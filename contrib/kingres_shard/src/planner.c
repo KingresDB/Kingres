@@ -387,6 +387,17 @@ analyze_query(Query *q, Analysis *a, const KsCatalog *cat)
 			a->ndist_rtes++;
 		if (q->onConflict != NULL && q->onConflict->exclRelIndex == (int) rti)
 			continue;
+		/*
+		 * FROM ONLY a distributed table (review P2D-03): a distributed table is one table to its user, whose rows
+		 * are in the partitions of every group, so ONLY has no meaning for it; the statement is refused on every
+		 * path instead of reading the rows of the parent alone, or of one group.  The target of an INSERT has no
+		 * inheritance flag and is not a scan.
+		 */
+		if (dt != NULL && !rte->inh && !(q->commandType == CMD_INSERT && rti == (Index) q->resultRelation))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("FROM ONLY is not supported for distributed table \"%s\"", get_rel_name(rte->relid)),
+					 errhint("A distributed table is one table whose rows are in the partitions of every shard group; leave out ONLY.")));
 		if (dt != NULL)
 		{
 			DistRef    *ref = palloc0(sizeof(DistRef));
@@ -1130,7 +1141,7 @@ plan_forwarded(Query *parse, const char *query_string, int cursorOptions,
 				PlannedStmt *pstmt = plan_locally(parse, query_string, cursorOptions, boundParams,
 												  cat, a->ndist_rtes);
 
-				if (place != 0 &&
+				if (
 					kingres_shard_placement_hash_now(qf.colocation_id) != place)
 					ereport(ERROR,
 							(errcode(ERRCODE_KINGRES_STALE_MAP),
@@ -1168,7 +1179,7 @@ plan_forwarded(Query *parse, const char *query_string, int cursorOptions,
 												  cat, a->ndist_rtes);
 
 				/* after planning (the target is locked ROW EXCLUSIVE, the sources ACCESS SHARE) */
-				if (place != 0 &&
+				if (
 					kingres_shard_placement_hash_now(is.colocation_id) != place)
 					ereport(ERROR,
 							(errcode(ERRCODE_KINGRES_STALE_MAP),
@@ -2074,6 +2085,16 @@ refuse_bucket_partition_write(Query *parse, const KsCatalog *cat)
  */
 /* Is the statement this call of the planner hook plans the local part that the caller armed? */
 static bool this_is_local_part = false;
+/* the second pass of planner_hook_body after a reload of the catalog does not try the shipped INSERT ... SELECT again */
+static bool insel_attempted = false;
+
+/* the gap in which the plan of the local part can be invalidated: a fault point for the tests (t/131) */
+static void
+local_part_gap(bool is_local_part)
+{
+	if (is_local_part)
+		kingres_shard_fault_point("local_part_planned");
+}
 
 static PlannedStmt *
 kingres_shard_planner_hook(Query *parse, const char *query_string,
@@ -2092,6 +2113,8 @@ kingres_shard_planner_hook(Query *parse, const char *query_string,
 	PG_TRY();
 	{
 		result = planner_hook_body(parse, query_string, cursorOptions, boundParams);
+		/* the gap in which the plan of the local part can be invalidated (t/131) */
+		local_part_gap(this_is_local_part);
 	}
 	PG_FINALLY();
 	{
@@ -2286,7 +2309,7 @@ planner_hook_body(Query *parse, const char *query_string,
 			if (ref->query == parse && ref->rti == (Index) parse->resultRelation)
 				target = ref;
 		}
-		if (target != NULL && target->bucket < 0 && !target->param_pending)
+		if (target != NULL && target->bucket < 0 && !target->param_pending && !insel_attempted)
 		{
 			int64		generation = kingres_shard_catalog_generation();
 			PlannedStmt *shipped = plan_colocated_insert_select(parse);
@@ -2299,26 +2322,27 @@ planner_hook_body(Query *parse, const char *query_string,
 			 * invalidations and can make this backend load the catalog cache again: every pointer
 			 * that this function took from the old one (the tables of a.refs, the nodes) is then
 			 * dangling.  Decide again from the start, with the new cache; the second pass cannot
-			 * come back here for the same reason more than a few times.
+			 * come back here.
 			 */
 			if (kingres_shard_catalog_generation() != generation)
 			{
-				static int	replans = 0;
 				PlannedStmt *again;
+				bool		old_attempted = insel_attempted;
 
-				if (replans >= 3)
-					ereport(ERROR,
-							(errcode(ERRCODE_KINGRES_STALE_MAP),
-							 errmsg("the catalog of the cluster changed again and again while the statement was planned"),
-							 errhint("Repeat the statement.")));
-				replans++;
+				/*
+				 * The second pass does not try to ship again (review P2D-04): the first attempt already
+				 * found that the statement is not shipped whole, and under debug_discard_caches every pass
+				 * reloads the cache, so a loop that waits for a stable generation would never end.  It plans
+				 * the statement from the start with the new cache, which is all the dangling pointers need.
+				 */
+				insel_attempted = true;
 				PG_TRY();
 				{
 					again = planner_hook_body(parse, query_string, cursorOptions, boundParams);
 				}
 				PG_FINALLY();
 				{
-					replans--;
+					insel_attempted = old_attempted;
 				}
 				PG_END_TRY();
 				return again;

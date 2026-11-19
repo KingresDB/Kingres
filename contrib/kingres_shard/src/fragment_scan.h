@@ -20,6 +20,7 @@
 
 #include "postgres.h"
 
+#include "datatype/timestamp.h"
 #include "nodes/params.h"
 #include "nodes/parsenodes.h"
 #include "nodes/pg_list.h"
@@ -53,6 +54,9 @@ typedef struct KsFrag
 	int			port;
 	int			group_id;
 	int64	   *identity;		/* identity of the node's partitions of every table of the probe when first asked */
+	TimestampTz sent_at;		/* when the first FETCH was sent (EXPLAIN ANALYZE) */
+	double		first_ms;		/* milliseconds from that to the first batch */
+	bool		first_seen;
 } KsFrag;
 
 /* The fragments of one scan, and what they need to be read in turn. */

@@ -1376,6 +1376,15 @@ to gain).  `EXPLAIN (VERBOSE)` of the scan such a statement gets says why (`Push
 
 `EXPLAIN` of a shipped statement shows `Pushed:`, `Groups: 3 of 3 (local + 2 remote)` (with `; pruned by <column>`
 when a restriction on the key left groups out), and `Remote SQL:`; `EXPLAIN ANALYZE` adds `Rows from groups:`.
+
+**What is never shipped, and what is refused.**  A `FULL JOIN` is never shipped whole (the scan answers).  In a
+colocated `INSERT ... SELECT` every cast that is not text to text goes through the row router, not through the groups; the
+groups run one after another, not at once.  `ON CONFLICT DO SELECT` (19) is refused, not merely "not shipped".  A
+parameter, an array, a range or a row of a `reg*` type is not shipped (each group would resolve the name to its own
+object).  `FROM ONLY` a distributed table is refused on every path ("FROM ONLY is not supported for distributed table").
+A closed query that returns about as many rows as it reads (a grouping or `DISTINCT` by a unique key of one table) is
+left to the scan: the groups would return the same rows.  `EXPLAIN ANALYZE` of a fragment scan shows the time to the
+first batch of each group.
 Switches: `kingres_shard.enable_pushdown` and `kingres_shard.enable_pushdown_closed`.  Fault points of the tests:
 `frag_before_probe`, `frag_after_probe_before`, `frag_after_declare`, `frag_local_open`, `frag_after_probe_after`,
 `frag_first_fetch`, `frag_before_fetch`, `frag_wait_batch`, `frag_local_fetch`, `frag_declared_g<n>`.  A statement

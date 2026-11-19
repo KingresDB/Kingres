@@ -47,6 +47,9 @@
 #include "utils/rel.h"
 #include "utils/relcache.h"
 #include "utils/syscache.h"
+#include "utils/rangetypes.h"
+#include "access/relation.h"
+#include "catalog/pg_type.h"
 #include "utils/lsyscache.h"
 
 #include "catalog.h"
@@ -90,27 +93,74 @@ type_ok(Oid type)
 	return type < FirstGenbkiObjectId;
 }
 
-/* The types whose value is the OID of a catalog object. */
+/*
+ * A scalar type whose value is the OID of a catalog object (regclass, regproc, ..., and the types a later
+ * major adds, regdatabase of 19): decided by the server's own data, not by a list.  Every such type is built in,
+ * and its input function is named reg<something>in.
+ */
+static bool
+is_reg_scalar(Oid type)
+{
+	HeapTuple	tup;
+	bool		result = false;
+
+	if (type >= FirstGenbkiObjectId)
+		return false;
+	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type));
+	if (HeapTupleIsValid(tup))
+	{
+		Oid			infunc = ((Form_pg_type) GETSTRUCT(tup))->typinput;
+		char	   *name = get_func_name(infunc);
+
+		result = name != NULL && strncmp(name, "reg", 3) == 0 &&
+			strlen(name) > 5 && strcmp(name + strlen(name) - 2, "in") == 0;
+		ReleaseSysCache(tup);
+	}
+	return result;
+}
+
+/* Does the type, looked into through domains, arrays, ranges and the fields of a row, hold a reg* value? */
+static bool
+type_mentions_reg(Oid type, int depth)
+{
+	Oid			base;
+	Oid			elem;
+	Oid			relid;
+
+	if (depth > 8)
+		return true;
+	base = getBaseType(type);
+	if (is_reg_scalar(base))
+		return true;
+	elem = get_element_type(base);
+	if (OidIsValid(elem))
+		return type_mentions_reg(elem, depth + 1);
+	if (type_is_range(base))
+		return type_mentions_reg(get_range_subtype(base), depth + 1);
+	if (type_is_multirange(base))
+		return type_mentions_reg(get_multirange_range(base), depth + 1);
+	relid = get_typ_typrelid(base);
+	if (OidIsValid(relid))
+	{
+		Relation	rel = relation_open(relid, AccessShareLock);
+		TupleDesc	desc = RelationGetDescr(rel);
+		bool		found = false;
+		int			i;
+
+		for (i = 0; i < desc->natts && !found; i++)
+			if (!TupleDescAttr(desc, i)->attisdropped)
+				found = type_mentions_reg(TupleDescAttr(desc, i)->atttypid, depth + 1);
+		relation_close(rel, AccessShareLock);
+		return found;
+	}
+	return false;
+}
+
+/* The types whose value is the OID of a catalog object (a scalar of such a type). */
 static bool
 is_reg_type(Oid type)
 {
-	switch (type)
-	{
-		case REGPROCOID:
-		case REGPROCEDUREOID:
-		case REGOPEROID:
-		case REGOPERATOROID:
-		case REGCLASSOID:
-		case REGTYPEOID:
-		case REGROLEOID:
-		case REGNAMESPACEOID:
-		case REGCONFIGOID:
-		case REGDICTIONARYOID:
-		case REGCOLLATIONOID:
-			return true;
-		default:
-			return false;
-	}
+	return is_reg_scalar(getBaseType(type));
 }
 
 /* The default collation and "C" mean the same on every node. */
@@ -524,6 +574,9 @@ ship_walker(Node *node, ShipCtx *ctx)
 				if (!c->constisnull && is_reg_type(c->consttype) &&
 					DatumGetObjectId(c->constvalue) >= FirstGenbkiObjectId)
 					return fail(ctx, "it uses the OID of an object that is not built in, which names another object on another node");
+				/* an array, a range or a row that holds reg* values: each group would resolve the names itself (review P2D-01) */
+				if (!c->constisnull && !is_reg_type(c->consttype) && type_mentions_reg(c->consttype, 0))
+					return fail(ctx, "it uses a constant that holds the OID of an object, which names another object on another node");
 				return false;
 			}
 
@@ -535,6 +588,8 @@ ship_walker(Node *node, ShipCtx *ctx)
 					return fail(ctx, "it uses a parameter that is computed during execution");
 				if (!type_ok(p->paramtype) || !collation_ok(p->paramcollid))
 					return fail(ctx, "it uses a parameter of a type or collation that is not built in");
+				if (type_mentions_reg(p->paramtype, 0))
+					return fail(ctx, "it uses a parameter that holds the OID of an object, which names another object on another node");
 				return false;
 			}
 

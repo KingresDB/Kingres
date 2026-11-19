@@ -42,7 +42,7 @@ sub table
 	$c->on_single($create);
 }
 
-table(q{CREATE TABLE public.s1 (id int PRIMARY KEY, a int, b int, t text, n numeric(8,2), f float8)},
+table(q{CREATE TABLE public.s1 (id int, a int, b int, t text, n numeric(8,2), f float8)},
 	q{; SELECT kingres.create_distributed_table('public.s1', 'id', bucket_count => 12)});
 table(q{CREATE TABLE public.s2 (id int PRIMARY KEY, c int, t text)},
 	q{; SELECT kingres.create_distributed_table('public.s2', 'id', colocate_with => 'public.s1')});
@@ -54,7 +54,7 @@ $c->on_every_node(q{CREATE TABLE public.loc (x int, y int)});
 $c->on_single(q{CREATE TABLE public.loc (x int, y int)});
 $c->on_both(q{INSERT INTO public.r VALUES (0, 'L0'), (1, 'L1'), (2, 'L2'), (3, 'L3'), (4, 'L4'), (5, 'L5'), (6, 'L6')});
 $c->on_both(q{INSERT INTO public.s1 SELECT g, CASE WHEN g % 17 = 0 THEN NULL ELSE (g * 7) % 50 END, CASE WHEN g % 19 = 0 THEN NULL ELSE (g * 13) % 30 END,
-	CASE WHEN g % 23 = 0 THEN NULL ELSE 'v' || (g % 300) END, round((g % 997) / 7.0, 2), (g % 100) / 3.0 FROM generate_series(1, 4000) g});
+	CASE WHEN g % 23 = 0 THEN NULL ELSE 'v' || (g % 300) END, round((g % 997) / 7.0, 2), (g % 100) / 3.0 FROM generate_series(1, 4000) g, generate_series(1, 2) dup});
 $c->on_both(q{INSERT INTO public.s2 SELECT g, CASE WHEN g % 11 = 0 THEN NULL ELSE g % 9 END, CASE WHEN g % 13 = 0 THEN NULL ELSE 's' || g END FROM generate_series(1, 4000, 2) g});
 $c->on_both(q{INSERT INTO public.far SELECT g, 'f' || g FROM generate_series(1, 80) g});
 $c->on_every_node(q{INSERT INTO public.loc SELECT g, g % 5 FROM generate_series(1, 40) g});

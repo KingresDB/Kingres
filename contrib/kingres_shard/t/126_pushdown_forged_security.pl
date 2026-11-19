@@ -82,7 +82,7 @@ sub fragment
 	return "/* kingres:query-fragment place=$place */ DECLARE ks_forged NO SCROLL CURSOR FOR $sql";
 }
 
-table(q{CREATE TABLE public.s (id int PRIMARY KEY, g int, v text, n int)},
+table(q{CREATE TABLE public.s (id int, g int, v text, n int)},
 	q{; SELECT kingres.create_distributed_table('public.s', 'id', bucket_count => 12)});
 table(q{CREATE TABLE public.o (id int PRIMARY KEY, w text)},
 	q{; SELECT kingres.create_distributed_table('public.o', 'id', colocate_with => 'public.s')});
@@ -93,7 +93,7 @@ table(q{CREATE TABLE public.lookup (k int PRIMARY KEY, label text)},
 $c->on_every_node(q{CREATE TABLE public.loc (x int, y int)});
 $c->on_single(q{CREATE TABLE public.loc (x int, y int)});
 $c->on_both(q{INSERT INTO public.lookup VALUES (0, 'L0'), (1, 'L1'), (2, 'L2'), (3, 'L3'), (4, 'L4'), (5, 'L5'), (6, 'L6')});
-$c->on_both(q{INSERT INTO public.s SELECT g, g % 7, 'v' || g, g % 50 FROM generate_series(1, 3000) g});
+$c->on_both(q{INSERT INTO public.s SELECT g, g % 7, 'v' || g, g % 50 FROM generate_series(1, 3000) g, generate_series(1, 2) dup});
 $c->on_both(q{INSERT INTO public.o SELECT g, 'w' || g FROM generate_series(1, 3000, 2) g});
 $c->on_both(q{INSERT INTO public.away SELECT g, 'a' || g FROM generate_series(1, 50) g});
 $c->on_every_node(q{INSERT INTO public.loc SELECT g, g % 5 FROM generate_series(1, 40) g});
@@ -190,7 +190,7 @@ for my $sql (@refused)
 		isnt($rc, 0, "a $stmt with the marker is refused");
 		like($err, qr/0A000|permission denied|does not accept/, '... with a refusal');
 	}
-	is($n1->safe_psql('postgres', q{SELECT count(*) FROM public.s}), 3000, 'no row was changed by the forged statements');
+	is($n1->safe_psql('postgres', q{SELECT count(*) FROM public.s}), 6000, 'no row was changed by the forged statements');
 
 	($rc, $out, $err) = run_sql($n1, "/* kingres:query-fragment place=$PLACE */ SELECT id, count(*) FROM public.s WHERE id <= 40 GROUP BY id");
 	is($rc, 0, 'a client that writes the marker gets an ordinary statement') or diag($err);
@@ -206,7 +206,7 @@ for my $sql (@refused)
 	is($rcl, 0, 'a real fragment gives the rows of the buckets of the group') or diag($el);
 	my $mine = $n2->safe_psql('postgres', q{SET kingres_shard.enable_routing = off; SELECT count(*) FROM public.s});
 	my ($full) = run_sql($n2, "BEGIN; SET kingres_shard.enable_pushdown = off; SELECT 1; ROLLBACK;");
-	cmp_ok($mine, '<', 3000, '(the group holds a part of the table)');
+	cmp_ok($mine, '<', 6000, '(the group holds a part of the table)');
 }
 
 # ---------------------------------------------------------------------------
@@ -282,9 +282,9 @@ for my $sql (@refused)
 # D. hostile values and names
 # ---------------------------------------------------------------------------
 {
-	table(q{CREATE TABLE public."Od""d na.me" (id int PRIMARY KEY, "a b" text, "c;--" int, "d*/" text)},
+	table(q{CREATE TABLE public."Od""d na.me" (id int, "a b" text, "c;--" int, "d*/" text)},
 		q{; SELECT kingres.create_distributed_table('public."Od""d na.me"', 'id', bucket_count => 12)});
-	$c->on_both(q{INSERT INTO public."Od""d na.me" SELECT g, 'it''s ' || g, g % 4, E'back\\slash ' || g FROM generate_series(1, 400) g});
+	$c->on_both(q{INSERT INTO public."Od""d na.me" SELECT g, 'it''s ' || g, g % 4, E'back\\slash ' || g FROM generate_series(1, 400) g, generate_series(1, 2) dup});
 	$c->on_every_node(q{ANALYZE});
 	$c->on_single(q{ANALYZE});
 	my @hostile = (
@@ -295,7 +295,7 @@ for my $sql (@refused)
 	);
 	for my $q (@hostile)
 	{
-		$c->compare("hostile: $q", $q, ordered => ($q =~ /ORDER BY/ ? 1 : 0), path => $FS);
+		$c->compare("hostile: $q", $q, ordered => ($q =~ /ORDER BY/ ? 1 : 0), ($q =~ /DISTINCT/ ? () : (path => $FS)));
 	}
 }
 

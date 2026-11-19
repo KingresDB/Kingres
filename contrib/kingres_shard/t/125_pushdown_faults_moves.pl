@@ -42,9 +42,9 @@ sub setup3
 	my ($prefix, %opt) = @_;
 	my @n = make_cluster($prefix, 3, %opt);
 	$n[0]->safe_psql('postgres', qq{
-		CREATE TABLE public.s (id int PRIMARY KEY, g int, v text);
+		CREATE TABLE public.s (id int, g int, v text, c int DEFAULT 1, PRIMARY KEY (id, c));
 		SELECT kingres.create_distributed_table('public.s', 'id', bucket_count => 12);
-		INSERT INTO public.s SELECT g, g % 7, 'v' || g FROM generate_series(1, $ROWS) g;
+		INSERT INTO public.s SELECT g, g % 7, 'v' || g, dup FROM generate_series(1, $ROWS) g, generate_series(1, 2) dup;
 	});
 	$_->safe_psql('postgres', 'ANALYZE') for @n;
 	return @n;
@@ -290,8 +290,8 @@ sub bucket_of
 	$t->query_safe(qq{PREPARE pt AS $Q});
 	$t->query_safe('EXECUTE pt') for (1 .. 6);
 	$m1->safe_psql('postgres', q{DROP TABLE public.s});
-	$m1->safe_psql('postgres', q{CREATE TABLE public.s (id int PRIMARY KEY, g int, v text); SELECT kingres.create_distributed_table('public.s', 'id', bucket_count => 7);
-		INSERT INTO public.s SELECT g, g % 5, 'w' || g FROM generate_series(1, 50) g});
+	$m1->safe_psql('postgres', q{CREATE TABLE public.s (id int, g int, v text, c int DEFAULT 1, PRIMARY KEY (id, c)); SELECT kingres.create_distributed_table('public.s', 'id', bucket_count => 7);
+		INSERT INTO public.s SELECT g, g % 5, 'w' || g, dup FROM generate_series(1, 50) g, generate_series(1, 2) dup});
 	$t->{stderr} = '';
 	my $after = $t->query('EXECUTE pt');
 	$e = $t->{stderr};
@@ -310,9 +310,9 @@ sub setup2
 	my ($prefix) = @_;
 	my ($a, $b) = make_cluster($prefix, 2, replication => 1);
 	$a->safe_psql('postgres', qq{
-		CREATE TABLE public.s (id int PRIMARY KEY, g int, v text);
+		CREATE TABLE public.s (id int, g int, v text, c int DEFAULT 1, PRIMARY KEY (id, c));
 		SELECT kingres.create_distributed_table('public.s', 'id', bucket_count => 12);
-		INSERT INTO public.s SELECT g, g % 7, 'v' || g FROM generate_series(1, $ROWS) g;
+		INSERT INTO public.s SELECT g, g % 7, 'v' || g, dup FROM generate_series(1, $ROWS) g, generate_series(1, 2) dup;
 	});
 	my $s = make_standby($b, "${prefix}_s2");
 	my $id = register_standby($a, $s, 1);
@@ -372,7 +372,7 @@ SKIP:
 	skip 'needs /proc', 3 unless -r '/proc/self/status';
 	my @m = setup3('pm');
 	my $m1 = $m[0];
-	$m1->safe_psql('postgres', q{INSERT INTO public.s SELECT g, g % 7, 'big' || g FROM generate_series(1000, 200999) g});
+	$m1->safe_psql('postgres', q{INSERT INTO public.s SELECT g, g % 7, 'big' || g, dup FROM generate_series(1000, 200999) g, generate_series(1, 2) dup});
 	$_->safe_psql('postgres', 'ANALYZE') for @m;
 	my $b = $m1->background_psql('postgres', on_error_stop => 1);
 	my $pid = $b->query_safe('SELECT pg_backend_pid()');

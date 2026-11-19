@@ -3066,3 +3066,54 @@ cost model is not calibrated. Only one seed of the generator `t/127` was run.
 - The paths are added by `fs_upper_paths` on `create_upper_paths_hook`; `KsPushdownInfo` is the
   hand-over from the planner hook, and its `kind` drives `EXPLAIN`.
 - The Makefile does not track header dependencies: after a change of a header, build clean.
+
+
+### Round after step 6 (the mark of the local part, the rest of the review of steps 3 and 4, leftovers of step 6)
+
+**The second planning of the local part (design 4.4, step 2 and the notes of steps 3 and 4).** It cannot happen on
+the paths that use the one-shot mark: SPI_execute_with_args (the local part of a fan-out write, the router's local
+batch) makes a one-shot plan, which SPI plans once in _SPI_execute_plan with no revalidation, and
+SPI_cursor_open_with_args (the local cursor of the fragment scan) builds its plan once in GetCachedPlan; the validity
+of a plan is checked only when a plan is reused.  A concurrent ANALYZE that commits between the planning and the start
+was played with the fault point local_part_planned (t/131): the planner hook ran once per statement and every answer was
+the single node's.  As a guard the second planning of the armed text before the execution starts is refused with KS001
+(fanout.c, kingres_shard_local_part_take; the window is closed by ExecutorStart, so a statement that SQL code runs
+during the execution, a CHECK function that replays the text, is planned and routed as before: t/132).  The mark is
+armed only by the C code around the SPI call and disarmed when the call ends; nothing in the text or in a setting
+carries it.  debug_discard_caches = 1 crashes the backend by stack overflow in the catalog loader of the extension
+(each lock acquisition resets the caches and the loader runs queries): not usable as a test, not a wrong answer.
+
+**S14-04.** The mutant "a failed ROLLBACK TO never dooms the transaction" survives t/119 because
+discard_connection() notes a session that wrote for the user as well: the second path makes the first one redundant
+for a session that wrote.  The mutant that always dooms is killed (a session that only read must commit).  The
+reset of xact_depth in the broken-session branch of the abort callback was removed: the callback of the next level up
+sees xact_depth above its level and closes the session.
+
+**COPY and row-level security (row_router.c)** is reachable only after row-level security is turned on by hand with
+routing off; it is tested that way (t/133).  **The step 5 path** with keys that have a type modifier (timestamp(0),
+numeric(8,2), varchar(8), a wider source modifier than the target's) gives the twin's rows (t/133).
+
+**EXPLAIN ANALYZE** of a fragment scan shows "Time to the first batch" per group and for this node's own part
+(with TIMING on): the time from the first FETCH sent to the first batch read.
+
+**place=0 (review of step 5, P2D-05).** A group now compares the placement number of a closed-query fragment and of a
+colocated INSERT ... SELECT whatever its value, so place=0 is a stale placement (KS001), not "no check".  The only
+legitimate 0 is the insert fragment of an explicit destination that is not in the catalog (it carries ident instead),
+whose comparison stays as it was.
+
+**reg* values (P2D-01).** The walker now decides a reg* type from the server (a built-in type whose input function is
+named reg<...>in, looked through domains, arrays, ranges and the fields of a row), and refuses a parameter of such a type
+and a constant of an array, range or row type that holds one.  A scalar constant keeps rule 6 of 5.1.  An
+expression the planner folds to plain OIDs (a regclass compared with an oid, array of regclass cast to oid[]) is shipped as
+numbers and means the same number everywhere, as it does on a single node; the hazard is only a value that is turned
+into a name.  The row router and the colocated INSERT ... SELECT send values through the same walker.  Not done:
+a test with objects whose OIDs differ between nodes for the router and the 2a scan.
+
+**FROM ONLY (P2D-03).** Refused on every path with "FROM ONLY is not supported for distributed table": a distributed
+table is one table whose rows are in the partitions of every group.  A reference table is an ordinary table on each node
+and ONLY works.
+
+**The cost of a closed query that reduces nothing.** A fragment scan over one distributed table whose result has 90 percent or
+more of the rows the table gives after its restrictions is not offered (no gain: a grouping or DISTINCT by a unique key).
+The tests t/124 to t/127 therefore use tables that hold every key twice (or a primary key of (id, copy)), and the cases that
+return as many rows as they read have no path assertion.

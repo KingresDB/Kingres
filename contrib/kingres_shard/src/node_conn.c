@@ -3597,8 +3597,12 @@ conn_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 				 * What it held is lost with it; a session that wrote for the user is noted when
 				 * the connection is closed (discard_connection).
 				 */
+				/*
+				 * xact_depth is not lowered here (review S14-01, P2C): the session is closed, and the callback of the
+				 * next level up finds xact_depth above its own level and closes it the same way, noting it when it
+				 * held work.  Lowering it made no test fail (t/118, t/119 with the line removed).
+				 */
 				kc->have_error = true;
-				kc->xact_depth = curlevel - 1;
 				continue;
 			}
 			snprintf(sql, sizeof(sql), "ROLLBACK TO SAVEPOINT s%d", curlevel);

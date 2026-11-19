@@ -231,6 +231,10 @@ tests += {
       't/127_pushdown_generator.pl',
       't/128_router_review_round.pl',
       't/130_router_identity.pl',
+      't/131_local_part_replan.pl',
+      't/132_local_part_replay.pl',
+      't/133_review_leftovers.pl',
+      't/134_review_step5.pl',
     ],
   },
 }

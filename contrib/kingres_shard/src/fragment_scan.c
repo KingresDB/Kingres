@@ -60,6 +60,7 @@
 #include "utils/portal.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/timestamp.h"
 #include "utils/wait_classes.h"
 
 #include "catalog.h"
@@ -391,6 +392,11 @@ frag_collect(KsFrag *f, bool quiet)
 	}
 	f->res = res;
 	f->nrows = PQntuples(res);
+	if (!f->first_seen && f->sent_at != 0)
+	{
+		f->first_seen = true;
+		f->first_ms = (double) (GetCurrentTimestamp() - f->sent_at) / 1000.0;
+	}
 	f->next_row = 0;
 	if (f->nrows < kingres_shard_scan_fetch_size)
 		f->exhausted = true;
@@ -438,6 +444,8 @@ frag_send_fetch(KsFrag *f)
 				 errmsg("could not send a command to node %s:%d", f->host, f->port),
 				 errdetail_internal("%s", kingres_shard_conn_error_text(f->kc->conn))));
 	}
+	if (f->sent_at == 0)
+		f->sent_at = GetCurrentTimestamp();
 	f->in_flight = true;
 	kingres_shard_conn_set_pending(f->kc, f, frag_finish_pending);
 }
@@ -818,6 +826,9 @@ typedef struct KsFragScanState
 	bool		lexhausted;
 	int64	   *ident_before;	/* the identity of this node's partitions of every distributed table before the cursor opens */
 	List	   *group_rows;		/* of FsGroupRows * */
+	TimestampTz local_sent;		/* EXPLAIN ANALYZE: the first fetch of this node's own part, and what it took */
+	double		local_first_ms;
+	bool		local_first_seen;
 } KsFragScanState;
 
 static create_upper_paths_hook_type prev_create_upper_paths_hook = NULL;
@@ -1026,6 +1037,27 @@ fs_upper_paths(PlannerInfo *root, UpperRelationKind stage, RelOptInfo *input_rel
 	coloc = kingres_shard_lookup_colocation(pi->colocation_id);
 	if (coloc == NULL)
 		return;
+	/*
+	 * No gain (review of step 6, measurement): one distributed table, and the result has about as many rows
+	 * as the table gives after its restrictions (a grouping or DISTINCT by a unique key): the groups would
+	 * return the rows that the scan returns, and the scan already ships only the restricted ones.
+	 */
+	if (list_length(pi->dist_relids) == 1)
+	{
+		int			i;
+		double		in_rows = 0;
+
+		for (i = 1; i < root->simple_rel_array_size; i++)
+		{
+			RelOptInfo *r = root->simple_rel_array[i];
+
+			if (r != NULL && r->reloptkind == RELOPT_BASEREL && r->rtekind == RTE_RELATION &&
+				list_member_oid(pi->dist_relids, root->simple_rte_array[i]->relid))
+				in_rows = Max(in_rows, r->rows);
+		}
+		if (in_rows > 0 && base->rows >= 0.9 * in_rows)
+			return;
+	}
 	prune = fs_prune_items(root);
 	frags = kingres_shard_frag_choose(coloc, cat, prune, root->glob->boundParams, &local, NULL, NULL);
 	nremote = list_length(frags);
@@ -1399,7 +1431,9 @@ fs_local_close(KsFragScanState *s)
 		s->local_desc = NULL;
 	}
 	if (s->lcxt != NULL)
-		MemoryContextReset(s->lcxt);
+		if (s->local_sent == 0)
+		s->local_sent = GetCurrentTimestamp();
+	MemoryContextReset(s->lcxt);
 	s->lbatch = NULL;
 	s->nl = s->next_l = 0;
 	s->has_local = false;
@@ -1510,6 +1544,11 @@ fs_local_fetch(KsFragScanState *s)
 		s->lbatch[k] = heap_copytuple(SPI_tuptable->vals[k]);
 	MemoryContextSwitchTo(oldcxt);
 	s->nl = (int) n;
+	if (!s->local_first_seen)
+	{
+		s->local_first_seen = true;
+		s->local_first_ms = (double) (GetCurrentTimestamp() - s->local_sent) / 1000.0;
+	}
 	if (n < (uint64) kingres_shard_scan_fetch_size)
 		s->lexhausted = true;
 	SPI_freetuptable(SPI_tuptable);
@@ -1714,6 +1753,25 @@ fs_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 	initStringInfo(&flat);
 	flatten_sql(s->sql, &flat);
 	ExplainPropertyText("Remote SQL", flat.data, es);
+
+	if (es->analyze && es->timing)
+	{
+		StringInfoData ft;
+		ListCell   *flc;
+
+		initStringInfo(&ft);
+		if (s->local_first_seen)
+			appendStringInfo(&ft, "local=%.3f ms", s->local_first_ms);
+		foreach(flc, s->fs.frags)
+		{
+			KsFrag	   *ff = (KsFrag *) lfirst(flc);
+
+			if (ff->first_seen)
+				appendStringInfo(&ft, "%sgroup %d=%.3f ms", ft.len > 0 ? ", " : "", ff->group_id, ff->first_ms);
+		}
+		if (ft.len > 0)
+			ExplainPropertyText("Time to the first batch", ft.data, es);
+	}
 
 	if (es->analyze && s->group_rows != NIL)
 	{
