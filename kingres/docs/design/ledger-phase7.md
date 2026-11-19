@@ -2966,6 +2966,60 @@ The number 159 is not used.
 170. **`bundle fetch` (4.6, 7.4)** needs the logs named: `logs.json` is optional and has no format
     yet. A partial tile that is gone is not an error. Without a trust file nothing is verified and
     the word is `FETCHED`, not `VERIFIED`.
+171. **What was published is kept outside the system database (5.x, P8-01).** A restore of the system
+    database to an older state made the publisher sign a second history. Every holder of the key
+    files keeps a record (`published.json` in the key directory: the highest size and root of every
+    log, the number of events and the hash of the last one, with a checksum). A round, a retirement
+    and a key task that appends an event first compare the database with the record; a database
+    that is behind it or disagrees with it signs and writes nothing, and a critical alert is raised.
+    The leader sends the record to the holders every ten seconds, and a server without one asks the
+    others before it takes the database as the start. The record is not signed: who can write the
+    key directory can sign. The limit: a restore when every copy of the record is lost or older
+    than the publication is not detected by the publisher, only by a mirror or an auditor.
+172. **A retirement (3.x, P8-02)** is refused only for a checkpoint above the bound that carries the
+    signature of the retiring key, not for any checkpoint above it; the other key keeps signing.
+173. **A database that vanished (147, P8-03)** ends its chains after every shard group answered "no
+    such database" for 30 minutes and the system instance does not have it either, with an alert
+    from the first such answer; rounds are not counted. A chain that was closed and answers again
+    under the same chain identity is not reopened: a critical `ledgerChainDiverged` names the
+    group, the height and why the log ended, and no leaf, event or tile is written. Reopening needs
+    the epoch of step 20.
+174. **An answer that names the open chain of another group (P8-04)** makes both logs diverged with
+    critical alerts and retires nothing; a group whose chain was really replaced raises a critical
+    alert too.
+175. **Small rules (P8-05 to P8-07).** The table of the rate limit evicts its oldest entry and
+    counts an IPv6 client by its /64. A checkpoint note is replaced only by a note with the same
+    text under the same revision of the key set. The marker that lets a key file without a row be
+    adopted names the task and the fingerprint; it is no protection against someone who can write
+    the directory.
+176. **A diverged chain that is retired stays diverged (P8-08)**: the flags of its last leaf say
+    both (0x06), and its alert is not cleared. This is the only change of published bytes in this
+    round.
+177. **Decisions stated and not changed (P8-10)**: the caching headers of files that cannot change;
+    an aggregate identifier can be guessed as far as the name of the database can; the certificate
+    of the listener is read once; the answer of a peer is bounded; an unknown hash version stops
+    the log.
+178. **`logs.json` (170)** has a format now: `{"format":1,"logs":[{"kind","origin","state","size"}]}`
+    on one line, in the order the logs were made, at the root of a publication.
+179. **An anchor record that is claimed (6.x)** is shown as `submitted`: `LedgerAnchor.state` of the
+    contract has no `claimed`.
+180. **Outgoing requests of anchoring** go only to the host and port of the configured target. An
+    address written as a literal is used as written; a name that resolves to a loopback, link-local,
+    unspecified or multicast address is refused; a private address is allowed.
+181. **Credentials of a target** are kept in files of the key directory (clear, or sealed with
+    AES-GCM under the passphrase file), sent to the holders by two internal calls, and never
+    returned; each value is at least four printable ASCII characters.
+182. **"Behind"** is the age of the oldest checkpoint that no anchor of the target covers, counted
+    from no earlier than the time the target was enabled: a warning at three intervals and one
+    hour, critical at twelve intervals and one hour.
+183. **`retryLedgerAnchor` never raises the generation of a WORM object**; the contract does not
+    offer it.
+
+Built of step 10: the anchoring framework and the WORM target. Not built in it: the publication of
+evidence files under the publication root, the cluster settings for the limits of retries (the
+defaults of the library apply), the warnings about retention of a WORM object, the monitoring of the
+store's clock, and tests that kill the process inside a round (P8-09 in part). Steps 12 (RFC 3161)
+and 14 (OpenTimestamps) register their kinds in the same framework.
 
 Of section 13: item 2 (test vectors) is settled for signed notes (the example key and note of the
 specification are in the tests; the checkpoint example has no published key), item 3 (entry bundles at
