@@ -383,7 +383,7 @@ func (p fplan) PrimaryNames(context.Context, string, int32) ([]int64, bool) {
 }
 func (p fplan) Preferred(_ context.Context, g int32, s string) bool { return s == "s3" }
 func (p fplan) Ring(from, to string) int                            { return 0 }
-func (p fplan) AfterPromotion(_ context.Context, g int32, s StandbyRec, srv string, port int) error {
+func (p fplan) AfterPromotion(_ context.Context, g int32, s StandbyRec, srv string, port int, old OldPrimaryRec) error {
 	p.w.rec("after-promotion %d %s:%d", s.ID, srv, port)
 	p.w.records++
 	var keep []StandbyRec

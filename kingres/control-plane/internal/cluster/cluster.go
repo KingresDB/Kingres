@@ -94,8 +94,11 @@ type Service struct {
 
 	mu       sync.Mutex
 	dsnSinks []func(dsn string) error
-	bg       context.Context
-	wg       sync.WaitGroup
+	// catalogPrimaries is what the last SyncRoles read: the TCP ports of this server's primary rows of the catalog,
+	// by group (roles.go, Unattributed).
+	catalogPrimaries map[int32][]int
+	bg               context.Context
+	wg               sync.WaitGroup
 }
 
 // New builds the service. When cfg.BinDir is empty the service is disabled:

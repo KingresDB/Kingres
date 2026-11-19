@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -113,6 +114,10 @@ func (m *Manager) InitStandby(ctx context.Context, s StandbySpec) (err error) {
 	if err := os.WriteFile(filepath.Join(dir, MarkerName), mk, 0o600); err != nil {
 		return err
 	}
+	// The mark comes before anything of the copy; the agent removes it when the standby is complete (F2-08).
+	if err := m.MarkCopyUnfinished(s.ID); err != nil {
+		return err
+	}
 	if err := m.WriteRole(s.ID, Role{Group: int32(s.ID - StandbyBaseID), Role: RoleStandby, Origin: OriginCopy}); err != nil {
 		return err
 	}
@@ -150,6 +155,11 @@ const StandbyIdentMap = "kingres_standby"
 // reloads the standby when one changed and it runs. It reports whether it changed
 // anything.
 func (m *Manager) SyncAccess(ctx context.Context, from, to int, osUser string) (bool, error) {
+	if from == to {
+		// A server whose only instance is a standby (no primary left on it) has nothing to copy the rules from; copying
+		// a file onto itself would add the rule at every round.
+		return false, nil
+	}
 	src, err := m.DataDir(from)
 	if err != nil {
 		return false, err
@@ -172,10 +182,14 @@ func (m *Manager) SyncAccess(ctx context.Context, from, to int, osUser string) (
 			return false, fmt.Errorf("instance: reading %s: %w", f, err)
 		}
 		var want string
+		want = string(b)
 		if f == "pg_hba.conf" {
-			want = "local   all  " + ServiceRole + "  peer map=" + StandbyIdentMap + "\n" + string(b)
-		} else {
-			want = string(b) + StandbyIdentMap + " " + q + " " + ServiceRole + "\n"
+			// A source that is itself a standby (or a rewound former primary) has the rule already.
+			if !strings.Contains(want, "peer map="+StandbyIdentMap) {
+				want = "local   all  " + ServiceRole + "  peer map=" + StandbyIdentMap + "\n" + want
+			}
+		} else if line := StandbyIdentMap + " " + q + " " + ServiceRole + "\n"; !strings.Contains(want, line) {
+			want += line
 		}
 		have, err := os.ReadFile(filepath.Join(dst, f)) //nolint:gosec // fixed names below the manager root
 		if err == nil && string(have) == want {
@@ -194,12 +208,45 @@ func (m *Manager) SyncAccess(ctx context.Context, from, to int, osUser string) (
 	return changed, nil
 }
 
-// Rewind brings the stopped data directory of instance id back in line with the
+// Rewind (it answers what pg_rewind printed, with --progress) brings the stopped data directory of instance id back in line with the
 // primary that conninfo names (pg_rewind): it is for a standby whose history
 // diverged from the primary's (a former primary), where it is cheaper than a new
 // base backup. The source connection needs a database role, so conninfo names a
 // database. The caller falls back to a new base backup when it fails.
-func (m *Manager) Rewind(ctx context.Context, id int, conninfo string) error {
+//
+// A former primary that was stopped with an immediate shutdown (a fence) was not shut down cleanly: pg_rewind then
+// starts it in single-user mode to finish its crash recovery and stops it again (the program's default,
+// --ensure-shutdown; the configuration of the instance, with the extension in shared_preload_libraries, is the one
+// it runs with). A failure of that, or of the rewind itself, is the caller's reason to take a base backup (design
+// 6.2 step 3 and 4, open point 11).
+func (m *Manager) Rewind(ctx context.Context, id int, conninfo string) (string, error) {
+	if err := m.rewindable(ctx, id); err != nil {
+		return "", err
+	}
+	data, _ := m.DataDir(id)
+	out, err := m.run(ctx, "pg_rewind", "--progress", "--target-pgdata="+data, "--source-server="+conninfo)
+	if err != nil {
+		return out, fmt.Errorf("instance: pg_rewind: %w: %s", err, out)
+	}
+	return out, os.WriteFile(filepath.Join(data, "standby.signal"), nil, 0o600)
+}
+
+// RewindDryRun runs pg_rewind --dry-run --progress against the same source and returns what it printed: where the
+// histories parted and how much would be copied. The target is not modified, except that pg_rewind finishes its crash
+// recovery first when it was not shut down cleanly (the shutdown checkpoint it leaves is the end of its WAL).
+func (m *Manager) RewindDryRun(ctx context.Context, id int, conninfo string) (string, error) {
+	if err := m.rewindable(ctx, id); err != nil {
+		return "", err
+	}
+	data, _ := m.DataDir(id)
+	out, err := m.run(ctx, "pg_rewind", "--dry-run", "--progress", "--target-pgdata="+data, "--source-server="+conninfo)
+	if err != nil {
+		return out, fmt.Errorf("instance: pg_rewind --dry-run: %w: %s", err, out)
+	}
+	return out, nil
+}
+
+func (m *Manager) rewindable(ctx context.Context, id int) error {
 	if _, err := m.Managed(id); err != nil {
 		return err
 	}
@@ -209,10 +256,76 @@ func (m *Manager) Rewind(ctx context.Context, id int, conninfo string) error {
 		}
 		return errors.New("instance: pg_rewind needs the instance stopped")
 	}
-	data, _ := m.DataDir(id)
-	out, err := m.run(ctx, "pg_rewind", "--target-pgdata="+data, "--source-server="+conninfo, "--no-ensure-shutdown")
+	return nil
+}
+
+// ControlData reads pg_controldata of the stopped or running instance: the lines "name: value" as a map.
+func (m *Manager) ControlData(ctx context.Context, id int) (map[string]string, error) {
+	data, err := m.DataDir(id)
 	if err != nil {
-		return fmt.Errorf("instance: pg_rewind: %w: %s", err, out)
+		return nil, err
+	}
+	out, err := m.run(ctx, "pg_controldata", "-D", data)
+	if err != nil {
+		return nil, fmt.Errorf("instance: pg_controldata: %w: %s", err, out)
+	}
+	res := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		if k, v, ok := strings.Cut(line, ":"); ok {
+			res[strings.TrimSpace(k)] = strings.TrimSpace(v)
+		}
+	}
+	return res, nil
+}
+
+// RebaseStandby replaces the data directory of instance id with a base backup of the primary that s.Conninfo names and
+// makes it a standby (standby.signal and the managed configuration of s.Settings). Everything outside the data
+// directory (marker, role file, trust, settings, the files next to them) stays: it is for a former primary whose
+// pg_rewind failed, where the instance directory is the server's own and must not be created again. The instance must
+// be stopped, and the caller has proved that it may be overwritten (a role file that says standby and the mark of an
+// unfinished copy). A failure leaves the data directory incomplete, which the mark says.
+func (m *Manager) RebaseStandby(ctx context.Context, id int, s StandbySpec) error {
+	mk, err := m.Managed(id)
+	if err != nil {
+		return err
+	}
+	if s.Conninfo == "" || s.Slot == "" {
+		return invalid("a standby needs a connection string and a slot")
+	}
+	if up, err := m.Running(ctx, id); err != nil || up {
+		if err != nil {
+			return err
+		}
+		return errors.New("instance: the instance must be stopped before its data directory is replaced")
+	}
+	s.Settings.SocketDir = ""
+	if sock, err := m.SocketDir(id); err == nil {
+		s.Settings.SocketDir = filepath.ToSlash(sock)
+	}
+	if s.Settings.Port == 0 {
+		s.Settings.Port = mk.Port
+	}
+	managed, err := RenderManaged(s.Settings)
+	if err != nil {
+		return err
+	}
+	data, err := m.DataDir(id)
+	if err != nil {
+		return err
+	}
+	if err := os.RemoveAll(data); err != nil {
+		return fmt.Errorf("instance: removing the old data directory: %w", err)
+	}
+	out, runErr := m.run(ctx, "pg_basebackup", "-D", data, "-d", s.Conninfo, "-X", "stream", "-S", s.Slot,
+		"--checkpoint=fast", "-w", "--no-password")
+	if runErr != nil {
+		return fmt.Errorf("instance: pg_basebackup: %w: %s", runErr, out)
+	}
+	if err := os.WriteFile(filepath.Join(data, "kingres-managed.conf"), []byte(managed), 0o600); err != nil {
+		return err
+	}
+	if err := m.saveSettings(id, s.Settings); err != nil {
+		return err
 	}
 	return os.WriteFile(filepath.Join(data, "standby.signal"), nil, 0o600)
 }

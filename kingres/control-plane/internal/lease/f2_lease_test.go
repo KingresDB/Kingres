@@ -4,8 +4,11 @@ package lease
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 )
 
 // F2-04: after a hand-over the gate holds the old primary directory back; an adoption (the fence holder of a later
@@ -85,5 +88,89 @@ func TestARoundIsNotSentForAGroupReleasedMeanwhile(t *testing.T) {
 	}
 	if r.m.mayRenew(1, Topology{Groups: []int32{1}}) {
 		t.Fatal("mayRenew says a relinquished group may be renewed")
+	}
+}
+
+// recordingVoter records, for every request, the group and whether it was a release, and calls onFirstGrant once, in
+// the middle of the first plain renewal it sees.
+type recordingVoter struct {
+	*fakeVoter
+	mu           sync.Mutex
+	calls        []string
+	onFirstGrant func()
+	// ready, when set, holds every plain request for group 1 until it is true (bounded): no vote of the round of group 1
+	// returns before the release of group 2 has marked the group.
+	ready func() bool
+	once  sync.Once
+}
+
+func (v *recordingVoter) Grant(ctx context.Context, server string, req Request) (Reply, error) {
+	v.mu.Lock()
+	kind := "grant"
+	if req.Release {
+		kind = "release"
+	}
+	v.calls = append(v.calls, fmt.Sprintf("%s:%d", kind, req.Group))
+	v.mu.Unlock()
+	if !req.Release && req.TransferTo == "" && v.onFirstGrant != nil {
+		v.once.Do(v.onFirstGrant)
+	}
+	if !req.Release && req.TransferTo == "" && req.Group == 1 && v.ready != nil {
+		for deadline := time.Now().Add(10 * time.Second); !v.ready() && time.Now().Before(deadline); {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	return v.fakeVoter.Grant(ctx, server, req)
+}
+
+func (v *recordingVoter) seen() []string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return append([]string(nil), v.calls...)
+}
+
+// F2-02, the case of the review: a server runs groups 1 and 2, the pass of Renew has taken the list [1, 2], and while it
+// works on group 1 the failover releases group 2. The pass must not then send a plain renewal for group 2: a grantor
+// would hold the group for the releaser again and the new holder would be refused for duration plus margin. The test
+// fails when the check in Renew's loop (mayRenew) is removed. Nothing here depends on speed: the release starts
+// inside the first request of the round of group 1 and the test waits, with a bound, for the group to be marked.
+func TestARoundIsNotSentForAGroupReleasedInTheMiddleOfAPass(t *testing.T) {
+	ctx := context.Background()
+	r := newRig(t, []string{"a", "b", "c"}, false)
+	r.m.c.Source = fakeSource{Topology{Groups: []int32{1, 2}, Members: []string{"a", "b", "c"}}}
+	rv := &recordingVoter{fakeVoter: r.voter}
+	r.m.c.Voter = rv
+	r.m.Renew(ctx) // both groups held
+	_ = r.inst.StopImmediate(ctx)
+	released := make(chan error, 1)
+	rv.onFirstGrant = func() {
+		go func() {
+			_, err := r.m.ReleaseGroup(ctx, 2)
+			released <- err
+		}()
+	}
+	rv.ready = func() bool { return r.m.Relinquished(2) }
+	mark := len(rv.seen())
+	r.m.Renew(ctx)
+	select {
+	case err := <-released:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the release did not finish")
+	}
+	after := rv.seen()[mark:]
+	sawRelease := false
+	for _, c := range after {
+		switch c {
+		case "release:2":
+			sawRelease = true
+		case "grant:2":
+			t.Fatalf("a renewal of group 2 was sent in the pass that released it: %v", after)
+		}
+	}
+	if !sawRelease {
+		t.Fatalf("no release was sent: %v", after)
 	}
 }

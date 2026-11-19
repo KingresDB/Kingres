@@ -52,8 +52,9 @@ func (a *Agent) createLocked(ctx context.Context, e Entry) (CreateResponse, erro
 			}
 			return a.startExisting(ctx, id, m)
 		}
-		// An unfinished copy: remove it (the slot stays, it is reused below), unless it is something else (FO-04).
-		if err := a.provedStandby(ctx, id, true); err != nil {
+		// Not a complete standby: remove it (the slot stays, it is reused below) when it is an unfinished copy by the
+		// positive mark of InitStandby (F2-08) or a standby proved by its role file and standby.signal (FO-04); anything else stays.
+		if err := a.provedStandby(ctx, id, a.mgr().CopyUnfinished(id)); err != nil {
 			return CreateResponse{}, err
 		}
 		if err := a.mgr().Remove(ctx, id); err != nil {
@@ -102,6 +103,10 @@ func (a *Agent) createLocked(ctx context.Context, e Entry) (CreateResponse, erro
 	e.Port = port
 	if err := a.writeMeta(id, e); err != nil {
 		return CreateResponse{}, fmt.Errorf("standby: recording the standby: %w", err)
+	}
+	// The copy is complete: the mark InitStandby wrote first goes last (F2-08).
+	if err := a.mgr().ClearCopyUnfinished(id); err != nil {
+		return CreateResponse{}, fmt.Errorf("standby: clearing the mark of an unfinished copy: %w", err)
 	}
 	return a.startExisting(ctx, id, e)
 }
@@ -178,7 +183,7 @@ func (a *Agent) removeLocked(ctx context.Context, e Entry) error {
 		}
 		// Only an instance proved to be a standby is deleted (FO-04): a promoted standby whose role file is not
 		// written yet, or is broken, is a primary with its data.
-		if err := a.provedStandby(ctx, id, merr != nil); err != nil {
+		if err := a.provedStandby(ctx, id, a.mgr().CopyUnfinished(id)); err != nil {
 			return err
 		}
 		if err := a.mgr().Remove(ctx, id); err != nil {
@@ -200,12 +205,18 @@ func (a *Agent) removeLocked(ctx context.Context, e Entry) error {
 // differs; when that is not possible, and for a standby that fell behind its slot,
 // the instance is deleted, the slot made again and a new base backup taken.
 func (a *Agent) Rebuild(ctx context.Context, e Entry, diverged bool) (CreateResponse, error) {
+	return a.rebuild(ctx, e, diverged, 0)
+}
+
+// rebuild is Rebuild with the catalog term the leader asks under: the old primary of a group is rebuilt only when the
+// term is newer than the one its role file was written under (oldprimary.go).
+func (a *Agent) rebuild(ctx context.Context, e Entry, diverged bool, term int64) (CreateResponse, error) {
 	if err := validEntry(e); err != nil {
 		return CreateResponse{}, err
 	}
 	a.opMu.Lock()
 	defer a.opMu.Unlock()
-	id := e.dir()
+	id := a.dirFor(e, diverged)
 	if a.mgr().Exists(id) && e.Generation > 0 {
 		// ST-03: the call is repeated when its answer was lost. A standby that is of the generation asked for was
 		// rebuilt by the first execution: a second one is a no-op (it only makes sure the instance runs).
@@ -214,21 +225,23 @@ func (a *Agent) Rebuild(ctx context.Context, e Entry, diverged bool) (CreateResp
 		}
 	}
 	if a.mgr().Exists(id) {
-		if err := a.provedStandby(ctx, id, false); err != nil {
+		// The old primary of the group is a primary on disk: it is rebuilt only when it is proved to be one (a role file
+		// that says primary of this group, stopped, not held by a lease of this server, marked, a newer term).
+		former, err := a.enterFormer(ctx, id, e, term)
+		if err != nil {
+			return CreateResponse{}, err
+		}
+		if former {
+			return a.rebuildFormerLocked(ctx, id, e, term)
+		}
+		if err := a.provedStandby(ctx, id, a.mgr().CopyUnfinished(id)); err != nil {
 			return CreateResponse{}, err
 		}
 	}
 	if diverged && a.mgr().Exists(id) {
-		if err := a.rewindLocked(ctx, id, e); err == nil {
-			if m, merr := a.metaOf(id); merr == nil {
-				m.Generation = e.Generation
-				_ = a.writeMeta(id, m)
-			}
-			a.audit(ctx, "standbyInstanceRebuilt", strconv.FormatInt(e.ID, 10), audit.OutcomeSuccess, map[string]any{"group": e.Group, "server": a.Self, "method": "pg_rewind"})
-			return a.startExisting(ctx, id, e)
-		} else {
-			a.Log.Info("standby: pg_rewind was not possible, taking a new base backup", "standby", e.ID, "error", err)
-		}
+		// A standby that is ahead of its new primary or on another timeline: the same steps as the old primary, with
+		// the proof of a standby (the role file and the recovery or standby.signal).
+		return a.rebuildFormerLocked(ctx, id, e, term)
 	}
 	if err := a.removeLocked(ctx, e); err != nil {
 		return CreateResponse{}, err
@@ -239,17 +252,6 @@ func (a *Agent) Rebuild(ctx context.Context, e Entry, diverged bool) (CreateResp
 	}
 	a.audit(ctx, "standbyInstanceRebuilt", strconv.FormatInt(e.ID, 10), audit.OutcomeSuccess, map[string]any{"group": e.Group, "server": a.Self, "method": "base backup"})
 	return res, nil
-}
-
-func (a *Agent) rewindLocked(ctx context.Context, id int, e Entry) error {
-	if err := a.mgr().Stop(ctx, id); err != nil {
-		return err
-	}
-	conninfo, err := a.Svc.ReplicationConninfo(e.PrimaryServer, e.PrimaryPort, AppName(e.ID), "postgres")
-	if err != nil {
-		return err
-	}
-	return a.mgr().Rewind(ctx, id, conninfo)
 }
 
 // superviseStandbys keeps the standby instances of this server running and in
@@ -418,18 +420,47 @@ func (a *Agent) provedStandby(ctx context.Context, id int, unfinished bool) erro
 		}
 		return nil
 	}
-	mk, err := a.mgr().Managed(id)
-	if err != nil {
-		return fmt.Errorf("%w: %w", ErrNotProvedStandby, err)
-	}
-	c, err := a.Svc.ServiceConnAt(ctx, id, mk.Port, "postgres")
+	inRecovery, err := a.askRecovery(ctx, id)
 	if err != nil {
 		return fmt.Errorf("%w: it runs and cannot be asked: %w", ErrNotProvedStandby, err)
 	}
-	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
-	var inRecovery bool
-	if err := c.QueryRow(ctx, "SELECT pg_catalog.pg_is_in_recovery()").Scan(&inRecovery); err != nil || !inRecovery {
+	if !inRecovery {
 		return fmt.Errorf("%w: it is not in recovery", ErrNotProvedStandby)
 	}
 	return nil
+}
+
+// askRecovery asks the running instance of directory id whether it is in recovery (a test sets Agent.AskRecovery).
+func (a *Agent) askRecovery(ctx context.Context, id int) (bool, error) {
+	if a.AskRecovery != nil {
+		return a.AskRecovery(ctx, id)
+	}
+	mk, err := a.mgr().Managed(id)
+	if err != nil {
+		return false, err
+	}
+	c, err := a.Svc.ServiceConnAt(ctx, id, mk.Port, "postgres")
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	var inRecovery bool
+	if err := c.QueryRow(ctx, "SELECT pg_catalog.pg_is_in_recovery()").Scan(&inRecovery); err != nil {
+		return false, err
+	}
+	return inRecovery, nil
+}
+
+// LockLifecycle takes the lock of the agent's create, remove and rebuild for the caller: the promotion of a standby runs
+// under it, so that the proof that a directory is a standby and its removal (or the promotion that makes it a primary)
+// are never interleaved (F2-08). It waits until ctx ends.
+func (a *Agent) LockLifecycle(ctx context.Context) (unlock func(), err error) {
+	for !a.opMu.TryLock() {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	return a.opMu.Unlock, nil
 }

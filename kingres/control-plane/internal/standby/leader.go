@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -67,6 +68,13 @@ type Leader struct {
 	// UnregisterWait is the pause between two tries of a catalog removal that the
 	// extension refused with KS009 because the primary still names the standby (default 5 s).
 	UnregisterWait time.Duration
+	// ReplaceAfter is how long the record of an old primary whose server does not answer counts as a planned standby
+	// (setting standby-replace-after, default 30 minutes): after it the record is removed, in the order of extension
+	// sequence 8, and the ordinary reconcile places a replacement. The alert oldPrimaryNotRebuilt comes at the shorter
+	// of ten minutes and half of it.
+	ReplaceAfter time.Duration
+	// Dead says that the leader's liveness view calls a server dead (nil: none is).
+	Dead func(server string) bool
 
 	st   store
 	kick chan struct{}
@@ -75,6 +83,8 @@ type Leader struct {
 	mu       sync.Mutex
 	lastTry  map[int64]time.Time
 	underFor map[int32]int
+	// alertedOld are the servers with a raised oldPrimaryNotRebuilt (so that the alert is cleared when the cause is gone).
+	alertedOld map[string]bool
 }
 
 // NewLeader prepares the leader's side; Run starts it.
@@ -88,6 +98,9 @@ func NewLeader(l *Leader) *Leader {
 	}
 	if l.RetryAfter == 0 {
 		l.RetryAfter = 30 * time.Second
+	}
+	if l.ReplaceAfter == 0 {
+		l.ReplaceAfter = 30 * time.Minute
 	}
 	if l.UnregisterWait == 0 {
 		l.UnregisterWait = 5 * time.Second
@@ -157,7 +170,7 @@ func (l *Leader) readTopology(ctx context.Context) (topology, error) {
 	}
 	defer rows.Close()
 	var t topology
-	seen := map[string]bool{}
+	seen := map[string]int{}
 	for rows.Next() {
 		var g int32
 		var host, role, zone string
@@ -166,14 +179,19 @@ func (l *Leader) readTopology(ctx context.Context) (topology, error) {
 		if err := rows.Scan(&g, &host, &port, &role, &active, &zone); err != nil {
 			return topology{}, err
 		}
+		// A server is in the ring whatever its nodes are: after a failover a server can run only standbys (its group
+		// moved to another server) and is still a place for the standbys of other groups, and the record of the old
+		// primary must find it a valid candidate (design 6.5). The zone of the first row that has one counts.
+		if i, ok := seen[host]; !ok {
+			seen[host] = len(t.ring)
+			t.ring = append(t.ring, Server{ID: host, Zone: zone})
+		} else if t.ring[i].Zone == "" && zone != "" {
+			t.ring[i].Zone = zone
+		}
 		if role != "primary" || !active {
 			continue
 		}
 		t.groups = append(t.groups, groupInfo{ID: g, Primary: host, Port: port})
-		if !seen[host] {
-			seen[host] = true
-			t.ring = append(t.ring, Server{ID: host, Zone: zone})
-		}
 	}
 	return t, rows.Err()
 }
@@ -240,6 +258,18 @@ func (l *Leader) diff(t topology, recs []Record, replicas int) work {
 			}
 			existing = append(existing, r.Server)
 		}
+		// A server that is dead is no place for a new standby (the replacement of an old primary that did not return must
+		// not be made on it again); a standby that is on it already stays a valid one, a server that merely reboots must
+		// not lose it.
+		if l.Dead != nil {
+			var alive []string
+			for _, s := range cand {
+				if !l.Dead(s) || slices.Contains(existing, s) {
+					alive = append(alive, s)
+				}
+			}
+			cand = alive
+		}
 		add, remove := Plan(cand, existing, replicas)
 		for _, s := range add {
 			w.Add = append(w.Add, Entry{Group: g.ID, Server: s, PrimaryServer: g.Primary, PrimaryPort: g.Port})
@@ -253,6 +283,10 @@ func (l *Leader) diff(t topology, recs []Record, replicas int) work {
 			case r.State == stateRemoving:
 			case rm[r.Server]:
 				w.Remove = append(w.Remove, r.Entry(g.Port))
+			case r.Diverged && r.State != stateReady:
+				// The old primary of a group (or a standby that is ahead of its primary): rebuilt with pg_rewind, never made
+				// again as a new standby, whatever its state says.
+				w.Rebuild = append(w.Rebuild, r.Entry(g.Port))
 			case r.State == stateCreating || r.State == stateRebuilding:
 				w.Resume = append(w.Resume, r.Entry(g.Port))
 			case r.NeedsRebuild:
@@ -384,6 +418,7 @@ func (l *Leader) round(ctx context.Context) error {
 			}
 		}
 	}
+	l.watchOldPrimaries(ctx, recs, statuses)
 	recs, err = l.st.list(ctx)
 	if err != nil {
 		return err
@@ -788,7 +823,15 @@ func (l *Leader) rebuildStandby(ctx context.Context, env *task.Env, e Entry) err
 	entry.Ready = false
 	_ = env.SetDetail(ctx, fmt.Sprintf("Rebuilding the standby of shard group %d on server %s from a new base backup.", e.Group, e.Server))
 	var res CreateResponse
-	if err := l.call(ctx, rec.Server, CallRebuild, RebuildRequest{Entry: entry}, &res); err != nil {
+	req := RebuildRequest{Entry: entry, Diverged: rec.Diverged}
+	if rec.Diverged {
+		term, terr := l.catalogTerm(ctx)
+		if terr != nil {
+			return terr
+		}
+		req.Term = term
+	}
+	if err := l.call(ctx, rec.Server, CallRebuild, req, &res); err != nil {
 		l.audit(ctx, env, "standbyRebuilt", entry, audit.OutcomeFailure, nil)
 		return fmt.Errorf("rebuilding the standby of shard group %d on %s: %w", e.Group, rec.Server, err)
 	}
@@ -803,12 +846,142 @@ func (l *Leader) rebuildStandby(ctx context.Context, env *task.Env, e Entry) err
 			return err
 		}
 	}
+	if res.InstanceID > 0 && res.InstanceID != rec.InstanceID {
+		// The old primary's directory was found by its server (the failover did not know it).
+		if err := l.st.setInstance(ctx, rec.ID, res.InstanceID); err != nil {
+			return err
+		}
+	}
+	if res.OldPrimary != nil {
+		if b, merr := json.Marshal(res.OldPrimary); merr == nil {
+			if err := l.st.recordOldPrimary(ctx, rec.Group, rec.Server, b); err != nil {
+				l.Log.Warn("standby: storing the report of the old primary", "standby", rec.ID, "error", err)
+			}
+		}
+	}
 	if err := l.st.setState(ctx, rec.ID, stateReady, res.Port); err != nil {
 		return err
+	}
+	if rec.Diverged {
+		// The old primary is a standby now: what was raised about it is over.
+		l.clearOldPrimaryAlerts(ctx, rec)
+		// The failover declared the standbys of this server gone, so that no list waited for them: they are back. Until the
+		// declaration lapses (minutes) the primary of the group would not name the standby that was just rebuilt.
+		if t, terr := l.readTopology(ctx); terr == nil {
+			for _, s := range append(t.servers(), l.Self) {
+				cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				if err := l.call(cctx, s, CallStandbysGone, GoneRequest{Server: rec.Server, Clear: true}, nil); err != nil {
+					l.Log.Debug("standby: taking a server back from the gone set", "to", s, "server", rec.Server, "error", err)
+				}
+				cancel()
+			}
+		}
 	}
 	_ = env.SetDetail(ctx, "")
 	l.audit(ctx, env, "standbyRebuilt", entry, audit.OutcomeSuccess, nil)
 	return l.publish(ctx)
+}
+
+// clearOldPrimaryAlerts resolves the alerts about the old primary of a group on a server once it is a standby.
+func (l *Leader) clearOldPrimaryAlerts(ctx context.Context, rec Record) {
+	subject := fmt.Sprintf("server:%s|group:%d", rec.Server, rec.Group)
+	err := l.Sys(ctx, func(c *pgx.Conn) error {
+		_, err := c.Exec(ctx, `UPDATE kingres_cp.alert SET cleared_at = now()
+			WHERE kind IN ('oldPrimaryRunning', 'oldPrimaryNotStopped', 'oldPrimaryNotRebuilt') AND subject = $1 AND cleared_at IS NULL`, subject)
+		return err
+	})
+	if err != nil {
+		l.Log.Warn("standby: clearing the alerts about an old primary", "subject", subject, "error", err)
+	}
+}
+
+// catalogTerm reads the term of the catalog of the system database: the term a rebuild of an old primary asks under.
+func (l *Leader) catalogTerm(ctx context.Context) (int64, error) {
+	c, err := l.ServiceConn(ctx, sysdb.Database)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	var term int64
+	if err := c.QueryRow(ctx, `SELECT term FROM kingres.catalog_status`).Scan(&term); err != nil {
+		return 0, fmt.Errorf("standby: reading the catalog term: %w", err)
+	}
+	return term, nil
+}
+
+// watchOldPrimaries looks at the records of old primaries that wait to be rebuilt (diverged, not ready), once per check:
+// it notes that the server does not answer (and that it does again), removes the record of a server that has been
+// silent for ReplaceAfter (the standby of the group is then made on another server by the ordinary reconcile; the
+// order of the removal is the one of sequence 8, in removeStandby), and raises or clears oldPrimaryNotRebuilt
+// (design 6.5). The alert comes after the shorter of ten minutes and half of ReplaceAfter, from the creation of the
+// record: the server is silent, or it answers and the rebuild does not succeed.
+func (l *Leader) watchOldPrimaries(ctx context.Context, recs []Record, statuses map[string]Status) {
+	alertAfter := min(10*time.Minute, l.ReplaceAfter/2)
+	now := time.Now()
+	conds := map[string][]monitor.Condition{} // by server
+	for _, r := range recs {
+		if !r.Diverged || r.State == stateReady || r.State == stateRemoving {
+			continue
+		}
+		// A server answers when the leader's liveness view does not call it dead (Dead); without that view, when its status was read.
+		_, answers := statuses[r.Server]
+		if l.Dead != nil {
+			answers = !l.Dead(r.Server)
+		}
+		switch {
+		case !answers && r.WaitingSince == nil:
+			if err := l.st.setWaiting(ctx, r.ID, true); err != nil {
+				l.Log.Debug("standby: noting that a server does not answer", "server", r.Server, "error", err)
+			}
+		case answers && r.WaitingSince != nil:
+			if err := l.st.setWaiting(ctx, r.ID, false); err != nil {
+				l.Log.Debug("standby: noting that a server answers again", "server", r.Server, "error", err)
+			}
+		}
+		if !answers && r.WaitingSince != nil && now.Sub(*r.WaitingSince) >= l.ReplaceAfter {
+			l.Log.Warn("standby: the server of an old primary has not answered for the replace-after time; its record is removed and a replacement is made elsewhere",
+				"standby", r.ID, "group", r.Group, "server", r.Server, "after", l.ReplaceAfter)
+			if err := l.st.markRemoving(ctx, r.ID); err != nil {
+				l.Log.Warn("standby: removing the record of an old primary that does not return", "standby", r.ID, "error", err)
+			}
+			continue
+		}
+		if now.Sub(r.CreatedAt) >= alertAfter {
+			why := "The server does not answer."
+			if answers {
+				why = "The server answers, and the rebuild did not succeed yet."
+			}
+			conds[r.Server] = append(conds[r.Server], monitor.Condition{Kind: "oldPrimaryNotRebuilt", Severity: "warning",
+				Subject: fmt.Sprintf("server:%s|group:%d", r.Server, r.Group),
+				Message: fmt.Sprintf("The old primary of shard group %d on server %s has not been turned into a standby %s after the failover. %s", r.Group, r.Server, now.Sub(r.CreatedAt).Round(time.Second), why)})
+		}
+	}
+	l.mu.Lock()
+	servers := map[string]bool{}
+	for s := range l.alertedOld {
+		servers[s] = true
+	}
+	for s := range conds {
+		servers[s] = true
+	}
+	l.alertedOld = map[string]bool{}
+	for s := range conds {
+		l.alertedOld[s] = true
+	}
+	l.mu.Unlock()
+	if len(servers) == 0 {
+		return
+	}
+	c, err := l.ServiceConn(ctx, sysdb.Database)
+	if err != nil {
+		return
+	}
+	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	for s := range servers {
+		if err := monitor.ReconcileScope(ctx, c, "server:"+s, conds[s], map[string]bool{"oldPrimaryNotRebuilt": true}, now); err != nil {
+			l.Log.Warn("standby: updating the alert of an old primary that is not rebuilt", "server", s, "error", err)
+		}
+	}
 }
 
 func (l *Leader) groupOf(ctx context.Context, id int32) (groupInfo, error) {

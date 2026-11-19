@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -22,6 +23,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ha"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/lease"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/monitor"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/peerclient"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/setup"
 )
@@ -60,6 +62,14 @@ func startLeases(d *haDeps) error {
 			li, ok := d.Svc.PrimaryOf(g)
 			return localInstance{d.Svc, li.ID}, ok
 		},
+		// An instance that may serve a group and cannot be attributed to it is stopped by a fence of the group (F2-06).
+		Unattributed: func(g int32) []lease.Instance {
+			var out []lease.Instance
+			for _, li := range d.Svc.Unattributed(g) {
+				out = append(out, localInstance{d.Svc, li.ID})
+			}
+			return out
+		},
 		// Self-fencing is enforced only for a group that has a standby: with none,
 		// nothing could be promoted, and stopping the only copy would only cost
 		// availability. The standby manager answers from local knowledge.
@@ -74,6 +84,35 @@ func startLeases(d *haDeps) error {
 		return err
 	}
 	d.Registry.SetLeases(mgr)
+	if d.Standby != nil {
+		f := leaseConditions(d)
+		d.Standby.leaseProbe.Store(&f)
+		// The old primary of a group is turned into a standby only when this server proves, from what only it knows, that
+		// nothing may run on it any more (design 6.2; internal/standby/oldprimary.go): it does not hold the lease of the
+		// group and is not adopting it, and a marker of a hand-over, a fence or a wait is on disk. After it is a standby the
+		// markers and the lease manager's memory of it are cleared.
+		d.Standby.agent.FormerPrimary = formerPrimaryProof(mgr)
+		d.Standby.agent.BecameStandby = func(group int32, id int) {
+			leaseFile := ""
+			if dir, err := d.Svc.Manager().Dir(id); err == nil {
+				leaseFile = filepath.Join(dir, "lease.json")
+			}
+			if err := mgr.BecameStandby(group, leaseFile); err != nil {
+				d.Log.Warn("clearing the markers of an old primary that became a standby", "group", group, "error", err)
+			}
+		}
+	}
+	if d.Ops != nil {
+		// A stop or restart of an enforced primary is not run on a record that cannot be written (F2-09).
+		d.Ops.EnforcedPrimary = func() bool {
+			for _, li := range d.Svc.WritableInstances() {
+				if d.Fault.ForceEnforce() || d.Registry.Standbys().HasStandby(li.Role.Group) {
+					return true
+				}
+			}
+			return false
+		}
+	}
 	d.LeaseMgr = mgr
 
 	d.Calls.Register("POST /lease/grant", func(_ context.Context, peer string, body []byte) (any, error) {
@@ -112,6 +151,8 @@ func startLeases(d *haDeps) error {
 
 	d.WG.Add(1)
 	go func() { defer d.WG.Done(); mgr.Run(d.BG) }()
+	d.WG.Add(1)
+	go fenceStandbyPrimaries(d)
 	return nil
 }
 
@@ -369,5 +410,145 @@ func (w *watchdogRunner) kill() {
 	select {
 	case <-exited:
 	case <-time.After(2 * time.Second):
+	}
+}
+
+// leaseConditions are the conditions the lease manager of this server raises through the monitor:
+//   - oldPrimaryNotStopped: a primary whose fence could not stop it (the stop is repeated every lease.FenceRetry, F2-05);
+//   - oldPrimaryRunning: an instance that runs as a primary (its role file says primary, it takes writes) on a port the
+//     catalog calls a standby, while this server does not hold the lease of the group (design 6.1: the marker logic
+//     failed, or an operator removed it). The same condition must hold for two rounds in a row, so that the moments
+//     between a promotion and the catalog that follows it raise nothing.
+//
+// A kind is evaluated only while something is raised or was raised, so that it is cleared when its cause is gone and is
+// not cleared under the failover task's own alert of the same kind on a server that never had the condition.
+func leaseConditions(d *haDeps) func(ctx context.Context, now time.Time) ([]monitor.Condition, map[string]bool) {
+	var raisedStop, raisedRun bool
+	seen := map[int32]int{}
+	return func(ctx context.Context, _ time.Time) ([]monitor.Condition, map[string]bool) {
+		if d.LeaseMgr == nil {
+			return nil, nil
+		}
+		evaluated := map[string]bool{}
+		var conds []monitor.Condition
+		for _, g := range d.LeaseMgr.FenceFailures() {
+			conds = append(conds, monitor.Condition{Kind: "oldPrimaryNotStopped", Severity: "critical", Subject: fmt.Sprintf("server:%s|group:%d", d.ServerHost, g),
+				Message: fmt.Sprintf("The primary of shard group %d on %s could not be stopped after its lease was lost; the stop is tried again every few seconds.", g, d.ServerHost)})
+		}
+		if len(conds) > 0 || raisedStop {
+			evaluated["oldPrimaryNotStopped"] = true
+		}
+		raisedStop = len(conds) > 0
+		running := runningStandbyPrimaries(ctx, d)
+		next := map[int32]int{}
+		var runConds []monitor.Condition
+		for _, g := range running {
+			next[g] = seen[g] + 1
+			if next[g] >= 2 {
+				runConds = append(runConds, monitor.Condition{Kind: "oldPrimaryRunning", Severity: "critical", Subject: fmt.Sprintf("server:%s|group:%d", d.ServerHost, g),
+					Message: fmt.Sprintf("An instance of %s runs as a primary of shard group %d, which the catalog calls a standby, and this server does not hold the lease of the group.", d.ServerHost, g)})
+			}
+		}
+		seen = next
+		if len(runConds) > 0 || raisedRun {
+			evaluated["oldPrimaryRunning"] = true
+		}
+		raisedRun = len(runConds) > 0
+		conds = append(conds, runConds...)
+		if len(evaluated) == 0 {
+			return nil, nil
+		}
+		return conds, evaluated
+	}
+}
+
+// runningStandbyPrimaries lists the groups of the instances of this server that run as primaries (their role file says
+// so) on a port the catalog gives to a standby node, and whose lease this server does not hold.
+func runningStandbyPrimaries(ctx context.Context, d *haDeps) []int32 {
+	var candidates []cluster.LocalInstance
+	for _, li := range d.Svc.WritableInstances() {
+		if up, err := d.Svc.Manager().Running(ctx, li.ID); err == nil && up && li.Role.Group >= 0 && !d.Registry.Leases().Holds(li.Role.Group) {
+			candidates = append(candidates, li)
+		}
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	conn, err := d.Svc.SystemConn(ctx)
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+	rows, err := conn.Query(ctx, `SELECT port, role FROM kingres.node WHERE host = $1`, d.ServerHost)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	role := map[int]string{}
+	for rows.Next() {
+		var port int
+		var r string
+		if rows.Scan(&port, &r) == nil {
+			role[port] = r
+		}
+	}
+	var out []int32
+	for _, li := range candidates {
+		if role[li.Port] == "standby" {
+			out = append(out, li.Role.Group)
+		}
+	}
+	return out
+}
+
+// fenceStandbyPrimaries stops an instance that runs as a primary (its role file says so) on a port that the catalog calls a
+// standby, while this server does not hold the lease of its group: the old primary of a failover whose server had no
+// working kingresd and no watchdog when the failover ran (design 6.1, test T11c), or a promoted instance whose kingresd
+// restarted before the catalog followed. The lease manager judges only the groups the catalog names this server the
+// primary of, so nothing else would stop it. The same reading must hold twice in a row (two seconds apart) before the
+// instance is fenced, and a lease that this server holds, or is adopting, protects it.
+func fenceStandbyPrimaries(d *haDeps) {
+	defer d.WG.Done()
+	seen := map[int32]int{}
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-d.BG.Done():
+			return
+		case <-t.C:
+		}
+		ctx, cancel := context.WithTimeout(d.BG, 30*time.Second)
+		next := map[int32]int{}
+		for _, g := range runningStandbyPrimaries(ctx, d) {
+			next[g] = seen[g] + 1
+			if _, _, adopted := d.LeaseMgr.Adopted(g); adopted || next[g] < 2 {
+				continue
+			}
+			d.Log.Error("an instance runs as the primary of a shard group that the catalog calls a standby, and this server does not hold the lease of the group: it is fenced", "group", g)
+			if err := d.LeaseMgr.Fence(ctx, g); err != nil {
+				d.Log.Error("fencing an old primary that runs", "group", g, "error", err)
+			}
+		}
+		seen = next
+		cancel()
+	}
+}
+
+// formerPrimaryProof is what the lease manager of this server can say before the directory of a former primary is
+// rebuilt as a standby: this server does not hold the lease of the group and is not adopting it, and a marker of a
+// hand-over, a fence or a wait is on disk (the primary was told not to run, by the product).
+func formerPrimaryProof(mgr *lease.Manager) func(group int32) error {
+	return func(group int32) error {
+		if mgr.Holds(group) {
+			return errors.New("this server holds the lease of the group")
+		}
+		if _, _, adopted := mgr.Adopted(group); adopted {
+			return errors.New("this server is adopting the lease of the group")
+		}
+		if !mgr.HeldBack(group) {
+			return errors.New("nothing on disk says that the primary of the group was fenced, handed over or kept waiting for the lease")
+		}
+		return nil
 	}
 }

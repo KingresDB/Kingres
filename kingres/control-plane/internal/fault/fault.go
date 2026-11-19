@@ -55,6 +55,9 @@ type Spec struct {
 	// to end the leader at a step boundary. TaskExitStep -1 means any step.
 	TaskExitPoint string `json:"taskExitPoint,omitempty"`
 	TaskExitStep  int    `json:"taskExitStep,omitempty"`
+	// FailRewind makes the rebuild of an old primary treat pg_rewind as failed, so that the fallback (a new base backup)
+	// is taken (the test of the old primary that comes back).
+	FailRewind bool `json:"failRewind,omitempty"`
 	// LedgerExitKind ends this process (as a kill does) at the write of the ledger publication of that kind ("tile", "frontier", "pending",
 	// "checkpoint", "note", "state", "retired", "digest", "log"), after LedgerExitSkip writes of that kind since the fault was read: the tests of the
 	// collector use it to cut a round at each of its writes.
@@ -129,6 +132,11 @@ func (h *Hook) ClockOffset() time.Duration {
 // (a test stand-in for "the group has a standby").
 func (h *Hook) ForceEnforce() bool {
 	return h != nil && h.load().ForceEnforce
+}
+
+// RewindFails says that pg_rewind of an old primary must be treated as failed (FailRewind).
+func (h *Hook) RewindFails() bool {
+	return h != nil && h.load().FailRewind
 }
 
 // DirectoryDelay is the pause of DirectoryDelayMs.

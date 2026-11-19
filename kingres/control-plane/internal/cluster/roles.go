@@ -5,6 +5,7 @@ package cluster
 import (
 	"context"
 	"errors"
+	"slices"
 	"sort"
 
 	"github.com/jackc/pgx/v5"
@@ -107,6 +108,38 @@ func (s *Service) PrimaryOf(group int32) (LocalInstance, bool) {
 	return LocalInstance{}, false
 }
 
+// Unattributed lists the instances of this server that may be the primary of the group and that PrimaryOf cannot name
+// (F2-06): a directory whose role file cannot be read (it may be a primary), two directories that claim the group, and
+// a primary whose role file names another group than the catalog gives for its port. The lease must fail closed for
+// them: the start gate holds them, the first fence of the group stops them, and a hand-over of the group's lease is
+// refused while one runs. Only the groups the catalog names this server the primary of are judged (the catalog is read
+// by SyncRoles); an instance is looked for by the port of the catalog's row.
+func (s *Service) Unattributed(group int32) []LocalInstance {
+	s.mu.Lock()
+	ports := append([]int(nil), s.catalogPrimaries[group]...)
+	s.mu.Unlock()
+	if len(ports) == 0 {
+		return nil
+	}
+	var out, claims []LocalInstance
+	for _, li := range s.LocalInstances() {
+		switch {
+		case li.Role.Role == instance.RoleUnknown:
+			if li.Port == 0 || slices.Contains(ports, li.Port) {
+				out = append(out, li)
+			}
+		case li.Role.Writable() && li.Role.Group == group:
+			claims = append(claims, li)
+		case li.Role.Writable() && li.Role.Group != group && li.Role.Group != instance.GroupUnknown && slices.Contains(ports, li.Port):
+			out = append(out, li)
+		}
+	}
+	if len(claims) > 1 {
+		out = append(out, claims...)
+	}
+	return out
+}
+
 // InstanceConn opens a service connection to the local instance with this id
 // (the home instance included).
 func (s *Service) InstanceConn(ctx context.Context, id int, db string) (*pgx.Conn, error) {
@@ -181,6 +214,15 @@ func (s *Service) SyncRoles(host string, rows []CatalogRow) []int {
 		return nil
 	}
 	var changed []int
+	prim := map[int32][]int{}
+	for _, r := range rows {
+		if r.Host == host && r.Role == "primary" {
+			prim[r.Group] = append(prim[r.Group], r.Port)
+		}
+	}
+	s.mu.Lock()
+	s.catalogPrimaries = prim
+	s.mu.Unlock()
 	for _, li := range s.LocalInstances() {
 		cur, exists, err := s.mgr.RoleOf(li.ID)
 		if err != nil {
@@ -314,8 +356,21 @@ func (s *Service) SystemInstance() LocalInstance {
 
 // GateInfo tells the start gate of the instance manager which group a directory
 // is the primary of: primary is false for a standby, which the lease never holds back. An instance whose role file
-// cannot be read is held back like a primary (it may be one).
+// cannot be read is held back like a primary (it may be one). A primary whose role file names another group than the
+// catalog gives for its port is judged as one of an unknown group (F2-06): any marker of any group holds it back.
 func (s *Service) GateInfo(id int) (group int32, primary bool) {
 	r := s.mgr.MustRole(id)
+	if r.Writable() && r.Group != instance.GroupUnknown {
+		if port := s.portOf(id); port != 0 {
+			s.mu.Lock()
+			for g, ps := range s.catalogPrimaries {
+				if g != r.Group && slices.Contains(ps, port) {
+					s.mu.Unlock()
+					return instance.GroupUnknown, true
+				}
+			}
+			s.mu.Unlock()
+		}
+	}
 	return r.Group, !r.IsStandby()
 }

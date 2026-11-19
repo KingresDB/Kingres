@@ -62,6 +62,10 @@ type Ops struct {
 	// server's instance act on (nil: instance 1 only, the layout of a server that never
 	// had a failover).
 	WritableIDs func() []int
+	// EnforcedPrimary tells whether this server runs the primary of a group that has a standby: a stop or restart of
+	// its instances is then never run on a record that could not be written (F2-09): the exclusion of a failover
+	// lives in that record. nil: no group is enforced.
+	EnforcedPrimary func() bool
 	// Recorder writes the tasks of instance start and stop (PeerRecorder on a
 	// server that may not be the leader); nil records in this server's own task
 	// engine.

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -33,6 +34,12 @@ type Record struct {
 	NeedsRebuild  bool
 	Generation    int64
 	CatalogNode   *int32
+	// Diverged says that the instance may hold writes the primary does not have (an old primary after a failover, a
+	// standby that is ahead of its new primary): it is rebuilt with pg_rewind, else a base backup. WaitingSince is when
+	// the leader first found its server silent (nil: it answers).
+	Diverged     bool
+	WaitingSince *time.Time
+	CreatedAt    time.Time
 }
 
 // Entry converts the record for the plan: Ready only while the standby is in the
@@ -46,11 +53,11 @@ func (r Record) Entry(primaryPort int) Entry {
 // SysFunc runs f with a service connection to the system database (the leader's).
 type SysFunc func(ctx context.Context, f func(c *pgx.Conn) error) error
 
-const recordCols = `standby_id, group_id, server_id, primary_server, instance_id, coalesce(port, 0), state, needs_rebuild, generation, catalog_node_id`
+const recordCols = `standby_id, group_id, server_id, primary_server, instance_id, coalesce(port, 0), state, needs_rebuild, generation, catalog_node_id, diverged, waiting_since, created_at`
 
 func scanRecord(r pgx.Row) (Record, error) {
 	var x Record
-	err := r.Scan(&x.ID, &x.Group, &x.Server, &x.PrimaryServer, &x.InstanceID, &x.Port, &x.State, &x.NeedsRebuild, &x.Generation, &x.CatalogNode)
+	err := r.Scan(&x.ID, &x.Group, &x.Server, &x.PrimaryServer, &x.InstanceID, &x.Port, &x.State, &x.NeedsRebuild, &x.Generation, &x.CatalogNode, &x.Diverged, &x.WaitingSince, &x.CreatedAt)
 	return x, err
 }
 
@@ -120,7 +127,10 @@ func (s store) get(ctx context.Context, id int64) (Record, bool, error) {
 func (s store) setState(ctx context.Context, id int64, state string, port int) error {
 	return wrapErr("updating a standby record", s.sys(ctx, func(c *pgx.Conn) error {
 		_, err := c.Exec(ctx, `UPDATE kingres_cp.standby SET state = $2, port = CASE WHEN $3 > 0 THEN $3 ELSE port END,
-			needs_rebuild = CASE WHEN $2 = 'ready' THEN false ELSE needs_rebuild END, updated_at = now() WHERE standby_id = $1 AND state <> 'removing'`, id, state, port)
+			needs_rebuild = CASE WHEN $2 = 'ready' THEN false ELSE needs_rebuild END,
+			diverged = CASE WHEN $2 = 'ready' THEN false ELSE diverged END,
+			waiting_since = CASE WHEN $2 = 'ready' THEN NULL ELSE waiting_since END,
+			updated_at = now() WHERE standby_id = $1 AND state <> 'removing'`, id, state, port)
 		return err
 	}))
 }
@@ -194,6 +204,39 @@ func (r Record) catalogNode() int32 {
 func (s store) setCatalogNode(ctx context.Context, id int64, node int32) error {
 	return wrapErr("storing the catalog node of a standby", s.sys(ctx, func(c *pgx.Conn) error {
 		_, err := c.Exec(ctx, `UPDATE kingres_cp.standby SET catalog_node_id = nullif($2, 0), updated_at = now() WHERE standby_id = $1`, id, node)
+		return err
+	}))
+}
+
+// setWaiting marks, or unmarks, that the server of a standby that is not ready does not answer the leader: the time
+// is kept at the first check that finds it silent (the standby-replace-after rule counts from it) and cleared when
+// the server answers.
+func (s store) setWaiting(ctx context.Context, id int64, waiting bool) error {
+	return wrapErr("recording that a server does not answer", s.sys(ctx, func(c *pgx.Conn) error {
+		if waiting {
+			_, err := c.Exec(ctx, `UPDATE kingres_cp.standby SET waiting_since = coalesce(waiting_since, now()) WHERE standby_id = $1 AND waiting_since IS NULL`, id)
+			return err
+		}
+		_, err := c.Exec(ctx, `UPDATE kingres_cp.standby SET waiting_since = NULL WHERE standby_id = $1 AND waiting_since IS NOT NULL`, id)
+		return err
+	}))
+}
+
+// setInstance records the directory a standby turned out to be in (the old primary's: the failover did not know it).
+func (s store) setInstance(ctx context.Context, id int64, instanceID int) error {
+	return wrapErr("storing the instance of a standby", s.sys(ctx, func(c *pgx.Conn) error {
+		_, err := c.Exec(ctx, `UPDATE kingres_cp.standby SET instance_id = $2, updated_at = now() WHERE standby_id = $1 AND instance_id <> $2`, id, instanceID)
+		return err
+	}))
+}
+
+// recordOldPrimary stores what the rebuild of the old primary found and did in the newest failover row of the group
+// that names the server as its old server (the report reads it). A row of a run that is gone is not an error.
+func (s store) recordOldPrimary(ctx context.Context, group int32, server string, report []byte) error {
+	return wrapErr("storing the report of an old primary", s.sys(ctx, func(c *pgx.Conn) error {
+		_, err := c.Exec(ctx, `UPDATE kingres_cp.failover_group SET old_primary_report = $3::jsonb, old_primary = 'standby'
+			WHERE (task_id, group_id) = (SELECT task_id, group_id FROM kingres_cp.failover_group
+				WHERE group_id = $1 AND old_server = $2 ORDER BY task_id DESC LIMIT 1)`, group, server, string(report))
 		return err
 	}))
 }

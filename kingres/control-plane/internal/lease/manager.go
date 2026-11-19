@@ -75,6 +75,11 @@ type Config struct {
 	// Instance when set (after a failover a server runs primaries that are not
 	// instance 1). false: no instance of this server serves the group now.
 	InstanceFor func(group int32) (Instance, bool)
+	// Unattributed returns the instances that may be the primary of the group but that the role files cannot
+	// attribute to it (a role file that cannot be read, two directories claiming the group, a role file that names
+	// another group than the catalog): the lease fails closed for them (F2-06). A fence stops them, a hand-over of
+	// the lease is refused while one runs.
+	Unattributed func(group int32) []Instance
 	// Enforced tells whether losing the lease of the group stops the instance (a
 	// group with a standby). It is asked at the moment of the decision.
 	Enforced func(group int32) bool
@@ -149,6 +154,10 @@ type Manager struct {
 	// their primary (adopt.go); relinq the groups whose lease was given up and is not renewed.
 	adopted map[int32]*adoption
 	relinq  map[int32]bool
+	// ambWarned is when the warning about an unattributed instance of the group was last logged.
+	ambWarned map[int32]time.Duration
+	// fenceFail is the set of groups whose last fence could not stop an instance (the alert oldPrimaryNotStopped, F2-05).
+	fenceFail map[int32]bool
 }
 
 const (
@@ -245,6 +254,7 @@ func (m *Manager) Renew(ctx context.Context) {
 		m.rmu.Lock()
 		// The list was taken before the rounds began; a group that was released or handed over meanwhile is not
 		// asked for (F2-02). The check is made with the round lock held, which ReleaseGroup waits for.
+		m.warnUnattributed(g)
 		if m.mayRenew(g, t) {
 			m.round(ctx, g, t.Members)
 		}
@@ -374,6 +384,7 @@ func (m *Manager) round(ctx context.Context, group int32, members []string) {
 	valid := st.have && m.c.Clock.Mono() < st.validUntil-m.c.Margin
 	if ok && valid {
 		st.lost = false
+		delete(m.fenceFail, group) // the lease is held again: nothing to stop
 	}
 	m.mu.Unlock()
 	if !ok || !valid {
@@ -531,11 +542,18 @@ func (m *Manager) refence(ctx context.Context, group int32) {
 	if busy || !m.c.Enforced(group) {
 		return
 	}
-	inst, have := m.instance(group)
-	if !have {
-		return
+	var insts []Instance
+	if inst, have := m.instance(group); have {
+		insts = append(insts, inst)
 	}
-	if up, err := inst.Running(ctx); err == nil && !up {
+	insts = append(insts, m.unattributed(group)...)
+	anyUp := false
+	for _, inst := range insts {
+		if up, err := inst.Running(ctx); err != nil || up {
+			anyUp = true
+		}
+	}
+	if !anyUp {
 		return
 	}
 	if err := m.Fence(ctx, group); err != nil {
@@ -551,6 +569,13 @@ func (m *Manager) lose(ctx context.Context, group int32) {
 		// A lease that guards no instance (the fence holder of a failover, or the server that is
 		// about to promote a standby): there is nothing to stop and no marker to write.
 		m.c.Log.Warn("an adopted group lease was lost", "group", group, "kind", a.kind)
+		return
+	}
+	// Nothing runs here that the lease protects: no instance serves the group and none may be its primary. The group is
+	// still in the cached topology of a server whose old primary was rebuilt as a standby while its catalog could not be
+	// read; a marker written now would hold the next primary of the group back for ever.
+	if _, have := m.instance(group); !have && len(m.unattributed(group)) == 0 {
+		m.c.Log.Warn("a group lease was lost and no instance of this server serves the group: nothing to fence", "group", group)
 		return
 	}
 	enforced := m.c.Enforced(group)
@@ -577,24 +602,68 @@ func (m *Manager) Fence(ctx context.Context, group int32) error {
 	if err := pki.WriteFile(FencedPath(m.c.Dir, group), []byte("fenced\n"), 0o600); err != nil {
 		return fmt.Errorf("writing the fence marker: %w", err)
 	}
-	inst, have := m.instance(group)
-	if !have {
-		return nil // no instance of this server serves the group: the marker is all there is to do
+	// The instance that serves the group, and every instance that may (F2-06): all of them are stopped.
+	var insts []Instance
+	if inst, have := m.instance(group); have {
+		insts = append(insts, inst)
 	}
-	if up, err := inst.Running(ctx); err == nil && !up {
-		// Nothing runs that could be stopped: the marker keeps it from starting
-		// without a lease, and no stop is claimed in the audit log.
+	insts = append(insts, m.unattributed(group)...)
+	var first error
+	stopped := false
+	for _, inst := range insts {
+		if up, err := inst.Running(ctx); err == nil && !up {
+			// Nothing runs that could be stopped: the marker keeps it from starting
+			// without a lease, and no stop is claimed in the audit log.
+			continue
+		}
+		// The stop must not be cut short by the caller's context: a fence that
+		// does not happen is the failure the whole protocol exists to prevent.
+		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		err := inst.StopImmediate(sctx)
+		cancel()
+		if err != nil {
+			if first == nil {
+				first = fmt.Errorf("stopping the primary: %w", err)
+			}
+			continue
+		}
+		stopped = true
+	}
+	if stopped {
+		m.audit(ctx, AuditLeaseFenced, group, "the primary instance was stopped with an immediate shutdown")
+	}
+	m.mu.Lock()
+	if first != nil {
+		if m.fenceFail == nil {
+			m.fenceFail = map[int32]bool{}
+		}
+		m.fenceFail[group] = true
+	} else {
+		delete(m.fenceFail, group)
+	}
+	m.mu.Unlock()
+	return first
+}
+
+// FenceFailures lists the groups whose instance a fence could not stop and whose lease has not been won again since
+// (the alert oldPrimaryNotStopped; the stop is repeated every FenceRetry).
+func (m *Manager) FenceFailures() []int32 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []int32
+	for g := range m.fenceFail {
+		out = append(out, g)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+// unattributed is Config.Unattributed, nil-safe.
+func (m *Manager) unattributed(group int32) []Instance {
+	if m.c.Unattributed == nil {
 		return nil
 	}
-	// The stop must not be cut short by the caller's context: a fence that
-	// does not happen is the failure the whole protocol exists to prevent.
-	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-	defer cancel()
-	if err := inst.StopImmediate(sctx); err != nil {
-		return fmt.Errorf("stopping the primary: %w", err)
-	}
-	m.audit(ctx, AuditLeaseFenced, group, "the primary instance was stopped with an immediate shutdown")
-	return nil
+	return m.c.Unattributed(group)
 }
 
 func (m *Manager) audit(ctx context.Context, action string, group int32, detail string) {
@@ -762,4 +831,25 @@ func (m *Manager) adoptionOf(group int32) *adoption {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.adopted[group]
+}
+
+// warnUnattributed logs, once a minute per group, an instance that may be the primary of the group and that the role
+// files cannot attribute to it (F2-06). The alert kinds of the contract have none for it; the log line is what there is.
+func (m *Manager) warnUnattributed(group int32) {
+	if m.c.Unattributed == nil || len(m.c.Unattributed(group)) == 0 {
+		return
+	}
+	now := m.c.Clock.Mono()
+	m.mu.Lock()
+	last, seen := m.ambWarned[group]
+	if seen && now-last < time.Minute {
+		m.mu.Unlock()
+		return
+	}
+	if m.ambWarned == nil {
+		m.ambWarned = map[int32]time.Duration{}
+	}
+	m.ambWarned[group] = now
+	m.mu.Unlock()
+	m.c.Log.Error("an instance of this server may be the primary of the group and cannot be attributed to it by its role file: it is held by the start gate, stopped by a fence and counted as running by a hand-over of the lease", "group", group)
 }

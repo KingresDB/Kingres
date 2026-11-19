@@ -57,6 +57,11 @@ const (
 	// certificate and is refused once the server is clustered unless the
 	// caller is the leader.
 	LeaderOrJoining
+	// LeaderOrHeldBack: the leader, and also, while this server's instance is held back (so that it cannot read its
+	// catalog and does not know the leader), the server that the other members name as the leader. The old primary of a
+	// failover is in that state when it is rebuilt: its instance is stopped and may not start before it is a standby, and
+	// the leader has to be able to tell it so. The call proves what it needs itself (the rebuild of an old primary does).
+	LeaderOrHeldBack
 	// Bootstrap: no client certificate. The first contact of a join, before
 	// the two sides share a CA: authenticated by the new server's setup token
 	// or by administrator credentials, over TLS whose certificate the caller
@@ -125,11 +130,11 @@ var Calls = map[string]Policy{
 	"POST /heartbeat":       AnyPeer,
 	"POST /lease/grant":     AnyPeer,
 	"GET /lease/state":      AnyPeer,
-	"POST /standby/plan":    LeaderOnly,
+	"POST /standby/plan":    LeaderOrHeldBack,
 	"POST /standby/create":  LeaderOnly,
 	"POST /standby/remove":  LeaderOnly,
-	"POST /standby/rebuild": LeaderOnly,
-	"GET /standby/status":   LeaderOnly,
+	"POST /standby/rebuild": LeaderOrHeldBack,
+	"GET /standby/status":   LeaderOrHeldBack,
 
 	// The read calls and the freeze of the failover (internal-api.md, "Failover groundwork").
 	"GET /failover/position":       AnyPeer,
@@ -352,6 +357,10 @@ type Backend struct {
 	// know the leader (nil: never). Such a server answers 503 service_unavailable with Retry-After,
 	// not 403 not_leader, and task steps wait for it.
 	Unavailable func() bool
+	// PeerLeader asks the other members of the cluster who the manager leader is, for a server that cannot read its own
+	// catalog (nil: it cannot); "" when they do not agree or do not answer. Only the calls of policy LeaderOrHeldBack
+	// use it, and only while the server is held back.
+	PeerLeader func(ctx context.Context) string
 	// Fault is the fault-injection hook of the tests (nil in production): a call from
 	// a blocked peer is dropped without an answer.
 	Fault *fault.Hook
@@ -454,18 +463,28 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if policy == LeaderOnly || policy == LeaderOrJoining {
+	if policy == LeaderOnly || policy == LeaderOrJoining || policy == LeaderOrHeldBack {
 		joining := policy == LeaderOrJoining && s.be.Joining != nil && s.be.Joining()
+		heldBack := policy == LeaderOrHeldBack && s.be.PeerLeader != nil && s.notReady(r.Context())
 		// A joining server has no catalog and knows no leader: it is not asked (and not waited for).
 		if !joining {
-			if s.notReady(r.Context()) {
+			if heldBack {
+				// This server cannot read its catalog: the other members tell who the leader is. Without an answer it is
+				// "not yet", as for every other leader call.
+				if l := s.be.PeerLeader(r.Context()); l == "" || l != peer {
+					failNotReady(w)
+					return
+				}
+			} else if s.notReady(r.Context()) {
 				failNotReady(w)
 				return
 			}
-			if l := s.leader(r.Context()); l == "" || l != peer {
-				s.log.Warn("internal call refused", "reason", "not the leader", "call", key, "peer", peer)
-				fail(w, http.StatusForbidden, "not_leader", "Only the manager leader may make this call.")
-				return
+			if !heldBack {
+				if l := s.leader(r.Context()); l == "" || l != peer {
+					s.log.Warn("internal call refused", "reason", "not the leader", "call", key, "peer", peer)
+					fail(w, http.StatusForbidden, "not_leader", "Only the manager leader may make this call.")
+					return
+				}
 			}
 			// The caller is the leader: the task run it makes the call for is fenced.
 			if hdr := r.Header.Get(fence.Header); hdr != "" && s.be.Fence != nil {

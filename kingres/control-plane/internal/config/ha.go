@@ -37,8 +37,13 @@ type HAConfig struct {
 	// SlotWarnBytes and SlotLimitBytes are the WAL a physical slot may retain
 	// before an alert is raised and before the slot is dropped.
 	StandbySyncGrace time.Duration
-	SlotWarnBytes    int64
-	SlotLimitBytes   int64
+	// StandbyReplaceAfter is how long the record of an old primary that is waiting to be rebuilt (its server does not
+	// answer) counts as a planned standby; after it the record is removed and the ordinary reconcile places a
+	// replacement on another server (design 6.5). The alert oldPrimaryNotRebuilt comes at the shorter of ten minutes
+	// and half of it.
+	StandbyReplaceAfter time.Duration
+	SlotWarnBytes       int64
+	SlotLimitBytes      int64
 	// StandbyPortBase is the first port tried for a new standby instance (0: the
 	// server's pg-port plus 1000). It is kept away from pg-port + 1, which on a
 	// machine that runs several servers is the next server's port that is not bound yet.
@@ -67,7 +72,7 @@ func DefaultHA() HAConfig {
 	return HAConfig{
 		HeartbeatInterval: time.Second, SuspectTimeout: 5 * time.Second, FailureTimeout: 10 * time.Second, LeaderLossBound: 30 * time.Second,
 		LeaseDuration: 10 * time.Second, LeaseRenew: 2 * time.Second, LeaseMargin: 3 * time.Second,
-		StandbySyncGrace: 30 * time.Second, SlotWarnBytes: 1 << 30, SlotLimitBytes: 4 << 30,
+		StandbySyncGrace: 30 * time.Second, StandbyReplaceAfter: 30 * time.Minute, SlotWarnBytes: 1 << 30, SlotLimitBytes: 4 << 30,
 		ClientMaxConnections: 1000, ClientConnectTimeout: 5 * time.Second, ClientIdleTimeout: time.Hour,
 	}
 }
@@ -84,6 +89,9 @@ func (h HAConfig) validate() error {
 		errs = append(errs, errors.New("lease-margin must be shorter than lease-duration"))
 	} else if h.LeaseRenew*2 > h.LeaseDuration-h.LeaseMargin {
 		errs = append(errs, errors.New("lease-renew must be at most half of lease-duration minus lease-margin"))
+	}
+	if h.StandbyReplaceAfter <= 0 {
+		errs = append(errs, errors.New("standby-replace-after must be positive"))
 	}
 	if h.SlotWarnBytes > h.SlotLimitBytes {
 		errs = append(errs, errors.New("slot-retention-warn-bytes must not exceed slot-retention-limit-bytes"))
@@ -131,6 +139,8 @@ func init() {
 			apply: dur(func(c *Config) *time.Duration { return &c.HA.LeaseMargin })},
 		setting{key: "standby-sync-grace", env: "KINGRES_STANDBY_SYNC_GRACE", usage: "how long the last streaming standby may be unreachable before the group stops waiting for it (default 30s)",
 			apply: dur(func(c *Config) *time.Duration { return &c.HA.StandbySyncGrace })},
+		setting{key: "standby-replace-after", env: "KINGRES_STANDBY_REPLACE_AFTER", usage: "how long an old primary that cannot be reached counts as a planned standby before a replacement is made on another server (default 30m)",
+			apply: dur(func(c *Config) *time.Duration { return &c.HA.StandbyReplaceAfter })},
 		setting{key: "slot-retention-warn-bytes", env: "KINGRES_SLOT_RETENTION_WARN_BYTES", usage: "WAL a standby's slot may retain before an alert is raised (default 1073741824)",
 			apply: integer(func(c *Config) *int64 { return &c.HA.SlotWarnBytes }, 1)},
 		setting{key: "standby-port-base", env: "KINGRES_STANDBY_PORT_BASE", usage: "first port tried for a new standby instance (default: pg-port plus 1000)",

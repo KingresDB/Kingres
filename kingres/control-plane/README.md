@@ -2022,7 +2022,7 @@ What exists (design `ha-phase5.md`, "Fencing by lease"; code in `internal/lease`
   only durations travel (the request carries `durationMs`, the refusal `waitMs`).
 - **Fencing.** The holder acts on a lease only until `lease-duration` minus `lease-margin` after the round start
   (`Holds`). A check every 100 ms (`lease.Manager.Check`) fences when that time has passed without a successful round:
-  it writes the **fence marker** `<data-dir>/lease/fenced`, then stops the instance with `pg_ctl stop -m immediate`
+  it writes the **fence marker** of the group (`<data-dir>/lease/fenced.<group>`), then stops the instance with `pg_ctl stop -m immediate`
   (no checkpoint, no waiting for clients), and audits `leaseLost` and `leaseFenced`. While the marker exists the instance
   manager's start gate refuses to start the instance (`instance.ErrLeaseRequired`: the instance start operations fail,
   the start at kingresd's own start is skipped with a warning; decision 7 adds the wait marker for a cold start). The next successful round removes the marker, starts
@@ -2032,7 +2032,7 @@ What exists (design `ha-phase5.md`, "Fencing by lease"; code in `internal/lease`
   manager answers `Standbys().HasStandby(group)` from local knowledge). For a group without a standby nothing could be
   promoted, so stopping the only copy would cost availability and buy nothing: the lease is still acquired, renewed and
   reported, and its loss raises the alert `leaseLost` (critical, subject `server:<id>|group:<n>`) and the audit event
-  `leaseLost`, without stopping the instance. A one-server cluster has one member and a majority of one: it grants itself
+  `leaseLost`, without stopping the instance for a lapsed lease (only a `kingresd` that stopped running, through the watchdog file that is refreshed by a loop of its own, F2-07). A one-server cluster has one member and a majority of one: it grants itself
   its lease.
 - **Watchdog.** `kingres-watchdog` (standard library only, about 90 lines) covers a dead or hung `kingresd` next to a
   live primary. For an enforced group kingresd starts it after the first successful round, detached in its own session
@@ -2223,6 +2223,7 @@ setting is `replica.default` in `kingres_cp.cluster_setting`, ADR 0011).
 | Key | Default | Meaning |
 |---|---|---|
 | `standby-sync-grace` | `30s` | how long no standby may stream before the group stops waiting for it |
+| `standby-replace-after` | `30m` | how long the record of an old primary whose server does not answer counts as a planned standby before a replacement is made on another server |
 | `slot-retention-warn-bytes` | `1073741824` | WAL a standby's slot may retain before `replicationLagHigh` is raised |
 | `slot-retention-limit-bytes` | `4294967296` | WAL a standby's slot may retain before it is dropped and the standby rebuilt |
 | `standby-port-base` | `pg-port + 1000` | first port tried for a new standby instance (the first free one from there is used and recorded) |
@@ -2764,7 +2765,7 @@ Separate from the increments above (own files and tests; see the report of the w
   `RoleUnknown` for a role file that cannot be read (not writable, not a standby, not a copy; the start gate holds it like a primary). The
   standby agent deletes, rebuilds or rewinds a directory only when `provedStandby` says so: a valid role file that says standby, and
   `pg_is_in_recovery` when it runs or `standby.signal` when it does not (an unfinished copy without a meta file is thrown away unless its role file says
-  something else or it runs outside recovery). The refusal is `ErrNotProvedStandby` (409 `not_a_standby`). `Service.PrimaryOf` answers nothing
+  something else or it runs outside recovery). The refusal is `ErrNotProvedStandby` (409 `not_a_standby`). `Service.PrimaryOf` answers nothing (that is not a protection of either directory; F2-06 below makes the lease fail closed for them)
   when two directories claim one group. Removing the instances of a server that is removed or reset (`RemoveInstance`) is the server's own removal
   and is not guarded. Increment 3 writes the role file before `pg_promote`.
 - **FO-02.** `SyncState.Decide` never changes the list of a frozen group, also when no name is planned.
@@ -2813,7 +2814,7 @@ read as "the call did not finish": the step asks the callee for its state and th
 | `Make the catalog follow` | `kingres.promote_node` repeated by the README rules of the extension (`promote.go`: 10 calls, 15 minutes, the answers by SQLSTATE; `KS007` only after a probe, `KS014` and `KS012` ask the operator, `KS009` for the new primary re-applies the empty list). |
 | `Check the catalog` | Reads the result back (a success of `promote_node` is not proof for a node that went silent at the end): the new node is the primary, the old one is not, the term rose; repeats the call once, then pauses. Stops an old primary that is still running (`oldPrimaryRunning`). |
 | `Point the other standbys at the new primary` | `POST /standby/repoint` per standby (slot on the new primary, `primary_conninfo`, wait for the walreceiver); a standby that does not stream is flagged for a rebuild. |
-| `Update the standby records` | One transaction that proves the lease of the run: the record of the promoted standby is deleted, the others follow the new primary; the plan is sent. The old primary's record is **not** inserted: its return is the next increment. |
+| `Update the standby records` | One transaction that proves the lease of the run: the record of the promoted standby is deleted, the others follow the new primary, the old primary is inserted as a standby that waits for its rebuild (increment 4, below); the plan is sent. |
 | `Check synchronous_standby_names`, `Resolve prepared transactions`, `Check that clients arrive` | Waits (bounded) that never fail the task; `recover_prepared_transactions()` and `check_cluster()` on the map group primary, incidents into the report, the alert `failoverDataLoss`. |
 | `Lift the freeze`, `Write the report` | Unfreeze, group `done`, the run's outcome. |
 
@@ -2833,7 +2834,68 @@ known position of the old primary" of the report and the base of the verdict.
 - A failover is refused while a rebalance is pending or running (`rebalance_in_progress`): this increment does not stop it for the operator.
 - `recover_prepared_transactions()` runs on the map group primary and on the promoted instance (`POST /failover/prepared`).
 - Not done in this increment: a rollback of a failover that was cancelled after the old primary was stopped (not offered), the
-  rebuild of the old primary (the record is not inserted; its instance stays stopped and fenced).
+  rebuild of the old primary (done in increment 4, below).
+
+## The old primary after a failover (increment 4 of ha-phase5-part2.md)
+
+After a failover the old primary becomes a standby of the new primary, by itself when its server returns, and a replacement is made when it does
+not. Still refused with `422 unsupported_operation`: `mode: graceful`, the map group, `restorePreferredPrimaries`, automatic failover.
+Code: `internal/standby/oldprimary.go` (the proof, the order of the rebuild, the divergence), `internal/standby/leader.go` (`watchOldPrimaries`, the
+routing of a `diverged` record to a rebuild, the ring), `internal/instance` (`Rewind`, `RewindDryRun`, `RebaseStandby`, the mark of an unfinished copy),
+`internal/lease` (`HeldBack`, `BecameStandby`), `internal/failover` (the record of the old primary in `records`, the live state in the report),
+migration 0015, `cmd/kingresd/ha_leases.go` (the hooks, the alerts, `fenceStandbyPrimaries`).
+
+**The record.** The step `Update the standby records` also inserts, in the same transaction, the old primary as a standby of the new one: state
+`rebuilding`, `diverged`, generation 1, the directory of its instance when its server answered (else 0: the server finds the directory by its role
+file and the answer of the rebuild says which), the port of its catalog node. The catalog row is the one the extension kept (role `standby`
+after `promote_node`); the registration step reads it back when the standby is ready. The report's `oldPrimary.state` is read live: `rebuildScheduled`
+(before the first try), `rebuilding` (the standby task runs), `waitingForServer` (its server does not answer the leader), `standby` (rebuilt),
+`removed` (the record is gone: the replace-after rule or the removal of the server). `method`, `divergenceBytes`, `rewindBytes` and `message` come
+from the answer of the rebuild (`failover_group.old_primary_report`, migration 0015).
+
+**The rebuild** (`POST /standby/rebuild` with `diverged` and the catalog `term`). The directory of the old primary is a primary on disk; the server
+touches it only when it proves the following: the role file says primary of exactly this group, the instance is stopped, the lease of the group is not this
+server's and is not being adopted, a marker of a hand-over, a fence or a wait is on disk, the plan names another server as the primary of the group, and
+the term is newer than the one in the role file. Then, in an order that survives a crash at every point: (1) the mark `kingres-copy-unfinished` (with its
+step) and the role file `standby, copy` are written; the slot on the new primary is made; (2) `pg_rewind --dry-run --progress` measures the divergence (where
+the histories parted, the bytes it would copy; the shutdown checkpoint that its crash recovery leaves is the end of the old WAL, so
+`divergenceBytes` is the end of the old WAL minus the divergence point); (3) `pg_rewind` (it finishes the crash recovery of a primary that was fenced with an
+immediate stop); (4) when it fails (the fault flag `failRewind` makes it fail in the tests), the data directory is replaced by a base backup of the new
+primary into the same directory (`RebaseStandby`: marker, role file, settings, trust stay; the home instance of a server is such a directory); (5) the
+standby's own managed settings are written again (`pg_rewind` copies the new primary's over them: port, socket, certificate paths), the access rules are
+copied, the meta file written; (6) `lease.Manager.BecameStandby` removes the markers of the group and the memory of the hand-over and sets the watchdog
+file to `off`, then the mark goes, then the instance starts. A rewind that was interrupted (mark step `rewinding`) is repaired by a base backup, one that
+finished (`rewound`) is not done again. A standby that is ahead of its new primary (`FlagRebuild`) goes through the same steps with the proof of a
+standby. Refusals: `409 not_former_primary`, `409 old_primary_running` (the leader's demote stops it first), `409 not_a_standby`.
+
+**The server that does not return.** The leader notes the first check that finds the server silent (`standby.waiting_since`) and clears it when the
+server answers. After `standby-replace-after` (default 30 minutes) the record is marked `removing`: the primary's list stops naming it, the instance
+is removed when the server returns (its supervision removes standbys that are not in the plan; the old primary's directory is not a standby and stays,
+stopped and held back), the catalog row goes by `remove_node` (extension sequence 8: the list first), and the ordinary reconcile makes a replacement on
+a server that is not dead (`Leader.Dead`: a dead server gets no new standby, and a standby that is on it stays). The alert `oldPrimaryNotRebuilt`
+(warning) comes after the shorter of ten minutes and half of `standby-replace-after`, counted from the record, whether the server is silent or answers
+and the rebuild does not succeed; the rebuild clears it, and `oldPrimaryRunning` and `oldPrimaryNotStopped` of that server and group.
+
+**The ring.** `readTopology` puts every active server in the ring, not only the servers that run a primary: after a failover a server can run only
+standbys and is still a place for the standbys of other groups; without this the record of the old primary would have found its server no candidate
+and been removed.
+
+**An old primary that runs.** `fenceStandbyPrimaries` (every 2 s) stops an instance whose role file says primary, on a port that the catalog calls a
+standby, while this server does not hold or adopt the lease of its group (twice in a row): the old primary of a failover whose server had neither a
+working `kingresd` nor a watchdog (test T11c), or a promoted instance whose `kingresd` restarted before the catalog followed. The probe of the
+monitor raises `oldPrimaryRunning` for the same reading.
+
+**Configuration.** `standby-replace-after` (flag, `KINGRES_STANDBY_REPLACE_AFTER`, file key; default `30m`) joins the keys of the table above.
+Fault hook: `failRewind` (tests only).
+
+**Tests.** Unit (`internal/standby`): `TestAPrimaryThatIsNotProvedToBeTheFormerPrimaryIsNotRebuilt` (seven refusals, nothing touched),
+`TestTheFormerPrimaryIsRewoundAndBecomesAStandby`, `TestTheFallbackIsABaseBackup`,
+`TestAnInterruptedRewindIsRepairedByABaseBackupAndAFinishedOneIsNotRepeated`, `TestTheDirectoryOfTheFormerPrimaryIsFoundByItsRoleFile`,
+`TestDiffRoutesAnOldPrimaryToARebuild`, `TestDiffPlacesNoNewStandbyOnADeadServer`, `TestTheLeaderWatchesTheOldPrimariesThatWait` (PostgreSQL),
+`TestTheReportOfTheOldPrimaryIsStoredInTheNewestRunOfTheGroup`. Cluster, in WSL (`internal/clustertest`): T11 `TestOldPrimaryReturns` (pg_rewind, the
+rows only the old primary had are gone, markers and mark gone, streaming, the new term, `check_cluster()` empty, the report, then a second failover
+back to it) and `TestOldPrimaryReturnsAndIsRebuiltByABaseBackup`; T11b `TestOldPrimaryNeverReturns`; T11c `TestOldPrimaryRunningUnfenced`;
+`TestAStandbyThatLagsIsNotChosenAndFollowsTheNewPrimary`; `TestASecondFailoverWhileOneIsPaused`.
 
 ## Fixes for the independent review F2-01 to F2-17 (2026-11-18)
 
@@ -2848,12 +2910,28 @@ kingresd that stopped running), **F2-10** (the read-back also happens in the `42
 **F2-13** (`lease.LockHeld`, `GET /failover/state` reports `watchdog`, the failover refuses an old primary that runs without one, no fork
 while an old watchdog holds the lock), **F2-17** (the cause is not the clock; see below).
 
-Partly: **F2-02** (a round checks `mayRenew` under the round lock; no deterministic test, the race needs a hook in `Renew`).
+**Closed in the round of increment 4 (2026-11-18).** Each with a test that fails without it:
 
-Not done: **F2-06** (fail closed for a directory that cannot be attributed to a group), **F2-08** (the positive mark of an unfinished copy,
-the two untested legs of `provedStandby`, the promote under the agent's lock), **F2-09** (the exclusion of a failover and an operation in flight
-in both directions, and an operation on an enforced primary that does not run when its record cannot be written), **F2-14** (statements of the
-design), **F2-16** (tests against the real extension, two groups on one server in the lease tests, the surviving mutants).
+- **F2-02** (`TestARoundIsNotSentForAGroupReleasedInTheMiddleOfAPass`): two groups on one server, `Renew` has taken the list `[1, 2]`, the release of
+  group 2 starts inside the first request of the round of group 1; the pass must not send a renewal for group 2 (the check `mayRenew` under the round
+  lock). It fails when the check is removed.
+- **F2-06** (fail closed): `cluster.Service.Unattributed(group)` lists the instances that may be the primary of a group that the role files cannot
+  attribute to it (an unreadable role file, two directories claiming the group, a role file that names another group than the catalog gives for the port);
+  `lease.Config.Unattributed` makes `Fence` stop them with the instance of the group, `refence` count them, and `Transfer` and `ReleaseGroup` refuse while
+  one runs; `GateInfo` judges a primary whose role file contradicts the catalog as one of any group, so any marker holds it back. The warning is logged once
+  a minute per group (the contract has no alert kind for it). Not covered: a watchdog for such a directory (it has no lease file name).
+- **F2-08**: an unfinished copy is the mark `kingres-copy-unfinished` that `InitStandby` writes first and the agent removes last (a meta file that cannot
+  be read is no longer the sign of one; the directories of an older version have no mark and are not deleted); `provedStandby` asks the instance through
+  `Agent.AskRecovery`, so the two legs "running and not in recovery" and "running and cannot be asked" have tests; the promotion of a standby takes the
+  agent's lifecycle lock (`Agent.LockLifecycle`) for its whole run.
+- **F2-09, the other direction**: `Ops.EnforcedPrimary` (wired to the lease manager's view: a writable instance whose group has a standby) makes a stop
+  or restart that cannot be recorded fail with `503 service_unavailable` instead of running from memory; a start still runs from memory.
+- **F2-05, the alert**: `Manager.FenceFailures` and a monitor probe raise `oldPrimaryNotStopped` while a fence cannot stop a primary and clear it when the
+  stop succeeds or the lease is won again.
+- **F2-14**: the statements of this README about the fence marker, the enforcement rule and `PrimaryOf` are corrected above.
+- **F2-16**: `TestAReleaseWaitsForTheRenewalInFlight` waits for the release to have marked the group instead of a fixed time;
+  `Recover` of a bucket move logs once when `internal_move_alive` does not answer; `TestTheRealExtensionAnswersTheMoveAliveCallOfTheRecovery` calls the real
+  function on a real map primary. Two groups on one server are in the lease tests now (the F2-02 test).
 
 **The 503 of the clock subtest (F2-17).** The cause found in the logs of a failing run on PostgreSQL 19 is not the restart delay the review
 read: node 1's kingresd lost the lease of its group and fenced the primary (`pg_ctl` immediate shutdown at 06:16:38.751), and in the same

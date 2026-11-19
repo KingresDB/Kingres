@@ -269,6 +269,17 @@ func (sc *stepCtx) runRow(ctx context.Context) (RunRow, error) {
 	if !ok {
 		return run, fail(CodeSuperseded, false, "the record of the run does not exist")
 	}
+	// The term the destructive calls of this group expect is the one the run read at its start, raised by the groups of
+	// this run that were promoted before it: each promote_node raises it by one, and the run itself did it. Without this
+	// the second group of a server that hosted two primaries met its own run's term and ended "superseded".
+	for _, g := range sc.in.Groups {
+		if g == sc.group {
+			break
+		}
+		if gr, found, gerr := sc.rows.Group(ctx, g); gerr == nil && found && gr.TermAfter != nil && *gr.TermAfter > run.ExpectedTerm {
+			run.ExpectedTerm = *gr.TermAfter
+		}
+	}
 	return run, nil
 }
 
@@ -1375,7 +1386,22 @@ func (r *Runner) records(ctx context.Context, env *task.Env, sc *stepCtx) error 
 			port = n.Port
 		}
 	}
-	return r.Plan.AfterPromotion(ctx, sc.group, nw, nw.Server, port)
+	old := OldPrimaryRec{Server: sc.old(), Node: gr.OldNode}
+	for _, n := range nodes {
+		if n.ID == gr.OldNode {
+			old.Port = n.Port
+		}
+	}
+	// The directory of the old primary, when its server answers: it is the instance whose role file says primary of the
+	// group (stopped by the demote). A server that does not answer finds its own directory when it is rebuilt.
+	if st, err := r.Peers.State(ctx, sc.old(), sc.group); err == nil {
+		for _, i := range st.Instances {
+			if i.Group == sc.group && i.Role == "primary" && !i.Running {
+				old.InstanceID = i.ID
+			}
+		}
+	}
+	return r.Plan.AfterPromotion(ctx, sc.group, nw, nw.Server, port, old)
 }
 
 func (r *Runner) syncNames(ctx context.Context, env *task.Env, sc *stepCtx) error {
@@ -1483,7 +1509,7 @@ func (r *Runner) unfreeze(ctx context.Context, env *task.Env, sc *stepCtx) error
 	}
 	old := "waitingForServer"
 	if st, err := r.Peers.State(ctx, sc.old(), sc.group); err == nil && len(st.OutOfRecovery()) == 0 {
-		old = "rebuildNotScheduled"
+		old = "rebuildScheduled" // the reconcile loop rebuilds it (oldprimary.go in internal/standby)
 	}
 	if err := sc.rows.Set(ctx, sc.group, GroupSet{State: ptr("done"), OldPrimary: &old, Finished: true}); err != nil {
 		return err

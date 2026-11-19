@@ -651,6 +651,7 @@ const sinceTolerance = 10 * time.Second
 // whose session holds the extension's mark of a live move is waited for as long as it lives (ST-07; a copy is
 // unbounded by design), and the run can be stopped meanwhile (the loop watches it).
 func (b *PG) Recover(ctx context.Context, r MoveRow) (string, string, error) {
+	warned := false
 	wait := b.RecoverWait
 	if wait == 0 {
 		wait = 10 * time.Minute
@@ -686,7 +687,14 @@ func (b *PG) Recover(ctx context.Context, r MoveRow) (string, string, error) {
 				// A live session is waited for as long as it lives; an answer that cannot be had counts as
 				// not alive (the bound applies).
 				var live bool
-				if err := c.QueryRow(ctx, `SELECT kingres.internal_move_alive($1)`, e.id).Scan(&live); err == nil && live {
+				if err := c.QueryRow(ctx, `SELECT kingres.internal_move_alive($1)`, e.id).Scan(&live); err != nil {
+					// Said once per call of Recover: a function that does not answer (another signature, not installed) must
+					// not turn the wait for a live move into the old fixed bound without a trace (F2-16).
+					if !warned {
+						warned = true
+						b.log().Warn("the extension cannot say whether a bucket move is alive; the bound of the wait applies", "move", e.id, "error", err)
+					}
+				} else if live {
 					alive = true
 				}
 			}

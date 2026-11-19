@@ -74,9 +74,9 @@ version 1, the caller \"2\"."}` when the number is missing or different.
 | `POST /internal/v1/node/finish` | leader, or any peer while joining | the server becomes clustered and its setup token is removed |
 | `POST /internal/v1/node/reset` | leader | delete the instance, certificates and key; the server is uninitialized again with a new setup token |
 | `POST /internal/v1/apply` | leader | one cluster-wide operation from a closed set (create or drop a database, network rules, role sync and drop, grant, `role.changed`: end the sessions of a changed role and forget cached role checks) with structured parameters |
-| `POST /internal/v1/standby/plan` | leader | the complete list of the cluster's standbys with a version; stored by every server, applied at once by the server that runs a group's primary; see "Standbys" |
-| `POST /internal/v1/standby/create`, `/remove`, `/rebuild` | leader | create (slot on the primary, `pg_basebackup`, start in recovery), delete, or make again the standby instance of a group on this server |
-| `GET /internal/v1/standby/status` | leader | the standby instances of this server and, for the group whose primary it runs, the synchronous setting, streaming standbys, slots and the standbys whose slot was lost |
+| `POST /internal/v1/standby/plan` | leader (or, while this server is held back, the server the others name as the leader) | the complete list of the cluster's standbys with a version; stored by every server, applied at once by the server that runs a group's primary; see "Standbys" |
+| `POST /internal/v1/standby/create`, `/remove`, `/rebuild` | leader; `/rebuild` also while this server is held back, from the server the others name as the leader | create (slot on the primary, `pg_basebackup`, start in recovery), delete, or make again the standby instance of a group on this server |
+| `GET /internal/v1/standby/status` | leader (or, while this server is held back, the server the others name as the leader) | the standby instances of this server and, for the group whose primary it runs, the synchronous setting, streaming standbys, slots and the standbys whose slot was lost |
 | `GET /internal/v1/failover/position?group=<g>` | any peer | read-only: the position of the instance of this server that serves the group (see "The read calls of the failover") |
 | `GET /internal/v1/liveness` | any peer | this server's heartbeat view of every other server (state and silence) |
 | `GET /internal/v1/failover/state?group=<g>` | leader | this server's knowledge of one group: its instances and their roles, the lease, an adoption or a hand-over, the freeze, the catalog term |
@@ -103,6 +103,13 @@ one exception: `POST /internal/v1/exec`, which is restricted to the leader. Its
 body is `{"database": "...", "sql": "...", "rowLimit": 1000}` (SQL at most 1,000,000
 bytes, row limit at most 10,000); the server logs the caller, the database, the
 length and a hash prefix of the statement, never its text.
+
+**The leader of a server that is held back.** A server whose instance waits for its group lease (the old primary of a failover, stopped and kept from
+starting until it is a standby) cannot read its catalog and does not know the leader: its leader-only calls answer `503 service_unavailable`, and a
+task step waits for it. Three calls (`POST /standby/plan`, `POST /standby/rebuild`, `GET /standby/status`) have the policy "leader or held back": while
+the server is held back it asks the other servers of its peer directory `GET /leader` (any peer answers; the answers count when every server that
+answered names the same leader; kept three seconds) and accepts the call of the server they name. Without an answer it stays `503`. The rebuild of an
+old primary proves what it needs itself (internal-api.md, "Standbys"), so this widens nothing a member could not already do to its own instance.
 
 ## Forwarding an operation to the leader
 
@@ -349,7 +356,7 @@ Types: `internal/standby/wire.go`.
 | `POST /standby/plan` | `{version, replicas, standbys: [{id, group, server, primaryServer, primaryPort, port, ready, generation}]}` | `{}` | Stores the complete list of the cluster's standbys in `<data-dir>/standby/state.json` unless it holds a newer version, and runs its primary-side maintenance (slots, `synchronous_standby_names`) at once. Sent to every server whenever the list changes, and by the leader's check to a server that reports an older `planVersion`. |
 | `POST /standby/create` | `{entry}` | `{port}` | Makes the standby of `entry` on this server: slot on the primary (certificate connection), `pg_basebackup`, managed configuration, `standby.signal`, start. Idempotent. `409 conflict` when the directory of the group holds another standby. |
 | `POST /standby/remove` | `{entry}` | `{}` | Stops and deletes the standby instance and drops its slot on the primary (best effort). |
-| `POST /standby/rebuild` | `{entry, diverged}` | `{port}` | Makes the standby again: `pg_rewind` when `diverged` and possible, otherwise delete, new slot, new base backup. |
+| `POST /standby/rebuild` | `{entry, diverged, term}` | `{port, instanceId, oldPrimary}` | Makes the standby again: for `diverged`, `pg_rewind` (it finishes the crash recovery of a stopped primary itself) and, when that is not possible, a new base backup into the same directory (`RebaseStandby`: everything outside `pgdata` stays); otherwise delete, new slot, new base backup. The directory of the old primary of a group (role file `primary`) is touched only when the server proves it is the former primary: stopped, role file naming exactly this group, `term` newer than the one in the role file, the plan names another server as the primary, the lease of the group is not this server's and is not being adopted, and a marker of a hand-over, a fence or a wait is on disk; else `409 not_former_primary`, or `409 old_primary_running` when it runs (the leader's demote stops it first). The mark `kingres-copy-unfinished` (with its step) comes first, the role file `standby` second, the data last; the markers go when the directory is a standby, before it starts. `oldPrimary` is `{method: pgRewind|baseBackup, divergenceLsn, oldEndLsn, divergenceBytes, rewindBytes, message}`; `instanceId` is the directory the server found when the entry did not name one. |
 | `GET /standby/status` | none | `{server, planVersion, standbys: [{id, group, port, running, generation, receiving, replayLagBytes}], primary: {group, synchronousStandbyNames, without, streaming, slots, needsRebuild}}` | Reports the standby instances of this server and, when it runs a group's primary, that group's synchronous setting, streaming standbys, slot retention and the standbys whose slot was lost. |
 
 The slot and the base backup use the caller's certificate-authenticated connection to the primary's instance: the
@@ -448,7 +455,7 @@ fence token; a client time limit that ended after the connection was made is not
 | `POST /instance/trust`, `/pki/install`, `/peers`, `/config/apply`, `/standby/plan`, `/globals/apply` | rewrite the same files or rows and reload |
 | `POST /apply` | `database.create` checks that the database exists; the other kinds were not all read |
 | `POST /standby/create`, `/remove` | no-op (they check what exists), serialized by the agent |
-| `POST /standby/rebuild` | **no-op for a standby that is of the generation asked for** (changed in this step) |
+| `POST /standby/rebuild` | **no-op for a standby that is of the generation asked for** (changed in this step); the rebuild of an old primary resumes where its mark says it stopped: a rewind that was interrupted is repaired by a base backup, one that finished is not done again |
 | `POST /config/restart` | **no-op with `ifPending` when nothing waits for a restart** (changed in this step; a call without it restarts) |
 | `POST /failover/freeze`, `/unfreeze`, `/standbys-gone` | set the same state in memory |
 | `POST /failover/lease` | adopt again (no-op), a transfer from a server that is no longer the holder is refused (`transferred: false`; the step then reads `/failover/state`), `release` of an adoption that is gone is a no-op |

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pki"
 )
@@ -153,3 +154,73 @@ func (m *Manager) IsCopy(id int) bool { return m.MustRole(id).Origin == OriginCo
 
 // IsWritable reports whether the instance is the primary of its group.
 func (m *Manager) IsWritable(id int) bool { return m.MustRole(id).Writable() }
+
+// CopyUnfinishedMarker is the file in an instance directory (next to the role file, outside the data directory) that
+// says "a copy is being made into this directory and is not complete". It is written first and removed last
+// (F2-08): an unfinished copy is recognised by this positive mark, never by the absence of the last file, which a
+// complete standby whose bookkeeping file cannot be read lacks as well.
+const CopyUnfinishedMarker = "kingres-copy-unfinished"
+
+// MarkCopyUnfinished writes the mark (durably) before a copy, a rewind or any other change that leaves the data
+// directory incomplete.
+func (m *Manager) MarkCopyUnfinished(id int) error {
+	dir, err := m.Dir(id)
+	if err != nil {
+		return err
+	}
+	return pki.WriteFile(filepath.Join(dir, CopyUnfinishedMarker), []byte(CopyStarted+"\n"), 0o600)
+}
+
+// ClearCopyUnfinished removes the mark: the last thing a copy does.
+func (m *Manager) ClearCopyUnfinished(id int) error {
+	dir, err := m.Dir(id)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(filepath.Join(dir, CopyUnfinishedMarker)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+// CopyUnfinished says whether the mark exists.
+func (m *Manager) CopyUnfinished(id int) bool {
+	dir, err := m.Dir(id)
+	if err != nil {
+		return false
+	}
+	_, err = os.Lstat(filepath.Join(dir, CopyUnfinishedMarker))
+	return err == nil
+}
+
+// SetCopyStep records how far a copy into the directory has come, in the mark itself ("started" when the mark is
+// written): a rewind that was interrupted leaves a directory that only a new base backup can repair, one that finished
+// does not need to be done again.
+func (m *Manager) SetCopyStep(id int, step string) error {
+	dir, err := m.Dir(id)
+	if err != nil {
+		return err
+	}
+	return pki.WriteFile(filepath.Join(dir, CopyUnfinishedMarker), []byte(step+"\n"), 0o600)
+}
+
+// CopyStep returns the step recorded in the mark ("" when there is no mark).
+func (m *Manager) CopyStep(id int) string {
+	dir, err := m.Dir(id)
+	if err != nil {
+		return ""
+	}
+	b, err := os.ReadFile(filepath.Join(dir, CopyUnfinishedMarker)) //nolint:gosec // fixed name below the manager root
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// Steps of a copy into an existing directory (CopyStep).
+const (
+	CopyStarted   = "started"
+	CopyRewinding = "rewinding"
+	CopyRewound   = "rewound"
+	CopyBackup    = "basebackup"
+)

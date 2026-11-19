@@ -78,3 +78,26 @@ func TestAGroupThatBecomesEnforcedAfterItsLeaseRanOutIsStopped(t *testing.T) {
 	}
 	_ = time.Second
 }
+
+// F2-05 (c): a group whose primary could not be stopped is listed (the alert oldPrimaryNotStopped is raised from it)
+// until the stop succeeds.
+func TestAFenceThatCannotStopThePrimaryIsListedUntilItDoes(t *testing.T) {
+	ctx := context.Background()
+	r := newRig(t, []string{"a", "b", "c"}, true)
+	r.m.c.Instance = &failingStop{fakeInstance: r.inst, fails: 2}
+	r.m.Renew(ctx)
+	r.voter.down["b"], r.voter.down["c"] = true, true
+	r.clk.Advance(dur)
+	r.m.Renew(ctx)
+	r.m.Check(ctx)
+	if got := r.m.FenceFailures(); len(got) != 1 || got[0] != 1 {
+		t.Fatalf("a failed stop is not listed: %v", got)
+	}
+	for i := 0; i < 4; i++ {
+		r.clk.Advance(FenceRetry)
+		r.m.Check(ctx)
+	}
+	if got := r.m.FenceFailures(); len(got) != 0 {
+		t.Fatalf("the list still names a group whose primary was stopped: %v", got)
+	}
+}

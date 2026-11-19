@@ -130,13 +130,14 @@ func serveInternal(ctx context.Context, d internalDeps) {
 			return st
 		},
 		// The leader is the server holding the primary of shard group 0.
-		Leader:    leaderOf(d),
-		Self:      me,
-		Gather:    d.gather,
-		Revoked:   d.svc.RevokedSerials,
-		Handle:    handleCall(d),
-		Bootstrap: d.receiver.Bootstrap,
-		Joining:   d.svc.Joining,
+		Leader:     leaderOf(d),
+		PeerLeader: peerLeaderOf(d),
+		Self:       me,
+		Gather:     d.gather,
+		Revoked:    d.svc.RevokedSerials,
+		Handle:     handleCall(d),
+		Bootstrap:  d.receiver.Bootstrap,
+		Joining:    d.svc.Joining,
 		// An instance held back until its group lease is won (the fence marker, or the wait marker
 		// of an instance that was not running when kingresd started) cannot read the catalog: its
 		// callers get 503 service_unavailable and wait, not 403 not_leader.
@@ -434,5 +435,54 @@ func internalCertificate(dir string, names func() pki.Names, state func() setup.
 		}
 		onBootstrap(fp)
 		return &pair, nil
+	}
+}
+
+// peerLeaderOf asks the other servers of the peer directory who the manager leader is (GET /leader, which any peer may
+// ask), for the calls of policy LeaderOrHeldBack on a server that cannot read its own catalog: the old primary of a
+// failover is rebuilt while its instance is stopped. The answer counts only when every server that answered names the
+// same leader; it is kept for three seconds.
+func peerLeaderOf(d internalDeps) func(ctx context.Context) string {
+	var mu sync.Mutex
+	var cached string
+	var at time.Time
+	return func(ctx context.Context) string {
+		mu.Lock()
+		if cached != "" && time.Since(at) < 3*time.Second {
+			c := cached
+			mu.Unlock()
+			return c
+		}
+		mu.Unlock()
+		if d.members == nil || d.members.Peers == nil || d.members.Client == nil {
+			return ""
+		}
+		var named []string
+		for _, p := range d.members.Peers.All() {
+			if p.ServerID == d.serverHost {
+				continue
+			}
+			cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			var out struct {
+				Leader string `json:"leader"`
+			}
+			err := d.members.Client.Do(cctx, p.ServerID, http.MethodGet, "/leader", nil, &out)
+			cancel()
+			if err == nil && out.Leader != "" {
+				named = append(named, out.Leader)
+			}
+		}
+		if len(named) == 0 {
+			return ""
+		}
+		for _, n := range named {
+			if n != named[0] {
+				return ""
+			}
+		}
+		mu.Lock()
+		cached, at = named[0], time.Now()
+		mu.Unlock()
+		return named[0]
 	}
 }
