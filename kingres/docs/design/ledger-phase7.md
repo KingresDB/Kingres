@@ -3046,7 +3046,30 @@ The number 159 is not used.
     asked for with `--init`.
 195. **`bundle fetch` is bounded** by a number of files and of bytes when no trust file is given,
     checks the size a checkpoint claims against that bound before it requests a tile, and compares
-    what it already holds before it replaces anything.
+. **`anchors`** checks the anchors of a signed aggregate checkpoint. The digest is computed again from
+    the signed aggregate log, never taken from an evidence file; for an older size from the first
+    leaves, proved a prefix of the signed log.
+197. **The statuses of `anchors`.** Not verified (3): a WORM object not fetched again, a time-stamp
+    token without pinned certificates, an OpenTimestamps proof without a header given by the auditor
+    or only pending, no evidence for the size, an anchored size above the checkpoint served. A failure
+    (1): any check that fails, also an operation of a proof the verifier does not compute; whether such
+    paths of calendars (RIPEMD-160) should be "not verified" instead is open.
+198. **`--require`** names the kinds that must hold a verified anchor; other files that cannot be
+    verified are notes; a failure of any file is a failure.
+199. **A WORM evidence file** carries the hash and length of the object but not the note, so nothing
+    about the object is checked offline; only a fetch by the auditor makes it an anchor.
+200. **The time of a time-stamp token** is the authority's word within its accuracy; the revocation of
+    the authority's certificate is not read; the certificates are the ones the auditor pinned.
+201. **The header of a Bitcoin block** comes from the auditor; the one the cluster kept is never used;
+    a header that does not meet its own target, or is easier than difficulty 1, is refused.
+202. **A time-stamp token** whose list of digest algorithms differs from its signer's, or that has
+    extensions, is refused.
+203. **The byte sweeps of the verifier's tests** change a fixed sample by default and every byte with
+    `KINGRES_VERIFY_FULL_SWEEP=1`.
+
+Correction 168 (an old checkpoint of a revoked key dated by an anchor) is not applied: the design must
+state which kinds of anchor may date a checkpoint, whether the comparison with the time of compromise is
+strict, and what it means that an anchor covers a checkpoint of a chain.
 
 Built of step 10: the anchoring framework and the WORM target. Not built in it: the publication of
 evidence files under the publication root, the cluster settings for the limits of retries (the
