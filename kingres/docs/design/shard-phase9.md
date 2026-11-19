@@ -824,3 +824,37 @@ Each has a recommendation; the project owner is not asked.
 - `choose_colocation` allocates `max(colocation_id) + 1`, which can reuse an id; the 0.3 review's S4-01 argument assumes placements never come back.
 - `dist_table.c` says the remote work of `create_distributed_table` is committed in the pre-commit callback ("not atomically, see node_admin.c") while the README says it is one two-phase transaction.
 - [shard-phase2b.md](shard-phase2b.md) states that a distributed table has no user triggers by construction; this phase keeps that and lists it as a reason for the refusal.
+
+## Found while building
+
+### Increments 9.1 and 9.2 (2026-11-19)
+
+The extension version of this phase is 0.7 (the document says 0.6, which phase 2b took).
+
+- **The blocking variant builds a shadow named after the table's oid** (`kingres_shadow_<oid>`) while
+  readers read the old table, and drops the old table in the same transaction after the counts
+  match. No copy of the old table is kept and no digest is compared; `table_old_copy` and the
+  operation tables exist and are unused until 9.3, whose rebuilds need names per operation.
+- **Foreign keys** are added validated inside the transaction. A key to a colocated distributed
+  table can exist only with one shard group or with routing off; a key of a table to itself only on
+  the distribution column.
+- **The form of a refusal.** One blocker is its own sentence with the SQLSTATE of its code; several
+  are "N problems prevent the change of table X" with one line per code in the detail and SQLSTATE
+  `0A000`. Codes added to the report beside the design's: `not_available_yet`, `node_unreachable`,
+  `role_missing`, `name_in_use`, `group_busy`, `no_hash_support`.
+- **The handshake** asks the other nodes with twice the node timeout.
+- **`create_distributed_table` sends eleven statements to a node** (seven before).
+- **A colocation id is never used again**; ids are therefore not contiguous, which the control plane
+  must not assume.
+- **Sequences.** The owner of an owned serial sequence is now set on the other nodes; privileges on
+  owned sequences are not carried yet.
+- **`money`** crosses nodes under `lc_monetary = C` in the copy only; other paths are as before.
+- **For range and list partitions** a check constraint proves the attach only when the column is
+  `NOT NULL`.
+- **The guard of DDL** fires only when the statement is propagated.
+
+Of the section "Needs verification": items 1, 2, 3, 4, 5, 7, 8, 9, 11, 13 and 14 are settled by the
+regression test `pg_facts` and the TAP tests; 6, 10 and 12 are not.
+
+What the control plane must follow: the version 0.7, `kingres.table_change_report(kind, relation,
+options)`, the views `kingres.table_operations` and `kingres.partitions`, the new error texts.
