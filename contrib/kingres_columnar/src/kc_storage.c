@@ -33,6 +33,12 @@
 #include "catalog/pg_class.h"
 #include "catalog/storage.h"
 #include "miscadmin.h"
+#include "replication/decode.h"
+#include "replication/logical.h"
+#include "replication/origin.h"
+#include "replication/reorderbuffer.h"
+#include "replication/snapbuild.h"
+#include "access/htup_details.h"
 #include "port/pg_crc32c.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
@@ -52,6 +58,7 @@
 #define XLOG_KC_META		0x10	/* whole-page image of the metapage */
 #define XLOG_KC_FREEZE		0x20	/* metapage image, its transaction id frozen */
 #define XLOG_KC_RETURN		0x30	/* metapage image, the tail of a reservation given back (0.2) */
+#define XLOG_KC_LOGICAL		0x40	/* rows of a stripe in the form of heap tuples, for decoding (C7), no page */
 
 typedef struct xl_kc_pages
 {
@@ -76,6 +83,13 @@ typedef struct xl_kc_return
 	uint64		first_row;		/* the first number given back */
 	uint32		nrows;			/* how many */
 } xl_kc_return;
+
+/* the record of the rows of a stripe for logical decoding (C7): then the tuples */
+typedef struct xl_kc_logical
+{
+	RelFileLocator rlocator;
+	uint32		ntuples;
+} xl_kc_logical;
 
 #define KC_MAX_BLOCKS_PER_RECORD 32
 
@@ -123,7 +137,7 @@ kc_redo(XLogReaderState *record)
 	int			b;
 
 	if (info != XLOG_KC_PAGES && info != XLOG_KC_META && info != XLOG_KC_FREEZE &&
-		info != XLOG_KC_RETURN)
+		info != XLOG_KC_RETURN && info != XLOG_KC_LOGICAL)
 		elog(PANIC, "kingres_columnar_redo: unknown op code %u", info);
 
 	/*
@@ -188,6 +202,13 @@ kc_desc(StringInfo buf, XLogReaderState *record)
 		appendStringInfo(buf, "metapage, row numbers " UINT64_FORMAT " and %u more given back",
 						 xlrec->first_row, xlrec->nrows);
 	}
+	else if (info == XLOG_KC_LOGICAL)
+	{
+		xl_kc_logical *xlrec = (xl_kc_logical *) XLogRecGetData(record);
+
+		appendStringInfo(buf, "%u rows of relation %u for logical decoding",
+						 xlrec->ntuples, xlrec->rlocator.relNumber);
+	}
 }
 
 static const char *
@@ -203,6 +224,8 @@ kc_identify(uint8 info)
 			return "FREEZE";
 		case XLOG_KC_RETURN:
 			return "RETURN";
+		case XLOG_KC_LOGICAL:
+			return "LOGICAL_INSERT";
 	}
 	return NULL;
 }
@@ -214,12 +237,142 @@ kc_mask(char *pagedata, BlockNumber blkno)
 	mask_page_lsn_and_checksum((Page) pagedata);
 }
 
+
+/* ------------------------------------------------------------------------
+ * Logical decoding of inserts (increment C7)
+ * ------------------------------------------------------------------------
+ *
+ * A stripe's pages are compressed column chunks, which the decoder cannot read.  When
+ * wal_level is logical and the table is logically logged, the flush of a stripe that
+ * holds user rows also writes XLOG_KC_LOGICAL records: the rows in the form of heap tuples,
+ * a few hundred (or about a megabyte) to a record.  Redo ignores them; rm_decode queues
+ * each tuple as an INSERT of the reorder buffer, as heap_decode does for a heap insert.
+ *
+ * A record: xl_kc_logical, then for each tuple a header (len, infomask2, infomask,
+ * hoff; the fields of xl_heap_header, with the length of what follows) and the bytes of
+ * the tuple after its fixed header.  The record is written by the transaction (or
+ * subtransaction) that writes the stripe, which is the one whose commit makes the stripe's
+ * catalog row visible, so the decoder emits the rows exactly when a reader could see them.
+ */
+#define KC_LOGICAL_TUPLE_HDR	9	/* uint32 len, uint16 infomask2, uint16 infomask, uint8 hoff */
+
+void
+kc_xlog_logical(Relation rel, uint32 ntuples, const char *data, Size len)
+{
+	xl_kc_logical xlrec;
+
+	xlrec.rlocator = rel->rd_locator;
+	xlrec.ntuples = ntuples;
+	XLogBeginInsert();
+	XLogRegisterData((char *) &xlrec, sizeof(xlrec));
+	XLogRegisterData((char *) data, len);
+	/* filtering by origin on a row level is much more efficient (as heap does) */
+	XLogSetRecordFlags(XLOG_INCLUDE_ORIGIN);
+	(void) XLogInsert(KC_RMGR_ID, XLOG_KC_LOGICAL);
+}
+
+/* Append a tuple the way a record holds it. */
+void
+kc_logical_append_tuple(StringInfo sb, HeapTuple tuple)
+{
+	uint32		len = tuple->t_len - SizeofHeapTupleHeader;
+	uint16		infomask2 = tuple->t_data->t_infomask2;
+	uint16		infomask = tuple->t_data->t_infomask;
+	uint8		hoff = tuple->t_data->t_hoff;
+
+	appendBinaryStringInfo(sb, (char *) &len, sizeof(len));
+	appendBinaryStringInfo(sb, (char *) &infomask2, sizeof(infomask2));
+	appendBinaryStringInfo(sb, (char *) &infomask, sizeof(infomask));
+	appendBinaryStringInfo(sb, (char *) &hoff, sizeof(hoff));
+	appendBinaryStringInfo(sb, ((char *) tuple->t_data) + SizeofHeapTupleHeader, len);
+}
+
+/*
+ * rm_decode: queue the tuples of the record as inserts, as DecodeInsert does for one heap
+ * tuple.  Everything the decoder asks of a heap record is asked here: the xid is processed
+ * first for every record; nothing is queued before the snapshot builder has a full snapshot,
+ * for a change the builder does not want, in fast-forward mode, in another database or for an
+ * origin the output plugin filters.
+ */
+static void
+kc_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
+{
+	XLogReaderState *r = buf->record;
+	uint8		info = XLogRecGetInfo(r) & ~XLR_INFO_MASK;
+	TransactionId xid = XLogRecGetXid(r);
+	SnapBuild  *builder = ctx->snapshot_builder;
+	xl_kc_logical *xlrec;
+	const char *p;
+	const char *end;
+	uint32		i;
+
+	ReorderBufferProcessXid(ctx->reorder, xid, buf->origptr);
+	if (SnapBuildCurrentState(builder) < SNAPBUILD_FULL_SNAPSHOT)
+		return;
+	if (info != XLOG_KC_LOGICAL)
+		return;
+	if (!SnapBuildProcessChange(builder, xid, buf->origptr) || ctx->fast_forward)
+		return;
+
+	xlrec = (xl_kc_logical *) XLogRecGetData(r);
+	if (xlrec->rlocator.dbOid != ctx->slot->data.database)
+		return;
+	if (ctx->callbacks.filter_by_origin_cb != NULL &&
+		filter_by_origin_cb_wrapper(ctx, XLogRecGetOrigin(r)))
+		return;
+
+	p = (const char *) XLogRecGetData(r) + sizeof(xl_kc_logical);
+	end = (const char *) XLogRecGetData(r) + XLogRecGetDataLen(r);
+	for (i = 0; i < xlrec->ntuples; i++)
+	{
+		ReorderBufferChange *change;
+		HeapTuple	tuple;
+		uint32		len;
+		uint16		infomask2;
+		uint16		infomask;
+		uint8		hoff;
+		HeapTupleHeader header;
+
+		if (end - p < KC_LOGICAL_TUPLE_HDR)
+			elog(ERROR, "kingres_columnar: a logical record is truncated");
+		memcpy(&len, p, sizeof(len));
+		memcpy(&infomask2, p + 4, sizeof(infomask2));
+		memcpy(&infomask, p + 6, sizeof(infomask));
+		memcpy(&hoff, p + 8, sizeof(hoff));
+		p += KC_LOGICAL_TUPLE_HDR;
+		if ((Size) (end - p) < len)
+			elog(ERROR, "kingres_columnar: a logical record is truncated");
+
+		change = ReorderBufferAllocChange(ctx->reorder);
+		change->action = REORDER_BUFFER_CHANGE_INSERT;
+		change->origin_id = XLogRecGetOrigin(r);
+		memcpy(&change->data.tp.rlocator, &xlrec->rlocator, sizeof(RelFileLocator));
+
+		tuple = ReorderBufferAllocTupleBuf(ctx->reorder, len);
+		tuple->t_len = len + SizeofHeapTupleHeader;
+		ItemPointerSetInvalid(&tuple->t_self);
+		tuple->t_tableOid = InvalidOid;
+		header = tuple->t_data;
+		memset(header, 0, SizeofHeapTupleHeader);
+		memcpy(((char *) header) + SizeofHeapTupleHeader, p, len);
+		header->t_infomask = infomask;
+		header->t_infomask2 = infomask2;
+		header->t_hoff = hoff;
+		p += len;
+
+		change->data.tp.newtuple = tuple;
+		change->data.tp.clear_toast_afterwards = true;
+		ReorderBufferQueueChange(ctx->reorder, xid, buf->origptr, change, false);
+	}
+}
+
 static const RmgrData kc_rmgr = {
 	.rm_name = "KingresColumnar",
 	.rm_redo = kc_redo,
 	.rm_desc = kc_desc,
 	.rm_identify = kc_identify,
 	.rm_mask = kc_mask,
+	.rm_decode = kc_decode,
 };
 
 /*

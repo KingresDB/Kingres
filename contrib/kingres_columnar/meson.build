@@ -145,6 +145,7 @@ tests += {
       't/058_index_cursor.pl',
       't/059_compact_index.pl',
       't/060_compact_index_crash_standby.pl',
+      't/061_logical.pl',
     ],
   },
 }

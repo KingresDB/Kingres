@@ -194,9 +194,9 @@ $$;
 --  * foreign keys on or to a columnar table, and row-level AFTER triggers on
 --    one: they lock or re-read rows by their TID, which a columnar row does
 --    not have until its stripe is written;
---  * columnar tables in a publication, and a publication that would include
---    one: columnar rows are not decoded for logical replication yet, so a
---    subscriber would silently miss them.
+--  * a publication that would include the stripe catalog (all tables, or the
+--    schema kingres) once a columnar table exists (0.2: columnar tables
+--    themselves can be published, their rows are decoded; 0.1 refused them).
 CREATE FUNCTION columnar_check_ddl()
     RETURNS event_trigger
     LANGUAGE plpgsql SECURITY DEFINER
@@ -263,44 +263,34 @@ BEGIN
                 USING ERRCODE = '0A000',
                       HINT = 'Use a BEFORE ROW or a statement-level trigger, or keep the table in row storage.';
         END IF;
-        -- What a publication publishes is what the server says it does
-        -- (pg_get_publication_tables: all tables, a schema, the listed
-        -- tables, the exceptions of 19, the partitions or their root with
-        -- publish_via_partition_root), so ask it, and test the table and
-        -- every ancestor of it against that list.
+        -- Columnar tables can be published (0.2, C7: the rows are decoded from the
+        -- flush of a stripe).  What must never be published is the stripe catalog,
+        -- whose rows describe files of this server; a publication of all tables or
+        -- of the schema kingres would include it (pg_get_publication_tables says
+        -- what a publication includes: all tables, a schema, the listed tables, the
+        -- exceptions of 19), and a subscriber would apply its rows.
         IF EXISTS (SELECT 1
-                     FROM unnest(cols) AS col(relid),
-                          pg_catalog.pg_publication p,
+                     FROM pg_catalog.pg_publication p,
                           LATERAL pg_catalog.pg_get_publication_tables(p.pubname) pt
-                    WHERE pt.relid = col.relid
-                       OR pt.relid IN (SELECT an.relid
-                                         FROM pg_catalog.pg_partition_ancestors(col.relid) an)) THEN
-            RAISE EXCEPTION 'columnar tables are not replicated logically yet: a publication would include a columnar table'
+                    WHERE pt.relid = 'kingres.columnar_stripe'::pg_catalog.regclass) THEN
+            RAISE EXCEPTION 'a publication would include the stripe catalog of kingres_columnar, kingres.columnar_stripe'
                 USING ERRCODE = '0A000',
-                      HINT = 'Keep tables that are published in row storage, or leave the columnar table out of the publication.';
+                      HINT = 'List the tables to publish (CREATE PUBLICATION ... FOR TABLE ...) instead of publishing all tables or the schema kingres.';
         END IF;
     END IF;
 
     IF cardinality(pubs) > 0 THEN
-        -- The relations listed are the ones published under their own name
-        -- (partitions) or, with publish_via_partition_root, the roots of
-        -- partitioned tables: the rows that are published are those of the
-        -- listed relation and of everything below it.
         IF EXISTS (SELECT 1
                      FROM pg_catalog.pg_publication p,
-                          LATERAL pg_catalog.pg_get_publication_tables(p.pubname) pt,
-                          LATERAL (SELECT pt.relid
-                                   UNION ALL
-                                   SELECT t.relid
-                                     FROM pg_catalog.pg_partition_tree(pt.relid) t) x(relid)
+                          LATERAL pg_catalog.pg_get_publication_tables(p.pubname) pt
                     WHERE p.oid = ANY (pubs)
-                      AND EXISTS (SELECT 1
-                                    FROM pg_catalog.pg_class c
-                                   WHERE c.oid = x.relid
-                                     AND kingres.columnar_is_columnar_am(c.relam))) THEN
-            RAISE EXCEPTION 'columnar tables are not replicated logically yet: the publication would include a columnar table'
+                      AND pt.relid = 'kingres.columnar_stripe'::pg_catalog.regclass)
+           AND EXISTS (SELECT 1 FROM pg_catalog.pg_class c
+                        WHERE c.relkind IN ('r', 'm')
+                          AND kingres.columnar_is_columnar_am(c.relam)) THEN
+            RAISE EXCEPTION 'a publication would include the stripe catalog of kingres_columnar, kingres.columnar_stripe'
                 USING ERRCODE = '0A000',
-                      HINT = 'Leave columnar tables out of publications.';
+                      HINT = 'List the tables to publish (CREATE PUBLICATION ... FOR TABLE ...) instead of publishing all tables or the schema kingres.';
         END IF;
     END IF;
 

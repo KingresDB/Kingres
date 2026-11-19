@@ -231,14 +231,6 @@ kc_parallelscan_reinitialize(Relation rel, ParallelTableScanDesc pscan)
  * ------------------------------------------------------------------------
  */
 
-static pg_noreturn void
-kc_no_indexes(void)
-{
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("columnar tables have no indexes in this version")));
-}
-
 /*
  * What the entry points that always raise an error do where an error is
  * forbidden: the one helper decides (kc_entry_refused); where it says no the
@@ -395,7 +387,23 @@ kc_index_delete_tuples(Relation rel, TM_IndexDeleteOp *delstate)
 {
 	if (kc_write_refused(rel, "index delete"))
 		return InvalidTransactionId;
-	kc_no_indexes();
+
+	/*
+	 * A B-tree asks this in two cases.  (1) Simple deletion, for index tuples that
+	 * carry the LP_DEAD hint: the fetch never says "all dead" (all_dead stays false), so
+	 * no tuple has the hint and this is never asked.  (2) Bottom-up deletion, when a leaf
+	 * page of a unique index is full and an insert found an entry with its key that
+	 * names a row nobody sees (the entry of a rolled-back writer; the same key is being
+	 * inserted again): it asks which of the page's entries may go, to avoid a split.
+	 * The answer "none" is always allowed ("it might even have no entries at all",
+	 * nbtpage.c): the page splits and VACUUM removes the entries (kc_index_vacuum).  A
+	 * decision here would have to read the stripe catalog and the metapage while a leaf
+	 * page is locked.
+	 */
+	if (!delstate->bottomup)
+		elog(ERROR, "kingres_columnar: simple deletion of index entries was asked, but no entry is ever marked dead");
+	delstate->ndeltids = 0;
+	return InvalidTransactionId;
 }
 
 /* ------------------------------------------------------------------------

@@ -67,6 +67,7 @@
 
 #include "access/detoast.h"
 #include "access/htup_details.h"
+#include "access/xlog.h"
 #include "access/parallel.h"
 #include "access/relation.h"
 #include "access/table.h"
@@ -2361,6 +2362,65 @@ kc_buf_drop_prefix(KcWriteBuf *b, uint32 n)
 	kc_buf_tail_install(b, &t, false);
 }
 
+
+/*
+ * The rows [first, first + count) of a buffer in the form of heap tuples for logical decoding
+ * (increment C7; see kc_decode in kc_storage.c).  Written by the transaction that writes the
+ * stripe, a few hundred rows or about a megabyte to a record.  Not for the copies compaction makes
+ * (maintenance), which are no new rows.
+ */
+static void
+kc_log_logical_rows(Relation rel, KcWriteBuf *b, uint32 first, uint32 count)
+{
+	TupleDesc	desc = RelationGetDescr(rel);
+	int			natts = desc->natts;
+	Datum	   *v = palloc(sizeof(Datum) * Max(natts, 1));
+	bool	   *n = palloc(sizeof(bool) * Max(natts, 1));
+	StringInfoData sb;
+	uint32		nt = 0;
+	uint32		r;
+	int			c;
+
+	/* the transaction has an id: the stripe's catalog row was written by it */
+	(void) GetCurrentTransactionId();
+	initStringInfo(&sb);
+	for (r = first; r < first + count; r++)
+	{
+		HeapTuple	tup;
+
+		for (c = 0; c < natts; c++)
+		{
+			if (c < b->ncols)
+			{
+				Size		idx = (Size) r * b->ncols + c;
+
+				v[c] = b->vals[idx];
+				n[c] = b->nulls[idx];
+			}
+			else
+			{
+				v[c] = (Datum) 0;
+				n[c] = true;
+			}
+		}
+		tup = heap_form_tuple(desc, v, n);
+		kc_logical_append_tuple(&sb, tup);
+		heap_freetuple(tup);
+		nt++;
+		if (nt >= 512 || sb.len >= 1024 * 1024)
+		{
+			kc_xlog_logical(rel, nt, sb.data, sb.len);
+			resetStringInfo(&sb);
+			nt = 0;
+		}
+	}
+	if (nt > 0)
+		kc_xlog_logical(rel, nt, sb.data, sb.len);
+	pfree(sb.data);
+	pfree(v);
+	pfree(n);
+}
+
 /*
  * Write rows [first, first + count) of the buffer as one stripe.  The caller
  * is in the subtransaction that owns the buffer and holds a lock on rel.
@@ -2455,6 +2515,10 @@ kc_write_stripe(KcRelState *st, KcWriteBuf *b, Relation rel, uint32 first,
 		kc_give_back_tail(rel, res_first + count, res_count - count);
 	}
 	kc_flush_epoch++;
+
+	/* the rows for logical decoding (C7), by the transaction that writes the stripe */
+	if (!maintenance && XLogLogicalInfoActive() && RelationIsLogicallyLogged(rel))
+		kc_log_logical_rows(rel, b, first, count);
 
 	/*
 	 * The stripe can be found by readers from here on.  A reader that took

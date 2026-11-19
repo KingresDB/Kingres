@@ -280,3 +280,28 @@ SELECT * FROM kingres.columnar_check_indexes('pu');
 ------------+----------+--------
 (0 rows)
 
+-- a leaf page of a unique index that fills up with the entries of rolled-back inserts of the same
+-- keys: the B-tree asks the access method which entries may go (bottom-up deletion; the answer
+-- "none" is allowed), and the insert goes on with a page split
+CREATE TABLE ubu (id int, v text) USING columnar;
+CREATE UNIQUE INDEX ubu_id ON ubu (id);
+DO $$ BEGIN
+  FOR i IN 1..12 LOOP
+    BEGIN
+      INSERT INTO ubu SELECT g, 'undo' FROM generate_series(1, 3000) g;
+      RAISE EXCEPTION 'undo';
+    EXCEPTION WHEN raise_exception THEN NULL;
+    END;
+  END LOOP;
+END $$;
+INSERT INTO ubu SELECT g, 'kept' FROM generate_series(1, 3000) g;
+SELECT count(*), count(DISTINCT id) FROM ubu;
+ count | count 
+-------+-------
+  3000 |  3000
+(1 row)
+
+INSERT INTO ubu VALUES (17, 'duplicate');
+ERROR:  duplicate key value violates unique constraint "ubu_id"
+DETAIL:  Key (id)=(17) already exists.
+DROP TABLE ubu;

@@ -335,6 +335,8 @@ extern int	kc_stat_compare(const KcColInfo *ci, Datum a, Datum b);
  * ------------------------------------------------------------------------
  */
 extern void kc_rmgr_register(void);
+extern void kc_xlog_logical(Relation rel, uint32 ntuples, const char *data, Size len);
+extern void kc_logical_append_tuple(StringInfo sb, HeapTuple tuple);
 extern void kc_require_rmgr(void);
 extern bool kc_rmgr_registered;
 extern void kc_meta_init_storage(Relation rel, const RelFileLocator *rlocator,

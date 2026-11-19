@@ -2,9 +2,9 @@
 # contrib/kingres_columnar/t/034_decoding.pl
 #
 # Logical decoding of transactions that had a call refused at a moment where the
-# server forbids an error (the refusals of C7-01, C8-01, C8-02 and C9-01).  The
-# columnar rows themselves are not decoded (they are not heap records; the README says
-# so, and a publication of a columnar table is refused), but the transaction's other
+# server forbids an error (the refusals of C7-01, C8-01, C8-02 and C9-01)....  The
+# columnar rows are decoded since C7 (rows of stripes the transaction wrote; the README says
+# so), as are the transaction's other
 # changes are, and so are the changes of the stripe catalog (kingres.columnar_stripe,
 # an ordinary heap table), which is where a refusal could show: a refused call must leave
 # no catalog change behind, a transaction that failed because of a refusal must decode to
@@ -86,7 +86,8 @@ like($tx[0], qr/table \w+\.hp: INSERT: a\[integer\]:1/, '... with the heap row')
 my @st = $tx[0] =~ /table kingres\.columnar_stripe: INSERT:.*?row_count\[integer\]:(\d+)/g;
 is(join(',', @st), '1', '... and one stripe of one row in the catalog: the user\'s row, not the refused one');
 is($node->safe_psql('postgres', 'SELECT string_agg(a::text, \',\') FROM t'), '100', '... which is what the table holds');
-unlike($tx[0], qr/table \w+\.t:/, '... and the columnar rows themselves are not decoded');
+like($tx[0], qr/table \w+\.t: INSERT: a\[integer\]:100/, '... and the columnar row itself is decoded (C7): the user\'s row');
+unlike($tx[0], qr/table \w+\.t: INSERT: a\[integer\]:(?!100\b)/, '... and no other row of it: the refused call wrote none');
 
 # 2. a refusal while the transaction is alive (the commit of a subtransaction): the transaction fails and decodes to nothing
 ($o, $e) = run("SET kcevents.at = 'commit_sub'; BEGIN; SELECT kcevents_open('t'); INSERT INTO hp VALUES (2); SAVEPOINT s; INSERT INTO t VALUES (200); RELEASE s; COMMIT;");

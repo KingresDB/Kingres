@@ -135,3 +135,22 @@ VACUUM (INDEX_CLEANUP on) iv;
 SELECT * FROM kingres.columnar_check();
 SELECT * FROM kingres.columnar_check_indexes('iv');
 SELECT * FROM kingres.columnar_check_indexes('pu');
+
+-- a leaf page of a unique index that fills up with the entries of rolled-back inserts of the same
+-- keys: the B-tree asks the access method which entries may go (bottom-up deletion; the answer
+-- "none" is allowed), and the insert goes on with a page split
+CREATE TABLE ubu (id int, v text) USING columnar;
+CREATE UNIQUE INDEX ubu_id ON ubu (id);
+DO $$ BEGIN
+  FOR i IN 1..12 LOOP
+    BEGIN
+      INSERT INTO ubu SELECT g, 'undo' FROM generate_series(1, 3000) g;
+      RAISE EXCEPTION 'undo';
+    EXCEPTION WHEN raise_exception THEN NULL;
+    END;
+  END LOOP;
+END $$;
+INSERT INTO ubu SELECT g, 'kept' FROM generate_series(1, 3000) g;
+SELECT count(*), count(DISTINCT id) FROM ubu;
+INSERT INTO ubu VALUES (17, 'duplicate');
+DROP TABLE ubu;

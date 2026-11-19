@@ -137,7 +137,7 @@ changed:
   the list of live files of the clean-up of the stripe catalog, the drop note
   (`kc_write_note_dropped`), the planner's path (`kc_cscan.c`), the transient table
   of a rewrite (`kc_am.c`) and, in the install script, the event trigger that refuses
-  foreign keys and publications.  The clean-up deletes nothing while a relation's
+  foreign keys and the publications that would include the stripe catalog.  The clean-up deletes nothing while a relation's
   access method cannot be classified.
 * The orphan step reads with two snapshots and a second claim (C11-01); the check
   lets go of each table's lock when it has looked at it (C11-03); the in-place truncate
@@ -625,10 +625,32 @@ All with SQLSTATE `0A000`.
 * A parallel-safe function that reads a columnar table inside a parallel worker
   fails with `0A000`: only the scans of the plan the leader started may run in a
   worker (see "Parallel scan").
-* Logical replication: a columnar table cannot be put in a publication, a
-  publication that would include one (`FOR ALL TABLES`, `TABLES IN SCHEMA`) is
-  refused, and so is creating a columnar table into such a scope: "columnar
-  tables are not replicated logically yet".
+* **Logical replication (0.2, C7): the inserts of a columnar table are decoded.**  A columnar
+  table can be in a publication (`FOR TABLE`, also through the root of a partitioned table), and
+  a subscriber (a heap or a columnar table) receives its rows: the initial copy is an ordinary
+  read, and what is inserted afterwards is decoded from the log.  How: when `wal_level` is
+  `logical` and the table is logically logged (`RelationIsLogicallyLogged`: not a catalog, not
+  unlogged, not temporary), the flush of a stripe also writes `LOGICAL_INSERT` records, the rows of the stripe
+  as heap tuples, up to 512 rows or about 1 MB to a record (**the WAL of a load at `wal_level =
+  logical` is about twice what it is otherwise**, the raw rows in addition to the compressed pages; at any
+  other level nothing is written), and the resource manager's `rm_decode` queues them as
+  inserts of the reorder buffer, as `heap_decode` does for a heap insert (it needs the library on the
+  publisher, and the standbys replay the records without a page).  The record is written by the
+  transaction or subtransaction that writes the stripe, which is the one whose commit makes
+  the stripe visible: the rows are sent when a reader could see them, a savepoint that is rolled back
+  sends nothing even if its rows were flushed by memory pressure, a prepared transaction is decoded at
+  `PREPARE TRANSACTION` when the subscription has `two_phase`, and a crash loses only what the
+  log does not hold.  **What differs from a heap table**: the rows of a stripe are decoded when it is
+  written (at commit, at `PREPARE`, at a flush by size or memory), so the order of the changes of
+  one transaction across tables is not the statement order (the changes of a table are in order);
+  `UPDATE` and `DELETE` do not exist, so a publication needs no replica identity for them
+  (`REPLICA IDENTITY FULL` is accepted, for the checks that ask for one); `TRUNCATE` is decoded by the
+  server as for any table; the copies `columnar_compact`, `VACUUM FULL` and
+  `SET ACCESS METHOD` make are no new rows and are not logged.  **What is still refused**: a publication
+  that would include the stripe catalog `kingres.columnar_stripe` (`FOR ALL TABLES`, `FOR TABLES IN
+  SCHEMA kingres`), when a columnar table exists or is made: its rows describe the files of one server
+  and must not be applied by a subscriber; list the tables (`FOR TABLE ...`) instead.  Tested in
+  `t/061_logical.pl` against a subscriber row by row.
 * A row cannot be fetched by TID (C6b). `ctid` shows a number made from the row's
   position; without reserved row numbers it is not stable and means nothing, and
   with them (0.2, "Reserved row numbers") it is the TID the insert returned, until
@@ -893,10 +915,8 @@ Set `search_path` explicitly, or create the tables in another schema.
 Append-only, B-tree indexes only (unique ones too), no TOAST (values up to the 1 GB limit of one value are
 stored inline), at most about 8.8 x 10^12 rows per table, 150000-row stripes
 mean small transactions make small stripes, serial scans only, no vectorised
-execution, skipping is not in the cost estimate, logical decoding is not
-supported: a publication that would publish a columnar table is refused,
-whatever form it has (also `publish_via_partition_root` through the root of a
-partitioned table, and the table side of it), and a hostile or damaged file can
+execution, skipping is not in the cost estimate, logical decoding covers inserts only (there is
+no update or delete) and doubles the log of a load at `wal_level = logical`, and a hostile or damaged file can
 give a clean error but not always the right data.
 
 Memory and costs worth knowing:
