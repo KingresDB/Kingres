@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -384,7 +386,21 @@ func (o *Ops) dropDB(ctx context.Context, p dropParams) error {
 		return err
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
-	return run(ctx, c, stmt().Text("DROP DATABASE IF EXISTS").ID(sqlx.MustIdent(p.Name)).Text("WITH (FORCE)"))
+	// WITH (FORCE) ends the sessions that are there, but a session that connects in the moment between that and the drop (the collector of the
+	// ledger reads every database) makes the drop fail with 55006: that is tried again a few times before the step fails.
+	var err2 error
+	for attempt := 0; attempt < 6; attempt++ {
+		err2 = run(ctx, c, stmt().Text("DROP DATABASE IF EXISTS").ID(sqlx.MustIdent(p.Name)).Text("WITH (FORCE)"))
+		if err2 == nil || !strings.Contains(err2.Error(), "55006") {
+			return err2
+		}
+		select {
+		case <-ctx.Done():
+			return err2
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	return err2
 }
 
 func (o *Ops) stepDropSettings(ctx context.Context, env *task.Env) error {

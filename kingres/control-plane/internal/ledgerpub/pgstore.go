@@ -546,6 +546,9 @@ func (s PGStore) Object(ctx context.Context, origin, rest string) (Object, error
 	if err != nil {
 		return Object{}, err
 	}
+	if strings.HasPrefix(rest, "anchors/") {
+		return s.evidenceFile(ctx, row, rest)
+	}
 	r, err := ParseRest(rest)
 	if err != nil {
 		return Object{}, ErrNotFound

@@ -21,7 +21,11 @@ import (
 type SysFunc func(ctx context.Context, f func(c *pgx.Conn) error) error
 
 // PGStore is the Store in kingres_cp (migration 0030).
-type PGStore struct{ Sys SysFunc }
+type PGStore struct {
+	Sys SysFunc
+	// OnWrite, when set, is called after the guard of a change that appends events, with the kind "event" (a test ends the process there).
+	OnWrite func(kind string)
+}
 
 // BumpTerm is the scheduler's Bump: it increments the stored term.
 func (s PGStore) BumpTerm(ctx context.Context) (scheduler.Term, error) {
@@ -130,6 +134,9 @@ func (s PGStore) Commit(ctx context.Context, term scheduler.Term, expect int64, 
 		defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 		if err := term.Guard(ctx, tx); err != nil {
 			return err
+		}
+		if s.OnWrite != nil && len(ch.Events) > 0 {
+			s.OnWrite("event")
 		}
 		tag, err := tx.Exec(ctx, `UPDATE kingres_cp.ledger_cluster SET keys_revision = keys_revision + 1 WHERE keys_revision = $1`, expect)
 		if err != nil {

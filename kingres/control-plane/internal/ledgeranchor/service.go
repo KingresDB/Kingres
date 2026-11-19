@@ -91,6 +91,7 @@ type Service struct {
 	mu          sync.Mutex
 	lastEnqueue time.Time
 	inflight    map[int64]bool
+	dutyLogged  map[int64]time.Time
 	exporters   map[string]exporter
 }
 

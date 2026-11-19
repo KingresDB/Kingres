@@ -3339,3 +3339,29 @@ Esplora-compatible explorer of a node the operator trusts (`/block-height/<h>`, 
 allows. No credentials. `jobs.go` gives every submitted or claimed record a time for its next look (`UpgradeInterval`), also a claimed record that has none, applies `ExpireIfDue` with the timeouts of the library, keeps what the calendars that answered gave when a
 submission is partial and passes it to `Resume` at the next attempt, and notes contradicted claims in `lastError` and the log. The Test button warns when the table of real headers of the build is older than a year, and so does a line in the log at start.
 `downloadLedgerAnchor?format=ots` writes the detached `.ots` file.
+
+### Part A of the last round (corrections 187 to 192)
+
+* **The 305 blocks (187):** explained, not a fault. The helper of the cluster test makes one digest for each row it writes, and a digest closes a block, so the rows of a test make as many blocks as the test has digests plus the
+  blocks of the extension's own tables. `TestAQuietLedgerDatabaseStaysQuiet` (`KINGRES_QUIET_MINUTES`, default 3) writes five rows with no digest, lets the collector publish, and then watches ten minutes: the blocks, the digests,
+  the sizes of every published log and the number of events did not change (pg18: blocks `[1 1]` to `[1 1]`, digests `[0 0]` to `[0 0]`, 659 s). The builder puts the pending transactions of one visit into one block.
+* **The whole fixture (188):** `TestLedgerPublicationOfADatabaseOnTwoGroups` saves the whole publication (`events/`, `keyring.json`, `logs.json`, the tiles and the latest checkpoint of every log) twice: `first` after the first
+  verifier pass and `second` after growth and a round, so every log has two checkpoints; one WORM target (the fake S3 of the test) holds one anchored record and its evidence file. To regenerate:
+  `scripts/run-integration.ps1 -Fixtures <windows dir> -Run TestLedgerPublicationOfADatabaseOnTwoGroups` (with `-Install` for the other major) for each major; the directories are `<dir>/first` and `<dir>/second`. `-TestEnv 'A=b;C=d'` passes environment to the test.
+  Nothing under `kingres/verifier` was changed.
+* **Process kills in a round (189):** `TestLedgerSurvivesAKillAtEveryOtherKindOfWrite` kills the leader at a write of kind digest, log, unread, state, retired, event and note (the hook `fault.Spec.LedgerExitKind`; "event" is new, at the
+  commit of a key event in `ledgersign.PGStore`), restarts it, and checks: no log diverged or closed that should not be, the stored logs audit against their tiles, every log passes the verifier, and `published.json` agrees with the database.
+  `TestTheConcurrencyLimitIsNeverExceeded` (package `ledgerpub`) holds the limit of two with ten requests: the peak is two, eight get 503 with `Retry-After`.
+  `TestAFollowerThatForwardsAHostileBodyLeaksNoCredential` sends truncated, oversized, mistyped and trailing bodies with credentials through a follower: no answer, log or audit entry holds a credential.
+* **Duties 9 and 10 (190):** the Test of a WORM target reports the checks `retention` (ok), `retention-ends` (warning when the object lock ends within 30 days), `retention-ended` (failed), `evidence-attempt` (warning when `attempt` is null),
+  `evidence-found` (warning when the store says the evidence was found) and `server-clock` (the store's `Date` against the database clock: warning above 30 s, failed above 5 minutes, the text names both times). The same checks run in the
+  monitor job and as an hourly line in the log.
+* **Retry limits (191):** the contract has no member for them, so the daemon reads `KINGRES_ANCHOR_MAX_RETRY_ATTEMPTS` and `KINGRES_ANCHOR_MAX_RETRY_AGE_HOURS` (the names the settings would have: `anchor.maxRetryAttempts`,
+  `anchor.maxRetryAgeHours`); a bad value is refused at start with a log line and the default is kept.
+* **Evidence files in the publication (192):** `a/<aggregate id>/anchors/<size>/<target>.json` serves the canonical evidence of an anchored (or submitted or claimed, with evidence) record, only at that path; it is never listed
+  (`logs.json` is unchanged) and is `Mutable`, so a short cache.
+* **Found by the cluster runs:** a drop task ends the publication first and drops the database a few steps later, so the collector saw the chain of a database it had just retired as a closed chain coming back and raised a critical
+  alert. For the reason "dropped" that is now silent for `DropGrace` (30 minutes) after the retirement. The step "Drop the database" also tries the drop again on SQLSTATE 55006 (a session that connected between the termination of
+  the sessions and the drop).
+* **"Anchored" through the header source (not done):** the OTS library has no exported way to inject the proof-of-work check, and a real block header cannot be matched to the merkle root a calendar returns, so the outcome
+  "anchored" through the wiring cannot be shown without a library change. The claim path is tested up to `claimed`.

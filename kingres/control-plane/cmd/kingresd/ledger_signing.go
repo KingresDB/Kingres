@@ -97,6 +97,9 @@ func newLedgerParts(cfg config.Config, svc *cluster.Service, self string, log *s
 		return f(c)
 	}
 	store := ledgersign.PGStore{Sys: sys}
+	if faultHook != nil {
+		store.OnWrite = faultHook.LedgerWrite
+	}
 	sched, err := scheduler.New(scheduler.Config{
 		Self: self, Leader: leaders.Get, Margin: cfg.HA.LeaseMargin, Bump: store.BumpTerm, Log: log.With("component", "scheduler"),
 	})

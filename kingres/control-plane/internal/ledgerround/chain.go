@@ -95,6 +95,13 @@ func (c *Collector) chain(ctx context.Context, pc *ledgersign.PubContext, term s
 			// chain is back: its log is NOT opened again and nothing is published for the new blocks, until the next epoch of step 20 is
 			// started by an operator. That is said loudly (P8-03): a critical alert names the group, the height now and why the log was
 			// closed. An auditor sees the closed log with its chain-retired event and nothing after it.
+			// The task that drops a database ends the publication first and drops the database a few steps later, so the chain is still
+			// there for a short time after the retirement for "dropped": that window is no return of a closed chain (found by the cluster
+			// test of the drop in the round of part A). Nothing is published for it and no alert is raised until DropGrace has passed.
+			if closed.Detail == "retired: "+ReasonDropped && closed.ClosedAt != nil && c.cfg.Clock().Sub(*closed.ClosedAt) < DropGrace {
+				gr.Log, gr.Diverged = closed, true
+				return nil
+			}
 			c.alert(ctx, AlertDiverged, "critical", db, g, fmt.Sprintf("The chain of shard group %d (head %d) is back with the chain id of a log whose publication ended (%s). Its new blocks are not published until a new epoch is started.", g, gr.Resp.Height, closed.Detail), true)
 			gr.Log, gr.Diverged = closed, true
 			return nil

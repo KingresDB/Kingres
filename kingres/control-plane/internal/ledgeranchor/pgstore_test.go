@@ -5,6 +5,7 @@ package ledgeranchor
 import (
 	"context"
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/anchor"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgerpub"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pgtest"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/scheduler"
@@ -196,3 +198,36 @@ func TestTheDatabaseStoreKeepsTheRulesOfTheStore(t *testing.T) {
 
 // rebuildOn makes the service again over the given store (a restart of the process, with the same credentials directory).
 func (e *env) rebuildOn(st Store) { e.store = st; e.rebuild("") }
+
+// The evidence file is published below the aggregate log (correction 187): the same bytes as downloadLedgerAnchor, under the canonical path
+// only, nothing for a record without evidence.
+func TestTheEvidenceFileIsPublishedUnderTheAggregateLog(t *testing.T) {
+	e, _, st := pgEnv(t)
+	tg := e.addWorm("vault")
+	e.putAgg("shop", 3)
+	if err := e.runEnqueue(); err != nil {
+		t.Fatal(err)
+	}
+	pub := ledgerpub.PGStore{Sys: ledgerpub.SysFunc(st.Sys)}
+	r0 := e.rows()[0]
+	path := "anchors/3/" + strconv.FormatInt(tg.ID, 10) + ".json"
+	if _, err := pub.Object(bg(), r0.Origin, path); !errors.Is(err, ledgerpub.ErrNotFound) {
+		t.Fatalf("a record without evidence: %v", err)
+	}
+	if err := e.runSubmit(); err != nil {
+		t.Fatal(err)
+	}
+	o, err := pub.Object(bg(), r0.Origin, path)
+	if err != nil || !o.Mutable || o.ContentType != "application/json" {
+		t.Fatalf("%v %+v", err, o)
+	}
+	want, err := e.svc.Evidence(e.ctx(), "shop", r0.ID, "json")
+	if err != nil || string(o.Data) != string(want.Data) {
+		t.Fatalf("the published file is not the downloaded one: %v", err)
+	}
+	for _, bad := range []string{"anchors/03/" + strconv.FormatInt(tg.ID, 10) + ".json", "anchors/3/" + strconv.FormatInt(tg.ID, 10), "anchors/3/99.json", "anchors/4/1.json", "anchors", "anchors/3", "anchors/3/1.json/x"} {
+		if _, err := pub.Object(bg(), r0.Origin, bad); !errors.Is(err, ledgerpub.ErrNotFound) {
+			t.Errorf("%s: %v", bad, err)
+		}
+	}
+}

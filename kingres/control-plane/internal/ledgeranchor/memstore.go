@@ -28,6 +28,8 @@ type MemStore struct {
 	// Hook, when set, is called at the start of every write with its kind ("target", "enqueue", "begin", "apply",
 	// ...); an error it returns is the error of the write, which then changes nothing.
 	Hook func(kind string) error
+	// Now is the clock of the "database" (time.Now when nil).
+	Now func() time.Time
 }
 
 type memAgg struct {
@@ -434,4 +436,14 @@ func (m *MemStore) Failures(context.Context) ([]Row, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil
+}
+
+// DBTime implements Store: the clock of the "database" is Now (time.Now when nil).
+func (m *MemStore) DBTime(context.Context) (time.Time, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.Now != nil {
+		return m.Now().UTC(), nil
+	}
+	return time.Now().UTC(), nil
 }

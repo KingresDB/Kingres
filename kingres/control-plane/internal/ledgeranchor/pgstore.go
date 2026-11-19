@@ -581,3 +581,10 @@ func (s PGStore) Failures(ctx context.Context) ([]Row, error) {
 	})
 	return out, err
 }
+
+// DBTime implements Store.
+func (s PGStore) DBTime(ctx context.Context) (time.Time, error) {
+	var t time.Time
+	err := s.read(ctx, func(c *pgx.Conn) error { return c.QueryRow(ctx, `SELECT now()`).Scan(&t) })
+	return t.UTC(), err
+}

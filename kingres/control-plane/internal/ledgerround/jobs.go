@@ -19,6 +19,10 @@ const Tick = 10 * time.Second
 // publication of its chains (ReasonDatabaseMissing). One answer is not enough: an instance that is being rebuilt answers the same.
 const DefaultMissingFor = 30 * time.Minute
 
+// DropGrace is how long after the retirement of a chain for "dropped" the same chain may still be read without an alert: the task of a drop
+// ends the publication first and drops the database in its later steps.
+const DropGrace = 30 * time.Minute
+
 // Jobs returns the jobs of the collector for the scheduler (design 6.7): ledger.round and ledger.digest. Both run on the manager leader
 // only, under its term; a pass that returns scheduler.ErrDeposed ends the leadership.
 func (c *Collector) Jobs() []scheduler.Job {

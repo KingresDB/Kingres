@@ -182,4 +182,6 @@ type Store interface {
 	NewestAnchored(ctx context.Context) ([]Anchored, error)
 	// Failures lists the failed and expired records of live targets that carry an alert, without notes.
 	Failures(ctx context.Context) ([]Row, error)
+	// DBTime is the clock of the database.
+	DBTime(ctx context.Context) (time.Time, error)
 }

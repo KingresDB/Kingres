@@ -205,6 +205,13 @@ func (s *Service) jobMonitor(ctx context.Context, _ scheduler.Term) error {
 		return nil
 	}
 	sn, err := s.snapshot(ctx)
+	if err == nil {
+		ts := make([]TargetRow, 0, len(sn.Views))
+		for _, v := range sn.Views {
+			ts = append(ts, v.Row)
+		}
+		s.logDuties(ctx, ts)
+	}
 	if err != nil {
 		return err
 	}

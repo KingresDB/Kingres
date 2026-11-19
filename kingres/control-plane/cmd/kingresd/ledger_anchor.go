@@ -7,10 +7,14 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log/slog"
+	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/anchor"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/config"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgeranchor"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/membership"
@@ -70,7 +74,7 @@ func newLedgerAnchor(cfg config.Config, dir string, sys func(ctx context.Context
 	}
 	svc, err := ledgeranchor.New(ledgeranchor.Config{
 		Store: ledgeranchor.PGStore{Sys: sys}, Creds: creds, Term: sched.Term, Log: log.With("component", "ledger-anchor"),
-		Alert: alert,
+		Alert: alert, Limits: anchorLimits(os.Getenv, log),
 		OpenAlerts: func(ctx context.Context) ([]ledgeranchor.OpenAlert, error) {
 			var out []ledgeranchor.OpenAlert
 			err := sys(ctx, func(c *pgx.Conn) error {
@@ -139,4 +143,27 @@ func newLedgerAnchor(cfg config.Config, dir string, sys func(ctx context.Context
 		}
 	}
 	return svc, nil
+}
+
+// anchorLimits reads the limits of the retries of a record (design 6.6, duty 16 of internal/anchor): KINGRES_ANCHOR_MAX_RETRY_ATTEMPTS (an integer,
+// default 200) and KINGRES_ANCHOR_MAX_RETRY_AGE_HOURS (an integer, default 168). They are the settings anchor.maxRetryAttempts and
+// anchor.maxRetryAgeHours of the design; the settings schema of the contract (LedgerAnchorSettings) has no member for them, so they are
+// environment variables of the daemon and not cluster settings (correction 189). A value that is not a positive integer is ignored with a warning.
+func anchorLimits(getenv func(string) string, log *slog.Logger) anchor.Limits {
+	var l anchor.Limits
+	if v := getenv("KINGRES_ANCHOR_MAX_RETRY_ATTEMPTS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			l.MaxAttempts = n
+		} else {
+			log.Warn("KINGRES_ANCHOR_MAX_RETRY_ATTEMPTS is not a positive integer: the default is used")
+		}
+	}
+	if v := getenv("KINGRES_ANCHOR_MAX_RETRY_AGE_HOURS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 24*365 {
+			l.MaxAge = time.Duration(n) * time.Hour
+		} else {
+			log.Warn("KINGRES_ANCHOR_MAX_RETRY_AGE_HOURS is not a number of hours from 1 to 8760: the default is used")
+		}
+	}
+	return l
 }

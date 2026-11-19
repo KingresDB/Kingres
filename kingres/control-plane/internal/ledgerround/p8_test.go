@@ -160,3 +160,30 @@ func TestALossOfOneBlockAndAnEmptyAnswerAreDivergences(t *testing.T) {
 		t.Fatalf("an empty answer: %s %q", l.State, l.Detail)
 	}
 }
+
+// The task of a drop ends the publication first and drops the database a few steps later, so the chain of a database that was just retired for
+// "dropped" is still read: that raises no alert for DropGrace, nothing is published for it, and after the grace the return is reported as any other.
+func TestTheChainOfADatabaseBeingDroppedRaisesNoAlertForTheGrace(t *testing.T) {
+	a, b := newChain(1, 3), newChain(40, 2)
+	e := newEnv(t, a, b)
+	e.round()
+	if err := e.coll.RetireDatabase(bg, "shop", ReasonDropped, true); err != nil {
+		t.Fatal(err)
+	}
+	size, events := e.chainLog(0).Size, len(eventsOf(e.keys))
+	a.add(1)
+	e.alerts = nil
+	e.advance(time.Minute)
+	e.round()
+	if e.hasAlert(AlertDiverged + "/raise/critical/database:shop|group:0") {
+		t.Fatalf("an alert inside the grace of a drop: %v", e.alerts)
+	}
+	if l := e.chainLog(0); l.Size != size || l.State != ledgerpub.StateClosed || len(eventsOf(e.keys)) != events {
+		t.Errorf("something was published for the chain of a database being dropped: %+v", l)
+	}
+	e.advance(DropGrace)
+	e.round()
+	if !e.hasAlert(AlertDiverged + "/raise/critical/database:shop|group:0") {
+		t.Fatalf("no alert after the grace: %v", e.alerts)
+	}
+}

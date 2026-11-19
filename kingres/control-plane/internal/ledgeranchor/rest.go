@@ -399,8 +399,9 @@ func (s *Service) TestTarget(ctx context.Context, id int64) (api.LedgerAnchorTes
 		cctx, cancel := context.WithTimeout(ctx, TestTimeout)
 		res := b.Target.Test(cctx)
 		cancel()
-		for _, w := range b.Info.Warnings {
-			_ = w // the kinds put their own warnings in the checks
+		if b.Kind.Name == anchor.KindWORM {
+			res.Checks = append(res.Checks, s.clockCheck(ctx))
+			res.Checks = append(res.Checks, s.evidenceChecks(ctx, row)...)
 		}
 		out = apiTest(res, b.Red, s.now())
 	}

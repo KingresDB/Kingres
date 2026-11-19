@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -455,5 +456,62 @@ func TestLogsJSONListsTheLogsInTheDefinedFormat(t *testing.T) {
 		if c := get(t, h, "GET", p).Code; c != 404 && c != 400 {
 			t.Errorf("%s: %d", p, c)
 		}
+	}
+}
+
+// The concurrency limit by a real assertion (P8-09): with a limit of 2 and ten requests that all wait inside the store, at most two are ever inside
+// at once, and the others are answered 503 with Retry-After at once, not after a timeout.
+func TestTheConcurrencyLimitIsNeverExceeded(t *testing.T) {
+	var inside, peak atomic.Int64
+	release := make(chan struct{})
+	h := &ledgerpub.Handler{MaxConcurrent: 2, RatePerSecond: 100000, Objects: func(ctx context.Context, p ledgerpub.LogPath) (ledgerpub.Object, error) {
+		n := inside.Add(1)
+		for {
+			old := peak.Load()
+			if n <= old || peak.CompareAndSwap(old, n) {
+				break
+			}
+		}
+		defer inside.Add(-1)
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return ledgerpub.Object{Data: []byte("{}"), Mutable: true, ContentType: "application/json"}, nil
+	}}
+	var wg sync.WaitGroup
+	codes := make(chan int, 10)
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w := get(t, h, "GET", "/keyring.json")
+			if w.Code == 503 && w.Header().Get("Retry-After") == "" {
+				t.Error("a 503 without Retry-After")
+			}
+			codes <- w.Code
+		}()
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for len(codes) < 8 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(codes) != 8 {
+		t.Fatalf("%d requests were answered while two were held: the others were not refused at once", len(codes))
+	}
+	close(release)
+	wg.Wait()
+	close(codes)
+	ok, busy := 0, 0
+	for c := range codes {
+		switch c {
+		case 200:
+			ok++
+		case 503:
+			busy++
+		}
+	}
+	if ok != 2 || busy != 8 || peak.Load() != 2 {
+		t.Errorf("ok %d busy %d peak inside %d", ok, busy, peak.Load())
 	}
 }
