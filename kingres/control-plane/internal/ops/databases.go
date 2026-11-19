@@ -80,7 +80,10 @@ func (o *Ops) Definitions() []task.Definition {
 			if err != nil {
 				return nil, err
 			}
-			steps := o.perServer(p.Servers, "Drop the database on server %s", o.stepDropOn)
+			// The publication of the ledger ends first: the final round needs the database, and the chain-retired events are what tells an
+			// auditor that the chains ended by an act of the control plane and were not rolled back.
+			steps := []task.Step{{Name: "End the publication of the ledger", Run: o.stepLedgerRetire}}
+			steps = append(steps, o.perServer(p.Servers, "Drop the database on server %s", o.stepDropOn)...)
 			return append(steps,
 				task.Step{Name: "Drop the database", Irreversible: true, Run: o.stepDropDB},
 				task.Step{Name: "Remove the settings", Run: o.stepDropSettings}), nil

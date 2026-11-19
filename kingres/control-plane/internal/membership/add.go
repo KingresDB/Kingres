@@ -62,6 +62,9 @@ type Manager struct {
 	GatherSigner *fwdproof.Signer
 	// Fault is the fault-injection hook of the tests (nil in production).
 	Fault *fault.Hook
+	// LedgerRetire ends the publication of the ledger chains of the groups that a server runs, before the server is removed: a final read, the
+	// chain-retired events and one aggregate leaf in which the members are retired (nil: the ledger is not published).
+	LedgerRetire func(ctx context.Context, server string) error
 	// Standbys removes the standbys that go with a server that is removed or leaves
 	// (nil: none are managed).
 	Standbys interface {

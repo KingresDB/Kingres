@@ -155,6 +155,11 @@ var Calls = map[string]Policy{
 	"POST /ledger/key/remove":  LeaderOnly,
 	"POST /ledger/key/list":    LeaderOnly,
 
+	// The collector of the publication (internal-api.md, "The ledger read and publication calls"): the leader asks the server that runs the
+	// primary of a shard group for the head, a digest or the blocks of a ledger; a follower asks the leader for one file of the publication.
+	"POST /ledger/read":            LeaderOnly,
+	"POST /ledger/publication/get": ToLeader,
+
 	"POST /config/state":   LeaderOnly,
 	"POST /config/apply":   LeaderOnly,
 	"POST /config/check":   LeaderOnly,
@@ -177,6 +182,7 @@ var handled = map[string]bool{
 	"POST /failover/unfreeze": true, "POST /failover/standbys-gone": true,
 	"POST /failover/lease": true, "POST /failover/demote": true, "POST /failover/promote": true, "POST /failover/prepared": true, "POST /standby/repoint": true,
 	"POST /ledger/key/install": true, "POST /ledger/key/remove": true, "POST /ledger/key/list": true,
+	"POST /ledger/read": true, "POST /ledger/publication/get": true,
 	"POST /config/state": true, "POST /config/apply": true, "POST /config/check": true, "POST /config/restart": true, "GET /time": true,
 }
 

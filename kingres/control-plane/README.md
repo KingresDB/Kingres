@@ -158,6 +158,8 @@ server at start. The DSN is never logged.
 | `pg-bin-dir` | `KINGRES_PG_BIN_DIR` | none | directory of `postgres`, `initdb`, `pg_ctl`, `pg_config` (the package sets `/opt/kingres/bin`). Unset: the directory of the kingresd binary, then `PATH`; none found: instance management is off and `initCluster` answers 422. A directory that is not a KingresDB build of a supported PostgreSQL major (18 or 19, pre-releases such as `19rc2` included; all programs of one major) stops the server |
 | `ledger-keys-dir` | `KINGRES_LEDGER_KEYS_DIR` | `<data-dir>/ledger/keys` | directory of the private signing keys of the ledger (`signing/<fingerprint>.key`, mode 0600, directory 0700). It may be on another volume; back it up off the cluster, separately from the passphrase file (design 9.2) |
 | `ledger-key-passphrase-file` | `KINGRES_LEDGER_KEY_PASSPHRASE_FILE` | none | file (mode 0600, one line) with the passphrase that seals the signing key files (PBKDF2-HMAC-SHA256, AES-256-GCM). Read at the start and whenever a key file is read or written, never from the environment or the command line. Without it the key files are in clear text, like `ca.key`; every server that holds keys needs the same passphrase |
+| `ledger-publication-listen` | `KINGRES_LEDGER_PUBLICATION_LISTEN` | empty (off) | `host:port` of the HTTP listener that serves the published ledger (checkpoints, tiles, entry bundles, events, the key ring) to anybody, with no authentication; every server can run one (a follower asks the leader). Empty: no listener |
+| `ledger-publication-tls-cert`, `ledger-publication-tls-key` | `KINGRES_LEDGER_PUBLICATION_TLS_CERT`, `KINGRES_LEDGER_PUBLICATION_TLS_KEY` | none | certificate and key files of the publication listener, set together and only with `ledger-publication-listen`; without them it is plain HTTP |
 | `socket-dir` | `KINGRES_SOCKET_DIR` | `<data-dir>/run` | base directory of the instances' unix sockets (the package sets `/run/kingres`); never `/tmp` |
 | `pg-port`, `pg-listen` | `KINGRES_PG_PORT`, `KINGRES_PG_LISTEN` | `5432`, `127.0.0.1` | port and `listen_addresses` of the managed instance. In a cluster of several servers `pg-listen` must include the address the other servers reach this one at (the `server-host`), and `127.0.0.1` for kingresd itself, for example `127.0.0.1,10.0.0.12` |
 | `internal-listen` | `KINGRES_INTERNAL_LISTEN` | empty (off) | host:port of the mutual-TLS listener of the internal server-to-server API. **Required to join, add or remove servers and for forwarding.** By convention it is the port above the REST API (`listen` 8091, `internal-listen` 8092): the contract names only the REST address of a server, and the internal API of that server is found at the next port (kingresd warns when it is not) |
@@ -336,7 +338,7 @@ paths; what is not done is in "Not done in this increment"). "Real" means the op
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **109 of 132 operations are real; 23 answer "not yet".**
+authenticated operation lists in 0.2.0. **112 of 132 operations are real; 20 answer "not yet".**
 
 | Tag | Real | Not yet |
 |---|---|---|
@@ -347,7 +349,7 @@ authenticated operation lists in 0.2.0. **109 of 132 operations are real; 23 ans
 | Roles | `listClusterRoles`, `listRoles`, `createRole`, `getRole`, `deleteRole`, `updateRole`, `setRoleClusterRoles`, `setRoleMemberships` |  |
 | Databases | `getDatabaseCreateOptions`, `listDatabases`, `createDatabase`, `getDatabase`, `dropDatabase`, `updateDatabase` |  |
 | Shards | `getBucketDistribution`, `listColocationGroups`, `listBuckets` |  |
-| Ledger | `getLedgerStatus`, `listLedgerBlocks`, `listLedgerDigests`, `generateLedgerDigest`, `startLedgerVerification`, `listLedgerStatus`, `createInclusionProof`, `listLedgerVerifications`, `getLedgerVerification`, `getLedgerSettings`, `updateLedgerSettings`, `getLedgerSigning`, `createLedgerSigningKey`, `retireLedgerSigningKey`, `revokeLedgerSigningKey`, `getLedgerTrustFile` | `getLedgerPublication`, `listLedgerAnchorTargets`, `createLedgerAnchorTarget`, `getLedgerAnchorTarget`, `updateLedgerAnchorTarget`, `deleteLedgerAnchorTarget`, `testLedgerAnchorTarget`, `getLedgerAggregate`, `listLedgerAggregates`, `listLedgerAnchors`, `anchorLedgerNow`, `retryLedgerAnchor`, `downloadLedgerAnchor`, `createLedgerBundle`, `getLedgerBundle`, `listLedgerClientKeys`, `registerLedgerClientKey`, `revokeLedgerClientKey`, `setTableSignaturePolicy`, `upgradeLedgerExtension`, `acknowledgeLedgerDivergence` |
+| Ledger | `getLedgerStatus`, `listLedgerBlocks`, `listLedgerDigests`, `generateLedgerDigest`, `startLedgerVerification`, `listLedgerStatus`, `createInclusionProof`, `listLedgerVerifications`, `getLedgerVerification`, `getLedgerSettings`, `updateLedgerSettings`, `getLedgerSigning`, `createLedgerSigningKey`, `retireLedgerSigningKey`, `revokeLedgerSigningKey`, `getLedgerTrustFile`, `getLedgerPublication`, `getLedgerAggregate`, `listLedgerAggregates` | `listLedgerAnchorTargets`, `createLedgerAnchorTarget`, `getLedgerAnchorTarget`, `updateLedgerAnchorTarget`, `deleteLedgerAnchorTarget`, `testLedgerAnchorTarget`, `listLedgerAnchors`, `anchorLedgerNow`, `retryLedgerAnchor`, `downloadLedgerAnchor`, `createLedgerBundle`, `getLedgerBundle`, `listLedgerClientKeys`, `registerLedgerClientKey`, `revokeLedgerClientKey`, `setTableSignaturePolicy`, `upgradeLedgerExtension`, `acknowledgeLedgerDivergence` |
 | Tables | `getTable`, `distributeTable`, `enableTableLedger`, `listTables` |  |
 | Grants | `listGrants`, `createGrant`, `revokeGrants`, `applyGrantTemplate` |  |
 | Health | `getHealth`, `getReadiness` |  |
@@ -2867,7 +2869,7 @@ subtest also waits for the lease to be freshly held before it steps the clock.
 Design: `kingres/docs/design/ledger-phase7.md` (3.2 to 3.4, 6.7, 8.2 to 8.4, 9.1 to 9.3 and the corrections of section 14). This
 increment is the control plane's foundation of phase 7: the contract (every operation of 8.4 is in `openapi.yaml`; the ones that
 are not built answer 422 `unsupported_operation`), the migration, the scheduler with its term guard, and everything about the
-**server signing keys**. Nothing is signed or published yet: the collector, the chain logs and the aggregate are the next steps (5 and 6).
+**server signing keys**. What signs with them is the collector of the next section (steps 5 and 6).
 
 ### What exists
 
@@ -2904,7 +2906,7 @@ row; the term guards the key tables. The jobs of this step:
 |---|---|---|
 | `ledger.key.due` | 1 min | `DueForRetirement`: starts the task `ledger.key.retire` (actor `system`, one audit entry) for an active key whose overlap ended |
 | `ledger.signer.check` | 10 s | raises or clears the alert `ledgerSignerUnavailable` (critical, subject `cluster`): the key set is damaged, differs from the published trust file, or the file of an active or next key is missing on this server |
-| `ledger.key.sync` | 1 min | compares what every holder has with what it should have and starts `ledger.key.distribute` only when there is something to do (an unreachable server is tried again at the next pass and never makes a task) |
+| `ledger.key.sync` | 1 min | compares what every holder has with what it should have and starts `ledger.key.distribute` only when there is something to do (an unreachable server that is a holder is tried again at the next pass; a server that left the cluster is forgotten; the same state is not started again for 15 minutes) |
 
 ### Tasks (all of subject `ledgerKey` / `signing`: one key task at a time, cluster-wide)
 
@@ -2962,9 +2964,44 @@ the migration runner accepts gaps and applies every migration it has not recorde
 of the key tasks is `ledgerKey` / `signing` (124); `compromised-since` is clamped (125); a revocation never creates a key (126); holders are the
 servers of group 0 (127); a retired key that signed nothing is bound to 1 (128); the signer for a rotation and the retirement must exclude each
 other in step 5 (129); a key file is never taken from before the task (130); the passphrases of the holders must agree (131); the
-trust file is built without the `next` keys (132); `Content-Disposition` passes a forwarded answer (133); the tables carry columns the design's list lacks and
-the operations need the term (134); the alert `ledgerSignerUnavailable` is also raised for a damaged set, a trust file that differs and a missing key file (135);
-a key that waited 300 days as `next` is not taken again (136).
+trust file is built without the `next` keys (132); the tables carry columns the design's list lacks (133); the alert `ledgerSignerUnavailable` is also raised for a damagedset, a trust file that differs and a missing key file (134), a stale `next` key keeps its place (135), and `Content-Disposition` passes a forwarded answer (136). The numbers arethose of section 14 of the design (the first version of this paragraph numbered some of them differently). The review of the signing keys adds the decisions of the nextsection.
+
+### Fixes for the review of the signing keys (P7-01 to P7-16)
+
+The independent review found nothing critical or high. What was changed, and what is stated instead of changed:
+
+* **P7-01, signing and retiring exclude each other.** One mechanism with three parts. (1) `Service.Publication` does not give the collector a key whose `key-retired` event is published. (2) The
+  collector stores a checkpoint only while the revision of the key set is the one its signers were read at (`ledgerpub.PutCheckpoint`), and every change of the key set, an event included, raises
+  the revision. (3) Both commits of a retirement carry `Change.CheckpointBound`: the store, holding the row of the cluster under the term guard, refuses the change when a checkpoint above the bound is stored,
+  and the retire step reads the bound again and ends with the task error `bound_exceeded` (the key stays active) when a checkpoint above the bound of its event was stored. Tested with a retirement and a
+  signing pass interleaved at every boundary of the engine (`review_test.go`).
+* **P7-02, the clock.** The "second source" of the clock is the database of the same host on a one-server cluster, so the comparison proves nothing there: a clock that is wrong by an hour passes. It is stated
+  here and not fixed: with several servers the operator is warned by the existing alert `clockDifference` (which compares servers), and an operator of a one-server cluster must keep the clock right (NTP) before the
+  first key is created and before a rotation: a first key activated in the future cannot sign until that time, and `ledger.key.due` retires a key early when the clock jumps forward.
+* **P7-03, a server that left.** A server that is no longer a member (`kingres_cp.server`) and cannot be reached is forgotten as a holder: it leaves `Cluster.Holders`, the log says that key files may remain on
+  that host and that the operator must wipe it (the daemon cannot), and the distribution is not started again for it. A server that is still a member and down stays a holder and is tried again. The sync job does not
+  start a distribution again for the same state within 15 minutes (a holder with another passphrase, or a host that never answers, would otherwise make a task row a minute). A revocation whose last step could not
+  remove a file from a reachable-later server is run again by calling `revokeLedgerSigningKey` once more while a server still has a file of that key (it is refused as before when none has). What remains: the task rows
+  that finished are not pruned (there is no retention in the task engine; the task of the job is started rarely now), and the removal of a server does not wipe its key directory by itself (the sync job does it while the server
+  answers and is no holder; a server that goes away before that must be wiped by hand).
+* **P7-04, a key file that does not open.** `alarmText` opens the file of every active and next key and compares its public key with the row: garbage, another passphrase and another key under the name are the alarm
+  (`signerAlarm`, the alert `ledgerSignerUnavailable`). A holder answers `ledger/key/list` with the files that do not open (`unopenable`); the distribution installs the key again over them (`Keyring.Install` replaces
+  a file that does not open, never one that holds another key).
+* **P7-05, the stored state.** At every load the chain of events is verified: numbered from 0 without a gap, each note parses, carries the number and type of its row, and is signed by a key of the stored set. A changed,
+  added or deleted event is an alarm (no signing, no trust file is served). What an attacker who can write to the system database and holds no signing key can still do: change key rows together with the stored trust file
+  (the two live in the same database), which makes the daemon publish a trust file that lists their key; they cannot make it sign (no key file), cannot forge an event, and an auditor who obtained the fingerprint out of band
+  does not trust the key. Events deleted from the end are not seen. The trust file of the API is no source of first trust; an operator who needs more keeps a copy of `getLedgerTrustFile` off the cluster.
+* **P7-06**: the `compromised-since` of a revocation is decided once, in the event, and the revoke step reads it back. **P7-07**: `kingresd` sets `RLIMIT_CORE` to 0 and is not dumpable (`harden_linux.go`); the install body
+  and the base64 text of a seed on the install path are strings that Go does not let us zero: they stay in memory until the garbage collector frees them, and that is documented, not removed. **P7-08**: errors of key files
+  name the fingerprint, never a path. **P7-09**: temporary key files older than a minute are removed when the keyring starts and when the list call is answered. **P7-10**: a key file is adopted only when it carries
+  the marker the daemon writes next to it (`<fingerprint>.task`, written before the file); a file that somebody placed has none. The marker is no boundary against somebody who can write the directory (they can write it too); the passphrase seal is.
+* **P7-11**: a due retirement that was started is not started again for 10 minutes. No alert at 14 keys and none for a revocation (the audit entry is the record): not added. **P7-12**: the set is read again immediately before a
+  key file is removed, and the file of a key made since the first read is never removed. **P7-13** (a leader change between "generate" and "install"): not changed; the task fails with `key_file_missing` and the key can be revoked
+  once another key is active. **P7-14**: the README numbers now follow section 14; the contract text of `originPrefixLocked` still says "a checkpoint exists" while the server locks at the first key (correction 121): it
+  needs a documentation change of the contract at the next revision. **P7-15**: unchanged (noted).
+* **P7-16, the migration runner.** Decision: a migration with a number below one already applied is applied late, after the higher ones, and the rule is that such a migration must not alter what a higher one
+  relies on (migrations 15 to 29 are reserved for the failover work and are independent of 30 and 31, which only create tables and add columns of their own). The test `TestAMigrationInAGapIsAppliedLater` of
+  `internal/sysdb` states the behaviour.
 
 ### What steps 5 and 6 will find
 
@@ -2992,3 +3029,84 @@ test of a key available after a leader change is therefore not written. What sta
 the public key the API shows (the cluster test), the scheduler restarts its loop and takes a new term after a kill and a restart of the leader (the
 cluster test), and a new service over the same store and key files signs (`Signers` after `rebuild` in `TestTheKeyLifecycleOnTheDatabaseStore`): nothing but the
 store, the key files and the clock is needed. The test of a real leader change is to be written with the failover of the map group.
+
+## The collector, the chain logs, the aggregate and the publication (phase 7, steps 5 and 6, contract 0.11.0)
+
+Design: `kingres/docs/design/ledger-phase7.md` (4.1 to 4.7, 5, 6.7, 8.3, 9.4 and the corrections of section 14, with the decisions below). The contract is
+unchanged (0.11.0): `getLedgerPublication`, `getLedgerAggregate` and `listLedgerAggregates` stop answering `unsupported_operation`, `generateLedgerDigest`
+reads every shard group, `LedgerDigest.aggregateHash` and `aggregateSize` are filled.
+
+| Package or file | What it is |
+|---|---|
+| `internal/sysdb/migrations/0031_ledger_publication.sql` | `ledger_tile` (write once: the primary key refuses a second row, a trigger refuses an update), the columns a log needs beyond migration 30 (why it stopped, the aggregate leaf that closed it, the aggregate leaf that is being appended, when its group became unreadable), the unique indexes (one open log per chain, one aggregate log per database name) and `ledger_digest_view` |
+| `internal/ledgerpub` | the `Store` of the publication (`PGStore` in `kingres_cp`, `MemStore` for tests, both under the same test suite), the parser of the publication paths, the HTTP `Handler` and the `Listener` (plain or TLS) |
+| `internal/ledgerround` | the collector: `Reader` (the callee of `ledger/read`), `Source` (the groups and the calls), the round (`chain.go`, `extend.go`, `aggregate.go`), the retirements (`retire.go`), the digest and the views of the API (`digest.go`, `views.go`), the re-signing at a rotation (`resign.go`), the files the listener serves (`objects.go`), the jobs (`jobs.go`) |
+| `internal/ledgersign/publish.go` | what the collector takes from the keys: `Publication` (the settings, the signers, the revision of the key set), `AppendEvent` (the `chain-retired` event), `Prefix` |
+| `cmd/kingresd/ledger_signing.go` | the wiring: the collector, the listener, the internal calls, the hooks of `dropDatabase` and of the removal of a server |
+
+Settings (the pair `--x` / `KINGRES_X`): `--ledger-publication-listen` / `KINGRES_LEDGER_PUBLICATION_LISTEN` (`host:port` of the listener that serves the published
+files; empty, the default: no listener), `--ledger-publication-tls-cert` and `--ledger-publication-tls-key` (together; without them the listener is plain HTTP and the
+console warns). The listener serves `GET` and `HEAD` for the layout of design 4.6 and nothing else, with no authentication (the files are public by design), no
+cookie, no redirect and no listing; a path that is not in the layout, or that needs decoding, is a 404 with `max-age=5`. Tiles, bundles and events have
+`Cache-Control: public, max-age=31536000, immutable`; the checkpoint and `keyring.json` have `max-age=5`. At most 200 requests are served at once (more get 503) and
+50 per second per client address (more get 429). Every server can have a listener: a follower asks the leader (`ledger/publication/get`) and keeps the immutable files in
+a bounded cache. `keyring.json` is the trust file of `getLedgerTrustFile`. The listener serves whatever is stored while it runs, also when the setting
+`publication.enabled` is off (the setting stops the collector, not the files that were published).
+
+### A round (5.4)
+
+The job `ledger.round` wakes every 10 seconds on the manager leader and runs a round for every database with a ledger every `publication.intervalSeconds`
+(`ledger.digest` runs one per `digestIntervalSeconds`, with the operation that closes the open block and records a digest). A round reads the head of each shard group
+from the server that runs its primary (`ledger/read`, 10 seconds), appends the new blocks to the chain log of that group (at most 9 999 per round; the first block read is
+the last published one and its hash must still be the published one), and then builds the aggregate leaf from the logs. The order of every log is the one of `ledgerlog`:
+append the tiles, store the frontier with its size and root, sign, store the checkpoint; each is a write of its own whose first statement is the term guard. A log is opened
+with its stored frontier; when tiles are ahead of it (a kill between the tiles and the frontier) it is opened once with `AllowTilesAhead` and the same leaves are appended again,
+and another leaf is a divergence. A stored tree without a checkpoint (a kill between the frontier and the checkpoint) is signed at the next round. The leaf of the aggregate holds
+the time of the round, so it is stored in the log row before it is appended (`PutPending`), and a crash appends the same bytes. A round that finds nothing new writes nothing.
+
+* **Never a smaller tree, never a second root.** `PutCheckpoint` takes the log row for update and refuses (`ErrConflict`) a note that is not for the stored size and root, a
+  checkpoint below one that was signed, another root for a size, and a log that is not active; the signature is made over `Log.Checkpoint()` only.
+* **Signing and retiring a key exclude each other (corrections 128 and 129).** `Publication` returns the revision of the key set the signers were read at, and `PutCheckpoint`
+  stores a note only while the revision is still that one (`ErrKeysChanged`: nothing is stored, the next round signs again). The retirement states its bound inside the change
+  that records the event, and the store refuses that change (`Change.CheckpointBound`) when a checkpoint above the bound was stored after the bound was read; the step reads the
+  bound again. A key whose `key-retired` event is published is no longer given to the collector.
+* **Divergence (4.7).** A head below the published size, a head block that is not the published block at its height, a first block read that is not the last published one, an entry that
+  is not a header, blocks that do not follow each other, or tiles that differ from the leaves: the log is stopped (`diverged`, with the reason), the alert `ledgerChainDiverged`
+  (critical, `database:<name>|group:<n>`) is raised, no tile or checkpoint is written for it and nothing repairs it; a chain that comes back to the published history does not wake the
+  log up. Its member in the aggregate is flagged `diverged` with the last good head. The other chains go on.
+* **An unreachable group.** A group that cannot be read, answers an error, or has no ledger or no database is not covered: its members are `stale` (the last good head repeated), the
+  digest says `complete: false` and names it, and an alert `ledgerGroupUnread` is raised (warning after a minute, critical after an hour). It is never skipped as complete.
+* **A follower never signs and writes nothing**: a round on a server that holds no term is `ErrNotLeader` before the first write; a leader whose term ended gets `ErrDeposed` at its
+  first write.
+* **Re-signing at a rotation.** The hook of the key tasks (`Config.Resign`) adds the signature of the keys that sign now to the latest checkpoint of every log, growing or not, closed or
+  not, after the note was verified under every key of the trust file (`ledgerlog.ResignCheckpoint`); only the signers that have no line yet are added.
+
+### The aggregate (5.2)
+
+One aggregate log per database name (origin `<prefix>/a/<id>`, the id from the cluster id and the name). A leaf is appended only when the members, their heights, hashes, roots or flags
+differ from the previous leaf. A database with more than 512 chains is refused (`ErrTooManyChains`; the aggregate does not move). `getLedgerAggregate` reads the leaf from the tiles after
+checking them against the root of the checkpoint (a damaged store is a 503, never a wrong answer); `complete` and `uncoveredShardGroupIds` are the groups whose member is stale or diverged.
+`generateLedgerDigest` runs a full round and returns the digest of every group read, stored as a view; `listLedgerDigests` lists the views (the digests that the extension recorded before this version
+stay in each database and are not listed).
+
+### The end of a chain
+
+* `dropDatabase` begins with a step that runs a final round, publishes the event `chain-retired` for every chain (`chain`, `epoch`, `final-height`, `final-block-hash`, `reason: dropped`), closes the
+  logs and appends one aggregate leaf in which every member is flagged `retired`. The aggregate log stays open: a database of the same name continues it with new chains.
+* The removal of a server does the same for the chains of the groups whose primary runs on it (`reason: group-removed`), before anything is changed on the server.
+* **A database that disappears without `dropDatabase`.** The owner of a database is a role that is not a superuser, and it can drop the database from SQL; nothing of the control plane sees it. When
+  every group answers for two rounds in a row that the database does not exist, the collector ends the publication of its chains with the same event and `reason: database-missing`, one aggregate leaf
+  with the members flagged `retired`, and closed logs. An auditor tells it from a rollback: a rollback is `diverged`, with an alert, and the chain log stops with the old head; this is `retired`,
+  with a signed event and no alert of divergence. One group that answers "no database" while the others answer is only an unread group. A group that holds another chain than the one published
+  (a database made again outside the control plane) gets the same end for the old chain (`reason: chain-replaced`) and a new log for the new one. Options that were rejected: a revoke of the
+  right to drop (it would change who owns existing databases); an event trigger (`DROP DATABASE` does not fire one, and it would run in the database that is being dropped); treating the missing
+  database as a rollback (an auditor could not tell a deletion from a restore); doing nothing (a log that is stale for ever, with no record of why). The event states the last published head, not a
+  head read at the end, because the database is gone.
+
+### What a test of this step runs
+
+`internal/ledgerround` (memory store and fake source: the sizes of the verifier, rounds, a cut at every write of a round and of a retirement, divergences, unreachable and back, retirements,
+digests, views, re-signing, a follower and a deposed leader, 512 chains; and the same rounds on PostgreSQL), `internal/ledgerpub` (the rules of the store on the memory store and on PostgreSQL, the HTTP
+behaviour, a TLS listener), `internal/ledgersign` (the signers, the exclusion with the retirement, the event), `internal/httpapi` (the three operations against the contract), and in
+`internal/clustertest` two servers with a database on two groups: the digest, the aggregate, the files over both listeners, the verifier, a kill at each kind of write, the cut off group, the drop and the
+vanished database.

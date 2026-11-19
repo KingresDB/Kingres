@@ -192,3 +192,21 @@ func (p *params) serverIDQuery(name string) *string {
 	}
 	return &v
 }
+
+// int64Query reads an optional int64 query parameter of at least min.
+func (p *params) int64Query(name string, min int64) *int64 {
+	v := p.q.Get(name)
+	if v == "" {
+		return nil
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		p.fail(name, "must be a 64-bit integer", "type")
+		return nil
+	}
+	if n < min {
+		p.fail(name, "must be at least "+strconv.FormatInt(min, 10), "out_of_range")
+		return nil
+	}
+	return &n
+}

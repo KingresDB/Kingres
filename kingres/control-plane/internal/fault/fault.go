@@ -55,6 +55,11 @@ type Spec struct {
 	// to end the leader at a step boundary. TaskExitStep -1 means any step.
 	TaskExitPoint string `json:"taskExitPoint,omitempty"`
 	TaskExitStep  int    `json:"taskExitStep,omitempty"`
+	// LedgerExitKind ends this process (as a kill does) at the write of the ledger publication of that kind ("tile", "frontier", "pending",
+	// "checkpoint", "note", "state", "retired", "digest", "log"), after LedgerExitSkip writes of that kind since the fault was read: the tests of the
+	// collector use it to cut a round at each of its writes.
+	LedgerExitKind string `json:"ledgerExitKind,omitempty"`
+	LedgerExitSkip int    `json:"ledgerExitSkip,omitempty"`
 }
 
 // Hook reads the fault file. A nil *Hook means "no faults" and is valid.
@@ -65,6 +70,10 @@ type Hook struct {
 	mu      sync.Mutex
 	checked time.Time
 	spec    Spec
+	// ledgerSeen counts the writes of the kind of the fault, from the moment the fault was first read.
+	ledgerFor  string
+	ledgerSkip int
+	ledgerSeen int
 }
 
 // New returns a hook that polls dir, or nil when dir is empty.
@@ -160,4 +169,26 @@ func (h *Hook) TaskPoint(point string, _ int64, step int) {
 		return
 	}
 	os.Exit(137)
+}
+
+// LedgerWrite is the crash hook of the writes of the ledger publication: it ends the process when the fault file asks for a write of this
+// kind and the writes before it were let through. Only tests write such a file.
+func (h *Hook) LedgerWrite(kind string) {
+	if h == nil {
+		return
+	}
+	sp := h.load()
+	if sp.LedgerExitKind == "" || sp.LedgerExitKind != kind {
+		return
+	}
+	h.mu.Lock()
+	if h.ledgerFor != sp.LedgerExitKind || h.ledgerSkip != sp.LedgerExitSkip {
+		h.ledgerFor, h.ledgerSkip, h.ledgerSeen = sp.LedgerExitKind, sp.LedgerExitSkip, 0
+	}
+	h.ledgerSeen++
+	hit := h.ledgerSeen > h.ledgerSkip
+	h.mu.Unlock()
+	if hit {
+		os.Exit(137)
+	}
 }

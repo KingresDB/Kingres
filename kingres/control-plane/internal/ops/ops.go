@@ -28,9 +28,11 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/cluster"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sqlx"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/store"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
 )
 
@@ -78,6 +80,13 @@ type Ops struct {
 	// OnReplicaCount is called after the cluster setting defaultReplicaCount was stored
 	// (also when the value is the same): the standby task checks the standbys at once.
 	OnReplicaCount func(ctx context.Context) (*task.Task, error)
+	// LedgerDigest and LedgerDigests, when set, make generateLedgerDigest and listLedgerDigests work on every shard group and on the stored
+	// digests of the cluster (ledger phase 7, step 5: internal/ledgerround); nil keeps the digest of this server's own chain.
+	LedgerDigest  func(ctx context.Context, db, actor string) (api.LedgerDigest, error)
+	LedgerDigests func(ctx context.Context, db string, p store.Page) (api.LedgerDigestPage, error)
+	// LedgerRetireDatabase, when set, ends the publication of the chains of a database before it is dropped: a final round, the
+	// chain-retired events and the aggregate leaf in which every member is retired (step 6). It does nothing for a database with no log.
+	LedgerRetireDatabase func(ctx context.Context, db string) error
 	// BG bounds background task runs; Wait waits for them.
 	BG  context.Context
 	Log *slog.Logger

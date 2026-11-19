@@ -116,7 +116,9 @@ type LedgerDigest struct {
 	HashVersion   int                 `json:"hashVersion"`
 	Chains        []LedgerDigestChain `json:"chains"`
 	AggregateHash *string             `json:"aggregateHash"`
-	Anchors       []DigestAnchor      `json:"anchors"`
+	// AggregateSize is the size of the aggregate log the digest belongs to (contract 0.11.0); null until the aggregate exists.
+	AggregateSize *int64         `json:"aggregateSize"`
+	Anchors       []DigestAnchor `json:"anchors"`
 	// Complete and UncoveredShardGroupIDs (contract 0.6.0): the digest covers
 	// only the chain of the server that made it; the other shard groups of the
 	// database are named here instead of being silently left out.

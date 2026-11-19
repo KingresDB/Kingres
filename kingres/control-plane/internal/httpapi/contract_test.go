@@ -296,6 +296,9 @@ func TestResponsesValidateAgainstContract(t *testing.T) {
 	for id := range e.srv.ledgerSigningHandlers() {
 		mutating[id] = true // validated in ledger_signing_http_test.go with a fake service
 	}
+	for id := range e.srv.ledgerPublicationHandlers() {
+		mutating[id] = true // validated in ledger_publication_http_test.go with a fake service
+	}
 	for id := range e.srv.serverGroupHandlers() {
 		mutating[id] = true // need the system database; validated in cmd/kingresd/servergroups_e2e_test.go
 	}
