@@ -2982,3 +2982,87 @@ test.
 - For this path "closed" follows from the rule that the key is bare, so only
   the reason line tests it; step 6 needs tests of its own for it.
 - The reg-constant rule above changes what a 2a scan ships.
+
+### Step 6 (the fragment scan and closed queries), with the fixes for the review of steps 3 and 4
+
+**Where the path sits.** One path at the final upper relation, not at the grouping one: the fragment
+returns exactly the final target of the query. The origin sorts and limits with its own Sort and
+Limit over the scan; the groups get the query without ORDER BY and LIMIT, and an ORDER BY expression
+that is not selected travels as an ordinary column (a DISTINCT query with such a column is not
+shipped). Because ORDER BY and LIMIT stay at the origin, an ordered or limited query that the plan
+of before answers cheaply is not shipped; the ordered merge is step 9.
+
+**The rule "gain".** A closed query is shipped only when it has an aggregate, a GROUP BY or
+DISTINCT, or two or more distributed tables. One table without grouping stays on the scan of 2a,
+since the groups would return the same rows. `EXPLAIN VERBOSE` of the scan says why
+("Pushdown: not used: ..."), when both switches are on.
+
+**The marker and the rule of the group.** `/* kingres:query-fragment place=<n> */`, a plain comment;
+the v=2 marker with `kind`, `ident` and `ext` does not exist. A group accepts the fragment only in a
+forwarded session and runs the same function as the origin (analysis, "closed", no LIMIT, the
+shippability walker) on the text it parsed again; otherwise `0A000`, and a stale `place` is `KS001`.
+The origin parses its own deparsed text and runs that function before it ships.
+
+**What is not relaxed.** Window functions are not shipped whatever their partition says (6.4 would
+let a window partitioned by the key be closed); DISTINCT ON, float and order-sensitive aggregates,
+stable functions and an ORDER BY inside an aggregate are refused by the walker as before.
+
+**Cost.** `100 * remote groups + (input total - startup) / groups + rows * transfer * remote
+fraction`; a tie goes to the scan. It is a first-order model: for a selective grouping by a unique
+key and for DISTINCT on a unique key the fragment is chosen and is slower by 0.05 to 0.08 s on the
+test data; for joins and grouped joins on the key it is 20 to 30 percent faster.
+
+**Pruning** uses the restrictions of every distributed table of the statement and intersects the
+groups they allow.
+
+**The part of the origin's own group** runs through an SPI cursor planned under the one-shot mark;
+a cursor plan that contains a scan of the extension is refused with `KS001`. The partitions of the
+origin are identified before and after, and its placement is computed again.
+
+**`EXPLAIN`** shows `Pushed`, `Groups` and `Remote SQL`; `EXPLAIN ANALYZE` adds the rows per group.
+The time to the first batch (section 12) is not shown.
+
+**A statement that ends while a FETCH is in flight** (an error, a cancel, the abort of a
+subtransaction) asks the group to stop it, bounded; before, an abort behind a group that waited for
+a lock took up to `node_timeout`.
+
+**The move between the probes and the cursors** cannot be played with a real move, since the cursors
+hold locks that the move waits for. Fault points exist at every gap (`frag_before_probe`,
+`frag_after_probe_before`, `frag_after_declare`, `frag_local_open`, `frag_after_probe_after`,
+`frag_first_fetch`, `frag_before_fetch`, `frag_wait_batch`, `frag_local_fetch`,
+`frag_declared_g<n>`), and three checks of the start survive their mutants for that reason (the
+plan's placement, the identity of the origin's partitions after the open, the probes after the
+DECLAREs), with the check of the relation signatures.
+
+**What moved.** The start, fetch, collect, drain and stop of a scan over the groups, the choice of
+groups with pruning and the renumbering of parameters are in `fragment_scan.c` and serve both
+scans; `dist_scan.c` keeps the path hook, the child plan, the conversion of rows and `EXPLAIN`.
+
+**Switches.** `kingres_shard.enable_pushdown` and `enable_pushdown_closed`.
+
+**The fixes for the review of steps 3 and 4.** P2C-01: the source of the row router is coerced with
+the type modifier of the column, and the length coercion of an assignment is kept visible in the
+deparsed text, so the origin hashes the value the table stores, and an over-length `varchar` or an
+over-precision `numeric` fails with the message of a single node. P2C-02: the source cursor is
+fetched in steps that follow the widest row seen (16 rows first, then the batch bytes divided by the
+widest row, at least one). P2C-04 and P2C-07 in part: tests. P2C-03, 08, 09, 11: the README. The
+defect of a routed `GENERATED ALWAYS` identity column could not be reproduced on this base; a test
+(`t/130`) covers every case against a single node, and its mutant reproduces the reported error.
+
+**Open after this step.** No test for P2C-05 (a function that replays the text of the local part)
+and P2C-06 (S14-04); the reset of `xact_depth` in the broken-session branch is neither tested nor
+removed; the refusal of COPY with row-level security has no test. A hazard that is older than this
+step: the one-shot mark is consumed by the first planning; when SPI plans the local part of a
+fan-out write or of a router batch a second time (an invalidated plan), the second plan is an
+ordinary one and would read the other groups too; only the fragment scan guards against it. The
+cost model is not calibrated. Only one seed of the generator `t/127` was run.
+
+### What step 7 will find changed
+
+- `KsFragSet` and `kingres_shard_fragset_*` in `fragment_scan.h` are the shared machinery; a scan of
+  partial aggregates can use them and changes only the marker and the part of the origin's group.
+- `kingres_shard_query_fragment_analyze` in `pushdown.c` is the rule of the group, to be extended
+  with a kind for partial aggregates.
+- The paths are added by `fs_upper_paths` on `create_upper_paths_hook`; `KsPushdownInfo` is the
+  hand-over from the planner hook, and its `kind` drives `EXPLAIN`.
+- The Makefile does not track header dependencies: after a change of a header, build clean.
