@@ -78,6 +78,7 @@ tests += {
       'columnar_reserve',
       'columnar_index',
       'columnar_unique',
+      'columnar_compact_index',
       'upgrade',
     ],
     'regress_args': ['--temp-config', files('kingres_columnar.conf')],
@@ -142,6 +143,8 @@ tests += {
       't/056_index_vacuum.pl',
       't/057_unique_standby.pl',
       't/058_index_cursor.pl',
+      't/059_compact_index.pl',
+      't/060_compact_index_crash_standby.pl',
     ],
   },
 }

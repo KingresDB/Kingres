@@ -358,6 +358,11 @@ static bool kc_broken_any = false;
 /* set while compaction copies rows through the buffers (kc_write_set_maintenance) */
 static bool kc_maintenance_write = false;
 
+/* the first row number of each stripe that compaction wrote in this transaction (kc_write_maintenance_ranges) */
+static uint64 *kc_maint_first = NULL;
+static int	kc_maint_nfirst = 0;
+static int	kc_maint_cap = 0;
+
 /*
  * The files this transaction replaced (a rewrite, VACUUM FULL, a change of
  * access method): the table and the identity of the file it had.  The stripe
@@ -520,6 +525,9 @@ kc_state_reset(void)
 	kc_holds = NULL;
 	kc_maintenance_write = false;
 	kc_maint_buf = NULL;
+	kc_maint_first = NULL;
+	kc_maint_nfirst = 0;
+	kc_maint_cap = 0;
 	kc_total_bytes = 0;
 	kc_bytes_since_look = 0;
 	kc_handover_prepared = false;
@@ -1090,16 +1098,38 @@ kc_write_maintenance_flush(Relation rel)
 		{
 			uint32		n = Min(limit, b->nrows - done);
 
-			kc_write_stripe(st, b, rel, done, n, true, NULL);
+			uint64		fr = KC_NO_ROW;
+
+			kc_write_stripe(st, b, rel, done, n, true, &fr);
+			if (kc_maint_nfirst == kc_maint_cap)
+			{
+				kc_maint_cap = kc_maint_cap ? kc_maint_cap * 2 : 16;
+				kc_maint_first = kc_maint_first ?
+					repalloc(kc_maint_first, sizeof(uint64) * kc_maint_cap) :
+					MemoryContextAlloc(kc_write_cxt, sizeof(uint64) * kc_maint_cap);
+			}
+			kc_maint_first[kc_maint_nfirst++] = fr;
 			done += n;
 		}
 	}
 	kc_buf_free(b);
 }
 
+/*
+ * The first row numbers of the stripes that compaction has written since it began: the rows
+ * it copied have these numbers, and the indexes of the table need entries for them.
+ */
+uint64 *
+kc_write_maintenance_ranges(int *n)
+{
+	*n = kc_maint_nfirst;
+	return kc_maint_first;
+}
+
 void
 kc_write_maintenance_discard(void)
 {
+	kc_maint_nfirst = 0;
 	if (kc_maint_buf != NULL)
 	{
 		kc_buf_free(kc_maint_buf);

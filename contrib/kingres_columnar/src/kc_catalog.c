@@ -1889,6 +1889,33 @@ kc_version_superseded(HeapTupleHeader th)
 }
 
 /*
+ * Does this version hold nothing for a unique check, by what became of its replacement or
+ * deletion?  A reserved row is replaced by the stripe row of its own writer, which covers only
+ * the rows the stripe has: whatever the replacer's state, the reserved row holds nothing
+ * (its numbers beyond the stripe may be reserved again by another writer).  A stripe row that
+ * a transaction deleted (compaction replaces stripes with copies that have new numbers) holds
+ * nothing once the deleter is this transaction or has committed; while the deleter runs, and
+ * if it aborted, the rows are still the table's rows.
+ */
+static bool
+kc_version_gone(Relation cat, HeapTuple tup)
+{
+	HeapTupleHeader th = tup->t_data;
+	TransactionId xmax;
+
+	if (!kc_version_superseded(th))
+		return false;
+	if (kc_tuple_is_reserved(cat, tup))
+		return true;
+	xmax = HeapTupleHeaderGetUpdateXid(th);
+	if (TransactionIdIsCurrentTransactionId(xmax))
+		return true;
+	if (TransactionIdIsInProgress(xmax))
+		return false;
+	return TransactionIdDidCommit(xmax);
+}
+
+/*
  * The state of one row number of rel for a dirty read (a unique index asks, with
  * SnapshotDirty): KC_ROW_NONE (no row: nobody holds it, or its writer aborted),
  * KC_ROW_FOUND (a row that is committed or this transaction's own), or KC_ROW_WAIT
@@ -1925,7 +1952,7 @@ kc_catalog_probe_row(Relation rel, uint64 row, TransactionId *xwait)
 
 		if (row < first || row - first >= cnt)
 			continue;
-		if (kc_version_superseded(tup->t_data))
+		if (kc_version_gone(cat, tup))
 			continue;
 		v = kc_version_status(tup->t_data, &x);
 		if (v == KC_VER_OWN || v == KC_VER_COMMITTED)

@@ -101,7 +101,6 @@ CREATE INDEX CONCURRENTLY ci_conc ON ci (id);
 REINDEX INDEX CONCURRENTLY ci_id;
 REINDEX TABLE CONCURRENTLY ci;
 CREATE TABLE ci_pk (id int PRIMARY KEY) USING columnar;
-SELECT kingres.columnar_compact('ci', 1000000);
 CLUSTER ci USING ci_id;
 -- no leftovers of the refused statements
 SELECT count(*) AS indexes FROM pg_index WHERE indrelid = 'ci'::regclass;

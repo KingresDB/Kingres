@@ -28,6 +28,7 @@
 #include "access/skey.h"
 #include "access/table.h"
 #include "access/xact.h"
+#include "catalog/index.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_class.h"
 #include "catalog/storage.h"
@@ -440,6 +441,101 @@ kc_relation_vacuum(KC_VACUUM_PARAMS)
 }
 
 /*
+ * Index entries for the rows that compaction copied (C6d).  The copies have new row numbers,
+ * and every index of the table names rows by number, so each index gets an entry for each
+ * copy; the entries of the old numbers stay.  Nothing is rebuilt and no lock is taken that the
+ * compaction does not hold already (SHARE UPDATE EXCLUSIVE on the table, ROW EXCLUSIVE on the
+ * indexes, as a writer takes): a reader with an older snapshot still sees the old stripes and
+ * finds their rows by the old entries, a reader after the commit sees the copies and finds them
+ * by the new ones, and the entries that name rows no snapshot can see are removed by the next
+ * VACUUM (the ranges of stripes deleted before the oldest snapshot are not live).  The entries
+ * are made without a uniqueness check: the key of a copy is the key of its source, which is
+ * still in the index, and the check of any other writer sees both (the source's rows are
+ * the table's rows while their deleter runs, the copy's wait for the compaction).
+ * The rows are read from the stripes the compaction wrote, identified by their first row.
+ */
+static void
+kc_compact_index_entries(Relation rel, uint64 *firsts, int nfirst)
+{
+	List	   *ilist = RelationGetIndexList(rel);
+	int			nidx = list_length(ilist);
+	Relation   *Irel;
+	IndexInfo **info;
+	ExprState **pred;
+	EState	   *estate;
+	ExprContext *econtext;
+	TupleTableSlot *slot;
+	KcScan	   *scan;
+	ListCell   *lc;
+	int			i;
+	int			ns = 0;
+	Datum		values[INDEX_MAX_KEYS];
+	bool		isnull[INDEX_MAX_KEYS];
+
+	if (nidx == 0 || nfirst == 0)
+		return;
+	Irel = palloc(sizeof(Relation) * nidx);
+	info = palloc(sizeof(IndexInfo *) * nidx);
+	pred = palloc0(sizeof(ExprState *) * nidx);
+	i = 0;
+	foreach(lc, ilist)
+	{
+		Irel[i] = index_open(lfirst_oid(lc), RowExclusiveLock);
+		info[i] = BuildIndexInfo(Irel[i]);
+		i++;
+	}
+	estate = CreateExecutorState();
+	econtext = GetPerTupleExprContext(estate);
+	slot = table_slot_create(rel, NULL);
+	econtext->ecxt_scantuple = slot;
+	for (i = 0; i < nidx; i++)
+		pred[i] = ExecPrepareQual(info[i]->ii_Predicate, estate);
+
+	scan = kc_scan_begin(rel, NULL, NULL, NULL, KC_SCAN_MAINTENANCE);
+	for (i = 0; i < scan->nstripes; i++)
+	{
+		KcStripeInfo *si = &scan->stripes[i];
+		int			j;
+		bool		mine = false;
+
+		if (si->own)
+			for (j = 0; j < nfirst; j++)
+				if (firsts[j] == si->first_row)
+				{
+					mine = true;
+					break;
+				}
+		if (mine)
+			scan->stripes[ns++] = *si;
+	}
+	scan->nstripes = ns;
+	kc_scan_drop_hold(scan);
+	while (kc_scan_next(scan, slot))
+	{
+		CHECK_FOR_INTERRUPTS();
+		for (i = 0; i < nidx; i++)
+		{
+			MemoryContextReset(econtext->ecxt_per_tuple_memory);
+			if (pred[i] != NULL && !ExecQual(pred[i], econtext))
+				continue;
+			FormIndexDatum(info[i], slot, estate, values, isnull);
+			index_insert(Irel[i], values, isnull, &slot->tts_tid, rel,
+						 UNIQUE_CHECK_NO, false, info[i]);
+		}
+	}
+	kc_scan_end(scan);
+	ExecDropSingleTupleTableSlot(slot);
+	FreeExecutorState(estate);
+	for (i = 0; i < nidx; i++)
+	{
+		info[i]->ii_ExpressionsState = NIL;
+		info[i]->ii_PredicateState = NULL;
+		index_close(Irel[i], NoLock);
+	}
+	list_free(ilist);
+}
+
+/*
  * Merge the stripes of fewer than min_rows rows into full ones.  The rows
  * are read from the small stripes, written through the ordinary write buffer,
  * and the old stripes' catalog rows are deleted in the same transaction:
@@ -484,18 +580,6 @@ kc_compact(Relation rel, uint32 min_rows)
 	uint64		rows = 0;
 	KcMetaData	m;
 	CommandId	cid = GetCurrentCommandId(true);
-
-	/*
-	 * Compaction gives the rows it copies new numbers, and an index names rows by number:
-	 * until the rebuild of the indexes is part of it (C6d) a table that has one is not compacted.
-	 */
-	if (RelationGetIndexList(rel) != NIL)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("columnar_compact is not supported on columnar table \"%s\", which has an index",
-						RelationGetRelationName(rel)),
-				 errdetail("Compaction gives rows new numbers, and the indexes of the table name rows by number; rebuilding them is not part of it yet."),
-				 errhint("Use VACUUM FULL, which rewrites the table and its indexes, or drop the indexes and create them again after the compaction.")));
 
 	kc_meta_read(rel, &m);
 	scan = kc_scan_begin(rel, IsolationUsesXactSnapshot() ? GetTransactionSnapshot() : NULL,
@@ -560,5 +644,14 @@ kc_compact(Relation rel, uint32 min_rows)
 	}
 	kc_scan_end(scan);
 	kc_write_maintenance_flush(rel);
+
+	/* the copies have new numbers: every index of the table gets an entry for each (C6d) */
+	{
+		int			nfirst;
+		uint64	   *firsts = kc_write_maintenance_ranges(&nfirst);
+
+		kc_compact_index_entries(rel, firsts, nfirst);
+		kc_write_maintenance_discard();
+	}
 	return (int) ((rows + m.stripe_rows - 1) / m.stripe_rows);
 }

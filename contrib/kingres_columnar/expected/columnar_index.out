@@ -219,10 +219,6 @@ REINDEX TABLE CONCURRENTLY ci;
 ERROR:  CREATE INDEX CONCURRENTLY and REINDEX CONCURRENTLY are not supported on columnar tables
 HINT:  Use CREATE INDEX or REINDEX, which lock the table against writes while they run.
 CREATE TABLE ci_pk (id int PRIMARY KEY) USING columnar;
-SELECT kingres.columnar_compact('ci', 1000000);
-ERROR:  columnar_compact is not supported on columnar table "ci", which has an index
-DETAIL:  Compaction gives rows new numbers, and the indexes of the table name rows by number; rebuilding them is not part of it yet.
-HINT:  Use VACUUM FULL, which rewrites the table and its indexes, or drop the indexes and create them again after the compaction.
 CLUSTER ci USING ci_id;
 ERROR:  CLUSTER is not supported on columnar tables: it would reorder the rows, and an index names rows by their number
 -- no leftovers of the refused statements

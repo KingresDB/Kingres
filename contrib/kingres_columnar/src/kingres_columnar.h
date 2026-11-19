@@ -524,6 +524,7 @@ extern void kc_write_note_dropped(Oid relid);
 extern int	kc_write_cleanup_replaced(void);
 extern void kc_write_maintenance_flush(Relation rel);
 extern void kc_write_maintenance_discard(void);
+extern uint64 *kc_write_maintenance_ranges(int *n);
 
 /* the rows [first, nrows) of one buffer: its visible part when the scan began */
 typedef struct KcPendingRef
