@@ -30,7 +30,7 @@
 
 /* Module magic with a name and a version (available since PostgreSQL 18). */
 #define KC_MODULE_MAGIC() \
-	PG_MODULE_MAGIC_EXT(.name = "kingres_columnar", .version = "0.1")
+	PG_MODULE_MAGIC_EXT(.name = "kingres_columnar", .version = "0.2")
 
 #if PG_VERSION_NUM >= 190000
 

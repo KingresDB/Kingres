@@ -415,7 +415,7 @@ kc_compact(Relation rel, uint32 min_rows)
 		while (kc_scan_next(scan, slot))
 		{
 			slot_getallattrs(slot);
-			kc_write_row_values(rel, slot->tts_values, slot->tts_isnull, cid);
+			kc_write_row_values(rel, slot->tts_values, slot->tts_isnull, cid, NULL);
 			rows++;
 			CHECK_FOR_INTERRUPTS();
 		}

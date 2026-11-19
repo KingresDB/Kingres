@@ -817,10 +817,16 @@ kc_gate_held_by_superuser(const LOCKTAG *tag)
 void
 kc_check_gate(int which)
 {
+	kc_gate_wait((which == KC_GATE_ORPHANS) ? kc_guc_check_gate_orphans :
+				 (which == KC_GATE_CLAIMS) ? kc_guc_check_gate_claims : kc_guc_check_gate);
+}
+
+/* The wait of every gate, also those of the writer (kingres_columnar.reserve_gate). */
+void
+kc_gate_wait(int key)
+{
 	LOCKTAG		tag;
 	int			i;
-	int			key = (which == KC_GATE_ORPHANS) ? kc_guc_check_gate_orphans :
-		(which == KC_GATE_CLAIMS) ? kc_guc_check_gate_claims : kc_guc_check_gate;
 
 	if (key == 0)
 		return;
@@ -1041,6 +1047,32 @@ kc_check_one(Oid relid, bool fix, KcCheckSink *sink)
 			pfree(s[i].col_stats);
 		}
 		pfree(s);
+	}
+
+	/*
+	 * A reserved stripe row that a committed transaction left (C6a): a writer
+	 * that reserved numbers replaces the row by its stripe's before it commits or
+	 * prepares, so a row that is still "reserved" and is seen by everything
+	 * committed is damage.  What this does not report, on purpose: the reserved
+	 * row of a transaction that is in progress (its writer is alive, and the
+	 * snapshot does not see it), of one that aborted, of a backend that died (the
+	 * heap's own rules make such a row dead, and a vacuum of the catalog takes it
+	 * away), of a prepared transaction (it has written its stripes), and those of
+	 * this session's own transaction.
+	 */
+	{
+		Snapshot	rs = kc_latest_snapshot();
+		int			nres = kc_catalog_count_reserved(rel, rs);
+
+		pfree(rs);
+		if (nres > 0)
+		{
+			char		detail[160];
+
+			snprintf(detail, sizeof(detail), "%d reserved stripe row(s) of committed transactions: row numbers were reserved and no stripe was written for them",
+					 nres);
+			kc_check_row(sink, "reserved_row_left", RelationGetRelid(rel), detail);
+		}
 	}
 
 	/*

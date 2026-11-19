@@ -324,9 +324,18 @@ kc_index_delete_tuples(Relation rel, TM_IndexDeleteOp *delstate)
  * TID would make it run the trigger without a row.
  */
 static void
-kc_set_insert_tid(TupleTableSlot *slot)
+kc_set_insert_tid(TupleTableSlot *slot, uint64 rownum)
 {
-	ItemPointerSet(&slot->tts_tid, MaxBlockNumber - 1, 1);
+	/*
+	 * A row that was given its number when it was inserted (the buffer holds a
+	 * reservation of row numbers, or the row was written at once) has its real
+	 * TID, the one a scan shows after the commit; every other row gets the
+	 * meaningless one.
+	 */
+	if (rownum != KC_NO_ROW)
+		kc_row_tid(rownum, &slot->tts_tid);
+	else
+		ItemPointerSet(&slot->tts_tid, MaxBlockNumber - 1, 1);
 }
 
 static void
@@ -338,13 +347,15 @@ kc_tuple_insert(Relation rel, TupleTableSlot *slot, CommandId cid,
 	 * section) the write is refused with a warning, here and in every callback
 	 * below that would otherwise raise one (kc_write_refused).
 	 */
+	uint64		rownum = KC_NO_ROW;
+
 	if (!kc_write_refused(rel, "insert"))
 	{
 		kc_require_rmgr();
-		kc_write_row(rel, slot, cid);
+		rownum = kc_write_row(rel, slot, cid);
 	}
 	slot->tts_tableOid = RelationGetRelid(rel);
-	kc_set_insert_tid(slot);
+	kc_set_insert_tid(slot, rownum);
 }
 
 static void
@@ -375,17 +386,21 @@ kc_multi_insert(Relation rel, TupleTableSlot **slots, int nslots, CommandId cid,
 				KcInsertOptions options, struct BulkInsertStateData *bistate)
 {
 	int			i;
+	uint64	   *rownums = palloc(sizeof(uint64) * Max(nslots, 1));
 
+	for (i = 0; i < nslots; i++)
+		rownums[i] = KC_NO_ROW;
 	if (!kc_write_refused(rel, "multi insert"))
 	{
 		kc_require_rmgr();
-		kc_write_rows(rel, slots, nslots, cid);
+		kc_write_rows(rel, slots, nslots, cid, rownums);
 	}
 	for (i = 0; i < nslots; i++)
 	{
 		slots[i]->tts_tableOid = RelationGetRelid(rel);
-		kc_set_insert_tid(slots[i]);
+		kc_set_insert_tid(slots[i], rownums[i]);
 	}
+	pfree(rownums);
 }
 
 static TM_Result
@@ -740,7 +755,7 @@ kc_relation_copy_for_cluster(KC_COPY_FOR_CLUSTER_PARAMS)
 	{
 		slot_getallattrs(slot);
 		kc_write_row_values(NewTable, slot->tts_values, slot->tts_isnull,
-							GetCurrentCommandId(true));
+							GetCurrentCommandId(true), NULL);
 		n++;
 		CHECK_FOR_INTERRUPTS();
 	}

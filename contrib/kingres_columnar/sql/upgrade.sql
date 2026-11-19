@@ -1,0 +1,211 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+--
+-- upgrade.sql: pg_regress test of kingres_columnar 0.2 (purpose below).
+-- ALTER EXTENSION kingres_columnar UPDATE from 0.1 to 0.2 must give exactly the
+-- catalog that installing 0.2 gives, and keep the stripe rows of the tables 0.1
+-- wrote: they stay readable and writable.  This test drops the extension (and the
+-- tables of the other tests, which depend on its access method), so it is the last one.
+SET search_path = public, pg_temp;
+SET client_min_messages = warning;
+DROP EXTENSION kingres_columnar CASCADE;
+DROP EXTENSION IF EXISTS pageinspect;
+RESET client_min_messages;
+
+-- A description of every object of the extension that the two paths could make
+-- differ (the same one the upgrade test of kingres_shard uses): columns, constraints,
+-- indexes, functions with the digest of their body, triggers, event triggers,
+-- comments, privileges, the members of the extension, and the rest.
+CREATE FUNCTION public.upg_snapshot() RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+BEGIN
+RETURN QUERY
+  SELECT 'column ' || c.relname || '.' || a.attnum || ' ' || a.attname || ' '
+         || pg_catalog.format_type(a.atttypid, a.atttypmod)
+         || ' notnull=' || a.attnotnull
+         || ' default=' || coalesce(pg_catalog.pg_get_expr(d.adbin, d.adrelid), '-')
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+    LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum
+   WHERE c.relnamespace = 'kingres'::regnamespace AND c.relkind IN ('r', 'v')
+  UNION ALL
+  SELECT 'constraint ' || conrelid::regclass || ' ' || conname || ' ' || pg_catalog.pg_get_constraintdef(oid)
+    FROM pg_catalog.pg_constraint WHERE connamespace = 'kingres'::regnamespace
+  UNION ALL
+  SELECT 'index ' || pg_catalog.pg_get_indexdef(i.indexrelid)
+    FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
+   WHERE c.relnamespace = 'kingres'::regnamespace
+  UNION ALL
+  SELECT 'function ' || p.oid::regprocedure || ' ' || pg_catalog.pg_get_function_result(p.oid)
+         || ' lang=' || l.lanname || ' secdef=' || p.prosecdef || ' strict=' || p.proisstrict
+         || ' volatile=' || p.provolatile::text || ' parallel=' || p.proparallel::text
+         || ' config=' || coalesce(p.proconfig::text, '-')
+         || ' acl=' || coalesce(p.proacl::text, '-')
+         || ' src=' || md5(coalesce(p.prosrc, '')) || ' bin=' || coalesce(p.probin, '-')
+    FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_language l ON l.oid = p.prolang
+   WHERE p.pronamespace = 'kingres'::regnamespace
+  UNION ALL
+  SELECT 'trigger ' || t.tgrelid::regclass || ' ' || pg_catalog.pg_get_triggerdef(t.oid)
+    FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+   WHERE c.relnamespace = 'kingres'::regnamespace AND NOT t.tgisinternal
+  UNION ALL
+  SELECT 'event trigger ' || evtname || ' ' || evtevent || ' ' || evtfoid::regproc || ' ' || evtenabled::text
+    FROM pg_catalog.pg_event_trigger WHERE evtfoid::regproc::text LIKE 'kingres.%'
+  UNION ALL
+  SELECT 'comment ' || pg_catalog.pg_describe_object(classoid, objoid, objsubid) || ' ' || description
+    FROM pg_catalog.pg_description
+   WHERE (classoid = 'pg_class'::regclass AND objoid IN (SELECT oid FROM pg_catalog.pg_class WHERE relnamespace = 'kingres'::regnamespace))
+      OR (classoid = 'pg_proc'::regclass AND objoid IN (SELECT oid FROM pg_catalog.pg_proc WHERE pronamespace = 'kingres'::regnamespace))
+  UNION ALL
+  SELECT 'acl ' || c.relname || ' ' || coalesce(c.relacl::text, '-')
+         || ' rls=' || c.relrowsecurity || '/' || c.relforcerowsecurity
+    FROM pg_catalog.pg_class c
+   WHERE c.relnamespace = 'kingres'::regnamespace AND c.relkind IN ('r', 'v')
+  UNION ALL
+  SELECT 'member ' || pg_catalog.pg_describe_object(d.classid, d.objid, d.objsubid)
+    FROM pg_catalog.pg_depend d
+   WHERE d.refclassid = 'pg_extension'::regclass
+     AND d.refobjid = (SELECT oid FROM pg_catalog.pg_extension WHERE extname = 'kingres_columnar')
+     AND d.deptype = 'e'
+  UNION ALL
+  SELECT 'view ' || c.relname || ' ' || pg_catalog.pg_get_viewdef(c.oid, true)
+         || ' options=' || coalesce(c.reloptions::text, '-')
+    FROM pg_catalog.pg_class c
+   WHERE c.relnamespace = 'kingres'::regnamespace AND c.relkind = 'v'
+  UNION ALL
+  SELECT 'relation ' || c.relname || ' kind=' || c.relkind::text || ' persistence=' || c.relpersistence::text
+         || ' owner=' || c.relowner::regrole || ' options=' || coalesce(c.reloptions::text, '-')
+    FROM pg_catalog.pg_class c
+   WHERE c.relnamespace = 'kingres'::regnamespace AND c.relkind IN ('r', 'v', 'S', 'i')
+  UNION ALL
+  SELECT 'column details ' || c.relname || '.' || a.attname || ' identity=' || a.attidentity::text
+         || ' generated=' || a.attgenerated::text || ' collation=' || a.attcollation::regcollation
+         || ' storage=' || a.attstorage::text || ' acl=' || coalesce(a.attacl::text, '-')
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+   WHERE c.relnamespace = 'kingres'::regnamespace AND c.relkind IN ('r', 'v')
+  UNION ALL
+  SELECT 'sequence ' || s.seqrelid::regclass || ' type=' || s.seqtypid::regtype || ' start=' || s.seqstart
+         || ' increment=' || s.seqincrement || ' max=' || s.seqmax || ' min=' || s.seqmin
+         || ' cache=' || s.seqcache || ' cycle=' || s.seqcycle
+    FROM pg_catalog.pg_sequence s JOIN pg_catalog.pg_class c ON c.oid = s.seqrelid
+   WHERE c.relnamespace = 'kingres'::regnamespace
+  UNION ALL
+  SELECT 'policy ' || p.polrelid::regclass || ' ' || p.polname || ' cmd=' || p.polcmd::text
+         || ' permissive=' || p.polpermissive || ' roles=' || p.polroles::text
+         || ' using=' || coalesce(pg_catalog.pg_get_expr(p.polqual, p.polrelid), '-')
+         || ' check=' || coalesce(pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid), '-')
+    FROM pg_catalog.pg_policy p JOIN pg_catalog.pg_class c ON c.oid = p.polrelid
+   WHERE c.relnamespace = 'kingres'::regnamespace
+  UNION ALL
+  SELECT 'function owner ' || p.oid::regprocedure || ' ' || p.proowner::regrole
+    FROM pg_catalog.pg_proc p WHERE p.pronamespace = 'kingres'::regnamespace
+  UNION ALL
+  SELECT 'function depends ' || p.oid::regprocedure || ' -> '
+         || pg_catalog.pg_describe_object(d.refclassid, d.refobjid, d.refobjsubid) || ' ' || d.deptype::text
+    FROM pg_catalog.pg_depend d
+    JOIN pg_catalog.pg_proc p ON d.classid = 'pg_proc'::regclass AND d.objid = p.oid
+   WHERE p.pronamespace = 'kingres'::regnamespace AND d.refclassid <> 'pg_extension'::regclass
+  UNION ALL
+  SELECT 'event trigger details ' || evtname || ' tags=' || coalesce(evttags::text, '-')
+         || ' owner=' || evtowner::regrole
+    FROM pg_catalog.pg_event_trigger WHERE evtfoid::regproc::text LIKE 'kingres.%'
+  UNION ALL
+  SELECT 'schema kingres owner=' || n.nspowner::regrole || ' acl=' || coalesce(n.nspacl::text, '-')
+    FROM pg_catalog.pg_namespace n WHERE n.nspname = 'kingres'
+  UNION ALL
+  SELECT 'type ' || t.typname || ' kind=' || t.typtype::text
+    FROM pg_catalog.pg_type t
+   WHERE t.typnamespace = 'kingres'::regnamespace AND t.typtype <> 'c' AND t.typcategory <> 'A'
+  UNION ALL
+  SELECT 'dumped configuration ' || coalesce(extconfig::regclass[]::text, '-') || ' ' || coalesce(extcondition::text, '-')
+    FROM pg_catalog.pg_extension WHERE extname = 'kingres_columnar';
+END
+$$;
+
+-- Install 0.2 directly.
+CREATE EXTENSION kingres_columnar;
+SELECT extversion FROM pg_extension WHERE extname = 'kingres_columnar';
+CREATE TABLE public.upg_direct AS SELECT line FROM public.upg_snapshot() line;
+SELECT count(*) > 50 AS direct_snapshot_is_not_trivial FROM public.upg_direct;
+DROP EXTENSION kingres_columnar;
+
+-- Install 0.1, write tables with it, upgrade.  The library is the one of 0.2,
+-- which makes a table as 0.1 does while the catalog is the catalog of 0.1.
+CREATE EXTENSION kingres_columnar VERSION '0.1';
+SELECT extversion FROM pg_extension WHERE extname = 'kingres_columnar';
+SELECT count(*) AS catalog_columns FROM pg_attribute
+ WHERE attrelid = 'kingres.columnar_stripe'::regclass AND attnum > 0 AND NOT attisdropped;
+CREATE TABLE public.u1 (a int, b text) USING columnar;
+SELECT kingres.columnar_set_options('public.u1', stripe_row_count => 1000, chunk_row_count => 100);
+INSERT INTO public.u1 SELECT g, 'old' || g FROM generate_series(1, 2500) g;
+CREATE EXTENSION pageinspect;
+CREATE TABLE public.u2 (a int) USING columnar;
+INSERT INTO public.u2 SELECT generate_series(1, 7);
+SELECT sum(a), count(*) FROM public.u1;
+SELECT stripe_id, first_row, row_count FROM kingres.columnar_stripes('public.u1') ORDER BY stripe_id;
+-- the format version in the metapage: 2 is what 0.1 writes (and what a table made while the
+-- catalog is the catalog of 0.1 gets)
+SELECT get_byte(get_raw_page('public.u1', 0), 28) AS u1_format_version;
+-- the setting changes nothing for a table of 0.1: its rows have no numbers when inserted
+SET kingres_columnar.reserve_row_numbers = on;
+BEGIN;
+INSERT INTO public.u1 VALUES (2501, 'old table, setting on');
+SELECT count(*) FILTER (WHERE ctid::text LIKE '(4294967293,%') AS fake_tids, count(*) AS rows FROM public.u1 WHERE a > 2500;
+COMMIT;
+RESET kingres_columnar.reserve_row_numbers;
+SELECT stripe_id, first_row, row_count FROM kingres.columnar_stripes('public.u1') ORDER BY stripe_id;
+
+ALTER EXTENSION kingres_columnar UPDATE;
+SELECT extversion FROM pg_extension WHERE extname = 'kingres_columnar';
+CREATE TABLE public.upg_upgraded AS SELECT line FROM public.upg_snapshot() line;
+
+-- No difference in either direction.
+SELECT 'only in direct install' AS side, line FROM
+  (SELECT line FROM public.upg_direct EXCEPT SELECT line FROM public.upg_upgraded) x
+UNION ALL
+SELECT 'only in upgrade', line FROM
+  (SELECT line FROM public.upg_upgraded EXCEPT SELECT line FROM public.upg_direct) y
+ORDER BY 1, 2;
+
+-- The stripes of the old tables are read, and the tables are written (the catalog
+-- row of a stripe written after the update has the new column), by both settings.
+SELECT sum(a), count(*) FROM public.u1;
+SELECT stripe_id, first_row, row_count FROM kingres.columnar_stripes('public.u1') ORDER BY stripe_id;
+SELECT count(*) AS reserved_rows FROM kingres.columnar_stripe WHERE reserved;
+INSERT INTO public.u1 VALUES (2502, 'old table, after the update');
+INSERT INTO public.u2 SELECT generate_series(8, 10);
+SELECT sum(a), count(*) FROM public.u2;
+SET kingres_columnar.reserve_row_numbers = on;
+-- still a table of format 2: no reservation, whatever the setting says
+BEGIN;
+INSERT INTO public.u1 VALUES (2503, 'old table, setting on, after the update');
+SELECT count(*) FILTER (WHERE ctid::text LIKE '(4294967293,%') AS fake_tids FROM public.u1 WHERE a > 2502;
+SELECT count(*) AS reserved_rows FROM kingres.columnar_stripe WHERE reserved;
+COMMIT;
+-- a table made after the update reserves
+CREATE TABLE public.u3 (a int) USING columnar;
+BEGIN;
+INSERT INTO public.u3 SELECT generate_series(1, 5);
+SELECT count(*) AS reserved_rows FROM kingres.columnar_stripe WHERE reserved;
+SELECT min(ctid) AS first_tid, max(ctid) AS last_tid FROM public.u3;
+COMMIT;
+SELECT get_byte(get_raw_page('public.u1', 0), 28) AS u1_format_version, get_byte(get_raw_page('public.u3', 0), 28) AS u3_format_version;
+RESET kingres_columnar.reserve_row_numbers;
+SELECT sum(a), count(*) FROM public.u1;
+SELECT * FROM kingres.columnar_check();
+-- an old table can be vacuumed, compacted, converted and checked
+VACUUM public.u1;
+SELECT kingres.columnar_compact('public.u1', 100000) >= 0 AS compacted;
+SELECT sum(a), count(*) FROM public.u1;
+ALTER TABLE public.u1 SET ACCESS METHOD heap;
+SELECT sum(a), count(*) FROM public.u1;
+SELECT * FROM kingres.columnar_check();
+
+SET client_min_messages = warning;
+DROP TABLE public.upg_direct, public.upg_upgraded;
+DROP EXTENSION pageinspect;
+DROP EXTENSION kingres_columnar CASCADE;
+RESET client_min_messages;
+DROP TABLE public.u1;
+DROP FUNCTION public.upg_snapshot();

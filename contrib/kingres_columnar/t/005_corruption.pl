@@ -407,9 +407,9 @@ add('meta: bad magic', must_error => \@MI,
 	file => sub { meta_poke($_[0], 0, 'V', 0xDEADBEEF) });
 add('meta: magic zero', must_error => \@MI,
 	file => sub { meta_poke($_[0], 0, 'V', 0) });
-add('meta: format version 3 (feature not supported is fine)',
+add('meta: format version 4 (feature not supported is fine; 2 and 3 are read)',
 	must_error => \@MI, ok_states => ['0A000'],
-	file => sub { meta_poke($_[0], 4, 'V', 3) });
+	file => sub { meta_poke($_[0], 4, 'V', 4) });
 add('meta: format version 0xFFFFFFFF', must_error => \@MI, ok_states => ['0A000'],
 	file => sub { meta_poke($_[0], 4, 'V', 0xFFFFFFFF) });
 add('meta: codec 9', must_error => \@MI,
@@ -444,6 +444,11 @@ add('meta: next_stripe_id 0x7FFFFFFFFFFFFFFF (no ids left is a clean error)', ok
 	file => sub { meta_poke($_[0], 32, 'Q<', 0x7FFFFFFFFFFFFFFF) });
 add('meta: next_row 0x7FFFFFFFFFFFFFFF (no row numbers left is a clean error)', ok_states => ['54000'],
 	file => sub { meta_poke($_[0], 24, 'Q<', 0x7FFFFFFFFFFFFFFF) });
+add('meta: next_row at the last number a TID can hold (C6a: no row numbers left is a clean error)',
+	must_error => ['insert'], ok_states => ['54000'],
+	file => sub { meta_poke($_[0], 24, 'Q<', (0xFFFFFFFE - 1) * 2048) });
+add('meta: next_row two numbers before it (an insert of one row works)',
+	file => sub { meta_poke($_[0], 24, 'Q<', (0xFFFFFFFE - 1) * 2048 - 2) });
 add('meta: page header pd_special 8168 (a special area on the metapage)', must_error => \@MI,
 	file => sub { poke($_[0], 16, pack('v', 8168)) });
 add('meta: whole page zeroed', must_error => \@MI,

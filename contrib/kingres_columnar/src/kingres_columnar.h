@@ -56,7 +56,20 @@
  */
 
 #define KC_META_MAGIC		0x4B434D31	/* "KCM1" */
-#define KC_META_VERSION		2
+
+/*
+ * The format version of the metapage decides what a table is.  Version 2 is
+ * what 0.1 wrote: row numbers are assigned when a stripe is written.  Version
+ * 3 (0.2) is a table whose writers may reserve row numbers when a row is
+ * inserted and whose stripe catalog may hold a reserved, not yet written, row
+ * (increment C6a).  This server reads both and writes a new file as version 3
+ * when the stripe catalog has the column that a reserved row needs
+ * (kc_catalog_has_reserved), else as version 2, which is byte for byte what 0.1
+ * writes.  A reservation is made only for a table of version 3.
+ */
+#define KC_META_VERSION_BASE	2
+#define KC_META_VERSION_RESERVE	3
+#define KC_META_VERSION		KC_META_VERSION_RESERVE
 #define KC_PAGE_MAGIC		0x4B43		/* "KC" */
 #define KC_STRIPE_MAGIC		0x4B435331	/* "KCS1" */
 #define KC_STRIPE_VERSION	2
@@ -286,6 +299,9 @@ extern int	kc_guc_write_buffer_kb;
 extern int	kc_guc_max_stripe_rows;
 extern int	kc_guc_orphan_notes_max;
 extern int	kc_guc_truncate_lock_timeout;
+extern bool kc_guc_reserve_rows;
+extern int	kc_guc_reserve_gate;
+extern int	kc_guc_reserve_gate_at;
 
 /* how long a vacuum asks for the exclusive lock of its truncation, as heap does (ms) */
 #define KC_TRUNCATE_LOCK_TIMEOUT	5000
@@ -341,6 +357,7 @@ extern void kc_check_snapshot_age(Relation rel, Snapshot snap);
 extern void kc_meta_read(Relation rel, KcMetaData *out);
 extern void kc_meta_allocate(Relation rel, uint32 nrows, uint64 *stripe_id,
 							 uint64 *first_row);
+extern bool kc_meta_return(Relation rel, uint64 first_row, uint32 nrows);
 extern void kc_meta_set_options(Relation rel, const KcOptions *opts);
 extern void kc_meta_reset(Relation rel);
 extern TransactionId kc_meta_freeze(Relation rel, TransactionId oldest_xmin);
@@ -390,6 +407,7 @@ extern bool kc_rel_is_columnar(Relation rel);
 #define KC_GATE_ORPHANS		2
 #define KC_GATE_CLAIMS		3
 extern void kc_check_gate(int which);
+extern void kc_gate_wait(int key);
 extern Snapshot kc_catalog_snapshot(Snapshot snap, bool *is_mvcc);
 extern Snapshot kc_latest_snapshot(void);
 
@@ -410,6 +428,13 @@ extern void kc_catalog_insert(Relation rel, const KcStripeInfo *si,
 							  const char *cid_points, int cid_len,
 							  const char *col_stats, int stats_len, bool frozen,
 							  bool maintenance);
+extern bool kc_catalog_has_reserved(void);
+extern void kc_catalog_insert_reserved(Relation rel, const KcStripeInfo *si);
+extern void kc_catalog_update_reserved(Relation rel, const KcStripeInfo *si,
+									   const char *cid_points, int cid_len,
+									   const char *col_stats, int stats_len);
+extern void kc_catalog_delete_reserved(Relation rel, uint64 stripe_id);
+extern int	kc_catalog_count_reserved(Relation rel, Snapshot snap);
 extern int	kc_catalog_delete_uid(uint64 uid);
 extern int	kc_catalog_delete_stripe(uint64 uid, uint64 stripe_id, bool wait);
 extern bool kc_catalog_uid_in_use(uint64 uid);
@@ -430,11 +455,36 @@ extern void kc_footer_free(KcFooter *f);
  * ------------------------------------------------------------------------
  */
 extern void kc_write_init(void);
-extern void kc_write_row(Relation rel, TupleTableSlot *slot, CommandId cid);
+
+/*
+ * The number of a row that has none (a table that does not reserve): its slot
+ * gets the meaningless TID kc_am.c has always given, and a scan of the buffer
+ * shows the same.
+ */
+#define KC_NO_ROW	PG_UINT64_MAX
+
+/*
+ * The most row numbers a table has: a TID holds a block number below the one the
+ * meaningless TID of an unnumbered row uses (MaxBlockNumber - 1) and an offset
+ * of MaxOffsetNumber values, about 8.8 x 10^12 rows.  A row number is a TID
+ * (kc_row_tid), so the allocation of numbers stops here, where it used to stop at
+ * the largest 64-bit number, from which a TID would have wrapped.
+ */
+#define KC_MAX_ROW_NUMBER	((uint64) (MaxBlockNumber - 1) * MaxOffsetNumber)
+
+/* the TID of a row number (design 5.3), the one every reader and the writer use */
+static inline void
+kc_row_tid(uint64 row, ItemPointer tid)
+{
+	ItemPointerSet(tid, (BlockNumber) (row / MaxOffsetNumber),
+				   (OffsetNumber) (row % MaxOffsetNumber) + 1);
+}
+
+extern uint64 kc_write_row(Relation rel, TupleTableSlot *slot, CommandId cid);
 extern void kc_write_rows(Relation rel, TupleTableSlot **slots, int nslots,
-						  CommandId cid);
+						  CommandId cid, uint64 *rownums);
 extern bool kc_write_row_values(Relation rel, Datum *vals, bool *nulls,
-								CommandId cid);
+								CommandId cid, uint64 *rownum);
 extern bool kc_entry_refused(const char *what, const char *name, bool fails_txn);
 extern bool kc_write_refused(Relation rel, const char *what);
 extern bool kc_error_forbidden(void);
@@ -469,7 +519,7 @@ extern void kc_write_hold_release(uint64 hold);
 extern void kc_write_hold_check(uint64 hold, Relation rel);
 extern bool kc_write_pending_fetch(Oid relid, const KcPendingRef *ref,
 								   uint32 rowno, Datum **vals, bool **nulls,
-								   int *ncols, CommandId *cid);
+								   int *ncols, CommandId *cid, uint64 *rownum);
 
 /* ------------------------------------------------------------------------
  * kc_scan.c: the serial scan, shared by the access method and custom scan

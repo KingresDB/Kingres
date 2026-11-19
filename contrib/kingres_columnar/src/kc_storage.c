@@ -51,6 +51,7 @@
 #define XLOG_KC_PAGES		0x00	/* whole-page images of a stripe */
 #define XLOG_KC_META		0x10	/* whole-page image of the metapage */
 #define XLOG_KC_FREEZE		0x20	/* metapage image, its transaction id frozen */
+#define XLOG_KC_RETURN		0x30	/* metapage image, the tail of a reservation given back (0.2) */
 
 typedef struct xl_kc_pages
 {
@@ -63,6 +64,18 @@ typedef struct xl_kc_freeze
 {
 	TransactionId horizon;		/* the id that was frozen: standby queries holding it conflict */
 } xl_kc_freeze;
+
+/*
+ * The record that gives the unused tail of a reservation of row numbers back
+ * (plus the page image of the metapage, like every record of this manager).
+ * Redo restores the image and ignores the fields; they say what happened to
+ * a person who reads the log.
+ */
+typedef struct xl_kc_return
+{
+	uint64		first_row;		/* the first number given back */
+	uint32		nrows;			/* how many */
+} xl_kc_return;
 
 #define KC_MAX_BLOCKS_PER_RECORD 32
 
@@ -109,7 +122,8 @@ kc_redo(XLogReaderState *record)
 	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
 	int			b;
 
-	if (info != XLOG_KC_PAGES && info != XLOG_KC_META && info != XLOG_KC_FREEZE)
+	if (info != XLOG_KC_PAGES && info != XLOG_KC_META && info != XLOG_KC_FREEZE &&
+		info != XLOG_KC_RETURN)
 		elog(PANIC, "kingres_columnar_redo: unknown op code %u", info);
 
 	/*
@@ -167,6 +181,13 @@ kc_desc(StringInfo buf, XLogReaderState *record)
 
 		appendStringInfo(buf, "metapage, freeze transaction id %u", xlrec->horizon);
 	}
+	else if (info == XLOG_KC_RETURN)
+	{
+		xl_kc_return *xlrec = (xl_kc_return *) XLogRecGetData(record);
+
+		appendStringInfo(buf, "metapage, row numbers " UINT64_FORMAT " and %u more given back",
+						 xlrec->first_row, xlrec->nrows);
+	}
 }
 
 static const char *
@@ -180,6 +201,8 @@ kc_identify(uint8 info)
 			return "METAPAGE";
 		case XLOG_KC_FREEZE:
 			return "FREEZE";
+		case XLOG_KC_RETURN:
+			return "RETURN";
 	}
 	return NULL;
 }
@@ -227,7 +250,8 @@ kc_meta_seal(KcMetaData *m)
 static void
 kc_meta_format(Page page, const KcOptions *opts, uint64 next_row,
 			   uint64 next_stripe, uint64 uid, TransactionId xid,
-			   uint32 flags, Oid relid, TransactionId table_xid)
+			   uint32 flags, Oid relid, TransactionId table_xid,
+			   uint32 version)
 {
 	KcMetaData *m;
 
@@ -235,7 +259,7 @@ kc_meta_format(Page page, const KcOptions *opts, uint64 next_row,
 	m = (KcMetaData *) PageGetContents(page);
 	memset(m, 0, sizeof(*m));
 	m->magic = KC_META_MAGIC;
-	m->version = KC_META_VERSION;
+	m->version = version;
 	m->codec = opts->codec;
 	m->level = opts->level;
 	m->stripe_rows = opts->stripe_rows;
@@ -287,9 +311,14 @@ kc_meta_init_storage(Relation rel, const RelFileLocator *rlocator,
 		if (tries >= 16)
 			elog(ERROR, "could not find an unused identity for a columnar file");
 	}
+	/*
+	 * Version 3 only where the stripe catalog can hold what a reservation
+	 * leaves in it (0.2); with the catalog of 0.1 the file is what 0.1 writes.
+	 */
 	kc_meta_format((Page) buf, opts, 0, 1, uid, GetCurrentTransactionId(),
 			   replaces_content ? KC_META_REPLACES_CONTENT : 0,
-			   RelationGetRelid(rel), table_xid);
+			   RelationGetRelid(rel), table_xid,
+			   kc_catalog_has_reserved() ? KC_META_VERSION_RESERVE : KC_META_VERSION_BASE);
 	smgr_bulk_write(bulk, 0, buf, true);
 	smgr_bulk_finish(bulk);
 	smgrclose(srel);
@@ -312,12 +341,12 @@ kc_meta_check(Relation rel, Page page)
 		if ((uint32) kc_crc32c((const char *) &copy, sizeof(copy)) != m->crc)
 			kc_corrupt(rel, 0, "the metapage checksum does not match");
 	}
-	if (m->version != KC_META_VERSION)
+	if (m->version != KC_META_VERSION_BASE && m->version != KC_META_VERSION_RESERVE)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("columnar table \"%s\" has format version %u, this server reads version %u",
+				 errmsg("columnar table \"%s\" has format version %u, this server reads versions %u and %u",
 						RelationGetRelationName(rel), m->version,
-						KC_META_VERSION)));
+						KC_META_VERSION_BASE, KC_META_VERSION_RESERVE)));
 	if (m->codec > KC_CODEC_ZSTD ||
 		m->stripe_rows < KC_MIN_STRIPE_ROWS || m->stripe_rows > KC_MAX_STRIPE_ROWS ||
 		m->chunk_rows < KC_MIN_CHUNK_ROWS || m->chunk_rows > KC_MAX_CHUNK_ROWS)
@@ -378,7 +407,7 @@ kc_meta_allocate(Relation rel, uint32 nrows, uint64 *stripe_id,
 
 	*stripe_id = m->next_stripe_id;
 	*first_row = m->next_row;
-	if (m->next_row > PG_INT64_MAX - nrows || m->next_stripe_id >= PG_INT64_MAX)
+	if (m->next_row > KC_MAX_ROW_NUMBER - nrows || m->next_stripe_id >= PG_INT64_MAX)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("columnar table \"%s\" has no row numbers left",
@@ -392,6 +421,56 @@ kc_meta_allocate(Relation rel, uint32 nrows, uint64 *stripe_id,
 	kc_meta_log_and_release(rel, buf);
 	END_CRIT_SECTION();
 	UnlockReleaseBuffer(buf);
+}
+
+/*
+ * Give back the unused tail [first_row, first_row + nrows) of a reservation
+ * made by kc_meta_allocate, when it is still the end of the range: nobody has
+ * reserved after it, so the next number to hand out goes back to first_row.
+ * Otherwise the numbers stay unused, a gap (the answer is false).  Under the
+ * exclusive lock of the metapage, so the test and the change are one step.  The
+ * caller has already made the claim on the numbers smaller (the catalog row of
+ * the stripe says how many rows it has), so that no moment exists at which
+ * numbers are free and still claimed.  Not for numbers a row was given: those
+ * are never given back (a later index entry may name them).
+ */
+bool
+kc_meta_return(Relation rel, uint64 first_row, uint32 nrows)
+{
+	Buffer		buf = ReadBuffer(rel, 0);
+	Page		page;
+	KcMetaData *m;
+
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(buf);
+	m = kc_meta_check(rel, page);
+
+	if (nrows == 0 || m->next_row != first_row + nrows)
+	{
+		UnlockReleaseBuffer(buf);
+		return false;
+	}
+
+	START_CRIT_SECTION();
+	m->next_row = first_row;
+	kc_meta_seal(m);
+	MarkBufferDirty(buf);
+	if (RelationNeedsWAL(rel))
+	{
+		XLogRecPtr	recptr;
+		xl_kc_return xlrec;
+
+		xlrec.first_row = first_row;
+		xlrec.nrows = nrows;
+		XLogBeginInsert();
+		XLogRegisterData(&xlrec, sizeof(xlrec));
+		XLogRegisterBuffer(0, buf, REGBUF_FORCE_IMAGE | REGBUF_STANDARD);
+		recptr = XLogInsert(KC_RMGR_ID, XLOG_KC_RETURN);
+		PageSetLSN(BufferGetPage(buf), recptr);
+	}
+	END_CRIT_SECTION();
+	UnlockReleaseBuffer(buf);
+	return true;
 }
 
 void

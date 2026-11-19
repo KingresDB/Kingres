@@ -18,12 +18,12 @@ OBJS = \
 	src/kingres_columnar.o
 
 EXTENSION = kingres_columnar
-DATA = kingres_columnar--0.1.sql
+DATA = kingres_columnar--0.1.sql kingres_columnar--0.2.sql kingres_columnar--0.1--0.2.sql
 PGFILEDESC = "kingres_columnar - columnar table access method for KingresDB"
 
 REGRESS = columnar_setup columnar_basic columnar_types columnar_ddl \
 	columnar_refusals columnar_scan_plans columnar_stats columnar_vacuum \
-	columnar_analyze columnar_review columnar_parallel columnar_security
+	columnar_analyze columnar_review columnar_parallel columnar_security columnar_reserve upgrade
 
 TAP_TESTS = 1
 

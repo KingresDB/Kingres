@@ -526,8 +526,7 @@ kc_store_group_row(KcScan *scan, TupleTableSlot *slot)
 	{
 		uint64		row = scan->cur->first_row + scan->group_start + scan->group_pos;
 
-		ItemPointerSet(&slot->tts_tid, (BlockNumber) (row / MaxOffsetNumber),
-					   (OffsetNumber) (row % MaxOffsetNumber) + 1);
+		kc_row_tid(row, &slot->tts_tid);
 	}
 	slot->tts_tableOid = RelationGetRelid(scan->rel);
 	scan->group_pos++;
@@ -544,11 +543,12 @@ kc_next_pending(KcScan *scan, TupleTableSlot *slot)
 		bool	   *nulls;
 		int			ncols;
 		CommandId	cid;
+		uint64		rownum;
 		int			c;
 
 		kc_write_hold_check(scan->hold, scan->rel);
 		if (!kc_write_pending_fetch(RelationGetRelid(scan->rel), ref,
-									scan->pend_row, &vals, &nulls, &ncols, &cid) ||
+									scan->pend_row, &vals, &nulls, &ncols, &cid, &rownum) ||
 			(!scan->all_own_rows && cid >= scan->curcid))
 		{
 			/* command ids never decrease in a buffer: this one is done */
@@ -568,8 +568,11 @@ kc_next_pending(KcScan *scan, TupleTableSlot *slot)
 			else
 				kc_missing_value(scan, c, &slot->tts_values[c], &slot->tts_isnull[c]);
 		}
-		ItemPointerSet(&slot->tts_tid, MaxBlockNumber - 1,
-					   (OffsetNumber) (scan->pend_row % MaxOffsetNumber) + 1);
+		if (rownum != KC_NO_ROW)
+			kc_row_tid(rownum, &slot->tts_tid);	/* a row that has its number (a reservation) */
+		else
+			ItemPointerSet(&slot->tts_tid, MaxBlockNumber - 1,
+						   (OffsetNumber) (scan->pend_row % MaxOffsetNumber) + 1);
 		slot->tts_tableOid = RelationGetRelid(scan->rel);
 		scan->pend_row++;
 		ExecStoreVirtualTuple(slot);

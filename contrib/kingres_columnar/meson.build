@@ -51,6 +51,8 @@ shared_module('kcprobe',
 
 install_data(
   'kingres_columnar--0.1.sql',
+  'kingres_columnar--0.2.sql',
+  'kingres_columnar--0.1--0.2.sql',
   'kingres_columnar.control',
   kwargs: contrib_data_args,
 )
@@ -73,6 +75,8 @@ tests += {
       'columnar_review',
       'columnar_parallel',
       'columnar_security',
+      'columnar_reserve',
+      'upgrade',
     ],
     'regress_args': ['--temp-config', files('kingres_columnar.conf')],
   },
@@ -121,6 +125,13 @@ tests += {
       't/041_vacuum_failsafe.pl',
       't/042_not_checked_memory.pl',
       't/043_parallel.pl',
+      't/044_reserve_tids.pl',
+      't/045_reserve_subxact.pl',
+      't/046_reserve_crash.pl',
+      't/047_reserve_concurrent.pl',
+      't/048_reserve_standby.pl',
+      't/049_upgrade_data.pl',
+      't/050_reserve_check.pl',
     ],
   },
 }
