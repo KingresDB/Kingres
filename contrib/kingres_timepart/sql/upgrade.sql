@@ -1,0 +1,217 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+--
+-- upgrade: pg_regress test of kingres_timepart 0.2 (purpose below).
+-- ALTER EXTENSION kingres_timepart UPDATE from 0.1 to 0.2 must give exactly the
+-- catalog that installing 0.2 gives (also for a role that was given the right
+-- to drive its own maintenance before), keep the policies, the history and the
+-- identity of the installation, and leave the conversion working.
+SET search_path = public, pg_temp;
+SET timezone = 'UTC';
+SET datestyle = ISO;
+SET intervalstyle = postgres;
+\set VERBOSITY default
+\set SHOW_CONTEXT never
+
+-- A description of every object of the extension that the two paths could
+-- make differ: columns (with defaults, identity, generation, collation, storage and
+-- column privileges), constraints, indexes, views (with their definitions),
+-- relations (kind, persistence, owner, options), sequences (with their parameters),
+-- functions (with the digest of their body, owner and the objects they depend
+-- on; the body of the function that holds the random identity of an installation
+-- is not compared), triggers, event triggers (with their tags and owner), policies,
+-- comments, privileges, the schema's owner and privileges, the configuration tables
+-- the extension dumps, and the members of the extension.
+CREATE FUNCTION public.upg_snapshot() RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+BEGIN
+RETURN QUERY
+  SELECT 'column ' || c.relname || '.' || a.attnum || ' ' || a.attname || ' '
+         || pg_catalog.format_type(a.atttypid, a.atttypmod)
+         || ' notnull=' || a.attnotnull
+         || ' default=' || coalesce(pg_catalog.pg_get_expr(d.adbin, d.adrelid), '-')
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+    LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum
+   WHERE c.relnamespace = 'kingres'::regnamespace AND c.relkind IN ('r', 'v')
+  UNION ALL
+  SELECT 'constraint ' || conrelid::regclass || ' ' || conname || ' ' || pg_catalog.pg_get_constraintdef(oid)
+    FROM pg_catalog.pg_constraint WHERE connamespace = 'kingres'::regnamespace
+  UNION ALL
+  SELECT 'index ' || pg_catalog.pg_get_indexdef(i.indexrelid)
+    FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
+   WHERE c.relnamespace = 'kingres'::regnamespace
+  UNION ALL
+  SELECT 'function ' || p.oid::regprocedure || ' ' || pg_catalog.pg_get_function_result(p.oid)
+         || ' lang=' || l.lanname || ' secdef=' || p.prosecdef || ' strict=' || p.proisstrict
+         || ' volatile=' || p.provolatile::text || ' parallel=' || p.proparallel::text
+         || ' config=' || coalesce(p.proconfig::text, '-')
+         || ' acl=' || coalesce(p.proacl::text, '-')
+         || ' src=' || CASE WHEN p.proname = 'timepart__stamp' THEN 'random' ELSE md5(coalesce(p.prosrc, '')) END || ' bin=' || coalesce(p.probin, '-')
+    FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_language l ON l.oid = p.prolang
+   WHERE p.pronamespace = 'kingres'::regnamespace
+  UNION ALL
+  SELECT 'trigger ' || t.tgrelid::regclass || ' ' || pg_catalog.pg_get_triggerdef(t.oid)
+    FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+   WHERE c.relnamespace = 'kingres'::regnamespace AND NOT t.tgisinternal
+  UNION ALL
+  SELECT 'event trigger ' || evtname || ' ' || evtevent || ' ' || evtfoid::regproc || ' ' || evtenabled::text
+    FROM pg_catalog.pg_event_trigger WHERE evtfoid::regproc::text LIKE 'kingres.%'
+  UNION ALL
+  SELECT 'comment ' || pg_catalog.pg_describe_object(classoid, objoid, objsubid) || ' ' || description
+    FROM pg_catalog.pg_description
+   WHERE (classoid = 'pg_class'::regclass AND objoid IN (SELECT oid FROM pg_catalog.pg_class WHERE relnamespace = 'kingres'::regnamespace))
+      OR (classoid = 'pg_proc'::regclass AND objoid IN (SELECT oid FROM pg_catalog.pg_proc WHERE pronamespace = 'kingres'::regnamespace))
+  UNION ALL
+  SELECT 'acl ' || c.relname || ' ' || coalesce(c.relacl::text, '-')
+         || ' rls=' || c.relrowsecurity || '/' || c.relforcerowsecurity
+    FROM pg_catalog.pg_class c
+   WHERE c.relnamespace = 'kingres'::regnamespace AND c.relkind IN ('r', 'v')
+  UNION ALL
+  SELECT 'member ' || pg_catalog.pg_describe_object(d.classid, d.objid, d.objsubid)
+    FROM pg_catalog.pg_depend d
+   WHERE d.refclassid = 'pg_extension'::regclass
+     AND d.refobjid = (SELECT oid FROM pg_catalog.pg_extension WHERE extname = 'kingres_timepart')
+     AND d.deptype = 'e'
+  UNION ALL
+  SELECT 'view ' || c.relname || ' ' || pg_catalog.pg_get_viewdef(c.oid, true)
+         || ' options=' || coalesce(c.reloptions::text, '-')
+    FROM pg_catalog.pg_class c
+   WHERE c.relnamespace = 'kingres'::regnamespace AND c.relkind = 'v'
+  UNION ALL
+  SELECT 'relation ' || c.relname || ' kind=' || c.relkind::text || ' persistence=' || c.relpersistence::text
+         || ' owner=' || c.relowner::regrole || ' options=' || coalesce(c.reloptions::text, '-')
+    FROM pg_catalog.pg_class c
+   WHERE c.relnamespace = 'kingres'::regnamespace AND c.relkind IN ('r', 'v', 'S', 'i')
+  UNION ALL
+  SELECT 'column details ' || c.relname || '.' || a.attname || ' identity=' || a.attidentity::text
+         || ' generated=' || a.attgenerated::text || ' collation=' || a.attcollation::regcollation
+         || ' storage=' || a.attstorage::text || ' acl=' || coalesce(a.attacl::text, '-')
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+   WHERE c.relnamespace = 'kingres'::regnamespace AND c.relkind IN ('r', 'v')
+  UNION ALL
+  SELECT 'sequence ' || s.seqrelid::regclass || ' type=' || s.seqtypid::regtype || ' start=' || s.seqstart
+         || ' increment=' || s.seqincrement || ' max=' || s.seqmax || ' min=' || s.seqmin
+         || ' cache=' || s.seqcache || ' cycle=' || s.seqcycle
+    FROM pg_catalog.pg_sequence s JOIN pg_catalog.pg_class c ON c.oid = s.seqrelid
+   WHERE c.relnamespace = 'kingres'::regnamespace
+  UNION ALL
+  SELECT 'policy ' || p.polrelid::regclass || ' ' || p.polname || ' cmd=' || p.polcmd::text
+         || ' permissive=' || p.polpermissive || ' roles=' || p.polroles::text
+         || ' using=' || coalesce(pg_catalog.pg_get_expr(p.polqual, p.polrelid), '-')
+         || ' check=' || coalesce(pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid), '-')
+    FROM pg_catalog.pg_policy p JOIN pg_catalog.pg_class c ON c.oid = p.polrelid
+   WHERE c.relnamespace = 'kingres'::regnamespace
+  UNION ALL
+  SELECT 'function owner ' || p.oid::regprocedure || ' ' || p.proowner::regrole
+    FROM pg_catalog.pg_proc p WHERE p.pronamespace = 'kingres'::regnamespace
+  UNION ALL
+  SELECT 'function depends ' || p.oid::regprocedure || ' -> '
+         || pg_catalog.pg_describe_object(d.refclassid, d.refobjid, d.refobjsubid) || ' ' || d.deptype::text
+    FROM pg_catalog.pg_depend d
+    JOIN pg_catalog.pg_proc p ON d.classid = 'pg_proc'::regclass AND d.objid = p.oid
+   WHERE p.pronamespace = 'kingres'::regnamespace AND d.refclassid <> 'pg_extension'::regclass
+  UNION ALL
+  SELECT 'event trigger details ' || evtname || ' tags=' || coalesce(evttags::text, '-')
+         || ' owner=' || evtowner::regrole
+    FROM pg_catalog.pg_event_trigger WHERE evtfoid::regproc::text LIKE 'kingres.%'
+  UNION ALL
+  SELECT 'schema kingres owner=' || n.nspowner::regrole || ' acl=' || coalesce(n.nspacl::text, '-')
+    FROM pg_catalog.pg_namespace n WHERE n.nspname = 'kingres'
+  UNION ALL
+  SELECT 'type ' || t.typname || ' kind=' || t.typtype::text
+    FROM pg_catalog.pg_type t
+   WHERE t.typnamespace = 'kingres'::regnamespace AND t.typtype <> 'c' AND t.typcategory <> 'A'
+  UNION ALL
+  SELECT 'dumped configuration ' || coalesce(extconfig::regclass[]::text, '-') || ' ' || coalesce(extcondition::text, '-')
+    FROM pg_catalog.pg_extension WHERE extname = 'kingres_timepart';
+END
+$$;
+
+
+SET client_min_messages = warning;
+DROP ROLE IF EXISTS upg_driver;
+RESET client_min_messages;
+CREATE ROLE upg_driver NOLOGIN;
+
+-- Install 0.2 directly.
+DROP EXTENSION kingres_timepart;
+CREATE EXTENSION kingres_timepart;
+SELECT extversion FROM pg_extension WHERE extname = 'kingres_timepart';
+SELECT kingres.timepart_grant_driver('upg_driver');
+CREATE TABLE public.upg_direct AS SELECT line FROM public.upg_snapshot() line;
+SELECT count(*) > 300 AS direct_snapshot_is_not_trivial FROM public.upg_direct;
+DROP EXTENSION kingres_timepart;
+
+-- Install 0.1, use it, upgrade.
+CREATE EXTENSION kingres_timepart VERSION '0.1';
+SELECT extversion FROM pg_extension WHERE extname = 'kingres_timepart';
+SELECT kingres.timepart_grant_driver('upg_driver');
+CREATE TABLE public.upg_t (ts timestamptz NOT NULL, v int) PARTITION BY RANGE (ts);
+SELECT kingres.timepart_set_policy('public.upg_t', '1 day', create_ahead => '1 day', columnar_after => '2 days',
+                                   columnar_options => '{"compression": "pglz"}');
+\o /dev/null
+CALL kingres.timepart_run('public.upg_t', '2026-03-05 12:00 UTC');
+\o
+SELECT kingres.create_time_partitions('public.upg_t', '1 day', '2026-03-05 UTC', '2026-03-01 UTC');
+INSERT INTO public.upg_t SELECT '2026-03-01 UTC'::timestamptz + (i % 5) * interval '1 day', i FROM generate_series(1, 50) i;
+CREATE TEMP TABLE upg_before AS
+SELECT kingres.timepart__stamp() AS stamp,
+       (SELECT count(*) FROM kingres.timepart_policy) AS policies,
+       (SELECT count(*) FROM kingres.timepart_run) AS runs,
+       (SELECT count(*) FROM kingres.timepart_run_action) AS actions;
+-- what 0.1 says about a conversion
+CALL kingres.convert_partition('public.upg_t', 'public.upg_t_p20260301');
+
+ALTER EXTENSION kingres_timepart UPDATE;
+SELECT extversion FROM pg_extension WHERE extname = 'kingres_timepart';
+CREATE TABLE public.upg_upgraded AS SELECT line FROM public.upg_snapshot() line;
+
+-- No difference in either direction.
+SELECT 'only in direct install' AS side, line FROM
+  (SELECT line FROM public.upg_direct EXCEPT SELECT line FROM public.upg_upgraded) x
+UNION ALL
+SELECT 'only in upgrade', line FROM
+  (SELECT line FROM public.upg_upgraded EXCEPT SELECT line FROM public.upg_direct) y
+ORDER BY 1, 2;
+
+-- The data and the identity of the installation survived.
+SELECT b.stamp = kingres.timepart__stamp() AS same_stamp,
+       b.policies = (SELECT count(*) FROM kingres.timepart_policy) AS same_policies,
+       b.runs = (SELECT count(*) FROM kingres.timepart_run) AS same_runs,
+       b.actions = (SELECT count(*) FROM kingres.timepart_run_action) AS same_actions
+  FROM upg_before b;
+SELECT table_name, columnar_after, columnar_options FROM kingres.timepart_policy;
+-- the role that drives its own maintenance has the new functions
+SELECT has_function_privilege('upg_driver', 'kingres.timepart__convert_after(bigint)', 'EXECUTE') AS driver_has_convert_after,
+       has_function_privilege('upg_driver', 'kingres.timepart__convert_note(bigint, oid, boolean)', 'EXECUTE') AS driver_has_convert_note,
+       has_function_privilege('upg_driver', 'kingres.timepart_run_action(bigint, text)', 'EXECUTE') AS driver_has_run_action,
+       has_function_privilege('public', 'kingres.timepart__convert_note(bigint, oid, boolean)', 'EXECUTE') AS public_has_convert_note;
+
+-- and the conversion works on what 0.1 made
+SET client_min_messages = warning;
+CREATE EXTENSION kingres_columnar;
+RESET client_min_messages;
+CALL kingres.convert_partition('public.upg_t', 'public.upg_t_p20260301');
+SELECT c.relname, a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam
+ WHERE c.relname = 'upg_t_p20260301';
+SELECT count(*) AS rows_after FROM public.upg_t;
+\o /dev/null
+CALL kingres.timepart_run('public.upg_t', '2026-03-05 12:00 UTC');
+\o
+SELECT state FROM kingres.timepart_run ORDER BY run_id DESC LIMIT 1;
+SELECT a.kind, a.partition_name, a.state FROM kingres.timepart_run_action a
+ WHERE a.run_id = (SELECT max(run_id) FROM kingres.timepart_run) AND a.kind = 'convert' ORDER BY a.seq;
+
+SET client_min_messages = warning;
+DROP TABLE public.upg_t;
+DROP EXTENSION kingres_columnar;
+DROP TABLE public.upg_direct, public.upg_upgraded;
+DROP FUNCTION public.upg_snapshot();
+DROP OWNED BY upg_driver;
+DROP ROLE upg_driver;
+-- the extension, as the other tests left it
+DROP EXTENSION kingres_timepart;
+CREATE EXTENSION kingres_timepart;
+RESET client_min_messages;
