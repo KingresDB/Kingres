@@ -119,6 +119,7 @@ export const keys = {
   ledgerSigning: ['ledgerSigning'] as const,
   ledgerPublication: ['ledgerPublication'] as const,
   ledgerAnchorTargets: ['ledgerAnchorTargets'] as const,
+  ledgerClientKeys: (name: string) => ['ledger', name, 'clientKeys'] as const,
   alerts: ['alerts'] as const,
   logs: ['logs'] as const,
   metrics: ['metrics'] as const,
@@ -457,6 +458,15 @@ export const useLedgerAnchorTargets = (enabled: MaybeRefOrGetter<boolean> = true
     queryFn: endpoints.listLedgerAnchorTargets,
     refetchInterval: every(POLL.normal),
     enabled: computed(() => toValue(enabled)),
+  })
+
+/** 0.11.0: the client keys of a database (a server may answer 422 `unsupported_operation`: extension older than 0.3, or not built). */
+export const useLedgerClientKeys = (name: MaybeRefOrGetter<string>) =>
+  useQuery({
+    queryKey: computed(() => keys.ledgerClientKeys(toValue(name))),
+    queryFn: () => endpoints.listLedgerClientKeys(toValue(name)),
+    refetchInterval: every(POLL.normal),
+    enabled: computed(() => toValue(name) !== ''),
   })
 
 // --- this server ------------------------------------------------------------------------------

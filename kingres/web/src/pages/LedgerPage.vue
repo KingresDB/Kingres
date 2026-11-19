@@ -18,6 +18,7 @@ import { useLedgerStatusList } from '@/api/queries'
 import OverviewTab from '@/components/ledger/OverviewTab.vue'
 import DigestsTab from '@/components/ledger/DigestsTab.vue'
 import AnchoringTab from '@/components/ledger/AnchoringTab.vue'
+import ClientKeysTab from '@/components/ledger/ClientKeysTab.vue'
 import SigningTab from '@/components/ledger/SigningTab.vue'
 import PublicationTab from '@/components/ledger/PublicationTab.vue'
 
@@ -30,6 +31,7 @@ const TABS = [
   { id: 'overview', label: 'Overview' },
   { id: 'digests', label: 'Digests' },
   { id: 'anchoring', label: 'Anchoring' },
+  { id: 'clients', label: 'Client keys' },
   { id: 'signing', label: 'Signing' },
   { id: 'publication', label: 'Publication' },
 ]
@@ -144,6 +146,14 @@ const aboutDatabase = computed(() => tab.value === 'overview' || tab.value === '
     aria-labelledby="tab-anchoring"
   >
     <AnchoringTab v-model:database-name="dbName" />
+  </div>
+  <div
+    v-else-if="tab === 'clients'"
+    id="panel-clients"
+    role="tabpanel"
+    aria-labelledby="tab-clients"
+  >
+    <ClientKeysTab v-model:database-name="dbName" />
   </div>
   <div
     v-else-if="tab === 'signing'"

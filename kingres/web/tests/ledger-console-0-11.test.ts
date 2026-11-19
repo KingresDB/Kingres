@@ -62,12 +62,19 @@ async function openPublication() {
 const rows = (testId: string) => screen.queryAllByTestId(testId)
 
 describe('the tab bar of the Ledger page', () => {
-  it('has Overview, Digests, Anchoring, Signing and Publication, and keeps the database and the tab in the address', async () => {
+  it('has Overview, Digests, Anchoring, Client keys, Signing and Publication, and keeps the database and the tab in the address', async () => {
     const user = userEvent.setup()
     const { router } = await renderApp('/ledger')
     await screen.findByText(/status of shop/i)
     const tabs = screen.getAllByRole('tab').map((t) => t.textContent?.trim())
-    expect(tabs).toEqual(['Overview', 'Digests', 'Anchoring', 'Signing', 'Publication'])
+    expect(tabs).toEqual([
+      'Overview',
+      'Digests',
+      'Anchoring',
+      'Client keys',
+      'Signing',
+      'Publication',
+    ])
     expect(screen.getByRole('tab', { name: 'Overview' })).toHaveAttribute('aria-selected', 'true')
     await user.click(screen.getByRole('tab', { name: 'Digests' }))
     await screen.findByRole('heading', { name: 'Digests' })

@@ -79,6 +79,9 @@ export async function startBrowserMocks(): Promise<void> {
     // 0.12.0: the values of `?signing=` while the page is open (`restored`: the system database is older than what was published).
     signingSwitch: (text: string) =>
       applySwitches(new URLSearchParams({ signing: text }), getState()),
+    // Any value of any URL switch of the mock while the page is open: `urlSwitch('clientkeys', 'keys')`.
+    urlSwitch: (name: string, text: string) =>
+      applySwitches(new URLSearchParams({ [name]: text }), getState()),
     anchorsSwitch: (text: string) =>
       applySwitches(new URLSearchParams({ anchors: text }), getState()),
     resetCounter: () => {

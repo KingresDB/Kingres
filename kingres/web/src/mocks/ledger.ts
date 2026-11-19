@@ -806,6 +806,64 @@ function isKey32(text: unknown): boolean {
   }
 }
 
+/** `?clientkeys=legacy`: the ledger extension of the database is older than 0.3, so there are no client keys. */
+function legacyCheck(): void {
+  if (mockConfig.clientLegacy)
+    throw problem(
+      'unsupported_operation',
+      'The ledger extension of this database is older than 0.3.',
+    )
+}
+
+/** `?clientkeys=refuse:<code>`. */
+function clientRefuse(): void {
+  const code = mockConfig.clientRefuse
+  if (code)
+    throw problem(
+      code as Parameters<typeof problem>[0],
+      'The server refused the request (a state of the mock).',
+    )
+}
+
+/** The identity point and the other encodings of a point of small order (the registry refuses them, L21-01). */
+const SMALL_ORDER = [
+  'AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=', // 01 00 .. 00: the identity
+  '7P///////////////////////////////////////////38=', // ec ff .. 7f: its alias
+  'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIA=', // 00 .. 80: a point of order 4
+]
+function isSmallOrder(publicKey: string): boolean {
+  return SMALL_ORDER.includes(publicKey)
+}
+
+/** `?clientkeys=keys`: three client keys of every database that has a ledger. */
+export function seedClientKeys(s: MockState): void {
+  const l = l7(s)
+  const ago = (d: number): string => new Date(Date.now() - d * 86_400_000).toISOString()
+  const b64 = (seed: number): string => {
+    const bytes = new Uint8Array(32).map((_, i) => (seed * 37 + i * 11 + 5) % 251)
+    return btoa(String.fromCharCode(...bytes))
+  }
+  for (const rec of s.databases.filter(hasLedger)) {
+    const name = rec.info.name
+    if ((l.clientKeys[name] ?? []).length > 0) continue
+    const mk = (seed: number, label: string, roleName: string | null, revoked: boolean) => ({
+      keyId: hex64(b64(seed)).slice(0, 8),
+      publicKey: b64(seed),
+      roleName,
+      label,
+      registeredBy: 'admin',
+      registeredAt: ago(30 - seed),
+      revokedAt: revoked ? ago(2) : null,
+      revocationReason: revoked ? 'The laptop that held the key was lost.' : null,
+    })
+    l.clientKeys[name] = [
+      mk(1, 'orders service', null, false),
+      mk(2, 'billing batch job', 'kingres_ops', false),
+      mk(3, 'old import script', null, true),
+    ]
+  }
+}
+
 // --- the handlers --------------------------------------------------------------------------------
 
 export function ledgerHandlers(): Partial<Record<OperationId, Handler>> {
@@ -1018,16 +1076,36 @@ export function ledgerHandlers(): Partial<Record<OperationId, Handler>> {
       }
     },
     listLedgerClientKeys: (c) => {
+      legacyCheck()
       const rec = db(c.s, c.params.databaseName ?? '')
       return ok({ items: structuredClone(l7(c.s).clientKeys[rec.info.name] ?? []) })
     },
     registerLedgerClientKey: (c) => {
+      legacyCheck()
+      clientRefuse()
+      if (mockConfig.clientNoSsl)
+        throw problem(
+          'unsupported_operation',
+          'This server was built without OpenSSL: it cannot check attestations.',
+        )
       const l = l7(c.s)
       const rec = db(c.s, c.params.databaseName ?? '')
       const b = body<S['RegisterLedgerClientKeyRequest']>(c)
       const errors: { field: string; message: string }[] = []
       if (!isKey32(b.publicKey))
         errors.push({ field: 'publicKey', message: 'Give 32 bytes as standard base64.' })
+      else if (isSmallOrder(b.publicKey))
+        errors.push({
+          field: 'publicKey',
+          message:
+            'This is not the canonical encoding of a point of the curve that does not have small order: a signature under such a key can be forged, so it is refused.',
+        })
+      if (
+        typeof b.roleName === 'string' &&
+        b.roleName !== '' &&
+        !c.s.roles.some((r) => r.name === b.roleName)
+      )
+        errors.push({ field: 'roleName', message: 'This role does not exist.' })
       if (typeof b.label !== 'string' || b.label.length < 1 || b.label.length > 100)
         errors.push({ field: 'label', message: 'Give a label of 1 to 100 characters.' })
       if (errors.length > 0) throw validationFailed(errors)
@@ -1048,6 +1126,8 @@ export function ledgerHandlers(): Partial<Record<OperationId, Handler>> {
       return created(structuredClone(key))
     },
     revokeLedgerClientKey: (c) => {
+      legacyCheck()
+      clientRefuse()
       const rec = db(c.s, c.params.databaseName ?? '')
       const key = (l7(c.s).clientKeys[rec.info.name] ?? []).find((k) => k.keyId === c.params.keyId)
       if (!key) throw problem('not_found', 'The key does not exist.')
@@ -1062,6 +1142,8 @@ export function ledgerHandlers(): Partial<Record<OperationId, Handler>> {
       return ok(structuredClone(key))
     },
     setTableSignaturePolicy: (c) => {
+      legacyCheck()
+      clientRefuse()
       const l = l7(c.s)
       const rec = db(c.s, c.params.databaseName ?? '')
       const t = rec.tables.find(
@@ -1076,6 +1158,7 @@ export function ledgerHandlers(): Partial<Record<OperationId, Handler>> {
       return ok(structuredClone(t))
     },
     upgradeLedgerExtension: (c) => {
+      clientRefuse()
       const rec = db(c.s, c.params.databaseName ?? '')
       if (c.s.tasks.some((t) => t.task.state === 'running' && t.task.kind === 'ledger.upgrade'))
         throw problem('operation_in_progress', 'An upgrade is running.')

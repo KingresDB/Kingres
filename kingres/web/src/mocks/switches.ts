@@ -64,6 +64,7 @@ import {
   seedAnchors,
   seedAnchorsAll,
   seedAnchorsDisabled,
+  seedClientKeys,
 } from './ledger'
 import { signingKey, withoutKeys } from './ledger-data'
 import {
@@ -253,6 +254,15 @@ export function applySwitches(params: URLSearchParams, s: MockState): void {
     if (entry === 'testwarn') mockConfig.anchorTest = 'warn'
     const refuse = /^refuse:([a-z_]+)$/.exec(entry)
     if (refuse) mockConfig.anchorRefuse = refuse[1] as string
+  }
+  // 0.11.0 (Console C): `keys` (three client keys: any role, bound to a role, revoked), `legacy` (the extension is older than 0.3),
+  // `nossl` (the server cannot attest), `refuse:<code>` (every change answers that problem code).
+  for (const entry of (params.get('clientkeys') ?? '').split(',')) {
+    if (entry === 'keys') seedClientKeys(s)
+    if (entry === 'legacy') mockConfig.clientLegacy = true
+    if (entry === 'nossl') mockConfig.clientNoSsl = true
+    const refuse = /^refuse:([a-z_]+)$/.exec(entry)
+    if (refuse) mockConfig.clientRefuse = refuse[1] as string
   }
   for (const entry of (params.get('clock') ?? '').split(',')) {
     const off = /^off:([^:]+):(-?\d+(?:\.\d+)?)$/.exec(entry)

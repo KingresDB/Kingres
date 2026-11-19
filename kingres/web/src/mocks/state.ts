@@ -141,6 +141,12 @@ export const mockConfig = {
   anchorTest: null as null | 'warn' | 'fail',
   /** 0.11.0 (console part B): every change to a target, a test, an anchor-now and a retry answers this problem code. */
   anchorRefuse: null as null | string,
+  /** 0.11.0 (console part C): the ledger extension is older than 0.3: every client-key operation answers 422 `unsupported_operation`. */
+  clientLegacy: false,
+  /** The server has no OpenSSL: a key cannot be registered (422 `unsupported_operation`). */
+  clientNoSsl: false,
+  /** Every change of a client key or of a signature policy, and the upgrade, answers this problem code. */
+  clientRefuse: null as null | string,
   /** 0.8.0: the source commit the server reports in GET /setup/state: a hex id, null (the build does not know it) or text that is not a hex id. */
   commit: '0123456789abcdef0123456789abcdef01234567' as string | null,
   /**

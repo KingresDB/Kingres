@@ -459,6 +459,19 @@ function seedHostileLedger(s: MockState): void {
       state: 'none',
     })
   }
+  // Client keys (console part C): a label, a role, a registrar and a reason written by someone hostile.
+  l.clientKeys.shop = [HOSTILE.markup, HOSTILE.reversed, HOSTILE.long.slice(0, 100)].map(
+    (label, i) => ({
+      keyId: `0000000${i}`,
+      publicKey: btoa(String.fromCharCode(...new Uint8Array(32).fill(65 + i))),
+      roleName: i === 0 ? HOSTILE.zeroWidth : null,
+      label,
+      registeredBy: HOSTILE.reversed,
+      registeredAt: nowIso(),
+      revokedAt: i === 2 ? nowIso() : null,
+      revocationReason: i === 2 ? HOSTILE.newline : null,
+    }),
+  )
   l.anchors.push({
     databaseName: 'shop',
     id: l.nextAnchorId++,

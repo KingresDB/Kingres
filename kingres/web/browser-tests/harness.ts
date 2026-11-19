@@ -214,6 +214,7 @@ export const ROUTES = [
   '/ledger',
   '/ledger?tab=digests',
   '/ledger?tab=anchoring',
+  '/ledger?tab=clients',
   '/ledger?tab=signing',
   '/ledger?tab=publication',
   '/workbench',
@@ -300,6 +301,31 @@ const anchorsSwitch = async (page: Page, value: string) => {
     ).__queryClient.invalidateQueries()
   }, value)
   await sleep(300)
+}
+
+/** Applies a value of a URL switch of the mock while the page is open, and makes the pages read again. */
+const urlSwitch = async (page: Page, name: string, value: string) => {
+  await page.evaluate(
+    (n, v) => {
+      ;(
+        window as unknown as { __kingresMock: { urlSwitch: (n: string, t: string) => void } }
+      ).__kingresMock.urlSwitch(n, v)
+      void (
+        window as unknown as { __queryClient: { invalidateQueries: () => unknown } }
+      ).__queryClient.invalidateQueries()
+    },
+    name,
+    value,
+  )
+  await sleep(300)
+}
+
+/** Opens the Client keys tab with three keys (once). */
+async function clientKeys(page: Page): Promise<void> {
+  await urlSwitch(page, 'clientkeys', 'keys')
+  await page.waitForSelector('[data-testid="client-keys"] tbody tr', { timeout: 30_000 })
+  await page.waitForSelector('[data-testid="client-tables"] tbody tr', { timeout: 30_000 })
+  await sleep(250)
 }
 
 /** Clicks the button with this accessible name (an `aria-label`) or visible text. */
@@ -1090,6 +1116,59 @@ export const STATES: PageState[] = [
       await cancel(page)
       await freshFailover(page)
     },
+  },
+  {
+    // 0.11.0, Console C: the Client keys tab (keys of three states, the tables with their policy) and its dialogs.
+    name: 'client keys tab (0.11.0)',
+    needsMock: true,
+    route: '/ledger?tab=clients',
+    open: clientKeys,
+  },
+  {
+    name: 'client keys: register a key (0.11.0)',
+    needsMock: true,
+    route: '/ledger?tab=clients',
+    open: async (page) => {
+      await clientKeys(page)
+      await clickText(page, 'Register a key')
+      await dialogOpen(page)
+      await clickText(page, 'Register the key', '[role="dialog"] button')
+      await page.waitForSelector('[role="dialog"] .error', { timeout: 10_000 })
+    },
+    close: cancel,
+  },
+  {
+    name: 'client keys: require signatures for a table (0.11.0)',
+    needsMock: true,
+    route: '/ledger?tab=clients',
+    open: async (page) => {
+      await clientKeys(page)
+      await page.evaluate(() => {
+        const b = [...document.querySelectorAll<HTMLElement>('button')].find((e) =>
+          (e.getAttribute('aria-label') ?? '').startsWith('Require signatures for'),
+        )
+        b?.click()
+      })
+      await dialogOpen(page)
+      await page.waitForSelector('[data-testid="policy-consequences"]', { timeout: 10_000 })
+    },
+    close: cancel,
+  },
+  {
+    name: 'client keys: revoke a key (0.11.0)',
+    needsMock: true,
+    route: '/ledger?tab=clients',
+    open: async (page) => {
+      await clientKeys(page)
+      await page.evaluate(() => {
+        const b = [...document.querySelectorAll<HTMLElement>('button')].find((e) =>
+          (e.getAttribute('aria-label') ?? '').startsWith('Revoke key'),
+        )
+        b?.click()
+      })
+      await dialogOpen(page)
+    },
+    close: cancel,
   },
   {
     name: 'system database stopped',

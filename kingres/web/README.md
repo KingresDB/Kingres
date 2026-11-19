@@ -470,6 +470,42 @@ copy. Adapting to the next revision is a separate step.
   `failover_in_progress` while a failover runs and with the blocker's code; `?unsupported=restorePreferredPrimaries` is the server of today for the restore; the switchover
   is "not available" until `?failover=graceful`. Tests: `failover-console-part3.test.ts`; browser states: the switchover plan, the switchover not available, the restore plan.
 
+### The Ledger console, part C (step 19 of the plan of phase 7: the Client keys tab)
+
+The Ledger page has a sixth tab, **Client keys** (`?tab=clients`, after Anchoring; cluster-wide like Anchoring, with its own database choice). Components under
+`src/components/ledger/`, words and checks in `lib/ledger-client.ts`:
+
+- **Keys** (`ClientKeysTab.vue`): the public keys that clients registered to sign the rows they write, with label, key id, a short public key, the role (or "Any role"), who
+  registered it and when, and active or revoked (with the reason). The text says what a client key is for and what an attestation does not prove (the application must
+  recompute the row hash itself; the label and the role say nothing about who holds the key). **Register a key** (`RegisterClientKeyDialog.vue`): the public key as 32 bytes of
+  standard base64, an optional role, a label of 1 to 100 characters; there is no field for a private key and the dialog says where the key pair is made. **Revoke**
+  (`RevokeClientKeyDialog.vue`): a reason of 1 to 200 characters and the words of what a revocation means (entries signed before stay valid; a revoked key is never
+  registered again).
+- **The signature policy of a table** (`SignaturePolicyDialog.vue`): the ledger tables of the database and **Require signatures...**. Before the click the dialog says what it does
+  and what it cannot undo: from then on a transaction that writes the table commits only with an attestation for every entry (otherwise it fails at COMMIT with KL010); **the
+  switch waits for the open writers of the table** (every open transaction that wrote it, a prepared one until it ends, and later writers wait for the switch; the wait is bounded and
+  a switch that is not over in time fails and changes nothing); entries committed before the switch are not asked for an attestation; it cannot be switched back; the table
+  name is typed. While the request is open the dialog says that it waits.
+- **The upgrade of the extension** (`UpgradeExtensionDialog.vue`): **Upgrade the extension** starts the task `ledger.upgrade` (ALTER EXTENSION kingres_ledger UPDATE in every shard
+  group); the dialog says that a group that cannot be upgraded fails the task and its error names the server.
+- **Refusals** in words (`clientRefusal`, `LedgerRefusal.vue`) for each action and code: `already_exists` (a key is registered once; a revoked key never again), `conflict` (a key that
+  is revoked already, a policy that is required already: told as information, and the table is then shown as Required), `unprocessable` (not a ledger table), `not_found`,
+  `operation_in_progress` (an upgrade runs), and `unsupported_operation` (the extension is older than 0.3, the server has no OpenSSL, or this server version does not build it yet): the
+  calm "not available" with "Nothing was changed". Any other code falls back to the generic words.
+- **Roles.** Everybody who may read the ledger reads the keys and the tables; Register, Revoke, Require signatures and Upgrade need `kingres_admin`: a role that may not sees the
+  button disabled with the reason.
+- **Mock.** `?clientkeys=keys` (three keys: any role, bound to a role, revoked), `legacy` (the extension is older than 0.3: every client-key operation answers 422
+  `unsupported_operation`), `nossl` (a key cannot be registered), `refuse:<code>` (every change and the upgrade answer that problem code); the registration checks the key as the
+  registry does (32 bytes; the identity point and its aliases of small order are refused at `publicKey`), that the role exists, and never registers a key twice; `?phase7=today` is the
+  server of today (all of it answers `unsupported_operation`); `?mock=hostile` adds keys with hostile labels, roles, registrars and reasons; `__kingresMock.urlSwitch(name, text)`
+  applies any URL switch while the page is open.
+- **Waits for the contract or the server.** The contract's `TableLedger` has no member for the signature policy of a table (and the extension has `signature_required_from`), so the
+  console cannot show the policy of a table it did not switch: the column says "Not reported" until this session switched it or the server said it is required already. The
+  extension version of a database (or of each group) is not in `LedgerStatus`, so the upgrade button is always offered to an administrator (design: shown when a group reports 0.2) and
+  the dialog says what it does for a group that is on the newest version: nothing. The error code of a switch that timed out waiting for writers (`55P03`) has no problem code of its own in the contract.
+- **Tests.** `ledger-client-0-11.test.ts` (every state, the dialogs, the refusals, the roles, hostile text, axe, the library); the tab is in `pages-a11y.test.ts` and `hostile.test.ts`; the
+  browser tests have the route and four states (the tab, the register dialog with its errors, the policy dialog, the revoke dialog).
+
 ## What the panel does for contract 0.12.0
 
 Contract 0.12.0 adds no operation (132) and four small things that the panel follows: the new outcome `completedWithWarnings`, the plan in the problem

@@ -106,6 +106,8 @@ export type LedgerAnchorTargetCreate = S['LedgerAnchorTargetCreate']
 export type LedgerAnchorTargetUpdate = S['LedgerAnchorTargetUpdate']
 export type LedgerAnchorTest = S['LedgerAnchorTest']
 export type LedgerAnchor = S['LedgerAnchor']
+// Client keys (contract 0.11.0)
+export type LedgerClientKey = S['LedgerClientKey']
 
 // Configuration (contract 0.8.0)
 export type ConfigLevel = S['ConfigLevel']
