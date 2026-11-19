@@ -2918,6 +2918,55 @@ build to the corrected rule. The verifier's README has the same list with the re
     `KL010`). A commit callback of another module that was registered before this library's could
     write after the check.
 
+The number 159 is not used.
+
+160. **The inputs of `attestation` (7.4).** The proof of the attestation row is a proof of the usual
+    format in a file of its own, with the columns file of the row. The verifier cannot know which
+    table is the table of attestations (111: no number is assumed), so the table identifiers of the
+    attestations and of the revocations are flags, and the output says that they are claims of the
+    server; the signature under a key the auditor pinned is what a row of another table cannot have.
+    `bundle.json` names the columns file beside the attestation file.
+161. **The attestation row is in the block of its entry (3.7).** `ledger_attest` runs in the
+    transaction of the entry and a transaction is in one block, so the attestation row must name the
+    transaction and the sequence number of the entry and be in the same block.
+162. **The flags of an aggregate member (5.5, 5.6).** `diverged` is status 1: the publisher says the
+    chain was rolled back or rewritten, and a status of 0 would hide it from a script. `stale` is
+    status 3. `retired` needs a `chain-retired` event that the trust chain authorises and that names
+    the same final height and block hash: no such event is status 3, an event that no authorised key
+    signed is status 1, another head is status 1. A member is checked against the signed checkpoint
+    of the chain log it names, whose size may be larger than the member's.
+163. **The state of `monitor` is a directory (7.5).** One file per log in the form of
+    `checkpoint --state`, so every property the reviews of the verifier established holds for it,
+    and one file for what is not a checkpoint (the audited size of each log, a digest of the text of
+    each event, the chains that were retired). An event is identified by the text of its note, never
+    by its signature lines. A run stops at the first finding.
+164. **Sources (4.4, 7.4).** An HTTP source follows no redirect and uses no proxy; plain `http` is
+    for this machine only; a server that cannot be reached is status 3. An HTTP source cannot list a
+    directory, so the epoch of a chain log is given and the tile directories of older sizes are not
+    checked, which a note says. An archive is read under limits.
+165. **The authority of an event (3.3, 3.4).** An event counts when a key signed it that is, at its
+    number, a key of the trust file that the file does not call revoked, or a key that an earlier
+    verified event added, and that no earlier event retired or revoked. A key the file calls revoked
+    never vouches for an event, so `trust follow` starts from the file the auditor pinned. The
+    validity windows are not applied to events. A `key-added` event is signed by an authorised key
+    other than the new one and by the new key; a `key-retired` and a `key-revoked` event by an
+    authorised key other than the one they are about.
+166. **`bundle verify` checks every file of the tile directories (7.3)**, not only those the
+    checkpoint needs: a partial tile or entry bundle of an older size must be a prefix of the tile or
+    bundle of the signed tree, and a file the tree does not have is a failure.
+167. **The three tests of a public key (155)** are applied to every key the verifier reads: the
+    pinned server keys, the client keys, and the key of a `key-added` event.
+168. **A revoked key is revoked (3.3).** The rule that old checkpoints of a revoked key may stay good
+    when an anchor dates them needs anchors; until the verifier reads anchors, `trust follow` writes
+    `revoked`, and a held checkpoint rests on the rules of 55 and 69.
+169. **The log leg (4.10, 7.4).** A block at a height the signed chain log does not cover is a
+    failure. The leg through the aggregate shows the block through the member of the last leaf of
+    the signed aggregate; its root of trust is the signature on the aggregate checkpoint, and the
+    output says that no anchor was checked.
+170. **`bundle fetch` (4.6, 7.4)** needs the logs named: `logs.json` is optional and has no format
+    yet. A partial tile that is gone is not an error. Without a trust file nothing is verified and
+    the word is `FETCHED`, not `VERIFIED`.
+
 Of section 13: item 2 (test vectors) is settled for signed notes (the example key and note of the
 specification are in the tests; the checkpoint example has no published key), item 3 (entry bundles at
 the standard path) and item 4 (RFC 9162 sections 2.1.3.2 and 2.1.4.2) were checked against the source.
