@@ -795,6 +795,7 @@ static void kc_flush_buf_ex(KcRelState *st, KcWriteBuf *b, Relation rel,
 static uint32 kc_stripe_limit(const KcOptions *opts);
 static void kc_coalesce(KcRelState *st);
 static void kc_buf_free(KcWriteBuf *b);
+static void kc_buf_visible(const KcWriteBuf *b, uint32 *first, uint32 *end);
 
 /*
  * Rows buffered for a file the relation no longer has (it was truncated or
@@ -2171,6 +2172,77 @@ kc_write_flush_relation(Relation rel)
 		if (b->nrows > 0 && kc_buf_flushable(st, b))
 			kc_flush_buf(st, b, rel);
 	}
+}
+
+/*
+ * A plan that has a Gather runs the scans of columnar tables in parallel
+ * workers, which cannot see rows that exist only in this backend's memory.
+ * Called by the custom scan of the leader when it starts such a plan (before
+ * the executor enters parallel mode, where a catalog row could not be written):
+ * the running subtransaction's buffers of the relation become stripes (design
+ * 7.1; the rows of the commands that ran before are then visible by the
+ * stripe's command ids exactly as in a serial scan), and what cannot be
+ * written (a buffer of an enclosing subtransaction, which the stripe row's
+ * transaction id would not follow; a buffer another scan of this backend
+ * reads) makes the plan fail with a message, never answer without those rows.
+ */
+void
+kc_write_prepare_for_workers(Relation rel)
+{
+	KcRelState *st;
+	ListCell   *lc;
+	uint64		uid;
+
+	kc_write_flush_relation(rel);
+	st = kc_state_get(RelationGetRelid(rel), false);
+	if (st == NULL)
+		return;
+	uid = kc_rel_ident(rel)->uid;
+	foreach(lc, st->bufs)
+	{
+		KcWriteBuf *b = lfirst(lc);
+		uint32		first;
+		uint32		end;
+
+		kc_buf_visible(b, &first, &end);
+		if (end > first && b->uid == uid)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("columnar table \"%s\" has rows that this transaction wrote and parallel workers cannot read",
+							RelationGetRelationName(rel)),
+					 errdetail("The rows were written by an enclosing subtransaction, or a scan of this session is still reading them."),
+					 errhint("Run the query with max_parallel_workers_per_gather = 0, or after the subtransaction has ended.")));
+	}
+}
+
+/*
+ * Does this backend hold rows of rel that kc_write_prepare_for_workers could
+ * not make visible to workers?  The planner asks, and offers no parallel path
+ * for such a relation (a plan prepared earlier and run later can still meet the
+ * rows, and then fails with the message of kc_write_prepare_for_workers).
+ */
+bool
+kc_write_parallel_blocked(Relation rel)
+{
+	KcRelState *st = kc_state_get(RelationGetRelid(rel), false);
+	ListCell   *lc;
+	uint64		uid;
+
+	if (st == NULL)
+		return false;
+	uid = kc_rel_ident(rel)->uid;
+	foreach(lc, st->bufs)
+	{
+		KcWriteBuf *b = lfirst(lc);
+		uint32		first;
+		uint32		end;
+
+		kc_buf_visible(b, &first, &end);
+		if (end > first && b->uid == uid &&
+			(kc_write_state_forbids_error() || !kc_buf_flushable(st, b)))
+			return true;
+	}
+	return false;
 }
 
 /* Forget the running subtransaction's buffered rows of a relation. */

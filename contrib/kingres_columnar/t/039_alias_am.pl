@@ -326,6 +326,33 @@ SELECT count(*) FROM keep;");
 	q1('DROP TABLE we; DROP ACCESS METHOD am_err; DROP FUNCTION kingres.herr(internal)');
 }
 
+# ------------------------------------------------------------------------
+# 10. C13-01: a broken handler is called once per call of the check, however many tables of its
+#     access method there are and however they are interleaved with other tables in pg_class
+# ------------------------------------------------------------------------
+{
+	q1(qq{CREATE FUNCTION kingres.herr2(internal) RETURNS table_am_handler AS '$pdir/kcprobe', 'kcprobe_am_error' LANGUAGE C;
+		CREATE ACCESS METHOD am_err2 TYPE TABLE HANDLER kingres.herr2;});
+	for my $i (1 .. 40)
+	{
+		q1("CREATE TABLE we2_$i (a int) USING am_err2; CREATE TABLE wh2_$i (a int)");
+	}
+	my $off = -s $node->logfile;
+	my ($ret, $out, $err) = $node->psql('postgres', "SET kcprobe.am_error = on;
+SELECT kingres.columnar_check_clean();
+SELECT count(*) FROM kingres.columnar_check() WHERE check_name = 'not_checked';");
+	is($ret, 0, 'a broken handler under 40 interleaved tables: no call fails');
+	is($out, "f\n1", '... the check says that the orphan step could not be done');
+	my $log = slurp_file($node->logfile, $off);
+	my $n = () = $log =~ /the handler of access method \d+ raised an error/g;
+	is($n, 2, '... and the handler was called once in each of the two calls, and logged once (not once per table)');
+	for my $i (1 .. 40)
+	{
+		q1("DROP TABLE we2_$i; DROP TABLE wh2_$i");
+	}
+	q1('DROP ACCESS METHOD am_err2; DROP FUNCTION kingres.herr2(internal)');
+}
+
 is(q1('SELECT kingres.columnar_check_clean()'), 't', 'at the end the check is clean');
 $node->stop;
 done_testing();

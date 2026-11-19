@@ -71,6 +71,7 @@ tests += {
       'columnar_vacuum',
       'columnar_analyze',
       'columnar_review',
+      'columnar_parallel',
       'columnar_security',
     ],
     'regress_args': ['--temp-config', files('kingres_columnar.conf')],
@@ -119,6 +120,7 @@ tests += {
       't/040_check_lock_table.pl',
       't/041_vacuum_failsafe.pl',
       't/042_not_checked_memory.pl',
+      't/043_parallel.pl',
     ],
   },
 }

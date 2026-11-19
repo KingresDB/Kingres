@@ -233,6 +233,24 @@ kc_am_class(Oid amoid)
  * step stand down and say so (C12-01) and leaves the relation out of the list
  * of tables.
  */
+/*
+ * The access methods whose handler raised an error since the entry point of
+ * the running call (the check, the reconcile, a vacuum) began: each is called
+ * once per call, however many tables of it the passes over pg_class meet, and
+ * its error is logged once.  Cleared by kc_am_failed_reset at the start of every
+ * entry point, and when an access method or a function changes.  More than
+ * KC_AM_FAILED_MAX broken access methods are called again when they come up.
+ */
+#define KC_AM_FAILED_MAX 16
+static Oid	kc_am_failed[KC_AM_FAILED_MAX];
+static int	kc_am_failed_n = 0;
+
+void
+kc_am_failed_reset(void)
+{
+	kc_am_failed_n = 0;
+}
+
 static KcAmClass
 kc_am_class_guarded(Oid amoid)
 {
@@ -240,12 +258,19 @@ kc_am_class_guarded(Oid amoid)
 	MemoryContext oldcxt = CurrentMemoryContext;
 	ResourceOwner oldowner = CurrentResourceOwner;
 
+	int			i;
+
 	if (!OidIsValid(amoid))
 		return KC_AM_UNKNOWN;
 	if (kc_am_class_cached(amoid, &cls))
 		return cls;
 	if (!kc_subxact_possible())
 		return kc_am_class(amoid);
+
+	/* a handler that failed during this call is not called again (C13-01) */
+	for (i = 0; i < kc_am_failed_n; i++)
+		if (kc_am_failed[i] == amoid)
+			return KC_AM_UNKNOWN;
 
 	BeginInternalSubTransaction(NULL);
 	MemoryContextSwitchTo(oldcxt);
@@ -274,6 +299,8 @@ kc_am_class_guarded(Oid amoid)
 						amoid, ed->message)));
 		FreeErrorData(ed);
 		cls = KC_AM_UNKNOWN;
+		if (kc_am_failed_n < KC_AM_FAILED_MAX)
+			kc_am_failed[kc_am_failed_n++] = amoid;
 	}
 	PG_END_TRY();
 	return cls;

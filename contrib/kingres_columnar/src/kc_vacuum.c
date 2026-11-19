@@ -265,6 +265,7 @@ kc_relation_vacuum(KC_VACUUM_PARAMS)
 
 	failsafe = kc_failsafe_active(rel);
 
+	kc_am_failed_reset();
 	(void) kc_catalog_reconcile(NULL, true);
 
 	nblocks = RelationGetNumberOfBlocks(rel);

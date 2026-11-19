@@ -607,6 +607,7 @@ kingres_columnar_reconcile(PG_FUNCTION_ARGS)
 	if (kc_entry_refused("columnar_reconcile", NULL, false))
 		PG_RETURN_INT32(0);
 	/* at the start of a subtransaction (not visible from here) none may be begun: only at the top level */
+	kc_am_failed_reset();
 	n = kc_catalog_reconcile(&why, GetCurrentTransactionNestLevel() == 1);
 	if (n < 0)
 	{
@@ -1160,6 +1161,7 @@ kc_check_run(bool fix, KcCheckSink *sink)
 	List	   *later;
 	ListCell   *lc;
 
+	kc_am_failed_reset();
 	if (!kc_catalog_lock_nowait(&locks, fix ? RowExclusiveLock : AccessShareLock))
 	{
 		char		who[240];

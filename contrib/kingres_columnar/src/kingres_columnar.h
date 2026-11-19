@@ -29,6 +29,7 @@
 #include "utils/resowner.h"
 #include "utils/snapshot.h"
 #include "access/tupdesc.h"
+#include "port/atomics.h"
 
 #include "pg_compat.h"
 
@@ -380,6 +381,7 @@ typedef struct KcAmMemo
 extern KcAmClass kc_am_class(Oid amoid);
 extern KcAmClass kc_am_class_memo(Oid amoid, KcAmMemo *memo);
 extern bool kc_am_is_columnar(Oid amoid);
+extern void kc_am_failed_reset(void);
 extern void kc_am_cache_init(void);
 extern bool kc_rel_is_columnar(Relation rel);
 
@@ -442,6 +444,8 @@ extern int	kc_write_path_count(void);
 extern const char *kc_write_path_get(int i, uint64 *hits);
 extern void kc_write_paths_reset(void);
 extern void kc_write_flush_relation(Relation rel);
+extern void kc_write_prepare_for_workers(Relation rel);
+extern bool kc_write_parallel_blocked(Relation rel);
 extern void kc_write_discard_relation(Oid relid, bool *had_outer);
 extern void kc_write_set_frozen(Relation rel, bool frozen);
 extern void kc_write_set_maintenance(bool on);
@@ -483,9 +487,40 @@ typedef struct KcScanStats
 	uint64		bytes_read;
 } KcScanStats;
 
+/*
+ * The state a parallel columnar scan shares (design 8.4), in the dynamic
+ * shared memory segment of the query: the index of the next stripe to take,
+ * a fingerprint of the stripe list the leader read (every participant reads
+ * the list itself with the same snapshot, and must have read the same one),
+ * and one slot of counters per participant (slot 0 is the leader, slot 1 + n
+ * is parallel worker n), which only its owner writes.
+ */
+typedef struct KcParStat
+{
+	uint64		stripes_total;
+	uint64		stripes_skipped;
+	uint64		groups_total;
+	uint64		groups_skipped;
+	uint64		bytes_read;
+	uint64		rows;
+} KcParStat;
+
+typedef struct KcParallel
+{
+	pg_atomic_uint64 next;		/* next index into the stripe list to take */
+	uint64		fingerprint;	/* of the leader's list of stripes */
+	uint32		nstripes;		/* its length */
+	int			nslots;
+	KcParStat	stats[FLEXIBLE_ARRAY_MEMBER];
+} KcParallel;
+
+#define KcParallelSize(nslots) \
+	(offsetof(KcParallel, stats) + sizeof(KcParStat) * (Size) (nslots))
+
 typedef struct KcScan
 {
 	TableScanDescData base;		/* must be first */
+	KcParallel *shared;			/* the stripes are taken from here (NULL: all of them) */
 	Relation	rel;
 	Snapshot	cat_snap;		/* snapshot for catalog reads (may be a copy) */
 	CommandId	curcid;
@@ -545,6 +580,14 @@ typedef struct KcScan
 /* a scan flag of the extension itself, outside the SO_ bits of PostgreSQL */
 #define KC_SCAN_MAINTENANCE	(1 << 30)
 
+/*
+ * The scan may begin in a parallel worker: set by the custom scan, whose
+ * leader made the rows of its transaction visible to workers before they
+ * started (kc_write_prepare_for_workers).  Any other scan in a worker is
+ * refused.
+ */
+#define KC_SCAN_PARALLEL_OK	(1 << 29)
+
 extern KcScan *kc_scan_begin(Relation rel, Snapshot snapshot,
 							 const bool *needed, struct KcSkip *skip,
 							 int flags);
@@ -554,6 +597,8 @@ extern void kc_scan_end(KcScan *scan);
 extern void kc_scan_drop_hold(KcScan *scan);
 extern uint64 kc_scan_stripe_for_block(KcScan *scan, BlockNumber blk,
 									   int *idx);
+extern uint64 kc_scan_fingerprint(const KcScan *scan);
+extern void kc_scan_attach(KcScan *scan, KcParallel *shared);
 extern bool kc_scan_analyze_block(KcScan *scan, Buffer buf);
 extern bool kc_scan_analyze_next(KcScan *scan, TupleTableSlot *slot);
 

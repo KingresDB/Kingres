@@ -77,7 +77,7 @@ SET kingres_columnar.enable_custom_scan = off;
 EXPLAIN (costs off) SELECT id FROM sp WHERE id = 5;
 SELECT count(*), sum(id), sum(n) FROM sp WHERE id < 100;
 RESET kingres_columnar.enable_custom_scan;
--- no worker is used: the scan is not parallel
+-- a big enough table gets a parallel plan (C5): a partial Columnar Scan under a Gather
 SET parallel_setup_cost = 0; SET parallel_tuple_cost = 0; SET min_parallel_table_scan_size = 0;
 SET max_parallel_workers_per_gather = 4;
 EXPLAIN (costs off) SELECT count(*) FROM sp;

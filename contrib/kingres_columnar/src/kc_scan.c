@@ -101,6 +101,7 @@ kc_scan_begin(Relation rel, Snapshot snapshot, const bool *needed,
 	int			i;
 	int			nvisible;
 	bool		maintenance = false;
+	bool		parallel_ok = false;
 
 	/*
 	 * Maintenance (compaction) takes part in no serializable bookkeeping: no
@@ -115,8 +116,19 @@ kc_scan_begin(Relation rel, Snapshot snapshot, const bool *needed,
 		flags &= ~KC_SCAN_MAINTENANCE;
 	}
 
-	/* the leader's unflushed rows are invisible to a worker: refuse, never answer wrongly */
-	if (IsParallelWorker())
+	if (flags & KC_SCAN_PARALLEL_OK)
+	{
+		parallel_ok = true;
+		flags &= ~KC_SCAN_PARALLEL_OK;
+	}
+
+	/*
+	 * The leader's unflushed rows are invisible to a worker: refuse, never
+	 * answer wrongly.  Only the custom scan may run in a worker, because the
+	 * leader has flushed the rows its transaction wrote before the workers
+	 * started (kc_write_prepare_for_workers), or refused to start them.
+	 */
+	if (IsParallelWorker() && !parallel_ok)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("columnar tables cannot be read in a parallel worker"),
@@ -202,6 +214,11 @@ kc_scan_rescan(KcScan *scan)
 		kc_footer_free(&scan->footer);
 		scan->in_stripe = false;
 	}
+	/*
+	 * A scan that takes its stripes from a parallel state does not restart by
+	 * itself: the state is reset by the node that owns it (ReInitializeDSM) and
+	 * every participant then takes its share again.
+	 */
 	scan->stripe_idx = 0;
 	scan->have_group = false;
 	scan->pend_idx = 0;
@@ -209,6 +226,52 @@ kc_scan_rescan(KcScan *scan)
 	scan->ordinal = 0;
 	scan->hit_end = false;
 	MemoryContextReset(scan->group_cxt);
+}
+
+/*
+ * A fingerprint of the stripes the scan will read (their number, ids, first
+ * rows and visible rows), which every participant of a parallel scan must
+ * compute alike: they took the list with the same snapshot, so a difference is
+ * a defect, and it is reported, never answered with rows read twice or not at
+ * all.
+ */
+uint64
+kc_scan_fingerprint(const KcScan *scan)
+{
+	uint64		h = UINT64CONST(14695981039346656037);
+	int			i;
+
+#define KC_FP_MIX(v) \
+	do { h ^= (uint64) (v); h *= UINT64CONST(1099511628211); } while (0)
+	KC_FP_MIX(scan->nstripes);
+	for (i = 0; i < scan->nstripes; i++)
+	{
+		const KcStripeInfo *si = &scan->stripes[i];
+
+		KC_FP_MIX(si->stripe_id);
+		KC_FP_MIX(si->first_row);
+		KC_FP_MIX(si->row_count);
+		KC_FP_MIX(si->visible_rows);
+	}
+#undef KC_FP_MIX
+	return h;
+}
+
+/*
+ * Take the stripes from a parallel state from now on (the node that owns the
+ * state calls this before the first row is read).  A scan that already read
+ * from the state, or a list that differs from the leader's, is an error.
+ */
+void
+kc_scan_attach(KcScan *scan, KcParallel *shared)
+{
+	if (scan->nstripes != (int) shared->nstripes ||
+		kc_scan_fingerprint(scan) != shared->fingerprint)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("a parallel scan of columnar table \"%s\" found another list of stripes than its leader",
+						RelationGetRelationName(scan->rel))));
+	scan->shared = shared;
 }
 
 /*
@@ -353,9 +416,25 @@ kc_group_stats(KcScan *scan, uint32 g, KcColStat *out)
 static bool
 kc_open_next_stripe(KcScan *scan)
 {
-	while (scan->stripe_idx < scan->nstripes)
+	for (;;)
 	{
-		KcStripeInfo *si = &scan->stripes[scan->stripe_idx++];
+		KcStripeInfo *si;
+
+		if (scan->shared != NULL)
+		{
+			/* every participant takes the next stripe nobody has taken */
+			uint64		idx = pg_atomic_fetch_add_u64(&scan->shared->next, 1);
+
+			if (idx >= (uint64) scan->nstripes)
+				return false;
+			si = &scan->stripes[idx];
+		}
+		else
+		{
+			if (scan->stripe_idx >= scan->nstripes)
+				return false;
+			si = &scan->stripes[scan->stripe_idx++];
+		}
 
 		scan->stats.stripes_total++;
 		if (scan->skip && kc_guc_enable_chunk_skipping && kc_skip_active(scan->skip))
@@ -382,7 +461,6 @@ kc_open_next_stripe(KcScan *scan)
 		scan->stripe_row_pos = 0;
 		return true;
 	}
-	return false;
 }
 
 static bool
