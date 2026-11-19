@@ -926,6 +926,20 @@ kingres_shard_coloc_bucket(const KsColocation *coloc, int i)
 }
 
 /*
+ * The modulus of the hash partition that is a bucket: FOR VALUES WITH (MODULUS m,
+ * REMAINDER bucket).  Every bucket of a group has the modulus bucket_count today;
+ * when a bucket can be split (design/shard-phase10.md) each bucket has its own,
+ * and the code that creates or attaches a bucket partition asks here.
+ */
+int
+kingres_shard_bucket_modulus(const KsColocation *coloc, int bucket)
+{
+	Assert(bucket >= 0 && bucket < coloc->bucket_count);
+	(void) bucket;
+	return coloc->bucket_count;
+}
+
+/*
  * A copy of a colocation group's bucket layout that stays valid when the catalog
  * cache is reloaded (the batch sender keeps one for the whole of a statement,
  * which plans other statements while it runs).  Made in the current memory context.
@@ -947,6 +961,27 @@ kingres_shard_bucket_group(const KsColocation *coloc, int bucket)
 	if (bucket < 0 || bucket >= coloc->bucket_count)
 		return -1;
 	return coloc->bucket_group[bucket];
+}
+
+/*
+ * A colocation group's layout made by the caller from the catalog tables as its own
+ * transaction sees them (a group made in this transaction is not in the cache yet):
+ * groups[b], for b = 0 .. nbuckets - 1, is the group that owns bucket b, or -1.  Made
+ * in the current memory context.
+ */
+KsColocation *
+kingres_shard_coloc_make(int colocation_id, int nbuckets, Oid dist_type, Oid collation,
+						 const int *groups)
+{
+	KsColocation *c = palloc0(sizeof(KsColocation));
+
+	c->colocation_id = colocation_id;
+	c->bucket_count = nbuckets;
+	c->dist_type = dist_type;
+	c->collation = collation;
+	c->bucket_group = palloc(sizeof(int) * Max(nbuckets, 1));
+	memcpy(c->bucket_group, groups, sizeof(int) * nbuckets);
+	return c;
 }
 
 /*

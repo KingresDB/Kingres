@@ -223,9 +223,9 @@ sub crash
 	like($err, qr/already distributed or a reference table/, 'a reference table cannot be made one twice');
 	($rc, $out, $err) = run_sql($n1, "SELECT kingres.create_reference_table('public.kv')");
 	like($err, qr/already distributed or a reference table/, 'a distributed table cannot be made a reference table');
-	$n1->safe_psql('postgres', 'CREATE TABLE public.has_fk (id int PRIMARY KEY, a int REFERENCES public.ref_a(id))');
+	$n1->safe_psql('postgres', 'CREATE TABLE public.plain_p (id int PRIMARY KEY); CREATE TABLE public.has_fk (id int PRIMARY KEY, a int REFERENCES public.plain_p(id))');
 	($rc, $out, $err) = run_sql($n1, "SELECT kingres.create_reference_table('public.has_fk')");
-	like($err, qr/foreign key constraint .* is not supported yet/, 'a table with a foreign key is refused');
+	like($err, qr/foreign key "has_fk_a_fkey" references ordinary table "public.plain_p"/, 'a table with a foreign key to an ordinary table is refused');
 	($rc, $out, $err) = run_sql($n1, "SELECT kingres.create_distributed_table('public.ref_b', 'id')");
 	like($err, qr/already distributed/, 'a reference table cannot be distributed');
 	$n1->safe_psql('postgres', 'CREATE TABLE public.plain1 (id int PRIMARY KEY)');

@@ -35,7 +35,8 @@ CREATE TEMP TABLE tmp1 (a int);
 SELECT kingres.create_reference_table('tmp1');
 CREATE UNLOGGED TABLE ul (a int);
 SELECT kingres.create_reference_table('ul');
-CREATE TABLE has_fk (id int PRIMARY KEY, a int REFERENCES r1 (id));
+CREATE TABLE plain_parent (id int PRIMARY KEY);
+CREATE TABLE has_fk (id int PRIMARY KEY, a int REFERENCES plain_parent (id));
 SELECT kingres.create_reference_table('has_fk');
 CREATE TABLE has_trg (id int PRIMARY KEY);
 CREATE FUNCTION trg() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
@@ -61,7 +62,7 @@ SELECT jsonb_path_query_array(kingres.internal_catalog_snapshot(), '$.dist_table
 DROP TABLE r1 CASCADE;
 SELECT relid::regclass FROM kingres.dist_table ORDER BY 1;
 
-DROP TABLE has_fk, has_trg, d1, p, ul;
+DROP TABLE has_fk, plain_parent, has_trg, d1, p, ul;
 DROP FUNCTION trg();
 DROP VIEW IF EXISTS v1;
 DROP EXTENSION kingres_shard;

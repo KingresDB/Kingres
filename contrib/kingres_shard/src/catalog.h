@@ -86,6 +86,8 @@ extern int kingres_shard_local_node_id_raw(void);
 extern void kingres_shard_catalog_invalidate(void);
 extern int64 kingres_shard_catalog_generation(void);
 extern KsColocation *kingres_shard_coloc_copy(const KsColocation *coloc);
+extern KsColocation *kingres_shard_coloc_make(int colocation_id, int nbuckets, Oid dist_type, Oid collation,
+											  const int *groups);
 extern int64 kingres_shard_placement_hash(const KsColocation *coloc);
 extern int64 kingres_shard_placement_hash_now(int colocation_id);
 extern int64 kingres_shard_map_version_now(void);
@@ -106,6 +108,7 @@ extern const KsColocation *kingres_shard_lookup_colocation(int colocation_id);
  */
 extern int	kingres_shard_coloc_nbuckets(const KsColocation *coloc);
 extern int	kingres_shard_coloc_bucket(const KsColocation *coloc, int i);
+extern int	kingres_shard_bucket_modulus(const KsColocation *coloc, int bucket);
 extern int	kingres_shard_bucket_group(const KsColocation *coloc, int bucket);
 extern const KsNode *kingres_shard_group_primary(int group_id);
 extern const KsNode *kingres_shard_node_by_id(int node_id);

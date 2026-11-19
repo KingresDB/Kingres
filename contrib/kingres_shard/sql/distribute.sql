@@ -25,9 +25,6 @@ SELECT kingres.create_distributed_table('bad_unique', 'k');
 CREATE TABLE bad_index (id int, k int);
 CREATE UNIQUE INDEX bad_index_id_idx ON bad_index (id);
 SELECT kingres.create_distributed_table('bad_index', 'k');
-CREATE TABLE full_table (id int, k int);
-INSERT INTO full_table VALUES (1, 1);
-SELECT kingres.create_distributed_table('full_table', 'k');
 CREATE TABLE no_column (id int);
 SELECT kingres.create_distributed_table('no_column', 'nope');
 CREATE TABLE unhashable (id int, p point);
@@ -50,7 +47,7 @@ SELECT kingres.create_distributed_table('bad_pk', 'k', bucket_count => 0);
 SELECT kingres.create_distributed_table('bad_pk', 'k', bucket_count => 5000);
 SELECT count(*) AS distributed_after_errors FROM kingres.dist_table;
 DROP VIEW a_view;
-DROP TABLE bad_pk, bad_unique, bad_index, full_table, no_column, unhashable,
+DROP TABLE bad_pk, bad_unique, bad_index, no_column, unhashable,
            fk_child, fk_parent, already_part, trg;
 DROP FUNCTION trg_fn();
 

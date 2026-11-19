@@ -1,0 +1,789 @@
+-- sql/distribute_rows.sql
+--   Phase 9, increments 9.1 and 9.2 (design/shard-phase9.md): the report of what
+--   prevents a change of a table (one statement per code), and
+--   create_distributed_table / create_reference_table of a table that holds rows
+--   on a one-node cluster (the copy, the counts, owner, privileges, comments,
+--   identity columns and sequences, foreign keys to a reference table, unique
+--   and other indexes).  The tests with several nodes, faults and interleavings
+--   are t/140.
+--
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+\set SHOW_CONTEXT never
+SET search_path = public;
+CREATE EXTENSION kingres_shard;
+-- Before the cluster is initialized there is no map group to run on.
+CREATE TABLE early (id int PRIMARY KEY);
+SELECT severity, code, detail FROM kingres.table_change_report('distribute', 'early', '{"column":"id"}');
+ severity |       code       |                   detail                    
+----------+------------------+---------------------------------------------
+ blocker  | not_on_map_group | the cluster is not initialized on this node
+(1 row)
+
+SELECT kingres.init_cluster('localhost', current_setting('port')::int);
+ init_cluster 
+--------------
+ 
+(1 row)
+
+SELECT severity, code, object FROM kingres.table_change_report('distribute', 'early', '{"column":"id"}');
+ severity | code | object 
+----------+------+--------
+(0 rows)
+
+SELECT * FROM kingres.table_change_report('no_such_kind', 'early');
+ERROR:  unknown kind "no_such_kind"
+HINT:  Use distribute, distribute_reference, undistribute, alter, create_partition, attach_partition, detach_partition or drop_partition.
+DROP TABLE early;
+-- One statement per code of a distribution ---------------------------------------------
+-- a table that cannot be distributed at all
+CREATE VIEW a_view AS SELECT 1 AS id;
+SELECT severity, code, object FROM kingres.table_change_report('distribute', 'a_view', '{"column":"id"}');
+ severity |        code        |    object     
+----------+--------------------+---------------
+ blocker  | not_ordinary_table | public.a_view
+(1 row)
+
+CREATE TEMP TABLE temp_t (id int);
+SELECT severity, code FROM kingres.table_change_report('distribute', 'temp_t', '{"column":"id"}');
+ severity |         code          
+----------+-----------------------
+ blocker  | temporary_or_unlogged
+(1 row)
+
+CREATE UNLOGGED TABLE unlogged_t (id int);
+SELECT severity, code, object FROM kingres.table_change_report('distribute', 'unlogged_t', '{"column":"id"}');
+ severity |         code          |      object       
+----------+-----------------------+-------------------
+ blocker  | temporary_or_unlogged | public.unlogged_t
+(1 row)
+
+CREATE TABLE part_t (id int) PARTITION BY RANGE (id);
+CREATE TABLE part_t_1 PARTITION OF part_t FOR VALUES FROM (0) TO (10);
+SELECT severity, code, object FROM kingres.table_change_report('distribute', 'part_t', '{"column":"id"}');
+ severity |       code        |    object     
+----------+-------------------+---------------
+ blocker  | partitioned_table | public.part_t
+(1 row)
+
+SELECT severity, code, object FROM kingres.table_change_report('distribute', 'part_t_1', '{"column":"id"}');
+ severity |       code        |     object      
+----------+-------------------+-----------------
+ blocker  | partitioned_table | public.part_t_1
+ blocker  | inheritance       | public.part_t_1
+(2 rows)
+
+CREATE TABLE inh_p (id int);
+CREATE TABLE inh_c () INHERITS (inh_p);
+SELECT severity, code, object FROM kingres.table_change_report('distribute', 'inh_p', '{"column":"id"}');
+ severity |    code     |    object    
+----------+-------------+--------------
+ blocker  | inheritance | public.inh_p
+(1 row)
+
+CREATE TABLE stor_t (id int) WITH (fillfactor = 70);
+SELECT severity, code, object FROM kingres.table_change_report('distribute', 'stor_t', '{"column":"id"}');
+ severity |        code        |    object     
+----------+--------------------+---------------
+ blocker  | storage_parameters | public.stor_t
+(1 row)
+
+CREATE TABLE rls_t (id int);
+ALTER TABLE rls_t ENABLE ROW LEVEL SECURITY;
+SELECT severity, code, object FROM kingres.table_change_report('distribute', 'rls_t', '{"column":"id"}');
+ severity |        code        |    object    
+----------+--------------------+--------------
+ blocker  | row_level_security | public.rls_t
+(1 row)
+
+CREATE TABLE excl_t (id int, EXCLUDE USING btree (id WITH =));
+SELECT severity, code, object FROM kingres.table_change_report('distribute', 'excl_t', '{"column":"id"}');
+ severity |         code         |     object     
+----------+----------------------+----------------
+ blocker  | exclusion_constraint | excl_t_id_excl
+(1 row)
+
+CREATE TABLE trg_t (id int);
+CREATE FUNCTION trg_fn() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+CREATE TRIGGER trg_a BEFORE INSERT ON trg_t FOR EACH ROW EXECUTE FUNCTION trg_fn();
+CREATE TRIGGER trg_b AFTER DELETE ON trg_t FOR EACH ROW EXECUTE FUNCTION trg_fn();
+SELECT severity, code, object FROM kingres.table_change_report('distribute', 'trg_t', '{"column":"id"}');
+ severity |  code   | object 
+----------+---------+--------
+ blocker  | trigger | trg_a
+ blocker  | trigger | trg_b
+(2 rows)
+
+-- a shared catalog lives in a tablespace of its own
+SELECT severity, code, object FROM kingres.table_change_report('distribute', 'pg_database', '{"column":"oid"}');
+ severity |                code                |          object           
+----------+------------------------------------+---------------------------
+ blocker  | tablespace                         | pg_catalog.pg_database
+ blocker  | tablespace                         | pg_database_datname_index
+ blocker  | tablespace                         | pg_database_oid_index
+ blocker  | unique_without_distribution_column | pg_database_datname_index
+ warning  | not_carried                        | pg_catalog.pg_database
+ note     | rows                               | pg_catalog.pg_database
+(6 rows)
+
+-- what depends on the table
+CREATE TABLE dep_t (id int PRIMARY KEY, v int);
+CREATE VIEW dep_v AS SELECT id FROM dep_t;
+CREATE MATERIALIZED VIEW dep_mv AS SELECT v FROM dep_t;
+CREATE FUNCTION dep_f(r dep_t) RETURNS int LANGUAGE sql AS 'SELECT $1.v';
+SET client_min_messages = error;
+CREATE PUBLICATION dep_pub FOR TABLE dep_t;
+RESET client_min_messages;
+SELECT severity, code, object FROM kingres.table_change_report('distribute', 'dep_t', '{"column":"id"}');
+ severity |       code       |           object           
+----------+------------------+----------------------------
+ blocker  | dependent_object | public.dep_mv
+ blocker  | dependent_object | public.dep_v
+ blocker  | dependent_object | public.dep_f(public.dep_t)
+ blocker  | dependent_object | dep_pub
+(4 rows)
+
+-- columns and keys
+CREATE TABLE col_t (id int, p point, long_name_of_a_table_that_is_near_the_limit_of_sixty_three int);
+SELECT severity, code, object FROM kingres.table_change_report('distribute', 'col_t', '{"column":"nope"}');
+ severity |      code      | object 
+----------+----------------+--------
+ blocker  | column_missing | nope
+(1 row)
+
+SELECT severity, code, object FROM kingres.table_change_report('distribute', 'col_t', '{"column":"p"}');
+ severity |      code       | object 
+----------+-----------------+--------
+ blocker  | no_hash_support | p
+(1 row)
+
+CREATE TABLE a_very_long_table_name_that_is_at_the_limit_of_sixty_three_chars (id int);
+NOTICE:  identifier "a_very_long_table_name_that_is_at_the_limit_of_sixty_three_chars" will be truncated to "a_very_long_table_name_that_is_at_the_limit_of_sixty_three_char"
+SELECT severity, code, object FROM kingres.table_change_report('distribute', 'a_very_long_table_name_that_is_at_the_limit_of_sixty_three_chars', '{"column":"id"}');
+ severity |     code      |                                 object                                 
+----------+---------------+------------------------------------------------------------------------
+ blocker  | name_too_long | public.a_very_long_table_name_that_is_at_the_limit_of_sixty_three_char
+(1 row)
+
+CREATE TABLE key_t (id int PRIMARY KEY, k int, UNIQUE (k));
+CREATE UNIQUE INDEX key_t_idx ON key_t (id) WHERE k > 0;
+SELECT severity, code, object FROM kingres.table_change_report('distribute', 'key_t', '{"column":"k"}');
+ severity |                code                |   object   
+----------+------------------------------------+------------
+ blocker  | unique_without_distribution_column | key_t_idx
+ blocker  | unique_without_distribution_column | key_t_pkey
+(2 rows)
+
+CREATE TABLE used_t (id int);
+CREATE TABLE used_t_b0003 (x int);
+SELECT severity, code, object FROM kingres.table_change_report('distribute', 'used_t', '{"column":"id"}');
+ severity |    code     |    object    
+----------+-------------+--------------
+ blocker  | name_in_use | used_t_b0003
+(1 row)
+
+-- an online copy needs a key
+CREATE TABLE nokey_t (id int, v int);
+CREATE TABLE nullkey_t (id int, v int, UNIQUE (id));
+CREATE TABLE okkey_t (id int NOT NULL, v int, UNIQUE (id));
+SELECT code, object FROM kingres.table_change_report('distribute', 'nokey_t', '{"column":"id","mode":"online"}');
+       code        |     object     
+-------------------+----------------
+ no_key_for_online | public.nokey_t
+(1 row)
+
+SELECT code, object FROM kingres.table_change_report('distribute', 'nullkey_t', '{"column":"id","mode":"online"}');
+       code        |      object      
+-------------------+------------------
+ no_key_for_online | public.nullkey_t
+(1 row)
+
+SELECT code, object FROM kingres.table_change_report('distribute', 'okkey_t', '{"column":"id","mode":"online"}');
+ code | object 
+------+--------
+(0 rows)
+
+-- what is not carried, and what is good to know
+CREATE TABLE nc_t (id int PRIMARY KEY, v text);
+ALTER TABLE nc_t ALTER COLUMN v SET STORAGE EXTERNAL;
+ALTER TABLE nc_t ALTER COLUMN id SET STATISTICS 50;
+CREATE STATISTICS nc_t_stat ON id, v FROM nc_t;
+CREATE INDEX nc_t_idx ON nc_t (v);
+CLUSTER nc_t USING nc_t_idx;
+ALTER TABLE nc_t REPLICA IDENTITY FULL;
+INSERT INTO nc_t SELECT g, 'v' || g FROM generate_series(1, 100) g;
+ANALYZE nc_t;
+SELECT severity, code, object FROM kingres.table_change_report('distribute', 'nc_t', '{"column":"id"}');
+ severity |    code     |   object    
+----------+-------------+-------------
+ warning  | not_carried | nc_t_stat
+ warning  | not_carried | id
+ warning  | not_carried | v
+ warning  | not_carried | public.nc_t
+ warning  | not_carried | public.nc_t
+ note     | rows        | public.nc_t
+(6 rows)
+
+-- foreign keys ------------------------------------------------------------------------------
+CREATE TABLE plain_parent (id int PRIMARY KEY);
+CREATE TABLE fk_plain (id int PRIMARY KEY, p int REFERENCES plain_parent (id));
+SELECT severity, code, object FROM kingres.table_change_report('distribute', 'fk_plain', '{"column":"id"}');
+ severity |          code           |     object      
+----------+-------------------------+-----------------
+ blocker  | foreign_key_plain_table | fk_plain_p_fkey
+(1 row)
+
+SELECT severity, code, object FROM kingres.table_change_report('distribute', 'plain_parent', '{"column":"id"}');
+ severity |           code            |     object      
+----------+---------------------------+-----------------
+ blocker  | referenced_by_plain_table | fk_plain_p_fkey
+(1 row)
+
+SELECT severity, code, object FROM kingres.table_change_report('distribute_reference', 'fk_plain');
+ severity |          code           |     object      
+----------+-------------------------+-----------------
+ blocker  | foreign_key_plain_table | fk_plain_p_fkey
+(1 row)
+
+CREATE TABLE ref_parent (id int PRIMARY KEY);
+SELECT kingres.create_reference_table('ref_parent');
+ create_reference_table 
+------------------------
+ 
+(1 row)
+
+CREATE TABLE fk_ref (id int PRIMARY KEY, p int REFERENCES ref_parent (id));
+SELECT severity, code, object FROM kingres.table_change_report('distribute', 'fk_ref', '{"column":"id"}');
+ severity | code | object 
+----------+------+--------
+(0 rows)
+
+SELECT severity, code, object FROM kingres.table_change_report('distribute_reference', 'fk_ref');
+ severity | code | object 
+----------+------+--------
+(0 rows)
+
+CREATE TABLE dist_parent (id int PRIMARY KEY, g int);
+SELECT kingres.create_distributed_table('dist_parent', 'id', bucket_count => 8);
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+CREATE TABLE fk_dist (id int PRIMARY KEY, p int REFERENCES dist_parent (id));
+-- another group (the default has 128 buckets) or the wrong column
+SELECT severity, code, object FROM kingres.table_change_report('distribute', 'fk_dist', '{"column":"id"}');
+ severity |          code           |     object     
+----------+-------------------------+----------------
+ blocker  | foreign_key_other_group | fk_dist_p_fkey
+(1 row)
+
+SELECT severity, code, object FROM kingres.table_change_report('distribute', 'fk_dist', '{"column":"id","bucket_count":8}');
+ severity |                code                 |     object     
+----------+-------------------------------------+----------------
+ blocker  | foreign_key_not_distribution_column | fk_dist_p_fkey
+(1 row)
+
+SELECT severity, code, object FROM kingres.table_change_report('distribute', 'fk_dist', '{"column":"id","colocate_with":"public.dist_parent"}');
+ severity |                code                 |     object     
+----------+-------------------------------------+----------------
+ blocker  | foreign_key_not_distribution_column | fk_dist_p_fkey
+(1 row)
+
+SELECT severity, code, object FROM kingres.table_change_report('distribute', 'fk_dist', '{"column":"p","colocate_with":"public.dist_parent"}');
+ severity |                code                |    object    
+----------+------------------------------------+--------------
+ blocker  | unique_without_distribution_column | fk_dist_pkey
+(1 row)
+
+SELECT severity, code, object FROM kingres.table_change_report('distribute_reference', 'fk_dist');
+ severity |          code           |     object     
+----------+-------------------------+----------------
+ blocker  | foreign_key_other_group | fk_dist_p_fkey
+(1 row)
+
+CREATE TABLE fk_self (id int PRIMARY KEY, parent int REFERENCES fk_self (id));
+SELECT severity, code, object FROM kingres.table_change_report('distribute', 'fk_self', '{"column":"id"}');
+ severity |                code                 |       object        
+----------+-------------------------------------+---------------------
+ blocker  | foreign_key_not_distribution_column | fk_self_parent_fkey
+(1 row)
+
+SELECT severity, code, object FROM kingres.table_change_report('distribute', 'fk_self', '{"column":"parent"}');
+ severity |                code                 |       object        
+----------+-------------------------------------+---------------------
+ blocker  | foreign_key_not_distribution_column | fk_self_parent_fkey
+ blocker  | unique_without_distribution_column  | fk_self_pkey
+(2 rows)
+
+-- a distributed table, and a reference table, are not distributed again
+SELECT severity, code, object FROM kingres.table_change_report('distribute', 'dist_parent', '{"column":"id"}');
+ severity |        code         |       object       
+----------+---------------------+--------------------
+ blocker  | already_distributed | public.dist_parent
+(1 row)
+
+SELECT severity, code, object FROM kingres.table_change_report('distribute_reference', 'ref_parent');
+ severity |        code         |      object       
+----------+---------------------+-------------------
+ blocker  | already_distributed | public.ref_parent
+(1 row)
+
+-- a group in use ---------------------------------------------------------------------------
+INSERT INTO kingres.table_operation (kind, mode, phase, spec, started_at, updated_at)
+  VALUES ('distribute', 'online', 'copying', '{}', now(), now());
+INSERT INTO kingres.table_operation_lock (colocation_id, op_id)
+  SELECT d.colocation_id, 1 FROM kingres.dist_table d WHERE d.relid = 'dist_parent'::regclass;
+CREATE TABLE busy_t (id int PRIMARY KEY);
+SELECT severity, code FROM kingres.table_change_report('distribute', 'busy_t', '{"column":"id","colocate_with":"public.dist_parent"}');
+ severity |    code    
+----------+------------
+ blocker  | group_busy
+(1 row)
+
+SELECT kingres.create_distributed_table('busy_t', 'id', colocate_with => 'dist_parent');
+ERROR:  colocation group 1 is busy: a table operation uses it
+SELECT code FROM kingres.table_change_report('alter', 'dist_parent', '{"bucket_count":16}');
+    code    
+------------
+ group_busy
+(1 row)
+
+SELECT code FROM kingres.table_change_report('undistribute', 'dist_parent');
+    code    
+------------
+ group_busy
+(1 row)
+
+DELETE FROM kingres.table_operation_lock;
+DELETE FROM kingres.table_operation;
+DROP TABLE busy_t;
+-- the other kinds ------------------------------------------------------------------------
+SELECT severity, code, object FROM kingres.table_change_report('undistribute', 'plain_parent');
+ severity |      code       |       object        
+----------+-----------------+---------------------
+ blocker  | not_distributed | public.plain_parent
+(1 row)
+
+SELECT severity, code, object FROM kingres.table_change_report('undistribute', 'ref_parent');
+ severity | code | object 
+----------+------+--------
+(0 rows)
+
+SELECT severity, code, object FROM kingres.table_change_report('undistribute', 'dist_parent', '{"target_group":9}');
+ severity |         code         | object 
+----------+----------------------+--------
+ blocker  | target_group_invalid | 9
+(1 row)
+
+SELECT severity, code, object FROM kingres.table_change_report('alter', 'plain_parent', '{"bucket_count":16}');
+ severity |      code       |       object        
+----------+-----------------+---------------------
+ blocker  | not_distributed | public.plain_parent
+(1 row)
+
+SELECT severity, code, object FROM kingres.table_change_report('alter', 'dist_parent', '{"bucket_count":5000,"distribution_column":"nope"}');
+ severity |         code         | object 
+----------+----------------------+--------
+ blocker  | column_missing       | nope
+ blocker  | bucket_count_invalid | 5000
+(2 rows)
+
+SELECT severity, code, object FROM kingres.table_change_report('alter', 'dist_parent', '{"distribution_column":"g"}');
+ severity |                code                |      object      
+----------+------------------------------------+------------------
+ blocker  | unique_without_distribution_column | dist_parent_pkey
+(1 row)
+
+SELECT severity, code, object FROM kingres.table_change_report('alter', 'dist_parent', '{"colocate_with":"public.plain_parent"}');
+ severity |             code              |       object        
+----------+-------------------------------+---------------------
+ blocker  | colocate_with_not_distributed | public.plain_parent
+(1 row)
+
+SELECT severity, code, object FROM kingres.table_change_report('create_partition', 'dist_parent', '{"partition":"p1"}');
+ severity |       code        |       object       
+----------+-------------------+--------------------
+ blocker  | not_available_yet | public.dist_parent
+(1 row)
+
+SELECT severity, code, object FROM kingres.table_change_report('drop_partition', 'plain_parent', '{"partition":"a_partition_name_that_is_much_too_long_to_get_six_more_characters_"}');
+ severity |       code        |                               object                               
+----------+-------------------+--------------------------------------------------------------------
+ blocker  | not_distributed   | public.plain_parent
+ blocker  | name_too_long     | a_partition_name_that_is_much_too_long_to_get_six_more_characters_
+ blocker  | not_available_yet | public.plain_parent
+(3 rows)
+
+-- the report and the checks of the create functions agree -------------------------------
+SELECT kingres.create_distributed_table('trg_t', 'id');
+ERROR:  2 problems prevent the change of table "public.trg_t"
+DETAIL:  trigger: cannot distribute table "trg_t": trigger "trg_a" is not supported yet
+trigger: cannot distribute table "trg_t": trigger "trg_b" is not supported yet
+HINT:  kingres.table_change_report() lists them with the warnings and notes.
+SELECT kingres.create_distributed_table('key_t', 'k');
+ERROR:  2 problems prevent the change of table "public.key_t"
+DETAIL:  unique_without_distribution_column: cannot distribute table "key_t": unique index "key_t_idx" does not include the distribution column "k"; a unique or primary key constraint of a distributed table must include the distribution column
+unique_without_distribution_column: cannot distribute table "key_t": primary key constraint "key_t_pkey" does not include the distribution column "k"; a unique or primary key constraint of a distributed table must include the distribution column
+HINT:  kingres.table_change_report() lists them with the warnings and notes.
+SELECT kingres.create_distributed_table('dep_t', 'id');
+ERROR:  4 problems prevent the change of table "public.dep_t"
+DETAIL:  dependent_object: cannot distribute table "dep_t": materialized view public.dep_mv depends on the table; the table is replaced by a new one
+dependent_object: cannot distribute table "dep_t": view public.dep_v depends on the table; the table is replaced by a new one
+dependent_object: cannot distribute table "dep_t": function public.dep_f(public.dep_t) uses the row type of the table
+dependent_object: cannot distribute table "dep_t": publication "dep_pub" publishes the table
+HINT:  kingres.table_change_report() lists them with the warnings and notes.
+SELECT kingres.create_distributed_table('col_t', 'p');
+ERROR:  column "p" of type point cannot be a distribution column: the type has no default hash operator class with an extended hash function
+SELECT kingres.create_reference_table('fk_plain');
+ERROR:  cannot make table "fk_plain" a reference table: foreign key "fk_plain_p_fkey" references ordinary table "public.plain_parent"; a key to an ordinary table is not supported
+SELECT kingres.create_reference_table('fk_dist');
+ERROR:  cannot make table "fk_dist" a reference table: foreign key "fk_dist_p_fkey" references distributed table "public.dist_parent"; a reference table can only reference reference tables
+SELECT kingres.create_distributed_table('stor_t', 'id');
+ERROR:  cannot distribute table "stor_t": storage parameters are not supported yet
+SELECT count(*) AS distributed_after_refusals FROM kingres.dist_table;
+ distributed_after_refusals 
+----------------------------
+                          2
+(1 row)
+
+-- A table that holds rows -------------------------------------------------------------------
+CREATE ROLE p9_owner;
+CREATE ROLE p9_reader;
+CREATE ROLE p9_writer;
+CREATE ROLE p9_grantor;
+CREATE TABLE items (
+    tenant int NOT NULL,
+    id     int NOT NULL,
+    name   text DEFAULT 'unnamed',
+    qty    int CONSTRAINT items_qty_check CHECK (qty >= 0),
+    ser    serial,
+    ident  bigint GENERATED ALWAYS AS IDENTITY (START WITH 100 INCREMENT BY 5),
+    calc   int GENERATED ALWAYS AS (qty * 2) STORED,
+    ref    int REFERENCES ref_parent (id),
+    PRIMARY KEY (tenant, id)
+);
+CREATE INDEX items_name_idx ON items (name);
+CREATE UNIQUE INDEX items_part_idx ON items (id, tenant) WHERE qty > 10;
+INSERT INTO ref_parent SELECT g FROM generate_series(1, 5) g;
+INSERT INTO items (tenant, id, name, qty, ref)
+  SELECT g % 7, g, CASE WHEN g % 10 = 0 THEN NULL ELSE 'n' || g END, g % 50, 1 + g % 5
+    FROM generate_series(1, 2000) g;
+ALTER TABLE items OWNER TO p9_owner;
+GRANT SELECT ON items TO p9_reader;
+GRANT UPDATE (name), SELECT (qty) ON items TO p9_writer;
+GRANT INSERT, UPDATE ON items TO p9_grantor WITH GRANT OPTION;
+SET ROLE p9_grantor;
+GRANT INSERT ON items TO p9_writer;
+RESET ROLE;
+COMMENT ON TABLE items IS 'the items';
+COMMENT ON COLUMN items.name IS 'the name';
+COMMENT ON CONSTRAINT items_qty_check ON items IS 'qty is not negative';
+COMMENT ON CONSTRAINT items_pkey ON items IS 'the key';
+COMMENT ON INDEX items_name_idx IS 'by name';
+SELECT setval('items_ser_seq', 5000);
+ setval 
+--------
+   5000
+(1 row)
+
+-- What the source looks like, object by object: columns, constraints, indexes, owner,
+-- privileges, comments, sequences.  The same text is taken again after the copy.
+CREATE FUNCTION fingerprint(t regclass) RETURNS SETOF text LANGUAGE sql AS $$
+  SELECT 'column ' || a.attnum || ' ' || a.attname || ' ' || format_type(a.atttypid, a.atttypmod)
+         || ' notnull=' || a.attnotnull || ' identity=' || a.attidentity::text || ' generated=' || a.attgenerated::text
+         || ' default=' || coalesce(pg_get_expr(d.adbin, d.adrelid), '-')
+         || ' acl=' || coalesce(a.attacl::text, '-') || ' comment=' || coalesce(col_description(t, a.attnum), '-')
+    FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+   WHERE a.attrelid = t AND a.attnum > 0 AND NOT a.attisdropped
+  UNION ALL
+  SELECT 'constraint ' || c.conname || ' ' || pg_get_constraintdef(c.oid) || ' comment=' || coalesce(obj_description(c.oid, 'pg_constraint'), '-')
+    FROM pg_constraint c WHERE c.conrelid = t AND c.conparentid = 0
+  UNION ALL
+  SELECT 'index ' || ic.relname || ' ' || replace(pg_get_indexdef(i.indexrelid), ' ONLY ', ' ') || ' comment=' || coalesce(obj_description(i.indexrelid, 'pg_class'), '-')
+    FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid WHERE i.indrelid = t
+  UNION ALL
+  SELECT 'table owner=' || c.relowner::regrole || ' acl=' || coalesce(c.relacl::text, '-') || ' comment=' || coalesce(obj_description(t, 'pg_class'), '-')
+    FROM pg_class c WHERE c.oid = t
+  UNION ALL
+  SELECT 'sequence ' || s.seqrelid::regclass || ' type=' || s.seqtypid::regtype || ' start=' || s.seqstart || ' inc=' || s.seqincrement
+         || ' min=' || s.seqmin || ' max=' || s.seqmax || ' cache=' || s.seqcache || ' cycle=' || s.seqcycle
+         || ' owner=' || coalesce((SELECT d.refobjid::regclass || '.' || d.refobjsubid || '/' || d.deptype::text FROM pg_depend d
+                                    WHERE d.classid = 'pg_class'::regclass AND d.objid = s.seqrelid
+                                      AND d.refclassid = 'pg_class'::regclass LIMIT 1), '-')
+    FROM pg_sequence s
+   WHERE s.seqrelid IN (SELECT d.objid FROM pg_depend d WHERE d.classid = 'pg_class'::regclass
+                         AND d.refclassid = 'pg_class'::regclass AND d.refobjid = t AND d.deptype IN ('a', 'i'))
+$$;
+CREATE TABLE fp_before AS SELECT line FROM fingerprint('items') line;
+SELECT count(*) AS fingerprint_lines FROM fp_before;
+ fingerprint_lines 
+-------------------
+                21
+(1 row)
+
+CREATE TABLE items_model AS SELECT * FROM items;
+SELECT count(nextval('items_ident_seq')) AS identity_values_used_without_rows FROM generate_series(1, 3);
+ identity_values_used_without_rows 
+-----------------------------------
+                                 3
+(1 row)
+
+SELECT last_value, is_called FROM items_ser_seq \gset ser_
+SELECT last_value, is_called FROM items_ident_seq \gset ident_
+SELECT oid AS old_oid FROM pg_class WHERE oid = 'items'::regclass \gset
+SELECT severity, code, object FROM kingres.table_change_report('distribute', 'items', '{"column":"id"}');
+ severity | code | object 
+----------+------+--------
+(0 rows)
+
+SELECT kingres.create_distributed_table('items', 'id', bucket_count => 8);
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+SELECT count(*) AS rows, sum(qty) AS qty, count(DISTINCT id) AS ids FROM items;
+ rows |  qty  | ids  
+------+-------+------
+ 2000 | 49000 | 2000
+(1 row)
+
+SELECT (SELECT count(*) FROM (SELECT * FROM items EXCEPT SELECT * FROM items_model) a) AS only_after,
+       (SELECT count(*) FROM (SELECT * FROM items_model EXCEPT SELECT * FROM items) b) AS only_before;
+ only_after | only_before 
+------------+-------------
+          0 |           0
+(1 row)
+
+SELECT 'items'::regclass::oid <> :old_oid AS new_table;
+ new_table 
+-----------
+ t
+(1 row)
+
+SELECT relkind, pg_get_partkeydef(oid) FROM pg_class WHERE oid = 'items'::regclass;
+ relkind | pg_get_partkeydef 
+---------+-------------------
+ p       | HASH (id)
+(1 row)
+
+-- every row is in the partition of its own bucket, and nowhere else
+SELECT count(*) FILTER (WHERE tableoid::regclass::text = format('items_b%s', lpad(kingres.bucket_for('items'::regclass, id)::text, 4, '0'))) AS in_own_bucket,
+       count(*) AS total
+  FROM items;
+ in_own_bucket | total 
+---------------+-------
+          2000 |  2000
+(1 row)
+
+-- the same object by object
+CREATE TABLE fp_after AS SELECT line FROM fingerprint('items') line;
+SELECT 'only before' AS side, line FROM (SELECT line FROM fp_before EXCEPT SELECT line FROM fp_after) x
+UNION ALL
+SELECT 'only after', line FROM (SELECT line FROM fp_after EXCEPT SELECT line FROM fp_before) y
+ORDER BY 1, 2;
+ side | line 
+------+------
+(0 rows)
+
+-- the sequences go on where they were
+SELECT last_value = :ser_last_value AND is_called = :'ser_is_called' AS serial_state_carried FROM items_ser_seq;
+ serial_state_carried 
+----------------------
+ t
+(1 row)
+
+SELECT last_value = :ident_last_value AND is_called = :'ident_is_called' AS identity_state_carried FROM items_ident_seq;
+ identity_state_carried 
+------------------------
+ t
+(1 row)
+
+INSERT INTO items (tenant, id, qty, ref) VALUES (1, 9001, 3, 2) RETURNING ser, ident, calc;
+ ser  | ident | calc 
+------+-------+------
+ 5001 | 10115 |    6
+(1 row)
+
+-- the keys are enforced on the new table
+INSERT INTO items (tenant, id, qty, ref) VALUES (1, 9001, 3, 2);
+ERROR:  duplicate key value violates unique constraint "items_b0004_pkey"
+DETAIL:  Key (tenant, id)=(1, 9001) already exists.
+INSERT INTO items (tenant, id, qty, ref) VALUES (1, 9002, -1, 2);
+ERROR:  new row for relation "items_b0005" violates check constraint "items_qty_check"
+DETAIL:  Failing row contains (1, 9002, unnamed, -1, 5003, 10125, -2, 2).
+INSERT INTO items (tenant, id, qty, ref) VALUES (1, 9003, 1, 99);
+ERROR:  insert or update on table "items_b0005" violates foreign key constraint "items_ref_fkey"
+DETAIL:  Key (ref)=(99) is not present in table "ref_parent".
+DELETE FROM ref_parent WHERE id = 1;
+ERROR:  update or delete on table "ref_parent" violates foreign key constraint "items_ref_fkey" on table "items"
+DETAIL:  Key (id)=(1) is still referenced from table "items".
+-- nothing of the old table or the shadow is left
+SELECT relname FROM pg_class WHERE relname LIKE 'kingres\_shadow%' OR relname LIKE 'kingres\_old%';
+ relname 
+---------
+(0 rows)
+
+SELECT count(*) AS dist_tables FROM kingres.dist_table;
+ dist_tables 
+-------------
+           3
+(1 row)
+
+SELECT version > 0 AS map_version_moved FROM kingres.map_version;
+ map_version_moved 
+-------------------
+ t
+(1 row)
+
+-- A prepared statement made on the ordinary table is planned again after the swap (it finds the new
+-- table by name), in the session that distributes the table and in another one.
+CREATE TABLE prep_t (id int PRIMARY KEY, v int);
+INSERT INTO prep_t SELECT g, g * 2 FROM generate_series(1, 100) g;
+PREPARE prep_q AS SELECT count(*), sum(v) FROM prep_t;
+EXECUTE prep_q;
+ count |  sum  
+-------+-------
+   100 | 10100
+(1 row)
+
+SELECT kingres.create_distributed_table('prep_t', 'id', bucket_count => 4);
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+EXECUTE prep_q;
+ count |  sum  
+-------+-------
+   100 | 10100
+(1 row)
+
+EXPLAIN (COSTS OFF) EXECUTE prep_q;
+                  QUERY PLAN                   
+-----------------------------------------------
+ Aggregate
+   ->  Append
+         ->  Seq Scan on prep_t_b0000 prep_t_1
+         ->  Seq Scan on prep_t_b0001 prep_t_2
+         ->  Seq Scan on prep_t_b0002 prep_t_3
+         ->  Seq Scan on prep_t_b0003 prep_t_4
+(6 rows)
+
+DEALLOCATE prep_q;
+DROP TABLE prep_t;
+-- a table with rows joins the group of another one; its key to that table is carried
+CREATE TABLE orders (id int, parent int REFERENCES dist_parent (id), note text, PRIMARY KEY (id, parent));
+INSERT INTO dist_parent SELECT g, g % 3 FROM generate_series(1, 50) g;
+INSERT INTO orders SELECT g, g, 'o' || g FROM generate_series(1, 50) g;
+SELECT kingres.create_distributed_table('orders', 'parent', colocate_with => 'dist_parent');
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+SELECT count(*) AS orders FROM orders;
+ orders 
+--------
+     50
+(1 row)
+
+SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'orders'::regclass AND contype = 'f' AND conparentid = 0;
+      conname       |              pg_get_constraintdef               
+--------------------+-------------------------------------------------
+ orders_parent_fkey | FOREIGN KEY (parent) REFERENCES dist_parent(id)
+(1 row)
+
+INSERT INTO orders VALUES (51, 99, 'bad');
+ERROR:  insert or update on table "orders_b0002" violates foreign key constraint "orders_parent_fkey"
+DETAIL:  Key (parent)=(99) is not present in table "dist_parent".
+SELECT tableoid::regclass::text = format('orders_b%s', lpad(kingres.bucket_for('orders'::regclass, parent)::text, 4, '0')) AS in_bucket_of_parent, count(*) FROM orders GROUP BY 1;
+ in_bucket_of_parent | count 
+---------------------+-------
+ t                   |    50
+(1 row)
+
+-- a key from the table to itself must use the distribution column on both sides: a tree does not
+CREATE TABLE tree (id int PRIMARY KEY, parent int REFERENCES tree (id));
+INSERT INTO tree SELECT g, nullif(g - 1, 0) FROM generate_series(1, 30) g;
+SELECT kingres.create_distributed_table('tree', 'id', bucket_count => 4);
+ERROR:  cannot distribute table "tree": foreign key "tree_parent_fkey" does not use the distribution column "id" on both sides
+-- the key on the distribution column itself is carried
+CREATE TABLE self_key (id int PRIMARY KEY, v int, FOREIGN KEY (id) REFERENCES self_key (id));
+INSERT INTO self_key SELECT g, g FROM generate_series(1, 30) g;
+SELECT kingres.create_distributed_table('self_key', 'id', bucket_count => 4);
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+SELECT count(*) AS self_key FROM self_key;
+ self_key 
+----------
+       30
+(1 row)
+
+SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'self_key'::regclass AND contype = 'f' AND conparentid = 0;
+     conname      |           pg_get_constraintdef           
+------------------+------------------------------------------
+ self_key_id_fkey | FOREIGN KEY (id) REFERENCES self_key(id)
+(1 row)
+
+-- A reference table with a key to another reference table, and the privileges of both
+CREATE TABLE ref_child (id int PRIMARY KEY, p int REFERENCES ref_parent (id), v text);
+INSERT INTO ref_child SELECT g, 2 + g % 3, 'c' || g FROM generate_series(1, 20) g;
+ALTER TABLE ref_child OWNER TO p9_owner;
+GRANT SELECT ON ref_child TO p9_reader;
+COMMENT ON TABLE ref_child IS 'a reference table with a key';
+SELECT kingres.create_reference_table('ref_child');
+ create_reference_table 
+------------------------
+ 
+(1 row)
+
+SELECT count(*) AS ref_child FROM ref_child;
+ ref_child 
+-----------
+        20
+(1 row)
+
+SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'ref_child'::regclass AND contype = 'f';
+     conname      |           pg_get_constraintdef            
+------------------+-------------------------------------------
+ ref_child_p_fkey | FOREIGN KEY (p) REFERENCES ref_parent(id)
+(1 row)
+
+SELECT relacl, obj_description(oid) FROM pg_class WHERE oid = 'ref_child'::regclass;
+                      relacl                       |       obj_description        
+---------------------------------------------------+------------------------------
+ {p9_owner=arwdDxtm/p9_owner,p9_reader=r/p9_owner} | a reference table with a key
+(1 row)
+
+INSERT INTO ref_child VALUES (100, 77, 'bad');
+ERROR:  insert or update on table "ref_child" violates foreign key constraint "ref_child_p_fkey"
+DETAIL:  Key (p)=(77) is not present in table "ref_parent".
+-- the keys of a table that cannot be distributed are still refused, with the list
+CREATE TABLE multi_bad (id int PRIMARY KEY, k int, p int REFERENCES plain_parent (id));
+CREATE TRIGGER trg_m BEFORE INSERT ON multi_bad FOR EACH ROW EXECUTE FUNCTION trg_fn();
+SELECT kingres.create_distributed_table('multi_bad', 'k');
+ERROR:  3 problems prevent the change of table "public.multi_bad"
+DETAIL:  trigger: cannot distribute table "multi_bad": trigger "trg_m" is not supported yet
+foreign_key_plain_table: cannot distribute table "multi_bad": foreign key "multi_bad_p_fkey" references ordinary table "public.plain_parent"; a key to an ordinary table is not supported
+unique_without_distribution_column: cannot distribute table "multi_bad": primary key constraint "multi_bad_pkey" does not include the distribution column "k"; a unique or primary key constraint of a distributed table must include the distribution column
+HINT:  kingres.table_change_report() lists them with the warnings and notes.
+-- cleanup
+DROP PUBLICATION dep_pub;
+DROP MATERIALIZED VIEW dep_mv;
+DROP VIEW dep_v, a_view;
+DROP FUNCTION dep_f(dep_t);
+DROP TABLE multi_bad, ref_child, tree, self_key, orders, items, items_model, fp_before, fp_after,
+           dep_t, col_t, key_t, used_t, used_t_b0003, nokey_t, nullkey_t, okkey_t, nc_t,
+           fk_plain, plain_parent, fk_ref, fk_dist, fk_self, dist_parent, ref_parent, temp_t, unlogged_t,
+           part_t, inh_c, inh_p, stor_t, rls_t, excl_t, trg_t, a_very_long_table_name_that_is_at_the_limit_of_sixty_three_chars;
+NOTICE:  identifier "a_very_long_table_name_that_is_at_the_limit_of_sixty_three_chars" will be truncated to "a_very_long_table_name_that_is_at_the_limit_of_sixty_three_char"
+DROP FUNCTION trg_fn();
+DROP FUNCTION fingerprint(regclass);
+DROP OWNED BY p9_owner;
+DROP ROLE p9_owner, p9_reader, p9_writer, p9_grantor;
+DROP EXTENSION kingres_shard;

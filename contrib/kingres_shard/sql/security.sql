@@ -98,6 +98,54 @@ SHOW kingres_shard.forwarded;
 SHOW kingres_shard.enable_routing;
 RESET ROLE;
 
+-- The table lifecycle (0.7): its functions and records are for superusers.
+-- Every function the phase made is closed to PUBLIC (the query lists the open ones).
+SELECT p.oid::regprocedure AS function_open_to_public
+  FROM pg_proc p
+ WHERE p.pronamespace = 'kingres'::regnamespace
+   AND p.proname IN ('table_change_report', 'internal_raise_blockers', 'internal_require_version',
+                     'internal_has_hash_support', 'internal_advance_sequence', 'internal_rename_identity',
+                     'internal_table_ddl', 'internal_check_distributable', 'internal_check_referenceable',
+                     'internal_copy_routed')
+   AND (p.proacl IS NULL OR EXISTS (SELECT 1 FROM aclexplode(p.proacl) a WHERE a.grantee = 0))
+ ORDER BY 1::text;
+SELECT count(*) = 10 AS all_ten_were_found
+  FROM pg_proc p
+ WHERE p.pronamespace = 'kingres'::regnamespace
+   AND p.proname IN ('table_change_report', 'internal_raise_blockers', 'internal_require_version',
+                     'internal_has_hash_support', 'internal_advance_sequence', 'internal_rename_identity',
+                     'internal_table_ddl', 'internal_check_distributable', 'internal_check_referenceable',
+                     'internal_copy_routed');
+CREATE ROLE ks_sec_monitor;
+GRANT pg_monitor TO ks_sec_monitor;
+SET ROLE ks_sec_attacker;
+SELECT * FROM kingres.table_operation;
+SELECT * FROM kingres.table_operation_item;
+SELECT * FROM kingres.table_operation_lock;
+SELECT * FROM kingres.table_old_copy;
+SELECT * FROM kingres.table_operations;
+SELECT * FROM kingres.partitions;
+SELECT nextval('kingres.colocation_id_seq');
+SELECT * FROM kingres.table_change_report('distribute', 'sec_t', '{"column":"id"}');
+SELECT kingres.internal_copy_routed('sec_t', 'public', 'sec_t', 'every_node');
+SELECT kingres.internal_require_version('0.7');
+SELECT kingres.create_distributed_table('sec_t', 'id');
+SELECT kingres.create_reference_table('sec_t');
+RESET ROLE;
+-- the records show progress to pg_monitor, without error text and without a node address
+SET ROLE ks_sec_monitor;
+SELECT count(*) AS operations_seen FROM kingres.table_operations;
+SELECT count(*) AS partitions_seen FROM kingres.partitions;
+SELECT * FROM kingres.table_operation;
+RESET ROLE;
+SELECT column_name FROM information_schema.columns
+ WHERE table_schema = 'kingres' AND table_name = 'table_operations' ORDER BY ordinal_position;
+-- the catalog tables of a table's partitions are readable like the rest of the catalog
+SET ROLE ks_sec_attacker;
+SELECT count(*) AS partitions_catalog_readable FROM kingres.dist_partition;
+RESET ROLE;
+DROP ROLE ks_sec_monitor;
+
 DROP TABLE sec_t;
 DROP OWNED BY ks_sec_attacker;
 DROP ROLE ks_sec_attacker;

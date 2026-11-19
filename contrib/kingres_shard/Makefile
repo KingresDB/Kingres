@@ -11,6 +11,7 @@ OBJS = \
 	src/batch_sender.o \
 	src/bucket_move.o \
 	src/catalog.o \
+	src/copy_routed.o \
 	src/dist_scan.o \
 	src/dist_table.o \
 	src/fanout.o \
@@ -43,10 +44,11 @@ EXTENSION = kingres_shard
 DATA = kingres_shard--0.1.sql kingres_shard--0.2.sql kingres_shard--0.3.sql \
 	kingres_shard--0.4.sql kingres_shard--0.1--0.2.sql kingres_shard--0.2--0.3.sql \
 	kingres_shard--0.3--0.4.sql kingres_shard--0.5.sql kingres_shard--0.4--0.5.sql \
-	kingres_shard--0.6.sql kingres_shard--0.5--0.6.sql
+	kingres_shard--0.6.sql kingres_shard--0.5--0.6.sql \
+	kingres_shard--0.6--0.7.sql kingres_shard--0.7.sql
 
-REGRESS = version catalog bucket_for bucket_lookup distribute routing_single security \
-	utility_guard routing_decisions reference ddl_single rebalance_plan bulk_plans pushdown_shippable pushdown_plans upgrade
+REGRESS = version catalog bucket_for bucket_lookup distribute distribute_rows routing_single security \
+	utility_guard routing_decisions reference ddl_single rebalance_plan bulk_plans pushdown_shippable pushdown_plans upgrade pg_facts
 # The tests need the extension preloaded (see kingres_shard.conf).
 REGRESS_OPTS = --temp-config $(srcdir)/kingres_shard.conf
 TAP_TESTS = 1

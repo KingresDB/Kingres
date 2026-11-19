@@ -5,6 +5,7 @@ kingres_shard_sources = files(
   'src/batch_sender.c',
   'src/bucket_move.c',
   'src/catalog.c',
+  'src/copy_routed.c',
   'src/dist_scan.c',
   'src/dist_table.c',
   'src/fanout.c',
@@ -59,6 +60,8 @@ install_data(
   'kingres_shard--0.4--0.5.sql',
   'kingres_shard--0.6.sql',
   'kingres_shard--0.5--0.6.sql',
+  'kingres_shard--0.6--0.7.sql',
+  'kingres_shard--0.7.sql',
   kwargs: contrib_data_args,
 )
 
@@ -73,6 +76,7 @@ tests += {
       'bucket_for',
       'bucket_lookup',
       'distribute',
+      'distribute_rows',
       'routing_single',
       'security',
       'utility_guard',
@@ -84,6 +88,7 @@ tests += {
       'pushdown_shippable',
       'pushdown_plans',
       'upgrade',
+      'pg_facts',
     ],
     'regress_args': ['--temp-config', files('kingres_shard.conf')],
     # The tests need shared_preload_libraries = 'kingres_shard', which a
@@ -211,9 +216,14 @@ tests += {
       't/117_bulk_memory.pl',
       't/118_review_steps_1_2.pl',
       't/119_nested_subxacts.pl',
+      't/140_distribute_rows.pl',
+      't/141_distribute_memory.pl',
+      't/142_distribute_ledger.pl',
+      't/143_distribute_insel.pl',
       't/120_colocated_insert_select.pl',
       't/121_insel_roundtrip_security.pl',
       't/122_insel_faults_moves.pl',
+      't/123_insel_generator.pl',
     ],
   },
 }

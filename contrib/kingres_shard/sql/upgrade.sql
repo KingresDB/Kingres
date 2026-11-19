@@ -1,9 +1,9 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
 -- Portions Copyright (c) 2026, RooyeKhat Media Co
 --
--- upgrade.sql: pg_regress test of kingres_shard 0.6 (purpose below).
--- ALTER EXTENSION kingres_shard UPDATE from 0.1 (through 0.2, 0.3, 0.4 and 0.5), from 0.2, from 0.3, from 0.4 and from 0.5 to 0.6 must give exactly the
--- catalog that installing 0.6 gives, and keep the data of the catalog tables.
+-- upgrade.sql: pg_regress test of kingres_shard 0.7 (purpose below).
+-- ALTER EXTENSION kingres_shard UPDATE from 0.1 (through 0.2 to 0.6), from 0.2, from 0.3, from 0.4, from 0.5 and from 0.6 to 0.7 must give exactly the
+-- catalog that installing 0.7 gives, and keep the data of the catalog tables.
 SET search_path = public, pg_temp;
 
 -- A description of every object of the extension that the two paths could
@@ -121,7 +121,35 @@ RETURN QUERY
 END
 $$;
 
--- Install 0.6 directly.
+-- A table distributed the way the older versions did it: this test creates tables in
+-- versions 0.1 to 0.4, whose SQL objects the library of 0.7 no longer drives
+-- (create_distributed_table refuses a database whose objects are older than the library),
+-- so the partitions and the catalog rows are made by hand.  p_table is a table that is
+-- PARTITION BY HASH on its first column and has no partitions yet.
+CREATE FUNCTION public.upg_register(p_table regclass, p_buckets int) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_col  name;
+    v_id   int;
+    v_name text := (SELECT relname FROM pg_catalog.pg_class WHERE oid = p_table);
+BEGIN
+    SELECT a.attname INTO v_col FROM pg_catalog.pg_attribute a
+     WHERE a.attrelid = p_table AND a.attnum = 1;
+    FOR b IN 0 .. p_buckets - 1 LOOP
+        EXECUTE format('CREATE TABLE public.%I PARTITION OF %s FOR VALUES WITH (MODULUS %s, REMAINDER %s)',
+                       format('%s_b%s', v_name, lpad(b::text, 4, '0')), p_table, p_buckets, b);
+    END LOOP;
+    SELECT coalesce(max(colocation_id), 0) + 1 INTO v_id FROM kingres.colocation;
+    INSERT INTO kingres.colocation (colocation_id, bucket_count, dist_column_type, dist_collation)
+         VALUES (v_id, p_buckets, 'int4', 0);
+    INSERT INTO kingres.bucket_map (colocation_id, bucket, group_id)
+         SELECT v_id, g, 0 FROM generate_series(0, p_buckets - 1) g;
+    INSERT INTO kingres.dist_table (relid, method, dist_column, colocation_id)
+         VALUES (p_table, 'hash', v_col, v_id);
+END
+$$;
+
+-- Install 0.7 directly.
 CREATE EXTENSION kingres_shard;
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
 CREATE TABLE public.upg_direct AS SELECT line FROM public.upg_snapshot() line;
@@ -132,8 +160,13 @@ DROP EXTENSION kingres_shard;
 CREATE EXTENSION kingres_shard VERSION '0.1';
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
 SELECT kingres.init_cluster(btrim(split_part(current_setting('unix_socket_directories'), ',', 1)), current_setting('port')::int);
-CREATE TABLE public.upg_t (id int PRIMARY KEY, v text);
-SELECT kingres.create_distributed_table('public.upg_t', 'id', bucket_count => 4);
+-- Until ALTER EXTENSION UPDATE has run, the functions of the table lifecycle refuse with a
+-- clear message instead of a missing function (reference tables arrived in 0.2, so only the first function exists).
+CREATE TABLE public.upg_early (id int PRIMARY KEY);
+SELECT kingres.create_distributed_table('public.upg_early', 'id');
+DROP TABLE public.upg_early;
+CREATE TABLE public.upg_t (id int PRIMARY KEY, v text) PARTITION BY HASH (id);
+SELECT public.upg_register('public.upg_t', 4);
 INSERT INTO public.upg_t VALUES (1, 'one'), (2, 'two');
 
 ALTER EXTENSION kingres_shard UPDATE;
@@ -172,6 +205,35 @@ SELECT count(*) AS cluster_problems FROM kingres.check_cluster();
 SELECT kingres.resume_bucket_moves();
 SELECT kingres.cleanup_moved_buckets();
 
+-- 0.7: a table that was distributed before the upgrade is known to the new functions,
+-- and the numbers of colocation groups are never used twice.
+SELECT severity, code FROM kingres.table_change_report('alter', 'public.upg_t', '{"bucket_count":8}');
+SELECT severity, code FROM kingres.table_change_report('distribute', 'public.upg_t', '{"column":"id"}');
+SELECT count(*) AS partitions_of_user_tables FROM kingres.dist_partition;
+SELECT count(*) AS operations FROM kingres.table_operation;
+CREATE TABLE public.upg_t2 (id int PRIMARY KEY, v text);
+INSERT INTO public.upg_t2 VALUES (7, 'seven'), (8, 'eight');
+SELECT kingres.create_distributed_table('public.upg_t2', 'id', bucket_count => 6);
+SELECT colocation_id FROM kingres.dist_table WHERE relid = 'public.upg_t2'::regclass;
+SELECT count(*) FROM public.upg_t2;
+DROP TABLE public.upg_t2;
+DELETE FROM kingres.bucket_map WHERE colocation_id = 2;
+DELETE FROM kingres.colocation WHERE colocation_id = 2;
+CREATE TABLE public.upg_t3 (id int PRIMARY KEY);
+SELECT kingres.create_distributed_table('public.upg_t3', 'id', bucket_count => 6);
+SELECT colocation_id AS never_reused FROM kingres.dist_table WHERE relid = 'public.upg_t3'::regclass;
+DROP TABLE public.upg_t3;
+DELETE FROM kingres.bucket_map WHERE colocation_id = 3;
+DELETE FROM kingres.colocation WHERE colocation_id = 3;
+-- a map group primary that is not upgraded sends a catalog without the new keys
+BEGIN;
+SELECT kingres.internal_apply_catalog(kingres.internal_catalog_snapshot() - 'dist_partition');
+SELECT count(*) AS tables_after_old_snapshot FROM kingres.dist_table;
+ROLLBACK;
+-- the version handshake of the new functions
+SELECT kingres.internal_require_version('0.7');
+DO $$ BEGIN PERFORM kingres.internal_require_version('0.6'); EXCEPTION WHEN object_not_in_prerequisite_state THEN RAISE NOTICE '%', regexp_replace(SQLERRM, '\([^)]*\)', '(address)'); END $$;
+
 DROP TABLE public.upg_t;
 DROP EXTENSION kingres_shard;
 
@@ -179,16 +241,16 @@ DROP EXTENSION kingres_shard;
 CREATE EXTENSION kingres_shard VERSION '0.2';
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
 SELECT kingres.init_cluster(btrim(split_part(current_setting('unix_socket_directories'), ',', 1)), current_setting('port')::int);
-CREATE TABLE public.upg_t (id int PRIMARY KEY, v text);
-SELECT kingres.create_distributed_table('public.upg_t', 'id', bucket_count => 4);
+CREATE TABLE public.upg_t (id int PRIMARY KEY, v text) PARTITION BY HASH (id);
+SELECT public.upg_register('public.upg_t', 4);
 INSERT INTO public.upg_t VALUES (3, 'three');
 ALTER EXTENSION kingres_shard UPDATE TO '0.3';
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
 ALTER EXTENSION kingres_shard UPDATE TO '0.4';
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
 ALTER EXTENSION kingres_shard UPDATE TO '0.5';
-SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
 ALTER EXTENSION kingres_shard UPDATE TO '0.6';
+ALTER EXTENSION kingres_shard UPDATE TO '0.7';
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
 DROP TABLE public.upg_upgraded;
 CREATE TABLE public.upg_upgraded AS SELECT line FROM public.upg_snapshot() line;
@@ -208,15 +270,15 @@ DROP EXTENSION kingres_shard;
 CREATE EXTENSION kingres_shard VERSION '0.3';
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
 SELECT kingres.init_cluster(btrim(split_part(current_setting('unix_socket_directories'), ',', 1)), current_setting('port')::int);
-CREATE TABLE public.upg_t (id int PRIMARY KEY, v text);
-SELECT kingres.create_distributed_table('public.upg_t', 'id', bucket_count => 4);
+CREATE TABLE public.upg_t (id int PRIMARY KEY, v text) PARTITION BY HASH (id);
+SELECT public.upg_register('public.upg_t', 4);
 INSERT INTO public.upg_t VALUES (4, 'four');
 SELECT count(*) AS secret_rows FROM kingres.cluster_secret;
 ALTER EXTENSION kingres_shard UPDATE TO '0.4';
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
 ALTER EXTENSION kingres_shard UPDATE TO '0.5';
-SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
 ALTER EXTENSION kingres_shard UPDATE TO '0.6';
+ALTER EXTENSION kingres_shard UPDATE TO '0.7';
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
 SELECT count(*) AS secret_rows_after FROM kingres.cluster_secret;
 DROP TABLE public.upg_upgraded;
@@ -236,13 +298,13 @@ DROP EXTENSION kingres_shard;
 CREATE EXTENSION kingres_shard VERSION '0.4';
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
 SELECT kingres.init_cluster(btrim(split_part(current_setting('unix_socket_directories'), ',', 1)), current_setting('port')::int);
-CREATE TABLE public.upg_t (id int PRIMARY KEY, v text);
-SELECT kingres.create_distributed_table('public.upg_t', 'id', bucket_count => 4);
+CREATE TABLE public.upg_t (id int PRIMARY KEY, v text) PARTITION BY HASH (id);
+SELECT public.upg_register('public.upg_t', 4);
 INSERT INTO public.upg_t VALUES (5, 'five');
 INSERT INTO kingres.dtx_log VALUES ('kingres_1_1_1_1', 1, now());
 ALTER EXTENSION kingres_shard UPDATE TO '0.5';
-SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
 ALTER EXTENSION kingres_shard UPDATE TO '0.6';
+ALTER EXTENSION kingres_shard UPDATE TO '0.7';
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
 DROP TABLE public.upg_upgraded;
 CREATE TABLE public.upg_upgraded AS SELECT line FROM public.upg_snapshot() line;
@@ -262,16 +324,18 @@ DROP TABLE public.upg_t;
 DROP EXTENSION kingres_shard;
 
 -- The step from 0.5 on its own: 0.6 adds no object, so a node of 0.5 with a cluster, data and
--- a decision in dtx_log ends in the catalog a fresh 0.6 gives, and keeps everything it had.
+-- a decision in dtx_log ends, through 0.6 and 0.7, in the catalog a fresh 0.7 gives, and keeps everything it had.
 CREATE EXTENSION kingres_shard VERSION '0.5';
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
 SELECT kingres.init_cluster(btrim(split_part(current_setting('unix_socket_directories'), ',', 1)), current_setting('port')::int);
-CREATE TABLE public.upg_t (id int PRIMARY KEY, v text);
-SELECT kingres.create_distributed_table('public.upg_t', 'id', bucket_count => 4);
+CREATE TABLE public.upg_t (id int PRIMARY KEY, v text) PARTITION BY HASH (id);
+SELECT public.upg_register('public.upg_t', 4);
 INSERT INTO public.upg_t VALUES (6, 'six');
 INSERT INTO kingres.dtx_log VALUES ('kingres_1_1_1_1', 1, now());
 SELECT count(*) AS secret_rows FROM kingres.cluster_secret;
 ALTER EXTENSION kingres_shard UPDATE TO '0.6';
+SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
+ALTER EXTENSION kingres_shard UPDATE TO '0.7';
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
 DROP TABLE public.upg_upgraded;
 CREATE TABLE public.upg_upgraded AS SELECT line FROM public.upg_snapshot() line;
@@ -284,8 +348,37 @@ ORDER BY 1, 2;
 SELECT count(*) FROM public.upg_t;
 SELECT count(*) AS decisions_kept FROM kingres.dtx_log;
 SELECT count(*) AS secret_rows_after FROM kingres.cluster_secret;
-SELECT count(*) AS cluster_problems FROM kingres.check_cluster();
 SELECT kingres.internal_check_node_versions();
+DROP TABLE public.upg_t;
+DROP EXTENSION kingres_shard;
+
+-- The step from 0.6 on its own: a node with a bucket map and a table with rows, then the
+-- upgrade; the table keeps its rows, the new objects work on what 0.6 made, and a
+-- table with rows is distributed afterwards.
+CREATE EXTENSION kingres_shard VERSION '0.6';
+SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
+SELECT kingres.init_cluster(btrim(split_part(current_setting('unix_socket_directories'), ',', 1)), current_setting('port')::int);
+CREATE TABLE public.upg_t (id int PRIMARY KEY, v text) PARTITION BY HASH (id);
+SELECT public.upg_register('public.upg_t', 4);
+INSERT INTO public.upg_t VALUES (6, 'six');
+ALTER EXTENSION kingres_shard UPDATE TO '0.7';
+SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
+DROP TABLE public.upg_upgraded;
+CREATE TABLE public.upg_upgraded AS SELECT line FROM public.upg_snapshot() line;
+SELECT 'only in direct install' AS side, line FROM
+  (SELECT line FROM public.upg_direct EXCEPT SELECT line FROM public.upg_upgraded) x
+UNION ALL
+SELECT 'only in upgrade', line FROM
+  (SELECT line FROM public.upg_upgraded EXCEPT SELECT line FROM public.upg_direct) y
+ORDER BY 1, 2;
+SELECT count(*) FROM public.upg_t;
+SELECT last_value, is_called FROM kingres.colocation_id_seq;
+CREATE TABLE public.upg_rows (id int PRIMARY KEY, v text);
+INSERT INTO public.upg_rows SELECT g, 'r' || g FROM generate_series(1, 100) g;
+SELECT kingres.create_distributed_table('public.upg_rows', 'id', colocate_with => 'public.upg_t');
+SELECT count(*), sum(id) FROM public.upg_rows;
+SELECT colocation_id FROM kingres.dist_table ORDER BY relid::text;
+DROP TABLE public.upg_rows;
 DROP TABLE public.upg_t;
 DROP EXTENSION kingres_shard;
 

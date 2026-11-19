@@ -8,13 +8,22 @@ node as reference tables, and makes every statement correct on a cluster with
 several groups: a statement that touches one key goes to the group that owns
 it, and a statement that spans groups is answered by reading the other groups.
 
-This is version 0.6 (0.3 added moving buckets, phase 2a made every statement correct, 0.4 is the fix round of the reviews of 0.2 and 0.3, 0.5 is high availability: standby nodes, `promote_node`, prepared transactions across a failover, distributed deadlock detection and coordinated restore points; see "High availability" below; 0.6 is phase 2b and adds no SQL object, see "Installation" for why the version is raised). Phase 2b makes the common
+This is version 0.7 (0.7 is the table lifecycle of phase 9 on top of 0.6; 0.6 is the version of phase 2b; 0.3 added moving buckets, phase 2a made every statement correct, 0.4 is the fix round of the reviews of 0.2 and 0.3, 0.5 is high availability: standby nodes, `promote_node`, prepared transactions across a failover, distributed deadlock detection and coordinated restore points; see "High availability" below; 0.6 is phase 2b and adds no SQL object, see "Installation" for why the version is raised). Phase 2b makes the common
 statements fast. The designs are in
 [`kingres/docs/design/shard-mvp.md`](../../kingres/docs/design/shard-mvp.md)
 (phase 1) and
 [`kingres/docs/design/shard-phase2a.md`](../../kingres/docs/design/shard-phase2a.md)
 (this version, with its "Implementation notes and deviations"); this file
 describes what is implemented and how to use it.
+
+Version 0.7 (phase 9, [`shard-phase9.md`](../../kingres/docs/design/shard-phase9.md),
+increments 9.1 and 9.2) starts the table lifecycle: `create_distributed_table` and
+`create_reference_table` accept a table that already holds rows and carry its owner,
+privileges, comments, sequences and foreign keys; `kingres.table_change_report()` says what
+stands in the way of a change of a table before it is tried; and the catalog holds what the
+rest of the phase needs (see "The table lifecycle (version 0.7)"). The online variants,
+`undistribute_table`, `alter_distributed_table` and user partitions are the next increments
+and are not in this version.
 
 ## How it works in one page
 
@@ -263,7 +272,7 @@ PROVE_TESTS=t/013_dist_scan.pl kingres/dev/ext.sh kingres_shard tap
   second, fictitious shard group; `routing_decisions`: collations, functions
   and other nested contexts, forwarded sessions, decided with `EXPLAIN`;
   `reference`: reference tables on one node; `upgrade`: `ALTER EXTENSION ...
-  UPDATE` from 0.1, 0.2, 0.3, 0.4 and 0.5 against a fresh 0.6 install; the same on both majors:
+  UPDATE` from 0.1, 0.2, 0.3, 0.4, 0.5 and 0.6 against a fresh 0.7 install; the same on both majors:
   the script of 0.3 names a column of `pg_stat_subscription_stats` that PostgreSQL 19
   renamed, so on 19 it creates `kingres.internal_move_subscription_status()` with its
   body check off and `ALTER EXTENSION ... UPDATE` to 0.4 replaces it with a body that
@@ -382,6 +391,16 @@ PROVE_TESTS=t/013_dist_scan.pl kingres/dev/ext.sh kingres_shard tap
   `119_nested_subxacts` (the fixes of the sixth review of the call sequences: two nested subtransactions with the
   connection closed or answered with an error at every chunk, a failed `RELEASE` that PL/pgSQL catches, a read-only
   session that does not answer `ROLLBACK TO`, the memory of thousands of failed `RELEASE`s).
+  Table lifecycle (version 0.7, increments 9.1 and 9.2; the design's `t/040` and the numbers after it are
+  taken by older tests, so the names are `140` and up): the regression test `distribute_rows` (the report, one
+  statement per code, and a creation with rows on one node compared object by object with the source), the
+  steps from 0.6 in `upgrade`, the new objects in `security` and `catalog`; `140_distribute_rows` (the blocking
+  `t/040`: three nodes, every row in the group that owns its bucket and nowhere else, owner, privileges, comments,
+  sequences and keys the same on every node, writers wait and readers do not, an error at every step and every send and
+  wait of the sender, a cancel, a node that is down, the origin killed before and after its commit),
+  `141_distribute_memory` (a million and three million rows: the same peak memory), `143_distribute_insel` (a prepared colocated INSERT ... SELECT across the swap of its source, and one that waits for the lock of a table that is being distributed), `142_distribute_ledger` (a
+  ledger table is refused; it needs `kingres_ledger` built into the same installation, for example
+  `make -C contrib/kingres_ledger USE_PGXS=1 PG_CONFIG=... install`, and both libraries preloaded, which the test does).
   `t/KingresShardTest.pm` builds clusters (and standbys); `t/KingresShardCompare.pm` is the
   comparison harness: it loads the same data into a three-node cluster and a
   single node and compares query results (a NULL is shown as `<NULL>`, so it never equals
@@ -408,7 +427,7 @@ SELECT kingres.init_cluster('host1', 5432);       -- the address the other nodes
 SELECT kingres.add_node('host2', 5432);
 SELECT kingres.add_node('host3', 5432);
 
--- distribute an empty table, and keep a small one everywhere
+-- distribute a table (empty or not), and keep a small one everywhere
 CREATE TABLE users (id int, name text, PRIMARY KEY (id));
 SELECT kingres.create_distributed_table('users', 'id');
 CREATE TABLE countries (code text PRIMARY KEY, name text);
@@ -450,8 +469,9 @@ schema through `"$user"`; qualify names or fix `search_path`.
 | `kingres.detect_distributed_deadlocks() returns int` | Map group primary, superuser. One pass of the distributed deadlock detector (the recovery worker runs it); returns the number of transactions cancelled. |
 | `kingres.sync_catalog()` | Push the catalog to every active primary node, atomically. |
 | `kingres.rotate_secret()` | Map group primary, superuser. Replaces the secret behind the tokens of node-to-node sessions on every active primary, atomically. Refuses while a distributed transaction of the cluster is prepared on any node (its tag would stop verifying). Sessions another node opens while the commit is in flight may be refused once; repeat the statement. A node that dies between the PREPARE and the COMMIT PREPARED of the rotation is reached by the node that finishes it with the secret that the rotation replaced (every node keeps it as "previous" and never accepts a session with it); recovery commits the rotation by itself and drops the previous secret in the first pass of a node's recovery (the worker, or `recover_prepared_transactions()`, on that node) that reaches every primary with the current secret and needs no session made with the previous one: the pass that commits a stranded node's rotation needs it and keeps it, the next pass drops it (S9-03, `t/076` asserts both). |
-| `kingres.create_distributed_table(relation regclass, dist_column name, colocate_with regclass default null, bucket_count int default null)` | Map group primary only. See below. |
-| `kingres.create_reference_table(relation regclass)` | Map group primary only. Makes an ordinary table a reference table: creates it on every node and copies its rows. Writers are blocked while it copies. |
+| `kingres.create_distributed_table(relation regclass, dist_column name, colocate_with regclass default null, bucket_count int default null)` | Map group primary only; superuser. The table may hold rows. See "The table lifecycle (version 0.7)". |
+| `kingres.create_reference_table(relation regclass)` | Map group primary only; superuser. Makes an ordinary table a reference table: creates it on every node, copies its rows, and carries its owner, privileges, comments and its foreign keys to other reference tables. Writers are blocked while it copies. |
+| `kingres.table_change_report(kind text, relation regclass, options jsonb default '{}') returns table (severity text, code text, object text, detail text)` | Superuser, any node that has the catalog. What prevents a change of a table (`blocker`), what the change would not carry (`warning`) and what is good to know (`note`), without changing anything; it never stops at the first problem. `kind` is `distribute`, `distribute_reference`, `undistribute`, `alter`, `create_partition`, `attach_partition`, `detach_partition` or `drop_partition`. The codes are listed under "The table lifecycle (version 0.7)". |
 | `kingres.recover_prepared_transactions() returns int` | Commits or rolls back the prepared transactions this node originated, on every active primary (itself included); returns how many it resolved. Superuser. Runs in a `READ COMMITTED` transaction; not on a standby. |
 | `kingres.bucket_for(relation regclass, value anyelement) returns int` | The bucket of a key of a distributed table. |
 | `kingres.bucket_for(colocation_id int, value anyelement) returns int` | The bucket of a key in a colocation group. |
@@ -460,23 +480,150 @@ Views: `kingres.nodes` (`kingres.node` plus `is_local`) and
 `kingres.buckets` (table, bucket, partition name, group, owning node, state,
 and the partition size where the partition exists on this node).
 
-`create_distributed_table` requires an empty, ordinary, non-partitioned table
-without inheritance, foreign keys, triggers, row-level security, storage
+`create_distributed_table` takes an ordinary, permanent, non-partitioned table
+that may hold rows, without inheritance, triggers, row-level security, storage
 parameters or exclusion constraints, on a type with a default hash operator
 class and extended hash function. Every unique constraint or unique index must
 include the distribution column; the error names the offending object. The
 table is recreated as a hash-partitioned table with the same columns,
-defaults, `NOT NULL`, check and unique constraints and indexes, the sequences
-owned by its columns, and its owner. The colocation group is the one of
+defaults, identity and generated columns, `NOT NULL`, check, unique and foreign key
+constraints and indexes, the sequences owned by its columns (with their state), its
+owner, its table and column privileges and its comments, and its rows are
+moved to the groups that own their buckets. The colocation group is the one of
 `colocate_with`, else an existing group with the same type, collation and
 bucket count, else a new group whose buckets are spread round-robin over the
-groups that should hold shards. Privileges, comments and statistics objects
-are not copied (grant after creating; the grant is propagated).
+groups that should hold shards. Statistics objects, per-column storage, compression
+and statistics targets, `CLUSTER ON` and the replica identity are not carried (the
+report says so as warnings). Everything that prevents the call is listed in one error
+(or by `table_change_report()`); see the next section.
 
-`create_reference_table` takes the same kind of table (ordinary, permanent,
-without inheritance, foreign keys, triggers, row-level security, storage
-parameters or exclusion constraints; a unique constraint needs no distribution
-column). Add foreign keys afterwards with `ALTER TABLE`.
+`create_reference_table` takes the same kind of table (a unique constraint needs no
+distribution column). Its rows, owner, privileges and comments are carried to the other
+nodes, and so are its foreign keys to other reference tables.
+
+## The table lifecycle (version 0.7)
+
+This section is phase 9 of [`shard-phase9.md`](../../kingres/docs/design/shard-phase9.md),
+increments 9.1 and 9.2 (what the catalog and the report are, and the blocking
+`create_distributed_table` of a table with rows). The design calls its version "0.6"; the
+phase is 0.7 because phase 2b is 0.6 (a version with no object change). Not in this
+version: the online variants (`create_distributed_table_concurrently` and the rebuild
+engine), `undistribute_table`, `alter_distributed_table`, user partitions of distributed
+tables, the control plane and the console. `table_change_report` already reports for those
+kinds what it can know today (see the codes).
+
+### What a creation with rows does
+
+One transaction, the caller's, on the map group primary:
+
+1. The cluster lock, the check that this node is the map group primary, the **version
+   handshake** (`kingres.internal_require_version('0.7')`: every active primary must report
+   0.7, the first that does not is named), the report (any blocker raises one error that lists
+   all of them), the choice of the colocation group (a new group takes its id from
+   `kingres.colocation_id_seq`, so a number is never used twice, also after a rollback), and the
+   check that no bucket of the group is being moved and no table operation claims it.
+2. `LOCK TABLE ... IN EXCLUSIVE MODE` on the source. From here to the commit **writers of the table wait,
+   readers do not**; everything else goes on.
+3. The new table is made on every node **under the name `kingres_shadow_<oid>`** (its constraints and
+   indexes carry the oid too), with the partitions of the buckets the node's group owns (named `<table>_b<NNNN>`
+   at once, with the modulus of the bucket). It is not in the catalog of any node, so no statement, scan or
+   move sees it. The old table is still the table.
+4. The rows are copied with the batch sender of the row router (`copy_routed.c`) driven with an explicit
+   destination (a placement, because the shadow is not registered): the source is read through a cursor in
+   chunks and every row goes to the group that owns its bucket, in batches of one `INSERT` that carry the
+   identity of the destination's partitions. Rows read, rows the groups acknowledged and `count(*)` of the
+   source taken under the lock must be equal, or the call fails.
+5. From the moment the old table is dropped to the commit **readers of the table wait** too (`DROP TABLE` takes
+   `ACCESS EXCLUSIVE`): on this node the old table is dropped and the shadow takes its name (constraints, indexes,
+   identity sequences and the sequences that columns own are renamed or moved), the foreign keys are added, the
+   sequences are advanced (each node's to at least the largest value of its own rows, and this node's to the state
+   the source had), and the owner, privileges and comments are applied; on every other node the shadow takes its
+   name and gets the same. The table is registered and the catalog is pushed to every node.
+6. The commit is the two-phase commit of phase 2a: `PREPARE TRANSACTION` on every node that holds a part, the
+   decision in `kingres.dtx_log`, `COMMIT PREPARED`. A failure of any node or of this node at any point before the
+   decision rolls everything back (the old table is as it was, with its rows, and no node has a shadow, a
+   partition or a prepared transaction after recovery); a crash after the decision is finished by
+   `recover_prepared_transactions()` or the recovery worker, and the table is whole.
+
+Fault points of the creation (`kingres_shard.fault_injection`): `distribute_after_lock`,
+`distribute_after_shadow`, `copy_before_read`, `copy_after_copy`, `distribute_before_swap`,
+`distribute_after_swap`, and the points of the batch sender (`bulk_*`) and of the commit protocol.
+
+Memory does not depend on the number of rows: the cursor chunk is `insert_batch_rows` rows, the sender
+keeps at most two buffers per group (`insert_batch_rows` rows or `insert_batch_bytes` bytes each), and a group
+runs one batch at a time (`t/141` distributes 1,000,000 and 3,000,000 rows with 4 MB of shared buffers: the
+peak resident size of the backend is the same to the megabyte).
+
+### What is carried and what stays refused
+
+| | |
+|---|---|
+| Columns, defaults, identity (also `GENERATED ALWAYS`: copied with `OVERRIDING SYSTEM VALUE`), generated columns, collations, `NOT NULL` (with its constraint name), check, unique and primary key constraints, every index (expression, partial, covering) | carried |
+| Sequences owned by columns | carried: the same object on this node, created with the same options and the same owner on the others; the state is kept on this node, and advanced to the largest value of the node's own rows elsewhere. Privileges on the sequences are not carried |
+| Owner, table privileges, column privileges (with grantors and grant options), comments on the table, columns, constraints and indexes | carried; the roles must exist on every node (blocker `role_missing`) |
+| Foreign keys **to a reference table** | carried and validated in the same transaction |
+| Foreign keys **to a distributed table** of the group the table joins, on the distribution column of both | carried (such a key exists on an ordinary table only while the cluster has one shard group, or when it was made with `enable_routing = off`: with several groups the hook refuses it at creation) |
+| A key from the table to itself | carried when it is on the distribution column on both sides; refused otherwise |
+| Foreign keys to an ordinary table, to a distributed table of another group, or without the distribution column; foreign keys from an ordinary table to the table | refused (`foreign_key_plain_table`, `foreign_key_other_group`, `foreign_key_not_distribution_column`, `referenced_by_plain_table`) |
+| Triggers, row-level security, exclusion constraints, inheritance, partitioned tables and partitions (user partitions are increment 9.5), temporary and unlogged tables, storage parameters (increment 9.9), tablespaces, ledger tables and the history table of one, a table on a node that is not the map group primary | refused |
+| Views, materialized views, publications and functions that use the table's row type | refused (`dependent_object`): the table is replaced by a new one, and a rename would leave them on the old |
+| Statistics objects, per-column storage, compression and statistics target, `CLUSTER ON`, replica identity | not carried (warning `not_carried`) |
+| `lc_monetary` | the values of a `money` column are converted under `lc_monetary = 'C'` on both ends of the copy |
+
+The old table is dropped in the same transaction after the counts have matched; the design keeps it for
+`table_cleanup_delay` (increment 9.3 does, for the online variants). For a blocking creation the transaction
+is the guarantee: until it commits nothing changed, and after it the old copy would only be a second copy of
+rows that writers may have changed since.
+
+### The codes of `table_change_report`
+
+A code is a stable word; `object` names what is wrong, `detail` is a sentence (the text of the error when it is the only
+blocker). Severity `blocker`: the call is refused. `warning`: carried differently or not at all. `note`: good to know.
+
+| Code | Kinds | Meaning |
+|---|---|---|
+| `not_on_map_group` | all | this node is not the map group primary, or the cluster is not initialized |
+| `already_distributed` | distribute, distribute_reference | the table is distributed or a reference table already |
+| `not_ordinary_table` | distribute, distribute_reference | a view, a sequence, a foreign table, ... |
+| `partitioned_table` | distribute, distribute_reference | a partitioned table or a partition (until increment 9.5) |
+| `temporary_or_unlogged`, `inheritance`, `storage_parameters`, `row_level_security`, `exclusion_constraint`, `trigger` | distribute, distribute_reference | the table has what stays refused (one row per constraint and per trigger) |
+| `tablespace` | distribute, distribute_reference | the table or one of its indexes is not in the default tablespace |
+| `ledger_table` | distribute, distribute_reference | a `kingres_ledger` table or the history table of one |
+| `dependent_object` | distribute, distribute_reference | a view, materialized view, publication or function that uses the table |
+| `foreign_key_plain_table`, `foreign_key_other_group`, `foreign_key_not_distribution_column`, `referenced_by_plain_table`, `referenced_by_distributed_table` | distribute, distribute_reference | the foreign keys that stay refused |
+| `column_missing`, `no_hash_support`, `unique_without_distribution_column`, `name_too_long`, `name_in_use` | distribute | the distribution column is not usable, a unique key lacks it, the name leaves no room for `_bNNNN`, or a relation of a bucket partition's name exists |
+| `no_key_for_online` | distribute with `mode = 'online'` | a primary key or a unique index over `NOT NULL` columns is needed (for increment 9.3) |
+| `group_busy` | distribute, undistribute, alter | the colocation group has an unfinished move or a table operation |
+| `role_missing`, `default_function_missing`, `node_unreachable` | distribute, distribute_reference | another node lacks a role of the table's owner or privileges, or a function of a column default; or it cannot be asked |
+| `not_carried` (warning), `rows` (note) | distribute, distribute_reference | what is not carried; the estimate of the rows that writers wait for |
+| `not_distributed`, `foreign_key_linked`, `target_group_invalid` | undistribute | for the next increments |
+| `not_distributed`, `bucket_count_invalid`, `colocate_with_not_distributed`, `foreign_key_colocation`, `unique_without_distribution_column`, `column_missing`, `no_hash_support` | alter | for the next increments |
+| `not_distributed`, `name_too_long`, `not_available_yet` | create_partition, attach_partition, detach_partition, drop_partition | user partitions are not in this version |
+
+`options` is what the call would be given: `column`, `colocate_with` (a table name, schema-qualified unless it is in `pg_catalog`
+or `kingres`: the report runs with a fixed `search_path`), `bucket_count`, `mode` for a distribution;
+`cascade_via_foreign_keys` and `target_group` for undistribute; `distribution_column`, `bucket_count`, `colocate_with` and
+`cascade_to_colocated` for alter; `partition` for the partition kinds.
+
+### What 0.7 adds to the catalog
+
+`kingres.dist_table.partition_method` and `partition_key` (empty in this version), `kingres.dist_partition` (synchronized
+with the rest; nothing writes it yet), the sequence `kingres.colocation_id_seq` (a colocation id is never used twice; the
+update starts it at the highest id, and a node that applies a catalog keeps it above the ids it sees), and four node-local
+tables, readable by superusers only: `table_operation`, `table_operation_item`, `table_operation_lock` and `table_old_copy`
+(written by the online variants of increment 9.3; `internal_begin_move` and the DDL guard already refuse a colocation group
+that has a row in `table_operation_lock`). The views `kingres.table_operations` and `kingres.partitions` are readable by
+`pg_monitor` and show no error text and no node address. `kingres.internal_copy_routed()` copies the rows of a table to a
+placement, to every node or to one node for the rebuild engine to come; `kingres.internal_require_version()` is the
+handshake. All new functions are revoked from `PUBLIC`; none is `SECURITY DEFINER`.
+
+### Upgrading
+
+Load the new library on every node, then run `ALTER EXTENSION kingres_shard UPDATE` on every node. Until a node has been
+updated, `create_distributed_table` and `create_reference_table` refuse to run with "the kingres_shard objects of this
+database are older than the library", and the handshake of the new functions names the node that is behind; the other paths
+keep working, and a node can still be added. `internal_apply_catalog` accepts a catalog document without the new keys (a map
+group primary that is not updated yet).
 
 ## Restoring a node from a logical dump
 
@@ -2249,8 +2396,8 @@ assert the bound with it:
 |---|---|---|
 | `sync_catalog` | 12 | |
 | `rotate_secret` | 11 | |
-| `create_distributed_table` | 7 | |
-| `create_reference_table` | 7 + one per batch of the copy (a batch is at most 20000 values: a table of 60000 rows of two columns is six batches, 13 statements) | the rows and columns of the table |
+| `create_distributed_table` | 11 | the version handshake, the questions of the report about roles and functions, the shadow and its partitions, the swap and the final statements (0.7; it was 7 before) |
+| `create_reference_table` | 11 + about one per batch of the copy (a batch is at most 20000 values: a table of 60000 rows of two columns is 16 statements in the test) | the rows and columns of the table |
 | `recover_prepared_transactions` | 4 + 2 per prepared transaction of the node (6 for one) | the transactions in doubt |
 | `add_node`, the new node | 15 | one statement per table of the cluster, one per foreign key and per object whose privileges are copied, one per batch of the copy of a reference table |
 | `add_node`, a node already in the cluster | 8 | |

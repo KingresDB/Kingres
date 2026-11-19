@@ -139,6 +139,106 @@ SHOW kingres_shard.enable_routing;
 (1 row)
 
 RESET ROLE;
+-- The table lifecycle (0.7): its functions and records are for superusers.
+-- Every function the phase made is closed to PUBLIC (the query lists the open ones).
+SELECT p.oid::regprocedure AS function_open_to_public
+  FROM pg_proc p
+ WHERE p.pronamespace = 'kingres'::regnamespace
+   AND p.proname IN ('table_change_report', 'internal_raise_blockers', 'internal_require_version',
+                     'internal_has_hash_support', 'internal_advance_sequence', 'internal_rename_identity',
+                     'internal_table_ddl', 'internal_check_distributable', 'internal_check_referenceable',
+                     'internal_copy_routed')
+   AND (p.proacl IS NULL OR EXISTS (SELECT 1 FROM aclexplode(p.proacl) a WHERE a.grantee = 0))
+ ORDER BY 1::text;
+ function_open_to_public 
+-------------------------
+(0 rows)
+
+SELECT count(*) = 10 AS all_ten_were_found
+  FROM pg_proc p
+ WHERE p.pronamespace = 'kingres'::regnamespace
+   AND p.proname IN ('table_change_report', 'internal_raise_blockers', 'internal_require_version',
+                     'internal_has_hash_support', 'internal_advance_sequence', 'internal_rename_identity',
+                     'internal_table_ddl', 'internal_check_distributable', 'internal_check_referenceable',
+                     'internal_copy_routed');
+ all_ten_were_found 
+--------------------
+ t
+(1 row)
+
+CREATE ROLE ks_sec_monitor;
+GRANT pg_monitor TO ks_sec_monitor;
+SET ROLE ks_sec_attacker;
+SELECT * FROM kingres.table_operation;
+ERROR:  permission denied for table table_operation
+SELECT * FROM kingres.table_operation_item;
+ERROR:  permission denied for table table_operation_item
+SELECT * FROM kingres.table_operation_lock;
+ERROR:  permission denied for table table_operation_lock
+SELECT * FROM kingres.table_old_copy;
+ERROR:  permission denied for table table_old_copy
+SELECT * FROM kingres.table_operations;
+ERROR:  permission denied for view table_operations
+SELECT * FROM kingres.partitions;
+ERROR:  permission denied for view partitions
+SELECT nextval('kingres.colocation_id_seq');
+ERROR:  permission denied for sequence colocation_id_seq
+SELECT * FROM kingres.table_change_report('distribute', 'sec_t', '{"column":"id"}');
+ERROR:  permission denied for function table_change_report
+SELECT kingres.internal_copy_routed('sec_t', 'public', 'sec_t', 'every_node');
+ERROR:  permission denied for function internal_copy_routed
+SELECT kingres.internal_require_version('0.7');
+ERROR:  permission denied for function internal_require_version
+SELECT kingres.create_distributed_table('sec_t', 'id');
+ERROR:  permission denied for function create_distributed_table
+SELECT kingres.create_reference_table('sec_t');
+ERROR:  permission denied for function create_reference_table
+RESET ROLE;
+-- the records show progress to pg_monitor, without error text and without a node address
+SET ROLE ks_sec_monitor;
+SELECT count(*) AS operations_seen FROM kingres.table_operations;
+ operations_seen 
+-----------------
+               0
+(1 row)
+
+SELECT count(*) AS partitions_seen FROM kingres.partitions;
+ partitions_seen 
+-----------------
+               0
+(1 row)
+
+SELECT * FROM kingres.table_operation;
+ERROR:  permission denied for table table_operation
+RESET ROLE;
+SELECT column_name FROM information_schema.columns
+ WHERE table_schema = 'kingres' AND table_name = 'table_operations' ORDER BY ordinal_position;
+ column_name 
+-------------
+ op_id
+ kind
+ mode
+ phase
+ tables
+ rows_copied
+ rows_total
+ backlog
+ attempts
+ verified
+ started_at
+ updated_at
+(12 rows)
+
+-- the catalog tables of a table's partitions are readable like the rest of the catalog
+SET ROLE ks_sec_attacker;
+SELECT count(*) AS partitions_catalog_readable FROM kingres.dist_partition;
+ partitions_catalog_readable 
+-----------------------------
+                           0
+(1 row)
+
+RESET ROLE;
+DROP ROLE ks_sec_monitor;
 DROP TABLE sec_t;
 DROP OWNED BY ks_sec_attacker;
 DROP ROLE ks_sec_attacker;

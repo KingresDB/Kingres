@@ -1,0 +1,40 @@
+/*-------------------------------------------------------------------------
+ *
+ * copy_routed.h
+ *	  Copy the rows of a table to a destination that is described, not looked
+ *	  up in the catalog (design/shard-phase9.md, "Copy").
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only
+ * Portions Copyright (c) 2026, RooyeKhat Media Co
+ *
+ * IDENTIFICATION
+ *	  contrib/kingres_shard/src/copy_routed.h
+ *
+ *-------------------------------------------------------------------------
+ */
+#ifndef KINGRES_SHARD_COPY_ROUTED_H
+#define KINGRES_SHARD_COPY_ROUTED_H
+
+#include "postgres.h"
+
+#include "batch_sender.h"
+#include "catalog.h"
+
+/*
+ * Read every row of the table source (all columns that are not generated) and
+ * give it to the batch sender of the destination dest_schema.dest_table: each
+ * row to the group that owns its bucket in placement (KS_DEST_PLACEMENT, the key
+ * is key_column), to every active primary (KS_DEST_EVERY_NODE) or to node_id
+ * (KS_DEST_ONE_NODE).  The destination need not be in the catalog.  The rows are
+ * read through a cursor in chunks and sent in batches, so the memory used does
+ * not depend on the number of rows.  The transmission modes of the transaction
+ * are set around the conversion of the values.  Returns the number of rows the
+ * destination groups acknowledged and sets *rows_read to the number of rows
+ * read; the caller compares them.  The caller's transaction carries the writes:
+ * a failure is an error, which rolls everything back.
+ */
+extern int64 kingres_shard_copy_routed(Oid source, const char *dest_schema, const char *dest_table,
+									   KsDestKind kind, const KsColocation *placement,
+									   const char *key_column, int node_id, int64 *rows_read);
+
+#endif							/* KINGRES_SHARD_COPY_ROUTED_H */

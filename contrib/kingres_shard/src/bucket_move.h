@@ -20,7 +20,8 @@
  * Raise an error if a bucket of the colocation group is being moved (a move
  * that has not reached "cleaning").  Called under the cluster lock by the
  * statements that must not run then: DDL on a table of the group and the
- * creation of a table in it.
+ * creation of a table in it.  A table operation that claims the group (0.7,
+ * kingres.table_operation_lock) is refused the same way.
  */
 extern void kingres_shard_assert_no_move(int colocation_id);
 

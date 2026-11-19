@@ -71,7 +71,7 @@ sub clean_state
 	for my $nd (@$nodes)
 	{
 		my $mine = $nd->safe_psql('postgres', qq{SET kingres_shard.enable_routing = off;
-			SELECT count(*) FROM $table k JOIN kingres.bucket_map m ON m.colocation_id = 1 AND m.bucket = kingres.bucket_for(1, k.id) WHERE m.group_id = $i});
+			SELECT count(*) FROM $table k JOIN kingres.bucket_map m ON m.colocation_id = (SELECT colocation_id FROM kingres.dist_table WHERE relid = 'public.src'::regclass) AND m.bucket = kingres.bucket_for((SELECT colocation_id FROM kingres.dist_table WHERE relid = 'public.src'::regclass), k.id) WHERE m.group_id = $i});
 		my $total = $nd->safe_psql('postgres', "SET kingres_shard.enable_routing = off; SELECT count(*) FROM $table");
 		$wrong += $total - $mine;
 		$all += $total;
@@ -85,7 +85,7 @@ sub clean_state
 sub bucket_of
 {
 	my ($node, $group) = @_;
-	return $node->safe_psql('postgres', "SELECT min(bucket) FROM kingres.bucket_map WHERE colocation_id = 1 AND group_id = $group");
+	return $node->safe_psql('postgres', "SELECT min(bucket) FROM kingres.bucket_map WHERE colocation_id = (SELECT colocation_id FROM kingres.dist_table WHERE relid = 'public.src'::regclass) AND group_id = $group");
 }
 
 # Run $stmt on node 1 up to the fault point; run $during; let it go; returns (out, err).
@@ -269,7 +269,7 @@ for my $nd (@nodes) { release_node($nd); }
 	my @m = setup3('ie1', logical => 1);
 	my $m1 = $m[0];
 	my $b = bucket_of($m1, 1);
-	my ($out, $err) = with_gate($m1, 'insel_before_group', $P6, sub { $m1->safe_psql('postgres', "SELECT kingres.move_bucket(1, $b, 2)") }, 'e1');
+	my ($out, $err) = with_gate($m1, 'insel_before_group', $P6, sub { $m1->safe_psql('postgres', "SELECT kingres.move_bucket((SELECT colocation_id FROM kingres.dist_table WHERE relid = 'public.src'::regclass), $b, 2)") }, 'e1');
 	like($err, $KS, 'a bucket that moved between the plan and the run fails the statement with the retryable error');
 	clean_state(\@m, 'public.dst', 0, 'after the failed statement');
 	my ($rc, $o2, $e2) = run_sql($m1, $P6);
@@ -284,13 +284,13 @@ for my $nd (@nodes) { release_node($nd); }
 	my $b = bucket_of($m1, 0);
 	my $mover;
 	my ($out, $err) = with_gate($m1, 'insel_after_group', $P6, sub {
-			$mover = start_psql($m1, "SELECT kingres.move_bucket(1, $b, 1)");
+			$mover = start_psql($m1, "SELECT kingres.move_bucket((SELECT colocation_id FROM kingres.dist_table WHERE relid = 'public.src'::regclass), $b, 1)");
 			sleep(4);
 		}, 'e2');
 	unlike($err, qr/ERROR/, 'the statement is not disturbed by the move of a bucket of the origin: the switch waits for it');
 	my ($mo, $me) = finish_psql($mover);
 	unlike($me, qr/ERROR/, '... and the move completes after it') or diag($me);
-	is($m1->safe_psql('postgres', "SELECT group_id FROM kingres.bucket_map WHERE colocation_id = 1 AND bucket = $b"), 1, 'the bucket is in its new group');
+	is($m1->safe_psql('postgres', "SELECT group_id FROM kingres.bucket_map WHERE colocation_id = (SELECT colocation_id FROM kingres.dist_table WHERE relid = 'public.src'::regclass) AND bucket = $b"), 1, 'the bucket is in its new group');
 	clean_state(\@m, 'public.dst', $ROWS, 'after the statement and the move');
 	release_node($_) for @m;
 }
@@ -301,7 +301,7 @@ for my $nd (@nodes) { release_node($nd); }
 	my $b = bucket_of($m1, 2);
 	my $mover;
 	my ($out, $err) = with_gate($m1, 'insel_before_recheck', $P6, sub {
-			$mover = start_psql($m1, "SELECT kingres.move_bucket(1, $b, 1)");
+			$mover = start_psql($m1, "SELECT kingres.move_bucket((SELECT colocation_id FROM kingres.dist_table WHERE relid = 'public.src'::regclass), $b, 1)");
 			sleep(4);
 		}, 'e3');
 	my ($mo, $me) = finish_psql($mover);
@@ -327,7 +327,7 @@ for my $nd (@nodes) { release_node($nd); }
 	$s->query_safe(q{PREPARE pi AS INSERT INTO public.dst SELECT id, v FROM public.src ON CONFLICT DO NOTHING});
 	$s->query_safe('EXECUTE pi') for (1 .. 6);
 	$s->query_safe('DELETE FROM public.dst');
-	$m1->safe_psql('postgres', "SELECT kingres.move_bucket(1, $b, 2)");
+	$m1->safe_psql('postgres', "SELECT kingres.move_bucket((SELECT colocation_id FROM kingres.dist_table WHERE relid = 'public.src'::regclass), $b, 2)");
 	$s->query_safe('SET plan_cache_mode = force_generic_plan');
 	$s->{stderr} = '';
 	$s->query('EXECUTE pi');
