@@ -613,7 +613,11 @@ func (s *Service) Report(ctx context.Context, id int64) (Report, error) {
 		}
 		rows.Close()
 		for _, g := range grows {
-			out.Groups = append(out.Groups, groupReport(g))
+			gr := groupReport(g)
+			if st := liveOldPrimary(ctx, c, g); st != "" {
+				gr.OldPrimary.State = st
+			}
+			out.Groups = append(out.Groups, gr)
 		}
 		ev, err := c.Query(ctx, `SELECT at, group_id, coalesce(step, ''), kind, coalesce(detail::text, '') FROM kingres_cp.failover_event WHERE task_id = $1 ORDER BY seq`, id)
 		if err != nil {
@@ -673,6 +677,62 @@ func groupReport(g GroupRow) GroupReport {
 	default:
 		op.State = g.OldPrimary
 	}
+	if len(g.OldPrimaryReport) > 0 {
+		var rep struct {
+			Method          string `json:"method"`
+			DivergenceBytes *int64 `json:"divergenceBytes"`
+			RewindBytes     *int64 `json:"rewindBytes"`
+			Message         string `json:"message"`
+		}
+		if json.Unmarshal(g.OldPrimaryReport, &rep) == nil {
+			if rep.Method != "" {
+				op.Method = &rep.Method
+			}
+			op.DivergenceBytes, op.RewindBytes = rep.DivergenceBytes, rep.RewindBytes
+			if rep.Message != "" {
+				op.Message = &rep.Message
+			}
+		}
+	}
 	r.OldPrimary = op
 	return r
+}
+
+// liveOldPrimary reads the state of the old primary of a finished group from the record of the standby it became
+// (design 3.8, "read live"): standby once it is rebuilt, rebuilding while the reconcile task works, waitingForServer
+// while its server does not answer, rebuildScheduled before the first try, removed when its record is gone (the
+// replace-after rule, or the removal of the server), failed when the rebuild is overdue. "" keeps the stored state
+// (the group is not done: nothing was scheduled yet).
+func liveOldPrimary(ctx context.Context, c *pgx.Conn, g GroupRow) string {
+	if g.State != "done" || g.OldServer == "" {
+		return ""
+	}
+	var state string
+	var diverged bool
+	var waiting *time.Time
+	var created time.Time
+	err := c.QueryRow(ctx, `SELECT state, diverged, waiting_since, created_at FROM kingres_cp.standby WHERE group_id = $1 AND server_id = $2`, g.Group, g.OldServer).
+		Scan(&state, &diverged, &waiting, &created)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if g.OldPrimary == "" || g.OldPrimary == "rebuildNotScheduled" {
+			return ""
+		}
+		return "removed"
+	}
+	if err != nil {
+		return ""
+	}
+	switch {
+	case state == "removing":
+		return "removed"
+	case state == "ready" && !diverged:
+		return "standby"
+	case waiting != nil:
+		return "waitingForServer"
+	}
+	var running bool
+	if err := c.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM kingres_cp.task WHERE kind = 'standby.reconcile' AND state = 'running')`).Scan(&running); err == nil && running {
+		return "rebuilding"
+	}
+	return "rebuildScheduled"
 }

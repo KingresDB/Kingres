@@ -49,6 +49,9 @@ func (s *Server) handlers() map[string]handlerFunc {
 	for k, v := range s.ledgerSigningHandlers() {
 		m[k] = v
 	}
+	for k, v := range s.ledgerPublicationHandlers() {
+		m[k] = v
+	}
 	for k, v := range s.coreHandlers() {
 		m[k] = v
 	}

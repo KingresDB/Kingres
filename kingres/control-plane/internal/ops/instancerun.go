@@ -110,6 +110,14 @@ func (o *Ops) openTask(ctx context.Context, rec TaskRecorder, t task.Task) (out 
 		// stop or restart must not run now, and it is not kept in memory to run later.
 		return task.Task{}, false, problem.New(problem.FailoverInProgress, "A failover of this instance's shard group is in progress; try again when it has finished.")
 	}
+	// A stop or a restart of a primary that a lease protects does not run on a record that cannot be written: the record
+	// is where migrations 0013 and 0014 refuse it while a failover of its group is unfinished, and a server that cannot
+	// reach the leader is exactly the one a failover is for (F2-09). A start, which never endangers a copy, is kept in
+	// memory as before.
+	if (t.Kind == KindInstanceStop || t.Kind == KindInstanceRestart) && o.EnforcedPrimary != nil && o.EnforcedPrimary() {
+		o.Log.Warn("a stop or restart is refused: its record cannot be written and this server runs the primary of a group with a standby", "kind", t.Kind, "error", err)
+		return task.Task{}, false, problem.New(problem.ServiceUnavailable, "The operation cannot be recorded now, and this server runs the primary of a shard group that has a standby; try again when the leader can be reached.").WithRetryAfter(5)
+	}
 	o.Log.Warn("the task of an instance operation cannot be written now; it is kept in memory", "kind", t.Kind, "error", err)
 	if t.ID == 0 {
 		t.ID = o.nextTaskID()

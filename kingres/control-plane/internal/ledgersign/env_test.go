@@ -91,6 +91,8 @@ type env struct {
 	autorun  bool
 	started  []task.Task
 	resigned int
+	pubFail  string          // what the collector says about signing (PublicationFailure)
+	removed  map[string]bool // servers that left the cluster (IsMember)
 	fault    task.FaultFunc
 }
 
@@ -163,7 +165,9 @@ func (e *env) rebuild() {
 			}
 			return tk, nil
 		},
-		Resign: func(context.Context, ledgerkeys.Set) error { e.resigned++; return nil },
+		Resign:             func(context.Context, ledgerkeys.Set) error { e.resigned++; return nil },
+		PublicationFailure: func() string { return e.pubFail },
+		IsMember:           func(_ context.Context, s string) (bool, error) { return !e.removed[s], nil },
 		Alert: func(_ context.Context, kind, sev, subj, msg string, raise bool) {
 			e.alerts = append(e.alerts, kind+"/"+map[bool]string{true: "raise", false: "clear"}[raise]+"/"+msg)
 		},

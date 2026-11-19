@@ -8,7 +8,7 @@ node as reference tables, and makes every statement correct on a cluster with
 several groups: a statement that touches one key goes to the group that owns
 it, and a statement that spans groups is answered by reading the other groups.
 
-This is version 0.5 (0.3 added moving buckets, phase 2a made every statement correct, 0.4 is the fix round of the reviews of 0.2 and 0.3, 0.5 is high availability: standby nodes, `promote_node`, prepared transactions across a failover, distributed deadlock detection and coordinated restore points; see "High availability" below). Phase 2b will make the common
+This is version 0.6 (0.3 added moving buckets, phase 2a made every statement correct, 0.4 is the fix round of the reviews of 0.2 and 0.3, 0.5 is high availability: standby nodes, `promote_node`, prepared transactions across a failover, distributed deadlock detection and coordinated restore points; see "High availability" below; 0.6 is phase 2b and adds no SQL object, see "Installation" for why the version is raised). Phase 2b makes the common
 statements fast. The designs are in
 [`kingres/docs/design/shard-mvp.md`](../../kingres/docs/design/shard-mvp.md)
 (phase 1) and
@@ -47,10 +47,15 @@ describes what is implemented and how to use it.
   - an `UPDATE` or `DELETE` of one distributed table that spans groups and can be
     shipped whole is run on every group that owns buckets of the table;
   - a write to a reference table is run on every node;
-  - an `INSERT` whose rows belong to several groups (a multi-row `VALUES`,
-    `INSERT ... SELECT`, a single row whose key is computed) and `COPY ... FROM`
-    are run by the row router, which sends each row to the group that owns its
-    bucket in batches ("Bulk writes through the row router" below);
+  - an `INSERT ... SELECT` whose target and sources are colocated and joined on the
+    distribution key is shipped whole to every group, which reads and writes its own
+    buckets (no row passes through this node); `ON CONFLICT DO UPDATE` is allowed
+    there ("Colocated INSERT ... SELECT" below);
+  - any other `INSERT` whose rows belong to several groups (a multi-row `VALUES`,
+    an `INSERT ... SELECT` that is not colocated, a single row whose key is
+    computed) and `COPY ... FROM` are run by the row router, which sends each row
+    to the group that owns its bucket in batches ("Bulk writes through the row
+    router" below);
   - anything else (an `UPDATE` or `DELETE` that cannot be shipped, an insert that the
     router does not take) is refused with a "not supported yet" error that says what
     to change.
@@ -167,14 +172,27 @@ describes what is implemented and how to use it.
   database, so every node needs a role of that name, and `pg_hba.conf` (and the
   password file, if used) must let the nodes in. Credentials are never stored
   in the catalog. SSL options are set with `kingres_shard.node_conninfo`.
-- `CREATE EXTENSION kingres_shard` installs version 0.5;
-  `ALTER EXTENSION kingres_shard UPDATE` upgrades a 0.1, 0.2, 0.3 or 0.4 installation (the
-  catalog is identical to a fresh 0.5 one; the `upgrade` regression test
-  compares the two). Transactions that 0.4 prepared and that are pending at the upgrade
-  are resolved in the old identifier format (see "Prepared transactions across a
-  failover").
+- `CREATE EXTENSION kingres_shard` installs version 0.6;
+  `ALTER EXTENSION kingres_shard UPDATE` upgrades a 0.1, 0.2, 0.3, 0.4 or 0.5 installation
+  (the chain is 0.1 -> 0.2 -> 0.3 -> 0.4 -> 0.5 -> 0.6, and the catalog is identical to a
+  fresh 0.6 one; the `upgrade` regression test compares the two). Transactions that 0.4
+  prepared and that are pending at the upgrade are resolved in the old identifier format
+  (see "Prepared transactions across a failover").
+- **Version 0.6 adds no table, view, function or column.** `kingres_shard--0.5--0.6.sql` holds
+  one statement, which makes the check of the node versions before a bucket move ask for 0.6
+  (the function exists already; only its text names the version). The version is raised
+  because the nodes of a cluster must run the same protocol between them (the fragments that
+  phase 2b sends), and `add_node`, the placement check and `move_bucket()` refuse a node that
+  runs another version.
+- **Rolling upgrade from 0.5 to 0.6.** Nodes of 0.6 and nodes of 0.5 cannot cooperate on the
+  new fragments. Until the last node is upgraded, set `kingres_shard.enable_pushdown`,
+  `kingres_shard.enable_bulk_routing` and `kingres_shard.enable_copy_routing` to `off` on
+  every node (per session or in `postgresql.conf`), and set them back to `on` when the last
+  node is upgraded. Of these, `enable_bulk_routing` and `enable_copy_routing` exist today;
+  `enable_pushdown` comes with the step of phase 2b that adds pushdown, and until then there
+  is nothing to switch off for it. Then upgrade as described under "Upgrade order" below.
 - **Changes made to the 0.5 scripts in place.** 0.5 is not released, so its install script and its
-  `0.4--0.5` script change as the reviews find things, and the version stays 0.5. A database that
+  `0.4--0.5` script change as the reviews find things, and the version stays 0.5 (0.6 does not repair such a database either). A database that
   installed an earlier build of 0.5 has no update path to the later one (`ALTER EXTENSION ... UPDATE`
   does nothing for the same version). What changed in place, and what such a database needs:
   `kingres.pending_node.node_id` (added for `remove_node`, S11-05). Without it `add_node`,
@@ -206,12 +224,12 @@ describes what is implemented and how to use it.
   new files on every node, restart them one after the other, run `ALTER EXTENSION
   ... UPDATE` on every node at once and soon after, and do not start a bucket move
   before it is done: `move_bucket()` refuses unless every active primary reports
-  extension version 0.5, and names the node that does not. An older library does not
+  extension version 0.6, and names the node that does not. An older library does not
   accept the session of a newer one (the proof of a node-to-node session differs between
   versions), which looks like a lost connection; `check_cluster()` and `move_bucket()`
   ask for the version over a session that claims nothing when that happens, so they name
   both versions (`extension_version_differs`, "has kingres_shard 0.4, a bucket move needs
-  0.5") and do not call the node unreachable (review finding S6-06). A node that cannot
+  0.6") and do not call the node unreachable (review finding S6-06). A node that cannot
   be asked either is `node_unreachable`.
 
 ## Building and testing
@@ -245,7 +263,7 @@ PROVE_TESTS=t/013_dist_scan.pl kingres/dev/ext.sh kingres_shard tap
   second, fictitious shard group; `routing_decisions`: collations, functions
   and other nested contexts, forwarded sessions, decided with `EXPLAIN`;
   `reference`: reference tables on one node; `upgrade`: `ALTER EXTENSION ...
-  UPDATE` from 0.1, 0.2, 0.3 and 0.4 against a fresh 0.5 install; the same on both majors:
+  UPDATE` from 0.1, 0.2, 0.3, 0.4 and 0.5 against a fresh 0.6 install; the same on both majors:
   the script of 0.3 names a column of `pg_stat_subscription_stats` that PostgreSQL 19
   renamed, so on 19 it creates `kingres.internal_move_subscription_status()` with its
   body check off and `ALTER EXTENSION ... UPDATE` to 0.4 replaces it with a body that
@@ -511,6 +529,7 @@ the files of the extension, because the dump creates the extension.
 | `kingres_shard.enable_distributed_scan` | on | When off, a `SELECT` that spans shard groups raises the phase 1 error instead of reading the other groups (to forbid slow cross-group queries). |
 | `kingres_shard.scan_fetch_size` | 1000 | Rows requested from another group at a time by the distributed scan. |
 | `kingres_shard.enable_bulk_routing` | on | Off: an `INSERT` that goes to several shard groups is refused as in 0.5 (a multi-row `VALUES`, `INSERT ... SELECT`, a single row whose key is not a constant). A single row with a constant key never needed the router and is not affected. `USERSET`; it grants nothing. |
+| `kingres_shard.enable_colocated_insert_select` | on | Off: a colocated `INSERT ... SELECT` is not shipped whole: it goes through the row router when it can (no `ON CONFLICT DO UPDATE`) and is refused when it cannot. `USERSET`; it chooses among statements that give the same answer, and grants nothing. A cached plan keeps the path it was made with (as for every planner setting). |
 | `kingres_shard.enable_copy_routing` | on | Off: `COPY ... FROM` into a distributed table of a cluster with several groups is refused as in 0.5. `USERSET`. |
 | `kingres_shard.insert_batch_rows` | 1000 | Rows per batch that the row router sends to one group (1 to 100000). |
 | `kingres_shard.insert_batch_bytes` | 1MB | Text bytes per batch per group, the sum of the lengths of the values (16kB to 64MB). The memory of a bulk write is about two batches per group, whatever the number of rows. |
@@ -1086,7 +1105,8 @@ statement) with `BeginCopyFrom` and `NextCopyFrom`. **Refused**: `FREEZE`, `WHER
 bucket partition named directly. The error context names the line and the column. `pg_stat_progress_copy`
 is not updated.
 
-**Still refused for `INSERT`**: `ON CONFLICT DO UPDATE`, a `WITH` clause on the statement (put it inside the
+**Still refused for `INSERT`** (through the router; a colocated `INSERT ... SELECT` is shipped whole and
+allows `DO UPDATE`, see the next section): `ON CONFLICT DO UPDATE`, a `WITH` clause on the statement (put it inside the
 `SELECT`), `RETURNING` with `OLD`/`NEW` or an expression that is not shippable, an insert that reads a
 security barrier view or a view of another owner, an insert through a view `WITH CHECK OPTION` (the check
 would be lost), `session_replication_role` other than `origin`, a parallel
@@ -1100,6 +1120,67 @@ other session the same text is an ordinary statement and is routed like one.
 
 **New SQLSTATEs and messages.** None. `KS001` is raised for the changes of placement named above; the
 refusals use `0A000`. The messages of the refused forms are listed in `sql/bulk_plans.sql`.
+
+## Colocated `INSERT ... SELECT`, shipped whole (phase 2b, step 5)
+
+When the target of an `INSERT ... SELECT` and every distributed table its `SELECT` reads are in one
+colocation group, and the `SELECT` is joined and restricted so that each row of its result is made on the
+group that owns it, the whole statement is sent to every group of the target and run there, inside the
+distributed transaction of the session: each group reads its own buckets and writes its own buckets, no row
+passes through this node, and the count and the `RETURNING` rows are the sums over the groups. The plan is the
+"Kingres Fan-out Write" custom scan with a line `Pushed: colocated INSERT ... SELECT`, and its `Remote SQL` is
+the text that the groups run, starting with the comment `/* kingres:insert-select-fragment place=<n> */`
+(`place` is the placement number of the colocation group, which a group compares with its own after planning).
+The switch is `kingres_shard.enable_colocated_insert_select`.
+
+**What qualifies.** All of these (the analysis is `src/pushdown.c`, shared with the later pushdown paths):
+
+- the target is a distributed table and every distributed table of the `SELECT` is of its colocation group;
+  reference tables may be joined anywhere an inner join, or the nullable side of an outer join, allows;
+- the distributed tables of the `SELECT` are joined by equalities of their distribution keys (in `WHERE`,
+  in an inner `ON`, or in the `ON` of the outer join whose two sides they are on): one key class;
+  an outer join keeps its preserved side distributed, and a `FULL JOIN` is shipped only between two
+  distributed sides;
+- the distribution column of the target is given directly by a key of that class (not an expression of it, and not
+  a key of a table on the nullable side of an outer join): the row is then made, and stored, on the same group;
+- the `SELECT` is closed: an aggregate, `DISTINCT`, or grouping is by a key of the class (a `SELECT` without
+  `GROUP BY` but with an aggregate is not shipped); no `LIMIT`, `OFFSET`, `DISTINCT ON`, window function,
+  sub-select, `WITH`, set operation, `FOR UPDATE`, view, function or `VALUES` in `FROM`;
+- every expression is built in and immutable, on built-in types, with the default or the `C` collation, as in
+  "Which statements are shipped" above; a column that the statement does not name must have a default
+  that is the same everywhere (a constant: the group applies it), and a serial, identity, volatile or stable
+  (`now()`) default is computed once, at this node, by the row router; the OID of a table or function that is
+  not built in (`'t'::regclass`) is not shipped;
+- the target has no trigger or rule of a user, no row-level security and no `WITH CHECK OPTION`; the sources have
+  no row-level security and are not read with the rights of another role.
+
+A statement that does not qualify takes the row router (or its refusals) exactly as before, with the same
+rows and errors; `SET client_min_messages = debug1` says why a statement was not shipped.
+
+**`ON CONFLICT`.** None, `DO NOTHING`, and `DO UPDATE` (with an inference clause or `ON CONSTRAINT`), under
+the rules of design 11.7: the `SET` list does not assign the distribution column; the `SET` and `WHERE`
+expressions are shippable and use only the target and `EXCLUDED`; every unique index of the target has the
+distribution column among its key columns (PostgreSQL already requires it of a partitioned table). Two
+rows conflict only if their keys are equal, so on the same group: the count, the `RETURNING` rows and the
+error "ON CONFLICT DO UPDATE command cannot affect row a second time" are those of one node, and the whole
+statement fails and rolls back everywhere. `DO SELECT` (PostgreSQL 19) is not shipped.
+
+**Consistency.** The groups commit together by the two-phase commit of the fan-out. A bucket that moves, or a group
+that changes its primary, between the plan and the end of the statement is `KS001` with every change rolled back
+(the plan number is compared before the first group runs, `place=` by each group after planning, and the
+placement of every group after the last one ran; a move of a bucket of a group that already ran waits for the
+transaction). A cached or generic plan checks at its start that its relations are still what they were
+(distributed in the same group, or reference). Each group runs the statement under one snapshot of its own,
+so a source read twice by the same statement is one state of that group; between groups the skew of the scan
+remains. A group that fails is reported as the remote error, or as `KS001` when it has a standby (a failover may
+be in progress).
+
+**What an operator sees.** `EXPLAIN` shows the line `Pushed:` and the text of the groups. The setting is
+`kingres_shard.enable_colocated_insert_select`; fault points `insel_before_group`, `insel_after_group` and
+`insel_before_recheck` exist for the tests. The groups run it in a session that this node opened, and refuse
+the same text in any other session as an ordinary statement; a forged fragment is `0A000`, a stale
+placement `KS001`. During a rolling upgrade set the switch off on every node (the groups must run the same
+version, which the placement probes of the scans check).
 
 ## Limitations in phase 2a
 

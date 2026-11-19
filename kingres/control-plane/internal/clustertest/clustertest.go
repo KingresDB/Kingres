@@ -209,6 +209,26 @@ func (n *Node) signal(hard bool) {
 	n.mu.Unlock()
 }
 
+// WaitExit waits up to d for the process to end by itself (a fault that ends it, as a kill does) and then forgets it, so that Start can run it
+// again. It is false when the process still runs.
+func (n *Node) WaitExit(d time.Duration) bool {
+	n.mu.Lock()
+	exited := n.exited
+	n.mu.Unlock()
+	if exited == nil {
+		return true
+	}
+	select {
+	case <-exited:
+		n.mu.Lock()
+		n.cmd = nil
+		n.mu.Unlock()
+		return true
+	case <-time.After(d):
+		return false
+	}
+}
+
 // Running reports whether the process runs.
 func (n *Node) Running() bool {
 	n.mu.Lock()
@@ -560,6 +580,25 @@ func FormWithExtra(t testing.TB, n int, extra []string, before func(leader *Node
 	c := New(t, n)
 	for _, nd := range c.Nodes {
 		nd.Extra = append([]string(nil), extra...)
+	}
+	for _, nd := range c.Nodes {
+		nd.Start()
+	}
+	c.Leader().InitCluster("multi")
+	if before != nil {
+		before(c.Leader())
+	}
+	c.joinRest(t, 1)
+	return c
+}
+
+// FormWithNodeExtra is FormWithExtra where the extra flags of each node are chosen by a function (a setting that must differ per node, such as an
+// address to listen on).
+func FormWithNodeExtra(t testing.TB, n int, extra func(nd *Node) []string, before func(leader *Node)) *Cluster {
+	t.Helper()
+	c := New(t, n)
+	for _, nd := range c.Nodes {
+		nd.Extra = append([]string(nil), extra(nd)...)
 	}
 	for _, nd := range c.Nodes {
 		nd.Start()

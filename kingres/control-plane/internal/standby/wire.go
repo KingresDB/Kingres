@@ -68,7 +68,11 @@ type CreateRequest struct {
 
 // CreateResponse is the answer: the port the instance listens on.
 type CreateResponse struct {
-	Port int `json:"port"`
+	// InstanceID is the directory the standby is in, when the server found it (the former primary of a group: the
+	// leader did not know its directory); OldPrimary what the rebuild of an old primary found and did.
+	InstanceID int             `json:"instanceId,omitempty"`
+	OldPrimary *OldPrimaryInfo `json:"oldPrimary,omitempty"`
+	Port       int             `json:"port"`
 }
 
 // RemoveRequest is the body of POST /standby/remove: stop and delete the
@@ -83,6 +87,9 @@ type RemoveRequest struct {
 type RebuildRequest struct {
 	Entry    Entry `json:"entry"`
 	Diverged bool  `json:"diverged,omitempty"`
+	// Term is the catalog term the leader asks under: the old primary of a group is rebuilt only when it is newer than
+	// the one the role file of its directory was written under.
+	Term int64 `json:"term,omitempty"`
 }
 
 // LocalStatus is what a server knows of one standby instance it runs.

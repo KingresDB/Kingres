@@ -156,7 +156,18 @@ func TestAReleaseWaitsForTheRenewalInFlight(t *testing.T) {
 	}
 	released := make(chan error, 1)
 	go func() { _, err := r.m.ReleaseGroup(ctx, 1); released <- err }()
-	time.Sleep(300 * time.Millisecond)
+	// The release has started when it has marked the group (it does so before it waits for the round in flight): wait
+	// for that condition, with a bound, instead of a fixed time (F2-16). From then on it can only be blocked behind
+	// the round that holds the gate, and the negative check below looks at it for a short window.
+	for deadline := time.Now().Add(5 * time.Second); !r.m.Relinquished(1) && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+	}
+	if !r.m.Relinquished(1) {
+		t.Fatal("the release did not start")
+	}
+	for deadline := time.Now().Add(200 * time.Millisecond); asked() == base+2 && time.Now().Before(deadline); {
+		time.Sleep(5 * time.Millisecond)
+	}
 	if n := asked(); n != base+2 {
 		t.Fatalf("the release sent its requests while a renewal was in flight (%d asks, want %d)", n, base+2)
 	}

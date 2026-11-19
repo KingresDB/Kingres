@@ -117,6 +117,11 @@ type Config struct {
 	// environment or the command line.
 	LedgerKeysDir           string
 	LedgerKeyPassphraseFile string
+	// LedgerPublicationListen is the address of the HTTP listener that serves the publication of the ledger (design 4.5; empty: no listener).
+	// With LedgerPublicationTLSCert and LedgerPublicationTLSKey it serves TLS; without them plain HTTP, and the console warns.
+	LedgerPublicationListen  string
+	LedgerPublicationTLSCert string
+	LedgerPublicationTLSKey  string
 	// HA are the settings of high availability (see ha.go).
 	HA HAConfig
 }
@@ -227,6 +232,12 @@ var settings = []setting{
 		apply: str(func(c *Config) *string { return &c.LedgerKeysDir })},
 	{key: "ledger-key-passphrase-file", env: "KINGRES_LEDGER_KEY_PASSPHRASE_FILE", usage: "file (mode 0600) with the passphrase that seals the signing key files of the ledger; without it the key files are in clear text",
 		apply: str(func(c *Config) *string { return &c.LedgerKeyPassphraseFile })},
+	{key: "ledger-publication-listen", env: "KINGRES_LEDGER_PUBLICATION_LISTEN", usage: "address (host:port) of the listener that serves the published ledger (tiles, checkpoints; public, no authentication); empty: no listener",
+		apply: str(func(c *Config) *string { return &c.LedgerPublicationListen })},
+	{key: "ledger-publication-tls-cert", env: "KINGRES_LEDGER_PUBLICATION_TLS_CERT", usage: "TLS certificate file of the publication listener (with ledger-publication-tls-key)",
+		apply: str(func(c *Config) *string { return &c.LedgerPublicationTLSCert })},
+	{key: "ledger-publication-tls-key", env: "KINGRES_LEDGER_PUBLICATION_TLS_KEY", usage: "TLS private key file of the publication listener",
+		apply: str(func(c *Config) *string { return &c.LedgerPublicationTLSKey })},
 	{key: "pg-port", env: "KINGRES_PG_PORT", usage: "TCP port of the managed instance",
 		apply: func(c *Config, v string) error {
 			n := int64(0)
@@ -436,6 +447,12 @@ func (c *Config) Validate() error {
 	}
 	if (c.TLSCertFile == "") != (c.TLSKeyFile == "") {
 		errs = append(errs, errors.New("tls-cert-file and tls-key-file must be set together"))
+	}
+	if (c.LedgerPublicationTLSCert == "") != (c.LedgerPublicationTLSKey == "") {
+		errs = append(errs, errors.New("ledger-publication-tls-cert and ledger-publication-tls-key must be set together"))
+	}
+	if c.LedgerPublicationListen == "" && c.LedgerPublicationTLSCert != "" {
+		errs = append(errs, errors.New("ledger-publication-tls-cert needs ledger-publication-listen"))
 	}
 	if c.SocketDir == "" {
 		c.SocketDir = filepath.Join(c.DataDir, "run")

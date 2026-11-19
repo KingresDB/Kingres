@@ -59,6 +59,8 @@ func (m *Manager) RemoveServer(ctx context.Context, actor, id string) (task.Task
 func (m *Manager) removeDefinition() task.Definition {
 	return task.Definition{Kind: KindRemove, Steps: []task.Step{
 		{Name: "Check that the server owns no buckets", Run: m.stepRemoveCheck},
+		// A chain on a group that goes with the server cannot vanish silently: its publication ends with an event (design 5.5).
+		{Name: "End the publication of the ledger chains of the server", Run: m.stepRemoveLedger},
 		{Name: "Remove the standbys of the server", Run: m.stepRemoveStandbys},
 		{Name: "Unregister the server in every database", Run: m.stepRemoveUnregister},
 		{Name: "Remove the server from the managed rules of the others", Run: m.stepRemoveTrust},
@@ -253,4 +255,20 @@ func (m *Manager) stepRemoveStandbys(ctx context.Context, env *task.Env) error {
 		return fmt.Errorf("removing the standbys of the server: %w", err)
 	}
 	return nil
+}
+
+// stepRemoveLedger ends the publication of the ledger chains of the groups whose primary runs on the server (design 5.5): the hook
+// of the removal of a group. It does nothing when the ledger is not published or the server runs no group with a published chain.
+func (m *Manager) stepRemoveLedger(ctx context.Context, env *task.Env) error {
+	if m.LedgerRetire == nil {
+		return task.Skip("this server does not publish the ledger")
+	}
+	in, err := inputOf[removeInput](env.Task)
+	if err != nil {
+		return err
+	}
+	if _, err := m.getServer(ctx, in.ServerID); errors.Is(err, errNoServer) {
+		return nil // an earlier run already finished
+	}
+	return m.LedgerRetire(ctx, in.ServerID)
 }

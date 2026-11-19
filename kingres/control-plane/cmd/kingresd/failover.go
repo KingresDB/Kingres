@@ -592,7 +592,7 @@ func (p *foPlanner) Preferred(ctx context.Context, group int32, server string) b
 
 func (p *foPlanner) Ring(from, to string) int { return 0 }
 
-func (p *foPlanner) AfterPromotion(ctx context.Context, group int32, promoted failover.StandbyRec, newServer string, newPort int) error {
+func (p *foPlanner) AfterPromotion(ctx context.Context, group int32, promoted failover.StandbyRec, newServer string, newPort int, old failover.OldPrimaryRec) error {
 	err := p.sys(ctx, func(c *pgx.Conn) error {
 		tx, err := c.Begin(ctx)
 		if err != nil {
@@ -608,6 +608,22 @@ func (p *foPlanner) AfterPromotion(ctx context.Context, group int32, promoted fa
 		}
 		if _, err := tx.Exec(ctx, `UPDATE kingres_cp.standby SET primary_server = $2, updated_at = now() WHERE group_id = $1`, group, newServer); err != nil {
 			return err
+		}
+		// The old primary is a standby that waits to be rebuilt (design 3.3 F9, 6.1): its record is inserted in the same
+		// transaction, rebuilding and diverged, with the generation one higher than it had (a repeated step finds it and
+		// changes nothing but the primary). Its directory (0: its server finds it), its port and its node are the ones the
+		// failover knows; the registration step finds the node the catalog kept for it.
+		if old.Server != "" && old.Server != newServer {
+			var id int64
+			if err := tx.QueryRow(ctx, `INSERT INTO kingres_cp.standby (group_id, server_id, primary_server, instance_id, port, slot_name, state, needs_rebuild, diverged, generation)
+				VALUES ($1, $2, $3, $4, nullif($5, 0), 'pending', 'rebuilding', true, true, 1)
+				ON CONFLICT (group_id, server_id) DO UPDATE SET primary_server = EXCLUDED.primary_server, updated_at = now()
+				RETURNING standby_id`, group, old.Server, newServer, old.InstanceID, old.Port).Scan(&id); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `UPDATE kingres_cp.standby SET slot_name = $2 WHERE standby_id = $1`, id, standby.SlotName(id)); err != nil {
+				return err
+			}
 		}
 		return tx.Commit(ctx)
 	})
@@ -836,6 +852,14 @@ func handleFailoverPromote(ctx context.Context, d *haDeps, body []byte) (any, er
 		return nil, notStarted
 	}
 	started := time.Now()
+	// The promotion runs under the standby agent's lifecycle lock: the agent proves that a directory is a standby and
+	// removes or rebuilds it under the same lock, so a removal cannot be between the proof and the delete while this
+	// instance is promoted (F2-08). The role is read after the lock is taken.
+	unlock, lerr := d.Standby.agent.LockLifecycle(ctx)
+	if lerr != nil {
+		return nil, &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "A create, remove or rebuild of a standby is running on this server; repeat the call."}
+	}
+	defer unlock()
 	var li *cluster.LocalInstance
 	for _, x := range d.Svc.LocalInstances() {
 		x := x

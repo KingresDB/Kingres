@@ -2814,7 +2814,58 @@ build to the corrected rule. The verifier's README has the same list with the re
 136. **A forwarded answer keeps its `Content-Disposition`**, which the download of the trust file
     through a follower needs.
 
-The numbers 137 to 149 are kept for the collector and the publication (steps 5 and 6).
+137. **The order of a round and what a checkpoint may be (replaces step 5 of 4.5).** Each write of a
+    round is a transaction of its own that begins with the term guard, in the order: append,
+    frontier, signature, checkpoint. A checkpoint is refused when it is not for the stored size and
+    root, when it is for a smaller tree, when it would be a second root for a size, or when the log
+    is not active.
+138. **Signing and retiring exclude each other (the duty of 129), as one mechanism.** A key whose
+    `key-retired` event exists is not offered for signing. A checkpoint is stored only while the
+    revision of the key set equals the one the signers were read at, and every change of the key
+    set, an event included, raises the revision. Both commits of a retirement carry the bound and
+    check it under the guard; the step that retires ends with `bound_exceeded` when a checkpoint
+    above the bound was stored meanwhile.
+139. **The first checkpoint belongs to the collector.** The store of the keys never writes the time
+    of the first checkpoint back and never changes the origin prefix once it is set: a key change
+    that had read the row before the first checkpoint was stored would have unlocked the prefix.
+140. **A deadlock or a serialization failure is "busy", never a conflict.** Otherwise a key task
+    that commits at the same moment would stop a log as diverged.
+141. **What is a divergence (4.7).** A head below the published size; a head block that is not the
+    published block at its height; a first block read that is not the last published one; an entry
+    that is not a header, or blocks that do not link; tiles that differ. A diverged log never wakes
+    up, also when the chain returns to the published history. A group that now holds another chain
+    gets `chain-replaced`: the old log is retired and a new one is made.
+142. **The aggregate leaf holds a time**, so it is stored in the row of the log before it is
+    appended, and the repair after a crash appends the same bytes.
+143. **The aggregate log is never closed (replaces the sentence of 5.5).** A dropped database ends
+    with one leaf in which every member is `retired`; a database of the same name continues the log.
+    `retired` appears in exactly one leaf per chain, and the next leaf leaves the chain out.
+144. **`ledger/read` names the group.** A group that gives an error, or has no ledger or no
+    database, is "not covered": its members are `stale`, the digest says `complete: false` and names
+    it. When no group answers, the answer is 503.
+145. **Digests.** `listLedgerDigests` lists the stored views, with identifiers of their own; the
+    older digests of the extension stay in each database and are not listed. `generateLedgerDigest`
+    waits up to 20 seconds for the term of a new leader before it answers 503.
+146. **The listener** serves whatever is stored while it runs, also when the publication is switched
+    off. `keyring.json` is the trust file. Partial tiles are kept (no pruning after 24 hours). 429
+    per address, 503 at the cap of concurrent requests.
+147. **The event `chain-retired`.** Its subject is `<chain>:<epoch>`; its lines are `chain`, `epoch`,
+    `final-height`, `final-block-hash` and `reason`, one of `dropped`, `group-removed`,
+    `database-missing` and `chain-replaced`.
+148. **A database that disappears without `dropDatabase` (decided here, as section 10 left it to
+    step 6).** A database can be dropped from SQL by its owner, where no hook of the control plane
+    sees it. When every group answers "no database" in two rounds in a row, the collector retires
+    its chains with the reason `database-missing`: a signed event, one leaf with `retired` members,
+    closed logs, no divergence alert; the event states the last published head, since the database
+    is gone. An auditor tells it from a rollback, which stays `diverged` with a critical alert and
+    the old head. One group that answers "no database" while others answer is only a group that was
+    not read. Rejected: changing who owns databases or revoking the right to drop (it changes
+    existing databases); an event trigger (`DROP DATABASE` fires none); treating it as a rollback (a
+    deletion could not be told from a restore); doing nothing (a log that is stale for ever).
+149. **Limits and ownership.** A round appends at most 9 999 blocks (the first block read is the
+    last published one), and rounds run one database after another. The alert
+    `ledgerSignerUnavailable` has one owner, the check job of the key service, which also asks the
+    collector after two rounds that could not sign.
 
 150. **The switch to `required` is ordered with the writers by a table lock (replaces what 113 says
     about a transaction that was running; adds to 108, 110 and 117).** `ledger_set_signature_policy`
@@ -2866,6 +2917,55 @@ The numbers 137 to 149 are kept for the collector and the publication (steps 5 a
     logical replication cannot hold a table whose policy is `required` (the apply fails with
     `KL010`). A commit callback of another module that was registered before this library's could
     write after the check.
+
+The number 159 is not used.
+
+160. **The inputs of `attestation` (7.4).** The proof of the attestation row is a proof of the usual
+    format in a file of its own, with the columns file of the row. The verifier cannot know which
+    table is the table of attestations (111: no number is assumed), so the table identifiers of the
+    attestations and of the revocations are flags, and the output says that they are claims of the
+    server; the signature under a key the auditor pinned is what a row of another table cannot have.
+    `bundle.json` names the columns file beside the attestation file.
+161. **The attestation row is in the block of its entry (3.7).** `ledger_attest` runs in the
+    transaction of the entry and a transaction is in one block, so the attestation row must name the
+    transaction and the sequence number of the entry and be in the same block.
+162. **The flags of an aggregate member (5.5, 5.6).** `diverged` is status 1: the publisher says the
+    chain was rolled back or rewritten, and a status of 0 would hide it from a script. `stale` is
+    status 3. `retired` needs a `chain-retired` event that the trust chain authorises and that names
+    the same final height and block hash: no such event is status 3, an event that no authorised key
+    signed is status 1, another head is status 1. A member is checked against the signed checkpoint
+    of the chain log it names, whose size may be larger than the member's.
+163. **The state of `monitor` is a directory (7.5).** One file per log in the form of
+    `checkpoint --state`, so every property the reviews of the verifier established holds for it,
+    and one file for what is not a checkpoint (the audited size of each log, a digest of the text of
+    each event, the chains that were retired). An event is identified by the text of its note, never
+    by its signature lines. A run stops at the first finding.
+164. **Sources (4.4, 7.4).** An HTTP source follows no redirect and uses no proxy; plain `http` is
+    for this machine only; a server that cannot be reached is status 3. An HTTP source cannot list a
+    directory, so the epoch of a chain log is given and the tile directories of older sizes are not
+    checked, which a note says. An archive is read under limits.
+165. **The authority of an event (3.3, 3.4).** An event counts when a key signed it that is, at its
+    number, a key of the trust file that the file does not call revoked, or a key that an earlier
+    verified event added, and that no earlier event retired or revoked. A key the file calls revoked
+    never vouches for an event, so `trust follow` starts from the file the auditor pinned. The
+    validity windows are not applied to events. A `key-added` event is signed by an authorised key
+    other than the new one and by the new key; a `key-retired` and a `key-revoked` event by an
+    authorised key other than the one they are about.
+166. **`bundle verify` checks every file of the tile directories (7.3)**, not only those the
+    checkpoint needs: a partial tile or entry bundle of an older size must be a prefix of the tile or
+    bundle of the signed tree, and a file the tree does not have is a failure.
+167. **The three tests of a public key (155)** are applied to every key the verifier reads: the
+    pinned server keys, the client keys, and the key of a `key-added` event.
+168. **A revoked key is revoked (3.3).** The rule that old checkpoints of a revoked key may stay good
+    when an anchor dates them needs anchors; until the verifier reads anchors, `trust follow` writes
+    `revoked`, and a held checkpoint rests on the rules of 55 and 69.
+169. **The log leg (4.10, 7.4).** A block at a height the signed chain log does not cover is a
+    failure. The leg through the aggregate shows the block through the member of the last leaf of
+    the signed aggregate; its root of trust is the signature on the aggregate checkpoint, and the
+    output says that no anchor was checked.
+170. **`bundle fetch` (4.6, 7.4)** needs the logs named: `logs.json` is optional and has no format
+    yet. A partial tile that is gone is not an error. Without a trust file nothing is verified and
+    the word is `FETCHED`, not `VERIFIED`.
 
 Of section 13: item 2 (test vectors) is settled for signed notes (the example key and note of the
 specification are in the tests; the checkpoint example has no published key), item 3 (entry bundles at

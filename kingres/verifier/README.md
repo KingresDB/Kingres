@@ -12,7 +12,7 @@ documentation (`contrib/kingres_ledger/README.md` and
 exported from a real server (see "Cross-check against the server").
 
 It is standard library Go only, no third-party modules, so that an auditor can
-read all of it (about 4,000 lines outside the tests) and build it with one
+read all of it (about 14,000 lines outside the tests) and build it with one
 command.
 
 ## What it can and cannot prove
@@ -82,14 +82,20 @@ unknown subcommand.
 
 | Command | Statuses it can end with |
 |---|---|
-| `proof` | 0, 1, 2 |
+| `proof` | 0, 1, 2, 3 |
 | `row-hash` | 0, 2 |
 | `digest-chain` | 0, 1, 2 |
 | `blocks` | 0, 1, 2 |
 | `checkpoint` | 0, 1, 2, 3, 4 |
 | `consistency` | 0, 1, 2, 3 |
+| `aggregate` | 0, 1, 2, 3 |
+| `bundle verify` | 0, 1, 2, 3 |
+| `bundle fetch` | 0, 1, 2, 3 |
+| `monitor` | 0, 1, 2, 3 |
+| `attestation` | 0, 1, 2, 3 |
 | `trust init` | 0, 2 |
 | `trust show` | 0, 2 |
+| `trust follow` | 0, 1, 2, 3 |
 | `trust` | 2 |
 
 **Status 3 is not a pass.** It means that the publication did not contain something that was
@@ -390,8 +396,8 @@ kingres-verify consistency --trust trust.json --log <as above> --old NOTEFILE|SI
 **`trust init`** refuses to run without `--fingerprint` (the SHA-256 of the
 public key in hex; upper case and colons are accepted) and refuses a key that
 does not match it, so a mistyped or swapped key is noticed. It never overwrites
-a file. `trust follow` (rotation events of the publication) is not built yet and
-exits with status 2.
+a file. `trust follow` (rotation events of the publication) is described below, with
+the commands of step 7.
 
 **`trust show [--now TIME]`** validates a file and prints, for each key, how it
 stands at `--now` (default the system clock): `usable`, `not yet valid`,
@@ -968,12 +974,100 @@ Formats, with the specification they follow:
   must equal the first 16 bytes of the SHA-256 of the key), and `witnesses`,
   which must be empty. Unknown members are rejected.
 
-Not built yet (later steps of the design): `trust follow` and rotation events
-(`key-added`, `key-retired`, `key-revoked`), tar and HTTP sources, `proof
---bundle`, `aggregate`, `anchors`, `attestation`, `bundle`, `monitor`,
-`release verify`. The text of this section is the contract of step 1; where
+Not built yet (later steps of the design): `anchors`, `release verify`. The text of this section is the contract of step 1; where
 the design and the specification differ, the specification was followed (see
 "Findings about the phase 7 design").
+
+### Phase 7, step 7 and step 18: `aggregate`, `proof --bundle`, `bundle`, `monitor`, `trust follow`, `attestation`
+
+These commands read a **publication** (the layout of `ledger-phase7.md` 4.6) from `--source`, which is a
+directory, a `.tar.gz` file or an `https://` address (plain `http://` only for `127.0.0.1`, `::1` and `localhost`).
+A directory is read through `os.Root` with no link followed. An archive is read once into memory under limits
+(`MaxArchiveFile` 1 GiB, 200,000 entries, 512 MiB after decompression, 32 MiB a file), a name must be a plain
+relative path of at most 16 elements, and a link, device, pipe, repeated name, file that is also a directory, second
+gzip member or trailing data is refused. An HTTP source follows **no redirect** (status 2, "point the source at the
+address that serves the files"), uses **no proxy** from the environment, refuses an address with a user name or
+password, has a timeout on the connection (10 s), the headers (15 s) and the whole request (60 s), and reads at most
+the limit of the caller after any gzip decoding. A server that cannot be reached, answers 5xx or 429, or times
+out is "could not check": status 3, never 1. A 404 is an absent file.
+
+```
+kingres-verify aggregate   --trust T --aggregate-id HEX [--source S] [--previous NOTEFILE] [--chains-from S] [--now TIME] [--json]
+kingres-verify proof       --proof P --bundle S --trust T --log-leg chain|aggregate [--epoch N] [--aggregate-id HEX] [--table-id N --row-hash HEX --op I|D|any]
+kingres-verify bundle verify --trust T BUNDLE [--require-anchors N] [--require-attestation] [--attestation-table-id N]
+kingres-verify bundle fetch  --source URL --out DIR --log LOG [--log LOG ...] [--trust T] [--since-size N]
+kingres-verify monitor     --trust T --source S --state DIR [--log LOG ...] [--once] [--interval D] [--polls N]
+kingres-verify trust follow --trust T --source S --out FILE
+kingres-verify attestation --trust T --proof ROW --attestation ATT --attestation-columns FILE --attestation-table-id N
+                           (--digest D | --bundle S --log-leg chain|aggregate) [--client-key HEX]
+                           [--revocations DIR --revocation-table-id N]
+```
+
+**`aggregate`** verifies the checkpoint of the aggregate log, its **last leaf** as entry `size-1` of the signed tree
+(RFC 9162 2.1.3.2, from the tiles), parses it strictly (tag 0x23, format 1, `seq` equal to the index, 1 to 512 members
+sorted by (chain_id, epoch) with no repeat, flags only bits 0 to 2, epoch from 1, height below 2^62), and checks
+**every member against its chain log**: the signed chain checkpoint, the root the member names for size `height+1` as a
+prefix of that log (RFC 9162 2.1.4.2 from the tiles), and the block as the leaf at that height (87 bytes, tag 0x13,
+`SHA-256(leaf) = block_hash`). Failures: `member-root`, `member-block`, `member` (a chain checkpoint smaller than the
+member), `aggregate-leaf`. A member flagged **`diverged`** is a failure (step `diverged`: the publisher itself says the
+chain was rolled back or rewritten). A member flagged **`stale`** is status 3 (its head is old news). A member flagged
+**`retired`** needs a `chain-retired` event, **signed by keys the trust chain authorises**, that names the same final
+height and block hash: absent is status 3, present but not authorised is status 1 (step `chain-retired`), another head
+is status 1. With `--previous` (a checkpoint of this aggregate log you hold, a note or a state file) it also proves the
+aggregate log extends it, that the leader's times do not go back, that **no chain vanished without a record** (a
+chain of the older round must be in the newer one, flagged retired in the older one, or ended by a verified event),
+that **no head went back**, that a **retired chain does not return** in the next round, and that **each chain log
+extends the log the older round named** (a consistency proof from the chain's tiles). Only the two leaves named are read;
+the rounds between them are covered by the consistency of the aggregate log only, which the output says.
+The sentence of design 5.6 (no global snapshot) is in the output.
+
+**`proof --bundle`** runs steps 0 to 3 of the ledger README (binding, entry path, transaction path, block hash; the
+proof's `chain` of later headers is ignored), forms the 87-byte leaf data of the block and shows its leaf hash in the signed
+chain log of the bundle (step `log-inclusion`). `--log-leg aggregate` shows the block through the member of the signed
+aggregate's last leaf (step `aggregate-leg`; a round that does not reach the block is a failure). The last line says which root
+of trust ended the chain: *signature of key X*. No anchor is checked in this version, and the line says so.
+
+**`bundle verify`** treats `bundle.json` as an index that is not believed: the prefix must be the trust file's, each log it
+names must have the canonical origin and checkpoint path and the size the signed checkpoint says, and the layout is searched for
+logs the index does not name, which are verified too. For every log: the checkpoint, the binding of **every tile** to the signed root,
+every entry (block headers: heights, `prev_hash` links from the genesis hash, times; aggregate leaves: sequence, times), and **every
+file of the tile directories** (a partial tile or entry bundle of an older size must be the first hashes or entries of the tile or
+bundle of the signed tree; a file the tree does not have is a failure). Then each aggregate against its chains, each proof on the chain leg and
+on the aggregate leg when an aggregate names the chain, each attestation (needs `--attestation-table-id`), the events. **Anchors are not verified by this version**: a
+bundle that lists anchor files, or `--require-anchors` above 0, ends with status 3. A source that cannot list directories (HTTP) is
+told so in a note and the older partial tiles are not checked.
+Mutation tests flip every byte of every file of a bundle, one at a time, and none verifies.
+
+**`bundle fetch`** mirrors named logs (an HTTP source has no listing): `keyring.json`, `events/*`, the checkpoint of each log, the tiles
+and entry bundles of its size. File names are made from numbers only, written below the output directory through `os.Root`, through a temporary
+name and a rename. Without `--trust` the output says `FETCHED` and that **nothing was verified**; with it every checkpoint is verified and
+the tiles are bound to the signed root.
+
+**`monitor`** keeps `--state DIR`: one file `<log>.state` per log in the form of `checkpoint --state`, written by the same code (the
+state moves only to a checkpoint proved to extend it, under the lock, never over bytes the run did not read; a rollback, a fork or a rewrite is
+status 1 and the conflicting note is saved beside it, status 4 when it cannot be), and `monitor.json` with how far the entries of each log were
+audited, the digest of the text of each event seen and the chains retired. Each poll, per log: the checkpoint and its consistency with the
+state, then the entries not audited yet, then **all events**. Findings (status 1): `rollback`, `fork` (also of the aggregate, also across two
+polls: the case of the review P8-01), `events` (an event number whose text changed, or that is gone), `retired-continues` (the log of a chain that a verified
+chain-retired event ended has more blocks), `retired-reappears` (a member flagged retired is a member of a later round), `entries`, `tiles`.
+Status 3: the publication cannot be reached. Without `--once` it polls every `--interval` until `--polls` (default: until stopped) and stops at the first finding.
+It sees one view: a split view needs witnesses (design 4.8).
+
+**`trust follow`** reads `events/000000, 000001, ...` and verifies each one under the keys pinned in the file or added by a verified earlier event:
+`key-added` must be signed by an authorised key and by the new key and the key must pass the three tests of the extension (correction 155: canonical encoding,
+on the curve, not of small order, which every public key the verifier reads must pass: trust file, client keys, event keys); `key-retired` and
+`key-revoked` by an authorised key other than the one they are about. It writes a new file (`--out`, which must not exist and is never the file read): added keys with
+the event's `not_before`, retired keys limited to `max_tree_size` (an `unbounded` retirement is said), revoked keys `revoked`. An event signed by no
+authorised key stops the run (status 1). No event at all is status 3. Start from the file you pinned yourself.
+
+**`attestation`** (step 18): verifies the proof of the row's entry and the proof of the attestation row of `kingres.ledger_attestation` (its row
+hash recomputed from the columns file `ledger_txid, seq, key_id, nonce, signature`, its table id the one you give) against one anchor, that the attestation
+row names the transaction and entry of the row proof and sits in the same block, and the Ed25519 signature over the **136-byte message** under a key **pinned in
+`client_keys`** (a key only in the server's registry fails: step `client-key`). Revocation rows (`NAME.proof.json` and `NAME.columns.json` in `--revocations`)
+fail the attestation when the key was revoked in a block at or before the attestation's block (the same block counts as after). The result always says
+**"no revocation shown in the evidence given"**, and never that none exists: an inclusion proof shows presence, not absence.
+
+**Statuses** of the new commands are in the table of this README. **Findings and decisions of step 7 and step 18** are in "Decisions of steps 7 and 18" below.
 
 ### `version`, `--help`
 
@@ -1116,7 +1210,7 @@ Run one with `go test ./internal/proof -run '^$' -fuzz '^FuzzVerify$' -fuzztime 
 | Package | Purpose |
 |---|---|
 | `internal/merkle` | RFC 6962 hashes, tree root, RFC 9162 audit path and consistency proof verification |
-| `internal/format` | every hash input, one function each, with the domain tag as a named constant and the README text quoted; strict hex |
+| `internal/format` | every hash input (and the 87-byte leaf of a chain log), one function each, with the domain tag as a named constant and the README text quoted; strict hex |
 | `internal/jsonx` | strict JSON (duplicate keys, invalid UTF-8, lone surrogates, plain integers in range) with error paths |
 | `internal/chain` | digests, block headers, the block chain, digest sets |
 | `internal/proof` | proof parsing and the verification steps |
@@ -1129,6 +1223,12 @@ Run one with `go test ./internal/proof -run '^$' -fuzz '^FuzzVerify$' -fuzztime 
 | `internal/statefile` | the state file: lock, atomic replace with a crash test, link resolution, the place for conflicting evidence |
 | `internal/stdio` | tells the null device that the runtime puts in place of a closed standard output from the one the user asked for, and reads `KINGRES_VERIFY_NO_OUTPUT` with which a caller says it gave the null device on purpose |
 | `internal/testdir` | the temporary directories of the tests: a removal with a retry of 10 seconds on Windows, where a scanner can keep an entry for a moment (a test helper, never built into the program) |
+| `internal/edkey` | the three tests of an Ed25519 public key (canonical, on the curve, not of small order), from the definitions |
+| `internal/aggregate` | the leaf of an aggregate log (5.2): strict codec |
+| `internal/events` | the signed events of a publication and the walk that decides which key authorises which event |
+| `internal/pubsrc` | a publication as a directory, a `.tar.gz` or an HTTP(S) address, bounded and untrusted |
+| `internal/bundleidx` | `bundle.json`, read strictly and never believed |
+| `internal/attest` | the client attestation: the 136-byte message, the rows of the attestation and revocation tables, the block-height rule |
 | `internal/cli` | the command line (`cmd/kingres-verify` is a thin `main`) |
 
 ## Decisions where the documentation is silent
@@ -1720,3 +1820,60 @@ gaps. This round changes no verdict and no exit status.
 - On a file system that cannot make a hard link, an evidence file created in place is followed by a flush of the
   directory; a failed flush gives the same notes, statuses and `evidence_flushed` false as on the other paths.
 - No new flag, no new JSON member, no new exit status.
+## Decisions of steps 7 and 18 (proposed corrections 160 onwards of the design)
+
+The design is silent or open on these points; each decision takes the stricter behaviour.
+
+- **160 (7.4, attestation): the inputs.** The proof of the attestation row is a format 1 proof like any other, so it is a file of its
+  own (`--attestation`), with the columns file of the row (`--attestation-columns`); the verifier cannot know which table is
+  `kingres.ledger_attestation` (correction 111: the tables are found by name, no number is assumed), so the table id is a flag,
+  `--attestation-table-id`, and so is `--revocation-table-id`. They are the server's claims and the output says so (the
+  signature under a key the auditor pinned is what a row of another table cannot have). `--client-key` is the 16-byte key id in hex.
+  `bundle.json` gains `attestation_columns` beside `attestation_file`, and `bundle verify` takes `--attestation-table-id`;
+  without it an attestation of the bundle is status 3. Revocation evidence is a directory of `NAME.proof.json` and `NAME.columns.json`.
+- **161 (3.7): the attestation row is in the block of its entry.** `ledger_attest` runs in the transaction of the entry, and a transaction
+  is in one block, so the attestation row must name the transaction and the sequence number of the entry of the row proof and be
+  in the same block (same height and hash). A different block fails (`attestation-entry`).
+- **162 (5.5, 5.6): flags of an aggregate member.** `diverged` is status 1 (step `diverged`): the publisher says the chain was rolled
+  back or rewritten, and an exit status of 0 would hide that from a script. `stale` is status 3 (the head is old news). `retired` needs a
+  chain-retired event that the trust chain authorises and that names the same final height and block hash: no such event is status 3,
+  an event signed by no authorised key is status 1, another head is status 1. An aggregate member is checked against the chain log it
+  names with the chain's own signed checkpoint, whose size may be larger than the member's (the root of the prefix is shown with a
+  consistency proof from the tiles).
+- **163 (7.5): the state of `monitor` is a directory.** One file per log in the form of `checkpoint --state` (so every property of the
+  reviews holds for it: the identity of a checkpoint is its signed text, the lock file, replacement only of bytes the run read, limits, no
+  temporary name), and `monitor.json` for what is not a checkpoint (audited size per log, digest of the text of each event, chains retired). An event is identified by the
+  text of its note, never by its signature lines. A run stops at the first finding.
+- **164 (4.4, 7.4): sources.** An HTTP source follows no redirect and uses no proxy; `http://` is for this machine only; a server that cannot be
+  reached is status 3; an HTTP source cannot list directories, so the epoch of a chain log must be given and the tile directories of older sizes are not
+  checked (a note says so). An archive is read under the limits above.
+- **165 (3.3, 3.4): the authority of an event.** An event counts when a key signed it that is, at its number, a key of the trust file that the file does not call
+  revoked, or a key that an earlier verified event added, and that no earlier event retired or revoked. A key the file calls revoked never
+  vouches for an event (so `trust follow` starts from the file the auditor pinned, not from its own output when a revocation is in it).
+  Validity windows are not applied to events (an event is a statement about the past). `trust follow` stops at an event no authorised key signed;
+  the checks of an aggregate skip such an event, list it, and refuse the retired flag that depends on it. A key-added event for a key that is not pinned is
+  signed by an authorised key other than the new one and by the new key itself. A key-retired and a key-revoked event are signed by an authorised key other than the one they are about.
+- **166 (7.3): `bundle verify` checks every file of the tile directories**, not only those the checkpoint needs: a partial tile or entry bundle of an older size must
+  be the prefix of the tile or bundle of the signed tree, and a file the tree does not have is a failure. The mutation test of every byte found that without
+  this, a rewritten partial tile of an older size verified.
+- **167 (correction 155): the three tests** (canonical encoding, on the curve, not of small order) are applied to every public key the verifier reads: the pinned
+  server keys, the client keys, and the key of a key-added event. Written from the definitions with integers (`internal/edkey`) and tested with the vectors of
+  `contrib/kingres_ledger/t/038_public_key_check.pl`.
+- **168 (3.3): a revoked key is revoked.** The rule that a revoked key's old checkpoints may stay good when an anchor dates them needs anchors (steps 11 to 15). Until
+  then `trust follow` writes `revoked`, and a held checkpoint rests on the rules of corrections 55 and 69.
+- **169 (4.10, 7.4): the log leg.** A block at a height the signed chain log does not cover is a failure. `--log-leg aggregate` shows the block through the member of the
+  last leaf of the signed aggregate; its root of trust is the signature on the aggregate checkpoint and the output says that no anchor was checked.
+- **170 (4.6, 7.4): `bundle fetch`** needs the logs named (`--log`): `logs.json` is optional and has no format yet. A partial tile that is gone is not an error (tlog-tiles).
+  Without `--trust` nothing is verified, and the word is `FETCHED`, not `VERIFIED`.
+
+### What the verifier relies on in what `kingresd` publishes (today's format)
+
+- The leaf of an aggregate entry: tag 0x23, `u16` format 1, `u64` seq equal to the entry's index, `i64` microseconds, `u16` count 1 to 512, members of 109 bytes
+  (flags, chain id, `u32` epoch, `u64` height, block hash, log root) sorted by the bytes of (chain id, epoch), epoch from 1, flags 3 bits, height below 2^62.
+- The leaf of a chain log: the 87 bytes of the block hash preimage; its entry bundle prefix is a big-endian `u16`.
+- Origins `<prefix>/c/<chain>/e<n>` and `<prefix>/a/<aggregate>`; files `checkpoint`, `tile/<L>/<N>[.p/<W>]`, `tile/entries/<N>[.p/<W>]`, `events/<6 digits>` numbered from 0 without a gap,
+  `keyring.json` (copied by `bundle fetch`, not read by any check: the trust file is the one source of keys).
+- An event: `kingres-ledger-event/1`, `seq`, `time` (whole seconds, UTC), `type`, then `name: value` lines; `key-added` has `key`, `fingerprint`, `not-before`; `key-retired` has `key`,
+  `max-tree-size` (a number from 1 or `unbounded`); `key-revoked` has `key`, `compromised-since`, `reason`; `chain-retired` has `chain`, `epoch`, `final-height`, `final-block-hash`, `reason`
+  (one of `dropped`, `group-removed`, `database-missing`, `chain-replaced`). Its note's key name is the origin prefix.
+- A chain-retired event is read from the number it has; the verifier assumes that a number is never given to two texts (the case of review P8-01 is what `monitor` reports).

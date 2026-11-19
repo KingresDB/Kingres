@@ -43,6 +43,15 @@ extern PlannedStmt *kingres_shard_make_fanout_plan(Query *parse, char *sql,
 													List *relids, List *locknames);
 
 /*
+ * The plan of a colocated INSERT ... SELECT that every group runs whole (design 11.7).  sql starts
+ * with the marker of pushdown.h; place is the placement number of the colocation group the
+ * statement was decided with; relids are the relations of the statement (the plan remembers what
+ * each was and checks it when it starts).
+ */
+extern PlannedStmt *kingres_shard_make_insert_select_plan(Query *parse, char *sql, List *targets,
+														   int64 place, List *relids);
+
+/*
  * The statement that serializes writers of one reference table on a node (see
  * fanout.c); also used by add_node().
  */

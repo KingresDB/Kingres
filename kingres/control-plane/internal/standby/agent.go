@@ -45,6 +45,22 @@ type Agent struct {
 	// NameMatches asks the extension whether a name matches a streaming standby of this
 	// server's primary (kingres.standby_name_matches); nil: ask the database.
 	NameMatches func(ctx context.Context, dir int, name string) (bool, error)
+	// FormerPrimary is asked before the directory of a former primary of the group is turned into a standby: it
+	// returns nil only when this server does not hold the lease of the group, is not adopting it and has the markers
+	// of a hand-over, a fence or a wait on disk (nil: no former primary is ever touched).
+	FormerPrimary func(group int32) error
+	// FailRewind makes pg_rewind count as failed (the fault hook of the tests; nil: never).
+	FailRewind func() bool
+	// BecameStandby is called when the directory id is a standby of the group, before it starts: the markers and the
+	// lease manager's memory of the old primary are cleared (nil: nothing).
+	BecameStandby func(group int32, id int)
+	// Conninfo and EnsureSlot replace the replication connection string and the slot on the new primary in a test (nil:
+	// the cluster service and the primary's own database).
+	Conninfo   func(host string, port int, app, db string) (string, error)
+	EnsureSlot func(ctx context.Context, e Entry, slot string) error
+	// AskRecovery asks the running instance of directory id whether it is in recovery (nil: ask the database);
+	// a test replaces it.
+	AskRecovery func(ctx context.Context, id int) (bool, error)
 	// Grace, SlotWarn and SlotLimit are the settings standby-sync-grace,
 	// slot-retention-warn-bytes and slot-retention-limit-bytes.
 	Grace     time.Duration

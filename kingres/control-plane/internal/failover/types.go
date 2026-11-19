@@ -438,8 +438,10 @@ type Planner interface {
 	Ring(from, to string) int
 	// AfterPromotion records, in one transaction that proves the lease of the run,
 	// that the instance of the standby is the primary of the group now, and sends the
-	// plan to every server (design 3.3 F9).
-	AfterPromotion(ctx context.Context, group int32, promoted StandbyRec, newPrimaryServer string, newPrimaryPort int) error
+	// plan to every server (design 3.3 F9). The old primary is recorded in the same transaction as a standby that is
+	// waiting to be rebuilt (state rebuilding, diverged): the reconcile loop rebuilds it when its server answers
+	// (design 6.1 and 6.2).
+	AfterPromotion(ctx context.Context, group int32, promoted StandbyRec, newPrimaryServer string, newPrimaryPort int, old OldPrimaryRec) error
 	// FlagRebuild marks a standby that cannot follow the new primary as needing a rebuild.
 	FlagRebuild(ctx context.Context, standbyID int64) error
 	// RebalanceRunning says that a rebalance is pending or running.
@@ -472,10 +474,12 @@ type GroupRow struct {
 	Unreached     []byte
 	Incidents     []byte
 	OldPrimary    string
-	Error         string
-	StartedAt     *time.Time
-	PromotedAt    *time.Time
-	FinishedAt    *time.Time
+	// OldPrimaryReport is what the rebuild of the old primary found and did (JSON: method, divergence, message).
+	OldPrimaryReport []byte
+	Error            string
+	StartedAt        *time.Time
+	PromotedAt       *time.Time
+	FinishedAt       *time.Time
 }
 
 // GroupSet is an update of GroupRow: only the set members are written.
@@ -533,3 +537,13 @@ type Rows interface {
 // ErrLeaseLost is returned by Rows when the run no longer holds the task: the step
 // stands down quietly (the engine does the same on this error).
 var ErrLeaseLost = task.ErrLeaseLost
+
+// OldPrimaryRec is the old primary of a group as the failover knows it when it records the new primary: the server,
+// the node the catalog kept for it, the port of that node and, when the server answered, the directory of its
+// instance (0: the server rebuilds the directory it finds, oldprimary.go in internal/standby).
+type OldPrimaryRec struct {
+	Server     string
+	Node       int32
+	Port       int
+	InstanceID int
+}

@@ -67,7 +67,11 @@ Commands:
   blocks        recompute the block hash chain from an export of the block headers
   checkpoint    verify a signed checkpoint of a tile log against a trust file
   consistency   check that a log checkpoint extends an earlier one, from tiles
-  trust         create (init) or print (show) a trust file
+  aggregate     verify the aggregate log of a database against its chain logs
+  bundle        verify (verify) or copy (fetch) a bundle or a publication
+  monitor       watch a publication for a rollback, a fork or a rewrite
+  attestation   verify a client attestation of a ledger entry
+  trust         create (init), print (show) or follow the key events of (follow) a trust file
   version       print the version
 
 Run "kingres-verify <command> --help" for the flags of a command.
@@ -139,8 +143,16 @@ func dispatch(args []string, stdout, stderr io.Writer, version string) int {
 		return e.runConsistency(args[1:])
 	case "trust":
 		return e.runTrust(args[1:])
+	case "aggregate":
+		return e.runAggregate(args[1:])
+	case "bundle":
+		return e.runBundle(args[1:])
+	case "monitor":
+		return e.runMonitor(args[1:])
+	case "attestation":
+		return e.runAttestation(args[1:])
 	}
-	fmt.Fprintf(stderr, "kingres-verify: unknown command %s, expected one of proof, row-hash, digest-chain, blocks, checkpoint, consistency, trust, version\n", untrusted(fmt.Sprintf("%q", args[0])))
+	fmt.Fprintf(stderr, "kingres-verify: unknown command %s, expected one of proof, row-hash, digest-chain, blocks, checkpoint, consistency, aggregate, bundle, monitor, attestation, trust, version\n", untrusted(fmt.Sprintf("%q", args[0])))
 	return exit(ExitUsage)
 }
 
@@ -204,8 +216,18 @@ func (e *env) runProof(args []string) int {
 	tableID := fs.Int64("table-id", -1, "expected table id of the proof")
 	rowHash := fs.String("row-hash", "", "expected row hash, 64 lower case hex characters")
 	opFlag := fs.String("op", "any", "expected operation of the entry: I, D or any")
+	bundle := fs.String("bundle", "", "anchor the proof in a signed log instead of a digest: the publication or bundle (directory, .tar.gz or https address)")
+	logLeg := fs.String("log-leg", "", "with --bundle: chain (the signed chain log) or aggregate (the signed aggregate log)")
+	trustPath := fs.String("trust", "", "with --bundle: the trust file")
+	epoch := fs.Uint64("epoch", 0, "with --bundle: the epoch of the chain log (default: the only one in the source)")
+	aggID := fs.String("aggregate-id", "", "with --bundle --log-leg aggregate: the aggregate id (default: the only one in the source)")
+	nowFlag := fs.String("now", "", "with --bundle: time for key validity windows, RFC 3339 (default: system clock)")
 	if code, done := e.parseFlags(fs, args); done {
 		return code
+	}
+	if *bundle != "" {
+		return e.runProofLeg(*asJSON, proofLegArgs{proofPath: *proofPath, digest: *digestPath, bundle: *bundle, leg: *logLeg, trust: *trustPath, aggID: *aggID, epoch: *epoch,
+			tableID: *tableID, rowHash: *rowHash, op: *opFlag, now: nowOf(fs, nowFlag)})
 	}
 	const cmd = "proof"
 	for _, c := range [][2]string{{"proof", *proofPath}, {"digest", *digestPath}} {

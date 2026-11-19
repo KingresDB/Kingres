@@ -2208,3 +2208,83 @@ failover while one is paused, and a lost answer of each internal call (the
 fault hook cannot drop only an answer). The takeover points and the four
 refusal tests were run once or three times each, not repeated as the
 dead-server test was.
+
+### Increment 4 (the old primary back) and the rest of the second review (2026-11-19)
+
+What increment 4 did differently from sections 3 to 6, and the open findings
+of the second review (F2-06, F2-08, F2-16, the other direction of F2-09, a
+test for F2-02, the statements of F2-14).
+
+**The record of the old primary is made at the promotion.** The failover
+inserts the standby record of the old primary in the step after the
+promotion, not later, so that a leader that ends there leaves a record the
+next one finds. Migration 0015 adds the time since which the cluster waits
+for the old server, and the report of the old primary on the group row
+(method, bytes, message, divergence).
+
+**How a directory is proved to be a former primary.** The role file says
+primary of this group; the instance is stopped; the plan names another
+primary; the term of the plan is newer; and the lease state says that this
+server is held back, does not hold the lease and adopted nothing. A directory
+that fails one of these is not touched; a primary that still runs is its own
+error, and it is stopped by the fence, never by the rebuild.
+
+**The order of the rebuild.** A mark that says the copy is unfinished, then
+the role file, then the slot, then the data. The mark is cleared only after
+the standby settings, the access rules and the meta file are written, and
+then the instance starts. An agent treats a directory with that mark as a
+standby whose copy must be made again, whatever else it holds (F2-08).
+
+**`pg_rewind`.** Its dry run refuses a primary that was not shut down
+cleanly, so the instance first runs crash recovery once and is stopped again.
+The figures of the report come from the real run. With the default
+`wal_keep_size` the WAL from before the divergence is usually gone and the
+rewind fails; the rebuild then falls back to a base backup into the same
+directory. A default `wal_keep_size` (or a slot for the purpose) would make
+the cheap path the common one; it is not set yet.
+
+**A server that holds the former primary is held back, and still has to be
+told.** Its home instance may not start before it is a standby, so it cannot
+read its catalog and did not know the leader: the calls that plan, rebuild
+and report a standby answered 503 for five minutes. They now accept the
+leader that the other members name (`GET /leader` of the peers); the call
+proves what it needs itself.
+
+**Placement.** The ring holds every active server, also one that holds no
+standby; a server that is dead gets no new standby.
+
+**When the old primary does not come back.** An alert after the smaller of
+ten minutes and half of `standby-replace-after`; a replacement standby is
+scheduled after `standby-replace-after` (30 minutes by default). When the
+divergence cannot be measured the report gives a lower bound or none and
+states the position in its message.
+
+**An instance that runs as a primary where this server holds a standby role**
+is stopped, and the alerts `oldPrimaryRunning` and `oldPrimaryNotStopped` are
+raised from the lease conditions.
+
+**A failover of two groups.** The expected term of the second group did not
+include the change the first group made, so the second ended "superseded".
+The terms of the earlier groups are added. This was a defect of increment 3.
+
+**From the second review.** An instance that cannot be attributed to a group
+(its role file contradicts the catalog, or two claims exist) is stopped by a
+fence and blocks an adoption: the lease fails closed (F2-06). A stop or a
+restart of an instance answers 503 when its record cannot be written and a
+primary is enforced, and the promotion takes the same lock as those
+operations (F2-09). The statements that F2-14 named, corrected: the fence
+marker is one per group (`fenced.<group>`); a primary of a group without a
+standby is never stopped for a lapsed lease, only for a `kingresd` that
+stopped running; a stop that failed is repeated every five seconds until it
+succeeds or the lease is won again, and `oldPrimaryNotStopped` is raised by
+the monitor and by the failover task; that the catalog names no primary for
+two claims is not a protection; a marker is removed by a won lease, by an
+adoption, or when the rebuild made the directory a standby.
+
+**Open after this round.** The findings of the review of increment 3 (F3-01
+to F3-15) are not touched by it. Not tested: the promotion's lock by a test
+that fails without it. A server whose home instance is a standby cannot write
+alerts of the monitor (a read-only transaction). The reading of the topology
+answers 503 at the formation of a cluster in about one formation in twenty.
+The text of `notScheduled` in the contract no longer fits and waits for the
+next revision.

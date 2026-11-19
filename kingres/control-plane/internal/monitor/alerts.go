@@ -179,6 +179,7 @@ var titles = map[string]string{
 	"ledgerPendingTooOld": "Ledger entries pending for too long", "versionMismatch": "KingresDB versions differ",
 	"certificateRenewalFailed": "Certificate renewal failed", "replicationPending": "A server is behind on role and grant changes", "leaseLost": "A group lease was lost",
 	"groupWithoutSynchronousStandby": "A shard group runs without a synchronous standby", "groupUnderReplicated": "A shard group has too few standbys", "clockDifference": "A server's clock is off",
+	"oldPrimaryNotStopped": "An old primary could not be stopped", "oldPrimaryRunning": "An old primary is running", "oldPrimaryNotRebuilt": "An old primary has not been turned into a standby",
 }
 
 func scanAlert(r pgx.Row) (api.Alert, error) {

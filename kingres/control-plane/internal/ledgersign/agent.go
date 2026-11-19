@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 )
@@ -39,6 +40,8 @@ type RemoveRequest struct {
 // ListResponse is the answer of CallList: the fingerprints of the key files on the server, no more.
 type ListResponse struct {
 	Fingerprints []string `json:"fingerprints"`
+	// Unopenable are the key files that exist and do not open with the passphrase of this server (garbage, another passphrase, a truncated file).
+	Unopenable []string `json:"unopenable,omitempty"`
 }
 
 // Agent answers the calls on a server.
@@ -81,14 +84,15 @@ func (a *Agent) Handle(_ context.Context, key string, body []byte) (any, error) 
 		}
 		return struct{}{}, nil
 	case CallList:
-		fps, err := a.Keyring.List()
+		a.Keyring.CleanTemp(time.Minute)
+		fps, unopenable, err := a.Keyring.ListChecked()
 		if err != nil {
 			return nil, bad("unavailable", "The key directory cannot be read.", http.StatusServiceUnavailable)
 		}
 		if fps == nil {
 			fps = []string{}
 		}
-		return ListResponse{Fingerprints: fps}, nil
+		return ListResponse{Fingerprints: fps, Unopenable: unopenable}, nil
 	}
 	return nil, bad("not_found", "No such call.", http.StatusNotFound)
 }

@@ -42,4 +42,20 @@ extern bool kingres_shard_clause_shippable(Node *clause, Index varno);
 extern bool kingres_shard_stmt_shippable(Query *query, Oid shipped_relid,
 										  const char **reason);
 
+/*
+ * kingres_shard_stmt_shippable_colocated
+ *
+ * The multi-relation mode of the walker (design 5 and 11.7): a whole INSERT
+ * whose source reads distributed tables of the colocation group colocation_id
+ * (and reference tables) and writes target_relid.  Every expression passes the
+ * same tests; the relations of the group are accepted wherever the statement's
+ * own level and its one source level read them, and everything that could read a
+ * table behind them (a sub-select in an expression, a function, a VALUES list, a
+ * CTE, a whole-row reference) is refused.  That the tables are joined so that each
+ * group can answer for its own rows is not decided here but by pushdown.c.
+ */
+extern bool kingres_shard_stmt_shippable_colocated(Query *query, Oid target_relid,
+													int colocation_id,
+													const char **reason);
+
 #endif							/* KINGRES_SHARD_SHIPPABLE_H */

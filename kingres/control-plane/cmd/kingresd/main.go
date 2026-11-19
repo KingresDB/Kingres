@@ -64,6 +64,7 @@ var commit = "unknown"
 const contractRevision = "0.8.0"
 
 func main() {
+	hardenProcess()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	err := run(ctx, os.Args[1:], os.LookupEnv, os.Stderr, nil)
 	stop()
@@ -362,11 +363,12 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	// The signing keys of the ledger and the scheduler that runs their jobs on the manager leader.
 	var lgs *ledgerParts
 	if opsSvc != nil && svc.Enabled() {
-		lgs, err = newLedgerParts(cfg, svc, serverHost, log, members, opsSvc, leaders, auditFn(sink, log), haCalls)
+		lgs, err = newLedgerParts(cfg, svc, serverHost, log, members, opsSvc, leaders, auditFn(sink, log), haCalls, faultHook)
 		if err != nil {
 			return fmt.Errorf("preparing the signing keys of the ledger: %w", err)
 		}
 		deps.LedgerSigning = lgs.svc
+		deps.LedgerPublication = lgs.coll
 	}
 	deps.LeaderTrusted = leaderTrusted(haReg, lastLeader, serverHost, cfg.HA.LeaderLossBound)
 	api, err := httpapi.New(deps)

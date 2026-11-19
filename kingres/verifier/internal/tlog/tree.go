@@ -10,6 +10,7 @@ import (
 	"math/bits"
 
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/merkle"
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/pubsrc"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/safefile"
 )
 
@@ -68,6 +69,9 @@ func (s FSSource) read(name string, want int) ([]byte, error) {
 	case err == nil:
 	case errors.Is(err, fs.ErrNotExist):
 		return nil, fmt.Errorf("%w: %s", ErrMissing, name)
+	case errors.Is(err, pubsrc.ErrUnreachable):
+		// nothing is known about the tile: the check could not be made
+		return nil, fmt.Errorf("%w: %s: %v", ErrMissing, name, err)
 	case safefile.Unusable(err):
 		// Present but a link, a special file or too large: the log serves
 		// something that is not a tile.
@@ -110,10 +114,16 @@ func (r FSReader) ReadFile(name string, limit int64) ([]byte, error) {
 }
 
 // Reader computes tree hashes of a tree of a fixed size from tiles.
+// MaxCachedTiles bounds the tiles a Reader holds: a walk over a large log reads every tile once and
+// must not keep them all (16384 tiles of 8 KiB are about 134 MB). When the cache is full it is
+// emptied; TilesRead still counts every distinct tile that was read.
+const MaxCachedTiles = 16384
+
 type Reader struct {
 	src   TileSource
 	size  uint64
 	cache map[tileKey][]Hash
+	seen  map[tileKey]struct{}
 }
 
 type tileKey struct {
@@ -127,7 +137,7 @@ func NewReader(src TileSource, size uint64) (*Reader, error) {
 	if size >= MaxTreeSize {
 		return nil, fmt.Errorf("tree size %d is too large, expected less than %d", size, MaxTreeSize)
 	}
-	return &Reader{src: src, size: size, cache: map[tileKey][]Hash{}}, nil
+	return &Reader{src: src, size: size, cache: map[tileKey][]Hash{}, seen: map[tileKey]struct{}{}}, nil
 }
 
 // tile returns the hashes of tile n at level for this tree size: the full
@@ -153,7 +163,11 @@ func (r *Reader) tile(level int, n uint64) ([]Hash, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrBadTile, err)
 	}
+	if len(r.cache) >= MaxCachedTiles {
+		r.cache = map[tileKey][]Hash{}
+	}
 	r.cache[k] = hs
+	r.seen[k] = struct{}{}
 	return hs, nil
 }
 
@@ -304,4 +318,4 @@ func (r *Reader) subproof(m, lo, hi uint64, b bool) ([]Hash, error) {
 // TilesRead is the number of distinct tiles the reader has read so far. A
 // proof reads only the tiles on its path, so a caller can say how much of the
 // log was looked at.
-func (r *Reader) TilesRead() int { return len(r.cache) }
+func (r *Reader) TilesRead() int { return len(r.seen) }

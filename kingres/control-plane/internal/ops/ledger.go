@@ -119,6 +119,9 @@ func (o *Ops) GenerateDigest(ctx context.Context, db, actor string) (api.LedgerD
 	if _, err := ledgerDB(db); err != nil {
 		return api.LedgerDigest{}, err
 	}
+	if o.LedgerDigest != nil {
+		return o.LedgerDigest(ctx, db, actor)
+	}
 	var out api.LedgerDigest
 	var chain string
 	err := o.asService(ctx, db, func(tx pgx.Tx) error {
@@ -197,6 +200,9 @@ func (o *Ops) ListDigests(ctx context.Context, db string, p store.Page) (api.Led
 	page := api.LedgerDigestPage{Items: []api.LedgerDigest{}}
 	if _, err := ledgerDB(db); err != nil {
 		return page, err
+	}
+	if o.LedgerDigests != nil {
+		return o.LedgerDigests(ctx, db, p)
 	}
 	before, bounded, err := store.DecodeKey(p.Cursor)
 	if err != nil {
@@ -348,4 +354,18 @@ func (o *Ops) stepVerifyLedger(ctx context.Context, env *task.Env) error {
 		return fmt.Errorf("the verification found %d problem(s); see kingres.ledger_verification %d", problems, id)
 	}
 	return nil
+}
+
+// stepLedgerRetire is the first step of dropDatabase: the publication of the chains of the database ends with a final round, the
+// chain-retired events and one aggregate leaf in which every member is retired (design 5.5). It is idempotent, and does nothing when the
+// database has no published chain.
+func (o *Ops) stepLedgerRetire(ctx context.Context, env *task.Env) error {
+	if o.LedgerRetireDatabase == nil {
+		return task.Skip("this server does not publish the ledger")
+	}
+	p, err := inputOf[dropParams](env.Task)
+	if err != nil {
+		return err
+	}
+	return o.LedgerRetireDatabase(ctx, p.Name)
 }

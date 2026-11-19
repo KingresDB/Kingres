@@ -21,6 +21,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/edkey"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/format"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/jsonx"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/signednote"
@@ -117,6 +118,9 @@ func New(prefix, keyName string, pub []byte, typedFingerprint string) (*File, er
 	}
 	if len(pub) != ed25519.PublicKeySize {
 		return nil, fmt.Errorf("public key has %d bytes, expected %d", len(pub), ed25519.PublicKeySize)
+	}
+	if err := edkey.Check(pub); err != nil {
+		return nil, fmt.Errorf("public key: %w", err)
 	}
 	if err := validLabel(keyName); err != nil {
 		return nil, fmt.Errorf("key name: %w", err)
@@ -241,6 +245,9 @@ func parseKey(kv jsonx.Value) (Key, error) {
 		if err == nil {
 			err = fmt.Errorf("has %d bytes, expected %d", len(pub), ed25519.PublicKeySize)
 		}
+		return Key{}, fmt.Errorf("%s.public_key: %w", o.Path(), err)
+	}
+	if err := edkey.Check(pub); err != nil {
 		return Key{}, fmt.Errorf("%s.public_key: %w", o.Path(), err)
 	}
 	k.Public = pub
@@ -384,6 +391,9 @@ func parseClientKeys(obj jsonx.Object) ([]ClientKey, error) {
 		pub, err := signednote.DecodeBase64(b64)
 		if err != nil || len(pub) != ed25519.PublicKeySize {
 			return nil, fmt.Errorf("%s.public_key must be a canonical base64 Ed25519 public key of 32 bytes", o.Path())
+		}
+		if err := edkey.Check(pub); err != nil {
+			return nil, fmt.Errorf("%s.public_key: %w", o.Path(), err)
 		}
 		c.Public = pub
 		// ledger-phase7.md 3.7: key_id = SHA-256(public_key)[:16].

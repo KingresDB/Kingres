@@ -28,9 +28,11 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/cluster"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sqlx"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/store"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
 )
 
@@ -60,6 +62,10 @@ type Ops struct {
 	// server's instance act on (nil: instance 1 only, the layout of a server that never
 	// had a failover).
 	WritableIDs func() []int
+	// EnforcedPrimary tells whether this server runs the primary of a group that has a standby: a stop or restart of
+	// its instances is then never run on a record that could not be written (F2-09): the exclusion of a failover
+	// lives in that record. nil: no group is enforced.
+	EnforcedPrimary func() bool
 	// Recorder writes the tasks of instance start and stop (PeerRecorder on a
 	// server that may not be the leader); nil records in this server's own task
 	// engine.
@@ -78,6 +84,13 @@ type Ops struct {
 	// OnReplicaCount is called after the cluster setting defaultReplicaCount was stored
 	// (also when the value is the same): the standby task checks the standbys at once.
 	OnReplicaCount func(ctx context.Context) (*task.Task, error)
+	// LedgerDigest and LedgerDigests, when set, make generateLedgerDigest and listLedgerDigests work on every shard group and on the stored
+	// digests of the cluster (ledger phase 7, step 5: internal/ledgerround); nil keeps the digest of this server's own chain.
+	LedgerDigest  func(ctx context.Context, db, actor string) (api.LedgerDigest, error)
+	LedgerDigests func(ctx context.Context, db string, p store.Page) (api.LedgerDigestPage, error)
+	// LedgerRetireDatabase, when set, ends the publication of the chains of a database before it is dropped: a final round, the
+	// chain-retired events and the aggregate leaf in which every member is retired (step 6). It does nothing for a database with no log.
+	LedgerRetireDatabase func(ctx context.Context, db string) error
 	// BG bounds background task runs; Wait waits for them.
 	BG  context.Context
 	Log *slog.Logger

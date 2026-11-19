@@ -3,11 +3,10 @@
 package main
 
 import (
-	"time"
-
 	"context"
-	"github.com/KingresDB/Kingres/kingres/control-plane/internal/monitor"
 	"log/slog"
+	"sync/atomic"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -16,6 +15,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/config"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ha"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/membership"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/monitor"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ops"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/standby"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
@@ -28,6 +28,9 @@ import (
 type standbyParts struct {
 	agent  *standby.Agent
 	leader *standby.Leader
+	// leaseProbe is set by startLeases: the conditions of the lease manager that the monitor of this server raises
+	// (oldPrimaryNotStopped). It is read at the time of each round, the monitor starts before the leases do.
+	leaseProbe atomic.Pointer[func(ctx context.Context, now time.Time) ([]monitor.Condition, map[string]bool)]
 }
 
 // newStandbyParts builds the agent and the leader's side and connects them to the
@@ -51,9 +54,11 @@ func newStandbyParts(cfg config.Config, svc *cluster.Service, self string, log *
 	}
 	l := standby.NewLeader(&standby.Leader{
 		Self: self, Sys: sys, Agent: agent, Log: log, Audit: auditFn,
-		Call:        members.Client.Do,
-		StartTask:   opsSvc.StartTask,
-		ServiceConn: svc.ServiceConn,
+		Call:         members.Client.Do,
+		StartTask:    opsSvc.StartTask,
+		ReplaceAfter: cfg.HA.StandbyReplaceAfter,
+		Dead:         func(h string) bool { return h != self && reg.Liveness().State(h) == ha.PeerDead },
+		ServiceConn:  svc.ServiceConn,
 		// The catalog is written on the leader, which runs the primary of the map group.
 		Registrar: &standby.PGRegistrar{Log: log, Conn: func(ctx context.Context) (*pgx.Conn, error) { return svc.ServiceConn(ctx, sysdb.Database) },
 			Remote: func(ctx context.Context, host string, port int) (*pgx.Conn, error) {
@@ -101,6 +106,7 @@ func startStandbys(d *haDeps) error {
 			return p.agent.HandleCall(ctx, key, body)
 		})
 	}
+	p.agent.FailRewind = d.Fault.RewindFails
 	d.WG.Add(2)
 	go func() { defer d.WG.Done(); p.agent.Run(d.BG) }()
 	go func() { defer d.WG.Done(); p.leader.Run(d.BG) }()
@@ -112,5 +118,12 @@ func probesOf(p *standbyParts) []func(context.Context, time.Time) ([]monitor.Con
 	if p == nil {
 		return nil
 	}
-	return []func(context.Context, time.Time) ([]monitor.Condition, map[string]bool){p.agent.Probe}
+	return []func(context.Context, time.Time) ([]monitor.Condition, map[string]bool){p.agent.Probe,
+		func(ctx context.Context, now time.Time) ([]monitor.Condition, map[string]bool) {
+			f := p.leaseProbe.Load()
+			if f == nil {
+				return nil, nil
+			}
+			return (*f)(ctx, now)
+		}}
 }

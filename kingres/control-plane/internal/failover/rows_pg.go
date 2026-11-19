@@ -119,13 +119,13 @@ func (r *PGRows) Run(ctx context.Context) (RunRow, bool, error) {
 
 const groupCols = `group_id, seq, state, coalesce(old_server, ''), coalesce(old_node_id, 0), coalesce(new_server, ''), coalesce(new_node_id, 0),
 	coalesce(chosen_standby_id, 0), term_before, term_after, timeline, lease_wait_ms, decision, data_loss, unreached, incidents,
-	coalesce(old_primary, ''), coalesce(error, ''), started_at, promoted_at, finished_at`
+	coalesce(old_primary, ''), coalesce(error, ''), started_at, promoted_at, finished_at, old_primary_report`
 
 func scanGroup(row pgx.Row) (GroupRow, error) {
 	var g GroupRow
 	err := row.Scan(&g.Group, &g.Seq, &g.State, &g.OldServer, &g.OldNode, &g.NewServer, &g.NewNode, &g.ChosenStandby, &g.TermBefore,
 		&g.TermAfter, &g.Timeline, &g.LeaseWaitMs, &g.Decision, &g.DataLoss, &g.Unreached, &g.Incidents, &g.OldPrimary, &g.Error,
-		&g.StartedAt, &g.PromotedAt, &g.FinishedAt)
+		&g.StartedAt, &g.PromotedAt, &g.FinishedAt, &g.OldPrimaryReport)
 	return g, err
 }
 

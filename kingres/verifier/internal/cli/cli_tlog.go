@@ -15,6 +15,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/checkpoint"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/format"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/merkle"
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/pubsrc"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/safefile"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/signednote"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/tlog"
@@ -84,6 +85,7 @@ type pubKind int
 const (
 	pubAbsent pubKind = iota
 	pubMalformed
+	pubUnreachable
 )
 
 // pubError is a problem with the publication, not with the command line.
@@ -103,6 +105,8 @@ func classifyPub(what string, err error) error {
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return &pubError{pubAbsent, what, err}
+	case errors.Is(err, pubsrc.ErrUnreachable):
+		return &pubError{pubUnreachable, what, err}
 	case safefile.Unusable(err):
 		return &pubError{pubMalformed, what, err}
 	}
@@ -114,8 +118,12 @@ func classifyPub(what string, err error) error {
 func (e *env) finishPub(r *result, asJSON bool, err error) int {
 	var pe *pubError
 	if errors.As(err, &pe) {
-		if pe.kind == pubAbsent {
-			return e.finishIncomplete(r, asJSON, []string{"the publication does not contain " + pe.what + ": " + pe.err.Error()})
+		if pe.kind == pubAbsent || pe.kind == pubUnreachable {
+			lead := "the publication does not contain "
+			if pe.kind == pubUnreachable {
+				lead = "the publication could not be reached for "
+			}
+			return e.finishIncomplete(r, asJSON, []string{lead + pe.what + ": " + pe.err.Error()})
 		}
 		return e.finishFailed(r, asJSON, "publication", pe.err)
 	}
@@ -170,24 +178,25 @@ type logInputs struct {
 	trust  *trust.File
 	spec   logSpec
 	source string
-	dir    *safefile.Dir // the source directory, opened on first use
+	dir    pubsrc.Source // the source (directory, archive or HTTP address), opened on first use
+	shared bool          // the source belongs to the caller, which closes it
 	now    time.Time
 	notes  []string
 }
 
 // close releases the source directory.
 func (in *logInputs) close() {
-	if in.dir != nil {
+	if in.dir != nil && !in.shared {
 		_ = in.dir.Close()
 	}
 }
 
 // openSource opens --source: an input error when it is not a directory.
-func (in *logInputs) openSource() (*safefile.Dir, error) {
+func (in *logInputs) openSource() (pubsrc.Source, error) {
 	if in.dir != nil {
 		return in.dir, nil
 	}
-	d, err := safefile.OpenDir(in.source)
+	d, err := pubsrc.Open(in.source, pubsrc.Options{})
 	if err != nil {
 		return nil, fmt.Errorf("--source: %w", err)
 	}
@@ -640,7 +649,7 @@ func (e *env) runConsistency(args []string) int {
 
 // logFiles reads the files below one log directory of a source.
 type logFiles struct {
-	d   *safefile.Dir
+	d   pubsrc.Source
 	rel string
 }
 

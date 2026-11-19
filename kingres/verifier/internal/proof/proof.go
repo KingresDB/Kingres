@@ -261,62 +261,9 @@ func Verify(p *Proof, d chain.Digest, exp Expect) (*Result, error) {
 func verifyWith(p *Proof, d chain.Digest, exp Expect, walk func() (format.Header, error)) (*Result, error) {
 	res := &Result{BlockHeight: p.Block.Height, DigestHeight: d.Height}
 	pass := func(name, detail string) { res.Steps = append(res.Steps, Step{name, detail}) }
-
-	// Step 0 of the README: the proof is for the table and row the auditor
-	// means, and for the chain of the digest.
-	if exp.TableID != nil {
-		if p.TableID != *exp.TableID {
-			return nil, fail(StepBinding, "proof is for table_id %d, expected %d", p.TableID, *exp.TableID)
-		}
+	if err := verifyRow(p, d.ChainID, "the digest's", "proof and digest name the same chain", exp, pass); err != nil {
+		return nil, err
 	}
-	if exp.RowHash != nil {
-		if p.RowHash != *exp.RowHash {
-			return nil, fail(StepBinding, "proof row_hash is %x, expected %x", p.RowHash, *exp.RowHash)
-		}
-	}
-	if exp.Op != nil {
-		if p.Op != *exp.Op {
-			return nil, fail(StepBinding, "proof is for an entry with operation %s, expected %s", OpName(p.Op), OpName(*exp.Op))
-		}
-	}
-	if exp.TableID != nil || exp.RowHash != nil || exp.Op != nil {
-		pass(StepBinding, "proof is for the expected table, row and operation")
-	}
-	if p.ChainID != d.ChainID {
-		return nil, fail(StepChainID, "proof chain_id is %x, the digest's is %x", p.ChainID, d.ChainID)
-	}
-	pass(StepChainID, "proof and digest name the same chain")
-
-	// Step 1: the entry leaf and its path to tx_root.
-	e := format.EntryLeafHash(p.Seq, p.TableID, p.Op, p.RowHash)
-	if err := merkle.VerifyPath(e, p.EntryIndex, p.EntryCount, p.EntryPath, p.TxRoot); err != nil {
-		return nil, &Error{Step: StepEntryPath, Err: err}
-	}
-	pass(StepEntryPath, fmt.Sprintf("entry %d of %d leads to the transaction root", p.EntryIndex, p.EntryCount))
-
-	// Step 2: the transaction leaf and its path to the block's tx_merkle_root.
-	if p.EntryCount > math.MaxUint32 {
-		return nil, fail(StepTxPath, "entry_count %d does not fit 32 bits", p.EntryCount)
-	}
-	t, err := format.BlockTxLeafHash(p.LedgerTxID, uint32(p.EntryCount), p.TxRoot, p.UserName)
-	if err != nil {
-		return nil, &Error{Step: StepTxPath, Err: err}
-	}
-	if err := merkle.VerifyPath(t, p.TxIndex, uint64(p.Block.TxCount), p.TxPath, p.Block.TxMerkleRoot); err != nil {
-		return nil, &Error{Step: StepTxPath, Err: err}
-	}
-	pass(StepTxPath, fmt.Sprintf("transaction %d of %d leads to the block's transaction root", p.TxIndex, p.Block.TxCount))
-
-	// Step 3: the block hash from the header fields.
-	if err := chain.CheckHeader(p.Block); err != nil {
-		return nil, &Error{Step: StepBlockHash, Err: err}
-	}
-	if p.Block.Height == 0 {
-		if want := format.GenesisHash(d.ChainID); p.Block.PrevHash != want {
-			return nil, fail(StepBlockHash, "block 0 prev_hash is %x, expected %x (SHA-256 of 0x14 and the chain id)", p.Block.PrevHash, want)
-		}
-	}
-	pass(StepBlockHash, fmt.Sprintf("block %d hash recomputed", p.Block.Height))
 
 	// Step 4: reach the digest.
 	cur, err := walk()
@@ -334,6 +281,83 @@ func verifyWith(p *Proof, d chain.Digest, exp Expect, walk func() (format.Header
 		pass(StepDigestTime, "digest block_closed_at matches the block time")
 	}
 	return res, nil
+}
+
+// VerifyRow runs the steps of a proof that need no digest and no later header: the binding to
+// the expected table, row and operation, the chain id, the entry path to the transaction root,
+// the transaction path to the block's transaction root, and the block hash recomputed from
+// its header. The chain id is the one of the log the caller verifies the block against. It
+// proves nothing about where the block is: that is the work of a log leg (an inclusion proof
+// of the block header in a signed log).
+func VerifyRow(p *Proof, chainID [32]byte, exp Expect) (*Result, error) {
+	res := &Result{BlockHeight: p.Block.Height}
+	pass := func(name, detail string) { res.Steps = append(res.Steps, Step{name, detail}) }
+	if err := verifyRow(p, chainID, "the log's", "proof and log name the same chain", exp, pass); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+// verifyRow is steps 0 to 3 of the README: everything about the row and its block that does
+// not depend on how the block is tied to a trusted anchor.
+func verifyRow(p *Proof, chainID [32]byte, who, same string, exp Expect, pass func(name, detail string)) error {
+	// Step 0 of the README: the proof is for the table and row the auditor
+	// means, and for the chain of the digest.
+	if exp.TableID != nil {
+		if p.TableID != *exp.TableID {
+			return fail(StepBinding, "proof is for table_id %d, expected %d", p.TableID, *exp.TableID)
+		}
+	}
+	if exp.RowHash != nil {
+		if p.RowHash != *exp.RowHash {
+			return fail(StepBinding, "proof row_hash is %x, expected %x", p.RowHash, *exp.RowHash)
+		}
+	}
+	if exp.Op != nil {
+		if p.Op != *exp.Op {
+			return fail(StepBinding, "proof is for an entry with operation %s, expected %s", OpName(p.Op), OpName(*exp.Op))
+		}
+	}
+	if exp.TableID != nil || exp.RowHash != nil || exp.Op != nil {
+		pass(StepBinding, "proof is for the expected table, row and operation")
+	}
+	if p.ChainID != chainID {
+		return fail(StepChainID, "proof chain_id is %x, %s is %x", p.ChainID, who, chainID)
+	}
+	pass(StepChainID, same)
+
+	// Step 1: the entry leaf and its path to tx_root.
+	e := format.EntryLeafHash(p.Seq, p.TableID, p.Op, p.RowHash)
+	if err := merkle.VerifyPath(e, p.EntryIndex, p.EntryCount, p.EntryPath, p.TxRoot); err != nil {
+		return &Error{Step: StepEntryPath, Err: err}
+	}
+	pass(StepEntryPath, fmt.Sprintf("entry %d of %d leads to the transaction root", p.EntryIndex, p.EntryCount))
+
+	// Step 2: the transaction leaf and its path to the block's tx_merkle_root.
+	if p.EntryCount > math.MaxUint32 {
+		return fail(StepTxPath, "entry_count %d does not fit 32 bits", p.EntryCount)
+	}
+	t, err := format.BlockTxLeafHash(p.LedgerTxID, uint32(p.EntryCount), p.TxRoot, p.UserName)
+	if err != nil {
+		return &Error{Step: StepTxPath, Err: err}
+	}
+	if err := merkle.VerifyPath(t, p.TxIndex, uint64(p.Block.TxCount), p.TxPath, p.Block.TxMerkleRoot); err != nil {
+		return &Error{Step: StepTxPath, Err: err}
+	}
+	pass(StepTxPath, fmt.Sprintf("transaction %d of %d leads to the block's transaction root", p.TxIndex, p.Block.TxCount))
+
+	// Step 3: the block hash from the header fields.
+	if err := chain.CheckHeader(p.Block); err != nil {
+		return &Error{Step: StepBlockHash, Err: err}
+	}
+	if p.Block.Height == 0 {
+		if want := format.GenesisHash(chainID); p.Block.PrevHash != want {
+			return fail(StepBlockHash, "block 0 prev_hash is %x, expected %x (SHA-256 of 0x14 and the chain id)", p.Block.PrevHash, want)
+		}
+	}
+	pass(StepBlockHash, fmt.Sprintf("block %d hash recomputed", p.Block.Height))
+
+	return nil
 }
 
 // reach walks from the proof's block to the digest height and returns the

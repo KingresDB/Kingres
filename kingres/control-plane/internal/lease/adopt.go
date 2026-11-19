@@ -386,16 +386,52 @@ func releaseDone(r Reply) bool { return r.Granted && r.Holder == "" }
 // stops it first and confirms the stop. A group with no instance here (the fence holder of a failover) has
 // nothing that runs.
 func (m *Manager) primaryRunning(ctx context.Context, group int32) error {
-	inst, have := m.instance(group)
-	if !have {
-		return nil
+	var insts []Instance
+	if inst, have := m.instance(group); have {
+		insts = append(insts, inst)
 	}
-	up, err := inst.Running(ctx)
-	if err != nil {
-		return fmt.Errorf("lease: the instance of shard group %d cannot be asked whether it runs: %w", group, err)
-	}
-	if up {
-		return fmt.Errorf("lease: the instance of shard group %d runs on this server: stop it before its lease is handed over", group)
+	// An instance that may serve the group but cannot be attributed to it is treated as the primary (F2-06).
+	insts = append(insts, m.unattributed(group)...)
+	for _, inst := range insts {
+		up, err := inst.Running(ctx)
+		if err != nil {
+			return fmt.Errorf("lease: the instance of shard group %d cannot be asked whether it runs: %w", group, err)
+		}
+		if up {
+			return fmt.Errorf("lease: the instance of shard group %d runs on this server: stop it before its lease is handed over", group)
+		}
 	}
 	return nil
+}
+
+// HeldBack tells whether anything on disk keeps the primary of the group from starting on this server: the marker of
+// a hand-over, of a fence, or of a wait for the lease. A directory that is the former primary of a group and is held
+// back is the one the old-primary rebuild may turn into a standby (design 6.2; the proof is that and more).
+func (m *Manager) HeldBack(group int32) bool {
+	return markerExists(m.c.Dir, RelinquishedMarker, group) || markerExists(m.c.Dir, FencedMarker, group) || waitMarkerExists(m.c.Dir, group)
+}
+
+// BecameStandby clears everything that held the old primary of the group back, once its directory is a standby of the
+// group (design 6.2 step 5): the markers of a hand-over, of a fence and of a wait, the memory of all three, and the
+// watchdog file of the instance, which says "not a primary" from now on (leaseFile is that file; empty: none). The
+// caller has written the role file (standby) first: from then on the start gate does not look at the markers, and
+// removing them only stops them from saying something that is not true. It is the one place that removes the markers
+// of an old primary, besides a won lease and the withdrawal of a hand-over.
+func (m *Manager) BecameStandby(group int32, leaseFile string) error {
+	m.mu.Lock()
+	delete(m.relinq, group)
+	delete(m.adopted, group)
+	delete(m.groups, group)
+	delete(m.fenceFail, group)
+	m.mu.Unlock()
+	if leaseFile != "" {
+		m.writeWatchdogOff(leaseFile)
+	}
+	var first error
+	for _, base := range []string{RelinquishedMarker, FencedMarker, WaitMarker} {
+		if err := os.Remove(MarkerPath(m.c.Dir, base, group)); err != nil && !errors.Is(err, os.ErrNotExist) && first == nil {
+			first = err
+		}
+	}
+	return first
 }

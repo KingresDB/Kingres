@@ -188,6 +188,11 @@ func (s *Service) RevokeKey(ctx context.Context, actor, fp string, req api.Revok
 		return task.Task{}, err
 	}
 	if k.State == ledgerkeys.StateRevoked {
+		// A revocation that failed after its irreversible step (a server could not be reached to remove the file) is run again: its steps are
+		// idempotent, and the last one removes the files that remain. Without a server on record there is nothing left to do.
+		if s.keyFilesRemain(ctx, v, fp) {
+			return s.start(ctx, KindRevoke, actor, keyInput{Fingerprint: fp, CompromisedSince: req.CompromisedSince.UTC().Truncate(time.Second), Reason: req.Reason})
+		}
 		return task.Task{}, problem.New(problem.Conflict, "The key is revoked already.")
 	}
 	now, err := s.clock(ctx)
@@ -300,8 +305,11 @@ func (s *Service) stepGenerate(ctx context.Context, env *task.Env) error {
 				drop()
 				return nil, &coded{code: "cannot_add_key", msg: err.Error()}
 			}
-			// The file first: a row without a file could not be repaired, a file without a row is found
-			// again by Orphan.
+			// The marker of this task first, then the file: a row without a file could not be repaired, a file without a row is found again by
+			// Orphan, and only if it carries the marker of this task (a file that somebody placed has none, P7-10).
+			if err := s.cfg.Keyring.Mark(ledgerkeys.Fingerprint(pub), taskID); err != nil {
+				return nil, err
+			}
 			if err := write(); err != nil {
 				return nil, err
 			}
@@ -430,14 +438,16 @@ func (s *Service) stepEventRetired(ctx context.Context, env *task.Env) error {
 	if err != nil {
 		return err
 	}
-	max, err := s.cfg.Store.MaxCheckpointSize(ctx)
-	if err != nil {
-		return err
-	}
-	if max < 1 {
-		max = 1
-	}
 	return s.mutate(ctx, func(v *view, now time.Time) (*Change, error) {
+		// The bound is read inside the decision, so that a conflict (a checkpoint stored meanwhile) decides again with the new bound; the store
+		// checks it once more under the lock of the cluster row (Change.CheckpointBound).
+		max, err := s.cfg.Store.MaxCheckpointSize(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if max < 1 {
+			max = 1
+		}
 		k, ok := v.set.Get(in.Fingerprint)
 		if !ok {
 			return nil, &coded{code: "no_key", msg: "no such key"}
@@ -460,7 +470,7 @@ func (s *Service) stepEventRetired(ctx context.Context, env *task.Env) error {
 		if err != nil {
 			return nil, err
 		}
-		return &Change{Events: []EventRow{ev}}, nil
+		return &Change{Events: []EventRow{ev}, CheckpointBound: &max}, nil
 	})
 }
 
@@ -490,6 +500,16 @@ func (s *Service) stepRetire(ctx context.Context, env *task.Env) error {
 		if err != nil || size < 1 {
 			return nil, &coded{code: "bad_event", msg: "the max-tree-size of the event is not a size"}
 		}
+		// The bound was decided in the first step from the checkpoints stored then. A key whose event exists is not offered for signing any more
+		// (Publication), so no checkpoint of this key can be above it; a checkpoint above it that is stored anyway (a signer that was loaded before the event) is
+		// refused here, under the term guard, and the retirement does not happen (P7-01).
+		max, err := s.cfg.Store.MaxCheckpointSize(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if max > size {
+			return nil, &coded{code: "bound_exceeded", msg: fmt.Sprintf("a checkpoint of size %d was stored after the bound %d of the retirement was decided", max, size)}
+		}
 		set, err := v.set.Retire(in.Fingerprint, recordTime(v.set, now), ledgerkeys.AtMost(size))
 		if err != nil {
 			return nil, &coded{code: "cannot_retire", msg: err.Error()}
@@ -500,7 +520,7 @@ func (s *Service) stepRetire(ctx context.Context, env *task.Env) error {
 		}
 		cl := v.snap.Cluster
 		cl.TrustFile = trust
-		return &Change{Cluster: &cl, Keys: rows(v.snap.Keys, set, 0, "")}, nil
+		return &Change{Cluster: &cl, Keys: rows(v.snap.Keys, set, 0, ""), CheckpointBound: &size}, nil
 	})
 }
 
@@ -566,7 +586,19 @@ func (s *Service) stepRevoke(ctx context.Context, env *task.Env) error {
 			return nil, nil
 		}
 		t := recordTime(v.set, now)
+		// compromised-since was decided once, in the event; the record carries the same value (P7-06)
 		since := clampSince(in.CompromisedSince, t, k)
+		if e, ok := s.eventExists(v, EventKeyRevoked, in.Fingerprint); ok {
+			f, err := eventFields(noteText(e.Note))
+			if err != nil {
+				return nil, &coded{code: "bad_event", msg: err.Error()}
+			}
+			ev, err := time.Parse(time.RFC3339, f["compromised-since"])
+			if err != nil {
+				return nil, &coded{code: "bad_event", msg: "the compromised-since of the event is not a time"}
+			}
+			since = ev.UTC()
+		}
 		set, err := v.set.Revoke(in.Fingerprint, t, since, in.Reason)
 		if err != nil {
 			return nil, &coded{code: "cannot_revoke", msg: err.Error()}
@@ -736,23 +768,39 @@ func (s *Service) removeStale(ctx context.Context, env *task.Env, strict bool) e
 	want := wanted(v)
 	var pending []string
 	var good []string // the holders that have every wanted key
+	var forgotten []string
 	for h := range servers {
 		var have ListResponse
 		if err := s.callServer(ctx, h, CallList, struct{}{}, &have); err != nil {
+			if !isHolder[h] && !s.isMember(ctx, h) {
+				// removed from the cluster and not reachable: forgotten, with a record in the log (P7-03)
+				s.log.Warn("a server that left the cluster cannot be reached: key files may remain on that host, the operator must wipe it", "server", h)
+				forgotten = append(forgotten, h)
+				continue
+			}
 			s.log.Warn("the key files of a server could not be listed", "server", h, "error", err)
 			pending = append(pending, h)
 			continue
 		}
 		failed := false
 		present := map[string]bool{}
-		for _, fp := range have.Fingerprints {
+		for _, fp := range append(append([]string(nil), have.Fingerprints...), have.Unopenable...) {
 			present[fp] = true
 			if isHolder[h] && want[fp] {
+				continue
+			}
+			// the set is read again just before a file is removed: a key made since the first read is never removed (P7-12)
+			if cur, lerr := s.load(ctx); lerr != nil || wanted(cur)[fp] && !want[fp] {
 				continue
 			}
 			if err := s.callServer(ctx, h, CallRemove, RemoveRequest{Fingerprint: fp}, nil); err != nil {
 				s.log.Warn("a key file could not be removed", "server", h, "error", err)
 				failed = true
+			}
+		}
+		for _, fp := range have.Unopenable {
+			if isHolder[h] && want[fp] {
+				delete(present, fp) // a file that does not open is no copy: the distribution gives the server the key again
 			}
 		}
 		if failed {
@@ -768,6 +816,9 @@ func (s *Service) removeStale(ctx context.Context, env *task.Env, strict bool) e
 				good = append(good, h)
 			}
 		}
+	}
+	if len(forgotten) > 0 && env != nil {
+		_ = env.SetDetail(ctx, "servers that left the cluster and cannot be reached, key files may remain there: "+strings.Join(forgotten, ", "))
 	}
 	if len(pending) > 0 {
 		sortStrings(pending)
@@ -843,9 +894,15 @@ func (s *Service) jobDue(ctx context.Context, term scheduler.Term) error {
 	if err != nil {
 		return nil // no time is taken from a clock that cannot be compared
 	}
+	s.dueMu.Lock()
+	recent := time.Since(s.dueAt) < 10*time.Minute
+	s.dueMu.Unlock()
 	for _, fp := range v.set.DueForRetirement(now) {
 		if s.cfg.StartTask == nil {
 			return nil
+		}
+		if recent {
+			return nil // a retirement that was started a few minutes ago is not started again at once: one that fails for good would make a task row a minute (P7-11)
 		}
 		t, err := s.cfg.StartTask(ctx, KindRetire, SubjectType, SubjectID, keyInput{Fingerprint: fp}, "system")
 		if errors.Is(err, task.ErrSubjectBusy) {
@@ -854,6 +911,9 @@ func (s *Service) jobDue(ctx context.Context, term scheduler.Term) error {
 		if err != nil {
 			return err
 		}
+		s.dueMu.Lock()
+		s.dueAt = time.Now()
+		s.dueMu.Unlock()
 		if s.cfg.Audit != nil {
 			s.cfg.Audit(context.WithoutCancel(ctx), audit.Event{Actor: "system", Source: "system", Action: "retireLedgerSigningKey", ResourceType: SubjectType,
 				ResourceID: fp, Outcome: audit.OutcomeSuccess, Details: map[string]any{"taskId": t.ID, "reason": "the overlap of the rotation ended"}})
@@ -876,6 +936,12 @@ func (s *Service) jobCheck(ctx context.Context, _ scheduler.Term) error {
 	if a := s.alarmText(v); a != "" {
 		s.cfg.Alert(ctx, "ledgerSignerUnavailable", "critical", "cluster", "The ledger cannot be signed: "+a, true)
 		return nil
+	}
+	if s.cfg.PublicationFailure != nil {
+		if f := s.cfg.PublicationFailure(); f != "" {
+			s.cfg.Alert(ctx, "ledgerSignerUnavailable", "critical", "cluster", f, true)
+			return nil
+		}
 	}
 	s.cfg.Alert(ctx, "ledgerSignerUnavailable", "critical", "cluster", "", false)
 	return nil
@@ -907,6 +973,7 @@ func (s *Service) jobSync(ctx context.Context, _ scheduler.Term) error {
 		servers[h] = true
 	}
 	dirty := strings.Join(holders, ",") != strings.Join(v.snap.Cluster.Holders, ",")
+	sig := strings.Join(holders, ",") + "|" + strings.Join(v.snap.Cluster.Holders, ",")
 	for h := range servers {
 		var have ListResponse
 		if err := s.callServer(ctx, h, CallList, struct{}{}, &have); err != nil {
@@ -919,6 +986,10 @@ func (s *Service) jobSync(ctx context.Context, _ scheduler.Term) error {
 				dirty = true
 			}
 		}
+		if len(have.Unopenable) > 0 {
+			dirty = true // a file that does not open is replaced where the key is wanted and removed where it is not
+		}
+		sig += "|" + h + ":" + strings.Join(have.Fingerprints, ",") + "/" + strings.Join(have.Unopenable, ",")
 		if isHolder[h] {
 			for fp := range want {
 				if !present[fp] {
@@ -928,6 +999,17 @@ func (s *Service) jobSync(ctx context.Context, _ scheduler.Term) error {
 		}
 	}
 	if !dirty || s.cfg.StartTask == nil {
+		return nil
+	}
+	// A distribution that cannot change the outcome (the same state as the last one it was started for, a few minutes ago) is not started again: a
+	// holder with another passphrase or a host that never answers would make a task row every minute for ever (P7-03).
+	s.syncMu.Lock()
+	same := sig == s.syncSig && time.Since(s.syncAt) < 15*time.Minute
+	if !same {
+		s.syncSig, s.syncAt = sig, time.Now()
+	}
+	s.syncMu.Unlock()
+	if same {
 		return nil
 	}
 	_, err = s.cfg.StartTask(ctx, KindDistribute, SubjectType, SubjectID, keyInput{}, "system")
@@ -1017,4 +1099,41 @@ func retiredOrRevoked(set ledgerkeys.Set) bool {
 		}
 	}
 	return false
+}
+
+// keyFilesRemain tells whether a server on record still has a file of the key (a listing that fails counts as "remains": the file may be there).
+func (s *Service) keyFilesRemain(ctx context.Context, v *view, fp string) bool {
+	servers := map[string]bool{}
+	for _, h := range v.snap.Cluster.Holders {
+		servers[h] = true
+	}
+	if hs, err := s.holderSet(ctx); err == nil {
+		for _, h := range hs {
+			servers[h] = true
+		}
+	}
+	for h := range servers {
+		var have ListResponse
+		if err := s.callServer(ctx, h, CallList, struct{}{}, &have); err != nil {
+			if !s.isMember(ctx, h) {
+				continue
+			}
+			return true
+		}
+		for _, f := range append(append([]string(nil), have.Fingerprints...), have.Unopenable...) {
+			if f == fp {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isMember tells whether a server is still a member of the cluster (IsMember of the configuration; every server is one when it is not set).
+func (s *Service) isMember(ctx context.Context, server string) bool {
+	if s.cfg.IsMember == nil {
+		return true
+	}
+	ok, err := s.cfg.IsMember(ctx, server)
+	return err != nil || ok
 }

@@ -66,6 +66,7 @@
 #include "access/xact.h"
 #include "catalog/partition.h"
 #include "catalog/pg_constraint.h"
+#include "catalog/pg_type_d.h"
 #include "catalog/pg_language_d.h"
 #include "catalog/pg_proc.h"
 #include "commands/extension.h"
@@ -76,9 +77,11 @@
 #include "nodes/pathnodes.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/planner.h"
+#include "parser/analyze.h"
 #include "parser/parse_relation.h"
 #include "parser/parsetree.h"
 #include "rewrite/rewriteManip.h"
+#include "tcop/tcopprot.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -98,6 +101,7 @@
 #include "kingres_shard.h"
 #include "node_conn.h"
 #include "planner.h"
+#include "pushdown.h"
 #include "remote_scan.h"
 #include "row_router.h"
 #include "shippable.h"
@@ -660,57 +664,23 @@ error_write_spans_groups(Query *parse, DistRef *ref, const char *detail)
 }
 
 /*
- * plan_distributed_write
+ * fanout_targets
  *
- * An UPDATE or DELETE of one distributed table that is not restricted to one
- * bucket (design/shard-phase2a.md, section 6): when the whole statement can be
- * shipped (shippable.c: it reads no other distributed table, uses only built-in
- * immutable functions and operators) it is executed on every shard group that
- * owns buckets of the table, in one distributed transaction, and the counts
- * and the RETURNING rows of the groups are added.  A statement that assigns the
- * distribution column is refused: the row would have to move between groups.
- * The text carries KS_WRITE_MARKER, which tells the forwarded sessions of the
- * other groups that this is such a fragment.
+ * The primary node of every shard group that owns buckets of the colocation group, in
+ * group order (the same order on every node, so that concurrent statements take their
+ * locks in the same order).  The group of this node is the local one.
  */
-static PlannedStmt *
-plan_distributed_write(Query *parse, DistRef *ref, const KsCatalog *cat, List *relids)
+static List *
+fanout_targets(const KsColocation *coloc, const KsCatalog *cat)
 {
-	const char *reason = NULL;
 	List	   *groups = NIL;
 	List	   *targets = NIL;
 	ListCell   *lc;
 	int			b;
-	char	   *sql;
 
-	if (parse->commandType == CMD_UPDATE)
+	for (b = 0; b < kingres_shard_coloc_nbuckets(coloc); b++)
 	{
-		foreach(lc, parse->targetList)
-		{
-			TargetEntry *te = lfirst_node(TargetEntry, lc);
-
-			if (!te->resjunk && te->resno == ref->dt->dist_attno)
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("an UPDATE of the distribution column \"%s\" of \"%s\" is not supported",
-								NameStr(ref->dt->dist_column), get_rel_name(ref->dt->relid)),
-						 errdetail("The row would have to move to another bucket, possibly of another shard group."),
-						 errhint("DELETE the row and INSERT it with the new key.")));
-		}
-	}
-	if (parse->hasModifyingCTE || parse->rowMarks != NIL ||
-		!kingres_shard_stmt_shippable(parse, ref->dt->relid, &reason))
-		error_write_spans_groups(parse, ref,
-								 reason ? psprintf("The statement is not shippable: %s.", reason) : NULL);
-	kingres_shard_refuse_view_owner(ref->query, rt_fetch(ref->rti, ref->query->rtable));
-	if (IsInParallelMode())
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("a statement for several shard groups cannot be run from a parallel worker")));
-
-	for (b = 0; b < kingres_shard_coloc_nbuckets(ref->dt->coloc); b++)
-	{
-		int			g = kingres_shard_bucket_group(ref->dt->coloc,
-												   kingres_shard_coloc_bucket(ref->dt->coloc, b));
+		int			g = kingres_shard_bucket_group(coloc, kingres_shard_coloc_bucket(coloc, b));
 
 		if (g >= 0 && !list_member_int(groups, g))
 			groups = lappend_int(groups, g);
@@ -743,9 +713,194 @@ plan_distributed_write(Query *parse, DistRef *ref, const KsCatalog *cat, List *r
 		t->is_local = (g == cat->local_group_id);
 		targets = lappend(targets, t);
 	}
+	return targets;
+}
+
+/*
+ * plan_distributed_write
+ *
+ * An UPDATE or DELETE of one distributed table that is not restricted to one
+ * bucket (design/shard-phase2a.md, section 6): when the whole statement can be
+ * shipped (shippable.c: it reads no other distributed table, uses only built-in
+ * immutable functions and operators) it is executed on every shard group that
+ * owns buckets of the table, in one distributed transaction, and the counts
+ * and the RETURNING rows of the groups are added.  A statement that assigns the
+ * distribution column is refused: the row would have to move between groups.
+ * The text carries KS_WRITE_MARKER, which tells the forwarded sessions of the
+ * other groups that this is such a fragment.
+ */
+static PlannedStmt *
+plan_distributed_write(Query *parse, DistRef *ref, const KsCatalog *cat, List *relids)
+{
+	const char *reason = NULL;
+	List	   *targets = NIL;
+	ListCell   *lc;
+	char	   *sql;
+
+	if (parse->commandType == CMD_UPDATE)
+	{
+		foreach(lc, parse->targetList)
+		{
+			TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+			if (!te->resjunk && te->resno == ref->dt->dist_attno)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("an UPDATE of the distribution column \"%s\" of \"%s\" is not supported",
+								NameStr(ref->dt->dist_column), get_rel_name(ref->dt->relid)),
+						 errdetail("The row would have to move to another bucket, possibly of another shard group."),
+						 errhint("DELETE the row and INSERT it with the new key.")));
+		}
+	}
+	if (parse->hasModifyingCTE || parse->rowMarks != NIL ||
+		!kingres_shard_stmt_shippable(parse, ref->dt->relid, &reason))
+		error_write_spans_groups(parse, ref,
+								 reason ? psprintf("The statement is not shippable: %s.", reason) : NULL);
+	kingres_shard_refuse_view_owner(ref->query, rt_fetch(ref->rti, ref->query->rtable));
+	if (IsInParallelMode())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a statement for several shard groups cannot be run from a parallel worker")));
+
+	targets = fanout_targets(ref->dt->coloc, cat);
 
 	sql = psprintf("%s%s", KS_WRITE_MARKER, deparse_for_remote(parse));
 	return kingres_shard_make_fanout_plan(parse, sql, targets, true, relids, NIL);
+}
+
+/* The types of the external parameters of a statement: the groups parse its text with them. */
+typedef struct ParamTypes
+{
+	Oid		   *types;
+	int			n;
+} ParamTypes;
+
+static bool
+param_types_walker(Node *node, ParamTypes *pt)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Param))
+	{
+		Param	   *p = (Param *) node;
+
+		if (p->paramkind == PARAM_EXTERN && p->paramid > 0)
+		{
+			if (p->paramid > pt->n)
+			{
+				int			i;
+
+				pt->types = pt->types ? repalloc(pt->types, sizeof(Oid) * p->paramid) :
+					palloc(sizeof(Oid) * p->paramid);
+				for (i = pt->n; i < p->paramid; i++)
+					pt->types[i] = InvalidOid;
+				pt->n = p->paramid;
+			}
+			pt->types[p->paramid - 1] = p->paramtype;
+		}
+		return false;
+	}
+	if (IsA(node, Query))
+		return query_tree_walker((Query *) node, param_types_walker, pt, 0);
+	return expression_tree_walker(node, param_types_walker, pt);
+}
+
+/*
+ * insert_select_text_accepted
+ *
+ * The decision of a receiving group is made on the parse of the text it receives, not on
+ * the tree this node deparsed (design: "the receiving side decides on text that was
+ * deparsed and parsed again").  So that a statement that is shipped is never refused
+ * there, the text is parsed and rewritten here, under the same settings, and the same
+ * function decides on it.  Anything a deparse and a parse change in the meaning of the
+ * statement (the shape of a join, a default, a cast) shows up here as a refusal, and the
+ * statement goes to the row router.
+ */
+static bool
+insert_select_text_accepted(const char *body, Query *orig, const char **why)
+{
+	ParamTypes	pt = {NULL, 0};
+	List	   *raw;
+	List	   *rewritten;
+	Query	   *rq;
+	KsInsertSelect is2;
+	int			nest;
+	int			i;
+
+	(void) param_types_walker((Node *) orig, &pt);
+	for (i = 0; i < pt.n; i++)
+		if (!OidIsValid(pt.types[i]))
+			pt.types[i] = TEXTOID;
+
+	nest = kingres_shard_set_transmission_modes();
+	raw = pg_parse_query(body);
+	if (list_length(raw) != 1)
+	{
+		kingres_shard_reset_transmission_modes(nest);
+		*why = "the deparsed text is not one statement";
+		return false;
+	}
+	rq = parse_analyze_fixedparams(linitial_node(RawStmt, raw), body, pt.types, pt.n, NULL);
+	rewritten = pg_rewrite_query(rq);
+	kingres_shard_reset_transmission_modes(nest);
+	if (list_length(rewritten) != 1)
+	{
+		*why = "the deparsed text is rewritten into several statements";
+		return false;
+	}
+	return kingres_shard_insert_select_analyze(linitial_node(Query, rewritten), &is2, why);
+}
+
+/*
+ * plan_colocated_insert_select
+ *
+ * P6 (design 11.7): an INSERT ... SELECT whose target and sources are of one colocation
+ * group, joined on their keys so that every row of the result is made on the group that owns
+ * it, is shipped whole to every group of the target and run there: no row passes through this
+ * node, the counts and the RETURNING rows are added, the groups commit together by the
+ * two-phase path of the fan-out, and the placement of the group is compared after the
+ * statement ran on every group (fanout.c).  Returns NULL when the statement is not one (the
+ * row router or the refusals of 3 and 4 then decide, exactly as without this path).
+ */
+static PlannedStmt *
+plan_colocated_insert_select(Query *parse)
+{
+	KsInsertSelect is;
+	const char *why = NULL;
+	char	   *body;
+	char	   *sql;
+	int			nest;
+	int64		place;
+	const KsCatalog *cat;
+	const KsColocation *coloc;
+
+	if (IsInParallelMode())
+		return NULL;
+	if (!kingres_shard_insert_select_analyze(parse, &is, &why))
+	{
+		ereport(DEBUG1, (errmsg_internal("kingres_shard: INSERT ... SELECT is not shipped whole: %s", why)));
+		return NULL;
+	}
+
+	nest = kingres_shard_set_transmission_modes();
+	body = pg_get_querydef(is.insert, false);
+	kingres_shard_reset_transmission_modes(nest);
+
+	if (!insert_select_text_accepted(body, parse, &why))
+	{
+		ereport(DEBUG1, (errmsg_internal("kingres_shard: INSERT ... SELECT is not shipped whole: the groups would not accept its text: %s", why)));
+		return NULL;
+	}
+
+	/* the analyses read the catalog cache, which a call of theirs may have reloaded */
+	cat = kingres_shard_catalog();
+	coloc = kingres_shard_lookup_colocation(is.colocation_id);
+	if (coloc == NULL)
+		return NULL;
+	place = kingres_shard_placement_hash(coloc);
+	sql = psprintf("%s%s", kingres_shard_insert_select_marker(place), body);
+	return kingres_shard_make_insert_select_plan(parse, sql, fanout_targets(coloc, cat), place,
+												 is.relids);
 }
 
 /*
@@ -952,6 +1107,44 @@ plan_forwarded(Query *parse, const char *query_string, int cursorOptions,
 		return plan_locally(parse, query_string, cursorOptions, boundParams, cat,
 							a->ndist_rtes);
 
+	/*
+	 * A colocated INSERT ... SELECT that another node ships whole (11.7).  This node decides
+	 * on the parse of the text it received, with the function the sender used on the same text
+	 * (insert_select_text_accepted), and runs it over its own buckets: each row it reads is
+	 * inserted into a partition of this node, or fails with "no partition found for row".
+	 */
+	if (parse->commandType == CMD_INSERT && query_string != NULL)
+	{
+		int64		place;
+
+		if (kingres_shard_parse_insert_select_marker(query_string, &place))
+		{
+			KsInsertSelect is;
+			const char *why = NULL;
+
+			if (kingres_shard_insert_select_analyze(parse, &is, &why))
+			{
+				PlannedStmt *pstmt = plan_locally(parse, query_string, cursorOptions, boundParams,
+												  cat, a->ndist_rtes);
+
+				/* after planning (the target is locked ROW EXCLUSIVE, the sources ACCESS SHARE) */
+				if (place != 0 &&
+					kingres_shard_placement_hash_now(is.colocation_id) != place)
+					ereport(ERROR,
+							(errcode(ERRCODE_KINGRES_STALE_MAP),
+							 errmsg("the bucket map of this node is not the one the statement was shipped with (stale map version " INT64_FORMAT ")",
+									cat->map_version),
+							 errhint("A bucket moved between shard groups, or the primary of a group changed; repeat the statement.")));
+				return pstmt;
+			}
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("this node does not accept the fragment that another node sent it"),
+					 errdetail("The statement is not a colocated INSERT ... SELECT that this node runs: %s.", why),
+					 errhint("This is not a change of the bucket map: repeating the statement does not help.")));
+		}
+	}
+
 	/* A batch of rows that the row router of another node sends here (11.5). */
 	if (list_length(a->refs) == 1 && parse->commandType == CMD_INSERT)
 	{
@@ -1010,10 +1203,12 @@ plan_forwarded(Query *parse, const char *query_string, int cursorOptions,
 	 * node that sent it and this node decide on the same tree, so a retry gives the same
 	 * answer and the retryable error KS001 would be a lie (review P2B-02).
 	 */
-	if (query_string != NULL && list_length(a->refs) == 1 &&
-		(strncmp(query_string, KS_FRAGMENT_MARKER, strlen(KS_FRAGMENT_MARKER)) == 0 ||
-		 strncmp(query_string, KS_WRITE_MARKER, strlen(KS_WRITE_MARKER)) == 0 ||
-		 strncmp(query_string, KS_INSERT_MARKER_PREFIX, strlen(KS_INSERT_MARKER_PREFIX)) == 0))
+	if (query_string != NULL &&
+		((list_length(a->refs) == 1 &&
+		  (strncmp(query_string, KS_FRAGMENT_MARKER, strlen(KS_FRAGMENT_MARKER)) == 0 ||
+		   strncmp(query_string, KS_WRITE_MARKER, strlen(KS_WRITE_MARKER)) == 0 ||
+		   strncmp(query_string, KS_INSERT_MARKER_PREFIX, strlen(KS_INSERT_MARKER_PREFIX)) == 0)) ||
+		 strncmp(query_string, KS_INSERT_SELECT_MARKER_PREFIX, strlen(KS_INSERT_SELECT_MARKER_PREFIX)) == 0))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("this node does not accept the fragment that another node sent it"),
@@ -1863,6 +2058,62 @@ planner_hook_body(Query *parse, const char *query_string,
 									NameStr(ref->dt->dist_column), get_rel_name(ref->dt->relid)),
 							 errdetail("The row would have to move to another bucket, possibly of another shard group."),
 							 errhint("DELETE the row and INSERT it with the new key.")));
+			}
+		}
+	}
+
+	/*
+	 * A colocated INSERT ... SELECT is shipped whole (P6, design 11.7).  It comes before the
+	 * row router, which stays the answer for every statement this path does not take.
+	 */
+	if (parse->commandType == CMD_INSERT && parse->resultRelation > 0 &&
+		kingres_shard_enable_colocated_insert_select)
+	{
+		DistRef    *target = NULL;
+
+		foreach(lc, a.refs)
+		{
+			DistRef    *ref = (DistRef *) lfirst(lc);
+
+			if (ref->query == parse && ref->rti == (Index) parse->resultRelation)
+				target = ref;
+		}
+		if (target != NULL && target->bucket < 0 && !target->param_pending)
+		{
+			int64		generation = kingres_shard_catalog_generation();
+			PlannedStmt *shipped = plan_colocated_insert_select(parse);
+
+			if (shipped != NULL)
+				return shipped;
+
+			/*
+			 * The analysis of the statement, and the parse of its text, take locks, which process
+			 * invalidations and can make this backend load the catalog cache again: every pointer
+			 * that this function took from the old one (the tables of a.refs, the nodes) is then
+			 * dangling.  Decide again from the start, with the new cache; the second pass cannot
+			 * come back here for the same reason more than a few times.
+			 */
+			if (kingres_shard_catalog_generation() != generation)
+			{
+				static int	replans = 0;
+				PlannedStmt *again;
+
+				if (replans >= 3)
+					ereport(ERROR,
+							(errcode(ERRCODE_KINGRES_STALE_MAP),
+							 errmsg("the catalog of the cluster changed again and again while the statement was planned"),
+							 errhint("Repeat the statement.")));
+				replans++;
+				PG_TRY();
+				{
+					again = planner_hook_body(parse, query_string, cursorOptions, boundParams);
+				}
+				PG_FINALLY();
+				{
+					replans--;
+				}
+				PG_END_TRY();
+				return again;
 			}
 		}
 	}

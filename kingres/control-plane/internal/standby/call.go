@@ -63,7 +63,7 @@ func (a *Agent) HandleCall(ctx context.Context, key string, body []byte) (res an
 		if err := json.Unmarshal(body, &r); err != nil {
 			return nil, bad(errors.New("the body is not a rebuild request"))
 		}
-		res, err := a.Rebuild(ctx, r.Entry, r.Diverged)
+		res, err := a.rebuild(ctx, r.Entry, r.Diverged, r.Term)
 		return res, mapErr(err)
 	case CallStatus:
 		return a.Status(ctx), nil
@@ -82,6 +82,10 @@ func mapErr(err error) error {
 	switch {
 	case err == nil:
 		return nil
+	case errors.Is(err, ErrOldPrimaryRunning):
+		return &internalapi.CallError{Status: http.StatusConflict, Code: "old_primary_running", Message: "The old primary of the group runs on this server; it has to be stopped first."}
+	case errors.Is(err, ErrNotFormerPrimary):
+		return &internalapi.CallError{Status: http.StatusConflict, Code: "not_former_primary", Message: "The instance is a primary that is not proved to be the former primary of the group, so it is not rebuilt."}
 	case errors.Is(err, ErrNotProvedStandby):
 		return &internalapi.CallError{Status: http.StatusConflict, Code: "not_a_standby", Message: "The instance is not proved to be a standby, so it is neither deleted nor rebuilt."}
 	case errors.Is(err, ErrConflict):

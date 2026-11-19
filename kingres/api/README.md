@@ -355,8 +355,17 @@ means that a signed checkpoint of the chain log covers the block.
 
 #### Documentation
 
-Implemented by `kingresd` with this revision: `getLedgerSettings`, `updateLedgerSettings`, `getLedgerSigning`, `createLedgerSigningKey`,
-`retireLedgerSigningKey`, `revokeLedgerSigningKey` and `getLedgerTrustFile` (the signing keys, step 4 of the plan); the other 21 operations answer 422
+Steps 5 and 6 of the plan (the collector, the chain logs, the aggregate and the publication) implement `getLedgerPublication`, `getLedgerAggregate` and
+`listLedgerAggregates` **without a change of the contract**: the schemas were written with 0.11.0. `generateLedgerDigest` reads every shard group of the database
+(a group that cannot be read is named in `uncoveredShardGroupIds` and the digest is `complete: false`; `503 service_unavailable` when no group answers),
+`LedgerDigest.aggregateHash` is the hex of the root of the aggregate log and `aggregateSize` its size (both null while publication is off or no aggregate exists), and
+`listLedgerDigests` lists the digests of every group (`id` is the identifier of that digest, not the one of a digest of a single chain). `LedgerAggregateMember.flags`
+holds `stale`, `diverged` or `retired`; `LedgerAggregate.complete` is false and `uncoveredShardGroupIds` names the groups whose member is `stale` or `diverged`.
+The three reads are answered by the manager leader (a follower forwards them). The files of a publication are not part of this contract: they are served by the
+separate listener of `kingresd` in the layout of the C2SP tlog-tiles.
+
+Implemented by `kingresd` with revision 0.11.0 first: `getLedgerSettings`, `updateLedgerSettings`, `getLedgerSigning`, `createLedgerSigningKey`,
+`retireLedgerSigningKey`, `revokeLedgerSigningKey` and `getLedgerTrustFile` (the signing keys, step 4 of the plan); of the other 21 operations three are implemented by steps 5 and 6 (above) and the rest answer 422
 `unsupported_operation` until their step is built. `getLedgerTrustFile` through a follower keeps `Content-Disposition`. The key tasks have the
 subject `ledgerKey` with the id `signing`, and their task error codes are not an enum (clients tolerate codes they do not know): `key_set_damaged`,
 `clock`, `term_over`, `not_leader`, `last_signing_key`, `key_files_remain`, `key_file_missing`, `signer_unavailable`, `cannot_sign`, `cannot_activate`,

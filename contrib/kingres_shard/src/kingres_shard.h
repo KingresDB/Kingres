@@ -22,7 +22,7 @@
 #include "fmgr.h"
 
 /* The version of the extension this library belongs to (the SQL objects of every node must match). */
-#define KINGRES_SHARD_EXT_VERSION "0.5"
+#define KINGRES_SHARD_EXT_VERSION "0.6"
 #include "nodes/params.h"
 #include "nodes/parsenodes.h"
 #include "nodes/plannodes.h"
@@ -158,6 +158,7 @@ extern PGDLLIMPORT char *kingres_shard_node_conninfo;
 extern PGDLLIMPORT int kingres_shard_recovery_interval;
 extern PGDLLIMPORT bool kingres_shard_enable_distributed_scan;
 extern PGDLLIMPORT bool kingres_shard_enable_bulk_routing;
+extern PGDLLIMPORT bool kingres_shard_enable_colocated_insert_select;
 extern PGDLLIMPORT bool kingres_shard_enable_copy_routing;
 extern PGDLLIMPORT int kingres_shard_insert_batch_rows;
 extern PGDLLIMPORT int kingres_shard_insert_batch_bytes;

@@ -19,6 +19,7 @@ kingres_shard_sources = files(
   'src/placement_check.c',
   'src/planner.c',
   'src/prune.c',
+  'src/pushdown.c',
   'src/recovery.c',
   'src/remote_scan.c',
   'src/row_router.c',
@@ -56,6 +57,8 @@ install_data(
   'kingres_shard--0.3--0.4.sql',
   'kingres_shard--0.5.sql',
   'kingres_shard--0.4--0.5.sql',
+  'kingres_shard--0.6.sql',
+  'kingres_shard--0.5--0.6.sql',
   kwargs: contrib_data_args,
 )
 
@@ -78,6 +81,8 @@ tests += {
       'ddl_single',
       'rebalance_plan',
       'bulk_plans',
+      'pushdown_shippable',
+      'pushdown_plans',
       'upgrade',
     ],
     'regress_args': ['--temp-config', files('kingres_shard.conf')],
@@ -206,6 +211,9 @@ tests += {
       't/117_bulk_memory.pl',
       't/118_review_steps_1_2.pl',
       't/119_nested_subxacts.pl',
+      't/120_colocated_insert_select.pl',
+      't/121_insel_roundtrip_security.pl',
+      't/122_insel_faults_moves.pl',
     ],
   },
 }

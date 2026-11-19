@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgerlog"
 )
 
 // The events of the key history (design 3.2.4). An event is a signed note whose key name is the origin
@@ -103,4 +105,36 @@ func noteText(note []byte) []byte {
 		return nil
 	}
 	return note[:i+1]
+}
+
+// verifyEvents checks the chain of stored events at every load (P7-05): numbered from 0 without a gap, each note parses, carries the number and the type of its row
+// and is signed by at least one key of the stored set (the keys of the set include the revoked ones, whose old events stay valid). A row that was
+// changed, deleted or added by somebody who can write to the system database but holds no signing key fails this. What it does not prove, and the README
+// says so: that every transition of the key rows follows from the events (the trust file comparison covers the rows against the published file, and
+// both live in the same database), and that the events were not deleted from the end.
+func verifyEvents(v *view) error {
+	if len(v.snap.Events) == 0 {
+		return nil
+	}
+	keys := make([]ledgerlog.NoteKey, 0, len(v.set))
+	for _, k := range v.set {
+		keys = append(keys, ledgerlog.NoteKey{Name: v.prefix, Public: k.Public})
+	}
+	for i, e := range v.snap.Events {
+		if e.Seq != int64(i) {
+			return fmt.Errorf("the stored events are not numbered without a gap (event %d at place %d)", e.Seq, i)
+		}
+		n, err := ledgerlog.ParseNote(e.Note)
+		if err != nil {
+			return fmt.Errorf("the stored event %d is not a signed note", i)
+		}
+		f, err := eventFields(n.Text)
+		if err != nil || f["seq"] != strconv.Itoa(i) || f["type"] != e.Type {
+			return fmt.Errorf("the stored event %d does not say what its row says", i)
+		}
+		if _, err := ledgerlog.VerifyNote(n, keys); err != nil {
+			return fmt.Errorf("the stored event %d is not signed by a key of the set", i)
+		}
+	}
+	return nil
 }

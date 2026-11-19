@@ -75,6 +75,7 @@ char	   *kingres_shard_node_conninfo = NULL;
 int			kingres_shard_recovery_interval = 30;
 bool		kingres_shard_enable_distributed_scan = true;
 bool		kingres_shard_enable_bulk_routing = true;
+bool		kingres_shard_enable_colocated_insert_select = true;
 bool		kingres_shard_enable_copy_routing = true;
 int			kingres_shard_insert_batch_rows = 1000;
 int			kingres_shard_insert_batch_bytes = 1048576;
@@ -216,6 +217,14 @@ _PG_init(void)
 							 "Route an INSERT that goes to several shard groups through the row router.",
 							 "When off, such an INSERT is refused as in 2a: a multi-row INSERT, INSERT ... SELECT, and a single row whose key is not a constant.",
 							 &kingres_shard_enable_bulk_routing,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("kingres_shard.enable_colocated_insert_select",
+							 "Ship a colocated INSERT ... SELECT whole to every shard group, so that no row passes through this node.",
+							 "When off, such a statement goes through the row router when it can (no ON CONFLICT DO UPDATE) and is refused when it cannot.",
+							 &kingres_shard_enable_colocated_insert_select,
 							 true,
 							 PGC_USERSET, 0,
 							 NULL, NULL, NULL);

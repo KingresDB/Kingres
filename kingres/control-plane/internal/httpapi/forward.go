@@ -62,6 +62,8 @@ var leaderBoundReads = map[string]bool{
 	"listLedgerVerifications": true, "getLedgerVerification": true,
 	// The signing keys, the events and the trust file are in the leader's system database (phase 7).
 	"getLedgerSettings": true, "getLedgerSigning": true, "getLedgerTrustFile": true,
+	// The logs, the aggregates and the digests of the publication are in the leader's system database (phase 7, steps 5 and 6).
+	"getLedgerPublication": true, "getLedgerAggregate": true, "listLedgerAggregates": true, "listLedgerDigests": true,
 }
 
 // forwardsToLeader tells whether an operation is run by the leader. Mutating
