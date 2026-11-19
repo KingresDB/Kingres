@@ -2288,3 +2288,60 @@ alerts of the monitor (a read-only transaction). The reading of the topology
 answers 503 at the formation of a cluster in about one formation in twenty.
 The text of `notScheduled` in the contract no longer fits and waits for the
 next revision.
+
+### The fixes for the review of increment 3 (2026-11-19)
+
+The review of increment 3 (F3-01 to F3-16) found four high defects by reading. What the fixes
+changed against sections 3 to 7, and what the contract gained (0.12.0, additive).
+
+**A failed failover does not take the lease from the primary it promoted (F3-01).** The release of
+an adoption is refused when the adoption is attached to a running primary, and the call answers
+that the lease is still held.
+
+**Fencing of the old primary must be proved (F3-02, F3-12).** The leader records how many standbys
+the plan of each group carried (migration 0018). When the old server does not answer and the leader
+has no proof that its plan carried a standby, a group without a standby is never stopped by a lapsed
+lease, so the failover is refused with `cluster_inconsistent` unless the caller allows a loss of
+data; a dry run shows it as a blocker. The other way, a lease that fences whatever the plan says, is
+not built.
+
+**The verdict about lost writes (F3-03).** The time in which the old primary was not observed is
+taken only from the silence that a majority of the members share, and only what exceeds the lease
+and its margin; the leader asks the other members. A leader that alone lost the old server no longer
+concludes "none".
+
+**A failover and a change of the databases exclude each other (F3-04).** The preflight checks that
+the old primary is in the catalog of every database. A failover is refused while a database is
+created or dropped or a table is distributed, and those are refused while a failover is unfinished
+(migration 0016; the database operations answer `failover_in_progress`, the failover
+`operation_in_progress`). A failure to read the targets after the promotion is a pause, never a
+failed task.
+
+**Smaller ones.** A promotion that was begun and not finished is finished, not refused (F3-05). A
+pin that can be read is kept; one that cannot is withdrawn while nothing is promoted (F3-06). A
+primary that still runs is stopped only after some standby was read (F3-07). The attach of the
+promoted instance answers `lease_not_held` on both paths (F3-08). The entry point of a server whose
+own catalog cannot be read takes the nodes from a peer (F3-09). Prepared transactions are recovered
+and the cluster checked in every database (F3-10). A standby that is found out of recovery and that
+this task did not pin pauses the task with the alert `splitPromotion`; it is adopted only when a
+loss is allowed, with the verdict "possible" (F3-11). The calls that demote, promote, change a lease
+or recover prepared transactions name the group, and demote and promote need the fence header
+(F3-13). A freeze is lifted only by the task that set it (F3-14). A failover that ended with an
+incident of the cluster check ends `completedWithWarnings` (F3-15, migration 0017).
+
+**The contract, 0.12.0.** `FailoverReportSummary.outcome` has `completedWithWarnings`; the problem
+of a 409 `failover_needs_decision` carries the plan; the text of `notScheduled` is corrected.
+
+**The lease code.** Renewal rounds, releases and transfers returned at a majority and left requests
+in flight; a late one could reach a grantor after the group was released. A release now waits for
+the requests of its group.
+
+**A member that does not know the leader** answers 503 with `Retry-After`, and a client repeats; it
+does not forward or queue. The window without a leader is the election plus the lease. Tests that
+read the topology or a task once while the state moved now wait through that answer.
+
+**Open after this round.** The test of the entry point (F3-09) passes without the fix on a real
+cluster, so only a unit test shows it. No cluster test for F3-05, F3-08 and F3-10. Real writers on
+a primary that is cut off or killed are not tested for F3-03. Not covered of F3-16: a standby that
+lags, a lost answer of a call, an instance killed under writers. Of increment 5 (the failover of the
+map group) only the journal of a bootstrap exists (`internal/failover/journal`), used by nothing.
