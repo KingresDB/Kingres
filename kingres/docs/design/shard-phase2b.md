@@ -2863,3 +2863,27 @@ group, a stale cache at the origin).
   what no rule accepts is `0A000`. The receiving side decides on text that was
   deparsed and parsed again, so a rule is tested by that round trip
   (`t/118` has the pattern).
+
+### Version 0.6 was made before steps 5 to 12
+
+Section 14 and row 13 of section 17 put the version bump last. It was made
+after steps 3 and 4 instead: phase 9 was started beside the remaining steps of
+this phase and builds its catalog on 0.6 (as 0.7; phase 10 is then 0.8 and
+phase 11 is 0.9, each one higher than its own document says). No release
+exists between the two points, so the order matters to no user.
+`kingres_shard--0.5--0.6.sql` exists and `default_version` is 0.6, while the
+later code steps of this phase still change only C files, tests and the
+README.
+
+One correction to section 14, which says that the script holds the standard
+guard and a comment only: it also replaces
+`kingres.internal_check_node_versions()`, because that function names the
+required version in its body and in its message, and a fresh 0.6 would
+otherwise refuse every bucket move. No SQL object is added, dropped or changed
+in its signature; an installation upgraded from 0.1, 0.2, 0.3, 0.4 or 0.5 has
+the same catalog as a fresh 0.6, which the `upgrade` regression test compares.
+
+For a test run of both majors: the test of a cluster of two majors
+(`t/046`) uses the extension as it is installed for the other major, so after
+a change of the version both installations must hold the new version before
+that test can pass.
