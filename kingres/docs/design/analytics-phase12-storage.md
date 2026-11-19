@@ -2401,3 +2401,49 @@ Time partitioning:
 10. **`kingres/api/README.md` and `check-contract.mjs`** require every `TaskKind` to
    have a row in the "Task kinds and subjects" table (section 13), so the
    contract change touches the README in the same commit.
+
+## 21. Found while building
+
+### C5, parallel scan (2026-11-19)
+
+- **The test is `t/043_parallel.pl`**, with the plan test `columnar_parallel`; section 15 names it
+  `005_parallel`, and `t/005` is the corruption test.
+- **No plan has a parallel sequential scan of a columnar table (6, 8.4).** The rows a transaction
+  wrote and still holds in memory must be written as stripes before the executor enters parallel
+  mode, because a catalog row cannot be inserted in it. For a plan node the only place that runs
+  before that is `BeginCustomScan`; the table access method has no such callback. So the plain
+  `parallelscan_*` callbacks stay as they were, the planner's partial sequential scan paths of a
+  columnar table are removed, and with `kingres_columnar.enable_custom_scan` off there is no
+  parallel scan.
+- **What cannot be written before parallel mode** (rows of an enclosing subtransaction, rows that
+  another scan of the session still reads) makes the planner offer no parallel path for the table.
+  A plan prepared earlier that meets such rows fails with an error; it never answers with rows
+  missing.
+- **The scan without workers is parallel safe**: in a worker it reads the whole table (the inner
+  side of a partial join, a whole child of a Parallel Append, the single copy that
+  `debug_parallel_query` runs). A query that a function runs inside a worker is still refused: the
+  worker remembers the plan it was started for, and only scans of that plan run there.
+- **The shared state** holds, beside the counter of the next stripe, the length and a fingerprint
+  of the leader's stripe list, which every participant compares with its own, and one slot of
+  counters per participant for `EXPLAIN ANALYZE`.
+- **Workers**: at most the number of stripes less one. The size the planner compares with
+  `min_parallel_table_scan_size` is the compressed size, so a columnar table reaches a parallel
+  plan later than the same data in a heap table; the storage parameter `parallel_workers`
+  overrides it. A factor for the compressed size is open.
+- **No change** of the on-disk format, the metapage, the WAL, the SQL objects or the version.
+
+### Decisions for C6, indexes (2026-11-19)
+
+C6 is built in four parts: the reservation of row numbers and the early catalog row with no index
+yet (C6a), the fetch by TID and the index build (C6b), unique indexes and index vacuum (C6c),
+compaction with the standby and crash tests (C6d). Decided where sections 5.3 and 7.8 are silent:
+
+- A write buffer that reserves takes a stripe's worth of row numbers; the unused tail is given back
+  when it is still the end of the range, otherwise the gap stays.
+- While a buffer holds a reservation, a subtransaction that commits writes it as a stripe of its
+  own; it is not merged into the buffer of its parent.
+- Reservation applies only to a table that has an index.
+- `columnar_compact` on a table with indexes rebuilds every index of the table in the same
+  transaction under the lock that this needs; `CLUSTER` stays refused.
+- The catalog of stripes gains a state "reserved, not written", so C6 is version 0.2 with an
+  upgrade script; a table written by 0.1 stays readable and writable.
