@@ -82,6 +82,11 @@ func (e *Error) TaskCode() string { return e.Code }
 // TaskRetryable says whether repeating the request can succeed.
 func (e *Error) TaskRetryable() bool { return e.Retryable }
 
+// Fail makes an Error for another package (the bootstrap of the map group).
+func Fail(code string, retryable bool, format string, a ...any) *Error {
+	return fail(code, retryable, format, a...)
+}
+
 func fail(code string, retryable bool, format string, a ...any) *Error {
 	return &Error{Code: code, Message: fmt.Sprintf(format, a...), Retryable: retryable}
 }

@@ -242,7 +242,7 @@ func (s *Service) credentials() (string, error) {
 }
 
 func (s *Service) publishDSN() {
-	dsn := s.ServiceDSN("kingres_system")
+	dsn := s.SystemDSN()
 	if dsn == "" {
 		return
 	}
@@ -402,3 +402,30 @@ func (s *Service) homeConn(ctx context.Context, db string) (*pgx.Conn, error) {
 	}
 	return s.connect(ctx, db)
 }
+
+// SystemDSN is the connection string of the system database that the sinks of OnDSN use (the task engine, the store, the sign-in
+// authenticator): the instance that serves the map group when this server runs a promoted copy of it (the new manager leader after a failover
+// of the map group, design ha-phase5-part2.md 3.4, reached by peer authentication over its socket like every copy), the home instance otherwise.
+func (s *Service) SystemDSN() string {
+	if s.mgr != nil {
+		if li, ok := s.PrimaryOf(0); ok && li.Role.Group == 0 && li.ID != NodeID && s.mgr.IsCopy(li.ID) {
+			if sock, err := s.mgr.SocketDir(li.ID); err == nil {
+				dsn, err := pgconninfo.Format(
+					pgconninfo.Pair{Key: "host", Value: filepath.ToSlash(sock)},
+					pgconninfo.Pair{Key: "port", Value: strconv.Itoa(li.Port)},
+					pgconninfo.Pair{Key: "dbname", Value: "kingres_system"},
+					pgconninfo.Pair{Key: "user", Value: instance.ServiceRole},
+					pgconninfo.Pair{Key: "sslmode", Value: "disable"},
+				)
+				if err == nil {
+					return dsn
+				}
+			}
+		}
+	}
+	return s.ServiceDSN("kingres_system")
+}
+
+// PublishSystemDSN gives the sinks of OnDSN the system DSN as it is now: after a promotion of the map group the engine and the store
+// move to the promoted instance.
+func (s *Service) PublishSystemDSN() { s.publishDSN() }

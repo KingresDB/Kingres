@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.12.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.13.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and `kingres-cli`. Lint it and run the mechanical rule check with:
 
 ```
@@ -317,6 +317,33 @@ Where the architecture document leaves something open, the simplest option was c
     range and the cluster's replica count.
 
 ## Changelog
+
+### 0.13.0
+
+Revision written with the failover of the map group (increment 5 of `kingres/docs/design/ha-phase5-part2.md`). Summary for the panel:
+0 operations added (132 operations, 108 paths); one value added to an enum, the meaning of one id and the answer of one operation
+extended; **no change that is not additive**.
+
+#### Breaking
+
+None.
+
+#### Additive
+
+- `AlertKind` has `certificateAuthorityUnavailable` (`critical`, subject `cluster`): the map group was failed over, the new manager leader
+  holds no key of the certificate authority, and no certificate can be issued, renewed or revoked until the operator restores `pki/ca.key` and
+  `pki/revoked.json` from the backup of the old leader. A client that does not know the kind shows it as an alert of an unknown kind.
+- `failoverServer` for the server that runs the primary of the map group (the manager leader) is answered by any server that does not hear it:
+  202 with a `Task` whose `id` is 0 while no task can be recorded (the steps of the bootstrap, `state` `running`), `Location: /api/v1/failover`.
+  `GET /tasks/0` and `GET /failover` are answered by the server that runs the bootstrap until the task is recorded; `GET /failover` then names it
+  in `taskId`. In mode `hard` only; `dryRun` and `graceful` answer 422 `unsupported_operation`.
+
+#### Documentation
+
+- `Task.id`: 0 is the task that stands for the bootstrap; it never names a stored task.
+- The console should show: the pseudo task (a progress bar of the eight steps B1 to B8 while `id` is 0, then the recorded task), the paused
+  rebalance (`stoppedBy` `safetyRule`, text "The map group was failed over."), and the alert `certificateAuthorityUnavailable` with the
+  steps of its message.
 
 ### 0.12.0
 

@@ -230,3 +230,41 @@ func (s *Store) Recorded(taskID int64) error {
 
 // Gate is the function the task engine asks (task.Options.Gate): false while a bootstrap is in progress.
 func (s *Store) Gate() bool { return !s.Active() }
+
+// Adopt makes the journal of another server's bootstrap this server's own (the better candidate that was handed the lease at B4):
+// it is written as it is, with the steps that finished there, and refused when this server's journal belongs to a newer term or
+// to an unfinished bootstrap of another id.
+func (s *Store) Adopt(j Journal) (Journal, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.j != nil {
+		switch {
+		case s.j.Term > j.Term:
+			return Journal{}, ErrNewerTerm
+		case s.j.ID == j.ID:
+			return s.copyLocked(), nil
+		case s.j.Term == j.Term && !s.finishedLocked():
+			return Journal{}, errors.New("journal: another bootstrap of this term is in progress")
+		}
+	}
+	if j.Done == nil {
+		j.Done = map[string]time.Time{}
+	}
+	c := j
+	s.j = &c
+	return s.copyLocked(), s.saveLocked()
+}
+
+// Undo forgets that steps finished. A restarted kingresd uses it for the steps whose effect lives in the memory of the process (the
+// adoption of the lease at B3 and B5): they are idempotent, so they are done again before the step that needs them (B6).
+func (s *Store) Undo(steps ...string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.j == nil {
+		return errors.New("journal: no bootstrap is in progress")
+	}
+	for _, st := range steps {
+		delete(s.j.Done, st)
+	}
+	return s.saveLocked()
+}

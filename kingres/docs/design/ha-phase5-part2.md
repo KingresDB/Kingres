@@ -2345,3 +2345,72 @@ cluster, so only a unit test shows it. No cluster test for F3-05, F3-08 and F3-1
 a primary that is cut off or killed are not tested for F3-03. Not covered of F3-16: a standby that
 lags, a lost answer of a call, an instance killed under writers. Of increment 5 (the failover of the
 map group) only the journal of a bootstrap exists (`internal/failover/journal`), used by nothing.
+
+### Increment 5 (the failover of the map group) and the open items of the third review (2026-11-19)
+
+**What was built.** A request to fail over the server that runs the primary of the map group (the
+leader) is answered by any member that cannot hear it, in mode `hard` only. The member relays it to
+a candidate, a server with a ready registered standby of group 0, over the internal call
+`POST /internal/v1/failover/map/start` (`/continue` for a hand-over). The candidate runs the
+bootstrap B1 to B8 from a journal that survives a restart of `kingresd`:
+
+- **B1** decides: the catalog names the old server primary of group 0, a ready standby is here, a
+  majority is heard.
+- **B2** freezes locally.
+- **B3** asks the old server to demote if it answers, and takes the fence lease from a majority.
+- **B4** reads the positions and ranks the standbys as an ordinary failover does, and writes the pin
+  once. If another standby is better, the lease and the journal are handed to it.
+- **B5** takes the holder lease and makes the same promote call as the task.
+- **B6** runs `promote_node` on the promoted instance itself in every database. It repeats every 5
+  seconds while the majority rule of the extension refuses; after 60 seconds it raises
+  `failoverBlocked`, and after 10 minutes it pauses.
+- **B7** waits until the local catalog names this server primary of group 0 with a higher term,
+  moves the system database and pauses the rebalance that was running (outcome stopped,
+  `stopped_by` safetyRule, "The map group was failed over."). It then records the run as an
+  ordinary failover task, whose group-0 steps up to F7 are done.
+- **B8** checks for the key of the certificate authority and opens the gate of the task engine.
+
+While the bootstrap runs, `GET /tasks/0` and `GET /failover` are answered by the candidate. Task id 0
+never names a stored task. REST contract 0.13.0 (additive) has this, and the alert
+`certificateAuthorityUnavailable`.
+
+**Departures from the design.**
+
+- **The key of the certificate authority is not escrowed** (section 11.2). No sealing key could be
+  derived from what exists without a new construction, and the cluster secret lives in the
+  extension, not in `kingresd`. The bootstrap runs without it. A new leader that has no
+  `pki/ca.key` raises the critical alert `certificateAuthorityUnavailable` at B8. No certificate can
+  then be issued, renewed or revoked until the operator restores `pki/ca.key` and
+  `pki/revoked.json` from the old leader's backup and restarts `kingresd`.
+- **Authority of a manual request.** The member that receives the request authenticates the
+  operator and relays it. The candidate does not check the role again; it proves everything else
+  itself (the catalog, the standby, the majority, the lease, the extension's majority rule). The
+  design asked for the same role check as on the leader; this is weaker.
+- **A restart of the candidate** undoes B3 and B5 (idempotent) when B6 is not done, because the
+  adoption of the lease lived in memory. Members then come from the peer directory when the
+  catalog cannot be read.
+- **The stores follow the promoted instance.** The task engine's store and the REST store were
+  bound to the address of the home instance; they now follow the system database where it moves.
+  The sign-in authenticator stays on the home instance.
+- **A promoted copy keeps the rule that lets `kingresd` connect to it.** The rules a restarted
+  `kingresd` rewrote for a primary dropped the `kingres_standby` line from `pg_hba` and `pg_ident`.
+  This also affected every ordinary promoted instance after a restart.
+- **Not built:** monitors for an automatic failover of the map group (increment 6), `graceful` and
+  the dry run for it, and the second condition of the gate (the group-0 instance in recovery). When
+  the extension's majority can never be reached, the bootstrap only pauses after 10 minutes, with no
+  operation of its own for the operator.
+
+**The open items of the third review.** F3-05, F3-08, F3-09 and F3-10 have cluster tests. F3-05 and
+F3-08 use one-shot fault points that stand in for their causes: a promote call that ends after the
+role file, and a lease that cannot be attached. F3-09 uses a failover paused after the old primary
+stopped, so the old server's catalog cannot be read. The test of F3-10 shows that prepared
+transactions are recovered in every database, but makes no prepared transaction of its own.
+
+**Open.**
+
+- In 2 of 12 runs, the last step of two tests (resuming a paused failover after the heal and a
+  repeated request) timed out after 6 minutes. The assertion each test is about had already passed,
+  and the cause is not known.
+- A map group failover whose old server also held primaries of ordinary groups is not tested.
+- A hand-over at B4 and a demotion at B3 by a live old server are tested only with fakes.
+- A kill of the old leader under writers is not tested.

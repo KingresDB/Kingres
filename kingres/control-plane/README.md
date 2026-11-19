@@ -333,7 +333,7 @@ handlers in `internal/httpapi/handlers_config.go`, wiring in `cmd/kingresd/confi
 
 ## What is implemented
 
-The server implements revision **0.12.0** of the contract (132 operations, 108
+The server implements revision **0.13.0** of the contract (132 operations, 108
 paths; what is not done is in "Not done in this increment"). "Real" means the operation works against PostgreSQL or the local node
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
@@ -2999,11 +2999,9 @@ failover task at `<step name>:before`.
 
 ## The map group (increment 5 of ha-phase5-part2.md): what exists, and what does not
 
-Only the journal exists: `internal/failover/journal` is the local file `<data-dir>/failover/map-journal.json` (atomic and durable after every step,
-steps B1 to B8, the pin written once, events, `Gate()` for `task.Options.Gate`), with its tests. **Not built:** the bootstrap B1 to B8 itself, the
-candidate monitors, the closing of the engine gate by the journal in `main.go`, the pause of the old rebalance, the recorded task and the
-pseudo task with id 0, the escrow of the certificate authority (`POST /pki/escrow`), the tests T5, T5b, T6, T6b and T6c. `Preflight` still refuses the
-map group with 422 `unsupported_operation`.
+Built (contract 0.13.0): `internal/failover/journal` (the local journal), `internal/failover/mapgroup` (the bootstrap B1 to B8 over ports, tested with fakes at every step boundary), `cmd/kingresd/mapfailover.go` (the real ports, the candidate, the receiver, the answers about the bootstrap), `failover.RecordMapGroupRun` (the recorded task), `rebalance.PauseForMapGroupFailover`, the engine gate (`task.Options.Gate` from the journal) and the calls `POST /failover/map/start` and `/continue`. A request for the failover of the server that runs the primary of the map group is answered by any server that does not hear it (`httpapi.MapFailoverer`) with the task with id 0.
+
+**Not built:** the escrow of the key of the certificate authority (an alert, `certificateAuthorityUnavailable`, says what the operator does by hand: restore `pki/ca.key` and `pki/revoked.json` of the old leader from its backup into the pki directory of the new leader and restart kingresd), the candidate monitors that act on their own (automatic failover, increment 6), the second condition of the gate (the instance of group 0 in recovery), `graceful` for the map group. `Preflight` still refuses the map group with 422 `unsupported_operation` when the leader is alive (the request then goes to the leader).
 
 ## The signing keys of the ledger (phase 7, steps 3 and 4, contract 0.11.0)
 

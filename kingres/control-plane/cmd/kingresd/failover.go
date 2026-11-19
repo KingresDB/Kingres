@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -45,12 +46,15 @@ const (
 
 // failoverDeps is filled once the high-availability features exist (they are made after the
 // service that needs them).
-type failoverDeps struct{ d *haDeps }
+type failoverDeps struct {
+	d  *haDeps
+	mf *mapFailover
+}
 
 // newFailover builds the failover service of the manager leader: the ports of the task over
 // the peer client, the extension's functions and the records of the leader.
 func newFailover(svc *cluster.Service, o *ops.Ops, m *membership.Manager, stby *standbyParts, reg *ha.Registry, calls *callTable, self string, fh *fault.Hook,
-	log *slog.Logger, auditFn func(context.Context, audit.Event), fd *failoverDeps) *failover.Service {
+	dataDir string, log *slog.Logger, auditFn func(context.Context, audit.Event), fd *failoverDeps) *failover.Service {
 	cat := &foCatalog{svc: svc, log: log}
 	pl := &foPlanner{svc: svc, self: self, reg: reg, stby: stby, cat: cat, log: log, audit: auditFn, calls: calls, client: m.Client}
 	peers := &foPeers{self: self, calls: calls, client: m.Client}
@@ -58,6 +62,23 @@ func newFailover(svc *cluster.Service, o *ops.Ops, m *membership.Manager, stby *
 		NewRows: func(id int64) failover.Rows { return &failover.PGRows{Conns: svc, TaskID: id} }}
 	fs := &failover.Service{Runner: r, Conns: svc, Engine: o.Engine, Log: log, Audit: auditFn}
 	pl.svcRef = fs
+	if mf, err := newMapFailover(dataDir, svc, self, log, fd, peers, cat, pl, r, func(point string) error {
+		switch fh.FailoverInjection("map:" + point) {
+		case "exit":
+			log.Warn("the bootstrap of the map group ends kingresd at a crash point (injected by a test)", "point", point)
+			os.Exit(137)
+		case "hold":
+			log.Warn("the bootstrap of the map group holds at a point (injected by a test)", "point", point)
+			for fh.FailoverInjection("map:"+point) == "hold" {
+				time.Sleep(200 * time.Millisecond)
+			}
+		}
+		return nil
+	}); err != nil {
+		log.Error("the journal of the failover of the map group cannot be opened", "error", err)
+	} else {
+		fd.mf = mf
+	}
 	stby.leader.Busy = func(ctx context.Context) map[int32]bool { return pl.busyGroups(ctx) }
 	return fs
 }
@@ -424,10 +445,19 @@ type foPlanner struct {
 	calls  *callTable
 	client *peerclient.Client
 	svcRef *failover.Service
+	// localSys, when set, is where the planner reads the system database: the local copy of a candidate for the map group, whose
+	// own system database is not writable (the bootstrap, design 3.4).
+	localSys func(ctx context.Context) (*pgx.Conn, error)
 }
 
 func (p *foPlanner) sys(ctx context.Context, f func(c *pgx.Conn) error) error {
-	c, err := p.svc.ServiceConn(ctx, sysdb.Database)
+	var c *pgx.Conn
+	var err error
+	if p.localSys != nil {
+		c, err = p.localSys(ctx)
+	} else {
+		c, err = p.svc.ServiceConn(ctx, sysdb.Database)
+	}
 	if err != nil {
 		return err
 	}
@@ -916,7 +946,7 @@ func handleFailoverPromote(ctx context.Context, d *haDeps, body []byte) (any, er
 			return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "lease_not_held", Message: "This server does not hold the lease of the shard group."}
 		}
 		// F3-08: an instance that is writable and not guarded by the lease is not reported as promoted.
-		if err := attachPromoted(d.LeaseMgr, r.Group); err != nil {
+		if err := attachPromotedInjected(d, r.Group); err != nil {
 			return nil, err
 		}
 		return promoteAnswer(ctx, c, "already", started), nil
@@ -939,6 +969,11 @@ func handleFailoverPromote(ctx context.Context, d *haDeps, body []byte) (any, er
 	if err := d.Svc.Manager().WriteRole(li.ID, instance.Role{Group: r.Group, Role: instance.RolePrimary, Origin: instance.OriginCopy, Term: term}); err != nil {
 		return nil, err
 	}
+	// A test ends the call here (the role file is written, pg_promote was not called): the repeat must finish the promotion (F3-05).
+	if d.Fault.FailoverInjectionOnce("promote:afterRoleFile") == "fail" {
+		d.Log.Warn("failover: the promote call ends between the role file and pg_promote (injected by a test)", "group", r.Group)
+		return nil, &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The call ended between the role file and the promotion (injected by a test)."}
+	}
 	// 3. The lease, checked as the last thing before the promotion with nothing slow between the two.
 	if !d.Registry.Leases().Holds(r.Group) {
 		// Put the role back: this instance is still a standby and no primary of the group runs here.
@@ -951,7 +986,7 @@ func handleFailoverPromote(ctx context.Context, d *haDeps, body []byte) (any, er
 		return nil, &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The promotion did not finish within its bound; repeat the call."}
 	}
 	// 4. The lease guards the instance from now on, and the watchdog covers it.
-	if err := attachPromoted(d.LeaseMgr, r.Group); err != nil {
+	if err := attachPromotedInjected(d, r.Group); err != nil {
 		d.Log.Warn("failover: attaching the lease to the promoted instance", "group", r.Group, "error", err)
 		return nil, err
 	}
@@ -1002,6 +1037,8 @@ func registerFailoverCallee(d *haDeps) {
 	reg(callFailoverDemote, handleFailoverDemote)
 	reg(callFailoverPromote, handleFailoverPromote)
 	reg("POST /failover/prepared", handleFailoverPrepared)
+	reg(callMapStart, handleMapStart)
+	reg(callMapContinue, handleMapContinue)
 }
 
 var _ = url.Values{}
@@ -1164,4 +1201,19 @@ func attachPromoted(m attacher, group int32) error {
 		return &internalapi.CallError{Status: http.StatusConflict, Code: "lease_not_held", Message: "The lease of the shard group could not be attached to the promoted instance: " + err.Error()}
 	}
 	return nil
+}
+
+// attachPromotedInjected is attachPromoted, with the failure that a test injects (a lease lost between the check and the attach, F3-08).
+func attachPromotedInjected(d *haDeps, group int32) error {
+	if d.Fault.FailoverInjectionOnce("promote:attach") == "fail" {
+		d.Log.Warn("failover: the attach of the lease fails (injected by a test)", "group", group)
+		return attachPromoted(failingAttacher{}, group)
+	}
+	return attachPromoted(d.LeaseMgr, group)
+}
+
+type failingAttacher struct{}
+
+func (failingAttacher) Attach(int32) error {
+	return errors.New("lease: the lease is not held (injected by a test)")
 }

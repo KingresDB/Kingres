@@ -116,6 +116,9 @@ func (s *Server) tryForward(c *call, w http.ResponseWriter, r *http.Request) (bo
 	if fw == nil || forwardedOf(r) != nil || !forwardsToLeader(c.op) || c.session == nil {
 		return false, nil
 	}
+	if done, err := s.mapFailoverIntercept(c, w, r); done {
+		return true, err
+	}
 	leaderID, self, err := fw.Leader(r.Context())
 	if err != nil || leaderID == "" {
 		if err != nil {

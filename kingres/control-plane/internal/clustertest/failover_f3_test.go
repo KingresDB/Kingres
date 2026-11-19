@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -260,4 +261,145 @@ func foConnAs(ctx context.Context, n *clustertest.Node, port int, pool *x509.Cer
 	cfg.Fallbacks, cfg.ConnectTimeout = nil, 5*time.Second
 	cfg.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool, ServerName: serverName}
 	return pgx.ConnectConfig(ctx, cfg)
+}
+
+// foEvents returns the events of the report of a failover task.
+func foEvents(t *testing.T, leader *clustertest.Node, id any) []map[string]any {
+	t.Helper()
+	rep := leader.Expect(200, "GET", fmt.Sprintf("/failover/reports/%v", id), nil)
+	var out []map[string]any
+	evs, _ := rep["events"].([]any)
+	for _, e := range evs {
+		if m, ok := e.(map[string]any); ok {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// foDeadFailover kills the old primary's server and runs a failover of it that the caller waits for.
+func foDeadFailover(t *testing.T, c *clustertest.Cluster, old *clustertest.Node, g int) any {
+	t.Helper()
+	leader := c.Leader()
+	waitFacts(t, leader, g)
+	foKillServer(old)
+	st, resp := leader.Do("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard"}, nil)
+	if st != 202 {
+		t.Fatalf("failover request: %d %v\n%s", st, resp, leader.LogTail(3000))
+	}
+	return clustertest.TaskID(resp)
+}
+
+// F3-10. The prepared transactions are recovered, and the incidents read, in every database that has a catalog: the report
+// names the database "fo" as well as the system database.
+func TestFailoverRecoversPreparedTransactionsInEveryDatabase(t *testing.T) {
+	c, _, _ := foClusterWith(t, "-lease-duration", "12s", "-lease-renew", "2s", "-lease-margin", "3s")
+	g, old, _ := foVictim(t, c)
+	id := foDeadFailover(t, c, old, g)
+	c.Leader().WaitTaskDone(id, 8*time.Minute)
+	seen := map[string]bool{}
+	for _, e := range foEvents(t, c.Leader(), id) {
+		if e["kind"] == "preparedRecovered" {
+			msg, _ := e["message"].(string)
+			for _, db := range []string{"kingres_system", "fo"} {
+				if strings.Contains(msg, `"`+db+`"`) {
+					seen[db] = true
+				}
+			}
+		}
+	}
+	if !seen["kingres_system"] || !seen["fo"] {
+		t.Fatalf("recover_prepared_transactions() was not recorded in every database: %v", seen)
+	}
+}
+
+// F3-05. The call that promotes the standby ends after it wrote the role file and before pg_promote: the repeat of the call
+// finishes the promotion. Without the fix the instance (role primary, still in recovery) is refused for ever with not_standby
+// and the task fails.
+func TestFailoverFinishesAPromotionThatEndedAfterTheRoleFile(t *testing.T) {
+	c, _, _ := foClusterWith(t, "-lease-duration", "12s", "-lease-renew", "2s", "-lease-margin", "3s")
+	g, old, nw := foVictim(t, c)
+	nw.SetFaults(fault.Spec{FailoverPoint: "promote:afterRoleFile", FailoverMode: "fail"})
+	id := foDeadFailover(t, c, old, g)
+	task := foWaitTask(t, c.Leader(), id, 8*time.Minute, "done", "failed")
+	if task["state"] != "done" {
+		t.Fatalf("the failover did not finish after the interrupted promotion: %v\n%s", task, nw.LogTail(3000))
+	}
+	if !strings.Contains(nw.Log(), "ends between the role file and pg_promote") {
+		t.Fatal("the interruption was never injected, the test shows nothing")
+	}
+}
+
+// F3-08. The lease cannot be attached to the promoted instance: the call does not answer success, the step hands the lease
+// over again and repeats, and the repeat attaches. The report shows the second hand-over.
+func TestFailoverPromoteAnswersLeaseNotHeldWhenTheLeaseCannotBeAttached(t *testing.T) {
+	c, _, _ := foClusterWith(t, "-lease-duration", "12s", "-lease-renew", "2s", "-lease-margin", "3s")
+	g, old, nw := foVictim(t, c)
+	nw.SetFaults(fault.Spec{FailoverPoint: "promote:attach", FailoverMode: "fail"})
+	id := foDeadFailover(t, c, old, g)
+	c.Leader().WaitTaskDone(id, 8*time.Minute)
+	if !strings.Contains(nw.Log(), "the attach of the lease fails") {
+		t.Fatal("the failure was never injected, the test shows nothing")
+	}
+	handovers := 0
+	for _, e := range foEvents(t, c.Leader(), id) {
+		if e["kind"] == "leaseHandedOver" {
+			handovers++
+		}
+	}
+	// The hand-over of the step "Hand the lease" leaves no event when the new server is the leader's own (it holds the lease already):
+	// the one after the failed attach is then the only one.
+	need := 2
+	if nw == c.Leader() {
+		need = 1
+	}
+	if handovers < need {
+		t.Fatalf("the lease was handed over %d time(s), want %d: a failed attach was taken for success", handovers, need)
+	}
+}
+
+// F3-09, the setup in which the defect shows: the failover is paused after the old primary was stopped and before its catalog
+// moved, so the old server's only primary (its home instance) is stopped and held back, and its own catalog cannot be read.
+// Its client entry point must forward to the ring. Without the fallback to the other servers' catalog it resets the connection.
+func TestFailoverEntryPointOfAServerWithoutALocalCatalogForwards(t *testing.T) {
+	c, port, pool := foClusterWith(t, "-lease-duration", "12s", "-lease-renew", "2s", "-lease-margin", "3s")
+	leader := c.Leader()
+	g, old, _ := foVictim(t, c)
+	waitFacts(t, leader, g)
+	leader.SetFaults(fault.Spec{FailoverPoint: fmt.Sprintf("Group %d: %s:before", g, failover.StepCatalog), FailoverMode: "pause"})
+	st, resp := leader.Do("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard", "allowDataLoss": true}, nil)
+	if st != 202 {
+		t.Fatalf("failover request: %d %v", st, resp)
+	}
+	id := clustertest.TaskID(resp)
+	if task := foWaitTask(t, leader, id, 6*time.Minute, "done", "failed", "paused"); task["state"] != "paused" {
+		t.Fatalf("the task did not pause: %v", task)
+	}
+	// The old primary is stopped and its server cannot read its catalog: the entry point answers anyway.
+	ctx := context.Background()
+	var last error
+	ok := false
+	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline) && !ok; time.Sleep(time.Second) {
+		// The connection is forwarded to another server, whose certificate names that server: any name of the cluster may be it.
+		for _, n := range c.Nodes {
+			conn, err := foConnAs(ctx, old, port, pool, "fo", n.Host)
+			if err == nil {
+				var one int
+				err = conn.QueryRow(ctx, `SELECT 1`).Scan(&one)
+				_ = conn.Close(ctx)
+			}
+			if ok, last = err == nil, err; ok {
+				break
+			}
+		}
+	}
+	if !ok {
+		t.Fatalf("the entry point of %s, whose local catalog is unreadable, does not answer: %v\n%s", old.Host, last, old.LogTail(3000))
+	}
+	leader.Heal()
+	st, resp = leader.Do("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard", "allowDataLoss": true}, nil)
+	if st != 202 && st != 200 {
+		t.Fatalf("the repeated request: %d %v", st, resp)
+	}
+	foWaitTask(t, leader, id, 6*time.Minute, "done")
 }

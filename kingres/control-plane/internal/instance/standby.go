@@ -329,3 +329,32 @@ func (m *Manager) RebaseStandby(ctx context.Context, id int, s StandbySpec) erro
 	}
 	return os.WriteFile(filepath.Join(data, "standby.signal"), nil, 0o600)
 }
+
+// withStandbyAccessRule adds, for an instance that is a copy of another server's data (a standby, or a promoted standby), the rule
+// that lets kingresd in over the unix socket by peer authentication; the text of a primary's rules does not have it.
+func withStandbyAccessRule(hba string, isCopy bool) string {
+	if !isCopy || strings.Contains(hba, "peer map="+StandbyIdentMap) {
+		return hba
+	}
+	return "local   all  " + ServiceRole + "  peer map=" + StandbyIdentMap + "\n" + hba
+}
+
+// withStandbyIdentLine adds the line of pg_ident.conf that maps the operating system user of kingresd to the service role for such
+// an instance. A name that pg_hba.conf cannot carry leaves the text as it is.
+func withStandbyIdentLine(ident, osUser string, isCopy bool) string {
+	if !isCopy {
+		return ident
+	}
+	q, err := hbaName(osUser)
+	if err != nil {
+		return ident
+	}
+	line := StandbyIdentMap + " " + q + " " + ServiceRole + "\n"
+	if strings.Contains(ident, line) {
+		return ident
+	}
+	if !strings.HasSuffix(ident, "\n") {
+		ident += "\n"
+	}
+	return ident + line
+}

@@ -137,10 +137,13 @@ var Calls = map[string]Policy{
 	"GET /standby/status":   LeaderOrHeldBack,
 
 	// The read calls and the freeze of the failover (internal-api.md, "Failover groundwork").
-	"GET /failover/position":       AnyPeer,
-	"GET /liveness":                AnyPeer,
-	"GET /failover/state":          LeaderOnly,
-	"GET /catalog/nodes":           AnyPeer,
+	"GET /failover/position": AnyPeer,
+	"GET /liveness":          AnyPeer,
+	"GET /failover/state":    LeaderOnly,
+	"GET /catalog/nodes":     AnyPeer,
+	// The bootstrap of the map group runs while the manager leader is gone: any member may ask a candidate, and the candidate proves what it needs itself.
+	"POST /failover/map/start":     AnyPeer,
+	"POST /failover/map/continue":  AnyPeer,
 	"POST /failover/freeze":        LeaderOnly,
 	"POST /failover/unfreeze":      LeaderOnly,
 	"POST /failover/standbys-gone": LeaderOnly,
@@ -193,7 +196,7 @@ var handled = map[string]bool{
 	"POST /pki/renew": true, "GET /pki/csr": true,
 	"POST /heartbeat": true, "POST /lease/grant": true, "GET /lease/state": true, "POST /standby/plan": true,
 	"POST /standby/create": true, "POST /standby/remove": true, "POST /standby/rebuild": true, "GET /standby/status": true,
-	"GET /failover/position": true, "GET /liveness": true, "GET /catalog/nodes": true, "GET /failover/state": true, "POST /failover/freeze": true,
+	"GET /failover/position": true, "GET /liveness": true, "GET /catalog/nodes": true, "POST /failover/map/start": true, "POST /failover/map/continue": true, "GET /failover/state": true, "POST /failover/freeze": true,
 	"POST /failover/unfreeze": true, "POST /failover/standbys-gone": true,
 	"POST /failover/lease": true, "POST /failover/demote": true, "POST /failover/promote": true, "POST /failover/prepared": true, "POST /standby/repoint": true,
 	"POST /ledger/key/install": true, "POST /ledger/key/remove": true, "POST /ledger/key/list": true,

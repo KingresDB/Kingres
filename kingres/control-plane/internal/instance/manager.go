@@ -482,6 +482,9 @@ func (m *Manager) WriteHBA(id int, rules []HBARule, tlsRequired bool) error {
 	if err != nil {
 		return err
 	}
+	// A promoted standby is a copy of another server's data: its service role has that server's password, so kingresd reaches it over
+	// its private socket by peer authentication (StandbyIdentMap). The rule must survive the rewrite of the rules that a primary gets.
+	text = withStandbyAccessRule(text, m.IsCopy(id))
 	data, _ := m.DataDir(id)
 	return writeAtomic(filepath.Join(data, "pg_hba.conf"), []byte(text))
 }
@@ -589,6 +592,7 @@ func (m *Manager) WriteIdent(id int, osUser string, roles []string) error {
 	if err != nil {
 		return err
 	}
+	text = withStandbyIdentLine(text, osUser, m.IsCopy(id))
 	data, _ := m.DataDir(id)
 	return writeAtomic(filepath.Join(data, "pg_ident.conf"), []byte(text))
 }

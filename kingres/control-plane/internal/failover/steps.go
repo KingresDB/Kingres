@@ -1530,6 +1530,8 @@ func (r *Runner) prepared(ctx context.Context, env *task.Env, sc *stepCtx) error
 		for _, db := range dbs {
 			if err := r.Cat.RecoverPrepared(ctx, db); err != nil {
 				sc.event(ctx, "recoverPreparedError", map[string]any{"database": db, "error": err.Error()})
+			} else {
+				sc.event(ctx, "preparedRecovered", map[string]any{"database": db})
 			}
 			if err := r.Peers.RecoverPrepared(ctx, gr.NewServer, sc.group, db); err != nil {
 				sc.event(ctx, "recoverPreparedOnNewError", map[string]any{"database": db, "error": err.Error()})

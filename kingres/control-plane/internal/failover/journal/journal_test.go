@@ -10,7 +10,7 @@ import (
 )
 
 func TestTheJournalSurvivesARestartAndKeepsItsFirstPin(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempDir(t)
 	s, err := Open(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -57,7 +57,7 @@ func TestTheJournalSurvivesARestartAndKeepsItsFirstPin(t *testing.T) {
 }
 
 func TestAJournalOfANewerTermRefusesAndOfAnOlderOneIsReplaced(t *testing.T) {
-	s, _ := Open(t.TempDir())
+	s, _ := Open(tempDir(t))
 	if _, err := s.Begin("a", "s1", 9, "automatic", "", false); err != nil {
 		t.Fatal(err)
 	}
@@ -72,11 +72,32 @@ func TestAJournalOfANewerTermRefusesAndOfAnOlderOneIsReplaced(t *testing.T) {
 }
 
 func TestAJournalThatCannotBeReadIsAnError(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempDir(t)
 	if err := os.WriteFile(filepath.Join(dir, FileName), []byte("{not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Open(dir); err == nil {
 		t.Fatal("a damaged journal was ignored")
 	}
+}
+
+func TestUndoForgetsAStep(t *testing.T) {
+	s, _ := Open(tempDir(t))
+	_, _ = s.Begin("a", "s1", 3, "manual", "x", false)
+	_ = s.Done(StepLease)
+	_ = s.Done(StepPromote)
+	if err := s.Undo(StepLease, StepPromote); err != nil || s.IsDone(StepLease) || s.IsDone(StepPromote) {
+		t.Fatalf("%v", err)
+	}
+}
+
+// tempDir is a directory that is removed without failing the test when the machine still holds a file in it (an indexer on Windows).
+func tempDir(t *testing.T) string {
+	t.Helper()
+	d, err := os.MkdirTemp("", "kg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(d) })
+	return d
 }
