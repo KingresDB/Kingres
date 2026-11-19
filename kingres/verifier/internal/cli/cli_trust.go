@@ -14,7 +14,7 @@ import (
 
 func (e *env) runTrust(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(e.stderr, "kingres-verify trust: expected init or show")
+		fmt.Fprintln(e.stderr, "kingres-verify trust: expected init, show or follow")
 		return exit(ExitUsage)
 	}
 	switch args[0] {
@@ -23,13 +23,12 @@ func (e *env) runTrust(args []string) int {
 	case "show":
 		return e.runTrustShow(args[1:])
 	case "follow":
-		fmt.Fprintln(e.stderr, "kingres-verify trust follow: not built yet (it needs the key events of the publication)")
-		return exit(ExitUsage)
+		return e.runTrustFollow(args[1:])
 	case "-h", "--help", "help":
 		fmt.Fprint(e.stdout, "Usage: kingres-verify trust init|show [flags]\n\n  init  write a trust file from a public key you typed or pasted and its fingerprint\n  show  print a trust file and say, for each key, how it stands now and which of its members are enforced\n\nExit status: 0 ok, 2 usage or input error (including a trust file that no command could use).\n")
 		return exit(ExitOK)
 	}
-	fmt.Fprintf(e.stderr, "kingres-verify trust: unknown subcommand %s, expected init or show\n", untrusted(fmt.Sprintf("%q", args[0])))
+	fmt.Fprintf(e.stderr, "kingres-verify trust: unknown subcommand %s, expected init, show or follow\n", untrusted(fmt.Sprintf("%q", args[0])))
 	return exit(ExitUsage)
 }
 

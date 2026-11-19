@@ -502,8 +502,7 @@ func exitRows(x *exitEnv) []exitRow {
 	// ---- trust ----
 	add(
 		row("runTrust:exitUsage#1", 2, "trust"),
-		row("runTrust:exitUsage#2", 2, "trust", "follow"),
-		row("runTrust:exitUsage#3", 2, "trust", "nonsense"),
+		row("runTrust:exitUsage#2", 2, "trust", "nonsense"),
 	)
 	pubB64 := b64(x.p.signer.pub)
 	init := func(more ...string) []string {
@@ -537,6 +536,7 @@ func exitRows(x *exitEnv) []exitRow {
 			return []string{"trust", "show", "--trust", trustWith(t, x.p, `,"revoked":true`)}
 		}),
 	)
+	rows = append(rows, publicationRows(x)...)
 	return rows
 }
 
@@ -640,8 +640,20 @@ func verdictLine(out, word string) bool {
 func commandOfSite(site string) string {
 	fn, _, _ := strings.Cut(site, ":")
 	switch fn {
-	case "runProof":
+	case "runProof", "runProofLeg":
 		return "proof"
+	case "runAggregate":
+		return "aggregate"
+	case "runBundleVerify":
+		return "bundle verify"
+	case "runBundleFetch":
+		return "bundle fetch"
+	case "runMonitor":
+		return "monitor"
+	case "runAttestation":
+		return "attestation"
+	case "runTrustFollow":
+		return "trust follow"
 	case "runRowHash":
 		return "row-hash"
 	case "runDigestChain":
@@ -665,7 +677,7 @@ func commandOfSite(site string) string {
 // statusTable is the table of the README, made from the rows: for each command
 // the statuses a run can end with (0 for a success).
 func statusTable(rows []exitRow) []string {
-	order := []string{"proof", "row-hash", "digest-chain", "blocks", "checkpoint", "consistency", "trust init", "trust show", "trust"}
+	order := []string{"proof", "row-hash", "digest-chain", "blocks", "checkpoint", "consistency", "aggregate", "bundle verify", "bundle fetch", "monitor", "attestation", "trust init", "trust show", "trust follow", "trust"}
 	got := map[string]map[int]bool{}
 	for _, c := range order {
 		got[c] = map[int]bool{}

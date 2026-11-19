@@ -1,0 +1,18 @@
+{
+  "format": 1,
+  "origin_prefix": "127.0.0.2/kingres-ledger",
+  "keys": [
+    {
+      "name": "key-e26f509e8edd1bd5",
+      "public_key": "3ZXs6juImo3Wtr9Nxg9lcRglxm2FGv0BKTshdXFvuWE=",
+      "fingerprint": "e26f509e8edd1bd5dd66e9a6457a19578f81f7fec1a8fdc91b8e893dc301d9dc",
+      "not_before": "2026-11-19T04:04:00Z",
+      "not_after": null,
+      "revoked": false,
+      "max_tree_size": null
+    }
+  ],
+  "tsa_roots": [],
+  "client_keys": [],
+  "witnesses": []
+}

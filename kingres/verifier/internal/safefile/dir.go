@@ -240,3 +240,36 @@ func (d *Dir) RegularNames() (names, others []string, err error) {
 	sort.Strings(others)
 	return names, others, nil
 }
+
+// RegularFiles lists the names of the regular files directly in the directory rel, sorted. Links
+// and special files are refused as in the other reads (an error that Unusable recognises); at most
+// MaxDirEntries entries are read.
+func (d *Dir) RegularFiles(rel string) ([]string, error) {
+	if err := d.walk(rel, true); err != nil {
+		return nil, err
+	}
+	f, err := d.root.OpenFile(rel, os.O_RDONLY|openFlags, 0)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", rel, err)
+	}
+	defer f.Close()
+	ents, err := f.ReadDir(MaxDirEntries + 1)
+	if err != nil && len(ents) == 0 && !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("listing %s: %w", rel, err)
+	}
+	if len(ents) > MaxDirEntries {
+		return nil, fmt.Errorf("%s %w (more than %d entries)", rel, ErrTooLarge, MaxDirEntries)
+	}
+	var out []string
+	for _, en := range ents {
+		switch {
+		case en.IsDir():
+		case en.Type().IsRegular():
+			out = append(out, en.Name())
+		default:
+			return nil, fmt.Errorf("%s/%s %w", rel, en.Name(), ErrNotRegular)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
