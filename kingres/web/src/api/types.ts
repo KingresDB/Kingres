@@ -97,6 +97,15 @@ export type DataLossAssessment = S['DataLossAssessment']
 export type OldPrimaryReport = S['OldPrimaryReport']
 export type LedgerStatus = S['LedgerStatus']
 export type LedgerSettingsUpdate = S['LedgerSettingsUpdate']
+export type LedgerSettingsCluster = S['LedgerSettingsCluster']
+// Anchoring (contract 0.11.0)
+export type LedgerAnchorKind = S['LedgerAnchorKind']
+export type LedgerAnchorState = S['LedgerAnchorState']
+export type LedgerAnchorTarget = S['LedgerAnchorTarget']
+export type LedgerAnchorTargetCreate = S['LedgerAnchorTargetCreate']
+export type LedgerAnchorTargetUpdate = S['LedgerAnchorTargetUpdate']
+export type LedgerAnchorTest = S['LedgerAnchorTest']
+export type LedgerAnchor = S['LedgerAnchor']
 
 // Configuration (contract 0.8.0)
 export type ConfigLevel = S['ConfigLevel']

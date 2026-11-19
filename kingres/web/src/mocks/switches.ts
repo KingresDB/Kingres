@@ -51,6 +51,7 @@
 //                                 fail:<code>     the next key task ends failed with that code (key_files_remain, passphrase_mismatch, ...)
 //   ?publication=<a>,<b>,...      0.11.0: off | plain (the listener has no TLS) | nolistener | behind (the newest checkpoint is old)
 //                                 | unread (a group could not be read: a stale member) | diverged (the chain of group 2 of shop diverged)
+//   ?anchors=all|disabled|testfail|testwarn|refuse:<code>   0.11.0 (console part B): see the README
 //   ?anchors=<a>,<b>,...          0.11.0: none (alert ledgerNotAnchored) | required (the same, a warning) | ok | behind | failed
 //                                 (a WORM target "archive-worm" exists, with the newest aggregate anchored in time, late or not)
 //   ?clock=off:<server>:<ms>      the clock of that server is that many milliseconds ahead (negative: behind).
@@ -58,7 +59,12 @@
 import type { MockState } from './state'
 import { loseLease, mockConfig, silenceServer, stallStandby } from './state'
 import { FAIL_STEPS, raiseAutoFailoverLimit, seedAutomaticFailover } from './failover'
-import { answerAsTheServerDoesToday, seedAnchors } from './ledger'
+import {
+  answerAsTheServerDoesToday,
+  seedAnchors,
+  seedAnchorsAll,
+  seedAnchorsDisabled,
+} from './ledger'
 import { signingKey, withoutKeys } from './ledger-data'
 import {
   failNextApply,
@@ -232,6 +238,17 @@ export function applySwitches(params: URLSearchParams, s: MockState): void {
     if (entry === 'none' || entry === 'required') l.alertNotAnchored = true
     if (entry === 'required') l.settings.anchor.required = true
     if (entry === 'ok' || entry === 'behind' || entry === 'failed') seedAnchors(s, entry)
+    // 0.11.0 (console part B): the three kinds with a record in every state; a target that is turned off; what a test
+    // finds; a refusal of every change.
+    if (entry === 'all') seedAnchorsAll(s)
+    if (entry === 'disabled') {
+      seedAnchorsDisabled(s)
+      l.alertNotAnchored = true
+    }
+    if (entry === 'testfail') mockConfig.anchorTest = 'fail'
+    if (entry === 'testwarn') mockConfig.anchorTest = 'warn'
+    const refuse = /^refuse:([a-z_]+)$/.exec(entry)
+    if (refuse) mockConfig.anchorRefuse = refuse[1] as string
   }
   for (const entry of (params.get('clock') ?? '').split(',')) {
     const off = /^off:([^:]+):(-?\d+(?:\.\d+)?)$/.exec(entry)

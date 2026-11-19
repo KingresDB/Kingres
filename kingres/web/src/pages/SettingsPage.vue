@@ -12,6 +12,7 @@ import ProblemNotice from '@/components/ProblemNotice.vue'
 import FormField from '@/components/FormField.vue'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
 import AutoFailoverCounter from '@/components/AutoFailoverCounter.vue'
+import AnchorSettings from '@/components/ledger/AnchorSettings.vue'
 import { AUTO_FAILOVER_REQUIREMENTS } from '@/lib/failover'
 import { vBlockEnterSubmit } from '@/lib/forms'
 import { endpoints } from '@/api/endpoints'
@@ -294,6 +295,9 @@ function submit(): void {
       </div>
     </form>
   </QueryBoundary>
+  <div style="max-width: 720px; margin-top: var(--s-5)">
+    <AnchorSettings />
+  </div>
   <ConfirmDialog
     v-if="confirmingFeatures"
     :title="`Turn on ${confirmingFeatures.join(' and ')} for the whole cluster?`"

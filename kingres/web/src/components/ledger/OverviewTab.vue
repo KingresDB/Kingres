@@ -132,7 +132,12 @@ const verify = useTaskAction(
         data-testid="not-anchored"
       >
         <span aria-hidden="true">&#9650;</span>
-        <span>{{ NOT_ANCHORED_TEXT }}</span>
+        <span
+          >{{ NOT_ANCHORED_TEXT }}
+          <RouterLink :to="{ name: 'ledger', query: { tab: 'anchoring', db: databaseName } }"
+            >Open the Anchoring tab</RouterLink
+          ></span
+        >
       </p>
       <p
         v-if="statusCoverage && statusCoverageText(statusCoverage)"

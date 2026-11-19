@@ -51,9 +51,16 @@ const STATE: Record<'off' | 'attention' | 'notAnchored' | 'healthy', StatusMeta>
         <StatusBadge :meta="STATE[card.state]" />
         <span v-if="card.state === 'off'" class="muted">No database uses the ledger.</span>
       </p>
-      <p v-if="card.state === 'notAnchored'" class="muted" data-testid="ledger-card-not-anchored">
-        {{ NOT_ANCHORED_TEXT }}
-      </p>
+      <div v-if="card.state === 'notAnchored'" class="stack" data-testid="ledger-card-not-anchored">
+        <p class="muted">{{ NOT_ANCHORED_TEXT }}</p>
+        <p>
+          <RouterLink
+            :to="{ name: 'ledger', query: { tab: 'anchoring' } }"
+            data-testid="ledger-card-add-target"
+            >Add a target</RouterLink
+          >
+        </p>
+      </div>
       <div
         v-if="card.state === 'attention'"
         class="stack"
@@ -80,6 +87,10 @@ const STATE: Record<'off' | 'attention' | 'notAnchored' | 'healthy', StatusMeta>
           }}</span>
           <span v-else class="value">none</span>
         </li>
+        <li v-if="card.targetsUsed !== null" data-testid="ledger-card-targets">
+          <span class="label">Anchor targets in use</span>
+          <span class="value">{{ card.targetsUsed }}</span>
+        </li>
         <li data-testid="ledger-card-chains">
           <span class="label">Chains read</span>
           <span class="value">
@@ -102,6 +113,7 @@ const STATE: Record<'off' | 'attention' | 'notAnchored' | 'healthy', StatusMeta>
       </ul>
       <p v-if="card.state !== 'off'" class="row">
         <RouterLink :to="{ name: 'ledger' }">Overview</RouterLink>
+        <RouterLink :to="{ name: 'ledger', query: { tab: 'anchoring' } }">Anchoring</RouterLink>
         <RouterLink :to="{ name: 'ledger', query: { tab: 'signing' } }">Signing</RouterLink>
         <RouterLink :to="{ name: 'ledger', query: { tab: 'publication' } }">Publication</RouterLink>
       </p>

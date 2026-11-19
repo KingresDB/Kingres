@@ -213,6 +213,7 @@ export const ROUTES = [
   '/security',
   '/ledger',
   '/ledger?tab=digests',
+  '/ledger?tab=anchoring',
   '/ledger?tab=signing',
   '/ledger?tab=publication',
   '/workbench',
@@ -287,6 +288,39 @@ const setMock = (page: Page, settings: Record<string, unknown>) =>
       .__kingresMock
     Object.assign(mock.config, values)
   }, settings)
+
+/** Applies a value of `?anchors=` while the page is open (src/mocks/browser.ts), and makes the pages read again. */
+const anchorsSwitch = async (page: Page, value: string) => {
+  await page.evaluate((v) => {
+    ;(
+      window as unknown as { __kingresMock: { anchorsSwitch: (text: string) => void } }
+    ).__kingresMock.anchorsSwitch(v)
+    void (
+      window as unknown as { __queryClient: { invalidateQueries: () => unknown } }
+    ).__queryClient.invalidateQueries()
+  }, value)
+  await sleep(300)
+}
+
+/** Clicks the button with this accessible name (an `aria-label`) or visible text. */
+async function clickLabeled(page: Page, label: string): Promise<void> {
+  const ok = await page.evaluate((l) => {
+    const b = [...document.querySelectorAll<HTMLElement>('button')].find(
+      (e) => (e.getAttribute('aria-label') ?? e.textContent?.trim()) === l,
+    )
+    b?.click()
+    return !!b
+  }, label)
+  if (!ok) throw new Error(`No button named ${JSON.stringify(label)}`)
+  await sleep(200)
+}
+
+/** Opens the Anchoring tab with the three kinds of target and a record in every state. */
+async function anchoringAll(page: Page): Promise<void> {
+  await anchorsSwitch(page, 'all')
+  await page.waitForSelector('[data-testid="anchor-records"] tbody tr', { timeout: 30_000 })
+  await sleep(250)
+}
 
 /** Applies a value of `?failover=` while the page is open (src/mocks/browser.ts). */
 const mockSwitch = async (page: Page, value: string) => {
@@ -860,6 +894,69 @@ export const STATES: PageState[] = [
       await setMock(page, { failoverNeedsDecision: false })
       await leaveFailover(page)
     },
+  },
+  {
+    // 0.11.0, console part B: the Anchoring tab with the three kinds of target, a record in every state and (the page runs
+    // with the hostile mock) targets and records with hostile names.
+    name: 'anchoring tab: three kinds and every state of a record (0.11.0)',
+    needsMock: true,
+    route: '/ledger?tab=anchoring',
+    open: anchoringAll,
+  },
+  {
+    name: 'anchoring: add a WORM target (0.11.0)',
+    needsMock: true,
+    route: '/ledger?tab=anchoring',
+    open: async (page) => {
+      await anchoringAll(page)
+      await clickText(page, 'Add a target')
+      await dialogOpen(page)
+      await page.waitForSelector('[data-testid="compliance-confirm"]', { timeout: 10_000 })
+    },
+    close: cancel,
+  },
+  {
+    name: 'anchoring: add an OpenTimestamps target (0.11.0)',
+    needsMock: true,
+    route: '/ledger?tab=anchoring',
+    open: async (page) => {
+      await anchoringAll(page)
+      await clickText(page, 'Add a target')
+      await dialogOpen(page)
+      await page.click('[data-testid="kind-ots"]')
+      await clickText(page, 'Use the public calendars', '[role="dialog"] button')
+      await sleep(250)
+    },
+    close: cancel,
+  },
+  {
+    name: 'anchoring: a test that failed (0.11.0)',
+    needsMock: true,
+    route: '/ledger?tab=anchoring',
+    open: async (page) => {
+      await anchoringAll(page)
+      await setMock(page, { anchorTest: 'fail' })
+      await clickLabeled(page, 'Test archive-worm')
+      await dialogOpen(page)
+      await clickText(page, 'Run the test again', '[role="dialog"] button')
+      await page.waitForSelector('[data-testid="check-failed"]', { timeout: 20_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await setMock(page, { anchorTest: null })
+      await clickText(page, 'Close', '[role="dialog"] button')
+    },
+  },
+  {
+    name: 'anchoring: delete a target (0.11.0)',
+    needsMock: true,
+    route: '/ledger?tab=anchoring',
+    open: async (page) => {
+      await anchoringAll(page)
+      await clickLabeled(page, 'Delete public-tsa')
+      await dialogOpen(page)
+    },
+    close: cancel,
   },
   {
     name: 'system database stopped',

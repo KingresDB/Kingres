@@ -133,6 +133,10 @@ export const mockConfig = {
   failoverOld: null as null | 'rebuilding' | 'waiting' | 'running' | 'failed',
   failoverSwitchoverBehind: false,
   failoverReadiness: {} as Record<number, FailoverReadinessState>,
+  /** 0.11.0 (console part B): what the test of an anchor target finds: nothing wrong, a warning, or a failure. */
+  anchorTest: null as null | 'warn' | 'fail',
+  /** 0.11.0 (console part B): every change to a target, a test, an anchor-now and a retry answers this problem code. */
+  anchorRefuse: null as null | string,
   /** 0.8.0: the source commit the server reports in GET /setup/state: a hex id, null (the build does not know it) or text that is not a hex id. */
   commit: '0123456789abcdef0123456789abcdef01234567' as string | null,
   /**

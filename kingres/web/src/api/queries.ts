@@ -118,6 +118,7 @@ export const keys = {
   ledgerSettings: ['ledgerSettings'] as const,
   ledgerSigning: ['ledgerSigning'] as const,
   ledgerPublication: ['ledgerPublication'] as const,
+  ledgerAnchorTargets: ['ledgerAnchorTargets'] as const,
   alerts: ['alerts'] as const,
   logs: ['logs'] as const,
   metrics: ['metrics'] as const,
@@ -445,6 +446,15 @@ export const useLedgerPublication = (enabled: MaybeRefOrGetter<boolean> = true) 
   useQuery({
     queryKey: keys.ledgerPublication,
     queryFn: endpoints.getLedgerPublication,
+    refetchInterval: every(POLL.normal),
+    enabled: computed(() => toValue(enabled)),
+  })
+
+/** 0.11.0: the anchor targets of the cluster (a server may answer 422 `unsupported_operation` for now). */
+export const useLedgerAnchorTargets = (enabled: MaybeRefOrGetter<boolean> = true) =>
+  useQuery({
+    queryKey: keys.ledgerAnchorTargets,
+    queryFn: endpoints.listLedgerAnchorTargets,
     refetchInterval: every(POLL.normal),
     enabled: computed(() => toValue(enabled)),
   })

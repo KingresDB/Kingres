@@ -268,19 +268,177 @@ function target(s: MockState, c: Ctx): S['LedgerAnchorTarget'] {
   return t
 }
 
-function checkTarget(kind: S['LedgerAnchorKind'], name: unknown, config: unknown): void {
-  const errors: { field: string; message: string }[] = []
+/** The members of the configuration of each kind (design 6.3 to 6.5): the server rejects any other. */
+const CONFIG_MEMBERS: Record<string, string[]> = {
+  worm: [
+    'endpoint',
+    'region',
+    'bucket',
+    'keyPrefix',
+    'pathStyle',
+    'mode',
+    'retentionDays',
+    'ifNoneMatch',
+    'caBundlePath',
+    'allowInsecure',
+    'maxSkewSeconds',
+  ],
+  tsa: [
+    'url',
+    'hashAlgorithm',
+    'policyOid',
+    'caBundlePath',
+    'timeoutSeconds',
+    'maxSkewSeconds',
+    'allowInsecure',
+    'signerKeySha256',
+  ],
+  ots: [
+    'calendars',
+    'minCalendars',
+    'upgradeTimeoutDays',
+    'allowInsecure',
+    'contradictionConfirmMinutes',
+  ],
+}
+
+type FieldProblem = { field: string; message: string }
+
+function checkConfig(kind: string, c: Record<string, unknown>, errors: FieldProblem[]): void {
+  const bad = (m: string, message: string) => errors.push({ field: `config.${m}`, message })
+  const known = CONFIG_MEMBERS[kind] ?? []
+  for (const k of Object.keys(c))
+    if (!known.includes(k)) bad(k, 'This setting does not exist for this kind of target.')
+  const str = (k: string) => (typeof c[k] === 'string' ? (c[k] as string) : '')
+  const range = (k: string, lo: number, hi: number) => {
+    const v = c[k]
+    if (v !== undefined && (typeof v !== 'number' || !Number.isInteger(v) || v < lo || v > hi))
+      bad(k, `Give a whole number from ${lo} to ${hi}.`)
+  }
+  const insecure = c.allowInsecure === true
+  if (kind === 'worm') {
+    if (!/^[A-Za-z0-9._-]{1,64}$/.test(str('region')))
+      bad('region', 'A region is required (letters, digits, - _ .).')
+    if (!/^[A-Za-z0-9._-]{3,63}$/.test(str('bucket')))
+      bad('bucket', 'A bucket name has 3 to 63 letters, digits, dots and dashes.')
+    if (c.mode !== undefined && c.mode !== 'compliance' && c.mode !== 'governance')
+      bad('mode', 'The mode is compliance or governance.')
+    if (c.ifNoneMatch !== undefined && !['auto', 'on', 'off'].includes(String(c.ifNoneMatch)))
+      bad('ifNoneMatch', 'Choose auto, on or off.')
+    range('retentionDays', 1, 36500)
+    range('maxSkewSeconds', 1, 86400)
+    if (str('endpoint') !== '') {
+      const m = /^(https?):\/\/[^\s/?#@]+\/?$/.exec(str('endpoint'))
+      if (!m) bad('endpoint', 'The endpoint must be scheme://host[:port] without a path.')
+      else if (m[1] === 'http' && !insecure)
+        bad('endpoint', 'The endpoint is not https and allowInsecure is not set.')
+    }
+  } else if (kind === 'tsa') {
+    if (!/^https?:\/\/[^\s/?#@]+[^\s?#]*$/.test(str('url')))
+      bad('url', 'The url must be an http or https address without a query.')
+    if (str('caBundlePath') === '')
+      bad('caBundlePath', 'The certificates of the authority are required.')
+    range('timeoutSeconds', 1, 300)
+    range('maxSkewSeconds', 1, 86400)
+  } else if (kind === 'ots') {
+    const cals = Array.isArray(c.calendars) ? (c.calendars as unknown[]) : []
+    if (cals.length === 0) bad('calendars', 'At least one calendar is required.')
+    else if (
+      cals.some(
+        (x) =>
+          typeof x !== 'string' ||
+          !/^https?:\/\/[^\s/?#@]+/.test(x) ||
+          (x.startsWith('http://') && !insecure),
+      )
+    )
+      bad('calendars', 'Each calendar must be an https address.')
+    range('minCalendars', 1, Math.max(1, cals.length))
+    range('upgradeTimeoutDays', 1, 365)
+  }
+}
+
+function checkTarget(
+  kind: S['LedgerAnchorKind'],
+  name: unknown,
+  config: unknown,
+  credentials?: unknown,
+): void {
+  const errors: FieldProblem[] = []
   if (!['worm', 'tsa', 'ots'].includes(kind))
     errors.push({ field: 'kind', message: 'Choose worm, tsa or ots.' })
   if (typeof name !== 'string' || name.length < 1 || name.length > 63)
     errors.push({ field: 'name', message: 'Give a name of 1 to 63 characters.' })
   if (typeof config !== 'object' || config === null || Array.isArray(config))
     errors.push({ field: 'config', message: 'Give the configuration as an object.' })
+  else checkConfig(kind, config as Record<string, unknown>, errors)
+  if (credentials !== undefined) {
+    const c = (credentials ?? {}) as Record<string, unknown>
+    const allowed =
+      kind === 'worm'
+        ? ['accessKeyId', 'secretAccessKey', 'sessionToken']
+        : kind === 'tsa'
+          ? ['username', 'password']
+          : []
+    for (const k of Object.keys(c))
+      if (!allowed.includes(k) || typeof c[k] !== 'string')
+        errors.push({
+          field: `credentials.${k}`,
+          message: 'This credential does not exist for this kind of target.',
+        })
+    if (kind === 'worm' && (!c.accessKeyId || !c.secretAccessKey))
+      errors.push({
+        field: 'credentials.secretAccessKey',
+        message: 'Give the access key id and the secret access key together.',
+      })
+  }
   if (errors.length > 0) throw validationFailed(errors)
 }
 
+/** `?anchors=refuse:<code>`: every change answers this problem code, as a server that refuses would. */
+function refuseWrites(): void {
+  const code = mockConfig.anchorRefuse
+  if (code)
+    throw problem(
+      code as Parameters<typeof problem>[0],
+      'The server refused the request (a state of the mock).',
+    )
+}
+
+/** What `?anchors=testfail` and `testwarn` make a test find: the first check fails, or one check warns. */
+function shaped(
+  checks: S['LedgerAnchorTest']['checks'],
+  kind: string,
+): S['LedgerAnchorTest']['checks'] {
+  const how = mockConfig.anchorTest
+  if (how === 'fail')
+    return [
+      {
+        name: kind === 'ots' ? 'calendars' : kind === 'tsa' ? 'reachable' : 'credentials',
+        status: 'failed',
+        detail:
+          kind === 'worm'
+            ? 'The store refused the credentials (403).'
+            : kind === 'tsa'
+              ? 'The authority did not answer within 20 seconds.'
+              : 'None of the calendars answered.',
+      },
+      ...checks.slice(1).map((c) => ({ ...c, status: 'ok' as const })),
+    ]
+  if (how === 'warn')
+    return checks.map((c, i) =>
+      i === checks.length - 1
+        ? {
+            name: c.name,
+            status: 'warning' as const,
+            detail: 'The check passed, but the store keeps no default retention.',
+          }
+        : c,
+    )
+  return checks
+}
+
 function testResult(t: S['LedgerAnchorTarget']): S['LedgerAnchorTest'] {
-  const checks: S['LedgerAnchorTest']['checks'] =
+  const checks: S['LedgerAnchorTest']['checks'] = shaped(
     t.kind === 'worm'
       ? [
           {
@@ -302,7 +460,9 @@ function testResult(t: S['LedgerAnchorTarget']): S['LedgerAnchorTest'] {
               detail: 'The certificate of the authority expires in 41 days.',
             },
           ]
-        : [{ name: 'calendars', status: 'ok', detail: 'Two of three calendars answered.' }]
+        : [{ name: 'calendars', status: 'ok', detail: 'Two of three calendars answered.' }],
+    t.kind,
+  )
   return { checks, ok: !checks.some((x) => x.status === 'failed'), testedAt: nowIso() }
 }
 
@@ -336,6 +496,7 @@ export function seedAnchors(s: MockState, how: 'ok' | 'behind' | 'failed'): void
     enabled: true,
     config: {
       endpoint: 'https://s3.archive.example.com',
+      region: 'eu-west-1',
       bucket: 'kingres-ledger',
       mode: 'compliance',
     },
@@ -369,6 +530,123 @@ export function seedAnchors(s: MockState, how: 'ok' | 'behind' | 'failed'): void
       })
     }
   }
+}
+
+type Seeded = Omit<S['LedgerAnchor'], 'id' | 'targetId' | 'targetName' | 'kind'>
+
+/** One record of a seeded target in every database that has a ledger. */
+function seedRecords(
+  s: MockState,
+  t: S['LedgerAnchorTarget'],
+  rows: { size: number; extra: Partial<Seeded> & Pick<Seeded, 'state'> }[],
+): void {
+  const l = l7(s)
+  for (const rec of s.databases.filter(hasLedger))
+    for (const row of rows)
+      l.anchors.push({
+        databaseName: rec.info.name,
+        id: l.nextAnchorId++,
+        targetId: t.id,
+        targetName: t.name,
+        kind: t.kind,
+        aggregateSize: row.size,
+        attempts: 1,
+        nextAttemptAt: null,
+        anchoredAt: null,
+        evidenceTime: null,
+        lastError: null,
+        ...row.extra,
+      })
+}
+
+/**
+ * `?anchors=all`: the three kinds of target and a record in every state: the WORM store anchors in time; the time-stamp
+ * authority is late, has one record waiting, one failed and one anchored; OpenTimestamps has one sent and not final, one
+ * anchored and one never confirmed.
+ */
+export function seedAnchorsAll(s: MockState): void {
+  // Once: a second call (the browser tests apply it while the page is open) leaves what is there.
+  if (l7(s).targets.some((t) => t.name === 'public-tsa')) return
+  seedAnchors(s, 'ok')
+  const l = l7(s)
+  const ago = (ms: number): string => new Date(Date.now() - ms).toISOString()
+  const tsa: S['LedgerAnchorTarget'] = {
+    id: l.nextTargetId++,
+    kind: 'tsa',
+    name: 'public-tsa',
+    enabled: true,
+    config: { url: 'https://tsa.example.com/tsr', caBundlePath: '/etc/kingres/tsa.pem' },
+    credentialsSet: false,
+    lastTest: null,
+    newestAnchoredAt: ago(7 * 3600_000),
+    state: 'behind',
+  }
+  tsa.lastTest = testResult(tsa)
+  const ots: S['LedgerAnchorTarget'] = {
+    id: l.nextTargetId++,
+    kind: 'ots',
+    name: 'calendars',
+    enabled: true,
+    config: {
+      calendars: [
+        'https://alice.btc.calendar.opentimestamps.org',
+        'https://bob.btc.calendar.opentimestamps.org',
+      ],
+      minCalendars: 2,
+    },
+    credentialsSet: false,
+    lastTest: null,
+    newestAnchoredAt: ago(5 * 3600_000),
+    state: 'ok',
+  }
+  l.targets.push(tsa, ots)
+  const A = AGGREGATE_SIZE
+  seedRecords(s, tsa, [
+    { size: A, extra: { state: 'pending', attempts: 2, nextAttemptAt: ago(-60_000) } },
+    {
+      size: A - 6,
+      extra: {
+        state: 'failed',
+        attempts: 4,
+        lastError: 'The authority rejected the request: the policy is not accepted.',
+      },
+    },
+    {
+      size: A - 12,
+      extra: { state: 'anchored', anchoredAt: ago(7 * 3600_000), evidenceTime: ago(7 * 3600_000) },
+    },
+  ])
+  seedRecords(s, ots, [
+    { size: A, extra: { state: 'submitted', attempts: 1, nextAttemptAt: ago(-600_000) } },
+    {
+      size: A - 6,
+      extra: { state: 'anchored', anchoredAt: ago(5 * 3600_000), evidenceTime: ago(5 * 3600_000) },
+    },
+    {
+      size: A - 12,
+      extra: {
+        state: 'expired',
+        attempts: 7,
+        lastError: 'No Bitcoin confirmation arrived within 7 days.',
+      },
+    },
+  ])
+}
+
+/** `?anchors=disabled`: a target exists and is turned off, so nothing is anchored. */
+export function seedAnchorsDisabled(s: MockState): void {
+  const l = l7(s)
+  l.targets.push({
+    id: l.nextTargetId++,
+    kind: 'worm',
+    name: 'archive-worm',
+    enabled: false,
+    config: { region: 'eu-west-1', bucket: 'kingres-ledger', mode: 'compliance' },
+    credentialsSet: true,
+    lastTest: null,
+    newestAnchoredAt: null,
+    state: 'none',
+  })
 }
 
 // --- client keys ---------------------------------------------------------------------------------
@@ -410,9 +688,10 @@ export function ledgerHandlers(): Partial<Record<OperationId, Handler>> {
     },
     listLedgerAnchorTargets: (c) => ok({ items: structuredClone(l7(c.s).targets) }),
     createLedgerAnchorTarget: (c) => {
+      refuseWrites()
       const l = l7(c.s)
       const b = body<S['LedgerAnchorTargetCreate']>(c)
-      checkTarget(b.kind, b.name, b.config)
+      checkTarget(b.kind, b.name, b.config, b.credentials)
       if (l.targets.some((t) => t.name === b.name))
         throw problem('already_exists', 'A target with this name exists.')
       const t: S['LedgerAnchorTarget'] = {
@@ -431,11 +710,12 @@ export function ledgerHandlers(): Partial<Record<OperationId, Handler>> {
     },
     getLedgerAnchorTarget: (c) => ok(structuredClone(target(c.s, c))),
     updateLedgerAnchorTarget: (c) => {
+      refuseWrites()
       const t = target(c.s, c)
       const b = body<S['LedgerAnchorTargetUpdate']>(c)
       if (b.kind !== undefined && b.kind !== t.kind)
         throw problem('immutable_field', 'The kind of a target cannot change.')
-      if (b.name !== undefined) checkTarget(t.kind, b.name, b.config ?? t.config)
+      checkTarget(t.kind, b.name ?? t.name, b.config ?? t.config, b.credentials)
       if (b.name !== undefined && l7(c.s).targets.some((x) => x.name === b.name && x.id !== t.id))
         throw problem('already_exists', 'A target with this name exists.')
       if (b.name !== undefined) t.name = b.name
@@ -445,6 +725,7 @@ export function ledgerHandlers(): Partial<Record<OperationId, Handler>> {
       return ok(structuredClone(t))
     },
     deleteLedgerAnchorTarget: (c) => {
+      refuseWrites()
       const l = l7(c.s)
       const t = target(c.s, c)
       l.targets = l.targets.filter((x) => x.id !== t.id)
@@ -452,6 +733,7 @@ export function ledgerHandlers(): Partial<Record<OperationId, Handler>> {
       return noContent()
     },
     testLedgerAnchorTarget: (c) => {
+      refuseWrites()
       const t = target(c.s, c)
       t.lastTest = testResult(t)
       return ok(structuredClone(t.lastTest))
@@ -487,6 +769,7 @@ export function ledgerHandlers(): Partial<Record<OperationId, Handler>> {
     },
     listLedgerAnchors: (c) => anchorRecords(c.s, c),
     anchorLedgerNow: (c) => {
+      refuseWrites()
       const l = l7(c.s)
       const rec = db(c.s, c.params.databaseName ?? '')
       if (!published(c.s, rec))
@@ -519,6 +802,7 @@ export function ledgerHandlers(): Partial<Record<OperationId, Handler>> {
       } satisfies S['LedgerAnchorList'])
     },
     retryLedgerAnchor: (c) => {
+      refuseWrites()
       const a = l7(c.s).anchors.find(
         (x) => String(x.id) === c.params.anchorId && x.databaseName === c.params.databaseName,
       )

@@ -56,6 +56,10 @@ const canFailover = computed(() => session.can('getFailoverStatus'))
 // 0.11.0: an alert about the ledger links to the tab of the Ledger page where it is explained and handled.
 const LEDGER_TAB: Record<string, string | undefined> = {
   ledgerSignerUnavailable: 'signing',
+  ledgerNotAnchored: 'anchoring',
+  ledgerAnchorBehind: 'anchoring',
+  ledgerAnchorFailed: 'anchoring',
+  ledgerAnchorConflict: 'anchoring',
   ledgerPublicationBehind: 'publication',
   ledgerChainDiverged: 'publication',
   ledgerGroupUnread: 'publication',
@@ -77,9 +81,11 @@ const ledgerLinkText = computed(() => {
   const tab = LEDGER_TAB[props.alert.kind]
   return tab === 'signing'
     ? 'Signing keys of the ledger'
-    : tab === 'publication'
-      ? 'Publication of the ledger'
-      : 'Ledger page'
+    : tab === 'anchoring'
+      ? 'Anchoring of the ledger'
+      : tab === 'publication'
+        ? 'Publication of the ledger'
+        : 'Ledger page'
 })
 const isPending = computed(() => props.alert.kind === 'replicationPending')
 // 0.8.0: a clock that differs is explained and handled on the Time tab of the Configuration page.

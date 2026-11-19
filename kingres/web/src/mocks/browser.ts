@@ -75,6 +75,9 @@ export async function startBrowserMocks(): Promise<void> {
     // 0.10.0 (console part 2): the values of `?failover=` while the page is open (`limit`, `count:1:3`, `off`, `auto:10.0.0.12`).
     failoverSwitch: (text: string) =>
       applySwitches(new URLSearchParams({ failover: text }), getState()),
+    // 0.11.0 (console part B): the values of `?anchors=` while the page is open (`all`, `disabled`, `testfail`).
+    anchorsSwitch: (text: string) =>
+      applySwitches(new URLSearchParams({ anchors: text }), getState()),
     resetCounter: () => {
       resetAutoFailoverCounter(getState())
     },

@@ -399,14 +399,18 @@ describe('the mock: publication, aggregates and anchoring', () => {
       kind: 'worm',
       name: 'vault',
       enabled: true,
-      config: { bucket: 'b' },
-      credentials: { accessKey: 'AKIA...', secretKey: 'hunter2' },
+      config: { region: 'eu-west-1', bucket: 'bbb' },
+      credentials: { accessKeyId: 'AKIA...', secretAccessKey: 'hunter2' },
     })
     ok(created, 'LedgerAnchorTarget')
     expect(created.credentialsSet).toBe(true)
     expect(JSON.stringify(created)).not.toMatch(/hunter2|AKIA/)
     await expect(
-      endpoints.createLedgerAnchorTarget({ kind: 'worm', name: 'vault', config: {} }),
+      endpoints.createLedgerAnchorTarget({
+        kind: 'worm',
+        name: 'vault',
+        config: { region: 'eu-west-1', bucket: 'bbb' },
+      }),
     ).rejects.toMatchObject({ code: 'already_exists' })
     await expect(
       endpoints.updateLedgerAnchorTarget(created.id, { kind: 'tsa' }),

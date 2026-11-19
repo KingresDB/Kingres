@@ -34,6 +34,7 @@ const PAGES: PageCase[] = [
   { path: '/ledger', heading: 'Ledger', data: /Status of shop/ },
   { path: '/ledger?tab=digests', heading: 'Ledger', data: /Aggregate checkpoints/ },
   { path: '/ledger?tab=signing', heading: 'Ledger', data: /Signed events/ },
+  { path: '/ledger?tab=anchoring', heading: 'Ledger', data: /Anchor targets/ },
   { path: '/ledger?tab=publication', heading: 'Ledger', data: /What the publication reveals/ },
   { path: '/workbench', heading: 'Query workbench', data: /Run/ },
   { path: '/tasks', heading: 'Tasks', data: /No tasks|database\./ },
