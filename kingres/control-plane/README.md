@@ -3267,3 +3267,12 @@ the authority is checked against the roots of the system, not against that bundl
 record is `anchored` at once on a token the library verified in full (message imprint, nonce, chain at `genTime` and now, key usage, names); every refusal of 6.4 is a failed record with the code of the library in the alert. Requests go to the
 host and port of `url` only (the egress rule). `downloadLedgerAnchor?format=tsr` gives the DER of the time-stamp token (the CMS ContentInfo from the evidence), not a whole TimeStampResp, which the cluster does not keep. The Test button
 asks for a real token for the hash of an empty string and verifies it.
+
+### The OpenTimestamps target (phase 7, step 14; corrections 185 and 186)
+
+`kind_ots.go` registers the kind `ots` over `internal/anchor/ots`: the library's configuration (`calendars`, `minCalendars`, `upgradeTimeoutDays`, `allowInsecure`, `contradictionConfirmMinutes`) and one member of ours, `headerSource: {"url": ...}`, an
+Esplora-compatible explorer of a node the operator trusts (`/block-height/<h>`, `/block/<hash>/header`; the answers are bounded and the hash named must be the hash of the header given). Without it a claim of a calendar is a **claim**: the record is
+`claimed`, shown as `submitted`, never counted as anchored, looked at again at its next time; with it a record is anchored only on the header of the claimed height passing the library's rules. The calendars and the header source are the hosts the egress rule
+allows. No credentials. `jobs.go` gives every submitted or claimed record a time for its next look (`UpgradeInterval`), also a claimed record that has none, applies `ExpireIfDue` with the timeouts of the library, keeps what the calendars that answered gave when a
+submission is partial and passes it to `Resume` at the next attempt, and notes contradicted claims in `lastError` and the log. The Test button warns when the table of real headers of the build is older than a year, and so does a line in the log at start.
+`downloadLedgerAnchor?format=ots` writes the detached `.ots` file.

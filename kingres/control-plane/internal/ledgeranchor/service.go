@@ -113,6 +113,7 @@ func New(cfg Config) (*Service, error) {
 		log = slog.New(slog.DiscardHandler)
 	}
 	s := &Service{cfg: cfg, log: log, inflight: map[int64]bool{}, exporters: map[string]exporter{}}
+	warnHeaderTable(log, cfg.Clock())
 	for _, k := range kinds {
 		for f, fn := range k.Exports {
 			s.exporters[f] = exporter{kind: k.Name, fn: fn}

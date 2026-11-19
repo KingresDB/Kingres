@@ -98,7 +98,7 @@ func (s *Service) pass(ctx context.Context, term scheduler.Term, want func(Row) 
 	byTarget := map[int64][]Row{}
 	var order []int64
 	for _, r := range rows {
-		if !want(r) || !r.Record.Due(now) {
+		if !want(r) || !(r.Record.Due(now) || r.State == anchor.StateClaimed && r.NextAttemptAt == nil) {
 			continue
 		}
 		if _, ok := byTarget[r.TargetID]; !ok {
@@ -254,6 +254,16 @@ func (s *Service) succeed(ctx context.Context, term scheduler.Term, row Row, rc 
 	w := row
 	w.Record = rec
 	w.ErrorCode, w.Alert = "", ""
+	if (rec.State == anchor.StateSubmitted || rec.State == anchor.StateClaimed) && rec.NextAttemptAt == nil {
+		// a receipt that names no time for the next check still gets one, so that a claimed record is never left without (duty 13)
+		next := now.Add(anchor.UpgradeInterval(now.Sub(rec.CreatedAt)))
+		w.NextAttemptAt = &next
+	}
+	if n := rc.ContradictedClaims + rc.ClaimsAside + rc.ClaimsDropped + rc.ClaimsRepeated; n > 0 {
+		// a calendar whose claim a header contradicts, or a wrong source: visible in the record and in the log (duty 14)
+		w.LastError = fmt.Sprintf("claims of a calendar were contradicted by the header source: %d contradicted, %d kept aside, %d dropped, %d repeated", rc.ContradictedClaims, rc.ClaimsAside, rc.ClaimsDropped, rc.ClaimsRepeated)
+		s.log.Warn("claims of an OpenTimestamps calendar were contradicted", "record", row.ID, "contradicted", rc.ContradictedClaims, "aside", rc.ClaimsAside, "dropped", rc.ClaimsDropped, "repeated", rc.ClaimsRepeated)
+	}
 	return s.apply(ctx, term, w, row.Version)
 }
 
@@ -271,6 +281,12 @@ func (s *Service) fail(ctx context.Context, term scheduler.Term, row Row, err er
 	w := row
 	w.Record = rec
 	w.ErrorCode = anchor.CodeOf(err)
+	// what the calendars that answered gave is kept with the record (a partial submission leaves it in the error, duty 12)
+	if b != nil && b.Kind.PriorEvidence != nil && len(row.Evidence) == 0 {
+		if raw, ok := b.Kind.PriorEvidence(err); ok {
+			w.Evidence = raw
+		}
+	}
 	w.Alert = alertKind
 	if alertKind == anchor.AlertNone && (rec.State == anchor.StateFailed || rec.State == anchor.StateExpired) {
 		w.Alert = AlertFailed

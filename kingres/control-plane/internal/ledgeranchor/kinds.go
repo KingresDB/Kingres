@@ -64,6 +64,8 @@ type Kind struct {
 	// Timeouts returns how long a submitted and a claimed record may wait before it expires (zero: never) for a
 	// configuration; only OpenTimestamps waits.
 	Timeouts func(cfg json.RawMessage) (submitted, claimed time.Duration)
+	// PriorEvidence returns the evidence that a failed call left in its error (OpenTimestamps: what the calendars that answered gave), which the record must keep (duty 12).
+	PriorEvidence func(err error) (json.RawMessage, bool)
 	// Exports are the file formats besides JSON that downloadLedgerAnchor can write for the kind ("ots", "tsr").
 	Exports map[string]func(Row) ([]byte, error)
 }
