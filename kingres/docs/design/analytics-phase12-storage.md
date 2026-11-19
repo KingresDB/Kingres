@@ -2629,3 +2629,17 @@ the new table; unique indexes of the parent wait for C6c.
   tail of a committed buffer is returned.
 - **For `kingres_timepart`**: compaction of a columnar partition with indexes is allowed now;
   VACUUM after it removes the old entries.
+
+### T2 with indexes (2026-11-19)
+
+- A partition whose table has B-tree indexes of immediate checking (unique ones and primary keys
+  included) is converted: the new table is loaded first, its indexes are built afterwards under
+  temporary names so that the attach builds nothing under the lock of the parent, and the names and
+  comments are restored after the swap. No index entry is carried.
+- Refused: other index methods, exclusion constraints, deferrable keys, invalid indexes, foreign keys,
+  `AFTER ROW` triggers, a replica identity that uses an index, and a table with indexes while
+  `kingres_columnar` is still at 0.1 (a new table would be of format 2, which cannot have an index;
+  no SQL function reads the format of an existing columnar file).
+- **A conversion cannot end with `VACUUM`**: PostgreSQL refuses it inside a function or procedure,
+  also after a `COMMIT`. The conversion runs `ANALYZE`; whoever schedules it runs `VACUUM` afterwards
+  as a statement of its own.
