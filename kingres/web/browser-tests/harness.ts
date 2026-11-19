@@ -288,6 +288,20 @@ const setMock = (page: Page, settings: Record<string, unknown>) =>
     Object.assign(mock.config, values)
   }, settings)
 
+/** Applies a value of `?failover=` while the page is open (src/mocks/browser.ts). */
+const mockSwitch = async (page: Page, value: string) => {
+  await page.evaluate((v) => {
+    ;(
+      window as unknown as { __kingresMock: { failoverSwitch: (text: string) => void } }
+    ).__kingresMock.failoverSwitch(v)
+    // The pages keep what they read for a few seconds: ask again.
+    void (
+      window as unknown as { __queryClient: { invalidateQueries: () => unknown } }
+    ).__queryClient.invalidateQueries()
+  }, value)
+  await sleep(300)
+}
+
 /** Opens the failover dialog of a server on the Servers page. */
 async function openFailoverDialog(page: Page, server: string): Promise<void> {
   const ok = await page.evaluate((id) => {
@@ -781,6 +795,69 @@ export const STATES: PageState[] = [
     close: async (page) => {
       await page.click('[role="dialog"] [data-dialog-close]')
       await sleep(150)
+      await leaveFailover(page)
+    },
+  },
+  {
+    // 0.10.0, console part 2: the counter of automatic failovers at its limit, and the reset with its confirmation.
+    name: 'settings: automatic failover at its limit (0.10.0)',
+    needsMock: true,
+    route: '/settings',
+    open: async (page) => {
+      await freshFailover(page)
+      await mockSwitch(page, 'limit')
+      await go(page, '/dashboard')
+      await go(page, '/settings')
+      await page.waitForSelector('[data-testid="af-limit"]', { timeout: 20_000 })
+      await sleep(250)
+    },
+    close: freshFailover,
+  },
+  {
+    name: 'settings: reset the counter dialog (0.10.0)',
+    needsMock: true,
+    route: '/settings',
+    open: async (page) => {
+      await freshFailover(page)
+      await mockSwitch(page, 'limit')
+      await go(page, '/dashboard')
+      await go(page, '/settings')
+      await page.waitForSelector('[data-testid="af-limit"]', { timeout: 20_000 })
+      await clickText(page, 'Reset counter')
+      await dialogOpen(page)
+    },
+    close: async (page) => {
+      await cancel(page)
+      await freshFailover(page)
+    },
+  },
+  {
+    name: 'banner: a failover that goes on (0.10.0)',
+    needsMock: true,
+    route: '/dashboard',
+    open: async (page) => {
+      await freshFailover(page)
+      await setMock(page, { taskDurationMs: 60_000 })
+      await mockSwitch(page, 'auto:10.0.0.12')
+      await page.waitForSelector('[data-testid="banner-failover"]', { timeout: 30_000 })
+      await sleep(300)
+    },
+    close: leaveFailover,
+  },
+  {
+    name: 'banner: waiting for you (0.10.0)',
+    needsMock: true,
+    route: '/servers',
+    open: async (page) => {
+      await freshFailover(page)
+      await setMock(page, { failoverNeedsDecision: true })
+      await startFailover(page, '10.0.0.12')
+      await closeDialogs(page)
+      await page.waitForSelector('[data-testid="banner-failover"].tone-danger', { timeout: 30_000 })
+      await sleep(300)
+    },
+    close: async (page) => {
+      await setMock(page, { failoverNeedsDecision: false })
       await leaveFailover(page)
     },
   },

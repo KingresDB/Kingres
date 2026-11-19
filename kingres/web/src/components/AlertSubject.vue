@@ -42,8 +42,16 @@ const aspectText = computed(() => {
 })
 // 0.10.0: an alert about a failover links to where its progress and report are shown.
 const isFailoverAlert = computed(() =>
-  ['failoverNeedsDecision', 'failoverBlocked', 'failoverDataLoss'].includes(props.alert.kind),
+  [
+    'failoverNeedsDecision',
+    'failoverBlocked',
+    'failoverDataLoss',
+    'autoFailoverTriggered',
+  ].includes(props.alert.kind),
 )
+// 0.10.0: the alert that the limit of automatic failovers is reached links to the counter and its reset on Settings.
+const isLimitAlert = computed(() => props.alert.kind === 'autoFailoverLimitReached')
+const canSettings = computed(() => session.can('getClusterSettings'))
 const canFailover = computed(() => session.can('getFailoverStatus'))
 // 0.11.0: an alert about the ledger links to the tab of the Ledger page where it is explained and handled.
 const LEDGER_TAB: Record<string, string | undefined> = {
@@ -81,6 +89,7 @@ const canTime = computed(
 const any = computed(
   () =>
     (isFailoverAlert.value && canFailover.value) ||
+    (isLimitAlert.value && canSettings.value) ||
     (isLedgerAlert.value && canLedger.value) ||
     subject.value.serverId !== null ||
     subject.value.behindServerId !== null ||
@@ -130,6 +139,11 @@ const any = computed(
     <li v-if="isFailoverAlert && canFailover" data-testid="alert-failover">
       <RouterLink :to="{ name: 'replication', hash: '#failover-top' }"
         >Failover progress and report</RouterLink
+      >
+    </li>
+    <li v-if="isLimitAlert && canSettings" data-testid="alert-auto-failover-settings">
+      <RouterLink :to="{ name: 'settings' }"
+        >Automatic failover settings and the counter</RouterLink
       >
     </li>
     <li v-if="isLedgerAlert && canLedger" data-testid="alert-ledger">

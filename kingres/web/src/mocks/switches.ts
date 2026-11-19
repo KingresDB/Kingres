@@ -57,7 +57,7 @@
 //   ?clock=unreachable:<server>   the clock of that server cannot be read.
 import type { MockState } from './state'
 import { loseLease, mockConfig, silenceServer, stallStandby } from './state'
-import { FAIL_STEPS, seedAutomaticFailover } from './failover'
+import { FAIL_STEPS, raiseAutoFailoverLimit, seedAutomaticFailover } from './failover'
 import { answerAsTheServerDoesToday, seedAnchors } from './ledger'
 import { signingKey, withoutKeys } from './ledger-data'
 import {
@@ -95,6 +95,21 @@ function applyFailoverSwitch(entry: string, s: MockState): void {
       eventsSinceReset: s.settings.autoFailover.maxCount,
       lastEventAt: new Date(Date.now() - 600_000).toISOString(),
     }
+  if (entry === 'limit') raiseAutoFailoverLimit(s)
+  // 0.10.0 (console part 2): automatic failover turned off; the counter at n of m (the limit when n reaches m).
+  if (entry === 'off') s.settings.autoFailover = { ...s.settings.autoFailover, enabled: false }
+  const count = /^count:(\d{1,3})(?::(\d{1,3}))?$/.exec(entry)
+  if (count) {
+    const max = Math.max(1, Number(count[2] ?? s.settings.autoFailover.maxCount))
+    const events = Number(count[1])
+    s.settings.autoFailover = {
+      ...s.settings.autoFailover,
+      maxCount: max,
+      eventsSinceReset: events,
+      lastEventAt: events > 0 ? new Date(Date.now() - 3_600_000).toISOString() : null,
+    }
+    if (events >= max) raiseAutoFailoverLimit(s)
+  }
   const auto = /^auto:(.+)$/.exec(entry)
   if (auto) seedAutomaticFailover(s, auto[1] as string)
 }

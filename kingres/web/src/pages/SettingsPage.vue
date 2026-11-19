@@ -11,6 +11,8 @@ import GateButton from '@/components/GateButton.vue'
 import ProblemNotice from '@/components/ProblemNotice.vue'
 import FormField from '@/components/FormField.vue'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
+import AutoFailoverCounter from '@/components/AutoFailoverCounter.vue'
+import { AUTO_FAILOVER_REQUIREMENTS } from '@/lib/failover'
 import { vBlockEnterSubmit } from '@/lib/forms'
 import { endpoints } from '@/api/endpoints'
 import { describeProblem } from '@/api/problem'
@@ -70,7 +72,7 @@ const errors = computed(() =>
     ),
     'autoFailover.timeoutSeconds': firstError<number | null>(
       form.afTimeout,
-      integerBetween('The timeout', 1, 3600),
+      integerBetween('The timeout', 30, 3600),
     ),
     'autoFailover.maxCount': firstError<number | null>(
       form.afMax,
@@ -207,7 +209,7 @@ function submit(): void {
         <FormField
           v-slot="slot"
           label="Timeout (seconds)"
-          hint="30 to 3600. A server must be silent this long."
+          hint="30 to 3600. A server must be silent this long. A shorter time cannot tell a failure from a pause, and the cluster waits at least three times the time it takes to call a server failed, so a failover can start later than this."
           :error="err('autoFailover.timeoutSeconds')"
         >
           <input
@@ -222,7 +224,7 @@ function submit(): void {
         <FormField
           v-slot="slot"
           label="Maximum automatic failovers"
-          hint="After this many events further failovers need an operator. A rebalance resets the counter."
+          hint="1 to 100. After this many events further failovers need an operator. A rebalance that completes resets the counter."
           :error="err('autoFailover.maxCount')"
         >
           <input
@@ -234,9 +236,13 @@ function submit(): void {
             max="100"
           />
         </FormField>
-        <p class="muted">
-          Events since the last reset: <strong>{{ s.autoFailover.eventsSinceReset }}</strong>
-        </p>
+        <AutoFailoverCounter :auto-failover="s.autoFailover" />
+        <div data-testid="af-requirements">
+          <p class="muted">Automatic failover needs:</p>
+          <ul class="muted">
+            <li v-for="r in AUTO_FAILOVER_REQUIREMENTS" :key="r">{{ r }}</li>
+          </ul>
+        </div>
       </fieldset>
       <fieldset>
         <legend>Rebalance</legend>

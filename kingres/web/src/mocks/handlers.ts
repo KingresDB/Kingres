@@ -60,6 +60,7 @@ import {
   failoverPlan,
   failoverStatusView,
   resumeFailover,
+  resetAutoFailoverCounter,
   restorePlan,
   startFailoverRun,
 } from './failover'
@@ -2193,7 +2194,7 @@ export function createHandlers(): HttpHandler[] {
               g.primaryServerId = g.preferredPrimaryServerId
             }
             fixReplicas(s)
-            s.settings.autoFailover = { ...s.settings.autoFailover, eventsSinceReset: 0 }
+            resetAutoFailoverCounter(s)
           },
         }),
       )
@@ -2288,7 +2289,7 @@ export function createHandlers(): HttpHandler[] {
           s.rebalance.state = failing ? 'failed' : 'idle'
           s.rebalance.needed = failing
           if (!failing) s.rebalance.reasons = []
-          s.settings.autoFailover = { ...s.settings.autoFailover, eventsSinceReset: 0 }
+          resetAutoFailoverCounter(s)
           pushReport(s, {
             id: s.rebalance.taskId as number,
             outcome: failing ? 'failed' : 'completed',
@@ -2349,7 +2350,7 @@ export function createHandlers(): HttpHandler[] {
       return ok(r)
     },
     resetAutoFailoverCounter: (c) => {
-      c.s.settings.autoFailover = { ...c.s.settings.autoFailover, eventsSinceReset: 0 }
+      resetAutoFailoverCounter(c.s)
       return ok(c.s.settings)
     },
 

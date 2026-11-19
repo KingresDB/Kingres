@@ -27,7 +27,7 @@ import {
   silenceServer,
   type FailoverReadinessState,
 } from './state'
-import { resetFailoverState } from './failover'
+import { resetAutoFailoverCounter, resetFailoverState } from './failover'
 import { applySwitches } from './switches'
 import {
   bringConfigServerBack,
@@ -72,9 +72,11 @@ export async function startBrowserMocks(): Promise<void> {
       else mockConfig.failoverReadiness[group] = state
     },
     resetFailover: () => resetFailoverState(getState()),
+    // 0.10.0 (console part 2): the values of `?failover=` while the page is open (`limit`, `count:1:3`, `off`, `auto:10.0.0.12`).
+    failoverSwitch: (text: string) =>
+      applySwitches(new URLSearchParams({ failover: text }), getState()),
     resetCounter: () => {
-      const s = getState()
-      s.settings.autoFailover = { ...s.settings.autoFailover, eventsSinceReset: 0 }
+      resetAutoFailoverCounter(getState())
     },
     loseLease: (group: number) => loseLease(getState(), group),
     regainLease: (group: number) => regainLease(getState(), group),
