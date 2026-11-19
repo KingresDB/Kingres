@@ -20,6 +20,7 @@ func publicationRows(x *exitEnv) []exitRow {
 	var rows []exitRow
 	add := func(r ...exitRow) { rows = append(rows, r...) }
 	add(flagCases("Aggregate", "aggregate")...)
+	add(flagCases("Anchors", "anchors")...)
 	add(flagCases("BundleVerify", "bundle", "verify")...)
 	add(flagCases("BundleFetch", "bundle", "fetch")...)
 	add(flagCases("Monitor", "monitor")...)
@@ -51,6 +52,17 @@ func publicationRows(x *exitEnv) []exitRow {
 			w.addChain(a, 5)
 			w.appendRound(1, member(a, 5, aggregate.FlagStale))
 			return w.aggArgs()
+		}),
+
+		fn("runAnchors:inputError#1", 2, func(t *testing.T) []string { return []string{"anchors"} }),
+		fn("runAnchors:finishFailed#1", 1, func(t *testing.T) []string {
+			aw := newAnchorWorld(t)
+			aw.put(2, "x1", []byte(`{"format":1}`))
+			return aw.args(aw.trust)
+		}),
+		fn("runAnchors:finishIncomplete#1", 3, func(t *testing.T) []string {
+			aw := newAnchorWorld(t)
+			return aw.args(aw.trust)
 		}),
 
 		fn("runBundleVerify:inputError#1", 2, func(t *testing.T) []string { return []string{"bundle", "verify"} }),

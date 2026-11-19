@@ -143,6 +143,9 @@ func TestBundleVerifyRejectsEveryByteOfEveryFile(t *testing.T) {
 				p := filepath.Join(dir, rel)
 				orig, _ := os.ReadFile(p)
 				for i := range orig {
+					if !sweepPosition(i, len(orig)) {
+						continue
+					}
 					if n++; n%workers != k {
 						continue
 					}

@@ -89,6 +89,7 @@ unknown subcommand.
 | `checkpoint` | 0, 1, 2, 3, 4 |
 | `consistency` | 0, 1, 2, 3 |
 | `aggregate` | 0, 1, 2, 3 |
+| `anchors` | 0, 1, 2, 3 |
 | `bundle verify` | 0, 1, 2, 3 |
 | `bundle fetch` | 0, 1, 2, 3 |
 | `monitor` | 0, 1, 2, 3 |
@@ -2005,3 +2006,46 @@ and proofs) are signed by keys of the trust file he pinned that **no verified ev
 checkpoint**; that every event counted as verified was signed by a key the trust chain authorises; that every member flag of the last aggregate round was
 judged by the table. **Not** that no revocation exists (an event that is withheld, or sits after the point where an HTTP source stops, is invisible), not the
 time of anything (no anchor was read by these commands), and not that a key that an event added is trusted (use `trust follow`).
+
+## Anchors: `anchors` (phase 7, steps 11, 13 and 15)
+
+```
+kingres-verify anchors --trust T --aggregate-id HEX [--source S] [--size N] [--target ID ...] [--require worm,tsa,ots|any]
+                       [--worm-url [ID=]URL ...] [--btc-header HEIGHT:HEX80 ...] [--now TIME] [--json]
+```
+
+An anchor is evidence that the digest of an aggregate checkpoint (SHA-256 of its text, correction 179) existed at a time an outside party
+vouches for. The command verifies the aggregate checkpoint as `aggregate` does (the key events apply), then **recomputes the digest from the
+signed aggregate log** (for the size of the signed checkpoint, the text of the signed note; for an older `--size`, the three lines for the root of
+the first N leaves, proved a prefix of the signed log with RFC 9162 2.1.4.2 from the tiles) and reads the evidence files
+`a/<id>/anchors/<size>/<target>.json` (listed from a directory or `.tar.gz`; an HTTP source cannot list, so name them with `--target`). The evidence
+file is the cluster's claim and nothing in it is believed: its origin, size and `payload_sha256` must be the recomputed ones (else status 1,
+`anchor-evidence`), and each kind is then checked from **your** inputs. The files are read as strictly as the publisher writes them (unknown or missing
+member, upper case hex, a time that is not whole seconds ending in Z, non canonical base64: status 1).
+
+| Kind | What is verified | From what | Without that input | Wrong input |
+|---|---|---|---|---|
+| `worm` | the object key names this aggregate, size and generation; **with `--worm-url`**: the fetched bytes have the SHA-256 and length of the evidence, are a note signed by a key of your trust file (key events applied) of this size whose text is the digest; the store's version, lock mode, retain-until and Last-Modified headers equal the evidence when returned (a header not returned is said to be the cluster's word) | a URL to the object version, anonymous or presigned (no redirect, no proxy, 1 MiB, https or loopback http; the URL never appears in an error) | status 3: a claim that nobody re-fetched is not an anchor | different bytes, version, lock or key, another signer: 1; store unreachable: 3 |
+| `tsa` | RFC 3161 token, offline: DER, one SignerInfo, signed attributes (content type, message digest, ESS signing certificate), the signature (RSA PKCS#1 v1.5 of 2048 bits or more, or ECDSA; SHA-256, SHA-384, SHA-512), imprint is the digest, the certificate has id-kp-timeStamping alone in a **critical** extended key usage extension and chains to a root of **your** `tsa_roots`, valid **at genTime**, the `tsa` name if present is the subject; the evidence's gen_time, serial, policy and key hash equal the token's | `tsa_roots` of your trust file | status 3 ("pin the authority's certificate yourself") | any check failing: 1 |
+| `ots` | every calendar fragment is walked from the digest (append, prepend, SHA-256, SHA-1); a Bitcoin attestation's message must be the merkle root of the header at its height | `--btc-header HEIGHT:HEX` of a block header you obtained yourself; it must meet its own target (a work check, and not easier than difficulty 1) | status 3 ("commitment tree valid; not checked against Bitcoin"); pending only: 3 | a header whose merkle root is not the tree's, or not mined: 1; an operation not computed here (RIPEMD-160, reverse, hexlify, Keccak-256, unknown): 1, by name; the claim of the evidence not present in any fragment: 1 |
+
+Statuses: 0 when everything asked for verified; 1 when anything failed (wins over everything); 3 when nothing failed and something could not be checked, or
+no anchor exists for the size (the checkpoint is not anchored or the evidence was withheld), or the anchored size is larger than the signed checkpoint served
+(nothing can be recomputed; the publication may show a log older than the anchor); 2 for bad input. Without `--require` every evidence file read must verify.
+With `--require worm,tsa,ots` or `any`, each named kind needs one verified anchor and the other files that could not be checked are notes; a failure of any file is 1 in
+both cases. **What each time means:** the WORM time is the store's `Last-Modified` and the store's word; the time-stamp's is genTime and the authority's word, within its
+accuracy (printed, not used); the OpenTimestamps one is "no later than" the miner's time field of the header, an error of the order of hours. None is a statement that
+the checkpoint is the latest, that no other history was anchored, or (tsa) that the certificate was not revoked (no OCSP or CRL is read); a header is not shown to be on
+the best chain. `bundle verify` does not read anchors: it still lists them and ends with status 3; run `anchors` on the same source.
+
+**Tests and what is not testable here.** The evidence of the tests is made by `internal/anchortest` from the documented formats (the verifier module cannot import the
+control plane, and no dependency may be added): a local test authority with ECDSA and RSA keys, fragments written byte by byte, evidence files in the publisher's JSON. Not made
+here, and named: tokens of public authorities, a WORM object of a real MinIO, a `.ots` file of the reference client, and a **mined header of the block of an anchor** (the
+real header of the genesis block is used to test the work check, and the tests that need a header that matches a constructed tree replace the work check by one at an easy
+target through the unexported `parseHeader`; the real limit is tested to refuse such a header). Fuzz targets: `FuzzParse` (token), `FuzzWalk` (fragment), `FuzzParse` (evidence file).
+Every single-byte change of a token is refused except inside the copy of the root that the token carries, which is never trusted.
+
+**Correction 168 and revoked keys.** The rule that an old checkpoint of a revoked key may stay good when an anchor dates it before `compromised-since` is **not** applied: `revoked`
+stays revoked in every command. The design must state first: which anchor kinds may date (a WORM store's clock and a Bitcoin time field are not the same kind of word), whether
+the comparison with `compromised-since` is strict, what "covered by the anchor" means for a chain checkpoint (the consistency with the member `log_root` of an anchored aggregate whose leaf names the
+chain at a height), and that the anchor itself must be verified with the inputs above.
