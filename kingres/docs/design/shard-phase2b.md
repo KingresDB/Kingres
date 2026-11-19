@@ -2887,3 +2887,98 @@ For a test run of both majors: the test of a cluster of two majors
 (`t/046`) uses the extension as it is installed for the other major, so after
 a change of the version both installations must hold the new version before
 that test can pass.
+
+### Step 5 (the analysis module and the colocated INSERT ... SELECT)
+
+**The marker and the rule on the group.** The marker is
+`/* kingres:insert-select-fragment place=<n> */`; the v=2 marker machinery
+still does not exist. A group accepts the statement only in a forwarded
+session and runs the same analysis function on the parse of the text it
+received. A forged fragment is `0A000`, a stale `place` is `KS001`.
+
+**The origin parses its own text.** After it deparsed the statement, the
+origin parses and rewrites the text under the transmission modes and runs the
+function of the group on it. A statement the origin ships is therefore never
+refused by a group for its form; when the two disagree the statement goes to
+the row router. This costs one more parse analysis for a colocated
+`INSERT ... SELECT`.
+
+**Execution is the fan-out of 2a.** The groups run one after another in the
+order of the groups, not at once. The plan number is checked before the first
+group runs, `place=` by each group after it planned, and the placement of
+every group after the last one ran. A signature of every relation of the plan
+(relation and colocation group) is taken at planning and checked again when
+the plan starts. Errors of a group go through `kingres_shard_fragment_error`.
+No group is pruned: every group of the target runs the fragment, also when a
+restriction names one bucket.
+
+**Columns the statement does not name.** The origin leaves a default out of
+the text, and the group applies its own, only when the default has no
+variable, is immutable and is shippable. A serial, identity, volatile or
+stable default (`now()`) sends the statement to the row router, which computes
+it once per row at the origin.
+
+**Column order and literals.** The target list of the INSERT is put in the
+order of the source when every column comes from a variable of the source. A
+literal of the select list that has no type of its own (a quoted literal,
+NULL) is accepted only when the order is the one of the source already.
+Whole-row references are refused, except the one the parser adds for
+`EXCLUDED`; the walker no longer walks that list, which made a `money` or enum
+column anywhere in the target refuse `DO UPDATE`.
+
+**Rule 6 of 5.1 was missing in the code and is there now, for every mode of
+the walker.** A constant of a `reg*` type whose object is not built in (for
+example `'t'::regclass`) is not shipped. A restriction of a 2a scan with such
+a constant is now evaluated at the origin. This is a correction and has no
+switch.
+
+**The check of the unique indexes of the target (11.7, condition 1)** applies
+to every statement of this path, not only to `DO UPDATE`, and compares the
+collation of the distribution column in each unique index too. PostgreSQL
+already refuses a unique index of a partitioned table that lacks the
+partition key, so the check can only meet a catalog edited by hand.
+
+**Refused beside the design's list, each going to the row router or to its
+refusal**: a target with a trigger or a rule of a user; row-level security on
+the target or on a source; a target that is a view, check options, or the
+rights of another role; `DO SELECT` (on 19).
+
+**Switches.** `enable_colocated_insert_select` does not depend on
+`enable_bulk_routing`; `enable_pushdown` does not exist yet. A cached plan
+keeps the path it was made with, as with every planner setting, and its
+results stay right.
+
+**A reload of the catalog cache during planning.** Parse analysis can reload
+the cache and leave pointers into it dangling. Planning compares the
+generation of the cache before and after and plans again when it changed, at
+most three times.
+
+**Tests** take `t/120` to `t/123` (the design's `056` P6 part, `058`, `064`)
+and the regression tests `pushdown_shippable` and `pushdown_plans`. The
+generator of `t/123` writes colocated statements, which must be shipped, and
+almost colocated ones, which must not, and compares outcome, `RETURNING` rows,
+error text and table with a single node.
+
+**Open after this step.** Two branches of the move tests always took the
+branch without an error (a move while the statement waits at the last check;
+a prepared plan across a move), so their `KS001` branches are not reached by a
+test.
+
+### What step 6 will find changed
+
+- `pushdown.h` gives, for one SELECT level and with no dependence on the
+  INSERT case: `kingres_shard_pushdown_analyze` (the eligibility rules 2 to 6,
+  the join rules of 9.1 with outer and FULL joins, the key class of 6.3; it
+  does not check rule 1 (switches, level, session) nor rule 8, and the caller
+  runs the walker on the whole statement), `kingres_shard_pushdown_is_key_var`
+  (it looks through join aliases, grouping columns and relabels and refuses a
+  key from the nullable side of an outer join),
+  `kingres_shard_pushdown_closed` (6.4: aggregates, DISTINCT, DISTINCT ON,
+  window partitions) and `kingres_shard_pushdown_relids`.
+- The private list of a fan-out plan has two more members, the kind and the
+  relation signatures.
+- `fanout_targets()` in `planner.c` is shared by this path and the fan-out
+  write.
+- For this path "closed" follows from the rule that the key is bare, so only
+  the reason line tests it; step 6 needs tests of its own for it.
+- The reg-constant rule above changes what a 2a scan ships.
