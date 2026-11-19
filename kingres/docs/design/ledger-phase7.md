@@ -3027,6 +3027,26 @@ The number 159 is not used.
     for it); the test of a target and a log line at start warn when the table of real headers is
     older than a year. The outcome "anchored" through a header source is not tested through the
     control plane, since a real header cannot be made in a test.
+190. **A verified event that revokes or retires a key counts in every command of the verifier that
+    judges a signature**, by the rule of 165 and 168: a checkpoint vouched for only by a key that a
+    verified event of the same evidence revoked, or that lies above the bound of a retired key, is a
+    failure. A key that an event added is trusted only through `trust follow`, from the file the
+    auditor pinned.
+191. **The flags of a member of an aggregate** are judged together: `diverged` is always a failure,
+    also together with `retired` (0x06); `stale` is "not verified" and is never dropped, also together
+    with `retired` (0x03); a retired chain whose own signed log goes past the retirement height is a
+    failure. The README of the verifier gives the whole table.
+192. **Events are numbered without a gap**; a gap is a failure where the source can list the events.
+193. **The 136 signed bytes of an attestation** cover the chain, the table, the operation, the hash
+    of the row, the key id and the nonce, not the transaction or the block; the verifier checks that
+    the attestation row is an insert of the entry's own transaction in the entry's block by other
+    means.
+194. **The monitor's state is required**: a missing or emptied state is an error, and a first run is
+    asked for with `--init`.
+195. **`bundle fetch` is bounded** by a number of files and of bytes when no trust file is given,
+    checks the size a checkpoint claims against that bound before it requests a tile, and compares
+    what it already holds before it replaces anything.
+
 
 Built of step 10: the anchoring framework and the WORM target. Not built in it: the publication of
 evidence files under the publication root, the cluster settings for the limits of retries (the
