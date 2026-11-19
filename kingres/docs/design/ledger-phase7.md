@@ -3068,6 +3068,27 @@ The number 159 is not used.
 203. **The byte sweeps of the verifier's tests** change a fixed sample by default and every byte with
     `KINGRES_VERIFY_FULL_SWEEP=1`.
 
+187. **A database without writes grows nothing**: no block, digest, log size or event. The 305 blocks
+    for five rows of an earlier test were one digest per row of the test helper; a digest closes a
+    block.
+188. **The fixture of a whole publication** is made by the cluster test of a database published on
+    two groups, saved twice so that every log has two checkpoints, with one anchored WORM record and
+    its evidence; it is regenerated with `-Fixtures` of `run-integration.ps1`.
+189. **Process kills inside a round** are tested at every kind of write (digest, log, unread, state,
+    retired, an event of the key set, note): after each restart no log is diverged or closed
+    wrongly, the logs audit against their tiles and pass the standalone verifier, and the record of
+    what was published agrees with the database.
+204. **The duties of a WORM target** are reported by its test and the monitor: `retention`,
+    `retention-ends` (a warning within 30 days), `retention-ended` (a failure), `evidence-attempt`,
+    `evidence-found`, and `server-clock` (the store's clock against the database's: a warning above
+    30 seconds, a failure above five minutes).
+205. **The limits of retries** are read from the environment (`KINGRES_ANCHOR_MAX_RETRY_ATTEMPTS`,
+    `KINGRES_ANCHOR_MAX_RETRY_AGE_HOURS`), since the contract has no setting for them.
+206. **Evidence files** are served under the publication root at `a/<id>/anchors/<size>/<target>.json`,
+    at that path only and never listed. A log closed because its database was dropped raises no
+    alert of a returning chain for 30 minutes, the time the drop task needs between ending the
+    publication and dropping the database.
+
 Correction 168 (an old checkpoint of a revoked key dated by an anchor) is not applied: the design must
 state which kinds of anchor may date a checkpoint, whether the comparison with the time of compromise is
 strict, and what it means that an anchor covers a checkpoint of a chain.
