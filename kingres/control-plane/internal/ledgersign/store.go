@@ -112,6 +112,11 @@ type Change struct {
 	Keys []KeyRow
 	// Events are appended; the first must have the next sequence number.
 	Events []EventRow
+	// CheckpointBound, when not nil, makes the store refuse the change (ErrConflict) if any stored checkpoint has a size above it,
+	// the check being made after the store holds the row of the cluster: the bound of a retired key must not be smaller than a tree
+	// the collector signed with it (corrections 128 and 129). A checkpoint put at the same time either commits first, and the change is
+	// refused and decided again with the new bound, or waits and finds the key set changed (ledgerpub.ErrKeysChanged).
+	CheckpointBound *uint64
 }
 
 // Store is the storage of the key set. Every write names the term of the leader

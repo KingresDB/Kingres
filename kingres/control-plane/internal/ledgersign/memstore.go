@@ -24,6 +24,10 @@ type MemStore struct {
 	Origins []string
 	// MaxSize is the answer of MaxCheckpointSize.
 	MaxSize uint64
+	// AfterMax, when set, is called after every MaxCheckpointSize with the number of the call (a checkpoint that is stored between the read
+	// of the bound and the commit of the event that states it).
+	AfterMax func(n int)
+	maxCalls int
 	// Hook, when set, is called inside Commit after the checks and before the change is kept; an
 	// error from it aborts the commit (a crash between the checks and the write).
 	Hook func(ch Change) error
@@ -92,9 +96,16 @@ func (m *MemStore) Commit(_ context.Context, term scheduler.Term, expect int64, 
 	if m.snap.Revision != expect {
 		return ErrConflict
 	}
+	if ch.CheckpointBound != nil && m.MaxSize > *ch.CheckpointBound {
+		return fmt.Errorf("%w: a checkpoint above the bound of the retired key was stored meanwhile", ErrConflict)
+	}
 	next := clone(m.snap)
 	if ch.Cluster != nil {
 		next.Cluster = *ch.Cluster
+		// as the database store: the first checkpoint belongs to the collector, and what it locked stays locked
+		if old := m.snap.Cluster; old.FirstCheckpointAt != nil {
+			next.Cluster.FirstCheckpointAt, next.Cluster.OriginPrefix = old.FirstCheckpointAt, old.OriginPrefix
+		}
 	}
 	for _, k := range ch.Keys {
 		replaced := false
@@ -148,8 +159,14 @@ func (m *MemStore) LogOrigins(context.Context) ([]string, error) {
 // MaxCheckpointSize implements Store.
 func (m *MemStore) MaxCheckpointSize(context.Context) (uint64, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.MaxSize, nil
+	size := m.MaxSize
+	m.maxCalls++
+	n, after := m.maxCalls, m.AfterMax
+	m.mu.Unlock()
+	if after != nil {
+		after(n)
+	}
+	return size, nil
 }
 
 // Overwrite replaces the stored keys without any check (a test that damages the store).

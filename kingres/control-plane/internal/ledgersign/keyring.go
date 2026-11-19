@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -51,6 +52,7 @@ func NewKeyring(dir, passFile string) (*Keyring, error) {
 	if err := os.MkdirAll(k.signingDir(), 0o700); err != nil {
 		return nil, fmt.Errorf("ledgersign: creating the key directory: %w", err)
 	}
+	k.CleanTemp(time.Minute)
 	return k, nil
 }
 
@@ -149,7 +151,8 @@ func (k *Keyring) Signer(fp string) (ledgerkeys.Signer, error) {
 		if errors.Is(err, ledgerkeys.ErrWrongPassphrase) || errors.Is(err, ledgerkeys.ErrPassphraseRequired) || errors.Is(err, ledgerkeys.ErrPassphraseNotNeeded) {
 			return nil, ErrPassphrase
 		}
-		return nil, fmt.Errorf("ledgersign: reading the key file %s: %w", filepath.Base(path), err)
+		_ = path
+		return nil, fmt.Errorf("ledgersign: the key file of %s cannot be opened: %s", fp[:16], k.noPath(err))
 	}
 	k.cache[fp] = s
 	return s, nil
@@ -242,7 +245,11 @@ func (k *Keyring) Install(fp string, data []byte) error {
 	if k.Has(fp) {
 		have, err := ledgerkeys.ReadNamed(k.signingDir(), fp, p)
 		if err != nil {
-			return fmt.Errorf("ledgersign: a key file exists and cannot be read: %w", err)
+			// A file that exists and does not open is no copy of the key: it is replaced by this one (P7-04).
+			if rerr := k.Remove(fp); rerr != nil {
+				return rerr
+			}
+			return ledgerkeys.WriteFile(path, *s, p, false)
 		}
 		same := have.SameKey(*s)
 		_ = have.Close()
@@ -263,6 +270,7 @@ func (k *Keyring) Remove(fp string) error {
 		return err
 	}
 	k.Forget(fp)
+	_ = os.Remove(filepath.Join(k.signingDir(), fp+".task"))
 	st, err := os.Lstat(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
@@ -339,7 +347,7 @@ func (k *Keyring) Orphan(known map[string]bool, since time.Time, slack time.Dura
 		return "", err
 	}
 	for _, fp := range fps {
-		if known[fp] {
+		if known[fp] || !k.marked(fp) {
 			continue
 		}
 		st, err := os.Stat(filepath.Join(k.signingDir(), fp+".key"))
@@ -360,4 +368,95 @@ func (k *Keyring) PublicOf(fp string) (ed25519.PublicKey, error) {
 		return nil, err
 	}
 	return s.Public(), nil
+}
+
+// Verify opens the key file of a key (from the disk, not from the cache) and checks that it holds the public key that the row of the key has.
+// An error names the fingerprint, never a path (P7-04, P7-08).
+func (k *Keyring) Verify(fp string, pub ed25519.PublicKey) error {
+	if !k.Has(fp) {
+		return ErrNoKeyFile
+	}
+	p, err := k.passphrase()
+	if err != nil {
+		return err
+	}
+	defer p.Destroy()
+	s, err := ledgerkeys.ReadNamed(k.signingDir(), fp, p)
+	if err != nil {
+		if errors.Is(err, ledgerkeys.ErrWrongPassphrase) || errors.Is(err, ledgerkeys.ErrPassphraseRequired) || errors.Is(err, ledgerkeys.ErrPassphraseNotNeeded) {
+			return ErrPassphrase
+		}
+		return fmt.Errorf("ledgersign: the key file of %s cannot be opened: %s", fp[:16], k.noPath(err))
+	}
+	defer func() { _ = s.Close() }()
+	if !s.Public().Equal(pub) {
+		return fmt.Errorf("ledgersign: the key file of %s holds another key", fp[:16])
+	}
+	return nil
+}
+
+// noPath is the text of an error without the key directory.
+func (k *Keyring) noPath(err error) string {
+	return strings.ReplaceAll(strings.ReplaceAll(err.Error(), k.signingDir(), "<key directory>"), k.dir, "<key directory>")
+}
+
+// ListChecked lists the key files that open (with this server's passphrase) and the ones that exist and do not.
+func (k *Keyring) ListChecked() (ok, bad []string, err error) {
+	all, err := k.List()
+	if err != nil {
+		return nil, nil, err
+	}
+	p, perr := k.passphrase()
+	for _, fp := range all {
+		if perr != nil {
+			bad = append(bad, fp)
+			continue
+		}
+		s, rerr := ledgerkeys.ReadNamed(k.signingDir(), fp, p)
+		if rerr != nil {
+			bad = append(bad, fp)
+			continue
+		}
+		_ = s.Close()
+		ok = append(ok, fp)
+	}
+	if perr == nil {
+		p.Destroy()
+	}
+	return ok, bad, nil
+}
+
+// CleanTemp removes the temporary files a crash left in the key directory (a key file is written under a temporary name and linked into place): the
+// ones older than maxAge. A temporary file can hold a whole key file (P7-09).
+func (k *Keyring) CleanTemp(maxAge time.Duration) {
+	ents, err := os.ReadDir(k.signingDir())
+	if err != nil {
+		return
+	}
+	for _, e := range ents {
+		if !strings.HasPrefix(e.Name(), ".key-") || !e.Type().IsRegular() {
+			continue
+		}
+		if info, err := e.Info(); err == nil && time.Since(info.ModTime()) >= maxAge {
+			_ = os.Remove(filepath.Join(k.signingDir(), e.Name()))
+		}
+	}
+}
+
+// Mark writes the marker that says which task made a key file: a file with no row is adopted only when it carries the marker of the task that asks
+// (Orphan). The marker is written by the daemon after the key file; a file that somebody placed has none.
+func (k *Keyring) Mark(fp string, taskID int64) error {
+	if _, err := k.path(fp); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(k.signingDir(), fp+".task"), []byte(fmt.Sprint(taskID)+"\n"), 0o600)
+}
+
+func (k *Keyring) marked(fp string) bool {
+	b, err := os.ReadFile(filepath.Join(k.signingDir(), fp+".task"))
+	if err != nil {
+		return false
+	}
+	_, err = strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	return err == nil
 }

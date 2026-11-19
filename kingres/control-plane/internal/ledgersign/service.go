@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
@@ -82,6 +83,12 @@ type Config struct {
 	// Resign re-signs the latest checkpoint of every log with the keys that sign after a rotation (design
 	// 14, correction 47). The collector of the next step provides it; nil means no log is published yet.
 	Resign func(ctx context.Context, set ledgerkeys.Set) error
+	// IsMember, when set, tells whether a server is still a member of the cluster. A server that was removed from the cluster and cannot be reached is
+	// forgotten as a holder (its key files may remain on that host: the operator wipes it, the log says so), instead of being tried for ever (P7-03).
+	IsMember func(ctx context.Context, server string) (bool, error)
+	// PublicationFailure, when set, returns why the collector could not sign for two rounds, "" when it can (correction 134): the check job
+	// raises ledgerSignerUnavailable for it too, and clears the alert only when neither the key set nor the collector complains.
+	PublicationFailure func() string
 	// Alert raises or clears an alert of the cluster; Audit appends an audit event (system actions).
 	Alert func(ctx context.Context, kind, severity, subject, message string, raise bool)
 	Audit func(ctx context.Context, ev audit.Event)
@@ -94,9 +101,14 @@ type Config struct {
 
 // Service is the signing keys of the cluster as the daemon drives them.
 type Service struct {
-	cfg   Config
-	log   *slog.Logger
-	agent *Agent
+	syncMu  sync.Mutex // the state a distribution was last started for (jobSync)
+	syncSig string
+	syncAt  time.Time
+	dueMu   sync.Mutex // when the due retirement was last started (jobDue)
+	dueAt   time.Time
+	cfg     Config
+	log     *slog.Logger
+	agent   *Agent
 }
 
 // New builds the service.
@@ -188,6 +200,11 @@ func (s *Service) load(ctx context.Context) (*view, error) {
 		}
 	} else if snap.Cluster.TrustFile != nil {
 		v.alarm = fmt.Errorf("%w: a trust file was published and the stored key set has no key it lists", ErrAlarm)
+	}
+	if v.alarm == nil {
+		if err := verifyEvents(v); err != nil {
+			v.alarm = fmt.Errorf("%w: %w", ErrAlarm, err)
+		}
 	}
 	return v, nil
 }
@@ -462,6 +479,12 @@ func (s *Service) alarmText(v *view) string {
 	for _, k := range v.set {
 		if (k.State == ledgerkeys.StateActive || k.State == ledgerkeys.StateNext) && !s.cfg.Keyring.Has(k.Fingerprint()) {
 			return fmt.Sprintf("the key file of the %s key %s is missing on this server", k.State, k.Fingerprint()[:16])
+		}
+		if k.State == ledgerkeys.StateActive || k.State == ledgerkeys.StateNext {
+			// a file that exists and does not open (garbage, another passphrase, another key under this name) is as bad as a missing one (P7-04)
+			if err := s.cfg.Keyring.Verify(k.Fingerprint(), k.Public); err != nil {
+				return fmt.Sprintf("the key file of the %s key %s cannot be used on this server: %s", k.State, k.Fingerprint()[:16], err.Error())
+			}
 		}
 	}
 	return ""

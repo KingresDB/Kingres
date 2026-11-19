@@ -137,6 +137,15 @@ func (s PGStore) Commit(ctx context.Context, term scheduler.Term, expect int64, 
 		if tag.RowsAffected() != 1 {
 			return ErrConflict
 		}
+		if ch.CheckpointBound != nil {
+			var max int64
+			if err := tx.QueryRow(ctx, `SELECT coalesce(max(size), 0) FROM kingres_cp.ledger_checkpoint`).Scan(&max); err != nil {
+				return err
+			}
+			if max < 0 || uint64(max) > *ch.CheckpointBound { //nolint:gosec // not negative after the first test
+				return fmt.Errorf("%w: a checkpoint above the bound of the retired key was stored meanwhile", ErrConflict)
+			}
+		}
 		if cl := ch.Cluster; cl != nil {
 			var prefix *string
 			if cl.OriginPrefix != "" {
@@ -151,8 +160,12 @@ func (s PGStore) Commit(ctx context.Context, term scheduler.Term, expect int64, 
 			if holders == nil {
 				holders = []string{}
 			}
-			if _, err := tx.Exec(ctx, `UPDATE kingres_cp.ledger_cluster SET cluster_id = $1, origin_prefix = $2, public_url = $3, publication_enabled = $4,
-				publication_interval_seconds = $5, anchor_interval_seconds = $6, anchor_minimum = $7, anchor_required = $8, first_checkpoint_at = $9,
+			if _, err := tx.Exec(ctx, `UPDATE kingres_cp.ledger_cluster SET cluster_id = $1,
+				-- The first checkpoint belongs to the collector (ledgerpub.PutCheckpoint), which can store it after this change read the row: the time is
+				-- never taken back and the prefix is never changed once it is set, whatever stale row this change started from.
+				origin_prefix = CASE WHEN first_checkpoint_at IS NULL THEN $2::text ELSE origin_prefix END, public_url = $3, publication_enabled = $4,
+				publication_interval_seconds = $5, anchor_interval_seconds = $6, anchor_minimum = $7, anchor_required = $8,
+				first_checkpoint_at = coalesce(first_checkpoint_at, $9::timestamptz),
 				trust_file = $10, holders = $11, backup_advised = $12, discontinuity = $13`,
 				cl.ClusterID, prefix, cl.PublicURL, cl.PublicationEnabled, cl.PublicationInterval, cl.AnchorInterval, cl.AnchorMinimum,
 				cl.AnchorRequired, cl.FirstCheckpointAt, trust, holders, cl.BackupAdvised, cl.Discontinuity); err != nil {
