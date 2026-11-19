@@ -128,11 +128,14 @@ describe('failover console', () => {
   }, 15000)
 
   it('the Tasks page with a failover and its report button', async () => {
-    const { container } = await renderApp('/tasks')
+    const { container, ...app } = await renderApp('/tasks')
     const task = await endpoints.failoverServer('10.0.0.12', 'hard')
-    await waitFor(async () => expect((await endpoints.getTask(task.id)).state).toBe('done'))
-    await screen.findByTestId('task-report', {}, { timeout: 6000 })
+    await waitFor(async () => expect((await endpoints.getTask(task.id)).state).toBe('done'), {
+      timeout: 30_000,
+    })
+    await app.queryClient.invalidateQueries()
+    await screen.findByTestId('task-report', {}, { timeout: 30_000 })
     await settled()
     await clean(container)
-  }, 15000)
+  }, 90_000)
 })

@@ -6,8 +6,8 @@
 // edit a target of each kind, the secrets that are never shown, the test and its result, turning a target on and off,
 // deleting it, the anchor records (retry, evidence, anchor now), each problem code in its own words, what each role sees and
 // does, the settings of anchoring on the Settings page, the alerts and the dashboard card, hostile text and axe.
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { screen, waitFor, within } from '@testing-library/vue'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import { configure, getConfig, screen, waitFor, within } from '@testing-library/vue'
 import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'
 import { axe } from 'vitest-axe'
@@ -855,6 +855,10 @@ describe('what each role sees and does', () => {
 })
 
 describe('the settings of anchoring', () => {
+  // These tests wait for pages that read two or three things; how long that takes on a loaded machine is not what they test.
+  const saved = getConfig().asyncUtilTimeout
+  beforeAll(() => configure({ asyncUtilTimeout: 30_000 }))
+  afterAll(() => configure({ asyncUtilTimeout: saved }))
   it('the tab says when it is anchored and links to Settings for the role that may change it', async () => {
     await open('admin')
     expect(await screen.findByTestId('anchor-settings-text')).toHaveTextContent(

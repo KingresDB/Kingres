@@ -548,6 +548,10 @@ describe('the Signing tab', () => {
     await user.click(screen.getByRole('button', { name: /^rotate the key$/i }))
     const dialog = await screen.findByRole('dialog')
     await (await import('@/api/endpoints')).endpoints.createLedgerSigningKey()
+    // That task stays running for as long as the test lasts: whether it is still running when the button is clicked must not
+    // depend on how long the machine takes to get there.
+    for (const t of getState().tasks)
+      if (t.task.kind.startsWith('ledger.key')) t.durationMs = 3_600_000
     await user.click(within(dialog).getByRole('button', { name: /^rotate the key$/i }))
     expect((await within(dialog).findAllByText(/in progress/i)).length).toBeGreaterThan(0)
     expect(within(dialog).queryByText('Finished.')).not.toBeInTheDocument()

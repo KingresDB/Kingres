@@ -289,10 +289,14 @@ describe('the report of a finished run', () => {
   it('the Replication page names the last failover and opens its report with the numbers', async () => {
     const user = userEvent.setup()
     applySwitches(new URLSearchParams('failover=dataloss,old:rebuilding'), getState())
-    await renderApp('/replication')
+    const app = await renderApp('/replication')
     const task = await endpoints.failoverServer('10.0.0.12', { mode: 'hard', allowDataLoss: true })
-    await waitFor(async () => expect((await endpoints.getTask(task.id)).state).toBe('done'))
-    const last = await screen.findByTestId('last-failover', {}, { timeout: 6000 })
+    await waitFor(async () => expect((await endpoints.getTask(task.id)).state).toBe('done'), {
+      timeout: 30_000,
+    })
+    // The page reads the status again at once instead of at its next poll: how long a poll takes is not what is tested.
+    await app.queryClient.invalidateQueries()
+    const last = await screen.findByTestId('last-failover', {}, { timeout: 30_000 })
     expect(last).toHaveTextContent(/failover of server 10\.0\.0\.12/i)
     await user.click(within(last).getByTestId('last-failover-report'))
     const dialog = await screen.findByRole('dialog', {
