@@ -2814,7 +2814,58 @@ build to the corrected rule. The verifier's README has the same list with the re
 136. **A forwarded answer keeps its `Content-Disposition`**, which the download of the trust file
     through a follower needs.
 
-The numbers 137 to 149 are kept for the collector and the publication (steps 5 and 6).
+137. **The order of a round and what a checkpoint may be (replaces step 5 of 4.5).** Each write of a
+    round is a transaction of its own that begins with the term guard, in the order: append,
+    frontier, signature, checkpoint. A checkpoint is refused when it is not for the stored size and
+    root, when it is for a smaller tree, when it would be a second root for a size, or when the log
+    is not active.
+138. **Signing and retiring exclude each other (the duty of 129), as one mechanism.** A key whose
+    `key-retired` event exists is not offered for signing. A checkpoint is stored only while the
+    revision of the key set equals the one the signers were read at, and every change of the key
+    set, an event included, raises the revision. Both commits of a retirement carry the bound and
+    check it under the guard; the step that retires ends with `bound_exceeded` when a checkpoint
+    above the bound was stored meanwhile.
+139. **The first checkpoint belongs to the collector.** The store of the keys never writes the time
+    of the first checkpoint back and never changes the origin prefix once it is set: a key change
+    that had read the row before the first checkpoint was stored would have unlocked the prefix.
+140. **A deadlock or a serialization failure is "busy", never a conflict.** Otherwise a key task
+    that commits at the same moment would stop a log as diverged.
+141. **What is a divergence (4.7).** A head below the published size; a head block that is not the
+    published block at its height; a first block read that is not the last published one; an entry
+    that is not a header, or blocks that do not link; tiles that differ. A diverged log never wakes
+    up, also when the chain returns to the published history. A group that now holds another chain
+    gets `chain-replaced`: the old log is retired and a new one is made.
+142. **The aggregate leaf holds a time**, so it is stored in the row of the log before it is
+    appended, and the repair after a crash appends the same bytes.
+143. **The aggregate log is never closed (replaces the sentence of 5.5).** A dropped database ends
+    with one leaf in which every member is `retired`; a database of the same name continues the log.
+    `retired` appears in exactly one leaf per chain, and the next leaf leaves the chain out.
+144. **`ledger/read` names the group.** A group that gives an error, or has no ledger or no
+    database, is "not covered": its members are `stale`, the digest says `complete: false` and names
+    it. When no group answers, the answer is 503.
+145. **Digests.** `listLedgerDigests` lists the stored views, with identifiers of their own; the
+    older digests of the extension stay in each database and are not listed. `generateLedgerDigest`
+    waits up to 20 seconds for the term of a new leader before it answers 503.
+146. **The listener** serves whatever is stored while it runs, also when the publication is switched
+    off. `keyring.json` is the trust file. Partial tiles are kept (no pruning after 24 hours). 429
+    per address, 503 at the cap of concurrent requests.
+147. **The event `chain-retired`.** Its subject is `<chain>:<epoch>`; its lines are `chain`, `epoch`,
+    `final-height`, `final-block-hash` and `reason`, one of `dropped`, `group-removed`,
+    `database-missing` and `chain-replaced`.
+148. **A database that disappears without `dropDatabase` (decided here, as section 10 left it to
+    step 6).** A database can be dropped from SQL by its owner, where no hook of the control plane
+    sees it. When every group answers "no database" in two rounds in a row, the collector retires
+    its chains with the reason `database-missing`: a signed event, one leaf with `retired` members,
+    closed logs, no divergence alert; the event states the last published head, since the database
+    is gone. An auditor tells it from a rollback, which stays `diverged` with a critical alert and
+    the old head. One group that answers "no database" while others answer is only a group that was
+    not read. Rejected: changing who owns databases or revoking the right to drop (it changes
+    existing databases); an event trigger (`DROP DATABASE` fires none); treating it as a rollback (a
+    deletion could not be told from a restore); doing nothing (a log that is stale for ever).
+149. **Limits and ownership.** A round appends at most 9 999 blocks (the first block read is the
+    last published one), and rounds run one database after another. The alert
+    `ledgerSignerUnavailable` has one owner, the check job of the key service, which also asks the
+    collector after two rounds that could not sign.
 
 150. **The switch to `required` is ordered with the writers by a table lock (replaces what 113 says
     about a transaction that was running; adds to 108, 110 and 117).** `ledger_set_signature_policy`
