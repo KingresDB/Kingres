@@ -404,6 +404,8 @@ const freshFailover = async (page: Page): Promise<void> => {
   await setMock(page, {
     failoverDataLoss: false,
     failoverNeedsDecision: false,
+    failoverWarnings: false,
+    failoverNoPlan: false,
     failoverOld: null,
     failoverFailStep: null,
     failoverBlock: null,
@@ -957,6 +959,37 @@ export const STATES: PageState[] = [
       await dialogOpen(page)
     },
     close: cancel,
+  },
+  {
+    // 0.12.0: a run that ended well and whose check of the cluster reported something: "Completed, with remarks", with the report.
+    name: 'failover report: completed with remarks (0.12.0)',
+    needsMock: true,
+    route: '/servers',
+    open: async (page) => {
+      await freshFailover(page)
+      await setMock(page, { failoverWarnings: true })
+      await startFailover(page, '10.0.0.12')
+      await page.waitForFunction(
+        () => document.querySelector('[role="dialog"]')?.textContent?.includes('Finished.'),
+        { timeout: 30_000 },
+      )
+      await closeDialogs(page)
+      await go(page, '/replication')
+      await clickWhenThere(page, '[data-testid="last-failover-report"]')
+      await page.waitForFunction(
+        () =>
+          document
+            .querySelector('[role="dialog"]')
+            ?.textContent?.includes('Completed, with remarks'),
+        { timeout: 20_000 },
+      )
+      await sleep(300)
+    },
+    close: async (page) => {
+      await page.click('[role="dialog"] [data-dialog-close]')
+      await sleep(150)
+      await leaveFailover(page)
+    },
   },
   {
     name: 'system database stopped',

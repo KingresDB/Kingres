@@ -3096,6 +3096,8 @@ export interface components {
             sqlState?: string;
             /** @description 1-based character position of the error in the statement; present for some `sql_error` problems. */
             sqlPosition?: number;
+            /** @description Added in 0.12.0, optional. The whole plan of the request (the same body as `dryRun` answers), present only when `code` is `failover_needs_decision`: the console shows the groups, the candidates and the verdict without asking again. */
+            plan?: components["schemas"]["FailoverPlan"];
             /** @description Added in 0.9.0, optional. Servers that can be opened instead; set for `leader_unavailable`: the manager leader first when this server knows it, then the other servers of the cluster as this server knows them. Empty or absent when it knows none. */
             serverIds?: components["schemas"]["ServerId"][];
         };
@@ -4154,7 +4156,7 @@ export interface components {
             trigger: "manual" | "automatic";
             serverId: string | null;
             /** @enum {string} */
-            outcome: "completed" | "partial" | "failed" | "cancelled" | "paused";
+            outcome: "completed" | "completedWithWarnings" | "partial" | "failed" | "cancelled" | "paused";
             /** Format: date-time */
             startedAt: string;
             /** Format: date-time */
@@ -4213,7 +4215,7 @@ export interface components {
         };
         OldPrimaryReport: {
             /**
-             * @description `notScheduled`: this revision of kingresd does not turn the old primary into a standby again (a later increment does); it stays stopped and fenced.
+             * @description `notScheduled`: no rebuild of the old primary is scheduled for the group (for a record of an earlier revision of kingresd that never rebuilt it, and for a group whose old primary has no directory to rebuild); it stays stopped and fenced until an operator acts. From 0.12.0 kingresd rebuilds the old primary of an ordinary group by itself (`rebuildScheduled`, `rebuilding`, `standby`).
              * @enum {string}
              */
             state: "notScheduled" | "rebuildScheduled" | "rebuilding" | "standby" | "waitingForServer" | "removed" | "failed";

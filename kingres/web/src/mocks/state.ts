@@ -132,6 +132,10 @@ export const mockConfig = {
   failoverGraceful: false,
   failoverOld: null as null | 'rebuilding' | 'waiting' | 'running' | 'failed',
   failoverSwitchoverBehind: false,
+  /** 0.12.0: a finished failover ends `completedWithWarnings` (the check of the cluster reported something). */
+  failoverWarnings: false,
+  /** 0.12.0: a refusal `failover_needs_decision` carries no plan (a server of 0.11.0): the console asks with a dry run. */
+  failoverNoPlan: false,
   failoverReadiness: {} as Record<number, FailoverReadinessState>,
   /** 0.11.0 (console part B): what the test of an anchor target finds: nothing wrong, a warning, or a failure. */
   anchorTest: null as null | 'warn' | 'fail',

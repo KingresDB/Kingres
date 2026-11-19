@@ -248,6 +248,13 @@ export function runStateMeta(state: string): StatusMeta {
 /** How a run ended (`FailoverReportSummary.outcome`). */
 export const OUTCOME: Record<string, StatusMeta> = {
   completed: { tone: 'ok', icon: OK, label: 'Completed' },
+  // 0.12.0: the failover ended and the check of the cluster afterwards reported something; the report says what.
+  completedWithWarnings: {
+    tone: 'ok',
+    icon: OK,
+    label: 'Completed, with remarks',
+    hint: 'The failover ended. The check of the cluster afterwards reported something: open the report to read it.',
+  },
   partial: { tone: 'warn', icon: WARN, label: 'Partly done' },
   failed: { tone: 'danger', icon: BAD, label: 'Failed' },
   cancelled: { tone: 'neutral', icon: RING, label: 'Cancelled' },
@@ -294,7 +301,8 @@ export const MODE_LABEL: Record<string, string> = {
 
 /** What the extension and the old primary's server did with the old primary. */
 const OLD_PRIMARY_STATE: Record<OldPrimaryReport['state'], string> = {
-  notScheduled: 'It stays stopped and fenced; this server version does not rebuild it yet.',
+  notScheduled:
+    'No rebuild of it is scheduled. It stays stopped and fenced (an earlier version of the server never rebuilt it, or it has no directory to rebuild).',
   rebuildScheduled: 'It will be rebuilt as a standby.',
   rebuilding: 'It is being rebuilt as a standby',
   standby: 'It is a standby of the new primary now',

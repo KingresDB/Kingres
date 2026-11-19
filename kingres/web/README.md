@@ -3,7 +3,7 @@
 # KingresDB web panel
 
 The management console of KingresDB: a single-page application (Vue 3, TypeScript, Vite) that is a client
-of the REST API in `kingres/api/openapi.yaml` (revision 0.11.0, 132 operations; the generated files follow 0.11.0, see "Contract revisions" below) and nothing else. The Go server (`kingresd`) will embed the
+of the REST API in `kingres/api/openapi.yaml` (revision 0.12.0, 132 operations; the generated files follow 0.12.0, see "Contract revisions" below) and nothing else. The Go server (`kingresd`) will embed the
 production build from `dist/` and serve it on every node. The information architecture follows the
 "Management panel" chapter of `docs/architecture.md`: a first-run wizard, a **Cluster** scope and a
 **This server** scope.
@@ -45,6 +45,8 @@ Development switches in the URL (mock API only):
 | `?failover=blocked:rebalance`, `blocked:lease`, `blocked:quorum`, `blocked:noreplica` | 0.10.0: the plan lists the blocker and the request is refused with 409 `rebalance_in_progress`, 409 `lease_settings_differ`, 503 `quorum_unavailable` (a dry run is refused too) or 409 `no_replica_available`; every group's readiness carries the same blocker.                                                                                                                                                                                                                                                                                         |
 | `?failover=fail:<step>[:<group>]`                                                     | 0.10.0: the task ends failed at that step of the first group (or of the group given) with a task error code and a report; `<step>` is one of `check`, `freeze`, `stop`, `lease`, `choose`, `handover`, `promote`, `catalog`, `repoint`, `lift`, `verify`, `pause`, `report`. With two groups (`map`) a failure in the second leaves the first promoted: the report is `partial`.                                                                                                                                                                          |
 | `?failover=slow`                                                                      | 0.10.0: the steps of a failover take about three times as long as a task does, so that the phases, the lease wait and Cancel can be tried.                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `?failover=warnings`                                                                  | 0.12.0: a finished failover ends `completedWithWarnings` ("Completed, with remarks").                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `?failover=noplan`                                                                    | 0.12.0: a refusal `failover_needs_decision` carries no plan (a server of 0.11.0): the dialog asks with a dry run.                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `?failover=map`                                                                       | 0.10.0: the map group can be failed over (the real server answers 422 `unsupported_operation` for it until increment 5; so does the mock without the switch). The manager moves first: the status has no `taskId` and the phase `bootstrap` until the catalog follows.                                                                                                                                                                                                                                                                                    |
 | `?failover=graceful`                                                                  | 0.10.0: the planned switchover is accepted (the real server answers 422 `unsupported_operation` until increment 7; so does the mock without the switch): the steps are the switchover's, the groups report `writesPausedSince`. `?failover=switchover:behind` also makes its verification fail: rolled back, task error `standby_behind`.                                                                                                                                                                                                                 |
 | `?failover=old:rebuilding`, `old:waiting`, `old:running`, `old:failed`                | 0.10.0: the state of the old primary in the report (rebuilding with `pg_rewind` and 12 MiB, waiting for its server, still running, rebuild failed); `running` and `failed` also raise the alerts `oldPrimaryRunning` and `oldPrimaryNotRebuilt`.                                                                                                                                                                                                                                                                                                          |
@@ -435,7 +437,7 @@ tokens instead.
 
 ## Contract revisions and the checks against them
 
-The generated files (`src/api/schema.d.ts`, `src/api/operations.generated.ts`) follow contract **0.11.0**, the revision of
+The generated files (`src/api/schema.d.ts`, `src/api/operations.generated.ts`) follow contract **0.12.0**, the revision of
 `kingres/api/openapi.yaml` (changelog "0.11.0" in `kingres/api/README.md`). `npm run api:check` and the contract tests compare
 with that file. While the working tree holds a draft of a later revision they fail, and that failure says nothing about the
 panel; to check against another copy of the contract (for example the committed one), point `KINGRES_API_SPEC` at it:
@@ -448,6 +450,25 @@ KINGRES_API_SPEC=openapi-copy.yaml npm test
 
 `scripts/gen-api.mjs` and the contract tests read the same variable, so `npm run api:generate` with it set regenerates from that
 copy. Adapting to the next revision is a separate step.
+
+## What the panel does for contract 0.12.0
+
+Contract 0.12.0 adds no operation (132) and four small things that the panel follows: the new outcome `completedWithWarnings`, the plan in the problem
+`failover_needs_decision` (`Problem.plan`), the corrected text of `OldPrimaryReport.state = notScheduled`, and the refusal `failover_in_progress` of a
+database or table action.
+
+- **`completedWithWarnings`** is shown like `completed` (green, a tick) with the label "Completed, with remarks" and the hint "The failover ended. The check of the cluster
+  afterwards reported something: open the report to read it." Every place that shows an outcome (the report dialog, the Replication page, the Tasks page) uses
+  `outcomeMeta`, and the report button is on every finished run.
+- **The plan of the refusal.** `FailoverDialog` shows `Problem.plan` when the start is refused with 409 `failover_needs_decision` and asks for the decision from it; when the
+  member is absent (a server of 0.11.0) it asks again with a dry run, as before. `FailoverProgress` uses the plan of a refused repeat for the verdict of the groups that wait
+  (it wins over the report, which is older).
+- **`notScheduled`** now reads "No rebuild of it is scheduled. It stays stopped and fenced (an earlier version of the server never rebuilt it, or it has no directory to rebuild)."
+- **`failover_in_progress`** has neutral words in `api/problem.ts` ("A failover or a restore of the preferred primaries is running, and the cluster does not change its databases or
+  its servers while it does. Nothing was changed. Wait until it has finished, then try again."), so create database, drop database and distribute table show them; a failover
+  refused with `operation_in_progress` or `failover_in_progress` keeps its own words in `lib/failover.ts`.
+- **Mock.** The refusal carries the plan (`?failover=noplan`: it does not); a finished run ends `completedWithWarnings` with `?failover=warnings`; create and drop database
+  and distribute table are refused with 409 `failover_in_progress` while a failover or a restore runs. Tests: `contract-0-12.test.ts`; the browser tests have the state "failover report: completed with remarks".
 
 ## What the panel does for contract 0.11.0
 

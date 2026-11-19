@@ -156,7 +156,13 @@ async function start() {
       ...(acceptLoss.value ? { allowDataLoss: true } : {}),
     })
   } catch (e) {
-    if (e instanceof ApiError && e.code === 'failover_needs_decision') await refreshPlan()
+    // 0.12.0: the refusal carries the plan; a server that does not send it is asked again with a dry run.
+    if (e instanceof ApiError && e.code === 'failover_needs_decision') {
+      if (e.problem.plan) {
+        plan.value = e.problem.plan
+        acceptLoss.value = false
+      } else await refreshPlan()
+    }
     throw e
   }
 }

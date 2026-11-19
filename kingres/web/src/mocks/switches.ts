@@ -79,6 +79,8 @@ function applyFailoverSwitch(entry: string, s: MockState): void {
   if (entry === 'dataloss') mockConfig.failoverDataLoss = true
   if (entry === 'needs-decision') mockConfig.failoverNeedsDecision = true
   if (entry === 'slow') mockConfig.failoverSlow = true
+  if (entry === 'warnings') mockConfig.failoverWarnings = true
+  if (entry === 'noplan') mockConfig.failoverNoPlan = true
   if (entry === 'map') mockConfig.failoverMap = true
   if (entry === 'graceful') mockConfig.failoverGraceful = true
   const blocked = /^blocked:(rebalance|lease|quorum|noreplica)$/.exec(entry)

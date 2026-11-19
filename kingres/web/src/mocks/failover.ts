@@ -356,7 +356,9 @@ export function writeReport(s: MockState, run: FailoverRun, finished = false): v
     task.state === 'paused'
       ? 'paused'
       : task.state === 'done'
-        ? 'completed'
+        ? mockConfig.failoverWarnings
+          ? 'completedWithWarnings'
+          : 'completed'
         : cancelled
           ? 'cancelled'
           : done > 0
