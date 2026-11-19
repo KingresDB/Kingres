@@ -102,29 +102,129 @@ describe('what the mock refuses, with the field named', () => {
     }
     return undefined
   }
-  it('a missing bucket, a setting of another kind, a range, a calendar without TLS', async () => {
-    expect((await refused('worm', { region: 'r' }))?.map((x) => x.field)).toContain('config.bucket')
-    expect((await refused('worm', { ...worm, url: 'x' }))?.map((x) => x.field)).toContain(
-      'config.url',
+  const first = async (...args: Parameters<typeof refused>) =>
+    (await refused(...args))?.[0] as { field: string; message: string } | undefined
+  it('the configuration: one message at /config, in the words of the server, for each kind', async () => {
+    expect(await first('worm', { region: 'r' })).toEqual(
+      expect.objectContaining({ field: '/config', message: 'worm: bucket name is not valid' }),
     )
-    expect((await refused('worm', { ...worm, retentionDays: 0 }))?.map((x) => x.field)).toContain(
-      'config.retentionDays',
+    expect(await first('worm', { ...worm, url: 'x' })).toEqual(
+      expect.objectContaining({
+        field: '/config',
+        message: 'worm: configuration: json: unknown field "url"',
+      }),
     )
-    expect((await refused('tsa', { url: 'https://t.example' }))?.map((x) => x.field)).toContain(
-      'config.caBundlePath',
+    expect((await first('worm', { ...worm, retentionDays: 0 }))?.message).toBe(
+      'worm: retentionDays must be 1 to 36500',
+    )
+    expect((await first('worm', { ...worm, endpoint: 'http://minio:9000' }))?.message).toBe(
+      'worm: endpoint is not https and allowInsecure is not set',
+    )
+    expect((await first('tsa', { url: 'https://t.example' }))?.message).toBe(
+      'tsa: config: caBundlePath is required',
     )
     expect(
-      (await refused('ots', { calendars: ['http://a.example'] }))?.map((x) => x.field),
-    ).toContain('config.calendars')
+      (await first('tsa', { url: 'https://t.example/x?k=1', caBundlePath: '/c.pem' }))?.message,
+    ).toBe('tsa: config: url must not have a query')
+    expect((await first('ots', { calendars: ['http://a.example'] }))?.message).toMatch(
+      /^ots: configuration: calendar 1/,
+    )
+    expect(
+      (
+        await first('ots', {
+          calendars: ['https://a.example'],
+          headerSource: { url: 'http://x.example' },
+        })
+      )?.message,
+    ).toBe(
+      'headerSource.url must be an https URL (http only with allowInsecure) without user information or query',
+    )
+    expect(
+      (await first('ots', { calendars: ['https://a.example'], headerSource: 'x' }))?.message,
+    ).toBe('headerSource must be {"url": "..."}')
     expect(getState().ledger7.targets).toHaveLength(0)
   })
-  it('a credential of another kind, and half of a pair', async () => {
-    expect((await refused('worm', worm, { password: 'x' }))?.map((x) => x.field)).toContain(
-      'credentials.password',
+  it('OpenTimestamps takes headerSource.url and contradictionConfirmMinutes, and no credentials', async () => {
+    const t = await endpoints.createLedgerAnchorTarget({
+      kind: 'ots',
+      name: 'ots one',
+      config: {
+        calendars: ['https://a.example'],
+        headerSource: { url: 'https://blocks.example/api' },
+        contradictionConfirmMinutes: 90,
+      },
+    })
+    ok(t, 'LedgerAnchorTarget')
+    const e = await first('ots', { calendars: ['https://a.example'] }, { password: 'abcd' })
+    expect(e).toEqual(
+      expect.objectContaining({
+        field: '/credentials',
+        message: 'this kind of target takes no credentials',
+      }),
     )
-    expect((await refused('worm', worm, { accessKeyId: 'only' }))?.map((x) => x.field)).toContain(
-      'credentials.secretAccessKey',
+  })
+  it('the credentials: the member and the rule, with the limits of each member', async () => {
+    expect((await first('worm', worm, { password: 'abcd' }))?.message).toBe(
+      'worm: unknown credential member "password"',
     )
+    expect(
+      (await first('worm', worm, { accessKeyId: 'abc', secretAccessKey: 'abcd' }))?.message,
+    ).toBe('credentials.accessKeyId must have 4 to 128 characters')
+    expect(
+      (await first('worm', worm, { accessKeyId: 'abcd', secretAccessKey: 'ab cd' }))?.message,
+    ).toMatch(/printable ASCII characters only/)
+    expect((await first('worm', worm, { accessKeyId: 'abcd' }))?.message).toBe(
+      'credentials.secretAccessKey is required',
+    )
+    expect(
+      (await first('tsa', { url: 'https://t.example', caBundlePath: '/c.pem' }, { username: 'u' }))
+        ?.message,
+    ).toBe('credentials.username and credentials.password go together')
+    // A password may hold a space; a user name may not.
+    ok(
+      await endpoints.createLedgerAnchorTarget({
+        kind: 'tsa',
+        name: 'tsa one',
+        config: { url: 'https://t.example', caBundlePath: '/c.pem' },
+        credentials: { username: 'u', password: 'a b' },
+      }),
+      'LedgerAnchorTarget',
+    )
+  })
+  it('a WORM target cannot be enabled without credentials; {} removes the stored ones', async () => {
+    await expect(
+      endpoints.createLedgerAnchorTarget({ kind: 'worm', name: 'w1', enabled: true, config: worm }),
+    ).rejects.toMatchObject({
+      problem: {
+        errors: [
+          expect.objectContaining({
+            field: '/credentials',
+            message: 'credentials are required to enable a target of this kind',
+          }),
+        ],
+      },
+    })
+    const t = await endpoints.createLedgerAnchorTarget({
+      kind: 'worm',
+      name: 'w1',
+      config: worm,
+      credentials: { accessKeyId: 'abcd', secretAccessKey: 'abcd' },
+    })
+    expect(t.credentialsSet).toBe(true)
+    await expect(
+      endpoints.updateLedgerAnchorTarget(t.id, { enabled: true, credentials: {} }),
+    ).rejects.toMatchObject({ code: 'validation_failed' })
+    const removed = await endpoints.updateLedgerAnchorTarget(t.id, { credentials: {} })
+    expect(removed.credentialsSet).toBe(false)
+  })
+  it('the name: the pattern of the server', async () => {
+    await expect(
+      endpoints.createLedgerAnchorTarget({
+        kind: 'ots',
+        name: '-bad',
+        config: { calendars: ['https://a.example'] },
+      }),
+    ).rejects.toMatchObject({ problem: { errors: [expect.objectContaining({ field: '/name' })] } })
   })
   it('never returns a credential, however it is asked', async () => {
     const t = await endpoints.createLedgerAnchorTarget({

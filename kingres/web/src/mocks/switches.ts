@@ -163,6 +163,8 @@ function applySigningSwitch(entry: string, s: MockState): void {
   if (entry === 'alarm')
     l.signing.signerAlarm = 'The key file of the active key is missing on this server.'
   if (entry === 'discontinuity') l.signing.discontinuity = true
+  // 0.12.0: the system database was restored from a backup older than what was published.
+  if (entry === 'restored') l.publishedStateAlarm = true
   if (entry === 'command') l.signing.mode = 'command'
   const fail = /^fail:([a-z_]+)$/.exec(entry)
   if (fail)

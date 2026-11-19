@@ -58,9 +58,14 @@ export const GOVERNANCE_TEXT =
 export const WORM_PROBE_TEXT =
   'The test writes one empty probe object under the key prefix, in a folder named _probe. It is zero bytes, and it stays until its own lock ends: about ten minutes, and where the bucket has a default retention in compliance mode, until that ends.'
 export const OTS_WAIT_TEXT =
-  'OpenTimestamps takes hours. A record stays "Sent, not final" until a Bitcoin block confirms it, and it counts as anchored only then.'
+  'OpenTimestamps takes hours. A record stays "Sent, not final" while a calendar only claims a Bitcoin block: it counts as anchored only when the header of that block was read from the block header source of the target and matches. Without a block header source it never counts as anchored.'
+export const HEADER_SOURCE_TEXT =
+  "An address that answers Bitcoin block headers (an Esplora explorer). The servers ask it for the header of the block a calendar names and check that the proof matches. It is what turns a calendar's claim into an anchor; without it a claim stays a claim."
 export const CREDENTIALS_TEXT =
-  'Credentials are stored in a sealed file on the servers and are never shown again, here or anywhere else. To change them, type the new ones; leave the fields empty to keep what is stored.'
+  'Credentials are stored in a sealed file on the servers and are never shown again, here or anywhere else. To change them, type the new ones; leave the fields empty to keep what is stored. Values are printable ASCII characters without spaces.'
+export const NAME_RULE =
+  '1 to 63 characters: letters, digits, space, dot, hyphen and underscore, starting with a letter or a digit.'
+export const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,62}$/
 export const EVIDENCE_TEXT =
   'The evidence file is what an auditor needs to check the anchor with the verifier. The WORM evidence says what the cluster recorded; the verifier reads the object itself.'
 
@@ -304,10 +309,19 @@ export const FIELDS: Record<AnchorKind, FieldSpec[]> = {
     {
       key: 'maxSkewSeconds',
       label: 'Allowed difference of the store clock (seconds)',
-      hint: 'From 1 to 86400. Empty means 300.',
+      hint: 'From 0 to 86400. Empty or 0 means 300.',
       type: 'number',
       initial: '',
       advanced: true,
+    },
+    {
+      key: 'credentialsPath',
+      label: 'Credentials file on the servers',
+      hint: 'Instead of typing credentials: a file that already exists on every server that may become the manager leader and that only its owner can read. It is read at every use and never copied. A file and typed credentials exclude each other.',
+      type: 'text',
+      initial: '',
+      advanced: true,
+      mono: true,
     },
     {
       key: 'allowInsecure',
@@ -322,7 +336,7 @@ export const FIELDS: Record<AnchorKind, FieldSpec[]> = {
     {
       key: 'url',
       label: 'Address of the authority',
-      hint: 'An https address (http only with the box below), without a query.',
+      hint: 'An https or http address without a query. The answer proves itself, so TLS is not needed for it.',
       type: 'text',
       initial: '',
       required: true,
@@ -356,7 +370,7 @@ export const FIELDS: Record<AnchorKind, FieldSpec[]> = {
     {
       key: 'maxSkewSeconds',
       label: 'Allowed difference of the authority clock (seconds)',
-      hint: 'From 1 to 86400. Empty means 300.',
+      hint: 'From 0 to 86400. Empty or 0 means 300.',
       type: 'number',
       initial: '',
       advanced: true,
@@ -371,9 +385,18 @@ export const FIELDS: Record<AnchorKind, FieldSpec[]> = {
       mono: true,
     },
     {
+      key: 'credentialsPath',
+      label: 'Credentials file on the servers',
+      hint: 'Instead of typing credentials: a file that already exists on every server that may become the manager leader and that only its owner can read. It is read at every use and never copied. A file and typed credentials exclude each other.',
+      type: 'text',
+      initial: '',
+      advanced: true,
+      mono: true,
+    },
+    {
       key: 'allowInsecure',
-      label: 'Allow an address without TLS',
-      hint: 'The answer proves itself, but a user name and a password sent over plain HTTP do not.',
+      label: 'Allow credentials over an address without TLS',
+      hint: 'The answer proves itself, but a user name and a password sent over plain HTTP do not: without this box a target with a user name needs an https address.',
       type: 'checkbox',
       initial: false,
       advanced: true,
@@ -387,6 +410,14 @@ export const FIELDS: Record<AnchorKind, FieldSpec[]> = {
       type: 'lines',
       initial: '',
       required: true,
+      mono: true,
+    },
+    {
+      key: 'headerSource.url',
+      label: 'Block header source',
+      hint: 'Optional. An https address (http only with the box below). See what it is for under the field.',
+      type: 'text',
+      initial: '',
       mono: true,
     },
     {
@@ -404,8 +435,16 @@ export const FIELDS: Record<AnchorKind, FieldSpec[]> = {
       initial: '',
     },
     {
+      key: 'contradictionConfirmMinutes',
+      label: 'Minutes before a contradicted claim is dropped',
+      hint: 'When a block header contradicts a claim of a calendar, the source must contradict it again after this long before the claim is dropped. From 1 to 10080. Empty means 60.',
+      type: 'number',
+      initial: '',
+      advanced: true,
+    },
+    {
       key: 'allowInsecure',
-      label: 'Allow calendars without TLS',
+      label: 'Allow calendars and the header source without TLS',
       hint: 'Only for tests and private networks.',
       type: 'checkbox',
       initial: false,
@@ -429,17 +468,38 @@ export interface CredentialSpec {
   requiredOnCreate: boolean
   /** The field is a secret (hidden while typing). */
   secret: boolean
+  /** The length the server accepts (credentials.<member> must have min to max characters). */
+  min: number
+  max: number
+  /** The space character is allowed (a password). */
+  space?: boolean
 }
 export const CREDENTIAL_FIELDS: Record<AnchorKind, CredentialSpec[]> = {
   worm: [
-    { key: 'accessKeyId', label: 'Access key id', requiredOnCreate: true, secret: false },
-    { key: 'secretAccessKey', label: 'Secret access key', requiredOnCreate: true, secret: true },
+    {
+      key: 'accessKeyId',
+      label: 'Access key id',
+      requiredOnCreate: true,
+      secret: false,
+      min: 4,
+      max: 128,
+    },
+    {
+      key: 'secretAccessKey',
+      label: 'Secret access key',
+      requiredOnCreate: true,
+      secret: true,
+      min: 4,
+      max: 256,
+    },
     {
       key: 'sessionToken',
       label: 'Session token',
       hint: 'Optional, for temporary credentials.',
       requiredOnCreate: false,
       secret: true,
+      min: 4,
+      max: 4096,
     },
   ],
   tsa: [
@@ -449,8 +509,18 @@ export const CREDENTIAL_FIELDS: Record<AnchorKind, CredentialSpec[]> = {
       hint: 'Optional: only when the authority asks for HTTP Basic credentials.',
       requiredOnCreate: false,
       secret: false,
+      min: 1,
+      max: 256,
     },
-    { key: 'password', label: 'Password', requiredOnCreate: false, secret: true },
+    {
+      key: 'password',
+      label: 'Password',
+      requiredOnCreate: false,
+      secret: true,
+      min: 1,
+      max: 256,
+      space: true,
+    },
   ],
   ots: [],
 }
@@ -463,11 +533,20 @@ export function initialValues(kind: AnchorKind): FormValues {
 const asText = (v: unknown): string =>
   typeof v === 'string' ? v : typeof v === 'number' ? String(v) : ''
 
+/** A member that is one level down (`headerSource.url`). */
+function nested(config: Record<string, unknown>, key: string): unknown {
+  const [a, b] = key.split('.') as [string, string]
+  const inner = config[a]
+  return typeof inner === 'object' && inner !== null
+    ? (inner as Record<string, unknown>)[b]
+    : undefined
+}
+
 /** The form of an existing configuration. Members the console does not know are left to `extraMembers`. */
 export function valuesFromConfig(kind: AnchorKind, config: Record<string, unknown>): FormValues {
   const values = initialValues(kind)
   for (const f of FIELDS[kind]) {
-    const v = config[f.key]
+    const v = f.key.includes('.') ? nested(config, f.key) : config[f.key]
     if (v === undefined || v === null) continue
     if (f.type === 'checkbox') values[f.key] = v === true
     else if (f.type === 'lines') values[f.key] = Array.isArray(v) ? v.map(asText).join('\n') : ''
@@ -482,7 +561,7 @@ export function extraMembers(
   kind: AnchorKind,
   config: Record<string, unknown>,
 ): Record<string, unknown> {
-  const known = new Set(FIELDS[kind].map((f) => f.key))
+  const known = new Set(FIELDS[kind].map((f) => f.key.split('.')[0] as string))
   return Object.fromEntries(Object.entries(config).filter(([k]) => !known.has(k)))
 }
 
@@ -521,7 +600,7 @@ export function validateForm(
 ): Record<string, string> {
   const e: Record<string, string> = {}
   const n = name.trim()
-  if (n.length < 1 || n.length > 63) e.name = 'Give a name of 1 to 63 characters.'
+  if (!NAME_PATTERN.test(n)) e.name = NAME_RULE
   for (const f of FIELDS[kind])
     if (
       f.required &&
@@ -550,15 +629,16 @@ export function validateForm(
     )
       e.keyPrefix = 'Use letters, digits and - _ . / only, at most 200 characters.'
     wholeBetween(e, values, 'retentionDays', 'The retention', 1, 36500)
-    wholeBetween(e, values, 'maxSkewSeconds', 'The allowed difference', 1, 86400)
+    wholeBetween(e, values, 'maxSkewSeconds', 'The allowed difference', 0, 86400)
   } else if (kind === 'tsa') {
     if (!e.url) {
       const u = text(values, 'url')
       const m = /^(https?):\/\/[^\s/?#@]+[^\s?#]*$/i.exec(u)
       if (!m || u.length > 2048)
         e.url = 'Use an https address without a query, for example https://tsa.example.com/tsr.'
-      else if (m[1]?.toLowerCase() === 'http' && !insecure)
-        e.url = 'An address without TLS needs the box "Allow an address without TLS".'
+      else if (m[1]?.toLowerCase() === 'http' && !insecure && text(credentials, 'username') !== '')
+        e['credentials.username'] =
+          'A user name over an address without TLS needs the box "Allow credentials over an address without TLS".'
     }
     const oid = text(values, 'policyOid')
     if (oid !== '' && !/^[0-2](\.\d+)+$/.test(oid))
@@ -566,8 +646,8 @@ export function validateForm(
     const pin = text(values, 'signerKeySha256')
     if (pin !== '' && !/^[0-9a-f]{64}$/.test(pin))
       e.signerKeySha256 = 'Use 64 lower case hexadecimal digits.'
-    wholeBetween(e, values, 'timeoutSeconds', 'The time to wait', 1, 300)
-    wholeBetween(e, values, 'maxSkewSeconds', 'The allowed difference', 1, 86400)
+    wholeBetween(e, values, 'timeoutSeconds', 'The time to wait', 0, 300)
+    wholeBetween(e, values, 'maxSkewSeconds', 'The allowed difference', 0, 86400)
   } else {
     const cals = lines(values, 'calendars')
     if (!e.calendars) {
@@ -577,15 +657,34 @@ export function validateForm(
         e.calendars = 'An address without TLS needs the box "Allow calendars without TLS".'
       else if (new Set(cals.map((c) => c.replace(/\/+$/, '').toLowerCase())).size !== cals.length)
         e.calendars = 'A calendar is listed twice.'
-      else if (cals.length > 8) e.calendars = 'Give at most 8 calendars.'
+      else if (cals.length > 16) e.calendars = 'Give at most 16 calendars.'
     }
+    const hs = text(values, 'headerSource.url')
+    if (hs !== '') {
+      const m = /^(https?):\/\/[^\s/?#@]+[^\s?#]*$/i.exec(hs)
+      if (!m) e['headerSource.url'] = 'Use an https address without user information or a query.'
+      else if (m[1]?.toLowerCase() === 'http' && !insecure)
+        e['headerSource.url'] =
+          'An address without TLS needs the box "Allow calendars and the header source without TLS".'
+    }
+    wholeBetween(e, values, 'contradictionConfirmMinutes', 'The minutes', 1, 10080)
     wholeBetween(e, values, 'minCalendars', 'The number of calendars', 1, Math.max(1, cals.length))
     wholeBetween(e, values, 'upgradeTimeoutDays', 'The days to wait', 1, 365)
   }
   const cred = CREDENTIAL_FIELDS[kind]
-  for (const c of cred)
-    if (creating && c.requiredOnCreate && text(credentials, c.key) === '')
+  const usesFile = text(values, 'credentialsPath') !== ''
+  for (const c of cred) {
+    const v = typeof credentials[c.key] === 'string' ? (credentials[c.key] as string) : ''
+    if (creating && c.requiredOnCreate && v === '' && !usesFile)
       e[`credentials.${c.key}`] = `${c.label} is required.`
+    if (v !== '' && (v.length < c.min || v.length > c.max))
+      e[`credentials.${c.key}`] = `${c.label} must have ${c.min} to ${c.max} characters.`
+    else if (v !== '' && !(c.space ? /^[\x20-\x7e]+$/ : /^[\x21-\x7e]+$/).test(v))
+      e[`credentials.${c.key}`] =
+        `${c.label} may hold printable ASCII characters only${c.space ? '' : ', without spaces'}.`
+    if (v !== '' && usesFile)
+      e[`credentials.${c.key}`] = 'Typed credentials and a credentials file exclude each other.'
+  }
   if (kind === 'tsa') {
     const u = text(credentials, 'username')
     const p = text(credentials, 'password')
@@ -618,6 +717,14 @@ export function buildConfig(
     }
     const t = text(values, f.key)
     if (t === '') continue
+    if (f.key.includes('.')) {
+      const [a, b] = f.key.split('.') as [string, string]
+      out[a] = {
+        ...(typeof out[a] === 'object' && out[a] !== null ? (out[a] as object) : {}),
+        [b]: t,
+      }
+      continue
+    }
     if (f.type === 'number') out[f.key] = Number(t)
     else if (f.key === 'pathStyle') out[f.key] = t === 'yes'
     else out[f.key] = t

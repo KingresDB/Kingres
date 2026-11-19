@@ -79,6 +79,8 @@ export interface Ledger7State {
   }
   /** True: a database with ledger tables and no enabled target raises `ledgerNotAnchored` (the alerts of a plain mock are none). */
   alertNotAnchored: boolean
+  /** 0.12.0: the system database is older than what was published: the alert `ledgerSignerUnavailable` with the subject `published-state`. */
+  publishedStateAlarm: boolean
   /** Text a hostile server could send in the statement and in the flags of an aggregate (`?mock=hostile`). Null: the normal text. */
   hostileText: string | null
   /** The next key task ends failed with this code. */
@@ -169,6 +171,7 @@ export function createLedger7State(): Ledger7State {
     },
     signing: defaultSigning(),
     alertNotAnchored: false,
+    publishedStateAlarm: false,
     hostileText: null,
     keyFailure: null,
     publication: {

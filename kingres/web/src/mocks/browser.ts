@@ -76,6 +76,9 @@ export async function startBrowserMocks(): Promise<void> {
     failoverSwitch: (text: string) =>
       applySwitches(new URLSearchParams({ failover: text }), getState()),
     // 0.11.0 (console part B): the values of `?anchors=` while the page is open (`all`, `disabled`, `testfail`).
+    // 0.12.0: the values of `?signing=` while the page is open (`restored`: the system database is older than what was published).
+    signingSwitch: (text: string) =>
+      applySwitches(new URLSearchParams({ signing: text }), getState()),
     anchorsSwitch: (text: string) =>
       applySwitches(new URLSearchParams({ anchors: text }), getState()),
     resetCounter: () => {

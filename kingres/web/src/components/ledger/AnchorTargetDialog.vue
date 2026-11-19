@@ -28,6 +28,8 @@ import {
   FIELDS,
   fieldOfServerError,
   GOVERNANCE_TEXT,
+  HEADER_SOURCE_TEXT,
+  NAME_RULE,
   initialValues,
   KIND_HELP,
   KIND_LABEL,
@@ -58,6 +60,7 @@ const values = reactive<FormValues>(
 const opened = JSON.stringify(values)
 const credentials = reactive<FormValues>({})
 const typed = ref('')
+const removeCreds = ref(false)
 const errors = ref<Record<string, string>>({})
 const extra = computed(() => (props.target ? extraMembers(kind.value, props.target.config) : {}))
 
@@ -89,14 +92,15 @@ function usePublic(): void {
 const save = useMutation({
   mutationFn: async (): Promise<LedgerAnchorTarget | null> => {
     const config = buildConfig(kind.value, values, extra.value)
-    const creds = buildCredentials(kind.value, credentials)
+    // `{}` asks the server to remove the stored credentials (the typed ones are ignored then).
+    const creds = removeCreds.value ? {} : buildCredentials(kind.value, credentials)
     if (!props.target)
       return endpoints.createLedgerAnchorTarget({
         kind: kind.value,
         name: name.value.trim(),
         enabled: enabled.value,
         config,
-        ...(creds ? { credentials: creds } : {}),
+        ...(creds && Object.keys(creds).length ? { credentials: creds } : {}),
       })
     const t = props.target
     const body: LedgerAnchorTargetUpdate = {}
@@ -197,7 +201,7 @@ const retentionOk = computed(
       <FormField
         v-slot="slot"
         label="Name"
-        hint="1 to 63 characters; it names the target in the lists and in the alerts."
+        :hint="`${NAME_RULE} It names the target in the lists and in the alerts.`"
         :error="errorFor('name')"
         required
       >
@@ -241,6 +245,13 @@ const retentionOk = computed(
             Use the public calendars
           </button>
           <span class="muted">Fills the list; nothing is sent until you save.</span>
+        </p>
+        <p
+          v-if="kind === 'ots' && f.key === 'headerSource.url'"
+          class="muted"
+          data-testid="header-source-note"
+        >
+          {{ HEADER_SOURCE_TEXT }}
         </p>
       </template>
 
@@ -323,6 +334,26 @@ const retentionOk = computed(
         <p v-if="editing" class="muted" data-testid="credentials-state">
           {{ target?.credentialsSet ? 'Credentials are stored.' : 'No credentials are stored.' }}
         </p>
+        <p
+          v-if="errorFor('credentials')"
+          class="error"
+          role="alert"
+          data-testid="credentials-error"
+        >
+          {{ errorFor('credentials') }}
+        </p>
+        <label v-if="editing && target?.credentialsSet" class="check">
+          <input v-model="removeCreds" type="checkbox" data-testid="remove-credentials" />
+          Remove the stored credentials
+          <span class="muted"
+            >Typed values are then ignored.
+            {{
+              kind === 'worm'
+                ? 'A WORM store cannot be used without credentials: the server refuses to keep it turned on.'
+                : ''
+            }}</span
+          >
+        </label>
         <FormField
           v-for="c in CREDENTIAL_FIELDS[kind]"
           :key="`${kind}-${c.key}`"
@@ -353,6 +384,9 @@ const retentionOk = computed(
         }}</span>
       </label>
 
+      <p v-if="errorFor('config')" class="error" role="alert" data-testid="config-error">
+        {{ errorFor('config') }}
+      </p>
       <ProblemNotice v-if="notice" :error="notice" />
       <p v-if="unchanged" class="notice tone-info" role="status" data-testid="anchor-unchanged">
         <span aria-hidden="true">&#9432;</span> Nothing was changed, so nothing was saved.

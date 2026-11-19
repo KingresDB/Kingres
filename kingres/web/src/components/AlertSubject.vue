@@ -32,7 +32,12 @@ const canDatabase = computed(() => session.can('getDatabase'))
 const linkable = (id: string): boolean => canServer.value && isAddressableSegment(id)
 
 /** Words for the qualifiers the contract names; any other one is shown as sent. */
-const ASPECT: Record<string, string> = { ca: 'Cluster certificate authority' }
+const ASPECT: Record<string, string> = {
+  ca: 'Cluster certificate authority',
+  // 0.12.0: the system database is older than what the ledger published (the alert kind is `ledgerSignerUnavailable`).
+  'published-state': 'The system database is older than what was published',
+}
+const isPublishedState = computed(() => subject.value.aspect === 'published-state')
 // 0.11.0: `target:<id>` is an anchor target of the ledger (the number only; anything else is shown as sent).
 const aspectText = computed(() => {
   const a = subject.value.aspect
@@ -68,7 +73,7 @@ const isLedgerAlert = computed(() => props.alert.kind.startsWith('ledger'))
 const canLedger = computed(() => session.can('listLedgerStatus'))
 const ledgerLink = computed(() => {
   const db = subject.value.databaseName
-  const tab = LEDGER_TAB[props.alert.kind]
+  const tab = isPublishedState.value ? 'publication' : LEDGER_TAB[props.alert.kind]
   return {
     name: 'ledger',
     query: {
@@ -78,6 +83,7 @@ const ledgerLink = computed(() => {
   }
 })
 const ledgerLinkText = computed(() => {
+  if (isPublishedState.value) return 'What was published and how to go on'
   const tab = LEDGER_TAB[props.alert.kind]
   return tab === 'signing'
     ? 'Signing keys of the ledger'
@@ -159,6 +165,11 @@ const any = computed(
       <RouterLink :to="{ name: 'configuration', query: { tab: 'time' } }"
         >Clocks and what to do</RouterLink
       >
+    </li>
+    <li v-if="isPublishedState" data-testid="alert-published-state">
+      The system database has gone back to an older state than what the ledger published, for
+      example after a restore from a backup. Nothing is signed until this is resolved, so that no
+      checkpoint contradicts what auditors already hold.
     </li>
     <li v-if="subject.aspect" data-testid="alert-aspect">
       <template v-if="aspectText">{{ aspectText }}</template>

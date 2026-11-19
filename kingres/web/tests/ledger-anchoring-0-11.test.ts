@@ -233,8 +233,8 @@ describe('adding a target', () => {
     await fill(user, d, /^name/i, 'soft')
     await fill(user, d, /^region/i, 'us-east-1')
     await fill(user, d, /^bucket/i, 'soft-bucket')
-    await fill(user, d, /access key id/i, 'A')
-    await fill(user, d, /secret access key/i, 'S')
+    await fill(user, d, /access key id/i, 'AKIA0001')
+    await fill(user, d, /secret access key/i, 'SECRET01')
     await user.click(d.getByRole('button', { name: 'Add the target' }))
     await waitFor(() => expect(targets()).toHaveLength(1))
     expect(targets()[0]?.config.mode).toBe('governance')
@@ -287,7 +287,11 @@ describe('adding a target', () => {
     await open()
     const d = await openAdd(user)
     await user.click(d.getByRole('button', { name: 'Add the target' }))
-    expect(await d.findByText('Give a name of 1 to 63 characters.')).toBeInTheDocument()
+    expect(
+      await d.findByText(
+        '1 to 63 characters: letters, digits, space, dot, hyphen and underscore, starting with a letter or a digit.',
+      ),
+    ).toBeInTheDocument()
     expect(d.getByText('Region is required.')).toBeInTheDocument()
     expect(d.getByText('Bucket is required.')).toBeInTheDocument()
     expect(d.getByText('Access key id is required.')).toBeInTheDocument()
@@ -320,8 +324,8 @@ describe('adding a target', () => {
     await fill(user, d, /^name/i, 'vault')
     await fill(user, d, /^region/i, 'eu-west-1')
     await fill(user, d, /^bucket/i, 'ledger-anchors')
-    await fill(user, d, /access key id/i, 'A')
-    await fill(user, d, /secret access key/i, 'S')
+    await fill(user, d, /access key id/i, 'AKIA0001')
+    await fill(user, d, /secret access key/i, 'SECRET01')
     await user.click(d.getByRole('button', { name: 'Add the target' }))
     const field = d.getByLabelText(/^bucket/i)
     await waitFor(() => expect(field).toHaveAttribute('aria-invalid', 'true'))
@@ -468,7 +472,7 @@ describe('editing a target', () => {
     await user.click(await screen.findByRole('button', { name: 'Edit archive-worm' }))
     const d = within(await dialog())
     await fill(user, d, /secret access key/i, 'typed-secret')
-    await fill(user, d, /access key id/i, 'K')
+    await fill(user, d, /access key id/i, 'KEY00001')
     await user.click(d.getByRole('button', { name: 'Save the target' }))
     expect(await d.findByText('Cannot be changed')).toBeInTheDocument()
     expect(d.getByLabelText(/secret access key/i)).toHaveValue('')

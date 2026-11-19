@@ -950,6 +950,24 @@ export const STATES: PageState[] = [
     },
   },
   {
+    // 0.12.0: the alert of a system database that is older than what was published (its own words and a link).
+    name: 'alert: the system database is older than what was published (0.12.0)',
+    needsMock: true,
+    route: '/alerts',
+    open: async (page) => {
+      await page.evaluate(() => {
+        ;(
+          window as unknown as { __kingresMock: { signingSwitch: (t: string) => void } }
+        ).__kingresMock.signingSwitch('restored')
+        void (
+          window as unknown as { __queryClient: { invalidateQueries: () => unknown } }
+        ).__queryClient.invalidateQueries()
+      })
+      await page.waitForSelector('[data-testid="alert-published-state"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+  },
+  {
     name: 'anchoring: delete a target (0.11.0)',
     needsMock: true,
     route: '/ledger?tab=anchoring',

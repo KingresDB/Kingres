@@ -268,7 +268,7 @@ function target(s: MockState, c: Ctx): S['LedgerAnchorTarget'] {
   return t
 }
 
-/** The members of the configuration of each kind (design 6.3 to 6.5): the server rejects any other. */
+/** The members of the configuration of each kind (as `ParseConfig` of the kind has them): the server rejects any other. */
 const CONFIG_MEMBERS: Record<string, string[]> = {
   worm: [
     'endpoint',
@@ -282,6 +282,7 @@ const CONFIG_MEMBERS: Record<string, string[]> = {
     'caBundlePath',
     'allowInsecure',
     'maxSkewSeconds',
+    'credentialsPath',
   ],
   tsa: [
     'url',
@@ -292,6 +293,7 @@ const CONFIG_MEMBERS: Record<string, string[]> = {
     'maxSkewSeconds',
     'allowInsecure',
     'signerKeySha256',
+    'credentialsPath',
   ],
   ots: [
     'calendars',
@@ -299,99 +301,243 @@ const CONFIG_MEMBERS: Record<string, string[]> = {
     'upgradeTimeoutDays',
     'allowInsecure',
     'contradictionConfirmMinutes',
+    'headerSource',
   ],
 }
 
-type FieldProblem = { field: string; message: string }
+type FieldProblem = { field: string; message: string; code?: string }
+const UNKNOWN_PREFIX: Record<string, string> = {
+  worm: 'worm: configuration: ',
+  tsa: 'tsa: config: ',
+  ots: 'ots: configuration: ',
+}
 
-function checkConfig(kind: string, c: Record<string, unknown>, errors: FieldProblem[]): void {
-  const bad = (m: string, message: string) => errors.push({ field: `config.${m}`, message })
+/**
+ * The first thing wrong with a configuration, in the words of the server (`internal/ledgeranchor`, `anchor/worm`, `anchor/tsa`,
+ * `anchor/ots`): the server answers one message at `/config`, not one per member. Null when it is good.
+ */
+function configProblem(kind: string, c: Record<string, unknown>): string | null {
   const known = CONFIG_MEMBERS[kind] ?? []
-  for (const k of Object.keys(c))
-    if (!known.includes(k)) bad(k, 'This setting does not exist for this kind of target.')
+  const unknown = Object.keys(c).find((k) => !known.includes(k))
+  if (unknown !== undefined)
+    return `${UNKNOWN_PREFIX[kind] ?? ''}json: unknown field ${JSON.stringify(unknown)}`
   const str = (k: string) => (typeof c[k] === 'string' ? (c[k] as string) : '')
-  const range = (k: string, lo: number, hi: number) => {
-    const v = c[k]
-    if (v !== undefined && (typeof v !== 'number' || !Number.isInteger(v) || v < lo || v > hi))
-      bad(k, `Give a whole number from ${lo} to ${hi}.`)
-  }
+  const whole = (k: string, lo: number, hi: number): boolean =>
+    c[k] === undefined ||
+    (typeof c[k] === 'number' &&
+      Number.isInteger(c[k]) &&
+      (c[k] as number) >= lo &&
+      (c[k] as number) <= hi)
   const insecure = c.allowInsecure === true
   if (kind === 'worm') {
     if (!/^[A-Za-z0-9._-]{1,64}$/.test(str('region')))
-      bad('region', 'A region is required (letters, digits, - _ .).')
-    if (!/^[A-Za-z0-9._-]{3,63}$/.test(str('bucket')))
-      bad('bucket', 'A bucket name has 3 to 63 letters, digits, dots and dashes.')
+      return 'worm: region is required (letters, digits, - _ .)'
+    const b = str('bucket')
+    if (!/^[A-Za-z0-9._-]{3,63}$/.test(b) || /^\.|\.$|\.\./.test(b))
+      return 'worm: bucket name is not valid'
+    const pre = str('keyPrefix')
+    if (
+      pre !== '' &&
+      (!/^[A-Za-z0-9._/-]{1,200}$/.test(pre) || pre.split('/').some((x) => x === '.' || x === '..'))
+    )
+      return 'worm: keyPrefix must be 1 to 200 characters of letters, digits, - _ . /'
     if (c.mode !== undefined && c.mode !== 'compliance' && c.mode !== 'governance')
-      bad('mode', 'The mode is compliance or governance.')
+      return 'worm: mode must be governance or compliance'
+    if (!whole('retentionDays', 1, 36500)) return 'worm: retentionDays must be 1 to 36500'
     if (c.ifNoneMatch !== undefined && !['auto', 'on', 'off'].includes(String(c.ifNoneMatch)))
-      bad('ifNoneMatch', 'Choose auto, on or off.')
-    range('retentionDays', 1, 36500)
-    range('maxSkewSeconds', 1, 86400)
+      return 'worm: ifNoneMatch must be auto, on or off'
+    if (!whole('maxSkewSeconds', 0, 86400)) return 'worm: maxSkewSeconds must be 0 to 86400'
     if (str('endpoint') !== '') {
       const m = /^(https?):\/\/[^\s/?#@]+\/?$/.exec(str('endpoint'))
-      if (!m) bad('endpoint', 'The endpoint must be scheme://host[:port] without a path.')
-      else if (m[1] === 'http' && !insecure)
-        bad('endpoint', 'The endpoint is not https and allowInsecure is not set.')
+      if (!m)
+        return 'worm: endpoint must be scheme://host[:port] without path, user information or query'
+      if (m[1] === 'http' && !insecure)
+        return 'worm: endpoint is not https and allowInsecure is not set'
     }
   } else if (kind === 'tsa') {
-    if (!/^https?:\/\/[^\s/?#@]+[^\s?#]*$/.test(str('url')))
-      bad('url', 'The url must be an http or https address without a query.')
-    if (str('caBundlePath') === '')
-      bad('caBundlePath', 'The certificates of the authority are required.')
-    range('timeoutSeconds', 1, 300)
-    range('maxSkewSeconds', 1, 86400)
+    if (!/^https?:\/\/[^\s/?#@]+[^\s#]*$/.test(str('url')))
+      return 'tsa: config: url must be an http or https URL without user information'
+    if (/\?/.test(str('url'))) return 'tsa: config: url must not have a query'
+    if (c.hashAlgorithm !== undefined && c.hashAlgorithm !== '' && c.hashAlgorithm !== 'sha256')
+      return 'tsa: config: hashAlgorithm must be sha256'
+    if (str('policyOid') !== '' && !/^[0-2](\.\d+)+$/.test(str('policyOid')))
+      return 'tsa: config: policyOid is not an OID'
+    if (str('caBundlePath') === '') return 'tsa: config: caBundlePath is required'
+    if (str('signerKeySha256') !== '' && !/^[0-9a-f]{64}$/.test(str('signerKeySha256')))
+      return 'tsa: config: signerKeySha256 must be 64 lower case hexadecimal digits'
+    if (!whole('timeoutSeconds', 0, 300)) return 'tsa: config: timeoutSeconds must be 0 to 300'
+    if (!whole('maxSkewSeconds', 0, 86400)) return 'tsa: config: maxSkewSeconds must be 0 to 86400'
   } else if (kind === 'ots') {
     const cals = Array.isArray(c.calendars) ? (c.calendars as unknown[]) : []
-    if (cals.length === 0) bad('calendars', 'At least one calendar is required.')
-    else if (
-      cals.some(
-        (x) =>
-          typeof x !== 'string' ||
-          !/^https?:\/\/[^\s/?#@]+/.test(x) ||
-          (x.startsWith('http://') && !insecure),
+    if (cals.length === 0) return 'ots: configuration: at least one calendar is required'
+    if (cals.length > 16) return 'ots: configuration: at most 16 calendars'
+    for (const [i, x] of cals.entries())
+      if (
+        typeof x !== 'string' ||
+        !/^https?:\/\/[^\s/?#@]+/.test(x) ||
+        (x.startsWith('http://') && !insecure)
       )
-    )
-      bad('calendars', 'Each calendar must be an https address.')
-    range('minCalendars', 1, Math.max(1, cals.length))
-    range('upgradeTimeoutDays', 1, 365)
+        return `ots: configuration: calendar ${i + 1}: must be an https URL`
+    if (new Set(cals.map((x) => String(x).replace(/\/+$/, '').toLowerCase())).size !== cals.length)
+      return 'ots: configuration: a calendar is a repeat'
+    if (c.minCalendars !== undefined && !whole('minCalendars', 1, cals.length))
+      return 'ots: configuration: minCalendars must be between 1 and the number of calendars'
+    if (!whole('contradictionConfirmMinutes', 1, 10080))
+      return 'ots: configuration: contradictionConfirmMinutes must be between 1 and 10080'
+    if (!whole('upgradeTimeoutDays', 1, 365))
+      return 'ots: configuration: upgradeTimeoutDays must be between 1 and 365'
+    if (c.headerSource !== undefined) {
+      const hs = c.headerSource as { url?: unknown } | null
+      if (typeof hs !== 'object' || hs === null || Object.keys(hs).some((k) => k !== 'url'))
+        return 'headerSource must be {"url": "..."}'
+      const u = typeof hs.url === 'string' ? hs.url : ''
+      if (!/^https?:\/\/[^\s/?#@]+[^\s?#]*$/.test(u) || (u.startsWith('http://') && !insecure))
+        return 'headerSource.url must be an https URL (http only with allowInsecure) without user information or query'
+    }
   }
+  return null
 }
 
+/** The members of the credentials of each kind with the length the server accepts (`credMembers` of `creds.go`). */
+const CRED_MEMBERS: Record<
+  string,
+  { name: string; required: boolean; min: number; max: number; space?: boolean }[]
+> = {
+  worm: [
+    { name: 'accessKeyId', required: true, min: 4, max: 128 },
+    { name: 'secretAccessKey', required: true, min: 4, max: 256 },
+    { name: 'sessionToken', required: false, min: 4, max: 4096 },
+  ],
+  tsa: [
+    { name: 'username', required: false, min: 1, max: 256 },
+    { name: 'password', required: false, min: 1, max: 256, space: true },
+  ],
+  ots: [],
+}
+
+/** The problem of a credentials object (the member and the rule, never a value), or null; `{}` removes the stored ones. */
+function credentialsProblem(kind: string, credentials: unknown): string | null {
+  const members = CRED_MEMBERS[kind] ?? []
+  if (members.length === 0) return 'this kind of target takes no credentials'
+  if (typeof credentials !== 'object' || credentials === null || Array.isArray(credentials))
+    return 'the credentials must be a JSON object'
+  const c = credentials as Record<string, unknown>
+  if (Object.keys(c).length === 0) return null
+  for (const k of Object.keys(c)) {
+    const m = members.find((x) => x.name === k)
+    if (!m) return `${kind}: unknown credential member ${JSON.stringify(k)}`
+    const v = c[k]
+    if (typeof v !== 'string') return `credentials.${k} must be a string`
+    if (v.length < m.min || v.length > m.max)
+      return `credentials.${k} must have ${m.min} to ${m.max} characters`
+    if (!(m.space ? /^[\x20-\x7e]*$/ : /^[\x21-\x7e]*$/).test(v))
+      return `credentials.${k} may hold printable ASCII characters only (no white space or control character)`
+  }
+  for (const m of members) if (m.required && !c[m.name]) return `credentials.${m.name} is required`
+  if (kind === 'tsa' && Boolean(c.username) !== Boolean(c.password))
+    return 'credentials.username and credentials.password go together'
+  return null
+}
+
+const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,62}$/
+
+/** The checks of `shape` and `checkName` of `internal/ledgeranchor/rest.go`, with its fields and its words. */
 function checkTarget(
   kind: S['LedgerAnchorKind'],
   name: unknown,
   config: unknown,
   credentials?: unknown,
+  enabling?: { enabled: boolean; hasCredentials: boolean },
 ): void {
-  const errors: FieldProblem[] = []
+  const fail = (_title: string, f: FieldProblem): never => {
+    throw validationFailed([f])
+  }
+  if (typeof name !== 'string' || !NAME_RE.test(name))
+    fail('The name is not valid.', {
+      field: '/name',
+      message:
+        '1 to 63 characters: letters, digits, space, dot, hyphen and underscore, starting with a letter or a digit',
+      code: 'invalid',
+    })
   if (!['worm', 'tsa', 'ots'].includes(kind))
-    errors.push({ field: 'kind', message: 'Choose worm, tsa or ots.' })
-  if (typeof name !== 'string' || name.length < 1 || name.length > 63)
-    errors.push({ field: 'name', message: 'Give a name of 1 to 63 characters.' })
+    fail('The kind is not valid.', {
+      field: '/kind',
+      message: 'one of worm, tsa, ots',
+      code: 'invalid',
+    })
   if (typeof config !== 'object' || config === null || Array.isArray(config))
-    errors.push({ field: 'config', message: 'Give the configuration as an object.' })
-  else checkConfig(kind, config as Record<string, unknown>, errors)
-  if (credentials !== undefined) {
-    const c = (credentials ?? {}) as Record<string, unknown>
-    const allowed =
-      kind === 'worm'
-        ? ['accessKeyId', 'secretAccessKey', 'sessionToken']
-        : kind === 'tsa'
-          ? ['username', 'password']
-          : []
-    for (const k of Object.keys(c))
-      if (!allowed.includes(k) || typeof c[k] !== 'string')
-        errors.push({
-          field: `credentials.${k}`,
-          message: 'This credential does not exist for this kind of target.',
-        })
-    if (kind === 'worm' && (!c.accessKeyId || !c.secretAccessKey))
-      errors.push({
-        field: 'credentials.secretAccessKey',
-        message: 'Give the access key id and the secret access key together.',
+    fail('The configuration is not valid.', {
+      field: '/config',
+      message: 'the configuration must be a JSON object',
+      code: 'invalid',
+    })
+  const cfg = config as Record<string, unknown>
+  const { credentialsPath, ...rest } = cfg
+  const bad = configProblem(kind, {
+    ...rest,
+    ...(credentialsPath === undefined ? {} : { credentialsPath }),
+  })
+  if (bad !== null)
+    fail('The configuration is not valid.', { field: '/config', message: bad, code: 'invalid' })
+  if (kind === 'tsa' && typeof cfg.caBundlePath === 'string' && !cfg.caBundlePath.startsWith('/'))
+    fail('The configuration is not valid.', {
+      field: '/config/caBundlePath',
+      message: 'the bundle cannot be read by this server (an absolute path to a PEM file)',
+      code: 'invalid',
+    })
+  const given = credentials !== undefined && credentials !== null
+  if (given) {
+    if (kind === 'ots')
+      fail('The credentials are not valid.', {
+        field: '/credentials',
+        message: 'this kind of target takes no credentials',
+        code: 'invalid',
+      })
+    if (typeof credentialsPath === 'string' && credentialsPath !== '')
+      fail('The credentials are not valid.', {
+        field: '/credentials',
+        message: 'credentials and credentialsPath exclude each other',
+        code: 'invalid',
+      })
+    const why = credentialsProblem(kind, credentials)
+    if (why !== null)
+      fail('The credentials are not valid.', {
+        field: '/credentials',
+        message: why,
+        code: 'invalid',
       })
   }
-  if (errors.length > 0) throw validationFailed(errors)
+  if (typeof credentialsPath === 'string' && credentialsPath !== '') {
+    if (kind === 'ots')
+      fail('The configuration is not valid.', {
+        field: '/config/credentialsPath',
+        message: 'this kind of target takes no credentials',
+        code: 'invalid',
+      })
+    if (!credentialsPath.startsWith('/'))
+      fail('The configuration is not valid.', {
+        field: '/config/credentialsPath',
+        message:
+          'the credentials file cannot be read by this server (a regular file that only its owner can read, holding the members of the kind)',
+        code: 'invalid',
+      })
+  }
+  if (
+    enabling?.enabled &&
+    kind === 'worm' &&
+    !enabling.hasCredentials &&
+    !(typeof credentialsPath === 'string' && credentialsPath !== '')
+  )
+    fail('The credentials are not valid.', {
+      field: '/credentials',
+      message: 'credentials are required to enable a target of this kind',
+      code: 'required',
+    })
+}
+
+/** True when a credentials object holds something (`{}` and null hold nothing: they remove or leave out). */
+function credentialsGiven(c: unknown): boolean {
+  return typeof c === 'object' && c !== null && Object.keys(c).length > 0
 }
 
 /** `?anchors=refuse:<code>`: every change answers this problem code, as a server that refuses would. */
@@ -691,7 +837,10 @@ export function ledgerHandlers(): Partial<Record<OperationId, Handler>> {
       refuseWrites()
       const l = l7(c.s)
       const b = body<S['LedgerAnchorTargetCreate']>(c)
-      checkTarget(b.kind, b.name, b.config, b.credentials)
+      checkTarget(b.kind, b.name, b.config, b.credentials, {
+        enabled: b.enabled ?? false,
+        hasCredentials: credentialsGiven(b.credentials),
+      })
       if (l.targets.some((t) => t.name === b.name))
         throw problem('already_exists', 'A target with this name exists.')
       const t: S['LedgerAnchorTarget'] = {
@@ -700,7 +849,7 @@ export function ledgerHandlers(): Partial<Record<OperationId, Handler>> {
         name: b.name,
         enabled: b.enabled ?? false,
         config: b.config,
-        credentialsSet: b.credentials !== undefined,
+        credentialsSet: credentialsGiven(b.credentials),
         lastTest: null,
         newestAnchoredAt: null,
         state: 'none',
@@ -715,13 +864,18 @@ export function ledgerHandlers(): Partial<Record<OperationId, Handler>> {
       const b = body<S['LedgerAnchorTargetUpdate']>(c)
       if (b.kind !== undefined && b.kind !== t.kind)
         throw problem('immutable_field', 'The kind of a target cannot change.')
-      checkTarget(t.kind, b.name ?? t.name, b.config ?? t.config, b.credentials)
+      const stillHas =
+        b.credentials === undefined ? t.credentialsSet : credentialsGiven(b.credentials)
+      checkTarget(t.kind, b.name ?? t.name, b.config ?? t.config, b.credentials, {
+        enabled: b.enabled ?? t.enabled,
+        hasCredentials: stillHas,
+      })
       if (b.name !== undefined && l7(c.s).targets.some((x) => x.name === b.name && x.id !== t.id))
         throw problem('already_exists', 'A target with this name exists.')
       if (b.name !== undefined) t.name = b.name
       if (b.enabled !== undefined) t.enabled = b.enabled
       if (b.config !== undefined) t.config = b.config
-      if (b.credentials !== undefined) t.credentialsSet = true
+      if (b.credentials !== undefined) t.credentialsSet = credentialsGiven(b.credentials)
       return ok(structuredClone(t))
     },
     deleteLedgerAnchorTarget: (c) => {
