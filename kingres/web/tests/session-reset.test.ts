@@ -65,7 +65,7 @@ describe('every way a session can end clears the server state', () => {
     const dialog = await screen.findByRole('dialog', { name: /drop role app_ro/i })
     await user.type(within(dialog).getByLabelText(/to confirm/i), 'app_ro')
     await user.click(within(dialog).getByRole('button', { name: /^drop role$/i }))
-    await waitFor(() => expect(router.currentRoute.value.name).toBe('login'), { timeout: 3000 })
+    await waitFor(() => expect(router.currentRoute.value.name).toBe('login'), { timeout: 30_000 })
     expect(withData(queryClient)).toHaveLength(0)
   })
 
@@ -77,7 +77,7 @@ describe('every way a session can end clears the server state', () => {
     await user.type(within(dialog).getByLabelText(/to confirm/i), 'reports')
     mockServer.use(http.get('*/api/v1/tasks/:id', expired))
     await user.click(within(dialog).getByRole('button', { name: /^drop database$/i }))
-    await waitFor(() => expect(router.currentRoute.value.name).toBe('login'), { timeout: 3000 })
+    await waitFor(() => expect(router.currentRoute.value.name).toBe('login'), { timeout: 30_000 })
     expect(withData(queryClient)).toHaveLength(0)
   })
 

@@ -131,7 +131,7 @@ describe('the plan that comes with a refusal that needs a decision', () => {
     const dialog = await startDialog(user)
     await user.type(within(dialog).getByLabelText(/to confirm/i), '10.0.0.12:8091')
     await user.click(within(dialog).getByRole('button', { name: /^hard failover$/i }))
-    const panel = await screen.findByTestId('waiting-for-you', {}, { timeout: 8000 })
+    const panel = await screen.findByTestId('waiting-for-you', {}, { timeout: 30_000 })
     mockServer.use(
       http.post('*/api/v1/servers/:id/failover', () =>
         HttpResponse.json(

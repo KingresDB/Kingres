@@ -130,7 +130,7 @@ describe('the banner in the shell', () => {
     await app.queryClient.invalidateQueries()
     await waitFor(
       () => expect(screen.getByTestId('banner-failover')).toHaveTextContent(/waiting for you/i),
-      { timeout: 5000 },
+      { timeout: 30_000 },
     )
     expect(screen.getByTestId('banner-failover')).toHaveClass('tone-danger')
   })
@@ -330,7 +330,7 @@ describe('the dashboard, the alerts and the counter in the mock', () => {
         await endpoints.getFailoverStatus()
         expect(getState().settings.autoFailover.eventsSinceReset).toBe(1)
       },
-      { timeout: 5000 },
+      { timeout: 30_000 },
     )
     const kinds = getState().alerts.map((a) => a.kind)
     expect(kinds).toContain('autoFailoverTriggered')

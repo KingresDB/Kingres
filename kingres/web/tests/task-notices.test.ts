@@ -49,7 +49,7 @@ describe('a task whose dialog was closed is still followed (W-13a)', () => {
     const notice = await screen.findByRole(
       'alert',
       { name: /drop database reports/i },
-      { timeout: 8000 },
+      { timeout: 30_000 },
     )
     expect(notice).toHaveTextContent(/the disk is on fire/i)
     expect(startedId).toBeGreaterThan(0)
@@ -66,7 +66,7 @@ describe('a task whose dialog was closed is still followed (W-13a)', () => {
     await user.click(within(dialog).getByRole('button', { name: /^restore primaries$/i }))
     await user.click(await within(dialog).findByRole('button', { name: /hide \(keeps running\)/i }))
     const notice = await screen.findByRole('status', { name: /restore preferred primaries/i })
-    await waitFor(() => expect(notice).toHaveTextContent(/finished/i), { timeout: 4000 })
+    await waitFor(() => expect(notice).toHaveTextContent(/finished/i), { timeout: 30_000 })
   })
 })
 

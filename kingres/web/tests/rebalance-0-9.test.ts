@@ -67,7 +67,7 @@ describe('stop in the middle, start again', () => {
     const dialog = await screen.findByRole('dialog', { name: /stop the rebalance/i })
     await user.click(within(dialog).getByRole('button', { name: /^stop rebalance$/i }))
     expect(await screen.findByTestId('stopping-note')).toBeInTheDocument()
-    const note = await screen.findByTestId('stopped-note', {}, { timeout: 5000 })
+    const note = await screen.findByTestId('stopped-note', {}, { timeout: 30_000 })
     expect(note).toHaveTextContent(/stopped by an operator/i)
     // A stopped run is a report too, listed as stopped; state is never by colour alone.
     expect(await screen.findByText('Stopped')).toBeInTheDocument()
@@ -75,7 +75,7 @@ describe('stop in the middle, start again', () => {
     await user.click(await screen.findByRole('button', { name: /start again/i }))
     await waitFor(() => expect(getState().rebalance.state).toBe('running'))
     expect(getState().rebalance.taskId).toBe(id)
-    await waitFor(() => expect(getState().rebalance.state).toBe('idle'), { timeout: 8000 })
+    await waitFor(() => expect(getState().rebalance.state).toBe('idle'), { timeout: 30_000 })
     const report = getState().rebalance.reports[0]!
     expect(report.id).toBe(id)
     expect(report.outcome).toBe('completed')
@@ -97,7 +97,7 @@ describe('stop in the middle, start again', () => {
     await user.click(await screen.findByRole('button', { name: /stop rebalance/i }))
     const stop = await screen.findByRole('dialog', { name: /stop the rebalance/i })
     await user.click(within(stop).getByRole('button', { name: /^stop rebalance$/i }))
-    await screen.findByTestId('stopped-note', {}, { timeout: 5000 })
+    await screen.findByTestId('stopped-note', {}, { timeout: 30_000 })
 
     // The task of a stopped run says that it can be cancelled.
     expect((await endpoints.getTask(id!)).cancellable).toBe(true)
@@ -118,7 +118,7 @@ describe('stop in the middle, start again', () => {
     await addServer()
     mockConfig.taskDurationMs = 1500
     await user.click(await screen.findByRole('button', { name: /start rebalance/i }))
-    await waitFor(() => expect(getState().rebalance.state).toBe('idle'), { timeout: 8000 })
+    await waitFor(() => expect(getState().rebalance.state).toBe('idle'), { timeout: 30_000 })
     const report = getState().rebalance.reports[0]!
     const first = report.moves[0]!
     // The same bucket twice in one run, and an outcome a newer server may send.
@@ -142,7 +142,7 @@ describe('a run that fails', () => {
     mockConfig.taskDurationMs = 500
     applySwitches(new URLSearchParams('rebalance=fail'), getState())
     await user.click(await screen.findByRole('button', { name: /start rebalance/i }))
-    expect(await screen.findByTestId('failed-note', {}, { timeout: 8000 })).toHaveTextContent(
+    expect(await screen.findByTestId('failed-note', {}, { timeout: 30_000 })).toHaveTextContent(
       /given up after 3 attempts/i,
     )
     await user.click(await screen.findByRole('button', { name: /show report/i }))

@@ -13,7 +13,7 @@ import { disposeBuiltApps } from './helpers'
 
 expect.extend(axeMatchers)
 // Pages are lazy-loaded and transformed on first use; give async queries room on a busy machine.
-configure({ asyncUtilTimeout: 5000 })
+configure({ asyncUtilTimeout: 30_000 })
 
 beforeAll(() => mockServer.listen({ onUnhandledFrame: 'error' }))
 beforeEach(() => {

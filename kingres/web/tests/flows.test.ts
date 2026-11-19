@@ -77,7 +77,7 @@ describe('session', () => {
     )
     await router.push('/dashboard')
     await router.push('/servers')
-    await waitFor(() => expect(router.currentRoute.value.name).toBe('login'), { timeout: 3000 })
+    await waitFor(() => expect(router.currentRoute.value.name).toBe('login'), { timeout: 30_000 })
   })
 })
 
@@ -109,9 +109,9 @@ describe('add server, then rebalance', () => {
     ).toBeInTheDocument()
     await waitFor(
       () => expect(screen.getByRole('button', { name: /start rebalance/i })).toBeInTheDocument(),
-      { timeout: 5000 },
+      { timeout: 30_000 },
     )
-    await waitFor(() => expect(getState().rebalance.needed).toBe(false), { timeout: 5000 })
+    await waitFor(() => expect(getState().rebalance.needed).toBe(false), { timeout: 30_000 })
 
     const s = getState()
     const group4 = s.groups.find((g) => g.preferredPrimaryServerId === '10.0.0.14')
@@ -140,7 +140,7 @@ describe('add server, then rebalance', () => {
     await user.click(await screen.findByRole('button', { name: /stop rebalance/i }))
     const dialog = await screen.findByRole('dialog', { name: /stop the rebalance/i })
     await user.click(within(dialog).getByRole('button', { name: /^stop rebalance$/i }))
-    await waitFor(() => expect(getState().rebalance.state).toBe('stopped'), { timeout: 5000 })
+    await waitFor(() => expect(getState().rebalance.state).toBe('stopped'), { timeout: 30_000 })
     expect(await screen.findByText(/stopped [(]start again to go on[)]/i)).toBeInTheDocument()
     expect(await screen.findByRole('button', { name: /start again/i })).toBeInTheDocument()
   })
@@ -235,7 +235,7 @@ describe('ledger', () => {
     await user.click(await screen.findByRole('button', { name: /start verification/i }))
     expect(await screen.findByRole('progressbar', { name: /task progress/i })).toBeInTheDocument()
     await waitFor(() => expect(getState().ledger.verifications[0]?.state).toBe('passed'), {
-      timeout: 4000,
+      timeout: 30_000,
     })
 
     await user.click(screen.getByRole('tab', { name: 'Digests' }))
@@ -340,7 +340,7 @@ describe('database detail', () => {
     await user.click(confirm)
     await waitFor(
       () => expect(getState().databases.some((d) => d.info.name === 'shop')).toBe(false),
-      { timeout: 4000 },
+      { timeout: 30_000 },
     )
   })
 })

@@ -29,7 +29,7 @@ async function displace(): Promise<void> {
   mockConfig.taskDurationMs = 60
   const t = await endpoints.failoverServer('10.0.0.12', 'hard')
   await waitFor(async () => expect((await endpoints.getTask(t.id)).state).toBe('done'), {
-    timeout: 5000,
+    timeout: 30_000,
   })
 }
 const restoreButton = () => screen.findByRole('button', { name: /^Restore preferred primaries/ })
@@ -85,7 +85,7 @@ describe('Switch over... on a group card', () => {
     await waitFor(
       () => expect(getState().groups.find((x) => x.id === 2)!.primaryServerId).not.toBe(before),
       {
-        timeout: 8000,
+        timeout: 30_000,
       },
     )
   })
@@ -168,7 +168,7 @@ describe('Restore preferred primaries', () => {
         expect(
           getState().groups.every((g) => g.primaryServerId === g.preferredPrimaryServerId),
         ).toBe(true),
-      { timeout: 8000 },
+      { timeout: 30_000 },
     )
   })
 

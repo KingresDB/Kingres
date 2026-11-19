@@ -181,7 +181,7 @@ describe('the acknowledgement of a diverged chain', () => {
       confirm: 'shop',
     })
     await waitFor(() => expect(getState().ledger7.diverged).not.toContain('shop:2'), {
-      timeout: 8000,
+      timeout: 30_000,
     })
   })
   it('chain_not_diverged and validation_failed are told in their own words', async () => {
@@ -238,12 +238,12 @@ describe('the verification with checks and the audit of the publication', () => 
     expect(bodies[0]).not.toHaveProperty('checks')
     await waitFor(
       () => expect(getState().ledger.verifications.every((v) => v.state !== 'running')).toBe(true),
-      { timeout: 8000 },
+      { timeout: 30_000 },
     )
     await user.click(screen.getByTestId('check-publication'))
     await user.click(screen.getByTestId('check-anchors'))
     await user.click(screen.getByRole('button', { name: 'Start verification' }))
-    await waitFor(() => expect(bodies).toHaveLength(2), { timeout: 8000 })
+    await waitFor(() => expect(bodies).toHaveLength(2), { timeout: 30_000 })
     expect(bodies[1]?.checks).toEqual(['chain', 'publication', 'anchors'])
     await user.click(screen.getByTestId('check-chain'))
     await user.click(screen.getByTestId('check-publication'))

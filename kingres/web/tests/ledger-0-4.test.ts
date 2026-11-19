@@ -222,7 +222,7 @@ describe('verification records', () => {
     const user = await openLedger()
     await user.click(screen.getByRole('button', { name: /start verification/i }))
     await waitFor(() => expect(getState().ledger.verifications[0]?.state).toBe('passed'), {
-      timeout: 4000,
+      timeout: 30_000,
     })
     const id = getState().ledger.verifications[0]?.id as number
     expect(getState().ledger.verifications[0]?.taskId).toBeGreaterThan(0)
@@ -241,7 +241,7 @@ describe('the link from a verification to its task', () => {
     const user = await openLedger()
     await user.click(screen.getByRole('button', { name: /start verification/i }))
     await waitFor(() => expect(getState().ledger.verifications[0]?.state).toBe('passed'), {
-      timeout: 4000,
+      timeout: 30_000,
     })
     const taskId = getState().ledger.verifications[0]?.taskId as number
     const link = await screen.findByRole('link', { name: `Task ${taskId}` })

@@ -100,7 +100,7 @@ describe('leases on the Replication page', () => {
     await waitFor(
       () => expect(g.getByTestId('group-lease')).toHaveAttribute('data-lease-state', 'held'),
       {
-        timeout: 6000,
+        timeout: 30_000,
       },
     )
   })

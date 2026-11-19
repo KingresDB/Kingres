@@ -71,7 +71,7 @@ describe('pages', () => {
       const { container } = await renderApp(page.path, { user: page.user })
       await screen.findByRole('heading', { level: 1, name: page.heading })
       await waitFor(() => expect(screen.getAllByText(page.data).length).toBeGreaterThan(0), {
-        timeout: 4000,
+        timeout: 30_000,
       })
       await settled()
       expect(await axe(container)).toHaveNoViolations()

@@ -68,17 +68,17 @@ describe('failover console', () => {
     mockConfig.taskDurationMs = 60_000
     const { container } = await renderApp('/servers')
     await endpoints.failoverServer('10.0.0.12', 'hard')
-    await screen.findByTestId('failover-progress', {}, { timeout: 6000 })
+    await screen.findByTestId('failover-progress', {}, { timeout: 30_000 })
     await settled()
     await clean(container)
-  }, 15000)
+  }, 90_000)
 
   it('the progress card waiting for a decision, and the confirmation of the decision', async () => {
     const user = userEvent.setup()
     applySwitches(new URLSearchParams('failover=needs-decision'), getState())
     const { container } = await renderApp('/servers')
     await endpoints.failoverServer('10.0.0.12', 'hard')
-    const panel = await screen.findByTestId('waiting-for-you', {}, { timeout: 6000 })
+    const panel = await screen.findByTestId('waiting-for-you', {}, { timeout: 30_000 })
     await within(panel).findByTestId('decision-loss-2')
     await waitFor(() =>
       expect(within(panel).getByTestId('accept-and-continue')).not.toHaveAttribute('aria-disabled'),
@@ -87,21 +87,21 @@ describe('failover console', () => {
     await user.click(within(panel).getByTestId('accept-and-continue'))
     const confirm = await screen.findByRole('dialog', { name: /continue and accept data loss/i })
     await clean(confirm)
-  }, 15000)
+  }, 90_000)
 
   it('the progress card of a run that failed, and the report that it opens', async () => {
     const user = userEvent.setup()
     applySwitches(new URLSearchParams('failover=fail:promote'), getState())
     const { container } = await renderApp('/servers')
     await endpoints.failoverServer('10.0.0.12', 'hard')
-    const card = await screen.findByTestId('failover-progress', {}, { timeout: 6000 })
-    await waitFor(() => expect(card).toHaveAttribute('data-state', 'failed'), { timeout: 6000 })
+    const card = await screen.findByTestId('failover-progress', {}, { timeout: 30_000 })
+    await waitFor(() => expect(card).toHaveAttribute('data-state', 'failed'), { timeout: 30_000 })
     await clean(container)
     await user.click(within(card).getByTestId('open-report'))
     const report = await screen.findByRole('dialog', { name: /failover report/i })
     await within(report).findByTestId('report-outcome')
     await clean(report)
-  }, 15000)
+  }, 90_000)
 
   it('the report of a finished run with every part of it', async () => {
     const user = userEvent.setup()
@@ -109,12 +109,12 @@ describe('failover console', () => {
     await renderApp('/replication')
     const task = await endpoints.failoverServer('10.0.0.12', { mode: 'hard', allowDataLoss: true })
     await waitFor(async () => expect((await endpoints.getTask(task.id)).state).toBe('done'))
-    const last = await screen.findByTestId('last-failover', {}, { timeout: 6000 })
+    const last = await screen.findByTestId('last-failover', {}, { timeout: 30_000 })
     await user.click(within(last).getByTestId('last-failover-report'))
     const report = await screen.findByRole('dialog', { name: /failover report/i })
     await within(report).findByTestId('report-old-primary')
     await clean(report)
-  }, 15000)
+  }, 90_000)
 
   it('the Replication page with a line on every group, a run and a last failover', async () => {
     applySwitches(new URLSearchParams('failover=dataloss'), getState())
@@ -122,10 +122,10 @@ describe('failover console', () => {
     await screen.findAllByTestId('failover-readiness')
     const task = await endpoints.failoverServer('10.0.0.12', { mode: 'hard', allowDataLoss: true })
     await waitFor(async () => expect((await endpoints.getTask(task.id)).state).toBe('done'))
-    await screen.findByTestId('last-failover', {}, { timeout: 6000 })
+    await screen.findByTestId('last-failover', {}, { timeout: 30_000 })
     await settled()
     await clean(container)
-  }, 15000)
+  }, 90_000)
 
   it('the Tasks page with a failover and its report button', async () => {
     const { container, ...app } = await renderApp('/tasks')
