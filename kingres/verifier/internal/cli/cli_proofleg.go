@@ -92,6 +92,9 @@ func (e *env) proofLegRun(r *result, a proofLegArgs) outcome {
 		return inputOut(err)
 	}
 	defer p.close()
+	if o := p.gate(); !o.ok() {
+		return o
+	}
 	r.notes = append(r.notes, p.notes...)
 	open := func() (io.ReadCloser, error) { return safefile.OpenArg(a.proofPath, maxProofSize) }
 	probe, err := open()
@@ -162,6 +165,7 @@ func (e *env) proofLegCore(r *result, p *pubInputs, open proof.Source, exp proof
 	r.info = map[string]any{"table_id": pr.TableID, "op": proof.OpName(pr.Op), "row_hash": format.EncodeHex(pr.RowHash[:]), "block_height": h,
 		"log_leg": a.leg, "chain_log": ol.cp.Origin, "chain_size": ol.cp.Size}
 	root := "signature of key " + describeSigners(ol.signers) + " on the checkpoint of the chain log"
+	var legInc []string // what the aggregate leg could not confirm (a stale or unconfirmed retired member)
 	if a.leg == "aggregate" {
 		aggID := a.aggID
 		if aggID == "" {
@@ -186,6 +190,7 @@ func (e *env) proofLegCore(r *result, p *pubInputs, open proof.Source, exp proof
 		if !out.ok() {
 			return out
 		}
+		legInc = rep.incomplete
 		var member aggregate.Member
 		for _, m := range rep.leaf.Members {
 			if (memberKey{m.ChainID, m.Epoch}) == key {
@@ -218,5 +223,8 @@ func (e *env) proofLegCore(r *result, p *pubInputs, open proof.Source, exp proof
 		"when the block was made: block times are the server's clock, and no anchor was checked",
 		"the row hash must be recomputed from data you hold (kingres-verify row-hash)",
 		"that the trust file was obtained outside the cluster: that is your responsibility")
+	if len(legInc) > 0 {
+		return outcome{kind: outIncomplete, missing: legInc}
+	}
 	return outcome{}
 }

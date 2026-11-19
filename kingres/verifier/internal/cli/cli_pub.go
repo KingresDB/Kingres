@@ -80,7 +80,11 @@ func tileOutcome(err error, where string) outcome {
 
 // pubInputs are the inputs of a command that reads several logs of one source.
 type pubInputs struct {
+	// trust is the file the signatures are verified under: the file the auditor pinned, narrowed by the
+	// verified key events of the publication (applyKeyEvents). base is the file as pinned, which the events
+	// themselves are verified under.
 	trust   *trust.File
+	base    *trust.File
 	spec    string // --source as given
 	src     pubsrc.Source
 	now     time.Time
@@ -92,6 +96,12 @@ type pubInputs struct {
 
 // loadPubInputs reads --trust and --now and opens the source. A problem is an input error.
 func loadPubInputs(trustPath, source string, nowFlag nowArg) (*pubInputs, error) {
+	return loadPubInputsOpt(trustPath, source, nowFlag, true)
+}
+
+// loadPubInputsOpt is loadPubInputs; with applyEvents false the key events are not read (trust follow reads them itself,
+// strictly, under the file as pinned).
+func loadPubInputsOpt(trustPath, source string, nowFlag nowArg, applyEvents bool) (*pubInputs, error) {
 	if trustPath == "" {
 		return nil, errors.New("missing --trust")
 	}
@@ -115,6 +125,18 @@ func loadPubInputs(trustPath, source string, nowFlag nowArg) (*pubInputs, error)
 	if source != "" {
 		if p.src, err = pubsrc.Open(source, pubsrc.Options{}); err != nil {
 			return nil, fmt.Errorf("--source: %w", err)
+		}
+	}
+	p.base = p.trust
+	if p.src != nil && applyEvents {
+		// the key events narrow the file for every command that judges a signature
+		p.walked = true
+		p.walk, p.walkErr = readEvents(p.base, p.src, false)
+		if p.walk != nil {
+			var kn []string
+			p.trust, kn = applyKeyEvents(p.base, p.walk)
+			p.notes = append(p.notes, kn...)
+			p.notes = append(p.notes, skippedNotes(p.walk)...)
 		}
 	}
 	return p, nil
@@ -194,7 +216,7 @@ func (p *pubInputs) openLog(spec logSpec, src pubsrc.Source) (*openedLog, []stri
 func (p *pubInputs) events() (*events.Walk, error) {
 	if !p.walked {
 		p.walked = true
-		p.walk, p.walkErr = events.Follow(p.trust, events.FromSource(p.src.ReadFile), false)
+		p.walk, p.walkErr = readEvents(p.base, p.src, false)
 	}
 	return p.walk, p.walkErr
 }

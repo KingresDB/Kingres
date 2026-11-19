@@ -53,8 +53,12 @@ func between(t *testing.T, steps ...func()) {
 }
 
 func (w *world) monitorArgs(srv *httptest.Server, state string, polls int, more ...string) []string {
-	return append([]string{"monitor", "--trust", w.trust, "--source", srv.URL, "--state", state, "--polls", fmtInt(polls), "--interval", "1ms", "--now", "2026-11-19T12:00:00Z",
+	args := append([]string{"monitor", "--trust", w.trust, "--source", srv.URL, "--state", state, "--polls", fmtInt(polls), "--interval", "1ms", "--now", "2026-11-19T12:00:00Z",
 		"--log", "chain:" + w.chains[0].idHex + ":e1", "--log", "aggregate:" + w.aggID}, more...)
+	if _, err := os.Stat(filepath.Join(state, monitorMeta)); err != nil {
+		args = append(args, "--init") // a first run is a run the user says is the first
+	}
+	return args
 }
 
 func fmtInt(n int) string { return itoa(n) }
@@ -241,7 +245,7 @@ func TestMonitorCatchesUpInSeveralRunsWhenTheAuditIsBounded(t *testing.T) {
 	if n < 3 {
 		t.Fatalf("the 8 blocks were read in %d step(s), expected several: %s", n, out)
 	}
-	meta, _, err := readMeta(st)
+	meta, _, err := readMeta(st, false)
 	if err != nil || meta.Audited["chain-"+a.idHex+"-e1"] != 8 {
 		t.Fatalf("%+v %v", meta, err)
 	}

@@ -110,6 +110,10 @@ func TestBundleVerifyRejectsEveryByteOfEveryFile(t *testing.T) {
 	w.addChain(b, 2)
 	w.appendRound(10_000_000, member(a, 2, 0), member(b, 2, 0))
 	w.appendRound(20_000_000, member(a, 3, 0), member(b, 2, 0))
+	// the events are part of the bundle: every byte of them is mutated too (V8-02: 825 positions of the event files were accepted)
+	w.event(0, "key-added", []signer{w.s1}, keyAddedLines(w.s1)...)
+	w.event(1, "key-added", []signer{w.s1, w.s2}, keyAddedLines(w.s2)...)
+	w.event(2, "key-retired", []signer{w.s2}, "key: "+b64pub(w.s1), "max-tree-size: unbounded")
 	w.bundleJSON()
 	var files []string
 	_ = filepath.WalkDir(w.dir, func(p string, d fs.DirEntry, err error) error {

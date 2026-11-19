@@ -6,22 +6,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io/fs"
-	"os"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/bundleidx"
-	"github.com/KingresDB/Kingres/kingres/verifier/internal/checkpoint"
-	"github.com/KingresDB/Kingres/kingres/verifier/internal/events"
-	"github.com/KingresDB/Kingres/kingres/verifier/internal/format"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/proof"
-	"github.com/KingresDB/Kingres/kingres/verifier/internal/pubsrc"
-	"github.com/KingresDB/Kingres/kingres/verifier/internal/signednote"
-	"github.com/KingresDB/Kingres/kingres/verifier/internal/tlog"
 )
 
 var regexp16 = regexp.MustCompile(`^[0-9a-f]{32}$`)
@@ -106,6 +97,9 @@ func (e *env) bundleVerifyRun(r *result, a bundleVerifyArgs) outcome {
 		return inputOut(err)
 	}
 	defer p.close()
+	if o := p.gate(); !o.ok() {
+		return o
+	}
 	r.notes = append(r.notes, p.notes...)
 	raw, err := p.src.ReadFile("bundle.json", bundleidx.MaxSize)
 	if err != nil {
@@ -345,7 +339,11 @@ func (e *env) bundleVerifyRun(r *result, a bundleVerifyArgs) outcome {
 	}
 	// events: a bundle that carries them is checked as `aggregate` checks them
 	if w, werr := p.events(); werr == nil && w.Count > 0 {
-		r.ok("events", fmt.Sprintf("%d event(s) read and verified under the trust file, %d chain(s) retired", w.Count, len(w.Retired)))
+		unverified := len(w.Skipped)
+		r.ok("events", fmt.Sprintf("%d event(s) read: %d verified under the trust file, %d NOT verified (no authorised key signed them), %d chain(s) retired by a verified event", w.Count, w.Count-unverified, unverified, len(w.Retired)))
+		if unverified > 0 {
+			inc = append(inc, fmt.Sprintf("%d event(s) of the bundle were read and are not verified: no key the trust chain authorises signed them (they are listed in the notes); a key they add or a key they revoke or retire is not known to this run", unverified))
+		}
 	} else if werr != nil {
 		if o := eventsOutcome(werr, "the events of the bundle could not be read"); o.kind == outIncomplete {
 			addInc(o)
@@ -407,281 +405,3 @@ func (e *env) layoutLogs(p *pubInputs) ([]logSpec, error) {
 	}
 	return out, nil
 }
-
-// ---- bundle fetch ----
-
-type bundleFetchArgs struct {
-	source, out, trust string
-	logs               []string
-	since              uint64
-	now                nowArg
-}
-
-func (e *env) runBundleFetch(args []string) int {
-	fs, asJSON := e.newFlagsWithExit("bundle fetch", "--source URL --out DIR --log LOG [--log LOG ...] [--trust FILE] [--since-size N] [--now TIME]",
-		"Mirror logs of a publication to a directory in the layout of the publication: keyring.json, events/*, and for each\n"+
-			"log its checkpoint, the tiles of that size and the entry bundles. --log is chain:<64 hex>:e<N> or\n"+
-			"aggregate:<64 hex> (an HTTP source cannot be listed). With --since-size N the tiles and bundles that end\n"+
-			"at or before leaf N are not fetched (you hold them from an earlier fetch). Names are made from numbers\n"+
-			"only, never from what the server says. With --trust every checkpoint is verified and the tiles are bound\n"+
-			"to the signed root; without it the copy is NOT verified and the output says so. Run bundle verify on the\n"+
-			"copy. Redirects are never followed; every request has a timeout.", exitTextWith3)
-	source := fs.String("source", "", "https address of the publication (or a directory)")
-	out := fs.String("out", "", "directory to write")
-	trustPath := fs.String("trust", "", "trust file: verify the checkpoints and bind the tiles to them")
-	var logs logListFlag
-	fs.Var(&logs, "log", "a log to fetch (repeatable)")
-	since := fs.Uint64("since-size", 0, "skip tiles and bundles that end at or before this leaf")
-	nowFlag := fs.String("now", "", "time for key validity windows, RFC 3339 (default: system clock)")
-	if code, done := e.parseFlags(fs, args); done {
-		return code
-	}
-	const cmd = "bundle fetch"
-	r := &result{cmd: cmd, word: "FETCHED"}
-	o := e.bundleFetchRun(r, bundleFetchArgs{source: *source, out: *out, trust: *trustPath, logs: logs, since: *since, now: nowOf(fs, nowFlag)})
-	switch o.kind {
-	case outInput:
-		return e.inputErrorInfo(cmd, *asJSON, o.err, r.inputInfo())
-	case outFailed:
-		return e.finishFailed(r, *asJSON, o.step, o.err)
-	case outIncomplete:
-		return e.finishIncomplete(r, *asJSON, o.missing)
-	}
-	return e.finishOK(r, *asJSON)
-}
-
-// fetcher writes what it reads below one directory (os.Root: no path leaves it).
-type fetcher struct {
-	src   pubsrc.Source
-	root  *os.Root
-	files int
-	bytes int64
-}
-
-func (f *fetcher) get(rel string, limit int64, skipIfSize int64) (data []byte, err error) {
-	if skipIfSize > 0 {
-		if st, serr := f.root.Stat(rel); serr == nil && st.Mode().IsRegular() && st.Size() == skipIfSize {
-			return nil, nil // immutable and already here
-		}
-	}
-	data, err = f.src.ReadFile(rel, limit)
-	if err != nil {
-		return nil, err
-	}
-	if dir := filepath.Dir(filepath.FromSlash(rel)); dir != "." {
-		if err := f.root.MkdirAll(dir, 0o755); err != nil {
-			return nil, fmt.Errorf("writing %s: %w", rel, err)
-		}
-	}
-	tmp := rel + ".part"
-	if err := f.root.WriteFile(tmp, data, 0o644); err != nil {
-		return nil, fmt.Errorf("writing %s: %w", rel, err)
-	}
-	if err := f.root.Rename(tmp, rel); err != nil {
-		_ = f.root.Remove(tmp)
-		return nil, fmt.Errorf("writing %s: %w", rel, err)
-	}
-	f.files++
-	f.bytes += int64(len(data))
-	return data, nil
-}
-
-func (e *env) bundleFetchRun(r *result, a bundleFetchArgs) outcome {
-	switch {
-	case a.source == "":
-		return inputOut(errors.New("missing --source"))
-	case a.out == "":
-		return inputOut(errors.New("missing --out"))
-	case len(a.logs) == 0:
-		return inputOut(errors.New("name the logs to fetch with --log: an HTTP source has no listing (a publication may serve logs.json, whose format is not defined yet)"))
-	}
-	var specs []logSpec
-	for _, l := range a.logs {
-		s, err := parseLogSpec(l)
-		if err != nil {
-			return inputOut(err)
-		}
-		if s.kind == "chain" && !s.hasEpoch {
-			return inputOut(fmt.Errorf("--log %s: give the epoch, chain:%s:e<N>", l, s.id))
-		}
-		specs = append(specs, s)
-	}
-	src, err := pubsrc.Open(a.source, pubsrc.Options{})
-	if err != nil {
-		return inputOut(fmt.Errorf("--source: %w", err))
-	}
-	defer src.Close()
-	if err := os.MkdirAll(a.out, 0o755); err != nil {
-		return inputOut(fmt.Errorf("--out %s: %w", a.out, err))
-	}
-	root, err := os.OpenRoot(a.out)
-	if err != nil {
-		return inputOut(fmt.Errorf("--out %s: %w", a.out, err))
-	}
-	defer root.Close()
-	f := &fetcher{src: src, root: root}
-	var p *pubInputs
-	if a.trust != "" {
-		if p, err = loadPubInputs(a.trust, "", a.now); err != nil {
-			return inputOut(err)
-		}
-		r.notes = append(r.notes, p.notes...)
-	}
-	// keyring and events
-	if _, err := f.get("keyring.json", 1<<20, 0); err != nil && !absent(err) {
-		return fetchOutcome(err, "keyring.json")
-	}
-	nev := 0
-	for seq := uint64(0); seq < events.MaxEvents; seq++ {
-		name := fmt.Sprintf("events/%06d", seq)
-		if _, err := f.get(name, signednote.MaxNoteSize, 0); err != nil {
-			if absent(err) {
-				break
-			}
-			return fetchOutcome(err, name)
-		}
-		nev++
-	}
-	r.ok("events", fmt.Sprintf("%d event(s) copied", nev))
-	for _, s := range specs {
-		rel := s.rel()
-		note, err := f.get(rel+"/checkpoint", signednote.MaxNoteSize, 0)
-		if err != nil {
-			return fetchOutcome(err, rel+"/checkpoint")
-		}
-		var size uint64
-		if p != nil {
-			in := p.logIn(s, src)
-			cp, _, notes, verr := in.verifyNote(note)
-			r.notes = appendNew(r.notes, notes)
-			if verr != nil {
-				var ie *inputErr
-				if errors.As(verr, &ie) {
-					return inputOut(ie.error)
-				}
-				step := "checkpoint"
-				var ce *checkpoint.Error
-				if errors.As(verr, &ce) {
-					step = ce.Step
-				}
-				return failedOut(step, fmt.Errorf("%s: %w", rel, verr))
-			}
-			size = cp.Size
-		} else {
-			n, err := signednote.Parse(note)
-			if err != nil {
-				return failedOut("parse", fmt.Errorf("%s: %w", rel, err))
-			}
-			cp, err := checkpoint.Parse(n.Text)
-			if err != nil || !strings.HasSuffix(cp.Origin, "/"+rel) {
-				return failedOut("checkpoint", fmt.Errorf("%s: the note is not a checkpoint of this log (the signature was not checked: no --trust)", rel))
-			}
-			size = cp.Size
-		}
-		nt, err := f.fetchTiles(rel, size, a.since)
-		if err != nil {
-			return fetchOutcome(err, rel)
-		}
-		r.ok("log "+s.kindAndShort(), fmt.Sprintf("checkpoint of size %d and %d tile/bundle file(s) copied", size, nt))
-		if p != nil {
-			mp := &pubInputs{trust: p.trust, spec: a.out, now: p.now}
-			if mp.src, err = pubsrc.OpenDir(a.out); err != nil {
-				return inputOut(err)
-			}
-			ol, _, out := mp.openLog(s, nil)
-			if out.ok() {
-				out = bindLog(ol, a.since)
-			}
-			mp.close()
-			if !out.ok() {
-				return out
-			}
-			r.ok("bind "+s.kindAndShort(), "the tiles copied lead to the signed root")
-		}
-	}
-	r.info = map[string]any{"files": f.files, "bytes": f.bytes, "verified": p != nil, "out": a.out}
-	r.headline = fmt.Sprintf("%d file(s), %d byte(s) copied to %s.", f.files, f.bytes, a.out)
-	if p == nil {
-		r.notes = append(r.notes, "the copy is NOT verified: no --trust was given")
-	}
-	if p == nil {
-		r.notProved = append(r.notProved, "everything: no --trust was given, so no signature was verified and the tiles were not bound to a root; run bundle verify on the copy")
-	} else {
-		r.notProved = append(r.notProved, "the entries behind the tiles and the events: bundle verify checks them")
-	}
-	return outcome{}
-}
-
-func fetchOutcome(err error, what string) outcome {
-	switch {
-	case errors.Is(err, pubsrc.ErrUnreachable) || absent(err):
-		return incompleteOut(fmt.Sprintf("%s could not be fetched: %v", what, err))
-	case errors.Is(err, pubsrc.ErrRedirect), errors.Is(err, pubsrc.ErrNoListing):
-		return inputOut(err)
-	}
-	return failedOut("fetch", fmt.Errorf("%s: %w", what, err))
-}
-
-// fetchTiles copies the tiles and entry bundles of the tree of a size.
-func (f *fetcher) fetchTiles(rel string, size, since uint64) (int, error) {
-	n := 0
-	get := func(name string, want int, immutable bool) error {
-		skip := int64(0)
-		if immutable {
-			skip = int64(want)
-		}
-		if _, err := f.get(rel+"/"+name, int64(want), skip); err != nil {
-			if absent(err) && strings.Contains(name, ".p/") {
-				return nil // a partial tile may be gone once the full tile exists (tlog-tiles)
-			}
-			return err
-		}
-		n++
-		return nil
-	}
-	for level := 0; tlog.TileHeight*level < 63; level++ {
-		count := size >> (tlog.TileHeight * uint(level))
-		if count == 0 {
-			break
-		}
-		full := count / tlog.TileWidth
-		for i := uint64(0); i < full; i++ {
-			if since > 0 && ((i+1)<<(tlog.TileHeight*uint(level+1))) <= since {
-				continue
-			}
-			if err := get(tlog.TilePath(level, i, tlog.TileWidth), tlog.FullTile, true); err != nil {
-				return n, err
-			}
-		}
-		if w := int(count % tlog.TileWidth); w > 0 {
-			if err := get(tlog.TilePath(level, full, w), w*tlog.HashSize, false); err != nil {
-				return n, err
-			}
-		}
-	}
-	spec := rel
-	maxEntry := format.BlockLeafSize
-	if strings.HasPrefix(spec, "a/") {
-		maxEntry = 1 << 16
-	}
-	full := size / tlog.TileWidth
-	for i := uint64(0); i < full; i++ {
-		if since > 0 && (i+1)*tlog.TileWidth <= since {
-			continue
-		}
-		if _, err := f.get(rel+"/"+tlog.EntriesPath(i, tlog.TileWidth), int64(tlog.TileWidth)*int64(2+maxEntry), 0); err != nil {
-			return n, err
-		}
-		n++
-	}
-	if w := int(size % tlog.TileWidth); w > 0 {
-		if _, err := f.get(rel+"/"+tlog.EntriesPath(full, w), int64(w)*int64(2+maxEntry), 0); err != nil && !absent(err) {
-			return n, err
-		} else if err == nil {
-			n++
-		}
-	}
-	return n, nil
-}
-
-var _ = fs.ErrNotExist

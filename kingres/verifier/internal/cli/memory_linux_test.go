@@ -99,6 +99,9 @@ func childRunWithin(t testing.TB, bound int64, args ...string) (code int, out st
 // buffers), and the bound is that plus a constant that holds the file a few
 // times. The first version used 2.0 to 2.4 GiB for the zeros.
 func TestPeakResidentSetOfACommandOnAHostileFile(t *testing.T) {
+	if raceDetector {
+		t.Skip("a bound on the resident set means nothing under the race detector, which multiplies the memory of the process")
+	}
 	if testing.Short() {
 		t.Skip("reads files of 16 MiB")
 	}

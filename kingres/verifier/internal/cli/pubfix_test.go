@@ -36,7 +36,8 @@ type chainFix struct {
 	entries [][]byte // leaf data of block i
 	leaves  []h32
 	hdrs    []format.Header
-	rows    []h32 // row hash of entry 0 of block i
+	rows    []h32    // row hash of entry 0 of block i
+	txids   []uint64 // the transaction id of block i (100+i unless makeChainTx says otherwise)
 }
 
 func rowHashOf(chain byte, i int) h32 { return sha([]byte{chain}, []byte(fmt.Sprintf("row %d", i))) }
@@ -50,6 +51,12 @@ type extraEntry struct {
 
 // makeChain makes n blocks. extra[i] lists entries added after entry 0 of block i.
 func makeChain(idb byte, n int, extra map[int][]extraEntry) *chainFix {
+	return makeChainTx(idb, n, extra, nil)
+}
+
+// makeChainTx is makeChain with the transaction id of each block chosen by txid (nil: 100+i); a test of a forged
+// publication can give two blocks one transaction id, which an honest chain never does.
+func makeChainTx(idb byte, n int, extra map[int][]extraEntry, txid func(i int) uint64) *chainFix {
 	c := &chainFix{epoch: 1}
 	for i := range c.id {
 		c.id[i] = idb
@@ -65,7 +72,12 @@ func makeChain(idb byte, n int, extra map[int][]extraEntry) *chainFix {
 			leaves = append(leaves, format.EntryLeafHash(uint32(j+1), x.table, x.op, x.row))
 		}
 		txRoot := refMTH(leaves)
-		txLeaf, err := format.BlockTxLeafHash(uint64(100+i), uint32(len(leaves)), txRoot, "alice")
+		tx := uint64(100 + i)
+		if txid != nil {
+			tx = txid(i)
+		}
+		c.txids = append(c.txids, tx)
+		txLeaf, err := format.BlockTxLeafHash(tx, uint32(len(leaves)), txRoot, "alice")
 		if err != nil {
 			panic(err)
 		}
@@ -103,7 +115,7 @@ func (c *chainFix) proofJSON(i int, extra []extraEntry, k int) []byte {
 	if op == format.OpDelete {
 		opS = "D"
 	}
-	doc := map[string]any{"format": 1, "chain_id": c.idHex, "table_id": table, "ledger_txid": 100 + i, "seq": k, "op": opS, "row_hash": hx(row), "entry_index": k, "entry_count": len(leaves),
+	doc := map[string]any{"format": 1, "chain_id": c.idHex, "table_id": table, "ledger_txid": c.txids[i], "seq": k, "op": opS, "row_hash": hx(row), "entry_index": k, "entry_count": len(leaves),
 		"entry_path": ps, "tx_root": hx(refMTH(leaves)), "user_name": "alice", "tx_index": 0, "tx_path": []string{}, "block": hdr, "chain": []any{}}
 	b, err := json.Marshal(doc)
 	if err != nil {

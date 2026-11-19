@@ -303,10 +303,9 @@ func exitRows(x *exitEnv) []exitRow {
 			return x.cp("--state", tmp("s", newSigner(7).note(x.p.origin, 300, refMTH(x.p.all[:300]))))
 		}),
 		never("applyState:fail#10", 2, "guard: verifyHeld returns only input errors"),
-		fn("applyState:fail#11", 2, func(t *testing.T) []string {
-			st := x.stateAt300()
-			return []string{"checkpoint", "--trust", x.p.trust, "--log", x.p.log(), "--source", x.p.trust, "--note", filepath.Join(x.p.logDir, "checkpoint"), "--state", st}
-		}),
+		// A source that cannot be opened ends the run when the inputs are loaded (the events of the source are read there, they decide
+		// which keys may vouch), so the later look at it cannot fail.
+		never("applyState:fail#11", 2, "guard: the source is opened, and its events read, when the inputs are loaded"),
 		// The read-back guard and the second look at the state are reached through
 		// the seam encodeStateFn, which sits between the decision and the write.
 		fn("applyState:fail#12", 2, func(t *testing.T) []string {
@@ -482,10 +481,7 @@ func exitRows(x *exitEnv) []exitRow {
 		}),
 		fn("runConsistency:finishFailed#2", 1, func(t *testing.T) []string { return x.co("--old", "701:"+nonEmptyRoot) }),
 		fn("runConsistency:finishFailed#3", 1, func(t *testing.T) []string { return x.co("--old", "700:"+nonEmptyRoot) }),
-		fn("runConsistency:inputError#10", 2, func(t *testing.T) []string {
-			return []string{"consistency", "--trust", x.p.trust, "--log", x.p.log(), "--source", x.p.trust, "--old", root300(),
-				"--new", tmp("n", x.p.signer.note(x.p.origin, 700, refMTH(x.p.all)))}
-		}),
+		never("runConsistency:inputError#10", 2, "guard: the source is opened, and its events read, when the inputs are loaded"),
 		never("runConsistency:inputError#11", 2, "guard: the tree size of a verified checkpoint is always valid"),
 		never("runConsistency:inputError#12", 2, "guard: an error of the proof that is neither a missing tile nor a damaged one"),
 		fn("runConsistency:finishIncomplete#1", 3, func(t *testing.T) []string {

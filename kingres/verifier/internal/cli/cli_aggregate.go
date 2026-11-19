@@ -128,17 +128,25 @@ func (p *pubInputs) verifyAggregate(r *result, id string, o aggOptions) (*aggRep
 		}
 		rep.checked[k] = true
 		detail := fmt.Sprintf("block %d, hash %x, is the leaf %d of the chain log whose size-%d root %x the member names; that root is a prefix of the signed chain log of size %d", m.Height, m.BlockHash[:8], m.Height, m.Size(), m.LogRoot[:8], cl.cp.Size)
-		switch {
-		case m.Retired():
-			if out := p.checkRetired(r, m); !out.ok() {
-				return nil, out
-			}
-		case m.Stale():
+		// The flags are judged together (the table is in the README): diverged is a failure whatever else is set,
+		// stale is never dropped, and a retired member needs its event, so that no combination turns a failure
+		// into "could not check" or a "could not check" into a pass.
+		if m.Stale() {
 			rep.incomplete = append(rep.incomplete, fmt.Sprintf("the group of chain %s was not read in round %d (flag stale): its head is the last good head, old news and not a claim about now", k, leaf.Seq))
 			detail += "; flagged stale"
 		}
 		if m.Diverged() {
 			diverged = append(diverged, k.String())
+			detail += "; flagged diverged"
+		} else if m.Retired() {
+			switch out := p.checkRetired(r, m, cl); out.kind {
+			case outOK:
+			case outIncomplete:
+				rep.incomplete = append(rep.incomplete, out.missing...)
+				detail += "; flagged retired, and the event that confirms it was not found"
+			default:
+				return nil, out
+			}
 		}
 		r.ok("member "+k.short(), detail)
 	}
@@ -245,7 +253,7 @@ func (c *chainChecker) check(r *result, m aggregate.Member) (*openedLog, outcome
 
 // checkRetired checks a member flagged retired against the chain-retired event of the publication: the
 // event must be signed by keys that the trust chain authorises, and name the head the member names.
-func (p *pubInputs) checkRetired(r *result, m aggregate.Member) outcome {
+func (p *pubInputs) checkRetired(r *result, m aggregate.Member, cl *openedLog) outcome {
 	k := memberKey{m.ChainID, m.Epoch}
 	w, err := p.events()
 	if err != nil {
@@ -260,6 +268,9 @@ func (p *pubInputs) checkRetired(r *result, m aggregate.Member) outcome {
 	}
 	if ev.FinalHeight != m.Height || ev.FinalBlockHash != m.BlockHash {
 		return failedOut("chain-retired", fmt.Errorf("the event %06d retires chain %s at height %d, block %x, and the aggregate member says height %d, block %x", ev.Seq, k, ev.FinalHeight, ev.FinalBlockHash[:8], m.Height, m.BlockHash[:8]))
+	}
+	if cl.cp.Size > ev.FinalHeight+1 {
+		return failedOut("chain-retired", fmt.Errorf("the event %06d retires chain %s at height %d (%d block(s)) and the signed log of that chain has size %d: a retired chain continues, which the event and the retired flag say it does not", ev.Seq, k, ev.FinalHeight, ev.FinalHeight+1, cl.cp.Size))
 	}
 	r.ok("chain-retired "+k.short(), fmt.Sprintf("event %06d (%s), signed by %d authorised key(s), names the head of the member", ev.Seq, ev.Reason, len(ev.SignedBy)))
 	return outcome{}
@@ -412,6 +423,9 @@ func (e *env) aggregateRun(r *result, trustPath, source, aggID, previous, chains
 		return inputOut(err)
 	}
 	defer p.close()
+	if o := p.gate(); !o.ok() {
+		return o
+	}
 	r.notes = append(r.notes, p.notes...)
 	var o aggOptions
 	if chainsFrom != "" {

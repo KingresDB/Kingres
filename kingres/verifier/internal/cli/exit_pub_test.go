@@ -79,11 +79,11 @@ func publicationRows(x *exitEnv) []exitRow {
 		fn("runMonitor:finishFailed#1", 1, func(t *testing.T) []string {
 			w, _, _ := stdWorld(t)
 			w.trust = w.writeTrust(newSigner(9)) // pins another key: the checkpoint does not verify
-			return []string{"monitor", "--trust", w.trust, "--source", w.dir, "--state", filepath.Join(testdir.New(t), "s"), "--once", "--log", "aggregate:" + w.aggID}
+			return []string{"monitor", "--trust", w.trust, "--source", w.dir, "--state", filepath.Join(testdir.New(t), "s"), "--init", "--once", "--log", "aggregate:" + w.aggID}
 		}),
 		fn("runMonitor:finishIncomplete#1", 3, func(t *testing.T) []string {
 			w := newWorld(t)
-			return []string{"monitor", "--trust", w.trust, "--source", w.dir, "--state", filepath.Join(testdir.New(t), "s"), "--once", "--log", "aggregate:" + w.aggID}
+			return []string{"monitor", "--trust", w.trust, "--source", w.dir, "--state", filepath.Join(testdir.New(t), "s"), "--init", "--once", "--log", "aggregate:" + w.aggID}
 		}),
 
 		fn("runAttestation:inputError#1", 2, func(t *testing.T) []string { return []string{"attestation"} }),

@@ -16,6 +16,9 @@ import (
 // whose peak resident set stays within a few MiB (less than 16) of that of a small input; held
 // in memory, the second would need some 150 MB for the headers and the file.
 func TestPeakResidentSetOfAProofDoesNotGrowWithItsChain(t *testing.T) {
+	if raceDetector {
+		t.Skip("a bound on the resident set means nothing under the race detector, which multiplies the memory of the process")
+	}
 	if testing.Short() {
 		t.Skip("writes files of some hundred MB")
 	}

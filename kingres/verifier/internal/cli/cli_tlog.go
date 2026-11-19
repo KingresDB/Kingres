@@ -296,6 +296,10 @@ func loadLogInputs(trustPath, logFlag, source string, nowFlag nowArg, noteGiven 
 			return nil, err
 		}
 	}
+	if err := in.applyEvents(); err != nil {
+		in.close()
+		return nil, err
+	}
 	return in, nil
 }
 
@@ -613,7 +617,9 @@ func (e *env) runConsistency(args []string) int {
 		}
 		r.ok("tiles", "no tile was needed: the proof is empty, nothing was read from the source")
 		if oldCP.Size == 0 {
-			r.ok("consistency", "the empty tree is a prefix of every tree: there is nothing to prove")
+			r.ok("consistency", "NOTHING WAS COMPARED: the empty tree is a prefix of every tree, so a log of size 0 held says nothing about the history of this one (any second root would be accepted)")
+			r.notProved = append(r.notProved, "that this log has anything to do with the one you held: the held checkpoint has size 0, an empty tree is a prefix of every tree, and nothing about a history was compared")
+			r.info["compared"] = false
 		} else {
 			r.ok("consistency", fmt.Sprintf("both checkpoints have size %d and the same root", oldCP.Size))
 			r.headline = fmt.Sprintf("the log at size %d is the same as the log at size %d.", newCP.Size, oldCP.Size)

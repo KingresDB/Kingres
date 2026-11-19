@@ -125,6 +125,14 @@ func (e *env) attestCore(r *result, in attestInput) outcome {
 	if apr.ChainID != row.ChainID {
 		return failedOut("attestation-chain", fmt.Errorf("the attestation row is in the chain %x and the row in the chain %x: an attestation belongs to the chain of its entry", apr.ChainID, row.ChainID))
 	}
+	// the attestation row is itself an entry of the chain: an insert, in the transaction of the entry it attests (ledger_attest runs
+	// in that transaction), so a row that was deleted, or that sits in another transaction, is not an attestation of this entry
+	if apr.Op != format.OpInsert {
+		return failedOut("attestation-row", fmt.Errorf("the entry of the attestation row is an operation %s: an attestation is an insert into the attestation table", proof.OpName(apr.Op)))
+	}
+	if apr.LedgerTxID != row.LedgerTxID {
+		return failedOut("attestation-row", fmt.Errorf("the entry of the attestation row is in transaction %d and the entry it attests in transaction %d: ledger_attest runs in the transaction of the entry", apr.LedgerTxID, row.LedgerTxID))
+	}
 	// (3) the attestation names the entry of the row proof
 	if att.LedgerTxID != row.LedgerTxID || att.Seq != row.Seq {
 		return failedOut("attestation-entry", fmt.Errorf("the attestation row names transaction %d, entry %d; the proof of the row is for transaction %d, entry %d", att.LedgerTxID, att.Seq, row.LedgerTxID, row.Seq))
@@ -289,6 +297,9 @@ func (e *env) attestationRun(r *result, a attestArgs) outcome {
 		return inputOut(err)
 	}
 	defer p.close()
+	if o := p.gate(); !o.ok() {
+		return o
+	}
 	r.notes = append(r.notes, p.notes...)
 	an := &anchorer{p: p, leg: a.leg, aggID: a.aggID, epoch: a.epoch}
 	if a.digest != "" {

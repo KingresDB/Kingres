@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/KingresDB/Kingres/kingres/verifier/internal/events"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/trust"
 )
 
@@ -55,7 +54,7 @@ func (e *env) trustFollowRun(r *result, trustPath, source, out string, now nowAr
 	if out == "" {
 		return inputOut(errors.New("missing --out: the new trust file is written beside the old one, never over it"))
 	}
-	p, err := loadPubInputs(trustPath, source, now)
+	p, err := loadPubInputsOpt(trustPath, source, now, false)
 	if err != nil {
 		return inputOut(err)
 	}
@@ -67,20 +66,20 @@ func (e *env) trustFollowRun(r *result, trustPath, source, out string, now nowAr
 	if _, err := os.Lstat(out); err == nil {
 		return inputOut(fmt.Errorf("--out %s exists: it is not overwritten", out))
 	}
-	w, err := events.Follow(p.trust, events.FromSource(p.src.ReadFile), true)
+	w, err := readEvents(p.base, p.src, true)
 	if err != nil {
 		return eventsOutcome(err, "the events of the publication could not be read")
 	}
 	if w.Count == 0 {
 		return incompleteOut("the publication holds no event: not even the event of the first key (events/000000). It may have been withheld; nothing was followed and nothing was written")
 	}
-	nf := &trust.File{OriginPrefix: p.trust.OriginPrefix, TSARoots: p.trust.TSARoots, ClientKeys: p.trust.ClientKeys}
+	nf := &trust.File{OriginPrefix: p.base.OriginPrefix, TSARoots: p.base.TSARoots, ClientKeys: p.base.ClientKeys}
 	byFP := map[string]trust.Key{}
-	for _, k := range p.trust.Keys {
+	for _, k := range p.base.Keys {
 		byFP[k.Fingerprint] = k
 	}
 	names := map[string]bool{}
-	for _, k := range p.trust.Keys {
+	for _, k := range p.base.Keys {
 		names[k.Name] = true
 	}
 	changes := 0
