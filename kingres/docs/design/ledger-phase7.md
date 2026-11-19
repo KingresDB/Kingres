@@ -3027,6 +3027,7 @@ The number 159 is not used.
     for it); the test of a target and a log line at start warn when the table of real headers is
     older than a year. The outcome "anchored" through a header source is not tested through the
     control plane, since a real header cannot be made in a test.
+
 190. **A verified event that revokes or retires a key counts in every command of the verifier that
     judges a signature**, by the rule of 165 and 168: a checkpoint vouched for only by a key that a
     verified event of the same evidence revoked, or that lies above the bound of a retired key, is a
@@ -3046,7 +3047,6 @@ The number 159 is not used.
 195. **`bundle fetch` is bounded** by a number of files and of bytes when no trust file is given,
     checks the size a checkpoint claims against that bound before it requests a tile, and compares
     what it already holds before it replaces anything.
-
 
 Built of step 10: the anchoring framework and the WORM target. Not built in it: the publication of
 evidence files under the publication root, the cluster settings for the limits of retries (the
