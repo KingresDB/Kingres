@@ -220,6 +220,23 @@ export function failoverPlan(
 
 /** What a restore of the preferred primaries would do (the groups that run away from their home server). */
 export function restorePlan(s: MockState, ids?: number[]): S['FailoverPlan'] {
+  // The same switches as a failover (`?failover=blocked:...`) reach a restore: a lost majority is a refusal, the others are blockers.
+  if (mockConfig.failoverBlock === 'quorum')
+    throw problem('quorum_unavailable', 'This server cannot hear a majority of the servers.')
+  const blockers: S['FailoverBlocker'][] = []
+  if (mockConfig.failoverBlock === 'lease')
+    blockers.push({
+      code: 'lease_settings_differ',
+      shardGroupId: null,
+      message:
+        'The servers do not use the same lease duration and margin (10 s and 4 s on 10.0.0.12).',
+    })
+  if (mockConfig.failoverBlock === 'rebalance')
+    blockers.push({
+      code: 'rebalance_in_progress',
+      shardGroupId: null,
+      message: 'A rebalance is running and did not stop within a minute.',
+    })
   const groups = s.groups
     .filter((g) => g.primaryServerId !== g.preferredPrimaryServerId && (!ids || ids.includes(g.id)))
     .map((g): S['FailoverGroupPlan'] => ({
@@ -239,8 +256,8 @@ export function restorePlan(s: MockState, ids?: number[]): S['FailoverPlan'] {
     kind: 'restorePreferredPrimaries',
     mode: 'restore',
     serverId: null,
-    canProceed: true,
-    blockers: [],
+    canProceed: blockers.length === 0,
+    blockers,
     willStopRebalance: false,
     groups,
   }

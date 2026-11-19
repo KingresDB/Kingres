@@ -451,6 +451,25 @@ KINGRES_API_SPEC=openapi-copy.yaml npm test
 `scripts/gen-api.mjs` and the contract tests read the same variable, so `npm run api:generate` with it set regenerates from that
 copy. Adapting to the next revision is a separate step.
 
+### The failover console, part 3 (increment 8, after increment 7: the switchover and the restore)
+
+- **Switch over...** (`ReplicationPage.vue`, on every group card, `GateButton op="failoverServer"`, `kingres_ops`): the planned switchover of that one group. It is
+  `FailoverDialog` with the prop `group`: the mode is graceful and fixed, the server is the one that runs the primary of the group, only the standby is chosen
+  (the default is the one that holds the most WAL), then the plan (a dry run with `shardGroupIds: [group]`), then **Switch over**. No typed address and no decision about
+  lost data: a switchover loses no commit (`allowDataLoss` is ignored by it). The button is blocked with the reason when the group has no primary, no standby, or the
+  servers are not read yet.
+- **Restore preferred primaries** (header of the Replication page, `kingres_ops`): the header says how many groups are away from their preferred server and the button is
+  blocked with the reason when none is. `RestorePrimariesDialog.vue` has its own plan view: the groups that are away (from server X back to server Y; the map group says it moves
+  the manager), then the plan (`previewRestore`, a dry run: the time writes pause, the steps, the blockers), then **Restore primaries**. All of the groups that are away are sent
+  as no list (so that a group that comes back meanwhile is not left out by a stale list); a group left out is sent as `shardGroupIds`.
+- **Refusals** in words, in the dialog, for the plan and for the start, with the same codes as a failover (`FailoverRefusal`): `quorum_unavailable`, `lease_settings_differ`,
+  `rebalance_in_progress`, `failover_in_progress`, `operation_in_progress`, `no_replica_available`, `version_mismatch`. A blocker of the plan is listed and the start stays disabled.
+  `unsupported_operation` is the calm "Not available on this server version yet": for a restore it says that restoring the preferred primaries is not part of this server version
+  yet, for a switchover that the planned switchover of a group is not (without sending the person to the hard mode), and "Nothing was changed".
+- **Mock.** A restore plan carries the blockers of `?failover=blocked:lease` and `blocked:rebalance` (and `blocked:quorum` is a refusal); a restore start is refused with
+  `failover_in_progress` while a failover runs and with the blocker's code; `?unsupported=restorePreferredPrimaries` is the server of today for the restore; the switchover
+  is "not available" until `?failover=graceful`. Tests: `failover-console-part3.test.ts`; browser states: the switchover plan, the switchover not available, the restore plan.
+
 ## What the panel does for contract 0.12.0
 
 Contract 0.12.0 adds no operation (132) and four small things that the panel follows: the new outcome `completedWithWarnings`, the plan in the problem

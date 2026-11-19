@@ -18,11 +18,10 @@ import ReplicaCountDialog from '@/components/ReplicaCountDialog.vue'
 import FailoverProgress from '@/components/FailoverProgress.vue'
 import FailoverReadiness from '@/components/FailoverReadiness.vue'
 import FailoverReportDialog from '@/components/FailoverReportDialog.vue'
-import TaskActionDialog from '@/components/TaskActionDialog.vue'
+import FailoverDialog from '@/components/FailoverDialog.vue'
+import RestorePrimariesDialog from '@/components/RestorePrimariesDialog.vue'
 import TaskProgress from '@/components/TaskProgress.vue'
-import { endpoints } from '@/api/endpoints'
 import {
-  keys,
   useAlerts,
   useClusterSettings,
   useFailoverStatus,
@@ -36,6 +35,7 @@ import { groupLabel } from '@/lib/cluster'
 import { commitRule, managedStandbyId } from '@/lib/standby'
 import { formatAgo, formatBytes, formatLag } from '@/lib/format'
 import { useSessionStore } from '@/stores/session'
+import type { ShardGroup } from '@/api/types'
 
 const session = useSessionStore()
 const route = useRoute()
@@ -55,6 +55,18 @@ const failover = useFailoverStatus(() => session.can('getFailoverStatus'))
 const lastFailover = computed(() => failover.data.value?.lastReport ?? null)
 const reportId = ref<number | null>(null)
 const restoring = ref(false)
+// "Switch over..." on a group card: the planned switchover of that group (graceful failover of one group).
+const switching = ref<number | null>(null)
+const switchGroup = computed(() => groups.value.find((g) => g.id === switching.value) ?? null)
+const switchServer = computed(() =>
+  servers.data.value?.items.find((s) => s.id === switchGroup.value?.primary?.serverId),
+)
+function switchBlocked(g: ShardGroup): string {
+  if (!g.primary) return 'This group has no primary to hand over from.'
+  if (g.standbys.length === 0) return 'This group has no standby to hand over to.'
+  if (!servers.data.value) return 'The servers are still being read.'
+  return ''
+}
 const changingCount = ref(false)
 
 const replicaCount = computed(() => settings.data.value?.defaultReplicaCount ?? null)
@@ -91,9 +103,18 @@ watch(
     subtitle="Primary, standbys, leases and commit rule of every group."
   >
     <template #actions>
+      <span class="muted" data-testid="displaced-count">
+        {{
+          displaced.length === 0
+            ? 'Every group is on its preferred server.'
+            : `${displaced.length} ${displaced.length === 1 ? 'group is' : 'groups are'} away from the preferred server.`
+        }}
+      </span>
       <GateButton
         op="restorePreferredPrimaries"
-        :disabled="displaced.length === 0"
+        :blocked-reason="
+          displaced.length === 0 ? 'Every group is already on its preferred server.' : ''
+        "
         @click="restoring = true"
       >
         Restore preferred primaries
@@ -198,6 +219,15 @@ watch(
           <span class="row">
             <span class="muted">Preferred primary: server {{ g.preferredPrimaryServerId }}</span>
             <StatusBadge :meta="GROUP_HEALTH[g.health]" />
+            <GateButton
+              op="failoverServer"
+              small
+              :blocked-reason="switchBlocked(g)"
+              :aria-label="`Switch over ${groupLabel(g.id, g.isMapGroup)}`"
+              :data-testid="`switch-${g.id}`"
+              @click="switching = g.id"
+              >Switch over...</GateButton
+            >
           </span>
         </div>
         <div class="grid-2">
@@ -315,19 +345,13 @@ watch(
     </div>
   </QueryBoundary>
 
-  <TaskActionDialog
-    v-if="restoring"
-    title="Restore preferred primaries"
-    confirm-label="Restore primaries"
-    :start="() => endpoints.restorePreferredPrimaries()"
-    :invalidate="[keys.topology, keys.servers]"
-    @close="restoring = false"
-  >
-    <p>
-      {{ displaced.length }} shard group(s) switch back to their home server. Connections to those
-      primaries are interrupted for a moment.
-    </p>
-  </TaskActionDialog>
+  <RestorePrimariesDialog v-if="restoring" @close="restoring = false" />
+  <FailoverDialog
+    v-if="switchGroup && switchServer"
+    :server="switchServer"
+    :group="switchGroup"
+    @close="switching = null"
+  />
   <FailoverReportDialog v-if="reportId !== null" :report-id="reportId" @close="reportId = null" />
   <ReplicaCountDialog
     v-if="changingCount && replicaCount !== null"

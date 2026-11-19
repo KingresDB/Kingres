@@ -2194,9 +2194,13 @@ export function createHandlers(): HttpHandler[] {
       const s = c.s
       const req = body<S['RestorePreferredPrimariesRequest']>(c)
       requireNoRebalance(s)
-      if (req.dryRun === true) return ok(restorePlan(s, req.shardGroupIds))
+      const planned = restorePlan(s, req.shardGroupIds)
+      if (req.dryRun === true) return ok(planned)
       if (activeTask(s, 'replication.restorePreferredPrimaries'))
         throw problem('operation_in_progress')
+      if (failoverRunning(s)) throw problem('failover_in_progress')
+      const stuck = planned.blockers[0]
+      if (stuck) throw problem(stuck.code as Parameters<typeof problem>[0], stuck.message)
       return accepted(
         createTask(s, {
           kind: 'replication.restorePreferredPrimaries',

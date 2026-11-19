@@ -428,7 +428,9 @@ export interface FailoverRefusal {
 }
 
 export interface RefusalContext {
-  mode: 'hard' | 'graceful'
+  mode: 'hard' | 'graceful' | 'restore'
+  /** The dialog is the switchover of one group (the words do not send the person to the hard mode). */
+  switchover?: boolean
   /** The request names the map group (the manager of the cluster moves with it). */
   includesMapGroup: boolean
 }
@@ -543,7 +545,13 @@ export function failoverRefusal(error: unknown, ctx: RefusalContext): FailoverRe
       }
     case 'unsupported_operation': {
       const parts: string[] = []
-      if (ctx.mode === 'graceful')
+      if (ctx.mode === 'restore')
+        parts.push(
+          'Restoring the preferred primaries (a planned switchover of every group that runs away from its home server) is not part of this server version yet.',
+        )
+      else if (ctx.mode === 'graceful' && ctx.switchover)
+        parts.push('The planned switchover of a group is not part of this server version yet.')
+      else if (ctx.mode === 'graceful')
         parts.push(
           'The planned switchover (graceful) is not part of this server version yet. A server that is down needs the hard mode.',
         )

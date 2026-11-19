@@ -336,6 +336,28 @@ const mockSwitch = async (page: Page, value: string) => {
   await sleep(300)
 }
 
+/** Puts two groups on the standby of their home server, as after a failover, and makes the pages read again. */
+async function awayGroups(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const mock = (
+      window as unknown as {
+        __kingresMock: {
+          state: () => {
+            groups: { id: number; primaryServerId: string; standbyServerIds: string[] }[]
+          }
+        }
+      }
+    ).__kingresMock
+    for (const g of mock.state().groups)
+      if ((g.id === 1 || g.id === 2) && g.standbyServerIds[0])
+        g.primaryServerId = g.standbyServerIds[0]
+    void (
+      window as unknown as { __queryClient: { invalidateQueries: () => unknown } }
+    ).__queryClient.invalidateQueries()
+  })
+  await sleep(500)
+}
+
 /** Opens the failover dialog of a server on the Servers page. */
 async function openFailoverDialog(page: Page, server: string): Promise<void> {
   const ok = await page.evaluate((id) => {
@@ -405,6 +427,7 @@ const freshFailover = async (page: Page): Promise<void> => {
     failoverDataLoss: false,
     failoverNeedsDecision: false,
     failoverWarnings: false,
+    failoverGraceful: false,
     failoverNoPlan: false,
     failoverOld: null,
     failoverFailStep: null,
@@ -1007,6 +1030,65 @@ export const STATES: PageState[] = [
       await page.click('[role="dialog"] [data-dialog-close]')
       await sleep(150)
       await leaveFailover(page)
+    },
+  },
+  {
+    // 0.12.0, failover console part 3: the planned switchover of one group (the server version that builds it, and one that does not).
+    name: 'switchover of a group: the plan (0.12.0)',
+    needsMock: true,
+    route: '/replication',
+    open: async (page) => {
+      await freshFailover(page)
+      await mockSwitch(page, 'graceful')
+      await clickLabeled(page, 'Switch over Shard group 2')
+      await dialogOpen(page)
+      await clickText(page, 'Show the plan', '[role="dialog"] button')
+      await page.waitForSelector('[role="dialog"] [data-testid="failover-plan"]', {
+        timeout: 20_000,
+      })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await cancel(page)
+      await freshFailover(page)
+    },
+  },
+  {
+    name: 'switchover of a group: not available on this server version (0.12.0)',
+    needsMock: true,
+    route: '/replication',
+    open: async (page) => {
+      await freshFailover(page)
+      await clickLabeled(page, 'Switch over Shard group 2')
+      await dialogOpen(page)
+      await clickText(page, 'Show the plan', '[role="dialog"] button')
+      await page.waitForSelector('[role="dialog"] [data-testid="failover-refusal"]', {
+        timeout: 20_000,
+      })
+      await sleep(250)
+    },
+    close: cancel,
+  },
+  {
+    name: 'restore preferred primaries: the groups and the plan (0.12.0)',
+    needsMock: true,
+    route: '/replication',
+    open: async (page) => {
+      await freshFailover(page)
+      await awayGroups(page)
+      await clickText(page, 'Restore preferred primaries')
+      await dialogOpen(page)
+      await page.waitForSelector('[data-testid="restore-groups"]', { timeout: 20_000 })
+      await sleep(200)
+      await clickText(page, 'Show the plan', '[role="dialog"] button')
+      await page.waitForSelector('[role="dialog"] [data-testid="failover-plan"]', {
+        timeout: 20_000,
+      })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await cancel(page)
+      await freshFailover(page)
     },
   },
   {
