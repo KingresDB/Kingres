@@ -2542,3 +2542,39 @@ table that has an index.
 
 What C6b finds: a function from a row number to a TID, the numbers returned by the insert paths, one
 place that decides whether a buffer reserves, and no fetch by TID yet for rows still in a buffer.
+
+### C6b, B-tree indexes that are not unique (2026-11-19)
+
+No change of the on-disk format, the catalog or the WAL beyond C6a.
+
+- **The TID of a row** is its row number: block `number / 2048`, offset `number % 2048 + 1`.
+- **No bitmap scans.** The bitmap of the server holds at most `MaxHeapTuplesPerPage` (291) offsets
+  per block and a columnar block has 2048, so the method offers none; no index-only scans, for the
+  lack of a visibility map; no parallel index scans. Ordered and backward scans, merge joins and
+  nested loops with an inner index scan work. PostgreSQL 18 has a hook where the planner reads the
+  properties of an index and 19 has not, so the properties are cleared in the path-list hook and
+  the index paths are made again: one source for both majors.
+- **The cost of a fetch** is one chunk group with all its columns, kept for the next fetch of the
+  same group. On 4 million rows a point lookup took 0.8 ms where a heap table took 0.2 ms; a range
+  of one percent took 11 ms by the index against 425 ms by the scan (a shared machine: indicative).
+- **The first index of a table whose rows the transaction still holds in memory**: the build writes
+  the rows of the running subtransaction first, so they get their numbers; rows of an enclosing
+  subtransaction, or rows a cursor holds, make the statement fail.
+- **`VACUUM` leaves the entries of rolled-back rows** in the index until C6c; the fetch filters
+  them, since a number that no visible stripe and no buffer of the transaction has answers nothing.
+- **Refused until later increments**: unique indexes, primary keys and unique constraints (C6c);
+  `columnar_compact` on a table with an index (C6d). Refused for good: `CONCURRENTLY` builds, which
+  are refused before anything is made, the other index methods, `CLUSTER`, exclusion constraints,
+  and an index on a file written by 0.1, which must be rewritten first.
+- **A parallel index build** uses the parallel-scan callbacks of the access method with a shared
+  counter of stripes; it is refused when the transaction holds unwritten rows.
+- **The memory of reservation** (the open point of C6a) is about 0.7 kB of private memory per
+  stripe reserved in a transaction; the 27 MB seen before was shared memory that a process counts
+  when it first touches pages.
+- **`columnar_check` does not compare index entries with stripes** yet; it comes with index vacuum.
+- **Open.** One guard of the fetch (a row offset beyond the visible rows of a stripe) is neither
+  reached by a test nor proven unreachable.
+
+For the conversion of partitions in `kingres_timepart`: the refusal of a partition whose parent has
+an index can be lifted for B-tree indexes that are not unique once the conversion creates them on
+the new table; unique indexes of the parent wait for C6c.
