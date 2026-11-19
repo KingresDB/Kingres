@@ -23,6 +23,8 @@ type Info struct {
 	ExtraHosts []string
 	// CABundle is the path of a PEM bundle ("" for none); CARequired says the kind needs one.
 	CABundle string
+	// TLSSystemRoots says that the connection is checked against the roots of the system and the CA bundle is for something else (the token).
+	TLSSystemRoots bool
 	// Warnings are texts the operator is told with the result of a create or a test (not errors).
 	Warnings []string
 }
@@ -34,6 +36,8 @@ type BuildEnv struct {
 	Info   Info
 	Creds  Creds
 	Egress *Egress
+	// CAPEM is the content of the CA bundle ("" when there is none).
+	CAPEM []byte
 	// Client is made from the egress rule and the CA bundle of the configuration.
 	Client *http.Client
 	Clock  anchor.Clock
@@ -53,6 +57,8 @@ type Kind struct {
 	// CARequired says that the kind needs a CA bundle in its configuration (the token of an authority is checked
 	// against it); a kind that does not takes the roots of the system when there is none.
 	CARequired bool
+	// CheckBundle, when set, checks the content of the CA bundle when the target is made.
+	CheckBundle func(pem []byte) error
 	// Build makes the target.
 	Build func(env BuildEnv) (anchor.Target, error)
 	// Timeouts returns how long a submitted and a claimed record may wait before it expires (zero: never) for a

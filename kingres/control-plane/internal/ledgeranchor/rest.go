@@ -146,7 +146,11 @@ func (s *Service) shape(kind *Kind, rawCfg, rawCreds json.RawMessage) (shaped, *
 		return sh, problem.Validation("The configuration is not valid.", fieldErr("/config", clean(err.Error()), "invalid"))
 	}
 	if info.CABundle != "" {
-		if _, err := LoadPool(info.CABundle); err != nil {
+		if pem, err := ReadBundle(info.CABundle); err != nil {
+			return sh, problem.Validation("The configuration is not valid.", fieldErr("/config/caBundlePath", clean(err.Error()), "invalid"))
+		} else if kind.CheckBundle != nil && kind.CheckBundle(pem) != nil {
+			return sh, problem.Validation("The configuration is not valid.", fieldErr("/config/caBundlePath", "the bundle is not a set of trust anchors for this kind (it needs a self-signed certificate)", "invalid"))
+		} else if _, err := LoadPool(info.CABundle); err != nil {
 			return sh, problem.Validation("The configuration is not valid.", fieldErr("/config/caBundlePath", clean(err.Error()), "invalid"))
 		}
 	} else if kind.CARequired {

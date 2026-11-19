@@ -3258,3 +3258,12 @@ vanished database.
   keep the whole publication (these files, and two successive checkpoints of each log by saving twice with a round in between) needs a cluster run of the test on both majors, which this round could not queue; it is the first thing
   to do before the verifier's writer regenerates `kingres/verifier/testdata/publication`. The 305 blocks of a chain where the test wrote 5 rows are not explained yet: the builder's schedule, a block per digest and the
   blocks of the extension's own tables are the candidates, and whether a quiet database grows by itself is to be measured on a cluster (the number of blocks after an idle hour).
+
+### The RFC 3161 target (phase 7, step 12; correction 184)
+
+`kind_tsa.go` registers the kind `tsa` over `internal/anchor/tsa`. The configuration is the library's: `url` (http or https, no user information, no query), `caBundlePath` (required: the trust anchors and intermediates that the **token** is checked against; it must hold a
+self-signed certificate), `policyOid`, `hashAlgorithm` (`sha256`), `timeoutSeconds`, `maxSkewSeconds`, `signerKeySha256` (the pin of one authority) and `allowInsecure` (needed to send the Basic credentials over http). The TLS connection to
+the authority is checked against the roots of the system, not against that bundle (the chain of a token and the certificate of the server are two matters). The credentials are an optional HTTP Basic pair (`username` and `password` go together). A
+record is `anchored` at once on a token the library verified in full (message imprint, nonce, chain at `genTime` and now, key usage, names); every refusal of 6.4 is a failed record with the code of the library in the alert. Requests go to the
+host and port of `url` only (the egress rule). `downloadLedgerAnchor?format=tsr` gives the DER of the time-stamp token (the CMS ContentInfo from the evidence), not a whole TimeStampResp, which the cluster does not keep. The Test button
+asks for a real token for the hash of an empty string and verifies it.

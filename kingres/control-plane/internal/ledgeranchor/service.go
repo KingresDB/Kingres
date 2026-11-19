@@ -219,22 +219,28 @@ func (s *Service) build(row TargetRow) (*Built, error) {
 		eg.Dial = func(ctx context.Context, n, a string) (net.Conn, error) { return s.cfg.Dial(ctx, n, a) }
 	}
 	var roots *x509.CertPool
-	switch {
-	case info.CABundle != "":
-		roots, err = LoadPool(info.CABundle)
-		if err != nil {
+	var capem []byte
+	if info.CABundle != "" {
+		if capem, err = ReadBundle(info.CABundle); err != nil {
 			return nil, err
 		}
-	case k.CARequired:
-		return nil, errors.New("a CA bundle is required")
-	default:
-		roots, err = s.cfg.Roots()
-		if err != nil {
-			return nil, errors.New("the system roots cannot be read: name a CA bundle (caBundlePath)")
+		if k.CheckBundle != nil {
+			if err := k.CheckBundle(capem); err != nil {
+				return nil, err
+			}
 		}
+	} else if k.CARequired {
+		return nil, errors.New("a CA bundle is required")
+	}
+	if info.CABundle != "" && !info.TLSSystemRoots {
+		if roots, err = LoadPool(info.CABundle); err != nil {
+			return nil, err
+		}
+	} else if roots, err = s.cfg.Roots(); err != nil {
+		return nil, errors.New("the system roots cannot be read: name a CA bundle (caBundlePath)")
 	}
 	hc := eg.Client(roots)
-	t, err := k.Build(BuildEnv{Config: norm, Info: info, Creds: creds, Egress: eg, Client: hc, Clock: anchor.Clock(s.now), TargetID: row.ID})
+	t, err := k.Build(BuildEnv{Config: norm, Info: info, Creds: creds, Egress: eg, Client: hc, Clock: anchor.Clock(s.now), TargetID: row.ID, CAPEM: capem})
 	if err != nil {
 		return nil, redactErr(err, creds)
 	}

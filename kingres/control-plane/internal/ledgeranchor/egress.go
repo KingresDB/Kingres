@@ -152,3 +152,16 @@ func LoadPool(path string) (*x509.CertPool, error) {
 	}
 	return pool, nil
 }
+
+// ReadBundle reads a PEM bundle (a regular file of at most 1 MiB).
+func ReadBundle(path string) ([]byte, error) {
+	st, err := os.Stat(path)
+	if err != nil || !st.Mode().IsRegular() || st.Size() > 1<<20 {
+		return nil, errors.New("the CA bundle cannot be read (it must be a regular file of at most 1 MiB)")
+	}
+	b, err := os.ReadFile(path) // #nosec G304 -- the path is configured by the administrator
+	if err != nil {
+		return nil, errors.New("the CA bundle cannot be read")
+	}
+	return b, nil
+}
