@@ -2643,3 +2643,72 @@ the new table; unique indexes of the parent wait for C6c.
 - **A conversion cannot end with `VACUUM`**: PostgreSQL refuses it inside a function or procedure,
   also after a `COMMIT`. The conversion runs `ANALYZE`; whoever schedules it runs `VACUUM` afterwards
   as a statement of its own.
+
+### C7, logical decoding of inserts (2026-11-19)
+
+- **The record.** Every stripe that is not a compaction copy also writes `LOGICAL_INSERT`
+  records (`XLOG_KC_LOGICAL`, no page): the rows as heap tuples, 512 rows or about 1 MB to a
+  record, by the transaction or subtransaction that writes the stripe, with its origin. They are
+  written only when `wal_level = logical` and the table is logically logged, so the WAL of a load
+  roughly doubles there and is unchanged at any other level. Redo ignores them, so standbys and
+  base backups are not affected.
+- **`rm_decode`** queues one insert per tuple, as `heap_decode` does for an insert; the same
+  source builds on both majors. Inside one transaction the order across tables is not the
+  statement order (rows are decoded when their stripe is written: at commit, at prepare, or at a
+  flush by size or memory); the order within a table is.
+- **Subtransactions and two-phase.** The xid of a record is the one whose commit makes the
+  stripe visible, so a stripe flushed inside a subtransaction that rolls back is dropped with it.
+  The stripe is written at `PREPARE`, so two-phase decoding holds the rows until
+  `COMMIT PREPARED`.
+- **The guard.** A publication that names a columnar table is accepted now. Still refused, once a
+  columnar table exists: a publication that would include the stripe catalog
+  `kingres.columnar_stripe` (`FOR ALL TABLES`, `FOR TABLES IN SCHEMA kingres`), whose rows a
+  subscriber must not apply. Only inserts exist, so no replica identity is needed;
+  `REPLICA IDENTITY FULL` is accepted.
+- **A defect of C6c found on the way.** A unique index whose leaf page filled with the entries of
+  rolled-back inserts of the same keys made the B-tree ask the access method for bottom-up
+  deletion, which raised "columnar tables have no indexes in this version" and failed the insert.
+  The answer is now "no entry may go": the page splits and `VACUUM` removes the entries.
+- **For bucket moves in `kingres_shard` (S3).** The copy tables are created `USING` the source's
+  access method and loaded through `COPY`, then compacted before the switch. The move's
+  publication names tables with `FOR TABLE` (or the root with `publish_via_partition_root`),
+  never `FOR ALL TABLES`. The publisher needs the library preloaded and `wal_level = logical`. A
+  columnar leaf under a root published through the root is not tested yet. The refusal of
+  columnar relations in step 1 of increment 9.3 can be removed when S3 is built.
+- **Tests and mutants.** `t/061_logical.pl` compares a subscriber row by row with the publisher
+  (every column type, a 2 MB value, `COPY`, 30 001 rows, savepoints, prepared transactions,
+  reserved row numbers and an index, four sessions, compaction, `TRUNCATE`, two crashes, the
+  origin, a physical standby). Of 17 one-line mutants 12 are killed; the 5 that survive change
+  nothing observable (for example the top transaction id, which at `wal_level = logical` is never
+  needed because the assignment of a subtransaction is logged at once).
+
+### C8, reuse of free space in the file (2026-11-19)
+
+- **Where it differs from section 7.5.** The design finds free pages by walking stripe headers
+  and the writer transaction named on each page. Pages carry no transaction id here (a choice of
+  C1: an id on a page would need freezing), so such a walk cannot tell a crashed writer's pages
+  from a running one's. Instead `VACUUM` takes a `SHARE` lock on the table without waiting,
+  retrying every 50 ms for `vacuum_truncate_lock_timeout`, which excludes every running writer
+  (prepared transactions included); the stripe catalog alone then says which blocks are used. No
+  page is read and readers are not blocked. The cost: a table that never has a moment without a
+  writer gets no list, and its file grows as before (`DEBUG2` says that `VACUUM` gave up).
+  Decided by the integrator: accepted.
+- **The list.** Up to 400 free extents in the metapage, in space that was zero, with a checksum of
+  its own; a list that is not sound (unsorted, overlapping, past the end of the file) reads as
+  empty. An older binary ignores the list and drops it when it rewrites the page, which loses
+  space, not data, so the version stays 0.2. `pd_lower` now covers the list, or a full-page image
+  would leave it out.
+- **The take.** A stripe write takes the first extent that fits, under the metapage lock, and
+  logs the metapage before any page is written; otherwise the file is extended as before. A crash
+  after the take and before a page loses only the run's place in the list; the next `VACUUM`
+  lists it again. A taken run is never given out twice after a crash, because the take is logged.
+- **Standbys.** `XLOG_KC_FREE` carries the newest transaction that deleted a stripe whose blocks
+  are listed for the first time, and redo cancels the standby queries that may still read them
+  before any of them can be written over. With `hot_standby_feedback` such stripes are not listed.
+- **Check.** `columnar_check` reports `free_extent_overlaps_stripe`. A damaged list is not tested
+  (it needs a hand-made page checksum).
+- **Tests and mutants.** `t/062_free_extents.pl`: in a steady load of small inserts, compactions
+  and vacuums over 40 rounds the vacuumed file stays at 2.0 MB against 23.4 MB for a control that is
+  never vacuumed; older snapshots, failed loads in the middle and at the end of the file, exact
+  and one-block-short runs, a writer in flight, two crashes, a hot standby with and without
+  feedback, four writers. All 12 one-line mutants are killed.
