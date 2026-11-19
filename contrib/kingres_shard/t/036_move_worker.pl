@@ -187,11 +187,11 @@ sub move_backend_pid
 	$tgt = ($src + 1) % 3;
 	($rc, $out, $err) = run_sql($n1, "SELECT kingres.move_bucket(1, $b, $tgt)");
 	isnt($rc, 0, 'a move is refused when a node has another version');
-	like($err, qr/node 3 \(\S+:\d+\) has kingres_shard 0\.2, a bucket move needs 0\.5 on every node/,
+	like($err, qr/node 3 \(\S+:\d+\) has kingres_shard 0\.2, a bucket move needs 0\.6 on every node/,
 		'the error says which node and which version');
 	is($n1->safe_psql('postgres', 'SELECT count(*) FROM kingres.bucket_move'), $moves, 'and nothing was recorded');
 	is(owner($n1, $b), $src, 'the bucket did not move');
-	$n3->safe_psql('postgres', "UPDATE pg_catalog.pg_extension SET extversion = '0.5' WHERE extname = 'kingres_shard'");
+	$n3->safe_psql('postgres', "UPDATE pg_catalog.pg_extension SET extversion = '0.6' WHERE extname = 'kingres_shard'");
 	is($n1->safe_psql('postgres', "SELECT kingres.move_bucket(1, $b, $tgt) > 0"), 't', 'with the version restored the move runs');
 
 	# -----------------------------------------------------------------------

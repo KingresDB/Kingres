@@ -1,9 +1,9 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
 -- Portions Copyright (c) 2026, RooyeKhat Media Co
 --
--- upgrade.sql: pg_regress test of kingres_shard 0.5 (purpose below).
--- ALTER EXTENSION kingres_shard UPDATE from 0.1 (through 0.2, 0.3 and 0.4), from 0.2, from 0.3 and from 0.4 to 0.5 must give exactly the
--- catalog that installing 0.5 gives, and keep the data of the catalog tables.
+-- upgrade.sql: pg_regress test of kingres_shard 0.6 (purpose below).
+-- ALTER EXTENSION kingres_shard UPDATE from 0.1 (through 0.2, 0.3, 0.4 and 0.5), from 0.2, from 0.3, from 0.4 and from 0.5 to 0.6 must give exactly the
+-- catalog that installing 0.6 gives, and keep the data of the catalog tables.
 SET search_path = public, pg_temp;
 
 -- A description of every object of the extension that the two paths could
@@ -121,7 +121,7 @@ RETURN QUERY
 END
 $$;
 
--- Install 0.5 directly.
+-- Install 0.6 directly.
 CREATE EXTENSION kingres_shard;
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
 CREATE TABLE public.upg_direct AS SELECT line FROM public.upg_snapshot() line;
@@ -188,6 +188,8 @@ ALTER EXTENSION kingres_shard UPDATE TO '0.4';
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
 ALTER EXTENSION kingres_shard UPDATE TO '0.5';
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
+ALTER EXTENSION kingres_shard UPDATE TO '0.6';
+SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
 DROP TABLE public.upg_upgraded;
 CREATE TABLE public.upg_upgraded AS SELECT line FROM public.upg_snapshot() line;
 SELECT 'only in direct install' AS side, line FROM
@@ -214,6 +216,8 @@ ALTER EXTENSION kingres_shard UPDATE TO '0.4';
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
 ALTER EXTENSION kingres_shard UPDATE TO '0.5';
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
+ALTER EXTENSION kingres_shard UPDATE TO '0.6';
+SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
 SELECT count(*) AS secret_rows_after FROM kingres.cluster_secret;
 DROP TABLE public.upg_upgraded;
 CREATE TABLE public.upg_upgraded AS SELECT line FROM public.upg_snapshot() line;
@@ -238,6 +242,8 @@ INSERT INTO public.upg_t VALUES (5, 'five');
 INSERT INTO kingres.dtx_log VALUES ('kingres_1_1_1_1', 1, now());
 ALTER EXTENSION kingres_shard UPDATE TO '0.5';
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
+ALTER EXTENSION kingres_shard UPDATE TO '0.6';
+SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
 DROP TABLE public.upg_upgraded;
 CREATE TABLE public.upg_upgraded AS SELECT line FROM public.upg_snapshot() line;
 SELECT 'only in direct install' AS side, line FROM
@@ -252,6 +258,34 @@ SELECT count(*) AS incidents FROM kingres.dtx_incident;
 SELECT count(*) AS standbys FROM kingres.standby_status();
 SELECT count(*) AS cluster_problems FROM kingres.check_cluster();
 SELECT kingres.detect_distributed_deadlocks();
+DROP TABLE public.upg_t;
+DROP EXTENSION kingres_shard;
+
+-- The step from 0.5 on its own: 0.6 adds no object, so a node of 0.5 with a cluster, data and
+-- a decision in dtx_log ends in the catalog a fresh 0.6 gives, and keeps everything it had.
+CREATE EXTENSION kingres_shard VERSION '0.5';
+SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
+SELECT kingres.init_cluster(btrim(split_part(current_setting('unix_socket_directories'), ',', 1)), current_setting('port')::int);
+CREATE TABLE public.upg_t (id int PRIMARY KEY, v text);
+SELECT kingres.create_distributed_table('public.upg_t', 'id', bucket_count => 4);
+INSERT INTO public.upg_t VALUES (6, 'six');
+INSERT INTO kingres.dtx_log VALUES ('kingres_1_1_1_1', 1, now());
+SELECT count(*) AS secret_rows FROM kingres.cluster_secret;
+ALTER EXTENSION kingres_shard UPDATE TO '0.6';
+SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
+DROP TABLE public.upg_upgraded;
+CREATE TABLE public.upg_upgraded AS SELECT line FROM public.upg_snapshot() line;
+SELECT 'only in direct install' AS side, line FROM
+  (SELECT line FROM public.upg_direct EXCEPT SELECT line FROM public.upg_upgraded) x
+UNION ALL
+SELECT 'only in upgrade', line FROM
+  (SELECT line FROM public.upg_upgraded EXCEPT SELECT line FROM public.upg_direct) y
+ORDER BY 1, 2;
+SELECT count(*) FROM public.upg_t;
+SELECT count(*) AS decisions_kept FROM kingres.dtx_log;
+SELECT count(*) AS secret_rows_after FROM kingres.cluster_secret;
+SELECT count(*) AS cluster_problems FROM kingres.check_cluster();
+SELECT kingres.internal_check_node_versions();
 DROP TABLE public.upg_t;
 DROP EXTENSION kingres_shard;
 

@@ -41,7 +41,8 @@ SHLIB_LINK_INTERNAL = $(libpq)
 EXTENSION = kingres_shard
 DATA = kingres_shard--0.1.sql kingres_shard--0.2.sql kingres_shard--0.3.sql \
 	kingres_shard--0.4.sql kingres_shard--0.1--0.2.sql kingres_shard--0.2--0.3.sql \
-	kingres_shard--0.3--0.4.sql kingres_shard--0.5.sql kingres_shard--0.4--0.5.sql
+	kingres_shard--0.3--0.4.sql kingres_shard--0.5.sql kingres_shard--0.4--0.5.sql \
+	kingres_shard--0.6.sql kingres_shard--0.5--0.6.sql
 
 REGRESS = version catalog bucket_for bucket_lookup distribute routing_single security \
 	utility_guard routing_decisions reference ddl_single rebalance_plan bulk_plans upgrade

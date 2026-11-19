@@ -56,6 +56,8 @@ install_data(
   'kingres_shard--0.3--0.4.sql',
   'kingres_shard--0.5.sql',
   'kingres_shard--0.4--0.5.sql',
+  'kingres_shard--0.6.sql',
+  'kingres_shard--0.5--0.6.sql',
   kwargs: contrib_data_args,
 )
 

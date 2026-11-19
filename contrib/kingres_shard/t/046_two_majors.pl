@@ -54,8 +54,8 @@ sub other_installation
 	return (undef, "kingres_shard is not installed in $dir (run kingres/dev/ext-majors.sh first)")
 	  unless -e "$libdir/kingres_shard.so" && -e "$sharedir/extension/kingres_shard.control";
 	# The script of the version is the one of this source tree.
-	my $script = "$FindBin::RealBin/../kingres_shard--0.4.sql";
-	if (open(my $a, '<', $script) && open(my $b, '<', "$sharedir/extension/kingres_shard--0.4.sql"))
+	my $script = "$FindBin::RealBin/../kingres_shard--0.6.sql";
+	if (open(my $a, '<', $script) && open(my $b, '<', "$sharedir/extension/kingres_shard--0.6.sql"))
 	{
 		local $/;
 		return (undef, "the kingres_shard installed in $dir is not built from this source")

@@ -8,7 +8,7 @@ node as reference tables, and makes every statement correct on a cluster with
 several groups: a statement that touches one key goes to the group that owns
 it, and a statement that spans groups is answered by reading the other groups.
 
-This is version 0.5 (0.3 added moving buckets, phase 2a made every statement correct, 0.4 is the fix round of the reviews of 0.2 and 0.3, 0.5 is high availability: standby nodes, `promote_node`, prepared transactions across a failover, distributed deadlock detection and coordinated restore points; see "High availability" below). Phase 2b will make the common
+This is version 0.6 (0.3 added moving buckets, phase 2a made every statement correct, 0.4 is the fix round of the reviews of 0.2 and 0.3, 0.5 is high availability: standby nodes, `promote_node`, prepared transactions across a failover, distributed deadlock detection and coordinated restore points; see "High availability" below; 0.6 is phase 2b and adds no SQL object, see "Installation" for why the version is raised). Phase 2b makes the common
 statements fast. The designs are in
 [`kingres/docs/design/shard-mvp.md`](../../kingres/docs/design/shard-mvp.md)
 (phase 1) and
@@ -167,14 +167,27 @@ describes what is implemented and how to use it.
   database, so every node needs a role of that name, and `pg_hba.conf` (and the
   password file, if used) must let the nodes in. Credentials are never stored
   in the catalog. SSL options are set with `kingres_shard.node_conninfo`.
-- `CREATE EXTENSION kingres_shard` installs version 0.5;
-  `ALTER EXTENSION kingres_shard UPDATE` upgrades a 0.1, 0.2, 0.3 or 0.4 installation (the
-  catalog is identical to a fresh 0.5 one; the `upgrade` regression test
-  compares the two). Transactions that 0.4 prepared and that are pending at the upgrade
-  are resolved in the old identifier format (see "Prepared transactions across a
-  failover").
+- `CREATE EXTENSION kingres_shard` installs version 0.6;
+  `ALTER EXTENSION kingres_shard UPDATE` upgrades a 0.1, 0.2, 0.3, 0.4 or 0.5 installation
+  (the chain is 0.1 -> 0.2 -> 0.3 -> 0.4 -> 0.5 -> 0.6, and the catalog is identical to a
+  fresh 0.6 one; the `upgrade` regression test compares the two). Transactions that 0.4
+  prepared and that are pending at the upgrade are resolved in the old identifier format
+  (see "Prepared transactions across a failover").
+- **Version 0.6 adds no table, view, function or column.** `kingres_shard--0.5--0.6.sql` holds
+  one statement, which makes the check of the node versions before a bucket move ask for 0.6
+  (the function exists already; only its text names the version). The version is raised
+  because the nodes of a cluster must run the same protocol between them (the fragments that
+  phase 2b sends), and `add_node`, the placement check and `move_bucket()` refuse a node that
+  runs another version.
+- **Rolling upgrade from 0.5 to 0.6.** Nodes of 0.6 and nodes of 0.5 cannot cooperate on the
+  new fragments. Until the last node is upgraded, set `kingres_shard.enable_pushdown`,
+  `kingres_shard.enable_bulk_routing` and `kingres_shard.enable_copy_routing` to `off` on
+  every node (per session or in `postgresql.conf`), and set them back to `on` when the last
+  node is upgraded. Of these, `enable_bulk_routing` and `enable_copy_routing` exist today;
+  `enable_pushdown` comes with the step of phase 2b that adds pushdown, and until then there
+  is nothing to switch off for it. Then upgrade as described under "Upgrade order" below.
 - **Changes made to the 0.5 scripts in place.** 0.5 is not released, so its install script and its
-  `0.4--0.5` script change as the reviews find things, and the version stays 0.5. A database that
+  `0.4--0.5` script change as the reviews find things, and the version stays 0.5 (0.6 does not repair such a database either). A database that
   installed an earlier build of 0.5 has no update path to the later one (`ALTER EXTENSION ... UPDATE`
   does nothing for the same version). What changed in place, and what such a database needs:
   `kingres.pending_node.node_id` (added for `remove_node`, S11-05). Without it `add_node`,
@@ -206,12 +219,12 @@ describes what is implemented and how to use it.
   new files on every node, restart them one after the other, run `ALTER EXTENSION
   ... UPDATE` on every node at once and soon after, and do not start a bucket move
   before it is done: `move_bucket()` refuses unless every active primary reports
-  extension version 0.5, and names the node that does not. An older library does not
+  extension version 0.6, and names the node that does not. An older library does not
   accept the session of a newer one (the proof of a node-to-node session differs between
   versions), which looks like a lost connection; `check_cluster()` and `move_bucket()`
   ask for the version over a session that claims nothing when that happens, so they name
   both versions (`extension_version_differs`, "has kingres_shard 0.4, a bucket move needs
-  0.5") and do not call the node unreachable (review finding S6-06). A node that cannot
+  0.6") and do not call the node unreachable (review finding S6-06). A node that cannot
   be asked either is `node_unreachable`.
 
 ## Building and testing
@@ -245,7 +258,7 @@ PROVE_TESTS=t/013_dist_scan.pl kingres/dev/ext.sh kingres_shard tap
   second, fictitious shard group; `routing_decisions`: collations, functions
   and other nested contexts, forwarded sessions, decided with `EXPLAIN`;
   `reference`: reference tables on one node; `upgrade`: `ALTER EXTENSION ...
-  UPDATE` from 0.1, 0.2, 0.3 and 0.4 against a fresh 0.5 install; the same on both majors:
+  UPDATE` from 0.1, 0.2, 0.3, 0.4 and 0.5 against a fresh 0.6 install; the same on both majors:
   the script of 0.3 names a column of `pg_stat_subscription_stats` that PostgreSQL 19
   renamed, so on 19 it creates `kingres.internal_move_subscription_status()` with its
   body check off and `ALTER EXTENSION ... UPDATE` to 0.4 replaces it with a body that
