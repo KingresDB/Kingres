@@ -96,6 +96,7 @@
 #include "catalog.h"
 #include "dist_scan.h"
 #include "fanout.h"
+#include "fragment_scan.h"
 #include "forward_auth.h"
 #include "hashing.h"
 #include "kingres_shard.h"
@@ -1108,6 +1109,45 @@ plan_forwarded(Query *parse, const char *query_string, int cursorOptions,
 							a->ndist_rtes);
 
 	/*
+	 * A closed query that another node runs whole (P4, P5 without order or limit; 4.2).  This node
+	 * decides on the parse of the text it received, with the function the sender used on the same
+	 * text (query_text_accepted), and runs it over its own buckets: the rows are the ones the
+	 * buckets of this node make, which is what the sender asks for.  The placement of the colocation
+	 * group is compared with the sender's after planning (the parents are locked since parse
+	 * analysis, which a DETACH of a bucket waits for).  What no rule accepts is not a stale map.
+	 */
+	if (parse->commandType == CMD_SELECT && query_string != NULL)
+	{
+		int64		place;
+
+		if (kingres_shard_parse_query_marker(query_string, &place))
+		{
+			KsQueryFragment qf;
+			const char *why = NULL;
+
+			if (kingres_shard_query_fragment_analyze(parse, &qf, &why))
+			{
+				PlannedStmt *pstmt = plan_locally(parse, query_string, cursorOptions, boundParams,
+												  cat, a->ndist_rtes);
+
+				if (place != 0 &&
+					kingres_shard_placement_hash_now(qf.colocation_id) != place)
+					ereport(ERROR,
+							(errcode(ERRCODE_KINGRES_STALE_MAP),
+							 errmsg("the bucket map of this node is not the one the statement was shipped with (stale map version " INT64_FORMAT ")",
+									cat->map_version),
+							 errhint("A bucket moved between shard groups, or the primary of a group changed; repeat the statement.")));
+				return pstmt;
+			}
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("this node does not accept the fragment that another node sent it"),
+					 errdetail("The statement is not a closed query that this node runs: %s.", why),
+					 errhint("This is not a change of the bucket map: repeating the statement does not help.")));
+		}
+	}
+
+	/*
 	 * A colocated INSERT ... SELECT that another node ships whole (11.7).  This node decides
 	 * on the parse of the text it received, with the function the sender used on the same text
 	 * (insert_select_text_accepted), and runs it over its own buckets: each row it reads is
@@ -1208,7 +1248,8 @@ plan_forwarded(Query *parse, const char *query_string, int cursorOptions,
 		  (strncmp(query_string, KS_FRAGMENT_MARKER, strlen(KS_FRAGMENT_MARKER)) == 0 ||
 		   strncmp(query_string, KS_WRITE_MARKER, strlen(KS_WRITE_MARKER)) == 0 ||
 		   strncmp(query_string, KS_INSERT_MARKER_PREFIX, strlen(KS_INSERT_MARKER_PREFIX)) == 0)) ||
-		 strncmp(query_string, KS_INSERT_SELECT_MARKER_PREFIX, strlen(KS_INSERT_SELECT_MARKER_PREFIX)) == 0))
+		 strncmp(query_string, KS_INSERT_SELECT_MARKER_PREFIX, strlen(KS_INSERT_SELECT_MARKER_PREFIX)) == 0 ||
+		 strncmp(query_string, KS_QUERY_MARKER_PREFIX, strlen(KS_QUERY_MARKER_PREFIX)) == 0))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("this node does not accept the fragment that another node sent it"),
@@ -1549,6 +1590,164 @@ can_distributed_scan(Query *parse, const KsCatalog *cat, bool spans)
 }
 
 /*
+ * query_text_accepted
+ *
+ * The decision of a receiving group is made on the parse of the text it receives, not on the tree
+ * this node deparsed (design: "the receiving side decides on text that was deparsed and parsed
+ * again").  So that a query that is shipped is never refused there, the text is parsed and
+ * rewritten here, under the same settings, and the same function decides on it.  What a deparse
+ * and a parse change in the meaning of the query shows up as a refusal, and the scan answers.  The
+ * columns of the text must be those the plan expects: the same number, of the same types.
+ */
+static bool
+query_text_accepted(const char *body, Query *sent, const char **why)
+{
+	ParamTypes	pt = {NULL, 0};
+	List	   *raw;
+	List	   *rewritten;
+	Query	   *rq;
+	KsQueryFragment qf;
+	ListCell   *la;
+	ListCell   *lb;
+	int			nest;
+	int			i;
+
+	(void) param_types_walker((Node *) sent, &pt);
+	for (i = 0; i < pt.n; i++)
+		if (!OidIsValid(pt.types[i]))
+			pt.types[i] = TEXTOID;
+
+	nest = kingres_shard_set_transmission_modes();
+	raw = pg_parse_query(body);
+	if (list_length(raw) != 1)
+	{
+		kingres_shard_reset_transmission_modes(nest);
+		*why = "the deparsed text is not one statement";
+		return false;
+	}
+	rq = parse_analyze_fixedparams(linitial_node(RawStmt, raw), body, pt.types, pt.n, NULL);
+	rewritten = pg_rewrite_query(rq);
+	kingres_shard_reset_transmission_modes(nest);
+	if (list_length(rewritten) != 1)
+	{
+		*why = "the deparsed text is rewritten into several statements";
+		return false;
+	}
+	rq = linitial_node(Query, rewritten);
+	if (!kingres_shard_query_fragment_analyze(rq, &qf, why))
+		return false;
+	if (list_length(rq->targetList) != list_length(sent->targetList))
+	{
+		*why = "the deparsed text returns another number of columns";
+		return false;
+	}
+	forboth(la, rq->targetList, lb, sent->targetList)
+	{
+		TargetEntry *a = lfirst_node(TargetEntry, la);
+		TargetEntry *b = lfirst_node(TargetEntry, lb);
+
+		if (a->resjunk || exprType((Node *) a->expr) != exprType((Node *) b->expr))
+		{
+			*why = "a column of the deparsed text has another type";
+			return false;
+		}
+	}
+	return true;
+}
+
+/*
+ * pushdown_prepare
+ *
+ * The decision of design 6 for a SELECT that spans shard groups: is it a closed query that every
+ * group can run whole on its own buckets (6.1 and 6.4), that gains something from it, that passes
+ * the shippability walker, and whose text the groups accept?  Returns what the paths of the
+ * statement need (fragment_scan.c) or NULL with *why (a static string, shown by EXPLAIN VERBOSE of
+ * the scan the statement gets instead).  ORDER BY and LIMIT are not sent: the node that gathers
+ * the rows applies them (the ordered merge and the pushed limit are step 9 of the design).  A column that
+ * only orders or groups (a resjunk entry of the select list) is sent as an ordinary column, so
+ * the node that sorts has it; a DISTINCT query with such a column is not sent.
+ *
+ * The statement is not changed.  The work reads the catalog, which can reload the cache of this
+ * backend: nothing taken from it before the call is used after it.
+ */
+static KsPushdownInfo *
+pushdown_prepare(Query *parse, const char **why)
+{
+	KsPushdown	pd;
+	const char *reason = NULL;
+	Query	   *ship;
+	KsQueryFragment qf;
+	KsParamRenumber prn = {NIL};
+	char	   *body;
+	int			nest;
+	ListCell   *lc;
+	List	   *dist = NIL;
+	const KsColocation *coloc;
+	KsPushdownInfo *pi;
+
+#define PD_NO(msg) do { *why = (msg); return NULL; } while (0)
+
+	if (IsInParallelMode())
+		PD_NO("it is planned in a parallel worker");
+	if (!kingres_shard_pushdown_analyze(parse, &pd, &reason))
+		PD_NO(reason);
+	if (!kingres_shard_pushdown_closed(&pd, &reason))
+		PD_NO(reason);
+	ship = copyObject(parse);
+	foreach(lc, ship->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (te->resjunk && ship->distinctClause != NIL)
+			PD_NO("it removes duplicates and has a column that only orders or groups");
+		te->resjunk = false;
+	}
+	ship->sortClause = NIL;
+	ship->limitOffset = NULL;
+	ship->limitCount = NULL;
+	ship->limitOption = LIMIT_OPTION_COUNT;
+	if (!kingres_shard_query_fragment_analyze(ship, &qf, &reason))
+		PD_NO(reason);
+	if (!parse->hasAggs && parse->groupClause == NIL && parse->distinctClause == NIL && pd.ndist < 2)
+		PD_NO("it reads one table and neither groups nor removes duplicates: the groups would return the rows the scan returns");
+
+	ship = query_tree_mutator(ship, kingres_shard_renumber_params, &prn, 0);
+	nest = kingres_shard_set_transmission_modes();
+	body = pg_get_querydef(ship, false);
+	kingres_shard_reset_transmission_modes(nest);
+	if (!query_text_accepted(body, ship, &reason))
+	{
+		ereport(DEBUG1, (errmsg_internal("kingres_shard: a closed query is not shipped: the groups would not accept its text: %s", reason)));
+		PD_NO(reason);
+	}
+
+	/* the analyses read the catalog cache, which a call of theirs may have reloaded */
+	coloc = kingres_shard_lookup_colocation(qf.colocation_id);
+	if (coloc == NULL)
+		PD_NO("its colocation group is not known");
+	foreach(lc, qf.pd.rels)
+	{
+		KsPdRel    *r = (KsPdRel *) lfirst(lc);
+
+		if (!r->reference)
+			dist = list_append_unique_oid(dist, r->relid);
+	}
+	pi = palloc0(sizeof(KsPushdownInfo));
+	pi->parse = parse;
+	pi->sql = body;
+	pi->param_ids = prn.ids;
+	pi->colocation_id = qf.colocation_id;
+	pi->place = kingres_shard_placement_hash(coloc);
+	pi->relids = qf.relids;
+	pi->dist_relids = dist;
+	pi->kind = (parse->hasAggs || parse->groupClause != NIL) ? "closed aggregate (by key)" :
+		(parse->distinctClause != NIL ? "closed distinct (by key)" : "closed join (on key)");
+	pi->ncols = list_length(parse->targetList);
+	return pi;
+#undef PD_NO
+}
+
+/*
  * plan_with_scan
  *
  * Plan a statement with the standard planner while the set_rel_pathlist_hook of
@@ -1558,10 +1757,12 @@ can_distributed_scan(Query *parse, const KsCatalog *cat, bool spans)
  */
 static PlannedStmt *
 plan_with_scan(Query *parse, const char *query_string, int cursorOptions,
-			   ParamListInfo boundParams)
+			   ParamListInfo boundParams, KsPushdownInfo *pi, const char *pushdown_reason)
 {
 	PlannedStmt *pstmt;
 	int			nest = NewGUCNestLevel();
+	KsPushdownInfo *old_pi = kingres_shard_pushdown_info_set(pi);
+	const char *old_reason = kingres_shard_pushdown_reason_swap(pushdown_reason);
 
 	(void) set_config_option("enable_partitionwise_join", "off", PGC_SUSET,
 							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
@@ -1575,11 +1776,14 @@ plan_with_scan(Query *parse, const char *query_string, int cursorOptions,
 	PG_FINALLY();
 	{
 		(void) kingres_shard_distscan_set_active(false);
+		(void) kingres_shard_pushdown_info_set(old_pi);
+		(void) kingres_shard_pushdown_reason_swap(old_reason);
 	}
 	PG_END_TRY();
 	AtEOXact_GUC(true, nest);
 	return pstmt;
 }
+
 
 /*
  * is_scan_fragment
@@ -1879,6 +2083,8 @@ kingres_shard_planner_hook(Query *parse, const char *query_string,
 	bool		old = kingres_shard_distscan_set_active(false);
 	void	   *old_explain = current_explain;
 	bool		saved_local_part = this_is_local_part;
+	KsPushdownInfo *old_pushdown = kingres_shard_pushdown_info_set(NULL);
+	const char *old_reason = kingres_shard_pushdown_reason_swap(NULL);
 
 	current_explain = (void *) KS_PLANNER_ES_VALUE;
 	/* consumed first of all: nothing this hook runs can see the mark (fanout.c, P2B-01) */
@@ -1892,6 +2098,8 @@ kingres_shard_planner_hook(Query *parse, const char *query_string,
 		(void) kingres_shard_distscan_set_active(old);
 		current_explain = old_explain;
 		this_is_local_part = saved_local_part;
+		(void) kingres_shard_pushdown_info_set(old_pushdown);
+		(void) kingres_shard_pushdown_reason_swap(old_reason);
 	}
 	PG_END_TRY();
 	return result;
@@ -2028,7 +2236,7 @@ planner_hook_body(Query *parse, const char *query_string,
 		 * statement).  The distributed scan reads such a table correctly.
 		 */
 		if (!kingres_shard_session_forwarded() && kingres_shard_enable_distributed_scan)
-			return plan_with_scan(parse, query_string, cursorOptions, boundParams);
+			return plan_with_scan(parse, query_string, cursorOptions, boundParams, NULL, NULL);
 		return plan_locally(parse, query_string, cursorOptions, boundParams,
 							cat, a.ndist_rtes);
 	}
@@ -2185,7 +2393,25 @@ planner_hook_body(Query *parse, const char *query_string,
 		 * INSERT ... SELECT) or is handled by the planner of the writes below.
 		 */
 		if (can_distributed_scan(parse, cat, true))
-			return plan_with_scan(parse, query_string, cursorOptions, boundParams);
+		{
+			KsPushdownInfo *pi = NULL;
+			const char *why = NULL;
+
+			/*
+			 * A closed query is one more alternative, with a cost (fragment_scan.c); the scan is
+			 * planned beside it and answers whatever the alternative does not take (ADR 0022).
+			 * The decision reads the catalog and may reload this backend's cache: nothing taken
+			 * from the cache before it is used after it.
+			 */
+			if (parse->commandType == CMD_SELECT && kingres_shard_enable_pushdown &&
+				kingres_shard_enable_pushdown_closed)
+			{
+				pi = pushdown_prepare(parse, &why);
+				if (pi == NULL && why != NULL)
+					ereport(DEBUG1, (errmsg_internal("kingres_shard: no pushdown: %s", why)));
+			}
+			return plan_with_scan(parse, query_string, cursorOptions, boundParams, pi, why);
+		}
 		if (parse->commandType == CMD_UPDATE || parse->commandType == CMD_DELETE)
 		{
 			if (list_length(a.refs) == 1 && span_ref->query == parse &&
@@ -2232,7 +2458,7 @@ planner_hook_body(Query *parse, const char *query_string,
 	 */
 	if ((a.has_nondist || (cursorOptions & CURSOR_OPT_SCROLL)) &&
 		can_distributed_scan(parse, cat, false))
-		return plan_with_scan(parse, query_string, cursorOptions, boundParams);
+		return plan_with_scan(parse, query_string, cursorOptions, boundParams, NULL, NULL);
 	if (a.has_nondist)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

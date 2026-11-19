@@ -1004,3 +1004,52 @@ kingres_shard_insert_select_analyze(Query *insert, KsInsertSelect *is, const cha
 	return true;
 #undef IS_NO
 }
+
+/* ======================================================================
+ * A closed query (P4, P5 without order or limit)
+ * ====================================================================== */
+
+char *
+kingres_shard_query_marker(int64 place)
+{
+	return psprintf(KS_QUERY_MARKER_PREFIX "place=" INT64_FORMAT " */ ", place);
+}
+
+bool
+kingres_shard_parse_query_marker(const char *query_string, int64 *place)
+{
+	const char *p;
+	char	   *end;
+
+	if (query_string == NULL ||
+		strncmp(query_string, KS_QUERY_MARKER_PREFIX, strlen(KS_QUERY_MARKER_PREFIX)) != 0)
+		return false;
+	p = query_string + strlen(KS_QUERY_MARKER_PREFIX);
+	if (strncmp(p, "place=", 6) != 0)
+		return false;
+	p += 6;
+	*place = strtoll(p, &end, 10);
+	if (end == p)
+		return false;
+	return strncmp(end, " */ ", 4) == 0;
+}
+
+bool
+kingres_shard_query_fragment_analyze(Query *query, KsQueryFragment *qf, const char **reason)
+{
+	memset(qf, 0, sizeof(*qf));
+	if (!kingres_shard_pushdown_analyze(query, &qf->pd, reason))
+		return false;
+	if (!kingres_shard_pushdown_closed(&qf->pd, reason))
+		return false;
+	if (query->limitCount != NULL || query->limitOffset != NULL)
+	{
+		*reason = "it has LIMIT or OFFSET, which the node that gathers the rows applies";
+		return false;
+	}
+	if (!kingres_shard_stmt_shippable_colocated(query, InvalidOid, qf->pd.colocation_id, reason))
+		return false;
+	qf->colocation_id = qf->pd.colocation_id;
+	qf->relids = kingres_shard_pushdown_relids(&qf->pd);
+	return true;
+}

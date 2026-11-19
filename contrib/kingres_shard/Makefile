@@ -18,6 +18,7 @@ OBJS = \
 	src/failover.o \
 	src/fault.o \
 	src/forward_auth.o \
+	src/fragment_scan.o \
 	src/ha.o \
 	src/hashing.o \
 	src/kingres_shard.o \

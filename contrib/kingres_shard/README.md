@@ -675,6 +675,8 @@ the files of the extension, because the dump creates the extension.
 | `kingres_shard.enable_routing` | on | When off, the planner and utility hooks do nothing. Superusers only (`PGC_SUSET`): with routing off a `SELECT` reads the local partitions only and a `TRUNCATE` clears this node only, which an administrator who repeats a statement on every node by hand wants and an ordinary session must not be able to switch on. |
 | `kingres_shard.enable_distributed_scan` | on | When off, a `SELECT` that spans shard groups raises the phase 1 error instead of reading the other groups (to forbid slow cross-group queries). |
 | `kingres_shard.scan_fetch_size` | 1000 | Rows requested from another group at a time by the distributed scan. |
+| `kingres_shard.enable_pushdown` | on | Master switch of the pushdown paths of a read (step 6: closed queries). Off: a read that spans shard groups is answered by the row-moving distributed scan, as before. `USERSET`; it chooses among plans that give the same answer, and grants nothing. |
+| `kingres_shard.enable_pushdown_closed` | on | Off: a closed query (see "Closed queries, run whole by every group") is not shipped; the scan answers. `USERSET`. |
 | `kingres_shard.enable_bulk_routing` | on | Off: an `INSERT` that goes to several shard groups is refused as in 0.5 (a multi-row `VALUES`, `INSERT ... SELECT`, a single row whose key is not a constant). A single row with a constant key never needed the router and is not affected. `USERSET`; it grants nothing. |
 | `kingres_shard.enable_colocated_insert_select` | on | Off: a colocated `INSERT ... SELECT` is not shipped whole: it goes through the row router when it can (no `ON CONFLICT DO UPDATE`) and is refused when it cannot. `USERSET`; it chooses among statements that give the same answer, and grants nothing. A cached plan keeps the path it was made with (as for every planner setting). |
 | `kingres_shard.enable_copy_routing` | on | Off: `COPY ... FROM` into a distributed table of a cluster with several groups is refused as in 0.5. `USERSET`. |
@@ -1217,6 +1219,24 @@ known. There is no partial result.
 **Memory.** At most one batch is in flight per remote group, and the previous answer is read before the
 next batch is sent, so the memory is about two batches (`insert_batch_bytes`) per group plus the batch of
 the source cursor and the `RETURNING` rows not yet handed out (a tuplestore: `work_mem`, then disk),
+
+The batch of the source cursor is bounded in bytes as well: it is fetched in steps that follow the widest row seen
+so far, about `insert_batch_bytes` plus one row, down to one row at a time (`t/128_router_review_round.pl`).  One row
+is never split, and one very large value costs several times its size: the output string, the array literal and the
+message at the origin, and on the group the parameter, the array, the `unnest` row and the stored row (measured:
+about 5 times at the origin and 8 times at the receiving group for a value of 150 MB), so a value near the limit of
+1 GB of a column needs memory of that order on the group, and the statement then fails with an ordinary out of memory
+error.  The parameters of a batch follow the logging settings of each group (`log_statement`,
+`log_min_duration_statement`, `log_parameter_max_length`): a group that logs binds logs the values of a batch, up to
+`insert_batch_bytes`; the origin never logs the data of a `COPY`, and `pg_stat_activity.query` of a group shows the
+marker and the statement, never a value.  The wait for the answer to a batch has no bound of its own besides a cancel,
+`statement_timeout` and the keepalives; the locks of the statement stay on every group it wrote until then.
+
+**Refused with a message that names another cause.**  A `RETURNING` list that cannot be run by the groups (a cast of an
+integer to `text`, a whole-row reference, a system column, a sub-select, `random()`, `now()`) is refused with "the
+RETURNING list ... cannot be run by the shard groups" (an I/O cast of an immutable type is not shipped); a
+data-modifying CTE around a multi-group insert, `WITH i AS (INSERT INTO t SELECT ... RETURNING id) SELECT ...`, is
+refused with the 2a message "statements that span shard groups are not supported yet".  Both fail closed.
 whatever the number of rows (`t/117_bulk_memory.pl`).
 
 **Waits.** The send is non-blocking and a wait for room in the socket is a latch wait, the answer is read
@@ -1328,6 +1348,39 @@ be in progress).
 the same text in any other session as an ordinary statement; a forged fragment is `0A000`, a stale
 placement `KS001`. During a rolling upgrade set the switch off on every node (the groups must run the same
 version, which the placement probes of the scans check).
+
+## Closed queries, run whole by every group (phase 2b, step 6)
+
+A `SELECT` that spans shard groups is normally answered by the distributed scan, which moves rows to the node
+that runs the statement.  A **closed** query is one whose every output row depends on the rows of one group only:
+a `GROUP BY` that contains the distribution key (or a key that is equal to it through a join on the keys), a
+`DISTINCT` that has the key in its select list, a join of colocated tables on their keys with a reference table
+or without.  Each group computes its own final rows from its own buckets and only those rows cross the network
+(the "Kingres Fragment Scan" of `EXPLAIN`); the node that runs the statement runs its own group's part through
+SPI, concatenates, and applies `ORDER BY`, `OFFSET` and `LIMIT` itself (they are not sent).  The planner takes this
+path only when its cost is lower than the scan's; a statement outside it gets the plan it got before.
+
+What is sent is the statement with its parameters (`$1`...), after a check that the groups would accept its text
+(the origin parses and rewrites the text it deparsed and runs the group's own rule on it).  The marker is the
+comment `/* kingres:query-fragment place=<n> */`; a group refuses a statement that no rule accepts with `0A000`
+and a stale placement with `KS001`.  Reading is checked as the scan is (the placement of the colocation group
+before and after the cursors are opened, the partitions of every table, one node per group in a transaction).
+
+Not shipped (the scan answers): a grouping or `DISTINCT` that does not contain the key, an aggregate with no
+`GROUP BY`, grouping sets, window functions, `DISTINCT ON`, aggregates whose result depends on the order of the
+rows (`array_agg`, `string_agg`, floating point sums), a function that is not built in and immutable (`now()`),
+a conversion through the text form of a value, a sub-select, a CTE, a view, a local table, a table of another
+colocation group, a key from the nullable side of an outer join, row-level security, a view of another owner, a
+statement that locks rows, and a statement that reads one table and neither groups nor removes duplicates (nothing
+to gain).  `EXPLAIN (VERBOSE)` of the scan such a statement gets says why (`Pushdown: not used: ...`).
+
+`EXPLAIN` of a shipped statement shows `Pushed:`, `Groups: 3 of 3 (local + 2 remote)` (with `; pruned by <column>`
+when a restriction on the key left groups out), and `Remote SQL:`; `EXPLAIN ANALYZE` adds `Rows from groups:`.
+Switches: `kingres_shard.enable_pushdown` and `kingres_shard.enable_pushdown_closed`.  Fault points of the tests:
+`frag_before_probe`, `frag_after_probe_before`, `frag_after_declare`, `frag_local_open`, `frag_after_probe_after`,
+`frag_first_fetch`, `frag_before_fetch`, `frag_wait_batch`, `frag_local_fetch`, `frag_declared_g<n>`.  A statement
+that is cancelled, or fails, while a group runs its part asks the group to stop it (bounded), so a group that is
+blocked by a lock does not hold the end of the statement for `node_timeout`.
 
 ## Limitations in phase 2a
 

@@ -227,6 +227,38 @@ kingres_shard_spi_local_part(const char *sql, int nargs, Oid *argtypes, Datum *v
 }
 
 /*
+ * kingres_shard_spi_local_part_cursor
+ *
+ * The same, as a read-only cursor that is read in batches later (the fragment scan of
+ * fragment_scan.c, design 4.4).  The caller has connected to SPI; the cursor outlives the
+ * connection.  The mark is armed for the planning of the statement only; the caller checks that
+ * the plan holds no scan of this extension, because a plan that was invalidated and made again
+ * while the cursor opened is planned without the mark (the one-shot flag is consumed by the first
+ * call of the planner hook).
+ */
+Portal
+kingres_shard_spi_local_part_cursor(const char *sql, int nargs, Oid *argtypes, Datum *values,
+									const char *nulls)
+{
+	Portal		portal;
+
+	PG_TRY();
+	{
+		local_part_arm(sql);
+		portal = SPI_cursor_open_with_args(NULL, sql, nargs, argtypes, values, nulls, true,
+										   CURSOR_OPT_NO_SCROLL);
+	}
+	PG_FINALLY();
+	{
+		local_part_disarm();
+	}
+	PG_END_TRY();
+	if (portal == NULL)
+		elog(ERROR, "could not open the cursor of this node's own part of a statement");
+	return portal;
+}
+
+/*
  * True when the statement of the top-level query text of this backend is the
  * fragment of a reference-table write that another node runs on every node.
  */

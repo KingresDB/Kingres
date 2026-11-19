@@ -71,6 +71,8 @@ extern bool kingres_shard_local_part_take(const char *query_string);
  * Run a statement through SPI (already connected) as a local part: it is marked
  * by the one-shot flag and planned for this node only.  Used by the batch sender for the origin's own group.
  */
+extern struct PortalData *kingres_shard_spi_local_part_cursor(const char *sql, int nargs, Oid *argtypes,
+															  Datum *values, const char *nulls);
 extern int	kingres_shard_spi_local_part(const char *sql, int nargs, Oid *argtypes,
 										  Datum *values, const char *nulls);
 

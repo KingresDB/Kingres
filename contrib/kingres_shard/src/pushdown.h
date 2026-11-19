@@ -139,4 +139,35 @@ typedef struct KsInsertSelect
 extern bool kingres_shard_insert_select_analyze(Query *insert, KsInsertSelect *is,
 												const char **reason);
 
+/* ------------------------------------------------------------------------
+ * A closed query (P4, P5 without order or limit; 6.4)
+ * ---------------------------------------------------------------------- */
+
+/* The marker that starts the statement text of a closed query that every group runs whole. */
+#define KS_QUERY_MARKER_PREFIX "/* kingres:query-fragment "
+
+/* "marker text" of the fragment for a placement number: the text, ending with a blank. */
+extern char *kingres_shard_query_marker(int64 place);
+
+/* Parse the marker at the start of a statement text; false when it is not one. */
+extern bool kingres_shard_parse_query_marker(const char *query_string, int64 *place);
+
+typedef struct KsQueryFragment
+{
+	KsPushdown	pd;				/* the analysis of the query */
+	int			colocation_id;
+	List	   *relids;			/* every relation of the query */
+} KsQueryFragment;
+
+/*
+ * Decide a closed query that every group runs whole on its own buckets and whose rows are
+ * concatenated: it is a unit (6.1), closed (6.4), has no LIMIT or OFFSET (they are applied by the
+ * node that gathers the rows), and passes the shippability walker as a whole statement (5).  The
+ * origin runs this function on the query it ships (and again on the parse of its text), and a
+ * receiving group on the parse of the text it received, so that both decide on the same shape.
+ * False with *reason (a static string) when the query is not one.
+ */
+extern bool kingres_shard_query_fragment_analyze(Query *query, KsQueryFragment *qf,
+												 const char **reason);
+
 #endif							/* KINGRES_SHARD_PUSHDOWN_H */

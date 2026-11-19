@@ -20,6 +20,8 @@
  *	fanout.c	 the "Kingres Fan-out Write" custom scan: reference table writes
  *				 and UPDATE/DELETE that span shard groups
  *	dist_scan.c	 the "Kingres Distributed Scan" custom scan and its path hook
+ *	fragment_scan.c the fragments of a read that the shard groups run, and the
+ *				 "Kingres Fragment Scan" custom scan of a closed query
  *	shippable.c	 what may be sent to another node and mean the same there
  *	recovery.c	 recover_prepared_transactions() and the background workers
  *	fault.c		 fault injection for the tests of two-phase commit
@@ -44,6 +46,7 @@
 
 #include "catalog.h"
 #include "dist_scan.h"
+#include "fragment_scan.h"
 #include "fanout.h"
 #include "forward_auth.h"
 #include "bucket_move.h"
@@ -74,6 +77,8 @@ int			kingres_shard_control_call_timeout = 0;
 char	   *kingres_shard_node_conninfo = NULL;
 int			kingres_shard_recovery_interval = 30;
 bool		kingres_shard_enable_distributed_scan = true;
+bool		kingres_shard_enable_pushdown = true;
+bool		kingres_shard_enable_pushdown_closed = true;
 bool		kingres_shard_enable_bulk_routing = true;
 bool		kingres_shard_enable_colocated_insert_select = true;
 bool		kingres_shard_enable_copy_routing = true;
@@ -221,6 +226,23 @@ _PG_init(void)
 							 PGC_USERSET, 0,
 							 NULL, NULL, NULL);
 
+	/* Query pushdown (design/shard-phase2b.md, sections 6 and 13). */
+	DefineCustomBoolVariable("kingres_shard.enable_pushdown",
+							 "Let a read that spans shard groups be run by the groups themselves when the planner finds that cheaper.",
+							 "Master switch of the pushdown paths.  When off, such a read is answered by the row-moving distributed scan, as in 2a (pruning and the placement check stay on).",
+							 &kingres_shard_enable_pushdown,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("kingres_shard.enable_pushdown_closed",
+							 "Let a closed read (every output row depends on the rows of one shard group) be run whole by every group.",
+							 "A grouping, a DISTINCT or a join on the distribution key, with no row that depends on two groups.  When off, such a read is answered by the row-moving distributed scan.",
+							 &kingres_shard_enable_pushdown_closed,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+
 	DefineCustomBoolVariable("kingres_shard.enable_colocated_insert_select",
 							 "Ship a colocated INSERT ... SELECT whole to every shard group, so that no row passes through this node.",
 							 "When off, such a statement goes through the row router when it can (no ON CONFLICT DO UPDATE) and is refused when it cannot.",
@@ -328,6 +350,7 @@ _PG_init(void)
 	kingres_shard_recovery_init();
 	kingres_shard_fanout_init();
 	kingres_shard_dist_scan_init();
+	kingres_shard_fragment_scan_init();
 	kingres_shard_planner_init();
 	kingres_shard_utility_init();
 	kingres_shard_remote_scan_init();
