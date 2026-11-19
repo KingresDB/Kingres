@@ -3014,12 +3014,25 @@ The number 159 is not used.
     hour, critical at twelve intervals and one hour.
 183. **`retryLedgerAnchor` never raises the generation of a WORM object**; the contract does not
     offer it.
+184. **The evidence format `tsr`** is the DER of the time-stamp token (the CMS structure of the
+    evidence), not a whole time-stamp response, which the cluster does not keep. The bundle of trust
+    anchors of a time-stamp target is for the token; the TLS connection to the authority is checked
+    against the system roots.
+185. **The OpenTimestamps target has a member `headerSource`** that names an explorer which answers
+    block headers (http or https). With it a claim can become anchored on a header that confirms
+    it; without it a claim stays a claim. Its host is one of the hosts the egress rule allows. The
+    answer is bounded, and the hash it names must be the hash of the header it gives.
+186. **Every submitted or claimed OpenTimestamps record has a time for its next look**; a claim that
+    the header source contradicts is written into the record's last error (there is no alert kind
+    for it); the test of a target and a log line at start warn when the table of real headers is
+    older than a year. The outcome "anchored" through a header source is not tested through the
+    control plane, since a real header cannot be made in a test.
 
 Built of step 10: the anchoring framework and the WORM target. Not built in it: the publication of
 evidence files under the publication root, the cluster settings for the limits of retries (the
 defaults of the library apply), the warnings about retention of a WORM object, the monitoring of the
 store's clock, and tests that kill the process inside a round (P8-09 in part). Steps 12 (RFC 3161)
-and 14 (OpenTimestamps) register their kinds in the same framework.
+and 14 (OpenTimestamps) register their kinds in the same framework and are built (184 to 186).
 
 Of section 13: item 2 (test vectors) is settled for signed notes (the example key and note of the
 specification are in the tests; the checkpoint example has no published key), item 3 (entry bundles at
