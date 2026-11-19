@@ -19,15 +19,18 @@ describe('a task whose dialog was closed is still followed (W-13a)', () => {
     const dialog = await screen.findByRole('dialog', { name: /drop database reports/i })
     await user.type(within(dialog).getByLabelText(/to confirm/i), 'reports')
     let startedId = 0
+    // The task fails only after the dialog was hidden: on a slow machine the click on "Hide" can come after a poll, and a task that
+    // already failed in the open dialog is not a hidden one.
+    let hidden = false
     mockServer.use(
       http.get('*/api/v1/tasks/:id', ({ params }) => {
         startedId = Number(params.id)
         return HttpResponse.json({
           id: startedId,
           kind: 'database.drop',
-          state: 'failed',
+          state: hidden ? 'failed' : 'running',
           progress: { percent: 40, currentStep: null, steps: [] },
-          error: { code: 'x', message: 'the disk is on fire' },
+          error: hidden ? { code: 'x', message: 'the disk is on fire' } : null,
           subject: { type: 'database', id: 'reports' },
           cancellable: false,
           createdAt: '2026-01-01T00:00:00Z',
@@ -39,6 +42,7 @@ describe('a task whose dialog was closed is still followed (W-13a)', () => {
     await user.click(within(dialog).getByRole('button', { name: /^drop database$/i }))
     await user.click(await within(dialog).findByRole('button', { name: /hide \(keeps running\)/i }))
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    hidden = true
 
     // The notice appears when the next poll of the hidden task sees the failure. On a loaded
     // machine that poll can come later than the default wait of one second.
