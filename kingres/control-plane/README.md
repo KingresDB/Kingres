@@ -3173,7 +3173,7 @@ stay in each database and are not listed).
   logs and appends one aggregate leaf in which every member is flagged `retired`. The aggregate log stays open: a database of the same name continues it with new chains.
 * The removal of a server does the same for the chains of the groups whose primary runs on it (`reason: group-removed`), before anything is changed on the server.
 * **A database that disappears without `dropDatabase`.** The owner of a database is a role that is not a superuser, and it can drop the database from SQL; nothing of the control plane sees it. When
-  every group answers for two rounds in a row that the database does not exist, the collector ends the publication of its chains with the same event and `reason: database-missing`, one aggregate leaf
+  every group has answered "no database" without one other answer in between for 30 minutes (`KINGRES_LEDGER_MISSING_FOR`, a duration, changes it; time, not a count of rounds), the system instance does not have the database either, and a critical alert (`ledgerGroupUnread`, subject the database) has warned from the first answer on, the collector ends the publication of its chains with the same event and `reason: database-missing`, one aggregate leaf
   with the members flagged `retired`, and closed logs. An auditor tells it from a rollback: a rollback is `diverged`, with an alert, and the chain log stops with the old head; this is `retired`,
   with a signed event and no alert of divergence. One group that answers "no database" while the others answer is only an unread group. A group that holds another chain than the one published
   (a database made again outside the control plane) gets the same end for the old chain (`reason: chain-replaced`) and a new log for the new one. Options that were rejected: a revoke of the
@@ -3188,3 +3188,44 @@ digests, views, re-signing, a follower and a deposed leader, 512 chains; and the
 behaviour, a TLS listener), `internal/ledgersign` (the signers, the exclusion with the retirement, the event), `internal/httpapi` (the three operations against the contract), and in
 `internal/clustertest` two servers with a database on two groups: the digest, the aggregate, the files over both listeners, the verifier, a kill at each kind of write, the cut off group, the drop and the
 vanished database.
+
+### What the review of the collector and the publication changed (corrections 171 to 178)
+
+* **What was published is kept outside the system database (P8-01).** `<ledger-keys-dir>/published.json` holds the highest size and root of every log that has a signed checkpoint, the number of events and the
+  hash of the last one (package `ledgerstate`; mode 0600, written atomically, with a checksum; no secret). The aggregate leaf and the events hold a clock time and what the chains looked like then, so they are not
+  reproducible, and a restore of `kingres_cp` from an older backup made the publisher sign a second root for a size and a second event for a number with no alert. Now every round, every retirement and every key task that
+  appends an event begins by comparing the database with the record: a database that holds less than was published, or another root at a published size, or another last event, refuses the round (nothing is signed or
+  written) and raises the critical alert `ledgerSignerUnavailable` with the subject `published-state`; it clears itself when the database holds what was published. Before a checkpoint is signed the record is asked
+  again (`Allow`), so a size that was published is never signed with other content whatever the database holds. The record is updated after the store accepted a checkpoint or an event; a crash in between leaves
+  it one behind the database, which is harmless. It is not signed: whoever can write the key directory can already sign with the keys. A **damaged** file refuses everything until an operator removes it.
+* **Every holder.** The leader sends its record to the holders at every pass of the job `ledger.state.sync` (internal call `ledger/state/merge`: the larger size per log, the larger event count; two copies that
+  disagree on one size are refused), and a server that is about to lead and has none asks the others first (`ledger/state/get`) and merges what they hold. Only when no holder answers does it take what its
+  database holds as the starting point, and a log line says so: this is also the first start after an upgrade from a tree without the record. **What is not covered:** a restore of the database when every copy of the
+  record is lost or older than the publication; a mirror or an auditor that holds the later checkpoint is what shows that fork. A restore of both the database and the record to the same older point is the same case.
+* **A retirement is about the checkpoints of the key that retires (P8-02).** After the event `key-retired` the other key keeps signing and the logs grow; the check at the retirement asks for checkpoints that carry a
+  signature of the retiring key above its bound, not for the largest tree of the cluster, and the task ends.
+* **A database that vanished (P8-03).** Time (30 minutes), the system instance and a warning alert instead of two rounds; a chain whose log was closed (any reason) and that comes back with the same chain id is not
+  opened again and not published in silence: a critical `ledgerChainDiverged` names the group, the height and why the log ended, and its new blocks wait for the new epoch of step 20. An auditor sees the closed
+  log with its `chain-retired` event and nothing after it.
+* **Swapped answers and replaced chains (P8-04).** An answer that names the chain of another group's open log is a divergence of both logs (critical alerts, nothing closed, nothing signed). A chain that is really
+  replaced still ends with a signed event and starts a new log, and now raises a critical alert as well.
+* **The rate table (P8-05)** evicts the entry that asked longest ago when it is full, and an IPv6 address counts by its /64. **`ReplaceNote` (P8-06)** accepts only a note whose text is the stored checkpoint's and
+  only while the key revision is the one the signers were read at. **A diverged log that is retired (P8-08)** stays flagged `diverged` in its retiring leaf and its alert is not cleared. **The adoption marker (P8-07)**
+  reads `task <n> key <fingerprint>`, and `Orphan` takes the id of the asking task (a file marked by a later task is not adopted); the marker cannot be made unforgeable against a person who can write the key
+  directory, and the text says so.
+* Decided, not changed (P8-10): tiles and events stay `immutable` (the record now makes a re-signed size impossible, so a mirror's copy cannot be contradicted by this publisher); the aggregate id is a hash of the
+  cluster id and the database name, hidden only as far as the name is unguessable (design 4.9 says so); the listener reads its certificate at start; a peer's answer over the asked number of blocks is refused by `Append`
+  (10 000) and bounded by the 64 MiB limit of the peer client; a future hash version of blocks stops the logs with a divergence that says "not a block header", and needs the decision of step 20 before a version 2 exists.
+
+### `logs.json`, the whole fixture and the blocks of a quiet database (correction 178)
+
+* **`logs.json`** is served at the root of the publication next to `keyring.json` (short cache, `application/json`): `{"format":1,"logs":[{"kind":"chain|aggregate","origin":"...","state":"active|diverged|closed","size":N},...]}`,
+  one line and a newline, the members in this order, the logs in the order of their creation, a log with no checkpoint yet included. It holds no database name (an origin is made of the chain id or of the aggregate id).
+* **What changed in the bytes that the verifier reads, from the fixes of the review:** the tiles, the checkpoints, the entries of the chain logs, the aggregate leaf and the text of an event are unchanged byte for byte.
+  Two things differ. The leaf in which a diverged chain is retired by a drop or a removal now carries the flags of the member as `retired` and `diverged` together (the flag byte 0x06, where it was 0x02), and the event
+  `chain-retired` for it is unchanged. A chain whose log was closed and that comes back is never reopened and never gets a leaf, an event or a tile (an alert only), so no number of an event and no size of a log is ever given
+  to two texts: that assumption of the verifier is now kept by the record `published.json` and by the checks above, with the limit stated there.
+* **The fixture of the cluster test** (`KINGRES_PUBLICATION_FIXTURES`) still saves checkpoints and tiles of the latest state only, and no `events/`, `keyring.json` or `logs.json`. Making `TestLedgerPublicationOfADatabaseOnTwoGroups`
+  keep the whole publication (these files, and two successive checkpoints of each log by saving twice with a round in between) needs a cluster run of the test on both majors, which this round could not queue; it is the first thing
+  to do before the verifier's writer regenerates `kingres/verifier/testdata/publication`. The 305 blocks of a chain where the test wrote 5 rows are not explained yet: the builder's schedule, a block per digest and the
+  blocks of the extension's own tables are the candidates, and whether a quiet database grows by itself is to be measured on a cluster (the number of blocks after an idle hour).

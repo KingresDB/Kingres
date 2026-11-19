@@ -66,6 +66,10 @@ func ParsePath(p string) (LogPath, error) {
 		}
 	}
 	switch parts[0] {
+	case "logs.json":
+		if len(parts) == 1 {
+			return LogPath{Rest: "logs.json"}, nil
+		}
 	case "keyring.json":
 		if len(parts) == 1 {
 			return LogPath{Rest: "keyring.json"}, nil

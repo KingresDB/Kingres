@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgerlog"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgerpub"
@@ -66,6 +67,10 @@ func (c *Collector) aggregateMembers(logs []ledgerpub.LogRow, db string, stale m
 				}
 			}
 			m.Flags = ledgerlog.FlagRetired
+			if strings.Contains(l.Detail, wasDivergedMark) {
+				// a diverged log that is retired by a drop or a removal stays flagged diverged in its retiring leaf (P8-08)
+				m.Flags |= ledgerlog.FlagDiverged
+			}
 			retired = append(retired, l.ID)
 		}
 		members = append(members, m)

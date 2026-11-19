@@ -15,9 +15,9 @@ import (
 // are woken often and decide for themselves when a pass is due (design 6.7).
 const Tick = 10 * time.Second
 
-// MissingRounds is how many rounds in a row every group must answer that a database does not exist before the collector ends the
+// DefaultMissingFor is how long every group must answer that a database does not exist before the collector ends the
 // publication of its chains (ReasonDatabaseMissing). One answer is not enough: an instance that is being rebuilt answers the same.
-const MissingRounds = 2
+const DefaultMissingFor = 30 * time.Minute
 
 // Jobs returns the jobs of the collector for the scheduler (design 6.7): ledger.round and ledger.digest. Both run on the manager leader
 // only, under its term; a pass that returns scheduler.ErrDeposed ends the leadership.
@@ -62,10 +62,7 @@ func (c *Collector) jobRound(ctx context.Context, _ scheduler.Term) error {
 			c.log.Warn("a round of the ledger publication failed", "database", d.Name, "error", err)
 			continue
 		}
-		c.mu.Lock()
-		gone := c.missing[d.Name] >= MissingRounds
-		c.mu.Unlock()
-		if gone {
+		if c.vanished(ctx, d.Name) {
 			// every group says the database does not exist, and nobody dropped it through the control plane: end the publication of its
 			// chains with an event that says so (the owner of a database can drop it from SQL; there is no hook there)
 			if err := c.RetireDatabase(ctx, d.Name, ReasonDatabaseMissing, false); err != nil {

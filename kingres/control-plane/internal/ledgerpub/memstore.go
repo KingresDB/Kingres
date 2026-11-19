@@ -287,15 +287,21 @@ func (m *MemStore) PutCheckpoint(_ context.Context, term scheduler.Term, c Check
 }
 
 // ReplaceNote implements Store.
-func (m *MemStore) ReplaceNote(_ context.Context, term scheduler.Term, logID, size int64, note []byte) error {
+func (m *MemStore) ReplaceNote(_ context.Context, term scheduler.Term, logID, size int64, note []byte, rev int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if err := m.guard(term, "note"); err != nil {
 		return err
 	}
+	if rev != m.keysRevision {
+		return ErrKeysChanged
+	}
 	old, ok := m.checkpoints[logID][size]
 	if !ok {
 		return ErrNotFound
+	}
+	if err := sameText(old.Note, note); err != nil {
+		return err
 	}
 	old.Note = append([]byte(nil), note...)
 	m.checkpoints[logID][size] = old
@@ -458,6 +464,12 @@ func (m *MemStore) LastDigestAt(_ context.Context, database string) (time.Time, 
 func (m *MemStore) Object(ctx context.Context, origin, rest string) (Object, error) {
 	if origin == "" {
 		switch {
+		case rest == "logs.json":
+			logs, err := m.Logs(ctx)
+			if err != nil {
+				return Object{}, err
+			}
+			return Object{Data: LogsJSON(logs), Mutable: true, ContentType: "application/json"}, nil
 		case rest == "keyring.json":
 			if m.Keyring == nil {
 				return Object{}, ErrNotFound

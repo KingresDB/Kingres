@@ -176,16 +176,24 @@ func TestADatabaseThatVanishedEndsWithAnEventThatSaysSo(t *testing.T) {
 	e.round()
 	size := e.aggregateLog().Size
 	e.src.noDB = true
+	e.exists = func(string) (bool, error) { return false, nil }
 	step := func() {
 		e.advance(61 * time.Second)
 		if err := e.coll.jobRound(bg, 5); err != nil {
 			t.Fatal(err)
 		}
 	}
+	// rounds do not end a publication, time does (P8-03): a digest request counts as a round too and changes nothing
+	step()
+	_, _ = e.coll.Round(bg, "shop", OpHead)
 	step()
 	if len(eventsOf(e.keys)) != 0 || e.chainLog(0).State != ledgerpub.StateActive {
-		t.Fatal("one answer that the database is missing is not enough")
+		t.Fatal("two rounds that say the database is missing are not enough")
 	}
+	if !e.hasAlert(AlertUnread + "/raise/critical/database:shop") {
+		t.Errorf("no alert warns that the end is near: %v", e.alerts)
+	}
+	e.advance(DefaultMissingFor)
 	step()
 	ev := eventsOf(e.keys)
 	if len(ev) != 2 {

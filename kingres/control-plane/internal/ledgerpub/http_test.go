@@ -13,6 +13,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
@@ -121,7 +122,7 @@ func TestTheListenerAnswersOnlyTheLayoutAndNeverRedirects(t *testing.T) {
 	h.RatePerSecond = 100000 // this test asks many times from one address
 	notFound := []string{
 		"/", "", "//", "/c", "/c/", "/a", "/events", "/events/", "/events/0", "/events/0000000", "/events/00000a", "/events/000001", "/events/-00001", "/events/+00001",
-		"/keyring.json/", "/keyring.json/x", "/keyring", "/logs.json",
+		"/keyring.json/", "/keyring.json/x", "/keyring",
 		logPrefix, logPrefix + "/", logPrefix + "/tile", logPrefix + "/tile/", logPrefix + "/tile/0", logPrefix + "/tile/0/", logPrefix + "/tile/0/0", logPrefix + "/tile/0/0000",
 		logPrefix + "/tile/00/000", logPrefix + "/tile/64/000", logPrefix + "/tile/0/000.p/0", logPrefix + "/tile/0/000.p/256", logPrefix + "/tile/0/000.p/01", logPrefix + "/tile/0/000/",
 		logPrefix + "/tile/entries", logPrefix + "/checkpoint/", logPrefix + "/checkpoint/x", logPrefix + "/../checkpoint", logPrefix + "/./checkpoint",
@@ -383,6 +384,76 @@ func TestPathParsing(t *testing.T) {
 	for _, p := range []string{"", "tile", "tile/0", "checkpoint/", "Checkpoint", "tile/0/000.p/256", "tile/0/001/000"} {
 		if _, err := ledgerpub.ParseRest(p); err == nil {
 			t.Errorf("%q was accepted", p)
+		}
+	}
+}
+
+// P8-05: 4096 addresses that asked one after the other fill the table; a new auditor is still served (the oldest entry makes room), and a
+// flood from one IPv6 /64 is one client.
+func TestAFullRateTableServesTheNewAuditorAndAnIPv6NetworkIsOneClient(t *testing.T) {
+	h, _, _ := publication(t)
+	now := time.Unix(5000, 0)
+	h.Now = func() time.Time { return now }
+	from := func(addr string) int {
+		r := httptest.NewRequest("GET", logPrefix+"/checkpoint", nil)
+		r.RemoteAddr = addr
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Code
+	}
+	for i := 0; i < 5000; i++ {
+		now = now.Add(time.Millisecond) // all within 10 seconds: nothing is stale
+		if c := from(fmt.Sprintf("10.%d.%d.%d:1", i>>16&255, i>>8&255, i&255)); c != 200 {
+			t.Fatalf("address %d: %d", i, c)
+		}
+	}
+	if c := from("203.0.113.9:1"); c != 200 {
+		t.Fatalf("a new auditor with a full table: %d", c)
+	}
+	// one /64 is one client: its budget is shared by every address of it
+	h.RatePerSecond = 3
+	got429 := false
+	for i := 0; i < 20; i++ {
+		if from(fmt.Sprintf("[2001:db8:1:2:%x::1]:1", i+1)) == 429 {
+			got429 = true
+		}
+	}
+	if !got429 {
+		t.Error("twenty addresses of one /64 were not limited")
+	}
+	if c := from("[2001:db8:9:9::1]:1"); c != 200 {
+		t.Errorf("another network: %d", c)
+	}
+}
+
+// P8-09: every answer says nosniff and a public CORS header (the mutants that the review found alive).
+func TestEveryAnswerSaysNosniffAndTheCORSHeader(t *testing.T) {
+	h, _, _ := publication(t)
+	for _, p := range []string{logPrefix + "/checkpoint", logPrefix + "/nothing", "/keyring.json"} {
+		w := get(t, h, "GET", p)
+		if w.Header().Get("X-Content-Type-Options") != "nosniff" {
+			t.Errorf("%s: no nosniff (status %d)", p, w.Code)
+		}
+	}
+	if w := get(t, h, "GET", logPrefix+"/checkpoint"); w.Header().Get("Access-Control-Allow-Origin") != "*" {
+		t.Errorf("no CORS header: %v", w.Header())
+	}
+}
+
+// logs.json lists the logs of a publication in a defined format (correction 178), is served like the key ring, and has no other spelling.
+func TestLogsJSONListsTheLogsInTheDefinedFormat(t *testing.T) {
+	h, l, _ := publication(t)
+	w := get(t, h, "GET", "/logs.json")
+	if w.Code != 200 || w.Header().Get("Content-Type") != "application/json" || w.Header().Get("Cache-Control") != ledgerpub.CacheMutable {
+		t.Fatalf("%d %v", w.Code, w.Header())
+	}
+	want := `{"format":1,"logs":[{"kind":"chain","origin":"` + l.Origin + `","state":"active","size":300}]}` + "\n"
+	if w.Body.String() != want {
+		t.Errorf("logs.json is %q, want %q", w.Body.String(), want)
+	}
+	for _, p := range []string{"/logs.json/", "/logs.json/x", "/logs", "/LOGS.json"} {
+		if c := get(t, h, "GET", p).Code; c != 404 && c != 400 {
+			t.Errorf("%s: %d", p, c)
 		}
 	}
 }

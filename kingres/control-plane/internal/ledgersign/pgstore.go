@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgerkeys"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgerlog"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/scheduler"
 )
 
@@ -137,7 +138,15 @@ func (s PGStore) Commit(ctx context.Context, term scheduler.Term, expect int64, 
 		if tag.RowsAffected() != 1 {
 			return ErrConflict
 		}
-		if ch.CheckpointBound != nil {
+		if ch.CheckpointBound != nil && ch.BoundKey != nil {
+			max, err := signedByMax(ctx, tx, ch.BoundKey, int64(*ch.CheckpointBound)) //nolint:gosec // a bound is below 2^62
+			if err != nil {
+				return err
+			}
+			if max > *ch.CheckpointBound {
+				return fmt.Errorf("%w: a checkpoint signed by the retired key above its bound was stored meanwhile", ErrConflict)
+			}
+		} else if ch.CheckpointBound != nil {
 			var max int64
 			if err := tx.QueryRow(ctx, `SELECT coalesce(max(size), 0) FROM kingres_cp.ledger_checkpoint`).Scan(&max); err != nil {
 				return err
@@ -254,4 +263,49 @@ func (s PGStore) MaxCheckpointSize(ctx context.Context) (uint64, error) {
 		n = 0
 	}
 	return uint64(n), err //nolint:gosec // not negative
+}
+
+// signedByMax is the largest size above floor of a stored checkpoint that carries a signature of pub (the line is the one of the key id
+// for the origin of the log it belongs to). It reads the notes of the checkpoints above the floor only: after the key-retired event that
+// is what the other key has signed since, a few rows.
+func signedByMax(ctx context.Context, q interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}, pub ed25519.PublicKey, floor int64) (uint64, error) {
+	rows, err := q.Query(ctx, `SELECT l.origin, c.size, c.note FROM kingres_cp.ledger_checkpoint c JOIN kingres_cp.ledger_log l USING (log_id) WHERE c.size > $1`, floor)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	var max uint64
+	for rows.Next() {
+		var origin string
+		var size int64
+		var note []byte
+		if err := rows.Scan(&origin, &size, &note); err != nil {
+			return 0, err
+		}
+		n, err := ledgerlog.ParseNote(note)
+		if err != nil {
+			// a note that does not parse cannot be shown to carry the key; the checkpoint was written by this daemon, so this is damage: refuse
+			return 0, fmt.Errorf("a stored checkpoint of %s does not parse: %w", origin, err)
+		}
+		id := ledgerkeys.KeyID(origin, pub)
+		for _, s := range n.Signatures {
+			if s.Name == origin && s.ID == id && uint64(size) > max { //nolint:gosec // sizes are positive
+				max = uint64(size) //nolint:gosec // as above
+			}
+		}
+	}
+	return max, rows.Err()
+}
+
+// MaxCheckpointSizeSignedBy implements Store.
+func (s PGStore) MaxCheckpointSizeSignedBy(ctx context.Context, pub ed25519.PublicKey) (uint64, error) {
+	var n uint64
+	err := s.Sys(ctx, func(c *pgx.Conn) error {
+		var err error
+		n, err = signedByMax(ctx, c, pub, 0)
+		return err
+	})
+	return n, err
 }

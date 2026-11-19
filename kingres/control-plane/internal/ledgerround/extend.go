@@ -169,6 +169,13 @@ func (c *Collector) ensureCheckpoint(ctx context.Context, pc ledgersign.PubConte
 	if cp.Size != uint64(l.Size) || !bytes.Equal(cp.Root[:], l.Root) { //nolint:gosec // not negative
 		return fmt.Errorf("the log %s is at size %d and the stored frontier at %d: nothing is signed", l.Origin, cp.Size, l.Size)
 	}
+	if p := c.cfg.Published; p != nil {
+		// what was published is not signed again with other content (P8-01), whatever the database holds
+		if err := p.Allow(l.Origin, l.Size, l.Root); err != nil {
+			c.publishedAlert(ctx, "A checkpoint of "+l.Origin+" would contradict what was published: "+err.Error(), true)
+			return fmt.Errorf("%w: %v", ErrPublishedState, err)
+		}
+	}
 	note, err := ledgerlog.SignCheckpoint(ctx, cp, pc.Signers...)
 	if err != nil {
 		return fmt.Errorf("signing the checkpoint of %s: %w", l.Origin, err)
@@ -177,6 +184,11 @@ func (c *Collector) ensureCheckpoint(ctx context.Context, pc ledgersign.PubConte
 		pc.Revision, !pc.Locked, pc.Prefix)
 	if errors.Is(err, ledgerpub.ErrConflict) {
 		return c.divergeFatal(ctx, term, db, g, *l, "the store refused the checkpoint: "+err.Error())
+	}
+	if err == nil && c.cfg.Published != nil {
+		if rerr := c.cfg.Published.RecordCheckpoint(l.Origin, l.Size, l.Root); rerr != nil {
+			c.log.Error("a checkpoint was stored and could not be noted in the record of what was published", "origin", l.Origin, "error", rerr.Error())
+		}
 	}
 	return err
 }

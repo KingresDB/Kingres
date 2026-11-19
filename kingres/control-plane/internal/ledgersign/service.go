@@ -91,8 +91,14 @@ type Config struct {
 	PublicationFailure func() string
 	// Alert raises or clears an alert of the cluster; Audit appends an audit event (system actions).
 	Alert func(ctx context.Context, kind, severity, subject, message string, raise bool)
-	Audit func(ctx context.Context, ev audit.Event)
-	Log   *slog.Logger
+	// Published is the record of what was published, outside the system database (internal/ledgerstate, P8-01): an event is appended only
+	// while the database holds the events that were published, and every stored event is noted. Nil in tests that do not need it.
+	Published Published
+	// PublishedCheck, when set, is called before an event is appended: the full check of the collector (it pulls the record from the other
+	// holders and starts one from the database when there is none).
+	PublishedCheck func(ctx context.Context) error
+	Audit          func(ctx context.Context, ev audit.Event)
+	Log            *slog.Logger
 	// ConflictTries is how often a change is read and decided again after a conflict (default 5).
 	ConflictTries int
 	// TermWait is how long a step waits for the term (default 30 s).
@@ -306,8 +312,30 @@ func (s *Service) mutate(ctx context.Context, f func(v *view, now time.Time) (*C
 		if ch == nil {
 			return nil
 		}
+		if len(ch.Events) > 0 && s.cfg.PublishedCheck != nil {
+			if err := s.cfg.PublishedCheck(ctx); err != nil {
+				return &coded{code: "published_state", msg: err.Error()}
+			}
+		}
+		if len(ch.Events) > 0 && s.cfg.Published != nil {
+			// an event is appended only while the database holds what was published (P8-01): a restored database would reuse numbers
+			var last []byte
+			if n := len(v.snap.Events); n > 0 {
+				last = v.snap.Events[n-1].Note
+			}
+			if err := s.cfg.Published.AllowEvent(int64(len(v.snap.Events)), last); err != nil {
+				return &coded{code: "published_state", msg: err.Error()}
+			}
+		}
 		switch err := s.cfg.Store.Commit(ctx, term, v.snap.Revision, *ch); {
 		case err == nil:
+			if s.cfg.Published != nil {
+				for _, e := range ch.Events {
+					if err := s.cfg.Published.RecordEvent(e.Seq, e.Note); err != nil && s.cfg.Log != nil {
+						s.cfg.Log.Error("an event was stored and could not be noted in the record of what was published", "seq", e.Seq, "error", err.Error())
+					}
+				}
+			}
 			return nil
 		case errors.Is(err, ErrConflict):
 			lastErr = err
@@ -659,4 +687,10 @@ func (s *Service) holderSet(ctx context.Context) ([]string, error) {
 
 func fingerprintOK(fp string) bool {
 	return fingerprintRE.MatchString(strings.ToLower(fp)) && fp == strings.ToLower(fp)
+}
+
+// Published is what the key service needs of the state of internal/ledgerstate.
+type Published interface {
+	AllowEvent(count int64, lastNote []byte) error
+	RecordEvent(seq int64, note []byte) error
 }

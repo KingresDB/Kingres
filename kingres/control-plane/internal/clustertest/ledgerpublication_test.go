@@ -504,6 +504,8 @@ func TestLedgerRoundSurvivesAKillAtEachKindOfWrite(t *testing.T) {
 }
 
 func TestLedgerPublicationEndsWhenADatabaseIsDroppedAndWhenItVanishes(t *testing.T) {
+	// the daemons read the time a database must be missing before its publication ends; the default is 30 minutes (P8-03)
+	t.Setenv("KINGRES_LEDGER_MISSING_FOR", "20s")
 	p := formPublishing(t, "drop_db", "vanish_db")
 	c := p.c
 	leader, follower := c.Nodes[0], c.Nodes[1]
@@ -582,7 +584,18 @@ func TestLedgerPublicationEndsWhenADatabaseIsDroppedAndWhenItVanishes(t *testing
 			t.Errorf("a vanished database raised %v", it)
 		}
 	}
-	ab := leader.Expect(200, "GET", "/databases/vanish_db/ledger/aggregate", nil)
+	// the leaf that flags the members retired follows the events by a moment
+	var ab map[string]any
+	until(t, time.Minute, "the aggregate of the vanished database to say retired", func() bool {
+		ab = leader.Expect(200, "GET", "/databases/vanish_db/ledger/aggregate", nil)
+		n := 0
+		for _, m := range anyList(ab["members"]) {
+			if f := anyList(asMap(m)["flags"]); len(f) > 0 && f[len(f)-1] == "retired" {
+				n++
+			}
+		}
+		return n == 2
+	})
 	retired = 0
 	for _, m := range anyList(ab["members"]) {
 		if f := anyList(asMap(m)["flags"]); len(f) > 0 && f[len(f)-1] == "retired" {
