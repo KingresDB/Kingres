@@ -96,6 +96,8 @@ type Deps struct {
 	LedgerPublication LedgerPublisher
 	// LedgerSigning serves the signing keys and the settings of the ledger (phase 7); nil makes them answer "not supported".
 	LedgerSigning LedgerSigner
+	// LedgerAnchoring serves the anchor targets and the anchor records of the ledger (phase 7, step 10); nil makes them answer "not supported".
+	LedgerAnchoring LedgerAnchoring
 	// Config serves the Configuration operations (phase 13); nil makes them answer "not supported".
 	Config *pgconfig.Leader
 	// LocalSettings serves getThisServerSettings and updateThisServerSettings;

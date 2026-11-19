@@ -160,6 +160,10 @@ var Calls = map[string]Policy{
 	"POST /ledger/key/remove":  LeaderOnly,
 	"POST /ledger/key/list":    LeaderOnly,
 
+	// The credentials of anchor targets (internal-api.md, "The credentials of anchor targets"): the leader gives a holder the file, takes it away.
+	"POST /ledger/anchor/credentials/install": LeaderOnly,
+	"POST /ledger/anchor/credentials/remove":  LeaderOnly,
+
 	// The record of what was published (internal-api.md, "The record of what was published"): the leader merges its state into a holder's, and a server that
 	// is about to lead and has none asks the others for theirs.
 	"POST /ledger/state/get":   LeaderOnly,
@@ -192,6 +196,7 @@ var handled = map[string]bool{
 	"POST /failover/unfreeze": true, "POST /failover/standbys-gone": true,
 	"POST /failover/lease": true, "POST /failover/demote": true, "POST /failover/promote": true, "POST /failover/prepared": true, "POST /standby/repoint": true,
 	"POST /ledger/key/install": true, "POST /ledger/key/remove": true, "POST /ledger/key/list": true,
+	"POST /ledger/anchor/credentials/install": true, "POST /ledger/anchor/credentials/remove": true,
 	"POST /ledger/state/get": true, "POST /ledger/state/merge": true,
 	"POST /ledger/read": true, "POST /ledger/publication/get": true,
 	"POST /config/state": true, "POST /config/apply": true, "POST /config/check": true, "POST /config/restart": true, "GET /time": true,

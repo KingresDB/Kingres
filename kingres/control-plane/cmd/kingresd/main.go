@@ -369,6 +369,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		}
 		deps.LedgerSigning = lgs.svc
 		deps.LedgerPublication = lgs.coll
+		deps.LedgerAnchoring = lgs.anchor
 	}
 	deps.LeaderTrusted = leaderTrusted(haReg, lastLeader, serverHost, cfg.HA.LeaderLossBound)
 	api, err := httpapi.New(deps)

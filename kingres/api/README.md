@@ -371,6 +371,15 @@ subject `ledgerKey` with the id `signing`, and their task error codes are not an
 `clock`, `term_over`, `not_leader`, `last_signing_key`, `key_files_remain`, `key_file_missing`, `signer_unavailable`, `cannot_sign`, `cannot_activate`,
 `cannot_retire`, `cannot_revoke`, `trust_file`, `key_id_collision`.
 
+Step 10 of the plan adds, **without a change of the contract**, `listLedgerAnchorTargets`, `createLedgerAnchorTarget`, `getLedgerAnchorTarget`, `updateLedgerAnchorTarget`,
+`deleteLedgerAnchorTarget`, `testLedgerAnchorTarget`, `listLedgerAnchors`, `anchorLedgerNow`, `retryLedgerAnchor` and `downloadLedgerAnchor` (the WORM target; the
+formats `ots` and `tsr` of the download answer 422 `unprocessable` until their targets are built). Decisions where the contract is silent: a target is created
+disabled unless `enabled` is true, and enabling a target of a kind that needs credentials without them is 400 `validation_failed`; `credentials` is read once and never
+returned (`credentialsSet` says whether they are stored; an empty object removes them, `null` or an absent member changes nothing); `config.credentialsPath` names the
+operator's own credentials file instead; the state `claimed` of an OpenTimestamps record is shown as `submitted` in `LedgerAnchor.state` and never counts as anchored;
+a record of a deleted target has `targetId: null` and keeps `targetName`; `retryLedgerAnchor` answers 409 `conflict` for a record that is not `failed` or `expired`;
+a follower forwards all ten to the manager leader, which holds the term (503 with `Retry-After` while a new leader has none).
+
 What is secret and what is not: a private key, a seed, a passphrase and a credential of an anchor target are never part of an answer, a task,
 an audit entry or an error; the public key, the fingerprint and the trust file are public and the trust file is not a source of first trust
 (an auditor compares the fingerprint with one obtained out of band). The signing keys are one set per cluster and live on the manager

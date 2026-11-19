@@ -17,6 +17,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/config"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fault"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/leader"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgeranchor"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgerkeys"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgerpub"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgerround"
@@ -36,7 +37,9 @@ type ledgerParts struct {
 	// coll is the collector of the publication (steps 5 and 6); listener serves the published files, nil when none is configured.
 	coll     *ledgerround.Collector
 	listener *ledgerpub.Listener
-	log      *slog.Logger
+	// anchor is the anchoring of the aggregate checkpoints (step 10).
+	anchor *ledgeranchor.Service
+	log    *slog.Logger
 }
 
 // defaultOriginPrefix is the origin prefix used until the operator sets one: the address of this server and
@@ -283,7 +286,11 @@ func newLedgerParts(cfg config.Config, svc *cluster.Service, self string, log *s
 		calls.Register(ledgerround.CallRead, func(ctx context.Context, _ string, body []byte) (any, error) { return reader.Handle(ctx, body) })
 		calls.Register(ledgerround.CallPublicationGet, func(ctx context.Context, _ string, body []byte) (any, error) { return files.Handle(ctx, body) })
 	}
-	return &ledgerParts{svc: s, sched: sched, coll: coll, listener: listener, log: log}, nil
+	anch, err := newLedgerAnchor(cfg, dir, sys, sched, members, calls, self, log, alertFn)
+	if err != nil {
+		return nil, err
+	}
+	return &ledgerParts{svc: s, sched: sched, coll: coll, listener: listener, anchor: anch, log: log}, nil
 }
 
 // run is the loop of the scheduler; it ends when ctx ends and zeroes the opened keys then. The publication listener, when one is configured,

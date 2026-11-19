@@ -58,7 +58,7 @@ internal/
   scheduler/              the recurring jobs of the manager leader, the term and its guard (ledger phase 7)
   ledgersign/             the signing keys of the ledger: key files, key tasks, events, trust file, jobs (ledger phase 7)
   ledgerkeys/, ledgerlog/, anchor/  libraries of ledger phase 7 (keys and their state machine; logs, tiles, checkpoints; anchoring); ledgerkeys and
-                          ledgerlog are wired by ledgersign, anchor by a later step
+                          ledgerlog are wired by ledgersign, anchor by ledgeranchor (steps 10, 12 and 14)
   ops/                    operations that change the cluster (roles, grants, databases, tables, network, workbench)
   sdnotify/               systemd readiness notification
   pgtest/, contracttest/  test helpers (real instances; contract response validation)
@@ -338,7 +338,7 @@ paths; what is not done is in "Not done in this increment"). "Real" means the op
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **112 of 132 operations are real; 20 answer "not yet".**
+authenticated operation lists in 0.2.0. **122 of 132 operations are real; 10 answer "not yet".**
 
 | Tag | Real | Not yet |
 |---|---|---|
@@ -349,7 +349,7 @@ authenticated operation lists in 0.2.0. **112 of 132 operations are real; 20 ans
 | Roles | `listClusterRoles`, `listRoles`, `createRole`, `getRole`, `deleteRole`, `updateRole`, `setRoleClusterRoles`, `setRoleMemberships` |  |
 | Databases | `getDatabaseCreateOptions`, `listDatabases`, `createDatabase`, `getDatabase`, `dropDatabase`, `updateDatabase` |  |
 | Shards | `getBucketDistribution`, `listColocationGroups`, `listBuckets` |  |
-| Ledger | `getLedgerStatus`, `listLedgerBlocks`, `listLedgerDigests`, `generateLedgerDigest`, `startLedgerVerification`, `listLedgerStatus`, `createInclusionProof`, `listLedgerVerifications`, `getLedgerVerification`, `getLedgerSettings`, `updateLedgerSettings`, `getLedgerSigning`, `createLedgerSigningKey`, `retireLedgerSigningKey`, `revokeLedgerSigningKey`, `getLedgerTrustFile`, `getLedgerPublication`, `getLedgerAggregate`, `listLedgerAggregates` | `listLedgerAnchorTargets`, `createLedgerAnchorTarget`, `getLedgerAnchorTarget`, `updateLedgerAnchorTarget`, `deleteLedgerAnchorTarget`, `testLedgerAnchorTarget`, `listLedgerAnchors`, `anchorLedgerNow`, `retryLedgerAnchor`, `downloadLedgerAnchor`, `createLedgerBundle`, `getLedgerBundle`, `listLedgerClientKeys`, `registerLedgerClientKey`, `revokeLedgerClientKey`, `setTableSignaturePolicy`, `upgradeLedgerExtension`, `acknowledgeLedgerDivergence` |
+| Ledger | `getLedgerStatus`, `listLedgerBlocks`, `listLedgerDigests`, `generateLedgerDigest`, `startLedgerVerification`, `listLedgerStatus`, `createInclusionProof`, `listLedgerVerifications`, `getLedgerVerification`, `getLedgerSettings`, `updateLedgerSettings`, `getLedgerSigning`, `createLedgerSigningKey`, `retireLedgerSigningKey`, `revokeLedgerSigningKey`, `getLedgerTrustFile`, `getLedgerPublication`, `getLedgerAggregate`, `listLedgerAggregates`, `listLedgerAnchorTargets`, `createLedgerAnchorTarget`, `getLedgerAnchorTarget`, `updateLedgerAnchorTarget`, `deleteLedgerAnchorTarget`, `testLedgerAnchorTarget`, `listLedgerAnchors`, `anchorLedgerNow`, `retryLedgerAnchor`, `downloadLedgerAnchor` | `createLedgerBundle`, `getLedgerBundle`, `listLedgerClientKeys`, `registerLedgerClientKey`, `revokeLedgerClientKey`, `setTableSignaturePolicy`, `upgradeLedgerExtension`, `acknowledgeLedgerDivergence` |
 | Tables | `getTable`, `distributeTable`, `enableTableLedger`, `listTables` |  |
 | Grants | `listGrants`, `createGrant`, `revokeGrants`, `applyGrantTemplate` |  |
 | Health | `getHealth`, `getReadiness` |  |
@@ -3216,6 +3216,35 @@ vanished database.
 * Decided, not changed (P8-10): tiles and events stay `immutable` (the record now makes a re-signed size impossible, so a mirror's copy cannot be contradicted by this publisher); the aggregate id is a hash of the
   cluster id and the database name, hidden only as far as the name is unguessable (design 4.9 says so); the listener reads its certificate at start; a peer's answer over the asked number of blocks is refused by `Append`
   (10 000) and bounded by the 64 MiB limit of the peer client; a future hash version of blocks stops the logs with a divergence that says "not a block header", and needs the decision of step 20 before a version 2 exists.
+
+## Anchoring of the aggregate checkpoints (phase 7, step 10; the WORM target; contract 0.11.0)
+
+`internal/ledgeranchor` wires the libraries `internal/anchor`, `anchor/sigv4` and `anchor/worm` into the daemon. What it does, by the sections of design 6, with the decisions of corrections 179 to 183:
+
+* **Targets and credentials.** A target is a row of `kingres_cp.ledger_anchor_target` (migration 0032): `kind`, `name`, `enabled`, the non-secret configuration in the spelling of the library of the kind (stored normalised, the
+  defaults filled in), `credentialsSet`, the last test. The credentials are write-only: `createLedgerAnchorTarget` and `updateLedgerAnchorTarget` take a `credentials` object (WORM: `accessKeyId`, `secretAccessKey`,
+  optional `sessionToken`; at least four printable ASCII characters each, so that the redaction can find them), the service validates it, writes `<ledger-keys-dir>/anchor/<id>.json` (mode 0600, in clear without a
+  passphrase file, sealed with AES-256-GCM under PBKDF2 of the passphrase file with one; written atomically) and hands the file to the holders by the internal call `ledger/anchor/credentials/install`. Nothing returns
+  them: not the target, not the list, not an error, not a log line, not a task row, not an alert, not the audit entry (it says `credentialsChanged`, no more). `{}` removes them. A target may instead name
+  `credentialsPath` in its configuration, the operator's own file (JSON with the same members, a regular file that only its owner can read), read at every use and never copied. An enabled target needs credentials.
+  `credentialsSet` is false until they are given, and a target without them is built as a failed check, not as a crash.
+* **Records and jobs.** `kingres_cp.ledger_anchor` keeps one record per (target, aggregate log, size) with the signed note it was made for (a re-signing at a rotation does not change the bytes a retry sends), the evidence as
+  text (the strict parsers read canonical bytes only), the counters of the library, `submit_start` and `generation`, and a `version` that every write raises. Four jobs run on the leader under its term:
+  `ledger.anchor.enqueue` (every `anchor.intervalSeconds`, and on `anchorLedgerNow`: a record of the newest checkpoint per enabled target and database; an older record that is still pending is superseded in the same
+  transaction), `ledger.anchor.submit` (30 s), `ledger.anchor.upgrade` (60 s) and `ledger.anchor.monitor` (10 s). Every write begins with the term guard; a follower holds no term and runs no job, a deposed leader's write is
+  refused. A submit is made in three writes that survive a kill at any point: the start of the first submission is written before the call (duty 1 of the library), the call is made with no transaction open and a
+  timeout, and the result is written by a compare and swap on the version of the row (a result that finds the row changed is dropped). A target that hangs holds one place of a pass, not the pass.
+* **What anchored means.** Only a receipt that the library of the kind returned, with evidence that its own parser reads back, moves a record to `anchored`; a record's state changes only through the methods of
+  `anchor.Record`; `claimed` (OpenTimestamps) is shown as `submitted` and never counts. `retryLedgerAnchor` puts a failed or expired record back to pending (it never raises the generation of a WORM key, which is an explicit
+  choice the contract does not offer; the start and the generation are kept). `downloadLedgerAnchor` writes the evidence file of the library (`json`); `ots` and `tsr` come with their targets.
+* **Outgoing requests (correction 180).** A client reaches exactly the host and port of the configuration (the endpoint, or the S3 host of the region with the virtual host of the bucket) and no other: the dialer refuses
+  every other address, the libraries follow no redirect, and no proxy is read. An address written in the configuration is connected to as written; a host name that resolves to a loopback, link-local, unspecified or
+  multicast address is refused (a name that leads to a metadata service or to this server); private addresses are fine for names. Without `caBundlePath` the roots of the system are used; with one, those only.
+* **Alerts (6.6, 6.9).** The alerts are a function of the state, recomputed every 10 s and written only when one appears, changes severity or goes away: `ledgerNotAnchored` (`database:<name>`, info, warning when
+  `anchor.required`), `ledgerAnchorBehind` (`target:<id>`: warning after three intervals and an hour, critical after twelve and an hour, counted from the oldest checkpoint the target has not covered and not earlier
+  than the target was switched on), `ledgerAnchorFailed` (`target:<id>`, from a failed or expired record, worded from the code and the text of the error, cleared by a Retry or by deleting the target) and
+  `ledgerAnchorConflict` (`database:<name>|target:<id>`).
+* The settings are those of `getLedgerSettings`; the contract did not change (the operations were in 0.11.0 and answered `unsupported_operation`).
 
 ### `logs.json`, the whole fixture and the blocks of a quiet database (correction 178)
 
