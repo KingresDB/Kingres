@@ -4156,7 +4156,7 @@ kc_write_init(void)
 							PGC_SUSET, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 	DefineCustomIntVariable("kingres_columnar.reserve_gate_at",
 							"The point of the reservation where reserve_gate waits: 1 numbers taken, 2 reserved row inserted, 3 pages written, 4 row updated (testing).",
-							NULL, &kc_guc_reserve_gate_at, 0, 0, 4,
+							NULL, &kc_guc_reserve_gate_at, 0, 0, 5,
 							PGC_SUSET, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 
 #ifdef USE_ASSERT_CHECKING

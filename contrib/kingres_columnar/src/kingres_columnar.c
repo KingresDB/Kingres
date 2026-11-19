@@ -573,8 +573,10 @@ kingres_columnar_info(PG_FUNCTION_ARGS)
 	 * compaction replaced, and of a load that is still in progress (an
 	 * estimate at any moment).  VACUUM gives back such pages at the end of the
 	 * file when they are at least 1000 pages or a sixteenth of it (heap's rule),
-	 * and nothing reuses them in the middle of the file, so a file whose number
-	 * stays high after a VACUUM is waiting for VACUUM FULL.  Read with a
+	 * and VACUUM lists the ones in the middle of the file for the next stripes to
+	 * reuse (C8), so the number includes blocks that are free and waiting to be
+	 * taken; a number that stays high through loads and vacuums is waiting for
+	 * VACUUM FULL.  Read with a
 	 * snapshot of this moment, whatever the caller's snapshot is.
 	 */
 	{
@@ -1013,6 +1015,8 @@ kc_check_one(Oid relid, bool fix, KcCheckSink *sink)
 	int			i;
 	KcStripeInfo *s;
 	BlockNumber nblocks;
+	KcFreeExtent fa[KC_MAX_FREE_EXTENTS];
+	int			nfa;
 
 	kc_check_gate(KC_GATE_TABLES);
 
@@ -1064,6 +1068,8 @@ kc_check_one(Oid relid, bool fix, KcCheckSink *sink)
 	 * after it, and would call a damaged table clean.  The orphan step has
 	 * always read the catalog this way.
 	 */
+	/* the list of free blocks before the stripes, and again after (C8): only what both hold is judged */
+	nfa = kc_meta_free_read(rel, fa, KC_MAX_FREE_EXTENTS);
 	cs = kc_latest_snapshot();
 	s = kc_catalog_load(rel, cs, &n);
 	pfree(cs);
@@ -1122,6 +1128,40 @@ kc_check_one(Oid relid, bool fix, KcCheckSink *sink)
 		kc_check_row(sink, problem, RelationGetRelid(rel), detail);
 		if (fix && strcmp(problem, "stripe_beyond_file") == 0)
 			(void) kc_catalog_delete_stripe(kc_rel_ident(rel)->uid, s[i].stripe_id, false);
+	}
+	/*
+	 * The list of free blocks (C8) must name no block of a stripe visible now: a writer would
+	 * overwrite it.  (A list that is not sound reads as empty, which loses space and nothing else.)
+	 */
+	{
+		KcFreeExtent fe[KC_MAX_FREE_EXTENTS];
+		int			nfe = kc_meta_free_read(rel, fe, KC_MAX_FREE_EXTENTS);
+		int			k;
+		int			a;
+
+		for (k = 0; k < nfe; k++)
+		{
+			bool		kept = false;
+
+			for (a = 0; a < nfa; a++)
+				if (fa[a].first <= fe[k].first &&
+					(uint64) fa[a].first + fa[a].nblocks >= (uint64) fe[k].first + fe[k].nblocks)
+					kept = true;
+			if (!kept)
+				continue;
+			for (i = 0; i < n; i++)
+				if (s[i].first_block < (uint64) fe[k].first + fe[k].nblocks &&
+					(uint64) fe[k].first < s[i].first_block + s[i].block_count)
+				{
+					char		detail[256];
+
+					snprintf(detail, sizeof(detail), "the free blocks %u to %u overlap stripe " UINT64_FORMAT " (blocks %llu to %llu)",
+							 fe[k].first, fe[k].first + fe[k].nblocks - 1, s[i].stripe_id,
+							 (unsigned long long) s[i].first_block,
+							 (unsigned long long) (s[i].first_block + s[i].block_count - 1));
+					kc_check_row(sink, "free_extent_overlaps_stripe", RelationGetRelid(rel), detail);
+				}
+		}
 	}
 	if (s)
 	{

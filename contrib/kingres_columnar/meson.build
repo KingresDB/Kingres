@@ -146,6 +146,7 @@ tests += {
       't/059_compact_index.pl',
       't/060_compact_index_crash_standby.pl',
       't/061_logical.pl',
+      't/062_free_extents.pl',
     ],
   },
 }

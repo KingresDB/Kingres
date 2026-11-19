@@ -457,6 +457,38 @@ extern void kc_reserve_lock(Relation rel, LOCKMODE mode);
 extern void kc_reserve_unlock(Relation rel, LOCKMODE mode);
 extern bool kc_scan_dirty_fetch(Relation rel, ItemPointer tid, Snapshot snap, TupleTableSlot *slot);
 extern void kc_index_vacuum(Relation rel, bool skip, double live_rows, BufferAccessStrategy bstrategy);
+
+/*
+ * Free extents (increment C8).  The blocks of the file that no stripe any snapshot can
+ * still see occupies are listed in the metapage, after KcMetaData: VACUUM finds them (the
+ * complement of the stripe catalog's block ranges, while no writer is running) and a writer
+ * takes a run for its stripe before it extends the file.  A list that is missing, damaged or
+ * full loses space, never data: the next VACUUM works it out again.
+ */
+#define KC_FREE_MAGIC			0x4B434652	/* "KCFR" */
+#define KC_MAX_FREE_EXTENTS		400
+
+typedef struct KcFreeExtent
+{
+	uint32		first;			/* first block, at least 1 */
+	uint32		nblocks;
+} KcFreeExtent;
+
+typedef struct KcFreeList
+{
+	uint32		magic;
+	uint32		count;
+	uint32		crc;			/* CRC-32C of count and the extents, with this field zero */
+	uint32		pad;
+	KcFreeExtent ext[KC_MAX_FREE_EXTENTS];
+} KcFreeList;
+
+extern bool kc_meta_take_extent(Relation rel, uint64 npages, uint64 *first_block);
+extern void kc_meta_free_install(Relation rel, const KcFreeExtent *ext, int n, TransactionId horizon);
+extern void kc_meta_free_trim(Relation rel, BlockNumber nblocks);
+extern int	kc_meta_free_read(Relation rel, KcFreeExtent *out, int cap);
+extern KcRowRange *kc_catalog_live_blocks(Relation rel, TransactionId oldest, int *n_out,
+										  TransactionId *horizon);
 extern int	kc_catalog_delete_uid(uint64 uid);
 extern int	kc_catalog_delete_stripe(uint64 uid, uint64 stripe_id, bool wait);
 extern bool kc_catalog_uid_in_use(uint64 uid);

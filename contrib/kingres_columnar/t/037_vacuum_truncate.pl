@@ -258,10 +258,14 @@ $standby->stop;
 	is(q1("SELECT unreferenced_bytes FROM kingres.columnar_info('big')"), $tail * $BLCKSZ,
 		'columnar_info shows the garbage: unreferenced_bytes is the pages no stripe uses');
 
-	# a load that commits after it makes the pages permanent (nothing reuses them): the figure keeps saying so
+	# a load that commits after it goes into the free pages (C8: VACUUM listed them): the file does
+	# not grow and the figure falls by the pages the new stripe took, instead of keeping the garbage for good
 	q1('INSERT INTO big SELECT g, \'later\' FROM generate_series(1, 10) g');
 	q1('VACUUM big');
-	is(q1("SELECT unreferenced_bytes FROM kingres.columnar_info('big')"), $tail * $BLCKSZ, 'the pages in the middle of the file are still counted after a later load and a VACUUM');
+	is(blocks('big') - $base, $tail, 'a load that commits after the garbage went into its pages: the file did not grow');
+	my $unref = q1("SELECT unreferenced_bytes FROM kingres.columnar_info('big')");
+	cmp_ok($unref, '<', $tail * $BLCKSZ, 'the unused bytes fell by what the new stripe took');
+	cmp_ok($unref, '>=', ($tail - 3) * $BLCKSZ, '... which is a page or two');
 	q1('VACUUM FULL big');
 	is(q1("SELECT unreferenced_bytes FROM kingres.columnar_info('big')"), 0, 'VACUUM FULL gives all of it back');
 

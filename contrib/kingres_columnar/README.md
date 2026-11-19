@@ -704,25 +704,48 @@ exactly where the server may refuse to assign one.  It still advances
 a truncation that is cancelled while it waits for its lock, or given up, has
 already done what matters for the age (`t/041`).
 
-**Space in the middle of the file is not reused, and that is a choice.**  Pages
-of rolled-back or crashed loads and of stripes replaced by `columnar_compact`
-stay until they are at the end of the file and worth giving back, or until the
-table is rewritten with `VACUUM FULL`.  The rule for "worth giving back" is
-heap's (1000 pages or a sixteenth), so a failed load whose aborted tail is below
-it is not cut, and once another load commits after it those pages are in the
-middle of the file for good; a workload of failing and retried loads grows the
-file without a bound until a `VACUUM FULL`.  An earlier version of this round
-cut such a tail at every vacuum, whatever its size, and took `ACCESS EXCLUSIVE`
-for it every time; that was given up on purpose (C10-06), and reusing the space
-is a feature of its own that this version does not have (C11-06).  What the
-operator has is the measure: `kingres.columnar_info(rel).unreferenced_bytes` is
-what the file holds that no stripe visible now uses; a figure that stays high
-after a `VACUUM` is waiting for `VACUUM FULL` (or, for a table that takes no
-`VACUUM FULL` window, for the file to be rebuilt by `ALTER TABLE ... SET ACCESS
-METHOD`).  `t/037` shows it for a tail below the threshold, before and after a
-later load.  The cost of each vacuum also grows with the stripe catalog (it is
-read in full by the decision and again under the lock, besides the clean-up of
-the catalog), which a catalog of millions of stripes will notice.
+**Space in the middle of the file is reused (0.2, C8).**  Pages of rolled-back or
+crashed loads and of stripes replaced by `columnar_compact` are listed by `VACUUM`
+and written over by the next stripes, so a steady load of inserts, compactions and
+vacuums stops growing the file (`t/062`: 40 rounds, the file of the vacuumed table
+stays within 1.5 times its size after ten rounds, the control table that is never
+vacuumed grows several times larger).  **How**: the metapage holds, after its fixed
+part, a list of up to 400 free extents (first block, number of blocks; its own
+checksum; a list that is missing, damaged or not sound reads as empty, which loses
+space and never data).  `VACUUM` takes a `SHARE` lock on the table (without waiting,
+retried every 50 ms for `vacuum_truncate_lock_timeout`, 5 seconds by default, the way
+the truncation takes its lock; given up for this visit when writers do not leave, and
+the next vacuum tries again), reads the stripe catalog and makes the list the complement of
+the block ranges that some version of a stripe row still needs: every version
+whose writer did not abort, except the ones deleted by a transaction that committed before the
+oldest transaction any snapshot may still have, which the catalog's own vacuum is
+about to remove.  The lock is what makes this safe: no writer is running, so pages
+written for a stripe whose catalog row is not there yet cannot be taken for free.  It is
+held for the catalog read and one metapage write and is not WAL-logged (a standby does
+not see it); readers are not blocked.  A stripe that is written takes the first fit of
+the list before it extends the file (`kc_meta_take_extent`: the take is logged before
+any page is written, the pages are written over the run, each with a full-page
+image, the rest of the extent stays); a crash between the take and the pages loses the
+run's place in the list and nothing else (`t/062`: the blocks are free and the next vacuum lists them again).
+**On a standby**: the record that replaces the list carries the newest transaction that deleted a
+stripe whose blocks are listed for the first time, and its replay cancels the standby queries
+that may still hold it (a recovery conflict, as for the removal of a heap tuple), before any
+page can be written again; with `hot_standby_feedback` the primary's oldest snapshot
+includes the standby's, so it does not list the blocks of a stripe the standby can still see
+and the query goes on.  A tail that is free is still given back by the truncation, which
+trims the list.  **What it costs**: one catalog read and one metapage image per `VACUUM`,
+an extra metapage image per stripe that takes a run; and a `VACUUM` of a table that never has a
+quiet moment lists nothing (long writer transactions and continuous load: `DEBUG2` says so),
+so the file grows as before until it has one.  The list holds 400 extents: more runs than that
+keep the largest, the rest stays free and unlisted until a later vacuum has room.
+`kingres.columnar_info(rel).unreferenced_bytes` still counts the blocks the file holds that no
+stripe visible now uses, listed or not; what the next stripes will reuse is part of it.  A rewrite
+(`VACUUM FULL`, `SET ACCESS METHOD`) starts with an empty list, as with a new file.
+`kingres.columnar_check()` reports a list that names a block of a stripe visible now
+(`free_extent_overlaps_stripe`), which would be overwritten.  An earlier version of this section
+said that reusing the space was left out on purpose (C10-06, C11-06) for the cost of an exclusive
+lock at every vacuum; the shared lock above is not that cost, and the design's walk of the stripe
+headers is not needed: the stripe catalog already says what is used.
 
 How the stripe rows of a file that goes away are removed.  Correctness never
 depends on an event trigger firing; the triggers are only a way to do it earlier.

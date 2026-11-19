@@ -167,10 +167,105 @@ kc_truncate_tail(Relation rel)
 		{
 			RelationTruncate(rel, need);
 			cut = true;
+			kc_meta_free_trim(rel, need);
 		}
 	}
 	UnlockRelation(rel, AccessExclusiveLock);
 	return cut;
+}
+
+/*
+ * Free extents (increment C8): list the blocks of the file that no stripe any snapshot can still
+ * see occupies, for the writers to take before they extend the file.  What is free is what no
+ * non-removable catalog row version needs (kc_catalog_live_blocks), within the file past the
+ * metapage, and that is only true while no writer is running, because pages written for a
+ * stripe whose catalog row is not there yet belong to nobody the catalog knows.  A lock that
+ * conflicts with ROW EXCLUSIVE (SHARE) is therefore taken without waiting, retried like the
+ * truncation's (every 50 ms for the same time), and given up for this visit when writers do not
+ * leave: the list is made at the next VACUUM.  Held only for the catalog read and the metapage
+ * write.  SHARE is not WAL-logged, so a standby does not see it.
+ */
+static void
+kc_free_space(Relation rel)
+{
+	int			retry = 0;
+	TransactionId oldest;
+	TransactionId horizon;
+	BlockNumber nblocks;
+	KcRowRange *live;
+	int			nlive;
+	KcFreeExtent *fr;
+	int			nfr = 0;
+	KcFreeExtent cur[KC_MAX_FREE_EXTENTS];
+	int			ncur;
+	uint64		pos = 1;
+	int			i;
+	bool		newly = false;
+	bool		same;
+
+	while (!ConditionalLockRelation(rel, ShareLock))
+	{
+		CHECK_FOR_INTERRUPTS();
+		if (++retry > (kc_guc_truncate_lock_timeout / KC_TRUNCATE_LOCK_WAIT_INTERVAL))
+		{
+			ereport(DEBUG2,
+					(errmsg("\"%s\": the list of free blocks is not made: writers did not leave",
+							RelationGetRelationName(rel))));
+			return;
+		}
+		(void) WaitLatch(MyLatch,
+						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 KC_TRUNCATE_LOCK_WAIT_INTERVAL,
+						 WAIT_EVENT_VACUUM_TRUNCATE);
+		ResetLatch(MyLatch);
+	}
+
+	oldest = GetOldestNonRemovableTransactionId(rel);
+	nblocks = RelationGetNumberOfBlocks(rel);
+	live = kc_catalog_live_blocks(rel, oldest, &nlive, &horizon);
+	fr = palloc(sizeof(KcFreeExtent) * (nlive + 2));
+	for (i = 0; i <= nlive; i++)
+	{
+		uint64		upto = (i < nlive) ? Min(live[i].first, (uint64) nblocks) : (uint64) nblocks;
+
+		if (upto > pos && upto - pos < PG_UINT32_MAX)
+		{
+			fr[nfr].first = (uint32) pos;
+			fr[nfr].nblocks = (uint32) (upto - pos);
+			nfr++;
+		}
+		if (i < nlive && live[i].end > pos)
+			pos = live[i].end;
+	}
+
+	/* the horizon is needed when the list gets blocks it did not hold */
+	ncur = kc_meta_free_read(rel, cur, KC_MAX_FREE_EXTENTS);
+	for (i = 0; i < nfr && !newly; i++)
+	{
+		int			j;
+		bool		covered = false;
+
+		for (j = 0; j < ncur; j++)
+			if (cur[j].first <= fr[i].first &&
+				(uint64) cur[j].first + cur[j].nblocks >= (uint64) fr[i].first + fr[i].nblocks)
+			{
+				covered = true;
+				break;
+			}
+		if (!covered)
+			newly = true;
+	}
+	same = (ncur == nfr);
+	for (i = 0; same && i < nfr; i++)
+		if (cur[i].first != fr[i].first || cur[i].nblocks != fr[i].nblocks)
+			same = false;
+	if (!same)
+		kc_meta_free_install(rel, fr, nfr, newly ? horizon : InvalidTransactionId);
+
+	UnlockRelation(rel, ShareLock);
+	pfree(fr);
+	if (live)
+		pfree(live);
 }
 
 /*
@@ -379,6 +474,10 @@ kc_relation_vacuum(KC_VACUUM_PARAMS)
 
 	/* the entries of the indexes of dead rows (not with INDEX_CLEANUP off) */
 	kc_index_vacuum(rel, params->index_cleanup == VACOPTVALUE_DISABLED, (double) rows, bstrategy);
+
+	/* the blocks no stripe needs, for the writers to reuse (C8): not under the wraparound failsafe, which skips the optional work */
+	if (!failsafe)
+		kc_free_space(rel);
 
 	/*
 	 * The only transaction id a columnar file holds is the one in its

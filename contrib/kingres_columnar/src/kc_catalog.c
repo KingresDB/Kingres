@@ -2058,3 +2058,81 @@ kc_catalog_live_ranges(Relation rel, TransactionId oldest, uint64 next_row,
 	*n_out = m;
 	return r;
 }
+
+/*
+ * The blocks of the file that some stripe row version still needs (increment C8), as disjoint
+ * ranges [first, end) sorted by their first block: the blocks of every version of this table's
+ * stripes whose writer did not abort, except versions deleted by a transaction that committed
+ * before the oldest transaction any snapshot may still have (compaction's old stripes, once
+ * nobody can see them).  A version with no blocks (a reserved row) needs none.  Everything else
+ * in the file, past the metapage, is free, provided no writer is running (the caller's lock
+ * sees to that).  *horizon is the newest transaction among those deleters, which a standby
+ * query may still hold: the record that lists the blocks cancels it.
+ */
+KcRowRange *
+kc_catalog_live_blocks(Relation rel, TransactionId oldest, int *n_out, TransactionId *horizon)
+{
+	Relation	cat = table_open(kc_catalog_oid(), AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	KcRowRange *r = NULL;
+	int			n = 0;
+	int			cap = 0;
+	int			i;
+	int			m;
+
+	*horizon = InvalidTransactionId;
+	ScanKeyInit(&key, Anum_kc_uid, BTEqualStrategyNumber, F_INT8EQ,
+				Int64GetDatum((int64) kc_rel_ident(rel)->uid));
+	scan = systable_beginscan(cat, kc_catalog_index_oid(), true, SnapshotAny, 1, &key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		bool		isnull;
+		uint64		first = (uint64) DatumGetInt64(heap_getattr(tup, Anum_kc_first_block,
+																  RelationGetDescr(cat), &isnull));
+		uint32		cnt = (uint32) DatumGetInt32(heap_getattr(tup, Anum_kc_block_count,
+															  RelationGetDescr(cat), &isnull));
+		HeapTupleHeader th = tup->t_data;
+		TransactionId x;
+		KcVer		v = kc_version_status(th, &x);
+
+		if (v == KC_VER_DEAD || cnt == 0)
+			continue;
+		if (kc_version_superseded(th))
+		{
+			TransactionId xmax = HeapTupleHeaderGetUpdateXid(th);
+
+			if (!TransactionIdIsCurrentTransactionId(xmax) && !TransactionIdIsInProgress(xmax) &&
+				TransactionIdDidCommit(xmax) && TransactionIdPrecedes(xmax, oldest))
+			{
+				if (!TransactionIdIsValid(*horizon) || TransactionIdFollows(xmax, *horizon))
+					*horizon = xmax;
+				continue;
+			}
+		}
+		if (n == cap)
+		{
+			cap = cap ? cap * 2 : 64;
+			r = r ? repalloc(r, sizeof(KcRowRange) * cap) : palloc(sizeof(KcRowRange) * cap);
+		}
+		r[n].first = first;
+		r[n].end = first + cnt;
+		n++;
+	}
+	systable_endscan(scan);
+	table_close(cat, AccessShareLock);
+
+	if (n > 1)
+		qsort(r, n, sizeof(KcRowRange), kc_range_cmp);
+	m = 0;
+	for (i = 0; i < n; i++)
+	{
+		if (m > 0 && r[i].first <= r[m - 1].end)
+			r[m - 1].end = Max(r[m - 1].end, r[i].end);
+		else
+			r[m++] = r[i];
+	}
+	*n_out = m;
+	return r;
+}
