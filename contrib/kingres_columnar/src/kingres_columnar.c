@@ -20,6 +20,13 @@
  */
 #include "postgres.h"
 
+#include "catalog/index.h"
+#include "catalog/namespace.h"
+#include "commands/defrem.h"
+#include "nodes/parsenodes.h"
+#include "tcop/utility.h"
+#include "utils/lsyscache.h"
+
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
@@ -116,6 +123,81 @@ kc_object_access(ObjectAccessType access, Oid classId, Oid objectId, int subId,
 	if (access == OAT_DROP && classId == RelationRelationId && subId == 0 &&
 		!kc_entry_refused("drop note", NULL, false))
 		kc_write_note_dropped(objectId);
+}
+
+/*
+ * Utility statements that touch an index of a columnar table (C6b): the concurrent
+ * forms are refused before they begin (their first transaction would commit an
+ * invalid index that the build then fails to make).  The write of the rows this
+ * transaction holds, before a build reads stripes, is the build's own
+ * (kc_index_build_range_scan).
+ */
+static ProcessUtility_hook_type kc_prev_process_utility = NULL;
+
+static Oid
+kc_columnar_table_of(Oid relid)
+{
+	char		kind;
+
+	if (!OidIsValid(relid))
+		return InvalidOid;
+	kind = get_rel_relkind(relid);
+	if (kind == RELKIND_INDEX)
+		relid = IndexGetRelation(relid, true);
+	if (!OidIsValid(relid))
+		return InvalidOid;
+	kind = get_rel_relkind(relid);
+	if ((kind == RELKIND_RELATION || kind == RELKIND_MATVIEW) &&
+		kc_am_is_columnar(get_rel_relam(relid)))
+		return relid;
+	return InvalidOid;
+}
+
+static void
+kc_process_utility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree,
+				   ProcessUtilityContext context, ParamListInfo params,
+				   QueryEnvironment *queryEnv, DestReceiver *dest,
+				   QueryCompletion *qc)
+{
+	Node	   *parsetree = pstmt->utilityStmt;
+	Oid			tbl = InvalidOid;
+	bool		concurrent = false;
+
+	if (IsA(parsetree, IndexStmt))
+	{
+		IndexStmt  *stmt = (IndexStmt *) parsetree;
+
+		if (stmt->relation != NULL)
+			tbl = kc_columnar_table_of(RangeVarGetRelid(stmt->relation, NoLock, true));
+		concurrent = stmt->concurrent;
+	}
+	else if (IsA(parsetree, ReindexStmt))
+	{
+		ReindexStmt *stmt = (ReindexStmt *) parsetree;
+		ListCell   *lc;
+
+		foreach(lc, stmt->params)
+		{
+			DefElem    *opt = (DefElem *) lfirst(lc);
+
+			if (strcmp(opt->defname, "concurrently") == 0)
+				concurrent = defGetBoolean(opt);
+		}
+		if ((stmt->kind == REINDEX_OBJECT_INDEX || stmt->kind == REINDEX_OBJECT_TABLE) &&
+			stmt->relation != NULL)
+			tbl = kc_columnar_table_of(RangeVarGetRelid(stmt->relation, NoLock, true));
+	}
+	if (OidIsValid(tbl) && concurrent)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("CREATE INDEX CONCURRENTLY and REINDEX CONCURRENTLY are not supported on columnar tables"),
+				 errhint("Use CREATE INDEX or REINDEX, which lock the table against writes while they run.")));
+	if (kc_prev_process_utility)
+		kc_prev_process_utility(pstmt, queryString, readOnlyTree, context, params,
+								queryEnv, dest, qc);
+	else
+		standard_ProcessUtility(pstmt, queryString, readOnlyTree, context, params,
+								queryEnv, dest, qc);
 }
 
 void
@@ -240,6 +322,8 @@ _PG_init(void)
 	kc_cscan_init();
 	kc_prev_object_access_hook = object_access_hook;
 	object_access_hook = kc_object_access;
+	kc_prev_process_utility = ProcessUtility_hook;
+	ProcessUtility_hook = kc_process_utility;
 }
 
 void

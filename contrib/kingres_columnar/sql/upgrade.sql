@@ -194,6 +194,9 @@ SELECT get_byte(get_raw_page('public.u1', 0), 28) AS u1_format_version, get_byte
 RESET kingres_columnar.reserve_row_numbers;
 SELECT sum(a), count(*) FROM public.u1;
 SELECT * FROM kingres.columnar_check();
+-- a table of 0.1 (format version 2) cannot have an index until it is rewritten
+CREATE INDEX u2_a ON public.u2 (a);
+SELECT count(*) AS indexes_on_old FROM pg_index WHERE indrelid = 'public.u2'::regclass;
 -- an old table can be vacuumed, compacted, converted and checked
 VACUUM public.u1;
 SELECT kingres.columnar_compact('public.u1', 100000) >= 0 AS compacted;

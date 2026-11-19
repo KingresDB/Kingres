@@ -80,13 +80,13 @@ INSERT INTO r1 VALUES (7777, 'ret') RETURNING id, s;
 
 -- indexes, primary keys and unique constraints
 CREATE INDEX r1_i ON r1 (id);
+DROP INDEX r1_i;
 CREATE INDEX r1_hash ON r1 USING hash (id);
 CREATE INDEX r1_brin ON r1 USING brin (id);
 CREATE UNIQUE INDEX r1_u ON r1 (id);
 CREATE INDEX CONCURRENTLY r1_ic ON r1 (id);
--- the failed concurrent build leaves an invalid index, as it does on a heap table
-SELECT indisvalid FROM pg_index WHERE indexrelid = 'r1_ic'::regclass;
-DROP INDEX r1_ic;
+-- the refused concurrent build leaves nothing behind
+SELECT count(*) AS invalid_left FROM pg_index WHERE indrelid = 'r1'::regclass;
 CREATE TABLE r2 (id int PRIMARY KEY, s text) USING columnar;
 CREATE TABLE r2 (id int UNIQUE, s text) USING columnar;
 CREATE TABLE r2 (id int, s text, EXCLUDE USING btree (id WITH =)) USING columnar;

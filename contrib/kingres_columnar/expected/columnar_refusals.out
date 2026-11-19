@@ -214,36 +214,52 @@ INSERT INTO r1 VALUES (7777, 'ret') RETURNING id, s;
 
 -- indexes, primary keys and unique constraints
 CREATE INDEX r1_i ON r1 (id);
-ERROR:  indexes on columnar tables are not supported in this version
+DROP INDEX r1_i;
 CREATE INDEX r1_hash ON r1 USING hash (id);
-ERROR:  indexes on columnar tables are not supported in this version
+ERROR:  columnar tables support B-tree indexes only
+DETAIL:  The index "r1_hash" is of another access method.
+HINT:  Use a B-tree index, or keep the table in row storage.
 CREATE INDEX r1_brin ON r1 USING brin (id);
-ERROR:  indexes on columnar tables are not supported in this version
+ERROR:  columnar tables support B-tree indexes only
+DETAIL:  The index "r1_brin" is of another access method.
+HINT:  Use a B-tree index, or keep the table in row storage.
 CREATE UNIQUE INDEX r1_u ON r1 (id);
-ERROR:  indexes on columnar tables are not supported in this version
+ERROR:  unique indexes, primary keys and unique constraints are not supported on columnar tables yet
+DETAIL:  The index "r1_u" on "r1" is unique.  Uniqueness needs the wait on a running writer (increment C6c).
+HINT:  Create a non-unique index, or keep the table in row storage.
 CREATE INDEX CONCURRENTLY r1_ic ON r1 (id);
-ERROR:  indexes on columnar tables are not supported in this version
--- the failed concurrent build leaves an invalid index, as it does on a heap table
-SELECT indisvalid FROM pg_index WHERE indexrelid = 'r1_ic'::regclass;
- indisvalid 
-------------
- f
+ERROR:  CREATE INDEX CONCURRENTLY and REINDEX CONCURRENTLY are not supported on columnar tables
+HINT:  Use CREATE INDEX or REINDEX, which lock the table against writes while they run.
+-- the refused concurrent build leaves nothing behind
+SELECT count(*) AS invalid_left FROM pg_index WHERE indrelid = 'r1'::regclass;
+ invalid_left 
+--------------
+            0
 (1 row)
 
-DROP INDEX r1_ic;
 CREATE TABLE r2 (id int PRIMARY KEY, s text) USING columnar;
-ERROR:  indexes on columnar tables are not supported in this version
+ERROR:  unique indexes, primary keys and unique constraints are not supported on columnar tables yet
+DETAIL:  The index "r2_pkey" on "r2" is unique.  Uniqueness needs the wait on a running writer (increment C6c).
+HINT:  Create a non-unique index, or keep the table in row storage.
 CREATE TABLE r2 (id int UNIQUE, s text) USING columnar;
-ERROR:  indexes on columnar tables are not supported in this version
+ERROR:  unique indexes, primary keys and unique constraints are not supported on columnar tables yet
+DETAIL:  The index "r2_id_key" on "r2" is unique.  Uniqueness needs the wait on a running writer (increment C6c).
+HINT:  Create a non-unique index, or keep the table in row storage.
 CREATE TABLE r2 (id int, s text, EXCLUDE USING btree (id WITH =)) USING columnar;
-ERROR:  indexes on columnar tables are not supported in this version
+ERROR:  exclusion constraints are not supported on columnar tables
+DETAIL:  The index "r2_id_excl" on "r2" enforces one; that needs a fetch with a dirty snapshot (increment C6c).
 CREATE TABLE r2 (id int, s text) USING columnar;
 ALTER TABLE r2 ADD PRIMARY KEY (id);
-ERROR:  indexes on columnar tables are not supported in this version
+ERROR:  unique indexes, primary keys and unique constraints are not supported on columnar tables yet
+DETAIL:  The index "r2_pkey" on "r2" is unique.  Uniqueness needs the wait on a running writer (increment C6c).
+HINT:  Create a non-unique index, or keep the table in row storage.
 ALTER TABLE r2 ADD UNIQUE (id);
-ERROR:  indexes on columnar tables are not supported in this version
+ERROR:  unique indexes, primary keys and unique constraints are not supported on columnar tables yet
+DETAIL:  The index "r2_id_key" on "r2" is unique.  Uniqueness needs the wait on a running writer (increment C6c).
+HINT:  Create a non-unique index, or keep the table in row storage.
 ALTER TABLE r2 ADD EXCLUDE USING btree (id WITH =);
-ERROR:  indexes on columnar tables are not supported in this version
+ERROR:  exclusion constraints are not supported on columnar tables
+DETAIL:  The index "r2_id_excl" on "r2" enforces one; that needs a fetch with a dirty snapshot (increment C6c).
 ALTER TABLE r2 ADD CONSTRAINT r2_u UNIQUE USING INDEX r1_nonexistent;
 ERROR:  index "r1_nonexistent" does not exist
 LINE 1: ALTER TABLE r2 ADD CONSTRAINT r2_u UNIQUE USING INDEX r1_non...
@@ -257,11 +273,12 @@ SELECT count(*) AS indexes_on_columnar FROM pg_index WHERE indrelid IN ('r1'::re
 -- a heap table with an index cannot become columnar; without one it can
 CREATE TABLE r3 (id int PRIMARY KEY, s text);
 ALTER TABLE r3 SET ACCESS METHOD columnar;
-ERROR:  indexes on columnar tables are not supported in this version
+ERROR:  unique indexes, primary keys and unique constraints are not supported on columnar tables yet
+DETAIL:  The index "r3_pkey" on "r3" is unique.  Uniqueness needs the wait on a running writer (increment C6c).
+HINT:  Create a non-unique index, or keep the table in row storage.
 CREATE TABLE r3b (id int, s text);
 CREATE INDEX r3b_i ON r3b (id);
 ALTER TABLE r3b SET ACCESS METHOD columnar;
-ERROR:  indexes on columnar tables are not supported in this version
 DROP INDEX r3b_i;
 ALTER TABLE r3b SET ACCESS METHOD columnar;
 SELECT a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.oid = 'r3b'::regclass;
@@ -271,7 +288,9 @@ SELECT a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.oid = 'r
 (1 row)
 
 CREATE TABLE r3c (LIKE r3 INCLUDING ALL) USING columnar;
-ERROR:  indexes on columnar tables are not supported in this version
+ERROR:  unique indexes, primary keys and unique constraints are not supported on columnar tables yet
+DETAIL:  The index "r3c_pkey" on "r3c" is unique.  Uniqueness needs the wait on a running writer (increment C6c).
+HINT:  Create a non-unique index, or keep the table in row storage.
 CREATE TABLE r3c (LIKE r3 INCLUDING DEFAULTS INCLUDING CONSTRAINTS) USING columnar;
 SELECT a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.oid = 'r3c'::regclass;
   amname  
@@ -281,7 +300,9 @@ SELECT a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.oid = 'r
 
 CREATE MATERIALIZED VIEW mv USING columnar AS SELECT id, s FROM src;
 CREATE UNIQUE INDEX mv_u ON mv (id);
-ERROR:  indexes on columnar tables are not supported in this version
+ERROR:  unique indexes, primary keys and unique constraints are not supported on columnar tables yet
+DETAIL:  The index "mv_u" on "mv" is unique.  Uniqueness needs the wait on a running writer (increment C6c).
+HINT:  Create a non-unique index, or keep the table in row storage.
 REFRESH MATERIALIZED VIEW CONCURRENTLY mv;
 ERROR:  cannot refresh materialized view "public.mv" concurrently
 HINT:  Create a unique index with no WHERE clause on one or more columns of the materialized view.

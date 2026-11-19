@@ -583,6 +583,7 @@ typedef struct KcScan
 
 	KcStripeInfo *stripes;
 	int			nstripes;
+	uint64		list_epoch;		/* kc_flush_epoch when the list was read */
 	int			stripe_idx;		/* next stripe to open */
 
 	/* the open stripe */
@@ -638,6 +639,9 @@ typedef struct KcScan
  */
 #define KC_SCAN_PARALLEL_OK	(1 << 29)
 
+/* the scan is for index fetches by row number: it holds no write buffer (kc_scan_fetch_row) */
+#define KC_SCAN_FETCH	(1 << 28)
+
 extern KcScan *kc_scan_begin(Relation rel, Snapshot snapshot,
 							 const bool *needed, struct KcSkip *skip,
 							 int flags);
@@ -651,6 +655,15 @@ extern uint64 kc_scan_fingerprint(const KcScan *scan);
 extern void kc_scan_attach(KcScan *scan, KcParallel *shared);
 extern bool kc_scan_analyze_block(KcScan *scan, Buffer buf);
 extern bool kc_scan_analyze_next(KcScan *scan, TupleTableSlot *slot);
+extern bool kc_scan_fetch_row(KcScan *scan, uint64 row, TupleTableSlot *slot);
+
+/* flushes of stripes in this backend: a scan that fetches by number re-reads its stripe list when it changed */
+extern uint64 kc_flush_epoch;
+extern bool kc_write_pending_by_number(Oid relid, uint64 uid, uint64 row, Datum **vals,
+									   bool **nulls, int *ncols, CommandId *cid);
+extern void kc_write_flush_for_index(Relation rel);
+extern bool kc_write_has_unwritten(Relation rel);
+extern bool kc_rel_reserves(Relation rel);
 
 /* ------------------------------------------------------------------------
  * kc_skip.c: min/max skipping

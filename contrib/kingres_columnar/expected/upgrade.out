@@ -309,6 +309,16 @@ SELECT * FROM kingres.columnar_check();
 ------------+----------+--------
 (0 rows)
 
+-- a table of 0.1 (format version 2) cannot have an index until it is rewritten
+CREATE INDEX u2_a ON public.u2 (a);
+ERROR:  columnar table "u2" cannot have an index: its file was written by version 0.1 (format version 2)
+HINT:  Rewrite the table first: VACUUM FULL, or ALTER TABLE ... SET ACCESS METHOD columnar (a new file of format version 3).
+SELECT count(*) AS indexes_on_old FROM pg_index WHERE indrelid = 'public.u2'::regclass;
+ indexes_on_old 
+----------------
+              0
+(1 row)
+
 -- an old table can be vacuumed, compacted, converted and checked
 VACUUM public.u1;
 SELECT kingres.columnar_compact('public.u1', 100000) >= 0 AS compacted;

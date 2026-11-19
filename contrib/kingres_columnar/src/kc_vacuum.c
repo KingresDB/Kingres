@@ -283,7 +283,7 @@ kc_relation_vacuum(KC_VACUUM_PARAMS)
 	remaining = kc_meta_freeze(rel, oldest);
 	frozenxid = TransactionIdIsValid(remaining) ? remaining : oldest;
 	minmxid = GetOldestMultiXactId();
-	vac_update_relstats(rel, nblocks, (double) rows, 0, 0, false,
+	vac_update_relstats(rel, nblocks, (double) rows, 0, 0, RelationGetIndexList(rel) != NIL,
 						frozenxid, minmxid, NULL, NULL, false);
 
 	/*
@@ -300,7 +300,7 @@ kc_relation_vacuum(KC_VACUUM_PARAMS)
 		kc_truncate_tail(rel))
 	{
 		nblocks = RelationGetNumberOfBlocks(rel);
-		vac_update_relstats(rel, nblocks, (double) rows, 0, 0, false,
+		vac_update_relstats(rel, nblocks, (double) rows, 0, 0, RelationGetIndexList(rel) != NIL,
 							frozenxid, minmxid, NULL, NULL, false);
 	}
 	KC_REPORT_VACUUM(rel, (PgStat_Counter) rows, 0, starttime);
@@ -376,6 +376,18 @@ kc_compact(Relation rel, uint32 min_rows)
 	uint64		rows = 0;
 	KcMetaData	m;
 	CommandId	cid = GetCurrentCommandId(true);
+
+	/*
+	 * Compaction gives the rows it copies new numbers, and an index names rows by number:
+	 * until the rebuild of the indexes is part of it (C6d) a table that has one is not compacted.
+	 */
+	if (RelationGetIndexList(rel) != NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("columnar_compact is not supported on columnar table \"%s\", which has an index",
+						RelationGetRelationName(rel)),
+				 errdetail("Compaction gives rows new numbers, and the indexes of the table name rows by number; rebuilding them is not part of it yet."),
+				 errhint("Use VACUUM FULL, which rewrites the table and its indexes, or drop the indexes and create them again after the compaction.")));
 
 	kc_meta_read(rel, &m);
 	scan = kc_scan_begin(rel, IsolationUsesXactSnapshot() ? GetTransactionSnapshot() : NULL,

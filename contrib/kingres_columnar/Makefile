@@ -23,7 +23,7 @@ PGFILEDESC = "kingres_columnar - columnar table access method for KingresDB"
 
 REGRESS = columnar_setup columnar_basic columnar_types columnar_ddl \
 	columnar_refusals columnar_scan_plans columnar_stats columnar_vacuum \
-	columnar_analyze columnar_review columnar_parallel columnar_security columnar_reserve upgrade
+	columnar_analyze columnar_review columnar_parallel columnar_security columnar_reserve columnar_index upgrade
 
 TAP_TESTS = 1
 

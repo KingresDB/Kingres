@@ -89,6 +89,26 @@ kc_visible_rows(const KcStripeInfo *si, CommandId curcid, bool all_rows)
 	return si->row_count;
 }
 
+/* the stripes the scan's snapshot sees, with the rows of each that its command may read */
+static void
+kc_scan_load_stripes(KcScan *scan)
+{
+	int			i;
+	int			nvisible = 0;
+
+	scan->stripes = kc_catalog_load(scan->rel, scan->cat_snap, &scan->nstripes);
+	for (i = 0; i < scan->nstripes; i++)
+	{
+		KcStripeInfo *si = &scan->stripes[i];
+
+		si->visible_rows = kc_visible_rows(si, scan->curcid, scan->all_own_rows);
+		if (si->visible_rows > 0)
+			scan->stripes[nvisible++] = *si;
+	}
+	scan->nstripes = nvisible;
+	scan->list_epoch = kc_flush_epoch;
+}
+
 KcScan *
 kc_scan_begin(Relation rel, Snapshot snapshot, const bool *needed,
 			  struct KcSkip *skip, int flags)
@@ -99,9 +119,16 @@ kc_scan_begin(Relation rel, Snapshot snapshot, const bool *needed,
 	bool		mvcc;
 	Snapshot	cs;
 	int			i;
-	int			nvisible;
 	bool		maintenance = false;
 	bool		parallel_ok = false;
+	bool		fetch = false;
+
+	/* a scan for fetches by row number (index scans) reads buffered rows by number, it holds none */
+	if (flags & KC_SCAN_FETCH)
+	{
+		fetch = true;
+		flags &= ~KC_SCAN_FETCH;
+	}
 
 	/*
 	 * Maintenance (compaction) takes part in no serializable bookkeeping: no
@@ -167,23 +194,13 @@ kc_scan_begin(Relation rel, Snapshot snapshot, const bool *needed,
 	scan->all_own_rows = !mvcc || maintenance;
 	scan->curcid = (mvcc && !maintenance) ? snapshot->curcid : InvalidCommandId;
 
-	scan->stripes = kc_catalog_load(rel, cs, &scan->nstripes);
-	nvisible = 0;
-	for (i = 0; i < scan->nstripes; i++)
-	{
-		KcStripeInfo *si = &scan->stripes[i];
-
-		si->visible_rows = kc_visible_rows(si, scan->curcid, scan->all_own_rows);
-		if (si->visible_rows > 0)
-			scan->stripes[nvisible++] = *si;
-	}
-	scan->nstripes = nvisible;
+	kc_scan_load_stripes(scan);
 
 	/*
 	 * The rows the transaction buffered, pinned so that no flush empties the
 	 * buffer under the scan.  An analyze scan has no use for them.
 	 */
-	if (!(flags & SO_TYPE_ANALYZE))
+	if (!(flags & SO_TYPE_ANALYZE) && !fetch)
 	{
 		ResourceOwner owner = CurrentResourceOwner;
 
@@ -779,4 +796,156 @@ kc_scan_analyze_next(KcScan *scan, TupleTableSlot *slot)
 
 	MemoryContextSwitchTo(old);
 	return res;
+}
+
+/* ------------------------------------------------------------------------
+ * Fetch of one row by its number (index scans, C6b)
+ * ------------------------------------------------------------------------
+ */
+
+/*
+ * The row with this number, if the scan's snapshot and command may see it, into
+ * slot.  A row the transaction has buffered and numbered (a buffer that
+ * reserves) is taken from the buffer, by the command-id rule; any other row from
+ * the stripe whose numbers contain it: one chunk group is decoded (all the
+ * columns) and kept, so consecutive fetches in the same group cost one decode.
+ * A number that no visible stripe and no buffer of this transaction has (an
+ * index entry of an aborted or rolled back writer, of a stripe that was removed,
+ * of a writer not committed before the snapshot) returns nothing: that is how
+ * every dead entry is filtered, and it is why a row number is never given to
+ * another row.  The scan was begun with KC_SCAN_FETCH.
+ */
+bool
+kc_scan_fetch_row(KcScan *scan, uint64 row, TupleTableSlot *slot)
+{
+	Datum	   *vals;
+	bool	   *nulls;
+	int			ncols;
+	CommandId	cid;
+	KcStripeInfo *si = NULL;
+	int			lo,
+				hi,
+				idx = -1,
+				i,
+				c;
+	uint32		off;
+	uint32		start = 0;
+	uint32		g;
+	MemoryContext old;
+
+	if (row >= KC_MAX_ROW_NUMBER)
+		return false;
+
+	if (kc_write_pending_by_number(RelationGetRelid(scan->rel), kc_rel_ident(scan->rel)->uid,
+								   row, &vals, &nulls, &ncols, &cid))
+	{
+		if (!scan->all_own_rows && cid >= scan->curcid)
+			return false;
+		ExecClearTuple(slot);
+		for (c = 0; c < scan->natts; c++)
+		{
+			if (c < ncols)
+			{
+				slot->tts_values[c] = vals[c];
+				slot->tts_isnull[c] = nulls[c];
+			}
+			else
+				kc_missing_value(scan, c, &slot->tts_values[c], &slot->tts_isnull[c]);
+		}
+		kc_row_tid(row, &slot->tts_tid);
+		slot->tts_tableOid = RelationGetRelid(scan->rel);
+		ExecStoreVirtualTuple(slot);
+		return true;
+	}
+
+	old = MemoryContextSwitchTo(scan->scan_cxt);
+	if (scan->list_epoch != kc_flush_epoch)
+	{
+		/* this backend wrote a stripe since the list was read: the rows of a buffer may be in it now */
+		if (scan->in_stripe)
+			kc_footer_free(&scan->footer);
+		scan->in_stripe = false;
+		scan->have_group = false;
+		kc_scan_load_stripes(scan);
+	}
+	MemoryContextSwitchTo(old);
+
+	lo = 0;
+	hi = scan->nstripes - 1;
+	while (lo <= hi)
+	{
+		int			mid = lo + (hi - lo) / 2;
+
+		if (scan->stripes[mid].first_row <= row)
+		{
+			idx = mid;
+			lo = mid + 1;
+		}
+		else
+			hi = mid - 1;
+	}
+	if (idx >= 0 && row < scan->stripes[idx].first_row + scan->stripes[idx].row_count)
+		si = &scan->stripes[idx];
+	else
+	{
+		/* the list is in stripe id order, which is the order of the numbers; do not trust it blindly */
+		for (i = 0; i < scan->nstripes; i++)
+			if (scan->stripes[i].first_row <= row &&
+				row < scan->stripes[i].first_row + scan->stripes[i].row_count)
+			{
+				si = &scan->stripes[i];
+				break;
+			}
+	}
+	if (si == NULL)
+		return false;
+	off = (uint32) (row - si->first_row);
+	if (off >= si->visible_rows)
+		return false;
+
+	old = MemoryContextSwitchTo(scan->scan_cxt);
+	if (!scan->in_stripe || scan->cur->stripe_id != si->stripe_id)
+	{
+		if (scan->in_stripe)
+			kc_footer_free(&scan->footer);
+		scan->cur = si;
+		kc_footer_load(scan->rel, si, &scan->footer);
+		scan->in_stripe = true;
+		scan->have_group = false;
+	}
+	scan->cur = si;
+	for (g = 0; g < scan->footer.ngroups; g++)
+	{
+		if (off < start + scan->footer.group_rows[g])
+			break;
+		start += scan->footer.group_rows[g];
+	}
+	if (g >= scan->footer.ngroups)
+		kc_corrupt(scan->rel, si->stripe_id, "the chunk groups do not hold row %u", off);
+	if (!scan->have_group || scan->group_start != start)
+	{
+		scan->group_nrows = kc_load_group(scan, g);
+		scan->group_start = start;
+		scan->have_group = true;
+	}
+	MemoryContextSwitchTo(old);
+
+	ExecClearTuple(slot);
+	for (c = 0; c < scan->natts; c++)
+	{
+		if (scan->needed[c] && scan->colvals[c] != NULL)
+		{
+			slot->tts_values[c] = scan->colvals[c][off - start];
+			slot->tts_isnull[c] = scan->colnulls[c][off - start];
+		}
+		else
+		{
+			slot->tts_values[c] = (Datum) 0;
+			slot->tts_isnull[c] = true;
+		}
+	}
+	kc_row_tid(row, &slot->tts_tid);
+	slot->tts_tableOid = RelationGetRelid(scan->rel);
+	ExecStoreVirtualTuple(slot);
+	return true;
 }

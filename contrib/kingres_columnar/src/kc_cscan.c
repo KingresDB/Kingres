@@ -36,6 +36,8 @@
  */
 #include "postgres.h"
 
+#include "optimizer/paths.h"
+
 #include "access/parallel.h"
 #include "access/relation.h"
 #include "access/table.h"
@@ -277,6 +279,52 @@ kc_add_custom_path(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	}
 }
 
+/*
+ * What the planner may assume about the indexes of a columnar table (C6b):
+ *
+ *	 - no bitmap scan: the bitmap code keeps at most MaxHeapTuplesPerPage offsets
+ *	   for a block, a columnar TID has up to MaxOffsetNumber (2048), so such a bitmap
+ *	   cannot be made (amhasgetbitmap is false);
+ *	 - no index-only scan: there is no visibility map, so each would fetch every
+ *	   row, and a plan must not promise what the table cannot give (canreturn);
+ *	 - no parallel index scan: a worker cannot read the rows of the leader's
+ *	   transaction (amcanparallel).
+ *
+ * PostgreSQL 19 has no hook where the index descriptions are made, so the flags are
+ * changed here, after the server made its paths: the bitmap and index-only paths are
+ * dropped (they may have dominated the plain index paths, which add_path then
+ * discarded), the flags are set, and the index paths are made again, which can then
+ * only be plain, ordered or parameterised index scans.
+ */
+static void
+kc_limit_index_paths(PlannerInfo *root, RelOptInfo *rel)
+{
+	ListCell   *lc;
+
+	if (rel->indexlist == NIL)
+		return;
+	foreach(lc, rel->pathlist)
+	{
+		Path	   *path = (Path *) lfirst(lc);
+
+		if (IsA(path, BitmapHeapPath) ||
+			(IsA(path, IndexPath) && ((IndexPath *) path)->path.pathtype == T_IndexOnlyScan))
+			rel->pathlist = foreach_delete_current(rel->pathlist, lc);
+	}
+	foreach(lc, rel->indexlist)
+	{
+		IndexOptInfo *info = (IndexOptInfo *) lfirst(lc);
+		int			i;
+
+		info->amhasgetbitmap = false;
+		info->amcanparallel = false;
+		for (i = 0; i < info->ncolumns; i++)
+			info->canreturn[i] = false;
+	}
+	rel->partial_pathlist = NIL;
+	create_index_paths(root, rel);
+}
+
 static void
 kc_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 					RangeTblEntry *rte)
@@ -304,6 +352,7 @@ kc_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	 * marked not parallel-safe: not a Parallel Append child, not the inner side of
 	 * a partitioned join, not under a Gather.
 	 */
+	kc_limit_index_paths(root, rel);
 	rel->partial_pathlist = NIL;
 	foreach(lc, rel->pathlist)
 	{

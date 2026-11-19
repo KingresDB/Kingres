@@ -561,11 +561,20 @@ kc_state_get(Oid relid, bool create)
  * are written, as without the setting; nothing can have an index yet that would
  * need them earlier (the target of the statement is new).
  */
-static bool
-kc_reserve_asked(KcRelState *st)
+/* Has the table an index?  Then every row it takes needs its number when it is inserted (C6b). */
+bool
+kc_rel_reserves(Relation rel)
 {
-	return kc_guc_reserve_rows && !kc_maintenance_write && !st->frozen &&
-		!IsInParallelMode();
+	return rel->rd_rel->relhasindex && RelationGetIndexList(rel) != NIL;
+}
+
+uint64		kc_flush_epoch = 0;
+
+static bool
+kc_reserve_asked(KcRelState *st, Relation rel)
+{
+	return (kc_guc_reserve_rows || kc_rel_reserves(rel)) && !kc_maintenance_write &&
+		!st->frozen && !IsInParallelMode();
 }
 
 /*
@@ -617,7 +626,7 @@ kc_buf_make(Relation rel, int ncols, MemoryContext parent, bool counted,
 static KcWriteBuf *
 kc_buf_create(KcRelState *st, Relation rel, int ncols)
 {
-	KcWriteBuf *b = kc_buf_make(rel, ncols, kc_write_cxt, true, kc_reserve_asked(st));
+	KcWriteBuf *b = kc_buf_make(rel, ncols, kc_write_cxt, true, kc_reserve_asked(st, rel));
 	MemoryContext old = MemoryContextSwitchTo(kc_write_cxt);
 
 	st->bufs = lappend(st->bufs, b);
@@ -1633,7 +1642,7 @@ kc_write_late(Relation rel, Datum **vv, bool **nn, int nrows, CommandId cid,
 	int			i;
 
 	KC_PATH(kc_handover_prepared ? KC_PATH_LATE_WINDOW : KC_PATH_LATE_COMMIT);
-	b = kc_buf_make(rel, desc->natts, CurrentMemoryContext, false, kc_reserve_asked(st));
+	b = kc_buf_make(rel, desc->natts, CurrentMemoryContext, false, kc_reserve_asked(st, rel));
 	for (i = 0; i < nrows; i++)
 		kc_buf_put_row(b, desc, vv[i], nn[i], cid);
 
@@ -1802,7 +1811,7 @@ kc_write_row_values(Relation rel, Datum *vals, bool *nulls, CommandId cid,
 		 * reserves gives its rows numbers, the others never do), and a buffer
 		 * that reserves is full when it has used the numbers it took.
 		 */
-		else if (b->reserve_asked != kc_reserve_asked(st) ||
+		else if (b->reserve_asked != kc_reserve_asked(st, rel) ||
 				 (b->reserving && b->res_valid && b->nrows >= b->res_count))
 			b = NULL;
 	}
@@ -1828,6 +1837,12 @@ kc_write_row_values(Relation rel, Datum *vals, bool *nulls, CommandId cid,
 		rownum = b->res_first + b->nrows;
 	}
 
+	if (!b->reserving && !kc_maintenance_write && kc_rel_reserves(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("a row of columnar table \"%s\", which has an index, cannot be given a row number now",
+						RelationGetRelationName(rel)),
+				 errdetail("The file is of format version 2, or the catalog is not the one of version 0.2.")));
 	kc_buf_put_row(b, desc, vals, nulls, cid);
 	if (rownum_out != NULL)
 		*rownum_out = rownum;
@@ -2370,6 +2385,7 @@ kc_write_stripe(KcRelState *st, KcWriteBuf *b, Relation rel, uint32 first,
 		kc_reserve_gate(KC_RES_AFTER_UPDATE);
 		kc_give_back_tail(rel, res_first + count, res_count - count);
 	}
+	kc_flush_epoch++;
 
 	/*
 	 * The stripe can be found by readers from here on.  A reader that took
@@ -2993,6 +3009,99 @@ kc_write_pending_fetch(Oid relid, const KcPendingRef *ref, uint32 rowno,
 		return true;
 	}
 	return false;
+}
+
+/*
+ * The row with this number in a buffer of this transaction that reserved it
+ * (C6b: an index scan fetches a row its own transaction inserted and has not
+ * written).  Only a buffer that reserves has numbers.  The pointers are valid
+ * until the next write to the relation.
+ */
+bool
+kc_write_pending_by_number(Oid relid, uint64 uid, uint64 row, Datum **vals,
+						   bool **nulls, int *ncols, CommandId *cid)
+{
+	KcRelState *st = kc_state_get(relid, false);
+	ListCell   *lc;
+
+	if (st == NULL)
+		return false;
+	foreach(lc, st->bufs)
+	{
+		KcWriteBuf *b = lfirst(lc);
+		uint32		first;
+		uint32		end;
+
+		if (!b->reserving || !b->res_valid || b->uid != uid)
+			continue;
+		kc_buf_visible(b, &first, &end);
+		if (row < b->res_first + first || row >= b->res_first + end)
+			continue;
+		*vals = &b->vals[(Size) (row - b->res_first) * b->ncols];
+		*nulls = &b->nulls[(Size) (row - b->res_first) * b->ncols];
+		*ncols = b->ncols;
+		*cid = b->cids[row - b->res_first];
+		return true;
+	}
+	return false;
+}
+
+/* Does this transaction hold rows of the table that are only in memory? */
+bool
+kc_write_has_unwritten(Relation rel)
+{
+	KcRelState *st = kc_state_get(RelationGetRelid(rel), false);
+	ListCell   *lc;
+	uint64		uid = kc_rel_ident(rel)->uid;
+
+	if (st == NULL)
+		return false;
+	foreach(lc, st->bufs)
+	{
+		KcWriteBuf *b = lfirst(lc);
+
+		if (b->nrows > 0 && b->uid == uid)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * A first index on a table whose transaction holds rows in buffers: those rows
+ * have no numbers (their buffers were made before the table had an index) or
+ * are still only in memory, and the build scan reads stripes.  The buffers of the
+ * running subtransaction are written first, so the build sees every row with the
+ * number it has.  What cannot be written (a buffer of an enclosing subtransaction,
+ * one that a scan reads) makes the statement fail, never build an index that
+ * misses rows.
+ */
+void
+kc_write_flush_for_index(Relation rel)
+{
+	KcRelState *st;
+	ListCell   *lc;
+	uint64		uid;
+
+	kc_write_flush_relation(rel);
+	st = kc_state_get(RelationGetRelid(rel), false);
+	if (st == NULL)
+		return;
+	uid = kc_rel_ident(rel)->uid;
+	foreach(lc, st->bufs)
+	{
+		KcWriteBuf *b = lfirst(lc);
+		uint32		first;
+		uint32		end;
+
+		kc_buf_visible(b, &first, &end);
+		if (end > first && b->uid == uid)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot build an index on columnar table \"%s\": this transaction holds rows of it that cannot be written yet",
+							RelationGetRelationName(rel)),
+					 errdetail("The rows were written by an enclosing subtransaction, or a scan of this session is still reading them."),
+					 errhint("Build the index in the subtransaction that wrote the rows, or after the savepoint is released, or close the cursor.")));
+	}
 }
 
 /* ------------------------------------------------------------------------

@@ -76,6 +76,7 @@ tests += {
       'columnar_parallel',
       'columnar_security',
       'columnar_reserve',
+      'columnar_index',
       'upgrade',
     ],
     'regress_args': ['--temp-config', files('kingres_columnar.conf')],
@@ -132,6 +133,8 @@ tests += {
       't/048_reserve_standby.pl',
       't/049_upgrade_data.pl',
       't/050_reserve_check.pl',
+      't/051_index_twin.pl',
+      't/052_reserve_memory.pl',
     ],
   },
 }

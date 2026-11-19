@@ -340,6 +340,52 @@ metapage has its own checksum. A damaged byte inside a stripe page is caught by
 the chunk checksum; page checksums, when enabled, catch it earlier.
 
 
+## B-tree indexes (0.2, increment C6b)
+
+`CREATE INDEX` on a columnar table builds a non-unique B-tree over the rows of
+the table, and index scans find rows by TID: a TID is a row number
+(`block * 2048 + offset - 1`).  What is served: plain, multi-column, expression and
+partial indexes, `INCLUDE` columns, `DESC` and `NULLS FIRST`, collations, and any
+column type that has a B-tree operator class (arrays, `jsonb`, `numeric`, text,
+dates, ...); the build reads the stripes with the maintenance rule and the rows
+of its own transaction after writing them.  Planner: index scans, ordered index
+scans (`ORDER BY`, merge joins, `LIMIT`) and the inner side of nested loops.  **No
+bitmap scans**: the bitmap code of the server holds at most `MaxHeapTuplesPerPage`
+(291) offsets for a block and a columnar block has 2048, so such a bitmap cannot
+be made (the flags of the index descriptions are switched off for a columnar table in `set_rel_pathlist_hook`, which makes the index paths again, because PostgreSQL 19 has no hook where they are made).  **No index-only scans** (there is no visibility map: each
+would fetch every row, so `canreturn` is off) and **no parallel index scans** (a
+worker cannot read the rows of the leader's transaction; `amcanparallel` is off).
+A reindex after a rewrite is the server's own (`VACUUM FULL`, `ALTER TABLE ... SET
+ACCESS METHOD` in both directions, `TRUNCATE`, `REINDEX`).
+
+* **Refused, with a message** (`columnar_refusals`, `columnar_index`): unique
+  indexes, primary keys, unique constraints and exclusion constraints (C6c: they
+  need the wait on a running writer), hash, GiST, GIN, BRIN and SP-GiST indexes,
+  `CREATE INDEX CONCURRENTLY` and `REINDEX CONCURRENTLY`, `CLUSTER`, a build on a
+  file of format version 2 ("its file was written by version 0.1": rewrite the table
+  first), and `columnar_compact` of a table with an index (it gives rows new numbers;
+  C6d).  A build in a subtransaction over rows that an enclosing one wrote, or while
+  a cursor reads the buffers, is refused: the rows cannot be written first.
+* **Reservation switches on by itself**: a buffer made for a table that has an
+  index reserves (`kc_rel_reserves`), with or without the developer setting.  A table
+  that gets its first index while the transaction holds rows in buffers that did not
+  reserve: the utility hook writes the rows of the running subtransaction as stripes
+  before the build (they get their numbers then), and the later inserts reserve.
+* **The fetch** (`kc_scan_fetch_row`): a row of a buffer of the fetching transaction
+  that reserved is taken from the buffer by the command-id rule; any other from the
+  visible stripe whose numbers hold it (binary search in the stripe list, kept for the
+  scan and read again when this backend wrote a stripe since); the footer is kept
+  for the open stripe and **one chunk group is decoded, all columns, and kept**, so
+  consecutive fetches in the same group cost one decode.  A number that no visible
+  stripe and no buffer has (an entry of an aborted or rolled back writer or
+  subtransaction, of a writer not committed before the snapshot, of a removed stripe)
+  returns nothing: dead entries are filtered by the fetch.  `VACUUM` does not remove
+  index entries (C6c): they stay, and are filtered; correct, only wasteful.
+* **Cost**: a point lookup decodes one chunk group of every column (100 to 10 000
+  rows by `chunk_row_count`), so it is much dearer than a heap fetch; the index
+  pays when a query returns few rows of a large table.  Measurements are in the
+  design notes.
+
 ## Reserved row numbers (0.2, increment C6a)
 
 A B-tree index needs a row's TID when the row is inserted, and other sessions
@@ -488,9 +534,7 @@ All with SQLSTATE `0A000`.
   partitions.
 * Row locks (`SELECT ... FOR UPDATE/SHARE`), `ON CONFLICT DO UPDATE`,
   `TABLESAMPLE`, `CLUSTER`.
-* Indexes, primary keys, unique constraints (0.2 gives a row its TID when it is
-  inserted, with the developer setting, but nothing builds or searches an index
-  yet: C6b, C6c); `CREATE INDEX` fails in the access method.
+* Unique indexes, primary keys, unique constraints, exclusion constraints, indexes of any access method but B-tree, `CREATE INDEX CONCURRENTLY`, `REINDEX CONCURRENTLY`, `CLUSTER` and `columnar_compact` of a table that has an index: refused with a message that says why (see "B-tree indexes").
 * Foreign keys on or to a columnar table, and row-level `AFTER` triggers
   (event triggers refuse them at creation; the executor re-reads such rows
   by TID, which a columnar row has not). `BEFORE ROW` and statement
@@ -764,7 +808,7 @@ Set `search_path` explicitly, or create the tables in another schema.
 
 ## Limits
 
-Append-only, no indexes, no TOAST (values up to the 1 GB limit of one value are
+Append-only, non-unique B-tree indexes only, no TOAST (values up to the 1 GB limit of one value are
 stored inline), at most about 8.8 x 10^12 rows per table, 150000-row stripes
 mean small transactions make small stripes, serial scans only, no vectorised
 execution, skipping is not in the cost estimate, logical decoding is not
