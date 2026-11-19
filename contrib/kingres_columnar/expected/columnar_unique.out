@@ -1,0 +1,282 @@
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+-- SPDX-License-Identifier: AGPL-3.0-only
+--
+-- columnar_unique: unique indexes, primary keys and unique constraints on columnar
+-- tables (increment C6c), what is refused, and index vacuum.  The sessions that race
+-- are in t/053 to t/056.
+SET search_path = public;
+CREATE TABLE u (id int, v text) USING columnar;
+SELECT kingres.columnar_set_options('u', stripe_row_count => 1000, chunk_row_count => 100);
+ columnar_set_options 
+----------------------
+ 
+(1 row)
+
+CREATE UNIQUE INDEX u_id ON u (id);
+INSERT INTO u VALUES (1, 'a'), (2, 'b');
+-- a duplicate of a committed row, of a row of this transaction, inside one statement
+INSERT INTO u VALUES (1, 'dup');
+ERROR:  duplicate key value violates unique constraint "u_id"
+DETAIL:  Key (id)=(1) already exists.
+BEGIN;
+INSERT INTO u VALUES (3, 'c');
+INSERT INTO u VALUES (3, 'again');
+ERROR:  duplicate key value violates unique constraint "u_id"
+DETAIL:  Key (id)=(3) already exists.
+ROLLBACK;
+INSERT INTO u VALUES (4, 'x'), (4, 'y');
+ERROR:  duplicate key value violates unique constraint "u_id"
+DETAIL:  Key (id)=(4) already exists.
+INSERT INTO u SELECT 5, 'z' FROM generate_series(1, 2);
+ERROR:  duplicate key value violates unique constraint "u_id"
+DETAIL:  Key (id)=(5) already exists.
+COPY u (id, v) FROM STDIN;
+ERROR:  duplicate key value violates unique constraint "u_id"
+DETAIL:  Key (id)=(6) already exists.
+CONTEXT:  COPY u, line 2
+SELECT id FROM u ORDER BY id;
+ id 
+----
+  1
+  2
+(2 rows)
+
+-- the failed statements left nothing: a key of a failed statement is free
+INSERT INTO u VALUES (3, 'c'), (4, 'x'), (5, 'z'), (6, 'one');
+SELECT id, v FROM u ORDER BY id;
+ id |  v  
+----+-----
+  1 | a
+  2 | b
+  3 | c
+  4 | x
+  5 | z
+  6 | one
+(6 rows)
+
+-- NULLs are not equal
+INSERT INTO u VALUES (NULL, 'n1'), (NULL, 'n2');
+SELECT count(*) AS nulls FROM u WHERE id IS NULL;
+ nulls 
+-------
+     2
+(1 row)
+
+-- a savepoint that rolled back frees its key, one that was released holds it
+BEGIN;
+SAVEPOINT s;
+INSERT INTO u VALUES (10, 'in savepoint');
+ROLLBACK TO s;
+INSERT INTO u VALUES (10, 'again');
+SAVEPOINT t;
+INSERT INTO u VALUES (11, 'x');
+RELEASE t;
+INSERT INTO u VALUES (11, 'dup of a released savepoint');
+ERROR:  duplicate key value violates unique constraint "u_id"
+DETAIL:  Key (id)=(11) already exists.
+ROLLBACK;
+SELECT count(*) AS ten_or_eleven FROM u WHERE id IN (10, 11);
+ ten_or_eleven 
+---------------
+             0
+(1 row)
+
+-- a PL/pgSQL exception block
+DO $$ BEGIN
+  INSERT INTO u VALUES (20, 'a');
+  BEGIN
+    INSERT INTO u VALUES (20, 'b');
+  EXCEPTION WHEN unique_violation THEN RAISE NOTICE 'caught';
+  END;
+END $$;
+NOTICE:  caught
+SELECT count(*) AS twenty FROM u WHERE id = 20;
+ twenty 
+--------
+      1
+(1 row)
+
+-- the unique index answers by index scan too
+SET enable_seqscan = off;
+SET kingres_columnar.enable_custom_scan = off;
+SELECT v FROM u WHERE id = 20;
+ v 
+---
+ a
+(1 row)
+
+RESET enable_seqscan;
+RESET kingres_columnar.enable_custom_scan;
+-- a unique index made over duplicates fails with the server's message and leaves nothing
+CREATE TABLE ud (id int) USING columnar;
+INSERT INTO ud VALUES (1), (2), (2);
+CREATE UNIQUE INDEX ud_id ON ud (id);
+ERROR:  could not create unique index "ud_id"
+DETAIL:  Key (id)=(2) is duplicated.
+SELECT count(*) AS indexes_left FROM pg_index WHERE indrelid = 'ud'::regclass;
+ indexes_left 
+--------------
+            0
+(1 row)
+
+DELETE FROM ud WHERE false;
+TRUNCATE ud;
+INSERT INTO ud VALUES (1), (2);
+CREATE UNIQUE INDEX ud_id ON ud (id);
+-- a unique index made while another transaction holds rows of the table waits for it (see t/053)
+-- primary keys and unique constraints
+CREATE TABLE pk (id int PRIMARY KEY, v text) USING columnar;
+INSERT INTO pk VALUES (1, 'a');
+INSERT INTO pk VALUES (1, 'b');
+ERROR:  duplicate key value violates unique constraint "pk_pkey"
+DETAIL:  Key (id)=(1) already exists.
+INSERT INTO pk VALUES (NULL, 'c');
+ERROR:  null value in column "id" of relation "pk" violates not-null constraint
+DETAIL:  Failing row contains (null, c).
+CREATE TABLE pk2 (a int, b int, v text, UNIQUE (a, b)) USING columnar;
+INSERT INTO pk2 VALUES (1, 1, 'x'), (1, 2, 'y'), (2, 1, 'z');
+INSERT INTO pk2 VALUES (1, 2, 'dup');
+ERROR:  duplicate key value violates unique constraint "pk2_a_b_key"
+DETAIL:  Key (a, b)=(1, 2) already exists.
+CREATE TABLE pk3 (id int, v text) USING columnar;
+INSERT INTO pk3 VALUES (1, 'a'), (2, 'b');
+ALTER TABLE pk3 ADD PRIMARY KEY (id);
+INSERT INTO pk3 VALUES (2, 'dup');
+ERROR:  duplicate key value violates unique constraint "pk3_pkey"
+DETAIL:  Key (id)=(2) already exists.
+ALTER TABLE pk3 ADD UNIQUE (v);
+INSERT INTO pk3 VALUES (3, 'a');
+ERROR:  duplicate key value violates unique constraint "pk3_v_key"
+DETAIL:  Key (v)=(a) already exists.
+ALTER TABLE pk3 DROP CONSTRAINT pk3_pkey;
+INSERT INTO pk3 VALUES (2, 'c');
+-- a partial and an expression unique index
+CREATE TABLE pu (id int, g int, t text) USING columnar;
+CREATE UNIQUE INDEX pu_part ON pu (id) WHERE g = 1;
+CREATE UNIQUE INDEX pu_expr ON pu (lower(t));
+INSERT INTO pu VALUES (1, 1, 'A'), (1, 2, 'B'), (2, 2, 'C');
+INSERT INTO pu VALUES (1, 1, 'D');
+ERROR:  duplicate key value violates unique constraint "pu_part"
+DETAIL:  Key (id)=(1) already exists.
+INSERT INTO pu VALUES (9, 9, 'a');
+ERROR:  duplicate key value violates unique constraint "pu_expr"
+DETAIL:  Key (lower(t))=(a) already exists.
+-- refused, with a message that says why
+CREATE TABLE ref_to (id int PRIMARY KEY) USING columnar;
+CREATE TABLE ref_from (id int REFERENCES ref_to (id));
+ERROR:  foreign keys on or to columnar tables are not supported
+HINT:  Keep the referencing and the referenced table in row storage.
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 52 at RAISE
+CREATE TABLE ref_h (id int PRIMARY KEY);
+CREATE TABLE ref_c (id int REFERENCES ref_h (id)) USING columnar;
+ERROR:  foreign keys on or to columnar tables are not supported
+HINT:  Keep the referencing and the referenced table in row storage.
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 52 at RAISE
+ALTER TABLE pk3 ADD CONSTRAINT pk3_def UNIQUE (id) DEFERRABLE;
+ERROR:  deferrable unique and exclusion constraints are not supported on columnar tables
+DETAIL:  The constraint on index "pk3_def" would be checked at the end of the transaction by a trigger that re-reads the row by its TID.
+HINT:  Make the constraint NOT DEFERRABLE.
+ALTER TABLE pk3 ADD CONSTRAINT pk3_def2 UNIQUE (id) DEFERRABLE INITIALLY DEFERRED;
+ERROR:  deferrable unique and exclusion constraints are not supported on columnar tables
+DETAIL:  The constraint on index "pk3_def2" would be checked at the end of the transaction by a trigger that re-reads the row by its TID.
+HINT:  Make the constraint NOT DEFERRABLE.
+ALTER TABLE pk3 ADD EXCLUDE USING btree (id WITH =);
+ERROR:  exclusion constraints are not supported on columnar tables
+DETAIL:  The index "pk3_id_excl" on "pk3" enforces one; that needs a fetch with a dirty snapshot (increment C6c).
+INSERT INTO u VALUES (1, 'x') ON CONFLICT DO NOTHING;
+ERROR:  INSERT ... ON CONFLICT is not supported on columnar tables that have an index
+DETAIL:  A speculative insertion would have to take a row back, and a row of a columnar table cannot be taken back.
+HINT:  Insert the rows and handle the unique violation, or keep the table in row storage.
+INSERT INTO u VALUES (1, 'x') ON CONFLICT (id) DO NOTHING;
+ERROR:  INSERT ... ON CONFLICT is not supported on columnar tables that have an index
+DETAIL:  A speculative insertion would have to take a row back, and a row of a columnar table cannot be taken back.
+HINT:  Insert the rows and handle the unique violation, or keep the table in row storage.
+INSERT INTO u VALUES (1, 'x') ON CONFLICT (id) DO UPDATE SET v = 'y';
+ERROR:  INSERT ... ON CONFLICT is not supported on columnar tables that have an index
+DETAIL:  A speculative insertion would have to take a row back, and a row of a columnar table cannot be taken back.
+HINT:  Insert the rows and handle the unique violation, or keep the table in row storage.
+-- row locks and updates stay refused
+UPDATE u SET v = 'q' WHERE id = 1;
+ERROR:  columnar tables are append-only: UPDATE and DELETE are not supported
+SELECT * FROM u WHERE id = 1 FOR UPDATE;
+ERROR:  columnar tables do not support row locks
+-- index vacuum: the entries of rolled back inserts go, the rows stay, the answers do not change
+CREATE TABLE iv (id int, v text) USING columnar;
+SELECT kingres.columnar_set_options('iv', stripe_row_count => 1000, chunk_row_count => 100);
+ columnar_set_options 
+----------------------
+ 
+(1 row)
+
+CREATE INDEX iv_id ON iv (id);
+CREATE UNIQUE INDEX iv_u ON iv (v);
+INSERT INTO iv SELECT g, 'k' || g FROM generate_series(1, 3000) g;
+BEGIN;
+INSERT INTO iv SELECT g, 'r' || g FROM generate_series(5001, 8000) g;
+ROLLBACK;
+SELECT idx_tup_read IS NOT NULL AS stats_ok FROM pg_stat_user_indexes WHERE indexrelname = 'iv_id';
+ stats_ok 
+----------
+ t
+(1 row)
+
+SELECT (SELECT reltuples FROM pg_class WHERE relname = 'iv_id') AS before_vacuum_tuples;
+ before_vacuum_tuples 
+----------------------
+                    0
+(1 row)
+
+VACUUM iv;
+SELECT (SELECT reltuples FROM pg_class WHERE relname = 'iv_id') AS after_vacuum_tuples;
+ after_vacuum_tuples 
+---------------------
+                3000
+(1 row)
+
+SELECT (SELECT reltuples FROM pg_class WHERE relname = 'iv_u') AS after_vacuum_unique_tuples;
+ after_vacuum_unique_tuples 
+----------------------------
+                       3000
+(1 row)
+
+SET enable_seqscan = off;
+SET kingres_columnar.enable_custom_scan = off;
+SELECT count(*) AS by_index FROM iv WHERE id > 0;
+ by_index 
+----------
+     3000
+(1 row)
+
+SELECT count(*) AS rolled_back_rows FROM iv WHERE id > 5000;
+ rolled_back_rows 
+------------------
+                0
+(1 row)
+
+RESET enable_seqscan;
+RESET kingres_columnar.enable_custom_scan;
+-- the keys of the rolled back rows are free and the entries are not in the way
+INSERT INTO iv SELECT g, 'r' || g FROM generate_series(5001, 5010) g;
+SELECT count(*) FROM iv;
+ count 
+-------
+  3010
+(1 row)
+
+VACUUM (INDEX_CLEANUP off) iv;
+VACUUM (INDEX_CLEANUP on) iv;
+SELECT * FROM kingres.columnar_check();
+ check_name | relation | detail 
+------------+----------+--------
+(0 rows)
+
+SELECT * FROM kingres.columnar_check_indexes('iv');
+ check_name | relation | detail 
+------------+----------+--------
+(0 rows)
+
+SELECT * FROM kingres.columnar_check_indexes('pu');
+ check_name | relation | detail 
+------------+----------+--------
+(0 rows)
+

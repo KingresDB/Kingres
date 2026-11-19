@@ -87,6 +87,15 @@ CREATE FUNCTION columnar_check(fix boolean DEFAULT false)
     LANGUAGE C STRICT SECURITY INVOKER
     SET search_path = pg_catalog, kingres, pg_temp;
 
+-- The cross-check of the indexes of one columnar table against its stripes: a visible
+-- row with no entry in an index is damage (index_entry_missing); an entry with no row is
+-- expected until the next VACUUM and is not reported.  It reads every index of the table.
+CREATE FUNCTION columnar_check_indexes(rel regclass)
+    RETURNS TABLE (check_name text, relation regclass, detail text)
+    AS 'MODULE_PATHNAME', 'kingres_columnar_check_indexes'
+    LANGUAGE C STRICT SECURITY INVOKER
+    SET search_path = pg_catalog, kingres, pg_temp;
+
 -- The strict form of columnar_check: true only when every columnar table was
 -- checked and nothing was found.  false for any row columnar_check() would
 -- return, a table that could not be locked at once (not_checked) included.
@@ -221,6 +230,10 @@ BEGIN
     END LOOP;
 
     IF cardinality(rels) > 0 THEN
+        -- the tables the keys of these relations point to (a foreign key TO a columnar table
+        -- needs a row lock on the referenced row, which a columnar row cannot give)
+        rels := rels || ARRAY(SELECT DISTINCT c.confrelid FROM pg_catalog.pg_constraint c
+                               WHERE c.contype = 'f' AND c.conrelid = ANY (rels));
         -- partitions of the partitioned tables the command named
         rels := rels || ARRAY(SELECT t.relid
                                 FROM unnest(rels) x,
@@ -322,6 +335,7 @@ REVOKE ALL ON FUNCTION columnar_info(regclass) FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_stripes(regclass) FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_compact(regclass, int) FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_check(boolean) FROM PUBLIC;
+REVOKE ALL ON FUNCTION columnar_check_indexes(regclass) FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_check_clean() FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_reconcile() FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_write_paths(boolean) FROM PUBLIC;

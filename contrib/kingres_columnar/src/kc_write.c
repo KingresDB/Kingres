@@ -74,6 +74,7 @@
 #include "catalog/storage.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "storage/lock.h"
 #include "storage/predicate.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
@@ -1559,6 +1560,35 @@ kc_give_back_tail(Relation rel, uint64 first, uint32 count)
 		KC_PATH(KC_PATH_GAP);
 }
 
+/*
+ * The reservation lock (C6c).  Between the moment a writer takes row numbers from the
+ * metapage and the moment the catalog row that claims them is inserted, the numbers
+ * belong to nobody the catalog knows, and an index vacuum that looked at the catalog
+ * in that gap would call the index entries the writer is about to make dead.  A writer
+ * holds this lock in SHARE mode across the gap (an advisory-class lock of its own,
+ * field 4 = 7, that no user lock uses), and the index vacuum takes it in EXCLUSIVE
+ * mode while it reads the metapage and the catalog (kc_index_vacuum), so each of them
+ * sees every claim that was made before it and the metapage that comes after.  Writers
+ * do not wait for each other; one waits only for the short look of a vacuum.
+ */
+void
+kc_reserve_lock(Relation rel, LOCKMODE mode)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_ADVISORY(tag, MyDatabaseId, 0x4B43, RelationGetRelid(rel), 7);
+	(void) LockAcquire(&tag, mode, false, false);
+}
+
+void
+kc_reserve_unlock(Relation rel, LOCKMODE mode)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_ADVISORY(tag, MyDatabaseId, 0x4B43, RelationGetRelid(rel), 7);
+	(void) LockRelease(&tag, mode, false);
+}
+
 /* Take the numbers and insert the reserved catalog row; the buffer has none. */
 static void
 kc_buf_reserve_numbers(KcWriteBuf *b, Relation rel)
@@ -1569,6 +1599,7 @@ kc_buf_reserve_numbers(KcWriteBuf *b, Relation rel)
 	uint32		count = kc_stripe_limit(&b->opts);
 
 	Assert(b->reserving && !b->res_valid);
+	kc_reserve_lock(rel, ShareLock);
 	kc_meta_allocate(rel, count, &stripe_id, &first_row);
 	KC_PATH(KC_PATH_RESERVED);
 	kc_reserve_gate(KC_RES_AFTER_ALLOC);
@@ -1584,6 +1615,7 @@ kc_buf_reserve_numbers(KcWriteBuf *b, Relation rel)
 	b->res_first = first_row;
 	b->res_count = count;
 	b->res_valid = true;
+	kc_reserve_unlock(rel, ShareLock);
 	kc_reserve_gate(KC_RES_AFTER_EARLY_ROW);
 }
 
@@ -2323,6 +2355,7 @@ kc_write_stripe(KcRelState *st, KcWriteBuf *b, Relation rel, uint32 first,
 	MemoryContext old = CurrentMemoryContext;
 	MemoryContext fcxt;
 	bool		reserved = b->res_valid && !maintenance;
+	bool		locked = false;
 
 	/*
 	 * A stripe of a buffer that holds a reservation is the front of the numbers
@@ -2346,7 +2379,11 @@ kc_write_stripe(KcRelState *st, KcWriteBuf *b, Relation rel, uint32 first,
 		first_row = b->res_first;
 	}
 	else
+	{
+		kc_reserve_lock(rel, ShareLock);
 		kc_meta_allocate(rel, count, &stripe_id, &first_row);
+		locked = true;
+	}
 	if (first_row_out != NULL)
 		*first_row_out = first_row;
 	kc_build_stripe(rel, b, first, count, &b->opts, stripe_id, &blob, &stats,
@@ -2366,6 +2403,8 @@ kc_write_stripe(KcRelState *st, KcWriteBuf *b, Relation rel, uint32 first,
 	if (!reserved)
 		kc_catalog_insert(rel, &si, cidpts.data, cidpts.len, stats.data, stats.len,
 						  st->frozen, maintenance);
+	if (locked)
+		kc_reserve_unlock(rel, ShareLock);
 	else
 	{
 		uint64		res_first = b->res_first;

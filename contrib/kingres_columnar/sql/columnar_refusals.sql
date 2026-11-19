@@ -88,15 +88,19 @@ CREATE INDEX CONCURRENTLY r1_ic ON r1 (id);
 -- the refused concurrent build leaves nothing behind
 SELECT count(*) AS invalid_left FROM pg_index WHERE indrelid = 'r1'::regclass;
 CREATE TABLE r2 (id int PRIMARY KEY, s text) USING columnar;
+DROP TABLE r2;
 CREATE TABLE r2 (id int UNIQUE, s text) USING columnar;
+DROP TABLE r2;
 CREATE TABLE r2 (id int, s text, EXCLUDE USING btree (id WITH =)) USING columnar;
 CREATE TABLE r2 (id int, s text) USING columnar;
 ALTER TABLE r2 ADD PRIMARY KEY (id);
+ALTER TABLE r2 DROP CONSTRAINT r2_pkey;
 ALTER TABLE r2 ADD UNIQUE (id);
+ALTER TABLE r2 DROP CONSTRAINT r2_id_key;
 ALTER TABLE r2 ADD EXCLUDE USING btree (id WITH =);
 ALTER TABLE r2 ADD CONSTRAINT r2_u UNIQUE USING INDEX r1_nonexistent;
 SELECT count(*) AS indexes_on_columnar FROM pg_index WHERE indrelid IN ('r1'::regclass, 'r2'::regclass);
--- a heap table with an index cannot become columnar; without one it can
+-- a heap table with a primary key or another B-tree index becomes columnar (its indexes are rebuilt)
 CREATE TABLE r3 (id int PRIMARY KEY, s text);
 ALTER TABLE r3 SET ACCESS METHOD columnar;
 CREATE TABLE r3b (id int, s text);
@@ -106,6 +110,7 @@ DROP INDEX r3b_i;
 ALTER TABLE r3b SET ACCESS METHOD columnar;
 SELECT a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.oid = 'r3b'::regclass;
 CREATE TABLE r3c (LIKE r3 INCLUDING ALL) USING columnar;
+DROP TABLE r3c;
 CREATE TABLE r3c (LIKE r3 INCLUDING DEFAULTS INCLUDING CONSTRAINTS) USING columnar;
 SELECT a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.oid = 'r3c'::regclass;
 CREATE MATERIALIZED VIEW mv USING columnar AS SELECT id, s FROM src;

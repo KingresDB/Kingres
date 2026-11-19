@@ -311,9 +311,13 @@ kc_index_fetch_tuple(IndexFetchTableData *scan, ItemPointer tid,
 	MemoryContext old;
 
 	*call_again = false;
-	*all_dead = false;
+	/* the unique check asks with no all_dead pointer */
+	if (all_dead != NULL)
+		*all_dead = false;
 	if (scan == &kc_refused_fetch || kc_write_refused(scan->rel, "index fetch"))
 		return false;
+	if (snapshot->snapshot_type == SNAPSHOT_DIRTY)
+		return kc_scan_dirty_fetch(scan->rel, tid, snapshot, slot);
 	off = ItemPointerGetOffsetNumber(tid);
 	if (off < 1 || off > MaxOffsetNumber)
 		return false;
@@ -450,7 +454,7 @@ kc_tuple_insert_speculative(Relation rel, TupleTableSlot *slot, CommandId cid,
 		return;
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("INSERT ... ON CONFLICT DO UPDATE is not supported on columnar tables")));
+			 errmsg("INSERT ... ON CONFLICT is not supported on columnar tables: a speculative insertion would have to take a row back")));
 }
 
 static void
@@ -461,7 +465,7 @@ kc_tuple_complete_speculative(Relation rel, TupleTableSlot *slot,
 		return;
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("INSERT ... ON CONFLICT DO UPDATE is not supported on columnar tables")));
+			 errmsg("INSERT ... ON CONFLICT is not supported on columnar tables: a speculative insertion would have to take a row back")));
 }
 
 static void
@@ -944,19 +948,19 @@ kc_index_build_range_scan(Relation table_rel, Relation index_rel,
 				 errmsg("columnar tables support B-tree indexes only"),
 				 errdetail("The index \"%s\" is of another access method.", RelationGetRelationName(index_rel)),
 				 errhint("Use a B-tree index, or keep the table in row storage.")));
-	if (index_info->ii_Unique)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("unique indexes, primary keys and unique constraints are not supported on columnar tables yet"),
-				 errdetail("The index \"%s\" on \"%s\" is unique.  Uniqueness needs the wait on a running writer (increment C6c).",
-						   RelationGetRelationName(index_rel), RelationGetRelationName(table_rel)),
-				 errhint("Create a non-unique index, or keep the table in row storage.")));
 	if (index_info->ii_ExclusionOps != NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("exclusion constraints are not supported on columnar tables"),
 				 errdetail("The index \"%s\" on \"%s\" enforces one; that needs a fetch with a dirty snapshot (increment C6c).",
 						   RelationGetRelationName(index_rel), RelationGetRelationName(table_rel))));
+	if ((index_info->ii_Unique || index_info->ii_ExclusionOps != NULL) && !index_rel->rd_index->indimmediate)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("deferrable unique and exclusion constraints are not supported on columnar tables"),
+				 errdetail("The constraint on index \"%s\" would be checked at the end of the transaction by a trigger that re-reads the row by its TID.",
+						   RelationGetRelationName(index_rel)),
+				 errhint("Make the constraint NOT DEFERRABLE.")));
 	if (index_info->ii_Concurrent)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

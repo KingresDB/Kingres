@@ -354,7 +354,7 @@ BEGIN; SELECT kcevents_open('t'); SAVEPOINT s; INSERT INTO t VALUES (2); ROLLBAC
 		}
 		else
 		{
-			like($err, qr/ERROR:  (columnar tables are append-only|columnar tables do not support row locks|INSERT \.\.\. ON CONFLICT DO UPDATE is not supported)/,
+			like($err, qr/ERROR:  (columnar tables are append-only|columnar tables do not support row locks|INSERT \.\.\. ON CONFLICT is not supported on columnar tables)/,
 				"$order: $op at XACT_EVENT_PRE_COMMIT: an error, where an error is allowed");
 			is($rows->('t'), '', "$order: $op at XACT_EVENT_PRE_COMMIT: ... and the transaction aborted with it");
 		}

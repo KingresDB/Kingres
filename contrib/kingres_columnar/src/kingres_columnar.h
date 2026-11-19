@@ -435,6 +435,26 @@ extern void kc_catalog_update_reserved(Relation rel, const KcStripeInfo *si,
 									   const char *col_stats, int stats_len);
 extern void kc_catalog_delete_reserved(Relation rel, uint64 stripe_id);
 extern int	kc_catalog_count_reserved(Relation rel, Snapshot snap);
+
+/* who holds a row number, and which numbers are live (uniqueness and index vacuum, C6c) */
+typedef enum KcRowState
+{
+	KC_ROW_NONE,				/* nobody: no row, or its writer aborted */
+	KC_ROW_FOUND,				/* a committed row or this transaction's own */
+	KC_ROW_WAIT					/* a row of a transaction in progress: wait for it */
+} KcRowState;
+typedef struct KcRowRange
+{
+	uint64		first;
+	uint64		end;			/* exclusive */
+} KcRowRange;
+extern KcRowState kc_catalog_probe_row(Relation rel, uint64 row, TransactionId *xwait);
+extern KcRowRange *kc_catalog_live_ranges(Relation rel, TransactionId oldest, uint64 next_row,
+										  int *n_out, uint64 *low);
+extern void kc_reserve_lock(Relation rel, LOCKMODE mode);
+extern void kc_reserve_unlock(Relation rel, LOCKMODE mode);
+extern bool kc_scan_dirty_fetch(Relation rel, ItemPointer tid, Snapshot snap, TupleTableSlot *slot);
+extern void kc_index_vacuum(Relation rel, bool skip, double live_rows, BufferAccessStrategy bstrategy);
 extern int	kc_catalog_delete_uid(uint64 uid);
 extern int	kc_catalog_delete_stripe(uint64 uid, uint64 stripe_id, bool wait);
 extern bool kc_catalog_uid_in_use(uint64 uid);

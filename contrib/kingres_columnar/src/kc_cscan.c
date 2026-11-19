@@ -37,6 +37,10 @@
 #include "postgres.h"
 
 #include "optimizer/paths.h"
+#include "catalog/pg_class.h"
+#include "nodes/plannodes.h"
+#include "parser/parsetree.h"
+#include "utils/syscache.h"
 
 #include "access/parallel.h"
 #include "access/relation.h"
@@ -773,9 +777,64 @@ kc_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 	}
 }
 
+/*
+ * INSERT ... ON CONFLICT into a columnar table that has an index (C6c).  The server
+ * inserts speculatively when no conflict was found beforehand: the row goes into the
+ * table, the index entries follow, and a conflict that shows up then takes the row
+ * back.  A columnar row cannot be taken back (it is in a buffer that numbers its
+ * rows, and entries of other indexes may already name it), so the statement is refused
+ * for every form of ON CONFLICT, whether or not this run would have found a conflict
+ * first: the answer must not depend on timing.
+ */
+static void
+kc_refuse_on_conflict_plan(PlannedStmt *pstmt)
+{
+	ListCell   *lc;
+	List	   *plans;
+
+	if (pstmt == NULL || (pstmt->commandType != CMD_INSERT && !pstmt->hasModifyingCTE))
+		return;
+	plans = list_make1(pstmt->planTree);
+	plans = list_concat(plans, list_copy(pstmt->subplans));
+	foreach(lc, plans)
+	{
+		Plan	   *plan = (Plan *) lfirst(lc);
+		ModifyTable *mt;
+		ListCell   *rc;
+
+		if (plan == NULL || !IsA(plan, ModifyTable))
+			continue;
+		mt = (ModifyTable *) plan;
+		if (mt->onConflictAction == ONCONFLICT_NONE)
+			continue;
+		foreach(rc, mt->resultRelations)
+		{
+			RangeTblEntry *rte = rt_fetch(lfirst_int(rc), pstmt->rtable);
+			HeapTuple	tup;
+			bool		indexed;
+
+			if (rte->rtekind != RTE_RELATION || !kc_am_is_columnar(get_rel_relam(rte->relid)))
+				continue;
+			tup = SearchSysCache1(RELOID, ObjectIdGetDatum(rte->relid));
+			if (!HeapTupleIsValid(tup))
+				continue;
+			indexed = ((Form_pg_class) GETSTRUCT(tup))->relhasindex;
+			ReleaseSysCache(tup);
+			if (indexed)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("INSERT ... ON CONFLICT is not supported on columnar tables that have an index"),
+						 errdetail("A speculative insertion would have to take a row back, and a row of a columnar table cannot be taken back."),
+						 errhint("Insert the rows and handle the unique violation, or keep the table in row storage.")));
+		}
+	}
+	list_free(plans);
+}
+
 static void
 kc_executor_start(QueryDesc *queryDesc, int eflags)
 {
+	kc_refuse_on_conflict_plan(queryDesc->plannedstmt);
 	if (IsParallelWorker() && kc_worker_top == NULL)
 		kc_worker_top = queryDesc->plannedstmt;
 	if (prev_executor_start)

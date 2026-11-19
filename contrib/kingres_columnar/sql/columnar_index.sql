@@ -203,7 +203,6 @@ WITH i AS (INSERT INTO cx VALUES (30001, 'w') RETURNING id) SELECT count(*) AS s
 SELECT count(*) AS next_command_lookup FROM cx WHERE id = 30001;
 SET enable_hashjoin = off;
 SET enable_mergejoin = off;
-BEGIN;
 INSERT INTO cx SELECT g, 'small' FROM generate_series(39001, 39300) g;
 WITH i AS (INSERT INTO cx SELECT g, 'big' FROM generate_series(40001, 41200) g RETURNING id) SELECT count(*) AS same_command_after_stripe FROM i JOIN cx ON cx.id = i.id;
 SELECT count(*) AS earlier_command_rows FROM cx WHERE id BETWEEN 39001 AND 39300;

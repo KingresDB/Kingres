@@ -195,17 +195,8 @@ RESET enable_indexscan;
 RESET enable_seqscan;
 -- what is refused
 CREATE UNIQUE INDEX ci_u ON ci (id);
-ERROR:  unique indexes, primary keys and unique constraints are not supported on columnar tables yet
-DETAIL:  The index "ci_u" on "ci" is unique.  Uniqueness needs the wait on a running writer (increment C6c).
-HINT:  Create a non-unique index, or keep the table in row storage.
 ALTER TABLE ci ADD PRIMARY KEY (id);
-ERROR:  unique indexes, primary keys and unique constraints are not supported on columnar tables yet
-DETAIL:  The index "ci_pkey" on "ci" is unique.  Uniqueness needs the wait on a running writer (increment C6c).
-HINT:  Create a non-unique index, or keep the table in row storage.
 ALTER TABLE ci ADD UNIQUE (g, id);
-ERROR:  unique indexes, primary keys and unique constraints are not supported on columnar tables yet
-DETAIL:  The index "ci_g_id_key" on "ci" is unique.  Uniqueness needs the wait on a running writer (increment C6c).
-HINT:  Create a non-unique index, or keep the table in row storage.
 CREATE INDEX ci_hash ON ci USING hash (id);
 ERROR:  columnar tables support B-tree indexes only
 DETAIL:  The index "ci_hash" is of another access method.
@@ -228,9 +219,6 @@ REINDEX TABLE CONCURRENTLY ci;
 ERROR:  CREATE INDEX CONCURRENTLY and REINDEX CONCURRENTLY are not supported on columnar tables
 HINT:  Use CREATE INDEX or REINDEX, which lock the table against writes while they run.
 CREATE TABLE ci_pk (id int PRIMARY KEY) USING columnar;
-ERROR:  unique indexes, primary keys and unique constraints are not supported on columnar tables yet
-DETAIL:  The index "ci_pk_pkey" on "ci_pk" is unique.  Uniqueness needs the wait on a running writer (increment C6c).
-HINT:  Create a non-unique index, or keep the table in row storage.
 SELECT kingres.columnar_compact('ci', 1000000);
 ERROR:  columnar_compact is not supported on columnar table "ci", which has an index
 DETAIL:  Compaction gives rows new numbers, and the indexes of the table name rows by number; rebuilding them is not part of it yet.
@@ -241,7 +229,7 @@ ERROR:  CLUSTER is not supported on columnar tables: it would reorder the rows, 
 SELECT count(*) AS indexes FROM pg_index WHERE indrelid = 'ci'::regclass;
  indexes 
 ---------
-      10
+      13
 (1 row)
 
 SELECT count(*) AS invalid FROM pg_index WHERE NOT indisvalid OR NOT indisready;
@@ -460,8 +448,6 @@ SELECT count(*) AS next_command_lookup FROM cx WHERE id = 30001;
 
 SET enable_hashjoin = off;
 SET enable_mergejoin = off;
-BEGIN;
-WARNING:  there is already a transaction in progress
 INSERT INTO cx SELECT g, 'small' FROM generate_series(39001, 39300) g;
 WITH i AS (INSERT INTO cx SELECT g, 'big' FROM generate_series(40001, 41200) g RETURNING id) SELECT count(*) AS same_command_after_stripe FROM i JOIN cx ON cx.id = i.id;
  same_command_after_stripe 

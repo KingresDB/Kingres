@@ -1844,3 +1844,190 @@ kc_catalog_uid_in_use(uint64 uid)
 	table_close(cat, AccessShareLock);
 	return used;
 }
+
+/* ------------------------------------------------------------------------
+ * Who holds a row number (uniqueness, C6c) and which numbers are live (index vacuum)
+ * ------------------------------------------------------------------------
+ */
+
+/* What one version of a stripe catalog row says about its writer. */
+typedef enum KcVer
+{
+	KC_VER_DEAD,				/* aborted, or replaced/deleted: holds nothing */
+	KC_VER_OWN,					/* written by this transaction or one of its subtransactions */
+	KC_VER_COMMITTED,
+	KC_VER_RUNNING				/* a transaction in progress, a prepared one included */
+} KcVer;
+
+static KcVer
+kc_version_status(HeapTupleHeader th, TransactionId *xmin_out)
+{
+	TransactionId xmin = HeapTupleHeaderGetRawXmin(th);
+
+	*xmin_out = InvalidTransactionId;
+	if (HeapTupleHeaderXminFrozen(th))
+		return KC_VER_COMMITTED;
+	if (th->t_infomask & HEAP_XMIN_INVALID)
+		return KC_VER_DEAD;
+	if (TransactionIdIsCurrentTransactionId(xmin))
+		return KC_VER_OWN;
+	if (TransactionIdIsInProgress(xmin))
+	{
+		*xmin_out = xmin;
+		return KC_VER_RUNNING;
+	}
+	if ((th->t_infomask & HEAP_XMIN_COMMITTED) || TransactionIdDidCommit(xmin))
+		return KC_VER_COMMITTED;
+	return KC_VER_DEAD;
+}
+
+/* Has this version been replaced or deleted (by anyone, whatever became of that)? */
+static bool
+kc_version_superseded(HeapTupleHeader th)
+{
+	return !(th->t_infomask & HEAP_XMAX_INVALID) && !HEAP_XMAX_IS_LOCKED_ONLY(th->t_infomask);
+}
+
+/*
+ * The state of one row number of rel for a dirty read (a unique index asks, with
+ * SnapshotDirty): KC_ROW_NONE (no row: nobody holds it, or its writer aborted),
+ * KC_ROW_FOUND (a row that is committed or this transaction's own), or KC_ROW_WAIT
+ * (the row belongs to a transaction in progress, *xwait): the caller waits for it
+ * and asks again.  The answer comes from the stripe catalog alone, with its own
+ * visibility rules (a stripe is its catalog row, the claim of a writer is its
+ * reserved row), so a row that is only in the memory of another backend is found by
+ * the claim.  A version that was replaced (a reserved row by its stripe's row, which
+ * covers only the rows the stripe has) holds nothing: its numbers beyond the stripe
+ * may be reserved again by another writer after the tail was given back.
+ */
+KcRowState
+kc_catalog_probe_row(Relation rel, uint64 row, TransactionId *xwait)
+{
+	Relation	cat = table_open(kc_catalog_oid(), AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	KcRowState	res = KC_ROW_NONE;
+
+	*xwait = InvalidTransactionId;
+	ScanKeyInit(&key, Anum_kc_uid, BTEqualStrategyNumber, F_INT8EQ,
+				Int64GetDatum((int64) kc_rel_ident(rel)->uid));
+	scan = systable_beginscan(cat, kc_catalog_index_oid(), true, SnapshotAny, 1, &key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		bool		isnull;
+		uint64		first = (uint64) DatumGetInt64(heap_getattr(tup, Anum_kc_first_row,
+																  RelationGetDescr(cat), &isnull));
+		uint32		cnt = (uint32) DatumGetInt32(heap_getattr(tup, Anum_kc_row_count,
+															  RelationGetDescr(cat), &isnull));
+		TransactionId x;
+		KcVer		v;
+
+		if (row < first || row - first >= cnt)
+			continue;
+		if (kc_version_superseded(tup->t_data))
+			continue;
+		v = kc_version_status(tup->t_data, &x);
+		if (v == KC_VER_OWN || v == KC_VER_COMMITTED)
+		{
+			res = KC_ROW_FOUND;
+			break;
+		}
+		if (v == KC_VER_RUNNING && res == KC_ROW_NONE)
+		{
+			res = KC_ROW_WAIT;
+			*xwait = x;
+		}
+	}
+	systable_endscan(scan);
+	table_close(cat, AccessShareLock);
+	return res;
+}
+
+static int
+kc_range_cmp(const void *a, const void *b)
+{
+	const KcRowRange *x = a;
+	const KcRowRange *y = b;
+
+	return (x->first > y->first) - (x->first < y->first);
+}
+
+/*
+ * The row numbers an index entry may still need (index vacuum): the ranges of
+ * every stripe row version whose writer did not abort, except versions deleted by a
+ * transaction that committed before the oldest transaction any snapshot may still
+ * have, merged into disjoint ranges sorted by their first number.  *low is the
+ * number below which the answer holds: a number at or above it is never to be
+ * deleted (the claims of writers in progress and every number the metapage may hand
+ * out from now on).  The caller holds the reservation lock (kc_reserve_lock), which
+ * keeps the metapage and the catalog in step: no writer is between taking numbers and
+ * inserting its row for them.
+ */
+KcRowRange *
+kc_catalog_live_ranges(Relation rel, TransactionId oldest, uint64 next_row,
+					   int *n_out, uint64 *low)
+{
+	Relation	cat = table_open(kc_catalog_oid(), AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	KcRowRange *r = NULL;
+	int			n = 0;
+	int			cap = 0;
+	int			i;
+	int			m;
+
+	*low = next_row;
+	ScanKeyInit(&key, Anum_kc_uid, BTEqualStrategyNumber, F_INT8EQ,
+				Int64GetDatum((int64) kc_rel_ident(rel)->uid));
+	scan = systable_beginscan(cat, kc_catalog_index_oid(), true, SnapshotAny, 1, &key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		bool		isnull;
+		uint64		first = (uint64) DatumGetInt64(heap_getattr(tup, Anum_kc_first_row,
+																  RelationGetDescr(cat), &isnull));
+		uint32		cnt = (uint32) DatumGetInt32(heap_getattr(tup, Anum_kc_row_count,
+															  RelationGetDescr(cat), &isnull));
+		HeapTupleHeader th = tup->t_data;
+		TransactionId x;
+		KcVer		v = kc_version_status(th, &x);
+
+		if (v == KC_VER_DEAD)
+			continue;
+		if (v == KC_VER_RUNNING || v == KC_VER_OWN)
+			*low = Min(*low, first);
+		if (kc_version_superseded(th))
+		{
+			TransactionId xmax = HeapTupleHeaderGetUpdateXid(th);
+
+			if (!TransactionIdIsCurrentTransactionId(xmax) && !TransactionIdIsInProgress(xmax) &&
+				TransactionIdDidCommit(xmax) && TransactionIdPrecedes(xmax, oldest))
+				continue;
+		}
+		if (n == cap)
+		{
+			cap = cap ? cap * 2 : 64;
+			r = r ? repalloc(r, sizeof(KcRowRange) * cap) : palloc(sizeof(KcRowRange) * cap);
+		}
+		r[n].first = first;
+		r[n].end = first + cnt;
+		n++;
+	}
+	systable_endscan(scan);
+	table_close(cat, AccessShareLock);
+
+	if (n > 1)
+		qsort(r, n, sizeof(KcRowRange), kc_range_cmp);
+	/* merge into disjoint ranges */
+	m = 0;
+	for (i = 0; i < n; i++)
+	{
+		if (m > 0 && r[i].first <= r[m - 1].end)
+			r[m - 1].end = Max(r[m - 1].end, r[i].end);
+		else
+			r[m++] = r[i];
+	}
+	*n_out = m;
+	return r;
+}

@@ -33,6 +33,8 @@
 #include "catalog/storage.h"
 #include "commands/dbcommands.h"
 #include "commands/vacuum.h"
+#include "access/genam.h"
+#include "postmaster/autovacuum.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -230,6 +232,109 @@ kc_stored_relfrozenxid(Relation rel)
 	return result;
 }
 
+/*
+ * Index vacuum (C6c): the entries of a table's indexes whose row is in no stripe that
+ * anyone can use and under no claim of a live writer are removed, as heap's vacuum
+ * removes the entries of dead rows.  What is dead: the rows of writers that aborted
+ * (a stripe row or a reserved row of an aborted transaction or subtransaction, or of a
+ * backend that died) and of stripes that were removed.  What is never dead: a number in a
+ * stripe or under the claim of a transaction in progress, also a prepared one, and every
+ * number at or above kc_catalog_live_ranges' "low" (the claims of running writers and
+ * what the metapage hands out from now on, which the vacuum cannot know about).  A
+ * number is never given to another row while an entry may name it (a number whose
+ * writer aborted is not given back, kc_write.c), so a removed entry is gone for good and
+ * a kept one only costs space.
+ */
+typedef struct KcVacState
+{
+	KcRowRange *r;
+	int			n;
+	uint64		low;
+	double		removed;
+} KcVacState;
+
+static bool
+kc_vacuum_dead(ItemPointer itemptr, void *state)
+{
+	KcVacState *s = (KcVacState *) state;
+	uint64		row = (uint64) ItemPointerGetBlockNumber(itemptr) * MaxOffsetNumber +
+		(ItemPointerGetOffsetNumber(itemptr) - 1);
+	int			lo = 0;
+	int			hi = s->n - 1;
+
+	if (row >= s->low)
+		return false;
+	while (lo <= hi)
+	{
+		int			mid = lo + (hi - lo) / 2;
+
+		if (s->r[mid].first > row)
+			hi = mid - 1;
+		else if (s->r[mid].end <= row)
+			lo = mid + 1;
+		else
+			return false;
+	}
+	s->removed += 1;
+	return true;
+}
+
+void
+kc_index_vacuum(Relation rel, bool skip, double live_rows, BufferAccessStrategy bstrategy)
+{
+	Relation   *Irel;
+	int			nindexes;
+	KcMetaData	meta;
+	KcVacState	st;
+	int			i;
+
+	if (skip || !rel->rd_rel->relhasindex)
+		return;
+	vac_open_indexes(rel, RowExclusiveLock, &nindexes, &Irel);
+	if (nindexes == 0)
+	{
+		vac_close_indexes(nindexes, Irel, RowExclusiveLock);
+		return;
+	}
+
+	/* the metapage and the catalog in step: no claim is half made while this is held */
+	kc_reserve_lock(rel, ExclusiveLock);
+	kc_meta_read(rel, &meta);
+	st.r = kc_catalog_live_ranges(rel, GetOldestNonRemovableTransactionId(rel),
+								  meta.next_row, &st.n, &st.low);
+	kc_reserve_unlock(rel, ExclusiveLock);
+	st.removed = 0;
+
+	for (i = 0; i < nindexes; i++)
+	{
+		IndexVacuumInfo ivinfo;
+		IndexBulkDeleteResult *stats;
+
+		memset(&ivinfo, 0, sizeof(ivinfo));
+		ivinfo.index = Irel[i];
+		ivinfo.heaprel = rel;
+		ivinfo.estimated_count = false;
+		ivinfo.message_level = DEBUG2;
+		ivinfo.num_heap_tuples = live_rows;
+		ivinfo.strategy = bstrategy;
+		KC_IVINFO_AUTOVAC(ivinfo);
+
+		stats = index_bulk_delete(&ivinfo, NULL, kc_vacuum_dead, &st);
+		stats = index_vacuum_cleanup(&ivinfo, stats);
+		if (stats != NULL)
+		{
+			vac_update_relstats(Irel[i], stats->num_pages, stats->num_index_tuples, 0, 0,
+								false, InvalidTransactionId, InvalidMultiXactId,
+								NULL, NULL, false);
+			pfree(stats);
+		}
+		CHECK_FOR_INTERRUPTS();
+	}
+	vac_close_indexes(nindexes, Irel, RowExclusiveLock);
+	if (st.r)
+		pfree(st.r);
+}
+
 void
 kc_relation_vacuum(KC_VACUUM_PARAMS)
 {
@@ -270,6 +375,9 @@ kc_relation_vacuum(KC_VACUUM_PARAMS)
 
 	nblocks = RelationGetNumberOfBlocks(rel);
 	rows = kc_catalog_row_total(rel, NULL, NULL, NULL, NULL);
+
+	/* the entries of the indexes of dead rows (not with INDEX_CLEANUP off) */
+	kc_index_vacuum(rel, params->index_cleanup == VACOPTVALUE_DISABLED, (double) rows, bstrategy);
 
 	/*
 	 * The only transaction id a columnar file holds is the one in its

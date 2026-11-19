@@ -949,3 +949,48 @@ kc_scan_fetch_row(KcScan *scan, uint64 row, TupleTableSlot *slot)
 	ExecStoreVirtualTuple(slot);
 	return true;
 }
+
+/*
+ * A fetch for a unique index (SnapshotDirty): is there a row of this number, and if
+ * its writer is still running, which transaction is it (snap->xmin: the caller waits
+ * for it and asks again).  The row itself is not read; the slot is stored empty.  A
+ * row of this transaction is found whatever its command (a duplicate inside one
+ * statement is a duplicate).
+ */
+bool
+kc_scan_dirty_fetch(Relation rel, ItemPointer tid, Snapshot snap, TupleTableSlot *slot)
+{
+	uint64		row;
+	OffsetNumber off = ItemPointerGetOffsetNumber(tid);
+	Datum	   *vals;
+	bool	   *nulls;
+	int			ncols;
+	CommandId	cid;
+	TransactionId xwait;
+
+	snap->xmin = snap->xmax = InvalidTransactionId;
+	snap->speculativeToken = 0;
+	if (off < 1 || off > MaxOffsetNumber)
+		return false;
+	row = (uint64) ItemPointerGetBlockNumber(tid) * MaxOffsetNumber + (off - 1);
+	if (row >= KC_MAX_ROW_NUMBER)
+		return false;
+	if (!kc_write_pending_by_number(RelationGetRelid(rel), kc_rel_ident(rel)->uid,
+									row, &vals, &nulls, &ncols, &cid))
+	{
+		switch (kc_catalog_probe_row(rel, row, &xwait))
+		{
+			case KC_ROW_NONE:
+				return false;
+			case KC_ROW_WAIT:
+				snap->xmin = xwait;
+				break;
+			case KC_ROW_FOUND:
+				break;
+		}
+	}
+	ExecStoreAllNullTuple(slot);
+	*(&slot->tts_tid) = *tid;
+	slot->tts_tableOid = RelationGetRelid(rel);
+	return true;
+}

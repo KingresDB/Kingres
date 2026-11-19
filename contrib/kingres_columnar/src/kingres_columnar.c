@@ -65,6 +65,7 @@ PG_FUNCTION_INFO_V1(kingres_columnar_info);
 PG_FUNCTION_INFO_V1(kingres_columnar_stripes);
 PG_FUNCTION_INFO_V1(kingres_columnar_compact);
 PG_FUNCTION_INFO_V1(kingres_columnar_check);
+PG_FUNCTION_INFO_V1(kingres_columnar_check_indexes);
 PG_FUNCTION_INFO_V1(kingres_columnar_check_clean);
 PG_FUNCTION_INFO_V1(kingres_columnar_reconcile);
 PG_FUNCTION_INFO_V1(kingres_columnar_write_paths);
@@ -1359,6 +1360,167 @@ kc_check_run(bool fix, KcCheckSink *sink)
  * the tables are clean, and the warning says so.  The superuser test comes
  * after the refusal because an error is not allowed at those moments.
  */
+/*
+ * columnar_check_indexes(rel): the cross-check of the indexes of one table against its
+ * stripes (C6c).  A row that the stripes of now hold and an index has no entry for is
+ * damage ('index_entry_missing'); an entry with no row is expected garbage until the
+ * next VACUUM and is not reported.  The stripe list is taken first and the index read
+ * after it, so a writer that commits meanwhile cannot make a row look unindexed (its
+ * entries precede its commit).  It reads every index in full and keeps the row numbers
+ * of one index in memory (8 bytes each): above KC_CHECK_MAX_ENTRIES entries the index is
+ * reported as 'not_checked'.  A separate function, because the cost of the check of
+ * the stripe catalog must not grow with the size of the indexes.
+ */
+#define KC_CHECK_MAX_ENTRIES	(50 * 1000 * 1000)
+
+static int
+kc_u64_cmp2(const void *a, const void *b)
+{
+	uint64		x = *(const uint64 *) a;
+	uint64		y = *(const uint64 *) b;
+
+	return (x > y) - (x < y);
+}
+
+static void
+kc_check_one_index(Relation rel, Relation idx, KcCheckSink *sink)
+{
+	IndexInfo  *ii = BuildIndexInfo(idx);
+	bool		partial = (ii->ii_Predicate != NIL);
+	bool	   *needed = NULL;
+	KcScan	   *scan;
+	uint64	   *ents = NULL;
+	uint64		n = 0;
+	uint64		cap = 0;
+	uint64		missing = 0;
+	uint64		first_missing[3];
+	IndexScanDesc is;
+	TupleTableSlot *slot;
+	EState	   *estate = NULL;
+	ExprContext *econtext = NULL;
+	ExprState  *pred = NULL;
+	char		detail[300];
+	int			i;
+
+	if (partial)
+	{
+		estate = CreateExecutorState();
+		econtext = GetPerTupleExprContext(estate);
+		pred = ExecPrepareQual(ii->ii_Predicate, estate);
+	}
+	else
+	{
+		needed = palloc0(sizeof(bool) * (RelationGetDescr(rel)->natts + 1));
+	}
+
+	/* the rows first (their stripe list is fixed here), then the entries */
+	scan = kc_scan_begin(rel, NULL, needed, NULL, KC_SCAN_MAINTENANCE);
+	is = KC_INDEX_BEGINSCAN(rel, idx, SnapshotAny);
+	index_rescan(is, NULL, 0, NULL, 0);
+	while (index_getnext_tid(is, ForwardScanDirection) != NULL)
+	{
+		ItemPointer tid = &is->xs_heaptid;
+
+		if (n == cap)
+		{
+			if (n >= KC_CHECK_MAX_ENTRIES)
+			{
+				snprintf(detail, sizeof(detail), "the index has more than %d entries and was not checked (the check keeps them in memory)",
+						 KC_CHECK_MAX_ENTRIES);
+				kc_check_row(sink, "not_checked", RelationGetRelid(idx), detail);
+				index_endscan(is);
+				kc_scan_end(scan);
+				if (ents)
+					pfree(ents);
+				return;
+			}
+			cap = cap ? cap * 2 : 1024;
+			ents = ents ? repalloc_huge(ents, sizeof(uint64) * cap)
+				: MemoryContextAllocHuge(CurrentMemoryContext, sizeof(uint64) * cap);
+		}
+		ents[n++] = (uint64) ItemPointerGetBlockNumber(tid) * MaxOffsetNumber +
+			(ItemPointerGetOffsetNumber(tid) - 1);
+		CHECK_FOR_INTERRUPTS();
+	}
+	index_endscan(is);
+	if (n > 1)
+		qsort(ents, n, sizeof(uint64), kc_u64_cmp2);
+
+	slot = table_slot_create(rel, NULL);
+	if (partial)
+		econtext->ecxt_scantuple = slot;
+	while (kc_scan_next(scan, slot))
+	{
+		uint64		row = (uint64) ItemPointerGetBlockNumber(&slot->tts_tid) * MaxOffsetNumber +
+			(ItemPointerGetOffsetNumber(&slot->tts_tid) - 1);
+
+		CHECK_FOR_INTERRUPTS();
+		if (partial)
+		{
+			MemoryContextReset(econtext->ecxt_per_tuple_memory);
+			if (!ExecQual(pred, econtext))
+				continue;
+		}
+		if (n == 0 || bsearch(&row, ents, n, sizeof(uint64), kc_u64_cmp2) == NULL)
+		{
+			if (missing < 3)
+				first_missing[missing] = row;
+			missing++;
+		}
+	}
+	ExecDropSingleTupleTableSlot(slot);
+	kc_scan_end(scan);
+	if (estate)
+		FreeExecutorState(estate);
+	if (ents)
+		pfree(ents);
+	if (missing > 0)
+	{
+		int			len;
+
+		len = snprintf(detail, sizeof(detail), "%llu visible row(s) have no entry in the index; first row numbers:",
+					   (unsigned long long) missing);
+		for (i = 0; i < 3 && (uint64) i < missing && len < (int) sizeof(detail) - 24; i++)
+			len += snprintf(detail + len, sizeof(detail) - len, " %llu", (unsigned long long) first_missing[i]);
+		kc_check_row(sink, "index_entry_missing", RelationGetRelid(idx), detail);
+	}
+}
+
+Datum
+kingres_columnar_check_indexes(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	KcCheckSink sink;
+	Relation	rel;
+	List	   *il;
+	ListCell   *lc;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to run columnar_check_indexes")));
+	InitMaterializedSRF(fcinfo, 0);
+	sink.rsinfo = rsinfo;
+	sink.rows = 0;
+	sink.ld = NULL;
+	sink.ld_uses = 0;
+	rel = kc_open_columnar_read(relid, "columnar_check_indexes");
+	if (rel == NULL)
+		return (Datum) 0;
+	il = RelationGetIndexList(rel);
+	foreach(lc, il)
+	{
+		Relation	idx = index_open(lfirst_oid(lc), AccessShareLock);
+
+		kc_check_one_index(rel, idx, &sink);
+		index_close(idx, AccessShareLock);
+	}
+	list_free(il);
+	relation_close(rel, AccessShareLock);
+	return (Datum) 0;
+}
+
 Datum
 kingres_columnar_check(PG_FUNCTION_ARGS)
 {
