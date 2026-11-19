@@ -47,6 +47,7 @@
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/snapmgr.h"
 #include "utils/typcache.h"
 
 #include "bucket_move.h"
@@ -61,23 +62,11 @@
 PG_FUNCTION_INFO_V1(kingres_create_distributed_table);
 PG_FUNCTION_INFO_V1(kingres_internal_has_hash_support);
 
-/* The statements that recreate the table, by where they run. */
-typedef struct DdlSet
-{
-	StringInfoData local_pre;
-	StringInfoData remote_pre;
-	StringInfoData both;
-	StringInfoData swap;
-	StringInfoData fk;
-	StringInfoData post;
-	StringInfoData post_local;
-} DdlSet;
-
 /*
  * Run a statement through SPI and check that it succeeded.
  */
-static void
-run_spi(const char *sql, int nargs, Oid *argtypes, Datum *values)
+void
+kingres_shard_run_spi(const char *sql, int nargs, Oid *argtypes, Datum *values)
 {
 	int			ret;
 
@@ -112,8 +101,8 @@ kingres_internal_has_hash_support(PG_FUNCTION_ARGS)
  * the new table is made under a name that carries the OID of the old one.
  * Must run before the old table is dropped.
  */
-static void
-fetch_ddl(Oid relid, const char *column, bool shadow, DdlSet *ddl, MemoryContext cxt)
+void
+kingres_shard_fetch_ddl(Oid relid, const char *column, bool shadow, DdlSet *ddl, MemoryContext cxt)
 {
 	Oid			argtypes[3] = {OIDOID, TEXTOID, BOOLOID};
 	Datum		values[3];
@@ -191,6 +180,23 @@ require_current_sql_objects(void)
 }
 
 /*
+ * The copy reads the rows with a snapshot taken after the lock that stops the writers (copy_routed.c).
+ * Only READ COMMITTED gives a new snapshot to take; a transaction that holds one snapshot for its whole
+ * life would copy the rows as they were before the lock and lose what a writer committed while the call
+ * waited for the lock.
+ */
+static void
+require_read_committed(void)
+{
+	if (IsolationUsesXactSnapshot())
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("a table cannot be distributed in a REPEATABLE READ or SERIALIZABLE transaction"),
+				 errdetail("The rows are copied as of the moment the writers are stopped, which a transaction snapshot taken earlier does not show."),
+				 errhint("Run the call in a READ COMMITTED transaction.")));
+}
+
+/*
  * kingres_shard_remote_table_script
  *
  * The script that creates the parent of an existing distributed table (with
@@ -207,7 +213,7 @@ kingres_shard_remote_table_script(Oid relid, const char *column)
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
-	fetch_ddl(relid, column, false, &ddl, callercxt);
+	kingres_shard_fetch_ddl(relid, column, false, &ddl, callercxt);
 	SPI_finish();
 
 	initStringInfo(&script);
@@ -231,7 +237,7 @@ kingres_shard_remote_fk_script(Oid relid, const char *column)
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
-	fetch_ddl(relid, column, false, &ddl, callercxt);
+	kingres_shard_fetch_ddl(relid, column, false, &ddl, callercxt);
 	SPI_finish();
 	return ddl.fk.data;
 }
@@ -243,8 +249,8 @@ kingres_shard_remote_fk_script(Oid relid, const char *column)
  * group owns: partition <prefix>_b<NNNN> of table nsp.parent, with the modulus
  * of the bucket (catalog.c).
  */
-static void
-append_partitions(StringInfo buf, const char *nsp, const char *prefix, const char *parent,
+void
+kingres_shard_append_partitions(StringInfo buf, const char *nsp, const char *prefix, const char *parent,
 				  const KsColocation *coloc, int group)
 {
 	int			i;
@@ -276,9 +282,9 @@ append_partitions(StringInfo buf, const char *nsp, const char *prefix, const cha
  * sequence kingres.colocation_id_seq, so that an id is never used twice.
  * Returns the colocation id and fills *bucket_count.
  */
-static int
-choose_colocation(Oid coltype, Oid collation, Oid colocate_with,
-				  int requested_buckets, int *bucket_count)
+int
+kingres_shard_choose_colocation(Oid coltype, Oid collation, Oid colocate_with,
+								int requested_buckets, int *bucket_count, bool *created)
 {
 	Oid			argtypes[4];
 	Datum		values[4];
@@ -286,6 +292,8 @@ choose_colocation(Oid coltype, Oid collation, Oid colocate_with,
 	int			nbuckets;
 	bool		isnull;
 
+	if (created != NULL)
+		*created = false;
 	if (OidIsValid(colocate_with))
 	{
 		const KsDistTable *other = kingres_shard_lookup_dist_table(colocate_with);
@@ -326,9 +334,12 @@ choose_colocation(Oid coltype, Oid collation, Oid colocate_with,
 	values[0] = ObjectIdGetDatum(coltype);
 	values[1] = ObjectIdGetDatum(collation);
 	values[2] = Int32GetDatum(nbuckets);
-	run_spi("SELECT colocation_id FROM " KINGRES_SHARD_SCHEMA ".colocation "
+	kingres_shard_run_spi("SELECT colocation_id FROM " KINGRES_SHARD_SCHEMA ".colocation "
 			"WHERE dist_column_type::pg_catalog.oid = $1 AND dist_collation = $2 "
-			"AND bucket_count = $3 ORDER BY colocation_id LIMIT 1",
+			"AND bucket_count = $3 "
+			"AND NOT EXISTS (SELECT 1 FROM " KINGRES_SHARD_SCHEMA ".table_operation_lock l "
+			"WHERE l.colocation_id OPERATOR(pg_catalog.=) colocation.colocation_id) "
+			"ORDER BY colocation_id LIMIT 1",
 			3, argtypes, values);
 	if (SPI_processed > 0)
 		return DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
@@ -339,7 +350,7 @@ choose_colocation(Oid coltype, Oid collation, Oid colocate_with,
 		StringInfoData arr;
 		uint64		i;
 
-		run_spi("SELECT DISTINCT group_id FROM " KINGRES_SHARD_SCHEMA ".node "
+		kingres_shard_run_spi("SELECT DISTINCT group_id FROM " KINGRES_SHARD_SCHEMA ".node "
 				"WHERE role = 'primary' AND is_active AND should_have_shards "
 				"ORDER BY group_id",
 				0, NULL, NULL);
@@ -357,7 +368,7 @@ choose_colocation(Oid coltype, Oid collation, Oid colocate_with,
 														 &isnull)));
 		appendStringInfoChar(&arr, '}');
 
-		run_spi("SELECT pg_catalog.nextval('" KINGRES_SHARD_SCHEMA ".colocation_id_seq')::pg_catalog.int4",
+		kingres_shard_run_spi("SELECT pg_catalog.nextval('" KINGRES_SHARD_SCHEMA ".colocation_id_seq')::pg_catalog.int4",
 				0, NULL, NULL);
 		colocation_id = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
 													SPI_tuptable->tupdesc, 1,
@@ -371,7 +382,9 @@ choose_colocation(Oid coltype, Oid collation, Oid colocate_with,
 		values[1] = Int32GetDatum(nbuckets);
 		values[2] = ObjectIdGetDatum(coltype);
 		values[3] = ObjectIdGetDatum(collation);
-		run_spi("INSERT INTO " KINGRES_SHARD_SCHEMA ".colocation "
+		if (created != NULL)
+			*created = true;
+		kingres_shard_run_spi("INSERT INTO " KINGRES_SHARD_SCHEMA ".colocation "
 				"VALUES ($1, $2, $3::pg_catalog.oid::pg_catalog.regtype, $4)",
 				4, argtypes, values);
 
@@ -381,7 +394,7 @@ choose_colocation(Oid coltype, Oid collation, Oid colocate_with,
 		values[0] = Int32GetDatum(colocation_id);
 		values[1] = CStringGetTextDatum(arr.data);
 		values[2] = Int32GetDatum(nbuckets);
-		run_spi("INSERT INTO " KINGRES_SHARD_SCHEMA ".bucket_map (colocation_id, bucket, group_id) "
+		kingres_shard_run_spi("INSERT INTO " KINGRES_SHARD_SCHEMA ".bucket_map (colocation_id, bucket, group_id) "
 				"SELECT $1, g, (a.groups)[1 + g % pg_catalog.cardinality(a.groups)] "
 				"FROM (SELECT $2::pg_catalog.text::pg_catalog.int4[] AS groups) a, "
 				"pg_catalog.generate_series(0, $3 - 1) g",
@@ -394,8 +407,8 @@ choose_colocation(Oid coltype, Oid collation, Oid colocate_with,
  * The nodes other than this one that are active primaries, copied into the
  * caller's context (the cached catalog is replaced when the catalog changes).
  */
-static List *
-remote_primaries(MemoryContext callercxt)
+List *
+kingres_shard_remote_primaries(MemoryContext callercxt)
 {
 	const KsCatalog *cat = kingres_shard_catalog();
 	List	   *targets = NIL;
@@ -422,8 +435,8 @@ remote_primaries(MemoryContext callercxt)
 }
 
 /* Run a script on a node inside its open transaction branch. */
-static void
-exec_on_node(KsConn *kc, const char *script)
+void
+kingres_shard_exec_on_node(KsConn *kc, const char *script)
 {
 	PGresult   *res;
 
@@ -439,8 +452,8 @@ exec_on_node(KsConn *kc, const char *script)
  * report has checked every key, and the table is not in the catalog of that node
  * yet), then sequence values, privileges and comments.
  */
-static char *
-remote_tail_script(const DdlSet *ddl)
+char *
+kingres_shard_remote_tail_script(const DdlSet *ddl)
 {
 	StringInfoData s;
 
@@ -513,6 +526,7 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 	 * lock is taken first so that the report and the count see what the copy will
 	 * read.
 	 */
+	require_read_committed();
 	LockRelationOid(relid, ExclusiveLock);
 	relname = get_rel_name(relid);
 	if (relname == NULL)
@@ -531,7 +545,7 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 		elog(ERROR, "SPI_connect failed");
 
 	/* 0. Every node must run this version (review finding S4-05). */
-	run_spi("SELECT " KINGRES_SHARD_SCHEMA ".internal_require_version('" KINGRES_SHARD_EXT_VERSION "')",
+	kingres_shard_run_spi("SELECT " KINGRES_SHARD_SCHEMA ".internal_require_version('" KINGRES_SHARD_EXT_VERSION "')",
 			0, NULL, NULL);
 
 	/* 1. Validate the table and the column: the blockers of the report. */
@@ -559,8 +573,8 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 											   SPI_tuptable->tupdesc, 2, &isnull));
 
 	/* 2. The colocation group and the placement of its buckets. */
-	colocation_id = choose_colocation(coltype, collation, colocate_with,
-									  requested, &nbuckets);
+	colocation_id = kingres_shard_choose_colocation(coltype, collation, colocate_with,
+												  requested, &nbuckets, NULL);
 	/* A table added to a group whose bucket is being moved, or that an operation uses, would be missed. */
 	kingres_shard_assert_no_move(colocation_id);
 
@@ -569,7 +583,7 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 		groups[i] = -1;
 	argtypes[0] = INT4OID;
 	values[0] = Int32GetDatum(colocation_id);
-	run_spi("SELECT bucket, group_id FROM " KINGRES_SHARD_SCHEMA ".bucket_map "
+	kingres_shard_run_spi("SELECT bucket, group_id FROM " KINGRES_SHARD_SCHEMA ".bucket_map "
 			"WHERE colocation_id = $1 ORDER BY bucket",
 			1, argtypes, values);
 	for (i = 0; i < SPI_processed; i++)
@@ -591,29 +605,29 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 	}
 
 	/* 3. The statements that recreate the table (before it is replaced). */
-	fetch_ddl(relid, column, true, &ddl, callercxt);
+	kingres_shard_fetch_ddl(relid, column, true, &ddl, callercxt);
 
 	/* The rows, counted under the lock: the copy must give exactly this many. */
 	initStringInfo(&qrel);
 	appendStringInfo(&qrel, "SELECT pg_catalog.count(*) FROM %s", quote_qualified_identifier(nspname, relname));
-	run_spi(qrel.data, 0, NULL, NULL);
+	kingres_shard_run_spi(qrel.data, 0, NULL, NULL);
 	nrows = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
 	kingres_shard_fault_point("distribute_after_lock");
 
 	/* 4a. The shadow here, with the partitions of this group. */
 	if (ddl.local_pre.len > 0)
-		run_spi(ddl.local_pre.data, 0, NULL, NULL);
+		kingres_shard_run_spi(ddl.local_pre.data, 0, NULL, NULL);
 	resetStringInfo(&script);
 	appendStringInfoString(&script, ddl.both.data);
-	append_partitions(&script, nspname, relname, shadow, placement, local_group);
-	run_spi(script.data, 0, NULL, NULL);
+	kingres_shard_append_partitions(&script, nspname, relname, shadow, placement, local_group);
+	kingres_shard_run_spi(script.data, 0, NULL, NULL);
 
 	/*
 	 * 4b. The other nodes.  The node list is read after the catalog changes
 	 * above so that it is current; each node gets the shadow and the
 	 * partitions of its own group.
 	 */
-	targets = remote_primaries(callercxt);
+	targets = kingres_shard_remote_primaries(callercxt);
 	foreach(lc, targets)
 	{
 		KsNode	   *n = (KsNode *) lfirst(lc);
@@ -625,8 +639,8 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 		appendStringInfoString(&script, "SET LOCAL lc_monetary = 'C';\n");
 		appendStringInfoString(&script, ddl.remote_pre.data);
 		appendStringInfoString(&script, ddl.both.data);
-		append_partitions(&script, nspname, relname, shadow, placement, n->group_id);
-		exec_on_node(kc, script.data);
+		kingres_shard_append_partitions(&script, nspname, relname, shadow, placement, n->group_id);
+		kingres_shard_exec_on_node(kc, script.data);
 	}
 	kingres_shard_fault_point("distribute_after_shadow");
 
@@ -655,7 +669,7 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 	resetStringInfo(&script);
 	appendStringInfo(&script, "DROP TABLE %s;\n", quote_qualified_identifier(nspname, relname));
 	appendStringInfoString(&script, ddl.swap.data);
-	run_spi(script.data, 0, NULL, NULL);
+	kingres_shard_run_spi(script.data, 0, NULL, NULL);
 
 	newrelid = get_relname_relid(relname, nspoid);
 	if (!OidIsValid(newrelid))
@@ -673,7 +687,7 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 		kingres_shard_internal_ddl_enter();
 		PG_TRY();
 		{
-			run_spi(ddl.fk.data, 0, NULL, NULL);
+			kingres_shard_run_spi(ddl.fk.data, 0, NULL, NULL);
 		}
 		PG_FINALLY();
 		{
@@ -682,9 +696,9 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 		PG_END_TRY();
 	}
 	if (ddl.post.len > 0)
-		run_spi(ddl.post.data, 0, NULL, NULL);
+		kingres_shard_run_spi(ddl.post.data, 0, NULL, NULL);
 	if (ddl.post_local.len > 0)
-		run_spi(ddl.post_local.data, 0, NULL, NULL);
+		kingres_shard_run_spi(ddl.post_local.data, 0, NULL, NULL);
 
 	/* 8. Record the table. */
 	argtypes[0] = OIDOID;
@@ -693,7 +707,7 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 	values[0] = ObjectIdGetDatum(newrelid);
 	values[1] = CStringGetTextDatum(column);
 	values[2] = Int32GetDatum(colocation_id);
-	run_spi("INSERT INTO " KINGRES_SHARD_SCHEMA ".dist_table (relid, method, dist_column, colocation_id) "
+	kingres_shard_run_spi("INSERT INTO " KINGRES_SHARD_SCHEMA ".dist_table (relid, method, dist_column, colocation_id) "
 			"VALUES ($1::pg_catalog.oid::pg_catalog.regclass, 'hash', "
 			"$2::pg_catalog.name, $3)",
 			3, argtypes, values);
@@ -707,7 +721,7 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 		KsConn	   *kc = kingres_shard_get_conn(n->host, n->port, false, NULL);
 
 		kingres_shard_begin_write_xact(kc);
-		exec_on_node(kc, remote_tail_script(&ddl));
+		kingres_shard_exec_on_node(kc, kingres_shard_remote_tail_script(&ddl));
 	}
 
 	/* 10. Make every node know the table. */
@@ -758,7 +772,7 @@ kingres_shard_copy_table_rows(Oid relid, List *conns)
 		elog(ERROR, "SPI_connect failed");
 
 	values[0] = ObjectIdGetDatum(relid);
-	run_spi("SELECT pg_catalog.quote_ident(attname::pg_catalog.text) FROM pg_catalog.pg_attribute "
+	kingres_shard_run_spi("SELECT pg_catalog.quote_ident(attname::pg_catalog.text) FROM pg_catalog.pg_attribute "
 			"WHERE attrelid OPERATOR(pg_catalog.=) $1 AND attnum OPERATOR(pg_catalog.>) 0 "
 			"AND NOT attisdropped AND attgenerated OPERATOR(pg_catalog.=) '' ORDER BY attnum",
 			1, argtypes, values);
@@ -779,6 +793,8 @@ kingres_shard_copy_table_rows(Oid relid, List *conns)
 	plan = SPI_prepare(query.data, 0, NULL);
 	if (plan == NULL)
 		elog(ERROR, "could not prepare the copy of table \"%s\"", rel);
+	/* a fresh snapshot: the caller's was taken before the wait for the lock (copy_routed.c) */
+	PushActiveSnapshot(GetTransactionSnapshot());
 	portal = SPI_cursor_open(NULL, plan, NULL, NULL, true);
 
 	rows_per_batch = Max(1, 20000 / ncols);
@@ -832,6 +848,7 @@ kingres_shard_copy_table_rows(Oid relid, List *conns)
 	}
 	kingres_shard_reset_transmission_modes(nest);
 	SPI_cursor_close(portal);
+	PopActiveSnapshot();
 	MemoryContextDelete(batchcxt);
 	SPI_finish();
 }
@@ -862,17 +879,18 @@ kingres_create_reference_table_body(PG_FUNCTION_ARGS)
 	require_current_sql_objects();
 	kingres_shard_lock_catalog();
 	kingres_shard_require_map_group();
+	require_read_committed();
 	LockRelationOid(relid, ExclusiveLock);
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
-	run_spi("SELECT " KINGRES_SHARD_SCHEMA ".internal_require_version('" KINGRES_SHARD_EXT_VERSION "')",
+	kingres_shard_run_spi("SELECT " KINGRES_SHARD_SCHEMA ".internal_require_version('" KINGRES_SHARD_EXT_VERSION "')",
 			0, NULL, NULL);
 	values[0] = ObjectIdGetDatum(relid);
-	run_spi("SELECT " KINGRES_SHARD_SCHEMA ".internal_check_referenceable("
+	kingres_shard_run_spi("SELECT " KINGRES_SHARD_SCHEMA ".internal_check_referenceable("
 			"$1::pg_catalog.oid::pg_catalog.regclass)", 1, argtypes, values);
-	fetch_ddl(relid, NULL, false, &ddl, callercxt);
-	run_spi("INSERT INTO " KINGRES_SHARD_SCHEMA ".dist_table (relid, method) "
+	kingres_shard_fetch_ddl(relid, NULL, false, &ddl, callercxt);
+	kingres_shard_run_spi("INSERT INTO " KINGRES_SHARD_SCHEMA ".dist_table (relid, method) "
 			"VALUES ($1::pg_catalog.oid::pg_catalog.regclass, 'reference')",
 			1, argtypes, values);
 	/* Plans of statements on the table (prepared, in functions) were made for an ordinary table (S3-02). */
@@ -885,14 +903,14 @@ kingres_create_reference_table_body(PG_FUNCTION_ARGS)
 	appendStringInfoString(&script, ddl.remote_pre.data);
 	appendStringInfoString(&script, ddl.both.data);
 
-	targets = remote_primaries(callercxt);
+	targets = kingres_shard_remote_primaries(callercxt);
 	foreach(lc, targets)
 	{
 		KsNode	   *n = (KsNode *) lfirst(lc);
 		KsConn	   *kc = kingres_shard_get_conn(n->host, n->port, false, NULL);
 
 		kingres_shard_begin_write_xact(kc);
-		exec_on_node(kc, script.data);
+		kingres_shard_exec_on_node(kc, script.data);
 		conns = lappend(conns, kc);
 	}
 	kingres_shard_copy_table_rows(relid, conns);
@@ -911,7 +929,7 @@ kingres_create_reference_table_body(PG_FUNCTION_ARGS)
 	}
 	appendStringInfoString(&script, ddl.post.data);
 	foreach(lc, conns)
-		exec_on_node((KsConn *) lfirst(lc), script.data);
+		kingres_shard_exec_on_node((KsConn *) lfirst(lc), script.data);
 
 	kingres_shard_sync_catalog_internal();
 	PG_RETURN_VOID();

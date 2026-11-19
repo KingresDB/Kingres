@@ -858,3 +858,108 @@ regression test `pg_facts` and the TAP tests; 6, 10 and 12 are not.
 
 What the control plane must follow: the version 0.7, `kingres.table_change_report(kind, relation,
 options)`, the views `kingres.table_operations` and `kingres.partitions`, the new error texts.
+
+### The fixes for the review of 9.1 and 9.2 (2026-11-19)
+
+- **P9A-01 (critical).** The copy cursor used the snapshot of the top statement, taken before the
+  call waited for the lock on the table, so a change committed by a transaction that was open when
+  the call began was not copied. The copy (distributed and reference) now pushes a fresh snapshot
+  after the lock and pops it when the cursor is closed. `REPEATABLE READ` and `SERIALIZABLE` are
+  refused with the reason (`55006`), since a transaction snapshot cannot be renewed. In the online
+  engine the capture trigger is created under `SHARE ROW EXCLUSIVE`, which waits for every writer,
+  and the switch replays under `EXCLUSIVE` with fresh statements. `t/150` races a writer that
+  commits during the wait, for every kind of change, both variants and reference tables.
+- **P9A-02 (high).** The utility hook takes `ROW EXCLUSIVE` on the table of a statement before it
+  reads the catalog (ALTER TABLE, RENAME, SET SCHEMA, CREATE INDEX, TRIGGER, RULE or POLICY, COPY
+  FROM, TRUNCATE, GRANT on tables, DROP TABLE), and resolves the name again after the wait. For a
+  statement that propagates, the lock is given back before the catalog lock is taken (keeping it
+  deadlocked with propagating DDL). **Remaining window:** a statement that touches a plain table and
+  a distributed table together and propagates (a foreign key from the plain table to the
+  distributed one) is not seen by a call on the plain table that starts in that gap.
+- **P9A-03 to P9A-05, P9A-07.** New blocking codes of the report: `rule`, `invalid_index`,
+  `check_not_valid`, `dependent_object` (also a column of another table of the row type),
+  `default_sequence_not_owned`, `function_owner_not_superuser`, `enum_distribution_column`,
+  `collation_missing`, `schema_privilege` (asked only when the owner is not a superuser),
+  `name_in_use` (now also on the other nodes), and `row_level_security` also for
+  `FORCE ROW LEVEL SECURITY` alone; attribute options are a warning (`not_carried`). P9A-05 is
+  resolved by refusing, not by running the copy as the owner as the design proposed.
+- **P9A-06.** The state of a serial sequence is raised to the largest value of the column and kept
+  when it is higher (documented in the README of the extension).
+- **The privileges of the new table** are those of the old one: `internal_reset_acl` takes back every
+  grant that default privileges gave the shadow (the owner's own entry included), then the carried
+  grants are applied. A default ACL is written out explicitly afterwards (the same privileges).
+- 21 one-line mutants of the round, all killed by `t/150`. One test skips where the system has only
+  the C and POSIX locales (a different `lc_monetary` between nodes); one check of the copy is an
+  equivalent mutant (it guards a partition replaced between the probe and the insert, which nothing
+  can do to a private shadow).
+
+### Increment 9.3, the rebuild engine (2026-11-19)
+
+`create_distributed_table_concurrently()` and its reference variant: a shadow is built and loaded
+while writers go on, a capture trigger logs the keys they change, the log is replayed in chunks, and
+the switch replays the rest and swaps the tables under a short lock. Where it differs from the
+sections above:
+
+- **Names.** The shadow parent is `kingres_shadow_<oid of the source>` (found again after a crash
+  without a lookup; recorded in `table_operation_item.shadow_name`). The design's per-operation names
+  are needed only for a rebuild of a table that is already distributed (9.4). The log table is
+  `kingres.tlog_<op>_1(seq, op, k1 .. kn)` with the key columns in key order, because source
+  columns may be called `seq` or `op`. The key is the primary key or the first unique index over
+  `NOT NULL` columns without predicate or expression; it always contains the distribution column,
+  so an `UPDATE` that changes the key logs the old key as a delete and the new one as an update.
+- **The replay deletes in the transaction of its chunk**, on other nodes in the remote branch of
+  that chunk's two-phase transaction, not in a session of its own (which could not see an earlier
+  chunk's uncommitted insert of the same key). **The final replay runs in the transaction of the
+  swap**, so the statement that sees the log empty is in the transaction that renames.
+- **The verification after the switch is not exact while writers write.** The digest of a node
+  also counts the rows newer than that node's swap transaction; if the digests differ and newer rows
+  exist the result is `skipped` with the reason, otherwise `failed`. **A workload of deletes only in
+  that window can give a false `failed`**; the old copy is then kept and nothing is lost. An exact
+  check would need a digest under the lock, which the targets for blocked time rule out.
+- **`done` does not wait for the old copy to be dropped.** The claim of the colocation group is
+  released after the verification and the validation of the foreign keys; the old copy moves to the
+  schema `kingres`, renamed per object, unreadable to all but its owner and without foreign keys,
+  and `cleanup_table_operations()` (called by the recovery worker) drops it after
+  `kingres_shard.table_cleanup_delay`. `check_cluster()` reports `old_table` when it is an hour
+  overdue.
+- **The reference variant keeps a shadow on every node**, the map group primary included.
+- **The shadow gets all its indexes when it is made**, not the non-unique ones after the copy; a
+  faster load is left for later.
+- **`resume_table_operations()` undoes** an operation whose session is gone, that did not switch and
+  that has not been written for twice the node timeout, and finishes one that switched. Continuing
+  an operation is `kingres.table_operation_advance()` called by another session (the control plane);
+  the recovery worker does not run a copy inside its pass. An unreachable node during an undo keeps
+  its leftovers, listed in `spec -> 'cleanup_pending'` and cleaned when it answers; an empty
+  colocation group may stay and is taken by the next table of its kind.
+- **`kingres_shard.rebuild_batch_bytes` is not built**; a chunk is bounded by rows and the batch
+  sender bounds what goes to a node.
+- **The wrapper functions undo what fails** before they re-raise; the wrapper is one statement and
+  holds its snapshot for the whole operation, the control plane's phase calls do not.
+- **The caller's transaction must not hold locks on the source**: statements that read the source
+  run in a session of their own, or the swap waits for ever. A later increment that adds a read of
+  the source to the caller must do the same.
+- **The switch attempt locks the row of the operation** for its length, so a cancel and a switch are
+  serialized and a cancel never arrives in the middle of a swap.
+- **`check_cluster()` is now a wrapper** over the old function (renamed
+  `internal_check_cluster_base`, same privileges) and a part for operations: rows
+  `table_operation_stalled`, `shadow_table`, `log_table`, `capture_trigger`, `old_table`,
+  `table_verification_failed`.
+- **DDL on the source of an operation is refused** with the id of the operation (the sessions of the
+  operation are exempt); the guard reads the catalog as the bootstrap superuser and only for the
+  statements it guards. A claimed group is skipped when `create_distributed_table` looks for a group
+  of the same type, collation and bucket count.
+- **Fault points** added for the swap (`rebuild_switch_before_swap`, `_after_local_swap`,
+  `_after_remote_swap`, and the commit points scoped with `@tswitch`); those of partitions come with
+  9.5.
+- **Identity and owned sequences** keep their options on every node and their state at the origin;
+  a value drawn by an explicit `nextval()` in the milliseconds between the read of the state and the
+  rename would be given twice.
+- **A defect of 9.2 found by the tests:** `kingres_shard_load_placement()` read its bucket array
+  after it was freed (reachable only by a superuser calling an internal function); fixed.
+- 22 one-line mutants of the proof of completeness and of the switch, all killed (`t/144` to
+  `t/149`).
+
+What 9.4 will find: the table DDL function knows only "a plain table becomes hash-partitioned"; a
+distributed source needs a copy over each node's partitions, a log per node, the per-operation
+shadow names, a placement kept in `spec`, a retirement that moves partitions, locks on every node
+and bucket partition at the switch, and claims of several groups for an alter of colocated tables.

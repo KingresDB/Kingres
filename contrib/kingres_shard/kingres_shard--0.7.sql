@@ -5660,6 +5660,37 @@ BEGIN
 END;
 $$;
 
+-- The ACL of a new table is the one of the old table and nothing else: the default privileges of the schema
+-- (ALTER DEFAULT PRIVILEGES) gave the new table grants that the old one never had.  Every grant is taken back and
+-- the owner gets all of them again only when the old table had the default ACL (NULL); otherwise the carried grants, the owner's own among them, follow.
+CREATE FUNCTION kingres.internal_reset_acl(p_table regclass, p_default bool)
+    RETURNS void
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    r pg_catalog.record;
+    v_owner pg_catalog.text;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    SELECT ro.rolname INTO v_owner FROM pg_catalog.pg_class c JOIN pg_catalog.pg_roles ro ON ro.oid OPERATOR(pg_catalog.=) c.relowner
+     WHERE c.oid OPERATOR(pg_catalog.=) p_table::pg_catalog.oid;
+    -- the owner first: on a table with the default ACL (NULL) this makes the entry of the owner explicit and takes it away
+    EXECUTE pg_catalog.format('REVOKE ALL ON TABLE %s FROM %I', p_table, v_owner);
+    FOR r IN SELECT DISTINCT e.grantee FROM pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) e
+              WHERE c.oid OPERATOR(pg_catalog.=) p_table::pg_catalog.oid
+                AND e.grantee OPERATOR(pg_catalog.<>) c.relowner
+    LOOP
+        EXECUTE pg_catalog.format('REVOKE ALL ON TABLE %s FROM %s', p_table,
+                    CASE WHEN r.grantee OPERATOR(pg_catalog.=) 0 THEN 'PUBLIC'
+                         ELSE pg_catalog.quote_ident((SELECT ro.rolname FROM pg_catalog.pg_roles ro WHERE ro.oid OPERATOR(pg_catalog.=) r.grantee)) END);
+    END LOOP;
+    IF p_default THEN
+        EXECUTE pg_catalog.format('GRANT ALL ON TABLE %s TO %I', p_table, v_owner);
+    END IF;
+END;
+$$;
+
 -- ---------------------------------------------------------------------------
 -- The statements that recreate a table
 -- ---------------------------------------------------------------------------
@@ -5949,12 +5980,12 @@ BEGIN
     END LOOP;
 
     IF p_shadow OR p_column IS NULL THEN
+        n := n + 1; ord := n; scope := 'post';
+        stmt := format('SELECT kingres.internal_reset_acl(%L::pg_catalog.regclass, %L::pg_catalog.bool)', qname, c.relacl IS NULL);
+        RETURN NEXT;
         -- table privileges: the owner's own entries first, so that the entries other
         -- grantors made find their grant option
         IF c.relacl IS NOT NULL THEN
-            n := n + 1; ord := n; scope := 'post';
-            stmt := format('REVOKE ALL ON TABLE %s FROM PUBLIC, %I', qname, owner);
-            RETURN NEXT;
             FOR q IN
                 SELECT x.grantor, x.grantee, x.is_grantable,
                        string_agg(x.privilege_type, ', ' ORDER BY x.privilege_type) AS privs
@@ -6169,7 +6200,8 @@ BEGIN
                        'blocker', 'storage_parameters', qname,
                        pfx OPERATOR(pg_catalog.||) 'storage parameters are not supported yet'));
         END IF;
-        IF c.relrowsecurity OR EXISTS (SELECT 1 FROM pg_catalog.pg_policy p WHERE p.polrelid OPERATOR(pg_catalog.=) relation::pg_catalog.oid) THEN
+        IF c.relrowsecurity OR c.relforcerowsecurity
+           OR EXISTS (SELECT 1 FROM pg_catalog.pg_policy p WHERE p.polrelid OPERATOR(pg_catalog.=) relation::pg_catalog.oid) THEN
             rep := rep OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_array(
                        'blocker', 'row_level_security', qname,
                        pfx OPERATOR(pg_catalog.||) 'row-level security is not supported yet'));
@@ -6445,6 +6477,93 @@ BEGIN
             END IF;
         END IF;
 
+        -- rules on the table are neither carried nor safe to drop silently (an audit rule, an INSTEAD NOTHING rule)
+        FOR r IN SELECT rw.rulename FROM pg_catalog.pg_rewrite rw
+                  WHERE rw.ev_class OPERATOR(pg_catalog.=) relation::pg_catalog.oid AND rw.rulename OPERATOR(pg_catalog.<>) '_RETURN'
+                  ORDER BY rw.rulename
+        LOOP
+            rep := rep OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_array(
+                       'blocker', 'rule', r.rulename,
+                       pfx OPERATOR(pg_catalog.||) pg_catalog.format('rule "%s" is not carried to the new table and would be dropped; drop it or turn it into a trigger-free statement of the application', r.rulename)));
+        END LOOP;
+        -- an index that is not valid cannot be carried as it is: it would be built and made valid
+        FOR r IN SELECT ic.relname FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class ic ON ic.oid OPERATOR(pg_catalog.=) i.indexrelid
+                  WHERE i.indrelid OPERATOR(pg_catalog.=) relation::pg_catalog.oid AND (NOT i.indisvalid OR NOT i.indisready)
+                  ORDER BY ic.relname
+        LOOP
+            rep := rep OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_array(
+                       'blocker', 'invalid_index', r.relname,
+                       pfx OPERATOR(pg_catalog.||) pg_catalog.format('index "%s" is not valid; drop it or rebuild it first', r.relname)));
+        END LOOP;
+        -- a CHECK that is not valid: the rows that violate it would stop the copy
+        FOR r IN SELECT k.conname FROM pg_catalog.pg_constraint k
+                  WHERE k.conrelid OPERATOR(pg_catalog.=) relation::pg_catalog.oid AND k.contype OPERATOR(pg_catalog.=) 'c' AND NOT k.convalidated
+                  ORDER BY k.conname
+        LOOP
+            rep := rep OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_array(
+                       'blocker', 'check_not_valid', r.conname,
+                       pfx OPERATOR(pg_catalog.||) pg_catalog.format('check constraint "%s" is not validated; validate it or drop it first', r.conname)));
+        END LOOP;
+        -- the row type of the table is a column of another table
+        FOR r IN SELECT DISTINCT a.attrelid::pg_catalog.regclass::pg_catalog.text AS name, a.attname
+                   FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class cl ON cl.oid OPERATOR(pg_catalog.=) a.attrelid
+                  WHERE a.attrelid OPERATOR(pg_catalog.<>) relation::pg_catalog.oid AND NOT a.attisdropped AND a.attnum OPERATOR(pg_catalog.>) 0
+                    AND cl.relkind IN ('r', 'p', 'm', 'c')
+                    AND a.atttypid IN (c.reltype, (SELECT t.typarray FROM pg_catalog.pg_type t WHERE t.oid OPERATOR(pg_catalog.=) c.reltype))
+                  ORDER BY 1, 2
+        LOOP
+            rep := rep OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_array(
+                       'blocker', 'dependent_object', r.name,
+                       pfx OPERATOR(pg_catalog.||) pg_catalog.format('column "%s" of %s has the row type of the table', r.attname, r.name)));
+        END LOOP;
+        -- a default that calls nextval() of a sequence that no column of the table owns
+        FOR r IN SELECT DISTINCT s.oid::pg_catalog.regclass::pg_catalog.text AS name
+                   FROM pg_catalog.pg_attrdef ad
+                   JOIN pg_catalog.pg_depend d ON d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_attrdef'::pg_catalog.regclass AND d.objid OPERATOR(pg_catalog.=) ad.oid
+                                              AND d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass
+                   JOIN pg_catalog.pg_class s ON s.oid OPERATOR(pg_catalog.=) d.refobjid AND s.relkind OPERATOR(pg_catalog.=) 'S'
+                  WHERE ad.adrelid OPERATOR(pg_catalog.=) relation::pg_catalog.oid
+                    AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend o
+                                     WHERE o.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass AND o.objid OPERATOR(pg_catalog.=) s.oid
+                                       AND o.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass
+                                       AND o.refobjid OPERATOR(pg_catalog.=) relation::pg_catalog.oid AND o.deptype IN ('a', 'i'))
+                  ORDER BY 1
+        LOOP
+            rep := rep OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_array(
+                       'blocker', 'default_sequence_not_owned', r.name,
+                       pfx OPERATOR(pg_catalog.||) pg_catalog.format('a column default calls nextval() of sequence %s, which no column of the table owns; the other nodes do not have it', r.name)));
+        END LOOP;
+        -- a distribution column whose hash is not the same on every node: an enum value hashes by its OID
+        IF kind OPERATOR(pg_catalog.=) 'distribute' AND v_col IS NOT NULL
+           AND EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_type t ON t.oid OPERATOR(pg_catalog.=) a.atttypid
+                        WHERE a.attrelid OPERATOR(pg_catalog.=) relation::pg_catalog.oid AND a.attname OPERATOR(pg_catalog.=) v_col AND NOT a.attisdropped
+                          AND (t.typtype OPERATOR(pg_catalog.=) 'e' OR (t.typtype OPERATOR(pg_catalog.=) 'd' AND EXISTS (SELECT 1 FROM pg_catalog.pg_type bt WHERE bt.oid OPERATOR(pg_catalog.=) t.typbasetype AND bt.typtype OPERATOR(pg_catalog.=) 'e'))
+                               OR t.typcategory OPERATOR(pg_catalog.=) 'A' AND EXISTS (SELECT 1 FROM pg_catalog.pg_type et WHERE et.oid OPERATOR(pg_catalog.=) t.typelem AND et.typtype OPERATOR(pg_catalog.=) 'e'))) THEN
+            rep := rep OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_array(
+                       'blocker', 'enum_distribution_column', v_col::pg_catalog.text,
+                       pfx OPERATOR(pg_catalog.||) pg_catalog.format('column "%s" is an enum: the hash of an enum value depends on the OID of the value, which differs between the nodes', v_col)));
+        END IF;
+        -- the functions that the copy runs (CHECK, defaults, generated columns, index expressions) must belong to a superuser:
+        -- the call runs them as the caller on every node
+        FOR r IN SELECT DISTINCT pr.oid::pg_catalog.regprocedure::pg_catalog.text AS name,
+                        (SELECT ro.rolname FROM pg_catalog.pg_roles ro WHERE ro.oid OPERATOR(pg_catalog.=) pr.proowner) AS owner
+                   FROM pg_catalog.pg_depend d
+                   JOIN pg_catalog.pg_proc pr ON pr.oid OPERATOR(pg_catalog.=) d.refobjid
+                  WHERE d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_proc'::pg_catalog.regclass
+                    AND pr.oid OPERATOR(pg_catalog.>=) 16384
+                    AND NOT (SELECT ro.rolsuper FROM pg_catalog.pg_roles ro WHERE ro.oid OPERATOR(pg_catalog.=) pr.proowner)
+                    AND ((d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_attrdef'::pg_catalog.regclass
+                          AND d.objid IN (SELECT ad.oid FROM pg_catalog.pg_attrdef ad WHERE ad.adrelid OPERATOR(pg_catalog.=) relation::pg_catalog.oid))
+                         OR (d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_constraint'::pg_catalog.regclass
+                             AND d.objid IN (SELECT k.oid FROM pg_catalog.pg_constraint k WHERE k.conrelid OPERATOR(pg_catalog.=) relation::pg_catalog.oid))
+                         OR (d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass
+                             AND d.objid IN (SELECT i.indexrelid FROM pg_catalog.pg_index i WHERE i.indrelid OPERATOR(pg_catalog.=) relation::pg_catalog.oid)))
+                  ORDER BY 1
+        LOOP
+            rep := rep OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_array(
+                       'blocker', 'function_owner_not_superuser', r.name,
+                       pfx OPERATOR(pg_catalog.||) pg_catalog.format('function %s, used by a constraint, default or index of the table, belongs to the role "%s", who is not a superuser; the copy would run it with the rights of the caller on every node', r.name, r.owner)));
+        END LOOP;
         -- what the other nodes must have: the roles of the table and the functions of its defaults
         SELECT pg_catalog.array_agg(DISTINCT s.ro) INTO names FROM (
             SELECT (SELECT r2.rolname FROM pg_catalog.pg_roles r2 WHERE r2.oid OPERATOR(pg_catalog.=) c.relowner) AS ro
@@ -6497,7 +6616,52 @@ BEGIN
                                    pfx OPERATOR(pg_catalog.||) pg_catalog.format('function(s) %s used by column defaults do not exist on node %s; functions are not synchronized between the nodes', probe, nd.node_id)));
                     END IF;
                 END IF;
-            EXCEPTION WHEN OTHERS THEN
+                -- the collations of the columns that do not belong to pg_catalog
+                SELECT pg_catalog.string_agg(DISTINCT pg_catalog.format('%I.%I', cn.nspname, co.collname), ',') INTO x
+                  FROM pg_catalog.pg_attribute a
+                  JOIN pg_catalog.pg_collation co ON co.oid OPERATOR(pg_catalog.=) a.attcollation
+                  JOIN pg_catalog.pg_namespace cn ON cn.oid OPERATOR(pg_catalog.=) co.collnamespace
+                 WHERE a.attrelid OPERATOR(pg_catalog.=) relation::pg_catalog.oid AND NOT a.attisdropped AND a.attnum OPERATOR(pg_catalog.>) 0
+                   AND cn.nspname OPERATOR(pg_catalog.<>) 'pg_catalog';
+                IF x IS NOT NULL THEN
+                    probe := kingres.internal_exec_scalar(nd.node_id,
+                        pg_catalog.format('SELECT pg_catalog.string_agg(q, '','' ORDER BY q) FROM pg_catalog.unnest(pg_catalog.string_to_array(%L, '','')) q WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_collation co JOIN pg_catalog.pg_namespace cn ON cn.oid OPERATOR(pg_catalog.=) co.collnamespace WHERE pg_catalog.format(''%%I.%%I'', cn.nspname, co.collname) OPERATOR(pg_catalog.=) q)', x),
+                        (SELECT s.setting::pg_catalog.int4 OPERATOR(pg_catalog.*) 2000 FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) 'kingres_shard.node_timeout'));
+                    IF probe IS NOT NULL THEN
+                        rep := rep OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_array(
+                                   'blocker', 'collation_missing', probe,
+                                   pfx OPERATOR(pg_catalog.||) pg_catalog.format('collation(s) %s do not exist on node %s; collations are not synchronized between the nodes', probe, nd.node_id)));
+                    END IF;
+                END IF;
+                -- an owner who is not a superuser needs CREATE on the schema on every node (the new table is handed to him there)
+                IF NOT (SELECT ro.rolsuper FROM pg_catalog.pg_roles ro WHERE ro.oid OPERATOR(pg_catalog.=) c.relowner)
+                   AND pg_catalog.has_schema_privilege(c.relowner, c.relnamespace, 'CREATE') THEN
+                    probe := kingres.internal_exec_scalar(nd.node_id,
+                        pg_catalog.format('SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) %L) AND EXISTS (SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname OPERATOR(pg_catalog.=) %L) THEN pg_catalog.has_schema_privilege(%L, %L, ''CREATE'')::pg_catalog.text ELSE ''f'' END',
+                                          (SELECT ro.rolname FROM pg_catalog.pg_roles ro WHERE ro.oid OPERATOR(pg_catalog.=) c.relowner), nsp,
+                                          (SELECT ro.rolname FROM pg_catalog.pg_roles ro WHERE ro.oid OPERATOR(pg_catalog.=) c.relowner), nsp),
+                        (SELECT s.setting::pg_catalog.int4 OPERATOR(pg_catalog.*) 2000 FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) 'kingres_shard.node_timeout'));
+                    IF probe OPERATOR(pg_catalog.=) 'false' OR probe OPERATOR(pg_catalog.=) 'f' THEN
+                        rep := rep OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_array(
+                                   'blocker', 'schema_privilege', nsp,
+                                   pfx OPERATOR(pg_catalog.||) pg_catalog.format('the owner of the table does not have CREATE on schema "%s" on node %s (schemas and their privileges are not synchronized between the nodes)', nsp, nd.node_id)));
+                    END IF;
+                END IF;
+                -- the names of the new objects must be free on the node
+                IF kind OPERATOR(pg_catalog.=) 'distribute' THEN
+                    probe := kingres.internal_exec_scalar(nd.node_id,
+                        pg_catalog.format('SELECT pg_catalog.string_agg(cl.relname, '','' ORDER BY cl.relname) FROM pg_catalog.pg_class cl JOIN pg_catalog.pg_namespace ns ON ns.oid OPERATOR(pg_catalog.=) cl.relnamespace WHERE ns.nspname OPERATOR(pg_catalog.=) %L AND (cl.relname OPERATOR(pg_catalog.=) %L OR cl.relname LIKE %L OR (pg_catalog.length(cl.relname) OPERATOR(pg_catalog.=) %s AND pg_catalog.left(cl.relname, %s) OPERATOR(pg_catalog.=) %L AND pg_catalog.right(cl.relname, 4) OPERATOR(pg_catalog.~) ''^[0-9]{4}$''))',
+                                          nsp, pg_catalog.format('kingres_shadow_%s', relation::pg_catalog.oid),
+                                          pg_catalog.format('kingres\_shadow\_%s\_%%', relation::pg_catalog.oid),
+                                          pg_catalog.length(rname) OPERATOR(pg_catalog.+) 6, pg_catalog.length(rname) OPERATOR(pg_catalog.+) 2, rname OPERATOR(pg_catalog.||) '_b'),
+                        (SELECT s.setting::pg_catalog.int4 OPERATOR(pg_catalog.*) 2000 FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) 'kingres_shard.node_timeout'));
+                    IF probe IS NOT NULL THEN
+                        rep := rep OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_array(
+                                   'blocker', 'name_in_use', probe,
+                                   pfx OPERATOR(pg_catalog.||) pg_catalog.format('relation(s) %s exist on node %s; their names are needed for the new table', probe, nd.node_id)));
+                    END IF;
+                END IF;
+            EXCEPTION WHEN OTHERS OR query_canceled THEN
                 rep := rep OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_array(
                            'blocker', 'node_unreachable', nd.node_id::pg_catalog.text,
                            pg_catalog.format('node %s (%s:%s) could not be asked: %s', nd.node_id, nd.host, nd.port, SQLERRM)));
@@ -6521,6 +6685,14 @@ BEGIN
             rep := rep OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_array(
                        'warning', 'not_carried', r.attname::pg_catalog.text,
                        pg_catalog.format('the storage, compression or statistics target of column "%s" is not carried to the new table', r.attname)));
+        END LOOP;
+        FOR r IN SELECT a.attname FROM pg_catalog.pg_attribute a
+                  WHERE a.attrelid OPERATOR(pg_catalog.=) relation::pg_catalog.oid AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped
+                    AND EXISTS (SELECT 1 FROM pg_catalog.unnest(a.attoptions) o WHERE o NOT LIKE 'pg_attver=%') ORDER BY a.attnum
+        LOOP
+            rep := rep OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_array(
+                       'warning', 'not_carried', r.attname::pg_catalog.text,
+                       pg_catalog.format('the attribute options of column "%s" are not carried to the new table', r.attname)));
         END LOOP;
         IF EXISTS (SELECT 1 FROM pg_catalog.pg_index i WHERE i.indrelid OPERATOR(pg_catalog.=) relation::pg_catalog.oid AND i.indisclustered) THEN
             rep := rep OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_array(
@@ -6758,7 +6930,1684 @@ REVOKE ALL ON FUNCTION
     kingres.internal_has_hash_support(regtype),
     kingres.internal_advance_sequence(regclass, regclass, name, bigint, bool),
     kingres.internal_rename_identity(regclass, name, name),
+    kingres.internal_reset_acl(regclass, bool),
     kingres.internal_table_ddl(regclass, name, bool),
     kingres.internal_check_distributable(regclass, name, regclass, int),
     kingres.internal_copy_routed(regclass, name, name, text, name, int, int)
+    FROM PUBLIC;
+
+-- ---------------------------------------------------------------------------
+-- The rebuild engine of the online table operations (design/shard-phase9.md,
+-- "The rebuild engine"), increment 9.3
+-- ---------------------------------------------------------------------------
+
+-- The mark of a live operation: the session that runs it holds a lock that nothing
+-- else takes; whoever finds it held leaves the operation alone.
+CREATE FUNCTION kingres.internal_op_lock(p_op bigint)
+    RETURNS bool
+    AS 'MODULE_PATHNAME', 'kingres_internal_op_lock'
+    LANGUAGE C STRICT
+    SET search_path = pg_catalog, kingres, pg_temp;
+
+CREATE FUNCTION kingres.internal_op_unlock(p_op bigint)
+    RETURNS void
+    AS 'MODULE_PATHNAME', 'kingres_internal_op_unlock'
+    LANGUAGE C STRICT
+    SET search_path = pg_catalog, kingres, pg_temp;
+
+CREATE FUNCTION kingres.internal_op_alive(p_op bigint)
+    RETURNS bool
+    AS 'MODULE_PATHNAME', 'kingres_internal_op_alive'
+    LANGUAGE C STRICT
+    SET search_path = pg_catalog, kingres, pg_temp;
+
+-- The functions that commit in sessions of their own cannot run in a transaction block.
+CREATE FUNCTION kingres.internal_prevent_xact_block(p_what text)
+    RETURNS void
+    AS 'MODULE_PATHNAME', 'kingres_internal_prevent_xact_block'
+    LANGUAGE C STRICT
+    SET search_path = pg_catalog, kingres, pg_temp;
+
+-- The colocation group of a new table and its bucket count; a new group has its catalog
+-- rows made in the calling transaction.
+CREATE FUNCTION kingres.internal_choose_colocation(p_type regtype, p_collation oid,
+                                                   p_colocate_with regclass DEFAULT NULL,
+                                                   p_buckets int DEFAULT NULL)
+    RETURNS jsonb
+    AS 'MODULE_PATHNAME', 'kingres_internal_choose_colocation'
+    LANGUAGE C
+    SET search_path = pg_catalog, kingres, pg_temp;
+
+-- The statements that create the shadow of a table on the node of a group.
+CREATE FUNCTION kingres.internal_shadow_script(p_relid regclass, p_column name, p_colocation int, p_group int)
+    RETURNS text
+    AS 'MODULE_PATHNAME', 'kingres_internal_shadow_script'
+    LANGUAGE C
+    SET search_path = pg_catalog, kingres, pg_temp;
+
+-- The swap of the switch (see rebuild.c); returns the retained old copy.
+CREATE FUNCTION kingres.internal_swap_table(p_op bigint, p_relid regclass, p_column name,
+                                            p_colocation int, p_cleanup_delay int)
+    RETURNS text
+    AS 'MODULE_PATHNAME', 'kingres_internal_swap_table'
+    LANGUAGE C
+    SET search_path = pg_catalog, kingres, pg_temp;
+
+-- A statement on another node in the remote branch of the current transaction (the replay deletes keys
+-- in the same transaction that writes their rows).
+CREATE FUNCTION kingres.internal_branch_exec(p_node int, p_sql text)
+    RETURNS void
+    AS 'MODULE_PATHNAME', 'kingres_internal_branch_exec'
+    LANGUAGE C STRICT
+    SET search_path = pg_catalog, kingres, pg_temp;
+
+-- One chunk of the copy or of the replay (see copy_routed.c).
+CREATE FUNCTION kingres.internal_copy_chunk(p_source regclass, p_dest_schema name, p_dest_table name,
+                                            p_dest_kind text, p_key_column name, p_colocation int,
+                                            p_node int, p_order_cols text[], p_after text[],
+                                            p_batch bigint, p_where text, p_conflict_nothing bool)
+    RETURNS jsonb
+    AS 'MODULE_PATHNAME', 'kingres_internal_copy_chunk'
+    LANGUAGE C
+    SET search_path = pg_catalog, kingres, pg_temp;
+
+-- ---- capture ----
+
+-- The trigger function of the capture (design, "Capture"): it writes the key of the old and of the
+-- new row of the source into the log table, in the transaction of the writer.  It is SECURITY
+-- DEFINER because the writer has no privilege on the log table; it inserts key columns of the row
+-- that is being changed and nothing else, takes the names of the log and of the columns from the
+-- arguments of the trigger (made by the extension; EXECUTE is revoked from PUBLIC, so no one else
+-- can make a trigger of it) and refuses a log that is not one of the extension's.
+CREATE FUNCTION kingres.internal_capture_trigger()
+    RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_log  pg_catalog.text := TG_ARGV[0];
+    v_cols pg_catalog.text := TG_ARGV[1];
+    v_new  pg_catalog.text := TG_ARGV[2];
+    v_old  pg_catalog.text;
+BEGIN
+    IF v_log !~ '^kingres\.tlog_[0-9]+_[0-9]+$' THEN
+        RAISE EXCEPTION 'the capture trigger of table "%" has no log table of table operations', TG_TABLE_NAME
+            USING ERRCODE = 'internal_error';
+    END IF;
+    IF TG_OP = 'INSERT' THEN
+        EXECUTE pg_catalog.format('INSERT INTO %s (op, %s) SELECT ''I'', %s', v_log, v_cols, v_new)
+            USING pg_catalog.to_jsonb(NEW);
+    ELSIF TG_OP = 'DELETE' THEN
+        EXECUTE pg_catalog.format('INSERT INTO %s (op, %s) SELECT ''D'', %s', v_log, v_cols, v_new)
+            USING pg_catalog.to_jsonb(OLD);
+    ELSE
+        v_old := pg_catalog.replace(v_new, '$1', '$2');
+        EXECUTE pg_catalog.format('INSERT INTO %s (op, %s) SELECT ''U'', %s UNION ALL SELECT ''D'', %s WHERE (%s) IS DISTINCT FROM (%s)',
+                                  v_log, v_cols, v_new, v_old, v_old, v_new)
+            USING pg_catalog.to_jsonb(NEW), pg_catalog.to_jsonb(OLD);
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+-- A replay cannot follow a TRUNCATE (it reads the current row of a key), so it is refused.
+CREATE FUNCTION kingres.internal_capture_truncate()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+BEGIN
+    RAISE EXCEPTION 'table "%" is being rebuilt; TRUNCATE is not allowed until it finishes', TG_TABLE_NAME
+        USING ERRCODE = 'object_not_in_prerequisite_state',
+              HINT = 'Wait for the table operation to finish, or cancel it with kingres.cancel_table_operation().';
+END;
+$$;
+
+-- ---- small helpers ----
+
+-- A setting as a number in its own unit (current_setting() answers with the unit, "10s").
+CREATE FUNCTION kingres.internal_setting(p_name text)
+    RETURNS bigint
+    LANGUAGE sql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+SELECT s.setting::pg_catalog.int8 FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) p_name;
+$$;
+
+-- The sessions that hold a lock on a table, for the text of a refusal.
+CREATE FUNCTION kingres.internal_lock_holders(p_rel regclass)
+    RETURNS text
+    LANGUAGE sql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+SELECT pg_catalog.string_agg(s.h, '; ' ORDER BY s.h)
+  FROM (SELECT pg_catalog.format('pid %s (%s, transaction since %s, %s)', a.pid, a.usename,
+                                 a.xact_start, pg_catalog.left(a.query, 80)) AS h
+          FROM (SELECT DISTINCT l.pid FROM pg_catalog.pg_locks l
+                 WHERE l.relation OPERATOR(pg_catalog.=) p_rel::pg_catalog.oid AND l.granted AND l.pid IS NOT NULL
+                   AND l.pid OPERATOR(pg_catalog.<>) pg_catalog.pg_backend_pid()) x
+          JOIN pg_catalog.pg_stat_activity a ON a.pid OPERATOR(pg_catalog.=) x.pid
+        UNION ALL
+        SELECT pg_catalog.format('prepared transaction "%s" (%s, prepared %s)', p.gid, p.owner, p.prepared)
+          FROM pg_catalog.pg_prepared_xacts p
+         WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_locks l
+                        WHERE l.relation OPERATOR(pg_catalog.=) p_rel::pg_catalog.oid AND l.granted AND l.pid IS NULL
+                          AND l.virtualtransaction IN (SELECT t.virtualtransaction FROM pg_catalog.pg_locks t
+                                                        WHERE t.locktype OPERATOR(pg_catalog.=) 'transactionid'
+                                                          AND t.transactionid OPERATOR(pg_catalog.=) p.transaction))) s;
+$$;
+
+-- A lock on a user table by the rule of the design ("Locks"): try without waiting for a while, then
+-- queue once for at most kingres_shard.rebuild_lock_timeout.  A refusal names the holders.
+CREATE FUNCTION kingres.internal_lock_table(p_rel regclass, p_mode text)
+    RETURNS void
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_end  pg_catalog.timestamptz;
+    v_hold pg_catalog.text;
+BEGIN
+    v_end := pg_catalog.clock_timestamp() OPERATOR(pg_catalog.+)
+             pg_catalog.make_interval(secs => (kingres.internal_setting('kingres_shard.rebuild_switch_timeout')::pg_catalog.int4 OPERATOR(pg_catalog./) 4) OPERATOR(pg_catalog./) 1000.0);
+    LOOP
+        BEGIN
+            EXECUTE pg_catalog.format('LOCK TABLE %s IN %s MODE NOWAIT', p_rel, p_mode);
+            RETURN;
+        EXCEPTION WHEN lock_not_available THEN
+            NULL;
+        END;
+        EXIT WHEN pg_catalog.clock_timestamp() OPERATOR(pg_catalog.>=) v_end;
+        PERFORM pg_catalog.pg_sleep(0.005 OPERATOR(pg_catalog.+) pg_catalog.random() OPERATOR(pg_catalog.*) 0.015);
+    END LOOP;
+    PERFORM pg_catalog.set_config('lock_timeout', pg_catalog.current_setting('kingres_shard.rebuild_lock_timeout'), true);
+    BEGIN
+        EXECUTE pg_catalog.format('LOCK TABLE %s IN %s MODE', p_rel, p_mode);
+    EXCEPTION WHEN lock_not_available THEN
+        v_hold := kingres.internal_lock_holders(p_rel);
+        RAISE EXCEPTION 'could not lock table % in % mode', p_rel, p_mode
+            USING ERRCODE = 'lock_not_available',
+                  DETAIL = pg_catalog.format('Held by: %s', COALESCE(v_hold, 'a session that could not be read')),
+                  HINT = 'The operation tries again; a long transaction on the table delays it.';
+    END;
+END;
+$$;
+
+-- The record of an operation: its phase and what it waits for.  Runs in a session of its own (through
+-- internal_node_exec) so that it is committed at once.  A finished operation does not change, and an
+-- operation that was asked to stop does not enter its switch.
+CREATE FUNCTION kingres.internal_op_set(p_op bigint, p_phase text, p_detail text)
+    RETURNS void
+    LANGUAGE sql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+UPDATE kingres.table_operation o
+   SET phase = p_phase, detail = p_detail, updated_at = pg_catalog.clock_timestamp(),
+       finished_at = CASE WHEN p_phase IN ('done', 'failed', 'cancelled') THEN pg_catalog.clock_timestamp() ELSE o.finished_at END
+ WHERE o.op_id OPERATOR(pg_catalog.=) p_op
+   AND o.phase IN ('preparing', 'shadow', 'copying', 'catching_up', 'switching', 'cleaning')
+   AND NOT (p_phase OPERATOR(pg_catalog.=) 'switching' AND o.cancel_requested);
+$$;
+
+-- What an operation decided or learned, merged into its spec.
+CREATE FUNCTION kingres.internal_op_spec(p_op bigint, p_patch jsonb)
+    RETURNS void
+    LANGUAGE sql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+UPDATE kingres.table_operation o
+   SET spec = o.spec OPERATOR(pg_catalog.||) p_patch, updated_at = pg_catalog.clock_timestamp()
+ WHERE o.op_id OPERATOR(pg_catalog.=) p_op;
+$$;
+
+-- The row identity of the log: the columns of the primary key, or of the first unique index over
+-- NOT NULL columns (no predicate, no expression).
+CREATE FUNCTION kingres.internal_log_key(p_relid regclass)
+    RETURNS TABLE (key_names text[], key_types text[])
+    LANGUAGE sql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+SELECT pg_catalog.array_agg(a.attname::pg_catalog.text ORDER BY k.ord),
+       pg_catalog.array_agg(pg_catalog.format_type(a.atttypid, a.atttypmod) ORDER BY k.ord)
+  FROM (SELECT i.indrelid, i.indkey
+          FROM pg_catalog.pg_index i
+         WHERE i.indrelid OPERATOR(pg_catalog.=) p_relid::pg_catalog.oid AND i.indisunique AND i.indpred IS NULL AND i.indisvalid
+           AND NOT EXISTS (SELECT 1 FROM pg_catalog.unnest(i.indkey::pg_catalog.int2[]) kk(attno)
+                            WHERE kk.attno OPERATOR(pg_catalog.=) 0
+                               OR NOT (SELECT a2.attnotnull FROM pg_catalog.pg_attribute a2
+                                        WHERE a2.attrelid OPERATOR(pg_catalog.=) i.indrelid AND a2.attnum OPERATOR(pg_catalog.=) kk.attno))
+         ORDER BY i.indisprimary DESC, i.indexrelid LIMIT 1) x
+  CROSS JOIN LATERAL pg_catalog.unnest(x.indkey::pg_catalog.int2[]) WITH ORDINALITY k(attno, ord)
+  JOIN pg_catalog.pg_attribute a ON a.attrelid OPERATOR(pg_catalog.=) x.indrelid AND a.attnum OPERATOR(pg_catalog.=) k.attno
+ HAVING pg_catalog.count(*) OPERATOR(pg_catalog.>) 0;
+$$;
+
+-- ---- the record of an operation ----
+
+-- Record an operation (phase preparing) and claim its colocation group, in a session of its own, under
+-- the cluster lock: the checks of the report, the version handshake, the choice of the group (a new
+-- group is made here and announced to the nodes), the log key, and what undoing needs to know.
+-- Idempotent for an operation of the same request_id.
+CREATE FUNCTION kingres.internal_begin_table_operation(p_kind text, p_relid regclass, p_options jsonb)
+    RETURNS bigint
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_opts    pg_catalog.jsonb := COALESCE(p_options, '{}'::pg_catalog.jsonb) OPERATOR(pg_catalog.||) '{"mode": "online"}'::pg_catalog.jsonb;
+    v_req     pg_catalog.text := p_options OPERATOR(pg_catalog.->>) 'request_id';
+    v_col     pg_catalog.name := p_options OPERATOR(pg_catalog.->>) 'column';
+    v_cwith   pg_catalog.regclass := NULLIF(p_options OPERATOR(pg_catalog.->>) 'colocate_with', '')::pg_catalog.oid::pg_catalog.regclass;
+    v_buckets pg_catalog.int4 := (p_options OPERATOR(pg_catalog.->>) 'bucket_count')::pg_catalog.int4;
+    v_id      pg_catalog.int8;
+    v_type    pg_catalog.oid;
+    v_coll    pg_catalog.oid;
+    v_ch      pg_catalog.jsonb;
+    v_group   pg_catalog.int4;
+    v_nb      pg_catalog.int4;
+    v_created pg_catalog.bool := false;
+    v_keys    pg_catalog.text[];
+    v_ktypes  pg_catalog.text[];
+    v_seqs    pg_catalog.text[];
+    v_nsp     pg_catalog.text;
+    v_rname   pg_catalog.text;
+    v_other   pg_catalog.int8;
+    v_ver     pg_catalog.text;
+    v_total   pg_catalog.float8;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    PERFORM kingres.internal_require_map_group();
+    IF p_kind NOT IN ('distribute', 'distribute_reference') THEN
+        RAISE EXCEPTION 'table operation "%" is not available in this version', p_kind
+            USING ERRCODE = 'feature_not_supported';
+    END IF;
+    IF v_req IS NOT NULL THEN
+        SELECT o.op_id INTO v_id FROM kingres.table_operation o
+         WHERE o.spec OPERATOR(pg_catalog.->>) 'request_id' OPERATOR(pg_catalog.=) v_req
+           AND o.phase NOT IN ('failed', 'cancelled');
+        IF FOUND THEN
+            RETURN v_id;
+        END IF;
+    END IF;
+
+    LOCK TABLE kingres.map_version IN EXCLUSIVE MODE;
+    SELECT i.op_id INTO v_other FROM kingres.table_operation_item i
+      JOIN kingres.table_operation o ON o.op_id OPERATOR(pg_catalog.=) i.op_id
+     WHERE i.relid OPERATOR(pg_catalog.=) p_relid AND o.phase IN ('preparing', 'shadow', 'copying', 'catching_up', 'switching');
+    IF FOUND THEN
+        RAISE EXCEPTION 'table "%" is already being rebuilt by table operation %', p_relid, v_other
+            USING ERRCODE = 'object_in_use', HINT = 'See kingres.table_operations.';
+    END IF;
+    SELECT e.extversion INTO v_ver FROM pg_catalog.pg_extension e WHERE e.extname OPERATOR(pg_catalog.=) 'kingres_shard';
+    PERFORM kingres.internal_require_version(v_ver);
+    PERFORM kingres.internal_raise_blockers(p_kind, p_relid, v_opts);
+
+    SELECT n.nspname, c.relname INTO v_nsp, v_rname
+      FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
+     WHERE c.oid OPERATOR(pg_catalog.=) p_relid::pg_catalog.oid;
+    SELECT k.key_names, k.key_types INTO v_keys, v_ktypes FROM kingres.internal_log_key(p_relid) k;
+    IF v_keys IS NULL THEN
+        RAISE EXCEPTION 'table "%" has no primary key or unique index over NOT NULL columns', p_relid
+            USING ERRCODE = 'feature_not_supported',
+                  HINT = 'Use the blocking variant, kingres.create_distributed_table().';
+    END IF;
+    SELECT pg_catalog.array_agg(pg_catalog.format('%I.%I', sn.nspname, s.relname) ORDER BY a.attnum) INTO v_seqs
+      FROM pg_catalog.pg_depend d
+      JOIN pg_catalog.pg_class s ON s.oid OPERATOR(pg_catalog.=) d.objid AND s.relkind OPERATOR(pg_catalog.=) 'S'
+      JOIN pg_catalog.pg_namespace sn ON sn.oid OPERATOR(pg_catalog.=) s.relnamespace
+      JOIN pg_catalog.pg_attribute a ON a.attrelid OPERATOR(pg_catalog.=) d.refobjid AND a.attnum OPERATOR(pg_catalog.=) d.refobjsubid
+     WHERE d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass
+       AND d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass
+       AND d.refobjid OPERATOR(pg_catalog.=) p_relid::pg_catalog.oid AND d.deptype OPERATOR(pg_catalog.=) 'a';
+
+    IF p_kind OPERATOR(pg_catalog.=) 'distribute' THEN
+        SELECT a.atttypid, a.attcollation INTO v_type, v_coll FROM pg_catalog.pg_attribute a
+         WHERE a.attrelid OPERATOR(pg_catalog.=) p_relid::pg_catalog.oid AND a.attname OPERATOR(pg_catalog.=) v_col
+           AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped;
+        IF NOT (v_col::pg_catalog.text OPERATOR(pg_catalog.=) ANY (v_keys)) THEN
+            RAISE EXCEPTION 'the distribution column "%" is not part of the key of table "%"', v_col, p_relid
+                USING ERRCODE = 'invalid_table_definition';
+        END IF;
+        v_ch := kingres.internal_choose_colocation(v_type::pg_catalog.regtype, v_coll, v_cwith, v_buckets);
+        v_group := (v_ch OPERATOR(pg_catalog.->>) 'colocation_id')::pg_catalog.int4;
+        v_nb := (v_ch OPERATOR(pg_catalog.->>) 'bucket_count')::pg_catalog.int4;
+        v_created := (v_ch OPERATOR(pg_catalog.->>) 'created')::pg_catalog.bool;
+
+        -- the group must be free of other operations and of moves
+        SELECT l.op_id INTO v_other FROM kingres.table_operation_lock l WHERE l.colocation_id OPERATOR(pg_catalog.=) v_group;
+        IF FOUND THEN
+            RAISE EXCEPTION 'colocation group % is busy: table operation % uses it', v_group, v_other
+                USING ERRCODE = 'object_in_use';
+        END IF;
+        IF EXISTS (SELECT 1 FROM kingres.bucket_move m
+                    WHERE m.colocation_id OPERATOR(pg_catalog.=) v_group
+                      AND m.phase IN ('preparing', 'copying', 'catching_up', 'switching'))
+           OR EXISTS (SELECT 1 FROM kingres.bucket_map b
+                       WHERE b.colocation_id OPERATOR(pg_catalog.=) v_group AND b.state OPERATOR(pg_catalog.<>) 'active') THEN
+            RAISE EXCEPTION 'colocation group % is busy: a bucket of it is being moved', v_group
+                USING ERRCODE = 'object_in_use';
+        END IF;
+    END IF;
+
+    v_total := (SELECT c.reltuples FROM pg_catalog.pg_class c WHERE c.oid OPERATOR(pg_catalog.=) p_relid::pg_catalog.oid);
+    INSERT INTO kingres.table_operation (kind, mode, phase, spec, colocation_id, started_at, updated_at)
+    VALUES (p_kind, 'online', 'preparing',
+            pg_catalog.jsonb_build_object(
+                'relid', p_relid::pg_catalog.oid, 'schema', v_nsp, 'table', v_rname,
+                'shadow', pg_catalog.format('kingres_shadow_%s', p_relid::pg_catalog.oid),
+                'column', v_col, 'colocation_id', v_group, 'bucket_count', v_nb, 'new_group', v_created,
+                'dest_kind', CASE WHEN p_kind OPERATOR(pg_catalog.=) 'distribute' THEN 'placement' ELSE 'every_node' END,
+                'keys', pg_catalog.to_jsonb(v_keys), 'key_types', pg_catalog.to_jsonb(v_ktypes),
+                'sequences', pg_catalog.to_jsonb(COALESCE(v_seqs, ARRAY[]::pg_catalog.text[])),
+                'request_id', v_req, 'last', NULL::pg_catalog.jsonb, 'validate', '[]'::pg_catalog.jsonb),
+            v_group, pg_catalog.clock_timestamp(), pg_catalog.clock_timestamp())
+    RETURNING op_id INTO v_id;
+    UPDATE kingres.table_operation o
+       SET spec = o.spec OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_object('log', pg_catalog.format('kingres.tlog_%s_1', v_id))
+     WHERE o.op_id OPERATOR(pg_catalog.=) v_id;
+    INSERT INTO kingres.table_operation_item (op_id, ordinal, relid, shadow_name, rows_total)
+    VALUES (v_id, 1, p_relid, pg_catalog.format('kingres_shadow_%s', p_relid::pg_catalog.oid), v_total::pg_catalog.int8);
+    IF v_group IS NOT NULL THEN
+        INSERT INTO kingres.table_operation_lock (colocation_id, op_id) VALUES (v_group, v_id);
+    END IF;
+    IF v_created THEN
+        -- the group is announced to every node (it holds no table yet)
+        PERFORM kingres.sync_catalog();
+    END IF;
+    RETURN v_id;
+END;
+$$;
+
+-- Start an online table operation: the checks of the report, the claim of the colocation group and the
+-- record, committed at once.  The phases are run by table_operation_advance().
+CREATE FUNCTION kingres.begin_table_operation(kind text, relation regclass, options jsonb DEFAULT '{}'::jsonb)
+    RETURNS bigint
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_kind  pg_catalog.text := kind;
+    v_opts  pg_catalog.jsonb := COALESCE(options, '{}'::pg_catalog.jsonb);
+    v_self  pg_catalog.int4;
+    v_ms    pg_catalog.int4;
+BEGIN
+    PERFORM kingres.internal_prevent_xact_block('kingres.begin_table_operation()');
+    PERFORM kingres.internal_require_superuser();
+    PERFORM kingres.internal_require_map_group();
+    IF v_kind NOT IN ('distribute', 'distribute_reference') THEN
+        RAISE EXCEPTION 'table operation "%" is not available in this version', v_kind
+            USING ERRCODE = 'feature_not_supported',
+                  HINT = 'This version has distribute and distribute_reference.';
+    END IF;
+    -- the blockers of the report are refused here, in the session of the caller: nothing is recorded
+    PERFORM kingres.internal_raise_blockers(v_kind, relation, v_opts OPERATOR(pg_catalog.||) '{"mode": "online"}'::pg_catalog.jsonb);
+    SELECT l.node_id INTO v_self FROM kingres.local_node l;
+    v_ms := (SELECT s.setting::pg_catalog.int4 FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) 'kingres_shard.node_timeout') * 4000;
+    RETURN kingres.internal_exec_scalar(v_self,
+        pg_catalog.format('SELECT kingres.internal_begin_table_operation(%L, %L::pg_catalog.oid::pg_catalog.regclass, %L::pg_catalog.jsonb)',
+                          v_kind, relation::pg_catalog.oid, v_opts::pg_catalog.text), v_ms)::pg_catalog.int8;
+END;
+$$;
+
+-- ---- capture, copy and replay (each runs in a session of its own and commits at once) ----
+
+-- The log table and the triggers on the source, under a lock that excludes writers while they
+-- are made.  Every step checks what exists.
+CREATE FUNCTION kingres.internal_op_capture(p_op bigint)
+    RETURNS void
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_spec  pg_catalog.jsonb;
+    v_rel   pg_catalog.regclass;
+    v_log   pg_catalog.text;
+    v_keys  pg_catalog.text[];
+    v_types pg_catalog.text[];
+    v_cols  pg_catalog.text;
+    v_exprs pg_catalog.text;
+    v_defs  pg_catalog.text;
+    v_trg   pg_catalog.text := pg_catalog.format('kingres_capture_%s', p_op);
+    v_ntr   pg_catalog.text := pg_catalog.format('kingres_notrunc_%s', p_op);
+    i       pg_catalog.int4;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    SELECT o.spec INTO v_spec FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) p_op;
+    v_rel := (v_spec OPERATOR(pg_catalog.->>) 'relid')::pg_catalog.oid::pg_catalog.regclass;
+    v_log := v_spec OPERATOR(pg_catalog.->>) 'log';
+    SELECT pg_catalog.array_agg(x) INTO v_keys FROM pg_catalog.jsonb_array_elements_text(v_spec OPERATOR(pg_catalog.->) 'keys') x;
+    SELECT pg_catalog.array_agg(x) INTO v_types FROM pg_catalog.jsonb_array_elements_text(v_spec OPERATOR(pg_catalog.->) 'key_types') x;
+    PERFORM kingres.internal_lock_table(v_rel, 'SHARE ROW EXCLUSIVE');
+    IF pg_catalog.to_regclass(v_log) IS NULL THEN
+        v_defs := '';
+        FOR i IN 1 .. pg_catalog.cardinality(v_keys) LOOP
+            v_defs := v_defs OPERATOR(pg_catalog.||) pg_catalog.format(', k%s %s NOT NULL', i, v_types[i]);
+        END LOOP;
+        EXECUTE pg_catalog.format('CREATE TABLE %s (seq pg_catalog.int8 GENERATED ALWAYS AS IDENTITY PRIMARY KEY, op pg_catalog."char" NOT NULL%s)', v_log, v_defs);
+        EXECUTE pg_catalog.format('REVOKE ALL ON %s FROM PUBLIC', v_log);
+    END IF;
+    v_cols := (SELECT pg_catalog.string_agg(pg_catalog.format('k%s', g), ', ' ORDER BY g) FROM pg_catalog.generate_series(1, pg_catalog.cardinality(v_keys)) g);
+    v_exprs := (SELECT pg_catalog.string_agg(pg_catalog.format('($1 OPERATOR(pg_catalog.->>) %L)::%s', v_keys[g], v_types[g]), ', ' ORDER BY g)
+                  FROM pg_catalog.generate_series(1, pg_catalog.cardinality(v_keys)) g);
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t WHERE t.tgrelid OPERATOR(pg_catalog.=) v_rel::pg_catalog.oid AND t.tgname OPERATOR(pg_catalog.=) v_trg) THEN
+        EXECUTE pg_catalog.format('CREATE TRIGGER %I AFTER INSERT OR UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION kingres.internal_capture_trigger(%L, %L, %L)',
+                                  v_trg, v_rel, v_log, v_cols, v_exprs);
+        EXECUTE pg_catalog.format('ALTER TABLE %s ENABLE ALWAYS TRIGGER %I', v_rel, v_trg);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t WHERE t.tgrelid OPERATOR(pg_catalog.=) v_rel::pg_catalog.oid AND t.tgname OPERATOR(pg_catalog.=) v_ntr) THEN
+        EXECUTE pg_catalog.format('CREATE TRIGGER %I BEFORE TRUNCATE ON %s FOR EACH STATEMENT EXECUTE FUNCTION kingres.internal_capture_truncate()', v_ntr, v_rel);
+        EXECUTE pg_catalog.format('ALTER TABLE %s ENABLE ALWAYS TRIGGER %I', v_rel, v_ntr);
+    END IF;
+END;
+$$;
+
+-- One chunk of the copy: the rows after the last key, to their places in the shadow.  The key of the last
+-- row and the number of rows are recorded in the same transaction as the chunk.
+CREATE FUNCTION kingres.internal_op_copy_step(p_op bigint)
+    RETURNS jsonb
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_spec pg_catalog.jsonb;
+    v_keys pg_catalog.text[];
+    v_last pg_catalog.text[];
+    v_res  pg_catalog.jsonb;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    SELECT o.spec INTO v_spec FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) p_op;
+    SELECT pg_catalog.array_agg(x) INTO v_keys FROM pg_catalog.jsonb_array_elements_text(v_spec OPERATOR(pg_catalog.->) 'keys') x;
+    IF pg_catalog.jsonb_typeof(v_spec OPERATOR(pg_catalog.->) 'last') OPERATOR(pg_catalog.=) 'array' THEN
+        SELECT pg_catalog.array_agg(x) INTO v_last FROM pg_catalog.jsonb_array_elements_text(v_spec OPERATOR(pg_catalog.->) 'last') x;
+    END IF;
+    PERFORM kingres.internal_fault_point('rebuild_copy_chunk');
+    v_res := kingres.internal_copy_chunk((v_spec OPERATOR(pg_catalog.->>) 'relid')::pg_catalog.oid::pg_catalog.regclass,
+                                         (v_spec OPERATOR(pg_catalog.->>) 'schema')::pg_catalog.name,
+                                         (v_spec OPERATOR(pg_catalog.->>) 'shadow')::pg_catalog.name,
+                                         v_spec OPERATOR(pg_catalog.->>) 'dest_kind',
+                                         (v_spec OPERATOR(pg_catalog.->>) 'column')::pg_catalog.name,
+                                         (v_spec OPERATOR(pg_catalog.->>) 'colocation_id')::pg_catalog.int4,
+                                         NULL, v_keys, v_last,
+                                         pg_catalog.current_setting('kingres_shard.rebuild_batch_rows')::pg_catalog.int8,
+                                         NULL, true);
+    UPDATE kingres.table_operation_item i
+       SET rows_copied = i.rows_copied OPERATOR(pg_catalog.+) (v_res OPERATOR(pg_catalog.->>) 'read')::pg_catalog.int8
+     WHERE i.op_id OPERATOR(pg_catalog.=) p_op AND i.ordinal OPERATOR(pg_catalog.=) 1;
+    UPDATE kingres.table_operation o
+       SET spec = o.spec OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_object('last', v_res OPERATOR(pg_catalog.->) 'last'),
+           updated_at = pg_catalog.clock_timestamp()
+     WHERE o.op_id OPERATOR(pg_catalog.=) p_op AND pg_catalog.jsonb_typeof(v_res OPERATOR(pg_catalog.->) 'last') OPERATOR(pg_catalog.=) 'array';
+    RETURN v_res;
+END;
+$$;
+
+-- One chunk of the replay (design, "Replay"): for each key that the next entries of the log name,
+-- the destination is made equal to the current row of the source: the key is deleted at the
+-- destination (a group, or every node), then the row, if it exists, is inserted; then the entries
+-- are removed.  The deletes at other nodes commit at once, the rest is in the caller's transaction;
+-- a chunk that is repeated gives the same result.  Returns the number of entries it took.
+CREATE FUNCTION kingres.internal_replay_chunk(p_op bigint, p_batch int)
+    RETURNS int
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_spec     pg_catalog.jsonb;
+    v_log      pg_catalog.text;
+    v_keys     pg_catalog.text[];
+    v_types    pg_catalog.text[];
+    v_col      pg_catalog.text;
+    v_coloc    pg_catalog.int4;
+    v_shadow   pg_catalog.text;
+    v_nsp      pg_catalog.text;
+    v_seqs     pg_catalog.int8[];
+    v_n        pg_catalog.int4;
+    v_self     pg_catalog.int4;
+    v_ucols    pg_catalog.text;
+    v_cond     pg_catalog.text;
+    v_unnest   pg_catalog.text;
+    v_aggs     pg_catalog.text;
+    v_lcols    pg_catalog.text;
+    v_kcols    pg_catalog.text;
+    v_distidx  pg_catalog.int4;
+    v_tmpl     pg_catalog.text;
+    v_dest     pg_catalog.text;
+    r          pg_catalog.record;
+    i          pg_catalog.int4;
+BEGIN
+    SELECT o.spec INTO v_spec FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) p_op;
+    v_log := v_spec OPERATOR(pg_catalog.->>) 'log';
+    EXECUTE pg_catalog.format('SELECT COALESCE(pg_catalog.array_agg(s.seq), ARRAY[]::pg_catalog.int8[]) FROM (SELECT l.seq FROM %s l ORDER BY l.seq LIMIT %s) s',
+                              v_log, p_batch) INTO v_seqs;
+    v_n := pg_catalog.cardinality(v_seqs);
+    PERFORM kingres.internal_fault_point('rebuild_replay_chunk');
+    IF v_n OPERATOR(pg_catalog.=) 0 THEN
+        RETURN 0;
+    END IF;
+    SELECT pg_catalog.array_agg(x) INTO v_keys FROM pg_catalog.jsonb_array_elements_text(v_spec OPERATOR(pg_catalog.->) 'keys') x;
+    SELECT pg_catalog.array_agg(x) INTO v_types FROM pg_catalog.jsonb_array_elements_text(v_spec OPERATOR(pg_catalog.->) 'key_types') x;
+    v_col := v_spec OPERATOR(pg_catalog.->>) 'column';
+    v_coloc := (v_spec OPERATOR(pg_catalog.->>) 'colocation_id')::pg_catalog.int4;
+    v_nsp := v_spec OPERATOR(pg_catalog.->>) 'schema';
+    v_shadow := pg_catalog.format('%I.%I', v_nsp, v_spec OPERATOR(pg_catalog.->>) 'shadow');
+    SELECT l.node_id INTO v_self FROM kingres.local_node l;
+
+    v_ucols := (SELECT pg_catalog.string_agg(pg_catalog.format('%I', v_keys[g]), ', ' ORDER BY g) FROM pg_catalog.generate_series(1, pg_catalog.cardinality(v_keys)) g);
+    v_cond := (SELECT pg_catalog.string_agg(pg_catalog.format('d.%I OPERATOR(pg_catalog.=) u.%I', v_keys[g], v_keys[g]), ' AND ' ORDER BY g)
+                 FROM pg_catalog.generate_series(1, pg_catalog.cardinality(v_keys)) g);
+    -- inside the format of the template the placeholders are doubled once more
+    v_unnest := (SELECT pg_catalog.string_agg(pg_catalog.format('%%L::%s[]', v_types[g]), ', ' ORDER BY g)
+                   FROM pg_catalog.generate_series(1, pg_catalog.cardinality(v_keys)) g);
+    v_aggs := (SELECT pg_catalog.string_agg(pg_catalog.format('pg_catalog.array_agg(k.k%s)', g), ', ' ORDER BY g)
+                 FROM pg_catalog.generate_series(1, pg_catalog.cardinality(v_keys)) g);
+    v_lcols := (SELECT pg_catalog.string_agg(pg_catalog.format('k%s', g), ', ' ORDER BY g) FROM pg_catalog.generate_series(1, pg_catalog.cardinality(v_keys)) g);
+    v_kcols := v_ucols;
+    v_tmpl := pg_catalog.format('DELETE FROM %s d USING unnest(%s) AS u(%s) WHERE %s',
+                                v_shadow, v_unnest, v_ucols, v_cond);
+
+    -- 1. the keys are removed from the destination
+    IF v_col IS NOT NULL THEN
+        v_distidx := pg_catalog.array_position(v_keys, v_col);
+        FOR r IN EXECUTE pg_catalog.format(
+                    'SELECT m.group_id AS grp, pg_catalog.format(%L, %s) AS stmt '
+                    'FROM (SELECT DISTINCT %s FROM %s WHERE seq OPERATOR(pg_catalog.=) ANY (%L::pg_catalog.int8[])) k '
+                    'JOIN kingres.bucket_map m ON m.colocation_id OPERATOR(pg_catalog.=) %s '
+                    'AND m.bucket OPERATOR(pg_catalog.=) kingres.bucket_for(%s, k.k%s) GROUP BY m.group_id',
+                    v_tmpl, v_aggs, v_lcols, v_log, v_seqs, v_coloc, v_coloc, v_distidx)
+        LOOP
+            IF (SELECT n.node_id FROM kingres.node n WHERE n.group_id OPERATOR(pg_catalog.=) r.grp AND n.role OPERATOR(pg_catalog.=) 'primary' AND n.is_active) OPERATOR(pg_catalog.=) v_self THEN
+                EXECUTE r.stmt;
+            ELSE
+                PERFORM kingres.internal_branch_exec(kingres.internal_group_node(r.grp), r.stmt);
+            END IF;
+        END LOOP;
+    ELSE
+        EXECUTE pg_catalog.format(
+                    'SELECT pg_catalog.format(%L, %s) FROM (SELECT DISTINCT %s FROM %s WHERE seq OPERATOR(pg_catalog.=) ANY (%L::pg_catalog.int8[])) k',
+                    v_tmpl, v_aggs, v_lcols, v_log, v_seqs) INTO v_dest;
+        FOR r IN SELECT n.node_id FROM kingres.node n WHERE n.role OPERATOR(pg_catalog.=) 'primary' AND n.is_active ORDER BY n.node_id LOOP
+            IF r.node_id OPERATOR(pg_catalog.=) v_self THEN
+                EXECUTE v_dest;
+            ELSE
+                PERFORM kingres.internal_branch_exec(r.node_id, v_dest);
+            END IF;
+        END LOOP;
+    END IF;
+
+    -- 2. the rows that exist now are inserted
+    PERFORM kingres.internal_copy_chunk((v_spec OPERATOR(pg_catalog.->>) 'relid')::pg_catalog.oid::pg_catalog.regclass,
+                                        v_nsp::pg_catalog.name, (v_spec OPERATOR(pg_catalog.->>) 'shadow')::pg_catalog.name,
+                                        v_spec OPERATOR(pg_catalog.->>) 'dest_kind', v_col::pg_catalog.name, v_coloc,
+                                        NULL, NULL, NULL, NULL,
+                                        pg_catalog.format('(%s) IN (SELECT %s FROM %s WHERE seq OPERATOR(pg_catalog.=) ANY (%L::pg_catalog.int8[]))',
+                                                          v_kcols, v_lcols, v_log, v_seqs),
+                                        false);
+
+    -- 3. the entries are done
+    EXECUTE pg_catalog.format('DELETE FROM %s WHERE seq OPERATOR(pg_catalog.=) ANY (%L::pg_catalog.int8[])', v_log, v_seqs);
+    RETURN v_n;
+END;
+$$;
+
+-- ---- the switch ----
+
+-- Put the old table out of the way, in the transaction of the swap (design, "Switch", step 4): the
+-- capture triggers and the log table are dropped, the foreign keys are let go (the new table has
+-- them; the retained copy must not hold up the tables it referred to), the indexes (with their
+-- constraints) and the sequences of identity columns get names that carry the OID of the table,
+-- and the table is renamed, moved to the schema kingres and made unreadable by PUBLIC.
+CREATE FUNCTION kingres.internal_retire_table(p_relid regclass, p_op bigint)
+    RETURNS regclass
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_oid  pg_catalog.oid := p_relid::pg_catalog.oid;
+    v_nsp  pg_catalog.text;
+    v_name pg_catalog.text;
+    v_new  pg_catalog.text := pg_catalog.format('kingres_old_%s', p_relid::pg_catalog.oid);
+    r      pg_catalog.record;
+    k      pg_catalog.int4 := 0;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    SELECT n.nspname, c.relname INTO v_nsp, v_name
+      FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
+     WHERE c.oid OPERATOR(pg_catalog.=) v_oid;
+    FOR r IN SELECT t.tgname FROM pg_catalog.pg_trigger t
+              WHERE t.tgrelid OPERATOR(pg_catalog.=) v_oid
+                AND (t.tgname LIKE 'kingres\_capture\_%' OR t.tgname LIKE 'kingres\_notrunc\_%')
+    LOOP
+        EXECUTE pg_catalog.format('DROP TRIGGER %I ON %s', r.tgname, p_relid);
+    END LOOP;
+    EXECUTE pg_catalog.format('DROP TABLE IF EXISTS kingres.tlog_%s_1', p_op);
+    FOR r IN SELECT c.conname FROM pg_catalog.pg_constraint c
+              WHERE c.conrelid OPERATOR(pg_catalog.=) v_oid AND c.contype OPERATOR(pg_catalog.=) 'f' AND c.conparentid OPERATOR(pg_catalog.=) 0
+    LOOP
+        EXECUTE pg_catalog.format('ALTER TABLE %s DROP CONSTRAINT %I', p_relid, r.conname);
+    END LOOP;
+    FOR r IN SELECT ic.relname FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class ic ON ic.oid OPERATOR(pg_catalog.=) i.indexrelid
+              WHERE i.indrelid OPERATOR(pg_catalog.=) v_oid ORDER BY i.indexrelid
+    LOOP
+        k := k OPERATOR(pg_catalog.+) 1;
+        EXECUTE pg_catalog.format('ALTER INDEX %I.%I RENAME TO %I', v_nsp, r.relname, pg_catalog.format('kingres_old_%s_i%s', v_oid, k));
+    END LOOP;
+    FOR r IN SELECT a.attnum, pg_catalog.pg_get_serial_sequence(pg_catalog.format('%I.%I', v_nsp, v_name), a.attname::pg_catalog.text) AS seq
+               FROM pg_catalog.pg_attribute a
+              WHERE a.attrelid OPERATOR(pg_catalog.=) v_oid AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped AND a.attidentity OPERATOR(pg_catalog.<>) ''
+    LOOP
+        EXECUTE pg_catalog.format('ALTER SEQUENCE %s RENAME TO %I', r.seq, pg_catalog.format('kingres_old_%s_s%s', v_oid, r.attnum));
+    END LOOP;
+    EXECUTE pg_catalog.format('ALTER TABLE %I.%I RENAME TO %I', v_nsp, v_name, v_new);
+    EXECUTE pg_catalog.format('ALTER TABLE %I.%I SET SCHEMA kingres', v_nsp, v_new);
+    EXECUTE pg_catalog.format('REVOKE ALL ON kingres.%I FROM PUBLIC', v_new);
+    -- (a rename does not change privileges: whoever could read the table could read the copy)
+    FOR r IN SELECT DISTINCT x.grantee FROM pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) x
+              WHERE c.oid OPERATOR(pg_catalog.=) p_relid::pg_catalog.oid AND x.grantee OPERATOR(pg_catalog.<>) c.relowner AND x.grantee OPERATOR(pg_catalog.<>) 0
+    LOOP
+        EXECUTE pg_catalog.format('REVOKE ALL ON kingres.%I FROM %I', v_new, (SELECT ro.rolname FROM pg_catalog.pg_roles ro WHERE ro.oid OPERATOR(pg_catalog.=) r.grantee));
+    END LOOP;
+    RETURN pg_catalog.format('kingres.%I', v_new)::pg_catalog.regclass;
+END;
+$$;
+
+-- One attempt of the switch (design, "Switch"), in a session of its own, in one transaction: the
+-- cluster lock, the lock of the source (writers wait, readers go on), the replay of the rest of the
+-- log, the proof that nothing is left, the lock that the rename needs, and the swap.  An attempt that
+-- cannot get a lock in time, or whose replay takes too long, fails with lock_not_available and
+-- leaves everything as it was.
+CREATE FUNCTION kingres.internal_switch_attempt(p_op bigint)
+    RETURNS text
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_rec      kingres.table_operation%ROWTYPE;
+    v_rel      pg_catalog.regclass;
+    v_log      pg_catalog.text;
+    v_col      pg_catalog.name;
+    v_deadline pg_catalog.timestamptz;
+    v_batch    pg_catalog.int4 := pg_catalog.current_setting('kingres_shard.rebuild_batch_rows')::pg_catalog.int4;
+    v_n        pg_catalog.int4;
+    v_cnt      pg_catalog.int8;
+    v_valid    pg_catalog.text[];
+    v_left     pg_catalog.int4;
+    v_old      pg_catalog.text;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    PERFORM kingres.internal_require_map_group();
+    SELECT * INTO v_rec FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) p_op FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'table operation % does not exist', p_op USING ERRCODE = 'undefined_object';
+    END IF;
+    IF v_rec.phase OPERATOR(pg_catalog.<>) 'switching' THEN
+        RAISE EXCEPTION 'table operation % is in phase "%", not switching', p_op, v_rec.phase
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    IF v_rec.cancel_requested THEN
+        -- not query_canceled: a PL/pgSQL handler for OTHERS does not catch that one
+        RAISE EXCEPTION 'table operation % was asked to stop', p_op USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    v_rel := (v_rec.spec OPERATOR(pg_catalog.->>) 'relid')::pg_catalog.oid::pg_catalog.regclass;
+    v_log := v_rec.spec OPERATOR(pg_catalog.->>) 'log';
+    v_col := v_rec.spec OPERATOR(pg_catalog.->>) 'column';
+    v_deadline := pg_catalog.clock_timestamp() OPERATOR(pg_catalog.+)
+                  pg_catalog.make_interval(secs => kingres.internal_setting('kingres_shard.rebuild_switch_timeout')::pg_catalog.int4 OPERATOR(pg_catalog./) 1000.0);
+    PERFORM kingres.internal_fault_point('rebuild_before_switch');
+
+    -- the catalog lock first (the order of every catalog change), then the table
+    PERFORM pg_catalog.set_config('lock_timeout', pg_catalog.current_setting('kingres_shard.rebuild_lock_timeout'), true);
+    LOCK TABLE kingres.map_version IN EXCLUSIVE MODE;
+    PERFORM kingres.internal_lock_table(v_rel, 'EXCLUSIVE');
+    PERFORM kingres.internal_fault_point('rebuild_switch_after_lock');
+
+    -- the rest of the log, replayed after the lock was granted: no writer can add to it now
+    LOOP
+        v_n := kingres.internal_replay_chunk(p_op, v_batch);
+        EXIT WHEN v_n OPERATOR(pg_catalog.=) 0;
+        IF pg_catalog.clock_timestamp() OPERATOR(pg_catalog.>) v_deadline THEN
+            EXECUTE pg_catalog.format('SELECT pg_catalog.count(*) FROM %s', v_log) INTO v_left;
+            RAISE EXCEPTION 'the final replay of table % did not finish in time: % entries are left', v_rel, v_left
+                USING ERRCODE = 'lock_not_available',
+                      HINT = 'The writers of the table wait meanwhile; the operation tries again.';
+        END IF;
+    END LOOP;
+    EXECUTE pg_catalog.format('SELECT pg_catalog.count(*) FROM %s', v_log) INTO v_cnt;
+    IF v_cnt OPERATOR(pg_catalog.>) 0 THEN
+        RAISE EXCEPTION 'the log of table % is not empty after the final replay (% entries)', v_rel, v_cnt
+            USING ERRCODE = 'internal_error';
+    END IF;
+    PERFORM kingres.internal_fault_point('rebuild_switch_after_final_replay');
+
+    PERFORM kingres.internal_lock_table(v_rel, 'ACCESS EXCLUSIVE');
+    SELECT pg_catalog.array_agg(c.conname::pg_catalog.text ORDER BY c.conname) INTO v_valid
+      FROM pg_catalog.pg_constraint c
+     WHERE c.conrelid OPERATOR(pg_catalog.=) v_rel::pg_catalog.oid AND c.contype OPERATOR(pg_catalog.=) 'f'
+       AND c.conparentid OPERATOR(pg_catalog.=) 0 AND c.convalidated;
+    PERFORM kingres.internal_op_spec(p_op, pg_catalog.jsonb_build_object('validate', pg_catalog.to_jsonb(COALESCE(v_valid, ARRAY[]::pg_catalog.text[]))));
+    -- what is left of the time bounds the waits of the swap
+    PERFORM pg_catalog.set_config('lock_timeout',
+        GREATEST(1, pg_catalog.floor(EXTRACT(epoch FROM (v_deadline OPERATOR(pg_catalog.-) pg_catalog.clock_timestamp())) OPERATOR(pg_catalog.*) 1000))::pg_catalog.int4::pg_catalog.text, true);
+    v_old := kingres.internal_swap_table(p_op, v_rel, v_col, (v_rec.spec OPERATOR(pg_catalog.->>) 'colocation_id')::pg_catalog.int4,
+                                         kingres.internal_setting('kingres_shard.table_cleanup_delay')::pg_catalog.int4);
+    RETURN v_old;
+END;
+$$;
+
+-- ---- verification and cleaning ----
+
+-- The number of rows of a table (of this node's partitions, when it is a distributed table) and the
+-- sum of a hash of every row in text form: the same on every node for equal rows, whatever their
+-- order.  The text of a row does not depend on the settings of the session that asks.
+CREATE FUNCTION kingres.internal_table_digest(p_rel regclass, p_xid xid8 DEFAULT NULL)
+    RETURNS TABLE (n_rows bigint, n_hash numeric, n_newer bigint)
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    SET DateStyle = 'ISO, YMD'
+    SET IntervalStyle = 'postgres'
+    SET extra_float_digits = 3
+    SET bytea_output = 'hex'
+    SET lc_monetary = 'C'
+    SET TimeZone = 'UTC'
+    SET kingres_shard.enable_routing = 'off'
+    AS $$
+BEGIN
+    -- n_newer: the rows that a transaction after p_xid (the swap of the operation on this node) wrote
+    RETURN QUERY EXECUTE pg_catalog.format('SELECT pg_catalog.count(*), COALESCE(pg_catalog.sum(pg_catalog.hashtextextended(t::pg_catalog.text, 0)::pg_catalog.numeric), 0), pg_catalog.count(*) FILTER (WHERE t.xmin::pg_catalog.text::pg_catalog.int8 OPERATOR(pg_catalog.>) %L::pg_catalog.int8) FROM %s t',
+                                           COALESCE((p_xid::pg_catalog.text::pg_catalog.numeric OPERATOR(pg_catalog.%) 4294967296)::pg_catalog.int8, 9223372036854775807), p_rel);
+END;
+$$;
+
+-- The cleaning phase (design, "Verification after the switch"): the old copy is compared with the new
+-- table, the foreign keys that the switch added NOT VALID are validated (writers are admitted
+-- meanwhile), the claim of the colocation group is released and the operation is done.  A difference
+-- keeps the old copy and is reported by the answer 'failed: ...'.  The old copy itself is dropped by
+-- cleanup_table_operations() when its time has come.
+CREATE FUNCTION kingres.internal_op_clean(p_op bigint)
+    RETURNS text
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_rec    kingres.table_operation%ROWTYPE;
+    v_item   kingres.table_operation_item%ROWTYPE;
+    v_new    pg_catalog.text;
+    v_old    pg_catalog.text;
+    v_self   pg_catalog.int4;
+    v_orows  pg_catalog.int8;
+    v_ohash  pg_catalog.numeric;
+    v_rows   pg_catalog.int8 := 0;
+    v_hash   pg_catalog.numeric := 0;
+    v_newer  pg_catalog.int8 := 0;
+    v_r      pg_catalog.int8;
+    v_h      pg_catalog.numeric;
+    v_nw     pg_catalog.int8;
+    v_xid    pg_catalog.text;
+    v_res    pg_catalog.text;
+    v_ref    pg_catalog.bool;
+    v_ok     pg_catalog.bool := true;
+    v_why    pg_catalog.text;
+    v_names  pg_catalog.text[];
+    nd       pg_catalog.record;
+    nm       pg_catalog.text;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    PERFORM kingres.internal_require_map_group();
+    SELECT * INTO v_rec FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) p_op FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'table operation % does not exist', p_op USING ERRCODE = 'undefined_object';
+    END IF;
+    IF v_rec.phase OPERATOR(pg_catalog.=) 'done' THEN
+        RETURN 'done';
+    END IF;
+    IF v_rec.phase OPERATOR(pg_catalog.<>) 'cleaning' THEN
+        RAISE EXCEPTION 'table operation % is in phase "%", not cleaning', p_op, v_rec.phase
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    SELECT * INTO v_item FROM kingres.table_operation_item i WHERE i.op_id OPERATOR(pg_catalog.=) p_op AND i.ordinal OPERATOR(pg_catalog.=) 1;
+    SELECT l.node_id INTO v_self FROM kingres.local_node l;
+    v_new := pg_catalog.format('%I.%I', v_rec.spec OPERATOR(pg_catalog.->>) 'schema', v_rec.spec OPERATOR(pg_catalog.->>) 'table');
+    v_old := pg_catalog.format('kingres.%I', v_item.old_name);
+    v_ref := v_rec.kind OPERATOR(pg_catalog.=) 'distribute_reference';
+    PERFORM kingres.internal_fault_point('rebuild_verify');
+
+    IF NOT pg_catalog.current_setting('kingres_shard.rebuild_verify')::pg_catalog.bool THEN
+        UPDATE kingres.table_operation o SET verified = 'skipped' WHERE o.op_id OPERATOR(pg_catalog.=) p_op;
+    ELSIF v_item.old_name IS NULL OR pg_catalog.to_regclass(v_old) IS NULL THEN
+        UPDATE kingres.table_operation o SET verified = 'skipped' WHERE o.op_id OPERATOR(pg_catalog.=) p_op;
+    ELSE
+        SELECT d.n_rows, d.n_hash INTO v_orows, v_ohash FROM kingres.internal_table_digest(v_old::pg_catalog.regclass) d;
+        FOR nd IN SELECT n.node_id FROM kingres.node n WHERE n.role OPERATOR(pg_catalog.=) 'primary' AND n.is_active ORDER BY n.node_id LOOP
+            v_xid := v_rec.spec OPERATOR(pg_catalog.->) 'swap_xid' OPERATOR(pg_catalog.->>) nd.node_id::pg_catalog.text;
+            IF nd.node_id OPERATOR(pg_catalog.=) v_self THEN
+                SELECT d.n_rows, d.n_hash, d.n_newer INTO v_r, v_h, v_nw
+                  FROM kingres.internal_table_digest(v_new::pg_catalog.regclass, v_xid::pg_catalog.xid8) d;
+            ELSE
+                v_res := kingres.internal_exec_scalar(nd.node_id,
+                    pg_catalog.format('SELECT d.n_rows::pg_catalog.text OPERATOR(pg_catalog.||) '','' OPERATOR(pg_catalog.||) d.n_hash::pg_catalog.text OPERATOR(pg_catalog.||) '','' OPERATOR(pg_catalog.||) d.n_newer::pg_catalog.text FROM kingres.internal_table_digest(%L::pg_catalog.regclass, %L::pg_catalog.xid8) d', v_new, v_xid));
+                v_r := pg_catalog.split_part(v_res, ',', 1)::pg_catalog.int8;
+                v_h := pg_catalog.split_part(v_res, ',', 2)::pg_catalog.numeric;
+                v_nw := pg_catalog.split_part(v_res, ',', 3)::pg_catalog.int8;
+            END IF;
+            v_newer := v_newer OPERATOR(pg_catalog.+) v_nw;
+            IF v_ref THEN
+                IF v_r IS DISTINCT FROM v_orows OR v_h IS DISTINCT FROM v_ohash THEN
+                    v_ok := false;
+                    v_why := pg_catalog.format('node %s holds %s rows (the old copy has %s) or a different content', nd.node_id, v_r, v_orows);
+                END IF;
+            ELSE
+                v_rows := v_rows OPERATOR(pg_catalog.+) v_r;
+                v_hash := v_hash OPERATOR(pg_catalog.+) v_h;
+            END IF;
+        END LOOP;
+        IF NOT v_ref AND (v_rows IS DISTINCT FROM v_orows OR v_hash IS DISTINCT FROM v_ohash) THEN
+            v_ok := false;
+            v_why := pg_catalog.format('the new table holds %s rows (the old copy has %s) or a different content', v_rows, v_orows);
+        END IF;
+        IF NOT v_ok AND v_newer OPERATOR(pg_catalog.>) 0 THEN
+            -- the table was written to after the swap: the old copy cannot be compared with it
+            UPDATE kingres.table_operation o SET verified = 'skipped', detail = 'the table was written to after the switch; the comparison with the old copy is not possible'
+             WHERE o.op_id OPERATOR(pg_catalog.=) p_op;
+        ELSIF NOT v_ok THEN
+            UPDATE kingres.table_operation o SET verified = 'failed', detail = v_why, updated_at = pg_catalog.clock_timestamp()
+             WHERE o.op_id OPERATOR(pg_catalog.=) p_op;
+            RETURN pg_catalog.format('failed: %s', v_why);
+        ELSE
+            UPDATE kingres.table_operation o SET verified = 'ok' WHERE o.op_id OPERATOR(pg_catalog.=) p_op;
+        END IF;
+    END IF;
+
+    -- the foreign keys that the swap added NOT VALID
+    SELECT pg_catalog.array_agg(x) INTO v_names FROM pg_catalog.jsonb_array_elements_text(v_rec.spec OPERATOR(pg_catalog.->) 'validate') x;
+    IF v_names IS NOT NULL THEN
+        PERFORM pg_catalog.set_config('kingres_shard.enable_routing', 'off', true);
+        FOREACH nm IN ARRAY v_names LOOP
+            FOR nd IN SELECT n.node_id FROM kingres.node n WHERE n.role OPERATOR(pg_catalog.=) 'primary' AND n.is_active ORDER BY n.node_id LOOP
+                IF nd.node_id OPERATOR(pg_catalog.=) v_self THEN
+                    EXECUTE pg_catalog.format('ALTER TABLE %s VALIDATE CONSTRAINT %I', v_new, nm);
+                ELSE
+                    PERFORM kingres.internal_node_exec(nd.node_id,
+                        pg_catalog.format('SET LOCAL kingres_shard.enable_routing = off; ALTER TABLE %s VALIDATE CONSTRAINT %I', v_new, nm));
+                END IF;
+            END LOOP;
+        END LOOP;
+    END IF;
+    PERFORM kingres.internal_fault_point('rebuild_cleanup');
+
+    DELETE FROM kingres.table_operation_lock l WHERE l.op_id OPERATOR(pg_catalog.=) p_op;
+    PERFORM kingres.internal_op_set(p_op, 'done', NULL);
+    RETURN 'done';
+END;
+$$;
+
+-- ---- undoing an operation that did not switch ----
+
+CREATE FUNCTION kingres.internal_op_request_cancel(p_op bigint)
+    RETURNS void
+    LANGUAGE sql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+UPDATE kingres.table_operation o SET cancel_requested = true, updated_at = pg_catalog.clock_timestamp()
+ WHERE o.op_id OPERATOR(pg_catalog.=) p_op AND o.phase IN ('preparing', 'shadow', 'copying', 'catching_up', 'switching');
+$$;
+
+CREATE FUNCTION kingres.internal_op_attempt(p_op bigint, p_detail text)
+    RETURNS void
+    LANGUAGE sql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+UPDATE kingres.table_operation o SET attempts = o.attempts OPERATOR(pg_catalog.+) 1, detail = p_detail,
+       updated_at = pg_catalog.clock_timestamp()
+ WHERE o.op_id OPERATOR(pg_catalog.=) p_op;
+$$;
+
+-- Undo an operation that has not switched: the capture triggers and the log on the source, the shadow
+-- tables (and the sequences made for them) on every node, the claim and a colocation group that the
+-- operation made.  Every step checks what exists.  A node that cannot be reached keeps its leftovers: they
+-- are named in the spec (cleanup_pending) and removed by a later call.  Runs in a session of its own.
+-- Returns 'undone', 'incomplete' (a node was missed), or 'switched' (nothing to undo).
+CREATE FUNCTION kingres.internal_op_undo(p_op bigint, p_final text, p_reason text)
+    RETURNS text
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_rec    kingres.table_operation%ROWTYPE;
+    v_spec   pg_catalog.jsonb;
+    v_rel    pg_catalog.oid;
+    v_self   pg_catalog.int4;
+    v_nsp    pg_catalog.text;
+    v_shadow pg_catalog.text;
+    v_failed pg_catalog.int4[] := ARRAY[]::pg_catalog.int4[];
+    v_seqs   pg_catalog.text[];
+    v_group  pg_catalog.int4;
+    v_drop   pg_catalog.bool := false;
+    nd       pg_catalog.record;
+    t        pg_catalog.record;
+    s        pg_catalog.text;
+    i        pg_catalog.int4;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    PERFORM kingres.internal_require_map_group();
+    SELECT * INTO v_rec FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) p_op FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'table operation % does not exist', p_op USING ERRCODE = 'undefined_object';
+    END IF;
+    IF v_rec.phase IN ('cleaning', 'done') THEN
+        RETURN 'switched';
+    END IF;
+    v_spec := v_rec.spec;
+    IF v_rec.phase IN ('failed', 'cancelled')
+       AND pg_catalog.jsonb_array_length(COALESCE(v_spec OPERATOR(pg_catalog.->) 'cleanup_pending', '[]'::pg_catalog.jsonb)) OPERATOR(pg_catalog.=) 0 THEN
+        RETURN 'undone';
+    END IF;
+    UPDATE kingres.table_operation o SET cancel_requested = true WHERE o.op_id OPERATOR(pg_catalog.=) p_op;
+    SELECT l.node_id INTO v_self FROM kingres.local_node l;
+    v_rel := (v_spec OPERATOR(pg_catalog.->>) 'relid')::pg_catalog.oid;
+    v_nsp := v_spec OPERATOR(pg_catalog.->>) 'schema';
+    v_shadow := v_spec OPERATOR(pg_catalog.->>) 'shadow';
+    v_group := (v_spec OPERATOR(pg_catalog.->>) 'colocation_id')::pg_catalog.int4;
+    SELECT pg_catalog.array_agg(x) INTO v_seqs FROM pg_catalog.jsonb_array_elements_text(v_spec OPERATOR(pg_catalog.->) 'sequences') x;
+
+    -- 1. the capture on the source
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid OPERATOR(pg_catalog.=) v_rel) THEN
+        IF EXISTS (SELECT 1 FROM pg_catalog.pg_trigger g WHERE g.tgrelid OPERATOR(pg_catalog.=) v_rel
+                      AND g.tgname IN (pg_catalog.format('kingres_capture_%s', p_op), pg_catalog.format('kingres_notrunc_%s', p_op))) THEN
+            -- dropping a trigger needs the strongest lock: wait for a long holder a while (a prepared transaction that
+            -- the operation could not get past), then leave the rest to resume_table_operations()
+            FOR i IN 1 .. 12 LOOP
+                BEGIN
+                    PERFORM kingres.internal_lock_table(v_rel::pg_catalog.regclass, 'ACCESS EXCLUSIVE');
+                    EXIT;
+                EXCEPTION WHEN lock_not_available THEN
+                    IF i OPERATOR(pg_catalog.=) 12 THEN
+                        RAISE;
+                    END IF;
+                END;
+            END LOOP;
+            FOR t IN SELECT g.tgname FROM pg_catalog.pg_trigger g WHERE g.tgrelid OPERATOR(pg_catalog.=) v_rel
+                        AND g.tgname IN (pg_catalog.format('kingres_capture_%s', p_op), pg_catalog.format('kingres_notrunc_%s', p_op))
+            LOOP
+                EXECUTE pg_catalog.format('DROP TRIGGER %I ON %s', t.tgname, v_rel::pg_catalog.regclass);
+            END LOOP;
+        END IF;
+    END IF;
+    EXECUTE pg_catalog.format('DROP TABLE IF EXISTS kingres.tlog_%s_1', p_op);
+    PERFORM kingres.internal_fault_point('rebuild_undo_after_triggers');
+
+    -- 2. the shadows
+    FOR nd IN SELECT n.node_id FROM kingres.node n WHERE n.role OPERATOR(pg_catalog.=) 'primary' AND n.is_active ORDER BY n.node_id LOOP
+        BEGIN
+            IF nd.node_id OPERATOR(pg_catalog.=) v_self THEN
+                EXECUTE pg_catalog.format('DROP TABLE IF EXISTS %I.%I CASCADE', v_nsp, v_shadow);
+            ELSE
+                PERFORM kingres.internal_node_exec(nd.node_id, pg_catalog.format('DROP TABLE IF EXISTS %I.%I CASCADE', v_nsp, v_shadow));
+                IF v_seqs IS NOT NULL THEN
+                    FOREACH s IN ARRAY v_seqs LOOP
+                        PERFORM kingres.internal_node_exec(nd.node_id, pg_catalog.format('DROP SEQUENCE IF EXISTS %s', s));
+                    END LOOP;
+                END IF;
+            END IF;
+        EXCEPTION WHEN OTHERS OR query_canceled THEN
+            v_failed := v_failed OPERATOR(pg_catalog.||) nd.node_id;
+        END;
+    END LOOP;
+    PERFORM kingres.internal_fault_point('rebuild_undo_after_shadows');
+
+    -- 3. the claim, and the group that the operation made
+    DELETE FROM kingres.table_operation_lock l WHERE l.op_id OPERATOR(pg_catalog.=) p_op;
+    IF COALESCE((v_spec OPERATOR(pg_catalog.->>) 'new_group')::pg_catalog.bool, false) AND v_group IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM kingres.dist_table d WHERE d.colocation_id OPERATOR(pg_catalog.=) v_group) THEN
+        v_drop := true;
+    END IF;
+
+    UPDATE kingres.table_operation o
+       SET phase = p_final, detail = p_reason, updated_at = pg_catalog.clock_timestamp(), finished_at = pg_catalog.clock_timestamp(),
+           spec = o.spec OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_object('cleanup_pending', pg_catalog.to_jsonb(v_failed))
+     WHERE o.op_id OPERATOR(pg_catalog.=) p_op;
+    IF v_drop THEN
+        BEGIN
+            DELETE FROM kingres.bucket_map b WHERE b.colocation_id OPERATOR(pg_catalog.=) v_group;
+            DELETE FROM kingres.colocation c WHERE c.colocation_id OPERATOR(pg_catalog.=) v_group;
+            PERFORM kingres.sync_catalog();
+        EXCEPTION WHEN OTHERS OR query_canceled THEN
+            -- a node that cannot be reached cannot be told: the empty group stays (it holds no table; the next table
+            -- of the same kind takes it) and the undo goes on
+            RAISE WARNING 'the colocation group % that table operation % made could not be removed everywhere: %', v_group, p_op, SQLERRM;
+        END;
+    END IF;
+    RETURN CASE WHEN pg_catalog.cardinality(v_failed) OPERATOR(pg_catalog.=) 0 THEN 'undone' ELSE 'incomplete' END;
+END;
+$$;
+
+-- ---- running the phases ----
+
+-- Run an online operation up to the end of the phase to_phase (shadow, copying, catching_up, switching
+-- or cleaning) and return the phase it is in.  Every phase can be called again after a failure or a
+-- crash: it checks what exists.  The session that runs it holds the live mark of the operation.
+-- Each step that must outlive this call commits in a session of its own (internal_node_exec on this
+-- node), so a call that dies leaves a record that another session can continue from, or undo.
+-- 'switching' returns with the detail set when the attempts of one call are used up (the caller calls
+-- again).  Progress is in kingres.table_operations.
+CREATE FUNCTION kingres.table_operation_advance(op_id bigint, to_phase text, timeout_ms int DEFAULT NULL)
+    RETURNS text
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_op       pg_catalog.int8 := op_id;
+    v_to       pg_catalog.text := to_phase;
+    v_phases   pg_catalog.text[] := ARRAY['preparing', 'shadow', 'copying', 'catching_up', 'switching', 'cleaning', 'done'];
+    v_stop     pg_catalog.int4;
+    v_rec      kingres.table_operation%ROWTYPE;
+    v_self     pg_catalog.int4;
+    v_ms       pg_catalog.int4;
+    v_chunk_ms pg_catalog.int4;
+    v_deadline pg_catalog.timestamptz;
+    v_phase    pg_catalog.text;
+    v_cancel   pg_catalog.bool;
+    v_spec     pg_catalog.jsonb;
+    v_res      pg_catalog.text;
+    v_script   pg_catalog.text;
+    v_read     pg_catalog.int8;
+    v_batch    pg_catalog.int4 := pg_catalog.current_setting('kingres_shard.rebuild_batch_rows')::pg_catalog.int4;
+    v_thr      pg_catalog.int8 := pg_catalog.current_setting('kingres_shard.rebuild_drain_threshold')::pg_catalog.int8;
+    v_max      pg_catalog.int4 := pg_catalog.current_setting('kingres_shard.rebuild_switch_max_attempts')::pg_catalog.int4;
+    v_sw_ms    pg_catalog.int4 := kingres.internal_setting('kingres_shard.rebuild_switch_timeout')::pg_catalog.int4;
+    v_backlog  pg_catalog.int8;
+    v_prev     pg_catalog.int8 := -1;
+    v_still    pg_catalog.int4 := 0;
+    v_att      pg_catalog.int4;
+    v_detail   pg_catalog.text;
+    v_diag     pg_catalog.text;
+    v_state    pg_catalog.text;
+    v_switched pg_catalog.bool;
+    n          pg_catalog.record;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    PERFORM kingres.internal_require_map_group();
+    IF pg_catalog.current_setting('transaction_isolation') OPERATOR(pg_catalog.<>) 'read committed' THEN
+        RAISE EXCEPTION 'kingres.table_operation_advance() must run in a READ COMMITTED transaction'
+            USING ERRCODE = 'invalid_transaction_state',
+                  DETAIL = 'It follows the progress of other sessions and nodes with statements that must see their latest commits.';
+    END IF;
+    IF v_to NOT IN ('shadow', 'copying', 'catching_up', 'switching', 'cleaning') THEN
+        RAISE EXCEPTION 'unknown phase "%"', v_to
+            USING ERRCODE = 'invalid_parameter_value',
+                  HINT = 'Use shadow, copying, catching_up, switching or cleaning.';
+    END IF;
+    SELECT * INTO v_rec FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) v_op;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'table operation % does not exist', v_op USING ERRCODE = 'undefined_object';
+    END IF;
+    IF v_rec.phase IN ('done', 'failed', 'cancelled') THEN
+        RETURN v_rec.phase;
+    END IF;
+    IF NOT kingres.internal_op_lock(v_op) THEN
+        RAISE EXCEPTION 'table operation % is being run by another session', v_op
+            USING ERRCODE = 'object_in_use';
+    END IF;
+    SELECT l.node_id INTO v_self FROM kingres.local_node l;
+    v_ms := (SELECT s.setting::pg_catalog.int4 FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) 'kingres_shard.node_timeout') * 1000;
+    v_chunk_ms := GREATEST(v_ms * 6, 600000);
+    v_stop := pg_catalog.array_position(v_phases, v_to) OPERATOR(pg_catalog.+) 1;
+    IF timeout_ms IS NOT NULL THEN
+        v_deadline := pg_catalog.clock_timestamp() OPERATOR(pg_catalog.+) pg_catalog.make_interval(secs => timeout_ms OPERATOR(pg_catalog./) 1000.0);
+    END IF;
+
+    BEGIN
+        LOOP
+            SELECT o.phase, o.cancel_requested, o.spec INTO v_phase, v_cancel, v_spec
+              FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) v_op;
+            EXIT WHEN v_phase IN ('done', 'failed', 'cancelled');
+            IF v_cancel THEN
+                PERFORM kingres.internal_exec_scalar(v_self,
+                    pg_catalog.format('SELECT kingres.internal_op_undo(%s, ''cancelled'', %L)', v_op, 'cancelled on request'), v_chunk_ms);
+                PERFORM kingres.internal_op_unlock(v_op);
+                RAISE EXCEPTION 'table operation % was cancelled', v_op USING ERRCODE = 'query_canceled';
+            END IF;
+            EXIT WHEN pg_catalog.array_position(v_phases, v_phase) OPERATOR(pg_catalog.>=) v_stop;
+            IF v_deadline IS NOT NULL AND pg_catalog.clock_timestamp() OPERATOR(pg_catalog.>) v_deadline THEN
+                EXIT;
+            END IF;
+
+            IF v_phase IN ('preparing', 'shadow') THEN
+                -- the shadow on every node, then the capture on the source
+                PERFORM kingres.internal_exec_scalar(v_self, pg_catalog.format('SELECT kingres.internal_op_set(%s, ''shadow'', NULL)', v_op), v_ms);
+                PERFORM kingres.internal_fault_point('rebuild_after_preparing');
+                FOR n IN SELECT nd.node_id, nd.group_id FROM kingres.node nd
+                          WHERE nd.role OPERATOR(pg_catalog.=) 'primary' AND nd.is_active ORDER BY nd.node_id
+                LOOP
+                    v_res := kingres.internal_exec_scalar(n.node_id,
+                        pg_catalog.format('SELECT pg_catalog.count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace s ON s.oid OPERATOR(pg_catalog.=) c.relnamespace WHERE s.nspname OPERATOR(pg_catalog.=) %L AND c.relname OPERATOR(pg_catalog.=) %L',
+                                          v_spec OPERATOR(pg_catalog.->>) 'schema', v_spec OPERATOR(pg_catalog.->>) 'shadow'), v_ms);
+                    IF v_res OPERATOR(pg_catalog.=) '0' THEN
+                        -- the script is read in a session of its own: reading the sequences of the table here would
+                        -- leave a lock in this transaction that the swap (which renames them) would wait for for ever
+                        v_script := kingres.internal_exec_scalar(v_self,
+                            pg_catalog.format('SELECT kingres.internal_shadow_script(%L::pg_catalog.oid::pg_catalog.regclass, %L::pg_catalog.name, %L::pg_catalog.int4, %L::pg_catalog.int4)',
+                                              v_spec OPERATOR(pg_catalog.->>) 'relid', v_spec OPERATOR(pg_catalog.->>) 'column',
+                                              v_spec OPERATOR(pg_catalog.->>) 'colocation_id', n.group_id), v_ms);
+                        PERFORM kingres.internal_node_exec(n.node_id, v_script, v_chunk_ms);
+                    END IF;
+                END LOOP;
+                PERFORM kingres.internal_fault_point('rebuild_after_shadow');
+                PERFORM kingres.internal_exec_scalar(v_self, pg_catalog.format('SELECT kingres.internal_op_capture(%s)', v_op), v_chunk_ms);
+                PERFORM kingres.internal_fault_point('rebuild_after_capture');
+                PERFORM kingres.internal_exec_scalar(v_self, pg_catalog.format('SELECT kingres.internal_op_set(%s, ''copying'', NULL)', v_op), v_ms);
+
+            ELSIF v_phase OPERATOR(pg_catalog.=) 'copying' THEN
+                LOOP
+                    v_res := kingres.internal_exec_scalar(v_self, pg_catalog.format('SELECT kingres.internal_op_copy_step(%s)', v_op), v_chunk_ms);
+                    v_read := ((v_res::pg_catalog.jsonb) OPERATOR(pg_catalog.->>) 'read')::pg_catalog.int8;
+                    EXIT WHEN v_read OPERATOR(pg_catalog.=) 0;
+                    EXIT WHEN EXISTS (SELECT 1 FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) v_op AND o.cancel_requested);
+                    EXIT WHEN v_deadline IS NOT NULL AND pg_catalog.clock_timestamp() OPERATOR(pg_catalog.>) v_deadline;
+                END LOOP;
+                CONTINUE WHEN v_read OPERATOR(pg_catalog.<>) 0;
+                PERFORM kingres.internal_fault_point('rebuild_after_copy');
+                PERFORM kingres.internal_exec_scalar(v_self, pg_catalog.format('SELECT kingres.internal_op_set(%s, ''catching_up'', NULL)', v_op), v_ms);
+
+            ELSIF v_phase OPERATOR(pg_catalog.=) 'catching_up' THEN
+                -- replay until the backlog is under the threshold after a chunk
+                v_prev := -1;
+                v_still := 0;
+                LOOP
+                    v_res := kingres.internal_exec_scalar(v_self, pg_catalog.format('SELECT kingres.internal_replay_chunk(%s, %s)', v_op, v_batch), v_chunk_ms);
+                    v_backlog := kingres.internal_exec_scalar(v_self, pg_catalog.format('SELECT pg_catalog.count(*) FROM %s', v_spec OPERATOR(pg_catalog.->>) 'log'), v_ms)::pg_catalog.int8;
+                    EXIT WHEN v_backlog OPERATOR(pg_catalog.<=) v_thr;
+                    EXIT WHEN v_res::pg_catalog.int4 OPERATOR(pg_catalog.=) 0;
+                    IF v_prev OPERATOR(pg_catalog.>=) 0 AND v_backlog OPERATOR(pg_catalog.>=) v_prev THEN
+                        v_still := v_still OPERATOR(pg_catalog.+) 1;
+                        IF v_still OPERATOR(pg_catalog.>=) 5 THEN
+                            PERFORM kingres.internal_exec_scalar(v_self,
+                                pg_catalog.format('SELECT kingres.internal_op_set(%s, ''catching_up'', %L)', v_op,
+                                                  pg_catalog.format('the backlog does not shrink: %s entries', v_backlog)), v_ms);
+                            v_still := 0;
+                        END IF;
+                    ELSE
+                        v_still := 0;
+                    END IF;
+                    v_prev := v_backlog;
+                    EXIT WHEN EXISTS (SELECT 1 FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) v_op AND o.cancel_requested);
+                    EXIT WHEN v_deadline IS NOT NULL AND pg_catalog.clock_timestamp() OPERATOR(pg_catalog.>) v_deadline;
+                END LOOP;
+                CONTINUE WHEN v_backlog OPERATOR(pg_catalog.>) v_thr;
+                PERFORM kingres.internal_exec_scalar(v_self, pg_catalog.format('SELECT kingres.internal_op_set(%s, ''switching'', NULL)', v_op), v_ms);
+
+            ELSIF v_phase OPERATOR(pg_catalog.=) 'switching' THEN
+                v_att := 0;
+                v_switched := false;
+                LOOP
+                    v_att := v_att OPERATOR(pg_catalog.+) 1;
+                    BEGIN
+                        v_res := kingres.internal_exec_scalar(v_self, pg_catalog.format('SELECT kingres.internal_switch_attempt(%s)', v_op),
+                                                              v_sw_ms OPERATOR(pg_catalog.+) v_ms * 2);
+                        v_switched := true;
+                    EXCEPTION WHEN OTHERS THEN
+                        GET STACKED DIAGNOSTICS v_state = RETURNED_SQLSTATE, v_diag = PG_EXCEPTION_DETAIL;
+                        -- a switch that committed although the answer was lost is a switch
+                        SELECT o.phase INTO v_phase FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) v_op;
+                        IF v_phase IN ('cleaning', 'done') THEN
+                            v_switched := true;
+                        ELSIF v_state OPERATOR(pg_catalog.=) '55000'
+                              AND EXISTS (SELECT 1 FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) v_op AND o.cancel_requested) THEN
+                            -- the attempt saw the request to stop: the loop below sees it too
+                            NULL;
+                        ELSIF v_state OPERATOR(pg_catalog.<>) '55P03' THEN
+                            RAISE;
+                        ELSE
+                            v_detail := pg_catalog.format('attempt %s: %s%s', v_att, SQLERRM,
+                                                          CASE WHEN v_diag IS NULL THEN '' ELSE ' (' OPERATOR(pg_catalog.||) v_diag OPERATOR(pg_catalog.||) ')' END);
+                            PERFORM kingres.internal_exec_scalar(v_self, pg_catalog.format('SELECT kingres.internal_op_attempt(%s, %L)', v_op, v_detail), v_ms);
+                        END IF;
+                    END;
+                    EXIT WHEN v_switched;
+                    EXIT WHEN v_att OPERATOR(pg_catalog.>=) v_max;
+                    EXIT WHEN EXISTS (SELECT 1 FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) v_op AND o.cancel_requested);
+                    PERFORM pg_catalog.pg_sleep(0.2 OPERATOR(pg_catalog.+) pg_catalog.random() OPERATOR(pg_catalog.*) 0.5);
+                    -- the log grew while the attempt waited
+                    v_res := kingres.internal_exec_scalar(v_self, pg_catalog.format('SELECT kingres.internal_replay_chunk(%s, %s)', v_op, v_batch), v_chunk_ms);
+                END LOOP;
+                IF v_switched THEN
+                    PERFORM kingres.internal_fault_point('rebuild_after_switch');
+                    CONTINUE;
+                END IF;
+                IF EXISTS (SELECT 1 FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) v_op AND o.cancel_requested) THEN
+                    CONTINUE;
+                END IF;
+                -- the operation stays in switching with its detail; the caller calls again
+                EXIT;
+
+            ELSIF v_phase OPERATOR(pg_catalog.=) 'cleaning' THEN
+                v_res := kingres.internal_exec_scalar(v_self, pg_catalog.format('SELECT kingres.internal_op_clean(%s)', v_op), v_chunk_ms * 2);
+                IF v_res LIKE 'failed:%' THEN
+                    RAISE EXCEPTION 'verification of table operation % failed: %', v_op, pg_catalog.substr(v_res, 9)
+                        USING ERRCODE = 'data_corrupted',
+                              HINT = 'The old copy is kept; the data was not rolled back.';
+                END IF;
+            END IF;
+        END LOOP;
+    EXCEPTION WHEN OTHERS THEN
+        PERFORM kingres.internal_op_unlock(v_op);
+        RAISE;
+    END;
+    PERFORM kingres.internal_op_unlock(v_op);
+    RETURN (SELECT o.phase FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) v_op);
+END;
+$$;
+
+-- Stop an operation that has not switched: its capture and shadows are removed, its claim released.  A
+-- session that is running it notices at the end of its chunk and undoes it itself; otherwise it is undone
+-- here.  After the switch nothing is undone and a notice says so.
+CREATE FUNCTION kingres.cancel_table_operation(op_id bigint)
+    RETURNS void
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_op    pg_catalog.int8 := op_id;
+    v_phase pg_catalog.text;
+    v_self  pg_catalog.int4;
+    v_ms    pg_catalog.int4;
+    v_res   pg_catalog.text;
+    i       pg_catalog.int4;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    PERFORM kingres.internal_require_map_group();
+    SELECT o.phase INTO v_phase FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) v_op;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'table operation % does not exist', v_op USING ERRCODE = 'undefined_object';
+    END IF;
+    IF v_phase IN ('cleaning', 'done') THEN
+        RAISE NOTICE 'table operation % has switched: nothing is undone', v_op;
+        RETURN;
+    END IF;
+    IF v_phase IN ('failed', 'cancelled') THEN
+        RETURN;
+    END IF;
+    SELECT l.node_id INTO v_self FROM kingres.local_node l;
+    v_ms := (SELECT s.setting::pg_catalog.int4 FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) 'kingres_shard.node_timeout') * 1000;
+    PERFORM kingres.internal_exec_scalar(v_self, pg_catalog.format('SELECT kingres.internal_op_request_cancel(%s)', v_op), v_ms);
+    IF kingres.internal_op_alive(v_op) THEN
+        -- the session that runs it undoes it at the end of its chunk
+        FOR i IN 1 .. (v_ms OPERATOR(pg_catalog./) 100) * 4 LOOP
+            PERFORM pg_catalog.pg_sleep(0.1);
+            SELECT o.phase INTO v_phase FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) v_op;
+            EXIT WHEN v_phase IN ('failed', 'cancelled', 'cleaning', 'done');
+        END LOOP;
+        IF v_phase NOT IN ('failed', 'cancelled', 'cleaning', 'done') THEN
+            RAISE NOTICE 'table operation % was asked to stop; the session that runs it has not yet noticed', v_op;
+        END IF;
+        RETURN;
+    END IF;
+    v_res := kingres.internal_exec_scalar(v_self,
+        pg_catalog.format('SELECT kingres.internal_op_undo(%s, ''cancelled'', %L)', v_op, 'cancelled on request'), v_ms * 6);
+    IF v_res OPERATOR(pg_catalog.=) 'incomplete' THEN
+        RAISE NOTICE 'table operation % was cancelled but a node could not be cleaned; kingres.resume_table_operations() removes what is left', v_op;
+    END IF;
+END;
+$$;
+
+-- The recovery worker's pass (and anybody's): operations whose session is gone and that did not
+-- switch are undone (an operation is left alone while its session holds the live mark, or has written
+-- its record a moment ago: a switch may still be committing); operations that switched are finished
+-- (verified, validated, released); undone operations that missed a node are cleaned again.  Prepared
+-- transactions are resolved first.  Returns how many it resolved.
+CREATE FUNCTION kingres.resume_table_operations()
+    RETURNS int
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    r      pg_catalog.record;
+    v_self pg_catalog.int4;
+    v_res  pg_catalog.text;
+    v_to   pg_catalog.int4;
+    n      pg_catalog.int4 := 0;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    IF pg_catalog.pg_is_in_recovery() THEN
+        RETURN 0;
+    END IF;
+    SELECT l.node_id INTO v_self
+      FROM kingres.local_node l JOIN kingres.node nd ON nd.node_id OPERATOR(pg_catalog.=) l.node_id
+     WHERE nd.group_id OPERATOR(pg_catalog.=) 0 AND nd.role OPERATOR(pg_catalog.=) 'primary';
+    IF v_self IS NULL THEN
+        RETURN 0;
+    END IF;
+    v_to := (SELECT s.setting::pg_catalog.int4 FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) 'kingres_shard.node_timeout');
+    BEGIN
+        PERFORM kingres.internal_exec_scalar(v_self, 'SELECT kingres.recover_prepared_transactions()', v_to * 4000);
+    EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'kingres_shard: recovery of prepared transactions failed: %', SQLERRM;
+    END;
+
+    FOR r IN SELECT o.op_id, o.phase, o.updated_at,
+                    (o.phase IN ('failed', 'cancelled')) AS finished
+               FROM kingres.table_operation o
+              WHERE o.phase IN ('preparing', 'shadow', 'copying', 'catching_up', 'switching', 'cleaning')
+                 OR (o.phase IN ('failed', 'cancelled')
+                     AND pg_catalog.jsonb_array_length(COALESCE(o.spec OPERATOR(pg_catalog.->) 'cleanup_pending', '[]'::pg_catalog.jsonb)) OPERATOR(pg_catalog.>) 0)
+              ORDER BY o.op_id
+    LOOP
+        BEGIN
+            IF kingres.internal_op_alive(r.op_id) THEN
+                CONTINUE;
+            END IF;
+            IF r.phase OPERATOR(pg_catalog.=) 'cleaning' THEN
+                v_res := kingres.internal_exec_scalar(v_self, pg_catalog.format('SELECT kingres.internal_op_clean(%s)', r.op_id), v_to * 8000);
+                IF v_res OPERATOR(pg_catalog.=) 'done' THEN
+                    n := n OPERATOR(pg_catalog.+) 1;
+                END IF;
+            ELSE
+                IF NOT r.finished AND r.updated_at OPERATOR(pg_catalog.>) (pg_catalog.clock_timestamp() OPERATOR(pg_catalog.-) pg_catalog.make_interval(secs => v_to * 2)) THEN
+                    CONTINUE;
+                END IF;
+                v_res := kingres.internal_exec_scalar(v_self, pg_catalog.format(
+                    'SELECT kingres.internal_op_undo(%s, CASE WHEN %L THEN (SELECT o.phase FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) %s) ELSE ''failed'' END, %L)',
+                    r.op_id, r.finished, r.op_id, 'interrupted; undone by kingres.resume_table_operations()'), v_to * 6000);
+                IF v_res IN ('undone', 'switched') THEN
+                    n := n OPERATOR(pg_catalog.+) 1;
+                END IF;
+            END IF;
+        EXCEPTION WHEN OTHERS OR query_canceled THEN
+            RAISE WARNING 'kingres_shard: could not resume table operation %: %', r.op_id, SQLERRM;
+        END;
+    END LOOP;
+    RETURN n;
+END;
+$$;
+
+-- Drop the old copies whose time has come (all of them with force).  A copy that failed its
+-- verification is kept unless force is given.
+CREATE FUNCTION kingres.cleanup_table_operations(force bool DEFAULT false)
+    RETURNS int
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_force pg_catalog.bool := force;
+    r       pg_catalog.record;
+    n       pg_catalog.int4 := 0;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    IF pg_catalog.pg_is_in_recovery() THEN
+        RETURN 0;
+    END IF;
+    FOR r IN SELECT c.relid::pg_catalog.oid AS oid
+               FROM kingres.table_old_copy c
+              WHERE (v_force OR c.dropped_after OPERATOR(pg_catalog.<=) pg_catalog.clock_timestamp())
+                AND (v_force OR NOT EXISTS (SELECT 1 FROM kingres.table_operation_item i
+                                              JOIN kingres.table_operation o ON o.op_id OPERATOR(pg_catalog.=) i.op_id
+                                             WHERE i.old_name OPERATOR(pg_catalog.=) (SELECT cl.relname FROM pg_catalog.pg_class cl WHERE cl.oid OPERATOR(pg_catalog.=) c.relid::pg_catalog.oid)
+                                               AND o.verified OPERATOR(pg_catalog.=) 'failed'))
+              ORDER BY c.dropped_after
+    LOOP
+        PERFORM kingres.internal_fault_point('rebuild_cleanup');
+        IF EXISTS (SELECT 1 FROM pg_catalog.pg_class cl WHERE cl.oid OPERATOR(pg_catalog.=) r.oid) THEN
+            EXECUTE pg_catalog.format('DROP TABLE %s', r.oid::pg_catalog.regclass);
+        END IF;
+        DELETE FROM kingres.table_old_copy c WHERE c.relid::pg_catalog.oid OPERATOR(pg_catalog.=) r.oid;
+        n := n OPERATOR(pg_catalog.+) 1;
+    END LOOP;
+    RETURN n;
+END;
+$$;
+
+-- ---- the online variants ----
+
+CREATE FUNCTION kingres.create_distributed_table_concurrently(relation regclass, dist_column name,
+                                                              colocate_with regclass DEFAULT NULL,
+                                                              bucket_count int DEFAULT NULL)
+    RETURNS bigint
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_op     pg_catalog.int8;
+    v_phase  pg_catalog.text;
+    v_self   pg_catalog.int4;
+    v_ms     pg_catalog.int4;
+    v_detail pg_catalog.text;
+BEGIN
+    PERFORM kingres.internal_prevent_xact_block('kingres.create_distributed_table_concurrently()');
+    v_op := kingres.begin_table_operation('distribute', relation,
+                pg_catalog.jsonb_strip_nulls(pg_catalog.jsonb_build_object('column', dist_column,
+                    'colocate_with', colocate_with::pg_catalog.oid::pg_catalog.text, 'bucket_count', bucket_count)));
+    SELECT l.node_id INTO v_self FROM kingres.local_node l;
+    v_ms := (SELECT s.setting::pg_catalog.int4 FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) 'kingres_shard.node_timeout') * 6000;
+    BEGIN
+        v_phase := kingres.table_operation_advance(v_op, 'cleaning');
+    EXCEPTION WHEN OTHERS THEN
+        -- what did not switch is undone (an operation that switched answers 'switched')
+        BEGIN
+            PERFORM kingres.internal_exec_scalar(v_self,
+                pg_catalog.format('SELECT kingres.internal_op_undo(%s, ''failed'', %L)', v_op, SQLERRM), v_ms);
+        EXCEPTION WHEN OTHERS THEN
+            NULL;
+        END;
+        RAISE;
+    END;
+    IF v_phase OPERATOR(pg_catalog.<>) 'done' THEN
+        SELECT o.detail INTO v_detail FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) v_op;
+        PERFORM kingres.internal_exec_scalar(v_self,
+            pg_catalog.format('SELECT kingres.internal_op_undo(%s, ''failed'', %L)', v_op, COALESCE(v_detail, 'did not finish')), v_ms);
+        RAISE EXCEPTION 'table operation % did not finish: it stopped in phase %', v_op, v_phase
+            USING ERRCODE = 'object_not_in_prerequisite_state', DETAIL = v_detail;
+    END IF;
+    RETURN v_op;
+END;
+$$;
+
+CREATE FUNCTION kingres.create_reference_table_concurrently(relation regclass)
+    RETURNS bigint
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_op     pg_catalog.int8;
+    v_phase  pg_catalog.text;
+    v_self   pg_catalog.int4;
+    v_ms     pg_catalog.int4;
+    v_detail pg_catalog.text;
+BEGIN
+    PERFORM kingres.internal_prevent_xact_block('kingres.create_reference_table_concurrently()');
+    v_op := kingres.begin_table_operation('distribute_reference', relation, '{}'::pg_catalog.jsonb);
+    SELECT l.node_id INTO v_self FROM kingres.local_node l;
+    v_ms := (SELECT s.setting::pg_catalog.int4 FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) 'kingres_shard.node_timeout') * 6000;
+    BEGIN
+        v_phase := kingres.table_operation_advance(v_op, 'cleaning');
+    EXCEPTION WHEN OTHERS THEN
+        BEGIN
+            PERFORM kingres.internal_exec_scalar(v_self,
+                pg_catalog.format('SELECT kingres.internal_op_undo(%s, ''failed'', %L)', v_op, SQLERRM), v_ms);
+        EXCEPTION WHEN OTHERS THEN
+            NULL;
+        END;
+        RAISE;
+    END;
+    IF v_phase OPERATOR(pg_catalog.<>) 'done' THEN
+        SELECT o.detail INTO v_detail FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) v_op;
+        PERFORM kingres.internal_exec_scalar(v_self,
+            pg_catalog.format('SELECT kingres.internal_op_undo(%s, ''failed'', %L)', v_op, COALESCE(v_detail, 'did not finish')), v_ms);
+        RAISE EXCEPTION 'table operation % did not finish: it stopped in phase %', v_op, v_phase
+            USING ERRCODE = 'object_not_in_prerequisite_state', DETAIL = v_detail;
+    END IF;
+    RETURN v_op;
+END;
+$$;
+
+COMMENT ON FUNCTION kingres.create_distributed_table_concurrently(regclass, name, regclass, int) IS
+    'The online variant of create_distributed_table: writers keep working; returns the id of the operation when the table is distributed';
+COMMENT ON FUNCTION kingres.create_reference_table_concurrently(regclass) IS
+    'The online variant of create_reference_table: writers keep working; returns the id of the operation when the table is a reference table';
+COMMENT ON FUNCTION kingres.begin_table_operation(text, regclass, jsonb) IS
+    'Check, claim and record an online table operation; kingres.table_operation_advance() runs its phases';
+COMMENT ON FUNCTION kingres.table_operation_advance(bigint, text, int) IS
+    'Run an online table operation up to the end of a phase and return the phase it is in';
+COMMENT ON FUNCTION kingres.cancel_table_operation(bigint) IS
+    'Undo an online table operation that has not switched';
+COMMENT ON FUNCTION kingres.resume_table_operations() IS
+    'Undo the operations whose session is gone and that did not switch, finish those that switched; returns how many it resolved';
+COMMENT ON FUNCTION kingres.cleanup_table_operations(bool) IS
+    'Drop the old copies of replaced tables whose time has come; returns how many';
+
+REVOKE ALL ON FUNCTION
+    kingres.internal_op_lock(bigint),
+    kingres.internal_op_unlock(bigint),
+    kingres.internal_op_alive(bigint),
+    kingres.internal_prevent_xact_block(text),
+    kingres.internal_choose_colocation(regtype, oid, regclass, int),
+    kingres.internal_shadow_script(regclass, name, int, int),
+    kingres.internal_swap_table(bigint, regclass, name, int, int),
+    kingres.internal_copy_chunk(regclass, name, name, text, name, int, int, text[], text[], bigint, text, bool),
+    kingres.internal_branch_exec(int, text),
+    kingres.internal_capture_trigger(),
+    kingres.internal_capture_truncate(),
+    kingres.internal_lock_holders(regclass),
+    kingres.internal_setting(text),
+    kingres.internal_lock_table(regclass, text),
+    kingres.internal_op_set(bigint, text, text),
+    kingres.internal_op_spec(bigint, jsonb),
+    kingres.internal_log_key(regclass),
+    kingres.internal_begin_table_operation(text, regclass, jsonb),
+    kingres.begin_table_operation(text, regclass, jsonb),
+    kingres.internal_op_capture(bigint),
+    kingres.internal_op_copy_step(bigint),
+    kingres.internal_replay_chunk(bigint, int),
+    kingres.internal_retire_table(regclass, bigint),
+    kingres.internal_switch_attempt(bigint),
+    kingres.internal_table_digest(regclass, xid8),
+    kingres.internal_op_clean(bigint),
+    kingres.internal_op_request_cancel(bigint),
+    kingres.internal_op_attempt(bigint, text),
+    kingres.internal_op_undo(bigint, text, text),
+    kingres.table_operation_advance(bigint, text, int),
+    kingres.cancel_table_operation(bigint),
+    kingres.resume_table_operations(),
+    kingres.cleanup_table_operations(bool),
+    kingres.create_distributed_table_concurrently(regclass, name, regclass, int),
+    kingres.create_reference_table_concurrently(regclass)
+    FROM PUBLIC;
+
+-- ---- check_cluster() knows the leftovers of table operations ----
+
+-- What is wrong with the table operations (design, "Interaction with the rest of the system"):
+--   table_operation_stalled     unfinished, nobody runs it, not written for three node_timeout
+--   shadow_table, log_table, capture_trigger
+--                               objects of an operation that is done, failed, cancelled or unknown
+--   old_table                   an old copy that is overdue by an hour
+--   table_verification_failed   the old copy and the new table differ; the old copy is kept
+CREATE FUNCTION kingres.internal_check_table_operations()
+    RETURNS TABLE (check_name text, node_id int, object text, detail text)
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_to   pg_catalog.int4;
+    n      pg_catalog.record;
+    o      pg_catalog.record;
+    r      pg_catalog.jsonb;
+    x      pg_catalog.text;
+    v_oid  pg_catalog.oid;
+    v_op   pg_catalog.int8;
+    v_live pg_catalog.bool;
+BEGIN
+    IF pg_catalog.to_regclass('kingres.table_operation') IS NULL THEN
+        RETURN;
+    END IF;
+    v_to := (SELECT s.setting::pg_catalog.int4 FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) 'kingres_shard.node_timeout');
+
+    FOR o IN SELECT t.op_id, t.phase, t.updated_at, t.verified FROM kingres.table_operation t ORDER BY t.op_id LOOP
+        IF o.phase IN ('preparing', 'shadow', 'copying', 'catching_up', 'switching', 'cleaning')
+           AND o.updated_at OPERATOR(pg_catalog.<) (pg_catalog.clock_timestamp() OPERATOR(pg_catalog.-) pg_catalog.make_interval(secs => v_to * 3))
+           AND NOT kingres.internal_op_alive(o.op_id) THEN
+            check_name := 'table_operation_stalled'; node_id := NULL;
+            object := pg_catalog.format('table operation %s', o.op_id);
+            detail := pg_catalog.format('in phase %s since %s and nobody runs it; kingres.table_operation_advance() continues it, kingres.cancel_table_operation() undoes it', o.phase, o.updated_at);
+            RETURN NEXT;
+        END IF;
+        IF o.verified OPERATOR(pg_catalog.=) 'failed' THEN
+            check_name := 'table_verification_failed'; node_id := NULL;
+            object := pg_catalog.format('table operation %s', o.op_id);
+            detail := 'the old copy and the new table differ; the old copy is kept as the evidence (kingres.cleanup_table_operations(true) drops it)';
+            RETURN NEXT;
+        END IF;
+    END LOOP;
+
+    FOR o IN SELECT c.relid::pg_catalog.oid AS oid, c.dropped_after FROM kingres.table_old_copy c
+              WHERE c.dropped_after OPERATOR(pg_catalog.<) (pg_catalog.clock_timestamp() OPERATOR(pg_catalog.-) interval '1 hour') ORDER BY c.dropped_after LOOP
+        check_name := 'old_table'; node_id := NULL;
+        object := COALESCE(o.oid::pg_catalog.regclass::pg_catalog.text, o.oid::pg_catalog.text);
+        detail := pg_catalog.format('the old copy of a replaced table was due for dropping at %s', o.dropped_after);
+        RETURN NEXT;
+    END LOOP;
+
+    -- the objects that operations make on the nodes: a shadow is kingres_shadow_<oid of the source>, a log and
+    -- the triggers carry the id of the operation
+    FOR n IN SELECT nd.node_id AS id FROM kingres.node nd WHERE nd.role OPERATOR(pg_catalog.=) 'primary' AND nd.is_active ORDER BY nd.node_id LOOP
+        BEGIN
+            r := kingres.internal_node_exec(n.id,
+                'SELECT pg_catalog.jsonb_build_object(''shadows'', COALESCE((SELECT pg_catalog.jsonb_agg(s.nspname OPERATOR(pg_catalog.||) ''.'' OPERATOR(pg_catalog.||) c.relname) '
+                'FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace s ON s.oid OPERATOR(pg_catalog.=) c.relnamespace '
+                'WHERE c.relname LIKE ''kingres\_shadow\_%'' AND c.relkind IN (''r'', ''p'')), ''[]''::pg_catalog.jsonb), '
+                '''logs'', COALESCE((SELECT pg_catalog.jsonb_agg(c.relname) FROM pg_catalog.pg_class c WHERE c.relnamespace OPERATOR(pg_catalog.=) ''kingres''::pg_catalog.regnamespace AND c.relname LIKE ''tlog\_%'' AND c.relkind OPERATOR(pg_catalog.=) ''r''), ''[]''::pg_catalog.jsonb), '
+                '''triggers'', COALESCE((SELECT pg_catalog.jsonb_agg(t.tgname) FROM pg_catalog.pg_trigger t WHERE NOT t.tgisinternal AND (t.tgname LIKE ''kingres\_capture\_%'' OR t.tgname LIKE ''kingres\_notrunc\_%'')), ''[]''::pg_catalog.jsonb))');
+            r := (r OPERATOR(pg_catalog.->) 0) OPERATOR(pg_catalog.->>) 0;
+        EXCEPTION WHEN OTHERS OR query_canceled THEN
+            CONTINUE;
+        END;
+        FOR x IN SELECT e FROM pg_catalog.jsonb_array_elements_text(r OPERATOR(pg_catalog.->) 'shadows') e LOOP
+            v_oid := NULLIF(pg_catalog.regexp_replace(x, '^.*kingres_shadow_', ''), '')::pg_catalog.oid;
+            IF NOT EXISTS (SELECT 1 FROM kingres.table_operation_item i JOIN kingres.table_operation t ON t.op_id OPERATOR(pg_catalog.=) i.op_id
+                            WHERE i.relid::pg_catalog.oid OPERATOR(pg_catalog.=) v_oid
+                              AND t.phase IN ('preparing', 'shadow', 'copying', 'catching_up', 'switching')) THEN
+                check_name := 'shadow_table'; node_id := n.id; object := x;
+                detail := 'the shadow table of a table operation that is not running';
+                RETURN NEXT;
+            END IF;
+        END LOOP;
+        FOR x IN SELECT e FROM pg_catalog.jsonb_array_elements_text(r OPERATOR(pg_catalog.->) 'logs') e LOOP
+            v_op := NULLIF(pg_catalog.split_part(x, '_', 2), '')::pg_catalog.int8;
+            IF NOT EXISTS (SELECT 1 FROM kingres.table_operation t WHERE t.op_id OPERATOR(pg_catalog.=) v_op
+                              AND t.phase IN ('preparing', 'shadow', 'copying', 'catching_up', 'switching')) THEN
+                check_name := 'log_table'; node_id := n.id; object := pg_catalog.format('kingres.%s', x);
+                detail := 'the capture log of a table operation that is not running';
+                RETURN NEXT;
+            END IF;
+        END LOOP;
+        FOR x IN SELECT e FROM pg_catalog.jsonb_array_elements_text(r OPERATOR(pg_catalog.->) 'triggers') e LOOP
+            v_op := NULLIF(pg_catalog.regexp_replace(x, '^kingres_(capture|notrunc)_', ''), '')::pg_catalog.int8;
+            IF NOT EXISTS (SELECT 1 FROM kingres.table_operation t WHERE t.op_id OPERATOR(pg_catalog.=) v_op
+                              AND t.phase IN ('preparing', 'shadow', 'copying', 'catching_up', 'switching')) THEN
+                check_name := 'capture_trigger'; node_id := n.id; object := x;
+                detail := 'a capture trigger of a table operation that is not running';
+                RETURN NEXT;
+            END IF;
+        END LOOP;
+    END LOOP;
+    RETURN;
+END;
+$$;
+
+ALTER FUNCTION kingres.check_cluster(interval) RENAME TO internal_check_cluster_base;
+
+CREATE FUNCTION kingres.check_cluster(p_prepared_older_than interval DEFAULT interval '5 minutes')
+    RETURNS TABLE (check_name text, node_id int, object text, detail text)
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+BEGIN
+    RETURN QUERY SELECT b.check_name, b.node_id, b.object, b.detail FROM kingres.internal_check_cluster_base(p_prepared_older_than) b;
+    RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_table_operations() t;
+END;
+$$;
+
+COMMENT ON FUNCTION kingres.check_cluster(interval) IS
+    'One row per inconsistency of the cluster (catalogs, partitions against the bucket map, leftovers of moves and of table operations, old prepared transactions); none when consistent';
+
+REVOKE ALL ON FUNCTION
+    kingres.check_cluster(interval),
+    kingres.internal_check_cluster_base(interval),
+    kingres.internal_check_table_operations()
     FROM PUBLIC;

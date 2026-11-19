@@ -37,4 +37,31 @@ extern int64 kingres_shard_copy_routed(Oid source, const char *dest_schema, cons
 									   KsDestKind kind, const KsColocation *placement,
 									   const char *key_column, int node_id, int64 *rows_read);
 
+/*
+ * One chunk of an online copy or replay: the rows of the source that satisfy where_sql (a
+ * predicate text made by the extension, or NULL), taken in the order of the key columns after the
+ * key given in after (NULL: from the start), at most limit of them (0: all).  The last key read
+ * is returned as text in *last (nkeys values, in the caller's memory context; NULL when no row was
+ * read).  With conflict_nothing the insert has ON CONFLICT DO NOTHING (a chunk that is repeated
+ * stores nothing twice); without it a conflict is an error.
+ */
+typedef struct KsCopyOpts
+{
+	const char *where_sql;
+	int			nkeys;
+	char	  **keycols;
+	char	  **after;
+	int64		limit;
+	bool		conflict_nothing;
+	char	  **last;			/* out: nkeys strings, or NULL */
+} KsCopyOpts;
+
+/* The placement of a colocation group from the catalog tables, as of this transaction (needs no SPI connection of its own). */
+extern KsColocation *kingres_shard_load_placement(int colocation_id);
+
+extern int64 kingres_shard_copy_routed_ex(Oid source, const char *dest_schema, const char *dest_table,
+										  KsDestKind kind, const KsColocation *placement,
+										  const char *key_column, int node_id, int64 *rows_read,
+										  KsCopyOpts *opts);
+
 #endif							/* KINGRES_SHARD_COPY_ROUTED_H */

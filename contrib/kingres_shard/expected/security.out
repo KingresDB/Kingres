@@ -44,9 +44,48 @@ WITH ext_functions AS (
 SELECT fn AS unexpected_security_definer
   FROM ext_functions
  WHERE prosecdef
-   AND fn NOT IN ('kingres.forget_dropped_tables()')
+   AND fn NOT IN ('kingres.forget_dropped_tables()', 'kingres.internal_capture_trigger()')
  ORDER BY fn;
  unexpected_security_definer 
+-----------------------------
+(0 rows)
+
+-- Exactly two functions are SECURITY DEFINER: the guard of dropped tables and the trigger function of the
+-- capture of an online table operation (it writes the key of a changed row into a log table that the
+-- writer has no privilege on; EXECUTE is revoked from PUBLIC, so only a superuser can make a trigger of it).
+SELECT p.oid::regprocedure::text AS security_definer_function
+  FROM pg_proc p
+  JOIN pg_depend d ON d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'e'
+  JOIN pg_extension e ON e.oid = d.refobjid AND d.refclassid = 'pg_extension'::regclass
+ WHERE e.extname = 'kingres_shard' AND p.prosecdef
+ ORDER BY 1;
+     security_definer_function      
+------------------------------------
+ kingres.forget_dropped_tables()
+ kingres.internal_capture_trigger()
+(2 rows)
+
+-- Every function of the table operations is revoked from PUBLIC (the roles are the ones of the install: none
+-- can run them without a grant).
+SELECT p.oid::regprocedure::text AS function_callable_by_public
+  FROM pg_proc p
+  JOIN pg_depend d ON d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'e'
+  JOIN pg_extension e ON e.oid = d.refobjid AND d.refclassid = 'pg_extension'::regclass
+ WHERE e.extname = 'kingres_shard'
+   AND p.proname IN ('begin_table_operation', 'table_operation_advance', 'cancel_table_operation',
+        'resume_table_operations', 'cleanup_table_operations', 'create_distributed_table_concurrently',
+        'create_reference_table_concurrently', 'table_change_report', 'check_cluster',
+        'internal_capture_trigger', 'internal_capture_truncate', 'internal_op_lock', 'internal_op_unlock', 'internal_op_alive',
+        'internal_op_set', 'internal_op_spec', 'internal_op_capture', 'internal_op_copy_step', 'internal_op_clean',
+        'internal_op_undo', 'internal_op_request_cancel', 'internal_op_attempt', 'internal_lock_table', 'internal_lock_holders',
+        'internal_setting', 'internal_branch_exec', 'internal_copy_chunk', 'internal_copy_routed', 'internal_swap_table',
+        'internal_shadow_script', 'internal_choose_colocation', 'internal_replay_chunk', 'internal_retire_table',
+        'internal_switch_attempt', 'internal_table_digest', 'internal_begin_table_operation', 'internal_log_key',
+        'internal_prevent_xact_block', 'internal_check_table_operations', 'internal_check_cluster_base',
+        'internal_table_ddl', 'internal_require_version', 'internal_advance_sequence', 'internal_rename_identity')
+   AND has_function_privilege('public', p.oid, 'EXECUTE')
+ ORDER BY 1;
+ function_callable_by_public 
 -----------------------------
 (0 rows)
 

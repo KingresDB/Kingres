@@ -88,6 +88,13 @@ int			kingres_shard_move_catchup_threshold = 1024;	/* kB */
 int			kingres_shard_move_switch_timeout = 10000;	/* ms */
 int			kingres_shard_move_switch_attempts = 20;
 int			kingres_shard_move_cleanup_delay = 600;	/* s */
+int			kingres_shard_rebuild_batch_rows = 10000;
+int			kingres_shard_rebuild_drain_threshold = 1000;
+int			kingres_shard_rebuild_lock_timeout = 200;	/* ms */
+int			kingres_shard_rebuild_switch_timeout = 10000;	/* ms */
+int			kingres_shard_rebuild_switch_max_attempts = 30;
+int			kingres_shard_table_cleanup_delay = 600;	/* s */
+bool		kingres_shard_rebuild_verify = true;
 int			kingres_shard_deadlock_check_interval = 2;
 int			kingres_shard_deadlock_confirm_delay = 200;	/* ms */
 int			kingres_shard_decision_retention = 300;	/* s */
@@ -307,6 +314,63 @@ _PG_init(void)
 							600, 0, 31536000,
 							PGC_USERSET, GUC_UNIT_S,
 							NULL, NULL, NULL);
+
+	/* The rebuild engine of the table operations (design/shard-phase9.md, "Settings"). */
+	DefineCustomIntVariable("kingres_shard.rebuild_batch_rows",
+							"Rows per chunk of the copy and of the replay of an online table operation.",
+							"A chunk is one transaction on every group it writes (two-phase commit when it writes on two or more).",
+							&kingres_shard_rebuild_batch_rows,
+							10000, 1, 1000000,
+							PGC_USERSET, 0,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("kingres_shard.rebuild_drain_threshold",
+							"Entries of the capture log under which the switch of an online table operation is attempted.",
+							NULL,
+							&kingres_shard_rebuild_drain_threshold,
+							1000, 0, 100000000,
+							PGC_USERSET, 0,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("kingres_shard.rebuild_lock_timeout",
+							"The longest a lock request of the switch is queued behind other sessions.",
+							NULL,
+							&kingres_shard_rebuild_lock_timeout,
+							200, 1, 600000,
+							PGC_USERSET, GUC_UNIT_MS,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("kingres_shard.rebuild_switch_timeout",
+							"The longest one switch attempt of an online table operation lasts (lock, final replay, commit).",
+							NULL,
+							&kingres_shard_rebuild_switch_timeout,
+							10000, 1, 3600000,
+							PGC_USERSET, GUC_UNIT_MS,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("kingres_shard.rebuild_switch_max_attempts",
+							"Switch attempts in one call of kingres.table_operation_advance(..., 'switching').",
+							NULL,
+							&kingres_shard_rebuild_switch_max_attempts,
+							30, 1, 100000,
+							PGC_USERSET, 0,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("kingres_shard.table_cleanup_delay",
+							"How long the old copy of a table is kept after a table operation switched.",
+							"0 drops it after the check.",
+							&kingres_shard_table_cleanup_delay,
+							600, 0, 31536000,
+							PGC_USERSET, GUC_UNIT_S,
+							NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("kingres_shard.rebuild_verify",
+							 "Compare the old copy with the new table before the old copy is dropped.",
+							 NULL,
+							 &kingres_shard_rebuild_verify,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
 
 	/* Distributed deadlock detection (ha-phase5.md, part C). */
 	DefineCustomIntVariable("kingres_shard.deadlock_check_interval",

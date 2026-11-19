@@ -224,9 +224,16 @@ SELECT name, setting, unit, context
  kingres_shard.node_connect_timeout           | 5       | s    | user
  kingres_shard.node_conninfo                  |         |      | sighup
  kingres_shard.node_timeout                   | 60      | s    | user
+ kingres_shard.rebuild_batch_rows             | 10000   |      | user
+ kingres_shard.rebuild_drain_threshold        | 1000    |      | user
+ kingres_shard.rebuild_lock_timeout           | 200     | ms   | user
+ kingres_shard.rebuild_switch_max_attempts    | 30      |      | user
+ kingres_shard.rebuild_switch_timeout         | 10000   | ms   | user
+ kingres_shard.rebuild_verify                 | on      |      | user
  kingres_shard.recovery_interval              | 0       | s    | sighup
  kingres_shard.scan_fetch_size                | 1000    |      | user
-(25 rows)
+ kingres_shard.table_cleanup_delay            | 600     | s    | user
+(32 rows)
 
 SET kingres_shard.default_bucket_count = 0;
 ERROR:  0 is outside the valid range for parameter "kingres_shard.default_bucket_count" (1 .. 4096)
