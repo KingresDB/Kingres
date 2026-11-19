@@ -416,4 +416,3 @@ decided inside the module or written into the header as the caller's duty, and t
   so the case could not be built with a colocated source).
 * `kingres_shard.enable_routing = off` sessions (a superuser's own risk).
 * The upgrade path (`kingres_shard--0.5--0.6.sql`) beyond what the regression test `upgrade` shows.
-
