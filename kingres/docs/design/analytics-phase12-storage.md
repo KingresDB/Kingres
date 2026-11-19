@@ -2611,3 +2611,21 @@ the new table; unique indexes of the parent wait for C6c.
 - On 6 million rows of random text (217 MB columnar, 669 MB heap): an index build took 4.6 s
   against 5.8 s for heap; a point lookup 4.7 ms against 0.6 ms; a range of one percent by the index
   43 ms against 42 ms (indicative, a shared machine).
+
+### C6d, compaction of a table with indexes (2026-11-19)
+
+- **Decided differently from the plan of C6b.** `columnar_compact` does not rebuild the indexes of
+  the table: a rebuild would name only the new row numbers, and a snapshot older than the compaction
+  that still sees the old stripes would find none of its rows through an index; preventing that
+  needs a lock that blocks every reader for the whole compaction. The compaction adds an entry for
+  every copied row to every index instead (predicates and expressions evaluated, no uniqueness
+  check), and VACUUM removes the old entries once no snapshot can see the old stripes. Locks: those
+  of a writer. Cost: a second decode of the copied rows, an insertion per row and index, and two
+  entries per copied row until the next VACUUM.
+- **The unique check** treats a stripe row deleted by a running or aborted transaction as still
+  holding its rows (after a rolled-back compaction it would otherwise admit a duplicate).
+- **The row numbers of aborted writers are never given back**: their index entries would find
+  another row with another key, since a plain index scan does not recheck the key. Only the unused
+  tail of a committed buffer is returned.
+- **For `kingres_timepart`**: compaction of a columnar partition with indexes is allowed now;
+  VACUUM after it removes the old entries.
