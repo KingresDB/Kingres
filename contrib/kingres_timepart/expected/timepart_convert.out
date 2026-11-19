@@ -12,7 +12,7 @@ SET intervalstyle = postgres;
 \set VERBOSITY default
 \set SHOW_CONTEXT never
 SET client_min_messages = warning;
-CREATE EXTENSION kingres_columnar;
+CREATE EXTENSION kingres_columnar VERSION '0.1';
 RESET client_min_messages;
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_timepart';
  extversion 
@@ -68,6 +68,35 @@ LANGUAGE sql STABLE AS $$
      WHERE a.run_id = (SELECT max(r.run_id) FROM kingres.timepart_run r WHERE r.schema_name = 'tpv' AND r.table_name = p_table)
      ORDER BY a.seq
 $$;
+------------------------------------------------------------------------
+-- 00. The extension is still at 0.1: a table it makes is of file format 2 and
+--     cannot have an index, so a table with indexes is refused; without
+--     indexes the conversion works, and after the update the indexes do
+------------------------------------------------------------------------
+CREATE SCHEMA tpf;
+CREATE TABLE tpf.fx (id int, ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+CREATE TABLE tpf.fx_a PARTITION OF tpf.fx FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+CREATE TABLE tpf.fx_b PARTITION OF tpf.fx FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
+INSERT INTO tpf.fx VALUES (1, '2026-01-02'), (2, '2026-02-02');
+CREATE INDEX ON tpf.fx_a (id);
+CALL kingres.convert_partition('tpf.fx', 'tpf.fx_a');
+ERROR:  conversion_refused: the table has indexes and the new partition would be made by kingres_columnar 0.1 (file format 2, written by 0.1), which cannot have an index: run ALTER EXTENSION kingres_columnar UPDATE
+DROP INDEX tpf.fx_a_id_idx;
+CALL kingres.convert_partition('tpf.fx', 'tpf.fx_a');
+CREATE INDEX ON tpf.fx_b (id);
+CALL kingres.convert_partition('tpf.fx', 'tpf.fx_b');
+ERROR:  conversion_refused: the table has indexes and the new partition would be made by kingres_columnar 0.1 (file format 2, written by 0.1), which cannot have an index: run ALTER EXTENSION kingres_columnar UPDATE
+ALTER EXTENSION kingres_columnar UPDATE;
+CALL kingres.convert_partition('tpf.fx', 'tpf.fx_b');
+SELECT c.relname, a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.relnamespace = 'tpf'::regnamespace AND c.relkind = 'r' ORDER BY 1;
+ relname |  amname  
+---------+----------
+ fx_a    | columnar
+ fx_b    | columnar
+(2 rows)
+
+DROP SCHEMA tpf CASCADE;
+NOTICE:  drop cascades to table tpf.fx
 ------------------------------------------------------------------------
 -- 0. A publication that would take in the columnar partition (columnar
 --    tables are not replicated logically yet; the publication has to be there
@@ -551,19 +580,51 @@ INSERT INTO kingres.ledger_table VALUES ('tpv.rf_a');
 CALL kingres.convert_partition('tpv.rf', 'tpv.rf_a');
 ERROR:  conversion_refused: tpv.rf_a belongs to a ledger table
 DROP TABLE kingres.ledger_table;
--- the refusals of columnar itself, found before the attach fails on them
-CREATE INDEX rf_a_idx ON tpv.rf_a (id);
+-- the refusals of columnar itself, found before the attach fails on them:
+-- an index that is not a B-tree with immediate checking
+CREATE INDEX rf_a_hash ON tpv.rf_a USING hash (id);
 CALL kingres.convert_partition('tpv.rf', 'tpv.rf_a');
-ERROR:  conversion_refused: tpv.rf_a has the index tpv.rf_a_idx: columnar tables have no indexes in this version
-DROP INDEX tpv.rf_a_idx;
-CREATE INDEX rf_idx ON tpv.rf (id);
+ERROR:  conversion_refused: tpv.rf_a has the index tpv.rf_a_hash (access method hash: columnar tables have B-tree indexes only)
+DROP INDEX tpv.rf_a_hash;
+CREATE INDEX rf_a_brin ON tpv.rf_a USING brin (ts);
 CALL kingres.convert_partition('tpv.rf', 'tpv.rf_a');
-ERROR:  conversion_refused: tpv.rf has the index tpv.rf_idx, and the columnar partition would need a matching index: columnar tables have no indexes in this version
-DROP INDEX tpv.rf_idx;
-ALTER TABLE tpv.rf_a ADD PRIMARY KEY (id);
+ERROR:  conversion_refused: tpv.rf_a has the index tpv.rf_a_brin (access method brin: columnar tables have B-tree indexes only)
+DROP INDEX tpv.rf_a_brin;
+CREATE INDEX rf_a_spgist ON tpv.rf_a USING spgist (note);
 CALL kingres.convert_partition('tpv.rf', 'tpv.rf_a');
-ERROR:  conversion_refused: tpv.rf_a has the index tpv.rf_a_pkey: columnar tables have no indexes in this version
-ALTER TABLE tpv.rf_a DROP CONSTRAINT rf_a_pkey;
+ERROR:  conversion_refused: tpv.rf_a has the index tpv.rf_a_spgist (access method spgist: columnar tables have B-tree indexes only)
+DROP INDEX tpv.rf_a_spgist;
+CREATE INDEX rf_a_gin ON tpv.rf_a USING gin (to_tsvector('simple', note));
+CALL kingres.convert_partition('tpv.rf', 'tpv.rf_a');
+ERROR:  conversion_refused: tpv.rf_a has the index tpv.rf_a_gin (access method gin: columnar tables have B-tree indexes only)
+DROP INDEX tpv.rf_a_gin;
+CREATE INDEX rf_a_gist ON tpv.rf_a USING gist (box(point(id, id), point(id, id)));
+CALL kingres.convert_partition('tpv.rf', 'tpv.rf_a');
+ERROR:  conversion_refused: tpv.rf_a has the index tpv.rf_a_gist (access method gist: columnar tables have B-tree indexes only)
+DROP INDEX tpv.rf_a_gist;
+ALTER TABLE tpv.rf_a ADD CONSTRAINT rf_a_excl EXCLUDE USING btree (id WITH =);
+CALL kingres.convert_partition('tpv.rf', 'tpv.rf_a');
+ERROR:  conversion_refused: tpv.rf_a has the index tpv.rf_a_excl (an exclusion constraint: columnar tables cannot have one)
+ALTER TABLE tpv.rf_a DROP CONSTRAINT rf_a_excl;
+ALTER TABLE tpv.rf_a ADD CONSTRAINT rf_a_dpk PRIMARY KEY (id) DEFERRABLE;
+CALL kingres.convert_partition('tpv.rf', 'tpv.rf_a');
+ERROR:  conversion_refused: tpv.rf_a has the index tpv.rf_a_dpk (deferrable: a columnar table checks a unique key when the row goes in)
+ALTER TABLE tpv.rf_a DROP CONSTRAINT rf_a_dpk;
+CREATE UNIQUE INDEX rf_a_inv ON tpv.rf_a (id);
+UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'tpv.rf_a_inv'::regclass;
+CALL kingres.convert_partition('tpv.rf', 'tpv.rf_a');
+ERROR:  conversion_refused: tpv.rf_a has the index tpv.rf_a_inv (not valid: it is not complete)
+DROP INDEX tpv.rf_a_inv;
+ALTER TABLE tpv.rf ADD CONSTRAINT rf_dk UNIQUE (id, ts) DEFERRABLE;
+CALL kingres.convert_partition('tpv.rf', 'tpv.rf_a');
+ERROR:  conversion_refused: tpv.rf has the index tpv.rf_dk (deferrable: a columnar table checks a unique key when the row goes in)
+ALTER TABLE tpv.rf DROP CONSTRAINT rf_dk;
+CREATE UNIQUE INDEX rf_a_ri ON tpv.rf_a (id);
+ALTER TABLE tpv.rf_a REPLICA IDENTITY USING INDEX rf_a_ri;
+CALL kingres.convert_partition('tpv.rf', 'tpv.rf_a');
+ERROR:  conversion_refused: tpv.rf_a uses an index as its replica identity
+ALTER TABLE tpv.rf_a REPLICA IDENTITY DEFAULT;
+DROP INDEX tpv.rf_a_ri;
 ALTER TABLE tpv.rf ADD CONSTRAINT rf_out_fk FOREIGN KEY (id) REFERENCES tpv.refs (id) NOT VALID;
 CALL kingres.convert_partition('tpv.rf', 'tpv.rf_a');
 ERROR:  conversion_refused: the foreign key rf_out_fk on tpv.rf concerns tpv.rf_a or tpv.rf: columnar tables have no foreign keys
@@ -982,7 +1043,7 @@ SELECT part, am FROM tpv.methods('tpv.cpol') WHERE am = 'columnar';
 (6 rows)
 
 -- a partition that cannot be converted is skipped and the run goes on; the check says so
-CREATE INDEX cpol_dev_idx ON tpv.cpol_p20260307 (dev);
+CREATE INDEX cpol_dev_idx ON tpv.cpol_p20260307 USING hash (dev);
 \o /dev/null
 CALL kingres.timepart_run('tpv.cpol', '2026-03-11 12:00 UTC');
 \o
@@ -993,15 +1054,15 @@ SELECT * FROM tp.last_run('tpv', 'cpol');
 (1 row)
 
 SELECT * FROM tpv.actions('cpol') WHERE kind = 'convert';
-  kind   |      part      |  state  |                                                         detail                                                         
----------+----------------+---------+------------------------------------------------------------------------------------------------------------------------
- convert | cpol_p20260307 | skipped | conversion_refused: tpv.cpol_p20260307 has the index tpv.cpol_dev_idx: columnar tables have no indexes in this version
+  kind   |      part      |  state  |                                                                detail                                                                
+---------+----------------+---------+--------------------------------------------------------------------------------------------------------------------------------------
+ convert | cpol_p20260307 | skipped | conversion_refused: tpv.cpol_p20260307 has the index tpv.cpol_dev_idx (access method hash: columnar tables have B-tree indexes only)
 (1 row)
 
 SELECT problem, left(detail, 150) FROM kingres.timepart_check('1 hour', '2026-03-11 12:00 UTC') WHERE table_name = 'cpol';
      problem     |                                                                   left                                                                    
 -----------------+-------------------------------------------------------------------------------------------------------------------------------------------
- convert_blocked | partitions that could not be converted: cpol_p20260307 (conversion_refused: tpv.cpol_p20260307 has the index tpv.cpol_dev_idx: columnar )
+ convert_blocked | partitions that could not be converted: cpol_p20260307 (conversion_refused: tpv.cpol_p20260307 has the index tpv.cpol_dev_idx (access me)
 (1 row)
 
 DROP INDEX tpv.cpol_dev_idx;
@@ -1183,6 +1244,226 @@ SELECT count(*) AS pow_rows FROM tpv.cpow;
  pow_rows 
 ----------
       100
+(1 row)
+
+------------------------------------------------------------------------
+-- 8. A table with indexes: every kind that a columnar table may have, both ways
+------------------------------------------------------------------------
+CREATE FUNCTION tpv.indexes(rel regclass) RETURNS SETOF text LANGUAGE sql STABLE AS $$
+    SELECT ic.relname || ' | '
+           || regexp_replace(pg_get_indexdef(i.indexrelid), '^CREATE (UNIQUE )?INDEX \S+ ON \S+ ', 'CREATE \1INDEX ON ')
+           || ' | ' || coalesce((SELECT k.contype::text || ':' || k.conname FROM pg_constraint k WHERE k.conindid = i.indexrelid AND k.conrelid = i.indrelid), '-')
+           || ' | ' || coalesce(obj_description(i.indexrelid, 'pg_class'), '-')
+           || ' | ' || coalesce((SELECT obj_description(k.oid, 'pg_constraint') FROM pg_constraint k WHERE k.conindid = i.indexrelid AND k.conrelid = i.indrelid), '-')
+           || ' | parent:' || coalesce((SELECT pc.relname FROM pg_inherits h JOIN pg_class pc ON pc.oid = h.inhparent WHERE h.inhrelid = i.indexrelid), '-')
+      FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid
+     WHERE i.indrelid = rel ORDER BY 1
+$$;
+CREATE TABLE tpv.ix (id int, ts timestamptz NOT NULL, a int, b text, c numeric,
+                     PRIMARY KEY (id, ts), CONSTRAINT ix_uq UNIQUE (b, ts)) PARTITION BY RANGE (ts);
+CREATE INDEX ix_plain ON tpv.ix (a);
+CREATE INDEX ix_multi ON tpv.ix (a, b, ts);
+CREATE INDEX ix_expr ON tpv.ix ((lower(b)), a);
+CREATE INDEX ix_part ON tpv.ix (a) WHERE c > 10;
+CREATE INDEX ix_incl ON tpv.ix (a) INCLUDE (c);
+CREATE INDEX ix_desc ON tpv.ix (c DESC NULLS FIRST, id);
+CREATE UNIQUE INDEX ix_uq_expr ON tpv.ix ((upper(b)), ts);
+CREATE UNIQUE INDEX ix_uq_nnd ON tpv.ix (b, ts) NULLS NOT DISTINCT;
+COMMENT ON INDEX tpv.ix_plain IS 'the plain index';
+COMMENT ON CONSTRAINT ix_uq ON tpv.ix IS 'the unique key';
+CREATE TABLE tpv.ix_a PARTITION OF tpv.ix FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+CREATE TABLE tpv.ix_b PARTITION OF tpv.ix FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
+-- an index of the partition that the parent does not have
+CREATE INDEX ix_a_own ON tpv.ix_a (c, a);
+COMMENT ON INDEX tpv.ix_a_own IS 'the own index';
+INSERT INTO tpv.ix SELECT i, '2026-01-01 UTC'::timestamptz + (i % 28) * interval '1 day' + (i % 86400) * interval '1 second',
+       i % 50, 'b' || i, CASE WHEN i % 9 = 0 THEN NULL ELSE i % 40 END FROM generate_series(1, 6000) i;
+INSERT INTO tpv.ix SELECT i, '2026-02-01 UTC'::timestamptz + (i % 27) * interval '1 day' + (i % 86400) * interval '1 second',
+       i % 50, 'b' || i, i % 40 FROM generate_series(10001, 10500) i;
+SELECT tpv.digest('tpv.ix') AS ix_digest \gset
+SELECT tpv.digest('tpv.ix_a') AS ix_a_digest \gset
+CREATE TABLE tpv.ix_copy AS TABLE tpv.ix_a;
+CREATE TEMP TABLE ix_before AS SELECT x FROM tpv.indexes('tpv.ix_a') x;
+SELECT count(*) AS indexes_before FROM ix_before;
+ indexes_before 
+----------------
+             11
+(1 row)
+
+CALL kingres.convert_partition('tpv.ix', 'tpv.ix_a');
+SELECT * FROM tpv.methods('tpv.ix');
+ part |    am    |                            bounds                             
+------+----------+---------------------------------------------------------------
+ ix_a | columnar | FROM ('2026-01-01 00:00:00+00') TO ('2026-02-01 00:00:00+00')
+ ix_b | heap     | FROM ('2026-02-01 00:00:00+00') TO ('2026-03-01 00:00:00+00')
+(2 rows)
+
+-- the same indexes, with the same names, kinds, comments and parents
+SELECT x AS only_after FROM tpv.indexes('tpv.ix_a') x WHERE x NOT IN (SELECT x FROM ix_before)
+UNION ALL SELECT 'only before: ' || x FROM ix_before WHERE x NOT IN (SELECT x FROM tpv.indexes('tpv.ix_a') x);
+ only_after 
+------------
+(0 rows)
+
+SELECT count(*) AS indexes_after FROM tpv.indexes('tpv.ix_a');
+ indexes_after 
+---------------
+            11
+(1 row)
+
+SELECT tpv.digest('tpv.ix_a') = :'ix_a_digest' AS partition_same_rows, tpv.digest('tpv.ix') = :'ix_digest' AS table_same_rows;
+ partition_same_rows | table_same_rows 
+---------------------+-----------------
+ t                   | t
+(1 row)
+
+SELECT count(*) AS leftover_names FROM pg_class WHERE relname LIKE '%\_\_kc%' AND relnamespace = 'tpv'::regnamespace;
+ leftover_names 
+----------------
+              0
+(1 row)
+
+SELECT count(*) AS check_indexes_rows FROM kingres.columnar_check_indexes('tpv.ix_a');
+ check_indexes_rows 
+--------------------
+                  0
+(1 row)
+
+-- the indexes serve the queries, and answer as the heap did
+SET enable_seqscan = off; SET enable_bitmapscan = off;
+SELECT count(*) AS by_pk FROM tpv.ix WHERE id = 5 AND ts >= '2026-01-01' AND ts < '2026-02-01';
+ by_pk 
+-------
+     1
+(1 row)
+
+SELECT count(*) AS by_plain FROM tpv.ix_a WHERE a = 7;
+ by_plain 
+----------
+      120
+(1 row)
+
+SELECT id FROM tpv.ix_a WHERE b = 'b12' ORDER BY ts LIMIT 1;
+ id 
+----
+ 12
+(1 row)
+
+SELECT count(*) AS by_expr FROM tpv.ix_a WHERE lower(b) = 'b100';
+ by_expr 
+---------
+       1
+(1 row)
+
+SELECT count(*) AS by_partial FROM tpv.ix_a WHERE a = 7 AND c > 10;
+ by_partial 
+------------
+         81
+(1 row)
+
+SELECT (SELECT count(*) FROM tpv.ix_a WHERE a = 7) = (SELECT count(*) FROM tpv.ix_copy WHERE a = 7) AS same_as_heap_twin;
+ same_as_heap_twin 
+-------------------
+ t
+(1 row)
+
+RESET enable_seqscan; RESET enable_bitmapscan;
+-- uniqueness is enforced on the columnar partition
+INSERT INTO tpv.ix SELECT id, ts, 1, 'dupcheck', 1 FROM tpv.ix_a WHERE id = 5;
+ERROR:  duplicate key value violates unique constraint "ix_a_pkey"
+DETAIL:  Key (id, ts)=(5, 2026-01-06 00:00:05+00) already exists.
+INSERT INTO tpv.ix SELECT 999999, ts, 1, b, 1 FROM tpv.ix_a WHERE b = 'b1';
+ERROR:  duplicate key value violates unique constraint "ix_a_b_ts_key"
+DETAIL:  Key (b, ts)=(b1, 2026-01-02 00:00:01+00) already exists.
+SELECT count(*) AS rows_after_refused_inserts FROM tpv.ix_a;
+ rows_after_refused_inserts 
+----------------------------
+                       6000
+(1 row)
+
+-- the columnar partition refuses ON CONFLICT (kingres_columnar)
+INSERT INTO tpv.ix VALUES (999998, '2026-01-06 UTC', 1, 'oc', 1) ON CONFLICT DO NOTHING;
+ERROR:  INSERT ... ON CONFLICT is not supported on columnar tables: a speculative insertion would have to take a row back
+-- and back
+CALL kingres.convert_partition('tpv.ix', 'tpv.ix_a', 'heap');
+SELECT * FROM tpv.methods('tpv.ix');
+ part |  am  |                            bounds                             
+------+------+---------------------------------------------------------------
+ ix_a | heap | FROM ('2026-01-01 00:00:00+00') TO ('2026-02-01 00:00:00+00')
+ ix_b | heap | FROM ('2026-02-01 00:00:00+00') TO ('2026-03-01 00:00:00+00')
+(2 rows)
+
+SELECT x AS only_after FROM tpv.indexes('tpv.ix_a') x WHERE x NOT IN (SELECT x FROM ix_before)
+UNION ALL SELECT 'only before: ' || x FROM ix_before WHERE x NOT IN (SELECT x FROM tpv.indexes('tpv.ix_a') x);
+ only_after 
+------------
+(0 rows)
+
+SELECT tpv.digest('tpv.ix_a') = :'ix_a_digest' AS back_same_rows;
+ back_same_rows 
+----------------
+ t
+(1 row)
+
+INSERT INTO tpv.ix VALUES (999998, '2026-01-06 UTC', 1, 'oc', 1) ON CONFLICT DO NOTHING;
+DELETE FROM tpv.ix WHERE id = 999998;
+-- a partition without its own index, with the unique key of the parent only, by the policy
+CALL kingres.convert_old_partitions('tpv.ix', '2026-03-01 UTC');
+SELECT * FROM tpv.methods('tpv.ix');
+ part |    am    |                            bounds                             
+------+----------+---------------------------------------------------------------
+ ix_a | columnar | FROM ('2026-01-01 00:00:00+00') TO ('2026-02-01 00:00:00+00')
+ ix_b | columnar | FROM ('2026-02-01 00:00:00+00') TO ('2026-03-01 00:00:00+00')
+(2 rows)
+
+SELECT count(*) AS indexes_b FROM tpv.indexes('tpv.ix_b');
+ indexes_b 
+-----------
+        10
+(1 row)
+
+SELECT tpv.digest('tpv.ix') = :'ix_digest' AS table_same_rows;
+ table_same_rows 
+-----------------
+ t
+(1 row)
+
+-- a duplicate found while the unique index is built fails the conversion,
+-- with the server's message, and leaves the old partition
+CREATE FUNCTION tpv.fold(t text) RETURNS text LANGUAGE sql IMMUTABLE
+    AS $$ SELECT CASE WHEN current_setting('tpv.fold', true) = 'on' THEN lower(t) ELSE t END $$;
+CREATE TABLE tpv.dp (id int, ts timestamptz NOT NULL, b text) PARTITION BY RANGE (ts);
+CREATE UNIQUE INDEX dp_fold ON tpv.dp ((tpv.fold(b)), ts);
+CREATE TABLE tpv.dp_a PARTITION OF tpv.dp FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+INSERT INTO tpv.dp VALUES (1, '2026-01-02', 'Same'), (2, '2026-01-02', 'same'), (3, '2026-01-03', 'other');
+SELECT tpv.digest('tpv.dp_a') AS dp_digest \gset
+SET tpv.fold = 'on';
+CALL kingres.convert_partition('tpv.dp', 'tpv.dp_a');
+ERROR:  could not create unique index "dp_a__kc_1"
+DETAIL:  Key (tpv.fold(b), ts)=(same, 2026-01-02 00:00:00+00) is duplicated.
+RESET tpv.fold;
+SELECT * FROM tpv.methods('tpv.dp');
+ part |  am  |                            bounds                             
+------+------+---------------------------------------------------------------
+ dp_a | heap | FROM ('2026-01-01 00:00:00+00') TO ('2026-02-01 00:00:00+00')
+(1 row)
+
+SELECT tpv.digest('tpv.dp_a') = :'dp_digest' AS dp_unchanged;
+ dp_unchanged 
+--------------
+ t
+(1 row)
+
+SELECT count(*) AS dp_indexes FROM tpv.indexes('tpv.dp_a');
+ dp_indexes 
+------------
+          1
+(1 row)
+
+SELECT count(*) AS leftovers FROM pg_class WHERE relname LIKE '%\_\_kc%';
+ leftovers 
+-----------
+         0
 (1 row)
 
 -- The owner drives its own run, from its own session (timepart_grant_driver),

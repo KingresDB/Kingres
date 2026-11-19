@@ -704,6 +704,19 @@ partition as it was, and no trace of the new one):
 4. `INSERT INTO <partition>__kc (<every stored column>) SELECT ... FROM
    <partition> ORDER BY <sort_by>`: the columns are listed one by one, no
    default is evaluated, and it reads with a plain scan.
+4b. The indexes: every index of the old partition (the parent's, and the
+   partition's own), made on the new table **after the load** with a plain
+   `CREATE INDEX`, or `ALTER TABLE ... ADD CONSTRAINT` for a primary key and a
+   unique constraint, from the definition the server gives
+   (`pg_get_indexdef`, `pg_get_constraintdef`), under temporary names; never
+   `CONCURRENTLY`, never `CLUSTER`. No index entry is carried over: the rows have
+   new numbers and the index is built from them. The attach in step 7 then finds
+   an equal index for each index of the parent and builds nothing under the lock
+   on the parent. After the old partition is dropped the indexes and
+   constraints get its names back, with their comments. A unique index that
+   finds a duplicate while it is built fails the conversion with the server's
+   message (`could not create unique index ...`, with the key), and the old
+   partition stays. Converting back to heap does the same.
 5. The check that the copy is whole: both tables have the same number of
    rows, or the transaction fails with `verification_failed`. (The design also
    compares the rows of `columnar_info`; a columnar table writes its stripes
@@ -717,7 +730,11 @@ partition as it was, and no trace of the new one):
    sees the old partition or the new one, never neither and never both.
 8. The commit; then, in a transaction of its own, the result is written to the
    history (`bytes_after`, rows, time) and the new partition is analyzed
-   (`ANALYZE`; a failure of it is a warning, autovacuum does it later).
+   (`ANALYZE`; a failure of it is a warning). A `VACUUM` of the new partition is
+   not done here: PostgreSQL does not allow `VACUUM` inside a function or a
+   procedure (`VACUUM cannot be executed from a function`), so a driver that wants
+   one (the scheduler of the control plane) issues it as a statement of its own
+   after the conversion, and autovacuum does it otherwise.
 
 **Locks and how long a session waits.**
 
@@ -773,22 +790,39 @@ silently:
   publication, is used by a view or materialized view, or is referenced by a
   foreign key;
 * for `columnar`, what that access method refuses (`kingres_columnar` README,
-  "What is refused"): **an index on the partition or a partitioned index on the
-  table** (the error names it; columnar tables have no indexes in this
-  version, so a table meant to get columnar partitions has no index on the
-  parent and creates its time index on each heap partition, and a primary key
-  or unique constraint, which is an index, refuses the conversion), a foreign
-  key on or to the partition or the table, an `AFTER ROW` trigger on the
-  partition or the table, a publication that would include the partition
-  (`FOR ALL TABLES`, a schema, the table);
+  "What is refused" and "B-tree indexes"):
+  * **an index that is not a B-tree with immediate checking**, on the table
+    (its partitioned index) or on the partition: another access method (hash,
+    GiST, GIN, BRIN, SP-GiST), an exclusion constraint, a deferrable primary key
+    or unique constraint, an invalid index; the error names the index and the
+    reason. A B-tree index of any other kind is carried over: plain,
+    multi-column, expression, partial, `INCLUDE`, `DESC`, `NULLS FIRST`,
+    unique (also `NULLS NOT DISTINCT`), primary key and unique constraint (they
+    are per partition: the partition key is in the key of the parent's);
+  * **an extension still at 0.1**: the new table would be made by
+    `kingres_columnar` 0.1, of file format 2, which cannot have an index, so a
+    table with indexes is refused until `ALTER EXTENSION kingres_columnar UPDATE`
+    (a table the new extension makes is format 3); a table without indexes is
+    converted either way;
+  * a foreign key on or to the partition or the table, an `AFTER ROW` trigger
+    on the partition or the table, a publication that would include the
+    partition (`FOR ALL TABLES`, a schema, the table);
+* a replica identity that uses an index (any target);
 * a sort column that is not a column of the partition, an empty `sort_by`,
   options that are not valid (the keys and ranges of `columnar_options`
   above), or options with `heap`;
 * a name conflict: a table named `<partition>__kc` exists (`name_conflict`).
 
-A refused index is not dropped. Nothing is made from the indexes of a heap
-partition: convert only partitions that have none, or drop the index yourself
-when you decide that its loss is right.
+A refused index is not dropped: drop it yourself when you decide that its loss
+is right, or leave the partition in heap storage.
+
+**What a columnar partition does with them.** `INSERT ... ON CONFLICT` into a
+columnar partition that has an index is refused by `kingres_columnar` itself
+(`INSERT ... ON CONFLICT is not supported on columnar tables`): the speculative
+insert needs a row lock and a take-back that a columnar row cannot give. A
+plain `INSERT` that makes a duplicate of a unique key fails as on a heap table.
+`UPDATE` and `DELETE` are refused as before. Index scans and ordered index scans
+work, bitmap and index-only scans do not (`kingres_columnar` README).
 
 **Who may convert.** The owner of the table (it must own the partition too),
 in its own session, or a superuser. The conversion copies rows through the
@@ -926,10 +960,13 @@ not edited: `kingres_timepart--0.1.sql` is as it was.
 - Partitions are owned by the role that created them; the owner of the table
   needs `CREATE` on the schema of the table.
 - A schema rename orphans the policies of its tables.
-- A conversion needs a partition that has no index, foreign key, row trigger,
-  rule, view or publication of the kinds listed in "Conversion" (until
-  `kingres_columnar` has indexes), and the owner of the table owns the
-  partition. A table with distributed partitions is not converted.
+- A conversion needs a partition that has no hash, GiST, GIN, BRIN or SP-GiST
+  index, exclusion constraint, deferrable unique key, foreign key, row trigger,
+  rule, view or publication of the kinds listed in "Conversion", and the owner
+  of the table owns the partition. A table with distributed partitions is not
+  converted. A partition with indexes needs about twice the time of the copy
+  alone (the indexes are built from the new rows), and room for the indexes of
+  both tables until the swap.
 - A conversion is tried once per run and not retried; a partition that is
   written through the parent at every attempt is not converted (`timepart_check`
   says `convert_blocked`).
@@ -1044,6 +1081,12 @@ The design is `kingres/docs/design/analytics-phase12-storage.md`, section 4.4 an
       policy path records each partition and goes on.
     - The policy's `columnar_options` is checked when the policy is set: the keys
       of `kingres.columnar_set_options` and their ranges.
+17. Indexes (the round after T2, `kingres_columnar` 0.2): a conversion carries
+    every B-tree index with immediate checking; see "Conversion". The indexes of
+    the new table are built after the load with plain `CREATE INDEX` (a
+    constraint with `ADD CONSTRAINT`), under temporary names, before the swap, so
+    that the attach finds them; a `VACUUM` of the new partition is not made by
+    the extension (not allowed in a function).
 
 ## Tests
 
@@ -1052,11 +1095,11 @@ The design is `kingres/docs/design/analytics-phase12-storage.md`, section 4.4 an
 `timepart_retention`, `timepart_names`, `timepart_hostile`, `timepart_security`, `timepart_history` (who
 sees the history, renamed roles and tables, owner changes, dropped roles),
 `timepart_privilege` (the code of a table owner while a superuser runs the
-maintenance), `timepart_forged` (policy and history rows shaped by hand, the seal), `timepart_owner_code` (the refusal, what the acknowledgement gives away, the owner's own session), `timepart_convert` (conversion to columnar and back, every refusal with its message, a copy that loses rows, who may convert, hostile names and search paths, the policy path), `timepart_drop` (`DROP EXTENSION` and `CREATE EXTENSION`, also where
+maintenance), `timepart_forged` (policy and history rows shaped by hand, the seal), `timepart_owner_code` (the refusal, what the acknowledgement gives away, the owner's own session), `timepart_convert` (conversion to columnar and back, every kind of index and every refusal with its message, a duplicate found while an index is built, a copy that loses rows, who may convert, hostile names and search paths, the policy path), `timepart_drop` (`DROP EXTENSION` and `CREATE EXTENSION`, also where
 the user has objects of the same names), and `upgrade` (0.1 to 0.2 against a new installation of 0.2)).
 `timepart_convert` needs `kingres_columnar` in the installation and preloaded
 (`kingres_timepart.conf` does it; for a build outside the tree, install
-`kingres_columnar` first). Every one passes an `as_of` time; none reads the clock. `t/` holds the TAP tests:
+`kingres_columnar` 0.2 first). Every one passes an `as_of` time; none reads the clock. `t/` holds the TAP tests:
 `001_locks.pl` (a long transaction holding the parent, readers and writers,
 one run per table, a role that holds advisory locks, a foreign key), `002_interrupt.pl` (a backend killed and the server
 crashed in the middle of a run, then repeated), `003_dump_restore.pl`

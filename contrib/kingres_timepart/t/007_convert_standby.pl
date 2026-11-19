@@ -36,7 +36,8 @@ ALTER DATABASE postgres SET search_path = public;
 ALTER DATABASE postgres SET timezone = 'UTC';
 });
 $primary->safe_psql('postgres', q{
-CREATE TABLE ev (id bigint, ts timestamptz NOT NULL, dev int, payload text) PARTITION BY RANGE (ts);
+CREATE TABLE ev (id bigint, ts timestamptz NOT NULL, dev int, payload text, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+CREATE INDEX ev_dev ON ev (dev, id);
 SELECT kingres.create_time_partitions('ev', '1 day', '2026-03-03 UTC', '2026-03-01 UTC');
 INSERT INTO ev SELECT i, '2026-03-01 UTC'::timestamptz + (i % 3) * interval '1 day' + (i % 86400) * interval '1 second',
        i % 11, md5(i::text) || repeat('z', i % 30)
@@ -107,7 +108,12 @@ is($s, $base, '2: and the standby has every row');
 is($s, $p, '2: the rows and stripes of the columnar partition are the same on the standby');
 ($p, $s) = both(digest_sql('ev_p20260301'));
 is($s, $p, '2: and the rows of that partition');
-($p, $s) = both(q{SELECT count(*) FROM pg_class WHERE relname LIKE '%\_\_kc'});
+($p, $s) = both(q{SELECT count(*) || ':' || string_agg(DISTINCT c.relname, ',') FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid WHERE c.relname = 'ev_p20260301'});
+is($s, $p, '2: the indexes of the partition are on the standby');
+is($s, '2:ev_p20260301', '2: and they are two');
+($p, $s) = both(q{SET enable_seqscan = off; SET enable_bitmapscan = off; SELECT count(*) || ':' || sum(id) FROM ev_p20260301 WHERE id BETWEEN 100 AND 200 OR dev = 3});
+is($s, $p, '2: an index scan of the columnar partition gives the same on the standby');
+($p, $s) = both(q{SELECT count(*) FROM pg_class WHERE relname LIKE '%\_\_kc%'});
 is("$p|$s", '0|0', '2: no stray table on either');
 
 # ---- 3. Back to heap, and by the policy.

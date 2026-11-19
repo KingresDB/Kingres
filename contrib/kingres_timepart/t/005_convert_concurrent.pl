@@ -52,7 +52,8 @@ ALTER DATABASE postgres SET timezone = 'UTC';
 # is big enough for the copy to take a moment.
 my $N = 1000000;
 $node->safe_psql('postgres', qq{
-CREATE TABLE ev (id bigint, ts timestamptz NOT NULL, dev int, payload text) PARTITION BY RANGE (ts);
+CREATE TABLE ev (id bigint, ts timestamptz NOT NULL, dev int, payload text, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+CREATE INDEX ev_dev ON ev (dev, id);
 SELECT kingres.create_time_partitions('ev', '1 day', '2026-03-03 UTC', '2026-03-01 UTC');
 INSERT INTO ev
 SELECT i, '2026-03-01 UTC'::timestamptz + (i % 86400) * interval '1 second',
@@ -165,6 +166,16 @@ sub back_to_heap
 is(methods(), 'ev_p20260301:heap,ev_p20260302:heap,ev_p20260303:heap', 'start: three heap partitions');
 my $convert = q{CALL kingres.convert_partition('ev', 'ev_p20260301', 'columnar')};
 
+sub indexes_of
+{
+	my ($part) = @_;
+	return q1(qq{SELECT string_agg(d, ' ; ' ORDER BY d) FROM (
+		SELECT regexp_replace(pg_get_indexdef(i.indexrelid), 'INDEX [^ ]+ ON [^ ]+ ', 'INDEX ON ') AS d
+		FROM pg_index i WHERE i.indrelid = '$part'::regclass) x});
+}
+my $ix_before = indexes_of('ev_p20260301');
+like($ix_before, qr/PRIMARY|UNIQUE/, 'start: the partition has a unique index and another');
+
 # ---- 1. A writer that names the partition waits, then goes on against the new one.
 my $conv = spawn($convert . ";\n");
 wait_for(copying_sql('ev_p20260301'), 'the copy to start');
@@ -185,7 +196,10 @@ is(q1(q{SELECT a.amname FROM ev e JOIN pg_class c ON c.oid = e.tableoid JOIN pg_
 	'columnar', '1: and it is in the columnar partition');
 is(digest_of('ev'), expected(), '1: count and checksum of every row are those of the rows inserted');
 is(strays(), '0', '1: no stray table');
+is(indexes_of('ev_p20260301'), $ix_before, '1: the same indexes');
+is(q1(q{SELECT count(*) FROM kingres.columnar_check_indexes('ev_p20260301')}), '0', '1: and they have an entry for every row');
 back_to_heap();
+is(indexes_of('ev_p20260301'), $ix_before, '1: and the same indexes back in heap');
 is(digest_of('ev'), expected(), '1: and back to heap, the same rows');
 
 # ---- 2. A writer through the parent: the swap gives way, the row is kept, the next attempt converts it.
@@ -311,6 +325,8 @@ q1(qq{CALL kingres.timepart_run('ev', $asof, '{convert}')});
 is(methods(), 'ev_p20260301:columnar,ev_p20260302:heap,ev_p20260303:heap', '7: the next run converts');
 is(digest_of('ev'), expected(), '7: the same rows');
 is(q1(q{SELECT kingres.columnar_check_clean()}), 't', 'the columnar files and the stripe catalog are clean');
+is(indexes_of('ev_p20260301'), $ix_before, 'the converted partition has the indexes of the parent');
+is(q1(q{SET enable_seqscan = off; SELECT count(*) FROM ev WHERE id = 9000001}), '1', 'a unique index finds the row of the writer');
 
 $node->stop;
 done_testing();

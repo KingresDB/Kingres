@@ -46,7 +46,8 @@ CREATE ROLE reader NOLOGIN;
 # p1 is small and is converted at every step; p2 is big, for the crash in the
 # middle of the copy.
 $node->safe_psql('postgres', q{
-CREATE TABLE ev (id bigint, ts timestamptz NOT NULL, dev int, payload text) PARTITION BY RANGE (ts);
+CREATE TABLE ev (id bigint, ts timestamptz NOT NULL, dev int, payload text, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+CREATE INDEX ev_dev ON ev (dev, id);
 SELECT kingres.create_time_partitions('ev', '1 day', '2026-03-03 UTC', '2026-03-01 UTC');
 INSERT INTO ev SELECT i, '2026-03-01 UTC'::timestamptz + (i % 86400) * interval '1 second', i % 9, md5(i::text)
   FROM generate_series(1, 30000) i;
@@ -76,6 +77,12 @@ sub am_of
 {
 	my ($part) = @_;
 	return q1(qq{SELECT a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.relname = '$part'});
+}
+
+sub nindexes
+{
+	my ($part) = @_;
+	return q1(qq{SELECT count(*) FROM pg_index i WHERE i.indrelid = '$part'::regclass});
 }
 
 sub strays
@@ -153,6 +160,8 @@ sub old_state
 	is(digest_of('ev_p20260301'), $base1, "$what: with every row");
 	is(digest_of('ev'), $base, "$what: and the table has every row");
 	is(strays(), '0', "$what: no stray table");
+	is(nindexes('ev_p20260301'), '2', "$what: with its two indexes");
+	is(q1(q{SELECT count(*) FROM pg_class WHERE relname LIKE '%\_\_kc%'}), '0', "$what: and no stray index");
 	is(q1(q{SELECT count(*) FROM pg_inherits WHERE inhparent = 'ev'::regclass}), '3', "$what: three partitions");
 	is(q1(q{SELECT count(*) || ':' || coalesce(max(obj_description(oid, 'pg_class')), '') FROM pg_class WHERE relname = 'ev_p20260301'}),
 		'1:the first day', "$what: one table of that name, with its comment");
@@ -171,6 +180,8 @@ for my $n (1 .. $K)
 	# a rerun finishes
 	q1($convert);
 	is(am_of('ev_p20260301'), 'columnar', "after the crash before statement $n: the rerun converts");
+	is(nindexes('ev_p20260301'), '2', "after the crash before statement $n: with its two indexes");
+	is(q1(q{SELECT count(*) FROM kingres.columnar_check_indexes('ev_p20260301')}), '0', "after the crash before statement $n: and every row is in them");
 	is(digest_of('ev_p20260301'), $base1, "after the crash before statement $n: with every row");
 	is(q1(q{SELECT kingres.columnar_check_clean()}), 't', "after the crash before statement $n: clean");
 	q1(q{CALL kingres.convert_partition('ev', 'ev_p20260301', 'heap')});
@@ -220,6 +231,8 @@ for my $n (1 .. $K)
 	is(q1(q{SELECT kingres.columnar_check_clean()}), 't', 'after commit: clean');
 	is(q1(q{SELECT i.rows FROM kingres.columnar_info('ev_p20260301') i}), q1(q{SELECT count(*) FROM ev_p20260301}),
 		'after commit: the rows of the stripes are the rows of the partition');
+	is(nindexes('ev_p20260301'), '2', 'after commit: with its two indexes');
+	is(q1(q{SELECT count(*) FROM kingres.columnar_check_indexes('ev_p20260301')}), '0', 'after commit: and every row is in them');
 	q1(q{CALL kingres.convert_partition('ev', 'ev_p20260301', 'heap')});
 }
 

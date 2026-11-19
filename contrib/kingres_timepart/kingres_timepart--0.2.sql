@@ -3197,7 +3197,7 @@ BEGIN
         RETURN format('access method "%s" is not supported: convert to columnar or to heap', p_target);
     END IF;
 
-    SELECT c.relkind, c.relpersistence, c.relowner, c.relhassubclass,
+    SELECT c.relkind, c.relpersistence, c.relowner, c.relhassubclass, c.relreplident,
            c.relrowsecurity, c.relnamespace, a.amname,
            pg_get_expr(c.relpartbound, c.oid) AS bound
       INTO v_c
@@ -3220,6 +3220,9 @@ BEGIN
     v_cur := kingres.timepart__am_kind(v_c.amname);
     IF v_cur = v_kind THEN
         RETURN format('%s is already stored with the access method "%s"', v_pn, v_c.amname);
+    END IF;
+    IF v_c.relreplident = 'i' THEN
+        RETURN format('%s uses an index as its replica identity', v_pn);
     END IF;
     IF v_c.relpersistence <> 'p' THEN
         RETURN format('%s is a temporary or unlogged table', v_pn);
@@ -3308,18 +3311,39 @@ BEGIN
     IF v_kind = 'columnar' THEN
         -- What a columnar table cannot have (kingres_columnar README, "What
         -- is refused"), found before the attach would fail on it.
-        SELECT format('%s', i.indexrelid::pg_catalog.regclass::text) INTO v_x
-          FROM pg_index i WHERE i.indrelid = p_parent
-         ORDER BY i.indexrelid LIMIT 1;
-        IF v_x IS NOT NULL THEN
-            RETURN format('%s has the index %s, and the columnar partition would need a matching index: columnar tables have no indexes in this version',
-                          v_parn, v_x);
-        END IF;
-        SELECT format('%s', i.indexrelid::pg_catalog.regclass::text) INTO v_x
-          FROM pg_index i WHERE i.indrelid = p_part
-         ORDER BY i.indexrelid LIMIT 1;
-        IF v_x IS NOT NULL THEN
-            RETURN format('%s has the index %s: columnar tables have no indexes in this version', v_pn, v_x);
+        -- Indexes: a B-tree with immediate checking can be on a columnar
+        -- table (kingres_columnar 0.2: plain, multi-column, expression,
+        -- partial, INCLUDE, DESC, NULLS FIRST, unique, primary key, unique
+        -- constraint); the parent's indexes are looked at first, then the
+        -- partition's own.
+        FOR v_s IN SELECT unnest(ARRAY[p_parent, p_part])::text LOOP
+            SELECT format('%s (%s)', i.indexrelid::pg_catalog.regclass::text,
+                          CASE WHEN am.amname <> 'btree'
+                                    THEN 'access method ' || am.amname || ': columnar tables have B-tree indexes only'
+                               WHEN i.indisexclusion
+                                    THEN 'an exclusion constraint: columnar tables cannot have one'
+                               WHEN NOT i.indimmediate
+                                    THEN 'deferrable: a columnar table checks a unique key when the row goes in'
+                               ELSE 'not valid: it is not complete' END)
+              INTO v_x
+              FROM pg_index i
+              JOIN pg_class ic ON ic.oid = i.indexrelid
+              JOIN pg_am am ON am.oid = ic.relam
+             WHERE i.indrelid = v_s::pg_catalog.oid
+               AND (am.amname <> 'btree' OR i.indisexclusion OR NOT i.indimmediate
+                    OR NOT i.indisvalid OR NOT i.indisready)
+             ORDER BY i.indexrelid LIMIT 1;
+            IF v_x IS NOT NULL THEN
+                RETURN format('%s has the index %s', v_s::pg_catalog.oid::pg_catalog.regclass::text, v_x);
+            END IF;
+        END LOOP;
+        IF EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid IN (p_parent, p_part)) THEN
+            -- A new table made by an extension still at 0.1 is of file format
+            -- 2, which cannot have an index.
+            SELECT e.extversion INTO v_x FROM pg_extension e WHERE e.extname = 'kingres_columnar';
+            IF string_to_array(coalesce(v_x, '0.1'), '.')::int[] < ARRAY[0, 2] THEN
+                RETURN format('the table has indexes and the new partition would be made by kingres_columnar %s (file format 2, written by 0.1), which cannot have an index: run ALTER EXTENSION kingres_columnar UPDATE', coalesce(v_x, '0.1'));
+            END IF;
         END IF;
         SELECT format('%I on %s', k.conname, k.conrelid::pg_catalog.regclass::text) INTO v_x
           FROM pg_constraint k
@@ -3402,6 +3426,13 @@ $$;
 --   4. The check: the two tables have the same number of rows, or the block
 --      fails with verification_failed and nothing has happened.
 --   5. The privileges of the old partition on the new one.
+--   5b. The indexes of the old partition (every index: the parent's, matched
+--      by the attach below, and the partition's own), made on the new table
+--      with plain CREATE INDEX or ADD CONSTRAINT after the load, under
+--      temporary names; the old names are given to them after the old
+--      partition is dropped.  The attach finds an equal index for each index
+--      of the parent and builds nothing under the strong lock.  A duplicate
+--      found by a unique index fails the conversion with the server's message.
 --   6. The swap: no wait at all if a session that holds the parent waits for
 --      the partition (a cycle); else a short wait (the smaller of 500 ms and
 --      half of deadlock_timeout) for ACCESS EXCLUSIVE on the parent, then detach,
@@ -3437,6 +3468,12 @@ DECLARE
     v_opts    record;
     v_swap    integer;
     v_dl      integer;
+    v_ix      jsonb := '[]';
+    v_ixr     record;
+    v_ixn     integer := 0;
+    v_ixtmp   text;
+    v_ixpre   text;
+    v_ixstmt  text;
     v_body    text;
     i         integer;
 BEGIN
@@ -3520,6 +3557,41 @@ BEGIN
         SELECT NULL::text AS o_compression, NULL::integer AS o_level,
                NULL::integer AS o_stripe, NULL::integer AS o_chunk INTO v_opts;
     END IF;
+    -- The indexes of the partition, as statements for the new table.
+    FOR v_ixr IN
+        SELECT i.indexrelid, ic.relname AS iname, i.indisunique, k.oid AS conoid, k.conname,
+               pg_get_indexdef(i.indexrelid) AS d,
+               obj_description(i.indexrelid, 'pg_class') AS idesc,
+               obj_description(k.oid, 'pg_constraint') AS cdesc
+          FROM pg_index i
+          JOIN pg_class ic ON ic.oid = i.indexrelid
+          LEFT JOIN pg_constraint k ON k.conindid = i.indexrelid AND k.conrelid = p_part
+                                   AND k.contype IN ('p', 'u')
+         WHERE i.indrelid = p_part
+         ORDER BY i.indexrelid
+    LOOP
+        v_ixn := v_ixn + 1;
+        v_ixtmp := left(v_tmp, 55) || '_' || v_ixn;
+        IF v_ixr.conoid IS NULL THEN
+            v_ixpre := 'CREATE ' || CASE WHEN v_ixr.indisunique THEN 'UNIQUE ' ELSE '' END
+                       || 'INDEX ' || quote_ident(v_ixr.iname) || ' ON '
+                       || format('%I.%I', v_schema, v_pname) || ' USING ';
+            IF left(v_ixr.d, length(v_ixpre)) <> v_ixpre THEN
+                RAISE EXCEPTION 'conversion_refused: cannot read the definition of the index %: %',
+                    quote_ident(v_ixr.iname), v_ixr.d USING ERRCODE = '0A000';
+            END IF;
+            v_ixstmt := 'CREATE ' || CASE WHEN v_ixr.indisunique THEN 'UNIQUE ' ELSE '' END
+                        || 'INDEX ' || quote_ident(v_ixtmp) || ' ON '
+                        || format('%I.%I', v_schema, v_tmp) || ' USING '
+                        || substr(v_ixr.d, length(v_ixpre) + 1);
+        ELSE
+            v_ixstmt := 'ALTER TABLE ' || format('%I.%I', v_schema, v_tmp) || ' ADD CONSTRAINT '
+                        || quote_ident(v_ixtmp) || ' ' || pg_get_constraintdef(v_ixr.conoid);
+        END IF;
+        v_ix := v_ix || jsonb_build_array(jsonb_build_object(
+            'create', v_ixstmt, 'tmp', v_ixtmp, 'name', v_ixr.iname, 'con', v_ixr.conname,
+            'idesc', v_ixr.idesc, 'cdesc', v_ixr.cdesc));
+    END LOOP;
     -- A writer of the partition holds the parent in ROW EXCLUSIVE while it
     -- waits for our lock on the partition, and we wait for the parent: a
     -- cycle that only a timeout breaks.  The wait is below the deadlock
@@ -3549,6 +3621,7 @@ DECLARE
     v_columnar boolean := %18$s;
     v_part_oid oid := %19$s;
     v_parent_oid oid := %20$s;
+    v_ix       jsonb := %21$L;
     v_prev_lt  text := pg_catalog.current_setting('lock_timeout');
     v_owner    oid;
     v_old_cnt  bigint;
@@ -3590,6 +3663,14 @@ BEGIN
         RAISE EXCEPTION 'verification_failed: %% has %% rows, its copy has %%',
             v_part, v_old_cnt, v_new_cnt USING ERRCODE = 'KT001';
     END IF;
+
+    -- the indexes, after the load, with plain CREATE INDEX (under the lock of
+    -- the partition, so the rows cannot change); a duplicate fails here
+    FOR r IN SELECT x ->> 'create' AS stmt
+               FROM pg_catalog.jsonb_array_elements(v_ix) WITH ORDINALITY t(x, n) ORDER BY n
+    LOOP
+        EXECUTE r.stmt;
+    END LOOP;
 
     -- the privileges of the old partition, table and column level
     FOR r IN SELECT DISTINCT x.grantee
@@ -3653,6 +3734,28 @@ BEGIN
              || pg_catalog.quote_ident(v_old_name)
              || ' DROP CONSTRAINT ' || pg_catalog.quote_ident(v_check);
     END IF;
+    -- the names, and the comments, of the indexes and constraints
+    FOR r IN SELECT x FROM pg_catalog.jsonb_array_elements(v_ix) t(x)
+    LOOP
+        IF r.x ->> 'con' IS NOT NULL THEN
+            EXECUTE 'ALTER TABLE ' || pg_catalog.quote_ident(v_schema) || '.'
+                 || pg_catalog.quote_ident(v_old_name) || ' RENAME CONSTRAINT '
+                 || pg_catalog.quote_ident(r.x ->> 'tmp') || ' TO ' || pg_catalog.quote_ident(r.x ->> 'con');
+            IF r.x ->> 'cdesc' IS NOT NULL THEN
+                EXECUTE 'COMMENT ON CONSTRAINT ' || pg_catalog.quote_ident(r.x ->> 'con') || ' ON '
+                     || pg_catalog.quote_ident(v_schema) || '.' || pg_catalog.quote_ident(v_old_name)
+                     || ' IS ' || pg_catalog.quote_literal(r.x ->> 'cdesc');
+            END IF;
+        ELSE
+            EXECUTE 'ALTER INDEX ' || pg_catalog.quote_ident(v_schema) || '.'
+                 || pg_catalog.quote_ident(r.x ->> 'tmp') || ' RENAME TO ' || pg_catalog.quote_ident(r.x ->> 'name');
+        END IF;
+        IF r.x ->> 'idesc' IS NOT NULL THEN
+            EXECUTE 'COMMENT ON INDEX ' || pg_catalog.quote_ident(v_schema) || '.'
+                 || pg_catalog.quote_ident(coalesce(r.x ->> 'con', r.x ->> 'name'))
+                 || ' IS ' || pg_catalog.quote_literal(r.x ->> 'idesc');
+        END IF;
+    END LOOP;
     PERFORM pg_catalog.set_config('lock_timeout', v_prev_lt, true);
 END
 $tpl$,
@@ -3662,7 +3765,7 @@ $tpl$,
         v_schema, v_pname, p_target, v_cols, v_order, v_bound_cl, v_bound,
         v_check, v_tblspc, v_opts.o_compression, v_opts.o_level,
         v_opts.o_stripe, v_opts.o_chunk, v_swap, (v_kind = 'columnar')::text,
-        p_part::oid, p_parent::oid);
+        p_part::oid, p_parent::oid, v_ix::text);
     RETURN ARRAY[format('DO %L', v_body)];
 END;
 $$;

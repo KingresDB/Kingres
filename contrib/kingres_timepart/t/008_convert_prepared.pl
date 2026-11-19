@@ -37,7 +37,8 @@ ALTER DATABASE postgres SET search_path = public;
 ALTER DATABASE postgres SET timezone = 'UTC';
 });
 $node->safe_psql('postgres', q{
-CREATE TABLE ev (id bigint, ts timestamptz NOT NULL, dev int, payload text) PARTITION BY RANGE (ts);
+CREATE TABLE ev (id bigint, ts timestamptz NOT NULL, dev int, payload text, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+CREATE INDEX ev_dev ON ev (dev);
 SELECT kingres.create_time_partitions('ev', '1 day', '2026-03-03 UTC', '2026-03-01 UTC');
 INSERT INTO ev SELECT i, '2026-03-01 UTC'::timestamptz + (i % 3) * interval '1 day' + (i % 86400) * interval '1 second',
        i % 11, md5(i::text)
