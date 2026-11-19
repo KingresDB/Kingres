@@ -2578,3 +2578,36 @@ No change of the on-disk format, the catalog or the WAL beyond C6a.
 For the conversion of partitions in `kingres_timepart`: the refusal of a partition whose parent has
 an index can be lifted for B-tree indexes that are not unique once the conversion creates them on
 the new table; unique indexes of the parent wait for C6c.
+
+### C6c, unique indexes and index vacuum (2026-11-19)
+
+- **The unique check** of a B-tree asks the access method for each candidate TID with a dirty
+  snapshot; the answer is the state of the row number in the stripe catalog alone: a superseded
+  version holds nothing, a version of this transaction or a committed one is a row, a version of a
+  transaction in progress means "wait for its id", a dead one is nothing. A row still in a buffer of
+  the same backend is found there by its number. The claim of every writer is its reserved catalog
+  row, so another backend finds it.
+- **A lock of the reservation.** Between taking row numbers from the metapage and inserting the
+  claim, an index vacuum must not read the metapage and the catalog, or it would call entries of a
+  number no range covers dead. Writers hold a lock of an advisory class in a shared mode across
+  that gap; the index vacuum holds it exclusively while it reads. No writer waits for another
+  transaction inside the gap, so the lock is never part of a deadlock; a waiter on a key waits on
+  the writer's transaction id, never on this lock or a catalog row.
+- **Index vacuum** removes entries whose number lies below the lowest number of a running or own
+  version and in no live stripe range, then cleans up the index; `INDEX_CLEANUP off` is respected.
+  An index file does not shrink, as for a heap table; what goes is its entries.
+- **Refused**: exclusion constraints, deferrable unique constraints, every `ON CONFLICT` on a
+  columnar table with an index (speculative insertion needs a row lock), and a foreign key that
+  references a columnar table.
+- **`kingres.columnar_check_indexes(rel)`** reports a visible row that an index lacks; an index of
+  more than 50 million entries is not checked.
+- **Not done**: the return of the row numbers of aborted writers (a mistake there is a duplicate
+  TID; the cost is that workloads which roll back large buffers use the number space faster), and a
+  fetch that decodes only the columns a plan reads (the interface does not say which).
+- **For `kingres_timepart`**: a partition of a parent with unique or non-unique B-tree indexes,
+  primary keys included, can be converted when its file is of format 3 and no constraint is
+  deferrable or an exclusion; the conversion must create the indexes on the new table before the
+  swap, and rows get new numbers. Foreign keys stay refused.
+- On 6 million rows of random text (217 MB columnar, 669 MB heap): an index build took 4.6 s
+  against 5.8 s for heap; a point lookup 4.7 ms against 0.6 ms; a range of one percent by the index
+  43 ms against 42 ms (indicative, a shared machine).
