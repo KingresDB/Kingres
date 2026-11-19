@@ -140,7 +140,8 @@ func TestARoundIsNotSentForAGroupReleasedInTheMiddleOfAPass(t *testing.T) {
 	r.m.c.Source = fakeSource{Topology{Groups: []int32{1, 2}, Members: []string{"a", "b", "c"}}}
 	rv := &recordingVoter{fakeVoter: r.voter}
 	r.m.c.Voter = rv
-	r.m.Renew(ctx) // both groups held
+	r.m.Renew(ctx)   // both groups held
+	r.m.fl.waitAll() // the requests of that round to the last grantor are over before the count below starts
 	_ = r.inst.StopImmediate(ctx)
 	released := make(chan error, 1)
 	rv.onFirstGrant = func() {

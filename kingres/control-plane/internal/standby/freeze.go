@@ -104,14 +104,22 @@ func (a *Agent) FreezeBy(group int32, ttl time.Duration, task, epoch int64) erro
 
 // Unfreeze lifts the freeze of a group.
 func (a *Agent) Unfreeze(group int32) {
-	_ = a.UnfreezeBy(group, 0, 0)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.frozen, group)
+	delete(a.frozenBy, group)
+	_ = a.persistLocked()
 }
 
-// UnfreezeBy lifts the freeze for the run (task, epoch); a lower epoch of the task that holds it is refused.
+// UnfreezeBy lifts the freeze for the run (task, epoch). It lifts only a freeze of its own task (F3-14): a late call
+// of another task, or a call of task 0, and a lower epoch of the task that holds the freeze are refused.
 func (a *Agent) UnfreezeBy(group int32, task, epoch int64) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if own, ok := a.frozenBy[group]; ok && task != 0 && own.Task == task && epoch < own.Epoch {
+	if task == 0 {
+		return ErrStaleFreeze
+	}
+	if own, ok := a.frozenBy[group]; ok && (own.Task != task || epoch < own.Epoch) {
 		return ErrStaleFreeze
 	}
 	delete(a.frozen, group)

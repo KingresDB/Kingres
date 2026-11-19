@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.11.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.12.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and `kingres-cli`. Lint it and run the mechanical rule check with:
 
 ```
@@ -317,6 +317,33 @@ Where the architecture document leaves something open, the simplest option was c
     range and the cluster's replica count.
 
 ## Changelog
+
+### 0.12.0
+
+Revision written with the fixes for the review of the manual failover and the map group (kingresd). Summary for the panel:
+0 operations added (132 operations, 108 paths); one value added to an enum, one optional property added to a schema, the text of one
+state corrected; **no change that is not additive**.
+
+#### Breaking
+
+None.
+
+#### Additive
+
+- `FailoverReportSummary.outcome` has the value `completedWithWarnings`: every group was moved, and something that never fails a
+  step was left undone or needs reading (a standby that could not be pointed at the new primary, a list of synchronous standbys that is
+  still empty, prepared transactions that remain, an incident of `check_cluster`, a skipped call). A client that knows `completed`
+  only must show it like `completed` and offer the report.
+- `Problem.plan` (`FailoverPlan`, optional): present only on 409 `failover_needs_decision`; it is the plan that `dryRun` would answer, so
+  that the console shows the groups, the candidates and the verdict of the refusal without a second request.
+
+#### Documentation
+
+- `FailoverOldPrimary.state` `notScheduled`: the text said that this revision does not rebuild the old primary. It does (the states
+  `rebuildScheduled`, `rebuilding` and `standby` exist); `notScheduled` is now the record of an earlier revision and of a group whose
+  old primary has no directory to rebuild.
+- A failover and the creation or drop of a database, or the distribution of a table, exclude each other (409
+  `failover_in_progress` for the database operations, `operation_in_progress` for the failover); the web console shows the message.
 
 ### 0.11.0
 

@@ -333,7 +333,7 @@ handlers in `internal/httpapi/handlers_config.go`, wiring in `cmd/kingresd/confi
 
 ## What is implemented
 
-The server implements revision **0.11.0** of the contract (132 operations, 108
+The server implements revision **0.12.0** of the contract (132 operations, 108
 paths; what is not done is in "Not done in this increment"). "Real" means the operation works against PostgreSQL or the local node
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
@@ -2941,6 +2941,69 @@ group lease is held: the primary instance was started" and the following reads w
 clock was not involved. Fix: `Manager.Fence` marks the group as being fenced until its stop has ended and `acquired` does not start the
 instance while it is (the marker stays, the next round starts it); `TestARoundThatWinsTheLeaseDuringAFenceStartsTheInstanceAfterTheStop`. The
 subtest also waits for the lease to be freshly held before it steps the clock.
+
+## Fixes for the independent review F3-01 to F3-16 (2026-11-18, contract 0.12.0)
+
+The review is `kingres/docs/reviews/2026-11-18-kingresd-failover-increment-3.md`. Done, each with a test that fails without it (the mutants
+are listed in the report of the round):
+
+- **F3-01** `lease.Manager.Unadopt` refuses an adoption that is attached (it guards a promoted primary) and returns false; the handler of
+  `POST /failover/lease` with role `release` answers `{held: true}` then. A failed task (`OnFail`) can no longer make the lease of a promoted
+  primary run out when the leader's own server is the new primary. Cluster test `TestFailoverFailedTaskKeepsTheLeaseOfThePromotedPrimary` (the
+  failure is injected after the promotion with the fault `failoverPoint`, mode `fail`); unit test `TestUnadoptRefusesAnAttachedAdoption`.
+- **F3-02, F3-12** `GroupFacts.PrimaryPlanned` (migration 0018, `group_replication_state.planned_standbys`, filled by the leader's check from
+  `PrimaryStatus.Planned`, which the primary's agent reports from the plan it holds) is what the leader knows of an old server that does not answer.
+  `Preflight` refuses (409 `cluster_inconsistent`) a failover of such a server without proof that its plan carried a standby, unless the request
+  says `allowDataLoss`; `dryRun` shows it as a blocker. `GET /failover/state` reports `enforced`. The other half of the finding (a lease that
+  fences regardless of the plan) is **not** done. Cluster test `TestFailoverRefusedWhenFencingOfTheOldPrimaryIsUnproven`.
+- **F3-03** `failover.UnobservedAge`: the age of the last check is lowered only by the silence that a majority of the members share, and only by
+  what exceeds the lease and its margin (the leader asks the other members with `GET /liveness`). Unit test `TestUnobservedAgeSubtractsOnlyWhatAMajorityDidNotHear`,
+  cluster test `TestFailoverVerdictIsNotNoneWhenOnlyTheLeaderLostTheServer`.
+- **F3-04** the request refuses a database whose catalog lacks the old primary (host and port), as it already did for the standbys; migration 0016
+  makes a failover and `database.create`, `database.drop` and `table.distribute` exclude each other (KX006 for the failover, KX007 for the database
+  operations; `task.excluded`, `MemStore`); a failure of `targets` after the promotion is a pause (`targetsPause`), never a failed task. Tests:
+  `TestADatabaseWithoutTheOldPrimaryRefusesTheFailover`, `TestADatabaseThatAppearsAfterThePromotionPausesTheTask`,
+  `TestAFailoverAndDatabaseChangesExcludeEachOther` (PostgreSQL), cluster test `TestFailoverExcludesDatabaseCreationAndPausesAfterThePromotion`.
+- **F3-05** `promoteAction`: a role file `primary` on an instance still in recovery is a promotion to finish, not `not_standby`.
+- **F3-06** `choose` keeps a pin whose standby can be read (the accepted verdict is not recomputed for another one) and withdraws a pin whose
+  standby cannot be read while nothing is promoted.
+- **F3-07** F2 stops a live old primary only after one ready standby was read in recovery (`someStandbyReadable`).
+- **F3-08** `promote` answers 409 `lease_not_held` when `Attach` fails (both paths).
+- **F3-09** the client entry point reads the catalog from another server (`GET /catalog/nodes`) when its own cannot be read. Cluster test
+  `TestFailoverEntryPointOfTheFailedOverServerForwards`.
+- **F3-10** F7 and F11 run `recover_prepared_transactions()` and `check_cluster()` in every database that has a catalog (`Catalog.RecoverPrepared(ctx, db)`).
+- **F3-11** a standby found out of recovery that this task did not pin pauses the task (alert `splitPromotion`) and is adopted only with
+  `allowDataLoss`, with a recorded verdict `possible`; the summary counts a promoted group without a verdict as a possible loss.
+- **F3-13** `group` must be in the body of `lease`, `demote`, `promote` and `prepared`; `demote` and `promote` need the fence header and are
+  refused with 503 when the callee cannot read its catalog term. Cluster test `TestFailoverCalleeRefusesUnfencedAndUnnamedCalls`.
+- **F3-14** an unfreeze lifts only a freeze of its own task; `OnFail` sends its own task with the highest epoch.
+- **F3-15** the outcome `completedWithWarnings` (migration 0017, contract 0.12.0) when a step recorded a skipped standby, a pending list, remaining
+  prepared transactions or an incident.
+- **F3-16** the test list: the cluster tests above cover a live old primary only through F3-09, the leader's server as the new primary (F3-01), a
+  failure after F6 (F3-01, F3-04), a database created during a failover (F3-04). Not covered: a lagging standby, a second failover while one
+  is paused, a lost answer of any call, a kill of the instance with the writers still running (the old tests stop the instance cleanly).
+
+Also fixed in this round: **the renewal rounds of the lease manager left requests in flight.** A round ends when a majority answered; the request to
+the last grantor was still on its way and could reach the grantor after a release (`ReleaseGroup` waited for the round, not for its stragglers: the
+claim of FO-13 was not true) and could write into a test's directory after the test ended. `internal/lease/flights.go` counts the requests of
+rounds, releases and transfers per group; `ReleaseGroup` waits for those of its group, and the rig of the tests waits for all before its directories are
+removed. This was a defect of the lease code (the intermittent `TestAReleaseWaitsForTheRenewalInFlight`) and of two tests that counted requests
+of the round before (`TestARoundIsNotSentForAGroupReleasedInTheMiddleOfAPass`). The `TempDir RemoveAll cleanup: ... not empty` that remains on Windows
+when the whole package runs (and never when a test runs alone, 40 of 40) is the outside-process problem of this machine, not a writer of ours.
+Two cluster tests read once where the state is in motion and took a 503 as final (`topology` right after the formation, `GET /tasks/{id}` on a
+restarted leader that has not found itself again): the 503 with `Retry-After` is the answer of the product (a member that does not know the manager
+leader says so, a server whose instance is starting says so), so the helpers wait for 200 within a bound.
+
+Fault injection for the tests (never in a product's configuration): `fault.Spec.FailoverPoint` and `FailoverMode` (`fail` or `pause`) fail or pause the
+failover task at `<step name>:before`.
+
+## The map group (increment 5 of ha-phase5-part2.md): what exists, and what does not
+
+Only the journal exists: `internal/failover/journal` is the local file `<data-dir>/failover/map-journal.json` (atomic and durable after every step,
+steps B1 to B8, the pin written once, events, `Gate()` for `task.Options.Gate`), with its tests. **Not built:** the bootstrap B1 to B8 itself, the
+candidate monitors, the closing of the engine gate by the journal in `main.go`, the pause of the old rebalance, the recorded task and the
+pseudo task with id 0, the escrow of the certificate authority (`POST /pki/escrow`), the tests T5, T5b, T6, T6b and T6c. `Preflight` still refuses the
+map group with 422 `unsupported_operation`.
 
 ## The signing keys of the ledger (phase 7, steps 3 and 4, contract 0.11.0)
 

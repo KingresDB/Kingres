@@ -120,7 +120,7 @@ func TestFreezeCallsValidateAndApply(t *testing.T) {
 	if g := a.FrozenGroups(); len(g) != 1 || g[0] != 3 {
 		t.Fatalf("FrozenGroups = %v", g)
 	}
-	if _, err := a.handleFreezeCall(ctx, CallUnfreeze, []byte(`{"group":3}`)); err != nil || a.isFrozen(3) {
+	if _, err := a.handleFreezeCall(ctx, CallUnfreeze, []byte(`{"group":3,"task":9,"epoch":2}`)); err != nil || a.isFrozen(3) {
 		t.Fatalf("unfreeze: %v", err)
 	}
 	if _, err := a.handleFreezeCall(ctx, CallStandbysGone, []byte(`{"server":""}`)); err == nil {

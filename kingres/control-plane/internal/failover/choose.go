@@ -223,3 +223,26 @@ func judge(in ChooseInput, c Choice) (string, string) {
 func Accepts(verdict string, allowDataLoss bool) bool {
 	return verdict == VerdictNone || allowDataLoss
 }
+
+// UnobservedAge is the age of the leader's last check of a group, corrected for a primary that the leader did not hear
+// (F3-03). The leader's own silence is not the server's death: a leader that is cut off from a server that still serves
+// its clients would then say "no loss" for a window in which the primary ran unobserved. The age is lowered only by what
+// a MAJORITY of the members agree they have not heard from the server (silences are the silence each member that answered
+// reports, the leader's own included; members is the number of members), and then only by what exceeds the lease: a
+// primary that lost the lease with the majority stops acting within lease+margin of the last renewal, so the window in
+// which it can have acknowledged commits unobserved is at most that long. Without a majority of answers, or when the
+// majority's silence does not exceed the lease, the age is the plain age.
+func UnobservedAge(plain time.Duration, silences []time.Duration, members int, lease, margin time.Duration) time.Duration {
+	need := members/2 + 1
+	if members <= 0 || len(silences) < need {
+		return plain
+	}
+	s := append([]time.Duration(nil), silences...)
+	sort.Slice(s, func(i, j int) bool { return s[i] > s[j] }) // longest silence first
+	majority := s[need-1]                                     // the longest silence that need members share
+	cut := majority - lease - margin
+	if cut <= 0 || cut >= plain {
+		return plain
+	}
+	return plain - cut
+}

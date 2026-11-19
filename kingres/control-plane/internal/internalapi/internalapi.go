@@ -140,6 +140,7 @@ var Calls = map[string]Policy{
 	"GET /failover/position":       AnyPeer,
 	"GET /liveness":                AnyPeer,
 	"GET /failover/state":          LeaderOnly,
+	"GET /catalog/nodes":           AnyPeer,
 	"POST /failover/freeze":        LeaderOnly,
 	"POST /failover/unfreeze":      LeaderOnly,
 	"POST /failover/standbys-gone": LeaderOnly,
@@ -192,7 +193,7 @@ var handled = map[string]bool{
 	"POST /pki/renew": true, "GET /pki/csr": true,
 	"POST /heartbeat": true, "POST /lease/grant": true, "GET /lease/state": true, "POST /standby/plan": true,
 	"POST /standby/create": true, "POST /standby/remove": true, "POST /standby/rebuild": true, "GET /standby/status": true,
-	"GET /failover/position": true, "GET /liveness": true, "GET /failover/state": true, "POST /failover/freeze": true,
+	"GET /failover/position": true, "GET /liveness": true, "GET /catalog/nodes": true, "GET /failover/state": true, "POST /failover/freeze": true,
 	"POST /failover/unfreeze": true, "POST /failover/standbys-gone": true,
 	"POST /failover/lease": true, "POST /failover/demote": true, "POST /failover/promote": true, "POST /failover/prepared": true, "POST /standby/repoint": true,
 	"POST /ledger/key/install": true, "POST /ledger/key/remove": true, "POST /ledger/key/list": true,
@@ -201,6 +202,10 @@ var handled = map[string]bool{
 	"POST /ledger/read": true, "POST /ledger/publication/get": true,
 	"POST /config/state": true, "POST /config/apply": true, "POST /config/check": true, "POST /config/restart": true, "GET /time": true,
 }
+
+// fenceRequired are the destructive calls of the failover: they are accepted from the leader only with the fence
+// header of a task run (F3-13).
+var fenceRequired = map[string]bool{"POST /failover/demote": true, "POST /failover/promote": true}
 
 // CallError is an error with the status and code the internal API answers.
 type CallError struct {
@@ -496,6 +501,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					fail(w, http.StatusForbidden, "not_leader", "Only the manager leader may make this call.")
 					return
 				}
+			}
+			// F3-13: a call that stops or promotes an instance names the run it is made for; one without the header is
+			// refused (a caller that holds the leader's certificate, or a defect, must not stop a primary without a run).
+			if r.Header.Get(fence.Header) == "" && fenceRequired[key] && s.be.Fence != nil {
+				fail(w, http.StatusBadRequest, "bad_request", "The call must carry the fence header of the task run it is made for.")
+				return
 			}
 			// The caller is the leader: the task run it makes the call for is fenced.
 			if hdr := r.Header.Get(fence.Header); hdr != "" && s.be.Fence != nil {

@@ -8,11 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fence"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
 )
 
@@ -62,6 +64,9 @@ type Runner struct {
 	Sleep func(ctx context.Context, d time.Duration) error
 	Now   func() time.Time
 	Fault FaultFunc
+	// Inject is the failure hook of the tests (nil in the product): at "<step name>:before" it answers "fail" (the step fails with
+	// a code that is not retried) or "pause" (the task pauses), or "" for nothing.
+	Inject func(point string) string
 
 	// The bounds. Each is named, none is derived from a hard-coded formula in a step.
 	FreezeTTL          time.Duration // the freeze of a group; renewed by every step that relies on it (default 5 min)
@@ -238,6 +243,14 @@ func (r *Runner) step(name string, group int32, key string, irreversible bool, f
 		}
 		sc := &stepCtx{r: r, in: in, rows: rows, group: group, key: key, env: env}
 		r.fault(name + ":before")
+		if r.Inject != nil {
+			switch r.Inject(name + ":before") {
+			case "fail":
+				return fail(CodeBadPromoteTarget, false, "a failure injected by a test at %s", name)
+			case "pause":
+				return &PauseError{Reason: "a pause injected by a test at " + name}
+			}
+		}
 		err = f(ctx, env, sc)
 		if err == nil {
 			r.fault(name + ":after")
@@ -367,14 +380,35 @@ func (r *Runner) Preflight(ctx context.Context, in Input) *Refusal {
 			}
 			ready++
 		}
-		if ref := r.registeredEverywhere(ctx, g, recs); ref != nil {
+		var oldNode *Node
+		for _, n := range nodes {
+			if n.Group == g && n.Role == "primary" && n.Host == in.ServerID {
+				n := n
+				oldNode = &n
+			}
+		}
+		if ref := r.registeredEverywhere(ctx, g, recs, oldNode); ref != nil {
 			return ref
 		}
 		// F2-13: an old primary that answers and runs without a watchdog is covered by its lease manager alone (a hung
 		// kingresd could not stop it): the failover does not count it as fenceable and refuses until it has one.
-		if st, err := r.Peers.State(ctx, in.ServerID, g); err == nil && st.Watchdog != nil && !*st.Watchdog && len(st.OutOfRecovery()) > 0 {
+		st, serr := r.Peers.State(ctx, in.ServerID, g)
+		if serr == nil && st.Watchdog != nil && !*st.Watchdog && len(st.OutOfRecovery()) > 0 {
 			return &Refusal{Code: "cluster_inconsistent", Status: 409, Group: &g,
 				Message: fmt.Sprintf("No watchdog runs for the primary of shard group %d on %s, so a hung kingresd there could not stop it.", g, in.ServerID)}
+		}
+		// F3-02, F3-12: a server that does not answer cannot be asked whether its lease would stop its primary. The lease
+		// stops a primary only on a server whose plan says the group has a standby, so the leader asks its own record of
+		// what that server held at the last check; without proof the failover goes on only when the operator accepts it.
+		if errors.Is(serr, ErrUnreachable) && !in.AllowDataLoss {
+			facts, ferr := r.Plan.Facts(ctx, g)
+			if ferr != nil {
+				return &Refusal{Code: "service_unavailable", Status: 503, Message: "The replication facts of the group cannot be read: " + ferr.Error()}
+			}
+			if facts.PrimaryPlanned == 0 {
+				return &Refusal{Code: "cluster_inconsistent", Status: 409, Group: &g,
+					Message: fmt.Sprintf("Server %s does not answer, and the leader has no proof that it knew of a standby of shard group %d at its last check: its lease would then not stop its primary, which clients may still reach. Repeat the request with allowDataLoss set to true to accept that the old primary is not proven fenced.", in.ServerID, g)}
+			}
 		}
 		if ready == 0 {
 			return &Refusal{Code: "no_replica_available", Status: 409, Group: &g, Message: fmt.Sprintf("Shard group %d has no standby that is ready to take over.", g)}
@@ -602,6 +636,15 @@ func (r *Runner) stopOld(ctx context.Context, env *task.Env, sc *stepCtx) error 
 			return fail(CodeSuperseded, false, "server %s runs an older version of kingresd", sc.old())
 		}
 	}
+	// F3-07: a primary that answers is stopped only when a standby that can take over was read just now, whatever the
+	// operator accepted: a stop that is followed by "no candidate" leaves the group down and its old primary held back
+	// by the marker. A promotion that this run made already (an instance of the group is out of recovery on a
+	// standby's server) is not asked again.
+	if ok, err := r.someStandbyReadable(ctx, sc.group); err != nil {
+		return err
+	} else if !ok {
+		return fail(CodeNoCandidate, true, "no standby of shard group %d can be read, so the old primary on %s was not stopped; nothing was changed", sc.group, sc.old())
+	}
 	ans, err := r.Peers.Demote(ctx, sc.old(), DemoteRequest{Group: sc.group, Mode: "immediate", ExpectedTerm: run.ExpectedTerm, TransferTo: r.Plan.Self()})
 	switch {
 	case err == nil:
@@ -786,11 +829,46 @@ func (r *Runner) choose(ctx context.Context, env *task.Env, sc *stepCtx) error {
 		return fail(CodeSplitPromotion, false, "two instances of shard group %d are out of recovery (%s and %s); nothing else is done", sc.group, promoted[0].Server, promoted[1].Server)
 	}
 	if len(promoted) == 1 {
+		if gr.ChosenStandby != promoted[0].ID {
+			// F3-11: nobody pinned this instance: it was promoted by hand (or by a run that is not this one). It may be
+			// behind, may have diverged and may have taken writes, and no verdict exists for it. The request goes on with it
+			// only when the operator accepted a loss; the pause names it.
+			msg := fmt.Sprintf("the standby of shard group %d on %s was promoted outside this failover; it may be behind or may have diverged", sc.group, promoted[0].Server)
+			if !sc.in.AllowDataLoss {
+				r.Plan.Alert(ctx, "splitPromotion", "critical", fmt.Sprintf("group:%d", sc.group), "Instance promoted outside the failover: "+promoted[0].Server, true)
+				return &PauseError{Reason: "The failover of shard group " + fmt.Sprint(sc.group) + " found that " + msg + ". Repeat the request with allowDataLoss set to true to adopt it, or look at it first."}
+			}
+			dl, _ := json.Marshal(DataLoss{Verdict: VerdictPossible, Message: msg, AsyncDatabases: []string{}, UnreadableServerIDs: []string{}})
+			pinned, _, err := sc.rows.Pin(ctx, sc.group, promoted[0], nil, dl)
+			if err != nil {
+				return err
+			}
+			return sc.afterPin(ctx, pinned)
+		}
 		pinned, _, err := sc.rows.Pin(ctx, sc.group, promoted[0], nil, nil)
 		if err != nil {
 			return err
 		}
 		return sc.afterPin(ctx, pinned)
+	}
+	// F3-06: a pin that this task made before anything was promoted is kept while its standby can be read (the verdict
+	// that was accepted is the one of that choice) and withdrawn when it cannot, so that the choice can be made again.
+	if gr.ChosenStandby != 0 {
+		for _, c := range reads {
+			if c.rec.ID != gr.ChosenStandby {
+				continue
+			}
+			if c.err == nil {
+				return sc.afterPin(ctx, c.rec)
+			}
+			if err := sc.rows.Set(ctx, sc.group, GroupSet{ClearPin: true, State: ptr("fenced")}); err != nil {
+				return err
+			}
+			sc.event(ctx, "pinWithdrawn", map[string]any{"standby": gr.ChosenStandby, "reason": "the standby cannot be read and no instance of the group is out of recovery"})
+			gr.ChosenStandby = 0
+		}
+		// A pin whose standby has no record any more (the group was promoted and the record went in F9) is kept: Pin below
+		// answers the recorded choice.
 	}
 	cands := make([]Candidate, 0, len(reads))
 	for _, c := range reads {
@@ -1142,7 +1220,7 @@ func (r *Runner) targets(ctx context.Context, gr GroupRow, group int32) ([]dbTar
 
 // registeredEverywhere refuses a failover while a ready standby of the group is not a standby of the group in the
 // catalog of some database: promote_node there would not find it.
-func (r *Runner) registeredEverywhere(ctx context.Context, g int32, recs []StandbyRec) *Refusal {
+func (r *Runner) registeredEverywhere(ctx context.Context, g int32, recs []StandbyRec, oldNode *Node) *Refusal {
 	dbs, err := r.Cat.Databases(ctx)
 	if err != nil {
 		return &Refusal{Code: "service_unavailable", Status: 503, Message: "The databases cannot be listed: " + err.Error()}
@@ -1154,6 +1232,20 @@ func (r *Runner) registeredEverywhere(ctx context.Context, g int32, recs []Stand
 		nodes, err := r.Cat.Nodes(ctx, db)
 		if err != nil {
 			return &Refusal{Code: "service_unavailable", Status: 503, Message: "The catalog of database " + db + " cannot be read: " + err.Error()}
+		}
+		// F3-04: the old primary must be in the catalog of every database too, by host and port: `targets` finds the old
+		// node there and a database without it would end the task after the point of no return.
+		if oldNode != nil {
+			found := false
+			for _, n := range nodes {
+				if n.Group == g && n.Host == oldNode.Host && n.Port == oldNode.Port {
+					found = true
+				}
+			}
+			if !found {
+				return &Refusal{Code: "cluster_inconsistent", Status: 409, Group: &g,
+					Message: fmt.Sprintf("The primary of shard group %d (%s:%d) is not in the catalog of database %s.", g, oldNode.Host, oldNode.Port, db)}
+			}
 		}
 		for _, s := range recs {
 			if s.State != "ready" {
@@ -1188,7 +1280,7 @@ func (r *Runner) catalogFollows(ctx context.Context, env *task.Env, sc *stepCtx)
 	}
 	targets, err := r.targets(ctx, gr, sc.group)
 	if err != nil {
-		return err
+		return sc.targetsPause(ctx, err)
 	}
 	var sysOut PromoteOutcome
 	for _, t := range targets {
@@ -1246,7 +1338,7 @@ func (r *Runner) checkCatalog(ctx context.Context, env *task.Env, sc *stepCtx) e
 	}
 	targets, err := r.targets(ctx, gr, sc.group)
 	if err != nil {
-		return err
+		return sc.targetsPause(ctx, err)
 	}
 	for _, t := range targets {
 		for attempt := 0; ; attempt++ {
@@ -1431,13 +1523,17 @@ func (r *Runner) prepared(ctx context.Context, env *task.Env, sc *stepCtx) error
 	if err != nil {
 		return err
 	}
+	dbs := r.catalogDatabases(ctx, sc)
 	deadline := r.now().Add(orDur(r.PreparedWait, 2*time.Minute))
 	for {
-		if err := r.Cat.RecoverPrepared(ctx); err != nil {
-			sc.event(ctx, "recoverPreparedError", map[string]any{"error": err.Error()})
-		}
-		if err := r.Peers.RecoverPrepared(ctx, gr.NewServer, sc.group); err != nil {
-			sc.event(ctx, "recoverPreparedOnNewError", map[string]any{"error": err.Error()})
+		// F3-10: every database has a catalog of its own, and the recovery acts on the catalog of the database it runs in.
+		for _, db := range dbs {
+			if err := r.Cat.RecoverPrepared(ctx, db); err != nil {
+				sc.event(ctx, "recoverPreparedError", map[string]any{"database": db, "error": err.Error()})
+			}
+			if err := r.Peers.RecoverPrepared(ctx, gr.NewServer, sc.group, db); err != nil {
+				sc.event(ctx, "recoverPreparedOnNewError", map[string]any{"database": db, "error": err.Error()})
+			}
 		}
 		st, err := r.Peers.State(ctx, gr.NewServer, sc.group)
 		if err == nil && (st.Prepared == nil || *st.Prepared == 0) {
@@ -1451,10 +1547,19 @@ func (r *Runner) prepared(ctx context.Context, env *task.Env, sc *stepCtx) error
 			return err
 		}
 	}
-	incidents, err := r.Cat.CheckCluster(ctx)
-	if err != nil {
-		sc.event(ctx, "checkClusterError", map[string]any{"error": err.Error()})
-		return nil
+	var incidents []Incident
+	for _, db := range dbs {
+		ins, err := r.Cat.CheckCluster(ctx, db)
+		if err != nil {
+			sc.event(ctx, "checkClusterError", map[string]any{"database": db, "error": err.Error()})
+			continue
+		}
+		for _, in := range ins {
+			if db != SystemDB {
+				in.Message = "database " + db + ": " + in.Message
+			}
+			incidents = append(incidents, in)
+		}
 	}
 	var rep []IncidentOut
 	loss := false
@@ -1529,6 +1634,14 @@ func (r *Runner) report(ctx context.Context, env *task.Env, sc *stepCtx) error {
 			outcome = "partial"
 		}
 	}
+	// F3-15: steps that never fail say what they could not do; the outcome carries it to the operator.
+	if outcome == "completed" {
+		if warned, err := sc.rows.Warned(ctx); err != nil {
+			return err
+		} else if warned {
+			outcome = "completedWithWarnings"
+		}
+	}
 	return sc.rows.Finish(ctx, outcome, "")
 }
 
@@ -1542,7 +1655,8 @@ func (r *Runner) OnFail(abandon func(ctx context.Context, taskID int64, outcome,
 			return
 		}
 		for _, g := range in.Groups {
-			_ = r.Peers.Unfreeze(ctx, in.ServerID, g)
+			// The task is over: its freeze is lifted whatever epoch holds it (F3-14: only a freeze of this task is lifted).
+			_ = r.Peers.Unfreeze(fence.With(ctx, fence.Token{Task: t.ID, Epoch: math.MaxInt64}), in.ServerID, g)
 			// The fence adoption is not renewed any more: it runs out at the grantors.
 			_, _ = r.Peers.Lease(ctx, r.Plan.Self(), LeaseRequest{Group: g, Role: LeaseRelease})
 		}
@@ -1562,4 +1676,51 @@ func (r *Runner) OnFail(abandon func(ctx context.Context, taskID int64, outcome,
 			}
 		}
 	}
+}
+
+// catalogDatabases lists the databases that have a catalog (the system database first); a list that cannot be read
+// is the system database alone, with an event, so that the step still looks where it always looked.
+func (r *Runner) catalogDatabases(ctx context.Context, sc *stepCtx) []string {
+	dbs, err := r.Cat.Databases(ctx)
+	if err != nil || len(dbs) == 0 {
+		if err != nil {
+			sc.event(ctx, "databasesUnreadable", map[string]any{"error": err.Error()})
+		}
+		return []string{SystemDB}
+	}
+	return dbs
+}
+
+// targetsPause is what a step does when the nodes of the group cannot be resolved in the catalog of every database after
+// the promotion (F3-04): nothing is failed there. The point of no return has passed and the promoted instance holds the
+// lease; the task waits for the operator (a database that is being created or dropped, a catalog that cannot be read) and
+// the repeated request runs the step again. An error of the context is the engine's.
+func (sc *stepCtx) targetsPause(ctx context.Context, err error) error {
+	if ctx.Err() != nil || errors.Is(err, ErrLeaseLost) {
+		return err
+	}
+	sc.r.Plan.Alert(ctx, "failoverBlocked", "critical", subjectOf(sc.group, sc.old()), "The catalogs cannot be followed: "+err.Error(), true)
+	return &PauseError{Reason: "The catalogs of shard group " + fmt.Sprint(sc.group) + " cannot be moved to the promoted standby yet (" + err.Error() +
+		"). The group was promoted and holds the lease; repair what the message names, then repeat the request."}
+}
+
+// someStandbyReadable reads the position of every ready standby of the group once and says whether at least one answers
+// and is in recovery (F3-07).
+func (r *Runner) someStandbyReadable(ctx context.Context, group int32) (bool, error) {
+	recs, err := r.Plan.Standbys(ctx, group)
+	if err != nil {
+		return false, err
+	}
+	for _, rec := range recs {
+		if rec.State != "ready" {
+			continue
+		}
+		cctx, cancel := context.WithTimeout(ctx, orDur(r.PositionTimeout, 5*time.Second))
+		p, perr := r.Peers.Position(cctx, rec.Server, group)
+		cancel()
+		if perr == nil && p.InRecovery {
+			return true, nil
+		}
+	}
+	return false, nil
 }

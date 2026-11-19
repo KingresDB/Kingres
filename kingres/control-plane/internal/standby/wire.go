@@ -130,6 +130,9 @@ type PrimaryStatus struct {
 	// NeedsRebuild are the standbys whose slot was lost or dropped: they must be
 	// made again from a base backup.
 	NeedsRebuild []int64 `json:"needsRebuild"`
+	// Planned is the number of standbys of the group in the plan this server holds: a primary whose server holds none is
+	// not stopped by a lapsed lease (F3-02), and the leader records what it was told.
+	Planned int `json:"planned"`
 }
 
 // Status is the answer of GET /standby/status.

@@ -170,7 +170,14 @@ func TestASecondFailoverWhileOneIsPaused(t *testing.T) {
 	leader.Start()
 	until(t, 3*time.Minute, "the restarted leader accepts a sign-in", func() bool { return leader.Login(clustertest.AdminUser, clustertest.AdminPass) })
 	until(t, 5*time.Minute, "the task to pause for a decision", func() bool {
-		body := leader.Expect(200, "GET", fmt.Sprintf("/tasks/%v", id), nil)
+		// A member that has not found the manager leader yet answers 503 with Retry-After (the restarted leader is being elected again): wait.
+		code, body := leader.Do("GET", fmt.Sprintf("/tasks/%v", id), nil, nil)
+		if code == 503 {
+			return false
+		}
+		if code != 200 {
+			t.Fatalf("GET /tasks/%v: status %d %v", id, code, body)
+		}
 		if body["state"] == "done" || body["state"] == "failed" {
 			t.Fatalf("the task ended instead of pausing: %v", body)
 		}

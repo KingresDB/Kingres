@@ -291,7 +291,8 @@ func TestFailoverOfAGroupWhoseServerIsDead(t *testing.T) {
 	// The report names the standby, the terms and the verdict.
 	rep := leader.Expect(200, "GET", fmt.Sprintf("/failover/reports/%v", clustertest.TaskID(resp)), nil)
 	groups, _ := rep["groups"].([]any)
-	if rep["outcome"] != "completed" || len(groups) != 1 {
+	// A dead server leaves an incident (its standby cannot be asked): the outcome says so (F3-15).
+	if (rep["outcome"] != "completed" && rep["outcome"] != "completedWithWarnings") || len(groups) != 1 {
 		t.Fatalf("report: %v", rep)
 	}
 	gr := groups[0].(map[string]any)

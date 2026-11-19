@@ -135,7 +135,7 @@ func (a *Agent) maintainPrimary(ctx context.Context, lp localPrimary) error {
 	frozen := a.isFrozen(g)
 	gone := a.goneServers()
 
-	ps := &PrimaryStatus{Group: g, Streaming: []int64{}, Slots: []SlotStatus{}, NeedsRebuild: []int64{}}
+	ps := &PrimaryStatus{Group: g, Streaming: []int64{}, Slots: []SlotStatus{}, NeedsRebuild: []int64{}, Planned: len(entries)}
 	if err := c.QueryRow(ctx, `SELECT pg_current_wal_flush_lsn()::text`).Scan(&ps.FlushLsn); err != nil {
 		ps.FlushLsn = ""
 	}

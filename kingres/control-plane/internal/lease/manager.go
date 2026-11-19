@@ -138,6 +138,9 @@ type Manager struct {
 	// given up, so that a renewal sent before the release cannot be received by a grantor after it (FO-13).
 	rmu sync.Mutex
 
+	// fl counts the renewal requests that are on their way to a grantor (flights.go).
+	fl flights
+
 	// starting is set while the instance is being started after the lease was won;
 	// the start runs beside the renewal rounds, so that the lease is renewed while
 	// PostgreSQL starts or recovers. wg tracks it (tests wait on it).
@@ -336,7 +339,9 @@ func (m *Manager) round(ctx context.Context, group int32, members []string) {
 	}
 	results := make(chan vote, len(members))
 	for _, s := range members {
+		m.fl.add(group)
 		go func() {
+			defer m.fl.done(group)
 			if s == m.c.Self {
 				r, err := m.c.Grantor.Grant(group, m.c.Self, m.c.Duration, false)
 				results <- vote{s, err == nil && r.Granted, r}

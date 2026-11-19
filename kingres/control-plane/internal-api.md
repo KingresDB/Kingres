@@ -385,10 +385,11 @@ Types: `cmd/kingresd/ha_failover.go`, `internal/standby/freeze.go`. A `GET` carr
 | Call | Answer |
 |---|---|
 | `GET /failover/position?group=<g>` (any peer) | `{server, group, instanceId, role, inRecovery, timeline, receiveLsn, replayLsn, receiverState, systemIdentifier, catalogTerm}` of the instance of this server whose role file names the group (a standby in preference); `receiveLsn` is the flushed WAL position (the received one in recovery, the current flush position of a primary), `catalogTerm` is `null` when the instance has no catalog or it cannot be read. `404 no_instance` when this server runs no instance of the group, `503 unavailable` when it cannot be read. Read-only. |
+| `GET /catalog/nodes` (any peer) | `[{ID, Group, Host, Port, Primary, Active}]`: the rows of `kingres.node` of the system catalog as the answering server reads them. The client entry point of a server that can no longer read its own catalog (its only primary was failed over and is held back) asks the other servers with it, so that it forwards to the ring instead of resetting the connection (F3-09). |
 | `GET /liveness` (any peer) | `{server, peers: [{server, state: live\|suspect\|dead\|unknown, silenceMs}]}`: the heartbeat tracker of the answering server; a failover asks every server to corroborate a death. |
 | `GET /failover/state?group=<g>` (leader) | `{server, group, instances: [{id, port, role, origin, group, term, running, inRecovery}], holds, leaseState, adopted, attached, relinquished, frozen, catalogTerm, preparedTransactions, destination}`: what this server knows of the group; a task that is not sure what its last call did asks it. |
 | `POST /failover/freeze` (leader) | `{group, ttlMs, task, epoch}` -> `{}`: the synchronous list of the group is never emptied while the freeze lasts (at most 10 minutes; renewed by repeating the call). |
-| `POST /failover/unfreeze` (leader) | `{group}` -> `{}` |
+| `POST /failover/unfreeze` (leader) | `{group, task, epoch}` -> `{}`: lifts only a freeze of the same task (F3-14); a call of task 0, or of another task, is refused with 409 `fenced`. |
 | `POST /failover/standbys-gone` (leader) | `{server, ttlMs, clear}` -> `{}`: the standbys that run on `server` are not planned any more for the lists of the primaries of this server, so a list that names them is emptied at once and not after `standby-sync-grace`; the list of a frozen group is not touched. Lapses after `ttlMs` (at most 10 minutes) or with `clear`. |
 
 All of these only change what the standby agent reads from memory: nothing is written to an instance.
@@ -406,11 +407,21 @@ refuses the failover with `version_mismatch` at the request), never as `no_insta
 | `POST /failover/lease` `{group, role: fence|holder|release, transferTo, expectedTerm}` | `fence`, `holder`: adopt the lease of the group (renewed like a holder's) and answer `{held, rounds, waitMs, refusedBy}` from the last round; with `transferTo`: hand the lease to that server (`{transferred}`); `release`: stop renewing it. |
 | `POST /failover/demote` `{group, mode: immediate, expectedTerm, transferTo}` | on the old primary's server: relinquish the lease (marker), stop the instance with an immediate shutdown, confirm it does not run, only then hand the lease to `transferTo`; `{stopped, transferred}`. `409 not_primary` when the server runs no primary of the group. |
 | `POST /failover/promote` `{group, standbyId, instanceId, expectedTerm, reapplyList}` | on the standby's server: empty `synchronous_standby_names` and reload, write the role file (primary, origin copy), check that the server holds the group lease as the last thing before `pg_promote(true, 60)`, then `Attach` the lease to the instance (watchdog); `{status: promoted|already, timeline, lsn}`. `409 lease_not_held`, `409 not_standby`, `409 stale_term`; `503 unavailable` when `pg_promote` did not finish (repeat). |
-| `POST /failover/prepared` `{group}` | on the promoted instance's server: `kingres.recover_prepared_transactions()` on the instance that is the group's primary, READ COMMITTED (the extension asks for it on the promoted node and on the map group primary). `409 not_primary`; `503 unavailable` (repeat). Repeating it is harmless. |
+| `POST /failover/prepared` `{group, database}` | on the promoted instance's server: `kingres.recover_prepared_transactions()` on the instance that is the group's primary, READ COMMITTED (the extension asks for it on the promoted node and on the map group primary). `409 not_primary`; `503 unavailable` (repeat). Repeating it is harmless. |
 | `POST /standby/repoint` `{group, standbyId, instanceId, primaryHost, primaryPort, expectedTerm}` | on another standby's server: create the standby's slot on the new primary, rewrite `primary_conninfo` and `primary_slot_name`, reload, wait up to 60 s for the walreceiver; `{streaming, state}`. |
 
 `GET /lease/state` already carries `durationMs` and `marginMs` of the answering server; the request is refused (`lease_settings_differ`) when two servers
 differ.
+
+Changes of the fixes for the review F3 (2026-11-18): `demote` and `promote` are refused with `400 bad_request` when they come from the leader without
+the fence header of a task run (a caller that holds the leader's certificate cannot stop or promote an instance without a run), and every body of
+the four destructive calls (`lease`, `demote`, `promote`, `prepared`) must name `group` (a missing group read as 0, the map group); `demote` and
+`promote` answer `503 unavailable` when the callee cannot read its own catalog term (they were not judged by it before). `lease` with role `release`
+does not forget an adoption that is attached (the lease guards a promoted primary) and answers `{held: true}` then. `promote` finishes a promotion
+that an earlier call began (the role file already says primary, the instance is still in recovery) and answers `409 lease_not_held` when the lease
+could not be attached to the promoted instance, so that the step hands the lease over again. `prepared` acts in the database named by `database`
+(the system database when absent): every database has a catalog of its own. `GET /failover/state` adds `enforced` (the lease manager of the
+server would stop a primary of the group whose lease lapsed: it does so only when its plan says the group has a standby).
 
 ### The ledger keys (ledger phase 7, step 4)
 

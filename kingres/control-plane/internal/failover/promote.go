@@ -195,7 +195,7 @@ func RunPromoteNode(ctx context.Context, cat Catalog, o PromoteOptions) (Promote
 				lastForeign = ""
 			}
 			if !recovered || foreignFree(res.Blocked) {
-				if rerr := cat.RecoverPrepared(ctx); rerr != nil {
+				if rerr := cat.RecoverPrepared(ctx, o.DB); rerr != nil {
 					o.Event("recoverPreparedError", map[string]any{"error": rerr.Error()})
 				}
 				recovered = true

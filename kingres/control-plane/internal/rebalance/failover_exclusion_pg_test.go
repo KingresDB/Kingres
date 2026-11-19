@@ -224,3 +224,34 @@ func TestAFailoverIsRefusedWhileAnInstanceOperationRuns(t *testing.T) {
 		t.Fatalf("after the operations ended: %v", err)
 	}
 }
+
+// KX006 and KX007 (migration 0016, F3-04): a failover cannot start while a database is created or dropped or a table is
+// distributed, those operations cannot start while a failover is unfinished, and an ended task frees the way.
+func TestAFailoverAndDatabaseChangesExcludeEachOther(t *testing.T) {
+	e := newEnvNoTask(t)
+	st := task.NewPGStore(e.sys)
+	var x *task.ExcludedError
+	for _, kind := range []string{"database.create", "database.drop", "table.distribute"} {
+		var id int64
+		if err := e.sys.QueryRow(context.Background(), `INSERT INTO kingres_cp.task (kind, state, subject_type, subject_id, created_by) VALUES ($1, 'running', 'database', 'd', 'test') RETURNING id`,
+			kind).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.create(t, st, kindFailover, "s1"); !errors.As(err, &x) {
+			t.Fatalf("a failover while %s runs was accepted: %v", kind, err)
+		}
+		e.setState(t, id, "done")
+	}
+	if _, err := e.create(t, st, kindFailover, "s1"); err != nil {
+		t.Fatalf("after the operations ended: %v", err)
+	}
+	for _, kind := range []string{"database.create", "database.drop", "table.distribute"} {
+		var nid int64
+		err := e.sys.QueryRow(context.Background(), `INSERT INTO kingres_cp.task (kind, state, subject_type, subject_id, created_by) VALUES ($1, 'pending', 'database', 'd', 'test') RETURNING id`,
+			kind).Scan(&nid)
+		var pe *pgconn.PgError
+		if !errors.As(err, &pe) || pe.Code != "KX007" {
+			t.Fatalf("%s while a failover is unfinished was accepted: %v", kind, err)
+		}
+	}
+}

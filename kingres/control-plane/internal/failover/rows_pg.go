@@ -295,3 +295,13 @@ func ProveLease(ctx context.Context, tx pgx.Tx) error {
 	}
 	return err
 }
+
+// Warned implements Rows.
+func (r *PGRows) Warned(ctx context.Context) (bool, error) {
+	var n int
+	err := r.sys(ctx, func(c *pgx.Conn) error {
+		return c.QueryRow(ctx, `SELECT (SELECT count(*) FROM kingres_cp.failover_event WHERE task_id = $1 AND kind = ANY($2))
+			+ (SELECT count(*) FROM kingres_cp.failover_group WHERE task_id = $1 AND incidents IS NOT NULL AND incidents <> '[]'::jsonb)`, r.TaskID, WarningKinds).Scan(&n)
+	})
+	return n > 0, err
+}

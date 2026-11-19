@@ -136,6 +136,8 @@ type Problem struct {
 	SQLPosition int `json:"sqlPosition,omitempty"`
 	// ServerIDs are servers that can be opened instead (leader_unavailable).
 	ServerIDs []string `json:"serverIds,omitempty"`
+	// Plan is the plan of a failover request that needs a decision (failover_needs_decision; contract 0.12.0).
+	Plan any `json:"plan,omitempty"`
 
 	// retryAfter, when positive, is sent as a Retry-After header (seconds).
 	retryAfter int
@@ -300,4 +302,10 @@ func Write(w http.ResponseWriter, instance, requestID string, p *Problem) {
 	}
 	w.WriteHeader(out.Status)
 	_, _ = w.Write(append(body, '\n'))
+}
+
+// WithPlan attaches the plan of a failover request to a failover_needs_decision problem (contract 0.12.0).
+func (p *Problem) WithPlan(plan any) *Problem {
+	p.Plan = plan
+	return p
 }

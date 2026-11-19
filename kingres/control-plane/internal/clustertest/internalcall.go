@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fence"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pki"
 )
@@ -26,6 +27,15 @@ import (
 // status; an error means the call did not complete (a dropped connection, for
 // example, is what a blocked fault looks like).
 func (n *Node) InternalCall(target *Node, method, path string, in, out any) (int, error) {
+	return n.internalCall(target, method, path, in, out, true)
+}
+
+// InternalCallUnfenced is InternalCall without the fence header of a task run (F3-13: the destructive calls refuse it).
+func (n *Node) InternalCallUnfenced(target *Node, method, path string, in, out any) (int, error) {
+	return n.internalCall(target, method, path, in, out, false)
+}
+
+func (n *Node) internalCall(target *Node, method, path string, in, out any, fenced bool) (int, error) {
 	pkiDir := filepath.Join(n.DataDir, "pki")
 	caPEM, err := os.ReadFile(filepath.Join(pkiDir, pki.CACertFile))
 	if err != nil {
@@ -48,6 +58,10 @@ func (n *Node) InternalCall(target *Node, method, path string, in, out any) (int
 	}
 	req, _ := http.NewRequestWithContext(context.Background(), method, "https://"+target.InternalAddr()+internalapi.Prefix+path, body)
 	req.Header.Set(internalapi.HeaderVersion, internalapi.Version)
+	if fenced {
+		// A test acts as the leader of a run of its own: a task id that no real task has, so it never lowers a real epoch.
+		req.Header.Set(fence.Header, fence.Token{Task: 1 << 40, Epoch: 1}.String())
+	}
 	if in != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}

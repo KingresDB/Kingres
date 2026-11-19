@@ -16,11 +16,11 @@ type scripted struct {
 	recovered int
 }
 
-func (s *scripted) Databases(context.Context) ([]string, error)         { return []string{SystemDB}, nil }
-func (s *scripted) Nodes(context.Context, string) ([]Node, error)       { return nil, nil }
-func (s *scripted) Status(context.Context, string) (int64, bool, error) { return 1, false, nil }
-func (s *scripted) RecoverPrepared(context.Context) error               { s.recovered++; return nil }
-func (s *scripted) CheckCluster(context.Context) ([]Incident, error)    { return nil, nil }
+func (s *scripted) Databases(context.Context) ([]string, error)              { return []string{SystemDB}, nil }
+func (s *scripted) Nodes(context.Context, string) ([]Node, error)            { return nil, nil }
+func (s *scripted) Status(context.Context, string) (int64, bool, error)      { return 1, false, nil }
+func (s *scripted) RecoverPrepared(context.Context, string) error            { s.recovered++; return nil }
+func (s *scripted) CheckCluster(context.Context, string) ([]Incident, error) { return nil, nil }
 func (s *scripted) PromoteNode(context.Context, string, int32) (PromoteResult, error) {
 	i := s.calls
 	s.calls++

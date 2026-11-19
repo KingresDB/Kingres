@@ -45,7 +45,20 @@ type standbyView struct {
 func topology(t *testing.T, n *clustertest.Node) map[int][]standbyView {
 	t.Helper()
 	out := map[int][]standbyView{}
-	body := n.Expect(200, "GET", "/replication/topology", nil)
+	// 503 with Retry-After is the right answer while the instance of a server that has just formed or restarted is still
+	// starting: the state is in motion, so the read waits for 200 within a bound.
+	var body map[string]any
+	until(t, 90*time.Second, "GET /replication/topology to answer 200 on node "+fmt.Sprint(n.Index), func() bool {
+		st, b := n.Do("GET", "/replication/topology", nil, nil)
+		if st == 200 {
+			body = b
+			return true
+		}
+		if st != 503 {
+			t.Fatalf("node %d: GET /replication/topology: status %d %v", n.Index, st, b)
+		}
+		return false
+	})
 	groups, _ := body["groups"].([]any)
 	for _, g := range groups {
 		gm := g.(map[string]any)
@@ -97,6 +110,10 @@ func waitStandbys(t *testing.T, c *clustertest.Cluster, want int) {
 		}
 	}()
 	until(t, 3*time.Minute, fmt.Sprintf("%d streaming standbys in every group", want), func() bool {
+		// 503 with Retry-After is the right answer while an instance is still starting after the formation: wait for 200.
+		if st, _ := c.Leader().Do("GET", "/replication/topology", nil, nil); st == 503 {
+			return false
+		}
 		top := topology(t, c.Leader())
 		if len(top) < len(c.Nodes) {
 			return false

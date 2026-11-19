@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
 	"strconv"
 	"sync"
 	"time"
@@ -128,27 +129,7 @@ func primaryResolver(d *haDeps) clientproxy.Resolver {
 			}
 			return ports
 		},
-		Nodes: func(ctx context.Context) ([]clientproxy.Node, error) {
-			c, err := d.Svc.ServiceConn(ctx, sysdb.Database)
-			if err != nil {
-				return nil, fmt.Errorf("reading the shard catalog: %w", err)
-			}
-			defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
-			rows, err := c.Query(ctx, `SELECT node_id, group_id, host, port, role = 'primary', is_active FROM kingres.node`)
-			if err != nil {
-				return nil, fmt.Errorf("reading the shard catalog: %w", err)
-			}
-			defer rows.Close()
-			out := []clientproxy.Node{}
-			for rows.Next() {
-				var n clientproxy.Node
-				if err := rows.Scan(&n.ID, &n.Group, &n.Host, &n.Port, &n.Primary, &n.Active); err != nil {
-					return nil, fmt.Errorf("reading the shard catalog: %w", err)
-				}
-				out = append(out, n)
-			}
-			return out, rows.Err()
-		},
+		Nodes:         func(ctx context.Context) ([]clientproxy.Node, error) { return catalogNodesWithFallback(ctx, d) },
 		LeaseKnown:    func() bool { return len(d.Registry.Leases().Info()) > 0 },
 		HoldsLease:    func(g int32) bool { return d.Registry.Leases().Holds(g) },
 		Dead:          func(host string) bool { return d.Registry.Liveness().State(host) == ha.PeerDead },
@@ -242,4 +223,65 @@ func localDial(serverHost string) func(ctx context.Context, addr string) (net.Co
 		var plain net.Dialer
 		return plain.DialContext(ctx, "tcp", addr)
 	}
+}
+
+// catalogNodes reads the shard catalog of this server's own instance.
+func catalogNodes(ctx context.Context, d *haDeps) ([]clientproxy.Node, error) {
+	c, err := d.Svc.ServiceConn(ctx, sysdb.Database)
+	if err != nil {
+		return nil, fmt.Errorf("reading the shard catalog: %w", err)
+	}
+	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	rows, err := c.Query(ctx, `SELECT node_id, group_id, host, port, role = 'primary', is_active FROM kingres.node`)
+	if err != nil {
+		return nil, fmt.Errorf("reading the shard catalog: %w", err)
+	}
+	defer rows.Close()
+	out := []clientproxy.Node{}
+	for rows.Next() {
+		var n clientproxy.Node
+		if err := rows.Scan(&n.ID, &n.Group, &n.Host, &n.Port, &n.Primary, &n.Active); err != nil {
+			return nil, fmt.Errorf("reading the shard catalog: %w", err)
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
+// catalogNodesWithFallback is the catalog the client entry point decides from. A server that has no primary of its own
+// any more (a failed-over server whose only primary is stopped and held back) cannot read its catalog locally and used to
+// close every connection (F3-09): it asks the other servers, which can, and forwards to the ring as it always does.
+func catalogNodesWithFallback(ctx context.Context, d *haDeps) ([]clientproxy.Node, error) {
+	var peers []func(context.Context) ([]clientproxy.Node, error)
+	if d.PC != nil && d.Peers != nil {
+		for _, p := range d.Peers.All() {
+			if p.ServerID == d.ServerHost {
+				continue
+			}
+			id := p.ServerID
+			peers = append(peers, func(ctx context.Context) ([]clientproxy.Node, error) {
+				var out []clientproxy.Node
+				err := d.PC.Do(ctx, id, http.MethodGet, "/catalog/nodes", nil, &out)
+				return out, err
+			})
+		}
+	}
+	return nodesWithFallback(ctx, func(ctx context.Context) ([]clientproxy.Node, error) { return catalogNodes(ctx, d) }, peers)
+}
+
+// nodesWithFallback reads the catalog with local; when that fails, the first peer that answers with rows is the answer.
+func nodesWithFallback(ctx context.Context, local func(context.Context) ([]clientproxy.Node, error), peers []func(context.Context) ([]clientproxy.Node, error)) ([]clientproxy.Node, error) {
+	nodes, err := local(ctx)
+	if err == nil {
+		return nodes, nil
+	}
+	for _, peer := range peers {
+		cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		out, perr := peer(cctx)
+		cancel()
+		if perr == nil && len(out) > 0 {
+			return out, nil
+		}
+	}
+	return nil, err
 }

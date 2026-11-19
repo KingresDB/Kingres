@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: KingresDB Management API
-  version: 0.11.0
+  version: 0.12.0
   summary: REST API of the KingresDB management panel, CLI and manager.
   description: |
     The single REST API served by `kingresd` on every KingresDB server. The web panel
@@ -4962,6 +4962,9 @@ components:
           type: integer
           minimum: 1
           description: 1-based character position of the error in the statement; present for some `sql_error` problems.
+        plan:
+          $ref: '#/components/schemas/FailoverPlan'
+          description: 'Added in 0.12.0, optional. The whole plan of the request (the same body as `dryRun` answers), present only when `code` is `failover_needs_decision`: the console shows the groups, the candidates and the verdict without asking again.'
         serverIds:
           type: array
           description: 'Added in 0.9.0, optional. Servers that can be opened instead; set for `leader_unavailable`: the manager leader first when this server knows it, then the other servers of the cluster as this server knows them. Empty or absent when it knows none.'
@@ -6489,7 +6492,7 @@ components:
         kind: { type: string, enum: [failover, restorePreferredPrimaries] }
         trigger: { type: string, enum: [manual, automatic] }
         serverId: { type: [string, 'null'] }
-        outcome: { type: string, enum: [completed, partial, failed, cancelled, paused] }
+        outcome: { type: string, enum: [completed, completedWithWarnings, partial, failed, cancelled, paused] }
         startedAt: { type: string, format: date-time }
         finishedAt: { type: [string, 'null'], format: date-time }
         requestedBy: { type: string }
@@ -6567,7 +6570,7 @@ components:
       type: object
       required: [state, method, divergenceBytes, rewindBytes, message]
       properties:
-        state: { type: string, enum: [notScheduled, rebuildScheduled, rebuilding, standby, waitingForServer, removed, failed], description: '`notScheduled`: this revision of kingresd does not turn the old primary into a standby again (a later increment does); it stays stopped and fenced.' }
+        state: { type: string, enum: [notScheduled, rebuildScheduled, rebuilding, standby, waitingForServer, removed, failed], description: '`notScheduled`: no rebuild of the old primary is scheduled for the group (for a record of an earlier revision of kingresd that never rebuilt it, and for a group whose old primary has no directory to rebuild); it stays stopped and fenced until an operator acts. From 0.12.0 kingresd rebuilds the old primary of an ordinary group by itself (`rebuildScheduled`, `rebuilding`, `standby`).' }
         method: { type: [string, 'null'], enum: [clean, pgRewind, baseBackup, null] }
         divergenceBytes: { type: [integer, 'null'], format: int64 }
         rewindBytes: { type: [integer, 'null'], format: int64 }

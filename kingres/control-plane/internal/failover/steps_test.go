@@ -173,9 +173,7 @@ func TestARepeatAfterPromotionKeepsTheSameStandby(t *testing.T) {
 			t.Fatalf("%s: %v", s.Name, err)
 		}
 	}
-	// The leader dies and the pin is lost with it (a second run starts from a fresh record): the instance is out of recovery.
-	w.rows.groups[1].ChosenStandby = 0
-	w.rows.groups[1].NewServer = ""
+	// The leader dies after pg_promote and before the record: the pin is durable, the instance is out of recovery.
 	if err := steps[4].Run(context.Background(), env); err != nil { // choose
 		t.Fatal(err)
 	}

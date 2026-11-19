@@ -357,7 +357,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	foDeps := &failoverDeps{}
 	var fos *failover.Service
 	if opsSvc != nil && svc.Enabled() && members != nil && stby != nil {
-		fos = newFailover(svc, opsSvc, members, stby, haReg, haCalls, serverHost, log, auditFn(sink, log), foDeps)
+		fos = newFailover(svc, opsSvc, members, stby, haReg, haCalls, serverHost, faultHook, log, auditFn(sink, log), foDeps)
 		deps.Failover = fos
 	}
 	// The signing keys of the ledger and the scheduler that runs their jobs on the manager leader.

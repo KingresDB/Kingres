@@ -236,7 +236,7 @@ func (s *Service) Start(ctx context.Context, actor, server string, req Request) 
 			for _, b := range p.Blockers {
 				detail += fmt.Sprintf(" Shard group %s: %s", groupText(b.ShardGroupID), b.Message)
 			}
-			return nil, nil, problem.New(problem.FailoverNeedsDecision, detail)
+			return nil, nil, problem.New(problem.FailoverNeedsDecision, detail).WithPlan(p)
 		}
 	}
 	if a != nil {
@@ -297,7 +297,7 @@ func (s *Service) resume(ctx context.Context, eng *task.Engine, a *activeRun, ac
 			WHERE id = $1 AND state = 'paused'`, a.ID)
 		if err != nil {
 			var pe *pgconn.PgError
-			if errors.As(err, &pe) && (pe.Code == "KX001" || pe.Code == "KX002" || pe.Code == "KX003") {
+			if errors.As(err, &pe) && (pe.Code == "KX001" || pe.Code == "KX002" || pe.Code == "KX003" || pe.Code == "KX006") {
 				return &task.ExcludedError{Kind: KindFailover, Other: pe.Detail}
 			}
 			return err
@@ -418,6 +418,10 @@ func summaryOf(c *pgx.Conn, ctx context.Context, x runSummary) (ReportSummary, e
 		}
 		var d DataLoss
 		if json.Unmarshal(dl, &d) == nil && d.Verdict != "" && d.Verdict != VerdictNone {
+			out.DataLossPossible = true
+		}
+		// F3-11: a group that was promoted with no verdict on record is not a group without loss.
+		if (state == "done" || state == "promoted") && (len(dl) == 0 || d.Verdict == "") {
 			out.DataLossPossible = true
 		}
 	}

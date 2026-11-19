@@ -55,6 +55,11 @@ type Spec struct {
 	// to end the leader at a step boundary. TaskExitStep -1 means any step.
 	TaskExitPoint string `json:"taskExitPoint,omitempty"`
 	TaskExitStep  int    `json:"taskExitStep,omitempty"`
+	// FailoverPoint, with FailoverMode "fail" or "pause", makes the failover task fail (a code that is not retried) or pause
+	// when it reaches "<step name>:before" (for example "Group 1: Make the catalog follow:before"): the tests of the failures
+	// after the point of no return use it. Only tests write such a file.
+	FailoverPoint string `json:"failoverPoint,omitempty"`
+	FailoverMode  string `json:"failoverMode,omitempty"`
 	// FailRewind makes the rebuild of an old primary treat pg_rewind as failed, so that the fallback (a new base backup)
 	// is taken (the test of the old primary that comes back).
 	FailRewind bool `json:"failRewind,omitempty"`
@@ -199,4 +204,16 @@ func (h *Hook) LedgerWrite(kind string) {
 	if hit {
 		os.Exit(137)
 	}
+}
+
+// FailoverInjection is the mode ("fail", "pause" or "") that the fault file asks for at this point of the failover task.
+func (h *Hook) FailoverInjection(point string) string {
+	if h == nil {
+		return ""
+	}
+	sp := h.load()
+	if sp.FailoverPoint == "" || sp.FailoverPoint != point {
+		return ""
+	}
+	return sp.FailoverMode
 }
