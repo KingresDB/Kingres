@@ -693,7 +693,8 @@ describe('the alerts of the ledger', () => {
     const links = await screen.findAllByTestId('alert-ledger')
     const hrefs = links.map((l) => l.querySelector('a')?.getAttribute('href') ?? '')
     expect(hrefs.some((h) => h.includes('tab=signing'))).toBe(true)
-    expect(hrefs.some((h) => h.includes('tab=publication') && h.includes('db=shop'))).toBe(true)
+    // A diverged chain is handled (acknowledged) on the Overview tab, which is the page without a tab in its address (console part D).
+    expect(hrefs.some((h) => !h.includes('tab=') && h.includes('db=shop'))).toBe(true)
   })
 })
 

@@ -506,6 +506,25 @@ The Ledger page has a sixth tab, **Client keys** (`?tab=clients`, after Anchorin
 - **Tests.** `ledger-client-0-11.test.ts` (every state, the dialogs, the refusals, the roles, hostile text, axe, the library); the tab is in `pages-a11y.test.ts` and `hostile.test.ts`; the
   browser tests have the route and four states (the tab, the register dialog with its errors, the policy dialog, the revoke dialog).
 
+### The Ledger console, part D (step 22 of the plan of phase 7: bundle, acknowledgement, audit, checks)
+
+- **Bundle** (`BundleDialog.vue`; **Create a bundle** on the Digests tab and on the Publication tab): which logs (all, or chosen from the published ones), only the part after a size, whether the
+  anchor evidence goes in, and optionally the inclusion proof of one row with the warning that a proof shows the hash of the row to everyone who holds the bundle. A task makes it; when it is done
+  the dialog offers **Download the bundle** (kept 24 hours; saved as the bytes the server sent). The contract has no member for the result of a task, so the bundle id is read from the task detail
+  ("bundle N"); without it the dialog says to look on the Tasks page. `ledger_not_published`, `not_found`, a bundle that expired (410) and `unsupported_operation` have words (`lib/ledger-ops.ts`).
+- **Acknowledge a diverged chain** (`AcknowledgeDivergenceDialog.vue`; the section "Chains that diverged" of the Overview tab, shown while the status says the publication diverged, one button per group,
+  groups from the open alerts `ledgerChainDiverged`): a danger dialog that says what acknowledging means for the history (nothing is repaired or hidden; the old log is closed as it is and a new epoch
+  starts; the acknowledgement is part of the history; the alert goes away, the fact does not; it cannot be undone), asks what happened (restore, failover loss, other) and a reason of 1 to 200
+  characters, and needs the database name typed (sent as `confirm`). `chain_not_diverged` is told as information. Needs `kingres_admin`.
+- **The alert `ledgerChainDiverged`** names the shard group, the height and why the log ended in its own text (also for a closed log that answers again: `?publication=reopened`); the alert list
+  adds a note and the link "Acknowledge the divergence on the Overview tab".
+- **Audit of the publication** (`PublicationAudit.vue`, Publication tab): **Audit the publication now** starts a verification of the chosen database with `checks: ["publication"]` and scope full, and
+  says what it does (re-reads every chain from block 0; the server also does it daily); needs `kingres_ops`.
+- **Verification with checks** (Overview tab): checkboxes for the chain, the publication and the anchors with words for each; the chain alone is the default and sends no `checks`; none chosen blocks the start.
+- **Mock.** `?bundle=expired` (a bundle answers 410), `?bundle=refuse:<code>` (a bundle or an acknowledgement answers that code), `?publication=reopened`; `?phase7=today` is the server of today.
+- **Waits for the contract or the server.** The result of the bundle task (an id) is read from the task detail; a verification record has no member that says which checks ran; one proof per bundle is offered
+  (the contract takes a list). Tests: `ledger-ops-0-11.test.ts`; the browser tests have three new states (the bundle dialog, the acknowledgement dialog, the audit card).
+
 ## What the panel does for contract 0.12.0
 
 Contract 0.12.0 adds no operation (132) and four small things that the panel follows: the new outcome `completedWithWarnings`, the plan in the problem

@@ -316,7 +316,9 @@ export function syncLedgerAlerts(s: MockState): void {
         { kind: 'ledgerChainDiverged', databaseName: name, shardGroupId: g },
         'critical',
         `The chain of group ${g} of ${name} diverged`,
-        'The chain no longer extends its published log.',
+        l.divergedWhy
+          ? `The chain no longer extends its published log: ${l.divergedWhy}.`
+          : 'The chain no longer extends its published log.',
       )
     }
     const last = groups[groups.length - 1] as number

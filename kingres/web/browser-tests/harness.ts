@@ -1171,6 +1171,41 @@ export const STATES: PageState[] = [
     close: cancel,
   },
   {
+    // 0.11.0, Console D: the bundle dialog with a proof (and its warning), the acknowledgement of a diverged chain, the audit card.
+    name: 'bundle dialog with a proof (0.11.0)',
+    needsMock: true,
+    route: '/ledger?tab=digests',
+    open: async (page) => {
+      await clickText(page, 'Create a bundle')
+      await dialogOpen(page)
+      await page.click('[data-testid="bundle-proof"]')
+      await page.waitForSelector('[data-testid="proofs-warning"]', { timeout: 10_000 })
+      await sleep(200)
+    },
+    close: cancel,
+  },
+  {
+    name: 'acknowledge a diverged chain (0.11.0)',
+    needsMock: true,
+    route: '/ledger',
+    open: async (page) => {
+      await urlSwitch(page, 'publication', 'diverged')
+      await page.waitForSelector('[data-testid="diverged-chains"]', { timeout: 30_000 })
+      await clickLabeled(page, 'Acknowledge the divergence of shard group 2')
+      await dialogOpen(page)
+    },
+    close: cancel,
+  },
+  {
+    name: 'publication: audit and bundle (0.11.0)',
+    needsMock: true,
+    route: '/ledger?tab=publication',
+    open: async (page) => {
+      await page.waitForSelector('[data-testid="publication-audit"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+  },
+  {
     name: 'system database stopped',
     route: '/this-server',
     open: async (page) => {

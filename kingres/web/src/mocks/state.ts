@@ -147,6 +147,9 @@ export const mockConfig = {
   clientNoSsl: false,
   /** Every change of a client key or of a signature policy, and the upgrade, answers this problem code. */
   clientRefuse: null as null | string,
+  /** Console D: a bundle is gone when it is downloaded (410), or every bundle/acknowledge/verify request answers a problem code. */
+  bundleExpired: false,
+  opsRefuse: null as null | string,
   /** 0.8.0: the source commit the server reports in GET /setup/state: a hex id, null (the build does not know it) or text that is not a hex id. */
   commit: '0123456789abcdef0123456789abcdef01234567' as string | null,
   /**

@@ -237,6 +237,12 @@ export function applySwitches(params: URLSearchParams, s: MockState): void {
     if (entry === 'behind') l.publication.health = 'behind'
     if (entry === 'unread') l.publication.health = 'unread'
     if (entry === 'diverged') l.diverged.push('shop:2')
+    // A log that was closed and answers again: diverged, with the height and why the log ended in the text of the alert.
+    if (entry === 'reopened') {
+      l.diverged.push('shop:2')
+      l.divergedWhy =
+        'the log of an earlier epoch was closed at height 120, and the chain answers again at height 121'
+    }
   }
   for (const entry of (params.get('anchors') ?? '').split(',')) {
     const l = s.ledger7
@@ -263,6 +269,12 @@ export function applySwitches(params: URLSearchParams, s: MockState): void {
     if (entry === 'nossl') mockConfig.clientNoSsl = true
     const refuse = /^refuse:([a-z_]+)$/.exec(entry)
     if (refuse) mockConfig.clientRefuse = refuse[1] as string
+  }
+  // Console D: `expired` (a bundle is gone: 410), `refuse:<code>` (a request for a bundle or an acknowledgement answers that code).
+  for (const entry of (params.get('bundle') ?? '').split(',')) {
+    if (entry === 'expired') mockConfig.bundleExpired = true
+    const refuse = /^refuse:([a-z_]+)$/.exec(entry)
+    if (refuse) mockConfig.opsRefuse = refuse[1] as string
   }
   for (const entry of (params.get('clock') ?? '').split(',')) {
     const off = /^off:([^:]+):(-?\d+(?:\.\d+)?)$/.exec(entry)

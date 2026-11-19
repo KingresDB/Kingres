@@ -7,11 +7,17 @@ import { computed } from 'vue'
 import ProblemNotice from '@/components/ProblemNotice.vue'
 import SafeName from '@/components/SafeName.vue'
 import { clientRefusal, type ClientAction } from '@/lib/ledger-client'
+import { opsRefusal, type OpsAction } from '@/lib/ledger-ops'
 import { ApiError } from '@/api/problem'
 
-const props = defineProps<{ error: unknown; action: ClientAction }>()
+// `action` is an action of the Client keys tab; `ops` an action of Console D (bundle, acknowledge, verify): the words differ.
+const props = defineProps<{ error: unknown; action?: ClientAction; ops?: OpsAction }>()
 const emit = defineEmits<{ retry: [] }>()
-const refusal = computed(() => clientRefusal(props.error, props.action))
+const refusal = computed(() =>
+  props.ops
+    ? opsRefusal(props.error, props.ops)
+    : clientRefusal(props.error, props.action ?? 'list'),
+)
 const detail = computed(() =>
   props.error instanceof ApiError && refusal.value?.withDetail ? props.error.problem.detail : null,
 )

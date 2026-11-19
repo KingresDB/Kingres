@@ -92,6 +92,8 @@ export interface Ledger7State {
   }
   /** Shard groups whose chain diverged, as `${database}:${group}`. */
   diverged: string[]
+  /** Why the log ended, as the alert of a diverged chain says it (null: the plain text). */
+  divergedWhy: string | null
   /** The epoch of a chain after an acknowledged divergence, as `${database}:${group}` (absent: 1). */
   epochs: Record<string, number>
   targets: S['LedgerAnchorTarget'][]
@@ -179,6 +181,7 @@ export function createLedger7State(): Ledger7State {
       health: 'ok',
     },
     diverged: [],
+    divergedWhy: null,
     epochs: {},
     targets: [],
     anchors: [],

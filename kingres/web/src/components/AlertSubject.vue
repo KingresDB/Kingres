@@ -66,7 +66,7 @@ const LEDGER_TAB: Record<string, string | undefined> = {
   ledgerAnchorFailed: 'anchoring',
   ledgerAnchorConflict: 'anchoring',
   ledgerPublicationBehind: 'publication',
-  ledgerChainDiverged: 'publication',
+  ledgerChainDiverged: 'overview',
   ledgerGroupUnread: 'publication',
 }
 const isLedgerAlert = computed(() => props.alert.kind.startsWith('ledger'))
@@ -78,12 +78,14 @@ const ledgerLink = computed(() => {
     name: 'ledger',
     query: {
       ...(db !== null && isAddressableSegment(db) ? { db } : {}),
-      ...(tab ? { tab } : {}),
+      ...(tab && tab !== 'overview' ? { tab } : {}),
     },
   }
 })
 const ledgerLinkText = computed(() => {
   if (isPublishedState.value) return 'What was published and how to go on'
+  if (props.alert.kind === 'ledgerChainDiverged')
+    return 'Acknowledge the divergence on the Overview tab'
   const tab = LEDGER_TAB[props.alert.kind]
   return tab === 'signing'
     ? 'Signing keys of the ledger'
@@ -165,6 +167,12 @@ const any = computed(
       <RouterLink :to="{ name: 'configuration', query: { tab: 'time' } }"
         >Clocks and what to do</RouterLink
       >
+    </li>
+    <li v-if="props.alert.kind === 'ledgerChainDiverged'" data-testid="alert-diverged">
+      A log that was closed and answers again, or a chain that no longer extends its log, is shown
+      here with the shard group, the height and why the log ended (the text of the alert). Read it,
+      find out what happened, then acknowledge it to start a new epoch: the old log stays as it
+      ended.
     </li>
     <li v-if="isPublishedState" data-testid="alert-published-state">
       The system database has gone back to an older state than what the ledger published, for

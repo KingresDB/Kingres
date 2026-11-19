@@ -8,6 +8,7 @@ import TableWrap from '@/components/TableWrap.vue'
 import { useMutation, useQueryClient } from '@tanstack/vue-query'
 import QueryBoundary from '@/components/QueryBoundary.vue'
 import GateButton from '@/components/GateButton.vue'
+import BundleDialog from '@/components/ledger/BundleDialog.vue'
 import NullableValue from '@/components/NullableValue.vue'
 import ProblemNotice from '@/components/ProblemNotice.vue'
 import SafeName from '@/components/SafeName.vue'
@@ -33,6 +34,7 @@ const props = defineProps<{ databaseName: string }>()
 const dbName = computed(() => props.databaseName)
 const client = useQueryClient()
 const openAggregate = ref<number | null>(null)
+const bundling = ref(false)
 // 0.11.0: the aggregate checkpoints of the database, newest first (a server that does not build them yet says so).
 const aggregates = usePagedQuery(
   () => [...keys.ledger(dbName.value), 'aggregates'],
@@ -188,12 +190,15 @@ function downloadDigest(d: RawDigest, c: DigestChain): void {
     <section class="card stack" aria-labelledby="digests-h">
       <div class="row-between">
         <h2 id="digests-h">Digests</h2>
-        <GateButton
-          op="generateLedgerDigest"
-          :disabled="generate.isPending.value"
-          @click="generate.mutate()"
-          >Generate digest</GateButton
-        >
+        <div class="row">
+          <GateButton
+            op="generateLedgerDigest"
+            :disabled="generate.isPending.value"
+            @click="generate.mutate()"
+            >Generate digest</GateButton
+          >
+          <GateButton op="createLedgerBundle" @click="bundling = true">Create a bundle</GateButton>
+        </div>
       </div>
       <p class="muted">
         A digest is the head of each chain. Save its documents
@@ -497,6 +502,7 @@ function downloadDigest(d: RawDigest, c: DigestChain): void {
       <ProofResult v-if="proof && !proofApiError" :proof="proof" />
     </section>
   </div>
+  <BundleDialog v-if="bundling" :database-name="dbName" @close="bundling = false" />
   <AggregateDialog
     v-if="openAggregate !== null"
     :database-name="dbName"

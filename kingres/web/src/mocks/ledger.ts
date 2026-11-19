@@ -825,6 +825,16 @@ function clientRefuse(): void {
     )
 }
 
+/** `?bundle=refuse:<code>`. */
+function opsRefuse(): void {
+  const code = mockConfig.opsRefuse
+  if (code)
+    throw problem(
+      code as Parameters<typeof problem>[0],
+      'The server refused the request (a state of the mock).',
+    )
+}
+
 /** The identity point and the other encodings of a point of small order (the registry refuses them, L21-01). */
 const SMALL_ORDER = [
   'AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=', // 01 00 .. 00: the identity
@@ -1049,6 +1059,7 @@ export function ledgerHandlers(): Partial<Record<OperationId, Handler>> {
       if (!published(c.s, rec))
         throw problem('ledger_not_published', 'This database has no published aggregate.')
       const b = body<S['LedgerBundleRequest']>(c)
+      opsRefuse()
       if (typeof b.includeAnchors !== 'boolean')
         throw validationFailed([
           { field: 'includeAnchors', message: 'Say whether to include the anchors.' },
@@ -1069,6 +1080,17 @@ export function ledgerHandlers(): Partial<Record<OperationId, Handler>> {
         (x) => String(x.id) === c.params.bundleId && x.databaseName === c.params.databaseName,
       )
       if (!b) throw problem('not_found', 'The bundle does not exist.')
+      if (mockConfig.bundleExpired)
+        return {
+          status: 410,
+          body: {
+            type: 'about:blank',
+            title: 'Gone',
+            status: 410,
+            code: 'not_found',
+            detail: 'The bundle has expired.',
+          },
+        }
       return {
         status: 200,
         rawBody: new Uint8Array([0x1f, 0x8b, 8, 0]),
@@ -1184,6 +1206,7 @@ export function ledgerHandlers(): Partial<Record<OperationId, Handler>> {
       if (typeof b.reason !== 'string' || b.reason.length < 1 || b.reason.length > 200)
         errors.push({ field: 'reason', message: 'Give a reason of 1 to 200 characters.' })
       if (errors.length > 0) throw validationFailed(errors)
+      opsRefuse()
       if (!isDiverged(c.s, rec.info.name, g))
         throw problem('chain_not_diverged', 'This chain has not diverged.')
       return accepted(
