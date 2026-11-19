@@ -377,6 +377,27 @@ for n in 1 2 3; do
     check_eq "kingres-${n}: count(*) of events" 20 "$(event_count)"
 done
 
+# kingres_shard 0.7: create_distributed_table of a table that already holds
+# rows, on the map group primary of three servers (the call needs a superuser,
+# so it is made as the service role of kingres-1).  The version handshake asks
+# every primary for 0.7; the rows are copied to the groups that own their
+# buckets and are counted on every node.
+note "create_distributed_table of a table that holds rows (three servers)"
+use_node 1
+check "create table parts with 3000 rows on kingres-1" \
+    psql_run -d mesh -v ON_ERROR_STOP=1 \
+    -c 'create table public.parts (id bigint primary key, qty int not null, note text)' \
+    -c "insert into public.parts select g, g % 5, 'p' || g from generate_series(1,3000) g"
+check "kingres.create_distributed_table('public.parts', 'id') as the service role" \
+    docker exec kingres-1 bash -c 'PGPASSWORD="$(cat /var/lib/kingres/service-credentials)" exec psql -X -h 127.0.0.1 -p 5432 -U kingresd -d mesh -v ON_ERROR_STOP=1 -c "select kingres.create_distributed_table('"'"'public.parts'"'"', '"'"'id'"'"')"'
+for n in 1 2 3; do
+    use_node "${n}"
+    check_eq "kingres-${n}: all 3000 rows of parts after the creation (count, sum)" "3000 4501500" \
+        "$(psql_run -d mesh -Atc 'select count(*) || chr(32) || sum(id) from public.parts' 2>/dev/null)"
+done
+use_node 3
+check_eq "kingres-3: a row of parts by key" p2024 "$(psql_run -d mesh -Atc 'select note from public.parts where id = 2024' 2>/dev/null)"
+
 # ------------------------------------ a non-leader node restarts (kingres-2)
 note "docker compose restart of kingres-2 (not the leader)"
 docker compose -f "${compose}" restart kingres-2 >/dev/null 2>&1

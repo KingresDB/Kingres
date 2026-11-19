@@ -192,6 +192,98 @@ flow_check_extensions() {
     check "${p}: kingres_shard can be created after kingres_columnar in one database" \
         flow_shard_after_columnar
     check "${p}: drop the second scratch database" svc -d postgres -v ON_ERROR_STOP=1 -c 'drop database ext_check2'
+    flow_check_extension_versions "${p}"
+    flow_check_distribute_rows "${p}"
+    flow_check_timepart_columnar "${p}"
+}
+
+# flow_check_extension_versions PREFIX: ALTER EXTENSION ... UPDATE from the
+# versions that an earlier package carried (kingres_shard 0.6, kingres_timepart
+# 0.1, kingres_columnar 0.1, kingres_ledger 0.1) to the ones of this package.
+# The library is the new one all the time, as after a package upgrade.
+flow_check_extension_versions() {
+    local p="$1" e
+    check "${p}: create the scratch database ext_upgrade" svc -d postgres -v ON_ERROR_STOP=1 -c 'create database ext_upgrade'
+    check "${p}: install the old versions (shard 0.6, ledger 0.1, timepart 0.1, columnar 0.1)" \
+        svc -d ext_upgrade -v ON_ERROR_STOP=1 \
+        -c "create extension kingres_shard version '0.6'" -c "create extension kingres_ledger version '0.1'" \
+        -c "create extension kingres_timepart version '0.1'" -c "create extension kingres_columnar version '0.1'" \
+        -c "create extension kingres_sketch"
+    check_eq "${p}: the old versions are in the catalog" "kingres_columnar 0.1 kingres_ledger 0.1 kingres_shard 0.6 kingres_sketch 1.0 kingres_timepart 0.1" \
+        "$(svc -d ext_upgrade -Atc "select string_agg(extname || ' ' || extversion, ' ' order by extname) from pg_extension where extname like 'kingres%'" 2>/dev/null)"
+    for e in kingres_shard kingres_ledger kingres_timepart kingres_columnar; do
+        check "${p}: ALTER EXTENSION ${e} UPDATE" svc -d ext_upgrade -v ON_ERROR_STOP=1 -c "alter extension ${e} update"
+    done
+    check_eq "${p}: every extension is at the default version of this package" \
+        "kingres_columnar 0.2 kingres_ledger 0.3 kingres_shard 0.7 kingres_sketch 1.0 kingres_timepart 0.2" \
+        "$(svc -d ext_upgrade -Atc "select string_agg(extname || ' ' || extversion, ' ' order by extname) from pg_extension where extname like 'kingres%'" 2>/dev/null)"
+    check "${p}: the updated kingres_timepart has the conversion procedure of 0.2" \
+        svc -d ext_upgrade -v ON_ERROR_STOP=1 -c "select 'kingres.convert_partition'::regproc" -c "select 'kingres.table_change_report'::regproc"
+    check "${p}: drop the scratch database ext_upgrade" svc -d postgres -v ON_ERROR_STOP=1 -c 'drop database ext_upgrade'
+}
+
+# flow_check_distribute_rows PREFIX: create_distributed_table of a table that
+# holds rows (kingres_shard 0.7) on the cluster this package made: the rows are
+# still there, counted by every path, and a new row is routed.
+flow_check_distribute_rows() {
+    local p="$1"
+    check "${p}: create a table with 1000 rows in shop" "${PSQL_CMD[@]}" -d shop -v ON_ERROR_STOP=1 \
+        -c "create table public.stock (id bigint primary key, qty int not null default 0, note text)" \
+        -c "insert into public.stock select g, g % 7, 'n' || g from generate_series(1,1000) g"
+    check "${p}: kingres.create_distributed_table of a table that holds rows" \
+        svc -d shop -v ON_ERROR_STOP=1 -c "select kingres.create_distributed_table('public.stock', 'id')"
+    check_eq "${p}: the table is registered as distributed" 1 \
+        "$(svc -d shop -Atc "select count(*) from kingres.dist_table where relid = 'public.stock'::regclass" 2>/dev/null)"
+    check_eq "${p}: all 1000 rows are there after the creation (count, sum)" "1000 500500" \
+        "$(psql_run -d shop -Atc "select count(*) || ' ' || sum(id) from public.stock" 2>/dev/null)"
+    check_eq "${p}: a row is found by its key" n421 "$(psql_run -d shop -Atc 'select note from public.stock where id = 421' 2>/dev/null)"
+    check "${p}: a new row is routed" "${PSQL_CMD[@]}" -d shop -v ON_ERROR_STOP=1 -c "insert into public.stock values (1001, 1, 'new')"
+    check_eq "${p}: and counted" 1001 "$(psql_run -d shop -Atc 'select count(*) from public.stock' 2>/dev/null)"
+}
+
+# flow_check_timepart_columnar PREFIX: kingres_timepart 0.2 converts a partition
+# to columnar storage and back, and a columnar table can have a B-tree index
+# (kingres_columnar 0.2).  Both need kingres_columnar preloaded, so what the
+# test expects depends on what the instance preloads: with the library
+# (flow_check_extensions asserts the list) both work; without it the conversion
+# and the creation of a columnar table are refused with the name of the
+# setting, and the partition stays a heap table with its rows.
+flow_check_timepart_columnar() {
+    local p="$1" out preload am
+    preload="$(svc -d postgres -Atc 'show shared_preload_libraries' 2>/dev/null)"
+    check "${p}: create the scratch database ext_tp" svc -d postgres -v ON_ERROR_STOP=1 -c 'create database ext_tp'
+    check "${p}: kingres_shard, kingres_columnar and kingres_timepart in it" svc -d ext_tp -v ON_ERROR_STOP=1 \
+        -c 'create extension kingres_shard' -c 'create extension kingres_columnar' -c 'create extension kingres_timepart'
+    check "${p}: a time-partitioned table with 1000 rows" svc -d ext_tp -v ON_ERROR_STOP=1 \
+        -c "create table public.ev (ts timestamptz not null, n int) partition by range (ts)" \
+        -c "create table public.ev_2026_01 partition of public.ev for values from ('2026-01-01 00:00:00+00') to ('2026-02-01 00:00:00+00')" \
+        -c "insert into public.ev select '2026-01-05 00:00:00+00'::timestamptz + g * interval '1 minute', g from generate_series(1,1000) g"
+    am="select a.amname from pg_class c join pg_am a on a.oid = c.relam where c.oid = 'public.ev_2026_01'::regclass"
+    out="$(svc -d ext_tp -v ON_ERROR_STOP=1 -c "call kingres.convert_partition('public.ev', 'public.ev_2026_01')" 2>&1 || true)"
+    case ",${preload}," in
+        *,kingres_columnar,*)
+            check_eq "${p}: the partition is columnar after the conversion" columnar "$(svc -d ext_tp -Atc "${am}" 2>/dev/null)"
+            check_eq "${p}: ... with its rows" "1000 500500" "$(svc -d ext_tp -Atc 'select count(*) || chr(32) || sum(n) from public.ev' 2>/dev/null)"
+            check "${p}: convert it back to heap" svc -d ext_tp -v ON_ERROR_STOP=1 -c "call kingres.convert_partition('public.ev', 'public.ev_2026_01', 'heap')"
+            check_eq "${p}: the partition is heap again" heap "$(svc -d ext_tp -Atc "${am}" 2>/dev/null)"
+            check_eq "${p}: ... with its rows" "1000 500500" "$(svc -d ext_tp -Atc 'select count(*) || chr(32) || sum(n) from public.ev' 2>/dev/null)"
+            check "${p}: a columnar table with a B-tree index" svc -d ext_tp -v ON_ERROR_STOP=1 \
+                -c 'create table public.col_i (id int, v text) using columnar' \
+                -c "insert into public.col_i select g, 'v' || g from generate_series(1,2000) g" \
+                -c 'create index col_i_id on public.col_i (id)'
+            check_eq "${p}: ... and a lookup through it" v1234 "$(svc -d ext_tp -Atc 'select v from public.col_i where id = 1234' 2>/dev/null)"
+            ;;
+        *)
+            check "${p}: the conversion to columnar is refused, naming shared_preload_libraries (${out:0:120})" \
+                bash -c 'grep -q "shared_preload_libraries" <<<"$1"' _ "${out}"
+            check_eq "${p}: the partition is still heap" heap "$(svc -d ext_tp -Atc "${am}" 2>/dev/null)"
+            check_eq "${p}: ... with all its rows" "1000 500500" "$(svc -d ext_tp -Atc 'select count(*) || chr(32) || sum(n) from public.ev' 2>/dev/null)"
+            out="$(svc -d ext_tp -v ON_ERROR_STOP=1 -c 'create table public.col_i (id int) using columnar' 2>&1 || true)"
+            check "${p}: a columnar table (and so a B-tree index on one) is refused, naming shared_preload_libraries" \
+                bash -c 'grep -q "shared_preload_libraries" <<<"$1"' _ "${out}"
+            ;;
+    esac
+    check "${p}: drop the scratch database ext_tp" svc -d postgres -v ON_ERROR_STOP=1 -c 'drop database ext_tp'
 }
 flow_shard_after_columnar() {
     svc -d ext_check2 -v ON_ERROR_STOP=1 -c 'create extension kingres_columnar' &&

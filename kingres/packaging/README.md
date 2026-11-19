@@ -52,14 +52,25 @@ Target: Ubuntu 24.04, amd64. Everything below was run on Windows 11 with WSL2
 - The PostgreSQL based server of the major that was built (18.7 or 19rc2: `postgres`,
   `initdb`, `pg_ctl`, ...), its client programs, all contrib modules, and the five
   KingresDB extensions: `kingres_columnar`, `kingres_ledger`, `kingres_shard`,
-  `kingres_sketch` and `kingres_timepart` (`share/BUILD-INFO` lists them; the
-  build stops when an extension of the source tree is not in the staged tree).
+  `kingres_sketch` and `kingres_timepart` (`share/BUILD-INFO` lists them and
+  their versions; the build stops when an extension of the source tree is not
+  in the staged tree, or when a `--x.y.sql` or `--x--y.sql` script of it is
+  missing from the staged tree or from the `DATA` list of its Makefile). This
+  release carries `kingres_shard` 0.7, `kingres_ledger` 0.3, `kingres_sketch`
+  1.0, `kingres_timepart` 0.2 and `kingres_columnar` 0.2, with every install
+  and update script of each (an instance made by an earlier package updates
+  with `ALTER EXTENSION ... UPDATE`: tested from `kingres_shard` 0.6,
+  `kingres_ledger` 0.1, `kingres_timepart` 0.1 and `kingres_columnar` 0.1).
   `kingres_columnar` needs `shared_preload_libraries = 'kingres_columnar'` to
-  write (it registers a WAL resource manager), and the product does **not**
-  enable it: without the preload `CREATE EXTENSION` works, a columnar table can
-  be created and read, and a write is refused, as its README says. The other
-  four need no preload except `kingres_shard` and `kingres_ledger`, which
-  `kingresd` preloads.
+  write (it registers a WAL resource manager). **What the product preloads
+  today, and what it should preload, is described in
+  [The preload of `kingres_columnar`](#the-preload-of-kingres_columnar).** In
+  short: `kingresd` preloads `kingres_shard,kingres_ledger` and not
+  `kingres_columnar`; without the preload `CREATE EXTENSION` works, a columnar
+  table can be read, and creating one, a write, and the conversion of a
+  partition to columnar storage by `kingres_timepart` are refused with a message
+  that names `shared_preload_libraries`. The other four extensions need no
+  preload except `kingres_shard` and `kingres_ledger`.
 - `kingresd`: one static Go binary with the web panel embedded, and
   `kingres-watchdog`, the lease watchdog next to it.
 - `kingres-verify`: the standalone ledger verifier, when `kingres/verifier/go.mod`
@@ -290,8 +301,10 @@ A session is held in the memory of the server that issued it: a bearer token
 of one node is not used on another, sign in on each node (same administrator).
 DDL of a sharded database (`create table`) runs on kingres-1, the map group
 primary; the table is distributed through the API (any node), and rows can be
-written and read on any node (one row per `INSERT`: a statement that spans
-shard groups is not supported yet).
+written and read on any node. The test writes one row per `INSERT`; a multi-row
+`INSERT`, `INSERT ... SELECT` and `COPY ... FROM` that span shard groups are routed
+by the row router of `kingres_shard` (see its README, "Bulk writes through the row
+router").
 
 ## Debian package
 
@@ -534,7 +547,12 @@ compose test, which uses `N+1..3` and `N+11..13`). `test/flow.sh` is the shared
 a database with sharding and the ledger, creates two tables with `psql`,
 distributes one and enables the ledger on the other through the API, inserts and
 reads rows, and generates a ledger digest; `flow_check_*` repeat the reads
-after every restart.
+after every restart. `flow_check_extensions` (package and image tests) then works in
+scratch databases as the service role: every extension is created, the extension
+updates, `create_distributed_table` of a table with rows, and the conversion of a
+partition to columnar and back plus a B-tree index on a columnar table (or, when the
+instance does not preload `kingres_columnar`, their refusals; it reads the list from
+the instance).
 
 - **`test-deb.sh`** starts a clean `ubuntu:24.04` with systemd as PID 1
   (`--privileged`, host cgroup namespace; `policy-rc.d` removed) and checks:
@@ -556,9 +574,17 @@ after every restart.
   database stopped, data kept); reinstall (cluster comes back); purge
   (everything gone, no process left). In the throw-away server (`pg-smoke.sh`) and
   in the running node every extension is created in a database
-  (`kingres_columnar` without the preload: `CREATE EXTENSION` works, a columnar
-  table can be created and read and a write is refused; with the preload, as an
-  experiment and not the default, a write works). **The other major** (needs
+  (`kingres_columnar` without the preload: `CREATE EXTENSION` works, creating a columnar
+  table and a write are refused; with the preload, as an experiment and not the
+  default, a write works, a B-tree index of a columnar table is built and used, and
+  `kingres_timepart` converts a partition to columnar and back with its rows kept,
+  while without the preload that conversion is refused and the partition is
+  untouched). The versions: `BUILD-INFO` lists every extension with its version, the
+  catalog has the default version of each control file, the install and update scripts
+  of this release are in the tree, and `ALTER EXTENSION ... UPDATE` takes a database
+  from the versions of the earlier package (`kingres_shard` 0.6, `kingres_ledger` 0.1,
+  `kingres_timepart` 0.1, `kingres_columnar` 0.1) to the current ones; on the node,
+  `kingres.create_distributed_table` of a table that holds 1000 rows keeps them all. **The other major** (needs
   `--other-deb`): with the cluster running and data present, the package of the
   other major is refused by `apt-get install` and by `dpkg -i` with the message of
   the `preinst`, and nothing changed (version, programs, service, postmaster PID,
@@ -630,6 +656,75 @@ Verified by the tests against the commit built:
    major (`VerifyBinaries`); the package, the image and the compose nodes of either major
    become ready.
 
+## The preload of `kingres_columnar`
+
+**What the product does today.** `kingresd` writes
+`shared_preload_libraries = 'kingres_shard,kingres_ledger'` for every instance
+(`RenderManaged`, `kingres/control-plane/internal/instance/render.go`), and the tests of
+this directory assert exactly that. The parameter is managed: the settings API refuses a
+change of it (`config_parameter_managed`) and `kingresd` offers no other way.
+So **an operator has no supported way to turn the preload on** today. On such an
+instance (the default of every package, image and compose node):
+
+- `CREATE EXTENSION kingres_columnar` works, and a columnar table that already exists is
+  read;
+- `CREATE TABLE ... USING columnar`, an insert, `COPY`, and so every conversion of
+  `kingres_timepart` (`convert_partition`, `convert_old_partitions`, the policy's
+  `columnar_after`) are refused with `kingres_columnar must be listed in
+  shared_preload_libraries to write columnar tables`; the partition stays a heap table with
+  all its rows (the flow test checks it).
+
+**Recommendation: preload it (the design's choice,
+[analytics-phase12-storage.md](../docs/design/analytics-phase12-storage.md), question 6 and
+section 4: "the package default lists all three").** The library registers a WAL resource
+manager, which PostgreSQL accepts only while `shared_preload_libraries` is processed, so the
+product cannot offer "columnar storage" or the conversion of old partitions (the point of
+`kingres_timepart` 0.2) without it, and `kingres_columnar` 0.2 (indexes, a parallel scan) is
+dead weight in the package without it. What it costs every backend, from reading
+`_PG_init` and the hooks in `contrib/kingres_columnar/src` (not measured):
+
+- **No shared memory, no background worker, no `shmem_request_hook`**: nothing is added to
+  the size of the shared segment, to `max_worker_processes` or to the start time beyond
+  loading one library. The postmaster loads it once; backends inherit it.
+- **One resource manager id (128, `RM_EXPERIMENTAL_ID`)**, registered at start. The id is
+  part of the WAL format and is still the experimental one (phase 12 reserves a real id
+  before the first release; a change of it changes what replay accepts).
+- **Hooks in every backend**: `object_access_hook` (every drop of a relation costs one
+  `pg_class` syscache lookup and a test of its access method); `ProcessUtility_hook` (looks
+  at `CREATE INDEX` and `REINDEX` only, to refuse the concurrent forms on a columnar table);
+  `set_rel_pathlist_hook` (once per base relation planned: a syscache lookup of the access
+  method, and a return when it is not columnar); `ExecutorStart_hook` (a test of
+  `IsParallelWorker()`); transaction and subtransaction callbacks (at each commit and abort
+  they flush the buffers of columnar writes the transaction made, an empty list otherwise).
+  All of them chain to the hook that was installed before; the order in the preload list
+  matters only for modules that replace a hook instead of chaining.
+- About 20 `kingres_columnar.*` settings (most of them test knobs, not in the sample
+  configuration), reserved under the prefix `kingres_columnar`.
+- **A new obligation, not a per-backend cost**: once an instance has written columnar WAL,
+  the library must be preloaded on it for as long as that WAL exists (crash recovery, archive
+  recovery, base backups, `pg_rewind`) and on **every standby** of it, or the server may fail
+  to start or to replay. So the preload is a property of the whole cluster, and it must
+  never be taken away from an instance that holds columnar data.
+
+**Upgrade of an existing cluster.** `kingres-managed.conf` is written when an instance is
+created and rewritten only by `WriteManaged` (a settings change); `EnsureConfig` at the start
+of `kingresd` rewrites it only when the include of the override file is missing. A package or
+image upgrade therefore leaves an old instance with `kingres_shard,kingres_ledger` unless
+`kingresd` is changed to bring the preload line up to date at start. The exact change is
+listed in the report of the round that wrote this section: `RenderManaged` gets the new list
+(`kingres_shard,kingres_ledger,kingres_columnar`; the order keeps `kingres_shard` first),
+`EnsureConfig` also re-renders when the rendered `shared_preload_libraries` differs from the
+file, the tests that name the old value (`manager_test.go`, `render_test.go`) and the
+description in `managed.go` change, and **the flow test of this directory then expects the new
+list** (`flow_check_extensions` already branches on the list it finds: with the library
+preloaded it tests the conversion in both directions and a B-tree index on a columnar table,
+without it the refusals above). The new list takes effect at the restart that an upgrade does
+anyway. On a rolling upgrade of a cluster with standbys, upgrade the standbys first: a primary
+that has begun to write columnar WAL under the new list would otherwise be ahead of a standby
+that cannot replay it. Until this change is made, the working path (preload on, conversion
+both ways, indexed columnar table) is tested in the throw-away server of `pg-smoke.sh`, on
+both majors, with the files of the package.
+
 ## What is not included yet
 
 - **No Patroni, no etcd, no metrics store** (decided: they arrive with the
@@ -641,11 +736,41 @@ Verified by the tests against the commit built:
   man pages beyond one-page stubs; the licences of every compiled-in Go and npm
   dependency as full texts (only the dependency lists are shipped); NLS, GSSAPI,
   LDAP, PAM, JIT, PL languages.
-- Package upgrades are tested for a revision bump only (no database migration,
-  no major-version path, no rollback); the instance is restarted on upgrade.
+- Package upgrades are tested for a revision bump, and the extensions of a database made by
+  an earlier package are updated with `ALTER EXTENSION ... UPDATE` (from `kingres_shard` 0.6,
+  `kingres_ledger` 0.1, `kingres_timepart` 0.1 and `kingres_columnar` 0.1); there is no
+  major-version path and no rollback; the instance is restarted on upgrade, and nothing here updates the extensions
+  of existing databases for the administrator (the test does it by hand).
 - No automated backup, no PITR archive configuration (pointers above only).
 
 ## What was run
+
+### The run of 2026-11-19 (kingres_shard 0.7, kingres_timepart 0.2, kingres_columnar 0.2)
+
+Same machine, one major at a time, one docker build at a time. PostgreSQL 18 from
+`kingres-18` at `824a695995` plus the working-tree `kingres/packaging`; PostgreSQL 19
+from a scratch tree made as the sync does it (`kingres-19` at `91fcbffef0`, whose KingresDB
+directories are older than those of `kingres-18`, with `contrib/kingres_*` and `kingres/`
+replaced by those of `kingres-18` at `824a695995`, and the same packaging overlay), because
+the branch `kingres-19` had not been synced yet (it carried `kingres_shard` 0.6 and
+`kingres_columnar` 0.1). The same extension source built and passed on both majors.
+
+| Check | PostgreSQL 18 | PostgreSQL 19 |
+|---|---|---|
+| `test/test-deb.sh` (the package of the other major as `--other-deb`) | 284 passed, 0 failed | 284 passed, 0 failed |
+| `test/test-image.sh` | 177 passed, 0 failed | 177 passed, 0 failed |
+| `test/test-compose.sh` | 178 passed, 0 failed | 178 passed, 0 failed |
+| `lintian --fail-on error` | 0 errors, 0 warnings, 146 information tags | 0 errors, 0 warnings, 148 information tags |
+| `shellcheck -x -P SCRIPTDIR` on `build/*.sh`, `deb/build-deb.sh`, `docker/*.sh`, `test/*.sh` | clean | clean |
+
+The packages are 15,354,504 bytes (18) and 15,579,080 bytes (19). New in the numbers
+(47 more checks in the package test and image test, 16 in the compose test): the versions
+of the five extensions and their scripts, the updates from the earlier versions, the
+conversion of a partition to columnar and back, a B-tree index on a columnar table, and
+`create_distributed_table` of a table with rows (on one server in the package and image
+tests, on three joined servers in the compose test).
+
+### The run of 2026-11-16
 
 The release builds and all tests below were run on 2026-11-16 on a 24-core WSL2
 machine (Windows 11, Ubuntu 24.04, Docker Engine in the distribution), each major
