@@ -2447,3 +2447,53 @@ compaction with the standby and crash tests (C6d). Decided where sections 5.3 an
   transaction under the lock that this needs; `CLUSTER` stays refused.
 - The catalog of stripes gains a state "reserved, not written", so C6 is version 0.2 with an
   upgrade script; a table written by 0.1 stays readable and writable.
+
+### T2, conversion of partitions (2026-11-19)
+
+`kingres_timepart` is version 0.2 with this increment (an upgrade script and a full script; eight new
+functions, eleven replaced with their signatures, one dropped; the `upgrade` regression test compares
+an upgraded catalog with a fresh one).
+
+- **The reasoning about deadlocks in 10.4 step 6 and 10.5 does not hold for a writer that has
+  waited.** A writer through the parent holds a lock on the parent and waits for the partition that
+  the copy holds; its own `deadlock_timeout` began when it started to wait, perhaps a second before
+  the swap asks for the parent. When it fires inside the 500 ms of the swap, the writer is the victim
+  (seen in a test). Before it asks for the parent, the swap therefore reads `pg_locks` and gives up
+  at once (`swap_lock_timeout`) when a session that holds the parent waits for the partition. The
+  500 ms wait stays for readers and prepared transactions.
+- **"A writer waits, then goes on against the new partition" (10.4 step 3, 15) is true only for a
+  writer that names the partition.** A writer through the parent makes the conversion give way; its
+  row goes into the old partition and the next run converts it. A partition that is written through
+  the parent at every attempt is never converted; `timepart_check` reports it as `convert_blocked`.
+- **The lock on the partition is `SHARE ROW EXCLUSIVE`, not `SHARE`**: the same for readers and
+  writers, and it also keeps out a plain `CREATE INDEX`, whose index would be dropped with the old
+  partition, and a second conversion.
+- **The row counts of `columnar_info` cannot be compared inside the transaction** (10.4 step 5): a
+  columnar table writes its stripes at commit. The two `count(*)` are compared under the lock; the
+  sizes and the rows go into the history in a transaction after the commit, which also runs the
+  `ANALYZE`.
+- **A conversion is tried once per run**, not five times: it copies the whole partition. A lock that
+  is not granted is a failed action of a partial run, and the next run is due in at most five
+  minutes. A refusal is a skipped action of a run that is done.
+- **Refusals added to the list of 10.4 step 1**, each because the drop of the old partition or the
+  attach would lose or break something: a trigger of the partition's own of any kind, extended
+  statistics, an identity column, a sequence the partition owns, an owner other than the table's, an
+  isolation level other than READ COMMITTED (a row committed between an older snapshot and the lock
+  would be dropped uncopied), a default partition, a partition that is not permanent, options with
+  a heap target. For a columnar target, what the columnar method refuses is found before the attach
+  fails: an index on the partition or on the parent (named in the message; lifted when C6 is
+  built), a foreign key, an `AFTER ROW` trigger, a publication that would include the partition.
+- **The rule of section 12 about functions outside `pg_catalog`** is replaced by the rule every
+  other action of a run has: a superuser's session runs the code of an owner that is not a superuser
+  only with `kingres_timepart.trust_table_owners` on. Whether the control plane needs the narrower
+  rule of the design is a decision for the part that builds `table.setStorage`.
+- **`convert_old_partitions` stops at the first partition that is refused or fails** (a procedure
+  that commits cannot catch an error); the policy path records each partition and goes on.
+- **`columnar_options` of a policy is checked when the policy is set** (the keys and ranges of
+  `columnar_set_options`); 0.1 accepted any object.
+- **Tests need `kingres_columnar` installed and preloaded** in the test server.
+
+What C6 changes for the conversion: the two index refusals go; the conversion creates the indexes of
+the parent on the new table before the swap, so that the attach finds them and scans nothing under
+the strongest lock; an index of the partition's own is created again on the new table; a primary key
+or unique constraint of the parent needs the uniqueness check of C6c.
