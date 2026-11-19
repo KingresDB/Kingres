@@ -3046,7 +3046,8 @@ The number 159 is not used.
     asked for with `--init`.
 195. **`bundle fetch` is bounded** by a number of files and of bytes when no trust file is given,
     checks the size a checkpoint claims against that bound before it requests a tile, and compares
-. **`anchors`** checks the anchors of a signed aggregate checkpoint. The digest is computed again from
+    what it already holds before it replaces anything.
+196. **`anchors`** checks the anchors of a signed aggregate checkpoint. The digest is computed again from
     the signed aggregate log, never taken from an evidence file; for an older size from the first
     leaves, proved a prefix of the signed log.
 197. **The statuses of `anchors`.** Not verified (3): a WORM object not fetched again, a time-stamp
