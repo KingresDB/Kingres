@@ -2497,3 +2497,48 @@ What C6 changes for the conversion: the two index refusals go; the conversion cr
 the parent on the new table before the swap, so that the attach finds them and scans nothing under
 the strongest lock; an index of the partition's own is created again on the new table; a primary key
 or unique constraint of the parent needs the uniqueness check of C6c.
+
+### C6a, row numbers reserved at insert time (2026-11-19)
+
+`kingres_columnar` is version 0.2 with this increment. It builds the base for indexes and no index;
+a developer setting (`kingres_columnar.reserve_row_numbers`) switches it on until C6b does so for a
+table that has an index.
+
+- **Reservation.** A write buffer that reserves takes `stripe_row_count` numbers from the metapage
+  with the existing allocation record when its first row goes in; row `i` of the buffer is number
+  `first + i`, and its TID is the one every scan already showed. The unused tail goes back, with the
+  new record `XLOG_KC_RETURN`, only when it is still the end of the range. An abort gives nothing
+  back, since the abort callbacks may not touch the file: an aborted writer wastes at most one
+  stripe's worth of numbers.
+- **The largest row number** is the largest that fits a TID (about 8.8e12), no longer the largest
+  64-bit number.
+- **The early catalog row.** `kingres.columnar_stripe` has a column `reserved`. The row of a stripe
+  is inserted at the first insert with the numbers reserved and nothing else, and the flush updates
+  it. Two things section 7.8 does not say: PostgreSQL refuses to update a row of its own command, so
+  the writer passes the command counter before the update when the flush happens in the command
+  that inserted the row; and the row can move between the insert and the flush (a rewrite of the
+  catalog), so the flush finds it by its key and keeps no TID.
+- **Hand-over.** A buffer that reserves is never merged; a subtransaction that commits writes it as
+  a stripe of its own; a buffer that a cursor holds becomes the parent's with its reservation. A row
+  goes only into a buffer made under the same setting.
+- **Not reserved**: the rows of a rewrite and of compaction, and rows written in parallel mode (a
+  `CREATE TABLE AS` with a parallel query writes in the leader in parallel mode, where the update of
+  the catalog row is not allowed).
+- **Versions.** Format version 3 of the metapage means "may reserve"; version 2 stays readable and
+  writable and never reserves; a new file is version 3 only when the catalog has the new column.
+  Both shapes of the catalog are served, so the time between replacing the library and `ALTER
+  EXTENSION UPDATE` works. The 0.1 library refuses a version 3 file and the new catalog: there is no
+  way back.
+- **The check.** A reserved row of an aborted or crashed writer is an ordinary dead row; one of a
+  live or prepared writer is never visible to the check or the reconcile. A reserved row that a
+  committed transaction left is a new kind of finding, `reserved_row_left`.
+- **Serializable.** A reader that skips the reserved row of a writer in progress reports the
+  dependency at the writer's first insert, earlier than before.
+- **On a hot standby** every stripe of a reserving buffer leaves one dead version of a catalog row,
+  and the replay of its pruning can cancel a query with an old snapshot.
+- **Open.** With reservation on everywhere, the memory of a backend that writes 1500 partitions is
+  27 MB where the test of 0.1 allows 18 MB; this is examined with C6b, where tables with an index
+  reserve.
+
+What C6b finds: a function from a row number to a TID, the numbers returned by the insert paths, one
+place that decides whether a buffer reserves, and no fetch by TID yet for rows still in a buffer.
