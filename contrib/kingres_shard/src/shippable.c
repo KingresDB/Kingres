@@ -59,6 +59,9 @@ typedef struct ShipCtx
 	bool		statement;		/* a whole statement, not one clause */
 	Oid			shipped_relid;	/* statement mode: the table being written */
 	Query	   *top;			/* statement mode: the statement itself */
+	int			colocation_id;	/* multi-relation mode (design 5, 11.7): every distributed table of
+								 * this colocation group may be read, at the one source level the
+								 * analysis of pushdown.c found; else 0 */
 	const char *reason;
 } ShipCtx;
 
@@ -85,6 +88,29 @@ type_ok(Oid type)
 	if (type == CASHOID || get_element_type(type) == CASHOID)
 		return false;
 	return type < FirstGenbkiObjectId;
+}
+
+/* The types whose value is the OID of a catalog object. */
+static bool
+is_reg_type(Oid type)
+{
+	switch (type)
+	{
+		case REGPROCOID:
+		case REGPROCEDUREOID:
+		case REGOPEROID:
+		case REGOPERATOROID:
+		case REGCLASSOID:
+		case REGTYPEOID:
+		case REGROLEOID:
+		case REGNAMESPACEOID:
+		case REGCONFIGOID:
+		case REGDICTIONARYOID:
+		case REGCOLLATIONOID:
+			return true;
+		default:
+			return false;
+	}
 }
 
 /* The default collation and "C" mean the same on every node. */
@@ -159,6 +185,15 @@ relation_ok(Oid relid, ShipCtx *ctx, Query *q, int rtindex)
 
 	if (dt != NULL && dt->is_reference)
 		return true;
+	/*
+	 * Multi-relation mode: the tables of the colocation group are all read by the
+	 * statement that each group runs on its own buckets.  Whether they are joined so
+	 * that this is right is decided by the analysis of pushdown.c, not here; this walker
+	 * only accepts the relation, and refuses what could read another table behind that
+	 * analysis (a sub-select, a function, a CTE: see query_ok and ship_walker).
+	 */
+	if (ctx->colocation_id != 0)
+		return dt != NULL && !dt->is_reference && dt->colocation_id == ctx->colocation_id;
 	/*
 	 * The distributed table that is written appears once, as the target: any
 	 * other reading of it (a subquery, a self join) would need the rows of the
@@ -350,9 +385,26 @@ query_ok(Query *q, ShipCtx *ctx)
 		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
 
 		rtindex++;
+
+		/*
+		 * Multi-relation mode reads the relations of the level directly: below the
+		 * statement itself only plain tables, joins and the grouping entry; the one
+		 * sub-select it accepts is the source of the statement (the statement's own
+		 * level), which pushdown.c has found to be the one unit.  A function, a
+		 * VALUES list, a CTE or a deeper sub-select could read a table of the
+		 * group without the key the analysis relies on.
+		 */
+		if (ctx->colocation_id != 0 && rte->rtekind != RTE_RELATION && rte->rtekind != RTE_JOIN &&
+			rte->rtekind != RTE_GROUP && !(rte->rtekind == RTE_SUBQUERY && q == ctx->top))
+			return fail(ctx, "it reads something other than the tables of the colocation group (a sub-select, a function, a VALUES list or a CTE)");
+
 		switch (rte->rtekind)
 		{
 			case RTE_RELATION:
+				/* the EXCLUDED pseudo relation of ON CONFLICT DO UPDATE holds the row being inserted */
+				if (q == ctx->top && q->onConflict != NULL &&
+					rtindex == q->onConflict->exclRelIndex)
+					break;
 				if (rte->tablesample != NULL)
 					return fail(ctx, "it samples a table at random");
 
@@ -438,6 +490,17 @@ ship_walker(Node *node, ShipCtx *ctx)
 					(v->varno != ctx->varno || v->varlevelsup != 0 || v->varattno <= 0))
 					return fail(ctx, "it uses a column of another table or a system column");
 				/* The whole-row column of an allowed table (ON CONFLICT DO UPDATE has one). */
+				/*
+				 * ON CONFLICT DO UPDATE has a whole-row entry of EXCLUDED in its target list (the
+				 * parser adds it, nothing refers to it unless the statement does, and a use of
+				 * it is a function or a field selection that the walker judges on its own).
+				 */
+				if (ctx->colocation_id != 0 && v->varattno == 0 &&
+					!(ctx->top != NULL && ctx->top->onConflict != NULL &&
+					  v->varlevelsup == 0 && v->varno == (Index) ctx->top->onConflict->exclRelIndex))
+					return fail(ctx, "it uses a whole-row reference, whose text form carries the types of every column");
+				if (ctx->colocation_id != 0 && v->varattno == 0)
+					return false;
 				if (ctx->statement && v->varattno == 0 &&
 					OidIsValid(get_typ_typrelid(v->vartype)) &&
 					relation_ok(get_typ_typrelid(v->vartype), ctx, ctx->top, ctx->top->resultRelation))
@@ -453,6 +516,14 @@ ship_walker(Node *node, ShipCtx *ctx)
 
 				if (!type_ok(c->consttype) || !collation_ok(c->constcollid))
 					return fail(ctx, "it uses a constant of a type or collation that is not built in");
+				/*
+				 * Rule 6 of 5.1: the OID of a table, function, type, role or schema that is not
+				 * built in names another object (or none) on another node.  'my_table'::regclass is
+				 * folded into such a constant at parse time.
+				 */
+				if (!c->constisnull && is_reg_type(c->consttype) &&
+					DatumGetObjectId(c->constvalue) >= FirstGenbkiObjectId)
+					return fail(ctx, "it uses the OID of an object that is not built in, which names another object on another node");
 				return false;
 			}
 
@@ -623,9 +694,31 @@ ship_walker(Node *node, ShipCtx *ctx)
 				return fail(ctx, "it has the structure of a whole statement");
 			if (!ks_onconflict_action_shippable(((OnConflictExpr *) node)->action))
 				return fail(ctx, psprintf("its ON CONFLICT action (%d) is not one that can be shipped", (int) ((OnConflictExpr *) node)->action));
+			/*
+			 * Multi-relation mode: the description of the EXCLUDED relation (a Var for every column of
+			 * the target, a column of a type that is not shippable included) says nothing the
+			 * statement uses; what it does use (the SET list, the WHERE and the inference clause) is
+			 * walked on its own.
+			 */
+			if (ctx->colocation_id != 0)
+			{
+				OnConflictExpr *oc = (OnConflictExpr *) node;
+
+				return ship_walker((Node *) oc->arbiterElems, ctx) ||
+					ship_walker(oc->arbiterWhere, ctx) ||
+					ship_walker((Node *) oc->onConflictSet, ctx) ||
+					ship_walker(oc->onConflictWhere, ctx);
+			}
 			break;
 
 		case T_SubLink:
+			/* a sub-select reads tables without the key that ties it to a group (multi-relation mode) */
+			if (ctx->colocation_id != 0)
+				return fail(ctx, "it has a sub-select in an expression");
+			if (!ctx->statement)
+				return fail(ctx, "it has the structure of a whole statement");
+			break;
+
 		case T_FromExpr:
 		case T_JoinExpr:
 		case T_RangeTblRef:
@@ -665,6 +758,29 @@ kingres_shard_stmt_shippable(Query *query, Oid shipped_relid, const char **reaso
 	memset(&ctx, 0, sizeof(ctx));
 	ctx.statement = true;
 	ctx.shipped_relid = shipped_relid;
+	ctx.top = query;
+	bad = query_ok(query, &ctx);
+	if (bad && reason != NULL)
+		*reason = ctx.reason ? ctx.reason : "it cannot be shipped";
+	return !bad;
+}
+
+/*
+ * The multi-relation mode (design 5 and 17, step 5): an INSERT whose source reads
+ * several distributed tables of one colocation group (and reference tables).
+ */
+bool
+kingres_shard_stmt_shippable_colocated(Query *query, Oid target_relid, int colocation_id,
+									   const char **reason)
+{
+	ShipCtx		ctx;
+	bool		bad;
+
+	Assert(colocation_id != 0);
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.statement = true;
+	ctx.shipped_relid = target_relid;
+	ctx.colocation_id = colocation_id;
 	ctx.top = query;
 	bad = query_ok(query, &ctx);
 	if (bad && reason != NULL)

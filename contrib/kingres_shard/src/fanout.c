@@ -78,8 +78,14 @@
 #define FO_PRIV_ALL_ROWS	2
 #define FO_PRIV_COLOC		3	/* Integer: colocation group of the table (0: a reference table) */
 #define FO_PRIV_PLACEMENT	4	/* String: its placement when the statement was planned */
-#define FO_PRIV_NLOCKS		5
+#define FO_PRIV_KIND		5	/* Integer: FO_KIND_* */
+#define FO_PRIV_RELS		6	/* String: "relid:colocation," per relation of a colocated INSERT ... SELECT */
+#define FO_PRIV_NLOCKS		7
 /* then the lock names, then (host, port, local) per target */
+
+/* What the statement is (FO_PRIV_KIND). */
+#define FO_KIND_WRITE			0	/* a write to a reference table, an UPDATE or DELETE of a distributed table */
+#define FO_KIND_INSERT_SELECT	1	/* a colocated INSERT ... SELECT, shipped whole (design 11.7) */
 
 /*
  * The mark of the local part that is about to run through SPI (design 4.4, review P2B-01).
@@ -115,6 +121,8 @@ typedef struct KsFanoutState
 	bool		all_rows;
 	int			colocation_id;	/* of the table, 0 for a reference table */
 	int64		plan_placement;	/* its placement when the targets were chosen */
+	int			kind;			/* FO_KIND_* */
+	char	   *rels;			/* FO_KIND_INSERT_SELECT: the relations and what they were when planned */
 	List	   *targets;		/* of KsFanTarget * */
 	List	   *locknames;		/* reference tables to lock on every node first */
 	bool		done;
@@ -410,9 +418,49 @@ fo_executor_start(QueryDesc *queryDesc, int eflags)
 		standard_ExecutorStart(queryDesc, eflags);
 }
 
+/* "relid:colocation," for each relation, the colocation 0 for a reference table. */
+static char *
+relations_signature(List *relids)
+{
+	StringInfoData buf;
+	ListCell   *lc;
+
+	initStringInfo(&buf);
+	foreach(lc, relids)
+	{
+		const KsDistTable *dt = kingres_shard_lookup_dist_table(lfirst_oid(lc));
+
+		appendStringInfo(&buf, "%u:%d,", lfirst_oid(lc),
+						 (dt == NULL || dt->is_reference) ? 0 : dt->colocation_id);
+	}
+	return buf.data;
+}
+
+static PlannedStmt *make_fanout_plan(Query *parse, char *sql, List *targets, bool all_rows,
+									 List *relids, List *locknames, int kind, int64 place);
+
 PlannedStmt *
 kingres_shard_make_fanout_plan(Query *parse, char *sql, List *targets,
 								bool all_rows, List *relids, List *locknames)
+{
+	return make_fanout_plan(parse, sql, targets, all_rows, relids, locknames, FO_KIND_WRITE, 0);
+}
+
+/*
+ * The plan of a colocated INSERT ... SELECT that every group runs whole (11.7).  `place` is the
+ * placement number the statement was decided with (the text carries it too); `relids` are the
+ * relations of the statement, of which the plan remembers what each was.
+ */
+PlannedStmt *
+kingres_shard_make_insert_select_plan(Query *parse, char *sql, List *targets, int64 place,
+									  List *relids)
+{
+	return make_fanout_plan(parse, sql, targets, true, relids, NIL, FO_KIND_INSERT_SELECT, place);
+}
+
+static PlannedStmt *
+make_fanout_plan(Query *parse, char *sql, List *targets, bool all_rows, List *relids,
+				 List *locknames, int kind, int64 place)
 {
 	bool		returns_rows = (parse->returningList != NIL);
 	List	   *private;
@@ -436,7 +484,10 @@ kingres_shard_make_fanout_plan(Query *parse, char *sql, List *targets,
 						 makeInteger(all_rows ? 1 : 0));
 	private = lappend(private, makeInteger(colocation_id));
 	private = lappend(private, makeString(psprintf(INT64_FORMAT,
+												   place != 0 ? place :
 												   kingres_shard_placement_hash(kingres_shard_lookup_colocation(colocation_id)))));
+	private = lappend(private, makeInteger(kind));
+	private = lappend(private, makeString(kind == FO_KIND_INSERT_SELECT ? relations_signature(relids) : ""));
 	private = lappend(private, makeInteger(list_length(locknames)));
 	foreach(lc, locknames)
 		private = lappend(private, makeString(pstrdup((char *) lfirst(lc))));
@@ -470,6 +521,8 @@ fo_create_scan_state(CustomScan *cscan)
 	s->all_rows = intVal(list_nth(p, FO_PRIV_ALL_ROWS)) != 0;
 	s->colocation_id = intVal(list_nth(p, FO_PRIV_COLOC));
 	s->plan_placement = pg_strtoint64(strVal(list_nth(p, FO_PRIV_PLACEMENT)));
+	s->kind = intVal(list_nth(p, FO_PRIV_KIND));
+	s->rels = pstrdup(strVal(list_nth(p, FO_PRIV_RELS)));
 	nlocks = intVal(list_nth(p, FO_PRIV_NLOCKS));
 	for (i = 0; i < nlocks; i++)
 		s->locknames = lappend(s->locknames, pstrdup(strVal(list_nth(p, FO_PRIV_NLOCKS + 1 + i))));
@@ -483,6 +536,46 @@ fo_create_scan_state(CustomScan *cscan)
 		s->targets = lappend(s->targets, t);
 	}
 	return (Node *) s;
+}
+
+/*
+ * A cached or generic plan of a colocated INSERT ... SELECT was decided for relations that were
+ * what they were when it was made (design 10.4): the target and the sources distributed in the
+ * colocation group of the plan, the others reference tables.  Every change of the catalog
+ * invalidates the plan through the relation cache, and this is the second defence, which holds
+ * when an invalidation was missed: a table that became a reference table, a local table, or
+ * another group's, makes the plan wrong, and nothing has been sent yet.
+ */
+static void
+check_relations_unchanged(KsFanoutState *s)
+{
+	char	   *p = s->rels;
+
+	while (*p != '\0')
+	{
+		char	   *end;
+		Oid			relid = (Oid) strtoul(p, &end, 10);
+		int			coloc;
+		const KsDistTable *dt;
+		int			now;
+
+		if (*end != ':')
+			elog(ERROR, "malformed relation list in the plan of a colocated INSERT ... SELECT");
+		coloc = (int) strtol(end + 1, &end, 10);
+		if (*end != ',')
+			elog(ERROR, "malformed relation list in the plan of a colocated INSERT ... SELECT");
+		p = end + 1;
+
+		dt = kingres_shard_lookup_dist_table(relid);
+		now = (dt == NULL) ? -1 : (dt->is_reference ? 0 : dt->colocation_id);
+		if (now != coloc)
+			ereport(ERROR,
+					(errcode(ERRCODE_KINGRES_STALE_MAP),
+					 errmsg("table \"%s\" is no longer what it was when this INSERT ... SELECT was planned",
+							get_rel_name(relid) ? get_rel_name(relid) : "(dropped)"),
+					 errdetail("The plan ships the statement whole to every shard group, which is right only while the tables keep their colocation group."),
+					 errhint("Repeat the statement; it is planned again.")));
+	}
 }
 
 static void
@@ -505,6 +598,8 @@ fo_begin_scan(CustomScanState *node, EState *estate, int eflags)
 				 errmsg("cannot execute a write statement in a read-only transaction")));
 	kingres_shard_refuse_replica_role(s->colocation_id == 0 ?
 									  "a reference table" : "a distributed table on several shard groups");
+	if (s->kind == FO_KIND_INSERT_SELECT)
+		check_relations_unchanged(s);
 
 	tupdesc = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
 	s->ncols = tupdesc->natts;
@@ -967,6 +1062,10 @@ run_all(KsFanoutState *s)
 		KsFanTarget *t = (KsFanTarget *) lfirst(lc);
 		uint64		count;
 
+		/* a point per group: kill:n or wait stops the statement between two groups */
+		if (s->kind == FO_KIND_INSERT_SELECT)
+			kingres_shard_fault_point("insel_before_group");
+
 		if (t->is_local)
 		{
 			count = run_local(s, params, true);
@@ -983,7 +1082,16 @@ run_all(KsFanoutState *s)
 
 			kingres_shard_begin_write_xact(kc);
 			values = kingres_shard_params_to_text(params, &types, &nparams);
-			res = kingres_shard_exec_params(kc, s->sql, nparams, types, values, true);
+			if (s->kind == FO_KIND_INSERT_SELECT)
+			{
+				/* the error of a group is turned into what it means (KS001 on a change of primary, 4.6) */
+				res = kingres_shard_exec_params(kc, s->sql, nparams, types, values, false);
+				if (res == NULL || (PQresultStatus(res) != PGRES_COMMAND_OK &&
+									PQresultStatus(res) != PGRES_TUPLES_OK))
+					kingres_shard_fragment_error(kc, res, "colocated INSERT ... SELECT");
+			}
+			else
+				res = kingres_shard_exec_params(kc, s->sql, nparams, types, values, true);
 			count = strtoull(PQcmdTuples(res), NULL, 10);
 			if (s->all_rows && s->returns_rows)
 				store_remote_rows(s, res);
@@ -1005,9 +1113,13 @@ run_all(KsFanoutState *s)
 							   (unsigned long long) count),
 					 errhint("Compare the table on the nodes; kingres.create_reference_table() copies it again only on a new node.")));
 		total += count;
+		if (s->kind == FO_KIND_INSERT_SELECT)
+			kingres_shard_fault_point("insel_after_group");
 	}
 	(void) have_local;
 	kingres_shard_fault_point("fanout_after_run");
+	if (s->kind == FO_KIND_INSERT_SELECT)
+		kingres_shard_fault_point("insel_before_recheck");
 
 	/*
 	 * The map version rule (design/shard-phase4.md): a write to a distributed
@@ -1102,6 +1214,8 @@ fo_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 	const char *p;
 	bool		pending_space = false;
 
+	if (s->kind == FO_KIND_INSERT_SELECT)
+		ExplainPropertyText("Pushed", "colocated INSERT ... SELECT (every group reads and writes its own buckets)", es);
 	ExplainPropertyInteger("Nodes", NULL, list_length(s->targets), es);
 	ExplainPropertyText("Result", s->all_rows ? "sum over the nodes" : "reference table: copies must agree", es);
 

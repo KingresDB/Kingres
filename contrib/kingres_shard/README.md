@@ -47,10 +47,15 @@ describes what is implemented and how to use it.
   - an `UPDATE` or `DELETE` of one distributed table that spans groups and can be
     shipped whole is run on every group that owns buckets of the table;
   - a write to a reference table is run on every node;
-  - an `INSERT` whose rows belong to several groups (a multi-row `VALUES`,
-    `INSERT ... SELECT`, a single row whose key is computed) and `COPY ... FROM`
-    are run by the row router, which sends each row to the group that owns its
-    bucket in batches ("Bulk writes through the row router" below);
+  - an `INSERT ... SELECT` whose target and sources are colocated and joined on the
+    distribution key is shipped whole to every group, which reads and writes its own
+    buckets (no row passes through this node); `ON CONFLICT DO UPDATE` is allowed
+    there ("Colocated INSERT ... SELECT" below);
+  - any other `INSERT` whose rows belong to several groups (a multi-row `VALUES`,
+    an `INSERT ... SELECT` that is not colocated, a single row whose key is
+    computed) and `COPY ... FROM` are run by the row router, which sends each row
+    to the group that owns its bucket in batches ("Bulk writes through the row
+    router" below);
   - anything else (an `UPDATE` or `DELETE` that cannot be shipped, an insert that the
     router does not take) is refused with a "not supported yet" error that says what
     to change.
@@ -524,6 +529,7 @@ the files of the extension, because the dump creates the extension.
 | `kingres_shard.enable_distributed_scan` | on | When off, a `SELECT` that spans shard groups raises the phase 1 error instead of reading the other groups (to forbid slow cross-group queries). |
 | `kingres_shard.scan_fetch_size` | 1000 | Rows requested from another group at a time by the distributed scan. |
 | `kingres_shard.enable_bulk_routing` | on | Off: an `INSERT` that goes to several shard groups is refused as in 0.5 (a multi-row `VALUES`, `INSERT ... SELECT`, a single row whose key is not a constant). A single row with a constant key never needed the router and is not affected. `USERSET`; it grants nothing. |
+| `kingres_shard.enable_colocated_insert_select` | on | Off: a colocated `INSERT ... SELECT` is not shipped whole: it goes through the row router when it can (no `ON CONFLICT DO UPDATE`) and is refused when it cannot. `USERSET`; it chooses among statements that give the same answer, and grants nothing. A cached plan keeps the path it was made with (as for every planner setting). |
 | `kingres_shard.enable_copy_routing` | on | Off: `COPY ... FROM` into a distributed table of a cluster with several groups is refused as in 0.5. `USERSET`. |
 | `kingres_shard.insert_batch_rows` | 1000 | Rows per batch that the row router sends to one group (1 to 100000). |
 | `kingres_shard.insert_batch_bytes` | 1MB | Text bytes per batch per group, the sum of the lengths of the values (16kB to 64MB). The memory of a bulk write is about two batches per group, whatever the number of rows. |
@@ -1099,7 +1105,8 @@ statement) with `BeginCopyFrom` and `NextCopyFrom`. **Refused**: `FREEZE`, `WHER
 bucket partition named directly. The error context names the line and the column. `pg_stat_progress_copy`
 is not updated.
 
-**Still refused for `INSERT`**: `ON CONFLICT DO UPDATE`, a `WITH` clause on the statement (put it inside the
+**Still refused for `INSERT`** (through the router; a colocated `INSERT ... SELECT` is shipped whole and
+allows `DO UPDATE`, see the next section): `ON CONFLICT DO UPDATE`, a `WITH` clause on the statement (put it inside the
 `SELECT`), `RETURNING` with `OLD`/`NEW` or an expression that is not shippable, an insert that reads a
 security barrier view or a view of another owner, an insert through a view `WITH CHECK OPTION` (the check
 would be lost), `session_replication_role` other than `origin`, a parallel
@@ -1113,6 +1120,67 @@ other session the same text is an ordinary statement and is routed like one.
 
 **New SQLSTATEs and messages.** None. `KS001` is raised for the changes of placement named above; the
 refusals use `0A000`. The messages of the refused forms are listed in `sql/bulk_plans.sql`.
+
+## Colocated `INSERT ... SELECT`, shipped whole (phase 2b, step 5)
+
+When the target of an `INSERT ... SELECT` and every distributed table its `SELECT` reads are in one
+colocation group, and the `SELECT` is joined and restricted so that each row of its result is made on the
+group that owns it, the whole statement is sent to every group of the target and run there, inside the
+distributed transaction of the session: each group reads its own buckets and writes its own buckets, no row
+passes through this node, and the count and the `RETURNING` rows are the sums over the groups. The plan is the
+"Kingres Fan-out Write" custom scan with a line `Pushed: colocated INSERT ... SELECT`, and its `Remote SQL` is
+the text that the groups run, starting with the comment `/* kingres:insert-select-fragment place=<n> */`
+(`place` is the placement number of the colocation group, which a group compares with its own after planning).
+The switch is `kingres_shard.enable_colocated_insert_select`.
+
+**What qualifies.** All of these (the analysis is `src/pushdown.c`, shared with the later pushdown paths):
+
+- the target is a distributed table and every distributed table of the `SELECT` is of its colocation group;
+  reference tables may be joined anywhere an inner join, or the nullable side of an outer join, allows;
+- the distributed tables of the `SELECT` are joined by equalities of their distribution keys (in `WHERE`,
+  in an inner `ON`, or in the `ON` of the outer join whose two sides they are on): one key class;
+  an outer join keeps its preserved side distributed, and a `FULL JOIN` is shipped only between two
+  distributed sides;
+- the distribution column of the target is given directly by a key of that class (not an expression of it, and not
+  a key of a table on the nullable side of an outer join): the row is then made, and stored, on the same group;
+- the `SELECT` is closed: an aggregate, `DISTINCT`, or grouping is by a key of the class (a `SELECT` without
+  `GROUP BY` but with an aggregate is not shipped); no `LIMIT`, `OFFSET`, `DISTINCT ON`, window function,
+  sub-select, `WITH`, set operation, `FOR UPDATE`, view, function or `VALUES` in `FROM`;
+- every expression is built in and immutable, on built-in types, with the default or the `C` collation, as in
+  "Which statements are shipped" above; a column that the statement does not name must have a default
+  that is the same everywhere (a constant: the group applies it), and a serial, identity, volatile or stable
+  (`now()`) default is computed once, at this node, by the row router; the OID of a table or function that is
+  not built in (`'t'::regclass`) is not shipped;
+- the target has no trigger or rule of a user, no row-level security and no `WITH CHECK OPTION`; the sources have
+  no row-level security and are not read with the rights of another role.
+
+A statement that does not qualify takes the row router (or its refusals) exactly as before, with the same
+rows and errors; `SET client_min_messages = debug1` says why a statement was not shipped.
+
+**`ON CONFLICT`.** None, `DO NOTHING`, and `DO UPDATE` (with an inference clause or `ON CONSTRAINT`), under
+the rules of design 11.7: the `SET` list does not assign the distribution column; the `SET` and `WHERE`
+expressions are shippable and use only the target and `EXCLUDED`; every unique index of the target has the
+distribution column among its key columns (PostgreSQL already requires it of a partitioned table). Two
+rows conflict only if their keys are equal, so on the same group: the count, the `RETURNING` rows and the
+error "ON CONFLICT DO UPDATE command cannot affect row a second time" are those of one node, and the whole
+statement fails and rolls back everywhere. `DO SELECT` (PostgreSQL 19) is not shipped.
+
+**Consistency.** The groups commit together by the two-phase commit of the fan-out. A bucket that moves, or a group
+that changes its primary, between the plan and the end of the statement is `KS001` with every change rolled back
+(the plan number is compared before the first group runs, `place=` by each group after planning, and the
+placement of every group after the last one ran; a move of a bucket of a group that already ran waits for the
+transaction). A cached or generic plan checks at its start that its relations are still what they were
+(distributed in the same group, or reference). Each group runs the statement under one snapshot of its own,
+so a source read twice by the same statement is one state of that group; between groups the skew of the scan
+remains. A group that fails is reported as the remote error, or as `KS001` when it has a standby (a failover may
+be in progress).
+
+**What an operator sees.** `EXPLAIN` shows the line `Pushed:` and the text of the groups. The setting is
+`kingres_shard.enable_colocated_insert_select`; fault points `insel_before_group`, `insel_after_group` and
+`insel_before_recheck` exist for the tests. The groups run it in a session that this node opened, and refuse
+the same text in any other session as an ordinary statement; a forged fragment is `0A000`, a stale
+placement `KS001`. During a rolling upgrade set the switch off on every node (the groups must run the same
+version, which the placement probes of the scans check).
 
 ## Limitations in phase 2a
 

@@ -145,6 +145,22 @@ kingres_shard_catalog(void)
 }
 
 /*
+ * kingres_shard_catalog_generation
+ *
+ * How many times this backend has loaded the cache.  Everything a caller took from the cache is
+ * dangling once the number changed: code that calls something that may load the cache again
+ * (parse analysis takes locks, which process invalidations) compares it before it goes on with
+ * pointers of its own.
+ */
+static int64 catalog_generation = 0;
+
+int64
+kingres_shard_catalog_generation(void)
+{
+	return catalog_generation;
+}
+
+/*
  * kingres_shard_catalog_relid
  *
  * The OID of one of the catalog tables, or InvalidOid when the extension is
@@ -358,6 +374,7 @@ catalog_load(void)
 
 	memset(&cat, 0, sizeof(cat));
 	cat.local_group_id = -1;
+	catalog_generation++;
 
 	nsp = get_namespace_oid(KINGRES_SHARD_SCHEMA, true);
 	for (i = 0; i < (int) NUM_CATALOG_TABLES; i++)
