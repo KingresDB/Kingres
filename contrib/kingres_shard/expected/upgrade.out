@@ -245,7 +245,7 @@ SELECT kingres.recover_prepared_transactions();
 -- reference table has neither.
 UPDATE kingres.dist_table SET dist_column = NULL;
 ERROR:  new row for relation "dist_table" violates check constraint "dist_table_shape_check"
-DETAIL:  Failing row contains (upg_t, hash, null, 1, null, null).
+DETAIL:  Failing row contains (upg_t, hash, null, 1, null, null, null).
 BEGIN;
 UPDATE kingres.dist_table SET method = 'reference', dist_column = NULL, colocation_id = NULL;
 SELECT method, dist_column, colocation_id FROM kingres.dist_table;

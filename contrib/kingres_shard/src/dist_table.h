@@ -47,7 +47,9 @@ extern void kingres_shard_append_partition_tree(StringInfo buf, const char *nsp,
 								  const KsColocation *coloc, int group, const char *partby,
 								  List *leafnames, List *leafbounds);
 extern void kingres_shard_append_partitions(StringInfo buf, const char *nsp, const char *prefix,
-											const char *parent, const KsColocation *coloc, int group);
+											const char *parent, const KsColocation *coloc, int group, const char *with_clause);
+/* the storage parameters, as a WITH (...) clause for CREATE TABLE, of the table (the recorded ones of a distributed table); never NULL */
+extern char *kingres_shard_with_clause(Oid relid, char **reloptions_literal, MemoryContext cxt);
 extern List *kingres_shard_remote_primaries(MemoryContext callercxt);
 extern void kingres_shard_exec_on_node(KsConn *kc, const char *script);
 extern char *kingres_shard_remote_tail_script(const DdlSet *ddl);

@@ -1181,3 +1181,54 @@ A table partitioned by the user (RANGE or LIST) can be distributed: every leaf i
 - `ALTER TABLE s`/`CREATE INDEX ON s` of a logical partition name: PostgreSQL's "does not exist" stands.
 - `orphan_table` of check_cluster for a partitioned orphan; the access-method mutant (needs a second access method).
 - Not run: the whole TAP suite, t/046, the in-tree meson run; the cluster mutex was not taken.
+
+### Increments 9.8, dependent views, and 9.9, storage parameters (2026-11-20)
+
+#### 9.8: kingres_shard.dependent_views = 'recreate'
+
+Design decisions
+- The option is a session setting, not an argument: the public functions have fixed signatures and the design's option belongs to the control plane request
+  (9.6 maps it to the setting). `refuse` (default) keeps today's behaviour; `recreate` drops and recreates. An online operation reads the setting once, in
+  `begin_table_operation`, and keeps it in its spec (a session that finishes it later does not change what it does with the views); the options of the
+  report carry it too, because the control sessions that check a request again do not have the caller's setting.
+- `internal_view_capture(regclass[])` (node-local): the plain views that depend on the tables, transitively, in an order in which they can be created (a view after
+  the views it uses), with definition (`pg_get_viewdef`), column names, owner, reloptions, privileges (`aclexplode`, with the grant option and PUBLIC),
+  view and column comments. `blockers` lists what cannot be recreated: a materialized view, a rule other than the view's own, a trigger, privileges on a
+  column, a function that uses the row type, a publication of the view, a dependency cycle.
+- Where: blocking `create_distributed_table` (C, local node), `alter_distributed_table`, `undistribute_table`, the single-node switch of the online engine and
+  `internal_switch_attempt_dist`. The views are captured on every node that holds the table (a view is local to the node where it was created), dropped in the
+  transaction of the swap (last first) and recreated after it (first first). Recreating is inside the same transaction and the same locks as the swap.
+- The report (`table_change_report`) with `recreate`: the views are not blockers; what cannot be recreated is a `dependent_object` blocker naming the node;
+  for an undistribute a view on a node other than the one that keeps the table is a blocker ("the table will be on node N only"). Everything is refused before
+  anything is made, and no operation is recorded.
+
+Lessons of the build
+- Reading a view (`pg_get_viewdef`, deparse) takes a lock on the tables it uses: capturing on another node after the switch took ACCESS EXCLUSIVE there
+  waits forever. The capture of `internal_switch_attempt_dist` is made before the ACCESS EXCLUSIVE loop. The check of the report runs in a control session on every
+  node (this one too): in the caller's transaction it left a lock on the source that the switch (another session) needed, and the operation deadlocked with its own caller.
+- The first plan recreated views on every node on undistribute; the table is gone from the others, so it is now a refusal.
+- The scan's rule that a distributed table read through a view of another owner needs `security_invoker` shows in the tests: the views over distributed tables are `security_invoker`.
+
+Tests: t/195_dependent_views (default refuses; every operation, blocking and online; views on views (the view that sorts before the one it uses); a view on node 2;
+privileges, owner, options, comments identical; the views are bound to the new table; refusals (materialized view on a table and on a view, trigger, column privilege, rule;
+a view on node 3 of a distributed table; undistribute with a view on node 2); an error at four points of the switch and in the blocking alter after the drop; a reader of a view on
+node 2 waits for the switch and reads through the new table). Mutants w01-w15, all killed (the order mutant needed the test with the alphabetically earlier view name).
+
+#### 9.9: storage parameters carried
+
+Design decisions
+- `kingres.dist_table.reloptions text[]`, synchronized (the catalog snapshot carries it). A partitioned parent cannot have storage parameters, so they are on the
+  bucket partitions; the record is what every later table gets.
+- `internal_reloptions_of(regclass)`: the recorded ones of a distributed table, else the table's own; `internal_with_clause(text[])`.
+- Applied: blocking create (C: `kingres_shard_append_partitions` with a WITH clause on every node), the shadow script of the rebuild engine (create and alter
+  online), `internal_table_ddl` for a plain target (undistribute, reference tables), the bucket move (the source's bucket partition reloptions travel in
+  `internal_move_inspect`, the target copy is made WITH them). Recorded: the C create, the C swap of the single-node engine, blocking alter, online alter.
+- The report: `storage_parameters` is a note, not a blocker.
+- Not done: the parameters of a partition of a user-partitioned table (still `partition_local_object`), and keeping the record in step with a later `ALTER TABLE ... SET`
+  on a bucket partition.
+
+Tests: t/196_storage_parameters. Mutants x01-x13.
+
+#### Results and files
+
+See the report. Files changed outside tests: src/dist_table.c, dist_table.h, kingres_shard.c, kingres_shard.h, rebuild.c, the SQL delta; planner and pushdown files untouched.

@@ -94,6 +94,7 @@ int			kingres_shard_move_switch_attempts = 20;
 int			kingres_shard_move_cleanup_delay = 600;	/* s */
 int			kingres_shard_rebuild_batch_rows = 10000;
 int			kingres_shard_max_partition_leaves = 8192;
+int			kingres_shard_dependent_views = 0;
 int			kingres_shard_rebuild_drain_threshold = 1000;
 int			kingres_shard_rebuild_lock_timeout = 200;	/* ms */
 int			kingres_shard_rebuild_switch_timeout = 10000;	/* ms */
@@ -137,6 +138,12 @@ check_shippable_extensions(char **newval, void **extra, GucSource source)
  * Define the GUCs and install the hooks.  Every hook saves the previous
  * value and the hook functions call it (coding-standards.md, 1.7).
  */
+static const struct config_enum_entry dependent_views_options[] = {
+	{"refuse", 0, false},
+	{"recreate", 1, false},
+	{NULL, 0, false}
+};
+
 void
 _PG_init(void)
 {
@@ -380,6 +387,15 @@ _PG_init(void)
 							NULL, NULL, NULL);
 
 	/* The rebuild engine of the table operations (design/shard-phase9.md, "Settings"). */
+	DefineCustomEnumVariable("kingres_shard.dependent_views",
+							 "What a table operation does with the plain views that use the table it replaces.",
+							 "refuse: a view that uses the table stops the operation. recreate: the views (and the views on them) are dropped in the switch and made again on the new table, with their owner, options, privileges and comments.",
+							 &kingres_shard_dependent_views,
+							 0,
+							 dependent_views_options,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+
 	DefineCustomIntVariable("kingres_shard.max_partition_leaves",
 							"Most leaves (buckets times user partitions) that one distributed table may have.",
 							"A user-partitioned table is refused when its bucket count times its number of partitions is more than this.",

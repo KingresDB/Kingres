@@ -251,7 +251,7 @@ kingres_shard_remote_fk_script(Oid relid, const char *column)
  */
 void
 kingres_shard_append_partitions(StringInfo buf, const char *nsp, const char *prefix, const char *parent,
-				  const KsColocation *coloc, int group)
+				  const KsColocation *coloc, int group, const char *with_clause)
 {
 	int			i;
 
@@ -264,12 +264,41 @@ kingres_shard_append_partitions(StringInfo buf, const char *nsp, const char *pre
 			continue;
 		part = psprintf("%s_b%04d", prefix, b);
 		appendStringInfo(buf,
-						 "CREATE TABLE %s.%s PARTITION OF %s.%s FOR VALUES WITH (MODULUS %d, REMAINDER %d);\n",
+						 "CREATE TABLE %s.%s PARTITION OF %s.%s FOR VALUES WITH (MODULUS %d, REMAINDER %d) %s;\n",
 						 quote_identifier(nsp), quote_identifier(part),
 						 quote_identifier(nsp), quote_identifier(parent),
-						 kingres_shard_bucket_modulus(coloc, b), b);
+						 kingres_shard_bucket_modulus(coloc, b), b, with_clause != NULL ? with_clause : "");
 		pfree(part);
 	}
+}
+
+/*
+ * with_clause
+ *
+ * The storage parameters of a table as a WITH (...) clause (empty when it has none), and, through *reloptions_literal, as an
+ * array literal for the catalog (NULL when it has none).  A distributed table's are the recorded ones: its parent cannot have
+ * them (reloptions.c).  Needs an SPI connection.
+ */
+char *
+kingres_shard_with_clause(Oid relid, char **reloptions_literal, MemoryContext cxt)
+{
+	Oid			argtypes[1] = {OIDOID};
+	Datum		values[1];
+	char	   *result;
+	MemoryContext old;
+
+	values[0] = ObjectIdGetDatum(relid);
+	kingres_shard_run_spi("SELECT " KINGRES_SHARD_SCHEMA ".internal_with_clause(" KINGRES_SHARD_SCHEMA ".internal_reloptions_of($1::pg_catalog.oid::pg_catalog.regclass)), "
+						  KINGRES_SHARD_SCHEMA ".internal_reloptions_of($1::pg_catalog.oid::pg_catalog.regclass)::pg_catalog.text",
+						  1, argtypes, values);
+	old = MemoryContextSwitchTo(cxt);
+	result = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+	if (result == NULL)
+		result = pstrdup("");
+	if (reloptions_literal != NULL)
+		*reloptions_literal = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
+	MemoryContextSwitchTo(old);
+	return result;
 }
 
 /*
@@ -553,6 +582,9 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 	Oid			newrelid;
 	int64		nrows;
 	char	   *partby = NULL;
+	char	   *views = NULL;
+	char	   *with_clause = NULL;
+	char	   *reloptions = NULL;
 	List	   *leafnames = NIL;
 	List	   *leafbounds = NIL;
 	int64		nread = 0;
@@ -685,6 +717,9 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 						relname, nbuckets * list_length(leafnames), nbuckets, list_length(leafnames),
 						kingres_shard_max_partition_leaves)));
 
+	/* The storage parameters of the table: the bucket partitions get them (a partitioned table cannot have them). */
+	with_clause = kingres_shard_with_clause(relid, &reloptions, callercxt);
+
 	/* 3. The statements that recreate the table (before it is replaced). */
 	kingres_shard_fetch_ddl(relid, column, true, &ddl, callercxt);
 
@@ -703,7 +738,7 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 	if (partby != NULL)
 		kingres_shard_append_partition_tree(&script, nspname, relname, shadow, placement, local_group, partby, leafnames, leafbounds);
 	else
-		kingres_shard_append_partitions(&script, nspname, relname, shadow, placement, local_group);
+		kingres_shard_append_partitions(&script, nspname, relname, shadow, placement, local_group, with_clause);
 	kingres_shard_run_spi(script.data, 0, NULL, NULL);
 
 	/*
@@ -726,7 +761,7 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 		if (partby != NULL)
 			kingres_shard_append_partition_tree(&script, nspname, relname, shadow, placement, n->group_id, partby, leafnames, leafbounds);
 		else
-			kingres_shard_append_partitions(&script, nspname, relname, shadow, placement, n->group_id);
+			kingres_shard_append_partitions(&script, nspname, relname, shadow, placement, n->group_id, with_clause);
 		kingres_shard_exec_on_node(kc, script.data);
 	}
 	kingres_shard_fault_point("distribute_after_shadow");
@@ -747,6 +782,30 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 							relname, nrows, nread, nacked)));
 	}
 	kingres_shard_fault_point("distribute_before_swap");
+
+	/*
+	 * The views that use the table follow it by their OIDs: with kingres_shard.dependent_views = recreate they are captured here
+	 * (a view that cannot be recreated stops the call) and dropped; they are made again on the new table below.
+	 */
+	if (kingres_shard_dependent_views == 1)
+	{
+		Oid			vt[1] = {TEXTOID};
+		Datum		vv[1];
+
+		vv[0] = CStringGetTextDatum(quote_qualified_identifier(nspname, relname));
+		if (SPI_execute_with_args("SELECT " KINGRES_SHARD_SCHEMA ".internal_views_capture(ARRAY[$1], false, 'recreate')::pg_catalog.text",
+								  1, vt, vv, NULL, true, 1) != SPI_OK_SELECT || SPI_processed != 1)
+			elog(ERROR, "could not capture the views of table \"%s\"", relname);
+		{
+			MemoryContext old = MemoryContextSwitchTo(callercxt);
+
+			views = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+			MemoryContextSwitchTo(old);
+		}
+		vt[0] = TEXTOID;
+		vv[0] = CStringGetTextDatum(views);
+		kingres_shard_run_spi("SELECT " KINGRES_SHARD_SCHEMA ".internal_views_drop($1::pg_catalog.jsonb)", 1, vt, vv);
+	}
 
 	/*
 	 * 6. The swap.  The old table is dropped (readers wait from here to the
@@ -787,6 +846,15 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 	if (ddl.post_local.len > 0)
 		kingres_shard_run_spi(ddl.post_local.data, 0, NULL, NULL);
 
+	if (views != NULL)
+	{
+		Oid			vt[1] = {TEXTOID};
+		Datum		vv[1];
+
+		vv[0] = CStringGetTextDatum(views);
+		kingres_shard_run_spi("SELECT " KINGRES_SHARD_SCHEMA ".internal_views_recreate($1::pg_catalog.jsonb)", 1, vt, vv);
+	}
+
 	/* 8. Record the table. */
 	argtypes[0] = OIDOID;
 	argtypes[1] = TEXTOID;
@@ -794,10 +862,14 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 	values[0] = ObjectIdGetDatum(newrelid);
 	values[1] = CStringGetTextDatum(column);
 	values[2] = Int32GetDatum(colocation_id);
-	kingres_shard_run_spi("INSERT INTO " KINGRES_SHARD_SCHEMA ".dist_table (relid, method, dist_column, colocation_id) "
-			"VALUES ($1::pg_catalog.oid::pg_catalog.regclass, 'hash', "
-			"$2::pg_catalog.name, $3)",
-			3, argtypes, values);
+	{
+		char	   *ins = psprintf("INSERT INTO " KINGRES_SHARD_SCHEMA ".dist_table (relid, method, dist_column, colocation_id, reloptions) "
+								"VALUES ($1::pg_catalog.oid::pg_catalog.regclass, 'hash', "
+								"$2::pg_catalog.name, $3, %s::pg_catalog.text[])",
+								reloptions != NULL ? quote_literal_cstr(reloptions) : "NULL");
+
+		kingres_shard_run_spi(ins, 3, argtypes, values);
+	}
 	if (partby != NULL)
 	{
 		StringInfoData names;

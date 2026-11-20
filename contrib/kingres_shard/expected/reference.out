@@ -128,9 +128,9 @@ SELECT count(*), sum(d1.v) FROM d1 JOIN r1 ON r1.id = d1.id;
 
 -- The catalog is synchronized with the name of the table, not its OID.
 SELECT jsonb_path_query_array(kingres.internal_catalog_snapshot(), '$.dist_table[*] ? (@.method == "reference")') AS ref_snapshot;
-                                                                       ref_snapshot                                                                       
-----------------------------------------------------------------------------------------------------------------------------------------------------------
- [{"name": "r1", "method": "reference", "schema": "public", "dist_column": null, "colocation_id": null, "partition_key": null, "partition_method": null}]
+                                                                                 ref_snapshot                                                                                 
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ [{"name": "r1", "method": "reference", "schema": "public", "reloptions": null, "dist_column": null, "colocation_id": null, "partition_key": null, "partition_method": null}]
 (1 row)
 
 -- Dropping the table removes it from the catalog.

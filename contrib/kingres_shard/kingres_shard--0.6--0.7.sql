@@ -36,12 +36,16 @@
 ALTER TABLE kingres.dist_table
     ADD COLUMN partition_method text,
     ADD COLUMN partition_key    text,
+    ADD COLUMN reloptions       text[],
     ADD CONSTRAINT dist_table_partition_check CHECK (
         (partition_method IS NULL AND partition_key IS NULL)
         OR (method = 'hash' AND partition_method IN ('range', 'list') AND partition_key IS NOT NULL));
 
 COMMENT ON COLUMN kingres.dist_table.partition_method IS
     'NULL, ''range'' or ''list'': how the user partitioned the table below the hash level';
+COMMENT ON COLUMN kingres.dist_table.reloptions IS
+    'The storage parameters of the table (fillfactor, autovacuum_*, ...) as pg_class.reloptions gives them: a partitioned table cannot have them, so they are applied to the bucket partitions, and carried to every new table that replaces this one';
+
 COMMENT ON COLUMN kingres.dist_table.partition_key IS
     'The partition key of the user partitioning as pg_get_partkeydef gives it, without the method';
 
@@ -216,7 +220,8 @@ SELECT jsonb_build_object(
                                        'dist_column', d.dist_column,
                                        'colocation_id', d.colocation_id,
                                        'partition_method', d.partition_method,
-                                       'partition_key', d.partition_key)
+                                       'partition_key', d.partition_key,
+                                       'reloptions', d.reloptions)
                                      ORDER BY d.colocation_id, ns.nspname, cl.relname)
                               FROM kingres.dist_table d
                               JOIN pg_catalog.pg_class cl ON cl.oid OPERATOR(pg_catalog.=) d.relid::pg_catalog.oid
@@ -281,7 +286,7 @@ BEGIN
     FOR r IN SELECT * FROM pg_catalog.jsonb_to_recordset(snapshot OPERATOR(pg_catalog.->) 'dist_table')
                   AS x(schema pg_catalog.text, name pg_catalog.text, method pg_catalog.text,
                        dist_column pg_catalog.name, colocation_id pg_catalog.int4,
-                       partition_method pg_catalog.text, partition_key pg_catalog.text)
+                       partition_method pg_catalog.text, partition_key pg_catalog.text, reloptions pg_catalog.text[])
     LOOP
         rid := pg_catalog.to_regclass(pg_catalog.format('%I.%I', r.schema, r.name));
         IF rid IS NULL THEN
@@ -289,8 +294,8 @@ BEGIN
                 USING ERRCODE = 'undefined_table';
         END IF;
         INSERT INTO kingres.dist_table (relid, method, dist_column, colocation_id,
-                                        partition_method, partition_key)
-        VALUES (rid, r.method, r.dist_column, r.colocation_id, r.partition_method, r.partition_key);
+                                        partition_method, partition_key, reloptions)
+        VALUES (rid, r.method, r.dist_column, r.colocation_id, r.partition_method, r.partition_key, r.reloptions);
         -- Plans of statements on the table were made with the old catalog.
         PERFORM kingres.internal_invalidate_relation(rid);
     END LOOP;
@@ -830,7 +835,7 @@ BEGIN
     n := n + 1; ord := n; scope := 'both';
     -- A NULL column means a reference table: a plain table, a full copy per node.
     IF p_column IS NULL THEN
-        stmt := format('CREATE TABLE %s (%s)', qtarget, coldefs);
+        stmt := format('CREATE TABLE %s (%s)%s', qtarget, coldefs, COALESCE(NULLIF(' ' || kingres.internal_with_clause(kingres.internal_reloptions_of(p_relid)), ' '), ''));
     ELSE
         stmt := format('CREATE TABLE %s (%s) PARTITION BY HASH (%I)', qtarget, coldefs, p_column);
     END IF;
@@ -1086,6 +1091,8 @@ CREATE FUNCTION kingres.table_change_report(kind text, relation regclass,
     AS $$
 #variable_conflict use_variable
 DECLARE
+    v_dv      pg_catalog.text := COALESCE(options OPERATOR(pg_catalog.->>) 'dependent_views', pg_catalog.current_setting('kingres_shard.dependent_views', true), 'refuse');
+    v_vb      pg_catalog.text;
     rep       pg_catalog.jsonb := '[]'::pg_catalog.jsonb;
     c         pg_catalog.pg_class%ROWTYPE;
     nsp       pg_catalog.text;
@@ -1243,9 +1250,10 @@ BEGIN
                        'blocker', 'inheritance', qname, pfx OPERATOR(pg_catalog.||) 'inheritance is not supported'));
         END IF;
         IF c.reloptions IS NOT NULL THEN
+            -- carried: applied to the bucket partitions of a distributed table, to the new table of an undistribute and to a reference table
             rep := rep OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_array(
-                       'blocker', 'storage_parameters', qname,
-                       pfx OPERATOR(pg_catalog.||) 'storage parameters are not supported yet'));
+                       'note', 'storage_parameters', qname,
+                       pg_catalog.format('the storage parameters (%s) are carried to the bucket partitions of the new table', pg_catalog.array_to_string(c.reloptions, ', '))));
         END IF;
         IF c.relrowsecurity OR c.relforcerowsecurity
            OR EXISTS (SELECT 1 FROM pg_catalog.pg_policy p WHERE p.polrelid OPERATOR(pg_catalog.=) relation::pg_catalog.oid) THEN
@@ -1314,6 +1322,7 @@ BEGIN
                     AND d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass
                     AND d.refobjid OPERATOR(pg_catalog.=) relation::pg_catalog.oid
                     AND rw.ev_class OPERATOR(pg_catalog.<>) relation::pg_catalog.oid
+                    AND v_dv OPERATOR(pg_catalog.<>) 'recreate'
                   ORDER BY 2
         LOOP
             rep := rep OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_array(
@@ -1321,6 +1330,12 @@ BEGIN
                        pfx OPERATOR(pg_catalog.||) pg_catalog.format('%s %s depends on the table; the table is replaced by a new one',
                            CASE r.relkind WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' ELSE 'object' END, r.name)));
         END LOOP;
+        IF v_dv OPERATOR(pg_catalog.=) 'recreate' THEN
+            FOR v_vb IN SELECT b.detail FROM kingres.internal_view_blockers(ARRAY[relation::pg_catalog.text], false) b LOOP
+                rep := rep OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_array(
+                           'blocker', 'dependent_object', qname, pfx OPERATOR(pg_catalog.||) v_vb));
+            END LOOP;
+        END IF;
         FOR r IN SELECT DISTINCT p.oid::pg_catalog.regprocedure::pg_catalog.text AS name
                    FROM pg_catalog.pg_depend d
                    JOIN pg_catalog.pg_proc p ON p.oid OPERATOR(pg_catalog.=) d.objid
@@ -1789,6 +1804,14 @@ BEGIN
                                pg_catalog.format('colocation group %s is busy: a bucket is being moved', v_dt.colocation_id)));
                 END IF;
             END IF;
+            IF v_dv OPERATOR(pg_catalog.=) 'recreate' THEN
+                FOR v_vb IN SELECT b.detail FROM kingres.internal_view_blockers(
+                              (SELECT pg_catalog.array_agg(comp.relid::pg_catalog.text) FROM kingres.internal_fk_component(relation, COALESCE((options OPERATOR(pg_catalog.->>) 'cascade_via_foreign_keys')::pg_catalog.bool, false)) comp), true,
+                              CASE WHEN kind OPERATOR(pg_catalog.=) 'undistribute' THEN kingres.internal_group_node(COALESCE((options OPERATOR(pg_catalog.->>) 'target_group')::pg_catalog.int4, 0)) END) b LOOP
+                    rep := rep OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_array(
+                               'blocker', 'dependent_object', qname, pfx OPERATOR(pg_catalog.||) v_vb));
+                END LOOP;
+            END IF;
             -- the tables go through DROP TABLE: a view (or anything else) that uses one of them stops it, on this node or another
             FOR r IN SELECT DISTINCT c2.oid::pg_catalog.regclass::pg_catalog.text AS name, comp.relid::pg_catalog.text AS dep
                        FROM kingres.internal_fk_component(relation, COALESCE((options OPERATOR(pg_catalog.->>) 'cascade_via_foreign_keys')::pg_catalog.bool, false)) comp
@@ -1796,6 +1819,7 @@ BEGIN
                        JOIN pg_catalog.pg_rewrite rw ON d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_rewrite'::pg_catalog.regclass AND rw.oid OPERATOR(pg_catalog.=) d.objid
                        JOIN pg_catalog.pg_class c2 ON c2.oid OPERATOR(pg_catalog.=) rw.ev_class
                       WHERE c2.oid OPERATOR(pg_catalog.<>) comp.relid::pg_catalog.oid
+                        AND v_dv OPERATOR(pg_catalog.<>) 'recreate'
                       ORDER BY 1
             LOOP
                 rep := rep OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_array(
@@ -2462,6 +2486,8 @@ CREATE FUNCTION kingres.begin_table_operation(kind text, relation regclass, opti
     SET search_path = pg_catalog, kingres, pg_temp
     AS $$
 DECLARE
+    v_id    pg_catalog.int8;
+    v_dv    pg_catalog.text;
     v_kind  pg_catalog.text := kind;
     v_opts  pg_catalog.jsonb := COALESCE(options, '{}'::pg_catalog.jsonb);
     v_self  pg_catalog.int4;
@@ -2475,14 +2501,19 @@ BEGIN
             USING ERRCODE = 'feature_not_supported',
                   HINT = 'This version has distribute, distribute_reference, undistribute and alter.';
     END IF;
+    v_dv := COALESCE(v_opts OPERATOR(pg_catalog.->>) 'dependent_views', pg_catalog.current_setting('kingres_shard.dependent_views', true), 'refuse');
+    v_opts := v_opts OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_object('dependent_views', v_dv);
     -- the blockers of the report are refused here, in the session of the caller: nothing is recorded
     PERFORM kingres.internal_raise_blockers(v_kind, relation, v_opts OPERATOR(pg_catalog.||) '{"mode": "online"}'::pg_catalog.jsonb);
     SELECT l.node_id INTO v_self FROM kingres.local_node l;
     v_ms := (SELECT s.setting::pg_catalog.int4 FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) 'kingres_shard.node_timeout') * 4000;
-    RETURN kingres.internal_exec_scalar(v_self,
+    v_id := kingres.internal_exec_scalar(v_self,
         pg_catalog.format('SELECT kingres.%s(%L, %L::pg_catalog.oid::pg_catalog.regclass, %L::pg_catalog.jsonb)',
                           CASE WHEN v_kind IN ('undistribute', 'alter') THEN 'internal_begin_dist_operation' ELSE 'internal_begin_table_operation' END,
                           v_kind, relation::pg_catalog.oid, v_opts::pg_catalog.text), v_ms)::pg_catalog.int8;
+    -- the setting is the operation's: a session that finishes it later does not change what it does with the views
+    PERFORM kingres.internal_exec_scalar(v_self, pg_catalog.format('UPDATE kingres.table_operation SET spec = spec || pg_catalog.jsonb_build_object(''dependent_views'', %L::pg_catalog.text) WHERE op_id = %s RETURNING 1', v_dv, v_id));
+    RETURN v_id;
 END;
 $$;
 
@@ -2784,6 +2815,7 @@ CREATE FUNCTION kingres.internal_switch_attempt(p_op bigint)
     SET search_path = pg_catalog, kingres, pg_temp
     AS $$
 DECLARE
+    v_views    pg_catalog.jsonb;
     v_rec      kingres.table_operation%ROWTYPE;
     v_rel      pg_catalog.regclass;
     v_log      pg_catalog.text;
@@ -2850,8 +2882,12 @@ BEGIN
     -- what is left of the time bounds the waits of the swap
     PERFORM pg_catalog.set_config('lock_timeout',
         GREATEST(1, pg_catalog.floor(EXTRACT(epoch FROM (v_deadline OPERATOR(pg_catalog.-) pg_catalog.clock_timestamp())) OPERATOR(pg_catalog.*) 1000))::pg_catalog.int4::pg_catalog.text, true);
+    -- the views that use the table follow it to the old copy by their OIDs: they are dropped here and made again on the new table
+    v_views := kingres.internal_views_capture(ARRAY[v_rel::pg_catalog.text], false, COALESCE(v_rec.spec OPERATOR(pg_catalog.->>) 'dependent_views', 'refuse'));
+    PERFORM kingres.internal_views_drop(v_views);
     v_old := kingres.internal_swap_table(p_op, v_rel, v_col, (v_rec.spec OPERATOR(pg_catalog.->>) 'colocation_id')::pg_catalog.int4,
                                          kingres.internal_setting('kingres_shard.table_cleanup_delay')::pg_catalog.int4);
+    PERFORM kingres.internal_views_recreate(v_views);
     RETURN v_old;
 END;
 $$;
@@ -3971,6 +4007,7 @@ CREATE FUNCTION kingres.undistribute_table(relation regclass, cascade_via_foreig
     SET client_min_messages = warning
     AS $$
 DECLARE
+    v_views   pg_catalog.jsonb;
     v_ver     pg_catalog.text;
     v_self    pg_catalog.int4;
     v_tgroup  pg_catalog.int4 := COALESCE(target_group, 0);
@@ -4064,9 +4101,11 @@ BEGIN
     END LOOP;
 
     PERFORM kingres.internal_fault_point('undistribute_after_copy');
+    v_views := kingres.internal_views_capture(v_hash || v_ref, true, pg_catalog.current_setting('kingres_shard.dependent_views', true), v_target);
 
     -- from here the statements of the extension are written by hand on every node
     PERFORM pg_catalog.set_config('kingres_shard.enable_routing', 'off', true);
+    PERFORM kingres.internal_views_drop(v_views);
     FOR nd IN SELECT n.node_id FROM kingres.node n WHERE n.role OPERATOR(pg_catalog.=) 'primary' AND n.is_active ORDER BY n.node_id LOOP
         IF nd.node_id OPERATOR(pg_catalog.<>) v_self THEN
             PERFORM kingres.internal_branch_exec(nd.node_id, 'SET LOCAL kingres_shard.enable_routing = off');
@@ -4097,6 +4136,7 @@ BEGIN
             PERFORM kingres.internal_run_on(v_target, t.stmt);
         END LOOP;
     END LOOP;
+    PERFORM kingres.internal_views_recreate(v_views);
     PERFORM pg_catalog.set_config('kingres_shard.enable_routing', v_routing, true);
     PERFORM kingres.sync_catalog();
     PERFORM kingres.internal_fault_point('undistribute_after_swap');
@@ -4196,6 +4236,8 @@ CREATE FUNCTION kingres.alter_distributed_table(relation regclass, distribution_
     AS $$
 #variable_conflict use_variable
 DECLARE
+    v_ro      pg_catalog.jsonb;
+    v_views   pg_catalog.jsonb;
     v_ver      pg_catalog.text;
     v_self     pg_catalog.int4;
     v_routing  pg_catalog.text := COALESCE(pg_catalog.current_setting('kingres_shard.enable_routing', true), 'on');
@@ -4375,6 +4417,10 @@ BEGIN
     PERFORM kingres.internal_fault_point('alter_after_copy');
     -- the swap
     PERFORM pg_catalog.set_config('kingres_shard.enable_routing', 'off', true);
+    v_views := kingres.internal_views_capture(v_set, true, pg_catalog.current_setting('kingres_shard.dependent_views', true));
+    -- the storage parameters of the old tables, to record them for the new ones
+    SELECT pg_catalog.jsonb_object_agg(x, pg_catalog.to_jsonb(kingres.internal_reloptions_of(x::pg_catalog.regclass))) INTO v_ro FROM pg_catalog.unnest(v_set) x;
+    PERFORM kingres.internal_views_drop(v_views);
     FOR nd IN SELECT n.node_id FROM kingres.node n WHERE n.role OPERATOR(pg_catalog.=) 'primary' AND n.is_active ORDER BY n.node_id LOOP
         FOR t IN SELECT e->>'stmt' AS stmt FROM pg_catalog.jsonb_array_elements(v_ddl) e WHERE (e->>'scope') OPERATOR(pg_catalog.=) 'local_pre'
                   ORDER BY (SELECT h.i FROM pg_catalog.unnest(v_set) WITH ORDINALITY h(y, i) WHERE h.y OPERATOR(pg_catalog.=) (e->>'t')), (e->>'ord')::pg_catalog.int4 LOOP
@@ -4393,9 +4439,12 @@ BEGIN
             END LOOP;
         END LOOP;
     END LOOP;
+    PERFORM kingres.internal_views_recreate(v_views);
     -- the catalog: the new tables, and no group without a table
     FOREACH x IN ARRAY v_set LOOP
-        INSERT INTO kingres.dist_table (relid, method, dist_column, colocation_id) VALUES (x::pg_catalog.regclass, 'hash', v_col, v_new);
+        INSERT INTO kingres.dist_table (relid, method, dist_column, colocation_id, reloptions)
+        VALUES (x::pg_catalog.regclass, 'hash', v_col, v_new,
+                CASE WHEN pg_catalog.jsonb_typeof(v_ro OPERATOR(pg_catalog.->) x) OPERATOR(pg_catalog.=) 'array' THEN ARRAY(SELECT pg_catalog.jsonb_array_elements_text(v_ro OPERATOR(pg_catalog.->) x)) END);
     END LOOP;
     IF NOT EXISTS (SELECT 1 FROM kingres.dist_table d WHERE d.colocation_id OPERATOR(pg_catalog.=) v_dt.colocation_id)
        AND NOT EXISTS (SELECT 1 FROM kingres.bucket_move m WHERE m.colocation_id OPERATOR(pg_catalog.=) v_dt.colocation_id) THEN
@@ -4771,6 +4820,8 @@ CREATE FUNCTION kingres.internal_switch_attempt_dist(p_op bigint)
     AS $$
 #variable_conflict use_variable
 DECLARE
+    v_ro       pg_catalog.text[];
+    v_views    pg_catalog.jsonb;
     v_rec      kingres.table_operation%ROWTYPE;
     v_spec     pg_catalog.jsonb;
     v_rel      pg_catalog.regclass;
@@ -4829,6 +4880,7 @@ BEGIN
     v_deadline := pg_catalog.clock_timestamp() OPERATOR(pg_catalog.+)
                   pg_catalog.make_interval(secs => kingres.internal_setting('kingres_shard.rebuild_switch_timeout')::pg_catalog.int4 OPERATOR(pg_catalog./) 1000.0);
     PERFORM kingres.internal_fault_point('rebuild_before_switch');
+    v_ro := kingres.internal_reloptions_of(v_rel);
 
     -- the catalog lock first (the order of every catalog change), then the tables, in node order
     PERFORM pg_catalog.set_config('lock_timeout', v_lt, true);
@@ -4859,6 +4911,8 @@ BEGIN
     END LOOP;
     PERFORM kingres.internal_fault_point('rebuild_switch_after_final_replay');
 
+    -- the views are read before ACCESS EXCLUSIVE is taken on the nodes: reading a view takes a lock on its tables
+    v_views := kingres.internal_views_capture(ARRAY[v_q], true, COALESCE(v_spec OPERATOR(pg_catalog.->>) 'dependent_views', 'refuse'), v_target);
     FOR nd IN SELECT n.node_id FROM kingres.node n WHERE n.role OPERATOR(pg_catalog.=) 'primary' AND n.is_active ORDER BY n.node_id LOOP
         IF nd.node_id OPERATOR(pg_catalog.=) v_self THEN
             PERFORM kingres.internal_lock_table(v_rel, 'ACCESS EXCLUSIVE');
@@ -4878,6 +4932,8 @@ BEGIN
 
     -- the swap, on every node, with the statements of the extension off
     PERFORM pg_catalog.set_config('kingres_shard.enable_routing', 'off', true);
+    -- the views that use the table follow it to the old copy by their OIDs: they are dropped on every node and made again on the new table
+    PERFORM kingres.internal_views_drop(v_views);
     FOR nd IN SELECT n.node_id FROM kingres.node n WHERE n.role OPERATOR(pg_catalog.=) 'primary' AND n.is_active ORDER BY n.node_id LOOP
         v_has := v_target IS NULL OR nd.node_id OPERATOR(pg_catalog.=) v_target;
         IF nd.node_id OPERATOR(pg_catalog.<>) v_self THEN
@@ -4930,13 +4986,14 @@ BEGIN
             PERFORM kingres.internal_fault_point('rebuild_switch_after_local_swap');
         END IF;
     END LOOP;
+    PERFORM kingres.internal_views_recreate(v_views);
     PERFORM kingres.internal_fault_point('rebuild_switch_after_remote_swap');
 
     -- the catalog: the old table is out, the new one is in
     DELETE FROM kingres.dist_table d WHERE d.relid OPERATOR(pg_catalog.=) v_rel;
     IF v_target IS NULL THEN
-        INSERT INTO kingres.dist_table (relid, method, dist_column, colocation_id)
-        VALUES (pg_catalog.to_regclass(v_q), 'hash', v_col, v_new);
+        INSERT INTO kingres.dist_table (relid, method, dist_column, colocation_id, reloptions)
+        VALUES (pg_catalog.to_regclass(v_q), 'hash', v_col, v_new, v_ro);
     END IF;
     PERFORM pg_catalog.set_config('kingres_shard.enable_routing', v_routing, true);
     UPDATE kingres.table_operation o
@@ -5445,7 +5502,7 @@ CREATE FUNCTION kingres.internal_move_tree(p_oid oid)
     LANGUAGE sql STABLE
     SET search_path = pg_catalog, kingres, pg_temp
     AS $$
-SELECT CASE WHEN c.relkind OPERATOR(pg_catalog.=) 'p'
+SELECT pg_catalog.jsonb_build_object('reloptions', pg_catalog.to_jsonb(c.reloptions)) OPERATOR(pg_catalog.||) CASE WHEN c.relkind OPERATOR(pg_catalog.=) 'p'
             THEN pg_catalog.jsonb_build_object(
                      'partby', pg_catalog.pg_get_partkeydef(c.oid),
                      'leaves', COALESCE((SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
@@ -5591,8 +5648,8 @@ DECLARE
     l       pg_catalog.record;
 BEGIN
     PERFORM kingres.internal_require_superuser();
-    FOR t IN SELECT x.schema_name, x.table_name, x.replident, x.partby, x.leaves
-               FROM pg_catalog.jsonb_to_recordset(p_tables) AS x(schema_name text, table_name text, replident text, partby text, leaves jsonb)
+    FOR t IN SELECT x.schema_name, x.table_name, x.replident, x.partby, x.leaves, x.reloptions
+               FROM pg_catalog.jsonb_to_recordset(p_tables) AS x(schema_name text, table_name text, replident text, partby text, leaves jsonb, reloptions text[])
     LOOP
         v_part := kingres.internal_bucket_part_name(t.table_name, p_bucket);
         v_parent := pg_catalog.format('%I.%I', t.schema_name, t.table_name)::pg_catalog.regclass;
@@ -5602,9 +5659,11 @@ BEGIN
         IF pg_catalog.to_regclass(pg_catalog.format('%I.%I', t.schema_name, v_part)) IS NOT NULL THEN
             CONTINUE;	-- made by an earlier attempt of this move
         END IF;
-        EXECUTE pg_catalog.format('CREATE TABLE %I.%I (LIKE %I.%I INCLUDING ALL)%s',
+        -- LIKE does not copy the storage parameters: they are those of the bucket partition on the source
+        EXECUTE pg_catalog.format('CREATE TABLE %I.%I (LIKE %I.%I INCLUDING ALL)%s %s',
                                   t.schema_name, v_part, t.schema_name, t.table_name,
-                                  CASE WHEN t.partby IS NOT NULL THEN ' PARTITION BY ' OPERATOR(pg_catalog.||) t.partby ELSE '' END);
+                                  CASE WHEN t.partby IS NOT NULL THEN ' PARTITION BY ' OPERATOR(pg_catalog.||) t.partby ELSE '' END,
+                                  kingres.internal_with_clause(t.reloptions));
         IF t.partby IS NOT NULL THEN
             -- a user-partitioned bucket partition: the copy is the same tree, a leaf per user partition with its bound and its access method
             FOR l IN SELECT y.name, y.bound, y.am FROM pg_catalog.jsonb_to_recordset(t.leaves) AS y(name text, bound text, am text) ORDER BY y.name LOOP
@@ -5742,3 +5801,328 @@ CREATE OR REPLACE VIEW kingres.buckets AS
                        pg_catalog.quote_ident(ns.nspname) || '.' ||
                        pg_catalog.quote_ident(p.partition_name)) AS part) lp
              ON true;
+
+-- ---------------------------------------------------------------------------
+-- Increment 9.8: dependent plain views are recreated on the new table (kingres_shard.dependent_views = 'recreate')
+-- ---------------------------------------------------------------------------
+
+-- On this node: the plain views that depend on the tables, directly or through other views, in the order in which they can be created, with
+-- everything that recreates them (definition, columns, owner, options, privileges, comments).  "blockers" names what cannot be recreated:
+-- a materialized view, a rule other than a view's own, a trigger on a view, a privilege on a column of a view, a function that uses the row type
+-- of a view, a publication of a view.
+CREATE FUNCTION kingres.internal_view_capture(p_rels regclass[])
+    RETURNS jsonb
+    LANGUAGE plpgsql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_tabs   pg_catalog.oid[];
+    v_front  pg_catalog.oid[];
+    v_new    pg_catalog.oid[];
+    v_all    pg_catalog.oid[] := ARRAY[]::pg_catalog.oid[];
+    v_done   pg_catalog.oid[] := ARRAY[]::pg_catalog.oid[];
+    v_pick   pg_catalog.oid;
+    v_blk    pg_catalog.text[] := ARRAY[]::pg_catalog.text[];
+    v_views  pg_catalog.jsonb := '[]'::pg_catalog.jsonb;
+    c        pg_catalog.record;
+    q        pg_catalog.text;
+BEGIN
+    SELECT pg_catalog.array_agg(x::pg_catalog.oid) INTO v_tabs FROM pg_catalog.unnest(p_rels) x;
+    v_front := v_tabs;
+    LOOP
+        SELECT pg_catalog.array_agg(DISTINCT cl.oid) INTO v_new
+          FROM pg_catalog.pg_depend d
+          JOIN pg_catalog.pg_rewrite rw ON d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_rewrite'::pg_catalog.regclass AND rw.oid OPERATOR(pg_catalog.=) d.objid
+          JOIN pg_catalog.pg_class cl ON cl.oid OPERATOR(pg_catalog.=) rw.ev_class
+         WHERE d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass
+           AND d.refobjid OPERATOR(pg_catalog.=) ANY (v_front)
+           AND cl.oid OPERATOR(pg_catalog.<>) d.refobjid
+           AND NOT (cl.oid OPERATOR(pg_catalog.=) ANY (v_tabs)) AND NOT (cl.oid OPERATOR(pg_catalog.=) ANY (v_all));
+        EXIT WHEN v_new IS NULL;
+        v_all := v_all OPERATOR(pg_catalog.||) v_new;
+        v_front := v_new;
+    END LOOP;
+
+    FOR c IN SELECT cl.oid, cl.relkind, cl.relname, n.nspname, cl.reltype FROM pg_catalog.pg_class cl JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) cl.relnamespace
+              WHERE cl.oid OPERATOR(pg_catalog.=) ANY (v_all) ORDER BY n.nspname, cl.relname
+    LOOP
+        q := pg_catalog.format('%I.%I', c.nspname, c.relname);
+        IF c.relkind OPERATOR(pg_catalog.<>) 'v' THEN
+            v_blk := v_blk OPERATOR(pg_catalog.||) pg_catalog.format('%s %s depends on the table and is not a plain view',
+                         CASE c.relkind WHEN 'm' THEN 'materialized view' ELSE 'object' END, q);
+            CONTINUE;
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_catalog.pg_rewrite rw WHERE rw.ev_class OPERATOR(pg_catalog.=) c.oid AND rw.rulename OPERATOR(pg_catalog.<>) '_RETURN') THEN
+            v_blk := v_blk OPERATOR(pg_catalog.||) pg_catalog.format('view %s has a rule of its own', q);
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t WHERE t.tgrelid OPERATOR(pg_catalog.=) c.oid AND NOT t.tgisinternal) THEN
+            v_blk := v_blk OPERATOR(pg_catalog.||) pg_catalog.format('view %s has a trigger', q);
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a WHERE a.attrelid OPERATOR(pg_catalog.=) c.oid AND a.attnum OPERATOR(pg_catalog.>) 0 AND a.attacl IS NOT NULL) THEN
+            v_blk := v_blk OPERATOR(pg_catalog.||) pg_catalog.format('view %s has privileges on columns', q);
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_proc p ON p.oid OPERATOR(pg_catalog.=) d.objid
+                    WHERE d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_proc'::pg_catalog.regclass AND d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_type'::pg_catalog.regclass
+                      AND d.refobjid OPERATOR(pg_catalog.=) c.reltype) THEN
+            v_blk := v_blk OPERATOR(pg_catalog.||) pg_catalog.format('a function uses the row type of view %s', q);
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_catalog.pg_publication_rel pr WHERE pr.prrelid OPERATOR(pg_catalog.=) c.oid) THEN
+            v_blk := v_blk OPERATOR(pg_catalog.||) pg_catalog.format('a publication publishes view %s', q);
+        END IF;
+    END LOOP;
+
+    -- the order of creation: a view comes after the views it uses
+    WHILE pg_catalog.cardinality(v_done) OPERATOR(pg_catalog.<) pg_catalog.cardinality(v_all) LOOP
+        v_pick := NULL;
+        SELECT cl.oid INTO v_pick FROM pg_catalog.pg_class cl JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) cl.relnamespace
+         WHERE cl.oid OPERATOR(pg_catalog.=) ANY (v_all) AND NOT (cl.oid OPERATOR(pg_catalog.=) ANY (v_done))
+           AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_rewrite rw ON d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_rewrite'::pg_catalog.regclass AND rw.oid OPERATOR(pg_catalog.=) d.objid
+                            WHERE rw.ev_class OPERATOR(pg_catalog.=) cl.oid AND d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass
+                              AND d.refobjid OPERATOR(pg_catalog.=) ANY (v_all) AND d.refobjid OPERATOR(pg_catalog.<>) cl.oid AND NOT (d.refobjid OPERATOR(pg_catalog.=) ANY (v_done)))
+         ORDER BY n.nspname, cl.relname LIMIT 1;
+        IF v_pick IS NULL THEN
+            v_blk := v_blk OPERATOR(pg_catalog.||) 'the views depend on each other in a cycle'::pg_catalog.text;
+            EXIT;
+        END IF;
+        v_done := v_done OPERATOR(pg_catalog.||) v_pick;
+        SELECT v_views OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
+                   'schema', n.nspname, 'name', cl.relname,
+                   'cols', (SELECT pg_catalog.jsonb_agg(a.attname ORDER BY a.attnum) FROM pg_catalog.pg_attribute a WHERE a.attrelid OPERATOR(pg_catalog.=) cl.oid AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped),
+                   'def', pg_catalog.regexp_replace(pg_catalog.pg_get_viewdef(cl.oid, true), ';[[:space:]]*$', ''),
+                   'owner', pg_catalog.pg_get_userbyid(cl.relowner),
+                   'options', COALESCE(pg_catalog.to_jsonb(cl.reloptions), 'null'::pg_catalog.jsonb),
+                   'has_acl', cl.relacl IS NOT NULL,
+                   'acl', COALESCE((SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+                                        'grantee', CASE WHEN x.grantee OPERATOR(pg_catalog.=) 0 THEN 'PUBLIC' ELSE pg_catalog.pg_get_userbyid(x.grantee) END,
+                                        'priv', x.privilege_type, 'grant', x.is_grantable) ORDER BY x.grantee, x.privilege_type)
+                                      FROM pg_catalog.aclexplode(cl.relacl) x WHERE x.grantee OPERATOR(pg_catalog.<>) cl.relowner), '[]'::pg_catalog.jsonb),
+                   'comment', pg_catalog.obj_description(cl.oid, 'pg_class'),
+                   'colcomments', COALESCE((SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('col', a.attname, 'comment', pg_catalog.col_description(cl.oid, a.attnum)) ORDER BY a.attnum)
+                                              FROM pg_catalog.pg_attribute a WHERE a.attrelid OPERATOR(pg_catalog.=) cl.oid AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped
+                                               AND pg_catalog.col_description(cl.oid, a.attnum) IS NOT NULL), '[]'::pg_catalog.jsonb)))
+          INTO v_views
+          FROM pg_catalog.pg_class cl JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) cl.relnamespace WHERE cl.oid OPERATOR(pg_catalog.=) v_pick;
+    END LOOP;
+    RETURN pg_catalog.jsonb_build_object('views', v_views, 'blockers', pg_catalog.to_jsonb(v_blk));
+END;
+$$;
+
+-- On this node: drop the captured views, the last first.
+CREATE FUNCTION kingres.internal_view_drop(p_doc jsonb)
+    RETURNS void
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v pg_catalog.record;
+BEGIN
+    IF p_doc IS NULL OR pg_catalog.jsonb_array_length(COALESCE(p_doc OPERATOR(pg_catalog.->) 'views', '[]'::pg_catalog.jsonb)) OPERATOR(pg_catalog.=) 0 THEN
+        RETURN;
+    END IF;
+    FOR v IN SELECT e.value AS j FROM pg_catalog.jsonb_array_elements(p_doc OPERATOR(pg_catalog.->) 'views') WITH ORDINALITY e(value, ord) ORDER BY e.ord DESC LOOP
+        EXECUTE pg_catalog.format('DROP VIEW %I.%I', v.j OPERATOR(pg_catalog.->>) 'schema', v.j OPERATOR(pg_catalog.->>) 'name');
+    END LOOP;
+END;
+$$;
+
+-- On this node: create the captured views again, on the table that has the name of the old one now.
+CREATE FUNCTION kingres.internal_view_recreate(p_doc jsonb)
+    RETURNS void
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v pg_catalog.record;
+    a pg_catalog.record;
+    q pg_catalog.text;
+    o pg_catalog.text;
+BEGIN
+    IF p_doc IS NULL THEN
+        RETURN;
+    END IF;
+    FOR v IN SELECT e.value AS j FROM pg_catalog.jsonb_array_elements(COALESCE(p_doc OPERATOR(pg_catalog.->) 'views', '[]'::pg_catalog.jsonb)) WITH ORDINALITY e(value, ord) ORDER BY e.ord LOOP
+        q := pg_catalog.format('%I.%I', v.j OPERATOR(pg_catalog.->>) 'schema', v.j OPERATOR(pg_catalog.->>) 'name');
+        o := NULL;
+        IF pg_catalog.jsonb_typeof(v.j OPERATOR(pg_catalog.->) 'options') OPERATOR(pg_catalog.=) 'array' THEN
+            SELECT 'WITH (' OPERATOR(pg_catalog.||) pg_catalog.string_agg(x, ', ') OPERATOR(pg_catalog.||) ')' INTO o FROM pg_catalog.jsonb_array_elements_text(v.j OPERATOR(pg_catalog.->) 'options') x;
+        END IF;
+        EXECUTE pg_catalog.format('CREATE VIEW %s (%s) %s AS %s', q,
+                    (SELECT pg_catalog.string_agg(pg_catalog.quote_ident(x), ', ') FROM pg_catalog.jsonb_array_elements_text(v.j OPERATOR(pg_catalog.->) 'cols') x),
+                    COALESCE(o, ''), v.j OPERATOR(pg_catalog.->>) 'def');
+        EXECUTE pg_catalog.format('ALTER VIEW %s OWNER TO %I', q, v.j OPERATOR(pg_catalog.->>) 'owner');
+        IF (v.j OPERATOR(pg_catalog.->>) 'has_acl')::pg_catalog.bool THEN
+            EXECUTE pg_catalog.format('REVOKE ALL ON %s FROM PUBLIC', q);
+            FOR a IN SELECT e.value ->> 'grantee' AS grantee, e.value ->> 'priv' AS priv, (e.value ->> 'grant')::pg_catalog.bool AS gr
+                       FROM pg_catalog.jsonb_array_elements(v.j OPERATOR(pg_catalog.->) 'acl') e(value) LOOP
+                EXECUTE pg_catalog.format('GRANT %s ON %s TO %s%s', a.priv, q,
+                            CASE WHEN a.grantee OPERATOR(pg_catalog.=) 'PUBLIC' THEN 'PUBLIC' ELSE pg_catalog.quote_ident(a.grantee) END,
+                            CASE WHEN a.gr THEN ' WITH GRANT OPTION' ELSE '' END);
+            END LOOP;
+        END IF;
+        IF v.j OPERATOR(pg_catalog.->>) 'comment' IS NOT NULL THEN
+            EXECUTE pg_catalog.format('COMMENT ON VIEW %s IS %L', q, v.j OPERATOR(pg_catalog.->>) 'comment');
+        END IF;
+        FOR a IN SELECT e.value ->> 'col' AS col, e.value ->> 'comment' AS cm FROM pg_catalog.jsonb_array_elements(v.j OPERATOR(pg_catalog.->) 'colcomments') e(value) LOOP
+            EXECUTE pg_catalog.format('COMMENT ON COLUMN %s.%I IS %L', q, a.col, a.cm);
+        END LOOP;
+    END LOOP;
+END;
+$$;
+
+-- The captured views of every node that holds the tables (or of this node only), as {node id: document}; {} when the setting is "refuse".
+-- A view that cannot be recreated stops the operation here.
+CREATE FUNCTION kingres.internal_views_capture(p_rels text[], p_all bool, p_mode text, p_only int DEFAULT NULL)
+    RETURNS jsonb
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    nd    pg_catalog.record;
+    v_doc pg_catalog.jsonb;
+    v_out pg_catalog.jsonb := '{}'::pg_catalog.jsonb;
+    v_self pg_catalog.int4;
+    v_lit pg_catalog.text;
+BEGIN
+    IF p_mode IS DISTINCT FROM 'recreate' THEN
+        RETURN v_out;
+    END IF;
+    SELECT l.node_id INTO v_self FROM kingres.local_node l;
+    SELECT pg_catalog.string_agg(pg_catalog.quote_literal(x), ', ') INTO v_lit FROM pg_catalog.unnest(p_rels) x;
+    FOR nd IN SELECT n.node_id FROM kingres.node n WHERE n.role OPERATOR(pg_catalog.=) 'primary' AND n.is_active AND (p_all OR n.node_id OPERATOR(pg_catalog.=) v_self) ORDER BY n.node_id LOOP
+        IF nd.node_id OPERATOR(pg_catalog.=) v_self THEN
+            v_doc := kingres.internal_view_capture((SELECT pg_catalog.array_agg(x::pg_catalog.regclass) FROM pg_catalog.unnest(p_rels) x));
+        ELSE
+            v_doc := kingres.internal_exec_scalar(nd.node_id, pg_catalog.format('SELECT kingres.internal_view_capture(ARRAY[%s]::pg_catalog.regclass[])::pg_catalog.text', v_lit))::pg_catalog.jsonb;
+        END IF;
+        IF pg_catalog.jsonb_array_length(v_doc OPERATOR(pg_catalog.->) 'blockers') OPERATOR(pg_catalog.>) 0 THEN
+            RAISE EXCEPTION 'a view that depends on the table cannot be recreated on node %: %', nd.node_id,
+                  (SELECT pg_catalog.string_agg(x, '; ') FROM pg_catalog.jsonb_array_elements_text(v_doc OPERATOR(pg_catalog.->) 'blockers') x)
+                  USING ERRCODE = 'feature_not_supported';
+        END IF;
+        IF p_only IS NOT NULL AND nd.node_id OPERATOR(pg_catalog.<>) p_only AND pg_catalog.jsonb_array_length(v_doc OPERATOR(pg_catalog.->) 'views') OPERATOR(pg_catalog.>) 0 THEN
+            RAISE EXCEPTION 'the views on node % cannot be recreated: the table will be on node % only', nd.node_id, p_only USING ERRCODE = 'feature_not_supported';
+        END IF;
+        IF pg_catalog.jsonb_array_length(v_doc OPERATOR(pg_catalog.->) 'views') OPERATOR(pg_catalog.>) 0 THEN
+            v_out := v_out OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_object(nd.node_id::pg_catalog.text, v_doc);
+        END IF;
+    END LOOP;
+    RETURN v_out;
+END;
+$$;
+
+CREATE FUNCTION kingres.internal_views_drop(p_docs jsonb)
+    RETURNS void
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    e pg_catalog.record;
+    v_routing pg_catalog.text := COALESCE(pg_catalog.current_setting('kingres_shard.enable_routing', true), 'on');
+    v_self pg_catalog.int4 := (SELECT l.node_id FROM kingres.local_node l);
+BEGIN
+    -- the statements of the extension are off while the views are changed, here and in the branches; the caller's setting comes back
+    PERFORM pg_catalog.set_config('kingres_shard.enable_routing', 'off', true);
+    FOR e IN SELECT d.key, d.value FROM pg_catalog.jsonb_each(COALESCE(p_docs, '{}'::pg_catalog.jsonb)) d ORDER BY d.key::pg_catalog.int4 LOOP
+        IF e.key::pg_catalog.int4 OPERATOR(pg_catalog.=) v_self THEN
+            PERFORM kingres.internal_view_drop(e.value);
+        ELSE
+            PERFORM kingres.internal_run_on(e.key::pg_catalog.int4, pg_catalog.format('SET LOCAL kingres_shard.enable_routing = off; SELECT kingres.internal_view_drop(%L::pg_catalog.jsonb)', e.value::pg_catalog.text));
+        END IF;
+    END LOOP;
+    PERFORM pg_catalog.set_config('kingres_shard.enable_routing', v_routing, true);
+END;
+$$;
+
+CREATE FUNCTION kingres.internal_views_recreate(p_docs jsonb)
+    RETURNS void
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    e pg_catalog.record;
+    v_routing pg_catalog.text := COALESCE(pg_catalog.current_setting('kingres_shard.enable_routing', true), 'on');
+    v_self pg_catalog.int4 := (SELECT l.node_id FROM kingres.local_node l);
+BEGIN
+    -- the statements of the extension are off while the views are changed, here and in the branches; the caller's setting comes back
+    PERFORM pg_catalog.set_config('kingres_shard.enable_routing', 'off', true);
+    FOR e IN SELECT d.key, d.value FROM pg_catalog.jsonb_each(COALESCE(p_docs, '{}'::pg_catalog.jsonb)) d ORDER BY d.key::pg_catalog.int4 LOOP
+        IF e.key::pg_catalog.int4 OPERATOR(pg_catalog.=) v_self THEN
+            PERFORM kingres.internal_view_recreate(e.value);
+        ELSE
+            PERFORM kingres.internal_run_on(e.key::pg_catalog.int4, pg_catalog.format('SET LOCAL kingres_shard.enable_routing = off; SELECT kingres.internal_view_recreate(%L::pg_catalog.jsonb)', e.value::pg_catalog.text));
+        END IF;
+    END LOOP;
+    PERFORM pg_catalog.set_config('kingres_shard.enable_routing', v_routing, true);
+END;
+$$;
+
+-- What the report says about the views of the tables when the setting is "recreate": what cannot be recreated, on which node.
+CREATE FUNCTION kingres.internal_view_blockers(p_rels text[], p_all bool, p_only int DEFAULT NULL)
+    RETURNS TABLE (detail text)
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    nd    pg_catalog.record;
+    v_doc pg_catalog.jsonb;
+    v_self pg_catalog.int4;
+    v_lit pg_catalog.text;
+    x     pg_catalog.text;
+BEGIN
+    SELECT l.node_id INTO v_self FROM kingres.local_node l;
+    SELECT pg_catalog.string_agg(pg_catalog.quote_literal(r), ', ') INTO v_lit FROM pg_catalog.unnest(p_rels) r;
+    FOR nd IN SELECT n.node_id FROM kingres.node n WHERE n.role OPERATOR(pg_catalog.=) 'primary' AND n.is_active AND (p_all OR n.node_id OPERATOR(pg_catalog.=) v_self) ORDER BY n.node_id LOOP
+        BEGIN
+            -- in a session of its own on every node, this one too: the caller's transaction keeps no lock on the table, which the switch needs
+            v_doc := kingres.internal_exec_scalar(nd.node_id, pg_catalog.format('SELECT kingres.internal_view_capture(ARRAY[%s]::pg_catalog.regclass[])::pg_catalog.text', v_lit))::pg_catalog.jsonb;
+        EXCEPTION WHEN OTHERS OR query_canceled THEN
+            CONTINUE;
+        END;
+        FOR x IN SELECT e FROM pg_catalog.jsonb_array_elements_text(v_doc OPERATOR(pg_catalog.->) 'blockers') e LOOP
+            detail := pg_catalog.format('node %s: %s', nd.node_id, x);
+            RETURN NEXT;
+        END LOOP;
+        IF p_only IS NOT NULL AND nd.node_id OPERATOR(pg_catalog.<>) p_only AND pg_catalog.jsonb_array_length(v_doc OPERATOR(pg_catalog.->) 'views') OPERATOR(pg_catalog.>) 0 THEN
+            detail := pg_catalog.format('node %s: the views on the table cannot be recreated there: the table will be on node %s only', nd.node_id, p_only);
+            RETURN NEXT;
+        END IF;
+    END LOOP;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION
+    kingres.internal_view_capture(regclass[]),
+    kingres.internal_view_drop(jsonb),
+    kingres.internal_view_recreate(jsonb),
+    kingres.internal_views_capture(text[], bool, text, int),
+    kingres.internal_views_drop(jsonb),
+    kingres.internal_views_recreate(jsonb),
+    kingres.internal_view_blockers(text[], bool, int)
+    FROM PUBLIC;
+
+-- ---------------------------------------------------------------------------
+-- Increment 9.9: the storage parameters of a table are carried
+-- ---------------------------------------------------------------------------
+
+-- The storage parameters of a table that is about to be replaced: the recorded ones for a distributed table (its parent cannot have them),
+-- the table's own otherwise.
+CREATE FUNCTION kingres.internal_reloptions_of(p_relid regclass)
+    RETURNS text[]
+    LANGUAGE sql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+SELECT COALESCE((SELECT d.reloptions FROM kingres.dist_table d WHERE d.relid OPERATOR(pg_catalog.=) p_relid),
+                (SELECT c.reloptions FROM pg_catalog.pg_class c WHERE c.oid OPERATOR(pg_catalog.=) p_relid::pg_catalog.oid));
+$$;
+
+-- WITH (...) for CREATE TABLE, or nothing.
+CREATE FUNCTION kingres.internal_with_clause(p_opts text[])
+    RETURNS text
+    LANGUAGE sql IMMUTABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+SELECT CASE WHEN p_opts IS NULL OR pg_catalog.cardinality(p_opts) OPERATOR(pg_catalog.=) 0 THEN ''
+            ELSE 'WITH (' OPERATOR(pg_catalog.||) pg_catalog.array_to_string(p_opts, ', ') OPERATOR(pg_catalog.||) ')' END;
+$$;
+
+REVOKE ALL ON FUNCTION kingres.internal_reloptions_of(regclass), kingres.internal_with_clause(text[]) FROM PUBLIC;
