@@ -91,6 +91,7 @@ tests += {
       'reference',
       'ddl_single',
       'rebalance_plan',
+      'plan_strategies',
       'bulk_plans',
       'pushdown_shippable',
       'pushdown_plans',

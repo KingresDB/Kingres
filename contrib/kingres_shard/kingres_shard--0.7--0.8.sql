@@ -758,6 +758,393 @@ BEGIN
 END;
 $$;
 
+-- ---------------------------------------------------------------------------
+-- P10.3: capacity weights, the plan of a rebalance with strategies (design/shard-phase10.md, sections 4 and 5).
+-- ---------------------------------------------------------------------------
+
+-- The capacity of the group whose primary this node is.  The control plane keeps the weight per server and writes it to every node
+-- of the server, as it does should_have_shards.
+ALTER TABLE kingres.node
+    ADD COLUMN weight float8 NOT NULL DEFAULT 1,
+    ADD CONSTRAINT node_weight_check CHECK (weight > 0 AND weight <= 1000);
+
+-- A node row that does not say its weight (a catalog document of a map group that is not upgraded yet) has the weight 1.
+CREATE OR REPLACE FUNCTION kingres.internal_layout_defaults()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+BEGIN
+    IF TG_TABLE_NAME OPERATOR(pg_catalog.=) 'colocation' THEN
+        NEW.max_modulus := COALESCE(NEW.max_modulus, NEW.bucket_count);
+        NEW.placement_epoch := COALESCE(NEW.placement_epoch, 0);
+    ELSIF TG_TABLE_NAME OPERATOR(pg_catalog.=) 'node' THEN
+        NEW.weight := COALESCE(NEW.weight, 1);
+    ELSE
+        NEW.modulus := COALESCE(NEW.modulus,
+                                (SELECT c.bucket_count FROM kingres.colocation c WHERE c.colocation_id OPERATOR(pg_catalog.=) NEW.colocation_id),
+                                -- a row of a group that does not exist is refused by the foreign key, not by this default
+                                (CASE WHEN NEW.bucket OPERATOR(pg_catalog.>) 0 THEN NEW.bucket ELSE 0 END) OPERATOR(pg_catalog.+) 1);
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER node_layout_defaults BEFORE INSERT ON kingres.node
+    FOR EACH ROW EXECUTE FUNCTION kingres.internal_layout_defaults();
+
+-- The smallest cost of a bucket by_disk_size counts (an empty bucket is not free).
+-- (the setting kingres_shard.min_bucket_cost is defined by the library)
+
+-- kingres.set_node_property(node, should_have_shards, weight): NULL leaves a property as it is.  The two-argument form stays (the control plane
+-- asks for it by its signature).
+CREATE FUNCTION kingres.set_node_property(node_id int, should_have_shards bool, weight float8)
+    RETURNS void
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_node pg_catalog.int4 := node_id;
+    v_flag pg_catalog.bool := should_have_shards;
+    v_w    pg_catalog.float8 := weight;
+BEGIN
+    LOCK TABLE kingres.map_version IN EXCLUSIVE MODE;
+    PERFORM kingres.internal_require_map_group();
+    IF v_flag IS NULL AND v_w IS NULL THEN
+        RAISE EXCEPTION 'set_node_property needs should_have_shards or weight' USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF v_w IS NOT NULL AND (v_w OPERATOR(pg_catalog.<=) 0 OR v_w OPERATOR(pg_catalog.>) 1000 OR v_w IS NOT DISTINCT FROM 'NaN'::pg_catalog.float8) THEN
+        RAISE EXCEPTION 'the weight must be above 0 and at most 1000, not %', v_w USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    UPDATE kingres.node n
+       SET should_have_shards = COALESCE(v_flag, n.should_have_shards), weight = COALESCE(v_w, n.weight)
+     WHERE n.node_id OPERATOR(pg_catalog.=) v_node;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'node % does not exist', v_node USING ERRCODE = 'undefined_object';
+    END IF;
+    PERFORM kingres.sync_catalog();
+END;
+$$;
+COMMENT ON FUNCTION kingres.set_node_property(int, bool, float8) IS
+    'Change whether a node accepts buckets and the weight of its group in a rebalance (NULL leaves a property as it is); map group primary only; atomic';
+REVOKE ALL ON FUNCTION kingres.set_node_property(int, bool, float8) FROM PUBLIC;
+
+-- What a plan reads, as one document: {"groups": [...], "items": [...]}.  A group is every shard group that owns a bucket or has an
+-- active primary; "avail" says it has an active primary, "recv" that it may receive buckets (avail, should_have_shards, not excluded),
+-- "w" is the weight of its primary, "extra" the load of other databases for a receiver.  An item is one bucket of the selected
+-- colocation groups' map: "owner" is where it is going to be (the target of a move that is running), "phys" where its partitions are now,
+-- "mov" whether a plan may move it (active, not moving, of a selected colocation group), "cost" what it counts for in the strategy and
+-- "size" the bytes of its partitions (by_disk_size).
+CREATE FUNCTION kingres.internal_plan_inputs(p_strategy text, p_extra jsonb, p_exclude int[], p_colos int[])
+    RETURNS jsonb
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_groups pg_catalog.jsonb;
+    v_items  pg_catalog.jsonb;
+    v_min    pg_catalog.int8;
+    v_sizes  pg_catalog.jsonb := '{}';
+    g        pg_catalog.record;
+    v_node   pg_catalog.int4;
+BEGIN
+    IF p_strategy IS NULL OR p_strategy NOT IN ('by_bucket_count', 'by_disk_size') THEN
+        RAISE EXCEPTION 'unknown rebalance strategy "%" (by_bucket_count or by_disk_size)', p_strategy
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF p_extra IS NOT NULL AND pg_catalog.jsonb_typeof(p_extra) IS DISTINCT FROM 'object' THEN
+        RAISE EXCEPTION 'extra_load must be a JSON object of group id to load' USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    v_min := (SELECT s.setting::pg_catalog.int8 FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) 'kingres_shard.min_bucket_cost') * 1024;
+
+    SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+               'id', x.group_id, 'avail', x.node_id IS NOT NULL,
+               'recv', x.node_id IS NOT NULL AND x.should AND NOT (x.group_id OPERATOR(pg_catalog.=) ANY (COALESCE(p_exclude, '{}'::pg_catalog.int4[]))),
+               'w', COALESCE(x.weight, 1),
+               'extra', CASE WHEN x.node_id IS NOT NULL AND x.should AND NOT (x.group_id OPERATOR(pg_catalog.=) ANY (COALESCE(p_exclude, '{}'::pg_catalog.int4[])))
+                             THEN COALESCE((p_extra OPERATOR(pg_catalog.->>) x.group_id::pg_catalog.text)::pg_catalog.float8, 0) ELSE 0 END)
+               ORDER BY x.group_id), '[]'::pg_catalog.jsonb)
+      INTO v_groups
+      FROM (SELECT gr.group_id,
+                   (SELECT n.node_id FROM kingres.node n WHERE n.group_id OPERATOR(pg_catalog.=) gr.group_id AND n.role OPERATOR(pg_catalog.=) 'primary' AND n.is_active) AS node_id,
+                   COALESCE((SELECT n.should_have_shards FROM kingres.node n WHERE n.group_id OPERATOR(pg_catalog.=) gr.group_id AND n.role OPERATOR(pg_catalog.=) 'primary' AND n.is_active), false) AS should,
+                   (SELECT n.weight FROM kingres.node n WHERE n.group_id OPERATOR(pg_catalog.=) gr.group_id AND n.role OPERATOR(pg_catalog.=) 'primary' AND n.is_active) AS weight
+              FROM (SELECT n.group_id FROM kingres.node n UNION SELECT m.group_id FROM kingres.bucket_map m) gr) x;
+
+    IF p_strategy OPERATOR(pg_catalog.=) 'by_disk_size' THEN
+        PERFORM kingres.internal_require_superuser();
+        -- the sizes of the bucket partitions of every table of every colocation group, from the node that owns them now
+        FOR g IN SELECT DISTINCT m.group_id FROM kingres.bucket_map m ORDER BY m.group_id LOOP
+            v_node := kingres.internal_group_node(g.group_id);
+            IF v_node IS NULL THEN
+                CONTINUE;           -- a group without a primary is not planned
+            END IF;
+            BEGIN
+                v_sizes := v_sizes OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_object(g.group_id::pg_catalog.text,
+                    (kingres.internal_node_exec(v_node,
+                        'SELECT COALESCE(pg_catalog.jsonb_object_agg(s.k, s.sz), ''{}''::pg_catalog.jsonb)::pg_catalog.text FROM ('
+                        'SELECT d.colocation_id::pg_catalog.text OPERATOR(pg_catalog.||) '':'' OPERATOR(pg_catalog.||) b.bucket::pg_catalog.text AS k, '
+                        'pg_catalog.sum(b.partition_size)::pg_catalog.int8 AS sz '
+                        'FROM kingres.buckets b JOIN kingres.dist_table d ON d.relid OPERATOR(pg_catalog.=) b.table_name '
+                        'WHERE b.partition_size IS NOT NULL GROUP BY 1) s',
+                        10000) OPERATOR(pg_catalog.->) 0 OPERATOR(pg_catalog.->>) 0)::pg_catalog.jsonb);
+            EXCEPTION WHEN OTHERS THEN
+                RAISE EXCEPTION 'the sizes of the buckets of shard group % cannot be read (%): a plan by disk size does not guess', g.group_id, SQLERRM
+                    USING ERRCODE = 'object_not_in_prerequisite_state';
+            END;
+        END LOOP;
+    END IF;
+
+    SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+               'c', q.colocation_id, 'b', q.bucket, 'owner', q.owner, 'phys', q.group_id,
+               'mov', q.mov, 'size', q.size,
+               'cost', CASE WHEN p_strategy OPERATOR(pg_catalog.=) 'by_disk_size' THEN (CASE WHEN COALESCE(q.size, 0) OPERATOR(pg_catalog.>) v_min THEN q.size ELSE v_min END) ELSE 1 END)
+               ORDER BY q.colocation_id, q.bucket), '[]'::pg_catalog.jsonb)
+      INTO v_items
+      FROM (SELECT m.colocation_id, m.bucket, m.group_id,
+                   COALESCE((SELECT b.target_group FROM kingres.bucket_move b
+                              WHERE b.colocation_id OPERATOR(pg_catalog.=) m.colocation_id AND b.bucket OPERATOR(pg_catalog.=) m.bucket
+                                AND b.phase IN ('preparing', 'copying', 'catching_up', 'switching')), m.group_id) AS owner,
+                   m.state OPERATOR(pg_catalog.=) 'active' AND (p_colos IS NULL OR m.colocation_id OPERATOR(pg_catalog.=) ANY (p_colos)) AS mov,
+                   (v_sizes OPERATOR(pg_catalog.->) m.group_id::pg_catalog.text OPERATOR(pg_catalog.->>) (m.colocation_id::pg_catalog.text OPERATOR(pg_catalog.||) ':' OPERATOR(pg_catalog.||) m.bucket::pg_catalog.text))::pg_catalog.int8 AS size
+              FROM kingres.bucket_map m) q;
+    RETURN pg_catalog.jsonb_build_object('groups', v_groups, 'items', v_items);
+END;
+$$;
+REVOKE ALL ON FUNCTION kingres.internal_plan_inputs(text, jsonb, int[], int[]) FROM PUBLIC;
+
+-- Where the groups stand: the load of every group, its utilization (load plus the load of other databases, per unit of weight)
+-- and how far a receiver is from the ideal (design section 4.4).  The ideal counts the load of the groups that are drained as work
+-- to be distributed.  "available" says the group has an active primary; a group without one is neither a receiver nor a source.
+CREATE FUNCTION kingres.group_load(strategy text DEFAULT 'by_bucket_count', extra_load jsonb DEFAULT NULL, exclude_groups int[] DEFAULT NULL)
+    RETURNS TABLE (group_id int, receiving bool, weight float8, buckets int, load bigint, utilization float8, deviation float8, available bool)
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_in    pg_catalog.jsonb := kingres.internal_plan_inputs(strategy, extra_load, exclude_groups, NULL);
+    v_total pg_catalog.float8;
+    v_wsum  pg_catalog.float8;
+    v_ideal pg_catalog.float8;
+BEGIN
+    SELECT COALESCE(pg_catalog.sum(i.cost) FILTER (WHERE gr.avail), 0)::pg_catalog.float8 OPERATOR(pg_catalog.+)
+           COALESCE((SELECT pg_catalog.sum(x.extra) FROM pg_catalog.jsonb_to_recordset(v_in OPERATOR(pg_catalog.->) 'groups') AS x(recv bool, extra float8) WHERE x.recv), 0)
+      INTO v_total
+      FROM pg_catalog.jsonb_to_recordset(v_in OPERATOR(pg_catalog.->) 'items') AS i(owner int, cost int8)
+      JOIN pg_catalog.jsonb_to_recordset(v_in OPERATOR(pg_catalog.->) 'groups') AS gr(id int, avail bool) ON gr.id OPERATOR(pg_catalog.=) i.owner;
+    SELECT COALESCE(pg_catalog.sum(x.w), 0) INTO v_wsum
+      FROM pg_catalog.jsonb_to_recordset(v_in OPERATOR(pg_catalog.->) 'groups') AS x(recv bool, w float8) WHERE x.recv;
+    v_ideal := CASE WHEN v_wsum OPERATOR(pg_catalog.>) 0 THEN v_total OPERATOR(pg_catalog./) v_wsum ELSE 0 END;
+    RETURN QUERY
+    SELECT gr.id, gr.recv, gr.w, COALESCE(l.n, 0)::pg_catalog.int4, COALESCE(l.load, 0)::pg_catalog.int8,
+           CASE WHEN gr.recv THEN (COALESCE(l.load, 0) OPERATOR(pg_catalog.+) gr.extra) OPERATOR(pg_catalog./) gr.w END,
+           CASE WHEN gr.recv AND v_ideal OPERATOR(pg_catalog.>) 0
+                THEN pg_catalog.abs((COALESCE(l.load, 0) OPERATOR(pg_catalog.+) gr.extra) OPERATOR(pg_catalog./) gr.w OPERATOR(pg_catalog.-) v_ideal) OPERATOR(pg_catalog./) v_ideal
+                WHEN gr.recv THEN 0 END,
+           gr.avail
+      FROM pg_catalog.jsonb_to_recordset(v_in OPERATOR(pg_catalog.->) 'groups') AS gr(id int, avail bool, recv bool, w float8, extra float8)
+      LEFT JOIN (SELECT i.owner, pg_catalog.count(*) AS n, pg_catalog.sum(i.cost) AS load
+                   FROM pg_catalog.jsonb_to_recordset(v_in OPERATOR(pg_catalog.->) 'items') AS i(owner int, cost int8) GROUP BY i.owner) l ON l.owner OPERATOR(pg_catalog.=) gr.id
+     ORDER BY gr.id;
+END;
+$$;
+COMMENT ON FUNCTION kingres.group_load(text, jsonb, int[]) IS
+    'The load, utilization and deviation of every shard group under a rebalance strategy (by_bucket_count or by_disk_size); read only';
+
+-- The plan of a rebalance, by simulation (design section 4.5).  Deterministic for a given state.  Moves are planned over the buckets of
+-- every colocation group together (the load of a group is the sum over all colocation groups), a bucket is planned at most once, and a bucket
+-- that is moving counts at its target.  A plan stops when every receiver is within the threshold (default 0 for by_bucket_count, 0.1 for
+-- by_disk_size) and no group that may not hold shards still holds a bucket; with drain_only only the drain moves are planned.
+CREATE FUNCTION kingres.internal_plan_simulate(v_in jsonb, strategy text, threshold float8, max_moves int, drain_only bool)
+    RETURNS TABLE (seq int, colocation_id int, bucket int, source_group int, target_group int, cost bigint, size_bytes bigint, reason text)
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_thr    pg_catalog.float8 := threshold;
+    v_max    pg_catalog.int4;
+    g_id     pg_catalog.int4[];
+    g_w      pg_catalog.float8[];
+    g_extra  pg_catalog.float8[];
+    g_load   pg_catalog.float8[];
+    g_recv   pg_catalog.bool[];
+    g_avail  pg_catalog.bool[];
+    g_cand   pg_catalog.bool[];
+    i_c      pg_catalog.int4[];
+    i_b      pg_catalog.int4[];
+    i_owner  pg_catalog.int4[];
+    i_mov    pg_catalog.bool[];
+    i_cost   pg_catalog.int8[];
+    i_size   pg_catalog.int8[];
+    ng       pg_catalog.int4;
+    ni       pg_catalog.int4;
+    k        pg_catalog.int4;
+    j        pg_catalog.int4;
+    s        pg_catalog.int4;
+    t        pg_catalog.int4;
+    best     pg_catalog.int4;
+    v_seq    pg_catalog.int4 := 0;
+    v_total  pg_catalog.float8;
+    v_wsum   pg_catalog.float8;
+    v_ideal  pg_catalog.float8;
+    v_us     pg_catalog.float8;
+    v_ut     pg_catalog.float8;
+    v_drain  pg_catalog.bool;
+    v_dev    pg_catalog.bool;
+    v_found  pg_catalog.bool;
+    v_u      pg_catalog.float8;
+    v_best_u pg_catalog.float8;
+    v_plan   pg_catalog.jsonb := '[]'::pg_catalog.jsonb;
+BEGIN
+    IF v_thr IS NULL THEN
+        v_thr := CASE WHEN strategy OPERATOR(pg_catalog.=) 'by_disk_size' THEN 0.1 ELSE 0 END;
+    END IF;
+    IF v_thr OPERATOR(pg_catalog.<) 0 OR v_thr IS NOT DISTINCT FROM 'NaN'::pg_catalog.float8 THEN
+        RAISE EXCEPTION 'the threshold must not be negative' USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF max_moves IS NOT NULL AND max_moves OPERATOR(pg_catalog.<) 0 THEN
+        RAISE EXCEPTION 'max_moves must not be negative' USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    SELECT pg_catalog.array_agg(x.id ORDER BY x.id), pg_catalog.array_agg(x.w ORDER BY x.id), pg_catalog.array_agg(x.extra ORDER BY x.id),
+           pg_catalog.array_agg(x.recv ORDER BY x.id), pg_catalog.array_agg(x.avail ORDER BY x.id)
+      INTO g_id, g_w, g_extra, g_recv, g_avail
+      FROM pg_catalog.jsonb_to_recordset(v_in OPERATOR(pg_catalog.->) 'groups') AS x(id int, avail bool, recv bool, w float8, extra float8);
+    SELECT pg_catalog.array_agg(x.c ORDER BY x.ord), pg_catalog.array_agg(x.b ORDER BY x.ord), pg_catalog.array_agg(x.owner ORDER BY x.ord),
+           pg_catalog.array_agg(x.mov ORDER BY x.ord), pg_catalog.array_agg(x.cost ORDER BY x.ord), pg_catalog.array_agg(x.size ORDER BY x.ord)
+      INTO i_c, i_b, i_owner, i_mov, i_cost, i_size
+      FROM ROWS FROM (pg_catalog.jsonb_to_recordset(v_in OPERATOR(pg_catalog.->) 'items') AS (c int, b int, owner int, mov bool, cost int8, size int8)) WITH ORDINALITY AS x(c, b, owner, mov, cost, size, ord);
+    ng := COALESCE(pg_catalog.cardinality(g_id), 0);
+    ni := COALESCE(pg_catalog.cardinality(i_c), 0);
+    IF ng OPERATOR(pg_catalog.=) 0 OR ni OPERATOR(pg_catalog.=) 0 THEN
+        RETURN;
+    END IF;
+    v_max := CASE WHEN COALESCE(max_moves, ni) OPERATOR(pg_catalog.<) ni THEN COALESCE(max_moves, ni) ELSE ni END;
+    g_load := pg_catalog.array_fill(0::pg_catalog.float8, ARRAY[ng]);
+    g_cand := pg_catalog.array_fill(true, ARRAY[ng]);
+    FOR k IN 1 .. ni LOOP
+        j := pg_catalog.array_position(g_id, i_owner[k]);
+        IF j IS NOT NULL AND g_avail[j] THEN
+            g_load[j] := g_load[j] OPERATOR(pg_catalog.+) i_cost[k];
+        END IF;
+    END LOOP;
+
+    WHILE v_seq OPERATOR(pg_catalog.<) v_max LOOP
+        v_total := 0; v_wsum := 0;
+        FOR j IN 1 .. ng LOOP
+            IF g_avail[j] THEN v_total := v_total OPERATOR(pg_catalog.+) g_load[j]; END IF;
+            IF g_recv[j] THEN v_total := v_total OPERATOR(pg_catalog.+) g_extra[j]; v_wsum := v_wsum OPERATOR(pg_catalog.+) g_w[j]; END IF;
+        END LOOP;
+        -- the source: the drain source with the greatest load that still holds a bucket it may move
+        s := NULL; v_drain := false;
+        FOR j IN 1 .. ng LOOP
+            IF g_avail[j] AND NOT g_recv[j] AND g_cand[j] AND EXISTS (SELECT 1 FROM pg_catalog.generate_series(1, ni) q WHERE i_owner[q] OPERATOR(pg_catalog.=) g_id[j] AND i_mov[q])
+               AND (s IS NULL OR g_load[j] OPERATOR(pg_catalog.>) g_load[s]) THEN
+                s := j; v_drain := true;
+            END IF;
+        END LOOP;
+        IF v_wsum OPERATOR(pg_catalog.=) 0 THEN
+            IF s IS NOT NULL THEN
+                RAISE EXCEPTION 'no shard group can receive buckets' USING ERRCODE = 'object_not_in_prerequisite_state',
+                      HINT = 'Set should_have_shards on a node with kingres.set_node_property().';
+            END IF;
+            EXIT;
+        END IF;
+        v_ideal := v_total OPERATOR(pg_catalog./) v_wsum;
+        IF s IS NULL THEN
+            EXIT WHEN drain_only;
+            v_dev := false;
+            FOR j IN 1 .. ng LOOP
+                IF g_recv[j] AND v_ideal OPERATOR(pg_catalog.>) 0
+                   AND pg_catalog.abs((g_load[j] OPERATOR(pg_catalog.+) g_extra[j]) OPERATOR(pg_catalog./) g_w[j] OPERATOR(pg_catalog.-) v_ideal) OPERATOR(pg_catalog./) v_ideal OPERATOR(pg_catalog.>) v_thr THEN
+                    v_dev := true;
+                END IF;
+            END LOOP;
+            EXIT WHEN NOT v_dev;
+            -- the receiver with the greatest utilization that is still a candidate and holds a bucket it may move
+            v_best_u := NULL;
+            FOR j IN 1 .. ng LOOP
+                IF g_recv[j] AND g_cand[j] AND EXISTS (SELECT 1 FROM pg_catalog.generate_series(1, ni) q WHERE i_owner[q] OPERATOR(pg_catalog.=) g_id[j] AND i_mov[q]) THEN
+                    v_u := (g_load[j] OPERATOR(pg_catalog.+) g_extra[j]) OPERATOR(pg_catalog./) g_w[j];
+                    IF v_best_u IS NULL OR v_u OPERATOR(pg_catalog.>) v_best_u THEN
+                        s := j; v_best_u := v_u;
+                    END IF;
+                END IF;
+            END LOOP;
+            EXIT WHEN s IS NULL;
+        END IF;
+        -- the target: the receiver other than the source with the least utilization (ties: the lowest group id)
+        t := NULL; v_best_u := NULL;
+        FOR j IN 1 .. ng LOOP
+            IF g_recv[j] AND j OPERATOR(pg_catalog.<>) s THEN
+                v_u := (g_load[j] OPERATOR(pg_catalog.+) g_extra[j]) OPERATOR(pg_catalog./) g_w[j];
+                IF v_best_u IS NULL OR v_u OPERATOR(pg_catalog.<) v_best_u THEN
+                    t := j; v_best_u := v_u;
+                END IF;
+            END IF;
+        END LOOP;
+        IF t IS NULL THEN
+            IF v_drain THEN
+                RAISE EXCEPTION 'no shard group can receive buckets' USING ERRCODE = 'object_not_in_prerequisite_state',
+                      HINT = 'Set should_have_shards on a node with kingres.set_node_property().';
+            END IF;
+            g_cand[s] := false;
+            CONTINUE;
+        END IF;
+        -- the bucket: by decreasing cost (ties: the higher bucket number, then the higher colocation id); a bucket of a receiver must
+        -- bring the two utilizations closer
+        best := NULL;
+        v_us := (g_load[s] OPERATOR(pg_catalog.+) g_extra[s]) OPERATOR(pg_catalog./) g_w[s];
+        v_ut := (g_load[t] OPERATOR(pg_catalog.+) g_extra[t]) OPERATOR(pg_catalog./) g_w[t];
+        FOR k IN 1 .. ni LOOP
+            CONTINUE WHEN NOT i_mov[k] OR i_owner[k] OPERATOR(pg_catalog.<>) g_id[s];
+            IF NOT v_drain AND NOT (pg_catalog.abs((v_us OPERATOR(pg_catalog.-) i_cost[k] OPERATOR(pg_catalog./) g_w[s]) OPERATOR(pg_catalog.-) (v_ut OPERATOR(pg_catalog.+) i_cost[k] OPERATOR(pg_catalog./) g_w[t]))
+                                    OPERATOR(pg_catalog.<) pg_catalog.abs(v_us OPERATOR(pg_catalog.-) v_ut)) THEN
+                CONTINUE;
+            END IF;
+            IF best IS NULL OR (i_cost[k], i_b[k], i_c[k]) OPERATOR(pg_catalog.>) (i_cost[best], i_b[best], i_c[best]) THEN
+                best := k;
+            END IF;
+        END LOOP;
+        IF best IS NULL THEN
+            g_cand[s] := false;
+            CONTINUE;
+        END IF;
+        v_seq := v_seq OPERATOR(pg_catalog.+) 1;
+        v_plan := v_plan OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
+                      'seq', v_seq, 'c', i_c[best], 'b', i_b[best], 'source', g_id[s], 'target', g_id[t], 'cost', i_cost[best],
+                      'size', CASE WHEN strategy OPERATOR(pg_catalog.=) 'by_disk_size' THEN i_size[best] END,
+                      'reason', CASE WHEN v_drain THEN 'drain' ELSE 'balance' END));
+        g_load[s] := g_load[s] OPERATOR(pg_catalog.-) i_cost[best];
+        g_load[t] := g_load[t] OPERATOR(pg_catalog.+) i_cost[best];
+        i_owner[best] := g_id[t];
+        i_mov[best] := false;
+    END LOOP;
+
+    RETURN QUERY
+    SELECT p.seq, p.c, p.b, p.source, p.target, p.cost, p.size, p.reason
+      FROM pg_catalog.jsonb_to_recordset(v_plan) AS p(seq int, c int, b int, source int, target int, cost int8, size int8, reason text)
+     ORDER BY p.seq;
+END;
+$$;
+REVOKE ALL ON FUNCTION kingres.internal_plan_simulate(jsonb, text, float8, int, bool) FROM PUBLIC;
+
+-- The plan of a rebalance for the state of the cluster now.
+CREATE FUNCTION kingres.plan_rebalance(strategy text DEFAULT 'by_bucket_count', threshold float8 DEFAULT NULL, max_moves int DEFAULT NULL,
+                                        drain_only bool DEFAULT false, extra_load jsonb DEFAULT NULL, exclude_groups int[] DEFAULT NULL,
+                                        colocation_ids int[] DEFAULT NULL)
+    RETURNS TABLE (seq int, colocation_id int, bucket int, source_group int, target_group int, cost bigint, size_bytes bigint, reason text)
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+BEGIN
+    RETURN QUERY
+    SELECT p.seq, p.colocation_id, p.bucket, p.source_group, p.target_group, p.cost, p.size_bytes, p.reason
+      FROM kingres.internal_plan_simulate(kingres.internal_plan_inputs(strategy, extra_load, exclude_groups, colocation_ids),
+                                          strategy, threshold, max_moves, drain_only) p;
+END;
+$$;
+COMMENT ON FUNCTION kingres.plan_rebalance(text, float8, int, bool, jsonb, int[], int[]) IS
+    'The plan of a rebalance by simulation: by_bucket_count or by_disk_size, a threshold, drain_only, the load of other databases, groups to treat as not receiving; read only';
+
 -- ===========================================================================
 -- END OF SECTION P10
 -- ===========================================================================

@@ -64,6 +64,7 @@ SELECT conrelid::regclass AS tbl, conname, contype
  node                 | node_pkey                       | p
  node                 | node_port_check                 | c
  node                 | node_role_check                 | c
+ node                 | node_weight_check               | c
  pending_node         | pending_node_pkey               | p
  table_old_copy       | table_old_copy_pkey             | p
  table_operation_item | table_operation_item_op_id_fkey | f
@@ -75,7 +76,7 @@ SELECT conrelid::regclass AS tbl, conname, contype
  table_operation      | table_operation_phase_check     | c
  table_operation      | table_operation_pkey            | p
  table_operation      | table_operation_verified_check  | c
-(41 rows)
+(42 rows)
 
 -- Nothing is created outside the kingres schema.
 SELECT count(*) AS tables_outside_kingres
@@ -148,15 +149,15 @@ DETAIL:  Key (host, port)=(a.example, 5432) already exists.
 INSERT INTO kingres.node (node_id, group_id, host, port, role)
   VALUES (3, 0, 'c.example', 5432, 'leader');
 ERROR:  new row for relation "node" violates check constraint "node_role_check"
-DETAIL:  Failing row contains (3, 0, c.example, 5432, leader, t, t, null).
+DETAIL:  Failing row contains (3, 0, c.example, 5432, leader, t, t, null, 1).
 INSERT INTO kingres.node (node_id, group_id, host, port, role)
   VALUES (3, -1, 'c.example', 5432, 'primary');
 ERROR:  new row for relation "node" violates check constraint "node_group_id_check"
-DETAIL:  Failing row contains (3, -1, c.example, 5432, primary, t, t, null).
+DETAIL:  Failing row contains (3, -1, c.example, 5432, primary, t, t, null, 1).
 INSERT INTO kingres.node (node_id, group_id, host, port, role)
   VALUES (3, 0, 'c.example', 70000, 'primary');
 ERROR:  new row for relation "node" violates check constraint "node_port_check"
-DETAIL:  Failing row contains (3, 0, c.example, 70000, primary, t, t, null).
+DETAIL:  Failing row contains (3, 0, c.example, 70000, primary, t, t, null, 1).
 INSERT INTO kingres.colocation VALUES (2, 0, 'int4', 0);
 ERROR:  new row for relation "colocation" violates check constraint "colocation_bucket_count_check"
 DETAIL:  Failing row contains (2, 0, integer, 0, 0, 0).
@@ -237,6 +238,7 @@ SELECT name, setting, unit, context
  kingres_shard.insert_batch_bytes             | 1048576 | B    | user
  kingres_shard.insert_batch_rows              | 1000    |      | user
  kingres_shard.max_partition_leaves           | 8192    |      | user
+ kingres_shard.min_bucket_cost                | 1024    | kB   | user
  kingres_shard.move_catchup_threshold         | 1024    | kB   | user
  kingres_shard.move_cleanup_delay             | 600     | s    | user
  kingres_shard.move_switch_attempts           | 20      |      | user
@@ -254,7 +256,7 @@ SELECT name, setting, unit, context
  kingres_shard.scan_fetch_size                | 1000    |      | user
  kingres_shard.shippable_extensions           | all     |      | user
  kingres_shard.table_cleanup_delay            | 600     | s    | user
-(38 rows)
+(39 rows)
 
 SET kingres_shard.default_bucket_count = 0;
 ERROR:  0 is outside the valid range for parameter "kingres_shard.default_bucket_count" (1 .. 4096)

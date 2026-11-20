@@ -2334,6 +2334,38 @@ Version 0.8 prepares the catalog and every place that routes by bucket for it; n
 Tests: the regression test `bucket_layout` (mixed moduli against the partition PostgreSQL stores a row in, the layout checks) and `t/200_bucket_layout.pl`
 (splits made by hand on a cluster, reads and writes from every node, moves of the split children, the epoch, new tables, `check_cluster()`).
 
+## Weights and the plan of a rebalance (version 0.8, phase 10, increment P10.3)
+
+`kingres.rebalance_plan()` (phase 4) balances the number of buckets of each colocation group. Version 0.8 adds a plan that knows what a bucket costs
+and what a group can hold ([`shard-phase10.md`](../../kingres/docs/design/shard-phase10.md), sections 4 and 5). `rebalance_plan()` stays as it was.
+
+- **`kingres.set_node_property(node_id, should_have_shards, weight)`**: NULL leaves a property as it is; `kingres.node.weight` is the capacity of
+  the group whose primary the node is (above 0, at most 1000, default 1). The two-argument form still exists and leaves the weight alone (the control plane asks for it
+  by that signature). Map group primary only, superuser.
+- **`kingres.plan_rebalance(strategy, threshold, max_moves, drain_only, extra_load, exclude_groups, colocation_ids)`** returns
+  `(seq, colocation_id, bucket, source_group, target_group, cost, size_bytes, reason)`; read only, superuser or a role that may read `kingres.bucket_move`, on the map group primary.
+  - `strategy` is `by_bucket_count` (every bucket costs 1) or `by_disk_size` (the size of the bucket's partitions of every table of the colocation
+    group, read from the group that owns them, at least `kingres_shard.min_bucket_cost`, 1 MiB by default; it needs a superuser, and a group that
+    does not answer is an error that names it: the plan does not guess).
+  - A group may receive buckets when its primary is active and has `should_have_shards`; `exclude_groups` takes groups out of the receivers for a what-if
+    drain; a group with no active primary is neither a receiver nor a source.
+  - The load of a group is the sum of the costs of its buckets over **all** colocation groups; its utilization is the load plus `extra_load` (the load of
+    other databases, a JSON object of group id to a number in the unit of the strategy, receivers only) per unit of weight. A receiver deviates from the
+    ideal (the total load, the load of drained groups included, per unit of the receivers' weight) by `abs(utilization - ideal) / ideal`.
+  - The plan is a simulation: while a group that may not hold buckets still holds one, or a receiver deviates by more than `threshold` (default 0 by
+    bucket count, 0.1 by disk size), the greatest drain source or the receiver of the greatest utilization gives its most costly bucket (ties: the higher
+    bucket number) to the receiver of the least utilization (ties: the lowest group id); a bucket of a receiver must bring the two utilizations closer.
+    A bucket is planned once; a bucket that is moving counts at its target and is not planned; `drain_only` plans the drain moves only; `max_moves` caps the plan.
+  - `reason` is `drain` for a move off a group that may not hold buckets and `balance` otherwise.
+- **`kingres.group_load(strategy, extra_load, exclude_groups)`** returns, for every group, `receiving`, `weight`, `buckets`, `load`, `utilization`,
+  `deviation` and `available`.
+- With equal weights, one colocation group and threshold 0 the plan has the number of moves and the counts of `rebalance_plan()` (a regression test
+  compares them over generated maps). With several colocation groups it balances the sum, not each colocation group.
+
+Tests: the regression test `plan_strategies` (the examples of the design with their move counts, weights, drain, `exclude_groups`, `extra_load`, several
+colocation groups, moving buckets, refusals; the disk-size simulation through `kingres.internal_plan_simulate()` with sizes as data) and `t/201_plan_disk_weights.pl`
+(real sizes on three groups, a plan executed, weights, a drain executed, a group that does not answer, who may plan).
+
 ## High availability (version 0.5, phase 5)
 
 Version 0.5 is the part of high availability that lives in the extension

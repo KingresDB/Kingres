@@ -90,6 +90,7 @@ int			kingres_shard_insert_batch_rows = 1000;
 int			kingres_shard_insert_batch_bytes = 1048576;
 int			kingres_shard_move_catchup_threshold = 1024;	/* kB */
 int			kingres_shard_move_switch_timeout = 10000;	/* ms */
+int			kingres_shard_min_bucket_cost = 1024;	/* kB */
 int			kingres_shard_move_switch_attempts = 20;
 int			kingres_shard_move_cleanup_delay = 600;	/* s */
 int			kingres_shard_rebuild_batch_rows = 10000;
@@ -358,6 +359,15 @@ _PG_init(void)
 							"How close the copy of a bucket move must be to the source before the switch is attempted.",
 							"Lag of the replication slot behind the current WAL position of the source; a replay proven by a marker row counts as caught up.",
 							&kingres_shard_move_catchup_threshold,
+							1024, 0, MAX_KILOBYTES,
+							PGC_USERSET, GUC_UNIT_KB,
+							NULL, NULL, NULL);
+
+	/* What a bucket costs at least in a plan by disk size (design/shard-phase10.md, section 4.2); read by kingres.plan_rebalance(). */
+	DefineCustomIntVariable("kingres_shard.min_bucket_cost",
+							"The smallest cost of a bucket in a rebalance plan by disk size.",
+							"An empty bucket is not free: it counts for at least this much, so that empty buckets do not pile up on one group.",
+							&kingres_shard_min_bucket_cost,
 							1024, 0, MAX_KILOBYTES,
 							PGC_USERSET, GUC_UNIT_KB,
 							NULL, NULL, NULL);
