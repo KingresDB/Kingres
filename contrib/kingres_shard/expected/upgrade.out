@@ -1,9 +1,9 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
 -- Portions Copyright (c) 2026, RooyeKhat Media Co
 --
--- upgrade.sql: pg_regress test of kingres_shard 0.7 (purpose below).
--- ALTER EXTENSION kingres_shard UPDATE from 0.1 (through 0.2 to 0.6), from 0.2, from 0.3, from 0.4, from 0.5 and from 0.6 to 0.7 must give exactly the
--- catalog that installing 0.7 gives, and keep the data of the catalog tables.
+-- upgrade.sql: pg_regress test of kingres_shard 0.8 (purpose below).
+-- ALTER EXTENSION kingres_shard UPDATE from 0.1 (through 0.2 to 0.6), from 0.2, from 0.3, from 0.4, from 0.5 and from 0.6 and from 0.7 to 0.8 must give exactly the
+-- catalog that installing 0.8 gives, and keep the data of the catalog tables.
 SET search_path = public, pg_temp;
 -- A description of every object of the extension that the two paths could
 -- make differ: columns (with defaults, identity, generation, collation, storage and
@@ -120,7 +120,7 @@ RETURN QUERY
 END
 $$;
 -- A table distributed the way the older versions did it: this test creates tables in
--- versions 0.1 to 0.4, whose SQL objects the library of 0.7 no longer drives
+-- versions 0.1 to 0.4, whose SQL objects the library of 0.8 no longer drives
 -- (create_distributed_table refuses a database whose objects are older than the library),
 -- so the partitions and the catalog rows are made by hand.  p_table is a table that is
 -- PARTITION BY HASH on its first column and has no partitions yet.
@@ -146,12 +146,12 @@ BEGIN
          VALUES (p_table, 'hash', v_col, v_id);
 END
 $$;
--- Install 0.7 directly.
+-- Install 0.8 directly.
 CREATE EXTENSION kingres_shard;
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
  extversion 
 ------------
- 0.7
+ 0.8
 (1 row)
 
 CREATE TABLE public.upg_direct AS SELECT line FROM public.upg_snapshot() line;
@@ -195,7 +195,7 @@ ALTER EXTENSION kingres_shard UPDATE;
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
  extversion 
 ------------
- 0.7
+ 0.8
 (1 row)
 
 CREATE TABLE public.upg_upgraded AS SELECT line FROM public.upg_snapshot() line;
@@ -260,7 +260,7 @@ ROLLBACK;
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
  extversion 
 ------------
- 0.7
+ 0.8
 (1 row)
 
 SELECT count(*) AS moves FROM kingres.bucket_move;
@@ -379,14 +379,14 @@ SELECT count(*) AS tables_after_old_snapshot FROM kingres.dist_table;
 
 ROLLBACK;
 -- the version handshake of the new functions
-SELECT kingres.internal_require_version('0.7');
+SELECT kingres.internal_require_version('0.8');
  internal_require_version 
 --------------------------
  
 (1 row)
 
 DO $$ BEGIN PERFORM kingres.internal_require_version('0.6'); EXCEPTION WHEN object_not_in_prerequisite_state THEN RAISE NOTICE '%', regexp_replace(SQLERRM, '\([^)]*\)', '(address)'); END $$;
-NOTICE:  node 1 (address) has kingres_shard 0.7, a table operation needs 0.6 on every node
+NOTICE:  node 1 (address) has kingres_shard 0.8, a table operation needs 0.6 on every node
 DROP TABLE public.upg_t;
 DROP EXTENSION kingres_shard;
 -- The steps from 0.2 to 0.3 and from 0.3 to 0.4 on their own, with a bucket map that is not trivial.
@@ -428,10 +428,11 @@ SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
 ALTER EXTENSION kingres_shard UPDATE TO '0.5';
 ALTER EXTENSION kingres_shard UPDATE TO '0.6';
 ALTER EXTENSION kingres_shard UPDATE TO '0.7';
+ALTER EXTENSION kingres_shard UPDATE TO '0.8';
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
  extversion 
 ------------
- 0.7
+ 0.8
 (1 row)
 
 DROP TABLE public.upg_upgraded;
@@ -499,10 +500,11 @@ SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
 ALTER EXTENSION kingres_shard UPDATE TO '0.5';
 ALTER EXTENSION kingres_shard UPDATE TO '0.6';
 ALTER EXTENSION kingres_shard UPDATE TO '0.7';
+ALTER EXTENSION kingres_shard UPDATE TO '0.8';
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
  extversion 
 ------------
- 0.7
+ 0.8
 (1 row)
 
 SELECT count(*) AS secret_rows_after FROM kingres.cluster_secret;
@@ -564,10 +566,11 @@ INSERT INTO kingres.dtx_log VALUES ('kingres_1_1_1_1', 1, now());
 ALTER EXTENSION kingres_shard UPDATE TO '0.5';
 ALTER EXTENSION kingres_shard UPDATE TO '0.6';
 ALTER EXTENSION kingres_shard UPDATE TO '0.7';
+ALTER EXTENSION kingres_shard UPDATE TO '0.8';
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
  extversion 
 ------------
- 0.7
+ 0.8
 (1 row)
 
 DROP TABLE public.upg_upgraded;
@@ -658,10 +661,11 @@ SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
 (1 row)
 
 ALTER EXTENSION kingres_shard UPDATE TO '0.7';
+ALTER EXTENSION kingres_shard UPDATE TO '0.8';
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
  extversion 
 ------------
- 0.7
+ 0.8
 (1 row)
 
 DROP TABLE public.upg_upgraded;
@@ -727,10 +731,11 @@ SELECT public.upg_register('public.upg_t', 4);
 
 INSERT INTO public.upg_t VALUES (6, 'six');
 ALTER EXTENSION kingres_shard UPDATE TO '0.7';
+ALTER EXTENSION kingres_shard UPDATE TO '0.8';
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
  extversion 
 ------------
- 0.7
+ 0.8
 (1 row)
 
 DROP TABLE public.upg_upgraded;
@@ -779,6 +784,56 @@ SELECT colocation_id FROM kingres.dist_table ORDER BY relid::text;
 (2 rows)
 
 DROP TABLE public.upg_rows;
+DROP TABLE public.upg_t;
+DROP EXTENSION kingres_shard;
+-- The step from 0.7 on its own: a node with a bucket map and a table with rows, then the
+-- upgrade; the table keeps its rows and the catalog is the one a fresh 0.8 gives.
+CREATE EXTENSION kingres_shard VERSION '0.7';
+SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
+ extversion 
+------------
+ 0.7
+(1 row)
+
+SELECT kingres.init_cluster(btrim(split_part(current_setting('unix_socket_directories'), ',', 1)), current_setting('port')::int);
+ init_cluster 
+--------------
+ 
+(1 row)
+
+CREATE TABLE public.upg_t (id int PRIMARY KEY, v text) PARTITION BY HASH (id);
+SELECT public.upg_register('public.upg_t', 4);
+ upg_register 
+--------------
+ 
+(1 row)
+
+INSERT INTO public.upg_t VALUES (7, 'seven');
+ALTER EXTENSION kingres_shard UPDATE TO '0.8';
+SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
+ extversion 
+------------
+ 0.8
+(1 row)
+
+DROP TABLE public.upg_upgraded;
+CREATE TABLE public.upg_upgraded AS SELECT line FROM public.upg_snapshot() line;
+SELECT 'only in direct install' AS side, line FROM
+  (SELECT line FROM public.upg_direct EXCEPT SELECT line FROM public.upg_upgraded) x
+UNION ALL
+SELECT 'only in upgrade', line FROM
+  (SELECT line FROM public.upg_upgraded EXCEPT SELECT line FROM public.upg_direct) y
+ORDER BY 1, 2;
+ side | line 
+------+------
+(0 rows)
+
+SELECT count(*) FROM public.upg_t;
+ count 
+-------
+     1
+(1 row)
+
 DROP TABLE public.upg_t;
 DROP EXTENSION kingres_shard;
 DROP TABLE public.upg_direct, public.upg_upgraded;

@@ -8,7 +8,7 @@ node as reference tables, and makes every statement correct on a cluster with
 several groups: a statement that touches one key goes to the group that owns
 it, and a statement that spans groups is answered by reading the other groups.
 
-This is version 0.7 (0.7 is the table lifecycle of phase 9 on top of 0.6; 0.6 is the version of phase 2b; 0.3 added moving buckets, phase 2a made every statement correct, 0.4 is the fix round of the reviews of 0.2 and 0.3, 0.5 is high availability: standby nodes, `promote_node`, prepared transactions across a failover, distributed deadlock detection and coordinated restore points; see "High availability" below; 0.6 is phase 2b and adds no SQL object, see "Installation" for why the version is raised). Phase 2b makes the common
+This is version 0.8 (0.8 is the bucket layout of phase 10, see "The bucket layout (version 0.8)", and the schemas of phase 11; 0.7 is the table lifecycle of phase 9 on top of 0.6; 0.6 is the version of phase 2b; 0.3 added moving buckets, phase 2a made every statement correct, 0.4 is the fix round of the reviews of 0.2 and 0.3, 0.5 is high availability: standby nodes, `promote_node`, prepared transactions across a failover, distributed deadlock detection and coordinated restore points; see "High availability" below; 0.6 is phase 2b and adds no SQL object, see "Installation" for why the version is raised). Phase 2b makes the common
 statements fast. The designs are in
 [`kingres/docs/design/shard-mvp.md`](../../kingres/docs/design/shard-mvp.md)
 (phase 1) and
@@ -2303,6 +2303,36 @@ needs `cleanup_moved_buckets(true)` after the move (review finding S4-10).
   moved to this node after the snapshot of the transaction was taken") and can be
   retried. `COPY (SELECT ...) TO` reads like any `SELECT`; `COPY ... FROM` into a
   distributed table is routed by the row router, which fails with the retryable `KS001` when a bucket moved between its plan and its first batch and otherwise makes the switch of a move wait for it (section "Bulk writes through the row router").
+
+## The bucket layout (version 0.8, phase 10, increment P10.1)
+
+[`shard-phase10.md`](../../kingres/docs/design/shard-phase10.md) lets one bucket be split into several without touching the others.
+Version 0.8 prepares the catalog and every place that routes by bucket for it; nothing in this version splits a bucket yet.
+
+- **A bucket is a hash partition `(MODULUS m, REMAINDER r)`, and its number is its remainder `r`.** `kingres.bucket_map` has a `modulus`
+  column for it; `kingres.colocation.bucket_count` stays what a new table of the group asks for (the base modulus), and the number of
+  buckets is the number of rows of `bucket_map`. `kingres.colocation.max_modulus` is the greatest modulus of the group (the base
+  `bucket_count` until a split). The buckets of a group cover each slot `0 .. max_modulus - 1` of `hash % max_modulus` exactly once.
+  PostgreSQL accepts such a table (moduli that divide the next larger one, partitions that share no slot).
+- **The bucket of a key is a lookup, not `hash % bucket_count`.** The cache of the catalog builds, for each group, a table with one entry per
+  slot (the same idea as `boundinfo->indexes` of PostgreSQL), and `kingres_shard_bucket_for_hash()` reads it. Everything that routes (the planner,
+  the row router, `COPY`, the pushdown, `kingres.bucket_for()`) goes through it; the code that creates or attaches a bucket partition asks
+  `kingres_shard_bucket_modulus()`. A key whose slot no bucket covers is an error that names the slot, never a wrong bucket.
+- **`kingres.colocation.placement_epoch`** counts the switches of a group (a move now, a split later), in the transaction that changes the
+  partitions. The placement hash that a scan compares before and after it starts includes it, so a bucket that moves away and comes back
+  inside the window of a statement no longer restores the hash (review finding S4-01).
+- **`kingres.bucket_range(colocation_id, bucket)`** returns the modulus and the remainder; `kingres.buckets` has a `modulus` column.
+- **`check_cluster()`** says `bucket_map_incomplete` for a group that was never split and lacks a bucket (as before), and `bucket_layout` for any
+  other flaw: buckets that do not cover each slot exactly once, or a bucket partition on a node whose bounds differ from the bucket map.
+- **Upgrade and rows of the older form.** `ALTER EXTENSION kingres_shard UPDATE` gives every bucket the modulus `bucket_count`; a row that
+  does not say its modulus or the `max_modulus` (an `INSERT` of the older form, a catalog document of a map group that is not upgraded yet)
+  gets the layout of a group that was never split, through the trigger `kingres.internal_layout_defaults()`.
+- **Moves.** `move_bucket()` copies a bucket with its own modulus and raises the epoch. `rebalance_plan()` counts the buckets of a group, not its
+  `bucket_count`. A new table colocated with a split group has the buckets of the group; `alter_distributed_table()` into a group of its own
+  that is like a split group makes the same buckets, moduli and owners.
+
+Tests: the regression test `bucket_layout` (mixed moduli against the partition PostgreSQL stores a row in, the layout checks) and `t/200_bucket_layout.pl`
+(splits made by hand on a cluster, reads and writes from every node, moves of the split children, the epoch, new tables, `check_cluster()`).
 
 ## High availability (version 0.5, phase 5)
 

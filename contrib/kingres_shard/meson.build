@@ -64,6 +64,8 @@ install_data(
   'kingres_shard--0.5--0.6.sql',
   'kingres_shard--0.6--0.7.sql',
   'kingres_shard--0.7.sql',
+  'kingres_shard--0.7--0.8.sql',
+  'kingres_shard--0.8.sql',
   kwargs: contrib_data_args,
 )
 
@@ -77,6 +79,7 @@ tests += {
       'catalog',
       'bucket_for',
       'bucket_lookup',
+      'bucket_layout',
       'distribute',
       'distribute_rows',
       'sequence_options',

@@ -89,13 +89,14 @@ kingres_shard_hash_of_value(Oid column_type, Oid collation, Oid value_type,
  * kingres_shard_bucket_for_hash
  *
  * The number of the bucket that holds a hash value in a colocation group:
- * hash % bucket_count, the remainder PostgreSQL itself uses to choose the
- * partition of a row (MODULUS bucket_count).  The one place that computes it.
+ * the bucket that covers slot hash % max_modulus of the layout of the group (the
+ * remainder in the modulus of that bucket: PostgreSQL itself picks the partition of a
+ * row through the same slot table).  -1 when the layout has a gap.
  */
 int
 kingres_shard_bucket_for_hash(const KsColocation *coloc, uint64 hash)
 {
-	return (int) (hash % (uint64) coloc->bucket_count);
+	return kingres_shard_coloc_bucket_of_hash(coloc, hash);
 }
 
 /*
@@ -117,7 +118,7 @@ kingres_shard_try_bucket(Oid column_type, Oid collation,
 									  value, isnull, &hash))
 		return false;
 	*bucket = kingres_shard_bucket_for_hash(coloc, hash);
-	return true;
+	return *bucket >= 0;			/* false: the layout has a gap there */
 }
 
 /*
@@ -135,11 +136,22 @@ kingres_shard_bucket(Oid column_type, Oid collation,
 
 	if (!kingres_shard_try_bucket(column_type, collation, coloc,
 								   value_type, value, isnull, &bucket))
+	{
+		uint64		hash;
+
+		/* the value hashes but the layout of the group has no bucket for the slot: a broken catalog, say so */
+		if (kingres_shard_hash_of_value(column_type, collation, value_type, value, isnull, &hash))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("colocation group %d has no bucket for slot %d of its layout", coloc->colocation_id,
+							(int) (hash % (uint64) Max(coloc->max_modulus, 1))),
+					 errhint("Run kingres.check_cluster(): the buckets of the group do not cover every slot.")));
 		ereport(ERROR,
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
 				 errmsg("cannot compute a bucket for a value of type %s with a distribution column of type %s",
 						format_type_be(value_type),
 						format_type_be(column_type))));
+	}
 	return bucket;
 }
 

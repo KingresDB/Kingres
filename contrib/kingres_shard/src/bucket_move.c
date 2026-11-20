@@ -1460,7 +1460,20 @@ kingres_internal_switch_bucket(PG_FUNCTION_ARGS)
 							  "WHERE colocation_id OPERATOR(pg_catalog.=) $1 AND bucket OPERATOR(pg_catalog.=) $3",
 							  3, argtypes, values, NULL, false, 0) != SPI_OK_UPDATE)
 		elog(ERROR, "could not update the bucket map");
+	/*
+	 * The epoch of the group: it counts the switches, in the transaction that changes the
+	 * partitions, and goes into the placement hash that a scan compares before and after it
+	 * starts (review finding S4-01: a bucket that moves away and comes back restores the
+	 * placement, never the epoch).
+	 */
+	argtypes[0] = INT4OID;
+	values[0] = Int32GetDatum(colocation_id);
+	if (SPI_execute_with_args("UPDATE " KINGRES_SHARD_SCHEMA ".colocation SET placement_epoch = placement_epoch OPERATOR(pg_catalog.+) 1 "
+							  "WHERE colocation_id OPERATOR(pg_catalog.=) $1",
+							  1, argtypes, values, NULL, false, 0) != SPI_OK_UPDATE)
+		elog(ERROR, "could not raise the placement epoch");
 	argtypes[0] = INT8OID;
+
 	argtypes[1] = INT4OID;
 	values[0] = Int64GetDatum(move_id);
 	values[1] = Int32GetDatum(cleanup_delay);

@@ -171,7 +171,7 @@ sub q1 { my ($n, $sql) = @_; return $n->safe_psql('postgres', $sql); }
 	my $bucket = q1($n1, q{SELECT min(bucket) FROM kingres.bucket_map WHERE colocation_id = 1 AND group_id = 0});
 	my ($rc, $o, $err) = run_sql($n1, "SELECT kingres.move_bucket(1, $bucket, 2)");
 	isnt($rc, 0, 'S6-06: a move is refused');
-	like($err, qr/node 2 \(\S+:\d+\) has kingres_shard 0\.4, a bucket move needs 0\.7 on every node/, 'S6-06: with both versions named');
+	like($err, qr/node 2 \(\S+:\d+\) has kingres_shard 0\.4, a bucket move needs 0.8 on every node/, 'S6-06: with both versions named');
 	unlike($err, qr/cannot be asked/, 'S6-06: and not as a node that cannot be asked');
 	# The helper is for superusers.
 	q1($n1, 'CREATE ROLE alice LOGIN');

@@ -567,7 +567,6 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 	int			colocation_id;
 	int			nbuckets;
 	KsColocation *placement;
-	int		   *groups;
 	int			local_group;
 	DdlSet		ddl;
 	Oid			argtypes[4];
@@ -657,30 +656,45 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 	/* A table added to a group whose bucket is being moved, or that an operation uses, would be missed. */
 	kingres_shard_assert_no_move(colocation_id);
 
-	groups = MemoryContextAlloc(callercxt, sizeof(int) * nbuckets);
-	for (i = 0; i < (uint64) nbuckets; i++)
-		groups[i] = -1;
-	argtypes[0] = INT4OID;
-	values[0] = Int32GetDatum(colocation_id);
-	kingres_shard_run_spi("SELECT bucket, group_id FROM " KINGRES_SHARD_SCHEMA ".bucket_map "
-			"WHERE colocation_id = $1 ORDER BY bucket",
-			1, argtypes, values);
-	for (i = 0; i < SPI_processed; i++)
+	/*
+	 * The layout of the group as of this transaction (the cache of the catalog may not have it
+	 * yet): the buckets with their moduli and owners.  A group that was split has more buckets than
+	 * bucket_count and buckets of several moduli, and the partitions of the new table follow it.
+	 */
 	{
-		int			b = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i],
-													SPI_tuptable->tupdesc, 1, &isnull));
-		int			g = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i],
-													SPI_tuptable->tupdesc, 2, &isnull));
+		int			maxmod;
+		int64		epoch;
+		uint64		nrows;
+		int		   *rows;
+		MemoryContext old;
 
-		if (b >= 0 && b < nbuckets)
-			groups[b] = g;
-	}
-	/* the layout of the group as of this transaction (the cache of the catalog may not have it yet) */
-	{
-		MemoryContext old = MemoryContextSwitchTo(callercxt);
-
-		placement = kingres_shard_coloc_make(colocation_id, nbuckets, coltype, collation, groups);
+		argtypes[0] = INT4OID;
+		values[0] = Int32GetDatum(colocation_id);
+		kingres_shard_run_spi("SELECT max_modulus, placement_epoch FROM " KINGRES_SHARD_SCHEMA ".colocation "
+							  "WHERE colocation_id = $1",
+							  1, argtypes, values);
+		if (SPI_processed != 1)
+			elog(ERROR, "colocation group %d does not exist", colocation_id);
+		maxmod = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+		epoch = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull));
+		kingres_shard_run_spi("SELECT bucket, group_id, modulus FROM " KINGRES_SHARD_SCHEMA ".bucket_map "
+							  "WHERE colocation_id = $1 ORDER BY bucket",
+							  1, argtypes, values);
+		nrows = SPI_processed;
+		rows = MemoryContextAlloc(callercxt, sizeof(int) * 3 * Max(nrows, 1));
+		for (i = 0; i < nrows; i++)
+		{
+			rows[3 * i] = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
+			rows[3 * i + 1] = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2, &isnull));
+			rows[3 * i + 2] = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 3, &isnull));
+		}
+		old = MemoryContextSwitchTo(callercxt);
+		placement = kingres_shard_coloc_begin(colocation_id, nbuckets, maxmod, epoch, coltype, collation);
+		for (i = 0; i < nrows; i++)
+			kingres_shard_coloc_add(placement, rows[3 * i], rows[3 * i + 2], rows[3 * i + 1]);
+		kingres_shard_coloc_finish(placement);
 		MemoryContextSwitchTo(old);
+		pfree(rows);
 	}
 
 	/*
@@ -710,6 +724,7 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 		}
 		MemoryContextSwitchTo(old);
 	}
+	nbuckets = kingres_shard_coloc_nbuckets(placement);	/* the buckets of the group, which a split group has more of than bucket_count */
 	if (partby != NULL && (uint64) nbuckets * (uint64) list_length(leafnames) > (uint64) kingres_shard_max_partition_leaves)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
