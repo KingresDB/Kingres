@@ -295,6 +295,7 @@ typedef struct KcWriteBuf
 bool		kc_guc_reserve_rows = false;
 int			kc_guc_reserve_gate = 0;
 int			kc_guc_reserve_gate_at = 0;
+int			kc_guc_reserve_min = 64;
 
 /* where kingres_columnar.reserve_gate_at stops a writer (testing) */
 #define KC_RES_AFTER_ALLOC		1	/* the numbers are taken from the metapage */
@@ -302,7 +303,7 @@ int			kc_guc_reserve_gate_at = 0;
 #define KC_RES_AFTER_PAGES		3	/* the stripe's pages are written, its row is not yet updated */
 #define KC_RES_AFTER_UPDATE		4	/* the row is updated, the tail not yet given back */
 
-static void
+void
 kc_reserve_gate(int point)
 {
 	if (kc_guc_reserve_gate != 0 && kc_guc_reserve_gate_at == point)
@@ -1585,10 +1586,166 @@ kc_give_back_tail(Relation rel, uint64 first, uint32 count)
 {
 	if (count == 0)
 		return;
+	/* while an index vacuum runs the numbers stay a gap (C14-01); the lock is taken here, for every caller */
+	if (!kc_vacuum_lock(rel, ShareLock, false))
+	{
+		KC_PATH(KC_PATH_GAP);
+		return;
+	}
 	if (kc_meta_return(rel, first, count))
 		KC_PATH(KC_PATH_RETURNED);
 	else
 		KC_PATH(KC_PATH_GAP);
+	kc_vacuum_unlock(rel, ShareLock);
+}
+
+/*
+ * How many numbers a reservation takes (C13-02).  A reservation used to take a whole stripe's
+ * worth (150 000 by default) for every buffer, so any writer that aborted, and any that
+ * committed behind another's reservation, left up to that many numbers unused and a role with
+ * INSERT could use up the 8.8 x 10^12 numbers of a table in minutes.  A reservation now starts at
+ * kingres_columnar.reserve_min_rows (64; 0 is the old size) or at what the session's last
+ * buffer of this table needed (a bulk loader goes on at its size, rounded up to a power of two),
+ * and grows in place while the buffer fills and it is still the end of the numbers
+ * (kc_buf_extend_reservation); the unused tail goes back at the flush, and an aborted writer's
+ * goes back at the session's next reservation (kc_note_abandoned).  After an abort the hint is
+ * forgotten, so a session cannot carry a big reservation into an abort loop.
+ */
+#define KC_HINTS 16
+typedef struct KcReserveHint
+{
+	Oid			relid;
+	uint64		uid;
+	uint32		rows;
+} KcReserveHint;
+
+static KcReserveHint kc_hints[KC_HINTS];
+static int	kc_nhints = 0;
+
+static uint32
+kc_reserve_initial(Relation rel, uint32 limit)
+{
+	uint32		mn = (uint32) kc_guc_reserve_min;
+	int			i;
+
+	if (mn == 0 || mn >= limit)
+		return limit;
+	for (i = 0; i < kc_nhints && i < KC_HINTS; i++)
+		if (kc_hints[i].relid == RelationGetRelid(rel) && kc_hints[i].uid == kc_rel_ident(rel)->uid)
+			return Min(limit, Max(mn, kc_hints[i].rows));
+	return mn;
+}
+
+/* what the next reservation of the session for this table starts at: rows, rounded up to a power of two */
+static void
+kc_reserve_hint_set(Oid relid, uint64 uid, uint32 rows)
+{
+	int			i;
+	uint32		p = 1;
+
+	while (p < rows && p < ((uint32) 1 << 30))
+		p <<= 1;
+	for (i = 0; i < kc_nhints && i < KC_HINTS; i++)
+		if (kc_hints[i].relid == relid && kc_hints[i].uid == uid)
+		{
+			kc_hints[i].rows = p;
+			return;
+		}
+	i = kc_nhints % KC_HINTS;
+	kc_nhints++;
+	kc_hints[i].relid = relid;
+	kc_hints[i].uid = uid;
+	kc_hints[i].rows = p;
+}
+
+static void
+kc_reserve_hint_reset(Oid relid)
+{
+	int			i;
+
+	for (i = 0; i < kc_nhints && i < KC_HINTS; i++)
+		if (kc_hints[i].relid == relid)
+			kc_hints[i].rows = 0;
+}
+
+/*
+ * The unused tails of reservations that an aborted transaction or subtransaction held
+ * (C13-02).  The abort callback may not touch the file, so the tail is noted here and given
+ * back by the session's next reservation for the table (kc_apply_abandoned), when it is still
+ * the end of the numbers.  Only the numbers after the rows that were put in the buffer: the
+ * rows' numbers have index entries, which are not given back with them.  A note that is not
+ * applied is lost (a gap), and the oldest goes when the list is full.
+ */
+#define KC_ABANDONED_MAX 32
+typedef struct KcAbandoned
+{
+	Oid			relid;
+	uint64		uid;
+	uint64		first;
+	uint32		count;
+} KcAbandoned;
+
+static KcAbandoned kc_abandoned[KC_ABANDONED_MAX];
+static int	kc_nabandoned = 0;
+
+static void
+kc_note_abandoned(KcWriteBuf *b)
+{
+	if (!b->reserving || !b->res_valid)
+		return;
+	kc_reserve_hint_reset(b->relid);
+	if (b->nrows >= b->res_count)
+		return;
+	if (kc_nabandoned == KC_ABANDONED_MAX)
+	{
+		memmove(&kc_abandoned[0], &kc_abandoned[1], sizeof(KcAbandoned) * (KC_ABANDONED_MAX - 1));
+		kc_nabandoned--;
+	}
+	kc_abandoned[kc_nabandoned].relid = b->relid;
+	kc_abandoned[kc_nabandoned].uid = b->uid;
+	kc_abandoned[kc_nabandoned].first = b->res_first + b->nrows;
+	kc_abandoned[kc_nabandoned].count = b->res_count - b->nrows;
+	kc_nabandoned++;
+}
+
+/* an aborted top-level transaction: every reservation its buffers still hold */
+static void
+kc_note_abandoned_all(void)
+{
+	HASH_SEQ_STATUS seq;
+	KcRelState *st;
+
+	if (kc_states == NULL)
+		return;
+	hash_seq_init(&seq, kc_states);
+	while ((st = hash_seq_search(&seq)) != NULL)
+	{
+		ListCell   *lc;
+
+		foreach(lc, st->bufs)
+			kc_note_abandoned((KcWriteBuf *) lfirst(lc));
+	}
+}
+
+static void
+kc_apply_abandoned(Relation rel)
+{
+	int			i = 0;
+
+	while (i < kc_nabandoned)
+	{
+		if (kc_abandoned[i].relid == RelationGetRelid(rel))
+		{
+			KcAbandoned a = kc_abandoned[i];
+
+			memmove(&kc_abandoned[i], &kc_abandoned[i + 1], sizeof(KcAbandoned) * (kc_nabandoned - i - 1));
+			kc_nabandoned--;
+			if (a.uid == kc_rel_ident(rel)->uid)
+				kc_give_back_tail(rel, a.first, a.count);
+			continue;
+		}
+		i++;
+	}
 }
 
 /*
@@ -1620,6 +1777,35 @@ kc_reserve_unlock(Relation rel, LOCKMODE mode)
 	(void) LockRelease(&tag, mode, false);
 }
 
+/*
+ * The vacuum lock (C14-01).  An index vacuum decides which index entries are dead from the
+ * catalog and the metapage as they were when it looked (kc_index_vacuum), and deletes through
+ * the whole run of the scan.  A writer that gives the tail of an aborted reservation back makes
+ * the next reservation take numbers the vacuum has already counted as dead (the claim row of the
+ * aborted writer is dead, it does not lower the bound), so the vacuum would delete the entries
+ * of rows that commit in the meantime.  The index vacuum therefore holds this lock EXCLUSIVE
+ * from before it looks until its scan is done, and a give-back takes it SHARE without waiting:
+ * when a vacuum is running the tail is not given back, it stays a gap (at most the small
+ * reservation, C13-02).  Advisory class 0x4B43, field 8.
+ */
+bool
+kc_vacuum_lock(Relation rel, LOCKMODE mode, bool wait)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_ADVISORY(tag, MyDatabaseId, 0x4B43, RelationGetRelid(rel), 8);
+	return LockAcquire(&tag, mode, false, !wait) != LOCKACQUIRE_NOT_AVAIL;
+}
+
+void
+kc_vacuum_unlock(Relation rel, LOCKMODE mode)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_ADVISORY(tag, MyDatabaseId, 0x4B43, RelationGetRelid(rel), 8);
+	(void) LockRelease(&tag, mode, false);
+}
+
 /* Take the numbers and insert the reserved catalog row; the buffer has none. */
 static void
 kc_buf_reserve_numbers(KcWriteBuf *b, Relation rel)
@@ -1627,9 +1813,12 @@ kc_buf_reserve_numbers(KcWriteBuf *b, Relation rel)
 	KcStripeInfo si;
 	uint64		stripe_id;
 	uint64		first_row;
-	uint32		count = kc_stripe_limit(&b->opts);
+	uint32		limit = kc_stripe_limit(&b->opts);
+	uint32		count;
 
 	Assert(b->reserving && !b->res_valid);
+	kc_apply_abandoned(rel);
+	count = kc_reserve_initial(rel, limit);
 	kc_reserve_lock(rel, ShareLock);
 	kc_meta_allocate(rel, count, &stripe_id, &first_row);
 	KC_PATH(KC_PATH_RESERVED);
@@ -1648,6 +1837,43 @@ kc_buf_reserve_numbers(KcWriteBuf *b, Relation rel)
 	b->res_valid = true;
 	kc_reserve_unlock(rel, ShareLock);
 	kc_reserve_gate(KC_RES_AFTER_EARLY_ROW);
+}
+
+/*
+ * The buffer has used the numbers it took and could take more: grow the reservation in place
+ * (C13-02), when it is still the end of the numbers.  The numbers are taken from the metapage
+ * and the claim row of the catalog says so under the reservation lock, as at the first
+ * reservation, so that an index vacuum never sees the one without the other.  False when another
+ * writer has taken numbers since: the caller then writes the buffer as a stripe, and the next
+ * reservation starts at twice the size.
+ */
+static bool
+kc_buf_extend_reservation(KcWriteBuf *b, Relation rel)
+{
+	uint32		limit = kc_stripe_limit(&b->opts);
+	uint32		extra;
+	KcStripeInfo si;
+
+	if (!b->reserving || !b->res_valid || b->res_count >= limit || b->refs > 0)
+		return false;
+	extra = Min(limit - b->res_count, Max(b->res_count, (uint32) 64));
+	kc_reserve_lock(rel, ShareLock);
+	if (!kc_meta_extend(rel, b->res_first + b->res_count, extra))
+	{
+		kc_reserve_unlock(rel, ShareLock);
+		return false;
+	}
+	kc_pass_command(b);
+	memset(&si, 0, sizeof(si));
+	si.stripe_id = b->res_stripe_id;
+	si.first_row = b->res_first;
+	si.row_count = b->res_count + extra;
+	si.natts = b->ncols;
+	kc_catalog_resize_reserved(rel, &si);
+	b->res_cmin = GetCurrentCommandId(true);
+	b->res_count += extra;
+	kc_reserve_unlock(rel, ShareLock);
+	return true;
 }
 
 /*
@@ -1689,8 +1915,9 @@ kc_buf_forget_reservation(KcWriteBuf *b)
  * the one that wrote the rows; if a later callback fails and the transaction
  * aborts, they go with it.  A row written one at a time is a stripe of one
  * row: correct, and rare (only code that runs after the access method's
- * callback gets here).  Only columnar_compact() joins small stripes (VACUUM
- * does not): the cost of one stripe per row, measured, is in the README.
+ * callback gets here).  Small stripes are joined by columnar_compact() and, since C13-05,
+ * by VACUUM when there are many (kingres_columnar.vacuum_compact_stripes): the cost of one
+ * stripe per row, measured, is in the README.
  */
 static void
 kc_write_late(Relation rel, Datum **vv, bool **nn, int nrows, CommandId cid,
@@ -1921,15 +2148,26 @@ kc_write_row_values(Relation rel, Datum *vals, bool *nulls, CommandId cid,
 		return true;
 	}
 
+	/* a buffer that has used its numbers takes more when it can, instead of becoming a small stripe (C13-02) */
+	if (b->reserving && b->res_valid && b->nrows >= b->res_count && b->res_count < kc_stripe_limit(&b->opts))
+		(void) kc_buf_extend_reservation(b, rel);
+
 	if (b->nrows >= (b->reserving ? b->res_count : kc_stripe_limit(&b->opts)) &&
 		kc_buf_flushable(st, b))
 	{
 		Relation	r = try_table_open(b->relid, RowExclusiveLock);
+		uint32		full = b->reserving ? b->res_count : 0;
+		uint32		limit = kc_stripe_limit(&b->opts);
+		Oid			frelid = b->relid;
+		uint64		fuid = b->uid;
 
 		if (r != NULL)
 		{
 			kc_flush_buf_ex(st, b, r, true);
 			table_close(r, NoLock);
+			/* it could not grow (another writer took numbers after it): the next reservation starts at twice the size */
+			if (full > 0 && full < limit)
+				kc_reserve_hint_set(frelid, fuid, full * 2);
 			KC_PATH(KC_PATH_SIZE_FLUSH);
 		}
 	}
@@ -2397,10 +2635,15 @@ kc_log_logical_rows(Relation rel, KcWriteBuf *b, uint32 first, uint32 count)
 				v[c] = b->vals[idx];
 				n[c] = b->nulls[idx];
 			}
-			else
+			else if (TupleDescAttr(desc, c)->attisdropped)
 			{
 				v[c] = (Datum) 0;
 				n[c] = true;
+			}
+			else
+			{
+				/* a column added after the row was put in the buffer: what a scan returns for it (C13-03) */
+				v[c] = getmissingattr(desc, c + 1, &n[c]);
 			}
 		}
 		tup = heap_form_tuple(desc, v, n);
@@ -2513,6 +2756,8 @@ kc_write_stripe(KcRelState *st, KcWriteBuf *b, Relation rel, uint32 first,
 		b->res_valid = false;
 		kc_reserve_gate(KC_RES_AFTER_UPDATE);
 		kc_give_back_tail(rel, res_first + count, res_count - count);
+		/* the session's next reservation for this table starts at what this one needed (C13-02) */
+		kc_reserve_hint_set(b->relid, b->uid, count);
 	}
 	kc_flush_epoch++;
 
@@ -3447,6 +3692,8 @@ kc_xact_callback(XactEvent event, void *arg)
 			break;
 		case XACT_EVENT_PREPARE:
 		case XACT_EVENT_ABORT:
+			if (event == XACT_EVENT_ABORT)
+				kc_note_abandoned_all();
 			kc_orphans_adopted = false;
 			kc_replaced = NIL;
 			kc_state_reset();
@@ -4060,6 +4307,7 @@ kc_subxact_abort(SubTransactionId mySubid)
 				/* the stripes of a prepared hand-over go with the subtransaction */
 				if (b->merge_into != NULL)
 					b->merge_into->vis_from = 0;
+				kc_note_abandoned(b);
 				st->bufs = foreach_delete_current(st->bufs, lc);
 				kc_buf_free(b);
 			}
@@ -4154,9 +4402,13 @@ kc_write_init(void)
 							"Advisory lock key that a writer that reserves waits on at the point reserve_gate_at names (testing).",
 							NULL, &kc_guc_reserve_gate, 0, 0, 1000000,
 							PGC_SUSET, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
+	DefineCustomIntVariable("kingres_columnar.reserve_min_rows",
+							"How many row numbers a writer reserves at first for a table that has an index; the reservation grows while its buffer fills (0: a whole stripe's worth, the size of version 0.2 before C13).",
+							NULL, &kc_guc_reserve_min, 64, 0, 10000000,
+							PGC_SUSET, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 	DefineCustomIntVariable("kingres_columnar.reserve_gate_at",
-							"The point of the reservation where reserve_gate waits: 1 numbers taken, 2 reserved row inserted, 3 pages written, 4 row updated (testing).",
-							NULL, &kc_guc_reserve_gate_at, 0, 0, 5,
+							"The point of the reservation where reserve_gate waits: 1 numbers taken, 2 reserved row inserted, 3 pages written, 4 row updated, 6 an index vacuum has its ranges, 7 the merge of a VACUUM is done (testing).",
+							NULL, &kc_guc_reserve_gate_at, 0, 0, 7,
 							PGC_SUSET, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 
 #ifdef USE_ASSERT_CHECKING

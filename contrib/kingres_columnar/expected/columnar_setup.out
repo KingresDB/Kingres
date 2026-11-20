@@ -35,8 +35,8 @@ SELECT name, setting, unit, vartype, enumvals, context, boot_val,
   FROM pg_settings WHERE name LIKE 'kingres\_columnar.%'
    AND name NOT LIKE 'kingres\_columnar.fault\_%'	-- developer settings of assertion builds only
  ORDER BY name;
-                     name                      | setting  | unit | vartype |         enumvals          |  context  | boot_val | min_val | max_val  
------------------------------------------------+----------+------+---------+---------------------------+-----------+----------+---------+----------
+                     name                      | setting  | unit | vartype |         enumvals          |  context  | boot_val | min_val |  max_val   
+-----------------------------------------------+----------+------+---------+---------------------------+-----------+----------+---------+------------
  kingres_columnar.check_gate                   | 0        |      | integer |                           | superuser | 0        | 0       | 1000000
  kingres_columnar.check_gate_claims            | 0        |      | integer |                           | superuser | 0        | 0       | 1000000
  kingres_columnar.check_gate_orphans           | 0        |      | integer |                           | superuser | 0        | 0       | 1000000
@@ -48,12 +48,15 @@ SELECT name, setting, unit, vartype, enumvals, context, boot_val,
  kingres_columnar.max_stripe_rows              | 10000000 |      | integer |                           | superuser | 10000000 | 1000    | 10000000
  kingres_columnar.orphan_notes_max             | 10000    |      | integer |                           | superuser | 10000    | 1       | 10000
  kingres_columnar.reserve_gate                 | 0        |      | integer |                           | superuser | 0        | 0       | 1000000
- kingres_columnar.reserve_gate_at              | 0        |      | integer |                           | superuser | 0        | 0       | 5
+ kingres_columnar.reserve_gate_at              | 0        |      | integer |                           | superuser | 0        | 0       | 7
+ kingres_columnar.reserve_min_rows             | 64       |      | integer |                           | superuser | 64       | 0       | 10000000
  kingres_columnar.reserve_row_numbers          | off      |      | bool    |                           | superuser | off      |         | 
  kingres_columnar.stripe_row_count             | 150000   |      | integer |                           | user      | 150000   | 1000    | 10000000
+ kingres_columnar.vacuum_compact_rows          | 1000000  |      | integer |                           | superuser | 1000000  | 0       | 2147483647
+ kingres_columnar.vacuum_compact_stripes       | 128      |      | integer |                           | superuser | 128      | 0       | 10000000
  kingres_columnar.vacuum_truncate_lock_timeout | 5000     | ms   | integer |                           | superuser | 5000     | 50      | 600000
  kingres_columnar.write_buffer_memory          | 131072   | kB   | integer |                           | user      | 131072   |         | 
-(16 rows)
+(19 rows)
 
 SHOW kingres_columnar.compression;
  kingres_columnar.compression 

@@ -25,7 +25,8 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
-my $node = new_node('rconc');
+my $node = new_node('rconc', conf => "kingres_columnar.reserve_min_rows = 0
+");
 my $KEY = 778;
 
 q1($node, q{

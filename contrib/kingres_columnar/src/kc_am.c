@@ -37,6 +37,7 @@
 #include "miscadmin.h"
 #include "tcop/pquery.h"
 #include "storage/bufmgr.h"
+#include "storage/procarray.h"
 #include "storage/read_stream.h"
 #include "storage/smgr.h"
 #include "storage/lmgr.h"
@@ -937,6 +938,7 @@ kc_index_build_range_scan(Relation table_rel, Relation index_rel,
 	Datum		values[INDEX_MAX_KEYS];
 	bool		isnull[INDEX_MAX_KEYS];
 	double		reltuples = 0;
+	bool		check_read;
 
 	if (kc_write_refused(table_rel, "index build"))
 		return 0;
@@ -969,7 +971,16 @@ kc_index_build_range_scan(Relation table_rel, Relation index_rel,
 				 errdetail("The constraint on index \"%s\" would be checked at the end of the transaction by a trigger that re-reads the row by its TID.",
 						   RelationGetRelationName(index_rel)),
 				 errhint("Make the constraint NOT DEFERRABLE.")));
-	if (index_info->ii_Concurrent)
+	/*
+	 * A concurrent index description on an index that is valid and ready is a read of the index
+	 * against the table, not a build: amcheck's heapallindexed asks for the rows through this
+	 * entry point with ii_Concurrent set (C13-04).  A build that is concurrent has an index that
+	 * is not ready yet (CREATE INDEX CONCURRENTLY, and the copy REINDEX CONCURRENTLY makes) and is
+	 * refused.
+	 */
+	check_read = index_info->ii_Concurrent && index_rel->rd_index->indisvalid &&
+		index_rel->rd_index->indisready;
+	if (index_info->ii_Concurrent && !check_read)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("CREATE INDEX CONCURRENTLY and REINDEX CONCURRENTLY are not supported on columnar tables"),
@@ -1012,6 +1023,51 @@ kc_index_build_range_scan(Relation table_rel, Relation index_rel,
 	}
 	if (scan == NULL)
 		kc_scan_end(kscan);
+
+	/*
+	 * The rows of stripes that only an older snapshot can still see (C13-01): the stripes a
+	 * compaction replaced and VACUUM has not yet made removable.  The new index needs entries for
+	 * them, as heap indexes recently dead tuples, or a snapshot older than the compaction that
+	 * reads through the index finds none of its rows while its scan finds all of them.  They are
+	 * passed as "not alive", which the B-tree build keeps out of the uniqueness check (the copies
+	 * repeat their keys).  In a parallel build only the leader does it, once: the participants
+	 * would have to agree on a list that a prune of the stripe catalog could change under them.
+	 * The build holds SHARE on the table, which keeps a compaction and a vacuum out.
+	 *
+	 * Leader only is complete because the B-tree build always has the leader take part in a
+	 * parallel build: _bt_begin_parallel starts the leader's own scan unless the compile-time symbol
+	 * DISABLE_LEADER_PARTICIPATION is defined (parallel_leader_participation, the setting, does not
+	 * reach it; measured, C14-05).  A build that ran only in workers would skip this pass without a
+	 * word and an older snapshot would lose rows through the index again; t/063 shows one result is
+	 * right, not that the leader ran the pass.  A change that makes the leader stay out must make
+	 * one participant do the pass instead.
+	 */
+	if (!check_read && (scan == NULL || !IsParallelWorker()))
+	{
+		int			ndead;
+		KcStripeInfo *dead = kc_catalog_load_dead(table_rel,
+												  GetOldestNonRemovableTransactionId(table_rel),
+												  &ndead);
+
+		if (ndead > 0)
+		{
+			KcScan	   *dscan = kc_scan_begin(table_rel, NULL, NULL, NULL, KC_SCAN_MAINTENANCE);
+
+			dscan->stripes = dead;
+			dscan->nstripes = ndead;
+			kc_scan_drop_hold(dscan);	/* the rows of this transaction were read by the pass above */
+			while (kc_scan_next(dscan, slot))
+			{
+				CHECK_FOR_INTERRUPTS();
+				MemoryContextReset(econtext->ecxt_per_tuple_memory);
+				if (predicate != NULL && !ExecQual(predicate, econtext))
+					continue;
+				FormIndexDatum(index_info, slot, estate, values, isnull);
+				callback(index_rel, &slot->tts_tid, values, isnull, false, callback_state);
+			}
+			kc_scan_end(dscan);
+		}
+	}
 	ExecDropSingleTupleTableSlot(slot);
 	FreeExecutorState(estate);
 	index_info->ii_ExpressionsState = NIL;
