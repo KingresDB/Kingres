@@ -29,23 +29,53 @@ import (
 // KindFailover is the kind of the task (contract TaskKind server.failover).
 const KindFailover = "server.failover"
 
+// KindRestore is the kind of the task that restores the preferred primaries (contract TaskKind replication.restorePreferredPrimaries); its
+// subject is "replication" / "preferred-primaries".
+const (
+	KindRestore      = "replication.restorePreferredPrimaries"
+	SubjectRestoreID = "preferred-primaries"
+	SubjectRestore   = "replication"
+)
+
 // Request modes.
 const (
 	ModeHard     = "hard"
 	ModeGraceful = "graceful"
+	// ModeRestore is the restore of the preferred primaries: a switchover per group whose primary is not on its preferred server.
+	ModeRestore = "restore"
 )
 
 // Input is the input of the task: the request as it was resolved when the task
 // was made. It holds no secret. Groups is ascending, the map group (0) first.
 type Input struct {
-	Mode          string           `json:"mode"`
-	ServerID      string           `json:"serverId"`
+	Mode     string `json:"mode"`
+	ServerID string `json:"serverId"`
+	// Olds is the server whose primary is handed over, per group, for a restore (a restore spans servers); empty for the others, where
+	// it is ServerID.
+	Olds map[int32]string `json:"olds,omitempty"`
+	// Skipped are the groups that a restore does not touch, with the reason (preferredNotReady, mapGroup).
+	Skipped       []SkippedGroup   `json:"skipped,omitempty"`
 	Groups        []int32          `json:"groups"`
 	Targets       map[int32]string `json:"targets,omitempty"`
 	AllowDataLoss bool             `json:"allowDataLoss"`
 	Comment       string           `json:"comment,omitempty"`
 	Trigger       string           `json:"trigger"`
 	RequestedBy   string           `json:"requestedBy"`
+}
+
+// SkippedGroup is a group that a restore leaves alone.
+type SkippedGroup struct {
+	Group  int32  `json:"group"`
+	Reason string `json:"reason"`
+	Text   string `json:"text"`
+}
+
+// oldOf is the server whose primary of group g is handed over.
+func (in Input) oldOf(g int32) string {
+	if s := in.Olds[g]; s != "" {
+		return s
+	}
+	return in.ServerID
 }
 
 // Task error codes (README table of the control plane; the contract does not make

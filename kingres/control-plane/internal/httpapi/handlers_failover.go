@@ -17,6 +17,7 @@ import (
 // answered by the leader too, because the run's records are in its system database.
 type Failoverer interface {
 	Start(ctx context.Context, actor, server string, req failover.Request) (*task.Task, *failover.Plan, error)
+	StartRestore(ctx context.Context, actor string, req failover.RestoreRequest) (*task.Task, *failover.Plan, error)
 	Status(ctx context.Context) (failover.Status, error)
 	Reports(ctx context.Context, limit int, cursor string) (failover.ReportPage, error)
 	Report(ctx context.Context, id int64) (failover.Report, error)
@@ -24,10 +25,11 @@ type Failoverer interface {
 
 func (s *Server) failoverHandlers() map[string]handlerFunc {
 	return map[string]handlerFunc{
-		"failoverServer":      s.failoverServer,
-		"getFailoverStatus":   s.getFailoverStatus,
-		"listFailoverReports": s.listFailoverReports,
-		"getFailoverReport":   s.getFailoverReport,
+		"failoverServer":            s.failoverServer,
+		"restorePreferredPrimaries": s.restorePreferredPrimaries,
+		"getFailoverStatus":         s.getFailoverStatus,
+		"listFailoverReports":       s.listFailoverReports,
+		"getFailoverReport":         s.getFailoverReport,
 	}
 }
 
@@ -71,6 +73,31 @@ func (s *Server) failoverServer(c *call, w http.ResponseWriter, r *http.Request)
 	}
 	c.addDetails(map[string]any{"taskId": t.ID, "serverId": server, "mode": req.Mode, "shardGroupIds": req.ShardGroupIDs,
 		"allowDataLoss": req.AllowDataLoss, "comment": req.Comment})
+	s.accepted(w, r, *t)
+	return nil
+}
+
+// restorePreferredPrimaries starts the restore of the preferred primaries, or answers its plan (the body is optional).
+func (s *Server) restorePreferredPrimaries(c *call, w http.ResponseWriter, r *http.Request) error {
+	fo, err := s.needFailover()
+	if err != nil {
+		return err
+	}
+	var req failover.RestoreRequest
+	if r.ContentLength != 0 {
+		if err := s.body(w, r, &req); err != nil {
+			return err
+		}
+	}
+	t, plan, err := fo.StartRestore(r.Context(), c.session.Username, req)
+	if err != nil {
+		return s.failoverProblem(r, err)
+	}
+	if plan != nil {
+		s.writeJSON(w, r, http.StatusOK, plan)
+		return nil
+	}
+	c.addDetails(map[string]any{"taskId": t.ID, "shardGroupIds": req.ShardGroupIDs})
 	s.accepted(w, r, *t)
 	return nil
 }

@@ -2523,3 +2523,30 @@ still holds. A plain failover still pauses.
 
 **Open after the review (listed for later):** F4-05, the decision `allowDataLoss` of an operator that a member carries in the body of `start` (a signed assertion of the
 operator's session is the remedy); F4-06, an operator's call to abandon a stuck map bootstrap (a contract change; the monitor gives up a stale one by itself).
+
+### Increment 7, round 2 (the restore of the preferred primaries, the plan of a switchover, the phases, 2026-11-20)
+
+Contract unchanged (0.13.0): the restore operation, the plan and the status schemas were declared in 0.10.0; the text of the operations says how
+`kingresd` behaves.
+
+- **Restore** (`internal/failover/restore.go`): the task `replication.restorePreferredPrimaries` (subject `replication` / `preferred-primaries`) is the
+  steps of a switchover over other groups. `Input.Olds` says, per group, which server runs the primary now (a restore spans servers) and
+  `Input.Targets` the preferred server, the server of the group's first node by id; every place that took the old server from `Input.ServerID` takes it
+  from `oldOf(group)`. A group whose primary is at home is not listed; a group whose preferred server has no ready, registered standby is skipped
+  (`preferredNotReady`); the map group is skipped (`mapGroup`: the planned switchover of the map group is not built). Skipped groups are rows of the report with
+  state `skipped` and the reason. `failover_run.kind` is `restorePreferredPrimaries` (no migration: the column and its check exist from 0011), a restore pauses and
+  resumes like a failover (the resume keeps the input it was started with), and the rebalance refuses to start while one is unfinished.
+- **A group that fails before its promotion** is rolled back by the step that failed; the wrapper of the step (`restoreContinues`) then records the group
+  `failed` with the code and message, and the remaining steps of that group do nothing; the next group is run and the task ends with the outcome `partial`
+  (5.5, 4). A failure after the promotion, a pause, a lost lease and a stopped context are not turned: they are the task's.
+- **Plan** (`dryRun`): for `graceful` and `restore` the candidates that do not stream are not eligible, the verdict is `none`, the group has `writesPausedSeconds`
+  (an estimate of ten seconds) and `estimatedSeconds` (a minute), the steps are those of a switchover. The plan of a restore has no `serverId`.
+- **Phases and the pause.** `GET /failover` takes the phase of a group of a switchover or restore from the task's steps (the first step of the group that is not done:
+  `checking`, `choosing`, `quiescing`, `waitingForTransactions`, `stopping`, `verifying`, `waitingForLease`, `promoting`, `followingCatalog`, `repointing`,
+  `finishing`) and `writesPausedSince` from the event `quiesced` of the group while no later `writesResumed`, `rolledBack` or `groupFailed` event exists.
+  The phases of a hard failover are the earlier ones (from the state of the group's row).
+- **Not built.** The map group in a restore (and the planned switchover of the map group); the skipped groups are in the report, not in the plan; the adoption
+  `/standby/adopt {clean}` (the old primary is rebuilt, `pg_rewind`, as in round 1).
+- **Tests.** Unit: `internal/failover/restore_test.go` (resolving, skipping, the hand-back, a failed group, skipped rows, the plans, the phases). Cluster
+  (`internal/clustertest/failover_restore_test.go`): T12 `TestSwitchoverAndBack` (plan, switchover, restore, no loss, a second restore refused) and
+  `TestSwitchoverStatusNamesThePhaseAndThePause`.

@@ -13,7 +13,7 @@ Settings pages; the third lets a second and a third server join (`joinCluster`, 
 server (`removeServer`) and makes the cluster-wide operations run on every server (see
 [Running several servers](#running-several-servers)). At that time rebalance, failover, restoring preferred primaries
 still answered the contract's "not supported yet" problem (rebalance and failover are built since; the table
-under "What is implemented" is current, and only `restorePreferredPrimaries` and eight ledger operations still answer so). The fourth step added server groups, leaving a cluster,
+under "What is implemented" is current, and no operation answers so any more). The fourth step added server groups, leaving a cluster,
 instance start and stop, local settings, inclusion proofs and verification records, security headers and
 crash-injection tests of the task engine. The fifth step (contract 0.5.0) added certificate renewal and revocation,
 the cluster-wide logs, alerts and metrics, the alert kinds that nothing raised, and the corrections listed in
@@ -339,7 +339,7 @@ paths; what is not done is in "Not done in this increment"). "Real" means the op
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **139 of 140 operations are real; 1 answer "not yet".**
+authenticated operation lists in 0.2.0. **140 of 140 operations are real; none answers "not yet".**
 
 | Tag | Real | Not yet |
 |---|---|---|
@@ -358,7 +358,7 @@ authenticated operation lists in 0.2.0. **139 of 140 operations are real; 1 answ
 | Metrics | `queryMetrics` |  |
 | Query | `executeQuery`, `cancelStatement` |  |
 | Rebalance | `getRebalanceStatus`, `startRebalance`, `previewRebalancePlan`, `listRebalanceReports`, `getRebalanceReport`, `stopRebalance` |  |
-| Replication | `getReplicationTopology`, `getFailoverStatus`, `listFailoverReports`, `getFailoverReport` | `restorePreferredPrimaries` |
+| Replication | `getReplicationTopology`, `getFailoverStatus`, `listFailoverReports`, `getFailoverReport`, `restorePreferredPrimaries` | |
 | Server groups | `listServerGroups`, `createServerGroup`, `deleteServerGroup` |  |
 | Servers | `listServers`, `getServer`, `addServer`, `removeServer`, `updateServer`, `renewServerCertificates`, `revokeServerCertificates`, `failoverServer` |  |
 | Configuration | `listConfigParameters`, `getConfigParameter`, `previewConfigChange`, `applyConfigChange`, `listConfigChanges`, `revertConfigChange`, `listConfigServers`, `getConfigSummary`, `getClusterTime`, `listTimeZones`, `restartPendingInstances` |  |
@@ -3070,6 +3070,16 @@ Code: `internal/failover/switchover.go` (the steps), `cmd/kingresd/switchover.go
 Per group (ordinary groups; the map group still answers 422 for `graceful`): `Freeze`, `Choose the standby` (a standby that streams from the primary; the verdict is none), `Stop the writes`, `Let distributed transactions end`, `Stop the old primary cleanly` (mark, the standby replays the mark, fast shutdown, the lease released), `Verify the new primary` (`switchover_verify`, repeated for 30 s), then `Wait for the old lease`, `Hand the lease`, `Promote` and the steps of every failover. Any failure before the promotion rolls back (`rollbackSwitchover`: the leases of the run are released, the old primary is resumed, the writes are let in again) and fails with `standby_behind`, `switchover_unproven`, `cannot_quiesce` or `prepared_transactions_pending`; a cancel does the same through `OnFail`; the cancel guard refuses from the start of `Promote`. The access rules of the old primary are put back in the last step, before its rebuild.
 
 Deviations from the design: the old primary becomes a standby by the rebuild of increment 4 (`pg_rewind`, which finds nothing to rewind after a clean stop), not by the adoption `/standby/adopt {clean}` of 6.3; the phases `quiescing`, `waitingForTransactions`, `stopping`, `verifying` and `writesPausedSince` of `GET /failover` are not reported yet (the steps are named in the task, and the report has the events `quiesced`, `stoppedClean`, `verified` and `writesResumed` with `pauseMs`); `Unquiesce` is not persisted across a restart of kingresd (the failed task puts the rules back).
+
+## The restore of the preferred primaries, the plan of a switchover and the phases (increment 7, round 2; contract 0.13.0 text only)
+
+`POST /replication/restore-preferred-primaries` (optional body `{shardGroupIds, dryRun}`) starts the task `replication.restorePreferredPrimaries`: a switchover (the steps of
+round 1) per group whose primary is not on its preferred server (the server of the group's first node by id), from the server that took it over; code in
+`internal/failover/restore.go` and the per-group `Input.Olds`. Groups at home are not listed, a group whose preferred server has no ready standby and the map group are
+reported `skipped`; a group that fails before its promotion is rolled back and reported `failed` while the task goes on and ends `partial`; 422 `unprocessable` when
+nothing needs to be restored. `dryRun` answers the plan for a restore and for a switchover (`writesPausedSeconds`, the steps, verdict `none`). `GET /failover` names the phase of
+a group of a switchover or restore from the task's steps and `writesPausedSince` from the events `quiesced` and `writesResumed`. See the design ("Increment 7, round 2") for
+what is not built.
 
 ## The signing keys of the ledger (phase 7, steps 3 and 4, contract 0.11.0)
 

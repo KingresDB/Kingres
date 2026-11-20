@@ -5,6 +5,7 @@ package failover
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -36,8 +37,8 @@ func switchoverStepNames() []string {
 	return append(out, StepWriteReport)
 }
 
-// graceful tells whether the input is a planned switchover.
-func (in Input) graceful() bool { return in.Mode == ModeGraceful }
+// graceful tells whether the input is a planned switchover (a restore is a switchover per group).
+func (in Input) graceful() bool { return in.Mode == ModeGraceful || in.Mode == ModeRestore }
 
 // addGraceful appends the steps of one group of a switchover.
 func (r *Runner) addGraceful(out *[]task.Step, g int32) {
@@ -141,11 +142,11 @@ func (r *Runner) rollbackSwitchover(ctx context.Context, taskID int64, in Input,
 	}
 	// An error is logged, never swallowed: a server that cannot be reached keeps its hold and its marker, and the loop of Repair undoes them when
 	// the server answers again (F4-02), whatever became of this task.
-	if err := r.Peers.Resume(ctx, in.ServerID, ResumeRequest{Group: g, ExpectedTerm: term}); err != nil {
-		r.log().Warn("failover: the old primary could not be resumed; the repair of switchovers will try again", "group", g, "server", in.ServerID, "error", err)
+	if err := r.Peers.Resume(ctx, in.oldOf(g), ResumeRequest{Group: g, ExpectedTerm: term}); err != nil {
+		r.log().Warn("failover: the old primary could not be resumed; the repair of switchovers will try again", "group", g, "server", in.oldOf(g), "error", err)
 	}
-	if err := r.Peers.Unquiesce(ctx, in.ServerID, QuiesceRequest{Group: g, ExpectedTerm: term}); err != nil {
-		r.log().Warn("failover: the writes could not be let in again; the repair of switchovers will try again", "group", g, "server", in.ServerID, "error", err)
+	if err := r.Peers.Unquiesce(ctx, in.oldOf(g), QuiesceRequest{Group: g, ExpectedTerm: term}); err != nil {
+		r.log().Warn("failover: the writes could not be let in again; the repair of switchovers will try again", "group", g, "server", in.oldOf(g), "error", err)
 	}
 	r.mu.Lock()
 	delete(r.paused, pauseKey(taskID, g))
@@ -349,15 +350,16 @@ func (r *Runner) preflightGraceful(ctx context.Context, in Input) *Refusal {
 				Message: "The planned switchover of the map group is not supported yet; name the other groups in shardGroupIds, or use the failover."}
 		}
 	}
-	if r.Plan.Live(ctx, in.ServerID) != "live" {
-		return &Refusal{Code: "node_state_invalid", Status: 422, Message: "Server " + in.ServerID + " is not live; a planned switchover needs a live server (use mode hard)."}
-	}
 	for _, g := range in.Groups {
 		g := g
-		st, err := r.Peers.State(ctx, in.ServerID, g)
+		old := in.oldOf(g)
+		if r.Plan.Live(ctx, old) != "live" {
+			return &Refusal{Code: "node_state_invalid", Status: 422, Group: &g, Message: "Server " + old + " is not live; a planned switchover needs a live server (use mode hard)."}
+		}
+		st, err := r.Peers.State(ctx, old, g)
 		if err != nil || len(st.OutOfRecovery()) == 0 || !st.Holds {
 			return &Refusal{Code: "node_state_invalid", Status: 422, Group: &g,
-				Message: fmt.Sprintf("The primary of shard group %d does not run under its lease on %s; a planned switchover needs a running primary.", g, in.ServerID)}
+				Message: fmt.Sprintf("The primary of shard group %d does not run under its lease on %s; a planned switchover needs a running primary.", g, old)}
 		}
 		recs, err := r.Plan.Standbys(ctx, g)
 		if err != nil {
@@ -431,4 +433,39 @@ func failedPastPromotion(step string, g int32) bool {
 		return false
 	}
 	return pastPromotion(strings.TrimPrefix(step, prefix))
+}
+
+// restoreContinues turns the failure of a step of one group of a restore into a skip, when the group was not promoted: the group is
+// rolled back, recorded failed with the reason, and the run goes on with the next group (design 5.5, 4). A failure after the promotion,
+// a pause, a lost lease and a stop of the context are not turned: they are the task's.
+func (sc *stepCtx) restoreContinues(ctx context.Context, err error) error {
+	var fe *Error
+	if !errors.As(err, &fe) || ctx.Err() != nil || errors.Is(err, ErrLeaseLost) {
+		return nil
+	}
+	if pastPromotion(sc.key) {
+		return nil // from the promotion on a failure is the task's (F4-03)
+	}
+	gr, ok, gerr := sc.rows.Group(ctx, sc.group)
+	if gerr != nil || !ok {
+		return nil
+	}
+	switch gr.State {
+	case "pending", "frozen", "fenced", "pinned":
+	default:
+		return nil
+	}
+	term := int64(-1)
+	if run, rerr := sc.runRow(ctx); rerr == nil {
+		term = run.ExpectedTerm
+	}
+	sc.r.rollbackSwitchover(ctx, sc.env.Task.ID, sc.in, sc.group, gr.NewServer, term)
+	_ = sc.r.Peers.Unfreeze(ctx, sc.old(), sc.group)
+	text := fe.Code + ": " + fe.Message
+	if serr := sc.rows.Set(ctx, sc.group, GroupSet{State: ptr("failed"), Error: &text, Finished: true}); serr != nil {
+		return nil
+	}
+	sc.event(ctx, "groupFailed", map[string]any{"code": fe.Code, "message": fe.Message})
+	sc.r.Plan.Audit(ctx, "failoverGroupFailed", sc.group, map[string]any{"error": text})
+	return task.Skip("the group failed and was rolled back: " + text)
 }

@@ -77,10 +77,14 @@ type world struct {
 	verifyErr          error
 	verifyN            int
 	quiesced           bool
+	oldSrv             string // the server whose primary is handed over (default s1)
+	self               string // the leader's server (default s2)
 }
 
 func newWorld() *world {
 	w := &world{
+		oldSrv:   "s1",
+		self:     "s2",
 		oldAlive: false,
 		term:     5,
 		nodes: []Node{
@@ -147,7 +151,7 @@ func (w *world) count(prefix string) int {
 type fpeers struct{ w *world }
 
 func (p fpeers) unreach(server string) error {
-	if server == "s1" && !p.w.oldAlive {
+	if server == p.w.oldSrv && !p.w.oldAlive {
 		return ErrUnreachable
 	}
 	return nil
@@ -171,7 +175,7 @@ func (p fpeers) State(_ context.Context, server string, g int32) (State, error) 
 	}
 	p.w.rec("state %s", server)
 	st := State{Server: server, Group: g, Holds: p.w.lease[server], Frozen: p.w.frozen}
-	if server == "s1" {
+	if server == p.w.oldSrv {
 		f := false
 		st.Instances = []StateInstance{{ID: 1, Group: g, Running: p.w.oldWritable, InRecovery: &f, Role: "primary"}}
 		if !p.w.oldWritable {
@@ -422,7 +426,7 @@ func (c fcat) PromoteNode(_ context.Context, db string, id int32) (PromoteResult
 
 type fplan struct{ w *world }
 
-func (p fplan) Self() string { return "s2" }
+func (p fplan) Self() string { return p.w.self }
 func (p fplan) Members(context.Context) ([]string, error) {
 	return []string{"s1", "s2", "s3"}, nil
 }
@@ -564,6 +568,9 @@ func (m *memRows) Set(_ context.Context, g int32, u GroupSet) error {
 	}
 	if u.DataLoss != nil {
 		r.DataLoss = u.DataLoss
+	}
+	if u.Error != nil {
+		r.Error = *u.Error
 	}
 	return nil
 }
