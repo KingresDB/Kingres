@@ -90,6 +90,7 @@ typedef struct KsFragStart
 	const Oid  *relids;			/* the tables of the probes */
 	int64		plan_placement;
 	const char *marker;			/* the comment that starts the statement of the DECLARE */
+	const char *ext;			/* "name:version,..." of the extensions the statement uses, or NULL (the probe asks the node for them) */
 	const char *sql;			/* the query of the cursor */
 	int			nparams;
 	const Oid  *ptypes;

@@ -673,10 +673,10 @@ start_dest(KsBatchSender *s, KsBatchDest *d)
 	kingres_shard_fault_point("bulk_before_probe");
 	if (s->colocation_id != 0 && s->expect_placement != 0)
 	{
-		char	   *ask = kingres_shard_probe_before_sql(s->colocation_id, 1, &s->relid);
+		char	   *ask = kingres_shard_probe_before_sql(s->colocation_id, 1, &s->relid, NULL);
 		PGresult   *res = kingres_shard_exec_params(d->kc, ask, 0, NULL, NULL, false);
 
-		kingres_shard_probe_read_before(d->kc, res, 1, s->expect_placement, &d->identity);
+		kingres_shard_probe_read_before(d->kc, res, 1, s->expect_placement, &d->identity, NULL);
 	}
 	else if (s->check_identity)
 	{

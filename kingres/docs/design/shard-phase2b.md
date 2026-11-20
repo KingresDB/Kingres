@@ -3391,3 +3391,37 @@ fixed: a group that never had the extension raises `3F000` (its schema does not 
 conversion to KS001 does not cover, while t/162 tested only a dropped extension, whose schema stays;
 the test that another error is not converted fails at `FETCH`, not at `DECLARE`; and t/161 reads the
 source through the scan, not the pushdown paths.
+
+### The fixes for the review of step 13 (2026-11-20)
+
+Each finding was reproduced before the change. The new tests are t/173 to t/175.
+
+- **P2F-01 to P2F-03, a missing extension is decided by the catalog.** The conversion of a failed
+  `DECLARE` by its SQLSTATE is removed. The probe that runs on every group before the `DECLARE` now
+  also returns, when the statement names extensions, the name and version of each of them from the
+  group's `pg_extension`. A group that lacks one raises KS001 with the node, the extension and its
+  version; a group that has another version is left to the group's own check, which names both
+  versions. So a group that never had the extension (no schema, `3F000`), one whose extension was
+  dropped with its schema left (`42883`) and one whose type is gone (`42704`) all give KS001, and no
+  other failure of a `DECLARE` is taken for a missing extension: its SQLSTATE comes through. The list
+  of extensions reaches the probe in a new field of the fragment start. One window stays: an
+  extension dropped on a group between the probe and the `DECLARE` gives the parser's own error; a
+  repeat gives KS001.
+- **P2F-04, the ledger and the pushdown paths.** t/161 now also runs a scan, a partial aggregation,
+  an ordered merge with a limit and a closed aggregate inside PL/pgSQL functions (`RETURN QUERY`, so
+  the fragments are shipped) and feeds two ledger tables from them on every node. The log of a group
+  proves that the fragment statements ran. One ledger entry per row, none twice, and
+  `ledger_verify()` is clean.
+- **P2F-05, assertions.** The forged write fragments of t/160 now change something the checks see
+  and run in their own transaction, so a refusal that failed would leave a change; the expected
+  message no longer accepts `FATAL`. The catch-all `ERROR` is removed from a pattern of t/158.
+- **P2F-06.** The README says that ties are ordered among the groups and that the order inside one
+  group is the group's own, and it describes the probe.
+- **P2F-07, untested checks.** A move cannot overtake a statement, so t/174 changes the bucket map
+  of a node by hand at the point where the statement waits: a remote group's map after the
+  `DECLARE`, and this node's own map at a new fault point `frag_before_own_check`, between the
+  opening of the own cursor and its check. The statement fails with the retryable KS001. t/175
+  distributes a table that holds rows and whose column names have quotes, blanks, a reserved word,
+  a comment and a semicolon.
+
+Six mutants of the fixes, one at a time on 19, are all killed.

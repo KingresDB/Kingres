@@ -42,7 +42,7 @@ extern void kingres_shard_placement_check_plan(int colocation_id, int64 plan_pla
  * Before: placement and identity of every table, and the extension version of
  * the node.  After: the placement and the identity of every table.
  */
-extern char *kingres_shard_probe_before_sql(int colocation_id, int ntables, const Oid *relids);
+extern char *kingres_shard_probe_before_sql(int colocation_id, int ntables, const Oid *relids, const char *ext);
 extern char *kingres_shard_probe_after_sql(int colocation_id, int ntables, const Oid *relids);
 
 /*
@@ -55,7 +55,7 @@ extern char *kingres_shard_probe_after_sql(int colocation_id, int ntables, const
  * version of the extension.
  */
 extern void kingres_shard_probe_read_before(KsConn *kc, PGresult *res, int ntables,
-											 int64 plan_placement, int64 *identities);
+											 int64 plan_placement, int64 *identities, const char *ext);
 extern void kingres_shard_probe_read_after(KsConn *kc, PGresult *res, int ntables,
 											int64 plan_placement, const int64 *identities);
 

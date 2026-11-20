@@ -43,9 +43,12 @@ $_->safe_psql('postgres', 'ANALYZE') for ($f1, $f2);
 
 sub as_node
 {
-	my ($node, $id, $sql, $opts) = @_;
+	my ($node, $id, $sql, $opts, $notx) = @_;
 	my $tok = $node->safe_psql('postgres', "SELECT kingres.internal_forward_token(current_user, $id)");
 	local $ENV{PGOPTIONS} = $opts // "-c kingres_shard.forwarded=on -c kingres_shard.forward_token=$tok";
+	# $notx: the statement runs in its own transaction, so that a refusal that failed to refuse would leave a change that the checks see
+	# (review P2F-05); the controls with the proof stay inside BEGIN ... ROLLBACK
+	return run_sql($node, "\\set VERBOSITY verbose\n$sql;") if $notx && $sql !~ /DECLARE/;   # a DECLARE needs a transaction block; it is a read
 	return run_sql($node, "\\set VERBOSITY verbose\nBEGIN;\n$sql;\nROLLBACK;");
 }
 
@@ -67,16 +70,16 @@ ok(defined $K2, "a key whose bucket is in the group of node 2");
 # every kind of fragment: the marker, the text that follows it
 my @kinds = (
 	[ 'scan-fragment',          q{/* kingres:scan-fragment */ SELECT id, c, w, g FROM public.s AS ks_t WHERE id < 0} ],
-	[ 'write-fragment',         q{/* kingres:write-fragment */ UPDATE public.s SET w = w WHERE id < 0} ],
-	[ 'reference-write',        q{/* kingres:reference-write */ UPDATE public.r SET lbl = lbl WHERE k < 0} ],
+	[ 'write-fragment',         q{/* kingres:write-fragment */ UPDATE public.s SET w = w + 1000} ],
+	[ 'reference-write',        q{/* kingres:reference-write */ UPDATE public.r SET lbl = 'changed'} ],
 	[ 'query-fragment',         "/* kingres:query-fragment place=$PLACE */ DECLARE ks_f NO SCROLL CURSOR FOR $closed" ],
 	[ 'partial-fragment',       "/* kingres:partial-fragment place=$PLACE */ DECLARE ks_f NO SCROLL CURSOR FOR $partial" ],
-	[ 'insert-select-fragment', "/* kingres:insert-select-fragment place=$PLACE */ INSERT INTO public.s2 SELECT id, c, w, g FROM public.s WHERE id < 0" ],
+	[ 'insert-select-fragment', "/* kingres:insert-select-fragment place=$PLACE */ INSERT INTO public.s2 SELECT id, c, w, g FROM public.s" ],
 	[ 'insert-fragment',        "/* kingres:insert-fragment place=$PLACE */ INSERT INTO public.s (id, c, w, g) VALUES ($K2, 1, 1, 1)" ],
 );
 is(scalar(@kinds), 7, 'the seven kinds of fragment');
 
-my $rows = sub { return $_[0]->safe_psql('postgres', q{SET kingres_shard.enable_routing = off; SELECT count(*) FROM public.s}) . '/' . $_[0]->safe_psql('postgres', q{SELECT lbl FROM public.r WHERE k = 1}); };
+my $rows = sub { return $_[0]->safe_psql('postgres', q{SET kingres_shard.enable_routing = off; SELECT count(*) || '/' || sum(w) FROM public.s}) . '/' . $_[0]->safe_psql('postgres', q{SET kingres_shard.enable_routing = off; SELECT count(*) FROM public.s2}) . '/' . $_[0]->safe_psql('postgres', q{SELECT string_agg(DISTINCT lbl, ',') FROM public.r}); };
 my %before = (f1 => $rows->($f1), f2 => $rows->($f2));
 
 # ---------------------------------------------------------------------------
@@ -93,17 +96,19 @@ for my $k (@kinds)
 		($rc, $out, $err) = as_node($f2, 2, $text);
 		is($rc, 0, "'$name': with the proof of a node of the cluster a healthy primary runs it") or diag($err);
 	}
-	($rc, $out, $err) = as_node($f2, 2, $text, '-c kingres_shard.forwarded=on');
+	($rc, $out, $err) = as_node($f2, 2, $text, '-c kingres_shard.forwarded=on', 1);
 	isnt($rc, 0, "'$name': a session that claims to be forwarded without the token is refused");
-	like($err, qr/forward|token|authent|FATAL/i, '... with a message about the token') or diag($err);
-	($rc, $out, $err) = as_node($f2, 2, $text, '-c kingres_shard.forwarded=on -c kingres_shard.forward_token=' . ('0' x 64));
+	like($err, qr/KS014|forwarded|token|authent/i, '... with a message about the token') or diag($err);
+	($rc, $out, $err) = as_node($f2, 2, $text, '-c kingres_shard.forwarded=on -c kingres_shard.forward_token=' . ('0' x 64), 1);
 	isnt($rc, 0, "'$name': a token that is not the proof is refused");
 	like($err, qr/cannot prove it|KS014/, '... as a session that cannot prove it') or diag($err);
-	($rc, $out, $err) = as_node($f2, 2, $text, '-c kingres_shard.forwarded=on -c kingres_shard.forward_token=zz');
+	($rc, $out, $err) = as_node($f2, 2, $text, '-c kingres_shard.forwarded=on -c kingres_shard.forward_token=zz', 1);
 	isnt($rc, 0, "'$name': a token of the wrong shape is refused");
 }
 is($rows->($f1), $before{f1}, 'nothing changed on node 1');
 is($rows->($f2), $before{f2}, 'nothing changed on node 2');
+# the insert fragment has no control run with the proof: its text takes the parameters of a batch, which psql cannot send, so its refusal
+# is tied to the token by the other six kinds that share the check and not by a run of its own
 
 # ---------------------------------------------------------------------------
 # B. the old primary after a planned switchover
@@ -129,7 +134,7 @@ is($rows->($f2), $before{f2}, 'nothing changed on node 2');
 			like($err, qr/term|KS002|no longer the primary|KS001/, '... naming the term') or diag($err);
 			next;
 		}
-		my ($rc, $out, $err) = as_node($f2, 2, $text);
+		my ($rc, $out, $err) = as_node($f2, 2, $text, undef, 1);
 		isnt($rc, 0, "'$name': the demoted node refuses it");
 		like($err, qr/no longer the primary of its shard group|KS001/, '... with the retryable KS001') or diag($err);
 	}

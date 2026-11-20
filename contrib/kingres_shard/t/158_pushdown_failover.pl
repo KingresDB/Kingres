@@ -180,7 +180,7 @@ for my $p (@paths)
 	change_primary($f1, $f2, $s2, $id, 0);
 	$b->{stderr} = '';
 	$b->query($p->{sql});
-	like($b->{stderr}, qr/already uses node .* of shard group 1|bucket map|map changed|no longer|ERROR/,
+	like($b->{stderr}, qr/already uses node .* of shard group 1|bucket map|map changed|no longer|KS001/,
 		"$label: the read is refused, one node of a group per transaction (never a read of the new primary beside a write of the old)");
 	$b->{stderr} = '';
 	$b->query('ROLLBACK');

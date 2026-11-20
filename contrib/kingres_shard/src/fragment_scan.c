@@ -462,48 +462,6 @@ frag_send_fetch(KsFrag *f)
 }
 
 /*
- * A group that does not have an extension the statement uses fails when it parses the text ("function ... does not exist", "type ...
- * does not exist"), before any hook of the extension can see the marker: PostgreSQL has no hook between the parser and the
- * analysis of a DECLARE.  This node knows what the statement uses (the marker names the extensions), so it turns that failure into
- * the KS001 of a version difference (design 5.5): the extension is not at the version here on that node.  A repeat does not help before
- * the extension is installed on every node.  The group's own message is kept as the detail.
- */
-static void
-declare_missing_extension(KsFrag *f, PGresult *res, const char *marker)
-{
-	const char *p;
-	const char *end;
-	int			sqlstate;
-	char	   *names;
-	char	   *said = NULL;
-	const char *s;
-	char	   *host;
-	int			port;
-
-	if (res == NULL || marker == NULL || (p = strstr(marker, " ext=")) == NULL)
-		return;
-	sqlstate = kingres_shard_result_sqlstate(res);
-	if (sqlstate != ERRCODE_UNDEFINED_FUNCTION && sqlstate != ERRCODE_UNDEFINED_OBJECT)
-		return;
-	p += 5;
-	end = strstr(p, " */");
-	if (end == NULL)
-		return;
-	names = pnstrdup(p, end - p);
-	if ((s = PQresultErrorField(res, PG_DIAG_MESSAGE_PRIMARY)) != NULL)
-		said = pstrdup(s);
-	host = pstrdup(f->kc->host);
-	port = f->kc->port;
-	PQclear(res);
-	ereport(ERROR,
-			(errcode(ERRCODE_KINGRES_STALE_MAP),
-			 errmsg("node %s:%d does not have an extension that the statement uses (%s)", host, port, names),
-			 errdetail("The node said: %s", said != NULL ? said : "an object does not exist"),
-			 errhint("A repeat does not help until the extension is installed at the same version on every node; "
-					 "SET kingres_shard.shippable_extensions = 'none' reads the rows and runs the extension's functions here.")));
-}
-
-/*
  * The statement fails the way a failed group does (placement_check.c, 4.6) when a command
  * cannot be sent: the connection is gone.
  */
@@ -552,7 +510,7 @@ kingres_shard_fragset_start(KsFragSet *fs, const KsFragStart *st)
 	 * cursors are opened, then every group is asked again (step 4).  A node whose answers
 	 * differ, or differ from the plan's, had a switch commit in between.
 	 */
-	ask = kingres_shard_probe_before_sql(st->colocation_id, st->ntables, st->relids);
+	ask = kingres_shard_probe_before_sql(st->colocation_id, st->ntables, st->relids, st->ext);
 	recheck = kingres_shard_probe_after_sql(st->colocation_id, st->ntables, st->relids);
 	foreach(lc, fs->frags)
 	{
@@ -578,7 +536,7 @@ kingres_shard_fragset_start(KsFragSet *fs, const KsFragStart *st)
 		f->in_flight = false;
 		if (res == NULL)
 			f->kc->have_error = true;
-		kingres_shard_probe_read_before(f->kc, res, st->ntables, st->plan_placement, f->identity);
+		kingres_shard_probe_read_before(f->kc, res, st->ntables, st->plan_placement, f->identity, st->ext);
 	}
 	kingres_shard_fault_point(st->fp_after_probe_before);
 
@@ -614,7 +572,6 @@ kingres_shard_fragset_start(KsFragSet *fs, const KsFragStart *st)
 		{
 			if (res == NULL)
 				f->kc->have_error = true;
-			declare_missing_extension(f, res, st->marker);
 			kingres_shard_fragment_error(f->kc, res, "DECLARE");
 		}
 		PQclear(res);
@@ -654,7 +611,12 @@ kingres_shard_fragset_start(KsFragSet *fs, const KsFragStart *st)
 	}
 	/* This node's own placement and partitions can have changed in the same window. */
 	if (st->after_check != NULL)
+	{
+		/* a point of the tests: the map of this node changes after its own cursor is open and the groups were asked again (t/174) */
+		if (kingres_shard_fault_spec()[0] != '\0')
+			kingres_shard_fault_point(psprintf("%sbefore_own_check", st->fp_declared_prefix));
 		st->after_check(st->arg);
+	}
 	kingres_shard_fault_point(st->fp_after_check);
 	if (st->fp_first_fetch != NULL)
 		kingres_shard_fault_point(st->fp_first_fetch);
@@ -2219,6 +2181,7 @@ fs_start(KsFragScanState *s)
 	st.relids = relids;
 	st.plan_placement = s->plan_placement;
 	st.marker = s->partial ? kingres_shard_partial_marker(s->plan_placement, s->ext) : kingres_shard_query_marker(s->plan_placement, s->ext);
+	st.ext = s->ext;
 	st.sql = s->sql;
 	st.nparams = nparams;
 	st.ptypes = types;

@@ -1608,7 +1608,7 @@ The groups sort the rows of a closed query and this node merges the sorted strea
 offset>` with no `OFFSET`; every group returns its first rows of the final order, the `Kingres Fragment Scan` merges the streams with
 one `SortSupport` per key (the ordering operator, the direction, `NULLS FIRST` or `LAST` and the collation of the key, as the planner
 takes them for a `Sort`), so there is no `Sort` above it, and the `Limit` of this node applies the offset and the limit to the merged
-stream.  A tie goes to the stream of the group with the lower group id (this node's own part has the id of its own group), so rows that compare equal come out in the same order whichever node runs the statement, and in the same order when the statement is repeated.  `EXPLAIN` shows
+stream.  A tie goes to the stream of the group with the lower group id (this node's own part has the id of its own group), so rows that compare equal come out in the same order among the groups whichever node runs the statement, and in the same order when the statement is repeated on unchanged data.  The order of equal rows inside one group is that group's own (it can differ between a plan with a limit and one without).  `EXPLAIN` shows
 `Merge keys: <n>` and the text with `ORDER BY` and `LIMIT`.  A cursor that is closed early closes the cursors of the groups; a group that
 answers late holds the merge up for as long as it has to.
 
@@ -1676,10 +1676,12 @@ ext=kingres_sketch:1.0 */` (the same for `kingres:query-fragment`).  A group com
 analyses the text: another version, or none, is `KS001` with the message "extension kingres_sketch is at version 1.0 here and 0.9
 at the node that sent the statement", and the hint says a repeat does not help before the upgrade is finished on every node.  A
 statement that uses an extension its marker does not name, or a marker that names one the statement does not use, is `0A000`.  A
-group that does not have the extension at all fails earlier, when it parses the text (the function does not exist there); PostgreSQL has no hook
-between the parser and the analysis of the `DECLARE`, so the node that sent the statement, which knows from the marker what the statement uses,
-turns that failure into the `KS001` of a version difference ("node host:port does not have an extension that the statement uses
-(kingres_sketch:1.0)", with what the node said as the detail).  This is the
+group that does not have the extension at all would fail when it parses the text ("function ... does not exist" when the extension was
+dropped and its schema is left, "schema ... does not exist" when it never had it); PostgreSQL has no hook between the parser and the analysis
+of the `DECLARE`, so the sender does not wait for that error: the probe that it asks of every group before the `DECLARE` also asks the catalog
+of the group which of the extensions named in the marker it has, and a group that has none of that name gives the `KS001` of a version difference
+("node host:port does not have an extension that the statement uses (kingres_sketch:1.0)", the detail says it is not installed there).  The
+decision is the group's catalog, not the error of a parse, so no other error is taken for a missing extension.  This is the
 one place where a shipped statement can fail for a reason the scan would not have; the escape is
 `SET kingres_shard.shippable_extensions = 'none'`, with which the node that runs the statement reads the rows and runs the
 aggregate itself.
