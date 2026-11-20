@@ -68,6 +68,7 @@ PG_FUNCTION_INFO_V1(kingres_internal_schema_delta);
 /* kingres_shard.max_distributed_schemas, kingres_shard.schema_placement_group, kingres_shard.distribute_new_schemas */
 int			kingres_shard_max_distributed_schemas = 10000;
 int			kingres_shard_schema_placement_group = -1;
+bool		kingres_shard_enable_schema_routing = true;
 static int	distribute_new_schemas_setting = 0;	/* 0 default, 1 on, 2 off */
 
 static const struct config_enum_entry distribute_new_schemas_options[] = {
@@ -80,6 +81,14 @@ static const struct config_enum_entry distribute_new_schemas_options[] = {
 void
 kingres_shard_schema_ddl_init(void)
 {
+	DefineCustomBoolVariable("kingres_shard.enable_schema_routing",
+							 "Run a statement on a distributed schema whole on the shard group that holds it.",
+							 "When off, such a statement is planned with the distributed scan (single-source form) and a write to a schema of another group is refused; used to compare the two paths.",
+							 &kingres_shard_enable_schema_routing,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+
 	DefineCustomIntVariable("kingres_shard.max_distributed_schemas",
 							"Upper bound on the number of distributed schemas of a database.",
 							"The number is a guess and not a measured limit; the creation of another distributed schema fails with a clear message.",
@@ -585,6 +594,15 @@ kingres_shard_schema_ddl_classify(Node *parsetree, const KsCatalog *cat, bool fo
 				Oid			ns = rv_ns(a->relation);
 
 				ns_add(&s, ns);
+				/* a key from a table outside a distributed schema to a table of one is refused too */
+				if (s.dist == NIL && OidIsValid(ns) && s.other != NIL)
+					foreach(lc, a->cmds)
+					{
+						AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
+
+						if (cmd->subtype == AT_AddConstraint && cmd->def != NULL && IsA(cmd->def, Constraint))
+							check_foreign_key((Constraint *) cmd->def, ns, cat, sd);
+					}
 				if (s.dist != NIL)
 				{
 					foreach(lc, a->cmds)

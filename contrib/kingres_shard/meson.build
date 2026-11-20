@@ -294,6 +294,7 @@ tests += {
       't/232_schema_distribute_cluster.pl',
       't/233_schema_ddl_cluster.pl',
       't/234_schema_modes_cluster.pl',
+      't/235_schema_route_cluster.pl',
     ],
   },
 }

@@ -110,6 +110,7 @@
 #include "pushdown.h"
 #include "remote_scan.h"
 #include "row_router.h"
+#include "schema_ddl.h"
 #include "shippable.h"
 #include "utility.h"
 
@@ -2599,6 +2600,7 @@ typedef struct SchemaFind
 	const KsCatalog *cat;
 	bool		any;			/* the statement names a table of a distributed schema */
 	bool		shell;			/* ... one of which another group holds */
+	bool		shell_table;	/* ... and it is a table (not only a sequence that the statement calls) */
 	Oid			shell_relid;
 	int			shell_group;	/* its owner */
 	bool		write_shell;	/* a data-modifying query whose target is a shell */
@@ -2640,6 +2642,7 @@ schema_find_walker(Node *node, void *context)
 				sf->shell_group = owner;
 			}
 			sf->shell = true;
+			sf->shell_table = true;
 			if (q->resultRelation == (int) rti &&
 				(q->commandType == CMD_INSERT || q->commandType == CMD_UPDATE ||
 				 q->commandType == CMD_DELETE || q->commandType == CMD_MERGE) &&
@@ -2651,10 +2654,46 @@ schema_find_walker(Node *node, void *context)
 		}
 		return query_tree_walker(q, schema_find_walker, context, 0);
 	}
+	/* a sequence of a distributed schema named by a constant: nextval(), currval(), setval() belong to its owner (design 6.4) */
+	if (IsA(node, FuncExpr))
+	{
+		FuncExpr   *fe = (FuncExpr *) node;
+
+		if (fe->funcid < FirstNormalObjectId && fe->funcresulttype == INT8OID && fe->args != NIL &&
+			IsA(linitial(fe->args), Const) && ((Const *) linitial(fe->args))->consttype == REGCLASSOID &&
+			!((Const *) linitial(fe->args))->constisnull)
+		{
+			char	   *fname = get_func_name(fe->funcid);
+
+			if (fname != NULL && (strcmp(fname, "nextval") == 0 || strcmp(fname, "currval") == 0 ||
+								  strcmp(fname, "setval") == 0))
+			{
+				Oid			seq = DatumGetObjectId(((Const *) linitial(fe->args))->constvalue);
+				const KsDistSchema *ds = kingres_shard_lookup_dist_schema(sf->cat, get_rel_namespace(seq));
+
+				if (ds != NULL)
+				{
+					int			owner = kingres_shard_bucket_group(ds->coloc, kingres_shard_coloc_bucket(ds->coloc, 0));
+
+					sf->any = true;
+					if (owner != sf->cat->local_group_id)
+					{
+						if (!sf->shell)
+						{
+							sf->shell_relid = seq;
+							sf->shell_group = owner;
+						}
+						sf->shell = true;
+					}
+				}
+			}
+		}
+	}
 	return expression_tree_walker(node, schema_find_walker, context);
 }
 
 /* What a statement does with the tables of distributed schemas. */
+
 static void
 schema_find(Query *parse, const KsCatalog *cat, SchemaFind *sf)
 {
@@ -2683,16 +2722,217 @@ schema_forwarded_check(const SchemaFind *sf, const KsCatalog *cat)
 }
 
 /*
+ * Path S (design 6.2): a statement that touches the tables of one distributed schema held by another group,
+ * and reference tables it only reads, and nothing else, is one closed statement.  It is deparsed and run whole
+ * by the owner, which plans it with its own statistics and indexes: subqueries, CTEs (also those that write),
+ * windows, aggregates, joins, set operations, FOR UPDATE, ON CONFLICT and RETURNING need nothing of this
+ * node.  The plan does not depend on a key, so a generic plan can be routed too.  What the owner checks, and
+ * what a stale map means, is the forwarded-session check above (KS001, then the retry of remote_scan.c).
+ */
+typedef struct PathS
+{
+	const KsCatalog *cat;
+	int			owner;			/* the group that holds the tables, -1 until one is met */
+	bool		ok;
+	const char *why;			/* the reason when not ok, for the message of a refused write */
+	bool		user_function;	/* a function, operator or aggregate that is not built in */
+	bool		ship_all;		/* every schema the statement touches ships its functions */
+	List	   *relids;			/* the tables and sequences, for the invalidation of the plan */
+} PathS;
+
+static void
+paths_fail(PathS *p, const char *why)
+{
+	if (p->ok)
+	{
+		p->ok = false;
+		p->why = why;
+	}
+}
+
+static void
+paths_note_group(PathS *p, int group, bool ship)
+{
+	if (p->owner < 0)
+		p->owner = group;
+	else if (p->owner != group)
+		paths_fail(p, "it reads tables of distributed schemas that different shard groups hold");
+	if (!ship)
+		p->ship_all = false;
+}
+
+static bool
+paths_walker(Node *node, void *context)
+{
+	PathS	   *p = (PathS *) context;
+
+	if (node == NULL)
+		return false;
+	if (IsA(node, Query))
+	{
+		Query	   *q = (Query *) node;
+		ListCell   *lc;
+
+		foreach(lc, q->rtable)
+		{
+			RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+			const KsDistTable *st;
+			const KsDistTable *dt;
+
+			if (rte->rtekind != RTE_RELATION)
+				continue;
+			st = kingres_shard_lookup_schema_table(p->cat, rte->relid);
+			if (st != NULL)
+			{
+				const KsDistSchema *ds = kingres_shard_lookup_dist_schema(p->cat, get_rel_namespace(rte->relid));
+
+				kingres_shard_refuse_view_owner(q, rte);
+				paths_note_group(p, kingres_shard_schema_table_owner(st), ds != NULL && ds->ship_functions);
+				p->relids = list_append_unique_oid(p->relids, rte->relid);
+				continue;
+			}
+			dt = p->cat->ndist_tables > 0 ? hash_search(p->cat->dist_tables, &rte->relid, HASH_FIND, NULL) : NULL;
+			if (dt != NULL && dt->is_reference)
+			{
+				/* a view that another role owns would run with the rights of the session on the other node */
+				if (rte->perminfoindex > 0)
+				{
+					Oid			owner = getRTEPermissionInfo(q->rteperminfos, rte)->checkAsUser;
+
+					if (OidIsValid(owner) && owner != GetUserId())
+						paths_fail(p, "it reads a reference table through a view that another role owns");
+				}
+				p->relids = list_append_unique_oid(p->relids, rte->relid);
+				continue;
+			}
+			paths_fail(p, dt != NULL ? "it reads a hash-distributed table" :
+					   "it reads a table that is not in a distributed schema and not a reference table");
+		}
+		return query_tree_walker(q, paths_walker, context, 0);
+	}
+	if (IsA(node, FuncExpr))
+	{
+		FuncExpr   *fe = (FuncExpr *) node;
+
+		if (fe->funcid >= FirstNormalObjectId)
+			p->user_function = true;
+		else if (fe->funcresulttype == INT8OID && fe->args != NIL)
+		{
+			char	   *fname = get_func_name(fe->funcid);
+
+			if (fname != NULL && strcmp(fname, "lastval") == 0)
+				paths_fail(p, "it calls lastval()");
+			else if (fname != NULL && (strcmp(fname, "nextval") == 0 || strcmp(fname, "currval") == 0 ||
+									   strcmp(fname, "setval") == 0))
+			{
+				Node	   *a0 = linitial(fe->args);
+
+				if (IsA(a0, Const) && ((Const *) a0)->consttype == REGCLASSOID && !((Const *) a0)->constisnull)
+				{
+					Oid			seq = DatumGetObjectId(((Const *) a0)->constvalue);
+					const KsDistSchema *ds = kingres_shard_lookup_dist_schema(p->cat, get_rel_namespace(seq));
+
+					if (ds != NULL)
+					{
+						paths_note_group(p, kingres_shard_bucket_group(ds->coloc, kingres_shard_coloc_bucket(ds->coloc, 0)),
+										 ds->ship_functions);
+						p->relids = list_append_unique_oid(p->relids, seq);
+					}
+					else
+						paths_fail(p, "it calls a sequence that is not in a distributed schema");
+				}
+				else
+					paths_fail(p, "it calls a sequence that is not named by a constant");
+			}
+		}
+	}
+	else if (IsA(node, OpExpr))
+	{
+		OpExpr	   *oe = (OpExpr *) node;
+
+		set_opfuncid(oe);
+		if (oe->opfuncid >= FirstNormalObjectId)
+			p->user_function = true;
+	}
+	else if (IsA(node, Aggref))
+	{
+		if (((Aggref *) node)->aggfnoid >= FirstNormalObjectId)
+			p->user_function = true;
+	}
+	else if (IsA(node, WindowFunc))
+	{
+		if (((WindowFunc *) node)->winfnoid >= FirstNormalObjectId)
+			p->user_function = true;
+	}
+	return expression_tree_walker(node, paths_walker, context);
+}
+
+/*
  * The statement of a session that is not forwarded names a table of a distributed schema that another
- * group holds.  A SELECT, and a write whose target is not a shell nor a hash-distributed table, is
- * planned with the distributed scan; the rest is refused (the writes go to the owner in a later step of
- * the design: path S, 6.2).
+ * group holds.  Path S ships it whole to the owner when it can; else a SELECT (and a write whose target is
+ * not a shell nor a hash-distributed table) is planned with the distributed scan, and the rest is refused
+ * with the reason.
  */
 static PlannedStmt *
 plan_schema_shell(Query *parse, const char *query_string, int cursorOptions,
 				  ParamListInfo boundParams, Analysis *a, const KsCatalog *cat,
 				  const SchemaFind *sf)
 {
+	const char *why = NULL;
+
+	if (kingres_shard_enable_schema_routing)
+	{
+		PathS		ps;
+
+		memset(&ps, 0, sizeof(ps));
+		ps.cat = cat;
+		ps.owner = -1;
+		ps.ok = true;
+		ps.ship_all = true;
+		(void) paths_walker((Node *) parse, &ps);
+		if (ps.ok && ps.owner < 0)
+			paths_fail(&ps, "it names no table of a distributed schema");
+		if (ps.ok && ps.user_function && !ps.ship_all)
+			paths_fail(&ps, "it calls a function that is not built in, and the schema does not ship functions (kingres.alter_distributed_schema)");
+		if (ps.ok && (cursorOptions & CURSOR_OPT_SCROLL) && parse->commandType == CMD_SELECT)
+			paths_fail(&ps, "a scrollable cursor needs the distributed scan");
+		if (ps.ok && a->has_ref && OidIsValid(reference_write_target(parse, cat)))
+			paths_fail(&ps, "it writes a reference table");
+		if (ps.ok && ps.owner != cat->local_group_id)
+		{
+			const KsNode *node = NULL;
+			ListCell   *lc;
+			bool		is_write;
+
+			if (IsInParallelMode())
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("a statement for another shard group cannot be forwarded from a parallel worker"),
+						 errhint("Mark the function that runs the statement PARALLEL RESTRICTED or PARALLEL UNSAFE.")));
+			foreach(lc, cat->nodes)
+			{
+				KsNode	   *n = (KsNode *) lfirst(lc);
+
+				if (n->group_id == ps.owner && n->is_primary && n->is_active)
+				{
+					node = n;
+					break;
+				}
+			}
+			if (node == NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("shard group %d has no active primary node", ps.owner)));
+			is_write = parse->commandType != CMD_SELECT || parse->rowMarks != NIL ||
+				parse->hasModifyingCTE || contain_volatile_functions((Node *) parse);
+			return kingres_shard_make_remote_plan(parse, deparse_for_remote(parse), node->host, node->port,
+												  ps.owner, 0, is_write, ps.relids);
+		}
+		why = ps.why;
+	}
+	else
+		why = "kingres_shard.enable_schema_routing is off";
+
 	if (sf->write_shell)
 	{
 		const KsNode *owner = kingres_shard_group_primary(sf->shell_group);
@@ -2701,9 +2941,17 @@ plan_schema_shell(Query *parse, const char *query_string, int cursorOptions,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("a write to table \"%s\" of a distributed schema, which shard group %d holds, is not supported from shard group %d yet",
 						qualified_name(sf->write_relid), sf->shell_group, cat->local_group_id),
+				 errdetail("The statement cannot be run whole on the owner: %s.", why != NULL ? why : "unknown reason"),
 				 owner ? errhint("Run the statement on node %d (%s:%d), the primary of shard group %d.",
 								 owner->node_id, owner->host, owner->port, sf->shell_group) : 0));
 	}
+	if (!sf->shell_table)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a sequence of a distributed schema that shard group %d holds cannot be used from shard group %d in this statement",
+						sf->shell_group, cat->local_group_id),
+				 errdetail("The statement cannot be run whole on the owner: %s.", why != NULL ? why : "unknown reason"),
+				 errhint("Call the sequence in a statement of its own.")));
 	if (a->has_ref && OidIsValid(reference_write_target(parse, cat)))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -2953,7 +3201,7 @@ planner_hook_body(Query *parse, const char *query_string,
 	/* The window of shard-phase4.md, "A routed statement on a target"; forced by t/033. */
 	kingres_shard_fault_point("route_before_catalog");
 	cat = kingres_shard_catalog();
-	if (!cat->present || (cat->ndist_tables == 0 && cat->nschema_tables == 0) || cat->local_group_id == -1)
+	if (!cat->present || (cat->ndist_tables == 0 && cat->nschema_tables == 0 && cat->ndist_schemas == 0) || cat->local_group_id == -1)
 		return pass_through(parse, query_string, cursorOptions, boundParams);
 
 	/* With one shard group every bucket is local. */
@@ -3025,7 +3273,7 @@ planner_hook_body(Query *parse, const char *query_string,
 	 * opened is told its map is not this node's; a read of this node's own session is planned with the
 	 * distributed scan, a write is refused (see plan_schema_shell).
 	 */
-	if (cat->nschema_tables > 0)
+	if (cat->nschema_tables > 0 || cat->ndist_schemas > 0)
 	{
 		SchemaFind	sf;
 

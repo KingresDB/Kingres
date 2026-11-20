@@ -95,6 +95,7 @@ same_everywhere(q{SELECT count(*) FROM pg_class WHERE relname = 'a_id_seq' AND r
 }
 fails($n1, q{CREATE TABLE t1.c (x int REFERENCES public.loc (id))}, qr/foreign key between a table of a distributed schema and a table outside the schema/, 'a foreign key to a local table');
 fails($n1, q{CREATE TABLE public.d (x int REFERENCES t1.a (id))}, qr/foreign key between a table of a distributed schema and a table outside the schema/, 'a foreign key from a local table to a schema table');
+fails($n1, q{ALTER TABLE public.loc ADD FOREIGN KEY (id) REFERENCES t1.a (id)}, qr/foreign key between a table of a distributed schema and a table outside the schema/, 'ALTER TABLE: a foreign key from a local table to a schema table');
 fails($n1, q{CREATE TABLE t1.c2 (x int REFERENCES t2.nothing (id))}, qr/does not exist/, 'a foreign key to a table that does not exist (the error of PostgreSQL)');
 q1($n1, q{CREATE TABLE t2.k (id int PRIMARY KEY)});
 fails($n1, q{CREATE TABLE t1.c3 (x int REFERENCES t2.k (id))}, qr/foreign key between a table of a distributed schema and a table outside the schema/, 'a foreign key to a table of another distributed schema');

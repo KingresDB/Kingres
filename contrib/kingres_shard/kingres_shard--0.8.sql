@@ -12230,10 +12230,37 @@ CREATE FUNCTION kingres.internal_schema_delta(op text, nsp name, colocation_id i
     LANGUAGE C
     SET search_path = pg_catalog, kingres, pg_temp;
 
+-- A flag of a distributed schema (design 5.4): ship_functions lets path S run a statement that calls functions of the
+-- schema (or any function that is not built in) whole on the owner, which has them all.  The catalog goes to every node.
+CREATE FUNCTION kingres.alter_distributed_schema(nsp regnamespace, ship_functions bool DEFAULT NULL)
+    RETURNS void
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+#variable_conflict use_variable
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    LOCK TABLE kingres.map_version IN EXCLUSIVE MODE;
+    PERFORM kingres.internal_require_map_group();
+    IF NOT EXISTS (SELECT 1 FROM kingres.dist_schema s WHERE s.nsp OPERATOR(pg_catalog.=) nsp) THEN
+        RAISE EXCEPTION 'schema % is not a distributed schema', nsp::pg_catalog.oid
+            USING ERRCODE = 'undefined_object';
+    END IF;
+    IF ship_functions IS NOT NULL THEN
+        UPDATE kingres.dist_schema s SET ship_functions = alter_distributed_schema.ship_functions WHERE s.nsp OPERATOR(pg_catalog.=) nsp;
+    END IF;
+    PERFORM kingres.sync_catalog();
+END;
+$$;
+
+COMMENT ON FUNCTION kingres.alter_distributed_schema(regnamespace, bool) IS
+    'Change a flag of a distributed schema (ship_functions); map group primary only';
+
 REVOKE ALL ON FUNCTION
     kingres.internal_choose_schema_group(),
     kingres.internal_register_schema_tables(name),
-    kingres.distribute_schema(regnamespace, int)
+    kingres.distribute_schema(regnamespace, int),
+    kingres.alter_distributed_schema(regnamespace, bool)
     FROM PUBLIC;
 
 -- =========================================================================

@@ -1904,6 +1904,31 @@ and `dist_table` are made by hand with the delta functions, as the tests do.
 - A session that another node opened (a forwarded session) that names a table of a distributed schema which this group does not hold gets the retryable
   error `KS001` ("this node does not hold table ...").
 
+**Increment 3: DDL on a distributed schema, `distribute_schema` of an empty schema, `CREATE SCHEMA` that distributes.**
+
+- `kingres.distribute_schema(nsp regnamespace, group_id int default null) returns int` (superuser, map group primary, read committed, mode `schema`
+  or `both`): the schema must exist and hold no object; it is created on every other node with its owner and registered everywhere in the same
+  two-phase transaction.  The group is the one with the fewest distributed schemas among the groups whose primary is active and should have shards (the
+  lowest group on a tie), the one named, or the one of `kingres_shard.schema_placement_group` (superuser, session).  A system schema, `public`, the schema of an
+  extension and a schema that is already distributed are refused; a schema that holds objects is refused until the conversion of a later increment.
+- A statement whose object is in a distributed schema is run on the map group primary and then on every other node in the same two-phase transaction, as
+  the DDL on a hash-distributed table is: `CREATE`/`ALTER`/`DROP TABLE` (also partitioned tables and `PARTITION OF`), indexes (`CONCURRENTLY` is
+  refused), views, sequences, functions and procedures, enum, composite and domain types, `COMMENT`, `GRANT`/`REVOKE` (also `ON ALL TABLES IN SCHEMA`
+  and `ALTER DEFAULT PRIVILEGES IN SCHEMA`), triggers, `TRUNCATE`, renames and `OWNER TO`.  Every table the statement makes is registered as a schema table on every
+  node (`kingres.internal_schema_delta`, a node-local step that runs with the rights of the bootstrap superuser; the caller is an ordinary role).  After a
+  `CREATE`, `ALTER` or `CREATE INDEX` on a table the map group primary asks every node for the structure of the table in the same transaction
+  (`kingres.internal_table_structure`, `internal_table_fingerprint`) and the whole statement is rolled back when one differs.
+- Refused in a distributed schema, with `<statement> is not supported in a distributed schema yet`: `CREATE MATERIALIZED VIEW`, `CREATE TABLE AS`, `SELECT INTO`, rules,
+  policies and row-level security, extended statistics, foreign tables, range types, aggregates and operators and the other `CREATE` forms of `DefineStmt`,
+  `TRUNCATE ... CASCADE`, `ALTER ... SET SCHEMA` into or out of a distributed schema, a statement that names a distributed schema and another schema, a foreign key from a table of a
+  distributed schema to anything but the same schema or a reference table, a foreign key from outside to a table of a distributed schema, and a partition or
+  parent in another schema.  A statement that is none of these kinds is run on this node only, as before.
+- `CREATE SCHEMA` in a database that distributes new schemas (`kingres.set_sharding_mode(mode, true)`, or `kingres_shard.distribute_new_schemas = on` for the session of a
+  superuser; an ordinary role cannot opt out) creates the schema on every node and registers it, on the map group primary.  `CREATE SCHEMA ... CREATE TABLE ...`
+  (elements) is refused there.  The limit `kingres_shard.max_distributed_schemas` (default 10000, a guess) bounds the number of schemas.
+- `create_distributed_table` is refused in the mode `schema` and for a table of a distributed schema; `create_reference_table` is refused for a table of a distributed schema and
+  stays allowed in the mode `schema`.
+
 ## Limitations in phase 2a
 
 Read these first; each is a reviewed boundary, not an accident.

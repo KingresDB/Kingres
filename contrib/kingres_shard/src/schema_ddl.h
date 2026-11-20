@@ -39,6 +39,8 @@ typedef struct KsSchemaDdl
 	List	   *verify_tables;		/* of RangeVar *: the tables whose structure is compared across the nodes afterwards */
 } KsSchemaDdl;
 
+extern bool kingres_shard_enable_schema_routing;
+
 extern void kingres_shard_schema_ddl_init(void);
 
 /* Does this kind of statement have to be looked at at all? */

@@ -30,6 +30,14 @@ use KingresShardTest qw(make_cluster run_sql prepared_count);
 my @nodes = make_cluster('ss', 3);
 my ($n1, $n2, $n3) = @nodes;
 
+# This test is about the single-source scan, which answers everything that path S (t/235) does not take: path S is off in every
+# session, so that every statement below is planned with the scan (the comparison of the two paths is in t/235).
+for my $n (@nodes)
+{
+	$n->append_conf('postgresql.conf', "kingres_shard.enable_schema_routing = off\n");
+	$n->reload;
+}
+
 sub q1 { my ($n, $sql) = @_; return $n->safe_psql('postgres', $sql); }
 
 # the structure of both schemas on every node, the rows of ten on node 2 (group 1) and of ten3 on node 3 (group 2),
