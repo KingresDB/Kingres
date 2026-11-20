@@ -2550,3 +2550,50 @@ Contract unchanged (0.13.0): the restore operation, the plan and the status sche
 - **Tests.** Unit: `internal/failover/restore_test.go` (resolving, skipping, the hand-back, a failed group, skipped rows, the plans, the phases). Cluster
   (`internal/clustertest/failover_restore_test.go`): T12 `TestSwitchoverAndBack` (plan, switchover, restore, no loss, a second restore refused) and
   `TestSwitchoverStatusNamesThePhaseAndThePause`.
+
+### Increment 7, round 2: the map group with a live old leader (design delta, 2026-11-21; not built)
+
+What the code does today, read for this delta. (1) A request for the server that runs the primary of the map group is taken by the bootstrap only when that server is not heard
+(`mapFailover.Handles`), and only in mode `hard`. (2) When the old leader answers, the request goes through the leader's task, whose `Preflight` refuses group 0 with
+`unsupported_operation` (422): the failover of a live leader's server, a switchover of the map group and a restore that has to move the map group are all refused. (3) The branch of
+`mapgroup.takeFence` that asks a live old server to demote (design 3.5, last bullet) cannot work as it stands: `POST /failover/demote`, `/failover/lease`, `/failover/state`,
+`/failover/quiesce`, `/failover/mark` and `/failover/verify` are `LeaderOnly`, and the candidate is not the leader, so the callee answers `not_leader` and the bootstrap logs
+the event and goes on to wait for the lease to run out. (4) The old leader's task cannot be recorded once its own instance is stopped, because the system database is that instance.
+
+The shape that fits these facts, for `graceful`, for a `hard` failover of a live leader's server, and for a restore that includes group 0:
+
+1. **The leader's task makes every call to the old server, as it does for any group; the candidate only takes over.** The calls that stop things stay `LeaderOnly` and fenced.
+   The old leader's own task runs them against its own server (a call to itself over the internal API, as today).
+2. **Group 0 is the last group of the task** (a restore and a multi-group failover order the groups so; the other groups are done by the old leader as usual). For group 0 the steps
+   are the steps of a switchover up to `Stop the writes` and `Let distributed transactions end` (the hold rules keep the service role's loopback lines, so the task can still
+   write its own rows while the clients are held), then:
+   - `Start the bootstrap`: the leader calls `POST /failover/map/start` on the chosen standby's server (the choice is the streaming standby of F4) with the term, the requester, the
+     comment, the id of its task and `planned: true`. The candidate runs B1 with a live old server (manual only, as today), B2 (its freeze), and then **waits at B3** until the old
+     server's instance is stopped cleanly; it never calls the old server.
+   - `Stop the old primary cleanly`: the leader marks, waits for the standby's replay, and stops with `fast`, as in round 1. This is the last thing the old leader's engine does.
+   The step cannot be recorded done: the instance that holds the task row is gone. That is intended; see 3.
+3. **The new leader's engine claims the task.** The row replicated to the standby before the stop says `running`, the step `Stop the old primary cleanly` `running`, and the
+   task's lease is expired for the new leader. The engine claims it once its gate is open (B8), and the steps that are not recorded done run again; each of them is idempotent
+   for this case and says so: the stop reads the shutdown checkpoint again with the idempotent `demote fast` call (the old server's kingresd answers a call of the new leader
+   through the held-back rule of the callee), the verify and the hand-over of the lease find the work done, `Promote` answers `already`, `promote_node` answers `already` with
+   `final`. The bootstrap does not insert a task for a `planned` journal (`RecordTask` returns the id of the task named in the journal), so there is one task, the operator's.
+4. **The proof.** The promotion of the candidate carries the shutdown checkpoint (F4-07): the bootstrap reads it from the old server with `demote fast` (the leader's engine
+   made the stop, and the old server's kingresd is up), and `switchover_verify` runs on the candidate before `pg_promote`. A refusal is not a rollback here: the old primary is
+   stopped, so the bootstrap restarts it (`Resume` of the old server through the new... see open point 1) or pauses with `failoverNeedsDecision`.
+5. **Rollback before the stop** is the rollback of round 1 (the leader releases its leases, resumes, lets the writes in) plus `POST /failover/map/abandon`-like cleanup of the
+   candidate's journal (`Journal.Abandon`, F4-06): the candidate gives up a `planned` journal when the old server is still running after the task ended or the task is gone.
+
+Open points to settle before building (each needs the cluster, not a unit test):
+1. After the stop of the old leader the leader role is vacant until B7; a refusal of the proof then leaves a stopped old primary and no leader. Who restarts it: the candidate's
+   monitor, by the same path as a map group whose old primary came back (`Resume` through the lease rounds of the old server: the wait marker, then a won lease). To be shown
+   by a cluster test with the fault `verify:false` on the candidate.
+2. The fence of the re-run steps: the old server's fence cache for the task is in the system database that is stopped; the new run has epoch + 1 and the callee must accept it
+   from the new leader. To be shown by T5-like test with the leader's kingresd ended at the stop step.
+3. `GET /failover/state` is `LeaderOnly`: the bootstrap cannot read the old server's state, so the wait at B3 reads the old server's position through `GET /failover/position`
+   (`AnyPeer`), which says whether the instance answers. That is enough to wait; the checkpoint comes with the call of the engine's re-run.
+4. A restore with the map group first would have its other groups run by the new leader's engine; with the map group last, everything is the old leader's except the final
+   hand-over. The order of the groups in a restore is therefore: ascending, group 0 last.
+
+Work in order: (a) unit tests on fakes of the bootstrap with `planned: true` (wait at B3, no task inserted, the proof carried); (b) `Preflight` and `Resolve` accept group 0 with a live old
+server (the three modes), group order; (c) the two steps and their idempotent re-run; (d) the cluster tests: switchover of the map group, the leader ending at the stop, a refused
+proof, the restore with the map group. Contract: none (the operation texts say that group 0 is allowed); the 422 for group 0 is lifted.
