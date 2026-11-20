@@ -1610,7 +1610,7 @@ the old history learns that the history was cut, when, and by whom (the acknowle
 event). The flag `--accept-epoch-closed <seq>` turns that failure into a printed finding with exit
 status 0 for a verification of the new epoch alone; it never hides the finding.
 
-**Restoring only the system database** (`kingres_cp`): the tiles, checkpoints and anchor records
+**Restoring only the system database** (`kingres_system`, whose schema is `kingres_cp`): the tiles, checkpoints and anchor records
 are public data derived from the chains and from keys the host still has. The publisher re-derives
 tiles (same leaves give the same bytes), Ed25519 is deterministic so re-signed checkpoints are
 byte-identical, WORM re-submission finds the same bytes (the idempotent path of 6.3, 4), and anchor
@@ -1618,6 +1618,8 @@ records that were lost are re-created for the latest checkpoint. A restored `led
 smaller than a deposed leader's last term is the one case this design does not close (a deposed leader
 that wakes up with a higher term could keep writing to a restored table): the restore procedure
 documented in the README says to restart every `kingresd` after restoring the system database.
+
+*Note of 2026-11-20:* the README of the control plane did not contain this step when this was written; it does now ("Restoring the system database"). The code does require it in practice: the guard of every write of the key set compares the stored term with the one the leader holds, so after a restore to an older term those writes fail with `term_over` until the leader has taken over again, which a restart does. The case this design leaves open is unchanged.
 
 **Clones and `pg_dump`.** A physical clone of a database shares `chain_id` until the two diverge;
 published under a different `originPrefix` the logs are distinguishable, and the verifier only

@@ -43,6 +43,8 @@ either from **the source it is given**; the major is never typed a second time:
 
 `kingres:<version>` without a suffix is not produced.
 
+**The version `0.1.0` in this README is an example.** `<version>` is `kingres_version` in the top-level `meson.build` (`0.1.0` while this was written), and every file name, tag, label and command below that names `0.1.0` stands for the current value; the numbers of the runs further down are the versions that were built then.
+
 Target: Ubuntu 24.04, amd64. Everything below was run on Windows 11 with WSL2
 (Ubuntu 24.04, Docker Engine installed inside the distribution); see
 [What was run](#what-was-run).
@@ -727,10 +729,10 @@ both majors, with the files of the package.
 
 ## What is not included yet
 
-- **No Patroni, no etcd, no metrics store** (decided: they arrive with the
-  high-availability phase; `kingresd` exposes Prometheus-format metrics itself).
-- `kingres-cli`; removing or leaving servers, standbys and rebalancing in the compose test
-  (the test does not exercise them; `kingresd` has no failover yet).
+- **No Patroni, no etcd, no metrics store** (decided: `kingresd` does the failover itself
+  ([ADR 0021](../docs/adr/0021-failover-in-kingresd.md)) and exposes Prometheus-format metrics itself).
+- `kingres-cli` (planned, not built); removing or leaving servers, standbys and rebalancing in the compose test
+  (the test does not exercise them, nor does it exercise failover or switchover, which `kingresd` has since the failover increments of 2026-11-18 to 2026-11-20; those are tested by the cluster tests of the control plane).
 - RPM, arm64, Windows; package signing and an apt repository; image signing and
   publishing; SBOM; debug symbols package (`-dbgsym`); a `kingres-dev` package;
   man pages beyond one-page stubs; the licences of every compiled-in Go and npm

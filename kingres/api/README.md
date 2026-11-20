@@ -1,7 +1,7 @@
 # KingresDB management REST API
 
 `openapi.yaml` (OpenAPI 3.1, version 0.13.0) is the contract between the Go backend (`kingresd`) and the
-Vue/TypeScript panel and `kingres-cli`. Lint it and run the mechanical rule check with:
+Vue/TypeScript panel and, when it is built, the planned `kingres-cli` (it does not exist yet). Lint it and run the mechanical rule check with:
 
 ```
 npx --yes @redocly/cli@latest lint kingres/api/openapi.yaml     # from the repository root

@@ -205,10 +205,10 @@ the next increments and are not in this version.
   database, so every node needs a role of that name, and `pg_hba.conf` (and the
   password file, if used) must let the nodes in. Credentials are never stored
   in the catalog. SSL options are set with `kingres_shard.node_conninfo`.
-- `CREATE EXTENSION kingres_shard` installs version 0.6;
-  `ALTER EXTENSION kingres_shard UPDATE` upgrades a 0.1, 0.2, 0.3, 0.4 or 0.5 installation
-  (the chain is 0.1 -> 0.2 -> 0.3 -> 0.4 -> 0.5 -> 0.6, and the catalog is identical to a
-  fresh 0.6 one; the `upgrade` regression test compares the two). Transactions that 0.4
+- `CREATE EXTENSION kingres_shard` installs version 0.7 (the `default_version` of the control file);
+  `ALTER EXTENSION kingres_shard UPDATE` upgrades a 0.1, 0.2, 0.3, 0.4, 0.5 or 0.6 installation
+  (the chain is 0.1 -> 0.2 -> 0.3 -> 0.4 -> 0.5 -> 0.6 -> 0.7, and the catalog is identical to a
+  fresh 0.7 one; the `upgrade` regression test compares the two). Transactions that 0.4
   prepared and that are pending at the upgrade are resolved in the old identifier format
   (see "Prepared transactions across a failover").
 - **Version 0.6 adds no table, view, function or column.** `kingres_shard--0.5--0.6.sql` holds
