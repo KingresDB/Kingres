@@ -37,9 +37,10 @@ func extStub(t *testing.T, e *guardEnv) *pgx.Conn {
 	return stub
 }
 
-// ST-05: the mark is kept with the row, so a holder that takes over reads it back; a new attempt of the move
-// starts without the mark of the one before.
-func TestTheMarkOfAMoveIsKeptWithItsRow(t *testing.T) {
+// ST-05 and P4D-03: the mark is written in the statement that makes the row, so a row never exists without it (a holder
+// that takes over reads it back, and no row is matched by time except the rows of before migration 0012); a new attempt of
+// the move has the mark of its own call, not the one of the attempt before.
+func TestTheMarkOfAMoveIsWrittenWithItsRow(t *testing.T) {
 	e, lease := newGuardEnv(t)
 	ctx := fence.With(context.Background(), fence.Token{Task: e.id, Epoch: lease.Epoch})
 	rows := &PGRows{Conns: e, TaskID: e.id}
@@ -47,10 +48,6 @@ func TestTheMarkOfAMoveIsKeptWithItsRow(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := Move{Database: "shop", Bucket: 3, From: 1, To: 2}
-	seq, err := rows.StartMove(ctx, m, "s1", "s2", 1)
-	if err != nil {
-		t.Fatal(err)
-	}
 	got := func() MoveRow {
 		all, err := rows.Moves(ctx)
 		if err != nil || len(all) != 1 {
@@ -58,29 +55,21 @@ func TestTheMarkOfAMoveIsKeptWithItsRow(t *testing.T) {
 		}
 		return all[0]
 	}
-	if r := got(); r.Marked {
-		t.Fatalf("a row without a mark reads as marked: %+v", r)
-	}
-	if err := rows.SetMark(ctx, seq, 0); err != nil { // 0 is a mark: the extension had no move yet
+	seq, err := rows.StartMove(ctx, m, "s1", "s2", 1, 0) // 0 is a mark: the extension had no move yet
+	if err != nil {
 		t.Fatal(err)
 	}
 	if r := got(); !r.Marked || r.After != 0 {
-		t.Fatalf("mark 0 not read back: %+v", r)
-	}
-	if err := rows.SetMark(ctx, seq, 41); err != nil {
-		t.Fatal(err)
-	}
-	if r := got(); !r.Marked || r.After != 41 {
-		t.Fatalf("mark 41 not read back: %+v", r)
+		t.Fatalf("mark 0 not read back at once: %+v", r)
 	}
 	if err := rows.FinishMove(ctx, seq, MoveFailed, "x", "", nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := rows.StartMove(ctx, m, "s1", "s2", 2); err != nil {
+	if _, err := rows.StartMove(ctx, m, "s1", "s2", 2, 41); err != nil {
 		t.Fatal(err)
 	}
-	if r := got(); r.Marked {
-		t.Fatalf("the next attempt kept the mark of the first: %+v", r)
+	if r := got(); !r.Marked || r.After != 41 {
+		t.Fatalf("the next attempt does not carry its own mark 41: %+v", r)
 	}
 }
 

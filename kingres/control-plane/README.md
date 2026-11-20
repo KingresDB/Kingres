@@ -539,7 +539,7 @@ Four failures that showed only in a complete run on a loaded machine led to thes
   waits a minute between two attempts for one server; the wait now applies to a repeat of an attempt at the same configuration (by its hash)
   that was not seen to work: a server that is seen up to date is forgotten, so one whose group changed a minute after an earlier catch-up is not left behind. Found by
   running `TestConfigServerGroupAndServerLevels` several times against one cluster. A server that keeps failing is tried again after one minute, then two,
-  four and eight, at most ten minutes (`retryWait`, review ST-08); the task list is not pruned (open).
+  four and eight, at most ten minutes (`retryWait`, review ST-08); the task list is not pruned (a decision, see "Closing review of phase 4", P4D-04).
 - **One start or stop of an instance at a time.** The restart of a standby failed after 60 s with `pg_ctl stop: server does not shut
   down` although the instance had shut down and was running again: `pg_ctl stop -w` waits until the pid file is gone, and the agent
   of the standbys had started the standby again in the moment it was down, which put a new pid file there. That hang is what made
@@ -2577,7 +2577,7 @@ another holder took over, in the complete runs, showed what the first of them hi
 - **RBR-05, a move is found by an identity.** Before the call `Backend.Mark` reads the highest move id of the extension; the record of the call is
   the one of the bucket with a higher id. No clock of this process is compared with the extension's. A row left by an earlier holder that never saw
   its record is found by the mark that is kept with the row (migration 0012, `rebalance_move.ext_mark`, written before the call), so that a holder that
-  takes over has it and no clock is compared (review ST-05). Only a row made before the mark was kept is found by the time it was started, with a
+  takes over has it and no clock is compared (review ST-05); since P4D-03 the mark is taken before the row and written in the statement that makes it. Only a row made before the mark was kept is found by the time it was started, with a
   tolerance of 10 s for the difference of the two clocks. A recovery of a move that is not settled waits as long as its session is alive (the
   extension's `internal_move_alive`) and for at most `RecoverWait` otherwise (ST-07).
 - **RBR-06, rebalance and failover.** The design of the failover (`kingres/docs/design/ha-phase5-part2.md`, section 4.5) stops the rebalance first,
@@ -2751,8 +2751,8 @@ Separate from the increments above (own files and tests; see the report of the w
   `TestSwitchingEnforcementOnAndOffNeverFencesAHealthyPrimary` (a cluster: the replica count to 0 and back three times, every instance sampled
   every 100 ms, no fault hook), and `TestRemovingAServerCostsNoOtherGroupItsLease` now runs with real standbys and without `ForceEnforce`.
 - **ST-02, an observation that failed was read as "not running".** In `RunMove` an error of `findMove` or of `callRunning` is "unknown": the
-  observation session is made again and the loop goes on; a call whose state is unknown is never withdrawn (the bound `maxCallWait` still ends the
-  wait). Test: `TestABrokenObservationSessionDoesNotCancelARecordedMove` (a real PostgreSQL, the observation session terminated with
+  observation session is made again and the loop goes on; a call whose state is unknown is never withdrawn (the bound `maxCallWait` ends the
+  wait of a call that was looked at, not of one whose last look failed: P4D-02). Test: `TestABrokenObservationSessionDoesNotCancelARecordedMove` (a real PostgreSQL, the observation session terminated with
   `pg_terminate_backend`, the extension's record inserted afterwards).
 - **ST-03, a repeated call repeated its work.** `/standby/rebuild` is a no-op for a standby that is of the generation asked for (the generation
   is in the standby's meta file; the rewind path updates it); `/config/restart` from a task step carries `ifPending` and is a no-op for an
@@ -2764,6 +2764,44 @@ Separate from the increments above (own files and tests; see the report of the w
   (the marker the fence wrote is there). Tests: `TestTheLifecycleLockWaitEndsWithTheContext`, `TestAFenceDoesNotWaitForAStartAndTheStartDoesNotSurviveIt`.
 - **ST-12, statements that were not true:** the text of RBR-05 above is corrected.
 - **Not done in this step:** ST-11, ST-13. ST-05 to ST-10 were fixed by the next round (see "Rebalancing after the second review" and the review of 2026-11-18).
+
+### Closing review of phase 4 (P4D-01 to P4D-08 of 2026-11-20): what was done
+
+Review: `kingres/docs/reviews/2026-11-20-kingresd-rebalance-closing.md`.
+
+- **P4D-01, a failover with a move in flight, end to end.** `internal/clustertest/rebalance_failover_test.go`:
+  `TestFailoverDuringBucketMove` (the automatic failover with the source of the move lost while the move is held in `copying` and in `switching`),
+  `TestSwitchoverDuringBucketMove` (a switchover is refused with `rebalance_in_progress` while a move runs; the stop cancels the move; the switchover then
+  runs; the rebalance started again finishes) and `TestMapGroupFailoverDuringBucketMove` (the leader's server, which runs the rebalance and the extension
+  session of the move, is lost with a move held in its copy). Every case ends with the same checks: no acknowledged row is lost and no id is there twice,
+  every bucket has one owner and the same map is read on every server that is up, no move of the extension is unfinished, `check_cluster()` has nothing that
+  forbids a move, and every move of the run's report has an outcome. What the tests do not do: hold the other phases (`preparing`, `catching_up`,
+  `cleaning`), and make the standby of the map group replay less than the move's record (it is synchronous); the extension's own TAP test `054` covers the
+  failover in the middle of a move for the extension alone.
+- **P4D-02, both arms of the ST-02 fix are pinned, and the bound no longer cancels a recorded move.** Tests in `internal/rebalance/p4d_pg_test.go`:
+  `TestADeadObservationSessionIsReopenedAndTheRecordIsSeen` (the guard is let go while the call runs, which needs the new session),
+  `TestACallThatCannotBeObservedIsNotCancelled` (an error of the running-check is not "not running", and `maxCallWait` does not withdraw a call whose last
+  look failed). The decision: the 5 minute bound applies to a call that was looked at. When the last look at the record failed, the record may exist (even in
+  `switching`), and cancelling then is the cancel that ST-02 removed; the wait then ends with the call, with the lease (the guard) or with the run. A call that
+  is observed and still not recorded after `maxCallWait` is withdrawn as before.
+- **P4D-03, the mark is written with the row.** `Backend.Mark` is read before the row is made and `Rows.StartMove` writes it in the same statement
+  (`SetMark` is gone), so a row never exists without a mark; the match by time stays for the rows made before migration 0012 only. A mark that cannot be
+  had starts nothing and leaves no row. Tests: `TestTheMarkOfAMoveIsWrittenWithItsRow`, `TestAMoveWhoseMarkCannotBeHadLeavesNoRow`.
+- **P4D-04, finished tasks are not pruned: a decision, not a fix.** A prune is not a small change: `rebalance_run` and `failover_run` (and their moves, events and
+  reports) are keyed by the task id, the audit log and the panel name task ids, and a failover task is the record that a promotion was made. Deleting rows of
+  `kingres_cp.task` needs a retention rule that no document has yet (which kinds, how old, whether the report outlives the task row, what the panel shows for a
+  report whose task is gone). Until then the growth is bounded at the source: the retry wait of the configuration loop (1, 2, 4, 8, then 10 minutes) makes a server
+  that never applies a configuration cost about 144 tasks a day, and other kinds are started by people or rarely. It stays open as a known limit of the task engine.
+- **P4D-05, `ifPending` is pinned by a unit test.** `TestARestartCallWithIfPendingRestartsOnlyWhatIsPending` (`internal/pgconfig`, Linux, an agent over a fake `pg_ctl`
+  and a stand-in for the question "does this instance have to be restarted now"): nothing pending means nothing is restarted, without `ifPending` it is, with a pending
+  setting it is. The cluster test `TestARepeatedRestartCallRestartsOnlyWhatIsPending` stays.
+- **P4D-06**, the README row of phase 4, is the owner's to change.
+- **P4D-07, a move started by hand and the preflight of a failover: documented, not changed.** `RebalanceRunning` looks at tasks of kind `rebalance` only, so a live move that
+  a person started with `kingres.move_bucket` does not make a manual failover or a switchover refuse. The data is protected by the extension (its own recovery settles a move
+  whose source or target is failed over, TAP test `054`, and the move worker); what is lost is the operator's early warning. A check that asked the extension for a live move on
+  every map group primary would add a call to the preflight of every failover for a case that is rare and safe; it is left for the day a move is started from the panel.
+- **P4D-08, one last look before the cancel.** When the run ends before the loop saw a record, `RunMove` reads the record once more (own context, two seconds) and, if the
+  extension recorded the move in the last poll, does not cancel the call. Test: `TestARecordWrittenAsTheRunEndsIsNotCancelled`.
 
 ### Review FO-01 to FO-16 of 2026-11-17 (the failover increments 0 to 2): what was fixed in this step
 
