@@ -37,6 +37,7 @@ import (
 const (
 	callMapStart    = "POST /failover/map/start"
 	callMapContinue = "POST /failover/map/continue"
+	callMapAbandon  = "POST /failover/map/abandon"
 )
 
 // mapFailover is the server's part of the failover of the map group: the candidate that runs the bootstrap, the receiver that
@@ -645,4 +646,89 @@ func (p *mapPorts) isCandidate(ctx context.Context, server string) (bool, error)
 		}
 	}
 	return false, nil
+}
+
+// ---------------------------------------------------------------------------------
+// Giving up a bootstrap (F4-06)
+
+type mapAbandonBody struct {
+	Reason string `json:"reason"`
+}
+
+type mapAbandonAnswer struct {
+	Abandoned bool `json:"abandoned"`
+}
+
+// abandonLocal gives up the bootstrap in progress on this server; false when none is. A bootstrap that promoted the standby cannot be given
+// up (409): the promoted instance holds the lease and the bootstrap goes on to its end.
+func (m *mapFailover) abandonLocal(reason string) (bool, error) {
+	if !m.journal.Active() {
+		return false, nil
+	}
+	if err := m.journal.Abandon(reason); err != nil {
+		if errors.Is(err, journal.ErrPromoted) {
+			return false, problem.New(problem.Conflict, "The bootstrap of the map group already promoted its standby; it cannot be given up, and goes on to its end.")
+		}
+		return false, err
+	}
+	m.log.Warn("the bootstrap of the map group was given up", "reason", reason)
+	return true, nil
+}
+
+// Abandon gives up the bootstrap of the map group that is in progress on this server, or on the server of a standby of the map group: the
+// request may arrive anywhere, and the leader may be the server that is gone. It is false when no bootstrap is in progress anywhere that
+// this server can ask.
+func (m *mapFailover) Abandon(ctx context.Context, actor, reason string) (bool, error) {
+	reason = "given up by " + actor + ": " + reason
+	if ok, err := m.abandonLocal(reason); ok || err != nil {
+		return ok, err
+	}
+	members, err := (&mapPorts{m: m}).Members(ctx)
+	if err != nil {
+		return false, problem.New(problem.ServiceUnavailable, "The servers of the cluster cannot be read now.").WithRetryAfter(5)
+	}
+	var asked, failed int
+	for _, s := range members {
+		if s == m.self {
+			continue
+		}
+		asked++
+		var out mapAbandonAnswer
+		if err := m.peers.do(ctx, s, http.MethodPost, "/failover/map/abandon", mapAbandonBody{Reason: reason}, &out); err != nil {
+			var ce *failover.CallError
+			if errors.As(err, &ce) && ce.Status == http.StatusConflict {
+				return false, problem.New(problem.Conflict, ce.Message)
+			}
+			failed++
+			continue
+		}
+		if out.Abandoned {
+			return true, nil
+		}
+	}
+	if asked > 0 && failed == asked {
+		return false, problem.New(problem.ServiceUnavailable, "No other server of the cluster answered, so it is not known whether a bootstrap of the map group is in progress there.").WithRetryAfter(5)
+	}
+	return false, nil
+}
+
+// handleMapAbandon is the call of a server that was asked to give up the bootstrap: it acts on its own journal only.
+func handleMapAbandon(_ context.Context, d *haDeps, _ string, body []byte) (any, error) {
+	mf := d.MapFailover
+	if mf == nil {
+		return nil, notStarted
+	}
+	var b mapAbandonBody
+	if err := json.Unmarshal(body, &b); err != nil || b.Reason == "" || len(b.Reason) > 600 {
+		return nil, badBody("a reason")
+	}
+	ok, err := mf.abandonLocal(b.Reason)
+	if err != nil {
+		var p *problem.Problem
+		if errors.As(err, &p) {
+			return nil, &internalapi.CallError{Status: p.Status, Code: string(p.Code), Message: p.Detail}
+		}
+		return nil, err
+	}
+	return mapAbandonAnswer{Abandoned: ok}, nil
 }

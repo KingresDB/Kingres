@@ -2502,7 +2502,7 @@ The review (`docs/reviews/2026-11-20-kingresd-failover-increments-4-7.md`) found
   *Open:* the decision `allowDataLoss` of an operator is still carried in the body by the member that received the request; a member that is not honest can
   set it (a signed assertion of the operator's session is the remedy and is not built).
 - **F4-06.** A map bootstrap that did not reach the promotion is given up by the candidate monitor when the catalog has a newer term or it is 15 minutes old
-  (`Journal.Abandon`, `journal.Stuck`); a promoted one cannot be given up. *Open:* no operator call to abandon (it would be a contract change).
+  (`Journal.Abandon`, `journal.Stuck`); a promoted one cannot be given up. The operator's call to abandon is `abandonMapGroupBootstrap` (contract 0.15.0, `POST /failover/map/abandon`).
 - **F4-07.** The call that promotes carries the shutdown checkpoint and the state, and the callee makes `switchover_verify` again before it changes anything; a
   refusal (`unprovable`, `standby_behind`) is a rollback.
 - **F4-08.** `task.Step.Interruptible`: a cancel ends a running step of the kind (when the guard allows it) within one poll, not at its end; the steps of a
@@ -2525,7 +2525,7 @@ down: `takeFence` rolls it back through the path of every failure (`quorum_unava
 still holds. A plain failover still pauses.
 
 **Open after the review (listed for later):** F4-05, the decision `allowDataLoss` of an operator that a member carries in the body of `start` (a signed assertion of the
-operator's session is the remedy); F4-06, an operator's call to abandon a stuck map bootstrap (a contract change; the monitor gives up a stale one by itself).
+operator's session is the remedy); F4-06 is closed in 0.15.0 (`abandonMapGroupBootstrap`).
 
 ### Increment 7, round 2 (the restore of the preferred primaries, the plan of a switchover, the phases, 2026-11-20)
 

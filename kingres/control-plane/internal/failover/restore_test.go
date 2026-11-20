@@ -257,7 +257,7 @@ func TestThePlanOfARestoreListsTheSkippedGroups(t *testing.T) {
 		if g.ShardGroupID == 1 {
 			continue
 		}
-		if g.ToServerID != nil || len(g.Steps) != 0 || len(g.Candidates) != 0 || !strings.Contains(g.DataLoss.Message, "Skipped (") {
+		if g.Skipped == nil || g.Skipped.Reason == "" || g.Skipped.Message == "" || g.ToServerID != nil || len(g.Steps) != 0 || len(g.Candidates) != 0 || !strings.Contains(g.DataLoss.Message, "Skipped (") {
 			t.Errorf("a skipped group: %+v", g)
 		}
 	}

@@ -211,11 +211,11 @@ func (s *Service) Plan(ctx context.Context, in Input) (Plan, error) {
 		out.Groups = append(out.Groups, gp)
 	}
 	_ = nodes
-	// The groups a restore leaves alone are in the plan as they are in the report: a group with no target, no candidates and no steps,
-	// whose message names the reason (the contract has no member for it before 0.15.0; a console reads "no steps and no target" as skipped).
+	// The groups a restore leaves alone are in the plan as they are in the report: a group with no target, no candidates and no steps and the member
+	// `skipped` (contract 0.15.0); dataLoss.message repeats the reason for a console that does not read the member.
 	for _, sk := range in.Skipped {
 		out.Groups = append(out.Groups, GroupPlan{ShardGroupID: sk.Group, IsMapGroup: sk.Group == 0, FromServerID: in.oldOf(sk.Group), Candidates: []CandidateOut{},
-			Steps: []string{}, MovesTheManager: sk.Group == 0,
+			Steps: []string{}, MovesTheManager: sk.Group == 0, Skipped: &SkippedOut{Reason: sk.Reason, Message: sk.Text},
 			DataLoss: DataLoss{Verdict: VerdictNone, Message: "Skipped (" + sk.Reason + "): " + sk.Text, AsyncDatabases: []string{}, UnreadableServerIDs: []string{}}})
 	}
 	sort.Slice(out.Groups, func(i, j int) bool { return out.Groups[i].ShardGroupID < out.Groups[j].ShardGroupID })

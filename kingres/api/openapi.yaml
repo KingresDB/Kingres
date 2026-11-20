@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: KingresDB Management API
-  version: 0.14.0
+  version: 0.15.0
   summary: REST API of the KingresDB management panel, CLI and manager.
   description: |
     The single REST API served by `kingresd` on every KingresDB server. The web panel
@@ -2086,6 +2086,38 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /failover/map/abandon:
+    post:
+      operationId: abandonMapGroupBootstrap
+      summary: Give up a stuck bootstrap of the map group
+      description: |
+        Added in 0.15.0. A failover of the map group that the manager leader's loss forces is run by a bootstrap on the server of a standby (not by a
+        task: no task can be recorded while the system database is not writable). A bootstrap that did not reach the promotion and cannot go on (for
+        example it waits for a majority that does not come back) is given up by the candidate monitor after fifteen minutes or when the catalog has a
+        newer term; this operation gives it up at once, so that the gate of the task engine opens and a new request can begin. It is answered by any
+        server (the leader may be the server that is gone): the server asks the servers that host a ready standby of the map group and gives up the
+        bootstrap that one of them runs. `abandoned` is false when no bootstrap is in progress. A bootstrap that already promoted the standby cannot
+        be given up (409 `conflict`): the promoted instance holds the lease and the bootstrap goes on to its end. The audit event is `abandonMapGroupBootstrap`.
+      tags: [Replication]
+      x-required-role: kingres_admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AbandonMapGroupBootstrapRequest' }
+      responses:
+        '200':
+          description: The bootstrap was given up, or none was in progress.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AbandonMapGroupBootstrapResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
         '422': { $ref: '#/components/responses/UnprocessableEntity' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /failover/reports:
@@ -6673,6 +6705,23 @@ components:
           type: [integer, 'null']
           format: int32
         message: { type: string }
+    AbandonMapGroupBootstrapRequest:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 500
+          description: Why the bootstrap is given up; it is kept in the journal of the bootstrap and in the audit event.
+    AbandonMapGroupBootstrapResult:
+      type: object
+      required: [abandoned]
+      properties:
+        abandoned:
+          type: boolean
+          description: True when a bootstrap was in progress and is given up; false when none was.
     FailoverGroupPlan:
       type: object
       description: The plan for one group.
@@ -6701,6 +6750,18 @@ components:
         movesTheManager:
           type: boolean
           description: True for the map group.
+        skipped:
+          type: object
+          description: |
+            Added in 0.15.0. Present only for a group that a `restorePreferredPrimaries` leaves alone (the plan then has `toServerId` null, no
+            candidates and no steps). The report lists the same group as `skipped` with the same reason.
+          required: [reason, message]
+          properties:
+            reason:
+              type: string
+              enum: [preferredNotReady, mapGroup]
+              description: '`preferredNotReady`: the preferred server has no ready, registered standby of the group. `mapGroup`: the map group while its server is alive is not supported yet.'
+            message: { type: string }
     FailoverCandidate:
       type: object
       description: A standby that could be promoted.
@@ -9037,6 +9098,7 @@ components:
         - updateServer
         - removeServer
         - failoverServer
+        - abandonMapGroupBootstrap
         - autoFailover
         - createServerGroup
         - deleteServerGroup

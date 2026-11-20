@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
+	"unicode"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
@@ -30,6 +32,7 @@ func (s *Server) failoverHandlers() map[string]handlerFunc {
 		"getFailoverStatus":         s.getFailoverStatus,
 		"listFailoverReports":       s.listFailoverReports,
 		"getFailoverReport":         s.getFailoverReport,
+		"abandonMapGroupBootstrap":  s.abandonMapGroupBootstrap,
 	}
 }
 
@@ -162,6 +165,8 @@ type MapFailoverer interface {
 	Active() bool
 	TaskZero() (task.Task, bool)
 	Status() (failover.Status, bool)
+	// Abandon gives up the bootstrap of the map group that is in progress on this server or on a standby's server (F4-06): false when none is.
+	Abandon(ctx context.Context, actor, reason string) (bool, error)
 }
 
 // mapFailoverIntercept answers the operations of the bootstrap of the map group on this server. It returns true when it answered.
@@ -191,6 +196,8 @@ func (s *Server) mapFailoverIntercept(c *call, w http.ResponseWriter, r *http.Re
 		w.Header().Set("Location", "/api/v1/failover")
 		s.writeJSON(w, r, http.StatusAccepted, taskToAPI(t))
 		return true, nil
+	case "abandonMapGroupBootstrap":
+		return true, s.abandonMapGroupBootstrap(c, w, r)
 	case "getFailoverStatus":
 		if st, ok := mf.Status(); ok {
 			s.writeJSON(w, r, http.StatusOK, st)
@@ -205,4 +212,29 @@ func (s *Server) mapFailoverIntercept(c *call, w http.ResponseWriter, r *http.Re
 		}
 	}
 	return false, nil
+}
+
+// abandonMapGroupBootstrap gives up a stuck bootstrap of the map group (0.15.0). Any server answers it: the leader may be the server that is gone.
+func (s *Server) abandonMapGroupBootstrap(c *call, w http.ResponseWriter, r *http.Request) error {
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	if err := s.bodyClosed(w, r, &req); err != nil {
+		return err
+	}
+	reason := strings.TrimSpace(req.Reason)
+	if reason == "" || len(reason) > 500 || strings.ContainsFunc(reason, unicode.IsControl) {
+		return problem.New(problem.ValidationFailed, "The reason must be 1 to 500 characters without control characters.")
+	}
+	mf := s.deps.MapFailover
+	if mf == nil {
+		return problem.New(problem.UnsupportedOp, "This server cannot give up a bootstrap of the map group (no managed instance or no internal API).")
+	}
+	abandoned, err := mf.Abandon(r.Context(), c.session.Username, reason)
+	if err != nil {
+		return s.failoverProblem(r, err)
+	}
+	c.addDetails(map[string]any{"reason": reason, "abandoned": abandoned})
+	s.writeJSON(w, r, http.StatusOK, map[string]bool{"abandoned": abandoned})
+	return nil
 }

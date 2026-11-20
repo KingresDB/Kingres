@@ -52,6 +52,8 @@ type GroupPlan struct {
 	WritesPausedSeconds *int64         `json:"writesPausedSeconds"`
 	Steps               []string       `json:"steps"`
 	MovesTheManager     bool           `json:"movesTheManager"`
+	// Skipped is set for a group that a restore leaves alone (0.15.0).
+	Skipped *SkippedOut `json:"skipped,omitempty"`
 }
 
 // Plan is FailoverPlan.
@@ -200,4 +202,10 @@ type Request struct {
 	AllowDataLoss bool            `json:"allowDataLoss"`
 	DryRun        bool            `json:"dryRun"`
 	Comment       string          `json:"comment"`
+}
+
+// SkippedOut is the skipped member of FailoverGroupPlan.
+type SkippedOut struct {
+	Reason  string `json:"reason"`
+	Message string `json:"message"`
 }

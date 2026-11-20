@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.14.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.15.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and, when it is built, the planned `kingres-cli` (it does not exist yet). Lint it and run the mechanical rule check with:
 
 ```
@@ -317,6 +317,27 @@ Where the architecture document leaves something open, the simplest option was c
     range and the cluster's replica count.
 
 ## Changelog
+
+### 0.15.0
+
+Revision written with the end of the failover increments (`kingres/docs/design/ha-phase5-part2.md`, open items F4-06 and the plan of a restore). Summary for the panel:
+1 operation added (141 operations, 114 paths); one optional member added to `FailoverGroupPlan`; **no change that is not additive**.
+
+#### Breaking
+
+None.
+
+#### Additive
+
+- `abandonMapGroupBootstrap` (`POST /failover/map/abandon`, `kingres_admin`, body `{reason}`, answer `{abandoned}`): gives up a bootstrap of the map group that did not reach the promotion
+  (409 `conflict` after it). Any server answers it, because the manager leader may be the server that is gone. `AuditAction` has `abandonMapGroupBootstrap`.
+- `FailoverGroupPlan.skipped` (`{reason, message}`, `reason` is `preferredNotReady` or `mapGroup`): present for a group that a `restorePreferredPrimaries` leaves alone; such a group has
+  no target, no candidates and no steps in the plan (before 0.15.0 the plan listed only the groups that are restored, and the report listed the skipped ones).
+
+#### Documentation
+
+- `failoverServer`, `mode: graceful` and `restorePreferredPrimaries`: a failover, a switchover or a restore that involves the map group while the server that runs its primary answers is
+  refused with 422 `unsupported_operation` in this version (the restore lists the map group as skipped, reason `mapGroup`).
 
 ### 0.14.0
 
