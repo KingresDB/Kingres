@@ -876,6 +876,9 @@ differs from a dead OLD:
   stops with it; the task row (replicated to the candidate before the stop, and `switchover_verify` asks the
   same thing for the data) is claimed by the new leader's engine after B8, and its step "hand over" finds the
   work done.
+  **Status (2026-11-21): not built.** A failover, a switchover or a restore that involves the map group while the server of its primary is alive is
+  refused today with 422 `unsupported_operation`, and the bootstrap refuses a live old server (it cannot ask it to demote: those calls are the
+  leader's). The delta that builds it is the last section of this document.
 
 ### 3.6 Choosing the standby
 
