@@ -109,6 +109,11 @@ func TestAReplacedChainIsAnAlertAndNotOnlyAnEvent(t *testing.T) {
 	e.src.chains[0] = newChain(120, 2)
 	e.alerts = nil
 	e.advance(time.Minute)
+	e.round() // the first answer of another chain: an alert, nothing is retired yet (P7A-06)
+	if len(eventsOf(e.keys)) != 0 {
+		t.Fatalf("a first answer retired the log: %v", eventsOf(e.keys))
+	}
+	e.advance(DefaultMissingFor + time.Minute)
 	e.round()
 	ev := eventsOf(e.keys)
 	if len(ev) != 1 || !strings.Contains(ev[0], "reason=chain-replaced") {

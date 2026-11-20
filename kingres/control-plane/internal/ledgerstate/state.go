@@ -36,8 +36,12 @@ import (
 // FileName is the name of the state file in the key directory.
 const FileName = "published.json"
 
-// MaxFile is the most the file may hold (a few hundred logs at most).
-const MaxFile = 4 << 20
+// MaxFile is the most the file may hold: a log takes about 230 bytes, so about 140 000 logs. A save that would write more is refused (and says so),
+// never written: a file that is larger than this is read as damaged at the next start, and a damaged record stops all signing (P7A-14).
+const MaxFile = 32 << 20
+
+// maxFile is MaxFile, which a test lowers.
+var maxFile = MaxFile
 
 // Mark is the highest checkpoint of one log: its size and root (hexadecimal).
 type Mark struct {
@@ -52,6 +56,26 @@ type State struct {
 	// Events is the number of events published (the next sequence number) and EventHash the SHA-256 (hex) of the note of the last one.
 	Events    int64  `json:"events"`
 	EventHash string `json:"eventHash"`
+	// Generation counts the restores of the system database that an operator accepted (Accept); it is 0 for a record that never saw one. A
+	// record of a higher generation replaces one of a lower generation when two are merged, where within one generation the merge keeps the
+	// larger of everything (P7A-02).
+	Generation int64 `json:"generation,omitempty"`
+	// Restore is set from the acceptance of a restore until the event that announces it is published, so that a crash between the two
+	// leaves the announcement to be made and does not drop it.
+	Restore *RestoreNote `json:"restore,omitempty"`
+}
+
+// RestoreNote is what the signed event restore-acknowledged says about the break that an operator accepted: what the record held and what the
+// restored database held, as counts and SHA-256 sums of the two states (the sums let anyone who holds the old record check the event).
+type RestoreNote struct {
+	PublishedEvents int64  `json:"publishedEvents"`
+	PublishedLogs   int    `json:"publishedLogs"`
+	PublishedSHA    string `json:"publishedSha256"`
+	DatabaseEvents  int64  `json:"databaseEvents"`
+	DatabaseLogs    int    `json:"databaseLogs"`
+	DatabaseSHA     string `json:"databaseSha256"`
+	Reason          string `json:"reason"`
+	Actor           string `json:"actor"`
 }
 
 // Errors. The texts hold no secret.
@@ -62,6 +86,9 @@ var (
 	ErrDamaged = errors.New("ledgerstate: the file of what was published is damaged")
 	// ErrFork: a size would get a second root, or an event number a second note.
 	ErrFork = errors.New("ledgerstate: a size or an event number that was published would get other content")
+	// ErrNotWritten: the record could not be written to the disk (full, read only, or larger than MaxFile). What is in memory is current,
+	// the file is behind: nothing is signed until a write succeeds, because the record is the guard that a signature cannot be repeated (P7A-11).
+	ErrNotWritten = errors.New("ledgerstate: the record of what was published cannot be written")
 )
 
 type onDisk struct {
@@ -83,6 +110,8 @@ type File struct {
 	have bool
 	// Warned is set when a damaged file was met (it stays damaged until an operator removes it).
 	bad bool
+	// dirty is set when a change could not be written: the file is behind the memory (see ErrNotWritten).
+	dirty bool
 }
 
 // Open prepares the state in dir (which must exist). A missing file is not an error (Initialized reports it); a damaged one is remembered
@@ -96,7 +125,7 @@ func Open(dir string) (*File, error) {
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		return f, nil
-	case err != nil || len(data) > MaxFile:
+	case err != nil || len(data) > maxFile:
 		f.bad = true
 		return f, nil
 	}
@@ -136,11 +165,36 @@ func (f *File) Snapshot() State {
 }
 
 func clone(s State) State {
-	out := State{Logs: map[string]Mark{}, Events: s.Events, EventHash: s.EventHash}
+	out := State{Logs: map[string]Mark{}, Events: s.Events, EventHash: s.EventHash, Generation: s.Generation}
 	for k, v := range s.Logs {
 		out.Logs[k] = v
 	}
+	if s.Restore != nil {
+		r := *s.Restore
+		out.Restore = &r
+	}
 	return out
+}
+
+// persist writes the state and remembers whether it could (dirty). The caller holds the lock.
+func (f *File) persist() error {
+	if err := f.save(); err != nil {
+		f.dirty = true
+		return err
+	}
+	f.dirty = false
+	return nil
+}
+
+// settle writes again a change that could not be written before, and refuses while it cannot (ErrNotWritten). The caller holds the lock.
+func (f *File) settle() error {
+	if !f.dirty {
+		return nil
+	}
+	if err := f.persist(); err != nil {
+		return fmt.Errorf("%w: %v", ErrNotWritten, err)
+	}
+	return nil
 }
 
 // save writes the state atomically. The caller holds the lock.
@@ -148,6 +202,9 @@ func (f *File) save() error {
 	b, err := json.Marshal(onDisk{State: f.st, Sum: sumOf(f.st)})
 	if err != nil {
 		return err
+	}
+	if len(b) > maxFile {
+		return fmt.Errorf("ledgerstate: the record is %d bytes, more than the %d that a file may hold", len(b), maxFile)
 	}
 	dir := filepath.Dir(f.path)
 	tmp, err := os.CreateTemp(dir, ".published-*")
@@ -179,8 +236,21 @@ func (f *File) save() error {
 		_ = os.Remove(name)
 		return errors.New("ledgerstate: the state file cannot be written")
 	}
+	syncDir(dir)
 	f.have = true
 	return nil
+}
+
+// syncDir makes the rename durable on the systems that can sync a directory (a power loss would otherwise leave the old file, one write behind the
+// database). A system that cannot is not an error.
+func syncDir(dir string) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	if d, err := os.Open(dir); err == nil { // #nosec G304 -- the key directory of the daemon
+		_ = d.Sync()
+		_ = d.Close()
+	}
 }
 
 // Allow says whether a checkpoint of the log with this size and root may be signed: not when a checkpoint of a larger size was published,
@@ -190,6 +260,9 @@ func (f *File) Allow(origin string, size int64, root []byte) error {
 	defer f.mu.Unlock()
 	if f.bad {
 		return ErrDamaged
+	}
+	if err := f.settle(); err != nil {
+		return err
 	}
 	m, ok := f.st.Logs[origin]
 	if !ok {
@@ -227,7 +300,7 @@ func (f *File) RecordCheckpoint(origin string, size int64, root []byte) error {
 		return nil
 	}
 	f.st.Logs[origin] = Mark{Size: size, Root: h}
-	return f.save()
+	return f.persist()
 }
 
 // EventHashOf is the hash that stands for the note of an event.
@@ -243,6 +316,9 @@ func (f *File) AllowEvent(count int64, lastNote []byte) error {
 	defer f.mu.Unlock()
 	if f.bad {
 		return ErrDamaged
+	}
+	if err := f.settle(); err != nil {
+		return err
 	}
 	return f.checkEvents(count, lastNote)
 }
@@ -274,7 +350,7 @@ func (f *File) RecordEvent(seq int64, note []byte) error {
 		return nil
 	}
 	f.st.Events, f.st.EventHash = seq+1, EventHashOf(note)
-	return f.save()
+	return f.persist()
 }
 
 // Merge adds what another copy of the state knows: the larger size per log, the larger event count. Two copies that disagree on the root of
@@ -284,6 +360,14 @@ func (f *File) Merge(o State) error {
 	defer f.mu.Unlock()
 	if f.bad {
 		return ErrDamaged
+	}
+	switch {
+	case o.Generation > f.st.Generation:
+		// an operator accepted a restore that this copy has not seen: that record replaces this one (the loss it accepted is the new floor)
+		f.st = clone(o)
+		return f.persist()
+	case o.Generation < f.st.Generation:
+		return nil // a copy that has not seen the acceptance: nothing of it is merged (it would take the floor back)
 	}
 	next := clone(f.st)
 	for k, v := range o.Logs {
@@ -301,8 +385,11 @@ func (f *File) Merge(o State) error {
 	case o.Events == next.Events && o.EventHash != next.EventHash:
 		return fmt.Errorf("%w: the last event", ErrFork)
 	}
+	if next.Restore == nil {
+		next.Restore = o.Restore
+	}
 	f.st = next
-	return f.save()
+	return f.persist()
 }
 
 func clipOrigin(s string) string {
@@ -320,6 +407,9 @@ func (f *File) Check(have func(origin string, size int64) (root []byte, ok bool,
 	defer f.mu.Unlock()
 	if f.bad {
 		return ErrDamaged
+	}
+	if err := f.settle(); err != nil {
+		return err
 	}
 	for origin, m := range f.st.Logs {
 		root, ok, err := have(origin, m.Size)
@@ -348,12 +438,98 @@ func (f *File) Check(have func(origin string, size int64) (root []byte, ok bool,
 	return nil
 }
 
-// Replace sets the state to the given one without any check: the first start (what the database holds is all there is to go on), and the
-// operator's explicit acceptance after a restore.
+// Replace sets the state to the given one without any check: the first start of a server that has no record and no holder to ask (what the
+// database holds is all there is to go on). The acceptance of a restore is Accept.
 func (f *File) Replace(s State) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.st = clone(s)
 	f.bad = false
-	return f.save()
+	return f.persist()
+}
+
+// AcceptFileName is the file in the key directory by which an operator accepts the loss of a restore of the system database (see Accept).
+const AcceptFileName = "accept-restore"
+
+// Accept is the operator's acceptance of a restore of the system database: the record becomes what the restored database holds (db), one
+// generation higher, with the note that announces the break in a signed event (RestoreNote; the collector publishes it and ClearRestore ends
+// it). The record it replaces is kept beside it as published.json.before-restore-<generation> (an auditor who holds it can see what was given
+// up), and the write of that copy must succeed before anything changes. Nothing else replaces a record that has been published.
+func (f *File) Accept(db State, n RestoreNote) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.bad {
+		return ErrDamaged
+	}
+	next := clone(db)
+	next.Generation = f.st.Generation + 1
+	nn := n
+	next.Restore = &nn
+	if data, err := os.ReadFile(f.path); err == nil { // #nosec G304 -- the key directory of the daemon
+		keep := fmt.Sprintf("%s.before-restore-%d", f.path, next.Generation)
+		if err := os.WriteFile(keep, data, 0o600); err != nil { // #nosec G306 -- mode 0600
+			return errors.New("ledgerstate: the record to be replaced cannot be kept: nothing was changed")
+		}
+	}
+	f.st = next
+	return f.persist()
+}
+
+// ClearRestore ends the note of an accepted restore after its event was published.
+func (f *File) ClearRestore() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.bad {
+		return ErrDamaged
+	}
+	if f.st.Restore == nil {
+		return nil
+	}
+	f.st.Restore = nil
+	return f.persist()
+}
+
+// AcceptToken reads the file accept-restore of the key directory: the first line is the confirmation the operator copied from the alert, an
+// optional second line is the reason (printable ASCII, at most 200 bytes). "" when there is no such file or it is not as described.
+func (f *File) AcceptToken() (token, reason string) {
+	data, err := os.ReadFile(filepath.Join(filepath.Dir(f.path), AcceptFileName)) // #nosec G304 -- the key directory of the daemon
+	if err != nil || len(data) > 1024 {
+		return "", ""
+	}
+	lines := bytes.Split(bytes.TrimSpace(data), []byte("\n"))
+	token = string(bytes.TrimSpace(lines[0]))
+	if len(lines) > 1 {
+		reason = string(bytes.TrimSpace(bytes.Join(lines[1:], []byte(" "))))
+	}
+	for i := 0; i < len(reason); i++ {
+		if reason[i] < 0x20 || reason[i] > 0x7e {
+			reason = ""
+			break
+		}
+	}
+	if len(reason) > 200 {
+		reason = reason[:200]
+	}
+	return token, reason
+}
+
+// ConsumeAcceptToken removes the file accept-restore (the acceptance was made).
+func (f *File) ConsumeAcceptToken() {
+	_ = os.Remove(filepath.Join(filepath.Dir(f.path), AcceptFileName))
+}
+
+// SumOf is the SHA-256 (hex) of the canonical encoding of a state without its generation and its note: the identity of what a record held.
+func SumOf(s State) string {
+	c := clone(s)
+	c.Generation, c.Restore = 0, nil
+	return sumOf(c)
+}
+
+// Confirmation is what an operator must write in the file accept-restore to accept the loss of this restore: sixteen hexadecimal digits that
+// depend on the record (with its generation) and on what the restored database holds, so that it fits this one situation and no other.
+func Confirmation(published, database State) string {
+	p := clone(published)
+	p.Restore = nil
+	h := sha256.Sum256([]byte("kingres restore confirmation 1\n" + sumOf(p) + "\n" + SumOf(database)))
+	return hex.EncodeToString(h[:8])
 }

@@ -36,6 +36,8 @@ type Snapshot struct {
 	Settings Settings
 	Views    []View
 	Now      time.Time
+	// CredProblems are the targets whose credentials file this server or a holder lacks (credsync.go), by target id.
+	CredProblems map[int64]CredProblem
 }
 
 // snapshot reads the targets, the newest anchored record of each (target, log), the failures and the aggregates,
@@ -123,6 +125,7 @@ func (s *Service) snapshot(ctx context.Context) (Snapshot, error) {
 		}
 		sn.Views = append(sn.Views, v)
 	}
+	sn.CredProblems = s.credProblemList()
 	return sn, nil
 }
 
@@ -193,6 +196,13 @@ func Wanted(sn Snapshot, databases []string) []wanted {
 		}
 		if failed != nil {
 			out = append(out, wanted{AlertFailed, targetSubject(id), "critical", failureText(*failed)})
+		}
+		if p, ok := sn.CredProblems[id]; ok {
+			sev := "warning"
+			if p.Critical {
+				sev = "critical"
+			}
+			out = append(out, wanted{AlertFailed, targetSubject(id) + "|credentials", sev, p.Text})
 		}
 	}
 	return out

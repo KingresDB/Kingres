@@ -26,9 +26,30 @@ func init() {
 		Normalize:           normalizeTSA,
 		CheckBundle:         func(pem []byte) error { _, _, err := tsa.ParseBundle(pem); return err },
 		Build:               buildTSA,
+		Binds:               bindsTSA,
 		Timeouts:            func(json.RawMessage) (time.Duration, time.Duration) { return 0, 0 },
 		Exports:             map[string]func(Row) ([]byte, error){"tsr": exportTSR},
 	})
+}
+
+// bindsTSA: the message imprint of the token is the digest of the record.
+func bindsTSA(r Row, raw json.RawMessage) error {
+	ev, err := anchor.ParseTSAEvidence(raw)
+	if err != nil {
+		return err
+	}
+	der, err := base64.StdEncoding.DecodeString(ev.TokenDERB64)
+	if err != nil {
+		return errors.New("the token of the evidence is not base64")
+	}
+	imprint, err := tsa.ImprintOf(der)
+	if err != nil {
+		return errors.New("the imprint of the token cannot be read")
+	}
+	if imprint != r.PayloadSHA256 {
+		return errors.New("the token of the evidence stamps another digest than the one of this checkpoint")
+	}
+	return nil
 }
 
 func normalizeTSA(raw json.RawMessage) (json.RawMessage, Info, error) {

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgerlog"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgerpub"
@@ -67,7 +68,16 @@ func (c *Collector) chain(ctx context.Context, pc *ledgersign.PubContext, term s
 		}
 		// The group holds another chain than the one published for it (the database was dropped and made again outside the control plane, or
 		// its ledger was replaced): the old log cannot be extended, and it must not simply stop. It is closed with an event and flagged
-		// retired in the aggregate, as a removed group is.
+		// retired in the aggregate, as a removed group is, but not on the first answer (P7A-06): the end is irreversible and public, and one
+		// wrong answer (a forged one, a mapping fault, a group that briefly answers from another database) is not the proof of it. The same
+		// new chain id must answer in every round for MissingFor, as for a database that vanished, and an alert is raised from the first answer.
+		if ok, left := c.replacementConfirmed(db, g, chainID); !ok {
+			c.alert(ctx, AlertDiverged, "critical", db, g, fmt.Sprintf("Shard group %d answered another chain than the one published for it. If it keeps answering the same chain for %s the published log ends for good (a signed chain-retired event) and the log of the new chain starts; until then nothing is published for the group.", g, left.Round(time.Minute)), true)
+			gr.Log = existing
+			gr.Err = &ReadError{Group: g, Code: "chain_changed", Message: "the group answers another chain than the one published for it; waiting to see whether it keeps doing so"}
+			return nil
+		}
+		c.replacementDone(db, g)
 		if err := c.retireLogs(ctx, *pc, term, db, []ledgerpub.LogRow{*existing}, "chain-replaced"); err != nil {
 			return err
 		}
@@ -88,6 +98,10 @@ func (c *Collector) chain(ctx context.Context, pc *ledgersign.PubContext, term s
 		}
 		copy(logs, l2)
 		existing = nil
+	}
+	if existing != nil {
+		// the group answers the chain of its log: a replacement that was being watched ended with that answer
+		c.replacementEnded(ctx, db, g)
 	}
 	if existing == nil {
 		if closed := closedLog(logs, chainID); closed != nil {

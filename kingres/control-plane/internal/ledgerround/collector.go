@@ -79,6 +79,7 @@ type Collector struct {
 	signFails    int
 	signErr      error
 	missingSince map[string]time.Time
+	replacing    map[string]replacement
 	tries        map[string]time.Time
 	lastRound    time.Time
 }
@@ -104,7 +105,7 @@ func New(cfg Config) (*Collector, error) {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	return &Collector{cfg: cfg, log: log, locks: map[string]*sync.Mutex{}, missingSince: map[string]time.Time{}, tries: map[string]time.Time{}}, nil
+	return &Collector{cfg: cfg, log: log, locks: map[string]*sync.Mutex{}, missingSince: map[string]time.Time{}, replacing: map[string]replacement{}, tries: map[string]time.Time{}}, nil
 }
 
 func (c *Collector) lock(db string) *sync.Mutex {
@@ -273,6 +274,11 @@ func (c *Collector) round(ctx context.Context, db, op string, only map[int32]boo
 		}
 		return res, err
 	}
+	if err := c.announceRestore(ctx); err != nil {
+		// an accepted restore is announced before anything else is signed; the next round tries again
+		res.SignErr = fmt.Errorf("%w: %v", ErrPublishedState, err)
+		return res, nil
+	}
 	logs, err := c.cfg.Store.Logs(ctx)
 	if err != nil {
 		return res, err
@@ -284,12 +290,20 @@ func (c *Collector) round(ctx context.Context, db, op string, only map[int32]boo
 				res.KeysChanged = true
 				return res, nil
 			}
+			if errors.Is(err, ErrPublishedState) {
+				res.SignErr = err
+				return res, nil
+			}
 			return res, err
 		}
 	}
 	if err := c.aggregate(ctx, pc, term, db, &res); err != nil {
 		if errors.Is(err, ErrKeysChanged) {
 			res.KeysChanged = true
+			return res, nil
+		}
+		if errors.Is(err, ErrPublishedState) {
+			res.SignErr = err
 			return res, nil
 		}
 		return res, err

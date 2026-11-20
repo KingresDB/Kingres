@@ -70,11 +70,36 @@ func (c Creds) Secrets() []anchor.Secret {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	out := make([]anchor.Secret, 0, len(keys))
+	out := make([]anchor.Secret, 0, len(keys)+1)
 	for _, k := range keys {
 		out = append(out, c[k])
 	}
+	// the HTTP Basic pair is sent as the base64 of "user:password": a server that repeats the header in a text repeats that, which is
+	// not a spelling of either member alone
+	if u, p := c["username"], c["password"]; u != "" && p != "" {
+		out = append(out, anchor.Secret(u.Reveal()+":"+p.Reveal()))
+	}
 	return out
+}
+
+// IDs lists the targets that have a credentials file on this server.
+func (s *CredStore) IDs() ([]int64, error) {
+	ents, err := os.ReadDir(s.dir)
+	if err != nil {
+		return nil, ErrCredentials
+	}
+	var out []int64
+	for _, e := range ents {
+		name := e.Name()
+		if !e.Type().IsRegular() || len(name) < 6 || name[len(name)-5:] != ".json" {
+			continue
+		}
+		if id, err := strconv.ParseInt(name[:len(name)-5], 10, 64); err == nil && id > 0 && strconv.FormatInt(id, 10) == name[:len(name)-5] {
+			out = append(out, id)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
 }
 
 func (c Creds) get(name string) anchor.Secret { return c[name] }
@@ -94,7 +119,8 @@ var credMembers = map[string][]credMember{
 		{"accessKeyId", true, 4, 128, false}, {"secretAccessKey", true, 4, 256, false}, {"sessionToken", false, 4, 4096, false},
 	},
 	anchor.KindTSA: {
-		{"username", false, 1, 256, false}, {"password", false, 1, 256, true},
+		// at least anchor.MinSecretLength: the redactor ignores a shorter value, so a shorter one could not be removed from a text (P7A-10)
+		{"username", false, anchor.MinSecretLength, 256, false}, {"password", false, anchor.MinSecretLength, 256, true},
 	},
 	anchor.KindOTS: {},
 }
@@ -427,9 +453,29 @@ func ReadCredentialsFile(path, kind string) (Creds, error) {
 	defer clear(data)
 	c, err := ParseCreds(kind, data)
 	if err != nil || c == nil {
-		return nil, ErrCredentials
+		return nil, errCredContent
 	}
 	return c, nil
+}
+
+// The three reasons a credentials file named by credentialsPath is refused, told apart so that the operator is told which (P7A-12). Each
+// is an ErrCredentials; none names a path or a content.
+var (
+	errCredMode    = fmt.Errorf("%w (the file may be read by group or others)", ErrCredentials)
+	errCredContent = fmt.Errorf("%w (the content is not a JSON object with the members of the kind)", ErrCredentials)
+)
+
+// credFileProblem says in words why ReadCredentialsFile refused: no path, no content.
+func credFileProblem(err error) string {
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return "the file does not exist on this server"
+	case errors.Is(err, errCredMode):
+		return "the file can be read by group or others (give it the mode 0600)"
+	case errors.Is(err, errCredContent):
+		return "the content is not a JSON object with the members of the kind"
+	}
+	return "the file is not a regular file of at most 4 KiB that this server can read"
 }
 
 // readPrivate reads a regular file that only its owner can read (on a system with modes), without following a
@@ -446,7 +492,7 @@ func readPrivate(path string, limit int64) ([]byte, error) {
 		return nil, ErrCredentials
 	}
 	if runtime.GOOS != "windows" && st.Mode().Perm()&0o077 != 0 {
-		return nil, fmt.Errorf("%w (the file may be read by group or others)", ErrCredentials)
+		return nil, errCredMode
 	}
 	f, err := os.Open(path) // #nosec G304 -- the path is configured by the operator or built from a number
 	if err != nil {

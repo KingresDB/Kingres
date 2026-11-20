@@ -36,6 +36,7 @@ func init() {
 		CredentialsAllowed: false,
 		Normalize:          normalizeOTS,
 		Build:              buildOTS,
+		Binds:              bindsOTS,
 		Timeouts: func(cfg json.RawMessage) (time.Duration, time.Duration) {
 			c, _, err := splitOTS(cfg)
 			if err != nil {
@@ -46,6 +47,18 @@ func init() {
 		PriorEvidence: ots.PriorEvidenceRaw,
 		Exports:       map[string]func(Row) ([]byte, error){"ots": exportOTS},
 	})
+}
+
+// bindsOTS: the digest that the calendars stamped is the digest of the record.
+func bindsOTS(r Row, raw json.RawMessage) error {
+	ev, err := anchor.ParseOTSEvidence(raw)
+	if err != nil {
+		return err
+	}
+	if ev.Digest != hex.EncodeToString(r.PayloadSHA256[:]) {
+		return errors.New("the digest of the evidence is not the digest of this checkpoint")
+	}
+	return nil
 }
 
 type headerSourceCfg struct {

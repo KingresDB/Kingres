@@ -22,6 +22,12 @@ type PublishedState interface {
 	Replace(s ledgerstate.State) error
 	Merge(s ledgerstate.State) error
 	Snapshot() ledgerstate.State
+	// The acceptance of a restore of the system database by an operator (restore.go): the confirmation written in the file accept-restore,
+	// the replacement of the record by what the database holds, and the end of the note that the event announces.
+	AcceptToken() (token, reason string)
+	ConsumeAcceptToken()
+	Accept(db ledgerstate.State, n ledgerstate.RestoreNote) error
+	ClearRestore() error
 }
 
 // AlertPublishedState is the subject of the alert of a database that is older than what was published (kind ledgerSignerUnavailable: nothing
@@ -178,12 +184,15 @@ func (c *Collector) checkPublished(ctx context.Context) error {
 	case err == nil:
 		c.publishedAlert(ctx, "", false)
 		return nil
+	case errors.Is(err, ledgerstate.ErrNotWritten):
+		// the record cannot be written (a full or read only disk): it is the guard of every signature, so nothing is signed until it is (P7A-11)
+		c.log.Error("the record of what was published cannot be written", "error", err)
+		c.publishedAlert(ctx, "The record of what was published cannot be written to the key directory ("+err.Error()+"). Nothing is signed until it can: free the disk or fix the directory.", true)
+		return fmt.Errorf("%w: %v", ErrPublishedState, err)
 	case errors.Is(err, ledgerstate.ErrBehind), errors.Is(err, ledgerstate.ErrFork), errors.Is(err, ledgerstate.ErrDamaged):
 		msg := "The system database is older than what was published, or contradicts it (a restore of an older backup?): " + err.Error() +
-			". Nothing is signed and nothing is written until the database holds what was published. Events published: " + strconv.FormatInt(snap.Events, 10) + "."
-		c.log.Error("the system database is older than what was published", "error", err)
-		c.publishedAlert(ctx, msg, true)
-		return fmt.Errorf("%w: %v", ErrPublishedState, err)
+			". Nothing is signed and nothing is written until the database holds what was published, or an operator accepts the loss. Events published: " + strconv.FormatInt(snap.Events, 10) + "."
+		return c.onMismatch(ctx, snap, err, msg)
 	}
 	return err
 }
