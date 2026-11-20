@@ -288,6 +288,7 @@ tests += {
       't/137_reg_oids.pl',
       't/138_no_gain_plans.pl',
       't/139_partial_agg.pl',
+      't/230_schema_catalog_cluster.pl',
     ],
   },
 }
