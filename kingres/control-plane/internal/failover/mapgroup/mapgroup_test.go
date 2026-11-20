@@ -20,6 +20,8 @@ import (
 // standbys 10 and 11 of group 0 (nodes 4 and 5).
 type world struct {
 	mu        sync.Mutex
+	freezeErr error // FreezeLocal fails from the second call on (the agent was lost with a restart)
+	freezes   int
 	log       []string
 	self      string
 	term      int64
@@ -147,7 +149,16 @@ func (p ports) Promote(_ context.Context, s string, r failover.PromoteRequest) (
 	p.w.rec("promote %s", s)
 	return failover.PromoteAnswer{Status: "promoted", Timeline: 2, Lsn: "0/5000100"}, nil
 }
-func (p ports) FreezeLocal(context.Context, time.Duration) error { p.w.rec("freeze"); return nil }
+func (p ports) FreezeLocal(context.Context, time.Duration) error {
+	p.w.rec("freeze")
+	p.w.mu.Lock()
+	defer p.w.mu.Unlock()
+	p.w.freezes++
+	if p.w.freezes > 1 {
+		return p.w.freezeErr
+	}
+	return nil
+}
 func (p ports) Continue(_ context.Context, s string, j journal.Journal) error {
 	p.w.rec("continue %s id=%s", s, j.ID)
 	return nil
@@ -449,9 +460,13 @@ func TestANewLeaderWithoutTheKeyOfTheCertificateAuthorityRaisesAnAlert(t *testin
 
 // A step that finished is not run again after a crash, and a task that was recorded is not recorded twice.
 func TestAFinishedStepIsNotRepeatedAfterACrash(t *testing.T) {
-	for _, c := range []struct{ point, marker string }{
-		{journal.StepFreeze + ":after", "freeze"},
-		{journal.StepCatalog + ":after", "promote_node"},
+	for _, c := range []struct {
+		point, marker string
+		want          int
+	}{
+		// B2 asks once; each of the six steps after it asks again (the freeze is renewed, and redone after a restart)
+		{journal.StepFreeze + ":after", "freeze", 7},
+		{journal.StepCatalog + ":after", "promote_node", 1},
 	} {
 		w := newWorld()
 		r, _ := w.runner(t)
@@ -469,8 +484,8 @@ func TestAFinishedStepIsNotRepeatedAfterACrash(t *testing.T) {
 		if _, _, err := r.Resume(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		if n := w.count(c.marker); n != 1 {
-			t.Errorf("after a crash at %s the step with %q ran %d times", c.point, c.marker, n)
+		if n := w.count(c.marker); n != c.want {
+			t.Errorf("after a crash at %s the step with %q ran %d times, want %d", c.point, c.marker, n, c.want)
 		}
 	}
 }
@@ -522,5 +537,19 @@ func TestAnAutomaticStartForALiveOldServerIsRefused(t *testing.T) {
 	}
 	if _, err := r.Decide(context.Background(), req()); err != nil {
 		t.Fatalf("a manual request for a live server: %v", err)
+	}
+}
+
+// The freeze is asked for again before every step after B2: when it cannot be had (the agent is gone), the bootstrap does not go on to
+// the promotion without it.
+func TestTheBootstrapDoesNotPromoteWithoutItsFreeze(t *testing.T) {
+	w := newWorld()
+	w.freezeErr = errors.New("the standby agent is not running")
+	r, _ := w.runner(t)
+	if _, err := r.Run(context.Background(), req()); err == nil {
+		t.Fatal("the bootstrap went on without a freeze")
+	}
+	if w.count("promote ") != 0 {
+		t.Fatalf("promoted without the freeze: %v", w.log)
 	}
 }

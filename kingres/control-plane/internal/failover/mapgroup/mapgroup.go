@@ -275,6 +275,13 @@ func (r *Runner) resume(ctx context.Context, j journal.Journal) (Result, error) 
 		if err := r.fault(s.name + ":before"); err != nil {
 			return res, err
 		}
+		// The freeze of B2 lapses (ten minutes) and is memory of the agent that a restart may have lost: every step after it asks for it again,
+		// so a bootstrap that waits long (the old lease, a promoted instance that starts) or that a restart interrupted never runs without it.
+		if s.name != journal.StepDecide && s.name != journal.StepFreeze && r.Journal.IsDone(journal.StepFreeze) {
+			if err := r.P.FreezeLocal(ctx, dur(r.FreezeTTL, 10*time.Minute)); err != nil {
+				return res, err
+			}
+		}
 		cur, _ := r.Journal.Current()
 		stop, err := s.f(ctx, cur)
 		if err != nil {
