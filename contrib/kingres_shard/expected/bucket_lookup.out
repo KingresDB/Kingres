@@ -1483,6 +1483,8 @@ EXPLAIN (COSTS OFF) SELECT v FROM p_int4 WHERE id = 1 OR id = 3;
                      Index Cond: (id = ANY ('{1,3}'::integer[]))
 (13 rows)
 
+-- the plan of the scan (step 7 answers an aggregate by partial aggregation; that is tested in t/139)
+SET kingres_shard.enable_partial_aggregation = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM p_int4 WHERE id IN (1, 2);
                                             QUERY PLAN                                            
 --------------------------------------------------------------------------------------------------
@@ -1502,6 +1504,7 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM p_int4 WHERE id IN (1, 2);
                            Index Cond: (id = ANY ('{1,2}'::integer[]))
 (14 rows)
 
+RESET kingres_shard.enable_partial_aggregation;
 EXPLAIN (COSTS OFF) SELECT a.v FROM p_int4 a JOIN p_int8 b ON a.id = b.id WHERE a.id = 1 AND b.id = 1;
                                    QUERY PLAN                                    
 ---------------------------------------------------------------------------------

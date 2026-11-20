@@ -58,6 +58,7 @@
 
 typedef struct ShipCtx
 {
+	bool		allow_order_aggs;	/* a partial aggregation: float and order-sensitive aggregates are combined (design 7.6, A3) */
 	Index		varno;			/* clause mode: the only table; else 0 */
 	bool		statement;		/* a whole statement, not one clause */
 	Oid			shipped_relid;	/* statement mode: the table being written */
@@ -725,7 +726,7 @@ ship_walker(Node *node, ShipCtx *ctx)
 					!collation_ok(a->aggcollid) || !collation_ok(a->inputcollid) ||
 					a->aggorder != NIL)
 					return fail(ctx, "it uses an aggregate that cannot be shipped");
-				if (agg_order_sensitive(a))
+				if (!ctx->allow_order_aggs && agg_order_sensitive(a))
 					return fail(ctx, "it uses an aggregate whose result can depend on the order of the rows");
 				break;
 			}
@@ -837,6 +838,31 @@ kingres_shard_stmt_shippable_colocated(Query *query, Oid target_relid, int coloc
 	ctx.shipped_relid = target_relid;
 	ctx.colocation_id = colocation_id;
 	ctx.top = query;
+	bad = query_ok(query, &ctx);
+	if (bad && reason != NULL)
+		*reason = ctx.reason ? ctx.reason : "it cannot be shipped";
+	return !bad;
+}
+
+/*
+ * The fragment of a partial aggregation (design 7): the same tests as the colocated mode, except that
+ * an aggregate whose result depends on the order or the grouping of the rows (a floating point sum,
+ * array_agg, string_agg) is accepted: the partial states are combined in the order the groups
+ * answer, as in a parallel plan, and the README says so (design 7.6, A3).
+ */
+bool
+kingres_shard_stmt_shippable_partial(Query *query, int colocation_id, const char **reason)
+{
+	ShipCtx		ctx;
+	bool		bad;
+
+	Assert(colocation_id != 0);
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.statement = true;
+	ctx.shipped_relid = InvalidOid;
+	ctx.colocation_id = colocation_id;
+	ctx.top = query;
+	ctx.allow_order_aggs = true;
 	bad = query_ok(query, &ctx);
 	if (bad && reason != NULL)
 		*reason = ctx.reason ? ctx.reason : "it cannot be shipped";

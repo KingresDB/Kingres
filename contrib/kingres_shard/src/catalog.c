@@ -73,6 +73,8 @@ static struct
 
 static void catalog_inval_callback(Datum arg, Oid relid);
 static void catalog_load(void);
+static void catalog_retire(MemoryContext cxt);
+static void catalog_xact_callback(XactEvent event, void *arg);
 
 /*
  * kingres_shard_catalog_init
@@ -83,6 +85,7 @@ void
 kingres_shard_catalog_init(void)
 {
 	CacheRegisterRelcacheCallback(catalog_inval_callback, (Datum) 0);
+	RegisterXactCallback(catalog_xact_callback, NULL);
 }
 
 /*
@@ -111,6 +114,37 @@ catalog_inval_callback(Datum arg, Oid relid)
 			return;
 		}
 	}
+}
+
+/*
+ * A cache that was replaced is not freed at once: code that is in the middle of a statement
+ * holds pointers into it (a distributed table, a colocation group, a node) and the load can
+ * happen under any call that takes a lock, and under debug_discard_caches under every one of
+ * them.  The pointers then keep describing the catalog as the statement began with it, and
+ * the memory goes when the transaction ends.
+ */
+static List *retired_cxts = NIL;
+
+static void
+catalog_retire(MemoryContext cxt)
+{
+	MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
+	retired_cxts = lappend(retired_cxts, cxt);
+	MemoryContextSwitchTo(old);
+}
+
+static void
+catalog_xact_callback(XactEvent event, void *arg)
+{
+	ListCell   *lc;
+
+	if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT && event != XACT_EVENT_PREPARE)
+		return;
+	foreach(lc, retired_cxts)
+		MemoryContextDelete((MemoryContext) lfirst(lc));
+	list_free(retired_cxts);
+	retired_cxts = NIL;
 }
 
 /*
@@ -604,7 +638,7 @@ catalog_load(void)
 	ks.cat = cat;
 	memcpy(ks.relids, relids, sizeof(relids));
 	if (prevcxt != NULL)
-		MemoryContextDelete(prevcxt);
+		catalog_retire(prevcxt);
 	ks.valid = true;
 
 	/* Sessions to nodes that are no longer primaries are of no use any more. */

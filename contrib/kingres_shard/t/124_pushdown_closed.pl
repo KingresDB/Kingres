@@ -27,7 +27,8 @@ use Test::More;
 use KingresShardTest qw(run_sql);
 use KingresShardCompare;
 
-my $c = KingresShardCompare->new('pc');
+my $c = KingresShardCompare->new('pc', extra => "kingres_shard.enable_partial_aggregation = off" . "
+");
 my ($n1, $n2, $n3) = $c->nodes;
 my $single = $c->single;
 my @nodes = ($n1, $n2, $n3);

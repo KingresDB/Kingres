@@ -166,6 +166,9 @@ typedef struct KsPushdownInfo
 	List	   *dist_relids;	/* of Oid: the distributed tables, which the probes name */
 	const char *kind;			/* what is pushed, for EXPLAIN (a static string) */
 	int			ncols;			/* the columns the groups return */
+	int			ndist;			/* the references to distributed tables (a self join has two of one table) */
+	bool		partial;		/* a partial aggregation (design 7): sql and ncols are made by the path, which knows the partial target */
+	Query	   *ship;			/* partial: a copy of the query, to deparse with the select list of the partial target */
 } KsPushdownInfo;
 
 extern void kingres_shard_fragment_scan_init(void);

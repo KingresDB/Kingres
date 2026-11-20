@@ -65,6 +65,7 @@
 #include "access/table.h"
 #include "access/xact.h"
 #include "catalog/partition.h"
+#include "catalog/pg_aggregate.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_type_d.h"
 #include "catalog/pg_language_d.h"
@@ -101,6 +102,7 @@
 #include "hashing.h"
 #include "kingres_shard.h"
 #include "node_conn.h"
+#include "pg_compat.h"
 #include "planner.h"
 #include "pushdown.h"
 #include "remote_scan.h"
@@ -844,6 +846,8 @@ insert_select_text_accepted(const char *body, Query *orig, const char **why)
 		if (!OidIsValid(pt.types[i]))
 			pt.types[i] = TEXTOID;
 
+	/* the window between the deparse and the parse of the text (P2D-02) */
+	kingres_shard_fault_point("insel_before_text_parse");
 	nest = kingres_shard_set_transmission_modes();
 	raw = pg_parse_query(body);
 	if (list_length(raw) != 1)
@@ -1080,6 +1084,139 @@ plan_locally(Query *parse, const char *query_string, int cursorOptions,
 }
 
 /*
+ * partialize_plan
+ *
+ * The plan of the fragment of a partial aggregation (design 7.3): the planner made the plan of an ordinary
+ * grouping query; it is turned into the first step of a two-step aggregation, which returns the transition state of
+ * every aggregate (a state of type internal as bytea, serialized) instead of the final value.  The top node must
+ * be the Agg node (or, with no aggregate, a Group node, which has nothing to split); the node and every Aggref of its
+ * target list change together (nodeAgg.c asserts that they agree).  Any other shape is an error that names it: the
+ * settings of plan_partial_fragment make the plan one Agg over the scan or the join, and the text the sender makes
+ * has only bare aggregates and grouping columns in its select list.
+ */
+static Node *
+partial_aggref_mutator(Node *node, void *context)
+{
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, Aggref))
+	{
+		Aggref	   *a = copyObject((Aggref *) node);
+
+		mark_partial_aggref(a, AGGSPLIT_INITIAL_SERIAL);
+		return (Node *) a;
+	}
+	return expression_tree_mutator(node, partial_aggref_mutator, context);
+}
+
+static bool
+has_aggref_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Aggref))
+		return true;
+	return expression_tree_walker(node, has_aggref_walker, context);
+}
+
+/*
+ * Is the state of every aggregate of the query its final value (no final function, the state of the type of the result)?  min()
+ * and max() are: a query that has only those and no GROUP BY can be planned by the planner as an index probe (an InitPlan
+ * under a Result node, no Agg node), whose output columns are then the partial states as they stand.
+ */
+static bool
+aggs_state_is_value_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Aggref))
+	{
+		Aggref	   *a = (Aggref *) node;
+		HeapTuple	tup = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(a->aggfnoid));
+		bool		bad;
+
+		if (!HeapTupleIsValid(tup))
+			return true;
+		bad = OidIsValid(((Form_pg_aggregate) GETSTRUCT(tup))->aggfinalfn) ||
+			(((Form_pg_aggregate) GETSTRUCT(tup))->aggtranstype != a->aggtype &&
+			 !IsPolymorphicType(((Form_pg_aggregate) GETSTRUCT(tup))->aggtranstype));
+		ReleaseSysCache(tup);
+		return bad;
+	}
+	return expression_tree_walker(node, aggs_state_is_value_walker, context);
+}
+
+static void
+partialize_plan(PlannedStmt *pstmt, bool state_is_value)
+{
+	Plan	   *top = pstmt->planTree;
+	ListCell   *lc;
+
+	/*
+	 * The planner answered min() and max() of an indexed column by an index probe: a Result over InitPlans, with no Agg
+	 * node.  The values it returns are the transition states of those aggregates, which have no final function.
+	 */
+	if (IsA(top, Result) && top->lefttree == NULL && state_is_value)
+		return;
+
+	if (IsA(top, Group))
+	{
+		if (has_aggref_walker((Node *) top->targetlist, NULL))
+			elog(ERROR, "the plan of a partial aggregation has a Group node with aggregates");
+		return;
+	}
+	if (IsA(top, Agg))
+	{
+		Agg		   *agg = (Agg *) top;
+
+		if (agg->aggsplit != AGGSPLIT_SIMPLE || agg->plan.qual != NIL)
+			elog(ERROR, "the plan of a partial aggregation has an Agg node that is already split or has a qualification");
+		foreach(lc, agg->plan.targetlist)
+		{
+			TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+			if (IsA(te->expr, Aggref))
+				te->expr = (Expr *) partial_aggref_mutator((Node *) te->expr, NULL);
+			else if (has_aggref_walker((Node *) te->expr, NULL))
+				elog(ERROR, "the plan of a partial aggregation has an aggregate inside an expression");
+		}
+		agg->aggsplit = AGGSPLIT_INITIAL_SERIAL;
+		return;
+	}
+	elog(ERROR, "the plan of a partial aggregation does not have an Agg node at its top (node type %d)", (int) nodeTag(top));
+}
+
+/*
+ * Plan the fragment of a partial aggregation (a group that received it, or this node for its own part): one Agg
+ * over the scan or the join (no parallel workers, no partitionwise aggregation, no eager aggregation: 7.3, D1),
+ * then partialize.
+ */
+static PlannedStmt *
+plan_partial_fragment(Query *parse, const char *query_string, int cursorOptions,
+					  ParamListInfo boundParams, const KsCatalog *cat, int expected, bool local_part)
+{
+	int			nest = NewGUCNestLevel();
+	PlannedStmt *pstmt;
+	bool		state_is_value = !aggs_state_is_value_walker((Node *) parse->targetList, NULL);
+
+	(void) set_config_option("max_parallel_workers_per_gather", "0", PGC_SUSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+	(void) set_config_option("enable_partitionwise_aggregate", "off", PGC_SUSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+#ifdef KS_EAGER_AGGREGATE_GUC
+	(void) set_config_option(KS_EAGER_AGGREGATE_GUC, "off", PGC_SUSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+#endif
+	if (local_part)
+		pstmt = pass_through(parse, query_string, cursorOptions, boundParams);
+	else
+		pstmt = plan_locally(parse, query_string, cursorOptions, boundParams, cat, expected);
+	AtEOXact_GUC(true, nest);
+	partialize_plan(pstmt, state_is_value);
+	return pstmt;
+}
+
+/*
  * plan_forwarded
  *
  * The statement of a forwarded session (kingres_shard.forwarded is on): the
@@ -1154,6 +1291,41 @@ plan_forwarded(Query *parse, const char *query_string, int cursorOptions,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("this node does not accept the fragment that another node sent it"),
 					 errdetail("The statement is not a closed query that this node runs: %s.", why),
+					 errhint("This is not a change of the bucket map: repeating the statement does not help.")));
+		}
+	}
+
+	/*
+	 * The first step of a partial aggregation that another node asks for (design 7.3): this node plans the
+	 * grouping query it received over its own buckets, turns the plan into one that returns the partial states,
+	 * and compares the placement as for a closed query.
+	 */
+	if (parse->commandType == CMD_SELECT && query_string != NULL)
+	{
+		int64		place;
+
+		if (kingres_shard_parse_partial_marker(query_string, &place))
+		{
+			KsQueryFragment qf;
+			const char *why = NULL;
+
+			if (kingres_shard_partial_fragment_analyze(parse, &qf, &why))
+			{
+				PlannedStmt *pstmt = plan_partial_fragment(parse, query_string, cursorOptions, boundParams,
+														   cat, a->ndist_rtes, false);
+
+				if (kingres_shard_placement_hash_now(qf.colocation_id) != place)
+					ereport(ERROR,
+							(errcode(ERRCODE_KINGRES_STALE_MAP),
+							 errmsg("the bucket map of this node is not the one the statement was shipped with (stale map version " INT64_FORMAT ")",
+									cat->map_version),
+							 errhint("A bucket moved between shard groups, or the primary of a group changed; repeat the statement.")));
+				return pstmt;
+			}
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("this node does not accept the fragment that another node sent it"),
+					 errdetail("The statement is not a partial aggregation that this node runs: %s.", why),
 					 errhint("This is not a change of the bucket map: repeating the statement does not help.")));
 		}
 	}
@@ -1260,7 +1432,8 @@ plan_forwarded(Query *parse, const char *query_string, int cursorOptions,
 		   strncmp(query_string, KS_WRITE_MARKER, strlen(KS_WRITE_MARKER)) == 0 ||
 		   strncmp(query_string, KS_INSERT_MARKER_PREFIX, strlen(KS_INSERT_MARKER_PREFIX)) == 0)) ||
 		 strncmp(query_string, KS_INSERT_SELECT_MARKER_PREFIX, strlen(KS_INSERT_SELECT_MARKER_PREFIX)) == 0 ||
-		 strncmp(query_string, KS_QUERY_MARKER_PREFIX, strlen(KS_QUERY_MARKER_PREFIX)) == 0))
+		 strncmp(query_string, KS_QUERY_MARKER_PREFIX, strlen(KS_QUERY_MARKER_PREFIX)) == 0 ||
+		 strncmp(query_string, KS_PARTIAL_MARKER_PREFIX, strlen(KS_PARTIAL_MARKER_PREFIX)) == 0))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("this node does not accept the fragment that another node sent it"),
@@ -1610,8 +1783,8 @@ can_distributed_scan(Query *parse, const KsCatalog *cat, bool spans)
  * and a parse change in the meaning of the query shows up as a refusal, and the scan answers.  The
  * columns of the text must be those the plan expects: the same number, of the same types.
  */
-static bool
-query_text_accepted(const char *body, Query *sent, const char **why)
+bool
+kingres_shard_text_accepted(const char *body, Query *sent, bool partial, const char **why)
 {
 	ParamTypes	pt = {NULL, 0};
 	List	   *raw;
@@ -1628,6 +1801,7 @@ query_text_accepted(const char *body, Query *sent, const char **why)
 		if (!OidIsValid(pt.types[i]))
 			pt.types[i] = TEXTOID;
 
+	kingres_shard_fault_point("query_before_text_parse");
 	nest = kingres_shard_set_transmission_modes();
 	raw = pg_parse_query(body);
 	if (list_length(raw) != 1)
@@ -1645,22 +1819,38 @@ query_text_accepted(const char *body, Query *sent, const char **why)
 		return false;
 	}
 	rq = linitial_node(Query, rewritten);
-	if (!kingres_shard_query_fragment_analyze(rq, &qf, why))
+	if (partial ? !kingres_shard_partial_fragment_analyze(rq, &qf, why) : !kingres_shard_query_fragment_analyze(rq, &qf, why))
 		return false;
-	if (list_length(rq->targetList) != list_length(sent->targetList))
-	{
-		*why = "the deparsed text returns another number of columns";
-		return false;
-	}
-	forboth(la, rq->targetList, lb, sent->targetList)
-	{
-		TargetEntry *a = lfirst_node(TargetEntry, la);
-		TargetEntry *b = lfirst_node(TargetEntry, lb);
 
-		if (a->resjunk || exprType((Node *) a->expr) != exprType((Node *) b->expr))
+	/*
+	 * The columns the text returns are the ones that are not resjunk: a partial fragment groups by columns that it does not
+	 * return (a resjunk entry of the parse), a closed one has none (every entry was made an ordinary column).
+	 */
+	{
+		List	   *ca = NIL;
+		List	   *cb = NIL;
+
+		foreach(la, rq->targetList)
+			if (!lfirst_node(TargetEntry, la)->resjunk || !partial)
+				ca = lappend(ca, lfirst(la));
+		foreach(lb, sent->targetList)
+			if (!lfirst_node(TargetEntry, lb)->resjunk || !partial)
+				cb = lappend(cb, lfirst(lb));
+		if (list_length(ca) != list_length(cb))
 		{
-			*why = "a column of the deparsed text has another type";
+			*why = "the deparsed text returns another number of columns";
 			return false;
+		}
+		forboth(la, ca, lb, cb)
+		{
+			TargetEntry *a = lfirst_node(TargetEntry, la);
+			TargetEntry *b = lfirst_node(TargetEntry, lb);
+
+			if (a->resjunk || exprType((Node *) a->expr) != exprType((Node *) b->expr))
+			{
+				*why = "a column of the deparsed text has another type";
+				return false;
+			}
 		}
 	}
 	return true;
@@ -1689,12 +1879,13 @@ pushdown_prepare(Query *parse, const char **why)
 	Query	   *ship;
 	KsQueryFragment qf;
 	KsParamRenumber prn = {NIL};
-	char	   *body;
+	char	   *body = NULL;
 	int			nest;
 	ListCell   *lc;
 	List	   *dist = NIL;
 	const KsColocation *coloc;
 	KsPushdownInfo *pi;
+	bool		is_partial = false;
 
 #define PD_NO(msg) do { *why = (msg); return NULL; } while (0)
 
@@ -1703,7 +1894,31 @@ pushdown_prepare(Query *parse, const char **why)
 	if (!kingres_shard_pushdown_analyze(parse, &pd, &reason))
 		PD_NO(reason);
 	if (!kingres_shard_pushdown_closed(&pd, &reason))
-		PD_NO(reason);
+	{
+		const char *preason = NULL;
+
+		/*
+		 * Not closed: an aggregation or a grouping that does not contain a distribution key can still be run in
+		 * two steps (design 7): each group aggregates its own rows and this node combines the partial states.  The
+		 * text of the groups is made by the path, which knows the partial target (fragment_scan.c).
+		 */
+		if (!kingres_shard_enable_partial_aggregation)
+			PD_NO(reason);
+		if (!kingres_shard_partial_shape_ok(parse, &preason))
+			PD_NO(parse->hasAggs || parse->groupClause != NIL ? preason : reason);
+		qf.pd = pd;
+		qf.colocation_id = pd.colocation_id;
+		qf.relids = kingres_shard_pushdown_relids(&pd);
+		ship = copyObject(parse);
+		ship->sortClause = NIL;
+		ship->limitOffset = NULL;
+		ship->limitCount = NULL;
+		ship->limitOption = LIMIT_OPTION_COUNT;
+		is_partial = true;
+		goto assemble;
+	}
+	if (!kingres_shard_enable_pushdown_closed)
+		PD_NO("closed pushdown is switched off");
 	ship = copyObject(parse);
 	foreach(lc, ship->targetList)
 	{
@@ -1726,12 +1941,13 @@ pushdown_prepare(Query *parse, const char **why)
 	nest = kingres_shard_set_transmission_modes();
 	body = pg_get_querydef(ship, false);
 	kingres_shard_reset_transmission_modes(nest);
-	if (!query_text_accepted(body, ship, &reason))
+	if (!kingres_shard_text_accepted(body, ship, false, &reason))
 	{
 		ereport(DEBUG1, (errmsg_internal("kingres_shard: a closed query is not shipped: the groups would not accept its text: %s", reason)));
 		PD_NO(reason);
 	}
 
+assemble:
 	/* the analyses read the catalog cache, which a call of theirs may have reloaded */
 	coloc = kingres_shard_lookup_colocation(qf.colocation_id);
 	if (coloc == NULL)
@@ -1754,6 +1970,14 @@ pushdown_prepare(Query *parse, const char **why)
 	pi->kind = (parse->hasAggs || parse->groupClause != NIL) ? "closed aggregate (by key)" :
 		(parse->distinctClause != NIL ? "closed distinct (by key)" : "closed join (on key)");
 	pi->ncols = list_length(parse->targetList);
+	pi->ndist = qf.pd.ndist;
+	pi->partial = is_partial;
+	pi->ship = is_partial ? ship : NULL;
+	if (is_partial)
+	{
+		pi->sql = NULL;
+		pi->kind = "partial aggregate";
+	}
 	return pi;
 #undef PD_NO
 }
@@ -2208,17 +2432,43 @@ planner_hook_body(Query *parse, const char *query_string,
 
 	refuse_bucket_partition_write(parse, cat);
 
-	memset(&a, 0, sizeof(a));
-	a.params = boundParams;
-	a.parse = parse;
-	ctx[0] = &a;
-	ctx[1] = (void *) cat;
-	(void) analyze_walker((Node *) parse, ctx);
+	/*
+	 * The analysis and the refresh of the partition lists take locks, which process invalidations
+	 * and can make this backend load the catalog cache again (every time under
+	 * debug_discard_caches): the cache that `a` points into is then gone.  The analysis is made
+	 * again with the new cache; the locks are held by then, and a few rounds are enough.
+	 */
+	for (int tries = 0;; tries++)
+	{
+		int64		generation = kingres_shard_catalog_generation();
+		int64		map_version = cat->map_version;
 
-	/* The partition lists must be as new as the catalog cache just read. */
-	foreach(lc, a.refs)
-		kingres_shard_ensure_fresh_partitions(((DistRef *) lfirst(lc))->dt->relid,
-											  cat->map_version);
+		memset(&a, 0, sizeof(a));
+		a.params = boundParams;
+		a.parse = parse;
+		ctx[0] = &a;
+		ctx[1] = (void *) cat;
+		(void) analyze_walker((Node *) parse, ctx);
+
+		/* The partition lists must be as new as the catalog cache just read. */
+		{
+			List	   *fresh = NIL;
+
+			foreach(lc, a.refs)
+				fresh = lappend_oid(fresh, ((DistRef *) lfirst(lc))->dt->relid);
+			foreach(lc, fresh)
+				kingres_shard_ensure_fresh_partitions(lfirst_oid(lc), map_version);
+		}
+
+		if (kingres_shard_catalog_generation() == generation)
+			break;
+		if (tries >= 4)
+			ereport(ERROR,
+					(errcode(ERRCODE_KINGRES_STALE_MAP),
+					 errmsg("the catalog of this node kept changing while the statement was analysed"),
+					 errhint("Repeat the statement.")));
+		cat = kingres_shard_catalog();
+	}
 
 	/*
 	 * The local part of a fanned-out statement or of a batch, which this backend runs
@@ -2230,7 +2480,15 @@ planner_hook_body(Query *parse, const char *query_string,
 	 * cannot make one (review P2B-01).
 	 */
 	if (this_is_local_part)
+	{
+		int64		pplace;
+
+		/* this node's own part of a partial aggregation returns partial states as the others do */
+		if (parse->commandType == CMD_SELECT && query_string != NULL &&
+			kingres_shard_parse_partial_marker(query_string, &pplace))
+			return plan_partial_fragment(parse, query_string, cursorOptions, boundParams, cat, a.ndist_rtes, true);
 		return pass_through(parse, query_string, cursorOptions, boundParams);
+	}
 
 	/*
 	 * A write to a reference table runs on every node; it takes no part in the
@@ -2428,7 +2686,7 @@ planner_hook_body(Query *parse, const char *query_string,
 			 * from the cache before it is used after it.
 			 */
 			if (parse->commandType == CMD_SELECT && kingres_shard_enable_pushdown &&
-				kingres_shard_enable_pushdown_closed)
+				(kingres_shard_enable_pushdown_closed || kingres_shard_enable_partial_aggregation))
 			{
 				pi = pushdown_prepare(parse, &why);
 				if (pi == NULL && why != NULL)

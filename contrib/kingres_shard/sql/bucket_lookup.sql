@@ -263,7 +263,10 @@ EXPLAIN (COSTS OFF) EXECUTE pk(2);
 -- Several keys of the same statement.
 EXPLAIN (COSTS OFF) SELECT v FROM p_int4 WHERE id = 1 AND id = 1;
 EXPLAIN (COSTS OFF) SELECT v FROM p_int4 WHERE id = 1 OR id = 3;
+-- the plan of the scan (step 7 answers an aggregate by partial aggregation; that is tested in t/139)
+SET kingres_shard.enable_partial_aggregation = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM p_int4 WHERE id IN (1, 2);
+RESET kingres_shard.enable_partial_aggregation;
 EXPLAIN (COSTS OFF) SELECT a.v FROM p_int4 a JOIN p_int8 b ON a.id = b.id WHERE a.id = 1 AND b.id = 1;
 EXPLAIN (COSTS OFF) SELECT a.v FROM p_int4 a JOIN p_int4 b ON a.v = b.v WHERE a.id = 1 AND b.id = 1;
 EXPLAIN (COSTS OFF) SELECT a.v FROM p_int4 a JOIN p_int4 b ON a.v = b.v WHERE a.id = 1 AND b.id = 3;

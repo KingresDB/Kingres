@@ -40,7 +40,8 @@ my $KS = qr/KS001|bucket map|map changed|no longer what it was|failed while a di
 sub setup3
 {
 	my ($prefix, %opt) = @_;
-	my @n = make_cluster($prefix, 3, %opt);
+	my @n = make_cluster($prefix, 3, extra => "kingres_shard.enable_partial_aggregation = off
+", %opt);
 	$n[0]->safe_psql('postgres', qq{
 		CREATE TABLE public.s (id int, g int, v text, c int DEFAULT 1, PRIMARY KEY (id, c));
 		SELECT kingres.create_distributed_table('public.s', 'id', bucket_count => 12);

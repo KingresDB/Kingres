@@ -653,7 +653,11 @@ fo_begin_scan(CustomScanState *node, EState *estate, int eflags)
 	kingres_shard_refuse_replica_role(s->colocation_id == 0 ?
 									  "a reference table" : "a distributed table on several shard groups");
 	if (s->kind == FO_KIND_INSERT_SELECT)
+	{
+		/* the window of the defence against a plan whose relations changed (P2D-02) */
+		kingres_shard_fault_point("insel_before_rels_check");
 		check_relations_unchanged(s);
+	}
 
 	tupdesc = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
 	s->ncols = tupdesc->natts;
@@ -1092,6 +1096,9 @@ run_all(KsFanoutState *s)
 	 */
 	if (s->all_rows)
 	{
+		/* the window of the placement check at the start of the run (P2D-02) */
+		if (s->kind == FO_KIND_INSERT_SELECT)
+			kingres_shard_fault_point("insel_before_start_check");
 		kingres_shard_placement_check_plan(s->colocation_id, s->plan_placement);
 		origin_placement = s->plan_placement;
 	}

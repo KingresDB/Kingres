@@ -37,6 +37,8 @@
 #include "access/htup_details.h"
 #include "access/parallel.h"
 #include "access/xact.h"
+#include "access/table.h"
+#include "catalog/pg_index.h"
 #include "catalog/pg_type_d.h"
 #include "commands/explain.h"
 #include "commands/explain_format.h"
@@ -52,6 +54,9 @@
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
+#include "optimizer/planner.h"
+#include "optimizer/prep.h"
+#include "optimizer/tlist.h"
 #include "optimizer/paths.h"
 #include "parser/parsetree.h"
 #include "utils/builtins.h"
@@ -59,7 +64,10 @@
 #include "utils/memutils.h"
 #include "utils/portal.h"
 #include "utils/rel.h"
+#include "utils/ruleutils.h"
+#include "utils/selfuncs.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 #include "utils/timestamp.h"
 #include "utils/wait_classes.h"
 
@@ -790,6 +798,7 @@ kingres_shard_fragset_next(KsFragSet *fs, PGresult **res_out, int *row_out, KsFr
 #define FS_PRIV_PRUNE		6	/* List of List (Integer relid, terms): the pruning of the restrictions */
 #define FS_PRIV_KIND		7	/* String: what is pushed */
 #define FS_PRIV_NCOLS		8	/* Integer: columns of a row */
+#define FS_PRIV_PARTIAL		9	/* Integer: 1 for a partial aggregation (the groups return partial states) */
 
 /* The rows one group returned, for EXPLAIN ANALYZE. */
 typedef struct FsGroupRows
@@ -811,6 +820,7 @@ typedef struct KsFragScanState
 	List	   *prune;			/* of KsFragPrune * */
 	char	   *kind;
 	int			ncols;
+	bool		partial;
 	FmgrInfo   *infuncs;
 	Oid		   *typioparams;
 	int32	   *typmods;
@@ -843,6 +853,8 @@ static TupleTableSlot *fs_exec_scan(CustomScanState *node);
 static void fs_end_scan(CustomScanState *node);
 static void fs_rescan(CustomScanState *node);
 static void fs_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es);
+static void fs_partial_paths(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_rel,
+							 GroupPathExtraData *extra);
 static void fs_upper_paths(PlannerInfo *root, UpperRelationKind stage, RelOptInfo *input_rel,
 						   RelOptInfo *output_rel, void *extra);
 
@@ -989,6 +1001,59 @@ fs_prune_items(PlannerInfo *root)
 	return items;
 }
 
+/*
+ * Does a unique index of the table (immediate, valid, without a predicate or an expression) lie within the columns
+ * the query groups or removes duplicates by?  Then every group of rows holds one row and the query returns as many
+ * rows as it reads whatever the statistics say: the estimates of the planner for the number of groups come from the
+ * rows of this node and are not to be trusted here.
+ */
+static bool
+fs_unique_key_covered(Oid relid, Bitmapset *attnos)
+{
+	Relation	rel = table_open(relid, NoLock);
+	List	   *il = RelationGetIndexList(rel);
+	ListCell   *lc;
+	bool		covered = false;
+
+	foreach(lc, il)
+	{
+		HeapTuple	tup = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(lfirst_oid(lc)));
+		Form_pg_index ix;
+		int			k;
+		bool		all = true;
+
+		if (!HeapTupleIsValid(tup))
+			continue;
+		ix = (Form_pg_index) GETSTRUCT(tup);
+		if (!ix->indisunique || !ix->indimmediate || !ix->indisvalid || ix->indnkeyatts < 1 ||
+			!heap_attisnull(tup, Anum_pg_index_indpred, NULL) ||
+			!heap_attisnull(tup, Anum_pg_index_indexprs, NULL))
+		{
+			ReleaseSysCache(tup);
+			continue;
+		}
+		for (k = 0; k < ix->indnkeyatts; k++)
+		{
+			int			attno = ix->indkey.values[k];
+
+			if (attno <= 0 || !bms_is_member(attno, attnos))
+			{
+				all = false;
+				break;
+			}
+		}
+		ReleaseSysCache(tup);
+		if (all)
+		{
+			covered = true;
+			break;
+		}
+	}
+	list_free(il);
+	table_close(rel, NoLock);
+	return covered;
+}
+
 static void
 fs_upper_paths(PlannerInfo *root, UpperRelationKind stage, RelOptInfo *input_rel,
 			   RelOptInfo *output_rel, void *extra)
@@ -1013,9 +1078,18 @@ fs_upper_paths(PlannerInfo *root, UpperRelationKind stage, RelOptInfo *input_rel
 
 	if (prev_create_upper_paths_hook)
 		prev_create_upper_paths_hook(root, stage, input_rel, output_rel, extra);
-	if (stage != UPPERREL_FINAL || pi == NULL || parse != pi->parse || root->query_level != 1)
+	if (pi == NULL || parse != pi->parse || root->query_level != 1)
 		return;
 	if (IsParallelWorker())
+		return;
+	if (pi->partial)
+	{
+		/* a partial aggregation is one more way to make the grouped relation (design 7.4) */
+		if (stage == UPPERREL_GROUP_AGG)
+			fs_partial_paths(root, input_rel, output_rel, (GroupPathExtraData *) extra);
+		return;
+	}
+	if (stage != UPPERREL_FINAL)
 		return;
 
 	target = root->upper_targets[UPPERREL_FINAL];
@@ -1042,10 +1116,11 @@ fs_upper_paths(PlannerInfo *root, UpperRelationKind stage, RelOptInfo *input_rel
 	 * as the table gives after its restrictions (a grouping or DISTINCT by a unique key): the groups would
 	 * return the rows that the scan returns, and the scan already ships only the restricted ones.
 	 */
-	if (list_length(pi->dist_relids) == 1)
+	if (list_length(pi->dist_relids) == 1 && pi->ndist == 1)
 	{
 		int			i;
 		double		in_rows = 0;
+		Index		dist_rti = 0;
 
 		for (i = 1; i < root->simple_rel_array_size; i++)
 		{
@@ -1053,8 +1128,31 @@ fs_upper_paths(PlannerInfo *root, UpperRelationKind stage, RelOptInfo *input_rel
 
 			if (r != NULL && r->reloptkind == RELOPT_BASEREL && r->rtekind == RTE_RELATION &&
 				list_member_oid(pi->dist_relids, root->simple_rte_array[i]->relid))
+			{
 				in_rows = Max(in_rows, r->rows);
+				dist_rti = (Index) i;
+			}
 		}
+		/* a grouping or DISTINCT by the columns of a unique index returns every row it reads, whatever the estimates say */
+		if (dist_rti > 0 && (parse->groupClause != NIL || parse->distinctClause != NIL))
+		{
+			List	   *clauses = parse->groupClause != NIL ? parse->groupClause : parse->distinctClause;
+			Bitmapset  *attnos = NULL;
+			ListCell   *lcg;
+
+			foreach(lcg, clauses)
+			{
+				Node	   *e = get_sortgroupclause_expr(lfirst_node(SortGroupClause, lcg), parse->targetList);
+
+				while (e != NULL && IsA(e, RelabelType))
+					e = (Node *) ((RelabelType *) e)->arg;
+				if (e != NULL && IsA(e, Var) && ((Var *) e)->varno == dist_rti && ((Var *) e)->varlevelsup == 0)
+					attnos = bms_add_member(attnos, ((Var *) e)->varattno);
+			}
+			if (attnos != NULL && fs_unique_key_covered(root->simple_rte_array[dist_rti]->relid, attnos))
+				return;
+		}
+		ereport(DEBUG1, (errmsg_internal("kingres_shard: fragment scan gain check: the table gives %.0f rows, the query returns %.0f", in_rows, base->rows)));
 		if (in_rows > 0 && base->rows >= 0.9 * in_rows)
 			return;
 	}
@@ -1118,6 +1216,238 @@ fs_upper_paths(PlannerInfo *root, UpperRelationKind stage, RelOptInfo *input_rel
 	add_path(output_rel, p);
 }
 
+/*
+ * fs_partial_paths
+ *
+ * Design 7.4.  At the grouped relation of a statement that pushdown_prepare found eligible for a partial aggregation:
+ *
+ *  1. the partial target, made as make_partial_grouping_target() of the planner makes it (that function is static):
+ *     the grouping columns, then every Var and Aggref that the other columns and HAVING need, each Aggref marked as the
+ *     first step of a two-step aggregation (it returns the transition state, bytea for an internal one);
+ *  2. the text every group runs: the query with the select list of the unmarked partial target, the grouping kept,
+ *     HAVING, ORDER BY and LIMIT left to this node;  the origin parses it once more with the rule of the groups;
+ *  3. a custom path that returns the partial rows of the groups, and above it the planner's own final aggregation
+ *     (AGGSPLIT_FINAL_DESERIAL: it deserializes and combines the states, applies HAVING, runs the final functions).
+ *
+ * Only when the planner itself finds the aggregation splittable (GROUPING_CAN_PARTIAL_AGG: no DISTINCT or ORDER BY inside
+ * a call, a combine function, serialization of internal states, send and receive functions where array_agg needs them).
+ */
+static void
+fs_partial_paths(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_rel, GroupPathExtraData *extra)
+{
+	KsPushdownInfo *pi = current_info;
+	Query	   *parse = root->parse;
+	PathTarget *gtarget = output_rel->reltarget;
+	PathTarget *ptarget;
+	List	   *non_group = NIL;
+	List	   *non_group_exprs;
+	List	   *unmarked;
+	Path	   *base = NULL;
+	Path	   *cpath_p;
+	CustomPath *cpath;
+	AggClauseCosts final_costs;
+	Query	   *ship;
+	List	   *tlist = NIL;
+	KsParamRenumber prn = {NIL};
+	const char *why = NULL;
+	char	   *body;
+	int			nest;
+	int			resno = 1;
+	int			i;
+	ListCell   *lc;
+	const KsCatalog *cat;
+	const KsColocation *coloc;
+	List	   *prune;
+	List	   *frags;
+	bool		local = false;
+	int			nremote;
+	int			ntotal;
+	double		startup;
+	double		total;
+	double		ngroups;
+	double		prows;
+	List	   *info;
+	List	   *pids = NIL;
+
+#define PA_NO(msg) do { ereport(DEBUG1, (errmsg_internal("kingres_shard: no partial aggregation: %s", (msg)))); return; } while (0)
+
+	if (!kingres_shard_enable_partial_aggregation)
+		return;
+	if (!(extra->flags & GROUPING_CAN_PARTIAL_AGG))
+		PA_NO("the planner does not find the aggregation splittable");
+	if (parse->groupingSets != NIL || gtarget == NULL)
+		PA_NO("grouping sets");
+
+	/* 1. the partial target */
+	ptarget = create_empty_pathtarget();
+	i = 0;
+	foreach(lc, gtarget->exprs)
+	{
+		Expr	   *expr = (Expr *) lfirst(lc);
+		Index		sgref = get_pathtarget_sortgroupref(gtarget, i);
+
+		if (sgref && root->processed_groupClause &&
+			get_sortgroupref_clause_noerr(sgref, root->processed_groupClause) != NULL)
+			add_column_to_pathtarget(ptarget, expr, sgref);
+		else
+			non_group = lappend(non_group, expr);
+		i++;
+	}
+	if (extra->havingQual != NULL)
+		non_group = lappend(non_group, extra->havingQual);
+	non_group_exprs = pull_var_clause((Node *) non_group,
+									  PVC_INCLUDE_AGGREGATES | PVC_RECURSE_WINDOWFUNCS | PVC_INCLUDE_PLACEHOLDERS);
+	add_new_columns_to_pathtarget(ptarget, non_group_exprs);
+	if (ptarget->exprs == NIL)
+		PA_NO("the partial target is empty");
+	unmarked = list_copy(ptarget->exprs);
+	foreach(lc, ptarget->exprs)
+	{
+		Expr	   *expr = (Expr *) lfirst(lc);
+
+		if (IsA(expr, Aggref))
+		{
+			Aggref	   *newagg = (Aggref *) palloc(sizeof(Aggref));
+
+			memcpy(newagg, expr, sizeof(Aggref));
+			mark_partial_aggref(newagg, AGGSPLIT_INITIAL_SERIAL);
+			lfirst(lc) = newagg;
+		}
+	}
+	set_pathtarget_cost_width(root, ptarget);
+
+	/* 2. the text */
+	ship = copyObject(pi->ship);
+	i = 0;
+	foreach(lc, unmarked)
+	{
+		TargetEntry *te = makeTargetEntry((Expr *) copyObject(lfirst(lc)), (AttrNumber) resno++, NULL, false);
+
+		te->ressortgroupref = get_pathtarget_sortgroupref(ptarget, i);
+		tlist = lappend(tlist, te);
+		i++;
+	}
+	/* a column that only groups is not returned, and the text still groups by it */
+	foreach(lc, ship->groupClause)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		bool		found = false;
+		ListCell   *lt;
+
+		foreach(lt, tlist)
+			if (lfirst_node(TargetEntry, lt)->ressortgroupref == sgc->tleSortGroupRef)
+				found = true;
+		if (!found)
+		{
+			Node	   *ge = get_sortgroupclause_expr(sgc, pi->ship->targetList);
+			TargetEntry *te = makeTargetEntry((Expr *) copyObject(ge), (AttrNumber) resno++, NULL, true);
+
+			te->ressortgroupref = sgc->tleSortGroupRef;
+			tlist = lappend(tlist, te);
+		}
+	}
+	ship->targetList = tlist;
+	ship->havingQual = NULL;
+	ship->sortClause = NIL;
+	ship->limitOffset = NULL;
+	ship->limitCount = NULL;
+	ship = query_tree_mutator(ship, kingres_shard_renumber_params, &prn, 0);
+	nest = kingres_shard_set_transmission_modes();
+	body = pg_get_querydef(ship, false);
+	kingres_shard_reset_transmission_modes(nest);
+	if (!kingres_shard_text_accepted(body, ship, true, &why))
+	{
+		ereport(DEBUG1, (errmsg_internal("kingres_shard: a partial aggregation is not shipped: the groups would not accept its text: %s", why)));
+		return;
+	}
+	foreach(lc, prn.ids)
+		pids = lappend(pids, makeInteger(lfirst_int(lc)));
+
+	/* 3. the cost, the custom path and the final aggregation */
+	foreach(lc, input_rel->pathlist)
+	{
+		Path	   *c = (Path *) lfirst(lc);
+
+		if (base == NULL || c->total_cost < base->total_cost)
+			base = c;
+	}
+	if (base == NULL)
+		PA_NO("the relation has no path");
+	cat = kingres_shard_catalog();
+	if (!cat->present)
+		PA_NO("no catalog");
+	coloc = kingres_shard_lookup_colocation(pi->colocation_id);
+	if (coloc == NULL)
+		PA_NO("its colocation group is not known");
+	prune = fs_prune_items(root);
+	frags = kingres_shard_frag_choose(coloc, cat, prune, root->glob->boundParams, &local, NULL, NULL);
+	nremote = list_length(frags);
+	ntotal = nremote + (local ? 1 : 0);
+	if (ntotal == 0)
+		PA_NO("no group to ask");
+
+	if (parse->groupClause == NIL)
+		ngroups = 1;
+	else
+		ngroups = estimate_num_groups(root,
+									  get_sortgrouplist_exprs(root->processed_groupClause, root->processed_tlist),
+									  input_rel->rows, NULL, NULL);
+	prows = clamp_row_est(Min(ngroups * ntotal, Max(input_rel->rows, 1.0)));
+	startup = 100.0 * nremote;
+	total = startup + Max(base->total_cost - startup, 0.0) / ntotal +
+		prows * (cpu_tuple_cost * 2.0 + 0.02) * nremote / ntotal;
+
+	cpath = makeNode(CustomPath);
+	cpath->path.pathtype = T_CustomScan;
+	cpath->path.parent = output_rel;
+	cpath->path.pathtarget = ptarget;
+	cpath->path.param_info = NULL;
+	cpath->path.parallel_aware = false;
+	cpath->path.parallel_safe = false;
+	cpath->path.parallel_workers = 0;
+	cpath->path.pathkeys = NIL;
+	cpath->path.rows = prows;
+	cpath->path.disabled_nodes = 0;
+	cpath->path.startup_cost = startup;
+	cpath->path.total_cost = total;
+	cpath->flags = 0;
+	cpath->custom_paths = NIL;
+	cpath->custom_restrictinfo = NIL;
+	info = list_make2(makeString(body), pids);
+	cpath->custom_private = list_make2(prune, info);
+	cpath->methods = &fs_path_methods;
+	cpath_p = (Path *) cpath;
+
+	if (extra->partial_costs_set)
+		final_costs = extra->agg_final_costs;
+	else
+	{
+		MemSet(&final_costs, 0, sizeof(final_costs));
+		get_agg_clause_costs(root, AGGSPLIT_FINAL_DESERIAL, &final_costs);
+	}
+	if (parse->groupClause == NIL)
+		add_path(output_rel, (Path *) create_agg_path(root, output_rel, cpath_p, output_rel->reltarget,
+													  AGG_PLAIN, AGGSPLIT_FINAL_DESERIAL, NIL,
+													  (List *) extra->havingQual, &final_costs, 1));
+	else
+	{
+		if (extra->flags & GROUPING_CAN_USE_HASH)
+			add_path(output_rel, (Path *) create_agg_path(root, output_rel, cpath_p, output_rel->reltarget,
+														  AGG_HASHED, AGGSPLIT_FINAL_DESERIAL,
+														  root->processed_groupClause,
+														  (List *) extra->havingQual, &final_costs, ngroups));
+		if ((extra->flags & GROUPING_CAN_USE_SORT) && root->group_pathkeys != NIL)
+		{
+			Path	   *sorted = (Path *) create_sort_path(root, output_rel, cpath_p, root->group_pathkeys, -1.0);
+
+			add_path(output_rel, (Path *) create_agg_path(root, output_rel, sorted, output_rel->reltarget,
+														  AGG_SORTED, AGGSPLIT_FINAL_DESERIAL,
+														  root->processed_groupClause,
+														  (List *) extra->havingQual, &final_costs, ngroups));
+		}
+	}
+}
+
 static Plan *
 fs_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path, List *tlist,
 					List *clauses, List *custom_plans)
@@ -1130,11 +1460,24 @@ fs_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path, L
 	List	   *prune = NIL;
 	List	   *scan_tlist = NIL;
 	ListCell   *lc;
+	const char *sql;
 
 	if (pi == NULL || root->parse != pi->parse)
 		elog(ERROR, "a fragment scan was planned for a statement that was not decided");
-	foreach(lc, pi->param_ids)
-		param_ids = lappend(param_ids, makeInteger(lfirst_int(lc)));
+	if (pi->partial)
+	{
+		/* the path made the text, with the select list of the partial target (fs_partial_paths) */
+		List	   *info = (List *) lsecond(best_path->custom_private);
+
+		sql = strVal(linitial(info));
+		param_ids = (List *) lsecond(info);
+	}
+	else
+	{
+		sql = pi->sql;
+		foreach(lc, pi->param_ids)
+			param_ids = lappend(param_ids, makeInteger(lfirst_int(lc)));
+	}
 	foreach(lc, pi->dist_relids)
 		dist = lappend(dist, makeInteger((int) lfirst_oid(lc)));
 	foreach(lc, prune_items)
@@ -1157,14 +1500,15 @@ fs_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path, L
 	cscan->custom_scan_tlist = scan_tlist;
 	cscan->custom_plans = NIL;
 	cscan->custom_relids = bms_copy(root->all_baserels);
-	cscan->custom_private = list_make5(makeString(pstrdup(pi->sql)), param_ids,
+	cscan->custom_private = list_make5(makeString(pstrdup(sql)), param_ids,
 									   makeInteger(pi->colocation_id),
 									   makeString(psprintf(INT64_FORMAT, pi->place)),
 									   makeString(relations_signature(pi->relids)));
 	cscan->custom_private = lappend(cscan->custom_private, dist);
 	cscan->custom_private = lappend(cscan->custom_private, prune);
 	cscan->custom_private = lappend(cscan->custom_private, makeString(pstrdup(pi->kind)));
-	cscan->custom_private = lappend(cscan->custom_private, makeInteger(pi->ncols));
+	cscan->custom_private = lappend(cscan->custom_private, makeInteger(pi->partial ? list_length(tlist) : pi->ncols));
+	cscan->custom_private = lappend(cscan->custom_private, makeInteger(pi->partial ? 1 : 0));
 	cscan->methods = &fs_scan_methods;
 	return &cscan->scan.plan;
 }
@@ -1200,6 +1544,7 @@ fs_create_scan_state(CustomScan *cscan)
 	}
 	s->kind = pstrdup(strVal(list_nth(p, FS_PRIV_KIND)));
 	s->ncols = intVal(list_nth(p, FS_PRIV_NCOLS));
+	s->partial = intVal(list_nth(p, FS_PRIV_PARTIAL)) != 0;
 	return (Node *) s;
 }
 
@@ -1346,7 +1691,8 @@ fs_local_open(void *arg)
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
 	nest = kingres_shard_set_transmission_modes();
-	portal = kingres_shard_spi_local_part_cursor(s->sql, n, argtypes, values, nulls);
+	portal = kingres_shard_spi_local_part_cursor(s->partial ? psprintf("%s%s", kingres_shard_partial_marker(s->plan_placement), s->sql) : s->sql,
+												 n, argtypes, values, nulls);
 	kingres_shard_reset_transmission_modes(nest);
 
 	/*
@@ -1489,7 +1835,7 @@ fs_start(KsFragScanState *s)
 	st.ntables = nrels;
 	st.relids = relids;
 	st.plan_placement = s->plan_placement;
-	st.marker = kingres_shard_query_marker(s->plan_placement);
+	st.marker = s->partial ? kingres_shard_partial_marker(s->plan_placement) : kingres_shard_query_marker(s->plan_placement);
 	st.sql = s->sql;
 	st.nparams = nparams;
 	st.ptypes = types;

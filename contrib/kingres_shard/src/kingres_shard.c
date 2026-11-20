@@ -79,6 +79,7 @@ int			kingres_shard_recovery_interval = 30;
 bool		kingres_shard_enable_distributed_scan = true;
 bool		kingres_shard_enable_pushdown = true;
 bool		kingres_shard_enable_pushdown_closed = true;
+bool		kingres_shard_enable_partial_aggregation = true;
 bool		kingres_shard_enable_bulk_routing = true;
 bool		kingres_shard_enable_colocated_insert_select = true;
 bool		kingres_shard_enable_copy_routing = true;
@@ -246,6 +247,14 @@ _PG_init(void)
 							 "Let a closed read (every output row depends on the rows of one shard group) be run whole by every group.",
 							 "A grouping, a DISTINCT or a join on the distribution key, with no row that depends on two groups.  When off, such a read is answered by the row-moving distributed scan.",
 							 &kingres_shard_enable_pushdown_closed,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("kingres_shard.enable_partial_aggregation",
+							 "Let every shard group aggregate its own rows and send the partial states, which this node combines.",
+							 "An aggregate or a grouping that is not closed (it does not contain a distribution key) is run in two steps: each group returns one partial row per group of rows, and this node combines them.  When off, such a read is answered by the row-moving distributed scan.",
+							 &kingres_shard_enable_partial_aggregation,
 							 true,
 							 PGC_USERSET, 0,
 							 NULL, NULL, NULL);

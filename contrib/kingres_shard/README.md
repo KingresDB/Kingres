@@ -776,7 +776,8 @@ the files of the extension, because the dump creates the extension.
 | `kingres_shard.enable_distributed_scan` | on | When off, a `SELECT` that spans shard groups raises the phase 1 error instead of reading the other groups (to forbid slow cross-group queries). |
 | `kingres_shard.scan_fetch_size` | 1000 | Rows requested from another group at a time by the distributed scan. |
 | `kingres_shard.enable_pushdown` | on | Master switch of the pushdown paths of a read (step 6: closed queries). Off: a read that spans shard groups is answered by the row-moving distributed scan, as before. `USERSET`; it chooses among plans that give the same answer, and grants nothing. |
-| `kingres_shard.enable_pushdown_closed` | on | Off: a closed query (see "Closed queries, run whole by every group") is not shipped; the scan answers. `USERSET`. |
+| `kingres_shard.enable_pushdown_closed` | on | Off: a closed query (see "Closed queries, run whole by every group") is not shipped (the partial aggregation has its own switch); the scan answers. `USERSET`. |
+| `kingres_shard.enable_partial_aggregation` | on | Off: an aggregate or a grouping that is not closed is not run in two steps (see "Partial aggregation"); the scan answers. `USERSET`. |
 | `kingres_shard.enable_bulk_routing` | on | Off: an `INSERT` that goes to several shard groups is refused as in 0.5 (a multi-row `VALUES`, `INSERT ... SELECT`, a single row whose key is not a constant). A single row with a constant key never needed the router and is not affected. `USERSET`; it grants nothing. |
 | `kingres_shard.enable_colocated_insert_select` | on | Off: a colocated `INSERT ... SELECT` is not shipped whole: it goes through the row router when it can (no `ON CONFLICT DO UPDATE`) and is refused when it cannot. `USERSET`; it chooses among statements that give the same answer, and grants nothing. A cached plan keeps the path it was made with (as for every planner setting). |
 | `kingres_shard.enable_copy_routing` | on | Off: `COPY ... FROM` into a distributed table of a cluster with several groups is refused as in 0.5. `USERSET`. |
@@ -799,7 +800,7 @@ the files of the extension, because the dump creates the extension.
 | `kingres_shard.node_timeout` | 60s | The longest the phases that cannot be left waiting may wait for a node (`COMMIT PREPARED`, the cleanup after an abort, savepoint rollbacks and releases, the recovery worker), the longest any statement of a control-plane call (`promote_node`, `add_node`, `remove_node`, `sync_catalog`, `rotate_secret`, `recover_prepared_transactions`, `create_distributed_table`) waits for a node, and the longest such a call waits for another call that changes the catalog (then `KS008`); the node's own lock wait in such a call ends at three quarters of it (README, "Bounds that apply to every call"). And, as `tcp_user_timeout` and keepalives, the time after which a connection to a node that does not answer at all is dead. The cancel request sent when a wait runs out is bounded too (a third of this value, at most `node_connect_timeout`, at least a second), so a node whose postmaster is stopped delays the committing session by `node_timeout` plus that, not until it resumes (S3-07). The recovery worker takes the value of the server configuration, whatever `ALTER DATABASE ... SET` says (S3-16); so for `node_connect_timeout`. |
 | `kingres_shard.forwarded` | off | Set by the router on the sessions it opens, together with `kingres_shard.forward_token`; fixed at connection time (`PGC_BACKEND`). A client that sets it without the token is refused. See "The forwarded flag" below. |
 | `kingres_shard.forward_token` | hidden | The proof of a forwarded session; never shown. |
-| `kingres_shard.fault_injection` | empty | Developer setting, superuser only: fails the commit protocol at a named point (`<point>:kill`, `:error`, `:wait:<file>`; points `before_prepare`, `after_first_prepare`, `after_prepare`, `after_log`, `after_commit`, `between_commit_prepared`; 0.5 adds `commit_waits_for_barrier`, `promote_before_change`, `promote_after_first_push`, `promote_after_push`, `restore_barrier_up`, `restore_all_quiet` and `recovery_before_resolve` (recovery has decided and is about to send COMMIT PREPARED or ROLLBACK PREPARED); `server_major:value:<n>` and `peer_major:value:<n>` make this node, or the nodes it connects to, report another PostgreSQL major to the checks that keep one major per cluster). Used by the tests; it adds no capability a superuser does not have. |
+| `kingres_shard.fault_injection` | empty | Developer setting, superuser only: fails the commit protocol at a named point (`<point>:kill`, `:error`, `:wait:<file>`, `:waitinv:<file>` (the same, and then the backend takes the invalidations that committed meanwhile: a test changes the catalog of the node behind the statement); points `before_prepare`, `after_first_prepare`, `after_prepare`, `after_log`, `after_commit`, `between_commit_prepared`; 0.5 adds `commit_waits_for_barrier`, `promote_before_change`, `promote_after_first_push`, `promote_after_push`, `restore_barrier_up`, `restore_all_quiet` and `recovery_before_resolve` (recovery has decided and is about to send COMMIT PREPARED or ROLLBACK PREPARED); `server_major:value:<n>` and `peer_major:value:<n>` make this node, or the nodes it connects to, report another PostgreSQL major to the checks that keep one major per cluster). Used by the tests; it adds no capability a superuser does not have. |
 
 ### Node connection options
 
@@ -1473,7 +1474,7 @@ comment `/* kingres:query-fragment place=<n> */`; a group refuses a statement th
 and a stale placement with `KS001`.  Reading is checked as the scan is (the placement of the colocation group
 before and after the cursors are opened, the partitions of every table, one node per group in a transaction).
 
-Not shipped (the scan answers): a grouping or `DISTINCT` that does not contain the key, an aggregate with no
+Not shipped as a closed query (the scan answers, or the partial aggregation below does for an aggregate or a grouping): a grouping or `DISTINCT` that does not contain the key, an aggregate with no
 `GROUP BY`, grouping sets, window functions, `DISTINCT ON`, aggregates whose result depends on the order of the
 rows (`array_agg`, `string_agg`, floating point sums), a function that is not built in and immutable (`now()`),
 a conversion through the text form of a value, a sub-select, a CTE, a view, a local table, a table of another
@@ -1492,11 +1493,73 @@ object).  `FROM ONLY` a distributed table is refused on every path ("FROM ONLY i
 A closed query that returns about as many rows as it reads (a grouping or `DISTINCT` by a unique key of one table) is
 left to the scan: the groups would return the same rows.  `EXPLAIN ANALYZE` of a fragment scan shows the time to the
 first batch of each group.
+The test is not the planner's estimate of the number of groups (it comes from the rows of this node): a grouping or `DISTINCT`
+whose columns contain every column of a unique index of the table (immediate, valid, no predicate, no expression) is
+left to the scan whatever the statistics say.  `DEBUG1` shows the two numbers it compared.
+
+**What a value of a `reg*` type means.**  On the paths that evaluate at this node (the scan, a fragment scan that is not
+shipped, the router, a colocated `INSERT ... SELECT` that is not shipped) it is the value this node computes: the OID
+of this node's object.  A statement that names one key goes to its group as the text the user wrote (the 2a path,
+unchanged) and that group resolves the names in it itself: a raw OID that one node computed and stored in a column is
+not an object of another node, and such a column is not portable between nodes.  t/137 uses a table whose OID differs on
+every node and runs every node as the origin.
+
 Switches: `kingres_shard.enable_pushdown` and `kingres_shard.enable_pushdown_closed`.  Fault points of the tests:
 `frag_before_probe`, `frag_after_probe_before`, `frag_after_declare`, `frag_local_open`, `frag_after_probe_after`,
-`frag_first_fetch`, `frag_before_fetch`, `frag_wait_batch`, `frag_local_fetch`, `frag_declared_g<n>`.  A statement
+`frag_first_fetch`, `frag_before_fetch`, `frag_wait_batch`, `frag_local_fetch`, `frag_declared_g<n>`; the windows of the defences against a catalog that changed after the plan (t/136): `insel_before_rels_check`, `insel_before_start_check`, `insel_before_text_parse`, `query_before_text_parse`.  A statement
 that is cancelled, or fails, while a group runs its part asks the group to stop it (bounded), so a group that is
 blocked by a lock does not hold the end of the statement for `node_timeout`.
+
+**Under `debug_discard_caches`.**  A node runs under the setting (every cache is discarded at every lock and every
+catalog access) as it runs without it.  The cache of the catalog that was replaced is kept until the end of the
+transaction, so that the pointers a statement holds stay valid (a node, a distributed table, a colocation group), and the
+planner makes its analysis again with the new cache when the cache changed under it.  `add_node` and the check of the
+synchronous standbys of the other primaries copy what they need before they connect.  t/135 runs a cluster under the setting.
+
+## Partial aggregation (phase 2b, step 7)
+
+An aggregate or a grouping that is not closed (it does not contain a distribution key: `SELECT count(*) FROM t`, `SELECT a,
+sum(b) FROM t GROUP BY a`, the same over a join of tables of one colocation group on their keys, or with a reference table)
+is run in two steps.  Every group aggregates its own rows and returns one row per group of rows, with the transition
+state of each aggregate (a state of type `internal` is returned serialized, as `bytea`, by the aggregate's own
+serialization function); the node that runs the statement combines the states with the planner's own final aggregation
+(`Finalize HashAggregate`, `Finalize GroupAggregate` or `Finalize Aggregate` in `EXPLAIN`, over the `Kingres Fragment
+Scan`), applies `HAVING`, runs the final functions, and everything above (`ORDER BY`, `LIMIT`, a window function over
+the result) is planned by PostgreSQL as usual.  The marker of the text a group receives is
+`/* kingres:partial-fragment place=<n> */`; a group refuses what its rule does not accept (a statement with `HAVING`,
+`ORDER BY`, `LIMIT`, `DISTINCT`, a window, an aggregate that cannot be split, an aggregate inside an expression) with
+`0A000`, and a stale placement with `KS001`, as for a closed query.  The placement check, the cursors, the local part of
+this node, pruning, cancel and failover are those of the fragment scan.
+
+What is split: the built-in aggregates that have a combine function and, for an internal state, a serialization pair
+(`any_value`, `array_agg`, `avg`, `bit_and`, `bit_or`, `bit_xor`, `bool_and`, `bool_or`, `corr`, `count`, `covar_pop`,
+`covar_samp`, `every`, `max`, `min`, `range_intersect_agg`, the `regr_*` family, `stddev`, `stddev_pop`, `stddev_samp`,
+`string_agg`, `sum`, `var_pop`, `var_samp`, `variance`), with `FILTER`, over any type that is shipped.  The test t/139
+recomputes this list from `pg_aggregate` and fails when a release changes it.  Not split (the scan answers, the answer is the
+same): `DISTINCT` or `ORDER BY` inside the call, ordered-set and hypothetical-set aggregates, `json_agg`, `jsonb_agg`,
+the `*_object_agg` family, `range_agg`, `xmlagg` (no combine function), grouping sets, a window function in the same query
+level, `DISTINCT` above the aggregation, a column of type `money`, an aggregate of an extension (the aggregates of
+`kingres_sketch` are the next step: see below), a table of another colocation group, a local table, a sub-select.
+
+**Floating point and order.**  The partial states are combined in the order the groups answer, as in a parallel plan.  A
+floating point `sum`, `avg`, `stddev`, `variance`, `corr` or `regr_*` can therefore differ from the single node's in the
+last digits, and between two runs of one query; `array_agg` and `string_agg` without `ORDER BY` give the elements in
+an order that SQL leaves open.  (The closed query of step 6 never ships such an aggregate: it is run by the scan.)
+`kingres_shard.enable_partial_aggregation = off` restores the scan.  The tests compare a float to nine digits and sort
+the elements of an array.
+
+Switch: `kingres_shard.enable_partial_aggregation` (on; `enable_pushdown` is the master switch).  `DEBUG1` says why a
+statement is not split.
+
+**What an aggregate of an extension needs (not built).**  `kingres_sketch` has `aggcombinefn`, `aggserialfn` and
+`aggdeserialfn` and a state of type `internal`, so the planner's own test (`GROUPING_CAN_PARTIAL_AGG`) already passes, and
+the groups would return the serialized state as `bytea`.  What is missing is the rule that lets the call be shipped at all
+(design 5.5 and step 8): a compiled-in list of the objects of an allowed extension (`ext_object_ok`) that replaces the
+"built in" test of `kingres_shard_aggregate_partial_ok` and of the shippability walker for the aggregate, its argument
+types and its operators; the name and version of every extension a statement uses in the marker (`ext=`), checked by the
+group (a node at another version is `KS001` with the detail); the narrowing setting `shippable_extensions`; and tests
+with the extension installed on every node, at one version and at two.
+
 
 ## Limitations in phase 2a
 

@@ -30,7 +30,8 @@ use Test::More;
 use KingresShardTest qw(run_sql);
 use KingresShardCompare;
 
-my $c = KingresShardCompare->new('pgen');
+my $c = KingresShardCompare->new('pgen', extra => "kingres_shard.enable_partial_aggregation = off" . "
+");
 my @nodes = $c->nodes;
 my $single = $c->single;
 my $FS = 'Kingres Fragment Scan';

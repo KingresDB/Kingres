@@ -70,6 +70,10 @@ sub make_node
 	  . "kingres_shard.recovery_interval = $interval\n"
 	  . "kingres_shard.deadlock_check_interval = " . ($opt{deadlock_interval} // 0) . "\n"
 	  . "kingres_shard.deadlock_confirm_delay = " . ($opt{deadlock_confirm} // 200) . "\n";
+	# The tests of the scan of phase 2a, of the fragments and of the closed query test those paths; a read that
+	# aggregates would take the partial aggregation of step 7 instead.  A test of step 7 turns it on
+	# (t/139: extra => "kingres_shard.enable_partial_aggregation = on", which comes later in the file).
+	$conf .= "kingres_shard.enable_partial_aggregation = off\n";
 	$conf .= logical_settings() if $opt{logical};
 	$conf .= $opt{extra} if defined $opt{extra};
 	# tcp: the node also listens on 127.0.0.1 and trusts connections from there, so that

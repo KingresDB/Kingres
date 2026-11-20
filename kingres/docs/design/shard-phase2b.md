@@ -3117,3 +3117,82 @@ and ONLY works.
 more of the rows the table gives after its restrictions is not offered (no gain: a grouping or DISTINCT by a unique key).
 The tests t/124 to t/127 therefore use tables that hold every key twice (or a primary key of (id, copy)), and the cases that
 return as many rows as they read have no path assertion.
+
+### Step 7 (partial aggregation), with the rest of the review of step 5 and the crash under cache discards (2026-11-20)
+
+**The crash under debug_discard_caches (answer to the question of the coordinator).**  It is the extension, not PostgreSQL.  A bare
+server (initdb, no preload) and a server that only preloads kingres_shard and has the extension created run SELECT, CREATE TABLE and
+the catalog functions under debug_discard_caches = 1 without a crash.  The crash needs a cluster: a SIGSEGV handler
+(preloaded library, backtrace + addr2line on the build with -g) showed
+
+  1. kingres.add_node -> require_primaries_can_commit (node_admin.c) walked `cat->nodes` and connected to each node in the loop; the
+     connection takes locks, a lock processes invalidations, the catalog cache of the extension was loaded again and freed, and the
+     loop read the freed list;
+  2. an INSERT of several rows -> planner_hook_body -> kingres_shard_plan_row_router -> kingres_shard_placement_hash(dt->coloc):
+     `dt` was taken from the cache by the analysis, kingres_shard_placement_hash() calls kingres_shard_catalog() first, the cache was
+     invalid at that moment (a lock processed an invalidation), it was loaded again and the old context freed, `coloc` was freed memory.
+
+The earlier note (stack overflow in the loader) was wrong: the address of the fault is 0 and the loader is guarded against re-entry.
+The fix is in the extension (commit ca00f81bd5): a replaced cache is retired and freed at the end of the transaction, require_primaries_can_commit
+copies, the planner analyses again when the generation changed.  t/135 runs a whole cluster under the setting on both majors.  With the
+retire reverted (mutant) the test is killed.
+
+**P2D-02.**  The fault action `waitinv` (fault.c) is new: wait for the file, then AcceptInvalidationMessages().  Without it the origin
+does not see the catalog change that the test made while the statement waited (the lock it holds on the relations is already
+granted, so nothing processes the invalidation) and the "cache is fresh, the plan is old" state that the defences exist for cannot be
+produced.  The test changes the catalog of the origin by hand (bucket_map, dist_table); the groups agree with the plan.  Real moves
+cannot be used: the switch of a move waits for the locks of the statement.
+
+**P2D-01, 2a.**  A statement that names one key is forwarded to its group as the text the user wrote, so the group resolves the
+names itself (reg* values are names there).  t/137 first expected the origin's OID there and failed for two of three origins;
+the meaning on that path is the name, and it is what the README now says.  The review's criterion (one meaning on the paths that
+evaluate at the origin) holds on the scan, the fragment scan, the router and the shipped INSERT ... SELECT.
+
+**C, the no-gain rule.**  The first version compared two estimates that do not agree (rows of the table: all groups; rows of the grouping:
+statistics of the local partitions).  t/138 (grouping by the primary key of 8000 rows) showed it shipped.  The rule now asks the
+catalog for a unique index within the grouping columns.
+
+**Mutant tables are only valid with a clean build.**  The first runs of the mutant scripts (mut.sh, mut19.sh) synced the mutated copy
+with rsync -a over a work area that kept the objects of the previous mutant; the mtimes of the restored sources were older than the
+objects, so make kept the mutated object of an earlier mutant and every later mutant inherited it (M07 to M10 of the section 5 table were
+"killed" by the M06 mutant that came before them).  The scripts now run `clean build` for every mutant and run the test files one
+at a time, stopping at the first failure; every table in the report is from the second run.
+
+**D, partial aggregation (design 7), what differs from the text of the design.**
+- The partial target and the text are made in one place, fs_partial_paths (the hook at UPPERREL_GROUP_AGG), from the planner's own
+  grouping target; pushdown_prepare only decides eligibility (shape and aggregates) and keeps a copy of the query (`ship`).  The design
+  has the select list "replaced by the unmarked expressions of the partial target"; so does this, and a grouping column that is not in the
+  partial target stays in GROUP BY as a resjunk entry of the deparsed query.
+- The aggregate rule of the group is kingres_shard_partial_fragment_analyze (pushdown analysis, shape, no HAVING/ORDER BY/LIMIT, no
+  aggregate inside an expression, the shippability walker with allow_order_aggs).  It checks the catalog itself (combine function,
+  serialization pair, normal kind, built in), not only the planner flag, because a forged fragment must not rely on the sender's flag.
+- DISTINCT after the aggregation, a window in the same level and grouping sets are refused by the shape rule (the scan answers).  The
+  design allows a window above an aggregate (A6) at the origin; it is not offered yet.
+- A Group node at the top of the plan (a grouping with no aggregate, sorted) is accepted by partialize_plan and left as it is.
+- Float and order-sensitive aggregates are accepted for the partial path only (A3).  The closed path still refuses them (step 6, unchanged).
+- The classification test is part of t/139 (section C2), not a pg_regress file: the harness already compares on both majors and the list is the same on 18.7 and 19rc2.
+- enable_pushdown_closed no longer disables the partial path (pushdown_prepare is called when either switch is on and the closed branch
+  honours its own switch).  t/124 to t/127 run with enable_partial_aggregation = off: what they call "not shipped" is the closed rule.
+- 2a path and reg*: see above.
+
+**A kingres_sketch aggregate (step 8, not built).**  What it needs is listed in the README ("What an aggregate of an extension needs").
+
+**Measurement after the no-gain rule asks for a unique key** (3 million rows, PostgreSQL 18.7,
+three runs each): grouping by the key of 3 million rows 27.4 s by the scan, which is chosen;
+of 30 000 rows 0.35 s against 0.34 s, the scan chosen; a join on the key with a filter 0.27 s by
+the scan against 0.20 s as a fragment; a grouped join 1.95 s against 1.65 s. The loss of 25 percent
+on a grouping by the primary key is gone.
+
+**Mutants.** Of thirty mutants of the rules of section 5, five are killed by the tests of reads
+(t/124 to t/127); of the rest the rules of inserts that a read cannot reach are killed by t/136
+(M07, M09, M10, M27) and the regression tests (M04, M12), and two (M02, M20) are made redundant by
+the walker of shippability for reads. Of eleven mutants of partial aggregation eight are killed and
+three are equivalent (a check behind which another branch also refuses, a switch the hook checks
+again, a sorted path that remains when the hashed one is removed).
+
+**What the full run found after step 7.** `min()` and `max()` of an indexed column without
+`GROUP BY` are answered by an index probe with no aggregation node; the partial plan accepts a
+result with no left tree when every aggregate has no final function and a state of the result
+type. A join of a table with itself was never shipped (the rule counted tables, not references).
+The test harness writes `enable_partial_aggregation = off`, so that the older tests keep testing
+the scan, the fragment scan and closed queries; t/139 turns it on.

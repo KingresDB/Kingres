@@ -78,9 +78,9 @@ is(direct('SELECT count(*) FROM public.t WHERE id >= 200 AND b = 5'), 61, 'C: wi
 ($out, $err) = replanned("INSERT INTO public.t VALUES (300, 7), (301, 7), (302, 7), (303, 7), (304, 7), (305, 7)");
 is(direct('SELECT count(*) FROM public.t WHERE id >= 300'), 6, 'D: a multi-row INSERT stored every row once') or diag("$out\n$err");
 
-# E. the closed query: its local cursor
+# E. the closed query: its local cursor (a join of two distributed tables: a grouping by the key of one table is left to the scan, nothing to gain)
 $n1->safe_psql('postgres', 'ANALYZE');
-($out, $err) = replanned('SELECT id, count(*) FROM public.t GROUP BY id');
+($out, $err) = replanned('SELECT x.id, y.b FROM public.t x JOIN public.t y ON y.id = x.id');
 my @rows = grep { /^\d+\|/ } split /\n/, $out;
 ok(scalar(@rows) == 100 + 61 + 6 && scalar(keys %{{ map { (split /\|/)[0] => 1 } @rows }}) == scalar(@rows),
 	'E: a closed query whose local plan was invalidated returns every row once, or fails') or diag("$out\n$err");

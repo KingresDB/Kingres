@@ -239,7 +239,7 @@ sub slurp
 	# The order of the planner hook: the mark is acted on after the analysis and after the partition
 	# lists are made as new as the catalog (design 4.4).
 	my $planner = slurp("$src/planner.c");
-	my $i_fresh = index($planner, 'kingres_shard_ensure_fresh_partitions(((DistRef *)');
+	my $i_fresh = index($planner, 'kingres_shard_ensure_fresh_partitions(lfirst_oid(lc)');
 	my $i_nonce = index($planner, 'if (this_is_local_part)');
 	cmp_ok($i_fresh, '>', 0, 'planner.c makes the partition lists as new as the catalog after its analysis');
 	cmp_ok($i_nonce, '>', $i_fresh, 'and recognizes the local part after that');

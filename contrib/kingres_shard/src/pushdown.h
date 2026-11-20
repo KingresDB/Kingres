@@ -152,12 +152,22 @@ extern char *kingres_shard_query_marker(int64 place);
 /* Parse the marker at the start of a statement text; false when it is not one. */
 extern bool kingres_shard_parse_query_marker(const char *query_string, int64 *place);
 
+/* A partial aggregation (design 7): every group aggregates its own rows and returns the partial states. */
+#define KS_PARTIAL_MARKER_PREFIX "/* kingres:partial-fragment "
+extern char *kingres_shard_partial_marker(int64 place);
+extern bool kingres_shard_parse_partial_marker(const char *query_string, int64 *place);
+
 typedef struct KsQueryFragment
 {
 	KsPushdown	pd;				/* the analysis of the query */
 	int			colocation_id;
 	List	   *relids;			/* every relation of the query */
 } KsQueryFragment;
+
+extern bool kingres_shard_text_accepted(const char *body, Query *sent, bool partial, const char **why);
+extern bool kingres_shard_aggregate_partial_ok(Aggref *a, const char **reason);
+extern bool kingres_shard_partial_shape_ok(Query *query, const char **reason);
+extern bool kingres_shard_partial_fragment_analyze(Query *query, KsQueryFragment *qf, const char **reason);
 
 /*
  * Decide a closed query that every group runs whole on its own buckets and whose rows are

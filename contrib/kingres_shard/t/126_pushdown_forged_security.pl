@@ -28,7 +28,8 @@ use IPC::Run ();
 use KingresShardTest qw(run_sql prepared_count);
 use KingresShardCompare;
 
-my $c = KingresShardCompare->new('pg');
+my $c = KingresShardCompare->new('pg', extra => "kingres_shard.enable_partial_aggregation = off" . "
+");
 my ($n1, $n2, $n3) = $c->nodes;
 my $single = $c->single;
 my @nodes = ($n1, $n2, $n3);

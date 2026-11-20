@@ -210,6 +210,7 @@ SELECT name, setting, unit, context
  kingres_shard.enable_colocated_insert_select | on      |      | user
  kingres_shard.enable_copy_routing            | on      |      | user
  kingres_shard.enable_distributed_scan        | on      |      | user
+ kingres_shard.enable_partial_aggregation     | on      |      | user
  kingres_shard.enable_pushdown                | on      |      | user
  kingres_shard.enable_pushdown_closed         | on      |      | user
  kingres_shard.enable_routing                 | on      |      | superuser
@@ -233,7 +234,7 @@ SELECT name, setting, unit, context
  kingres_shard.recovery_interval              | 0       | s    | sighup
  kingres_shard.scan_fetch_size                | 1000    |      | user
  kingres_shard.table_cleanup_delay            | 600     | s    | user
-(32 rows)
+(33 rows)
 
 SET kingres_shard.default_bucket_count = 0;
 ERROR:  0 is outside the valid range for parameter "kingres_shard.default_bucket_count" (1 .. 4096)

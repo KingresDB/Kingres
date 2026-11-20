@@ -159,6 +159,7 @@ extern PGDLLIMPORT int kingres_shard_recovery_interval;
 extern PGDLLIMPORT bool kingres_shard_enable_distributed_scan;
 extern PGDLLIMPORT bool kingres_shard_enable_pushdown;
 extern PGDLLIMPORT bool kingres_shard_enable_pushdown_closed;
+extern PGDLLIMPORT bool kingres_shard_enable_partial_aggregation;
 extern PGDLLIMPORT bool kingres_shard_enable_bulk_routing;
 extern PGDLLIMPORT bool kingres_shard_enable_colocated_insert_select;
 extern PGDLLIMPORT bool kingres_shard_enable_copy_routing;

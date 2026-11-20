@@ -245,6 +245,11 @@ tests += {
       't/132_local_part_replay.pl',
       't/133_review_leftovers.pl',
       't/134_review_step5.pl',
+      't/135_discard_caches.pl',
+      't/136_defences.pl',
+      't/137_reg_oids.pl',
+      't/138_no_gain_plans.pl',
+      't/139_partial_agg.pl',
     ],
   },
 }

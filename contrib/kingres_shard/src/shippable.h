@@ -58,4 +58,7 @@ extern bool kingres_shard_stmt_shippable_colocated(Query *query, Oid target_reli
 													int colocation_id,
 													const char **reason);
 
+extern bool kingres_shard_stmt_shippable_partial(Query *query, int colocation_id,
+												  const char **reason);
+
 #endif							/* KINGRES_SHARD_SHIPPABLE_H */
