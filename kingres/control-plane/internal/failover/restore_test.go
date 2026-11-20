@@ -232,3 +232,33 @@ func TestThePlanOfASwitchoverSkipsAStandbyThatDoesNotStream(t *testing.T) {
 		t.Fatalf("%+v %v", plan, err)
 	}
 }
+
+// A group that a restore leaves alone is in the plan with the reason, as it is in the report: no target, no candidates, no steps.
+func TestThePlanOfARestoreListsTheSkippedGroups(t *testing.T) {
+	w := restoreWorld()
+	r := w.runner()
+	w.fakeClock(r)
+	in := restoreInputOf(t, w)
+	in.Skipped = []SkippedGroup{{Group: 0, Reason: "mapGroup", Text: "The planned switchover of the map group is not supported yet."},
+		{Group: 7, Reason: "preferredNotReady", Text: "The preferred server has no ready standby."}}
+	in.Olds[0], in.Olds[7] = "s3", "s2"
+	p, err := (&Service{Runner: r}).Plan(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p.CanProceed || len(p.Groups) != 3 {
+		t.Fatalf("%+v", p)
+	}
+	// ordered by group
+	if p.Groups[0].ShardGroupID != 0 || p.Groups[1].ShardGroupID != 1 && p.Groups[1].ShardGroupID != 7 {
+		t.Fatalf("order: %+v", p.Groups)
+	}
+	for _, g := range p.Groups {
+		if g.ShardGroupID == 1 {
+			continue
+		}
+		if g.ToServerID != nil || len(g.Steps) != 0 || len(g.Candidates) != 0 || !strings.Contains(g.DataLoss.Message, "Skipped (") {
+			t.Errorf("a skipped group: %+v", g)
+		}
+	}
+}
