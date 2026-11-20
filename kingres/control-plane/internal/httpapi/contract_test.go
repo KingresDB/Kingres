@@ -299,6 +299,12 @@ func TestResponsesValidateAgainstContract(t *testing.T) {
 	for id := range e.srv.ledgerPublicationHandlers() {
 		mutating[id] = true // validated in ledger_publication_http_test.go with a fake service
 	}
+	for id := range e.srv.ledgerBundleHandlers() {
+		mutating[id] = true // validated by the cluster tests of package clustertest (ledgerbundle_test.go)
+	}
+	for id := range e.srv.ledgerClientHandlers() {
+		mutating[id] = true // validated by the cluster tests of package clustertest (ledgerclient_test.go)
+	}
 	for id := range e.srv.ledgerAnchorHandlers() {
 		mutating[id] = true // validated in ledger_anchor_http_test.go with a fake service
 	}

@@ -21,6 +21,7 @@ package ops
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -91,6 +92,17 @@ type Ops struct {
 	// LedgerRetireDatabase, when set, ends the publication of the chains of a database before it is dropped: a final round, the
 	// chain-retired events and the aggregate leaf in which every member is retired (step 6). It does nothing for a database with no log.
 	LedgerRetireDatabase func(ctx context.Context, db string) error
+	// LedgerBundleBuild writes the bundle of a database to w (step 20); files are further files by their path in the bundle (the inclusion
+	// proofs). LedgerPublished tells whether the database has a published log. BundleDir is where the files of the bundles are kept.
+	LedgerBundleBuild func(ctx context.Context, db string, req api.LedgerBundleRequest, files map[string][]byte, w io.Writer) error
+	LedgerPublished   func(ctx context.Context, db string) (bool, error)
+	// LedgerChainDiverged and LedgerEpochStart serve acknowledgeLedgerDivergence (step 20): whether the chain of a group is diverged, and the
+	// start of the new epoch (a task step, idempotent).
+	LedgerChainDiverged func(ctx context.Context, db string, group int32) (bool, error)
+	LedgerEpochStart    func(ctx context.Context, db string, group int32, kind, reason, actor string) error
+	// LedgerAudit is the check "publication" of a verification: the findings of the audit of the stored logs of a database (nil: not supported).
+	LedgerAudit func(ctx context.Context, db string) ([]string, error)
+	BundleDir   string
 	// BG bounds background task runs; Wait waits for them.
 	BG  context.Context
 	Log *slog.Logger

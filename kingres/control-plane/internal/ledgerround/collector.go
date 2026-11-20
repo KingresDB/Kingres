@@ -62,6 +62,9 @@ type Config struct {
 	// PullState asks the other holders of the keys for their copy (the first start of a server that has none).
 	Published PublishedState
 	PullState func(ctx context.Context) (ledgerstate.State, bool)
+	// OnNewChain is called after the log of a chain was created for the first time (a database that got its ledger, or a shard group that was
+	// added): the control plane copies the client keys of the registry to the new group (correction 211). Its error is only logged.
+	OnNewChain func(ctx context.Context, db string) error
 }
 
 // Collector is the publisher: the only writer of the logs. It is safe for concurrent use; rounds of one database exclude each other (one

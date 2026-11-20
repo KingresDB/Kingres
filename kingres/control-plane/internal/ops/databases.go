@@ -63,6 +63,9 @@ type createParams struct {
 func (o *Ops) Definitions() []task.Definition {
 	return []task.Definition{
 		o.replicateDefinition(),
+		o.ledgerUpgradeDefinition(),
+		o.ledgerBundleDefinition(),
+		o.ledgerEpochDefinition(),
 		{Kind: KindDatabaseCreate, Dynamic: func(in json.RawMessage) ([]task.Step, error) {
 			p, err := rawInput[createParams](in)
 			if err != nil {

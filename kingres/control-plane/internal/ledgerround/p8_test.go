@@ -3,6 +3,8 @@
 package ledgerround
 
 import (
+	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -185,5 +187,92 @@ func TestTheChainOfADatabaseBeingDroppedRaisesNoAlertForTheGrace(t *testing.T) {
 	e.round()
 	if !e.hasAlert(AlertDiverged + "/raise/critical/database:shop|group:0") {
 		t.Fatalf("no alert after the grace: %v", e.alerts)
+	}
+}
+
+// Step 20: the acknowledgement of a diverged chain closes its epoch with a signed event, closes the old log, opens the log of epoch 2, which is
+// built from block 0 of the chain as it is, and the old member is flagged retired in the aggregate; a repeated or resumed call changes nothing.
+func TestStartingANewEpochOfADivergedChain(t *testing.T) {
+	a, b := newChain(1, 10), newChain(40, 4)
+	e := newEnv(t, a, b)
+	e.round()
+	if err := e.coll.StartEpoch(bg, "shop", 0, "restore", "restore of the nightly backup", "alice"); !errors.Is(err, ErrNotDiverged) {
+		t.Fatalf("an epoch of a chain that is not diverged: %v", err)
+	}
+	a.blocks = a.blocks[:6] // an older backup, and the chain grew again with other blocks
+	a.salt++
+	a.add(6)
+	b.add(1)
+	e.advance(time.Minute)
+	e.round()
+	old := e.chainLog(0)
+	if old.State != ledgerpub.StateDiverged {
+		t.Fatalf("the chain is %s", old.State)
+	}
+	if err := e.coll.StartEpoch(bg, "shop", 0, "other kind", "x", "alice"); err == nil {
+		t.Error("an unknown kind is accepted")
+	}
+	events := len(eventsOf(e.keys))
+	if err := e.coll.StartEpoch(bg, "shop", 0, "restore", "restore of the nightly backup", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	ev := eventsOf(e.keys)
+	if len(ev) != events+1 {
+		t.Fatalf("events: %v", ev)
+	}
+	var closedEvent string
+	for _, x := range ev {
+		if strings.HasPrefix(x, "epoch-closed ") {
+			closedEvent = x
+		}
+	}
+	for _, want := range []string{"epoch=1", "final-size=" + strconv.FormatInt(old.Size, 10), "kind=restore", "acknowledged-by=alice", "reason=restore of the nightly backup"} {
+		if !strings.Contains(closedEvent, want) {
+			t.Errorf("the event %q lacks %q", closedEvent, want)
+		}
+	}
+	// the old log is closed and kept; the next epoch's log exists and is empty
+	var oldNow, next *ledgerpub.LogRow
+	for _, l := range e.logs() {
+		l := l
+		if l.Kind == ledgerpub.KindChain && l.ShardGroupID != nil && *l.ShardGroupID == 0 {
+			if l.Epoch == 1 {
+				oldNow = &l
+			} else if l.Epoch == 2 {
+				next = &l
+			}
+		}
+	}
+	if oldNow == nil || oldNow.State != ledgerpub.StateClosed || oldNow.Size != old.Size || !strings.HasPrefix(oldNow.Detail, "retired: epoch-closed") {
+		t.Fatalf("the old log: %+v", oldNow)
+	}
+	if next == nil || next.Size != 0 || next.State != ledgerpub.StateActive || !strings.HasSuffix(next.Origin, "/e2") {
+		t.Fatalf("the new log: %+v", next)
+	}
+	if e.hasAlert(AlertDiverged+"/raise") && !e.hasAlert(AlertDiverged+"/clear") {
+		t.Errorf("the alert is not cleared: %v", e.alerts)
+	}
+	if fl := flagsOf(leafAt(t, e, uint64(e.aggregateLog().Size)-1)); len(fl) == 0 || fl[0]&(ledgerlog.FlagDiverged|ledgerlog.FlagRetired) != ledgerlog.FlagDiverged|ledgerlog.FlagRetired {
+		t.Errorf("the leaf after the epoch start does not flag the old member retired and diverged: %v", fl)
+	}
+	// repeated after it finished: the chain is no longer diverged, and nothing more is written
+	if err := e.coll.StartEpoch(bg, "shop", 0, "restore", "restore of the nightly backup", "alice"); !errors.Is(err, ErrNotDiverged) {
+		t.Fatalf("a repeat: %v", err)
+	}
+	if len(eventsOf(e.keys)) != events+1 {
+		t.Error("a repeated epoch start made another event")
+	}
+	// the next round builds the new log from block 0 of the chain as it is
+	e.advance(time.Minute)
+	e.round()
+	var grown *ledgerpub.LogRow
+	for _, l := range e.logs() {
+		l := l
+		if l.Kind == ledgerpub.KindChain && l.ShardGroupID != nil && *l.ShardGroupID == 0 && l.Epoch == 2 {
+			grown = &l
+		}
+	}
+	if grown == nil || grown.Size != int64(len(a.blocks)) || grown.State != ledgerpub.StateActive {
+		t.Fatalf("the log of epoch 2 after a round: %+v (the chain has %d blocks)", grown, len(a.blocks))
 	}
 }

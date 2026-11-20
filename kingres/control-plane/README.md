@@ -339,7 +339,7 @@ paths; what is not done is in "Not done in this increment"). "Real" means the op
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **123 of 132 operations are real; 9 answer "not yet".** The eight ledger operations in that column (client keys, bundles, the signature policy of a table, the upgrade of the extension, the acknowledgement of a diverged chain) are built against the contract in the console, which tries them on its mock API; their implementation in `kingresd` is on a branch that is not merged yet.
+authenticated operation lists in 0.2.0. **131 of 132 operations are real; 1 answer "not yet".**
 
 | Tag | Real | Not yet |
 |---|---|---|
@@ -350,7 +350,7 @@ authenticated operation lists in 0.2.0. **123 of 132 operations are real; 9 answ
 | Roles | `listClusterRoles`, `listRoles`, `createRole`, `getRole`, `deleteRole`, `updateRole`, `setRoleClusterRoles`, `setRoleMemberships` |  |
 | Databases | `getDatabaseCreateOptions`, `listDatabases`, `createDatabase`, `getDatabase`, `dropDatabase`, `updateDatabase` |  |
 | Shards | `getBucketDistribution`, `listColocationGroups`, `listBuckets` |  |
-| Ledger | `getLedgerStatus`, `listLedgerBlocks`, `listLedgerDigests`, `generateLedgerDigest`, `startLedgerVerification`, `listLedgerStatus`, `createInclusionProof`, `listLedgerVerifications`, `getLedgerVerification`, `getLedgerSettings`, `updateLedgerSettings`, `getLedgerSigning`, `createLedgerSigningKey`, `retireLedgerSigningKey`, `revokeLedgerSigningKey`, `getLedgerTrustFile`, `getLedgerPublication`, `getLedgerAggregate`, `listLedgerAggregates`, `listLedgerAnchorTargets`, `createLedgerAnchorTarget`, `getLedgerAnchorTarget`, `updateLedgerAnchorTarget`, `deleteLedgerAnchorTarget`, `testLedgerAnchorTarget`, `listLedgerAnchors`, `anchorLedgerNow`, `retryLedgerAnchor`, `downloadLedgerAnchor` | `createLedgerBundle`, `getLedgerBundle`, `listLedgerClientKeys`, `registerLedgerClientKey`, `revokeLedgerClientKey`, `setTableSignaturePolicy`, `upgradeLedgerExtension`, `acknowledgeLedgerDivergence` |
+| Ledger | `getLedgerStatus`, `listLedgerBlocks`, `listLedgerDigests`, `generateLedgerDigest`, `startLedgerVerification`, `listLedgerStatus`, `createInclusionProof`, `listLedgerVerifications`, `getLedgerVerification`, `getLedgerSettings`, `updateLedgerSettings`, `getLedgerSigning`, `createLedgerSigningKey`, `retireLedgerSigningKey`, `revokeLedgerSigningKey`, `getLedgerTrustFile`, `getLedgerPublication`, `getLedgerAggregate`, `listLedgerAggregates`, `listLedgerAnchorTargets`, `createLedgerAnchorTarget`, `getLedgerAnchorTarget`, `updateLedgerAnchorTarget`, `deleteLedgerAnchorTarget`, `testLedgerAnchorTarget`, `listLedgerAnchors`, `anchorLedgerNow`, `retryLedgerAnchor`, `downloadLedgerAnchor`, `listLedgerClientKeys`, `registerLedgerClientKey`, `revokeLedgerClientKey`, `setTableSignaturePolicy`, `upgradeLedgerExtension`, `createLedgerBundle`, `getLedgerBundle`, `acknowledgeLedgerDivergence` | |
 | Tables | `getTable`, `distributeTable`, `enableTableLedger`, `listTables` |  |
 | Grants | `listGrants`, `createGrant`, `revokeGrants`, `applyGrantTemplate` |  |
 | Health | `getHealth`, `getReadiness` |  |
@@ -3393,3 +3393,24 @@ submission is partial and passes it to `Resume` at the next attempt, and notes c
   the sessions and the drop).
 * **"Anchored" through the header source (not done):** the OTS library has no exported way to inject the proof-of-work check, and a real block header cannot be matched to the merkle root a calendar returns, so the outcome
   "anchored" through the wiring cannot be shown without a library change. The claim path is tested up to `claimed`.
+
+### Client keys, the upgrade, bundles and the audit (phase 7, steps 17 and 20; corrections 207 to 211)
+
+* **Client keys, signature policy, upgrade (step 17).** Every shard group has its own registry (the tables of `kingres_ledger` 0.3 are ledger tables of that group's chain), so `registerLedgerClientKey`,
+  `revokeLedgerClientKey` and `setTableSignaturePolicy` run on every server through the apply kind `ledger.client`: a check here and on every reachable server first (a group on 0.2 refuses the whole operation and is
+  named), then the change here, then on the other servers; an unreachable server gets the task `replicate.apply`. Every apply is idempotent. `upgradeLedgerExtension` starts the task `ledger.upgrade` (subject
+  `database/<name>`, one step for this server and one for each other); 0.3 is detected by object (`kingres.ledger_client_key`), not by number. The API names a key by the first 8 hexadecimal characters of its 16-byte
+  id, and refuses a registration whose short id belongs to another key. Who registered and who revoked is in `kingres_cp.ledger_client_key_actor` (migration 0033), because the extension records only the service role.
+* **A group added later (correction 211).** When the log of a chain is created for the first time, the collector calls `Ops.SyncClientKeys`, which copies the registry of this server's group (the manager leader's) to
+  the other servers, revocations included (idempotent). The policies are not copied: a ledger table lives on one group, so a new group has none. Limit: it runs in the publication's round, so a cluster whose
+  publication is off is not synced until it is on.
+* **Bundles (step 20).** `createLedgerBundle` gives the bundle a number (migration 0034), starts the task `ledger.bundle.create` and writes `bundle N` in its detail (what the console reads). The task writes
+  `<data dir>/ledger/bundles/bundle-N.tar.gz` (the layout of the publication restricted to the database's logs, the events, the key ring, `logs.json`, the evidence files with `includeAnchors`, the proofs asked for as
+  `proofs/proof-N.json`, and `bundle.json`). `getLedgerBundle` is answered by the manager leader (which built it), 404 for another database's bundle, 410 after 24 hours (the file is removed then). A bundle is lost
+  with a change of the leader (the record names the server).
+* **The audit of the publication.** `startLedgerVerification` accepts `checks`: `chain` (always run: the task leaves the extension's record), `publication` (every tile and entry bundle of the database's stored logs against
+  the root of the latest checkpoint, and the stored note against the stored size and root; the findings are in the error of the task) and `anchors` (422 `unsupported_operation`: not built). The per-check member of
+  `LedgerVerification` is a proposal for 0.13.0 (`p7c-work/contract-0.13.0-ledger.yaml`); until it is in the contract the outcome is the state of the task and its error.
+* **The new epoch (step 20).** `acknowledgeLedgerDivergence` (400 for a wrong `confirm`, kind or reason; 409 `chain_not_diverged`) starts the task `ledger.epoch.start`: `Collector.StartEpoch` signs and publishes the event `epoch-closed` (lines `chain`, `epoch`, `final-size`, `final-root`, `common-height`, `kind`, `reason`, `acknowledged-by`), closes the old log (kept and served, detail `retired: epoch-closed (was diverged: ...)`), creates the log of epoch e+1 empty (same chain id, origin `./e<e+1>`), clears the alert and appends the aggregate leaf that flags the old member retired and diverged; the next round builds the new log from block 0 and the next leaf names it. Every step is idempotent and resumable. `common-height` is `unknown` in this version: the highest height whose hash is the same in both histories needs the old blocks, and only the published entries have them (a proposal for the design, correction 213).
+* **Not built yet:** the scheduled audit job, and the
+  check of the anchors.

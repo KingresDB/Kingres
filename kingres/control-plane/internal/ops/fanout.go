@@ -143,6 +143,8 @@ func (o *Ops) ApplyLocal(ctx context.Context, kind string, raw json.RawMessage) 
 			return errors.New("this server has no instance")
 		}
 		return o.Local.DropRole(ctx, p.Name)
+	case ApplyLedgerClient:
+		return o.ledgerClientApply(ctx, raw)
 	case ApplyGrant:
 		var p grantOp
 		if err := strictJSON(raw, &p); err != nil {
@@ -341,10 +343,11 @@ func (o *Ops) replicateGrant(ctx context.Context, g grantOp) {
 }
 
 type replicateInput struct {
-	Kind    string   `json:"kind"`
-	Names   []string `json:"names,omitempty"`
-	Grant   *grantOp `json:"grant,omitempty"`
-	Servers []string `json:"servers,omitempty"`
+	Kind    string          `json:"kind"`
+	Names   []string        `json:"names,omitempty"`
+	Grant   *grantOp        `json:"grant,omitempty"`
+	Ledger  *ledgerClientOp `json:"ledger,omitempty"`
+	Servers []string        `json:"servers,omitempty"`
 }
 
 // params builds the parameters of the operation from the current state.
@@ -360,6 +363,8 @@ func (o *Ops) replicaParams(ctx context.Context, in replicateInput) (any, error)
 		return roleDrop{Name: in.Names[0]}, nil
 	case ApplyGrant:
 		return in.Grant, nil
+	case ApplyLedgerClient:
+		return in.Ledger, nil
 	}
 	return nil, fmt.Errorf("unknown replication kind %q", in.Kind)
 }

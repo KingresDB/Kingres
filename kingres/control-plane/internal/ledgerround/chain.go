@@ -117,6 +117,11 @@ func (c *Collector) chain(ctx context.Context, pc *ledgersign.PubContext, term s
 		if err != nil {
 			return err
 		}
+		if c.cfg.OnNewChain != nil {
+			if err := c.cfg.OnNewChain(ctx, db); err != nil {
+				c.log.Warn("copying the client keys to a new chain failed", "database", db, "group", g, "error", err)
+			}
+		}
 		existing = &row
 	}
 	gr.Log = existing
