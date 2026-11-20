@@ -247,3 +247,51 @@ func swWait(t *testing.T, e swEnv, id any, d time.Duration) map[string]any {
 	}
 	return body
 }
+
+// A1 of round 2. The leader's kingresd ends right after the writes were stopped (the step is recorded, the old primary holds the hold rules),
+// and is started again: the hold is on disk and stays while kingresd is away (the state call of the old primary says so), the task goes
+// on after the restart and ends with the switchover done, and nothing acknowledged is lost.
+func TestSwitchoverSurvivesTheLeaderEndingWhileTheWritesAreStopped(t *testing.T) {
+	e := swCluster(t)
+	c, port, pool, leader, g, old, nw, w := e.c, e.port, e.pool, e.leader, e.g, e.old, e.nw, e.w
+	// Step indexes: 0 check, 1 freeze, 2 choose, 3 stop the writes, 4 let distributed transactions end, 5 stop the old primary cleanly.
+	leader.SetFaults(fault.Spec{TaskExitPoint: "step_recorded", TaskExitStep: 3})
+	id := swRequest(t, leader, old, nw, g)
+	until(t, 5*time.Minute, "the leader's kingresd to end after the writes were stopped", func() bool {
+		st, _ := leader.Do("GET", "/healthz", nil, nil)
+		return st != 200
+	})
+	leader.Kill() // reaps the process
+	// The hold is on the old primary's disk: the state call answers quiesced for as long as kingresd of the leader is away, and the old
+	// primary is still the primary (nothing was stopped).
+	for i := 0; i < 5; i++ {
+		var state map[string]any
+		code, err := leader.InternalCall(old, "GET", fmt.Sprintf("/failover/state?group=%d", g), nil, &state)
+		if err != nil || code != 200 || state["quiesced"] != true {
+			t.Fatalf("the hold of the writes while the leader is away: %d %v %v", code, err, state)
+		}
+		time.Sleep(time.Second)
+	}
+	leader.Heal()
+	leader.Start()
+	until(t, 3*time.Minute, "the restarted leader accepts a sign-in", func() bool { return leader.Login(clustertest.AdminUser, clustertest.AdminPass) })
+	swWait(t, e, id, 8*time.Minute)
+	if host := swPrimaryHost(t, leader, g); host != nw.Host {
+		t.Fatalf("the primary of group %d is on %s, want %s", g, host, nw.Host)
+	}
+	before := w.count()
+	until(t, 2*time.Minute, "writes after the switchover", func() bool { return w.count() > before+30 })
+	acked := w.Stop()
+	for _, n := range c.Nodes {
+		if n == old {
+			continue
+		}
+		have := foReadIDs(t, n, port, pool)
+		for rid := range acked {
+			if !have[rid] {
+				t.Errorf("acknowledged row %d is missing when read through %s", rid, n.Host)
+				break
+			}
+		}
+	}
+}
