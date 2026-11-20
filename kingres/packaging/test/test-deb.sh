@@ -190,6 +190,15 @@ check_eq "kingres-psql reports PostgreSQL ${pg_version}" "psql (PostgreSQL) ${pg
 check "kingres-pg_dump runs" x kingres-pg_dump --version
 check "kingres-pg_isready runs" sh_ 'kingres-pg_isready -p 1; [ $? -ne 127 ]'
 check "kingres-verify runs" x kingres-verify --help
+check "kingres-verify has the release subcommand" sh_ 'kingres-verify release --help | grep -q "release verify"'
+check "kingres-verify is the file of /opt/kingres/bin, linked from /usr/bin" sh_ \
+    '[ "$(readlink /usr/bin/kingres-verify)" = /opt/kingres/bin/kingres-verify ] && [ -x /opt/kingres/bin/kingres-verify ]'
+check "BUILD-INFO has the SHA-256 of the installed kingres-verify" sh_ \
+    '[ "$(sed -n "s/^kingres-verify sha256: \([0-9a-f]*\) .*/\1/p" /opt/kingres/share/BUILD-INFO)" = "$(sha256sum /opt/kingres/bin/kingres-verify | cut -d" " -f1)" ]'
+# The ledger signing key can be in the memory of kingresd: no core file may be written.
+check_eq "the unit says LimitCORE=0" 0 "$(x systemctl show -p LimitCORE --value kingres)"
+check "the manager runs with a zero core file limit" sh_ \
+    'grep -Eq "^Max core file size +0 +0" /proc/$(systemctl show -p MainPID --value kingres)/limits'
 check "kingresd -h runs" sh_ 'kingresd -h 2>&1 | grep -q "Usage of kingresd"'
 check "no /usr/bin/psql was installed" sh_ '! test -e /usr/bin/psql && ! test -e /usr/bin/pg_dump'
 check "no linked name without the prefix (other than kingresd)" \

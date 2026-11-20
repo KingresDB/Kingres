@@ -77,8 +77,13 @@ Target: Ubuntu 24.04, amd64. Everything below was run on Windows 11 with WSL2
   `kingres-watchdog`, the lease watchdog next to it.
 - `kingres-verify`: the standalone ledger verifier, when `kingres/verifier/go.mod`
   exists in the source tree (the build has a marked hook and skips it
-  otherwise).
-- The systemd unit `kingres.service` and default configuration (package only).
+  otherwise). It is a copy for convenience: `README.Debian` and the manual page say that an
+  auditor must not rely on a verifier that came from the cluster it checks, and name
+  `kingres-verify release verify` and the release key as the way to check a verifier (see
+  `kingres/verifier/README.md`, "Releases, and how a third party gets the verifier").
+- The systemd unit `kingres.service` and default configuration (package only). The unit sets
+  `LimitCORE=0`: `kingresd` can hold the ledger signing key in memory, and a core file would
+  write it to disk. `build-deb.sh` refuses a unit without that line, and the tests check it.
 
 Not included yet: see [What is not included](#what-is-not-included-yet).
 
@@ -121,10 +126,14 @@ unfinished work.
    `DESTDIR` into `WORK/stage`, stripped.
 3. **Panel**: `npm ci`, `npm run build` (type-check and vite), copied into
    `kingres/control-plane/internal/webui/dist`, the directory `kingresd` embeds.
-4. **Go**: `kingresd` and `kingres-verify` with `CGO_ENABLED=0 go build -trimpath
+4. **Go**: `kingresd` and `kingres-watchdog` with `CGO_ENABLED=0 go build -trimpath
    -buildvcs=false -buildmode=pie -ldflags "-s -w -X main.version=<version> -X main.commit=<commit>"`,
    `GOTOOLCHAIN=local` (no toolchain downloads) and `-mod=readonly` (the locked
-   `go.sum` must be complete).
+   `go.sum` must be complete). `kingres-verify` is built by
+   `kingres/verifier/scripts/build-one.sh`, the one script that holds the reproducible flags of
+   the verifier (no PIE, no build id), so the installed copy is the same bytes as the
+   `kingres-verify-linux-amd64` file of a release of the same version made with the same Go
+   release; `share/BUILD-INFO` records its SHA-256.
 5. Checks that the tree says the same as the server it built (major and
    version), and that every `contrib/kingres_*` extension (control file, install
    script for its default version, and the library when the control file names
@@ -530,6 +539,7 @@ once in the copyright file.
 test/test-image.sh   --rev kingres-19 [--port 58790]       # build the image, run it, full cluster flow
 test/test-compose.sh --rev kingres-19 [--port-base 58700]  # three nodes joined into one cluster
 test/test-deb.sh --deb FILE --other-deb FILE --work WORK   # install ... purge under systemd
+test/test-verifier-package.sh [--work DIR]                 # the verifier in the package, no Docker
 ```
 
 Each test is run once per major, on the source of that major. The image and
@@ -593,6 +603,20 @@ the instance).
   data); after `apt remove` (data kept) it is refused again; with no package and
   a leftover data directory of this major it is refused; and after a purge it
   installs and starts (and the package of the first major is refused in turn).
+- **`test-verifier-package.sh`** needs no Docker and builds no PostgreSQL (run it in WSL with
+  `go` on the `PATH`): it builds `kingres-verify` with `kingres/verifier/scripts/build-one.sh`,
+  stages it in a small tree whose other programs are empty stand-ins, runs the real
+  `deb/build-deb.sh` and looks into the package. It checks that the binary is in
+  `/opt/kingres/bin` and linked from `/usr/bin`, that its manual page and `README.Debian` say an
+  auditor must not rely on the copy, that the unit has `LimitCORE=0` once in `[Service]`, that a
+  unit without the line or with another value is not built into a package, that the binary runs
+  and has `release verify`, and, with a release and a key made in the test (never a real key), that
+  the packaged binary is byte for byte the release file of the same version and that
+  `release verify` of the packaged copy accepts that release and answers 1 for a changed binary
+  and for another key. The checks that need a running node (`systemctl show -p LimitCORE` is 0,
+  the manager's `/proc/PID/limits` shows a zero core limit, `BUILD-INFO` carries the SHA-256 of
+  the installed binary) are in `test-deb.sh`, which needs Docker and a full build and was not run for
+  this step.
 - **`test-image.sh`**: the image builds under the name of its major; its labels
   (major, PostgreSQL version, KingresDB version, `AGPL-3.0-only AND PostgreSQL`)
   and `postgres --version` agree with the source tree; the five extensions are

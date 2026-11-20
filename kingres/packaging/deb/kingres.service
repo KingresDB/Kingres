@@ -52,6 +52,11 @@ RestartSec=3s
 # and crash recovery repairs the instance at the next start.
 TimeoutStopSec=120s
 LimitNOFILE=65536
+# No core dumps: kingresd may hold the ledger signing key (a plain key file or its
+# passphrase) in memory, and a core file would write it to disk. kingresd also sets
+# the limit and the dumpable flag itself (harden_linux.go); this line is the
+# unit's own and the package build and test check it (ledger-phase7.md, 3.2.2).
+LimitCORE=0
 # PostgreSQL creates one process per connection and workers: a generous but
 # finite bound.
 TasksMax=16384

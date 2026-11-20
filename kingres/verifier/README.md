@@ -52,8 +52,125 @@ go build -o kingres-verify ./cmd/kingres-verify      # Linux, macOS
 go build -o kingres-verify.exe ./cmd/kingres-verify  # Windows
 ```
 
+Releases and how to get a verifier that does not come from the cluster: see "Releases, and how a third party gets the verifier".
 Go 1.27.3 or later. `go test ./...` needs no database (the fixtures are
 committed). `go.mod` has no `require` line: only the standard library is used.
+
+## Releases, and how a third party gets the verifier (phase 7, step 23)
+
+An auditor must not run a verifier that came from the cluster it checks. Two ways give a
+verifier that does not depend on the operator, and both end in the same check.
+
+**From the source, at the release tag (preferred).** Clone the repository on your own machine,
+check out the tag, and build with the Go release that `go.mod` names (`go 1.27.3`):
+
+```
+cd kingres/verifier
+scripts/build-one.sh linux amd64 0.1.0 ./kingres-verify    # GOOS GOARCH VERSION OUTPUT
+sha256sum kingres-verify                                   # compare with the line of SHA256SUMS
+```
+
+`scripts/build-one.sh` is the one place that holds the flags: `CGO_ENABLED=0 go build -trimpath
+-buildvcs=false -ldflags "-s -w -buildid= -X main.version=VERSION" ./cmd/kingres-verify`, with the
+micro-architecture levels fixed (`GOAMD64=v1`, `GOARM64=v8.0`), `GOFLAGS=-mod=readonly`, `GOWORK=off`
+and `GOTOOLCHAIN=local` (no other Go release is fetched). There is no third-party module, so the
+build depends on the Go release only. The same source and Go release give the same bytes on any
+machine and at any path.
+
+**From the release files.** A release is these files, made by `scripts/release.sh` at the first
+release and at each later one (no tag exists before the first):
+
+| File | What it is |
+|---|---|
+| `kingres-verify-linux-amd64`, `kingres-verify-linux-arm64`, `kingres-verify-darwin-arm64`, `kingres-verify-windows-amd64.exe` | the binaries |
+| `SHA256SUMS` | one line per binary in the form `sha256sum -c` reads: 64 lower case hex characters, two spaces, the file name |
+| `SHA256SUMS.note` | a signed note (the format of the checkpoints) whose text is exactly `SHA256SUMS`, signed with the release key: Ed25519, key name `kingres-verify-release` |
+
+Check them **before you run anything**, with a verifier you already trust (a build of your own, or
+one from an earlier release) and the release key **that you got from the documentation, a printout
+or a colleague, not from the place you downloaded the files from**:
+
+```
+kingres-verify release verify --sums SHA256SUMS --note SHA256SUMS.note \
+    --key <release key> --binary kingres-verify-linux-amd64
+```
+
+`--key` is the base64 of the 32 byte public key, or the key string
+`kingres-verify-release+<id>+<base64>`. The line you want is `VERIFIED`; it is printed only when
+the note is signed by that key, its text is the sums file, and every `--binary` has the SHA-256 of
+its line (the line is found by the file's name; `--name` says which line a renamed file is).
+Statuses: 0 verified; 1 a check failed, the step is named (`note-parse`, `note-signature`,
+`note-text`, `sums-format`, `binary`) and `VERIFIED` is not printed; 2 a flag or file is wrong, or
+the key cannot be read. Status 3 is not used: every check that is asked for is made or fails.
+With no `--binary` the note alone is checked, and the output says that no binary was.
+
+**The release key.** The project's public key is printed here when the first release is made:
+
+```
+release key: (not created yet: the key's custody is a decision of the project owner)
+```
+
+Until then there is no release and nothing to check against; do not trust a key that is not in
+this file and in the documentation of the same tag. The key is made with
+`go run ./cmd/kingres-release-tool keygen --out release.key` (a file of mode 0600 that the tool
+will not overwrite and that other users cannot read; no private key is in the repository, and
+the tests make theirs). `go run ./cmd/kingres-release-tool pub --key-file release.key` prints the
+public key, its key string and its fingerprint.
+
+**Making a release** (the holder of the key, on a machine with the Go release of `go.mod`):
+
+```
+scripts/release.sh --version 0.1.0 --out ../../release-0.1.0 --key-file /path/to/release.key
+```
+
+`--version` is the product version (what `kingres_version` says, so that the binary the package
+installs is the same file as `kingres-verify-linux-amd64`); it is never guessed. The script
+refuses a Go release other than the one of `go.mod` (`KINGRES_ALLOW_TOOL_MISMATCH=1` for a trial),
+an output directory that is not empty, and a key file that others can read. It builds the four
+files, writes `SHA256SUMS`, checks it with `sha256sum -c`, signs it, and verifies the note it just
+made with `release verify` before it prints anything. `--unsigned` builds and sums without a note
+and says in capitals that the result is not a release.
+
+**Checking that the build is reproducible.** `scripts/repro-check.sh` copies the source twice into
+directories of different depth and name length, gives each its own empty Go build cache and GOPATH,
+builds all four files in each with `release.sh --unsigned`, and compares every byte. It prints
+`REPRODUCIBLE` and the sums (exit 0), or `NOT REPRODUCIBLE` and the names that differ (exit 1).
+Run it on a clean checkout before a release. On Linux with `go` on the `PATH`:
+
+```
+scripts/repro-check.sh [--work DIR] [--targets "linux/amd64 windows/amd64"]
+```
+
+**The copy on the server.** The Debian package installs a copy of `kingres-verify` in
+`/opt/kingres/bin`, built with `build-one.sh`, and `LimitCORE=0` is in the service unit. The copy
+is for convenience; an auditor does not use it. `kingres/packaging/test/test-verifier-package.sh`
+checks, without Docker, that the package holds it, that it is the same bytes as the release file
+of the same version, and that `release verify` of the packaged copy accepts a release made in the
+test.
+
+**What this does not prove.** That the key is the project's (you passed it), that the code is
+free of faults, that the source was reviewed. A matching hash shows that your binary is the one
+whose hash the key holder signed, and that it can be rebuilt from the source you read.
+
+**Decisions of step 23** (the design is silent or leaves them open):
+
+- The signing side is a separate program, `cmd/kingres-release-tool` (`keygen`, `pub`, `sums`,
+  `sign`), not a subcommand of `kingres-verify`: the verifier never signs, and the tool is not part
+  of a release. It reads a key only from a file (never from the command line or the environment),
+  refuses a key file that others can read on Unix, and refuses to overwrite a key, a sums file or a note.
+- `go.mod` is not changed by the release (the design says a `toolchain` line is added by the
+  release step): a script that edits a tracked file makes the tree it builds differ from the tag.
+  The `go` line already names the exact release (`go 1.27.3`); `release.sh` insists that the
+  installed toolchain is that one, and uses a `toolchain` line instead when one is present.
+- The key may be given as the raw base64 (44 characters) or as the key string; an input of 44
+  characters is always the raw form, because that base64 may itself contain plus signs.
+- The sums file allows only plain file names (letters, digits, dot, dash, underscore), no
+  path, no duplicate, the two-space form only, and the note's text must be byte for byte the
+  file, so the tool never signs sums that this check would refuse.
+- `ParseVKey` split a key string on every plus sign, so a key whose base64 holds one (about half
+  of all keys) could not be read; it now splits into three parts.
+- An unsigned build is possible (`--unsigned`) only so that the reproducibility check and the
+  package test can run without a key; it writes no note and says it is not a release.
 
 ## Exit statuses
 
@@ -94,6 +211,7 @@ unknown subcommand.
 | `bundle fetch` | 0, 1, 2, 3 |
 | `monitor` | 0, 1, 2, 3 |
 | `attestation` | 0, 1, 2, 3 |
+| `release verify` | 0, 1, 2 |
 | `trust init` | 0, 2 |
 | `trust show` | 0, 2 |
 | `trust follow` | 0, 1, 2, 3 |

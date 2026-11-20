@@ -91,3 +91,20 @@ Removal
   apt remove kingres   stops the service and the database; data and settings stay.
   apt purge kingres    ALSO DELETES /var/lib/kingres (all databases of this
                        node), /etc/kingres and the kingres user.
+
+The ledger verifier on the server
+---------------------------------
+The package puts a copy of kingres-verify in /opt/kingres/bin and links it as
+/usr/bin/kingres-verify, so that an operator can try it on the node.  Do not
+use it as an auditor: a verifier that came from the cluster it is meant to check
+proves nothing about that cluster.  An auditor takes the verifier from the source
+repository at a release tag (and builds it, see scripts/repro-check.sh in the
+verifier directory) or from the release files on another machine, and checks it
+with the release key:
+
+    kingres-verify release verify --sums SHA256SUMS --note SHA256SUMS.note \
+        --key <release key> --binary kingres-verify-linux-amd64
+
+The service unit sets LimitCORE=0: kingresd can hold the ledger signing key in
+memory, and a core file would write it to disk.  Keep that line in any drop-in
+that changes the unit.

@@ -3104,3 +3104,87 @@ and 14 (OpenTimestamps) register their kinds in the same framework and are built
 Of section 13: item 2 (test vectors) is settled for signed notes (the example key and note of the
 specification are in the tests; the checkpoint example has no published key), item 3 (entry bundles at
 the standard path) and item 4 (RFC 9162 sections 2.1.3.2 and 2.1.4.2) were checked against the source.
+
+## 15. Notes from building steps 21 and 23 (2026-11-20)
+
+### Step 21: the verifier and the epochs
+
+These notes say what step 21 built, where it differs from the text of the design, and what the design should now say. Plain statements, in the order a reader of 9.4 will want them.
+
+1. The event. The event `epoch-closed` that step 20 publishes has the lines chain, epoch, final-size, final-root, common-height, kind, reason and acknowledged-by. The verifier reads exactly these lines, in any order after seq, time and type, refuses a missing or extra line, a second event for one epoch, a kind other than restore, failover-loss or other, and a number that is not canonical. The publisher writes `common-height: unknown` today, because the highest height whose block is the same in both histories cannot be found once the old blocks are gone from the database. The design says the value is a height or -1. The verifier accepts a height, -1 and `unknown`. The design should say that `unknown` is a legal value and what follows from it: a finding then cannot say how many blocks were lost, only that blocks above the common height existed in the old epoch and are not in the new one. If the publisher ever learns the common height (for example from a mirror that holds the old entries), it can write it, and the findings get sharper without any change in the verifier.
+
+2. What a closed epoch is, to an auditor. Each epoch verifies on its own. The new epoch is a different log with a different origin, built from block 0 of the chain as it is after the restore. It is not an extension of the old one, so no consistency proof between them exists, and none is attempted. What the verifier adds is that the cut is never silent. Three places show it. A member of the aggregate that is flagged diverged, which the publisher also flags retired in the one leaf that closes the epoch, is a failure at step epoch-closed unless the auditor accepts the finding. A round of the aggregate that the auditor holds from before the closing, compared with the last round by `aggregate --previous`, is a failure at step epoch-closed that quotes the event (its number, the kind, who acknowledged, the reason, the number of blocks the old epoch published) and says that the held head is a prefix of the frozen old log, so the old epoch is genuine and the new one is not its continuation. And `consistency` between a checkpoint of epoch 1 and the log of epoch 2 is a failure that says the same thing; there is nothing to accept there, because nothing is proved.
+
+3. The flag. `--accept-epoch-closed SEQ` takes the number of the event. It exists on `aggregate`, `proof --bundle` and `bundle verify`, the commands that can reach a closed epoch while verifying the new one. It turns the failure of that one event into a printed finding and exit status 0. It does not cover a disagreement between the event and the log it closes (final size or root), a held head that is not in the frozen log (a fork), an event that no authorised key signed, a diverged member without an event, or any other event. A number that no finding of the run needed is reported in a note, so that a typo cannot pass for an acceptance. The design said the flag turns the failure into a finding for a verification of the new epoch alone. That is what was built; the design should add that the finding is a step of its own (`finding epoch-closed`) and an entry of the JSON output, never only a line of text.
+
+4. The new epoch alone. `aggregate` of a publication whose last round is the new epoch's verifies with status 0, as the design says, and prints a note for every verified epoch-closed event about a chain of the aggregate: nothing was compared with the old epoch, give `--previous`. A single-log command (`checkpoint`, `consistency` inside one epoch) prints the same kind of note when the log it checks is of a closed epoch. The design should say that the verification of the new epoch alone is a statement about the new epoch alone, and that the note is the only trace of the cut in that case.
+
+5. A stricter choice in `bundle verify`. A bundle of a database with a closed epoch holds both logs and the event. The design does not say what `bundle verify` should do. The verifier ends with status 1, step epoch-closed, unless the auditor accepts the event with the flag, and the reason is the same as for `aggregate --previous`: a bundle is the "everything in one run" check, and an auditor who reads VERIFIED must not learn only later that the history was cut. The failure is checked before it is a finding: the closed log in the bundle must have the size and root that the event states, and a log of epoch e + 1 needs a verified event that closed epoch e. A proof whose block is in a closed epoch is named in the failure, unless the event states a common height at or above the block. The design should record this choice, because it makes every bundle of a database that was ever restored need the flag.
+
+6. Proofs across epochs. A proof file carries no epoch. In a bundle with several epochs of the chain the verifier shows the proof in the epochs newest first and takes the first whose log holds the block at its height. The aggregate leg is made only against the epoch the aggregate names in its last round. The design says the bundle index names the proofs; it should also say whether the index may name the epoch of a proof. The control plane does not write one, and the verifier does not need it.
+
+7. Anchors in `bundle verify`. The design (7.1) says `bundle verify` checks everything applicable in one run. Until step 21 it listed anchors and ended with status 3. It now verifies the anchors of every aggregate checkpoint of the bundle with the code of `anchors`, from the directories of the source, or from the paths the index names when the source cannot list them. `--require-anchors N` used to mean "any N above 0 ends with 3". It now means that at least N anchors must verify, and an anchor that cannot be checked is then a note. Without it every anchor the bundle holds must verify, and one that cannot is status 3, as it was. `--worm-url` and `--btc-header` are flags of `bundle verify` too. The design should say which of the two meanings of `--require-anchors` is the contract. The second is the one the console's bundle dialog needs.
+
+8. What was not tested against a real publication. The cluster test of step 20 was not run for step 21. The fixture of a closed epoch is built by the verifier's tests from the documents (the aggregate rounds, the event, the frozen log and the log of the new epoch), with the formats taken from the code that writes them. A real closed-epoch publication should be added to `testdata/publication` the way the other one was made, by a cluster test run with the fixtures variable set, and the cross-check of the verifier should read it. Until then the byte formats of the event are checked against the writer by reading, not by running.
+
+9. The eighth review. All twelve findings of the review of the publication and the client signatures (V8-01 to V8-12) were already fixed in the verifier; the project README still listed four of them as open. Step 21 re-ran every test of those fixes and mutated the fixes of the four medium findings; the results are in the verifier README.
+
+### Step 23: the release of the verifier
+
+What was built (branch ver-rel):
+
+1. `kingres/verifier/scripts/build-one.sh GOOS GOARCH VERSION OUTPUT` holds the reproducible build
+   flags in one place: CGO off, -trimpath, no VCS stamping, empty build id, no symbols, fixed
+   micro-architecture levels (GOAMD64=v1, GOARM64=v8.0), read-only module graph, GOWORK off,
+   GOTOOLCHAIN=local, and a cleaned environment (no GOFLAGS, compiler or level inherited).
+2. `scripts/release.sh --version TAG --out DIR (--key-file FILE | --unsigned) [--targets]` builds
+   the four named binaries through build-one.sh, writes SHA256SUMS (sha256sum -c format, checked
+   with sha256sum -c), signs it into SHA256SUMS.note (Ed25519 signed note, key name
+   kingres-verify-release) and verifies the note with `release verify` before it reports.
+3. `scripts/repro-check.sh` copies the source twice into paths of different depth and length, gives
+   each an empty Go cache and GOPATH, builds all four files in each and compares every byte.
+4. `kingres-verify release verify --sums F --note F --key KEY [--binary F]... [--name N]`: new
+   package `internal/release`, new file `internal/cli/cli_release.go`, three lines in the shared
+   dispatch (one case, one usage line, the unknown-command text).
+5. `cmd/kingres-release-tool` (keygen, pub, sums, sign): the signing side, not part of a release.
+6. Packaging: `LimitCORE=0` in kingres.service, a guard in build-deb.sh that refuses a unit
+   without it, build.sh builds kingres-verify through build-one.sh and records its SHA-256 in
+   BUILD-INFO, the man page and README.Debian say the server copy is for convenience only,
+   new `test/test-verifier-package.sh` (no Docker), extra checks in the Docker-based `test-deb.sh`
+   (not run here).
+7. README sections of the verifier and of the packaging directory.
+
+Decisions where the design was silent or open:
+
+- Signing is a separate program, not a subcommand of the verifier, so the verifier binary never
+  holds signing code and the tool is not shipped. A key is read only from a file of mode 0600
+  (never from the command line or environment); nothing is ever overwritten.
+- No private key exists in the repository; tests make theirs from a fixed seed or with keygen in a
+  temporary directory. The release key itself, its custody and its public value are the owner's
+  decision (design decision 33); the README says "not created yet" where the key will be printed.
+- go.mod is not edited by the release (the design said a toolchain line is added). Editing a
+  tracked file would make the built tree differ from the tag. The go line already names the exact
+  release; release.sh insists the installed Go equals it (or the toolchain line if one is added
+  later), with an explicit override for trials.
+- --version is mandatory and never guessed, because no tag exists before the first release. The
+  product version (0.1.0) is the intended value so the packaged binary equals the linux/amd64
+  release file; the packaging test proves this byte for byte.
+- The package's verifier is built by the same script as a release (no PIE, no build id), instead of
+  the PIE flags of the other Go programs, so it can match the release file. BUILD-INFO records its hash.
+- Exit codes follow 7.4: 0, 1 (step named), 2. Status 3 is not used by `release verify` because
+  every requested check is made or fails; with no --binary the note alone is checked and the output
+  lists "no binary was checked" under not proved.
+- The key argument is the raw base64 (exactly 44 characters, always read as raw) or the full key
+  string. The sums file is strict: plain file names only, two-space form, no duplicates, no blank
+  lines, and the note text must equal the file byte for byte.
+- --unsigned exists only so the reproducibility check and the packaging test run without a key; it
+  writes no note and prints that it is not a release.
+- Docker-free packaging test: the existing packaging tests build the whole product and run Docker
+  with systemd, far beyond the 2 GB limit, so the new test builds a real .deb from a small staged tree
+  with the real build-deb.sh. The running-node checks (systemctl show LimitCORE, /proc limits) were
+  added to test-deb.sh but not run.
+
+Bug found and fixed on the way: `signednote.ParseVKey` split the key string on every plus sign, but the
+base64 part of a key string may contain plus signs (about half of all keys), so those keys could not be
+read. It now splits into three parts. Only the new release code calls it.
+
