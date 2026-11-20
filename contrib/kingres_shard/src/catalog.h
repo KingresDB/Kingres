@@ -41,6 +41,7 @@ typedef struct KsDistTable
 	KsColocation *coloc;
 	NameData	dist_column;
 	bool		is_reference;	/* a reference table: no key, no colocation group */
+	bool		is_schema;		/* a table of a distributed schema (phase 11): one bucket, no key; kept in schema_tables, never in dist_tables */
 } KsDistTable;
 
 /* A node of the cluster. */
@@ -75,6 +76,9 @@ typedef struct KsCatalog
 	List	   *nodes;			/* of KsNode * */
 	List	   *colocations;	/* of KsColocation * */
 	HTAB	   *dist_tables;	/* relid -> KsDistTable */
+	int			nschema_tables;
+	HTAB	   *schema_tables;	/* relid -> KsDistTable (is_schema) of the tables of distributed schemas; no code that
+								 * works on hash-distributed tables sees them (phase 11, design/shard-phase11.md 5.1) */
 } KsCatalog;
 
 extern void kingres_shard_catalog_init(void);
@@ -96,6 +100,16 @@ extern int64 kingres_shard_partition_set_identity(int n, const Oid *oids);
 extern int64 kingres_shard_partition_identity_now(Oid parent);
 extern const KsDistTable *kingres_shard_lookup_dist_table(Oid relid);
 extern const KsColocation *kingres_shard_lookup_colocation(int colocation_id);
+
+/*
+ * Tables of distributed schemas (phase 11).  A schema table is a table of one colocation group of kind
+ * schema: one bucket, bucket 0, held by one shard group, the owner; on every other group the table is an
+ * empty "shell" that must never be read as if it held the rows.  The lookup returns NULL for a relation
+ * that is not one.
+ */
+extern const KsDistTable *kingres_shard_lookup_schema_table(const KsCatalog *cat, Oid relid);
+extern int	kingres_shard_schema_table_owner(const KsDistTable *st);
+extern const KsDistTable *kingres_shard_lookup_scan_table(const KsCatalog *cat, Oid relid);
 
 /*
  * The buckets of a colocation group.  Code that walks the buckets, or asks

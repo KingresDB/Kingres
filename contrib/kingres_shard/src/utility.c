@@ -259,6 +259,55 @@ rangevar_relid(RangeVar *rv)
 }
 
 /*
+ * refuse_copy_of_schema_shell
+ *
+ * COPY of the relation itself does not go through the planner hook (design/shard-phase11.md 6.8, item 3).
+ * For a table of a distributed schema that another shard group holds, this node has an empty copy:
+ * COPY TO would answer with no rows and COPY FROM would write to the copy.  Both are refused with a
+ * message that says where the rows are; the form COPY (SELECT ...) TO goes through the planner and reads
+ * the table from its owner.
+ */
+static void
+refuse_copy_of_schema_shell(CopyStmt *stmt)
+{
+	const KsCatalog *cat;
+	const KsDistTable *st;
+	Oid			relid;
+	int			owner;
+	const KsNode *node;
+
+	if (stmt->relation == NULL)
+		return;
+	cat = kingres_shard_catalog();
+	if (!cat->present || cat->nschema_tables == 0)
+		return;
+	relid = rangevar_relid(stmt->relation);
+	if (!OidIsValid(relid))
+		return;
+	st = kingres_shard_lookup_schema_table(cat, relid);
+	if (st == NULL)
+		return;
+	owner = kingres_shard_schema_table_owner(st);
+	if (owner == cat->local_group_id)
+		return;
+	node = kingres_shard_group_primary(owner);
+	if (stmt->is_from)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("COPY FROM into table \"%s\" of a distributed schema, which shard group %d holds, is not supported from shard group %d yet",
+						get_rel_name(relid), owner, cat->local_group_id),
+				 node ? errhint("Run COPY on node %d (%s:%d), the primary of shard group %d.",
+								node->node_id, node->host, node->port, owner) : 0));
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("COPY \"%s\" TO would read the empty copy of the table on this node; shard group %d holds the rows",
+					get_rel_name(relid), owner),
+			 errhint("Use COPY (SELECT * FROM %s) TO, which reads the table from shard group %d.",
+					 quote_qualified_identifier(get_namespace_name(get_rel_namespace(relid)), get_rel_name(relid)),
+					 owner)));
+}
+
+/*
  * reject
  *
  * Raise the error for a statement that is not supported on the distributed or
@@ -2055,6 +2104,11 @@ kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
 	/* Whatever the routing setting is: see refuse_trigger_on_reference_table. */
 	if (IsA(parsetree, CreateTrigStmt) && !creating_extension && !kingres_shard_session_forwarded())
 		refuse_trigger_on_reference_table((CreateTrigStmt *) parsetree);
+
+	/* COPY of a table of a distributed schema that another group holds (phase 11, design 6.8). */
+	if (IsA(parsetree, CopyStmt) && kingres_shard_enable_routing && !creating_extension &&
+		!kingres_shard_session_forwarded())
+		refuse_copy_of_schema_shell((CopyStmt *) parsetree);
 
 	/* The source of an online table operation is not changed by anybody else until it ends. */
 	if (!creating_extension && !kingres_shard_session_forwarded())

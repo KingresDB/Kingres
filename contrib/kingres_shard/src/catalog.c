@@ -435,6 +435,8 @@ catalog_load(void)
 		ctl.hcxt = newcxt;
 		cat.dist_tables = hash_create("kingres_shard dist tables", 64, &ctl,
 									  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		cat.schema_tables = hash_create("kingres_shard schema tables", 64, &ctl,
+										HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
 		if (complete)
 		{
@@ -588,6 +590,37 @@ catalog_load(void)
 				/* A relation that vanished is cleaned up by the drop trigger. */
 				if (get_rel_name(relid) == NULL)
 					continue;
+
+				/*
+				 * A table of a distributed schema (phase 11): no distribution column, the colocation
+				 * group of its schema (one bucket).  It is kept apart from the hash-distributed tables,
+				 * so that no code written for those meets it.
+				 */
+				if (strcmp(method, "schema") == 0)
+				{
+					KsDistTable *st;
+
+					if (cid_null)
+						continue;
+					st = hash_search(cat.schema_tables, &relid, HASH_ENTER, &found);
+					memset(st, 0, sizeof(*st));
+					st->relid = relid;
+					st->dist_attno = InvalidAttrNumber;
+					st->colocation_id = DatumGetInt32(ciddatum);
+					st->is_schema = true;
+					foreach(lc, cat.colocations)
+					{
+						KsColocation *c = (KsColocation *) lfirst(lc);
+
+						if (c->colocation_id == st->colocation_id)
+							st->coloc = c;
+					}
+					if (st->coloc == NULL)
+						hash_search(cat.schema_tables, &relid, HASH_REMOVE, NULL);
+					else
+						cat.nschema_tables++;
+					continue;
+				}
 				if (!is_ref)
 				{
 					if (col_null || cid_null)
@@ -603,6 +636,7 @@ catalog_load(void)
 				dt->colocation_id = is_ref ? 0 : DatumGetInt32(ciddatum);
 				dt->coloc = NULL;
 				dt->is_reference = is_ref;
+				dt->is_schema = false;
 				if (is_ref)
 					memset(&dt->dist_column, 0, sizeof(dt->dist_column));
 				else
@@ -918,6 +952,50 @@ kingres_shard_lookup_dist_table(Oid relid)
 	if (!cat->present || cat->ndist_tables == 0)
 		return NULL;
 	return hash_search(cat->dist_tables, &relid, HASH_FIND, NULL);
+}
+
+/*
+ * kingres_shard_lookup_schema_table
+ *
+ * The cached entry of a table of a distributed schema, or NULL.  The entry is not in
+ * dist_tables, so code that works on hash-distributed tables never sees it.
+ */
+const KsDistTable *
+kingres_shard_lookup_schema_table(const KsCatalog *cat, Oid relid)
+{
+	if (!cat->present || cat->nschema_tables == 0 || cat->schema_tables == NULL)
+		return NULL;
+	return hash_search(cat->schema_tables, &relid, HASH_FIND, NULL);
+}
+
+/*
+ * The shard group that holds the rows of a schema table: the group of its one bucket
+ * (-1 when the bucket is not mapped).
+ */
+int
+kingres_shard_schema_table_owner(const KsDistTable *st)
+{
+	return kingres_shard_bucket_group(st->coloc, kingres_shard_coloc_bucket(st->coloc, 0));
+}
+
+/*
+ * The table the distributed scan reads: a distributed table (not a reference table) or a table of a
+ * distributed schema, or NULL.
+ */
+const KsDistTable *
+kingres_shard_lookup_scan_table(const KsCatalog *cat, Oid relid)
+{
+	const KsDistTable *dt;
+
+	if (!cat->present)
+		return NULL;
+	if (cat->dist_tables != NULL && cat->ndist_tables > 0)
+	{
+		dt = hash_search(cat->dist_tables, &relid, HASH_FIND, NULL);
+		if (dt != NULL)
+			return dt->is_reference ? NULL : dt;
+	}
+	return kingres_shard_lookup_schema_table(cat, relid);
 }
 
 /*
