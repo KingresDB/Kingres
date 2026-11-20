@@ -1080,6 +1080,9 @@ func registerFailoverCallee(d *haDeps) {
 	d.Calls.Register(callMapAbandon, func(ctx context.Context, caller string, body []byte) (any, error) {
 		return handleMapAbandon(ctx, d, caller, body)
 	})
+	d.Calls.Register(callMapProof, func(ctx context.Context, caller string, body []byte) (any, error) {
+		return handleMapProof(ctx, d, caller, body)
+	})
 }
 
 var _ = url.Values{}

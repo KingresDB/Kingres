@@ -38,6 +38,7 @@ const (
 	callMapStart    = "POST /failover/map/start"
 	callMapContinue = "POST /failover/map/continue"
 	callMapAbandon  = "POST /failover/map/abandon"
+	callMapProof    = "POST /failover/map/proof"
 )
 
 // mapFailover is the server's part of the failover of the map group: the candidate that runs the bootstrap, the receiver that
@@ -166,11 +167,13 @@ type mapStartBody struct {
 	RequestedBy   string `json:"requestedBy"`
 	AllowDataLoss bool   `json:"allowDataLoss"`
 	Comment       string `json:"comment"`
+	// Planned is set by the old leader's own task for a planned switchover (handleMapStart accepts it from that server only).
+	Planned *journal.Planned `json:"planned,omitempty"`
 }
 
 // begin runs B1 here (the refusal answers the request) and starts the rest in the background.
 func (m *mapFailover) begin(ctx context.Context, b mapStartBody) error {
-	if _, err := m.runner.Decide(ctx, mapgroup.Request{OldServer: b.Server, Trigger: nonEmptyStr(b.Trigger, "manual"), RequestedBy: b.RequestedBy, AllowDataLoss: b.AllowDataLoss, Comment: b.Comment}); err != nil {
+	if _, err := m.runner.Decide(ctx, mapgroup.Request{OldServer: b.Server, Trigger: nonEmptyStr(b.Trigger, "manual"), RequestedBy: b.RequestedBy, AllowDataLoss: b.AllowDataLoss, Comment: b.Comment, Planned: b.Planned}); err != nil {
 		var ref *mapgroup.Refusal
 		if errors.As(err, &ref) {
 			return problem.New(problem.Code(ref.Code), ref.Message)
@@ -346,6 +349,14 @@ func handleMapStart(ctx context.Context, d *haDeps, caller string, body []byte) 
 	b.Trigger = "manual"
 	if b.RequestedBy == "" || b.RequestedBy == "system" {
 		b.RequestedBy = "operator (via " + caller + ")"
+	}
+	// A planned switchover is the old leader's own task: only that server may say so, and it says nothing about data loss (there is none to accept).
+	if b.Planned != nil {
+		if caller != b.Server || b.Planned.TaskID <= 0 || b.Planned.StandbyID <= 0 {
+			return nil, &internalapi.CallError{Status: http.StatusForbidden, Code: "forbidden", Message: "A planned switchover of the map group is started by the task of the old leader, on its own server."}
+		}
+		b.Planned.Checkpoint, b.Planned.ClusterState = "", ""
+		b.AllowDataLoss = false
 	}
 	if err := mf.begin(ctx, b); err != nil {
 		var p *problem.Problem
@@ -731,4 +742,34 @@ func handleMapAbandon(_ context.Context, d *haDeps, _ string, body []byte) (any,
 		return nil, err
 	}
 	return mapAbandonAnswer{Abandoned: ok}, nil
+}
+
+// mapProofBody is what the old leader sends after its clean stop (planned switchover): the shutdown checkpoint and the state of the cluster.
+type mapProofBody struct {
+	Checkpoint   string `json:"checkpoint"`
+	ClusterState string `json:"clusterState"`
+}
+
+// handleMapProof records the proof of the old leader's clean stop in the journal of the bootstrap. Only the old server of the journal sends it; the
+// standby that is promoted on it checks it against what it replayed (switchover_verify), so a wrong proof is refused there and not trusted here.
+func handleMapProof(_ context.Context, d *haDeps, caller string, body []byte) (any, error) {
+	mf := d.MapFailover
+	if mf == nil {
+		return nil, notStarted
+	}
+	var b mapProofBody
+	if err := json.Unmarshal(body, &b); err != nil || b.Checkpoint == "" || b.ClusterState == "" || len(b.Checkpoint) > 64 || len(b.ClusterState) > 64 {
+		return nil, badBody("a checkpoint and a cluster state")
+	}
+	cur, ok := mf.journal.Current()
+	if !ok || !mf.journal.Active() || cur.Planned == nil {
+		return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "conflict", Message: "No planned switchover of the map group is in progress on this server."}
+	}
+	if caller != cur.OldServer {
+		return nil, &internalapi.CallError{Status: http.StatusForbidden, Code: "forbidden", Message: "Only the old leader sends the proof of its stop."}
+	}
+	if err := mf.journal.SetProof(b.Checkpoint, b.ClusterState); err != nil {
+		return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "conflict", Message: err.Error()}
+	}
+	return struct{}{}, nil
 }

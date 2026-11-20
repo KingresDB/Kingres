@@ -151,3 +151,50 @@ func TestWhenABootstrapIsStuck(t *testing.T) {
 		t.Error("a promoted bootstrap is never given up")
 	}
 }
+
+// A planned switchover marks the journal once, before a standby is pinned; the proof is recorded once and a different one is refused.
+func TestThePlannedFieldsAndTheProofOfAJournal(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetProof("0/1", "shut down"); err == nil {
+		t.Fatal("a proof for a bootstrap that is not planned")
+	}
+	if _, err := s.Begin("b", "s1", 3, "manual", "op", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SetPlanned(Planned{TaskID: 9, StandbyID: 4}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SetPlanned(Planned{TaskID: 9, StandbyID: 4}); err != nil {
+		t.Fatalf("the same again: %v", err)
+	}
+	if _, err := s.SetPlanned(Planned{TaskID: 10, StandbyID: 4}); err == nil {
+		t.Fatal("another planned switchover on the same journal")
+	}
+	if err := s.SetProof("0/6000028", "shut down"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetProof("0/6000028", "shut down"); err != nil {
+		t.Fatalf("the same proof again: %v", err)
+	}
+	if err := s.SetProof("0/7000000", "shut down"); err == nil {
+		t.Fatal("another proof replaced the first")
+	}
+	// It survives a restart and is part of the copy that Current returns.
+	s2, err := Open(filepath.Dir(s.path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur, _ := s2.Current(); cur.Planned == nil || cur.Planned.Checkpoint != "0/6000028" || cur.Planned.TaskID != 9 {
+		t.Fatalf("after a restart: %+v", cur.Planned)
+	}
+	// A standby pinned: too late to mark a bootstrap as planned.
+	s3, _ := Open(t.TempDir())
+	_, _ = s3.Begin("c", "s1", 3, "manual", "op", false)
+	_, _ = s3.SetPin(Pin{StandbyID: 1, Server: "s2"})
+	if _, err := s3.SetPlanned(Planned{TaskID: 1, StandbyID: 1}); err == nil {
+		t.Fatal("planned after the pin")
+	}
+}
