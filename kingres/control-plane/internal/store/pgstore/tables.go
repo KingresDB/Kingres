@@ -130,7 +130,7 @@ func (s *Store) readTables(ctx context.Context, h *dbHandle, schema, name, class
 	if err != nil {
 		return nil, s.wrap("listing tables", err)
 	}
-	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (api.Table, error) {
+	out, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (api.Table, error) {
 		var (
 			t                  api.Table
 			method, column     *string
@@ -178,6 +178,45 @@ func (s *Store) readTables(ctx context.Context, h *dbHandle, schema, name, class
 		}
 		return t, nil
 	})
+	if err != nil || !hasShard {
+		return out, err
+	}
+	s.addPartitioning(ctx, h, out)
+	return out, nil
+}
+
+// addPartitioning fills Table.Partitioning (contract 0.14.0) of the user-partitioned distributed tables of the page; a catalog of an older extension has no such column and
+// nothing is added.
+func (s *Store) addPartitioning(ctx context.Context, h *dbHandle, ts []api.Table) {
+	if len(ts) == 0 {
+		return
+	}
+	var has bool
+	if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'kingres.dist_table'::regclass AND attname = 'partition_method' AND NOT attisdropped)`).Scan(&has); err != nil || !has {
+		return
+	}
+	rows, err := h.pool.Query(ctx, `SELECT n.nspname || '.' || c.relname, d.partition_method, d.partition_key,
+			(SELECT count(*) FROM kingres.dist_partition p WHERE p.parent = d.relid)::int
+		FROM kingres.dist_table d JOIN pg_class c ON c.oid = d.relid::oid JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE d.partition_method IS NOT NULL`)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	by := map[string]api.TablePartitioning{}
+	for rows.Next() {
+		var name string
+		var p api.TablePartitioning
+		if rows.Scan(&name, &p.Method, &p.Key, &p.PartitionCount) == nil {
+			by[name] = p
+		}
+	}
+	for i := range ts {
+		if p, ok := by[ts[i].Schema+"."+ts[i].Name]; ok {
+			q := p
+			ts[i].Partitioning = &q
+		}
+	}
 }
 
 // localGroup is the catalog group of this node (from local_node), used as the

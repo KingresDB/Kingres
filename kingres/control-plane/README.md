@@ -334,12 +334,12 @@ handlers in `internal/httpapi/handlers_config.go`, wiring in `cmd/kingresd/confi
 
 ## What is implemented
 
-The server implements revision **0.13.0** of the contract (132 operations, 108
+The server implements revision **0.14.0** of the contract (140 operations, 113
 paths; what is not done is in "Not done in this increment"). "Real" means the operation works against PostgreSQL or the local node
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **131 of 132 operations are real; 1 answer "not yet".**
+authenticated operation lists in 0.2.0. **139 of 140 operations are real; 1 answer "not yet".**
 
 | Tag | Real | Not yet |
 |---|---|---|
@@ -351,7 +351,7 @@ authenticated operation lists in 0.2.0. **131 of 132 operations are real; 1 answ
 | Databases | `getDatabaseCreateOptions`, `listDatabases`, `createDatabase`, `getDatabase`, `dropDatabase`, `updateDatabase` |  |
 | Shards | `getBucketDistribution`, `listColocationGroups`, `listBuckets` |  |
 | Ledger | `getLedgerStatus`, `listLedgerBlocks`, `listLedgerDigests`, `generateLedgerDigest`, `startLedgerVerification`, `listLedgerStatus`, `createInclusionProof`, `listLedgerVerifications`, `getLedgerVerification`, `getLedgerSettings`, `updateLedgerSettings`, `getLedgerSigning`, `createLedgerSigningKey`, `retireLedgerSigningKey`, `revokeLedgerSigningKey`, `getLedgerTrustFile`, `getLedgerPublication`, `getLedgerAggregate`, `listLedgerAggregates`, `listLedgerAnchorTargets`, `createLedgerAnchorTarget`, `getLedgerAnchorTarget`, `updateLedgerAnchorTarget`, `deleteLedgerAnchorTarget`, `testLedgerAnchorTarget`, `listLedgerAnchors`, `anchorLedgerNow`, `retryLedgerAnchor`, `downloadLedgerAnchor`, `listLedgerClientKeys`, `registerLedgerClientKey`, `revokeLedgerClientKey`, `setTableSignaturePolicy`, `upgradeLedgerExtension`, `createLedgerBundle`, `getLedgerBundle`, `acknowledgeLedgerDivergence` | |
-| Tables | `getTable`, `distributeTable`, `enableTableLedger`, `listTables` |  |
+| Tables | `getTable`, `distributeTable`, `enableTableLedger`, `listTables`, `previewTableChange`, `undistributeTable`, `alterTableDistribution`, `listTablePartitions`, `createTablePartition`, `attachTablePartition`, `detachTablePartition`, `dropTablePartition` |  |
 | Grants | `listGrants`, `createGrant`, `revokeGrants`, `applyGrantTemplate` |  |
 | Health | `getHealth`, `getReadiness` |  |
 | Logs | `listLogs` |  |
@@ -3429,3 +3429,38 @@ The review ([report](../docs/reviews/2026-11-20-kingresd-anchoring-wiring-and-pu
 * **The record of what was published (P7A-11, P7A-14).** A write that fails (disk full, directory gone, more than 32 MiB) leaves the record in memory current and the file behind; nothing is signed, and the critical alert stands, until it is written (it is tried before the next signature). The rename is followed by a sync of the directory.
 * **Decisions (P7A-15).** Written in correction 244 of the design: paths of `credentialsPath` and `caBundlePath`, addresses as IPs, what `kingres_readonly` reads, the probe objects of the Test in a bucket with a compliance retention, and `anchor_minimum`. They are decisions that stand, not defects.
 * **Not done:** a recovery of the lost rows of the aggregate log and the events from a mirror (it would keep the history unbroken; ADR 0025 names it); a console action for the acceptance; a cluster test of a restore of `kingres_cp` from a backup.
+## Table lifecycle (contract 0.14.0, increment 9.6 of the shard design)
+
+`distributeTable` (changed: a table with rows can be distributed), `undistributeTable`, `alterTableDistribution` and the five partition operations
+(`listTablePartitions`, `createTablePartition`, `attachTablePartition`, `detachTablePartition`, `dropTablePartition`) start tasks of kind `table.distribute`,
+`table.undistribute`, `table.alter` and `table.partition` (subject `table`, id `database/schema.table`); `previewTableChange` answers synchronously. The code is
+in `internal/ops/tablelife.go` (steps and the database side), `internal/ops/tableprep.go` (what is checked before a task exists), `internal/httpapi/handlers_tables.go`
+and `internal/api/tables_lifecycle.go`. They need `kingres_shard` 0.7 with its increments 9.3 to 9.9; without the report function the operations answer 422 `unsupported_operation`.
+
+- **Before the task exists.** The request is validated, the table is read, and `kingres.table_change_report` runs for the mode the task will use; a blocker is a 422
+  `table_not_eligible` with `blockers` (the lines of the report). `mode` `auto` is online when the online report has no blocker and the table has more than
+  100000 estimated rows, otherwise blocking; `online` and `blocking` ask for one and are refused with the blockers of that mode. An unfinished rebalance
+  answers 409 `rebalance_in_progress` (a rebalance that starts later is not stopped by a table task yet: see "Not done"). A busy colocation group is refused by the extension
+  and the task fails retryable with code `operation_in_progress`.
+- **Steps (online).** Check the table, (Find linked tables for an undistribute, Plan the change for an alter), Check free space, Prepare (`begin_table_operation`, which finds
+  an operation that is unfinished for the table, so the step is idempotent), Create the new layout (`table_operation_advance(..., 'shadow')`), Copy rows, Catch up with writers,
+  Switch, Verify and clean up. Blocking: Check the table, Check free space, Copy rows and switch (one call of the blocking function; writers wait), Verify and clean up. Partition tasks:
+  Check the request, Change the partitions on every server, Verify and clean up. A task recorded before this version (input without `v`) still runs its one step.
+- **Free space.** The estimate (rows and bytes of the table with its partitions; a distributed table's local partitions times the groups) is compared with the free space of each
+  destination server (a share of the data plus half again plus 64 MiB; an undistribute needs the whole table on its target). `Ops.DiskFree` tells it; `kingresd` knows the data directory of
+  its own server only, so other servers are not checked from here and the step is skipped when this server has no probe.
+- **The switch and `paused`.** When the attempts of the extension are used up (a long transaction holds the table) the step shows the blockers in the task's detail ("Waiting to switch: ...")
+  and tries again every 60 seconds, for as long as they hold (a day, then the task fails retryable with `switch_not_possible`). It does not use the engine's paused state: nothing resumes a paused table task, so the wait stays inside the step;
+  a cancel request is looked at between the attempts.
+- **Cancel and failure.** `Cancellable` is true until the switch is done (a blocking task: until its one call runs). A cancel, or a failure, of an online task that has not switched calls
+  `cancel_table_operation`, so nothing is left; a node that cannot be reached keeps its leftovers, named by the extension, for the recovery worker. A task killed with the process goes on at the first step that is not done (tests: `internal/ops/tablelife_test.go`, a crash at every step).
+- **dependentViews.** `recreate` sets `kingres_shard.dependent_views` for the operation (`SET` on the service connection of the blocking call, and in the options of `begin_table_operation`, which keeps it in the operation); `refuse` is the default.
+- **Table.partitioning** (optional) is read from `kingres.dist_table` by `listTables` and `getTable`.
+
+Tests. Unit (no database): `go test ./internal/ops ./internal/httpapi ./internal/contract ./internal/problem ./internal/api` (a fake database side: steps, crash at every step, cancel while the switch waits,
+blockers, free space, validation). Integration, with a cluster: `internal/clustertest/tablelife_test.go` (`TestTableLifecycle`: distribute with rows blocking and online with a writer on another server, a table
+that is refused, alter, undistribute, a cancel, a switch held by a transaction, partitions, views), run only with `scripts/run-integration.ps1 -Packages ./internal/clustertest -Run TestTableLifecycle` after the extension of this
+increment is installed in the installation of the tests.
+
+Not done: the rebalance does not look for an unfinished table task before it moves a bucket of the group (the extension refuses a move of a group that an operation claims; the rebalance then reports the move as failed); `Table.operation`
+(the unfinished task of a table) of the design is not in the contract yet; `relatedTables` of the distribute request (distribute with related tables) is increment 9.7; the free space of other servers.

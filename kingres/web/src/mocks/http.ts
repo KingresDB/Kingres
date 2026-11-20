@@ -118,6 +118,7 @@ const STATUS: Record<ProblemCode, number> = {
   signing_key_missing: 409,
   last_signing_key: 409,
   chain_not_diverged: 409,
+  table_not_eligible: 422,
   insufficient_disk: 409,
   no_receiving_server: 409,
   unprocessable: 422,

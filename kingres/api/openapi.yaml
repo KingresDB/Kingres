@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: KingresDB Management API
-  version: 0.13.0
+  version: 0.14.0
   summary: REST API of the KingresDB management panel, CLI and manager.
   description: |
     The single REST API served by `kingresd` on every KingresDB server. The web panel
@@ -1547,6 +1547,14 @@ paths:
         Turns a plain table into a hash-distributed table (by a distribution column) or a reference table
         (a full copy on every shard group). Requires sharding to be enabled on the database. Long-running: returns a task.
 
+        **0.14.0 (increment 9.6): a table with rows can be distributed.** `mode` `online` copies the rows while writers go on
+        (`create_distributed_table_concurrently`; needs a primary key or a unique index on NOT NULL columns); `blocking` makes writers wait for the whole copy;
+        `auto` (the default) is online for a table with a usable key and more than 100000 estimated rows. `bucketCount` sets the bucket count of a new
+        colocation group. `dependentViews` `recreate` makes the plain views that use the table be made again on the new table. A table that cannot be
+        distributed is refused before the task exists with 422 `table_not_eligible` and the `blockers` (the table's own report: for example a trigger, a foreign key to an ordinary table,
+        a materialized view that uses it). The free space of every destination server is checked first (step *Check free space*). A RANGE or LIST partitioned table
+        becomes a user-partitioned distributed table (blocking only). The text below, that the table must be empty, holds for contract versions before 0.14.0.
+
         **What the sharding extension can do, and what this operation refuses (0.9.0 states exactly that).**
         *Hash* (`kingres.create_distributed_table`): the table must be **empty** (422 `unprocessable`: distributing a
         table that has rows is a later phase; create an empty copy, distribute it and insert the rows), have a primary
@@ -1576,6 +1584,251 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '422': { $ref: '#/components/responses/UnprocessableEntity' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+    delete:
+      operationId: undistributeTable
+      summary: Turn a distributed table back into a plain table
+      description: |
+        Added in 0.14.0 (increment 9.6). Turns a distributed or reference table back into an ordinary table on one server
+        (`kingres.undistribute_table`, or `undistribute_table_concurrently` in mode `online`). With `cascadeViaForeignKeys` the tables
+        that foreign keys link to it are undistributed in the same operation; without it a table that is linked to others is refused
+        (422 `table_not_eligible`, the linked tables named in `blockers`). The table goes to the primary of the shard group
+        `targetGroupId` (default 0, the map group). Long-running: returns a task of kind `table.undistribute`. `mode`: `auto` (online when
+        the table has a usable key and more than 100000 estimated rows, otherwise blocking), `online` (writers go on; needs a primary key or a unique index
+        on NOT NULL columns) or `blocking` (writers wait for the whole copy). A user-partitioned table cannot be undistributed in this version
+        (`table_not_eligible`). The free space of the target server is checked first. `dependentViews` `recreate` makes the plain views that use the table be made
+        again on the new table (setting `kingres_shard.dependent_views`); a view on a server that will not hold the table makes the table not eligible.
+      tags: [Tables]
+      x-required-role: kingres_admin
+      parameters:
+        - name: cascadeViaForeignKeys
+          in: query
+          schema: { type: boolean, default: false }
+          description: Undistribute the tables that foreign keys link to this one too.
+        - name: targetGroupId
+          in: query
+          schema: { type: integer, format: int32, minimum: 0, default: 0 }
+          description: Shard group (`group_id`) whose primary receives the table; 0 is the map group.
+        - name: mode
+          in: query
+          schema: { $ref: '#/components/schemas/TableChangeMode' }
+        - name: dependentViews
+          in: query
+          schema: { $ref: '#/components/schemas/DependentViews' }
+      responses:
+        '202': { $ref: '#/components/responses/AcceptedTask' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+    patch:
+      operationId: alterTableDistribution
+      summary: Change the distribution of a distributed table
+      description: |
+        Added in 0.14.0. Changes the distribution column, the bucket count or the colocation group of a distributed table
+        (`kingres.alter_distributed_table`, or `alter_distributed_table_concurrently` in mode `online`); with `cascadeToColocated`
+        the tables of its colocation group change together (blocking mode only). At least one of `distributionColumn`, `bucketCount` and
+        `colocateWith` is needed (400 `validation_failed` otherwise). Long-running: returns a task of kind `table.alter`. A request that
+        changes the catalog only (no row moves) is done in one step. The free space of every destination server is checked first.
+        A user-partitioned table cannot be altered in this version (`table_not_eligible`).
+      tags: [Tables]
+      x-required-role: kingres_admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AlterTableDistributionRequest' }
+            examples:
+              buckets: { value: { bucketCount: 512 } }
+      responses:
+        '202': { $ref: '#/components/responses/AcceptedTask' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/distribution/preview:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+      - $ref: '#/components/parameters/SchemaName'
+      - $ref: '#/components/parameters/TableName'
+    post:
+      operationId: previewTableChange
+      summary: Preview a change of a table
+      description: |
+        Added in 0.14.0. What the report of the sharding extension (`kingres.table_change_report`) says about the change, without changing anything:
+        the `blockers` that would make the operation fail with 422 `table_not_eligible`, the `warnings` and `notes`, the tables the change would affect
+        (the table, the tables of its colocation group that would change with it, the tables linked by foreign keys), and an estimate of the work.
+        Synchronous; reads only.
+      tags: [Tables]
+      x-required-role: kingres_admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TableChangeRequest' }
+            examples:
+              distribute: { value: { kind: distribute, distribute: { method: hash, distributionColumn: customer_id } } }
+      responses:
+        '200':
+          description: The preview.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TableChangePreview' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partitions:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+      - $ref: '#/components/parameters/SchemaName'
+      - $ref: '#/components/parameters/TableName'
+    get:
+      operationId: listTablePartitions
+      summary: List the user partitions of a distributed table
+      description: |
+        Added in 0.14.0. The user partitions (`kingres.dist_partition`) of a distributed table that was partitioned by the user (RANGE or LIST),
+        with their bound, the number of their leaves (one per bucket) and, when it can be read, their size. An empty list for a table that is not user-partitioned.
+      tags: [Tables]
+      x-required-role: kingres_readonly
+      parameters:
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: A page of partitions.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TablePartitionPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+    post:
+      operationId: createTablePartition
+      summary: Create a user partition
+      description: |
+        Added in 0.14.0. Creates a partition of a user-partitioned distributed table (`kingres.create_partition`): one leaf in every bucket partition on
+        every server, in one transaction. `bound` is the text that follows `FOR VALUES` (`FROM ('2026-01-01') TO ('2026-02-01')`, `IN ('a', 'b')`) or `DEFAULT`.
+        Returns a task of kind `table.partition`; 409 `already_exists` when the partition exists and 409 `operation_in_progress` while a bucket move or
+        a table operation uses the colocation group (retry later).
+      tags: [Tables]
+      x-required-role: kingres_admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateTablePartitionRequest' }
+      responses:
+        '202': { $ref: '#/components/responses/AcceptedTask' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partitions/attach:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+      - $ref: '#/components/parameters/SchemaName'
+      - $ref: '#/components/parameters/TableName'
+    post:
+      operationId: attachTablePartition
+      summary: Attach a distributed table as a user partition
+      description: |
+        Added in 0.14.0. A distributed table of the colocation group of the table, on the same distribution column, becomes a user partition of it
+        (`kingres.attach_partition`); no row moves. Returns a task of kind `table.partition`.
+      tags: [Tables]
+      x-required-role: kingres_admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AttachTablePartitionRequest' }
+      responses:
+        '202': { $ref: '#/components/responses/AcceptedTask' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partitions/{partitionName}:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+      - $ref: '#/components/parameters/SchemaName'
+      - $ref: '#/components/parameters/TableName'
+      - $ref: '#/components/parameters/PartitionName'
+    delete:
+      operationId: dropTablePartition
+      summary: Drop a user partition
+      description: |
+        Added in 0.14.0. Drops a user partition with its leaves on every server (`kingres.drop_partition`); the rows of the partition are gone.
+        Returns a task of kind `table.partition`; 404 for a partition that does not exist.
+      tags: [Tables]
+      x-required-role: kingres_admin
+      responses:
+        '202': { $ref: '#/components/responses/AcceptedTask' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partitions/{partitionName}/detach:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+      - $ref: '#/components/parameters/SchemaName'
+      - $ref: '#/components/parameters/TableName'
+      - $ref: '#/components/parameters/PartitionName'
+    post:
+      operationId: detachTablePartition
+      summary: Detach a user partition as a table of its own
+      description: |
+        Added in 0.14.0. The partition becomes a distributed table of the same colocation group and distribution column (`kingres.detach_partition`); no
+        row moves. Returns a task of kind `table.partition`; 404 for a partition that does not exist. A table with foreign keys cannot detach a partition (`table_not_eligible`).
+      tags: [Tables]
+      x-required-role: kingres_admin
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DetachTablePartitionRequest' }
+      responses:
+        '202': { $ref: '#/components/responses/AcceptedTask' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
 
   /databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/ledger:
     parameters:
@@ -4565,6 +4818,12 @@ components:
       required: true
       description: Table name.
       schema: { type: string, minLength: 1, maxLength: 63 }
+    PartitionName:
+      name: partitionName
+      in: path
+      required: true
+      description: Name of a user partition (added in 0.14.0).
+      schema: { type: string, minLength: 1, maxLength: 57 }
     ColocationId:
       name: colocationId
       in: path
@@ -4819,6 +5078,8 @@ components:
       description: |
         Stable machine-readable error code. Clients branch on this, not on `title` or `detail`.
 
+        422: `table_not_eligible` (added in 0.14.0: the table cannot take the requested change; `blockers` says why).
+
         409 (state conflict): `conflict` (generic), `already_exists`, `immutable_field`,
         `rebalance_in_progress`, `operation_in_progress`, `task_not_cancellable`, `last_admin`, `role_in_use`,
         `optimistic_lock_failed`, `no_replica_available` (the instance or server is the only up-to-date copy),
@@ -4925,6 +5186,7 @@ components:
         - signing_key_missing
         - last_signing_key
         - chain_not_diverged
+        - table_not_eligible
     ValidationIssue:
       type: object
       description: One invalid field of a request.
@@ -4980,6 +5242,10 @@ components:
           type: integer
           minimum: 1
           description: 1-based character position of the error in the statement; present for some `sql_error` problems.
+        blockers:
+          type: array
+          description: Added in 0.14.0. The lines of the report of the sharding extension that make a table not eligible; present for `table_not_eligible`.
+          items: { $ref: '#/components/schemas/TableBlocker' }
         plan:
           $ref: '#/components/schemas/FailoverPlan'
           description: 'Added in 0.12.0, optional. The whole plan of the request (the same body as `dryRun` answers), present only when `code` is `failover_needs_decision`: the console shows the groups, the candidates and the verdict without asking again.'
@@ -7161,6 +7427,16 @@ components:
           format: int64
           minimum: 0
           description: Table size over all shards (primary copies); null when not available.
+        partitioning:
+          description: Added in 0.14.0, optional. How the user partitioned the table (a user-partitioned distributed table is also `distributed`); null when it is not partitioned.
+          oneOf:
+            - type: object
+              required: [method, key, partitionCount]
+              properties:
+                method: { type: string, enum: [range, list] }
+                key: { type: string }
+                partitionCount: { type: integer, minimum: 0 }
+            - type: 'null'
     DistributionBlockedReason:
       type: string
       description: |
@@ -7256,6 +7532,193 @@ components:
             - $ref: '#/components/schemas/TableRef'
             - type: 'null'
           description: Existing distributed table whose colocation group to join; null creates or reuses a group by column type.
+        bucketCount:
+          type: integer
+          minimum: 1
+          maximum: 4096
+          description: 'Added in 0.14.0. Bucket count of a new colocation group; ignored with `colocateWith`. Default: the database setting.'
+        mode:
+          $ref: '#/components/schemas/TableChangeMode'
+        dependentViews:
+          $ref: '#/components/schemas/DependentViews'
+
+    TableChangeMode:
+      type: string
+      description: |
+        Added in 0.14.0. How a table operation copies the rows. `auto` (the default): online when the table has a usable key and more than 100000 estimated rows, otherwise blocking.
+        `online`: writers go on (a capture trigger and a log on every node; needs a primary key or a unique index on NOT NULL columns). `blocking`: writers wait for the whole copy.
+      enum: [auto, online, blocking]
+      default: auto
+    DependentViews:
+      type: string
+      description: |
+        Added in 0.14.0. What an operation does with the plain views that use the table it replaces: `refuse` (the default; the view stops the operation, 422 `table_not_eligible`) or `recreate`
+        (the views and the views on them are dropped in the switch and made again on the new table with their owner, options, privileges and comments; sets
+        `kingres_shard.dependent_views` for the operation).
+      enum: [refuse, recreate]
+      default: refuse
+    AlterTableDistributionRequest:
+      type: object
+      description: |
+        Added in 0.14.0. What to change; at least one of `distributionColumn`, `bucketCount` and `colocateWith`.
+      minProperties: 1
+      properties:
+        distributionColumn:
+          type: string
+          description: The new distribution column (part of every unique key of the table).
+        bucketCount:
+          type: integer
+          minimum: 1
+          maximum: 4096
+          description: The new bucket count; a multiple of the old one moves no row between servers.
+        colocateWith:
+          oneOf:
+            - $ref: '#/components/schemas/TableRef'
+            - type: string
+              enum: [default, none]
+          description: A table whose colocation group to join, `default` (a group of the same type and bucket count) or `none` (a group of its own).
+        cascadeToColocated:
+          type: boolean
+          default: false
+          description: Change the tables of the colocation group together (blocking mode only).
+        mode:
+          $ref: '#/components/schemas/TableChangeMode'
+        dependentViews:
+          $ref: '#/components/schemas/DependentViews'
+    TableBlocker:
+      type: object
+      description: |
+        Added in 0.14.0. One line of the report of the sharding extension about a table: a blocker (the operation is refused), a warning or a note.
+      required: [code, object, message]
+      properties:
+        code:
+          type: string
+          description: The code of the extension, for example `partitioned_table`, `dependent_object`, `trigger`, `foreign_key_linked`, `no_unique_key`, `group_busy`. Clients tolerate codes they do not know.
+        object:
+          type: string
+          description: What the line is about (a table, a view, a constraint, a node).
+        message:
+          type: string
+          description: Human-readable text.
+    TableChangeRequest:
+      type: object
+      description: Added in 0.14.0. A change to preview.
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [distribute, undistribute, alter, createPartition, attachPartition, detachPartition, dropPartition]
+        distribute:
+          $ref: '#/components/schemas/DistributeTableRequest'
+        undistribute:
+          type: object
+          properties:
+            cascadeViaForeignKeys: { type: boolean }
+            targetGroupId: { type: integer, format: int32, minimum: 0 }
+            mode: { $ref: '#/components/schemas/TableChangeMode' }
+            dependentViews: { $ref: '#/components/schemas/DependentViews' }
+        alter:
+          $ref: '#/components/schemas/AlterTableDistributionRequest'
+        partition:
+          type: object
+          properties:
+            name: { type: string }
+            bound: { type: string }
+            table: { $ref: '#/components/schemas/TableRef' }
+    TableChangeTable:
+      type: object
+      description: Added in 0.14.0. A table that a change would touch.
+      required: [schema, name, role, sizeBytes, estimatedRows]
+      properties:
+        schema: { type: string }
+        name: { type: string }
+        role:
+          type: string
+          enum: [source, colocated, linked]
+        sizeBytes:
+          type: [integer, 'null']
+          format: int64
+          minimum: 0
+        estimatedRows:
+          type: [integer, 'null']
+          format: int64
+          minimum: 0
+    TableChangePreview:
+      type: object
+      description: Added in 0.14.0. The answer of `previewTableChange`.
+      required: [blockers, warnings, notes, affectedTables, estimate]
+      properties:
+        blockers:
+          type: array
+          items: { $ref: '#/components/schemas/TableBlocker' }
+        warnings:
+          type: array
+          items: { $ref: '#/components/schemas/TableBlocker' }
+        notes:
+          type: array
+          items: { $ref: '#/components/schemas/TableBlocker' }
+        affectedTables:
+          type: array
+          items: { $ref: '#/components/schemas/TableChangeTable' }
+        estimate:
+          type: object
+          required: [rows, bytes, modeRecommended, onlineAvailable, onlineUnavailableReason, writersBlocked]
+          properties:
+            rows: { type: [integer, 'null'], format: int64, minimum: 0, description: 'Estimated rows to copy; null when not available.' }
+            bytes: { type: [integer, 'null'], format: int64, minimum: 0, description: 'Estimated bytes to copy; null when not available.' }
+            modeRecommended: { type: string, enum: [online, blocking] }
+            onlineAvailable: { type: boolean }
+            onlineUnavailableReason: { type: [string, 'null'] }
+            writersBlocked: { type: string, enum: [none, switchOnly, wholeCopy], description: 'Who waits: nobody (a change of the catalog), writers during the switch only (online) or for the whole copy (blocking).' }
+    TablePartition:
+      type: object
+      description: Added in 0.14.0. A user partition of a distributed table.
+      required: [name, method, bound, isDefault, leafCount, sizeBytes]
+      properties:
+        name: { type: string }
+        method: { type: string, enum: [range, list] }
+        bound: { type: string, description: 'The text that follows `FOR VALUES`, or `DEFAULT`.' }
+        isDefault: { type: boolean }
+        leafCount: { type: integer, minimum: 0, description: 'One leaf per bucket.' }
+        sizeBytes: { type: [integer, 'null'], format: int64, minimum: 0, description: 'Size of the leaves that this server holds; null when not available.' }
+    TablePartitionPage:
+      type: object
+      description: Added in 0.14.0. A page of partitions.
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/TablePartition' }
+        nextCursor:
+          $ref: '#/components/schemas/NextCursor'
+    CreateTablePartitionRequest:
+      type: object
+      description: Added in 0.14.0.
+      required: [name, bound]
+      properties:
+        name:
+          type: string
+          maxLength: 57
+          description: Name of the partition; at most 57 bytes (leaf names append `_bNNNN`).
+        bound:
+          type: string
+          description: The text that follows `FOR VALUES` (`FROM ('2026-01-01') TO ('2026-02-01')`, `IN ('a')`) or `DEFAULT`.
+        ifNotExists:
+          type: boolean
+          default: false
+    AttachTablePartitionRequest:
+      type: object
+      description: Added in 0.14.0.
+      required: [table, bound]
+      properties:
+        table: { $ref: '#/components/schemas/TableRef' }
+        bound:
+          type: string
+          description: The text that follows `FOR VALUES`, or `DEFAULT`.
+    DetachTablePartitionRequest:
+      type: object
+      description: Added in 0.14.0. Reserved for options; the body may be absent.
+      properties: {}
 
     # ------------------------------------------------------------------ shards
     BucketState:
@@ -8021,6 +8484,9 @@ components:
         - ledger.bundle.create
         - ledger.epoch.start
         - ledger.upgrade
+        - table.undistribute
+        - table.alter
+        - table.partition
     TaskStep:
       type: object
       description: One step of a task.
@@ -8629,6 +9095,13 @@ components:
         - setTableSignaturePolicy
         - upgradeLedgerExtension
         - acknowledgeLedgerDivergence
+        - previewTableChange
+        - undistributeTable
+        - alterTableDistribution
+        - createTablePartition
+        - attachTablePartition
+        - detachTablePartition
+        - dropTablePartition
     AuditEvent:
       type: object
       description: One audit log entry.

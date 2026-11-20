@@ -400,6 +400,13 @@ const entries: Record<ProblemCode, Entry> = {
       'No other key is active, so ending this one would leave the ledger without a signer and no key would authorise the next. Add a new key first (a rotation), then end this one.',
     withDetail: true,
   },
+  table_not_eligible: {
+    tone: 'warning',
+    heading: 'This table cannot take the change',
+    message:
+      'The report of the sharding extension lists what stops it (a trigger, a key to an ordinary table, a view that depends on the table, ...). Remove the cause, or ask for the views to be recreated, and try again.',
+    withDetail: true,
+  },
   chain_not_diverged: {
     tone: 'info',
     heading: 'This chain has not diverged',

@@ -103,6 +103,10 @@ type Ops struct {
 	// LedgerAudit is the check "publication" of a verification: the findings of the audit of the stored logs of a database (nil: not supported).
 	LedgerAudit func(ctx context.Context, db string) ([]string, error)
 	BundleDir   string
+	// DiskFree, when set, tells the free space of the disk of a server (the table lifecycle checks the destinations before it copies); nil skips the check.
+	DiskFree DiskFree
+	// tableBackendOverride replaces the database side of the table tasks (tests).
+	tableBackendOverride tableBackend
 	// BG bounds background task runs; Wait waits for them.
 	BG  context.Context
 	Log *slog.Logger

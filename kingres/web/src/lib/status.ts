@@ -214,6 +214,7 @@ export const ALERT_KIND_LABEL: Record<AlertKind, string> = {
   ledgerPublicationBehind: 'Ledger publication is behind',
   ledgerSignerUnavailable: 'Ledger checkpoints cannot be signed',
   ledgerDigestOverdue: 'No ledger digest for too long',
+  certificateAuthorityUnavailable: 'The certificate authority is unavailable',
 }
 
 /** The label of an alert kind; a kind from a newer server is shown as sent (through SafeName). */
@@ -236,6 +237,9 @@ export const TASK_KIND_LABEL: Record<TaskKind, string> = {
   'database.update': 'Change a database',
   'database.drop': 'Drop a database',
   'table.distribute': 'Distribute a table',
+  'table.undistribute': 'Undistribute a table',
+  'table.alter': 'Change the distribution of a table',
+  'table.partition': 'Change the partitions of a table',
   rebalance: 'Rebalance',
   'replication.restorePreferredPrimaries': 'Restore preferred primaries',
   'ledger.verify': 'Verify the ledger',
@@ -346,6 +350,13 @@ export const AUDIT_ACTION_LABEL: Record<AuditAction, string> = {
   updateDatabase: 'Change a database',
   dropDatabase: 'Drop a database',
   distributeTable: 'Distribute a table',
+  previewTableChange: 'Preview a change of a table',
+  undistributeTable: 'Undistribute a table',
+  alterTableDistribution: 'Change the distribution of a table',
+  createTablePartition: 'Create a partition',
+  attachTablePartition: 'Attach a partition',
+  detachTablePartition: 'Detach a partition',
+  dropTablePartition: 'Drop a partition',
   enableTableLedger: 'Enable the ledger of a table',
   restorePreferredPrimaries: 'Restore preferred primaries',
   startRebalance: 'Start a rebalance',

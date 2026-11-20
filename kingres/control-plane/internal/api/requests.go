@@ -57,6 +57,11 @@ type DistributeTableRequest struct {
 	Method             string    `json:"method"`
 	DistributionColumn string    `json:"distributionColumn,omitempty"`
 	ColocateWith       *TableRef `json:"colocateWith,omitempty"`
+	// Added in contract 0.14.0: the bucket count of a new colocation group, how the rows are copied (auto, online, blocking) and what to do with
+	// the plain views that use the table (refuse, recreate).
+	BucketCount    *int   `json:"bucketCount,omitempty"`
+	Mode           string `json:"mode,omitempty"`
+	DependentViews string `json:"dependentViews,omitempty"`
 }
 
 // TableRef names a table.

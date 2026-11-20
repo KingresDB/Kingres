@@ -61,6 +61,10 @@ type createParams struct {
 // Definitions returns the task definitions of this package; the engine that
 // runs them is built by the caller (cluster wiring).
 func (o *Ops) Definitions() []task.Definition {
+	return append(o.baseDefinitions(), o.tableDefinitions()...)
+}
+
+func (o *Ops) baseDefinitions() []task.Definition {
 	return []task.Definition{
 		o.replicateDefinition(),
 		o.ledgerUpgradeDefinition(),
@@ -92,9 +96,6 @@ func (o *Ops) Definitions() []task.Definition {
 			return append(steps,
 				task.Step{Name: "Drop the database", Irreversible: true, Run: o.stepDropDB},
 				task.Step{Name: "Remove the settings", Run: o.stepDropSettings}), nil
-		}},
-		{Kind: KindTableDistribute, Steps: []task.Step{
-			{Name: "Distribute the table", Irreversible: true, Run: o.stepDistribute},
 		}},
 		{Kind: KindLedgerVerify, Steps: []task.Step{
 			{Name: "Verify the ledger", Run: o.stepVerifyLedger},
