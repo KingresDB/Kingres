@@ -3187,4 +3187,3 @@ Decisions where the design was silent or open:
 Bug found and fixed on the way: `signednote.ParseVKey` split the key string on every plus sign, but the
 base64 part of a key string may contain plus signs (about half of all keys), so those keys could not be
 read. It now splits into three parts. Only the new release code calls it.
-
