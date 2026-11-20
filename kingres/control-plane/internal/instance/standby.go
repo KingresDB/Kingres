@@ -155,11 +155,15 @@ const StandbyIdentMap = "kingres_standby"
 // reloads the standby when one changed and it runs. It reports whether it changed
 // anything.
 func (m *Manager) SyncAccess(ctx context.Context, from, to int, osUser string) (bool, error) {
-	if from == to {
-		// A server whose only instance is a standby (no primary left on it) has nothing to copy the rules from; copying
-		// a file onto itself would add the rule at every round.
+	if from == to && !m.IsCopy(to) {
+		// An instance that is the source of its own rules and is not a copy has nothing to add.
 		return false, nil
 	}
+	// from == to for a copy: a server whose only instance is a standby (the old primary that was rebuilt as a standby of the new one, with no
+	// primary left on the server) has no other instance to take the rules from. Its own files are made right: the rule that lets kingresd in
+	// through the unix socket is added when it is missing (the transformation below does nothing when it is there, so nothing is written
+	// at every round). Without it kingresd cannot reach the standby, which has the new primary's service password (round 2).
+
 	src, err := m.DataDir(from)
 	if err != nil {
 		return false, err
@@ -177,7 +181,18 @@ func (m *Manager) SyncAccess(ctx context.Context, from, to int, osUser string) (
 	}
 	changed := false
 	for _, f := range []string{"pg_hba.conf", "pg_ident.conf"} {
-		b, err := os.ReadFile(filepath.Join(src, f)) //nolint:gosec // fixed names below the manager root
+		// A source that is held (its writes are stopped for a switchover) has the hold rules in pg_hba.conf: the rules to copy are the ones it
+		// will have again, and the standbys of other groups on this server must keep admitting clients (F4-10).
+		var b []byte
+		var err error
+		if f == "pg_hba.conf" {
+			b, err = rulesAt(src)
+		} else {
+			b, err = os.ReadFile(filepath.Join(src, f)) //nolint:gosec // fixed names below the manager root
+		}
+		if err != nil && from == to && errors.Is(err, os.ErrNotExist) {
+			return false, nil // a directory without rules of its own has nothing to add its rule to
+		}
 		if err != nil {
 			return false, fmt.Errorf("instance: reading %s: %w", f, err)
 		}

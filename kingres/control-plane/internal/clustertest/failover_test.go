@@ -251,7 +251,7 @@ func TestFailoverOfAGroupWhoseServerIsDead(t *testing.T) {
 	old.StopStandbys()
 	killedAt := time.Now()
 
-	st, resp := leader.Do("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard", "comment": "test"}, nil)
+	st, resp := leader.DoThroughRestart("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard", "comment": "test"}, nil)
 	if st != 202 {
 		t.Fatalf("failover request: %d %v\n%s", st, resp, leader.LogTail(4000))
 	}
@@ -567,7 +567,7 @@ func TestFailoverSurvivesTheLeaderEndingAtAStepBoundary(t *testing.T) {
 			leader.SetFaults(fault.Spec{TaskExitPoint: pt.point, TaskExitStep: pt.step})
 			// allowDataLoss: after the restart of the leader the check of the group is older than the verdict accepts (the
 			// task pauses, which is the safe answer); what this test shows is the takeover of the steps, not the verdict.
-			st, resp := leader.Do("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard", "allowDataLoss": true}, nil)
+			st, resp := leader.DoThroughRestart("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard", "allowDataLoss": true}, nil)
 			if st != 202 {
 				t.Fatalf("failover request: %d %v", st, resp)
 			}

@@ -75,7 +75,7 @@ func TestFailoverFailedTaskKeepsTheLeaseOfThePromotedPrimary(t *testing.T) {
 	waitFacts(t, leader, g)
 	foKillServer(old)
 	leader.SetFaults(fault.Spec{FailoverPoint: fmt.Sprintf("Group %d: %s:before", g, failover.StepCatalog), FailoverMode: "fail"})
-	st, resp := leader.Do("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard"}, nil)
+	st, resp := leader.DoThroughRestart("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard"}, nil)
 	if st != 202 {
 		t.Fatalf("failover request: %d %v\n%s", st, resp, leader.LogTail(3000))
 	}
@@ -122,7 +122,7 @@ func TestFailoverRefusedWhenFencingOfTheOldPrimaryIsUnproven(t *testing.T) {
 	if st != 200 || plan["canProceed"] != false {
 		t.Fatalf("the plan must say that the failover cannot proceed: %d %v", st, plan)
 	}
-	st, resp := leader.Do("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard", "allowDataLoss": true}, nil)
+	st, resp := leader.DoThroughRestart("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard", "allowDataLoss": true}, nil)
 	if st != 202 {
 		t.Fatalf("an accepted failover: %d %v", st, resp)
 	}
@@ -168,7 +168,7 @@ func TestFailoverExcludesDatabaseCreationAndPausesAfterThePromotion(t *testing.T
 	waitFacts(t, leader, g)
 	foKillServer(old)
 	leader.SetFaults(fault.Spec{FailoverPoint: fmt.Sprintf("Group %d: %s:before", g, failover.StepCatalog), FailoverMode: "pause"})
-	st, resp := leader.Do("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard"}, nil)
+	st, resp := leader.DoThroughRestart("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard"}, nil)
 	if st != 202 {
 		t.Fatalf("failover request: %d %v", st, resp)
 	}
@@ -183,7 +183,7 @@ func TestFailoverExcludesDatabaseCreationAndPausesAfterThePromotion(t *testing.T
 		t.Fatalf("a database created while a failover is unfinished: %d %v", st, p)
 	}
 	leader.Heal()
-	st, resp = leader.Do("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard", "allowDataLoss": true}, nil)
+	st, resp = leader.DoThroughRestart("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard", "allowDataLoss": true}, nil)
 	if st != 202 && st != 200 {
 		t.Fatalf("the repeated request: %d %v", st, resp)
 	}
@@ -199,7 +199,7 @@ func TestFailoverEntryPointOfTheFailedOverServerForwards(t *testing.T) {
 	leader := c.Leader()
 	g, old, _ := foVictim(t, c)
 	waitFacts(t, leader, g)
-	st, resp := leader.Do("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard", "allowDataLoss": true}, nil)
+	st, resp := leader.DoThroughRestart("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard", "allowDataLoss": true}, nil)
 	if st != 202 {
 		t.Fatalf("failover request: %d %v", st, resp)
 	}
@@ -244,10 +244,26 @@ func TestFailoverCalleeRefusesUnfencedAndUnnamedCalls(t *testing.T) {
 	if code, err := leader.InternalCall(old, "POST", "/failover/demote", map[string]any{"mode": "immediate", "expectedTerm": -1}, nil); err != nil || code != 400 {
 		t.Errorf("demote without a group: %d %v, want 400", code, err)
 	}
+	// F4-09: the forward calls of a switchover need the fence of a run as well, and the mark and the stop need the term of the run.
+	for path, in := range map[string]any{"/failover/quiesce": failover.QuiesceRequest{Group: 1}, "/failover/mark": failover.MarkRequest{Group: 1, ExpectedTerm: 0},
+		"/failover/verify": failover.VerifyRequest{Group: 1, Mark: "0/1"}} {
+		if code, err := leader.InternalCallUnfenced(old, "POST", path, in, nil); err != nil || code != 400 {
+			t.Errorf("%s without the fence header: %d %v, want 400", path, code, err)
+		}
+	}
+	if code, err := leader.InternalCall(old, "POST", "/failover/mark", failover.MarkRequest{Group: 1, ExpectedTerm: -1}, nil); err != nil || code != 400 {
+		t.Errorf("mark without the term of the run: %d %v, want 400", code, err)
+	}
+	if code, err := leader.InternalCall(old, "POST", "/failover/demote", failover.DemoteRequest{Group: 1, Mode: "fast", ExpectedTerm: -1}, nil); err != nil || code != 400 {
+		t.Errorf("a clean stop without the term of the run: %d %v, want 400", code, err)
+	}
 	// The primary still runs: nothing was stopped by those calls.
 	var s failover.State
 	if code, err := leader.InternalCall(old, "GET", "/failover/state?group=1", nil, &s); err != nil || code != 200 {
 		t.Fatalf("state: %d %v", code, err)
+	}
+	if s.Quiesced || len(s.OutOfRecovery()) != 1 {
+		t.Errorf("the refused calls changed the primary: %+v", s)
 	}
 }
 
@@ -283,7 +299,7 @@ func foDeadFailover(t *testing.T, c *clustertest.Cluster, old *clustertest.Node,
 	leader := c.Leader()
 	waitFacts(t, leader, g)
 	foKillServer(old)
-	st, resp := leader.Do("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard"}, nil)
+	st, resp := leader.DoThroughRestart("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard"}, nil)
 	if st != 202 {
 		t.Fatalf("failover request: %d %v\n%s", st, resp, leader.LogTail(3000))
 	}
@@ -367,7 +383,7 @@ func TestFailoverEntryPointOfAServerWithoutALocalCatalogForwards(t *testing.T) {
 	g, old, _ := foVictim(t, c)
 	waitFacts(t, leader, g)
 	leader.SetFaults(fault.Spec{FailoverPoint: fmt.Sprintf("Group %d: %s:before", g, failover.StepCatalog), FailoverMode: "pause"})
-	st, resp := leader.Do("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard", "allowDataLoss": true}, nil)
+	st, resp := leader.DoThroughRestart("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard", "allowDataLoss": true}, nil)
 	if st != 202 {
 		t.Fatalf("failover request: %d %v", st, resp)
 	}
@@ -397,7 +413,7 @@ func TestFailoverEntryPointOfAServerWithoutALocalCatalogForwards(t *testing.T) {
 		t.Fatalf("the entry point of %s, whose local catalog is unreadable, does not answer: %v\n%s", old.Host, last, old.LogTail(3000))
 	}
 	leader.Heal()
-	st, resp = leader.Do("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard", "allowDataLoss": true}, nil)
+	st, resp = leader.DoThroughRestart("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard", "allowDataLoss": true}, nil)
 	if st != 202 && st != 200 {
 		t.Fatalf("the repeated request: %d %v", st, resp)
 	}

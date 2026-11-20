@@ -215,7 +215,11 @@ var handled = map[string]bool{
 
 // fenceRequired are the destructive calls of the failover: they are accepted from the leader only with the fence
 // header of a task run (F3-13).
-var fenceRequired = map[string]bool{"POST /failover/demote": true, "POST /failover/promote": true}
+var fenceRequired = map[string]bool{"POST /failover/demote": true, "POST /failover/promote": true,
+	// The forward calls of a planned switchover (F4-09): they end sessions, replace access rules, stop writes and prove a replay, so a leader that
+	// is not a live run of the task cannot make them. The undo calls (unquiesce, resume) are not fenced: the repair of a switchover that a task left
+	// behind has no run to show.
+	"POST /failover/quiesce": true, "POST /failover/mark": true, "POST /failover/verify": true}
 
 // CallError is an error with the status and code the internal API answers.
 type CallError struct {

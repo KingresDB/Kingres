@@ -72,6 +72,7 @@ type autoFake struct {
 	started  []string
 	stops    int
 	alerts   []string
+	cleared  []string
 }
 
 func (f *autoFake) View(context.Context) (AutoView, error) { return f.v, nil }
@@ -86,6 +87,8 @@ func (f *autoFake) Start(_ context.Context, s string) error {
 func (f *autoFake) Alert(_ context.Context, kind, _, _, _ string, raise bool) {
 	if raise {
 		f.alerts = append(f.alerts, kind)
+	} else {
+		f.cleared = append(f.cleared, kind)
 	}
 }
 func (f *autoFake) Log(string, ...any) {}
@@ -134,5 +137,28 @@ func TestAutoBacksOffAfterAFailedStartAndRaisesTheLimitOnce(t *testing.T) {
 	}
 	if len(f2.started) != 0 || len(f2.alerts) != 1 || f2.alerts[0] != "autoFailoverLimitReached" {
 		t.Fatalf("started %v alerts %v", f2.started, f2.alerts)
+	}
+}
+
+// F4-13. A leader that takes over does not know what the one before it raised: its first look clears the alert of the limit when the limit is
+// not reached (after a reset, the alert of the old leader would stay for ever), and raises it when it is.
+func TestANewLoopClearsTheAlertOfTheLimitWhenItIsNotReached(t *testing.T) {
+	f := &autoFake{v: autoView(), stopOK: true}
+	a := &Auto{P: f}
+	_, _ = a.Step(context.Background())
+	if len(f.cleared) != 1 || f.cleared[0] != "autoFailoverLimitReached" {
+		t.Fatalf("cleared %v", f.cleared)
+	}
+	f.started = nil
+	_, _ = a.Step(context.Background())
+	if len(f.cleared) != 1 {
+		t.Fatalf("the clear is repeated every look: %v", f.cleared)
+	}
+	f2 := &autoFake{v: autoView(), stopOK: true}
+	f2.v.Settings.EventsSinceReset = 1
+	a2 := &Auto{P: f2}
+	_, _ = a2.Step(context.Background())
+	if len(f2.alerts) != 1 {
+		t.Fatalf("raised %v", f2.alerts)
 	}
 }

@@ -191,7 +191,11 @@ func (r *Runner) Decide(ctx context.Context, req Request) (journal.Journal, erro
 		return journal.Journal{}, &Refusal{Code: "quorum_unavailable", Status: 503, Message: "This server cannot reach a majority of the servers; the map group is not promoted from a minority."}
 	}
 	if r.P.Live(ctx, req.OldServer) == "live" {
-		// The old server answers the liveness view: a partition on the leader's side, or a switchover. B3 asks it to stop first.
+		// The old server answers the liveness view: a partition on the leader's side, or a request of an operator for a switchover of the
+		// leader. Only an operator may go on: an automatic start for a server that is heard is refused (F4-05). B3 asks it to stop first.
+		if nonEmpty(req.Trigger, "manual") == "automatic" {
+			return journal.Journal{}, &Refusal{Code: "conflict", Status: 409, Message: "The old server of the map group is live for this server; an automatic failover does not start."}
+		}
 		r.logf("mapgroup: the old server %s is live for this server; B3 asks it to demote", req.OldServer)
 	}
 	id := strconv.FormatInt(r.now().UnixNano(), 36)
@@ -222,6 +226,14 @@ func (r *Runner) Run(ctx context.Context, req Request) (Result, error) {
 	var j journal.Journal
 	if cur, ok := r.Journal.Current(); ok && r.Journal.Active() {
 		j = cur
+		// A repeated request of an operator for the same server carries the decision (allowDataLoss) that the pause asked for (F4-01): the
+		// journal takes it, as long as nothing is pinned.
+		if req.OldServer == cur.OldServer && nonEmpty(req.Trigger, "manual") == "manual" {
+			var err error
+			if j, err = r.Journal.Begin(cur.ID, cur.OldServer, cur.Term, "manual", req.RequestedBy, req.AllowDataLoss); err != nil {
+				return Result{}, err
+			}
+		}
 	} else {
 		var err error
 		if j, err = r.Decide(ctx, req); err != nil {

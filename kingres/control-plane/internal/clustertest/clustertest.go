@@ -533,7 +533,7 @@ func (n *Node) MustPG(user, pass, db string) *pgx.Conn {
 	defer cancel()
 	c, err := n.PG(ctx, user, pass, db)
 	if err != nil {
-		n.t.Fatalf("node %d: connecting to %s as %s: %v", n.Index, db, user, err)
+		n.t.Fatalf("node %d: connecting to %s as %s: %v\n%s", n.Index, db, user, err, n.DownReport())
 	}
 	n.t.Cleanup(func() { _ = c.Close(context.Background()) })
 	return c

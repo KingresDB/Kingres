@@ -78,7 +78,7 @@ func TestOldPrimaryRunningUnfenced(t *testing.T) {
 		t.Fatal(err)
 	}
 	old.StopStandbys()
-	st, resp := leader.Do("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard", "allowDataLoss": true, "comment": "T11c"}, nil)
+	st, resp := leader.DoThroughRestart("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard", "allowDataLoss": true, "comment": "T11c"}, nil)
 	if st != 202 {
 		t.Fatalf("failover request: %d %v", st, resp)
 	}

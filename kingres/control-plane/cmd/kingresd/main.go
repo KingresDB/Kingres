@@ -473,6 +473,9 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 				mm := newMapMonitor(foDeps.mf, cfg.HA.FailureTimeout)
 				wg.Add(1)
 				go func() { defer wg.Done(); mm.Run(bgCtx) }()
+				rep := newSwitchoverRepair(foDeps.mf, fos, leaders, serverHost, log)
+				wg.Add(1)
+				go func() { defer wg.Done(); rep.Run(bgCtx) }()
 			}
 		})
 		return err

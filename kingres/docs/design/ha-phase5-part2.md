@@ -2479,3 +2479,47 @@ the dry run for a switchover are round 2. The contract is unchanged (0.13.0, tex
   `internal/instance/quiesce_test.go`. Cluster (`internal/clustertest/failover_switchover_test.go`): T12 `TestSwitchoverOfAGroup`, T12b
   `TestSwitchoverVerificationFails` and `TestSwitchoverWithAnUncleanStop`, T12c `TestSwitchoverCancelBeforeAndAfterThePointOfNoReturn`. The faults
   that stand in for the causes are callee-side points of the fault file: `quiesce:stall`, `verify:false`, `demote:state`.
+
+### The fixes for the independent review of increments 4 to 7 (F4-01 to F4-17, 2026-11-20)
+
+The review (`docs/reviews/2026-11-20-kingresd-failover-increments-4-7.md`) found no path to two writable primaries. What was changed, by finding:
+
+- **F4-03.** The hook of a failed switchover no longer rolls a group back when the failed step is the promotion or one of the steps after it
+  (`failedPastPromotion`): a promote call that did not answer may have taken effect, and resuming the old primary then could lose what the promoted
+  standby acknowledged.
+- **F4-01.** A repeated request of an operator for the map group takes the decision (`allowDataLoss`, the author) into the journal in progress as long as
+  nothing is pinned, in either direction; an automatic request never changes a journal that an operator began.
+- **F4-02, F4-12.** `failover.Repair` (`cmd/kingresd/switchoverrepair.go`) runs on the leader: when no failover task is unfinished and a group's catalog
+  primary has been seen held (hold rules, or the relinquished marker) for a minute, it resumes the group and puts the rules back; the rollback of a task
+  logs what it could not do. "Held" is read from the files (the state call and the entry point use `quiescedNow`), so it survives a restart of kingresd;
+  the rules are put back first and the entry point after.
+- **F4-04, F4-15.** The cool-down of the automatic failover sees a run that ended without finishing a group, and its age is measured by the database's clock.
+- **F4-05.** The map group calls are told their caller: `start` is never automatic (the monitor starts an automatic bootstrap itself), an automatic start
+  for a server that is heard is refused, and `continue` is accepted only from a server that hosts a ready standby of the map group and is cut at B4.
+  *Open:* the decision `allowDataLoss` of an operator is still carried in the body by the member that received the request; a member that is not honest can
+  set it (a signed assertion of the operator's session is the remedy and is not built).
+- **F4-06.** A map bootstrap that did not reach the promotion is given up by the candidate monitor when the catalog has a newer term or it is 15 minutes old
+  (`Journal.Abandon`, `journal.Stuck`); a promoted one cannot be given up. *Open:* no operator call to abandon (it would be a contract change).
+- **F4-07.** The call that promotes carries the shutdown checkpoint and the state, and the callee makes `switchover_verify` again before it changes anything; a
+  refusal (`unprovable`, `standby_behind`) is a rollback.
+- **F4-08.** `task.Step.Interruptible`: a cancel ends a running step of the kind (when the guard allows it) within one poll, not at its end; the steps of a
+  switchover before the promotion are interruptible.
+- **F4-09.** `quiesce`, `mark` and `verify` need the fence of a run, `mark` and the clean stop need the term of the run, and a term that cannot be read is a
+  refusal while the instance runs. `quiesce`, `unquiesce` and `resume` also carry the catalog term (`ExpectedTerm`) and are refused when the callee has seen a
+  newer one (the repair of switchovers passes the term it reads). *Why these cannot carry the fence of a task run:* the fence names a task and its epoch and
+  is checked against the task's row; `unquiesce` and `resume` are also made by the repair loop, which is not a task run, and the lease call is also made by the
+  bootstrap of the map group, which runs while the task engine is closed. The term is what refuses a late call of a superseded run or of a leader that is
+  behind; the replay that mattered (a late `resume` after the proof) is closed by the proof at the promotion (F4-07).
+- **F4-10, F4-11, F4-15.** While a primary is held the rules to copy to the standbys of the server are the backup; rules written during the hold are written behind
+  it; the hold of a standby is dropped; the quiesce ends sessions on the local socket too, matches `replication` as a word and waits until the postmaster has
+  loaded the hold rules (`pg_conf_load_time()`).
+- **F4-13, F4-14.** A new leader tells the alert of the limit once (raise or clear); the map monitor has a cool-down and a stagger of 90 s per rank.
+- **F4-15.** A target must name a group of the request also when the request names none; a comment may not hold control characters.
+- **Not changed:** F4-16 (a note), the B2 freeze of the map bootstrap is memory.
+
+**F4-02(c).** A switchover that cannot hear a majority after it stopped the writes (and, from the clean stop on, the old primary) no longer pauses with the group
+down: `takeFence` rolls it back through the path of every failure (`quorum_unavailable`, retryable), and the repair loop finishes what a server that cannot be reached
+still holds. A plain failover still pauses.
+
+**Open after the review (listed for later):** F4-05, the decision `allowDataLoss` of an operator that a member carries in the body of `start` (a signed assertion of the
+operator's session is the remedy); F4-06, an operator's call to abandon a stuck map bootstrap (a contract change; the monitor gives up a stale one by itself).

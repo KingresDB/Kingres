@@ -290,7 +290,12 @@ func (sc *stepCtx) row(ctx context.Context) (GroupRow, error) {
 }
 
 func (sc *stepCtx) runRow(ctx context.Context) (RunRow, error) {
-	run, ok, err := sc.rows.Run(ctx)
+	return runRowOf(ctx, sc.rows, sc.in, sc.group)
+}
+
+// runRowOf is the record of the run with the term that the calls of group expect.
+func runRowOf(ctx context.Context, rows Rows, in Input, group int32) (RunRow, error) {
+	run, ok, err := rows.Run(ctx)
 	if err != nil {
 		return run, err
 	}
@@ -300,11 +305,11 @@ func (sc *stepCtx) runRow(ctx context.Context) (RunRow, error) {
 	// The term the destructive calls of this group expect is the one the run read at its start, raised by the groups of
 	// this run that were promoted before it: each promote_node raises it by one, and the run itself did it. Without this
 	// the second group of a server that hosted two primaries met its own run's term and ended "superseded".
-	for _, g := range sc.in.Groups {
-		if g == sc.group {
+	for _, g := range in.Groups {
+		if g == group {
 			break
 		}
-		if gr, found, gerr := sc.rows.Group(ctx, g); gerr == nil && found && gr.TermAfter != nil && *gr.TermAfter > run.ExpectedTerm {
+		if gr, found, gerr := rows.Group(ctx, g); gerr == nil && found && gr.TermAfter != nil && *gr.TermAfter > run.ExpectedTerm {
 			run.ExpectedTerm = *gr.TermAfter
 		}
 	}
@@ -714,6 +719,12 @@ func (r *Runner) takeFence(ctx context.Context, env *task.Env, sc *stepCtx) erro
 			}
 			if r.now().Sub(quorumSince) > orDur(r.QuorumWait, time.Minute) {
 				r.Plan.Alert(ctx, "failoverBlocked", "warning", subjectOf(sc.group, sc.old()), "The server that runs the failover cannot hear a majority of the servers.", true)
+				if sc.in.graceful() {
+					// A switchover that waits for a majority is before the promotion and has stopped the writes of the group (and, from the clean stop on,
+					// the old primary): it does not wait for an operator with the group down. It goes back through the path of every failure, and the
+					// repair of switchovers finishes what a server that cannot be reached still holds (F4-02).
+					return sc.rollbackFailed(ctx, CodeQuorumUnavailable, true, "this server cannot hear a majority of the servers; shard group %d was given back to %s", sc.group, sc.old())
+				}
 				return &PauseError{Reason: "This server cannot hear a majority of the servers (quorum_unavailable); nothing was done. Repair the network or repeat the request from a server that can."}
 			}
 			sc.detail(ctx, "waiting for a majority of the servers to be heard")
@@ -1081,6 +1092,16 @@ func (r *Runner) promote(ctx context.Context, env *task.Env, sc *stepCtx) error 
 		return err
 	}
 	req := PromoteRequest{Group: sc.group, StandbyID: nw.ID, InstanceID: nw.InstanceID, ExpectedTerm: run.ExpectedTerm}
+	if sc.in.graceful() {
+		if st, serr := r.Peers.State(ctx, nw.Server, sc.group); !(serr == nil && len(st.OutOfRecovery()) > 0) {
+			// Not promoted yet: the proof is made again in the call (F4-07). The shutdown checkpoint is read again from the stopped old primary.
+			ans, derr := r.Peers.Demote(ctx, sc.old(), DemoteRequest{Group: sc.group, Mode: "fast", ExpectedTerm: run.ExpectedTerm})
+			if derr != nil || !ans.Stopped || ans.ClusterState != "shut down" || ans.Checkpoint == "" {
+				return sc.rollbackFailed(ctx, CodeSwitchoverUnproven, true, "the shutdown checkpoint of the old primary of shard group %d cannot be read before the promotion (%v)", sc.group, derr)
+			}
+			req.Checkpoint, req.ClusterState = ans.Checkpoint, ans.ClusterState
+		}
+	}
 	handedBack := false
 	unavailable := 0
 	for try := 0; ; try++ {
@@ -1095,6 +1116,11 @@ func (r *Runner) promote(ctx context.Context, env *task.Env, sc *stepCtx) error 
 			r.Plan.Audit(ctx, "failoverGroupPromoted", sc.group, map[string]any{"from": sc.old(), "to": nw.Server, "timeline": ans.Timeline,
 				"lsn": ans.Lsn, "allowDataLoss": sc.in.AllowDataLoss, "termBefore": run.ExpectedTerm})
 			return nil
+		case IsCode(err, "unprovable"):
+			// The callee refused before it promoted: this is still before the point of no return.
+			return sc.rollbackFailed(ctx, CodeSwitchoverUnproven, true, "the switchover of shard group %d cannot be proven at the promotion: %v", sc.group, err)
+		case IsCode(err, "standby_behind"):
+			return sc.rollbackFailed(ctx, CodeStandbyBehind, true, "the standby on %s does not hold everything the old primary of shard group %d wrote; it was not promoted", nw.Server, sc.group)
 		case IsCode(err, "stale_term"):
 			return fail(CodeSuperseded, false, "another failover changed the catalog term of the cluster")
 		case IsCode(err, "lease_not_held"):
@@ -1303,7 +1329,7 @@ func (r *Runner) catalogFollows(ctx context.Context, env *task.Env, sc *stepCtx)
 	for _, t := range targets {
 		o := r.promoteOptions(ctx, sc, gr, nw, run.ExpectedTerm)
 		o.NewNode, o.DB = t.newID, t.db
-		out, err := RunPromoteNode(ctx, r.Cat, o)
+		out, err := r.promoteNodePastPromotion(ctx, sc, nw, run.ExpectedTerm, o)
 		if err != nil {
 			var pe *PauseError
 			if errors.As(err, &pe) {
@@ -1382,7 +1408,7 @@ func (r *Runner) checkCatalog(ctx context.Context, env *task.Env, sc *stepCtx) e
 			}
 			o := r.promoteOptions(ctx, sc, gr, nw, run.ExpectedTerm)
 			o.NewNode, o.DB = t.newID, t.db
-			if _, err := RunPromoteNode(ctx, r.Cat, o); err != nil {
+			if _, err := r.promoteNodePastPromotion(ctx, sc, nw, run.ExpectedTerm, o); err != nil {
 				return err
 			}
 		}
@@ -1631,7 +1657,11 @@ func (r *Runner) clients(ctx context.Context, env *task.Env, sc *stepCtx) error 
 func (r *Runner) unfreeze(ctx context.Context, env *task.Env, sc *stepCtx) error {
 	if sc.in.graceful() {
 		// The old primary is a standby to be: its access rules are put back before the rebuild starts it again.
-		if err := r.Peers.Unquiesce(ctx, sc.old(), QuiesceRequest{Group: sc.group}); err != nil && !errors.Is(err, ErrUnreachable) && !IsCode(err, "no_instance") {
+		term := int64(-1)
+		if run, rerr := sc.runRow(ctx); rerr == nil {
+			term = run.ExpectedTerm
+		}
+		if err := r.Peers.Unquiesce(ctx, sc.old(), QuiesceRequest{Group: sc.group, ExpectedTerm: term}); err != nil && !errors.Is(err, ErrUnreachable) && !IsCode(err, "no_instance") {
 			r.log().Warn("failover: putting the access rules back", "group", sc.group, "error", err)
 		}
 	}
@@ -1758,4 +1788,35 @@ func (r *Runner) someStandbyReadable(ctx context.Context, group int32) (bool, er
 		}
 	}
 	return false, nil
+}
+
+// promoteNodePastPromotion runs kingres.promote_node after the point of no return, where nothing is failed (F3-04). A new primary
+// that does not accept connections for the whole wait is an instance that is down: its server's kingresd ended while the step
+// ran and was away longer than the lease, so the watchdog stopped it, and no lease round of that server asks for the group
+// before the catalog names it. The lease is handed to that server again (which starts the instance) and the promotion is asked
+// once more (it answers "already"); then the call is tried a second time. When that does not end either, the task pauses with
+// the reason: the repeated request does the same again, so a retry can succeed, and a failed task is not what the operator
+// meets after the promotion.
+func (r *Runner) promoteNodePastPromotion(ctx context.Context, sc *stepCtx, nw StandbyRec, term int64, o PromoteOptions) (PromoteOutcome, error) {
+	out, err := RunPromoteNode(ctx, r.Cat, o)
+	var fe *Error
+	if err == nil || !errors.As(err, &fe) || fe.Code != CodePromoteIncomplete {
+		return out, err
+	}
+	sc.event(ctx, "newPrimaryNotReady", map[string]any{"error": fe.Message})
+	if herr := sc.holdLease(ctx, nw, term, 0); herr != nil {
+		var he *Error
+		if errors.As(herr, &he) && he.Code == CodeSuperseded {
+			return out, herr
+		}
+		return out, sc.targetsPause(ctx, herr)
+	}
+	if _, perr := r.Peers.Promote(ctx, nw.Server, PromoteRequest{Group: sc.group, StandbyID: nw.ID, InstanceID: nw.InstanceID, ExpectedTerm: term}); perr != nil && IsCode(perr, "stale_term") {
+		return out, fail(CodeSuperseded, false, "another failover changed the catalog term of the cluster")
+	}
+	out, err = RunPromoteNode(ctx, r.Cat, o)
+	if err != nil && errors.As(err, &fe) && fe.Code == CodePromoteIncomplete {
+		return out, sc.targetsPause(ctx, err)
+	}
+	return out, err
 }

@@ -56,18 +56,27 @@ type world struct {
 	rows           *memRows
 	prepared       int
 	// the switchover
-	oldHolds      bool // the old primary's server holds the lease of its group
-	quiesceCalls  int  // calls of Quiesce that answer "sessions remain" before it succeeds
-	quiesceFail   bool // Quiesce never succeeds
-	oldPrepared   int  // prepared transactions on the old primary (decreasing by recovery)
-	markReplayed  bool // the standby has replayed the mark
-	stopState     string
-	stopStates    []string
-	stopN         int
-	verifyAnswers []bool // the answers of the proof, in order (the last one repeats)
-	verifyErr     error
-	verifyN       int
-	quiesced      bool
+	oldHolds           bool // the old primary's server holds the lease of its group
+	quiesceCalls       int  // calls of Quiesce that answer "sessions remain" before it succeeds
+	quiesceFail        bool // Quiesce never succeeds
+	oldPrepared        int  // prepared transactions on the old primary (decreasing by recovery)
+	markReplayed       bool // the standby has replayed the mark
+	stopState          string
+	stopStates         []string
+	stopN              int
+	promoteReqs        []PromoteRequest
+	oldPreparedUnknown bool    // the old primary does not report a count of prepared transactions
+	markErr            error   // the answer of the mark call
+	undoTerms          []int64 // the terms of the quiesce, unquiesce and resume calls
+	stopErr            error   // the answer of the clean stop call
+	notReleased        bool    // the clean stop does not release the lease
+	markTerms          []int64
+	stopTerms          []int64
+	promoteRefuse      error  // the answer of a promote call that carries a proof (the callee refuses it)
+	verifyAnswers      []bool // the answers of the proof, in order (the last one repeats)
+	verifyErr          error
+	verifyN            int
+	quiesced           bool
 }
 
 func newWorld() *world {
@@ -170,7 +179,9 @@ func (p fpeers) State(_ context.Context, server string, g int32) (State, error) 
 		}
 		st.Holds = p.w.oldHolds && p.w.oldWritable
 		pn := p.w.oldPrepared
-		st.Prepared = &pn
+		if !p.w.oldPreparedUnknown {
+			st.Prepared = &pn
+		}
 		st.Quiesced = p.w.quiesced
 		if p.w.oldWritable {
 			yes := !p.w.noWatchdog
@@ -233,6 +244,12 @@ func (p fpeers) Demote(_ context.Context, server string, r DemoteRequest) (Demot
 		return DemoteAnswer{}, p.w.oldRefusesDem
 	}
 	if r.Mode == "fast" {
+		p.w.mu.Lock()
+		p.w.stopTerms = append(p.w.stopTerms, r.ExpectedTerm)
+		p.w.mu.Unlock()
+		if p.w.stopErr != nil {
+			return DemoteAnswer{}, p.w.stopErr
+		}
 		p.w.rec("demote-fast %s", server)
 		p.w.oldWritable = false
 		state := p.w.stopState
@@ -248,7 +265,7 @@ func (p fpeers) Demote(_ context.Context, server string, r DemoteRequest) (Demot
 		}
 		p.w.stopN++
 		p.w.mu.Unlock()
-		return DemoteAnswer{Stopped: true, ClusterState: state, Checkpoint: "0/6000028", Released: true}, nil
+		return DemoteAnswer{Stopped: true, ClusterState: state, Checkpoint: "0/6000028", Released: !p.w.notReleased}, nil
 	}
 	p.w.rec("demote %s to=%s", server, r.TransferTo)
 	p.w.oldWritable = false
@@ -282,6 +299,13 @@ func (p fpeers) Lease(_ context.Context, server string, r LeaseRequest) (LeaseAn
 }
 
 func (p fpeers) Promote(_ context.Context, server string, r PromoteRequest) (PromoteAnswer, error) {
+	p.w.mu.Lock()
+	p.w.promoteReqs = append(p.w.promoteReqs, r)
+	p.w.mu.Unlock()
+	if p.w.promoteRefuse != nil && r.Checkpoint != "" {
+		p.w.rec("promote-refused-proof %s", server)
+		return PromoteAnswer{}, p.w.promoteRefuse
+	}
 	p.w.mu.Lock()
 	n := p.w.promoteN[server]
 	p.w.promoteN[server]++
@@ -647,6 +671,9 @@ func (m *memRows) Warned(context.Context) (bool, error) {
 }
 
 func (p fpeers) Quiesce(_ context.Context, server string, r QuiesceRequest) (QuiesceAnswer, error) {
+	p.w.mu.Lock()
+	p.w.undoTerms = append(p.w.undoTerms, r.ExpectedTerm)
+	p.w.mu.Unlock()
 	if err := p.unreach(server); err != nil {
 		return QuiesceAnswer{}, err
 	}
@@ -665,6 +692,9 @@ func (p fpeers) Quiesce(_ context.Context, server string, r QuiesceRequest) (Qui
 }
 
 func (p fpeers) Unquiesce(_ context.Context, server string, r QuiesceRequest) error {
+	p.w.mu.Lock()
+	p.w.undoTerms = append(p.w.undoTerms, r.ExpectedTerm)
+	p.w.mu.Unlock()
 	if err := p.unreach(server); err != nil {
 		return err
 	}
@@ -678,6 +708,12 @@ func (p fpeers) Unquiesce(_ context.Context, server string, r QuiesceRequest) er
 func (p fpeers) Mark(_ context.Context, server string, r MarkRequest) (MarkAnswer, error) {
 	if err := p.unreach(server); err != nil {
 		return MarkAnswer{}, err
+	}
+	p.w.mu.Lock()
+	p.w.markTerms = append(p.w.markTerms, r.ExpectedTerm)
+	p.w.mu.Unlock()
+	if p.w.markErr != nil {
+		return MarkAnswer{}, p.w.markErr
 	}
 	p.w.rec("mark %s", server)
 	return MarkAnswer{Mark: "0/6000000"}, nil
@@ -707,6 +743,9 @@ func (p fpeers) Verify(_ context.Context, server string, r VerifyRequest) (Verif
 }
 
 func (p fpeers) Resume(_ context.Context, server string, r ResumeRequest) error {
+	p.w.mu.Lock()
+	p.w.undoTerms = append(p.w.undoTerms, r.ExpectedTerm)
+	p.w.mu.Unlock()
 	if err := p.unreach(server); err != nil {
 		return err
 	}

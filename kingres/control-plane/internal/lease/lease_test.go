@@ -30,7 +30,7 @@ func newGrantor(t *testing.T, clk clock.Clock, dir string) *Grantor {
 
 func TestGrantorRefusesAnotherHolderUntilExpiryPlusMargin(t *testing.T) {
 	clk := clock.NewFake(time.Unix(0, 0))
-	g := newGrantor(t, clk, t.TempDir())
+	g := newGrantor(t, clk, tempDir(t))
 	if r, _ := g.Grant(1, "a", dur, false); !r.Granted {
 		t.Fatal("the first request must be granted")
 	}
@@ -55,7 +55,7 @@ func TestGrantorRefusesAnotherHolderUntilExpiryPlusMargin(t *testing.T) {
 
 func TestGrantorRenewalExtendsTheHold(t *testing.T) {
 	clk := clock.NewFake(time.Unix(0, 0))
-	g := newGrantor(t, clk, t.TempDir())
+	g := newGrantor(t, clk, tempDir(t))
 	_, _ = g.Grant(1, "a", dur, false)
 	clk.Advance(8 * time.Second)
 	_, _ = g.Grant(1, "a", dur, false)
@@ -66,7 +66,7 @@ func TestGrantorRenewalExtendsTheHold(t *testing.T) {
 }
 
 func TestGrantorRestartDoesNotGrantTwice(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempDir(t)
 	clk := clock.NewFake(time.Unix(0, 0))
 	g := newGrantor(t, clk, dir)
 	_, _ = g.Grant(1, "a", dur, false)
@@ -92,7 +92,7 @@ func TestGrantorRestartDoesNotGrantTwice(t *testing.T) {
 }
 
 func TestGrantorRefusesWhenTheGrantCannotBeRecorded(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempDir(t)
 	clk := clock.NewFake(time.Unix(0, 0))
 	g := newGrantor(t, clk, dir)
 	if err := os.RemoveAll(dir); err != nil {
@@ -110,7 +110,7 @@ func TestGrantorRefusesWhenTheGrantCannotBeRecorded(t *testing.T) {
 }
 
 func TestGrantorRejectsACorruptFile(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempDir(t)
 	if err := os.WriteFile(filepath.Join(dir, GrantsFile), []byte("{"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -165,13 +165,19 @@ type fakeVoter struct {
 	down     map[string]bool
 	gate     chan struct{}
 	asked    []string
+	// hang is the servers that accept the call and never answer (a peer that is stopped, a connection that is lost without a reset).
+	hang map[string]bool
 }
 
 func (v *fakeVoter) Grant(ctx context.Context, server string, req Request) (Reply, error) {
 	v.mu.Lock()
-	gate, down, g := v.gate, v.down[server], v.grantors[server]
+	gate, down, g, hang := v.gate, v.down[server], v.grantors[server], v.hang[server]
 	v.asked = append(v.asked, server)
 	v.mu.Unlock()
+	if hang {
+		<-ctx.Done()
+		return Reply{}, ctx.Err()
+	}
 	if gate != nil {
 		select {
 		case <-gate:
@@ -204,11 +210,11 @@ type rig struct {
 func newRig(t *testing.T, members []string, enforced bool) *rig {
 	t.Helper()
 	clk := clock.NewFake(time.Unix(0, 0))
-	r := &rig{clk: clk, inst: &fakeInstance{running: true}, dir: t.TempDir(), enf: &enforced}
+	r := &rig{clk: clk, inst: &fakeInstance{running: true}, dir: tempDir(t), enf: &enforced}
 	r.voter = &fakeVoter{grantors: map[string]*Grantor{}, down: map[string]bool{}}
 	for _, s := range members {
 		if s != "a" {
-			r.voter.grantors[s] = newGrantor(t, clk, filepath.Join(t.TempDir(), s))
+			r.voter.grantors[s] = newGrantor(t, clk, filepath.Join(tempDir(t), s))
 		}
 	}
 	m, err := New(Config{Self: "a", Clock: clk, Duration: dur, Renew: 2 * time.Second, Margin: margin,
@@ -221,7 +227,7 @@ func newRig(t *testing.T, members []string, enforced bool) *rig {
 	}
 	r.m = m
 	// A round ends when a majority answered; its last request may still be writing into the grantor's directory.
-	t.Cleanup(m.fl.waitAll)
+	t.Cleanup(func() { m.wg.Wait(); m.fl.waitAll() })
 	return r
 }
 
@@ -491,5 +497,70 @@ func TestConfirmingIsNotTrueWhileAFailedRenewalLeavesTheLeaseValid(t *testing.T)
 	}
 	if r.m.Confirming() {
 		t.Fatal("a group that was judged lost is being fenced, not confirmed")
+	}
+}
+
+// A round ends when a majority has answered: a grantor that never answers (a stopped peer, a connection lost without a reset) does
+// not hold the round, and the lease is renewed every time. The wait for the slowest grantor would run the lease out (duration
+// minus margin) on every loss of one server.
+func TestARoundDoesNotWaitForAGrantorThatNeverAnswers(t *testing.T) {
+	ctx := context.Background()
+	r := newRig(t, []string{"a", "b", "c"}, true)
+	r.voter.mu.Lock()
+	r.voter.hang = map[string]bool{"c": true}
+	r.voter.mu.Unlock()
+	for i := 0; i < 3; i++ {
+		start := time.Now()
+		r.m.Renew(ctx)
+		if d := time.Since(start); d > time.Second {
+			t.Fatalf("round %d took %v: it waited for the grantor that does not answer", i, d)
+		}
+		if !r.m.Holds(1) {
+			t.Fatalf("round %d: the lease was not renewed although two of three servers answered", i)
+		}
+		r.clk.Advance(2 * time.Second)
+	}
+}
+
+// flipSource is a topology source that hangs until its context ends once stuck is set (the catalog of the server cannot be read:
+// its instance is busy or being restarted).
+type flipSource struct {
+	t     Topology
+	mu    sync.Mutex
+	stuck bool
+}
+
+func (s *flipSource) Topology(ctx context.Context) (Topology, error) {
+	s.mu.Lock()
+	stuck := s.stuck
+	s.mu.Unlock()
+	if stuck {
+		<-ctx.Done()
+		return Topology{}, ctx.Err()
+	}
+	return s.t, nil
+}
+
+// The read of the topology is bounded: a catalog that does not answer must not stop the rounds (the cached topology is used, as for
+// any other error), or the lease runs out because nothing asked for it.
+func TestACatalogThatDoesNotAnswerDoesNotStopTheRounds(t *testing.T) {
+	ctx := context.Background()
+	r := newRig(t, []string{"a", "b", "c"}, true)
+	src := &flipSource{t: Topology{Groups: []int32{1}, Members: []string{"a", "b", "c"}}}
+	r.m.c.Source = src
+	r.m.Renew(ctx) // the topology is known now
+	src.mu.Lock()
+	src.stuck = true
+	src.mu.Unlock()
+	r.m.c.Renew = 300 * time.Millisecond
+	r.clk.Advance(2 * time.Second)
+	start := time.Now()
+	r.m.Renew(ctx)
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("the round waited %v for the catalog", d)
+	}
+	r.settle(t)
+	if r.m.state(1).lastStart != r.clk.Mono() {
+		t.Fatal("no round was asked while the catalog did not answer")
 	}
 }

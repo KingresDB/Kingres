@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -263,6 +264,10 @@ type Step struct {
 	Name string
 	// Irreversible steps say so; cancellation never undoes a finished step.
 	Irreversible bool
+	// Interruptible says that a cancel (when the kind's guard allows it) ends the step while it runs, by cancelling the context of Run, and not
+	// only at the next step boundary: a step that waits for a long time before the point of no return is one (F4-08). The task is then
+	// canceled as at a boundary, the step goes back to pending, and the hook of the kind runs.
+	Interruptible bool
 	// NonIdempotent marks a step that must never run twice. The engine
 	// records the step as running before it calls Run; when a later run finds
 	// that record (the leader died or lost its lease after the step started,
@@ -354,6 +359,8 @@ type Engine struct {
 	now func() time.Time
 	// renewEvery replaces the renewal ticker (tests).
 	renewEvery <-chan time.Time
+	// cancelPoll is how often a running interruptible step looks for a cancel (default 1 s; tests).
+	cancelPoll time.Duration
 	// gate, when set and false, keeps the engine from claiming or running (Options.Gate).
 	gate    func() bool
 	log     *slog.Logger
@@ -376,6 +383,8 @@ type Options struct {
 	// RenewEvery, when set, replaces the renewal ticker: one renewal per
 	// received value. Only tests use it, to drive the renewals without waiting.
 	RenewEvery <-chan time.Time
+	// CancelPoll is how often a running interruptible step looks for a cancel (default one second; tests).
+	CancelPoll time.Duration
 	Logger     *slog.Logger
 	// StoreTries is how many times a store write is tried, one second apart
 	// (default 30).
@@ -395,7 +404,7 @@ type Options struct {
 // NewEngine builds an engine. Definitions must have at least one step each.
 func NewEngine(s Store, defs []Definition, o Options) (*Engine, error) {
 	e := &Engine{store: s, defs: map[string]Definition{}, holder: o.Holder, lease: o.Lease, poll: o.Poll,
-		now: o.Now, log: o.Logger, tries: o.StoreTries, faultFn: o.Fault, renewEvery: o.RenewEvery, gate: o.Gate}
+		now: o.Now, log: o.Logger, tries: o.StoreTries, faultFn: o.Fault, renewEvery: o.RenewEvery, cancelPoll: o.CancelPoll, gate: o.Gate}
 	if e.holder == "" {
 		return nil, errors.New("task: a holder id is required")
 	}
@@ -616,7 +625,17 @@ func (e *Engine) run(ctx context.Context, t Task, started time.Time, secrets map
 			return e.cancelTask(ctx, t, def, i)
 		}
 		e.fault(FaultStepStarted, t.ID, i)
-		if err := st.Run(fence.With(runCtx, fence.Token{Task: t.ID, Epoch: env.lease.Epoch}), env); err != nil {
+		stepCtx, interrupted, stopWatch := e.watchCancel(runCtx, t.ID, def, st)
+		err := st.Run(fence.With(stepCtx, fence.Token{Task: t.ID, Epoch: env.lease.Epoch}), env)
+		stopWatch()
+		if interrupted.Load() {
+			// The cancel ended the step: it is not a failure of the step but the end of the task, as at a boundary.
+			if _, serr := e.setStep(ctx, t, i, StepPending, percent(i, len(def.Steps))); serr != nil && leaseLost(serr) {
+				return ErrLeaseLost
+			}
+			return e.cancelTask(ctx, t, def, i)
+		}
+		if err != nil {
 			// A step that was refused for its lease or its fence did not fail: the run was
 			// superseded, or its lease ran out. It stands down and does nothing more in the
 			// name of the task (no record, no hook, no alert); see leaseLost.
@@ -677,6 +696,41 @@ func (e *Engine) run(ctx context.Context, t Task, started time.Time, secrets map
 	err = e.finish(ctx, t, Done, nil)
 	e.fault(FaultAfterFinish, t.ID, len(def.Steps))
 	return err
+}
+
+// watchCancel runs while an interruptible step runs: it asks the store for the cancel mark every second and, when the guard of the kind
+// allows the cancel, cancels the context of the step. A step that is not interruptible gets the context of the run.
+func (e *Engine) watchCancel(runCtx context.Context, id int64, def Definition, st Step) (context.Context, *atomic.Bool, func()) {
+	interrupted := new(atomic.Bool)
+	if !st.Interruptible || def.Cancellable == nil {
+		return runCtx, interrupted, func() {}
+	}
+	stepCtx, cancel := context.WithCancel(runCtx)
+	done := make(chan struct{})
+	go func() {
+		every := e.cancelPoll
+		if every <= 0 {
+			every = time.Second
+		}
+		tick := time.NewTicker(every)
+		defer tick.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-stepCtx.Done():
+				return
+			case <-tick.C:
+				now, err := e.store.Get(context.WithoutCancel(runCtx), id)
+				if err == nil && now.CancelRequested && def.Cancellable(now) {
+					interrupted.Store(true)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return stepCtx, interrupted, func() { close(done); cancel() }
 }
 
 // leaseGuard cancels a run whose lease may have expired. validUntil is the

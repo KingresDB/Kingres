@@ -133,7 +133,7 @@ func TestRunningInstanceIsKeptAcrossARestartOfTheManager(t *testing.T) {
 // A standby instance of another group runs on this server whatever the state of this
 // server's own lease.
 func TestGateNeverHoldsBackAStandby(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempDir(t)
 	if _, err := PrepareStart(dir, func(int32) bool { return true }); err != nil {
 		t.Fatal(err)
 	}

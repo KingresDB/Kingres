@@ -272,7 +272,7 @@ func failoverState(ctx context.Context, d *haDeps, group int32) StateAnswer {
 		out.Adopted, out.Attached, _ = d.LeaseMgr.Adopted(group)
 		out.Relinquished = d.LeaseMgr.Relinquished(group)
 	}
-	out.Quiesced = quiesced.has(group)
+	out.Quiesced = quiescedNow(d, group)
 	if d.Standby != nil {
 		for _, g := range d.Standby.agent.FrozenGroups() {
 			if g == group {

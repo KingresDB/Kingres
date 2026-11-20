@@ -486,7 +486,11 @@ func (m *Manager) WriteHBA(id int, rules []HBARule, tlsRequired bool) error {
 	// its private socket by peer authentication (StandbyIdentMap). The rule must survive the rewrite of the rules that a primary gets.
 	text = withStandbyAccessRule(text, m.IsCopy(id))
 	data, _ := m.DataDir(id)
-	return writeAtomic(filepath.Join(data, "pg_hba.conf"), []byte(text))
+	if !m.IsWritable(id) {
+		dropHold(data) // a standby has no hold: the rules written for it are the rules
+	}
+	// While the instance is held the rules are written behind the hold, not over it (F4-10).
+	return writeRulesAt(data, text)
 }
 
 // WriteManaged replaces kingres-managed.conf atomically; changes of port,

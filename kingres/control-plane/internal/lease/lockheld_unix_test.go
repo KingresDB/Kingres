@@ -12,7 +12,7 @@ import (
 )
 
 func TestLockHeldSeesAnotherHolder(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "watchdog.1.lock")
+	p := filepath.Join(tempDir(t), "watchdog.1.lock")
 	if LockHeld(p) {
 		t.Fatal("a file that does not exist is not held")
 	}
