@@ -149,6 +149,7 @@
 
 /* GUC variables (defined in kingres_shard.c). */
 extern PGDLLIMPORT int kingres_shard_default_bucket_count;
+extern PGDLLIMPORT int kingres_shard_min_bucket_cost;
 extern PGDLLIMPORT bool kingres_shard_enable_routing;
 extern PGDLLIMPORT bool kingres_shard_forwarded;
 extern PGDLLIMPORT int kingres_shard_node_connect_timeout;

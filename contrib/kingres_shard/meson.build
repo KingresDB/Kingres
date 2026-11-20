@@ -80,6 +80,7 @@ tests += {
       'catalog',
       'bucket_for',
       'bucket_lookup',
+      'bucket_layout',
       'distribute',
       'distribute_rows',
       'sequence_options',
@@ -91,6 +92,7 @@ tests += {
       'reference',
       'ddl_single',
       'rebalance_plan',
+      'plan_strategies',
       'bulk_plans',
       'pushdown_shippable',
       'pushdown_plans',
@@ -295,6 +297,7 @@ tests += {
       't/233_schema_ddl_cluster.pl',
       't/234_schema_modes_cluster.pl',
       't/235_schema_route_cluster.pl',
+      't/236_schema_with_elasticity_cluster.pl',
     ],
   },
 }

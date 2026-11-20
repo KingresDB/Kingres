@@ -25,8 +25,10 @@ SELECT attname, format_type(atttypid, atttypmod) AS type, attnotnull
  bucket_count     | integer | t
  dist_column_type | regtype | f
  dist_collation   | oid     | t
+ max_modulus      | integer | t
+ placement_epoch  | bigint  | t
  kind             | text    | t
-(5 rows)
+(7 rows)
 
 SELECT attname, format_type(atttypid, atttypmod) AS type, attnotnull, pg_get_expr(d.adbin, d.adrelid) AS default
   FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
@@ -53,26 +55,27 @@ SELECT conrelid::regclass AS tbl, conname, pg_get_constraintdef(oid) AS def FROM
  kingres.colocation        | colocation_bucket_count_check   | CHECK (((bucket_count >= 1) AND (bucket_count <= 4096)))
  kingres.colocation        | colocation_kind_check           | CHECK ((kind = ANY (ARRAY['hash'::text, 'schema'::text])))
  kingres.colocation        | colocation_kind_shape_check     | CHECK ((((kind = 'hash'::text) AND (dist_column_type IS NOT NULL)) OR ((kind = 'schema'::text) AND (dist_column_type IS NULL) AND (bucket_count = 1))))
+ kingres.colocation        | colocation_max_modulus_check    | CHECK (((max_modulus >= 1) AND (max_modulus <= 65536)))
  kingres.dist_table        | dist_table_method_check         | CHECK ((method = ANY (ARRAY['hash'::text, 'reference'::text, 'schema'::text])))
  kingres.dist_table        | dist_table_partition_check      | CHECK ((((partition_method IS NULL) AND (partition_key IS NULL)) OR ((method = 'hash'::text) AND (partition_method = ANY (ARRAY['range'::text, 'list'::text])) AND (partition_key IS NOT NULL))))
  kingres.dist_table        | dist_table_shape_check          | CHECK ((((method = 'hash'::text) AND (dist_column IS NOT NULL) AND (colocation_id IS NOT NULL)) OR ((method = 'reference'::text) AND (dist_column IS NULL) AND (colocation_id IS NULL)) OR ((method = 'schema'::text) AND (dist_column IS NULL) AND (colocation_id IS NOT NULL))))
  kingres.sharding_settings | sharding_settings_default_check | CHECK (((distribute_new_schemas = false) OR (mode = ANY (ARRAY['schema'::text, 'both'::text]))))
  kingres.sharding_settings | sharding_settings_mode_check    | CHECK ((mode = ANY (ARRAY['row'::text, 'schema'::text, 'both'::text])))
-(8 rows)
+(9 rows)
 
 -- The checks of kind and method.
 INSERT INTO kingres.colocation (colocation_id, bucket_count, dist_column_type, kind) VALUES (50, 2, NULL, 'schema');
 ERROR:  new row for relation "colocation" violates check constraint "colocation_kind_shape_check"
-DETAIL:  Failing row contains (50, 2, null, 0, schema).
+DETAIL:  Failing row contains (50, 2, null, 0, 2, 0, schema).
 INSERT INTO kingres.colocation (colocation_id, bucket_count, dist_column_type, kind) VALUES (50, 1, 'int4', 'schema');
 ERROR:  new row for relation "colocation" violates check constraint "colocation_kind_shape_check"
-DETAIL:  Failing row contains (50, 1, integer, 0, schema).
+DETAIL:  Failing row contains (50, 1, integer, 0, 1, 0, schema).
 INSERT INTO kingres.colocation (colocation_id, bucket_count, dist_column_type, kind) VALUES (50, 4, NULL, 'hash');
 ERROR:  new row for relation "colocation" violates check constraint "colocation_kind_shape_check"
-DETAIL:  Failing row contains (50, 4, null, 0, hash).
+DETAIL:  Failing row contains (50, 4, null, 0, 4, 0, hash).
 INSERT INTO kingres.colocation (colocation_id, bucket_count, dist_column_type, kind) VALUES (50, 4, 'int4', 'bogus');
 ERROR:  new row for relation "colocation" violates check constraint "colocation_kind_check"
-DETAIL:  Failing row contains (50, 4, integer, 0, bogus).
+DETAIL:  Failing row contains (50, 4, integer, 0, 4, 0, bogus).
 INSERT INTO kingres.dist_table VALUES ('pg_class'::regclass, 'schema', 'oid', 1);
 ERROR:  new row for relation "dist_table" violates check constraint "dist_table_shape_check"
 DETAIL:  Failing row contains (pg_class, schema, oid, 1, null, null, null).

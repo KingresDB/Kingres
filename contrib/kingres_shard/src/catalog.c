@@ -526,27 +526,43 @@ catalog_load(void)
 				}
 			}
 
-			/* colocation(colocation_id, bucket_count, dist_column_type, dist_collation) */
+			/*
+			 * colocation(colocation_id, bucket_count, dist_column_type, dist_collation,
+			 * max_modulus, placement_epoch): the last two exist from 0.8; a catalog that is not
+			 * upgraded yet has the layout of a group that was never split.
+			 */
 			catscan_begin(&cs, relids[1]);
 			while ((tup = catscan_next(&cs)) != NULL)
 			{
 				TupleDesc	desc = RelationGetDescr(cs.rel);
 				bool		isnull;
-				KsColocation *c = palloc0(sizeof(KsColocation));
-				int			b;
+				int			cid = DatumGetInt32(heap_getattr(tup, 1, desc, &isnull));
+				int			count = DatumGetInt32(heap_getattr(tup, 2, desc, &isnull));
+				Oid			dtype = DatumGetObjectId(heap_getattr(tup, 3, desc, &isnull));
+				Oid			coll = DatumGetObjectId(heap_getattr(tup, 4, desc, &isnull));
+				int			maxmod = count;
+				int64		epoch = 0;
 
-				c->colocation_id = DatumGetInt32(heap_getattr(tup, 1, desc, &isnull));
-				c->bucket_count = DatumGetInt32(heap_getattr(tup, 2, desc, &isnull));
-				c->dist_type = DatumGetObjectId(heap_getattr(tup, 3, desc, &isnull));
-				c->collation = DatumGetObjectId(heap_getattr(tup, 4, desc, &isnull));
-				c->bucket_group = palloc(sizeof(int) * c->bucket_count);
-				for (b = 0; b < c->bucket_count; b++)
-					c->bucket_group[b] = -1;
-				cat.colocations = lappend(cat.colocations, c);
+				if (desc->natts >= 5)
+				{
+					Datum		d = heap_getattr(tup, 5, desc, &isnull);
+
+					if (!isnull)
+						maxmod = DatumGetInt32(d);
+				}
+				if (desc->natts >= 6)
+				{
+					Datum		d = heap_getattr(tup, 6, desc, &isnull);
+
+					if (!isnull)
+						epoch = DatumGetInt64(d);
+				}
+				cat.colocations = lappend(cat.colocations,
+										  kingres_shard_coloc_begin(cid, count, maxmod, epoch, dtype, coll));
 			}
 			catscan_end(&cs);
 
-			/* bucket_map(colocation_id, bucket, group_id, state) */
+			/* bucket_map(colocation_id, bucket, group_id, state, modulus): modulus exists from 0.8 */
 			catscan_begin(&cs, relids[3]);
 			while ((tup = catscan_next(&cs)) != NULL)
 			{
@@ -562,13 +578,23 @@ catalog_load(void)
 
 					if (c->colocation_id == cid)
 					{
-						if (bucket >= 0 && bucket < c->bucket_count)
-							c->bucket_group[bucket] = group;
+						int			modulus = c->bucket_count;
+
+						if (desc->natts >= 5)
+						{
+							Datum		d = heap_getattr(tup, 5, desc, &isnull);
+
+							if (!isnull)
+								modulus = DatumGetInt32(d);
+						}
+						kingres_shard_coloc_add(c, bucket, modulus, group);
 						break;
 					}
 				}
 			}
 			catscan_end(&cs);
+			foreach(lc, cat.colocations)
+				kingres_shard_coloc_finish((KsColocation *) lfirst(lc));
 
 			/* dist_table(relid, method, dist_column, colocation_id) */
 			catscan_begin(&cs, relids[2]);
@@ -756,6 +782,11 @@ catalog_load(void)
  * colocation group), which count the map version up too.  The sum of a mixed
  * value per bucket, so that the order of the rows does not matter: the node that
  * asks reads the heap in any order.
+ *
+ * Since 0.8 the number also holds the placement epoch of the group, a counter that only the
+ * switch of a move or of a split raises, in the transaction that changes the partitions.  A
+ * bucket that moves away and comes back inside the window of a statement restores the sum of
+ * the bucket terms, but never the epoch (review finding S4-01).
  */
 static uint64
 placement_mix(int bucket, int group)
@@ -766,6 +797,13 @@ placement_mix(int bucket, int group)
 	x = (x ^ (x >> 30)) * UINT64CONST(0xBF58476D1CE4E5B9);
 	x = (x ^ (x >> 27)) * UINT64CONST(0x94D049BB133111EB);
 	return x ^ (x >> 31);
+}
+
+/* The term of the placement epoch of a group in the placement hash. */
+static uint64
+epoch_term(int64 epoch)
+{
+	return placement_mix((int) (epoch & 0x7fffffff), (int) ((uint64) epoch >> 31)) ^ UINT64CONST(0x5bd1e9955bd1e995);
 }
 
 /*
@@ -897,6 +935,7 @@ kingres_shard_placement_hash(const KsColocation *coloc)
 
 	if (coloc == NULL)
 		return 0;
+	h = epoch_term(coloc->placement_epoch);
 	gp = palloc(sizeof(GroupPrimary) * Max(list_length(cat->nodes), 1));
 	foreach(lc, cat->nodes)
 	{
@@ -919,6 +958,54 @@ kingres_shard_placement_hash(const KsColocation *coloc)
 	}
 	pfree(gp);
 	return (int64) h;
+}
+
+/*
+ * The placement epoch of a colocation group from the catalog table, with the latest committed
+ * snapshot; 0 for a group that is not there or a catalog of a version without the column.
+ */
+static int64
+placement_epoch_now(int colocation_id)
+{
+	Oid			relid = kingres_shard_catalog_relid("colocation");
+	Relation	rel;
+	Snapshot	snap;
+	Oid			pkey;
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	int64		epoch = 0;
+
+	if (!OidIsValid(relid))
+		return 0;
+	rel = table_open(relid, AccessShareLock);
+	if (RelationGetDescr(rel)->natts < 6)
+	{
+		table_close(rel, AccessShareLock);
+		return 0;
+	}
+	snap = RegisterSnapshot(IsInParallelMode() ? GetActiveSnapshot() : GetLatestSnapshot());
+	pkey = get_relname_relid("colocation_pkey", RelationGetNamespace(rel));
+	ScanKeyInit(&key, 1, BTEqualStrategyNumber, F_INT4EQ, Int32GetDatum(colocation_id));
+	scan = systable_beginscan(rel, pkey, OidIsValid(pkey), snap, 1, &key);
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		bool		isnull;
+		bool		a;
+		Datum		d;
+
+		a = DatumGetInt32(heap_getattr(tup, 1, RelationGetDescr(rel), &isnull)) == colocation_id;
+		if (!a)
+			continue;
+		d = heap_getattr(tup, 6, RelationGetDescr(rel), &isnull);
+		if (!isnull)
+			epoch = DatumGetInt64(d);
+		break;
+	}
+	systable_endscan(scan);
+	UnregisterSnapshot(snap);
+	table_close(rel, AccessShareLock);
+	return epoch;
 }
 
 /*
@@ -1001,7 +1088,7 @@ kingres_shard_placement_hash_now(int colocation_id)
 	}
 	if (gp != NULL)
 		pfree(gp);
-	return (int64) h;
+	return (int64) (h + epoch_term(placement_epoch_now(colocation_id)));
 }
 
 /*
@@ -1098,79 +1185,162 @@ kingres_shard_lookup_colocation(int colocation_id)
 }
 
 /*
- * The buckets of a colocation group (catalog.h).  Today the buckets of a group
- * are numbered 0 .. bucket_count - 1; these three functions are the only
- * place besides the loading code that knows it.
+ * The buckets of a colocation group (catalog.h).  The layout is kept in the arrays of
+ * KsColocation; these functions and the three that make a layout are the only code that
+ * reads or writes them.
  */
 int
 kingres_shard_coloc_nbuckets(const KsColocation *coloc)
 {
-	return coloc->bucket_count;
+	return coloc->nbucket;
 }
 
 int
 kingres_shard_coloc_bucket(const KsColocation *coloc, int i)
 {
-	Assert(i >= 0 && i < coloc->bucket_count);
-	return i;
+	Assert(i >= 0 && i < coloc->nbucket);
+	return coloc->bucket_list[i];
 }
 
 /*
  * The modulus of the hash partition that is a bucket: FOR VALUES WITH (MODULUS m,
- * REMAINDER bucket).  Every bucket of a group has the modulus bucket_count today;
- * when a bucket can be split (design/shard-phase10.md) each bucket has its own,
- * and the code that creates or attaches a bucket partition asks here.
+ * REMAINDER bucket).  Every bucket of a group that was never split has the modulus
+ * bucket_count; a bucket that was split has children of a larger modulus
+ * (design/shard-phase10.md).  The code that creates or attaches a bucket partition asks here.
  */
 int
 kingres_shard_bucket_modulus(const KsColocation *coloc, int bucket)
 {
-	Assert(bucket >= 0 && bucket < coloc->bucket_count);
-	(void) bucket;
-	return coloc->bucket_count;
+	Assert(bucket >= 0 && bucket < coloc->max_modulus && coloc->bucket_mod[bucket] > 0);
+	return coloc->bucket_mod[bucket];
 }
 
 /*
- * A copy of a colocation group's bucket layout that stays valid when the catalog
- * cache is reloaded (the batch sender keeps one for the whole of a statement,
- * which plans other statements while it runs).  Made in the current memory context.
+ * A copy of a colocation group's bucket layout that stays valid when the catalog cache is
+ * reloaded (the batch sender keeps one for the whole of a statement, which plans other
+ * statements while it runs).  Made in the current memory context.
  */
 KsColocation *
 kingres_shard_coloc_copy(const KsColocation *coloc)
 {
 	KsColocation *c = palloc(sizeof(KsColocation));
+	Size		n = sizeof(int) * Max(coloc->max_modulus, 1);
 
 	*c = *coloc;
-	c->bucket_group = palloc(sizeof(int) * Max(coloc->bucket_count, 1));
-	memcpy(c->bucket_group, coloc->bucket_group, sizeof(int) * coloc->bucket_count);
+	c->bucket_list = palloc(sizeof(int) * Max(coloc->nbucket, 1));
+	memcpy(c->bucket_list, coloc->bucket_list, sizeof(int) * coloc->nbucket);
+	c->bucket_group = palloc(n);
+	memcpy(c->bucket_group, coloc->bucket_group, n);
+	c->bucket_mod = palloc(n);
+	memcpy(c->bucket_mod, coloc->bucket_mod, n);
+	c->slot_bucket = palloc(n);
+	memcpy(c->slot_bucket, coloc->slot_bucket, n);
 	return c;
 }
 
 int
 kingres_shard_bucket_group(const KsColocation *coloc, int bucket)
 {
-	if (bucket < 0 || bucket >= coloc->bucket_count)
+	if (bucket < 0 || bucket >= coloc->max_modulus)
 		return -1;
 	return coloc->bucket_group[bucket];
 }
 
 /*
- * A colocation group's layout made by the caller from the catalog tables as its own
- * transaction sees them (a group made in this transaction is not in the cache yet):
- * groups[b], for b = 0 .. nbuckets - 1, is the group that owns bucket b, or -1.  Made
- * in the current memory context.
+ * Making a layout: kingres_shard_coloc_begin() allocates it with no bucket, kingres_shard_coloc_add()
+ * records one row of bucket_map, kingres_shard_coloc_finish() lists the buckets.  A row that cannot
+ * belong (modulus that is not a divisor of max_modulus, remainder not below the modulus, a number
+ * twice, slots that another bucket covers) is dropped: the layout then has a gap, which the routing
+ * code treats as "no owner" and check_cluster() names.
+ */
+KsColocation *
+kingres_shard_coloc_begin(int colocation_id, int bucket_count, int max_modulus,
+						  int64 placement_epoch, Oid dist_type, Oid collation)
+{
+	KsColocation *c = palloc0(sizeof(KsColocation));
+	int			i;
+
+	if (max_modulus < 1)
+		max_modulus = Max(bucket_count, 1);
+	c->colocation_id = colocation_id;
+	c->bucket_count = bucket_count;
+	c->placement_epoch = placement_epoch;
+	c->dist_type = dist_type;
+	c->collation = collation;
+	c->max_modulus = max_modulus;
+	c->bucket_group = palloc(sizeof(int) * max_modulus);
+	c->bucket_mod = palloc0(sizeof(int) * max_modulus);
+	c->slot_bucket = palloc(sizeof(int) * max_modulus);
+	for (i = 0; i < max_modulus; i++)
+	{
+		c->bucket_group[i] = -1;
+		c->slot_bucket[i] = -1;
+	}
+	return c;
+}
+
+void
+kingres_shard_coloc_add(KsColocation *c, int bucket, int modulus, int group)
+{
+	int			s;
+
+	if (modulus < 1 || bucket < 0 || bucket >= modulus || c->max_modulus % modulus != 0 ||
+		c->bucket_mod[bucket] != 0)
+		return;
+	for (s = bucket; s < c->max_modulus; s += modulus)
+		if (c->slot_bucket[s] >= 0)
+			return;
+	for (s = bucket; s < c->max_modulus; s += modulus)
+		c->slot_bucket[s] = bucket;
+	c->bucket_mod[bucket] = modulus;
+	c->bucket_group[bucket] = group;
+}
+
+void
+kingres_shard_coloc_finish(KsColocation *c)
+{
+	int			b;
+	int			n = 0;
+
+	for (b = 0; b < c->max_modulus; b++)
+		if (c->bucket_mod[b] > 0)
+			n++;
+	/*
+	 * A group with no row in bucket_map at all (a catalog that is being made, or a broken one) has
+	 * the buckets of a group that was never split, none of them mapped: the routing then says "no
+	 * owner" instead of failing to find a bucket, as it always did.
+	 */
+	if (n == 0 && c->max_modulus == c->bucket_count)
+	{
+		for (b = 0; b < c->max_modulus; b++)
+		{
+			c->slot_bucket[b] = b;
+			c->bucket_mod[b] = c->bucket_count;
+		}
+		n = c->max_modulus;
+	}
+	c->nbucket = n;
+	c->bucket_list = palloc(sizeof(int) * Max(n, 1));
+	n = 0;
+	for (b = 0; b < c->max_modulus; b++)
+		if (c->bucket_mod[b] > 0)
+			c->bucket_list[n++] = b;
+}
+
+/*
+ * The layout of the buckets 0 .. nbuckets - 1, all of modulus nbuckets (a group that was never
+ * split), made by the caller: groups[b] is the group that owns bucket b, or -1.
  */
 KsColocation *
 kingres_shard_coloc_make(int colocation_id, int nbuckets, Oid dist_type, Oid collation,
 						 const int *groups)
 {
-	KsColocation *c = palloc0(sizeof(KsColocation));
+	KsColocation *c = kingres_shard_coloc_begin(colocation_id, nbuckets, nbuckets, 0, dist_type, collation);
+	int			b;
 
-	c->colocation_id = colocation_id;
-	c->bucket_count = nbuckets;
-	c->dist_type = dist_type;
-	c->collation = collation;
-	c->bucket_group = palloc(sizeof(int) * Max(nbuckets, 1));
-	memcpy(c->bucket_group, groups, sizeof(int) * nbuckets);
+	for (b = 0; b < nbuckets; b++)
+		kingres_shard_coloc_add(c, b, nbuckets, groups[b]);
+	kingres_shard_coloc_finish(c);
 	return c;
 }
 

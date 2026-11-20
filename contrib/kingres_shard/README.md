@@ -8,7 +8,7 @@ node as reference tables, and makes every statement correct on a cluster with
 several groups: a statement that touches one key goes to the group that owns
 it, and a statement that spans groups is answered by reading the other groups.
 
-This is version 0.8 (0.8 is distributed schemas, phase 11, and elasticity, phase 10; 0.7 is the table lifecycle of phase 9 on top of 0.6; 0.6 is the version of phase 2b; 0.3 added moving buckets, phase 2a made every statement correct, 0.4 is the fix round of the reviews of 0.2 and 0.3, 0.5 is high availability: standby nodes, `promote_node`, prepared transactions across a failover, distributed deadlock detection and coordinated restore points; see "High availability" below; 0.6 is phase 2b and adds no SQL object, see "Installation" for why the version is raised). Phase 2b makes the common
+This is version 0.8 (0.8 is the bucket layout of phase 10, see "The bucket layout (version 0.8)", and the schemas of phase 11; 0.7 is the table lifecycle of phase 9 on top of 0.6; 0.6 is the version of phase 2b; 0.3 added moving buckets, phase 2a made every statement correct, 0.4 is the fix round of the reviews of 0.2 and 0.3, 0.5 is high availability: standby nodes, `promote_node`, prepared transactions across a failover, distributed deadlock detection and coordinated restore points; see "High availability" below; 0.6 is phase 2b and adds no SQL object, see "Installation" for why the version is raised). Phase 2b makes the common
 statements fast. The designs are in
 [`kingres/docs/design/shard-mvp.md`](../../kingres/docs/design/shard-mvp.md)
 (phase 1) and
@@ -2396,6 +2396,135 @@ needs `cleanup_moved_buckets(true)` after the move (review finding S4-10).
   moved to this node after the snapshot of the transaction was taken") and can be
   retried. `COPY (SELECT ...) TO` reads like any `SELECT`; `COPY ... FROM` into a
   distributed table is routed by the row router, which fails with the retryable `KS001` when a bucket moved between its plan and its first batch and otherwise makes the switch of a move wait for it (section "Bulk writes through the row router").
+
+## The bucket layout (version 0.8, phase 10, increment P10.1)
+
+[`shard-phase10.md`](../../kingres/docs/design/shard-phase10.md) lets one bucket be split into several without touching the others.
+Version 0.8 prepares the catalog and every place that routes by bucket for it; nothing in this version splits a bucket yet.
+
+- **A bucket is a hash partition `(MODULUS m, REMAINDER r)`, and its number is its remainder `r`.** `kingres.bucket_map` has a `modulus`
+  column for it; `kingres.colocation.bucket_count` stays what a new table of the group asks for (the base modulus), and the number of
+  buckets is the number of rows of `bucket_map`. `kingres.colocation.max_modulus` is the greatest modulus of the group (the base
+  `bucket_count` until a split). The buckets of a group cover each slot `0 .. max_modulus - 1` of `hash % max_modulus` exactly once.
+  PostgreSQL accepts such a table (moduli that divide the next larger one, partitions that share no slot).
+- **The bucket of a key is a lookup, not `hash % bucket_count`.** The cache of the catalog builds, for each group, a table with one entry per
+  slot (the same idea as `boundinfo->indexes` of PostgreSQL), and `kingres_shard_bucket_for_hash()` reads it. Everything that routes (the planner,
+  the row router, `COPY`, the pushdown, `kingres.bucket_for()`) goes through it; the code that creates or attaches a bucket partition asks
+  `kingres_shard_bucket_modulus()`. A key whose slot no bucket covers is an error that names the slot, never a wrong bucket.
+- **`kingres.colocation.placement_epoch`** counts the switches of a group (a move now, a split later), in the transaction that changes the
+  partitions. The placement hash that a scan compares before and after it starts includes it, so a bucket that moves away and comes back
+  inside the window of a statement no longer restores the hash (review finding S4-01).
+- **`kingres.bucket_range(colocation_id, bucket)`** returns the modulus and the remainder; `kingres.buckets` has a `modulus` column.
+- **`check_cluster()`** says `bucket_map_incomplete` for a group that was never split and lacks a bucket (as before), and `bucket_layout` for any
+  other flaw: buckets that do not cover each slot exactly once, or a bucket partition on a node whose bounds differ from the bucket map.
+- **Upgrade and rows of the older form.** `ALTER EXTENSION kingres_shard UPDATE` gives every bucket the modulus `bucket_count`; a row that
+  does not say its modulus or the `max_modulus` (an `INSERT` of the older form, a catalog document of a map group that is not upgraded yet)
+  gets the layout of a group that was never split, through the trigger `kingres.internal_layout_defaults()`.
+- **Moves.** `move_bucket()` copies a bucket with its own modulus and raises the epoch. `rebalance_plan()` counts the buckets of a group, not its
+  `bucket_count`. A new table colocated with a split group has the buckets of the group; `alter_distributed_table()` into a group of its own
+  that is like a split group makes the same buckets, moduli and owners.
+
+Tests: the regression test `bucket_layout` (mixed moduli against the partition PostgreSQL stores a row in, the layout checks) and `t/200_bucket_layout.pl`
+(splits made by hand on a cluster, reads and writes from every node, moves of the split children, the epoch, new tables, `check_cluster()`).
+
+## Weights and the plan of a rebalance (version 0.8, phase 10, increment P10.3)
+
+`kingres.rebalance_plan()` (phase 4) balances the number of buckets of each colocation group. Version 0.8 adds a plan that knows what a bucket costs
+and what a group can hold ([`shard-phase10.md`](../../kingres/docs/design/shard-phase10.md), sections 4 and 5). `rebalance_plan()` stays as it was.
+
+- **`kingres.set_node_property(node_id, should_have_shards, weight)`**: NULL leaves a property as it is; `kingres.node.weight` is the capacity of
+  the group whose primary the node is (above 0, at most 1000, default 1). The two-argument form still exists and leaves the weight alone (the control plane asks for it
+  by that signature). Map group primary only, superuser.
+- **`kingres.plan_rebalance(strategy, threshold, max_moves, drain_only, extra_load, exclude_groups, colocation_ids)`** returns
+  `(seq, colocation_id, bucket, source_group, target_group, cost, size_bytes, reason)`; read only, superuser or a role that may read `kingres.bucket_move`, on the map group primary.
+  - `strategy` is `by_bucket_count` (every bucket costs 1) or `by_disk_size` (the size of the bucket's partitions of every table of the colocation
+    group, read from the group that owns them, at least `kingres_shard.min_bucket_cost`, 1 MiB by default; it needs a superuser, and a group that
+    does not answer is an error that names it: the plan does not guess).
+  - A group may receive buckets when its primary is active and has `should_have_shards`; `exclude_groups` takes groups out of the receivers for a what-if
+    drain; a group with no active primary is neither a receiver nor a source.
+  - The load of a group is the sum of the costs of its buckets over **all** colocation groups; its utilization is the load plus `extra_load` (the load of
+    other databases, a JSON object of group id to a number in the unit of the strategy, receivers only) per unit of weight. A receiver deviates from the
+    ideal (the total load, the load of drained groups included, per unit of the receivers' weight) by `abs(utilization - ideal) / ideal`.
+  - The plan is a simulation: while a group that may not hold buckets still holds one, or a receiver deviates by more than `threshold` (default 0 by
+    bucket count, 0.1 by disk size), the greatest drain source or the receiver of the greatest utilization gives its most costly bucket (ties: the higher
+    bucket number) to the receiver of the least utilization (ties: the lowest group id); a bucket of a receiver must bring the two utilizations closer.
+    A bucket is planned once; a bucket that is moving counts at its target and is not planned; `drain_only` plans the drain moves only; `max_moves` caps the plan.
+  - `reason` is `drain` for a move off a group that may not hold buckets and `balance` otherwise.
+- **`kingres.group_load(strategy, extra_load, exclude_groups)`** returns, for every group, `receiving`, `weight`, `buckets`, `load`, `utilization`,
+  `deviation` and `available`.
+- With equal weights, one colocation group and threshold 0 the plan has the number of moves and the counts of `rebalance_plan()` (a regression test
+  compares them over generated maps). With several colocation groups it balances the sum, not each colocation group.
+
+Tests: the regression test `plan_strategies` (the examples of the design with their move counts, weights, drain, `exclude_groups`, `extra_load`, several
+colocation groups, moving buckets, refusals; the disk-size simulation through `kingres.internal_plan_simulate()` with sizes as data) and `t/201_plan_disk_weights.pl`
+(real sizes on three groups, a plan executed, weights, a drain executed, a group that does not answer, who may plan).
+
+## Several moves at once, and the progress of a move (version 0.8, phase 10, increment P10.4)
+
+Moves of different buckets run together without anything special: every move has its own session, publication, slot, subscription and copy tables, and the
+only shared step, the switch, locks the parents of the colocation group's tables on the two nodes with `NOWAIT` and retries within `move_switch_attempts`.
+`t/202_concurrent_moves.pl` runs four moves at once with readers on three nodes: moves of one colocation group between disjoint pairs of groups, moves of
+two colocation groups between the same groups, two moves of one colocation group with the same source and target (each completes or fails cleanly and
+succeeds when started again), the same bucket twice (the second is refused), and checks every row and `check_cluster()` afterwards. A reader that overlaps a
+switch may get the retryable `KS001`; it never gets a wrong answer. The scheduler of the control plane still keeps moves that would lock the same
+tables on the same node apart (design 6.3), because a retry is a cost, not because it is unsafe.
+
+What a move costs the nodes, per move: on the map group primary the session that runs `move_bucket()` and its control sessions; on the source a WAL sender,
+a replication slot and a publication; on the target a subscription with its apply worker and, during the copy, a table synchronization worker. So
+`max_connections`, `max_wal_senders`, `max_replication_slots`, `max_logical_replication_workers` and `max_worker_processes` have to leave room for the
+number of moves that are allowed at once (`rebalance.maxConcurrentMoves`, default 4) on top of what the databases use; a node that runs out of
+connections makes the move fail with "too many clients" and the move is undone.
+
+- **`kingres.move_progress()`** (superusers; it asks the nodes) returns one row per unfinished move: `move_id`, `colocation_id`, `bucket`, `source_group`,
+  `target_group`, `phase`, `detail`, `started_at`, `updated_at`, `source_bytes` (the bucket's partitions on the source), `target_bytes` (the copy on the target;
+  NULL for either when the node does not answer) and `percent` (preparing 0; copying: the target's bytes over the source's, at most 89; catching_up 90;
+  switching 95; cleaning 100).
+- **`kingres.drain_status()`** (read only) returns one row per shard group: `receiving`, `available`, `buckets` (the map's), `arriving` and `leaving` (unfinished moves) and
+  `drained` (it may not receive, owns no bucket and none is arriving), which is what a drain waits for before the group is removed.
+
+Tests: `t/202_concurrent_moves.pl`, `t/203_move_progress.pl`, and `drain_status` in the regression test `plan_strategies`.
+
+## Splitting a bucket (version 0.8, phase 10, increment P10.5)
+
+`kingres.split_bucket(colocation_id, bucket, parts DEFAULT 2, verify DEFAULT 'count')` replaces the partition of one bucket, in every table of its
+colocation group, by `parts` (2, 4, 8 or 16) partitions of a modulus `parts` times larger. It runs on the map group primary, as a superuser, in a
+READ COMMITTED session (it follows the progress of other nodes), and returns the id of its record in `kingres.bucket_split`. The children stay on the
+group of the bucket: the new buckets are `bucket + i * modulus` for `i = 0 .. parts - 1`, the bucket keeps its number for `i = 0`, `max_modulus` of the group
+goes up and the placement epoch counts the switch. Move the children apart afterwards with `move_bucket()` or a rebalance.
+
+How it works (design/shard-phase10.md, section 3):
+
+1. **Preparing.** The preconditions are checked on the owning node before anything is recorded: every table has a primary key; none is partitioned by the user,
+   none has a generated or an identity column, every bucket partition is a plain heap table (a columnar table cannot be split); the bucket is `active`; no split
+   of the colocation group is unfinished; `kingres.internal_split_allowed()` (a hook that the line of work of distributed schemas redefines to refuse a group that
+   holds a schema) says yes. The record is made, the bucket's state becomes `splitting` on every node.
+2. **Children and triggers**, on the owning node, in one transaction: for every table a standalone child per part (`LIKE` the table, with the `ks_bucket_check`
+   constraint that makes the later attach scan-free) and a trigger on the old partition, `ENABLE ALWAYS` so that `session_replication_role = replica` does not skip it,
+   that makes every change of the partition in the child that covers the row, in the writer's own transaction (a delete and an upsert; `TRUNCATE` truncates the
+   children). A write of the old partition by any means is therefore copied.
+3. **Backfill**, in batches of 5000 rows each in a transaction of its own: the rows after the last key, those no writer holds (`FOR SHARE SKIP LOCKED`), are copied with
+   `ON CONFLICT DO NOTHING`. Passes repeat until one copies nothing and finds nothing held (at most 10).
+4. **Switch**, on the owning node, in one transaction: the tables and the old partitions are locked `SHARE` (writers wait, readers do not), each lock for at most
+   `max(200 ms, move_switch_timeout / 10)`; `verify 'count'` compares the number of rows of every old partition with its children and brings them in line if they differ
+   (`'full'` does it always, key by key; `'none'` trusts the triggers); the triggers go; the old partitions are detached as `kingres.orphan_s<id>_<n>` (readers wait from the
+   detach to the commit); the children are renamed to `<table>_bNNNN` and attached with the new modulus. A lock that is not got is retried up to
+   `move_switch_attempts` times with a growing pause; the last failure names the sessions in the way.
+5. **The catalog** on the map group primary: the bucket's row becomes the children's, `max_modulus` and the epoch go up, the map is synchronized. This comes after the switch
+   and not in the same two-phase transaction (a difference from the design): the children are on the same group as the bucket, so a router that still has the old layout
+   reaches the right group and PostgreSQL prunes by the partitions it has; a scan that overlaps the two steps sees the epoch change and gets the retryable `KS001`.
+6. **Cleaning.** The orphans are dropped by `kingres.cleanup_bucket_splits()` after `move_cleanup_delay` (the recovery worker calls it).
+
+Failure and recovery: until the switch every failure undoes the split (`internal_split_undo`: the triggers, their functions and the children go, the bucket is `active`). A session
+that dies is settled by `kingres.resume_bucket_splits()` (the recovery worker calls it): a split whose partitions are not switched is undone, one whose partitions are switched gets its
+catalog. `kingres.cancel_bucket_split(id)` stops a split that has not reached its switch. `kingres.check_cluster()` says `split_stalled`, `split_trigger` and `split_child_table`.
+While a split runs, `create_distributed_table()` and the other changes of the group's tables are refused (the same check as for a move) and the bucket cannot be moved. The bucket
+map's state is `splitting`, and `kingres.bucket_split` is readable by superusers only.
+
+Not done: a split of a user-partitioned table or of a columnar table (refused), a split by `parts` other than 2, 4, 8 or 16, the merge of buckets, and the split of several buckets of a group at once (one split per
+colocation group at a time).
+
+Tests: `t/204_split_bucket.pl` (splits, writers during every phase, bypasses, refusals, cancel, killed sessions and the worker, moves of the children, a table made later) and the regression test
+`bucket_layout` for the layouts a split makes.
 
 ## High availability (version 0.5, phase 5)
 

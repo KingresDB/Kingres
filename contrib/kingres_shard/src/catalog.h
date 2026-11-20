@@ -22,14 +22,30 @@
 #include "utils/hsearch.h"
 #include "utils/palloc.h"
 
-/* A colocation group: bucket count, key type and the bucket placement. */
+/*
+ * A colocation group: key type and the layout of its buckets.
+ *
+ * A bucket is a hash partition (MODULUS m, REMAINDER r); its number is its remainder r.
+ * A group that was never split has bucket_count buckets 0 .. bucket_count - 1, all of
+ * modulus bucket_count.  After a bucket is split (design/shard-phase10.md) the buckets have
+ * different moduli, every modulus divides max_modulus, and the buckets together cover each
+ * slot 0 .. max_modulus - 1 of hash % max_modulus exactly once.  The arrays below are
+ * indexed by bucket number or by slot and have max_modulus entries; only the accessors
+ * further down (and the code that builds a layout) touch them.
+ */
 typedef struct KsColocation
 {
 	int			colocation_id;
-	int			bucket_count;
+	int			bucket_count;	/* the base modulus a new table of the group asks for; NOT the number of buckets */
+	int64		placement_epoch;	/* counts the switches of the group (move or split), see kingres_shard_placement_hash() */
 	Oid			dist_type;
 	Oid			collation;
-	int		   *bucket_group;	/* bucket_count entries; -1 if unmapped */
+	int			max_modulus;	/* the greatest modulus of a bucket; the size of the arrays */
+	int			nbucket;		/* the number of buckets */
+	int		   *bucket_list;	/* nbucket entries: the bucket numbers, ascending */
+	int		   *bucket_group;	/* by bucket number: the owning group; -1 if unmapped or not a bucket */
+	int		   *bucket_mod;		/* by bucket number: its modulus; 0 if not a bucket */
+	int		   *slot_bucket;	/* by slot (hash % max_modulus): the bucket that holds it; -1 if a gap */
 } KsColocation;
 
 /* A distributed table, as cached.  The hash key is relid. */
@@ -113,6 +129,18 @@ extern int64 kingres_shard_catalog_generation(void);
 extern KsColocation *kingres_shard_coloc_copy(const KsColocation *coloc);
 extern KsColocation *kingres_shard_coloc_make(int colocation_id, int nbuckets, Oid dist_type, Oid collation,
 											  const int *groups);
+
+/*
+ * Making a layout from the catalog tables as the caller's own transaction sees them (the
+ * cache cannot be used for a group made in this transaction): begin, one add per row of
+ * bucket_map, finish.  A row that cannot belong to the layout (modulus that does not divide
+ * max_modulus, remainder not below the modulus) is left out, and the group then has a gap that
+ * kingres.check_cluster() reports as bucket_layout.  All in the current memory context.
+ */
+extern KsColocation *kingres_shard_coloc_begin(int colocation_id, int bucket_count, int max_modulus,
+											   int64 placement_epoch, Oid dist_type, Oid collation);
+extern void kingres_shard_coloc_add(KsColocation *coloc, int bucket, int modulus, int group);
+extern void kingres_shard_coloc_finish(KsColocation *coloc);
 extern int64 kingres_shard_placement_hash(const KsColocation *coloc);
 extern int64 kingres_shard_placement_hash_now(int colocation_id);
 extern int64 kingres_shard_map_version_now(void);
