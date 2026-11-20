@@ -76,6 +76,10 @@ my @rep = (
 	[ 'a count of distinct values above', q{SELECT count(DISTINCT cu.name) FROM public.o JOIN public.cu ON cu.id = o.cust}, 0 ],
 	[ 'a window above', q{SELECT o.id, rank() OVER (PARTITION BY cu.region ORDER BY o.id) FROM public.o JOIN public.cu ON cu.id = o.cust WHERE o.id < 200}, 0 ],
 	[ 'the column of the moved table in the select list only', q{SELECT cu.id, o.note FROM public.o JOIN public.cu ON cu.id = o.cust WHERE cu.id < 25}, 0 ],
+	[ 'LEFT JOIN: the table that stays is preserved', q{SELECT cu.id, o.id FROM public.cu LEFT JOIN public.o ON o.cust = cu.id WHERE cu.id < 60}, 0 ],
+	[ 'LEFT JOIN: a condition of the ON clause on the moved table', q{SELECT cu.id, o.id, o.amount FROM public.cu LEFT JOIN public.o ON o.cust = cu.id AND o.amount > 90}, 0 ],
+	[ 'LEFT JOIN: a count of the matches', q{SELECT cu.region, count(o.id) FROM public.cu LEFT JOIN public.o ON o.cust = cu.id GROUP BY cu.region ORDER BY 1}, 1 ],
+	[ 'LEFT JOIN: a condition on the preserved side in the WHERE', q{SELECT cu.id, o.id FROM public.cu LEFT JOIN public.o ON o.cust = cu.id WHERE cu.region = 2}, 0 ],
 	[ 'a restriction on the key of the other table', q{SELECT o.id, cu.name FROM public.o JOIN public.cu ON cu.id = o.cust WHERE cu.id = 17}, 0 ],
 );
 for my $q (@rep)
@@ -174,7 +178,9 @@ for my $q (@data)
 # ---------------------------------------------------------------------------
 my @not = (
 	[ 'a left join with the moved table preserved', q{SELECT o.id, cu.name FROM public.o LEFT JOIN public.cu ON cu.id = o.cust WHERE o.id < 200} ],
-	[ 'a left join with the other table preserved', q{SELECT cu.id, o.id FROM public.cu LEFT JOIN public.o ON o.cust = cu.id WHERE cu.id < 60} ],
+	[ 'a left join whose WHERE names only the nullable side', q{SELECT cu.id, o.id FROM public.cu LEFT JOIN public.o ON o.cust = cu.id WHERE cu.id < 60 AND o.id IS NULL} ],
+	[ 'two left joins', q{SELECT cu.id, o.id, it.id FROM public.cu LEFT JOIN public.o ON o.cust = cu.id LEFT JOIN public.it ON it.id = cu.id WHERE cu.id < 60} ],
+	[ 'a left join whose nullable side is a join', q{SELECT cu.id, o.id FROM public.cu LEFT JOIN (public.o JOIN public.it ON it.id = o.id) ON o.cust = cu.id WHERE cu.id < 60} ],
 	[ 'a full join', q{SELECT o.id, cu.id FROM public.o FULL JOIN public.cu ON cu.id = o.cust WHERE o.id < 100 OR cu.id < 100} ],
 	[ 'a join on an expression', q{SELECT o.id, cu.name FROM public.o JOIN public.cu ON cu.id = o.cust + 1 WHERE o.id < 300} ],
 	[ 'a join on a column of both that is not equal', q{SELECT o.id, cu.id FROM public.o JOIN public.cu ON cu.region < o.amount % 5 WHERE o.id < 20 AND cu.id < 20} ],

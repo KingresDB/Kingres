@@ -185,6 +185,8 @@ typedef struct RpCtx
 {
 	Query	   *q;
 	List	   *conj;			/* of Node *: the conjuncts of the WHERE and of the ON clauses of inner joins */
+	Index		outer_rti;		/* J2: the one table that is the nullable side of a LEFT JOIN, 0 for none */
+	List	   *outer_on;		/* the conjuncts of the ON clause of that join (they are also in conj) */
 	const char *reason;
 } RpCtx;
 
@@ -204,7 +206,29 @@ rp_flatten_and(Node *qual, List **out)
 	*out = lappend(*out, qual);
 }
 
-/* The conjuncts of an inner-join tree; an outer join is refused (J2). */
+/*
+ * Does the condition name the columns of the table r and no other table?  (pull_varnos also returns the join entries that a
+ * column of the nullable side of an outer join is nulled by, so it is not used here.)
+ */
+static bool
+rp_names_only(Node *qual, Index r)
+{
+	List	   *vars = pull_var_clause(qual, PVC_RECURSE_AGGREGATES | PVC_RECURSE_WINDOWFUNCS | PVC_RECURSE_PLACEHOLDERS);
+	ListCell   *lc;
+
+	if (vars == NIL)
+		return false;
+	foreach(lc, vars)
+	{
+		Var		   *v = (Var *) lfirst(lc);
+
+		if (!IsA(v, Var) || v->varlevelsup != 0 || v->varno != r)
+			return false;
+	}
+	return true;
+}
+
+/* The conjuncts of the join tree: inner joins, and one LEFT JOIN to a table (J2). */
 static bool
 rp_collect(RpCtx *c, Node *n)
 {
@@ -227,9 +251,27 @@ rp_collect(RpCtx *c, Node *n)
 	{
 		JoinExpr   *j = (JoinExpr *) n;
 
+		if (j->jointype == JOIN_LEFT)
+		{
+			/*
+			 * J2: one LEFT JOIN whose nullable side is one table, which can then be the moved one: every row of the
+			 * preserved side stays in its own group and finds there every row of the moved table that can match it.
+			 */
+			if (c->outer_rti != 0 || !IsA(j->rarg, RangeTblRef))
+			{
+				c->reason = "it has an outer join other than one LEFT JOIN to a table";
+				return false;
+			}
+			c->outer_rti = ((RangeTblRef *) j->rarg)->rtindex;
+			if (!rp_collect(c, j->larg))
+				return false;
+			rp_flatten_and(j->quals, &c->outer_on);
+			rp_flatten_and(j->quals, &c->conj);
+			return true;
+		}
 		if (j->jointype != JOIN_INNER)
 		{
-			c->reason = "it has an outer join, which a repartitioned join does not run yet";
+			c->reason = "it has an outer join that a repartitioned join does not run (only a LEFT JOIN to one table)";
 			return false;
 		}
 		if (!rp_collect(c, j->larg) || !rp_collect(c, j->rarg))
@@ -380,6 +422,19 @@ kingres_shard_repart_prepare(Query *parse, const char **why)
 	if (!rp_collect(&c, (Node *) parse->jointree))
 		RP_NO(c.reason);
 
+	/*
+	 * A condition of the WHERE that names only the nullable table of the LEFT JOIN cannot be given to its scan (it applies after
+	 * the join, to the rows that the join filled with NULLs).
+	 */
+	if (c.outer_rti != 0)
+	{
+		foreach(lc, c.conj)
+		{
+			if (!list_member_ptr(c.outer_on, lfirst(lc)) && rp_names_only((Node *) lfirst(lc), c.outer_rti))
+				RP_NO("a condition of the WHERE names only the table on the nullable side of the LEFT JOIN");
+		}
+	}
+
 	/* the equalities between columns, as classes of (relation, column) */
 	nd.n = 0;
 	nd.cap = 16;
@@ -444,6 +499,9 @@ kingres_shard_repart_prepare(Query *parse, const char **why)
 		List	   *dist = NIL;
 		int			nanch = 0;
 
+		/* with a LEFT JOIN, only the table on its nullable side can be moved */
+		if (c.outer_rti != 0 && rel->rti != c.outer_rti)
+			continue;
 		foreach(lo, drels)
 		{
 			RpRel	   *o = (RpRel *) lfirst(lo);
@@ -551,9 +609,7 @@ rp_strip_only(Node *qual, Index r)
 	rp_flatten_and(qual, &conj);
 	foreach(lc, conj)
 	{
-		Bitmapset  *vs = pull_varnos(NULL, (Node *) lfirst(lc));
-
-		if (bms_membership(vs) == BMS_SINGLETON && bms_is_member((int) r, vs))
+		if (rp_names_only((Node *) lfirst(lc), r))
 			continue;
 		keep = lappend(keep, lfirst(lc));
 	}
