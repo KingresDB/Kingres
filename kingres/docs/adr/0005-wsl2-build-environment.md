@@ -29,3 +29,7 @@ C code (the PostgreSQL fork and the extensions) is built and tested in WSL2 with
 
 - **Docker as the daily environment.** Listed as the other option; kept for CI images. The document does not give a reason for ranking it below WSL2 for daily work beyond the recommendation.
 - **Native Windows build (MSVC, or MSYS2 with meson).** Rejected for daily use: the document reports uncertainty (the MSYS2 problems and the possibly outdated report) and recommends it only as a CI compatibility job.
+
+## Note of 2026-11-20: no CI
+
+This ADR speaks of CI images, a Linux matrix, a Windows job and a nightly job in CI. The project runs no CI: GitHub Actions is switched off for the repository by decision of the project owner, and every check runs locally ([dev/releases.md](../dev/releases.md), "Where the checks run"). The decision that C code is built and tested in WSL2 stands; the CI parts of it were not carried out and are not planned.

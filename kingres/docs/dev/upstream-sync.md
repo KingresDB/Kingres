@@ -8,10 +8,10 @@ This document turns the architecture document's "Branch choice and mirror mechan
 - The base is upstream tag `REL_18_7` (commit `f5c41f6`, "Stamp 18.7."), checked out as the local branch `kingres-18`.
 - The remote `upstream` is `https://github.com/postgres/postgres.git`. The official clone URL is `https://git.postgresql.org/git/postgresql.git`; GitHub is a mirror (architecture document, citing the PostgreSQL docs).
 - `git ls-remote` shows that upstream has both `REL_18_STABLE` and `REL_19_STABLE` branches. This settles the open question in the architecture document about the exact branch names.
-- The local clone holds the full history behind `REL_18_7`. The hosting remote is `origin` (the private repository `KingresDB/Kingres`), and its default branch is `kingres-18`.
+- The local clone holds the full history behind `REL_18_7`. The hosting remote is `origin` (the repository `KingresDB/Kingres` on GitHub, which is public; it was private when this document was first written), and its default branch is `kingres-18`. `kingres-19` is pushed to it as well.
 - Git is configured with `core.autocrlf=false` and `core.eol=lf`. The tree must stay LF on Windows.
 - PostgreSQL 18 is supported until 2030-11-14. PostgreSQL 19 GA is scheduled for 2026-11-19 (architecture document, citing the versioning policy and the PG19 RC1 announcement).
-- The newest upstream tag of PostgreSQL 19 on 2026-11-15 is `REL_19_RC2`; there is no `REL_19_0` yet. The three core patches (`meson.build`, `contrib/meson.build`, `README.md`) applied to `REL_19_RC2` without a change (checked 2026-11-15 with `git apply`).
+- The newest upstream tag of PostgreSQL 19 on 2026-11-15 is `REL_19_RC2`; there is no `REL_19_0` yet. The core patches that existed then, KP-0001 to KP-0003 (`meson.build`, `contrib/meson.build`, `README.md`), applied to `REL_19_RC2` without a change (checked 2026-11-15 with `git apply`). The register has four entries now; KP-0004 (the `LICENSE` file) is applied on `kingres-19` as well.
 
 ## Branches
 
@@ -23,7 +23,7 @@ This document turns the architecture document's "Branch choice and mirror mechan
 | Local mirror branches, one per upstream stable branch that is used (proposed names: `mirror/REL_18_STABLE`, `mirror/REL_19_STABLE`) | Pure mirror | Fast-forward only to the matching upstream branch. No KingresDB commits, ever. The names are a proposal. |
 | `kingres-18` | Product branch | Upstream tag `REL_18_x` plus the KingresDB commits on top. Rebased onto each new minor tag. |
 | Feature branches | Short-lived | Branch from `kingres-18`, merged back through review. |
-| `kingres-19` | Product branch for PostgreSQL 19 | An upstream `REL_19_x` tag plus the same core patches as `kingres-18` plus the same `contrib/kingres_*` and `kingres/` directories (ADR 0023). Not created yet; the first upstream tag to base it on is the one after the general release (scheduled for 2026-11-19, to be confirmed). Until then `REL_19_RC2` is used for build and test only. See "A new major version". |
+| `kingres-19` | Product branch for PostgreSQL 19 | An upstream `REL_19_x` tag plus the same core patches as `kingres-18` plus the same `contrib/kingres_*` and `kingres/` directories (ADR 0023). It exists since 2026-11-15, is public on GitHub with `kingres-18`, and is based on `REL_19_RC2` until the first tag after the general release of PostgreSQL 19 (scheduled for 2026-11-19, to be confirmed). It is never rebased or force-pushed by a sync. See "A new major version". |
 
 Why rebase instead of merge: the Postgres-XL team reported that merging upstream master produced far more conflicts than expected and that they had to rebase onto a later commit first. This is an empirical reason, not official PostgreSQL policy; the primary sources reviewed in the research give no guidance on private branches (architecture document, "Branch choice and mirror mechanics"). A rebase keeps the KingresDB changes as a small, reviewable series on top of a known upstream tag. The cost is that published history changes; see "Shared history" below.
 
@@ -60,7 +60,7 @@ Do not use `git merge` of upstream into the product branch.
 At minimum, in WSL2 (build instructions are in [getting-started.md](getting-started.md)):
 
 1. A clean build with assertions enabled (the architecture document recommends `-Dcassert=true` for CI; the developer FAQ recommends `--enable-cassert --enable-debug` for development).
-2. The upstream test suite, including TAP tests (`meson test`, or `make check-world` with `--enable-tap-tests` for autoconf builds). Failures that also occur on the unmodified upstream tag are reported upstream-first and recorded, not fixed locally.
+2. The upstream test suite, including TAP tests (`meson test`; an autoconf build is not a supported way to build KingresDB, see [core-patches.md](core-patches.md)). Failures that also occur on the unmodified upstream tag are reported upstream-first and recorded, not fixed locally.
 3. The KingresDB extension regression and TAP tests, with both build systems (`Makefile` and `meson.build`) for each extension.
 4. The multi-node cluster tests (see [testing.md](testing.md)), once they exist.
 5. `pgindent --check` on KingresDB's C files, with the typedefs list updated.
@@ -68,7 +68,7 @@ At minimum, in WSL2 (build instructions are in [getting-started.md](getting-star
 7. A check that the `PG_MODULE_MAGIC` ABI check still accepts the extensions (a minor release should not change the ABI; confirm by loading them).
 8. Confirm that `core.eol` and `core.autocrlf` still keep the tree LF (`git diff --stat` after the rebase must show only intended changes).
 
-**[Needs verification]** The architecture document recommends a nightly CI job that merges the latest upstream stable tag and runs the full suite. How that job is built (merge in a throwaway branch versus a dry-run rebase), and when CI exists, are open.
+**[Needs verification]** The architecture document recommends a nightly CI job that merges the latest upstream stable tag and runs the full suite. The project runs no CI (GitHub Actions is switched off, see [releases.md](releases.md)), so there is no such job; the equivalent is to run this routine by hand when upstream publishes a tag. How a dry run is made (merge in a throwaway branch versus a dry-run rebase) is open.
 
 ## A new major version
 
@@ -77,7 +77,7 @@ PostgreSQL ships one major release per year, and KingresDB follows ADR 0023: one
 1. **Before the general release** (scheduled for 2026-11-19, to be confirmed), work on the newest `REL_19_*` tag, in a scratch tree outside this repository: build it with the options of `kingres/dev/build.sh`, apply the core patches (tried: they apply unchanged to `REL_19_RC2`), build and test each extension out of tree with `kingres/dev/ext-majors.sh` (see [testing.md](testing.md)). Compile errors and warnings are the list of interface differences; each goes into the extension's `src/pg_compat.h` (see [coding-standards.md](coding-standards.md), 1.13), not into the code that uses it.
 2. Create `mirror/REL_19_STABLE` as a fast-forward mirror of `upstream/REL_19_STABLE`.
 3. Create `kingres-19` from the chosen upstream tag and apply the core-patch series of `kingres-18` in the order of the register, so that each patch can be re-tested and re-justified; a patch that upstream now makes unnecessary is dropped.
-4. Carry `contrib/kingres_*` and `kingres/` from `kingres-18` to `kingres-19`: development happens once, on one branch (the one the change is first tested on), and the same commit is cherry-picked onto the other with `git cherry-pick -x`. Because both branches hold identical files in these directories, the cherry-pick applies without conflicts unless a core patch or a file outside these directories is touched; a conflict there is a sign that something was committed to the wrong place and is reported, not resolved by editing both copies. A commit is complete only when `ext-majors.sh` passes for every extension it touches on both majors (ADR 0023, point 4). A check that the two branches stay identical in these directories (`git diff kingres-18 kingres-19 -- contrib/kingres_ledger contrib/kingres_shard kingres`, expected empty) is to be added to the routine; it is to be confirmed.
+4. Carry `contrib/kingres_*` and `kingres/` from `kingres-18` to `kingres-19` by a sync commit, not by cherry-picking: development happens once, on `kingres-18`, and a commit on `kingres-19` takes the directories as they are at a named commit of `kingres-18`. On `kingres-19`: `git rm -r` the paths (so that a file that no longer exists on `kingres-18` is removed too), then `git checkout <sha of kingres-18> -- 'contrib/kingres_*' kingres`, then commit with the message `sync from kingres-18 at <short sha>`; the details and the check that the diff of the two branches is empty are in [releases.md](releases.md), "How a change reaches `kingres-19`". Nothing is edited by hand inside these directories on `kingres-19`; a difference there is a sign that something was committed to the wrong place and is reported, not resolved by editing both copies. A commit is complete only when `ext-majors.sh` passes for every extension it touches on both majors (ADR 0023, point 4). The check that the two branches are identical in these directories after a sync is `git diff kingres-18 kingres-19 -- 'contrib/kingres_*' kingres`, expected empty (it is part of releases.md).
 5. Run the full verification list above on `kingres-19`, then run cluster upgrade tests (upgrade from a PostgreSQL 18 based KingresDB cluster to 19 is a separate procedure and is not designed yet; ADR 0023, point 7, says one major per cluster until it is).
 6. Keep `kingres-18` as a maintained branch for as long as the supported releases require; the supported period for PG18 is until 2030-11-14. The policy for how long KingresDB itself supports each major is not decided.
 7. A new major costs a new section in each `pg_compat.h`, a test run on all supported majors, and a check of the core-patch register; it does not cost a second code base. Supporting a further major, or dropping one, is decided by a new ADR.
@@ -88,5 +88,5 @@ The cost of this step is the main risk named in the architecture document ("Annu
 
 - The hosting platform and its branch protection.
 - How long each major is maintained.
-- The exact CI jobs.
+- Any automated check of upstream tags: there is no CI.
 - The KingresDB version numbering scheme relative to PostgreSQL's.
