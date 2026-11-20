@@ -13,8 +13,8 @@ An ADR records one decision: the context, the decision, its consequences and the
 | [0004](0004-postgresql-license-no-citus-code.md) | PostgreSQL License; no Citus code | Superseded by 0024 in its choice of licence | 2026-11-14 | 3 |
 | [0005](0005-wsl2-build-environment.md) | WSL2 as the build environment | Accepted | 2026-11-14 | 4 |
 | [0006](0006-sharding-mvp-first.md) | Sharding MVP first | Accepted | 2026-11-14 | 5 |
-| [0007](0007-fixed-hash-buckets.md) | Fixed hash buckets (default 1024) | Accepted | 2026-11-14 | - |
-| [0008](0008-map-group-source-of-truth.md) | Map group in PostgreSQL is the source of truth; etcd only for leader election | Accepted | 2026-11-14 | - |
+| [0007](0007-fixed-hash-buckets.md) | Fixed hash buckets (default 1024; the implemented default is 128, see the note in the ADR) | Accepted | 2026-11-14 | - |
+| [0008](0008-map-group-source-of-truth.md) | Map group in PostgreSQL is the source of truth; etcd only for leader election | Accepted; the Patroni and etcd parts are superseded by 0021 and 0018 | 2026-11-14 | - |
 | [0009](0009-two-phase-commit-no-global-snapshot.md) | 2PC without a global snapshot at first | Accepted | 2026-11-14 | - |
 | [0010](0010-writes-on-any-node.md) | Writes on any node: a primary per server and a router in the agent; no conflict-resolving multi-master | Accepted | 2026-11-14 | - |
 | [0011](0011-replica-count-per-cluster.md) | Replica count per cluster, durability per database | Accepted | 2026-11-14 | 6 |
@@ -23,11 +23,11 @@ An ADR records one decision: the context, the decision, its consequences and the
 | [0014](0014-one-package-panel-on-every-node.md) | One package and a panel on every node | Accepted | 2026-11-14 | 9 (first OS) |
 | [0015](0015-panel-accounts-are-postgresql-roles.md) | Panel accounts are PostgreSQL roles | Accepted | 2026-11-14 | 10 |
 | [0016](0016-go-backend-react-frontend-openapi-first.md) | Go backend and React/TypeScript frontend, OpenAPI first | Accepted; frontend framework superseded by 0017 | 2026-11-14 | - |
-| [0017](0017-vue-for-the-web-panel.md) | Vue for the web panel | Accepted | 2026-11-14 | Supersedes part of 0016 |
+| [0017](0017-vue-for-the-web-panel.md) | Vue for the web panel | Accepted | 2026-11-14 | Supersedes the frontend framework of 0016 |
 | [0018](0018-manager-leader-follows-the-map-group-primary.md) | The manager leader is the server of the map group primary | Accepted | 2026-11-14 | - |
 | [0019](0019-cluster-state-in-a-system-database.md) | Control-plane state lives in a system database with embedded migrations | Accepted | 2026-11-14 | - |
 | [0020](0020-no-bundled-metrics-store.md) | No bundled metrics store; kingresd samples and exports metrics itself | Accepted | 2026-11-14 | - |
-| [0021](0021-failover-in-kingresd.md) | Failover is part of kingresd, with leases; Patroni and etcd are not bundled | Accepted | 2026-11-14 | Supersedes 0012 |
+| [0021](0021-failover-in-kingresd.md) | Failover is part of kingresd, with leases; Patroni and etcd are not bundled | Accepted | 2026-11-14 | Supersedes 0012 and the Patroni and etcd parts of 0008 |
 | [0022](0022-the-complete-scan-stays.md) | The row-moving distributed scan stays as the path that answers every query | Accepted | 2026-11-15 | - |
 | [0023](0023-one-extension-source-for-several-majors.md) | One source of every extension builds against each supported PostgreSQL major (18 and 19) | Accepted | 2026-11-15 | 1 (extends 0002) |
 | [0024](0024-agpl-for-kingresdb-code.md) | KingresDB's own code is licensed under the GNU Affero General Public License, version 3 | Accepted | 2026-11-15 | 3 (supersedes 0004) |
@@ -39,8 +39,9 @@ An ADR records one decision: the context, the decision, its consequences and the
 - **Proposed**: written, not yet accepted by the project owner.
 - **Accepted**: the project owner accepted it. The rest of the project follows it.
 - **Superseded by ADR NNNN**: replaced. The text of a superseded ADR is kept.
+- **Accepted; the part X is superseded by ADR NNNN**: the decision stands except for the named part.
 
-An accepted ADR is not rewritten. If the decision changes, write a new ADR that says what it supersedes, and change only the status line of the old one.
+An accepted ADR is not rewritten. If the decision changes, write a new ADR that says what it supersedes, and change only the status line of the old one. A dated note at the end of an ADR may state what became of a detail (an implemented default, a tool that was replaced) without rewriting the decision.
 
 ## How to add an ADR
 

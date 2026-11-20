@@ -466,7 +466,11 @@ function or procedure (checked by the test `timepart_retention`).
   below), and `timepart__special_table`, which reads the private catalogs of
   `kingres_ledger` and `kingres_shard` for the conversion and returns a word;
   none of them takes a decision about a caller except the ones that check it
-  as described below.
+  as described below. `timepart__special_table` answers only for a table of the
+  login role (`session_user`): a superuser, or a role that has the privileges of
+  the table's owner; any other role gets `permission denied`, so the function
+  cannot be used to ask the private catalogs about a table that is not
+  yours. The other helpers that `PUBLIC` may execute read `pg_catalog` only.
 - **Policy and history tables.** The base tables (`*_data`) grant nothing to
   `PUBLIC` and have no row-level security; roles reach them through
   `security_barrier` views owned by the extension owner, whose condition
@@ -681,11 +685,35 @@ heap, change it, convert it again.
 
 **What the new partition is.** The same table: the name, the bounds, the
 columns and their defaults, comments and storage settings, the `CHECK` and `NOT
-NULL` constraints, the stored generated columns (recomputed), the owner, the
-table comment, the privileges on the table and on its columns (copied exactly,
-including `GRANT OPTION`), the tablespace, and the replica identity `FULL` or
-`NOTHING`. Triggers of the parent are cloned by the attach, as for any
-partition. The options (`columnar_options`) are set before the first row is
+NULL` constraints (all validated: see "What is refused"), the stored generated
+columns (recomputed), the owner, the table comment, the tablespace, the
+replica identity `FULL` or `NOTHING`, all indexes with their names and
+comments (the comments of primary key and unique constraints too), and the
+following, which `CREATE TABLE ... (LIKE ...)` does not carry and the
+conversion sets itself:
+
+* the privileges on the table and on its columns, with `GRANT OPTION`, and the
+  privileges that the owner took from itself (`REVOKE UPDATE ON t FROM
+  owner` stays in force). Every privilege must have been granted by the owner:
+  a partition with a grant that another role made with its `GRANT OPTION` is
+  refused, because the new table would have the owner as the grantor and
+  `REVOKE ... CASCADE` would no longer reach it. Default privileges of the
+  schema (`ALTER DEFAULT PRIVILEGES`) are revoked from the new table;
+* the enabled state of the triggers that the partition has from the table
+  (`DISABLE TRIGGER`, `ENABLE REPLICA TRIGGER`, `ENABLE ALWAYS TRIGGER`): the
+  attach clones them as enabled, and the old state is put back;
+* the storage parameters of the table and of its TOAST table (`fillfactor`,
+  `autovacuum_enabled`, `parallel_workers`, ...), set after the load and the
+  indexes: they apply to what is written next, not to the pages of the copy. A
+  parameter that the target access method does not accept is a `WARNING` and
+  the others are carried. A columnar table has no TOAST table, so the TOAST
+  parameters are not carried to it, and not back;
+* the statistics target and the options (`n_distinct`) of each column, the
+  statistics target of an index expression, and the index that the table is
+  clustered on (`CLUSTER ON`, the marker only);
+* Triggers of the parent are cloned by the attach, as for any partition.
+
+The options (`columnar_options`) are set before the first row is
 written; without them the new table takes the `kingres_columnar.*` settings of
 the session that converts. Columnar options live in the table's metapage, so a
 partition that is converted back and forth keeps none of them.
@@ -693,14 +721,26 @@ partition that is converted back and forth keeps none of them.
 **The steps**, all in one transaction (a failure anywhere leaves the old
 partition as it was, and no trace of the new one):
 
-1. The checks (see "What is refused"), before any lock on the partition.
+1. The checks (see "What is refused"), before any lock on the partition: a
+   partition that cannot be converted is refused without waiting for anything.
 2. `LOCK TABLE <partition> IN SHARE ROW EXCLUSIVE MODE`: the writers of the
    partition wait, its readers go on. (The design says `SHARE`; this mode has
    the same effect on readers and writers and also keeps out a plain `CREATE
-   INDEX`, which `SHARE` lets in, and a second conversion.)
+   INDEX`, which `SHARE` lets in, and a second conversion.) **Everything the
+   conversion reads from the catalog is read again now**, with the lock held:
+   the checks, the columns, the indexes, the constraints, the name and the
+   bound. The lock can take a while to be granted (a session that holds a lock
+   on the partition may add a column, create an index, drop a column or rename
+   the partition before it commits), and a statement built before the wait would
+   copy the table as it was. What was read before the lock is only used to
+   refuse early. If the partition was renamed or dropped while the conversion
+   waited, the call fails with `schema_changed` (SQLSTATE `55P03`, retryable;
+   for a policy run the action is `failed` and the next run is due within five
+   minutes) and changes nothing.
 3. `CREATE TABLE <partition>__kc (LIKE <partition> ...) USING <method>` with a
    `CHECK` of the bound in its definition, so that the attach below scans
-   nothing; the options; the comment, replica identity.
+   nothing; the options; the comment, replica identity, the statistics targets
+   and options of the columns.
 4. `INSERT INTO <partition>__kc (<every stored column>) SELECT ... FROM
    <partition> ORDER BY <sort_by>`: the columns are listed one by one, no
    default is evaluated, and it reads with a plain scan.
@@ -716,7 +756,10 @@ partition as it was, and no trace of the new one):
    constraints get its names back, with their comments. A unique index that
    finds a duplicate while it is built fails the conversion with the server's
    message (`could not create unique index ...`, with the key), and the old
-   partition stays. Converting back to heap does the same.
+   partition stays. Converting back to heap does the same. The temporary names
+   are `kc_<12 characters of md5 of the partition name>_<n>`, so they are short
+   and cannot collide whatever the name of the partition is. The storage
+   parameters of the table are set after the indexes.
 5. The check that the copy is whole: both tables have the same number of
    rows, or the transaction fails with `verification_failed`. (The design also
    compares the rows of `columnar_info`; a columnar table writes its stripes
@@ -726,8 +769,11 @@ partition as it was, and no trace of the new one):
 7. The swap: `ACCESS EXCLUSIVE` on the parent, waited for at most 500 ms (or
    half of `deadlock_timeout` if that is less), then `DETACH PARTITION`,
    `ATTACH PARTITION`, `DROP TABLE` of the old partition, `RENAME` of the new
-   one to the old name, and drop of the helper `CHECK`. A reader of the parent
-   sees the old partition or the new one, never neither and never both.
+   one to the old name, drop of the helper `CHECK`, then the enabled state of
+   the cloned triggers, the clustering index and the statistics targets of the
+   indexes. A statement of the parent that runs at the swap sees the old
+   partition or the new one, never neither and never both; **a transaction with
+   an older snapshot is the exception**, see "Snapshots older than the swap".
 8. The commit; then, in a transaction of its own, the result is written to the
    history (`bytes_after`, rows, time) and the new partition is analyzed
    (`ANALYZE`; a failure of it is a warning). A `VACUUM` of the new partition is
@@ -735,6 +781,30 @@ partition as it was, and no trace of the new one):
    procedure (`VACUUM cannot be executed from a function`), so a driver that wants
    one (the scheduler of the control plane) issues it as a statement of its own
    after the conversion, and autovacuum does it otherwise.
+
+**Snapshots older than the swap.** The new partition is filled by the
+conversion's own transaction, so its rows are newer than any snapshot taken
+before the swap commits. A `REPEATABLE READ` or `SERIALIZABLE` transaction (or
+a session that exported a snapshot) whose snapshot is older than the swap, and
+that reads the table for the first time after the swap, **finds the converted
+partition empty**: the catalog it reads is the current one, its rows are
+those of the old snapshot, and the new rows are not in it. This is the
+rule PostgreSQL states for `TRUNCATE` and for the table-rewriting forms of
+`ALTER TABLE` ("not MVCC-safe", chapter "Concurrency Control"); no swap of one
+table for another done in a transaction can give a better one. What is not
+affected: a transaction that has already read the table (it holds `ACCESS
+SHARE` on it, so the swap gives way: it waits at most 500 ms and fails with
+`swap_lock_timeout`, see below), any statement at `READ COMMITTED` (its snapshot is
+taken after it has the locks it needs, so a statement that waits for the swap
+sees the new partition whole), and `pg_dump` once it has locked the table
+(it locks every table within seconds of taking its snapshot). So a long
+`REPEATABLE READ` or `SERIALIZABLE` transaction, a `pg_dump` that has not yet
+locked the table, and a session that holds an exported snapshot must not
+span a conversion of a partition they have not touched. The extension cannot
+see such a snapshot (`pg_stat_activity` shows `backend_xmin`, not the
+isolation level, and shows nothing about other roles' sessions to an owner),
+and does not try to guess: `t/009_convert_ddl_race.pl` keeps the behaviour
+under test, so that a change in it is noticed and this text is changed.
 
 **Locks and how long a session waits.**
 
@@ -789,6 +859,28 @@ silently:
   policy, extended statistics, an identity column, a sequence it owns, is in a
   publication, is used by a view or materialized view, or is referenced by a
   foreign key;
+* the partition has a `CHECK` or `NOT NULL` constraint that is not validated
+  (`NOT VALID`): the new table would have it validated, and a row that
+  violates it would fail the copy, in every run; validate it or drop it;
+* a privilege on the partition or on a column of it was granted by a role that
+  is not the owner (see "What the new partition is");
+* another object depends on the partition or on its row type: a function with
+  the row type as an argument or a result (also as an array), an SQL function
+  whose body reads it, a policy of another table that reads it, a default value
+  that names it. `DROP TABLE` of the old partition would fail on the first of
+  them, after the whole copy, in every run; the refusal names it
+  (`pg_describe_object`), drop or change it first;
+* the table has a default partition larger than
+  `kingres_timepart.convert_default_max_mb` (default 256 MB, 0 to 1048576):
+  `ATTACH PARTITION` scans the default partition under `ACCESS EXCLUSIVE` on the
+  table to check that it holds no row of the new range, which stalls every
+  reader and writer of the table for about 50 ms per million rows, and
+  `lock_timeout` does not bound a scan. A policy table has no default partition
+  (see "Default partition"); this is for a conversion by hand;
+* for `heap`, a publication of the partition's schema or of all tables: it would
+  take in the new table the moment it is created and publish every row of the
+  copy under the table's temporary name (for `columnar` every publication that
+  would include the partition is refused, as below);
 * for `columnar`, what that access method refuses (`kingres_columnar` README,
   "What is refused" and "B-tree indexes"):
   * **an index that is not a B-tree with immediate checking**, on the table
@@ -825,7 +917,9 @@ plain `INSERT` that makes a duplicate of a unique key fails as on a heap table.
 work, bitmap and index-only scans do not (`kingres_columnar` README).
 
 **Who may convert.** The owner of the table (it must own the partition too),
-in its own session, or a superuser. The conversion copies rows through the
+in its own session, or a superuser. The owner needs `USAGE` on the schema
+`kingres`, as for every function of the extension: the block that does the
+conversion calls `timepart__convert_plan` as the owner, after the lock. The conversion copies rows through the
 owner's own `CHECK` constraints and generated columns, and drops and creates
 tables as the owner, so it is run like every other action of a run (see
 "Security", "A run executes the DDL as the owner"): a superuser's session runs
@@ -846,6 +940,30 @@ conversion, in the middle of the copy, just after the commit, and in the
 middle of a run of the policy). The history records an action in the same
 transaction as the swap, so it is true after a crash: an action that is
 `done` was converted, and a conversion that was cut off has no action.
+
+**Files after a crash.** The catalog is as before, but the files of the
+unfinished new table are not removed: PostgreSQL does not remove the files
+of a relation that a transaction in flight at a crash had created (they
+belong to no `pg_class` row). A `kill -9` in the middle of a columnar to heap
+copy of 2.5 million rows left a file of 187 MB; a heap to columnar conversion
+writes its data at the commit, so it leaves less. A cancel, an error, a
+timeout and `pg_terminate_backend` leave nothing. The files are found by name:
+a file of the database directory whose number is no `pg_class.relfilenode`.
+As a superuser (it lists a directory), after a crash:
+
+```
+SELECT f AS orphan
+  FROM pg_ls_dir('base/' || (SELECT oid FROM pg_database WHERE datname = current_database())) f
+ WHERE f ~ '^[0-9]+$'
+   AND f::oid NOT IN (SELECT pg_relation_filenode(c.oid) FROM pg_class c
+                       WHERE pg_relation_filenode(c.oid) IS NOT NULL);
+```
+
+and, after looking at it (a relation that a session creates or rewrites
+now is in `pg_class` already, so a file that this lists after a quiet restart
+belongs to no relation), remove each file named `<number>` and
+`<number>.<n>` and its `_fsm` and `_vm` forks by hand, with the server stopped.
+Nothing in the extension can do it.
 
 **Standbys.** The conversion is ordinary WAL (the DDL of PostgreSQL and the
 records of `kingres_columnar`), so a hot standby sees the old partition or
@@ -939,6 +1057,20 @@ set (only the four keys of `columnar_set_options`; 0.1 accepted any JSON object)
 A policy of 0.1 that holds another key must be set again. A released script is
 not edited: `kingres_timepart--0.1.sql` is as it was.
 
+Version 0.2 itself has not been released (no beta, no tag), so the review of
+the conversion (`kingres/docs/reviews/2026-11-20-kingres-timepart-0.2.md`) was
+fixed in `kingres_timepart--0.2.sql` and in `kingres_timepart--0.1--0.2.sql`,
+which still give the same catalog; there is no `0.2--0.3` script. The fixes add
+one function (`timepart__convert_plan`), change `timepart__convert_refusal`,
+`timepart__convert_stmts`, `timepart__special_table` and two lines of
+`timepart_run_action` and `timepart__finish_run` (the retry of `schema_changed`),
+and add one setting (`kingres_timepart.convert_default_max_mb`). A database
+that has installed 0.2 from a development build before that needs `DROP
+EXTENSION` and `CREATE EXTENSION` (the policies are in the extension's own
+tables: dump them first) or the `CREATE OR REPLACE` of those functions from the
+script; once a version is released, a change to its script is a new version
+with an upgrade script.
+
 ## Limits
 
 - One time key column; no expression, no multi-column key, no `LIST` or `HASH`.
@@ -970,6 +1102,14 @@ not edited: `kingres_timepart--0.1.sql` is as it was.
 - A conversion is tried once per run and not retried; a partition that is
   written through the parent at every attempt is not converted (`timepart_check`
   says `convert_blocked`).
+- A `REPEATABLE READ` or `SERIALIZABLE` snapshot that is older than the swap and
+  has not read the table yet finds the converted partition empty (see "Snapshots
+  older than the swap"); the extension cannot see such a snapshot and does not
+  wait for it.
+- The new table is made by `CREATE TABLE ... (LIKE ...)` and filled by the
+  conversion, so the TOAST parameters do not go to a columnar partition, columnar
+  options do not come back from one, and the grantor of a privilege must be the
+  owner (see "What the new partition is").
 - A partition that a foreign key references is not retired while a referencing
   row exists.
 - A partition the policy does not recognise (bounds off the grid) is never
@@ -1095,7 +1235,16 @@ The design is `kingres/docs/design/analytics-phase12-storage.md`, section 4.4 an
 `timepart_retention`, `timepart_names`, `timepart_hostile`, `timepart_security`, `timepart_history` (who
 sees the history, renamed roles and tables, owner changes, dropped roles),
 `timepart_privilege` (the code of a table owner while a superuser runs the
-maintenance), `timepart_forged` (policy and history rows shaped by hand, the seal), `timepart_owner_code` (the refusal, what the acknowledgement gives away, the owner's own session), `timepart_convert` (conversion to columnar and back, every kind of index and every refusal with its message, a duplicate found while an index is built, a copy that loses rows, who may convert, hostile names and search paths, the policy path), `timepart_drop` (`DROP EXTENSION` and `CREATE EXTENSION`, also where
+maintenance), `timepart_forged` (policy and history rows shaped by hand, the seal), `timepart_owner_code` (the refusal, what the acknowledgement gives away, the owner's own session), `timepart_convert` (conversion to columnar and back, every kind of index and every refusal with its message, a duplicate found while an index is built, a copy that loses rows, who may convert, hostile names and search paths, the policy path), `timepart_convert_more` (what a conversion keeps: the enabled state of cloned
+triggers, storage parameters, statistics targets, the clustering index, replica
+identity, constraint comments, a revoked privilege of the owner, no default
+privilege of the schema; what it refuses before the copy: a constraint that is
+not validated, a grant made by another role, an object that depends on the
+partition or its row type, a large default partition, a publication of the
+schema; a name of multibyte letters with two indexes; another table access
+method; a partition off the grid in the convert phase of a run; a superuser
+that switched to the owner; the helper that knows the ledger and distributed
+tables), `timepart_drop` (`DROP EXTENSION` and `CREATE EXTENSION`, also where
 the user has objects of the same names), and `upgrade` (0.1 to 0.2 against a new installation of 0.2)).
 `timepart_convert` needs `kingres_columnar` in the installation and preloaded
 (`kingres_timepart.conf` does it; for a build outside the tree, install
@@ -1121,7 +1270,11 @@ middle of the copy, just after the commit, and in the middle of a policy run),
 rows and the same access method after replay, a promotion followed by a
 conversion), `008_convert_prepared.pl` (a prepared transaction that holds a
 row, a row through the parent, or a read, also across a restart and through
-the policy).
+the policy), `009_convert_ddl_race.pl` (a column added and filled and a unique
+index created, a column dropped, and the partition renamed, each while the
+conversion waits for its lock; the tablespace; the swap that gives way after the
+short wait and says why, to a reader and to a writer; the limit of the
+`REPEATABLE READ` snapshot).
 
 Build and test against a KingresDB installation, out of tree (install
 `kingres_columnar` into the same installation first, with

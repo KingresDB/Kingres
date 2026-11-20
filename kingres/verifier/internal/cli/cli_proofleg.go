@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/aggregate"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/chain"
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/events"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/format"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/merkle"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/proof"
@@ -22,6 +24,8 @@ type proofLegArgs struct {
 	epoch                                        uint64
 	tableID                                      int64
 	rowHash, op                                  string
+	acceptEpoch                                  []string
+	accept                                       *epochAccept
 	now                                          nowArg
 }
 
@@ -87,6 +91,11 @@ func (e *env) proofLegRun(r *result, a proofLegArgs) outcome {
 	if err != nil {
 		return inputOut(err)
 	}
+	acc, err := newEpochAccept(a.acceptEpoch)
+	if err != nil {
+		return inputOut(err)
+	}
+	a.accept = acc
 	p, err := loadPubInputs(a.trust, a.bundle, a.now)
 	if err != nil {
 		return inputOut(err)
@@ -162,6 +171,11 @@ func (e *env) proofLegCore(r *result, p *pubInputs, open proof.Source, exp proof
 		return failedOut("log-inclusion", fmt.Errorf("the block of height %d is not leaf %d of the signed chain log of size %d: %w", h, h, ol.cp.Size, err))
 	}
 	r.ok("log-inclusion", fmt.Sprintf("block %d: SHA-256 of its 87-byte leaf data is the block hash %x, and its leaf hash leads to the root of the signed chain log of size %d through %d hash(es) computed from the tiles (RFC 9162 2.1.3.2)", h, pr.Block.BlockHash[:8], ol.cp.Size, len(path)))
+	if w, werr := p.events(); werr == nil && w != nil {
+		if ec, ok := w.EpochClosed[events.ChainKey(pr.ChainID, uint32(spec.epoch))]; ok { // #nosec G115 -- range checked
+			r.notes = append(r.notes, "finding: the block is shown in epoch "+strconv.FormatUint(spec.epoch, 10)+", which a verified event closed: "+epochClosedText(memberKey{pr.ChainID, uint32(spec.epoch)}, ec)+". This run does not show that the block is in the history that goes on"+commonRemark(ec, h))
+		}
+	}
 	r.info = map[string]any{"table_id": pr.TableID, "op": proof.OpName(pr.Op), "row_hash": format.EncodeHex(pr.RowHash[:]), "block_height": h,
 		"log_leg": a.leg, "chain_log": ol.cp.Origin, "chain_size": ol.cp.Size}
 	root := "signature of key " + describeSigners(ol.signers) + " on the checkpoint of the chain log"
@@ -186,7 +200,7 @@ func (e *env) proofLegCore(r *result, p *pubInputs, open proof.Source, exp proof
 			return inputOut(errors.New("--aggregate-id must be 64 lower case hex characters"))
 		}
 		key := memberKey{pr.ChainID, uint32(spec.epoch)} // #nosec G115 -- the epoch was range checked
-		rep, out := p.verifyAggregate(r, aggID, aggOptions{only: &key})
+		rep, out := p.verifyAggregate(r, aggID, aggOptions{only: &key, accept: a.accept})
 		if !out.ok() {
 			return out
 		}

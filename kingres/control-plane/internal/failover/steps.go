@@ -85,12 +85,19 @@ type Runner struct {
 	PreparedWait       time.Duration // (default 2 min)
 	PreparedEvery      time.Duration // (default 30 s)
 	ClientsWait        time.Duration // (default 30 s)
+	QuiesceWait        time.Duration // the stop of the writes of a switchover is repeated this long (default 2 min)
+	DrainWait          time.Duration // the wait for prepared transactions of a switchover (default 1 min)
+	DrainEvery         time.Duration // (default 10 s)
+	MarkWait           time.Duration // the wait for the standby to replay the mark (default 10 s)
+	VerifyWait         time.Duration // the proof is repeated this long (default 30 s)
 	// PromoteNode are the bounds of the repeat loop of kingres.promote_node.
 	PromoteNode PromoteOptions
 	// PositionTimeout is the time of one read of a position (default 5 s).
 	PositionTimeout time.Duration
 
 	mu sync.Mutex
+	// paused is when the writes of a group of a switchover stopped (only for the measurement of the pause).
+	paused map[string]time.Time
 }
 
 func (r *Runner) log() *slog.Logger {
@@ -158,6 +165,10 @@ func Cancellable(t task.Task) bool {
 		if strings.HasSuffix(s.Name, ": "+StepStop) && s.State != task.StepPending {
 			return false
 		}
+		// The promotion is the point of no return of a switchover (design 5.3).
+		if strings.HasSuffix(s.Name, ": "+StepPromote) && s.State != task.StepPending {
+			return false
+		}
 	}
 	return true
 }
@@ -207,6 +218,10 @@ func (r *Runner) steps(input json.RawMessage) ([]task.Step, error) {
 	out := []task.Step{r.step(StepCheck, -1, StepCheck, false, r.check)}
 	for _, g := range in.Groups {
 		g := g
+		if in.graceful() {
+			r.addGraceful(&out, g)
+			continue
+		}
 		add := func(name string, irreversible bool, f stepFunc) {
 			out = append(out, r.step(StepName(g, name), g, name, irreversible, f))
 		}
@@ -353,7 +368,9 @@ func (r *Runner) Preflight(ctx context.Context, in Input) *Refusal {
 		return &Refusal{Code: "unprocessable", Status: 422, Message: "Server " + in.ServerID + " runs the primary of no shard group."}
 	}
 	if in.Mode == ModeGraceful {
-		return &Refusal{Code: "unsupported_operation", Status: 422, Message: "The planned switchover (mode graceful) is not supported by this version of kingresd."}
+		if ref := r.preflightGraceful(ctx, in); ref != nil {
+			return ref
+		}
 	}
 	nodeSet := map[int32]Node{}
 	for _, n := range nodes {
@@ -1598,6 +1615,7 @@ func (r *Runner) clients(ctx context.Context, env *task.Env, sc *stepCtx) error 
 	for {
 		st, err := r.Peers.State(ctx, gr.NewServer, sc.group)
 		if err == nil && st.Holds && len(st.OutOfRecovery()) == 1 {
+			r.writesResumed(ctx, sc)
 			return nil
 		}
 		if !r.now().Before(deadline) {
@@ -1611,6 +1629,12 @@ func (r *Runner) clients(ctx context.Context, env *task.Env, sc *stepCtx) error 
 }
 
 func (r *Runner) unfreeze(ctx context.Context, env *task.Env, sc *stepCtx) error {
+	if sc.in.graceful() {
+		// The old primary is a standby to be: its access rules are put back before the rebuild starts it again.
+		if err := r.Peers.Unquiesce(ctx, sc.old(), QuiesceRequest{Group: sc.group}); err != nil && !errors.Is(err, ErrUnreachable) && !IsCode(err, "no_instance") {
+			r.log().Warn("failover: putting the access rules back", "group", sc.group, "error", err)
+		}
+	}
 	if err := r.Peers.Unfreeze(ctx, sc.old(), sc.group); err != nil && !errors.Is(err, ErrUnreachable) && !IsCode(err, "no_instance") {
 		r.log().Warn("failover: lifting the freeze", "group", sc.group, "server", sc.old(), "error", err)
 	}
@@ -1661,6 +1685,9 @@ func (r *Runner) OnFail(abandon func(ctx context.Context, taskID int64, outcome,
 		var in Input
 		if err := json.Unmarshal(t.Input, &in); err != nil {
 			return
+		}
+		if in.graceful() {
+			r.rollbackUnpromoted(ctx, t, in)
 		}
 		for _, g := range in.Groups {
 			// The task is over: its freeze is lifted whatever epoch holds it (F3-14: only a freeze of this task is lifted).

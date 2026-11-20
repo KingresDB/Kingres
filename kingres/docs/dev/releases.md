@@ -46,9 +46,9 @@ A cluster runs one major: all its servers are installed from the same branch. Mo
 ## State on 2026-11-15
 
 - `kingres-18` is on `REL_18_7` and is the default branch.
-- `kingres-19` exists since 2026-11-15, on `REL_19_RC2`: upstream has no final release of PostgreSQL 19 yet (it is scheduled for 2026-11-19). Until the branch is on `REL_19_0` it is a pre-release and nothing is tagged from it. It consists of the upstream tag, one commit with the three core patches (they applied without a change to their content), and sync commits.
+- `kingres-19` exists since 2026-11-15, on `REL_19_RC2`: upstream has no final release of PostgreSQL 19 yet (it is scheduled for 2026-11-19). Until the branch is on `REL_19_0` it is a pre-release and nothing is tagged from it. It consists of the upstream tag, one commit with the core patches that existed then, KP-0001 to KP-0003 (they applied without a change to their content), one commit for KP-0004 (the `LICENSE` file), and sync commits. The register has four entries.
 - Checked on `kingres-19` at the sync from `d504f44464`, on the tree exactly as committed: the whole tree builds with assertions enabled and without a compiler warning; the core regression suite passes (243 tests); the suites of the four extensions pass in tree (73 suites, and the test that needs an installation of the other major skips). Out of tree, every extension passes on 18.7 and on 19rc2 with `-Werror`; `kingres_shard` runs 47 TAP files with 5847 subtests on each.
-- Not checked on 19 yet: the control plane's integration suite against PostgreSQL 19 instances, and the packaging. The packaging builds one major today and names its artifacts without the major, so there is no package or image for 19.
+- Checked on 19 later (the work log of 2026-11-16 and the following days has the runs, and [../../packaging/README.md](../../packaging/README.md) has the numbers): the integration suite of the control plane passes against PostgreSQL 19 instances, and the package, image and compose tests give the same numbers on both majors; the packaging builds one major at a time and names its artifacts with the major (`+pg18`, `+pg19`). When this section was first written (2026-11-15) neither had been checked on 19.
 - No release has been tagged on either branch.
 
 ## History rewritten on 2026-11-16

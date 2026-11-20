@@ -280,7 +280,11 @@ go_build "${cp_dir}" "${bin}/kingres-watchdog" ./cmd/kingres-watchdog
 
 if [ -f "${src}/kingres/verifier/go.mod" ]; then
     log "building kingres-verify ${version}"
-    go_build "${src}/kingres/verifier" "${bin}/kingres-verify" ./cmd/kingres-verify ||
+    # The one script that knows the reproducible flags of the verifier builds it, so that this
+    # binary is the same bytes as the linux/amd64 file of a release of the same version made with
+    # the same Go release (kingres/verifier/scripts/release.sh).  It is a copy for convenience: an
+    # auditor must not rely on a verifier that came from the cluster it checks.
+    bash "${src}/kingres/verifier/scripts/build-one.sh" linux amd64 "${version}" "${bin}/kingres-verify" ||
         die "kingres/verifier has a go.mod but does not build"
     verify_status="built"
 else
@@ -391,6 +395,9 @@ mkdir -p "$(dirname "${bi}")"
     echo "source commit: ${commit}"
     echo "prefix: ${prefix}"
     echo "kingres-verify: ${verify_status}"
+    if [ "${verify_status}" = built ]; then
+        echo "kingres-verify sha256: $(sha256sum "${bin}/kingres-verify" | cut -d" " -f1) (built by kingres/verifier/scripts/build-one.sh, flags of its own)"
+    fi
     echo "go: $(go version)"
     echo "node: $(node --version)  npm: $(npm --version)"
     echo "meson: $(meson --version)  ninja: $(ninja --version)"

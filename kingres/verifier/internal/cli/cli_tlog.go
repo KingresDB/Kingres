@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/checkpoint"
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/events"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/format"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/merkle"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/pubsrc"
@@ -182,6 +183,7 @@ type logInputs struct {
 	shared bool          // the source belongs to the caller, which closes it
 	now    time.Time
 	notes  []string
+	walk   *events.Walk // the events of the source, when they were read (applyEvents)
 }
 
 // close releases the source directory.
@@ -507,6 +509,7 @@ func (e *env) runConsistency(args []string) int {
 	var oldCP *checkpoint.Checkpoint
 	oldSigned := false
 	var oldHeld *heldNote
+	var crossEvent *events.EpochClosed
 	if m := sizeRootRE.FindStringSubmatch(*oldFlag); m != nil {
 		size, err := strconv.ParseUint(m[1], 10, 64)
 		rb, derr := signednote.DecodeBase64(m[2])
@@ -538,7 +541,18 @@ func (e *env) runConsistency(args []string) int {
 		// A state file of this program is the auditor's own record: it stays an
 		// anchor when its keys are no longer counted (see verifyHeld). A plain note
 		// handed in is not, and keeps the strict rule.
-		held, oldNotes, verr := in.verifyHeld(oldData, rec, "--old "+*oldFlag, rec != nil)
+		// A checkpoint of the same chain at another epoch that a verified event closed is judged as the log of that epoch: it is a
+		// failure that says why, not a malformed input (design 9.4). Without such an event it is not a checkpoint of this log, as before.
+		heldIn := in
+		if oe, ok := in.otherEpochOf(oldData); ok {
+			if ec, found := in.closedEvent(oe); found {
+				copyIn := *in
+				copyIn.spec = chainSpec(in.spec.id, oe)
+				heldIn = &copyIn
+				crossEvent = &ec
+			}
+		}
+		held, oldNotes, verr := heldIn.verifyHeld(oldData, rec, "--old "+*oldFlag, rec != nil)
 		if verr != nil {
 			var ie *inputErr
 			if errors.As(verr, &ie) {
@@ -589,11 +603,18 @@ func (e *env) runConsistency(args []string) int {
 		}
 		return err
 	}
-	if oldCP.Size > newCP.Size {
+	if crossEvent != nil && r.info == nil {
+		r.info = map[string]any{"old_size": oldCP.Size, "new_size": newCP.Size}
+	}
+	if crossEvent != nil || oldCP.Size > newCP.Size {
 		if r.info != nil { // the member of the held checkpoint is there since it was judged
 			r.info["old_size"], r.info["new_size"] = oldCP.Size, newCP.Size
 		}
-		return e.finishFailed(r, *asJSON, "sizes", weakWrap(fmt.Errorf("the new checkpoint has size %d, smaller than the old size %d: the log went back", newCP.Size, oldCP.Size)))
+		step, ferr := "sizes", fmt.Errorf("the new checkpoint has size %d, smaller than the old size %d: the log went back", newCP.Size, oldCP.Size)
+		if crossEvent != nil {
+			step, ferr = in.crossEpochFailure(*crossEvent, oldCP)
+		}
+		return e.finishFailed(r, *asJSON, step, weakWrap(ferr))
 	}
 	r.ok("sizes", fmt.Sprintf("old %d, new %d", oldCP.Size, newCP.Size))
 	r.info = map[string]any{"old_size": oldCP.Size, "new_size": newCP.Size, "old_root": format.EncodeHex(oldCP.Root[:]), "new_root": format.EncodeHex(newCP.Root[:])}

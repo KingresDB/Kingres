@@ -142,6 +142,9 @@ func TestAReleaseWaitsForTheRenewalInFlight(t *testing.T) {
 	ctx := context.Background()
 	r := newRig(t, []string{"a", "b", "c"}, false)
 	r.m.Renew(ctx)
+	// A round ends when a majority answered; its request to the last grantor may still be on its way and be counted as an ask a moment
+	// later. The count below starts when every request of this first round has ended (the cause of "4 asks, want 6").
+	r.m.fl.waitAll()
 	_ = r.inst.StopImmediate(ctx)
 	r.voter.mu.Lock()
 	r.voter.gate = make(chan struct{})
@@ -151,15 +154,20 @@ func TestAReleaseWaitsForTheRenewalInFlight(t *testing.T) {
 	go func() { r.m.Renew(ctx); close(renewed) }()
 	asked := func() int { r.voter.mu.Lock(); defer r.voter.mu.Unlock(); return len(r.voter.asked) }
 	base := asked()
-	for deadline := time.Now().Add(5 * time.Second); asked() < base+2 && time.Now().Before(deadline); {
+	// The renewal in flight sends its two asks (the two other grantors) and then waits at the gate. The wait is for that condition: how
+	// long it takes depends on the machine (a loaded one took seconds), so the bound only says "it never came".
+	for deadline := time.Now().Add(2 * time.Minute); asked() < base+2 && time.Now().Before(deadline); {
 		time.Sleep(10 * time.Millisecond)
+	}
+	if asked() < base+2 {
+		t.Fatalf("the renewal in flight did not send its asks (%d, want %d)", asked(), base+2)
 	}
 	released := make(chan error, 1)
 	go func() { _, err := r.m.ReleaseGroup(ctx, 1); released <- err }()
 	// The release has started when it has marked the group (it does so before it waits for the round in flight): wait
 	// for that condition, with a bound, instead of a fixed time (F2-16). From then on it can only be blocked behind
 	// the round that holds the gate, and the negative check below looks at it for a short window.
-	for deadline := time.Now().Add(5 * time.Second); !r.m.Relinquished(1) && time.Now().Before(deadline); {
+	for deadline := time.Now().Add(2 * time.Minute); !r.m.Relinquished(1) && time.Now().Before(deadline); {
 		time.Sleep(time.Millisecond)
 	}
 	if !r.m.Relinquished(1) {

@@ -30,3 +30,7 @@ The authoritative cluster state (nodes, bucket map, colocation, tasks, desired s
 - **A separate Raft store for the map** (the Couchbase Chronicle model). Rejected: one more component to build and keep coordinated, and map changes could not share a transaction with the rest of the metadata.
 - **Row-to-node directory.** Rejected: see ADR 0007.
 - **etcd as the map store.** Not explicitly discussed in the document. etcd is used for leader election and health only; the document does not evaluate holding the map there.
+
+## Note of 2026-11-20: Patroni and etcd
+
+The parts of this ADR that name Patroni (failover of the map group) and etcd (leader election and health) are superseded. [ADR 0021](0021-failover-in-kingresd.md) puts failover, for the map group too, into `kingresd` with leases, and does not bundle Patroni or etcd; [ADR 0018](0018-manager-leader-follows-the-map-group-primary.md) takes the manager leader from the map group primary, not from etcd. The decision that the map group in PostgreSQL is the source of truth for the catalog stands.

@@ -81,6 +81,7 @@ type Hook struct {
 
 	mu      sync.Mutex
 	checked time.Time
+	info    os.FileInfo // of the file that spec was read from
 	spec    Spec
 	// ledgerSeen counts the writes of the kind of the fault, from the moment the fault was first read.
 	ledgerFor  string
@@ -102,8 +103,16 @@ func New(dir string) *Hook {
 func (h *Hook) load() Spec {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if now := h.now(); now.Sub(h.checked) >= 100*time.Millisecond {
+	// The file is read again when it is a different file (it is replaced by a rename, so a stat tells at once) and, as a backstop,
+	// every 100 ms: a test that changes the faults and then starts work never sees the old ones (SetFaults of the harness relies on it).
+	fi, serr := os.Stat(h.path)
+	changed := (serr == nil) != (h.info != nil) || (serr == nil && (!os.SameFile(fi, h.info) || !fi.ModTime().Equal(h.info.ModTime()) || fi.Size() != h.info.Size()))
+	if now := h.now(); changed || now.Sub(h.checked) >= 100*time.Millisecond {
 		h.checked = now
+		h.info = nil
+		if serr == nil {
+			h.info = fi
+		}
 		var s Spec
 		if b, err := os.ReadFile(h.path); err == nil {
 			_ = json.Unmarshal(b, &s) // a half-written or absent file means no faults

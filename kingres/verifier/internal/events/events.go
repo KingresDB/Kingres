@@ -232,9 +232,13 @@ type Walk struct {
 	UnauthorisedRetired map[string]uint64
 	Keys                []*Key
 	Retired             map[string]ChainRetired // by ChainKey
-	Count               int                     // events read
-	Other               map[string]int          // verified events of a type this version does not interpret
-	Notes               []string
+	// EpochClosed are the verified epoch-closed events, by ChainKey of the chain and the epoch they closed.
+	EpochClosed map[string]EpochClosed
+	// UnauthorisedEpochClosed names the epochs that a skipped epoch-closed event is about (the lines are not trusted).
+	UnauthorisedEpochClosed map[string]uint64
+	Count                   int            // events read
+	Other                   map[string]int // verified events of a type this version does not interpret
+	Notes                   []string
 }
 
 // ChainKey is the key of a chain and epoch in Walk.Retired.
@@ -260,7 +264,7 @@ func FromSource(read func(rel string, limit int64) ([]byte, error)) Reader {
 // one that has no more: the number of events read is in Count, and a caller that holds an earlier
 // count (the trust file it made at the last follow) can say that events went missing.
 func Follow(file *trust.File, read Reader, strict bool) (*Walk, error) {
-	w := &Walk{Retired: map[string]ChainRetired{}, Other: map[string]int{}, UnauthorisedRetired: map[string]uint64{}}
+	w := &Walk{Retired: map[string]ChainRetired{}, Other: map[string]int{}, UnauthorisedRetired: map[string]uint64{}, EpochClosed: map[string]EpochClosed{}, UnauthorisedEpochClosed: map[string]uint64{}}
 	byFP := map[string]*Key{}
 	for _, k := range file.Keys {
 		if err := edkey.Check(k.Public); err != nil {
@@ -467,6 +471,8 @@ func (w *Walk) apply(prefix string, seq uint64, raw []byte, byFP map[string]*Key
 		k.MaxTreeSize = nil
 	case TypeChainRetired:
 		return w.chainRetired(ev, authorised)
+	case TypeEpochClosed:
+		return w.epochClosed(ev, authorised)
 	default:
 		w.Other[ev.Type]++
 	}
@@ -613,6 +619,13 @@ func (w *Walk) skip(seq uint64, raw []byte, ae *authError) {
 	if n, err := signednote.Parse(raw); err == nil {
 		if ev, err := Parse(n.Text); err == nil {
 			sk.Type = ev.Type
+			if ev.Type == TypeEpochClosed {
+				if c, err := hex32(ev.Fields["chain"]); err == nil {
+					if e, err := canonicalUint(ev.Fields["epoch"], 1<<31); err == nil && e >= 1 {
+						w.UnauthorisedEpochClosed[ChainKey(c, uint32(e))] = seq // #nosec G115 -- range checked
+					}
+				}
+			}
 			if ev.Type == TypeChainRetired {
 				if c, err := hex32(ev.Fields["chain"]); err == nil {
 					if e, err := canonicalUint(ev.Fields["epoch"], 1<<31); err == nil && e >= 1 {

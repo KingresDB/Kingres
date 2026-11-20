@@ -229,6 +229,7 @@ type StateAnswer struct {
 	Adopted      string          `json:"adopted,omitempty"`
 	Attached     bool            `json:"attached,omitempty"`
 	Relinquished bool            `json:"relinquished"`
+	Quiesced     bool            `json:"quiesced"`
 	Frozen       bool            `json:"frozen"`
 	CatalogTerm  *int64          `json:"catalogTerm"`
 	Prepared     *int            `json:"preparedTransactions"`
@@ -271,6 +272,7 @@ func failoverState(ctx context.Context, d *haDeps, group int32) StateAnswer {
 		out.Adopted, out.Attached, _ = d.LeaseMgr.Adopted(group)
 		out.Relinquished = d.LeaseMgr.Relinquished(group)
 	}
+	out.Quiesced = quiesced.has(group)
 	if d.Standby != nil {
 		for _, g := range d.Standby.agent.FrozenGroups() {
 			if g == group {

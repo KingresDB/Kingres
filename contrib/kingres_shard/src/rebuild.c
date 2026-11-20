@@ -60,6 +60,7 @@ PG_FUNCTION_INFO_V1(kingres_internal_op_unlock);
 PG_FUNCTION_INFO_V1(kingres_internal_op_alive);
 PG_FUNCTION_INFO_V1(kingres_internal_prevent_xact_block);
 PG_FUNCTION_INFO_V1(kingres_internal_branch_exec);
+PG_FUNCTION_INFO_V1(kingres_internal_branch_scalar);
 
 static void
 require_superuser(const char *what)
@@ -187,6 +188,7 @@ kingres_internal_shadow_script(PG_FUNCTION_ARGS)
 	char	   *column = PG_ARGISNULL(1) ? NULL : pstrdup(NameStr(*PG_GETARG_NAME(1)));
 	int			colocation_id = PG_ARGISNULL(2) ? 0 : PG_GETARG_INT32(2);
 	int			group = PG_ARGISNULL(3) ? 0 : PG_GETARG_INT32(3);
+	char	   *partbase = PG_ARGISNULL(4) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(4));
 	MemoryContext callercxt = CurrentMemoryContext;
 	char	   *relname;
 	char	   *nspname;
@@ -221,7 +223,8 @@ kingres_internal_shadow_script(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("a distributed shadow needs a colocation group")));
 		placement = kingres_shard_load_placement(colocation_id);
-		kingres_shard_append_partitions(&script, nspname, relname, shadow, placement, group);
+		/* a table that is rebuilt while the old one is in use cannot have its partitions under the final names yet */
+		kingres_shard_append_partitions(&script, nspname, partbase != NULL ? partbase : relname, shadow, placement, group);
 	}
 	PG_RETURN_TEXT_P(cstring_to_text(script.data));
 }
@@ -453,6 +456,50 @@ kingres_internal_swap_table(PG_FUNCTION_ARGS)
 	kingres_shard_fault_point("rebuild_switch_after_prepare");
 
 	PG_RETURN_TEXT_P(cstring_to_text(oldname));
+}
+
+/*
+ * kingres.internal_branch_scalar(node_id int, sql text) returns text
+ *
+ * Like internal_branch_exec(), and the first value of the first row that the statement returns (NULL when it
+ * returns none): the transaction id of the swap on a node, the OID of a table there.
+ */
+Datum
+kingres_internal_branch_scalar(PG_FUNCTION_ARGS)
+{
+	int			node_id = PG_GETARG_INT32(0);
+	char	   *sql = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	const KsNode *n;
+	KsConn	   *kc;
+	PGresult   *res;
+	text	   *result = NULL;
+
+	require_superuser("kingres.internal_branch_scalar()");
+	n = kingres_shard_node_by_id(node_id);
+	if (n == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("node %d does not exist", node_id)));
+	if (n->node_id == kingres_shard_catalog()->local_node_id)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("node %d is this node", node_id)));
+	kc = kingres_shard_get_conn(n->host, n->port, false, NULL);
+	kingres_shard_begin_write_xact(kc);
+	res = kingres_shard_exec(kc, sql);
+	if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0 && !PQgetisnull(res, 0, 0))
+		result = cstring_to_text(PQgetvalue(res, 0, 0));
+	else if (PQresultStatus(res) != PGRES_TUPLES_OK && PQresultStatus(res) != PGRES_COMMAND_OK)
+	{
+		PQclear(res);
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("the statement failed on node %d", node_id)));
+	}
+	PQclear(res);
+	if (result == NULL)
+		PG_RETURN_NULL();
+	PG_RETURN_TEXT_P(result);
 }
 
 /*

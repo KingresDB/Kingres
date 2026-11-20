@@ -108,7 +108,11 @@ $$;
 -- Is the table, or its partition, one that another extension owns: a ledger
 -- table (kingres_ledger) or a distributed table (kingres_shard)?  SECURITY
 -- DEFINER because the catalogs of those extensions are private to them; it
--- decides nothing about the caller and returns a word, or null.
+-- decides nothing about the caller and returns a word, or null.  It answers
+-- only about a table of the caller: the login role (session_user, which no
+-- SQL changes without superuser rights) must be a superuser or have the
+-- privileges of the owner of the table, so that a role cannot use it to ask
+-- the private catalogs of the other extensions about any table.
 CREATE FUNCTION kingres.timepart__special_table(p_parent oid, p_part oid)
 RETURNS text
 LANGUAGE plpgsql SECURITY DEFINER
@@ -117,6 +121,13 @@ AS $$
 DECLARE
     v_hit boolean;
 BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r WHERE r.rolname = session_user AND r.rolsuper)
+       AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c
+                        WHERE c.oid = p_parent
+                          AND pg_catalog.pg_has_role(session_user, c.relowner, 'USAGE')) THEN
+        RAISE EXCEPTION 'permission denied: only the owner of the table or a superuser may ask'
+            USING ERRCODE = '42501';
+    END IF;
     IF pg_catalog.to_regclass('kingres.ledger_table') IS NOT NULL THEN
         EXECUTE 'SELECT EXISTS (SELECT 1 FROM kingres.ledger_table t WHERE t.relid::pg_catalog.oid IN ($1, $2))'
             INTO v_hit USING p_parent, p_part;
@@ -276,6 +287,92 @@ BEGIN
     IF v_x IS NOT NULL THEN
         RETURN format('%s has the identity column "%s"', v_pn, v_x);
     END IF;
+    -- A constraint that is not validated would be made on the empty new table,
+    -- where it is valid, and checked against every row of the copy.
+    SELECT k.conname INTO v_x FROM pg_constraint k
+     WHERE k.conrelid = p_part AND NOT k.convalidated AND k.contype IN ('c', 'n')
+     ORDER BY k.conname LIMIT 1;
+    IF v_x IS NOT NULL THEN
+        RETURN format('%s has the constraint "%s" that is not validated (NOT VALID): the new table would have it validated, and a row that violates it would fail the copy', v_pn, v_x);
+    END IF;
+    -- A privilege that another role than the owner granted (a role with GRANT
+    -- OPTION that passed it on) would be granted by the owner on the new table.
+    SELECT format('%s granted to %s by "%s"', x.privilege_type,
+                  CASE WHEN x.grantee = 0 THEN 'PUBLIC' ELSE '"' || pg_get_userbyid(x.grantee) || '"' END,
+                  pg_get_userbyid(x.grantor)) INTO v_x
+      FROM pg_class c, LATERAL aclexplode(c.relacl) x
+     WHERE c.oid = p_part AND x.grantor <> c.relowner
+     ORDER BY x.grantor, x.grantee, x.privilege_type LIMIT 1;
+    IF v_x IS NULL THEN
+        SELECT format('%s (%s) granted to %s by "%s"', x.privilege_type, a.attname,
+                      CASE WHEN x.grantee = 0 THEN 'PUBLIC' ELSE '"' || pg_get_userbyid(x.grantee) || '"' END,
+                      pg_get_userbyid(x.grantor)) INTO v_x
+          FROM pg_attribute a, LATERAL aclexplode(a.attacl) x
+         WHERE a.attrelid = p_part AND a.attnum > 0 AND NOT a.attisdropped
+           AND x.grantor <> v_c.relowner
+         ORDER BY a.attnum, x.grantor, x.grantee, x.privilege_type LIMIT 1;
+    END IF;
+    IF v_x IS NOT NULL THEN
+        RETURN format('%s has a privilege that the owner did not grant (%s): the new table would have the owner as the grantor', v_pn, v_x);
+    END IF;
+    -- Objects that depend on the partition, or on its row type, without
+    -- being a view, a rule, a foreign key or an owned sequence (found above):
+    -- a function with the row type as an argument, an SQL function that reads
+    -- it, a policy of another table, a default that names it.  DROP TABLE
+    -- would fail on the first of them after the whole copy.
+    SELECT pg_describe_object(d.classid, d.objid, d.objsubid) INTO v_x
+      FROM pg_depend d
+     WHERE d.deptype = 'n'
+       AND ((d.refclassid = 'pg_class'::pg_catalog.regclass AND d.refobjid = p_part)
+            OR (d.refclassid = 'pg_type'::pg_catalog.regclass
+                AND d.refobjid IN (SELECT t.oid FROM pg_type t
+                                    WHERE t.typrelid = p_part
+                                       OR t.oid = (SELECT t2.typarray FROM pg_type t2
+                                                    WHERE t2.typrelid = p_part))))
+       AND NOT (d.classid = 'pg_class'::pg_catalog.regclass AND d.objid = p_part)
+       -- the partition's own objects that name its columns (the expression of
+       -- a generated column, a constraint, a trigger, a policy, an index)
+       AND NOT (d.classid = 'pg_attrdef'::pg_catalog.regclass
+                AND EXISTS (SELECT 1 FROM pg_attrdef ad WHERE ad.oid = d.objid AND ad.adrelid = p_part))
+       AND NOT (d.classid = 'pg_constraint'::pg_catalog.regclass
+                AND EXISTS (SELECT 1 FROM pg_constraint k WHERE k.oid = d.objid AND k.conrelid = p_part))
+       AND NOT (d.classid = 'pg_trigger'::pg_catalog.regclass
+                AND EXISTS (SELECT 1 FROM pg_trigger t WHERE t.oid = d.objid AND t.tgrelid = p_part))
+       AND NOT (d.classid = 'pg_policy'::pg_catalog.regclass
+                AND EXISTS (SELECT 1 FROM pg_policy po WHERE po.oid = d.objid AND po.polrelid = p_part))
+       AND NOT (d.classid = 'pg_class'::pg_catalog.regclass
+                AND EXISTS (SELECT 1 FROM pg_index i WHERE i.indexrelid = d.objid AND i.indrelid = p_part))
+     ORDER BY d.classid, d.objid, d.objsubid LIMIT 1;
+    IF v_x IS NOT NULL THEN
+        RETURN format('%s is used by %s, which the drop of the old partition would stop', v_pn, v_x);
+    END IF;
+    -- The attach scans the default partition, under ACCESS EXCLUSIVE on the
+    -- table, for rows of the new range: refuse when it is large.
+    SELECT format('%s of %s', d.oid::pg_catalog.regclass::text,
+                  pg_size_pretty(pg_relation_size(d.oid))) INTO v_x
+      FROM pg_inherits i JOIN pg_class d ON d.oid = i.inhrelid
+     WHERE i.inhparent = p_parent AND d.oid <> p_part
+       AND pg_get_expr(d.relpartbound, d.oid) = 'DEFAULT'
+       AND pg_relation_size(d.oid) > kingres.timepart__setting_int(
+               'kingres_timepart.convert_default_max_mb', 256, 0, 1048576)::bigint * 1048576;
+    IF v_x IS NOT NULL THEN
+        RETURN format('the default partition %s of %s would be scanned by the attach under ACCESS EXCLUSIVE on the table (kingres_timepart.convert_default_max_mb is %s)',
+                      v_x, v_parn,
+                      kingres.timepart__setting_int('kingres_timepart.convert_default_max_mb', 256, 0, 1048576));
+    END IF;
+    -- A publication of all tables or of the schema takes in the new table, which
+    -- the copy fills under its temporary name (a publication of the partition
+    -- itself was refused above; for columnar every publication is refused below).
+    IF v_kind = 'heap' THEN
+        SELECT pb.pubname INTO v_x FROM pg_publication pb
+         WHERE pb.puballtables
+            OR EXISTS (SELECT 1 FROM pg_publication_namespace pn
+                        WHERE pn.pnpubid = pb.oid AND pn.pnnspid = v_c.relnamespace)
+         ORDER BY pb.pubname LIMIT 1;
+        IF v_x IS NOT NULL THEN
+            RETURN format('the publication "%s" would publish every row of the copy under the temporary name of the new table', v_x);
+        END IF;
+    END IF;
 
     IF v_kind = 'columnar' THEN
         -- What a columnar table cannot have (kingres_columnar README, "What
@@ -375,42 +472,25 @@ BEGIN
 END;
 $$;
 
--- The statements that replace one partition by a copy in another access method
--- (10.4, "Convert one partition"): after the checks, one DO statement that
--- the caller executes as the owner of the table (timepart__exec_direct or
--- timepart__exec_as), so that the whole conversion is one transaction of the
--- caller and the owner's privileges apply to all of it.  The names are
--- quoted here, once, and handed to the block as literals; the block holds
--- no name of its own.  What it does, in order:
+-- What the conversion reads from the catalog, as one document: the checks of
+-- timepart__convert_refusal, the names, the bound, the column list of the copy,
+-- the sort, the tablespace and the statements for the indexes.  Called twice by
+-- every conversion: by timepart__convert_stmts, before any lock, to refuse
+-- early; and by the block that those statements make, right after it holds its
+-- lock on the partition, whose result is the one it uses.  The first reading can
+-- be stale by the time the lock is granted (a session that held a lock on the
+-- partition may have added a column, an index or a constraint, or dropped one,
+-- before it committed), so nothing read before the lock is used to copy rows or
+-- to make an index.  VOLATILE on purpose: every statement of it takes a new
+-- snapshot.  SECURITY INVOKER: it reads the catalogs only, as the caller.
 --
---   1. SHARE ROW EXCLUSIVE on the partition: its writers wait, its readers go
---      on (the design says SHARE; this mode also keeps out a plain CREATE
---      INDEX, which SHARE lets in, and a second conversion).
---   2. A new table next to it (LIKE the partition, with the check of the
---      bound in its definition so that the attach below scans nothing), in
---      the new access method, with the options, comment, tablespace and
---      replica identity of the old one.
---   3. The copy: the columns named one by one, ordered by sort_by (the
---      partition column by default for columnar).
---   4. The check: the two tables have the same number of rows, or the block
---      fails with verification_failed and nothing has happened.
---   5. The privileges of the old partition on the new one.
---   5b. The indexes of the old partition (every index: the parent's, matched
---      by the attach below, and the partition's own), made on the new table
---      with plain CREATE INDEX or ADD CONSTRAINT after the load, under
---      temporary names; the old names are given to them after the old
---      partition is dropped.  The attach finds an equal index for each index
---      of the parent and builds nothing under the strong lock.  A duplicate
---      found by a unique index fails the conversion with the server's message.
---   6. The swap: no wait at all if a session that holds the parent waits for
---      the partition (a cycle); else a short wait (the smaller of 500 ms and
---      half of deadlock_timeout) for ACCESS EXCLUSIVE on the parent, then detach,
---      attach, drop, rename and drop of the helper check.  If the lock is not
---      granted in time the block fails with swap_lock_timeout and the copy is
---      rolled back with everything else.
-CREATE FUNCTION kingres.timepart__convert_stmts(
+-- The result has the keys schema, old (the name of the partition), new (the
+-- temporary name of the new table), part, newq and parent (the qualified,
+-- quoted names), cols, order, bound_cl, bound, check, tblspc and ix (an array
+-- of the statements and names for the indexes).
+CREATE FUNCTION kingres.timepart__convert_plan(
     p_parent oid, p_part oid, p_target name, p_sort text[], p_options jsonb)
-RETURNS text[]
+RETURNS jsonb
 LANGUAGE plpgsql
 SET search_path = pg_catalog, kingres, pg_temp
 SET DateStyle = 'ISO, MDY'
@@ -434,16 +514,13 @@ DECLARE
     v_cols    text;
     v_order   text := '';
     v_tblspc  text := '';
-    v_opts    record;
-    v_swap    integer;
-    v_dl      integer;
     v_ix      jsonb := '[]';
     v_ixr     record;
     v_ixn     integer := 0;
     v_ixtmp   text;
     v_ixpre   text;
     v_ixstmt  text;
-    v_body    text;
+    v_stats   jsonb;
     i         integer;
 BEGIN
     SELECT * INTO v_info FROM kingres.timepart__key_info(p_parent);
@@ -520,15 +597,13 @@ BEGIN
         SELECT ' TABLESPACE ' || quote_ident(t.spcname) INTO v_tblspc
           FROM pg_tablespace t WHERE t.oid = v_c.reltablespace;
     END IF;
-    IF v_kind = 'columnar' THEN
-        SELECT * INTO v_opts FROM kingres.timepart__columnar_options(p_options);
-    ELSE
-        SELECT NULL::text AS o_compression, NULL::integer AS o_level,
-               NULL::integer AS o_stripe, NULL::integer AS o_chunk INTO v_opts;
-    END IF;
-    -- The indexes of the partition, as statements for the new table.
+    -- The indexes of the partition, as statements for the new table.  The
+    -- temporary names are made from a digest of the name of the partition and a
+    -- counter, so that they are short whatever the name of the partition is (a
+    -- name cut to 63 bytes could make two of them equal), and the same every time.
     FOR v_ixr IN
-        SELECT i.indexrelid, ic.relname AS iname, i.indisunique, k.oid AS conoid, k.conname,
+        SELECT i.indexrelid, ic.relname AS iname, i.indisunique, i.indisclustered,
+               k.oid AS conoid, k.conname,
                pg_get_indexdef(i.indexrelid) AS d,
                obj_description(i.indexrelid, 'pg_class') AS idesc,
                obj_description(k.oid, 'pg_constraint') AS cdesc
@@ -540,7 +615,11 @@ BEGIN
          ORDER BY i.indexrelid
     LOOP
         v_ixn := v_ixn + 1;
-        v_ixtmp := left(v_tmp, 55) || '_' || v_ixn;
+        v_ixtmp := 'kc_' || substr(md5(v_pname), 1, 12) || '_' || v_ixn;
+        IF kingres.timepart__oid(v_schema, v_ixtmp::name) IS NOT NULL THEN
+            RAISE EXCEPTION 'name_conflict: relation %.% already exists',
+                quote_ident(v_schema), quote_ident(v_ixtmp) USING ERRCODE = '42P07';
+        END IF;
         IF v_ixr.conoid IS NULL THEN
             v_ixpre := 'CREATE ' || CASE WHEN v_ixr.indisunique THEN 'UNIQUE ' ELSE '' END
                        || 'INDEX ' || quote_ident(v_ixr.iname) || ' ON '
@@ -557,10 +636,94 @@ BEGIN
             v_ixstmt := 'ALTER TABLE ' || format('%I.%I', v_schema, v_tmp) || ' ADD CONSTRAINT '
                         || quote_ident(v_ixtmp) || ' ' || pg_get_constraintdef(v_ixr.conoid);
         END IF;
+        -- the statistics targets of the index columns (set on expressions only)
+        SELECT coalesce(jsonb_agg(jsonb_build_object('n', a.attnum, 't', a.attstattarget)
+                                  ORDER BY a.attnum), '[]')
+          INTO v_stats
+          FROM pg_attribute a
+         WHERE a.attrelid = v_ixr.indexrelid AND a.attnum > 0
+           AND a.attstattarget IS NOT NULL AND a.attstattarget <> -1;
         v_ix := v_ix || jsonb_build_array(jsonb_build_object(
             'create', v_ixstmt, 'tmp', v_ixtmp, 'name', v_ixr.iname, 'con', v_ixr.conname,
-            'idesc', v_ixr.idesc, 'cdesc', v_ixr.cdesc));
+            'idesc', v_ixr.idesc, 'cdesc', v_ixr.cdesc,
+            'cluster', v_ixr.indisclustered, 'stats', v_stats));
     END LOOP;
+    RETURN jsonb_build_object(
+        'schema', v_schema, 'old', v_pname, 'new', v_tmp,
+        'part', format('%I.%I', v_schema, v_pname),
+        'newq', format('%I.%I', v_schema, v_tmp),
+        'parent', format('%I.%I', v_info.r_schema, v_info.r_table),
+        'cols', v_cols, 'order', v_order, 'bound_cl', v_bound_cl,
+        'bound', v_bound, 'check', v_check, 'tblspc', v_tblspc, 'ix', v_ix);
+END;
+$$;
+
+-- The statements that replace one partition by a copy in another access method
+-- (10.4, "Convert one partition"): after the checks, one DO statement that
+-- the caller executes as the owner of the table (timepart__exec_direct or
+-- timepart__exec_as), so that the whole conversion is one transaction of the
+-- caller and the owner's privileges apply to all of it.  The block holds the
+-- OIDs of the table and the partition and the caller's arguments, and no name:
+-- the names, the columns, the indexes and everything else that the catalog
+-- says come from timepart__convert_plan, read again after the lock.  What it
+-- does, in order:
+--
+--   1. SHARE ROW EXCLUSIVE on the partition: its writers wait, its readers go
+--      on (the design says SHARE; this mode also keeps out a plain CREATE
+--      INDEX, which SHARE lets in, and a second conversion).  Then the plan
+--      and the checks again, now that nothing can change on the partition.
+--   2. A new table next to it (LIKE the partition, with the check of the
+--      bound in its definition so that the attach below scans nothing), in
+--      the new access method, with the options, comment, tablespace, replica
+--      identity and column statistics targets and options of the old one.
+--   3. The copy: the columns named one by one, ordered by sort_by (the
+--      partition column by default for columnar).
+--   4. The check: the two tables have the same number of rows, or the block
+--      fails with verification_failed and nothing has happened.
+--   5. The privileges of the old partition on the new one.
+--   5b. The indexes of the old partition (every index: the parent's, matched
+--      by the attach below, and the partition's own), made on the new table
+--      with plain CREATE INDEX or ADD CONSTRAINT after the load, under
+--      temporary names; the old names are given to them after the old
+--      partition is dropped.  The attach finds an equal index for each index
+--      of the parent and builds nothing under the strong lock.  A duplicate
+--      found by a unique index fails the conversion with the server's message.
+--      Then the storage parameters of the table, after the load: they apply to
+--      what is written next, and parallel_workers would send a columnar table
+--      into a parallel build of rows that are not written yet.
+--   6. The swap: no wait at all if a session that holds the parent waits for
+--      the partition (a cycle); else a short wait (the smaller of 500 ms and
+--      half of deadlock_timeout) for ACCESS EXCLUSIVE on the parent, then detach,
+--      attach, drop, rename and drop of the helper check; then the enabled
+--      state of the cloned triggers, the clustering index and the statistics
+--      targets of the indexes.  If the lock is not granted in time the block
+--      fails with swap_lock_timeout and the copy is rolled back with
+--      everything else.
+CREATE FUNCTION kingres.timepart__convert_stmts(
+    p_parent oid, p_part oid, p_target name, p_sort text[], p_options jsonb)
+RETURNS text[]
+LANGUAGE plpgsql
+SET search_path = pg_catalog, kingres, pg_temp
+SET DateStyle = 'ISO, MDY'
+AS $$
+DECLARE
+    v_plan    jsonb;
+    v_kind    text;
+    v_opts    record;
+    v_swap    integer;
+    v_dl      integer;
+    v_body    text;
+BEGIN
+    -- The checks and the plan, before any lock: a refusal is raised here, with
+    -- nothing locked.  The block reads them again under its lock.
+    v_plan := kingres.timepart__convert_plan(p_parent, p_part, p_target, p_sort, p_options);
+    v_kind := kingres.timepart__am_kind(p_target);
+    IF v_kind = 'columnar' THEN
+        SELECT * INTO v_opts FROM kingres.timepart__columnar_options(p_options);
+    ELSE
+        SELECT NULL::text AS o_compression, NULL::integer AS o_level,
+               NULL::integer AS o_stripe, NULL::integer AS o_chunk INTO v_opts;
+    END IF;
     -- A writer of the partition holds the parent in ROW EXCLUSIVE while it
     -- waits for our lock on the partition, and we wait for the parent: a
     -- cycle that only a timeout breaks.  The wait is below the deadlock
@@ -570,36 +733,75 @@ BEGIN
 
     v_body := format($tpl$
 DECLARE
-    v_parent   text := %1$L;
-    v_part     text := %2$L;
-    v_new      text := %3$L;
-    v_schema   text := %4$L;
-    v_old_name text := %5$L;
-    v_am       text := %6$L;
-    v_cols     text := %7$L;
-    v_order    text := %8$L;
-    v_bound_cl text := %9$L;
-    v_bound    text := %10$L;
-    v_check    text := %11$L;
-    v_tblspc   text := %12$L;
-    v_o_comp   text := %13$L;
-    v_o_level  integer := %14$L;
-    v_o_stripe integer := %15$L;
-    v_o_chunk  integer := %16$L;
-    v_swap     integer := %17$s;
-    v_columnar boolean := %18$s;
-    v_part_oid oid := %19$s;
-    v_parent_oid oid := %20$s;
-    v_ix       jsonb := %21$L;
+    v_am       text := %1$L;
+    v_sort     text[] := %2$L;
+    v_options  jsonb := %3$L;
+    v_o_comp   text := %4$L;
+    v_o_level  integer := %5$L;
+    v_o_stripe integer := %6$L;
+    v_o_chunk  integer := %7$L;
+    v_swap     integer := %8$s;
+    v_columnar boolean := %9$s;
+    v_part_oid oid := %10$s;
+    v_parent_oid oid := %11$s;
     v_prev_lt  text := pg_catalog.current_setting('lock_timeout');
+    v_plan     jsonb;
+    v_parent   text;
+    v_part     text;
+    v_new      text;
+    v_schema   text;
+    v_old_name text;
+    v_cols     text;
+    v_order    text;
+    v_bound_cl text;
+    v_bound    text;
+    v_check    text;
+    v_tblspc   text;
+    v_ix       jsonb;
+    v_trg      jsonb;
+    v_final    text;
     v_owner    oid;
     v_old_cnt  bigint;
     v_new_cnt  bigint;
     v_text     text;
+    v_k        text;
+    v_v        text;
     v_ident    "char";
+    i          integer;
     r          record;
 BEGIN
-    EXECUTE 'LOCK TABLE ' || v_part || ' IN SHARE ROW EXCLUSIVE MODE';
+    BEGIN
+        EXECUTE 'LOCK TABLE ' || v_part_oid::pg_catalog.regclass::pg_catalog.text
+             || ' IN SHARE ROW EXCLUSIVE MODE';
+    EXCEPTION WHEN undefined_table THEN
+        RAISE EXCEPTION 'schema_changed: the partition with OID %% was renamed or dropped while the conversion waited for its lock; the next run tries again',
+            v_part_oid USING ERRCODE = '55P03';
+    END;
+    -- the lock that is held is the one on the partition, not on a table that
+    -- took its name while this statement waited
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_locks l
+                    WHERE l.pid = pg_catalog.pg_backend_pid() AND l.locktype = 'relation'
+                      AND l.database = (SELECT d.oid FROM pg_catalog.pg_database d WHERE d.datname = pg_catalog.current_database())
+                      AND l.relation = v_part_oid AND l.mode = 'ShareRowExclusiveLock' AND l.granted) THEN
+        RAISE EXCEPTION 'schema_changed: the partition with OID %% was renamed or dropped while the conversion waited for its lock, and its name is another table now; the next run tries again',
+            v_part_oid USING ERRCODE = '55P03';
+    END IF;
+    -- everything the catalog says about the partition, now that nothing can
+    -- change on it; a refusal or an error here is raised as it would be above
+    v_plan := kingres.timepart__convert_plan(v_parent_oid, v_part_oid, v_am::pg_catalog.name, v_sort, v_options);
+    v_parent   := v_plan ->> 'parent';
+    v_part     := v_plan ->> 'part';
+    v_new      := v_plan ->> 'newq';
+    v_schema   := v_plan ->> 'schema';
+    v_old_name := v_plan ->> 'old';
+    v_cols     := v_plan ->> 'cols';
+    v_order    := v_plan ->> 'order';
+    v_bound_cl := v_plan ->> 'bound_cl';
+    v_bound    := v_plan ->> 'bound';
+    v_check    := v_plan ->> 'check';
+    v_tblspc   := v_plan ->> 'tblspc';
+    v_ix       := v_plan -> 'ix';
+
     EXECUTE 'CREATE TABLE ' || v_new || ' (LIKE ' || v_part
          || ' INCLUDING DEFAULTS INCLUDING CONSTRAINTS INCLUDING COMMENTS'
          || ' INCLUDING STORAGE INCLUDING GENERATED INCLUDING COMPRESSION'
@@ -622,6 +824,39 @@ BEGIN
     ELSIF v_ident = 'n' THEN
         EXECUTE 'ALTER TABLE ' || v_new || ' REPLICA IDENTITY NOTHING';
     END IF;
+    -- The statistics target and the options of each column, which LIKE does not
+    -- carry (the storage parameters of the table follow the indexes, below).
+    FOR r IN SELECT a.attname, a.attstattarget, a.attoptions
+               FROM pg_catalog.pg_attribute a
+              WHERE a.attrelid = v_part_oid AND a.attnum > 0 AND NOT a.attisdropped
+              ORDER BY a.attnum
+    LOOP
+        IF r.attstattarget IS NOT NULL AND r.attstattarget <> -1 THEN
+            BEGIN
+                EXECUTE 'ALTER TABLE ' || v_new || ' ALTER COLUMN ' || pg_catalog.quote_ident(r.attname)
+                     || ' SET STATISTICS ' || r.attstattarget::pg_catalog.text;
+            EXCEPTION WHEN OTHERS THEN
+                RAISE WARNING 'the statistics target of the column %% of %% was not carried to the new table: %%',
+                    r.attname, v_part, SQLERRM;
+            END;
+        END IF;
+        IF r.attoptions IS NOT NULL THEN
+            FOR i IN 1 .. pg_catalog.array_length(r.attoptions, 1) LOOP
+                v_k := pg_catalog.split_part(r.attoptions[i], '=', 1);
+                v_v := pg_catalog.substr(r.attoptions[i], pg_catalog.strpos(r.attoptions[i], '=') + 1);
+                -- the version stamp of the column is the server's own, and
+                -- the new column has its own
+                CONTINUE WHEN v_k = 'pg_attver';
+                BEGIN
+                    EXECUTE 'ALTER TABLE ' || v_new || ' ALTER COLUMN ' || pg_catalog.quote_ident(r.attname)
+                         || ' SET (' || pg_catalog.quote_ident(v_k) || ' = ' || pg_catalog.quote_literal(v_v) || ')';
+                EXCEPTION WHEN OTHERS THEN
+                    RAISE WARNING 'the option %% of the column %% of %% was not carried to the new table: %%',
+                        r.attoptions[i], r.attname, v_part, SQLERRM;
+                END;
+            END LOOP;
+        END IF;
+    END LOOP;
 
     EXECUTE 'INSERT INTO ' || v_new || ' (' || v_cols || ') SELECT ' || v_cols
          || ' FROM ' || v_part || v_order;
@@ -641,6 +876,29 @@ BEGIN
         EXECUTE r.stmt;
     END LOOP;
 
+    -- The storage parameters of the table (and of its TOAST table), which LIKE
+    -- does not carry, after the load and the indexes: parallel_workers would
+    -- have a columnar table refuse a parallel index build of rows that the
+    -- transaction has not written yet.  The target access method may not
+    -- accept one of them: that one is a warning, the rest are carried.
+    FOR r IN SELECT o.o AS opt
+               FROM pg_catalog.pg_class c, LATERAL pg_catalog.unnest(c.reloptions) o(o)
+              WHERE c.oid = v_part_oid
+    LOOP
+        v_k := pg_catalog.split_part(r.opt, '=', 1);
+        v_v := pg_catalog.substr(r.opt, pg_catalog.strpos(r.opt, '=') + 1);
+        BEGIN
+            EXECUTE 'ALTER TABLE ' || v_new || ' SET ('
+                 || CASE WHEN pg_catalog.strpos(v_k, '.') > 0
+                         THEN pg_catalog.quote_ident(pg_catalog.split_part(v_k, '.', 1)) || '.'
+                              || pg_catalog.quote_ident(pg_catalog.split_part(v_k, '.', 2))
+                         ELSE pg_catalog.quote_ident(v_k) END
+                 || ' = ' || pg_catalog.quote_literal(v_v) || ')';
+        EXCEPTION WHEN OTHERS THEN
+            RAISE WARNING 'the storage parameter %% of %% was not carried to the new table: %%',
+                r.opt, v_part, SQLERRM;
+        END;
+    END LOOP;
     -- the privileges of the old partition, table and column level
     FOR r IN SELECT DISTINCT x.grantee
                FROM pg_catalog.pg_class c, LATERAL pg_catalog.aclexplode(c.relacl) x
@@ -671,6 +929,25 @@ BEGIN
                      ELSE pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(r.grantee)) END
              || CASE WHEN r.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END;
     END LOOP;
+    -- the privileges that the owner took from itself stay taken
+    FOR r IN SELECT d.privilege_type
+               FROM pg_catalog.pg_class c,
+                    LATERAL pg_catalog.aclexplode(pg_catalog.acldefault('r', c.relowner)) d
+              WHERE c.oid = v_part_oid AND c.relacl IS NOT NULL AND d.grantee = c.relowner
+                AND NOT EXISTS (SELECT 1 FROM pg_catalog.aclexplode(c.relacl) x
+                                 WHERE x.grantee = c.relowner AND x.privilege_type = d.privilege_type)
+    LOOP
+        EXECUTE 'REVOKE ' || r.privilege_type || ' ON TABLE ' || v_new || ' FROM '
+             || pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(v_owner));
+    END LOOP;
+
+    -- the enabled state of the triggers that the partition has from the
+    -- table: the attach clones them enabled, and the old state is put back below
+    SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('name', t.tgname, 'en', t.tgenabled::pg_catalog.text)
+                                ORDER BY t.tgname) INTO v_trg
+      FROM pg_catalog.pg_trigger t
+     WHERE t.tgrelid = v_part_oid AND NOT t.tgisinternal AND t.tgparentid <> 0
+       AND t.tgenabled <> 'O';
 
     -- the swap.  A session that holds the parent (a writer through it, a
     -- reader inside a transaction) and waits for a lock on the partition,
@@ -698,22 +975,20 @@ BEGIN
     EXECUTE 'ALTER TABLE ' || v_parent || ' ATTACH PARTITION ' || v_new || ' ' || v_bound;
     EXECUTE 'DROP TABLE ' || v_part;
     EXECUTE 'ALTER TABLE ' || v_new || ' RENAME TO ' || pg_catalog.quote_ident(v_old_name);
+    v_final := pg_catalog.quote_ident(v_schema) || '.' || pg_catalog.quote_ident(v_old_name);
     IF v_bound_cl <> '' THEN
-        EXECUTE 'ALTER TABLE ' || pg_catalog.quote_ident(v_schema) || '.'
-             || pg_catalog.quote_ident(v_old_name)
+        EXECUTE 'ALTER TABLE ' || v_final
              || ' DROP CONSTRAINT ' || pg_catalog.quote_ident(v_check);
     END IF;
     -- the names, and the comments, of the indexes and constraints
     FOR r IN SELECT x FROM pg_catalog.jsonb_array_elements(v_ix) t(x)
     LOOP
         IF r.x ->> 'con' IS NOT NULL THEN
-            EXECUTE 'ALTER TABLE ' || pg_catalog.quote_ident(v_schema) || '.'
-                 || pg_catalog.quote_ident(v_old_name) || ' RENAME CONSTRAINT '
+            EXECUTE 'ALTER TABLE ' || v_final || ' RENAME CONSTRAINT '
                  || pg_catalog.quote_ident(r.x ->> 'tmp') || ' TO ' || pg_catalog.quote_ident(r.x ->> 'con');
             IF r.x ->> 'cdesc' IS NOT NULL THEN
                 EXECUTE 'COMMENT ON CONSTRAINT ' || pg_catalog.quote_ident(r.x ->> 'con') || ' ON '
-                     || pg_catalog.quote_ident(v_schema) || '.' || pg_catalog.quote_ident(v_old_name)
-                     || ' IS ' || pg_catalog.quote_literal(r.x ->> 'cdesc');
+                     || v_final || ' IS ' || pg_catalog.quote_literal(r.x ->> 'cdesc');
             END IF;
         ELSE
             EXECUTE 'ALTER INDEX ' || pg_catalog.quote_ident(v_schema) || '.'
@@ -724,17 +999,44 @@ BEGIN
                  || pg_catalog.quote_ident(coalesce(r.x ->> 'con', r.x ->> 'name'))
                  || ' IS ' || pg_catalog.quote_literal(r.x ->> 'idesc');
         END IF;
+        -- the statistics targets of the expression columns of the index
+        FOR i IN 0 .. pg_catalog.jsonb_array_length(r.x -> 'stats') - 1 LOOP
+            BEGIN
+                EXECUTE 'ALTER INDEX ' || pg_catalog.quote_ident(v_schema) || '.'
+                     || pg_catalog.quote_ident(coalesce(r.x ->> 'con', r.x ->> 'name'))
+                     || ' ALTER COLUMN ' || ((r.x -> 'stats' -> i) ->> 'n')
+                     || ' SET STATISTICS ' || ((r.x -> 'stats' -> i) ->> 't');
+            EXCEPTION WHEN OTHERS THEN
+                RAISE WARNING 'a statistics target of the index %% was not carried to the new table: %%',
+                    coalesce(r.x ->> 'con', r.x ->> 'name'), SQLERRM;
+            END;
+        END LOOP;
+        -- the index that the table is clustered on
+        IF (r.x ->> 'cluster')::pg_catalog.bool THEN
+            BEGIN
+                EXECUTE 'ALTER TABLE ' || v_final || ' CLUSTER ON '
+                     || pg_catalog.quote_ident(coalesce(r.x ->> 'con', r.x ->> 'name'));
+            EXCEPTION WHEN OTHERS THEN
+                RAISE WARNING 'the clustering index %% was not carried to the new table: %%',
+                    coalesce(r.x ->> 'con', r.x ->> 'name'), SQLERRM;
+            END;
+        END IF;
+    END LOOP;
+    -- the enabled state of the cloned triggers
+    FOR r IN SELECT x FROM pg_catalog.jsonb_array_elements(coalesce(v_trg, '[]'::pg_catalog.jsonb)) t(x)
+    LOOP
+        EXECUTE 'ALTER TABLE ' || v_final
+             || CASE r.x ->> 'en' WHEN 'D' THEN ' DISABLE TRIGGER '
+                                  WHEN 'R' THEN ' ENABLE REPLICA TRIGGER '
+                                  ELSE ' ENABLE ALWAYS TRIGGER ' END
+             || pg_catalog.quote_ident(r.x ->> 'name');
     END LOOP;
     PERFORM pg_catalog.set_config('lock_timeout', v_prev_lt, true);
 END
 $tpl$,
-        format('%I.%I', v_info.r_schema, v_info.r_table),
-        format('%I.%I', v_schema, v_pname),
-        format('%I.%I', v_schema, v_tmp),
-        v_schema, v_pname, p_target, v_cols, v_order, v_bound_cl, v_bound,
-        v_check, v_tblspc, v_opts.o_compression, v_opts.o_level,
+        p_target, p_sort::text, p_options::text, v_opts.o_compression, v_opts.o_level,
         v_opts.o_stripe, v_opts.o_chunk, v_swap, (v_kind = 'columnar')::text,
-        p_part::oid, p_parent::oid, v_ix::text);
+        p_part::oid, p_parent::oid);
     RETURN ARRAY[format('DO %L', v_body)];
 END;
 $$;
@@ -1258,7 +1560,8 @@ BEGIN
         EXCEPTION
             WHEN lock_not_available THEN
                 v_state := 'failed';
-                IF v_s.o_kind = 'convert' AND SQLERRM LIKE 'swap_lock_timeout:%' THEN
+                IF v_s.o_kind = 'convert' AND (SQLERRM LIKE 'swap_lock_timeout:%'
+                                               OR SQLERRM LIKE 'schema_changed:%') THEN
                     v_detail := SQLERRM;
                 ELSE
                     v_detail := 'lock_timeout: ' || SQLERRM
@@ -1356,7 +1659,8 @@ BEGIN
     SELECT count(*) FILTER (WHERE a.state = 'failed'),
            coalesce(bool_or(a.state = 'failed'
                             AND (a.detail LIKE 'lock_timeout%'
-                                 OR a.detail LIKE 'swap_lock_timeout%')), false)
+                                 OR a.detail LIKE 'swap_lock_timeout%'
+                                 OR a.detail LIKE 'schema_changed%')), false)
       INTO v_nfailed, v_locked
       FROM kingres.timepart_run_action_data a
      WHERE a.run_id = timepart__finish_run.run_id;

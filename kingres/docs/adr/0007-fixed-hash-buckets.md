@@ -30,3 +30,7 @@ Distributed tables use a fixed number of hash buckets per colocation group, 1024
 - **Range sharding.** Rejected for the same reason; the document notes it is useful for range scans but has a hotspot risk.
 - **Row directory (row-to-node mapping).** Rejected: the mapping table grows as large as the data itself and every query needs an extra lookup.
 - **Citus-style shards as plain `tbl_<shardid>` tables over a 32-bit hash space divided into N contiguous ranges.** Mentioned in the document as an alternative to the local-partition approach; it was not chosen for the recommended design, and the document does not weigh the two in detail.
+
+## Note of 2026-11-20: the default that was implemented
+
+The decision above says 1024 buckets by default. The implemented default is **128**, decided during the sharding MVP (work log of 2026-11-14; [design/shard-mvp.md](../design/shard-mvp.md)): a bucket is stored as one hash partition, and 1024 partitions per table is too many relations on a small cluster. It is set in two places: the setting `kingres_shard.default_bucket_count` of the extension (default 128, range 1 to 4096; `contrib/kingres_shard/src/kingres_shard.c`), and the control plane, which offers and uses 128 as the default of `sharding.bucketCount` (range 1 to 4096; `kingres/control-plane/internal/ops/databases.go` and the contract). The rest of this ADR, a fixed number of buckets chosen at creation, stands. The title and the index keep the figure of the time of the decision.

@@ -31,6 +31,7 @@ tests += {
       'timepart_forged',
       'timepart_owner_code',
       'timepart_convert',
+      'timepart_convert_more',
       'timepart_drop',
       'upgrade',
     ],
@@ -51,6 +52,7 @@ tests += {
       't/006_convert_crash.pl',
       't/007_convert_standby.pl',
       't/008_convert_prepared.pl',
+      't/009_convert_ddl_race.pl',
     ],
   },
 }

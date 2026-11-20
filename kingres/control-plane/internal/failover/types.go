@@ -65,6 +65,11 @@ const (
 	CodeBadPromoteTarget   = "bad_promote_target"
 	CodePromoteUnsafe      = "promote_unsafe"
 	CodeStandbyUnreadable  = "standby_unreadable"
+	// The codes of the planned switchover (design 5.3).
+	CodeStandbyBehind      = "standby_behind"
+	CodeSwitchoverUnproven = "switchover_unproven"
+	CodeCannotQuiesce      = "cannot_quiesce"
+	CodePreparedPending    = "prepared_transactions_pending"
 )
 
 // Error is a failure of a step that the task records with a code (task.Error).
@@ -210,6 +215,8 @@ type State struct {
 	Destination  string          `json:"destination,omitempty"`
 	// Watchdog says whether a watchdog of the group's primary instance runs on the server (nil: unknown).
 	Watchdog *bool `json:"watchdog"`
+	// Quiesced says that the writes of the group are stopped on this server (a switchover is under way).
+	Quiesced bool `json:"quiesced"`
 	// Enforced says whether this server's lease manager would stop the primary of the group when its lease lapsed: it does
 	// only for a group that its plan says has a standby (F3-02; nil: unknown or no primary here).
 	Enforced *bool `json:"enforced"`
@@ -236,8 +243,9 @@ type LeaseSettings struct {
 // DemoteRequest is the body of POST /failover/demote: stop the instance that serves
 // the group here, and only then hand the lease to TransferTo (design 3.3 F2).
 type DemoteRequest struct {
-	Group        int32  `json:"group"`
-	Mode         string `json:"mode"` // "immediate"
+	Group int32  `json:"group"`
+	Mode  string `json:"mode"` // "immediate"
+	// Mode "fast" is the clean stop of a switchover: the lease is released (not transferred) and the answer carries the proof.
 	ExpectedTerm int64  `json:"expectedTerm"`
 	TransferTo   string `json:"transferTo"`
 }
@@ -247,6 +255,54 @@ type DemoteAnswer struct {
 	Stopped      bool   `json:"stopped"`
 	ClusterState string `json:"clusterState,omitempty"`
 	Transferred  bool   `json:"transferred"`
+	// Checkpoint is "Latest checkpoint location" of pg_controldata, read after a clean stop; Released says that the lease was released.
+	Checkpoint string `json:"checkpoint,omitempty"`
+	Released   bool   `json:"released,omitempty"`
+}
+
+// The calls of the planned switchover (design 5.2). The same group number, task and epoch rules as the other calls apply.
+
+// QuiesceRequest is the body of POST /failover/quiesce and /unquiesce.
+type QuiesceRequest struct {
+	Group int32 `json:"group"`
+}
+
+// QuiesceAnswer says whether no client session of the instance is left.
+type QuiesceAnswer struct {
+	Quiesced  bool `json:"quiesced"`
+	Remaining int  `json:"remaining"`
+}
+
+// MarkRequest is the body of POST /failover/mark: the primary reports the position M that a standby must replay (design S4).
+type MarkRequest struct {
+	Group        int32 `json:"group"`
+	ExpectedTerm int64 `json:"expectedTerm"`
+}
+
+// MarkAnswer is the answer of POST /failover/mark.
+type MarkAnswer struct {
+	Mark string `json:"mark"`
+}
+
+// VerifyRequest is the body of POST /failover/verify, sent to the server of the standby. Without Checkpoint it asks whether the standby
+// replayed Mark (switchover_replayed); with it, whether the standby has everything the old primary wrote (switchover_verify).
+type VerifyRequest struct {
+	Group        int32  `json:"group"`
+	InstanceID   int    `json:"instanceId"`
+	Mark         string `json:"mark,omitempty"`
+	Checkpoint   string `json:"checkpoint,omitempty"`
+	ClusterState string `json:"clusterState,omitempty"`
+}
+
+// VerifyAnswer is the answer of POST /failover/verify: Ok is the t or f of the extension; a proof that can never be made is the
+// call error "unprovable".
+type VerifyAnswer struct {
+	Ok bool `json:"ok"`
+}
+
+// ResumeRequest is the body of POST /failover/resume: the rollback of a switchover whose old primary was stopped.
+type ResumeRequest struct {
+	Group int32 `json:"group"`
 }
 
 // Lease roles of POST /failover/lease.
@@ -330,6 +386,12 @@ type Peers interface {
 	// RecoverPrepared runs kingres.recover_prepared_transactions() on the instance of the group that is the primary
 	// on that server (the promoted instance), as the extension asks after a failover.
 	RecoverPrepared(ctx context.Context, server string, group int32, db string) error
+	// The calls of the planned switchover.
+	Quiesce(ctx context.Context, server string, r QuiesceRequest) (QuiesceAnswer, error)
+	Unquiesce(ctx context.Context, server string, r QuiesceRequest) error
+	Mark(ctx context.Context, server string, r MarkRequest) (MarkAnswer, error)
+	Verify(ctx context.Context, server string, r VerifyRequest) (VerifyAnswer, error)
+	Resume(ctx context.Context, server string, r ResumeRequest) error
 }
 
 // Node is a row of kingres.node.

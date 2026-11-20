@@ -71,6 +71,7 @@ SELECT proname FROM members
  timepart__check_tz
  timepart__children
  timepart__columnar_options
+ timepart__convert_plan
  timepart__convert_refusal
  timepart__convert_stmts
  timepart__create_rows
@@ -109,7 +110,7 @@ SELECT proname FROM members
  timepart_interval_parts
  timepart_part_name
  timepart_retire_one
-(45 rows)
+(46 rows)
 
 -- The policy and the history are shown to a role through security_barrier
 -- views (the rows of the tables it owns); the base tables and the lock table

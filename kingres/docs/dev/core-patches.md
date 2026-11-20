@@ -3,7 +3,7 @@
 
 This file lists every change KingresDB makes to files that exist in upstream PostgreSQL (outside `contrib/kingres_shard/` and `contrib/kingres_ledger/`). The reason for the register is in the architecture document: deep forks fall behind upstream, and a small, documented patch set is what keeps the rebase cost low ("The pattern of existing forks: a small patch set plus extensions").
 
-As of the base `REL_18_7`, the register has three entries: two for the minimal rebrand and one that adds the extensions to the build.
+As of the base `REL_18_7`, the register has four entries (KP-0001 to KP-0004): the version of the product and a short section in the top-level README (the minimal rebrand), the line that adds the extensions to the build, and the `LICENSE` file with the text of the AGPL ([ADR 0024](../adr/0024-agpl-for-kingresdb-code.md)). It had three entries until KP-0004 was added.
 
 **Build system scope.** KingresDB is built with meson only. The autoconf build files (`configure.ac`, `configure`, `src/include/pg_config.h.in`) are left exactly as upstream ships them, so an autoconf build of this tree produces a server without the KingresDB version symbols and is not a supported way to build KingresDB. The reason is that `configure` is a generated file that upstream regenerates with one specific autoconf version; patching it by hand would add an untested code path and a recurring rebase conflict for no benefit.
 

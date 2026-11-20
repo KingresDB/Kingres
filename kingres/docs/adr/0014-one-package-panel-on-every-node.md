@@ -29,3 +29,7 @@ KingresDB ships as one installable package, and every node serves the same panel
 - **A dedicated management server** (VTAdmin pattern with separate API and web components). The document cites VTAdmin as a pattern for the API layer, but the chosen model follows Couchbase and CockroachDB with an identical node set; a dedicated server would add a single point of failure for management.
 - **Separate installs of agent, manager, etcd and Patroni.** Not chosen: the goal is the Couchbase experience of installing one package and opening the node's own panel. The document states `kingres-agent` and `kingres-manager` are roles inside `kingresd`, not separate installs.
 - **RHEL family first.** Listed in decision #9; Ubuntu and Debian recommended first without further reasoning in the document.
+
+## Note of 2026-11-20: etcd and Patroni
+
+The package does not contain an embedded etcd or Patroni: [ADR 0021](0021-failover-in-kingresd.md) moved failover into `kingresd` and does not bundle them. `kingres-cli` is planned and is not built; the control plane has two executables today, `kingresd` and `kingres-watchdog`.

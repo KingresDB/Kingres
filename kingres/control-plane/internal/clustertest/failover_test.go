@@ -368,9 +368,10 @@ func TestFailoverRefusals(t *testing.T) {
 	leader := c.Leader()
 	_, old, _ := foVictim(t, c)
 
-	st, p := leader.Do("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "graceful"}, nil)
+	// The planned switchover of the map group is not supported yet (the other groups are: failover_switchover_test.go).
+	st, p := leader.Do("POST", "/servers/"+leader.Host+"/failover", map[string]any{"mode": "graceful"}, nil)
 	if st != 422 || p["code"] != "unsupported_operation" {
-		t.Errorf("graceful: %d %v", st, p)
+		t.Errorf("graceful for the map group: %d %v", st, p)
 	}
 	st, p = leader.Do("POST", "/servers/"+leader.Host+"/failover", map[string]any{"mode": "hard"}, nil)
 	if st != 422 {

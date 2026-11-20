@@ -6,10 +6,10 @@
 # Two pieces that earlier rounds left out and the design asks for:
 #
 #   A. KS001 for an extension that a group does not have (design 5.5).  A group that lacks the extension fails when it parses the
-#      text of the fragment (the function does not exist), before any hook of the extension can see the marker; the node that
-#      sent the fragment knows what the statement uses (the marker names the extensions) and raises the KS001 of a version
-#      difference, naming the extension and the node.  The escape is shippable_extensions = 'none'.  Both kinds of fragment (the
-#      closed query and the partial aggregation) are tested; when the extension is installed on the node the statement works.
+#      text of the fragment (the function or the schema does not exist), before any hook of the extension can see the marker; the
+#      probe that the sender asks of every group before the DECLARE also asks which of the extensions named in the marker the group has,
+#      and the sender raises the KS001 of a version difference, naming the extension and the node (t/173 has the cases of a node that
+#      never had the extension).
 #   B. The tie-break of the ordered merge (design 8, O3): rows that compare equal come out in the order of their group id,
 #      whichever node runs the statement (the node's own part is not first).
 
@@ -67,7 +67,7 @@ sub plan_of
 		like($err, qr/KS001/, '... with the retryable KS001, not "function does not exist"') or diag($err);
 		like($err, qr/does not have an extension that the statement uses \(kingres_sketch:1\.0\)/, '... naming the extension and its version');
 		like($err, qr/ae3|:\d+ does not have/, '... and the node');
-		like($err, qr/does not exist/, '... with what the node said, as the detail');
+		like($err, qr/is not installed in the database of that node/, '... saying that it is not installed there, as the detail');
 		like($err, qr/shippable_extensions = 'none'/, '... and the escape in the hint');
 		is($out, '', "$name: no row was printed");
 		# the escape: this node reads the rows and runs the aggregate itself

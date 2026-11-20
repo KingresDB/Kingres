@@ -5,13 +5,17 @@
 #
 # The design's 068_pushdown_ledger (design/shard-phase2b.md, 11.8 and 16.2): kingres_shard and kingres_ledger loaded together.
 # The ledger tables of a node are local tables of that node (a ledger table is never distributed: t/142).  They are written
-# from the groups' data by INSERT ... SELECT, and that read goes through every path of phase 2b.  The ledger's guarantees must
-# not change:
+# from the groups' data by INSERT ... SELECT.  The source of an INSERT ... SELECT is read by the 2a Kingres Distributed Scan, not by
+# the fragment paths of phase 2b (design 6.1 and 18: it is planned as a subquery), so section A tests the ledger with the 2a scan,
+# and section A2 tests the ledger with the fragment paths: the same statements run inside a function (RETURN QUERY plans a statement
+# of its own at the top level, where the partial aggregation, the ordered merge and the closed query are shipped) and feed the ledger
+# table (review P2F-04); the log of a group shows that the fragments were sent.  The ledger's guarantees must not change:
 #
 #   A. INSERT INTO <ledger table> SELECT ... FROM <distributed table> from every node, for an append-only and an updatable
 #      table, with a source that is a scan, a partial aggregation, an ordered merge with a limit and a closed aggregate: every
 #      row is captured exactly once (the table holds each row once; the history of the updatable table holds each insert once),
 #      ledger_verify() reports no problem;
+#   A2. the same through functions, so that the fragment paths are under the ledger: one entry per row, none twice;
 #   B. an UPDATE and a DELETE of an append-only table are still refused, an UPDATE of the updatable one is recorded;
 #   C. a COPY into a distributed table by a role that also owns a ledger table does not touch that ledger table, and the
 #      ledger stays consistent.
@@ -31,7 +35,7 @@ use KingresShardTest qw(make_cluster run_sql prepared_count);
 
 my @nodes = make_cluster('pl', 3, extra => "shared_preload_libraries = 'kingres_shard,kingres_ledger'\n"
 	. "kingres_ledger.block_interval = 0\n"
-	. "kingres_shard.enable_partial_aggregation = on\nkingres_shard.enable_pushdown_sort = on\n");
+	. "kingres_shard.enable_partial_aggregation = on\nkingres_shard.enable_pushdown_sort = on\nlog_statement = 'all'\n");
 my ($n1) = @nodes;
 $_->safe_psql('postgres', 'CREATE ROLE lrole LOGIN') for @nodes;
 $n1->safe_psql('postgres', q{
@@ -48,10 +52,14 @@ for my $n (@nodes)
 		CREATE TABLE public.led_a (kind int, id int, v text);
 		CREATE TABLE public.led_u (kind int, id int, v text);
 		CREATE TABLE public.led_own (kind int, id int, v text);
+		CREATE TABLE public.led_f (kind int, id int, v text);
+		CREATE TABLE public.led_fu (kind int, id int, v text);
 		ALTER TABLE public.led_own OWNER TO lrole;
 		SELECT kingres.ledger_enable('public.led_a', 'append_only');
 		SELECT kingres.ledger_enable('public.led_u', 'updatable');
 		SELECT kingres.ledger_enable('public.led_own', 'append_only');
+		SELECT kingres.ledger_enable('public.led_f', 'append_only');
+		SELECT kingres.ledger_enable('public.led_fu', 'updatable');
 	});
 }
 
@@ -108,6 +116,59 @@ for my $n (@nodes)
 			"$EXPECT/$EXPECT/$EXPECT", "$nm: the ledger holds one entry for each row of $t, none twice");
 	}
 	is($n->safe_psql('postgres', 'SELECT count(*) FROM kingres.ledger_verify()'), 0, "$nm: ledger_verify() reports no problem");
+}
+
+# ---------------------------------------------------------------------------
+# A2. the same through functions: the fragment paths under the ledger (review P2F-04)
+# ---------------------------------------------------------------------------
+{
+	# [ function, the types it returns, the statement, the marker that a group's log must show, the rows ]
+	my @fn = (
+		[ 'f_scan',    'int, int, text',   q{SELECT 1, id, v FROM public.dist WHERE k = 1 AND id <= 30}, undef, 30 ],
+		[ 'f_partial', 'int, int, bigint', q{SELECT 2, g, count(*) FROM public.dist GROUP BY g}, 'kingres:partial-fragment', 7 ],
+		[ 'f_merge',   'int, int, bigint', q{SELECT 3, id, count(*) FROM public.dist GROUP BY id ORDER BY count(*) DESC, id LIMIT 20}, 'kingres:query-fragment', 20 ],
+		[ 'f_closed',  'int, int, text',   q{SELECT 4, id, max(v) FROM public.dist WHERE id <= 100 GROUP BY id}, 'kingres:query-fragment', 100 ],
+	);
+	my $total = 0;
+	$total += $_->[4] for @fn;
+	for my $n (@nodes)
+	{
+		for my $f (@fn)
+		{
+			my ($name, $types, $sql) = @$f;
+			my @ty = split /, /, $types;
+			my $cols = join(', ', map { "o$_ $ty[$_ - 1]" } (1 .. 3));
+			$n->safe_psql('postgres', "CREATE FUNCTION public.$name() RETURNS TABLE ($cols) LANGUAGE plpgsql AS \$f\$ BEGIN RETURN QUERY $sql; END \$f\$");
+		}
+	}
+	for my $n (@nodes)
+	{
+		my $nm = $n->name;
+		my ($other) = grep { $_ != $n } @nodes;
+		for my $f (@fn)
+		{
+			my ($name, $types, $sql, $marker, $rows) = @$f;
+			my $off = -s $other->logfile;
+			for my $t (qw(led_f led_fu))
+			{
+				my ($rc, $out, $err) = run_sql($n, "INSERT INTO public.$t SELECT o1, o2, o3::text FROM public.$name()");
+				is($rc, 0, "$nm: INSERT INTO $t SELECT FROM $name() runs") or diag($err);
+			}
+			if (defined $marker)
+			{
+				my $log = PostgreSQL::Test::Utils::slurp_file($other->logfile, $off);
+				my $seen = () = $log =~ /\Q$marker\E/g;
+				cmp_ok($seen, '>=', 2, "$nm: a group received the fragment of $name() ($marker, seen $seen times): the pushdown path is under the ledger");
+			}
+		}
+		for my $t (qw(led_f led_fu))
+		{
+			is($n->safe_psql('postgres', "SELECT count(*) || '/' || count(DISTINCT (kind, id)) FROM public.$t"), "$total/$total", "$nm: $t holds each row once");
+			is($n->safe_psql('postgres', "SELECT count(*) || '/' || count(DISTINCT (e.ledger_txid, e.seq)) || '/' || count(DISTINCT e.row_hash) FROM kingres.ledger_entry e JOIN kingres.ledger_table lt USING (table_id) WHERE lt.relid = 'public.$t'::regclass"),
+				"$total/$total/$total", "$nm: the ledger holds one entry for each row of $t, none twice");
+		}
+		is($n->safe_psql('postgres', 'SELECT count(*) FROM kingres.ledger_verify()'), 0, "$nm: ledger_verify() reports no problem");
+	}
 }
 
 # ---------------------------------------------------------------------------

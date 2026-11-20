@@ -1439,7 +1439,7 @@ INSERT INTO tpv.dp VALUES (1, '2026-01-02', 'Same'), (2, '2026-01-02', 'same'), 
 SELECT tpv.digest('tpv.dp_a') AS dp_digest \gset
 SET tpv.fold = 'on';
 CALL kingres.convert_partition('tpv.dp', 'tpv.dp_a');
-ERROR:  could not create unique index "dp_a__kc_1"
+ERROR:  could not create unique index "kc_58cacec6554a_1"
 DETAIL:  Key (tpv.fold(b), ts)=(same, 2026-01-02 00:00:00+00) is duplicated.
 RESET tpv.fold;
 SELECT * FROM tpv.methods('tpv.dp');

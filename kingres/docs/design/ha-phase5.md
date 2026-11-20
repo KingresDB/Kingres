@@ -207,6 +207,8 @@ changes because of a failover, existing connections are closed, and new
 ones go to the new primary. Clients may list several servers; any of them
 accepts writes while it can reach a primary.
 
+> **Note of 2026-11-20.** The code differs from the default stated above: the client entry point is **off** unless it is configured. `client-listen` (`KINGRES_CLIENT_LISTEN`) and `client-standby-listen` (`KINGRES_CLIENT_STANDBY_LISTEN`) are empty by default, and `kingresd` forwards no client connection while both are empty (`internal/config/ha.go`, `cmd/kingresd/ha_proxy.go`; the control-plane README has the table of settings). The ports 5432 and 5433 are the ones the design proposes for an operator who turns it on; in the image and the compose file 5432 is the port of the PostgreSQL instance itself.
+
 ## What the control plane exposes
 
 Contract additions: standbys in the server and replication views (already

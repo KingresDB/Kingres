@@ -2448,3 +2448,34 @@ exist from migration 0015).
   is running when the failover starts (covered by the unit test of the order and by the rebalance's own test of `StopForFailover`, not by a cluster
   test), `failoverNeedsDecision` for an automatic run with an asynchronous standby (the journal and the task already ask; no cluster test), and the
   stall tests of T14.
+
+### Increment 7, round 1 (the planned switchover, 2026-11-20)
+
+`failoverServer` with `mode: graceful` for ordinary groups, built to section 5 with these departures; the restore of the preferred primaries and
+the dry run for a switchover are round 2. The contract is unchanged (0.13.0, text only: the steps and codes in the description of the operation,
+`group_degraded` used for the first time).
+
+- **Steps per group** (`internal/failover/switchover.go`): `Freeze`, `Choose the standby`, `Stop the writes`, `Let distributed transactions end`,
+  `Stop the old primary cleanly`, `Verify the new primary`, then `Wait for the old lease`, `Hand the lease`, `Promote` and F7 to F13. The choice is
+  made first so that the standby that must replay the mark is known; only a standby that streams from the primary is a candidate, and the verdict is
+  `none` by construction. S4 and S5 are one step (mark, the standby replays the mark within 10 s, fast shutdown); S6 reads the shutdown
+  checkpoint again with the same idempotent call and asks the standby, repeating for 30 s. S7 is the existing fence step: the lease was released by
+  the clean stop, so the leader's first round obtains it and then hands it to the new server as in a failover.
+- **Stop of the writes** (`cmd/kingresd/switchover.go`, `internal/instance/quiesce.go`): the group is added to a set that the entry point reads
+  (the proxy then sees a group whose lease is not held and sends new connections to another group's primary), `pg_hba.conf` is replaced by the hold
+  rules (replication lines, `local` lines and the service role's loopback lines; the previous file is kept next to it), and every client session
+  that is not the service role's is ended; the leader repeats the call every second for two minutes. The hold is not persisted across a restart of
+  kingresd.
+- **Rollback** (`rollbackSwitchover`): the leases that the run holds are released (the leader's fence adoption, the new server's holder adoption),
+  the old primary is resumed (`Manager.Resume`: the hand-over marker is removed and, when the instance does not run, the wait marker is written so
+  that the lease rounds start it) and the writes are let in again. A step that fails with a code does it before it returns; a cancel and any other
+  failure do it in `OnFail` for the groups that were begun and not promoted. The cancel guard refuses from the start of `Promote`.
+- **Departures.** (1) The old primary becomes a standby through the rebuild of increment 4 (`pg_rewind`, which has nothing to rewind after a clean
+  stop), not through `/standby/adopt {clean}` of 6.3; the report therefore does not say `method: clean`. (2) The phases `quiescing`,
+  `waitingForTransactions`, `stopping`, `verifying` and `writesPausedSince` of `GET /failover` are not reported; the pause of the writes is the
+  event `writesResumed` (`pauseMs`) of the report. (3) The map group is refused for `graceful` (422); it needs the bootstrap with a live old server.
+  (4) The wait for prepared transactions looks at the old primary only and asks every catalog database to recover them every ten seconds.
+- **Tests.** Unit: `internal/failover/switchover_test.go` (every step, every rollback, the refusals, the cancel guard, `OnFail`) and
+  `internal/instance/quiesce_test.go`. Cluster (`internal/clustertest/failover_switchover_test.go`): T12 `TestSwitchoverOfAGroup`, T12b
+  `TestSwitchoverVerificationFails` and `TestSwitchoverWithAnUncleanStop`, T12c `TestSwitchoverCancelBeforeAndAfterThePointOfNoReturn`. The faults
+  that stand in for the causes are callee-side points of the fault file: `quiesce:stall`, `verify:false`, `demote:state`.

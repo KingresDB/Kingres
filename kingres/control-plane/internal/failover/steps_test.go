@@ -350,7 +350,7 @@ func TestPreflightRefusals(t *testing.T) {
 		{"the map group", func(w *world, in *Input) { in.ServerID = "s2"; in.Groups = []int32{0} }, "unsupported_operation"},
 		{"a group the server is not primary of", func(w *world, in *Input) { in.Groups = []int32{2} }, "unprocessable"},
 		{"a target that is not a standby of the group", func(w *world, in *Input) { in.Targets = map[int32]string{1: "s1"} }, "unprocessable"},
-		{"graceful", func(w *world, in *Input) { in.Mode = ModeGraceful }, "unsupported_operation"},
+		{"graceful on a server that is not live", func(w *world, in *Input) { in.Mode = ModeGraceful }, "node_state_invalid"},
 		{"an old primary that runs with no watchdog (F2-13)", func(w *world, in *Input) { w.oldAlive, w.oldWritable, w.noWatchdog = true, true, true }, "cluster_inconsistent"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

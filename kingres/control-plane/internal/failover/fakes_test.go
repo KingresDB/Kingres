@@ -55,6 +55,19 @@ type world struct {
 	alerts         []string
 	rows           *memRows
 	prepared       int
+	// the switchover
+	oldHolds      bool // the old primary's server holds the lease of its group
+	quiesceCalls  int  // calls of Quiesce that answer "sessions remain" before it succeeds
+	quiesceFail   bool // Quiesce never succeeds
+	oldPrepared   int  // prepared transactions on the old primary (decreasing by recovery)
+	markReplayed  bool // the standby has replayed the mark
+	stopState     string
+	stopStates    []string
+	stopN         int
+	verifyAnswers []bool // the answers of the proof, in order (the last one repeats)
+	verifyErr     error
+	verifyN       int
+	quiesced      bool
 }
 
 func newWorld() *world {
@@ -155,7 +168,10 @@ func (p fpeers) State(_ context.Context, server string, g int32) (State, error) 
 		if !p.w.oldWritable {
 			st.Instances[0].Running = false
 		}
-		st.Holds = false
+		st.Holds = p.w.oldHolds && p.w.oldWritable
+		pn := p.w.oldPrepared
+		st.Prepared = &pn
+		st.Quiesced = p.w.quiesced
 		if p.w.oldWritable {
 			yes := !p.w.noWatchdog
 			st.Watchdog = &yes
@@ -215,6 +231,24 @@ func (p fpeers) Demote(_ context.Context, server string, r DemoteRequest) (Demot
 	}
 	if p.w.oldRefusesDem != nil {
 		return DemoteAnswer{}, p.w.oldRefusesDem
+	}
+	if r.Mode == "fast" {
+		p.w.rec("demote-fast %s", server)
+		p.w.oldWritable = false
+		state := p.w.stopState
+		if state == "" {
+			state = "shut down"
+		}
+		p.w.mu.Lock()
+		if n := p.w.stopN; len(p.w.stopStates) > 0 {
+			if n >= len(p.w.stopStates) {
+				n = len(p.w.stopStates) - 1
+			}
+			state = p.w.stopStates[n]
+		}
+		p.w.stopN++
+		p.w.mu.Unlock()
+		return DemoteAnswer{Stopped: true, ClusterState: state, Checkpoint: "0/6000028", Released: true}, nil
 	}
 	p.w.rec("demote %s to=%s", server, r.TransferTo)
 	p.w.oldWritable = false
@@ -610,4 +644,75 @@ func (m *memRows) Warned(context.Context) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+func (p fpeers) Quiesce(_ context.Context, server string, r QuiesceRequest) (QuiesceAnswer, error) {
+	if err := p.unreach(server); err != nil {
+		return QuiesceAnswer{}, err
+	}
+	p.w.mu.Lock()
+	defer p.w.mu.Unlock()
+	p.w.log = append(p.w.log, "quiesce "+server)
+	if p.w.quiesceFail {
+		return QuiesceAnswer{Remaining: 3}, nil
+	}
+	if p.w.quiesceCalls > 0 {
+		p.w.quiesceCalls--
+		return QuiesceAnswer{Remaining: p.w.quiesceCalls + 1}, nil
+	}
+	p.w.quiesced = true
+	return QuiesceAnswer{Quiesced: true}, nil
+}
+
+func (p fpeers) Unquiesce(_ context.Context, server string, r QuiesceRequest) error {
+	if err := p.unreach(server); err != nil {
+		return err
+	}
+	p.w.rec("unquiesce %s", server)
+	p.w.mu.Lock()
+	p.w.quiesced = false
+	p.w.mu.Unlock()
+	return nil
+}
+
+func (p fpeers) Mark(_ context.Context, server string, r MarkRequest) (MarkAnswer, error) {
+	if err := p.unreach(server); err != nil {
+		return MarkAnswer{}, err
+	}
+	p.w.rec("mark %s", server)
+	return MarkAnswer{Mark: "0/6000000"}, nil
+}
+
+func (p fpeers) Verify(_ context.Context, server string, r VerifyRequest) (VerifyAnswer, error) {
+	if r.Checkpoint == "" {
+		p.w.rec("replayed? %s", server)
+		return VerifyAnswer{Ok: p.w.markReplayed}, nil
+	}
+	p.w.mu.Lock()
+	n := p.w.verifyN
+	p.w.verifyN++
+	answers, err := p.w.verifyAnswers, p.w.verifyErr
+	p.w.mu.Unlock()
+	p.w.rec("verify %s", server)
+	if err != nil {
+		return VerifyAnswer{}, err
+	}
+	if len(answers) == 0 {
+		return VerifyAnswer{Ok: true}, nil
+	}
+	if n >= len(answers) {
+		n = len(answers) - 1
+	}
+	return VerifyAnswer{Ok: answers[n]}, nil
+}
+
+func (p fpeers) Resume(_ context.Context, server string, r ResumeRequest) error {
+	if err := p.unreach(server); err != nil {
+		return err
+	}
+	p.w.rec("resume %s", server)
+	p.w.mu.Lock()
+	p.w.oldWritable = true
+	p.w.mu.Unlock()
+	return nil
 }

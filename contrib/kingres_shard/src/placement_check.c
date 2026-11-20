@@ -97,7 +97,7 @@ kingres_shard_placement_check_plan(int colocation_id, int64 plan_placement)
  * each parent at least as new as the answer (kingres.internal_placement_hash).
  */
 char *
-kingres_shard_probe_before_sql(int colocation_id, int ntables, const Oid *relids)
+kingres_shard_probe_before_sql(int colocation_id, int ntables, const Oid *relids, const char *ext)
 {
 	Oid		   *rels = kingres_shard_probe_tables(ntables, relids);
 	StringInfoData sql;
@@ -115,6 +115,24 @@ kingres_shard_probe_before_sql(int colocation_id, int ntables, const Oid *relids
 #endif
 	appendStringInfoString(&sql,
 						   "(SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'kingres_shard')");
+	if (ext != NULL)
+	{
+		/* the extensions of the statement that the node has, "name:version" each: decided by the catalog of the node, not by the error of a parse (review P2F-01) */
+		const char *p = ext;
+
+		appendStringInfoString(&sql, ", (SELECT pg_catalog.string_agg(extname || ':' || extversion, ',' ORDER BY extname) FROM pg_catalog.pg_extension WHERE extname IN (");
+		while (*p)
+		{
+			const char *colon = strchr(p, ':');
+			const char *comma = strchr(p, ',');
+			size_t		n = (colon != NULL && (comma == NULL || colon < comma)) ? (size_t) (colon - p) : (comma != NULL ? (size_t) (comma - p) : strlen(p));
+			char	   *name = pnstrdup(p, n);
+
+			appendStringInfo(&sql, "%s%s", p == ext ? "" : ", ", quote_literal_cstr(name));
+			p = comma != NULL ? comma + 1 : p + strlen(p);
+		}
+		appendStringInfoString(&sql, "))");
+	}
 	return sql.data;
 }
 
@@ -190,10 +208,10 @@ probe_shape(KsConn *kc, PGresult *res, int ncols)
 
 void
 kingres_shard_probe_read_before(KsConn *kc, PGresult *res, int ntables,
-								int64 plan_placement, int64 *identities)
+								int64 plan_placement, int64 *identities, const char *ext)
 {
 	int			nid = probe_nidentities(ntables);
-	int			ncols = ntables + nid + 1;
+	int			ncols = ntables + nid + 1 + (ext != NULL ? 1 : 0);
 	int			i;
 	bool		same = true;
 	char	   *version;
@@ -207,7 +225,7 @@ kingres_shard_probe_read_before(KsConn *kc, PGresult *res, int ntables,
 	 * something a repeat helps (rolling upgrade, design 14).  Said before the
 	 * numbers, which another version may not compute the same way.
 	 */
-	version = PQgetisnull(res, 0, ncols - 1) ? pstrdup("") : pstrdup(PQgetvalue(res, 0, ncols - 1));
+	version = PQgetisnull(res, 0, ntables + nid) ? pstrdup("") : pstrdup(PQgetvalue(res, 0, ntables + nid));
 	if (strcmp(version, KINGRES_SHARD_EXT_VERSION) != 0)
 	{
 		char	   *host = pstrdup(kc->host);
@@ -220,6 +238,52 @@ kingres_shard_probe_read_before(KsConn *kc, PGresult *res, int ntables,
 						version[0] ? version : "(none)", KINGRES_SHARD_EXT_VERSION),
 				 errdetail("A statement that reads several shard groups needs every node at the same version of the extension."),
 				 errhint("Finish the upgrade (ALTER EXTENSION kingres_shard UPDATE on every node); repeating the statement does not help until then.")));
+	}
+
+	/*
+	 * An extension that the statement uses and the node does not have: KS001 of a version difference (design 5.5).  The groups would fail
+	 * when they parse the text ("function does not exist", or "schema does not exist" when the extension was never installed); PostgreSQL
+	 * has no hook between the parser and the analysis of a DECLARE, so the probe asks the catalog of the node before the DECLARE.  A node
+	 * that has the extension at another version is left to the check of the group, which says both versions.
+	 */
+	if (ext != NULL)
+	{
+		const char *have = PQgetisnull(res, 0, ncols - 1) ? "" : PQgetvalue(res, 0, ncols - 1);
+		const char *p = ext;
+
+		while (*p)
+		{
+			const char *colon = strchr(p, ':');
+			const char *comma = strchr(p, ',');
+			size_t		n = (colon != NULL && (comma == NULL || colon < comma)) ? (size_t) (colon - p) : (comma != NULL ? (size_t) (comma - p) : strlen(p));
+			bool		found = false;
+			const char *q = have;
+
+			while (*q)
+			{
+				const char *qc = strchr(q, ',');
+				size_t		ql = qc != NULL ? (size_t) (qc - q) : strlen(q);
+
+				if (ql > n && strncmp(q, p, n) == 0 && q[n] == ':')
+					found = true;
+				q = qc != NULL ? qc + 1 : q + ql;
+			}
+			if (!found)
+			{
+				char	   *host = pstrdup(kc->host);
+				int			port = kc->port;
+				char	   *names = pstrdup(ext);
+
+				PQclear(res);
+				ereport(ERROR,
+						(errcode(ERRCODE_KINGRES_STALE_MAP),
+						 errmsg("node %s:%d does not have an extension that the statement uses (%s)", host, port, names),
+						 errdetail("The extension %.*s is not installed in the database of that node.", (int) n, p),
+						 errhint("A repeat does not help until the extension is installed at the same version on every node; "
+								 "SET kingres_shard.shippable_extensions = 'none' reads the rows and runs the extension's functions here.")));
+			}
+			p = comma != NULL ? comma + 1 : p + strlen(p);
+		}
 	}
 
 	for (i = 0; i < ntables; i++)

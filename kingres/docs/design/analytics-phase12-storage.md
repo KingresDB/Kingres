@@ -1528,6 +1528,121 @@ before it and prefers partitioning for large tables. There is no build-and-swap
 for a non-partition table in this part: dependent views, foreign keys and
 publications make the swap much more than a rename (open question 8).
 
+### 10.4a Fixes of the review of the conversion (kingres_timepart 0.2, findings T13-01 to T13-14)
+
+Decisions, in the order of the findings. The code is in
+`contrib/kingres_timepart/kingres_timepart--0.2.sql` (and the same text in
+`kingres_timepart--0.1--0.2.sql`); the tests are `sql/timepart_convert_more.sql`
+and `t/009_convert_ddl_race.pl`.
+
+**T13-01. Read the catalog after the lock.** The statements of a conversion used
+to be built before `LOCK TABLE <partition>`, which can wait for writers for
+`create_lock_timeout_ms`; a session that held a lock on the partition could add a
+column, create an index or drop a column before it committed, and the copy then
+lost the new column (null for every row) and the new index. Now everything the
+conversion reads from the catalog (the refusals, the names, the bound, the column
+list, the sort, the tablespace, the index statements and what is needed to carry
+over) is made by one function, `timepart__convert_plan`, which is VOLATILE (a new
+snapshot for every statement). `timepart__convert_stmts` calls it once, before any
+lock, only to refuse early; the DO block it returns holds the OIDs of the table and
+the partition and the caller's arguments, no name, and calls the plan again right
+after the lock. A fingerprint compared after the lock was the other choice; it
+would turn the race into an error, where the plan turns it into a correct copy.
+The lock is taken by the name of the moment (from the OID); if the name no longer
+exists, the block fails with `schema_changed` (SQLSTATE 55P03: retryable, the
+policy run records it as a failed action and is due again within five minutes), and
+the block checks in `pg_locks` that the lock it holds is on the OID it means. The
+swap needed no change: a session that waits for the partition while it holds the
+table is the cycle that the swap already breaks by giving way.
+
+**T13-02. Not MVCC-safe, as TRUNCATE and the rewriting forms of ALTER TABLE.**
+The new partition is filled by the conversion's transaction, so a REPEATABLE READ
+or SERIALIZABLE snapshot older than the swap, on a table that the transaction has
+not read yet, finds the partition empty. No swap of one table for another in one
+transaction can avoid it (the rows would need an older xmin, and only COPY FREEZE
+into a table made in the same transaction gives that, from a client, not from SQL
+inside a block). Detecting the snapshot is not possible either: the isolation
+level of another session is not visible, `backend_xmin` of other roles' sessions
+is not visible to an owner, and waiting for older snapshots as CREATE INDEX
+CONCURRENTLY does needs two transactions, because a snapshot taken after the wait
+and before the commit is as old as one taken before it. So this is a documented
+limit: the README says which transactions are affected (READ COMMITTED statements
+are not: they take their snapshot after the lock; a transaction that has read the
+table is not: the swap gives way to it; `pg_dump` is not once it has locked the
+tables) and `t/009_convert_ddl_race.pl` keeps the behaviour under test. The claim
+"never neither" of the README is now limited to statements.
+
+**T13-03. Publication of the copy.** A heap target is refused when a publication
+of the partition's schema, or of all tables, would take in the new table at its
+creation and publish the copy under its temporary name. (A publication of all
+tables cannot even be created while kingres_columnar is installed; the check is
+there for the order of events in which it was.) The columnar target keeps its
+refusal of every publication that would include the partition.
+
+**T13-04, T13-05. What LIKE does not carry.** After the attach the enabled state of
+each cloned trigger is put back (`DISABLE`, `ENABLE REPLICA`, `ENABLE ALWAYS`). The
+storage parameters of the table and of its TOAST table, the statistics target and
+the options of each column (not the server's own version stamp `pg_attver`), the
+statistics target of an index expression and the clustering index are carried;
+each is a statement of its own in a sub-block, so a parameter that the target
+access method does not accept is a WARNING and the rest goes on. The storage
+parameters are set after the load and the indexes: `parallel_workers` set before
+makes a columnar table refuse a parallel index build of rows that the transaction
+has not written, and a fillfactor set after the load applies to what is written
+next, as it would after an ordinary ALTER TABLE. A columnar table has no TOAST
+table, so those parameters do not go to it and do not come back.
+
+**T13-06. NOT VALID.** Refused, by name (CHECK and NOT NULL). Recreating the
+constraint NOT VALID after the load was the other choice; refusing is the rule of
+this extension for what the new table cannot carry exactly.
+
+**T13-07. Grantor.** The privileges that the owner took from itself are revoked
+again on the new table. A privilege that a role other than the owner granted (with
+GRANT OPTION passed on) is refused: GRANT cannot name another grantor for a
+non-superuser, and the owner as grantor would change what REVOKE ... CASCADE does.
+
+**T13-08. Dependents.** The refusal reads `pg_depend` for every normal dependency
+on the partition, on its row type and on the array type of the row type, except the
+partition's own objects (generated column expressions, constraints, triggers,
+policies, indexes), and names the first with `pg_describe_object`. DROP TABLE
+without CASCADE would stop at exactly those, after the whole copy and in every run.
+
+**T13-09. Names.** The temporary names of the indexes are
+`kc_<12 characters of md5 of the partition name>_<n>`: short, the same on every
+call, no cut by characters. They are checked against existing relations.
+
+**T13-10. Default partition.** Refused when it is larger than the setting
+`kingres_timepart.convert_default_max_mb` (default 256, 0 to 1048576): the attach
+scans it under ACCESS EXCLUSIVE on the table and `lock_timeout` does not bound a
+scan. A helper CHECK on the default partition (NOT VALID, then VALIDATE) would
+keep SHARE ROW EXCLUSIVE on it to the commit, which is worse for its writers.
+
+**T13-11. Files after a crash.** Documented, with a query that lists the files of
+the database directory that no `pg_class` row names; nothing in the extension can
+remove them.
+
+**T13-12, T13-13. Tests.** Survivors of the review's mutants are now killed: M15
+replica identity, M32 constraint comments, M34 default privileges, M37 another
+table access method, M18 the grid in the plan of a run (`timepart_convert_more`);
+M23 the session_user rule, as a superuser that has done SET ROLE (the same file);
+M16 the tablespace and M04/M05/M40 the wait of the swap (`t/009`). M26 stays
+equivalent.
+
+**T13-14. Helpers.** `timepart__special_table` (SECURITY DEFINER, reads the private
+catalogs of the ledger and the distributed tables) answers only a superuser or a
+role that has the privileges of the owner of the table, judged by `session_user`
+(inside a SECURITY DEFINER function nothing else says who called it). The other
+helpers that PUBLIC may execute read `pg_catalog` only and are left as they are.
+The new `timepart__convert_plan` is among them: it runs as the owner, after the
+lock, so the owner needs USAGE on the schema `kingres`, as for every function of
+the extension.
+
+**Version.** 0.2 has not been released (no beta, no tag), so its two scripts were
+edited in place and still give the same catalog (the `upgrade` test); there is no
+0.2--0.3 script. A database that installed 0.2 from a development build earlier
+re-creates the extension. After the first release a change of the script is a new
+version with an upgrade script.
+
 ### 10.5 Locks at a glance
 
 | Action | Lock on the parent | Lock on the partition | Blocks readers of the parent | Blocks writers |

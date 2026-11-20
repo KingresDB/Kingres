@@ -3,7 +3,7 @@
 # KingresDB web panel
 
 The management console of KingresDB: a single-page application (Vue 3, TypeScript, Vite) that is a client
-of the REST API in `kingres/api/openapi.yaml` (revision 0.12.0, 132 operations; the generated files follow 0.12.0, see "Contract revisions" below) and nothing else. The Go server (`kingresd`) will embed the
+of the REST API in `kingres/api/openapi.yaml` (revision 0.13.0, 132 operations; the generated files still follow 0.12.0, see "Contract revisions" below) and nothing else. The Go server (`kingresd`) will embed the
 production build from `dist/` and serve it on every node. The information architecture follows the
 "Management panel" chapter of `docs/architecture.md`: a first-run wizard, a **Cluster** scope and a
 **This server** scope.
@@ -437,8 +437,7 @@ tokens instead.
 
 ## Contract revisions and the checks against them
 
-The generated files (`src/api/schema.d.ts`, `src/api/operations.generated.ts`) follow contract **0.12.0**, the revision of
-`kingres/api/openapi.yaml` (changelog "0.11.0" in `kingres/api/README.md`). `npm run api:check` and the contract tests compare
+The generated files (`src/api/schema.d.ts`, `src/api/operations.generated.ts`) follow contract **0.12.0** (the last one generated from, in commit "the panel follows contract 0.12.0"; the newest note of a revision in them is "Added in 0.12.0"). The revision of `kingres/api/openapi.yaml` is now **0.13.0** (the switchover of a group, the failover of the map group, the alert `certificateAuthorityUnavailable`), which the generated files do not contain yet. `npm run api:check` and the contract tests compare
 with that file. While the working tree holds a draft of a later revision they fail, and that failure says nothing about the
 panel; to check against another copy of the contract (for example the committed one), point `KINGRES_API_SPEC` at it:
 

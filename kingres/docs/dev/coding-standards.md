@@ -7,6 +7,8 @@ Tool versions on the current developer machine (checked 2026-11-14): Go `go1.27.
 
 Commands that are not yet verified in this repository are marked "to be confirmed".
 
+**No CI.** The project runs no continuous integration: GitHub Actions is switched off for the repository and no workflow is published ([releases.md](releases.md), "Where the checks run"). Where a rule below says that CI enforces it, it means the same check run locally by the developer before a commit (the scripts are in `kingres/dev`, `kingres/control-plane/scripts`, `kingres/web` and `kingres/packaging/test`), and the result is recorded in the work log. A check that is not scripted yet is done in review.
+
 ## 1. C (extensions and core patches)
 
 The rule of thumb: KingresDB C code must look like PostgreSQL C code. A reviewer who knows the PostgreSQL tree should not see a style change when moving from `contrib/pg_buffercache` to `contrib/kingres_shard`.
@@ -20,7 +22,7 @@ The rule of thumb: KingresDB C code must look like PostgreSQL C code. A reviewer
 ### 1.2 Formatting
 
 - Format with pgindent using the tree's own typedefs list, `src/tools/pgindent/typedefs.list`. The tree's `src/tools/pgindent/README` says pgindent needs `pg_bsd_indent` in the `PATH` (source in `src/tools/pg_bsd_indent`) and a specific perltidy version for Perl files.
-- Run from the top of the tree: `src/tools/pgindent/pgindent <paths>`. The script also has `--diff` and `--check` options, which show or test changes without rewriting files. Enforced by: `pgindent --check` in CI (the CI job itself is not written yet).
+- Run from the top of the tree: `src/tools/pgindent/pgindent <paths>`. The script also has `--diff` and `--check` options, which show or test changes without rewriting files. Enforced by: `pgindent --check`, run locally (there is no CI).
 - Every new type that appears in a `typedef` must be added to `src/tools/pgindent/typedefs.list` (the README says to do this when pgindent makes ugly whitespace around new typedefs). Because that file is an upstream file, the register rule in [core-patches.md](core-patches.md) applies: additions to it are the one kind of upstream-file change that is allowed without a patch ID, and they must be a separate commit. **[Recommendation]**
 - Tabs are 4 columns wide, as in upstream. Lines are kept to about 80 columns where pgindent allows it.
 - Line endings are LF. The repository is configured with `core.autocrlf=false` and `core.eol=lf`; do not let an editor convert files to CRLF. Enforced by: `.gitattributes` and `.editorconfig` already in the tree, and review of diffs for whole-file changes.
@@ -103,7 +105,7 @@ The rule of thumb: KingresDB C code must look like PostgreSQL C code. A reviewer
    *    that turn a distribution key into a group.
    *
    * SPDX-License-Identifier: AGPL-3.0-only
-   * Copyright (c) 2026, KingresDB contributors
+   * Copyright (c) 2026, RooyeKhat Media Co
    *
    * IDENTIFICATION
    *    contrib/kingres_shard/bucket_map.c
@@ -112,7 +114,7 @@ The rule of thumb: KingresDB C code must look like PostgreSQL C code. A reviewer
    */
   ```
 
-  The exact copyright holder string is to be confirmed once the hosting organisation exists.
+  The copyright holder is RooyeKhat Media Co, as in `kingres/COPYRIGHT` and in the files of the repository. (Earlier versions of this document said "KingresDB contributors, to be confirmed"; that is no longer so.)
 - Every non-trivial function has a comment block directly before it that says what the function does and why it exists or why it works this way: inputs, outputs, side effects, locking, memory-context assumptions, error behaviour. "Non-trivial" means more than a few lines or any function with side effects outside its arguments.
 - Inside functions, comments explain why (an invariant, a PostgreSQL rule, a race that is being avoided), not what the next line does.
 - A comment that refers to a design decision names the section of `docs/architecture.md` or the ADR.
@@ -120,7 +122,7 @@ The rule of thumb: KingresDB C code must look like PostgreSQL C code. A reviewer
 ### 1.10 Build files
 
 - Each extension has both a `Makefile` (PGXS) and a `meson.build`. The tree's `contrib/pg_buffercache/Makefile` and `meson.build` are the models: the Makefile supports `USE_PGXS=1` (build outside the tree against an installed `pg_config`) and the in-tree path.
-- Both files list the same sources, the same `DATA` / `install_data` files (including every upgrade script), the same regression tests and the same TAP tests. A new file added to one must be added to the other. Enforced by: CI builds the extension with both systems (not written yet); until then, review.
+- Both files list the same sources, the same `DATA` / `install_data` files (including every upgrade script), the same regression tests and the same TAP tests. A new file added to one must be added to the other. Enforced by: building the extension with both systems locally, and review.
 - Both build files set the `PGFILEDESC` / Windows resource description.
 
 ### 1.11 SQL install and upgrade scripts
@@ -139,7 +141,7 @@ The rule of thumb: KingresDB C code must look like PostgreSQL C code. A reviewer
 One source of each extension builds against every supported major, 18 and 19 (ADR 0023).
 
 - Each extension has one compatibility header, `src/pg_compat.h`. It holds every difference between the majors: a renamed function or type, a changed signature, a header that moved, a changed struct member, a compiler-flag consequence. It is included by the extension's main header, after `postgres.h`.
-- Nothing outside `pg_compat.h` tests `PG_VERSION_NUM` or `PG_MAJORVERSION_NUM`, in C or in a build file. Code calls a macro or a `static inline` function that the header defines for each major, named after what the code means (for example `KS_TABLE_BEGINSCAN`), and the header's comment names the upstream change it follows. Enforced by: `grep -rn PG_VERSION_NUM contrib/kingres_*` lists only `pg_compat.h` files; review.
+- Nothing outside the compatibility header of an extension (`src/pg_compat.h`) tests `PG_VERSION_NUM` or `PG_MAJORVERSION_NUM`, in C or in a build file. One exception is known and real: `contrib/kingres_columnar/t/kcevents/kcevents_compat.h`, the compatibility header of the test-only module `kcevents` of `kingres_columnar`, which is not part of the extension and cannot include its `src/pg_compat.h`; it tests `PG_VERSION_NUM` in its wrappers of table access method calls, and it is the only file that does. Code calls a macro or a `static inline` function that the header defines for each major, named after what the code means (for example `KS_TABLE_BEGINSCAN`), and the header's comment names the upstream change it follows. Enforced by: `grep -rn PG_VERSION_NUM contrib/kingres_*` lists only `pg_compat.h` files and that one file; the TAP test `contrib/kingres_shard/t/098_foundation.pl` checks the sources of `kingres_shard`; review.
 - The header uses the newest major's spelling as the one the code is written in where that is natural, and defines it for the older major; when a major is dropped its branch of each `#if` is removed and the wrapper can go. A difference that cannot be hidden without changing behaviour on the older major is not hidden by guessing: it is described in the pull request and decided there.
 - A feature that exists on a newer major alone lives in its own file, compiled on that major only; on the older major the SQL function it backs raises a clear "needs PostgreSQL N" error. The SQL scripts are the same on every major; where a catalog differs, the script or the C code decides at run time.
 - No compiler warning on any supported major, and no `-Wno-*` flag to hide one. `kingres/dev/ext-majors.sh` builds with `-Werror` on each major. Enforced by: that script.
@@ -160,14 +162,14 @@ One source of each extension builds against every supported major, 18 and 19 (AD
 
 Tool version in use today: `go1.27.3`.
 
-- Layout: `cmd/<binary>/main.go` for each executable (`kingresd`, `kingres-cli`, `kingres-verifier`), and `internal/` for everything else. Nothing is exported from the module unless another repository needs it; that decision is recorded in an ADR. One `go.mod` for the control plane. The exact module path is to be confirmed once the repository host exists.
-- Formatting and static checks: `gofmt` (or `gofmt -s`) with no diff, `go vet ./...` clean, `golangci-lint run` clean. The `golangci-lint` configuration file (`.golangci.yml`) will be checked into `kingres/control-plane/`; the list of enabled linters is to be confirmed when it is written. Enforced by: CI (not written yet) and a pre-commit check.
+- Layout: `cmd/<binary>/main.go` for each executable (in the control plane today `kingresd` and `kingres-watchdog`; `kingres-cli` is planned and does not exist yet; the verifier is a separate module, `kingres/verifier/cmd/kingres-verify`), and `internal/` for everything else. Nothing is exported from the module unless another repository needs it; that decision is recorded in an ADR. One `go.mod` for the control plane. The exact module path is to be confirmed once the repository host exists.
+- Formatting and static checks: `gofmt` (or `gofmt -s`) with no diff, `go vet ./...` clean, `golangci-lint run` clean. The `golangci-lint` configuration file is `kingres/control-plane/.golangci.yml`. Enforced by: `golangci-lint run` run locally (the configuration is `kingres/control-plane/.golangci.yml`).
 - `context.Context` is the first parameter of every function that does I/O, blocks or can be cancelled, named `ctx`. Never store a context in a struct.
 - Errors: return errors, do not panic for expected conditions. Wrap with `fmt.Errorf("doing X: %w", err)`; add the operation, not the word "failed". Compare with `errors.Is` / `errors.As`. Define sentinel errors or typed errors for conditions callers branch on.
 - Logging: `log/slog` only. Pass a `*slog.Logger` to constructors; do not use the default logger from library code. Log with key-value attributes. Never log secrets, passwords, tokens or connection strings with passwords.
 - No global mutable state and no `init()` that does work. Dependencies are passed in constructors. Configuration is parsed once in `main` into a struct.
 - Interfaces are defined where they are used (the consumer package), are small, and are not created before a second implementation or a test needs them. Return concrete types from constructors.
-- Concurrency: every goroutine has an owner that waits for it or cancels it through its context. Run tests with `-race` in CI. Use `errgroup` only after the dependency policy below is applied (the standard library alone is acceptable).
+- Concurrency: every goroutine has an owner that waits for it or cancels it through its context. Run tests with `-race` (locally; there is no CI). Use `errgroup` only after the dependency policy below is applied (the standard library alone is acceptable).
 - Tests: table-driven with `t.Run` subtests; test files next to the code; use `t.Helper()` and `t.Cleanup()`; no sleeping to wait for conditions. See [testing.md](testing.md).
 - Documentation: every exported identifier has a doc comment starting with its name. Every package has a `doc.go` or package comment stating its purpose. Enforced by: the `revive` or `staticcheck` rules for exported comments enabled in `golangci-lint` (to be confirmed which linter), and review.
 - Dependency policy: standard library first. A new third-party module requires, before it is added to `go.mod`: (1) a check of its licence against the project licence policy in section 5 (permissive licences such as MIT, BSD, Apache-2.0 are candidates; AGPL and other strong copyleft are not accepted without an ADR), (2) a check that it is maintained, and (3) an entry in an ADR or, for small libraries, a note in the work-log entry that adds it, naming the module, version, licence and why the standard library is not enough. `go.sum` is committed. Enforced by: review of `go.mod` changes; a licence-scanning tool in CI is to be decided.
@@ -180,11 +182,11 @@ The panel is written in Vue 3 with TypeScript ([ADR 0017](../adr/0017-vue-for-th
 
 Tool version in use today: Node.js `v24.22.1`.
 
-- TypeScript `strict: true` in `tsconfig.json`, plus `noUncheckedIndexedAccess` and `noImplicitOverride`. No `any`: use `unknown` and narrow it. No `@ts-ignore`; `@ts-expect-error` needs a comment explaining why. Enforced by: `vue-tsc --noEmit` in CI (it type-checks the templates as well as the scripts), and the ESLint rule `@typescript-eslint/no-explicit-any` set to `error`.
-- Linting and formatting: ESLint with a flat config (`eslint.config.js`) and Prettier. Prettier owns formatting; ESLint owns correctness. CI fails on any lint warning. The plugin list (typescript-eslint, `eslint-plugin-vue`, `eslint-plugin-vuejs-accessibility`) is to be confirmed when the config is written.
+- TypeScript `strict: true` in `tsconfig.json`, plus `noUncheckedIndexedAccess` and `noImplicitOverride`. No `any`: use `unknown` and narrow it. No `@ts-ignore`; `@ts-expect-error` needs a comment explaining why. Enforced by: `vue-tsc --noEmit` (`npm run typecheck`, run locally; it type-checks the templates as well as the scripts), and the ESLint rule `@typescript-eslint/no-explicit-any` set to `error`.
+- Linting and formatting: ESLint with a flat config (`eslint.config.js`) and Prettier. Prettier owns formatting; ESLint owns correctness. `npm run lint` fails on any lint warning. The plugin list (typescript-eslint, `eslint-plugin-vue`, `eslint-plugin-vuejs-accessibility`) is to be confirmed when the config is written.
 - Components are single-file components using `<script setup lang="ts">` and the Composition API. No Options API and no class components. Props and emits are declared with types (`defineProps<...>()`, `defineEmits<...>()`). Reusable stateful logic lives in composables (`useXxx`), not in mixins.
 - Server state (anything fetched from the REST API) goes through one query library (TanStack Query for Vue is the candidate; the choice is to be recorded when the web project is created). Components do not call `fetch` directly. Client-only state that is shared between pages (the session, the theme) lives in a Pinia store; local UI state uses `ref`/`reactive`. Do not copy server data into a store or into local state.
-- API client: generated from `kingres/api/openapi.yaml`, not written by hand. The generator is to be chosen and recorded in an ADR. The generated code is either committed in a marked directory and never edited by hand, or generated at build time; whichever is chosen, CI fails if the generated output differs from the spec. Request and response types come only from the generated client.
+- API client: generated from `kingres/api/openapi.yaml`, not written by hand. The generator is `openapi-typescript` with `openapi-fetch` (`web/scripts/gen-api.mjs`). The generated files are committed in `web/src/api` and never edited by hand; `npm run api:check` fails if the committed output differs from the spec. Request and response types come only from the generated client.
 - Accessibility (the panel is a tool used under pressure; it must work with a keyboard and a screen reader):
   - Use semantic HTML elements (`button`, `a`, `table`, `nav`, `main`, headings in order) before ARIA.
   - Every interactive control is reachable and operable with the keyboard, with a visible focus indicator.
@@ -199,15 +201,15 @@ Tool version in use today: Node.js `v24.22.1`.
 
 ## 5. Cross-cutting rules
 
-- **English only.** Code, identifiers, comments, commit messages, documentation, file and directory names, test data and log messages are in English. No non-English text anywhere in the repository. Enforced by: a CI check that scans new and changed files for characters outside printable ASCII, with an allow-list for files that legitimately need them (for example upstream files and test data for encoding tests). **[Recommendation]**
+- **English only.** Code, identifiers, comments, commit messages, documentation, file and directory names, test data and log messages are in English. No non-English text anywhere in the repository. Enforced by: a check that scans new and changed files for characters outside printable ASCII, with an allow-list for files that legitimately need them (for example upstream files and test data for encoding tests). **[Recommendation]**
 - **Comments say why.** A comment that repeats the code is deleted. A comment that records a constraint, an upstream behaviour, a failure mode or a decision is required.
-- **No secrets in the repository.** No passwords, tokens, private keys, certificates with private keys, or connection strings with credentials, including in tests and examples. Test credentials are generated at test time. Enforced by: a secret-scanning step in CI and pre-commit (tool to be decided); review.
+- **No secrets in the repository.** No passwords, tokens, private keys, certificates with private keys, or connection strings with credentials, including in tests and examples. Test credentials are generated at test time. Enforced by: review, and a scan of the files of a commit before it is made (no scanning tool is chosen).
 - **Licences.**
   - KingresDB's own code is under the GNU Affero General Public License, version 3 only ([ADR 0024](../adr/0024-agpl-for-kingresdb-code.md)); PostgreSQL's code stays under the PostgreSQL License. The upstream `COPYRIGHT` file stays unchanged; `kingres/COPYRIGHT` says which licence covers which part. The legal review named in the architecture document has not been done.
   - Citus is licensed under AGPL-3 (architecture document, "The key decision"). Do not copy, translate or closely paraphrase Citus code, tests or comments. Use Citus documentation and the published architecture only as a source of concepts. If you are unsure whether something is a concept or code, ask before writing it.
   - The same caution applies to any other code: third-party code is not copied into KingresDB without a decision of its own, whatever its licence (ADR 0024, point 6), and a dependency must have a licence that can be combined with AGPL-3.0. A third-party file copied into the tree keeps its own licence header and is listed in a `THIRD-PARTY` note (the file will be created with the first such import).
   - Code taken from upstream PostgreSQL keeps its upstream header.
-- **SPDX header.** Every new KingresDB source file starts with `SPDX-License-Identifier: AGPL-3.0-only` in the first comment (in the form that the file type allows: `/* */` in C, `--` in SQL, `//` in Go and TypeScript, `<!-- -->` in Markdown, `#` in scripts and YAML). Add `Copyright (c) <year>, KingresDB contributors` after it in source files. Files copied from upstream and edited are not re-headed. Enforced by: a header check in CI (to be written).
+- **SPDX header.** Every new KingresDB source file starts with `SPDX-License-Identifier: AGPL-3.0-only` in the first comment (in the form that the file type allows: `/* */` in C, `--` in SQL, `//` in Go and TypeScript, `<!-- -->` in Markdown, `#` in scripts and YAML). Add `Copyright (c) <year>, RooyeKhat Media Co` after it in source files. Files copied from upstream and edited are not re-headed. Enforced by: review (no header check is scripted yet).
 - **Commit messages.** One logical change per commit. Core patches follow the extra rules in [core-patches.md](core-patches.md).
 - **Platform.** C code is built and tested in WSL2 (Ubuntu 24.04) on the Windows 11 developer machine; Go and Node.js build natively on Windows. Code must not assume either platform where upstream does not.
 - **Needs-verification discipline.** A design item labelled **[Needs verification]** in the architecture document is checked against the PostgreSQL source or documentation before code depends on it. The result of the check goes in the work log.

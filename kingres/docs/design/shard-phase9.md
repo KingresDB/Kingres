@@ -1019,3 +1019,70 @@ reproduced by its test on the tree under review before it was fixed. The tests a
 
 Of the mutants of the fixes, all are killed except two lines that set `extra_float_digits` in the copy
 and the replay, which were removed because those sessions are already forced to 3.
+
+### Increment 9.4, undistribute and alter (2026-11-20)
+
+Four calls: `undistribute_table` and `alter_distributed_table` (blocking), and
+`undistribute_table_concurrently` and `alter_distributed_table_concurrently` (online). Tests t/185 to
+t/188. The only C change is in `rebuild.c` (an optional base name for shadow partitions and a helper
+that reads one value from a node's branch); the planner and the pushdown code are not touched.
+
+**The blocking calls.** The order is:
+
+1. Checks: superuser, map group primary, version handshake, the cluster lock, then the report with
+   two new blockers: an object such as a view that uses a table the call drops (`dependent_object`),
+   and a group that a move uses.
+2. The statements that rebuild the old table's definition (sequence states, owner, privileges, keys)
+   are read before anything is dropped.
+3. `EXCLUSIVE` on the table on every active primary in node order: writers, also those of other
+   nodes, wait; readers go on.
+4. Undistribute makes one ordinary shadow table on the target node. Alter renames the old partitions
+   out of the way on every node and makes the shadow of the new layout with its final names. Then
+   the rows are copied and the counts compared.
+5. The swap runs with the extension's statement handling off in every node's branch: the sequences
+   are released, the old tables are dropped, the shadows take the names, and the keys, sequence
+   states, privileges and comments follow. Then the catalog changes, a group left without a table
+   is deleted, and `sync_catalog()` runs.
+6. The caller's transaction commits with the two-phase commit of 2a.
+
+The whole call is one transaction, so no claim row is written: the cluster lock and the report's
+refusal of a busy group keep others out. Deviations from the design:
+
+- For a reference table, the copy of the target node stays and the copies are not compared first
+  (a difference could only be reported, not repaired; the README says so).
+- Foreign keys of the component are recreated valid in the same transaction. `NOT VALID` with a
+  later validation belongs to the online form, whose switch must not scan under the locks.
+- A changed distribution column always makes a new group. When the new bucket count is a multiple of
+  the old one, each bucket keeps the node of its rows, but the rows still pass through the map group
+  primary.
+- Four fault points per call (after the lock, the copy, the drop and the swap) make the atomicity
+  and the waiting of writers testable.
+
+**The online calls.** One operation row on the map group primary and a mirror row on every other
+node. The node-local functions of 9.3 (capture, copy step, replay, undo, DDL guard) read the row of
+their own node and run unchanged on every node with routing off, so the lessons of the second review
+(the guard on every node, exact keys in the capture, the same cancel and undo) hold here too. The
+destination is either the shadow partitions of the new placement (alter) or one ordinary shadow
+table on the target node (undistribute). The switch attempt takes the catalog lock, then `EXCLUSIVE`
+on every node's table, replays every node's log and checks that every log is empty. It then takes
+`ACCESS EXCLUSIVE` and swaps node by node, recording each node's swap transaction and old copy. The
+verification compares the digests of all old copies with the new table, with the rule of 9.3 for
+rows written after the swap. The cleanup drops the old copies on every node. The untrusted-code
+check of the second review also applies to these calls.
+
+Decisions of the online form:
+
+- It takes one table. A table linked by a foreign key to another hash-distributed table, and the
+  `cascade_*` options, need the blocking calls; a key to a reference table is carried over.
+- A request that moves no rows returns NULL and starts no operation; the blocking call does that
+  change.
+- After an undistribute, a writer on another node whose statement comes after the swap gets
+  `relation ... does not exist` and writes nothing.
+
+**Mutants.** Of the blocking calls, two survive: the count check after the copy cannot fail,
+because the copy already fails unless every row read was stored. Every mutant of the online calls is
+killed. Two of them survived the first run and led to new tests: one that reads `pg_locks` on every
+node at the three points of the switch, and one that loses a row from the old copy of a second node,
+which the verification must report.
+
+**Not done.** Several tables at once online, and the control plane and console (9.6).

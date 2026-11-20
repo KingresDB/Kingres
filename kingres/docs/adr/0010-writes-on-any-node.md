@@ -31,3 +31,7 @@ Every server runs a writable primary of one shard group and standbys of neighbou
 - **Conflict-resolving active-active (Spock, PGD).** Rejected: it gives up strong consistency, and without a single commit order per shard the ledger hash chain cannot work. The document says these systems suit HA and geo distribution, not data sharding.
 - **Dedicated coordinator or router nodes only.** Not discussed as a rejected option; the document's design (every node can plan and route) follows the Couchbase and CockroachDB pattern of identical nodes.
 - **Client-side routing only** (clients list several hosts). Kept as an extra, not as the mechanism: the agent's router gives a writable session from any server.
+
+## Note of 2026-11-20: Patroni
+
+The instances are not managed by Patroni; `kingresd` manages them and does the failover ([ADR 0021](0021-failover-in-kingresd.md)).

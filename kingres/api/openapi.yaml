@@ -1049,7 +1049,17 @@ paths:
         422 `node_state_invalid` for `graceful` on a server that is not `live`, 422 `unprocessable` for a group
         the server is not primary of or a target that is not a standby of the group. While `kingresd` lacks a
         part of the design, the request answers 422 `unsupported_operation`: this revision's server implements
-        `hard` for ordinary groups only.
+        `hard` and `graceful` for ordinary groups.
+
+        **0.13.0, the planned switchover (`graceful`).** For each group, in this order: the writes of the group stop on the old primary
+        (new connections go elsewhere, the other sessions are ended), the distributed transactions end, the old primary stops with a fast
+        shutdown and releases its lease, the standby that streams from it is proven to hold everything the old primary wrote, and only then
+        is it promoted. A standby that is behind, or a proof that cannot be made, rolls the group back (the old primary starts again, the
+        writes are let in again) and the task ends `failed` with the code `standby_behind` or `switchover_unproven`; a stop of the writes
+        that does not succeed in two minutes ends it with `cannot_quiesce`, and prepared transactions that do not end with
+        `prepared_transactions_pending`. The task can be cancelled until the promotion has begun (`Task.cancellable`). Refused with 409
+        `group_degraded` when no standby of a group streams from its primary (or the named target does not), and with 422
+        `unsupported_operation` for a request that includes the map group (name the other groups in `shardGroupIds`).
 
         **0.13.0, the map group.** The failover of the server that runs the primary of the map group (and the manager
         leader) is accepted by any server that does not hear it, in mode `hard` only (`dryRun` and `graceful` answer 422
@@ -4823,7 +4833,7 @@ components:
         `rebalance_not_running` (`stopRebalance`), `cluster_inconsistent` (`kingres.check_cluster()` reports something that
         makes moving buckets unsafe), `version_mismatch` (the servers do not run the same version of the sharding
         extension and the same PostgreSQL major), `failover_in_progress`, `no_receiving_server` (no server should hold
-        shards). `group_degraded` and `insufficient_disk` are reserved for later increments (a move that meets them is
+        shards). `insufficient_disk` is reserved for a later increment and `group_degraded` is used by `failoverServer` in mode `graceful` since 0.13.0 (a move that meets them is
         skipped and reported, not refused). `leader_unavailable` (503) names, in `serverIds`, servers that can be opened
         instead. Clients must tolerate codes they do not know.
 
