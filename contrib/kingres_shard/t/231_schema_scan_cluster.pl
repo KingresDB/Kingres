@@ -52,12 +52,6 @@ q1($n3, q{INSERT INTO ten3.c SELECT g, g * 10 FROM generate_series(1, 10) g});
 for my $n ($n1, $n3) { q1($n, q{INSERT INTO ten.a VALUES (1000, 'junk'); INSERT INTO ten.b VALUES (1000, 1000)}); }
 for my $n ($n1, $n2) { q1($n, q{INSERT INTO ten3.c VALUES (1000, 1000)}); }
 
-q1($n1, q{
-	CREATE TABLE public.h (id int PRIMARY KEY, v int);
-	SELECT kingres.create_distributed_table('public.h', 'id', bucket_count => 6);
-	INSERT INTO public.h SELECT g, g FROM generate_series(1, 20) g;
-});
-
 # registration, the node-local functions of increment 1 on the map primary, then the push
 my $g2 = q1($n1, q{SELECT group_id FROM kingres.node WHERE node_id = 2});
 my $g3 = q1($n1, q{SELECT group_id FROM kingres.node WHERE node_id = 3});
@@ -69,6 +63,20 @@ q1($n1, "SELECT kingres.internal_register_schema('ten3', $c2, $g3)");
 q1($n1, q{SELECT kingres.internal_register_schema_table('ten3.c')});
 q1($n1, 'SELECT kingres.sync_catalog()');
 isnt($g2, $g3, 'the two schemas have two owners');
+
+# no hash-distributed table exists yet: the schema tables alone make the planner look at the statement
+for my $n (@nodes)
+{
+	is(q1($n, q{SELECT count(*) FROM ten.a}), 50, $n->name . ': with no hash-distributed table in the cluster, a shell is read from the owner');
+	is(q1($n, q{SELECT count(*) FROM ten3.c}), 10, $n->name . ': ... and the other schema too');
+}
+
+q1($n1, q{
+	CREATE TABLE public.h (id int PRIMARY KEY, v int);
+	SELECT kingres.create_distributed_table('public.h', 'id', bucket_count => 6);
+	INSERT INTO public.h SELECT g, g FROM generate_series(1, 20) g;
+});
+
 
 # ---------------------------------------------------------------------------
 # A. reads
@@ -255,6 +263,34 @@ q1($n1, "SELECT kingres.internal_set_schema_group($c1, $g3, 'active')");
 }
 q1($n1, "SELECT kingres.internal_set_schema_group($c1, $g2, 'active')");
 is(q1($n1, q{SELECT count(*) FROM ten.a}), 50, 'with the map the same again, the answer is back');
+
+# ---------------------------------------------------------------------------
+# E2. a session that another node opened (6.8, item 2): the statement of a node whose map is not this one's.  The
+# session is made by hand with the token of the cluster secret, as t/019 does; on the owner the statement runs, on a node
+# that does not hold the table it is the retryable error and never an answer from the empty copy.
+# ---------------------------------------------------------------------------
+{
+	my $role = q1($n1, 'SELECT current_user');
+	my %id = (ss1 => 1, ss2 => 2, ss3 => 3);
+	for my $n (@nodes)
+	{
+		my $tok = q1($n, "SELECT kingres.internal_forward_token('$role', $id{$n->name})");
+		local $ENV{PGOPTIONS} = "-c kingres_shard.forwarded=on -c kingres_shard.forward_token=$tok";
+		my ($rc, $out, $err) = run_sql($n, qq{\\set VERBOSITY sqlstate\nSELECT count(*) FROM ten.a});
+		if ($n == $n2)
+		{
+			is($out, '50', 'a forwarded statement on the owner runs and answers from its table') or diag($err);
+		}
+		else
+		{
+			isnt($rc, 0, $n->name . ': a forwarded statement on a node that does not hold the table fails');
+			like($err, qr/KS001/, $n->name . ': ... with the retryable error of a stale map') or diag($err);
+			($rc, $out, $err) = run_sql($n, q{SELECT count(*) FROM ten.a});
+			like($err, qr/this node does not hold table "ten\.a" of a distributed schema/, $n->name . ': ... and the message says the node does not hold the table') or diag($err);
+			unlike($out, qr/^\d+$/, $n->name . ': ... and no count came back (the junk of the shell is not an answer)');
+		}
+	}
+}
 
 # ---------------------------------------------------------------------------
 # F. the same statements with the scan as the only path (the complete scan is the fallback)
