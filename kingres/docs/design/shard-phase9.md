@@ -1086,3 +1086,98 @@ node at the three points of the switch, and one that loses a row from the old co
 which the verification must report.
 
 **Not done.** Several tables at once online, and the control plane and console (9.6).
+
+### Increment 9.5, user-partitioned tables (2026-11-20)
+
+A table partitioned by the user (RANGE or LIST) can be distributed: every leaf is distributed in the colocation of the parent, the four partition functions and the statements keep the tree the same on every node, the bucket move copies the tree, and queries read the tree. Notes from the build follow.
+
+#### Answers to the two open questions (experiments on 18.7 and 19rc2, identical results)
+
+1. `ATTACH PARTITION` with a CHECK equal to the bound.
+   - A CHECK that is only the user's bound (`t >= .. AND t < ..`) does NOT make the attach skip the scan ("verifying table leaf"): the partition
+     constraint of a leaf also contains the constraints of its ancestors (the hash condition of the bucket partition).
+   - A CHECK that includes the hash condition (`satisfies_hash_partition('<root>'::regclass, m, r, key) AND <bound>`) IS recognised
+     ("partition constraint for table ... is implied by existing constraints"), no scan.
+   - Consequence for the design: the CHECK(satisfies_hash_partition ...) on the bucket partition (phase 4 puts it there) is inherited by a leaf made with
+     `LIKE <bucket partition> INCLUDING ALL`; adding only the bound as a second CHECK then makes the leaf attach without a scan (measured: leaf3 and p_b1
+     above). The bucket partition attached to the root with the hash CHECK on it is also implied (no scan).
+   - A DEFAULT partition under the bucket partition is ALWAYS scanned by an attach, whatever checks the new leaf has ("verifying table p_b0_def"), and it is
+     locked `ACCESS EXCLUSIVE` for the rest of the transaction. `ATTACH` locks the bucket partition `SHARE UPDATE EXCLUSIVE`; `CREATE TABLE ... PARTITION OF`
+     locks it AND the default partition `ACCESS EXCLUSIVE`. So the design's choice (create a leaf by `ATTACH`) holds, and the `default_partition` warning is
+     right: the cost is one scan of the default leaf per bucket and node, and the default leaf is blocked for the whole two-phase commit.
+2. `publish_via_partition_root = true` on a partitioned root.
+   - The initial copy reads the root (60 rows arrive, routed by the subscriber into its own leaves 36/24); update, delete and insert are applied through the root;
+     the root with a primary key and replica identity `d` (default) is enough; a row filter on the partitioned root in such a publication is accepted.
+   - The subscriber needs the partition tree (or at least a matching partitioned table) with the leaf that the row belongs to: a change for a bound
+     with no leaf on the subscriber fails in the apply worker and is retried, so the move's target must create every leaf before the subscription starts and
+     a leaf created on the source during a move is refused (the design already refuses DDL on a group that moves).
+   - Not yet checked: phase 4's marker table and its `pg_subscription_rel` checks against a partitioned root (the table in `pg_subscription_rel` is the root's
+     leaves or the root, depending on the version: to be read from bucket_move.c in step 5, with a test).
+
+#### Step 2: blocking create_distributed_table of a RANGE or LIST table
+
+- The report (`table_change_report`, kind distribute) replaces the blanket blocker with: `partitioned_table` (a partition on its own, HASH strategy, a
+  partitioned reference table), `subpartitioned`, `foreign_partition`, `partition_local_object` (index, constraint, default or storage parameter of the
+  partition that the table lacks), `tablespace`, `name_too_long`; warnings `default_partition` and `distribution_column_is_partition_key`; the online
+  variant refuses with `not_available_yet`.
+- `internal_partition_layout(relid)` returns the key text (`pg_get_partkeydef`) and one row per partition (bound without `FOR VALUES`, `DEFAULT` for the
+  default partition); `dist_table.c` makes every bucket partition `PARTITION BY <method> (<key>)` with one leaf per user partition, here and on every node
+  (`kingres_shard_append_partition_tree`), copies from the parent (tuple routing at the owner places each row), and `internal_set_partitioning` records
+  `partition_method`, `partition_key` and the `dist_partition` rows. The swap drops the source parent and with it its partitions.
+- New setting `kingres_shard.max_partition_leaves` (default 8192), checked in C once the bucket count is known.
+
+#### Step 3: the four partition functions and the statements (lessons)
+
+- Functions: `create_partition`, `drop_partition`, `detach_partition`, `attach_partition`, built on `internal_leaf_op` (node-local, per owned bucket),
+  `internal_leaf_everywhere` (per node, routing off, bound validated: no `;`, `--`, `/*`, must start with FROM, IN, WITH or be DEFAULT) and
+  `internal_partition_context` (superuser, map group, version, catalog lock, busy group check). Fault points `partition_after_lock` and
+  `partition_after_leaves`.
+- Decision: a leaf is made `LIKE <bucket partition> INCLUDING ALL` and attached; no equal CHECK is added, because the leaf is empty (the experiments say
+  a CHECK would only matter for a populated table, and then it must include the hash condition).
+- Decision: `attach_partition` takes a distributed table of the group only; the ordinary-table form of the design (copy through the router, consume the table)
+  is not built: the caller creates the partition and inserts the rows. `detach_partition` and `attach_partition` refuse tables with foreign keys.
+- The hook (`utility.c`, `map_partition_statement`): the raw tree of a partition bound holds expressions, not `PartitionRangeDatum`; `MINVALUE` and `MAXVALUE`
+  are column references (found by the first run, which crashed the backend on a cast: fixed). Constants, casts of constants and negative numbers are
+  written back; anything else is refused with the hint to call the function.
+- A user-partitioned table cannot be undistributed or altered yet (`not_available_yet` in the report).
+- Not done in step 3: the ordinary-table attach, `ALTER TABLE s`/`CREATE INDEX ON s` messages naming the parent (PostgreSQL's "does not exist" stands),
+  foreign keys on detach and attach.
+
+#### Step 4: partition_leaves and the check
+
+- `kingres.partition_leaves(parent, partition_name)` from the catalog (node, bucket, leaf); `check_cluster()` reports `dist_partition_mismatch` for a leaf that
+  the catalog lists and its owner node does not have (one query per node). t/192, 5 mutants killed.
+
+#### Step 5: the bucket move
+
+- The source's `internal_move_inspect` adds the tree (`internal_move_tree`: key, leaves with bound and access method); `internal_create_move_tables` makes the
+  target copy `PARTITION BY` the key, one leaf per user partition with `USING <access method>` (so a converted leaf keeps its format; phase 12's requirement),
+  owners of the leaves follow the table; the `ks_bucket_check` on the root is inherited by the leaves, so the attach at the switch scans nothing (the
+  experiments above); the publication uses `publish_via_partition_root = true` when a table of the group is partitioned; `internal_detach_bucket` (C) renames the
+  leaves and their indexes to names of the orphan and moves them to schema `kingres` so a bucket that returns finds the names free; `internal_drop_orphans`
+  and `internal_drop_move_tables` take partitioned tables; the view `kingres.buckets` sums the leaf sizes over `pg_partition_tree`.
+- Found by the first run of t/193: a writer on another node gets "the bucket map changed while the statement was running ... Repeat the statement" at
+  the switch (existing behaviour, retryable); the test's writer repeats. The orphan listing of `check_cluster()` (`orphan_table`) does not include a partitioned
+  orphan: the 0.6 function was not redefined for it; the cleanup drops it.
+- Mutants: v01-v11 (10 run, v03 not testable: the test build has only the heap access method); v02 (publication without the root) survived the first run
+  because the leaf names are the same on both sides: killed by a test that holds the move after the slot and reads `pubviaroot` and `pg_publication_tables`.
+- Old move tests (t/025-037, t/074, t/083) pass on both majors with the changes.
+
+#### Step 6: queries
+
+- No change to planner.c, fragment_scan.c, shippable.c or pushdown.c was needed: with a user-partitioned table the plain-table paths give single-node answers
+  from every node (t/194, 119 tests), closed aggregates are fragment scans, key plus interval prune to one bucket partition and one leaf (+ the default one).
+
+#### Files changed outside tests, for the 2b reviewers
+
+- src/utility.c (the hook mapping, a new static section before the hook function), src/dist_table.c / dist_table.h (`kingres_shard_append_partition_tree`, the layout in
+  the creation), src/kingres_shard.c / .h (one setting), src/bucket_move.c (leaves in `internal_detach_bucket`), the SQL delta. Not touched: planner.c,
+  fragment_scan.c, shippable.c, pushdown.c, rebuild.c, copy_routed.c.
+
+#### Not done in 9.5
+
+- `create_distributed_table_concurrently` of a partitioned table, undistribute and alter of a user-partitioned table (refused with `not_available_yet`).
+- Attaching an ordinary table to a distributed partitioned table by a function (the design's copy-and-consume form); foreign keys on detach and attach.
+- `ALTER TABLE s`/`CREATE INDEX ON s` of a logical partition name: PostgreSQL's "does not exist" stands.
+- `orphan_table` of check_cluster for a partitioned orphan; the access-method mutant (needs a second access method).
+- Not run: the whole TAP suite, t/046, the in-tree meson run; the cluster mutex was not taken.

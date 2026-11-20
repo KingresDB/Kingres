@@ -42,6 +42,10 @@ extern void kingres_shard_copy_table_rows(Oid relid, List *conns);
 extern void kingres_shard_run_spi(const char *sql, int nargs, Oid *argtypes, Datum *values);
 extern void kingres_shard_fetch_ddl(Oid relid, const char *column, bool shadow, DdlSet *ddl,
 									MemoryContext cxt);
+/* The same for a table the user partitioned: each bucket partition is itself PARTITION BY <partby> with one leaf per user partition. */
+extern void kingres_shard_append_partition_tree(StringInfo buf, const char *nsp, const char *prefix, const char *parent,
+								  const KsColocation *coloc, int group, const char *partby,
+								  List *leafnames, List *leafbounds);
 extern void kingres_shard_append_partitions(StringInfo buf, const char *nsp, const char *prefix,
 											const char *parent, const KsColocation *coloc, int group);
 extern List *kingres_shard_remote_primaries(MemoryContext callercxt);

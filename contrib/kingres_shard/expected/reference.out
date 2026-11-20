@@ -81,7 +81,7 @@ SELECT kingres.create_reference_table('r1');
 ERROR:  table "r1" is already distributed or a reference table
 CREATE TABLE p (a int) PARTITION BY HASH (a);
 SELECT kingres.create_reference_table('p');
-ERROR:  cannot make table "p" a reference table: partitioned tables and partitions are not supported yet
+ERROR:  cannot make table "p" a reference table: a partitioned table cannot be a reference table
 CREATE TEMP TABLE tmp1 (a int);
 SELECT kingres.create_reference_table('tmp1');
 ERROR:  cannot make table "tmp1" a reference table: temporary and unlogged tables are not supported

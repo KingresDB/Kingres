@@ -1626,6 +1626,67 @@ kingres_internal_detach_bucket(PG_FUNCTION_ARGS)
 	}
 
 	/*
+	 * A user-partitioned bucket partition: its leaves keep the names <partition>_bNNNN, which a bucket that
+	 * comes back to this node needs again, and so do the names of their indexes.  They get names of the
+	 * orphan and go to schema kingres with it; dropping the orphan drops them.
+	 */
+	{
+		Oid			argtypes[1] = {OIDOID};
+		Datum		values[1];
+		List	   *leaves = NIL;
+		int			li = 0;
+
+		values[0] = ObjectIdGetDatum(partoid);
+		if (SPI_execute_with_args("SELECT c.oid::pg_catalog.regclass::pg_catalog.text FROM pg_catalog.pg_inherits i "
+								  "JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) i.inhrelid "
+								  "WHERE i.inhparent OPERATOR(pg_catalog.=) $1 ORDER BY c.relname",
+								  1, argtypes, values, NULL, true, 0) != SPI_OK_SELECT)
+			elog(ERROR, "could not list the leaves of \"%s\"", part);
+		for (i = 0; i < SPI_processed; i++)
+			leaves = lappend(leaves, pstrdup(SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1)));
+		foreach(lc, leaves)
+		{
+			char	   *leaf = (char *) lfirst(lc);
+			char	   *lname = psprintf("%s_l%d", orphan, ++li);
+			List	   *lidx = NIL;
+			ListCell   *lc2;
+			int			k = 0;
+			Oid			leafoid;
+
+			resetStringInfo(&sql);
+			appendStringInfo(&sql, "SELECT %s::pg_catalog.regclass::pg_catalog.oid", quote_literal_cstr(leaf));
+			if (SPI_execute(sql.data, true, 1) != SPI_OK_SELECT || SPI_processed != 1)
+				elog(ERROR, "could not find the leaf \"%s\"", leaf);
+			{
+				bool		isnull;
+
+				leafoid = DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+			}
+			values[0] = ObjectIdGetDatum(leafoid);
+			if (SPI_execute_with_args("SELECT i.indexrelid::pg_catalog.regclass::pg_catalog.text FROM pg_catalog.pg_index i "
+									  "WHERE i.indrelid OPERATOR(pg_catalog.=) $1 ORDER BY i.indexrelid",
+									  1, argtypes, values, NULL, true, 0) != SPI_OK_SELECT)
+				elog(ERROR, "could not list the indexes of \"%s\"", leaf);
+			for (i = 0; i < SPI_processed; i++)
+				lidx = lappend(lidx, pstrdup(SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1)));
+			foreach(lc2, lidx)
+			{
+				resetStringInfo(&sql);
+				appendStringInfo(&sql, "ALTER INDEX %s RENAME TO %s", (char *) lfirst(lc2),
+								 quote_identifier(psprintf("%s_i%d", lname, ++k)));
+				spi_stmt(sql.data);
+			}
+			resetStringInfo(&sql);
+			appendStringInfo(&sql, "ALTER TABLE %s RENAME TO %s", leaf, quote_identifier(lname));
+			spi_stmt(sql.data);
+			resetStringInfo(&sql);
+			appendStringInfo(&sql, "ALTER TABLE %s.%s SET SCHEMA " KINGRES_SHARD_SCHEMA,
+							 quote_identifier(nsp), quote_identifier(lname));
+			spi_stmt(sql.data);
+		}
+	}
+
+	/*
 	 * Give the indexes (and with them the constraints they implement) names of
 	 * the orphan.  The orphan moves to schema kingres below, where relation
 	 * names are unique among tables and indexes: a bucket that leaves the same

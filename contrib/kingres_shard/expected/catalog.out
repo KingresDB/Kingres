@@ -220,6 +220,7 @@ SELECT name, setting, unit, context
  kingres_shard.forwarded                      | off     |      | backend
  kingres_shard.insert_batch_bytes             | 1048576 | B    | user
  kingres_shard.insert_batch_rows              | 1000    |      | user
+ kingres_shard.max_partition_leaves           | 8192    |      | user
  kingres_shard.move_catchup_threshold         | 1024    | kB   | user
  kingres_shard.move_cleanup_delay             | 600     | s    | user
  kingres_shard.move_switch_attempts           | 20      |      | user
@@ -237,7 +238,7 @@ SELECT name, setting, unit, context
  kingres_shard.scan_fetch_size                | 1000    |      | user
  kingres_shard.shippable_extensions           | all     |      | user
  kingres_shard.table_cleanup_delay            | 600     | s    | user
-(36 rows)
+(37 rows)
 
 SET kingres_shard.default_bucket_count = 0;
 ERROR:  0 is outside the valid range for parameter "kingres_shard.default_bucket_count" (1 .. 4096)

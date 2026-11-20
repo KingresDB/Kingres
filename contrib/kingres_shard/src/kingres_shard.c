@@ -93,6 +93,7 @@ int			kingres_shard_move_switch_timeout = 10000;	/* ms */
 int			kingres_shard_move_switch_attempts = 20;
 int			kingres_shard_move_cleanup_delay = 600;	/* s */
 int			kingres_shard_rebuild_batch_rows = 10000;
+int			kingres_shard_max_partition_leaves = 8192;
 int			kingres_shard_rebuild_drain_threshold = 1000;
 int			kingres_shard_rebuild_lock_timeout = 200;	/* ms */
 int			kingres_shard_rebuild_switch_timeout = 10000;	/* ms */
@@ -379,6 +380,14 @@ _PG_init(void)
 							NULL, NULL, NULL);
 
 	/* The rebuild engine of the table operations (design/shard-phase9.md, "Settings"). */
+	DefineCustomIntVariable("kingres_shard.max_partition_leaves",
+							"Most leaves (buckets times user partitions) that one distributed table may have.",
+							"A user-partitioned table is refused when its bucket count times its number of partitions is more than this.",
+							&kingres_shard_max_partition_leaves,
+							8192, 1, 1000000,
+							PGC_USERSET, 0,
+							NULL, NULL, NULL);
+
 	DefineCustomIntVariable("kingres_shard.rebuild_batch_rows",
 							"Rows per chunk of the copy and of the replay of an online table operation.",
 							"A chunk is one transaction on every group it writes (two-phase commit when it writes on two or more).",
