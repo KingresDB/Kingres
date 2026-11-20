@@ -2579,7 +2579,7 @@ The shape that fits these facts, for `graceful`, for a `hard` failover of a live
    `final`. The bootstrap does not insert a task for a `planned` journal (`RecordTask` returns the id of the task named in the journal), so there is one task, the operator's.
 4. **The proof.** The promotion of the candidate carries the shutdown checkpoint (F4-07): the bootstrap reads it from the old server with `demote fast` (the leader's engine
    made the stop, and the old server's kingresd is up), and `switchover_verify` runs on the candidate before `pg_promote`. A refusal is not a rollback here: the old primary is
-   stopped, so the bootstrap restarts it (`Resume` of the old server through the new... see open point 1) or pauses with `failoverNeedsDecision`.
+   stopped, so it has to be started again (open point 1) or the bootstrap pauses with `failoverNeedsDecision`.
 5. **Rollback before the stop** is the rollback of round 1 (the leader releases its leases, resumes, lets the writes in) plus `POST /failover/map/abandon`-like cleanup of the
    candidate's journal (`Journal.Abandon`, F4-06): the candidate gives up a `planned` journal when the old server is still running after the task ended or the task is gone.
 
