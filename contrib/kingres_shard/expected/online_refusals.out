@@ -51,14 +51,12 @@ no_key_for_online: cannot distribute table "nokey": the online variant needs a p
 HINT:  kingres.table_change_report() lists them with the warnings and notes.
 -- operations that this version does not have
 SELECT kingres.begin_table_operation('undistribute', 'haskey', '{}');
-ERROR:  table operation "undistribute" is not available in this version
-HINT:  This version has distribute and distribute_reference.
+ERROR:  table "haskey" is not a distributed or reference table
 SELECT kingres.begin_table_operation('alter', 'haskey', '{}');
-ERROR:  table operation "alter" is not available in this version
-HINT:  This version has distribute and distribute_reference.
+ERROR:  table "haskey" is not a distributed table
 SELECT kingres.begin_table_operation('nonsense', 'haskey', '{}');
 ERROR:  table operation "nonsense" is not available in this version
-HINT:  This version has distribute and distribute_reference.
+HINT:  This version has distribute, distribute_reference, undistribute and alter.
 -- an operation that does not exist, a phase that does not exist
 SELECT kingres.table_operation_advance(999, 'copying');
 ERROR:  table operation 999 does not exist

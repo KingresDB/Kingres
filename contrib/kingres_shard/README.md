@@ -21,9 +21,9 @@ increments 9.1 and 9.2) starts the table lifecycle: `create_distributed_table` a
 `create_reference_table` accept a table that already holds rows and carry its owner,
 privileges, comments, sequences and foreign keys; `kingres.table_change_report()` says what
 stands in the way of a change of a table before it is tried; and the catalog holds what the
-rest of the phase needs (see "The table lifecycle (version 0.7)"). The online variants,
-`undistribute_table`, `alter_distributed_table` and user partitions are the next increments
-and are not in this version.
+rest of the phase needs (see "The table lifecycle (version 0.7)"). Increment 9.4 adds the blocking
+`undistribute_table` and `alter_distributed_table`. The online variants of those two and user partitions are
+the next increments and are not in this version.
 
 ## How it works in one page
 
@@ -443,6 +443,9 @@ PROVE_TESTS=t/013_dist_scan.pl kingres/dev/ext.sh kingres_shard tap
   replay and the verification that says it was not done; the guard against `DROP TRIGGER`, `SET SCHEMA` and the like and the lock of a
   `GRANT`; a cancelled call whose session stays; a column privilege on the old copy, a repeated copy chunk, the row lock of the switch,
   the worker and a live or recent operation, the log name of the capture trigger, a lost answer of the switch),
+  `187_online_undistribute` and `188_online_alter` (increment 9.4, part two: the online variants for a distributed table, a writer on another node at every point), `185_undistribute` and `186_alter` (increment 9.4: a table with every kind of object undistributed and compared with its definition before,
+  a reference table, keys with and without cascade, another target group, the refusals, an error at every step, a writer that waits;
+  the catalog-only cases of alter, the rebuilds with their placement, cascade over a group, the refusals and the faults),
   `150_distribute_races` (the fix round of the review of 9.1 and 9.2: a writer that commits while the call waits for the lock, for an
   update, a delete, an insert, a reference table and the online engine, with the values compared; statements queued behind the call;
   rules, row types, `NOT VALID` checks, unowned sequences, collations, schema privileges, enum keys, function owners, invalid indexes, forced
@@ -517,6 +520,8 @@ schema through `"$user"`; qualify names or fix `search_path`.
 | `kingres.rotate_secret()` | Map group primary, superuser. Replaces the secret behind the tokens of node-to-node sessions on every active primary, atomically. Refuses while a distributed transaction of the cluster is prepared on any node (its tag would stop verifying). Sessions another node opens while the commit is in flight may be refused once; repeat the statement. A node that dies between the PREPARE and the COMMIT PREPARED of the rotation is reached by the node that finishes it with the secret that the rotation replaced (every node keeps it as "previous" and never accepts a session with it); recovery commits the rotation by itself and drops the previous secret in the first pass of a node's recovery (the worker, or `recover_prepared_transactions()`, on that node) that reaches every primary with the current secret and needs no session made with the previous one: the pass that commits a stranded node's rotation needs it and keeps it, the next pass drops it (S9-03, `t/076` asserts both). |
 | `kingres.create_distributed_table(relation regclass, dist_column name, colocate_with regclass default null, bucket_count int default null)` | Map group primary only; superuser. The table may hold rows. See "The table lifecycle (version 0.7)". |
 | `kingres.create_reference_table(relation regclass)` | Map group primary only; superuser. Makes an ordinary table a reference table: creates it on every node, copies its rows, and carries its owner, privileges, comments and its foreign keys to other reference tables. Writers are blocked while it copies. |
+| `kingres.undistribute_table(relation regclass, cascade_via_foreign_keys bool default false, target_group int default null) returns void` | Map group primary only; superuser. Turns a distributed or a reference table back into an ordinary table on the primary of `target_group` (default: the map group), with the tables that foreign keys link to it when `cascade_via_foreign_keys` is true. One transaction, writers wait; see "Undistribute and alter (increment 9.4)". |
+| `kingres.alter_distributed_table(relation regclass, distribution_column name default null, bucket_count int default null, colocate_with text default null, cascade_to_colocated bool default false) returns void` | Map group primary only; superuser. Changes the distribution column, the bucket count or the colocation group (`'default'`, `'none'` or the name of a distributed table) of a distributed table, and of the tables of its group with `cascade_to_colocated`. One transaction, writers wait; see "Undistribute and alter (increment 9.4)". |
 | `kingres.table_change_report(kind text, relation regclass, options jsonb default '{}') returns table (severity text, code text, object text, detail text)` | Superuser, any node that has the catalog. What prevents a change of a table (`blocker`), what the change would not carry (`warning`) and what is good to know (`note`), without changing anything; it never stops at the first problem. `kind` is `distribute`, `distribute_reference`, `undistribute`, `alter`, `create_partition`, `attach_partition`, `detach_partition` or `drop_partition`. The codes are listed under "The table lifecycle (version 0.7)". |
 | `kingres.recover_prepared_transactions() returns int` | Commits or rolls back the prepared transactions this node originated, on every active primary (itself included); returns how many it resolved. Superuser. Runs in a `READ COMMITTED` transaction; not on a standby. |
 | `kingres.bucket_for(relation regclass, value anyelement) returns int` | The bucket of a key of a distributed table. |
@@ -556,8 +561,8 @@ increments 9.1, 9.2 and 9.3 (what the catalog and the report are, the blocking
 `create_distributed_table` of a table with rows, and the rebuild engine with
 `create_distributed_table_concurrently` and `create_reference_table_concurrently`). The design
 calls its version "0.6"; the phase is 0.7 because phase 2b is 0.6 (a version with no object
-change). Not in this version: `undistribute_table`, `alter_distributed_table`, user partitions
-of distributed tables, the control plane and the console. `table_change_report` already
+change). Increment 9.4 adds `undistribute_table` and `alter_distributed_table` (blocking). Not in this version: their online
+variants, user partitions of distributed tables, the control plane and the console. `table_change_report` already
 reports for those kinds what it can know today (see the codes).
 
 ### What a creation with rows does
@@ -663,14 +668,86 @@ blocker). Severity `blocker`: the call is refused. `warning`: carried differentl
 | `group_busy` | distribute, undistribute, alter | the colocation group has an unfinished move or a table operation |
 | `role_missing`, `default_function_missing`, `node_unreachable` | distribute, distribute_reference | another node lacks a role of the table's owner or privileges, or a function of a column default; or it cannot be asked |
 | `not_carried` (warning), `rows` (note) | distribute, distribute_reference | what is not carried; the estimate of the rows that writers wait for |
-| `not_distributed`, `foreign_key_linked`, `target_group_invalid` | undistribute | for the next increments |
-| `not_distributed`, `bucket_count_invalid`, `colocate_with_not_distributed`, `foreign_key_colocation`, `unique_without_distribution_column`, `column_missing`, `no_hash_support` | alter | for the next increments |
+| `not_distributed`, `foreign_key_linked`, `target_group_invalid`, `group_busy`, `dependent_object` | undistribute | the table is not distributed or a reference table; a foreign key links it to another table of the catalog (undistribute them together with `cascade_via_foreign_keys`, or drop the key; a key from a distributed table to a reference table is kept); the target group has no active primary; a move or an operation uses the group; a view (or another object) uses a table that the call drops |
+| `not_distributed`, `bucket_count_invalid`, `colocate_with_not_distributed`, `foreign_key_colocation`, `unique_without_distribution_column`, `column_missing`, `no_hash_support`, `group_busy` | alter | the table is not distributed; the bucket count is out of range; the table to colocate with is not distributed; a key depends on the colocation of two tables (pass `cascade_to_colocated`); a unique index lacks the new distribution column; the column does not exist or cannot be hashed; a move or an operation uses the group |
 | `not_distributed`, `name_too_long`, `not_available_yet` | create_partition, attach_partition, detach_partition, drop_partition | user partitions are not in this version |
 
 `options` is what the call would be given: `column`, `colocate_with` (a table name, schema-qualified unless it is in `pg_catalog`
 or `kingres`: the report runs with a fixed `search_path`), `bucket_count`, `mode` for a distribution;
 `cascade_via_foreign_keys` and `target_group` for undistribute; `distribution_column`, `bucket_count`, `colocate_with` and
 `cascade_to_colocated` for alter; `partition` for the partition kinds.
+
+### Undistribute and alter (increment 9.4)
+
+`undistribute_table(relation, cascade_via_foreign_keys, target_group)` and `alter_distributed_table(relation, distribution_column,
+bucket_count, colocate_with, cascade_to_colocated)` are the blocking variants of design/shard-phase9.md, "Feature 2" and "Feature 3". Each
+is one transaction, the caller's, and the commit is the two-phase commit of phase 2a: an error, a cancel or a failure of a node at any
+step leaves every table as it was (fault points `undistribute_after_lock`, `_after_copy`, `_after_drop`, `_after_swap` and the same
+four for `alter_distributed_table`). The report (kinds `undistribute` and `alter`) runs first and one error lists every blocker.
+Writers of the tables wait from the first lock to the commit (`EXCLUSIVE` on the table on every node); readers go on until the old
+table is dropped, which is the last step before the commit. Both functions run on the map group primary and refuse elsewhere.
+
+**Undistribute.** A distributed table is copied through the distributed scan into an ordinary table on the primary of `target_group`
+(the map group when null; the data must fit there), the distributed table is dropped on every node, and the new table takes its name,
+constraints, indexes, identity and owned sequences (their state is raised to the largest value of the rows), owner, privileges and
+comments; the table leaves the catalog and a colocation group without a table is removed (its id is never used again). A reference
+table stays on the target node (the same table, so views, grants and keys that depend on it stay) and is dropped on the others;
+its copies are not compared, the copy of the target node is the one that stays. A foreign key from a distributed table to a reference
+table is kept and the reference table stays a reference table; a key that links two tables of the catalog needs
+`cascade_via_foreign_keys => true`, which takes every table of the connected component (distributed and reference) in one transaction and
+recreates the keys on the ordinary tables. A view or anything else that depends on a table stops the call (blocker `dependent_object`).
+
+**Alter.** `colocate_with => 'none'` (the table leaves its group for a group of its own with the same placement) and
+`colocate_with => <table>` or `'default'` when the other group has the same type, collation, bucket count and placement change the
+catalog only: no table is touched. Anything else is a rebuild: another bucket count, distribution column or placement. The new tables are
+made on every node in a new colocation group (or the group of `colocate_with`), with the partitions named as a new table would name them (the
+old partitions and their indexes are renamed out of the way and dropped with the old table); the rows are read through the distributed scan
+and sent to their new buckets; the old tables are dropped and the new ones take their names; a group left without a table is removed. When the
+new bucket count is a multiple of the old one, new bucket `b` is placed on the group of old bucket `b mod old count`. Without
+`cascade_to_colocated` only the table changes and it leaves its group (refused with `foreign_key_colocation` when a key depends on the
+colocation); with it every table of the group changes together (the distribution column must exist, with the same type, in every one).
+
+**Limits of this increment.** All rows of a rebuild pass through the session of the map group primary (a distributed scan there, the batch
+sender to the destinations): the cost is the size of the table, not what it moves between nodes. Writers wait for the whole copy; the online
+variants follow below. The state of the sequences of the nodes that lose the table is dropped with it; a serial or identity column of an undistributed table
+continues above its rows and above the state of the map group's sequence. `t/185` and `t/186`.
+
+### The online variants for a distributed table (increment 9.4, part two)
+
+`kingres.undistribute_table_concurrently(relation, cascade_via_foreign_keys, target_group)` and
+`kingres.alter_distributed_table_concurrently(relation, distribution_column, bucket_count, colocate_with, cascade_to_colocated)` run the
+engine of the online variants above with a distributed table as the source: writers on every node go on while the rows are copied.
+Map group primary only; superuser; the same refusals as for the blocking variants, with these additions: the table needs a primary key or a
+unique index over NOT NULL columns (the capture names a row by it); it must have no foreign key to or from another hash-distributed table
+(a key to a reference table is carried over; tables linked to each other, `cascade_via_foreign_keys` and `cascade_to_colocated => true` are the
+blocking variants' work: the error says so); a request that moves no rows (a change of the catalog only) is the blocking function's and the
+online call returns no operation. Without `cascade_to_colocated` the table leaves its group alone, as in the blocking variant.
+
+How it works. The operation has a row on the map group primary and a mirror row on every other node, so that the node-local functions of the
+engine run unchanged on each node with the local table. On every node holding partitions: a capture trigger (`ENABLE ALWAYS`) and a log with the
+exact key of every changed row; a copy of every partition into the destination (alter: shadow partitions `kingres_shadow_<oid>_bNNNN` of the new
+group, each bucket on the node where its rows already are when the bucket count is a multiple of the old one; undistribute: one shadow table on
+`target_node`); a replay per node that reads the current row for every logged key. The switch is one transaction: the catalog lock, the locks of the table
+on every node, a last replay on every node, the swap, and on every node the retirement of the old partitions (they are renamed, not dropped).
+A table that exists on one node only stays the same for a writer on that node. Undo (an error, a cancel, a kill of the call) and the verification
+(a digest of the new table against the old copies, with the rule on rows written after the swap) work per node.
+
+Bounded waits (the same settings as the single-node variants). The capture triggers are taken with `NOWAIT` in a loop for
+`kingres_shard.rebuild_switch_timeout / 4`, then queued for `kingres_shard.rebuild_lock_timeout`; the locks of a switch attempt are queued for
+at most `rebuild_lock_timeout` on each node and an attempt that fails is retried until `rebuild_switch_timeout`; every call to another node is
+bounded by `kingres_shard.node_timeout`. The untrusted-code rule applies before any copy: the call is refused with `function_owner_not_superuser`
+when a default, a check, an index expression, a trigger or a generated column of the table calls a function of a role who is not a superuser.
+The DDL guard of the single-node variants is on every node (a mirror row is what the guard reads): `ALTER TABLE`, `DROP TRIGGER`, `RENAME`,
+`CREATE INDEX` and `TRUNCATE` on the table are refused on every node while the operation runs.
+
+After the switch. For `undistribute` the table is an ordinary table on `target_node` and is gone from the others: a statement of a writer on another node that comes after the
+switch fails with `relation ... does not exist` and writes nothing; one that came before the switch is in the new table. The old copies stay on
+every node for `kingres_shard.table_cleanup_delay`; `kingres.cleanup_table_operations()` drops them on every node. An error after the switch
+(`rebuild_verify`, `rebuild_cleanup`) leaves the operation in `cleaning`; another call to `table_operation_advance` finishes it.
+Fault points: the ones of the single-node variants at every phase, and `rebuild_switch_after_local_swap`, `rebuild_switch_after_remote_swap`,
+`rebuild_switch_after_prepare` in the switch. Tests: `t/187_online_undistribute` and `t/188_online_alter` (a table of every kind of object
+while it is written from another node, a writer racing each of eleven points, an error at each point, refusals, the guard on every node,
+cancel, float keys written with `extra_float_digits = 0`).
 
 ### What 0.7 adds to the catalog
 
