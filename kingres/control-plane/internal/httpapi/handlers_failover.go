@@ -123,3 +123,59 @@ func (s *Server) getFailoverReport(_ *call, w http.ResponseWriter, r *http.Reque
 	s.writeJSON(w, r, http.StatusOK, rep)
 	return nil
 }
+
+// MapFailoverer is what the HTTP layer needs of the failover of the map group (cmd/kingresd, design ha-phase5-part2.md 3.4). The
+// leader runs every operation, but when the leader is the server whose map group is being failed over it is gone, so a server that
+// does not hear it answers these itself: the request for that server's failover, the status, and the task with id 0 that stands for
+// the bootstrap until the task is recorded.
+type MapFailoverer interface {
+	// Handles says that a request for the failover of server is the failover of the map group that cannot go through the leader.
+	Handles(ctx context.Context, server string) bool
+	Start(ctx context.Context, actor, server string, req failover.Request) (task.Task, error)
+	Active() bool
+	TaskZero() (task.Task, bool)
+	Status() (failover.Status, bool)
+}
+
+// mapFailoverIntercept answers the operations of the bootstrap of the map group on this server. It returns true when it answered.
+func (s *Server) mapFailoverIntercept(c *call, w http.ResponseWriter, r *http.Request) (bool, error) {
+	mf := s.deps.MapFailover
+	if mf == nil {
+		return false, nil
+	}
+	switch c.op.ID {
+	case "failoverServer":
+		server := r.PathValue("serverId")
+		if !mf.Handles(r.Context(), server) {
+			return false, nil
+		}
+		var req failover.Request
+		if err := s.body(w, r, &req); err != nil {
+			return true, err
+		}
+		if req.DryRun {
+			return true, problem.New(problem.UnsupportedOp, "The plan of the failover of the map group cannot be asked while the manager leader is gone.")
+		}
+		t, err := mf.Start(r.Context(), c.session.Username, server, req)
+		if err != nil {
+			return true, s.failoverProblem(r, err)
+		}
+		c.addDetails(map[string]any{"serverId": server, "mode": req.Mode, "allowDataLoss": req.AllowDataLoss, "comment": req.Comment, "mapGroup": true})
+		w.Header().Set("Location", "/api/v1/failover")
+		s.writeJSON(w, r, http.StatusAccepted, taskToAPI(t))
+		return true, nil
+	case "getFailoverStatus":
+		if st, ok := mf.Status(); ok {
+			s.writeJSON(w, r, http.StatusOK, st)
+			return true, nil
+		}
+	case "getTask":
+		if r.PathValue("taskId") == "0" {
+			if t, ok := mf.TaskZero(); ok {
+				s.writeJSON(w, r, http.StatusOK, taskToAPI(t))
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}

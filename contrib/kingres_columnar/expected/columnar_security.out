@@ -17,6 +17,7 @@ SELECT p.proname, pg_get_function_identity_arguments(p.oid) AS args, l.lanname A
  columnar_check           | fix boolean                                                                                                  | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | f
  columnar_check_clean     |                                                                                                              | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | f
  columnar_check_ddl       |                                                                                                              | plpgsql | t                | {"search_path=pg_catalog, kingres, pg_temp"} | f
+ columnar_check_indexes   | rel regclass                                                                                                 | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | f
  columnar_compact         | rel regclass, min_rows integer                                                                               | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | t
  columnar_creating_xid    | rel regclass                                                                                                 | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | t
  columnar_finish_rewrites |                                                                                                              | c       | t                | {"search_path=pg_catalog, kingres, pg_temp"} | f
@@ -31,7 +32,7 @@ SELECT p.proname, pg_get_function_identity_arguments(p.oid) AS args, l.lanname A
  columnar_stripes         | rel regclass                                                                                                 | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | t
  columnar_table_xid       | rel regclass                                                                                                 | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | t
  columnar_write_paths     | reset boolean                                                                                                | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | f
-(17 rows)
+(18 rows)
 
 -- every function that runs with the rights of its owner or without a pinned search_path is listed above;
 -- none may be missing the pin
@@ -54,7 +55,7 @@ SELECT classid::regclass AS catalog, count(*) AS objects
      catalog      | objects 
 ------------------+---------
  pg_type          |       2
- pg_proc          |      17
+ pg_proc          |      18
  pg_class         |       1
  pg_am            |       1
  pg_event_trigger |       2
@@ -309,13 +310,13 @@ CREATE TABLE evil_pk (id int PRIMARY KEY);
 CREATE TABLE evil_fk (id int REFERENCES evil_pk (id)) USING columnar;
 ERROR:  foreign keys on or to columnar tables are not supported
 HINT:  Keep the referencing and the referenced table in row storage.
-CONTEXT:  PL/pgSQL function columnar_check_ddl() line 48 at RAISE
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 52 at RAISE
 CREATE TABLE evil_t (id int) USING columnar;
 CREATE FUNCTION evil_trg() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;
 CREATE TRIGGER evil_after AFTER INSERT ON evil_t FOR EACH ROW EXECUTE FUNCTION evil_trg();
 ERROR:  row-level AFTER triggers on columnar tables are not supported
 HINT:  Use a BEFORE ROW or a statement-level trigger, or keep the table in row storage.
-CONTEXT:  PL/pgSQL function columnar_check_ddl() line 55 at RAISE
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 59 at RAISE
 CREATE TRIGGER evil_stmt AFTER INSERT ON evil_t FOR EACH STATEMENT EXECUTE FUNCTION evil_trg();
 INSERT INTO evil_t VALUES (1);
 SET search_path = public;

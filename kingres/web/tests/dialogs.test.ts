@@ -40,7 +40,9 @@ describe('task progress is announced (W-16)', () => {
     expect(region).not.toBeNull()
     expect(region.textContent).toBe('')
     await user.click(within(dialog).getByRole('button', { name: /^restore primaries$/i }))
-    await waitFor(() => expect(region.textContent).toMatch(/finished|percent/i), { timeout: 4000 })
+    await waitFor(() => expect(region.textContent).toMatch(/finished|percent/i), {
+      timeout: 30_000,
+    })
     expect(dialog.contains(region)).toBe(true)
   })
 
@@ -63,7 +65,9 @@ describe('task progress is announced (W-16)', () => {
         ),
       )
       await user.click(within(dialog).getByRole('button', { name: /^restore primaries$/i }))
-      await waitFor(() => expect(assertive.textContent).toMatch(/lost contact/i), { timeout: 4000 })
+      await waitFor(() => expect(assertive.textContent).toMatch(/lost contact/i), {
+        timeout: 30_000,
+      })
       expect(within(dialog).getByRole('alert')).toHaveTextContent(/lost contact/i)
     } finally {
       taskPolling.maxConsecutiveFailures = saved

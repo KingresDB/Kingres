@@ -32,7 +32,12 @@ const canDatabase = computed(() => session.can('getDatabase'))
 const linkable = (id: string): boolean => canServer.value && isAddressableSegment(id)
 
 /** Words for the qualifiers the contract names; any other one is shown as sent. */
-const ASPECT: Record<string, string> = { ca: 'Cluster certificate authority' }
+const ASPECT: Record<string, string> = {
+  ca: 'Cluster certificate authority',
+  // 0.12.0: the system database is older than what the ledger published (the alert kind is `ledgerSignerUnavailable`).
+  'published-state': 'The system database is older than what was published',
+}
+const isPublishedState = computed(() => subject.value.aspect === 'published-state')
 // 0.11.0: `target:<id>` is an anchor target of the ledger (the number only; anything else is shown as sent).
 const aspectText = computed(() => {
   const a = subject.value.aspect
@@ -42,36 +47,53 @@ const aspectText = computed(() => {
 })
 // 0.10.0: an alert about a failover links to where its progress and report are shown.
 const isFailoverAlert = computed(() =>
-  ['failoverNeedsDecision', 'failoverBlocked', 'failoverDataLoss'].includes(props.alert.kind),
+  [
+    'failoverNeedsDecision',
+    'failoverBlocked',
+    'failoverDataLoss',
+    'autoFailoverTriggered',
+  ].includes(props.alert.kind),
 )
+// 0.10.0: the alert that the limit of automatic failovers is reached links to the counter and its reset on Settings.
+const isLimitAlert = computed(() => props.alert.kind === 'autoFailoverLimitReached')
+const canSettings = computed(() => session.can('getClusterSettings'))
 const canFailover = computed(() => session.can('getFailoverStatus'))
 // 0.11.0: an alert about the ledger links to the tab of the Ledger page where it is explained and handled.
 const LEDGER_TAB: Record<string, string | undefined> = {
   ledgerSignerUnavailable: 'signing',
+  ledgerNotAnchored: 'anchoring',
+  ledgerAnchorBehind: 'anchoring',
+  ledgerAnchorFailed: 'anchoring',
+  ledgerAnchorConflict: 'anchoring',
   ledgerPublicationBehind: 'publication',
-  ledgerChainDiverged: 'publication',
+  ledgerChainDiverged: 'overview',
   ledgerGroupUnread: 'publication',
 }
 const isLedgerAlert = computed(() => props.alert.kind.startsWith('ledger'))
 const canLedger = computed(() => session.can('listLedgerStatus'))
 const ledgerLink = computed(() => {
   const db = subject.value.databaseName
-  const tab = LEDGER_TAB[props.alert.kind]
+  const tab = isPublishedState.value ? 'publication' : LEDGER_TAB[props.alert.kind]
   return {
     name: 'ledger',
     query: {
       ...(db !== null && isAddressableSegment(db) ? { db } : {}),
-      ...(tab ? { tab } : {}),
+      ...(tab && tab !== 'overview' ? { tab } : {}),
     },
   }
 })
 const ledgerLinkText = computed(() => {
+  if (isPublishedState.value) return 'What was published and how to go on'
+  if (props.alert.kind === 'ledgerChainDiverged')
+    return 'Acknowledge the divergence on the Overview tab'
   const tab = LEDGER_TAB[props.alert.kind]
   return tab === 'signing'
     ? 'Signing keys of the ledger'
-    : tab === 'publication'
-      ? 'Publication of the ledger'
-      : 'Ledger page'
+    : tab === 'anchoring'
+      ? 'Anchoring of the ledger'
+      : tab === 'publication'
+        ? 'Publication of the ledger'
+        : 'Ledger page'
 })
 const isPending = computed(() => props.alert.kind === 'replicationPending')
 // 0.8.0: a clock that differs is explained and handled on the Time tab of the Configuration page.
@@ -81,6 +103,7 @@ const canTime = computed(
 const any = computed(
   () =>
     (isFailoverAlert.value && canFailover.value) ||
+    (isLimitAlert.value && canSettings.value) ||
     (isLedgerAlert.value && canLedger.value) ||
     subject.value.serverId !== null ||
     subject.value.behindServerId !== null ||
@@ -132,6 +155,11 @@ const any = computed(
         >Failover progress and report</RouterLink
       >
     </li>
+    <li v-if="isLimitAlert && canSettings" data-testid="alert-auto-failover-settings">
+      <RouterLink :to="{ name: 'settings' }"
+        >Automatic failover settings and the counter</RouterLink
+      >
+    </li>
     <li v-if="isLedgerAlert && canLedger" data-testid="alert-ledger">
       <RouterLink :to="ledgerLink">{{ ledgerLinkText }}</RouterLink>
     </li>
@@ -139,6 +167,17 @@ const any = computed(
       <RouterLink :to="{ name: 'configuration', query: { tab: 'time' } }"
         >Clocks and what to do</RouterLink
       >
+    </li>
+    <li v-if="props.alert.kind === 'ledgerChainDiverged'" data-testid="alert-diverged">
+      A log that was closed and answers again, or a chain that no longer extends its log, is shown
+      here with the shard group, the height and why the log ended (the text of the alert). Read it,
+      find out what happened, then acknowledge it to start a new epoch: the old log stays as it
+      ended.
+    </li>
+    <li v-if="isPublishedState" data-testid="alert-published-state">
+      The system database has gone back to an older state than what the ledger published, for
+      example after a restore from a backup. Nothing is signed until this is resolved, so that no
+      checkpoint contradicts what auditors already hold.
     </li>
     <li v-if="subject.aspect" data-testid="alert-aspect">
       <template v-if="aspectText">{{ aspectText }}</template>

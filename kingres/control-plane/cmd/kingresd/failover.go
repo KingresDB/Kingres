@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,6 +22,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/audit"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/cluster"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fault"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fence"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ha"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/instance"
@@ -44,19 +46,39 @@ const (
 
 // failoverDeps is filled once the high-availability features exist (they are made after the
 // service that needs them).
-type failoverDeps struct{ d *haDeps }
+type failoverDeps struct {
+	d  *haDeps
+	mf *mapFailover
+}
 
 // newFailover builds the failover service of the manager leader: the ports of the task over
 // the peer client, the extension's functions and the records of the leader.
-func newFailover(svc *cluster.Service, o *ops.Ops, m *membership.Manager, stby *standbyParts, reg *ha.Registry, calls *callTable, self string,
-	log *slog.Logger, auditFn func(context.Context, audit.Event), fd *failoverDeps) *failover.Service {
+func newFailover(svc *cluster.Service, o *ops.Ops, m *membership.Manager, stby *standbyParts, reg *ha.Registry, calls *callTable, self string, fh *fault.Hook,
+	dataDir string, log *slog.Logger, auditFn func(context.Context, audit.Event), fd *failoverDeps) *failover.Service {
 	cat := &foCatalog{svc: svc, log: log}
 	pl := &foPlanner{svc: svc, self: self, reg: reg, stby: stby, cat: cat, log: log, audit: auditFn, calls: calls, client: m.Client}
 	peers := &foPeers{self: self, calls: calls, client: m.Client}
-	r := &failover.Runner{Peers: peers, Cat: cat, Plan: pl, Log: log,
+	r := &failover.Runner{Peers: peers, Cat: cat, Plan: pl, Log: log, Inject: fh.FailoverInjection,
 		NewRows: func(id int64) failover.Rows { return &failover.PGRows{Conns: svc, TaskID: id} }}
 	fs := &failover.Service{Runner: r, Conns: svc, Engine: o.Engine, Log: log, Audit: auditFn}
 	pl.svcRef = fs
+	if mf, err := newMapFailover(dataDir, svc, self, log, fd, peers, cat, pl, r, func(point string) error {
+		switch fh.FailoverInjection("map:" + point) {
+		case "exit":
+			log.Warn("the bootstrap of the map group ends kingresd at a crash point (injected by a test)", "point", point)
+			os.Exit(137)
+		case "hold":
+			log.Warn("the bootstrap of the map group holds at a point (injected by a test)", "point", point)
+			for fh.FailoverInjection("map:"+point) == "hold" {
+				time.Sleep(200 * time.Millisecond)
+			}
+		}
+		return nil
+	}); err != nil {
+		log.Error("the journal of the failover of the map group cannot be opened", "error", err)
+	} else {
+		fd.mf = mf
+	}
 	stby.leader.Busy = func(ctx context.Context) map[int32]bool { return pl.busyGroups(ctx) }
 	return fs
 }
@@ -198,12 +220,13 @@ func (p *foPeers) Promote(ctx context.Context, server string, r failover.Promote
 	return out, err
 }
 
-func (p *foPeers) RecoverPrepared(ctx context.Context, server string, group int32) error {
+func (p *foPeers) RecoverPrepared(ctx context.Context, server string, group int32, db string) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 	return p.do(ctx, server, "POST", "/failover/prepared", struct {
-		Group int32 `json:"group"`
-	}{group}, nil)
+		Group    int32  `json:"group"`
+		Database string `json:"database,omitempty"`
+	}{group, db}, nil)
 }
 
 func (p *foPeers) Repoint(ctx context.Context, server string, r failover.RepointRequest) (failover.RepointAnswer, error) {
@@ -370,8 +393,8 @@ func (c *foCatalog) PromoteNode(ctx context.Context, db string, id int32) (failo
 	return res, nil
 }
 
-func (c *foCatalog) RecoverPrepared(ctx context.Context) error {
-	conn, err := c.session(ctx, sysdb.Database)
+func (c *foCatalog) RecoverPrepared(ctx context.Context, db string) error {
+	conn, err := c.session(ctx, dbOrSystem(db))
 	if err != nil {
 		return err
 	}
@@ -383,8 +406,8 @@ func (c *foCatalog) RecoverPrepared(ctx context.Context) error {
 	return sqlErr(err)
 }
 
-func (c *foCatalog) CheckCluster(ctx context.Context) ([]failover.Incident, error) {
-	conn, err := c.session(ctx, sysdb.Database)
+func (c *foCatalog) CheckCluster(ctx context.Context, db string) ([]failover.Incident, error) {
+	conn, err := c.session(ctx, dbOrSystem(db))
 	if err != nil {
 		return nil, err
 	}
@@ -422,10 +445,19 @@ type foPlanner struct {
 	calls  *callTable
 	client *peerclient.Client
 	svcRef *failover.Service
+	// localSys, when set, is where the planner reads the system database: the local copy of a candidate for the map group, whose
+	// own system database is not writable (the bootstrap, design 3.4).
+	localSys func(ctx context.Context) (*pgx.Conn, error)
 }
 
 func (p *foPlanner) sys(ctx context.Context, f func(c *pgx.Conn) error) error {
-	c, err := p.svc.ServiceConn(ctx, sysdb.Database)
+	var c *pgx.Conn
+	var err error
+	if p.localSys != nil {
+		c, err = p.localSys(ctx)
+	} else {
+		c, err = p.svc.ServiceConn(ctx, sysdb.Database)
+	}
 	if err != nil {
 		return err
 	}
@@ -484,20 +516,20 @@ func (p *foPlanner) Facts(ctx context.Context, group int32) (failover.GroupFacts
 	var f failover.GroupFacts
 	err := p.sys(ctx, func(c *pgx.Conn) error {
 		var streaming, without bool
+		var planned int
 		var lsn *string
 		var seen time.Time
 		var primary string
-		err := c.QueryRow(ctx, `SELECT coalesce(sync_streaming, false), coalesce(without_sync, false), flush_lsn, seen_at, coalesce(primary_server, '') FROM kingres_cp.group_replication_state WHERE group_id = $1`, group).
-			Scan(&streaming, &without, &lsn, &seen, &primary)
+		err := c.QueryRow(ctx, `SELECT coalesce(sync_streaming, false), coalesce(without_sync, false), flush_lsn, seen_at, coalesce(primary_server, ''), planned_standbys FROM kingres_cp.group_replication_state WHERE group_id = $1`, group).
+			Scan(&streaming, &without, &lsn, &seen, &primary, &planned)
 		if err == nil {
 			f.SyncStreaming = streaming && !without
+			f.PrimaryPlanned = planned
 			// The age that counts is the age of the last check at the moment the primary was last heard, not now: a failover
 			// takes longer than the check's validity, and the check stops when the primary's server stops answering.
 			f.LastKnownAge = time.Since(seen)
-			if primary != "" && primary != p.self {
-				if silence, ok := p.reg.Liveness().Silence(primary); ok && silence > 0 && silence < f.LastKnownAge {
-					f.LastKnownAge -= silence
-				}
+			if primary != "" {
+				f.LastKnownAge = p.unobservedAge(ctx, primary, f.LastKnownAge)
 			}
 			if lsn != nil {
 				f.LastKnownLsn = *lsn
@@ -743,20 +775,20 @@ var _ = monitor.Condition{}
 // ---------------------------------------------------------------------------------
 // The callee side: what a server does on its own instances when the leader asks.
 
-func staleTerm(ctx context.Context, d *haDeps, expected int64) error {
+func staleTerm(ctx context.Context, d *haDeps, expected int64, strict bool) error {
 	if expected < 0 {
 		return nil // the caller does not know the term (a negative value says so); 0 is the term of a cluster that never failed over
 	}
 	c, err := d.Svc.SystemConn(ctx)
 	if err != nil {
 		d.Log.Warn("failover: the catalog term of this server cannot be read; the call is not judged by it", "error", err)
-		return nil
+		return unreadableTerm(strict)
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
 	var term int64
 	if err := c.QueryRow(ctx, `SELECT term FROM kingres.catalog_status`).Scan(&term); err != nil {
 		d.Log.Warn("failover: the catalog term of this server cannot be read; the call is not judged by it", "error", err)
-		return nil
+		return unreadableTerm(strict)
 	}
 	d.Log.Debug("failover: the catalog term of this server", "term", term, "expected", expected)
 	if term > expected {
@@ -774,17 +806,24 @@ func handleFailoverLease(ctx context.Context, d *haDeps, body []byte) (any, erro
 	if err := json.Unmarshal(body, &r); err != nil || r.Group < 0 {
 		return nil, badBody("a lease request")
 	}
+	if err := requireGroup(body, "a lease request"); err != nil {
+		return nil, err
+	}
 	if d.LeaseMgr == nil {
 		return nil, notStarted
 	}
 	if r.Role == failover.LeaseRelease {
-		d.LeaseMgr.Unadopt(r.Group)
+		// F3-01: the adoption of a promoted primary (attached) is not released by a failed task: the lease guards a
+		// running primary, and forgetting it would let the lease run out and the watchdog stop the only promoted copy.
+		if !d.LeaseMgr.Unadopt(r.Group) {
+			return failover.LeaseAnswer{Held: true}, nil
+		}
 		return failover.LeaseAnswer{}, nil
 	}
 	if r.Role != failover.LeaseFence && r.Role != failover.LeaseHolder {
 		return nil, badBody("a lease request with a known role")
 	}
-	if err := staleTerm(ctx, d, r.ExpectedTerm); err != nil {
+	if err := staleTerm(ctx, d, r.ExpectedTerm, false); err != nil {
 		return nil, err
 	}
 	if r.TransferTo != "" {
@@ -811,10 +850,13 @@ func handleFailoverDemote(ctx context.Context, d *haDeps, body []byte) (any, err
 	if err := json.Unmarshal(body, &r); err != nil || r.Group < 0 {
 		return nil, badBody("a demote request")
 	}
+	if err := requireGroup(body, "a demote request"); err != nil {
+		return nil, err
+	}
 	if d.LeaseMgr == nil {
 		return nil, notStarted
 	}
-	if err := staleTerm(ctx, d, r.ExpectedTerm); err != nil {
+	if err := staleTerm(ctx, d, r.ExpectedTerm, true); err != nil {
 		return nil, err
 	}
 	li, ok := d.Svc.PrimaryOf(r.Group)
@@ -848,6 +890,9 @@ func handleFailoverPromote(ctx context.Context, d *haDeps, body []byte) (any, er
 	if err := json.Unmarshal(body, &r); err != nil || r.Group < 0 {
 		return nil, badBody("a promote request")
 	}
+	if err := requireGroup(body, "a promote request"); err != nil {
+		return nil, err
+	}
 	if d.LeaseMgr == nil || d.Standby == nil {
 		return nil, notStarted
 	}
@@ -870,7 +915,7 @@ func handleFailoverPromote(ctx context.Context, d *haDeps, body []byte) (any, er
 	if li == nil {
 		return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "not_standby", Message: "This server runs no standby of the shard group."}
 	}
-	if err := staleTerm(ctx, d, r.ExpectedTerm); err != nil {
+	if err := staleTerm(ctx, d, r.ExpectedTerm, true); err != nil {
 		return nil, err
 	}
 	// An instance that was promoted by an earlier call and whose kingresd restarted since is held back or stopped by the
@@ -888,22 +933,23 @@ func handleFailoverPromote(ctx context.Context, d *haDeps, body []byte) (any, er
 	if err := c.QueryRow(ctx, `SELECT pg_is_in_recovery()`).Scan(&inRecovery); err != nil {
 		return nil, &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The instance cannot be asked."}
 	}
-	if !inRecovery {
+	action := promoteAction(inRecovery, li.Role)
+	if action == promoteRefuse {
+		return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "not_standby", Message: "The instance is not a standby and not a promoted one: its role file and its state do not fit."}
+	}
+	if action == promoteAlready {
 		// Promoted by an earlier call: make sure what follows a promotion is done, and answer already.
-		if !li.Role.Writable() {
-			return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "not_standby", Message: "The instance is out of recovery and its role file does not say primary."}
-		}
 		if err := d.Standby.agent.EmptySyncNames(ctx, li.ID); r.ReapplyList && err != nil {
 			return nil, err
 		}
 		if !d.Registry.Leases().Holds(r.Group) {
 			return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "lease_not_held", Message: "This server does not hold the lease of the shard group."}
 		}
-		_ = d.LeaseMgr.Attach(r.Group)
+		// F3-08: an instance that is writable and not guarded by the lease is not reported as promoted.
+		if err := attachPromotedInjected(d, r.Group); err != nil {
+			return nil, err
+		}
 		return promoteAnswer(ctx, c, "already", started), nil
-	}
-	if !li.Role.IsStandby() {
-		return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "not_standby", Message: "The instance is not a standby."}
 	}
 	// 1. The list of synchronous standbys is emptied first: a promoted standby inherits its primary's list and every
 	//    commit on it would wait for ever (extension precondition 3). Harmless while the instance is in recovery.
@@ -923,6 +969,11 @@ func handleFailoverPromote(ctx context.Context, d *haDeps, body []byte) (any, er
 	if err := d.Svc.Manager().WriteRole(li.ID, instance.Role{Group: r.Group, Role: instance.RolePrimary, Origin: instance.OriginCopy, Term: term}); err != nil {
 		return nil, err
 	}
+	// A test ends the call here (the role file is written, pg_promote was not called): the repeat must finish the promotion (F3-05).
+	if d.Fault.FailoverInjectionOnce("promote:afterRoleFile") == "fail" {
+		d.Log.Warn("failover: the promote call ends between the role file and pg_promote (injected by a test)", "group", r.Group)
+		return nil, &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The call ended between the role file and the promotion (injected by a test)."}
+	}
 	// 3. The lease, checked as the last thing before the promotion with nothing slow between the two.
 	if !d.Registry.Leases().Holds(r.Group) {
 		// Put the role back: this instance is still a standby and no primary of the group runs here.
@@ -935,8 +986,9 @@ func handleFailoverPromote(ctx context.Context, d *haDeps, body []byte) (any, er
 		return nil, &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The promotion did not finish within its bound; repeat the call."}
 	}
 	// 4. The lease guards the instance from now on, and the watchdog covers it.
-	if err := d.LeaseMgr.Attach(r.Group); err != nil {
+	if err := attachPromotedInjected(d, r.Group); err != nil {
 		d.Log.Warn("failover: attaching the lease to the promoted instance", "group", r.Group, "error", err)
+		return nil, err
 	}
 	return promoteAnswer(ctx, c, "promoted", started), nil
 }
@@ -949,16 +1001,20 @@ func promoteAnswer(ctx context.Context, c *pgx.Conn, status string, started time
 
 func handleFailoverPrepared(ctx context.Context, d *haDeps, body []byte) (any, error) {
 	var r struct {
-		Group int32 `json:"group"`
+		Group    int32  `json:"group"`
+		Database string `json:"database"`
 	}
 	if err := json.Unmarshal(body, &r); err != nil || r.Group < 0 {
 		return nil, badBody("a prepared request")
+	}
+	if err := requireGroup(body, "a prepared request"); err != nil {
+		return nil, err
 	}
 	li, ok := d.Svc.PrimaryOf(r.Group)
 	if !ok {
 		return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "not_primary", Message: "This server runs no primary of the shard group."}
 	}
-	c, err := d.Svc.InstanceConn(ctx, li.ID, sysdb.Database)
+	c, err := d.Svc.InstanceConn(ctx, li.ID, dbOrSystem(r.Database))
 	if err != nil {
 		return nil, &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The instance cannot be reached."}
 	}
@@ -981,6 +1037,8 @@ func registerFailoverCallee(d *haDeps) {
 	reg(callFailoverDemote, handleFailoverDemote)
 	reg(callFailoverPromote, handleFailoverPromote)
 	reg("POST /failover/prepared", handleFailoverPrepared)
+	reg(callMapStart, handleMapStart)
+	reg(callMapContinue, handleMapContinue)
 }
 
 var _ = url.Values{}
@@ -1036,4 +1094,126 @@ func catalogDatabases(ctx context.Context, svc *cluster.Service, withSystem bool
 		}
 	}
 	return out, nil
+}
+
+// unreadableTerm is the answer of a call whose callee cannot read its catalog term. A call that stops or promotes an
+// instance is refused then (F3-13): the leader repeats it, and a step that cannot get it done leaves the lease to fence.
+// The other calls are not judged by a term that cannot be read.
+func unreadableTerm(strict bool) error {
+	if !strict {
+		return nil
+	}
+	return &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The catalog term of this server cannot be read; repeat the call."}
+}
+
+// requireGroup refuses a body that does not name the group: a missing group reads as 0, the map group, and a
+// destructive call must never default to it (F3-13).
+func requireGroup(body []byte, what string) error {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return badBody(what)
+	}
+	if _, ok := m["group"]; !ok {
+		return &internalapi.CallError{Status: http.StatusBadRequest, Code: "bad_request", Message: "The body of " + what + " must name the group."}
+	}
+	return nil
+}
+
+// dbOrSystem is the database a prepared-transaction or check call acts in: the named one, the system database when none
+// is named (an older leader).
+func dbOrSystem(db string) string {
+	if db == "" {
+		return sysdb.Database
+	}
+	return db
+}
+
+// unobservedAge corrects the age of the last check of a group for a primary's server that this leader did not hear (F3-03,
+// failover.UnobservedAge): the silences are asked of the other members, because the silence of the leader alone says
+// nothing about the server.
+func (p *foPlanner) unobservedAge(ctx context.Context, primary string, plain time.Duration) time.Duration {
+	if primary == p.self {
+		return plain
+	}
+	members, err := p.Members(ctx)
+	if err != nil {
+		return plain
+	}
+	var silences []time.Duration
+	if s, ok := p.reg.Liveness().Silence(primary); ok {
+		silences = append(silences, s)
+	}
+	for _, m := range members {
+		if m == p.self || m == primary {
+			continue
+		}
+		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		var ans LivenessAnswer
+		err := p.client.Do(cctx, m, "GET", "/liveness", nil, &ans)
+		cancel()
+		if err != nil {
+			continue
+		}
+		for _, lp := range ans.Peers {
+			if lp.Server == primary && lp.SilenceMs != nil {
+				silences = append(silences, time.Duration(*lp.SilenceMs)*time.Millisecond)
+			}
+		}
+	}
+	peers := &foPeers{self: p.self, calls: p.calls, client: p.client}
+	ls, err := peers.LeaseSettings(ctx, p.self)
+	if err != nil {
+		return plain
+	}
+	return failover.UnobservedAge(plain, silences, len(members), time.Duration(ls.DurationMs)*time.Millisecond, time.Duration(ls.MarginMs)*time.Millisecond)
+}
+
+// What the promote call does for an instance, from its state and its role file.
+const (
+	promoteRefuse  = "refuse"  // not a standby and not a promoted instance
+	promoteAlready = "already" // out of recovery with the role file primary: an earlier call promoted it
+	promoteDo      = "promote" // a standby, or a promotion that an earlier call started and did not finish
+)
+
+// promoteAction is the rule of the promote call (F3-05). A role file that says primary on an instance that is still in
+// recovery is a promotion that an earlier call began (it wrote the role file, and ended before pg_promote answered): it is
+// finished, not refused, or no later call could ever promote that standby.
+func promoteAction(inRecovery bool, role instance.Role) string {
+	switch {
+	case !inRecovery && role.Writable():
+		return promoteAlready
+	case !inRecovery:
+		return promoteRefuse
+	case role.IsStandby() || role.Writable():
+		return promoteDo
+	}
+	return promoteRefuse
+}
+
+// attacher is what the promote call needs of the lease manager.
+type attacher interface{ Attach(group int32) error }
+
+// attachPromoted makes the lease guard the promoted instance (the watchdog covers it from then on). An instance that is
+// writable and not guarded is not reported as promoted (F3-08): the answer is lease_not_held, the step hands the lease over
+// again and repeats, and the repeat (the instance is out of recovery) attaches or fails.
+func attachPromoted(m attacher, group int32) error {
+	if err := m.Attach(group); err != nil {
+		return &internalapi.CallError{Status: http.StatusConflict, Code: "lease_not_held", Message: "The lease of the shard group could not be attached to the promoted instance: " + err.Error()}
+	}
+	return nil
+}
+
+// attachPromotedInjected is attachPromoted, with the failure that a test injects (a lease lost between the check and the attach, F3-08).
+func attachPromotedInjected(d *haDeps, group int32) error {
+	if d.Fault.FailoverInjectionOnce("promote:attach") == "fail" {
+		d.Log.Warn("failover: the attach of the lease fails (injected by a test)", "group", group)
+		return attachPromoted(failingAttacher{}, group)
+	}
+	return attachPromoted(d.LeaseMgr, group)
+}
+
+type failingAttacher struct{}
+
+func (failingAttacher) Attach(int32) error {
+	return errors.New("lease: the lease is not held (injected by a test)")
 }

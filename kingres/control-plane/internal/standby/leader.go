@@ -1214,10 +1214,10 @@ func (l *Leader) recordReplicationState(ctx context.Context, statuses map[string
 			}
 			for _, p := range ps {
 				streaming := len(p.Streaming) > 0 && p.SynchronousStandbyNames != "" && !p.Without
-				if _, err := c.Exec(ctx, `INSERT INTO kingres_cp.group_replication_state (group_id, primary_server, flush_lsn, sync_streaming, without_sync, seen_at)
-					VALUES ($1, $2, nullif($3, ''), $4, $5, now())
+				if _, err := c.Exec(ctx, `INSERT INTO kingres_cp.group_replication_state (group_id, primary_server, flush_lsn, sync_streaming, without_sync, planned_standbys, seen_at)
+					VALUES ($1, $2, nullif($3, ''), $4, $5, $6, now())
 					ON CONFLICT (group_id) DO UPDATE SET primary_server = $2, flush_lsn = coalesce(nullif($3, ''), kingres_cp.group_replication_state.flush_lsn),
-						sync_streaming = $4, without_sync = $5, seen_at = now()`, p.Group, server, p.FlushLsn, streaming, p.Without); err != nil {
+						sync_streaming = $4, without_sync = $5, planned_standbys = $6, seen_at = now()`, p.Group, server, p.FlushLsn, streaming, p.Without, p.Planned); err != nil {
 					return err
 				}
 			}

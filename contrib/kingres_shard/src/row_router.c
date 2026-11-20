@@ -313,6 +313,34 @@ conflict_clause(Query *parse, Index rti, List *dpcontext)
 	return buf.data;
 }
 
+/*
+ * The length coercion of an assignment (varchar(x, n, false), bpchar(x, n, false)) that the parser put into a VALUES
+ * list or a select list is an implicit cast, which the deparser does not print: the text of the source would then
+ * carry the value unchecked, and the cast that the router writes after it is an explicit one, which cuts a value
+ * that is too long instead of failing as a single node does (review P2C-01).  The coercion is made a visible call
+ * of its function, which the deparser writes as such.
+ */
+static Node *
+length_coercion_visible(Node *node, void *context)
+{
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, Query))
+		return (Node *) query_tree_mutator((Query *) node, length_coercion_visible, context, 0);
+	if (IsA(node, FuncExpr))
+	{
+		FuncExpr   *f = (FuncExpr *) expression_tree_mutator(node, length_coercion_visible, context);
+
+		if (f->funcformat == COERCE_IMPLICIT_CAST && list_length(f->args) == 3 &&
+			IsA(llast(f->args), Const) && ((Const *) llast(f->args))->consttype == BOOLOID &&
+			!((Const *) llast(f->args))->constisnull && !DatumGetBool(((Const *) llast(f->args))->constvalue) &&
+			IsA(lsecond(f->args), Const) && ((Const *) lsecond(f->args))->consttype == INT4OID)
+			f->funcformat = COERCE_EXPLICIT_CALL;
+		return (Node *) f;
+	}
+	return expression_tree_mutator(node, length_coercion_visible, context);
+}
+
 PlannedStmt *
 kingres_shard_plan_row_router(Query *parse, const KsDistTable *dt, List *relids)
 {
@@ -429,9 +457,15 @@ kingres_shard_plan_row_router(Query *parse, const KsDistTable *dt, List *relids)
 		expr = next_value_mutator(copyObject(expr), NULL);
 		if (att->attidentity == ATTRIBUTE_IDENTITY_ALWAYS)
 			overriding = true;
-		if (exprType(expr) != att->atttypid)
+		/*
+		 * The value reaches the router as the table will store it: the assignment cast of the column, with its
+		 * type modifier (a length or a scale: timestamp(0), numeric(8,2), char(5), varchar(8)), is applied in the
+		 * source select, so the hash of the key is taken on the stored value, and a value that does not fit
+		 * fails with the message of a single node (review P2C-01).
+		 */
+		if (exprType(expr) != att->atttypid || att->atttypmod != -1)
 		{
-			Node	   *coerced = coerce_to_target_type(NULL, expr, exprType(expr), att->atttypid, -1,
+			Node	   *coerced = coerce_to_target_type(NULL, expr, exprType(expr), att->atttypid, att->atttypmod,
 														COERCION_ASSIGNMENT, COERCE_IMPLICIT_CAST, -1);
 
 			if (coerced == NULL)
@@ -440,6 +474,16 @@ kingres_shard_plan_row_router(Query *parse, const KsDistTable *dt, List *relids)
 						 errmsg("column \"%s\" is of type %s but the INSERT gives it a value of type %s",
 								NameStr(att->attname), format_type_be(att->atttypid),
 								format_type_be(exprType(expr)))));
+			/*
+			 * The length coercion of an assignment (varchar(n), char(n): varchar(x, n, false)) errors on a value that
+			 * is too long; the same cast written as a cast in the text of the SELECT is an explicit one, which cuts
+			 * the value.  It is therefore kept as a call of the function, which the deparser writes as one.
+			 */
+			if (IsA(coerced, FuncExpr) && ((FuncExpr *) coerced)->funcformat == COERCE_IMPLICIT_CAST &&
+				list_length(((FuncExpr *) coerced)->args) == 3 &&
+				IsA(llast(((FuncExpr *) coerced)->args), Const) &&
+				!DatumGetBool(((Const *) llast(((FuncExpr *) coerced)->args))->constvalue))
+				((FuncExpr *) coerced)->funcformat = COERCE_EXPLICIT_CALL;
 			expr = coerced;
 		}
 
@@ -449,7 +493,7 @@ kingres_shard_plan_row_router(Query *parse, const KsDistTable *dt, List *relids)
 		 * that is planned again would give an integer where the column is a bigint, and the
 		 * router reads every value with the output function of the column's type.
 		 */
-		expr = (Node *) makeRelabelType((Expr *) expr, att->atttypid, -1,
+		expr = (Node *) makeRelabelType((Expr *) expr, att->atttypid, att->atttypmod,
 										OidIsValid(att->attcollation) ? exprCollation(expr) : InvalidOid,
 										COERCE_EXPLICIT_CAST);
 		c = palloc(sizeof(KsBatchColumn));
@@ -497,6 +541,7 @@ kingres_shard_plan_row_router(Query *parse, const KsDistTable *dt, List *relids)
 	}
 	if (parse->hasSubLinks)
 		w->hasSubLinks = true;
+	w = query_tree_mutator(w, length_coercion_visible, NULL, 0);
 
 	nest = kingres_shard_set_transmission_modes();
 	source_sql = pg_get_querydef(w, false);
@@ -701,6 +746,7 @@ rr_run(KsRouterState *s)
 	Datum	   *values = palloc(sizeof(Datum) * ncols);
 	bool	   *nulls = palloc(sizeof(bool) * ncols);
 	bool		checked = false;
+	Size		widest = 0;
 	TupleDesc	retdesc = NULL;
 
 	old = MemoryContextSwitchTo(estate->es_query_cxt);
@@ -737,14 +783,22 @@ rr_run(KsRouterState *s)
 	if (portal == NULL)
 		elog(ERROR, "could not open the cursor that reads the rows of an INSERT");
 
+	/*
+	 * The fetch is bounded in bytes as the batches are (review P2C-02): it starts with a few rows and then
+	 * follows the widest row seen so far, so that a batch of the cursor weighs about insert_batch_bytes plus
+	 * one row, down to one row at a time.
+	 */
 	for (;;)
 	{
 		SPITupleTable *tuptable;
 		uint64		nproc;
 		uint64		k;
+		long		fetch;
 
 		CHECK_FOR_INTERRUPTS();
-		SPI_cursor_fetch(portal, true, kingres_shard_insert_batch_rows);
+		fetch = (widest == 0) ? Min(kingres_shard_insert_batch_rows, 16) :
+			Max(1, Min((long) kingres_shard_insert_batch_rows, (long) kingres_shard_insert_batch_bytes / (long) widest));
+		SPI_cursor_fetch(portal, true, fetch);
 		tuptable = SPI_tuptable;
 		nproc = SPI_processed;
 		if (nproc == 0 || tuptable == NULL)
@@ -769,6 +823,8 @@ rr_run(KsRouterState *s)
 			HeapTuple	tup = tuptable->vals[k];
 			int			c;
 
+			if ((Size) tup->t_len > widest)
+				widest = tup->t_len;
 			for (c = 0; c < ncols; c++)
 				values[c] = heap_getattr(tup, c + 1, tuptable->tupdesc, &nulls[c]);
 			kingres_shard_batch_add(sender, values, nulls);

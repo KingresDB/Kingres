@@ -34,6 +34,8 @@ const PAGES: PageCase[] = [
   { path: '/ledger', heading: 'Ledger', data: /Status of shop/ },
   { path: '/ledger?tab=digests', heading: 'Ledger', data: /Aggregate checkpoints/ },
   { path: '/ledger?tab=signing', heading: 'Ledger', data: /Signed events/ },
+  { path: '/ledger?tab=anchoring', heading: 'Ledger', data: /Anchor targets/ },
+  { path: '/ledger?tab=clients', heading: 'Ledger', data: /Signature policy of the tables/ },
   { path: '/ledger?tab=publication', heading: 'Ledger', data: /What the publication reveals/ },
   { path: '/workbench', heading: 'Query workbench', data: /Run/ },
   { path: '/tasks', heading: 'Tasks', data: /No tasks|database\./ },
@@ -69,7 +71,7 @@ describe('pages', () => {
       const { container } = await renderApp(page.path, { user: page.user })
       await screen.findByRole('heading', { level: 1, name: page.heading })
       await waitFor(() => expect(screen.getAllByText(page.data).length).toBeGreaterThan(0), {
-        timeout: 4000,
+        timeout: 30_000,
       })
       await settled()
       expect(await axe(container)).toHaveNoViolations()

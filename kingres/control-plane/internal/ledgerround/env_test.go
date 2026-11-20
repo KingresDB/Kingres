@@ -19,6 +19,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgerlog"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgerpub"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgersign"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgerstate"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/scheduler"
 )
 
@@ -234,6 +235,11 @@ type env struct {
 	now    time.Time
 	mu     sync.Mutex
 	alerts []string
+	// exists answers DatabaseExists (nil: the collector is not given one)
+	exists func(db string) (bool, error)
+	// published and pull are the record of what was published and the call that asks the other holders for theirs (nil: none)
+	published PublishedState
+	pull      func(ctx context.Context) (ledgerstate.State, bool)
 }
 
 func newEnv(t *testing.T, chains ...*fakeChain) *env {
@@ -252,7 +258,13 @@ func (e *env) collector() *Collector {
 		Databases: func(context.Context) ([]Database, error) {
 			return []Database{{Name: "shop", DigestInterval: time.Hour}}, nil
 		},
-		TermWait: 30 * time.Millisecond,
+		TermWait: 30 * time.Millisecond, Published: e.published, PullState: e.pull,
+		DatabaseExists: func(_ context.Context, db string) (bool, error) {
+			if e.exists == nil {
+				return db == "shop", nil
+			}
+			return e.exists(db)
+		},
 		Alert: func(_ context.Context, kind, severity, subject, msg string, raise bool) {
 			e.mu.Lock()
 			defer e.mu.Unlock()

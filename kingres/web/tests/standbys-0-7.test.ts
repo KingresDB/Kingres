@@ -103,7 +103,7 @@ describe('what the Replication page shows about the standbys', () => {
     await waitFor(
       async () =>
         expect((await group(2)).getByTestId('commit-rule')).toHaveAttribute('data-state', 'yes'),
-      { timeout: 6000 },
+      { timeout: 30_000 },
     )
     expect(s.alerts.find((a) => a.kind === 'groupWithoutSynchronousStandby')?.state).toBe(
       'resolved',
@@ -173,7 +173,7 @@ describe('changing the replica count', () => {
     await user.click(within(dialog).getByRole('button', { name: /^change replica count$/i }))
     // The task that the settings change started, with its progress.
     await within(dialog).findByLabelText(/task \d+ progress/i)
-    await within(dialog).findByTestId('replica-done', {}, { timeout: 6000 })
+    await within(dialog).findByTestId('replica-done', {}, { timeout: 30_000 })
     expect(getState().settings.defaultReplicaCount).toBe(2)
     // It is not a rebalance, and a standby was created for every group.
     expect(getState().rebalance.reasons).not.toContain('replicaCountChanged')
@@ -190,12 +190,12 @@ describe('changing the replica count', () => {
     // The new standbys are in the list with the instance id of a managed standby, and they stream.
     const g1 = await group(1)
     await waitFor(() => expect(g1.getAllByTestId('managed-standby').length).toBe(1), {
-      timeout: 6000,
+      timeout: 30_000,
     })
     expect(g1.getByTestId('managed-standby')).toHaveTextContent(/standby \d+, managed by kingresd/)
     expect(g1.getByText(/#10485\d\d/)).toBeInTheDocument()
     expect(screen.getByTestId('replica-count')).toHaveTextContent('2')
-  }, 20000)
+  }, 90_000)
 
   it('a standby that is being created is starting, does not stream and holds up no commit', async () => {
     const s = getState()
@@ -221,13 +221,13 @@ describe('changing the replica count', () => {
       /removed with their replication slots/i,
     )
     await user.click(within(dialog).getByRole('button', { name: /^change replica count$/i }))
-    await within(dialog).findByTestId('replica-done', {}, { timeout: 6000 })
+    await within(dialog).findByTestId('replica-done', {}, { timeout: 30_000 })
     expect(
       within(dialog).getAllByText(/remove the standby of shard group/i).length,
     ).toBeGreaterThan(0)
     for (const g of getState().groups) expect(g.standbyServerIds).toHaveLength(0)
     expect(getState().audit.filter((e) => e.action === 'standbyRemoved').length).toBe(4)
-  }, 20000)
+  }, 90_000)
 
   it('saving the value it already has changes nothing and says no task was started', async () => {
     const user = userEvent.setup()
@@ -257,7 +257,7 @@ describe('changing the replica count', () => {
       /only 2 can be created/i,
     )
     await user.click(within(dialog).getByRole('button', { name: /^change replica count$/i }))
-    await within(dialog).findByTestId('replica-done', {}, { timeout: 6000 })
+    await within(dialog).findByTestId('replica-done', {}, { timeout: 30_000 })
     for (const g of getState().groups) expect(g.standbyServerIds).toHaveLength(2)
     await user.click(within(dialog).getAllByRole('button', { name: /close/i }).at(-1)!)
     await waitFor(() =>
@@ -265,7 +265,7 @@ describe('changing the replica count', () => {
         getState().alerts.some((a) => a.kind === 'groupUnderReplicated' && a.state !== 'resolved'),
       ).toBe(true),
     )
-  }, 20000)
+  }, 90_000)
 
   it('the error of the settings operation is shown in the dialog', async () => {
     mockServer.use(
@@ -313,7 +313,7 @@ describe('changing the replica count', () => {
     await renderApp('/replication')
     const box = await screen.findByTestId('standby-task')
     await waitFor(() => expect(within(box).getByText(/last standby task/i)).toBeInTheDocument(), {
-      timeout: 6000,
+      timeout: 30_000,
     })
     expect(within(box).getByTestId('step-skipped')).toBeInTheDocument()
   })

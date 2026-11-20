@@ -10,7 +10,7 @@ import { AGGREGATE_SIZE, anchoringOf, digestAnchorsOf, l7, publicationOf } from 
 import type { HttpHandler } from 'msw'
 import type { components } from '@/api/schema'
 import type { OperationId } from '@/api/operations.generated'
-import type { Alert, Database, Role, Table, Task } from '@/api/types'
+import type { Alert, Database, Problem, Role, Table, Task } from '@/api/types'
 import {
   accepted,
   created,
@@ -60,6 +60,7 @@ import {
   failoverPlan,
   failoverStatusView,
   resumeFailover,
+  resetAutoFailoverCounter,
   restorePlan,
   startFailoverRun,
 } from './failover'
@@ -392,6 +393,17 @@ function isOpenServerTask(
 function markRebalance(s: MockState, reason: S['RebalanceReason']): void {
   s.rebalance.needed = true
   if (!s.rebalance.reasons.includes(reason)) s.rebalance.reasons.push(reason)
+}
+
+/** 0.12.0: the refusal of a request that needs a decision carries the plan (`?failover=noplan`: a server that does not yet). */
+function decisionExtra(plan: S['FailoverPlan']): Partial<Problem> {
+  return mockConfig.failoverNoPlan ? {} : { plan }
+}
+
+/** 0.12.0: a database is not created, dropped or distributed while a failover or a restore runs (409 `failover_in_progress`). */
+function refuseDuringFailover(s: MockState): void {
+  if (failoverRunning(s))
+    throw problem('failover_in_progress', 'A failover is running (server.failover).')
 }
 
 function requireNoRebalance(s: MockState): void {
@@ -1813,6 +1825,7 @@ export function createHandlers(): HttpHandler[] {
           throw problem(
             'failover_needs_decision',
             'The failover waits for a decision: commits that only the old primary holds can be lost.',
+            decisionExtra(plan),
           )
         return accepted(resumeFailover(s, waiting))
       }
@@ -1826,7 +1839,7 @@ export function createHandlers(): HttpHandler[] {
       if (stuck) throw problem('no_replica_available', stuck.message)
       const decision = plan.blockers.find((x) => x.code === 'failoverNeedsDecision')
       if (decision && req.allowDataLoss !== true)
-        throw problem('failover_needs_decision', decision.message)
+        throw problem('failover_needs_decision', decision.message, decisionExtra(plan))
       return accepted(startFailoverRun(s, { serverId: rec.id, mode, req, plan, trigger: 'manual' }))
     },
     listServerGroups: (c) =>
@@ -1863,6 +1876,7 @@ export function createHandlers(): HttpHandler[] {
     listDatabases: (c) => ok({ items: c.s.databases.map((d) => databaseView(c.s, d.info.name)) }),
     getDatabase: (c) => ok(databaseView(c.s, c.params.databaseName ?? '')),
     createDatabase: (c) => {
+      refuseDuringFailover(c.s)
       const s = c.s
       const b = body<S['DatabaseCreateRequest']>(c)
       validateDatabase(s, b)
@@ -1959,6 +1973,7 @@ export function createHandlers(): HttpHandler[] {
       )
     },
     dropDatabase: (c) => {
+      refuseDuringFailover(c.s)
       const s = c.s
       const name = c.params.databaseName ?? ''
       const rec = db(s, name)
@@ -2004,6 +2019,7 @@ export function createHandlers(): HttpHandler[] {
       } satisfies S['TableDetail'])
     },
     distributeTable: (c) => {
+      refuseDuringFailover(c.s)
       const s = c.s
       const rec = db(s, c.params.databaseName ?? '')
       const t = rec.tables.find(
@@ -2178,9 +2194,13 @@ export function createHandlers(): HttpHandler[] {
       const s = c.s
       const req = body<S['RestorePreferredPrimariesRequest']>(c)
       requireNoRebalance(s)
-      if (req.dryRun === true) return ok(restorePlan(s, req.shardGroupIds))
+      const planned = restorePlan(s, req.shardGroupIds)
+      if (req.dryRun === true) return ok(planned)
       if (activeTask(s, 'replication.restorePreferredPrimaries'))
         throw problem('operation_in_progress')
+      if (failoverRunning(s)) throw problem('failover_in_progress')
+      const stuck = planned.blockers[0]
+      if (stuck) throw problem(stuck.code as Parameters<typeof problem>[0], stuck.message)
       return accepted(
         createTask(s, {
           kind: 'replication.restorePreferredPrimaries',
@@ -2193,7 +2213,7 @@ export function createHandlers(): HttpHandler[] {
               g.primaryServerId = g.preferredPrimaryServerId
             }
             fixReplicas(s)
-            s.settings.autoFailover = { ...s.settings.autoFailover, eventsSinceReset: 0 }
+            resetAutoFailoverCounter(s)
           },
         }),
       )
@@ -2288,7 +2308,7 @@ export function createHandlers(): HttpHandler[] {
           s.rebalance.state = failing ? 'failed' : 'idle'
           s.rebalance.needed = failing
           if (!failing) s.rebalance.reasons = []
-          s.settings.autoFailover = { ...s.settings.autoFailover, eventsSinceReset: 0 }
+          resetAutoFailoverCounter(s)
           pushReport(s, {
             id: s.rebalance.taskId as number,
             outcome: failing ? 'failed' : 'completed',
@@ -2349,7 +2369,7 @@ export function createHandlers(): HttpHandler[] {
       return ok(r)
     },
     resetAutoFailoverCounter: (c) => {
-      c.s.settings.autoFailover = { ...c.s.settings.autoFailover, eventsSinceReset: 0 }
+      resetAutoFailoverCounter(c.s)
       return ok(c.s.settings)
     },
 

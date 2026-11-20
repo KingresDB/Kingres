@@ -220,6 +220,8 @@ func newRig(t *testing.T, members []string, enforced bool) *rig {
 		t.Fatal(err)
 	}
 	r.m = m
+	// A round ends when a majority answered; its last request may still be writing into the grantor's directory.
+	t.Cleanup(m.fl.waitAll)
 	return r
 }
 

@@ -427,4 +427,63 @@ function seedHostileLedger(s: MockState): void {
   l.signing.signerAlarm = HOSTILE.newline
   l.signing.events.push({ seq: l.signing.events.length, type: HOSTILE.markup, time: nowIso() })
   l.signing.events.push({ seq: l.signing.events.length, type: HOSTILE.reversed, time: nowIso() })
+  // Anchoring (console part B): targets that are turned off (so the state of the ledger stays what it was) with names, a
+  // configuration and a test result written by someone hostile, and records of a deleted target with a hostile name and error.
+  for (const [i, name] of [HOSTILE.markup, HOSTILE.reversed, HOSTILE.long.slice(0, 63)].entries()) {
+    l.targets.push({
+      id: l.nextTargetId++,
+      kind: (['worm', 'tsa', 'ots'] as const)[i] ?? 'worm',
+      name,
+      enabled: false,
+      config:
+        i === 0
+          ? {
+              endpoint: HOSTILE.breakout,
+              bucket: HOSTILE.markup,
+              region: 'x',
+              mode: HOSTILE.reversed,
+            }
+          : i === 1
+            ? { url: HOSTILE.breakout, caBundlePath: HOSTILE.markup }
+            : { calendars: [HOSTILE.markup, HOSTILE.reversed] },
+      credentialsSet: true,
+      lastTest: {
+        ok: false,
+        testedAt: nowIso(),
+        checks: [
+          { name: HOSTILE.reversed, status: 'failed', detail: HOSTILE.newline },
+          { name: HOSTILE.markup, status: 'warning', detail: HOSTILE.long },
+        ],
+      },
+      newestAnchoredAt: null,
+      state: 'none',
+    })
+  }
+  // Client keys (console part C): a label, a role, a registrar and a reason written by someone hostile.
+  l.clientKeys.shop = [HOSTILE.markup, HOSTILE.reversed, HOSTILE.long.slice(0, 100)].map(
+    (label, i) => ({
+      keyId: `0000000${i}`,
+      publicKey: btoa(String.fromCharCode(...new Uint8Array(32).fill(65 + i))),
+      roleName: i === 0 ? HOSTILE.zeroWidth : null,
+      label,
+      registeredBy: HOSTILE.reversed,
+      registeredAt: nowIso(),
+      revokedAt: i === 2 ? nowIso() : null,
+      revocationReason: i === 2 ? HOSTILE.newline : null,
+    }),
+  )
+  l.anchors.push({
+    databaseName: 'shop',
+    id: l.nextAnchorId++,
+    targetId: null,
+    targetName: HOSTILE.reversed,
+    kind: 'worm',
+    aggregateSize: 6,
+    state: 'failed',
+    attempts: 3,
+    nextAttemptAt: null,
+    anchoredAt: null,
+    evidenceTime: null,
+    lastError: HOSTILE.newline + HOSTILE.long,
+  })
 }

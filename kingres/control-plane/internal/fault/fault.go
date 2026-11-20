@@ -23,6 +23,7 @@ package fault
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -55,6 +56,14 @@ type Spec struct {
 	// to end the leader at a step boundary. TaskExitStep -1 means any step.
 	TaskExitPoint string `json:"taskExitPoint,omitempty"`
 	TaskExitStep  int    `json:"taskExitStep,omitempty"`
+	// FailoverPoint, with FailoverMode "fail" or "pause", makes the failover task fail (a code that is not retried) or pause
+	// when it reaches "<step name>:before" (for example "Group 1: Make the catalog follow:before"): the tests of the failures
+	// after the point of no return use it. Only tests write such a file.
+	FailoverPoint string `json:"failoverPoint,omitempty"`
+	FailoverMode  string `json:"failoverMode,omitempty"`
+	// FailoverTimes limits how many times FailoverInjectionOnce fires for the point (the calls of the callee side, which a repeat
+	// must meet healed); 0 means once.
+	FailoverTimes int `json:"failoverTimes,omitempty"`
 	// FailRewind makes the rebuild of an old primary treat pg_rewind as failed, so that the fallback (a new base backup)
 	// is taken (the test of the old primary that comes back).
 	FailRewind bool `json:"failRewind,omitempty"`
@@ -77,6 +86,9 @@ type Hook struct {
 	ledgerFor  string
 	ledgerSkip int
 	ledgerSeen int
+	// onceKey and onceFired count the firings of FailoverInjectionOnce for the fault that is in force.
+	onceKey   string
+	onceFired int
 }
 
 // New returns a hook that polls dir, or nil when dir is empty.
@@ -199,4 +211,43 @@ func (h *Hook) LedgerWrite(kind string) {
 	if hit {
 		os.Exit(137)
 	}
+}
+
+// FailoverInjection is the mode ("fail", "pause" or "") that the fault file asks for at this point of the failover task.
+func (h *Hook) FailoverInjection(point string) string {
+	if h == nil {
+		return ""
+	}
+	sp := h.load()
+	if sp.FailoverPoint == "" || sp.FailoverPoint != point {
+		return ""
+	}
+	return sp.FailoverMode
+}
+
+// FailoverInjectionOnce is FailoverInjection for the callee side of the failover: it fires at most FailoverTimes times (once when
+// the field is 0) for the fault that is in force, so that the repeat of the call meets the state a real interruption leaves.
+func (h *Hook) FailoverInjectionOnce(point string) string {
+	if h == nil {
+		return ""
+	}
+	sp := h.load()
+	if sp.FailoverPoint == "" || sp.FailoverPoint != point {
+		return ""
+	}
+	key := sp.FailoverPoint + "|" + sp.FailoverMode + "|" + fmt.Sprint(sp.FailoverTimes)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.onceKey != key {
+		h.onceKey, h.onceFired = key, 0
+	}
+	limit := sp.FailoverTimes
+	if limit <= 0 {
+		limit = 1
+	}
+	if h.onceFired >= limit {
+		return ""
+	}
+	h.onceFired++
+	return sp.FailoverMode
 }

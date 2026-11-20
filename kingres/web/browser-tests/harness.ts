@@ -213,6 +213,8 @@ export const ROUTES = [
   '/security',
   '/ledger',
   '/ledger?tab=digests',
+  '/ledger?tab=anchoring',
+  '/ledger?tab=clients',
   '/ledger?tab=signing',
   '/ledger?tab=publication',
   '/workbench',
@@ -288,6 +290,100 @@ const setMock = (page: Page, settings: Record<string, unknown>) =>
     Object.assign(mock.config, values)
   }, settings)
 
+/** Applies a value of `?anchors=` while the page is open (src/mocks/browser.ts), and makes the pages read again. */
+const anchorsSwitch = async (page: Page, value: string) => {
+  await page.evaluate((v) => {
+    ;(
+      window as unknown as { __kingresMock: { anchorsSwitch: (text: string) => void } }
+    ).__kingresMock.anchorsSwitch(v)
+    void (
+      window as unknown as { __queryClient: { invalidateQueries: () => unknown } }
+    ).__queryClient.invalidateQueries()
+  }, value)
+  await sleep(300)
+}
+
+/** Applies a value of a URL switch of the mock while the page is open, and makes the pages read again. */
+const urlSwitch = async (page: Page, name: string, value: string) => {
+  await page.evaluate(
+    (n, v) => {
+      ;(
+        window as unknown as { __kingresMock: { urlSwitch: (n: string, t: string) => void } }
+      ).__kingresMock.urlSwitch(n, v)
+      void (
+        window as unknown as { __queryClient: { invalidateQueries: () => unknown } }
+      ).__queryClient.invalidateQueries()
+    },
+    name,
+    value,
+  )
+  await sleep(300)
+}
+
+/** Opens the Client keys tab with three keys (once). */
+async function clientKeys(page: Page): Promise<void> {
+  await urlSwitch(page, 'clientkeys', 'keys')
+  await page.waitForSelector('[data-testid="client-keys"] tbody tr', { timeout: 30_000 })
+  await page.waitForSelector('[data-testid="client-tables"] tbody tr', { timeout: 30_000 })
+  await sleep(250)
+}
+
+/** Clicks the button with this accessible name (an `aria-label`) or visible text. */
+async function clickLabeled(page: Page, label: string): Promise<void> {
+  const ok = await page.evaluate((l) => {
+    const b = [...document.querySelectorAll<HTMLElement>('button')].find(
+      (e) => (e.getAttribute('aria-label') ?? e.textContent?.trim()) === l,
+    )
+    b?.click()
+    return !!b
+  }, label)
+  if (!ok) throw new Error(`No button named ${JSON.stringify(label)}`)
+  await sleep(200)
+}
+
+/** Opens the Anchoring tab with the three kinds of target and a record in every state. */
+async function anchoringAll(page: Page): Promise<void> {
+  await anchorsSwitch(page, 'all')
+  await page.waitForSelector('[data-testid="anchor-records"] tbody tr', { timeout: 30_000 })
+  await sleep(250)
+}
+
+/** Applies a value of `?failover=` while the page is open (src/mocks/browser.ts). */
+const mockSwitch = async (page: Page, value: string) => {
+  await page.evaluate((v) => {
+    ;(
+      window as unknown as { __kingresMock: { failoverSwitch: (text: string) => void } }
+    ).__kingresMock.failoverSwitch(v)
+    // The pages keep what they read for a few seconds: ask again.
+    void (
+      window as unknown as { __queryClient: { invalidateQueries: () => unknown } }
+    ).__queryClient.invalidateQueries()
+  }, value)
+  await sleep(300)
+}
+
+/** Puts two groups on the standby of their home server, as after a failover, and makes the pages read again. */
+async function awayGroups(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const mock = (
+      window as unknown as {
+        __kingresMock: {
+          state: () => {
+            groups: { id: number; primaryServerId: string; standbyServerIds: string[] }[]
+          }
+        }
+      }
+    ).__kingresMock
+    for (const g of mock.state().groups)
+      if ((g.id === 1 || g.id === 2) && g.standbyServerIds[0])
+        g.primaryServerId = g.standbyServerIds[0]
+    void (
+      window as unknown as { __queryClient: { invalidateQueries: () => unknown } }
+    ).__queryClient.invalidateQueries()
+  })
+  await sleep(500)
+}
+
 /** Opens the failover dialog of a server on the Servers page. */
 async function openFailoverDialog(page: Page, server: string): Promise<void> {
   const ok = await page.evaluate((id) => {
@@ -356,6 +452,9 @@ const freshFailover = async (page: Page): Promise<void> => {
   await setMock(page, {
     failoverDataLoss: false,
     failoverNeedsDecision: false,
+    failoverWarnings: false,
+    failoverGraceful: false,
+    failoverNoPlan: false,
     failoverOld: null,
     failoverFailStep: null,
     failoverBlock: null,
@@ -782,6 +881,328 @@ export const STATES: PageState[] = [
       await page.click('[role="dialog"] [data-dialog-close]')
       await sleep(150)
       await leaveFailover(page)
+    },
+  },
+  {
+    // 0.10.0, console part 2: the counter of automatic failovers at its limit, and the reset with its confirmation.
+    name: 'settings: automatic failover at its limit (0.10.0)',
+    needsMock: true,
+    route: '/settings',
+    open: async (page) => {
+      await freshFailover(page)
+      await mockSwitch(page, 'limit')
+      await go(page, '/dashboard')
+      await go(page, '/settings')
+      await page.waitForSelector('[data-testid="af-limit"]', { timeout: 20_000 })
+      await sleep(250)
+    },
+    close: freshFailover,
+  },
+  {
+    name: 'settings: reset the counter dialog (0.10.0)',
+    needsMock: true,
+    route: '/settings',
+    open: async (page) => {
+      await freshFailover(page)
+      await mockSwitch(page, 'limit')
+      await go(page, '/dashboard')
+      await go(page, '/settings')
+      await page.waitForSelector('[data-testid="af-limit"]', { timeout: 20_000 })
+      await clickText(page, 'Reset counter')
+      await dialogOpen(page)
+    },
+    close: async (page) => {
+      await cancel(page)
+      await freshFailover(page)
+    },
+  },
+  {
+    name: 'banner: a failover that goes on (0.10.0)',
+    needsMock: true,
+    route: '/dashboard',
+    open: async (page) => {
+      await freshFailover(page)
+      await setMock(page, { taskDurationMs: 60_000 })
+      await mockSwitch(page, 'auto:10.0.0.12')
+      await page.waitForSelector('[data-testid="banner-failover"]', { timeout: 30_000 })
+      await sleep(300)
+    },
+    close: leaveFailover,
+  },
+  {
+    name: 'banner: waiting for you (0.10.0)',
+    needsMock: true,
+    route: '/servers',
+    open: async (page) => {
+      await freshFailover(page)
+      await setMock(page, { failoverNeedsDecision: true })
+      await startFailover(page, '10.0.0.12')
+      await closeDialogs(page)
+      await page.waitForSelector('[data-testid="banner-failover"].tone-danger', { timeout: 30_000 })
+      await sleep(300)
+    },
+    close: async (page) => {
+      await setMock(page, { failoverNeedsDecision: false })
+      await leaveFailover(page)
+    },
+  },
+  {
+    // 0.11.0, console part B: the Anchoring tab with the three kinds of target, a record in every state and (the page runs
+    // with the hostile mock) targets and records with hostile names.
+    name: 'anchoring tab: three kinds and every state of a record (0.11.0)',
+    needsMock: true,
+    route: '/ledger?tab=anchoring',
+    open: anchoringAll,
+  },
+  {
+    name: 'anchoring: add a WORM target (0.11.0)',
+    needsMock: true,
+    route: '/ledger?tab=anchoring',
+    open: async (page) => {
+      await anchoringAll(page)
+      await clickText(page, 'Add a target')
+      await dialogOpen(page)
+      await page.waitForSelector('[data-testid="compliance-confirm"]', { timeout: 10_000 })
+    },
+    close: cancel,
+  },
+  {
+    name: 'anchoring: add an OpenTimestamps target (0.11.0)',
+    needsMock: true,
+    route: '/ledger?tab=anchoring',
+    open: async (page) => {
+      await anchoringAll(page)
+      await clickText(page, 'Add a target')
+      await dialogOpen(page)
+      await page.click('[data-testid="kind-ots"]')
+      await clickText(page, 'Use the public calendars', '[role="dialog"] button')
+      await sleep(250)
+    },
+    close: cancel,
+  },
+  {
+    name: 'anchoring: a test that failed (0.11.0)',
+    needsMock: true,
+    route: '/ledger?tab=anchoring',
+    open: async (page) => {
+      await anchoringAll(page)
+      await setMock(page, { anchorTest: 'fail' })
+      await clickLabeled(page, 'Test archive-worm')
+      await dialogOpen(page)
+      await clickText(page, 'Run the test again', '[role="dialog"] button')
+      await page.waitForSelector('[data-testid="check-failed"]', { timeout: 20_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await setMock(page, { anchorTest: null })
+      await clickText(page, 'Close', '[role="dialog"] button')
+    },
+  },
+  {
+    // 0.12.0: the alert of a system database that is older than what was published (its own words and a link).
+    name: 'alert: the system database is older than what was published (0.12.0)',
+    needsMock: true,
+    route: '/alerts',
+    open: async (page) => {
+      await page.evaluate(() => {
+        ;(
+          window as unknown as { __kingresMock: { signingSwitch: (t: string) => void } }
+        ).__kingresMock.signingSwitch('restored')
+        void (
+          window as unknown as { __queryClient: { invalidateQueries: () => unknown } }
+        ).__queryClient.invalidateQueries()
+      })
+      await page.waitForSelector('[data-testid="alert-published-state"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+  },
+  {
+    name: 'anchoring: delete a target (0.11.0)',
+    needsMock: true,
+    route: '/ledger?tab=anchoring',
+    open: async (page) => {
+      await anchoringAll(page)
+      await clickLabeled(page, 'Delete public-tsa')
+      await dialogOpen(page)
+    },
+    close: cancel,
+  },
+  {
+    // 0.12.0: a run that ended well and whose check of the cluster reported something: "Completed, with remarks", with the report.
+    name: 'failover report: completed with remarks (0.12.0)',
+    needsMock: true,
+    route: '/servers',
+    open: async (page) => {
+      await freshFailover(page)
+      await setMock(page, { failoverWarnings: true })
+      await startFailover(page, '10.0.0.12')
+      await page.waitForFunction(
+        () => document.querySelector('[role="dialog"]')?.textContent?.includes('Finished.'),
+        { timeout: 30_000 },
+      )
+      await closeDialogs(page)
+      await go(page, '/replication')
+      await clickWhenThere(page, '[data-testid="last-failover-report"]')
+      await page.waitForFunction(
+        () =>
+          document
+            .querySelector('[role="dialog"]')
+            ?.textContent?.includes('Completed, with remarks'),
+        { timeout: 20_000 },
+      )
+      await sleep(300)
+    },
+    close: async (page) => {
+      await page.click('[role="dialog"] [data-dialog-close]')
+      await sleep(150)
+      await leaveFailover(page)
+    },
+  },
+  {
+    // 0.12.0, failover console part 3: the planned switchover of one group (the server version that builds it, and one that does not).
+    name: 'switchover of a group: the plan (0.12.0)',
+    needsMock: true,
+    route: '/replication',
+    open: async (page) => {
+      await freshFailover(page)
+      await mockSwitch(page, 'graceful')
+      await clickLabeled(page, 'Switch over Shard group 2')
+      await dialogOpen(page)
+      await clickText(page, 'Show the plan', '[role="dialog"] button')
+      await page.waitForSelector('[role="dialog"] [data-testid="failover-plan"]', {
+        timeout: 20_000,
+      })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await cancel(page)
+      await freshFailover(page)
+    },
+  },
+  {
+    name: 'switchover of a group: not available on this server version (0.12.0)',
+    needsMock: true,
+    route: '/replication',
+    open: async (page) => {
+      await freshFailover(page)
+      await clickLabeled(page, 'Switch over Shard group 2')
+      await dialogOpen(page)
+      await clickText(page, 'Show the plan', '[role="dialog"] button')
+      await page.waitForSelector('[role="dialog"] [data-testid="failover-refusal"]', {
+        timeout: 20_000,
+      })
+      await sleep(250)
+    },
+    close: cancel,
+  },
+  {
+    name: 'restore preferred primaries: the groups and the plan (0.12.0)',
+    needsMock: true,
+    route: '/replication',
+    open: async (page) => {
+      await freshFailover(page)
+      await awayGroups(page)
+      await clickText(page, 'Restore preferred primaries')
+      await dialogOpen(page)
+      await page.waitForSelector('[data-testid="restore-groups"]', { timeout: 20_000 })
+      await sleep(200)
+      await clickText(page, 'Show the plan', '[role="dialog"] button')
+      await page.waitForSelector('[role="dialog"] [data-testid="failover-plan"]', {
+        timeout: 20_000,
+      })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await cancel(page)
+      await freshFailover(page)
+    },
+  },
+  {
+    // 0.11.0, Console C: the Client keys tab (keys of three states, the tables with their policy) and its dialogs.
+    name: 'client keys tab (0.11.0)',
+    needsMock: true,
+    route: '/ledger?tab=clients',
+    open: clientKeys,
+  },
+  {
+    name: 'client keys: register a key (0.11.0)',
+    needsMock: true,
+    route: '/ledger?tab=clients',
+    open: async (page) => {
+      await clientKeys(page)
+      await clickText(page, 'Register a key')
+      await dialogOpen(page)
+      await clickText(page, 'Register the key', '[role="dialog"] button')
+      await page.waitForSelector('[role="dialog"] .error', { timeout: 10_000 })
+    },
+    close: cancel,
+  },
+  {
+    name: 'client keys: require signatures for a table (0.11.0)',
+    needsMock: true,
+    route: '/ledger?tab=clients',
+    open: async (page) => {
+      await clientKeys(page)
+      await page.evaluate(() => {
+        const b = [...document.querySelectorAll<HTMLElement>('button')].find((e) =>
+          (e.getAttribute('aria-label') ?? '').startsWith('Require signatures for'),
+        )
+        b?.click()
+      })
+      await dialogOpen(page)
+      await page.waitForSelector('[data-testid="policy-consequences"]', { timeout: 10_000 })
+    },
+    close: cancel,
+  },
+  {
+    name: 'client keys: revoke a key (0.11.0)',
+    needsMock: true,
+    route: '/ledger?tab=clients',
+    open: async (page) => {
+      await clientKeys(page)
+      await page.evaluate(() => {
+        const b = [...document.querySelectorAll<HTMLElement>('button')].find((e) =>
+          (e.getAttribute('aria-label') ?? '').startsWith('Revoke key'),
+        )
+        b?.click()
+      })
+      await dialogOpen(page)
+    },
+    close: cancel,
+  },
+  {
+    // 0.11.0, Console D: the bundle dialog with a proof (and its warning), the acknowledgement of a diverged chain, the audit card.
+    name: 'bundle dialog with a proof (0.11.0)',
+    needsMock: true,
+    route: '/ledger?tab=digests',
+    open: async (page) => {
+      await clickText(page, 'Create a bundle')
+      await dialogOpen(page)
+      await page.click('[data-testid="bundle-proof"]')
+      await page.waitForSelector('[data-testid="proofs-warning"]', { timeout: 10_000 })
+      await sleep(200)
+    },
+    close: cancel,
+  },
+  {
+    name: 'acknowledge a diverged chain (0.11.0)',
+    needsMock: true,
+    route: '/ledger',
+    open: async (page) => {
+      await urlSwitch(page, 'publication', 'diverged')
+      await page.waitForSelector('[data-testid="diverged-chains"]', { timeout: 30_000 })
+      await clickLabeled(page, 'Acknowledge the divergence of shard group 2')
+      await dialogOpen(page)
+    },
+    close: cancel,
+  },
+  {
+    name: 'publication: audit and bundle (0.11.0)',
+    needsMock: true,
+    route: '/ledger?tab=publication',
+    open: async (page) => {
+      await page.waitForSelector('[data-testid="publication-audit"]', { timeout: 30_000 })
+      await sleep(250)
     },
   },
   {

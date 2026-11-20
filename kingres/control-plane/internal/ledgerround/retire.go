@@ -45,11 +45,19 @@ func (c *Collector) retireLogs(ctx context.Context, pc ledgersign.PubContext, te
 				return fmt.Errorf("publishing the end of the chain of shard group %s: %w", groupText(l), err)
 			}
 		}
-		if err := c.cfg.Store.SetState(ctx, term, l.ID, ledgerpub.StateClosed, "retired: "+reason); err != nil {
+		// A diverged log keeps its flag (P8-08): the retiring leaf says retired and diverged, and the critical alert is not cleared by a drop
+		// or a removal (an administrator who rolled a database back must not end the signal by dropping it).
+		detail := "retired: " + reason
+		if l.State == ledgerpub.StateDiverged {
+			detail += wasDivergedMark + l.Detail + ")"
+		}
+		if err := c.cfg.Store.SetState(ctx, term, l.ID, ledgerpub.StateClosed, detail); err != nil {
 			return err
 		}
 		if l.ShardGroupID != nil {
-			c.alert(ctx, AlertDiverged, "critical", db, *l.ShardGroupID, "", false)
+			if l.State != ledgerpub.StateDiverged {
+				c.alert(ctx, AlertDiverged, "critical", db, *l.ShardGroupID, "", false)
+			}
 			c.alert(ctx, AlertUnread, "warning", db, *l.ShardGroupID, "", false)
 		}
 		c.log.Info("ledger chain retired", "database", db, "group", groupText(l), "origin", l.Origin, "size", l.Size, "reason", reason)
@@ -90,6 +98,12 @@ func (c *Collector) prepare(ctx context.Context) (ledgersign.PubContext, error) 
 	if pc.SignErr != nil {
 		return pc, fmt.Errorf("%w: %v", ErrCannotRetire, pc.SignErr)
 	}
+	if err := c.checkPublished(ctx); err != nil {
+		if errors.Is(err, ErrPublishedState) {
+			return pc, fmt.Errorf("%w: %v", ErrCannotRetire, err)
+		}
+		return pc, err
+	}
 	return pc, nil
 }
 
@@ -123,8 +137,9 @@ func (c *Collector) RetireDatabase(ctx context.Context, db, reason string, final
 		return err
 	}
 	c.mu.Lock()
-	delete(c.missing, db)
+	delete(c.missingSince, db)
 	c.mu.Unlock()
+	c.alert(ctx, AlertUnread, "critical", db, -1, "", false)
 	return nil
 }
 
@@ -232,3 +247,6 @@ func (c *Collector) finalRound(ctx context.Context, db string, only map[int32]bo
 		}
 	}
 }
+
+// wasDivergedMark separates the reason of a retirement from the reason of the divergence in the detail of a closed log.
+const wasDivergedMark = " (was diverged: "

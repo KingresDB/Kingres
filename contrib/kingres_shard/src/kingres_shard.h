@@ -22,7 +22,7 @@
 #include "fmgr.h"
 
 /* The version of the extension this library belongs to (the SQL objects of every node must match). */
-#define KINGRES_SHARD_EXT_VERSION "0.6"
+#define KINGRES_SHARD_EXT_VERSION "0.7"
 #include "nodes/params.h"
 #include "nodes/parsenodes.h"
 #include "nodes/plannodes.h"
@@ -157,6 +157,11 @@ extern PGDLLIMPORT int kingres_shard_control_call_timeout;
 extern PGDLLIMPORT char *kingres_shard_node_conninfo;
 extern PGDLLIMPORT int kingres_shard_recovery_interval;
 extern PGDLLIMPORT bool kingres_shard_enable_distributed_scan;
+extern PGDLLIMPORT bool kingres_shard_enable_pushdown;
+extern PGDLLIMPORT bool kingres_shard_enable_pushdown_closed;
+extern PGDLLIMPORT bool kingres_shard_enable_partial_aggregation;
+extern PGDLLIMPORT bool kingres_shard_enable_pushdown_sort;
+extern PGDLLIMPORT bool kingres_shard_enable_pushdown_join;
 extern PGDLLIMPORT bool kingres_shard_enable_bulk_routing;
 extern PGDLLIMPORT bool kingres_shard_enable_colocated_insert_select;
 extern PGDLLIMPORT bool kingres_shard_enable_copy_routing;
@@ -166,6 +171,13 @@ extern PGDLLIMPORT int kingres_shard_move_catchup_threshold;
 extern PGDLLIMPORT int kingres_shard_move_switch_timeout;
 extern PGDLLIMPORT int kingres_shard_move_switch_attempts;
 extern PGDLLIMPORT int kingres_shard_move_cleanup_delay;
+extern PGDLLIMPORT int kingres_shard_rebuild_batch_rows;
+extern PGDLLIMPORT int kingres_shard_rebuild_drain_threshold;
+extern PGDLLIMPORT int kingres_shard_rebuild_lock_timeout;
+extern PGDLLIMPORT int kingres_shard_rebuild_switch_timeout;
+extern PGDLLIMPORT int kingres_shard_rebuild_switch_max_attempts;
+extern PGDLLIMPORT int kingres_shard_table_cleanup_delay;
+extern PGDLLIMPORT bool kingres_shard_rebuild_verify;
 extern PGDLLIMPORT int kingres_shard_deadlock_check_interval;
 extern PGDLLIMPORT int kingres_shard_deadlock_confirm_delay;
 extern PGDLLIMPORT int kingres_shard_decision_retention;

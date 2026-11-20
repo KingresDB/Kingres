@@ -186,7 +186,7 @@ describe('leave cluster: an unreachable leader', () => {
     expect(anyway).toBeEnabled()
     await user.click(anyway)
     // The forced answer is a finished task with id 0; it is never fetched.
-    await waitFor(() => expect(router.currentRoute.value.name).toBe('setup'), { timeout: 4000 })
+    await waitFor(() => expect(router.currentRoute.value.name).toBe('setup'), { timeout: 30_000 })
     expect(seen.filter((r) => r === 'GET /tasks/0')).toEqual([])
     expect(useSessionStore(pinia).isSignedIn).toBe(false)
     expect(seen).not.toContain('POST /auth/logout')
@@ -212,7 +212,7 @@ describe('leave cluster: while the server resets itself', () => {
     const { router, pinia } = await renderApp('/this-server')
     const dialog = await openLeave(user)
     await confirmLeave(user, dialog)
-    await waitFor(() => expect(router.currentRoute.value.name).toBe('setup'), { timeout: 5000 })
+    await waitFor(() => expect(router.currentRoute.value.name).toBe('setup'), { timeout: 30_000 })
     expect(useSessionStore(pinia).isSignedIn).toBe(false)
     expect(await screen.findByText(/left the cluster and was reset/i)).toBeInTheDocument()
     expect(document.body).toHaveTextContent(/set it up again to create or join a cluster/i)

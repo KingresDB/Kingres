@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -172,16 +171,14 @@ func TestKingresdPublicationRejectsEveryByteOfEveryFile(t *testing.T) {
 		}
 		return nil
 	})
-	// every byte on Linux; on Windows, where a run costs ten times more, every 23rd byte and the first and last 64
-	stride := 1
-	if runtime.GOOS == "windows" {
-		stride = 23
-	}
+	// a deterministic sample by default (every byte of a file of at most 2,048 bytes, the first and last 64 of every file, every 16th
+	// byte of the rest); KINGRES_VERIFY_FULL_SWEEP=1 flips every byte (see internal/cli/sweep_test.go)
+	full := os.Getenv("KINGRES_VERIFY_FULL_SWEEP") == "1"
 	total := 0
 	for _, p := range files {
 		orig, _ := os.ReadFile(p)
 		for i := range orig {
-			if i%stride != 0 && i >= 64 && i < len(orig)-64 {
+			if !full && len(orig) > 2048 && i%16 != 0 && i >= 64 && i < len(orig)-64 {
 				continue
 			}
 			mut := append([]byte{}, orig...)

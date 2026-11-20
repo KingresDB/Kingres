@@ -39,35 +39,26 @@ SELECT version > 0 AS map_version_moved FROM kingres.map_version;
 -- Rejected tables.  Each error names what is wrong.
 CREATE TABLE bad_pk (id int PRIMARY KEY, k int);
 SELECT kingres.create_distributed_table('bad_pk', 'k');
-ERROR:  cannot distribute table "bad_pk": primary key constraint "bad_pk_pkey" does not include the distribution column "k"
-HINT:  A unique or primary key constraint of a distributed table must include the distribution column.
+ERROR:  cannot distribute table "bad_pk": primary key constraint "bad_pk_pkey" does not include the distribution column "k"; a unique or primary key constraint of a distributed table must include the distribution column
 CREATE TABLE bad_unique (id int, k int, CONSTRAINT bad_unique_id_key UNIQUE (id));
 SELECT kingres.create_distributed_table('bad_unique', 'k');
-ERROR:  cannot distribute table "bad_unique": unique constraint "bad_unique_id_key" does not include the distribution column "k"
-HINT:  A unique or primary key constraint of a distributed table must include the distribution column.
+ERROR:  cannot distribute table "bad_unique": unique constraint "bad_unique_id_key" does not include the distribution column "k"; a unique or primary key constraint of a distributed table must include the distribution column
 CREATE TABLE bad_index (id int, k int);
 CREATE UNIQUE INDEX bad_index_id_idx ON bad_index (id);
 SELECT kingres.create_distributed_table('bad_index', 'k');
-ERROR:  cannot distribute table "bad_index": unique index "bad_index_id_idx" does not include the distribution column "k"
-HINT:  A unique or primary key constraint of a distributed table must include the distribution column.
-CREATE TABLE full_table (id int, k int);
-INSERT INTO full_table VALUES (1, 1);
-SELECT kingres.create_distributed_table('full_table', 'k');
-ERROR:  table "full_table" is not empty
-DETAIL:  Converting a table that already holds data is not supported yet.
+ERROR:  cannot distribute table "bad_index": unique index "bad_index_id_idx" does not include the distribution column "k"; a unique or primary key constraint of a distributed table must include the distribution column
 CREATE TABLE no_column (id int);
 SELECT kingres.create_distributed_table('no_column', 'nope');
 ERROR:  column "nope" of table "no_column" does not exist
 CREATE TABLE unhashable (id int, p point);
 SELECT kingres.create_distributed_table('unhashable', 'p');
-ERROR:  column "p" of type point cannot be a distribution column
-DETAIL:  The type has no default hash operator class with an extended hash function.
+ERROR:  column "p" of type point cannot be a distribution column: the type has no default hash operator class with an extended hash function
 CREATE TABLE fk_parent (id int PRIMARY KEY);
 CREATE TABLE fk_child (id int, parent int REFERENCES fk_parent);
 SELECT kingres.create_distributed_table('fk_child', 'id');
-ERROR:  cannot distribute table "fk_child": foreign key constraint "fk_child_parent_fkey" is not supported yet
+ERROR:  cannot distribute table "fk_child": foreign key "fk_child_parent_fkey" references ordinary table "public.fk_parent"; a key to an ordinary table is not supported
 SELECT kingres.create_distributed_table('fk_parent', 'id');
-ERROR:  cannot distribute table "fk_parent": foreign key constraint "fk_child_parent_fkey" is not supported yet
+ERROR:  cannot distribute table "fk_parent": foreign key "fk_child_parent_fkey" of ordinary table "public.fk_child" references the table; a key from an ordinary table is not supported
 CREATE TEMP TABLE temp_t (id int);
 SELECT kingres.create_distributed_table('temp_t', 'id');
 ERROR:  cannot distribute table "temp_t": temporary and unlogged tables are not supported
@@ -83,11 +74,9 @@ CREATE TRIGGER trg_t BEFORE INSERT ON trg FOR EACH ROW EXECUTE FUNCTION trg_fn()
 SELECT kingres.create_distributed_table('trg', 'id');
 ERROR:  cannot distribute table "trg": trigger "trg_t" is not supported yet
 SELECT kingres.create_distributed_table('bad_pk', 'k', bucket_count => 0);
-ERROR:  cannot distribute table "bad_pk": primary key constraint "bad_pk_pkey" does not include the distribution column "k"
-HINT:  A unique or primary key constraint of a distributed table must include the distribution column.
+ERROR:  cannot distribute table "bad_pk": primary key constraint "bad_pk_pkey" does not include the distribution column "k"; a unique or primary key constraint of a distributed table must include the distribution column
 SELECT kingres.create_distributed_table('bad_pk', 'k', bucket_count => 5000);
-ERROR:  cannot distribute table "bad_pk": primary key constraint "bad_pk_pkey" does not include the distribution column "k"
-HINT:  A unique or primary key constraint of a distributed table must include the distribution column.
+ERROR:  cannot distribute table "bad_pk": primary key constraint "bad_pk_pkey" does not include the distribution column "k"; a unique or primary key constraint of a distributed table must include the distribution column
 SELECT count(*) AS distributed_after_errors FROM kingres.dist_table;
  distributed_after_errors 
 --------------------------
@@ -95,7 +84,7 @@ SELECT count(*) AS distributed_after_errors FROM kingres.dist_table;
 (1 row)
 
 DROP VIEW a_view;
-DROP TABLE bad_pk, bad_unique, bad_index, full_table, no_column, unhashable,
+DROP TABLE bad_pk, bad_unique, bad_index, no_column, unhashable,
            fk_child, fk_parent, already_part, trg;
 DROP FUNCTION trg_fn();
 -- A table with a primary key that includes the key, a default, a check

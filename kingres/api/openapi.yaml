@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: KingresDB Management API
-  version: 0.11.0
+  version: 0.13.0
   summary: REST API of the KingresDB management panel, CLI and manager.
   description: |
     The single REST API served by `kingresd` on every KingresDB server. The web panel
@@ -1050,6 +1050,14 @@ paths:
         the server is not primary of or a target that is not a standby of the group. While `kingresd` lacks a
         part of the design, the request answers 422 `unsupported_operation`: this revision's server implements
         `hard` for ordinary groups only.
+
+        **0.13.0, the map group.** The failover of the server that runs the primary of the map group (and the manager
+        leader) is accepted by any server that does not hear it, in mode `hard` only (`dryRun` and `graceful` answer 422
+        `unsupported_operation`): the server asks a server that hosts a ready standby of the map group to run the bootstrap, and
+        answers 202 with a Task whose `id` is 0, `state` `running` and the steps of the bootstrap, with `Location: /api/v1/failover`;
+        the client polls `GET /failover` (answered by that server) until `taskId` is not null, then `GET /tasks/{id}` on the new
+        manager leader. The old leader's rebalance is paused (`stoppedBy` `safetyRule`). The key of the certificate authority is not
+        copied to the new leader: the alert `certificateAuthorityUnavailable` says what the operator must do.
 
         The task is `server.failover`, one block of steps per group (`TaskStep.shardGroupId`). A task that
         waits for an operator is `paused`; a repeat of this request for the same server resumes it. From the moment
@@ -4962,6 +4970,9 @@ components:
           type: integer
           minimum: 1
           description: 1-based character position of the error in the statement; present for some `sql_error` problems.
+        plan:
+          $ref: '#/components/schemas/FailoverPlan'
+          description: 'Added in 0.12.0, optional. The whole plan of the request (the same body as `dryRun` answers), present only when `code` is `failover_needs_decision`: the console shows the groups, the candidates and the verdict without asking again.'
         serverIds:
           type: array
           description: 'Added in 0.9.0, optional. Servers that can be opened instead; set for `leader_unavailable`: the manager leader first when this server knows it, then the other servers of the cluster as this server knows them. Empty or absent when it knows none.'
@@ -6489,7 +6500,7 @@ components:
         kind: { type: string, enum: [failover, restorePreferredPrimaries] }
         trigger: { type: string, enum: [manual, automatic] }
         serverId: { type: [string, 'null'] }
-        outcome: { type: string, enum: [completed, partial, failed, cancelled, paused] }
+        outcome: { type: string, enum: [completed, completedWithWarnings, partial, failed, cancelled, paused] }
         startedAt: { type: string, format: date-time }
         finishedAt: { type: [string, 'null'], format: date-time }
         requestedBy: { type: string }
@@ -6567,7 +6578,7 @@ components:
       type: object
       required: [state, method, divergenceBytes, rewindBytes, message]
       properties:
-        state: { type: string, enum: [notScheduled, rebuildScheduled, rebuilding, standby, waitingForServer, removed, failed], description: '`notScheduled`: this revision of kingresd does not turn the old primary into a standby again (a later increment does); it stays stopped and fenced.' }
+        state: { type: string, enum: [notScheduled, rebuildScheduled, rebuilding, standby, waitingForServer, removed, failed], description: '`notScheduled`: no rebuild of the old primary is scheduled for the group (for a record of an earlier revision of kingresd that never rebuilt it, and for a group whose old primary has no directory to rebuild); it stays stopped and fenced until an operator acts. From 0.12.0 kingresd rebuilds the old primary of an ordinary group by itself (`rebuildScheduled`, `rebuilding`, `standby`).' }
         method: { type: [string, 'null'], enum: [clean, pgRewind, baseBackup, null] }
         divergenceBytes: { type: [integer, 'null'], format: int64 }
         rewindBytes: { type: [integer, 'null'], format: int64 }
@@ -8109,7 +8120,7 @@ components:
         id:
           type: integer
           format: int64
-          description: Task identifier (`task_id` in `kingres.task`).
+          description: Task identifier (`task_id` in `kingres.task`). From 0.13.0 the id is 0 for the task that stands for the bootstrap of a map group failover while no task can be recorded (the system database is not writable yet); `GET /tasks/0` on the server that runs the bootstrap answers it, and `GET /failover` names the recorded task (`taskId`) once it exists. Id 0 never names a stored task.
         detail:
           type:
             - string
@@ -10607,7 +10618,7 @@ components:
     AlertKind:
       type: string
       description: |
-        Alert type. Clients must tolerate kinds they do not know. Added in 0.11.0 (ledger phase 7; subjects at `AlertSubject`): `ledgerNotAnchored` (a database has ledger tables and no anchor target is enabled; `info`, `warning` when the setting `anchor.required` is on), `ledgerAnchorBehind` (`warning`, `critical`), `ledgerAnchorFailed` (an anchor record is `failed` or `expired`; `critical`), `ledgerAnchorConflict` (the store holds a different object under the name of an anchor; `critical`), `ledgerChainDiverged` (a chain no longer extends its published log; `critical`), `ledgerGroupUnread` (a shard group's chain could not be read; `warning`, `critical`), `ledgerPublicationBehind` (the newest signed checkpoint of a chain is older than five publication intervals while its head advanced; `warning`), `ledgerSignerUnavailable` (no checkpoint could be signed for two rounds, or the key set is damaged, or the key file is missing on the leader; `critical`) and `ledgerDigestOverdue` (no digest within twice `digestIntervalSeconds`; `warning`). Added in 0.8.0: `clockDifference` (a server's clock differs from the manager leader's by more than `ClusterSettings.clock.maxDifferenceMs`, less the uncertainty of the measurement; `warning`, `critical` at ten times the threshold; `kingresd` does not set the system clock, run NTP or chrony). Added in 0.7.0: `leaseLost` (the `kingresd` that
+        Alert type. Clients must tolerate kinds they do not know. Added in 0.13.0: `certificateAuthorityUnavailable` (the map group was failed over and the new manager leader holds no key of the certificate authority, so no certificate can be issued, renewed or revoked until the operator restores `pki/ca.key` and `pki/revoked.json` from the backup of the old leader; subject `cluster`; `critical`). Added in 0.11.0 (ledger phase 7; subjects at `AlertSubject`): `ledgerNotAnchored` (a database has ledger tables and no anchor target is enabled; `info`, `warning` when the setting `anchor.required` is on), `ledgerAnchorBehind` (`warning`, `critical`), `ledgerAnchorFailed` (an anchor record is `failed` or `expired`; `critical`), `ledgerAnchorConflict` (the store holds a different object under the name of an anchor; `critical`), `ledgerChainDiverged` (a chain no longer extends its published log; `critical`), `ledgerGroupUnread` (a shard group's chain could not be read; `warning`, `critical`), `ledgerPublicationBehind` (the newest signed checkpoint of a chain is older than five publication intervals while its head advanced; `warning`), `ledgerSignerUnavailable` (no checkpoint could be signed for two rounds, or the key set is damaged, or the key file is missing on the leader; `critical`) and `ledgerDigestOverdue` (no digest within twice `digestIntervalSeconds`; `warning`). Added in 0.8.0: `clockDifference` (a server's clock differs from the manager leader's by more than `ClusterSettings.clock.maxDifferenceMs`, less the uncertainty of the measurement; `warning`, `critical` at ten times the threshold; `kingresd` does not set the system clock, run NTP or chrony). Added in 0.7.0: `leaseLost` (the `kingresd` that
         runs the primary of a shard group could not renew the group's lease in time; for a group with a standby the
         instance was stopped (fenced), for a group without one it keeps running and this alert is the only effect;
         `critical`), `groupWithoutSynchronousStandby` (the group's standby has been unreachable for longer than the
@@ -10658,6 +10669,7 @@ components:
         - ledgerPublicationBehind
         - ledgerSignerUnavailable
         - ledgerDigestOverdue
+        - certificateAuthorityUnavailable
     Alert:
       type: object
       description: An alert.

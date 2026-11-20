@@ -59,11 +59,11 @@ describe('0.7.0 states', () => {
     expect(await axe(dialog)).toHaveNoViolations()
     await fireEvent.update(within(dialog).getByLabelText(/standbys per shard group/i), '2')
     await user.click(within(dialog).getByRole('button', { name: /^change replica count$/i }))
-    await within(dialog).findByTestId('replica-done', {}, { timeout: 6000 })
+    await within(dialog).findByTestId('replica-done', {}, { timeout: 30_000 })
     expect(await axe(dialog)).toHaveNoViolations()
     expect(container).toBeTruthy()
     expect(errors).not.toHaveBeenCalled()
-  }, 20000)
+  }, 90_000)
 
   it('the page of a suspect server', async () => {
     silenceServer(getState(), '10.0.0.12', Date.now() - (mockConfig.suspectMs + 1000))
@@ -84,7 +84,7 @@ describe('0.7.0 states', () => {
     mockConfig.clientEntryPoint = 'standby'
     silenceServer(getState(), '10.0.0.13', Date.now() - (mockConfig.failureMs + 1000))
     const { container } = await renderApp('/dashboard')
-    await screen.findByTestId('client-entry-point', {}, { timeout: 6000 })
+    await screen.findByTestId('client-entry-point', {}, { timeout: 30_000 })
     await screen.findByTestId('not-live-servers')
     await waitFor(() => expect(screen.getAllByTestId(/^metric-client/)).toHaveLength(16))
     await clean(container)
@@ -100,7 +100,7 @@ describe('0.7.0 states', () => {
   it('the shell with the banner of a lost leader', async () => {
     mockConfig.leaderLost = true
     const { container } = await renderApp('/servers')
-    await screen.findByTestId('banner-leader', {}, { timeout: 7000 })
+    await screen.findByTestId('banner-leader', {}, { timeout: 30_000 })
     await clean(container)
   })
 

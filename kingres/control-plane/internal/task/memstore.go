@@ -296,6 +296,10 @@ var serverOps = map[string]bool{"server.add": true, "server.remove": true, "serv
 // failoverClass are the kinds of which at most one is unfinished at any time (migration 0011, KX003).
 var failoverClass = map[string]bool{"server.failover": true, "replication.restorePreferredPrimaries": true}
 
+// databaseOps are the kinds that change which databases and tables have a catalog (migration 0016): a failover is
+// excluded by them and excludes them.
+var databaseOps = map[string]bool{"database.create": true, "database.drop": true, "table.distribute": true}
+
 // excludedLocked is the rule of the database trigger for a task of kind about to be created.
 func (m *MemStore) excludedLocked(kind string) error {
 	for _, o := range m.tasks {
@@ -305,6 +309,11 @@ func (m *MemStore) excludedLocked(kind string) error {
 		case serverOps[kind] && o.Kind == "rebalance" && (o.State == Pending || o.State == Running):
 			return &ExcludedError{Kind: kind, Other: "rebalance"}
 		case failoverClass[kind] && failoverClass[o.Kind] && o.State.Active():
+			return &ExcludedError{Kind: kind, Other: o.Kind}
+		// Migration 0016 (F3-04): a failover and a creation, a drop or a distribution exclude each other.
+		case failoverClass[kind] && databaseOps[o.Kind] && o.State.Active():
+			return &ExcludedError{Kind: kind, Other: o.Kind}
+		case databaseOps[kind] && failoverClass[o.Kind] && o.State.Active():
 			return &ExcludedError{Kind: kind, Other: o.Kind}
 		}
 	}

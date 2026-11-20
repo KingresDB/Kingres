@@ -293,6 +293,10 @@ func (s *Store) ClusterSettings(ctx context.Context) (api.ClusterSettings, error
 				if json.Unmarshal(v, &n) == nil {
 					out.AutoFailover.TimeoutSeconds = n
 				}
+			case "autoFailover.eventsSinceReset":
+				if json.Unmarshal(v, &n) == nil {
+					out.AutoFailover.EventsSinceReset = n
+				}
 			case "autoFailover.maxCount":
 				if json.Unmarshal(v, &n) == nil {
 					out.AutoFailover.MaxCount = n

@@ -216,7 +216,9 @@ CREATE SCHEMA sz CREATE TABLE tz (a int) USING columnar;
 SELECT count(*) FROM sz.tz;
 DROP SCHEMA sz CASCADE;
 
--- C1-10: columnar tables are not published (the wal_level warning differs by major)
+-- C1-10 and C7: columnar tables can be published (their rows are decoded); a publication that
+-- would include the stripe catalog (all tables, the schema kingres) is refused while a columnar
+-- table exists (the wal_level warning differs by major)
 SET client_min_messages = error;
 CREATE TABLE pub_h (a int);
 CREATE TABLE pub_c (a int) USING columnar;
@@ -224,7 +226,8 @@ CREATE PUBLICATION pub1 FOR TABLE pub_h;
 ALTER PUBLICATION pub1 ADD TABLE pub_c;
 CREATE PUBLICATION pub2 FOR TABLE pub_c;
 CREATE PUBLICATION pub3 FOR ALL TABLES;
--- with a publication in place, a columnar table cannot join it
+CREATE PUBLICATION pub3b FOR TABLES IN SCHEMA kingres;
+-- with listed publications in place, columnar tables can be made and altered
 CREATE TABLE pub_c2 (a int) USING columnar;
 CREATE TABLE pub_h2 (a int);
 ALTER TABLE pub_h2 SET ACCESS METHOD columnar;

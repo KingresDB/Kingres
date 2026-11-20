@@ -88,10 +88,10 @@ ERROR:  cannot make table "tmp1" a reference table: temporary and unlogged table
 CREATE UNLOGGED TABLE ul (a int);
 SELECT kingres.create_reference_table('ul');
 ERROR:  cannot make table "ul" a reference table: temporary and unlogged tables are not supported
-CREATE TABLE has_fk (id int PRIMARY KEY, a int REFERENCES r1 (id));
+CREATE TABLE plain_parent (id int PRIMARY KEY);
+CREATE TABLE has_fk (id int PRIMARY KEY, a int REFERENCES plain_parent (id));
 SELECT kingres.create_reference_table('has_fk');
-ERROR:  cannot make table "has_fk" a reference table: foreign key constraint "has_fk_a_fkey" is not supported yet
-HINT:  Create the reference table first and add the foreign key afterwards with ALTER TABLE.
+ERROR:  cannot make table "has_fk" a reference table: foreign key "has_fk_a_fkey" references ordinary table "public.plain_parent"; a key to an ordinary table is not supported
 CREATE TABLE has_trg (id int PRIMARY KEY);
 CREATE FUNCTION trg() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
 CREATE TRIGGER t BEFORE INSERT ON has_trg FOR EACH ROW EXECUTE FUNCTION trg();
@@ -128,23 +128,21 @@ SELECT count(*), sum(d1.v) FROM d1 JOIN r1 ON r1.id = d1.id;
 
 -- The catalog is synchronized with the name of the table, not its OID.
 SELECT jsonb_path_query_array(kingres.internal_catalog_snapshot(), '$.dist_table[*] ? (@.method == "reference")') AS ref_snapshot;
-                                              ref_snapshot                                               
----------------------------------------------------------------------------------------------------------
- [{"name": "r1", "method": "reference", "schema": "public", "dist_column": null, "colocation_id": null}]
+                                                                       ref_snapshot                                                                       
+----------------------------------------------------------------------------------------------------------------------------------------------------------
+ [{"name": "r1", "method": "reference", "schema": "public", "dist_column": null, "colocation_id": null, "partition_key": null, "partition_method": null}]
 (1 row)
 
 -- Dropping the table removes it from the catalog.
 DROP TABLE r1 CASCADE;
-NOTICE:  drop cascades to 2 other objects
-DETAIL:  drop cascades to constraint has_fk_a_fkey on table has_fk
-drop cascades to view v1
+NOTICE:  drop cascades to view v1
 SELECT relid::regclass FROM kingres.dist_table ORDER BY 1;
  relid 
 -------
  d1
 (1 row)
 
-DROP TABLE has_fk, has_trg, d1, p, ul;
+DROP TABLE has_fk, plain_parent, has_trg, d1, p, ul;
 DROP FUNCTION trg();
 DROP VIEW IF EXISTS v1;
 NOTICE:  view "v1" does not exist, skipping

@@ -82,6 +82,11 @@ func (e *Error) TaskCode() string { return e.Code }
 // TaskRetryable says whether repeating the request can succeed.
 func (e *Error) TaskRetryable() bool { return e.Retryable }
 
+// Fail makes an Error for another package (the bootstrap of the map group).
+func Fail(code string, retryable bool, format string, a ...any) *Error {
+	return fail(code, retryable, format, a...)
+}
+
 func fail(code string, retryable bool, format string, a ...any) *Error {
 	return &Error{Code: code, Message: fmt.Sprintf(format, a...), Retryable: retryable}
 }
@@ -205,6 +210,9 @@ type State struct {
 	Destination  string          `json:"destination,omitempty"`
 	// Watchdog says whether a watchdog of the group's primary instance runs on the server (nil: unknown).
 	Watchdog *bool `json:"watchdog"`
+	// Enforced says whether this server's lease manager would stop the primary of the group when its lease lapsed: it does
+	// only for a group that its plan says has a standby (F3-02; nil: unknown or no primary here).
+	Enforced *bool `json:"enforced"`
 }
 
 // OutOfRecovery lists the instances of the group on this server that run and are
@@ -321,7 +329,7 @@ type Peers interface {
 	Repoint(ctx context.Context, server string, r RepointRequest) (RepointAnswer, error)
 	// RecoverPrepared runs kingres.recover_prepared_transactions() on the instance of the group that is the primary
 	// on that server (the promoted instance), as the extension asks after a failover.
-	RecoverPrepared(ctx context.Context, server string, group int32) error
+	RecoverPrepared(ctx context.Context, server string, group int32, db string) error
 }
 
 // Node is a row of kingres.node.
@@ -384,11 +392,11 @@ type Catalog interface {
 	Status(ctx context.Context, db string) (term int64, superseded bool, err error)
 	// PromoteNode makes one call of kingres.promote_node(id).
 	PromoteNode(ctx context.Context, db string, id int32) (PromoteResult, error)
-	// RecoverPrepared calls kingres.recover_prepared_transactions() on the map
+	// RecoverPrepared calls kingres.recover_prepared_transactions() in database db (every database has a catalog of its own, F3-10) on the map
 	// group primary.
-	RecoverPrepared(ctx context.Context) error
-	// CheckCluster reads kingres.check_cluster().
-	CheckCluster(ctx context.Context) ([]Incident, error)
+	RecoverPrepared(ctx context.Context, db string) error
+	// CheckCluster reads kingres.check_cluster() of database db.
+	CheckCluster(ctx context.Context, db string) ([]Incident, error)
 }
 
 // StandbyRec is a standby as the leader records it (kingres_cp.standby).
@@ -411,6 +419,8 @@ type GroupFacts struct {
 	// LastKnownLsn and LastKnownAge are the primary's flush position at that check.
 	LastKnownLsn string
 	LastKnownAge time.Duration
+	// PrimaryPlanned is the number of standbys the primary's server held in its plan at the last check (F3-02).
+	PrimaryPlanned int
 	// AsyncDatabases are the databases whose durability is async.
 	AsyncDatabases []string
 }
@@ -527,6 +537,8 @@ type Rows interface {
 	// choice that is recorded and answers the recorded one (design 3.3 F4).
 	Pin(ctx context.Context, group int32, standby StandbyRec, decision, dataLoss []byte) (StandbyRec, bool, error)
 	Event(ctx context.Context, group *int32, step, kind string, detail map[string]any) error
+	// Warned says whether the run recorded something the operator should read (WarningKinds), or a group has an incident.
+	Warned(ctx context.Context) (bool, error)
 	// Finish writes the outcome of the run.
 	Finish(ctx context.Context, outcome, errText string) error
 	// Abandon closes the record of a run whose task the engine recorded as failed or
@@ -547,3 +559,14 @@ type OldPrimaryRec struct {
 	Port       int
 	InstanceID int
 }
+
+// WarningKinds are the events that make a finished run "completedWithWarnings" (F3-15): a step that never fails but
+// did not do all it could.
+var WarningKinds = []string{"repointSkipped", "repointNotStreaming", "syncNamesPending", "preparedRemain", "oldPrimaryNotStopped",
+	"recoverPreparedError", "recoverPreparedOnNewError", "checkClusterError", "standbysGoneSkipped"}
+
+// CountAutomaticSQL adds one to the counter of automatic failovers when the run of $1 is automatic and was not counted yet (design 4.4).
+const CountAutomaticSQL = `WITH c AS (UPDATE kingres_cp.failover_run SET counted = true WHERE task_id = $1 AND NOT counted AND trigger = 'automatic' RETURNING 1)
+	INSERT INTO kingres_cp.cluster_setting (key, value)
+	SELECT 'autoFailover.eventsSinceReset', to_jsonb(coalesce((SELECT (value #>> '{}')::int FROM kingres_cp.cluster_setting WHERE key = 'autoFailover.eventsSinceReset'), 0) + 1) FROM c
+	ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`

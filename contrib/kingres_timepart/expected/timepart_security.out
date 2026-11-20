@@ -46,15 +46,17 @@ SELECT proname FROM members WHERE prosecdef ORDER BY proname;
             proname             
 --------------------------------
  timepart__begin_run
+ timepart__convert_note
  timepart__finish_run
  timepart__is_sealed
  timepart__on_ddl_end
  timepart__on_sql_drop
  timepart__policy_seal_trg
  timepart__policy_seal_truncate
+ timepart__special_table
  timepart__step_begin
  timepart__step_end
-(9 rows)
+(11 rows)
 
 -- No function is executable by PUBLIC except the pure helpers and the two
 -- DDL steps that run with the caller's own rights.
@@ -63,10 +65,14 @@ SELECT proname FROM members
            proname           
 -----------------------------
  timepart__add
+ timepart__am_kind
  timepart__bound_literal
  timepart__check_phases
  timepart__check_tz
  timepart__children
+ timepart__columnar_options
+ timepart__convert_refusal
+ timepart__convert_stmts
  timepart__create_rows
  timepart__create_stmts
  timepart__eff
@@ -76,6 +82,7 @@ SELECT proname FROM members
  timepart__lock_timeout
  timepart__mark_seal
  timepart__misaligned
+ timepart__need_columnar
  timepart__oid
  timepart__on_grid
  timepart__owns
@@ -90,6 +97,7 @@ SELECT proname FROM members
  timepart__run_table
  timepart__run_visible
  timepart__setting_int
+ timepart__special_table
  timepart__stamp
  timepart__timed_out
  timepart__validate_policy
@@ -101,7 +109,7 @@ SELECT proname FROM members
  timepart_interval_parts
  timepart_part_name
  timepart_retire_one
-(39 rows)
+(45 rows)
 
 -- The policy and the history are shown to a role through security_barrier
 -- views (the rows of the tables it owns); the base tables and the lock table

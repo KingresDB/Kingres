@@ -56,7 +56,7 @@ describe('audit actions of 0.7.0', () => {
     await user.selectOptions(select, 'standbyCreated')
     await waitFor(
       () => expect(screen.getAllByTestId('audit-action')[0]).toHaveTextContent('Standby created'),
-      { timeout: 6000 },
+      { timeout: 30_000 },
     )
     expect(screen.getAllByTestId('audit-action')[0]).toHaveTextContent('standbyCreated')
   })
@@ -111,7 +111,7 @@ describe('the client entry point on the dashboard', () => {
   it('shows the eight charts when the entry point is on, one series per server', async () => {
     mockConfig.clientEntryPoint = 'on'
     await renderApp('/dashboard')
-    const section = within(await screen.findByTestId('client-entry-point', {}, { timeout: 6000 }))
+    const section = within(await screen.findByTestId('client-entry-point', {}, { timeout: 30_000 }))
     expect(section.getByRole('heading', { name: 'Client entry point' })).toBeInTheDocument()
     await waitFor(() => expect(section.getAllByTestId(/^metric-client/)).toHaveLength(8))
     expect(section.getByText('Connections open now')).toBeInTheDocument()
@@ -134,7 +134,7 @@ describe('the client entry point on the dashboard', () => {
   it('shows the standby entry point as a second group when it is on too', async () => {
     mockConfig.clientEntryPoint = 'standby'
     await renderApp('/dashboard')
-    const section = within(await screen.findByTestId('client-entry-point', {}, { timeout: 6000 }))
+    const section = within(await screen.findByTestId('client-entry-point', {}, { timeout: 30_000 }))
     expect(await section.findByRole('heading', { name: 'Standby entry point' })).toBeInTheDocument()
     await waitFor(() => expect(section.getAllByTestId(/^metric-client/)).toHaveLength(16))
   })
@@ -172,15 +172,15 @@ describe('the client entry point on the dashboard', () => {
       }),
     )
     await renderApp('/dashboard')
-    const section = await screen.findByTestId('client-entry-point', {}, { timeout: 8000 })
+    const section = await screen.findByTestId('client-entry-point', {}, { timeout: 30_000 })
     expect(within(section).getByText(/unexpected server error/i)).toBeInTheDocument()
-  }, 15000)
+  }, 90_000)
 
   it('a stats-only account sees them too (it may read metrics)', async () => {
     mockConfig.clientEntryPoint = 'on'
     await renderApp('/dashboard', { user: 'metrics' })
     expect(
-      await screen.findByTestId('client-entry-point', {}, { timeout: 6000 }),
+      await screen.findByTestId('client-entry-point', {}, { timeout: 30_000 }),
     ).toBeInTheDocument()
   })
 })

@@ -328,3 +328,9 @@ func (a *Agent) primaryGroups() []int32 {
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out
 }
+
+// PlanEntries are the standbys of the cluster as this server was last told (the plan file): a candidate for the map group reads
+// the standbys of group 0 from it when the system database is not writable (design 3.4).
+func (a *Agent) PlanEntries() []Entry {
+	return append([]Entry(nil), a.local.snapshot().Standbys...)
+}

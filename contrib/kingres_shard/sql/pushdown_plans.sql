@@ -32,7 +32,7 @@ SELECT kingres.create_reference_table('r');
 INSERT INTO kingres.node (node_id, group_id, host, port, role)
   VALUES (2, 1, '127.0.0.1', 1, 'primary');
 UPDATE kingres.bucket_map SET group_id = 1 WHERE bucket % 2 = 1;
-UPDATE kingres.bucket_map SET group_id = 1 WHERE colocation_id = 2 AND bucket % 2 = 0;
+UPDATE kingres.bucket_map SET group_id = 1 WHERE colocation_id = (SELECT colocation_id FROM kingres.dist_table WHERE relid = 'away'::regclass) AND bucket % 2 = 0;
 
 -- The plan of a statement, one line per row, with the placement number (a hash of the map) hidden.
 CREATE FUNCTION plan_of(q text) RETURNS SETOF text LANGUAGE plpgsql AS $$

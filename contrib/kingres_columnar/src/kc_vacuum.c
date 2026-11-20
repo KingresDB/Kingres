@@ -28,11 +28,14 @@
 #include "access/skey.h"
 #include "access/table.h"
 #include "access/xact.h"
+#include "catalog/index.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_class.h"
 #include "catalog/storage.h"
 #include "commands/dbcommands.h"
 #include "commands/vacuum.h"
+#include "access/genam.h"
+#include "postmaster/autovacuum.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -164,10 +167,105 @@ kc_truncate_tail(Relation rel)
 		{
 			RelationTruncate(rel, need);
 			cut = true;
+			kc_meta_free_trim(rel, need);
 		}
 	}
 	UnlockRelation(rel, AccessExclusiveLock);
 	return cut;
+}
+
+/*
+ * Free extents (increment C8): list the blocks of the file that no stripe any snapshot can still
+ * see occupies, for the writers to take before they extend the file.  What is free is what no
+ * non-removable catalog row version needs (kc_catalog_live_blocks), within the file past the
+ * metapage, and that is only true while no writer is running, because pages written for a
+ * stripe whose catalog row is not there yet belong to nobody the catalog knows.  A lock that
+ * conflicts with ROW EXCLUSIVE (SHARE) is therefore taken without waiting, retried like the
+ * truncation's (every 50 ms for the same time), and given up for this visit when writers do not
+ * leave: the list is made at the next VACUUM.  Held only for the catalog read and the metapage
+ * write.  SHARE is not WAL-logged, so a standby does not see it.
+ */
+static void
+kc_free_space(Relation rel)
+{
+	int			retry = 0;
+	TransactionId oldest;
+	TransactionId horizon;
+	BlockNumber nblocks;
+	KcRowRange *live;
+	int			nlive;
+	KcFreeExtent *fr;
+	int			nfr = 0;
+	KcFreeExtent cur[KC_MAX_FREE_EXTENTS];
+	int			ncur;
+	uint64		pos = 1;
+	int			i;
+	bool		newly = false;
+	bool		same;
+
+	while (!ConditionalLockRelation(rel, ShareLock))
+	{
+		CHECK_FOR_INTERRUPTS();
+		if (++retry > (kc_guc_truncate_lock_timeout / KC_TRUNCATE_LOCK_WAIT_INTERVAL))
+		{
+			ereport(DEBUG2,
+					(errmsg("\"%s\": the list of free blocks is not made: writers did not leave",
+							RelationGetRelationName(rel))));
+			return;
+		}
+		(void) WaitLatch(MyLatch,
+						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 KC_TRUNCATE_LOCK_WAIT_INTERVAL,
+						 WAIT_EVENT_VACUUM_TRUNCATE);
+		ResetLatch(MyLatch);
+	}
+
+	oldest = GetOldestNonRemovableTransactionId(rel);
+	nblocks = RelationGetNumberOfBlocks(rel);
+	live = kc_catalog_live_blocks(rel, oldest, &nlive, &horizon);
+	fr = palloc(sizeof(KcFreeExtent) * (nlive + 2));
+	for (i = 0; i <= nlive; i++)
+	{
+		uint64		upto = (i < nlive) ? Min(live[i].first, (uint64) nblocks) : (uint64) nblocks;
+
+		if (upto > pos && upto - pos < PG_UINT32_MAX)
+		{
+			fr[nfr].first = (uint32) pos;
+			fr[nfr].nblocks = (uint32) (upto - pos);
+			nfr++;
+		}
+		if (i < nlive && live[i].end > pos)
+			pos = live[i].end;
+	}
+
+	/* the horizon is needed when the list gets blocks it did not hold */
+	ncur = kc_meta_free_read(rel, cur, KC_MAX_FREE_EXTENTS);
+	for (i = 0; i < nfr && !newly; i++)
+	{
+		int			j;
+		bool		covered = false;
+
+		for (j = 0; j < ncur; j++)
+			if (cur[j].first <= fr[i].first &&
+				(uint64) cur[j].first + cur[j].nblocks >= (uint64) fr[i].first + fr[i].nblocks)
+			{
+				covered = true;
+				break;
+			}
+		if (!covered)
+			newly = true;
+	}
+	same = (ncur == nfr);
+	for (i = 0; same && i < nfr; i++)
+		if (cur[i].first != fr[i].first || cur[i].nblocks != fr[i].nblocks)
+			same = false;
+	if (!same)
+		kc_meta_free_install(rel, fr, nfr, newly ? horizon : InvalidTransactionId);
+
+	UnlockRelation(rel, ShareLock);
+	pfree(fr);
+	if (live)
+		pfree(live);
 }
 
 /*
@@ -230,6 +328,109 @@ kc_stored_relfrozenxid(Relation rel)
 	return result;
 }
 
+/*
+ * Index vacuum (C6c): the entries of a table's indexes whose row is in no stripe that
+ * anyone can use and under no claim of a live writer are removed, as heap's vacuum
+ * removes the entries of dead rows.  What is dead: the rows of writers that aborted
+ * (a stripe row or a reserved row of an aborted transaction or subtransaction, or of a
+ * backend that died) and of stripes that were removed.  What is never dead: a number in a
+ * stripe or under the claim of a transaction in progress, also a prepared one, and every
+ * number at or above kc_catalog_live_ranges' "low" (the claims of running writers and
+ * what the metapage hands out from now on, which the vacuum cannot know about).  A
+ * number is never given to another row while an entry may name it (a number whose
+ * writer aborted is not given back, kc_write.c), so a removed entry is gone for good and
+ * a kept one only costs space.
+ */
+typedef struct KcVacState
+{
+	KcRowRange *r;
+	int			n;
+	uint64		low;
+	double		removed;
+} KcVacState;
+
+static bool
+kc_vacuum_dead(ItemPointer itemptr, void *state)
+{
+	KcVacState *s = (KcVacState *) state;
+	uint64		row = (uint64) ItemPointerGetBlockNumber(itemptr) * MaxOffsetNumber +
+		(ItemPointerGetOffsetNumber(itemptr) - 1);
+	int			lo = 0;
+	int			hi = s->n - 1;
+
+	if (row >= s->low)
+		return false;
+	while (lo <= hi)
+	{
+		int			mid = lo + (hi - lo) / 2;
+
+		if (s->r[mid].first > row)
+			hi = mid - 1;
+		else if (s->r[mid].end <= row)
+			lo = mid + 1;
+		else
+			return false;
+	}
+	s->removed += 1;
+	return true;
+}
+
+void
+kc_index_vacuum(Relation rel, bool skip, double live_rows, BufferAccessStrategy bstrategy)
+{
+	Relation   *Irel;
+	int			nindexes;
+	KcMetaData	meta;
+	KcVacState	st;
+	int			i;
+
+	if (skip || !rel->rd_rel->relhasindex)
+		return;
+	vac_open_indexes(rel, RowExclusiveLock, &nindexes, &Irel);
+	if (nindexes == 0)
+	{
+		vac_close_indexes(nindexes, Irel, RowExclusiveLock);
+		return;
+	}
+
+	/* the metapage and the catalog in step: no claim is half made while this is held */
+	kc_reserve_lock(rel, ExclusiveLock);
+	kc_meta_read(rel, &meta);
+	st.r = kc_catalog_live_ranges(rel, GetOldestNonRemovableTransactionId(rel),
+								  meta.next_row, &st.n, &st.low);
+	kc_reserve_unlock(rel, ExclusiveLock);
+	st.removed = 0;
+
+	for (i = 0; i < nindexes; i++)
+	{
+		IndexVacuumInfo ivinfo;
+		IndexBulkDeleteResult *stats;
+
+		memset(&ivinfo, 0, sizeof(ivinfo));
+		ivinfo.index = Irel[i];
+		ivinfo.heaprel = rel;
+		ivinfo.estimated_count = false;
+		ivinfo.message_level = DEBUG2;
+		ivinfo.num_heap_tuples = live_rows;
+		ivinfo.strategy = bstrategy;
+		KC_IVINFO_AUTOVAC(ivinfo);
+
+		stats = index_bulk_delete(&ivinfo, NULL, kc_vacuum_dead, &st);
+		stats = index_vacuum_cleanup(&ivinfo, stats);
+		if (stats != NULL)
+		{
+			vac_update_relstats(Irel[i], stats->num_pages, stats->num_index_tuples, 0, 0,
+								false, InvalidTransactionId, InvalidMultiXactId,
+								NULL, NULL, false);
+			pfree(stats);
+		}
+		CHECK_FOR_INTERRUPTS();
+	}
+	vac_close_indexes(nindexes, Irel, RowExclusiveLock);
+	if (st.r)
+		pfree(st.r);
+}
+
 void
 kc_relation_vacuum(KC_VACUUM_PARAMS)
 {
@@ -265,10 +466,18 @@ kc_relation_vacuum(KC_VACUUM_PARAMS)
 
 	failsafe = kc_failsafe_active(rel);
 
+	kc_am_failed_reset();
 	(void) kc_catalog_reconcile(NULL, true);
 
 	nblocks = RelationGetNumberOfBlocks(rel);
 	rows = kc_catalog_row_total(rel, NULL, NULL, NULL, NULL);
+
+	/* the entries of the indexes of dead rows (not with INDEX_CLEANUP off) */
+	kc_index_vacuum(rel, params->index_cleanup == VACOPTVALUE_DISABLED, (double) rows, bstrategy);
+
+	/* the blocks no stripe needs, for the writers to reuse (C8): not under the wraparound failsafe, which skips the optional work */
+	if (!failsafe)
+		kc_free_space(rel);
 
 	/*
 	 * The only transaction id a columnar file holds is the one in its
@@ -282,7 +491,7 @@ kc_relation_vacuum(KC_VACUUM_PARAMS)
 	remaining = kc_meta_freeze(rel, oldest);
 	frozenxid = TransactionIdIsValid(remaining) ? remaining : oldest;
 	minmxid = GetOldestMultiXactId();
-	vac_update_relstats(rel, nblocks, (double) rows, 0, 0, false,
+	vac_update_relstats(rel, nblocks, (double) rows, 0, 0, RelationGetIndexList(rel) != NIL,
 						frozenxid, minmxid, NULL, NULL, false);
 
 	/*
@@ -299,7 +508,7 @@ kc_relation_vacuum(KC_VACUUM_PARAMS)
 		kc_truncate_tail(rel))
 	{
 		nblocks = RelationGetNumberOfBlocks(rel);
-		vac_update_relstats(rel, nblocks, (double) rows, 0, 0, false,
+		vac_update_relstats(rel, nblocks, (double) rows, 0, 0, RelationGetIndexList(rel) != NIL,
 							frozenxid, minmxid, NULL, NULL, false);
 	}
 	KC_REPORT_VACUUM(rel, (PgStat_Counter) rows, 0, starttime);
@@ -328,6 +537,101 @@ kc_relation_vacuum(KC_VACUUM_PARAMS)
 	}
 	if (pushed)
 		PopActiveSnapshot();
+}
+
+/*
+ * Index entries for the rows that compaction copied (C6d).  The copies have new row numbers,
+ * and every index of the table names rows by number, so each index gets an entry for each
+ * copy; the entries of the old numbers stay.  Nothing is rebuilt and no lock is taken that the
+ * compaction does not hold already (SHARE UPDATE EXCLUSIVE on the table, ROW EXCLUSIVE on the
+ * indexes, as a writer takes): a reader with an older snapshot still sees the old stripes and
+ * finds their rows by the old entries, a reader after the commit sees the copies and finds them
+ * by the new ones, and the entries that name rows no snapshot can see are removed by the next
+ * VACUUM (the ranges of stripes deleted before the oldest snapshot are not live).  The entries
+ * are made without a uniqueness check: the key of a copy is the key of its source, which is
+ * still in the index, and the check of any other writer sees both (the source's rows are
+ * the table's rows while their deleter runs, the copy's wait for the compaction).
+ * The rows are read from the stripes the compaction wrote, identified by their first row.
+ */
+static void
+kc_compact_index_entries(Relation rel, uint64 *firsts, int nfirst)
+{
+	List	   *ilist = RelationGetIndexList(rel);
+	int			nidx = list_length(ilist);
+	Relation   *Irel;
+	IndexInfo **info;
+	ExprState **pred;
+	EState	   *estate;
+	ExprContext *econtext;
+	TupleTableSlot *slot;
+	KcScan	   *scan;
+	ListCell   *lc;
+	int			i;
+	int			ns = 0;
+	Datum		values[INDEX_MAX_KEYS];
+	bool		isnull[INDEX_MAX_KEYS];
+
+	if (nidx == 0 || nfirst == 0)
+		return;
+	Irel = palloc(sizeof(Relation) * nidx);
+	info = palloc(sizeof(IndexInfo *) * nidx);
+	pred = palloc0(sizeof(ExprState *) * nidx);
+	i = 0;
+	foreach(lc, ilist)
+	{
+		Irel[i] = index_open(lfirst_oid(lc), RowExclusiveLock);
+		info[i] = BuildIndexInfo(Irel[i]);
+		i++;
+	}
+	estate = CreateExecutorState();
+	econtext = GetPerTupleExprContext(estate);
+	slot = table_slot_create(rel, NULL);
+	econtext->ecxt_scantuple = slot;
+	for (i = 0; i < nidx; i++)
+		pred[i] = ExecPrepareQual(info[i]->ii_Predicate, estate);
+
+	scan = kc_scan_begin(rel, NULL, NULL, NULL, KC_SCAN_MAINTENANCE);
+	for (i = 0; i < scan->nstripes; i++)
+	{
+		KcStripeInfo *si = &scan->stripes[i];
+		int			j;
+		bool		mine = false;
+
+		if (si->own)
+			for (j = 0; j < nfirst; j++)
+				if (firsts[j] == si->first_row)
+				{
+					mine = true;
+					break;
+				}
+		if (mine)
+			scan->stripes[ns++] = *si;
+	}
+	scan->nstripes = ns;
+	kc_scan_drop_hold(scan);
+	while (kc_scan_next(scan, slot))
+	{
+		CHECK_FOR_INTERRUPTS();
+		for (i = 0; i < nidx; i++)
+		{
+			MemoryContextReset(econtext->ecxt_per_tuple_memory);
+			if (pred[i] != NULL && !ExecQual(pred[i], econtext))
+				continue;
+			FormIndexDatum(info[i], slot, estate, values, isnull);
+			index_insert(Irel[i], values, isnull, &slot->tts_tid, rel,
+						 UNIQUE_CHECK_NO, false, info[i]);
+		}
+	}
+	kc_scan_end(scan);
+	ExecDropSingleTupleTableSlot(slot);
+	FreeExecutorState(estate);
+	for (i = 0; i < nidx; i++)
+	{
+		info[i]->ii_ExpressionsState = NIL;
+		info[i]->ii_PredicateState = NULL;
+		index_close(Irel[i], NoLock);
+	}
+	list_free(ilist);
 }
 
 /*
@@ -414,7 +718,7 @@ kc_compact(Relation rel, uint32 min_rows)
 		while (kc_scan_next(scan, slot))
 		{
 			slot_getallattrs(slot);
-			kc_write_row_values(rel, slot->tts_values, slot->tts_isnull, cid);
+			kc_write_row_values(rel, slot->tts_values, slot->tts_isnull, cid, NULL);
 			rows++;
 			CHECK_FOR_INTERRUPTS();
 		}
@@ -439,5 +743,14 @@ kc_compact(Relation rel, uint32 min_rows)
 	}
 	kc_scan_end(scan);
 	kc_write_maintenance_flush(rel);
+
+	/* the copies have new numbers: every index of the table gets an entry for each (C6d) */
+	{
+		int			nfirst;
+		uint64	   *firsts = kc_write_maintenance_ranges(&nfirst);
+
+		kc_compact_index_entries(rel, firsts, nfirst);
+		kc_write_maintenance_discard();
+	}
 	return (int) ((rows + m.stripe_rows - 1) / m.stripe_rows);
 }

@@ -33,6 +33,12 @@
 #include "catalog/pg_class.h"
 #include "catalog/storage.h"
 #include "miscadmin.h"
+#include "replication/decode.h"
+#include "replication/logical.h"
+#include "replication/origin.h"
+#include "replication/reorderbuffer.h"
+#include "replication/snapbuild.h"
+#include "access/htup_details.h"
 #include "port/pg_crc32c.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
@@ -51,6 +57,9 @@
 #define XLOG_KC_PAGES		0x00	/* whole-page images of a stripe */
 #define XLOG_KC_META		0x10	/* whole-page image of the metapage */
 #define XLOG_KC_FREEZE		0x20	/* metapage image, its transaction id frozen */
+#define XLOG_KC_RETURN		0x30	/* metapage image, the tail of a reservation given back (0.2) */
+#define XLOG_KC_LOGICAL		0x40	/* rows of a stripe in the form of heap tuples, for decoding (C7), no page */
+#define XLOG_KC_FREE		0x50	/* metapage image, the list of free extents replaced (C8): the horizon says who must be cancelled */
 
 typedef struct xl_kc_pages
 {
@@ -64,7 +73,29 @@ typedef struct xl_kc_freeze
 	TransactionId horizon;		/* the id that was frozen: standby queries holding it conflict */
 } xl_kc_freeze;
 
+/*
+ * The record that gives the unused tail of a reservation of row numbers back
+ * (plus the page image of the metapage, like every record of this manager).
+ * Redo restores the image and ignores the fields; they say what happened to
+ * a person who reads the log.
+ */
+typedef struct xl_kc_return
+{
+	uint64		first_row;		/* the first number given back */
+	uint32		nrows;			/* how many */
+} xl_kc_return;
+
+/* the record of the rows of a stripe for logical decoding (C7): then the tuples */
+typedef struct xl_kc_logical
+{
+	RelFileLocator rlocator;
+	uint32		ntuples;
+} xl_kc_logical;
+
 #define KC_MAX_BLOCKS_PER_RECORD 32
+
+/* the point of the developer gate (kingres_columnar.reserve_gate_at) after a stripe took a free run, before it wrote a page */
+#define KC_FREE_GATE_AFTER_TAKE 5
 
 /* ------------------------------------------------------------------------
  * Errors and checksums
@@ -109,7 +140,9 @@ kc_redo(XLogReaderState *record)
 	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
 	int			b;
 
-	if (info != XLOG_KC_PAGES && info != XLOG_KC_META && info != XLOG_KC_FREEZE)
+	if (info != XLOG_KC_PAGES && info != XLOG_KC_META && info != XLOG_KC_FREEZE &&
+		info != XLOG_KC_RETURN && info != XLOG_KC_LOGICAL &&
+		info != XLOG_KC_FREE)
 		elog(PANIC, "kingres_columnar_redo: unknown op code %u", info);
 
 	/*
@@ -118,7 +151,7 @@ kc_redo(XLogReaderState *record)
 	 * getting the serialization failure.  A standby query that could hold the
 	 * id is therefore cancelled, as for the removal of a heap tuple.
 	 */
-	if (info == XLOG_KC_FREEZE && InHotStandby)
+	if ((info == XLOG_KC_FREEZE || info == XLOG_KC_FREE) && InHotStandby)
 	{
 		xl_kc_freeze *xlrec = (xl_kc_freeze *) XLogRecGetData(record);
 		RelFileLocator rlocator;
@@ -167,6 +200,26 @@ kc_desc(StringInfo buf, XLogReaderState *record)
 
 		appendStringInfo(buf, "metapage, freeze transaction id %u", xlrec->horizon);
 	}
+	else if (info == XLOG_KC_RETURN)
+	{
+		xl_kc_return *xlrec = (xl_kc_return *) XLogRecGetData(record);
+
+		appendStringInfo(buf, "metapage, row numbers " UINT64_FORMAT " and %u more given back",
+						 xlrec->first_row, xlrec->nrows);
+	}
+	else if (info == XLOG_KC_FREE)
+	{
+		xl_kc_freeze *xlrec = (xl_kc_freeze *) XLogRecGetData(record);
+
+		appendStringInfo(buf, "metapage, free extents replaced, standby queries holding transaction id %u are cancelled", xlrec->horizon);
+	}
+	else if (info == XLOG_KC_LOGICAL)
+	{
+		xl_kc_logical *xlrec = (xl_kc_logical *) XLogRecGetData(record);
+
+		appendStringInfo(buf, "%u rows of relation %u for logical decoding",
+						 xlrec->ntuples, xlrec->rlocator.relNumber);
+	}
 }
 
 static const char *
@@ -180,6 +233,12 @@ kc_identify(uint8 info)
 			return "METAPAGE";
 		case XLOG_KC_FREEZE:
 			return "FREEZE";
+		case XLOG_KC_RETURN:
+			return "RETURN";
+		case XLOG_KC_LOGICAL:
+			return "LOGICAL_INSERT";
+		case XLOG_KC_FREE:
+			return "FREE_EXTENTS";
 	}
 	return NULL;
 }
@@ -191,12 +250,142 @@ kc_mask(char *pagedata, BlockNumber blkno)
 	mask_page_lsn_and_checksum((Page) pagedata);
 }
 
+
+/* ------------------------------------------------------------------------
+ * Logical decoding of inserts (increment C7)
+ * ------------------------------------------------------------------------
+ *
+ * A stripe's pages are compressed column chunks, which the decoder cannot read.  When
+ * wal_level is logical and the table is logically logged, the flush of a stripe that
+ * holds user rows also writes XLOG_KC_LOGICAL records: the rows in the form of heap tuples,
+ * a few hundred (or about a megabyte) to a record.  Redo ignores them; rm_decode queues
+ * each tuple as an INSERT of the reorder buffer, as heap_decode does for a heap insert.
+ *
+ * A record: xl_kc_logical, then for each tuple a header (len, infomask2, infomask,
+ * hoff; the fields of xl_heap_header, with the length of what follows) and the bytes of
+ * the tuple after its fixed header.  The record is written by the transaction (or
+ * subtransaction) that writes the stripe, which is the one whose commit makes the stripe's
+ * catalog row visible, so the decoder emits the rows exactly when a reader could see them.
+ */
+#define KC_LOGICAL_TUPLE_HDR	9	/* uint32 len, uint16 infomask2, uint16 infomask, uint8 hoff */
+
+void
+kc_xlog_logical(Relation rel, uint32 ntuples, const char *data, Size len)
+{
+	xl_kc_logical xlrec;
+
+	xlrec.rlocator = rel->rd_locator;
+	xlrec.ntuples = ntuples;
+	XLogBeginInsert();
+	XLogRegisterData((char *) &xlrec, sizeof(xlrec));
+	XLogRegisterData((char *) data, len);
+	/* filtering by origin on a row level is much more efficient (as heap does) */
+	XLogSetRecordFlags(XLOG_INCLUDE_ORIGIN);
+	(void) XLogInsert(KC_RMGR_ID, XLOG_KC_LOGICAL);
+}
+
+/* Append a tuple the way a record holds it. */
+void
+kc_logical_append_tuple(StringInfo sb, HeapTuple tuple)
+{
+	uint32		len = tuple->t_len - SizeofHeapTupleHeader;
+	uint16		infomask2 = tuple->t_data->t_infomask2;
+	uint16		infomask = tuple->t_data->t_infomask;
+	uint8		hoff = tuple->t_data->t_hoff;
+
+	appendBinaryStringInfo(sb, (char *) &len, sizeof(len));
+	appendBinaryStringInfo(sb, (char *) &infomask2, sizeof(infomask2));
+	appendBinaryStringInfo(sb, (char *) &infomask, sizeof(infomask));
+	appendBinaryStringInfo(sb, (char *) &hoff, sizeof(hoff));
+	appendBinaryStringInfo(sb, ((char *) tuple->t_data) + SizeofHeapTupleHeader, len);
+}
+
+/*
+ * rm_decode: queue the tuples of the record as inserts, as DecodeInsert does for one heap
+ * tuple.  Everything the decoder asks of a heap record is asked here: the xid is processed
+ * first for every record; nothing is queued before the snapshot builder has a full snapshot,
+ * for a change the builder does not want, in fast-forward mode, in another database or for an
+ * origin the output plugin filters.
+ */
+static void
+kc_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
+{
+	XLogReaderState *r = buf->record;
+	uint8		info = XLogRecGetInfo(r) & ~XLR_INFO_MASK;
+	TransactionId xid = XLogRecGetXid(r);
+	SnapBuild  *builder = ctx->snapshot_builder;
+	xl_kc_logical *xlrec;
+	const char *p;
+	const char *end;
+	uint32		i;
+
+	ReorderBufferProcessXid(ctx->reorder, xid, buf->origptr);
+	if (SnapBuildCurrentState(builder) < SNAPBUILD_FULL_SNAPSHOT)
+		return;
+	if (info != XLOG_KC_LOGICAL)
+		return;
+	if (!SnapBuildProcessChange(builder, xid, buf->origptr) || ctx->fast_forward)
+		return;
+
+	xlrec = (xl_kc_logical *) XLogRecGetData(r);
+	if (xlrec->rlocator.dbOid != ctx->slot->data.database)
+		return;
+	if (ctx->callbacks.filter_by_origin_cb != NULL &&
+		filter_by_origin_cb_wrapper(ctx, XLogRecGetOrigin(r)))
+		return;
+
+	p = (const char *) XLogRecGetData(r) + sizeof(xl_kc_logical);
+	end = (const char *) XLogRecGetData(r) + XLogRecGetDataLen(r);
+	for (i = 0; i < xlrec->ntuples; i++)
+	{
+		ReorderBufferChange *change;
+		HeapTuple	tuple;
+		uint32		len;
+		uint16		infomask2;
+		uint16		infomask;
+		uint8		hoff;
+		HeapTupleHeader header;
+
+		if (end - p < KC_LOGICAL_TUPLE_HDR)
+			elog(ERROR, "kingres_columnar: a logical record is truncated");
+		memcpy(&len, p, sizeof(len));
+		memcpy(&infomask2, p + 4, sizeof(infomask2));
+		memcpy(&infomask, p + 6, sizeof(infomask));
+		memcpy(&hoff, p + 8, sizeof(hoff));
+		p += KC_LOGICAL_TUPLE_HDR;
+		if ((Size) (end - p) < len)
+			elog(ERROR, "kingres_columnar: a logical record is truncated");
+
+		change = ReorderBufferAllocChange(ctx->reorder);
+		change->action = REORDER_BUFFER_CHANGE_INSERT;
+		change->origin_id = XLogRecGetOrigin(r);
+		memcpy(&change->data.tp.rlocator, &xlrec->rlocator, sizeof(RelFileLocator));
+
+		tuple = ReorderBufferAllocTupleBuf(ctx->reorder, len);
+		tuple->t_len = len + SizeofHeapTupleHeader;
+		ItemPointerSetInvalid(&tuple->t_self);
+		tuple->t_tableOid = InvalidOid;
+		header = tuple->t_data;
+		memset(header, 0, SizeofHeapTupleHeader);
+		memcpy(((char *) header) + SizeofHeapTupleHeader, p, len);
+		header->t_infomask = infomask;
+		header->t_infomask2 = infomask2;
+		header->t_hoff = hoff;
+		p += len;
+
+		change->data.tp.newtuple = tuple;
+		change->data.tp.clear_toast_afterwards = true;
+		ReorderBufferQueueChange(ctx->reorder, xid, buf->origptr, change, false);
+	}
+}
+
 static const RmgrData kc_rmgr = {
 	.rm_name = "KingresColumnar",
 	.rm_redo = kc_redo,
 	.rm_desc = kc_desc,
 	.rm_identify = kc_identify,
 	.rm_mask = kc_mask,
+	.rm_decode = kc_decode,
 };
 
 /*
@@ -227,7 +416,8 @@ kc_meta_seal(KcMetaData *m)
 static void
 kc_meta_format(Page page, const KcOptions *opts, uint64 next_row,
 			   uint64 next_stripe, uint64 uid, TransactionId xid,
-			   uint32 flags, Oid relid, TransactionId table_xid)
+			   uint32 flags, Oid relid, TransactionId table_xid,
+			   uint32 version)
 {
 	KcMetaData *m;
 
@@ -235,7 +425,7 @@ kc_meta_format(Page page, const KcOptions *opts, uint64 next_row,
 	m = (KcMetaData *) PageGetContents(page);
 	memset(m, 0, sizeof(*m));
 	m->magic = KC_META_MAGIC;
-	m->version = KC_META_VERSION;
+	m->version = version;
 	m->codec = opts->codec;
 	m->level = opts->level;
 	m->stripe_rows = opts->stripe_rows;
@@ -287,9 +477,14 @@ kc_meta_init_storage(Relation rel, const RelFileLocator *rlocator,
 		if (tries >= 16)
 			elog(ERROR, "could not find an unused identity for a columnar file");
 	}
+	/*
+	 * Version 3 only where the stripe catalog can hold what a reservation
+	 * leaves in it (0.2); with the catalog of 0.1 the file is what 0.1 writes.
+	 */
 	kc_meta_format((Page) buf, opts, 0, 1, uid, GetCurrentTransactionId(),
 			   replaces_content ? KC_META_REPLACES_CONTENT : 0,
-			   RelationGetRelid(rel), table_xid);
+			   RelationGetRelid(rel), table_xid,
+			   kc_catalog_has_reserved() ? KC_META_VERSION_RESERVE : KC_META_VERSION_BASE);
 	smgr_bulk_write(bulk, 0, buf, true);
 	smgr_bulk_finish(bulk);
 	smgrclose(srel);
@@ -312,12 +507,12 @@ kc_meta_check(Relation rel, Page page)
 		if ((uint32) kc_crc32c((const char *) &copy, sizeof(copy)) != m->crc)
 			kc_corrupt(rel, 0, "the metapage checksum does not match");
 	}
-	if (m->version != KC_META_VERSION)
+	if (m->version != KC_META_VERSION_BASE && m->version != KC_META_VERSION_RESERVE)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("columnar table \"%s\" has format version %u, this server reads version %u",
+				 errmsg("columnar table \"%s\" has format version %u, this server reads versions %u and %u",
 						RelationGetRelationName(rel), m->version,
-						KC_META_VERSION)));
+						KC_META_VERSION_BASE, KC_META_VERSION_RESERVE)));
 	if (m->codec > KC_CODEC_ZSTD ||
 		m->stripe_rows < KC_MIN_STRIPE_ROWS || m->stripe_rows > KC_MAX_STRIPE_ROWS ||
 		m->chunk_rows < KC_MIN_CHUNK_ROWS || m->chunk_rows > KC_MAX_CHUNK_ROWS)
@@ -378,7 +573,7 @@ kc_meta_allocate(Relation rel, uint32 nrows, uint64 *stripe_id,
 
 	*stripe_id = m->next_stripe_id;
 	*first_row = m->next_row;
-	if (m->next_row > PG_INT64_MAX - nrows || m->next_stripe_id >= PG_INT64_MAX)
+	if (m->next_row > KC_MAX_ROW_NUMBER - nrows || m->next_stripe_id >= PG_INT64_MAX)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("columnar table \"%s\" has no row numbers left",
@@ -392,6 +587,56 @@ kc_meta_allocate(Relation rel, uint32 nrows, uint64 *stripe_id,
 	kc_meta_log_and_release(rel, buf);
 	END_CRIT_SECTION();
 	UnlockReleaseBuffer(buf);
+}
+
+/*
+ * Give back the unused tail [first_row, first_row + nrows) of a reservation
+ * made by kc_meta_allocate, when it is still the end of the range: nobody has
+ * reserved after it, so the next number to hand out goes back to first_row.
+ * Otherwise the numbers stay unused, a gap (the answer is false).  Under the
+ * exclusive lock of the metapage, so the test and the change are one step.  The
+ * caller has already made the claim on the numbers smaller (the catalog row of
+ * the stripe says how many rows it has), so that no moment exists at which
+ * numbers are free and still claimed.  Not for numbers a row was given: those
+ * are never given back (a later index entry may name them).
+ */
+bool
+kc_meta_return(Relation rel, uint64 first_row, uint32 nrows)
+{
+	Buffer		buf = ReadBuffer(rel, 0);
+	Page		page;
+	KcMetaData *m;
+
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(buf);
+	m = kc_meta_check(rel, page);
+
+	if (nrows == 0 || m->next_row != first_row + nrows)
+	{
+		UnlockReleaseBuffer(buf);
+		return false;
+	}
+
+	START_CRIT_SECTION();
+	m->next_row = first_row;
+	kc_meta_seal(m);
+	MarkBufferDirty(buf);
+	if (RelationNeedsWAL(rel))
+	{
+		XLogRecPtr	recptr;
+		xl_kc_return xlrec;
+
+		xlrec.first_row = first_row;
+		xlrec.nrows = nrows;
+		XLogBeginInsert();
+		XLogRegisterData(&xlrec, sizeof(xlrec));
+		XLogRegisterBuffer(0, buf, REGBUF_FORCE_IMAGE | REGBUF_STANDARD);
+		recptr = XLogInsert(KC_RMGR_ID, XLOG_KC_RETURN);
+		PageSetLSN(BufferGetPage(buf), recptr);
+	}
+	END_CRIT_SECTION();
+	UnlockReleaseBuffer(buf);
+	return true;
 }
 
 void
@@ -550,6 +795,278 @@ kc_meta_set_created_xid(Relation rel, TransactionId xid)
 	CacheInvalidateRelcache(rel);
 }
 
+
+/* ------------------------------------------------------------------------
+ * Free extents (increment C8)
+ * ------------------------------------------------------------------------
+ *
+ * The list sits in the metapage after KcMetaData.  The page is logged without its unused
+ * middle (pd_lower), so pd_lower is moved to cover the list whenever it is written.  A list that
+ * fails its checks is treated as empty (and replaced by the next VACUUM): a lost extent is lost
+ * space, nothing else.
+ */
+static KcFreeList *
+kc_free_list(Page page)
+{
+	return (KcFreeList *) ((char *) PageGetContents(page) + MAXALIGN(sizeof(KcMetaData)));
+}
+
+static uint32
+kc_free_crc(const KcFreeList *fl)
+{
+	pg_crc32c	crc;
+
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, (const char *) &fl->count, sizeof(fl->count));
+	COMP_CRC32C(crc, (const char *) fl->ext, sizeof(KcFreeExtent) * fl->count);
+	FIN_CRC32C(crc);
+	return (uint32) crc;
+}
+
+/* is the list the page holds sound, for a file of nblocks blocks? */
+static bool
+kc_free_list_ok(Page page, BlockNumber nblocks)
+{
+	KcFreeList *fl = kc_free_list(page);
+	uint32		i;
+	uint64		prev_end = 1;
+	Size		lower = (char *) fl - (char *) page + offsetof(KcFreeList, ext);
+
+	if (((PageHeader) page)->pd_lower < lower)
+		return false;			/* a page that never held a list */
+	if (fl->magic != KC_FREE_MAGIC || fl->count > KC_MAX_FREE_EXTENTS)
+		return false;
+	if (((PageHeader) page)->pd_lower < lower + sizeof(KcFreeExtent) * fl->count)
+		return false;
+	if (kc_free_crc(fl) != fl->crc)
+		return false;
+	for (i = 0; i < fl->count; i++)
+	{
+		const KcFreeExtent *e = &fl->ext[i];
+
+		/* sorted, apart, inside the file, past the metapage */
+		if (e->nblocks == 0 || e->first < prev_end || (uint64) e->first + e->nblocks > nblocks)
+			return false;
+		prev_end = (uint64) e->first + e->nblocks + 1;	/* adjacent runs are merged: a gap of a block at least */
+	}
+	return true;
+}
+
+/* write the list into the page: the caller holds the buffer exclusively, in a critical section */
+static void
+kc_free_list_store(Page page, const KcFreeExtent *ext, int n)
+{
+	KcFreeList *fl = kc_free_list(page);
+
+	memset(fl, 0, offsetof(KcFreeList, ext) + sizeof(KcFreeExtent) * KC_MAX_FREE_EXTENTS);
+	fl->magic = KC_FREE_MAGIC;
+	fl->count = n;
+	if (n > 0)
+		memcpy(fl->ext, ext, sizeof(KcFreeExtent) * n);
+	fl->crc = kc_free_crc(fl);
+	((PageHeader) page)->pd_lower =
+		(char *) fl - (char *) page + offsetof(KcFreeList, ext) + sizeof(KcFreeExtent) * n;
+}
+
+/*
+ * A run of npages free blocks for a stripe, taken from the list before the file is extended.
+ * First fit; what is left of the extent stays.  The take is logged (the metapage image) before
+ * the caller writes a page into the run, so a crash in between loses the run's place in the list,
+ * not data: the blocks are free and the next VACUUM lists them again.
+ */
+bool
+kc_meta_take_extent(Relation rel, uint64 npages, uint64 *first_block)
+{
+	Buffer		buf;
+	Page		page;
+	KcFreeList *fl;
+	BlockNumber nblocks;
+	int			i;
+	bool		found = false;
+
+	if (npages == 0 || npages >= PG_UINT32_MAX)
+		return false;
+	buf = ReadBuffer(rel, 0);
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(buf);
+	(void) kc_meta_check(rel, page);
+	nblocks = RelationGetNumberOfBlocks(rel);
+	if (!kc_free_list_ok(page, nblocks))
+	{
+		UnlockReleaseBuffer(buf);
+		return false;
+	}
+	fl = kc_free_list(page);
+	for (i = 0; i < (int) fl->count; i++)
+		if (fl->ext[i].nblocks >= npages)
+		{
+			KcFreeExtent copy[KC_MAX_FREE_EXTENTS];
+			int			n = 0;
+			int			j;
+
+			*first_block = fl->ext[i].first;
+			for (j = 0; j < (int) fl->count; j++)
+			{
+				if (j != i)
+					copy[n++] = fl->ext[j];
+				else if (fl->ext[i].nblocks > npages)
+				{
+					copy[n].first = fl->ext[i].first + (uint32) npages;
+					copy[n].nblocks = fl->ext[i].nblocks - (uint32) npages;
+					n++;
+				}
+			}
+			START_CRIT_SECTION();
+			kc_free_list_store(page, copy, n);
+			MarkBufferDirty(buf);
+			kc_meta_log_and_release(rel, buf);
+			END_CRIT_SECTION();
+			found = true;
+			break;
+		}
+	UnlockReleaseBuffer(buf);
+	return found;
+}
+
+/* the extents of the list (those it holds if it is sound): how many were put in out */
+int
+kc_meta_free_read(Relation rel, KcFreeExtent *out, int cap)
+{
+	Buffer		buf = ReadBuffer(rel, 0);
+	Page		page;
+	int			n = 0;
+
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	(void) kc_meta_check(rel, page);
+	if (kc_free_list_ok(page, RelationGetNumberOfBlocks(rel)))
+	{
+		KcFreeList *fl = kc_free_list(page);
+
+		n = (int) Min(fl->count, (uint32) cap);
+		memcpy(out, fl->ext, sizeof(KcFreeExtent) * n);
+	}
+	UnlockReleaseBuffer(buf);
+	return n;
+}
+
+/*
+ * VACUUM: replace the list.  Called while no writer can run (the caller holds a lock that
+ * conflicts with ROW EXCLUSIVE), with every free run of the file (sorted, apart, merged).
+ * More than the page holds: the largest are kept, the rest stays free and unlisted.  The record
+ * carries the horizon (the newest transaction that deleted a stripe whose blocks are listed now
+ * for the first time): a standby query that may still read those blocks is cancelled before the
+ * blocks can be written again.
+ */
+void
+kc_meta_free_install(Relation rel, const KcFreeExtent *ext, int n, TransactionId horizon)
+{
+	Buffer		buf;
+	Page		page;
+	KcFreeExtent keep[KC_MAX_FREE_EXTENTS];
+	int			m = 0;
+	int			i;
+
+	if (n > KC_MAX_FREE_EXTENTS)
+	{
+		/* keep the largest, in file order */
+		uint32		cut = 0;
+		int			larger;
+
+		for (;;)
+		{
+			larger = 0;
+			for (i = 0; i < n; i++)
+				if (ext[i].nblocks > cut)
+					larger++;
+			if (larger <= KC_MAX_FREE_EXTENTS)
+				break;
+			cut++;
+		}
+		for (i = 0; i < n && m < KC_MAX_FREE_EXTENTS; i++)
+			if (ext[i].nblocks > cut)
+				keep[m++] = ext[i];
+	}
+	else if (n > 0)
+	{
+		memcpy(keep, ext, sizeof(KcFreeExtent) * n);
+		m = n;
+	}
+
+	buf = ReadBuffer(rel, 0);
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(buf);
+	(void) kc_meta_check(rel, page);
+	START_CRIT_SECTION();
+	kc_free_list_store(page, keep, m);
+	MarkBufferDirty(buf);
+	if (RelationNeedsWAL(rel))
+	{
+		XLogRecPtr	recptr;
+		xl_kc_freeze xlrec;
+
+		xlrec.horizon = horizon;
+		XLogBeginInsert();
+		XLogRegisterData(&xlrec, sizeof(xlrec));
+		XLogRegisterBuffer(0, buf, REGBUF_FORCE_IMAGE | REGBUF_STANDARD);
+		recptr = XLogInsert(KC_RMGR_ID, XLOG_KC_FREE);
+		PageSetLSN(page, recptr);
+	}
+	END_CRIT_SECTION();
+	UnlockReleaseBuffer(buf);
+}
+
+/* the file was cut to nblocks: nothing of the list may lie past the end */
+void
+kc_meta_free_trim(Relation rel, BlockNumber nblocks)
+{
+	Buffer		buf = ReadBuffer(rel, 0);
+	Page		page;
+	KcFreeList *fl;
+	KcFreeExtent keep[KC_MAX_FREE_EXTENTS];
+	int			n = 0;
+	uint32		i;
+	bool		changed = false;
+
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(buf);
+	(void) kc_meta_check(rel, page);
+	/* the file may be shorter than the list says: the list is judged by the length it had */
+	if (!kc_free_list_ok(page, PG_UINT32_MAX))
+	{
+		UnlockReleaseBuffer(buf);
+		return;
+	}
+	fl = kc_free_list(page);
+	for (i = 0; i < fl->count; i++)
+	{
+		KcFreeExtent e = fl->ext[i];
+
+		if (e.first >= nblocks)
+		{
+			changed = true;
+			continue;
+		}
+		if ((uint64) e.first + e.nblocks > nblocks)
+		{
+			e.nblocks = nblocks - e.first;
+			changed = true;
+		}
+		keep[n++] = e;
+	}
+	if (!changed)
+	{
+		UnlockReleaseBuffer(buf);
+		return;
+	}
+	START_CRIT_SECTION();
+	kc_free_list_store(page, keep, n);
+	MarkBufferDirty(buf);
+	kc_meta_log_and_release(rel, buf);
+	END_CRIT_SECTION();
+	UnlockReleaseBuffer(buf);
+}
+
 /* ------------------------------------------------------------------------
  * Stripe pages
  * ------------------------------------------------------------------------
@@ -569,6 +1086,8 @@ kc_stripe_write(Relation rel, uint64 stripe_id, const char *blob,
 	uint64		done = 0;
 	BlockNumber expected = InvalidBlockNumber;
 	BufferAccessStrategy strategy;
+	bool		reuse;
+	uint64		reuse_first = 0;
 
 	if (npages == 0)
 		npages = 1;
@@ -579,7 +1098,21 @@ kc_stripe_write(Relation rel, uint64 stripe_id, const char *blob,
 						(unsigned long long) npages)));
 
 	strategy = GetAccessStrategy(BAS_BULKWRITE);
-	LockRelationForExtension(rel, ExclusiveLock);
+
+	/*
+	 * A run of free blocks (increment C8) before the file is extended.  The take is logged
+	 * before any page is written; the pages are written over what a stripe nobody can see any
+	 * more held (VACUUM listed the run after the standby queries that could read it were
+	 * cancelled), each with a full-page image.
+	 */
+	reuse = kc_meta_take_extent(rel, npages, &reuse_first);
+	if (reuse)
+	{
+		if (kc_guc_reserve_gate != 0 && kc_guc_reserve_gate_at == KC_FREE_GATE_AFTER_TAKE)
+			kc_gate_wait(kc_guc_reserve_gate);
+	}
+	else
+		LockRelationForExtension(rel, ExclusiveLock);
 
 	while (done < npages)
 	{
@@ -589,8 +1122,17 @@ kc_stripe_write(Relation rel, uint64 stripe_id, const char *blob,
 		BlockNumber first;
 		uint32		j;
 
-		first = ExtendBufferedRelBy(BMR_REL(rel), MAIN_FORKNUM, strategy, 0,
-									want, bufs, &got);
+		if (reuse)
+		{
+			first = (BlockNumber) (reuse_first + done);
+			for (j = 0; j < want; j++)
+				bufs[j] = ReadBufferExtended(rel, MAIN_FORKNUM, first + j,
+											 RBM_ZERO_AND_LOCK, strategy);
+			got = want;
+		}
+		else
+			first = ExtendBufferedRelBy(BMR_REL(rel), MAIN_FORKNUM, strategy, 0,
+										want, bufs, &got);
 		if (got == 0)
 			elog(ERROR, "could not extend relation \"%s\"",
 				 RelationGetRelationName(rel));
@@ -613,7 +1155,8 @@ kc_stripe_write(Relation rel, uint64 stripe_id, const char *blob,
 			if (BufferGetBlockNumber(bufs[j]) != first + j)
 				elog(ERROR, "extended pages of \"%s\" are not consecutive",
 					 RelationGetRelationName(rel));
-			LockBuffer(bufs[j], BUFFER_LOCK_EXCLUSIVE);
+			if (!reuse)
+				LockBuffer(bufs[j], BUFFER_LOCK_EXCLUSIVE);
 			page = BufferGetPage(bufs[j]);
 			PageInit(page, BLCKSZ, sizeof(KcPageSpecial));
 			sp = (KcPageSpecial *) PageGetSpecialPointer(page);
@@ -664,7 +1207,8 @@ kc_stripe_write(Relation rel, uint64 stripe_id, const char *blob,
 		done += got;
 	}
 
-	UnlockRelationForExtension(rel, ExclusiveLock);
+	if (!reuse)
+		UnlockRelationForExtension(rel, ExclusiveLock);
 	FreeAccessStrategy(strategy);
 	*block_count = (uint32) npages;
 }

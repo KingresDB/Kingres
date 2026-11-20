@@ -357,8 +357,11 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	foDeps := &failoverDeps{}
 	var fos *failover.Service
 	if opsSvc != nil && svc.Enabled() && members != nil && stby != nil {
-		fos = newFailover(svc, opsSvc, members, stby, haReg, haCalls, serverHost, log, auditFn(sink, log), foDeps)
+		fos = newFailover(svc, opsSvc, members, stby, haReg, haCalls, serverHost, faultHook, cfg.DataDir, log, auditFn(sink, log), foDeps)
 		deps.Failover = fos
+		if foDeps.mf != nil {
+			deps.MapFailover = foDeps.mf
+		}
 	}
 	// The signing keys of the ledger and the scheduler that runs their jobs on the manager leader.
 	var lgs *ledgerParts
@@ -369,6 +372,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		}
 		deps.LedgerSigning = lgs.svc
 		deps.LedgerPublication = lgs.coll
+		deps.LedgerAnchoring = lgs.anchor
 	}
 	deps.LeaderTrusted = leaderTrusted(haReg, lastLeader, serverHost, cfg.HA.LeaderLossBound)
 	api, err := httpapi.New(deps)
@@ -401,6 +405,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	wg.Add(1)
 	go func() { defer wg.Done(); sessions.Run(bgCtx, time.Minute) }()
 	var engineOnce sync.Once
+	var engSwap *swapDB
 	startEngine := func(dsn string) error {
 		if opsSvc == nil {
 			return nil
@@ -411,6 +416,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 			if pool, err = pgxpool.New(bgCtx, dsn); err != nil {
 				return
 			}
+			engSwap = newSwapDB(pool, dsn)
 			var eng *task.Engine
 			defs := opsSvc.Definitions()
 			defs = append(defs, opsSvc.InstanceDefinitions()...)
@@ -432,8 +438,8 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 			if lgs != nil {
 				defs = append(defs, lgs.svc.Definitions()...)
 			}
-			eng, err = task.NewEngine(task.NewPGStore(pool), defs, task.Options{
-				Holder: fmt.Sprintf("%s-%d", hostname, os.Getpid()), Logger: log, Fault: faultHook.TaskPoint})
+			eng, err = task.NewEngine(task.NewPGStore(engSwap), defs, task.Options{
+				Holder: fmt.Sprintf("%s-%d", hostname, os.Getpid()), Logger: log, Fault: faultHook.TaskPoint, Gate: engineGate(foDeps)})
 			if err != nil {
 				return
 			}
@@ -454,11 +460,19 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 			go func() {
 				defer wg.Done()
 				runEngineOnLeader(bgCtx, eng, leaders, serverHost, members, log)
-				pool.Close()
+				engSwap.Close()
 			}()
 			if lgs != nil {
 				wg.Add(1)
 				go func() { defer wg.Done(); lgs.run(bgCtx) }()
+			}
+			if fos != nil && foDeps.mf != nil {
+				auto := newAutoFailover(foDeps.mf, fos, rbs, leaders, serverHost, cfg.HA.FailureTimeout, log)
+				wg.Add(1)
+				go func() { defer wg.Done(); auto.Run(bgCtx) }()
+				mm := newMapMonitor(foDeps.mf, cfg.HA.FailureTimeout)
+				wg.Add(1)
+				go func() { defer wg.Done(); mm.Run(bgCtx) }()
 			}
 		})
 		return err
@@ -467,10 +481,17 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		if err := startEngine(d); err != nil {
 			return err
 		}
+		if engSwap != nil {
+			// the system database moved (a map group failover): the task store follows it
+			if err := engSwap.Reconnect(bgCtx, d); err != nil {
+				return err
+			}
+		}
 		if err := pg.SetDSN(d); err != nil {
 			return err
 		}
-		return authn.SetDSN(d)
+		// the sign-in checks the roles of this server's own instance (they are on every primary): not the system database that moved
+		return authn.SetDSN(svc.ServiceDSN("kingres_system"))
 	})
 	if proxy != nil && svc.Manager().Exists(cluster.NodeID) {
 		if err := proxy.Reset(); err != nil {
@@ -509,6 +530,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		hd.PC = members.Client
 	}
 	foDeps.d = hd
+	hd.MapFailover = foDeps.mf
 	if cfgp != nil {
 		cfgp.start(hd, haCalls)
 	}
@@ -516,6 +538,9 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		cancelBG()
 		wg.Wait()
 		return fmt.Errorf("starting high availability: %w", err)
+	}
+	if hd.MapFailover != nil {
+		hd.MapFailover.ResumeOnStart()
 	}
 
 	if cfg.InternalListen != "" && svc.Enabled() {

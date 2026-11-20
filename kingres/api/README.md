@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.11.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.13.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and `kingres-cli`. Lint it and run the mechanical rule check with:
 
 ```
@@ -318,6 +318,60 @@ Where the architecture document leaves something open, the simplest option was c
 
 ## Changelog
 
+### 0.13.0
+
+Revision written with the failover of the map group (increment 5 of `kingres/docs/design/ha-phase5-part2.md`). Summary for the panel:
+0 operations added (132 operations, 108 paths); one value added to an enum, the meaning of one id and the answer of one operation
+extended; **no change that is not additive**.
+
+#### Breaking
+
+None.
+
+#### Additive
+
+- `AlertKind` has `certificateAuthorityUnavailable` (`critical`, subject `cluster`): the map group was failed over, the new manager leader
+  holds no key of the certificate authority, and no certificate can be issued, renewed or revoked until the operator restores `pki/ca.key` and
+  `pki/revoked.json` from the backup of the old leader. A client that does not know the kind shows it as an alert of an unknown kind.
+- `failoverServer` for the server that runs the primary of the map group (the manager leader) is answered by any server that does not hear it:
+  202 with a `Task` whose `id` is 0 while no task can be recorded (the steps of the bootstrap, `state` `running`), `Location: /api/v1/failover`.
+  `GET /tasks/0` and `GET /failover` are answered by the server that runs the bootstrap until the task is recorded; `GET /failover` then names it
+  in `taskId`. In mode `hard` only; `dryRun` and `graceful` answer 422 `unsupported_operation`.
+
+#### Documentation
+
+- `Task.id`: 0 is the task that stands for the bootstrap; it never names a stored task.
+- The console should show: the pseudo task (a progress bar of the eight steps B1 to B8 while `id` is 0, then the recorded task), the paused
+  rebalance (`stoppedBy` `safetyRule`, text "The map group was failed over."), and the alert `certificateAuthorityUnavailable` with the
+  steps of its message.
+
+### 0.12.0
+
+Revision written with the fixes for the review of the manual failover and the map group (kingresd). Summary for the panel:
+0 operations added (132 operations, 108 paths); one value added to an enum, one optional property added to a schema, the text of one
+state corrected; **no change that is not additive**.
+
+#### Breaking
+
+None.
+
+#### Additive
+
+- `FailoverReportSummary.outcome` has the value `completedWithWarnings`: every group was moved, and something that never fails a
+  step was left undone or needs reading (a standby that could not be pointed at the new primary, a list of synchronous standbys that is
+  still empty, prepared transactions that remain, an incident of `check_cluster`, a skipped call). A client that knows `completed`
+  only must show it like `completed` and offer the report.
+- `Problem.plan` (`FailoverPlan`, optional): present only on 409 `failover_needs_decision`; it is the plan that `dryRun` would answer, so
+  that the console shows the groups, the candidates and the verdict of the refusal without a second request.
+
+#### Documentation
+
+- `FailoverOldPrimary.state` `notScheduled`: the text said that this revision does not rebuild the old primary. It does (the states
+  `rebuildScheduled`, `rebuilding` and `standby` exist); `notScheduled` is now the record of an earlier revision and of a group whose
+  old primary has no directory to rebuild.
+- A failover and the creation or drop of a database, or the distribution of a table, exclude each other (409
+  `failover_in_progress` for the database operations, `operation_in_progress` for the failover); the web console shows the message.
+
 ### 0.11.0
 
 Revision written with phase 7 of the ledger, signing, publication and anchoring (steps 3 and 4 of the implementation plan of
@@ -370,6 +424,15 @@ Implemented by `kingresd` with revision 0.11.0 first: `getLedgerSettings`, `upda
 subject `ledgerKey` with the id `signing`, and their task error codes are not an enum (clients tolerate codes they do not know): `key_set_damaged`,
 `clock`, `term_over`, `not_leader`, `last_signing_key`, `key_files_remain`, `key_file_missing`, `signer_unavailable`, `cannot_sign`, `cannot_activate`,
 `cannot_retire`, `cannot_revoke`, `trust_file`, `key_id_collision`.
+
+Step 10 of the plan adds, **without a change of the contract**, `listLedgerAnchorTargets`, `createLedgerAnchorTarget`, `getLedgerAnchorTarget`, `updateLedgerAnchorTarget`,
+`deleteLedgerAnchorTarget`, `testLedgerAnchorTarget`, `listLedgerAnchors`, `anchorLedgerNow`, `retryLedgerAnchor` and `downloadLedgerAnchor` (the WORM target; the
+formats `ots` and `tsr` of the download answer 422 `unprocessable` until their targets are built). Decisions where the contract is silent: a target is created
+disabled unless `enabled` is true, and enabling a target of a kind that needs credentials without them is 400 `validation_failed`; `credentials` is read once and never
+returned (`credentialsSet` says whether they are stored; an empty object removes them, `null` or an absent member changes nothing); `config.credentialsPath` names the
+operator's own credentials file instead; the state `claimed` of an OpenTimestamps record is shown as `submitted` in `LedgerAnchor.state` and never counts as anchored;
+a record of a deleted target has `targetId: null` and keeps `targetName`; `retryLedgerAnchor` answers 409 `conflict` for a record that is not `failed` or `expired`;
+a follower forwards all ten to the manager leader, which holds the term (503 with `Retry-After` while a new leader has none).
 
 What is secret and what is not: a private key, a seed, a passphrase and a credential of an anchor target are never part of an answer, a task,
 an audit entry or an error; the public key, the fingerprint and the trust file are public and the trust file is not a source of first trust

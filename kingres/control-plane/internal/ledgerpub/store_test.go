@@ -155,7 +155,7 @@ func testStore(t *testing.T, mk func(t *testing.T) *fixture) {
 		if err := f.store.PutCheckpoint(bg, old, ledgerpub.Checkpoint{LogID: l.ID, Size: 0, Root: l.Root, Note: []byte("n"), SignedAt: time.Now()}, f.rev(), false, ""); !errors.Is(err, scheduler.ErrDeposed) {
 			t.Errorf("PutCheckpoint: %v", err)
 		}
-		if err := f.store.ReplaceNote(bg, old, l.ID, 1, []byte("x")); !errors.Is(err, scheduler.ErrDeposed) {
+		if err := f.store.ReplaceNote(bg, old, l.ID, 1, []byte("x"), f.rev()); !errors.Is(err, scheduler.ErrDeposed) {
 			t.Errorf("ReplaceNote: %v", err)
 		}
 		got, _ := f.store.LogByOrigin(bg, l.Origin)
@@ -203,6 +203,7 @@ func testStore(t *testing.T, mk func(t *testing.T) *fixture) {
 		cur, _ := f.store.LogByOrigin(bg, l.Origin)
 		size7, root7 := grow(t, f, cur, 5, 2)
 		// a checkpoint for a smaller tree than the stored one is refused (the rollback: never signed)
+		n7 := mkNote(t, "ledger.test/kingres/c/x\n7\nAAAA\n", 1)
 		cp5 := ledgerpub.Checkpoint{LogID: l.ID, Size: size5, Root: root5, Note: []byte("note5"), SignedAt: time.Now()}
 		if err := f.store.PutCheckpoint(bg, f.term, cp5, f.rev(), true, "ledger.test/kingres"); !errors.Is(err, ledgerpub.ErrConflict) {
 			t.Fatalf("a smaller tree: %v", err)
@@ -212,7 +213,7 @@ func testStore(t *testing.T, mk func(t *testing.T) *fixture) {
 		if err := f.store.PutCheckpoint(bg, f.term, bad, f.rev(), false, ""); !errors.Is(err, ledgerpub.ErrConflict) {
 			t.Fatalf("another root: %v", err)
 		}
-		ok := ledgerpub.Checkpoint{LogID: l.ID, Size: size7, Root: root7, Note: []byte("note7"), SignedAt: time.Now()}
+		ok := ledgerpub.Checkpoint{LogID: l.ID, Size: size7, Root: root7, Note: n7, SignedAt: time.Now()}
 		if err := f.store.PutCheckpoint(bg, f.term, ok, f.rev(), true, "ledger.test/kingres"); err != nil {
 			t.Fatal(err)
 		}
@@ -222,7 +223,7 @@ func testStore(t *testing.T, mk func(t *testing.T) *fixture) {
 		if err := f.store.PutCheckpoint(bg, f.term, again, f.rev(), false, ""); err != nil {
 			t.Fatalf("the same tree again: %v", err)
 		}
-		if got, err := f.store.Checkpoint(bg, l.ID, size7); err != nil || string(got.Note) != "note7" {
+		if got, err := f.store.Checkpoint(bg, l.ID, size7); err != nil || !bytes.Equal(got.Note, n7) {
 			t.Fatalf("%v %v", got, err)
 		}
 		// the frontier does not go back, and another root for the stored size is refused
@@ -233,13 +234,31 @@ func testStore(t *testing.T, mk func(t *testing.T) *fixture) {
 			t.Errorf("another root for the stored size: %v", err)
 		}
 		// a note is replaced only by ReplaceNote (the re-signing)
-		if err := f.store.ReplaceNote(bg, f.term, l.ID, size7, []byte("note7+")); err != nil {
+		// P8-06: only a note that adds signatures to the same text; any other note, an unreadable one, and a re-signing that loaded the
+		// signers before a key event are refused, and the stored note stays
+		other := mkNote(t, "ledger.test/kingres/c/x\n7\nBBBB\n", 1, 2)
+		if err := f.store.ReplaceNote(bg, f.term, l.ID, size7, other, f.rev()); !errors.Is(err, ledgerpub.ErrConflict) {
+			t.Errorf("a note with another text: %v", err)
+		}
+		if err := f.store.ReplaceNote(bg, f.term, l.ID, size7, []byte("completely different text\n\n- sig\n"), f.rev()); !errors.Is(err, ledgerpub.ErrConflict) {
+			t.Errorf("a note that does not parse: %v", err)
+		}
+		stale := f.rev()
+		f.bumpKeys()
+		two := mkNote(t, "ledger.test/kingres/c/x\n7\nAAAA\n", 1, 2)
+		if err := f.store.ReplaceNote(bg, f.term, l.ID, size7, two, stale); !errors.Is(err, ledgerpub.ErrKeysChanged) {
+			t.Errorf("a re-signing with signers of an older key set: %v", err)
+		}
+		if got, _ := f.store.LatestCheckpoint(bg, l.ID); !bytes.Equal(got.Note, n7) {
+			t.Fatalf("a refused replacement changed the note")
+		}
+		if err := f.store.ReplaceNote(bg, f.term, l.ID, size7, two, f.rev()); err != nil {
 			t.Fatal(err)
 		}
-		if got, _ := f.store.LatestCheckpoint(bg, l.ID); string(got.Note) != "note7+" || got.Size != size7 {
+		if got, _ := f.store.LatestCheckpoint(bg, l.ID); !bytes.Equal(got.Note, two) || got.Size != size7 {
 			t.Errorf("latest %+v", got)
 		}
-		if err := f.store.ReplaceNote(bg, f.term, l.ID, 99, []byte("x")); !errors.Is(err, ledgerpub.ErrNotFound) {
+		if err := f.store.ReplaceNote(bg, f.term, l.ID, 99, []byte("x"), f.rev()); !errors.Is(err, ledgerpub.ErrNotFound) {
 			t.Errorf("a size that has no checkpoint: %v", err)
 		}
 		if cps, _ := f.store.Checkpoints(bg, l.ID, 0, 0); len(cps) != 1 {
@@ -416,3 +435,17 @@ func testStore(t *testing.T, mk func(t *testing.T) *fixture) {
 }
 
 func TestTheMemoryStoreKeepsTheRulesOfTheStore(t *testing.T) { testStore(t, memFixture) }
+
+// mkNote is a signed note of the shape ParseNote reads: the text and one signature line per id.
+func mkNote(t *testing.T, text string, ids ...uint32) []byte {
+	t.Helper()
+	n := &ledgerlog.Note{Text: []byte(text)}
+	for _, id := range ids {
+		n.Signatures = append(n.Signatures, ledgerlog.NoteSignature{Name: "ledger.test/kingres/c/x", ID: id, Sig: bytes.Repeat([]byte{7}, 64)})
+	}
+	b, err := n.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}

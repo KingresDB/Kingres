@@ -337,6 +337,7 @@ for f in postgres initdb pg_ctl psql pg_dump pg_basebackup pg_isready kingresd; 
 done
 ext_share="${stage}${prefix}/share/postgresql/extension"
 ext_dir="${stage}${prefix}/lib/postgresql"
+kingres_ext_versions=()
 for e in "${kingres_exts[@]}"; do
     ctl="${src}/contrib/${e}/${e}.control"
     [ -f "${ext_share}/${e}.control" ] || die "control file of ${e} was not installed"
@@ -347,6 +348,20 @@ for e in "${kingres_exts[@]}"; do
     default_version="$(sed -n "s/^default_version[[:space:]]*=[[:space:]]*'\\([^']*\\)'.*/\\1/p" "${ctl}")"
     [ -f "${ext_share}/${e}--${default_version}.sql" ] ||
         die "install script ${e}--${default_version}.sql of ${e} was not installed"
+    kingres_ext_versions+=("${e} ${default_version}")
+    # Every install and update script of the source tree is in the staged tree
+    # (a new version that is missing from the install list of meson.build
+    # would give an extension that cannot be installed or updated), nothing
+    # else of that name is, and the DATA list of the Makefile (the build
+    # outside the tree) names the same files.
+    src_scripts="$(find "${src}/contrib/${e}" -maxdepth 1 -name "${e}--*.sql" -printf '%f\n' | sort)"
+    [ -n "${src_scripts}" ] || die "${e} has no install script in the source tree"
+    staged_scripts="$(find "${ext_share}" -maxdepth 1 -name "${e}--*.sql" -printf '%f\n' | sort)"
+    [ "${src_scripts}" = "${staged_scripts}" ] ||
+        die "the scripts of ${e} in the staged tree differ from the source tree: source [$(echo "${src_scripts}" | tr '\n' ' ')] staged [$(echo "${staged_scripts}" | tr '\n' ' ')]"
+    make_scripts="$(grep -o "${e}--[0-9][0-9.]*\\(--[0-9][0-9.]*\\)\\?\\.sql" "${src}/contrib/${e}/Makefile" | sort -u)"
+    [ "${src_scripts}" = "${make_scripts}" ] ||
+        die "the DATA list of the Makefile of ${e} differs from its scripts: Makefile [$(echo "${make_scripts}" | tr '\n' ' ')] files [$(echo "${src_scripts}" | tr '\n' ' ')]"
 done
 # And nothing else named kingres_* may be there that the source does not have.
 for f in "${ext_share}"/kingres_*.control; do
@@ -372,6 +387,7 @@ mkdir -p "$(dirname "${bi}")"
     echo "KingresDB ${version}"
     echo "PostgreSQL: ${pg_version} (major ${pg_major})"
     echo "kingres extensions: ${kingres_exts[*]}"
+    echo "kingres extension versions: $(printf '%s, ' "${kingres_ext_versions[@]}" | sed 's/, $//')"
     echo "source commit: ${commit}"
     echo "prefix: ${prefix}"
     echo "kingres-verify: ${verify_status}"
@@ -394,6 +410,7 @@ printf '%s\n' "${version}" >"${info}/version"
 printf '%s\n' "${pg_version}" >"${info}/pg-version"
 printf '%s\n' "${pg_major}" >"${info}/pg-major"
 printf '%s\n' "${kingres_exts[@]}" >"${info}/extensions"
+printf '%s\n' "${kingres_ext_versions[@]}" >"${info}/extension-versions"
 printf '%s\n' "${prefix}" >"${info}/prefix"
 ( cd "${stage}" && find . -type f -print0 | sort -z | xargs -0 sha256sum ) >"${info}/SHA256SUMS"
 

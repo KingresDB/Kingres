@@ -12,16 +12,22 @@ import { getState } from '@/mocks/http'
 import { mockServer } from '@/mocks/server'
 import { availability, recovery } from '@/api/availability'
 import { shouldRetry, ApiError } from '@/api/problem'
+import { POLL } from '@/api/queries'
 import { useSessionStore } from '@/stores/session'
 import { renderApp } from './helpers'
 
 const saved = { ...recovery }
+const savedPoll = { ...POLL }
 beforeEach(() => {
   recovery.watchMs = 40
   recovery.afterStartMs = 40
+  // The pages poll every few milliseconds, so that a poll that should not happen shows at once: the test does not depend on how
+  // long a real poll takes to come.
+  Object.assign(POLL, { fast: 30, normal: 30, slow: 30 })
 })
 afterEach(() => {
   Object.assign(recovery, saved)
+  Object.assign(POLL, savedPoll)
   mockServer.events.removeAllListeners()
 })
 
@@ -31,6 +37,19 @@ function trackRequests(): string[] {
     seen.push(`${request.method} ${new URL(request.url).pathname.replace('/api/v1', '')}`)
   })
   return seen
+}
+
+/** Like trackRequests, and says how many requests have not ended yet. */
+function trackFlight(): { seen: string[]; inFlight: () => number } {
+  const seen = trackRequests()
+  let open = 0
+  mockServer.events.on('request:start', () => {
+    open += 1
+  })
+  mockServer.events.on('request:end', () => {
+    open -= 1
+  })
+  return { seen, inFlight: () => open }
 }
 
 async function stopSystemInstance(user: ReturnType<typeof userEvent.setup>) {
@@ -56,11 +75,25 @@ describe('the system database is stopped', () => {
     expect(screen.getByRole('button', { name: /^start instance #11$/i })).toBeEnabled()
     expect(document.body).toHaveTextContent(/can take a while/i)
     // Calm: while the state is shown, the only call is the cheap watch on the session.
-    const seen = trackRequests()
-    await new Promise((r) => setTimeout(r, 400))
-    const others = seen.filter((r) => r !== 'GET /auth/session')
-    expect(others).toEqual([])
-    expect(seen.length).toBeLessThan(20)
+    // The clock of this part is the panel's own watch on the session (every 40 ms): what was under way when the state appeared is
+    // allowed to end, then eight more watch calls are waited for (a condition, not a number of milliseconds), and in those no
+    // other request may start. The pages poll every 30 ms here, so a page that was not paused would show at once.
+    const flight = trackFlight()
+    const watches = () => flight.seen.filter((r) => r === 'GET /auth/session').length
+    await waitFor(() => expect(flight.inFlight()).toBe(0), { timeout: 10_000 })
+    const settledAt = watches()
+    await waitFor(() => expect(watches()).toBeGreaterThanOrEqual(settledAt + 3), {
+      timeout: 10_000,
+    })
+    await waitFor(() => expect(flight.inFlight()).toBe(0), { timeout: 10_000 })
+    const from = flight.seen.length
+    const fromWatches = watches()
+    await waitFor(() => expect(watches()).toBeGreaterThanOrEqual(fromWatches + 8), {
+      timeout: 10_000,
+    })
+    const window = flight.seen.slice(from)
+    expect(window.filter((r) => r !== 'GET /auth/session')).toEqual([])
+    expect(window.length).toBeLessThan(30)
   })
 
   it('Start instance starts it, and the panel returns to the page it was on', async () => {

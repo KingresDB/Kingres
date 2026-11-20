@@ -2982,3 +2982,412 @@ test.
 - For this path "closed" follows from the rule that the key is bare, so only
   the reason line tests it; step 6 needs tests of its own for it.
 - The reg-constant rule above changes what a 2a scan ships.
+
+### Step 6 (the fragment scan and closed queries), with the fixes for the review of steps 3 and 4
+
+**Where the path sits.** One path at the final upper relation, not at the grouping one: the fragment
+returns exactly the final target of the query. The origin sorts and limits with its own Sort and
+Limit over the scan; the groups get the query without ORDER BY and LIMIT, and an ORDER BY expression
+that is not selected travels as an ordinary column (a DISTINCT query with such a column is not
+shipped). Because ORDER BY and LIMIT stay at the origin, an ordered or limited query that the plan
+of before answers cheaply is not shipped; the ordered merge is step 9.
+
+**The rule "gain".** A closed query is shipped only when it has an aggregate, a GROUP BY or
+DISTINCT, or two or more distributed tables. One table without grouping stays on the scan of 2a,
+since the groups would return the same rows. `EXPLAIN VERBOSE` of the scan says why
+("Pushdown: not used: ..."), when both switches are on.
+
+**The marker and the rule of the group.** `/* kingres:query-fragment place=<n> */`, a plain comment;
+the v=2 marker with `kind`, `ident` and `ext` does not exist. A group accepts the fragment only in a
+forwarded session and runs the same function as the origin (analysis, "closed", no LIMIT, the
+shippability walker) on the text it parsed again; otherwise `0A000`, and a stale `place` is `KS001`.
+The origin parses its own deparsed text and runs that function before it ships.
+
+**What is not relaxed.** Window functions are not shipped whatever their partition says (6.4 would
+let a window partitioned by the key be closed); DISTINCT ON, float and order-sensitive aggregates,
+stable functions and an ORDER BY inside an aggregate are refused by the walker as before.
+
+**Cost.** `100 * remote groups + (input total - startup) / groups + rows * transfer * remote
+fraction`; a tie goes to the scan. It is a first-order model: for a selective grouping by a unique
+key and for DISTINCT on a unique key the fragment is chosen and is slower by 0.05 to 0.08 s on the
+test data; for joins and grouped joins on the key it is 20 to 30 percent faster.
+
+**Pruning** uses the restrictions of every distributed table of the statement and intersects the
+groups they allow.
+
+**The part of the origin's own group** runs through an SPI cursor planned under the one-shot mark;
+a cursor plan that contains a scan of the extension is refused with `KS001`. The partitions of the
+origin are identified before and after, and its placement is computed again.
+
+**`EXPLAIN`** shows `Pushed`, `Groups` and `Remote SQL`; `EXPLAIN ANALYZE` adds the rows per group.
+The time to the first batch (section 12) is not shown.
+
+**A statement that ends while a FETCH is in flight** (an error, a cancel, the abort of a
+subtransaction) asks the group to stop it, bounded; before, an abort behind a group that waited for
+a lock took up to `node_timeout`.
+
+**The move between the probes and the cursors** cannot be played with a real move, since the cursors
+hold locks that the move waits for. Fault points exist at every gap (`frag_before_probe`,
+`frag_after_probe_before`, `frag_after_declare`, `frag_local_open`, `frag_after_probe_after`,
+`frag_first_fetch`, `frag_before_fetch`, `frag_wait_batch`, `frag_local_fetch`,
+`frag_declared_g<n>`), and three checks of the start survive their mutants for that reason (the
+plan's placement, the identity of the origin's partitions after the open, the probes after the
+DECLAREs), with the check of the relation signatures.
+
+**What moved.** The start, fetch, collect, drain and stop of a scan over the groups, the choice of
+groups with pruning and the renumbering of parameters are in `fragment_scan.c` and serve both
+scans; `dist_scan.c` keeps the path hook, the child plan, the conversion of rows and `EXPLAIN`.
+
+**Switches.** `kingres_shard.enable_pushdown` and `enable_pushdown_closed`.
+
+**The fixes for the review of steps 3 and 4.** P2C-01: the source of the row router is coerced with
+the type modifier of the column, and the length coercion of an assignment is kept visible in the
+deparsed text, so the origin hashes the value the table stores, and an over-length `varchar` or an
+over-precision `numeric` fails with the message of a single node. P2C-02: the source cursor is
+fetched in steps that follow the widest row seen (16 rows first, then the batch bytes divided by the
+widest row, at least one). P2C-04 and P2C-07 in part: tests. P2C-03, 08, 09, 11: the README. The
+defect of a routed `GENERATED ALWAYS` identity column could not be reproduced on this base; a test
+(`t/130`) covers every case against a single node, and its mutant reproduces the reported error.
+
+**Open after this step.** No test for P2C-05 (a function that replays the text of the local part)
+and P2C-06 (S14-04); the reset of `xact_depth` in the broken-session branch is neither tested nor
+removed; the refusal of COPY with row-level security has no test. A hazard that is older than this
+step: the one-shot mark is consumed by the first planning; when SPI plans the local part of a
+fan-out write or of a router batch a second time (an invalidated plan), the second plan is an
+ordinary one and would read the other groups too; only the fragment scan guards against it. The
+cost model is not calibrated. Only one seed of the generator `t/127` was run.
+
+### What step 7 will find changed
+
+- `KsFragSet` and `kingres_shard_fragset_*` in `fragment_scan.h` are the shared machinery; a scan of
+  partial aggregates can use them and changes only the marker and the part of the origin's group.
+- `kingres_shard_query_fragment_analyze` in `pushdown.c` is the rule of the group, to be extended
+  with a kind for partial aggregates.
+- The paths are added by `fs_upper_paths` on `create_upper_paths_hook`; `KsPushdownInfo` is the
+  hand-over from the planner hook, and its `kind` drives `EXPLAIN`.
+- The Makefile does not track header dependencies: after a change of a header, build clean.
+
+
+### Round after step 6 (the mark of the local part, the rest of the review of steps 3 and 4, leftovers of step 6)
+
+**The second planning of the local part (design 4.4, step 2 and the notes of steps 3 and 4).** It cannot happen on
+the paths that use the one-shot mark: SPI_execute_with_args (the local part of a fan-out write, the router's local
+batch) makes a one-shot plan, which SPI plans once in _SPI_execute_plan with no revalidation, and
+SPI_cursor_open_with_args (the local cursor of the fragment scan) builds its plan once in GetCachedPlan; the validity
+of a plan is checked only when a plan is reused.  A concurrent ANALYZE that commits between the planning and the start
+was played with the fault point local_part_planned (t/131): the planner hook ran once per statement and every answer was
+the single node's.  As a guard the second planning of the armed text before the execution starts is refused with KS001
+(fanout.c, kingres_shard_local_part_take; the window is closed by ExecutorStart, so a statement that SQL code runs
+during the execution, a CHECK function that replays the text, is planned and routed as before: t/132).  The mark is
+armed only by the C code around the SPI call and disarmed when the call ends; nothing in the text or in a setting
+carries it.  debug_discard_caches = 1 crashes the backend by stack overflow in the catalog loader of the extension
+(each lock acquisition resets the caches and the loader runs queries): not usable as a test, not a wrong answer.
+
+**S14-04.** The mutant "a failed ROLLBACK TO never dooms the transaction" survives t/119 because
+discard_connection() notes a session that wrote for the user as well: the second path makes the first one redundant
+for a session that wrote.  The mutant that always dooms is killed (a session that only read must commit).  The
+reset of xact_depth in the broken-session branch of the abort callback was removed: the callback of the next level up
+sees xact_depth above its level and closes the session.
+
+**COPY and row-level security (row_router.c)** is reachable only after row-level security is turned on by hand with
+routing off; it is tested that way (t/133).  **The step 5 path** with keys that have a type modifier (timestamp(0),
+numeric(8,2), varchar(8), a wider source modifier than the target's) gives the twin's rows (t/133).
+
+**EXPLAIN ANALYZE** of a fragment scan shows "Time to the first batch" per group and for this node's own part
+(with TIMING on): the time from the first FETCH sent to the first batch read.
+
+**place=0 (review of step 5, P2D-05).** A group now compares the placement number of a closed-query fragment and of a
+colocated INSERT ... SELECT whatever its value, so place=0 is a stale placement (KS001), not "no check".  The only
+legitimate 0 is the insert fragment of an explicit destination that is not in the catalog (it carries ident instead),
+whose comparison stays as it was.
+
+**reg* values (P2D-01).** The walker now decides a reg* type from the server (a built-in type whose input function is
+named reg<...>in, looked through domains, arrays, ranges and the fields of a row), and refuses a parameter of such a type
+and a constant of an array, range or row type that holds one.  A scalar constant keeps rule 6 of 5.1.  An
+expression the planner folds to plain OIDs (a regclass compared with an oid, array of regclass cast to oid[]) is shipped as
+numbers and means the same number everywhere, as it does on a single node; the hazard is only a value that is turned
+into a name.  The row router and the colocated INSERT ... SELECT send values through the same walker.  Not done:
+a test with objects whose OIDs differ between nodes for the router and the 2a scan.
+
+**FROM ONLY (P2D-03).** Refused on every path with "FROM ONLY is not supported for distributed table": a distributed
+table is one table whose rows are in the partitions of every group.  A reference table is an ordinary table on each node
+and ONLY works.
+
+**The cost of a closed query that reduces nothing.** A fragment scan over one distributed table whose result has 90 percent or
+more of the rows the table gives after its restrictions is not offered (no gain: a grouping or DISTINCT by a unique key).
+The tests t/124 to t/127 therefore use tables that hold every key twice (or a primary key of (id, copy)), and the cases that
+return as many rows as they read have no path assertion.
+
+### Step 7 (partial aggregation), with the rest of the review of step 5 and the crash under cache discards (2026-11-20)
+
+**The crash under debug_discard_caches (answer to the question of the coordinator).**  It is the extension, not PostgreSQL.  A bare
+server (initdb, no preload) and a server that only preloads kingres_shard and has the extension created run SELECT, CREATE TABLE and
+the catalog functions under debug_discard_caches = 1 without a crash.  The crash needs a cluster: a SIGSEGV handler
+(preloaded library, backtrace + addr2line on the build with -g) showed
+
+  1. kingres.add_node -> require_primaries_can_commit (node_admin.c) walked `cat->nodes` and connected to each node in the loop; the
+     connection takes locks, a lock processes invalidations, the catalog cache of the extension was loaded again and freed, and the
+     loop read the freed list;
+  2. an INSERT of several rows -> planner_hook_body -> kingres_shard_plan_row_router -> kingres_shard_placement_hash(dt->coloc):
+     `dt` was taken from the cache by the analysis, kingres_shard_placement_hash() calls kingres_shard_catalog() first, the cache was
+     invalid at that moment (a lock processed an invalidation), it was loaded again and the old context freed, `coloc` was freed memory.
+
+The earlier note (stack overflow in the loader) was wrong: the address of the fault is 0 and the loader is guarded against re-entry.
+The fix is in the extension (commit ca00f81bd5): a replaced cache is retired and freed at the end of the transaction, require_primaries_can_commit
+copies, the planner analyses again when the generation changed.  t/135 runs a whole cluster under the setting on both majors.  With the
+retire reverted (mutant) the test is killed.
+
+**P2D-02.**  The fault action `waitinv` (fault.c) is new: wait for the file, then AcceptInvalidationMessages().  Without it the origin
+does not see the catalog change that the test made while the statement waited (the lock it holds on the relations is already
+granted, so nothing processes the invalidation) and the "cache is fresh, the plan is old" state that the defences exist for cannot be
+produced.  The test changes the catalog of the origin by hand (bucket_map, dist_table); the groups agree with the plan.  Real moves
+cannot be used: the switch of a move waits for the locks of the statement.
+
+**P2D-01, 2a.**  A statement that names one key is forwarded to its group as the text the user wrote, so the group resolves the
+names itself (reg* values are names there).  t/137 first expected the origin's OID there and failed for two of three origins;
+the meaning on that path is the name, and it is what the README now says.  The review's criterion (one meaning on the paths that
+evaluate at the origin) holds on the scan, the fragment scan, the router and the shipped INSERT ... SELECT.
+
+**C, the no-gain rule.**  The first version compared two estimates that do not agree (rows of the table: all groups; rows of the grouping:
+statistics of the local partitions).  t/138 (grouping by the primary key of 8000 rows) showed it shipped.  The rule now asks the
+catalog for a unique index within the grouping columns.
+
+**Mutant tables are only valid with a clean build.**  The first runs of the mutant scripts (mut.sh, mut19.sh) synced the mutated copy
+with rsync -a over a work area that kept the objects of the previous mutant; the mtimes of the restored sources were older than the
+objects, so make kept the mutated object of an earlier mutant and every later mutant inherited it (M07 to M10 of the section 5 table were
+"killed" by the M06 mutant that came before them).  The scripts now run `clean build` for every mutant and run the test files one
+at a time, stopping at the first failure; every table in the report is from the second run.
+
+**D, partial aggregation (design 7), what differs from the text of the design.**
+- The partial target and the text are made in one place, fs_partial_paths (the hook at UPPERREL_GROUP_AGG), from the planner's own
+  grouping target; pushdown_prepare only decides eligibility (shape and aggregates) and keeps a copy of the query (`ship`).  The design
+  has the select list "replaced by the unmarked expressions of the partial target"; so does this, and a grouping column that is not in the
+  partial target stays in GROUP BY as a resjunk entry of the deparsed query.
+- The aggregate rule of the group is kingres_shard_partial_fragment_analyze (pushdown analysis, shape, no HAVING/ORDER BY/LIMIT, no
+  aggregate inside an expression, the shippability walker with allow_order_aggs).  It checks the catalog itself (combine function,
+  serialization pair, normal kind, built in), not only the planner flag, because a forged fragment must not rely on the sender's flag.
+- DISTINCT after the aggregation, a window in the same level and grouping sets are refused by the shape rule (the scan answers).  The
+  design allows a window above an aggregate (A6) at the origin; it is not offered yet.
+- A Group node at the top of the plan (a grouping with no aggregate, sorted) is accepted by partialize_plan and left as it is.
+- Float and order-sensitive aggregates are accepted for the partial path only (A3).  The closed path still refuses them (step 6, unchanged).
+- The classification test is part of t/139 (section C2), not a pg_regress file: the harness already compares on both majors and the list is the same on 18.7 and 19rc2.
+- enable_pushdown_closed no longer disables the partial path (pushdown_prepare is called when either switch is on and the closed branch
+  honours its own switch).  t/124 to t/127 run with enable_partial_aggregation = off: what they call "not shipped" is the closed rule.
+- 2a path and reg*: see above.
+
+**A kingres_sketch aggregate (step 8, not built).**  What it needs is listed in the README ("What an aggregate of an extension needs").
+
+**Measurement after the no-gain rule asks for a unique key** (3 million rows, PostgreSQL 18.7,
+three runs each): grouping by the key of 3 million rows 27.4 s by the scan, which is chosen;
+of 30 000 rows 0.35 s against 0.34 s, the scan chosen; a join on the key with a filter 0.27 s by
+the scan against 0.20 s as a fragment; a grouped join 1.95 s against 1.65 s. The loss of 25 percent
+on a grouping by the primary key is gone.
+
+**Mutants.** Of thirty mutants of the rules of section 5, five are killed by the tests of reads
+(t/124 to t/127); of the rest the rules of inserts that a read cannot reach are killed by t/136
+(M07, M09, M10, M27) and the regression tests (M04, M12), and two (M02, M20) are made redundant by
+the walker of shippability for reads. Of eleven mutants of partial aggregation eight are killed and
+three are equivalent (a check behind which another branch also refuses, a switch the hook checks
+again, a sorted path that remains when the hashed one is removed).
+
+**What the full run found after step 7.** `min()` and `max()` of an indexed column without
+`GROUP BY` are answered by an index probe with no aggregation node; the partial plan accepts a
+result with no left tree when every aggregate has no final function and a state of the result
+type. A join of a table with itself was never shipped (the rule counted tables, not references).
+The test harness writes `enable_partial_aggregation = off`, so that the older tests keep testing
+the scan, the fragment scan and closed queries; t/139 turns it on.
+
+### Steps 8 to 12 (objects of extensions, sort and limit, join rows, the README and the security round) (2026-11-20)
+
+**Step 8, objects of extensions (5.5).** The compiled-in list (`kingres_sketch` 1.0), the object
+rules and the setting `kingres_shard.shippable_extensions` (all, none or a list; it only narrows)
+are as section 5.5 says. What differs:
+
+- An object of an extension is shipped only by a closed query and by a partial aggregation. The 2a
+  scan, the writes and the colocated `INSERT ... SELECT` never ship one, because their markers carry
+  no version. A sketch aggregate in an `INSERT ... SELECT` is therefore run by the row router at the
+  origin.
+- The marker is `/* kingres:<kind>-fragment place=<n> ext=name:version[,...] */` for the kinds
+  `query` and `partial`, not the `kingres:frag v=2 kind=...` of section 5.5; the markers of this
+  implementation never had that form. The characters of the list are checked.
+- A group checks the versions first: a different version, or an extension that the marker names and
+  the group does not have, raises KS001 with both versions. A statement that uses an extension the
+  marker does not name, or the reverse, raises 0A000. A group that does not have the extension at
+  all fails earlier, when it parses the text ("function does not exist"), not with KS001; a hook
+  between the marker and the parse would be needed for that.
+- `self_test()` and the encoding are not compared here; section 5.5 leaves them to `add_node` and
+  `check_cluster`.
+
+**The survivors of the review of step 5.** t/152 reads with a FULL JOIN on and off the key, with a
+reference table and with three tables, windows over closed groupings, sub-selects and views. The
+mutants M18, M18b, M20, M02 and M03 survive it, each shielded by another rule that decides the same
+statements (the count of key classes, the shippability walker, the analysis of the range table, the
+type of the key columns). No statement separates them, so the rules stay as a second layer that is
+not tested alone.
+
+**Step 9, sort and limit (8.1, 8.2).**
+
+- A closed query with `ORDER BY` has the groups sort; the fragment scan merges the sorted streams
+  with one SortSupport per key, and no Sort is added above it (`EXPLAIN` shows the merge keys).
+  Only a built-in B-tree operator with the default collation or "C" is pushed; otherwise this node
+  sorts as before. A partial aggregation pushes no sort; it sorts above the final aggregate.
+- The limit goes to the groups as `LIMIT count + offset` with no `OFFSET`, never with `WITH TIES`.
+  A constant is folded first (the parser leaves the cast of a literal as a call). A parameter, or an
+  expression of parameters and immutable or stable functions with no column, sub-select or volatile
+  function, is computed when the scan starts and sent as one extra `bigint` parameter; the local part
+  gets the same value. A NULL, a negative value or an overflow sends NULL, and the origin's own Limit
+  node raises the single node's error, so no group raises it. A group accepts a limit only as one
+  non-negative `bigint` constant or one `bigint` parameter.
+- Ties are returned as this node's own part first, then the groups in catalog order, not by group id
+  (O3); SQL does not order ties.
+- **A difference from a single node:** a cursor declared with neither `SCROLL` nor `NO SCROLL` over a
+  query whose groups sort cannot scan backward, because the merge cannot; `DECLARE ... SCROLL` can.
+  The README names it, and t/155 tests it.
+- Setting: `kingres_shard.enable_pushdown_sort` (on).
+
+**Window and `DISTINCT` above a partial aggregation (7.6, A4 and A6).** The text of the groups has
+neither (the named-window clause is cleared too, because the deparser prints it); the origin applies
+them above the final aggregate. A group that is sent one still refuses it.
+
+**Step 10, join rows (9.1).** A statement that is not closed as a whole (a window not partitioned
+by the key, an ordered-set aggregate, `count(DISTINCT)`, `DISTINCT ON`) but whose tables join on
+their keys gets the join of the whole level as a fragment of its own, through a chained
+`set_join_pathlist_hook`. The text is the statement's `FROM` and `WHERE` with only the columns of
+the join relation's target; it is itself a closed query, so a group needs no new rule. A closed
+statement keeps its own path, a partial aggregation keeps its path, and the planner chooses by cost.
+Setting: `kingres_shard.enable_pushdown_join` (on). Not done, as section 9 says: semi and anti joins,
+lateral references, a join below the top of the statement.
+
+**Step 11, the README.** Guarantees: pushdown gives the single node's answer and the scan is always
+the fallback; a group enforces its own rules whoever sends the fragment. Limitations: a new item
+names the differences that pushdown makes visible, among them the cursor above.
+
+**Step 12, the security round** (t/156): forged fragments (crossed kinds, a wrong place, forged
+text, a wrong forward token), privileges and row-level security on every path, `SECURITY DEFINER`,
+`search_path`, hostile identifiers and values, and the version marker of an extension.
+
+**Step 13, the version: correction.** This document says in several places (the header, the plan of
+steps, the upgrade test and "Version 0.6 was made before steps 5 to 12") that the steps of phase 2b
+end in version 0.6 with `kingres_shard--0.5--0.6.sql`. Version 0.6 was made, before step 5, and
+phase 9 then took 0.7. Steps 6 to 12 add no SQL object, only settings of the library, so they ship
+with the library of 0.7 and step 13 makes no version of its own. The four settings are in the
+catalog regression test, and the upgrade test from 0.6 compares the upgraded catalog with a fresh 0.7.
+
+**Tests and mutants.** t/151 (step 8), t/152 (the survivors), t/153 (step 9), t/154 (step 10), t/155
+(the limit by parameter, window and `DISTINCT` above a partial aggregation, the cursor) and t/156
+(step 12). The harness writes `enable_pushdown_join = off` beside `enable_partial_aggregation = off`,
+so the older tests keep testing their own paths. Of the mutants of steps 8 to 12, each built clean,
+all are killed except these equivalents: the "none" branch of `shippable_extensions` (the list parser
+refuses the name anyway), the rule that an extension function must be immutable (`kingres_sketch` has
+no other), the planner's collation check of the sort (the walker refuses that collation first), the
+second parse of the text of join rows, the test of the whole level of join rows (an intermediate join
+is never the cheaper path on the test data), and a negative limit sent as a number (the group would
+raise the same error text as the origin).
+
+KS001 for an extension that a group does not have at all, the tie-break by group id and the tests
+063, 064, 066, 067 and 068 of the plan were left for step 13; they are described in its section below.
+
+### The review of steps 6 to 12 and the fix for its critical finding (2026-11-20)
+
+The review ([report](../reviews/2026-11-20-kingres-shard-phase2b-steps-6-12.md)) compared about
+13 000 statements with a single node on both majors and found one critical finding, P2E-01: a
+`HAVING` condition with no aggregate was applied by nobody. The planner moves such a conjunct (no
+aggregate, no volatile function, no sub-select) from `HAVING` into `WHERE`, but the text of a partial
+aggregation and of join rows is made from the statement as written, with its `HAVING` removed and
+its `WHERE` unchanged. `SELECT c, count(*) FROM m GROUP BY c HAVING c < 3` returned every group; the
+same flaw was found in join rows. Both paths are now refused for such a statement, and the scan
+answers (`having_has_moved_conjunct` in `fragment_scan.c` applies the planner's rule, or a wider
+one). What stays in `HAVING` (an aggregate, a volatile function, a sub-select) keeps the partial
+path and is applied by this node's final aggregation. A closed query keeps its `HAVING` in its own
+text and was right before. t/170 compares every form of `HAVING` under the three plan profiles on
+every path, and the generator of t/127 has three such forms.
+
+The alternative of putting the moved conjuncts into the shipped `WHERE` was not taken: the `HAVING`
+of the statement is written in the variables of the grouping range table entry (18 and 19), which the
+planner has flattened, and a text with them in `WHERE` would need `flatten_group_exprs` on both
+majors. The cost is that `HAVING <grouping column> ...` is answered by the scan, a difference of speed
+only; a user can write the condition in `WHERE`. The four mutants of the fix are killed by t/170.
+
+The other findings, one commit each:
+
+- **P2E-02, `TABLESAMPLE`.** The scan asked the groups for every row with no sampling. A sample
+  cannot be taken correctly on the groups: a table spread over groups would be a different random
+  draw from any single node's, and `REPEATABLE` would not repeat. `TABLESAMPLE` of a distributed table
+  is now refused with 0A000 at any level of a statement (a sub-select, a CTE, the source of an
+  `INSERT` or `DELETE`), with pushdown on or off and in a prepared statement. A reference table and a
+  local table are sampled as on a single node. t/171; t/121 now expects the error.
+- **P2E-03, the second profile of the tests.** The harness turned the partial aggregation and join
+  rows off in the older tests. With `KS_ALL_PATHS=1` every node of every test has both on after the
+  test's own settings. t/124 to t/127, t/135 to t/138, t/152 and t/153 pass in that profile on both
+  majors, among them the faults and moves of t/125 and the discarded caches of t/135. Their "not
+  shipped" assertions become "not a closed query" in that profile (`not_shipped_ok()`).
+- **P2E-04, rules that no test separated.** t/172 forges fragments: a group refuses a negative
+  `LIMIT`, an `OFFSET`, `WITH TIES`, a sub-select or NULL as the limit, and `DISTINCT` or
+  `DISTINCT ON` in a partial fragment. The sum of count and offset that does not fit in a `bigint` is
+  tested with custom and generic plans from every node. Its five mutants are killed.
+- **P2E-05 to P2E-07, the README.** It names the `NOLOGIN` limit, the exceptions of the guarantee,
+  a view of another owner refused with an error on every path, `min` and `max` of values that compare
+  equal and print differently, and `TABLESAMPLE`.
+- **P2E-10.** The ordered merge frees its arrays at a rescan.
+- **P2E-08 and P2E-09** need no change. The cursor difference is in the README and in t/155. The
+  rules shielded by another rule stay as a second layer.
+
+### Step 13: the remaining tests, a missing extension, the order of ties and a crash (2026-11-20)
+
+**The tests of section 16.2.** Their numbers 055 to 069 were taken by tests of 0.5, so each one is a
+new `t/1nn` file or an addition to a test of steps 6 to 12. New in this step: t/157 (063 for the
+partial aggregation, the ordered merge, join rows and an extension object: a writer on the groups, a
+bucket that moves back and forth, a move between the plan and the run, a held switch, prepared
+statements, a session's own writes); t/158 (064 for the same paths: a planned switchover at four
+fault points with a prepared statement, a hard failover in the middle of a fetch, a write through the
+old primary); t/159 (066: the hostile names of 16.4 for schema, table, column, type, sequence and
+constraint over seven shapes of statement); t/160 (067: all seven kinds of fragment with no token,
+with a wrong token and on a demoted node); t/161 (068: `kingres_ledger` with `kingres_shard`). The
+source of an `INSERT ... SELECT` into a local table is planned as a subquery and read by the scan, not
+by the pushdown paths (6.1, 18).
+
+**A crash found by t/157.** A prepared statement with a sketch aggregate, executed several times on
+the same cached session, crashed a group with SIGSEGV on both majors. The check of an extension's
+aggregate ran from the analysis of the shape before the walk of the statement had reset the static list
+of extensions used, so it read the list of the previous statement, whose memory was gone. It came in
+with step 8. The check now starts its own empty list.
+
+**KS001 for an extension that a group does not have.** A group cannot raise it: PostgreSQL analyses
+the `DECLARE` of a fragment, and fails on the unknown function, before any hook of the extension, and
+`emit_log_hook` cannot read the catalog in a transaction that is aborting. The node that sent the
+fragment knows the extensions from the marker. When the `DECLARE` fails with `undefined_function` or
+`undefined_object` and the marker names an extension, it raises KS001 ("node host:port does not have
+an extension that the statement uses (kingres_sketch:1.0)") with the group's message as the detail
+and `shippable_extensions = 'none'` as the escape. Another error, such as a division by zero, is not
+changed. Known limit: another undefined function or type in a statement that also uses an extension
+gets the same message, with the group's text as the detail.
+
+**The order of ties (O3).** The streams of the merge are sorted by group id when it starts, so ties
+come out in the same order from every node and on a repeat. Inside one group the order is the
+group's own; a group that sorts with a top-N heap orders equal rows differently from a full sort.
+
+**Not built, as section 18 says, and named in the README:** a join below the top of the statement
+(6.1); semi and anti joins (9.1); grouping sets (6.1, 7.1, 7.6 A9); a `FULL JOIN` with a reference
+table or without the key equality in its `ON` (9.1, 6.3; a `FULL JOIN` of two distributed tables on
+the key is shipped); an aggregate without a combine function in a statement that is not closed (7.1,
+7.6 A9); a limit with a column, a volatile function or a sub-select.
+
+**A forwarded reference write without a term.** A demoted node runs a `reference-write` fragment
+that carries no claim of a catalog term. A real sender always carries its term, and the demoted node
+refuses an older one with KS002 (t/160). Refusing every such statement in the planner hook would break
+the calls of the control plane to an old primary and the filling of a new node's reference tables.
+
+**Tests and mutants.** t/157 to t/162. The eight mutants of this step (the conversion to KS001, the
+sort of the streams, the crash line, a blind comparison of the merge, a demoted node that serves
+fragments, a token that is not compared, a failed group that is not retryable, the local group read
+twice) are killed. The tree with the fixes of the review of steps 6 to 12 merged passes on both
+majors in both profiles.
+
+**The review of step 13 (2026-11-20).** The review
+([report](../reviews/2026-11-20-kingres-shard-phase2b-step-13.md)) found no wrong answer in 5120
+generated statements per major before and after bucket moves, could not crash a group through the
+fixed list by any path, and found no critical or high defect. Its three medium findings are being
+fixed: a group that never had the extension raises `3F000` (its schema does not exist), which the
+conversion to KS001 does not cover, while t/162 tested only a dropped extension, whose schema stays;
+the test that another error is not converted fails at `FETCH`, not at `DECLARE`; and t/161 reads the
+source through the scan, not the pushdown paths.

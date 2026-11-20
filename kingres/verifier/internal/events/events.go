@@ -295,6 +295,41 @@ func Follow(file *trust.File, read Reader, strict bool) (*Walk, error) {
 	}
 }
 
+// CheckGap compares the names of the files of the events directory (a listing the source gave) with the
+// number of events the walk read. Events are numbered from 0 without a gap, so a file with a number at or
+// above Count that the walk did not reach means that the event number Count is missing: one was withheld
+// or removed, and what follows it could not be applied. The error names the first number that is missing and
+// the first that is present beyond it. Names that are not six digits are not events and are ignored.
+func (w *Walk) CheckGap(names []string) error {
+	first := uint64(0)
+	found := false
+	for _, n := range names {
+		if len(n) != 6 {
+			continue
+		}
+		v, err := canonicalSix(n)
+		if err != nil || v < uint64(w.Count) {
+			continue
+		}
+		if !found || v < first {
+			first, found = v, true
+		}
+	}
+	if !found {
+		return nil
+	}
+	return &Error{uint64(w.Count), fmt.Errorf("event %06d is absent and event %06d is present: events are numbered from 0 without a gap, so one was withheld or removed, and the events after it were not applied", w.Count, first)}
+}
+
+func canonicalSix(s string) (uint64, error) {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, errors.New("not digits")
+		}
+	}
+	return strconv.ParseUint(s, 10, 64)
+}
+
 // authorised reports whether k's signature counts for the event with this number.
 func (k *Key) authorised(seq uint64) bool {
 	switch {

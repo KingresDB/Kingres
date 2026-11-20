@@ -20,7 +20,12 @@ async function bootstrap(): Promise<void> {
   const kingres = createKingres()
   kingres.install(app)
   // The browser tests drive the application through its router (development build only).
-  if (import.meta.env.DEV) (window as unknown as { __router?: unknown }).__router = kingres.router
+  if (import.meta.env.DEV) {
+    const w = window as unknown as { __router?: unknown; __queryClient?: unknown }
+    w.__router = kingres.router
+    // A state that the mock changes while the page is open is read again by a call to `__queryClient.invalidateQueries()`.
+    w.__queryClient = kingres.queryClient
+  }
   app.mount('#app')
 }
 

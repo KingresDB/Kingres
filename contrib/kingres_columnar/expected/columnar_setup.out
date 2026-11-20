@@ -10,7 +10,7 @@ SELECT e.extname, e.extversion, n.nspname, e.extrelocatable
  WHERE e.extname = 'kingres_columnar';
      extname      | extversion | nspname | extrelocatable 
 ------------------+------------+---------+----------------
- kingres_columnar | 0.1        | kingres | f
+ kingres_columnar | 0.2        | kingres | f
 (1 row)
 
 -- the access method
@@ -47,10 +47,13 @@ SELECT name, setting, unit, vartype, enumvals, context, boot_val,
  kingres_columnar.enable_custom_scan           | on       |      | bool    |                           | user      | on       |         | 
  kingres_columnar.max_stripe_rows              | 10000000 |      | integer |                           | superuser | 10000000 | 1000    | 10000000
  kingres_columnar.orphan_notes_max             | 10000    |      | integer |                           | superuser | 10000    | 1       | 10000
+ kingres_columnar.reserve_gate                 | 0        |      | integer |                           | superuser | 0        | 0       | 1000000
+ kingres_columnar.reserve_gate_at              | 0        |      | integer |                           | superuser | 0        | 0       | 5
+ kingres_columnar.reserve_row_numbers          | off      |      | bool    |                           | superuser | off      |         | 
  kingres_columnar.stripe_row_count             | 150000   |      | integer |                           | user      | 150000   | 1000    | 10000000
  kingres_columnar.vacuum_truncate_lock_timeout | 5000     | ms   | integer |                           | superuser | 5000     | 50      | 600000
  kingres_columnar.write_buffer_memory          | 131072   | kB   | integer |                           | user      | 131072   |         | 
-(13 rows)
+(16 rows)
 
 SHOW kingres_columnar.compression;
  kingres_columnar.compression 

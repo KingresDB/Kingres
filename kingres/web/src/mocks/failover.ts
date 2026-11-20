@@ -220,6 +220,23 @@ export function failoverPlan(
 
 /** What a restore of the preferred primaries would do (the groups that run away from their home server). */
 export function restorePlan(s: MockState, ids?: number[]): S['FailoverPlan'] {
+  // The same switches as a failover (`?failover=blocked:...`) reach a restore: a lost majority is a refusal, the others are blockers.
+  if (mockConfig.failoverBlock === 'quorum')
+    throw problem('quorum_unavailable', 'This server cannot hear a majority of the servers.')
+  const blockers: S['FailoverBlocker'][] = []
+  if (mockConfig.failoverBlock === 'lease')
+    blockers.push({
+      code: 'lease_settings_differ',
+      shardGroupId: null,
+      message:
+        'The servers do not use the same lease duration and margin (10 s and 4 s on 10.0.0.12).',
+    })
+  if (mockConfig.failoverBlock === 'rebalance')
+    blockers.push({
+      code: 'rebalance_in_progress',
+      shardGroupId: null,
+      message: 'A rebalance is running and did not stop within a minute.',
+    })
   const groups = s.groups
     .filter((g) => g.primaryServerId !== g.preferredPrimaryServerId && (!ids || ids.includes(g.id)))
     .map((g): S['FailoverGroupPlan'] => ({
@@ -239,8 +256,8 @@ export function restorePlan(s: MockState, ids?: number[]): S['FailoverPlan'] {
     kind: 'restorePreferredPrimaries',
     mode: 'restore',
     serverId: null,
-    canProceed: true,
-    blockers: [],
+    canProceed: blockers.length === 0,
+    blockers,
     willStopRebalance: false,
     groups,
   }
@@ -356,7 +373,9 @@ export function writeReport(s: MockState, run: FailoverRun, finished = false): v
     task.state === 'paused'
       ? 'paused'
       : task.state === 'done'
-        ? 'completed'
+        ? mockConfig.failoverWarnings
+          ? 'completedWithWarnings'
+          : 'completed'
         : cancelled
           ? 'cancelled'
           : done > 0
@@ -524,11 +543,8 @@ function finishRun(s: MockState, run: FailoverRun): void {
         g.failedServerIds.push(rec.id)
       }
     rec.status = 'dead'
-    s.settings.autoFailover = {
-      ...s.settings.autoFailover,
-      eventsSinceReset: s.settings.autoFailover.eventsSinceReset + 1,
-      lastEventAt: nowIso(),
-    }
+    // A failover that a person started is not counted and not limited (design 4.4); an automatic one is.
+    if (run.trigger === 'automatic') countAutomaticFailover(s, rec.id)
     s.alerts.unshift({
       id: Math.max(0, ...s.alerts.map((a) => a.id)) + 1,
       kind: 'serverDown',
@@ -919,4 +935,46 @@ export function resetFailoverState(s: MockState): void {
       !a.title.endsWith('was failed over'),
   )
   s.settings.autoFailover = { ...s.settings.autoFailover, eventsSinceReset: 0, lastEventAt: null }
+}
+
+/** Raises the alert that the limit of automatic failovers is reached (once; it clears when the counter is reset). */
+export function raiseAutoFailoverLimit(s: MockState): void {
+  raise(
+    s,
+    'autoFailoverLimitReached',
+    'warning',
+    {},
+    'Automatic failover limit reached',
+    'Automatic failover has been used as often as the settings allow. Further failures need an operator.',
+  )
+}
+
+/** One automatic failover that promoted a group: the counter goes up, the alert of the event is raised (info). */
+export function countAutomaticFailover(s: MockState, serverId: string): void {
+  const af = s.settings.autoFailover
+  s.settings.autoFailover = {
+    ...af,
+    eventsSinceReset: af.eventsSinceReset + 1,
+    lastEventAt: nowIso(),
+  }
+  raise(
+    s,
+    'autoFailoverTriggered',
+    'info',
+    { serverId },
+    'Automatic failover happened',
+    `Server ${serverId} was failed over automatically.`,
+  )
+  if (s.settings.autoFailover.eventsSinceReset >= s.settings.autoFailover.maxCount)
+    raiseAutoFailoverLimit(s)
+}
+
+/** The counter is set to 0 (by the reset, or by a rebalance that completes); the alert of the limit clears. */
+export function resetAutoFailoverCounter(s: MockState): void {
+  s.settings.autoFailover = { ...s.settings.autoFailover, eventsSinceReset: 0 }
+  for (const a of s.alerts)
+    if (a.kind === 'autoFailoverLimitReached' && a.state !== 'resolved') {
+      a.state = 'resolved'
+      a.resolvedAt = nowIso()
+    }
 }

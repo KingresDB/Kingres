@@ -10,14 +10,17 @@ import StatusBadge from '@/components/StatusBadge.vue'
 import GateButton from '@/components/GateButton.vue'
 import NullableValue from '@/components/NullableValue.vue'
 import NotAvailable from '@/components/NotAvailable.vue'
-import ProblemNotice from '@/components/ProblemNotice.vue'
 import TaskProgress from '@/components/TaskProgress.vue'
 import { safeText } from '@/lib/safe-text'
-import { keys, usePagedQuery } from '@/api/queries'
+import { keys, useAlerts, usePagedQuery } from '@/api/queries'
+import { useSessionStore } from '@/stores/session'
 import { endpoints } from '@/api/endpoints'
 import { useTaskAction } from '@/composables/useTask'
 import { LEDGER_MODE_LABEL, LEDGER_STATE } from '@/lib/status'
 import { formatAgo, formatDateTime, formatNumber, shortHash } from '@/lib/format'
+import AcknowledgeDivergenceDialog from '@/components/ledger/AcknowledgeDivergenceDialog.vue'
+import LedgerRefusal from '@/components/ledger/LedgerRefusal.vue'
+import { CHECKS, verifyBody, type CheckId } from '@/lib/ledger-ops'
 import { anchoringMeta, NOT_ANCHORED_TEXT, publicationMeta } from '@/lib/ledger-signing'
 import VerificationDialog from '@/components/ledger/VerificationDialog.vue'
 import {
@@ -29,6 +32,7 @@ import {
 import type { LedgerStatus } from '@/api/types'
 
 const props = defineProps<{ databaseName: string; status: LedgerStatus }>()
+const session = useSessionStore()
 const dbName = computed(() => props.databaseName)
 const status = computed(() => props.status)
 const statusCoverage = computed(() => (status.value ? coverageOf(status.value) : null))
@@ -67,10 +71,26 @@ const verifications = usePagedQuery(
   () => !!dbName.value,
 )
 const openVerification = ref<number | null>(null)
+// A chain that diverged (the alert `ledgerChainDiverged` names the group; the publication of the status says it for the database).
+const acknowledging = ref<number | null>(null)
+const alertsQuery = useAlerts('open', () => session.can('listAlerts'))
+const divergedGroups = computed<number[]>(() => {
+  if (props.status.publication?.state !== 'diverged') return []
+  const named = (alertsQuery.data.value?.items ?? [])
+    .filter((a) => a.kind === 'ledgerChainDiverged' && a.subject?.databaseName === dbName.value)
+    .map((a) => a.subject?.shardGroupId)
+    .filter((g): g is number => typeof g === 'number')
+  // Without a readable alert the groups of the status are offered: the server refuses a group that has not diverged.
+  return named.length > 0
+    ? [...new Set(named)].sort((a, b) => a - b)
+    : props.status.chains.map((c) => c.shardGroupId)
+})
 
 const scope = ref<'full' | 'sinceLastVerified'>('sinceLastVerified')
+const checks = ref<CheckId[]>(['chain'])
+const noChecks = computed(() => checks.value.length === 0)
 const verify = useTaskAction(
-  () => endpoints.startLedgerVerification(dbName.value, { scope: scope.value }),
+  () => endpoints.startLedgerVerification(dbName.value, verifyBody(scope.value, checks.value)),
   {
     invalidate: () => [keys.ledger(dbName.value), keys.ledgerStatus, keys.databases],
   },
@@ -132,7 +152,12 @@ const verify = useTaskAction(
         data-testid="not-anchored"
       >
         <span aria-hidden="true">&#9650;</span>
-        <span>{{ NOT_ANCHORED_TEXT }}</span>
+        <span
+          >{{ NOT_ANCHORED_TEXT }}
+          <RouterLink :to="{ name: 'ledger', query: { tab: 'anchoring', db: databaseName } }"
+            >Open the Anchoring tab</RouterLink
+          ></span
+        >
       </p>
       <p
         v-if="statusCoverage && statusCoverageText(statusCoverage)"
@@ -185,6 +210,38 @@ const verify = useTaskAction(
       </TableWrap>
     </section>
 
+    <section
+      v-if="divergedGroups.length > 0"
+      class="card stack"
+      aria-labelledby="div-h"
+      data-testid="diverged-chains"
+    >
+      <h2 id="div-h">Chains that diverged</h2>
+      <p class="notice tone-danger" role="alert">
+        <span aria-hidden="true">&#10006;</span>
+        <span
+          >{{ divergedGroups.length === 1 ? 'A chain' : 'Chains' }} of this database no longer
+          extend{{ divergedGroups.length === 1 ? 's' : '' }} the published log. Nothing is signed
+          for {{ divergedGroups.length === 1 ? 'it' : 'them' }} until the divergence is
+          acknowledged. Find out why first: a restore from a backup and a failover that lost commits
+          explain it, and a rewrite of the history looks the same.</span
+        >
+      </p>
+      <ul class="plain">
+        <li v-for="g in divergedGroups" :key="g" class="row" :data-testid="`diverged-${g}`">
+          <span>Shard group {{ g }}</span>
+          <GateButton
+            op="acknowledgeLedgerDivergence"
+            small
+            variant="danger"
+            :aria-label="`Acknowledge the divergence of shard group ${g}`"
+            @click="acknowledging = g"
+            >Acknowledge...</GateButton
+          >
+        </li>
+      </ul>
+    </section>
+
     <section class="card stack" aria-labelledby="verify-h">
       <h2 id="verify-h">Verification</h2>
       <div class="form-row">
@@ -199,11 +256,19 @@ const verify = useTaskAction(
           op="startLedgerVerification"
           variant="primary"
           :disabled="verify.isBusy.value"
+          :blocked-reason="noChecks ? 'Choose at least one thing to check.' : ''"
           @click="verify.run()"
           >Start verification</GateButton
         >
       </div>
-      <ProblemNotice v-if="verify.error.value" :error="verify.error.value" />
+      <fieldset class="stack" data-testid="verify-checks">
+        <legend>What to check</legend>
+        <label v-for="c in CHECKS" :key="c.id" class="check">
+          <input v-model="checks" type="checkbox" :value="c.id" :data-testid="`check-${c.id}`" />
+          {{ c.label }} <span class="muted">{{ c.hint }}</span>
+        </label>
+      </fieldset>
+      <LedgerRefusal v-if="verify.error.value" :error="verify.error.value" ops="verify" />
       <TaskProgress :task="verify.task.value" :poll-error="verify.pollError.value" />
       <QueryBoundary
         :loading="verifications.query.isPending.value"
@@ -293,6 +358,12 @@ const verify = useTaskAction(
           Load more verifications
         </button>
       </QueryBoundary>
+      <AcknowledgeDivergenceDialog
+        v-if="acknowledging !== null"
+        :database-name="dbName"
+        :shard-group-id="acknowledging"
+        @close="acknowledging = null"
+      />
       <VerificationDialog
         v-if="openVerification !== null"
         :database-name="dbName"

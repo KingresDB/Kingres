@@ -416,6 +416,51 @@ for (const [label, width, height] of [
       expect(g.scrollWidth, g.offenders.join(', ')).toBeLessThanOrEqual(g.innerWidth)
     })
 
+    it('the banner of a failover (running, then waiting for you) fits the window and keeps the top bar to one row', async () => {
+      await page.setViewport({ width, height })
+      await go(page, '/dashboard')
+      await page.evaluate(() => {
+        const mock = (
+          window as unknown as {
+            __kingresMock: {
+              resetFailover: () => void
+              failoverSwitch: (t: string) => void
+              config: { taskDurationMs: number }
+            }
+          }
+        ).__kingresMock
+        mock.resetFailover()
+        mock.config.taskDurationMs = 60_000
+        mock.failoverSwitch('auto:10.0.0.12')
+      })
+      try {
+        await page.waitForSelector('[data-testid="banner-failover"]', { timeout: 30_000 })
+        const g = await geometry()
+        expect(g.scrollWidth, g.offenders.join(', ')).toBeLessThanOrEqual(g.innerWidth)
+        const rows = await page.evaluate(() => {
+          const el = document.querySelector('header.topbar') as HTMLElement
+          const set = new Set<number>()
+          for (const child of Array.from(el.children) as HTMLElement[]) {
+            const r = child.getBoundingClientRect()
+            if (r.width > 0 && r.height > 0) set.add(Math.round((r.top + r.height / 2) / 6))
+          }
+          return set.size
+        })
+        expect(rows).toBe(1)
+        expect(await reachable('Sign out')).toBe(true)
+      } finally {
+        await page.evaluate(() => {
+          const mock = (
+            window as unknown as {
+              __kingresMock: { resetFailover: () => void; config: { taskDurationMs: number } }
+            }
+          ).__kingresMock
+          mock.resetFailover()
+          mock.config.taskDurationMs = 800
+        })
+      }
+    })
+
     it('the banner of a lost leader keeps the top bar to one row and fits the window', async () => {
       await page.setViewport({ width, height })
       await go(page, '/servers')

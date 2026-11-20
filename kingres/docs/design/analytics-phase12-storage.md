@@ -2401,3 +2401,314 @@ Time partitioning:
 10. **`kingres/api/README.md` and `check-contract.mjs`** require every `TaskKind` to
    have a row in the "Task kinds and subjects" table (section 13), so the
    contract change touches the README in the same commit.
+
+## 21. Found while building
+
+### C5, parallel scan (2026-11-19)
+
+- **The test is `t/043_parallel.pl`**, with the plan test `columnar_parallel`; section 15 names it
+  `005_parallel`, and `t/005` is the corruption test.
+- **No plan has a parallel sequential scan of a columnar table (6, 8.4).** The rows a transaction
+  wrote and still holds in memory must be written as stripes before the executor enters parallel
+  mode, because a catalog row cannot be inserted in it. For a plan node the only place that runs
+  before that is `BeginCustomScan`; the table access method has no such callback. So the plain
+  `parallelscan_*` callbacks stay as they were, the planner's partial sequential scan paths of a
+  columnar table are removed, and with `kingres_columnar.enable_custom_scan` off there is no
+  parallel scan.
+- **What cannot be written before parallel mode** (rows of an enclosing subtransaction, rows that
+  another scan of the session still reads) makes the planner offer no parallel path for the table.
+  A plan prepared earlier that meets such rows fails with an error; it never answers with rows
+  missing.
+- **The scan without workers is parallel safe**: in a worker it reads the whole table (the inner
+  side of a partial join, a whole child of a Parallel Append, the single copy that
+  `debug_parallel_query` runs). A query that a function runs inside a worker is still refused: the
+  worker remembers the plan it was started for, and only scans of that plan run there.
+- **The shared state** holds, beside the counter of the next stripe, the length and a fingerprint
+  of the leader's stripe list, which every participant compares with its own, and one slot of
+  counters per participant for `EXPLAIN ANALYZE`.
+- **Workers**: at most the number of stripes less one. The size the planner compares with
+  `min_parallel_table_scan_size` is the compressed size, so a columnar table reaches a parallel
+  plan later than the same data in a heap table; the storage parameter `parallel_workers`
+  overrides it. A factor for the compressed size is open.
+- **No change** of the on-disk format, the metapage, the WAL, the SQL objects or the version.
+
+### Decisions for C6, indexes (2026-11-19)
+
+C6 is built in four parts: the reservation of row numbers and the early catalog row with no index
+yet (C6a), the fetch by TID and the index build (C6b), unique indexes and index vacuum (C6c),
+compaction with the standby and crash tests (C6d). Decided where sections 5.3 and 7.8 are silent:
+
+- A write buffer that reserves takes a stripe's worth of row numbers; the unused tail is given back
+  when it is still the end of the range, otherwise the gap stays.
+- While a buffer holds a reservation, a subtransaction that commits writes it as a stripe of its
+  own; it is not merged into the buffer of its parent.
+- Reservation applies only to a table that has an index.
+- `columnar_compact` on a table with indexes rebuilds every index of the table in the same
+  transaction under the lock that this needs; `CLUSTER` stays refused.
+- The catalog of stripes gains a state "reserved, not written", so C6 is version 0.2 with an
+  upgrade script; a table written by 0.1 stays readable and writable.
+
+### T2, conversion of partitions (2026-11-19)
+
+`kingres_timepart` is version 0.2 with this increment (an upgrade script and a full script; eight new
+functions, eleven replaced with their signatures, one dropped; the `upgrade` regression test compares
+an upgraded catalog with a fresh one).
+
+- **The reasoning about deadlocks in 10.4 step 6 and 10.5 does not hold for a writer that has
+  waited.** A writer through the parent holds a lock on the parent and waits for the partition that
+  the copy holds; its own `deadlock_timeout` began when it started to wait, perhaps a second before
+  the swap asks for the parent. When it fires inside the 500 ms of the swap, the writer is the victim
+  (seen in a test). Before it asks for the parent, the swap therefore reads `pg_locks` and gives up
+  at once (`swap_lock_timeout`) when a session that holds the parent waits for the partition. The
+  500 ms wait stays for readers and prepared transactions.
+- **"A writer waits, then goes on against the new partition" (10.4 step 3, 15) is true only for a
+  writer that names the partition.** A writer through the parent makes the conversion give way; its
+  row goes into the old partition and the next run converts it. A partition that is written through
+  the parent at every attempt is never converted; `timepart_check` reports it as `convert_blocked`.
+- **The lock on the partition is `SHARE ROW EXCLUSIVE`, not `SHARE`**: the same for readers and
+  writers, and it also keeps out a plain `CREATE INDEX`, whose index would be dropped with the old
+  partition, and a second conversion.
+- **The row counts of `columnar_info` cannot be compared inside the transaction** (10.4 step 5): a
+  columnar table writes its stripes at commit. The two `count(*)` are compared under the lock; the
+  sizes and the rows go into the history in a transaction after the commit, which also runs the
+  `ANALYZE`.
+- **A conversion is tried once per run**, not five times: it copies the whole partition. A lock that
+  is not granted is a failed action of a partial run, and the next run is due in at most five
+  minutes. A refusal is a skipped action of a run that is done.
+- **Refusals added to the list of 10.4 step 1**, each because the drop of the old partition or the
+  attach would lose or break something: a trigger of the partition's own of any kind, extended
+  statistics, an identity column, a sequence the partition owns, an owner other than the table's, an
+  isolation level other than READ COMMITTED (a row committed between an older snapshot and the lock
+  would be dropped uncopied), a default partition, a partition that is not permanent, options with
+  a heap target. For a columnar target, what the columnar method refuses is found before the attach
+  fails: an index on the partition or on the parent (named in the message; lifted when C6 is
+  built), a foreign key, an `AFTER ROW` trigger, a publication that would include the partition.
+- **The rule of section 12 about functions outside `pg_catalog`** is replaced by the rule every
+  other action of a run has: a superuser's session runs the code of an owner that is not a superuser
+  only with `kingres_timepart.trust_table_owners` on. Whether the control plane needs the narrower
+  rule of the design is a decision for the part that builds `table.setStorage`.
+- **`convert_old_partitions` stops at the first partition that is refused or fails** (a procedure
+  that commits cannot catch an error); the policy path records each partition and goes on.
+- **`columnar_options` of a policy is checked when the policy is set** (the keys and ranges of
+  `columnar_set_options`); 0.1 accepted any object.
+- **Tests need `kingres_columnar` installed and preloaded** in the test server.
+
+What C6 changes for the conversion: the two index refusals go; the conversion creates the indexes of
+the parent on the new table before the swap, so that the attach finds them and scans nothing under
+the strongest lock; an index of the partition's own is created again on the new table; a primary key
+or unique constraint of the parent needs the uniqueness check of C6c.
+
+### C6a, row numbers reserved at insert time (2026-11-19)
+
+`kingres_columnar` is version 0.2 with this increment. It builds the base for indexes and no index;
+a developer setting (`kingres_columnar.reserve_row_numbers`) switches it on until C6b does so for a
+table that has an index.
+
+- **Reservation.** A write buffer that reserves takes `stripe_row_count` numbers from the metapage
+  with the existing allocation record when its first row goes in; row `i` of the buffer is number
+  `first + i`, and its TID is the one every scan already showed. The unused tail goes back, with the
+  new record `XLOG_KC_RETURN`, only when it is still the end of the range. An abort gives nothing
+  back, since the abort callbacks may not touch the file: an aborted writer wastes at most one
+  stripe's worth of numbers.
+- **The largest row number** is the largest that fits a TID (about 8.8e12), no longer the largest
+  64-bit number.
+- **The early catalog row.** `kingres.columnar_stripe` has a column `reserved`. The row of a stripe
+  is inserted at the first insert with the numbers reserved and nothing else, and the flush updates
+  it. Two things section 7.8 does not say: PostgreSQL refuses to update a row of its own command, so
+  the writer passes the command counter before the update when the flush happens in the command
+  that inserted the row; and the row can move between the insert and the flush (a rewrite of the
+  catalog), so the flush finds it by its key and keeps no TID.
+- **Hand-over.** A buffer that reserves is never merged; a subtransaction that commits writes it as
+  a stripe of its own; a buffer that a cursor holds becomes the parent's with its reservation. A row
+  goes only into a buffer made under the same setting.
+- **Not reserved**: the rows of a rewrite and of compaction, and rows written in parallel mode (a
+  `CREATE TABLE AS` with a parallel query writes in the leader in parallel mode, where the update of
+  the catalog row is not allowed).
+- **Versions.** Format version 3 of the metapage means "may reserve"; version 2 stays readable and
+  writable and never reserves; a new file is version 3 only when the catalog has the new column.
+  Both shapes of the catalog are served, so the time between replacing the library and `ALTER
+  EXTENSION UPDATE` works. The 0.1 library refuses a version 3 file and the new catalog: there is no
+  way back.
+- **The check.** A reserved row of an aborted or crashed writer is an ordinary dead row; one of a
+  live or prepared writer is never visible to the check or the reconcile. A reserved row that a
+  committed transaction left is a new kind of finding, `reserved_row_left`.
+- **Serializable.** A reader that skips the reserved row of a writer in progress reports the
+  dependency at the writer's first insert, earlier than before.
+- **On a hot standby** every stripe of a reserving buffer leaves one dead version of a catalog row,
+  and the replay of its pruning can cancel a query with an old snapshot.
+- **Open.** With reservation on everywhere, the memory of a backend that writes 1500 partitions is
+  27 MB where the test of 0.1 allows 18 MB; this is examined with C6b, where tables with an index
+  reserve.
+
+What C6b finds: a function from a row number to a TID, the numbers returned by the insert paths, one
+place that decides whether a buffer reserves, and no fetch by TID yet for rows still in a buffer.
+
+### C6b, B-tree indexes that are not unique (2026-11-19)
+
+No change of the on-disk format, the catalog or the WAL beyond C6a.
+
+- **The TID of a row** is its row number: block `number / 2048`, offset `number % 2048 + 1`.
+- **No bitmap scans.** The bitmap of the server holds at most `MaxHeapTuplesPerPage` (291) offsets
+  per block and a columnar block has 2048, so the method offers none; no index-only scans, for the
+  lack of a visibility map; no parallel index scans. Ordered and backward scans, merge joins and
+  nested loops with an inner index scan work. PostgreSQL 18 has a hook where the planner reads the
+  properties of an index and 19 has not, so the properties are cleared in the path-list hook and
+  the index paths are made again: one source for both majors.
+- **The cost of a fetch** is one chunk group with all its columns, kept for the next fetch of the
+  same group. On 4 million rows a point lookup took 0.8 ms where a heap table took 0.2 ms; a range
+  of one percent took 11 ms by the index against 425 ms by the scan (a shared machine: indicative).
+- **The first index of a table whose rows the transaction still holds in memory**: the build writes
+  the rows of the running subtransaction first, so they get their numbers; rows of an enclosing
+  subtransaction, or rows a cursor holds, make the statement fail.
+- **`VACUUM` leaves the entries of rolled-back rows** in the index until C6c; the fetch filters
+  them, since a number that no visible stripe and no buffer of the transaction has answers nothing.
+- **Refused until later increments**: unique indexes, primary keys and unique constraints (C6c);
+  `columnar_compact` on a table with an index (C6d). Refused for good: `CONCURRENTLY` builds, which
+  are refused before anything is made, the other index methods, `CLUSTER`, exclusion constraints,
+  and an index on a file written by 0.1, which must be rewritten first.
+- **A parallel index build** uses the parallel-scan callbacks of the access method with a shared
+  counter of stripes; it is refused when the transaction holds unwritten rows.
+- **The memory of reservation** (the open point of C6a) is about 0.7 kB of private memory per
+  stripe reserved in a transaction; the 27 MB seen before was shared memory that a process counts
+  when it first touches pages.
+- **`columnar_check` does not compare index entries with stripes** yet; it comes with index vacuum.
+- **Open.** One guard of the fetch (a row offset beyond the visible rows of a stripe) is neither
+  reached by a test nor proven unreachable.
+
+For the conversion of partitions in `kingres_timepart`: the refusal of a partition whose parent has
+an index can be lifted for B-tree indexes that are not unique once the conversion creates them on
+the new table; unique indexes of the parent wait for C6c.
+
+### C6c, unique indexes and index vacuum (2026-11-19)
+
+- **The unique check** of a B-tree asks the access method for each candidate TID with a dirty
+  snapshot; the answer is the state of the row number in the stripe catalog alone: a superseded
+  version holds nothing, a version of this transaction or a committed one is a row, a version of a
+  transaction in progress means "wait for its id", a dead one is nothing. A row still in a buffer of
+  the same backend is found there by its number. The claim of every writer is its reserved catalog
+  row, so another backend finds it.
+- **A lock of the reservation.** Between taking row numbers from the metapage and inserting the
+  claim, an index vacuum must not read the metapage and the catalog, or it would call entries of a
+  number no range covers dead. Writers hold a lock of an advisory class in a shared mode across
+  that gap; the index vacuum holds it exclusively while it reads. No writer waits for another
+  transaction inside the gap, so the lock is never part of a deadlock; a waiter on a key waits on
+  the writer's transaction id, never on this lock or a catalog row.
+- **Index vacuum** removes entries whose number lies below the lowest number of a running or own
+  version and in no live stripe range, then cleans up the index; `INDEX_CLEANUP off` is respected.
+  An index file does not shrink, as for a heap table; what goes is its entries.
+- **Refused**: exclusion constraints, deferrable unique constraints, every `ON CONFLICT` on a
+  columnar table with an index (speculative insertion needs a row lock), and a foreign key that
+  references a columnar table.
+- **`kingres.columnar_check_indexes(rel)`** reports a visible row that an index lacks; an index of
+  more than 50 million entries is not checked.
+- **Not done**: the return of the row numbers of aborted writers (a mistake there is a duplicate
+  TID; the cost is that workloads which roll back large buffers use the number space faster), and a
+  fetch that decodes only the columns a plan reads (the interface does not say which).
+- **For `kingres_timepart`**: a partition of a parent with unique or non-unique B-tree indexes,
+  primary keys included, can be converted when its file is of format 3 and no constraint is
+  deferrable or an exclusion; the conversion must create the indexes on the new table before the
+  swap, and rows get new numbers. Foreign keys stay refused.
+- On 6 million rows of random text (217 MB columnar, 669 MB heap): an index build took 4.6 s
+  against 5.8 s for heap; a point lookup 4.7 ms against 0.6 ms; a range of one percent by the index
+  43 ms against 42 ms (indicative, a shared machine).
+
+### C6d, compaction of a table with indexes (2026-11-19)
+
+- **Decided differently from the plan of C6b.** `columnar_compact` does not rebuild the indexes of
+  the table: a rebuild would name only the new row numbers, and a snapshot older than the compaction
+  that still sees the old stripes would find none of its rows through an index; preventing that
+  needs a lock that blocks every reader for the whole compaction. The compaction adds an entry for
+  every copied row to every index instead (predicates and expressions evaluated, no uniqueness
+  check), and VACUUM removes the old entries once no snapshot can see the old stripes. Locks: those
+  of a writer. Cost: a second decode of the copied rows, an insertion per row and index, and two
+  entries per copied row until the next VACUUM.
+- **The unique check** treats a stripe row deleted by a running or aborted transaction as still
+  holding its rows (after a rolled-back compaction it would otherwise admit a duplicate).
+- **The row numbers of aborted writers are never given back**: their index entries would find
+  another row with another key, since a plain index scan does not recheck the key. Only the unused
+  tail of a committed buffer is returned.
+- **For `kingres_timepart`**: compaction of a columnar partition with indexes is allowed now;
+  VACUUM after it removes the old entries.
+
+### T2 with indexes (2026-11-19)
+
+- A partition whose table has B-tree indexes of immediate checking (unique ones and primary keys
+  included) is converted: the new table is loaded first, its indexes are built afterwards under
+  temporary names so that the attach builds nothing under the lock of the parent, and the names and
+  comments are restored after the swap. No index entry is carried.
+- Refused: other index methods, exclusion constraints, deferrable keys, invalid indexes, foreign keys,
+  `AFTER ROW` triggers, a replica identity that uses an index, and a table with indexes while
+  `kingres_columnar` is still at 0.1 (a new table would be of format 2, which cannot have an index;
+  no SQL function reads the format of an existing columnar file).
+- **A conversion cannot end with `VACUUM`**: PostgreSQL refuses it inside a function or procedure,
+  also after a `COMMIT`. The conversion runs `ANALYZE`; whoever schedules it runs `VACUUM` afterwards
+  as a statement of its own.
+
+### C7, logical decoding of inserts (2026-11-19)
+
+- **The record.** Every stripe that is not a compaction copy also writes `LOGICAL_INSERT`
+  records (`XLOG_KC_LOGICAL`, no page): the rows as heap tuples, 512 rows or about 1 MB to a
+  record, by the transaction or subtransaction that writes the stripe, with its origin. They are
+  written only when `wal_level = logical` and the table is logically logged, so the WAL of a load
+  roughly doubles there and is unchanged at any other level. Redo ignores them, so standbys and
+  base backups are not affected.
+- **`rm_decode`** queues one insert per tuple, as `heap_decode` does for an insert; the same
+  source builds on both majors. Inside one transaction the order across tables is not the
+  statement order (rows are decoded when their stripe is written: at commit, at prepare, or at a
+  flush by size or memory); the order within a table is.
+- **Subtransactions and two-phase.** The xid of a record is the one whose commit makes the
+  stripe visible, so a stripe flushed inside a subtransaction that rolls back is dropped with it.
+  The stripe is written at `PREPARE`, so two-phase decoding holds the rows until
+  `COMMIT PREPARED`.
+- **The guard.** A publication that names a columnar table is accepted now. Still refused, once a
+  columnar table exists: a publication that would include the stripe catalog
+  `kingres.columnar_stripe` (`FOR ALL TABLES`, `FOR TABLES IN SCHEMA kingres`), whose rows a
+  subscriber must not apply. Only inserts exist, so no replica identity is needed;
+  `REPLICA IDENTITY FULL` is accepted.
+- **A defect of C6c found on the way.** A unique index whose leaf page filled with the entries of
+  rolled-back inserts of the same keys made the B-tree ask the access method for bottom-up
+  deletion, which raised "columnar tables have no indexes in this version" and failed the insert.
+  The answer is now "no entry may go": the page splits and `VACUUM` removes the entries.
+- **For bucket moves in `kingres_shard` (S3).** The copy tables are created `USING` the source's
+  access method and loaded through `COPY`, then compacted before the switch. The move's
+  publication names tables with `FOR TABLE` (or the root with `publish_via_partition_root`),
+  never `FOR ALL TABLES`. The publisher needs the library preloaded and `wal_level = logical`. A
+  columnar leaf under a root published through the root is not tested yet. The refusal of
+  columnar relations in step 1 of increment 9.3 can be removed when S3 is built.
+- **Tests and mutants.** `t/061_logical.pl` compares a subscriber row by row with the publisher
+  (every column type, a 2 MB value, `COPY`, 30 001 rows, savepoints, prepared transactions,
+  reserved row numbers and an index, four sessions, compaction, `TRUNCATE`, two crashes, the
+  origin, a physical standby). Of 17 one-line mutants 12 are killed; the 5 that survive change
+  nothing observable (for example the top transaction id, which at `wal_level = logical` is never
+  needed because the assignment of a subtransaction is logged at once).
+
+### C8, reuse of free space in the file (2026-11-19)
+
+- **Where it differs from section 7.5.** The design finds free pages by walking stripe headers
+  and the writer transaction named on each page. Pages carry no transaction id here (a choice of
+  C1: an id on a page would need freezing), so such a walk cannot tell a crashed writer's pages
+  from a running one's. Instead `VACUUM` takes a `SHARE` lock on the table without waiting,
+  retrying every 50 ms for `vacuum_truncate_lock_timeout`, which excludes every running writer
+  (prepared transactions included); the stripe catalog alone then says which blocks are used. No
+  page is read and readers are not blocked. The cost: a table that never has a moment without a
+  writer gets no list, and its file grows as before (`DEBUG2` says that `VACUUM` gave up).
+  Decided by the integrator: accepted.
+- **The list.** Up to 400 free extents in the metapage, in space that was zero, with a checksum of
+  its own; a list that is not sound (unsorted, overlapping, past the end of the file) reads as
+  empty. An older binary ignores the list and drops it when it rewrites the page, which loses
+  space, not data, so the version stays 0.2. `pd_lower` now covers the list, or a full-page image
+  would leave it out.
+- **The take.** A stripe write takes the first extent that fits, under the metapage lock, and
+  logs the metapage before any page is written; otherwise the file is extended as before. A crash
+  after the take and before a page loses only the run's place in the list; the next `VACUUM`
+  lists it again. A taken run is never given out twice after a crash, because the take is logged.
+- **Standbys.** `XLOG_KC_FREE` carries the newest transaction that deleted a stripe whose blocks
+  are listed for the first time, and redo cancels the standby queries that may still read them
+  before any of them can be written over. With `hot_standby_feedback` such stripes are not listed.
+- **Check.** `columnar_check` reports `free_extent_overlaps_stripe`. A damaged list is not tested
+  (it needs a hand-made page checksum).
+- **Tests and mutants.** `t/062_free_extents.pl`: in a steady load of small inserts, compactions
+  and vacuums over 40 rounds the vacuumed file stays at 2.0 MB against 23.4 MB for a control that is
+  never vacuumed; older snapshots, failed loads in the middle and at the end of the file, exact
+  and one-block-short runs, a writer in flight, two crashes, a hot standby with and without
+  feedback, four writers. All 12 one-line mutants are killed.

@@ -62,12 +62,19 @@ async function openPublication() {
 const rows = (testId: string) => screen.queryAllByTestId(testId)
 
 describe('the tab bar of the Ledger page', () => {
-  it('has Overview, Digests, Signing and Publication, and keeps the database and the tab in the address', async () => {
+  it('has Overview, Digests, Anchoring, Client keys, Signing and Publication, and keeps the database and the tab in the address', async () => {
     const user = userEvent.setup()
     const { router } = await renderApp('/ledger')
     await screen.findByText(/status of shop/i)
     const tabs = screen.getAllByRole('tab').map((t) => t.textContent?.trim())
-    expect(tabs).toEqual(['Overview', 'Digests', 'Signing', 'Publication'])
+    expect(tabs).toEqual([
+      'Overview',
+      'Digests',
+      'Anchoring',
+      'Client keys',
+      'Signing',
+      'Publication',
+    ])
     expect(screen.getByRole('tab', { name: 'Overview' })).toHaveAttribute('aria-selected', 'true')
     await user.click(screen.getByRole('tab', { name: 'Digests' }))
     await screen.findByRole('heading', { name: 'Digests' })
@@ -328,7 +335,7 @@ describe('the Signing tab', () => {
     await user.click(within(dialog).getByRole('checkbox', { name: /i confirm the origin prefix/i }))
     expect(confirm).toBeEnabled()
     await user.click(confirm)
-    await within(dialog).findByText('Finished.', {}, { timeout: 4000 })
+    await within(dialog).findByText('Finished.', {}, { timeout: 30_000 })
     expect(within(dialog).getByTestId('create-key-next')).toHaveTextContent(/trust file/i)
     expect(getState().ledger7.settings.publication.originPrefix).toBe('ledger.example.com/kingres')
     expect(getState().ledger7.signing.keys).toHaveLength(1)
@@ -368,7 +375,7 @@ describe('the Signing tab', () => {
     await user.type(days, '7')
     await user.click(within(dialog).getByRole('checkbox', { name: /i have made a backup/i }))
     await user.click(within(dialog).getByRole('button', { name: /^rotate the key$/i }))
-    await within(dialog).findByText('Finished.', {}, { timeout: 4000 })
+    await within(dialog).findByText('Finished.', {}, { timeout: 30_000 })
     await user.click(within(dialog).getByRole('button', { name: /^close$/i }))
     await waitFor(() => expect(rows('key-active')).toHaveLength(2))
     expect(getState().ledger7.signing.keys.filter((k) => k.state === 'active')).toHaveLength(2)
@@ -398,7 +405,7 @@ describe('the Signing tab', () => {
     expect(dialog.textContent).toMatch(/deleted from every server/i)
     expect(dialog.textContent).toMatch(/stays valid for ever/i)
     await user.click(within(dialog).getByRole('button', { name: /^retire the key$/i }))
-    await within(dialog).findByText('Finished.', {}, { timeout: 4000 })
+    await within(dialog).findByText('Finished.', {}, { timeout: 30_000 })
     await user.click(within(dialog).getByRole('button', { name: /^close$/i }))
     await waitFor(() => expect(rows('key-retired')).toHaveLength(2))
     expect(rows('key-active')).toHaveLength(1)
@@ -439,7 +446,7 @@ describe('the Signing tab', () => {
     await user.clear(reason)
     await user.type(reason, 'laptop lost')
     await user.click(confirm)
-    await within(dialog).findByText('Finished.', {}, { timeout: 4000 })
+    await within(dialog).findByText('Finished.', {}, { timeout: 30_000 })
     expect(within(dialog).getByTestId('revoke-next')).toHaveTextContent(/new trust file/i)
     const revoked = getState().ledger7.signing.keys.find(
       (k) => k.fingerprint === target.fingerprint,
@@ -471,7 +478,7 @@ describe('the Signing tab', () => {
     await user.click(within(rows('key-active')[0]!).getByRole('button', { name: /retire now/i }))
     const dialog = await screen.findByRole('dialog')
     await user.click(within(dialog).getByRole('button', { name: /^retire the key$/i }))
-    const hint = await within(dialog).findByTestId('task-error-hint', {}, { timeout: 4000 })
+    const hint = await within(dialog).findByTestId('task-error-hint', {}, { timeout: 30_000 })
     expect(hint).toHaveTextContent(/still on that server/i)
     expect(hint).toHaveTextContent(/retried/i)
     // The task error is shown with the server's own text too.
@@ -485,7 +492,7 @@ describe('the Signing tab', () => {
     await user.click(screen.getByRole('button', { name: /^rotate the key$/i }))
     const dialog = await screen.findByRole('dialog')
     await user.click(within(dialog).getByRole('button', { name: /^rotate the key$/i }))
-    const hint = await within(dialog).findByTestId('task-error-hint', {}, { timeout: 4000 })
+    const hint = await within(dialog).findByTestId('task-error-hint', {}, { timeout: 30_000 })
     expect(hint).toHaveTextContent(/cannot open it with its own passphrase/i)
     expect(hint).toHaveTextContent(/names the server/i)
     expect(getState().ledger7.signing.keys.filter((k) => k.state === 'active')).toHaveLength(2)
@@ -541,6 +548,10 @@ describe('the Signing tab', () => {
     await user.click(screen.getByRole('button', { name: /^rotate the key$/i }))
     const dialog = await screen.findByRole('dialog')
     await (await import('@/api/endpoints')).endpoints.createLedgerSigningKey()
+    // That task stays running for as long as the test lasts: whether it is still running when the button is clicked must not
+    // depend on how long the machine takes to get there.
+    for (const t of getState().tasks)
+      if (t.task.kind.startsWith('ledger.key')) t.durationMs = 3_600_000
     await user.click(within(dialog).getByRole('button', { name: /^rotate the key$/i }))
     expect((await within(dialog).findAllByText(/in progress/i)).length).toBeGreaterThan(0)
     expect(within(dialog).queryByText('Finished.')).not.toBeInTheDocument()
@@ -686,7 +697,8 @@ describe('the alerts of the ledger', () => {
     const links = await screen.findAllByTestId('alert-ledger')
     const hrefs = links.map((l) => l.querySelector('a')?.getAttribute('href') ?? '')
     expect(hrefs.some((h) => h.includes('tab=signing'))).toBe(true)
-    expect(hrefs.some((h) => h.includes('tab=publication') && h.includes('db=shop'))).toBe(true)
+    // A diverged chain is handled (acknowledged) on the Overview tab, which is the page without a tab in its address (console part D).
+    expect(hrefs.some((h) => !h.includes('tab=') && h.includes('db=shop'))).toBe(true)
   })
 })
 

@@ -352,7 +352,8 @@ const entries: Record<ProblemCode, Entry> = {
   failover_in_progress: {
     tone: 'warning',
     heading: 'A failover is in progress',
-    message: 'Wait until the failover has finished, then start the rebalance.',
+    message:
+      'A failover or a restore of the preferred primaries is running, and the cluster does not change its databases or its servers while it does. Nothing was changed. Wait until it has finished, then try again.',
     withDetail: true,
     retryable: true,
   },

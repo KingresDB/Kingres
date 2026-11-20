@@ -11,6 +11,7 @@ import { useMutation, useQueryClient } from '@tanstack/vue-query'
 import QueryBoundary from '@/components/QueryBoundary.vue'
 import ProblemNotice from '@/components/ProblemNotice.vue'
 import GateButton from '@/components/GateButton.vue'
+import PublicationAudit from '@/components/ledger/PublicationAudit.vue'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
 import FormField from '@/components/FormField.vue'
 import SafeName from '@/components/SafeName.vue'
@@ -355,6 +356,8 @@ const KIND: Record<string, string> = { chain: 'Chain log', aggregate: 'Aggregate
         </template>
       </QueryBoundary>
     </section>
+
+    <PublicationAudit />
 
     <section class="card stack" aria-labelledby="pubaddr-h">
       <h2 id="pubaddr-h">Addresses for auditors</h2>

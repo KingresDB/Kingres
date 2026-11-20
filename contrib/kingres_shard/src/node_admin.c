@@ -135,8 +135,27 @@ require_primaries_can_commit(void)
 	const KsCatalog *cat = kingres_shard_catalog();
 	ListCell   *lc;
 	int			ms = kingres_shard_node_timeout >= 2 ? Min(kingres_shard_node_timeout, 5) * 1000 - 1000 : 500;
+	List	   *targets = NIL;
 
+	/*
+	 * Connecting takes locks and reads settings, which processes invalidations and loads the
+	 * cache again (every time under debug_discard_caches), and the cache that was walked is
+	 * gone.  What the loop needs is copied out of the cache first.
+	 */
 	foreach(lc, cat->nodes)
+	{
+		const KsNode *n = (const KsNode *) lfirst(lc);
+		KsNode	   *t;
+
+		if (n->node_id == cat->local_node_id || !n->is_active || !n->is_primary)
+			continue;
+		t = palloc(sizeof(KsNode));
+		*t = *n;
+		t->host = pstrdup(n->host);
+		targets = lappend(targets, t);
+	}
+
+	foreach(lc, targets)
 	{
 		const KsNode *n = (const KsNode *) lfirst(lc);
 		char	   *err = NULL;
@@ -145,8 +164,6 @@ require_primaries_can_commit(void)
 		char		sql[160];
 		bool		ok;
 
-		if (n->node_id == cat->local_node_id || !n->is_active || !n->is_primary)
-			continue;
 		conn = kingres_shard_connect_control(n->host, n->port, &err);
 		if (conn == NULL)
 			continue;			/* a node that cannot be reached is the business of the call itself */

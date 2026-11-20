@@ -1,0 +1,483 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+package mapgroup
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover/journal"
+)
+
+// world models three servers: s1 ran the primary of the map group and the leader (it is dead), s2 (this server) and s3 host the
+// standbys 10 and 11 of group 0 (nodes 4 and 5).
+type world struct {
+	mu        sync.Mutex
+	log       []string
+	self      string
+	term      int64
+	primary   string
+	standbys  []failover.StandbyRec
+	pos       map[string]failover.Position
+	posErr    map[string]error
+	live      map[string]string
+	oldAlive  bool
+	promoted  map[string]bool
+	leaseHeld bool
+	rebalance int
+	taskID    int64
+	recorded  int
+	alerts    []string
+	facts     failover.GroupFacts
+	nodes     []failover.Node
+	noCA      bool
+}
+
+func newWorld() *world {
+	return &world{
+		self: "s2", term: 5, primary: "s1",
+		standbys: []failover.StandbyRec{
+			{ID: 10, Group: 0, Server: "s2", InstanceID: 100, Port: 5500, State: "ready", CatalogNode: 4},
+			{ID: 11, Group: 0, Server: "s3", InstanceID: 100, Port: 5501, State: "ready", CatalogNode: 5},
+		},
+		pos: map[string]failover.Position{
+			"s2": {Server: "s2", InRecovery: true, Timeline: 1, ReceiveLsn: "0/5000000", ReplayLsn: "0/5000000", SystemIdentifier: "9"},
+			"s3": {Server: "s3", InRecovery: true, Timeline: 1, ReceiveLsn: "0/4000000", ReplayLsn: "0/4000000", SystemIdentifier: "9"},
+		},
+		posErr:   map[string]error{},
+		live:     map[string]string{"s1": "dead", "s2": "live", "s3": "live"},
+		promoted: map[string]bool{},
+		facts:    failover.GroupFacts{SyncStreaming: true, LastKnownAge: time.Second, PrimaryPlanned: 1},
+		nodes: []failover.Node{
+			{ID: 1, Group: 0, Host: "s1", Port: 5400, Role: "primary"},
+			{ID: 4, Group: 0, Host: "s2", Port: 5500, Role: "standby"},
+			{ID: 5, Group: 0, Host: "s3", Port: 5501, Role: "standby"},
+		},
+	}
+}
+
+func (w *world) rec(f string, a ...any) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.log = append(w.log, fmt.Sprintf(f, a...))
+}
+
+func (w *world) index(prefix string) int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for i, l := range w.log {
+		if strings.HasPrefix(l, prefix) {
+			return i
+		}
+	}
+	return -1
+}
+
+func (w *world) count(prefix string) int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n := 0
+	for _, l := range w.log {
+		if strings.HasPrefix(l, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+type ports struct{ w *world }
+
+func (p ports) Self() string { return p.w.self }
+func (p ports) CatalogTerm(context.Context) (int64, string, error) {
+	return p.w.term, p.w.primary, nil
+}
+func (p ports) Members(context.Context) ([]string, error) { return []string{"s1", "s2", "s3"}, nil }
+func (p ports) Live(_ context.Context, s string) string   { return p.w.live[s] }
+func (p ports) Standbys(context.Context) ([]failover.StandbyRec, error) {
+	return append([]failover.StandbyRec(nil), p.w.standbys...), nil
+}
+func (p ports) Facts(context.Context) (failover.GroupFacts, error) { return p.w.facts, nil }
+func (p ports) Position(_ context.Context, s string) (failover.Position, error) {
+	if err := p.w.posErr[s]; err != nil {
+		return failover.Position{}, err
+	}
+	pos := p.w.pos[s]
+	if p.w.promoted[s] {
+		pos.InRecovery = false
+	}
+	return pos, nil
+}
+func (p ports) State(_ context.Context, s string) (failover.State, error) {
+	if s == "s1" && !p.w.oldAlive {
+		return failover.State{}, failover.ErrUnreachable
+	}
+	f := false
+	return failover.State{Server: s, Instances: []failover.StateInstance{{ID: 1, Group: 0, Running: true, InRecovery: &f, Role: "primary"}}}, nil
+}
+func (p ports) Demote(_ context.Context, s string, r failover.DemoteRequest) (failover.DemoteAnswer, error) {
+	p.w.rec("demote %s to=%s", s, r.TransferTo)
+	return failover.DemoteAnswer{Stopped: true, Transferred: true}, nil
+}
+func (p ports) Lease(_ context.Context, s string, r failover.LeaseRequest) (failover.LeaseAnswer, error) {
+	switch {
+	case r.TransferTo != "":
+		p.w.rec("lease-transfer %s to %s", s, r.TransferTo)
+		return failover.LeaseAnswer{Transferred: true, Holder: r.TransferTo}, nil
+	default:
+		p.w.rec("lease-%s %s", r.Role, s)
+		return failover.LeaseAnswer{Held: true}, nil
+	}
+}
+func (p ports) Promote(_ context.Context, s string, r failover.PromoteRequest) (failover.PromoteAnswer, error) {
+	p.w.mu.Lock()
+	already := p.w.promoted[s]
+	p.w.promoted[s] = true
+	p.w.mu.Unlock()
+	if already {
+		p.w.rec("promote-already %s", s)
+		return failover.PromoteAnswer{Status: "already", Timeline: 2}, nil
+	}
+	p.w.rec("promote %s", s)
+	return failover.PromoteAnswer{Status: "promoted", Timeline: 2, Lsn: "0/5000100"}, nil
+}
+func (p ports) FreezeLocal(context.Context, time.Duration) error { p.w.rec("freeze"); return nil }
+func (p ports) Continue(_ context.Context, s string, j journal.Journal) error {
+	p.w.rec("continue %s id=%s", s, j.ID)
+	return nil
+}
+func (p ports) Catalog() failover.Catalog { return fcat{p.w} }
+func (p ports) PauseRebalance(context.Context) (int, error) {
+	p.w.rec("pause-rebalance")
+	return p.w.rebalance, nil
+}
+func (p ports) RecordTask(_ context.Context, j journal.Journal) (int64, error) {
+	p.w.mu.Lock()
+	defer p.w.mu.Unlock()
+	p.w.recorded++
+	p.w.taskID = 77
+	p.w.log = append(p.w.log, "record-task")
+	return p.w.taskID, nil
+}
+func (p ports) MoveSystem(context.Context) error             { p.w.rec("move-system"); return nil }
+func (p ports) CheckAuthority(context.Context) (bool, error) { return !p.w.noCA, nil }
+func (p ports) Alert(_ context.Context, kind, _, _, _ string, raise bool) {
+	if raise {
+		p.w.mu.Lock()
+		p.w.alerts = append(p.w.alerts, kind)
+		p.w.mu.Unlock()
+	}
+}
+
+type fcat struct{ w *world }
+
+func (c fcat) Databases(context.Context) ([]string, error) { return []string{failover.SystemDB}, nil }
+func (c fcat) Nodes(context.Context, string) ([]failover.Node, error) {
+	return append([]failover.Node(nil), c.w.nodes...), nil
+}
+func (c fcat) Status(context.Context, string) (int64, bool, error) { return c.w.term, false, nil }
+func (c fcat) PromoteNode(_ context.Context, db string, id int32) (failover.PromoteResult, error) {
+	c.w.rec("promote_node %s %d", db, id)
+	c.w.mu.Lock()
+	defer c.w.mu.Unlock()
+	if c.w.primary != c.w.self {
+		c.w.primary = c.w.self
+		c.w.term++
+	}
+	return failover.PromoteResult{Status: "already", Term: c.w.term, Final: true}, nil
+}
+func (c fcat) RecoverPrepared(context.Context, string) error { return nil }
+func (c fcat) CheckCluster(context.Context, string) ([]failover.Incident, error) {
+	return nil, nil
+}
+
+func (w *world) runner(t *testing.T) (*Runner, *journal.Store) {
+	t.Helper()
+	js, err := journal.Open(tempDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(1_000_000, 0)
+	return &Runner{P: ports{w}, Journal: js,
+		Now:           func() time.Time { return now },
+		Sleep:         func(ctx context.Context, d time.Duration) error { now = now.Add(d); return ctx.Err() },
+		PromoteNodeOp: failover.PromoteOptions{Pause: time.Millisecond}}, js
+}
+
+func req() Request { return Request{OldServer: "s1", Trigger: "manual", RequestedBy: "admin"} }
+
+func TestTheMapGroupIsPromotedInTheOrderOfTheDesign(t *testing.T) {
+	w := newWorld()
+	r, js := w.runner(t)
+	res, err := r.Run(context.Background(), req())
+	if err != nil {
+		t.Fatalf("%v\n%s", err, strings.Join(w.log, "\n"))
+	}
+	order := []string{"freeze", "lease-fence s2", "lease-holder s2", "promote s2", "promote_node kingres_system 4", "move-system", "pause-rebalance", "record-task"}
+	last := -1
+	for _, o := range order {
+		i := w.index(o)
+		if i < 0 || i < last {
+			t.Fatalf("%q out of order (at %d, after %d):\n%s", o, i, last, strings.Join(w.log, "\n"))
+		}
+		last = i
+	}
+	if res.TaskID != 77 || js.Active() || !js.Gate() {
+		t.Fatalf("result %+v active=%v", res, js.Active())
+	}
+	for _, s := range journal.Order {
+		if !js.IsDone(s) {
+			t.Errorf("step %q is not done", s)
+		}
+	}
+}
+
+// Every step is idempotent and survives the end of kingresd at any boundary: after a crash the journal is read and the work goes
+// on without a second promotion and without a second task.
+func TestTheBootstrapSurvivesACrashAtEveryStepBoundary(t *testing.T) {
+	for _, step := range journal.Order {
+		for _, where := range []string{"before", "after"} {
+			point := step + ":" + where
+			t.Run(point, func(t *testing.T) {
+				w := newWorld()
+				r, js := w.runner(t)
+				crashed := false
+				r.Fault = func(p string) error {
+					if p == point && !crashed {
+						crashed = true
+						return errors.New("kingresd ended")
+					}
+					return nil
+				}
+				_, err := r.Run(context.Background(), req())
+				if step == journal.StepDecide {
+					// B1 has no function of its own: the journal is begun by Decide and nothing is done.
+					if err != nil && !crashed {
+						t.Fatal(err)
+					}
+				} else if err == nil {
+					t.Fatalf("the crash at %s did not end the run", point)
+				}
+				if !js.Active() && !js.IsDone(journal.StepGateOpen) {
+					t.Fatal("the journal is lost")
+				}
+				// a restart: the journal is read again from disk by a new store
+				res, ok, err := r.Resume(context.Background())
+				if crashed && !ok && !js.IsDone(journal.StepGateOpen) {
+					t.Fatal("nothing to resume")
+				}
+				if err != nil {
+					t.Fatalf("resume: %v\n%s", err, strings.Join(w.log, "\n"))
+				}
+				if w.count("promote ")+w.count("promote-already") < 1 {
+					t.Fatalf("the standby was never promoted:\n%s", strings.Join(w.log, "\n"))
+				}
+				if w.count("promote s2") != 1 {
+					t.Fatalf("promoted %d times:\n%s", w.count("promote s2"), strings.Join(w.log, "\n"))
+				}
+				if w.recorded != 1 {
+					t.Fatalf("the task was recorded %d times", w.recorded)
+				}
+				_ = res
+				if js.Active() {
+					t.Fatalf("the gate is still closed:\n%s", strings.Join(w.log, "\n"))
+				}
+			})
+		}
+	}
+}
+
+func TestAnotherCandidateThatIsBetterGetsTheLeaseAndTheJournal(t *testing.T) {
+	w := newWorld()
+	w.pos["s3"] = failover.Position{Server: "s3", InRecovery: true, Timeline: 1, ReceiveLsn: "0/9000000", ReplayLsn: "0/9000000", SystemIdentifier: "9"}
+	r, js := w.runner(t)
+	res, err := r.Run(context.Background(), req())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.HandedTo != "s3" {
+		t.Fatalf("result %+v\n%s", res, strings.Join(w.log, "\n"))
+	}
+	if w.index("promote s2") >= 0 || w.index("lease-transfer s2 to s3") < 0 || w.index("continue s3") < 0 {
+		t.Fatalf("hand-over:\n%s", strings.Join(w.log, "\n"))
+	}
+	if w.index("lease-transfer s2 to s3") > w.index("continue s3") {
+		t.Fatal("the other candidate was told before it held the lease")
+	}
+	if p := func() *journal.Pin { j, _ := js.Current(); return j.Pin }(); p == nil || p.Server != "s3" {
+		t.Fatalf("the pin of the journal: %+v", p)
+	}
+}
+
+func TestAnInstanceThatIsOutOfRecoveryIsNotAdopted(t *testing.T) {
+	w := newWorld()
+	w.promoted["s3"] = true
+	r, _ := w.runner(t)
+	_, err := r.Run(context.Background(), req())
+	var pe *failover.PauseError
+	if !errors.As(err, &pe) {
+		t.Fatalf("got %v", err)
+	}
+	if w.index("promote ") >= 0 || len(w.alerts) == 0 || w.alerts[0] != "failoverNeedsDecision" {
+		t.Fatalf("log:\n%s\nalerts %v", strings.Join(w.log, "\n"), w.alerts)
+	}
+}
+
+func TestAnUnreadableStandbyNeedsTheAcceptanceOfALoss(t *testing.T) {
+	w := newWorld()
+	w.posErr["s3"] = failover.ErrUnreachable
+	r, _ := w.runner(t)
+	_, err := r.Run(context.Background(), req())
+	var pe *failover.PauseError
+	if !errors.As(err, &pe) || w.index("promote ") >= 0 {
+		t.Fatalf("got %v\n%s", err, strings.Join(w.log, "\n"))
+	}
+	// The same request with the acceptance goes on: the pause did not close the journal.
+	rq := req()
+	rq.AllowDataLoss = true
+	w2 := newWorld()
+	w2.posErr["s3"] = failover.ErrUnreachable
+	r2, _ := w2.runner(t)
+	if _, err := r2.Run(context.Background(), rq); err != nil || w2.index("promote s2") < 0 {
+		t.Fatalf("with allowDataLoss: %v\n%s", err, strings.Join(w2.log, "\n"))
+	}
+}
+
+func TestDecideRefusals(t *testing.T) {
+	cases := []struct {
+		name string
+		mod  func(w *world)
+		req  Request
+		code string
+	}{
+		{"the catalog names another primary", func(w *world) { w.primary = "s3" }, req(), "unprocessable"},
+		{"this server is the old one", func(w *world) {}, Request{OldServer: "s2"}, "unprocessable"},
+		{"no ready standby here", func(w *world) { w.standbys[0].State = "creating" }, req(), "no_replica_available"},
+		{"no majority", func(w *world) { w.live["s3"] = "dead" }, req(), "quorum_unavailable"},
+	}
+	for _, c := range cases {
+		w := newWorld()
+		c.mod(w)
+		if c.name == "this server is the old one" {
+			w.primary = "s2"
+		}
+		r, js := w.runner(t)
+		_, err := r.Run(context.Background(), c.req)
+		var ref *Refusal
+		if !errors.As(err, &ref) || ref.Code != c.code {
+			t.Errorf("%s: %v", c.name, err)
+		}
+		if js.Active() {
+			t.Errorf("%s: a refused request began a journal", c.name)
+		}
+	}
+}
+
+func TestAnOldServerThatAnswersIsAskedToDemoteFirst(t *testing.T) {
+	w := newWorld()
+	w.oldAlive = true
+	w.live["s1"] = "live"
+	r, _ := w.runner(t)
+	if _, err := r.Run(context.Background(), req()); err != nil {
+		t.Fatal(err)
+	}
+	if w.index("demote s1 to=s2") < 0 || w.index("demote s1 to=s2") > w.index("lease-fence s2") {
+		t.Fatalf("log:\n%s", strings.Join(w.log, "\n"))
+	}
+}
+
+// Without the key of the certificate authority on the new leader the product says so (the escrow is an open point of the design).
+func TestANewLeaderWithoutTheKeyOfTheCertificateAuthorityRaisesAnAlert(t *testing.T) {
+	w := newWorld()
+	w.noCA = true
+	r, _ := w.runner(t)
+	if _, err := r.Run(context.Background(), req()); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, a := range w.alerts {
+		if a == AlertAuthority {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("alerts %v", w.alerts)
+	}
+	w2 := newWorld()
+	r2, _ := w2.runner(t)
+	if _, err := r2.Run(context.Background(), req()); err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range w2.alerts {
+		if a == AlertAuthority {
+			t.Fatalf("an alert although the key is there: %v", w2.alerts)
+		}
+	}
+}
+
+// A step that finished is not run again after a crash, and a task that was recorded is not recorded twice.
+func TestAFinishedStepIsNotRepeatedAfterACrash(t *testing.T) {
+	for _, c := range []struct{ point, marker string }{
+		{journal.StepFreeze + ":after", "freeze"},
+		{journal.StepCatalog + ":after", "promote_node"},
+	} {
+		w := newWorld()
+		r, _ := w.runner(t)
+		crashed := false
+		r.Fault = func(p string) error {
+			if p == c.point && !crashed {
+				crashed = true
+				return errors.New("kingresd ended")
+			}
+			return nil
+		}
+		if _, err := r.Run(context.Background(), req()); err == nil {
+			t.Fatalf("%s: no crash", c.point)
+		}
+		if _, _, err := r.Resume(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if n := w.count(c.marker); n != 1 {
+			t.Errorf("after a crash at %s the step with %q ran %d times", c.point, c.marker, n)
+		}
+	}
+}
+
+func TestARecordedTaskIsNotRecordedAgainAfterACrash(t *testing.T) {
+	w := newWorld()
+	r, _ := w.runner(t)
+	crashed := false
+	r.Fault = func(p string) error {
+		if p == "B7 recorded" && !crashed {
+			crashed = true
+			return errors.New("kingresd ended")
+		}
+		return nil
+	}
+	if _, err := r.Run(context.Background(), req()); err == nil {
+		t.Fatal("no crash")
+	}
+	if _, _, err := r.Resume(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if w.recorded != 1 {
+		t.Fatalf("recorded %d times", w.recorded)
+	}
+}
+
+// tempDir is a directory that is removed without failing the test when the machine still holds a file in it (an indexer on Windows).
+func tempDir(t *testing.T) string {
+	t.Helper()
+	d, err := os.MkdirTemp("", "kg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(d) })
+	return d
+}

@@ -13,8 +13,11 @@
 package ledgerpub
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgerlog"
@@ -130,7 +133,7 @@ type Store interface {
 	PutCheckpoint(ctx context.Context, term scheduler.Term, c Checkpoint, keysRevision int64, markFirst bool, prefix string) error
 	// ReplaceNote replaces the note of a stored checkpoint by one that adds signature lines to the same text (a
 	// re-signing at a key rotation); the root must equal the stored root.
-	ReplaceNote(ctx context.Context, term scheduler.Term, logID, size int64, note []byte) error
+	ReplaceNote(ctx context.Context, term scheduler.Term, logID, size int64, note []byte, keysRevision int64) error
 	// Checkpoint returns the checkpoint at a size, ErrNotFound when there is none.
 	Checkpoint(ctx context.Context, logID, size int64) (Checkpoint, error)
 	// LatestCheckpoint returns the newest checkpoint of a log, ErrNotFound when there is none.
@@ -158,3 +161,47 @@ type Store interface {
 
 // emptyRoot is the root of the empty tree as a slice (the root a new log row starts with).
 func emptyRoot() []byte { r := ledgerlog.EmptyRoot(); return r[:] }
+
+// sameText reports whether a note adds signatures to the text of the stored one and changes nothing else: ReplaceNote's rule (P8-06).
+func sameText(old, note []byte) error {
+	o, err := ledgerlog.ParseNote(old)
+	if err != nil {
+		return fmt.Errorf("%w: the stored note does not parse", ErrConflict)
+	}
+	n, err := ledgerlog.ParseNote(note)
+	if err != nil {
+		return fmt.Errorf("%w: the new note does not parse", ErrConflict)
+	}
+	if !bytes.Equal(o.Text, n.Text) {
+		return fmt.Errorf("%w: the text of the note is not the stored checkpoint's", ErrConflict)
+	}
+	return nil
+}
+
+// LogsJSON is the file logs.json of a publication (design 4.6, correction 178): the list of its logs, so that a client that follows a
+// publication (kingres-verify bundle fetch) need not be told every origin. The text is one JSON object on one line, a newline at the end,
+// the members in this order, the logs in the order of their creation:
+//
+//	{"format":1,"logs":[{"kind":"aggregate","origin":"<origin>","state":"active","size":3},...]}
+//
+// kind is "chain" or "aggregate"; origin is the origin of the log (its checkpoint is at <origin without the prefix>/checkpoint); state is
+// "active", "diverged" or "closed"; size is the size of the stored tree, which can be larger than that of the latest checkpoint for a moment.
+// A log without a signed checkpoint is listed too (its checkpoint answers 404). The file says nothing a client cannot find in the files it
+// lists, and no name of a database: the origin of a chain log is made of its chain id.
+func LogsJSON(rows []LogRow) []byte {
+	type entry struct {
+		Kind   string `json:"kind"`
+		Origin string `json:"origin"`
+		State  string `json:"state"`
+		Size   int64  `json:"size"`
+	}
+	out := struct {
+		Format int     `json:"format"`
+		Logs   []entry `json:"logs"`
+	}{Format: 1, Logs: []entry{}}
+	for _, r := range rows {
+		out.Logs = append(out.Logs, entry{Kind: r.Kind, Origin: r.Origin, State: r.State, Size: r.Size})
+	}
+	b, _ := json.Marshal(out)
+	return append(b, '\n')
+}

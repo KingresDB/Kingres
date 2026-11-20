@@ -57,6 +57,9 @@ type Key struct {
 	// tree size. A tree size is in the signed text of a checkpoint, a time is
 	// not, so this is how a retired key is limited in a way the data proves.
 	MaxTreeSize *uint64
+	// Cause says, for a key that a verified event of the publication revoked or limited, which event did
+	// it (not part of the file: a file written by trust follow carries the effect, not the cause).
+	Cause string
 }
 
 // ClientKey is a pinned client attestation key (used by a later step).
@@ -455,6 +458,9 @@ func (k Key) Why(now time.Time) string {
 	id := fmt.Sprintf("key %q (%s)", k.Name, k.Fingerprint[:16])
 	switch k.StandingAt(now) {
 	case Revoked:
+		if k.Cause != "" {
+			return id + " is revoked by " + k.Cause + " and was not used"
+		}
 		return id + " is revoked in the trust file and was not used"
 	case NotYetValid:
 		return fmt.Sprintf("%s is not valid before %s and was not used", id, k.NotBefore.Format(time.RFC3339Nano))
@@ -462,6 +468,9 @@ func (k Key) Why(now time.Time) string {
 		return fmt.Sprintf("%s has not_after %s, which has passed, and was not used (to check older checkpoints give --now a time before it, or limit the key with max_tree_size instead)", id, k.NotAfter.Format(time.RFC3339Nano))
 	}
 	if k.MaxTreeSize != nil {
+		if k.Cause != "" {
+			return fmt.Sprintf("%s counts only for checkpoints of tree size %d or less (%s)", id, *k.MaxTreeSize, k.Cause)
+		}
 		return fmt.Sprintf("%s counts only for checkpoints of tree size %d or less", id, *k.MaxTreeSize)
 	}
 	return id + " is usable"
@@ -523,6 +532,40 @@ func (f *File) SignerKeys(origin string, now time.Time) ([]signednote.Key, []str
 func (f *File) LimitFor(pub []byte, size uint64) bool {
 	k, ok := f.KeyFor(pub)
 	return ok && (k.MaxTreeSize == nil || size <= *k.MaxTreeSize)
+}
+
+// Clone returns a copy whose keys can be changed without changing f.
+func (f *File) Clone() *File {
+	c := *f
+	c.Keys = append([]Key(nil), f.Keys...)
+	return &c
+}
+
+// Revoke marks the key with this fingerprint revoked, for a cause that Why shows (a verified event of the
+// publication): from then on no signature of it is used and no size limit matters. It reports whether the key is in f.
+func (f *File) Revoke(fingerprint, cause string) bool {
+	for i := range f.Keys {
+		if f.Keys[i].Fingerprint == fingerprint {
+			f.Keys[i].Revoked, f.Keys[i].MaxTreeSize, f.Keys[i].Cause = true, nil, cause
+			return true
+		}
+	}
+	return false
+}
+
+// LimitTo limits the key with this fingerprint to checkpoints of tree size at most size (the smaller of this and
+// a limit it has), for a cause that Why shows. It reports whether the key is in f.
+func (f *File) LimitTo(fingerprint string, size uint64, cause string) bool {
+	for i := range f.Keys {
+		if f.Keys[i].Fingerprint == fingerprint {
+			if f.Keys[i].MaxTreeSize == nil || size < *f.Keys[i].MaxTreeSize {
+				n := size
+				f.Keys[i].MaxTreeSize, f.Keys[i].Cause = &n, cause
+			}
+			return true
+		}
+	}
+	return false
 }
 
 // fileJSON is the written form; field order is the order of the design.

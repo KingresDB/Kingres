@@ -14,6 +14,9 @@
  *	  <point>:wait:<file>	sleep as long as <file> exists, so that a test can
  *							stop a node or kill a process at a known moment;
  *							<file>.reached is created when the point is reached
+ *	  <point>:waitinv:<file>	the same, and then the backend takes the invalidations that
+ *							committed meanwhile (a catalog change made by the test while
+ *							the statement waited reaches its cache at that moment)
  *
  * A point name can carry a scope, <point>@<scope>:<action>: the point then fires
  * only in a session whose scope is that one.  The switch of a bucket move sets
@@ -62,6 +65,7 @@
 #include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
 
@@ -229,7 +233,7 @@ kingres_shard_fault_point(const char *point)
 					(errcode(ERRCODE_INTERNAL_ERROR),
 					 errmsg("injected failure at %s", point)));
 	}
-	else if (strcmp(action, "wait") == 0 && arg != NULL)
+	else if ((strcmp(action, "wait") == 0 || strcmp(action, "waitinv") == 0) && arg != NULL)
 	{
 		TimestampTz start = GetCurrentTimestamp();
 		char	   *reached = psprintf("%s.reached", arg);
@@ -247,6 +251,9 @@ kingres_shard_fault_point(const char *point)
 			if (TimestampDifferenceExceeds(start, GetCurrentTimestamp(), 120000))
 				break;
 		}
+		/* waitinv: what committed meanwhile is seen at once, as if the invalidation had arrived now */
+		if (strcmp(action, "waitinv") == 0)
+			AcceptInvalidationMessages();
 	}
 	pfree(spec);
 }

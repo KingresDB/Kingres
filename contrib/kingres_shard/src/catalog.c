@@ -73,6 +73,8 @@ static struct
 
 static void catalog_inval_callback(Datum arg, Oid relid);
 static void catalog_load(void);
+static void catalog_retire(MemoryContext cxt);
+static void catalog_xact_callback(XactEvent event, void *arg);
 
 /*
  * kingres_shard_catalog_init
@@ -83,6 +85,7 @@ void
 kingres_shard_catalog_init(void)
 {
 	CacheRegisterRelcacheCallback(catalog_inval_callback, (Datum) 0);
+	RegisterXactCallback(catalog_xact_callback, NULL);
 }
 
 /*
@@ -111,6 +114,37 @@ catalog_inval_callback(Datum arg, Oid relid)
 			return;
 		}
 	}
+}
+
+/*
+ * A cache that was replaced is not freed at once: code that is in the middle of a statement
+ * holds pointers into it (a distributed table, a colocation group, a node) and the load can
+ * happen under any call that takes a lock, and under debug_discard_caches under every one of
+ * them.  The pointers then keep describing the catalog as the statement began with it, and
+ * the memory goes when the transaction ends.
+ */
+static List *retired_cxts = NIL;
+
+static void
+catalog_retire(MemoryContext cxt)
+{
+	MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
+	retired_cxts = lappend(retired_cxts, cxt);
+	MemoryContextSwitchTo(old);
+}
+
+static void
+catalog_xact_callback(XactEvent event, void *arg)
+{
+	ListCell   *lc;
+
+	if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT && event != XACT_EVENT_PREPARE)
+		return;
+	foreach(lc, retired_cxts)
+		MemoryContextDelete((MemoryContext) lfirst(lc));
+	list_free(retired_cxts);
+	retired_cxts = NIL;
 }
 
 /*
@@ -604,7 +638,7 @@ catalog_load(void)
 	ks.cat = cat;
 	memcpy(ks.relids, relids, sizeof(relids));
 	if (prevcxt != NULL)
-		MemoryContextDelete(prevcxt);
+		catalog_retire(prevcxt);
 	ks.valid = true;
 
 	/* Sessions to nodes that are no longer primaries are of no use any more. */
@@ -926,6 +960,20 @@ kingres_shard_coloc_bucket(const KsColocation *coloc, int i)
 }
 
 /*
+ * The modulus of the hash partition that is a bucket: FOR VALUES WITH (MODULUS m,
+ * REMAINDER bucket).  Every bucket of a group has the modulus bucket_count today;
+ * when a bucket can be split (design/shard-phase10.md) each bucket has its own,
+ * and the code that creates or attaches a bucket partition asks here.
+ */
+int
+kingres_shard_bucket_modulus(const KsColocation *coloc, int bucket)
+{
+	Assert(bucket >= 0 && bucket < coloc->bucket_count);
+	(void) bucket;
+	return coloc->bucket_count;
+}
+
+/*
  * A copy of a colocation group's bucket layout that stays valid when the catalog
  * cache is reloaded (the batch sender keeps one for the whole of a statement,
  * which plans other statements while it runs).  Made in the current memory context.
@@ -947,6 +995,27 @@ kingres_shard_bucket_group(const KsColocation *coloc, int bucket)
 	if (bucket < 0 || bucket >= coloc->bucket_count)
 		return -1;
 	return coloc->bucket_group[bucket];
+}
+
+/*
+ * A colocation group's layout made by the caller from the catalog tables as its own
+ * transaction sees them (a group made in this transaction is not in the cache yet):
+ * groups[b], for b = 0 .. nbuckets - 1, is the group that owns bucket b, or -1.  Made
+ * in the current memory context.
+ */
+KsColocation *
+kingres_shard_coloc_make(int colocation_id, int nbuckets, Oid dist_type, Oid collation,
+						 const int *groups)
+{
+	KsColocation *c = palloc0(sizeof(KsColocation));
+
+	c->colocation_id = colocation_id;
+	c->bucket_count = nbuckets;
+	c->dist_type = dist_type;
+	c->collation = collation;
+	c->bucket_group = palloc(sizeof(int) * Max(nbuckets, 1));
+	memcpy(c->bucket_group, groups, sizeof(int) * nbuckets);
+	return c;
 }
 
 /*

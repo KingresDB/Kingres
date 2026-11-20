@@ -15,7 +15,7 @@ use File::Path ();
 use IPC::Run ();
 use Exporter 'import';
 
-our @EXPORT_OK = qw(make_node make_cluster keys_of_group run_sql group_of_key
+our @EXPORT_OK = qw(not_shipped_ok make_node make_cluster keys_of_group run_sql group_of_key
   prepared_count wait_prepared_count logical_settings move_state wait_for_fault_file
   make_standby register_standby wait_catchup set_sync promote_standby wait_waiter
   start_psql finish_psql release_node);
@@ -70,8 +70,20 @@ sub make_node
 	  . "kingres_shard.recovery_interval = $interval\n"
 	  . "kingres_shard.deadlock_check_interval = " . ($opt{deadlock_interval} // 0) . "\n"
 	  . "kingres_shard.deadlock_confirm_delay = " . ($opt{deadlock_confirm} // 200) . "\n";
+	# The tests of the scan of phase 2a, of the fragments and of the closed query test those paths; a read that
+	# aggregates would take the partial aggregation of step 7 instead, and one that joins colocated tables the join rows
+	# of step 10.  A test of those steps turns them on (t/139: extra => "kingres_shard.enable_partial_aggregation = on",
+	# t/154: enable_pushdown_join = on; the later line of the file wins).
+	$conf .= "kingres_shard.enable_partial_aggregation = off\n";
+	$conf .= "kingres_shard.enable_pushdown_join = off\n";
 	$conf .= logical_settings() if $opt{logical};
 	$conf .= $opt{extra} if defined $opt{extra};
+	# The second profile of the tests (review P2E-03): KS_ALL_PATHS=1 in the environment makes every node of every test run with the
+	# partial aggregation and the join rows ON, after the test's own `extra`, so that a test that wrote them off (t/124 to t/127, the older tests)
+	# runs the paths too.  The defaults above stay the profile of the closed query and the scan.  A statement of a test that proves
+	# that a path is NOT taken (a plan assertion that a statement is not shipped as a partial aggregation) is written for the
+	# defaults and says so (it skips under the profile); the answers are compared in both profiles.
+	$conf .= "kingres_shard.enable_partial_aggregation = on\nkingres_shard.enable_pushdown_join = on\n" if $ENV{KS_ALL_PATHS};
 	# tcp: the node also listens on 127.0.0.1 and trusts connections from there, so that
 	# a cluster can be registered by an address that libpq connects to by TCP (SSL
 	# options only apply to TCP connections).
@@ -109,6 +121,21 @@ sub make_cluster
 			sprintf("SELECT kingres.add_node('%s', %d)", ($opt{tcp} ? "127.0.0.1" : $nodes[$i]->host), $nodes[$i]->port));
 	}
 	return @nodes;
+}
+
+# A statement that a test says is not shipped (a closed query, the fragment scan).  Under the second profile (KS_ALL_PATHS=1: the partial
+# aggregation and the join rows are on) the plan may be a partial aggregation or the rows of a join, which are fragment scans too; the
+# assertion is then that it is not a closed query, the answer being compared in both profiles (review P2E-03).
+sub not_shipped_ok
+{
+	my ($plan, $name) = @_;
+	if ($ENV{KS_ALL_PATHS})
+	{
+		my $ok = Test::More::ok($plan !~ /Pushed: (?!partial aggregate|join rows)/, "$name (not a closed query)");
+		Test::More::diag($plan) unless $ok;
+		return $ok;
+	}
+	return Test::More::unlike($plan, qr/Kingres Fragment Scan/, $name);
 }
 
 # Run SQL and return (exit code, stdout, stderr).

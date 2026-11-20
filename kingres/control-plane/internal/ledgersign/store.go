@@ -117,6 +117,10 @@ type Change struct {
 	// the collector signed with it (corrections 128 and 129). A checkpoint put at the same time either commits first, and the change is
 	// refused and decided again with the new bound, or waits and finds the key set changed (ledgerpub.ErrKeysChanged).
 	CheckpointBound *uint64
+	// BoundKey, when not nil, narrows the check of CheckpointBound to the checkpoints that carry a signature of this key (P8-02): the
+	// refusal of a retirement is about checkpoints signed by the key that retires, above its bound, and not about the largest tree of the
+	// cluster, which the other key keeps growing after the key-retired event.
+	BoundKey ed25519.PublicKey
 }
 
 // Store is the storage of the key set. Every write names the term of the leader
@@ -134,4 +138,6 @@ type Store interface {
 	// MaxCheckpointSize is the largest size of any stored checkpoint of any log (0 when none): the
 	// bound of a retired key (ledgerkeys.AtMost) is at least this.
 	MaxCheckpointSize(ctx context.Context) (uint64, error)
+	// MaxCheckpointSizeSignedBy is the largest size of a stored checkpoint that carries a signature of the key (0 when none).
+	MaxCheckpointSizeSignedBy(ctx context.Context, pub ed25519.PublicKey) (uint64, error)
 }

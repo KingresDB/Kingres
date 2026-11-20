@@ -248,6 +248,13 @@ export function runStateMeta(state: string): StatusMeta {
 /** How a run ended (`FailoverReportSummary.outcome`). */
 export const OUTCOME: Record<string, StatusMeta> = {
   completed: { tone: 'ok', icon: OK, label: 'Completed' },
+  // 0.12.0: the failover ended and the check of the cluster afterwards reported something; the report says what.
+  completedWithWarnings: {
+    tone: 'ok',
+    icon: OK,
+    label: 'Completed, with remarks',
+    hint: 'The failover ended. The check of the cluster afterwards reported something: open the report to read it.',
+  },
   partial: { tone: 'warn', icon: WARN, label: 'Partly done' },
   failed: { tone: 'danger', icon: BAD, label: 'Failed' },
   cancelled: { tone: 'neutral', icon: RING, label: 'Cancelled' },
@@ -294,7 +301,8 @@ export const MODE_LABEL: Record<string, string> = {
 
 /** What the extension and the old primary's server did with the old primary. */
 const OLD_PRIMARY_STATE: Record<OldPrimaryReport['state'], string> = {
-  notScheduled: 'It stays stopped and fenced; this server version does not rebuild it yet.',
+  notScheduled:
+    'No rebuild of it is scheduled. It stays stopped and fenced (an earlier version of the server never rebuilt it, or it has no directory to rebuild).',
   rebuildScheduled: 'It will be rebuilt as a standby.',
   rebuilding: 'It is being rebuilt as a standby',
   standby: 'It is a standby of the new primary now',
@@ -420,7 +428,9 @@ export interface FailoverRefusal {
 }
 
 export interface RefusalContext {
-  mode: 'hard' | 'graceful'
+  mode: 'hard' | 'graceful' | 'restore'
+  /** The dialog is the switchover of one group (the words do not send the person to the hard mode). */
+  switchover?: boolean
   /** The request names the map group (the manager of the cluster moves with it). */
   includesMapGroup: boolean
 }
@@ -535,7 +545,13 @@ export function failoverRefusal(error: unknown, ctx: RefusalContext): FailoverRe
       }
     case 'unsupported_operation': {
       const parts: string[] = []
-      if (ctx.mode === 'graceful')
+      if (ctx.mode === 'restore')
+        parts.push(
+          'Restoring the preferred primaries (a planned switchover of every group that runs away from its home server) is not part of this server version yet.',
+        )
+      else if (ctx.mode === 'graceful' && ctx.switchover)
+        parts.push('The planned switchover of a group is not part of this server version yet.')
+      else if (ctx.mode === 'graceful')
         parts.push(
           'The planned switchover (graceful) is not part of this server version yet. A server that is down needs the hard mode.',
         )
@@ -562,3 +578,97 @@ export function failoverRefusal(error: unknown, ctx: RefusalContext): FailoverRe
 export function groupTitle(id: number, isMapGroup: boolean): string {
   return isMapGroup ? `Map group (group ${id})` : `Group ${id}`
 }
+
+export interface FailoverBannerWords {
+  tone: 'info' | 'danger'
+  /** `\u2716` for a run that waits for a person, `\u25D0` for one that goes on. */
+  icon: string
+  heading: string
+  detail: string
+}
+
+/**
+ * The banner of design 8.3: what a run does now, in one sentence, from the typed members of the status. Nothing is
+ * shown for an idle or a failed run (the progress card and the alerts say that); a run that waits for a person is
+ * danger and says so; while the manager of the cluster moves, the banner says where it moves to.
+ */
+export function failoverBanner(run: FailoverStatus | null | undefined): FailoverBannerWords | null {
+  if (!run || (run.state !== 'running' && run.state !== 'paused')) return null
+  const what =
+    run.kind === 'restorePreferredPrimaries'
+      ? 'Restoring the preferred primaries'
+      : run.trigger === 'automatic'
+        ? `Automatic failover of server ${safeText(run.serverId ?? 'unknown', 60)}`
+        : run.serverId
+          ? `Failover of server ${safeText(run.serverId, 60)}`
+          : 'Failover'
+  if (run.state === 'paused') {
+    const n = run.needsDecision.length
+    return {
+      tone: 'danger',
+      icon: '\u2716',
+      heading: `${what} is waiting for you.`,
+      detail:
+        n > 0
+          ? `A decision is needed for ${n === 1 ? '1 group' : `${n} groups`}.`
+          : 'It is paused until someone goes on or cancels it.',
+    }
+  }
+  if (run.phase === 'bootstrap') {
+    const to = run.groups.find((g) => g.toServerId)?.toServerId
+    return {
+      tone: 'info',
+      icon: '\u25D0',
+      heading: to
+        ? `The manager is moving to ${safeText(to, 60)}.`
+        : 'The manager of the cluster is moving.',
+      detail: 'Changes to the cluster wait until it has moved.',
+    }
+  }
+  const total = run.groups.length
+  const open = run.groups.findIndex((g) => !['done', 'skipped', 'failed'].includes(g.state))
+  const phase = phaseLabel(run.phase)
+  const place = total > 0 ? `group ${open < 0 ? total : open + 1} of ${total}` : null
+  return {
+    tone: 'info',
+    icon: '\u25D0',
+    heading: `${what} is running${place ? `: ${place}` : ''}.`,
+    detail: phase ?? '',
+  }
+}
+
+export interface AutoFailoverCounterWords {
+  /** "1 of 3". */
+  counter: string
+  /** When the last automatic failover was made, or that there was none. */
+  last: string
+  limitReached: boolean
+  /** The counter is at 0: there is nothing to reset. */
+  empty: boolean
+}
+
+/**
+ * The counter of automatic failovers in words (design 8.4). The limit is read from the numbers, so it also holds for a
+ * server that does not send `limitReached` (that member exists on the cluster summary only).
+ */
+export function autoFailoverCounterWords(af: {
+  eventsSinceReset: number
+  maxCount: number
+  lastEventAt?: string | null
+}): AutoFailoverCounterWords {
+  return {
+    counter: `${af.eventsSinceReset} of ${af.maxCount}`,
+    last: af.lastEventAt
+      ? `Last automatic failover: ${formatDateTime(af.lastEventAt)}.`
+      : 'No automatic failover has been made since the cluster was formed or the counter was reset.',
+    limitReached: af.eventsSinceReset >= af.maxCount,
+    empty: af.eventsSinceReset === 0,
+  }
+}
+
+/** What automatic failover needs, in words (design 8.4). */
+export const AUTO_FAILOVER_REQUIREMENTS: readonly string[] = [
+  'At least three servers, so that a majority can agree that a server has failed.',
+  'A standby for every shard group the failed server leads; a group without one cannot be failed over.',
+  'A synchronous standby for a failover that cannot lose data. Without one the failover waits for a person to accept the loss.',
+]

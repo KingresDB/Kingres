@@ -144,13 +144,19 @@ func logPath(origin string) string {
 
 func httpGet(t *testing.T, url string) (int, []byte) {
 	t.Helper()
-	resp, err := (&http.Client{Timeout: 20 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}).Get(url)
-	if err != nil {
-		t.Fatalf("GET %s: %v", url, err)
+	// A 503 is the listener's own "try again" (the limit of requests, or a store that is busy just after a restart): a reader tries again.
+	for attempt := 0; ; attempt++ {
+		resp, err := (&http.Client{Timeout: 20 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}).Get(url)
+		if err != nil {
+			t.Fatalf("GET %s: %v", url, err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable || attempt >= 20 {
+			return resp.StatusCode, b
+		}
+		time.Sleep(time.Second)
 	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
-	return resp.StatusCode, b
 }
 
 // download copies the files a reader of the latest checkpoint of the log may ask for, over HTTP, into dir (the layout of a publication).
@@ -208,6 +214,9 @@ func verifyPublication(t *testing.T, p *pubCluster, node int, lp string, minSize
 	// KINGRES_PUBLICATION_FIXTURES names a directory that keeps what the verifier read: the layout of the publication of a real two-group
 	// database and its trust.json, which the verifier tests of step 7 use as fixtures.
 	dir := os.Getenv("KINGRES_PUBLICATION_FIXTURES")
+	if !strings.HasPrefix(t.Name(), "TestLedgerPublicationOfADatabaseOnTwoGroups") {
+		dir = "" // only the test of the fixture writes into it (the logs of the kill tests are other logs)
+	}
 	if dir == "" {
 		dir = t.TempDir()
 	} else if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -394,6 +403,12 @@ func TestLedgerPublicationOfADatabaseOnTwoGroups(t *testing.T) {
 	}
 	auditStored(t, leader)
 
+	// one record of the WORM kind against a fake store, then the whole publication of this first moment (item 2 of the round)
+	s3 := newFakeS3()
+	defer s3.close()
+	anchorOne(t, p, "pub_db", s3, 1)
+	savePublication(t, p, 1, fixtureDir(t, "first"), "pub_db")
+
 	// the chain of group 0 grows: its log and the aggregate follow at the next round, and the verifier accepts the larger log
 	insertRows(t, leader, "pub_db", "t0", 100, 300)
 	until(t, 2*time.Minute, "the chain logs and then the aggregate to grow", func() bool {
@@ -417,6 +432,11 @@ func TestLedgerPublicationOfADatabaseOnTwoGroups(t *testing.T) {
 		t.Errorf("the aggregate did not grow: %d after %d", agg2.Size, agg.Size)
 	}
 	auditStored(t, leader)
+
+	// the whole publication of this moment is kept (events, key ring, logs.json, every log, the evidence of an anchored record): the second of two
+	// successive states, for the verifier's fixture
+	anchorOne(t, p, "pub_db", s3, 2)
+	savePublication(t, p, 0, fixtureDir(t, "second"), "pub_db")
 
 	// the follower's group becomes unreadable: the digest is incomplete and says which group, the aggregate flags the member stale; then it is read again
 	follower.Isolate(leader)
@@ -504,6 +524,8 @@ func TestLedgerRoundSurvivesAKillAtEachKindOfWrite(t *testing.T) {
 }
 
 func TestLedgerPublicationEndsWhenADatabaseIsDroppedAndWhenItVanishes(t *testing.T) {
+	// the daemons read the time a database must be missing before its publication ends; the default is 30 minutes (P8-03)
+	t.Setenv("KINGRES_LEDGER_MISSING_FOR", "20s")
 	p := formPublishing(t, "drop_db", "vanish_db")
 	c := p.c
 	leader, follower := c.Nodes[0], c.Nodes[1]
@@ -582,7 +604,18 @@ func TestLedgerPublicationEndsWhenADatabaseIsDroppedAndWhenItVanishes(t *testing
 			t.Errorf("a vanished database raised %v", it)
 		}
 	}
-	ab := leader.Expect(200, "GET", "/databases/vanish_db/ledger/aggregate", nil)
+	// the leaf that flags the members retired follows the events by a moment
+	var ab map[string]any
+	until(t, time.Minute, "the aggregate of the vanished database to say retired", func() bool {
+		ab = leader.Expect(200, "GET", "/databases/vanish_db/ledger/aggregate", nil)
+		n := 0
+		for _, m := range anyList(ab["members"]) {
+			if f := anyList(asMap(m)["flags"]); len(f) > 0 && f[len(f)-1] == "retired" {
+				n++
+			}
+		}
+		return n == 2
+	})
 	retired = 0
 	for _, m := range anyList(ab["members"]) {
 		if f := anyList(asMap(m)["flags"]); len(f) > 0 && f[len(f)-1] == "retired" {

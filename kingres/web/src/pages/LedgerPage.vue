@@ -2,8 +2,8 @@
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <script setup lang="ts">
 // Ledger: a page with a tab bar. Overview (status of a database: one hash chain per shard group, what is published and
-// anchored, verification, blocks), Digests (digests, aggregate checkpoints and row inclusion proofs), Signing (the keys of
-// the cluster) and Publication (the logs and their settings). Each tab is a component under components/ledger/. The
+// anchored, verification, blocks), Digests (digests, aggregate checkpoints and row inclusion proofs), Anchoring (the targets
+// and the anchor records), Signing (the keys of the cluster) and Publication (the logs and their settings). Each tab is a component under components/ledger/. The
 // database is chosen once for the two tabs that are about a database; Signing and Publication are about the cluster and
 // work without a database that uses the ledger.
 import { computed, ref, watch } from 'vue'
@@ -17,6 +17,8 @@ import { describeProblem } from '@/api/problem'
 import { useLedgerStatusList } from '@/api/queries'
 import OverviewTab from '@/components/ledger/OverviewTab.vue'
 import DigestsTab from '@/components/ledger/DigestsTab.vue'
+import AnchoringTab from '@/components/ledger/AnchoringTab.vue'
+import ClientKeysTab from '@/components/ledger/ClientKeysTab.vue'
 import SigningTab from '@/components/ledger/SigningTab.vue'
 import PublicationTab from '@/components/ledger/PublicationTab.vue'
 
@@ -28,6 +30,8 @@ const dbName = ref(typeof route.query.db === 'string' ? route.query.db : '')
 const TABS = [
   { id: 'overview', label: 'Overview' },
   { id: 'digests', label: 'Digests' },
+  { id: 'anchoring', label: 'Anchoring' },
+  { id: 'clients', label: 'Client keys' },
   { id: 'signing', label: 'Signing' },
   { id: 'publication', label: 'Publication' },
 ]
@@ -70,7 +74,7 @@ const aboutDatabase = computed(() => tab.value === 'overview' || tab.value === '
 <template>
   <PageHeader
     title="Ledger"
-    subtitle="Tamper-evident history: hash chains, digests, signing and publication."
+    subtitle="Tamper-evident history: hash chains, digests, anchoring, signing and publication."
   />
   <TabBar v-model="tab" :tabs="TABS" label="Ledger" />
 
@@ -135,6 +139,22 @@ const aboutDatabase = computed(() => tab.value === 'overview' || tab.value === '
       </div>
     </QueryBoundary>
   </template>
+  <div
+    v-else-if="tab === 'anchoring'"
+    id="panel-anchoring"
+    role="tabpanel"
+    aria-labelledby="tab-anchoring"
+  >
+    <AnchoringTab v-model:database-name="dbName" />
+  </div>
+  <div
+    v-else-if="tab === 'clients'"
+    id="panel-clients"
+    role="tabpanel"
+    aria-labelledby="tab-clients"
+  >
+    <ClientKeysTab v-model:database-name="dbName" />
+  </div>
   <div
     v-else-if="tab === 'signing'"
     id="panel-signing"

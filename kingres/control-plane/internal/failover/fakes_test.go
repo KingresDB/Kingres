@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -76,7 +77,7 @@ func newWorld() *world {
 			"s3": {Server: "s3", Group: 1, InRecovery: true, Timeline: 1, ReceiveLsn: "0/4000000", ReplayLsn: "0/4000000", SystemIdentifier: "9"},
 		},
 		posErr:         map[string]error{},
-		facts:          GroupFacts{SyncStreaming: true, LastKnownAge: time.Second},
+		facts:          GroupFacts{SyncStreaming: true, LastKnownAge: time.Second, PrimaryPlanned: 1},
 		live:           map[string]string{"s1": "dead", "s2": "live", "s3": "live"},
 		lease:          map[string]bool{},
 		promoted:       map[string]bool{},
@@ -279,7 +280,7 @@ func (p fpeers) Promote(_ context.Context, server string, r PromoteRequest) (Pro
 	return PromoteAnswer{Status: "promoted", Timeline: 2, Lsn: "0/5000100"}, nil
 }
 
-func (p fpeers) RecoverPrepared(_ context.Context, server string, g int32) error {
+func (p fpeers) RecoverPrepared(_ context.Context, server string, g int32, db string) error {
 	p.w.rec("recover-prepared-on %s", server)
 	return nil
 }
@@ -315,8 +316,11 @@ func (c fcat) Nodes(_ context.Context, db string) ([]Node, error) {
 func (c fcat) Status(_ context.Context, db string) (int64, bool, error) {
 	return c.w.term, false, nil
 }
-func (c fcat) RecoverPrepared(context.Context) error { c.w.rec("recover-prepared"); return nil }
-func (c fcat) CheckCluster(context.Context) ([]Incident, error) {
+func (c fcat) RecoverPrepared(_ context.Context, db string) error {
+	c.w.rec("recover-prepared %s", db)
+	return nil
+}
+func (c fcat) CheckCluster(_ context.Context, db string) ([]Incident, error) {
 	return nil, nil
 }
 func (c fcat) PromoteNode(_ context.Context, db string, id int32) (PromoteResult, error) {
@@ -497,6 +501,12 @@ func (m *memRows) Set(_ context.Context, g int32, u GroupSet) error {
 	if u.LeaseWaitMs != nil {
 		r.LeaseWaitMs = u.LeaseWaitMs
 	}
+	if u.Incidents != nil {
+		r.Incidents = u.Incidents
+	}
+	if u.DataLoss != nil {
+		r.DataLoss = u.DataLoss
+	}
 	return nil
 }
 func (m *memRows) Pin(_ context.Context, g int32, s StandbyRec, d, l []byte) (StandbyRec, bool, error) {
@@ -510,6 +520,9 @@ func (m *memRows) Pin(_ context.Context, g int32, s StandbyRec, d, l []byte) (St
 		return StandbyRec{ID: r.ChosenStandby, Group: g, Server: r.NewServer, CatalogNode: r.NewNode, InstanceID: s.InstanceID}, false, nil
 	}
 	r.ChosenStandby, r.NewServer, r.NewNode = s.ID, s.Server, s.CatalogNode
+	if l != nil {
+		r.DataLoss = l
+	}
 	return s, true, nil
 }
 func (m *memRows) Event(_ context.Context, g *int32, step, kind string, d map[string]any) error {
@@ -579,4 +592,22 @@ func runAll(t *testing.T, r *Runner, in Input) (string, error) {
 		}
 	}
 	return "", nil
+}
+
+func (m *memRows) Warned(context.Context) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, e := range m.events {
+		for _, k := range WarningKinds {
+			if strings.HasSuffix(e, "/"+k) {
+				return true, nil
+			}
+		}
+	}
+	for _, g := range m.groups {
+		if len(g.Incidents) > 0 {
+			return true, nil
+		}
+	}
+	return false, nil
 }

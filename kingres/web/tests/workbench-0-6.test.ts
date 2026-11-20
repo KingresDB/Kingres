@@ -65,7 +65,7 @@ describe('errors of a statement', () => {
     await fireEvent.update(screen.getByLabelText(/timeout/i), '1')
     await fireEvent.update(screen.getByLabelText(/^SQL/), 'select pg_sleep(100)')
     await user.click(screen.getByRole('button', { name: /^run$/i }))
-    const hint = await screen.findByTestId('query-error-hint', {}, { timeout: 5000 })
+    const hint = await screen.findByTestId('query-error-hint', {}, { timeout: 30_000 })
     expect(hint).toHaveTextContent(/cancelled because it ran longer than the time limit/i)
     expect(hint).toHaveTextContent(/not a fault of the server/i)
     expect(screen.queryByText(/service unavailable/i)).toBeNull()

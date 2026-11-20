@@ -20,6 +20,8 @@
  *	fanout.c	 the "Kingres Fan-out Write" custom scan: reference table writes
  *				 and UPDATE/DELETE that span shard groups
  *	dist_scan.c	 the "Kingres Distributed Scan" custom scan and its path hook
+ *	fragment_scan.c the fragments of a read that the shard groups run, and the
+ *				 "Kingres Fragment Scan" custom scan of a closed query
  *	shippable.c	 what may be sent to another node and mean the same there
  *	recovery.c	 recover_prepared_transactions() and the background workers
  *	fault.c		 fault injection for the tests of two-phase commit
@@ -44,6 +46,7 @@
 
 #include "catalog.h"
 #include "dist_scan.h"
+#include "fragment_scan.h"
 #include "fanout.h"
 #include "forward_auth.h"
 #include "bucket_move.h"
@@ -53,6 +56,7 @@
 #include "term.h"
 #include "planner.h"
 #include "recovery.h"
+#include "shippable.h"
 #include "remote_scan.h"
 #include "row_router.h"
 #include "utility.h"
@@ -74,6 +78,11 @@ int			kingres_shard_control_call_timeout = 0;
 char	   *kingres_shard_node_conninfo = NULL;
 int			kingres_shard_recovery_interval = 30;
 bool		kingres_shard_enable_distributed_scan = true;
+bool		kingres_shard_enable_pushdown = true;
+bool		kingres_shard_enable_pushdown_closed = true;
+bool		kingres_shard_enable_partial_aggregation = true;
+bool		kingres_shard_enable_pushdown_sort = true;
+bool		kingres_shard_enable_pushdown_join = true;
 bool		kingres_shard_enable_bulk_routing = true;
 bool		kingres_shard_enable_colocated_insert_select = true;
 bool		kingres_shard_enable_copy_routing = true;
@@ -83,9 +92,43 @@ int			kingres_shard_move_catchup_threshold = 1024;	/* kB */
 int			kingres_shard_move_switch_timeout = 10000;	/* ms */
 int			kingres_shard_move_switch_attempts = 20;
 int			kingres_shard_move_cleanup_delay = 600;	/* s */
+int			kingres_shard_rebuild_batch_rows = 10000;
+int			kingres_shard_rebuild_drain_threshold = 1000;
+int			kingres_shard_rebuild_lock_timeout = 200;	/* ms */
+int			kingres_shard_rebuild_switch_timeout = 10000;	/* ms */
+int			kingres_shard_rebuild_switch_max_attempts = 30;
+int			kingres_shard_table_cleanup_delay = 600;	/* s */
+bool		kingres_shard_rebuild_verify = true;
 int			kingres_shard_deadlock_check_interval = 2;
 int			kingres_shard_deadlock_confirm_delay = 200;	/* ms */
 int			kingres_shard_decision_retention = 300;	/* s */
+
+/*
+ * kingres_shard.shippable_extensions: "all", "none" or a comma-separated list of names from the list that is
+ * compiled into the library (design 5.5).  The setting narrows what the code allows and cannot add to it, so
+ * any user may set it.
+ */
+static bool
+check_shippable_extensions(char **newval, void **extra, GucSource source)
+{
+	char	   *copy;
+	char	   *tok;
+
+	if (*newval == NULL || strcmp(*newval, "all") == 0 || strcmp(*newval, "none") == 0)
+		return true;
+	copy = pstrdup(*newval);
+	for (tok = strtok(copy, ", "); tok != NULL; tok = strtok(NULL, ", "))
+	{
+		if (!kingres_shard_shippable_extension_known(tok))
+		{
+			GUC_check_errdetail("\"%s\" is not an extension that kingres_shard can ship the objects of.", tok);
+			pfree(copy);
+			return false;
+		}
+	}
+	pfree(copy);
+	return true;
+}
 
 /*
  * _PG_init
@@ -221,6 +264,55 @@ _PG_init(void)
 							 PGC_USERSET, 0,
 							 NULL, NULL, NULL);
 
+	/* Query pushdown (design/shard-phase2b.md, sections 6 and 13). */
+	DefineCustomBoolVariable("kingres_shard.enable_pushdown",
+							 "Let a read that spans shard groups be run by the groups themselves when the planner finds that cheaper.",
+							 "Master switch of the pushdown paths.  When off, such a read is answered by the row-moving distributed scan, as in 2a (pruning and the placement check stay on).",
+							 &kingres_shard_enable_pushdown,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("kingres_shard.enable_pushdown_closed",
+							 "Let a closed read (every output row depends on the rows of one shard group) be run whole by every group.",
+							 "A grouping, a DISTINCT or a join on the distribution key, with no row that depends on two groups.  When off, such a read is answered by the row-moving distributed scan.",
+							 &kingres_shard_enable_pushdown_closed,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("kingres_shard.enable_partial_aggregation",
+							 "Let every shard group aggregate its own rows and send the partial states, which this node combines.",
+							 "An aggregate or a grouping that is not closed (it does not contain a distribution key) is run in two steps: each group returns one partial row per group of rows, and this node combines them.  When off, such a read is answered by the row-moving distributed scan.",
+							 &kingres_shard_enable_partial_aggregation,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("kingres_shard.enable_pushdown_sort",
+							 "Let the groups sort and limit the rows of a closed query, and merge the sorted streams at this node.",
+							 "A closed query with ORDER BY has the groups return their rows in order and this node merge them instead of sorting every row; a LIMIT of constants is sent as LIMIT count + offset.  When off, the groups send the rows unordered and this node sorts and limits them.",
+							 &kingres_shard_enable_pushdown_sort,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("kingres_shard.enable_pushdown_join",
+							 "Let the groups run the join of colocated tables and return its rows.",
+							 "A read that is not closed (a window function that is not partitioned by the key, an aggregate that cannot be split) and joins tables of one colocation group on their keys has the groups return the rows of the join, which this node then processes.  When off, the rows of each table come to this node and it joins them.",
+							 &kingres_shard_enable_pushdown_join,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomStringVariable("kingres_shard.shippable_extensions",
+							   "The extensions whose functions, types and aggregates may be shipped to the other shard groups.",
+							   "all, none, or a comma-separated list of names from the list compiled into kingres_shard (today: kingres_sketch).  It narrows what the code allows; it cannot add an extension.  Read at the node that runs the statement; none is the escape during a rolling upgrade of an extension.",
+							   &kingres_shard_shippable_extensions,
+							   "all",
+							   PGC_USERSET, 0,
+							   check_shippable_extensions, NULL, NULL);
+
 	DefineCustomBoolVariable("kingres_shard.enable_colocated_insert_select",
 							 "Ship a colocated INSERT ... SELECT whole to every shard group, so that no row passes through this node.",
 							 "When off, such a statement goes through the row router when it can (no ON CONFLICT DO UPDATE) and is refused when it cannot.",
@@ -286,6 +378,63 @@ _PG_init(void)
 							PGC_USERSET, GUC_UNIT_S,
 							NULL, NULL, NULL);
 
+	/* The rebuild engine of the table operations (design/shard-phase9.md, "Settings"). */
+	DefineCustomIntVariable("kingres_shard.rebuild_batch_rows",
+							"Rows per chunk of the copy and of the replay of an online table operation.",
+							"A chunk is one transaction on every group it writes (two-phase commit when it writes on two or more).",
+							&kingres_shard_rebuild_batch_rows,
+							10000, 1, 1000000,
+							PGC_USERSET, 0,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("kingres_shard.rebuild_drain_threshold",
+							"Entries of the capture log under which the switch of an online table operation is attempted.",
+							NULL,
+							&kingres_shard_rebuild_drain_threshold,
+							1000, 0, 100000000,
+							PGC_USERSET, 0,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("kingres_shard.rebuild_lock_timeout",
+							"The longest a lock request of the switch is queued behind other sessions.",
+							NULL,
+							&kingres_shard_rebuild_lock_timeout,
+							200, 1, 600000,
+							PGC_USERSET, GUC_UNIT_MS,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("kingres_shard.rebuild_switch_timeout",
+							"The longest one switch attempt of an online table operation lasts (lock, final replay, commit).",
+							NULL,
+							&kingres_shard_rebuild_switch_timeout,
+							10000, 1, 3600000,
+							PGC_USERSET, GUC_UNIT_MS,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("kingres_shard.rebuild_switch_max_attempts",
+							"Switch attempts in one call of kingres.table_operation_advance(..., 'switching').",
+							NULL,
+							&kingres_shard_rebuild_switch_max_attempts,
+							30, 1, 100000,
+							PGC_USERSET, 0,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("kingres_shard.table_cleanup_delay",
+							"How long the old copy of a table is kept after a table operation switched.",
+							"0 drops it after the check.",
+							&kingres_shard_table_cleanup_delay,
+							600, 0, 31536000,
+							PGC_USERSET, GUC_UNIT_S,
+							NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("kingres_shard.rebuild_verify",
+							 "Compare the old copy with the new table before the old copy is dropped.",
+							 NULL,
+							 &kingres_shard_rebuild_verify,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+
 	/* Distributed deadlock detection (ha-phase5.md, part C). */
 	DefineCustomIntVariable("kingres_shard.deadlock_check_interval",
 							"Seconds between passes of the distributed deadlock detector; 0 disables.",
@@ -328,6 +477,7 @@ _PG_init(void)
 	kingres_shard_recovery_init();
 	kingres_shard_fanout_init();
 	kingres_shard_dist_scan_init();
+	kingres_shard_fragment_scan_init();
 	kingres_shard_planner_init();
 	kingres_shard_utility_init();
 	kingres_shard_remote_scan_init();

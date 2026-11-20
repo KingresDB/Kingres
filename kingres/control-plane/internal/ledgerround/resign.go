@@ -67,7 +67,7 @@ func (c *Collector) Resign(ctx context.Context, set ledgerkeys.Set) error {
 		if bytes.Equal(note, cp.Note) {
 			continue
 		}
-		if err := c.cfg.Store.ReplaceNote(ctx, pc.Term, l.ID, cp.Size, note); err != nil {
+		if err := c.cfg.Store.ReplaceNote(ctx, pc.Term, l.ID, cp.Size, note, pc.Revision); err != nil {
 			return err
 		}
 	}

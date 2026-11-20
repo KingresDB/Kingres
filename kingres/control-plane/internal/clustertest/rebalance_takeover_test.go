@@ -57,9 +57,13 @@ func takeoverAt(t *testing.T, point string, past bool) {
 	}
 	time.Sleep(5 * time.Second)
 	t.Logf("5 s after the move was released:\n%s", rbDump(l, id))
-	if _, err := sys.Exec(ctx, `UPDATE kingres_cp.task SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE id = $1`, id); err != nil {
+	// A connection that was opened minutes ago (it waited for the held move) may have been cut by the instance or the host under
+	// load: this statement opens its own.
+	sys2 := l.ServicePG("kingres_system")
+	if _, err := sys2.Exec(ctx, `UPDATE kingres_cp.task SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE id = $1`, id); err != nil {
 		t.Fatal(err)
 	}
+	_ = sys2.Close(ctx)
 	rep := waitReport(t, l, id, 5*time.Minute)
 	if rep["outcome"] != "completed" {
 		t.Fatalf("report: %v\n%s", rep, rbDump(l, id))

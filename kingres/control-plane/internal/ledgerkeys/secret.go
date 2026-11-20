@@ -238,3 +238,20 @@ func pathErr(err error) error {
 	}
 	return err
 }
+
+// DeriveKey returns a 32 byte key from the passphrase with PBKDF2-HMAC-SHA256 (the derivation of the key
+// files), for a sealed file of another kind that uses the same passphrase file (the credentials of an anchor
+// target, design 6.8). The caller zeroes the result. The salt must be at least SaltSize bytes and the
+// iteration count at least 1000; a file that is read must refuse a count below Iterations before it calls
+// this, as Parse does for a key file.
+func (p Passphrase) DeriveKey(salt []byte, iterations int) ([]byte, error) {
+	if len(salt) < SaltSize || iterations < 1000 {
+		return nil, errors.New("ledgerkeys: the salt or the iteration count is too small")
+	}
+	var key []byte
+	err := p.use(func(pw []byte) error {
+		key = pbkdf2(pw, salt, iterations)
+		return nil
+	})
+	return key, err
+}

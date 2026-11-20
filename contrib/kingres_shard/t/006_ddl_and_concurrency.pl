@@ -148,14 +148,16 @@ $n1->safe_psql('postgres', q{
 	CREATE TABLE public.kv (id int PRIMARY KEY, val text);
 	SELECT kingres.create_distributed_table('public.kv', 'id', bucket_count => 6);
 });
-# One row per group, written by the node that owns it.
+# One row per group, written by the node that owns it.  (The number of the colocation group is not 1:
+# a number is never used twice, and the table of the rolled back creation above took one.)
+my $coloc = $n1->safe_psql('postgres', "SELECT colocation_id FROM kingres.dist_table WHERE relid = 'public.kv'::regclass");
 my %key;
 for my $g (0 .. 2)
 {
 	$key{$g} = $n1->safe_psql('postgres', qq{
 		SELECT k FROM generate_series(1, 1000) k
 		 WHERE (SELECT m.group_id FROM kingres.bucket_map m
-		         WHERE m.colocation_id = 1 AND m.bucket = kingres.bucket_for(1, k)) = $g
+		         WHERE m.colocation_id = $coloc AND m.bucket = kingres.bucket_for($coloc, k)) = $g
 		 LIMIT 1});
 	$n1->safe_psql('postgres', "INSERT INTO public.kv VALUES ($key{$g}, 'row-$g')");
 }

@@ -43,6 +43,9 @@ func startFailoverCalls(d *haDeps) error {
 	d.Calls.Register(callLiveness, func(context.Context, string, []byte) (any, error) {
 		return livenessView(d), nil
 	})
+	d.Calls.Register("GET /catalog/nodes", func(ctx context.Context, _ string, _ []byte) (any, error) {
+		return catalogNodes(ctx, d)
+	})
 	d.Calls.Register(callState, func(ctx context.Context, _ string, body []byte) (any, error) {
 		g, err := groupOfQuery(body)
 		if err != nil {
@@ -233,6 +236,8 @@ type StateAnswer struct {
 	// Watchdog says whether a watchdog of the group's primary instance runs here (nil: this server runs no primary of the
 	// group, or does not know). A failover reads it before it counts the primary as fenceable by a lease alone.
 	Watchdog *bool `json:"watchdog"`
+	// Enforced: the lease manager of this server stops a primary of the group whose lease lapsed (it knows of a standby).
+	Enforced *bool `json:"enforced"`
 }
 
 func failoverState(ctx context.Context, d *haDeps, group int32) StateAnswer {
@@ -276,6 +281,10 @@ func failoverState(ctx context.Context, d *haDeps, group int32) StateAnswer {
 	if serving != nil && serving.Role.Writable() && d.Watchdogs != nil {
 		w := d.Watchdogs.running(group)
 		out.Watchdog = &w
+	}
+	if serving != nil && serving.Role.Writable() {
+		e := d.Fault.ForceEnforce() || d.Registry.Standbys().HasStandby(group)
+		out.Enforced = &e
 	}
 	if serving != nil {
 		out.CatalogTerm = catalogTerm(ctx, d, serving.ID)

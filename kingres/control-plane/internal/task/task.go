@@ -163,7 +163,7 @@ func (e *ExcludedError) Error() string {
 // excluded maps the database error of the exclusion trigger, nil for any other error.
 func excluded(kind string, err error) error {
 	var pe *pgconn.PgError
-	if errors.As(err, &pe) && (pe.Code == "KX001" || pe.Code == "KX002" || pe.Code == "KX003" || pe.Code == "KX004" || pe.Code == "KX005") {
+	if errors.As(err, &pe) && (pe.Code == "KX001" || pe.Code == "KX002" || pe.Code == "KX003" || pe.Code == "KX004" || pe.Code == "KX005" || pe.Code == "KX006" || pe.Code == "KX007") {
 		return &ExcludedError{Kind: kind, Other: pe.Detail}
 	}
 	return nil

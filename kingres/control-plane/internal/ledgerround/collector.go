@@ -15,6 +15,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgerlog"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgerpub"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgersign"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgerstate"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/scheduler"
 )
 
@@ -53,6 +54,14 @@ type Config struct {
 	Listener func() (address string, tlsOn, running bool)
 	// MaxBatch is the most new blocks one round appends to a chain log (default 9999, at most ledgerlog.MaxBatch less one).
 	MaxBatch int
+	// MissingFor is how long every group must answer that a database does not exist, without a single answer in between, before the
+	// collector ends the publication of its chains (default 30 minutes, P8-03: time, not rounds; the database must also be absent from
+	// the system instance when DatabaseExists is set).
+	MissingFor time.Duration
+	// Published is the record of what was published, outside the system database (P8-01); nil means none is kept (tests of other things).
+	// PullState asks the other holders of the keys for their copy (the first start of a server that has none).
+	Published PublishedState
+	PullState func(ctx context.Context) (ledgerstate.State, bool)
 }
 
 // Collector is the publisher: the only writer of the logs. It is safe for concurrent use; rounds of one database exclude each other (one
@@ -64,11 +73,11 @@ type Collector struct {
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex
 	// state of the failure counters, in memory: a restart begins again (the alerts are raised again after two more rounds)
-	signFails int
-	signErr   error
-	missing   map[string]int
-	tries     map[string]time.Time
-	lastRound time.Time
+	signFails    int
+	signErr      error
+	missingSince map[string]time.Time
+	tries        map[string]time.Time
+	lastRound    time.Time
 }
 
 // New builds a collector.
@@ -82,6 +91,9 @@ func New(cfg Config) (*Collector, error) {
 	if cfg.TermWait <= 0 {
 		cfg.TermWait = 20 * time.Second
 	}
+	if cfg.MissingFor <= 0 {
+		cfg.MissingFor = DefaultMissingFor
+	}
 	if cfg.MaxBatch <= 0 || cfg.MaxBatch >= MaxEntries {
 		cfg.MaxBatch = MaxEntries - 1
 	}
@@ -89,7 +101,7 @@ func New(cfg Config) (*Collector, error) {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	return &Collector{cfg: cfg, log: log, locks: map[string]*sync.Mutex{}, missing: map[string]int{}, tries: map[string]time.Time{}}, nil
+	return &Collector{cfg: cfg, log: log, locks: map[string]*sync.Mutex{}, missingSince: map[string]time.Time{}, tries: map[string]time.Time{}}, nil
 }
 
 func (c *Collector) lock(db string) *sync.Mutex {
@@ -251,6 +263,13 @@ func (c *Collector) round(ctx context.Context, db, op string, only map[int32]boo
 		res.SignErr = ledgersign.ErrNoKeys
 		return res, nil
 	}
+	if err := c.checkPublished(ctx); err != nil {
+		if errors.Is(err, ErrPublishedState) {
+			res.SignErr = err
+			return res, nil
+		}
+		return res, err
+	}
 	logs, err := c.cfg.Store.Logs(ctx)
 	if err != nil {
 		return res, err
@@ -301,7 +320,7 @@ func (c *Collector) SignFailure() string {
 	return ""
 }
 
-// noteMissing counts the rounds in which every group answered that the database does not exist.
+// noteMissing remembers since when every group has been answering that the database does not exist (a single answer from any group ends it).
 func (c *Collector) noteMissing(db string, res Result) {
 	all := len(res.Groups) > 0
 	for _, g := range res.Groups {
@@ -312,9 +331,11 @@ func (c *Collector) noteMissing(db string, res Result) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if all {
-		c.missing[db]++
+		if _, ok := c.missingSince[db]; !ok {
+			c.missingSince[db] = c.cfg.Clock()
+		}
 	} else {
-		delete(c.missing, db)
+		delete(c.missingSince, db)
 	}
 }
 
@@ -394,4 +415,32 @@ func (c *Collector) awaitTerm(ctx context.Context) (ledgersign.PubContext, error
 		case <-time.After(250 * time.Millisecond):
 		}
 	}
+}
+
+// vanished decides whether the publication of the chains of a database ends because the database is gone (design 148 with P8-03). It is the
+// test of time, of the catalog and of the alert: every group has answered "no database" without a single other answer for MissingFor, the
+// database is not in the system instance either (DatabaseExists, when set), and from the first answer on a critical alert says that the end
+// of the publication is near, so that an operator who restores the database in the meantime sees it before anything irreversible happens.
+func (c *Collector) vanished(ctx context.Context, db string) bool {
+	c.mu.Lock()
+	since, missing := c.missingSince[db]
+	c.mu.Unlock()
+	if !missing {
+		c.alert(ctx, AlertUnread, "critical", db, -1, "", false)
+		return false
+	}
+	left := c.cfg.MissingFor - c.cfg.Clock().Sub(since)
+	if c.cfg.DatabaseExists != nil {
+		exists, err := c.cfg.DatabaseExists(ctx, db)
+		if err != nil || exists {
+			// the system instance has the database (or cannot say): the groups are being rebuilt or restored; nothing ends
+			c.alert(ctx, AlertUnread, "critical", db, -1, "Every shard group answers that database "+db+" does not exist, but the system instance still has it: the publication of its ledger waits.", true)
+			return false
+		}
+	}
+	if left > 0 {
+		c.alert(ctx, AlertUnread, "critical", db, -1, fmt.Sprintf("Every shard group answers that database %s does not exist. If it is not back in %s the publication of its ledger ends for good (a signed chain-retired event).", db, left.Round(time.Minute)), true)
+		return false
+	}
+	return true
 }

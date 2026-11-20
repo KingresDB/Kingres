@@ -28,19 +28,25 @@ import { safeText } from '@/lib/safe-text'
 import { SYNC_STATE } from '@/lib/status'
 import type { FailoverPlan, FailoverRequest, Server, ShardGroup } from '@/api/types'
 
-const props = defineProps<{ server: Server; invalidate?: QueryKey[] }>()
+// `group`: the dialog is the planned switchover of that one group ("Switch over..." on its card): the mode is graceful and fixed, the
+// server is the one that runs the group's primary, and only the standby is chosen.
+const props = defineProps<{ server: Server; invalidate?: QueryKey[]; group?: ShardGroup }>()
 const emit = defineEmits<{ close: [] }>()
 
 const topology = useTopology()
 /** The groups whose primary runs on this server, the map group first. */
 const owned = computed<ShardGroup[]>(() =>
   (topology.data.value?.groups ?? [])
-    .filter((g) => g.primary?.serverId === props.server.id)
+    .filter(
+      (g) => g.primary?.serverId === props.server.id && (!props.group || g.id === props.group.id),
+    )
     .sort((a, b) => Number(b.isMapGroup) - Number(a.isMapGroup) || a.id - b.id),
 )
 
 // A server that answers is handed over from; one that does not is failed over.
-const mode = ref<'hard' | 'graceful'>(props.server.status === 'live' ? 'graceful' : 'hard')
+const mode = ref<'hard' | 'graceful'>(
+  props.group || props.server.status === 'live' ? 'graceful' : 'hard',
+)
 const unticked = ref<Record<number, boolean>>({})
 const target = ref<Record<number, string>>({})
 const comment = ref('')
@@ -56,6 +62,7 @@ const includesMapGroup = computed(() => picked.value.some((g) => g.isMapGroup))
 const refusalContext = computed(() => ({
   mode: mode.value,
   includesMapGroup: includesMapGroup.value,
+  switchover: props.group !== undefined,
 }))
 
 function request(): Omit<FailoverRequest, 'dryRun'> {
@@ -128,13 +135,17 @@ const startBlocked = computed(() => {
 })
 
 const config = computed(() => ({
-  title: `Fail over server ${props.server.address}`,
+  title: props.group
+    ? `Switch over ${groupTitle(props.group.id, props.group.isMapGroup)}`
+    : `Fail over server ${props.server.address}`,
   confirmLabel:
     stage.value === 'choose'
       ? 'Show the plan'
-      : mode.value === 'hard'
-        ? 'Hard failover'
-        : 'Graceful failover',
+      : props.group
+        ? 'Switch over'
+        : mode.value === 'hard'
+          ? 'Hard failover'
+          : 'Graceful failover',
   danger: stage.value === 'review' && mode.value === 'hard',
   // Marking a server dead is not undone by a click: the address has to be typed.
   typeToConfirm:
@@ -156,7 +167,13 @@ async function start() {
       ...(acceptLoss.value ? { allowDataLoss: true } : {}),
     })
   } catch (e) {
-    if (e instanceof ApiError && e.code === 'failover_needs_decision') await refreshPlan()
+    // 0.12.0: the refusal carries the plan; a server that does not send it is asked again with a dry run.
+    if (e instanceof ApiError && e.code === 'failover_needs_decision') {
+      if (e.problem.plan) {
+        plan.value = e.problem.plan
+        acceptLoss.value = false
+      } else await refreshPlan()
+    }
     throw e
   }
 }
@@ -199,13 +216,23 @@ function standbyText(g: ShardGroup, serverId: string): string {
       </p>
     </template>
     <template #default>
+      <template v-if="stage === 'choose' && group">
+        <p data-testid="switchover-intro">
+          The primary of
+          <strong>{{ groupTitle(group.id, group.isMapGroup) }}</strong> runs on server
+          <strong><SafeName :value="server.address" kind="text" :max="80" /></strong>. A planned
+          switchover hands it over to a standby of the group without losing a commit: writes to the
+          group pause for a moment, the standby catches up and is promoted, and the old primary
+          becomes a standby. The plan comes next, and nothing changes before you confirm it.
+        </p>
+      </template>
       <template v-if="stage === 'choose'">
-        <p>
+        <p v-if="!group">
           Choose how server
           <strong><SafeName :value="server.address" kind="text" :max="80" /></strong>
           is failed over. The plan comes next, and nothing changes before you confirm it.
         </p>
-        <fieldset>
+        <fieldset v-if="!group">
           <legend>Failover mode</legend>
           <label class="check"
             ><input v-model="mode" type="radio" value="graceful" /> Graceful: hand over without
@@ -219,7 +246,7 @@ function standbyText(g: ShardGroup, serverId: string): string {
             answering. Commits that reached no standby can be lost.</label
           >
         </fieldset>
-        <p v-if="mode === 'hard'" class="notice tone-danger" role="alert">
+        <p v-if="mode === 'hard' && !group" class="notice tone-danger" role="alert">
           <span aria-hidden="true">&#10006;</span>
           <span>
             Hard failover marks
@@ -232,7 +259,7 @@ function standbyText(g: ShardGroup, serverId: string): string {
             >
           </span>
         </p>
-        <p v-else>
+        <p v-else-if="!group">
           The primaries on
           <strong><SafeName :value="server.address" kind="text" :max="80" /></strong> hand over to
           their standbys. The server stays in the cluster as a standby.
@@ -258,7 +285,8 @@ function standbyText(g: ShardGroup, serverId: string): string {
             class="stack group-choice"
             :data-testid="`choice-${g.id}`"
           >
-            <label class="check">
+            <strong v-if="group">{{ groupTitle(g.id, g.isMapGroup) }}</strong>
+            <label v-else class="check">
               <input
                 type="checkbox"
                 :checked="!unticked[g.id]"

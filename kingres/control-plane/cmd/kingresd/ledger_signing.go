@@ -17,10 +17,12 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/config"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fault"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/leader"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgeranchor"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgerkeys"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgerpub"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgerround"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgersign"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgerstate"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/membership"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ops"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/scheduler"
@@ -35,7 +37,9 @@ type ledgerParts struct {
 	// coll is the collector of the publication (steps 5 and 6); listener serves the published files, nil when none is configured.
 	coll     *ledgerround.Collector
 	listener *ledgerpub.Listener
-	log      *slog.Logger
+	// anchor is the anchoring of the aggregate checkpoints (step 10).
+	anchor *ledgeranchor.Service
+	log    *slog.Logger
 }
 
 // defaultOriginPrefix is the origin prefix used until the operator sets one: the address of this server and
@@ -93,6 +97,9 @@ func newLedgerParts(cfg config.Config, svc *cluster.Service, self string, log *s
 		return f(c)
 	}
 	store := ledgersign.PGStore{Sys: sys}
+	if faultHook != nil {
+		store.OnWrite = faultHook.LedgerWrite
+	}
 	sched, err := scheduler.New(scheduler.Config{
 		Self: self, Leader: leaders.Get, Margin: cfg.HA.LeaseMargin, Bump: store.BumpTerm, Log: log.With("component", "scheduler"),
 	})
@@ -114,7 +121,33 @@ func newLedgerParts(cfg config.Config, svc *cluster.Service, self string, log *s
 			log.Warn("ledger signing: raising an alert", "kind", kind, "error", err)
 		}
 	}
+	pubState, err := ledgerstate.Open(dir)
+	if err != nil {
+		return nil, err
+	}
+	holderHosts := func(ctx context.Context) []string {
+		var hosts []string
+		_ = sys(ctx, func(c *pgx.Conn) error {
+			rows, err := c.Query(ctx, `SELECT DISTINCT host FROM kingres.node WHERE group_id = 0 AND is_active ORDER BY host`)
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var h string
+				if err := rows.Scan(&h); err != nil {
+					return err
+				}
+				if h != self {
+					hosts = append(hosts, h)
+				}
+			}
+			return rows.Err()
+		})
+		return hosts
+	}
 	lc := ledgersign.Config{
+		Published: pubState, PublishedCheck: func(ctx context.Context) error { return coll.CheckPublished(ctx) },
 		Self: self, Store: store, Keyring: kr, Term: sched.Term, DefaultPrefix: defaultOriginPrefix(self),
 		// A rotation signs the latest checkpoint of every log again with the keys that sign now (correction 47).
 		Resign:             func(ctx context.Context, set ledgerkeys.Set) error { return coll.Resign(ctx, set) },
@@ -158,6 +191,10 @@ func newLedgerParts(cfg config.Config, svc *cluster.Service, self string, log *s
 	}
 	// The internal calls: this server answers the leader's install, remove and list of key files.
 	if calls != nil {
+		stAgent := &ledgerstate.Agent{File: pubState}
+		for _, key := range ledgerstate.Calls {
+			calls.Register(key, func(ctx context.Context, _ string, body []byte) (any, error) { return stAgent.Handle(ctx, key, body) })
+		}
 		for _, key := range ledgersign.Calls {
 			calls.Register(key, func(ctx context.Context, _ string, body []byte) (any, error) {
 				return s.Agent().Handle(ctx, key, body)
@@ -198,7 +235,9 @@ func newLedgerParts(cfg config.Config, svc *cluster.Service, self string, log *s
 	}
 	coll, err = ledgerround.New(ledgerround.Config{
 		Store: pub, Source: src, Keys: s, Log: log.With("component", "ledger-round"), Alert: alertFn,
-		Listener: listener.Status,
+		Published: pubState, PullState: pullState(members, holderHosts, log.With("component", "ledger-state")),
+		MissingFor: missingFor(log),
+		Listener:   listener.Status,
 		DatabaseExists: func(ctx context.Context, db string) (bool, error) {
 			var ok bool
 			err := sys(ctx, func(c *pgx.Conn) error {
@@ -236,6 +275,9 @@ func newLedgerParts(cfg config.Config, svc *cluster.Service, self string, log *s
 			return nil, err
 		}
 	}
+	if err := sched.Add(stateSyncJob(pubState, members, holderHosts, log.With("component", "ledger-state"))); err != nil {
+		return nil, err
+	}
 	opsSvc.LedgerDigest, opsSvc.LedgerDigests = coll.Digest, coll.Digests
 	opsSvc.LedgerRetireDatabase = func(ctx context.Context, db string) error {
 		return coll.RetireDatabase(ctx, db, ledgerround.ReasonDropped, true)
@@ -247,7 +289,11 @@ func newLedgerParts(cfg config.Config, svc *cluster.Service, self string, log *s
 		calls.Register(ledgerround.CallRead, func(ctx context.Context, _ string, body []byte) (any, error) { return reader.Handle(ctx, body) })
 		calls.Register(ledgerround.CallPublicationGet, func(ctx context.Context, _ string, body []byte) (any, error) { return files.Handle(ctx, body) })
 	}
-	return &ledgerParts{svc: s, sched: sched, coll: coll, listener: listener, log: log}, nil
+	anch, err := newLedgerAnchor(cfg, dir, sys, sched, members, calls, self, log, alertFn)
+	if err != nil {
+		return nil, err
+	}
+	return &ledgerParts{svc: s, sched: sched, coll: coll, listener: listener, anchor: anch, log: log}, nil
 }
 
 // run is the loop of the scheduler; it ends when ctx ends and zeroes the opened keys then. The publication listener, when one is configured,

@@ -848,6 +848,7 @@ kingres_shard_assert_no_move(int colocation_id)
 	Oid			argtypes[1] = {INT4OID};
 	Datum		values[1];
 	int			found = 0;
+	int64		claimed = 0;
 	Oid			save_uid;
 	int			save_sec;
 	int			ret;
@@ -869,7 +870,6 @@ kingres_shard_assert_no_move(int colocation_id)
 							  "AND m.phase IN ('preparing', 'copying', 'catching_up', 'switching') "
 							  "LIMIT 1",
 							  1, argtypes, values, NULL, true, 0);
-	SetUserIdAndSecContext(save_uid, save_sec);
 	if (ret != SPI_OK_SELECT)
 		elog(ERROR, "could not look for bucket moves");
 	if (SPI_processed > 0)
@@ -879,6 +879,23 @@ kingres_shard_assert_no_move(int colocation_id)
 		found = (int) DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
 												   SPI_tuptable->tupdesc, 1, &isnull));
 	}
+	/* A table operation that claims the group (0.7) is the other thing a move must not meet. */
+	if (found == 0 && OidIsValid(kingres_shard_catalog_relid("table_operation_lock")))
+	{
+		ret = SPI_execute_with_args("SELECT l.op_id FROM " KINGRES_SHARD_SCHEMA ".table_operation_lock l "
+									"WHERE l.colocation_id OPERATOR(pg_catalog.=) $1",
+									1, argtypes, values, NULL, true, 0);
+		if (ret != SPI_OK_SELECT)
+			elog(ERROR, "could not look for table operations");
+		if (SPI_processed > 0)
+		{
+			bool		isnull;
+
+			claimed = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
+												  SPI_tuptable->tupdesc, 1, &isnull));
+		}
+	}
+	SetUserIdAndSecContext(save_uid, save_sec);
 	SPI_finish();
 	if (found > 0)
 		ereport(ERROR,
@@ -887,6 +904,13 @@ kingres_shard_assert_no_move(int colocation_id)
 						colocation_id, found),
 				 errdetail("The statement would change the tables of the group while the copy of the bucket on the target does not see it."),
 				 errhint("Wait for the move to finish, or cancel it with kingres.cancel_bucket_move(); see kingres.bucket_move.")));
+	if (claimed > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("colocation group %d is used by table operation " INT64_FORMAT,
+						colocation_id, claimed),
+				 errdetail("The statement would change the tables of the group while the operation copies them."),
+				 errhint("Wait for the operation to finish, or cancel it; see kingres.table_operations.")));
 }
 
 /* ---------------------------------------------------------------------------
@@ -1258,6 +1282,13 @@ kingres_internal_switch_bucket(PG_FUNCTION_ARGS)
 							  1, argtypes, values, NULL, true, 0) != SPI_OK_SELECT || SPI_processed != 1)
 		elog(ERROR, "colocation group %d does not exist", colocation_id);
 	bucket_count = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+	/* the modulus of the bucket: the bucket count today, a modulus of its own when buckets can be split */
+	{
+		const KsColocation *co = kingres_shard_lookup_colocation(colocation_id);
+
+		if (co != NULL)
+			bucket_count = kingres_shard_bucket_modulus(co, bucket);
+	}
 
 	if (SPI_execute_with_args("SELECT schema_name, table_name FROM " KINGRES_SHARD_SCHEMA ".internal_move_tables($1) ORDER BY ord",
 							  1, argtypes, values, NULL, true, 0) != SPI_OK_SELECT || SPI_processed == 0)
@@ -1477,6 +1508,7 @@ move_parent(Oid parent, char **nsp, char **rel, char **part, int bucket)
 
 /*
  * kingres.internal_attach_bucket(parent regclass, bucket int, bucket_count int)
+ * (the third argument is the modulus of the bucket: see kingres_shard_bucket_modulus())
  *
  * Attach the standalone table <parent>_b<bbbb> as the partition of the bucket.
  */

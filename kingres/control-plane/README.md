@@ -58,7 +58,7 @@ internal/
   scheduler/              the recurring jobs of the manager leader, the term and its guard (ledger phase 7)
   ledgersign/             the signing keys of the ledger: key files, key tasks, events, trust file, jobs (ledger phase 7)
   ledgerkeys/, ledgerlog/, anchor/  libraries of ledger phase 7 (keys and their state machine; logs, tiles, checkpoints; anchoring); ledgerkeys and
-                          ledgerlog are wired by ledgersign, anchor by a later step
+                          ledgerlog are wired by ledgersign, anchor by ledgeranchor (steps 10, 12 and 14)
   ops/                    operations that change the cluster (roles, grants, databases, tables, network, workbench)
   sdnotify/               systemd readiness notification
   pgtest/, contracttest/  test helpers (real instances; contract response validation)
@@ -333,12 +333,12 @@ handlers in `internal/httpapi/handlers_config.go`, wiring in `cmd/kingresd/confi
 
 ## What is implemented
 
-The server implements revision **0.11.0** of the contract (132 operations, 108
+The server implements revision **0.13.0** of the contract (132 operations, 108
 paths; what is not done is in "Not done in this increment"). "Real" means the operation works against PostgreSQL or the local node
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **112 of 132 operations are real; 20 answer "not yet".**
+authenticated operation lists in 0.2.0. **123 of 132 operations are real; 9 answer "not yet".**
 
 | Tag | Real | Not yet |
 |---|---|---|
@@ -349,7 +349,7 @@ authenticated operation lists in 0.2.0. **112 of 132 operations are real; 20 ans
 | Roles | `listClusterRoles`, `listRoles`, `createRole`, `getRole`, `deleteRole`, `updateRole`, `setRoleClusterRoles`, `setRoleMemberships` |  |
 | Databases | `getDatabaseCreateOptions`, `listDatabases`, `createDatabase`, `getDatabase`, `dropDatabase`, `updateDatabase` |  |
 | Shards | `getBucketDistribution`, `listColocationGroups`, `listBuckets` |  |
-| Ledger | `getLedgerStatus`, `listLedgerBlocks`, `listLedgerDigests`, `generateLedgerDigest`, `startLedgerVerification`, `listLedgerStatus`, `createInclusionProof`, `listLedgerVerifications`, `getLedgerVerification`, `getLedgerSettings`, `updateLedgerSettings`, `getLedgerSigning`, `createLedgerSigningKey`, `retireLedgerSigningKey`, `revokeLedgerSigningKey`, `getLedgerTrustFile`, `getLedgerPublication`, `getLedgerAggregate`, `listLedgerAggregates` | `listLedgerAnchorTargets`, `createLedgerAnchorTarget`, `getLedgerAnchorTarget`, `updateLedgerAnchorTarget`, `deleteLedgerAnchorTarget`, `testLedgerAnchorTarget`, `listLedgerAnchors`, `anchorLedgerNow`, `retryLedgerAnchor`, `downloadLedgerAnchor`, `createLedgerBundle`, `getLedgerBundle`, `listLedgerClientKeys`, `registerLedgerClientKey`, `revokeLedgerClientKey`, `setTableSignaturePolicy`, `upgradeLedgerExtension`, `acknowledgeLedgerDivergence` |
+| Ledger | `getLedgerStatus`, `listLedgerBlocks`, `listLedgerDigests`, `generateLedgerDigest`, `startLedgerVerification`, `listLedgerStatus`, `createInclusionProof`, `listLedgerVerifications`, `getLedgerVerification`, `getLedgerSettings`, `updateLedgerSettings`, `getLedgerSigning`, `createLedgerSigningKey`, `retireLedgerSigningKey`, `revokeLedgerSigningKey`, `getLedgerTrustFile`, `getLedgerPublication`, `getLedgerAggregate`, `listLedgerAggregates`, `listLedgerAnchorTargets`, `createLedgerAnchorTarget`, `getLedgerAnchorTarget`, `updateLedgerAnchorTarget`, `deleteLedgerAnchorTarget`, `testLedgerAnchorTarget`, `listLedgerAnchors`, `anchorLedgerNow`, `retryLedgerAnchor`, `downloadLedgerAnchor` | `createLedgerBundle`, `getLedgerBundle`, `listLedgerClientKeys`, `registerLedgerClientKey`, `revokeLedgerClientKey`, `setTableSignaturePolicy`, `upgradeLedgerExtension`, `acknowledgeLedgerDivergence` |
 | Tables | `getTable`, `distributeTable`, `enableTableLedger`, `listTables` |  |
 | Grants | `listGrants`, `createGrant`, `revokeGrants`, `applyGrantTemplate` |  |
 | Health | `getHealth`, `getReadiness` |  |
@@ -361,7 +361,7 @@ authenticated operation lists in 0.2.0. **112 of 132 operations are real; 20 ans
 | Server groups | `listServerGroups`, `createServerGroup`, `deleteServerGroup` |  |
 | Servers | `listServers`, `getServer`, `addServer`, `removeServer`, `updateServer`, `renewServerCertificates`, `revokeServerCertificates`, `failoverServer` |  |
 | Configuration | `listConfigParameters`, `getConfigParameter`, `previewConfigChange`, `applyConfigChange`, `listConfigChanges`, `revertConfigChange`, `listConfigServers`, `getConfigSummary`, `getClusterTime`, `listTimeZones`, `restartPendingInstances` |  |
-| Settings | `getClusterSettings`, `updateClusterSettings` | `resetAutoFailoverCounter` |
+| Settings | `getClusterSettings`, `updateClusterSettings`, `resetAutoFailoverCounter` |  |
 | Network access | `getNetworkAccess`, `replaceNetworkAccess` |  |
 | Setup | `initCluster`, `joinCluster`, `getNodeState`, `checkSetupToken` |  |
 | Tasks | `listTasks`, `getTask`, `cancelTask` |  |
@@ -2942,6 +2942,83 @@ clock was not involved. Fix: `Manager.Fence` marks the group as being fenced unt
 instance while it is (the marker stays, the next round starts it); `TestARoundThatWinsTheLeaseDuringAFenceStartsTheInstanceAfterTheStop`. The
 subtest also waits for the lease to be freshly held before it steps the clock.
 
+## Fixes for the independent review F3-01 to F3-16 (2026-11-18, contract 0.12.0)
+
+The review is `kingres/docs/reviews/2026-11-18-kingresd-failover-increment-3.md`. Done, each with a test that fails without it (the mutants
+are listed in the report of the round):
+
+- **F3-01** `lease.Manager.Unadopt` refuses an adoption that is attached (it guards a promoted primary) and returns false; the handler of
+  `POST /failover/lease` with role `release` answers `{held: true}` then. A failed task (`OnFail`) can no longer make the lease of a promoted
+  primary run out when the leader's own server is the new primary. Cluster test `TestFailoverFailedTaskKeepsTheLeaseOfThePromotedPrimary` (the
+  failure is injected after the promotion with the fault `failoverPoint`, mode `fail`); unit test `TestUnadoptRefusesAnAttachedAdoption`.
+- **F3-02, F3-12** `GroupFacts.PrimaryPlanned` (migration 0018, `group_replication_state.planned_standbys`, filled by the leader's check from
+  `PrimaryStatus.Planned`, which the primary's agent reports from the plan it holds) is what the leader knows of an old server that does not answer.
+  `Preflight` refuses (409 `cluster_inconsistent`) a failover of such a server without proof that its plan carried a standby, unless the request
+  says `allowDataLoss`; `dryRun` shows it as a blocker. `GET /failover/state` reports `enforced`. The other half of the finding (a lease that
+  fences regardless of the plan) is **not** done. Cluster test `TestFailoverRefusedWhenFencingOfTheOldPrimaryIsUnproven`.
+- **F3-03** `failover.UnobservedAge`: the age of the last check is lowered only by the silence that a majority of the members share, and only by
+  what exceeds the lease and its margin (the leader asks the other members with `GET /liveness`). Unit test `TestUnobservedAgeSubtractsOnlyWhatAMajorityDidNotHear`,
+  cluster test `TestFailoverVerdictIsNotNoneWhenOnlyTheLeaderLostTheServer`.
+- **F3-04** the request refuses a database whose catalog lacks the old primary (host and port), as it already did for the standbys; migration 0016
+  makes a failover and `database.create`, `database.drop` and `table.distribute` exclude each other (KX006 for the failover, KX007 for the database
+  operations; `task.excluded`, `MemStore`); a failure of `targets` after the promotion is a pause (`targetsPause`), never a failed task. Tests:
+  `TestADatabaseWithoutTheOldPrimaryRefusesTheFailover`, `TestADatabaseThatAppearsAfterThePromotionPausesTheTask`,
+  `TestAFailoverAndDatabaseChangesExcludeEachOther` (PostgreSQL), cluster test `TestFailoverExcludesDatabaseCreationAndPausesAfterThePromotion`.
+- **F3-05** `promoteAction`: a role file `primary` on an instance still in recovery is a promotion to finish, not `not_standby`.
+- **F3-06** `choose` keeps a pin whose standby can be read (the accepted verdict is not recomputed for another one) and withdraws a pin whose
+  standby cannot be read while nothing is promoted.
+- **F3-07** F2 stops a live old primary only after one ready standby was read in recovery (`someStandbyReadable`).
+- **F3-08** `promote` answers 409 `lease_not_held` when `Attach` fails (both paths).
+- **F3-09** the client entry point reads the catalog from another server (`GET /catalog/nodes`) when its own cannot be read. Cluster test
+  `TestFailoverEntryPointOfTheFailedOverServerForwards`.
+- **F3-10** F7 and F11 run `recover_prepared_transactions()` and `check_cluster()` in every database that has a catalog (`Catalog.RecoverPrepared(ctx, db)`).
+- **F3-11** a standby found out of recovery that this task did not pin pauses the task (alert `splitPromotion`) and is adopted only with
+  `allowDataLoss`, with a recorded verdict `possible`; the summary counts a promoted group without a verdict as a possible loss.
+- **F3-13** `group` must be in the body of `lease`, `demote`, `promote` and `prepared`; `demote` and `promote` need the fence header and are
+  refused with 503 when the callee cannot read its catalog term. Cluster test `TestFailoverCalleeRefusesUnfencedAndUnnamedCalls`.
+- **F3-14** an unfreeze lifts only a freeze of its own task; `OnFail` sends its own task with the highest epoch.
+- **F3-15** the outcome `completedWithWarnings` (migration 0017, contract 0.12.0) when a step recorded a skipped standby, a pending list, remaining
+  prepared transactions or an incident.
+- **F3-16** the test list: the cluster tests above cover a live old primary only through F3-09, the leader's server as the new primary (F3-01), a
+  failure after F6 (F3-01, F3-04), a database created during a failover (F3-04). Not covered: a lagging standby, a second failover while one
+  is paused, a lost answer of any call, a kill of the instance with the writers still running (the old tests stop the instance cleanly).
+
+Also fixed in this round: **the renewal rounds of the lease manager left requests in flight.** A round ends when a majority answered; the request to
+the last grantor was still on its way and could reach the grantor after a release (`ReleaseGroup` waited for the round, not for its stragglers: the
+claim of FO-13 was not true) and could write into a test's directory after the test ended. `internal/lease/flights.go` counts the requests of
+rounds, releases and transfers per group; `ReleaseGroup` waits for those of its group, and the rig of the tests waits for all before its directories are
+removed. This was a defect of the lease code (the intermittent `TestAReleaseWaitsForTheRenewalInFlight`) and of two tests that counted requests
+of the round before (`TestARoundIsNotSentForAGroupReleasedInTheMiddleOfAPass`). The `TempDir RemoveAll cleanup: ... not empty` that remains on Windows
+when the whole package runs (and never when a test runs alone, 40 of 40) is the outside-process problem of this machine, not a writer of ours.
+Two cluster tests read once where the state is in motion and took a 503 as final (`topology` right after the formation, `GET /tasks/{id}` on a
+restarted leader that has not found itself again): the 503 with `Retry-After` is the answer of the product (a member that does not know the manager
+leader says so, a server whose instance is starting says so), so the helpers wait for 200 within a bound.
+
+Fault injection for the tests (never in a product's configuration): `fault.Spec.FailoverPoint` and `FailoverMode` (`fail` or `pause`) fail or pause the
+failover task at `<step name>:before`.
+
+## The map group (increment 5 of ha-phase5-part2.md): what exists, and what does not
+
+Built (contract 0.13.0): `internal/failover/journal` (the local journal), `internal/failover/mapgroup` (the bootstrap B1 to B8 over ports, tested with fakes at every step boundary), `cmd/kingresd/mapfailover.go` (the real ports, the candidate, the receiver, the answers about the bootstrap), `failover.RecordMapGroupRun` (the recorded task), `rebalance.PauseForMapGroupFailover`, the engine gate (`task.Options.Gate` from the journal) and the calls `POST /failover/map/start` and `/continue`. A request for the failover of the server that runs the primary of the map group is answered by any server that does not hear it (`httpapi.MapFailoverer`) with the task with id 0.
+
+**Not built:** the escrow of the key of the certificate authority (an alert, `certificateAuthorityUnavailable`, says what the operator does by hand: restore `pki/ca.key` and `pki/revoked.json` of the old leader from its backup into the pki directory of the new leader and restart kingresd), the second condition of the gate (the instance of group 0 in recovery), `graceful` for the map group. `Preflight` still refuses the map group with 422 `unsupported_operation` when the leader is alive (the request then goes to the leader).
+
+## Automatic failover (increment 6 of ha-phase5-part2.md, no change of the contract)
+
+Code: `internal/failover/auto.go` (`Evaluate`, the rule of design 4.2 and 4.3 as a function of a view; `Auto`, the loop every 5 s on the manager leader),
+`cmd/kingresd/autofailover.go` (reads the view: the settings from `cluster_setting`, the tracker, the corroboration of the members by `GET /liveness`, the
+standbys, the unfinished task, the end of the last failover per group; stops a rebalance before the start) and `cmd/kingresd/mapmonitor.go` (the candidate
+monitor of the map group on a server that hosts a ready standby of group 0: rank by standby id, 30 s of waiting per rank, a new look at the same leader and
+term, then the bootstrap with the trigger `automatic`, never with `allowDataLoss`).
+
+A server is failed over when its tracker says dead for at least `max(timeoutSeconds, 3 x failure-timeout)`, a strict majority of the members report it
+not live, this server hears a majority, no failover task is unfinished, and none of its groups was failed over in the last 5 minutes. A failed start backs off
+60 s doubling to 10 minutes. `autoFailover.eventsSinceReset` is incremented once per automatic task in the transaction that records its first promoted
+group; at `maxCount` the loop raises `autoFailoverLimitReached` once; `resetAutoFailoverCounter` and a completed rebalance set it to 0. The end of an
+automatic run raises `autoFailoverTriggered`; the start writes the audit event `autoFailover`. `POST /failover/map/start` also takes `trigger` (default
+`manual`) for the monitor. Cluster tests: `internal/clustertest/failover_auto_test.go`. Not tested in a cluster: two failures at once (needs five servers),
+a rebalance running at the start, the stall tests of the design.
+
 ## The signing keys of the ledger (phase 7, steps 3 and 4, contract 0.11.0)
 
 Design: `kingres/docs/design/ledger-phase7.md` (3.2 to 3.4, 6.7, 8.2 to 8.4, 9.1 to 9.3 and the corrections of section 14). This
@@ -3173,7 +3250,7 @@ stay in each database and are not listed).
   logs and appends one aggregate leaf in which every member is flagged `retired`. The aggregate log stays open: a database of the same name continues it with new chains.
 * The removal of a server does the same for the chains of the groups whose primary runs on it (`reason: group-removed`), before anything is changed on the server.
 * **A database that disappears without `dropDatabase`.** The owner of a database is a role that is not a superuser, and it can drop the database from SQL; nothing of the control plane sees it. When
-  every group answers for two rounds in a row that the database does not exist, the collector ends the publication of its chains with the same event and `reason: database-missing`, one aggregate leaf
+  every group has answered "no database" without one other answer in between for 30 minutes (`KINGRES_LEDGER_MISSING_FOR`, a duration, changes it; time, not a count of rounds), the system instance does not have the database either, and a critical alert (`ledgerGroupUnread`, subject the database) has warned from the first answer on, the collector ends the publication of its chains with the same event and `reason: database-missing`, one aggregate leaf
   with the members flagged `retired`, and closed logs. An auditor tells it from a rollback: a rollback is `diverged`, with an alert, and the chain log stops with the old head; this is `retired`,
   with a signed event and no alert of divergence. One group that answers "no database" while the others answer is only an unread group. A group that holds another chain than the one published
   (a database made again outside the control plane) gets the same end for the old chain (`reason: chain-replaced`) and a new log for the new one. Options that were rejected: a revoke of the
@@ -3188,3 +3265,117 @@ digests, views, re-signing, a follower and a deposed leader, 512 chains; and the
 behaviour, a TLS listener), `internal/ledgersign` (the signers, the exclusion with the retirement, the event), `internal/httpapi` (the three operations against the contract), and in
 `internal/clustertest` two servers with a database on two groups: the digest, the aggregate, the files over both listeners, the verifier, a kill at each kind of write, the cut off group, the drop and the
 vanished database.
+
+### What the review of the collector and the publication changed (corrections 171 to 178)
+
+* **What was published is kept outside the system database (P8-01).** `<ledger-keys-dir>/published.json` holds the highest size and root of every log that has a signed checkpoint, the number of events and the
+  hash of the last one (package `ledgerstate`; mode 0600, written atomically, with a checksum; no secret). The aggregate leaf and the events hold a clock time and what the chains looked like then, so they are not
+  reproducible, and a restore of `kingres_cp` from an older backup made the publisher sign a second root for a size and a second event for a number with no alert. Now every round, every retirement and every key task that
+  appends an event begins by comparing the database with the record: a database that holds less than was published, or another root at a published size, or another last event, refuses the round (nothing is signed or
+  written) and raises the critical alert `ledgerSignerUnavailable` with the subject `published-state`; it clears itself when the database holds what was published. Before a checkpoint is signed the record is asked
+  again (`Allow`), so a size that was published is never signed with other content whatever the database holds. The record is updated after the store accepted a checkpoint or an event; a crash in between leaves
+  it one behind the database, which is harmless. It is not signed: whoever can write the key directory can already sign with the keys. A **damaged** file refuses everything until an operator removes it.
+* **Every holder.** The leader sends its record to the holders at every pass of the job `ledger.state.sync` (internal call `ledger/state/merge`: the larger size per log, the larger event count; two copies that
+  disagree on one size are refused), and a server that is about to lead and has none asks the others first (`ledger/state/get`) and merges what they hold. Only when no holder answers does it take what its
+  database holds as the starting point, and a log line says so: this is also the first start after an upgrade from a tree without the record. **What is not covered:** a restore of the database when every copy of the
+  record is lost or older than the publication; a mirror or an auditor that holds the later checkpoint is what shows that fork. A restore of both the database and the record to the same older point is the same case.
+* **A retirement is about the checkpoints of the key that retires (P8-02).** After the event `key-retired` the other key keeps signing and the logs grow; the check at the retirement asks for checkpoints that carry a
+  signature of the retiring key above its bound, not for the largest tree of the cluster, and the task ends.
+* **A database that vanished (P8-03).** Time (30 minutes), the system instance and a warning alert instead of two rounds; a chain whose log was closed (any reason) and that comes back with the same chain id is not
+  opened again and not published in silence: a critical `ledgerChainDiverged` names the group, the height and why the log ended, and its new blocks wait for the new epoch of step 20. An auditor sees the closed
+  log with its `chain-retired` event and nothing after it.
+* **Swapped answers and replaced chains (P8-04).** An answer that names the chain of another group's open log is a divergence of both logs (critical alerts, nothing closed, nothing signed). A chain that is really
+  replaced still ends with a signed event and starts a new log, and now raises a critical alert as well.
+* **The rate table (P8-05)** evicts the entry that asked longest ago when it is full, and an IPv6 address counts by its /64. **`ReplaceNote` (P8-06)** accepts only a note whose text is the stored checkpoint's and
+  only while the key revision is the one the signers were read at. **A diverged log that is retired (P8-08)** stays flagged `diverged` in its retiring leaf and its alert is not cleared. **The adoption marker (P8-07)**
+  reads `task <n> key <fingerprint>`, and `Orphan` takes the id of the asking task (a file marked by a later task is not adopted); the marker cannot be made unforgeable against a person who can write the key
+  directory, and the text says so.
+* Decided, not changed (P8-10): tiles and events stay `immutable` (the record now makes a re-signed size impossible, so a mirror's copy cannot be contradicted by this publisher); the aggregate id is a hash of the
+  cluster id and the database name, hidden only as far as the name is unguessable (design 4.9 says so); the listener reads its certificate at start; a peer's answer over the asked number of blocks is refused by `Append`
+  (10 000) and bounded by the 64 MiB limit of the peer client; a future hash version of blocks stops the logs with a divergence that says "not a block header", and needs the decision of step 20 before a version 2 exists.
+
+## Anchoring of the aggregate checkpoints (phase 7, step 10; the WORM target; contract 0.11.0)
+
+`internal/ledgeranchor` wires the libraries `internal/anchor`, `anchor/sigv4` and `anchor/worm` into the daemon. What it does, by the sections of design 6, with the decisions of corrections 179 to 183:
+
+* **Targets and credentials.** A target is a row of `kingres_cp.ledger_anchor_target` (migration 0032): `kind`, `name`, `enabled`, the non-secret configuration in the spelling of the library of the kind (stored normalised, the
+  defaults filled in), `credentialsSet`, the last test. The credentials are write-only: `createLedgerAnchorTarget` and `updateLedgerAnchorTarget` take a `credentials` object (WORM: `accessKeyId`, `secretAccessKey`,
+  optional `sessionToken`; at least four printable ASCII characters each, so that the redaction can find them), the service validates it, writes `<ledger-keys-dir>/anchor/<id>.json` (mode 0600, in clear without a
+  passphrase file, sealed with AES-256-GCM under PBKDF2 of the passphrase file with one; written atomically) and hands the file to the holders by the internal call `ledger/anchor/credentials/install`. Nothing returns
+  them: not the target, not the list, not an error, not a log line, not a task row, not an alert, not the audit entry (it says `credentialsChanged`, no more). `{}` removes them. A target may instead name
+  `credentialsPath` in its configuration, the operator's own file (JSON with the same members, a regular file that only its owner can read), read at every use and never copied. An enabled target needs credentials.
+  `credentialsSet` is false until they are given, and a target without them is built as a failed check, not as a crash.
+* **Records and jobs.** `kingres_cp.ledger_anchor` keeps one record per (target, aggregate log, size) with the signed note it was made for (a re-signing at a rotation does not change the bytes a retry sends), the evidence as
+  text (the strict parsers read canonical bytes only), the counters of the library, `submit_start` and `generation`, and a `version` that every write raises. Four jobs run on the leader under its term:
+  `ledger.anchor.enqueue` (every `anchor.intervalSeconds`, and on `anchorLedgerNow`: a record of the newest checkpoint per enabled target and database; an older record that is still pending is superseded in the same
+  transaction), `ledger.anchor.submit` (30 s), `ledger.anchor.upgrade` (60 s) and `ledger.anchor.monitor` (10 s). Every write begins with the term guard; a follower holds no term and runs no job, a deposed leader's write is
+  refused. A submit is made in three writes that survive a kill at any point: the start of the first submission is written before the call (duty 1 of the library), the call is made with no transaction open and a
+  timeout, and the result is written by a compare and swap on the version of the row (a result that finds the row changed is dropped). A target that hangs holds one place of a pass, not the pass.
+* **What anchored means.** Only a receipt that the library of the kind returned, with evidence that its own parser reads back, moves a record to `anchored`; a record's state changes only through the methods of
+  `anchor.Record`; `claimed` (OpenTimestamps) is shown as `submitted` and never counts. `retryLedgerAnchor` puts a failed or expired record back to pending (it never raises the generation of a WORM key, which is an explicit
+  choice the contract does not offer; the start and the generation are kept). `downloadLedgerAnchor` writes the evidence file of the library (`json`); `ots` and `tsr` come with their targets.
+* **Outgoing requests (correction 180).** A client reaches exactly the host and port of the configuration (the endpoint, or the S3 host of the region with the virtual host of the bucket) and no other: the dialer refuses
+  every other address, the libraries follow no redirect, and no proxy is read. An address written in the configuration is connected to as written; a host name that resolves to a loopback, link-local, unspecified or
+  multicast address is refused (a name that leads to a metadata service or to this server); private addresses are fine for names. Without `caBundlePath` the roots of the system are used; with one, those only.
+* **Alerts (6.6, 6.9).** The alerts are a function of the state, recomputed every 10 s and written only when one appears, changes severity or goes away: `ledgerNotAnchored` (`database:<name>`, info, warning when
+  `anchor.required`), `ledgerAnchorBehind` (`target:<id>`: warning after three intervals and an hour, critical after twelve and an hour, counted from the oldest checkpoint the target has not covered and not earlier
+  than the target was switched on), `ledgerAnchorFailed` (`target:<id>`, from a failed or expired record, worded from the code and the text of the error, cleared by a Retry or by deleting the target) and
+  `ledgerAnchorConflict` (`database:<name>|target:<id>`).
+* The settings are those of `getLedgerSettings`; the contract did not change (the operations were in 0.11.0 and answered `unsupported_operation`).
+
+### `logs.json`, the whole fixture and the blocks of a quiet database (correction 178)
+
+* **`logs.json`** is served at the root of the publication next to `keyring.json` (short cache, `application/json`): `{"format":1,"logs":[{"kind":"chain|aggregate","origin":"...","state":"active|diverged|closed","size":N},...]}`,
+  one line and a newline, the members in this order, the logs in the order of their creation, a log with no checkpoint yet included. It holds no database name (an origin is made of the chain id or of the aggregate id).
+* **What changed in the bytes that the verifier reads, from the fixes of the review:** the tiles, the checkpoints, the entries of the chain logs, the aggregate leaf and the text of an event are unchanged byte for byte.
+  Two things differ. The leaf in which a diverged chain is retired by a drop or a removal now carries the flags of the member as `retired` and `diverged` together (the flag byte 0x06, where it was 0x02), and the event
+  `chain-retired` for it is unchanged. A chain whose log was closed and that comes back is never reopened and never gets a leaf, an event or a tile (an alert only), so no number of an event and no size of a log is ever given
+  to two texts: that assumption of the verifier is now kept by the record `published.json` and by the checks above, with the limit stated there.
+* **The fixture of the cluster test** (`KINGRES_PUBLICATION_FIXTURES`) still saves checkpoints and tiles of the latest state only, and no `events/`, `keyring.json` or `logs.json`. Making `TestLedgerPublicationOfADatabaseOnTwoGroups`
+  keep the whole publication (these files, and two successive checkpoints of each log by saving twice with a round in between) needs a cluster run of the test on both majors, which this round could not queue; it is the first thing
+  to do before the verifier's writer regenerates `kingres/verifier/testdata/publication`. The 305 blocks of a chain where the test wrote 5 rows are not explained yet: the builder's schedule, a block per digest and the
+  blocks of the extension's own tables are the candidates, and whether a quiet database grows by itself is to be measured on a cluster (the number of blocks after an idle hour).
+
+### The RFC 3161 target (phase 7, step 12; correction 184)
+
+`kind_tsa.go` registers the kind `tsa` over `internal/anchor/tsa`. The configuration is the library's: `url` (http or https, no user information, no query), `caBundlePath` (required: the trust anchors and intermediates that the **token** is checked against; it must hold a
+self-signed certificate), `policyOid`, `hashAlgorithm` (`sha256`), `timeoutSeconds`, `maxSkewSeconds`, `signerKeySha256` (the pin of one authority) and `allowInsecure` (needed to send the Basic credentials over http). The TLS connection to
+the authority is checked against the roots of the system, not against that bundle (the chain of a token and the certificate of the server are two matters). The credentials are an optional HTTP Basic pair (`username` and `password` go together). A
+record is `anchored` at once on a token the library verified in full (message imprint, nonce, chain at `genTime` and now, key usage, names); every refusal of 6.4 is a failed record with the code of the library in the alert. Requests go to the
+host and port of `url` only (the egress rule). `downloadLedgerAnchor?format=tsr` gives the DER of the time-stamp token (the CMS ContentInfo from the evidence), not a whole TimeStampResp, which the cluster does not keep. The Test button
+asks for a real token for the hash of an empty string and verifies it.
+
+### The OpenTimestamps target (phase 7, step 14; corrections 185 and 186)
+
+`kind_ots.go` registers the kind `ots` over `internal/anchor/ots`: the library's configuration (`calendars`, `minCalendars`, `upgradeTimeoutDays`, `allowInsecure`, `contradictionConfirmMinutes`) and one member of ours, `headerSource: {"url": ...}`, an
+Esplora-compatible explorer of a node the operator trusts (`/block-height/<h>`, `/block/<hash>/header`; the answers are bounded and the hash named must be the hash of the header given). Without it a claim of a calendar is a **claim**: the record is
+`claimed`, shown as `submitted`, never counted as anchored, looked at again at its next time; with it a record is anchored only on the header of the claimed height passing the library's rules. The calendars and the header source are the hosts the egress rule
+allows. No credentials. `jobs.go` gives every submitted or claimed record a time for its next look (`UpgradeInterval`), also a claimed record that has none, applies `ExpireIfDue` with the timeouts of the library, keeps what the calendars that answered gave when a
+submission is partial and passes it to `Resume` at the next attempt, and notes contradicted claims in `lastError` and the log. The Test button warns when the table of real headers of the build is older than a year, and so does a line in the log at start.
+`downloadLedgerAnchor?format=ots` writes the detached `.ots` file.
+
+### Part A of the last round (corrections 187 to 192)
+
+* **The 305 blocks (187):** explained, not a fault. The helper of the cluster test makes one digest for each row it writes, and a digest closes a block, so the rows of a test make as many blocks as the test has digests plus the
+  blocks of the extension's own tables. `TestAQuietLedgerDatabaseStaysQuiet` (`KINGRES_QUIET_MINUTES`, default 3) writes five rows with no digest, lets the collector publish, and then watches ten minutes: the blocks, the digests,
+  the sizes of every published log and the number of events did not change (pg18: blocks `[1 1]` to `[1 1]`, digests `[0 0]` to `[0 0]`, 659 s). The builder puts the pending transactions of one visit into one block.
+* **The whole fixture (188):** `TestLedgerPublicationOfADatabaseOnTwoGroups` saves the whole publication (`events/`, `keyring.json`, `logs.json`, the tiles and the latest checkpoint of every log) twice: `first` after the first
+  verifier pass and `second` after growth and a round, so every log has two checkpoints; one WORM target (the fake S3 of the test) holds one anchored record and its evidence file. To regenerate:
+  `scripts/run-integration.ps1 -Fixtures <windows dir> -Run TestLedgerPublicationOfADatabaseOnTwoGroups` (with `-Install` for the other major) for each major; the directories are `<dir>/first` and `<dir>/second`. `-TestEnv 'A=b;C=d'` passes environment to the test.
+  Nothing under `kingres/verifier` was changed.
+* **Process kills in a round (189):** `TestLedgerSurvivesAKillAtEveryOtherKindOfWrite` kills the leader at a write of kind digest, log, unread, state, retired, event and note (the hook `fault.Spec.LedgerExitKind`; "event" is new, at the
+  commit of a key event in `ledgersign.PGStore`), restarts it, and checks: no log diverged or closed that should not be, the stored logs audit against their tiles, every log passes the verifier, and `published.json` agrees with the database.
+  `TestTheConcurrencyLimitIsNeverExceeded` (package `ledgerpub`) holds the limit of two with ten requests: the peak is two, eight get 503 with `Retry-After`.
+  `TestAFollowerThatForwardsAHostileBodyLeaksNoCredential` sends truncated, oversized, mistyped and trailing bodies with credentials through a follower: no answer, log or audit entry holds a credential.
+* **Duties 9 and 10 (190):** the Test of a WORM target reports the checks `retention` (ok), `retention-ends` (warning when the object lock ends within 30 days), `retention-ended` (failed), `evidence-attempt` (warning when `attempt` is null),
+  `evidence-found` (warning when the store says the evidence was found) and `server-clock` (the store's `Date` against the database clock: warning above 30 s, failed above 5 minutes, the text names both times). The same checks run in the
+  monitor job and as an hourly line in the log.
+* **Retry limits (191):** the contract has no member for them, so the daemon reads `KINGRES_ANCHOR_MAX_RETRY_ATTEMPTS` and `KINGRES_ANCHOR_MAX_RETRY_AGE_HOURS` (the names the settings would have: `anchor.maxRetryAttempts`,
+  `anchor.maxRetryAgeHours`); a bad value is refused at start with a log line and the default is kept.
+* **Evidence files in the publication (192):** `a/<aggregate id>/anchors/<size>/<target>.json` serves the canonical evidence of an anchored (or submitted or claimed, with evidence) record, only at that path; it is never listed
+  (`logs.json` is unchanged) and is `Mutable`, so a short cache.
+* **Found by the cluster runs:** a drop task ends the publication first and drops the database a few steps later, so the collector saw the chain of a database it had just retired as a closed chain coming back and raised a critical
+  alert. For the reason "dropped" that is now silent for `DropGrace` (30 minutes) after the retirement. The step "Drop the database" also tries the drop again on SQLSTATE 55006 (a session that connected between the termination of
+  the sessions and the drop).
+* **"Anchored" through the header source (not done):** the OTS library has no exported way to inject the proof-of-work check, and a real block header cannot be matched to the merkle root a calendar returns, so the outcome
+  "anchored" through the wiring cannot be shown without a library change. The claim path is tested up to `claimed`.

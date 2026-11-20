@@ -67,6 +67,7 @@
 
 #include "access/detoast.h"
 #include "access/htup_details.h"
+#include "access/xlog.h"
 #include "access/parallel.h"
 #include "access/relation.h"
 #include "access/table.h"
@@ -74,6 +75,7 @@
 #include "catalog/storage.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "storage/lock.h"
 #include "storage/predicate.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
@@ -132,13 +134,17 @@ typedef enum KcPath
 	KC_PATH_ORPHANS_CLEANED,	/* stripe rows of a file dropped after the cleanup, removed later */
 	KC_PATH_REFUSED_LIVE,		/* ... of those refusals, the ones whose top-level transaction was still alive (it then fails at its next pre-commit) */
 	KC_PATH_LOST_RAISED,		/* the error raised for a refusal of that kind */
+	KC_PATH_RESERVED,			/* a buffer reserved a stripe's worth of row numbers (0.2) */
+	KC_PATH_RETURNED,			/* the unused tail of a reservation was given back */
+	KC_PATH_GAP,				/* ... could not be, and stays a gap in the numbers */
 	KC_PATH_COUNT
 } KcPath;
 
 static const char *const kc_path_names[KC_PATH_COUNT] = {
 	"late_commit", "late_window", "pressure_flush", "own_flush", "handover_flush",
 	"size_flush", "prepared_skip", "ceiling_write", "ceiling_handover",
-	"refused_ending", "orphans_cleaned", "refused_live", "lost_raised"
+	"refused_ending", "orphans_cleaned", "refused_live", "lost_raised",
+	"reserved", "tail_returned", "tail_gap"
 };
 
 static uint64 kc_path_hits[KC_PATH_COUNT];
@@ -250,7 +256,58 @@ typedef struct KcWriteBuf
 	uint32		merge_written;	/* rows of the combined sequence already written as stripes */
 	bool		tail_ready;		/* a flush wrote the front; "tail" replaces merge_into's rows */
 	KcTail		tail;
+
+	/*
+	 * Row numbers reserved at insert (increment C6a, design 5.3 and 7.8).  A
+	 * buffer that reserves takes a whole stripe's worth of numbers from the
+	 * metapage when its first row goes in, and inserts the stripe's catalog row
+	 * in the state "reserved" at once: row i of the buffer has the number
+	 * res_first + i, and so the TID the insert returns, whatever happens to the
+	 * buffer (a flush by size, by memory, at a savepoint, at commit or prepare)
+	 * until the transaction ends.  A buffer that reserves holds at most
+	 * res_count rows, is written as one stripe (the front of the reservation;
+	 * the unused tail is given back when it is the end of the range), is never
+	 * merged into another buffer, and is written, not merged, by a committing
+	 * subtransaction (decision 3 of C6a).
+	 *
+	 *	 reserve_asked	the setting was on when the buffer was made, and the
+	 *					table is one that may reserve: what decides which buffer
+	 *					a row goes to (a row never goes into a buffer made under
+	 *					the other setting)
+	 *	 reserving		this buffer reserves (reserve_asked and the table is of
+	 *					format 3 and the catalog has the column)
+	 *	 res_valid		the reservation is held: the numbers are taken and the
+	 *					reserved catalog row is in the catalog (found by its key)
+	 *	 res_cmin		the command id that inserted that row: it is "invisible"
+	 *					to an update of the same command, which then waits for the
+	 *					command counter to pass (kc_pass_command)
+	 */
+	bool		reserve_asked;
+	bool		reserving;
+	bool		res_valid;
+	uint64		res_stripe_id;
+	uint64		res_first;
+	uint32		res_count;
+	CommandId	res_cmin;
 } KcWriteBuf;
+
+/* the developer settings of C6a (kc_write_init) */
+bool		kc_guc_reserve_rows = false;
+int			kc_guc_reserve_gate = 0;
+int			kc_guc_reserve_gate_at = 0;
+
+/* where kingres_columnar.reserve_gate_at stops a writer (testing) */
+#define KC_RES_AFTER_ALLOC		1	/* the numbers are taken from the metapage */
+#define KC_RES_AFTER_EARLY_ROW	2	/* the reserved catalog row is inserted */
+#define KC_RES_AFTER_PAGES		3	/* the stripe's pages are written, its row is not yet updated */
+#define KC_RES_AFTER_UPDATE		4	/* the row is updated, the tail not yet given back */
+
+static void
+kc_reserve_gate(int point)
+{
+	if (kc_guc_reserve_gate != 0 && kc_guc_reserve_gate_at == point)
+		kc_gate_wait(kc_guc_reserve_gate);
+}
 
 typedef struct KcRelState
 {
@@ -301,6 +358,11 @@ static bool kc_broken_any = false;
 
 /* set while compaction copies rows through the buffers (kc_write_set_maintenance) */
 static bool kc_maintenance_write = false;
+
+/* the first row number of each stripe that compaction wrote in this transaction (kc_write_maintenance_ranges) */
+static uint64 *kc_maint_first = NULL;
+static int	kc_maint_nfirst = 0;
+static int	kc_maint_cap = 0;
 
 /*
  * The files this transaction replaced (a rewrite, VACUUM FULL, a change of
@@ -464,6 +526,9 @@ kc_state_reset(void)
 	kc_holds = NULL;
 	kc_maintenance_write = false;
 	kc_maint_buf = NULL;
+	kc_maint_first = NULL;
+	kc_maint_nfirst = 0;
+	kc_maint_cap = 0;
 	kc_total_bytes = 0;
 	kc_bytes_since_look = 0;
 	kc_handover_prepared = false;
@@ -493,13 +558,44 @@ kc_state_get(Oid relid, bool create)
 }
 
 /*
+ * Do the rows written now ask for row numbers at insert?  The developer setting
+ * is on, and the rows are not the copies of compaction nor the rows of a rewrite
+ * (their stripes are written with frozen catalog rows, and a rewrite builds the
+ * table's indexes again; neither promises a TID to anyone).  Whether the table can
+ * is another matter (the format of its file and the shape of the stripe catalog:
+ * kc_buf_make).  Nor in parallel mode (a CREATE TABLE AS whose query is parallel
+ * writes its rows in the leader while the executor is in parallel mode): a reserved
+ * row is replaced by an update, and heap forbids an update, and the command counter
+ * passing it, in parallel mode, so such a buffer could never be written by size or
+ * by memory.  The rows of such a statement have their numbers when their stripes
+ * are written, as without the setting; nothing can have an index yet that would
+ * need them earlier (the target of the statement is new).
+ */
+/* Has the table an index?  Then every row it takes needs its number when it is inserted (C6b). */
+bool
+kc_rel_reserves(Relation rel)
+{
+	return rel->rd_rel->relhasindex && RelationGetIndexList(rel) != NIL;
+}
+
+uint64		kc_flush_epoch = 0;
+
+static bool
+kc_reserve_asked(KcRelState *st, Relation rel)
+{
+	return (kc_guc_reserve_rows || kc_rel_reserves(rel)) && !kc_maintenance_write &&
+		!st->frozen && !IsInParallelMode();
+}
+
+/*
  * A new buffer, in the memory of parent.  A counted buffer (the buffers of the
  * transaction's state) is charged KC_BUF_OVERHEAD from here on; an uncounted
  * one is the private buffer of a single write-through call (kc_write_late),
  * which lives in the caller's memory and is gone when the call ends.
  */
 static KcWriteBuf *
-kc_buf_make(Relation rel, int ncols, MemoryContext parent, bool counted)
+kc_buf_make(Relation rel, int ncols, MemoryContext parent, bool counted,
+		   bool reserve_asked)
 {
 	KcWriteBuf *b;
 	MemoryContext cxt;
@@ -525,6 +621,9 @@ kc_buf_make(Relation rel, int ncols, MemoryContext parent, bool counted)
 	b->opts.level = meta.level;
 	b->opts.stripe_rows = meta.stripe_rows;
 	b->opts.chunk_rows = meta.chunk_rows;
+	b->reserve_asked = reserve_asked;
+	b->reserving = reserve_asked && meta.version >= KC_META_VERSION_RESERVE &&
+		kc_catalog_has_reserved();
 	if (counted)
 	{
 		/* last: nothing after this point can fail, so the charge is never orphaned */
@@ -537,7 +636,7 @@ kc_buf_make(Relation rel, int ncols, MemoryContext parent, bool counted)
 static KcWriteBuf *
 kc_buf_create(KcRelState *st, Relation rel, int ncols)
 {
-	KcWriteBuf *b = kc_buf_make(rel, ncols, kc_write_cxt, true);
+	KcWriteBuf *b = kc_buf_make(rel, ncols, kc_write_cxt, true, kc_reserve_asked(st, rel));
 	MemoryContext old = MemoryContextSwitchTo(kc_write_cxt);
 
 	st->bufs = lappend(st->bufs, b);
@@ -784,17 +883,23 @@ kc_buf_flushable(KcRelState *st, KcWriteBuf *b)
 		KC_PATH(KC_PATH_PREPARED_SKIP);
 		return false;
 	}
+	/* a reserved row is updated by the flush: heap forbids that in parallel mode */
+	if (b->res_valid && IsInParallelMode())
+		return false;
 	return b->refs == 0 && b->subid == GetCurrentSubTransactionId();
 }
 
 static void kc_write_stripe(KcRelState *st, KcWriteBuf *b, Relation rel,
-						   uint32 first, uint32 count, bool maintenance);
+						   uint32 first, uint32 count, bool maintenance,
+						   uint64 *first_row_out);
 static void kc_flush_buf(KcRelState *st, KcWriteBuf *b, Relation rel);
 static void kc_flush_buf_ex(KcRelState *st, KcWriteBuf *b, Relation rel,
 							bool keep_tail);
 static uint32 kc_stripe_limit(const KcOptions *opts);
 static void kc_coalesce(KcRelState *st);
 static void kc_buf_free(KcWriteBuf *b);
+static void kc_buf_forget_reservation(KcWriteBuf *b);
+static void kc_buf_visible(const KcWriteBuf *b, uint32 *first, uint32 *end);
 
 /*
  * Rows buffered for a file the relation no longer has (it was truncated or
@@ -919,6 +1024,7 @@ kc_flush_pressure(void)
 		rel = try_table_open(best->relid, RowExclusiveLock);
 		if (rel == NULL)
 		{
+			kc_buf_forget_reservation(best);
 			kc_buf_clear(best);
 		}
 		else
@@ -964,7 +1070,7 @@ kc_maint_buffer(Relation rel, int ncols)
 		kc_maint_buf = NULL;
 	}
 	if (kc_maint_buf == NULL)
-		kc_maint_buf = kc_buf_make(rel, ncols, kc_write_cxt, true);
+		kc_maint_buf = kc_buf_make(rel, ncols, kc_write_cxt, true, false);
 	return kc_maint_buf;
 }
 
@@ -993,16 +1099,38 @@ kc_write_maintenance_flush(Relation rel)
 		{
 			uint32		n = Min(limit, b->nrows - done);
 
-			kc_write_stripe(st, b, rel, done, n, true);
+			uint64		fr = KC_NO_ROW;
+
+			kc_write_stripe(st, b, rel, done, n, true, &fr);
+			if (kc_maint_nfirst == kc_maint_cap)
+			{
+				kc_maint_cap = kc_maint_cap ? kc_maint_cap * 2 : 16;
+				kc_maint_first = kc_maint_first ?
+					repalloc(kc_maint_first, sizeof(uint64) * kc_maint_cap) :
+					MemoryContextAlloc(kc_write_cxt, sizeof(uint64) * kc_maint_cap);
+			}
+			kc_maint_first[kc_maint_nfirst++] = fr;
 			done += n;
 		}
 	}
 	kc_buf_free(b);
 }
 
+/*
+ * The first row numbers of the stripes that compaction has written since it began: the rows
+ * it copied have these numbers, and the indexes of the table need entries for them.
+ */
+uint64 *
+kc_write_maintenance_ranges(int *n)
+{
+	*n = kc_maint_nfirst;
+	return kc_maint_first;
+}
+
 void
 kc_write_maintenance_discard(void)
 {
+	kc_maint_nfirst = 0;
 	if (kc_maint_buf != NULL)
 	{
 		kc_buf_free(kc_maint_buf);
@@ -1411,6 +1539,145 @@ kc_buf_put_row(KcWriteBuf *b, TupleDesc desc, Datum *vals, bool *nulls, CommandI
 	b->nrows++;
 }
 
+/* ------------------------------------------------------------------------
+ * Reserved row numbers (increment C6a)
+ *
+ * The life of a reservation, for a buffer that reserves (KcWriteBuf):
+ *
+ *	 1. the first row goes in: the stripe's whole worth of numbers is taken
+ *	    from the metapage (kc_meta_allocate, the ALLOC record), and the
+ *	    stripe's catalog row is inserted as "reserved", by the transaction or
+ *	    subtransaction that inserts the row;
+ *	 2. every later row of the buffer has the next number;
+ *	 3. a flush writes the pages of the stripe (for the rows that are there),
+ *	    replaces the reserved catalog row by the stripe's row, and gives the
+ *	    unused tail of the numbers back when it is still the end of the range;
+ *	 4. a transaction or subtransaction that ends in an abort drops the buffer:
+ *	    the reserved row is a dead row nobody sees (the heap rules clean it), the
+ *	    numbers are not given back (the abort callback may not touch the file),
+ *	    and no row ever had them in a stripe.
+ *
+ * Numbers a row was handed are never given back (a later index entry may name
+ * them); only the tail beyond the last row of a stripe that was written is.
+ * ------------------------------------------------------------------------
+ */
+
+/*
+ * The update (or the delete) of the reserved row is made by a command later
+ * than the one that inserted it, because heap_update calls a row of its own
+ * command "inserted after the scan started" and refuses it.  A flush in the
+ * middle of the statement that wrote the first row (by size, or by memory), and
+ * the flush at the commit of a statement that was the last of its transaction,
+ * are the same command: the counter is passed first.  It is allowed where the
+ * flush is: the executor of a statement, the pre-commit and pre-prepare
+ * callbacks, the pre-commit of a subtransaction (never in a parallel mode, where
+ * nothing is written).
+ */
+static void
+kc_pass_command(KcWriteBuf *b)
+{
+	if (GetCurrentCommandId(false) <= b->res_cmin)
+		CommandCounterIncrement();
+}
+
+static void
+kc_give_back_tail(Relation rel, uint64 first, uint32 count)
+{
+	if (count == 0)
+		return;
+	if (kc_meta_return(rel, first, count))
+		KC_PATH(KC_PATH_RETURNED);
+	else
+		KC_PATH(KC_PATH_GAP);
+}
+
+/*
+ * The reservation lock (C6c).  Between the moment a writer takes row numbers from the
+ * metapage and the moment the catalog row that claims them is inserted, the numbers
+ * belong to nobody the catalog knows, and an index vacuum that looked at the catalog
+ * in that gap would call the index entries the writer is about to make dead.  A writer
+ * holds this lock in SHARE mode across the gap (an advisory-class lock of its own,
+ * field 4 = 7, that no user lock uses), and the index vacuum takes it in EXCLUSIVE
+ * mode while it reads the metapage and the catalog (kc_index_vacuum), so each of them
+ * sees every claim that was made before it and the metapage that comes after.  Writers
+ * do not wait for each other; one waits only for the short look of a vacuum.
+ */
+void
+kc_reserve_lock(Relation rel, LOCKMODE mode)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_ADVISORY(tag, MyDatabaseId, 0x4B43, RelationGetRelid(rel), 7);
+	(void) LockAcquire(&tag, mode, false, false);
+}
+
+void
+kc_reserve_unlock(Relation rel, LOCKMODE mode)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_ADVISORY(tag, MyDatabaseId, 0x4B43, RelationGetRelid(rel), 7);
+	(void) LockRelease(&tag, mode, false);
+}
+
+/* Take the numbers and insert the reserved catalog row; the buffer has none. */
+static void
+kc_buf_reserve_numbers(KcWriteBuf *b, Relation rel)
+{
+	KcStripeInfo si;
+	uint64		stripe_id;
+	uint64		first_row;
+	uint32		count = kc_stripe_limit(&b->opts);
+
+	Assert(b->reserving && !b->res_valid);
+	kc_reserve_lock(rel, ShareLock);
+	kc_meta_allocate(rel, count, &stripe_id, &first_row);
+	KC_PATH(KC_PATH_RESERVED);
+	kc_reserve_gate(KC_RES_AFTER_ALLOC);
+
+	memset(&si, 0, sizeof(si));
+	si.stripe_id = stripe_id;
+	si.first_row = first_row;
+	si.row_count = count;
+	si.natts = b->ncols;
+	kc_catalog_insert_reserved(rel, &si);
+	b->res_cmin = GetCurrentCommandId(true);
+	b->res_stripe_id = stripe_id;
+	b->res_first = first_row;
+	b->res_count = count;
+	b->res_valid = true;
+	kc_reserve_unlock(rel, ShareLock);
+	kc_reserve_gate(KC_RES_AFTER_EARLY_ROW);
+}
+
+/*
+ * Give a reservation up, for a buffer that holds no row: the reserved catalog
+ * row goes, and all its numbers are given back when they are still the end of
+ * the range.
+ */
+static void
+kc_buf_release_reservation(KcWriteBuf *b, Relation rel)
+{
+	if (!b->res_valid)
+		return;
+	kc_pass_command(b);
+	kc_catalog_delete_reserved(rel, b->res_stripe_id);
+	b->res_valid = false;
+	kc_give_back_tail(rel, b->res_first, b->res_count);
+}
+
+/*
+ * The rows of the buffer are discarded and the file they were for is gone or
+ * replaced (a stale buffer, a table dropped or truncated meanwhile): the claim
+ * stays as it is, a row of the old file that its drop or rewrite removes with the
+ * rest, and the buffer does not hold it any more.
+ */
+static void
+kc_buf_forget_reservation(KcWriteBuf *b)
+{
+	b->res_valid = false;
+}
+
 /*
  * Write rows as stripes at once (write-through): the rows of a callback that
  * runs after the access method's last chance to write its buffers.  The rows
@@ -1426,7 +1693,8 @@ kc_buf_put_row(KcWriteBuf *b, TupleDesc desc, Datum *vals, bool *nulls, CommandI
  * does not): the cost of one stripe per row, measured, is in the README.
  */
 static void
-kc_write_late(Relation rel, Datum **vv, bool **nn, int nrows, CommandId cid)
+kc_write_late(Relation rel, Datum **vv, bool **nn, int nrows, CommandId cid,
+			  uint64 *rownums)
 {
 	TupleDesc	desc = RelationGetDescr(rel);
 	KcRelState *st = kc_state_get(RelationGetRelid(rel), true);
@@ -1437,7 +1705,7 @@ kc_write_late(Relation rel, Datum **vv, bool **nn, int nrows, CommandId cid)
 	int			i;
 
 	KC_PATH(kc_handover_prepared ? KC_PATH_LATE_WINDOW : KC_PATH_LATE_COMMIT);
-	b = kc_buf_make(rel, desc->natts, CurrentMemoryContext, false);
+	b = kc_buf_make(rel, desc->natts, CurrentMemoryContext, false, kc_reserve_asked(st, rel));
 	for (i = 0; i < nrows; i++)
 		kc_buf_put_row(b, desc, vv[i], nn[i], cid);
 
@@ -1450,8 +1718,19 @@ kc_write_late(Relation rel, Datum **vv, bool **nn, int nrows, CommandId cid)
 	while (done < b->nrows)
 	{
 		uint32		n = Min(limit, b->nrows - done);
+		uint64		first_row;
+		uint32		j;
 
-		kc_write_stripe(st, b, rel, done, n, false);
+		kc_write_stripe(st, b, rel, done, n, false, &first_row);
+
+		/*
+		 * A table that reserves hands the numbers back to the caller (the TID of
+		 * the row that was just inserted): a stripe written at once gets its
+		 * numbers from the metapage, exactly n of them, nothing to give back.
+		 */
+		if (b->reserving && rownums != NULL)
+			for (j = 0; j < n; j++)
+				rownums[done + j] = first_row + j;
 		done += n;
 	}
 	if (pushed)
@@ -1466,7 +1745,8 @@ kc_write_late(Relation rel, Datum **vv, bool **nn, int nrows, CommandId cid)
  * batches and not one stripe per row.
  */
 void
-kc_write_rows(Relation rel, TupleTableSlot **slots, int nslots, CommandId cid)
+kc_write_rows(Relation rel, TupleTableSlot **slots, int nslots, CommandId cid,
+			  uint64 *rownums)
 {
 	int			i;
 
@@ -1485,14 +1765,19 @@ kc_write_rows(Relation rel, TupleTableSlot **slots, int nslots, CommandId cid)
 			vv[i] = slots[i]->tts_values;
 			nn[i] = slots[i]->tts_isnull;
 		}
-		kc_write_late(rel, vv, nn, nslots, cid);
+		kc_write_late(rel, vv, nn, nslots, cid, rownums);
 		pgstat_count_heap_insert(rel, nslots);
 		pfree(vv);
 		pfree(nn);
 		return;
 	}
 	for (i = 0; i < nslots; i++)
-		kc_write_row(rel, slots[i], cid);
+	{
+		uint64		rn = kc_write_row(rel, slots[i], cid);
+
+		if (rownums != NULL)
+			rownums[i] = rn;
+	}
 }
 
 /* The most memory the write buffers may hold, whatever the write cannot free. */
@@ -1504,14 +1789,18 @@ kc_ceiling(void)
 
 /* Returns false, after a warning, when the row was refused (kc_write_refused). */
 bool
-kc_write_row_values(Relation rel, Datum *vals, bool *nulls, CommandId cid)
+kc_write_row_values(Relation rel, Datum *vals, bool *nulls, CommandId cid,
+					uint64 *rownum_out)
 {
 	TupleDesc	desc = RelationGetDescr(rel);
 	KcRelState *st;
 	KcWriteBuf *b = NULL;
 	MemoryContext old = CurrentMemoryContext;
 	Size		before = kc_total_bytes;
+	uint64		rownum = KC_NO_ROW;
 
+	if (rownum_out != NULL)
+		*rownum_out = KC_NO_ROW;
 	if (kc_write_refused(rel, "insert"))
 		return false;
 	kc_write_check_state(rel);
@@ -1531,7 +1820,7 @@ kc_write_row_values(Relation rel, Datum *vals, bool *nulls, CommandId cid)
 	 */
 	if (kc_write_is_late())
 	{
-		kc_write_late(rel, &vals, &nulls, 1, cid);
+		kc_write_late(rel, &vals, &nulls, 1, cid, rownum_out);
 		return true;
 	}
 
@@ -1579,6 +1868,15 @@ kc_write_row_values(Relation rel, Datum *vals, bool *nulls, CommandId cid)
 		if (b->subid != GetCurrentSubTransactionId() || b->refs > 0 ||
 			b->uid != kc_rel_ident(rel)->uid)
 			b = NULL;
+
+		/*
+		 * A row goes only into a buffer made under the same setting (one that
+		 * reserves gives its rows numbers, the others never do), and a buffer
+		 * that reserves is full when it has used the numbers it took.
+		 */
+		else if (b->reserve_asked != kc_reserve_asked(st, rel) ||
+				 (b->reserving && b->res_valid && b->nrows >= b->res_count))
+			b = NULL;
 	}
 	if (b == NULL)
 		b = kc_buf_create(st, rel, desc->natts);
@@ -1586,7 +1884,31 @@ kc_write_row_values(Relation rel, Datum *vals, bool *nulls, CommandId cid)
 		kc_buf_widen(b, rel);
 	MemoryContextSwitchTo(old);
 
+	/*
+	 * The first row of a buffer that reserves takes the numbers of a stripe and
+	 * inserts the stripe's catalog row, "reserved"; this row has the next
+	 * number, which is the TID the insert returns (design 5.3).  Before the row
+	 * is put: if the reservation fails the transaction or subtransaction ends
+	 * and the buffer with it, and if the put fails the buffer holds a
+	 * reservation and no row, which the flush at the end gives back
+	 * (kc_buf_release_reservation).
+	 */
+	if (b->reserving)
+	{
+		if (!b->res_valid)
+			kc_buf_reserve_numbers(b, rel);
+		rownum = b->res_first + b->nrows;
+	}
+
+	if (!b->reserving && !kc_maintenance_write && kc_rel_reserves(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("a row of columnar table \"%s\", which has an index, cannot be given a row number now",
+						RelationGetRelationName(rel)),
+				 errdetail("The file is of format version 2, or the catalog is not the one of version 0.2.")));
 	kc_buf_put_row(b, desc, vals, nulls, cid);
+	if (rownum_out != NULL)
+		*rownum_out = rownum;
 
 	/*
 	 * The compaction buffer is private and written as stripes when it holds a
@@ -1599,7 +1921,8 @@ kc_write_row_values(Relation rel, Datum *vals, bool *nulls, CommandId cid)
 		return true;
 	}
 
-	if (b->nrows >= kc_stripe_limit(&b->opts) && kc_buf_flushable(st, b))
+	if (b->nrows >= (b->reserving ? b->res_count : kc_stripe_limit(&b->opts)) &&
+		kc_buf_flushable(st, b))
 	{
 		Relation	r = try_table_open(b->relid, RowExclusiveLock);
 
@@ -1626,12 +1949,15 @@ kc_write_row_values(Relation rel, Datum *vals, bool *nulls, CommandId cid)
 	return true;
 }
 
-void
+uint64
 kc_write_row(Relation rel, TupleTableSlot *slot, CommandId cid)
 {
+	uint64		rownum = KC_NO_ROW;
+
 	slot_getallattrs(slot);
-	if (kc_write_row_values(rel, slot->tts_values, slot->tts_isnull, cid))
+	if (kc_write_row_values(rel, slot->tts_values, slot->tts_isnull, cid, &rownum))
 		pgstat_count_heap_insert(rel, 1);
+	return rownum;
 }
 
 /* ------------------------------------------------------------------------
@@ -2036,6 +2362,65 @@ kc_buf_drop_prefix(KcWriteBuf *b, uint32 n)
 	kc_buf_tail_install(b, &t, false);
 }
 
+
+/*
+ * The rows [first, first + count) of a buffer in the form of heap tuples for logical decoding
+ * (increment C7; see kc_decode in kc_storage.c).  Written by the transaction that writes the
+ * stripe, a few hundred rows or about a megabyte to a record.  Not for the copies compaction makes
+ * (maintenance), which are no new rows.
+ */
+static void
+kc_log_logical_rows(Relation rel, KcWriteBuf *b, uint32 first, uint32 count)
+{
+	TupleDesc	desc = RelationGetDescr(rel);
+	int			natts = desc->natts;
+	Datum	   *v = palloc(sizeof(Datum) * Max(natts, 1));
+	bool	   *n = palloc(sizeof(bool) * Max(natts, 1));
+	StringInfoData sb;
+	uint32		nt = 0;
+	uint32		r;
+	int			c;
+
+	/* the transaction has an id: the stripe's catalog row was written by it */
+	(void) GetCurrentTransactionId();
+	initStringInfo(&sb);
+	for (r = first; r < first + count; r++)
+	{
+		HeapTuple	tup;
+
+		for (c = 0; c < natts; c++)
+		{
+			if (c < b->ncols)
+			{
+				Size		idx = (Size) r * b->ncols + c;
+
+				v[c] = b->vals[idx];
+				n[c] = b->nulls[idx];
+			}
+			else
+			{
+				v[c] = (Datum) 0;
+				n[c] = true;
+			}
+		}
+		tup = heap_form_tuple(desc, v, n);
+		kc_logical_append_tuple(&sb, tup);
+		heap_freetuple(tup);
+		nt++;
+		if (nt >= 512 || sb.len >= 1024 * 1024)
+		{
+			kc_xlog_logical(rel, nt, sb.data, sb.len);
+			resetStringInfo(&sb);
+			nt = 0;
+		}
+	}
+	if (nt > 0)
+		kc_xlog_logical(rel, nt, sb.data, sb.len);
+	pfree(sb.data);
+	pfree(v);
+	pfree(n);
+}
+
 /*
  * Write rows [first, first + count) of the buffer as one stripe.  The caller
  * is in the subtransaction that owns the buffer and holds a lock on rel.
@@ -2046,7 +2431,7 @@ kc_buf_drop_prefix(KcWriteBuf *b, uint32 n)
  */
 static void
 kc_write_stripe(KcRelState *st, KcWriteBuf *b, Relation rel, uint32 first,
-				uint32 count, bool maintenance)
+				uint32 count, bool maintenance, uint64 *first_row_out)
 {
 	KcStripeInfo si;
 	KcBuf		blob = {NULL, 0, 0};
@@ -2059,8 +2444,18 @@ kc_write_stripe(KcRelState *st, KcWriteBuf *b, Relation rel, uint32 first,
 	uint64		footer_off;
 	MemoryContext old = CurrentMemoryContext;
 	MemoryContext fcxt;
+	bool		reserved = b->res_valid && !maintenance;
+	bool		locked = false;
 
-	Assert(count > 0 && count <= kc_stripe_limit(&b->opts));
+	/*
+	 * A stripe of a buffer that holds a reservation is the front of the numbers
+	 * it took: the rows [0, count) of the buffer, which is the whole buffer (it
+	 * never holds more than it reserved).  Any other stripe takes its numbers
+	 * from the metapage now.
+	 */
+	Assert(count > 0 &&
+		   count <= (reserved ? b->res_count : kc_stripe_limit(&b->opts)));
+	Assert(!reserved || (first == 0 && count == b->nrows));
 	KC_FAULT(KC_FAULT_ALLOC);
 	fcxt = AllocSetContextCreate(CurrentMemoryContext, "kingres_columnar flush",
 								 ALLOCSET_DEFAULT_SIZES);
@@ -2068,7 +2463,19 @@ kc_write_stripe(KcRelState *st, KcWriteBuf *b, Relation rel, uint32 first,
 	initStringInfo(&stats);
 	initStringInfo(&cidpts);
 
-	kc_meta_allocate(rel, count, &stripe_id, &first_row);
+	if (reserved)
+	{
+		stripe_id = b->res_stripe_id;
+		first_row = b->res_first;
+	}
+	else
+	{
+		kc_reserve_lock(rel, ShareLock);
+		kc_meta_allocate(rel, count, &stripe_id, &first_row);
+		locked = true;
+	}
+	if (first_row_out != NULL)
+		*first_row_out = first_row;
 	kc_build_stripe(rel, b, first, count, &b->opts, stripe_id, &blob, &stats,
 					&cidpts, &ngroups, &raw_bytes, &footer_off);
 
@@ -2083,8 +2490,35 @@ kc_write_stripe(KcRelState *st, KcWriteBuf *b, Relation rel, uint32 first,
 	si.footer_offset = footer_off;
 	kc_stripe_write(rel, stripe_id, blob.data, blob.len, &si.first_block,
 					&si.block_count);
-	kc_catalog_insert(rel, &si, cidpts.data, cidpts.len, stats.data, stats.len,
-					  st->frozen, maintenance);
+	if (!reserved)
+		kc_catalog_insert(rel, &si, cidpts.data, cidpts.len, stats.data, stats.len,
+						  st->frozen, maintenance);
+	if (locked)
+		kc_reserve_unlock(rel, ShareLock);
+	else
+	{
+		uint64		res_first = b->res_first;
+		uint32		res_count = b->res_count;
+
+		/*
+		 * The pages are written; the reserved row becomes the stripe's row.  Its
+		 * claim shrinks to the rows that are there (row_count) before the unused
+		 * numbers are offered back, so no number is ever free while the catalog
+		 * still says a writer holds it.
+		 */
+		kc_reserve_gate(KC_RES_AFTER_PAGES);
+		kc_pass_command(b);
+		kc_catalog_update_reserved(rel, &si, cidpts.data, cidpts.len,
+								   stats.data, stats.len);
+		b->res_valid = false;
+		kc_reserve_gate(KC_RES_AFTER_UPDATE);
+		kc_give_back_tail(rel, res_first + count, res_count - count);
+	}
+	kc_flush_epoch++;
+
+	/* the rows for logical decoding (C7), by the transaction that writes the stripe */
+	if (!maintenance && XLogLogicalInfoActive() && RelationIsLogicallyLogged(rel))
+		kc_log_logical_rows(rel, b, first, count);
 
 	/*
 	 * The stripe can be found by readers from here on.  A reader that took
@@ -2121,11 +2555,26 @@ kc_flush_buf_ex(KcRelState *st, KcWriteBuf *b, Relation rel, bool keep_tail)
 	if (!kc_rel_is_columnar(rel) || kc_buf_is_stale(b, rel))
 	{
 		/* converted to another access method, truncated or rewritten meanwhile */
+		kc_buf_forget_reservation(b);
 		kc_buf_clear(b);
 		return;
 	}
 
 	KC_FAULT(KC_FAULT_FLUSH);
+
+	/*
+	 * A buffer that reserves holds one stripe, at most the numbers it took: it
+	 * is written whole, as the front of them, or (with keep_tail, the flush by
+	 * size) left alone until it has used them all.
+	 */
+	if (b->res_valid)
+	{
+		if (keep_tail && b->nrows < b->res_count)
+			return;
+		kc_write_stripe(st, b, rel, 0, b->nrows, false, NULL);
+		kc_buf_clear(b);
+		return;
+	}
 	limit = kc_stripe_limit(&b->opts);
 	while (done < b->nrows)
 	{
@@ -2133,7 +2582,7 @@ kc_flush_buf_ex(KcRelState *st, KcWriteBuf *b, Relation rel, bool keep_tail)
 
 		if (keep_tail && n < limit)
 			break;
-		kc_write_stripe(st, b, rel, done, n, false);
+		kc_write_stripe(st, b, rel, done, n, false, NULL);
 		done += n;
 	}
 	if (done == b->nrows)
@@ -2173,6 +2622,77 @@ kc_write_flush_relation(Relation rel)
 	}
 }
 
+/*
+ * A plan that has a Gather runs the scans of columnar tables in parallel
+ * workers, which cannot see rows that exist only in this backend's memory.
+ * Called by the custom scan of the leader when it starts such a plan (before
+ * the executor enters parallel mode, where a catalog row could not be written):
+ * the running subtransaction's buffers of the relation become stripes (design
+ * 7.1; the rows of the commands that ran before are then visible by the
+ * stripe's command ids exactly as in a serial scan), and what cannot be
+ * written (a buffer of an enclosing subtransaction, which the stripe row's
+ * transaction id would not follow; a buffer another scan of this backend
+ * reads) makes the plan fail with a message, never answer without those rows.
+ */
+void
+kc_write_prepare_for_workers(Relation rel)
+{
+	KcRelState *st;
+	ListCell   *lc;
+	uint64		uid;
+
+	kc_write_flush_relation(rel);
+	st = kc_state_get(RelationGetRelid(rel), false);
+	if (st == NULL)
+		return;
+	uid = kc_rel_ident(rel)->uid;
+	foreach(lc, st->bufs)
+	{
+		KcWriteBuf *b = lfirst(lc);
+		uint32		first;
+		uint32		end;
+
+		kc_buf_visible(b, &first, &end);
+		if (end > first && b->uid == uid)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("columnar table \"%s\" has rows that this transaction wrote and parallel workers cannot read",
+							RelationGetRelationName(rel)),
+					 errdetail("The rows were written by an enclosing subtransaction, or a scan of this session is still reading them."),
+					 errhint("Run the query with max_parallel_workers_per_gather = 0, or after the subtransaction has ended.")));
+	}
+}
+
+/*
+ * Does this backend hold rows of rel that kc_write_prepare_for_workers could
+ * not make visible to workers?  The planner asks, and offers no parallel path
+ * for such a relation (a plan prepared earlier and run later can still meet the
+ * rows, and then fails with the message of kc_write_prepare_for_workers).
+ */
+bool
+kc_write_parallel_blocked(Relation rel)
+{
+	KcRelState *st = kc_state_get(RelationGetRelid(rel), false);
+	ListCell   *lc;
+	uint64		uid;
+
+	if (st == NULL)
+		return false;
+	uid = kc_rel_ident(rel)->uid;
+	foreach(lc, st->bufs)
+	{
+		KcWriteBuf *b = lfirst(lc);
+		uint32		first;
+		uint32		end;
+
+		kc_buf_visible(b, &first, &end);
+		if (end > first && b->uid == uid &&
+			(kc_write_state_forbids_error() || !kc_buf_flushable(st, b)))
+			return true;
+	}
+	return false;
+}
+
 /* Forget the running subtransaction's buffered rows of a relation. */
 void
 kc_write_discard_relation(Oid relid, bool *had_outer)
@@ -2201,7 +2721,10 @@ kc_write_discard_relation(Oid relid, bool *had_outer)
 		KcWriteBuf *b = lfirst(lc);
 
 		if (b->subid == GetCurrentSubTransactionId())
+		{
+			kc_buf_forget_reservation(b);
 			kc_buf_clear(b);
+		}
 		else if (had_outer && b->nrows > 0)
 			*had_outer = true;
 	}
@@ -2594,7 +3117,8 @@ kc_holds_break_window(void)
  */
 bool
 kc_write_pending_fetch(Oid relid, const KcPendingRef *ref, uint32 rowno,
-					   Datum **vals, bool **nulls, int *ncols, CommandId *cid)
+					   Datum **vals, bool **nulls, int *ncols, CommandId *cid,
+					   uint64 *rownum)
 {
 	KcRelState *st = kc_state_get(relid, false);
 	ListCell   *lc;
@@ -2613,9 +3137,104 @@ kc_write_pending_fetch(Oid relid, const KcPendingRef *ref, uint32 rowno,
 		*nulls = &b->nulls[(Size) rowno * b->ncols];
 		*ncols = b->ncols;
 		*cid = b->cids[rowno];
+		/* the number a row of a buffer that reserves was given when it was inserted */
+		*rownum = (b->reserving && b->res_valid) ? b->res_first + rowno : KC_NO_ROW;
 		return true;
 	}
 	return false;
+}
+
+/*
+ * The row with this number in a buffer of this transaction that reserved it
+ * (C6b: an index scan fetches a row its own transaction inserted and has not
+ * written).  Only a buffer that reserves has numbers.  The pointers are valid
+ * until the next write to the relation.
+ */
+bool
+kc_write_pending_by_number(Oid relid, uint64 uid, uint64 row, Datum **vals,
+						   bool **nulls, int *ncols, CommandId *cid)
+{
+	KcRelState *st = kc_state_get(relid, false);
+	ListCell   *lc;
+
+	if (st == NULL)
+		return false;
+	foreach(lc, st->bufs)
+	{
+		KcWriteBuf *b = lfirst(lc);
+		uint32		first;
+		uint32		end;
+
+		if (!b->reserving || !b->res_valid || b->uid != uid)
+			continue;
+		kc_buf_visible(b, &first, &end);
+		if (row < b->res_first + first || row >= b->res_first + end)
+			continue;
+		*vals = &b->vals[(Size) (row - b->res_first) * b->ncols];
+		*nulls = &b->nulls[(Size) (row - b->res_first) * b->ncols];
+		*ncols = b->ncols;
+		*cid = b->cids[row - b->res_first];
+		return true;
+	}
+	return false;
+}
+
+/* Does this transaction hold rows of the table that are only in memory? */
+bool
+kc_write_has_unwritten(Relation rel)
+{
+	KcRelState *st = kc_state_get(RelationGetRelid(rel), false);
+	ListCell   *lc;
+	uint64		uid = kc_rel_ident(rel)->uid;
+
+	if (st == NULL)
+		return false;
+	foreach(lc, st->bufs)
+	{
+		KcWriteBuf *b = lfirst(lc);
+
+		if (b->nrows > 0 && b->uid == uid)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * A first index on a table whose transaction holds rows in buffers: those rows
+ * have no numbers (their buffers were made before the table had an index) or
+ * are still only in memory, and the build scan reads stripes.  The buffers of the
+ * running subtransaction are written first, so the build sees every row with the
+ * number it has.  What cannot be written (a buffer of an enclosing subtransaction,
+ * one that a scan reads) makes the statement fail, never build an index that
+ * misses rows.
+ */
+void
+kc_write_flush_for_index(Relation rel)
+{
+	KcRelState *st;
+	ListCell   *lc;
+	uint64		uid;
+
+	kc_write_flush_relation(rel);
+	st = kc_state_get(RelationGetRelid(rel), false);
+	if (st == NULL)
+		return;
+	uid = kc_rel_ident(rel)->uid;
+	foreach(lc, st->bufs)
+	{
+		KcWriteBuf *b = lfirst(lc);
+		uint32		first;
+		uint32		end;
+
+		kc_buf_visible(b, &first, &end);
+		if (end > first && b->uid == uid)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot build an index on columnar table \"%s\": this transaction holds rows of it that cannot be written yet",
+							RelationGetRelationName(rel)),
+					 errdetail("The rows were written by an enclosing subtransaction, or a scan of this session is still reading them."),
+					 errhint("Build the index in the subtransaction that wrote the rows, or after the savepoint is released, or close the cursor.")));
+	}
 }
 
 /* ------------------------------------------------------------------------
@@ -2660,7 +3279,8 @@ kc_flush_all(void)
 		{
 			KcWriteBuf *b = lfirst(lc);
 
-			if (b->nrows == 0)
+			/* an empty buffer that still holds a reservation gives it up below */
+			if (b->nrows == 0 && !b->res_valid)
 				continue;
 			if (b->subid != GetCurrentSubTransactionId())
 				elog(ERROR, "columnar write buffer of an inner subtransaction survived to commit");
@@ -2670,9 +3290,17 @@ kc_flush_all(void)
 				if (rel == NULL)
 				{
 					/* dropped in this transaction */
+					kc_buf_forget_reservation(b);
 					kc_buf_clear(b);
 					continue;
 				}
+			}
+			if (b->nrows == 0)
+			{
+				if (!kc_buf_is_stale(b, rel))
+					kc_buf_release_reservation(b, rel);
+				kc_buf_forget_reservation(b);
+				continue;
 			}
 			kc_flush_buf(st, b, rel);
 		}
@@ -2872,9 +3500,13 @@ kc_xact_callback(XactEvent event, void *arg)
 static bool
 kc_can_merge(KcWriteBuf *prev, KcWriteBuf *b, SubTransactionId parentSubid)
 {
+	/*
+	 * A buffer that reserves is never merged into another, nor another into it
+	 * (decision 3 of C6a): its rows have numbers, one stripe is its life.
+	 */
 	return prev != NULL && prev->subid == parentSubid &&
 		prev->ncols == b->ncols && prev->uid == b->uid &&
-		b->refs == 0 && prev->refs == 0;
+		b->refs == 0 && prev->refs == 0 && !b->reserving && !prev->reserving;
 }
 
 /*
@@ -2988,7 +3620,7 @@ kc_merge_flush_prepare(KcRelState *st, KcWriteBuf *prev, KcWriteBuf *b,
 	{
 		uint32		n = Min(limit, upto - done);
 
-		kc_write_stripe(st, prev, rel, done, n, false);
+		kc_write_stripe(st, prev, rel, done, n, false, NULL);
 		done += n;
 	}
 	table_close(rel, NoLock);
@@ -3091,7 +3723,8 @@ kc_coalesce(KcRelState *st)
 
 		if (prev != NULL && b->subid == prev->subid && b->ncols == prev->ncols &&
 			b->uid == prev->uid && b->refs == 0 && prev->refs == 0 &&
-			b->merge_into == NULL && prev->vis_from == 0)
+			b->merge_into == NULL && prev->vis_from == 0 &&
+			!b->reserving && !prev->reserving)
 		{
 			if (b->nrows > 0)
 			{
@@ -3121,7 +3754,17 @@ kc_flush_own_buffer(KcRelState *st, KcWriteBuf *b)
 	rel = try_table_open(b->relid, RowExclusiveLock);
 	if (rel == NULL)
 	{
+		kc_buf_forget_reservation(b);
 		kc_buf_clear(b);
+		return;
+	}
+	if (b->nrows == 0)
+	{
+		/* a reservation and no row (a failed insert): give it back */
+		if (!kc_buf_is_stale(b, rel))
+			kc_buf_release_reservation(b, rel);
+		kc_buf_forget_reservation(b);
+		table_close(rel, NoLock);
 		return;
 	}
 	if (!ActiveSnapshotSet())
@@ -3197,6 +3840,24 @@ kc_subxact_prepare(SubTransactionId mySubid, SubTransactionId parentSubid)
 
 			if (b->subid != mySubid)
 			{
+				prev = b;
+				busy = false;
+				continue;
+			}
+
+			/*
+			 * A buffer that reserves is written by the subtransaction that
+			 * inserted into it, as a stripe of its own, and never merged into the
+			 * parent's (decision 3 of C6a): its rows have numbers and a catalog
+			 * row of their own, inserted by this subtransaction, which the parent
+			 * could not write on its behalf.  One that a scan reads cannot be
+			 * written; it stays as it is and becomes the parent's, and the parent
+			 * writes it later.  Cost: one stripe per savepoint that wrote.
+			 */
+			if (b->reserving)
+			{
+				if ((b->nrows > 0 && b->refs == 0) || (b->nrows == 0 && b->res_valid))
+					kc_flush_own_buffer(st, b);
 				prev = b;
 				busy = false;
 				continue;
@@ -3357,9 +4018,11 @@ kc_subxact_publish(SubTransactionId mySubid, SubTransactionId parentSubid)
 				st->bufs = foreach_delete_current(st->bufs, lc);
 				kc_buf_free(b);
 			}
-			else if (b->nrows == 0 && prev != NULL && prev->subid == parentSubid &&
-					 prev->ncols == b->ncols && prev->uid == b->uid)
+			else if ((b->nrows == 0 && prev != NULL && prev->subid == parentSubid &&
+					  prev->ncols == b->ncols && prev->uid == b->uid) ||
+					 (b->reserving && b->nrows == 0 && !b->res_valid && b->refs == 0))
 			{
+				/* (a buffer that reserves and holds nothing, not even a claim, is of no use to the parent) */
 				st->bufs = foreach_delete_current(st->bufs, lc);
 				kc_buf_free(b);
 			}
@@ -3472,6 +4135,29 @@ kc_write_init(void)
 {
 	RegisterXactCallback(kc_xact_callback, NULL);
 	RegisterSubXactCallback(kc_subxact_callback, NULL);
+
+	/*
+	 * Developer settings of C6a, superuser only, for tests (README).  Until a
+	 * table has an index (C6b makes a table that has one reserve by itself) no
+	 * table needs row numbers at insert, so the tests switch the reservation on
+	 * for a session.  Off, nothing of the write path changes: the same stripes,
+	 * the same row numbers.  reserve_gate and reserve_gate_at stop a writer at a
+	 * point of its reservation, the way check_gate stops the check: the writer
+	 * waits while another session of a superuser holds the advisory lock (key,
+	 * 0), so that a test can stop the server at a moment it can name.
+	 */
+	DefineCustomBoolVariable("kingres_columnar.reserve_row_numbers",
+							 "Reserve row numbers when a row is inserted, so that its TID exists then (testing, until a table can have an index).",
+							 NULL, &kc_guc_reserve_rows, false,
+							 PGC_SUSET, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
+	DefineCustomIntVariable("kingres_columnar.reserve_gate",
+							"Advisory lock key that a writer that reserves waits on at the point reserve_gate_at names (testing).",
+							NULL, &kc_guc_reserve_gate, 0, 0, 1000000,
+							PGC_SUSET, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
+	DefineCustomIntVariable("kingres_columnar.reserve_gate_at",
+							"The point of the reservation where reserve_gate waits: 1 numbers taken, 2 reserved row inserted, 3 pages written, 4 row updated (testing).",
+							NULL, &kc_guc_reserve_gate_at, 0, 0, 5,
+							PGC_SUSET, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 
 #ifdef USE_ASSERT_CHECKING
 	DefineCustomEnumVariable("kingres_columnar.fault_point",

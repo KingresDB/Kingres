@@ -8,7 +8,8 @@ import { RouterLink } from 'vue-router'
 import { useQueryClient } from '@tanstack/vue-query'
 import SafeName from './SafeName.vue'
 import { ApiError } from '@/api/problem'
-import { keys, useCluster, useClusterSummary } from '@/api/queries'
+import { keys, useCluster, useClusterSummary, useFailoverStatus } from '@/api/queries'
+import { failoverBanner } from '@/lib/failover'
 import { REBALANCE_REASON_LABEL } from '@/lib/status'
 import { useSessionStore } from '@/stores/session'
 import type { Server } from '@/api/types'
@@ -37,6 +38,13 @@ const knownLeader = computed(() => cluster.data.value?.managerLeader?.serverId ?
 const c = computed(() => cluster.data.value)
 const canSeeRebalance = computed(() => session.can('getRebalanceStatus'))
 const canSeeAlerts = computed(() => session.can('listAlerts'))
+// 0.10.0: a failover that goes on or waits for a person. A role that may not read the status (kingres_stats) asks nothing,
+// and a server that does not know the operation yet shows nothing.
+const canSeeFailover = computed(() => session.isSignedIn && session.can('getFailoverStatus'))
+const failoverStatus = useFailoverStatus(canSeeFailover)
+const failover = computed(() =>
+  canSeeFailover.value ? failoverBanner(failoverStatus.data.value) : null,
+)
 </script>
 
 <template>
@@ -80,6 +88,21 @@ const canSeeAlerts = computed(() => session.can('listAlerts'))
           {{ c.openAlerts.critical + c.openAlerts.warning === 1 ? 'alert' : 'alerts' }} open.
         </strong>
         <RouterLink :to="{ name: 'alerts' }">View alerts</RouterLink>
+      </span>
+    </div>
+    <div
+      v-if="failover"
+      class="banner"
+      :class="`tone-${failover.tone}`"
+      data-testid="banner-failover"
+    >
+      <span aria-hidden="true">{{ failover.icon }}</span>
+      <span>
+        <strong>{{ failover.heading }}</strong>
+        {{ failover.detail }}
+        <RouterLink :to="{ name: 'replication', hash: '#failover-top' }"
+          >Follow the failover</RouterLink
+        >
       </span>
     </div>
     <div v-if="c?.rebalance.running" class="banner tone-info" data-testid="banner-rebalance">

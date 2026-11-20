@@ -29,6 +29,7 @@
 #include "utils/resowner.h"
 #include "utils/snapshot.h"
 #include "access/tupdesc.h"
+#include "port/atomics.h"
 
 #include "pg_compat.h"
 
@@ -55,7 +56,20 @@
  */
 
 #define KC_META_MAGIC		0x4B434D31	/* "KCM1" */
-#define KC_META_VERSION		2
+
+/*
+ * The format version of the metapage decides what a table is.  Version 2 is
+ * what 0.1 wrote: row numbers are assigned when a stripe is written.  Version
+ * 3 (0.2) is a table whose writers may reserve row numbers when a row is
+ * inserted and whose stripe catalog may hold a reserved, not yet written, row
+ * (increment C6a).  This server reads both and writes a new file as version 3
+ * when the stripe catalog has the column that a reserved row needs
+ * (kc_catalog_has_reserved), else as version 2, which is byte for byte what 0.1
+ * writes.  A reservation is made only for a table of version 3.
+ */
+#define KC_META_VERSION_BASE	2
+#define KC_META_VERSION_RESERVE	3
+#define KC_META_VERSION		KC_META_VERSION_RESERVE
 #define KC_PAGE_MAGIC		0x4B43		/* "KC" */
 #define KC_STRIPE_MAGIC		0x4B435331	/* "KCS1" */
 #define KC_STRIPE_VERSION	2
@@ -285,6 +299,9 @@ extern int	kc_guc_write_buffer_kb;
 extern int	kc_guc_max_stripe_rows;
 extern int	kc_guc_orphan_notes_max;
 extern int	kc_guc_truncate_lock_timeout;
+extern bool kc_guc_reserve_rows;
+extern int	kc_guc_reserve_gate;
+extern int	kc_guc_reserve_gate_at;
 
 /* how long a vacuum asks for the exclusive lock of its truncation, as heap does (ms) */
 #define KC_TRUNCATE_LOCK_TIMEOUT	5000
@@ -318,6 +335,8 @@ extern int	kc_stat_compare(const KcColInfo *ci, Datum a, Datum b);
  * ------------------------------------------------------------------------
  */
 extern void kc_rmgr_register(void);
+extern void kc_xlog_logical(Relation rel, uint32 ntuples, const char *data, Size len);
+extern void kc_logical_append_tuple(StringInfo sb, HeapTuple tuple);
 extern void kc_require_rmgr(void);
 extern bool kc_rmgr_registered;
 extern void kc_meta_init_storage(Relation rel, const RelFileLocator *rlocator,
@@ -340,6 +359,7 @@ extern void kc_check_snapshot_age(Relation rel, Snapshot snap);
 extern void kc_meta_read(Relation rel, KcMetaData *out);
 extern void kc_meta_allocate(Relation rel, uint32 nrows, uint64 *stripe_id,
 							 uint64 *first_row);
+extern bool kc_meta_return(Relation rel, uint64 first_row, uint32 nrows);
 extern void kc_meta_set_options(Relation rel, const KcOptions *opts);
 extern void kc_meta_reset(Relation rel);
 extern TransactionId kc_meta_freeze(Relation rel, TransactionId oldest_xmin);
@@ -380,6 +400,7 @@ typedef struct KcAmMemo
 extern KcAmClass kc_am_class(Oid amoid);
 extern KcAmClass kc_am_class_memo(Oid amoid, KcAmMemo *memo);
 extern bool kc_am_is_columnar(Oid amoid);
+extern void kc_am_failed_reset(void);
 extern void kc_am_cache_init(void);
 extern bool kc_rel_is_columnar(Relation rel);
 
@@ -388,6 +409,7 @@ extern bool kc_rel_is_columnar(Relation rel);
 #define KC_GATE_ORPHANS		2
 #define KC_GATE_CLAIMS		3
 extern void kc_check_gate(int which);
+extern void kc_gate_wait(int key);
 extern Snapshot kc_catalog_snapshot(Snapshot snap, bool *is_mvcc);
 extern Snapshot kc_latest_snapshot(void);
 
@@ -408,6 +430,65 @@ extern void kc_catalog_insert(Relation rel, const KcStripeInfo *si,
 							  const char *cid_points, int cid_len,
 							  const char *col_stats, int stats_len, bool frozen,
 							  bool maintenance);
+extern bool kc_catalog_has_reserved(void);
+extern void kc_catalog_insert_reserved(Relation rel, const KcStripeInfo *si);
+extern void kc_catalog_update_reserved(Relation rel, const KcStripeInfo *si,
+									   const char *cid_points, int cid_len,
+									   const char *col_stats, int stats_len);
+extern void kc_catalog_delete_reserved(Relation rel, uint64 stripe_id);
+extern int	kc_catalog_count_reserved(Relation rel, Snapshot snap);
+
+/* who holds a row number, and which numbers are live (uniqueness and index vacuum, C6c) */
+typedef enum KcRowState
+{
+	KC_ROW_NONE,				/* nobody: no row, or its writer aborted */
+	KC_ROW_FOUND,				/* a committed row or this transaction's own */
+	KC_ROW_WAIT					/* a row of a transaction in progress: wait for it */
+} KcRowState;
+typedef struct KcRowRange
+{
+	uint64		first;
+	uint64		end;			/* exclusive */
+} KcRowRange;
+extern KcRowState kc_catalog_probe_row(Relation rel, uint64 row, TransactionId *xwait);
+extern KcRowRange *kc_catalog_live_ranges(Relation rel, TransactionId oldest, uint64 next_row,
+										  int *n_out, uint64 *low);
+extern void kc_reserve_lock(Relation rel, LOCKMODE mode);
+extern void kc_reserve_unlock(Relation rel, LOCKMODE mode);
+extern bool kc_scan_dirty_fetch(Relation rel, ItemPointer tid, Snapshot snap, TupleTableSlot *slot);
+extern void kc_index_vacuum(Relation rel, bool skip, double live_rows, BufferAccessStrategy bstrategy);
+
+/*
+ * Free extents (increment C8).  The blocks of the file that no stripe any snapshot can
+ * still see occupies are listed in the metapage, after KcMetaData: VACUUM finds them (the
+ * complement of the stripe catalog's block ranges, while no writer is running) and a writer
+ * takes a run for its stripe before it extends the file.  A list that is missing, damaged or
+ * full loses space, never data: the next VACUUM works it out again.
+ */
+#define KC_FREE_MAGIC			0x4B434652	/* "KCFR" */
+#define KC_MAX_FREE_EXTENTS		400
+
+typedef struct KcFreeExtent
+{
+	uint32		first;			/* first block, at least 1 */
+	uint32		nblocks;
+} KcFreeExtent;
+
+typedef struct KcFreeList
+{
+	uint32		magic;
+	uint32		count;
+	uint32		crc;			/* CRC-32C of count and the extents, with this field zero */
+	uint32		pad;
+	KcFreeExtent ext[KC_MAX_FREE_EXTENTS];
+} KcFreeList;
+
+extern bool kc_meta_take_extent(Relation rel, uint64 npages, uint64 *first_block);
+extern void kc_meta_free_install(Relation rel, const KcFreeExtent *ext, int n, TransactionId horizon);
+extern void kc_meta_free_trim(Relation rel, BlockNumber nblocks);
+extern int	kc_meta_free_read(Relation rel, KcFreeExtent *out, int cap);
+extern KcRowRange *kc_catalog_live_blocks(Relation rel, TransactionId oldest, int *n_out,
+										  TransactionId *horizon);
 extern int	kc_catalog_delete_uid(uint64 uid);
 extern int	kc_catalog_delete_stripe(uint64 uid, uint64 stripe_id, bool wait);
 extern bool kc_catalog_uid_in_use(uint64 uid);
@@ -428,11 +509,36 @@ extern void kc_footer_free(KcFooter *f);
  * ------------------------------------------------------------------------
  */
 extern void kc_write_init(void);
-extern void kc_write_row(Relation rel, TupleTableSlot *slot, CommandId cid);
+
+/*
+ * The number of a row that has none (a table that does not reserve): its slot
+ * gets the meaningless TID kc_am.c has always given, and a scan of the buffer
+ * shows the same.
+ */
+#define KC_NO_ROW	PG_UINT64_MAX
+
+/*
+ * The most row numbers a table has: a TID holds a block number below the one the
+ * meaningless TID of an unnumbered row uses (MaxBlockNumber - 1) and an offset
+ * of MaxOffsetNumber values, about 8.8 x 10^12 rows.  A row number is a TID
+ * (kc_row_tid), so the allocation of numbers stops here, where it used to stop at
+ * the largest 64-bit number, from which a TID would have wrapped.
+ */
+#define KC_MAX_ROW_NUMBER	((uint64) (MaxBlockNumber - 1) * MaxOffsetNumber)
+
+/* the TID of a row number (design 5.3), the one every reader and the writer use */
+static inline void
+kc_row_tid(uint64 row, ItemPointer tid)
+{
+	ItemPointerSet(tid, (BlockNumber) (row / MaxOffsetNumber),
+				   (OffsetNumber) (row % MaxOffsetNumber) + 1);
+}
+
+extern uint64 kc_write_row(Relation rel, TupleTableSlot *slot, CommandId cid);
 extern void kc_write_rows(Relation rel, TupleTableSlot **slots, int nslots,
-						  CommandId cid);
+						  CommandId cid, uint64 *rownums);
 extern bool kc_write_row_values(Relation rel, Datum *vals, bool *nulls,
-								CommandId cid);
+								CommandId cid, uint64 *rownum);
 extern bool kc_entry_refused(const char *what, const char *name, bool fails_txn);
 extern bool kc_write_refused(Relation rel, const char *what);
 extern bool kc_error_forbidden(void);
@@ -442,6 +548,8 @@ extern int	kc_write_path_count(void);
 extern const char *kc_write_path_get(int i, uint64 *hits);
 extern void kc_write_paths_reset(void);
 extern void kc_write_flush_relation(Relation rel);
+extern void kc_write_prepare_for_workers(Relation rel);
+extern bool kc_write_parallel_blocked(Relation rel);
 extern void kc_write_discard_relation(Oid relid, bool *had_outer);
 extern void kc_write_set_frozen(Relation rel, bool frozen);
 extern void kc_write_set_maintenance(bool on);
@@ -450,6 +558,7 @@ extern void kc_write_note_dropped(Oid relid);
 extern int	kc_write_cleanup_replaced(void);
 extern void kc_write_maintenance_flush(Relation rel);
 extern void kc_write_maintenance_discard(void);
+extern uint64 *kc_write_maintenance_ranges(int *n);
 
 /* the rows [first, nrows) of one buffer: its visible part when the scan began */
 typedef struct KcPendingRef
@@ -465,7 +574,7 @@ extern void kc_write_hold_release(uint64 hold);
 extern void kc_write_hold_check(uint64 hold, Relation rel);
 extern bool kc_write_pending_fetch(Oid relid, const KcPendingRef *ref,
 								   uint32 rowno, Datum **vals, bool **nulls,
-								   int *ncols, CommandId *cid);
+								   int *ncols, CommandId *cid, uint64 *rownum);
 
 /* ------------------------------------------------------------------------
  * kc_scan.c: the serial scan, shared by the access method and custom scan
@@ -483,9 +592,40 @@ typedef struct KcScanStats
 	uint64		bytes_read;
 } KcScanStats;
 
+/*
+ * The state a parallel columnar scan shares (design 8.4), in the dynamic
+ * shared memory segment of the query: the index of the next stripe to take,
+ * a fingerprint of the stripe list the leader read (every participant reads
+ * the list itself with the same snapshot, and must have read the same one),
+ * and one slot of counters per participant (slot 0 is the leader, slot 1 + n
+ * is parallel worker n), which only its owner writes.
+ */
+typedef struct KcParStat
+{
+	uint64		stripes_total;
+	uint64		stripes_skipped;
+	uint64		groups_total;
+	uint64		groups_skipped;
+	uint64		bytes_read;
+	uint64		rows;
+} KcParStat;
+
+typedef struct KcParallel
+{
+	pg_atomic_uint64 next;		/* next index into the stripe list to take */
+	uint64		fingerprint;	/* of the leader's list of stripes */
+	uint32		nstripes;		/* its length */
+	int			nslots;
+	KcParStat	stats[FLEXIBLE_ARRAY_MEMBER];
+} KcParallel;
+
+#define KcParallelSize(nslots) \
+	(offsetof(KcParallel, stats) + sizeof(KcParStat) * (Size) (nslots))
+
 typedef struct KcScan
 {
 	TableScanDescData base;		/* must be first */
+	KcParallel *shared;			/* the stripes are taken from here (NULL: all of them) */
 	Relation	rel;
 	Snapshot	cat_snap;		/* snapshot for catalog reads (may be a copy) */
 	CommandId	curcid;
@@ -498,6 +638,7 @@ typedef struct KcScan
 
 	KcStripeInfo *stripes;
 	int			nstripes;
+	uint64		list_epoch;		/* kc_flush_epoch when the list was read */
 	int			stripe_idx;		/* next stripe to open */
 
 	/* the open stripe */
@@ -545,6 +686,17 @@ typedef struct KcScan
 /* a scan flag of the extension itself, outside the SO_ bits of PostgreSQL */
 #define KC_SCAN_MAINTENANCE	(1 << 30)
 
+/*
+ * The scan may begin in a parallel worker: set by the custom scan, whose
+ * leader made the rows of its transaction visible to workers before they
+ * started (kc_write_prepare_for_workers).  Any other scan in a worker is
+ * refused.
+ */
+#define KC_SCAN_PARALLEL_OK	(1 << 29)
+
+/* the scan is for index fetches by row number: it holds no write buffer (kc_scan_fetch_row) */
+#define KC_SCAN_FETCH	(1 << 28)
+
 extern KcScan *kc_scan_begin(Relation rel, Snapshot snapshot,
 							 const bool *needed, struct KcSkip *skip,
 							 int flags);
@@ -554,8 +706,19 @@ extern void kc_scan_end(KcScan *scan);
 extern void kc_scan_drop_hold(KcScan *scan);
 extern uint64 kc_scan_stripe_for_block(KcScan *scan, BlockNumber blk,
 									   int *idx);
+extern uint64 kc_scan_fingerprint(const KcScan *scan);
+extern void kc_scan_attach(KcScan *scan, KcParallel *shared);
 extern bool kc_scan_analyze_block(KcScan *scan, Buffer buf);
 extern bool kc_scan_analyze_next(KcScan *scan, TupleTableSlot *slot);
+extern bool kc_scan_fetch_row(KcScan *scan, uint64 row, TupleTableSlot *slot);
+
+/* flushes of stripes in this backend: a scan that fetches by number re-reads its stripe list when it changed */
+extern uint64 kc_flush_epoch;
+extern bool kc_write_pending_by_number(Oid relid, uint64 uid, uint64 row, Datum **vals,
+									   bool **nulls, int *ncols, CommandId *cid);
+extern void kc_write_flush_for_index(Relation rel);
+extern bool kc_write_has_unwritten(Relation rel);
+extern bool kc_rel_reserves(Relation rel);
 
 /* ------------------------------------------------------------------------
  * kc_skip.c: min/max skipping

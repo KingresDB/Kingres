@@ -293,6 +293,13 @@ export function syncLedgerAlerts(s: MockState): void {
     'The ledger cannot sign checkpoints',
     l.signing.signerAlarm ?? 'No checkpoint could be signed.',
   )
+  set(
+    l.publishedStateAlarm,
+    { kind: 'ledgerSignerUnavailable', aspect: 'published-state' },
+    'critical',
+    'The system database is older than what was published',
+    'Nothing is signed: the system database is older than what the ledger published.',
+  )
   for (const rec of s.databases.filter(hasLedger)) {
     const name = rec.info.name
     set(
@@ -309,7 +316,9 @@ export function syncLedgerAlerts(s: MockState): void {
         { kind: 'ledgerChainDiverged', databaseName: name, shardGroupId: g },
         'critical',
         `The chain of group ${g} of ${name} diverged`,
-        'The chain no longer extends its published log.',
+        l.divergedWhy
+          ? `The chain no longer extends its published log: ${l.divergedWhy}.`
+          : 'The chain no longer extends its published log.',
       )
     }
     const last = groups[groups.length - 1] as number

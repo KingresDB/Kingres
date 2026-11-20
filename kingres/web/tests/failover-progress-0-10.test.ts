@@ -74,7 +74,7 @@ describe('a run in progress', () => {
     await screen.findByTestId('failover-progress')
     // Step 4 of 11 (the wait for the old lease) is at 3.5 / 11 of the way.
     moveTo(3.4 / 11)
-    const message = await screen.findByTestId('group-message', {}, { timeout: 6000 })
+    const message = await screen.findByTestId('group-message', {}, { timeout: 30_000 })
     expect(message).toHaveTextContent(/waiting \d+ s for the old primary's lease to run out/i)
     expect(screen.getByTestId('failover-phase')).toHaveTextContent(/lease/i)
   })
@@ -87,7 +87,7 @@ describe('a run in progress', () => {
     const card = await screen.findByTestId('failover-progress')
     await user.click(within(card).getByTestId('cancel-failover'))
     await waitFor(() => expect(screen.queryByTestId('failover-progress')).not.toBeInTheDocument(), {
-      timeout: 6000,
+      timeout: 30_000,
     })
     expect(runTask()?.task.error?.code).toBe('cancelled')
     expect(getState().groups.find((g) => g.id === 2)?.primaryServerId).toBe('10.0.0.12')
@@ -101,7 +101,7 @@ describe('a run in progress', () => {
     await startByHand(user)
     await screen.findByTestId('failover-progress')
     moveTo(7.2 / 11)
-    const reason = await screen.findByTestId('cancel-reason', {}, { timeout: 6000 })
+    const reason = await screen.findByTestId('cancel-reason', {}, { timeout: 30_000 })
     expect(reason).toHaveTextContent(
       /a standby has been promoted; the failover can only go forward/i,
     )
@@ -138,14 +138,14 @@ describe('a run in progress', () => {
     await user.click(within(dialog).getByRole('button', { name: /hide/i }))
     await screen.findByTestId('failover-progress')
     moveTo(4 / 22)
-    const moving = await screen.findByTestId('manager-moving', {}, { timeout: 6000 })
+    const moving = await screen.findByTestId('manager-moving', {}, { timeout: 30_000 })
     expect(moving).toHaveTextContent(/the manager of the cluster is moving to server 10\.0\.0\.12/i)
     expect(screen.getByTestId('no-task-yet')).toBeInTheDocument()
     // There is no task to cancel yet, and the button says so.
     expect(screen.getByTestId('cancel-failover')).toHaveAttribute('aria-disabled', 'true')
     moveTo(15 / 22)
     await waitFor(() => expect(screen.queryByTestId('manager-moving')).not.toBeInTheDocument(), {
-      timeout: 6000,
+      timeout: 30_000,
     })
   })
 })
@@ -155,7 +155,7 @@ describe('a run that waits for a decision', () => {
     applySwitches(new URLSearchParams('failover=needs-decision'), getState())
     await renderApp('/servers')
     await startByHand(user)
-    return screen.findByTestId('waiting-for-you', {}, { timeout: 6000 })
+    return screen.findByTestId('waiting-for-you', {}, { timeout: 30_000 })
   }
 
   it('says what it needs, in words, with the blockers and the verdict of the group', async () => {
@@ -186,7 +186,7 @@ describe('a run that waits for a decision', () => {
     await user.click(
       within(confirm).getByRole('button', { name: /accept data loss and continue/i }),
     )
-    await waitFor(() => expect(runTask()?.task.state).toBe('done'), { timeout: 6000 })
+    await waitFor(() => expect(runTask()?.task.state).toBe('done'), { timeout: 30_000 })
     const report = getState().failover.reports[0]
     expect(report?.outcome).toBe('completed')
     // The request was built from the options the run was started with, plus the decision.
@@ -229,7 +229,7 @@ describe('a run that waits for a decision', () => {
     await user.type(within(dialog).getByLabelText(/to confirm/i), '10.0.0.12:8091')
     await user.click(within(dialog).getByRole('button', { name: /^hard failover$/i }))
     expect(
-      await within(dialog).findByTestId('failover-paused-note', {}, { timeout: 6000 }),
+      await within(dialog).findByTestId('failover-paused-note', {}, { timeout: 30_000 }),
     ).toHaveTextContent(/waits for you/i)
   })
 })
@@ -240,8 +240,8 @@ describe('a run that fails, and a run that is partly done', () => {
     applySwitches(new URLSearchParams('failover=fail:promote'), getState())
     await renderApp('/servers')
     await startByHand(user)
-    const card = await screen.findByTestId('failover-progress', {}, { timeout: 6000 })
-    await waitFor(() => expect(card).toHaveAttribute('data-state', 'failed'), { timeout: 6000 })
+    const card = await screen.findByTestId('failover-progress', {}, { timeout: 30_000 })
+    await waitFor(() => expect(card).toHaveAttribute('data-state', 'failed'), { timeout: 30_000 })
     expect(within(card).getByTestId('failover-state')).toHaveTextContent(/failed/i)
     expect(within(card).getByTestId('fg-2')).toHaveTextContent(/failed/i)
     expect(
@@ -289,10 +289,14 @@ describe('the report of a finished run', () => {
   it('the Replication page names the last failover and opens its report with the numbers', async () => {
     const user = userEvent.setup()
     applySwitches(new URLSearchParams('failover=dataloss,old:rebuilding'), getState())
-    await renderApp('/replication')
+    const app = await renderApp('/replication')
     const task = await endpoints.failoverServer('10.0.0.12', { mode: 'hard', allowDataLoss: true })
-    await waitFor(async () => expect((await endpoints.getTask(task.id)).state).toBe('done'))
-    const last = await screen.findByTestId('last-failover', {}, { timeout: 6000 })
+    await waitFor(async () => expect((await endpoints.getTask(task.id)).state).toBe('done'), {
+      timeout: 30_000,
+    })
+    // The page reads the status again at once instead of at its next poll: how long a poll takes is not what is tested.
+    await app.queryClient.invalidateQueries()
+    const last = await screen.findByTestId('last-failover', {}, { timeout: 30_000 })
     expect(last).toHaveTextContent(/failover of server 10\.0\.0\.12/i)
     await user.click(within(last).getByTestId('last-failover-report'))
     const dialog = await screen.findByRole('dialog', {

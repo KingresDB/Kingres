@@ -60,6 +60,8 @@ type haDeps struct {
 	// LeaseMgr is the lease manager (nil until startLeases ran); EntryDestination says where the
 	// client entry point sends a new connection now (nil without an entry point).
 	LeaseMgr *lease.Manager
+	// MapFailover is the server's part of the failover of the map group (nil without an internal API).
+	MapFailover *mapFailover
 	// Watchdogs are the watchdogs of the primary instances of this server (nil until startLeases ran).
 	Watchdogs        *watchdogs
 	EntryDestination func(ctx context.Context) string

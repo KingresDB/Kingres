@@ -284,7 +284,7 @@ func (s *Service) stepGenerate(ctx context.Context, env *task.Env) error {
 			return nil, err
 		}
 		// The file this task wrote just before it was killed.
-		if fp, err := s.cfg.Keyring.Orphan(known, env.Task.CreatedAt, s.cfg.MaxClockSkew); err == nil && fp != "" {
+		if fp, err := s.cfg.Keyring.Orphan(known, env.Task.CreatedAt, s.cfg.MaxClockSkew, env.Task.ID); err == nil && fp != "" {
 			if pub, err := s.cfg.Keyring.PublicOf(fp); err == nil {
 				if set, err := v.set.AddChecked(pub, "", t, origins...); err == nil {
 					return &Change{Cluster: &cl, Keys: rows(v.snap.Keys, set, taskID, fp)}, nil
@@ -503,12 +503,14 @@ func (s *Service) stepRetire(ctx context.Context, env *task.Env) error {
 		// The bound was decided in the first step from the checkpoints stored then. A key whose event exists is not offered for signing any more
 		// (Publication), so no checkpoint of this key can be above it; a checkpoint above it that is stored anyway (a signer that was loaded before the event) is
 		// refused here, under the term guard, and the retirement does not happen (P7-01).
-		max, err := s.cfg.Store.MaxCheckpointSize(ctx)
+		// The refusal is about the checkpoints that this key signed (P8-02): the other key keeps signing after the event and the logs grow, so
+		// the largest tree of the cluster says nothing about the key that retires.
+		max, err := s.cfg.Store.MaxCheckpointSizeSignedBy(ctx, k.Public)
 		if err != nil {
 			return nil, err
 		}
 		if max > size {
-			return nil, &coded{code: "bound_exceeded", msg: fmt.Sprintf("a checkpoint of size %d was stored after the bound %d of the retirement was decided", max, size)}
+			return nil, &coded{code: "bound_exceeded", msg: fmt.Sprintf("a checkpoint of size %d signed by the retiring key was stored after the bound %d of the retirement was decided", max, size)}
 		}
 		set, err := v.set.Retire(in.Fingerprint, recordTime(v.set, now), ledgerkeys.AtMost(size))
 		if err != nil {
@@ -520,7 +522,7 @@ func (s *Service) stepRetire(ctx context.Context, env *task.Env) error {
 		}
 		cl := v.snap.Cluster
 		cl.TrustFile = trust
-		return &Change{Cluster: &cl, Keys: rows(v.snap.Keys, set, 0, ""), CheckpointBound: &size}, nil
+		return &Change{Cluster: &cl, Keys: rows(v.snap.Keys, set, 0, ""), CheckpointBound: &size, BoundKey: k.Public}, nil
 	})
 }
 

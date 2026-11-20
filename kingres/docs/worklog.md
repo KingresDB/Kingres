@@ -7,6 +7,576 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-20: automatic failover, the last steps of phase 2b and their review, the second review of phase 9 and its fixes, and two npm alerts
+
+Covers 2026-11-20 from the morning, after the third entry of 2026-11-19.
+
+### What was done
+
+- **Phase 2b, steps 7 to 13** (2395ed9d98, d36744004b). Step 7 (partial
+  aggregation) and the rest of the review of step 5, with a crash under
+  `debug_discard_caches`. Steps 8 to 12: objects of extensions
+  (`kingres_sketch`), sort and limit by the groups, the join of tables
+  placed together done by the groups, the README for pushdown and a
+  security round. They add no SQL object and ship in 0.7. An
+  independent review of steps 6 to 12
+  ([reviews/2026-11-20-kingres-shard-phase2b-steps-6-12.md](reviews/2026-11-20-kingres-shard-phase2b-steps-6-12.md))
+  compared about 13 000 statements with a single node on both majors and
+  found one critical finding, P2E-01: a `HAVING` condition without an
+  aggregate was applied by nobody on the partial aggregation and the
+  join rows. Those paths are refused for such a statement and the scan
+  answers. The other findings are fixed as well: `TABLESAMPLE` of a
+  distributed table is refused; the older tests also run with every path
+  on; tests separate rules that no test separated; and the README is
+  corrected. Step 13 adds the remaining tests of the plan, KS001 for a
+  node that does not have an extension the statement uses, and a fixed
+  order of ties by group id. One of its tests found a crash of a group
+  (a prepared statement with a sketch aggregate, run again in the same
+  session, read a list of the previous statement), which is fixed. The
+  review of step 13
+  ([reviews/2026-11-20-kingres-shard-phase2b-step-13.md](reviews/2026-11-20-kingres-shard-phase2b-step-13.md))
+  found no wrong answer in 5120 generated statements per major and no
+  critical or high defect. Its three medium findings are fixed on a
+  branch and come with the next batch: a node that never had the
+  extension got PostgreSQL's own error, not KS001; one test never reached
+  the conversion it tested; the ledger test did not use the pushdown
+  paths. Notes in [design/shard-phase2b.md](design/shard-phase2b.md).
+- **Phase 9.** A second independent review
+  ([reviews/2026-11-20-kingres-shard-phase9-rebuild.md](reviews/2026-11-20-kingres-shard-phase9-rebuild.md))
+  of the online rebuild engine and of the fixes for the first review
+  found that P9A-01 holds and found two high defects: a function of a
+  role that is not a superuser, reached through a domain or an operator
+  of the table, ran as a superuser during the copy; and the capture lost
+  float keys when the writer's `extra_float_digits` was below 1. Four
+  medium, four low and three notes. All are fixed with tests t/180 to
+  t/184 (933025b5d0). Notes in [design/shard-phase9.md](design/shard-phase9.md).
+- **Failover, increment 6** (1f868cc33d): automatic failover, off by
+  default, with its rules and a counter. Two test faults found by a
+  complete run (00bf7ef2f5).
+- **npm alerts** (2480e640e6, 57bc832d6d): `minimatch` in the console's
+  build tools raised to 11.x through an override, and `yaml` in the
+  contract check raised to 2.8.3. Both alerts were moderate and in tools,
+  not in what runs.
+
+### How it was verified
+
+Run by the integrator on the tree that was committed, unless it says
+otherwise.
+
+- `kingres_shard`, steps 9 and 10 (268a81d93f): 38413 tests on 18.7 and
+  39148 on 19rc2 (155 files), in tree 198 of 198. The combined tree of
+  steps 8 to 13, their fixes and the fixes of phase 9: 43317 tests on
+  18.7 and 44022 on 19rc2 (169 files), in tree 212 of 212. The first run
+  on 19 met another run's install of the extension in the shared
+  PostgreSQL install and was repeated with a private copy; every run now
+  installs into its own copy. The 2b
+  writer ran the second profile (every path on) of the ten older tests
+  on both majors; the phase 9 writer ran t/140 to t/150 and t/180 to
+  t/184 on both.
+- `kingresd` at 00bf7ef2f5 (gate7): a complete integration run on each
+  major against the committed extensions. On 18, 1523 top-level tests
+  passed and 2 failed; on 19, 1524 passed and 1 failed. The failover and
+  takeover tests passed twice more on each major (24 of 24 each time).
+  The three failures are faults of the tests: `TestClientEntryPoint`
+  read through the entry point too soon after the cluster formed (seen
+  once before; then 10 of 10 alone);
+  `TestAReleaseWaitsForTheRenewalInFlight` waited 5 s for a renewal on a
+  loaded machine (then 10 of 10 alone); and a failover test on 19 resumed a paused
+  task at once after the heal, while `kingresd` read its fault file at
+  most every 100 ms and still saw the pause. The same cause explains the
+  timeouts "in two of twelve runs" of the last entry. Build for both
+  systems, vet, format and 57 unit packages on Windows after increment 6.
+- The console after the npm change: lint, the type check, the build and
+  1455 tests; the contract check passes.
+
+### Decisions and deviations
+
+- **P2E-01 is fixed by refusal**, not by putting the moved conditions
+  into the shipped `WHERE`, which would need `flatten_group_exprs` on
+  both majors. `HAVING <grouping column>` is answered by the scan.
+- **`TABLESAMPLE` of a distributed table is refused**: a sample spread
+  over groups is a different random draw from a single node's, and
+  `REPEATABLE` would not repeat.
+- **KS001 for a missing extension is raised by the node that sent the
+  fragment**, not by the group: PostgreSQL analyses the `DECLARE` before
+  any hook of the extension.
+- **P9B-01 is fixed by refusal**: a table that reaches code of a role
+  that is not a superuser cannot be distributed by these calls, also
+  when the function is `SECURITY DEFINER`.
+- **P9B-11 stays**: the check after the switch cannot see a loss once the
+  table is written after the swap; the call warns and the README says so.
+- **The push of 2026-11-20** stopped at 54b3938a88, the last commit
+  before phase 9, while the two high findings of phase 9 were open.
+
+### Still open
+
+- **Pushes.** This entry is pushed to kingres-18 with the commits it
+  names, and kingres-19 is synchronized after it. Next batch: the fixes
+  for the review of step 13 and phase 9 increment 9.4 (undistribute and
+  alter, blocking and online), then switchover (failover increment 7,
+  round 1) after a complete integration run of the control plane.
+- **The console** is generated from contract 0.12.0; the contract is
+  0.13.0, and switchover changes its text again. One round brings the
+  console to the newest contract after the switchover work.
+- **npm audit** of the console still lists a moderate advisory of `glob`
+  whose only fix downgrades `@vue/test-utils`.
+- **Reviews owed**: step 13 of phase 2b, failover increments 4 to 7, the
+  publication and anchoring, `kingres_timepart` 0.2, columnar C5 to C8,
+  the verifier's anchors, the console, packaging.
+- **In progress**: switchover (failover increment 7, round 1 built),
+  phase 9 increment 9.4 (blocking undistribute and alter built, online
+  forms next), phase 7 steps 17 and 20.
+- `kingres_columnar` uses `RM_EXPERIMENTAL_ID` for its WAL; a custom id
+  must be reserved before a release.
+
+### Core patches
+
+None.
+
+---
+
+## 2026-11-19 (third entry): the review and the rebuild engine of phase 9, the fixes for the review of step 5 of phase 2b, the failover of the map group, the verifier's anchors, and columnar indexes up to logical decoding and reuse of free space
+
+Covers the evening of 2026-11-19 and the night to 2026-11-20, after the
+second entry.
+
+### What was done
+
+- **Phase 9.** An independent review of increments 9.1 and 9.2
+  ([reviews/2026-11-19-kingres-shard-phase9-increments-1-2.md](reviews/2026-11-19-kingres-shard-phase9-increments-1-2.md),
+  6bffb374d6) found one critical finding, P9A-01:
+  rows written while `create_distributed_table` of a filled table ran
+  could be lost. The fixes (3ff98847ec) race a writer against the call in
+  each test. A call in `REPEATABLE READ` or `SERIALIZABLE` is refused,
+  and a statement that touches a plain table and a distributed table
+  together keeps a narrow window, which the design names. The same
+  commit holds increment 9.3, the online rebuild engine with
+  `create_distributed_table_concurrently`. Notes in
+  [design/shard-phase9.md](design/shard-phase9.md).
+- **Phase 2b.** The fixes for the review of step 5 (2eed174ef1): the
+  findings P2D-01 to P2D-06 are fixed with tests, and the part of a
+  statement that runs on the coordinator is no longer planned a second
+  time before it runs.
+- **Failover, increment 5** (8135c4b66e, REST contract 0.13.0): a
+  failover of the server that holds the primary of the map group,
+  answered by any member that cannot hear the leader, with a bootstrap
+  journal that survives a restart of `kingresd`. The open items of the
+  third review (F3-05, F3-08, F3-09, F3-10) have cluster tests now. The
+  key of the certificate authority is not escrowed; a new leader without
+  it raises `certificateAuthorityUnavailable`. Notes in
+  [design/ha-phase5-part2.md](design/ha-phase5-part2.md).
+- **Phase 7 in `kingresd`** (559c33b22c): the publication of a dropped
+  database, kill tests, retention and clock warnings and evidence files.
+  Corrections 187 to 189 and 204 to 206 of
+  [design/ledger-phase7.md](design/ledger-phase7.md).
+- **The verifier** (9e79ea83d3, 50b7cbf8cf): the fixes for its eighth
+  review (V8-01 to V8-12), `logs.json`, and the reading of anchors
+  (phase 7, steps 11, 13 and 15). Corrections 190 to 203.
+- **Phase 12.** `kingres_columnar` 0.2: unique indexes, primary keys and
+  index vacuum (C6c, d35f611dae), compaction of an indexed table (C6d,
+  c33794b4c5), logical decoding of inserts (C7, ad9d1a334d) and reuse of
+  free space in the file (C8, 3d83cc28c2). `kingres_timepart` 0.2
+  converts partitions whose table has indexes (a3499aa2fc). Notes in
+  [design/analytics-phase12-storage.md](design/analytics-phase12-storage.md).
+- **Packaging** (5ef0cda036): the new versions of the extensions, and
+  `kingres_columnar` in `shared_preload_libraries`.
+- **The console** (3defb54c2f, a67d13f916): no test depends on the speed
+  of the machine any more.
+- **Two tests found by a complete integration run**, both faults of the
+  test, not of the product: the freeze test lifted a freeze without the
+  task that holds it, which is refused since F3-14; and the test of the
+  settings validator set `statement_timeout` to 1 ms and then read it in
+  a second statement, which that timeout cancelled under load.
+
+### How it was verified
+
+Run by the integrator on the tree that was committed, unless it says
+otherwise.
+
+- `kingres_shard` with the fixes of step 5: 28027 tests on 18.7, 28698 on
+  19rc2, in tree 180 of 180. With phase 9 (9.1 to 9.3 and the fixes):
+  29086 and 29811, in tree 187 of 187.
+- `kingres_columnar` C7 and C8: in tree 65 of 65 twice, 11047 tests on
+  19rc2.
+- `kingresd` with increment 5: build for both systems, vet, format, 57
+  unit packages on Windows, the contract check. A complete integration
+  run of a14774e45f with the extensions of 8135c4b66e: 1496 top-level
+  tests passed and 2 failed on 18, 1497 passed and 1 failed on 19; the
+  failures are the two tests above. The rebalance tests passed three
+  times on 19 and once on 18. The ledger cluster tests of phase 7 passed
+  386 of 386 on 18 and on 19; one failure in a second run on 18 was fixed
+  by 559c33b22c, and the complete run above passed that test.
+- The verifier: 496 tests twice on Linux and a full byte sweep, the race
+  detector, 27 packages on Windows. The panel: 1455 tests, the build.
+
+### Decisions and deviations
+
+- **C8 takes a lock** in `VACUUM` instead of walking the pages, which the
+  design asked for; accepted, the reason is in the design notes.
+- **Ledger correction 213**: `common-height` may be "unknown" in an epoch
+  event, and the verifier must accept it and not rely on it.
+- **Migrations** 0033 and 0034 belong to phase 7; failover increment 6
+  starts at 0035.
+
+### Still open
+
+- **Pushes.** GitHub holds bfda9e8842 (18) and 91fcbffef0 (19). The head
+  is pushed after a complete integration run of it on both majors with
+  the two test fixes.
+- **Reviews owed**: failover increments 4 and 5 with the F3 fixes, the
+  publication and anchoring, steps 6 and later of phase 2b,
+  `kingres_timepart` 0.2, columnar C5 to C8, the verifier's anchors, the
+  console, packaging, increment 9.3 and the fixes of phase 9.
+- **In two of twelve runs** the last step of two failover tests (resuming
+  a paused failover after the heal) timed out; the cause is being looked
+  for.
+- `kingres_columnar` uses `RM_EXPERIMENTAL_ID` for its WAL; a custom id
+  must be reserved before a release.
+
+### Core patches
+
+None.
+
+---
+
+## 2026-11-19 (second entry): anchoring, the fixes for the reviews of the publication and of the manual failover, closed queries in phase 2b, the first increments of phase 9, conversion of partitions and indexes on columnar tables, and the last console parts
+
+Covers the morning and the afternoon of 2026-11-19, after the first entry.
+
+### What was done
+
+- **Phase 7 in `kingresd`.** The fixes for the review of the collector
+  and the publication (68f1b4f91f, P8-01 to P8-10): every holder of the
+  key files keeps a record of what was published outside the system
+  database, and a database that is behind it signs nothing; a retirement
+  is refused only for checkpoints the retiring key signed; a database
+  counts as vanished after 30 minutes. Anchoring, steps 10, 12 and 14
+  (02bd0e1168, 04b26dd13c, 4c5efc047d): the framework and the three
+  kinds of target, a WORM object store, an RFC 3161 time-stamp authority
+  and OpenTimestamps. Corrections 171 to 186 of
+  [design/ledger-phase7.md](design/ledger-phase7.md).
+- **Failover.** The fixes for the review of increment 3 (4574d26244,
+  F3-01 to F3-15, REST contract 0.12.0): among them a failed failover no
+  longer takes the lease from the primary it promoted, an old primary
+  whose fencing cannot be proved refuses the failover, the verdict about
+  lost writes counts only silence a majority shares, and a failover and
+  a change of the databases exclude each other. The lease code no longer
+  leaves requests in flight after a release. Notes in
+  [design/ha-phase5-part2.md](design/ha-phase5-part2.md). The first piece
+  of increment 5 (the journal of a bootstrap of the map group,
+  bed0881cc3) is used by nothing yet.
+- **Phase 2b, step 6** (4de9c4ce9d): a read whose result every shard
+  group can compute by itself is run whole by each group, and the
+  coordinator only unites, sorts and limits. The same commit holds the
+  fixes for the two medium findings of the review of steps 3 and 4 (a
+  key with a type modifier, and wide rows in the source of an
+  `INSERT ... SELECT`).
+- **Phase 9, increments 9.1 and 9.2** (8fa976c577, `kingres_shard` 0.7):
+  a report of what prevents a change of a table, and
+  `create_distributed_table` of a table that already holds rows. Notes
+  in [design/shard-phase9.md](design/shard-phase9.md).
+- **Phase 12.** `kingres_timepart` 0.2 (554a81bc4c): old partitions are
+  converted to columnar storage and back, by hand or by a policy.
+  `kingres_columnar`: a parallel scan (0ba0e045d3), and version 0.2 with
+  row numbers reserved at insert time (75d62f13a1) and B-tree indexes
+  that are not unique (65e050e5b1). Notes in a new section 21 of
+  [design/analytics-phase12-storage.md](design/analytics-phase12-storage.md).
+- **The console.** It follows contract 0.12.0; the failover console is
+  complete (part 2: the automatic settings, the counter and the banner;
+  part 3: switchover of a group and the restore of preferred primaries);
+  the Ledger page has the tabs for anchoring and for client keys and the
+  dialogs for bundles, the acknowledgement of a diverged chain and the
+  audit of the publication.
+- **Reviews**, one at a time: step 5 of phase 2b
+  ([reviews/2026-11-19-kingres-shard-phase2b-step-5.md](reviews/2026-11-19-kingres-shard-phase2b-step-5.md):
+  no shipped statement answered differently from a single node in 3600
+  generated statements apart from `FROM ONLY`; two medium findings) and
+  the verifier
+  ([reviews/2026-11-19-kingres-verifier-publication-and-client-signatures.md](reviews/2026-11-19-kingres-verifier-publication-and-client-signatures.md):
+  no input made it accept a wrong checkpoint, tile, proof or signature;
+  four medium findings, the largest that a verified revocation of the
+  signing key changes nothing in most commands). Its short check of the
+  ledger extension found the three mutants of the last review of client
+  signatures killed now.
+- **A check of phases 12 and 13 against their designs** (not committed;
+  its result is in the README): phase 13 is built apart from two
+  warnings of the preview and five integration tests; of phase 12 only
+  the three extensions exist.
+
+### How it was verified
+
+Run by the integrator on the tree that was committed, unless it says
+otherwise.
+
+- `kingres_shard` 0.7 with step 6: PostgreSQL 18.7, 18 regression tests
+  and 133 TAP files with 27732 tests; 19rc2, 28461 tests; in tree on 18
+  with assertions 173 of 176 on a loaded machine, and the three (two
+  timing sweeps and the bulk memory test that ran into its time limit)
+  passed alone. Phase 9 alone before it: 20672 and 21377 tests; the one
+  in-tree failure was a test that lost its include paths when it started
+  itself again under a memory limit, fixed.
+- `kingres_columnar`: in tree 47 of 47 twice (parallel scan), 53 of 53
+  twice (reservation), 55 of 55 (indexes; in a first run one assertion
+  of the backup test of an earlier round failed and the test passed
+  three times alone); on 19rc2 43, 50 and 52 TAP files with 10373, 10716
+  and 10740 tests. `kingres_timepart` 0.2: in tree 12 of 12 twice, on
+  19rc2 16 regression tests and 8 TAP files with 491 tests, again after
+  `kingres_columnar` 0.2.
+- `kingresd`: build for both systems, vet, format, 54 to 56 unit packages
+  on Windows and the contract check at each commit. On clusters: the two
+  failover tests that failed in the complete run passed five times on 18
+  and three times on 19; the rebalance takeover test three times on 19;
+  the cluster tests that use distributed tables with the extension of
+  step 5 passed 26 of 26 on 18 and 25 of 26 on 19 (see "Still open").
+- The panel: 87 to 90 test files with 1381 to 1455 tests at each commit,
+  the browser tests 3 files with 46, type check, lint, the contract and
+  brand checks and the build. On a heavily loaded machine one to four
+  tests that wait for the page failed, a different one in each run; a
+  run on a quieter machine passed all.
+
+### Decisions and deviations
+
+- **Version numbers.** `kingres_shard` 0.7 is phase 9; `kingres_timepart`
+  0.2 and `kingres_columnar` 0.2 change SQL objects and have upgrade
+  scripts. No release exists, so nothing is renumbered.
+- **The console follows the server where the server and the design
+  differ**, for anchoring in particular (member names and limits of the
+  targets, a credentials file, removal of stored credentials).
+- **Indexes on columnar tables in four parts**, decided where the design
+  is silent: a stripe's worth of row numbers is reserved per buffer; a
+  subtransaction that commits writes a reserving buffer as a stripe of
+  its own; compaction of an indexed table will rebuild its indexes; no
+  bitmap or index-only scans.
+- **A cluster batch holds the machine-wide lock of the integration runs**
+  for hours. Writers now queue one batch per round and wait for it.
+
+### Incidents on the build machine
+
+- **A weekly usage limit stopped every writer and reviewer twice** in the
+  afternoon, in the middle of their work; their trees kept what they had
+  written, and they were resumed from where they stopped. Until the limit
+  resets the integrator verifies and commits alone.
+- **A restart of the session lost the record of four background runs**
+  while their processes went on; they were found alive and followed by
+  new watchers.
+- **One writer started a cluster test without the lock of the
+  integration runs**; the lock is now named in every brief.
+
+### Still open
+
+- **Pushes.** Nothing of this day is on GitHub yet. The cluster test
+  `TestRebalance` failed once on 19 with the extension of step 5 ("a move
+  that fails is retried": the run after it paused because
+  `check_cluster()` reported `catalog_differs` on two nodes); it is being
+  repeated alone. The first batch (up to bfda9e8842) is pushed when that
+  is explained; the rest after a complete integration run of the head on
+  both majors.
+- **Reviews owed**: failover increment 4 with the F3 fixes, the fixes for
+  the publication and anchoring, phase 9 (its review was stopped by the
+  usage limit), step 6 of phase 2b, `kingres_timepart` 0.2, the parallel
+  scan and the indexes of `kingres_columnar`, the console parts.
+- **Open findings**: P2D-01 to P2D-06 of step 5 (a `reg*` parameter or
+  array shipped as a name; `FROM ONLY`; `debug_discard_caches`;
+  `place=0`); V8-01 to V8-12 of the verifier; P2C-05, P2C-06 and the
+  replanning hazard of the local part of a write in phase 2b; the reset
+  of identity sequence options by `create_distributed_table`.
+- **Being built when the writers stopped**: failover increment 5 (the map
+  group), the remaining items of phase 7 (the measurement of blocks of a
+  quiet database, the fixture of a whole publication, kills inside a
+  round, the retention warnings), the rebuild engine of phase 9 (9.3),
+  unique indexes and index vacuum of `kingres_columnar`, the fixes of the
+  verifier and its reading of anchors, step 7 of phase 2b.
+- **Phase 12 outside the extensions** (contract, control plane, console,
+  the parts in `kingres_shard`) and phases 10 and 11 are not started.
+
+### Core patches
+
+None.
+
+---
+
+## 2026-11-19 (first entry): the row router and the colocated INSERT ... SELECT of phase 2b, the old primary back as a standby, the keys, the collector and the publication of the ledger, and the verifier that reads them
+
+Covers the evening of 2026-11-18 and the night and early morning of 2026-11-19, up to the step 5 of phase 2b and its review of steps 3 and 4 (bfda9e8842).
+
+### What was done
+
+- **Phase 2b, steps 3 and 4 of thirteen** (f6484e3dfa; notes in
+  [design/shard-phase2b.md](design/shard-phase2b.md) under "Steps 3 and
+  4"): a multi-row `INSERT`, an `INSERT ... SELECT` and `COPY FROM` that
+  load rows for several shard groups are routed row by row, in bounded
+  memory, in one distributed transaction. The same commit holds the
+  fixes for the review of steps 1 and 2 (P2B-01 to P2B-09) and for the
+  sixth review of the call sequences (S14-01 to S14-08, report
+  [reviews/2026-11-18-kingres-shard-0.5-sixth-sequences.md](reviews/2026-11-18-kingres-shard-0.5-sixth-sequences.md)).
+- **`kingres_shard` 0.6** (be308c7e12): a version with no change of a
+  table, a view or a signature, made before the remaining steps of the
+  phase (see "Decisions").
+- **Phase 2b, step 5** (7aa46ebb9d; notes under "Step 5"): the analysis
+  module that the read pushdown builds on (`src/pushdown.c`), and its
+  first user: an `INSERT ... SELECT` whose target and sources are placed
+  together is run whole by each shard group.
+- **Failover in `kingresd`, increment 4 of ten** (cf390ffee8; notes in
+  [design/ha-phase5-part2.md](design/ha-phase5-part2.md) under
+  "Increment 4"): the server that held the old primary becomes a standby
+  of the new one, by `pg_rewind` or by a base backup, and only when its
+  directory is proved to be a former primary. The rest of the second
+  review (F2-06, F2-08, F2-09, F2-16, a test for F2-02) is in the same
+  commit, and a defect of increment 3 (the second group of a failover of
+  two groups ended "superseded").
+- **The failover console, part 1 of 3** (6b2f49fc4c): the dialog with
+  the plan of a dry run, the progress card and the report.
+- **Phase 7 in `kingresd`, steps 3 and 4** (3e36e43d9b; contract 0.11.0;
+  corrections 121 to 136 of
+  [design/ledger-phase7.md](design/ledger-phase7.md)): the 28 operations
+  of the phase in the contract, a scheduler of the leader, and the
+  signing keys of the cluster with their events and the trust file. The
+  fixes for their review (77a72ce498, P7-01 to P7-16).
+- **Phase 7 in `kingresd`, steps 5 and 6** (ca29bf1521; corrections 137
+  to 149): the leader reads the ledger of every database from every
+  shard group, keeps a transparency log per chain and an aggregate log
+  per database, signs their checkpoints and serves the publication on a
+  listener of its own.
+- **The verifier, steps 7 and 18 of phase 7** (cebc50a5a7; corrections
+  160 to 170): it reads a publication from a directory, an archive or an
+  address, checks an aggregate, a bundle and a client signature, follows
+  the key events from a pinned trust file, and has a monitor that never
+  moves backwards.
+- **The panel follows contract 0.11.0, and the Ledger console, part A**
+  (d7d7eb0384): overview, digests, signing keys and publication.
+- **`kingres_ledger` 0.3, two fix rounds for client signatures**
+  (30afc40830, L21-01 to L21-08, corrections 150 to 158; 99d50b6d65,
+  L22-01 to L22-07). The critical one: a transaction that was open when
+  a table was switched to "signature required" could commit entries
+  without an attestation afterwards.
+- **`kingres_columnar` 0.1, the fixes for the twelfth review**
+  (d8b2765084, C12-01 to C12-05), and the track of its reviews closed by
+  a closing check
+  ([reviews/2026-11-18-kingres-columnar-0.1-closing-check.md](reviews/2026-11-18-kingres-columnar-0.1-closing-check.md)).
+- **Nine independent reviews**, one at a time, each on an export of a
+  commit: the sixth of the call sequences (S14), failover increment 3
+  (F3), the seventh of the ledger guard with the first of client
+  signatures (L21), the second of client signatures (L22), the twelfth
+  of the columnar extension (C12) and its closing check, the signing
+  keys (P7), the collector and the publication (P8), and steps 3 and 4
+  of phase 2b (P2C). The reports are under [reviews/](reviews/) with the
+  dates 2026-11-18 and 2026-11-19.
+
+### How it was verified
+
+Run by the integrator on the tree that was committed, unless it says
+otherwise.
+
+- `kingres_shard` at f6484e3dfa: out of tree on 18.7, 14 regression
+  tests and 119 TAP files with 14516 tests; on 19rc2, 15175 tests; in
+  tree on 18 with assertions 162 of 162; no warnings. At be308c7e12 the
+  same suite again with the same totals. At 7aa46ebb9d: 16 regression
+  tests and 123 files with 20162 tests on 18.7, 20792 on 19rc2; in tree
+  163 of 165, the two failures being sweeps of `promote_node` that
+  passed two of two alone on a quiet machine.
+- `kingres_ledger` at 99d50b6d65: in tree on 18.7 with assertions 42 of
+  42 twice; out of tree on 19rc2 19 regression tests and 38 TAP files
+  with 2571 tests.
+- `kingres_columnar` at d8b2765084: in tree 46 of 46 twice; on 19rc2 11
+  regression tests and 42 TAP files with 10265 tests.
+- The verifier at cebc50a5a7: 409 tests in 22 packages on Windows, 444
+  in 23 packages on Linux twice. With the race detector no data race;
+  two older tests that bound the resident memory fail under it and
+  should skip there.
+- The panel at d7d7eb0384: 81 test files with 1224 tests, the browser
+  tests 3 files with 43, type check, lint, the contract and brand checks
+  and the build.
+- `kingresd`: build for both systems, vet, format and the unit packages
+  on Windows at every commit. Gates on real clusters after each change
+  of an extension (the cluster tests that use distributed tables and
+  standbys, and those that use the ledger) on both majors. A complete
+  integration run of the tree with increment 4, steps 5 and 6 of phase
+  7 and `kingres_shard` 0.6, about 85 minutes per major: on 18.7, 1406
+  passed, 24 skipped and 2 failed
+  (`TestASecondFailoverWhileOneIsPaused`, where the leader lost the
+  lease of its own group in the middle of the test, and
+  `TestOldPrimaryRunningUnfenced`, where the reading of the topology
+  answered 503 at the formation of the cluster, a defect that the notes
+  of increment 4 name); on 19rc2, 1407 passed, 24 skipped and 1 failed
+  (`TestRebalanceTakeoverAtTheCatchUp`, a writer of the test lost its
+  connection). Each of the three passed alone afterwards (the two failover
+  tests five times on 18 and three times on 19, the rebalance test three
+  times on 19); the two failover tests read a state once while the leader
+  changed, and wait for it now (4574d26244).
+
+### Decisions and deviations
+
+- **One commit per round of a writer.** Steps 3 and 4 of phase 2b and
+  the fixes for two reviews were written together and could not be
+  separated without rewriting; they are one commit that says so.
+- **Version 0.6 before steps 5 to 12 of phase 2b**, against section 14
+  of its design: the table lifecycle (phase 9) was started beside the
+  remaining steps and builds its catalog on 0.6. Phase 9 is therefore
+  0.7, phase 10 is 0.8 and phase 11 is 0.9, each one higher than its own
+  design says.
+- **Two writers in one directory.** When a branch of a worktree had to
+  enter a directory in which another writer had uncommitted work, the
+  index was set to the versions of the branch, the files that did not
+  overlap were written to the working tree, and each overlapping file
+  was merged by `git merge-file` and looked at by hand; the commit was
+  compared with the branch afterwards.
+- **A database that vanished without a call of the control plane**
+  retires its chains after no shard group has had it for two rounds of
+  the collector, with a signed event; the alert for it is not built.
+- **A guard review of the ledger is not repeated**: the seventh held.
+  The columnar track, the anchoring libraries and the key and log
+  libraries are closed in the same way; a later change of them is
+  reviewed as that change.
+- **The order of the unpublished commits was changed once** before they
+  were pushed (cherry-picked onto the published head and compared with
+  the old tip: no difference). Nothing that was published was rewritten.
+
+### Incidents on the build machine
+
+- **The system disk fell to 13 GB free.** The build cache of Go on
+  Windows, the page cache of WSL and finished work areas were removed;
+  about 20 GB of temporary files of other projects were left alone.
+- **Writers that end their turn while a run of theirs still goes**: the
+  first author of steps 3 and 4 handed back unfinished three times and
+  was replaced; the integrator reads the logs of such runs itself and
+  repeats the suite on the tree it commits.
+- **A verifier author downloaded a Go toolchain** from go.dev into its
+  own work area without checking its checksum. Nothing of it is in the
+  repository; the checks of the integrator use the toolchain that was
+  there before.
+- **The first test of a new extension version fails on 18**: the test
+  of a cluster of two majors uses the extension installed for the other
+  major, so both installations must hold the new version first.
+
+### Still open at the end of this part (see the next entry for what changed)
+
+- **Failover**: the findings of the review of increment 3 (F3-01 to
+  F3-15, four of them high, found by reading) are being fixed with
+  increment 5; increments 6 to 9; the review of increment 4.
+- **Phase 7**: the review of the collector and the publication found
+  one critical defect (P8-01: a restore of the system database forks the
+  aggregate log and the events) and two high ones; they are fixed before
+  the anchoring (step 10) that is being written. The publication is not
+  to be relied on until then.
+- **Phase 2b**: P2C-01 (a key with a type modifier that changes the
+  value makes a multi-row insert fail) and P2C-02 (the source cursor is
+  counted in rows, not in bytes), the tests the review asks for, and a
+  defect of the row router with `GENERATED ALWAYS AS IDENTITY`, in a
+  round before step 6; steps 6 to 12; the review of step 5 is running.
+- **Phase 9**: increments 9.1 and 9.2 (version 0.7) are written on a
+  branch and are being verified.
+- **The contract**: `failover_needs_decision` has no schema member for
+  its plan; the text of `notScheduled`; no operation for a backup alone;
+  a task has no result for a bundle.
+- **The verifier**: the table of Bitcoin headers is older than a year
+  and must be extended before a release.
+
+### Core patches
+
+None.
+
+---
+
 ## 2026-11-18 (third entry): a failover started by hand, client signatures in the ledger, and the fixes for three reviews
 
 Covers the afternoon of 2026-11-18.

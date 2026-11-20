@@ -4,6 +4,7 @@ package ledgersign_test
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"os"
 	"path/filepath"
@@ -86,6 +87,12 @@ func TestTheRetirementRefusesWhenACheckpointAboveTheBoundWasStoredAfterTheEvent(
 	e.create(1)
 	e.clk.Add(25 * time.Hour)
 	e.mem.MaxSize = 100
+	e.mem.BySigner = func(pub ed25519.PublicKey) uint64 {
+		if pub.Equal(k1.Public) {
+			return e.mem.MaxSize
+		}
+		return 0
+	}
 	e.fault = func(p string, _ int64, st int) {
 		if p == task.FaultStepRecorded && st == 0 {
 			e.mem.MaxSize = 5000
@@ -99,6 +106,34 @@ func TestTheRetirementRefusesWhenACheckpointAboveTheBoundWasStoredAfterTheEvent(
 	}
 	if stateOf(load(t, e), k1.Fingerprint()) != ledgerkeys.StateActive {
 		t.Error("the key was retired")
+	}
+}
+
+// P8-02: after the key-retired event the other key keeps signing and the logs grow, in every step of the task and after it. The retirement
+// still ends: the refusal is about checkpoints signed by the key that retires, and none was. (Before the fix the largest tree of the cluster
+// was compared with the bound and the task failed for good with bound_exceeded.)
+func TestTheRetirementEndsWhileTheOtherKeyKeepsSigning(t *testing.T) {
+	e := newEnv(t, memFactory)
+	e.create(0)
+	k1 := keyIn(t, load(t, e), ledgerkeys.StateActive)
+	e.clk.Add(time.Hour)
+	e.create(1)
+	e.clk.Add(25 * time.Hour)
+	e.mem.MaxSize = 100
+	e.mem.BySigner = func(ed25519.PublicKey) uint64 { return 0 } // only the other key signs
+	e.fault = func(p string, _ int64, st int) {
+		if p == task.FaultStepRecorded {
+			e.mem.MaxSize += 7 // a new checkpoint of the new key after every step
+		}
+	}
+	tk, _ := e.svc.RetireKey(context.Background(), "a", k1.Fingerprint())
+	_ = e.eng.RunNow(context.Background(), tk.ID, nil)
+	got, _ := e.eng.Get(context.Background(), tk.ID)
+	if got.State != task.Done {
+		t.Fatalf("the retirement did not end: %s %+v", got.State, got.Error)
+	}
+	if stateOf(load(t, e), k1.Fingerprint()) != ledgerkeys.StateRetired {
+		t.Error("the key is not retired")
 	}
 }
 
@@ -324,14 +359,18 @@ func TestTemporaryKeyFilesAreCleanedAndAFileWithoutAMarkerIsNotAdopted(t *testin
 		t.Fatal(err)
 	}
 	fp := ledgerkeys.Fingerprint(pub)
-	if got, _ := kr.Orphan(map[string]bool{}, time.Now().Add(-time.Minute), time.Minute); got != "" {
+	if got, _ := kr.Orphan(map[string]bool{}, time.Now().Add(-time.Minute), time.Minute, 7); got != "" {
 		t.Errorf("a file without a marker was adopted: %s", got)
 	}
 	if err := kr.Mark(fp, 7); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := kr.Orphan(map[string]bool{}, time.Now().Add(-time.Minute), time.Minute); got != fp {
+	if got, _ := kr.Orphan(map[string]bool{}, time.Now().Add(-time.Minute), time.Minute, 7); got != fp {
 		t.Errorf("a marked file was not found: %q", got)
+	}
+	// P8-07: the marker is the one of the task that asks; the marker of another task does not adopt the file
+	if got, _ := kr.Orphan(map[string]bool{}, time.Now().Add(-time.Minute), time.Minute, 6); got != "" {
+		t.Errorf("a file marked by task 7 was adopted by the earlier task 6: %q", got)
 	}
 	if err := kr.Remove(fp); err != nil {
 		t.Fatal(err)

@@ -8,13 +8,22 @@ node as reference tables, and makes every statement correct on a cluster with
 several groups: a statement that touches one key goes to the group that owns
 it, and a statement that spans groups is answered by reading the other groups.
 
-This is version 0.6 (0.3 added moving buckets, phase 2a made every statement correct, 0.4 is the fix round of the reviews of 0.2 and 0.3, 0.5 is high availability: standby nodes, `promote_node`, prepared transactions across a failover, distributed deadlock detection and coordinated restore points; see "High availability" below; 0.6 is phase 2b and adds no SQL object, see "Installation" for why the version is raised). Phase 2b makes the common
+This is version 0.7 (0.7 is the table lifecycle of phase 9 on top of 0.6; 0.6 is the version of phase 2b; 0.3 added moving buckets, phase 2a made every statement correct, 0.4 is the fix round of the reviews of 0.2 and 0.3, 0.5 is high availability: standby nodes, `promote_node`, prepared transactions across a failover, distributed deadlock detection and coordinated restore points; see "High availability" below; 0.6 is phase 2b and adds no SQL object, see "Installation" for why the version is raised). Phase 2b makes the common
 statements fast. The designs are in
 [`kingres/docs/design/shard-mvp.md`](../../kingres/docs/design/shard-mvp.md)
 (phase 1) and
 [`kingres/docs/design/shard-phase2a.md`](../../kingres/docs/design/shard-phase2a.md)
 (this version, with its "Implementation notes and deviations"); this file
 describes what is implemented and how to use it.
+
+Version 0.7 (phase 9, [`shard-phase9.md`](../../kingres/docs/design/shard-phase9.md),
+increments 9.1 and 9.2) starts the table lifecycle: `create_distributed_table` and
+`create_reference_table` accept a table that already holds rows and carry its owner,
+privileges, comments, sequences and foreign keys; `kingres.table_change_report()` says what
+stands in the way of a change of a table before it is tried; and the catalog holds what the
+rest of the phase needs (see "The table lifecycle (version 0.7)"). The online variants,
+`undistribute_table`, `alter_distributed_table` and user partitions are the next increments
+and are not in this version.
 
 ## How it works in one page
 
@@ -123,6 +132,30 @@ describes what is implemented and how to use it.
   that need one state of several tables from one node should read them in one
   scan node (a join of colocated tables on the key is routed to one group).
   `SERIALIZABLE` is serializable per node only.
+- **Pushdown gives the single node's answer, and the scan is always the fallback.** A read that spans shard
+  groups may be run by the groups (a closed query, a partial aggregation, the rows of a join, a sorted stream
+  with a limit, the functions of a listed extension: see the sections of phase 2b below). Every such path
+  returns the rows the single node returns, in the order the statement asks for (the same set of rows, the
+  same order where `ORDER BY` fixes one, the same errors for a negative or `NULL` `LIMIT`), with the exceptions
+  that "Differences from a single node that pushdown makes visible" lists: a floating point aggregate, an
+  aggregate over values that compare equal and print differently, a cursor that cannot scan backward, `SET ROLE`
+  to a role that cannot log in, and a `KS001` that the client repeats. A statement that
+  no path accepts, or whose pushed path costs more, runs through the distributed scan as before, and every
+  switch (`enable_pushdown`, `enable_pushdown_closed`, `enable_partial_aggregation`, `enable_pushdown_sort`,
+  `enable_pushdown_join`, `shippable_extensions = 'none'`) turns a path off without changing an answer.
+  What is **not** promised: a global snapshot (see above: the groups of a pushed statement read their own
+  snapshots, so the skew above applies to a pushed statement as well), and the last digits of a floating
+  point aggregate or the order of the elements of `array_agg` and `string_agg` without `ORDER BY` (the
+  states are combined in the order the groups answer, as in a parallel plan).
+- **A group does what it is allowed to do, whoever asks.** A fragment is a text with a marker
+  (`kingres:query-fragment`, `kingres:partial-fragment`) that a group parses and checks against its own
+  rules again; a text that is forged, or has a marker the statement does not fit, is refused with `0A000`,
+  and a placement or an extension version that differs from the sender's is `KS001`. A fragment runs with the
+  rights of the session role that this node opened on the group (never with the rights of the node), a
+  statement over a table with row-level security is not shipped (the scan answers), a statement that reads a view
+  of another owner is refused with an error (on every path: the view's owner has no rights on another node), a
+  function of a user is never shipped, and the session of a group runs with `search_path = pg_catalog`. See "Security
+  notes".
 - **Distributed deadlocks are detected (0.5).** Writes that fan out to several
   nodes take their row locks in the same order on every node (nodes in id
   order), so two such statements do not deadlock each other. Two transactions
@@ -263,7 +296,7 @@ PROVE_TESTS=t/013_dist_scan.pl kingres/dev/ext.sh kingres_shard tap
   second, fictitious shard group; `routing_decisions`: collations, functions
   and other nested contexts, forwarded sessions, decided with `EXPLAIN`;
   `reference`: reference tables on one node; `upgrade`: `ALTER EXTENSION ...
-  UPDATE` from 0.1, 0.2, 0.3, 0.4 and 0.5 against a fresh 0.6 install; the same on both majors:
+  UPDATE` from 0.1, 0.2, 0.3, 0.4, 0.5 and 0.6 against a fresh 0.7 install; the same on both majors:
   the script of 0.3 names a column of `pg_stat_subscription_stats` that PostgreSQL 19
   renamed, so on 19 it creates `kingres.internal_move_subscription_status()` with its
   body check off and `ALTER EXTENSION ... UPDATE` to 0.4 replaces it with a body that
@@ -382,6 +415,38 @@ PROVE_TESTS=t/013_dist_scan.pl kingres/dev/ext.sh kingres_shard tap
   `119_nested_subxacts` (the fixes of the sixth review of the call sequences: two nested subtransactions with the
   connection closed or answered with an error at every chunk, a failed `RELEASE` that PL/pgSQL catches, a read-only
   session that does not answer `ROLLBACK TO`, the memory of thousands of failed `RELEASE`s).
+  The online variants (increment 9.3): the regression test `online_refusals` (every refusal before anything is
+  recorded, with its message, and the privileges of the new functions); `144_online_distribute` (three nodes: a
+  table with rows, an owner, privileges, comments, a serial column, an identity column, a key to a reference table and
+  indexes, distributed in one call and phase by phase; the digests, the sequences, the old copy; a reference table),
+  `145_online_load` (four writers with inserts, updates, deletes and `COPY` throughout; the table equals a model),
+  `146_online_interleavings` (changes between the read of a chunk and its insert, a writer that waits for the lock of the
+  switch, a prepared transaction and a long reader that delay it, `session_replication_role = replica`, `COPY`, a role with no
+  privilege on the log), `147_online_faults` (an error at every point before and after the switch, the session killed, the
+  map group primary crashed inside every step and inside the commit of the swap, a node lost during the copy: the table
+  is whole in exactly one layout and nothing is left), `148_online_cancel_exclusion` (cancel in every phase, resume by
+  another session, a move against an operation, two operations, a prepared statement across the swap, the version
+  handshake), `149_online_verification` (a change behind the trigger, money and other types, verification off, a write
+  after the switch, a reference table).
+  Table lifecycle (version 0.7, increments 9.1 and 9.2; the design's `t/040` and the numbers after it are
+  taken by older tests, so the names are `140` and up): the regression test `distribute_rows` (the report, one
+  statement per code, and a creation with rows on one node compared object by object with the source), the
+  steps from 0.6 in `upgrade`, the new objects in `security` and `catalog`; `140_distribute_rows` (the blocking
+  `t/040`: three nodes, every row in the group that owns its bucket and nowhere else, owner, privileges, comments,
+  sequences and keys the same on every node, writers wait and readers do not, an error at every step and every send and
+  wait of the sender, a cancel, a node that is down, the origin killed before and after its commit),
+  `141_distribute_memory` (a million and three million rows: the same peak memory), `143_distribute_insel` (a prepared colocated INSERT ... SELECT across the swap of its source, and one that waits for the lock of a table that is being distributed), `142_distribute_ledger` (a
+  ledger table is refused; it needs `kingres_ledger` built into the same installation, for example
+  `make -C contrib/kingres_ledger USE_PGXS=1 PG_CONFIG=... install`, and both libraries preloaded, which the test does).
+  `180_untrusted_code` .. `184_engine_rules` (the fixes of the second review of phase 9: code of untrusted roles through domains,
+  operators, range types and hash functions; float, domain and very large keys in the capture, a unique value that changes hands in the
+  replay and the verification that says it was not done; the guard against `DROP TRIGGER`, `SET SCHEMA` and the like and the lock of a
+  `GRANT`; a cancelled call whose session stays; a column privilege on the old copy, a repeated copy chunk, the row lock of the switch,
+  the worker and a live or recent operation, the log name of the capture trigger, a lost answer of the switch),
+  `150_distribute_races` (the fix round of the review of 9.1 and 9.2: a writer that commits while the call waits for the lock, for an
+  update, a delete, an insert, a reference table and the online engine, with the values compared; statements queued behind the call;
+  rules, row types, `NOT VALID` checks, unowned sequences, collations, schema privileges, enum keys, function owners, invalid indexes, forced
+  row-level security, default privileges and the other refusals before anything changes).
   `t/KingresShardTest.pm` builds clusters (and standbys); `t/KingresShardCompare.pm` is the
   comparison harness: it loads the same data into a three-node cluster and a
   single node and compares query results (a NULL is shown as `<NULL>`, so it never equals
@@ -408,7 +473,7 @@ SELECT kingres.init_cluster('host1', 5432);       -- the address the other nodes
 SELECT kingres.add_node('host2', 5432);
 SELECT kingres.add_node('host3', 5432);
 
--- distribute an empty table, and keep a small one everywhere
+-- distribute a table (empty or not), and keep a small one everywhere
 CREATE TABLE users (id int, name text, PRIMARY KEY (id));
 SELECT kingres.create_distributed_table('users', 'id');
 CREATE TABLE countries (code text PRIMARY KEY, name text);
@@ -450,8 +515,9 @@ schema through `"$user"`; qualify names or fix `search_path`.
 | `kingres.detect_distributed_deadlocks() returns int` | Map group primary, superuser. One pass of the distributed deadlock detector (the recovery worker runs it); returns the number of transactions cancelled. |
 | `kingres.sync_catalog()` | Push the catalog to every active primary node, atomically. |
 | `kingres.rotate_secret()` | Map group primary, superuser. Replaces the secret behind the tokens of node-to-node sessions on every active primary, atomically. Refuses while a distributed transaction of the cluster is prepared on any node (its tag would stop verifying). Sessions another node opens while the commit is in flight may be refused once; repeat the statement. A node that dies between the PREPARE and the COMMIT PREPARED of the rotation is reached by the node that finishes it with the secret that the rotation replaced (every node keeps it as "previous" and never accepts a session with it); recovery commits the rotation by itself and drops the previous secret in the first pass of a node's recovery (the worker, or `recover_prepared_transactions()`, on that node) that reaches every primary with the current secret and needs no session made with the previous one: the pass that commits a stranded node's rotation needs it and keeps it, the next pass drops it (S9-03, `t/076` asserts both). |
-| `kingres.create_distributed_table(relation regclass, dist_column name, colocate_with regclass default null, bucket_count int default null)` | Map group primary only. See below. |
-| `kingres.create_reference_table(relation regclass)` | Map group primary only. Makes an ordinary table a reference table: creates it on every node and copies its rows. Writers are blocked while it copies. |
+| `kingres.create_distributed_table(relation regclass, dist_column name, colocate_with regclass default null, bucket_count int default null)` | Map group primary only; superuser. The table may hold rows. See "The table lifecycle (version 0.7)". |
+| `kingres.create_reference_table(relation regclass)` | Map group primary only; superuser. Makes an ordinary table a reference table: creates it on every node, copies its rows, and carries its owner, privileges, comments and its foreign keys to other reference tables. Writers are blocked while it copies. |
+| `kingres.table_change_report(kind text, relation regclass, options jsonb default '{}') returns table (severity text, code text, object text, detail text)` | Superuser, any node that has the catalog. What prevents a change of a table (`blocker`), what the change would not carry (`warning`) and what is good to know (`note`), without changing anything; it never stops at the first problem. `kind` is `distribute`, `distribute_reference`, `undistribute`, `alter`, `create_partition`, `attach_partition`, `detach_partition` or `drop_partition`. The codes are listed under "The table lifecycle (version 0.7)". |
 | `kingres.recover_prepared_transactions() returns int` | Commits or rolls back the prepared transactions this node originated, on every active primary (itself included); returns how many it resolved. Superuser. Runs in a `READ COMMITTED` transaction; not on a standby. |
 | `kingres.bucket_for(relation regclass, value anyelement) returns int` | The bucket of a key of a distributed table. |
 | `kingres.bucket_for(colocation_id int, value anyelement) returns int` | The bucket of a key in a colocation group. |
@@ -460,23 +526,264 @@ Views: `kingres.nodes` (`kingres.node` plus `is_local`) and
 `kingres.buckets` (table, bucket, partition name, group, owning node, state,
 and the partition size where the partition exists on this node).
 
-`create_distributed_table` requires an empty, ordinary, non-partitioned table
-without inheritance, foreign keys, triggers, row-level security, storage
-parameters or exclusion constraints, on a type with a default hash operator
+`create_distributed_table` takes an ordinary, permanent, non-partitioned table
+that may hold rows, without inheritance, triggers, rules, row-level security (enabled, forced or with a
+policy), storage parameters or exclusion constraints, on a type with a default hash operator
 class and extended hash function. Every unique constraint or unique index must
 include the distribution column; the error names the offending object. The
 table is recreated as a hash-partitioned table with the same columns,
-defaults, `NOT NULL`, check and unique constraints and indexes, the sequences
-owned by its columns, and its owner. The colocation group is the one of
+defaults, identity and generated columns, `NOT NULL`, check, unique and foreign key
+constraints and indexes, the sequences owned by its columns (each node's state is raised to the largest value of the
+column on that node, and the state of this node is kept when it is higher), its
+owner, its table and column privileges and its comments, and its rows are
+moved to the groups that own their buckets. The colocation group is the one of
 `colocate_with`, else an existing group with the same type, collation and
 bucket count, else a new group whose buckets are spread round-robin over the
-groups that should hold shards. Privileges, comments and statistics objects
-are not copied (grant after creating; the grant is propagated).
+groups that should hold shards. Statistics objects, per-column storage, compression
+and statistics targets, the attribute options of a column, `CLUSTER ON` and the replica identity are not carried (the
+report says so as warnings). The privileges of the new table are exactly those of the old one: the default privileges of
+the schema (`ALTER DEFAULT PRIVILEGES`) are not added to it. Everything that prevents the call is listed in one error
+(or by `table_change_report()`); see the next section.
 
-`create_reference_table` takes the same kind of table (ordinary, permanent,
-without inheritance, foreign keys, triggers, row-level security, storage
-parameters or exclusion constraints; a unique constraint needs no distribution
-column). Add foreign keys afterwards with `ALTER TABLE`.
+`create_reference_table` takes the same kind of table (a unique constraint needs no
+distribution column). Its rows, owner, privileges and comments are carried to the other
+nodes, and so are its foreign keys to other reference tables.
+
+## The table lifecycle (version 0.7)
+
+This section is phase 9 of [`shard-phase9.md`](../../kingres/docs/design/shard-phase9.md),
+increments 9.1, 9.2 and 9.3 (what the catalog and the report are, the blocking
+`create_distributed_table` of a table with rows, and the rebuild engine with
+`create_distributed_table_concurrently` and `create_reference_table_concurrently`). The design
+calls its version "0.6"; the phase is 0.7 because phase 2b is 0.6 (a version with no object
+change). Not in this version: `undistribute_table`, `alter_distributed_table`, user partitions
+of distributed tables, the control plane and the console. `table_change_report` already
+reports for those kinds what it can know today (see the codes).
+
+### What a creation with rows does
+
+One transaction, the caller's, on the map group primary:
+
+1. The cluster lock, the check that this node is the map group primary, the **version
+   handshake** (`kingres.internal_require_version('0.7')`: every active primary must report
+   0.7, the first that does not is named), the report (any blocker raises one error that lists
+   all of them), the choice of the colocation group (a new group takes its id from
+   `kingres.colocation_id_seq`, so a number is never used twice, also after a rollback), and the
+   check that no bucket of the group is being moved and no table operation claims it.
+2. `LOCK TABLE ... IN EXCLUSIVE MODE` on the source. From here to the commit **writers of the table wait,
+   readers do not**; everything else goes on.
+3. The new table is made on every node **under the name `kingres_shadow_<oid>`** (its constraints and
+   indexes carry the oid too), with the partitions of the buckets the node's group owns (named `<table>_b<NNNN>`
+   at once, with the modulus of the bucket). It is not in the catalog of any node, so no statement, scan or
+   move sees it. The old table is still the table.
+4. The rows are copied with the batch sender of the row router (`copy_routed.c`) driven with an explicit
+   destination (a placement, because the shadow is not registered): the source is read through a cursor in
+   chunks and every row goes to the group that owns its bucket, in batches of one `INSERT` that carry the
+   identity of the destination's partitions. Rows read, rows the groups acknowledged and `count(*)` of the
+   source taken under the lock must be equal, or the call fails.
+5. From the moment the old table is dropped to the commit **readers of the table wait** too (`DROP TABLE` takes
+   `ACCESS EXCLUSIVE`): on this node the old table is dropped and the shadow takes its name (constraints, indexes,
+   identity sequences and the sequences that columns own are renamed or moved), the foreign keys are added, the
+   sequences are advanced (each node's to at least the largest value of its own rows, and this node's to the state
+   the source had), and the owner, privileges and comments are applied; on every other node the shadow takes its
+   name and gets the same. The table is registered and the catalog is pushed to every node.
+6. The commit is the two-phase commit of phase 2a: `PREPARE TRANSACTION` on every node that holds a part, the
+   decision in `kingres.dtx_log`, `COMMIT PREPARED`. A failure of any node or of this node at any point before the
+   decision rolls everything back (the old table is as it was, with its rows, and no node has a shadow, a
+   partition or a prepared transaction after recovery); a crash after the decision is finished by
+   `recover_prepared_transactions()` or the recovery worker, and the table is whole.
+
+Fault points of the creation (`kingres_shard.fault_injection`): `distribute_after_lock`,
+`distribute_after_shadow`, `copy_before_read`, `copy_after_copy`, `distribute_before_swap`,
+`distribute_after_swap`, and the points of the batch sender (`bulk_*`) and of the commit protocol.
+
+Memory does not depend on the number of rows: the cursor chunk is `insert_batch_rows` rows, the sender
+keeps at most two buffers per group (`insert_batch_rows` rows or `insert_batch_bytes` bytes each), and a group
+runs one batch at a time (`t/141` distributes 1,000,000 and 3,000,000 rows with 4 MB of shared buffers: the
+peak resident size of the backend is the same to the megabyte).
+
+### Transactions that run at the same time
+
+The call reads the rows after the lock that stops the writers is granted, with a snapshot taken then: what a transaction
+committed while the call waited for the lock (an update, a delete, an insert) is in the new table. For that the call
+runs only in a `READ COMMITTED` transaction and is refused in `REPEATABLE READ` and `SERIALIZABLE`, whose snapshot is older
+than the lock. A statement that was started before the call and waits for the table (`ALTER TABLE`, `RENAME`, `CREATE INDEX`,
+`TRUNCATE`, `GRANT`, `COPY ... FROM`, `DROP TABLE` and the others the hook looks at) first waits for the lock and decides
+afterwards, so it finds the table as the call left it and goes to every node. The statement takes a `ROW EXCLUSIVE` lock
+on the table for this, which every writer holds anyway. Only a role that has the right the statement needs takes it (the owner; `INSERT` for
+`COPY ... FROM`; `TRUNCATE`; `TRIGGER` for `CREATE TRIGGER`; a grant option for `GRANT`), so a `GRANT` of a role that may only read
+leaves no lock behind. The online variants take the copy from a snapshot after the capture trigger exists. The trigger is made under
+a lock that excludes writers: the call tries without waiting for a quarter of `rebuild_switch_timeout` (2.5 s by default), then queues once for
+`rebuild_lock_timeout`, and fails with the holders named, and is undone, when a writer (or a prepared transaction) is still in the table. A
+table that always has a transaction open for longer than that cannot be rebuilt online with the call; the phase functions can be called
+again.
+
+### What is carried and what stays refused
+
+| | |
+|---|---|
+| Columns, defaults, identity (also `GENERATED ALWAYS`: copied with `OVERRIDING SYSTEM VALUE`), generated columns, collations, `NOT NULL` (with its constraint name), check, unique and primary key constraints, every index (expression, partial, covering) | carried |
+| Sequences owned by columns | carried: the same object on this node, created with the same options and the same owner on the others; the state is kept on this node when it is above the largest value of the column, otherwise raised to that value (`is_called` true), and on the other nodes raised to the largest value of the node's own rows. So the next value of a serial column can be higher than it was when the sequence was behind its column. Privileges on the sequences are not carried. **A sequence is per node, as before:** after the distribution the nodes start from different numbers (the largest value of each node's own rows), so a serial or identity column hands out the same value on two nodes, and the table's primary key (which contains the distribution column) is what keeps the rows apart; a value that repeats is harmless only when the repeated value goes to a different distribution key. Do not rely on a distributed serial column for a value that must be unique across the table |
+| Owner, table privileges, column privileges (with grantors and grant options), comments on the table, columns, constraints and indexes | carried; the roles must exist on every node (blocker `role_missing`) |
+| Foreign keys **to a reference table** | carried and validated in the same transaction |
+| Foreign keys **to a distributed table** of the group the table joins, on the distribution column of both | carried (such a key exists on an ordinary table only while the cluster has one shard group, or when it was made with `enable_routing = off`: with several groups the hook refuses it at creation) |
+| A key from the table to itself | carried when it is on the distribution column on both sides; refused otherwise |
+| Foreign keys to an ordinary table, to a distributed table of another group, or without the distribution column; foreign keys from an ordinary table to the table | refused (`foreign_key_plain_table`, `foreign_key_other_group`, `foreign_key_not_distribution_column`, `referenced_by_plain_table`) |
+| Triggers, rules, row-level security (also `FORCE ROW LEVEL SECURITY` alone), exclusion constraints, invalid indexes, `CHECK` constraints that are `NOT VALID`, inheritance, partitioned tables and partitions (user partitions are increment 9.5), temporary and unlogged tables, storage parameters (increment 9.9), tablespaces, ledger tables and the history table of one, a table on a node that is not the map group primary | refused |
+| Views, materialized views, publications and functions that use the table's row type, and a column of another table that has the row type | refused (`dependent_object`): the table is replaced by a new one, and a rename would leave them on the old |
+| A column default that calls `nextval()` of a sequence that no column of the table owns; a collation that another node does not have; an owner who has `CREATE` on the schema here but not on another node; an enum as the distribution column (the hash of an enum value depends on the OID of the value, which differs between the nodes); a relation of the shadow's name on another node; any function that the copy would reach and that belongs to a role who is not a superuser: one a `CHECK`, default, generated column or index names, and also one behind a domain of a column (its checks and its default), an operator or operator class of an index, a cast, a range or composite type (the copy runs it with the rights of the caller on every node, and the code of a table's owner must not run as a superuser) | refused before anything is done (`default_sequence_not_owned`, `collation_missing`, `schema_privilege`, `enum_distribution_column`, `name_in_use`, `function_owner_not_superuser`) |
+| Statistics objects, per-column storage, compression and statistics target, attribute options, `CLUSTER ON`, replica identity | not carried (warning `not_carried`) |
+| `lc_monetary` | the values of a `money` column are converted under `lc_monetary = 'C'` on both ends of the copy |
+
+The old table is dropped in the same transaction after the counts have matched; the design keeps it for
+`table_cleanup_delay` (increment 9.3 does, for the online variants). For a blocking creation the transaction
+is the guarantee: until it commits nothing changed, and after it the old copy would only be a second copy of
+rows that writers may have changed since.
+
+### The codes of `table_change_report`
+
+A code is a stable word; `object` names what is wrong, `detail` is a sentence (the text of the error when it is the only
+blocker). Severity `blocker`: the call is refused. `warning`: carried differently or not at all. `note`: good to know.
+
+| Code | Kinds | Meaning |
+|---|---|---|
+| `not_on_map_group` | all | this node is not the map group primary, or the cluster is not initialized |
+| `already_distributed` | distribute, distribute_reference | the table is distributed or a reference table already |
+| `not_ordinary_table` | distribute, distribute_reference | a view, a sequence, a foreign table, ... |
+| `partitioned_table` | distribute, distribute_reference | a partitioned table or a partition (until increment 9.5) |
+| `temporary_or_unlogged`, `inheritance`, `storage_parameters`, `row_level_security`, `exclusion_constraint`, `trigger`, `rule`, `invalid_index`, `check_not_valid` | distribute, distribute_reference | the table has what stays refused (one row per constraint and per trigger) |
+| `tablespace` | distribute, distribute_reference | the table or one of its indexes is not in the default tablespace |
+| `ledger_table` | distribute, distribute_reference | a `kingres_ledger` table or the history table of one |
+| `dependent_object` | distribute, distribute_reference | a view, materialized view, publication or function that uses the table, or a column of another table with its row type |
+| `default_sequence_not_owned`, `function_owner_not_superuser` | distribute, distribute_reference | a default calls `nextval()` of a sequence that no column of the table owns; code of a role who is not a superuser is reached by the copy through a constraint, default, index, domain, operator, operator class, cast, range or composite type (the report says through what) |
+| `enum_distribution_column`, `collation_missing`, `schema_privilege` | distribute | the hash of the column is not the same on every node; another node lacks a collation of a column or `CREATE` on the schema for the owner |
+| `foreign_key_plain_table`, `foreign_key_other_group`, `foreign_key_not_distribution_column`, `referenced_by_plain_table`, `referenced_by_distributed_table` | distribute, distribute_reference | the foreign keys that stay refused |
+| `column_missing`, `no_hash_support`, `unique_without_distribution_column`, `name_too_long`, `name_in_use` | distribute | the distribution column is not usable, a unique key lacks it, the name leaves no room for `_bNNNN`, or a relation of a bucket partition's name or of the shadow's name exists, on this node or on another |
+| `no_key_for_online` | distribute with `mode = 'online'` | a primary key or a unique index over `NOT NULL` columns is needed (for increment 9.3) |
+| `group_busy` | distribute, undistribute, alter | the colocation group has an unfinished move or a table operation |
+| `role_missing`, `default_function_missing`, `node_unreachable` | distribute, distribute_reference | another node lacks a role of the table's owner or privileges, or a function of a column default; or it cannot be asked |
+| `not_carried` (warning), `rows` (note) | distribute, distribute_reference | what is not carried; the estimate of the rows that writers wait for |
+| `not_distributed`, `foreign_key_linked`, `target_group_invalid` | undistribute | for the next increments |
+| `not_distributed`, `bucket_count_invalid`, `colocate_with_not_distributed`, `foreign_key_colocation`, `unique_without_distribution_column`, `column_missing`, `no_hash_support` | alter | for the next increments |
+| `not_distributed`, `name_too_long`, `not_available_yet` | create_partition, attach_partition, detach_partition, drop_partition | user partitions are not in this version |
+
+`options` is what the call would be given: `column`, `colocate_with` (a table name, schema-qualified unless it is in `pg_catalog`
+or `kingres`: the report runs with a fixed `search_path`), `bucket_count`, `mode` for a distribution;
+`cascade_via_foreign_keys` and `target_group` for undistribute; `distribution_column`, `bucket_count`, `colocate_with` and
+`cascade_to_colocated` for alter; `partition` for the partition kinds.
+
+### What 0.7 adds to the catalog
+
+`kingres.dist_table.partition_method` and `partition_key` (empty in this version), `kingres.dist_partition` (synchronized
+with the rest; nothing writes it yet), the sequence `kingres.colocation_id_seq` (a colocation id is never used twice; the
+update starts it at the highest id, and a node that applies a catalog keeps it above the ids it sees), and four node-local
+tables, readable by superusers only: `table_operation`, `table_operation_item`, `table_operation_lock` and `table_old_copy`
+(written by the online variants of increment 9.3; `internal_begin_move` and the DDL guard already refuse a colocation group
+that has a row in `table_operation_lock`). The views `kingres.table_operations` and `kingres.partitions` are readable by
+`pg_monitor` and show no error text and no node address. `kingres.internal_copy_routed()` copies the rows of a table to a
+placement, to every node or to one node for the rebuild engine to come; `kingres.internal_require_version()` is the
+handshake. All new functions are revoked from `PUBLIC`; one is `SECURITY DEFINER`:
+`kingres.internal_capture_trigger()` of the online variants (below), the second of the extension after
+`forget_dropped_tables`.
+
+### Upgrading
+
+Load the new library on every node, then run `ALTER EXTENSION kingres_shard UPDATE` on every node. Until a node has been
+updated, `create_distributed_table` and `create_reference_table` refuse to run with "the kingres_shard objects of this
+database are older than the library", and the handshake of the new functions names the node that is behind; the other paths
+keep working, and a node can still be added. `internal_apply_catalog` accepts a catalog document without the new keys (a map
+group primary that is not updated yet).
+
+### The online variants (increment 9.3)
+
+`kingres.create_distributed_table_concurrently(relation, dist_column, colocate_with, bucket_count) returns bigint` and
+`kingres.create_reference_table_concurrently(relation) returns bigint` do what their blocking namesakes do while **writers
+keep writing**. They cannot run inside a transaction block (they commit in sessions of their own), need a primary key or a
+unique index over NOT NULL columns (the report says `no_key_for_online` otherwise), and return the id of the operation
+(`kingres.table_operations`). Superusers, on the map group primary, in a `READ COMMITTED` session. Everything stays in 0.7.
+
+The work is a **record** (`kingres.table_operation`, node-local, with its phase and `spec`) and phases that can be called one
+by one, which is what the control plane does:
+
+| Phase | What happens | Function |
+|---|---|---|
+| `preparing` | `kingres.begin_table_operation(kind, relation, options)`: the report (every blocker, `no_key_for_online` too), the version handshake, the colocation group (a new one is made and announced), its claim in `kingres.table_operation_lock` (a group with an operation, an unfinished move or a bucket in motion is refused), the record. `kind` is `distribute` or `distribute_reference`; `options` has `column`, `colocate_with` (the OID as text), `bucket_count`, and optionally `request_id` (a second call with it returns the same operation). Committed at once. | `begin_table_operation` |
+| `shadow` | On every node, in a session of its own, the shadow of the table (`kingres_shadow_<oid>`, partitions of the node's buckets under their final names, the same statements as the blocking variant); then on the source, under `SHARE ROW EXCLUSIVE`, the **log table** `kingres.tlog_<op>_1` and the **capture trigger** `AFTER INSERT OR UPDATE OR DELETE ... ENABLE ALWAYS` (so `session_replication_role = replica` does not bypass it) and a `BEFORE TRUNCATE` trigger that refuses. | `table_operation_advance(op, 'shadow')` |
+| `copying` | The source is read in key order in chunks of `kingres_shard.rebuild_batch_rows` (one transaction each, with the last key recorded in the same transaction, so a copy resumes after it) and sent with the batch sender to the group of each bucket, `ON CONFLICT DO NOTHING`. | `table_operation_advance(op, 'copying')` |
+| `catching_up` | The log is replayed in chunks: for each key it names, the key is deleted at the destination and the row, if it exists, is inserted (the destination is made equal to the **current** row, so the order and the number of times do not matter); the entries are removed in the same transaction. It ends when the backlog is under `kingres_shard.rebuild_drain_threshold`. | `table_operation_advance(op, 'catching_up')` |
+| `switching` | One bounded attempt in one transaction: the catalog lock, `EXCLUSIVE` on the source (**writers wait, readers go on**; a lock is tried without waiting for a quarter of `rebuild_switch_timeout`, then queued once for `rebuild_lock_timeout`), the replay of what is left, the check that the log is empty, then `ACCESS EXCLUSIVE` and the swap, on every node in the two-phase commit of 2a: the old table moves to the schema `kingres` (`kingres_old_<oid>`, readable by its owner only, its keys dropped, its indexes renamed), the shadow takes its name, sequences, owner, privileges and comments, the foreign keys are added `NOT VALID`, the table is recorded and the catalog pushed. An attempt that cannot get a lock in time (a long reader, a prepared transaction: the detail names the holders) or whose replay takes too long leaves everything as it was; after `rebuild_switch_max_attempts` attempts the call returns with `detail` set and can be called again. | `table_operation_advance(op, 'switching')` |
+| `cleaning` | The old copy is compared with the new table (see below), the foreign keys are validated, the claim is released, the operation is `done`. The old copy is dropped after `kingres_shard.table_cleanup_delay`. | `table_operation_advance(op, 'cleaning')`, `cleanup_table_operations()` |
+
+`kingres.table_operation_advance(op_id, to_phase, timeout_ms)` runs the operation up to the end of `to_phase` and returns the
+phase it is in; any phase can be called again after a failure or a crash, by another session too; the session that runs it holds a live
+mark (an advisory lock) and a second session that tries gets "is being run by another session". **Cancel**:
+`kingres.cancel_table_operation(op)` undoes an operation that has not switched (triggers, log, shadows, claim, a colocation group the
+operation made); a session that runs it notices at the end of its chunk and undoes it itself; after the switch it only says so. **Resume**:
+`kingres.resume_table_operations()` (the recovery worker calls it every `recovery_interval`, after it resolved the prepared transactions) undoes
+the operations whose session is gone and that did not switch (not written for `2 x node_timeout`), finishes those that switched, and cleans
+again an undone operation that could not reach a node (`spec -> 'cleanup_pending'`). The two wrapper functions undo what fails, a cancel of the call (Ctrl-C, a statement timeout, `pg_cancel_backend`) included, whether or not the client stays connected: the live mark of the operation is released and the undo runs before the cancel is reported.
+
+**The proof that nothing is missed.** The capture trigger exists, on a source that no writer is half inside (the trigger is made under a lock
+that excludes writers), before the copy reads anything. Every row that exists is copied; every change after has a log entry, written in the
+writer's own transaction, so it commits or rolls back with the change. The replay sets the destination to the current state of each logged key.
+The switch takes the lock that waits for every earlier writer and stops later ones, then replays again **after the lock is granted** and
+checks that a statement that runs after it sees an empty log: no writer can add to it now, so the shadow is the table. The swap runs in the
+same locked state. What this does not cover is a change that bypasses the triggers (`ALTER TABLE ... DISABLE TRIGGER` by a superuser who edits
+the catalog); the DDL guard refuses that statement on the table of an operation, and the verification detects the rest.
+
+**The verification** (`kingres_shard.rebuild_verify`, on): in `cleaning`, `kingres.internal_table_digest()` returns the number of rows and
+the sum of a hash of every row in text form (under fixed `DateStyle`, `IntervalStyle`, `extra_float_digits`, `bytea_output`, `lc_monetary`
+and `TimeZone`) for the old copy and for the new table on every node. A difference keeps the old copy, sets `verified = 'failed'`, makes
+the call fail and is reported by `check_cluster()` (`table_verification_failed`). A table that was **written to after the swap** cannot be
+compared (its rows have changed): the digest also counts the rows whose `xmin` is newer than the swap of that node, and a difference with
+newer rows is `verified = 'skipped'` with the reason in `detail`, and the call that ends the operation raises a `WARNING` with it (also when
+the tables differ: the warning then says so). So the check is exact for a table nobody wrote since the swap, and **one write after the swap
+hides any loss**: a table that is written to constantly is never verified by this check, and the capture is then the only guard.
+Compare the retained old copy with the new table yourself in that case (the warning says so); the old copy is kept for
+`table_cleanup_delay`. A workload that only deletes in that window can give a false `failed`, which only keeps the old copy.
+The capture stores the keys with all their digits (it reads the key columns of the row, not a text of the row; the sessions of the engine
+run with `extra_float_digits = 3` like every control session) and in the base type of a
+domain, never as a jsonb of the whole row, so a float key, a domain key or a value over 256 MB does not change what is replayed or what a
+writer may write. A replay chunk that fails on a unique index other than the key (a unique value that moved from one row to another between
+two chunks) is repeated with the whole backlog.
+
+**What else changes.** The DDL guard refuses `ALTER TABLE` (also `SET SCHEMA` and `DISABLE TRIGGER`), `RENAME`, `DROP TABLE`, `DROP INDEX`, `DROP TRIGGER`,
+`DROP RULE`, `DROP POLICY`, `ALTER INDEX`, `CREATE INDEX`, `CREATE TRIGGER`, `CREATE RULE`, `CREATE POLICY` and `TRUNCATE` on the source
+of a running operation ("is being rebuilt by table operation N"). A bucket move of a claimed group is refused; so is a second operation on
+the group or the table. `create_distributed_table` does not choose a claimed group for a new table. `check_cluster()` also reports
+`table_operation_stalled`, `shadow_table`, `log_table`, `capture_trigger` (objects of an operation that is not running), `old_table` (an
+old copy overdue by an hour) and `table_verification_failed`.
+
+**Cost to writers.** One more insert into the log per changed row while the operation runs (the table is a plain table on the map group
+primary until the swap), and a wait from the first lock of the switch to its commit, bounded by the drain threshold and
+`rebuild_switch_timeout`. `t/145` measures a reader during the operation (under a second) and checks the table against a model of four
+writers (inserts, updates, deletes, `COPY`).
+
+**Disk and WAL.** While an operation runs the destination servers hold a second copy of the table with its indexes (about twice the
+size of the table and its indexes in total), and after the switch the retained old copy stays on the map group primary for
+`table_cleanup_delay` (ten minutes by default): up to three times the size at the peak. Every row is written once more to the WAL of its
+destination (and of the destination's standbys), every change during the operation is one more log row on the map group primary, and
+the verification reads the old copy and the new table once. A table whose size does not fit that room twice cannot be rebuilt online.
+
+**What the online variant does not promise.**
+
+- A value drawn by an explicit `nextval()` of an identity or owned sequence in the few milliseconds between the read of the sequence state
+  and its rename in the swap (writers cannot insert meanwhile, a call of `nextval()` alone can) is given twice (the design says so too).
+- The remaining window of the statements that wait for a table that is being distributed ("Transactions that run at the same time"):
+  a statement that names a plain table and a distributed table together and propagates (a foreign key from the plain table to the
+  distributed one, possible only on a cluster with one shard group) lets go of the lock of the plain table before it takes the lock of
+  the catalog. A call that starts on the plain table in those few instructions is not seen by the decision of that statement, which
+  then runs on a table that has become partitioned. It needs a DDL statement and an administrator's call on one table at the same
+  moment; the effect is on that statement, not on rows.
+
+Fault points: `rebuild_after_preparing`, `rebuild_after_shadow`, `rebuild_after_capture`, `rebuild_copy_chunk`, `rebuild_after_copy`,
+`rebuild_replay_chunk`, `rebuild_before_switch`, `rebuild_switch_after_lock`, `rebuild_switch_after_final_replay`,
+`rebuild_switch_before_swap`, `rebuild_switch_after_local_swap`, `rebuild_switch_after_remote_swap`, `rebuild_switch_after_prepare`,
+`rebuild_after_switch`, `rebuild_verify`, `rebuild_cleanup`, `rebuild_undo_after_triggers`, `rebuild_undo_after_shadows`; the points of the
+commit protocol can be scoped to the swap with `@tswitch` (`after_prepare@tswitch:kill`).
+
+Settings: `kingres_shard.rebuild_batch_rows`, `rebuild_drain_threshold`, `rebuild_lock_timeout`, `rebuild_switch_timeout`,
+`rebuild_switch_max_attempts`, `table_cleanup_delay` and `rebuild_verify` (see "Settings").
 
 ## Restoring a node from a logical dump
 
@@ -528,11 +835,24 @@ the files of the extension, because the dump creates the extension.
 | `kingres_shard.enable_routing` | on | When off, the planner and utility hooks do nothing. Superusers only (`PGC_SUSET`): with routing off a `SELECT` reads the local partitions only and a `TRUNCATE` clears this node only, which an administrator who repeats a statement on every node by hand wants and an ordinary session must not be able to switch on. |
 | `kingres_shard.enable_distributed_scan` | on | When off, a `SELECT` that spans shard groups raises the phase 1 error instead of reading the other groups (to forbid slow cross-group queries). |
 | `kingres_shard.scan_fetch_size` | 1000 | Rows requested from another group at a time by the distributed scan. |
+| `kingres_shard.enable_pushdown` | on | Master switch of the pushdown paths of a read (step 6: closed queries). Off: a read that spans shard groups is answered by the row-moving distributed scan, as before. `USERSET`; it chooses among plans that give the same answer, and grants nothing. |
+| `kingres_shard.enable_pushdown_closed` | on | Off: a closed query (see "Closed queries, run whole by every group") is not shipped (the partial aggregation has its own switch); the scan answers. `USERSET`. |
+| `kingres_shard.enable_partial_aggregation` | on | Off: an aggregate or a grouping that is not closed is not run in two steps (see "Partial aggregation"); the scan answers. `USERSET`. |
+| `kingres_shard.enable_pushdown_sort` | on | Off: a closed query is not sorted or limited by the groups; they send the rows unordered and this node sorts and limits them (see "Sort and limit of a closed query"). `USERSET`. |
+| `kingres_shard.enable_pushdown_join` | on | Off: the join of colocated tables is not run by the groups as a fragment of its own when the statement is not closed (see "Join rows"); the rows of each table come to this node. `USERSET`. |
+| `kingres_shard.shippable_extensions` | all | all, none, or a list of names from the list compiled into the library (see "Objects of extensions"): which extensions' objects may be shipped to the groups. A narrowing only. `USERSET`. |
 | `kingres_shard.enable_bulk_routing` | on | Off: an `INSERT` that goes to several shard groups is refused as in 0.5 (a multi-row `VALUES`, `INSERT ... SELECT`, a single row whose key is not a constant). A single row with a constant key never needed the router and is not affected. `USERSET`; it grants nothing. |
 | `kingres_shard.enable_colocated_insert_select` | on | Off: a colocated `INSERT ... SELECT` is not shipped whole: it goes through the row router when it can (no `ON CONFLICT DO UPDATE`) and is refused when it cannot. `USERSET`; it chooses among statements that give the same answer, and grants nothing. A cached plan keeps the path it was made with (as for every planner setting). |
 | `kingres_shard.enable_copy_routing` | on | Off: `COPY ... FROM` into a distributed table of a cluster with several groups is refused as in 0.5. `USERSET`. |
 | `kingres_shard.insert_batch_rows` | 1000 | Rows per batch that the row router sends to one group (1 to 100000). |
 | `kingres_shard.insert_batch_bytes` | 1MB | Text bytes per batch per group, the sum of the lengths of the values (16kB to 64MB). The memory of a bulk write is about two batches per group, whatever the number of rows. |
+| `kingres_shard.rebuild_batch_rows` | 10000 | Rows per chunk of the copy and of the replay of an online table operation (one transaction on every group it writes). `USERSET`. |
+| `kingres_shard.rebuild_drain_threshold` | 1000 | Entries of the capture log under which the switch is attempted. `USERSET`. |
+| `kingres_shard.rebuild_lock_timeout` | 200ms | The longest a lock request of the switch is queued behind other sessions. `USERSET`. |
+| `kingres_shard.rebuild_switch_timeout` | 10s | The longest one switch attempt lasts (locks, final replay, swap). `USERSET`. |
+| `kingres_shard.rebuild_switch_max_attempts` | 30 | Switch attempts in one call of `table_operation_advance(.., 'switching')`. `USERSET`. |
+| `kingres_shard.table_cleanup_delay` | 10min | How long the old copy of a replaced table is kept. 0 drops it after the check. `USERSET`. |
+| `kingres_shard.rebuild_verify` | on | Compare the old copy with the new table in the cleaning phase. `USERSET`. |
 | `kingres_shard.recovery_interval` | 30s | Seconds between runs of the recovery worker; 0 disables it. `sighup`. |
 | `kingres_shard.deadlock_check_interval` | 2s | Seconds between passes of the distributed deadlock detector; 0 disables it. `sighup`. |
 | `kingres_shard.deadlock_confirm_delay` | 200ms | Time between the two readings of the wait-for graph that confirm a cycle. `sighup`. |
@@ -543,7 +863,7 @@ the files of the extension, because the dump creates the extension.
 | `kingres_shard.node_timeout` | 60s | The longest the phases that cannot be left waiting may wait for a node (`COMMIT PREPARED`, the cleanup after an abort, savepoint rollbacks and releases, the recovery worker), the longest any statement of a control-plane call (`promote_node`, `add_node`, `remove_node`, `sync_catalog`, `rotate_secret`, `recover_prepared_transactions`, `create_distributed_table`) waits for a node, and the longest such a call waits for another call that changes the catalog (then `KS008`); the node's own lock wait in such a call ends at three quarters of it (README, "Bounds that apply to every call"). And, as `tcp_user_timeout` and keepalives, the time after which a connection to a node that does not answer at all is dead. The cancel request sent when a wait runs out is bounded too (a third of this value, at most `node_connect_timeout`, at least a second), so a node whose postmaster is stopped delays the committing session by `node_timeout` plus that, not until it resumes (S3-07). The recovery worker takes the value of the server configuration, whatever `ALTER DATABASE ... SET` says (S3-16); so for `node_connect_timeout`. |
 | `kingres_shard.forwarded` | off | Set by the router on the sessions it opens, together with `kingres_shard.forward_token`; fixed at connection time (`PGC_BACKEND`). A client that sets it without the token is refused. See "The forwarded flag" below. |
 | `kingres_shard.forward_token` | hidden | The proof of a forwarded session; never shown. |
-| `kingres_shard.fault_injection` | empty | Developer setting, superuser only: fails the commit protocol at a named point (`<point>:kill`, `:error`, `:wait:<file>`; points `before_prepare`, `after_first_prepare`, `after_prepare`, `after_log`, `after_commit`, `between_commit_prepared`; 0.5 adds `commit_waits_for_barrier`, `promote_before_change`, `promote_after_first_push`, `promote_after_push`, `restore_barrier_up`, `restore_all_quiet` and `recovery_before_resolve` (recovery has decided and is about to send COMMIT PREPARED or ROLLBACK PREPARED); `server_major:value:<n>` and `peer_major:value:<n>` make this node, or the nodes it connects to, report another PostgreSQL major to the checks that keep one major per cluster). Used by the tests; it adds no capability a superuser does not have. |
+| `kingres_shard.fault_injection` | empty | Developer setting, superuser only: fails the commit protocol at a named point (`<point>:kill`, `:error`, `:wait:<file>`, `:waitinv:<file>` (the same, and then the backend takes the invalidations that committed meanwhile: a test changes the catalog of the node behind the statement); points `before_prepare`, `after_first_prepare`, `after_prepare`, `after_log`, `after_commit`, `between_commit_prepared`; 0.5 adds `commit_waits_for_barrier`, `promote_before_change`, `promote_after_first_push`, `promote_after_push`, `restore_barrier_up`, `restore_all_quiet` and `recovery_before_resolve` (recovery has decided and is about to send COMMIT PREPARED or ROLLBACK PREPARED); `server_major:value:<n>` and `peer_major:value:<n>` make this node, or the nodes it connects to, report another PostgreSQL major to the checks that keep one major per cluster). Used by the tests; it adds no capability a superuser does not have. |
 
 ### Node connection options
 
@@ -1070,6 +1390,24 @@ known. There is no partial result.
 **Memory.** At most one batch is in flight per remote group, and the previous answer is read before the
 next batch is sent, so the memory is about two batches (`insert_batch_bytes`) per group plus the batch of
 the source cursor and the `RETURNING` rows not yet handed out (a tuplestore: `work_mem`, then disk),
+
+The batch of the source cursor is bounded in bytes as well: it is fetched in steps that follow the widest row seen
+so far, about `insert_batch_bytes` plus one row, down to one row at a time (`t/128_router_review_round.pl`).  One row
+is never split, and one very large value costs several times its size: the output string, the array literal and the
+message at the origin, and on the group the parameter, the array, the `unnest` row and the stored row (measured:
+about 5 times at the origin and 8 times at the receiving group for a value of 150 MB), so a value near the limit of
+1 GB of a column needs memory of that order on the group, and the statement then fails with an ordinary out of memory
+error.  The parameters of a batch follow the logging settings of each group (`log_statement`,
+`log_min_duration_statement`, `log_parameter_max_length`): a group that logs binds logs the values of a batch, up to
+`insert_batch_bytes`; the origin never logs the data of a `COPY`, and `pg_stat_activity.query` of a group shows the
+marker and the statement, never a value.  The wait for the answer to a batch has no bound of its own besides a cancel,
+`statement_timeout` and the keepalives; the locks of the statement stay on every group it wrote until then.
+
+**Refused with a message that names another cause.**  A `RETURNING` list that cannot be run by the groups (a cast of an
+integer to `text`, a whole-row reference, a system column, a sub-select, `random()`, `now()`) is refused with "the
+RETURNING list ... cannot be run by the shard groups" (an I/O cast of an immutable type is not shipped); a
+data-modifying CTE around a multi-group insert, `WITH i AS (INSERT INTO t SELECT ... RETURNING id) SELECT ...`, is
+refused with the 2a message "statements that span shard groups are not supported yet".  Both fail closed.
 whatever the number of rows (`t/117_bulk_memory.pl`).
 
 **Waits.** The send is non-blocking and a wait for room in the socket is a latch wait, the answer is read
@@ -1182,13 +1520,212 @@ the same text in any other session as an ordinary statement; a forged fragment i
 placement `KS001`. During a rolling upgrade set the switch off on every node (the groups must run the same
 version, which the placement probes of the scans check).
 
+## Closed queries, run whole by every group (phase 2b, step 6)
+
+A `SELECT` that spans shard groups is normally answered by the distributed scan, which moves rows to the node
+that runs the statement.  A **closed** query is one whose every output row depends on the rows of one group only:
+a `GROUP BY` that contains the distribution key (or a key that is equal to it through a join on the keys), a
+`DISTINCT` that has the key in its select list, a join of colocated tables on their keys with a reference table
+or without.  Each group computes its own final rows from its own buckets and only those rows cross the network
+(the "Kingres Fragment Scan" of `EXPLAIN`); the node that runs the statement runs its own group's part through
+SPI, concatenates, and applies `OFFSET` and `LIMIT` itself and, when the groups do not sort for it (see "Sort and limit of a closed query"), `ORDER BY`.  The planner takes this
+path only when its cost is lower than the scan's; a statement outside it gets the plan it got before.
+
+What is sent is the statement with its parameters (`$1`...), after a check that the groups would accept its text
+(the origin parses and rewrites the text it deparsed and runs the group's own rule on it).  The marker is the
+comment `/* kingres:query-fragment place=<n> */`; a group refuses a statement that no rule accepts with `0A000`
+and a stale placement with `KS001`.  Reading is checked as the scan is (the placement of the colocation group
+before and after the cursors are opened, the partitions of every table, one node per group in a transaction).
+
+Not shipped as a closed query (the scan answers, or the partial aggregation below does for an aggregate or a grouping): a grouping or `DISTINCT` that does not contain the key, an aggregate with no
+`GROUP BY`, grouping sets, `DISTINCT ON`, aggregates whose result depends on the order of the
+rows (`array_agg`, `string_agg`, floating point sums), a function that is not built in and immutable (`now()`),
+a conversion through the text form of a value, a sub-select, a CTE, a view, a local table, a table of another
+colocation group, a key from the nullable side of an outer join, row-level security, a
+statement that locks rows, and a statement that reads one table and neither groups nor removes duplicates (nothing
+to gain).  `EXPLAIN (VERBOSE)` of the scan such a statement gets says why (`Pushdown: not used: ...`).  A statement that reads a view of another
+owner is not answered by the scan either: it is refused with an error, on every path ("Views" in the limitations of phase 2a).
+
+`EXPLAIN` of a shipped statement shows `Pushed:`, `Groups: 3 of 3 (local + 2 remote)` (with `; pruned by <column>`
+when a restriction on the key left groups out), and `Remote SQL:`; `EXPLAIN ANALYZE` adds `Rows from groups:`.
+
+**What is never shipped, and what is refused.**  A `FULL JOIN` is shipped whole only between distributed tables whose key equality is in its `ON` clause; one with a
+reference table, or without that equality, is not (the scan answers).  In a
+colocated `INSERT ... SELECT` every cast that is not text to text goes through the row router, not through the groups; the
+groups run one after another, not at once.  `ON CONFLICT DO SELECT` (19) is refused, not merely "not shipped".  A
+parameter, an array, a range or a row of a `reg*` type is not shipped (each group would resolve the name to its own
+object).  `FROM ONLY` a distributed table is refused on every path ("FROM ONLY is not supported for distributed table"), and so is `TABLESAMPLE` of one
+("TABLESAMPLE is not supported for distributed table"): a sample of a table that is spread over groups is not one sample of the table; a reference
+table and a local table are sampled as on a single node, and a `random()` condition samples a distributed table.
+A closed query that returns about as many rows as it reads (a grouping or `DISTINCT` by a unique key of one table) is
+left to the scan: the groups would return the same rows.  `EXPLAIN ANALYZE` of a fragment scan shows the time to the
+first batch of each group.
+The test is not the planner's estimate of the number of groups (it comes from the rows of this node): a grouping or `DISTINCT`
+whose columns contain every column of a unique index of the table (immediate, valid, no predicate, no expression) is
+left to the scan whatever the statistics say.  `DEBUG1` shows the two numbers it compared.
+
+**What a value of a `reg*` type means.**  On the paths that evaluate at this node (the scan, a fragment scan that is not
+shipped, the router, a colocated `INSERT ... SELECT` that is not shipped) it is the value this node computes: the OID
+of this node's object.  A statement that names one key goes to its group as the text the user wrote (the 2a path,
+unchanged) and that group resolves the names in it itself: a raw OID that one node computed and stored in a column is
+not an object of another node, and such a column is not portable between nodes.  t/137 uses a table whose OID differs on
+every node and runs every node as the origin.
+
+Switches: `kingres_shard.enable_pushdown` and `kingres_shard.enable_pushdown_closed`.  Fault points of the tests:
+`frag_before_probe`, `frag_after_probe_before`, `frag_after_declare`, `frag_local_open`, `frag_after_probe_after`,
+`frag_first_fetch`, `frag_before_fetch`, `frag_wait_batch`, `frag_local_fetch`, `frag_declared_g<n>`; the windows of the defences against a catalog that changed after the plan (t/136): `insel_before_rels_check`, `insel_before_start_check`, `insel_before_text_parse`, `query_before_text_parse`.  A statement
+that is cancelled, or fails, while a group runs its part asks the group to stop it (bounded), so a group that is
+blocked by a lock does not hold the end of the statement for `node_timeout`.
+
+**Under `debug_discard_caches`.**  A node runs under the setting (every cache is discarded at every lock and every
+catalog access) as it runs without it.  The cache of the catalog that was replaced is kept until the end of the
+transaction, so that the pointers a statement holds stay valid (a node, a distributed table, a colocation group), and the
+planner makes its analysis again with the new cache when the cache changed under it.  `add_node` and the check of the
+synchronous standbys of the other primaries copy what they need before they connect.  t/135 runs a cluster under the setting.
+
+## Join rows (phase 2b, step 10)
+
+A statement that is not closed as a whole (a window function that is not partitioned by the key, an ordered-set aggregate,
+`count(DISTINCT ...)`, `DISTINCT ON`, a `FULL JOIN` with a window above it) but whose distributed tables are joined on their
+distribution keys (with reference tables if it likes) has a join that every group can compute on its own rows.  The join of the
+whole level is then a fragment of its own: the groups return the rows of the join, with the columns the rest of the plan needs
+(`EXPLAIN` shows `Pushed: join rows (on key)` and `Remote SQL: SELECT s1.id, s2.c FROM (public.s1 JOIN public.s2 ON ...) WHERE ...`), and
+this node plans what is above it (the window, the aggregate, the sort) as for any scan, so only the joined rows cross, not the rows of
+each table.  The text is a closed query (a join on the key and no aggregate), so the group's rule for the fragment of a closed query
+accepts it; nothing new can be asked of a group.  Permitted: an inner join of any mix of distributed and reference tables
+in one key class, a left, right or full join between distributed tables with the key equality in the `ON` clause of that join, and a
+distributed table left joined to a reference table.  Not pushed: a reference table on the preserved side of an outer join (every group would emit
+its unmatched rows), a join on a non-key column, two colocation groups or two key classes, a sub-select, a view, a local table.  The planner
+chooses by cost between this, the partial aggregation, the closed query and the scans; a closed statement keeps its own path.  The
+hook runs for the join relation of the whole level only, once, and never for a grouped relation (19, eager aggregation).  Switch:
+`kingres_shard.enable_pushdown_join` (on).
+
+
+## Sort and limit of a closed query (phase 2b, step 9)
+
+The groups sort the rows of a closed query and this node merges the sorted streams.  What is sent is the query with its `ORDER BY`
+(the select list holds every sort expression: an entry that only orders is sent as a column) and, when the limit is pushed, `LIMIT <count +
+offset>` with no `OFFSET`; every group returns its first rows of the final order, the `Kingres Fragment Scan` merges the streams with
+one `SortSupport` per key (the ordering operator, the direction, `NULLS FIRST` or `LAST` and the collation of the key, as the planner
+takes them for a `Sort`), so there is no `Sort` above it, and the `Limit` of this node applies the offset and the limit to the merged
+stream.  A tie goes to the stream of the group with the lower group id (this node's own part has the id of its own group), so rows that compare equal come out in the same order whichever node runs the statement, and in the same order when the statement is repeated.  `EXPLAIN` shows
+`Merge keys: <n>` and the text with `ORDER BY` and `LIMIT`.  A cursor that is closed early closes the cursors of the groups; a group that
+answers late holds the merge up for as long as it has to.
+
+Pushed only when this node can order exactly as the groups do: the ordering operator of every key is a built-in btree operator and
+the collation of the key is the default or `C`; otherwise the groups send the rows unordered and this node sorts them, as before.  The
+limit is pushed only with a sort that is pushed (or none).  Constants that fit in `bigint` are summed here (`LIMIT 7 OFFSET 20` sends
+`LIMIT 27`).  A parameter, or an expression of parameters and of immutable and stable functions (`LIMIT $1 OFFSET $2`, `LIMIT
+current_setting('x')::int`), is computed by this node when the scan starts, so it follows the values of each execution of a prepared
+statement and of a generic plan; count + offset is sent as one more `bigint` parameter (`LIMIT $n`).  `NULL`, a negative number and a sum
+that does not fit send no limit (`NULL`): this node's own `Limit` node then raises the single node's error for a negative count or
+offset, so the error is never one that a group made.  `LIMIT ALL`, `OFFSET` alone, `FETCH FIRST ... WITH TIES`, and an expression with
+a column, a volatile function or a sub-select send no limit (the merge still holds).  A group accepts a fragment with a limit only when
+it is one constant or one `bigint` parameter, with no `OFFSET`.  An aggregate or grouping that is not closed has nothing
+to push: its rows are sorted after the final aggregation.  Switch: `kingres_shard.enable_pushdown_sort` (on).
+
+
+## Partial aggregation (phase 2b, step 7)
+
+An aggregate or a grouping that is not closed (it does not contain a distribution key: `SELECT count(*) FROM t`, `SELECT a,
+sum(b) FROM t GROUP BY a`, the same over a join of tables of one colocation group on their keys, or with a reference table)
+is run in two steps.  Every group aggregates its own rows and returns one row per group of rows, with the transition
+state of each aggregate (a state of type `internal` is returned serialized, as `bytea`, by the aggregate's own
+serialization function); the node that runs the statement combines the states with the planner's own final aggregation
+(`Finalize HashAggregate`, `Finalize GroupAggregate` or `Finalize Aggregate` in `EXPLAIN`, over the `Kingres Fragment
+Scan`), applies `HAVING`, runs the final functions, and everything above (`ORDER BY`, `LIMIT`, a window function over
+the result, `DISTINCT` and `DISTINCT ON` of the result) is planned by PostgreSQL as usual: the text a group receives has neither a window
+nor `DISTINCT`, and a group that is sent one refuses it.  The marker of the text a group receives is
+`/* kingres:partial-fragment place=<n> */`; a group refuses what its rule does not accept (a statement with `HAVING`,
+`ORDER BY`, `LIMIT`, `DISTINCT`, a window, an aggregate that cannot be split, an aggregate inside an expression) with
+`0A000`, and a stale placement with `KS001`, as for a closed query.  The placement check, the cursors, the local part of
+this node, pruning, cancel and failover are those of the fragment scan.
+
+What is split: the built-in aggregates that have a combine function and, for an internal state, a serialization pair
+(`any_value`, `array_agg`, `avg`, `bit_and`, `bit_or`, `bit_xor`, `bool_and`, `bool_or`, `corr`, `count`, `covar_pop`,
+`covar_samp`, `every`, `max`, `min`, `range_intersect_agg`, the `regr_*` family, `stddev`, `stddev_pop`, `stddev_samp`,
+`string_agg`, `sum`, `var_pop`, `var_samp`, `variance`), with `FILTER`, over any type that is shipped.  The test t/139
+recomputes this list from `pg_aggregate` and fails when a release changes it.  Not split (the scan answers, the answer is the
+same): `DISTINCT` or `ORDER BY` inside the call, ordered-set and hypothetical-set aggregates, `json_agg`, `jsonb_agg`,
+the `*_object_agg` family, `range_agg`, `xmlagg` (no combine function), grouping sets, a column of type `money`, an aggregate of an extension that is not on the compiled-in list, a table of another colocation group, a local table, a sub-select.
+
+**Floating point and order.**  The partial states are combined in the order the groups answer, as in a parallel plan.  A
+floating point `sum`, `avg`, `stddev`, `variance`, `corr` or `regr_*` can therefore differ from the single node's in the
+last digits, and between two runs of one query; `array_agg` and `string_agg` without `ORDER BY` give the elements in
+an order that SQL leaves open.  (The closed query of step 6 never ships such an aggregate: it is run by the scan.)
+`kingres_shard.enable_partial_aggregation = off` restores the scan.  The tests compare a float to nine digits and sort
+the elements of an array.
+
+Switch: `kingres_shard.enable_partial_aggregation` (on; `enable_pushdown` is the master switch).  `DEBUG1` says why a
+statement is not split.
+
+## Objects of extensions (phase 2b, step 8)
+
+The functions, operators, types and aggregates of an extension are shipped to the groups when the extension is on a list that is
+compiled into `kingres_shard` (today `kingres_sketch`, version `1.0`), when the version installed on the node is one the list
+accepts, and when the object meets the rules below.  The `kingres_sketch` aggregates (`approx_count_distinct`, `hll_add_agg`,
+`hll_union_agg`, `topn_add_agg`, `tdigest_agg`, `approx_percentile`, ...) then run as partial aggregations and, when the query is
+closed, whole; a column of a sketch type crosses as its text form (`\x` and the hex digits).  The rules (`ext_object_ok`):
+a function or aggregate is written in C or `internal`, is `IMMUTABLE`, is not `SECURITY DEFINER`, has no `SET` clause, and has
+argument and result types that are built in or of the list; a type is a base type of the extension whose input, output, `send` and
+`receive` functions are the extension's; an operator is a member whose function meets the rule for functions.  A function of a user,
+whatever its label, is not shipped: functions are not synchronized between the nodes.
+
+The marker names the extensions the statement uses with their versions, `/* kingres:partial-fragment place=<n>
+ext=kingres_sketch:1.0 */` (the same for `kingres:query-fragment`).  A group compares them with its own catalog before it
+analyses the text: another version, or none, is `KS001` with the message "extension kingres_sketch is at version 1.0 here and 0.9
+at the node that sent the statement", and the hint says a repeat does not help before the upgrade is finished on every node.  A
+statement that uses an extension its marker does not name, or a marker that names one the statement does not use, is `0A000`.  A
+group that does not have the extension at all fails earlier, when it parses the text (the function does not exist there); PostgreSQL has no hook
+between the parser and the analysis of the `DECLARE`, so the node that sent the statement, which knows from the marker what the statement uses,
+turns that failure into the `KS001` of a version difference ("node host:port does not have an extension that the statement uses
+(kingres_sketch:1.0)", with what the node said as the detail).  This is the
+one place where a shipped statement can fail for a reason the scan would not have; the escape is
+`SET kingres_shard.shippable_extensions = 'none'`, with which the node that runs the statement reads the rows and runs the
+aggregate itself.
+
+`kingres_shard.shippable_extensions` (`USERSET`, default `all`) is `all`, `none` or a comma-separated list of names from the
+compiled-in list; another name is an error when it is set.  It is read at the node that runs the statement and only narrows what the
+code allows, so any user may set it.  Comparing `kingres_sketch.self_test()` and the encoding between nodes belongs to `add_node` and
+`check_cluster` (phase 12); this step checks the version only.  Objects of an extension are allowed in the fragment of a closed
+query and of a partial aggregation only; the scan, the writes and the colocated `INSERT ... SELECT` never ship them.
+
+
 ## Limitations in phase 2a
 
 Read these first; each is a reviewed boundary, not an accident.
 
 - **No global snapshot** (see Guarantees). The distributed scan is slow for
-  large tables by design: it moves rows, it pushes down restrictions only
-  (aggregates, sorts, limits and colocated joins are phase 2b).
+  large tables by design: it moves rows. Since phase 2b the planner can run a closed query, an
+  aggregate, a sorted stream with a limit and a join of colocated tables in the groups so that only their
+  results cross (the sections of phase 2b above); what none of those paths accepts is answered by the
+  scan, which moves the rows of every table involved. `EXPLAIN (VERBOSE)` says why a statement was not pushed.
+- **Differences from a single node that pushdown makes visible.**
+  - A cursor with neither `SCROLL` nor `NO SCROLL` over a pushed ordered statement (the merge of the sorted
+    streams) cannot scan backward: `FETCH BACKWARD` fails with "cursor can only scan forward". On a single node
+    the same cursor can, when the plan happens to allow it. Declare the cursor `SCROLL` (it then reads the
+    rows through a `Material` node and the pushed path stays) or accept forward only.
+  - A pushed statement can fail with `KS001` (a placement or an extension version that changed or that differs
+    between nodes) where the scan would have waited or answered; the client repeats it (for a version difference,
+    after the upgrade has reached every node).
+  - The groups run a pushed statement with the settings the extension sends and `search_path = pg_catalog`;
+    a function that reads other settings is not shipped (only built-in immutable functions and the listed
+    extension objects are).
+  - A floating point aggregate can differ in the last digits from the single node's and between runs, and
+    the elements of an `array_agg` or `string_agg` without `ORDER BY` come in an order SQL leaves open.  The same holds
+    for `min` and `max` of values that compare equal and print differently (`numeric` 57 and 57.00): any of them is
+    returned, and which one changes between runs (a single node leaves it open too).
+  - **`SET ROLE` to a role that cannot log in.**  The groups are reached as the current role (`current_user`), so after
+    `SET ROLE` to a role with `NOLOGIN` every read that spans groups fails ("role ... is not permitted to log in") where a
+    single node answers.  The scan has the same limit.  It leaks nothing (a role with no privilege is denied on both); use a role
+    that can log in, or connect as the role.
+  - A `LIMIT` that is a parameter or an expression of parameters and stable functions is computed when the
+    scan starts; an expression with a column, a volatile function or a sub-select is not pushed (the merge
+    still holds, and this node's `Limit` node applies it).
+  - Not pushed at all, answered by the scan: grouping sets, a `FULL JOIN` with a reference table or without the key equality in its `ON` clause, aggregates without a
+    combine function when the query is not closed (`json_agg`, `jsonb_agg`, `*_object_agg`, `range_agg`, `xmlagg`), `DISTINCT` or
+    `ORDER BY` inside an aggregate call, statements with sub-selects, CTEs, views, local tables, tables of
+    two colocation groups, a table with row-level security, and a statement that locks rows.
 - **Writes that span groups.** `MERGE` and an `UPDATE` or `DELETE` that cannot be
   shipped are refused. A write that uses a function that is not built in cannot be
   shipped. (A multi-row `INSERT`, `INSERT ... SELECT` and `COPY ... FROM` into a
@@ -1540,7 +2077,9 @@ active primary also `extension_version_differs` (the node runs another version o
 extension: nothing else is compared with it, so a copy of a reference table that could not be
 read is not reported as one that differs), `secret_missing` (the node holds no cluster secret),
 `server_major_differs` (the node runs another PostgreSQL major than the map
-group primary); and for every reference table `reference_table_differs` (a node whose copy has other rows).
+group primary); and for every reference table `reference_table_differs` (a node whose copy has other rows);
+and for the online table operations (9.3) `table_operation_stalled`, `shadow_table`, `log_table`, `capture_trigger`,
+`old_table` and `table_verification_failed` (see "The online variants").
 No rows means consistent, in this sense: it is a **structural** check (catalogs, which
 partitions exist where, what a move left behind). It never compares the rows, indexes,
 constraints or replica identity of a partition with its parent, so a copy that diverged
@@ -2249,8 +2788,8 @@ assert the bound with it:
 |---|---|---|
 | `sync_catalog` | 12 | |
 | `rotate_secret` | 11 | |
-| `create_distributed_table` | 7 | |
-| `create_reference_table` | 7 + one per batch of the copy (a batch is at most 20000 values: a table of 60000 rows of two columns is six batches, 13 statements) | the rows and columns of the table |
+| `create_distributed_table` | 11 | the version handshake, the questions of the report about roles and functions, the shadow and its partitions, the swap and the final statements (0.7; it was 7 before) |
+| `create_reference_table` | 11 + about one per batch of the copy (a batch is at most 20000 values: a table of 60000 rows of two columns is 16 statements in the test) | the rows and columns of the table |
 | `recover_prepared_transactions` | 4 + 2 per prepared transaction of the node (6 for one) | the transactions in doubt |
 | `add_node`, the new node | 15 | one statement per table of the cluster, one per foreign key and per object whose privileges are copied, one per batch of the copy of a reference table |
 | `add_node`, a node already in the cluster | 8 | |

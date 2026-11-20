@@ -77,6 +77,7 @@
 
 #include "catalog.h"
 #include "dist_scan.h"
+#include "fragment_scan.h"
 #include "kingres_shard.h"
 #include "planner.h"
 #include "node_conn.h"
@@ -92,32 +93,14 @@
 #define DS_PRIV_PLACEMENT	4	/* String: placement of the colocation group the statement was planned with */
 #define DS_PRIV_PARTITIONS	5	/* String: identity of the partitions of the table on this node, in the plan; "" when it is not partitioned */
 #define DS_PRIV_PRUNE		6	/* List: the pruning terms of the restrictions (prune.c); NIL: every group is asked */
+#define DS_PRIV_REASON		7	/* String: why the statement is not pushed down ("" when the question was not asked) */
 
 /* Rows requested from a remote group at a time. */
 int			kingres_shard_scan_fetch_size = 1000;
 
 static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL;
 static bool distscan_active = false;
-static uint64 cursor_serial = 0;
 
-/* A fragment: the query of one remote group, read through a cursor. */
-typedef struct DsFrag
-{
-	struct KsDistScanState *scan;
-	KsConn	   *kc;
-	char		cursor[40];
-	bool		declared;
-	bool		exhausted;
-	bool		in_flight;		/* a FETCH was sent and not yet read */
-	bool		failed;			/* the answer was read where no error may be raised: raise it when the batch is needed */
-	PGresult   *res;			/* the batch being consumed */
-	int			nrows;
-	int			next_row;
-	char	   *host;
-	int			port;
-	int			group_id;
-	int64		identity;		/* identity of the node's partitions when it was first asked */
-} DsFrag;
 
 typedef struct KsDistScanState
 {
@@ -125,6 +108,8 @@ typedef struct KsDistScanState
 	char	   *sql;
 	Oid			relid;
 	int			nchild;			/* scan columns the child returns */
+	int			colocation_id;	/* of the table, from the catalog when the scan starts */
+	char	   *reason;			/* why the statement is not pushed (EXPLAIN VERBOSE), "" when it was not asked */
 	int64		plan_placement;	/* placement of the colocation group in the plan (the local partitions are those of it) */
 	bool		plan_has_parts;	/* the table is partitioned on this node */
 	int64		plan_partitions;	/* identity of its partitions in the plan (catalog.c) */
@@ -134,8 +119,7 @@ typedef struct KsDistScanState
 	PlanState  *child;
 	bool		started;
 	bool		child_done;
-	List	   *frags;			/* of DsFrag * */
-	int			cur;			/* round-robin position */
+	KsFragSet	fs;				/* the fragments (fragment_scan.c) */
 	FmgrInfo   *infuncs;
 	Oid		   *typioparams;
 	int32	   *typmods;
@@ -157,8 +141,6 @@ static TupleTableSlot *ds_exec_scan(CustomScanState *node);
 static void ds_end_scan(CustomScanState *node);
 static void ds_rescan(CustomScanState *node);
 static void ds_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es);
-static void ds_finish_pending(void *owner, bool quiet);
-static void ds_stop(KsDistScanState *s, bool close_cursors);
 
 static const CustomPathMethods ds_path_methods = {
 	.CustomName = "Kingres Distributed Scan",
@@ -206,77 +188,28 @@ kingres_shard_distscan_set_active(bool active)
 }
 
 /*
- * The shard groups other than this one that own buckets of a table and can hold
- * rows the statement wants: their primaries, copied into the current memory
- * context.  The groups that the restrictions rule out are left out (pruning,
- * design 4.5): terms are the pruning terms of the plan and params the values of
- * its parameters (NULL: a parameter without a value prunes nothing).  *nall, when
- * given, is the number of remote groups before pruning, and *pruned whether a term
- * applied.
+ * The groups other than this one that own buckets of a table and can hold rows the statement
+ * wants: their primaries, as fragments (fragment_scan.c).  The groups that the restrictions rule out
+ * are left out (pruning, design 4.5): terms are the pruning terms of the plan and params the values of
+ * its parameters (NULL: a parameter without a value prunes nothing).  *nall, when given, is the
+ * number of remote groups before pruning, and *pruned whether a term applied.
  */
 static List *
 remote_groups_of(const KsDistTable *dt, const KsCatalog *cat, List *terms,
 				 ParamListInfo params, int *nall, bool *pruned_out)
 {
-	List	   *groups = NIL;
-	List	   *result = NIL;
-	List	   *allowed = NIL;
-	bool		pruned = false;
-	int			b;
-	ListCell   *lc;
+	KsFragPrune item;
+	List	   *prune = NIL;
 
-	for (b = 0; b < kingres_shard_coloc_nbuckets(dt->coloc); b++)
-	{
-		int			g = kingres_shard_bucket_group(dt->coloc,
-												   kingres_shard_coloc_bucket(dt->coloc, b));
-
-		if (g >= 0 && g != cat->local_group_id && !list_member_int(groups, g))
-			groups = lappend_int(groups, g);
-	}
-	if (nall != NULL)
-		*nall = list_length(groups);
 	if (terms != NIL)
 	{
-		/*
-		 * The terms are evaluated in a context of their own, which is deleted at once: a
-		 * rescan starts the scan again and again in the query context, and the arrays of a
-		 * large IN list (detoasted, deconstructed) must not stay until the statement ends
-		 * (review P2B-04).  Only the list of groups is copied out.
-		 */
-		MemoryContext tmp = AllocSetContextCreate(CurrentMemoryContext, "kingres_shard pruning",
-												  ALLOCSET_DEFAULT_SIZES);
-		MemoryContext oldcxt = MemoryContextSwitchTo(tmp);
-		List	   *found = kingres_shard_prune_groups(dt, terms, params, &pruned);
-
-		MemoryContextSwitchTo(oldcxt);
-		foreach(lc, found)
-			allowed = lappend_int(allowed, lfirst_int(lc));
-		MemoryContextDelete(tmp);
+		item.relid = dt->relid;
+		item.terms = terms;
+		prune = list_make1(&item);
 	}
-	if (pruned_out != NULL)
-		*pruned_out = pruned;
-	foreach(lc, groups)
-	{
-		int			g = lfirst_int(lc);
-		const KsNode *n;
-		DsFrag	   *f;
-
-		if (pruned && !list_member_int(allowed, g))
-			continue;
-		n = kingres_shard_group_primary(g);
-
-		if (n == NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("shard group %d has no active primary node", g)));
-		f = palloc0(sizeof(DsFrag));
-		f->group_id = g;
-		f->host = pstrdup(n->host);
-		f->port = n->port;
-		result = lappend(result, f);
-	}
-	return result;
+	return kingres_shard_frag_choose(dt->coloc, cat, prune, params, NULL, nall, pruned_out);
 }
+
 
 /* Does a restriction clause list contain a constant false or NULL clause? */
 static bool
@@ -458,44 +391,6 @@ ds_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	rel->consider_partitionwise_join = false;
 }
 
-/*
- * Replace the external parameters of a clause by consecutively numbered ones,
- * recording the original ids in order, for a fragment that carries only the
- * parameters it uses.
- */
-typedef struct ParamRenumber
-{
-	List	   *ids;			/* original ids, position = new id - 1 */
-} ParamRenumber;
-
-static Node *
-renumber_params(Node *node, ParamRenumber *ctx)
-{
-	if (node == NULL)
-		return NULL;
-	if (IsA(node, Param))
-	{
-		Param	   *p = (Param *) copyObject(node);
-		int			pos = -1;
-		int			i = 0;
-		ListCell   *lc;
-
-		foreach(lc, ctx->ids)
-		{
-			if (lfirst_int(lc) == p->paramid)
-				pos = i;
-			i++;
-		}
-		if (pos < 0)
-		{
-			ctx->ids = lappend_int(ctx->ids, p->paramid);
-			pos = list_length(ctx->ids) - 1;
-		}
-		p->paramid = pos + 1;
-		return (Node *) p;
-	}
-	return expression_tree_mutator(node, renumber_params, ctx);
-}
 
 /*
  * A system column of a distributed table was asked for.  In an UPDATE or
@@ -556,7 +451,7 @@ ds_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	StringInfoData sql;
 	StringInfoData select;
 	List	   *pushed = NIL;
-	ParamRenumber prn = {NIL};
+	KsParamRenumber prn = {NIL};
 	List	   *dpcontext;
 	int			nest;
 	char	   *nsp = get_namespace_name(get_rel_namespace(relid));
@@ -686,7 +581,7 @@ ds_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 			Node	   *c = (Node *) copyObject(q);
 
 			ChangeVarNodes(c, rel->relid, 1, 0);
-			c = renumber_params(c, &prn);
+			c = kingres_shard_renumber_params(c, &prn);
 			pushed = lappend(pushed, c);
 		}
 	}
@@ -718,6 +613,8 @@ ds_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 													   plan_placement(relid))));
 	cscan->custom_private = lappend(cscan->custom_private, lsecond(best_path->custom_private));
 	cscan->custom_private = lappend(cscan->custom_private, lthird(best_path->custom_private));
+	cscan->custom_private = lappend(cscan->custom_private,
+									makeString(kingres_shard_pushdown_reason() != NULL ? pstrdup(kingres_shard_pushdown_reason()) : pstrdup("")));
 	cscan->methods = &ds_scan_methods;
 	return &cscan->scan.plan;
 }
@@ -743,6 +640,7 @@ ds_create_scan_state(CustomScan *cscan)
 		s->plan_partitions = s->plan_has_parts ? pg_strtoint64(ident) : 0;
 	}
 	s->prune_terms = (List *) list_nth(p, DS_PRIV_PRUNE);
+	s->reason = pstrdup(strVal(list_nth(p, DS_PRIV_REASON)));
 	foreach(lc, (List *) list_nth(p, DS_PRIV_PARAMS))
 		s->param_ids = lappend_int(s->param_ids, intVal(lfirst(lc)));
 	return (Node *) s;
@@ -785,44 +683,6 @@ rewrite_for_scan(Node *node, ExprRewrite *ctx)
 	return expression_tree_mutator(node, rewrite_for_scan, ctx);
 }
 
-/*
- * The batches of a scan that an error ended are libpq memory (malloc), which
- * the memory context machinery does not know: a reset callback of the context
- * of the query clears them (review finding S2-17); an error never reaches
- * ExecEndNode.
- */
-static void
-ds_reset_callback(void *arg)
-{
-	KsDistScanState *s = (KsDistScanState *) arg;
-	ListCell   *lc;
-
-	foreach(lc, s->frags)
-	{
-		DsFrag	   *f = (DsFrag *) lfirst(lc);
-
-		/*
-		 * A connection must not keep pointing at a scan whose memory goes now
-		 * (S6-02): whatever way the statement ended, an error, the abort of a
-		 * subtransaction, a portal that is dropped.  What the scan had asked
-		 * for is read and dropped.
-		 */
-		if (f->kc != NULL && f->in_flight)
-		{
-			kingres_shard_conn_abandon_pending(f->kc, f);
-			f->in_flight = false;
-		}
-
-		/*
-		 * PostgreSQL 19 wraps every libpq result in an object that the memory
-		 * context frees itself, in a reset callback registered after this one,
-		 * so the results are gone already (see pg_compat.h).
-		 */
-		if (!KS_LIBPQ_RESULTS_OWNED_BY_CONTEXT && f->res != NULL)
-			PQclear(f->res);
-		f->res = NULL;
-	}
-}
 
 static void
 ds_begin_scan(CustomScanState *node, EState *estate, int eflags)
@@ -839,13 +699,7 @@ ds_begin_scan(CustomScanState *node, EState *estate, int eflags)
 				 errmsg("a distributed scan cannot run in a parallel worker"),
 				 errhint("Mark the function that runs the statement PARALLEL RESTRICTED or PARALLEL UNSAFE.")));
 	kingres_shard_fault_point("scan_begin");
-	{
-		MemoryContextCallback *cb = MemoryContextAlloc(estate->es_query_cxt, sizeof(MemoryContextCallback));
-
-		cb->func = ds_reset_callback;
-		cb->arg = s;
-		MemoryContextRegisterResetCallback(estate->es_query_cxt, cb);
-	}
+	kingres_shard_fragset_init(&s->fs, estate->es_query_cxt, 1);
 	s->child = ExecInitNode((Plan *) linitial(cscan->custom_plans), estate, eflags);
 	node->custom_ps = list_make1(s->child);
 
@@ -880,176 +734,24 @@ ds_begin_scan(CustomScanState *node, EState *estate, int eflags)
 	}
 }
 
-/* ---- remote fragments ---- */
 
-/* The value of an external parameter, as text, for the fragment. */
-static const char **
-fragment_params(KsDistScanState *s, Oid **types_out, int *n_out)
+/* ---- remote fragments (the machinery is fragment_scan.c) ---- */
+
+/* The origin's own partitions are compared again when the cursors of the other groups are open. */
+static void
+ds_after_check(void *arg)
 {
-	ParamListInfo params = s->css.ss.ps.state->es_param_list_info;
-	int			n = list_length(s->param_ids);
-	const char **values = palloc0(sizeof(char *) * Max(n, 1));
-	Oid		   *types = palloc0(sizeof(Oid) * Max(n, 1));
-	int			nest;
-	int			i = 0;
-	ListCell   *lc;
+	KsDistScanState *s = (KsDistScanState *) arg;
 
-	nest = kingres_shard_set_transmission_modes();
-	foreach(lc, s->param_ids)
-	{
-		int			id = lfirst_int(lc);
-		ParamExternData *prm;
-		ParamExternData workspace;
-		Oid			outfunc;
-		bool		isvarlena;
-
-		if (params == NULL || id < 1 || id > params->numParams)
-			elog(ERROR, "no value for parameter $%d of a distributed scan", id);
-		if (params->paramFetch != NULL)
-			prm = params->paramFetch(params, id, false, &workspace);
-		else
-			prm = &params->params[id - 1];
-		types[i] = prm->ptype;
-		if (!prm->isnull)
-		{
-			getTypeOutputInfo(prm->ptype, &outfunc, &isvarlena);
-			values[i] = OidOutputFunctionCall(outfunc, prm->value);
-		}
-		i++;
-	}
-	kingres_shard_reset_transmission_modes(nest);
-	*types_out = types;
-	*n_out = n;
-	return values;
+	kingres_shard_check_origin_placement(s->colocation_id, s->plan_placement, "reading it");
+	kingres_shard_check_origin_partitions(s->relid, s->plan_has_parts, s->plan_partitions);
 }
 
 /*
- * Read the answer of the FETCH that is in flight.  With quiet (an abort path
- * asks, and nothing may be thrown) a failure is kept in the fragment and
- * raised when the scan asks for the batch (frag_check_failed).
- */
-static void
-frag_collect(DsFrag *f, bool quiet)
-{
-	PGresult   *res;
-	MemoryContext oldcxt;
-
-	if (!f->in_flight)
-		return;
-
-	/*
-	 * The batch outlives this call, and the call can come from another
-	 * statement that wants the connection (ds_finish_pending), in whatever
-	 * memory context that statement is in.  PostgreSQL 19 ties a libpq result
-	 * to the context it is made in (see pg_compat.h), so make it in the one of
-	 * the query, which lives as long as the scan does.
-	 *
-	 * The scan stays registered on the connection until the answer is read: if
-	 * the wait is interrupted, the abort paths find the owner and let go of it
-	 * (S6-02).
-	 */
-	oldcxt = MemoryContextSwitchTo(f->scan->css.ss.ps.state->es_query_cxt);
-	if (quiet)
-		res = kingres_shard_conn_collect_quiet(f->kc);
-	else
-	{
-		res = libpqsrv_get_result_last(f->kc->conn, PG_WAIT_EXTENSION);
-		kingres_shard_conn_clear_pending(f->kc, f);
-	}
-	MemoryContextSwitchTo(oldcxt);
-	f->kc->in_query = false;
-	f->in_flight = false;
-	if (res == NULL)
-	{
-		f->kc->have_error = true;
-		if (quiet)
-		{
-			f->failed = true;
-			return;
-		}
-		kingres_shard_fragment_error(f->kc, NULL, "FETCH");
-	}
-	if (PQresultStatus(res) != PGRES_TUPLES_OK)
-	{
-		if (quiet)
-		{
-			f->res = res;
-			f->failed = true;
-			return;
-		}
-		kingres_shard_fragment_error(f->kc, res, "FETCH");
-	}
-	f->res = res;
-	f->nrows = PQntuples(res);
-	f->next_row = 0;
-	if (f->nrows < kingres_shard_scan_fetch_size)
-		f->exhausted = true;
-}
-
-/* Raise what a quiet read of the answer found (see frag_collect). */
-static void
-frag_check_failed(DsFrag *f)
-{
-	PGresult   *res;
-
-	if (!f->failed)
-		return;
-	f->failed = false;
-	res = f->res;
-	f->res = NULL;
-	f->nrows = f->next_row = 0;
-	kingres_shard_fragment_error(f->kc, res, "FETCH");
-}
-
-/* Called when something else wants the connection while a FETCH is in flight. */
-static void
-ds_finish_pending(void *owner, bool quiet)
-{
-	DsFrag	   *f = (DsFrag *) owner;
-
-	frag_collect(f, quiet);
-}
-
-static void
-frag_send_fetch(DsFrag *f)
-{
-	char		sql[96];
-
-	snprintf(sql, sizeof(sql), "FETCH FORWARD %d FROM %s", kingres_shard_scan_fetch_size,
-			 f->cursor);
-	/* Another scan of this statement may have a fetch in flight on the same connection. */
-	kingres_shard_conn_quiesce(f->kc);
-	f->kc->in_query = true;
-	if (!PQsendQuery(f->kc->conn, sql))
-	{
-		f->kc->have_error = true;
-		f->kc->in_query = false;
-		ereport(ERROR,
-				(errcode(ERRCODE_CONNECTION_FAILURE),
-				 errmsg("could not send a command to node %s:%d", f->host, f->port),
-				 errdetail_internal("%s", kingres_shard_conn_error_text(f->kc->conn))));
-	}
-	f->in_flight = true;
-	kingres_shard_conn_set_pending(f->kc, f, ds_finish_pending);
-}
-
-/*
- * The statement fails the way a failed group does (placement_check.c, 4.6) when
- * a command cannot be sent: the connection is gone.
- */
-static void
-frag_send_failed(DsFrag *f, const char *what)
-{
-	f->kc->have_error = true;
-	f->kc->in_query = false;
-	kingres_shard_fragment_error(f->kc, NULL, what);
-}
-
-/*
- * Open the cursors on every group, then ask each for its first batch.  The
- * procedure is the placement check of design 4.3 (placement_check.c): the plan
- * number, the probe before, the DECLAREs, the probe after, and no FETCH before
- * every node has passed.
+ * Open the cursors on every group, then ask each for its first batch.  The procedure is the
+ * placement check of design 4.3 (placement_check.c, kingres_shard_fragset_start): the plan
+ * number, the probe before, the DECLAREs, the probe after, and no FETCH before every node has
+ * passed.
  */
 static void
 ds_start(KsDistScanState *s)
@@ -1058,19 +760,17 @@ ds_start(KsDistScanState *s)
 	const KsCatalog *cat = kingres_shard_catalog();
 	const KsDistTable *dt = hash_search(cat->dist_tables, &s->relid, HASH_FIND, NULL);
 	MemoryContext old;
+	MemoryContext startcxt;
 	const char **values;
 	Oid		   *types;
 	int			nparams;
-	ListCell   *lc;
-	int			colocation_id;
-	char	   *ask;			/* the probe before */
-	char	   *recheck;		/* the probe after the DECLAREs */
+	KsFragStart st;
 
 	if (dt == NULL || dt->is_reference)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("table %u is no longer a distributed table", s->relid)));
-	colocation_id = dt->colocation_id;
+	s->colocation_id = dt->colocation_id;
 
 	/*
 	 * Step 1.  The partitions the local part of this scan reads are those of the
@@ -1078,7 +778,7 @@ ds_start(KsDistScanState *s)
 	 * executor started); the groups asked below are those of the placement as it is
 	 * now.  They must be one placement.
 	 */
-	kingres_shard_placement_check_plan(colocation_id, s->plan_placement);
+	kingres_shard_placement_check_plan(s->colocation_id, s->plan_placement);
 
 	/*
 	 * The partition list the plan was made with must be the one this node has
@@ -1091,347 +791,113 @@ ds_start(KsDistScanState *s)
 	kingres_shard_fault_point("scan_started");
 
 	old = MemoryContextSwitchTo(estate->es_query_cxt);
-	s->frags = remote_groups_of(dt, cat, s->prune_terms, estate->es_param_list_info, NULL, NULL);
+	s->fs.frags = remote_groups_of(dt, cat, s->prune_terms, estate->es_param_list_info, NULL, NULL);
 	MemoryContextSwitchTo(old);
-	s->cur = 0;
-	values = fragment_params(s, &types, &nparams);
+	s->fs.cur = 0;
 
-	/*
-	 * A transaction uses one node of a group (4.4): checked for every node of the
-	 * statement before anything is sent to any.
-	 */
-	foreach(lc, s->frags)
-	{
-		DsFrag	   *f = (DsFrag *) lfirst(lc);
+	/* The values of the parameters live in a context of their own: a rescan starts the scan again and again. */
+	startcxt = AllocSetContextCreate(CurrentMemoryContext, "kingres_shard scan start", ALLOCSET_SMALL_SIZES);
+	old = MemoryContextSwitchTo(startcxt);
+	values = kingres_shard_fragment_params(estate->es_param_list_info, s->param_ids, &types, &nparams);
 
-		kingres_shard_group_rule(f->host, f->port);
-	}
-
-	/*
-	 * Step 2.  First every group is asked for its placement, the identity of its
-	 * partitions of the table and its version of the extension (the question also
-	 * makes the node's partition list of the table current, see
-	 * kingres.internal_placement_hash), then the cursors are opened, then every
-	 * group is asked again (step 4).  A node whose answers differ, or differ from
-	 * the plan's, had a switch commit in between.
-	 */
-	ask = kingres_shard_probe_before_sql(colocation_id, 1, &s->relid);
-	recheck = kingres_shard_probe_after_sql(colocation_id, 1, &s->relid);
-	foreach(lc, s->frags)
-	{
-		DsFrag	   *f = (DsFrag *) lfirst(lc);
-
-		f->scan = s;
-		f->kc = kingres_shard_get_conn(f->host, f->port, false, NULL);
-		kingres_shard_begin_xact(f->kc);
-		f->kc->in_query = true;
-		if (!PQsendQuery(f->kc->conn, ask))
-			frag_send_failed(f, "placement");
-		f->kc->nstatements++;
-		f->in_flight = true;
-		kingres_shard_conn_set_pending(f->kc, f, ds_finish_pending);
-	}
-	foreach(lc, s->frags)
-	{
-		DsFrag	   *f = (DsFrag *) lfirst(lc);
-		PGresult   *res;
-
-		res = libpqsrv_get_result_last(f->kc->conn, PG_WAIT_EXTENSION);
-		kingres_shard_conn_clear_pending(f->kc, f);
-		f->kc->in_query = false;
-		f->in_flight = false;
-		if (res == NULL)
-			f->kc->have_error = true;
-		kingres_shard_probe_read_before(f->kc, res, 1, s->plan_placement, &f->identity);
-	}
-	kingres_shard_fault_point("scan_after_placement");
-
-	/* DECLARE on every group first (they plan concurrently), then read the answers. */
-	foreach(lc, s->frags)
-	{
-		DsFrag	   *f = (DsFrag *) lfirst(lc);
-		StringInfoData decl;
-
-		snprintf(f->cursor, sizeof(f->cursor), "ks_scan_" UINT64_FORMAT, ++cursor_serial);
-		initStringInfo(&decl);
-		appendStringInfo(&decl, KS_FRAGMENT_MARKER "DECLARE %s NO SCROLL CURSOR FOR %s", f->cursor, s->sql);
-		f->kc->in_query = true;
-		if (!PQsendQueryParams(f->kc->conn, decl.data, nparams, types, values, NULL, NULL, 0))
-			frag_send_failed(f, "DECLARE");
-		/* libpq holds its own copy; the statement text of a scan with a large IN list is large (review P2B-04) */
-		pfree(decl.data);
-		f->kc->nstatements++;
-		f->in_flight = true;
-		kingres_shard_conn_set_pending(f->kc, f, ds_finish_pending);
-	}
-	foreach(lc, s->frags)
-	{
-		DsFrag	   *f = (DsFrag *) lfirst(lc);
-		PGresult   *res;
-
-		/* The answer to DECLARE (not a batch). */
-		res = libpqsrv_get_result_last(f->kc->conn, PG_WAIT_EXTENSION);
-		kingres_shard_conn_clear_pending(f->kc, f);
-		f->kc->in_query = false;
-		f->in_flight = false;
-		if (res == NULL || PQresultStatus(res) != PGRES_COMMAND_OK)
-		{
-			if (res == NULL)
-				f->kc->have_error = true;
-			kingres_shard_fragment_error(f->kc, res, "DECLARE");
-		}
-		PQclear(res);
-		f->declared = true;
-		if (kingres_shard_fault_spec()[0] != '\0')
-			kingres_shard_fault_point(psprintf("scan_declared_g%d", f->group_id));
-	}
-	kingres_shard_fault_point("scan_after_declare");
-
-	/*
-	 * Step 4, the map version rule (design/shard-phase4.md, "The map version
-	 * rule"; design/shard-phase2b.md, 4.3 and 10.2).  A node's bucket partitions of a
-	 * table and its placement of the colocation group change only in the
-	 * transaction of a switch, which commits on every participant.  The placement
-	 * and the identity of the node's partitions of the table were read before the
-	 * cursor was opened and are read again now, from the catalog tables and not
-	 * from a cache.  The placement of every node must be the plan's; the identity
-	 * of a node must be what it was before: a switch that committed in between
-	 * changes it, whatever it did to the placement (a bucket that left and came
-	 * back leaves the placement as it was, but its partition on the node is a new
-	 * table).  When both are unchanged, no switch committed on the node between
-	 * the two reads, so the cursor was planned with the partitions of that
-	 * placement.  What happens on the node later cannot change what the cursor
-	 * reads: it holds the parent in ACCESS SHARE, which a detach (the source) waits
-	 * for, and a partition attached later (the target) is not in its plan, which is
-	 * what the placement says (the bucket is read from the source).  The statement
-	 * fails with the retryable KS001; nothing has been returned yet.
-	 */
-	foreach(lc, s->frags)
-	{
-		DsFrag	   *f = (DsFrag *) lfirst(lc);
-		PGresult   *res = kingres_shard_exec_params(f->kc, recheck, 0, NULL, NULL, false);
-
-		kingres_shard_probe_read_after(f->kc, res, 1, s->plan_placement, &f->identity);
-	}
-	/* This node's own placement and partitions can have changed in the same window. */
-	kingres_shard_check_origin_placement(colocation_id, s->plan_placement, "reading it");
-	kingres_shard_check_origin_partitions(s->relid, s->plan_has_parts, s->plan_partitions);
-	kingres_shard_fault_point("scan_after_check");
-	foreach(lc, s->frags)
-		frag_send_fetch((DsFrag *) lfirst(lc));
-	s->started = true;
-}
-
-/* Read the batch in flight, forgetting an error: the scan is being closed. */
-static void
-frag_drain(DsFrag *f)
-{
-	MemoryContext oldcxt = CurrentMemoryContext;
-
+	memset(&st, 0, sizeof(st));
+	st.colocation_id = s->colocation_id;
+	st.ntables = 1;
+	st.relids = &s->relid;
+	st.plan_placement = s->plan_placement;
+	st.marker = KS_FRAGMENT_MARKER;
+	st.sql = s->sql;
+	st.nparams = nparams;
+	st.ptypes = types;
+	st.pvalues = values;
+	st.after_check = ds_after_check;
+	st.arg = s;
+	st.fp_after_probe_before = "scan_after_placement";
+	st.fp_after_declare = "scan_after_declare";
+	st.fp_after_check = "scan_after_check";
+	st.fp_declared_prefix = "scan_";
 	PG_TRY();
 	{
-		frag_collect(f, false);
+		kingres_shard_fragset_start(&s->fs, &st);
 	}
-	PG_CATCH();
+	PG_FINALLY();
 	{
-		MemoryContextSwitchTo(oldcxt);
-		FlushErrorState();
-		/* An interrupt in the wait leaves the query in flight: read it and let go. */
-		if (f->in_flight)
-			kingres_shard_conn_abandon_pending(f->kc, f);
-		f->in_flight = false;
+		MemoryContextSwitchTo(old);
+		MemoryContextDelete(startcxt);
 	}
 	PG_END_TRY();
+	s->started = true;
 }
 
 /* Close cursors and free batches. */
 static void
 ds_stop(KsDistScanState *s, bool close_cursors)
 {
-	ListCell   *lc;
-
-	foreach(lc, s->frags)
-	{
-		DsFrag	   *f = (DsFrag *) lfirst(lc);
-
-		if (f->in_flight && f->kc != NULL && f->kc->conn != NULL && !f->kc->have_error)
-		{
-			/* Let the batch that was asked for arrive: cancelling would abort the remote transaction. */
-			frag_drain(f);
-		}
-		else if (f->in_flight && f->kc != NULL)
-		{
-			kingres_shard_conn_abandon_pending(f->kc, f);
-			f->in_flight = false;
-		}
-		f->failed = false;
-		if (f->res != NULL)
-			PQclear(f->res);
-		f->res = NULL;
-		if (close_cursors && f->declared && f->kc != NULL && f->kc->conn != NULL &&
-			!f->kc->have_error && f->kc->xact_depth > 0 &&
-			PQstatus(f->kc->conn) == CONNECTION_OK &&
-			PQtransactionStatus(f->kc->conn) == PQTRANS_INTRANS)
-		{
-			char		sql[64];
-			PGresult   *res;
-
-			kingres_shard_conn_quiesce(f->kc);
-			snprintf(sql, sizeof(sql), "CLOSE %s", f->cursor);
-			res = kingres_shard_bounded_exec(f->kc->conn, sql, false);
-			PQclear(res);
-		}
-		f->declared = false;
-	}
-	/*
-	 * A rescan starts the scan again in the query context: what the fragments of this run took
-	 * must not stay until the statement ends (review P2B-04).
-	 */
-	foreach(lc, s->frags)
-	{
-		DsFrag	   *f = (DsFrag *) lfirst(lc);
-
-		if (f->kc != NULL && f->kc->pending_owner == (void *) f)
-			continue;
-		pfree(f->host);
-		pfree(f);
-	}
-	list_free(s->frags);
-	s->frags = NIL;
+	kingres_shard_fragset_stop(&s->fs, close_cursors);
 	s->started = false;
 }
 
 /*
  * The next row of the other groups into the scan slot, or false at the end.
- * Batches are taken in turn, and the next batch of a group is requested as soon
- * as the current one is used up.
  */
 static bool
 ds_next_remote(KsDistScanState *s, TupleTableSlot *slot)
 {
-	int			nfrags = list_length(s->frags);
+	PGresult   *res;
+	int			row;
+	KsFrag	   *f;
+	int			j;
+	int			r = 0;
+	int			expected = (s->nfetch == 0) ? 1 : s->nfetch;
+	MemoryContext oldcxt;
+	ExprContext *econtext = s->css.ss.ps.ps_ExprContext;
 
-	if (nfrags == 0)
+	if (!kingres_shard_fragset_next(&s->fs, &res, &row, &f))
 		return false;
-	for (;;)
+	if (PQnfields(res) != expected)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("node %s:%d returned %d columns, expected %d",
+						f->host, f->port, PQnfields(res), expected)));
+	ExecClearTuple(slot);
+	/* The values live until the next call, which resets this context. */
+	oldcxt = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+	for (j = 0; j < s->ncols; j++)
 	{
-		int			i;
-		bool		any_pending = false;
-		DsFrag	   *f = NULL;
-
-		/* An answer that was read in an abort path and was an error (S6-02). */
-		for (i = 0; i < nfrags; i++)
-			frag_check_failed((DsFrag *) list_nth(s->frags, i));
-
-		/* A batch with rows left. */
-		for (i = 0; i < nfrags; i++)
+		if (!s->fetched[j])
 		{
-			DsFrag	   *c = (DsFrag *) list_nth(s->frags, (s->cur + i) % nfrags);
-
-			if (c->res != NULL && c->next_row < c->nrows)
-			{
-				f = c;
-				s->cur = (s->cur + i) % nfrags;
-				break;
-			}
-		}
-		if (f != NULL)
-		{
-			int			row = f->next_row++;
-			int			j;
-			int			r = 0;
-			int			expected = (s->nfetch == 0) ? 1 : s->nfetch;
-			MemoryContext oldcxt;
-			ExprContext *econtext = s->css.ss.ps.ps_ExprContext;
-
-			if (PQnfields(f->res) != expected)
-				ereport(ERROR,
-						(errcode(ERRCODE_DATA_EXCEPTION),
-						 errmsg("node %s:%d returned %d columns, expected %d",
-								f->host, f->port, PQnfields(f->res), expected)));
-			ExecClearTuple(slot);
-			/* The values live until the next call, which resets this context. */
-			oldcxt = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
-			for (j = 0; j < s->ncols; j++)
-			{
-				if (!s->fetched[j])
-				{
-					slot->tts_values[j] = (Datum) 0;
-					slot->tts_isnull[j] = true;
-					continue;
-				}
-				if (PQgetisnull(f->res, row, r))
-				{
-					slot->tts_values[j] = (Datum) 0;
-					slot->tts_isnull[j] = true;
-				}
-				else
-				{
-					slot->tts_isnull[j] = false;
-					slot->tts_values[j] = InputFunctionCall(&s->infuncs[j],
-															PQgetvalue(f->res, row, r),
-															s->typioparams[j],
-															s->typmods[j]);
-				}
-				r++;
-			}
-			ExecStoreVirtualTuple(slot);
-			/* The expressions of the target list, from the columns just read. */
-			econtext->ecxt_scantuple = slot;
-			for (j = 0; j < s->ncols; j++)
-			{
-				if (s->exprs[j] != NULL)
-					slot->tts_values[j] = ExecEvalExpr(s->exprs[j], econtext,
-													   &slot->tts_isnull[j]);
-			}
-			MemoryContextSwitchTo(oldcxt);
-			return true;
-		}
-
-		/* Batches that are used up: free them and ask for the next ones. */
-		for (i = 0; i < nfrags; i++)
-		{
-			DsFrag	   *c = (DsFrag *) list_nth(s->frags, i);
-
-			if (c->res != NULL && c->next_row >= c->nrows)
-			{
-				PQclear(c->res);
-				c->res = NULL;
-				c->nrows = 0;
-			}
-			if (c->res == NULL && !c->in_flight && !c->exhausted)
-				frag_send_fetch(c);
-			if (c->in_flight)
-				any_pending = true;
-		}
-		if (!any_pending)
-		{
-			bool		anything = false;
-
-			for (i = 0; i < nfrags; i++)
-			{
-				DsFrag	   *c = (DsFrag *) list_nth(s->frags, i);
-
-				if (c->res != NULL && c->next_row < c->nrows)
-					anything = true;
-			}
-			if (!anything)
-				return false;
+			slot->tts_values[j] = (Datum) 0;
+			slot->tts_isnull[j] = true;
 			continue;
 		}
-		/* Wait for the first group that has a batch coming. */
-		for (i = 0; i < nfrags; i++)
+		if (PQgetisnull(res, row, r))
 		{
-			DsFrag	   *c = (DsFrag *) list_nth(s->frags, (s->cur + i) % nfrags);
-
-			if (c->in_flight)
-			{
-				frag_collect(c, false);
-				break;
-			}
+			slot->tts_values[j] = (Datum) 0;
+			slot->tts_isnull[j] = true;
 		}
+		else
+		{
+			slot->tts_isnull[j] = false;
+			slot->tts_values[j] = InputFunctionCall(&s->infuncs[j],
+													PQgetvalue(res, row, r),
+													s->typioparams[j],
+													s->typmods[j]);
+		}
+		r++;
 	}
+	ExecStoreVirtualTuple(slot);
+	/* The expressions of the target list, from the columns just read. */
+	econtext->ecxt_scantuple = slot;
+	for (j = 0; j < s->ncols; j++)
+	{
+		if (s->exprs[j] != NULL)
+			slot->tts_values[j] = ExecEvalExpr(s->exprs[j], econtext,
+											   &slot->tts_isnull[j]);
+	}
+	MemoryContextSwitchTo(oldcxt);
+	return true;
 }
+
 
 static TupleTableSlot *
 ds_exec_scan(CustomScanState *node)
@@ -1557,4 +1023,6 @@ ds_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 		appendStringInfoChar(&flat, *p);
 	}
 	ExplainPropertyText("Remote SQL", flat.data, es);
+	if (es->verbose && s->reason[0] != '\0')
+		ExplainPropertyText("Pushdown", psprintf("not used: %s", s->reason), es);
 }

@@ -77,6 +77,8 @@ describe('list pages show hostile names safely', () => {
     ['/dashboard', /U\+202E|<img src=x/],
     ['/ledger', /Status of/],
     ['/ledger?tab=digests', /Aggregate checkpoints/],
+    ['/ledger?tab=anchoring', /U\+202E/],
+    ['/ledger?tab=clients', /U\+202E/],
     ['/ledger?tab=signing', /U\+202E/],
     ['/ledger?tab=publication', /U\+202E/],
     ['/shards', /Bucket map/],

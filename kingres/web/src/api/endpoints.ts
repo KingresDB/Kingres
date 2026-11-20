@@ -218,8 +218,19 @@ export const endpoints = {
 
   // --- replication and rebalance
   getReplicationTopology: () => j(api.GET('/replication/topology')),
-  restorePreferredPrimaries: () =>
-    startedTask(j(api.POST('/replication/restore-preferred-primaries'))),
+  restorePreferredPrimaries: (
+    request: Omit<S['RestorePreferredPrimariesRequest'], 'dryRun'> = {},
+  ) =>
+    startedTask(j(api.POST('/replication/restore-preferred-primaries', { body: { ...request } }))),
+  /** The plan of a restore (a dry run: 200 `FailoverPlan`, nothing is changed). */
+  previewRestore: (request: Omit<S['RestorePreferredPrimariesRequest'], 'dryRun'> = {}) =>
+    plan(
+      j(
+        api.POST('/replication/restore-preferred-primaries', {
+          body: { ...request, dryRun: true },
+        }),
+      ),
+    ),
   getRebalanceStatus: () => j(api.GET('/rebalance')),
   startRebalance: (body: S['RebalanceOptions']) => j(api.POST('/rebalance', { body })),
   previewRebalancePlan: (body: S['RebalancePlanRequest']) =>

@@ -41,6 +41,13 @@ func TestValidatorMatchesPostgreSQL(t *testing.T) {
 	c := in.Connect(t, "postgres")
 	ctx := context.Background()
 	meta := metaOf(t, c, "")
+	if _, err := c.Exec(ctx, `CREATE FUNCTION pg_temp.kg_set_and_read(n text, v text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+	PERFORM pg_catalog.set_config(n, v, true);
+	RETURN (SELECT setting FROM pg_catalog.pg_settings WHERE name = n);
+END $$`); err != nil {
+		t.Fatal(err)
+	}
 	corpus := map[string][]string{
 		"work_mem":                     {"64kB", "1MB", "1.5MB", "4096", "2GB", "63kB", "0", "-1", "1e3", "0x10", "010", "1.5", "64 kB", "64kb", "abc", "", "1TB", "2147483647kB", "2147483648kB", "+1MB"},
 		"statement_timeout":            {"0", "1", "500ms", "5s", "1min", "1h", "1d", "1.5s", "0.5s", "100us", "-1", "2147483647", "9999999999", "5 s", "5S", "5m"},
@@ -74,11 +81,9 @@ func TestValidatorMatchesPostgreSQL(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				var shown string
-				pgErr = tx.QueryRow(ctx, "SELECT pg_catalog.set_config($1, $2, true)", name, v).Scan(&shown)
-				if pgErr == nil {
-					_ = tx.QueryRow(ctx, "SELECT setting FROM pg_catalog.pg_settings WHERE name = $1", name).Scan(&pgSetting)
-				}
+				// Set and read in one statement: a timeout that is set (statement_timeout = 1 is one millisecond)
+				// applies from the next statement on, and would cancel a separate read on a loaded machine.
+				pgErr = tx.QueryRow(ctx, "SELECT pg_temp.kg_set_and_read($1, $2)", name, v).Scan(&pgSetting)
 				_ = tx.Rollback(ctx)
 			} else {
 				continue

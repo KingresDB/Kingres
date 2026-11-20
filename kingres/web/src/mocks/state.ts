@@ -132,7 +132,24 @@ export const mockConfig = {
   failoverGraceful: false,
   failoverOld: null as null | 'rebuilding' | 'waiting' | 'running' | 'failed',
   failoverSwitchoverBehind: false,
+  /** 0.12.0: a finished failover ends `completedWithWarnings` (the check of the cluster reported something). */
+  failoverWarnings: false,
+  /** 0.12.0: a refusal `failover_needs_decision` carries no plan (a server of 0.11.0): the console asks with a dry run. */
+  failoverNoPlan: false,
   failoverReadiness: {} as Record<number, FailoverReadinessState>,
+  /** 0.11.0 (console part B): what the test of an anchor target finds: nothing wrong, a warning, or a failure. */
+  anchorTest: null as null | 'warn' | 'fail',
+  /** 0.11.0 (console part B): every change to a target, a test, an anchor-now and a retry answers this problem code. */
+  anchorRefuse: null as null | string,
+  /** 0.11.0 (console part C): the ledger extension is older than 0.3: every client-key operation answers 422 `unsupported_operation`. */
+  clientLegacy: false,
+  /** The server has no OpenSSL: a key cannot be registered (422 `unsupported_operation`). */
+  clientNoSsl: false,
+  /** Every change of a client key or of a signature policy, and the upgrade, answers this problem code. */
+  clientRefuse: null as null | string,
+  /** Console D: a bundle is gone when it is downloaded (410), or every bundle/acknowledge/verify request answers a problem code. */
+  bundleExpired: false,
+  opsRefuse: null as null | string,
   /** 0.8.0: the source commit the server reports in GET /setup/state: a hex id, null (the build does not know it) or text that is not a hex id. */
   commit: '0123456789abcdef0123456789abcdef01234567' as string | null,
   /**

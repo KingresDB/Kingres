@@ -85,6 +85,22 @@ check_extension_files() {
     done
     check_eq "${p}: BUILD-INFO lists the extensions" "${KINGRES_EXTENSIONS}" \
         "$("$@" sed -n 's/^kingres extensions: //p' /opt/kingres/share/BUILD-INFO 2>/dev/null)"
+    # The versions: BUILD-INFO says what each control file says, and the
+    # install script of that version and every update script an earlier package
+    # needed (0.6 of kingres_shard, 0.1 of kingres_timepart and kingres_columnar)
+    # are in the tree.
+    local want=""
+    for e in ${KINGRES_EXTENSIONS}; do
+        want="${want:+${want}, }${e} $("$@" sed -n "s/^default_version[[:space:]]*=[[:space:]]*'\\([^']*\\)'.*/\\1/p" "${share}/${e}.control" 2>/dev/null)"
+    done
+    check_eq "${p}: BUILD-INFO lists the version of every extension, as its control file says" "${want}" \
+        "$("$@" sed -n 's/^kingres extension versions: //p' /opt/kingres/share/BUILD-INFO 2>/dev/null)"
+    check_eq "${p}: the versions of this release (shard 0.7, ledger 0.3, sketch 1.0, timepart 0.2, columnar 0.2)" \
+        "kingres_columnar 0.2, kingres_ledger 0.3, kingres_shard 0.7, kingres_sketch 1.0, kingres_timepart 0.2" "${want}"
+    for e in kingres_shard--0.6--0.7 kingres_shard--0.6 kingres_shard--0.7 kingres_timepart--0.1--0.2 kingres_timepart--0.1 \
+        kingres_columnar--0.1--0.2 kingres_columnar--0.1 kingres_ledger--0.2--0.3; do
+        check "${p}: ${e}.sql is installed" "$@" test -f "${share}/${e}.sql"
+    done
 }
 
 # check_smoke_output PREFIX MAJOR OUTPUT: what test/pg-smoke.sh printed for the
@@ -115,6 +131,29 @@ check_smoke_output() {
         grep -q '^columnar-preload-removed: count 3$' <<<"${out}"
     check "${p}: kingres_columnar: ... and a write is refused" \
         grep -q '^columnar-preload-removed: insert refused.*shared_preload_libraries' <<<"${out}"
+    # The versions in the catalog are the ones of the control files.
+    for e in ${KINGRES_EXTENSIONS}; do
+        # shellcheck disable=SC2016
+        check "${p}: ${e} is created at the default version of its control file" bash -c \
+            'v="$(sed -n "s/^control $1 //p" <<<"$2")"; [ -n "$v" ] && grep -qx "extension $1 $v" <<<"$2"' _ "${e}" "${out}"
+    done
+    # kingres_timepart 0.2: the conversion to columnar and back.  Without the
+    # preload it is refused with the name of the setting and the partition is
+    # untouched; with it (an experiment, not the default) it works both ways.
+    check "${p}: kingres_timepart: the conversion to columnar is refused without the preload, naming shared_preload_libraries" \
+        grep -q '^timepart-without-preload: conversion refused.*shared_preload_libraries' <<<"${out}"
+    check "${p}: kingres_timepart: ... and the partition is a heap table with its 1000 rows" \
+        grep -qx 'timepart-without-preload: access method heap, rows 1000 500500' <<<"${out}"
+    check "${p}: kingres_timepart: with the preload a partition is converted to columnar, rows kept" \
+        grep -qx 'timepart-with-preload: to columnar: access method columnar, rows 1000 500500' <<<"${out}"
+    check "${p}: kingres_timepart: ... and back to heap, rows kept" \
+        grep -qx 'timepart-with-preload: to heap: access method heap, rows 1000 500500' <<<"${out}"
+    check "${p}: kingres_columnar: a B-tree index on a columnar table is built" \
+        grep -qx 'columnar-index: created' <<<"${out}"
+    check "${p}: kingres_columnar: ... an index scan finds the row" \
+        grep -qx 'columnar-index: lookup v4242' <<<"${out}"
+    check "${p}: kingres_columnar: ... the plan is an index scan" \
+        grep -q '^columnar-index: plan .*Index' <<<"${out}"
 }
 
 # check_licence_files PREFIX COMMAND...: the licence files an installation

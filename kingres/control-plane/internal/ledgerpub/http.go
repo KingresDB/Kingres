@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"sync"
 	"time"
@@ -86,8 +87,16 @@ func (h *Handler) allow(addr string) bool {
 					delete(h.rate, k)
 				}
 			}
+			// still full: the entry that asked longest ago makes room, so that a flood of addresses cannot keep a new auditor out (P8-05)
 			if len(h.rate) >= 4096 {
-				return false
+				var oldest string
+				var oldestAt time.Time
+				for k, v := range h.rate {
+					if oldest == "" || v.last.Before(oldestAt) {
+						oldest, oldestAt = k, v.last
+					}
+				}
+				delete(h.rate, oldest)
 			}
 		}
 		b = &bucket{tokens: per, last: now}
@@ -126,7 +135,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		host = r.RemoteAddr
 	}
-	if !h.allow(host) {
+	if !h.allow(rateKey(host)) {
 		w.Header().Set("Retry-After", "1")
 		plain(w, http.StatusTooManyRequests, "no-store", "too many requests")
 		return
@@ -283,4 +292,18 @@ func (l *Listener) Stop() {
 	defer cancel()
 	_ = srv.Shutdown(ctx)
 	<-done
+}
+
+// rateKey is the key of the rate table for a client address: an IPv4 address as it is, an IPv6 address by its /64 network (one customer
+// holds a whole /64, so an address each is no new client).
+func rateKey(host string) string {
+	a, err := netip.ParseAddr(host)
+	if err != nil || a.Is4() || a.Is4In6() {
+		return host
+	}
+	p, err := a.Prefix(64)
+	if err != nil {
+		return host
+	}
+	return p.String()
 }

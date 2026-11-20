@@ -69,16 +69,19 @@
 #include "catalog/namespace.h"
 #include "catalog/partition.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_authid.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_type.h"
 #include "commands/copy.h"
 #include "commands/extension.h"
 #include "commands/tablecmds.h"
 #include "executor/spi.h"
+#include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/parsenodes.h"
 #include "nodes/value.h"
 #include "parser/parse_type.h"
+#include "storage/lmgr.h"
 #include "storage/lockdefs.h"
 #include "tcop/cmdtag.h"
 #include "tcop/utility.h"
@@ -1398,6 +1401,154 @@ refuse_trigger_on_reference_table(CreateTrigStmt *stmt)
 }
 
 /*
+ * refuse_ddl_on_claimed_table
+ *
+ * A table that an unfinished online table operation reads (the source of a distribution that
+ * runs "concurrently") is copied and followed by a capture trigger; DDL on it would make the copy
+ * and the log mean different things.  The statements that change the table or its name are refused
+ * with the id of the operation (design/shard-phase9.md, "Capture").  The sessions of the
+ * operation itself (forwarded sessions) are not refused.
+ */
+static void
+claimed_relid_check(Oid relid)
+{
+	Oid			argtypes[1] = {OIDOID};
+	Datum		values[1];
+	int			ret;
+	int64		op_id = 0;
+	Oid			save_userid;
+	int			save_sec;
+
+	if (!OidIsValid(kingres_shard_catalog_relid("table_operation_item")))
+		return;
+	if (!OidIsValid(relid))
+		return;
+	/* an index is the table's: ALTER INDEX, DROP INDEX */
+	{
+		char		kind = get_rel_relkind(relid);
+
+		if (kind == RELKIND_INDEX || kind == RELKIND_PARTITIONED_INDEX)
+		{
+			relid = IndexGetRelation(relid, true);
+			if (!OidIsValid(relid))
+				return;
+		}
+	}
+	GetUserIdAndSecContext(&save_userid, &save_sec);
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, save_sec | SECURITY_LOCAL_USERID_CHANGE);
+	if (SPI_connect() != SPI_OK_CONNECT)
+	{
+		SetUserIdAndSecContext(save_userid, save_sec);
+		return;
+	}
+	values[0] = ObjectIdGetDatum(relid);
+	ret = SPI_execute_with_args("SELECT i.op_id FROM " KINGRES_SHARD_SCHEMA ".table_operation_item i "
+								"JOIN " KINGRES_SHARD_SCHEMA ".table_operation o ON o.op_id OPERATOR(pg_catalog.=) i.op_id "
+								"WHERE i.relid OPERATOR(pg_catalog.=) $1::pg_catalog.oid::pg_catalog.regclass "
+								"AND o.phase IN ('preparing', 'shadow', 'copying', 'catching_up', 'switching') LIMIT 1",
+								1, argtypes, values, NULL, true, 1);
+	if (ret == SPI_OK_SELECT && SPI_processed > 0)
+	{
+		bool		isnull;
+
+		op_id = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+	}
+	SPI_finish();
+	SetUserIdAndSecContext(save_userid, save_sec);
+	if (op_id != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("table \"%s\" is being rebuilt by table operation " INT64_FORMAT "; it cannot be changed until the operation finishes",
+						get_rel_name(relid), op_id),
+				 errhint("Wait for it, or cancel it with kingres.cancel_table_operation(" INT64_FORMAT ").", op_id)));
+}
+
+static void
+claimed_table_check(RangeVar *rv)
+{
+	if (rv == NULL)
+		return;
+	claimed_relid_check(RangeVarGetRelid(rv, NoLock, true));
+}
+
+/* the table of an object that DROP names as schema.table.name (a trigger, a rule, a policy) */
+static void
+claimed_table_of_name(List *names)
+{
+	if (names == NIL || list_length(names) < 2)
+		return;
+	claimed_table_check(makeRangeVarFromNameList(list_copy_head(names, list_length(names) - 1)));
+}
+
+static void
+refuse_ddl_on_claimed_table(Node *parsetree)
+{
+	switch (nodeTag(parsetree))
+	{
+		case T_AlterTableStmt:
+			claimed_table_check(((AlterTableStmt *) parsetree)->relation);
+			break;
+		case T_RenameStmt:
+			claimed_table_check(((RenameStmt *) parsetree)->relation);
+			break;
+		case T_IndexStmt:
+			claimed_table_check(((IndexStmt *) parsetree)->relation);
+			break;
+		case T_CreateTrigStmt:
+			claimed_table_check(((CreateTrigStmt *) parsetree)->relation);
+			break;
+		case T_AlterObjectSchemaStmt:
+			claimed_table_check(((AlterObjectSchemaStmt *) parsetree)->relation);
+			break;
+		case T_RuleStmt:
+			claimed_table_check(((RuleStmt *) parsetree)->relation);
+			break;
+		case T_CreatePolicyStmt:
+			claimed_table_check(((CreatePolicyStmt *) parsetree)->table);
+			break;
+		case T_AlterPolicyStmt:
+			claimed_table_check(((AlterPolicyStmt *) parsetree)->table);
+			break;
+		case T_TruncateStmt:
+			{
+				ListCell   *lc;
+
+				foreach(lc, ((TruncateStmt *) parsetree)->relations)
+					claimed_table_check((RangeVar *) lfirst(lc));
+				break;
+			}
+		case T_DropStmt:
+			{
+				DropStmt   *ds = (DropStmt *) parsetree;
+				ListCell   *lc;
+
+				foreach(lc, ds->objects)
+				{
+					switch (ds->removeType)
+					{
+						case OBJECT_TABLE:
+						case OBJECT_INDEX:
+							if (IsA(lfirst(lc), List))
+								claimed_table_check(makeRangeVarFromNameList((List *) lfirst(lc)));
+							break;
+						case OBJECT_TRIGGER:
+						case OBJECT_RULE:
+						case OBJECT_POLICY:
+							if (IsA(lfirst(lc), List))
+								claimed_table_of_name((List *) lfirst(lc));
+							break;
+						default:
+							break;
+					}
+				}
+				break;
+			}
+		default:
+			break;
+	}
+}
+
+/*
  * refuse_inheritance_of_reference_table
  *
  * A write to a reference table also writes the rows of every table that inherits
@@ -1465,6 +1616,130 @@ refuse_inheritance_of_reference_table(Node *parsetree)
 }
 
 /*
+ * Wait for a table that is being distributed before the hook decides about a statement on it.
+ *
+ * create_distributed_table() and its relatives hold an EXCLUSIVE lock on the table and replace it by a
+ * partitioned one.  A statement that was started before the swap decides at its start, when the table is
+ * a plain table and nothing is propagated, and then waits for its lock in the standard code: after the
+ * swap it would run on the new table as if it were plain.  The lock taken here (ROW EXCLUSIVE, which every
+ * writer holds anyway, so that nothing else is serialized) conflicts with that EXCLUSIVE lock, so the
+ * statement waits first and decides afterwards, with the catalog as the commit of the call left it.  The
+ * name is looked up again after the wait.  Only a role that may do something with the table waits: the
+ * lock is no way to stall a table that the role cannot touch.
+ *
+ * The lock order of the extension is the lock of the catalog first, the table after.  A statement that goes
+ * on to propagate takes the lock of the catalog later and so lets go of the locks taken here before it does
+ * (the caller); a statement on a plain table never takes it, and keeps the lock, which is what stops a
+ * call from starting on the table while the statement runs.
+ */
+static List *wait_locked = NIL;
+
+static void
+wait_for_table_operation(RangeVar *rv, AclMode needed)
+{
+	Oid			relid;
+	MemoryContext old;
+
+	if (rv == NULL || rv->relpersistence == RELPERSISTENCE_TEMP)
+		return;
+	relid = RangeVarGetRelid(rv, NoLock, true);
+	if (!OidIsValid(relid))
+		return;
+	/*
+	 * Only a role that has the right the statement needs waits: the lock is the one the statement would take
+	 * anyway, but a statement that fails its permission check (a GRANT of a role that may only read) must not
+	 * leave a lock that the role could not take with LOCK TABLE.  needed is the privilege of the statement, 0
+	 * for a statement of the owner.
+	 */
+	if (!object_ownercheck(RelationRelationId, relid, GetUserId()) &&
+		(needed == 0 || pg_class_aclmask(relid, GetUserId(), needed, ACLMASK_ANY) == 0))
+		return;
+	relid = RangeVarGetRelid(rv, RowExclusiveLock, true);
+	if (!OidIsValid(relid))
+		return;
+	old = MemoryContextSwitchTo(TopTransactionContext);
+	wait_locked = lappend_oid(wait_locked, relid);
+	MemoryContextSwitchTo(old);
+}
+
+static void
+release_waited_tables(void)
+{
+	ListCell   *lc;
+
+	foreach(lc, wait_locked)
+		UnlockRelationOid(lfirst_oid(lc), RowExclusiveLock);
+	wait_locked = NIL;
+}
+
+static void
+wait_for_statement_tables(Node *parsetree)
+{
+	ListCell   *lc;
+
+	wait_locked = NIL;
+
+	switch (nodeTag(parsetree))
+	{
+		case T_AlterTableStmt:
+			wait_for_table_operation(((AlterTableStmt *) parsetree)->relation, 0);
+			break;
+		case T_RenameStmt:
+			wait_for_table_operation(((RenameStmt *) parsetree)->relation, 0);
+			break;
+		case T_AlterObjectSchemaStmt:
+			wait_for_table_operation(((AlterObjectSchemaStmt *) parsetree)->relation, 0);
+			break;
+		case T_IndexStmt:
+			wait_for_table_operation(((IndexStmt *) parsetree)->relation, 0);
+			break;
+		case T_CreateTrigStmt:
+			wait_for_table_operation(((CreateTrigStmt *) parsetree)->relation, ACL_TRIGGER);
+			break;
+		case T_RuleStmt:
+			wait_for_table_operation(((RuleStmt *) parsetree)->relation, 0);
+			break;
+		case T_CreatePolicyStmt:
+			wait_for_table_operation(((CreatePolicyStmt *) parsetree)->table, 0);
+			break;
+		case T_AlterPolicyStmt:
+			wait_for_table_operation(((AlterPolicyStmt *) parsetree)->table, 0);
+			break;
+		case T_CopyStmt:
+			if (((CopyStmt *) parsetree)->is_from)
+				wait_for_table_operation(((CopyStmt *) parsetree)->relation, ACL_INSERT);
+			break;
+		case T_TruncateStmt:
+			foreach(lc, ((TruncateStmt *) parsetree)->relations)
+				wait_for_table_operation((RangeVar *) lfirst(lc), ACL_TRUNCATE);
+			break;
+		case T_GrantStmt:
+			{
+				GrantStmt  *g = (GrantStmt *) parsetree;
+
+				if (g->targtype == ACL_TARGET_OBJECT && g->objtype == OBJECT_TABLE)
+					foreach(lc, g->objects)
+						if (IsA(lfirst(lc), RangeVar))
+							/* the owner, or a role that holds a privilege with the grant option */
+							wait_for_table_operation((RangeVar *) lfirst(lc), ACL_GRANT_OPTION_FOR(ACL_ALL_RIGHTS_RELATION));
+			}
+			break;
+		case T_DropStmt:
+			{
+				DropStmt   *ds = (DropStmt *) parsetree;
+
+				if (ds->removeType == OBJECT_TABLE)
+					foreach(lc, ds->objects)
+						if (IsA(lfirst(lc), List))
+							wait_for_table_operation(makeRangeVarFromNameList((List *) lfirst(lc)), 0);
+			}
+			break;
+		default:
+			break;
+	}
+}
+
+/*
  * kingres_shard_process_utility
  *
  * The hook: decide, run, propagate.  Statements that run while the extension
@@ -1498,6 +1773,10 @@ kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
 	if (IsA(parsetree, CreateTrigStmt) && !creating_extension && !kingres_shard_session_forwarded())
 		refuse_trigger_on_reference_table((CreateTrigStmt *) parsetree);
 
+	/* The source of an online table operation is not changed by anybody else until it ends. */
+	if (!creating_extension && !kingres_shard_session_forwarded())
+		refuse_ddl_on_claimed_table(parsetree);
+
 	/* And the same for inheritance and partitions of a reference table (S6-03). */
 	if ((IsA(parsetree, CreateStmt) || IsA(parsetree, AlterTableStmt)) &&
 		!creating_extension && !kingres_shard_session_forwarded())
@@ -1508,9 +1787,18 @@ kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
 		ddl_internal_depth == 0 && context != PROCESS_UTILITY_SUBCOMMAND)
 	{
 		cat = kingres_shard_catalog();
+		if (cat->present && !kingres_shard_session_forwarded())
+		{
+			wait_for_statement_tables(parsetree);
+			cat = kingres_shard_catalog();
+		}
 		if (cat->present && cat->ndist_tables > 0)
 		{
 			decide(parsetree, cat, &d);
+			if (d.propagate || d.copy_route)
+				release_waited_tables();
+			else
+				wait_locked = NIL;
 
 			if (d.replacement != NULL)
 			{

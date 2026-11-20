@@ -100,6 +100,7 @@
  */
 static bool local_part_armed = false;
 static const char *local_part_text = NULL;
+static bool local_part_window = false;	/* planned once, not yet started: a second planning of the text is a replan */
 
 /*
  * How many local parts of a fanned-out reference-table write are running in
@@ -176,10 +177,28 @@ kingres_shard_fanout_init(void)
 bool
 kingres_shard_local_part_take(const char *query_string)
 {
-	bool		ok = local_part_armed && query_string != NULL && local_part_text != NULL &&
+	bool		match = query_string != NULL && local_part_text != NULL &&
 		strcmp(query_string, local_part_text) == 0;
+	bool		ok = local_part_armed && match;
 
 	local_part_armed = false;
+	if (ok)
+		local_part_window = true;
+	else if (match && local_part_window)
+	{
+		/*
+		 * The statement of the local part is planned a second time before it started to run: a plan that
+		 * was invalidated while SPI had it.  That plan would be the plan of a statement of this session, which
+		 * acts on the other groups too, so it is refused (review P2B-01; no path of SPI does this today:
+		 * a one-shot plan is planned once and a cursor's plan is built once, see t/131).  A statement that
+		 * the local part runs after it started (a function of a CHECK that replays the text) comes after
+		 * ExecutorStart, which closes the window, and is planned and routed as any statement.
+		 */
+		ereport(ERROR,
+				(errcode(ERRCODE_KINGRES_STALE_MAP),
+				 errmsg("the statement of this node's own shard group was planned again while it started"),
+				 errhint("Repeat the statement.")));
+	}
 	return ok;
 }
 
@@ -194,6 +213,7 @@ local_part_arm(const char *sql)
 static void
 local_part_disarm(void)
 {
+	local_part_window = false;
 	local_part_armed = false;
 	local_part_text = NULL;
 }
@@ -224,6 +244,38 @@ kingres_shard_spi_local_part(const char *sql, int nargs, Oid *argtypes, Datum *v
 	}
 	PG_END_TRY();
 	return ret;
+}
+
+/*
+ * kingres_shard_spi_local_part_cursor
+ *
+ * The same, as a read-only cursor that is read in batches later (the fragment scan of
+ * fragment_scan.c, design 4.4).  The caller has connected to SPI; the cursor outlives the
+ * connection.  The mark is armed for the planning of the statement only; the caller checks that
+ * the plan holds no scan of this extension, because a plan that was invalidated and made again
+ * while the cursor opened is planned without the mark (the one-shot flag is consumed by the first
+ * call of the planner hook).
+ */
+Portal
+kingres_shard_spi_local_part_cursor(const char *sql, int nargs, Oid *argtypes, Datum *values,
+									const char *nulls)
+{
+	Portal		portal;
+
+	PG_TRY();
+	{
+		local_part_arm(sql);
+		portal = SPI_cursor_open_with_args(NULL, sql, nargs, argtypes, values, nulls, true,
+										   CURSOR_OPT_NO_SCROLL);
+	}
+	PG_FINALLY();
+	{
+		local_part_disarm();
+	}
+	PG_END_TRY();
+	if (portal == NULL)
+		elog(ERROR, "could not open the cursor of this node's own part of a statement");
+	return portal;
 }
 
 /*
@@ -370,6 +422,8 @@ fo_executor_start(QueryDesc *queryDesc, int eflags)
 {
 	PlannedStmt *pstmt = queryDesc->plannedstmt;
 	List	   *result_rels = ks_result_relations(pstmt);
+
+	local_part_window = false;
 
 	if (result_rels != NIL && !(eflags & EXEC_FLAG_EXPLAIN_ONLY) &&
 		kingres_shard_enable_routing && !creating_extension &&
@@ -599,7 +653,11 @@ fo_begin_scan(CustomScanState *node, EState *estate, int eflags)
 	kingres_shard_refuse_replica_role(s->colocation_id == 0 ?
 									  "a reference table" : "a distributed table on several shard groups");
 	if (s->kind == FO_KIND_INSERT_SELECT)
+	{
+		/* the window of the defence against a plan whose relations changed (P2D-02) */
+		kingres_shard_fault_point("insel_before_rels_check");
 		check_relations_unchanged(s);
+	}
 
 	tupdesc = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
 	s->ncols = tupdesc->natts;
@@ -1038,6 +1096,9 @@ run_all(KsFanoutState *s)
 	 */
 	if (s->all_rows)
 	{
+		/* the window of the placement check at the start of the run (P2D-02) */
+		if (s->kind == FO_KIND_INSERT_SELECT)
+			kingres_shard_fault_point("insel_before_start_check");
 		kingres_shard_placement_check_plan(s->colocation_id, s->plan_placement);
 		origin_placement = s->plan_placement;
 	}

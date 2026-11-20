@@ -64,6 +64,8 @@ var leaderBoundReads = map[string]bool{
 	"getLedgerSettings": true, "getLedgerSigning": true, "getLedgerTrustFile": true,
 	// The logs, the aggregates and the digests of the publication are in the leader's system database (phase 7, steps 5 and 6).
 	"getLedgerPublication": true, "getLedgerAggregate": true, "listLedgerAggregates": true, "listLedgerDigests": true,
+	// The anchor targets and records are in the leader's system database too (phase 7, step 10).
+	"listLedgerAnchorTargets": true, "getLedgerAnchorTarget": true, "listLedgerAnchors": true, "downloadLedgerAnchor": true,
 }
 
 // forwardsToLeader tells whether an operation is run by the leader. Mutating
@@ -113,6 +115,9 @@ func (s *Server) tryForward(c *call, w http.ResponseWriter, r *http.Request) (bo
 	fw := s.deps.Forwarder
 	if fw == nil || forwardedOf(r) != nil || !forwardsToLeader(c.op) || c.session == nil {
 		return false, nil
+	}
+	if done, err := s.mapFailoverIntercept(c, w, r); done {
+		return true, err
 	}
 	leaderID, self, err := fw.Leader(r.Context())
 	if err != nil || leaderID == "" {

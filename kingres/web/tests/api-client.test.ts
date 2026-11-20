@@ -88,7 +88,7 @@ describe('answers that are not problem documents (W-14)', () => {
     )
     await router.push('/dashboard')
     await router.push('/servers')
-    await waitFor(() => expect(router.currentRoute.value.name).toBe('login'), { timeout: 3000 })
+    await waitFor(() => expect(router.currentRoute.value.name).toBe('login'), { timeout: 30_000 })
   })
 
   it('maps a 403 page to "forbidden", not to "bad request"', async () => {

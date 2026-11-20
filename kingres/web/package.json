@@ -60,5 +60,8 @@
     "vue-eslint-parser": "^10.4.2",
     "vue-tsc": "^3.3.14",
     "yaml": "^2.9.1"
+  },
+  "overrides": {
+    "minimatch@^10": "^11.0.1"
   }
 }

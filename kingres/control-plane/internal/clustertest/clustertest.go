@@ -676,3 +676,19 @@ func (n *Node) InstanceLogs() string {
 	}
 	return sb.String()
 }
+
+// DoRaw sends the bytes as the body of a JSON request exactly as given (a test of a hostile body: no encoding is done, so the body may be invalid).
+func (n *Node) DoRaw(method, path string, body []byte) (int, []byte) {
+	req, _ := http.NewRequestWithContext(context.Background(), method, n.Base()+path, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if n.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+n.Token)
+	}
+	resp, err := n.client.Do(req)
+	if err != nil {
+		return 0, []byte(err.Error())
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, raw
+}

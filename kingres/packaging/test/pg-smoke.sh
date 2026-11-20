@@ -20,6 +20,11 @@
 #                                README: it loads and reads, and refuses to
 #                                write): create, create table, insert, count
 #   columnar-with-preload: ..    the same with the library preloaded
+#   control NAME VERSION         default_version of the installed control file
+#   timepart-without-preload: .. kingres_timepart's conversion of a partition
+#                                to columnar without the preload (refused)
+#   timepart-with-preload: ..    the conversion to columnar and back
+#   columnar-index: ..           a columnar table with a B-tree index (preload)
 #
 # kingres_shard and kingres_ledger are preloaded as the product does it;
 # kingres_columnar is not preloaded by default (it registers a WAL resource
@@ -81,8 +86,26 @@ col() { # col LABEL: the steps of the columnar check, printed under LABEL
 }
 col columnar-without-preload
 
-# The extensions as the catalog sees them.
+# kingres_timepart 0.2 converts a partition to columnar storage and back.  The
+# conversion writes a columnar table, so without the preload it is refused (by
+# the access method, with a message that names the setting) and the partition
+# stays as it was.  The table is used again below, with the preload.
+sql -c "create table public.ev (ts timestamptz not null, n int) partition by range (ts)" \
+    -c "create table public.ev_2026_01 partition of public.ev for values from ('2026-01-01 00:00:00+00') to ('2026-02-01 00:00:00+00')" \
+    -c "insert into public.ev select '2026-01-05 00:00:00+00'::timestamptz + g * interval '1 minute', g from generate_series(1,1000) g"
+am_of() { sql -c "select a.amname from pg_class c join pg_am a on a.oid = c.relam where c.oid = 'public.ev_2026_01'::regclass"; }
+if err="$(sql -c "call kingres.convert_partition('public.ev', 'public.ev_2026_01')" 2>&1)"; then
+    printf 'timepart-without-preload: conversion accepted\n'
+else
+    printf 'timepart-without-preload: conversion refused (%s)\n' "$(printf '%s' "${err}" | head -1)"
+fi
+printf 'timepart-without-preload: access method %s, rows %s\n' "$(am_of)" "$(sql -c 'select count(*) || chr(32) || sum(n) from public.ev')"
+
+# The extensions as the catalog sees them, and what each control file says.
 sql -c "select 'extension ' || extname || ' ' || extversion from pg_extension where extname like 'kingres%' order by extname"
+for c in "$(dirname "$(command -v pg_ctl)")"/../share/postgresql/extension/kingres_*.control; do
+    printf 'control %s %s\n' "$(basename "${c}" .control)" "$(sed -n "s/^default_version[[:space:]]*=[[:space:]]*'\\([^']*\\)'.*/\\1/p" "${c}")"
+done
 
 # And with the preload, to see that the files of the package are a working
 # access method (not the default configuration of the product).
@@ -90,6 +113,34 @@ pg_ctl -D "${data}" -m fast -w stop >/dev/null
 printf "shared_preload_libraries = 'kingres_shard,kingres_ledger,kingres_columnar'\n" >>"${data}/postgresql.conf"
 pg_ctl -D "${data}" -o "-k ${sock} -c listen_addresses=" -l "${work}/pg2.log" -w start >/dev/null
 col columnar-with-preload
+
+# With the preload the conversion of the partition works in both directions and
+# the rows stay (kingres_timepart 0.2).
+rows_of() { sql -c 'select count(*) || chr(32) || sum(n) from public.ev'; }
+if err="$(sql -c "call kingres.convert_partition('public.ev', 'public.ev_2026_01')" 2>&1)"; then
+    printf 'timepart-with-preload: to columnar: access method %s, rows %s\n' "$(am_of)" "$(rows_of)"
+else
+    printf 'timepart-with-preload: to columnar refused (%s)\n' "$(printf '%s' "${err}" | head -1)"
+fi
+if err="$(sql -c "call kingres.convert_partition('public.ev', 'public.ev_2026_01', 'heap')" 2>&1)"; then
+    printf 'timepart-with-preload: to heap: access method %s, rows %s\n' "$(am_of)" "$(rows_of)"
+else
+    printf 'timepart-with-preload: to heap refused (%s)\n' "$(printf '%s' "${err}" | head -1)"
+fi
+
+# A columnar table with a B-tree index that is not unique (kingres_columnar 0.2):
+# the index is built over the rows, a lookup uses it and finds the row.
+if err="$(sql -c 'create table public.col_i (id int, v text) using columnar' \
+    -c "insert into public.col_i select g, 'v' || g from generate_series(1,5000) g" \
+    -c 'create index col_i_id on public.col_i (id)' 2>&1)"; then
+    printf 'columnar-index: created\n'
+    printf 'columnar-index: lookup %s\n' "$(sql -c 'set enable_seqscan = off' -c 'set enable_bitmapscan = off' \
+        -c 'select v from public.col_i where id = 4242' 2>&1 | head -1)"
+    printf 'columnar-index: plan %s\n' "$(sql -c 'set enable_seqscan = off' -c 'set enable_bitmapscan = off' \
+        -c 'explain select v from public.col_i where id = 4242' 2>&1 | head -1)"
+else
+    printf 'columnar-index: refused (%s)\n' "$(printf '%s' "${err}" | head -1)"
+fi
 
 # The preload taken away again: the table of the last step is read, a write is refused.
 pg_ctl -D "${data}" -m fast -w stop >/dev/null

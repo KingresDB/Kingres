@@ -1,10 +1,10 @@
 # contrib/kingres_columnar/t/012_publications_toast.pl
 #
-# (1) Publications: a columnar table is not replicated, so a publication that
-# would publish one is refused, whichever way it gets there: the table or
-# the publication created or altered later, with or without
-# publish_via_partition_root (then the publication lists the root of a
-# partitioned table, and the columnar rows are those of a partition below it).
+# (1) Publications (0.2, C7): a columnar table can be published, listed or through the root of a
+# partitioned table, with or without publish_via_partition_root, and whichever way it gets
+# there (the table or the publication created or altered later).  What is refused is a publication
+# that would include the stripe catalog kingres.columnar_stripe (FOR ALL TABLES, FOR TABLES IN
+# SCHEMA kingres) while a columnar table exists: its rows must not be applied by a subscriber.
 # (2) A columnar table with rows over 8 kB converts back to heap.
 #
 # Portions Copyright (c) 2026, RooyeKhat Media Co
@@ -31,7 +31,7 @@ sub refused
 	my ($name, $sql) = @_;
 	my ($ret, $out, $err) = $node->psql('postgres', $sql);
 	isnt($ret, 0, "$name: refused");
-	like($err, qr/not replicated logically/, "$name: with the publication message")
+	like($err, qr/would include the stripe catalog/, "$name: with the stripe catalog message")
 	  if $ret != 0;
 	return;
 }
@@ -55,11 +55,11 @@ CREATE TABLE hp PARTITION OF par FOR VALUES FROM (0) TO (10);
 foreach my $via ('false', 'true')
 {
 	$node->safe_psql('postgres', $setup . q{CREATE TABLE cp PARTITION OF par FOR VALUES FROM (10) TO (20) USING columnar});
-	refused("FOR TABLE root, via root $via",
+	accepted("FOR TABLE root, via root $via",
 		"CREATE PUBLICATION p1 FOR TABLE par WITH (publish_via_partition_root = $via)");
 	$node->safe_psql('postgres', "CREATE PUBLICATION p2 WITH (publish_via_partition_root = $via)");
-	refused("ADD TABLE root, via root $via", 'ALTER PUBLICATION p2 ADD TABLE par');
-	refused("SET TABLE root, via root $via", 'ALTER PUBLICATION p2 SET TABLE par');
+	accepted("ADD TABLE root, via root $via", 'ALTER PUBLICATION p2 ADD TABLE par');
+	accepted("SET TABLE root, via root $via", 'ALTER PUBLICATION p2 SET TABLE par');
 	$node->safe_psql('postgres', "CREATE PUBLICATION p3 FOR TABLE hp WITH (publish_via_partition_root = $via)");
 	refused("ALTER ... SET (publish_via_partition_root) is harmless for a heap partition", 'SELECT 1/0')
 	  if 0;
@@ -74,14 +74,15 @@ foreach my $via ('false', 'true')
 foreach my $via ('false', 'true')
 {
 	$node->safe_psql('postgres', $setup . "CREATE PUBLICATION p1 FOR TABLE par WITH (publish_via_partition_root = $via)");
-	refused("partition created later, via root $via",
+	accepted("partition created later, via root $via",
 		'CREATE TABLE cp PARTITION OF par FOR VALUES FROM (10) TO (20) USING columnar');
+	$node->safe_psql('postgres', 'DROP TABLE cp');
 	$node->safe_psql('postgres', 'CREATE TABLE x (k int, v int) USING columnar');
-	refused("columnar table attached later, via root $via",
+	accepted("columnar table attached later, via root $via",
 		'ALTER TABLE par ATTACH PARTITION x FOR VALUES FROM (10) TO (20)');
 	$node->safe_psql('postgres', 'DROP TABLE x');
 	$node->safe_psql('postgres', 'CREATE TABLE x PARTITION OF par FOR VALUES FROM (10) TO (20)');
-	refused("partition converted later, via root $via",
+	accepted("partition converted later, via root $via",
 		'ALTER TABLE x SET ACCESS METHOD columnar');
 	$node->safe_psql('postgres', 'DROP PUBLICATION p1');
 	$node->safe_psql('postgres', 'DROP TABLE x');
@@ -101,6 +102,8 @@ if ($major >= 19)
 	  if 0;
 	refused('FOR ALL TABLES EXCEPT something else',
 		'CREATE TABLE ex (a int); CREATE PUBLICATION p6 FOR ALL TABLES EXCEPT (TABLE ex)');
+	accepted('FOR ALL TABLES EXCEPT the stripe catalog',
+		'CREATE PUBLICATION p7 FOR ALL TABLES EXCEPT (TABLE kingres.columnar_stripe)');
 }
 
 # ---------------------------------------------------------------------------

@@ -144,12 +144,18 @@ func (m *Manager) Attach(group int32) error {
 
 // Unadopt forgets the adoption of a group: the lease is not renewed any more and
 // runs out at the grantors (use Transfer or the grantors' release to hand it over
-// at once).
-func (m *Manager) Unadopt(group int32) {
+// at once). An adoption that is attached guards a promoted primary and is never
+// forgotten here (F3-01): only the catalog following it ends it
+// (groupsToRenewLocked). It returns false when it refused for that reason.
+func (m *Manager) Unadopt(group int32) bool {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	if a := m.adopted[group]; a != nil && a.attached {
+		return false
+	}
 	delete(m.adopted, group)
 	delete(m.groups, group)
-	m.mu.Unlock()
+	return true
 }
 
 // Relinquish stops renewing the lease of a group but keeps judging it: Check still
@@ -227,7 +233,9 @@ func (m *Manager) Transfer(ctx context.Context, group int32, to string) (Transfe
 	defer cancel()
 	results := make(chan bool, len(members))
 	for _, s := range members {
+		m.fl.add(group)
 		go func() {
+			defer m.fl.done(group)
 			if s == m.c.Self {
 				r, err := m.c.Grantor.Transfer(group, m.c.Self, to, m.c.Duration)
 				results <- err == nil && transferDone(r, to)
@@ -285,6 +293,9 @@ func (m *Manager) ReleaseGroup(ctx context.Context, group int32) (TransferResult
 	m.mu.Unlock()
 	m.rmu.Lock()
 	m.rmu.Unlock() //nolint:staticcheck // waiting for the round in flight is the point
+	// A round ends when a majority answered: the request to the last grantor may still be on its way, and must not be
+	// received after the release (FO-13).
+	m.fl.wait(group)
 	t, ok := m.topologyNow()
 	if !ok {
 		m.mu.Lock()
@@ -304,7 +315,9 @@ func (m *Manager) ReleaseGroup(ctx context.Context, group int32) (TransferResult
 	defer cancel()
 	results := make(chan bool, len(members))
 	for _, s := range members {
+		m.fl.add(group)
 		go func() {
+			defer m.fl.done(group)
 			if s == m.c.Self {
 				r, err := m.c.Grantor.Release(group, m.c.Self)
 				results <- err == nil && releaseDone(r)

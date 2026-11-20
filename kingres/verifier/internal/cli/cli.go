@@ -68,6 +68,7 @@ Commands:
   checkpoint    verify a signed checkpoint of a tile log against a trust file
   consistency   check that a log checkpoint extends an earlier one, from tiles
   aggregate     verify the aggregate log of a database against its chain logs
+  anchors       verify the anchors (WORM, RFC 3161, OpenTimestamps) of an aggregate checkpoint
   bundle        verify (verify) or copy (fetch) a bundle or a publication
   monitor       watch a publication for a rollback, a fork or a rewrite
   attestation   verify a client attestation of a ledger entry
@@ -145,6 +146,8 @@ func dispatch(args []string, stdout, stderr io.Writer, version string) int {
 		return e.runTrust(args[1:])
 	case "aggregate":
 		return e.runAggregate(args[1:])
+	case "anchors":
+		return e.runAnchors(args[1:])
 	case "bundle":
 		return e.runBundle(args[1:])
 	case "monitor":
@@ -152,7 +155,7 @@ func dispatch(args []string, stdout, stderr io.Writer, version string) int {
 	case "attestation":
 		return e.runAttestation(args[1:])
 	}
-	fmt.Fprintf(stderr, "kingres-verify: unknown command %s, expected one of proof, row-hash, digest-chain, blocks, checkpoint, consistency, aggregate, bundle, monitor, attestation, trust, version\n", untrusted(fmt.Sprintf("%q", args[0])))
+	fmt.Fprintf(stderr, "kingres-verify: unknown command %s, expected one of proof, row-hash, digest-chain, blocks, checkpoint, consistency, aggregate, anchors, bundle, monitor, attestation, trust, version\n", untrusted(fmt.Sprintf("%q", args[0])))
 	return exit(ExitUsage)
 }
 

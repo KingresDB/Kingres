@@ -2966,6 +2966,138 @@ The number 159 is not used.
 170. **`bundle fetch` (4.6, 7.4)** needs the logs named: `logs.json` is optional and has no format
     yet. A partial tile that is gone is not an error. Without a trust file nothing is verified and
     the word is `FETCHED`, not `VERIFIED`.
+171. **What was published is kept outside the system database (5.x, P8-01).** A restore of the system
+    database to an older state made the publisher sign a second history. Every holder of the key
+    files keeps a record (`published.json` in the key directory: the highest size and root of every
+    log, the number of events and the hash of the last one, with a checksum). A round, a retirement
+    and a key task that appends an event first compare the database with the record; a database
+    that is behind it or disagrees with it signs and writes nothing, and a critical alert is raised.
+    The leader sends the record to the holders every ten seconds, and a server without one asks the
+    others before it takes the database as the start. The record is not signed: who can write the
+    key directory can sign. The limit: a restore when every copy of the record is lost or older
+    than the publication is not detected by the publisher, only by a mirror or an auditor.
+172. **A retirement (3.x, P8-02)** is refused only for a checkpoint above the bound that carries the
+    signature of the retiring key, not for any checkpoint above it; the other key keeps signing.
+173. **A database that vanished (147, P8-03)** ends its chains after every shard group answered "no
+    such database" for 30 minutes and the system instance does not have it either, with an alert
+    from the first such answer; rounds are not counted. A chain that was closed and answers again
+    under the same chain identity is not reopened: a critical `ledgerChainDiverged` names the
+    group, the height and why the log ended, and no leaf, event or tile is written. Reopening needs
+    the epoch of step 20.
+174. **An answer that names the open chain of another group (P8-04)** makes both logs diverged with
+    critical alerts and retires nothing; a group whose chain was really replaced raises a critical
+    alert too.
+175. **Small rules (P8-05 to P8-07).** The table of the rate limit evicts its oldest entry and
+    counts an IPv6 client by its /64. A checkpoint note is replaced only by a note with the same
+    text under the same revision of the key set. The marker that lets a key file without a row be
+    adopted names the task and the fingerprint; it is no protection against someone who can write
+    the directory.
+176. **A diverged chain that is retired stays diverged (P8-08)**: the flags of its last leaf say
+    both (0x06), and its alert is not cleared. This is the only change of published bytes in this
+    round.
+177. **Decisions stated and not changed (P8-10)**: the caching headers of files that cannot change;
+    an aggregate identifier can be guessed as far as the name of the database can; the certificate
+    of the listener is read once; the answer of a peer is bounded; an unknown hash version stops
+    the log.
+178. **`logs.json` (170)** has a format now: `{"format":1,"logs":[{"kind","origin","state","size"}]}`
+    on one line, in the order the logs were made, at the root of a publication.
+179. **An anchor record that is claimed (6.x)** is shown as `submitted`: `LedgerAnchor.state` of the
+    contract has no `claimed`.
+180. **Outgoing requests of anchoring** go only to the host and port of the configured target. An
+    address written as a literal is used as written; a name that resolves to a loopback, link-local,
+    unspecified or multicast address is refused; a private address is allowed.
+181. **Credentials of a target** are kept in files of the key directory (clear, or sealed with
+    AES-GCM under the passphrase file), sent to the holders by two internal calls, and never
+    returned; each value is at least four printable ASCII characters.
+182. **"Behind"** is the age of the oldest checkpoint that no anchor of the target covers, counted
+    from no earlier than the time the target was enabled: a warning at three intervals and one
+    hour, critical at twelve intervals and one hour.
+183. **`retryLedgerAnchor` never raises the generation of a WORM object**; the contract does not
+    offer it.
+184. **The evidence format `tsr`** is the DER of the time-stamp token (the CMS structure of the
+    evidence), not a whole time-stamp response, which the cluster does not keep. The bundle of trust
+    anchors of a time-stamp target is for the token; the TLS connection to the authority is checked
+    against the system roots.
+185. **The OpenTimestamps target has a member `headerSource`** that names an explorer which answers
+    block headers (http or https). With it a claim can become anchored on a header that confirms
+    it; without it a claim stays a claim. Its host is one of the hosts the egress rule allows. The
+    answer is bounded, and the hash it names must be the hash of the header it gives.
+186. **Every submitted or claimed OpenTimestamps record has a time for its next look**; a claim that
+    the header source contradicts is written into the record's last error (there is no alert kind
+    for it); the test of a target and a log line at start warn when the table of real headers is
+    older than a year. The outcome "anchored" through a header source is not tested through the
+    control plane, since a real header cannot be made in a test.
+
+190. **A verified event that revokes or retires a key counts in every command of the verifier that
+    judges a signature**, by the rule of 165 and 168: a checkpoint vouched for only by a key that a
+    verified event of the same evidence revoked, or that lies above the bound of a retired key, is a
+    failure. A key that an event added is trusted only through `trust follow`, from the file the
+    auditor pinned.
+191. **The flags of a member of an aggregate** are judged together: `diverged` is always a failure,
+    also together with `retired` (0x06); `stale` is "not verified" and is never dropped, also together
+    with `retired` (0x03); a retired chain whose own signed log goes past the retirement height is a
+    failure. The README of the verifier gives the whole table.
+192. **Events are numbered without a gap**; a gap is a failure where the source can list the events.
+193. **The 136 signed bytes of an attestation** cover the chain, the table, the operation, the hash
+    of the row, the key id and the nonce, not the transaction or the block; the verifier checks that
+    the attestation row is an insert of the entry's own transaction in the entry's block by other
+    means.
+194. **The monitor's state is required**: a missing or emptied state is an error, and a first run is
+    asked for with `--init`.
+195. **`bundle fetch` is bounded** by a number of files and of bytes when no trust file is given,
+    checks the size a checkpoint claims against that bound before it requests a tile, and compares
+    what it already holds before it replaces anything.
+196. **`anchors`** checks the anchors of a signed aggregate checkpoint. The digest is computed again from
+    the signed aggregate log, never taken from an evidence file; for an older size from the first
+    leaves, proved a prefix of the signed log.
+197. **The statuses of `anchors`.** Not verified (3): a WORM object not fetched again, a time-stamp
+    token without pinned certificates, an OpenTimestamps proof without a header given by the auditor
+    or only pending, no evidence for the size, an anchored size above the checkpoint served. A failure
+    (1): any check that fails, also an operation of a proof the verifier does not compute; whether such
+    paths of calendars (RIPEMD-160) should be "not verified" instead is open.
+198. **`--require`** names the kinds that must hold a verified anchor; other files that cannot be
+    verified are notes; a failure of any file is a failure.
+199. **A WORM evidence file** carries the hash and length of the object but not the note, so nothing
+    about the object is checked offline; only a fetch by the auditor makes it an anchor.
+200. **The time of a time-stamp token** is the authority's word within its accuracy; the revocation of
+    the authority's certificate is not read; the certificates are the ones the auditor pinned.
+201. **The header of a Bitcoin block** comes from the auditor; the one the cluster kept is never used;
+    a header that does not meet its own target, or is easier than difficulty 1, is refused.
+202. **A time-stamp token** whose list of digest algorithms differs from its signer's, or that has
+    extensions, is refused.
+203. **The byte sweeps of the verifier's tests** change a fixed sample by default and every byte with
+    `KINGRES_VERIFY_FULL_SWEEP=1`.
+
+187. **A database without writes grows nothing**: no block, digest, log size or event. The 305 blocks
+    for five rows of an earlier test were one digest per row of the test helper; a digest closes a
+    block.
+188. **The fixture of a whole publication** is made by the cluster test of a database published on
+    two groups, saved twice so that every log has two checkpoints, with one anchored WORM record and
+    its evidence; it is regenerated with `-Fixtures` of `run-integration.ps1`.
+189. **Process kills inside a round** are tested at every kind of write (digest, log, unread, state,
+    retired, an event of the key set, note): after each restart no log is diverged or closed
+    wrongly, the logs audit against their tiles and pass the standalone verifier, and the record of
+    what was published agrees with the database.
+204. **The duties of a WORM target** are reported by its test and the monitor: `retention`,
+    `retention-ends` (a warning within 30 days), `retention-ended` (a failure), `evidence-attempt`,
+    `evidence-found`, and `server-clock` (the store's clock against the database's: a warning above
+    30 seconds, a failure above five minutes).
+205. **The limits of retries** are read from the environment (`KINGRES_ANCHOR_MAX_RETRY_ATTEMPTS`,
+    `KINGRES_ANCHOR_MAX_RETRY_AGE_HOURS`), since the contract has no setting for them.
+206. **Evidence files** are served under the publication root at `a/<id>/anchors/<size>/<target>.json`,
+    at that path only and never listed. A log closed because its database was dropped raises no
+    alert of a returning chain for 30 minutes, the time the drop task needs between ending the
+    publication and dropping the database.
+
+Correction 168 (an old checkpoint of a revoked key dated by an anchor) is not applied: the design must
+state which kinds of anchor may date a checkpoint, whether the comparison with the time of compromise is
+strict, and what it means that an anchor covers a checkpoint of a chain.
+
+Built of step 10: the anchoring framework and the WORM target. Not built in it: the publication of
+evidence files under the publication root, the cluster settings for the limits of retries (the
+defaults of the library apply), the warnings about retention of a WORM object, the monitoring of the
+store's clock, and tests that kill the process inside a round (P8-09 in part). Steps 12 (RFC 3161)
+and 14 (OpenTimestamps) register their kinds in the same framework and are built (184 to 186).
 
 Of section 13: item 2 (test vectors) is settled for signed notes (the example key and note of the
 specification are in the tests; the checkpoint example has no published key), item 3 (entry bundles at

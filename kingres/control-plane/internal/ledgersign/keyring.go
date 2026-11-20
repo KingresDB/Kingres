@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -341,13 +340,13 @@ func (k *Keyring) Protected() (bool, error) {
 // and could record it. known are the fingerprints of the rows. It returns "" when there is none. A file
 // older than since (less slack, the difference the clocks of the server and the database may have) is never
 // taken: it may be the only copy of a key of a restored system database.
-func (k *Keyring) Orphan(known map[string]bool, since time.Time, slack time.Duration) (string, error) {
+func (k *Keyring) Orphan(known map[string]bool, since time.Time, slack time.Duration, taskID int64) (string, error) {
 	fps, err := k.List()
 	if err != nil {
 		return "", err
 	}
 	for _, fp := range fps {
-		if known[fp] || !k.marked(fp) {
+		if known[fp] || !k.marked(fp, taskID) {
 			continue
 		}
 		st, err := os.Stat(filepath.Join(k.signingDir(), fp+".key"))
@@ -449,14 +448,23 @@ func (k *Keyring) Mark(fp string, taskID int64) error {
 	if _, err := k.path(fp); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(k.signingDir(), fp+".task"), []byte(fmt.Sprint(taskID)+"\n"), 0o600)
+	line := fmt.Sprintf("task %d key %s", taskID, fp) + string(rune(10))
+	return os.WriteFile(filepath.Join(k.signingDir(), fp+".task"), []byte(line), 0o600)
 }
 
-func (k *Keyring) marked(fp string) bool {
+func (k *Keyring) marked(fp string, taskID int64) bool {
 	b, err := os.ReadFile(filepath.Join(k.signingDir(), fp+".task"))
 	if err != nil {
 		return false
 	}
-	_, err = strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
-	return err == nil
+	// The marker names the task that made the file and the key it holds (P8-07): "task <n> key <fingerprint>", the fingerprint being the
+	// name of the file, and n at most the id of the task that asks (a task that was killed and run again as a new task finds the file of the
+	// earlier one, never the file of a later one). Nobody who can write this directory is stopped by it; it makes a damaged or foreign
+	// marker tell itself.
+	var n int64
+	var got string
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(b)), "task %d key %s", &n, &got); err != nil {
+		return false
+	}
+	return got == fp && n >= 1 && n <= taskID
 }

@@ -23,7 +23,11 @@ param(
     [string]$Install = '',
     # Count runs every selected test that many times in the same binary (stress loops); each run
     # makes its own clusters. Any failure fails the run.
-    [int]$Count = 1
+    [int]$Count = 1,
+    # A directory (a Windows path) where the tests keep the whole publication of a real cluster (KINGRES_PUBLICATION_FIXTURES inside WSL).
+    [string]$Fixtures = '',
+    # Further variables for the tests, NAME=value with plain characters, separated by semicolons (for example KINGRES_QUIET_MINUTES=10).
+    [string]$TestEnv = ''
 )
 $ErrorActionPreference = 'Stop'
 # Two runs would share the staging directory, ~/kw-cp/test/bin and the test ports: runs of
@@ -83,6 +87,11 @@ try {
     if ($Install -and $Install -notmatch '^[A-Za-z0-9_./~$-]+$') { throw "-Install must be a plain path inside WSL, got '$Install'" }
     $envInstall = ''
     if ($Install) { $envInstall = "export KINGRES_INSTALL=$Install; " }
+    if ($Fixtures) { New-Item -ItemType Directory -Force $Fixtures | Out-Null; $envInstall += "export KINGRES_PUBLICATION_FIXTURES='$(ConvertTo-WslPath $Fixtures)'; " }
+    foreach ($kv in ($TestEnv -split ';' | Where-Object { $_ })) {
+        if ($kv -notmatch '^[A-Z][A-Z0-9_]*=[A-Za-z0-9_./-]*$') { throw "-TestEnv holds a pair that is not NAME=value with plain characters: $kv" }
+        $envInstall += "export $kv; "
+    }
     $bins = ($names | ForEach-Object { "`$HOME/kw-cp/test/bin/$_.test" }) -join ' '
     $flags = @()
     if ($Run) { $flags += "-test.run '$Run'" }

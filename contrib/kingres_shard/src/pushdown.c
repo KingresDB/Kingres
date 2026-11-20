@@ -43,6 +43,7 @@
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
+#include "catalog/pg_aggregate.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_type_d.h"
@@ -53,12 +54,15 @@
 #include "optimizer/tlist.h"
 #include "parser/parse_relation.h"
 #include "parser/parsetree.h"
+#include "rewrite/rewriteManip.h"
 #include "utils/acl.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/relcache.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
+
+#include <ctype.h>
 
 #include "catalog.h"
 #include "pg_compat.h"
@@ -1003,4 +1007,310 @@ kingres_shard_insert_select_analyze(Query *insert, KsInsertSelect *is, const cha
 		is->relids = list_append_unique_oid(is->relids, ((KsPdRel *) lfirst(lc))->relid);
 	return true;
 #undef IS_NO
+}
+
+/* ======================================================================
+ * A closed query (P4, P5 without order or limit)
+ * ====================================================================== */
+
+char *
+kingres_shard_query_marker(int64 place, const char *ext)
+{
+	if (ext != NULL)
+		return psprintf(KS_QUERY_MARKER_PREFIX "place=" INT64_FORMAT " ext=%s */ ", place, ext);
+	return psprintf(KS_QUERY_MARKER_PREFIX "place=" INT64_FORMAT " */ ", place);
+}
+
+bool
+kingres_shard_parse_query_marker(const char *query_string, int64 *place, char **ext)
+{
+	const char *p;
+	char	   *end;
+
+	if (query_string == NULL ||
+		strncmp(query_string, KS_QUERY_MARKER_PREFIX, strlen(KS_QUERY_MARKER_PREFIX)) != 0)
+		return false;
+	p = query_string + strlen(KS_QUERY_MARKER_PREFIX);
+	if (strncmp(p, "place=", 6) != 0)
+		return false;
+	p += 6;
+	*place = strtoll(p, &end, 10);
+	if (end == p)
+		return false;
+	if (ext != NULL)
+		*ext = NULL;
+	if (strncmp(end, " ext=", 5) == 0)
+	{
+		const char *e = end + 5;
+		const char *q = e;
+
+		while (*q != '\0' && *q != ' ')
+		{
+			if (!(isalnum((unsigned char) *q) || *q == '_' || *q == '.' || *q == ':' || *q == ',' || *q == '-'))
+				return false;
+			q++;
+		}
+		if (q == e)
+			return false;
+		if (ext != NULL)
+			*ext = pnstrdup(e, q - e);
+		end = (char *) q;
+	}
+	return strncmp(end, " */ ", 4) == 0;
+}
+
+bool
+kingres_shard_query_fragment_analyze(Query *query, KsQueryFragment *qf, const char **reason)
+{
+	memset(qf, 0, sizeof(*qf));
+	if (!kingres_shard_pushdown_analyze(query, &qf->pd, reason))
+		return false;
+	if (!kingres_shard_pushdown_closed(&qf->pd, reason))
+		return false;
+	/*
+	 * LIMIT is part of the text only as one constant, no OFFSET, no WITH TIES: the node that sends the text has put count + offset
+	 * there (design 8, O4 and O5), and every group returns its first rows of the final order.
+	 */
+	if (query->limitOffset != NULL)
+	{
+		*reason = "it has OFFSET, which the node that gathers the rows applies";
+		return false;
+	}
+	if (query->limitCount != NULL)
+	{
+		/* the parser leaves the cast of a literal to bigint as a call: it is folded as the planner will fold it */
+		Node	   *cnt = eval_const_expressions(NULL, query->limitCount);
+
+		bool		ok_const = IsA(cnt, Const) && !((Const *) cnt)->constisnull && ((Const *) cnt)->consttype == INT8OID &&
+			DatumGetInt64(((Const *) cnt)->constvalue) >= 0;
+		/* or one external parameter of type bigint: count + offset that the sender computed when its scan started */
+		bool		ok_param = IsA(cnt, Param) && ((Param *) cnt)->paramkind == PARAM_EXTERN && ((Param *) cnt)->paramtype == INT8OID;
+
+		if (!(ok_const || ok_param) || query->limitOption != LIMIT_OPTION_COUNT)
+		{
+			*reason = "it has a LIMIT that is not one constant, which the node that gathers the rows applies";
+			return false;
+		}
+	}
+	if (!kingres_shard_stmt_shippable_query(query, qf->pd.colocation_id, reason))
+		return false;
+	qf->ext = kingres_shard_shippable_ext_used();
+	qf->colocation_id = qf->pd.colocation_id;
+	qf->relids = kingres_shard_pushdown_relids(&qf->pd);
+	return true;
+}
+
+/* ======================================================================
+ * A partial aggregation (design 7, step 7)
+ * ====================================================================== */
+
+char *
+kingres_shard_partial_marker(int64 place, const char *ext)
+{
+	if (ext != NULL)
+		return psprintf(KS_PARTIAL_MARKER_PREFIX "place=" INT64_FORMAT " ext=%s */ ", place, ext);
+	return psprintf(KS_PARTIAL_MARKER_PREFIX "place=" INT64_FORMAT " */ ", place);
+}
+
+bool
+kingres_shard_parse_partial_marker(const char *query_string, int64 *place, char **ext)
+{
+	const char *p;
+	char	   *end;
+
+	if (query_string == NULL ||
+		strncmp(query_string, KS_PARTIAL_MARKER_PREFIX, strlen(KS_PARTIAL_MARKER_PREFIX)) != 0)
+		return false;
+	p = query_string + strlen(KS_PARTIAL_MARKER_PREFIX);
+	if (strncmp(p, "place=", 6) != 0)
+		return false;
+	p += 6;
+	*place = strtoll(p, &end, 10);
+	if (end == p)
+		return false;
+	if (ext != NULL)
+		*ext = NULL;
+	if (strncmp(end, " ext=", 5) == 0)
+	{
+		const char *e = end + 5;
+		const char *q = e;
+
+		while (*q != '\0' && *q != ' ')
+		{
+			if (!(isalnum((unsigned char) *q) || *q == '_' || *q == '.' || *q == ':' || *q == ',' || *q == '-'))
+				return false;
+			q++;
+		}
+		if (q == e)
+			return false;
+		if (ext != NULL)
+			*ext = pnstrdup(e, q - e);
+		end = (char *) q;
+	}
+	return strncmp(end, " */ ", 4) == 0;
+}
+
+/*
+ * Can a group return the partial state of this aggregate and this node combine the states?  The
+ * catalog says (7.1): a built-in aggregate of the normal kind, with a combine function, and a
+ * serialization pair when its state is of type internal; no DISTINCT and no ORDER BY inside the call.
+ */
+bool
+kingres_shard_aggregate_partial_ok(Aggref *a, const char **reason)
+{
+	HeapTuple	tup;
+	Form_pg_aggregate agg;
+	bool		ok = true;
+
+	if (a->aggdistinct != NIL || a->aggorder != NIL)
+	{
+		*reason = "an aggregate has DISTINCT or ORDER BY inside the call, which cannot be split";
+		return false;
+	}
+	if (a->aggfnoid >= FirstGenbkiObjectId && !kingres_shard_extension_aggregate_ok(a->aggfnoid))
+	{
+		*reason = "an aggregate is not built in or of an extension that is shipped";
+		return false;
+	}
+	tup = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(a->aggfnoid));
+	if (!HeapTupleIsValid(tup))
+	{
+		*reason = "an aggregate is not in the catalog";
+		return false;
+	}
+	agg = (Form_pg_aggregate) GETSTRUCT(tup);
+	if (agg->aggkind != AGGKIND_NORMAL)
+	{
+		*reason = "an ordered-set or hypothetical-set aggregate cannot be split";
+		ok = false;
+	}
+	else if (!OidIsValid(agg->aggcombinefn))
+	{
+		*reason = "an aggregate has no combine function";
+		ok = false;
+	}
+	else if (agg->aggtranstype == INTERNALOID &&
+			 (!OidIsValid(agg->aggserialfn) || !OidIsValid(agg->aggdeserialfn)))
+	{
+		*reason = "the state of an aggregate cannot be serialized";
+		ok = false;
+	}
+	ReleaseSysCache(tup);
+	return ok;
+}
+
+typedef struct PartialAggCtx
+{
+	const char *reason;
+	bool		bad;
+} PartialAggCtx;
+
+static bool
+partial_agg_walker(Node *node, PartialAggCtx *ctx)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Aggref))
+	{
+		if (!kingres_shard_aggregate_partial_ok((Aggref *) node, &ctx->reason))
+		{
+			ctx->bad = true;
+			return true;
+		}
+		return false;
+	}
+	if (IsA(node, Query))
+		return false;
+	return expression_tree_walker(node, partial_agg_walker, ctx);
+}
+
+/*
+ * Is the query one that every group can aggregate on its own rows, the partial states being combined
+ * by the node that gathers them?  The shape rules of the extension (7.2): an aggregate or a grouping
+ * (grouping sets, windows, DISTINCT and a set returning function are the scan's), every aggregate
+ * splits (above).  Only the shape; the tables are the business of kingres_shard_pushdown_analyze.
+ */
+bool
+kingres_shard_partial_shape_ok(Query *query, bool fragment, const char **reason)
+{
+	PartialAggCtx ctx = {NULL, false};
+
+	if (!query->hasAggs && query->groupClause == NIL)
+	{
+		*reason = "it neither aggregates nor groups";
+		return false;
+	}
+	if (query->groupingSets != NIL)
+	{
+		*reason = "it has grouping sets";
+		return false;
+	}
+	/*
+	 * A window function and DISTINCT are applied after the grouping: this node does it above the final aggregate (design 7.6 A4 and
+	 * A6), and the text of the groups has neither.  A group that is sent them refuses (fragment).
+	 */
+	if (fragment && (query->hasWindowFuncs || query->windowClause != NIL))
+	{
+		*reason = "it has a window function";
+		return false;
+	}
+	if (fragment && query->distinctClause != NIL)
+	{
+		*reason = "it removes duplicates after the aggregation";
+		return false;
+	}
+	if (query->hasTargetSRFs)
+	{
+		*reason = "it has a set-returning function in the select list";
+		return false;
+	}
+	if (partial_agg_walker((Node *) query->targetList, &ctx) ||
+		partial_agg_walker(query->havingQual, &ctx))
+	{
+		*reason = ctx.reason;
+		return false;
+	}
+	return true;
+}
+
+/*
+ * The fragment of a partial aggregation as a group receives it: a grouping query over the tables of one
+ * colocation group (the analysis of pushdown.c), whose aggregates split, with no HAVING, ORDER BY, LIMIT,
+ * DISTINCT or window (the node that combines applies them).  A group that is asked for more than that
+ * refuses, and that is not a stale map.
+ */
+bool
+kingres_shard_partial_fragment_analyze(Query *query, KsQueryFragment *qf, const char **reason)
+{
+	memset(qf, 0, sizeof(*qf));
+	if (!kingres_shard_pushdown_analyze(query, &qf->pd, reason))
+		return false;
+	if (!kingres_shard_partial_shape_ok(query, true, reason))
+		return false;
+	{
+		ListCell   *lt;
+
+		foreach(lt, query->targetList)
+		{
+			TargetEntry *te = lfirst_node(TargetEntry, lt);
+
+			if (!IsA(te->expr, Aggref) && contain_aggs_of_level((Node *) te->expr, 0))
+			{
+				*reason = "an aggregate is inside an expression: the groups return the bare states";
+				return false;
+			}
+		}
+	}
+	if (query->havingQual != NULL || query->sortClause != NIL ||
+		query->limitCount != NULL || query->limitOffset != NULL)
+	{
+		*reason = "it has HAVING, ORDER BY or LIMIT, which the node that combines the states applies";
+		return false;
+	}
+	if (!kingres_shard_stmt_shippable_partial(query, qf->pd.colocation_id, reason))
+		return false;
+	qf->ext = kingres_shard_shippable_ext_used();
+	qf->colocation_id = qf->pd.colocation_id;
+	qf->relids = kingres_shard_pushdown_relids(&qf->pd);
+	return true;
 }

@@ -1,0 +1,185 @@
+-- sql/pg_facts.sql
+--   Behaviours of PostgreSQL that the table lifecycle (design/shard-phase9.md) relies on,
+--   settled by running them on every supported major (the "Needs verification" list of the
+--   design: items 1 to 5, 13 and 14).  The extension is not involved.
+--
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+\set SHOW_CONTEXT never
+\set VERBOSITY terse
+SET search_path = public;
+-- 1. A NOT VALID foreign key can be added to a partitioned referencing table, checks new
+--    rows at once, and is validated later without blocking writers of the referencing table.
+CREATE TABLE pf_ref (id int PRIMARY KEY);
+INSERT INTO pf_ref VALUES (1), (2);
+CREATE TABLE pf_child (id int PRIMARY KEY, r int) PARTITION BY HASH (id);
+CREATE TABLE pf_child_0 PARTITION OF pf_child FOR VALUES WITH (MODULUS 2, REMAINDER 0);
+CREATE TABLE pf_child_1 PARTITION OF pf_child FOR VALUES WITH (MODULUS 2, REMAINDER 1);
+INSERT INTO pf_child VALUES (1, 1), (2, 99);
+ALTER TABLE pf_child ADD CONSTRAINT pf_child_fk FOREIGN KEY (r) REFERENCES pf_ref (id) NOT VALID;
+SELECT conrelid::regclass AS relation, convalidated FROM pg_constraint
+ WHERE conname LIKE 'pf_child_fk%' ORDER BY conrelid::regclass::text;
+  relation  | convalidated 
+------------+--------------
+ pf_child   | f
+ pf_child_0 | f
+ pf_child_1 | f
+(3 rows)
+
+INSERT INTO pf_child VALUES (3, 98);
+ERROR:  insert or update on table "pf_child_1" violates foreign key constraint "pf_child_fk"
+ALTER TABLE pf_child VALIDATE CONSTRAINT pf_child_fk;
+ERROR:  insert or update on table "pf_child_0" violates foreign key constraint "pf_child_fk"
+UPDATE pf_child SET r = 1 WHERE id = 2;
+BEGIN;
+ALTER TABLE pf_child VALIDATE CONSTRAINT pf_child_fk;
+SELECT c.relname, l.mode FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+ WHERE l.pid = pg_backend_pid() AND c.relname IN ('pf_child', 'pf_child_0', 'pf_ref') AND l.locktype = 'relation'
+ ORDER BY 1, 2;
+  relname   |           mode           
+------------+--------------------------
+ pf_child   | ShareUpdateExclusiveLock
+ pf_child_0 | AccessShareLock
+ pf_child_0 | ShareUpdateExclusiveLock
+ pf_ref     | AccessShareLock
+ pf_ref     | RowShareLock
+(5 rows)
+
+ROLLBACK;
+ALTER TABLE pf_child VALIDATE CONSTRAINT pf_child_fk;
+SELECT conrelid::regclass AS relation, convalidated FROM pg_constraint
+ WHERE conname LIKE 'pf_child_fk%' ORDER BY conrelid::regclass::text;
+  relation  | convalidated 
+------------+--------------
+ pf_child   | t
+ pf_child_0 | t
+ pf_child_1 | t
+(3 rows)
+
+-- 2. A row trigger of a partitioned table is cloned to a partition that is attached later (and
+--    exists on the partitions that were there when it was created).
+CREATE TABLE pf_t (id int, v int) PARTITION BY RANGE (id);
+CREATE FUNCTION pf_fn() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+CREATE TABLE pf_t_1 PARTITION OF pf_t FOR VALUES FROM (0) TO (10);
+CREATE TRIGGER pf_trg AFTER INSERT OR UPDATE OR DELETE ON pf_t FOR EACH ROW EXECUTE FUNCTION pf_fn();
+CREATE TABLE pf_t_2 (id int, v int);
+ALTER TABLE pf_t ATTACH PARTITION pf_t_2 FOR VALUES FROM (10) TO (20);
+SELECT tgrelid::regclass AS relation, tgname, tgenabled FROM pg_trigger WHERE tgname = 'pf_trg' ORDER BY tgrelid::regclass::text;
+ relation | tgname | tgenabled 
+----------+--------+-----------
+ pf_t     | pf_trg | O
+ pf_t_1   | pf_trg | O
+ pf_t_2   | pf_trg | O
+(3 rows)
+
+-- 3. ATTACH PARTITION takes a validated check constraint that equals the bound as proof of
+--    the partition constraint and does not scan the table, but only when the column is NOT NULL
+--    too (range and list: the partition constraint says "IS NOT NULL"); without that the table is
+--    scanned.  The hash bound needs only the check.
+SET client_min_messages = debug1;
+CREATE TABLE pf_range (id int) PARTITION BY RANGE (id);
+CREATE TABLE pf_range_n (id int, CONSTRAINT pf_range_n_chk CHECK (id >= 0 AND id < 10));
+CREATE TABLE pf_range_a (id int NOT NULL, CONSTRAINT pf_range_a_chk CHECK (id >= 0 AND id < 10));
+CREATE TABLE pf_range_b (id int);
+ALTER TABLE pf_range ATTACH PARTITION pf_range_n FOR VALUES FROM (20) TO (30);
+DEBUG:  verifying table "pf_range_n"
+ALTER TABLE pf_range ATTACH PARTITION pf_range_a FOR VALUES FROM (0) TO (10);
+DEBUG:  partition constraint for table "pf_range_a" is implied by existing constraints
+ALTER TABLE pf_range ATTACH PARTITION pf_range_b FOR VALUES FROM (10) TO (20);
+DEBUG:  verifying table "pf_range_b"
+CREATE TABLE pf_list (id int) PARTITION BY LIST (id);
+CREATE TABLE pf_list_a (id int NOT NULL, CONSTRAINT pf_list_a_chk CHECK (id IN (1, 2)));
+ALTER TABLE pf_list ATTACH PARTITION pf_list_a FOR VALUES IN (1, 2);
+DEBUG:  partition constraint for table "pf_list_a" is implied by existing constraints
+CREATE TABLE pf_hash (id int, d int) PARTITION BY HASH (id);
+CREATE TABLE pf_hash_a (id int, d int, CONSTRAINT pf_hash_a_chk CHECK (satisfies_hash_partition('pf_hash'::regclass, 4, 1, id)));
+ALTER TABLE pf_hash ATTACH PARTITION pf_hash_a FOR VALUES WITH (MODULUS 4, REMAINDER 1);
+DEBUG:  partition constraint for table "pf_hash_a" is implied by existing constraints
+-- a partitioned child: the check is on its root, and its leaves inherit it
+CREATE TABLE pf_hash_c (id int, d int, CONSTRAINT pf_hash_c_chk CHECK (satisfies_hash_partition('pf_hash'::regclass, 4, 2, id)))
+  PARTITION BY RANGE (d);
+CREATE TABLE pf_hash_c_leaf PARTITION OF pf_hash_c FOR VALUES FROM (0) TO (100);
+SELECT conrelid::regclass AS relation, conname, coninhcount > 0 AS inherited FROM pg_constraint WHERE conname = 'pf_hash_c_chk' ORDER BY conrelid::regclass::text;
+    relation    |    conname    | inherited 
+----------------+---------------+-----------
+ pf_hash_c      | pf_hash_c_chk | f
+ pf_hash_c_leaf | pf_hash_c_chk | t
+(2 rows)
+
+ALTER TABLE pf_hash ATTACH PARTITION pf_hash_c FOR VALUES WITH (MODULUS 4, REMAINDER 2);
+DEBUG:  partition constraint for table "pf_hash_c" is implied by existing constraints
+RESET client_min_messages;
+-- 4. Attaching a partition when a DEFAULT partition exists locks the default partition
+--    ACCESS EXCLUSIVE (and scans it); 13. the parent is locked SHARE UPDATE EXCLUSIVE and the
+--    attached table ACCESS EXCLUSIVE.
+CREATE TABLE pf_d (id int) PARTITION BY LIST (id);
+CREATE TABLE pf_d_def PARTITION OF pf_d DEFAULT;
+CREATE TABLE pf_d_1 (id int);
+BEGIN;
+ALTER TABLE pf_d ATTACH PARTITION pf_d_1 FOR VALUES IN (1);
+SELECT c.relname, l.mode FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+ WHERE l.pid = pg_backend_pid() AND l.locktype = 'relation' AND c.relname IN ('pf_d', 'pf_d_def', 'pf_d_1')
+ ORDER BY 1, 2;
+ relname  |           mode           
+----------+--------------------------
+ pf_d     | ShareUpdateExclusiveLock
+ pf_d_1   | AccessExclusiveLock
+ pf_d_def | AccessExclusiveLock
+(3 rows)
+
+ROLLBACK;
+CREATE TABLE pf_e (id int) PARTITION BY LIST (id);
+CREATE TABLE pf_e_1 (id int);
+BEGIN;
+ALTER TABLE pf_e ATTACH PARTITION pf_e_1 FOR VALUES IN (1);
+SELECT c.relname, l.mode FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+ WHERE l.pid = pg_backend_pid() AND l.locktype = 'relation' AND c.relname IN ('pf_e', 'pf_e_1')
+ ORDER BY 1, 2;
+ relname |           mode           
+---------+--------------------------
+ pf_e    | ShareUpdateExclusiveLock
+ pf_e_1  | AccessExclusiveLock
+(2 rows)
+
+ROLLBACK;
+-- 5. LIKE ... INCLUDING ALL copies neither the storage parameters of the table nor its access method.
+CREATE ACCESS METHOD pf_heap TYPE TABLE HANDLER heap_tableam_handler;
+CREATE TABLE pf_src (id int, v text) USING pf_heap WITH (fillfactor = 70, autovacuum_enabled = false);
+CREATE TABLE pf_like (LIKE pf_src INCLUDING ALL);
+SELECT c.relname, c.reloptions, (SELECT a.amname FROM pg_am a WHERE a.oid = c.relam) AS access_method
+  FROM pg_class c WHERE c.relname IN ('pf_src', 'pf_like') ORDER BY 1;
+ relname |                reloptions                | access_method 
+---------+------------------------------------------+---------------
+ pf_like |                                          | heap
+ pf_src  | {fillfactor=70,autovacuum_enabled=false} | pf_heap
+(2 rows)
+
+-- and storage parameters cannot be given to a partitioned table
+CREATE TABLE pf_p (id int) PARTITION BY HASH (id) WITH (fillfactor = 70);
+ERROR:  cannot specify storage parameters for a partitioned table
+-- 14. A cached plan finds the table that has the name after a rename (the plan is made again from
+--     the raw tree when the rename invalidates it).
+CREATE TABLE pf_old (id int);
+INSERT INTO pf_old VALUES (1), (2), (3);
+CREATE TABLE pf_swap (id int);
+INSERT INTO pf_swap VALUES (1);
+PREPARE pf_q AS SELECT count(*) FROM pf_swap;
+EXECUTE pf_q;
+ count 
+-------
+     1
+(1 row)
+
+ALTER TABLE pf_swap RENAME TO pf_gone;
+ALTER TABLE pf_old RENAME TO pf_swap;
+EXECUTE pf_q;
+ count 
+-------
+     3
+(1 row)
+
+DEALLOCATE pf_q;
+DROP TABLE pf_child, pf_ref, pf_t, pf_range, pf_list, pf_hash, pf_d, pf_e, pf_d_1, pf_e_1,
+           pf_src, pf_like, pf_swap, pf_gone;
+DROP FUNCTION pf_fn();
+DROP ACCESS METHOD pf_heap;

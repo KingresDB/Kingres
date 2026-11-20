@@ -337,4 +337,15 @@ ks_window_ignore_nulls(const WindowFunc *wfunc)
 #define KS_PLAN_ORIGIN_UNKNOWN 0
 #endif
 
+/*
+ * KS_EAGER_AGGREGATE_GUC
+ *		The setting that keeps a partial aggregation out of the joins of a plan.  PostgreSQL 19 has
+ *		enable_eager_aggregate (on by default); the plan of the fragment of a partial aggregation must
+ *		have one Agg node at its top (planner.c, partialize), so it is set to off there.  18 has no such
+ *		setting, and the macro is not defined.
+ */
+#if PG_VERSION_NUM >= 190000
+#define KS_EAGER_AGGREGATE_GUC "enable_eager_aggregate"
+#endif
+
 #endif							/* KINGRES_SHARD_PG_COMPAT_H */

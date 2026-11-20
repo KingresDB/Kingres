@@ -24,6 +24,8 @@ export interface LedgerCard {
   lastVerificationState: LedgerStatus['verificationState']
   /** Databases whose ledger is not anchored (no enabled target). */
   notAnchored: string[]
+  /** Anchor targets in use, as the statuses say it (the targets are the cluster's); null when no status carries it. */
+  targetsUsed: number | null
 }
 
 const RANK: Record<string, number> = { critical: 3, warning: 2, info: 1 }
@@ -48,7 +50,9 @@ export function ledgerCard(
   let lastState: LedgerStatus['verificationState'] = null
   const reasons: string[] = []
   const notAnchored: string[] = []
+  let targetsUsed: number | null = null
   for (const s of statuses) {
+    if (s.anchoring) targetsUsed = Math.max(targetsUsed ?? 0, s.anchoring.targets)
     chainsRead += s.chains.length
     const c = coverageOf(s)
     if (c.state === 'complete') expected = expected === null ? null : expected + s.chains.length
@@ -92,5 +96,6 @@ export function ledgerCard(
     lastVerifiedAt: lastAt,
     lastVerificationState: lastState,
     notAnchored,
+    targetsUsed,
   }
 }

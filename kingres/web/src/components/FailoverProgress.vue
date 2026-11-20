@@ -33,7 +33,8 @@ import {
 } from '@/lib/failover'
 import { formatDateTime, formatDuration } from '@/lib/format'
 import { useSessionStore } from '@/stores/session'
-import type { FailoverRequest } from '@/api/types'
+import { ApiError } from '@/api/problem'
+import type { FailoverPlan, FailoverRequest } from '@/api/types'
 
 const session = useSessionStore()
 const client = useQueryClient()
@@ -99,10 +100,15 @@ const cancelBlocked = computed(() =>
         : '',
 )
 /** The assessments of the groups that wait for a decision, from the report of the paused run. */
+// 0.12.0: the refusal of a repeat carries the plan, whose verdicts are newer than the report's: they win when present.
+const resumePlan = ref<FailoverPlan | null>(null)
 const assessments = computed(() =>
-  (report.data.value?.groups ?? []).filter((g) =>
-    needing.value.some((b) => b.shardGroupId === g.shardGroupId),
-  ),
+  (report.data.value?.groups ?? [])
+    .filter((g) => needing.value.some((b) => b.shardGroupId === g.shardGroupId))
+    .map((g) => {
+      const fresh = resumePlan.value?.groups.find((p) => p.shardGroupId === g.shardGroupId)
+      return fresh ? { ...g, dataLoss: fresh.dataLoss } : g
+    }),
 )
 
 const cancel = useMutation({
@@ -134,6 +140,8 @@ async function resume(): Promise<void> {
     ])
   } catch (e) {
     resumeError.value = e
+    if (e instanceof ApiError && e.code === 'failover_needs_decision' && e.problem.plan)
+      resumePlan.value = e.problem.plan
   } finally {
     resuming.value = false
   }

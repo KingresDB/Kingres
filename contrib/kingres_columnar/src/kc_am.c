@@ -29,6 +29,7 @@
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/pg_am.h"
+#include "catalog/index.h"
 #include "catalog/pg_class.h"
 #include "catalog/storage.h"
 #include "commands/vacuum.h"
@@ -92,12 +93,22 @@ kc_slot_callbacks(Relation rel)
 	return &kc_slot_ops;
 }
 
+#define KC_PSCAN_HEAD	MAXALIGN(sizeof(ParallelTableScanDescData))
+
 static TableScanDesc
 kc_scan_begin_cb(Relation rel, Snapshot snapshot, int nkeys, struct ScanKeyData *key,
 				 ParallelTableScanDesc pscan, uint32 flags)
 {
 	KcScan	   *scan;
 
+	if (pscan != NULL)
+	{
+		/* the scan of an index build, shared by stripes (see kc_parallelscan_initialize) */
+		scan = kc_scan_begin(rel, NULL, NULL, NULL,
+							 (int) flags | KC_SCAN_MAINTENANCE | KC_SCAN_PARALLEL_OK);
+		scan->shared = (KcParallel *) ((char *) pscan + KC_PSCAN_HEAD);
+		return &scan->base;
+	}
 	/* the leader's unflushed rows are invisible to a worker: refuse, never answer wrongly */
 	if (IsParallelWorker())
 		ereport(ERROR,
@@ -171,39 +182,54 @@ kc_getnextslot(TableScanDesc sscan, ScanDirection direction, TupleTableSlot *slo
 	}
 }
 
+/*
+ * The only parallel table scan there is: the one a B-tree build starts (a plan never
+ * has one, kc_cscan.c).  The descriptor is followed by the counter the participants
+ * take the next stripe from (KcParallel); every participant reads the stripes
+ * with the maintenance rule (all rows of the committed stripes and of this
+ * transaction's own), and the rows of this transaction were written before the
+ * workers started.
+ */
 static Size
 kc_parallelscan_estimate(Relation rel)
 {
-	return sizeof(ParallelTableScanDescData);
+	return KC_PSCAN_HEAD + KcParallelSize(1);
 }
 
 static Size
 kc_parallelscan_initialize(Relation rel, ParallelTableScanDesc pscan)
 {
+	KcParallel *sh = (KcParallel *) ((char *) pscan + KC_PSCAN_HEAD);
+
+	/* rows of this transaction that are only in memory are invisible to workers */
+	if (kc_write_has_unwritten(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot build an index of columnar table \"%s\" in parallel: this transaction holds rows of it that are not written",
+						RelationGetRelationName(rel)),
+				 errhint("Set max_parallel_maintenance_workers to 0 for this statement.")));
 	pscan->phs_locator = rel->rd_locator;
 	pscan->phs_syncscan = false;
 	pscan->phs_snapshot_any = false;
 	pscan->phs_snapshot_off = 0;
-	return sizeof(ParallelTableScanDescData);
+	memset(sh, 0, KcParallelSize(1));
+	pg_atomic_init_u64(&sh->next, 0);
+	sh->nslots = 1;
+	return KC_PSCAN_HEAD + KcParallelSize(1);
 }
 
 static void
 kc_parallelscan_reinitialize(Relation rel, ParallelTableScanDesc pscan)
 {
+	KcParallel *sh = (KcParallel *) ((char *) pscan + KC_PSCAN_HEAD);
+
+	pg_atomic_write_u64(&sh->next, 0);
 }
 
 /* ------------------------------------------------------------------------
  * Index fetches and row versions: refused
  * ------------------------------------------------------------------------
  */
-
-static pg_noreturn void
-kc_no_indexes(void)
-{
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("columnar tables have no indexes in this version")));
-}
 
 /*
  * What the entry points that always raise an error do where an error is
@@ -213,18 +239,41 @@ kc_no_indexes(void)
  * error), so PostgreSQL itself never calls these at all; a module that does
  * gets the answer a table without rows would give, and a WARNING.
  */
+/*
+ * Index fetches (C6b).  An index scan hands the access method a TID, and the
+ * TID is a row number (kc_row_tid): the row is taken from a buffer of this
+ * transaction that reserved it, else from the visible stripe whose numbers hold
+ * it, one chunk group decoded at a time and kept (kc_scan_fetch_row).  What a scan
+ * cannot see (a stripe of a writer that is in progress or aborted, a number that
+ * no stripe has) returns nothing, which is how every dead index entry is filtered.
+ * Where the server forbids an error the answer is "nothing" and a warning
+ * (kc_write_refused).
+ */
+typedef struct KcIndexFetch
+{
+	IndexFetchTableData base;
+	KcScan	   *scan;			/* made at the first fetch, with the snapshot of that call */
+	Snapshot	snap;
+	MemoryContext cxt;			/* the scan lives as long as the fetch does */
+} KcIndexFetch;
+
 static IndexFetchTableData kc_refused_fetch;
 
 static IndexFetchTableData *
 kc_index_fetch_begin(KC_INDEX_FETCH_BEGIN_PARAMS)
 {
+	KcIndexFetch *f;
+
 	if (kc_write_refused(rel, "index fetch"))
 	{
 		/* static memory: nothing is allocated where the server forbids it */
 		kc_refused_fetch.rel = rel;
 		return &kc_refused_fetch;
 	}
-	kc_no_indexes();
+	f = palloc0(sizeof(KcIndexFetch));
+	f->base.rel = rel;
+	f->cxt = CurrentMemoryContext;
+	return &f->base;
 }
 
 static void
@@ -235,6 +284,13 @@ kc_index_fetch_reset(IndexFetchTableData *scan)
 static void
 kc_index_fetch_end(IndexFetchTableData *scan)
 {
+	KcIndexFetch *f = (KcIndexFetch *) scan;
+
+	if (scan == &kc_refused_fetch)
+		return;
+	if (f->scan != NULL)
+		kc_scan_end(f->scan);
+	pfree(f);
 }
 
 static bool
@@ -242,13 +298,36 @@ kc_index_fetch_tuple(IndexFetchTableData *scan, ItemPointer tid,
 					 Snapshot snapshot, TupleTableSlot *slot, bool *call_again,
 					 bool *all_dead)
 {
-	if (kc_write_refused(scan->rel, "index fetch"))
-	{
-		*call_again = false;
+	KcIndexFetch *f = (KcIndexFetch *) scan;
+	OffsetNumber off;
+	MemoryContext old;
+
+	*call_again = false;
+	/* the unique check asks with no all_dead pointer */
+	if (all_dead != NULL)
 		*all_dead = false;
+	if (scan == &kc_refused_fetch || kc_write_refused(scan->rel, "index fetch"))
 		return false;
+	if (snapshot->snapshot_type == SNAPSHOT_DIRTY)
+		return kc_scan_dirty_fetch(scan->rel, tid, snapshot, slot);
+	off = ItemPointerGetOffsetNumber(tid);
+	if (off < 1 || off > MaxOffsetNumber)
+		return false;
+	if (f->scan != NULL && f->snap != snapshot)
+	{
+		kc_scan_end(f->scan);
+		f->scan = NULL;
 	}
-	kc_no_indexes();
+	if (f->scan == NULL)
+	{
+		old = MemoryContextSwitchTo(f->cxt);
+		f->scan = kc_scan_begin(scan->rel, snapshot, NULL, NULL, KC_SCAN_FETCH);
+		f->snap = snapshot;
+		MemoryContextSwitchTo(old);
+	}
+	return kc_scan_fetch_row(f->scan,
+							 (uint64) ItemPointerGetBlockNumber(tid) * MaxOffsetNumber + (off - 1),
+							 slot);
 }
 
 /*
@@ -308,7 +387,23 @@ kc_index_delete_tuples(Relation rel, TM_IndexDeleteOp *delstate)
 {
 	if (kc_write_refused(rel, "index delete"))
 		return InvalidTransactionId;
-	kc_no_indexes();
+
+	/*
+	 * A B-tree asks this in two cases.  (1) Simple deletion, for index tuples that
+	 * carry the LP_DEAD hint: the fetch never says "all dead" (all_dead stays false), so
+	 * no tuple has the hint and this is never asked.  (2) Bottom-up deletion, when a leaf
+	 * page of a unique index is full and an insert found an entry with its key that
+	 * names a row nobody sees (the entry of a rolled-back writer; the same key is being
+	 * inserted again): it asks which of the page's entries may go, to avoid a split.
+	 * The answer "none" is always allowed ("it might even have no entries at all",
+	 * nbtpage.c): the page splits and VACUUM removes the entries (kc_index_vacuum).  A
+	 * decision here would have to read the stripe catalog and the metapage while a leaf
+	 * page is locked.
+	 */
+	if (!delstate->bottomup)
+		elog(ERROR, "kingres_columnar: simple deletion of index entries was asked, but no entry is ever marked dead");
+	delstate->ndeltids = 0;
+	return InvalidTransactionId;
 }
 
 /* ------------------------------------------------------------------------
@@ -324,9 +419,18 @@ kc_index_delete_tuples(Relation rel, TM_IndexDeleteOp *delstate)
  * TID would make it run the trigger without a row.
  */
 static void
-kc_set_insert_tid(TupleTableSlot *slot)
+kc_set_insert_tid(TupleTableSlot *slot, uint64 rownum)
 {
-	ItemPointerSet(&slot->tts_tid, MaxBlockNumber - 1, 1);
+	/*
+	 * A row that was given its number when it was inserted (the buffer holds a
+	 * reservation of row numbers, or the row was written at once) has its real
+	 * TID, the one a scan shows after the commit; every other row gets the
+	 * meaningless one.
+	 */
+	if (rownum != KC_NO_ROW)
+		kc_row_tid(rownum, &slot->tts_tid);
+	else
+		ItemPointerSet(&slot->tts_tid, MaxBlockNumber - 1, 1);
 }
 
 static void
@@ -338,13 +442,15 @@ kc_tuple_insert(Relation rel, TupleTableSlot *slot, CommandId cid,
 	 * section) the write is refused with a warning, here and in every callback
 	 * below that would otherwise raise one (kc_write_refused).
 	 */
+	uint64		rownum = KC_NO_ROW;
+
 	if (!kc_write_refused(rel, "insert"))
 	{
 		kc_require_rmgr();
-		kc_write_row(rel, slot, cid);
+		rownum = kc_write_row(rel, slot, cid);
 	}
 	slot->tts_tableOid = RelationGetRelid(rel);
-	kc_set_insert_tid(slot);
+	kc_set_insert_tid(slot, rownum);
 }
 
 static void
@@ -356,7 +462,7 @@ kc_tuple_insert_speculative(Relation rel, TupleTableSlot *slot, CommandId cid,
 		return;
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("INSERT ... ON CONFLICT DO UPDATE is not supported on columnar tables")));
+			 errmsg("INSERT ... ON CONFLICT is not supported on columnar tables: a speculative insertion would have to take a row back")));
 }
 
 static void
@@ -367,7 +473,7 @@ kc_tuple_complete_speculative(Relation rel, TupleTableSlot *slot,
 		return;
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("INSERT ... ON CONFLICT DO UPDATE is not supported on columnar tables")));
+			 errmsg("INSERT ... ON CONFLICT is not supported on columnar tables: a speculative insertion would have to take a row back")));
 }
 
 static void
@@ -375,17 +481,21 @@ kc_multi_insert(Relation rel, TupleTableSlot **slots, int nslots, CommandId cid,
 				KcInsertOptions options, struct BulkInsertStateData *bistate)
 {
 	int			i;
+	uint64	   *rownums = palloc(sizeof(uint64) * Max(nslots, 1));
 
+	for (i = 0; i < nslots; i++)
+		rownums[i] = KC_NO_ROW;
 	if (!kc_write_refused(rel, "multi insert"))
 	{
 		kc_require_rmgr();
-		kc_write_rows(rel, slots, nslots, cid);
+		kc_write_rows(rel, slots, nslots, cid, rownums);
 	}
 	for (i = 0; i < nslots; i++)
 	{
 		slots[i]->tts_tableOid = RelationGetRelid(rel);
-		kc_set_insert_tid(slots[i]);
+		kc_set_insert_tid(slots[i], rownums[i]);
 	}
+	pfree(rownums);
 }
 
 static TM_Result
@@ -700,7 +810,7 @@ kc_relation_copy_for_cluster(KC_COPY_FOR_CLUSTER_PARAMS)
 	if (OldIndex != NULL || use_sort)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("CLUSTER needs an index; columnar tables have none in this version")));
+				 errmsg("CLUSTER is not supported on columnar tables: it would reorder the rows, and an index names rows by their number")));
 	kc_require_rmgr();
 
 	/*
@@ -740,7 +850,7 @@ kc_relation_copy_for_cluster(KC_COPY_FOR_CLUSTER_PARAMS)
 	{
 		slot_getallattrs(slot);
 		kc_write_row_values(NewTable, slot->tts_values, slot->tts_isnull,
-							GetCurrentCommandId(true));
+							GetCurrentCommandId(true), NULL);
 		n++;
 		CHECK_FOR_INTERRUPTS();
 	}
@@ -818,12 +928,95 @@ kc_index_build_range_scan(Relation table_rel, Relation index_rel,
 						  BlockNumber numblocks, IndexBuildCallback callback,
 						  void *callback_state, TableScanDesc scan)
 {
+	KcMetaData	meta;
+	EState	   *estate;
+	ExprContext *econtext;
+	TupleTableSlot *slot;
+	ExprState  *predicate;
+	KcScan	   *kscan;
+	Datum		values[INDEX_MAX_KEYS];
+	bool		isnull[INDEX_MAX_KEYS];
+	double		reltuples = 0;
+
 	if (kc_write_refused(table_rel, "index build"))
 		return 0;
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("indexes on columnar tables are not supported in this version")));
-	return 0;
+	if (index_rel == NULL || index_info == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("an index build needs an index: columnar tables are indexed by CREATE INDEX only")));
+
+	/*
+	 * What a build can serve in this version (C6b): a B-tree, not unique, not
+	 * concurrent, of the whole table, on a file of format version 3.  Everything
+	 * else is refused here, before anything is written, in the statement itself.
+	 */
+	if (index_rel->rd_rel->relam != BTREE_AM_OID)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("columnar tables support B-tree indexes only"),
+				 errdetail("The index \"%s\" is of another access method.", RelationGetRelationName(index_rel)),
+				 errhint("Use a B-tree index, or keep the table in row storage.")));
+	if (index_info->ii_ExclusionOps != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("exclusion constraints are not supported on columnar tables"),
+				 errdetail("The index \"%s\" on \"%s\" enforces one; that needs a fetch with a dirty snapshot (increment C6c).",
+						   RelationGetRelationName(index_rel), RelationGetRelationName(table_rel))));
+	if ((index_info->ii_Unique || index_info->ii_ExclusionOps != NULL) && !index_rel->rd_index->indimmediate)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("deferrable unique and exclusion constraints are not supported on columnar tables"),
+				 errdetail("The constraint on index \"%s\" would be checked at the end of the transaction by a trigger that re-reads the row by its TID.",
+						   RelationGetRelationName(index_rel)),
+				 errhint("Make the constraint NOT DEFERRABLE.")));
+	if (index_info->ii_Concurrent)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("CREATE INDEX CONCURRENTLY and REINDEX CONCURRENTLY are not supported on columnar tables"),
+				 errhint("Use CREATE INDEX or REINDEX, which lock the table against writes while they run.")));
+	if (start_blockno != 0 || numblocks != InvalidBlockNumber)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("an index of a columnar table is built over the whole table")));
+	kc_meta_read(table_rel, &meta);
+	if (meta.version < KC_META_VERSION_RESERVE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("columnar table \"%s\" cannot have an index: its file was written by version 0.1 (format version %u)",
+						RelationGetRelationName(table_rel), meta.version),
+				 errhint("Rewrite the table first: VACUUM FULL, or ALTER TABLE ... SET ACCESS METHOD columnar (a new file of format version 3).")));
+
+	/* the rows of this transaction are written, with numbers, before the scan reads stripes */
+	if (scan == NULL)
+		kc_write_flush_for_index(table_rel);
+
+	estate = CreateExecutorState();
+	econtext = GetPerTupleExprContext(estate);
+	slot = table_slot_create(table_rel, NULL);
+	econtext->ecxt_scantuple = slot;
+	predicate = ExecPrepareQual(index_info->ii_Predicate, estate);
+
+	if (scan != NULL)
+		kscan = (KcScan *) scan;	/* a parallel build: the stripes are shared out */
+	else
+		kscan = kc_scan_begin(table_rel, NULL, NULL, NULL, KC_SCAN_MAINTENANCE);
+	while (kc_scan_next(kscan, slot))
+	{
+		CHECK_FOR_INTERRUPTS();
+		MemoryContextReset(econtext->ecxt_per_tuple_memory);
+		reltuples += 1;
+		if (predicate != NULL && !ExecQual(predicate, econtext))
+			continue;
+		FormIndexDatum(index_info, slot, estate, values, isnull);
+		callback(index_rel, &slot->tts_tid, values, isnull, true, callback_state);
+	}
+	if (scan == NULL)
+		kc_scan_end(kscan);
+	ExecDropSingleTupleTableSlot(slot);
+	FreeExecutorState(estate);
+	index_info->ii_ExpressionsState = NIL;
+	index_info->ii_PredicateState = NULL;
+	return reltuples;
 }
 
 static void

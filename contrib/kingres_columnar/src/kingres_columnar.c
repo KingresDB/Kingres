@@ -20,6 +20,13 @@
  */
 #include "postgres.h"
 
+#include "catalog/index.h"
+#include "catalog/namespace.h"
+#include "commands/defrem.h"
+#include "nodes/parsenodes.h"
+#include "tcop/utility.h"
+#include "utils/lsyscache.h"
+
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
@@ -58,6 +65,7 @@ PG_FUNCTION_INFO_V1(kingres_columnar_info);
 PG_FUNCTION_INFO_V1(kingres_columnar_stripes);
 PG_FUNCTION_INFO_V1(kingres_columnar_compact);
 PG_FUNCTION_INFO_V1(kingres_columnar_check);
+PG_FUNCTION_INFO_V1(kingres_columnar_check_indexes);
 PG_FUNCTION_INFO_V1(kingres_columnar_check_clean);
 PG_FUNCTION_INFO_V1(kingres_columnar_reconcile);
 PG_FUNCTION_INFO_V1(kingres_columnar_write_paths);
@@ -116,6 +124,81 @@ kc_object_access(ObjectAccessType access, Oid classId, Oid objectId, int subId,
 	if (access == OAT_DROP && classId == RelationRelationId && subId == 0 &&
 		!kc_entry_refused("drop note", NULL, false))
 		kc_write_note_dropped(objectId);
+}
+
+/*
+ * Utility statements that touch an index of a columnar table (C6b): the concurrent
+ * forms are refused before they begin (their first transaction would commit an
+ * invalid index that the build then fails to make).  The write of the rows this
+ * transaction holds, before a build reads stripes, is the build's own
+ * (kc_index_build_range_scan).
+ */
+static ProcessUtility_hook_type kc_prev_process_utility = NULL;
+
+static Oid
+kc_columnar_table_of(Oid relid)
+{
+	char		kind;
+
+	if (!OidIsValid(relid))
+		return InvalidOid;
+	kind = get_rel_relkind(relid);
+	if (kind == RELKIND_INDEX)
+		relid = IndexGetRelation(relid, true);
+	if (!OidIsValid(relid))
+		return InvalidOid;
+	kind = get_rel_relkind(relid);
+	if ((kind == RELKIND_RELATION || kind == RELKIND_MATVIEW) &&
+		kc_am_is_columnar(get_rel_relam(relid)))
+		return relid;
+	return InvalidOid;
+}
+
+static void
+kc_process_utility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree,
+				   ProcessUtilityContext context, ParamListInfo params,
+				   QueryEnvironment *queryEnv, DestReceiver *dest,
+				   QueryCompletion *qc)
+{
+	Node	   *parsetree = pstmt->utilityStmt;
+	Oid			tbl = InvalidOid;
+	bool		concurrent = false;
+
+	if (IsA(parsetree, IndexStmt))
+	{
+		IndexStmt  *stmt = (IndexStmt *) parsetree;
+
+		if (stmt->relation != NULL)
+			tbl = kc_columnar_table_of(RangeVarGetRelid(stmt->relation, NoLock, true));
+		concurrent = stmt->concurrent;
+	}
+	else if (IsA(parsetree, ReindexStmt))
+	{
+		ReindexStmt *stmt = (ReindexStmt *) parsetree;
+		ListCell   *lc;
+
+		foreach(lc, stmt->params)
+		{
+			DefElem    *opt = (DefElem *) lfirst(lc);
+
+			if (strcmp(opt->defname, "concurrently") == 0)
+				concurrent = defGetBoolean(opt);
+		}
+		if ((stmt->kind == REINDEX_OBJECT_INDEX || stmt->kind == REINDEX_OBJECT_TABLE) &&
+			stmt->relation != NULL)
+			tbl = kc_columnar_table_of(RangeVarGetRelid(stmt->relation, NoLock, true));
+	}
+	if (OidIsValid(tbl) && concurrent)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("CREATE INDEX CONCURRENTLY and REINDEX CONCURRENTLY are not supported on columnar tables"),
+				 errhint("Use CREATE INDEX or REINDEX, which lock the table against writes while they run.")));
+	if (kc_prev_process_utility)
+		kc_prev_process_utility(pstmt, queryString, readOnlyTree, context, params,
+								queryEnv, dest, qc);
+	else
+		standard_ProcessUtility(pstmt, queryString, readOnlyTree, context, params,
+								queryEnv, dest, qc);
 }
 
 void
@@ -240,6 +323,8 @@ _PG_init(void)
 	kc_cscan_init();
 	kc_prev_object_access_hook = object_access_hook;
 	object_access_hook = kc_object_access;
+	kc_prev_process_utility = ProcessUtility_hook;
+	ProcessUtility_hook = kc_process_utility;
 }
 
 void
@@ -488,8 +573,10 @@ kingres_columnar_info(PG_FUNCTION_ARGS)
 	 * compaction replaced, and of a load that is still in progress (an
 	 * estimate at any moment).  VACUUM gives back such pages at the end of the
 	 * file when they are at least 1000 pages or a sixteenth of it (heap's rule),
-	 * and nothing reuses them in the middle of the file, so a file whose number
-	 * stays high after a VACUUM is waiting for VACUUM FULL.  Read with a
+	 * and VACUUM lists the ones in the middle of the file for the next stripes to
+	 * reuse (C8), so the number includes blocks that are free and waiting to be
+	 * taken; a number that stays high through loads and vacuums is waiting for
+	 * VACUUM FULL.  Read with a
 	 * snapshot of this moment, whatever the caller's snapshot is.
 	 */
 	{
@@ -607,6 +694,7 @@ kingres_columnar_reconcile(PG_FUNCTION_ARGS)
 	if (kc_entry_refused("columnar_reconcile", NULL, false))
 		PG_RETURN_INT32(0);
 	/* at the start of a subtransaction (not visible from here) none may be begun: only at the top level */
+	kc_am_failed_reset();
 	n = kc_catalog_reconcile(&why, GetCurrentTransactionNestLevel() == 1);
 	if (n < 0)
 	{
@@ -816,10 +904,16 @@ kc_gate_held_by_superuser(const LOCKTAG *tag)
 void
 kc_check_gate(int which)
 {
+	kc_gate_wait((which == KC_GATE_ORPHANS) ? kc_guc_check_gate_orphans :
+				 (which == KC_GATE_CLAIMS) ? kc_guc_check_gate_claims : kc_guc_check_gate);
+}
+
+/* The wait of every gate, also those of the writer (kingres_columnar.reserve_gate). */
+void
+kc_gate_wait(int key)
+{
 	LOCKTAG		tag;
 	int			i;
-	int			key = (which == KC_GATE_ORPHANS) ? kc_guc_check_gate_orphans :
-		(which == KC_GATE_CLAIMS) ? kc_guc_check_gate_claims : kc_guc_check_gate;
 
 	if (key == 0)
 		return;
@@ -921,6 +1015,8 @@ kc_check_one(Oid relid, bool fix, KcCheckSink *sink)
 	int			i;
 	KcStripeInfo *s;
 	BlockNumber nblocks;
+	KcFreeExtent fa[KC_MAX_FREE_EXTENTS];
+	int			nfa;
 
 	kc_check_gate(KC_GATE_TABLES);
 
@@ -972,6 +1068,8 @@ kc_check_one(Oid relid, bool fix, KcCheckSink *sink)
 	 * after it, and would call a damaged table clean.  The orphan step has
 	 * always read the catalog this way.
 	 */
+	/* the list of free blocks before the stripes, and again after (C8): only what both hold is judged */
+	nfa = kc_meta_free_read(rel, fa, KC_MAX_FREE_EXTENTS);
 	cs = kc_latest_snapshot();
 	s = kc_catalog_load(rel, cs, &n);
 	pfree(cs);
@@ -1031,6 +1129,40 @@ kc_check_one(Oid relid, bool fix, KcCheckSink *sink)
 		if (fix && strcmp(problem, "stripe_beyond_file") == 0)
 			(void) kc_catalog_delete_stripe(kc_rel_ident(rel)->uid, s[i].stripe_id, false);
 	}
+	/*
+	 * The list of free blocks (C8) must name no block of a stripe visible now: a writer would
+	 * overwrite it.  (A list that is not sound reads as empty, which loses space and nothing else.)
+	 */
+	{
+		KcFreeExtent fe[KC_MAX_FREE_EXTENTS];
+		int			nfe = kc_meta_free_read(rel, fe, KC_MAX_FREE_EXTENTS);
+		int			k;
+		int			a;
+
+		for (k = 0; k < nfe; k++)
+		{
+			bool		kept = false;
+
+			for (a = 0; a < nfa; a++)
+				if (fa[a].first <= fe[k].first &&
+					(uint64) fa[a].first + fa[a].nblocks >= (uint64) fe[k].first + fe[k].nblocks)
+					kept = true;
+			if (!kept)
+				continue;
+			for (i = 0; i < n; i++)
+				if (s[i].first_block < (uint64) fe[k].first + fe[k].nblocks &&
+					(uint64) fe[k].first < s[i].first_block + s[i].block_count)
+				{
+					char		detail[256];
+
+					snprintf(detail, sizeof(detail), "the free blocks %u to %u overlap stripe " UINT64_FORMAT " (blocks %llu to %llu)",
+							 fe[k].first, fe[k].first + fe[k].nblocks - 1, s[i].stripe_id,
+							 (unsigned long long) s[i].first_block,
+							 (unsigned long long) (s[i].first_block + s[i].block_count - 1));
+					kc_check_row(sink, "free_extent_overlaps_stripe", RelationGetRelid(rel), detail);
+				}
+		}
+	}
 	if (s)
 	{
 		/* the stripe list of this table is not kept for the rest of the call */
@@ -1040,6 +1172,32 @@ kc_check_one(Oid relid, bool fix, KcCheckSink *sink)
 			pfree(s[i].col_stats);
 		}
 		pfree(s);
+	}
+
+	/*
+	 * A reserved stripe row that a committed transaction left (C6a): a writer
+	 * that reserved numbers replaces the row by its stripe's before it commits or
+	 * prepares, so a row that is still "reserved" and is seen by everything
+	 * committed is damage.  What this does not report, on purpose: the reserved
+	 * row of a transaction that is in progress (its writer is alive, and the
+	 * snapshot does not see it), of one that aborted, of a backend that died (the
+	 * heap's own rules make such a row dead, and a vacuum of the catalog takes it
+	 * away), of a prepared transaction (it has written its stripes), and those of
+	 * this session's own transaction.
+	 */
+	{
+		Snapshot	rs = kc_latest_snapshot();
+		int			nres = kc_catalog_count_reserved(rel, rs);
+
+		pfree(rs);
+		if (nres > 0)
+		{
+			char		detail[160];
+
+			snprintf(detail, sizeof(detail), "%d reserved stripe row(s) of committed transactions: row numbers were reserved and no stripe was written for them",
+					 nres);
+			kc_check_row(sink, "reserved_row_left", RelationGetRelid(rel), detail);
+		}
 	}
 
 	/*
@@ -1160,6 +1318,7 @@ kc_check_run(bool fix, KcCheckSink *sink)
 	List	   *later;
 	ListCell   *lc;
 
+	kc_am_failed_reset();
 	if (!kc_catalog_lock_nowait(&locks, fix ? RowExclusiveLock : AccessShareLock))
 	{
 		char		who[240];
@@ -1241,6 +1400,167 @@ kc_check_run(bool fix, KcCheckSink *sink)
  * the tables are clean, and the warning says so.  The superuser test comes
  * after the refusal because an error is not allowed at those moments.
  */
+/*
+ * columnar_check_indexes(rel): the cross-check of the indexes of one table against its
+ * stripes (C6c).  A row that the stripes of now hold and an index has no entry for is
+ * damage ('index_entry_missing'); an entry with no row is expected garbage until the
+ * next VACUUM and is not reported.  The stripe list is taken first and the index read
+ * after it, so a writer that commits meanwhile cannot make a row look unindexed (its
+ * entries precede its commit).  It reads every index in full and keeps the row numbers
+ * of one index in memory (8 bytes each): above KC_CHECK_MAX_ENTRIES entries the index is
+ * reported as 'not_checked'.  A separate function, because the cost of the check of
+ * the stripe catalog must not grow with the size of the indexes.
+ */
+#define KC_CHECK_MAX_ENTRIES	(50 * 1000 * 1000)
+
+static int
+kc_u64_cmp2(const void *a, const void *b)
+{
+	uint64		x = *(const uint64 *) a;
+	uint64		y = *(const uint64 *) b;
+
+	return (x > y) - (x < y);
+}
+
+static void
+kc_check_one_index(Relation rel, Relation idx, KcCheckSink *sink)
+{
+	IndexInfo  *ii = BuildIndexInfo(idx);
+	bool		partial = (ii->ii_Predicate != NIL);
+	bool	   *needed = NULL;
+	KcScan	   *scan;
+	uint64	   *ents = NULL;
+	uint64		n = 0;
+	uint64		cap = 0;
+	uint64		missing = 0;
+	uint64		first_missing[3];
+	IndexScanDesc is;
+	TupleTableSlot *slot;
+	EState	   *estate = NULL;
+	ExprContext *econtext = NULL;
+	ExprState  *pred = NULL;
+	char		detail[300];
+	int			i;
+
+	if (partial)
+	{
+		estate = CreateExecutorState();
+		econtext = GetPerTupleExprContext(estate);
+		pred = ExecPrepareQual(ii->ii_Predicate, estate);
+	}
+	else
+	{
+		needed = palloc0(sizeof(bool) * (RelationGetDescr(rel)->natts + 1));
+	}
+
+	/* the rows first (their stripe list is fixed here), then the entries */
+	scan = kc_scan_begin(rel, NULL, needed, NULL, KC_SCAN_MAINTENANCE);
+	is = KC_INDEX_BEGINSCAN(rel, idx, SnapshotAny);
+	index_rescan(is, NULL, 0, NULL, 0);
+	while (index_getnext_tid(is, ForwardScanDirection) != NULL)
+	{
+		ItemPointer tid = &is->xs_heaptid;
+
+		if (n == cap)
+		{
+			if (n >= KC_CHECK_MAX_ENTRIES)
+			{
+				snprintf(detail, sizeof(detail), "the index has more than %d entries and was not checked (the check keeps them in memory)",
+						 KC_CHECK_MAX_ENTRIES);
+				kc_check_row(sink, "not_checked", RelationGetRelid(idx), detail);
+				index_endscan(is);
+				kc_scan_end(scan);
+				if (ents)
+					pfree(ents);
+				return;
+			}
+			cap = cap ? cap * 2 : 1024;
+			ents = ents ? repalloc_huge(ents, sizeof(uint64) * cap)
+				: MemoryContextAllocHuge(CurrentMemoryContext, sizeof(uint64) * cap);
+		}
+		ents[n++] = (uint64) ItemPointerGetBlockNumber(tid) * MaxOffsetNumber +
+			(ItemPointerGetOffsetNumber(tid) - 1);
+		CHECK_FOR_INTERRUPTS();
+	}
+	index_endscan(is);
+	if (n > 1)
+		qsort(ents, n, sizeof(uint64), kc_u64_cmp2);
+
+	slot = table_slot_create(rel, NULL);
+	if (partial)
+		econtext->ecxt_scantuple = slot;
+	while (kc_scan_next(scan, slot))
+	{
+		uint64		row = (uint64) ItemPointerGetBlockNumber(&slot->tts_tid) * MaxOffsetNumber +
+			(ItemPointerGetOffsetNumber(&slot->tts_tid) - 1);
+
+		CHECK_FOR_INTERRUPTS();
+		if (partial)
+		{
+			MemoryContextReset(econtext->ecxt_per_tuple_memory);
+			if (!ExecQual(pred, econtext))
+				continue;
+		}
+		if (n == 0 || bsearch(&row, ents, n, sizeof(uint64), kc_u64_cmp2) == NULL)
+		{
+			if (missing < 3)
+				first_missing[missing] = row;
+			missing++;
+		}
+	}
+	ExecDropSingleTupleTableSlot(slot);
+	kc_scan_end(scan);
+	if (estate)
+		FreeExecutorState(estate);
+	if (ents)
+		pfree(ents);
+	if (missing > 0)
+	{
+		int			len;
+
+		len = snprintf(detail, sizeof(detail), "%llu visible row(s) have no entry in the index; first row numbers:",
+					   (unsigned long long) missing);
+		for (i = 0; i < 3 && (uint64) i < missing && len < (int) sizeof(detail) - 24; i++)
+			len += snprintf(detail + len, sizeof(detail) - len, " %llu", (unsigned long long) first_missing[i]);
+		kc_check_row(sink, "index_entry_missing", RelationGetRelid(idx), detail);
+	}
+}
+
+Datum
+kingres_columnar_check_indexes(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	KcCheckSink sink;
+	Relation	rel;
+	List	   *il;
+	ListCell   *lc;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to run columnar_check_indexes")));
+	InitMaterializedSRF(fcinfo, 0);
+	sink.rsinfo = rsinfo;
+	sink.rows = 0;
+	sink.ld = NULL;
+	sink.ld_uses = 0;
+	rel = kc_open_columnar_read(relid, "columnar_check_indexes");
+	if (rel == NULL)
+		return (Datum) 0;
+	il = RelationGetIndexList(rel);
+	foreach(lc, il)
+	{
+		Relation	idx = index_open(lfirst_oid(lc), AccessShareLock);
+
+		kc_check_one_index(rel, idx, &sink);
+		index_close(idx, AccessShareLock);
+	}
+	list_free(il);
+	relation_close(rel, AccessShareLock);
+	return (Datum) 0;
+}
+
 Datum
 kingres_columnar_check(PG_FUNCTION_ARGS)
 {

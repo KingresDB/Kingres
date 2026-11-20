@@ -79,6 +79,8 @@ export interface Ledger7State {
   }
   /** True: a database with ledger tables and no enabled target raises `ledgerNotAnchored` (the alerts of a plain mock are none). */
   alertNotAnchored: boolean
+  /** 0.12.0: the system database is older than what was published: the alert `ledgerSignerUnavailable` with the subject `published-state`. */
+  publishedStateAlarm: boolean
   /** Text a hostile server could send in the statement and in the flags of an aggregate (`?mock=hostile`). Null: the normal text. */
   hostileText: string | null
   /** The next key task ends failed with this code. */
@@ -90,6 +92,8 @@ export interface Ledger7State {
   }
   /** Shard groups whose chain diverged, as `${database}:${group}`. */
   diverged: string[]
+  /** Why the log ended, as the alert of a diverged chain says it (null: the plain text). */
+  divergedWhy: string | null
   /** The epoch of a chain after an acknowledged divergence, as `${database}:${group}` (absent: 1). */
   epochs: Record<string, number>
   targets: S['LedgerAnchorTarget'][]
@@ -169,6 +173,7 @@ export function createLedger7State(): Ledger7State {
     },
     signing: defaultSigning(),
     alertNotAnchored: false,
+    publishedStateAlarm: false,
     hostileText: null,
     keyFailure: null,
     publication: {
@@ -176,6 +181,7 @@ export function createLedger7State(): Ledger7State {
       health: 'ok',
     },
     diverged: [],
+    divergedWhy: null,
     epochs: {},
     targets: [],
     anchors: [],

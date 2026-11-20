@@ -1565,6 +1565,7 @@ kingres_shard_recovery_worker_main(Datum main_arg)
 {
 	Oid			dboid = DatumGetObjectId(main_arg);
 	bool		run_moves = false;
+	bool		run_table_ops = false;
 	bool		run_deadlock = false;
 	char		mode[16] = "recovery";
 
@@ -1610,6 +1611,11 @@ kingres_shard_recovery_worker_main(Datum main_arg)
 		run_moves = strcmp(mode, "recovery") == 0 &&
 			cat->present && cat->local_group_id == KINGRES_SHARD_MAP_GROUP &&
 			OidIsValid(kingres_shard_catalog_relid("bucket_move"));
+
+		/* The same for the records of table operations (design/shard-phase9.md, "Crashes and lost nodes"). */
+		run_table_ops = strcmp(mode, "recovery") == 0 &&
+			cat->present && cat->local_group_id == KINGRES_SHARD_MAP_GROUP &&
+			OidIsValid(kingres_shard_catalog_relid("table_operation"));
 	}
 	PopActiveSnapshot();
 	CommitTransactionCommand();
@@ -1629,6 +1635,17 @@ kingres_shard_recovery_worker_main(Datum main_arg)
 	{
 		run_move_step("SELECT " KINGRES_SHARD_SCHEMA ".resume_bucket_moves()");
 		run_move_step("SELECT " KINGRES_SHARD_SCHEMA ".cleanup_moved_buckets()");
+	}
+
+	/*
+	 * Table operations (design, "Crashes and lost nodes", S4-02): an operation whose session died and that did not
+	 * switch is undone, one that switched is finished, an undone one that missed a node is cleaned again; the old
+	 * copies whose time has come are dropped.  The functions leave an operation alone whose session holds its live mark.
+	 */
+	if (run_table_ops)
+	{
+		run_move_step("SELECT " KINGRES_SHARD_SCHEMA ".resume_table_operations()");
+		run_move_step("SELECT " KINGRES_SHARD_SCHEMA ".cleanup_table_operations()");
 	}
 	proc_exit(0);
 }

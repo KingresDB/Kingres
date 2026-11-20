@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgerlog"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgerpub"
@@ -24,15 +25,6 @@ func openLog(logs []ledgerpub.LogRow, db string, group int32) *ledgerpub.LogRow 
 		}
 	}
 	return nil
-}
-
-func hasClosed(logs []ledgerpub.LogRow, chainID []byte) bool {
-	for _, l := range logs {
-		if l.Kind == ledgerpub.KindChain && bytes.Equal(l.ChainID, chainID) && l.State == ledgerpub.StateClosed {
-			return true
-		}
-	}
-	return false
 }
 
 // chain updates the chain log of one group from what the round read (design 4.5 and 4.7): the checks of divergence, then the order of a
@@ -60,12 +52,27 @@ func (c *Collector) chain(ctx context.Context, pc *ledgersign.PubContext, term s
 		return fmt.Errorf("shard group %d answered a head that is not valid", g)
 	}
 	if existing != nil && !bytes.Equal(existing.ChainID, chainID) {
+		// The answer names the chain of another group's open log: two groups swapped (a mapping error), or an answer was forged. That is a
+		// divergence of both, never a retirement (P8-04): nothing is closed, nothing is signed for either log, and the alert is critical.
+		if other := openLogByChain(logs, chainID); other != nil && other.ID != existing.ID {
+			gr.Log, gr.Diverged = existing, true
+			why := "the group answered the chain of shard group " + groupText(*other) + " (two groups swapped, or a forged answer)"
+			if err := c.diverge(ctx, term, db, g, *existing, why); err != nil {
+				return err
+			}
+			if other.State == ledgerpub.StateActive && other.ShardGroupID != nil {
+				return c.diverge(ctx, term, other.Database, *other.ShardGroupID, *other, "the group "+strconv.Itoa(int(g))+" answered the chain of this group")
+			}
+			return nil
+		}
 		// The group holds another chain than the one published for it (the database was dropped and made again outside the control plane, or
 		// its ledger was replaced): the old log cannot be extended, and it must not simply stop. It is closed with an event and flagged
 		// retired in the aggregate, as a removed group is.
 		if err := c.retireLogs(ctx, *pc, term, db, []ledgerpub.LogRow{*existing}, "chain-replaced"); err != nil {
 			return err
 		}
+		// a replacement is not a quiet event (P8-04): the old chain ended with a signed event and a new log starts; an operator is told
+		c.alert(ctx, AlertDiverged, "critical", db, g, fmt.Sprintf("The chain of shard group %d was replaced by another chain: the published log ended with a signed event and a log of the new chain starts. Check that the database was meant to be replaced.", g), true)
 		// the event is a change of the key set: the signers are read again, with the revision they have now
 		fresh, err := c.cfg.Keys.Publication(ctx)
 		if err != nil {
@@ -83,8 +90,21 @@ func (c *Collector) chain(ctx context.Context, pc *ledgersign.PubContext, term s
 		existing = nil
 	}
 	if existing == nil {
-		if hasClosed(logs, chainID) {
-			return nil // the chain's log was closed (retired or acknowledged) and awaits the next epoch (step 20)
+		if closed := closedLog(logs, chainID); closed != nil {
+			// The chain's log was closed (retired for a drop, a removal, a vanished database or a replacement, or acknowledged) and the same
+			// chain is back: its log is NOT opened again and nothing is published for the new blocks, until the next epoch of step 20 is
+			// started by an operator. That is said loudly (P8-03): a critical alert names the group, the height now and why the log was
+			// closed. An auditor sees the closed log with its chain-retired event and nothing after it.
+			// The task that drops a database ends the publication first and drops the database a few steps later, so the chain is still
+			// there for a short time after the retirement for "dropped": that window is no return of a closed chain (found by the cluster
+			// test of the drop in the round of part A). Nothing is published for it and no alert is raised until DropGrace has passed.
+			if closed.Detail == "retired: "+ReasonDropped && closed.ClosedAt != nil && c.cfg.Clock().Sub(*closed.ClosedAt) < DropGrace {
+				gr.Log, gr.Diverged = closed, true
+				return nil
+			}
+			c.alert(ctx, AlertDiverged, "critical", db, g, fmt.Sprintf("The chain of shard group %d (head %d) is back with the chain id of a log whose publication ended (%s). Its new blocks are not published until a new epoch is started.", g, gr.Resp.Height, closed.Detail), true)
+			gr.Log, gr.Diverged = closed, true
+			return nil
 		}
 		var id [32]byte
 		copy(id[:], chainID)
@@ -123,4 +143,27 @@ func (c *Collector) chain(ctx context.Context, pc *ledgersign.PubContext, term s
 		return nil
 	}
 	return err
+}
+
+// closedLog returns a closed chain log with the chain id (the newest), nil when there is none.
+func closedLog(logs []ledgerpub.LogRow, chainID []byte) *ledgerpub.LogRow {
+	var found *ledgerpub.LogRow
+	for i := range logs {
+		l := &logs[i]
+		if l.Kind == ledgerpub.KindChain && bytes.Equal(l.ChainID, chainID) && l.State == ledgerpub.StateClosed {
+			found = l
+		}
+	}
+	return found
+}
+
+// openLogByChain returns the chain log with this chain id that is not closed, nil when there is none.
+func openLogByChain(logs []ledgerpub.LogRow, chainID []byte) *ledgerpub.LogRow {
+	for i := range logs {
+		l := &logs[i]
+		if l.Kind == ledgerpub.KindChain && bytes.Equal(l.ChainID, chainID) && l.State != ledgerpub.StateClosed {
+			return l
+		}
+	}
+	return nil
 }

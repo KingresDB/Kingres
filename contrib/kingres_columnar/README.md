@@ -11,9 +11,17 @@ events, logs, and old partitions of such data. The design is in
 `kingres/docs/design/analytics-phase12-storage.md`; this file says what version
 0.1 does.
 
-Version 0.1 is "increments C1 to C4" of the design: insert-only, no indexes,
+Version 0.1 was "increments C1 to C4" of the design: insert-only, no indexes,
 serial scan, codecs `none`, `pglz`, `lz4` and `zstd`, `VACUUM`, `VACUUM FULL`,
-standby reads. It adds no core patch and bundles no third-party code.
+standby reads; the parallel scan (C5) came after it with no change to the files.
+Version 0.2 is increments C6a to C6c of the road to B-tree indexes: a write buffer
+can **reserve row numbers when a row is inserted**, so that the row's TID exists
+then ("Reserved row numbers" below); a table can have **B-tree indexes**, unique
+ones included, which find rows by that TID ("B-tree indexes" below), and `VACUUM`
+cleans them.  It changes nothing for a table that has no index and a session that
+does not ask for reservation (a table with an index asks for it by itself; the
+developer setting does it for the tests).  It adds no core patch and bundles no
+third-party code.
 
 ## Installing
 
@@ -57,9 +65,10 @@ and use `kingres.columnar_compact` afterwards.
 | `kingres.columnar_options(rel)` | The options in force. |
 | `kingres.columnar_info(rel)` | Stripes, chunk groups, rows, bytes on disk, uncompressed bytes, ratio, and `unreferenced_bytes`: what the file holds that no stripe visible now uses (the pages of rolled-back loads, of stripes that compaction replaced, of a load still in progress), read with a snapshot of this moment whatever the caller's snapshot is.  VACUUM gives back such pages at the end of the file only when they are worth it (see "VACUUM and space"); a figure that stays high after a VACUUM is waiting for `VACUUM FULL`. |
 | `kingres.columnar_stripes(rel)` | One row per visible stripe. |
-| `kingres.columnar_compact(rel, min_rows)` | Merge stripes with fewer than `min_rows` rows (default a quarter of the stripe size); returns the number of stripes written. Owner only. It changes nothing logically: for every transaction, the one that calls it and every other, the rows each snapshot sees are the same before and after, and under SERIALIZABLE it creates no dependency (see "Isolation"). |
-| `kingres.columnar_check(fix)` | Superuser. Reports catalog rows of files nobody uses, stripes beyond the end of the file, stripes whose first page is not theirs, stripes with more rows than the developer setting `max_stripe_rows` lets a stripe have today (`stripe_over_row_limit`: readable, a rewrite writes them again), and relations that cannot be read (`unreadable`, with the reason: damage that the table shows, an unreadable or missing file, a format this server does not read). `fix` deletes the first two kinds. **It reads the stripe catalog as of now whatever the isolation level of the caller** (an older `REPEATABLE READ` or `SERIALIZABLE` snapshot does not see a table made after it, nor stripes committed after it, and would call a damaged table clean): the list of tables and the stripes are read by this call, not through the caller's snapshot. **It never waits for a lock, for every lock it takes**: the stripe catalog, its primary key index, its TOAST table and its index, and `pg_class` are locked without waiting before anything is read, and each table is locked without waiting; whatever cannot be locked (an administrator's `LOCK TABLE`, `REINDEX` or `VACUUM FULL` that is running, a prepared transaction that holds a lock until someone ends it) is reported as `not_checked` with the reason (for a catalog: for no table in particular, and nothing is checked), and the rest is checked.  The row says which processes hold the lock, read from the lock manager's tables without waiting (`It is held by process 1234.`, or `... by a prepared transaction (see pg_prepared_xacts).`: a prepared transaction has no process); for a catalog it also names the relation that could not be locked.  What remains is what every statement does: the relation cache reads the system catalogs such as `pg_attribute`, and a short wait for a buffer.  **One exception to "never waits"**, argued from the code and not tested: when the backend's cache is cold, resolving the stripe catalog by name (the first step of every call) takes ordinary, waiting locks on `pg_extension` and `pg_class`; a session that holds `pg_class` `ACCESS EXCLUSIVE` stalls nearly every statement of a database in the same way, so this is not a property of the check, but the sentence above does not cover that first lookup.  A table dropped, made another kind of table, or made while the call runs is a `not_checked` row as well, never counted as clean.  **A query cancel, a statement timeout, a lock timeout, an out-of-memory error or any other error that is not about the table being read ends the call with that error**; only damage that the table shows becomes an `unreadable` row. **What a caller must look for: any row at all means "not clean".** `not_checked` is not an error row and not a clean result: it says that this table was not looked at, so a monitor that tests for the names of the error rows (`stripe_beyond_file`, `unreadable`, `page_header_mismatch`, `orphan_catalog_rows`) would pass over a damaged table that happens to be locked.  A monitor tests that the result is empty, or uses `columnar_check_clean()`.  **What "clean" covers**: the stripe catalog against the files, and the first page of each stripe (its place in the file, its header, its identity and size); orphaned catalog rows; **not the other pages of a stripe** (a damaged later page is found when the stripe is read, by the checksums); **and not a stripe that only an old snapshot can still see** (one that compaction replaced and that is not yet invisible to every snapshot): the stripes looked at are those visible now.  **Which tables**: a table is a columnar table, here and everywhere else (the planner's path, the list of live files of the clean-up of the stripe catalog, the drop note, the event trigger that refuses foreign keys and publications), when the handler of its access method is this extension's handler, never by the name of the access method: a second access method made over `kingres.columnar_handler` by a superuser (`CREATE ACCESS METHOD columnar2 TYPE TABLE HANDLER kingres.columnar_handler`) is checked, cleaned up after and refused foreign keys like `columnar` (before this round the check did not list such a table and the clean-up deleted every stripe row of it).  The clean-up of the stripe catalog deletes nothing while a table-like relation has an access method that cannot be classified (an access method that a transaction has made and not committed, or a handler that raises an error), or while a columnar file has an unreadable metapage; **that is a visible outcome of the check (C12-01)**: the orphan step could not be done, so the call returns a `not_checked` row with no table, whose detail says `the orphan step could not be done: ` and the reason, `columnar_check_clean()` is `false`, and no `orphan_catalog_rows` row is made up; the answer is the same for `fix`, which deletes nothing then.  The handler of an access method that is not this extension's is code of somebody else: the check, VACUUM and `columnar_reconcile()` at the top level of a transaction call it inside a subtransaction (only when the answer is not already cached; `columnar_reconcile()` inside a subtransaction does not, because the start of one is not visible to the extension, and there such an error is raised), and an error it raises (other than a cancel, a shutdown or running out of memory) leaves the access method unclassified, with a line in the log, and does not fail the call (C12-06).  **What it leaves behind**: no lock.  Each table's lock (`ACCESS SHARE`, `SHARE UPDATE EXCLUSIVE` with `fix`) is let go as soon as the table has been looked at, and the catalogs' at the end of the call, so the call needs one entry of the shared lock table at a time and works with any number of columnar tables (it used to keep them all until the end of the transaction, and failed with `out of shared memory` with more tables than the lock table has room for); a lock that the caller's transaction already held on a table stays the caller's.  **What it costs in memory**: the stripe list of one table at a time (a descriptor of about 100 bytes and the stripe's statistics, a few hundred bytes for a table of a few columns, for each stripe; freed after the table), and the list of table oids; nothing grows with the number of rows; with the number of tables only the list of their oids grows, and, for the tables that are `not_checked` because they are locked, the rows themselves (about 700 bytes each in the result) and one copy of the server's lock data, which is read once for each 64 such rows and freed, and at the end of the call (it was read for every row and kept to the end, so that a large DDL that locks many tables made the memory of the call grow with the square of their number, C12-02).  **The orphan step** reads the stripe catalog and `pg_class` at two moments; a row is reported (and, with `fix`, deleted) only if two snapshots, one taken before and one after the read of `pg_class`, both see it, and no live file claims it in a second read of `pg_class` after the catalog was read, so a `DROP TABLE`, `VACUUM FULL` or `SET ACCESS METHOD` that commits meanwhile makes no false `orphan_catalog_rows` (it did, in 10 to 30 percent of the checks while DDL ran).  Where PostgreSQL cannot begin a subtransaction (a callback of another module at the end of a transaction, in a critical section: see "Writes while a transaction is ending") the call is refused with a WARNING and returns no rows, which is not a clean result either; no statement of a session is ever in that state. |
+| `kingres.columnar_compact(rel, min_rows)` | Merge stripes with fewer than `min_rows` rows (default a quarter of the stripe size); returns the number of stripes written. Owner only. On a table with indexes the copies get entries in every index (see "B-tree indexes"). It changes nothing logically: for every transaction, the one that calls it and every other, the rows each snapshot sees are the same before and after, and under SERIALIZABLE it creates no dependency (see "Isolation"). |
+| `kingres.columnar_check(fix)` | Superuser. Reports catalog rows of files nobody uses, stripes beyond the end of the file, stripes whose first page is not theirs, stripes with more rows than the developer setting `max_stripe_rows` lets a stripe have today (`stripe_over_row_limit`: readable, a rewrite writes them again), and relations that cannot be read (`unreadable`, with the reason: damage that the table shows, an unreadable or missing file, a format this server does not read). `fix` deletes the first two kinds. **It reads the stripe catalog as of now whatever the isolation level of the caller** (an older `REPEATABLE READ` or `SERIALIZABLE` snapshot does not see a table made after it, nor stripes committed after it, and would call a damaged table clean): the list of tables and the stripes are read by this call, not through the caller's snapshot. **It never waits for a lock, for every lock it takes**: the stripe catalog, its primary key index, its TOAST table and its index, and `pg_class` are locked without waiting before anything is read, and each table is locked without waiting; whatever cannot be locked (an administrator's `LOCK TABLE`, `REINDEX` or `VACUUM FULL` that is running, a prepared transaction that holds a lock until someone ends it) is reported as `not_checked` with the reason (for a catalog: for no table in particular, and nothing is checked), and the rest is checked.  The row says which processes hold the lock, read from the lock manager's tables without waiting (`It is held by process 1234.`, or `... by a prepared transaction (see pg_prepared_xacts).`: a prepared transaction has no process); for a catalog it also names the relation that could not be locked.  What remains is what every statement does: the relation cache reads the system catalogs such as `pg_attribute`, and a short wait for a buffer.  **One exception to "never waits"**, argued from the code and not tested: when the backend's cache is cold, resolving the stripe catalog by name (the first step of every call) takes ordinary, waiting locks on `pg_extension` and `pg_class`; a session that holds `pg_class` `ACCESS EXCLUSIVE` stalls nearly every statement of a database in the same way, so this is not a property of the check, but the sentence above does not cover that first lookup.  A table dropped, made another kind of table, or made while the call runs is a `not_checked` row as well, never counted as clean.  **A query cancel, a statement timeout, a lock timeout, an out-of-memory error or any other error that is not about the table being read ends the call with that error**; only damage that the table shows becomes an `unreadable` row. **What a caller must look for: any row at all means "not clean".** `not_checked` is not an error row and not a clean result: it says that this table was not looked at, so a monitor that tests for the names of the error rows (`stripe_beyond_file`, `unreadable`, `page_header_mismatch`, `orphan_catalog_rows`) would pass over a damaged table that happens to be locked.  A monitor tests that the result is empty, or uses `columnar_check_clean()`.  **What "clean" covers**: the stripe catalog against the files, and the first page of each stripe (its place in the file, its header, its identity and size); orphaned catalog rows; **not the other pages of a stripe** (a damaged later page is found when the stripe is read, by the checksums); **and not a stripe that only an old snapshot can still see** (one that compaction replaced and that is not yet invisible to every snapshot): the stripes looked at are those visible now.  **Which tables**: a table is a columnar table, here and everywhere else (the planner's path, the list of live files of the clean-up of the stripe catalog, the drop note, the event trigger that refuses foreign keys and publications), when the handler of its access method is this extension's handler, never by the name of the access method: a second access method made over `kingres.columnar_handler` by a superuser (`CREATE ACCESS METHOD columnar2 TYPE TABLE HANDLER kingres.columnar_handler`) is checked, cleaned up after and refused foreign keys like `columnar` (before this round the check did not list such a table and the clean-up deleted every stripe row of it).  The clean-up of the stripe catalog deletes nothing while a table-like relation has an access method that cannot be classified (an access method that a transaction has made and not committed, or a handler that raises an error), or while a columnar file has an unreadable metapage; **that is a visible outcome of the check (C12-01)**: the orphan step could not be done, so the call returns a `not_checked` row with no table, whose detail says `the orphan step could not be done: ` and the reason, `columnar_check_clean()` is `false`, and no `orphan_catalog_rows` row is made up; the answer is the same for `fix`, which deletes nothing then.  The handler of an access method that is not this extension's is code of somebody else: the check, VACUUM and `columnar_reconcile()` at the top level of a transaction call it inside a subtransaction (only when the answer is not already cached; `columnar_reconcile()` inside a subtransaction does not, because the start of one is not visible to the extension, and there such an error is raised), and an error it raises (other than a cancel, a shutdown or running out of memory) leaves the access method unclassified, with a line in the log, and does not fail the call (C12-06); a handler that failed is not called again by any pass of the same call, and its error is logged once (C13-01).  **What it leaves behind**: no lock.  Each table's lock (`ACCESS SHARE`, `SHARE UPDATE EXCLUSIVE` with `fix`) is let go as soon as the table has been looked at, and the catalogs' at the end of the call, so the call needs one entry of the shared lock table at a time and works with any number of columnar tables (it used to keep them all until the end of the transaction, and failed with `out of shared memory` with more tables than the lock table has room for); a lock that the caller's transaction already held on a table stays the caller's.  **What it costs in memory**: the stripe list of one table at a time (a descriptor of about 100 bytes and the stripe's statistics, a few hundred bytes for a table of a few columns, for each stripe; freed after the table), and the list of table oids; nothing grows with the number of rows; with the number of tables only the list of their oids grows, and, for the tables that are `not_checked` because they are locked, the rows themselves (about 700 bytes each in the result) and one copy of the server's lock data, which is read once for each 64 such rows and freed, and at the end of the call (a "held by" text is therefore a view of the lock manager as old as the first of the up to 64 rows that share one copy: it can name a holder that has let go since, or none for a lock taken after the copy was made; the `not_checked` row itself is never wrong, C13-02) (it was read for every row and kept to the end, so that a large DDL that locks many tables made the memory of the call grow with the square of their number, C12-02).  **The orphan step** reads the stripe catalog and `pg_class` at two moments; a row is reported (and, with `fix`, deleted) only if two snapshots, one taken before and one after the read of `pg_class`, both see it, and no live file claims it in a second read of `pg_class` after the catalog was read, so a `DROP TABLE`, `VACUUM FULL` or `SET ACCESS METHOD` that commits meanwhile makes no false `orphan_catalog_rows` (it did, in 10 to 30 percent of the checks while DDL ran).  Where PostgreSQL cannot begin a subtransaction (a callback of another module at the end of a transaction, in a critical section: see "Writes while a transaction is ending") the call is refused with a WARNING and returns no rows, which is not a clean result either; no statement of a session is ever in that state. |
 | `kingres.columnar_check_clean()` | Superuser. The strict form of `columnar_check()`: `true` only when every columnar table was checked and nothing was found, `false` for any row `columnar_check()` would return, a `not_checked` table included (and for a refused call, with the warning).  It is never `true` for a table that was not looked at (a table made or dropped during the call included), so a script that tests this function and not the names of rows cannot pass silently; when it is `false`, `columnar_check()` says why.  It reads, locks and fails exactly as `columnar_check()` does (as of now, never waiting, ending with a cancel or a timeout), and covers what "clean" covers there.  **How to use it on a busy database.** Rows that are false alarms by design appear while DDL runs: a table dropped or made during the call, a table that another transaction holds `ACCESS EXCLUSIVE` (a rewrite, `TRUNCATE`, a vacuum's truncation) and, with `fix`, one that a vacuum holds `SHARE UPDATE EXCLUSIVE` are `not_checked`.  So `columnar_check_clean()` is a good "is it all fine right now" on a quiet database and a flapping signal on a busy one: a monitor should treat `false` as "look again", run `columnar_check()` to see why, and raise an alarm only when the same damage row (`stripe_beyond_file`, `unreadable`, `page_header_mismatch`, `orphan_catalog_rows`) appears in two runs a short time apart, or a `not_checked` row for the same table keeps appearing for longer than any DDL or vacuum of yours takes.  A `not_checked` row names the processes that hold the lock. |
+| `kingres.columnar_check_indexes(rel regclass)` | Superuser. The cross-check of the indexes of one table against its stripes: `index_entry_missing` for an index that lacks entries for rows the stripes hold (see "B-tree indexes"); entries without a row are expected garbage and not reported; an index above 50 000 000 entries is `not_checked`. |
 | `kingres.columnar_reconcile()` | Superuser. Deletes catalog rows of files no relation uses (it reads the first block of every columnar file of the database) and returns how many. A row that another session is deleting or has deleted is left to it, never an error. **It returns NULL, with a WARNING that gives the reason, when it did nothing** because a relation has an access method that cannot be classified or a columnar file has an unreadable metapage (C12-01): `0` means "looked, nothing to delete", NULL means "did not look".  `VACUUM` does the same work and stays quiet; its only trace is the log line. |
 | `kingres.columnar_write_paths(reset)` | Superuser (grantable). How often each path of the write side was taken in this session (`late_commit`, `late_window`, `pressure_flush`, `own_flush`, `handover_flush`, `size_flush`, `prepared_skip`, `ceiling_write`, `ceiling_handover`, `refused_ending`, `orphans_cleaned`, `refused_live`, `lost_raised`) and, as `bytes_held` and `orphans_kept`, two numbers that are not counts: the memory the write buffers are charged for now, and the files the backend's last commit noted for its next transaction to clean up after; with `reset` the counts start again. A diagnostic, and what the tests of those paths read. |
 | `kingres.columnar_is_columnar_am(amoid)` | Superuser only by default (the install script's event trigger runs it as the owner). Whether an access method is this extension's, by what its handler returns: the one definition that every C path uses.  The DDL guard (foreign keys, `AFTER ROW` triggers, publications) asks it, so an access method over any SQL function that has the extension's C entry point is guarded like the one over `kingres.columnar_handler` (C12-03). |
@@ -89,6 +98,8 @@ denied for table", tested in `columnar_security`).  `columnar_set_options` and
 | `kingres_columnar.check_gate`, `kingres_columnar.check_gate_orphans`, `kingres_columnar.check_gate_claims` | 0 | Developer settings, superuser only (a role that was given `GRANT SET ON PARAMETER` could set them too, and can do nothing with them): the first integer of an advisory lock `pg_advisory_lock(key, 0)` that `columnar_check` and `columnar_check_clean` wait on, the first at the start of the look at each table (after the list of tables is made), the second in the orphan step between its first snapshot and its read of `pg_class`, the third between that read and its second snapshot, until the lock is no longer held, so that `t/036` can drop or make a table, commit DDL, or cancel the call, at that moment and not at one it can only hope for.  0 is no gate.  **They exist in every build** (the tests that use them run on production builds, which skip fewer tests than assertion builds).  So that they cannot be used to hold up an administrator's check (any role can take any advisory lock), a gate waits **only for an advisory lock that a session of a superuser holds**; the wait is bounded (two minutes) and can be cancelled.  A check run with a gate set by an administrator (`ALTER ROLE ... SET`) can therefore wait only for another administrator's session. |
 | `kingres_columnar.vacuum_truncate_lock_timeout` | 5s | Developer setting, superuser only: how long the truncation of a `VACUUM` asks for its exclusive lock (every 50 ms) before it gives up for this visit.  The default is heap's 5 seconds; the tests raise it so that a verdict does not depend on how fast the machine is, or lower it to see the give-up quickly. |
 | `kingres_columnar.max_stripe_rows` | 10000000 | Developer setting, superuser only: lowers the most rows the writer puts in one stripe (and the size above which `columnar_check` reports a stripe), so the limit can be tested with a few thousand rows. It cannot raise the compiled limit and does not touch the reader, so no value can make a table unreadable. |
+| `kingres_columnar.reserve_row_numbers` | off | Developer setting, superuser only, for tests (0.2, C6a): the session reserves row numbers when it inserts (see "Reserved row numbers"). A row then has its TID when the insert returns, `INSERT ... RETURNING ctid` shows it, and it is the TID the row keeps. Off: nothing changes, the same stripes and the same row numbers as 0.1. It decides per buffer, when the buffer is made: set it before the first write of a transaction. It is ignored for a table whose file is of format version 2 (written by 0.1) and while the stripe catalog is the one of 0.1. Until a table with an index switches the reservation on by itself (C6b) this is the only way to get it. |
+| `kingres_columnar.reserve_gate`, `kingres_columnar.reserve_gate_at` | 0, 0 | Developer settings, superuser only, for tests: a writer that reserves waits, at the point `reserve_gate_at` names (1 the numbers are taken from the metapage, 2 the reserved catalog row is inserted, 3 the pages of the stripe are written, 4 the reserved row is updated), for as long as a session of a superuser holds the advisory lock `pg_advisory_lock(reserve_gate, 0)`, as `check_gate` does for the check. `t/046` stops the server at each of them. 0 is no gate; the wait is bounded (two minutes) and can be cancelled. |
 | `kingres_columnar.fault_point`, `kingres_columnar.fault_nth` | off, 0 | Developer settings, superuser only, present only when the server is built with assertions (`USE_ASSERT_CHECKING`): make the nth allocation of the write path (`alloc`), the nth relation of a subtransaction's hand-over to its parent (`merge`) or the nth relation of a flush (`flush`) fail once with "out of memory". Used by `t/016_atomic_handover.pl`; absent from production builds. |
 | `kingres_columnar.enable_custom_scan` | on | Use the Columnar Scan (projection, skipping). |
 | `kingres_columnar.enable_chunk_skipping` | on | Use minimum and maximum to skip. |
@@ -126,7 +137,7 @@ changed:
   the list of live files of the clean-up of the stripe catalog, the drop note
   (`kc_write_note_dropped`), the planner's path (`kc_cscan.c`), the transient table
   of a rewrite (`kc_am.c`) and, in the install script, the event trigger that refuses
-  foreign keys and publications.  The clean-up deletes nothing while a relation's
+  foreign keys and the publications that would include the stripe catalog.  The clean-up deletes nothing while a relation's
   access method cannot be classified.
 * The orphan step reads with two snapshots and a second claim (C11-01); the check
   lets go of each table's lock when it has looked at it (C11-03); the in-place truncate
@@ -172,6 +183,18 @@ Custom Scan (Columnar Scan) on events
   Columnar Compressed Bytes Read: 1234 bytes  -- with ANALYZE
 ```
 
+A parallel scan is a `Parallel Custom Scan (Columnar Scan)` under a `Gather`; with
+`ANALYZE` the counters are the sum over every participant, and one more line says
+who read what:
+
+```
+  Columnar Stripes Read By: leader 12 (12000 rows), worker 0 31 (31000 rows), worker 1 37 (37000 rows)
+```
+
+(only the workers that read a stripe are listed; `BUFFERS` shows the pages all of
+them read).  For a plan that is stopped early (a `LIMIT`) the figures of workers
+that were still running are the last ones they published.
+
 Skipping is an optimisation only: the clauses stay in the plan as filters.
 Skipping understands `col OP expr` (OP in the btree family of the column's
 type, constants, parameters and stable functions on the other side),
@@ -188,6 +211,16 @@ One main fork, no other fork.
   number and the next stripe id, the identity, the creating transaction, the
   relation the file was created for and a flags word (`REPLACES_CONTENT`: the
   file replaced the content of an existing table, TRUNCATE). Changed in place and logged as a whole page.
+  The format version decides what a table is: **2** is what 0.1 writes (row
+  numbers are given when a stripe is written); **3** (0.2) is a table whose
+  writers may reserve row numbers at insert and whose stripe catalog may hold
+  reserved rows.  This server reads both.  A new file is version 3 when the stripe
+  catalog has the column `reserved` (the extension is at 0.2) and version 2 when it
+  does not (the library is new and `ALTER EXTENSION ... UPDATE` has not run yet:
+  the file is then byte for byte what 0.1 writes).  Only a file of version 3
+  reserves; the library of 0.1 refuses a file of version 3 by its version.  The
+  version of a file never changes: `VACUUM FULL`, `TRUNCATE` and every rewrite
+  write a new file, which is version 3.
 * Every other block belongs to a stripe: a run of consecutive blocks written
   once, never changed, each with a 24-byte special area (magic, page number,
   page count, writer transaction, stripe id). The payload of the pages, 8144
@@ -207,7 +240,8 @@ One main fork, no other fork.
   block count, sizes, the command-id change points of the writer (`cid_points`)
   the stripe-level statistics (`col_stats`) and a `maintenance` flag (the stripe
   was written by `columnar_compact`: it copies rows readers see in the stripes
-  it replaces). A stripe is visible exactly
+  it replaces) and, since 0.2, a `reserved` flag (a claim on row numbers whose
+  stripe is not written yet, see "Reserved row numbers"). A stripe is visible exactly
   when its catalog row is, so rollback, crash recovery, standbys, backup and
   `VACUUM FULL` follow from PostgreSQL's own rules. A byte-for-byte copy of the file (`SET TABLESPACE`, a base backup) keeps
   its identity and so its stripes, with nothing to update; a rewrite or
@@ -287,8 +321,13 @@ One main fork, no other fork.
   table's creation and its truncate.  The pages of a stripe hold no
   transaction id (that field is reserved, zero).
 * WAL: the resource manager `KingresColumnar` logs whole-page images only
-  (`STRIPE_PAGES`, `METAPAGE`); redo restores images and has no logic of its
-  own. A stripe's pages are logged before its catalog row is inserted.
+  (`STRIPE_PAGES`, `METAPAGE`, `FREEZE`, and since 0.2 `RETURN`); redo restores
+  images and has no logic of its own. A stripe's pages are logged before its catalog row
+  is inserted.  A reservation of row numbers is the existing `METAPAGE` record (the
+  metapage image after the next row number moved), and the tail of a reservation
+  that is given back is the new `RETURN` record (the image, and the numbers
+  given back for a person who reads the log): no existing record changed its
+  meaning, and a log without `RETURN` records replays exactly as before.
 
 What is validated when a chunk is read: page and stripe identity, the footer
 CRC, offsets, counts, codec ids, decompressed sizes, statistic lengths and
@@ -303,6 +342,270 @@ directory can still crash the server through such a type, as with heap. The
 metapage has its own checksum. A damaged byte inside a stripe page is caught by
 the chunk checksum; page checksums, when enabled, catch it earlier.
 
+
+## B-tree indexes (0.2, increments C6b and C6c)
+
+`CREATE INDEX` on a columnar table builds a B-tree over the rows of
+the table, and index scans find rows by TID: a TID is a row number
+(`block * 2048 + offset - 1`).  What is served: plain, multi-column, expression and
+partial indexes, `INCLUDE` columns, `DESC` and `NULLS FIRST`, collations, and any
+column type that has a B-tree operator class (arrays, `jsonb`, `numeric`, text,
+dates, ...); the build reads the stripes with the maintenance rule and the rows
+of its own transaction after writing them.  Planner: index scans, ordered index
+scans (`ORDER BY`, merge joins, `LIMIT`) and the inner side of nested loops.  **No
+bitmap scans**: the bitmap code of the server holds at most `MaxHeapTuplesPerPage`
+(291) offsets for a block and a columnar block has 2048, so such a bitmap cannot
+be made (the flags of the index descriptions are switched off for a columnar table in `set_rel_pathlist_hook`, which makes the index paths again, because PostgreSQL 19 has no hook where they are made).  **No index-only scans** (there is no visibility map: each
+would fetch every row, so `canreturn` is off) and **no parallel index scans** (a
+worker cannot read the rows of the leader's transaction; `amcanparallel` is off).
+A reindex after a rewrite is the server's own (`VACUUM FULL`, `ALTER TABLE ... SET
+ACCESS METHOD` in both directions, `TRUNCATE`, `REINDEX`).
+
+* **Refused, with a message** (`columnar_refusals`, `columnar_index`, `columnar_unique`):
+  exclusion constraints and deferrable unique constraints (the check cannot be
+  postponed: a duplicate is found when the row goes in), `ON CONFLICT` of every form
+  on a columnar table that has an index (`DO NOTHING` and `DO UPDATE` need the
+  speculative insert and the row lock of a conflicting row; there is no row lock), hash,
+  GiST, GIN, BRIN and SP-GiST indexes, `CREATE INDEX CONCURRENTLY` and
+  `REINDEX CONCURRENTLY`, `CLUSTER` (it would reorder the rows, and an index names rows
+  by their number), a build on a file of format version 2 ("its file was written by
+  version 0.1": rewrite the table first).  A build in a subtransaction over rows that
+  an enclosing one wrote, or while a cursor reads the buffers, is refused: the rows
+  cannot be written first.  **Foreign keys in both directions are refused**: from a
+  columnar table (as before) and now also **to** one (`columnar_check_ddl` looks at the
+  referenced table of a key too): a key check reads the referenced row with a row lock
+  that a columnar row cannot give.
+* **Unique indexes, primary keys and unique constraints (0.2, C6c)** work as on a
+  heap table, and are never allowed to admit a duplicate.  A row's index entry is made
+  when the row is inserted, with its reserved number, so the check sees the rows of
+  other sessions: the answer of `kc_catalog_probe_row` for a number is "no row",
+  "a row" (committed or this transaction's own) or "a row of a transaction in progress,
+  wait for it" (the stripe catalog holds the claim of every writer from its first insert,
+  the reserved stripe row); the B-tree waits on that transaction (`XactLockTableWait`)
+  and asks again, so a prepared transaction holds a key until `COMMIT PREPARED` or
+  `ROLLBACK PREPARED`, savepoints give their keys back at once, and deadlocks between
+  two writers are found by the server's detector and reported as for a heap table.  The
+  claim is made while the writer holds a **reservation lock** in `SHARE` mode (an advisory
+  class lock on the relation, taken from "numbers taken from the metapage" to "claim row
+  inserted"), which an index vacuum takes in `EXCLUSIVE` mode while it reads the
+  metapage and the live ranges, so a vacuum never reads a state with a number taken and
+  no claim.  Writers do not wait for each other for it.  `CREATE UNIQUE INDEX` waits for
+  running writers (its table lock conflicts with their `ROW EXCLUSIVE`), then sees their rows
+  if they committed and reports the duplicate as the server does.  Tested against a heap
+  twin under concurrency (`t/053`: pgbench with 2, 4 and 8 sessions, and a thousand random
+  interleavings of two transactions at the three isolation levels with prepare, commit
+  prepared and rollback prepared), with a crash (`t/054`), with savepoints, a waiter and
+  a writer that flushes meanwhile, a deadlock and a build under a running writer
+  (`t/055`), and on a standby (`t/057`).
+* **VACUUM cleans the indexes (0.2, C6c)**: `VACUUM` of a table with indexes calls the
+  B-tree's bulk delete with a callback that says an entry is dead when its row number is
+  in no live range: the ranges of the stripe rows whose writer did not abort, minus
+  versions deleted before the oldest snapshot, merged; every number from the lowest
+  range that a running or own writer holds upward is kept; numbers below the metapage's
+  next number that no range covers are the rolled-back writers' and are removed.
+  `VACUUM (INDEX_CLEANUP off)` leaves the indexes alone; autovacuum does the same as
+  `VACUUM`.  The index file does not shrink (a B-tree only reuses freed pages; the
+  index of the heap twin and this one are of the same size after the same work), the
+  garbage entries are gone (`t/056`: a million rolled-back entries are removed).
+  The numbers of an aborted writer are **never given back** to the metapage, and this is not a
+  cost that a later version should remove: a rolled-back writer has index entries for its
+  numbers (they are made when the row is inserted), and a number that is used again by another
+  row would make such an entry find the other row, with a key that is not its key; only the
+  unused tail of a *committed* buffer, which has no row and no entry, is returned.  The address
+  space (2^32 blocks of 2048 numbers) is used a little faster by workloads that roll back large
+  buffers.
+* **Compaction of a table with indexes (0.2, C6d).**  `columnar_compact` works on a table that has
+  indexes of any kind this version allows (unique and primary keys too).  The copies of the rows get
+  new row numbers, so after the copy **each index gets an entry for each copied row**
+  (`index_insert` without a uniqueness check, from the stripes the compaction wrote, with the
+  predicate and the expressions of the index); the entries of the old numbers stay.  **The lock is
+  the one the compaction had already**: `SHARE UPDATE EXCLUSIVE` on the table, and `ROW EXCLUSIVE` on
+  each index, which is what a writer takes; readers and writers of the table are not blocked, and
+  nothing waits for the compaction but another compaction or a `VACUUM` of the table.  **Why the
+  indexes are not rebuilt**: a rebuild replaces the index with one that names only the new numbers,
+  and a snapshot older than the compaction (REPEATABLE READ or a cursor, which still sees the old
+  stripes) that reads by the index after the commit would find none of its rows; with entries for
+  both, such a reader finds its rows through the old entries and every later one through the new
+  (`t/059` has the reader).  A unique index is safe through it: while the compaction runs a writer
+  that meets a key finds the row in the old stripe (a stripe a running transaction deleted still
+  holds its rows) and gets the duplicate error, and after the commit the copy is found the same
+  way.  **Cost**: the compaction reads the stripes it wrote once more (a decode of every column
+  of every copied row) and makes one index insertion per row per index, so it takes about as long as
+  an index build over the copied rows plus the copy; the indexes hold twice the entries of the copied
+  rows until the next `VACUUM`, which removes the entries of the numbers that no stripe any
+  snapshot can see has any more (the ranges of stripes deleted before the oldest snapshot are not
+  live, see "VACUUM cleans the indexes"); a compaction that rolls back or crashes leaves entries
+  for numbers of stripes that never committed, which are filtered like those of a rolled-back
+  writer and removed the same way.  A table that is compacted again and again between vacuums
+  grows its indexes by the copied rows each time; vacuum after compacting.
+* **`kingres.columnar_check_indexes(rel regclass)`** (superuser by default; `REVOKE`d
+  from `PUBLIC`): reads every index of the table in full and the rows of the stripes
+  as of now, and returns one row `index_entry_missing` for an index that has no entry
+  for rows it should have (the count and the first three row numbers in `detail`); an
+  entry without a row is the garbage the next `VACUUM` removes, and is not reported.  The
+  stripe list is taken first, then the index, so a writer that commits in between
+  cannot make a row look unindexed.  Cost: one pass over the index and one over the
+  table, 8 bytes of memory per entry of an index; above 50 000 000 entries an index is
+  reported as `not_checked` instead.  `columnar_check` does not do this (its cost must not
+  grow with the size of the indexes).
+* **Reservation switches on by itself**: a buffer made for a table that has an
+  index reserves (`kc_rel_reserves`), with or without the developer setting.  A table
+  that gets its first index while the transaction holds rows in buffers that did not
+  reserve: the utility hook writes the rows of the running subtransaction as stripes
+  before the build (they get their numbers then), and the later inserts reserve.
+* **The fetch** (`kc_scan_fetch_row`): a row of a buffer of the fetching transaction
+  that reserved is taken from the buffer by the command-id rule; any other from the
+  visible stripe whose numbers hold it (binary search in the stripe list, kept for the
+  scan and read again when this backend wrote a stripe since); the footer is kept
+  for the open stripe and **one chunk group is decoded, all columns, and kept**, so
+  consecutive fetches in the same group cost one decode.  A number that no visible
+  stripe and no buffer has (an entry of an aborted or rolled back writer or
+  subtransaction, of a writer not committed before the snapshot, of a removed stripe)
+  returns nothing: dead entries are filtered by the fetch, and removed by `VACUUM`
+  (see below).
+* **Cost**: a point lookup decodes one chunk group of every column (100 to 10 000
+  rows by `chunk_row_count`), so it is much dearer than a heap fetch; the index
+  pays when a query returns few rows of a large table.  Measurements are in the
+  design notes.
+
+## Reserved row numbers (0.2, increment C6a)
+
+A B-tree index needs a row's TID when the row is inserted, and other sessions
+need to see that a writer is working on a range of row numbers.  Until 0.2 the
+numbers were given when a stripe was written, at the flush, long after the
+insert.  A write buffer that **reserves** takes the numbers of a whole stripe
+(`stripe_row_count`, 150000 by default) from the metapage when its first row goes
+in, and inserts the stripe's catalog row in the state `reserved`, by the
+transaction (or subtransaction) that inserts the row.  The rows after it have the
+numbers after it, so a row has its TID when the insert returns it (block
+`number / 2048`, offset `number % 2048 + 1`, as every scan shows it), and it is
+the TID the row has after the commit whatever happens to the buffer: a flush by
+size, by memory, one that a read causes (a parallel plan), a savepoint, `PREPARE
+TRANSACTION`, write-through, a standby (`t/044`, `t/048`).  A scan of the rows a
+transaction has not yet written shows the same TIDs.
+
+* **The catalog row.**  `kingres.columnar_stripe` has one more column, `reserved
+  boolean NOT NULL DEFAULT false` (`kingres_columnar--0.1--0.2.sql`).  A reserved
+  row has the numbers it claims in `first_row` and `row_count` and nothing else
+  (no pages, no statistics).  Readers skip it, whoever it belongs to.  A flush
+  writes the pages of the stripe and then **replaces** the reserved row by the
+  stripe's row (an ordinary heap update, with the same key, so a stripe is visible
+  exactly when its row is, as before), and only then offers the numbers that no row
+  used back.  What is left of a reserved row when its transaction ends is heap's to
+  say: a transaction that aborts, or a backend that dies, leaves a row nobody sees,
+  which a vacuum of the catalog removes with the other dead rows (a standby replays
+  the same).  While its writer lives (an open transaction, a prepared one) the row is
+  in progress: no check, reconcile or vacuum looks at it or touches it, and its range
+  is the range of a writer that can be waited for (what a unique index will need,
+  C6c).  **Because the update is made by a later command than the insert, the
+  extension passes the command counter before it updates a reserved row**
+  (`CommandCounterIncrement` where a flush happens in the statement that inserted the
+  first row, as the flush by size does).  The reserved row is found again by its key
+  at the flush, not by a kept place: the writer holds no lock on the catalog between
+  the two, so a `VACUUM FULL` or `CLUSTER` of the catalog may move it.  **Cost**:
+  every stripe written by a buffer that reserves is one insert and one update of the
+  catalog where it used to be one insert, and leaves one dead row version for heap's
+  pruning and vacuum; on a hot standby the WAL of that pruning cancels queries with
+  an old snapshot (after `max_standby_streaming_delay`) as the WAL of any heap
+  update does, which the catalog of 0.1 did not cause while only inserting.
+* **What gives the numbers back, and what does not.**  The unused tail of a
+  reservation is given back only if it is still the end of the range (nobody
+  reserved after it), under the lock of the metapage, and only after the
+  catalog row says how many numbers the stripe has (`RETURN`); a transaction that
+  commits with a few rows and nobody after it wastes nothing.  Otherwise the numbers stay
+  unused, **a gap**: a reservation behind another writer's, and every reservation
+  of a transaction or subtransaction that **aborts** (an abort callback may not
+  touch the file, so nothing is given back there, and the numbers of a row that was
+  handed out are never given back in any case: an index entry may name them).
+  **The worst case of waste** is one reservation, `stripe_row_count` numbers (150000
+  by default, 10 000 000 at most), for every writer that aborts or ends behind another;
+  a table has about 8.8 x 10^12 numbers (the TID space), so 58 million such
+  writers at the default size, or 880 000 at the largest, use them up, after which
+  an insert fails with "has no row numbers left" and the table is to be rewritten
+  (`VACUUM FULL`).  The numbers are not reused: no number that a row has or had, or
+  that a live writer holds, is ever handed to another row (`t/047`).
+* **Subtransactions (decision 3 of C6a).**  A buffer that reserves is never merged
+  into another.  A committing subtransaction **writes such a buffer as a stripe of its own**
+  (its own flush, the `own_flush` path) instead of handing the rows to the parent, so
+  the rows keep the numbers and the stripe row the subtransaction inserted; one that
+  a cursor still reads cannot be written, and becomes the parent's, which writes it.
+  The cost is **one stripe per savepoint (or `EXCEPTION` block) that wrote**, however few rows,
+  where without reservation the rows of savepoints merge into the parent's buffer
+  and make full stripes; `columnar_compact` repairs it, and renumbers the rows (below).
+  The coalescing of the buffers that cursors kept apart leaves buffers that
+  reserve alone, too.  Nothing that reserves holds a list of reserved runs in the merge code.
+* **Which tables, which sessions.**  Only a table whose file is of format version 3, in a
+  database whose stripe catalog has the column (the extension is at 0.2), and only the
+  rows of a session that has `kingres_columnar.reserve_row_numbers` on when its buffer is
+  made.  The rows of a rewrite (`VACUUM FULL`, `SET ACCESS METHOD`, `ALTER TABLE ... TYPE`)
+  and of `columnar_compact` are not reserved: they are written with the numbers of
+  the flush, and the indexes of a rewritten table are built again.  `COPY`, `INSERT ... SELECT`
+  and `CREATE TABLE AS` reserve like `INSERT`.  Rows written after the commit-time
+  flush (write-through) take exactly the numbers they need and return them.  **Not in
+  parallel mode**: a `CREATE TABLE AS` (or materialized view) whose query is parallel
+  writes its rows in the leader while the executor is in parallel mode, where heap
+  forbids the update (and the command counter passing) that replaces a reserved row, so
+  such a buffer could never be written by size or by memory; its rows do not reserve
+  and have their numbers when their stripes are written, as without the setting (the
+  target of such a statement is new and cannot have an index).
+* **What is still as in 0.1.**  There is no index and a row still cannot be fetched by
+  TID (C6b).  `columnar_compact` gives the rows it copies new numbers, so the TIDs of a
+  table change when it is compacted, as they do when it is rewritten (and the indexes get
+  entries for the new numbers, see "Compaction of a table with indexes"). `reserved_row_left` is a new row of `columnar_check`: a reserved row that a
+  **committed** transaction left (no code path does; a writer replaces it before it commits
+  or prepares), the only reserved row that is damage.  Under SERIALIZABLE a reader that skips the
+  reserved row of a writer in progress reports the dependency on that writer, as it does
+  for a stripe row it skips; with the setting off no reserved row exists and nothing is
+  reported that was not before.
+
+## Parallel scan
+
+A table of more than one stripe can be read by a `Gather` (version 0.1, increment
+C5; no change to the files, the catalog, the WAL or the SQL objects).  The unit of
+work is the stripe: every participant (the leader and the workers) reads the list
+of stripes visible to the query's snapshot itself, and takes the next stripe nobody
+has taken from one atomic counter in the query's shared memory.  Each participant
+computes a fingerprint of its list (the number, ids, first rows and visible rows of
+the stripes); a list that differs from the leader's fails the query ("found another
+list of stripes than its leader") and never answers with rows read twice or not at
+all.  Projection and skipping work in every participant.
+
+* **When a plan is parallel.**  A partial path ("Parallel Custom Scan (Columnar
+  Scan)") is offered when `max_parallel_workers_per_gather` is above 0 and the
+  relation is parallel-safe for the planner.  The number of workers follows the
+  size of the file as for a heap table (`min_parallel_table_scan_size`, compared
+  with the *compressed* pages, which is why a columnar table needs a lower setting
+  than the same data in heap: **a columnar table reaches parallelism later than the same data in heap**, and `ALTER TABLE ... SET (parallel_workers = n)` overrides the threshold) or the table's `parallel_workers` option, and never
+  exceeds the number of stripes minus one: a table of one stripe is never read in
+  parallel.  The cost divides the per-row work by the participants and leaves the
+  page cost whole, as a sequential scan does.  `kingres_columnar.enable_custom_scan
+  = off` leaves no parallel scan of a columnar table.
+* **What else may run in a worker.**  The plain (non-parallel) Columnar Scan is
+  parallel-safe too: in a worker it reads the whole table, as the inner side of a
+  partial join, under a `Parallel Append` as a whole child, or as the single copy
+  that `debug_parallel_query` runs.  The access method's own scan (a `Seq Scan`) is
+  not, and the planner never puts it under a `Gather`.  A query that a function
+  runs inside a worker is not the plan the leader started, and is refused as before
+  (`columnar tables cannot be read in a parallel worker`).
+* **The rows of the leader's own transaction** exist only in its memory, and a
+  worker cannot see them.  When the executor starts a plan that has a `Gather`, the
+  Columnar Scan nodes of the leader write the running (sub)transaction's buffered
+  rows of their table as stripes, before the executor enters parallel mode (where a
+  catalog row cannot be written); the stripes carry the command ids that keep the
+  rows of the running command out of the scan (design 7.1), so `INSERT ... SELECT`
+  from the same table still reads only the rows of earlier commands.  Rows that
+  cannot be written that way, those of an enclosing savepoint and those a scan of
+  the same session is still reading, make the planner offer no parallel plan for
+  the table.  A plan made earlier and run later (a prepared statement, a cached
+  plan) that meets such rows fails with `columnar table "t" has rows that this
+  transaction wrote and parallel workers cannot read`, and never answers without
+  them.  A flush that a read causes makes a small stripe if the transaction wrote
+  little (`columnar_compact` repairs it), the cost the savepoint design already has.
+* **The plain `parallelscan_*` callbacks** of the access method are unchanged (a
+  descriptor of no state): no plan has a parallel `Seq Scan` over a columnar table,
+  because nothing could flush the leader's rows before the executor enters
+  parallel mode on that path.
+
 ## What is refused, and why
 
 All with SQLSTATE `0A000`.
@@ -313,22 +616,45 @@ All with SQLSTATE `0A000`.
   partitions.
 * Row locks (`SELECT ... FOR UPDATE/SHARE`), `ON CONFLICT DO UPDATE`,
   `TABLESAMPLE`, `CLUSTER`.
-* Indexes, primary keys, unique constraints (no row identity until a stripe is
-  written); `CREATE INDEX` fails in the access method.
+* Exclusion constraints, deferrable unique constraints, `ON CONFLICT` on a table with an index, foreign keys to a columnar table, indexes of any access method but B-tree, `CREATE INDEX CONCURRENTLY`, `REINDEX CONCURRENTLY` and `CLUSTER`: refused with a message that says why (see "B-tree indexes").
 * Foreign keys on or to a columnar table, and row-level `AFTER` triggers
   (event triggers refuse them at creation; the executor re-reads such rows
   by TID, which a columnar row has not). `BEFORE ROW` and statement
   triggers work.
 * Temporary and unlogged tables.
-* Parallel scans: no plan over a columnar table runs in a worker (rows the
-  transaction has not flushed exist only in the leader), and a parallel-safe
-  function that reads one inside a worker fails with `0A000`.
-* Logical replication: a columnar table cannot be put in a publication, a
-  publication that would include one (`FOR ALL TABLES`, `TABLES IN SCHEMA`) is
-  refused, and so is creating a columnar table into such a scope: "columnar
-  tables are not replicated logically yet".
-* A row cannot be fetched by TID. `ctid` shows a number made from the row's
-  position; it is not stable and means nothing.
+* A parallel-safe function that reads a columnar table inside a parallel worker
+  fails with `0A000`: only the scans of the plan the leader started may run in a
+  worker (see "Parallel scan").
+* **Logical replication (0.2, C7): the inserts of a columnar table are decoded.**  A columnar
+  table can be in a publication (`FOR TABLE`, also through the root of a partitioned table), and
+  a subscriber (a heap or a columnar table) receives its rows: the initial copy is an ordinary
+  read, and what is inserted afterwards is decoded from the log.  How: when `wal_level` is
+  `logical` and the table is logically logged (`RelationIsLogicallyLogged`: not a catalog, not
+  unlogged, not temporary), the flush of a stripe also writes `LOGICAL_INSERT` records, the rows of the stripe
+  as heap tuples, up to 512 rows or about 1 MB to a record (**the WAL of a load at `wal_level =
+  logical` is about twice what it is otherwise**, the raw rows in addition to the compressed pages; at any
+  other level nothing is written), and the resource manager's `rm_decode` queues them as
+  inserts of the reorder buffer, as `heap_decode` does for a heap insert (it needs the library on the
+  publisher, and the standbys replay the records without a page).  The record is written by the
+  transaction or subtransaction that writes the stripe, which is the one whose commit makes
+  the stripe visible: the rows are sent when a reader could see them, a savepoint that is rolled back
+  sends nothing even if its rows were flushed by memory pressure, a prepared transaction is decoded at
+  `PREPARE TRANSACTION` when the subscription has `two_phase`, and a crash loses only what the
+  log does not hold.  **What differs from a heap table**: the rows of a stripe are decoded when it is
+  written (at commit, at `PREPARE`, at a flush by size or memory), so the order of the changes of
+  one transaction across tables is not the statement order (the changes of a table are in order);
+  `UPDATE` and `DELETE` do not exist, so a publication needs no replica identity for them
+  (`REPLICA IDENTITY FULL` is accepted, for the checks that ask for one); `TRUNCATE` is decoded by the
+  server as for any table; the copies `columnar_compact`, `VACUUM FULL` and
+  `SET ACCESS METHOD` make are no new rows and are not logged.  **What is still refused**: a publication
+  that would include the stripe catalog `kingres.columnar_stripe` (`FOR ALL TABLES`, `FOR TABLES IN
+  SCHEMA kingres`), when a columnar table exists or is made: its rows describe the files of one server
+  and must not be applied by a subscriber; list the tables (`FOR TABLE ...`) instead.  Tested in
+  `t/061_logical.pl` against a subscriber row by row.
+* A row cannot be fetched by TID (C6b). `ctid` shows a number made from the row's
+  position; without reserved row numbers it is not stable and means nothing, and
+  with them (0.2, "Reserved row numbers") it is the TID the insert returned, until
+  `columnar_compact` or a rewrite gives the rows new numbers.
 
 ## VACUUM and space
 
@@ -378,25 +704,48 @@ exactly where the server may refuse to assign one.  It still advances
 a truncation that is cancelled while it waits for its lock, or given up, has
 already done what matters for the age (`t/041`).
 
-**Space in the middle of the file is not reused, and that is a choice.**  Pages
-of rolled-back or crashed loads and of stripes replaced by `columnar_compact`
-stay until they are at the end of the file and worth giving back, or until the
-table is rewritten with `VACUUM FULL`.  The rule for "worth giving back" is
-heap's (1000 pages or a sixteenth), so a failed load whose aborted tail is below
-it is not cut, and once another load commits after it those pages are in the
-middle of the file for good; a workload of failing and retried loads grows the
-file without a bound until a `VACUUM FULL`.  An earlier version of this round
-cut such a tail at every vacuum, whatever its size, and took `ACCESS EXCLUSIVE`
-for it every time; that was given up on purpose (C10-06), and reusing the space
-is a feature of its own that this version does not have (C11-06).  What the
-operator has is the measure: `kingres.columnar_info(rel).unreferenced_bytes` is
-what the file holds that no stripe visible now uses; a figure that stays high
-after a `VACUUM` is waiting for `VACUUM FULL` (or, for a table that takes no
-`VACUUM FULL` window, for the file to be rebuilt by `ALTER TABLE ... SET ACCESS
-METHOD`).  `t/037` shows it for a tail below the threshold, before and after a
-later load.  The cost of each vacuum also grows with the stripe catalog (it is
-read in full by the decision and again under the lock, besides the clean-up of
-the catalog), which a catalog of millions of stripes will notice.
+**Space in the middle of the file is reused (0.2, C8).**  Pages of rolled-back or
+crashed loads and of stripes replaced by `columnar_compact` are listed by `VACUUM`
+and written over by the next stripes, so a steady load of inserts, compactions and
+vacuums stops growing the file (`t/062`: 40 rounds, the file of the vacuumed table
+stays within 1.5 times its size after ten rounds, the control table that is never
+vacuumed grows several times larger).  **How**: the metapage holds, after its fixed
+part, a list of up to 400 free extents (first block, number of blocks; its own
+checksum; a list that is missing, damaged or not sound reads as empty, which loses
+space and never data).  `VACUUM` takes a `SHARE` lock on the table (without waiting,
+retried every 50 ms for `vacuum_truncate_lock_timeout`, 5 seconds by default, the way
+the truncation takes its lock; given up for this visit when writers do not leave, and
+the next vacuum tries again), reads the stripe catalog and makes the list the complement of
+the block ranges that some version of a stripe row still needs: every version
+whose writer did not abort, except the ones deleted by a transaction that committed before the
+oldest transaction any snapshot may still have, which the catalog's own vacuum is
+about to remove.  The lock is what makes this safe: no writer is running, so pages
+written for a stripe whose catalog row is not there yet cannot be taken for free.  It is
+held for the catalog read and one metapage write and is not WAL-logged (a standby does
+not see it); readers are not blocked.  A stripe that is written takes the first fit of
+the list before it extends the file (`kc_meta_take_extent`: the take is logged before
+any page is written, the pages are written over the run, each with a full-page
+image, the rest of the extent stays); a crash between the take and the pages loses the
+run's place in the list and nothing else (`t/062`: the blocks are free and the next vacuum lists them again).
+**On a standby**: the record that replaces the list carries the newest transaction that deleted a
+stripe whose blocks are listed for the first time, and its replay cancels the standby queries
+that may still hold it (a recovery conflict, as for the removal of a heap tuple), before any
+page can be written again; with `hot_standby_feedback` the primary's oldest snapshot
+includes the standby's, so it does not list the blocks of a stripe the standby can still see
+and the query goes on.  A tail that is free is still given back by the truncation, which
+trims the list.  **What it costs**: one catalog read and one metapage image per `VACUUM`,
+an extra metapage image per stripe that takes a run; and a `VACUUM` of a table that never has a
+quiet moment lists nothing (long writer transactions and continuous load: `DEBUG2` says so),
+so the file grows as before until it has one.  The list holds 400 extents: more runs than that
+keep the largest, the rest stays free and unlisted until a later vacuum has room.
+`kingres.columnar_info(rel).unreferenced_bytes` still counts the blocks the file holds that no
+stripe visible now uses, listed or not; what the next stripes will reuse is part of it.  A rewrite
+(`VACUUM FULL`, `SET ACCESS METHOD`) starts with an empty list, as with a new file.
+`kingres.columnar_check()` reports a list that names a block of a stripe visible now
+(`free_extent_overlaps_stripe`), which would be overwritten.  An earlier version of this section
+said that reusing the space was left out on purpose (C10-06, C11-06) for the cost of an exclusive
+lock at every vacuum; the shared lock above is not that cost, and the design's walk of the stripe
+headers is not needed: the stripe catalog already says what is used.
 
 How the stripe rows of a file that goes away are removed.  Correctness never
 depends on an event trigger firing; the triggers are only a way to do it earlier.
@@ -465,6 +814,23 @@ relative position in the stripe. It ignores rows buffered by the running
 transaction.
 
 ## Backup, restore, upgrade
+
+**From 0.1 to 0.2**: install the new library, then `ALTER EXTENSION kingres_columnar
+UPDATE` (`kingres_columnar--0.1--0.2.sql`: one `ALTER TABLE ... ADD COLUMN reserved
+boolean NOT NULL DEFAULT false` on the stripe catalog, which stores nothing in
+the existing rows).  The tables 0.1 wrote stay readable and writable, before the
+update (the library of 0.2 serves the catalog of 0.1) and after it; their files stay
+of format version 2 and never reserve row numbers, whatever the setting says, until
+a rewrite (`VACUUM FULL`, `ALTER TABLE ... SET ACCESS METHOD`) gives the table a new
+file, which is version 3.  A transaction prepared by 0.1 is committed by 0.2.  There
+is no way back: the library of 0.1 refuses a file of version 3 by its format
+version, and the catalog of 0.2 by its shape.  `t/049_upgrade_data.pl` carries a
+data directory written by the code of commit bfda9e8842 (built into a private
+installation named by `KC_OLD_INSTALL`) across the update, and `sql/upgrade.sql`
+compares an upgraded catalog with a fresh one.  A **base backup taken while writers
+hold reservations** restores to a clean state: the reserved rows belong to
+transactions that never commit, so nobody sees them and the vacuum of the
+catalog takes them away (`t/048`).
 
 `pg_basebackup`, incremental backup, archive recovery and `pg_rewind` work
 with the library preloaded. `pg_dump` writes `CREATE TABLE ... USING columnar`
@@ -569,13 +935,11 @@ Set `search_path` explicitly, or create the tables in another schema.
 
 ## Limits
 
-Append-only, no indexes, no TOAST (values up to the 1 GB limit of one value are
+Append-only, B-tree indexes only (unique ones too), no TOAST (values up to the 1 GB limit of one value are
 stored inline), at most about 8.8 x 10^12 rows per table, 150000-row stripes
 mean small transactions make small stripes, serial scans only, no vectorised
-execution, skipping is not in the cost estimate, logical decoding is not
-supported: a publication that would publish a columnar table is refused,
-whatever form it has (also `publish_via_partition_root` through the root of a
-partitioned table, and the table side of it), and a hostile or damaged file can
+execution, skipping is not in the cost estimate, logical decoding covers inserts only (there is
+no update or delete) and doubles the log of a load at `wal_level = logical`, and a hostile or damaged file can
 give a clean error but not always the right data.
 
 Memory and costs worth knowing:
@@ -995,8 +1359,8 @@ make USE_PGXS=1 installcheck       # needs a server with the library preloaded
 ```
 
 or `kingres/dev/ext.sh kingres_columnar` and `kingres/dev/ext-majors.sh
-kingres_columnar` for PostgreSQL 18 and 19. The tests are eleven `pg_regress`
-files (`sql/`, `expected/`) and forty-one TAP files in `t/`: crash recovery,
+kingres_columnar` for PostgreSQL 18 and 19. The tests are fourteen `pg_regress`
+files (`sql/`, `expected/`) and fifty TAP files in `t/`: crash recovery,
 standby and `pg_rewind`, backup/restore/dump, concurrent writers, corruption,
 a randomised comparison against heap (`KC_COMPARE_SEED`, `KC_COMPARE_STEPS`),
 older snapshots, array validation, serializable isolation against heap twins,
@@ -1026,13 +1390,19 @@ load orders, a refusal that fails a transaction that is still alive, savepoints,
 that is gone (`t/027`), stripe rows left behind, the cap on the files kept, and
 the way to find and remove them (`t/028`), `COMMIT AND CHAIN`, a parallel leader
 and a base backup under load, restored (`t/029`), the cost of rows written late
-(`t/030`), the stand-down of the orphan step as the check sees it, the guard for an access method over a second SQL function, a replaced handler seen by another session, a copy of the routine and a handler that raises an error (`t/039`), the two snapshots of the orphan step (`t/036`), the memory of a check with hundreds of locked tables (`t/042`), every entry point of the access method at every moment where an error
+(`t/030`), the parallel scan against a heap twin with 0, 1 and 4 workers, the workers that really read stripes, a rescan, a concurrent writer, the leader's own rows and a standby (`t/043`, `columnar_parallel`), the stand-down of the orphan step as the check sees it, the guard for an access method over a second SQL function, a replaced handler seen by another session, a copy of the routine and a handler that raises an error (`t/039`), the two snapshots of the orphan step (`t/036`), the memory of a check with hundreds of locked tables (`t/042`), every entry point of the access method at every moment where an error
 is forbidden, and the walk that fails for a callback without a decision (`t/031`),
-the way a module that cannot be built is treated (`t/032`), the same write paths on a standby with `wal_consistency_checking = all` and across a promotion, and a late drop under a hot standby's reader (`t/033`), logical decoding of transactions that had a refused call (`t/034`), the log line of autovacuum (`t/035`), the check functions: the snapshot they read with, the locks they never wait for, the errors they never hide and what they leave behind, the orphan step against DDL that commits between its reads, the process ids in the `not_checked` rows (`t/036`), the rule for giving the tail of the file back, with a hot standby, the 1000-page limb, and the lock wait (`t/037`), the `relfrozenxid` of a truncated or rewritten table and the autovacuum line (`t/038`), a second access method over the handler (`t/039`), the check with more tables than the lock table holds (`t/040`), the wraparound failsafe and the order of the frozen id and the truncation (`t/041`), and two laps of the
+the way a module that cannot be built is treated (`t/032`), the same write paths on a standby with `wal_consistency_checking = all` and across a promotion, and a late drop under a hot standby's reader (`t/033`), logical decoding of transactions that had a refused call (`t/034`), the log line of autovacuum (`t/035`), the check functions: the snapshot they read with, the locks they never wait for, the errors they never hide and what they leave behind, the orphan step against DDL that commits between its reads, the process ids in the `not_checked` rows (`t/036`), the rule for giving the tail of the file back, with a hot standby, the 1000-page limb, and the lock wait (`t/037`), the `relfrozenxid` of a truncated or rewritten table and the autovacuum line (`t/038`), a second access method over the handler (`t/039`), the check with more tables than the lock table holds (`t/040`), the wraparound failsafe and the order of the frozen id and the truncation (`t/041`), the reservation of row numbers (0.2, C6a): the TID of a row at insert and after every kind of flush against a heap twin with a generator of random transactions (`t/044`, seed printed, `KC_SEED`), model-based savepoints and exception blocks three levels deep (`t/045`), an immediate stop at each point of a reservation and a prepared transaction across a crash (`t/046`), two and four sessions and holders of reservations (`t/047`), a standby, the log and a base backup with reservations open (`t/048`), the check functions against live, prepared, aborted and killed writers (`t/050`), the plain regression test with the setting on (`columnar_reserve`) and the update from 0.1 (`upgrade`; `t/049_upgrade_data.pl` carries a data directory of the 0.1 code, commit bfda9e8842, built into an installation named by `KC_OLD_INSTALL`, across it, and is skipped without it), and two laps of the
 transaction id space (`t/013`).
 
 Some files do not run everywhere, and say why when they are skipped:
 
+* `t/049_upgrade_data.pl` needs an installation of the code of 0.1 (the commit
+  bfda9e8842 of the repository, built and installed into a copy of the
+  installation under test), named by `KC_OLD_INSTALL`; without it the file is
+  skipped, because a test run cannot build an older tree.  The update itself is
+  tested without it by `sql/upgrade.sql`, which installs 0.1 with the new
+  library (the catalog of 0.1, files of format version 2) and updates;
 * `t/016_atomic_handover.pl` needs the developer settings `fault_point` and
   `fault_nth`, which exist only in a server built with assertions
   (`USE_ASSERT_CHECKING`); a production build has no fault injection at all

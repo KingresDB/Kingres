@@ -76,7 +76,7 @@ func (l *logListFlag) String() string     { return strings.Join(*l, ",") }
 func (l *logListFlag) Set(v string) error { *l = append(*l, v); return nil }
 
 func (e *env) runMonitor(args []string) int {
-	fs, asJSON := e.newFlagsWithExit("monitor", "--trust FILE --source SOURCE --state DIR [--log LOG ...] [--once] [--interval DURATION] [--polls N] [--allow-shared-state-dir] [--now TIME]",
+	fs, asJSON := e.newFlagsWithExit("monitor", "--trust FILE --source SOURCE --state DIR [--log LOG ...] [--init] [--once] [--interval DURATION] [--polls N] [--allow-shared-state-dir] [--now TIME]",
 		"Watch a publication from a machine that is not part of the cluster. For every log named in the state\n"+
 			"directory (the first run: the --log flags) it fetches the checkpoint, verifies its signature, proves with\n"+
 			"the tiles that it extends the one in the state (RFC 9162 2.1.4.2), reads the entries it has not audited\n"+
@@ -95,6 +95,7 @@ func (e *env) runMonitor(args []string) int {
 	once := fs.Bool("once", false, "poll once and exit")
 	interval := fs.Duration("interval", 60*time.Second, "time between polls")
 	polls := fs.Int("polls", 0, "stop after this many polls (0: until stopped)")
+	initFlag := fs.Bool("init", false, "this is the first run: the state directory holds no record and no log state, and none is expected. Without it a missing or emptied monitor.json is an error, because what was seen is what makes a rollback visible")
 	allowShared := fs.Bool("allow-shared-state-dir", false, "accept a state directory that others can write (Unix); refused by default")
 	nowFlag := fs.String("now", "", "time for key validity windows, RFC 3339 (default: system clock)")
 	if code, done := e.parseFlags(fs, args); done {
@@ -102,7 +103,7 @@ func (e *env) runMonitor(args []string) int {
 	}
 	const cmd = "monitor"
 	r := &result{cmd: cmd}
-	o := e.monitorRun(r, monitorArgs{trust: *trustPath, source: *source, state: *stateDir, logs: logs, once: *once, interval: *interval, polls: *polls, allowShared: *allowShared, now: nowOf(fs, nowFlag)})
+	o := e.monitorRun(r, monitorArgs{trust: *trustPath, source: *source, state: *stateDir, logs: logs, once: *once, interval: *interval, polls: *polls, allowShared: *allowShared, init: *initFlag, now: nowOf(fs, nowFlag)})
 	switch o.kind {
 	case outInput:
 		return e.inputErrorInfo(cmd, *asJSON, o.err, r.inputInfo())
@@ -120,6 +121,7 @@ type monitorArgs struct {
 	once                 bool
 	interval             time.Duration
 	polls                int
+	init                 bool
 	allowShared          bool
 	now                  nowArg
 }
@@ -202,7 +204,7 @@ func (e *env) monitorPoll(r *result, a monitorArgs, extra []logSpec, poll int) o
 		slugs = append(slugs, s)
 	}
 	sort.Strings(slugs)
-	meta, metaRaw, merr := readMeta(a.state)
+	meta, metaRaw, merr := readMeta(a.state, a.init && poll == 1)
 	if merr != nil {
 		return inputOut(merr)
 	}
@@ -297,22 +299,58 @@ func (l logSpec) kindID() string {
 	return "chain:" + l.id + ":e" + strconv.FormatUint(l.epoch, 10)
 }
 
-func readMeta(dir string) (*monitorMetaFile, []byte, error) {
+func readMeta(dir string, init bool) (*monitorMetaFile, []byte, error) {
 	data, err := safefile.ReadArg(filepath.Join(dir, monitorMeta), 4<<20)
 	if errors.Is(err, fs.ErrNotExist) {
+		// A first run is a run the user says is the first: what the state holds is what makes a rollback visible, so a
+		// record that is missing (deleted, or never made) is not taken for "nothing was seen yet".
+		if !init {
+			if states := stateFilesIn(dir); len(states) > 0 {
+				return nil, nil, fmt.Errorf("--state %s holds %d log state file(s) and no %s: what was seen (the events, how far the entries were audited, the chains retired) was lost or removed. Restore your copy of %s. If you really mean to start again, move the log state files away and give --init", dir, len(states), monitorMeta, monitorMeta)
+			}
+			return nil, nil, fmt.Errorf("--state %s holds no %s: this is a first run only if you say so, with --init (a state that was there and is gone would otherwise be taken for a new one, and a rollback would not show)", dir, monitorMeta)
+		}
+		if states := stateFilesIn(dir); len(states) > 0 {
+			return nil, nil, fmt.Errorf("--init: --state %s already holds %d log state file(s) (%s ...): it is not a first run. Remove --init, or move the state files away to forget them on purpose", dir, len(states), states[0])
+		}
 		return newMeta(), nil, nil
 	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("--state %s: %w", filepath.Join(dir, monitorMeta), err)
 	}
+	if init {
+		return nil, nil, fmt.Errorf("--init: --state %s already holds %s: it is not a first run (remove --init)", dir, monitorMeta)
+	}
 	m := newMeta()
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(data, &members); err != nil {
+		return nil, nil, fmt.Errorf("--state %s: %s is not a monitor record of this program (keep the file, it holds what was seen: restore your copy)", dir, monitorMeta)
+	}
 	if err := json.Unmarshal(data, m); err != nil || m.Format != 1 {
 		return nil, nil, fmt.Errorf("--state %s: %s is not a monitor record of this program (keep the file, it holds what was seen: restore your copy)", dir, monitorMeta)
 	}
-	if m.Audited == nil || m.Events == nil || m.Retired == nil {
-		return nil, nil, fmt.Errorf("--state %s: %s is incomplete", dir, monitorMeta)
+	// the decoder keeps the maps that newMeta made when a member is absent, so the members are looked for in the file itself
+	for _, name := range []string{"audited", "events", "retired"} {
+		if raw, ok := members[name]; !ok || string(bytes.TrimSpace(raw)) == "null" {
+			return nil, nil, fmt.Errorf("--state %s: %s is incomplete (it has no %q member): it was cut or emptied, and what was seen is lost; restore your copy", dir, monitorMeta, name)
+		}
 	}
 	return m, data, nil
+}
+
+// stateFilesIn lists the log state files of a state directory.
+func stateFilesIn(dir string) []string {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, en := range ents {
+		if stateNameRE.MatchString(en.Name()) {
+			out = append(out, en.Name())
+		}
+	}
+	return out
 }
 
 func writeMeta(dir string, m *monitorMetaFile, was []byte, allowShared bool) error {
@@ -347,7 +385,7 @@ func writeMeta(dir string, m *monitorMetaFile, was []byte, allowShared bool) err
 func (e *env) monitorEvents(r *result, p *pubInputs, meta *monitorMetaFile, poll int) (*events.Walk, outcome) {
 	digests := map[uint64]string{}
 	rd := events.FromSource(p.src.ReadFile)
-	w, err := events.Follow(p.trust, func(seq uint64) ([]byte, error) {
+	w, err := events.Follow(p.base, func(seq uint64) ([]byte, error) {
 		b, err := rd(seq)
 		if err == nil {
 			t := b

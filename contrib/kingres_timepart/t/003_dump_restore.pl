@@ -55,7 +55,7 @@ SELECT kingres.timepart_set_policy('app.det', '1 day', create_ahead => '1 day', 
 -- a date key in another zone, disabled
 CREATE TABLE app.dd (d date NOT NULL) PARTITION BY RANGE (d);
 SELECT kingres.timepart_set_policy('app.dd', '1 month', create_ahead => '40 days', timezone => 'Asia/Tokyo', enabled => false,
-       columnar_after => '60 days', columnar_sort => '{d}', columnar_options => '{"compression": "zstd", "level": 3}');
+       columnar_after => '60 days', columnar_sort => '{d}', columnar_options => '{"compression": "zstd", "compression_level": 3}');
 -- a run that fails as a whole (too many partitions for one run)
 CREATE TABLE app.big (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
 SELECT kingres.timepart_set_policy('app.big', '1 hour', create_ahead => '2 years');

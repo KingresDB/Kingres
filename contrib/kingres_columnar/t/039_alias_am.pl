@@ -149,8 +149,11 @@ q1('DROP TABLE a3');
 	like(q1("EXPLAIN (COSTS OFF) SELECT a FROM c2 WHERE a > 19990"), qr/Columnar Scan/, 'the planner uses the Columnar Scan for a table of the second access method');
 	my ($ret, $out, $err) = $node->psql('postgres', "ALTER TABLE c2 ADD CONSTRAINT c2_fk FOREIGN KEY (a) REFERENCES p2 (a)");
 	like($err, qr/foreign keys on or to columnar tables are not supported/, 'a foreign key on a table of the second access method is refused, as for "columnar"');
+	($ret, $out, $err) = $node->psql('postgres', "CREATE PUBLICATION pub2 FOR ALL TABLES");
+	like($err, qr/would include the stripe catalog/, 'a publication of all tables is refused while a table of the second access method exists (it would include the stripe catalog)');
 	($ret, $out, $err) = $node->psql('postgres', "CREATE PUBLICATION pub2 FOR TABLE c2");
-	like($err, qr/columnar tables are not replicated logically yet/, 'so is a publication of it');
+	unlike($err, qr/ERROR/, 'a publication of the table itself is allowed (its inserts are decoded)');
+	$node->safe_psql('postgres', 'DROP PUBLICATION pub2');
 	q1('DROP TABLE c2, p2');
 }
 
@@ -249,8 +252,11 @@ q1('DROP TABLE a3');
 		like($err, qr/foreign keys on or to columnar tables are not supported/, "$t: a foreign key is refused");
 		($ret, $out, $err) = $node->psql('postgres', "CREATE TRIGGER tr AFTER INSERT ON $t FOR EACH ROW EXECUTE FUNCTION trf()");
 		like($err, qr/row-level AFTER triggers on columnar tables are not supported/, "$t: an AFTER ROW trigger is refused");
+		($ret, $out, $err) = $node->psql('postgres', "CREATE PUBLICATION pb_$t FOR ALL TABLES");
+		like($err, qr/would include the stripe catalog/, "$t: a publication of all tables is refused");
 		($ret, $out, $err) = $node->psql('postgres', "CREATE PUBLICATION pb_$t FOR TABLE $t");
-		like($err, qr/columnar tables are not replicated logically yet/, "$t: a publication of it is refused");
+		unlike($err, qr/ERROR/, "$t: a publication of the table is allowed");
+		$node->safe_psql('postgres', "DROP PUBLICATION pb_$t");
 	}
 	my ($ret, $out, $err) = $node->psql('postgres', "ALTER TABLE fk_heap ADD FOREIGN KEY (a) REFERENCES hp(a)");
 	unlike($err, qr/ERROR/, 'a heap table is not touched by the guard');
@@ -324,6 +330,33 @@ SELECT count(*) FROM keep;");
 	like(slurp_file($node->logfile, $off), qr/the handler of access method \d+ raised an error and the access method cannot be classified: kcprobe: the handler of this access method is broken/, '... the log has the error, and VACUUM went on');
 	is(q1('SELECT kingres.columnar_check_clean()'), 't', 'without the error the check is clean');
 	q1('DROP TABLE we; DROP ACCESS METHOD am_err; DROP FUNCTION kingres.herr(internal)');
+}
+
+# ------------------------------------------------------------------------
+# 10. C13-01: a broken handler is called once per call of the check, however many tables of its
+#     access method there are and however they are interleaved with other tables in pg_class
+# ------------------------------------------------------------------------
+{
+	q1(qq{CREATE FUNCTION kingres.herr2(internal) RETURNS table_am_handler AS '$pdir/kcprobe', 'kcprobe_am_error' LANGUAGE C;
+		CREATE ACCESS METHOD am_err2 TYPE TABLE HANDLER kingres.herr2;});
+	for my $i (1 .. 40)
+	{
+		q1("CREATE TABLE we2_$i (a int) USING am_err2; CREATE TABLE wh2_$i (a int)");
+	}
+	my $off = -s $node->logfile;
+	my ($ret, $out, $err) = $node->psql('postgres', "SET kcprobe.am_error = on;
+SELECT kingres.columnar_check_clean();
+SELECT count(*) FROM kingres.columnar_check() WHERE check_name = 'not_checked';");
+	is($ret, 0, 'a broken handler under 40 interleaved tables: no call fails');
+	is($out, "f\n1", '... the check says that the orphan step could not be done');
+	my $log = slurp_file($node->logfile, $off);
+	my $n = () = $log =~ /the handler of access method \d+ raised an error/g;
+	is($n, 2, '... and the handler was called once in each of the two calls, and logged once (not once per table)');
+	for my $i (1 .. 40)
+	{
+		q1("DROP TABLE we2_$i; DROP TABLE wh2_$i");
+	}
+	q1('DROP ACCESS METHOD am_err2; DROP FUNCTION kingres.herr2(internal)');
 }
 
 is(q1('SELECT kingres.columnar_check_clean()'), 't', 'at the end the check is clean');

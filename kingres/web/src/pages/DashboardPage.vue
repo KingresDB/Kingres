@@ -177,13 +177,29 @@ const metricsUnsupported = computed(() =>
               :max="80"
           /></span>
         </div>
-        <div class="card kpi">
+        <div class="card kpi" data-testid="kpi-auto-failover">
           <span class="label">Auto-failover</span>
           <span class="value">{{ c.autoFailover.enabled ? 'On' : 'Off' }}</span>
           <span class="muted"
             >{{ c.autoFailover.eventsSinceReset }} of {{ c.autoFailover.maxCount }} events
             used</span
           >
+          <span
+            v-if="
+              c.autoFailover.limitReached ??
+              c.autoFailover.eventsSinceReset >= c.autoFailover.maxCount
+            "
+            class="notice tone-warn"
+            data-testid="kpi-auto-failover-limit"
+          >
+            <span aria-hidden="true">&#9650;</span>
+            <span
+              >The limit is reached: further failures need an operator.
+              <RouterLink v-if="session.can('getClusterSettings')" :to="{ name: 'settings' }"
+                >Settings</RouterLink
+              ></span
+            >
+          </span>
         </div>
       </section>
     </QueryBoundary>

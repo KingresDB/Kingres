@@ -2288,3 +2288,163 @@ alerts of the monitor (a read-only transaction). The reading of the topology
 answers 503 at the formation of a cluster in about one formation in twenty.
 The text of `notScheduled` in the contract no longer fits and waits for the
 next revision.
+
+### The fixes for the review of increment 3 (2026-11-19)
+
+The review of increment 3 (F3-01 to F3-16) found four high defects by reading. What the fixes
+changed against sections 3 to 7, and what the contract gained (0.12.0, additive).
+
+**A failed failover does not take the lease from the primary it promoted (F3-01).** The release of
+an adoption is refused when the adoption is attached to a running primary, and the call answers
+that the lease is still held.
+
+**Fencing of the old primary must be proved (F3-02, F3-12).** The leader records how many standbys
+the plan of each group carried (migration 0018). When the old server does not answer and the leader
+has no proof that its plan carried a standby, a group without a standby is never stopped by a lapsed
+lease, so the failover is refused with `cluster_inconsistent` unless the caller allows a loss of
+data; a dry run shows it as a blocker. The other way, a lease that fences whatever the plan says, is
+not built.
+
+**The verdict about lost writes (F3-03).** The time in which the old primary was not observed is
+taken only from the silence that a majority of the members share, and only what exceeds the lease
+and its margin; the leader asks the other members. A leader that alone lost the old server no longer
+concludes "none".
+
+**A failover and a change of the databases exclude each other (F3-04).** The preflight checks that
+the old primary is in the catalog of every database. A failover is refused while a database is
+created or dropped or a table is distributed, and those are refused while a failover is unfinished
+(migration 0016; the database operations answer `failover_in_progress`, the failover
+`operation_in_progress`). A failure to read the targets after the promotion is a pause, never a
+failed task.
+
+**Smaller ones.** A promotion that was begun and not finished is finished, not refused (F3-05). A
+pin that can be read is kept; one that cannot is withdrawn while nothing is promoted (F3-06). A
+primary that still runs is stopped only after some standby was read (F3-07). The attach of the
+promoted instance answers `lease_not_held` on both paths (F3-08). The entry point of a server whose
+own catalog cannot be read takes the nodes from a peer (F3-09). Prepared transactions are recovered
+and the cluster checked in every database (F3-10). A standby that is found out of recovery and that
+this task did not pin pauses the task with the alert `splitPromotion`; it is adopted only when a
+loss is allowed, with the verdict "possible" (F3-11). The calls that demote, promote, change a lease
+or recover prepared transactions name the group, and demote and promote need the fence header
+(F3-13). A freeze is lifted only by the task that set it (F3-14). A failover that ended with an
+incident of the cluster check ends `completedWithWarnings` (F3-15, migration 0017).
+
+**The contract, 0.12.0.** `FailoverReportSummary.outcome` has `completedWithWarnings`; the problem
+of a 409 `failover_needs_decision` carries the plan; the text of `notScheduled` is corrected.
+
+**The lease code.** Renewal rounds, releases and transfers returned at a majority and left requests
+in flight; a late one could reach a grantor after the group was released. A release now waits for
+the requests of its group.
+
+**A member that does not know the leader** answers 503 with `Retry-After`, and a client repeats; it
+does not forward or queue. The window without a leader is the election plus the lease. Tests that
+read the topology or a task once while the state moved now wait through that answer.
+
+**Open after this round.** The test of the entry point (F3-09) passes without the fix on a real
+cluster, so only a unit test shows it. No cluster test for F3-05, F3-08 and F3-10. Real writers on
+a primary that is cut off or killed are not tested for F3-03. Not covered of F3-16: a standby that
+lags, a lost answer of a call, an instance killed under writers. Of increment 5 (the failover of the
+map group) only the journal of a bootstrap exists (`internal/failover/journal`), used by nothing.
+
+### Increment 5 (the failover of the map group) and the open items of the third review (2026-11-19)
+
+**What was built.** A request to fail over the server that runs the primary of the map group (the
+leader) is answered by any member that cannot hear it, in mode `hard` only. The member relays it to
+a candidate, a server with a ready registered standby of group 0, over the internal call
+`POST /internal/v1/failover/map/start` (`/continue` for a hand-over). The candidate runs the
+bootstrap B1 to B8 from a journal that survives a restart of `kingresd`:
+
+- **B1** decides: the catalog names the old server primary of group 0, a ready standby is here, a
+  majority is heard.
+- **B2** freezes locally.
+- **B3** asks the old server to demote if it answers, and takes the fence lease from a majority.
+- **B4** reads the positions and ranks the standbys as an ordinary failover does, and writes the pin
+  once. If another standby is better, the lease and the journal are handed to it.
+- **B5** takes the holder lease and makes the same promote call as the task.
+- **B6** runs `promote_node` on the promoted instance itself in every database. It repeats every 5
+  seconds while the majority rule of the extension refuses; after 60 seconds it raises
+  `failoverBlocked`, and after 10 minutes it pauses.
+- **B7** waits until the local catalog names this server primary of group 0 with a higher term,
+  moves the system database and pauses the rebalance that was running (outcome stopped,
+  `stopped_by` safetyRule, "The map group was failed over."). It then records the run as an
+  ordinary failover task, whose group-0 steps up to F7 are done.
+- **B8** checks for the key of the certificate authority and opens the gate of the task engine.
+
+While the bootstrap runs, `GET /tasks/0` and `GET /failover` are answered by the candidate. Task id 0
+never names a stored task. REST contract 0.13.0 (additive) has this, and the alert
+`certificateAuthorityUnavailable`.
+
+**Departures from the design.**
+
+- **The key of the certificate authority is not escrowed** (section 11.2). No sealing key could be
+  derived from what exists without a new construction, and the cluster secret lives in the
+  extension, not in `kingresd`. The bootstrap runs without it. A new leader that has no
+  `pki/ca.key` raises the critical alert `certificateAuthorityUnavailable` at B8. No certificate can
+  then be issued, renewed or revoked until the operator restores `pki/ca.key` and
+  `pki/revoked.json` from the old leader's backup and restarts `kingresd`.
+- **Authority of a manual request.** The member that receives the request authenticates the
+  operator and relays it. The candidate does not check the role again; it proves everything else
+  itself (the catalog, the standby, the majority, the lease, the extension's majority rule). The
+  design asked for the same role check as on the leader; this is weaker.
+- **A restart of the candidate** undoes B3 and B5 (idempotent) when B6 is not done, because the
+  adoption of the lease lived in memory. Members then come from the peer directory when the
+  catalog cannot be read.
+- **The stores follow the promoted instance.** The task engine's store and the REST store were
+  bound to the address of the home instance; they now follow the system database where it moves.
+  The sign-in authenticator stays on the home instance.
+- **A promoted copy keeps the rule that lets `kingresd` connect to it.** The rules a restarted
+  `kingresd` rewrote for a primary dropped the `kingres_standby` line from `pg_hba` and `pg_ident`.
+  This also affected every ordinary promoted instance after a restart.
+- **Not built:** monitors for an automatic failover of the map group (increment 6), `graceful` and
+  the dry run for it, and the second condition of the gate (the group-0 instance in recovery). When
+  the extension's majority can never be reached, the bootstrap only pauses after 10 minutes, with no
+  operation of its own for the operator.
+
+**The open items of the third review.** F3-05, F3-08, F3-09 and F3-10 have cluster tests. F3-05 and
+F3-08 use one-shot fault points that stand in for their causes: a promote call that ends after the
+role file, and a lease that cannot be attached. F3-09 uses a failover paused after the old primary
+stopped, so the old server's catalog cannot be read. The test of F3-10 shows that prepared
+transactions are recovered in every database, but makes no prepared transaction of its own.
+
+**Open.**
+
+- In 2 of 12 runs, the last step of two tests (resuming a paused failover after the heal and a
+  repeated request) timed out after 6 minutes. The assertion each test is about had already passed,
+  and the cause is not known.
+- A map group failover whose old server also held primaries of ordinary groups is not tested.
+- A hand-over at B4 and a demotion at B3 by a live old server are tested only with fakes.
+- A kill of the old leader under writers is not tested.
+
+### Increment 6 (automatic failover, 2026-11-19)
+
+Built to section 4 without a change of the contract (the settings, the reset, the alerts `autoFailoverTriggered`, `autoFailoverLimitReached` and
+`failoverBlocked`, and the trigger `automatic` of the report existed in 0.10.0); no migration was needed (`failover_run.counted` and the trigger
+exist from migration 0015).
+
+- **One rule, two loops.** `failover.Evaluate` is a function of a view (settings, the servers with their silence and the corroboration, the
+  majority this server hears, an unfinished task, the end of the last failover of each group) and has a test for each row of 4.2 and 4.3.
+  `failover.Auto` runs it every 5 s on the manager leader (`cmd/kingresd/autofailover.go` reads the view; it does nothing on a server that is not
+  the leader and reads nothing while the setting is off). The candidate monitor of the map group (`cmd/kingresd/mapmonitor.go`) runs the same rule
+  on every server that hosts a ready standby of group 0, for the one case in which the leader's server is the server that is gone.
+- **Evidence.** The server's own tracker says "dead" for at least the effective timeout, `max(timeoutSeconds, 3 x failure-timeout)`, and a strict
+  majority of the members (this server included) report the server as not live (`GET /liveness`); a server that hears no majority starts nothing.
+  Exactly half is not a majority.
+- **Order of events.** The loop stops a rebalance first (`StopForFailover`, then `WaitStopped` for up to 60 s per look) and starts the task only when
+  it is stopped; a failed start backs off 60 s, doubling to 10 minutes, per server; the cool-down of 5 minutes holds back a server one of whose
+  groups was failed over lately. The alert `failoverBlocked` ("no standby to promote") is raised and cleared per group by the loop.
+- **The counter.** `autoFailover.eventsSinceReset` is incremented once per automatic task, in the transaction that records the first promoted
+  group (`CountAutomaticSQL`, guarded by `failover_run.counted`; the map group's run is recorded with it). A rebalance that completes and
+  `resetAutoFailoverCounter` set it to 0. At the limit the loop raises `autoFailoverLimitReached` once and clears it when the counter is lower.
+- **The map group.** The candidates are ranked by the id of their registered standby; rank r waits `r x 30 s` after the evidence holds and looks
+  again at the same leader and term before it starts the bootstrap with the trigger `automatic` (never with `allowDataLoss`, so the rule of the
+  journal verdict decides). The lease still makes the choice safe whatever the order: one holder, and B4 hands the journal to a better candidate.
+  The settings come from the replica of the system database that the candidate holds.
+- **Alerts and audit.** `autoFailoverTriggered` (info, subject `cluster`) is raised when an automatic run ends (the report step of the task; the
+  promotion record of the map group); the audit event `autoFailover` is written when the loop starts the task.
+- **Tests.** Unit: the table of `Evaluate` and the loop with fake ports (`internal/failover/auto_test.go`). Cluster: T13
+  `TestAutomaticFailoverRulesAndTheCounter` (off: nothing; on: one automatic failover, the counter, the limit alert, the reset) and
+  `TestAutomaticFailoverOfTheMapGroup` (`internal/clustertest/failover_auto_test.go`).
+- **Not built and not tested:** two failures at once (T7 needs five servers: a cluster of three has no majority after the second), a rebalance that
+  is running when the failover starts (covered by the unit test of the order and by the rebalance's own test of `StopForFailover`, not by a cluster
+  test), `failoverNeedsDecision` for an automatic run with an asynchronous standby (the journal and the task already ask; no cluster test), and the
+  stall tests of T14.

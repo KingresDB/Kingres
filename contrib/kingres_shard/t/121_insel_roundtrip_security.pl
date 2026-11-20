@@ -358,11 +358,16 @@ for my $sql (@refused)
 		[ q{INSERT INTO public.sq (id, a) SELECT id, (sqs.*)::text FROM public.sqs}, qr/whole-row|text form|not built in/, 'a whole-row reference' ],
 		[ q{INSERT INTO public.sq (id, a) SELECT id, a FROM public.sqs WHERE ctid IS NOT NULL}, qr/system column/, 'a system column' ],
 		[ q{INSERT INTO public.sq (id, a) SELECT id, to_char(ts, 'HH')  FROM public.sqs}, qr/not built in and immutable/, 'to_char of a timestamptz (stable)' ],
-		[ q{INSERT INTO public.sq (id, a) SELECT id, a FROM public.sqs TABLESAMPLE SYSTEM (50)}, qr/samples a table/, 'a table sample' ],
 		[ q{INSERT INTO public.sq (id, a) SELECT id, a FROM public.sqs FOR UPDATE}, qr/locks rows|row locking/, 'row locking' ],
 		[ q{WITH x AS (SELECT id, a FROM public.sqs) INSERT INTO public.sq (id, a) SELECT id, a FROM x}, qr/WITH clause/, 'a WITH clause' ],
 		[ q{INSERT INTO public.sq (id, a) SELECT id, a FROM public.sqs UNION ALL SELECT id, a FROM public.sqs}, qr/set operation|something other than a table|source/, 'a set operation' ],
 	);
+	# a table sample of a distributed table is refused with an error on every path now (review P2E-02), the source of an INSERT included
+	{
+		my ($rs, $os, $es) = run_sql($n1, q{INSERT INTO public.sq (id, a) SELECT id, a FROM public.sqs TABLESAMPLE SYSTEM (50)});
+		isnt($rs, 0, 'a table sample as the source of an INSERT ... SELECT is refused');
+		like($es, qr/TABLESAMPLE is not supported for distributed table/, '... with the error of P2E-02');
+	}
 	for my $f (@no)
 	{
 		my $why = not_shipped_reason($n1, $f->[0]);

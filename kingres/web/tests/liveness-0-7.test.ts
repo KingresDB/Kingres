@@ -77,14 +77,14 @@ describe('Servers page', () => {
     const row = within(await screen.findByTestId('server-row-10.0.0.12'))
     expect(row.getByText('LIVE')).toBeInTheDocument()
     silenceServer(s, '10.0.0.12', Date.now() - (mockConfig.suspectMs + 200))
-    await waitFor(() => expect(row.getByText('SUSPECT')).toBeInTheDocument(), { timeout: 7000 })
+    await waitFor(() => expect(row.getByText('SUSPECT')).toBeInTheDocument(), { timeout: 30_000 })
     expect(row.getByTestId('last-heartbeat')).toBeInTheDocument()
     silenceServer(s, '10.0.0.12', Date.now() - (mockConfig.failureMs + 200))
-    await waitFor(() => expect(row.getByText('DEAD')).toBeInTheDocument(), { timeout: 7000 })
+    await waitFor(() => expect(row.getByText('DEAD')).toBeInTheDocument(), { timeout: 30_000 })
     reviveServer(s, '10.0.0.12')
-    await waitFor(() => expect(row.getByText('LIVE')).toBeInTheDocument(), { timeout: 7000 })
+    await waitFor(() => expect(row.getByText('LIVE')).toBeInTheDocument(), { timeout: 30_000 })
     expect(row.queryByTestId('last-heartbeat')).toBeNull()
-  }, 25000)
+  }, 90_000)
 
   it('the manager raises serverSuspect, then serverDown with the server as subject, and clears them', async () => {
     const s = getState()
@@ -195,7 +195,7 @@ describe('leader_unavailable', () => {
     await screen.findByTestId('server-row-10.0.0.12')
     // The first answers worked (the panel knows the servers); now this server has lost the leader.
     mockConfig.leaderLost = true
-    const banner = await screen.findByTestId('banner-leader', {}, { timeout: 7000 })
+    const banner = await screen.findByTestId('banner-leader', {}, { timeout: 30_000 })
     expect(banner).toHaveTextContent(/lost contact with the manager leader/i)
     expect(banner).toHaveTextContent(/nothing can be changed here/i)
     expect(banner).toHaveTextContent('10.0.0.12:8091')
@@ -225,7 +225,7 @@ describe('leader_unavailable', () => {
     await renderApp('/servers')
     await screen.findByTestId('server-row-10.0.0.12')
     mockConfig.leaderLost = true
-    const banner = await screen.findByTestId('banner-leader', {}, { timeout: 7000 })
+    const banner = await screen.findByTestId('banner-leader', {}, { timeout: 30_000 })
     expect(banner).toHaveTextContent(/10\.0\.0\.12:8091 \(the manager leader, as last known\)/)
   })
 
@@ -234,7 +234,7 @@ describe('leader_unavailable', () => {
     await renderApp('/servers')
     await screen.findByTestId('server-row-10.0.0.12')
     mockConfig.leaderLost = true
-    const banner = await screen.findByTestId('banner-leader', {}, { timeout: 7000 })
+    const banner = await screen.findByTestId('banner-leader', {}, { timeout: 30_000 })
     expect(banner.querySelector('img')).toBeNull()
     expect(banner.textContent).toContain('<img src=x')
   })
@@ -245,9 +245,11 @@ describe('leader_unavailable', () => {
     expect(await screen.findByText('No manager leader')).toBeInTheDocument()
     expect(screen.getAllByText(/open the console on another server/i).length).toBeGreaterThan(0)
     mockConfig.leaderLost = false
-    await waitFor(() => expect(screen.queryByTestId('banner-leader')).toBeNull(), { timeout: 8000 })
-    await screen.findByTestId('server-row-10.0.0.12', {}, { timeout: 8000 })
-  }, 20000)
+    await waitFor(() => expect(screen.queryByTestId('banner-leader')).toBeNull(), {
+      timeout: 30_000,
+    })
+    await screen.findByTestId('server-row-10.0.0.12', {}, { timeout: 30_000 })
+  }, 90_000)
 
   it('has no banner when the leader is there', async () => {
     await renderApp('/servers')

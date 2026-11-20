@@ -305,16 +305,27 @@ func (s PGStore) PutCheckpoint(ctx context.Context, term scheduler.Term, c Check
 }
 
 // ReplaceNote implements Store.
-func (s PGStore) ReplaceNote(ctx context.Context, term scheduler.Term, logID, size int64, note []byte) error {
+func (s PGStore) ReplaceNote(ctx context.Context, term scheduler.Term, logID, size int64, note []byte, keysRevision int64) error {
 	return s.write(ctx, term, "note", func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `UPDATE kingres_cp.ledger_checkpoint SET note = $3 WHERE log_id = $1 AND size = $2`, logID, size, note)
-		if err != nil {
+		var have int64
+		if err := tx.QueryRow(ctx, `SELECT keys_revision FROM kingres_cp.ledger_cluster`).Scan(&have); err != nil {
 			return err
 		}
-		if tag.RowsAffected() != 1 {
-			return ErrNotFound
+		if have != keysRevision {
+			return ErrKeysChanged
 		}
-		return nil
+		var old []byte
+		if err := tx.QueryRow(ctx, `SELECT note FROM kingres_cp.ledger_checkpoint WHERE log_id = $1 AND size = $2 FOR UPDATE`, logID, size).Scan(&old); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if err := sameText(old, note); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `UPDATE kingres_cp.ledger_checkpoint SET note = $3 WHERE log_id = $1 AND size = $2`, logID, size, note)
+		return err
 	})
 }
 
@@ -494,6 +505,12 @@ func (s PGStore) LastDigestAt(ctx context.Context, database string) (time.Time, 
 func (s PGStore) Object(ctx context.Context, origin, rest string) (Object, error) {
 	if origin == "" {
 		switch {
+		case rest == "logs.json":
+			logs, err := s.Logs(ctx)
+			if err != nil {
+				return Object{}, err
+			}
+			return Object{Data: LogsJSON(logs), Mutable: true, ContentType: "application/json"}, nil
 		case rest == "keyring.json":
 			var d []byte
 			err := s.Sys(ctx, func(c *pgx.Conn) error {
@@ -528,6 +545,9 @@ func (s PGStore) Object(ctx context.Context, origin, rest string) (Object, error
 	row, err := s.LogByOrigin(ctx, origin)
 	if err != nil {
 		return Object{}, err
+	}
+	if strings.HasPrefix(rest, "anchors/") {
+		return s.evidenceFile(ctx, row, rest)
 	}
 	r, err := ParseRest(rest)
 	if err != nil {

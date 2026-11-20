@@ -959,6 +959,12 @@ func (r *PGRows) Settle(ctx context.Context, outcome, stoppedBy, errText string,
 			finished_at = CASE WHEN $2 = 'stopped' THEN NULL ELSE clock_timestamp() END,
 			placement_after = CASE WHEN $5::jsonb = 'null'::jsonb THEN placement_after ELSE $5::jsonb END
 			WHERE task_id = $1`, r.TaskID, outcome, stoppedBy, clipText(errText, 500), pa)
+		if err != nil || outcome != OutcomeCompleted {
+			return err
+		}
+		// A rebalance that completes resets the counter of automatic failovers (design 4.4, the contract says so).
+		_, err = tx.Exec(ctx, `INSERT INTO kingres_cp.cluster_setting (key, value) VALUES ('autoFailover.eventsSinceReset', '0'::jsonb)
+			ON CONFLICT (key) DO UPDATE SET value = '0'::jsonb, updated_at = now()`)
 		return err
 	})
 }

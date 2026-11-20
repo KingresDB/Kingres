@@ -24,6 +24,8 @@ type MemStore struct {
 	Origins []string
 	// MaxSize is the answer of MaxCheckpointSize.
 	MaxSize uint64
+	// BySigner is the largest size of a checkpoint that carries the signature of a key (P8-02); nil means no checkpoint carries any.
+	BySigner func(pub ed25519.PublicKey) uint64
 	// AfterMax, when set, is called after every MaxCheckpointSize with the number of the call (a checkpoint that is stored between the read
 	// of the bound and the commit of the event that states it).
 	AfterMax func(n int)
@@ -96,7 +98,10 @@ func (m *MemStore) Commit(_ context.Context, term scheduler.Term, expect int64, 
 	if m.snap.Revision != expect {
 		return ErrConflict
 	}
-	if ch.CheckpointBound != nil && m.MaxSize > *ch.CheckpointBound {
+	if ch.CheckpointBound != nil && ch.BoundKey != nil && m.signedBy(ch.BoundKey) > *ch.CheckpointBound {
+		return fmt.Errorf("%w: a checkpoint signed by the retired key above its bound was stored meanwhile", ErrConflict)
+	}
+	if ch.CheckpointBound != nil && ch.BoundKey == nil && m.MaxSize > *ch.CheckpointBound {
 		return fmt.Errorf("%w: a checkpoint above the bound of the retired key was stored meanwhile", ErrConflict)
 	}
 	next := clone(m.snap)
@@ -174,4 +179,19 @@ func (m *MemStore) Overwrite(f func(s *Snapshot)) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	f(&m.snap)
+}
+
+// signedBy is the largest size signed by a key: the test sets BySigner; without it nothing is signed by any key.
+func (m *MemStore) signedBy(pub ed25519.PublicKey) uint64 {
+	if m.BySigner == nil {
+		return 0
+	}
+	return m.BySigner(pub)
+}
+
+// MaxCheckpointSizeSignedBy implements Store.
+func (m *MemStore) MaxCheckpointSizeSignedBy(_ context.Context, pub ed25519.PublicKey) (uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.signedBy(pub), nil
 }

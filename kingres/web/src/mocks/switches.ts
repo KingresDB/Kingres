@@ -51,14 +51,21 @@
 //                                 fail:<code>     the next key task ends failed with that code (key_files_remain, passphrase_mismatch, ...)
 //   ?publication=<a>,<b>,...      0.11.0: off | plain (the listener has no TLS) | nolistener | behind (the newest checkpoint is old)
 //                                 | unread (a group could not be read: a stale member) | diverged (the chain of group 2 of shop diverged)
+//   ?anchors=all|disabled|testfail|testwarn|refuse:<code>   0.11.0 (console part B): see the README
 //   ?anchors=<a>,<b>,...          0.11.0: none (alert ledgerNotAnchored) | required (the same, a warning) | ok | behind | failed
 //                                 (a WORM target "archive-worm" exists, with the newest aggregate anchored in time, late or not)
 //   ?clock=off:<server>:<ms>      the clock of that server is that many milliseconds ahead (negative: behind).
 //   ?clock=unreachable:<server>   the clock of that server cannot be read.
 import type { MockState } from './state'
 import { loseLease, mockConfig, silenceServer, stallStandby } from './state'
-import { FAIL_STEPS, seedAutomaticFailover } from './failover'
-import { answerAsTheServerDoesToday, seedAnchors } from './ledger'
+import { FAIL_STEPS, raiseAutoFailoverLimit, seedAutomaticFailover } from './failover'
+import {
+  answerAsTheServerDoesToday,
+  seedAnchors,
+  seedAnchorsAll,
+  seedAnchorsDisabled,
+  seedClientKeys,
+} from './ledger'
 import { signingKey, withoutKeys } from './ledger-data'
 import {
   failNextApply,
@@ -73,6 +80,8 @@ function applyFailoverSwitch(entry: string, s: MockState): void {
   if (entry === 'dataloss') mockConfig.failoverDataLoss = true
   if (entry === 'needs-decision') mockConfig.failoverNeedsDecision = true
   if (entry === 'slow') mockConfig.failoverSlow = true
+  if (entry === 'warnings') mockConfig.failoverWarnings = true
+  if (entry === 'noplan') mockConfig.failoverNoPlan = true
   if (entry === 'map') mockConfig.failoverMap = true
   if (entry === 'graceful') mockConfig.failoverGraceful = true
   const blocked = /^blocked:(rebalance|lease|quorum|noreplica)$/.exec(entry)
@@ -95,6 +104,21 @@ function applyFailoverSwitch(entry: string, s: MockState): void {
       eventsSinceReset: s.settings.autoFailover.maxCount,
       lastEventAt: new Date(Date.now() - 600_000).toISOString(),
     }
+  if (entry === 'limit') raiseAutoFailoverLimit(s)
+  // 0.10.0 (console part 2): automatic failover turned off; the counter at n of m (the limit when n reaches m).
+  if (entry === 'off') s.settings.autoFailover = { ...s.settings.autoFailover, enabled: false }
+  const count = /^count:(\d{1,3})(?::(\d{1,3}))?$/.exec(entry)
+  if (count) {
+    const max = Math.max(1, Number(count[2] ?? s.settings.autoFailover.maxCount))
+    const events = Number(count[1])
+    s.settings.autoFailover = {
+      ...s.settings.autoFailover,
+      maxCount: max,
+      eventsSinceReset: events,
+      lastEventAt: events > 0 ? new Date(Date.now() - 3_600_000).toISOString() : null,
+    }
+    if (events >= max) raiseAutoFailoverLimit(s)
+  }
   const auto = /^auto:(.+)$/.exec(entry)
   if (auto) seedAutomaticFailover(s, auto[1] as string)
 }
@@ -140,6 +164,8 @@ function applySigningSwitch(entry: string, s: MockState): void {
   if (entry === 'alarm')
     l.signing.signerAlarm = 'The key file of the active key is missing on this server.'
   if (entry === 'discontinuity') l.signing.discontinuity = true
+  // 0.12.0: the system database was restored from a backup older than what was published.
+  if (entry === 'restored') l.publishedStateAlarm = true
   if (entry === 'command') l.signing.mode = 'command'
   const fail = /^fail:([a-z_]+)$/.exec(entry)
   if (fail)
@@ -211,12 +237,44 @@ export function applySwitches(params: URLSearchParams, s: MockState): void {
     if (entry === 'behind') l.publication.health = 'behind'
     if (entry === 'unread') l.publication.health = 'unread'
     if (entry === 'diverged') l.diverged.push('shop:2')
+    // A log that was closed and answers again: diverged, with the height and why the log ended in the text of the alert.
+    if (entry === 'reopened') {
+      l.diverged.push('shop:2')
+      l.divergedWhy =
+        'the log of an earlier epoch was closed at height 120, and the chain answers again at height 121'
+    }
   }
   for (const entry of (params.get('anchors') ?? '').split(',')) {
     const l = s.ledger7
     if (entry === 'none' || entry === 'required') l.alertNotAnchored = true
     if (entry === 'required') l.settings.anchor.required = true
     if (entry === 'ok' || entry === 'behind' || entry === 'failed') seedAnchors(s, entry)
+    // 0.11.0 (console part B): the three kinds with a record in every state; a target that is turned off; what a test
+    // finds; a refusal of every change.
+    if (entry === 'all') seedAnchorsAll(s)
+    if (entry === 'disabled') {
+      seedAnchorsDisabled(s)
+      l.alertNotAnchored = true
+    }
+    if (entry === 'testfail') mockConfig.anchorTest = 'fail'
+    if (entry === 'testwarn') mockConfig.anchorTest = 'warn'
+    const refuse = /^refuse:([a-z_]+)$/.exec(entry)
+    if (refuse) mockConfig.anchorRefuse = refuse[1] as string
+  }
+  // 0.11.0 (Console C): `keys` (three client keys: any role, bound to a role, revoked), `legacy` (the extension is older than 0.3),
+  // `nossl` (the server cannot attest), `refuse:<code>` (every change answers that problem code).
+  for (const entry of (params.get('clientkeys') ?? '').split(',')) {
+    if (entry === 'keys') seedClientKeys(s)
+    if (entry === 'legacy') mockConfig.clientLegacy = true
+    if (entry === 'nossl') mockConfig.clientNoSsl = true
+    const refuse = /^refuse:([a-z_]+)$/.exec(entry)
+    if (refuse) mockConfig.clientRefuse = refuse[1] as string
+  }
+  // Console D: `expired` (a bundle is gone: 410), `refuse:<code>` (a request for a bundle or an acknowledgement answers that code).
+  for (const entry of (params.get('bundle') ?? '').split(',')) {
+    if (entry === 'expired') mockConfig.bundleExpired = true
+    const refuse = /^refuse:([a-z_]+)$/.exec(entry)
+    if (refuse) mockConfig.opsRefuse = refuse[1] as string
   }
   for (const entry of (params.get('clock') ?? '').split(',')) {
     const off = /^off:([^:]+):(-?\d+(?:\.\d+)?)$/.exec(entry)

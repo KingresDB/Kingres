@@ -30,7 +30,7 @@
 
 /* Module magic with a name and a version (available since PostgreSQL 18). */
 #define KC_MODULE_MAGIC() \
-	PG_MODULE_MAGIC_EXT(.name = "kingres_columnar", .version = "0.1")
+	PG_MODULE_MAGIC_EXT(.name = "kingres_columnar", .version = "0.2")
 
 #if PG_VERSION_NUM >= 190000
 
@@ -55,6 +55,8 @@ typedef uint32 KcInsertOptions;
 	TupleTableSlot *slot
 #define KC_VACUUM_PARAMS Relation rel, const VacuumParams *params, \
 	BufferAccessStrategy bstrategy
+#define KC_IVINFO_AUTOVAC(i) ((i).is_autovacuum = AmAutoVacuumWorkerProcess())
+#define KC_INDEX_BEGINSCAN(h, i, s) index_beginscan((h), (i), (s), NULL, 0, 0, 0)
 #define KC_TABLE_BEGINSCAN(rel, snap) \
 	table_beginscan((rel), (snap), 0, NULL, SO_NONE)
 #define KC_REPORT_VACUUM(rel, live, dead, start) \
@@ -89,6 +91,8 @@ typedef int KcInsertOptions;
 	double *deadrows, TupleTableSlot *slot
 #define KC_VACUUM_PARAMS Relation rel, struct VacuumParams *params, \
 	BufferAccessStrategy bstrategy
+#define KC_IVINFO_AUTOVAC(i) ((void) 0)
+#define KC_INDEX_BEGINSCAN(h, i, s) index_beginscan((h), (i), (s), NULL, 0, 0)
 #define KC_TABLE_BEGINSCAN(rel, snap) table_beginscan((rel), (snap), 0, NULL)
 #define KC_REPORT_VACUUM(rel, live, dead, start) \
 	pgstat_report_vacuum(RelationGetRelid(rel), (rel)->rd_rel->relisshared, \

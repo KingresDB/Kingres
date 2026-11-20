@@ -201,9 +201,9 @@ sub slurp
 	$n2->safe_psql('postgres', "UPDATE pg_catalog.pg_extension SET extversion = '0.4' WHERE extname = 'kingres_shard'");
 	my ($rc, $o, $e) = run_sql($n1, "\\set VERBOSITY verbose\nSELECT count(*) FROM public.t");
 	isnt($rc, 0, 'a node of another version: the scan fails');
-	like($e, qr/runs kingres_shard 0\.4, this node runs 0\.6/, 'and names the node and the versions');
+	like($e, qr/runs kingres_shard 0\.4, this node runs 0\.7/, 'and names the node and the versions');
 	unlike($e, qr/KS001/, 'it is not the retryable error');
-	$n2->safe_psql('postgres', "UPDATE pg_catalog.pg_extension SET extversion = '0.6' WHERE extname = 'kingres_shard'");
+	$n2->safe_psql('postgres', "UPDATE pg_catalog.pg_extension SET extversion = '0.7' WHERE extname = 'kingres_shard'");
 	is($n1->safe_psql('postgres', 'SELECT count(*) FROM public.t'), $total, 'with the version back the scan answers');
 }
 
@@ -239,7 +239,7 @@ sub slurp
 	# The order of the planner hook: the mark is acted on after the analysis and after the partition
 	# lists are made as new as the catalog (design 4.4).
 	my $planner = slurp("$src/planner.c");
-	my $i_fresh = index($planner, 'kingres_shard_ensure_fresh_partitions(((DistRef *)');
+	my $i_fresh = index($planner, 'kingres_shard_ensure_fresh_partitions(lfirst_oid(lc)');
 	my $i_nonce = index($planner, 'if (this_is_local_part)');
 	cmp_ok($i_fresh, '>', 0, 'planner.c makes the partition lists as new as the catalog after its analysis');
 	cmp_ok($i_nonce, '>', $i_fresh, 'and recognizes the local part after that');

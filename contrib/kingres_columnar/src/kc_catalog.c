@@ -57,7 +57,8 @@
 
 #include "kingres_columnar.h"
 
-#define Natts_kc_stripe				14
+#define Natts_kc_stripe_v01			14	/* the catalog of 0.1 */
+#define Natts_kc_stripe				15	/* the catalog of 0.2: + reserved */
 #define Anum_kc_uid					1
 #define Anum_kc_stripe_id			2
 #define Anum_kc_first_row			3
@@ -72,6 +73,7 @@
 #define Anum_kc_cid_points			12
 #define Anum_kc_col_stats			13
 #define Anum_kc_maintenance			14
+#define Anum_kc_reserved			15
 
 /*
  * The snapshot the catalog is read with: the caller's snapshot copied, with
@@ -233,6 +235,24 @@ kc_am_class(Oid amoid)
  * step stand down and say so (C12-01) and leaves the relation out of the list
  * of tables.
  */
+/*
+ * The access methods whose handler raised an error since the entry point of
+ * the running call (the check, the reconcile, a vacuum) began: each is called
+ * once per call, however many tables of it the passes over pg_class meet, and
+ * its error is logged once.  Cleared by kc_am_failed_reset at the start of every
+ * entry point, and when an access method or a function changes.  More than
+ * KC_AM_FAILED_MAX broken access methods are called again when they come up.
+ */
+#define KC_AM_FAILED_MAX 16
+static Oid	kc_am_failed[KC_AM_FAILED_MAX];
+static int	kc_am_failed_n = 0;
+
+void
+kc_am_failed_reset(void)
+{
+	kc_am_failed_n = 0;
+}
+
 static KcAmClass
 kc_am_class_guarded(Oid amoid)
 {
@@ -240,12 +260,19 @@ kc_am_class_guarded(Oid amoid)
 	MemoryContext oldcxt = CurrentMemoryContext;
 	ResourceOwner oldowner = CurrentResourceOwner;
 
+	int			i;
+
 	if (!OidIsValid(amoid))
 		return KC_AM_UNKNOWN;
 	if (kc_am_class_cached(amoid, &cls))
 		return cls;
 	if (!kc_subxact_possible())
 		return kc_am_class(amoid);
+
+	/* a handler that failed during this call is not called again (C13-01) */
+	for (i = 0; i < kc_am_failed_n; i++)
+		if (kc_am_failed[i] == amoid)
+			return KC_AM_UNKNOWN;
 
 	BeginInternalSubTransaction(NULL);
 	MemoryContextSwitchTo(oldcxt);
@@ -274,6 +301,8 @@ kc_am_class_guarded(Oid amoid)
 						amoid, ed->message)));
 		FreeErrorData(ed);
 		cls = KC_AM_UNKNOWN;
+		if (kc_am_failed_n < KC_AM_FAILED_MAX)
+			kc_am_failed[kc_am_failed_n++] = amoid;
 	}
 	PG_END_TRY();
 	return cls;
@@ -519,26 +548,62 @@ kc_copy_bytea(Datum d)
  * would drop the tables with their data (their access method is part of the
  * extension), so it is never given.
  */
-static void
+static int
 kc_catalog_check_shape(Relation cat)
 {
 	int			natts = RelationGetDescr(cat)->natts;
 
-	if (natts == Natts_kc_stripe)
-		return;
-	if (natts == Natts_kc_stripe - 1)
+	/*
+	 * Both shapes are served: the catalog of 0.2 (the column "reserved" at the
+	 * end), and the catalog of 0.1, which a database has between the
+	 * replacement of the library and ALTER EXTENSION kingres_columnar UPDATE.
+	 * With the catalog of 0.1 every row is a written stripe and nothing is ever
+	 * reserved (kc_catalog_has_reserved is false).
+	 */
+	if (natts == Natts_kc_stripe || natts == Natts_kc_stripe_v01)
+		return natts;
+	if (natts == Natts_kc_stripe_v01 - 1)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("the stripe catalog has %d columns, this build uses %d",
-						natts, Natts_kc_stripe),
+				 errmsg("the stripe catalog has %d columns, this build uses %d (0.1) or %d (0.2)",
+						natts, Natts_kc_stripe_v01, Natts_kc_stripe),
 				 errhint("The catalog was made by an earlier build of version 0.1. As the owner of the extension, run: ALTER TABLE %s.%s ADD COLUMN maintenance boolean NOT NULL DEFAULT false. Nothing is lost.",
 						 quote_identifier(get_namespace_name(RelationGetNamespace(cat))),
 						 quote_identifier(RelationGetRelationName(cat)))));
 	ereport(ERROR,
 			(errcode(ERRCODE_DATA_CORRUPTED),
-			 errmsg("the stripe catalog has %d columns, this build uses %d",
-					natts, Natts_kc_stripe),
+			 errmsg("the stripe catalog has %d columns, this build uses %d (0.1) or %d (0.2)",
+					natts, Natts_kc_stripe_v01, Natts_kc_stripe),
 			 errhint("The catalog does not belong to this build and cannot be repaired by it; restore it from a backup of the database.")));
+	return natts;				/* not reached */
+}
+
+/*
+ * Does the stripe catalog of this database have the column "reserved", that
+ * is, is the SQL side of the extension at version 0.2?  Only then may a file
+ * be made as format version 3 and a row number be reserved.
+ */
+bool
+kc_catalog_has_reserved(void)
+{
+	Relation	cat = table_open(kc_catalog_oid(), AccessShareLock);
+	int			natts = RelationGetDescr(cat)->natts;
+
+	table_close(cat, AccessShareLock);
+	return natts == Natts_kc_stripe;
+}
+
+/* Is this catalog row a reservation that no stripe has been written for? */
+static bool
+kc_tuple_is_reserved(Relation cat, HeapTuple tup)
+{
+	bool		isnull;
+	Datum		d;
+
+	if (RelationGetDescr(cat)->natts < Natts_kc_stripe)
+		return false;
+	d = heap_getattr(tup, Anum_kc_reserved, RelationGetDescr(cat), &isnull);
+	return !isnull && DatumGetBool(d);
 }
 
 static void
@@ -548,10 +613,10 @@ kc_stripe_from_tuple(Relation cat, HeapTuple tup, KcStripeInfo *si)
 	Datum		v[Natts_kc_stripe];
 	bool		n[Natts_kc_stripe];
 	int			i;
+	int			natts = kc_catalog_check_shape(cat);
 
-	kc_catalog_check_shape(cat);
 	heap_deform_tuple(tup, desc, v, n);
-	for (i = 0; i < Natts_kc_stripe; i++)
+	for (i = 0; i < natts; i++)
 		if (n[i])
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
@@ -680,6 +745,14 @@ kc_catalog_load(Relation rel, Snapshot snap, int *nstripes)
 				kc_report_conflict_out(rel, concurrent, snap);
 			continue;
 		}
+
+		/*
+		 * A reserved row is a claim on row numbers, not a stripe: nothing is
+		 * written for it yet, and when the writer flushes it the row is replaced
+		 * by the stripe's.  No reader takes it for a stripe, whoever it belongs to.
+		 */
+		if (kc_tuple_is_reserved(cat, tup))
+			continue;
 		if (n == cap)
 		{
 			cap = cap ? cap * 2 : 16;
@@ -802,27 +875,16 @@ kc_catalog_row_total(Relation rel, Snapshot snap, uint64 *stripes,
  * ------------------------------------------------------------------------
  */
 
-void
-kc_catalog_insert(Relation rel, const KcStripeInfo *si, const char *cid_points,
-				  int cid_len, const char *col_stats, int stats_len, bool frozen,
-				  bool maintenance)
+/*
+ * The values of a catalog row.  cp and cs are the cid_points and col_stats
+ * bytea (made by the caller).  The array has room for the 0.2 shape; with the
+ * catalog of 0.1 the tuple is formed from its first 14 entries.
+ */
+static void
+kc_catalog_values(Relation rel, const KcStripeInfo *si, bytea *cp, bytea *cs,
+				  bool maintenance, bool reserved, Datum *v, bool *n)
 {
-	Relation	cat = table_open(kc_catalog_oid(), RowExclusiveLock);
-	Datum		v[Natts_kc_stripe];
-	bool		n[Natts_kc_stripe];
-	bytea	   *cp;
-	bytea	   *cs;
-	HeapTuple	tup;
-
-	kc_catalog_check_shape(cat);
-	cp = palloc(VARHDRSZ + cid_len);
-	SET_VARSIZE(cp, VARHDRSZ + cid_len);
-	memcpy(VARDATA(cp), cid_points, cid_len);
-	cs = palloc(VARHDRSZ + stats_len);
-	SET_VARSIZE(cs, VARHDRSZ + stats_len);
-	memcpy(VARDATA(cs), col_stats, stats_len);
-
-	memset(n, 0, sizeof(n));
+	memset(n, 0, sizeof(bool) * Natts_kc_stripe);
 	v[Anum_kc_uid - 1] = Int64GetDatum((int64) kc_rel_ident(rel)->uid);
 	v[Anum_kc_stripe_id - 1] = Int64GetDatum((int64) si->stripe_id);
 	v[Anum_kc_first_row - 1] = Int64GetDatum((int64) si->first_row);
@@ -837,6 +899,192 @@ kc_catalog_insert(Relation rel, const KcStripeInfo *si, const char *cid_points,
 	v[Anum_kc_cid_points - 1] = PointerGetDatum(cp);
 	v[Anum_kc_col_stats - 1] = PointerGetDatum(cs);
 	v[Anum_kc_maintenance - 1] = BoolGetDatum(maintenance);
+	v[Anum_kc_reserved - 1] = BoolGetDatum(reserved);
+}
+
+static bytea *
+kc_make_bytea(const char *data, int len)
+{
+	bytea	   *b = palloc(VARHDRSZ + len);
+
+	SET_VARSIZE(b, VARHDRSZ + len);
+	if (len > 0)
+		memcpy(VARDATA(b), data, len);
+	return b;
+}
+
+/*
+ * The reserved row of a stripe that is about to be written (design 7.8,
+ * 5.4): inserted when the first row goes into a buffer that reserves, by the
+ * transaction (or subtransaction) that inserts that row, with the numbers it
+ * claims in first_row and row_count and nothing else yet.  Readers skip it;
+ * the transaction's flush replaces it with the stripe's row
+ * (kc_catalog_update_reserved), and the heap rules decide what is left of it:
+ * a transaction that aborts, or a backend that dies, leaves a row nobody sees.
+ * The row's place is not kept: the writer holds no lock on the catalog between
+ * the insert and its flush, so a VACUUM FULL or CLUSTER of the catalog may move
+ * the row meanwhile, and the flush finds it again by its key (kc_find_reserved).
+ */
+void
+kc_catalog_insert_reserved(Relation rel, const KcStripeInfo *si)
+{
+	Relation	cat = table_open(kc_catalog_oid(), RowExclusiveLock);
+	Datum		v[Natts_kc_stripe];
+	bool		n[Natts_kc_stripe];
+	bytea	   *cp = kc_make_bytea(NULL, 0);
+	bytea	   *cs = kc_make_bytea(NULL, 0);
+	HeapTuple	tup;
+
+	if (kc_catalog_check_shape(cat) != Natts_kc_stripe)
+		elog(ERROR, "cannot reserve row numbers: the stripe catalog is not the one of version 0.2");
+	kc_catalog_values(rel, si, cp, cs, false, true, v, n);
+	tup = heap_form_tuple(RelationGetDescr(cat), v, n);
+	CatalogTupleInsert(cat, tup);
+	heap_freetuple(tup);
+	pfree(cp);
+	pfree(cs);
+	table_close(cat, RowExclusiveLock);
+}
+
+/*
+ * The place of the reserved row of this stripe, found by its key: the version
+ * that is reserved, was inserted by this transaction or one of its subtransactions
+ * (committed into it or running) and that nothing of ours has deleted or updated
+ * (a deletion or update by a transaction that aborted does not count).  An
+ * error if there is none: the writer says it holds a reservation, and it does.
+ */
+static void
+kc_find_reserved(Relation cat, uint64 uid, uint64 stripe_id, ItemPointer tid)
+{
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	HeapTuple	tup;
+	bool		found = false;
+
+	ScanKeyInit(&key[0], Anum_kc_uid, BTEqualStrategyNumber, F_INT8EQ,
+				Int64GetDatum((int64) uid));
+	ScanKeyInit(&key[1], Anum_kc_stripe_id, BTEqualStrategyNumber, F_INT8EQ,
+				Int64GetDatum((int64) stripe_id));
+	scan = systable_beginscan(cat, kc_catalog_index_oid(), true, SnapshotAny, 2, key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		HeapTupleHeader th = tup->t_data;
+
+		if (!kc_tuple_is_reserved(cat, tup) || (th->t_infomask & HEAP_XMIN_INVALID) ||
+			!TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetRawXmin(th)))
+			continue;
+		if (!(th->t_infomask & HEAP_XMAX_INVALID) &&
+			!HEAP_XMAX_IS_LOCKED_ONLY(th->t_infomask))
+		{
+			TransactionId xmax = HeapTupleHeaderGetUpdateXid(th);
+
+			if (TransactionIdIsCurrentTransactionId(xmax) ||
+				TransactionIdIsInProgress(xmax) || TransactionIdDidCommit(xmax))
+				continue;
+		}
+		*tid = tup->t_self;
+		found = true;
+		break;
+	}
+	systable_endscan(scan);
+	if (!found)
+		elog(ERROR, "the reserved stripe row " UINT64_FORMAT " of this transaction is missing from the stripe catalog",
+			 stripe_id);
+}
+
+/*
+ * Replace a reserved row by the stripe's row: the same key, the real counts,
+ * place and statistics, no longer reserved.  The reserved row was inserted by
+ * this transaction or one of its committed subtransactions, so the update is
+ * ours to make; the caller has made the command counter pass the command that
+ * inserted it (an update of a row of the same command is "invisible" to
+ * heap_update).
+ */
+void
+kc_catalog_update_reserved(Relation rel, const KcStripeInfo *si,
+						   const char *cid_points, int cid_len,
+						   const char *col_stats, int stats_len)
+{
+	Relation	cat = table_open(kc_catalog_oid(), RowExclusiveLock);
+	Datum		v[Natts_kc_stripe];
+	bool		n[Natts_kc_stripe];
+	bytea	   *cp = kc_make_bytea(cid_points, cid_len);
+	bytea	   *cs = kc_make_bytea(col_stats, stats_len);
+	HeapTuple	tup;
+	ItemPointerData tid;
+
+	if (kc_catalog_check_shape(cat) != Natts_kc_stripe)
+		elog(ERROR, "cannot update a reserved row: the stripe catalog is not the one of version 0.2");
+	kc_find_reserved(cat, kc_rel_ident(rel)->uid, si->stripe_id, &tid);
+	kc_catalog_values(rel, si, cp, cs, false, false, v, n);
+	tup = heap_form_tuple(RelationGetDescr(cat), v, n);
+	CatalogTupleUpdate(cat, &tid, tup);
+	heap_freetuple(tup);
+	pfree(cp);
+	pfree(cs);
+	table_close(cat, RowExclusiveLock);
+}
+
+/* Delete the reserved row of a reservation that is given up (no row went in). */
+void
+kc_catalog_delete_reserved(Relation rel, uint64 stripe_id)
+{
+	Relation	cat = table_open(kc_catalog_oid(), RowExclusiveLock);
+	ItemPointerData tid;
+
+	kc_find_reserved(cat, kc_rel_ident(rel)->uid, stripe_id, &tid);
+	CatalogTupleDelete(cat, &tid);
+	table_close(cat, RowExclusiveLock);
+}
+
+/*
+ * The reserved rows of rel that this snapshot sees and that belong to no
+ * transaction of this backend: such a row survives only if the transaction that
+ * inserted it committed without writing the stripe, which no code path does.
+ * Rows of transactions in progress are not seen by the snapshot (the check's is
+ * one of everything committed), and those of this backend are its own writers'
+ * live claims.
+ */
+int
+kc_catalog_count_reserved(Relation rel, Snapshot snap)
+{
+	Relation	cat = table_open(kc_catalog_oid(), AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	int			n = 0;
+
+	ScanKeyInit(&key, Anum_kc_uid, BTEqualStrategyNumber, F_INT8EQ,
+				Int64GetDatum((int64) kc_rel_ident(rel)->uid));
+	scan = systable_beginscan(cat, kc_catalog_index_oid(), true, SnapshotAny, 1, &key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		if (!kc_tuple_visible(tup, snap, NULL) || !kc_tuple_is_reserved(cat, tup) ||
+			TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetXmin(tup->t_data)))
+			continue;
+		n++;
+	}
+	systable_endscan(scan);
+	table_close(cat, AccessShareLock);
+	return n;
+}
+
+void
+kc_catalog_insert(Relation rel, const KcStripeInfo *si, const char *cid_points,
+				  int cid_len, const char *col_stats, int stats_len, bool frozen,
+				  bool maintenance)
+{
+	Relation	cat = table_open(kc_catalog_oid(), RowExclusiveLock);
+	Datum		v[Natts_kc_stripe];
+	bool		n[Natts_kc_stripe];
+	bytea	   *cp;
+	bytea	   *cs;
+	HeapTuple	tup;
+
+	kc_catalog_check_shape(cat);
+	cp = kc_make_bytea(cid_points, cid_len);
+	cs = kc_make_bytea(col_stats, stats_len);
+	kc_catalog_values(rel, si, cp, cs, maintenance, false, v, n);
 
 	tup = heap_form_tuple(RelationGetDescr(cat), v, n);
 	if (!frozen)
@@ -1595,4 +1843,296 @@ kc_catalog_uid_in_use(uint64 uid)
 	systable_endscan(scan);
 	table_close(cat, AccessShareLock);
 	return used;
+}
+
+/* ------------------------------------------------------------------------
+ * Who holds a row number (uniqueness, C6c) and which numbers are live (index vacuum)
+ * ------------------------------------------------------------------------
+ */
+
+/* What one version of a stripe catalog row says about its writer. */
+typedef enum KcVer
+{
+	KC_VER_DEAD,				/* aborted, or replaced/deleted: holds nothing */
+	KC_VER_OWN,					/* written by this transaction or one of its subtransactions */
+	KC_VER_COMMITTED,
+	KC_VER_RUNNING				/* a transaction in progress, a prepared one included */
+} KcVer;
+
+static KcVer
+kc_version_status(HeapTupleHeader th, TransactionId *xmin_out)
+{
+	TransactionId xmin = HeapTupleHeaderGetRawXmin(th);
+
+	*xmin_out = InvalidTransactionId;
+	if (HeapTupleHeaderXminFrozen(th))
+		return KC_VER_COMMITTED;
+	if (th->t_infomask & HEAP_XMIN_INVALID)
+		return KC_VER_DEAD;
+	if (TransactionIdIsCurrentTransactionId(xmin))
+		return KC_VER_OWN;
+	if (TransactionIdIsInProgress(xmin))
+	{
+		*xmin_out = xmin;
+		return KC_VER_RUNNING;
+	}
+	if ((th->t_infomask & HEAP_XMIN_COMMITTED) || TransactionIdDidCommit(xmin))
+		return KC_VER_COMMITTED;
+	return KC_VER_DEAD;
+}
+
+/* Has this version been replaced or deleted (by anyone, whatever became of that)? */
+static bool
+kc_version_superseded(HeapTupleHeader th)
+{
+	return !(th->t_infomask & HEAP_XMAX_INVALID) && !HEAP_XMAX_IS_LOCKED_ONLY(th->t_infomask);
+}
+
+/*
+ * Does this version hold nothing for a unique check, by what became of its replacement or
+ * deletion?  A reserved row is replaced by the stripe row of its own writer, which covers only
+ * the rows the stripe has: whatever the replacer's state, the reserved row holds nothing
+ * (its numbers beyond the stripe may be reserved again by another writer).  A stripe row that
+ * a transaction deleted (compaction replaces stripes with copies that have new numbers) holds
+ * nothing once the deleter is this transaction or has committed; while the deleter runs, and
+ * if it aborted, the rows are still the table's rows.
+ */
+static bool
+kc_version_gone(Relation cat, HeapTuple tup)
+{
+	HeapTupleHeader th = tup->t_data;
+	TransactionId xmax;
+
+	if (!kc_version_superseded(th))
+		return false;
+	if (kc_tuple_is_reserved(cat, tup))
+		return true;
+	xmax = HeapTupleHeaderGetUpdateXid(th);
+	if (TransactionIdIsCurrentTransactionId(xmax))
+		return true;
+	if (TransactionIdIsInProgress(xmax))
+		return false;
+	return TransactionIdDidCommit(xmax);
+}
+
+/*
+ * The state of one row number of rel for a dirty read (a unique index asks, with
+ * SnapshotDirty): KC_ROW_NONE (no row: nobody holds it, or its writer aborted),
+ * KC_ROW_FOUND (a row that is committed or this transaction's own), or KC_ROW_WAIT
+ * (the row belongs to a transaction in progress, *xwait): the caller waits for it
+ * and asks again.  The answer comes from the stripe catalog alone, with its own
+ * visibility rules (a stripe is its catalog row, the claim of a writer is its
+ * reserved row), so a row that is only in the memory of another backend is found by
+ * the claim.  A version that was replaced (a reserved row by its stripe's row, which
+ * covers only the rows the stripe has) holds nothing: its numbers beyond the stripe
+ * may be reserved again by another writer after the tail was given back.
+ */
+KcRowState
+kc_catalog_probe_row(Relation rel, uint64 row, TransactionId *xwait)
+{
+	Relation	cat = table_open(kc_catalog_oid(), AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	KcRowState	res = KC_ROW_NONE;
+
+	*xwait = InvalidTransactionId;
+	ScanKeyInit(&key, Anum_kc_uid, BTEqualStrategyNumber, F_INT8EQ,
+				Int64GetDatum((int64) kc_rel_ident(rel)->uid));
+	scan = systable_beginscan(cat, kc_catalog_index_oid(), true, SnapshotAny, 1, &key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		bool		isnull;
+		uint64		first = (uint64) DatumGetInt64(heap_getattr(tup, Anum_kc_first_row,
+																  RelationGetDescr(cat), &isnull));
+		uint32		cnt = (uint32) DatumGetInt32(heap_getattr(tup, Anum_kc_row_count,
+															  RelationGetDescr(cat), &isnull));
+		TransactionId x;
+		KcVer		v;
+
+		if (row < first || row - first >= cnt)
+			continue;
+		if (kc_version_gone(cat, tup))
+			continue;
+		v = kc_version_status(tup->t_data, &x);
+		if (v == KC_VER_OWN || v == KC_VER_COMMITTED)
+		{
+			res = KC_ROW_FOUND;
+			break;
+		}
+		if (v == KC_VER_RUNNING && res == KC_ROW_NONE)
+		{
+			res = KC_ROW_WAIT;
+			*xwait = x;
+		}
+	}
+	systable_endscan(scan);
+	table_close(cat, AccessShareLock);
+	return res;
+}
+
+static int
+kc_range_cmp(const void *a, const void *b)
+{
+	const KcRowRange *x = a;
+	const KcRowRange *y = b;
+
+	return (x->first > y->first) - (x->first < y->first);
+}
+
+/*
+ * The row numbers an index entry may still need (index vacuum): the ranges of
+ * every stripe row version whose writer did not abort, except versions deleted by a
+ * transaction that committed before the oldest transaction any snapshot may still
+ * have, merged into disjoint ranges sorted by their first number.  *low is the
+ * number below which the answer holds: a number at or above it is never to be
+ * deleted (the claims of writers in progress and every number the metapage may hand
+ * out from now on).  The caller holds the reservation lock (kc_reserve_lock), which
+ * keeps the metapage and the catalog in step: no writer is between taking numbers and
+ * inserting its row for them.
+ */
+KcRowRange *
+kc_catalog_live_ranges(Relation rel, TransactionId oldest, uint64 next_row,
+					   int *n_out, uint64 *low)
+{
+	Relation	cat = table_open(kc_catalog_oid(), AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	KcRowRange *r = NULL;
+	int			n = 0;
+	int			cap = 0;
+	int			i;
+	int			m;
+
+	*low = next_row;
+	ScanKeyInit(&key, Anum_kc_uid, BTEqualStrategyNumber, F_INT8EQ,
+				Int64GetDatum((int64) kc_rel_ident(rel)->uid));
+	scan = systable_beginscan(cat, kc_catalog_index_oid(), true, SnapshotAny, 1, &key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		bool		isnull;
+		uint64		first = (uint64) DatumGetInt64(heap_getattr(tup, Anum_kc_first_row,
+																  RelationGetDescr(cat), &isnull));
+		uint32		cnt = (uint32) DatumGetInt32(heap_getattr(tup, Anum_kc_row_count,
+															  RelationGetDescr(cat), &isnull));
+		HeapTupleHeader th = tup->t_data;
+		TransactionId x;
+		KcVer		v = kc_version_status(th, &x);
+
+		if (v == KC_VER_DEAD)
+			continue;
+		if (v == KC_VER_RUNNING || v == KC_VER_OWN)
+			*low = Min(*low, first);
+		if (kc_version_superseded(th))
+		{
+			TransactionId xmax = HeapTupleHeaderGetUpdateXid(th);
+
+			if (!TransactionIdIsCurrentTransactionId(xmax) && !TransactionIdIsInProgress(xmax) &&
+				TransactionIdDidCommit(xmax) && TransactionIdPrecedes(xmax, oldest))
+				continue;
+		}
+		if (n == cap)
+		{
+			cap = cap ? cap * 2 : 64;
+			r = r ? repalloc(r, sizeof(KcRowRange) * cap) : palloc(sizeof(KcRowRange) * cap);
+		}
+		r[n].first = first;
+		r[n].end = first + cnt;
+		n++;
+	}
+	systable_endscan(scan);
+	table_close(cat, AccessShareLock);
+
+	if (n > 1)
+		qsort(r, n, sizeof(KcRowRange), kc_range_cmp);
+	/* merge into disjoint ranges */
+	m = 0;
+	for (i = 0; i < n; i++)
+	{
+		if (m > 0 && r[i].first <= r[m - 1].end)
+			r[m - 1].end = Max(r[m - 1].end, r[i].end);
+		else
+			r[m++] = r[i];
+	}
+	*n_out = m;
+	return r;
+}
+
+/*
+ * The blocks of the file that some stripe row version still needs (increment C8), as disjoint
+ * ranges [first, end) sorted by their first block: the blocks of every version of this table's
+ * stripes whose writer did not abort, except versions deleted by a transaction that committed
+ * before the oldest transaction any snapshot may still have (compaction's old stripes, once
+ * nobody can see them).  A version with no blocks (a reserved row) needs none.  Everything else
+ * in the file, past the metapage, is free, provided no writer is running (the caller's lock
+ * sees to that).  *horizon is the newest transaction among those deleters, which a standby
+ * query may still hold: the record that lists the blocks cancels it.
+ */
+KcRowRange *
+kc_catalog_live_blocks(Relation rel, TransactionId oldest, int *n_out, TransactionId *horizon)
+{
+	Relation	cat = table_open(kc_catalog_oid(), AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	KcRowRange *r = NULL;
+	int			n = 0;
+	int			cap = 0;
+	int			i;
+	int			m;
+
+	*horizon = InvalidTransactionId;
+	ScanKeyInit(&key, Anum_kc_uid, BTEqualStrategyNumber, F_INT8EQ,
+				Int64GetDatum((int64) kc_rel_ident(rel)->uid));
+	scan = systable_beginscan(cat, kc_catalog_index_oid(), true, SnapshotAny, 1, &key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		bool		isnull;
+		uint64		first = (uint64) DatumGetInt64(heap_getattr(tup, Anum_kc_first_block,
+																  RelationGetDescr(cat), &isnull));
+		uint32		cnt = (uint32) DatumGetInt32(heap_getattr(tup, Anum_kc_block_count,
+															  RelationGetDescr(cat), &isnull));
+		HeapTupleHeader th = tup->t_data;
+		TransactionId x;
+		KcVer		v = kc_version_status(th, &x);
+
+		if (v == KC_VER_DEAD || cnt == 0)
+			continue;
+		if (kc_version_superseded(th))
+		{
+			TransactionId xmax = HeapTupleHeaderGetUpdateXid(th);
+
+			if (!TransactionIdIsCurrentTransactionId(xmax) && !TransactionIdIsInProgress(xmax) &&
+				TransactionIdDidCommit(xmax) && TransactionIdPrecedes(xmax, oldest))
+			{
+				if (!TransactionIdIsValid(*horizon) || TransactionIdFollows(xmax, *horizon))
+					*horizon = xmax;
+				continue;
+			}
+		}
+		if (n == cap)
+		{
+			cap = cap ? cap * 2 : 64;
+			r = r ? repalloc(r, sizeof(KcRowRange) * cap) : palloc(sizeof(KcRowRange) * cap);
+		}
+		r[n].first = first;
+		r[n].end = first + cnt;
+		n++;
+	}
+	systable_endscan(scan);
+	table_close(cat, AccessShareLock);
+
+	if (n > 1)
+		qsort(r, n, sizeof(KcRowRange), kc_range_cmp);
+	m = 0;
+	for (i = 0; i < n; i++)
+	{
+		if (m > 0 && r[i].first <= r[m - 1].end)
+			r[m - 1].end = Max(r[m - 1].end, r[i].end);
+		else
+			r[m++] = r[i];
+	}
+	*n_out = m;
+	return r;
 }

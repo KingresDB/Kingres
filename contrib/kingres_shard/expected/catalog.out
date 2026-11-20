@@ -4,12 +4,13 @@ SELECT c.relname
   FROM pg_class c
   WHERE c.relnamespace = 'kingres'::regnamespace AND c.relkind = 'r'
   ORDER BY 1;
-     relname     
------------------
+       relname        
+----------------------
  bucket_map
  bucket_move
  cluster_secret
  colocation
+ dist_partition
  dist_table
  dtx_applied
  dtx_epoch
@@ -21,41 +22,58 @@ SELECT c.relname
  move_marker
  node
  pending_node
-(15 rows)
+ table_old_copy
+ table_operation
+ table_operation_item
+ table_operation_lock
+(20 rows)
 
 SELECT conrelid::regclass AS tbl, conname, contype
   FROM pg_constraint
   WHERE connamespace = 'kingres'::regnamespace AND contype <> 'n'
   ORDER BY 1::text, 2;
-       tbl       |            conname            | contype 
------------------+-------------------------------+---------
- bucket_map      | bucket_map_bucket_check       | c
- bucket_map      | bucket_map_colocation_id_fkey | f
- bucket_map      | bucket_map_group_id_check     | c
- bucket_map      | bucket_map_pkey               | p
- bucket_map      | bucket_map_state_check        | c
- bucket_move     | bucket_move_groups_check      | c
- bucket_move     | bucket_move_phase_check       | c
- bucket_move     | bucket_move_pkey              | p
- cluster_secret  | cluster_secret_length_check   | c
- colocation      | colocation_bucket_count_check | c
- colocation      | colocation_pkey               | p
- dist_table      | dist_table_colocation_id_fkey | f
- dist_table      | dist_table_method_check       | c
- dist_table      | dist_table_pkey               | p
- dist_table      | dist_table_shape_check        | c
- dtx_applied     | dtx_applied_pkey              | p
- dtx_incident    | dtx_incident_pkey             | p
- dtx_log         | dtx_log_pkey                  | p
- dtx_unconfirmed | dtx_unconfirmed_pkey          | p
- move_marker     | move_marker_pkey              | p
- node            | node_group_id_check           | c
- node            | node_host_port_key            | u
- node            | node_pkey                     | p
- node            | node_port_check               | c
- node            | node_role_check               | c
- pending_node    | pending_node_pkey             | p
-(26 rows)
+         tbl          |             conname             | contype 
+----------------------+---------------------------------+---------
+ bucket_map           | bucket_map_bucket_check         | c
+ bucket_map           | bucket_map_colocation_id_fkey   | f
+ bucket_map           | bucket_map_group_id_check       | c
+ bucket_map           | bucket_map_pkey                 | p
+ bucket_map           | bucket_map_state_check          | c
+ bucket_move          | bucket_move_groups_check        | c
+ bucket_move          | bucket_move_phase_check         | c
+ bucket_move          | bucket_move_pkey                | p
+ cluster_secret       | cluster_secret_length_check     | c
+ colocation           | colocation_bucket_count_check   | c
+ colocation           | colocation_pkey                 | p
+ dist_partition       | dist_partition_parent_fkey      | f
+ dist_partition       | dist_partition_pkey             | p
+ dist_table           | dist_table_colocation_id_fkey   | f
+ dist_table           | dist_table_method_check         | c
+ dist_table           | dist_table_partition_check      | c
+ dist_table           | dist_table_pkey                 | p
+ dist_table           | dist_table_shape_check          | c
+ dtx_applied          | dtx_applied_pkey                | p
+ dtx_incident         | dtx_incident_pkey               | p
+ dtx_log              | dtx_log_pkey                    | p
+ dtx_unconfirmed      | dtx_unconfirmed_pkey            | p
+ move_marker          | move_marker_pkey                | p
+ node                 | node_group_id_check             | c
+ node                 | node_host_port_key              | u
+ node                 | node_pkey                       | p
+ node                 | node_port_check                 | c
+ node                 | node_role_check                 | c
+ pending_node         | pending_node_pkey               | p
+ table_old_copy       | table_old_copy_pkey             | p
+ table_operation_item | table_operation_item_op_id_fkey | f
+ table_operation_item | table_operation_item_pkey       | p
+ table_operation      | table_operation_kind_check      | c
+ table_operation_lock | table_operation_lock_op_id_fkey | f
+ table_operation_lock | table_operation_lock_pkey       | p
+ table_operation      | table_operation_mode_check      | c
+ table_operation      | table_operation_phase_check     | c
+ table_operation      | table_operation_pkey            | p
+ table_operation      | table_operation_verified_check  | c
+(39 rows)
 
 -- Nothing is created outside the kingres schema.
 SELECT count(*) AS tables_outside_kingres
@@ -154,7 +172,7 @@ ERROR:  new row for relation "bucket_map" violates check constraint "bucket_map_
 DETAIL:  Failing row contains (1, 20, 0, broken).
 INSERT INTO kingres.dist_table VALUES ('pg_class'::regclass, 'range', 'oid', 1);
 ERROR:  new row for relation "dist_table" violates check constraint "dist_table_method_check"
-DETAIL:  Failing row contains (pg_class, range, oid, 1).
+DETAIL:  Failing row contains (pg_class, range, oid, 1, null, null).
 INSERT INTO kingres.dist_table VALUES ('pg_class'::regclass, 'hash', 'oid', 9);
 ERROR:  insert or update on table "dist_table" violates foreign key constraint "dist_table_colocation_id_fkey"
 DETAIL:  Key (colocation_id)=(9) is not present in table "colocation".
@@ -192,6 +210,11 @@ SELECT name, setting, unit, context
  kingres_shard.enable_colocated_insert_select | on      |      | user
  kingres_shard.enable_copy_routing            | on      |      | user
  kingres_shard.enable_distributed_scan        | on      |      | user
+ kingres_shard.enable_partial_aggregation     | on      |      | user
+ kingres_shard.enable_pushdown                | on      |      | user
+ kingres_shard.enable_pushdown_closed         | on      |      | user
+ kingres_shard.enable_pushdown_join           | on      |      | user
+ kingres_shard.enable_pushdown_sort           | on      |      | user
  kingres_shard.enable_routing                 | on      |      | superuser
  kingres_shard.fault_injection                |         |      | superuser
  kingres_shard.forwarded                      | off     |      | backend
@@ -204,9 +227,17 @@ SELECT name, setting, unit, context
  kingres_shard.node_connect_timeout           | 5       | s    | user
  kingres_shard.node_conninfo                  |         |      | sighup
  kingres_shard.node_timeout                   | 60      | s    | user
+ kingres_shard.rebuild_batch_rows             | 10000   |      | user
+ kingres_shard.rebuild_drain_threshold        | 1000    |      | user
+ kingres_shard.rebuild_lock_timeout           | 200     | ms   | user
+ kingres_shard.rebuild_switch_max_attempts    | 30      |      | user
+ kingres_shard.rebuild_switch_timeout         | 10000   | ms   | user
+ kingres_shard.rebuild_verify                 | on      |      | user
  kingres_shard.recovery_interval              | 0       | s    | sighup
  kingres_shard.scan_fetch_size                | 1000    |      | user
-(23 rows)
+ kingres_shard.shippable_extensions           | all     |      | user
+ kingres_shard.table_cleanup_delay            | 600     | s    | user
+(36 rows)
 
 SET kingres_shard.default_bucket_count = 0;
 ERROR:  0 is outside the valid range for parameter "kingres_shard.default_bucket_count" (1 .. 4096)

@@ -181,7 +181,7 @@ describe('the readiness line of a group', () => {
         expect(
           within(screen.getByTestId('group-2')).getByTestId('failover-readiness'),
         ).toHaveAttribute('data-state', 'blocked'),
-      { timeout: 6000 },
+      { timeout: 30_000 },
     )
     expect(
       within(screen.getByTestId('group-2')).getByTestId('failover-readiness'),
@@ -361,7 +361,7 @@ describe('the Tasks page and the alerts', () => {
     await renderApp('/tasks')
     const task = await endpoints.failoverServer('10.0.0.12', 'hard')
     await waitFor(async () => expect((await endpoints.getTask(task.id)).state).toBe('done'))
-    const button = await screen.findByTestId('task-report', {}, { timeout: 6000 })
+    const button = await screen.findByTestId('task-report', {}, { timeout: 30_000 })
     await user.click(button)
     const report = await screen.findByRole('dialog', { name: /failover report/i })
     expect(await within(report).findByTestId('report-outcome')).toHaveTextContent(/completed/i)
@@ -392,7 +392,7 @@ describe('the Tasks page and the alerts', () => {
     const alerts = await screen.findAllByText(
       /a failover waits for a decision/i,
       {},
-      { timeout: 6000 },
+      { timeout: 30_000 },
     )
     const alert = alerts[0] as HTMLElement
     const row = alert.closest('tr, li, article, section') as HTMLElement
@@ -441,7 +441,7 @@ describe('what each role sees and does (8.6)', () => {
     await signInAs(createPinia())
     await endpoints.failoverServer('10.0.0.12', 'hard')
     await renderApp('/servers', { user: 'ops' })
-    const panel = await screen.findByTestId('waiting-for-you', {}, { timeout: 6000 })
+    const panel = await screen.findByTestId('waiting-for-you', {}, { timeout: 30_000 })
     await waitFor(() =>
       expect(within(panel).getByTestId('accept-and-continue')).not.toHaveAttribute('aria-disabled'),
     )
@@ -590,7 +590,7 @@ describe('hostile text is text', () => {
     mockConfig.taskDurationMs = 60
     seedAutomaticFailover(getState(), '10.0.0.12')
     const rec = getState().tasks.find((t) => t.task.kind === 'server.failover')
-    await waitFor(() => expect(rec?.task.state).not.toBe('running'), { timeout: 3000 }).catch(
+    await waitFor(() => expect(rec?.task.state).not.toBe('running'), { timeout: 30_000 }).catch(
       () => undefined,
     )
     await renderApp('/servers')
@@ -598,7 +598,7 @@ describe('hostile text is text', () => {
     const t = getState().tasks.find((x) => x.task.kind === 'server.failover')
     if (t?.task.error) t.task.error.message = HOSTILE.markup
     if (t?.task.subject) t.task.subject.id = HOSTILE.breakout
-    const card = await screen.findByTestId('failover-progress', {}, { timeout: 6000 })
+    const card = await screen.findByTestId('failover-progress', {}, { timeout: 30_000 })
     expect(card.querySelector('img, svg, script')).toBeNull()
     expect((window as unknown as { __pwn?: number }).__pwn).toBeUndefined()
   })

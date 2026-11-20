@@ -400,7 +400,7 @@ CREATE SCHEMA sx
   CREATE TABLE cfk (a int REFERENCES pk1) USING columnar;
 ERROR:  foreign keys on or to columnar tables are not supported
 HINT:  Keep the referencing and the referenced table in row storage.
-CONTEXT:  PL/pgSQL function columnar_check_ddl() line 48 at RAISE
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 52 at RAISE
 SELECT count(*) FROM pg_class WHERE relname IN ('pk1', 'cfk');
  count 
 -------
@@ -412,7 +412,7 @@ CREATE SCHEMA sy
   CREATE TRIGGER tg AFTER INSERT ON ty FOR EACH ROW EXECUTE FUNCTION suppress_redundant_updates_trigger();
 ERROR:  row-level AFTER triggers on columnar tables are not supported
 HINT:  Use a BEFORE ROW or a statement-level trigger, or keep the table in row storage.
-CONTEXT:  PL/pgSQL function columnar_check_ddl() line 55 at RAISE
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 59 at RAISE
 SELECT count(*) FROM pg_class WHERE relname = 'ty';
  count 
 -------
@@ -431,45 +431,35 @@ SELECT count(*) FROM sz.tz;
 (1 row)
 
 DROP SCHEMA sz CASCADE;
--- C1-10: columnar tables are not published (the wal_level warning differs by major)
+-- C1-10 and C7: columnar tables can be published (their rows are decoded); a publication that
+-- would include the stripe catalog (all tables, the schema kingres) is refused while a columnar
+-- table exists (the wal_level warning differs by major)
 SET client_min_messages = error;
 CREATE TABLE pub_h (a int);
 CREATE TABLE pub_c (a int) USING columnar;
 CREATE PUBLICATION pub1 FOR TABLE pub_h;
 ALTER PUBLICATION pub1 ADD TABLE pub_c;
-ERROR:  columnar tables are not replicated logically yet: the publication would include a columnar table
-HINT:  Leave columnar tables out of publications.
-CONTEXT:  PL/pgSQL function columnar_check_ddl() line 94 at RAISE
 CREATE PUBLICATION pub2 FOR TABLE pub_c;
-ERROR:  columnar tables are not replicated logically yet: the publication would include a columnar table
-HINT:  Leave columnar tables out of publications.
-CONTEXT:  PL/pgSQL function columnar_check_ddl() line 94 at RAISE
 CREATE PUBLICATION pub3 FOR ALL TABLES;
-ERROR:  columnar tables are not replicated logically yet: the publication would include a columnar table
-HINT:  Leave columnar tables out of publications.
-CONTEXT:  PL/pgSQL function columnar_check_ddl() line 94 at RAISE
--- with a publication in place, a columnar table cannot join it
+ERROR:  a publication would include the stripe catalog of kingres_columnar, kingres.columnar_stripe
+HINT:  List the tables to publish (CREATE PUBLICATION ... FOR TABLE ...) instead of publishing all tables or the schema kingres.
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 88 at RAISE
+CREATE PUBLICATION pub3b FOR TABLES IN SCHEMA kingres;
+ERROR:  a publication would include the stripe catalog of kingres_columnar, kingres.columnar_stripe
+HINT:  List the tables to publish (CREATE PUBLICATION ... FOR TABLE ...) instead of publishing all tables or the schema kingres.
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 88 at RAISE
+-- with listed publications in place, columnar tables can be made and altered
 CREATE TABLE pub_c2 (a int) USING columnar;
 CREATE TABLE pub_h2 (a int);
 ALTER TABLE pub_h2 SET ACCESS METHOD columnar;
 DROP PUBLICATION pub1;
 CREATE PUBLICATION pub4 FOR TABLES IN SCHEMA public;
-ERROR:  columnar tables are not replicated logically yet: the publication would include a columnar table
-HINT:  Leave columnar tables out of publications.
-CONTEXT:  PL/pgSQL function columnar_check_ddl() line 94 at RAISE
 DROP PUBLICATION pub4;
-ERROR:  publication "pub4" does not exist
 CREATE SCHEMA pubs;
 CREATE PUBLICATION pub5 FOR TABLES IN SCHEMA pubs;
 CREATE TABLE pubs.c1 (a int) USING columnar;
-ERROR:  columnar tables are not replicated logically yet: a publication would include a columnar table
-HINT:  Keep tables that are published in row storage, or leave the columnar table out of the publication.
-CONTEXT:  PL/pgSQL function columnar_check_ddl() line 71 at RAISE
 CREATE TABLE pubs.h1 (a int);
 ALTER TABLE pubs.h1 SET ACCESS METHOD columnar;
-ERROR:  columnar tables are not replicated logically yet: a publication would include a columnar table
-HINT:  Keep tables that are published in row storage, or leave the columnar table out of the publication.
-CONTEXT:  PL/pgSQL function columnar_check_ddl() line 71 at RAISE
 DROP PUBLICATION pub5;
 DROP SCHEMA pubs CASCADE;
 -- clean up
