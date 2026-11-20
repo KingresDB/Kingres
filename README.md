@@ -21,7 +21,9 @@ is built for PostgreSQL 18 (this branch) and for PostgreSQL 19 (branch
 contain every phase of the roadmap except phase 8, which is future roadmap.
 Sharding, the ledger and its verifier, the control plane and the console are
 built; query pushdown, table lifecycle, high availability, signing and
-anchoring of the ledger, and analytics are still in progress.  Many parts have
+anchoring of the ledger, and analytics are still in progress; elasticity
+(phase 10) and distributed schemas (phase 11) are designed and not built yet.
+Many parts have
 been independently reviewed and their findings fixed; some fixes have not been
 reviewed again, and some findings are open.  In particular, failover must not
 be relied on yet, and nothing should be treated as anchored outside the
