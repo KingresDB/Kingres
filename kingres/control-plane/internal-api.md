@@ -432,6 +432,22 @@ could not be attached to the promoted instance, so that the step hands the lease
 (the system database when absent): every database has a catalog of its own. `GET /failover/state` adds `enforced` (the lease manager of the
 server would stop a primary of the group whose lease lapsed: it does so only when its plan says the group has a standby).
 
+Changes of the fixes for the review of increments 4 to 7 (F4-01 to F4-17, 2026-11-20 and 2026-11-21), all inside internal API version "1":
+- `quiesce`, `mark` and `verify` need the fence header of a task run (`400 bad_request` without it, as `demote` and `promote`); `unquiesce` and `resume` do not
+  (the repair loop that undoes a switchover left behind has no run), so they carry the catalog term instead.
+- `expectedTerm` is carried by `quiesce`, `unquiesce`, `resume`, `mark`, `demote` with `mode: fast` and `lease`; the callee answers `409 stale_term` when it has
+  seen a newer term. `mark` and the clean stop need the term: a callee that runs the primary and cannot read its term refuses (`503 unavailable`).
+- `demote` has `mode: fast` (the clean stop of a switchover: `{stopped, transferred, released, checkpoint, clusterState}`; repeated, it reads the checkpoint of the
+  stopped instance again) as well as `immediate`. `promote` carries `checkpoint` and `clusterState` of a switchover: the callee runs `switchover_verify` before
+  `pg_promote` and refuses with `409 unprovable` or `409 standby_behind`.
+- `quiesce` answers `{quiesced, remaining}` (the sessions that are not the service role's and are still open), ends sessions on the local socket as well, and
+  waits until the postmaster has loaded the hold rules (`pg_conf_load_time()`). The hold is the hold rules on disk (`pg_hba.conf.kingres-quiesced` keeps the
+  previous file), so `GET /failover/state` says `quiesced` after a restart of kingresd.
+- `POST /failover/map/start`: a call that came from a member is always handled as manual (the candidate monitor starts an automatic bootstrap on its own
+  server). A start for an old server that the candidate hears is refused: `409 conflict` for an automatic one, `422 unsupported_operation` for a manual one,
+  until the map group with a live old leader is built (README, "A failover, a switchover or a restore that involves the map group"). `POST /failover/map/continue`
+  is accepted only from a server that hosts a ready standby of the map group and only for a journal cut at B4.
+
 ### The ledger keys (ledger phase 7, step 4)
 
 Types: `internal/ledgersign/agent.go`. The three calls are `LeaderOnly` and carry the fence of the task run like every leader-only call. The leader
