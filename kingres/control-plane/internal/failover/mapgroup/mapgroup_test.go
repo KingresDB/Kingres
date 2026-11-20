@@ -19,27 +19,28 @@ import (
 // world models three servers: s1 ran the primary of the map group and the leader (it is dead), s2 (this server) and s3 host the
 // standbys 10 and 11 of group 0 (nodes 4 and 5).
 type world struct {
-	mu        sync.Mutex
-	freezeErr error // FreezeLocal fails from the second call on (the agent was lost with a restart)
-	freezes   int
-	log       []string
-	self      string
-	term      int64
-	primary   string
-	standbys  []failover.StandbyRec
-	pos       map[string]failover.Position
-	posErr    map[string]error
-	live      map[string]string
-	oldAlive  bool
-	promoted  map[string]bool
-	leaseHeld bool
-	rebalance int
-	taskID    int64
-	recorded  int
-	alerts    []string
-	facts     failover.GroupFacts
-	nodes     []failover.Node
-	noCA      bool
+	mu          sync.Mutex
+	promoteReqs []failover.PromoteRequest
+	freezeErr   error // FreezeLocal fails from the second call on (the agent was lost with a restart)
+	freezes     int
+	log         []string
+	self        string
+	term        int64
+	primary     string
+	standbys    []failover.StandbyRec
+	pos         map[string]failover.Position
+	posErr      map[string]error
+	live        map[string]string
+	oldAlive    bool
+	promoted    map[string]bool
+	leaseHeld   bool
+	rebalance   int
+	taskID      int64
+	recorded    int
+	alerts      []string
+	facts       failover.GroupFacts
+	nodes       []failover.Node
+	noCA        bool
 }
 
 func newWorld() *world {
@@ -139,6 +140,7 @@ func (p ports) Lease(_ context.Context, s string, r failover.LeaseRequest) (fail
 }
 func (p ports) Promote(_ context.Context, s string, r failover.PromoteRequest) (failover.PromoteAnswer, error) {
 	p.w.mu.Lock()
+	p.w.promoteReqs = append(p.w.promoteReqs, r)
 	already := p.w.promoted[s]
 	p.w.promoted[s] = true
 	p.w.mu.Unlock()
@@ -557,5 +559,85 @@ func TestTheBootstrapDoesNotPromoteWithoutItsFreeze(t *testing.T) {
 	}
 	if w.count("promote ") != 0 {
 		t.Fatalf("promoted without the freeze: %v", w.log)
+	}
+}
+
+// The planned switchover of the map group, bootstrap side: the old leader is alive (its own task asked), the lease is won once it stops, the standby
+// it chose is pinned, the promotion waits for the proof it delivers and carries it, and the bootstrap records no task (the task is the leader's).
+func TestAPlannedSwitchoverOfTheMapGroupWaitsForTheProofAndRecordsNoTask(t *testing.T) {
+	w := newWorld()
+	w.live["s1"] = "live"
+	r, js := w.runner(t)
+	sleeps := 0
+	base := r.Sleep
+	r.Sleep = func(ctx context.Context, d time.Duration) error {
+		sleeps++
+		if sleeps == 3 { // the old leader finished its clean stop and sends the proof
+			if err := js.SetProof("0/6000028", "shut down"); err != nil {
+				t.Errorf("the proof: %v", err)
+			}
+		}
+		return base(ctx, d)
+	}
+	rq := req()
+	rq.Planned = &journal.Planned{TaskID: 77, StandbyID: 10}
+	if _, err := r.Run(context.Background(), rq); err != nil {
+		t.Fatalf("%v\n%s", err, strings.Join(w.log, "\n"))
+	}
+	if len(w.promoteReqs) != 1 || w.promoteReqs[0].Checkpoint != "0/6000028" || w.promoteReqs[0].ClusterState != "shut down" || w.promoteReqs[0].StandbyID != 10 {
+		t.Fatalf("the promotion did not carry the proof: %+v", w.promoteReqs)
+	}
+	if w.count("record-task") != 0 {
+		t.Fatalf("a task was recorded for a planned switchover:\n%s", strings.Join(w.log, "\n"))
+	}
+	if cur, _ := js.Current(); !cur.Recorded || cur.TaskID != 77 {
+		t.Fatalf("the journal does not name the task of the old leader: %+v", cur)
+	}
+}
+
+// No proof, no promotion: the bootstrap pauses and nothing is promoted.
+func TestAPlannedSwitchoverWithoutTheProofPausesBeforeThePromotion(t *testing.T) {
+	w := newWorld()
+	w.live["s1"] = "live"
+	r, _ := w.runner(t)
+	rq := req()
+	rq.Planned = &journal.Planned{TaskID: 77, StandbyID: 10}
+	_, err := r.Run(context.Background(), rq)
+	var pe *failover.PauseError
+	if !errors.As(err, &pe) {
+		t.Fatalf("want a pause: %v", err)
+	}
+	if w.count("promote ") != 0 {
+		t.Fatalf("promoted without the proof:\n%s", strings.Join(w.log, "\n"))
+	}
+}
+
+// The standby that the old leader chose must be this server's: another is not a choice.
+func TestAPlannedSwitchoverPinsOnlyTheStandbyOfTheOldLeadersChoice(t *testing.T) {
+	w := newWorld()
+	w.live["s1"] = "live"
+	r, js := w.runner(t)
+	rq := req()
+	rq.Planned = &journal.Planned{TaskID: 77, StandbyID: 11} // the standby on s3, not on this server
+	_, err := r.Run(context.Background(), rq)
+	var fe *failover.Error
+	if !errors.As(err, &fe) || fe.Code != failover.CodeNoCandidate {
+		t.Fatalf("want no_candidate: %v", err)
+	}
+	if cur, _ := js.Current(); cur.Pin != nil {
+		t.Fatalf("a standby was pinned: %+v", cur.Pin)
+	}
+}
+
+// A planned request for a server that this server does not hear is a conflict, and an ordinary one for a live server stays refused.
+func TestAPlannedRequestNeedsALiveOldServer(t *testing.T) {
+	w := newWorld() // s1 is dead
+	r, js := w.runner(t)
+	rq := req()
+	rq.Planned = &journal.Planned{TaskID: 77, StandbyID: 10}
+	_, err := r.Decide(context.Background(), rq)
+	var ref *Refusal
+	if !errors.As(err, &ref) || ref.Code != "conflict" || js.Active() {
+		t.Fatalf("a planned request for a dead server: %v", err)
 	}
 }

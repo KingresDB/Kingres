@@ -76,6 +76,17 @@ type Journal struct {
 	TaskID   int64 `json:"taskId,omitempty"`
 	// Abandoned is when the bootstrap was given up before the promotion (F4-06): its gate is open and a new one may begin.
 	Abandoned time.Time `json:"abandoned,omitempty"`
+	// Planned is set when the bootstrap serves a planned switchover of the map group (the old leader is alive and stops cleanly; the task row is its task's).
+	Planned *Planned `json:"planned,omitempty"`
+}
+
+// Planned is what the old leader's task tells the candidate: the id of its task (the bootstrap records none of its own), the standby it chose and has the
+// mark replayed on, and, once the old leader stopped cleanly, the proof of the stop (the shutdown checkpoint and the state the cluster was left in).
+type Planned struct {
+	TaskID       int64  `json:"taskId"`
+	StandbyID    int64  `json:"standbyId"`
+	Checkpoint   string `json:"checkpoint,omitempty"`
+	ClusterState string `json:"clusterState,omitempty"`
 }
 
 // ErrNewerTerm is returned by Begin when the journal on disk belongs to a bootstrap of a higher term than the one asked for.
@@ -160,6 +171,10 @@ func (s *Store) copyLocked() Journal {
 	if s.j.Pin != nil {
 		p := *s.j.Pin
 		c.Pin = &p
+	}
+	if s.j.Planned != nil {
+		p := *s.j.Planned
+		c.Planned = &p
 	}
 	return c
 }
@@ -311,4 +326,43 @@ func Stuck(j Journal, catalogTerm int64, now time.Time, maxAge time.Duration) (b
 		return true, fmt.Sprintf("the bootstrap began %s ago and did not reach the promotion", now.Sub(j.StartedAt).Round(time.Second))
 	}
 	return false, ""
+}
+
+// SetPlanned marks the bootstrap in progress as the one of a planned switchover. It is refused when a standby is pinned already (the pin is
+// the end of what the old leader may still decide) and idempotent for the same task and standby.
+func (s *Store) SetPlanned(p Planned) (Journal, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.j == nil {
+		return Journal{}, errors.New("journal: no bootstrap is in progress")
+	}
+	if s.j.Planned != nil {
+		if s.j.Planned.TaskID == p.TaskID && s.j.Planned.StandbyID == p.StandbyID {
+			return s.copyLocked(), nil
+		}
+		return Journal{}, errors.New("journal: the bootstrap serves another planned switchover")
+	}
+	if s.j.Pin != nil {
+		return Journal{}, errors.New("journal: a standby is pinned already")
+	}
+	s.j.Planned = &Planned{TaskID: p.TaskID, StandbyID: p.StandbyID}
+	return s.copyLocked(), s.saveLocked()
+}
+
+// SetProof records the proof of the clean stop of the old leader. It is refused for a bootstrap that is not planned, and a proof that differs
+// from the one recorded is refused (the first stays).
+func (s *Store) SetProof(checkpoint, clusterState string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.j == nil || s.j.Planned == nil {
+		return errors.New("journal: no planned switchover is in progress")
+	}
+	if s.j.Planned.Checkpoint != "" {
+		if s.j.Planned.Checkpoint == checkpoint && s.j.Planned.ClusterState == clusterState {
+			return nil
+		}
+		return errors.New("journal: another proof is recorded")
+	}
+	s.j.Planned.Checkpoint, s.j.Planned.ClusterState = checkpoint, clusterState
+	return s.saveLocked()
 }
