@@ -137,7 +137,8 @@ func TestFreezeAndStandbysGoneOnACluster(t *testing.T) {
 	until(t, time.Minute, "the list names the standby", func() bool { return strings.HasPrefix(syncNames(t, prim), "ANY 1 (") })
 	named := syncNames(t, prim)
 
-	callOK(t, leader, prim, "POST", "/failover/freeze", map[string]any{"group": 1, "ttlMs": 120000}, 200, nil)
+	// The freeze is made and lifted as a run of a task does it: since F3-14 only the run that holds a freeze lifts it.
+	callOK(t, leader, prim, "POST", "/failover/freeze", map[string]any{"group": 1, "ttlMs": 120000, "task": 1, "epoch": 1}, 200, nil)
 	callOK(t, leader, prim, "POST", "/failover/standbys-gone", map[string]any{"server": sbServer, "ttlMs": 120000}, 200, nil)
 	var stt struct{ Frozen bool }
 	callOK(t, leader, prim, "GET", "/failover/state?group=1", nil, 200, &stt)
@@ -155,7 +156,9 @@ func TestFreezeAndStandbysGoneOnACluster(t *testing.T) {
 	if got := syncNames(t, prim); got != named {
 		t.Fatalf("the list of a frozen group changed: %q -> %q", named, got)
 	}
-	callOK(t, leader, prim, "POST", "/failover/unfreeze", map[string]any{"group": 1}, 200, nil)
+	callOK(t, leader, prim, "POST", "/failover/unfreeze", map[string]any{"group": 1}, 409, nil)
+	callOK(t, leader, prim, "POST", "/failover/unfreeze", map[string]any{"group": 1, "task": 2, "epoch": 1}, 409, nil)
+	callOK(t, leader, prim, "POST", "/failover/unfreeze", map[string]any{"group": 1, "task": 1, "epoch": 1}, 200, nil)
 	until(t, 30*time.Second, "the list emptied at once after the freeze, the standby being gone", func() bool { return syncNames(t, prim) == "" })
 	callOK(t, leader, prim, "POST", "/failover/standbys-gone", map[string]any{"server": sbServer, "clear": true}, 200, nil)
 	until(t, time.Minute, "the standby named again once it is not gone", func() bool { return syncNames(t, prim) == named })
