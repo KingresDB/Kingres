@@ -31,6 +31,7 @@ OBJS = \
 	src/rebuild.o \
 	src/recovery.o \
 	src/remote_scan.o \
+	src/repartition.o \
 	src/row_router.o \
 	src/schema_ddl.o \
 	src/shippable.o \

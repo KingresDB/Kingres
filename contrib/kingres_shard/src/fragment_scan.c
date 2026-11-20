@@ -60,6 +60,7 @@
 #include "optimizer/tlist.h"
 #include "optimizer/paths.h"
 #include "parser/parsetree.h"
+#include "utils/fmgroids.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -77,6 +78,7 @@
 #include "catalog.h"
 #include "fanout.h"
 #include "fragment_scan.h"
+#include "repartition.h"
 #include "kingres_shard.h"
 #include "node_conn.h"
 #include "placement_check.h"
@@ -550,7 +552,8 @@ kingres_shard_fragset_start(KsFragSet *fs, const KsFragStart *st)
 		initStringInfo(&decl);
 		appendStringInfo(&decl, "%sDECLARE %s NO SCROLL CURSOR FOR %s", st->marker, f->cursor, st->sql);
 		f->kc->in_query = true;
-		if (!PQsendQueryParams(f->kc->conn, decl.data, st->nparams, st->ptypes, st->pvalues, NULL, NULL, 0))
+		if (!PQsendQueryParams(f->kc->conn, decl.data, st->nparams, st->ptypes,
+							   st->group_values != NULL ? st->group_values(st->arg, f->group_id) : st->pvalues, NULL, NULL, 0))
 			frag_send_failed(f, "DECLARE");
 		/* libpq holds its own copy; the statement text of a scan with a large IN list is large (review P2B-04) */
 		pfree(decl.data);
@@ -855,11 +858,13 @@ kingres_shard_fragset_next(KsFragSet *fs, PGresult **res_out, int *row_out, KsFr
 #define FS_PRIV_EXT			10	/* String: the extensions of the text ("name:version,..."), empty for none */
 #define FS_PRIV_SORT		11	/* List of List(column, sort operator, collation, nulls first): the groups sort, this node merges */
 #define FS_PRIV_LIMIT		12	/* Integer: the number of the parameter that holds count + offset of a LIMIT computed at the start, 0 for none */
+#define FS_PRIV_REPART		13	/* List (J1): NIL, or (List of Integer child columns shipped, Integer position of the key among them) */
 
 /* What a custom path of the fragment scan is: the whole statement, a partial aggregation (design 7), the rows of a join (design 9) */
 #define FS_PATH_WHOLE		0
 #define FS_PATH_PARTIAL		1
 #define FS_PATH_JOIN		2
+#define FS_PATH_REPART		3		/* J1: the join with one shipped relation (repartition.h) */
 
 /* The rows one group returned, for EXPLAIN ANALYZE. */
 typedef struct FsGroupRows
@@ -925,6 +930,14 @@ typedef struct KsFragScanState
 	TimestampTz local_sent;		/* EXPLAIN ANALYZE: the first fetch of this node's own part, and what it took */
 	double		local_first_ms;
 	bool		local_first_seen;
+	/* J1: the relation that is shipped */
+	List	   *rp_cols;		/* of int: the columns of the child's output that are shipped, in the order of the arrays */
+	int			rp_keypos;		/* the position of the join key among them */
+	KsRepartRows *rp_rows;
+	MemoryContext rp_cxt;
+	bool		rp_ran;			/* the child was run once (a rescan has to rescan it) */
+	const char **rp_base;		/* the values of the statement's parameters, while the groups are being started */
+	int			rp_nbase;
 } KsFragScanState;
 
 static create_upper_paths_hook_type prev_create_upper_paths_hook = NULL;
@@ -1576,6 +1589,183 @@ fs_partial_paths(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_re
 	}
 }
 
+static void fs_repart_join_paths(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel, RelOptInfo *innerrel);
+
+/*
+ * fs_repart_join_paths (J1)
+ *
+ * The statement joins distributed tables on columns that are not their distribution key, so that one relation, routed by its join
+ * column, aligns the others.  For each candidate (repartition.h) a path is made: the text is the statement's FROM and WHERE with the
+ * columns that the planner needs above the join, the routed relation replaced by a sub-select over unnest() of array parameters; the
+ * relation is read by its own scan (the child of the path), its rows are hashed here to the group that owns the bucket of their key,
+ * and every group joins its rows with its own buckets of the other tables.
+ */
+static void
+fs_repart_join_paths(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel, RelOptInfo *innerrel)
+{
+	KsPushdownInfo *pi = current_info;
+	ListCell   *lcand;
+	const KsCatalog *cat = kingres_shard_catalog();
+
+	if (kingres_shard_enable_repartition_join == KS_REPART_OFF || !cat->present)
+		return;
+	if (joinrel->reltarget == NULL || joinrel->reltarget->exprs == NIL)
+		return;
+	if (having_has_moved_conjunct(pi->ship->havingQual))
+		return;
+
+	foreach(lcand, pi->repart)
+	{
+		KsRepartCand *cand = (KsRepartCand *) lfirst(lcand);
+		Query	   *jq;
+		List	   *tl = NIL;
+		KsParamRenumber prn = {NIL};
+		const char *why = NULL;
+		char	   *body;
+		char	   *ext = NULL;
+		int			nest;
+		int			resno = 1;
+		ListCell   *lc;
+		RelOptInfo *rrel;
+		Path	   *child;
+		List	   *child_cols = NIL;
+		int			keypos = 0;
+		List	   *pids = NIL;
+		List	   *prune;
+		List	   *prune2 = NIL;
+		List	   *frags;
+		bool		local = false;
+		const KsColocation *coloc;
+		int			nremote;
+		int			ntotal;
+		double		startup;
+		double		total;
+		double		rows;
+		double		base_total = 0;
+		double		moved_bytes;
+		CustomPath *cpath;
+		bool		bad = false;
+		List	   *dist = NIL;
+		List	   *rpinfo;
+
+#define RJ_NO(msg) { ereport(DEBUG1, (errmsg_internal("kingres_shard: no repartitioned join: %s", (msg)))); continue; }
+
+		if (cand->routed_rti >= (Index) root->simple_rel_array_size || (rrel = root->simple_rel_array[cand->routed_rti]) == NULL)
+			RJ_NO("the shipped relation has no base relation");
+		child = rrel->cheapest_total_path;
+		if (child == NULL || child->param_info != NULL)
+			RJ_NO("the shipped relation has no plain path");
+		foreach(lc, joinrel->reltarget->exprs)
+		{
+			Node	   *e = (Node *) lfirst(lc);
+
+			if (!IsA(e, Var) || ((Var *) e)->varlevelsup != 0 || ((Var *) e)->varattno <= 0 ||
+				((Var *) e)->varno > (Index) list_length(root->parse->rtable))
+			{
+				bad = true;
+				break;
+			}
+			tl = lappend(tl, makeTargetEntry((Expr *) copyObject(e), (AttrNumber) resno++, NULL, false));
+		}
+		if (bad)
+			RJ_NO("a column above the join is not a column of a table");
+
+		jq = copyObject(pi->ship);
+		jq->targetList = tl;
+		jq->groupClause = NIL;
+		jq->groupingSets = NIL;
+		jq->havingQual = NULL;
+		jq->distinctClause = NIL;
+		jq->hasDistinctOn = false;
+		jq->windowClause = NIL;
+		jq->hasWindowFuncs = false;
+		jq->hasAggs = false;
+		jq->sortClause = NIL;
+		jq->limitCount = NULL;
+		jq->limitOffset = NULL;
+		jq->limitOption = LIMIT_OPTION_COUNT;
+		jq->rowMarks = NIL;
+		jq = query_tree_mutator(jq, kingres_shard_renumber_params, &prn, 0);
+		if (!kingres_shard_repart_ship_text(jq, cand, list_length(prn.ids) + 1, rrel->reltarget, &child_cols, &keypos, &why))
+			RJ_NO(why);
+		nest = kingres_shard_set_transmission_modes();
+		body = pg_get_querydef(jq, false);
+		kingres_shard_reset_transmission_modes(nest);
+		if (!kingres_shard_text_accepted(body, jq, false, &why, &ext))
+			RJ_NO(why);
+		if (ext != NULL)
+			RJ_NO("the text uses an extension, which a repartitioned join does not carry yet");
+		foreach(lc, prn.ids)
+			pids = lappend(pids, makeInteger(lfirst_int(lc)));
+
+		coloc = kingres_shard_lookup_colocation(cand->colocation_id);
+		if (coloc == NULL)
+			RJ_NO("its colocation group is not known");
+		/* the pruning of the anchored tables only: a restriction on the shipped table says nothing about the buckets of the others */
+		prune = fs_prune_items(root);
+		foreach(lc, prune)
+			if (((KsFragPrune *) lfirst(lc))->relid != cand->routed_relid || list_member_oid(cand->dist_relids, cand->routed_relid))
+				prune2 = lappend(prune2, lfirst(lc));
+		prune = list_member_oid(cand->dist_relids, cand->routed_relid) ? NIL : prune2;
+		frags = kingres_shard_frag_choose(coloc, cat, prune, root->glob->boundParams, &local, NULL, NULL);
+		nremote = list_length(frags);
+		ntotal = nremote + (local ? 1 : 0);
+		if (ntotal == 0)
+			RJ_NO("no group to ask");
+
+		/* the rows that move: the estimate of the shipped side, twice through this node (read, then sent), against the bound */
+		moved_bytes = clamp_row_est(rrel->rows) * (double) Max(rrel->reltarget->width, 8);
+		if (kingres_shard_enable_repartition_join != KS_REPART_FORCE &&
+			moved_bytes > (double) kingres_shard_repartition_max_kb * 1024.0 / 2.0)
+			RJ_NO("the shipped side is estimated above half of repartition_max_bytes");
+
+		foreach(lc, cand->dist_relids)
+			dist = lappend(dist, makeInteger((int) lfirst_oid(lc)));
+		rpinfo = list_make5(child_cols, makeInteger(keypos), makeInteger(cand->colocation_id),
+							makeString(psprintf(INT64_FORMAT, cand->place)), dist);
+
+		/*
+		 * The groups do what the planner would pay to join the other tables with the shipped rows, divided among them; this node
+		 * pays for the scan of the shipped table, for sending its rows once and for the rows of the join.
+		 */
+		if (outerrel->cheapest_total_path != NULL && !bms_is_member((int) cand->routed_rti, outerrel->relids))
+			base_total += outerrel->cheapest_total_path->total_cost;
+		if (innerrel->cheapest_total_path != NULL && !bms_is_member((int) cand->routed_rti, innerrel->relids))
+			base_total += innerrel->cheapest_total_path->total_cost;
+		rows = clamp_row_est(joinrel->rows);
+		startup = child->total_cost + 100.0 * nremote;
+		total = startup + base_total / ntotal + clamp_row_est(rrel->rows) * (cpu_tuple_cost * 4.0 + 0.04) +
+			rows * (cpu_tuple_cost * 2.0 + 0.02) * nremote / ntotal;
+		if (kingres_shard_enable_repartition_join == KS_REPART_FORCE)
+		{
+			startup = 0.0;
+			total = 0.01;
+		}
+
+		cpath = makeNode(CustomPath);
+		cpath->path.pathtype = T_CustomScan;
+		cpath->path.parent = joinrel;
+		cpath->path.pathtarget = joinrel->reltarget;
+		cpath->path.param_info = NULL;
+		cpath->path.parallel_aware = false;
+		cpath->path.parallel_safe = false;
+		cpath->path.parallel_workers = 0;
+		cpath->path.pathkeys = NIL;
+		cpath->path.rows = rows;
+		cpath->path.disabled_nodes = 0;
+		cpath->path.startup_cost = startup;
+		cpath->path.total_cost = total;
+		cpath->flags = 0;
+		cpath->custom_paths = list_make1(child);
+		cpath->custom_restrictinfo = NIL;
+		cpath->custom_private = list_make4(prune, list_make3(makeString(body), pids, makeString(pstrdup(""))),
+										   makeInteger(FS_PATH_REPART), rpinfo);
+		cpath->methods = &fs_path_methods;
+		add_path(joinrel, (Path *) cpath);
+#undef RJ_NO
+	}
+}
+
 /*
  * fs_join_paths
  *
@@ -1623,10 +1813,21 @@ fs_join_paths(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel, RelO
 		prev_set_join_pathlist_hook(root, joinrel, outerrel, innerrel, jointype, extra);
 	if (pi == NULL || !pi->join || parse != pi->parse || root->query_level != 1 || IsParallelWorker())
 		return;
-	if (!kingres_shard_enable_pushdown_join || joinrel->reloptkind != RELOPT_JOINREL || KS_IS_GROUPED_REL(joinrel))
+	if (joinrel->reloptkind != RELOPT_JOINREL || KS_IS_GROUPED_REL(joinrel))
 		return;
 	/* the join of the whole level, and once */
 	if (!bms_is_subset(root->all_baserels, joinrel->relids) || pi->join_done == (void *) joinrel)
+		return;
+	if (pi->repart != NIL)
+	{
+		/* a statement that is not a unit of 2b: the paths that ship one relation (repartition.h) */
+		pi->join_done = (void *) joinrel;
+		fs_repart_join_paths(root, joinrel, outerrel, innerrel);
+		/* a 2b join of the same statement is tried too */
+		if (strcmp(pi->kind, "join rows (on key)") != 0)
+			return;
+	}
+	if (!kingres_shard_enable_pushdown_join)
 		return;
 	pi->join_done = (void *) joinrel;
 
@@ -1737,8 +1938,19 @@ fs_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path, L
 	const char *ext;
 	int			path_kind = list_length(best_path->custom_private) > 2 ? intVal(lthird(best_path->custom_private)) : FS_PATH_WHOLE;
 
+	List	   *rpinfo = NIL;
+	int			rp_coloc = 0;
+	const char *rp_place = NULL;
+
 	if (pi == NULL || root->parse != pi->parse)
 		elog(ERROR, "a fragment scan was planned for a statement that was not decided");
+
+	if (path_kind == FS_PATH_REPART)
+	{
+		rpinfo = (List *) lfourth(best_path->custom_private);
+		rp_coloc = intVal(lthird(rpinfo));
+		rp_place = strVal(lfourth(rpinfo));
+	}
 	if (path_kind != FS_PATH_WHOLE)
 	{
 		/* the path made the text: the select list of the partial target (fs_partial_paths) or the columns of the join (fs_join_paths) */
@@ -1755,8 +1967,11 @@ fs_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path, L
 		foreach(lc, pi->param_ids)
 			param_ids = lappend(param_ids, makeInteger(lfirst_int(lc)));
 	}
-	foreach(lc, pi->dist_relids)
-		dist = lappend(dist, makeInteger((int) lfirst_oid(lc)));
+	if (path_kind == FS_PATH_REPART)
+		dist = (List *) list_nth(rpinfo, 4);
+	else
+		foreach(lc, pi->dist_relids)
+			dist = lappend(dist, makeInteger((int) lfirst_oid(lc)));
 	foreach(lc, prune_items)
 	{
 		KsFragPrune *item = (KsFragPrune *) lfirst(lc);
@@ -1775,20 +1990,21 @@ fs_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path, L
 	cscan->scan.scanrelid = 0;
 	cscan->flags = best_path->flags;
 	cscan->custom_scan_tlist = scan_tlist;
-	cscan->custom_plans = NIL;
-	cscan->custom_relids = path_kind == FS_PATH_JOIN ? bms_copy(rel->relids) : bms_copy(root->all_baserels);
+	cscan->custom_plans = path_kind == FS_PATH_REPART ? custom_plans : NIL;
+	cscan->custom_relids = (path_kind == FS_PATH_JOIN || path_kind == FS_PATH_REPART) ? bms_copy(rel->relids) : bms_copy(root->all_baserels);
 	cscan->custom_private = list_make5(makeString(pstrdup(sql)), param_ids,
-									   makeInteger(pi->colocation_id),
-									   makeString(psprintf(INT64_FORMAT, pi->place)),
+									   makeInteger(path_kind == FS_PATH_REPART ? rp_coloc : pi->colocation_id),
+									   makeString(path_kind == FS_PATH_REPART ? pstrdup(rp_place) : psprintf(INT64_FORMAT, pi->place)),
 									   makeString(relations_signature(pi->relids)));
 	cscan->custom_private = lappend(cscan->custom_private, dist);
 	cscan->custom_private = lappend(cscan->custom_private, prune);
-	cscan->custom_private = lappend(cscan->custom_private, makeString(pstrdup(path_kind == FS_PATH_JOIN ? "join rows (on key)" : path_kind == FS_PATH_PARTIAL ? "partial aggregate" : pi->kind)));
+	cscan->custom_private = lappend(cscan->custom_private, makeString(pstrdup(path_kind == FS_PATH_REPART ? "repartitioned join (one table moved by its join key)" : path_kind == FS_PATH_JOIN ? "join rows (on key)" : path_kind == FS_PATH_PARTIAL ? "partial aggregate" : pi->kind)));
 	cscan->custom_private = lappend(cscan->custom_private, makeInteger(path_kind != FS_PATH_WHOLE ? list_length(tlist) : pi->ncols));
 	cscan->custom_private = lappend(cscan->custom_private, makeInteger(path_kind == FS_PATH_PARTIAL ? 1 : 0));
 	cscan->custom_private = lappend(cscan->custom_private, makeString(ext != NULL ? pstrdup(ext) : pstrdup("")));
 	cscan->custom_private = lappend(cscan->custom_private, path_kind != FS_PATH_WHOLE ? NIL : pi->sort);
 	cscan->custom_private = lappend(cscan->custom_private, makeInteger(path_kind == FS_PATH_WHOLE ? pi->limit_param : 0));
+	cscan->custom_private = lappend(cscan->custom_private, path_kind == FS_PATH_REPART ? list_make2(linitial(rpinfo), lsecond(rpinfo)) : NIL);
 	if (path_kind == FS_PATH_WHOLE && pi->limit_param > 0)
 		cscan->custom_exprs = list_make2(pi->limit_cnt, pi->limit_off != NULL ? pi->limit_off : (Node *) makeNullConst(INT8OID, -1, InvalidOid));
 	cscan->methods = &fs_scan_methods;
@@ -1829,6 +2045,15 @@ fs_create_scan_state(CustomScan *cscan)
 	s->partial = intVal(list_nth(p, FS_PRIV_PARTIAL)) != 0;
 	s->ext = strVal(list_nth(p, FS_PRIV_EXT))[0] != '\0' ? pstrdup(strVal(list_nth(p, FS_PRIV_EXT))) : NULL;
 	s->limit_param = intVal(list_nth(p, FS_PRIV_LIMIT));
+	if (list_length(p) > FS_PRIV_REPART && list_nth(p, FS_PRIV_REPART) != NIL)
+	{
+		List	   *rp = (List *) list_nth(p, FS_PRIV_REPART);
+		ListCell   *rl;
+
+		foreach(rl, (List *) linitial(rp))
+			s->rp_cols = lappend_int(s->rp_cols, lfirst_int(rl));
+		s->rp_keypos = intVal(lsecond(rp));
+	}
 	{
 		ListCell   *kl;
 		int			k = 0;
@@ -1868,6 +2093,14 @@ fs_begin_scan(CustomScanState *node, EState *estate, int eflags)
 	if (tupdesc->natts != s->ncols)
 		elog(ERROR, "the fragment scan returns %d columns and its plan has %d", s->ncols, tupdesc->natts);
 	kingres_shard_fragset_init(&s->fs, estate->es_query_cxt, list_length(s->dist_relids));
+	if (s->rp_cols != NIL)
+	{
+		ListCell   *cl;
+
+		foreach(cl, ((CustomScan *) node->ss.ps.plan)->custom_plans)
+			node->custom_ps = lappend(node->custom_ps, ExecInitNode((Plan *) lfirst(cl), estate, eflags));
+		s->rp_cxt = AllocSetContextCreate(estate->es_query_cxt, "kingres_shard repartition rows", ALLOCSET_DEFAULT_SIZES);
+	}
 	if (s->limit_param > 0)
 	{
 		List	   *lx = ((CustomScan *) node->ss.ps.plan)->custom_exprs;
@@ -1963,7 +2196,7 @@ fs_local_open(void *arg)
 	KsFragScanState *s = (KsFragScanState *) arg;
 	EState	   *estate = s->css.ss.ps.state;
 	ParamListInfo params = estate->es_param_list_info;
-	int			n = list_length(s->param_ids) + (s->limit_param > 0 ? 1 : 0);
+	int			n = list_length(s->param_ids) + (s->limit_param > 0 ? 1 : 0) + list_length(s->rp_cols);
 	Oid		   *argtypes = palloc(sizeof(Oid) * Max(n, 1));
 	Datum	   *values = palloc(sizeof(Datum) * Max(n, 1));
 	char	   *nulls = palloc(Max(n, 1));
@@ -2000,6 +2233,20 @@ fs_local_open(void *arg)
 		values[i] = Int64GetDatum(s->limit_value);
 		nulls[i] = s->limit_null ? 'n' : ' ';
 		i++;
+	}
+	if (s->rp_cols != NIL)
+	{
+		int			c;
+		int			lg = kingres_shard_catalog()->local_group_id;
+
+		/* the rows of the shipped relation that belong to this node's own group */
+		for (c = 0; c < list_length(s->rp_cols); c++)
+		{
+			argtypes[i] = TEXTARRAYOID;
+			values[i] = OidInputFunctionCall(F_ARRAY_IN, (char *) kingres_shard_repart_array(s->rp_rows, lg, c), TEXTOID, -1);
+			nulls[i] = ' ';
+			i++;
+		}
 	}
 
 	s->ident_before = MemoryContextAlloc(estate->es_query_cxt,
@@ -2104,6 +2351,21 @@ fs_local_close(KsFragScanState *s)
 	s->has_local = false;
 }
 
+/* The parameters of one group: the statement's, then the arrays of its own rows of the shipped relation. */
+static const char *const *
+fs_group_values(void *arg, int group_id)
+{
+	KsFragScanState *s = (KsFragScanState *) arg;
+	int			k = list_length(s->rp_cols);
+	const char **v = palloc0(sizeof(char *) * (s->rp_nbase + k));
+	int			c;
+
+	memcpy(v, s->rp_base, sizeof(char *) * s->rp_nbase);
+	for (c = 0; c < k; c++)
+		v[s->rp_nbase + c] = kingres_shard_repart_array(s->rp_rows, group_id, c);
+	return v;
+}
+
 static void
 fs_start(KsFragScanState *s)
 {
@@ -2171,7 +2433,39 @@ fs_start(KsFragScanState *s)
 		types = t2;
 		nparams++;
 	}
+	if (s->rp_cols != NIL)
+	{
+		List	   *groups = NIL;
+		int			k = list_length(s->rp_cols);
+		const char **v2;
+		Oid		   *t2;
+		int			c;
+
+		foreach(lc, s->fs.frags)
+			groups = lappend_int(groups, ((KsFrag *) lfirst(lc))->group_id);
+		if (local)
+			groups = lappend_int(groups, cat->local_group_id);
+		if (s->rp_ran)
+			ExecReScan((PlanState *) linitial(s->css.custom_ps));
+		s->rp_ran = true;
+		MemoryContextReset(s->rp_cxt);
+		s->rp_rows = kingres_shard_repart_collect((PlanState *) linitial(s->css.custom_ps), coloc, s->rp_cols, s->rp_keypos, groups, s->rp_cxt);
+		/* the arrays come after the statement's own parameters; their values are the group's own */
+		v2 = palloc0(sizeof(char *) * (nparams + k));
+		t2 = palloc0(sizeof(Oid) * (nparams + k));
+		memcpy(v2, values, sizeof(char *) * nparams);
+		memcpy(t2, types, sizeof(Oid) * nparams);
+		for (c = 0; c < k; c++)
+			t2[nparams + c] = TEXTARRAYOID;
+		s->rp_base = v2;
+		s->rp_nbase = nparams;
+		values = v2;
+		types = t2;
+		nparams += k;
+		i = 0;
+	}
 	relids = palloc(sizeof(Oid) * Max(nrels, 1));
+	i = 0;
 	foreach(lc, s->dist_relids)
 		relids[i++] = lfirst_oid(lc);
 
@@ -2180,7 +2474,10 @@ fs_start(KsFragScanState *s)
 	st.ntables = nrels;
 	st.relids = relids;
 	st.plan_placement = s->plan_placement;
-	st.marker = s->partial ? kingres_shard_partial_marker(s->plan_placement, s->ext) : kingres_shard_query_marker(s->plan_placement, s->ext);
+	st.marker = s->partial ? kingres_shard_partial_marker(s->plan_placement, s->ext) :
+		s->rp_cols != NIL ? kingres_shard_query_marker_rp(s->plan_placement, s->ext, 1) : kingres_shard_query_marker(s->plan_placement, s->ext);
+	if (s->rp_cols != NIL)
+		st.group_values = fs_group_values;
 	st.ext = s->ext;
 	st.sql = s->sql;
 	st.nparams = nparams;
@@ -2517,6 +2814,7 @@ fs_stop(KsFragScanState *s)
 {
 	kingres_shard_fragset_stop(&s->fs, true);
 	fs_local_close(s);
+	s->rp_rows = NULL;
 	if (s->merge_started)
 	{
 		int			i;
@@ -2540,7 +2838,12 @@ fs_stop(KsFragScanState *s)
 static void
 fs_end_scan(CustomScanState *node)
 {
+	ListCell   *lc;
+
 	fs_stop((KsFragScanState *) node);
+	foreach(lc, node->custom_ps)
+		ExecEndNode((PlanState *) lfirst(lc));
+	node->custom_ps = NIL;
 }
 
 static void

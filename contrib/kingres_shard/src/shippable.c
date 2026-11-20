@@ -62,6 +62,7 @@
 #include "catalog.h"
 #include "pg_compat.h"
 #include "shippable.h"
+#include "repartition.h"
 
 typedef struct ShipCtx
 {
@@ -710,6 +711,9 @@ query_ok(Query *q, ShipCtx *ctx)
 	ListCell   *lc;
 	int			rtindex = 0;
 
+	/* the sub-select that stands for a relation another node shipped (repartition.h): its shape is fixed and reads no table (false: nothing wrong) */
+	if (q != ctx->top && kingres_shard_repart_shipped_shape(q, NULL))
+		return false;
 	if (q != ctx->top && q->commandType != CMD_SELECT)
 		return fail(ctx, "it has a data-modifying statement inside a subquery or a WITH clause");
 	if (q->commandType == CMD_MERGE || q->commandType == CMD_UTILITY)

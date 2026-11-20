@@ -110,6 +110,7 @@
 #include "pg_compat.h"
 #include "planner.h"
 #include "pushdown.h"
+#include "repartition.h"
 #include "remote_scan.h"
 #include "row_router.h"
 #include "schema_ddl.h"
@@ -1443,13 +1444,16 @@ plan_forwarded(Query *parse, const char *query_string, int cursorOptions,
 		int64		place;
 		char	   *marker_ext = NULL;
 
-		if (kingres_shard_parse_query_marker(query_string, &place, &marker_ext))
+		int			marker_rp = 0;
+
+		if (kingres_shard_parse_query_marker_rp(query_string, &place, &marker_ext, &marker_rp))
 		{
 			KsQueryFragment qf;
 			const char *why = NULL;
 
 			if ((check_marker_installed_versions(marker_ext), true) &&
 				kingres_shard_query_fragment_analyze(parse, &qf, &why) &&
+				(marker_rp == qf.pd.nshipped || (why = "the shipped relations of the text are not the ones the marker counts", false)) &&
 				(check_marker_extensions(marker_ext, qf.ext), true))
 			{
 				PlannedStmt *pstmt = plan_locally(parse, query_string, cursorOptions, boundParams,
@@ -3762,6 +3766,8 @@ planner_hook_body(Query *parse, const char *query_string,
 				pi = pushdown_prepare(parse, &why);
 				if (pi == NULL && why != NULL)
 					ereport(DEBUG1, (errmsg_internal("kingres_shard: no pushdown: %s", why)));
+				/* phase 12 (J1): a join on columns other than the key, by moving one table (repartition.c) */
+				pi = kingres_shard_repart_attach(parse, pi);
 			}
 			return plan_with_scan(parse, query_string, cursorOptions, boundParams, pi, why);
 		}

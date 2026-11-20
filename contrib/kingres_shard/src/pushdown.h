@@ -69,6 +69,7 @@ typedef struct KsPushdown
 	List	   *rels;			/* of KsPdRel *, in range table order */
 	int			ndist;			/* distributed tables in the level */
 	int			nclasses;		/* key classes: 1 for a unit */
+	int			nshipped;		/* J1: sub-selects over unnest() that stand for shipped relations (repartition.h) */
 } KsPushdown;
 
 /*
@@ -151,6 +152,10 @@ extern char *kingres_shard_query_marker(int64 place, const char *ext);
 
 /* Parse the marker at the start of a statement text; false when it is not one. */
 extern bool kingres_shard_parse_query_marker(const char *query_string, int64 *place, char **ext);
+
+/* J1: the marker of a statement with shipped relations carries rp=<number of them>; the parser returns it (0 when absent) */
+extern char *kingres_shard_query_marker_rp(int64 place, const char *ext, int rp);
+extern bool kingres_shard_parse_query_marker_rp(const char *query_string, int64 *place, char **ext, int *rp);
 
 /* A partial aggregation (design 7): every group aggregates its own rows and returns the partial states. */
 #define KS_PARTIAL_MARKER_PREFIX "/* kingres:partial-fragment "

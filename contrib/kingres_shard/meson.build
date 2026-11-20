@@ -13,6 +13,7 @@ kingres_shard_sources = files(
   'src/fault.c',
   'src/forward_auth.c',
   'src/fragment_scan.c',
+
   'src/ha.c',
   'src/hashing.c',
   'src/kingres_shard.c',
@@ -25,6 +26,7 @@ kingres_shard_sources = files(
   'src/rebuild.c',
   'src/recovery.c',
   'src/remote_scan.c',
+  'src/repartition.c',
   'src/row_router.c',
   'src/schema_ddl.c',
   'src/shippable.c',

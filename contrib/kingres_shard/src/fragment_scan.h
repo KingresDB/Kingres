@@ -95,6 +95,8 @@ typedef struct KsFragStart
 	int			nparams;
 	const Oid  *ptypes;
 	const char *const *pvalues;
+	/* J1: the values of the parameters of one group (the arrays of the shipped relation differ), NULL: pvalues for all */
+	const char *const *(*group_values) (void *arg, int group_id);
 	void		(*local_open) (void *arg);
 	void		(*after_check) (void *arg);
 	void	   *arg;
@@ -186,6 +188,7 @@ typedef struct KsPushdownInfo
 	void	   *join_done;		/* the join relation that has its fragment path */
 	bool		partial;		/* a partial aggregation (design 7): sql and ncols are made by the path, which knows the partial target */
 	Query	   *ship;			/* partial: a copy of the query, to deparse with the select list of the partial target */
+	List	   *repart;			/* J1: of KsRepartCand *: the relations that can be shipped (repartition.h); join is also set */
 } KsPushdownInfo;
 
 extern void kingres_shard_fragment_scan_init(void);
