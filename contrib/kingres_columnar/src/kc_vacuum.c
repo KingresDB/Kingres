@@ -42,6 +42,7 @@
 #include "storage/bufmgr.h"
 #include "storage/latch.h"
 #include "storage/lmgr.h"
+#include "storage/proc.h"
 #include "storage/procarray.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
@@ -172,6 +173,131 @@ kc_truncate_tail(Relation rel)
 	}
 	UnlockRelation(rel, AccessExclusiveLock);
 	return cut;
+}
+
+/*
+ * Merge the small stripes when there are many (C13-05, bounded by C14-02 and C14-03).  A
+ * subtransaction that inserts rows and commits while its parent holds rows of the table writes a
+ * stripe of its own (a savepoint per row, which is what an exception block per row does, makes a
+ * stripe and a page per row), and so does every small transaction; each also takes a row of the
+ * stripe catalog.  Nothing else merges them but columnar_compact, so VACUUM does it when at least
+ * kingres_columnar.vacuum_compact_stripes (128; 0: never) stripes are smaller than a sixteenth
+ * of the stripe size.  The indexes get entries for the copies; the replaced stripes and their
+ * entries go at a later VACUUM, once no snapshot sees them.
+ *
+ * It is optional work and is done last, so that nothing it does can keep the rest of the VACUUM
+ * (the index vacuum, the free list, the freezing of the metapage) from being done:
+ *  - it is skipped when 90 percent of the table's row numbers are used (the copies take new
+ *    numbers and the numbers of the replaced stripes are not used again: at the end of the
+ *    numbers a merge would burn what is left, and fail);
+ *  - an error in it is caught in a subtransaction and reported as a WARNING, and the VACUUM goes on
+ *    (a cancel, a shutdown and the other errors of class 57 are not caught);
+ *  - only the stripes smaller than a sixteenth of the stripe size are merged (columnar_compact does
+ *    a quarter), and at most kingres_columnar.vacuum_compact_rows rows (1 000 000; 0: no limit) in
+ *    one VACUUM, the rest at the next ones: the transaction id the merge needs, which holds back the
+ *    cleanup horizon of every table of the cluster until the VACUUM of this table ends, is held
+ *    for a bounded run.
+ * Not under the wraparound failsafe, which skips optional work, and only when the table is not
+ * locked by a compaction or another vacuum (this vacuum holds the lock that excludes them).
+ */
+static void
+kc_vacuum_compact_small(Relation rel)
+{
+	KcMetaData	m;
+	Snapshot	cs;
+	KcStripeInfo *s;
+	int			n;
+	int			i;
+	int			nsmall = 0;
+	uint32		small;
+	MemoryContext oldcxt = CurrentMemoryContext;
+	ResourceOwner oldowner = CurrentResourceOwner;
+
+	if (kc_guc_vacuum_compact_stripes <= 0)
+		return;
+	kc_meta_read(rel, &m);
+	if (m.next_row >= KC_MAX_ROW_NUMBER / 100 * 90)
+		return;
+	small = Max(m.stripe_rows / 16, 1);
+	cs = kc_latest_snapshot();
+	s = kc_catalog_load(rel, cs, &n);
+	pfree(cs);
+	for (i = 0; i < n; i++)
+	{
+		if (!s[i].own && s[i].row_count < small)
+			nsmall++;
+		pfree(s[i].cid_points);
+		pfree(s[i].col_stats);
+	}
+	if (s)
+		pfree(s);
+	if (nsmall < kc_guc_vacuum_compact_stripes)
+		return;
+
+	/*
+	 * A lazy VACUUM runs with PROC_IN_VACUUM, which keeps its transaction id out of the snapshots
+	 * other backends take (GetSnapshotData skips such processes): sound for a vacuum, which writes
+	 * nothing a snapshot has to judge ("we mustn't do any regular updates", vacuum.c), and wrong
+	 * for a compaction, whose copies and deletions of stripe rows are judged by every reader.  A
+	 * reader whose snapshot did not list this transaction would see the stripe rows it deleted
+	 * and then, once it commits, the copies as well: duplicates (found by t/004, in one run of
+	 * six).  So the compaction runs only if this transaction has no id yet, and clears the flag first,
+	 * the way vacuum.c sets it: under ProcArrayLock, in the process and in the array the snapshots read.  Every snapshot
+	 * taken from then on lists the id once it is assigned, and one taken before has an xmax
+	 * at or below it, which counts it as running.  t/069 looks at the snapshot of another session
+	 * while the merge's id is held, so that a change that left the flag set cannot pass unseen.
+	 *
+	 * The vacuum's own xmin, which was hidden with its id, is counted from now on (C14-04): a
+	 * horizon computed by another backend in the first moments of this merge (it ignored the xmin)
+	 * can be larger than one computed after it.  What reads such a horizon and could be hurt by
+	 * the smaller one is the dead-stripe pass of an index build (kc_am.c), which includes more
+	 * stripes with a smaller bound, among them stripes whose blocks a vacuum of this table had
+	 * already listed free; the window is the last step of a VACUUM now, bounded by
+	 * vacuum_compact_rows, and the coincidence (a vacuum of this table computing its horizon in it,
+	 * a stripe deleted in it, an index built afterwards) was not constructed.  Closing it takes the
+	 * horizon of the free list in the metapage (a format change): left for the next format version.
+	 */
+	if (TransactionIdIsValid(GetTopTransactionIdIfAny()))
+		return;
+	if (MyProc->statusFlags & PROC_IN_VACUUM)
+	{
+		LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+		MyProc->statusFlags &= ~PROC_IN_VACUUM;
+		ProcGlobal->statusFlags[MyProc->pgxactoff] = MyProc->statusFlags;
+		LWLockRelease(ProcArrayLock);
+	}
+
+	BeginInternalSubTransaction("columnar vacuum merge");
+	PG_TRY();
+	{
+		(void) kc_compact(rel, small, (uint64) kc_guc_vacuum_compact_rows);
+		ReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(oldcxt);
+		CurrentResourceOwner = oldowner;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(oldcxt);
+		edata = CopyErrorData();
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(oldcxt);
+		CurrentResourceOwner = oldowner;
+		kc_write_maintenance_discard();
+
+		/* a cancel, a shutdown and the like are the operator's: not for this to swallow */
+		if (ERRCODE_TO_CATEGORY(edata->sqlerrcode) == ERRCODE_OPERATOR_INTERVENTION)
+			ReThrowError(edata);
+		ereport(WARNING,
+				(errmsg("the merge of the small stripes of \"%s\" was given up: %s",
+						RelationGetRelationName(rel), edata->message),
+				 errdetail("The VACUUM goes on without it; the next one tries again.")));
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
+	kc_reserve_gate(KC_RES_VAC_MERGED);
 }
 
 /*
@@ -394,12 +520,17 @@ kc_index_vacuum(Relation rel, bool skip, double live_rows, BufferAccessStrategy 
 	}
 
 	/* the metapage and the catalog in step: no claim is half made while this is held */
+	/* conflicts with a compaction, which makes entries for its copies (C13-06) */
+	Assert(CheckRelationLockedByMe(rel, ShareUpdateExclusiveLock, true));
+	/* no give-back of a reservation tail while the ranges below are in use (C14-01) */
+	(void) kc_vacuum_lock(rel, ExclusiveLock, true);
 	kc_reserve_lock(rel, ExclusiveLock);
 	kc_meta_read(rel, &meta);
 	st.r = kc_catalog_live_ranges(rel, GetOldestNonRemovableTransactionId(rel),
 								  meta.next_row, &st.n, &st.low);
 	kc_reserve_unlock(rel, ExclusiveLock);
 	st.removed = 0;
+	kc_reserve_gate(KC_RES_VAC_RANGES);
 
 	for (i = 0; i < nindexes; i++)
 	{
@@ -426,6 +557,7 @@ kc_index_vacuum(Relation rel, bool skip, double live_rows, BufferAccessStrategy 
 		}
 		CHECK_FOR_INTERRUPTS();
 	}
+	kc_vacuum_unlock(rel, ExclusiveLock);
 	vac_close_indexes(nindexes, Irel, RowExclusiveLock);
 	if (st.r)
 		pfree(st.r);
@@ -467,6 +599,7 @@ kc_relation_vacuum(KC_VACUUM_PARAMS)
 	failsafe = kc_failsafe_active(rel);
 
 	kc_am_failed_reset();
+
 	(void) kc_catalog_reconcile(NULL, true);
 
 	nblocks = RelationGetNumberOfBlocks(rel);
@@ -511,6 +644,16 @@ kc_relation_vacuum(KC_VACUUM_PARAMS)
 		vac_update_relstats(rel, nblocks, (double) rows, 0, 0, RelationGetIndexList(rel) != NIL,
 							frozenxid, minmxid, NULL, NULL, false);
 	}
+
+	/*
+	 * Many small stripes (a savepoint per row, small transactions) are merged: the cost of a stripe
+	 * per row is bounded by this (C13-05).  Last, so that nothing it does can keep the rest of the
+	 * VACUUM from being done and its transaction id is held for as short a time as it can be (C14-02,
+	 * C14-03); before anything in this vacuum can give it a transaction id: see
+	 * kc_vacuum_compact_small.
+	 */
+	if (!failsafe)
+		kc_vacuum_compact_small(rel);
 	KC_REPORT_VACUUM(rel, (PgStat_Counter) rows, 0, starttime);
 
 	/*
@@ -543,8 +686,10 @@ kc_relation_vacuum(KC_VACUUM_PARAMS)
  * Index entries for the rows that compaction copied (C6d).  The copies have new row numbers,
  * and every index of the table names rows by number, so each index gets an entry for each
  * copy; the entries of the old numbers stay.  Nothing is rebuilt and no lock is taken that the
- * compaction does not hold already (SHARE UPDATE EXCLUSIVE on the table, ROW EXCLUSIVE on the
- * indexes, as a writer takes): a reader with an older snapshot still sees the old stripes and
+ * compaction does not hold already: SHARE UPDATE EXCLUSIVE on the table (not a writer's mode: it
+ * conflicts with VACUUM and with another compaction: no index vacuum and no
+ * free-space pass runs while a compaction writes its copies and their entries, and the compaction's own
+ * deletions are never judged by a vacuum half way; the free-space pass relies on this; C13-06), ROW EXCLUSIVE on the indexes (a writer's).  A reader with an older snapshot still sees the old stripes and
  * finds their rows by the old entries, a reader after the commit sees the copies and finds them
  * by the new ones, and the entries that name rows no snapshot can see are removed by the next
  * VACUUM (the ranges of stripes deleted before the oldest snapshot are not live).  The entries
@@ -573,6 +718,8 @@ kc_compact_index_entries(Relation rel, uint64 *firsts, int nfirst)
 
 	if (nidx == 0 || nfirst == 0)
 		return;
+	/* the mode that keeps an index vacuum and another compaction out, whoever called (C13-06) */
+	Assert(CheckRelationLockedByMe(rel, ShareUpdateExclusiveLock, true));
 	Irel = palloc(sizeof(Relation) * nidx);
 	info = palloc(sizeof(IndexInfo *) * nidx);
 	pred = palloc0(sizeof(ExprState *) * nidx);
@@ -670,13 +817,14 @@ kc_compact_index_entries(Relation rel, uint64 *firsts, int nfirst)
  * stripes the transaction's own snapshot sees.
  */
 int
-kc_compact(Relation rel, uint32 min_rows)
+kc_compact(Relation rel, uint32 min_rows, uint64 max_rows)
 {
 	KcScan	   *scan;
 	TupleTableSlot *slot;
 	int			i;
 	int			nsmall = 0;
 	uint64		rows = 0;
+	uint64		picked = 0;
 	KcMetaData	m;
 	CommandId	cid = GetCurrentCommandId(true);
 
@@ -689,8 +837,14 @@ kc_compact(Relation rel, uint32 min_rows)
 	{
 		KcStripeInfo *si = &scan->stripes[i];
 
+		/* max_rows (not 0): stop picking when the stripes taken hold that many rows, the rest is for the next call (C14-03) */
+		if (max_rows > 0 && picked >= max_rows)
+			break;
 		if (!si->own && si->row_count < min_rows)
+		{
+			picked += si->row_count;
 			scan->stripes[nsmall++] = *si;
+		}
 	}
 	scan->nstripes = nsmall;
 	kc_scan_drop_hold(scan);

@@ -10,6 +10,9 @@
 -- setting off nothing changes.  The runs of several sessions, crashes, standbys
 -- and the check functions are in t/044 to t/050.
 SET search_path = public;
+-- the layout of the numbers below is that of a reservation of a whole stripe (the setting 0); the small, growing
+-- reservation of the default is tested in t/066
+SET kingres_columnar.reserve_min_rows = 0;
 
 -- the rows every table below holds, as a fingerprint
 CREATE FUNCTION fp(tbl regclass) RETURNS text LANGUAGE plpgsql AS $$

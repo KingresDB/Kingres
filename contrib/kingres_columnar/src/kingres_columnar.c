@@ -82,6 +82,8 @@ int			kc_guc_stripe_rows = 150000;
 int			kc_guc_max_stripe_rows = KC_MAX_STRIPE_ROWS;
 int			kc_guc_orphan_notes_max = KC_ORPHAN_NOTES_MAX;
 int			kc_guc_truncate_lock_timeout = KC_TRUNCATE_LOCK_TIMEOUT;
+int			kc_guc_vacuum_compact_stripes = 128;
+int			kc_guc_vacuum_compact_rows = 1000000;
 static int	kc_guc_check_gate = 0;
 static int	kc_guc_check_gate_orphans = 0;
 static int	kc_guc_check_gate_claims = 0;
@@ -292,6 +294,14 @@ _PG_init(void)
 							NULL, &kc_guc_truncate_lock_timeout, KC_TRUNCATE_LOCK_TIMEOUT,
 							50, 600000, PGC_SUSET, GUC_NOT_IN_SAMPLE | GUC_UNIT_MS,
 							NULL, NULL, NULL);
+	DefineCustomIntVariable("kingres_columnar.vacuum_compact_stripes",
+							"VACUUM merges the small stripes of a table when at least this many are smaller than a sixteenth of the stripe size (0: never).",
+							NULL, &kc_guc_vacuum_compact_stripes, 128, 0, 10000000,
+							PGC_SUSET, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
+	DefineCustomIntVariable("kingres_columnar.vacuum_compact_rows",
+							"The most rows one VACUUM copies when it merges small stripes; the rest is merged by the next VACUUM (0: no limit).",
+							NULL, &kc_guc_vacuum_compact_rows, 1000000, 0, INT_MAX,
+							PGC_SUSET, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 	DefineCustomIntVariable("kingres_columnar.chunk_row_count",
 							"Rows of a chunk group of a new columnar table.",
 							NULL, &kc_guc_chunk_rows, 10000,
@@ -310,7 +320,6 @@ _PG_init(void)
 							 "Skip stripes and chunk groups with their minimum and maximum.",
 							 NULL, &kc_guc_enable_chunk_skipping, true,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
-	MarkGUCPrefixReserved("kingres_columnar");
 
 	if (process_shared_preload_libraries_in_progress)
 	{
@@ -321,6 +330,14 @@ _PG_init(void)
 	kc_write_init();
 	kc_am_cache_init();
 	kc_cscan_init();
+
+	/*
+	 * After every setting of the extension is defined, those of the write path and of the scan
+	 * included: a setting in postgresql.conf is kept when its definition comes before this call
+	 * and dropped with a warning when it comes after (C13-02: the tests set the reservation size
+	 * there).
+	 */
+	MarkGUCPrefixReserved("kingres_columnar");
 	kc_prev_object_access_hook = object_access_hook;
 	object_access_hook = kc_object_access;
 	kc_prev_process_utility = ProcessUtility_hook;
@@ -673,7 +690,7 @@ kingres_columnar_compact(PG_FUNCTION_ARGS)
 					 errmsg("min_rows must be positive")));
 		minrows = v;
 	}
-	n = kc_compact(rel, minrows);
+	n = kc_compact(rel, minrows, 0);
 	relation_close(rel, NoLock);
 	PG_RETURN_INT32(n);
 }

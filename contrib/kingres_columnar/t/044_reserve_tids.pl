@@ -20,6 +20,7 @@
 #   5. the same transactions with the setting off make the stripes and the row
 #      numbers 0.1 made (the reservation changes nothing when it is off).
 #
+# (The cluster sets kingres_columnar.reserve_min_rows = 0: these tests describe the layout of a reservation of a whole stripe, C6a; t/066 tests the small one.)
 # Needs a compiler and the server's headers for the probe module (part 2).  The
 # seed of the generator is printed; KC_SEED reruns it.
 #
@@ -38,7 +39,8 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 
 my $dir = build_module('kcprobe');
-my $node = new_node('rtids', preload => "$dir/kcprobe,kingres_columnar");
+my $node = new_node('rtids', preload => "$dir/kcprobe,kingres_columnar", conf => "kingres_columnar.reserve_min_rows = 0
+");
 
 my $seed = $ENV{KC_SEED} // (time() ^ ($$ << 8)) & 0x7fffffff;
 srand($seed);
