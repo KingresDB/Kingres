@@ -340,6 +340,10 @@ None.
 
 #### Documentation
 
+- The planned switchover (`failoverServer` with `mode: graceful`, ordinary groups): no change of schema. The text of the operation lists the steps and the
+  task error codes `standby_behind`, `switchover_unproven`, `cannot_quiesce` and `prepared_transactions_pending`; `group_degraded` (409) is used for the
+  first time (no standby streams from the primary); a request that includes the map group still answers 422 `unsupported_operation`. The console
+  should show the pause of the writes (events `quiesced` and `writesResumed` with `pauseMs` in the report) and treat `Task.cancellable` as false from the promotion on.
 - `Task.id`: 0 is the task that stands for the bootstrap; it never names a stored task.
 - The console should show: the pseudo task (a progress bar of the eight steps B1 to B8 while `id` is 0, then the recorded task), the paused
   rebalance (`stoppedBy` `safetyRule`, text "The map group was failed over."), and the alert `certificateAuthorityUnavailable` with the

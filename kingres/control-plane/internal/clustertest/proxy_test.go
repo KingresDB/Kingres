@@ -59,6 +59,28 @@ func viaProxyMode(ctx context.Context, n *clustertest.Node, port int, user, pass
 	return pgx.ConnectConfig(ctx, cfg)
 }
 
+// viaProxyHome is viaProxy until the session is on n's own instance. Right after the formation the primary of a server has not won its
+// lease yet, and the entry point then sends the connection to another server's primary (design: a primary without its lease is not a
+// destination); the certificate that connection meets names that server, which is the answer / condition the test waits out.
+func viaProxyHome(ctx context.Context, n *clustertest.Node, port int, user, pass string, cert *tls.Certificate, pool *x509.CertPool) (*pgx.Conn, error) {
+	deadline := time.Now().Add(90 * time.Second)
+	for {
+		conn, err := viaProxy(ctx, n, port, user, pass, cert, pool)
+		if err == nil {
+			s, werr := whereAmI(ctx, conn)
+			if werr == nil && s.Port == n.PGPort {
+				return conn, nil
+			}
+			_ = conn.Close(ctx)
+			err = fmt.Errorf("the session is not on the server's own instance yet: %+v %v", s, werr)
+		}
+		if time.Now().After(deadline) {
+			return nil, err
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
 type session struct {
 	Port int
 	SSL  bool
@@ -95,7 +117,7 @@ func TestClientEntryPoint(t *testing.T) {
 
 	// SCRAM over TLS through every entry point: the session is on that server's own instance.
 	for _, n := range c.Nodes {
-		conn, err := viaProxy(ctx, n, port, proxyUser, proxyPass, nil, pool)
+		conn, err := viaProxyHome(ctx, n, port, proxyUser, proxyPass, nil, pool)
 		if err != nil {
 			t.Fatalf("node %d: connecting through the entry point: %v\n%s", n.Index, err, n.LogTail(2000))
 		}
@@ -131,7 +153,7 @@ func TestClientEntryPoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, n := range c.Nodes {
-		conn, err := viaProxy(ctx, n, port, certUser, "", &pair, pool)
+		conn, err := viaProxyHome(ctx, n, port, certUser, "", &pair, pool)
 		if err != nil {
 			t.Fatalf("node %d: client certificate through the entry point: %v\n%s", n.Index, err, n.LogTail(2000))
 		}

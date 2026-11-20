@@ -16,8 +16,7 @@ func (n *Node) FaultDir() string { return filepath.Join(n.Dir, "fault") }
 // ForceEnforce is kept in the fault file by every SetFaults of this node (package fault).
 
 // SetFaults replaces the faults of this node (package fault); the empty Spec
-// removes them. kingresd notices within about 100 ms; tests that depend on a
-// fault being in force wait for the effect they expect, not for a time.
+// removes them. kingresd notices at its next use of a fault point (the hook compares the file, package fault), so a step that starts after this call returns never sees the faults that were replaced; tests that depend on an effect wait for the effect, not for a time.
 func (n *Node) SetFaults(s fault.Spec) {
 	n.t.Helper()
 	s.ForceEnforce = s.ForceEnforce || n.ForceEnforce

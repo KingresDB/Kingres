@@ -856,8 +856,13 @@ func handleFailoverDemote(ctx context.Context, d *haDeps, body []byte) (any, err
 	if d.LeaseMgr == nil {
 		return nil, notStarted
 	}
-	if err := staleTerm(ctx, d, r.ExpectedTerm, true); err != nil {
+	// The clean stop of a switchover is asked again to read the proof, when the instance is stopped and its catalog cannot be read:
+	// the term is then judged only when it can be read.
+	if err := staleTerm(ctx, d, r.ExpectedTerm, r.Mode != "fast"); err != nil {
 		return nil, err
+	}
+	if r.Mode == "fast" {
+		return demoteClean(ctx, d, r)
 	}
 	li, ok := d.Svc.PrimaryOf(r.Group)
 	if !ok {
@@ -1037,6 +1042,7 @@ func registerFailoverCallee(d *haDeps) {
 	reg(callFailoverDemote, handleFailoverDemote)
 	reg(callFailoverPromote, handleFailoverPromote)
 	reg("POST /failover/prepared", handleFailoverPrepared)
+	registerSwitchoverCallee(reg)
 	reg(callMapStart, handleMapStart)
 	reg(callMapContinue, handleMapContinue)
 }

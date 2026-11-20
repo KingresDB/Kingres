@@ -448,3 +448,25 @@ func (m *Manager) BecameStandby(group int32, leaseFile string) error {
 	}
 	return first
 }
+
+// Resume is the rollback of a planned switchover that did not reach the promotion (design 5.3): the marker of the hand-over is removed
+// and, when the primary of the group was stopped for the hand-over, the wait marker is written, so that the lease rounds start it again as
+// soon as this server holds the lease (README decision 7: a primary with an enforced lease is not started before it holds one). It is
+// idempotent and does nothing to a primary that runs.
+func (m *Manager) Resume(ctx context.Context, group int32) error {
+	if err := m.Unrelinquish(group); err != nil {
+		return err
+	}
+	inst, have := m.instance(group)
+	if !have {
+		return nil
+	}
+	up, err := inst.Running(ctx)
+	if err != nil {
+		return err
+	}
+	if up {
+		return nil
+	}
+	return pki.WriteFile(MarkerPath(m.c.Dir, WaitMarker, group), []byte("waiting for the group lease\n"), 0o600)
+}

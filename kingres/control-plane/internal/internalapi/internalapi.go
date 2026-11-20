@@ -154,7 +154,13 @@ var Calls = map[string]Policy{
 	"POST /failover/demote":   LeaderOnly,
 	"POST /failover/promote":  LeaderOnly,
 	"POST /failover/prepared": LeaderOnly,
-	"POST /standby/repoint":   LeaderOnly,
+	// The calls of the planned switchover (design 5.2): stop the writes of a group, mark the position, ask a standby for the proof, undo.
+	"POST /failover/quiesce":   LeaderOnly,
+	"POST /failover/unquiesce": LeaderOnly,
+	"POST /failover/mark":      LeaderOnly,
+	"POST /failover/verify":    LeaderOnly,
+	"POST /failover/resume":    LeaderOnly,
+	"POST /standby/repoint":    LeaderOnly,
 
 	// Configuration from the console (phase 13): the leader reads and sets the parameters of every
 	// server; any server answers the clock probe.
@@ -199,6 +205,7 @@ var handled = map[string]bool{
 	"GET /failover/position": true, "GET /liveness": true, "GET /catalog/nodes": true, "POST /failover/map/start": true, "POST /failover/map/continue": true, "GET /failover/state": true, "POST /failover/freeze": true,
 	"POST /failover/unfreeze": true, "POST /failover/standbys-gone": true,
 	"POST /failover/lease": true, "POST /failover/demote": true, "POST /failover/promote": true, "POST /failover/prepared": true, "POST /standby/repoint": true,
+	"POST /failover/quiesce": true, "POST /failover/unquiesce": true, "POST /failover/mark": true, "POST /failover/verify": true, "POST /failover/resume": true,
 	"POST /ledger/key/install": true, "POST /ledger/key/remove": true, "POST /ledger/key/list": true,
 	"POST /ledger/anchor/credentials/install": true, "POST /ledger/anchor/credentials/remove": true,
 	"POST /ledger/state/get": true, "POST /ledger/state/merge": true,

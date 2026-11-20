@@ -3019,6 +3019,14 @@ automatic run raises `autoFailoverTriggered`; the start writes the audit event `
 `manual`) for the monitor. Cluster tests: `internal/clustertest/failover_auto_test.go`. Not tested in a cluster: two failures at once (needs five servers),
 a rebalance running at the start, the stall tests of the design.
 
+## The planned switchover (increment 7, round 1: mode graceful; contract 0.13.0 text only)
+
+Code: `internal/failover/switchover.go` (the steps), `cmd/kingresd/switchover.go` (the callee: quiesce, unquiesce, mark, verify, resume, and the clean stop in `handleFailoverDemote` mode `fast`), `internal/instance/quiesce.go` (the hold rules), `Manager.Resume` in `internal/lease/adopt.go`.
+
+Per group (ordinary groups; the map group still answers 422 for `graceful`): `Freeze`, `Choose the standby` (a standby that streams from the primary; the verdict is none), `Stop the writes`, `Let distributed transactions end`, `Stop the old primary cleanly` (mark, the standby replays the mark, fast shutdown, the lease released), `Verify the new primary` (`switchover_verify`, repeated for 30 s), then `Wait for the old lease`, `Hand the lease`, `Promote` and the steps of every failover. Any failure before the promotion rolls back (`rollbackSwitchover`: the leases of the run are released, the old primary is resumed, the writes are let in again) and fails with `standby_behind`, `switchover_unproven`, `cannot_quiesce` or `prepared_transactions_pending`; a cancel does the same through `OnFail`; the cancel guard refuses from the start of `Promote`. The access rules of the old primary are put back in the last step, before its rebuild.
+
+Deviations from the design: the old primary becomes a standby by the rebuild of increment 4 (`pg_rewind`, which finds nothing to rewind after a clean stop), not by the adoption `/standby/adopt {clean}` of 6.3; the phases `quiescing`, `waitingForTransactions`, `stopping`, `verifying` and `writesPausedSince` of `GET /failover` are not reported yet (the steps are named in the task, and the report has the events `quiesced`, `stoppedClean`, `verified` and `writesResumed` with `pauseMs`); `Unquiesce` is not persisted across a restart of kingresd (the failed task puts the rules back).
+
 ## The signing keys of the ledger (phase 7, steps 3 and 4, contract 0.11.0)
 
 Design: `kingres/docs/design/ledger-phase7.md` (3.2 to 3.4, 6.7, 8.2 to 8.4, 9.1 to 9.3 and the corrections of section 14). This

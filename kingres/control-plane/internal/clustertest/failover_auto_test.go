@@ -30,7 +30,12 @@ func autoEnable(t *testing.T, n *clustertest.Node, max int) {
 func autoReports(t *testing.T, n *clustertest.Node, trigger string) []map[string]any {
 	t.Helper()
 	var out []map[string]any
-	for _, r := range items(t, n.Expect(200, "GET", "/failover/reports", nil)) {
+	// A 503 (the system database is moving with the failover that was just made) is an answer to ask again, not a failure.
+	st, body := n.Do("GET", "/failover/reports", nil, nil)
+	if st != 200 {
+		return nil
+	}
+	for _, r := range items(t, body) {
 		if r["trigger"] == trigger {
 			out = append(out, r)
 		}

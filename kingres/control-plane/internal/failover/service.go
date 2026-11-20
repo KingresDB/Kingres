@@ -134,7 +134,7 @@ func (s *Service) Plan(ctx context.Context, in Input) (Plan, error) {
 	nodes, _ := r.Cat.Nodes(ctx, SystemDB)
 	for _, g := range in.Groups {
 		gp := GroupPlan{ShardGroupID: g, IsMapGroup: g == 0, FromServerID: in.ServerID, Candidates: []CandidateOut{}, MovesTheManager: g == 0,
-			Steps: stepNames(), DataLoss: DataLoss{Verdict: VerdictUnknown, AsyncDatabases: []string{}, UnreadableServerIDs: []string{}}}
+			Steps: stepNamesOf(in), DataLoss: DataLoss{Verdict: VerdictUnknown, AsyncDatabases: []string{}, UnreadableServerIDs: []string{}}}
 		recs, err := r.Plan.Standbys(ctx, g)
 		if err != nil {
 			return out, err
@@ -174,7 +174,7 @@ func (s *Service) Plan(ctx context.Context, in Input) (Plan, error) {
 			est := int64(30)
 			gp.EstimatedSeconds = &est
 		}
-		if !Accepts(ch.Verdict, in.AllowDataLoss) {
+		if !in.graceful() && !Accepts(ch.Verdict, in.AllowDataLoss) {
 			gg := g
 			out.Blockers = append(out.Blockers, Blocker{Code: string(problem.FailoverNeedsDecision), ShardGroupID: &gg, Message: ch.Message})
 		}
@@ -183,6 +183,13 @@ func (s *Service) Plan(ctx context.Context, in Input) (Plan, error) {
 	_ = nodes
 	out.CanProceed = len(out.Blockers) == 0
 	return out, nil
+}
+
+func stepNamesOf(in Input) []string {
+	if in.graceful() {
+		return switchoverStepNames()
+	}
+	return stepNames()
 }
 
 func stepNames() []string {
