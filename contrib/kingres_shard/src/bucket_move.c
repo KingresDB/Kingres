@@ -90,6 +90,7 @@
 PG_FUNCTION_INFO_V1(kingres_internal_node_exec);
 PG_FUNCTION_INFO_V1(kingres_internal_switch_bucket);
 PG_FUNCTION_INFO_V1(kingres_internal_attach_bucket);
+PG_FUNCTION_INFO_V1(kingres_internal_ddl);
 PG_FUNCTION_INFO_V1(kingres_internal_detach_bucket);
 PG_FUNCTION_INFO_V1(kingres_internal_subscription_conninfo);
 PG_FUNCTION_INFO_V1(kingres_internal_note_barrier);
@@ -849,6 +850,7 @@ kingres_shard_assert_no_move(int colocation_id)
 	Datum		values[1];
 	int			found = 0;
 	int64		claimed = 0;
+	int64		splitting = 0;
 	Oid			save_uid;
 	int			save_sec;
 	int			ret;
@@ -895,8 +897,30 @@ kingres_shard_assert_no_move(int colocation_id)
 												  SPI_tuptable->tupdesc, 1, &isnull));
 		}
 	}
+	/* A split of a bucket of the group (0.8): its children are copies that do not see a change of the tables. */
+	if (found == 0 && claimed == 0 && OidIsValid(kingres_shard_catalog_relid("bucket_split")))
+	{
+		ret = SPI_execute_with_args("SELECT s.split_id FROM " KINGRES_SHARD_SCHEMA ".bucket_split s "
+									"WHERE s.colocation_id OPERATOR(pg_catalog.=) $1 "
+									"AND s.phase IN ('preparing', 'copying', 'catching_up', 'switching') LIMIT 1",
+									1, argtypes, values, NULL, true, 0);
+		if (ret != SPI_OK_SELECT)
+			elog(ERROR, "could not look for bucket splits");
+		if (SPI_processed > 0)
+		{
+			bool		isnull;
+
+			splitting = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+		}
+	}
 	SetUserIdAndSecContext(save_uid, save_sec);
 	SPI_finish();
+	if (splitting > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("a bucket of colocation group %d is being split (split " INT64_FORMAT ")", colocation_id, splitting),
+				 errdetail("The statement would change the tables of the group while the children of the bucket are copied."),
+				 errhint("Wait for the split to finish, or cancel it with kingres.cancel_bucket_split(); see kingres.bucket_split.")));
 	if (found > 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
@@ -1560,6 +1584,35 @@ kingres_internal_attach_bucket(PG_FUNCTION_ARGS)
 		appendStringInfo(&sql, "ALTER TABLE %s.%s DROP CONSTRAINT IF EXISTS ks_bucket_check",
 						 quote_identifier(nsp), quote_identifier(part));
 		spi_stmt(sql.data);
+	}
+	PG_FINALLY();
+	{
+		kingres_shard_internal_ddl_leave();
+	}
+	PG_END_TRY();
+	SPI_finish();
+	PG_RETURN_VOID();
+}
+
+/*
+ * kingres.internal_ddl(sql text)
+ *
+ * Run one statement as the extension's own DDL: the utility hook that refuses a statement on a distributed table (and on its bucket
+ * partitions) that would change one node only lets it pass.  The split of a bucket creates its capture triggers on the bucket partition
+ * of the owning node this way.  Superusers only; one statement.
+ */
+Datum
+kingres_internal_ddl(PG_FUNCTION_ARGS)
+{
+	char	   *sql = text_to_cstring(PG_GETARG_TEXT_PP(0));
+
+	require_superuser("kingres.internal_ddl()");
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	kingres_shard_internal_ddl_enter();
+	PG_TRY();
+	{
+		spi_stmt(sql);
 	}
 	PG_FINALLY();
 	{

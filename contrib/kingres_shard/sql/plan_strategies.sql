@@ -153,6 +153,12 @@ SELECT count(*) AS moves_without_the_extra_load FROM kingres.plan_rebalance(thre
 SELECT public.setup_nodes(3, ARRAY[2]);
 SELECT public.setup_colo(1, 21, ARRAY['0:10', '1:10', '2:1']);
 SELECT seq, source_group, target_group, reason FROM kingres.plan_rebalance();
+-- a move must bring the utilizations closer, per unit of weight: group 0 (weight 1) holds 2 buckets (utilization 2), group 1 (weight 2) holds 3 (1.5);
+-- a bucket from 0 to 1 would give 1 and 2, which is farther apart, so there is nothing to move
+SELECT public.setup_nodes(2, '{}', ARRAY[1, 2]);
+SELECT public.setup_colo(1, 5, ARRAY['0:2', '1:3']);
+SELECT count(*) AS moves_that_do_not_help FROM kingres.plan_rebalance();
+SELECT * FROM kingres.group_load();
 -- weights decide too: group 2 counts for three
 SELECT public.setup_nodes(3, '{}', ARRAY[1, 1, 3]);
 SELECT public.setup_colo(1, 15, ARRAY['0:5', '1:5', '2:5']);

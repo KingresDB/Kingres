@@ -8,6 +8,7 @@ SELECT c.relname
 ----------------------
  bucket_map
  bucket_move
+ bucket_split
  cluster_secret
  colocation
  dist_partition
@@ -26,7 +27,7 @@ SELECT c.relname
  table_operation
  table_operation_item
  table_operation_lock
-(20 rows)
+(21 rows)
 
 SELECT conrelid::regclass AS tbl, conname, contype
   FROM pg_constraint
@@ -43,6 +44,10 @@ SELECT conrelid::regclass AS tbl, conname, contype
  bucket_move          | bucket_move_groups_check        | c
  bucket_move          | bucket_move_phase_check         | c
  bucket_move          | bucket_move_pkey                | p
+ bucket_split         | bucket_split_parts_check        | c
+ bucket_split         | bucket_split_phase_check        | c
+ bucket_split         | bucket_split_pkey               | p
+ bucket_split         | bucket_split_verify_check       | c
  cluster_secret       | cluster_secret_length_check     | c
  colocation           | colocation_bucket_count_check   | c
  colocation           | colocation_max_modulus_check    | c
@@ -76,7 +81,7 @@ SELECT conrelid::regclass AS tbl, conname, contype
  table_operation      | table_operation_phase_check     | c
  table_operation      | table_operation_pkey            | p
  table_operation      | table_operation_verified_check  | c
-(42 rows)
+(46 rows)
 
 -- Nothing is created outside the kingres schema.
 SELECT count(*) AS tables_outside_kingres

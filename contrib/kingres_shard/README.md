@@ -2391,6 +2391,48 @@ connections makes the move fail with "too many clients" and the move is undone.
 
 Tests: `t/202_concurrent_moves.pl`, `t/203_move_progress.pl`, and `drain_status` in the regression test `plan_strategies`.
 
+## Splitting a bucket (version 0.8, phase 10, increment P10.5)
+
+`kingres.split_bucket(colocation_id, bucket, parts DEFAULT 2, verify DEFAULT 'count')` replaces the partition of one bucket, in every table of its
+colocation group, by `parts` (2, 4, 8 or 16) partitions of a modulus `parts` times larger. It runs on the map group primary, as a superuser, in a
+READ COMMITTED session (it follows the progress of other nodes), and returns the id of its record in `kingres.bucket_split`. The children stay on the
+group of the bucket: the new buckets are `bucket + i * modulus` for `i = 0 .. parts - 1`, the bucket keeps its number for `i = 0`, `max_modulus` of the group
+goes up and the placement epoch counts the switch. Move the children apart afterwards with `move_bucket()` or a rebalance.
+
+How it works (design/shard-phase10.md, section 3):
+
+1. **Preparing.** The preconditions are checked on the owning node before anything is recorded: every table has a primary key; none is partitioned by the user,
+   none has a generated or an identity column, every bucket partition is a plain heap table (a columnar table cannot be split); the bucket is `active`; no split
+   of the colocation group is unfinished; `kingres.internal_split_allowed()` (a hook that the line of work of distributed schemas redefines to refuse a group that
+   holds a schema) says yes. The record is made, the bucket's state becomes `splitting` on every node.
+2. **Children and triggers**, on the owning node, in one transaction: for every table a standalone child per part (`LIKE` the table, with the `ks_bucket_check`
+   constraint that makes the later attach scan-free) and a trigger on the old partition, `ENABLE ALWAYS` so that `session_replication_role = replica` does not skip it,
+   that makes every change of the partition in the child that covers the row, in the writer's own transaction (a delete and an upsert; `TRUNCATE` truncates the
+   children). A write of the old partition by any means is therefore copied.
+3. **Backfill**, in batches of 5000 rows each in a transaction of its own: the rows after the last key, those no writer holds (`FOR SHARE SKIP LOCKED`), are copied with
+   `ON CONFLICT DO NOTHING`. Passes repeat until one copies nothing and finds nothing held (at most 10).
+4. **Switch**, on the owning node, in one transaction: the tables and the old partitions are locked `SHARE` (writers wait, readers do not), each lock for at most
+   `max(200 ms, move_switch_timeout / 10)`; `verify 'count'` compares the number of rows of every old partition with its children and brings them in line if they differ
+   (`'full'` does it always, key by key; `'none'` trusts the triggers); the triggers go; the old partitions are detached as `kingres.orphan_s<id>_<n>` (readers wait from the
+   detach to the commit); the children are renamed to `<table>_bNNNN` and attached with the new modulus. A lock that is not got is retried up to
+   `move_switch_attempts` times with a growing pause; the last failure names the sessions in the way.
+5. **The catalog** on the map group primary: the bucket's row becomes the children's, `max_modulus` and the epoch go up, the map is synchronized. This comes after the switch
+   and not in the same two-phase transaction (a difference from the design): the children are on the same group as the bucket, so a router that still has the old layout
+   reaches the right group and PostgreSQL prunes by the partitions it has; a scan that overlaps the two steps sees the epoch change and gets the retryable `KS001`.
+6. **Cleaning.** The orphans are dropped by `kingres.cleanup_bucket_splits()` after `move_cleanup_delay` (the recovery worker calls it).
+
+Failure and recovery: until the switch every failure undoes the split (`internal_split_undo`: the triggers, their functions and the children go, the bucket is `active`). A session
+that dies is settled by `kingres.resume_bucket_splits()` (the recovery worker calls it): a split whose partitions are not switched is undone, one whose partitions are switched gets its
+catalog. `kingres.cancel_bucket_split(id)` stops a split that has not reached its switch. `kingres.check_cluster()` says `split_stalled`, `split_trigger` and `split_child_table`.
+While a split runs, `create_distributed_table()` and the other changes of the group's tables are refused (the same check as for a move) and the bucket cannot be moved. The bucket
+map's state is `splitting`, and `kingres.bucket_split` is readable by superusers only.
+
+Not done: a split of a user-partitioned table or of a columnar table (refused), a split by `parts` other than 2, 4, 8 or 16, the merge of buckets, and the split of several buckets of a group at once (one split per
+colocation group at a time).
+
+Tests: `t/204_split_bucket.pl` (splits, writers during every phase, bypasses, refusals, cancel, killed sessions and the worker, moves of the children, a table made later) and the regression test
+`bucket_layout` for the layouts a split makes.
+
 ## High availability (version 0.5, phase 5)
 
 Version 0.5 is the part of high availability that lives in the extension

@@ -1566,6 +1566,7 @@ kingres_shard_recovery_worker_main(Datum main_arg)
 	Oid			dboid = DatumGetObjectId(main_arg);
 	bool		run_moves = false;
 	bool		run_table_ops = false;
+	bool		run_splits = false;
 	bool		run_deadlock = false;
 	char		mode[16] = "recovery";
 
@@ -1616,6 +1617,11 @@ kingres_shard_recovery_worker_main(Datum main_arg)
 		run_table_ops = strcmp(mode, "recovery") == 0 &&
 			cat->present && cat->local_group_id == KINGRES_SHARD_MAP_GROUP &&
 			OidIsValid(kingres_shard_catalog_relid("table_operation"));
+
+		/* The same for the records of bucket splits (0.8). */
+		run_splits = strcmp(mode, "recovery") == 0 &&
+			cat->present && cat->local_group_id == KINGRES_SHARD_MAP_GROUP &&
+			OidIsValid(kingres_shard_catalog_relid("bucket_split"));
 	}
 	PopActiveSnapshot();
 	CommitTransactionCommand();
@@ -1642,6 +1648,13 @@ kingres_shard_recovery_worker_main(Datum main_arg)
 	 * switch is undone, one that switched is finished, an undone one that missed a node is cleaned again; the old
 	 * copies whose time has come are dropped.  The functions leave an operation alone whose session holds its live mark.
 	 */
+	/* Splits (0.8): one whose session died is undone, or finished when its switch committed; the orphans of finished ones are dropped. */
+	if (run_splits)
+	{
+		run_move_step("SELECT " KINGRES_SHARD_SCHEMA ".resume_bucket_splits()");
+		run_move_step("SELECT " KINGRES_SHARD_SCHEMA ".cleanup_bucket_splits()");
+	}
+
 	if (run_table_ops)
 	{
 		run_move_step("SELECT " KINGRES_SHARD_SCHEMA ".resume_table_operations()");
