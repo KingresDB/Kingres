@@ -246,6 +246,8 @@ q1($n1, q{DELETE FROM public.loc WHERE id > 100});
 	is($out, "1\n2", 'a cursor that is not scrollable is shipped');
 }
 is(q1($n1, q{SELECT count(*) FROM ra.t t JOIN public.ref r ON r.id = t.n}), q1($n2, q{SELECT count(*) FROM ra.t t JOIN public.ref r ON r.id = t.n}), 'a reference table read together with a table of the schema');
+fails($n1, q{UPDATE public.ref r SET name = 'changed' FROM ra.t t WHERE t.id = r.id}, qr/writes a reference table and reads table "ra\.t"/, 'a write to a reference table that reads a table of the schema (it would change one copy)');
+for my $n (@nodes) { is(q1($n, q{SELECT string_agg(name, ',' ORDER BY id) FROM public.ref}), 'r1,r2', $n->name . ': the reference table is unchanged'); }
 fails($n1, q{WITH x AS (UPDATE public.ref SET name = name RETURNING id) SELECT count(*) FROM ra.t, x}, qr/reference table/, 'a write to a reference table that reads a table of the schema');
 
 # ---------------------------------------------------------------------------
