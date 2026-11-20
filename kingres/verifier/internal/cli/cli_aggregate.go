@@ -33,6 +33,8 @@ type aggOptions struct {
 	chainSrc pubsrc.Source
 	// previous is a checkpoint of this aggregate log the auditor holds (verified by the caller).
 	previous *checkpoint.Checkpoint
+	// accept are the epoch-closed events the auditor accepted (--accept-epoch-closed).
+	accept *epochAccept
 }
 
 type memberKey struct {
@@ -63,6 +65,8 @@ type aggReport struct {
 	notes      []string
 	info       []map[string]any
 	previous   *aggregate.Leaf
+	// closed lists the accepted epoch-closed findings, for the info.
+	closed []map[string]any
 }
 
 func flagNames(m aggregate.Member) []string {
@@ -110,11 +114,17 @@ func (p *pubInputs) verifyAggregate(r *result, id string, o aggOptions) (*aggRep
 			}
 		}
 		if !found {
-			return nil, failedOut("member", fmt.Errorf("the chain %s is not a member of the last round of the aggregate (round %d): the aggregate does not cover it", o.only, leaf.Seq))
+			tail := ""
+			if w, werr := p.events(); werr == nil && w != nil {
+				if ec, ok := w.EpochClosed[events.ChainKey(o.only.chain, o.only.epoch)]; ok {
+					tail = ". " + epochClosedText(*o.only, ec) + ". The aggregate covers the epochs that are open: show a block of a closed epoch through the signed chain log (--log-leg chain), which stays served, and an aggregate checkpoint you hold from before it was closed"
+				}
+			}
+			return nil, failedOut("member", fmt.Errorf("the chain %s is not a member of the last round of the aggregate (round %d): the aggregate does not cover it%s", o.only, leaf.Seq, tail))
 		}
 	}
 	cs := &chainChecker{p: p, src: o.chainSrc, rep: rep}
-	var diverged []string
+	var diverged, closedRefused, remarks []string
 	for _, m := range leaf.Members {
 		k := memberKey{m.ChainID, m.Epoch}
 		rep.info = append(rep.info, map[string]any{"chain_id": hex.EncodeToString(m.ChainID[:]), "epoch": m.Epoch, "height": m.Height, "flags": flagNames(m),
@@ -136,8 +146,23 @@ func (p *pubInputs) verifyAggregate(r *result, id string, o aggOptions) (*aggRep
 			detail += "; flagged stale"
 		}
 		if m.Diverged() {
-			diverged = append(diverged, k.String())
-			detail += "; flagged diverged"
+			st, text, out := p.closedMember(r, rep, k, m, cl, o.accept)
+			if !out.ok() {
+				return nil, out
+			}
+			switch st {
+			case epochAccepted:
+				detail += "; flagged diverged, and its epoch was closed by a verified event that you accepted (see the finding)"
+			case epochRefused:
+				closedRefused = append(closedRefused, text)
+				detail += "; flagged diverged, and its epoch was closed by a verified event"
+			default:
+				diverged = append(diverged, k.String())
+				if text != "" {
+					remarks = append(remarks, text)
+				}
+				detail += "; flagged diverged"
+			}
 		} else if m.Retired() {
 			switch out := p.checkRetired(r, m, cl); out.kind {
 			case outOK:
@@ -151,7 +176,10 @@ func (p *pubInputs) verifyAggregate(r *result, id string, o aggOptions) (*aggRep
 		r.ok("member "+k.short(), detail)
 	}
 	if len(diverged) > 0 {
-		return nil, failedOut("diverged", fmt.Errorf("the aggregate reports %s as diverged: the publisher stopped that chain log because it was rolled back or rewritten (a restore, or blocks lost at a failover), and the head shown is the last good one", strings.Join(diverged, ", ")))
+		return nil, failedOut("diverged", fmt.Errorf("the aggregate reports %s as diverged: the publisher stopped that chain log because it was rolled back or rewritten (a restore, or blocks lost at a failover), and the head shown is the last good one%s", strings.Join(diverged, ", "), remarkTail(remarks)))
+	}
+	if len(closedRefused) > 0 {
+		return nil, failedOut("epoch-closed", errors.New(strings.Join(closedRefused, "; ")))
 	}
 	if o.previous != nil {
 		if out := p.continuity(r, rep, o); !out.ok() {
@@ -327,8 +355,17 @@ func (p *pubInputs) continuity(r *result, rep *aggReport, o aggOptions) outcome 
 		case om.Retired() && still:
 			return failedOut("continuity", fmt.Errorf("chain %s was flagged retired in round %d and is in round %d again: a retired chain is left out of the next round", k, old.Seq, rep.leaf.Seq))
 		case om.Retired():
+			if handled, out := p.epochContinuity(r, rep, cs, om, k, o.accept); handled && !out.ok() {
+				return out
+			}
 			continue
 		case !still:
+			if handled, out := p.epochContinuity(r, rep, cs, om, k, o.accept); handled {
+				if !out.ok() {
+					return out
+				}
+				continue
+			}
 			// retired in a round between the two, which this run did not read: the event says so
 			w, werr := p.events()
 			if werr == nil {
@@ -377,7 +414,7 @@ func (p *pubInputs) continuity(r *result, rep *aggReport, o aggOptions) outcome 
 // ---- the command ----
 
 func (e *env) runAggregate(args []string) int {
-	fs, asJSON := e.newFlagsWithExit("aggregate", "--trust FILE --aggregate-id HEX [--source SOURCE] [--previous NOTEFILE] [--chains-from SOURCE] [--now TIME] [--json]",
+	fs, asJSON := e.newFlagsWithExit("aggregate", "--trust FILE --aggregate-id HEX [--source SOURCE] [--previous NOTEFILE] [--chains-from SOURCE] [--accept-epoch-closed SEQ ...] [--now TIME] [--json]",
 		"Verify the aggregate log of a database: its checkpoint (a signature of a pinned key), its last\n"+
 			"leaf as an entry of the signed tree, and each member of that leaf against the chain log it names\n"+
 			"(the checkpoint of the chain log, the member's root as a prefix of that log, the block as the\n"+
@@ -387,11 +424,15 @@ func (e *env) runAggregate(args []string) int {
 			"file) it also proves that the aggregate log extends it, that no chain vanished without a record,\n"+
 			"that no head went back and that every chain log extends the log the older round named.\n"+
 			"--source is a directory, a .tar.gz file or an https address; the chain logs are read from the\n"+
-			"same place unless --chains-from names another.", exitTextWith3)
+			"same place unless --chains-from names another. A member whose epoch a verified epoch-closed event closed (or a round you hold\n"+
+			"that names a chain whose epoch was closed since) is a failure at step epoch-closed that says what the event states;\n"+
+			"--accept-epoch-closed SEQ, for the number of that event, prints it as a finding and goes on, to verify the new epoch alone.", exitTextWith3)
 	trustPath := fs.String("trust", "", "trust file (JSON)")
 	source := fs.String("source", ".", "directory, .tar.gz or https address of the publication or bundle")
 	aggID := fs.String("aggregate-id", "", "the aggregate id, 64 lower case hex characters")
 	previous := fs.String("previous", "", "a checkpoint of this aggregate log that you hold (a note, or a state file)")
+	var acceptEpoch logListFlag
+	fs.Var(&acceptEpoch, "accept-epoch-closed", "the number of an epoch-closed event whose finding you accept (repeatable)")
 	chainsFrom := fs.String("chains-from", "", "where the chain logs are read when not in --source")
 	nowFlag := fs.String("now", "", "time for key validity windows, RFC 3339 (default: system clock)")
 	if code, done := e.parseFlags(fs, args); done {
@@ -399,7 +440,7 @@ func (e *env) runAggregate(args []string) int {
 	}
 	const cmd = "aggregate"
 	r := &result{cmd: cmd}
-	out := e.aggregateRun(r, *trustPath, *source, *aggID, *previous, *chainsFrom, nowOf(fs, nowFlag))
+	out := e.aggregateRun(r, *trustPath, *source, *aggID, *previous, *chainsFrom, acceptEpoch, nowOf(fs, nowFlag))
 	switch out.kind {
 	case outInput:
 		return e.inputErrorInfo(cmd, *asJSON, out.err, r.inputInfo())
@@ -414,7 +455,7 @@ func (e *env) runAggregate(args []string) int {
 var hex64RE = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 // aggregateRun does the work of the command and fills r; its outcome is how it ended.
-func (e *env) aggregateRun(r *result, trustPath, source, aggID, previous, chainsFrom string, now nowArg) outcome {
+func (e *env) aggregateRun(r *result, trustPath, source, aggID, previous, chainsFrom string, acceptEpoch []string, now nowArg) outcome {
 	if !hex64RE.MatchString(aggID) {
 		return inputOut(errors.New("--aggregate-id is required: 64 lower case hex characters"))
 	}
@@ -428,6 +469,11 @@ func (e *env) aggregateRun(r *result, trustPath, source, aggID, previous, chains
 	}
 	r.notes = append(r.notes, p.notes...)
 	var o aggOptions
+	acc, err := newEpochAccept(acceptEpoch)
+	if err != nil {
+		return inputOut(err)
+	}
+	o.accept = acc
 	if chainsFrom != "" {
 		cs, err := pubsrc.Open(chainsFrom, pubsrc.Options{})
 		if err != nil {
@@ -466,8 +512,16 @@ func (e *env) aggregateRun(r *result, trustPath, source, aggID, previous, chains
 		oldWeakInfo(r.info, held)
 	}
 	rep, out := p.verifyAggregate(r, aggID, o)
+	r.notes = append(r.notes, acc.unusedNotes()...)
 	if !out.ok() {
 		return out
+	}
+	r.notes = append(r.notes, p.closedEpochNotes(rep)...)
+	if len(rep.closed) > 0 {
+		if r.info == nil {
+			r.info = map[string]any{}
+		}
+		r.info["epochs_closed_accepted"] = rep.closed
 	}
 	if r.info == nil {
 		r.info = map[string]any{}

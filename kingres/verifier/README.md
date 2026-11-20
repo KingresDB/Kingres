@@ -993,9 +993,10 @@ the limit of the caller after any gzip decoding. A server that cannot be reached
 out is "could not check": status 3, never 1. A 404 is an absent file.
 
 ```
-kingres-verify aggregate   --trust T --aggregate-id HEX [--source S] [--previous NOTEFILE] [--chains-from S] [--now TIME] [--json]
-kingres-verify proof       --proof P --bundle S --trust T --log-leg chain|aggregate [--epoch N] [--aggregate-id HEX] [--table-id N --row-hash HEX --op I|D|any]
+kingres-verify aggregate   --trust T --aggregate-id HEX [--source S] [--previous NOTEFILE] [--chains-from S] [--accept-epoch-closed SEQ ...] [--now TIME] [--json]
+kingres-verify proof       --proof P --bundle S --trust T --log-leg chain|aggregate [--epoch N] [--aggregate-id HEX] [--accept-epoch-closed SEQ ...] [--table-id N --row-hash HEX --op I|D|any]
 kingres-verify bundle verify --trust T BUNDLE [--require-anchors N] [--require-attestation] [--attestation-table-id N]
+                           [--accept-epoch-closed SEQ ...] [--worm-url [ID=]URL ...] [--btc-header HEIGHT:HEX80 ...]
 kingres-verify bundle fetch  --source URL --out DIR [--log LOG ...] [--trust T] [--since-size N] [--max-files N] [--max-bytes N]
 kingres-verify monitor     --trust T --source S --state DIR [--log LOG ...] [--init] [--once] [--interval D] [--polls N]
 kingres-verify trust follow --trust T --source S --out FILE
@@ -1073,8 +1074,7 @@ logs the index does not name, which are verified too. For every log: the checkpo
 every entry (block headers: heights, `prev_hash` links from the genesis hash, times; aggregate leaves: sequence, times), and **every
 file of the tile directories** (a partial tile or entry bundle of an older size must be the first hashes or entries of the tile or
 bundle of the signed tree; a file the tree does not have is a failure). Then each aggregate against its chains, each proof on the chain leg and
-on the aggregate leg when an aggregate names the chain, each attestation (needs `--attestation-table-id`), the events (the line says how many were verified under the trust file and how many were not; one that is not is status 3). **Anchors are not verified by this version**: a
-bundle that lists anchor files, or `--require-anchors` above 0, ends with status 3. A source that cannot list directories (HTTP) is
+on the aggregate leg when an aggregate names the chain, each attestation (needs `--attestation-table-id`), the events (the line says how many were verified under the trust file and how many were not; one that is not is status 3). **Anchors are verified** (step 21, "Epochs and anchors in `bundle verify`" below). A source that cannot list directories (HTTP) is
 told so in a note and the older partial tiles are not checked.
 Mutation tests flip every byte of every file of a bundle, **the event files included**, one at a time, and none verifies
 (`bundle.json` alone is an index that is not believed, and `logs.json` is not read by `bundle verify`: the layout is searched). A log in the layout that the
@@ -1966,6 +1966,8 @@ The design is silent or open on these points; each decision takes the stricter b
 The eighth review (`kingres/docs/reviews/2026-11-19-kingres-verifier-publication-and-client-signatures.md`) found no input that verified when it should not.
 Its findings were about what a VERIFIED left out. Each fix has a test that fails without it, named in the table.
 
+**State at step 21.** All twelve findings are fixed in the code and have a test; none is left open. The project README listed four of them (V8-01 to V8-04) as open after they were fixed, and now says so. Step 21 ran every test of the table again and mutated each fix by one line (the revocation by a verified event, the count of events that were verified, the diverged flag in the table of the flags, the ceiling of files of `bundle fetch`, the retired chain that goes on): all are killed. One of them was not at first: the ceiling of files at the write itself, behind the check that precedes the requests, had no test that reached it, and `TestV803TheFileCeilingHoldsAtTheWriteAsWell` does (a ceiling equal to the number of tile and entry files passes the check and is reached by the checkpoint, the last file written).
+
 | Finding | Fix | Test |
 |---|---|---|
 | V8-01 key events changed nothing outside `trust follow` | one rule for every command: the trust file is narrowed by the verified events before any signature is judged (see "Key events"); the output names the event and the keys that vouched | `TestV801AKeyRevokedByAVerifiedEventVouchesForNothingInAnyCommand`, `TestV801TheOutputNamesTheKeysThatVouched`, `TestV801ARetiredKeyVouchesOnlyUpToTheBoundOfTheEvent`, `TestV801AKeyAddedByAnEventIsNotUsedHere` |
@@ -2007,6 +2009,88 @@ checkpoint**; that every event counted as verified was signed by a key the trust
 judged by the table. **Not** that no revocation exists (an event that is withheld, or sits after the point where an HTTP source stops, is invisible), not the
 time of anything (no anchor was read by these commands), and not that a key that an event added is trusted (use `trust follow`).
 
+## Epochs and anchors in `bundle verify` (phase 7, step 21)
+
+```
+kingres-verify aggregate     ... [--accept-epoch-closed SEQ ...]
+kingres-verify proof         ... --bundle S [--accept-epoch-closed SEQ ...]
+kingres-verify bundle verify ... [--accept-epoch-closed SEQ ...] [--require-anchors N] [--worm-url [ID=]URL ...] [--btc-header HEIGHT:HEX80 ...]
+```
+
+**What an epoch is.** When the chain of a database is restored to an earlier state, or loses its tail at a failover, the publisher stops that
+chain's log (the member is flagged `diverged`) until an operator acknowledges it (design 9.4). The acknowledgement publishes a signed event
+`epoch-closed`, freezes the log of the old epoch (its checkpoint and tiles stay served for ever), opens the log of epoch *e + 1* (a different log
+with another origin, built from block 0 of the chain as it is now), flags the old member `retired` and `diverged` (flag byte 0x06) in the one leaf
+that follows, and leaves it out after that. Each epoch verifies **on its own**. What does not hold is a comparison between them: the log of epoch
+*e + 1* is not an extension of the log of epoch *e*, and an auditor who holds a head of the old history must be told, not shown VERIFIED.
+
+**The event** (`events/<6 digits>`, the note of every event, key name the origin prefix) has the type `epoch-closed` and exactly these lines after `seq`,
+`time` and `type`: `chain` (64 lower case hex), `epoch` (the epoch that was closed, from 1), `final-size` (from 1: the size of the closed log, the last
+one published), `final-root` (64 lower case hex, its root at that size), `common-height` (`unknown`, `-1` for no common block, or a height below the
+final size), `kind` (`restore`, `failover-loss` or `other`), `reason` (1 to 200 printable ASCII characters) and `acknowledged-by` (1 to 200). A missing or
+extra line, a non canonical number, a second event for one epoch, a `kind` outside the three: status 1, step `events`. An event counts only when an
+authorised key signed it (the rule of every event, see "Key events"); one that no authorised key signed is skipped and listed, and changes nothing. The
+publisher writes `common-height: unknown` today: finding the highest height whose block is the same in both histories needs the old blocks, which the
+database no longer has. The text of a finding says "common height not stated" then, and counts the blocks above the common height only when the event gives it.
+**The event is what the operator and the publisher say; the verifier checks that it is signed and that it describes the log it closes, not that the
+restore happened as described.**
+
+**What each command does with it.**
+
+| Command | Input | Without `--accept-epoch-closed` | With it (for the number of that event) |
+|---|---|---|---|
+| `aggregate` | the last leaf has a member flagged diverged (0x04 or 0x06) for which a verified event closed the epoch | 1, step `epoch-closed`: the event's statement (epoch, event number, kind, common height, who acknowledged, the reason, the blocks published) and the sentence to run again | 0: the step `finding epoch-closed` says what was accepted; it is printed, never silent; the member is not checked for a chain-retired event (the event confirms it) |
+| `aggregate` | the same, and the event's `final-size` or `final-root` is not the member's size and root, or the signed log of the closed epoch is longer than `final-size` | 1, step `epoch-closed` | 1, the same: the flag never covers a disagreement between the event and the log |
+| `aggregate` | a member flagged diverged and **no** verified event (none, or one that no authorised key signed: the output says so) | 1, step `diverged` (unchanged, V8-04) | 1, step `diverged` |
+| `aggregate` | the last leaf is of the new epoch alone (the old member is left out) | 0 and a note per verified `epoch-closed` event about a chain of the aggregate: nothing was compared with the old epoch; give `--previous` | the same note (the number accepted nothing: said in a note) |
+| `aggregate --previous N` | the held round names a chain of epoch *e* that the last round no longer has, and a verified event closed that epoch | 1, step `epoch-closed`: "epoch *e* was closed by event ... N blocks above the common height existed and are not in epoch *e + 1*"; before saying it, the held head is proved a prefix of the frozen log of the closed epoch (else step `continuity`, a fork, never covered by the flag) | 0 and the finding; the continuity of every other chain is checked as before |
+| `aggregate --previous N` | the same and no verified event | 1, step `continuity`, "removed without record" (unchanged) | 1 |
+| `checkpoint`, `consistency` inside one epoch | the log is of an epoch that a verified event closed | 0 as before, and the note "finding: this log is of an epoch that a verified event closed, and it is frozen" with the statement of the event | the same |
+| `consistency --log chain:ID:eN --old NOTE` | the note is a checkpoint of the same chain at **another epoch** that a verified event closed | 1, step `epoch-closed` (the verified event, its statement, and "different logs: the tree of one is not a prefix of the other"), both checkpoints are verified first. When no verified event closed that epoch the note is not a checkpoint of this log, status 2, as before. A held size or root that contradicts the event is also step `epoch-closed` | there is no flag: nothing is proved, so nothing is accepted |
+| `proof --bundle --log-leg aggregate` | the chain of the proof is a member in a round where its epoch is closed (flagged 0x06) | as `aggregate` for that member | as `aggregate` |
+| `proof --bundle` | the block is shown in an epoch that a verified event closed | 0, with the note "finding: the block is shown in epoch *e*, which a verified event closed ... this run does not show that the block is in the history that goes on", and "by that statement it is in the history that goes on as well" when the event gives a common height at or above the block | the same |
+| `proof --log-leg aggregate` | the chain of the proof is of a closed epoch that the last round no longer names | 1, step `member`, with the finding and what to do instead (show the block through the signed chain log, and an aggregate checkpoint you hold from before the closing) | the same |
+| `bundle verify` | the bundle holds the log of an epoch *e + 1* of a chain and no verified event closed epoch *e* | 1, step `epoch-closed`: the event was withheld, or this is not the publication; "an event that no authorised key signed" is said when there is one | 1, the same |
+| `bundle verify` | a verified event closed an epoch of a chain the bundle holds | 1, step `epoch-closed` with the statement; when the closed log is in the bundle, its signed size and root must be the event's `final-size` and `final-root` (a difference is 1 whatever is accepted); a proof whose block is in the closed epoch (found by trying the epochs newest first) is named in the same failure unless the event states a common height at or above the block | 0, with the step `finding epoch-closed` that says what was accepted and what was compared (the frozen log, and whether the log of the next epoch is in the bundle) |
+| `monitor` | a verified `epoch-closed` event in the publication | 0 (nothing changes), and a note "finding: ..." on every poll: the closed log stays frozen, the log of the next epoch is another log, and a state kept for one is not a state of the other | the same |
+
+A chain log of the bundle with several epochs: a proof is shown in the epochs newest first, and the first whose log holds the block at its height is the one
+(the proof file carries no epoch). A proof that no epoch holds is the failure it always was (step `log-inclusion`). The aggregate leg of a proof is made only against the epoch
+the aggregate names in its last round; a proof of a block of a closed epoch says so in a note and has no aggregate leg.
+
+**What `--accept-epoch-closed SEQ` is.** SEQ is the number of the event, as in the file name `events/000003` (a canonical decimal; `007`, `-1`, an empty value
+or a number above 2^31 is status 2). It accepts **that event's finding and nothing else**: it does not make a checkpoint verify, does not cover a log that disagrees with the
+event, a fork of the held head, an event that no authorised key signed, a diverged member without an event, or a different event. It never hides the finding: the step
+`finding epoch-closed` carries the statement, the number is in `--json` as the step and in `info.epochs_closed_accepted` (`aggregate`) or `info.epochs_closed` (`bundle verify`), and a number
+that no finding of the run needed is said in a note ("accepted nothing"), so that a typo cannot pass for an acceptance. Use it to verify the new epoch alone, after reading
+the finding; do not put it in a script that is meant to notice a restore.
+
+**`bundle verify`: what else is new.**
+
+- *Anchors.* For every aggregate log in the bundle the sizes and targets are the directories `a/<id>/anchors/<size>/` of the source when it can list them, and the paths that
+  `bundle.json` names when it cannot (hints: nothing in the index is believed; a path that is not of the layout is not read and is listed as not checked). Each evidence file is
+  checked by the code of `anchors`: the digest is recomputed from the signed aggregate log, the kind is verified from **your** inputs (`--worm-url`, `--btc-header`, the `tsa_roots`
+  of the trust file). Without `--require-anchors` every anchor the bundle holds must verify, and one that cannot (no means for it, a pending proof, an evidence file that is absent,
+  a size above the signed checkpoint) is status 3. With `--require-anchors N` the count decides: status 3 unless at least N anchors verified, and an anchor that could not be
+  checked is a note ("not required, and not verified"). A failure of any evidence file is status 1 in both cases. A bundle with no anchor at all and no `--require-anchors` stays
+  as it was. The "not proved" lines about time say what an anchor shows and what it does not (the same as `anchors`): every time is an outside party's word.
+- *Epochs*, as the table above says.
+- The events line, the list of events that were not verified (status 3) and the checks of every byte are as in V8.
+
+**What an auditor may conclude.** VERIFIED from `bundle verify` with `--accept-epoch-closed`: everything it verified without the flag, and that the history of every closed epoch
+the bundle holds is a frozen log whose size and root the signed event states, that each later epoch is introduced by such an event, and that you accepted the cut. **Not** that the
+history above the common height was lost for the reason the operator gave, how many transactions were in it (the publication keeps hashes, not rows), or that a block of a closed
+epoch is in the history that goes on (only the common height of the event, when it states one, says so, and it is the operator's statement). A verification of the new epoch alone is
+a statement about the new epoch alone.
+
+**Tests and what is not tested here.** The tests build the whole publication of a restore from the documents (`epoch_test.go`: the aggregate rounds 0 to 3, the event, the frozen log of epoch 1
+and the log of epoch 2 with another history, a held checkpoint) and not from the code of `kingresd`; every case of the table above is a test, with the sign of the cases that must stay failures.
+The cluster test of step 20 (`ledgerepoch_test.go`) was not run for this step (it needs a cluster and the integration mutex), so **no byte of a real closed-epoch publication was read**: a
+real one can be added the way `testdata/publication` was made (a cluster test run with `KINGRES_PUBLICATION_FIXTURES`), and the epoch test of step 20 does not write one yet; the line formats above were taken from the
+code that writes the event (`ledgerround/epoch.go`, `ledgersign/publish.go`) and from the aggregate rules in `ledgerround/aggregate.go`. Fuzz target: `FuzzEpochClosedEvent`.
+
+**Mutants of step 21** (one line each, the tests named run; `killed` means a test failed): the member's size and root against the event, `--accept-epoch-closed` accepting any number, the held head not proved a prefix of the frozen log (the consistency proof and the equal size), a later epoch that needs no event, the closed log in the bundle not compared with the event, a refused finding dropped from the failure, the order of the epochs in which a proof is shown, the check that a note is of another epoch, the count of `--require-anchors`, an unmet anchor that is not a note, the note of a closed epoch in `checkpoint`, the note of the new epoch alone, the minimum final size, a second event for one epoch, the bound of the common height, an event that no authorised key signed: 22 of 22 (with those of V8 above) killed.
+
 ## Anchors: `anchors` (phase 7, steps 11, 13 and 15)
 
 ```
@@ -2036,7 +2120,7 @@ With `--require worm,tsa,ots` or `any`, each named kind needs one verified ancho
 both cases. **What each time means:** the WORM time is the store's `Last-Modified` and the store's word; the time-stamp's is genTime and the authority's word, within its
 accuracy (printed, not used); the OpenTimestamps one is "no later than" the miner's time field of the header, an error of the order of hours. None is a statement that
 the checkpoint is the latest, that no other history was anchored, or (tsa) that the certificate was not revoked (no OCSP or CRL is read); a header is not shown to be on
-the best chain. `bundle verify` does not read anchors: it still lists them and ends with status 3; run `anchors` on the same source.
+the best chain. `bundle verify` verifies the anchors of every aggregate checkpoint of the bundle with this same code (step 21, below); `--worm-url` and `--btc-header` are its flags too.
 
 **Tests and what is not testable here.** The evidence of the tests is made by `internal/anchortest` from the documented formats (the verifier module cannot import the
 control plane, and no dependency may be added): a local test authority with ECDSA and RSA keys, fragments written byte by byte, evidence files in the publisher's JSON. Not made

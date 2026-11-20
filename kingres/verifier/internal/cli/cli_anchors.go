@@ -197,43 +197,9 @@ func (e *env) anchorsRun(r *result, a anchorsArgs) outcome {
 	if err != nil {
 		return inputOut(err)
 	}
-	st := &anchorsState{verified: map[string]int{}}
-	for _, id := range ids {
-		raw, rerr := p.src.ReadFile(rel+"/"+id+".json", anchorev.MaxFileSize)
-		if rerr != nil {
-			o := pubOutcome(classifyPub(rel+"/"+id+".json", rerr))
-			if o.kind == outIncomplete {
-				st.unver = append(st.unver, o.missing...)
-				continue
-			}
-			return o
-		}
-		f, perr := anchorev.Parse(raw)
-		if perr != nil {
-			return failedOut("anchor-evidence", fmt.Errorf("%s: %w", id, perr))
-		}
-		if f.Origin != ol.cp.Origin || f.Size != n {
-			return failedOut("anchor-evidence", fmt.Errorf("%s: the evidence is for the checkpoint %q of size %d and this is %q of size %d", id, f.Origin, f.Size, ol.cp.Origin, n))
-		}
-		if f.PayloadSHA256 != digest {
-			return failedOut("anchor-evidence", fmt.Errorf("%s: payload_sha256 is %x and the digest of the checkpoint, recomputed from the signed log, is %x: the evidence stamps something else", id, f.PayloadSHA256[:8], digest[:8]))
-		}
-		var o outcome
-		switch f.Kind {
-		case anchorev.KindWORM:
-			u := wormTo[id]
-			if u == "" {
-				u = wormAll
-			}
-			o = e.checkWORM(r, p, st, id, f, a.aggID, digest, n, u)
-		case anchorev.KindTSA:
-			o = checkTSA(r, st, id, f, digest, roots)
-		case anchorev.KindOTS:
-			o = checkOTS(r, st, id, f, digest, headers)
-		}
-		if !o.ok() {
-			return o
-		}
+	st, o := e.checkEvidenceFiles(r, p, ol, a.aggID, n, rel, digest, ids, roots, wormTo, wormAll, headers)
+	if !o.ok() {
+		return o
 	}
 	r.info = map[string]any{"size": n, "digest": hex.EncodeToString(digest[:]), "verified": st.verified, "unverified": len(st.unver)}
 	r.notProved = []string{
