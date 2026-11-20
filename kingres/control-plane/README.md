@@ -339,7 +339,7 @@ paths; what is not done is in "Not done in this increment"). "Real" means the op
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **140 of 140 operations are real; none answers "not yet".**
+authenticated operation lists in 0.2.0. **140 of 140 operations are real; 0 answer "not yet".**
 
 | Tag | Real | Not yet |
 |---|---|---|
