@@ -209,6 +209,12 @@ func (r *PGRows) Set(ctx context.Context, group int32, u GroupSet) error {
 	}
 	return r.leased(ctx, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `UPDATE kingres_cp.failover_group SET `+strings.Join(sets, ", ")+` WHERE task_id = $1 AND group_id = $2`, args...)
+		if err != nil || !u.Promoted {
+			return err
+		}
+		// The counter of the automatic failovers (design 4.4): one per automatic task, in the transaction that records the promotion of its
+		// first group; counted makes a repeated step count once.
+		_, err = tx.Exec(ctx, CountAutomaticSQL, r.TaskID)
 		return err
 	})
 }

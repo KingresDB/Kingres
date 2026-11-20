@@ -161,6 +161,7 @@ func (m *mapFailover) candidate(ctx context.Context) (string, error) {
 
 type mapStartBody struct {
 	Server        string `json:"server"`
+	Trigger       string `json:"trigger,omitempty"`
 	RequestedBy   string `json:"requestedBy"`
 	AllowDataLoss bool   `json:"allowDataLoss"`
 	Comment       string `json:"comment"`
@@ -168,7 +169,7 @@ type mapStartBody struct {
 
 // begin runs B1 here (the refusal answers the request) and starts the rest in the background.
 func (m *mapFailover) begin(ctx context.Context, b mapStartBody) error {
-	if _, err := m.runner.Decide(ctx, mapgroup.Request{OldServer: b.Server, Trigger: "manual", RequestedBy: b.RequestedBy, AllowDataLoss: b.AllowDataLoss, Comment: b.Comment}); err != nil {
+	if _, err := m.runner.Decide(ctx, mapgroup.Request{OldServer: b.Server, Trigger: nonEmptyStr(b.Trigger, "manual"), RequestedBy: b.RequestedBy, AllowDataLoss: b.AllowDataLoss, Comment: b.Comment}); err != nil {
 		var ref *mapgroup.Refusal
 		if errors.As(err, &ref) {
 			return problem.New(problem.Code(ref.Code), ref.Message)
@@ -571,7 +572,14 @@ func (p *mapPorts) RecordTask(ctx context.Context, j journal.Journal) (int64, er
 		}
 	}
 	rec.DataLoss, _ = json.Marshal(dl)
-	return p.m.rr.RecordMapGroupRun(ctx, c, rec)
+	id, err := p.m.rr.RecordMapGroupRun(ctx, c, rec)
+	if err != nil {
+		return 0, err
+	}
+	if j.Trigger == "automatic" {
+		p.m.pl.Alert(ctx, "autoFailoverTriggered", "info", "cluster", "An automatic failover of server "+j.OldServer+" ended: the map group was promoted.", true)
+	}
+	return id, nil
 }
 
 func (p *mapPorts) Alert(ctx context.Context, kind, severity, subject, message string, raise bool) {

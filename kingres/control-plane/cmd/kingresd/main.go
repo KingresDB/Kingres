@@ -466,6 +466,14 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 				wg.Add(1)
 				go func() { defer wg.Done(); lgs.run(bgCtx) }()
 			}
+			if fos != nil && foDeps.mf != nil {
+				auto := newAutoFailover(foDeps.mf, fos, rbs, leaders, serverHost, cfg.HA.FailureTimeout, log)
+				wg.Add(1)
+				go func() { defer wg.Done(); auto.Run(bgCtx) }()
+				mm := newMapMonitor(foDeps.mf, cfg.HA.FailureTimeout)
+				wg.Add(1)
+				go func() { defer wg.Done(); mm.Run(bgCtx) }()
+			}
 		})
 		return err
 	}

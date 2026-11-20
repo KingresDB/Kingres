@@ -46,6 +46,7 @@ func (s *Server) opsHandlers() map[string]handlerFunc {
 		"cancelTask":                s.cancelTask,
 		"restartThisServerInstance": s.restartThisServerInstance,
 		"updateClusterSettings":     s.updateClusterSettings,
+		"resetAutoFailoverCounter":  s.resetAutoFailoverCounter,
 		"getClusterSummary":         s.getClusterSummary,
 		"listLedgerDigests":         s.listLedgerDigests,
 		"generateLedgerDigest":      s.generateLedgerDigest,
@@ -708,4 +709,21 @@ func prefersAsync(r *http.Request) bool {
 		}
 	}
 	return false
+}
+
+// resetAutoFailoverCounter sets the counter of automatic failovers to 0 and answers the settings after the reset (design 4.4).
+func (s *Server) resetAutoFailoverCounter(c *call, w http.ResponseWriter, r *http.Request) error {
+	o, err := s.needOps()
+	if err != nil {
+		return err
+	}
+	if err := o.ResetAutoFailoverCounter(r.Context()); err != nil {
+		return err
+	}
+	out, err := s.deps.Store.ClusterSettings(r.Context())
+	if err != nil {
+		return s.storeProblem(r, err, "")
+	}
+	s.writeJSON(w, r, http.StatusOK, out)
+	return nil
 }

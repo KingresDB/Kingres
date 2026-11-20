@@ -338,7 +338,7 @@ paths; what is not done is in "Not done in this increment"). "Real" means the op
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **122 of 132 operations are real; 10 answer "not yet".**
+authenticated operation lists in 0.2.0. **123 of 132 operations are real; 9 answer "not yet".**
 
 | Tag | Real | Not yet |
 |---|---|---|
@@ -361,7 +361,7 @@ authenticated operation lists in 0.2.0. **122 of 132 operations are real; 10 ans
 | Server groups | `listServerGroups`, `createServerGroup`, `deleteServerGroup` |  |
 | Servers | `listServers`, `getServer`, `addServer`, `removeServer`, `updateServer`, `renewServerCertificates`, `revokeServerCertificates`, `failoverServer` |  |
 | Configuration | `listConfigParameters`, `getConfigParameter`, `previewConfigChange`, `applyConfigChange`, `listConfigChanges`, `revertConfigChange`, `listConfigServers`, `getConfigSummary`, `getClusterTime`, `listTimeZones`, `restartPendingInstances` |  |
-| Settings | `getClusterSettings`, `updateClusterSettings` | `resetAutoFailoverCounter` |
+| Settings | `getClusterSettings`, `updateClusterSettings`, `resetAutoFailoverCounter` |  |
 | Network access | `getNetworkAccess`, `replaceNetworkAccess` |  |
 | Setup | `initCluster`, `joinCluster`, `getNodeState`, `checkSetupToken` |  |
 | Tasks | `listTasks`, `getTask`, `cancelTask` |  |
@@ -3001,7 +3001,23 @@ failover task at `<step name>:before`.
 
 Built (contract 0.13.0): `internal/failover/journal` (the local journal), `internal/failover/mapgroup` (the bootstrap B1 to B8 over ports, tested with fakes at every step boundary), `cmd/kingresd/mapfailover.go` (the real ports, the candidate, the receiver, the answers about the bootstrap), `failover.RecordMapGroupRun` (the recorded task), `rebalance.PauseForMapGroupFailover`, the engine gate (`task.Options.Gate` from the journal) and the calls `POST /failover/map/start` and `/continue`. A request for the failover of the server that runs the primary of the map group is answered by any server that does not hear it (`httpapi.MapFailoverer`) with the task with id 0.
 
-**Not built:** the escrow of the key of the certificate authority (an alert, `certificateAuthorityUnavailable`, says what the operator does by hand: restore `pki/ca.key` and `pki/revoked.json` of the old leader from its backup into the pki directory of the new leader and restart kingresd), the candidate monitors that act on their own (automatic failover, increment 6), the second condition of the gate (the instance of group 0 in recovery), `graceful` for the map group. `Preflight` still refuses the map group with 422 `unsupported_operation` when the leader is alive (the request then goes to the leader).
+**Not built:** the escrow of the key of the certificate authority (an alert, `certificateAuthorityUnavailable`, says what the operator does by hand: restore `pki/ca.key` and `pki/revoked.json` of the old leader from its backup into the pki directory of the new leader and restart kingresd), the second condition of the gate (the instance of group 0 in recovery), `graceful` for the map group. `Preflight` still refuses the map group with 422 `unsupported_operation` when the leader is alive (the request then goes to the leader).
+
+## Automatic failover (increment 6 of ha-phase5-part2.md, no change of the contract)
+
+Code: `internal/failover/auto.go` (`Evaluate`, the rule of design 4.2 and 4.3 as a function of a view; `Auto`, the loop every 5 s on the manager leader),
+`cmd/kingresd/autofailover.go` (reads the view: the settings from `cluster_setting`, the tracker, the corroboration of the members by `GET /liveness`, the
+standbys, the unfinished task, the end of the last failover per group; stops a rebalance before the start) and `cmd/kingresd/mapmonitor.go` (the candidate
+monitor of the map group on a server that hosts a ready standby of group 0: rank by standby id, 30 s of waiting per rank, a new look at the same leader and
+term, then the bootstrap with the trigger `automatic`, never with `allowDataLoss`).
+
+A server is failed over when its tracker says dead for at least `max(timeoutSeconds, 3 x failure-timeout)`, a strict majority of the members report it
+not live, this server hears a majority, no failover task is unfinished, and none of its groups was failed over in the last 5 minutes. A failed start backs off
+60 s doubling to 10 minutes. `autoFailover.eventsSinceReset` is incremented once per automatic task in the transaction that records its first promoted
+group; at `maxCount` the loop raises `autoFailoverLimitReached` once; `resetAutoFailoverCounter` and a completed rebalance set it to 0. The end of an
+automatic run raises `autoFailoverTriggered`; the start writes the audit event `autoFailover`. `POST /failover/map/start` also takes `trigger` (default
+`manual`) for the monitor. Cluster tests: `internal/clustertest/failover_auto_test.go`. Not tested in a cluster: two failures at once (needs five servers),
+a rebalance running at the start, the stall tests of the design.
 
 ## The signing keys of the ledger (phase 7, steps 3 and 4, contract 0.11.0)
 

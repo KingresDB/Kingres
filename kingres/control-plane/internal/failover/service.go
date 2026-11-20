@@ -740,3 +740,64 @@ func liveOldPrimary(ctx context.Context, c *pgx.Conn, g GroupRow) string {
 	}
 	return "rebuildScheduled"
 }
+
+// StartAutomatic starts the task of the failover of a server with trigger automatic and actor system (design section 4). It does not
+// ask the request-time question of the data-loss rule: the task starts and F4 asks (the task pauses and raises
+// failoverNeedsDecision). The preflight still refuses what cannot start (no replica, no quorum, lease settings that differ, a rebalance).
+func (s *Service) StartAutomatic(ctx context.Context, server string) (*task.Task, error) {
+	eng := s.Engine()
+	if eng == nil {
+		return nil, problem.New(problem.ServiceUnavailable, "The task engine is not running yet.").WithRetryAfter(5)
+	}
+	in, err := s.Resolve(ctx, "system", server, Request{Mode: ModeHard, Comment: "automatic failover"})
+	if err != nil {
+		return nil, err
+	}
+	in.Trigger = "automatic"
+	if a, err := s.active(ctx); err != nil {
+		return nil, err
+	} else if a != nil {
+		return nil, problem.New(problem.FailoverInProgress, "A failover is unfinished (task "+strconv.FormatInt(a.ID, 10)+").")
+	}
+	if ref := s.Runner.Preflight(ctx, in); ref != nil {
+		return nil, refusalProblem(ref)
+	}
+	t, err := eng.Submit(ctx, KindFailover, task.Subject{Type: SubjectType, ID: server}, in, "system")
+	var x *task.ExcludedError
+	if errors.As(err, &x) {
+		return nil, x.Problem()
+	}
+	if err != nil {
+		return nil, err
+	}
+	s.run(eng, t.ID)
+	return &t, nil
+}
+
+// Unfinished says whether a task of the failover class is pending, running or paused (the automatic loop waits for it).
+func (s *Service) Unfinished(ctx context.Context) (bool, error) {
+	a, err := s.active(ctx)
+	return a != nil, err
+}
+
+// LastEnded gives, per group, when the last finished failover of the group ended (the cool-down of the automatic failover).
+func (s *Service) LastEnded(ctx context.Context) (map[int32]time.Time, error) {
+	out := map[int32]time.Time{}
+	err := s.sys(ctx, func(c *pgx.Conn) error {
+		rows, err := c.Query(ctx, `SELECT g.group_id, max(g.finished_at) FROM kingres_cp.failover_group g WHERE g.finished_at IS NOT NULL GROUP BY g.group_id`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var g int32
+			var at time.Time
+			if err := rows.Scan(&g, &at); err != nil {
+				return err
+			}
+			out[g] = at
+		}
+		return rows.Err()
+	})
+	return out, err
+}

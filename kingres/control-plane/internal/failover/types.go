@@ -564,3 +564,9 @@ type OldPrimaryRec struct {
 // did not do all it could.
 var WarningKinds = []string{"repointSkipped", "repointNotStreaming", "syncNamesPending", "preparedRemain", "oldPrimaryNotStopped",
 	"recoverPreparedError", "recoverPreparedOnNewError", "checkClusterError", "standbysGoneSkipped"}
+
+// CountAutomaticSQL adds one to the counter of automatic failovers when the run of $1 is automatic and was not counted yet (design 4.4).
+const CountAutomaticSQL = `WITH c AS (UPDATE kingres_cp.failover_run SET counted = true WHERE task_id = $1 AND NOT counted AND trigger = 'automatic' RETURNING 1)
+	INSERT INTO kingres_cp.cluster_setting (key, value)
+	SELECT 'autoFailover.eventsSinceReset', to_jsonb(coalesce((SELECT (value #>> '{}')::int FROM kingres_cp.cluster_setting WHERE key = 'autoFailover.eventsSinceReset'), 0) + 1) FROM c
+	ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`

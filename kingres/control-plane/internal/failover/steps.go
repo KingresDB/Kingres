@@ -1644,7 +1644,13 @@ func (r *Runner) report(ctx context.Context, env *task.Env, sc *stepCtx) error {
 			outcome = "completedWithWarnings"
 		}
 	}
-	return sc.rows.Finish(ctx, outcome, "")
+	if err := sc.rows.Finish(ctx, outcome, ""); err != nil {
+		return err
+	}
+	if sc.in.Trigger == "automatic" {
+		r.Plan.Alert(ctx, "autoFailoverTriggered", "info", "cluster", "An automatic failover of server "+sc.old()+" ended: "+outcome+".", true)
+	}
+	return nil
 }
 
 // OnFail is the hook of a task that the engine recorded as failed or cancelled: the

@@ -132,6 +132,9 @@ func (r *Runner) RecordMapGroupRun(ctx context.Context, conn *pgx.Conn, rec MapR
 			return 0, err
 		}
 	}
+	if _, err := tx.Exec(ctx, CountAutomaticSQL, t.ID); err != nil {
+		return 0, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, err
 	}

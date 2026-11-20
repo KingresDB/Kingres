@@ -2414,3 +2414,37 @@ transactions are recovered in every database, but makes no prepared transaction 
 - A map group failover whose old server also held primaries of ordinary groups is not tested.
 - A hand-over at B4 and a demotion at B3 by a live old server are tested only with fakes.
 - A kill of the old leader under writers is not tested.
+
+### Increment 6 (automatic failover, 2026-11-19)
+
+Built to section 4 without a change of the contract (the settings, the reset, the alerts `autoFailoverTriggered`, `autoFailoverLimitReached` and
+`failoverBlocked`, and the trigger `automatic` of the report existed in 0.10.0); no migration was needed (`failover_run.counted` and the trigger
+exist from migration 0015).
+
+- **One rule, two loops.** `failover.Evaluate` is a function of a view (settings, the servers with their silence and the corroboration, the
+  majority this server hears, an unfinished task, the end of the last failover of each group) and has a test for each row of 4.2 and 4.3.
+  `failover.Auto` runs it every 5 s on the manager leader (`cmd/kingresd/autofailover.go` reads the view; it does nothing on a server that is not
+  the leader and reads nothing while the setting is off). The candidate monitor of the map group (`cmd/kingresd/mapmonitor.go`) runs the same rule
+  on every server that hosts a ready standby of group 0, for the one case in which the leader's server is the server that is gone.
+- **Evidence.** The server's own tracker says "dead" for at least the effective timeout, `max(timeoutSeconds, 3 x failure-timeout)`, and a strict
+  majority of the members (this server included) report the server as not live (`GET /liveness`); a server that hears no majority starts nothing.
+  Exactly half is not a majority.
+- **Order of events.** The loop stops a rebalance first (`StopForFailover`, then `WaitStopped` for up to 60 s per look) and starts the task only when
+  it is stopped; a failed start backs off 60 s, doubling to 10 minutes, per server; the cool-down of 5 minutes holds back a server one of whose
+  groups was failed over lately. The alert `failoverBlocked` ("no standby to promote") is raised and cleared per group by the loop.
+- **The counter.** `autoFailover.eventsSinceReset` is incremented once per automatic task, in the transaction that records the first promoted
+  group (`CountAutomaticSQL`, guarded by `failover_run.counted`; the map group's run is recorded with it). A rebalance that completes and
+  `resetAutoFailoverCounter` set it to 0. At the limit the loop raises `autoFailoverLimitReached` once and clears it when the counter is lower.
+- **The map group.** The candidates are ranked by the id of their registered standby; rank r waits `r x 30 s` after the evidence holds and looks
+  again at the same leader and term before it starts the bootstrap with the trigger `automatic` (never with `allowDataLoss`, so the rule of the
+  journal verdict decides). The lease still makes the choice safe whatever the order: one holder, and B4 hands the journal to a better candidate.
+  The settings come from the replica of the system database that the candidate holds.
+- **Alerts and audit.** `autoFailoverTriggered` (info, subject `cluster`) is raised when an automatic run ends (the report step of the task; the
+  promotion record of the map group); the audit event `autoFailover` is written when the loop starts the task.
+- **Tests.** Unit: the table of `Evaluate` and the loop with fake ports (`internal/failover/auto_test.go`). Cluster: T13
+  `TestAutomaticFailoverRulesAndTheCounter` (off: nothing; on: one automatic failover, the counter, the limit alert, the reset) and
+  `TestAutomaticFailoverOfTheMapGroup` (`internal/clustertest/failover_auto_test.go`).
+- **Not built and not tested:** two failures at once (T7 needs five servers: a cluster of three has no majority after the second), a rebalance that
+  is running when the failover starts (covered by the unit test of the order and by the rebalance's own test of `StopForFailover`, not by a cluster
+  test), `failoverNeedsDecision` for an automatic run with an asynchronous standby (the journal and the task already ask; no cluster test), and the
+  stall tests of T14.

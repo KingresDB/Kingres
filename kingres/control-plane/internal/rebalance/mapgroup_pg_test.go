@@ -70,3 +70,27 @@ func TestTheTaskOfTheMapGroupFailoverIsRecordedOnceWithItsFirstStepsDone(t *test
 		t.Fatalf("groups %d events %d (%v)", groups, events, err)
 	}
 }
+
+// The counter of automatic failovers (design 4.4): one per automatic run, counted once whatever the number of repeats of the step,
+// and a manual run is not counted.
+func TestTheCounterOfAutomaticFailoversCountsOncePerAutomaticRun(t *testing.T) {
+	e, _ := newGuardEnv(t)
+	ctx := context.Background()
+	for _, r := range []struct {
+		id      int64
+		trigger string
+	}{{9001, "automatic"}, {9002, "manual"}} {
+		if _, err := e.sys.Exec(ctx, `INSERT INTO kingres_cp.failover_run (task_id, kind, trigger, mode, server_id, requested_by) VALUES ($1, 'failover', $2, 'hard', 's1', 'x')`, r.id, r.trigger); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, id := range []int64{9001, 9001, 9002} {
+		if _, err := e.sys.Exec(ctx, failover.CountAutomaticSQL, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var n int
+	if err := e.sys.QueryRow(ctx, `SELECT (value #>> '{}')::int FROM kingres_cp.cluster_setting WHERE key = 'autoFailover.eventsSinceReset'`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("counter %d (%v), want 1", n, err)
+	}
+}

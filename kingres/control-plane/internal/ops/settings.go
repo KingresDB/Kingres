@@ -115,3 +115,13 @@ func (o *Ops) UpdateClusterSettings(ctx context.Context, actor string, req api.C
 	}
 	return nil, nil
 }
+
+// ResetAutoFailoverCounter sets the counter of automatic failovers to 0 (the operation resetAutoFailoverCounter; a rebalance that
+// completes does it too).
+func (o *Ops) ResetAutoFailoverCounter(ctx context.Context) error {
+	return wrap(o.asService(ctx, sysdb.Database, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO kingres_cp.cluster_setting (key, value) VALUES ('autoFailover.eventsSinceReset', '0'::jsonb)
+			ON CONFLICT (key) DO UPDATE SET value = '0'::jsonb, updated_at = now()`)
+		return err
+	}))
+}
