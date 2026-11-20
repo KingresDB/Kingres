@@ -32,6 +32,7 @@ OBJS = \
 	src/recovery.o \
 	src/remote_scan.o \
 	src/row_router.o \
+	src/schema_ddl.o \
 	src/shippable.o \
 	src/term.o \
 	src/utility.o

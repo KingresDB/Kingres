@@ -59,6 +59,7 @@
 #include "shippable.h"
 #include "remote_scan.h"
 #include "row_router.h"
+#include "schema_ddl.h"
 #include "utility.h"
 
 PG_MODULE_MAGIC_EXT(
@@ -507,6 +508,7 @@ _PG_init(void)
 	kingres_shard_utility_init();
 	kingres_shard_remote_scan_init();
 	kingres_shard_row_router_init();
+	kingres_shard_schema_ddl_init();
 }
 
 /*

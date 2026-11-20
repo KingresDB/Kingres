@@ -543,6 +543,28 @@ kingres_shard_remote_tail_script(const DdlSet *ddl)
 }
 
 /*
+ * The sharding model of the database (phase 11, design/shard-phase11.md 5.4 and 10): a table of a distributed schema is
+ * a schema table and nothing else, and in the mode "schema" no table is hash-distributed.  A reference table is allowed
+ * in the mode "schema" (a tenant's keys point to it), in a local schema.
+ */
+static void
+check_table_for_sharding_mode(Oid relid, bool hash)
+{
+	const KsCatalog *cat = kingres_shard_catalog();
+
+	if (kingres_shard_lookup_dist_schema(cat, get_rel_namespace(relid)) != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("table \"%s\" is in a distributed schema, which holds only schema tables", get_rel_name(relid)),
+				 errhint("Use a table of another schema.")));
+	if (hash && cat->sharding_mode == KS_MODE_SCHEMA)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("create_distributed_table is not available in the sharding mode \"schema\""),
+				 errhint("Run kingres.set_sharding_mode('both') to distribute tables by key and schemas in one database.")));
+}
+
+/*
  * kingres.create_distributed_table(relation regclass, dist_column name,
  *									 colocate_with regclass, bucket_count int)
  *
@@ -593,6 +615,7 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 	require_current_sql_objects();
 	kingres_shard_lock_catalog();
 	kingres_shard_require_map_group();
+	check_table_for_sharding_mode(relid, true);
 	local_group = kingres_shard_catalog()->local_group_id;
 
 	if (requested < 0)
@@ -1063,6 +1086,7 @@ kingres_create_reference_table_body(PG_FUNCTION_ARGS)
 	require_current_sql_objects();
 	kingres_shard_lock_catalog();
 	kingres_shard_require_map_group();
+	check_table_for_sharding_mode(relid, false);
 	require_read_committed();
 	LockRelationOid(relid, ExclusiveLock);
 

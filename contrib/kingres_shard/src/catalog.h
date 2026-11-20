@@ -44,6 +44,23 @@ typedef struct KsDistTable
 	bool		is_schema;		/* a table of a distributed schema (phase 11): one bucket, no key; kept in schema_tables, never in dist_tables */
 } KsDistTable;
 
+/* A distributed schema (phase 11): the key is the OID of the schema on this node. */
+typedef struct KsDistSchema
+{
+	Oid			nsp;
+	int			colocation_id;
+	KsColocation *coloc;
+	bool		ship_functions;
+} KsDistSchema;
+
+/* The sharding mode of the database (kingres.sharding_settings). */
+typedef enum KsShardingMode
+{
+	KS_MODE_ROW = 0,
+	KS_MODE_SCHEMA,
+	KS_MODE_BOTH
+} KsShardingMode;
+
 /* A node of the cluster. */
 typedef struct KsNode
 {
@@ -79,6 +96,10 @@ typedef struct KsCatalog
 	int			nschema_tables;
 	HTAB	   *schema_tables;	/* relid -> KsDistTable (is_schema) of the tables of distributed schemas; no code that
 								 * works on hash-distributed tables sees them (phase 11, design/shard-phase11.md 5.1) */
+	int			ndist_schemas;
+	HTAB	   *dist_schemas;	/* nsp OID -> KsDistSchema */
+	KsShardingMode sharding_mode;	/* kingres.sharding_settings; KS_MODE_ROW when the table is not there (an older install) */
+	bool		distribute_new_schemas;
 } KsCatalog;
 
 extern void kingres_shard_catalog_init(void);
@@ -109,6 +130,7 @@ extern const KsColocation *kingres_shard_lookup_colocation(int colocation_id);
  */
 extern const KsDistTable *kingres_shard_lookup_schema_table(const KsCatalog *cat, Oid relid);
 extern int	kingres_shard_schema_table_owner(const KsDistTable *st);
+extern const KsDistSchema *kingres_shard_lookup_dist_schema(const KsCatalog *cat, Oid nsp);
 extern const KsDistTable *kingres_shard_lookup_scan_table(const KsCatalog *cat, Oid relid);
 
 /*

@@ -101,6 +101,7 @@
 #include "node_admin.h"
 #include "node_conn.h"
 #include "row_router.h"
+#include "schema_ddl.h"
 #include "utility.h"
 
 static ProcessUtility_hook_type prev_ProcessUtility = NULL;
@@ -167,6 +168,23 @@ note_colocation(UtilDecision *d, const KsDistTable *dt)
 {
 	if (dt != NULL && !dt->is_reference)
 		d->colocations = list_append_unique_int(d->colocations, dt->colocation_id);
+}
+
+/*
+ * A statement whose objects are in a distributed schema (schema_ddl.c) is run here, then on every other
+ * node in the same transaction, like the DDL on a hash-distributed table; the drop guard lets it go.
+ */
+static void
+merge_schema_decision(UtilDecision *d, const KsSchemaDdl *sd)
+{
+	ListCell   *lc;
+
+	if (!sd->touches && !sd->create_schema)
+		return;
+	d->propagate = true;
+	d->authorize = true;
+	foreach(lc, sd->colocations)
+		d->colocations = list_append_unique_int(d->colocations, lfirst_int(lc));
 }
 
 static void kingres_shard_process_utility(PlannedStmt *pstmt,
@@ -2092,6 +2110,8 @@ kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
 	const KsCatalog *cat;
 	List	   *targets = NIL;
 	char	   *text = NULL;
+	KsSchemaDdl sd;
+	bool		have_sd = false;
 	bool		authorized;
 	bool		saved_drop_authorized;
 	volatile bool internal_active = false;
@@ -2100,6 +2120,7 @@ kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
 	(void) kingres_shard_session_forwarded();
 
 	memset(&d, 0, sizeof(d));
+	memset(&sd, 0, sizeof(sd));
 
 	/* Whatever the routing setting is: see refuse_trigger_on_reference_table. */
 	if (IsA(parsetree, CreateTrigStmt) && !creating_extension && !kingres_shard_session_forwarded())
@@ -2131,7 +2152,7 @@ kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
 	}
 
 	if (kingres_shard_enable_routing && !creating_extension &&
-		statement_is_of_interest(parsetree) &&
+		(statement_is_of_interest(parsetree) || kingres_shard_schema_ddl_interesting(parsetree)) &&
 		ddl_internal_depth == 0 && context != PROCESS_UTILITY_SUBCOMMAND)
 	{
 		cat = kingres_shard_catalog();
@@ -2140,9 +2161,28 @@ kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
 			wait_for_statement_tables(parsetree);
 			cat = kingres_shard_catalog();
 		}
-		if (cat->present && cat->ndist_tables > 0)
+		/* an object of a distributed schema, or a new schema that the database distributes (phase 11) */
+		if (cat->present && cat->local_node_id != 0 && kingres_shard_schema_ddl_interesting(parsetree) &&
+			(cat->ndist_schemas > 0 || IsA(parsetree, CreateSchemaStmt)))
 		{
-			decide(parsetree, cat, &d);
+			kingres_shard_schema_ddl_classify(parsetree, cat, kingres_shard_session_forwarded(), &sd);
+			have_sd = sd.touches || sd.create_schema;
+			if (sd.refuse_what != NULL || sd.refuse_message != NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 sd.refuse_message != NULL ? errmsg_internal("%s", sd.refuse_message) :
+						 errmsg("%s is not supported in a distributed schema yet", sd.refuse_what),
+						 sd.refuse_hint != NULL ? errhint("%s", sd.refuse_hint) : 0));
+			if (sd.create_schema)
+				kingres_shard_schema_check_limit(cat);
+			cat = kingres_shard_catalog();
+		}
+		if (cat->present && (cat->ndist_tables > 0 || have_sd))
+		{
+			if (cat->ndist_tables > 0)
+				decide(parsetree, cat, &d);
+			if (have_sd)
+				merge_schema_decision(&d, &sd);
 			if (d.propagate || d.copy_route)
 				release_waited_tables();
 			else
@@ -2250,6 +2290,22 @@ kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
 	if (text != NULL)
 	{
 		ListCell   *lc;
+		int			new_coloc = 0;
+		int			new_group = 0;
+
+		/* a new distributed schema: its colocation group and its group are chosen here, once, under the cluster lock */
+		if (have_sd && sd.create_schema)
+		{
+			new_coloc = kingres_shard_schema_next_colocation();
+			new_group = kingres_shard_schema_choose_group();
+			kingres_shard_schema_register_local(sd.create_name, new_coloc, new_group);
+			sd.schema_names = list_make1(sd.create_name);
+		}
+		else if (have_sd && sd.may_create_tables)
+		{
+			foreach(lc, sd.schema_names)
+				(void) kingres_shard_schema_sync_tables_local((char *) lfirst(lc));
+		}
 
 		foreach(lc, targets)
 		{
@@ -2258,6 +2314,52 @@ kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
 
 			kingres_shard_begin_write_xact(kc);
 			kingres_shard_exec_ddl(kc, text);
+			if (have_sd && sd.create_schema)
+				kingres_shard_exec_ddl(kc, psprintf("SELECT " KINGRES_SHARD_SCHEMA ".internal_schema_delta('register_schema', %s, %d, %d)",
+													quote_literal_cstr(sd.create_name), new_coloc, new_group));
+			else if (have_sd && sd.may_create_tables)
+			{
+				ListCell   *lc2;
+
+				foreach(lc2, sd.schema_names)
+					kingres_shard_exec_ddl(kc, psprintf("SELECT " KINGRES_SHARD_SCHEMA ".internal_schema_delta('register_tables', %s)",
+														quote_literal_cstr((char *) lfirst(lc2))));
+			}
+		}
+
+		/*
+		 * The structure that the statement made is the same on every node (design 7.1), or the transaction is
+		 * rolled back.  The question goes down the connection that ran the statement, in the same branch: the
+		 * table is not committed anywhere yet.
+		 */
+		if (have_sd && sd.verify_tables != NIL && targets != NIL)
+		{
+			List	   *relids = NIL;
+			List	   *fps = NIL;
+			ListCell   *lc2;
+
+			foreach(lc, sd.verify_tables)
+			{
+				Oid			relid = RangeVarGetRelid((RangeVar *) lfirst(lc), NoLock, true);
+
+				if (OidIsValid(relid))
+				{
+					relids = lappend_oid(relids, relid);
+					fps = lappend(fps, kingres_shard_schema_fingerprint_local(relid));
+				}
+			}
+			foreach(lc, targets)
+			{
+				DdlTarget  *t = (DdlTarget *) lfirst(lc);
+				KsConn	   *kc = kingres_shard_get_conn(t->host, t->port, false, NULL);
+				ListCell   *lf = list_head(fps);
+
+				foreach(lc2, relids)
+				{
+					kingres_shard_schema_verify_remote(kc, t->node_id, lfirst_oid(lc2), (const char *) lfirst(lf));
+					lf = lnext(fps, lf);
+				}
+			}
 		}
 	}
 }

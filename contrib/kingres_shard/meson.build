@@ -26,6 +26,7 @@ kingres_shard_sources = files(
   'src/recovery.c',
   'src/remote_scan.c',
   'src/row_router.c',
+  'src/schema_ddl.c',
   'src/shippable.c',
   'src/term.c',
   'src/utility.c',
@@ -290,6 +291,8 @@ tests += {
       't/139_partial_agg.pl',
       't/230_schema_catalog_cluster.pl',
       't/231_schema_scan_cluster.pl',
+      't/232_schema_distribute_cluster.pl',
+      't/233_schema_ddl_cluster.pl',
     ],
   },
 }

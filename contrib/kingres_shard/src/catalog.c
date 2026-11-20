@@ -656,6 +656,73 @@ catalog_load(void)
 					cat.ndist_tables++;
 			}
 			catscan_end(&cs);
+
+			/*
+			 * The distributed schemas and the sharding mode (phase 11, version 0.8).  The two tables are not
+			 * in the list that decides whether the extension is installed: a database that still has the
+			 * 0.7 objects (the library was replaced before ALTER EXTENSION UPDATE) works as it did, with no
+			 * distributed schema and the mode "row".
+			 */
+			{
+				Oid			ds_rel = OidIsValid(nsp) ? get_relname_relid("dist_schema", nsp) : InvalidOid;
+				Oid			ss_rel = OidIsValid(nsp) ? get_relname_relid("sharding_settings", nsp) : InvalidOid;
+
+				cat.sharding_mode = KS_MODE_ROW;
+				if (OidIsValid(ss_rel))
+				{
+					catscan_begin(&cs, ss_rel);
+					while ((tup = catscan_next(&cs)) != NULL)
+					{
+						TupleDesc	desc = RelationGetDescr(cs.rel);
+						bool		isnull;
+						char	   *mode = TextDatumGetCString(heap_getattr(tup, 1, desc, &isnull));
+
+						cat.sharding_mode = strcmp(mode, "schema") == 0 ? KS_MODE_SCHEMA :
+							strcmp(mode, "both") == 0 ? KS_MODE_BOTH : KS_MODE_ROW;
+						cat.distribute_new_schemas = DatumGetBool(heap_getattr(tup, 2, desc, &isnull));
+					}
+					catscan_end(&cs);
+				}
+				if (OidIsValid(ds_rel))
+				{
+					HASHCTL		dctl;
+
+					memset(&dctl, 0, sizeof(dctl));
+					dctl.keysize = sizeof(Oid);
+					dctl.entrysize = sizeof(KsDistSchema);
+					dctl.hcxt = newcxt;
+					cat.dist_schemas = hash_create("kingres_shard dist schemas", 64, &dctl,
+												   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+					/* dist_schema(nsp, colocation_id, created_at, ship_functions) */
+					catscan_begin(&cs, ds_rel);
+					while ((tup = catscan_next(&cs)) != NULL)
+					{
+						TupleDesc	desc = RelationGetDescr(cs.rel);
+						bool		isnull;
+						Oid			dnsp = DatumGetObjectId(heap_getattr(tup, 1, desc, &isnull));
+						KsDistSchema *s;
+						bool		found;
+
+						s = hash_search(cat.dist_schemas, &dnsp, HASH_ENTER, &found);
+						memset(s, 0, sizeof(*s));
+						s->nsp = dnsp;
+						s->colocation_id = DatumGetInt32(heap_getattr(tup, 2, desc, &isnull));
+						s->ship_functions = DatumGetBool(heap_getattr(tup, 4, desc, &isnull));
+						foreach(lc, cat.colocations)
+						{
+							KsColocation *c = (KsColocation *) lfirst(lc);
+
+							if (c->colocation_id == s->colocation_id)
+								s->coloc = c;
+						}
+						if (s->coloc == NULL)
+							hash_search(cat.dist_schemas, &dnsp, HASH_REMOVE, NULL);
+						else
+							cat.ndist_schemas++;
+					}
+					catscan_end(&cs);
+				}
+			}
 		}
 		MemoryContextSwitchTo(oldcxt);
 	}
@@ -966,6 +1033,17 @@ kingres_shard_lookup_schema_table(const KsCatalog *cat, Oid relid)
 	if (!cat->present || cat->nschema_tables == 0 || cat->schema_tables == NULL)
 		return NULL;
 	return hash_search(cat->schema_tables, &relid, HASH_FIND, NULL);
+}
+
+/*
+ * The distributed schema with this namespace OID (a node-local OID), or NULL.
+ */
+const KsDistSchema *
+kingres_shard_lookup_dist_schema(const KsCatalog *cat, Oid nsp)
+{
+	if (!cat->present || cat->ndist_schemas == 0 || cat->dist_schemas == NULL)
+		return NULL;
+	return hash_search(cat->dist_schemas, &nsp, HASH_FIND, NULL);
 }
 
 /*

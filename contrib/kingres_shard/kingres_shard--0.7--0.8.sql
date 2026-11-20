@@ -813,3 +813,223 @@ GRANT SELECT ON kingres.dist_schema, kingres.sharding_settings, kingres.schemas 
 -- =========================================================================
 -- PHASE 11, increment 1                                                      [end]
 -- =========================================================================
+
+-- =========================================================================
+-- PHASE 11 (distributed schemas), increment 3: a distributed schema and its DDL   [begin]
+--
+-- distribute_schema() of an empty schema, the choice of the group, the registration of the tables that a
+-- propagated DDL statement creates, and the structure fingerprint (design/shard-phase11.md 5.3, 7.1, 8.1, 9.1).
+-- The statements themselves are propagated by the ProcessUtility hook (src/utility.c, src/schema_ddl.c).
+-- =========================================================================
+
+-- The group that receives the next distributed schema (design 9.1): the shard group whose primary is active and should
+-- have shards, with the fewest distributed schemas; a tie goes to the lowest group id.  (The weight of a group belongs to
+-- phase 10 and is not in the catalog of 0.8 yet: the count is not divided by it.)
+CREATE FUNCTION kingres.internal_choose_schema_group()
+    RETURNS int
+    LANGUAGE sql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+SELECT g.group_id
+  FROM (SELECT DISTINCT n.group_id
+          FROM kingres.node n
+         WHERE n.role OPERATOR(pg_catalog.=) 'primary' AND n.is_active AND n.should_have_shards) g
+ ORDER BY (SELECT pg_catalog.count(*)
+             FROM kingres.dist_schema s
+             JOIN kingres.bucket_map b ON b.colocation_id OPERATOR(pg_catalog.=) s.colocation_id AND b.bucket OPERATOR(pg_catalog.=) 0
+            WHERE b.group_id OPERATOR(pg_catalog.=) g.group_id),
+          g.group_id
+ LIMIT 1;
+$$;
+
+-- Node-local: every ordinary and partitioned table of the schema that is not yet a schema table becomes one.  The hook runs
+-- it on every node after a propagated statement that may have created a table (the C function that calls it has checked
+-- that the session is a superuser or a session of another node).  Returns the number of tables registered.
+CREATE FUNCTION kingres.internal_register_schema_tables(p_nsp name)
+    RETURNS int
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    r pg_catalog.record;
+    n pg_catalog.int4 := 0;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    IF NOT EXISTS (SELECT 1 FROM kingres.dist_schema s WHERE s.nsp OPERATOR(pg_catalog.=) p_nsp::pg_catalog.regnamespace) THEN
+        RAISE EXCEPTION 'schema "%" is not a distributed schema on this node', p_nsp
+            USING ERRCODE = 'undefined_object';
+    END IF;
+    FOR r IN SELECT c.oid::pg_catalog.regclass AS rel
+               FROM pg_catalog.pg_class c
+              WHERE c.relnamespace OPERATOR(pg_catalog.=) p_nsp::pg_catalog.regnamespace
+                AND c.relkind IN ('r', 'p')
+                AND c.relpersistence OPERATOR(pg_catalog.<>) 't'
+                AND NOT EXISTS (SELECT 1 FROM kingres.dist_table d WHERE d.relid::pg_catalog.oid OPERATOR(pg_catalog.=) c.oid)
+              ORDER BY c.oid
+    LOOP
+        PERFORM kingres.internal_register_schema_table(r.rel);
+        n := n + 1;
+    END LOOP;
+    RETURN n;
+END;
+$$;
+
+-- The structure of a table as one text (and its md5, the fingerprint): columns (name, type, modifier, collation, not null, default, identity,
+-- generated), constraints, indexes and storage options, each sorted.  The same table has the same fingerprint on every
+-- node; the names of schemas are in it, the OIDs are not.  The search path is fixed so that the definitions print the same.
+-- The hook asks every node for it in the session of the user whose statement it is, so the function is executable by
+-- PUBLIC; it reads what pg_catalog shows anyway.
+CREATE FUNCTION kingres.internal_table_structure(p_rel regclass)
+    RETURNS text
+    LANGUAGE sql STABLE
+    SET search_path = pg_catalog, pg_temp
+    AS $$
+SELECT pg_catalog.format('%s|%s|%s|%s|%s',
+           (SELECT c.relkind::pg_catalog.text || c.relpersistence::pg_catalog.text || COALESCE(c.reloptions::pg_catalog.text, '') FROM pg_catalog.pg_class c WHERE c.oid OPERATOR(pg_catalog.=) p_rel::pg_catalog.oid),
+           COALESCE((SELECT pg_catalog.string_agg(pg_catalog.format('%s:%s:%s:%s:%s:%s:%s',
+                                a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod),
+                                COALESCE((SELECT co.collname FROM pg_catalog.pg_collation co WHERE co.oid OPERATOR(pg_catalog.=) a.attcollation), ''),
+                                a.attnotnull, COALESCE(pg_catalog.pg_get_expr(d.adbin, d.adrelid), ''), a.attidentity, a.attgenerated),
+                                ',' ORDER BY a.attnum)
+                       FROM pg_catalog.pg_attribute a
+                       LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid OPERATOR(pg_catalog.=) a.attrelid AND d.adnum OPERATOR(pg_catalog.=) a.attnum
+                      WHERE a.attrelid OPERATOR(pg_catalog.=) p_rel::pg_catalog.oid AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped), ''),
+           COALESCE((SELECT pg_catalog.string_agg(k.conname || ' ' || pg_catalog.pg_get_constraintdef(k.oid), ',' ORDER BY k.conname)
+                       FROM pg_catalog.pg_constraint k WHERE k.conrelid OPERATOR(pg_catalog.=) p_rel::pg_catalog.oid), ''),
+           COALESCE((SELECT pg_catalog.string_agg(pg_catalog.pg_get_indexdef(i.indexrelid), ',' ORDER BY pg_catalog.pg_get_indexdef(i.indexrelid))
+                       FROM pg_catalog.pg_index i WHERE i.indrelid OPERATOR(pg_catalog.=) p_rel::pg_catalog.oid), ''),
+           COALESCE((SELECT pg_catalog.string_agg(t.tgname, ',' ORDER BY t.tgname)
+                       FROM pg_catalog.pg_trigger t WHERE t.tgrelid OPERATOR(pg_catalog.=) p_rel::pg_catalog.oid AND NOT t.tgisinternal), ''));
+$$;
+
+CREATE FUNCTION kingres.internal_table_fingerprint(p_rel regclass)
+    RETURNS text
+    LANGUAGE sql STABLE
+    SET search_path = pg_catalog, pg_temp
+    AS $$
+SELECT pg_catalog.md5(kingres.internal_table_structure(p_rel));
+$$;
+
+GRANT EXECUTE ON FUNCTION kingres.internal_table_structure(regclass), kingres.internal_table_fingerprint(regclass) TO PUBLIC;
+
+-- distribute_schema(nsp, group): the schema becomes a distributed schema of a group.  Increment 3 takes the empty schema:
+-- it exists on this node, holds no object, and is created on every other node in the same two-phase transaction.  A schema
+-- with objects is the conversion of design 8.1 (a later increment).
+CREATE FUNCTION kingres.distribute_schema(nsp regnamespace, group_id int DEFAULT NULL)
+    RETURNS int
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+#variable_conflict use_variable
+DECLARE
+    v_name   pg_catalog.name;
+    v_owner  pg_catalog.name;
+    v_mode   pg_catalog.text;
+    v_group  pg_catalog.int4 := group_id;
+    v_coloc  pg_catalog.int4;
+    v_self   pg_catalog.int4;
+    v_max    pg_catalog.int4;
+    v_what   pg_catalog.text;
+    nd       pg_catalog.record;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    LOCK TABLE kingres.map_version IN EXCLUSIVE MODE;
+    PERFORM kingres.internal_require_map_group();
+    IF pg_catalog.current_setting('transaction_isolation') OPERATOR(pg_catalog.<>) 'read committed' THEN
+        RAISE EXCEPTION 'distribute_schema must run in a READ COMMITTED transaction'
+            USING ERRCODE = 'invalid_transaction_state';
+    END IF;
+    SELECT s.mode INTO v_mode FROM kingres.sharding_settings s;
+    IF v_mode OPERATOR(pg_catalog.=) 'row' THEN
+        RAISE EXCEPTION 'distribute_schema is not available in the sharding mode "row"'
+            USING ERRCODE = 'object_not_in_prerequisite_state',
+                  HINT = 'Run kingres.set_sharding_mode(''both'') or kingres.set_sharding_mode(''schema'') first.';
+    END IF;
+    PERFORM kingres.internal_check_node_versions();
+    SELECT ns.nspname, pg_catalog.pg_get_userbyid(ns.nspowner) INTO v_name, v_owner
+      FROM pg_catalog.pg_namespace ns WHERE ns.oid OPERATOR(pg_catalog.=) nsp::pg_catalog.oid;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'schema % does not exist', nsp::pg_catalog.oid
+            USING ERRCODE = 'invalid_schema_name';
+    END IF;
+    IF v_name OPERATOR(pg_catalog.~~) 'pg\_%' OR v_name IN ('information_schema', 'kingres', 'public')
+       OR EXISTS (SELECT 1 FROM pg_catalog.pg_depend dp
+                   WHERE dp.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_namespace'::pg_catalog.regclass
+                     AND dp.objid OPERATOR(pg_catalog.=) nsp::pg_catalog.oid AND dp.deptype OPERATOR(pg_catalog.=) 'e') THEN
+        RAISE EXCEPTION 'schema "%" cannot be distributed: it is a system schema, the schema public, or the schema of an extension', v_name
+            USING ERRCODE = 'feature_not_supported';
+    END IF;
+    IF EXISTS (SELECT 1 FROM kingres.dist_schema s WHERE s.nsp OPERATOR(pg_catalog.=) nsp) THEN
+        RAISE EXCEPTION 'schema "%" is already distributed', v_name
+            USING ERRCODE = 'duplicate_object';
+    END IF;
+    -- the schema holds nothing: tables, indexes, sequences and views are in pg_class, functions in pg_proc, types in pg_type
+    SELECT x.what INTO v_what
+      FROM (SELECT 'relation ' || c.relname AS what FROM pg_catalog.pg_class c WHERE c.relnamespace OPERATOR(pg_catalog.=) nsp::pg_catalog.oid
+            UNION ALL SELECT 'function ' || p.proname FROM pg_catalog.pg_proc p WHERE p.pronamespace OPERATOR(pg_catalog.=) nsp::pg_catalog.oid
+            UNION ALL SELECT 'type ' || t.typname FROM pg_catalog.pg_type t WHERE t.typnamespace OPERATOR(pg_catalog.=) nsp::pg_catalog.oid
+            UNION ALL SELECT 'operator ' || o.oprname FROM pg_catalog.pg_operator o WHERE o.oprnamespace OPERATOR(pg_catalog.=) nsp::pg_catalog.oid
+            UNION ALL SELECT 'collation ' || co.collname FROM pg_catalog.pg_collation co WHERE co.collnamespace OPERATOR(pg_catalog.=) nsp::pg_catalog.oid) x
+     ORDER BY x.what LIMIT 1;
+    IF v_what IS NOT NULL THEN
+        RAISE EXCEPTION 'schema "%" holds objects: distributing a schema that is not empty is not supported yet', v_name
+            USING ERRCODE = 'feature_not_supported',
+                  DETAIL = pg_catalog.format('The first object is %s.', v_what),
+                  HINT = 'Distribute the schema while it is empty, then create its objects.';
+    END IF;
+    v_max := pg_catalog.current_setting('kingres_shard.max_distributed_schemas')::pg_catalog.int4;
+    IF (SELECT pg_catalog.count(*) FROM kingres.dist_schema) OPERATOR(pg_catalog.>=) v_max THEN
+        RAISE EXCEPTION 'the database already has % distributed schemas, the limit of kingres_shard.max_distributed_schemas', v_max
+            USING ERRCODE = 'program_limit_exceeded';
+    END IF;
+    IF v_group IS NULL THEN
+        v_group := NULLIF(pg_catalog.current_setting('kingres_shard.schema_placement_group')::pg_catalog.int4, -1);
+    END IF;
+    IF v_group IS NULL THEN
+        v_group := kingres.internal_choose_schema_group();
+    ELSIF NOT EXISTS (SELECT 1 FROM kingres.node n
+                       WHERE n.group_id OPERATOR(pg_catalog.=) v_group AND n.role OPERATOR(pg_catalog.=) 'primary'
+                         AND n.is_active AND n.should_have_shards) THEN
+        RAISE EXCEPTION 'shard group % cannot hold a schema: it has no active primary that should have shards', v_group
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF v_group IS NULL THEN
+        RAISE EXCEPTION 'no shard group can hold a schema'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    SELECT l.node_id INTO v_self FROM kingres.local_node l;
+    v_coloc := pg_catalog.nextval('kingres.colocation_id_seq');
+    PERFORM kingres.internal_register_schema(v_name, v_coloc, v_group);
+    FOR nd IN SELECT n.node_id FROM kingres.node n
+               WHERE n.role OPERATOR(pg_catalog.=) 'primary' AND n.is_active AND n.node_id OPERATOR(pg_catalog.<>) v_self
+               ORDER BY n.node_id
+    LOOP
+        PERFORM kingres.internal_branch_exec(nd.node_id, pg_catalog.format('CREATE SCHEMA %I AUTHORIZATION %I', v_name, v_owner));
+        PERFORM kingres.internal_branch_exec(nd.node_id, pg_catalog.format('SELECT kingres.internal_register_schema(%L, %s, %s)', v_name, v_coloc, v_group));
+    END LOOP;
+    RETURN v_coloc;
+END;
+$$;
+
+COMMENT ON FUNCTION kingres.distribute_schema(regnamespace, int) IS
+    'Make an empty schema a distributed schema of a shard group (map group primary only); returns its colocation id';
+
+-- What the origin of a propagated statement asks every other node to do after the statement, in the same transaction:
+-- 'register_schema' (the schema that a CREATE SCHEMA made, in a database that distributes new schemas) and 'register_tables'
+-- (the tables the statement made).  The session that calls it runs as the role of the user whose statement it is, so the
+-- function checks its caller itself (a superuser, or a session that another node opened) and is not revoked from PUBLIC.
+CREATE FUNCTION kingres.internal_schema_delta(op text, nsp name, colocation_id int DEFAULT NULL, group_id int DEFAULT NULL)
+    RETURNS int
+    AS 'MODULE_PATHNAME', 'kingres_internal_schema_delta'
+    LANGUAGE C
+    SET search_path = pg_catalog, kingres, pg_temp;
+
+REVOKE ALL ON FUNCTION
+    kingres.internal_choose_schema_group(),
+    kingres.internal_register_schema_tables(name),
+    kingres.distribute_schema(regnamespace, int)
+    FROM PUBLIC;
+
+-- =========================================================================
+-- PHASE 11, increment 3                                                      [end]
+-- =========================================================================
