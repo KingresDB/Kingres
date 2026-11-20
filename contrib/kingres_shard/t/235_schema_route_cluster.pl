@@ -265,6 +265,15 @@ fails($n1, q{WITH x AS (UPDATE public.ref SET name = name RETURNING id) SELECT c
 	isnt($rc, 0, 'a role that may only insert cannot delete');
 	q1($n2, q{DELETE FROM ra.t WHERE id = 7700});
 }
+# a view that another role owns: the rights on the table are the owner's, which a statement run on the other node does not have
+q1($n1, q{CREATE VIEW ra.vw AS SELECT id, v FROM ra.t; GRANT SELECT ON ra.vw TO alice; REVOKE SELECT ON ra.t FROM alice});
+is(q1($n2, q{SELECT count(*) FROM ra.vw WHERE id < 3}), 2, 'the view works on the owner');
+{
+	my ($rc, $out, $err) = run_sql($n2, q{SELECT count(*) FROM ra.vw WHERE id < 3}, extra_params => [ '-U', 'alice' ]);
+	is($out, '2', 'a role that has the view and not the table reads it on the owner (the rights of the view owner)') or diag($err);
+}
+fails($n1, q{SELECT count(*) FROM ra.vw WHERE id < 3}, qr/read through a view owned by role/, 'the same read from another node is refused with the reason, not with an error of the owner', extra_params => [ '-U', 'alice' ]);
+q1($n1, q{DROP VIEW ra.vw});
 fails($n1, q{SET kingres_shard.enable_schema_routing = off; INSERT INTO ra.t (id, v) VALUES (7800, 'off')}, qr/kingres_shard\.enable_schema_routing is off/, 'with routing off a write to a shell is refused and says why');
 is(q1($n1, q{SET kingres_shard.enable_schema_routing = off; SELECT count(*) FROM ra.t WHERE id < 4}), 3, 'with routing off a read works (the scan)');
 
@@ -277,7 +286,7 @@ is(q1($n1, q{SET kingres_shard.enable_schema_routing = off; SELECT count(*) FROM
 	my $g2 = q1($n1, q{SELECT group_id FROM kingres.node WHERE node_id = 2});
 	q1($n1, "SELECT kingres.internal_set_schema_group($c, $g3, 'active')");
 	my ($rc, $out, $err) = run_sql($n1, qq{\\set VERBOSITY sqlstate\nSELECT count(*) FROM ra.t});
-	isnt($rc, 0, 'node 1 sends the statement to node 3, which does not hold the schema: no answer');
+	isnt($rc, 0, 'node 1 sends the statement to node 3, which does not hold the schema: no answer') or diag("out=$out err=$err");
 	like($err, qr/KS001/, '... the retryable error') or diag($err);
 	($rc, $out, $err) = run_sql($n1, q{INSERT INTO ra.t (id, v) VALUES (7900, 'stale')});
 	isnt($rc, 0, 'a write to the wrong node fails too');

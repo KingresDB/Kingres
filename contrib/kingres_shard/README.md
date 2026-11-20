@@ -1929,6 +1929,23 @@ and `dist_table` are made by hand with the delta functions, as the tests do.
 - `create_distributed_table` is refused in the mode `schema` and for a table of a distributed schema; `create_reference_table` is refused for a table of a distributed schema and
   stays allowed in the mode `schema`.
 
+**Increment 4: path S, the statement that the owner runs whole.**
+
+- A statement (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`, with subqueries, CTEs including those that write, windows, aggregates, joins, set operations, `FOR UPDATE`,
+  `ON CONFLICT` and `RETURNING`) whose tables are all tables of distributed schemas held by **one** other shard group, or reference tables that it only reads, is
+  deparsed and sent whole to the primary of that group, which plans and runs it with its own statistics and indexes (`Kingres Remote Statement` in `EXPLAIN`).
+  The decision does not depend on a key, so a generic plan is routed too.  The answer of a statement that is shipped is the answer of the same statement on the owner.
+- The sequences of a schema are the owner's: `nextval`, `currval` and `setval` with a constant sequence name count as the schema, so `SELECT nextval('s.seq')` on another
+  node is shipped, and the default of a `serial` column is evaluated by the owner.  `lastval()`, a sequence given by an expression and a sequence read as a table are not
+  shipped (a statement that needs one of them together with a table of another kind is refused with the reason).
+- A function, operator or aggregate that is not built in makes the statement stay with the distributed scan (the function is then evaluated on this node) unless the schema has
+  `ship_functions` (`kingres.alter_distributed_schema(nsp, ship_functions)`, superuser, map group primary; the catalog goes to every node).  A write that cannot be shipped
+  is refused and the detail names the reason (a local or hash-distributed table, two owners, a function that is not shipped, a write to a reference table).
+- `kingres_shard.enable_schema_routing` (default on, any role): off, a statement on a distributed schema is never shipped whole, a read is planned with the
+  distributed scan and a write to a schema of another group is refused.  The tests compare the answers of the two paths (ADR 0022).
+- A scrollable cursor, and everything that path S does not take, is answered by the scan; the reads that mix schemas of two owners, local tables, hash tables or
+  reference tables that are written are read through the scan, one fragment per schema.
+
 ## Limitations in phase 2a
 
 Read these first; each is a reviewed boundary, not an accident.
