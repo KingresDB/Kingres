@@ -66,7 +66,9 @@
 #include "access/xact.h"
 #include "catalog/partition.h"
 #include "catalog/pg_aggregate.h"
+#include "catalog/pg_collation_d.h"
 #include "catalog/pg_constraint.h"
+#include "common/int.h"
 #include "catalog/pg_type_d.h"
 #include "catalog/pg_language_d.h"
 #include "catalog/pg_proc.h"
@@ -77,6 +79,7 @@
 #include "nodes/params.h"
 #include "nodes/pathnodes.h"
 #include "optimizer/optimizer.h"
+#include "optimizer/clauses.h"
 #include "optimizer/planner.h"
 #include "parser/analyze.h"
 #include "parser/parse_relation.h"
@@ -400,6 +403,16 @@ analyze_query(Query *q, Analysis *a, const KsCatalog *cat)
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("FROM ONLY is not supported for distributed table \"%s\"", get_rel_name(rte->relid)),
 					 errhint("A distributed table is one table whose rows are in the partitions of every shard group; leave out ONLY.")));
+		/*
+		 * TABLESAMPLE of a distributed table (review P2E-02): the scan asks every group for its rows and applies no sampling to the rows of
+		 * the other groups, so the sample would be that of this node's partitions plus every row of the others.  A sample of a table that is
+		 * spread over groups is not one sample of the table, so it is refused on every path instead of answering with another table.
+		 */
+		if (dt != NULL && rte->tablesample != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("TABLESAMPLE is not supported for distributed table \"%s\"", get_rel_name(rte->relid)),
+					 errhint("Sample a copy of the rows (for example a table made with CREATE TABLE AS), or filter the rows with a random() condition.")));
 		if (dt != NULL)
 		{
 			DistRef    *ref = palloc0(sizeof(DistRef));
@@ -1217,6 +1230,124 @@ plan_partial_fragment(Query *parse, const char *query_string, int cursorOptions,
 }
 
 /*
+ * The extensions named in the marker are installed here at the version the origin has (design 5.5): another version, or none, is KS001
+ * with a detail that says the statement is not a retry until the upgrade is finished.  This runs before this node's own analysis, which
+ * would refuse an object of a version it does not know with a less useful message.
+ */
+static void
+check_marker_installed_versions(const char *marker_ext)
+{
+	char	   *copy;
+	char	   *tok;
+
+	if (marker_ext == NULL)
+		return;
+	copy = pstrdup(marker_ext);
+	for (tok = strtok(copy, ","); tok != NULL; tok = strtok(NULL, ","))
+	{
+		char	   *colon = strchr(tok, ':');
+		char	   *name;
+		char	   *here;
+
+		if (colon == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("this node does not accept the fragment that another node sent it"),
+					 errdetail("The marker names an extension without a version.")));
+		*colon = '\0';
+		name = tok;
+		here = kingres_shard_extension_version(name);
+		if (here == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_KINGRES_STALE_MAP),
+					 errmsg("extension %s is not installed here and is at version %s at the node that sent the statement", name, colon + 1),
+					 errdetail("The statement is shipped whole only between nodes that run the same version of the extension."),
+					 errhint("Repeating the statement does not help until the extension is installed on every node; SET kingres_shard.shippable_extensions = 'none' makes the node that runs the statement read the rows instead.")));
+		if (strcmp(here, colon + 1) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_KINGRES_STALE_MAP),
+					 errmsg("extension %s is at version %s here and %s at the node that sent the statement", name, here, colon + 1),
+					 errdetail("The statement is shipped whole only between nodes that run the same version of the extension."),
+					 errhint("Repeating the statement does not help until the upgrade of the extension is finished on every node; SET kingres_shard.shippable_extensions = 'none' makes the node that runs the statement read the rows instead.")));
+	}
+}
+
+/*
+ * The extensions that a fragment names in its marker (design 5.5) are the ones the statement uses, at the version this node has.
+ * `used` is what this node's own analysis of the text found.  A version that differs is KS001 with a detail that says it is not
+ * a retry until the upgrade is finished; a statement that uses what the marker does not name (a forged one) is 0A000.
+ */
+static void
+check_marker_extensions(const char *marker_ext, const char *used)
+{
+	List	   *mt = NIL;
+	List	   *ut = NIL;
+	ListCell   *lc;
+	ListCell   *lc2;
+	char	   *copy;
+	char	   *tok;
+
+	if (marker_ext == NULL && used == NULL)
+		return;
+	if (marker_ext != NULL)
+	{
+		copy = pstrdup(marker_ext);
+		for (tok = strtok(copy, ","); tok != NULL; tok = strtok(NULL, ","))
+			mt = lappend(mt, pstrdup(tok));
+	}
+	if (used != NULL)
+	{
+		copy = pstrdup(used);
+		for (tok = strtok(copy, ","); tok != NULL; tok = strtok(NULL, ","))
+			ut = lappend(ut, pstrdup(tok));
+	}
+	foreach(lc, ut)
+	{
+		char	   *u = (char *) lfirst(lc);
+		char	   *colon = strchr(u, ':');
+		size_t		nlen = colon ? (size_t) (colon - u) : strlen(u);
+		char	   *theirs = NULL;
+
+		foreach(lc2, mt)
+		{
+			char	   *m = (char *) lfirst(lc2);
+
+			if (strncmp(m, u, nlen) == 0 && m[nlen] == ':')
+				theirs = m + nlen + 1;
+		}
+		if (theirs == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("this node does not accept the fragment that another node sent it"),
+					 errdetail("The statement uses the extension %.*s, which its marker does not name.", (int) nlen, u),
+					 errhint("This is not a change of the bucket map: repeating the statement does not help.")));
+		if (strcmp(theirs, colon + 1) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_KINGRES_STALE_MAP),
+					 errmsg("extension %.*s is at version %s here and %s at the node that sent the statement", (int) nlen, u, colon + 1, theirs),
+					 errdetail("The statement is shipped whole only between nodes that run the same version of the extension."),
+					 errhint("Repeating the statement does not help until the upgrade of the extension is finished on every node; SET kingres_shard.shippable_extensions = 'none' makes the node that runs the statement read the rows instead.")));
+	}
+	foreach(lc, mt)
+	{
+		char	   *m = (char *) lfirst(lc);
+		char	   *colon = strchr(m, ':');
+		size_t		nlen = colon ? (size_t) (colon - m) : strlen(m);
+		bool		found = false;
+
+		foreach(lc2, ut)
+			if (strncmp((char *) lfirst(lc2), m, nlen) == 0 && ((char *) lfirst(lc2))[nlen] == ':')
+				found = true;
+		if (!found)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("this node does not accept the fragment that another node sent it"),
+					 errdetail("The marker names the extension %.*s, which the statement does not use.", (int) nlen, m),
+					 errhint("This is not a change of the bucket map: repeating the statement does not help.")));
+	}
+}
+
+/*
  * plan_forwarded
  *
  * The statement of a forwarded session (kingres_shard.forwarded is on): the
@@ -1267,13 +1398,16 @@ plan_forwarded(Query *parse, const char *query_string, int cursorOptions,
 	if (parse->commandType == CMD_SELECT && query_string != NULL)
 	{
 		int64		place;
+		char	   *marker_ext = NULL;
 
-		if (kingres_shard_parse_query_marker(query_string, &place))
+		if (kingres_shard_parse_query_marker(query_string, &place, &marker_ext))
 		{
 			KsQueryFragment qf;
 			const char *why = NULL;
 
-			if (kingres_shard_query_fragment_analyze(parse, &qf, &why))
+			if ((check_marker_installed_versions(marker_ext), true) &&
+				kingres_shard_query_fragment_analyze(parse, &qf, &why) &&
+				(check_marker_extensions(marker_ext, qf.ext), true))
 			{
 				PlannedStmt *pstmt = plan_locally(parse, query_string, cursorOptions, boundParams,
 												  cat, a->ndist_rtes);
@@ -1303,13 +1437,16 @@ plan_forwarded(Query *parse, const char *query_string, int cursorOptions,
 	if (parse->commandType == CMD_SELECT && query_string != NULL)
 	{
 		int64		place;
+		char	   *marker_ext = NULL;
 
-		if (kingres_shard_parse_partial_marker(query_string, &place))
+		if (kingres_shard_parse_partial_marker(query_string, &place, &marker_ext))
 		{
 			KsQueryFragment qf;
 			const char *why = NULL;
 
-			if (kingres_shard_partial_fragment_analyze(parse, &qf, &why))
+			if ((check_marker_installed_versions(marker_ext), true) &&
+				kingres_shard_partial_fragment_analyze(parse, &qf, &why) &&
+				(check_marker_extensions(marker_ext, qf.ext), true))
 			{
 				PlannedStmt *pstmt = plan_partial_fragment(parse, query_string, cursorOptions, boundParams,
 														   cat, a->ndist_rtes, false);
@@ -1784,7 +1921,7 @@ can_distributed_scan(Query *parse, const KsCatalog *cat, bool spans)
  * columns of the text must be those the plan expects: the same number, of the same types.
  */
 bool
-kingres_shard_text_accepted(const char *body, Query *sent, bool partial, const char **why)
+kingres_shard_text_accepted(const char *body, Query *sent, bool partial, const char **why, char **ext)
 {
 	ParamTypes	pt = {NULL, 0};
 	List	   *raw;
@@ -1821,6 +1958,8 @@ kingres_shard_text_accepted(const char *body, Query *sent, bool partial, const c
 	rq = linitial_node(Query, rewritten);
 	if (partial ? !kingres_shard_partial_fragment_analyze(rq, &qf, why) : !kingres_shard_query_fragment_analyze(rq, &qf, why))
 		return false;
+	if (ext != NULL)
+		*ext = qf.ext;
 
 	/*
 	 * The columns the text returns are the ones that are not resjunk: a partial fragment groups by columns that it does not
@@ -1856,6 +1995,116 @@ kingres_shard_text_accepted(const char *body, Query *sent, bool partial, const c
 	return true;
 }
 
+/* An expression that this node can compute when a scan starts: no column, no volatile function, no sub-select, no aggregate. */
+static bool
+limit_evaluable(Node *e)
+{
+	if (e == NULL)
+		return true;
+	return !contain_var_clause(e) && !contain_volatile_functions(e) && !contain_subplans(e) && !checkExprHasSubLink(e) &&
+		!contain_agg_clause(e) && !contain_window_function(e);
+}
+
+/*
+ * closed_sort_limit
+
+ *
+ * Design 8: the sort and the limit of a closed query go to the groups.  Every group returns its rows in the final order and this
+ * node merges the sorted streams (fragment_scan.c) instead of sorting every row.  What is sent is ORDER BY as the query has it
+ * (the select list holds every sort expression: the entries that only order were made ordinary columns) and, when the limit is
+ * pushed, LIMIT count + offset with no OFFSET: every group returns its first count + offset rows of the final order, and the node
+ * that gathers applies OFFSET and LIMIT to the merged stream.
+ *
+ * The sort is pushed only when this node can order exactly as the groups do (O1, O2): the ordering operator of every key is a
+ * built-in btree operator and the collation is the default or "C".  The limit is pushed only with a sort that is pushed (or none),
+ * with constants that fit, without WITH TIES (O4, O5).  *spec is a list of lists of four integers per key: the column, the operator,
+ * the collation, nulls first.  Without a pushed sort, the sort clause is taken out of the text.
+ */
+static void
+closed_sort_limit(Query *parse, Query *ship, List **spec, bool *limit_pushed, Node **lcnt, Node **loff)
+{
+	ListCell   *lc;
+	bool		sort_ok = true;
+
+	*spec = NIL;
+	*limit_pushed = false;
+	*lcnt = NULL;
+	*loff = NULL;
+	if (!kingres_shard_enable_pushdown_sort)
+	{
+		ship->sortClause = NIL;
+		ship->limitOffset = NULL;
+		ship->limitCount = NULL;
+		ship->limitOption = LIMIT_OPTION_COUNT;
+		return;
+	}
+	foreach(lc, parse->sortClause)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		TargetEntry *tle = get_sortgroupclause_tle(sgc, parse->targetList);
+		Oid			coll = exprCollation((Node *) tle->expr);
+		Oid			opfamily;
+		Oid			opcintype;
+		CompareType strategy;
+
+		if ((coll != InvalidOid && coll != DEFAULT_COLLATION_OID && coll != C_COLLATION_OID) ||
+			sgc->sortop >= FirstGenbkiObjectId ||
+			!get_ordering_op_properties(sgc->sortop, &opfamily, &opcintype, &strategy))
+		{
+			sort_ok = false;
+			break;
+		}
+		*spec = lappend(*spec, list_make4(makeInteger(tle->resno - 1), makeInteger((int) sgc->sortop),
+										  makeInteger((int) coll), makeInteger(sgc->nulls_first ? 1 : 0)));
+	}
+	if (!sort_ok)
+	{
+		*spec = NIL;
+		ship->sortClause = NIL;
+		ship->limitOffset = NULL;
+		ship->limitCount = NULL;
+		ship->limitOption = LIMIT_OPTION_COUNT;
+		return;
+	}
+	/*
+	 * the limit: constants only, count + offset, no WITH TIES.  The parser leaves the cast of the literal to bigint as a call
+	 * (the planner folds it later), so the expressions are folded here, as the planner will.
+	 */
+	ship->limitOffset = NULL;
+	ship->limitCount = NULL;
+	ship->limitOption = LIMIT_OPTION_COUNT;
+	if (parse->limitCount != NULL && parse->limitOption == LIMIT_OPTION_COUNT)
+	{
+		Node	   *cnt = eval_const_expressions(NULL, parse->limitCount);
+		Node	   *off = parse->limitOffset ? eval_const_expressions(NULL, parse->limitOffset) : NULL;
+
+		if (IsA(cnt, Const) && !((Const *) cnt)->constisnull && ((Const *) cnt)->consttype == INT8OID &&
+			(off == NULL ||
+			 (IsA(off, Const) && !((Const *) off)->constisnull && ((Const *) off)->consttype == INT8OID)))
+		{
+			int64		count = DatumGetInt64(((Const *) cnt)->constvalue);
+			int64		offset = off ? DatumGetInt64(((Const *) off)->constvalue) : 0;
+			int64		sum;
+
+			if (count >= 0 && offset >= 0 && !pg_add_s64_overflow(count, offset, &sum))
+			{
+				ship->limitCount = (Node *) makeConst(INT8OID, -1, InvalidOid, sizeof(int64), Int64GetDatum(sum), false, FLOAT8PASSBYVAL);
+				*limit_pushed = true;
+			}
+		}
+		else if (!(IsA(cnt, Const) && ((Const *) cnt)->constisnull) && limit_evaluable(cnt) && (off == NULL || limit_evaluable(off)))
+		{
+			/*
+			 * A parameter, or an expression of parameters and immutable and stable functions: this node computes
+			 * count + offset when the scan starts and sends it as one more parameter (design 8.2 O5).
+			 */
+			*lcnt = cnt;
+			*loff = off;
+			*limit_pushed = true;
+		}
+	}
+}
+
 /*
  * pushdown_prepare
  *
@@ -1880,12 +2129,19 @@ pushdown_prepare(Query *parse, const char **why)
 	KsQueryFragment qf;
 	KsParamRenumber prn = {NIL};
 	char	   *body = NULL;
+	char	   *pi_ext = NULL;
 	int			nest;
 	ListCell   *lc;
 	List	   *dist = NIL;
 	const KsColocation *coloc;
 	KsPushdownInfo *pi;
 	bool		is_partial = false;
+	bool		is_join = false;
+	List	   *sortspec = NIL;
+	bool		limit_pushed = false;
+	Node	   *lcnt = NULL;
+	Node	   *loff = NULL;
+	int			limit_param = 0;
 
 #define PD_NO(msg) do { *why = (msg); return NULL; } while (0)
 
@@ -1898,14 +2154,18 @@ pushdown_prepare(Query *parse, const char **why)
 		const char *preason = NULL;
 
 		/*
-		 * Not closed: an aggregation or a grouping that does not contain a distribution key can still be run in
-		 * two steps (design 7): each group aggregates its own rows and this node combines the partial states.  The
-		 * text of the groups is made by the path, which knows the partial target (fragment_scan.c).
+		 * Not closed.  An aggregation or a grouping that does not contain a distribution key can still be run in two steps
+		 * (design 7): each group aggregates its own rows and this node combines the partial states.  And the join of the level
+		 * may be a fragment of its own (design 9): the groups return the rows of the join and this node does the rest.  The
+		 * text of both is made by the path, which knows the columns it needs (fragment_scan.c).
 		 */
-		if (!kingres_shard_enable_partial_aggregation)
-			PD_NO(reason);
-		if (!kingres_shard_partial_shape_ok(parse, &preason))
-			PD_NO(parse->hasAggs || parse->groupClause != NIL ? preason : reason);
+		bool		can_partial = kingres_shard_enable_partial_aggregation &&
+			kingres_shard_partial_shape_ok(parse, false, &preason);
+		bool		can_join = kingres_shard_enable_pushdown_join && list_length(parse->rtable) >= 2;
+
+		if (!can_partial && !can_join)
+			PD_NO(kingres_shard_enable_partial_aggregation && (parse->hasAggs || parse->groupClause != NIL) && preason != NULL ?
+				  preason : reason);
 		qf.pd = pd;
 		qf.colocation_id = pd.colocation_id;
 		qf.relids = kingres_shard_pushdown_relids(&pd);
@@ -1914,9 +2174,11 @@ pushdown_prepare(Query *parse, const char **why)
 		ship->limitOffset = NULL;
 		ship->limitCount = NULL;
 		ship->limitOption = LIMIT_OPTION_COUNT;
-		is_partial = true;
+		is_partial = can_partial;
+		is_join = can_join;
 		goto assemble;
 	}
+
 	if (!kingres_shard_enable_pushdown_closed)
 		PD_NO("closed pushdown is switched off");
 	ship = copyObject(parse);
@@ -1928,20 +2190,31 @@ pushdown_prepare(Query *parse, const char **why)
 			PD_NO("it removes duplicates and has a column that only orders or groups");
 		te->resjunk = false;
 	}
-	ship->sortClause = NIL;
-	ship->limitOffset = NULL;
-	ship->limitCount = NULL;
-	ship->limitOption = LIMIT_OPTION_COUNT;
+	closed_sort_limit(parse, ship, &sortspec, &limit_pushed, &lcnt, &loff);
 	if (!kingres_shard_query_fragment_analyze(ship, &qf, &reason))
 		PD_NO(reason);
 	if (!parse->hasAggs && parse->groupClause == NIL && parse->distinctClause == NIL && pd.ndist < 2)
 		PD_NO("it reads one table and neither groups nor removes duplicates: the groups would return the rows the scan returns");
 
 	ship = query_tree_mutator(ship, kingres_shard_renumber_params, &prn, 0);
+	if (lcnt != NULL)
+	{
+		Param	   *lp = makeNode(Param);
+
+		/* the limit that is computed at the start of the scan: one more parameter, after those of the statement */
+		limit_param = list_length(prn.ids) + 1;
+		lp->paramkind = PARAM_EXTERN;
+		lp->paramid = limit_param;
+		lp->paramtype = INT8OID;
+		lp->paramtypmod = -1;
+		lp->paramcollid = InvalidOid;
+		lp->location = -1;
+		ship->limitCount = (Node *) lp;
+	}
 	nest = kingres_shard_set_transmission_modes();
 	body = pg_get_querydef(ship, false);
 	kingres_shard_reset_transmission_modes(nest);
-	if (!kingres_shard_text_accepted(body, ship, false, &reason))
+	if (!kingres_shard_text_accepted(body, ship, false, &reason, &pi_ext))
 	{
 		ereport(DEBUG1, (errmsg_internal("kingres_shard: a closed query is not shipped: the groups would not accept its text: %s", reason)));
 		PD_NO(reason);
@@ -1971,12 +2244,20 @@ assemble:
 		(parse->distinctClause != NIL ? "closed distinct (by key)" : "closed join (on key)");
 	pi->ncols = list_length(parse->targetList);
 	pi->ndist = qf.pd.ndist;
+	pi->ext = (is_partial || is_join) ? NULL : (pi_ext != NULL ? pi_ext : qf.ext);
+	pi->sort = sortspec;
+	pi->limit_cnt = lcnt;
+	pi->limit_off = loff;
+	pi->limit_param = limit_param;
+	pi->limit_pushed = limit_pushed;
 	pi->partial = is_partial;
-	pi->ship = is_partial ? ship : NULL;
-	if (is_partial)
+	pi->join = is_join;
+	pi->closed = !is_partial && !is_join;
+	pi->ship = (is_partial || is_join) ? ship : NULL;
+	if (is_partial || is_join)
 	{
 		pi->sql = NULL;
-		pi->kind = "partial aggregate";
+		pi->kind = is_partial ? "partial aggregate" : "join rows (on key)";
 	}
 	return pi;
 #undef PD_NO
@@ -2485,7 +2766,7 @@ planner_hook_body(Query *parse, const char *query_string,
 
 		/* this node's own part of a partial aggregation returns partial states as the others do */
 		if (parse->commandType == CMD_SELECT && query_string != NULL &&
-			kingres_shard_parse_partial_marker(query_string, &pplace))
+			kingres_shard_parse_partial_marker(query_string, &pplace, NULL))
 			return plan_partial_fragment(parse, query_string, cursorOptions, boundParams, cat, a.ndist_rtes, true);
 		return pass_through(parse, query_string, cursorOptions, boundParams);
 	}

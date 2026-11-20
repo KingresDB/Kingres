@@ -25,7 +25,7 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 use IPC::Run ();
-use KingresShardTest qw(run_sql prepared_count);
+use KingresShardTest qw(not_shipped_ok run_sql prepared_count);
 use KingresShardCompare;
 
 my $c = KingresShardCompare->new('pg', extra => "kingres_shard.enable_partial_aggregation = off" . "
@@ -140,7 +140,7 @@ for my $sql (@shipped)
 {
 	my $text = shipped_text($sql);
 	ok(defined $text, "shipped: $sql") or next;
-	unlike($text, qr/\b(?:ORDER BY|LIMIT)\b.*$/, '... the text has no ORDER BY and no LIMIT') if $sql !~ /'a''b/;
+	unlike($text, qr/\bOFFSET\b/, '... the text has no OFFSET (the sort and a limit are the groups\', step 9)') if $sql !~ /'a''b/;
 	for my $nd ([ $n2, 2 ], [ $n3, 3 ])
 	{
 		my ($rc, $out, $err) = as_node($nd->[0], $nd->[1], fragment($PLACE, $text));
@@ -150,7 +150,7 @@ for my $sql (@shipped)
 for my $sql (@refused)
 {
 	my $plan = plan_of($n1, $sql);
-	unlike($plan, qr/\Q$FS\E/, "not shipped: $sql");
+	not_shipped_ok($plan, "not shipped: $sql");
 	(my $text = $sql) =~ s/\s+(?:FOR UPDATE)$//;
 	my ($rc, $out, $err) = as_node($n2, 2, fragment($PLACE, $sql));
 	isnt($rc, 0, '... a group refuses it when it is forged into a fragment');
@@ -173,8 +173,13 @@ for my $sql (@refused)
 	like($err, qr/not the one the statement was shipped with/, '... which says what is wrong');
 
 	($rc, $out, $err) = as_node($n2, 2, fragment($PLACE, $base . ' LIMIT 5'));
-	isnt($rc, 0, 'a fragment with a LIMIT is refused (the node that gathers the rows applies it)');
+	is($rc, 0, 'a fragment with one constant LIMIT is accepted (the node that sent it put count + offset there)') or diag($err);
+	($rc, $out, $err) = as_node($n2, 2, fragment($PLACE, $base . ' LIMIT 5 OFFSET 2'));
+	isnt($rc, 0, 'a fragment with an OFFSET is refused (the node that gathers the rows applies it)');
 	like($err, qr/0A000/, '... with 0A000');
+	($rc, $out, $err) = as_node($n2, 2, fragment($PLACE, $base . ' FETCH FIRST 5 ROWS WITH TIES'));
+	isnt($rc, 0, 'a fragment with WITH TIES is refused');
+	like($err, qr/0A000|WITH TIES|ORDER BY/, '... with a refusal');
 
 	for my $bad ('/* kingres:query-fragment */ ', '/* kingres:query-fragment place=abc */ ', '/* kingres:query-fragment place=1 foo=2 */ ',
 				 '/* kingres:query-fragment v=2 kind=query place=1 */ ')

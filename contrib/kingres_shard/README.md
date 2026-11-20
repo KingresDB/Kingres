@@ -132,6 +132,30 @@ and are not in this version.
   that need one state of several tables from one node should read them in one
   scan node (a join of colocated tables on the key is routed to one group).
   `SERIALIZABLE` is serializable per node only.
+- **Pushdown gives the single node's answer, and the scan is always the fallback.** A read that spans shard
+  groups may be run by the groups (a closed query, a partial aggregation, the rows of a join, a sorted stream
+  with a limit, the functions of a listed extension: see the sections of phase 2b below). Every such path
+  returns the rows the single node returns, in the order the statement asks for (the same set of rows, the
+  same order where `ORDER BY` fixes one, the same errors for a negative or `NULL` `LIMIT`), with the exceptions
+  that "Differences from a single node that pushdown makes visible" lists: a floating point aggregate, an
+  aggregate over values that compare equal and print differently, a cursor that cannot scan backward, `SET ROLE`
+  to a role that cannot log in, and a `KS001` that the client repeats. A statement that
+  no path accepts, or whose pushed path costs more, runs through the distributed scan as before, and every
+  switch (`enable_pushdown`, `enable_pushdown_closed`, `enable_partial_aggregation`, `enable_pushdown_sort`,
+  `enable_pushdown_join`, `shippable_extensions = 'none'`) turns a path off without changing an answer.
+  What is **not** promised: a global snapshot (see above: the groups of a pushed statement read their own
+  snapshots, so the skew above applies to a pushed statement as well), and the last digits of a floating
+  point aggregate or the order of the elements of `array_agg` and `string_agg` without `ORDER BY` (the
+  states are combined in the order the groups answer, as in a parallel plan).
+- **A group does what it is allowed to do, whoever asks.** A fragment is a text with a marker
+  (`kingres:query-fragment`, `kingres:partial-fragment`) that a group parses and checks against its own
+  rules again; a text that is forged, or has a marker the statement does not fit, is refused with `0A000`,
+  and a placement or an extension version that differs from the sender's is `KS001`. A fragment runs with the
+  rights of the session role that this node opened on the group (never with the rights of the node), a
+  statement over a table with row-level security is not shipped (the scan answers), a statement that reads a view
+  of another owner is refused with an error (on every path: the view's owner has no rights on another node), a
+  function of a user is never shipped, and the session of a group runs with `search_path = pg_catalog`. See "Security
+  notes".
 - **Distributed deadlocks are detected (0.5).** Writes that fan out to several
   nodes take their row locks in the same order on every node (nodes in id
   order), so two such statements do not deadlock each other. Two transactions
@@ -778,6 +802,9 @@ the files of the extension, because the dump creates the extension.
 | `kingres_shard.enable_pushdown` | on | Master switch of the pushdown paths of a read (step 6: closed queries). Off: a read that spans shard groups is answered by the row-moving distributed scan, as before. `USERSET`; it chooses among plans that give the same answer, and grants nothing. |
 | `kingres_shard.enable_pushdown_closed` | on | Off: a closed query (see "Closed queries, run whole by every group") is not shipped (the partial aggregation has its own switch); the scan answers. `USERSET`. |
 | `kingres_shard.enable_partial_aggregation` | on | Off: an aggregate or a grouping that is not closed is not run in two steps (see "Partial aggregation"); the scan answers. `USERSET`. |
+| `kingres_shard.enable_pushdown_sort` | on | Off: a closed query is not sorted or limited by the groups; they send the rows unordered and this node sorts and limits them (see "Sort and limit of a closed query"). `USERSET`. |
+| `kingres_shard.enable_pushdown_join` | on | Off: the join of colocated tables is not run by the groups as a fragment of its own when the statement is not closed (see "Join rows"); the rows of each table come to this node. `USERSET`. |
+| `kingres_shard.shippable_extensions` | all | all, none, or a list of names from the list compiled into the library (see "Objects of extensions"): which extensions' objects may be shipped to the groups. A narrowing only. `USERSET`. |
 | `kingres_shard.enable_bulk_routing` | on | Off: an `INSERT` that goes to several shard groups is refused as in 0.5 (a multi-row `VALUES`, `INSERT ... SELECT`, a single row whose key is not a constant). A single row with a constant key never needed the router and is not affected. `USERSET`; it grants nothing. |
 | `kingres_shard.enable_colocated_insert_select` | on | Off: a colocated `INSERT ... SELECT` is not shipped whole: it goes through the row router when it can (no `ON CONFLICT DO UPDATE`) and is refused when it cannot. `USERSET`; it chooses among statements that give the same answer, and grants nothing. A cached plan keeps the path it was made with (as for every planner setting). |
 | `kingres_shard.enable_copy_routing` | on | Off: `COPY ... FROM` into a distributed table of a cluster with several groups is refused as in 0.5. `USERSET`. |
@@ -1465,7 +1492,7 @@ a `GROUP BY` that contains the distribution key (or a key that is equal to it th
 `DISTINCT` that has the key in its select list, a join of colocated tables on their keys with a reference table
 or without.  Each group computes its own final rows from its own buckets and only those rows cross the network
 (the "Kingres Fragment Scan" of `EXPLAIN`); the node that runs the statement runs its own group's part through
-SPI, concatenates, and applies `ORDER BY`, `OFFSET` and `LIMIT` itself (they are not sent).  The planner takes this
+SPI, concatenates, and applies `OFFSET` and `LIMIT` itself and, when the groups do not sort for it (see "Sort and limit of a closed query"), `ORDER BY`.  The planner takes this
 path only when its cost is lower than the scan's; a statement outside it gets the plan it got before.
 
 What is sent is the statement with its parameters (`$1`...), after a check that the groups would accept its text
@@ -1475,21 +1502,25 @@ and a stale placement with `KS001`.  Reading is checked as the scan is (the plac
 before and after the cursors are opened, the partitions of every table, one node per group in a transaction).
 
 Not shipped as a closed query (the scan answers, or the partial aggregation below does for an aggregate or a grouping): a grouping or `DISTINCT` that does not contain the key, an aggregate with no
-`GROUP BY`, grouping sets, window functions, `DISTINCT ON`, aggregates whose result depends on the order of the
+`GROUP BY`, grouping sets, `DISTINCT ON`, aggregates whose result depends on the order of the
 rows (`array_agg`, `string_agg`, floating point sums), a function that is not built in and immutable (`now()`),
 a conversion through the text form of a value, a sub-select, a CTE, a view, a local table, a table of another
-colocation group, a key from the nullable side of an outer join, row-level security, a view of another owner, a
+colocation group, a key from the nullable side of an outer join, row-level security, a
 statement that locks rows, and a statement that reads one table and neither groups nor removes duplicates (nothing
-to gain).  `EXPLAIN (VERBOSE)` of the scan such a statement gets says why (`Pushdown: not used: ...`).
+to gain).  `EXPLAIN (VERBOSE)` of the scan such a statement gets says why (`Pushdown: not used: ...`).  A statement that reads a view of another
+owner is not answered by the scan either: it is refused with an error, on every path ("Views" in the limitations of phase 2a).
 
 `EXPLAIN` of a shipped statement shows `Pushed:`, `Groups: 3 of 3 (local + 2 remote)` (with `; pruned by <column>`
 when a restriction on the key left groups out), and `Remote SQL:`; `EXPLAIN ANALYZE` adds `Rows from groups:`.
 
-**What is never shipped, and what is refused.**  A `FULL JOIN` is never shipped whole (the scan answers).  In a
+**What is never shipped, and what is refused.**  A `FULL JOIN` is shipped whole only between distributed tables whose key equality is in its `ON` clause; one with a
+reference table, or without that equality, is not (the scan answers).  In a
 colocated `INSERT ... SELECT` every cast that is not text to text goes through the row router, not through the groups; the
 groups run one after another, not at once.  `ON CONFLICT DO SELECT` (19) is refused, not merely "not shipped".  A
 parameter, an array, a range or a row of a `reg*` type is not shipped (each group would resolve the name to its own
-object).  `FROM ONLY` a distributed table is refused on every path ("FROM ONLY is not supported for distributed table").
+object).  `FROM ONLY` a distributed table is refused on every path ("FROM ONLY is not supported for distributed table"), and so is `TABLESAMPLE` of one
+("TABLESAMPLE is not supported for distributed table"): a sample of a table that is spread over groups is not one sample of the table; a reference
+table and a local table are sampled as on a single node, and a `random()` condition samples a distributed table.
 A closed query that returns about as many rows as it reads (a grouping or `DISTINCT` by a unique key of one table) is
 left to the scan: the groups would return the same rows.  `EXPLAIN ANALYZE` of a fragment scan shows the time to the
 first batch of each group.
@@ -1516,6 +1547,48 @@ transaction, so that the pointers a statement holds stay valid (a node, a distri
 planner makes its analysis again with the new cache when the cache changed under it.  `add_node` and the check of the
 synchronous standbys of the other primaries copy what they need before they connect.  t/135 runs a cluster under the setting.
 
+## Join rows (phase 2b, step 10)
+
+A statement that is not closed as a whole (a window function that is not partitioned by the key, an ordered-set aggregate,
+`count(DISTINCT ...)`, `DISTINCT ON`, a `FULL JOIN` with a window above it) but whose distributed tables are joined on their
+distribution keys (with reference tables if it likes) has a join that every group can compute on its own rows.  The join of the
+whole level is then a fragment of its own: the groups return the rows of the join, with the columns the rest of the plan needs
+(`EXPLAIN` shows `Pushed: join rows (on key)` and `Remote SQL: SELECT s1.id, s2.c FROM (public.s1 JOIN public.s2 ON ...) WHERE ...`), and
+this node plans what is above it (the window, the aggregate, the sort) as for any scan, so only the joined rows cross, not the rows of
+each table.  The text is a closed query (a join on the key and no aggregate), so the group's rule for the fragment of a closed query
+accepts it; nothing new can be asked of a group.  Permitted: an inner join of any mix of distributed and reference tables
+in one key class, a left, right or full join between distributed tables with the key equality in the `ON` clause of that join, and a
+distributed table left joined to a reference table.  Not pushed: a reference table on the preserved side of an outer join (every group would emit
+its unmatched rows), a join on a non-key column, two colocation groups or two key classes, a sub-select, a view, a local table.  The planner
+chooses by cost between this, the partial aggregation, the closed query and the scans; a closed statement keeps its own path.  The
+hook runs for the join relation of the whole level only, once, and never for a grouped relation (19, eager aggregation).  Switch:
+`kingres_shard.enable_pushdown_join` (on).
+
+
+## Sort and limit of a closed query (phase 2b, step 9)
+
+The groups sort the rows of a closed query and this node merges the sorted streams.  What is sent is the query with its `ORDER BY`
+(the select list holds every sort expression: an entry that only orders is sent as a column) and, when the limit is pushed, `LIMIT <count +
+offset>` with no `OFFSET`; every group returns its first rows of the final order, the `Kingres Fragment Scan` merges the streams with
+one `SortSupport` per key (the ordering operator, the direction, `NULLS FIRST` or `LAST` and the collation of the key, as the planner
+takes them for a `Sort`), so there is no `Sort` above it, and the `Limit` of this node applies the offset and the limit to the merged
+stream.  A tie goes to the stream of the group with the lower group id (this node's own part has the id of its own group), so rows that compare equal come out in the same order whichever node runs the statement, and in the same order when the statement is repeated.  `EXPLAIN` shows
+`Merge keys: <n>` and the text with `ORDER BY` and `LIMIT`.  A cursor that is closed early closes the cursors of the groups; a group that
+answers late holds the merge up for as long as it has to.
+
+Pushed only when this node can order exactly as the groups do: the ordering operator of every key is a built-in btree operator and
+the collation of the key is the default or `C`; otherwise the groups send the rows unordered and this node sorts them, as before.  The
+limit is pushed only with a sort that is pushed (or none).  Constants that fit in `bigint` are summed here (`LIMIT 7 OFFSET 20` sends
+`LIMIT 27`).  A parameter, or an expression of parameters and of immutable and stable functions (`LIMIT $1 OFFSET $2`, `LIMIT
+current_setting('x')::int`), is computed by this node when the scan starts, so it follows the values of each execution of a prepared
+statement and of a generic plan; count + offset is sent as one more `bigint` parameter (`LIMIT $n`).  `NULL`, a negative number and a sum
+that does not fit send no limit (`NULL`): this node's own `Limit` node then raises the single node's error for a negative count or
+offset, so the error is never one that a group made.  `LIMIT ALL`, `OFFSET` alone, `FETCH FIRST ... WITH TIES`, and an expression with
+a column, a volatile function or a sub-select send no limit (the merge still holds).  A group accepts a fragment with a limit only when
+it is one constant or one `bigint` parameter, with no `OFFSET`.  An aggregate or grouping that is not closed has nothing
+to push: its rows are sorted after the final aggregation.  Switch: `kingres_shard.enable_pushdown_sort` (on).
+
+
 ## Partial aggregation (phase 2b, step 7)
 
 An aggregate or a grouping that is not closed (it does not contain a distribution key: `SELECT count(*) FROM t`, `SELECT a,
@@ -1525,7 +1598,8 @@ state of each aggregate (a state of type `internal` is returned serialized, as `
 serialization function); the node that runs the statement combines the states with the planner's own final aggregation
 (`Finalize HashAggregate`, `Finalize GroupAggregate` or `Finalize Aggregate` in `EXPLAIN`, over the `Kingres Fragment
 Scan`), applies `HAVING`, runs the final functions, and everything above (`ORDER BY`, `LIMIT`, a window function over
-the result) is planned by PostgreSQL as usual.  The marker of the text a group receives is
+the result, `DISTINCT` and `DISTINCT ON` of the result) is planned by PostgreSQL as usual: the text a group receives has neither a window
+nor `DISTINCT`, and a group that is sent one refuses it.  The marker of the text a group receives is
 `/* kingres:partial-fragment place=<n> */`; a group refuses what its rule does not accept (a statement with `HAVING`,
 `ORDER BY`, `LIMIT`, `DISTINCT`, a window, an aggregate that cannot be split, an aggregate inside an expression) with
 `0A000`, and a stale placement with `KS001`, as for a closed query.  The placement check, the cursors, the local part of
@@ -1537,9 +1611,7 @@ What is split: the built-in aggregates that have a combine function and, for an 
 `string_agg`, `sum`, `var_pop`, `var_samp`, `variance`), with `FILTER`, over any type that is shipped.  The test t/139
 recomputes this list from `pg_aggregate` and fails when a release changes it.  Not split (the scan answers, the answer is the
 same): `DISTINCT` or `ORDER BY` inside the call, ordered-set and hypothetical-set aggregates, `json_agg`, `jsonb_agg`,
-the `*_object_agg` family, `range_agg`, `xmlagg` (no combine function), grouping sets, a window function in the same query
-level, `DISTINCT` above the aggregation, a column of type `money`, an aggregate of an extension (the aggregates of
-`kingres_sketch` are the next step: see below), a table of another colocation group, a local table, a sub-select.
+the `*_object_agg` family, `range_agg`, `xmlagg` (no combine function), grouping sets, a column of type `money`, an aggregate of an extension that is not on the compiled-in list, a table of another colocation group, a local table, a sub-select.
 
 **Floating point and order.**  The partial states are combined in the order the groups answer, as in a parallel plan.  A
 floating point `sum`, `avg`, `stddev`, `variance`, `corr` or `regr_*` can therefore differ from the single node's in the
@@ -1551,14 +1623,36 @@ the elements of an array.
 Switch: `kingres_shard.enable_partial_aggregation` (on; `enable_pushdown` is the master switch).  `DEBUG1` says why a
 statement is not split.
 
-**What an aggregate of an extension needs (not built).**  `kingres_sketch` has `aggcombinefn`, `aggserialfn` and
-`aggdeserialfn` and a state of type `internal`, so the planner's own test (`GROUPING_CAN_PARTIAL_AGG`) already passes, and
-the groups would return the serialized state as `bytea`.  What is missing is the rule that lets the call be shipped at all
-(design 5.5 and step 8): a compiled-in list of the objects of an allowed extension (`ext_object_ok`) that replaces the
-"built in" test of `kingres_shard_aggregate_partial_ok` and of the shippability walker for the aggregate, its argument
-types and its operators; the name and version of every extension a statement uses in the marker (`ext=`), checked by the
-group (a node at another version is `KS001` with the detail); the narrowing setting `shippable_extensions`; and tests
-with the extension installed on every node, at one version and at two.
+## Objects of extensions (phase 2b, step 8)
+
+The functions, operators, types and aggregates of an extension are shipped to the groups when the extension is on a list that is
+compiled into `kingres_shard` (today `kingres_sketch`, version `1.0`), when the version installed on the node is one the list
+accepts, and when the object meets the rules below.  The `kingres_sketch` aggregates (`approx_count_distinct`, `hll_add_agg`,
+`hll_union_agg`, `topn_add_agg`, `tdigest_agg`, `approx_percentile`, ...) then run as partial aggregations and, when the query is
+closed, whole; a column of a sketch type crosses as its text form (`\x` and the hex digits).  The rules (`ext_object_ok`):
+a function or aggregate is written in C or `internal`, is `IMMUTABLE`, is not `SECURITY DEFINER`, has no `SET` clause, and has
+argument and result types that are built in or of the list; a type is a base type of the extension whose input, output, `send` and
+`receive` functions are the extension's; an operator is a member whose function meets the rule for functions.  A function of a user,
+whatever its label, is not shipped: functions are not synchronized between the nodes.
+
+The marker names the extensions the statement uses with their versions, `/* kingres:partial-fragment place=<n>
+ext=kingres_sketch:1.0 */` (the same for `kingres:query-fragment`).  A group compares them with its own catalog before it
+analyses the text: another version, or none, is `KS001` with the message "extension kingres_sketch is at version 1.0 here and 0.9
+at the node that sent the statement", and the hint says a repeat does not help before the upgrade is finished on every node.  A
+statement that uses an extension its marker does not name, or a marker that names one the statement does not use, is `0A000`.  A
+group that does not have the extension at all fails earlier, when it parses the text (the function does not exist there); PostgreSQL has no hook
+between the parser and the analysis of the `DECLARE`, so the node that sent the statement, which knows from the marker what the statement uses,
+turns that failure into the `KS001` of a version difference ("node host:port does not have an extension that the statement uses
+(kingres_sketch:1.0)", with what the node said as the detail).  This is the
+one place where a shipped statement can fail for a reason the scan would not have; the escape is
+`SET kingres_shard.shippable_extensions = 'none'`, with which the node that runs the statement reads the rows and runs the
+aggregate itself.
+
+`kingres_shard.shippable_extensions` (`USERSET`, default `all`) is `all`, `none` or a comma-separated list of names from the
+compiled-in list; another name is an error when it is set.  It is read at the node that runs the statement and only narrows what the
+code allows, so any user may set it.  Comparing `kingres_sketch.self_test()` and the encoding between nodes belongs to `add_node` and
+`check_cluster` (phase 12); this step checks the version only.  Objects of an extension are allowed in the fragment of a closed
+query and of a partial aggregation only; the scan, the writes and the colocated `INSERT ... SELECT` never ship them.
 
 
 ## Limitations in phase 2a
@@ -1566,8 +1660,36 @@ with the extension installed on every node, at one version and at two.
 Read these first; each is a reviewed boundary, not an accident.
 
 - **No global snapshot** (see Guarantees). The distributed scan is slow for
-  large tables by design: it moves rows, it pushes down restrictions only
-  (aggregates, sorts, limits and colocated joins are phase 2b).
+  large tables by design: it moves rows. Since phase 2b the planner can run a closed query, an
+  aggregate, a sorted stream with a limit and a join of colocated tables in the groups so that only their
+  results cross (the sections of phase 2b above); what none of those paths accepts is answered by the
+  scan, which moves the rows of every table involved. `EXPLAIN (VERBOSE)` says why a statement was not pushed.
+- **Differences from a single node that pushdown makes visible.**
+  - A cursor with neither `SCROLL` nor `NO SCROLL` over a pushed ordered statement (the merge of the sorted
+    streams) cannot scan backward: `FETCH BACKWARD` fails with "cursor can only scan forward". On a single node
+    the same cursor can, when the plan happens to allow it. Declare the cursor `SCROLL` (it then reads the
+    rows through a `Material` node and the pushed path stays) or accept forward only.
+  - A pushed statement can fail with `KS001` (a placement or an extension version that changed or that differs
+    between nodes) where the scan would have waited or answered; the client repeats it (for a version difference,
+    after the upgrade has reached every node).
+  - The groups run a pushed statement with the settings the extension sends and `search_path = pg_catalog`;
+    a function that reads other settings is not shipped (only built-in immutable functions and the listed
+    extension objects are).
+  - A floating point aggregate can differ in the last digits from the single node's and between runs, and
+    the elements of an `array_agg` or `string_agg` without `ORDER BY` come in an order SQL leaves open.  The same holds
+    for `min` and `max` of values that compare equal and print differently (`numeric` 57 and 57.00): any of them is
+    returned, and which one changes between runs (a single node leaves it open too).
+  - **`SET ROLE` to a role that cannot log in.**  The groups are reached as the current role (`current_user`), so after
+    `SET ROLE` to a role with `NOLOGIN` every read that spans groups fails ("role ... is not permitted to log in") where a
+    single node answers.  The scan has the same limit.  It leaks nothing (a role with no privilege is denied on both); use a role
+    that can log in, or connect as the role.
+  - A `LIMIT` that is a parameter or an expression of parameters and stable functions is computed when the
+    scan starts; an expression with a column, a volatile function or a sub-select is not pushed (the merge
+    still holds, and this node's `Limit` node applies it).
+  - Not pushed at all, answered by the scan: grouping sets, a `FULL JOIN` with a reference table or without the key equality in its `ON` clause, aggregates without a
+    combine function when the query is not closed (`json_agg`, `jsonb_agg`, `*_object_agg`, `range_agg`, `xmlagg`), `DISTINCT` or
+    `ORDER BY` inside an aggregate call, statements with sub-selects, CTEs, views, local tables, tables of
+    two colocation groups, a table with row-level security, and a statement that locks rows.
 - **Writes that span groups.** `MERGE` and an `UPDATE` or `DELETE` that cannot be
   shipped are refused. A write that uses a function that is not built in cannot be
   shipped. (A multi-row `INSERT`, `INSERT ... SELECT` and `COPY ... FROM` into a

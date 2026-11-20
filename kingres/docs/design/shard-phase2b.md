@@ -3196,3 +3196,198 @@ result with no left tree when every aggregate has no final function and a state 
 type. A join of a table with itself was never shipped (the rule counted tables, not references).
 The test harness writes `enable_partial_aggregation = off`, so that the older tests keep testing
 the scan, the fragment scan and closed queries; t/139 turns it on.
+
+### Steps 8 to 12 (objects of extensions, sort and limit, join rows, the README and the security round) (2026-11-20)
+
+**Step 8, objects of extensions (5.5).** The compiled-in list (`kingres_sketch` 1.0), the object
+rules and the setting `kingres_shard.shippable_extensions` (all, none or a list; it only narrows)
+are as section 5.5 says. What differs:
+
+- An object of an extension is shipped only by a closed query and by a partial aggregation. The 2a
+  scan, the writes and the colocated `INSERT ... SELECT` never ship one, because their markers carry
+  no version. A sketch aggregate in an `INSERT ... SELECT` is therefore run by the row router at the
+  origin.
+- The marker is `/* kingres:<kind>-fragment place=<n> ext=name:version[,...] */` for the kinds
+  `query` and `partial`, not the `kingres:frag v=2 kind=...` of section 5.5; the markers of this
+  implementation never had that form. The characters of the list are checked.
+- A group checks the versions first: a different version, or an extension that the marker names and
+  the group does not have, raises KS001 with both versions. A statement that uses an extension the
+  marker does not name, or the reverse, raises 0A000. A group that does not have the extension at
+  all fails earlier, when it parses the text ("function does not exist"), not with KS001; a hook
+  between the marker and the parse would be needed for that.
+- `self_test()` and the encoding are not compared here; section 5.5 leaves them to `add_node` and
+  `check_cluster`.
+
+**The survivors of the review of step 5.** t/152 reads with a FULL JOIN on and off the key, with a
+reference table and with three tables, windows over closed groupings, sub-selects and views. The
+mutants M18, M18b, M20, M02 and M03 survive it, each shielded by another rule that decides the same
+statements (the count of key classes, the shippability walker, the analysis of the range table, the
+type of the key columns). No statement separates them, so the rules stay as a second layer that is
+not tested alone.
+
+**Step 9, sort and limit (8.1, 8.2).**
+
+- A closed query with `ORDER BY` has the groups sort; the fragment scan merges the sorted streams
+  with one SortSupport per key, and no Sort is added above it (`EXPLAIN` shows the merge keys).
+  Only a built-in B-tree operator with the default collation or "C" is pushed; otherwise this node
+  sorts as before. A partial aggregation pushes no sort; it sorts above the final aggregate.
+- The limit goes to the groups as `LIMIT count + offset` with no `OFFSET`, never with `WITH TIES`.
+  A constant is folded first (the parser leaves the cast of a literal as a call). A parameter, or an
+  expression of parameters and immutable or stable functions with no column, sub-select or volatile
+  function, is computed when the scan starts and sent as one extra `bigint` parameter; the local part
+  gets the same value. A NULL, a negative value or an overflow sends NULL, and the origin's own Limit
+  node raises the single node's error, so no group raises it. A group accepts a limit only as one
+  non-negative `bigint` constant or one `bigint` parameter.
+- Ties are returned as this node's own part first, then the groups in catalog order, not by group id
+  (O3); SQL does not order ties.
+- **A difference from a single node:** a cursor declared with neither `SCROLL` nor `NO SCROLL` over a
+  query whose groups sort cannot scan backward, because the merge cannot; `DECLARE ... SCROLL` can.
+  The README names it, and t/155 tests it.
+- Setting: `kingres_shard.enable_pushdown_sort` (on).
+
+**Window and `DISTINCT` above a partial aggregation (7.6, A4 and A6).** The text of the groups has
+neither (the named-window clause is cleared too, because the deparser prints it); the origin applies
+them above the final aggregate. A group that is sent one still refuses it.
+
+**Step 10, join rows (9.1).** A statement that is not closed as a whole (a window not partitioned
+by the key, an ordered-set aggregate, `count(DISTINCT)`, `DISTINCT ON`) but whose tables join on
+their keys gets the join of the whole level as a fragment of its own, through a chained
+`set_join_pathlist_hook`. The text is the statement's `FROM` and `WHERE` with only the columns of
+the join relation's target; it is itself a closed query, so a group needs no new rule. A closed
+statement keeps its own path, a partial aggregation keeps its path, and the planner chooses by cost.
+Setting: `kingres_shard.enable_pushdown_join` (on). Not done, as section 9 says: semi and anti joins,
+lateral references, a join below the top of the statement.
+
+**Step 11, the README.** Guarantees: pushdown gives the single node's answer and the scan is always
+the fallback; a group enforces its own rules whoever sends the fragment. Limitations: a new item
+names the differences that pushdown makes visible, among them the cursor above.
+
+**Step 12, the security round** (t/156): forged fragments (crossed kinds, a wrong place, forged
+text, a wrong forward token), privileges and row-level security on every path, `SECURITY DEFINER`,
+`search_path`, hostile identifiers and values, and the version marker of an extension.
+
+**Step 13, the version: correction.** This document says in several places (the header, the plan of
+steps, the upgrade test and "Version 0.6 was made before steps 5 to 12") that the steps of phase 2b
+end in version 0.6 with `kingres_shard--0.5--0.6.sql`. Version 0.6 was made, before step 5, and
+phase 9 then took 0.7. Steps 6 to 12 add no SQL object, only settings of the library, so they ship
+with the library of 0.7 and step 13 makes no version of its own. The four settings are in the
+catalog regression test, and the upgrade test from 0.6 compares the upgraded catalog with a fresh 0.7.
+
+**Tests and mutants.** t/151 (step 8), t/152 (the survivors), t/153 (step 9), t/154 (step 10), t/155
+(the limit by parameter, window and `DISTINCT` above a partial aggregation, the cursor) and t/156
+(step 12). The harness writes `enable_pushdown_join = off` beside `enable_partial_aggregation = off`,
+so the older tests keep testing their own paths. Of the mutants of steps 8 to 12, each built clean,
+all are killed except these equivalents: the "none" branch of `shippable_extensions` (the list parser
+refuses the name anyway), the rule that an extension function must be immutable (`kingres_sketch` has
+no other), the planner's collation check of the sort (the walker refuses that collation first), the
+second parse of the text of join rows, the test of the whole level of join rows (an intermediate join
+is never the cheaper path on the test data), and a negative limit sent as a number (the group would
+raise the same error text as the origin).
+
+KS001 for an extension that a group does not have at all, the tie-break by group id and the tests
+063, 064, 066, 067 and 068 of the plan were left for step 13; they are described in its section below.
+
+### The review of steps 6 to 12 and the fix for its critical finding (2026-11-20)
+
+The review ([report](../reviews/2026-11-20-kingres-shard-phase2b-steps-6-12.md)) compared about
+13 000 statements with a single node on both majors and found one critical finding, P2E-01: a
+`HAVING` condition with no aggregate was applied by nobody. The planner moves such a conjunct (no
+aggregate, no volatile function, no sub-select) from `HAVING` into `WHERE`, but the text of a partial
+aggregation and of join rows is made from the statement as written, with its `HAVING` removed and
+its `WHERE` unchanged. `SELECT c, count(*) FROM m GROUP BY c HAVING c < 3` returned every group; the
+same flaw was found in join rows. Both paths are now refused for such a statement, and the scan
+answers (`having_has_moved_conjunct` in `fragment_scan.c` applies the planner's rule, or a wider
+one). What stays in `HAVING` (an aggregate, a volatile function, a sub-select) keeps the partial
+path and is applied by this node's final aggregation. A closed query keeps its `HAVING` in its own
+text and was right before. t/170 compares every form of `HAVING` under the three plan profiles on
+every path, and the generator of t/127 has three such forms.
+
+The alternative of putting the moved conjuncts into the shipped `WHERE` was not taken: the `HAVING`
+of the statement is written in the variables of the grouping range table entry (18 and 19), which the
+planner has flattened, and a text with them in `WHERE` would need `flatten_group_exprs` on both
+majors. The cost is that `HAVING <grouping column> ...` is answered by the scan, a difference of speed
+only; a user can write the condition in `WHERE`. The four mutants of the fix are killed by t/170.
+
+The other findings, one commit each:
+
+- **P2E-02, `TABLESAMPLE`.** The scan asked the groups for every row with no sampling. A sample
+  cannot be taken correctly on the groups: a table spread over groups would be a different random
+  draw from any single node's, and `REPEATABLE` would not repeat. `TABLESAMPLE` of a distributed table
+  is now refused with 0A000 at any level of a statement (a sub-select, a CTE, the source of an
+  `INSERT` or `DELETE`), with pushdown on or off and in a prepared statement. A reference table and a
+  local table are sampled as on a single node. t/171; t/121 now expects the error.
+- **P2E-03, the second profile of the tests.** The harness turned the partial aggregation and join
+  rows off in the older tests. With `KS_ALL_PATHS=1` every node of every test has both on after the
+  test's own settings. t/124 to t/127, t/135 to t/138, t/152 and t/153 pass in that profile on both
+  majors, among them the faults and moves of t/125 and the discarded caches of t/135. Their "not
+  shipped" assertions become "not a closed query" in that profile (`not_shipped_ok()`).
+- **P2E-04, rules that no test separated.** t/172 forges fragments: a group refuses a negative
+  `LIMIT`, an `OFFSET`, `WITH TIES`, a sub-select or NULL as the limit, and `DISTINCT` or
+  `DISTINCT ON` in a partial fragment. The sum of count and offset that does not fit in a `bigint` is
+  tested with custom and generic plans from every node. Its five mutants are killed.
+- **P2E-05 to P2E-07, the README.** It names the `NOLOGIN` limit, the exceptions of the guarantee,
+  a view of another owner refused with an error on every path, `min` and `max` of values that compare
+  equal and print differently, and `TABLESAMPLE`.
+- **P2E-10.** The ordered merge frees its arrays at a rescan.
+- **P2E-08 and P2E-09** need no change. The cursor difference is in the README and in t/155. The
+  rules shielded by another rule stay as a second layer.
+
+### Step 13: the remaining tests, a missing extension, the order of ties and a crash (2026-11-20)
+
+**The tests of section 16.2.** Their numbers 055 to 069 were taken by tests of 0.5, so each one is a
+new `t/1nn` file or an addition to a test of steps 6 to 12. New in this step: t/157 (063 for the
+partial aggregation, the ordered merge, join rows and an extension object: a writer on the groups, a
+bucket that moves back and forth, a move between the plan and the run, a held switch, prepared
+statements, a session's own writes); t/158 (064 for the same paths: a planned switchover at four
+fault points with a prepared statement, a hard failover in the middle of a fetch, a write through the
+old primary); t/159 (066: the hostile names of 16.4 for schema, table, column, type, sequence and
+constraint over seven shapes of statement); t/160 (067: all seven kinds of fragment with no token,
+with a wrong token and on a demoted node); t/161 (068: `kingres_ledger` with `kingres_shard`). The
+source of an `INSERT ... SELECT` into a local table is planned as a subquery and read by the scan, not
+by the pushdown paths (6.1, 18).
+
+**A crash found by t/157.** A prepared statement with a sketch aggregate, executed several times on
+the same cached session, crashed a group with SIGSEGV on both majors. The check of an extension's
+aggregate ran from the analysis of the shape before the walk of the statement had reset the static list
+of extensions used, so it read the list of the previous statement, whose memory was gone. It came in
+with step 8. The check now starts its own empty list.
+
+**KS001 for an extension that a group does not have.** A group cannot raise it: PostgreSQL analyses
+the `DECLARE` of a fragment, and fails on the unknown function, before any hook of the extension, and
+`emit_log_hook` cannot read the catalog in a transaction that is aborting. The node that sent the
+fragment knows the extensions from the marker. When the `DECLARE` fails with `undefined_function` or
+`undefined_object` and the marker names an extension, it raises KS001 ("node host:port does not have
+an extension that the statement uses (kingres_sketch:1.0)") with the group's message as the detail
+and `shippable_extensions = 'none'` as the escape. Another error, such as a division by zero, is not
+changed. Known limit: another undefined function or type in a statement that also uses an extension
+gets the same message, with the group's text as the detail.
+
+**The order of ties (O3).** The streams of the merge are sorted by group id when it starts, so ties
+come out in the same order from every node and on a repeat. Inside one group the order is the
+group's own; a group that sorts with a top-N heap orders equal rows differently from a full sort.
+
+**Not built, as section 18 says, and named in the README:** a join below the top of the statement
+(6.1); semi and anti joins (9.1); grouping sets (6.1, 7.1, 7.6 A9); a `FULL JOIN` with a reference
+table or without the key equality in its `ON` (9.1, 6.3; a `FULL JOIN` of two distributed tables on
+the key is shipped); an aggregate without a combine function in a statement that is not closed (7.1,
+7.6 A9); a limit with a column, a volatile function or a sub-select.
+
+**A forwarded reference write without a term.** A demoted node runs a `reference-write` fragment
+that carries no claim of a catalog term. A real sender always carries its term, and the demoted node
+refuses an older one with KS002 (t/160). Refusing every such statement in the planner hook would break
+the calls of the control plane to an old primary and the filling of a new node's reference tables.
+
+**Tests and mutants.** t/157 to t/162. The eight mutants of this step (the conversion to KS001, the
+sort of the streams, the crash line, a blind comparison of the merge, a demoted node that serves
+fragments, a token that is not compared, a failed group that is not retryable, the local group read
+twice) are killed. The tree with the fixes of the review of steps 6 to 12 merged passes on both
+majors in both profiles.
+
+**The review of step 13 (2026-11-20).** The review
+([report](../reviews/2026-11-20-kingres-shard-phase2b-step-13.md)) found no wrong answer in 5120
+generated statements per major before and after bucket moves, could not crash a group through the
+fixed list by any path, and found no critical or high defect. Its three medium findings are being
+fixed: a group that never had the extension raises `3F000` (its schema does not exist), which the
+conversion to KS001 does not cover, while t/162 tested only a dropped extension, whose schema stays;
+the test that another error is not converted fails at `FETCH`, not at `DECLARE`; and t/161 reads the
+source through the scan, not the pushdown paths.

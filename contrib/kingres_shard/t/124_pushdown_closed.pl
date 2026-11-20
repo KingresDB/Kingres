@@ -24,7 +24,7 @@ use lib $FindBin::RealBin;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
-use KingresShardTest qw(run_sql);
+use KingresShardTest qw(not_shipped_ok run_sql);
 use KingresShardCompare;
 
 my $c = KingresShardCompare->new('pc', extra => "kingres_shard.enable_partial_aggregation = off" . "
@@ -153,7 +153,8 @@ for my $q (@almost)
 	my ($name, $sql, $ordered, $why) = @$q;
 	$c->compare("almost closed: $name", $sql, ordered => $ordered, plans => ['pushed', 'scan'], profiles => 0, normalize => 1);
 	my $plan = plan_of($n1, $sql);
-	unlike($plan, qr/\Q$FS\E/, "almost closed: $name is not shipped");
+	not_shipped_ok($plan, "almost closed: $name is not shipped");
+	next if $ENV{KS_ALL_PATHS};	# the plan of the second profile is not the scan's, and the reason is the closed query's
 	my $off = plan_of($n1, $sql, 'SET kingres_shard.enable_pushdown = off; ');
 	is($plan, $off, "almost closed: $name has the plan that enable_pushdown = off gives");
 	if (defined $why)
@@ -172,18 +173,26 @@ unlike(plan_of($n1, q{SELECT id, count(*) FROM public.s1 WHERE id IN (5, 6, 7, 8
 {
 	my $sql = q{SELECT id, count(*), sum(a) FROM public.s1 GROUP BY id HAVING count(*) > 0 ORDER BY id LIMIT 7};
 	my $p = plan_of($n1, $sql);
-	like($p, qr/Limit\n\s+->  Sort\n\s+Sort Key: s1\.id\n\s+->  Custom Scan \(Kingres Fragment Scan\)/, 'EXPLAIN: the origin sorts and limits above the fragment scan');
+	like($p, qr/Limit\n\s+->  Custom Scan \(Kingres Fragment Scan\)\n\s+Pushed: closed aggregate \(by key\)\n\s+Groups: 3 of 3 \(local \+ 2 remote\)\n\s+Merge keys: 1/, 'EXPLAIN: the limit of this node is above the merge of the sorted streams (step 9)');
 	like($p, qr/^\s+Pushed: closed aggregate \(by key\)$/m, 'EXPLAIN: what is pushed');
 	like($p, qr/^\s+Groups: 3 of 3 \(local \+ 2 remote\)$/m, 'EXPLAIN: the groups');
-	like($p, qr/^\s+Remote SQL: SELECT id, count\(\*\) AS count, sum\(a\) AS sum FROM public\.s1 GROUP BY id HAVING \(count\(\*\) > 0\)$/m,
-		'EXPLAIN: the text that every group runs (no ORDER BY, no LIMIT)');
+	like($p, qr/^\s+Remote SQL: SELECT id, count\(\*\) AS count, sum\(a\) AS sum FROM public\.s1 GROUP BY id HAVING \(count\(\*\) > 0\) ORDER BY id LIMIT '7'::bigint$/m,
+		'EXPLAIN: the text that every group runs (the sort and the limit of the groups)');
+	my $po = plan_of($n1, $sql, 'SET kingres_shard.enable_pushdown_sort = off; ');
+	like($po, qr/Limit\n\s+->  Sort\n\s+Sort Key: s1\.id\n\s+->  Custom Scan \(Kingres Fragment Scan\)/, 'EXPLAIN with enable_pushdown_sort = off: the origin sorts and limits above the fragment scan');
+	like($po, qr/^\s+Remote SQL: SELECT id, count\(\*\) AS count, sum\(a\) AS sum FROM public\.s1 GROUP BY id HAVING \(count\(\*\) > 0\)$/m,
+		'EXPLAIN with enable_pushdown_sort = off: the text that every group runs (no ORDER BY, no LIMIT)');
 	my ($rc, $out, $err) = run_sql($n1, "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) $sql");
 	is($rc, 0, 'EXPLAIN ANALYZE runs the fragment scan') or diag($err);
 	like($out, qr/Rows from groups: .*local=\d+.*group \d=\d+/, 'EXPLAIN ANALYZE: the rows of each group') or diag($out);
 	like($out, qr/Limit \(actual rows=7(?:.00)? loops=1\)/, 'EXPLAIN ANALYZE: the limit');
 	my $v = plan_of($n1, q{SELECT a, count(*) FROM public.s1 GROUP BY a});
 	unlike($v, qr/Pushdown:/, 'EXPLAIN without VERBOSE shows no reason');
+	SKIP:
+{
+	skip 'the partial aggregation pushes this statement in the second profile', 1 if $ENV{KS_ALL_PATHS};
 	like(reason_of($n3, q{SELECT a, count(*) FROM public.s1 GROUP BY a}) // '', qr/distribution key/, 'EXPLAIN VERBOSE of a scan says why the query was not pushed');
+}
 	is(reason_of($n3, q{SELECT a, count(*) FROM public.s1 GROUP BY a}), reason_of($n1, q{SELECT a, count(*) FROM public.s1 GROUP BY a}), '... the same on every node');
 
 	# the switches
@@ -237,7 +246,7 @@ for my $n (@nodes)
 	my ($rc, $out, $err) = run_sql($n, q{BEGIN;
 		DECLARE cur NO SCROLL CURSOR FOR SELECT id, count(*) FROM public.s1 GROUP BY id;
 		FETCH 3 FROM cur; CLOSE cur;
-		DECLARE cur2 CURSOR FOR SELECT id, count(*) FROM public.s1 GROUP BY id ORDER BY id;
+		DECLARE cur2 SCROLL CURSOR FOR SELECT id, count(*) FROM public.s1 GROUP BY id ORDER BY id;
 		FETCH 2 FROM cur2; FETCH BACKWARD 1 FROM cur2; FETCH ABSOLUTE 5 FROM cur2; MOVE FIRST IN cur2; FETCH 1 FROM cur2;
 		SELECT count(*) FROM public.s1; COMMIT;});
 	is($rc, 0, 'a cursor that is closed early, on ' . $n->name) or diag($err);

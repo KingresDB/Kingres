@@ -41,6 +41,13 @@
 #include "catalog/pg_type_d.h"
 #include "catalog/pg_collation_d.h"
 #include "catalog/pg_proc.h"
+#include "catalog/dependency.h"
+#include "catalog/pg_extension.h"
+#include "catalog/pg_language_d.h"
+#include "catalog/pg_operator_d.h"
+#include "commands/extension.h"
+#include "lib/stringinfo.h"
+#include "utils/builtins.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
@@ -58,6 +65,7 @@
 
 typedef struct ShipCtx
 {
+	bool		allow_top_limit;	/* the closed query: the top level may carry the LIMIT that was sent with it (design 8) */
 	bool		allow_order_aggs;	/* a partial aggregation: float and order-sensitive aggregates are combined (design 7.6, A3) */
 	Index		varno;			/* clause mode: the only table; else 0 */
 	bool		statement;		/* a whole statement, not one clause */
@@ -79,6 +87,223 @@ fail(ShipCtx *ctx, const char *reason)
 	return true;
 }
 
+/* ------------------------------------------------------------------------
+ * Objects of extensions (design 5.5): a list compiled into the library
+ * ---------------------------------------------------------------------- */
+
+typedef struct KsShippableExtension
+{
+	const char *name;
+	const char *const *versions;	/* the installed versions that share one state format, NULL terminated */
+} KsShippableExtension;
+
+static const char *const sketch_versions[] = {"1.0", NULL};
+
+static const KsShippableExtension shippable_extensions[] = {
+	{"kingres_sketch", sketch_versions},
+	{NULL, NULL}
+};
+
+/* kingres_shard.shippable_extensions: "all", "none" or a list of names; it narrows, it never adds */
+char	   *kingres_shard_shippable_extensions = NULL;
+
+/* Is the extension in the compiled-in list?  (the check of the setting) */
+bool
+kingres_shard_shippable_extension_known(const char *name)
+{
+	int			i;
+
+	for (i = 0; shippable_extensions[i].name != NULL; i++)
+		if (strcmp(shippable_extensions[i].name, name) == 0)
+			return true;
+	return false;
+}
+
+/* The statement modes that carry the extensions they use in their marker allow them; the others never do. */
+static bool ship_allow_ext = false;
+static List *ship_used_ext = NIL;	/* of char *: "name:version" of every extension the walk used */
+
+static bool
+ext_setting_allows(const char *name)
+{
+	const char *s = kingres_shard_shippable_extensions;
+	size_t		len = strlen(name);
+
+	if (s == NULL || strcmp(s, "all") == 0)
+		return true;
+	if (strcmp(s, "none") == 0)
+		return false;
+	while (*s != '\0')
+	{
+		const char *end;
+
+		while (*s == ' ' || *s == ',')
+			s++;
+		end = s;
+		while (*end != '\0' && *end != ',' && *end != ' ')
+			end++;
+		if ((size_t) (end - s) == len && strncmp(s, name, len) == 0)
+			return true;
+		s = end;
+	}
+	return false;
+}
+
+/* A function or aggregate of an extension: the code is the extension's library, fixed, immutable, no SET clause. */
+static bool type_ok(Oid type);
+
+static bool
+ext_proc_ok(Oid funcid)
+{
+	HeapTuple	tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
+	Form_pg_proc p;
+	bool		ok;
+	int			i;
+
+	if (!HeapTupleIsValid(tup))
+		return false;
+	p = (Form_pg_proc) GETSTRUCT(tup);
+	ok = (p->prolang == ClanguageId || p->prolang == INTERNALlanguageId) &&
+		p->provolatile == PROVOLATILE_IMMUTABLE && !p->prosecdef &&
+		heap_attisnull(tup, Anum_pg_proc_proconfig, NULL) && type_ok(p->prorettype);
+	for (i = 0; ok && i < p->pronargs; i++)
+		ok = type_ok(p->proargtypes.values[i]);
+	ReleaseSysCache(tup);
+	return ok;
+}
+
+/* The extension that an object belongs to, when it is in the list, in the setting and at a version the list accepts. */
+static bool
+ext_object_ok(Oid classid, Oid objid)
+{
+	Oid			extoid;
+	char	   *extname;
+	HeapTuple	etup;
+	Datum		d;
+	bool		isnull;
+	char	   *version;
+	const KsShippableExtension *e = NULL;
+	bool		version_ok = false;
+	int			i;
+
+	if (!ship_allow_ext)
+		return false;
+	extoid = getExtensionOfObject(classid, objid);
+	if (!OidIsValid(extoid))
+		return false;
+	extname = get_extension_name(extoid);
+	if (extname == NULL)
+		return false;
+	for (i = 0; shippable_extensions[i].name != NULL; i++)
+		if (strcmp(shippable_extensions[i].name, extname) == 0)
+			e = &shippable_extensions[i];
+	if (e == NULL || !ext_setting_allows(extname))
+		return false;
+	etup = SearchSysCache1(EXTENSIONOID, ObjectIdGetDatum(extoid));
+	if (!HeapTupleIsValid(etup))
+		return false;
+	d = SysCacheGetAttr(EXTENSIONOID, etup, Anum_pg_extension_extversion, &isnull);
+	version = isnull ? NULL : TextDatumGetCString(d);
+	ReleaseSysCache(etup);
+	if (version == NULL)
+		return false;
+	for (i = 0; e->versions[i] != NULL; i++)
+		if (strcmp(e->versions[i], version) == 0)
+			version_ok = true;
+	if (!version_ok)
+		return false;
+
+	if (classid == ProcedureRelationId)
+	{
+		if (!ext_proc_ok(objid))
+			return false;
+	}
+	else if (classid == TypeRelationId)
+	{
+		HeapTuple	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(objid));
+		Form_pg_type t;
+		bool		ok;
+
+		if (!HeapTupleIsValid(tup))
+			return false;
+		t = (Form_pg_type) GETSTRUCT(tup);
+		/* a base type of the extension, whose four conversion functions are the extension's too */
+		ok = t->typtype == TYPTYPE_BASE &&
+			OidIsValid(t->typinput) && OidIsValid(t->typoutput) && OidIsValid(t->typsend) && OidIsValid(t->typreceive) &&
+			getExtensionOfObject(ProcedureRelationId, t->typinput) == extoid &&
+			getExtensionOfObject(ProcedureRelationId, t->typoutput) == extoid &&
+			getExtensionOfObject(ProcedureRelationId, t->typsend) == extoid &&
+			getExtensionOfObject(ProcedureRelationId, t->typreceive) == extoid;
+		ReleaseSysCache(tup);
+		if (!ok)
+			return false;
+	}
+	else if (classid == OperatorRelationId)
+	{
+		if (!ext_proc_ok(get_opcode(objid)) ||
+			getExtensionOfObject(ProcedureRelationId, get_opcode(objid)) != extoid)
+			return false;
+	}
+	else
+		return false;
+
+	{
+		char	   *used = psprintf("%s:%s", extname, version);
+		ListCell   *lc;
+		bool		have = false;
+
+		foreach(lc, ship_used_ext)
+			if (strcmp((char *) lfirst(lc), used) == 0)
+				have = true;
+		if (!have)
+			ship_used_ext = lappend(ship_used_ext, used);
+	}
+	return true;
+}
+
+/*
+ * For the analysis of pushdown.c: is this aggregate of an extension one the list allows?  (Its call is accepted
+ * or refused by the walker as any other; this only lets the shape rule see it.)
+ */
+bool
+kingres_shard_extension_aggregate_ok(Oid aggfnoid)
+{
+	bool		old = ship_allow_ext;
+	List	   *old_used = ship_used_ext;
+	bool		ok;
+
+	/*
+	 * The list of the last walk lives in the memory of that statement, which may be gone: this call comes from the shape
+	 * analysis, before the walk of this statement starts and resets the list.  It must not read the old list (a freed list
+	 * is a crash in a group that runs a second fragment of an extension in one session).  It starts its own and drops it.
+	 */
+	ship_allow_ext = true;
+	ship_used_ext = NIL;
+	ok = ext_object_ok(ProcedureRelationId, aggfnoid);
+	ship_allow_ext = old;
+	ship_used_ext = old_used;
+	return ok;
+}
+
+/* "name:version,name:version" of what the last statement walk used, or NULL */
+char *
+kingres_shard_shippable_ext_used(void)
+{
+	StringInfoData buf;
+	ListCell   *lc;
+
+	if (ship_used_ext == NIL)
+		return NULL;
+	initStringInfo(&buf);
+	foreach(lc, ship_used_ext)
+	{
+		if (buf.len > 0)
+			appendStringInfoChar(&buf, ',');
+		appendStringInfoString(&buf, (char *) lfirst(lc));
+	}
+	return buf.data;
+}
+
 /* A type that exists with the same meaning on every node. */
 static bool
 type_ok(Oid type)
@@ -91,7 +316,17 @@ type_ok(Oid type)
 	 */
 	if (type == CASHOID || get_element_type(type) == CASHOID)
 		return false;
-	return type < FirstGenbkiObjectId;
+	if (type < FirstGenbkiObjectId)
+		return true;
+	if (ship_allow_ext)
+	{
+		Oid			elem = get_element_type(type);
+
+		if (OidIsValid(elem))
+			return type_ok(elem);
+		return ext_object_ok(TypeRelationId, type);
+	}
+	return false;
 }
 
 /*
@@ -213,16 +448,18 @@ libm_dependent(Oid funcid)
 static bool
 func_ok(Oid funcid)
 {
-	return funcid < FirstGenbkiObjectId &&
-		func_volatile(funcid) == PROVOLATILE_IMMUTABLE &&
+	if (funcid >= FirstGenbkiObjectId)
+		return ext_object_ok(ProcedureRelationId, funcid);
+	return func_volatile(funcid) == PROVOLATILE_IMMUTABLE &&
 		!libm_dependent(funcid);
 }
 
 static bool
 op_ok(Oid opno)
 {
-	return opno < FirstGenbkiObjectId &&
-		func_ok(get_opcode(opno));
+	if (opno >= FirstGenbkiObjectId)
+		return ext_object_ok(OperatorRelationId, opno);
+	return func_ok(get_opcode(opno));
 }
 
 /*
@@ -424,7 +661,8 @@ query_ok(Query *q, ShipCtx *ctx)
 	 * functions, system columns, order-sensitive aggregates, table sampling and
 	 * an UPDATE ... FROM that can match several rows to one target row.
 	 */
-	if (q->limitCount != NULL || q->limitOffset != NULL)
+	/* the one LIMIT of the closed-query text (count + offset, folded, checked by pushdown.c) is the top level's, and only in that mode */
+	if ((q->limitCount != NULL || q->limitOffset != NULL) && !(ctx->allow_top_limit && q == ctx->top))
 		return fail(ctx, "it has LIMIT or OFFSET, which picks rows by their order");
 	if (q->hasDistinctOn)
 		return fail(ctx, "it has DISTINCT ON, which picks an arbitrary row of each group");
@@ -800,6 +1038,8 @@ kingres_shard_clause_shippable(Node *clause, Index varno)
 {
 	ShipCtx		ctx;
 
+	ship_allow_ext = false;
+	ship_used_ext = NIL;
 	memset(&ctx, 0, sizeof(ctx));
 	ctx.varno = varno;
 	return !ship_walker(clause, &ctx);
@@ -811,6 +1051,8 @@ kingres_shard_stmt_shippable(Query *query, Oid shipped_relid, const char **reaso
 	ShipCtx		ctx;
 	bool		bad;
 
+	ship_allow_ext = false;
+	ship_used_ext = NIL;
 	memset(&ctx, 0, sizeof(ctx));
 	ctx.statement = true;
 	ctx.shipped_relid = shipped_relid;
@@ -833,6 +1075,8 @@ kingres_shard_stmt_shippable_colocated(Query *query, Oid target_relid, int coloc
 	bool		bad;
 
 	Assert(colocation_id != 0);
+	ship_allow_ext = false;
+	ship_used_ext = NIL;
 	memset(&ctx, 0, sizeof(ctx));
 	ctx.statement = true;
 	ctx.shipped_relid = target_relid;
@@ -857,6 +1101,8 @@ kingres_shard_stmt_shippable_partial(Query *query, int colocation_id, const char
 	bool		bad;
 
 	Assert(colocation_id != 0);
+	ship_allow_ext = true;
+	ship_used_ext = NIL;
 	memset(&ctx, 0, sizeof(ctx));
 	ctx.statement = true;
 	ctx.shipped_relid = InvalidOid;
@@ -867,4 +1113,51 @@ kingres_shard_stmt_shippable_partial(Query *query, int colocation_id, const char
 	if (bad && reason != NULL)
 		*reason = ctx.reason ? ctx.reason : "it cannot be shipped";
 	return !bad;
+}
+
+/*
+ * The fragment of a closed query that every group runs whole: the colocated mode, and the objects of the extensions
+ * of the list are allowed (they are named in the marker, and the group compares them with its own catalog).
+ */
+bool
+kingres_shard_stmt_shippable_query(Query *query, int colocation_id, const char **reason)
+{
+	ShipCtx		ctx;
+	bool		bad;
+
+	Assert(colocation_id != 0);
+	ship_allow_ext = true;
+	ship_used_ext = NIL;
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.statement = true;
+	ctx.shipped_relid = InvalidOid;
+	ctx.colocation_id = colocation_id;
+	ctx.top = query;
+	ctx.allow_top_limit = true;
+	bad = query_ok(query, &ctx);
+	if (bad && reason != NULL)
+		*reason = ctx.reason ? ctx.reason : "it cannot be shipped";
+	return !bad;
+}
+
+/* The installed version of an extension of this database, or NULL when it is not installed. */
+char *
+kingres_shard_extension_version(const char *name)
+{
+	Oid			extoid = get_extension_oid(name, true);
+	HeapTuple	etup;
+	Datum		d;
+	bool		isnull;
+	char	   *version = NULL;
+
+	if (!OidIsValid(extoid))
+		return NULL;
+	etup = SearchSysCache1(EXTENSIONOID, ObjectIdGetDatum(extoid));
+	if (!HeapTupleIsValid(etup))
+		return NULL;
+	d = SysCacheGetAttr(EXTENSIONOID, etup, Anum_pg_extension_extversion, &isnull);
+	if (!isnull)
+		version = TextDatumGetCString(d);
+	ReleaseSysCache(etup);
+	return version;
 }

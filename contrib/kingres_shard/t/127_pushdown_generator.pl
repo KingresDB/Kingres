@@ -27,7 +27,7 @@ use lib $FindBin::RealBin;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
-use KingresShardTest qw(run_sql);
+use KingresShardTest qw(not_shipped_ok run_sql);
 use KingresShardCompare;
 
 my $c = KingresShardCompare->new('pgen', extra => "kingres_shard.enable_partial_aggregation = off" . "
@@ -71,7 +71,9 @@ my @pred = ('true', 's1.id <= 900', 's1.id BETWEEN 400 AND 2500', 's1.id % 3 = 0
 	's1.n > 40', 's1.id > 3500', 's1.a BETWEEN 5 AND 15');
 my @agg = ('count(*)', 'count(s1.a), sum(s1.b)', 'min(s1.t), max(s1.a)', 'sum(s1.n), count(DISTINCT s1.b)', 'bool_or(s1.a > 40), min(s1.b)',
 	'avg(s1.a), max(s1.n)', 'count(*) FILTER (WHERE s1.a > 10), sum(s1.a * 2)');
-my @having = ('', '', 'HAVING count(*) >= 1', 'HAVING max(s1.a) > 5', 'HAVING sum(s1.b) IS NOT NULL');
+my @having = ('', '', 'HAVING count(*) >= 1', 'HAVING max(s1.a) > 5', 'HAVING sum(s1.b) IS NOT NULL',
+	# a condition without an aggregate: the planner moves it into WHERE (review P2E-01)
+	'HAVING s1.id < 2000', 'HAVING s1.id % 2 = 0 AND count(*) >= 1', 'HAVING s1.id > 10 OR count(*) > 1');
 my @oltail = ('', ' ORDER BY 1', ' ORDER BY 1 DESC LIMIT 25', ' ORDER BY 1 OFFSET 30 LIMIT 40', ' LIMIT 12');
 my @oltail_total = (' ORDER BY 1', ' ORDER BY 1 DESC LIMIT 25', ' ORDER BY 1 OFFSET 30 LIMIT 40');
 my %SLOTS = (pred => \@pred, agg => \@agg, having => \@having, tail => \@oltail, ttail => \@oltail_total,
@@ -151,8 +153,15 @@ for my $q (@q)
 	$shipped{ $q->{name} } += $is_shipped;
 	if ($q->{name} =~ /^fall:/)
 	{
-		is($is_shipped, 0, "generated $i ($q->{name}) is not shipped: $text");
-		is($plan, plan_of($nodes[$node], $sql, 'SET kingres_shard.enable_pushdown = off; '), "generated $i ($q->{name}) has the plan of enable_pushdown = off");
+		if ($ENV{KS_ALL_PATHS})
+		{
+			not_shipped_ok($plan, "generated $i ($q->{name}) is not shipped: $text");
+		}
+		else
+		{
+			is($is_shipped, 0, "generated $i ($q->{name}) is not shipped: $text");
+			is($plan, plan_of($nodes[$node], $sql, 'SET kingres_shard.enable_pushdown = off; '), "generated $i ($q->{name}) has the plan of enable_pushdown = off");
+		}
 	}
 	$c->compare("generated $i ($q->{name}) from node " . ($node + 1) . ": $text", $sql, ordered => $q->{ordered}, nodes => [$node], profiles => 0,
 		plans => ['pushed', 'scan'], normalize => 1);

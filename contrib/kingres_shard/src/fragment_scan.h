@@ -127,6 +127,13 @@ extern void kingres_shard_fragset_start(KsFragSet *fs, const KsFragStart *st);
  */
 extern bool kingres_shard_fragset_next(KsFragSet *fs, PGresult **res, int *row, KsFrag **frag);
 
+/*
+ * The ordered merge (design 8): every group is a stream of its own.  _prime sends the first FETCH to every group at once; _next_of
+ * gives the next row of one group (the batch is valid until the next call for that group), false at its end.
+ */
+extern void kingres_shard_fragset_prime(KsFragSet *fs);
+extern bool kingres_shard_fragset_next_of(KsFragSet *fs, KsFrag *f, PGresult **res, int *row);
+
 /* Close the cursors (when asked), read what is in flight, free the fragments. */
 extern void kingres_shard_fragset_stop(KsFragSet *fs, bool close_cursors);
 
@@ -166,7 +173,16 @@ typedef struct KsPushdownInfo
 	List	   *dist_relids;	/* of Oid: the distributed tables, which the probes name */
 	const char *kind;			/* what is pushed, for EXPLAIN (a static string) */
 	int			ncols;			/* the columns the groups return */
+	char	   *ext;			/* "name:version,..." of the extensions of the text (design 5.5), or NULL */
+	List	   *sort;			/* step 9: of List(column, sort operator, collation, nulls first): the groups sort, this node merges */
+	bool		limit_pushed;	/* LIMIT count + offset is in the text */
 	int			ndist;			/* the references to distributed tables (a self join has two of one table) */
+	Node	   *limit_cnt;		/* step 9: a LIMIT that is not a constant: the expressions, computed when the scan starts and sent as one parameter */
+	Node	   *limit_off;
+	int			limit_param;	/* the number of that parameter, 0 for none */
+	bool		closed;			/* a closed query: the whole statement is one fragment */
+	bool		join;			/* step 10: the join of the level may be a fragment of its own (rows of the join) */
+	void	   *join_done;		/* the join relation that has its fragment path */
 	bool		partial;		/* a partial aggregation (design 7): sql and ncols are made by the path, which knows the partial target */
 	Query	   *ship;			/* partial: a copy of the query, to deparse with the select list of the partial target */
 } KsPushdownInfo;

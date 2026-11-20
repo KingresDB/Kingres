@@ -62,6 +62,8 @@
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 
+#include <ctype.h>
+
 #include "catalog.h"
 #include "pg_compat.h"
 #include "pushdown.h"
@@ -1012,13 +1014,15 @@ kingres_shard_insert_select_analyze(Query *insert, KsInsertSelect *is, const cha
  * ====================================================================== */
 
 char *
-kingres_shard_query_marker(int64 place)
+kingres_shard_query_marker(int64 place, const char *ext)
 {
+	if (ext != NULL)
+		return psprintf(KS_QUERY_MARKER_PREFIX "place=" INT64_FORMAT " ext=%s */ ", place, ext);
 	return psprintf(KS_QUERY_MARKER_PREFIX "place=" INT64_FORMAT " */ ", place);
 }
 
 bool
-kingres_shard_parse_query_marker(const char *query_string, int64 *place)
+kingres_shard_parse_query_marker(const char *query_string, int64 *place, char **ext)
 {
 	const char *p;
 	char	   *end;
@@ -1033,6 +1037,25 @@ kingres_shard_parse_query_marker(const char *query_string, int64 *place)
 	*place = strtoll(p, &end, 10);
 	if (end == p)
 		return false;
+	if (ext != NULL)
+		*ext = NULL;
+	if (strncmp(end, " ext=", 5) == 0)
+	{
+		const char *e = end + 5;
+		const char *q = e;
+
+		while (*q != '\0' && *q != ' ')
+		{
+			if (!(isalnum((unsigned char) *q) || *q == '_' || *q == '.' || *q == ':' || *q == ',' || *q == '-'))
+				return false;
+			q++;
+		}
+		if (q == e)
+			return false;
+		if (ext != NULL)
+			*ext = pnstrdup(e, q - e);
+		end = (char *) q;
+	}
 	return strncmp(end, " */ ", 4) == 0;
 }
 
@@ -1044,13 +1067,34 @@ kingres_shard_query_fragment_analyze(Query *query, KsQueryFragment *qf, const ch
 		return false;
 	if (!kingres_shard_pushdown_closed(&qf->pd, reason))
 		return false;
-	if (query->limitCount != NULL || query->limitOffset != NULL)
+	/*
+	 * LIMIT is part of the text only as one constant, no OFFSET, no WITH TIES: the node that sends the text has put count + offset
+	 * there (design 8, O4 and O5), and every group returns its first rows of the final order.
+	 */
+	if (query->limitOffset != NULL)
 	{
-		*reason = "it has LIMIT or OFFSET, which the node that gathers the rows applies";
+		*reason = "it has OFFSET, which the node that gathers the rows applies";
 		return false;
 	}
-	if (!kingres_shard_stmt_shippable_colocated(query, InvalidOid, qf->pd.colocation_id, reason))
+	if (query->limitCount != NULL)
+	{
+		/* the parser leaves the cast of a literal to bigint as a call: it is folded as the planner will fold it */
+		Node	   *cnt = eval_const_expressions(NULL, query->limitCount);
+
+		bool		ok_const = IsA(cnt, Const) && !((Const *) cnt)->constisnull && ((Const *) cnt)->consttype == INT8OID &&
+			DatumGetInt64(((Const *) cnt)->constvalue) >= 0;
+		/* or one external parameter of type bigint: count + offset that the sender computed when its scan started */
+		bool		ok_param = IsA(cnt, Param) && ((Param *) cnt)->paramkind == PARAM_EXTERN && ((Param *) cnt)->paramtype == INT8OID;
+
+		if (!(ok_const || ok_param) || query->limitOption != LIMIT_OPTION_COUNT)
+		{
+			*reason = "it has a LIMIT that is not one constant, which the node that gathers the rows applies";
+			return false;
+		}
+	}
+	if (!kingres_shard_stmt_shippable_query(query, qf->pd.colocation_id, reason))
 		return false;
+	qf->ext = kingres_shard_shippable_ext_used();
 	qf->colocation_id = qf->pd.colocation_id;
 	qf->relids = kingres_shard_pushdown_relids(&qf->pd);
 	return true;
@@ -1061,13 +1105,15 @@ kingres_shard_query_fragment_analyze(Query *query, KsQueryFragment *qf, const ch
  * ====================================================================== */
 
 char *
-kingres_shard_partial_marker(int64 place)
+kingres_shard_partial_marker(int64 place, const char *ext)
 {
+	if (ext != NULL)
+		return psprintf(KS_PARTIAL_MARKER_PREFIX "place=" INT64_FORMAT " ext=%s */ ", place, ext);
 	return psprintf(KS_PARTIAL_MARKER_PREFIX "place=" INT64_FORMAT " */ ", place);
 }
 
 bool
-kingres_shard_parse_partial_marker(const char *query_string, int64 *place)
+kingres_shard_parse_partial_marker(const char *query_string, int64 *place, char **ext)
 {
 	const char *p;
 	char	   *end;
@@ -1082,6 +1128,25 @@ kingres_shard_parse_partial_marker(const char *query_string, int64 *place)
 	*place = strtoll(p, &end, 10);
 	if (end == p)
 		return false;
+	if (ext != NULL)
+		*ext = NULL;
+	if (strncmp(end, " ext=", 5) == 0)
+	{
+		const char *e = end + 5;
+		const char *q = e;
+
+		while (*q != '\0' && *q != ' ')
+		{
+			if (!(isalnum((unsigned char) *q) || *q == '_' || *q == '.' || *q == ':' || *q == ',' || *q == '-'))
+				return false;
+			q++;
+		}
+		if (q == e)
+			return false;
+		if (ext != NULL)
+			*ext = pnstrdup(e, q - e);
+		end = (char *) q;
+	}
 	return strncmp(end, " */ ", 4) == 0;
 }
 
@@ -1102,9 +1167,9 @@ kingres_shard_aggregate_partial_ok(Aggref *a, const char **reason)
 		*reason = "an aggregate has DISTINCT or ORDER BY inside the call, which cannot be split";
 		return false;
 	}
-	if (a->aggfnoid >= FirstGenbkiObjectId)
+	if (a->aggfnoid >= FirstGenbkiObjectId && !kingres_shard_extension_aggregate_ok(a->aggfnoid))
 	{
-		*reason = "an aggregate is not built in";
+		*reason = "an aggregate is not built in or of an extension that is shipped";
 		return false;
 	}
 	tup = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(a->aggfnoid));
@@ -1166,7 +1231,7 @@ partial_agg_walker(Node *node, PartialAggCtx *ctx)
  * splits (above).  Only the shape; the tables are the business of kingres_shard_pushdown_analyze.
  */
 bool
-kingres_shard_partial_shape_ok(Query *query, const char **reason)
+kingres_shard_partial_shape_ok(Query *query, bool fragment, const char **reason)
 {
 	PartialAggCtx ctx = {NULL, false};
 
@@ -1180,12 +1245,16 @@ kingres_shard_partial_shape_ok(Query *query, const char **reason)
 		*reason = "it has grouping sets";
 		return false;
 	}
-	if (query->hasWindowFuncs || query->windowClause != NIL)
+	/*
+	 * A window function and DISTINCT are applied after the grouping: this node does it above the final aggregate (design 7.6 A4 and
+	 * A6), and the text of the groups has neither.  A group that is sent them refuses (fragment).
+	 */
+	if (fragment && (query->hasWindowFuncs || query->windowClause != NIL))
 	{
 		*reason = "it has a window function";
 		return false;
 	}
-	if (query->distinctClause != NIL)
+	if (fragment && query->distinctClause != NIL)
 	{
 		*reason = "it removes duplicates after the aggregation";
 		return false;
@@ -1216,7 +1285,7 @@ kingres_shard_partial_fragment_analyze(Query *query, KsQueryFragment *qf, const 
 	memset(qf, 0, sizeof(*qf));
 	if (!kingres_shard_pushdown_analyze(query, &qf->pd, reason))
 		return false;
-	if (!kingres_shard_partial_shape_ok(query, reason))
+	if (!kingres_shard_partial_shape_ok(query, true, reason))
 		return false;
 	{
 		ListCell   *lt;
@@ -1240,6 +1309,7 @@ kingres_shard_partial_fragment_analyze(Query *query, KsQueryFragment *qf, const 
 	}
 	if (!kingres_shard_stmt_shippable_partial(query, qf->pd.colocation_id, reason))
 		return false;
+	qf->ext = kingres_shard_shippable_ext_used();
 	qf->colocation_id = qf->pd.colocation_id;
 	qf->relids = kingres_shard_pushdown_relids(&qf->pd);
 	return true;

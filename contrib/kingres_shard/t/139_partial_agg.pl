@@ -132,8 +132,6 @@ my @scan = (
 	[ 'json_agg (no combine function)', q{SELECT a % 3, json_array_length(json_agg(b)) FROM public.s1 WHERE id < 40 GROUP BY 1 ORDER BY 1 NULLS LAST}, 1 ],
 	[ 'grouping sets', q{SELECT a % 3, b % 2, count(*) FROM public.s1 GROUP BY GROUPING SETS ((1), (2), ()) ORDER BY 1 NULLS LAST, 2 NULLS LAST}, 1 ],
 	[ 'money', q{SELECT a, sum(mo) FROM public.mn GROUP BY a ORDER BY a}, 1 ],
-	[ 'a window above the aggregate', q{SELECT a % 4, count(*), rank() OVER (ORDER BY count(*)) FROM public.s1 GROUP BY 1 ORDER BY 1 NULLS LAST}, 1 ],
-	[ 'DISTINCT above the aggregate', q{SELECT DISTINCT count(*) FROM public.s1 GROUP BY a}, 0 ],
 	[ 'a table of another colocation group', q{SELECT far.w, count(*) FROM public.s1 JOIN public.far ON far.id = s1.id GROUP BY far.w ORDER BY 1 LIMIT 5}, 1 ],
 	[ 'a stable function', q{SELECT a % 3, count(*) FROM public.s1 WHERE ts < now() GROUP BY 1 ORDER BY 1 NULLS LAST}, 1 ],
 	[ 'a sub-select', q{SELECT a % 3, count(*) FROM public.s1 WHERE id IN (SELECT id FROM public.s2 WHERE c > 3) GROUP BY 1 ORDER BY 1 NULLS LAST}, 1 ],

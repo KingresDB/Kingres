@@ -51,6 +51,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/pathnodes.h"
+#include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
@@ -64,6 +65,8 @@
 #include "utils/memutils.h"
 #include "utils/portal.h"
 #include "utils/rel.h"
+#include "common/int.h"
+#include "utils/sortsupport.h"
 #include "utils/ruleutils.h"
 #include "utils/selfuncs.h"
 #include "utils/snapmgr.h"
@@ -459,6 +462,48 @@ frag_send_fetch(KsFrag *f)
 }
 
 /*
+ * A group that does not have an extension the statement uses fails when it parses the text ("function ... does not exist", "type ...
+ * does not exist"), before any hook of the extension can see the marker: PostgreSQL has no hook between the parser and the
+ * analysis of a DECLARE.  This node knows what the statement uses (the marker names the extensions), so it turns that failure into
+ * the KS001 of a version difference (design 5.5): the extension is not at the version here on that node.  A repeat does not help before
+ * the extension is installed on every node.  The group's own message is kept as the detail.
+ */
+static void
+declare_missing_extension(KsFrag *f, PGresult *res, const char *marker)
+{
+	const char *p;
+	const char *end;
+	int			sqlstate;
+	char	   *names;
+	char	   *said = NULL;
+	const char *s;
+	char	   *host;
+	int			port;
+
+	if (res == NULL || marker == NULL || (p = strstr(marker, " ext=")) == NULL)
+		return;
+	sqlstate = kingres_shard_result_sqlstate(res);
+	if (sqlstate != ERRCODE_UNDEFINED_FUNCTION && sqlstate != ERRCODE_UNDEFINED_OBJECT)
+		return;
+	p += 5;
+	end = strstr(p, " */");
+	if (end == NULL)
+		return;
+	names = pnstrdup(p, end - p);
+	if ((s = PQresultErrorField(res, PG_DIAG_MESSAGE_PRIMARY)) != NULL)
+		said = pstrdup(s);
+	host = pstrdup(f->kc->host);
+	port = f->kc->port;
+	PQclear(res);
+	ereport(ERROR,
+			(errcode(ERRCODE_KINGRES_STALE_MAP),
+			 errmsg("node %s:%d does not have an extension that the statement uses (%s)", host, port, names),
+			 errdetail("The node said: %s", said != NULL ? said : "an object does not exist"),
+			 errhint("A repeat does not help until the extension is installed at the same version on every node; "
+					 "SET kingres_shard.shippable_extensions = 'none' reads the rows and runs the extension's functions here.")));
+}
+
+/*
  * The statement fails the way a failed group does (placement_check.c, 4.6) when a command
  * cannot be sent: the connection is gone.
  */
@@ -569,6 +614,7 @@ kingres_shard_fragset_start(KsFragSet *fs, const KsFragStart *st)
 		{
 			if (res == NULL)
 				f->kc->have_error = true;
+			declare_missing_extension(f, res, st->marker);
 			kingres_shard_fragment_error(f->kc, res, "DECLARE");
 		}
 		PQclear(res);
@@ -642,6 +688,51 @@ frag_drain(KsFrag *f)
 }
 
 /* Close cursors and free batches. */
+/* The first FETCH to every group, so that the groups answer at the same time. */
+void
+kingres_shard_fragset_prime(KsFragSet *fs)
+{
+	ListCell   *lc;
+
+	foreach(lc, fs->frags)
+	{
+		KsFrag	   *c = (KsFrag *) lfirst(lc);
+
+		if (c->res == NULL && !c->in_flight && !c->exhausted)
+			frag_send_fetch(c);
+	}
+}
+
+/* The next row of one group: its batch, or the next batch that it has to answer for. */
+bool
+kingres_shard_fragset_next_of(KsFragSet *fs, KsFrag *f, PGresult **res_out, int *row_out)
+{
+	for (;;)
+	{
+		frag_check_failed(f);
+		if (f->res != NULL && f->next_row < f->nrows)
+		{
+			*res_out = f->res;
+			*row_out = f->next_row++;
+			return true;
+		}
+		if (f->res != NULL)
+		{
+			PQclear(f->res);
+			f->res = NULL;
+			f->nrows = 0;
+		}
+		if (!f->in_flight)
+		{
+			if (f->exhausted)
+				return false;
+			frag_send_fetch(f);
+		}
+		frag_fault(fs, "wait_batch");
+		frag_collect(f, false);
+	}
+}
+
 void
 kingres_shard_fragset_stop(KsFragSet *fs, bool close_cursors)
 {
@@ -799,6 +890,14 @@ kingres_shard_fragset_next(KsFragSet *fs, PGresult **res_out, int *row_out, KsFr
 #define FS_PRIV_KIND		7	/* String: what is pushed */
 #define FS_PRIV_NCOLS		8	/* Integer: columns of a row */
 #define FS_PRIV_PARTIAL		9	/* Integer: 1 for a partial aggregation (the groups return partial states) */
+#define FS_PRIV_EXT			10	/* String: the extensions of the text ("name:version,..."), empty for none */
+#define FS_PRIV_SORT		11	/* List of List(column, sort operator, collation, nulls first): the groups sort, this node merges */
+#define FS_PRIV_LIMIT		12	/* Integer: the number of the parameter that holds count + offset of a LIMIT computed at the start, 0 for none */
+
+/* What a custom path of the fragment scan is: the whole statement, a partial aggregation (design 7), the rows of a join (design 9) */
+#define FS_PATH_WHOLE		0
+#define FS_PATH_PARTIAL		1
+#define FS_PATH_JOIN		2
 
 /* The rows one group returned, for EXPLAIN ANALYZE. */
 typedef struct FsGroupRows
@@ -807,8 +906,20 @@ typedef struct FsGroupRows
 	int64		rows;
 } FsGroupRows;
 
+/* One stream of the ordered merge: a group, or this node's own part. */
+typedef struct FsMergeSrc
+{
+	KsFrag	   *frag;			/* NULL: this node's own part */
+	int			gid;			/* the group of the stream: the tie-break of the merge (design 8, O3) */
+	bool		loaded;			/* the current row is in vals */
+	Datum	   *vals;
+	bool	   *nulls;
+	MemoryContext cxt;
+} FsMergeSrc;
+
 typedef struct KsFragScanState
 {
+
 	CustomScanState css;
 	KsFragSet	fs;
 	char	   *sql;
@@ -821,6 +932,19 @@ typedef struct KsFragScanState
 	char	   *kind;
 	int			ncols;
 	bool		partial;
+	char	   *ext;
+	int			limit_param;
+	ExprState  *limit_cnt;
+	ExprState  *limit_off;
+	bool		limit_null;
+	int64		limit_value;
+	int			nsort;			/* the keys of the merge; 0: the streams are read as they come */
+	int		   *sortcol;
+	SortSupportData *ssup;
+	FsMergeSrc *msrc;
+	int			nmsrc;
+	int			mlast;			/* the stream that the last row came from, or -1 */
+	bool		merge_started;
 	FmgrInfo   *infuncs;
 	Oid		   *typioparams;
 	int32	   *typmods;
@@ -842,6 +966,7 @@ typedef struct KsFragScanState
 } KsFragScanState;
 
 static create_upper_paths_hook_type prev_create_upper_paths_hook = NULL;
+static set_join_pathlist_hook_type prev_set_join_pathlist_hook = NULL;
 static KsPushdownInfo *current_info = NULL;
 static const char *current_reason = NULL;
 
@@ -855,6 +980,8 @@ static void fs_rescan(CustomScanState *node);
 static void fs_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es);
 static void fs_partial_paths(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_rel,
 							 GroupPathExtraData *extra);
+static void fs_join_paths(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel, RelOptInfo *innerrel,
+						   JoinType jointype, JoinPathExtraData *extra);
 static void fs_upper_paths(PlannerInfo *root, UpperRelationKind stage, RelOptInfo *input_rel,
 						   RelOptInfo *output_rel, void *extra);
 
@@ -883,6 +1010,8 @@ kingres_shard_fragment_scan_init(void)
 	RegisterCustomScanMethods(&fs_scan_methods);
 	prev_create_upper_paths_hook = create_upper_paths_hook;
 	create_upper_paths_hook = fs_upper_paths;
+	prev_set_join_pathlist_hook = set_join_pathlist_hook;
+	set_join_pathlist_hook = fs_join_paths;
 }
 
 KsPushdownInfo *
@@ -1082,10 +1211,10 @@ fs_upper_paths(PlannerInfo *root, UpperRelationKind stage, RelOptInfo *input_rel
 		return;
 	if (IsParallelWorker())
 		return;
-	if (pi->partial)
+	if (!pi->closed)
 	{
 		/* a partial aggregation is one more way to make the grouped relation (design 7.4) */
-		if (stage == UPPERREL_GROUP_AGG)
+		if (pi->partial && stage == UPPERREL_GROUP_AGG)
 			fs_partial_paths(root, input_rel, output_rel, (GroupPathExtraData *) extra);
 		return;
 	}
@@ -1195,7 +1324,9 @@ fs_upper_paths(PlannerInfo *root, UpperRelationKind stage, RelOptInfo *input_rel
 	p = (Path *) cpath;
 
 	/* The origin sorts and limits above the rows the groups return (design 6.4; section 8 of the design is a later step). */
-	if (root->sort_pathkeys != NIL)
+	if (pi->sort != NIL)
+		cpath->path.pathkeys = root->sort_pathkeys;
+	else if (root->sort_pathkeys != NIL)
 		p = (Path *) create_sort_path(root, output_rel, p, root->sort_pathkeys, root->limit_tuples);
 	if (parse->limitCount != NULL || parse->limitOffset != NULL)
 	{
@@ -1214,6 +1345,34 @@ fs_upper_paths(PlannerInfo *root, UpperRelationKind stage, RelOptInfo *input_rel
 									   parse->limitOption, offset_est, count_est);
 	}
 	add_path(output_rel, p);
+}
+
+/*
+ * Does the HAVING clause of the statement as written have a condition that the planner moves into WHERE?  subquery_planner moves every
+ * conjunct of HAVING that has no aggregate, no volatile function and no sub-select (it filters rows before the grouping, as the
+ * grouping columns are all it can name).  The planner's own final aggregation then no longer has it, and the text of the groups, which is
+ * made from the statement before the planner ran, has neither it nor a copy of it in WHERE: the clause would be applied by nobody
+ * (review P2E-01).  The partial aggregation is not used for such a statement and the scan answers.  A constant TRUE is moved and
+ * dropped; it changes nothing.  What stays in HAVING (an aggregate, a volatile function, a sub-select, also in an OR with the others) is
+ * applied by the final aggregation of this node, as before.
+ */
+static bool
+having_has_moved_conjunct(Node *qual)
+{
+	if (qual == NULL)
+		return false;
+	if (IsA(qual, BoolExpr) && ((BoolExpr *) qual)->boolop == AND_EXPR)
+	{
+		ListCell   *lc;
+
+		foreach(lc, ((BoolExpr *) qual)->args)
+			if (having_has_moved_conjunct((Node *) lfirst(lc)))
+				return true;
+		return false;
+	}
+	if (IsA(qual, Const) && !((Const *) qual)->constisnull && DatumGetBool(((Const *) qual)->constvalue))
+		return false;
+	return !contain_agg_clause(qual) && !contain_volatile_functions(qual) && !contain_subplans(qual);
 }
 
 /*
@@ -1251,6 +1410,7 @@ fs_partial_paths(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_re
 	KsParamRenumber prn = {NIL};
 	const char *why = NULL;
 	char	   *body;
+	char	   *ext = NULL;
 	int			nest;
 	int			resno = 1;
 	int			i;
@@ -1277,6 +1437,8 @@ fs_partial_paths(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_re
 		PA_NO("the planner does not find the aggregation splittable");
 	if (parse->groupingSets != NIL || gtarget == NULL)
 		PA_NO("grouping sets");
+	if (having_has_moved_conjunct(pi->ship->havingQual))
+		PA_NO("its HAVING has a condition without an aggregate, which the planner moves into WHERE");
 
 	/* 1. the partial target */
 	ptarget = create_empty_pathtarget();
@@ -1348,6 +1510,10 @@ fs_partial_paths(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_re
 	}
 	ship->targetList = tlist;
 	ship->havingQual = NULL;
+	ship->distinctClause = NIL;
+	ship->hasDistinctOn = false;
+	ship->windowClause = NIL;
+	ship->hasWindowFuncs = false;
 	ship->sortClause = NIL;
 	ship->limitOffset = NULL;
 	ship->limitCount = NULL;
@@ -1355,7 +1521,7 @@ fs_partial_paths(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_re
 	nest = kingres_shard_set_transmission_modes();
 	body = pg_get_querydef(ship, false);
 	kingres_shard_reset_transmission_modes(nest);
-	if (!kingres_shard_text_accepted(body, ship, true, &why))
+	if (!kingres_shard_text_accepted(body, ship, true, &why, &ext))
 	{
 		ereport(DEBUG1, (errmsg_internal("kingres_shard: a partial aggregation is not shipped: the groups would not accept its text: %s", why)));
 		return;
@@ -1413,8 +1579,8 @@ fs_partial_paths(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_re
 	cpath->flags = 0;
 	cpath->custom_paths = NIL;
 	cpath->custom_restrictinfo = NIL;
-	info = list_make2(makeString(body), pids);
-	cpath->custom_private = list_make2(prune, info);
+	info = list_make3(makeString(body), pids, makeString(ext != NULL ? ext : pstrdup("")));
+	cpath->custom_private = list_make3(prune, info, makeInteger(FS_PATH_PARTIAL));
 	cpath->methods = &fs_path_methods;
 	cpath_p = (Path *) cpath;
 
@@ -1448,6 +1614,151 @@ fs_partial_paths(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_re
 	}
 }
 
+/*
+ * fs_join_paths
+ *
+ * Design 9.  A statement that is not closed as a whole (a window function that is not partitioned by the key, an aggregate that
+ * cannot be split) and whose tables are joined on their distribution keys (and reference tables) still has a join that every group
+ * can compute on its own rows: the join of the whole level is offered as a fragment of its own.  The text is the statement's FROM and
+ * WHERE with the columns that the planner needs above the join (joinrel->reltarget) as the select list, so it is a closed query
+ * (a join on the key, no aggregate) and the group's rule for the fragment of a closed query accepts it; this node plans what is above
+ * the join (the window, the aggregate, the sort) as for any scan.  When the statement is closed, or has a partial aggregation, the
+ * paths of fs_upper_paths and fs_partial_paths do more and win by cost.
+ *
+ * The hook runs for every pair of relations that make the join relation: one path per relation is made.  A grouped relation (19, eager
+ * aggregation) has the same relids and is left alone.
+ */
+static void
+fs_join_paths(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel, RelOptInfo *innerrel,
+			  JoinType jointype, JoinPathExtraData *extra)
+{
+	KsPushdownInfo *pi = current_info;
+	Query	   *parse = root->parse;
+	Query	   *jq;
+	List	   *tl = NIL;
+	KsParamRenumber prn = {NIL};
+	const char *why = NULL;
+	char	   *body;
+	char	   *ext = NULL;
+	int			nest;
+	int			resno = 1;
+	ListCell   *lc;
+	const KsCatalog *cat;
+	const KsColocation *coloc;
+	List	   *prune;
+	List	   *frags;
+	List	   *pids = NIL;
+	bool		local = false;
+	int			nremote;
+	int			ntotal;
+	double		startup;
+	double		total;
+	double		rows;
+	double		base_total = 0;
+	CustomPath *cpath;
+
+	if (prev_set_join_pathlist_hook)
+		prev_set_join_pathlist_hook(root, joinrel, outerrel, innerrel, jointype, extra);
+	if (pi == NULL || !pi->join || parse != pi->parse || root->query_level != 1 || IsParallelWorker())
+		return;
+	if (!kingres_shard_enable_pushdown_join || joinrel->reloptkind != RELOPT_JOINREL || KS_IS_GROUPED_REL(joinrel))
+		return;
+	/* the join of the whole level, and once */
+	if (!bms_is_subset(root->all_baserels, joinrel->relids) || pi->join_done == (void *) joinrel)
+		return;
+	pi->join_done = (void *) joinrel;
+
+#define JN_NO(msg) do { ereport(DEBUG1, (errmsg_internal("kingres_shard: no join fragment: %s", (msg)))); return; } while (0)
+
+	/* the planner has moved such a condition into WHERE of the join or of a table below it; the text is made from the statement before that */
+	if (having_has_moved_conjunct(pi->ship->havingQual))
+		JN_NO("its HAVING has a condition without an aggregate, which the planner moves into WHERE");
+	if (joinrel->reltarget == NULL || joinrel->reltarget->exprs == NIL)
+		JN_NO("the join has no column that is needed above it");
+	foreach(lc, joinrel->reltarget->exprs)
+	{
+		Node	   *e = (Node *) lfirst(lc);
+
+		if (!IsA(e, Var) || ((Var *) e)->varlevelsup != 0 || ((Var *) e)->varattno <= 0 ||
+			((Var *) e)->varno > (Index) list_length(parse->rtable))
+			JN_NO("a column above the join is not a column of a table");
+		tl = lappend(tl, makeTargetEntry((Expr *) copyObject(e), (AttrNumber) resno++, NULL, false));
+	}
+
+	/* the text: the FROM and WHERE of the statement, the columns above the join */
+	jq = copyObject(pi->ship);
+	jq->targetList = tl;
+	jq->groupClause = NIL;
+	jq->groupingSets = NIL;
+	jq->havingQual = NULL;
+	jq->distinctClause = NIL;
+	jq->hasDistinctOn = false;
+	jq->windowClause = NIL;
+	jq->hasWindowFuncs = false;
+	jq->hasAggs = false;
+	jq->sortClause = NIL;
+	jq->limitCount = NULL;
+	jq->limitOffset = NULL;
+	jq->limitOption = LIMIT_OPTION_COUNT;
+	jq->rowMarks = NIL;
+	jq = query_tree_mutator(jq, kingres_shard_renumber_params, &prn, 0);
+	nest = kingres_shard_set_transmission_modes();
+	body = pg_get_querydef(jq, false);
+	kingres_shard_reset_transmission_modes(nest);
+	if (!kingres_shard_text_accepted(body, jq, false, &why, &ext))
+		JN_NO(why);
+	foreach(lc, prn.ids)
+		pids = lappend(pids, makeInteger(lfirst_int(lc)));
+
+	cat = kingres_shard_catalog();
+	if (!cat->present)
+		JN_NO("no catalog");
+	coloc = kingres_shard_lookup_colocation(pi->colocation_id);
+	if (coloc == NULL)
+		JN_NO("its colocation group is not known");
+	prune = fs_prune_items(root);
+	frags = kingres_shard_frag_choose(coloc, cat, prune, root->glob->boundParams, &local, NULL, NULL);
+	nremote = list_length(frags);
+	ntotal = nremote + (local ? 1 : 0);
+	if (ntotal == 0)
+		JN_NO("no group to ask");
+
+	/*
+	 * What the groups do is what the planner would pay to join the two sides, divided among the groups that run at the same
+	 * time, plus the transfer of the rows of the join.
+	 */
+	if (outerrel->cheapest_total_path != NULL)
+		base_total += outerrel->cheapest_total_path->total_cost;
+	if (innerrel->cheapest_total_path != NULL)
+		base_total += innerrel->cheapest_total_path->total_cost;
+	rows = clamp_row_est(joinrel->rows);
+	startup = 100.0 * nremote;
+	total = startup + Max(base_total - startup, 0.0) / ntotal +
+		rows * (cpu_tuple_cost * 2.0 + 0.02) * nremote / ntotal;
+
+	cpath = makeNode(CustomPath);
+	cpath->path.pathtype = T_CustomScan;
+	cpath->path.parent = joinrel;
+	cpath->path.pathtarget = joinrel->reltarget;
+	cpath->path.param_info = NULL;
+	cpath->path.parallel_aware = false;
+	cpath->path.parallel_safe = false;
+	cpath->path.parallel_workers = 0;
+	cpath->path.pathkeys = NIL;
+	cpath->path.rows = rows;
+	cpath->path.disabled_nodes = 0;
+	cpath->path.startup_cost = startup;
+	cpath->path.total_cost = total;
+	cpath->flags = 0;
+	cpath->custom_paths = NIL;
+	cpath->custom_restrictinfo = NIL;
+	cpath->custom_private = list_make3(prune, list_make3(makeString(body), pids, makeString(ext != NULL ? ext : pstrdup(""))),
+									   makeInteger(FS_PATH_JOIN));
+	cpath->methods = &fs_path_methods;
+	add_path(joinrel, (Path *) cpath);
+#undef JN_NO
+}
+
 static Plan *
 fs_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path, List *tlist,
 					List *clauses, List *custom_plans)
@@ -1461,20 +1772,24 @@ fs_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path, L
 	List	   *scan_tlist = NIL;
 	ListCell   *lc;
 	const char *sql;
+	const char *ext;
+	int			path_kind = list_length(best_path->custom_private) > 2 ? intVal(lthird(best_path->custom_private)) : FS_PATH_WHOLE;
 
 	if (pi == NULL || root->parse != pi->parse)
 		elog(ERROR, "a fragment scan was planned for a statement that was not decided");
-	if (pi->partial)
+	if (path_kind != FS_PATH_WHOLE)
 	{
-		/* the path made the text, with the select list of the partial target (fs_partial_paths) */
+		/* the path made the text: the select list of the partial target (fs_partial_paths) or the columns of the join (fs_join_paths) */
 		List	   *info = (List *) lsecond(best_path->custom_private);
 
 		sql = strVal(linitial(info));
 		param_ids = (List *) lsecond(info);
+		ext = strVal(lthird(info));
 	}
 	else
 	{
 		sql = pi->sql;
+		ext = pi->ext;
 		foreach(lc, pi->param_ids)
 			param_ids = lappend(param_ids, makeInteger(lfirst_int(lc)));
 	}
@@ -1499,16 +1814,21 @@ fs_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path, L
 	cscan->flags = best_path->flags;
 	cscan->custom_scan_tlist = scan_tlist;
 	cscan->custom_plans = NIL;
-	cscan->custom_relids = bms_copy(root->all_baserels);
+	cscan->custom_relids = path_kind == FS_PATH_JOIN ? bms_copy(rel->relids) : bms_copy(root->all_baserels);
 	cscan->custom_private = list_make5(makeString(pstrdup(sql)), param_ids,
 									   makeInteger(pi->colocation_id),
 									   makeString(psprintf(INT64_FORMAT, pi->place)),
 									   makeString(relations_signature(pi->relids)));
 	cscan->custom_private = lappend(cscan->custom_private, dist);
 	cscan->custom_private = lappend(cscan->custom_private, prune);
-	cscan->custom_private = lappend(cscan->custom_private, makeString(pstrdup(pi->kind)));
-	cscan->custom_private = lappend(cscan->custom_private, makeInteger(pi->partial ? list_length(tlist) : pi->ncols));
-	cscan->custom_private = lappend(cscan->custom_private, makeInteger(pi->partial ? 1 : 0));
+	cscan->custom_private = lappend(cscan->custom_private, makeString(pstrdup(path_kind == FS_PATH_JOIN ? "join rows (on key)" : path_kind == FS_PATH_PARTIAL ? "partial aggregate" : pi->kind)));
+	cscan->custom_private = lappend(cscan->custom_private, makeInteger(path_kind != FS_PATH_WHOLE ? list_length(tlist) : pi->ncols));
+	cscan->custom_private = lappend(cscan->custom_private, makeInteger(path_kind == FS_PATH_PARTIAL ? 1 : 0));
+	cscan->custom_private = lappend(cscan->custom_private, makeString(ext != NULL ? pstrdup(ext) : pstrdup("")));
+	cscan->custom_private = lappend(cscan->custom_private, path_kind != FS_PATH_WHOLE ? NIL : pi->sort);
+	cscan->custom_private = lappend(cscan->custom_private, makeInteger(path_kind == FS_PATH_WHOLE ? pi->limit_param : 0));
+	if (path_kind == FS_PATH_WHOLE && pi->limit_param > 0)
+		cscan->custom_exprs = list_make2(pi->limit_cnt, pi->limit_off != NULL ? pi->limit_off : (Node *) makeNullConst(INT8OID, -1, InvalidOid));
 	cscan->methods = &fs_scan_methods;
 	return &cscan->scan.plan;
 }
@@ -1545,6 +1865,29 @@ fs_create_scan_state(CustomScan *cscan)
 	s->kind = pstrdup(strVal(list_nth(p, FS_PRIV_KIND)));
 	s->ncols = intVal(list_nth(p, FS_PRIV_NCOLS));
 	s->partial = intVal(list_nth(p, FS_PRIV_PARTIAL)) != 0;
+	s->ext = strVal(list_nth(p, FS_PRIV_EXT))[0] != '\0' ? pstrdup(strVal(list_nth(p, FS_PRIV_EXT))) : NULL;
+	s->limit_param = intVal(list_nth(p, FS_PRIV_LIMIT));
+	{
+		ListCell   *kl;
+		int			k = 0;
+
+		s->nsort = list_length((List *) list_nth(p, FS_PRIV_SORT));
+		s->sortcol = palloc(sizeof(int) * Max(s->nsort, 1));
+		s->ssup = palloc0(sizeof(SortSupportData) * Max(s->nsort, 1));
+		foreach(kl, (List *) list_nth(p, FS_PRIV_SORT))
+		{
+			List	   *key = (List *) lfirst(kl);
+			SortSupport ssup = &s->ssup[k];
+
+			s->sortcol[k] = intVal(linitial(key));
+			ssup->ssup_cxt = CurrentMemoryContext;
+			ssup->ssup_collation = (Oid) intVal(lthird(key));
+			ssup->ssup_nulls_first = intVal(lfourth(key)) != 0;
+			PrepareSortSupportFromOrderingOp((Oid) intVal(lsecond(key)), ssup);
+			k++;
+		}
+	}
+	s->mlast = -1;
 	return (Node *) s;
 }
 
@@ -1563,6 +1906,13 @@ fs_begin_scan(CustomScanState *node, EState *estate, int eflags)
 	if (tupdesc->natts != s->ncols)
 		elog(ERROR, "the fragment scan returns %d columns and its plan has %d", s->ncols, tupdesc->natts);
 	kingres_shard_fragset_init(&s->fs, estate->es_query_cxt, list_length(s->dist_relids));
+	if (s->limit_param > 0)
+	{
+		List	   *lx = ((CustomScan *) node->ss.ps.plan)->custom_exprs;
+
+		s->limit_cnt = ExecInitExpr((Expr *) linitial(lx), &node->ss.ps);
+		s->limit_off = ExecInitExpr((Expr *) lsecond(lx), &node->ss.ps);
+	}
 	s->lcxt = AllocSetContextCreate(estate->es_query_cxt, "kingres_shard fragment local batch",
 									ALLOCSET_DEFAULT_SIZES);
 	s->infuncs = palloc0(sizeof(FmgrInfo) * Max(s->ncols, 1));
@@ -1651,7 +2001,7 @@ fs_local_open(void *arg)
 	KsFragScanState *s = (KsFragScanState *) arg;
 	EState	   *estate = s->css.ss.ps.state;
 	ParamListInfo params = estate->es_param_list_info;
-	int			n = list_length(s->param_ids);
+	int			n = list_length(s->param_ids) + (s->limit_param > 0 ? 1 : 0);
 	Oid		   *argtypes = palloc(sizeof(Oid) * Max(n, 1));
 	Datum	   *values = palloc(sizeof(Datum) * Max(n, 1));
 	char	   *nulls = palloc(Max(n, 1));
@@ -1682,6 +2032,13 @@ fs_local_open(void *arg)
 		nulls[i] = prm->isnull ? 'n' : ' ';
 		i++;
 	}
+	if (s->limit_param > 0)
+	{
+		argtypes[i] = INT8OID;
+		values[i] = Int64GetDatum(s->limit_value);
+		nulls[i] = s->limit_null ? 'n' : ' ';
+		i++;
+	}
 
 	s->ident_before = MemoryContextAlloc(estate->es_query_cxt,
 										 sizeof(int64) * Max(list_length(s->dist_relids), 1));
@@ -1691,7 +2048,7 @@ fs_local_open(void *arg)
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
 	nest = kingres_shard_set_transmission_modes();
-	portal = kingres_shard_spi_local_part_cursor(s->partial ? psprintf("%s%s", kingres_shard_partial_marker(s->plan_placement), s->sql) : s->sql,
+	portal = kingres_shard_spi_local_part_cursor(s->partial ? psprintf("%s%s", kingres_shard_partial_marker(s->plan_placement, s->ext), s->sql) : s->sql,
 												 n, argtypes, values, nulls);
 	kingres_shard_reset_transmission_modes(nest);
 
@@ -1826,6 +2183,32 @@ fs_start(KsFragScanState *s)
 	startcxt = AllocSetContextCreate(CurrentMemoryContext, "kingres_shard fragment start", ALLOCSET_SMALL_SIZES);
 	old = MemoryContextSwitchTo(startcxt);
 	values = kingres_shard_fragment_params(estate->es_param_list_info, s->param_ids, &types, &nparams);
+	if (s->limit_param > 0)
+	{
+		ExprContext *ec = s->css.ss.ps.ps_ExprContext;
+		bool		n1;
+		bool		n2;
+		Datum		d1 = ExecEvalExprSwitchContext(s->limit_cnt, ec, &n1);
+		Datum		d2 = ExecEvalExprSwitchContext(s->limit_off, ec, &n2);
+		int64		cnt = n1 ? 0 : DatumGetInt64(d1);
+		int64		off = n2 ? 0 : DatumGetInt64(d2);
+		int64		sum = 0;
+		const char **v2;
+		Oid		   *t2;
+
+		/* no limit (NULL) for LIMIT NULL, a negative number (this node's own Limit node says so) and a sum that does not fit */
+		s->limit_null = n1 || cnt < 0 || off < 0 || pg_add_s64_overflow(cnt, off, &sum);
+		s->limit_value = s->limit_null ? 0 : sum;
+		v2 = palloc0(sizeof(char *) * (nparams + 1));
+		t2 = palloc0(sizeof(Oid) * (nparams + 1));
+		memcpy(v2, values, sizeof(char *) * nparams);
+		memcpy(t2, types, sizeof(Oid) * nparams);
+		t2[nparams] = INT8OID;
+		v2[nparams] = s->limit_null ? NULL : psprintf(INT64_FORMAT, s->limit_value);
+		values = v2;
+		types = t2;
+		nparams++;
+	}
 	relids = palloc(sizeof(Oid) * Max(nrels, 1));
 	foreach(lc, s->dist_relids)
 		relids[i++] = lfirst_oid(lc);
@@ -1835,7 +2218,7 @@ fs_start(KsFragScanState *s)
 	st.ntables = nrels;
 	st.relids = relids;
 	st.plan_placement = s->plan_placement;
-	st.marker = s->partial ? kingres_shard_partial_marker(s->plan_placement) : kingres_shard_query_marker(s->plan_placement);
+	st.marker = s->partial ? kingres_shard_partial_marker(s->plan_placement, s->ext) : kingres_shard_query_marker(s->plan_placement, s->ext);
 	st.sql = s->sql;
 	st.nparams = nparams;
 	st.ptypes = types;
@@ -1979,9 +2362,167 @@ fs_next_row(KsFragScanState *s, TupleTableSlot *slot, ExprContext *econtext)
 	return true;
 }
 
+/* The values of one row of a group, as input functions make them, in the context of its stream. */
+static void
+merge_load_remote(KsFragScanState *s, FsMergeSrc *src, PGresult *res, int row)
+{
+	int			j;
+	MemoryContext oldcxt;
+
+	if (PQnfields(res) != s->ncols)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("node %s:%d returned %d columns, expected %d",
+						src->frag->host, src->frag->port, PQnfields(res), s->ncols)));
+	oldcxt = MemoryContextSwitchTo(src->cxt);
+	for (j = 0; j < s->ncols; j++)
+	{
+		if (PQgetisnull(res, row, j))
+		{
+			src->vals[j] = (Datum) 0;
+			src->nulls[j] = true;
+		}
+		else
+		{
+			src->nulls[j] = false;
+			src->vals[j] = InputFunctionCall(&s->infuncs[j], PQgetvalue(res, row, j), s->typioparams[j], s->typmods[j]);
+		}
+	}
+	MemoryContextSwitchTo(oldcxt);
+}
+
+/* The next row of a stream; loaded is false at its end. */
+static void
+merge_advance(KsFragScanState *s, FsMergeSrc *src)
+{
+	MemoryContextReset(src->cxt);
+	src->loaded = false;
+	if (src->frag == NULL)
+	{
+		if (s->next_l >= s->nl && !s->lexhausted)
+			fs_local_fetch(s);
+		if (s->next_l < s->nl)
+		{
+			HeapTuple	tup = s->lbatch[s->next_l++];
+
+			/* the datums point into the batch, which stays until this stream asks for the next one */
+			heap_deform_tuple(tup, s->local_desc, src->vals, src->nulls);
+			src->loaded = true;
+		}
+	}
+	else
+	{
+		PGresult   *res;
+		int			row;
+
+		if (kingres_shard_fragset_next_of(&s->fs, src->frag, &res, &row))
+		{
+			merge_load_remote(s, src, res, row);
+			src->loaded = true;
+		}
+	}
+}
+
+static int
+merge_cmp(KsFragScanState *s, FsMergeSrc *a, FsMergeSrc *b)
+{
+	int			k;
+
+	for (k = 0; k < s->nsort; k++)
+	{
+		int			col = s->sortcol[k];
+		int			r = ApplySortComparator(a->vals[col], a->nulls[col], b->vals[col], b->nulls[col], &s->ssup[k]);
+
+		if (r != 0)
+			return r;
+	}
+	return 0;
+}
+
+/*
+ * The ordered merge (design 8): every stream is sorted by the keys, the row that comes next is the smallest head, and a tie
+ * goes to the stream of the group with the lower group id (this node's own part has the id of its own group, so the order of ties is
+ * the same whichever node runs the statement: design 8, O3).  A stream
+ * is read again only when its head was taken, so a group that answers slowly holds up the merge for as long as it has to
+ * and no longer.
+ */
+static bool
+fs_next_row_merged(KsFragScanState *s, TupleTableSlot *slot)
+{
+	int			i;
+	int			best = -1;
+
+	if (!s->merge_started)
+	{
+		ListCell   *lc;
+		int			n = list_length(s->fs.frags) + (s->has_local ? 1 : 0);
+		int			k = 0;
+
+		s->msrc = palloc0(sizeof(FsMergeSrc) * Max(n, 1));
+		s->nmsrc = n;
+		if (s->has_local)
+		{
+			s->msrc[k].frag = NULL;
+			s->msrc[k].gid = kingres_shard_catalog()->local_group_id;
+			k++;
+		}
+		foreach(lc, s->fs.frags)
+		{
+			s->msrc[k].frag = (KsFrag *) lfirst(lc);
+			s->msrc[k].gid = s->msrc[k].frag->group_id;
+			k++;
+		}
+		/* the streams in the order of their group ids (a stable insertion sort: the number of groups is small) */
+		for (i = 1; i < n; i++)
+		{
+			FsMergeSrc	cur = s->msrc[i];
+			int			j = i - 1;
+
+			while (j >= 0 && s->msrc[j].gid > cur.gid)
+			{
+				s->msrc[j + 1] = s->msrc[j];
+				j--;
+			}
+			s->msrc[j + 1] = cur;
+		}
+		for (i = 0; i < n; i++)
+		{
+			s->msrc[i].vals = palloc(sizeof(Datum) * Max(s->ncols, 1));
+			s->msrc[i].nulls = palloc(sizeof(bool) * Max(s->ncols, 1));
+			s->msrc[i].cxt = AllocSetContextCreate(s->css.ss.ps.state->es_query_cxt, "kingres_shard merge row", ALLOCSET_SMALL_SIZES);
+		}
+		kingres_shard_fragset_prime(&s->fs);
+		for (i = 0; i < n; i++)
+			merge_advance(s, &s->msrc[i]);
+		s->merge_started = true;
+		s->mlast = -1;
+	}
+	else if (s->mlast >= 0)
+		merge_advance(s, &s->msrc[s->mlast]);
+
+	for (i = 0; i < s->nmsrc; i++)
+	{
+		if (!s->msrc[i].loaded)
+			continue;
+		if (best < 0 || merge_cmp(s, &s->msrc[i], &s->msrc[best]) < 0)
+			best = i;
+	}
+	if (best < 0)
+		return false;
+	s->mlast = best;
+	ExecClearTuple(slot);
+	memcpy(slot->tts_values, s->msrc[best].vals, sizeof(Datum) * s->ncols);
+	memcpy(slot->tts_isnull, s->msrc[best].nulls, sizeof(bool) * s->ncols);
+	ExecStoreVirtualTuple(slot);
+	if (s->css.ss.ps.state->es_instrument)
+		count_group_row(s, s->msrc[best].frag == NULL ? -1 : s->msrc[best].frag->group_id);
+	return true;
+}
+
 static TupleTableSlot *
 fs_exec_scan(CustomScanState *node)
 {
+
 	KsFragScanState *s = (KsFragScanState *) node;
 	ExprContext *econtext = node->ss.ps.ps_ExprContext;
 	TupleTableSlot *scan = node->ss.ss_ScanTupleSlot;
@@ -1994,7 +2535,7 @@ fs_exec_scan(CustomScanState *node)
 		CHECK_FOR_INTERRUPTS();
 		ResetExprContext(econtext);
 
-		if (!fs_next_row(s, scan, econtext))
+		if (s->nsort > 0 ? !fs_next_row_merged(s, scan) : !fs_next_row(s, scan, econtext))
 			return NULL;
 		econtext->ecxt_scantuple = scan;
 		if (node->ss.ps.qual != NULL && !ExecQual(node->ss.ps.qual, econtext))
@@ -2013,6 +2554,23 @@ fs_stop(KsFragScanState *s)
 {
 	kingres_shard_fragset_stop(&s->fs, true);
 	fs_local_close(s);
+	if (s->merge_started)
+	{
+		int			i;
+
+		/* the arrays are made again at the next start (a rescan): let them go with the contexts (review P2E-10) */
+		for (i = 0; i < s->nmsrc; i++)
+		{
+			MemoryContextDelete(s->msrc[i].cxt);
+			pfree(s->msrc[i].vals);
+			pfree(s->msrc[i].nulls);
+		}
+		pfree(s->msrc);
+		s->msrc = NULL;
+		s->merge_started = false;
+		s->nmsrc = 0;
+		s->mlast = -1;
+	}
 	s->started = false;
 }
 
@@ -2095,6 +2653,8 @@ fs_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 	}
 	appendStringInfoChar(&groups, ')');
 	ExplainPropertyText("Groups", groups.data, es);
+	if (s->nsort > 0)
+		ExplainPropertyInteger("Merge keys", NULL, s->nsort, es);
 
 	initStringInfo(&flat);
 	flatten_sql(s->sql, &flat);
