@@ -963,3 +963,59 @@ What 9.4 will find: the table DDL function knows only "a plain table becomes has
 distributed source needs a copy over each node's partitions, a log per node, the per-operation
 shadow names, a placement kept in `spec`, a retirement that moves partitions, locks on every node
 and bucket partition at the switch, and claims of several groups for an alter of colocated tables.
+
+### The second review and its fixes (2026-11-20)
+
+The second review ([report](../reviews/2026-11-20-kingres-shard-phase9-rebuild.md)) looked at the
+rebuild engine and at the fixes for the first review. It found that P9A-01 holds and that P9A-05 was
+only half fixed, and it found two high, four medium and four low defects and three notes. Each one was
+reproduced by its test on the tree under review before it was fixed. The tests are t/180 to t/184.
+
+- **P9B-01 (high), code of a role that is not a superuser ran as a superuser.** The check of P9A-05
+  followed only the dependencies of the table's defaults, constraints and indexes on functions. A
+  domain check or default, the function behind an operator, an operator class, a cast and a range or
+  composite type were not followed. A role became superuser on every node. Now
+  `kingres.internal_untrusted_functions(relation)` follows all of them, and the operator classes of the
+  column types, to every user-defined function owned by a role that is not a superuser. The report
+  makes each one a `function_owner_not_superuser` blocker that says how it was reached, so both calls
+  and the reference variant refuse before they start. The section on rights asked for the code to run
+  as its owner or be refused; it is refused, also for a `SECURITY DEFINER` function of such a role.
+  Code of a superuser is trusted; what such a function calls by name in its body is not followed.
+  The capture log stores the base type of a domain key, so no domain check runs in the trigger, which
+  runs with the rights of the extension's owner.
+- **P9B-02 (high) and P9B-08 (low), the capture.** The trigger took the key from `to_jsonb(NEW)`,
+  which writes a float with the `extra_float_digits` of the writer's session: a writer with a value
+  below 1 logged a key that does not exist, and its change was not replayed. A row with a value over
+  256 MB could not be written. The trigger now reads the key columns from the row with no text between,
+  and it runs with `extra_float_digits = 3`; the sessions of the engine are already forced to 3.
+- **P9B-03 (medium), the replay and a unique index other than the key.** A value that moved from one
+  row to another could put the two rows in chunks in the wrong order, and the replay failed on every
+  retry. A chunk that raises `unique_violation` is now repeated with the whole log in one chunk, which
+  cannot conflict with itself; in the final replay of a switch attempt the attempt is given up and
+  tried again. Ordering the entries or deferring the index cannot be done for an index that is not
+  deferrable.
+- **P9B-04 (medium), the DDL guard.** It now also refuses `DROP TRIGGER` (the capture trigger by
+  the table's owner), `DROP INDEX`, `ALTER INDEX`, `SET SCHEMA`, `CREATE RULE`, `CREATE POLICY`,
+  `DROP RULE` and `DROP POLICY` while an operation runs.
+- **P9B-05 (medium), a cancelled call.** `WHEN OTHERS` does not catch `query_canceled`, so a call
+  cancelled while its session stayed left an operation that nothing could cancel. The handlers catch
+  both now. The same tests found that a switch attempt that runs out of time is raised as
+  `query_canceled` too, so "the switch committed although its answer was lost" was never seen after a
+  timeout; the switch and the recovery call catch it now.
+- **P9B-06 (medium), a reader's lock.** The lock of P9A-02 is taken only for a role that has the
+  right the statement needs. A role with only `SELECT` can still make an administrator's call wait
+  with a `GRANT` in an open transaction, because `GRANT` writes the table's row in `pg_class` even
+  when it grants nothing; plain PostgreSQL waits the same way.
+- **P9B-07 (low).** The README now states the bound of the capture's wait for writers.
+- **P9B-09 (low).** The retained old copy loses column privileges too.
+- **P9B-10 (low).** t/184 kills the six mutants that survived the review.
+- **P9B-11 (note), the verification.** One write after the swap hides any loss from the comparison.
+  An exact comparison would need a digest taken under the lock, which this design rules out, or the
+  logged keys. The record now says why in `detail`, the call that ends the operation raises a WARNING
+  with the reason, and the README says what to do.
+- **P9B-12 and P9B-13 (notes).** The README now names the window of P9A-02, the double draw of a
+  sequence, the disk and WAL cost of the online variant, and that a distributed serial column counts
+  per node after distribution.
+
+Of the mutants of the fixes, all are killed except two lines that set `extra_float_digits` in the copy
+and the replay, which were removed because those sessions are already forced to 3.

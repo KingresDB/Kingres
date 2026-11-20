@@ -438,6 +438,11 @@ PROVE_TESTS=t/013_dist_scan.pl kingres/dev/ext.sh kingres_shard tap
   `141_distribute_memory` (a million and three million rows: the same peak memory), `143_distribute_insel` (a prepared colocated INSERT ... SELECT across the swap of its source, and one that waits for the lock of a table that is being distributed), `142_distribute_ledger` (a
   ledger table is refused; it needs `kingres_ledger` built into the same installation, for example
   `make -C contrib/kingres_ledger USE_PGXS=1 PG_CONFIG=... install`, and both libraries preloaded, which the test does).
+  `180_untrusted_code` .. `184_engine_rules` (the fixes of the second review of phase 9: code of untrusted roles through domains,
+  operators, range types and hash functions; float, domain and very large keys in the capture, a unique value that changes hands in the
+  replay and the verification that says it was not done; the guard against `DROP TRIGGER`, `SET SCHEMA` and the like and the lock of a
+  `GRANT`; a cancelled call whose session stays; a column privilege on the old copy, a repeated copy chunk, the row lock of the switch,
+  the worker and a live or recent operation, the log name of the capture trigger, a lost answer of the switch),
   `150_distribute_races` (the fix round of the review of 9.1 and 9.2: a writer that commits while the call waits for the lock, for an
   update, a delete, an insert, a reference table and the online engine, with the values compared; statements queued behind the call;
   rules, row types, `NOT VALID` checks, unowned sequences, collations, schema privileges, enum keys, function owners, invalid indexes, forced
@@ -605,15 +610,20 @@ runs only in a `READ COMMITTED` transaction and is refused in `REPEATABLE READ` 
 than the lock. A statement that was started before the call and waits for the table (`ALTER TABLE`, `RENAME`, `CREATE INDEX`,
 `TRUNCATE`, `GRANT`, `COPY ... FROM`, `DROP TABLE` and the others the hook looks at) first waits for the lock and decides
 afterwards, so it finds the table as the call left it and goes to every node. The statement takes a `ROW EXCLUSIVE` lock
-on the table for this, which every writer holds anyway; a role that has no privilege on the table does not wait. The
-online variants take the copy from a snapshot after the capture trigger exists, whose creation waits for every writer.
+on the table for this, which every writer holds anyway. Only a role that has the right the statement needs takes it (the owner; `INSERT` for
+`COPY ... FROM`; `TRUNCATE`; `TRIGGER` for `CREATE TRIGGER`; a grant option for `GRANT`), so a `GRANT` of a role that may only read
+leaves no lock behind. The online variants take the copy from a snapshot after the capture trigger exists. The trigger is made under
+a lock that excludes writers: the call tries without waiting for a quarter of `rebuild_switch_timeout` (2.5 s by default), then queues once for
+`rebuild_lock_timeout`, and fails with the holders named, and is undone, when a writer (or a prepared transaction) is still in the table. A
+table that always has a transaction open for longer than that cannot be rebuilt online with the call; the phase functions can be called
+again.
 
 ### What is carried and what stays refused
 
 | | |
 |---|---|
 | Columns, defaults, identity (also `GENERATED ALWAYS`: copied with `OVERRIDING SYSTEM VALUE`), generated columns, collations, `NOT NULL` (with its constraint name), check, unique and primary key constraints, every index (expression, partial, covering) | carried |
-| Sequences owned by columns | carried: the same object on this node, created with the same options and the same owner on the others; the state is kept on this node when it is above the largest value of the column, otherwise raised to that value (`is_called` true), and on the other nodes raised to the largest value of the node's own rows. So the next value of a serial column can be higher than it was when the sequence was behind its column. Privileges on the sequences are not carried |
+| Sequences owned by columns | carried: the same object on this node, created with the same options and the same owner on the others; the state is kept on this node when it is above the largest value of the column, otherwise raised to that value (`is_called` true), and on the other nodes raised to the largest value of the node's own rows. So the next value of a serial column can be higher than it was when the sequence was behind its column. Privileges on the sequences are not carried. **A sequence is per node, as before:** after the distribution the nodes start from different numbers (the largest value of each node's own rows), so a serial or identity column hands out the same value on two nodes, and the table's primary key (which contains the distribution column) is what keeps the rows apart; a value that repeats is harmless only when the repeated value goes to a different distribution key. Do not rely on a distributed serial column for a value that must be unique across the table |
 | Owner, table privileges, column privileges (with grantors and grant options), comments on the table, columns, constraints and indexes | carried; the roles must exist on every node (blocker `role_missing`) |
 | Foreign keys **to a reference table** | carried and validated in the same transaction |
 | Foreign keys **to a distributed table** of the group the table joins, on the distribution column of both | carried (such a key exists on an ordinary table only while the cluster has one shard group, or when it was made with `enable_routing = off`: with several groups the hook refuses it at creation) |
@@ -621,7 +631,7 @@ online variants take the copy from a snapshot after the capture trigger exists, 
 | Foreign keys to an ordinary table, to a distributed table of another group, or without the distribution column; foreign keys from an ordinary table to the table | refused (`foreign_key_plain_table`, `foreign_key_other_group`, `foreign_key_not_distribution_column`, `referenced_by_plain_table`) |
 | Triggers, rules, row-level security (also `FORCE ROW LEVEL SECURITY` alone), exclusion constraints, invalid indexes, `CHECK` constraints that are `NOT VALID`, inheritance, partitioned tables and partitions (user partitions are increment 9.5), temporary and unlogged tables, storage parameters (increment 9.9), tablespaces, ledger tables and the history table of one, a table on a node that is not the map group primary | refused |
 | Views, materialized views, publications and functions that use the table's row type, and a column of another table that has the row type | refused (`dependent_object`): the table is replaced by a new one, and a rename would leave them on the old |
-| A column default that calls `nextval()` of a sequence that no column of the table owns; a collation that another node does not have; an owner who has `CREATE` on the schema here but not on another node; an enum as the distribution column (the hash of an enum value depends on the OID of the value, which differs between the nodes); a relation of the shadow's name on another node; a function used by a `CHECK`, default or index that belongs to a role who is not a superuser (the copy would run it with the rights of the caller on every node) | refused before anything is done (`default_sequence_not_owned`, `collation_missing`, `schema_privilege`, `enum_distribution_column`, `name_in_use`, `function_owner_not_superuser`) |
+| A column default that calls `nextval()` of a sequence that no column of the table owns; a collation that another node does not have; an owner who has `CREATE` on the schema here but not on another node; an enum as the distribution column (the hash of an enum value depends on the OID of the value, which differs between the nodes); a relation of the shadow's name on another node; any function that the copy would reach and that belongs to a role who is not a superuser: one a `CHECK`, default, generated column or index names, and also one behind a domain of a column (its checks and its default), an operator or operator class of an index, a cast, a range or composite type (the copy runs it with the rights of the caller on every node, and the code of a table's owner must not run as a superuser) | refused before anything is done (`default_sequence_not_owned`, `collation_missing`, `schema_privilege`, `enum_distribution_column`, `name_in_use`, `function_owner_not_superuser`) |
 | Statistics objects, per-column storage, compression and statistics target, attribute options, `CLUSTER ON`, replica identity | not carried (warning `not_carried`) |
 | `lc_monetary` | the values of a `money` column are converted under `lc_monetary = 'C'` on both ends of the copy |
 
@@ -645,7 +655,7 @@ blocker). Severity `blocker`: the call is refused. `warning`: carried differentl
 | `tablespace` | distribute, distribute_reference | the table or one of its indexes is not in the default tablespace |
 | `ledger_table` | distribute, distribute_reference | a `kingres_ledger` table or the history table of one |
 | `dependent_object` | distribute, distribute_reference | a view, materialized view, publication or function that uses the table, or a column of another table with its row type |
-| `default_sequence_not_owned`, `function_owner_not_superuser` | distribute, distribute_reference | a default calls `nextval()` of a sequence that no column of the table owns; a function of a constraint, default or index belongs to a role who is not a superuser |
+| `default_sequence_not_owned`, `function_owner_not_superuser` | distribute, distribute_reference | a default calls `nextval()` of a sequence that no column of the table owns; code of a role who is not a superuser is reached by the copy through a constraint, default, index, domain, operator, operator class, cast, range or composite type (the report says through what) |
 | `enum_distribution_column`, `collation_missing`, `schema_privilege` | distribute | the hash of the column is not the same on every node; another node lacks a collation of a column or `CREATE` on the schema for the owner |
 | `foreign_key_plain_table`, `foreign_key_other_group`, `foreign_key_not_distribution_column`, `referenced_by_plain_table`, `referenced_by_distributed_table` | distribute, distribute_reference | the foreign keys that stay refused |
 | `column_missing`, `no_hash_support`, `unique_without_distribution_column`, `name_too_long`, `name_in_use` | distribute | the distribution column is not usable, a unique key lacks it, the name leaves no room for `_bNNNN`, or a relation of a bucket partition's name or of the shadow's name exists, on this node or on another |
@@ -711,7 +721,7 @@ mark (an advisory lock) and a second session that tries gets "is being run by an
 operation made); a session that runs it notices at the end of its chunk and undoes it itself; after the switch it only says so. **Resume**:
 `kingres.resume_table_operations()` (the recovery worker calls it every `recovery_interval`, after it resolved the prepared transactions) undoes
 the operations whose session is gone and that did not switch (not written for `2 x node_timeout`), finishes those that switched, and cleans
-again an undone operation that could not reach a node (`spec -> 'cleanup_pending'`). The two wrapper functions undo what fails.
+again an undone operation that could not reach a node (`spec -> 'cleanup_pending'`). The two wrapper functions undo what fails, a cancel of the call (Ctrl-C, a statement timeout, `pg_cancel_backend`) included, whether or not the client stays connected: the live mark of the operation is released and the undo runs before the cancel is reported.
 
 **The proof that nothing is missed.** The capture trigger exists, on a source that no writer is half inside (the trigger is made under a lock
 that excludes writers), before the copy reads anything. Every row that exists is copied; every change after has a log entry, written in the
@@ -726,10 +736,19 @@ the sum of a hash of every row in text form (under fixed `DateStyle`, `IntervalS
 and `TimeZone`) for the old copy and for the new table on every node. A difference keeps the old copy, sets `verified = 'failed'`, makes
 the call fail and is reported by `check_cluster()` (`table_verification_failed`). A table that was **written to after the swap** cannot be
 compared (its rows have changed): the digest also counts the rows whose `xmin` is newer than the swap of that node, and a difference with
-newer rows is `verified = 'skipped'` with the reason. So the check is exact for a table nobody wrote since the swap; a workload that only
-deletes in that window can give a false `failed`, which only keeps the old copy.
+newer rows is `verified = 'skipped'` with the reason in `detail`, and the call that ends the operation raises a `WARNING` with it (also when
+the tables differ: the warning then says so). So the check is exact for a table nobody wrote since the swap, and **one write after the swap
+hides any loss**: a table that is written to constantly is never verified by this check, and the capture is then the only guard.
+Compare the retained old copy with the new table yourself in that case (the warning says so); the old copy is kept for
+`table_cleanup_delay`. A workload that only deletes in that window can give a false `failed`, which only keeps the old copy.
+The capture stores the keys with all their digits (it reads the key columns of the row, not a text of the row; the sessions of the engine
+run with `extra_float_digits = 3` like every control session) and in the base type of a
+domain, never as a jsonb of the whole row, so a float key, a domain key or a value over 256 MB does not change what is replayed or what a
+writer may write. A replay chunk that fails on a unique index other than the key (a unique value that moved from one row to another between
+two chunks) is repeated with the whole backlog.
 
-**What else changes.** The DDL guard refuses `ALTER TABLE`, `RENAME`, `DROP`, `CREATE INDEX`, `CREATE TRIGGER` and `TRUNCATE` on the source
+**What else changes.** The DDL guard refuses `ALTER TABLE` (also `SET SCHEMA` and `DISABLE TRIGGER`), `RENAME`, `DROP TABLE`, `DROP INDEX`, `DROP TRIGGER`,
+`DROP RULE`, `DROP POLICY`, `ALTER INDEX`, `CREATE INDEX`, `CREATE TRIGGER`, `CREATE RULE`, `CREATE POLICY` and `TRUNCATE` on the source
 of a running operation ("is being rebuilt by table operation N"). A bucket move of a claimed group is refused; so is a second operation on
 the group or the table. `create_distributed_table` does not choose a claimed group for a new table. `check_cluster()` also reports
 `table_operation_stalled`, `shadow_table`, `log_table`, `capture_trigger` (objects of an operation that is not running), `old_table` (an
@@ -739,6 +758,23 @@ old copy overdue by an hour) and `table_verification_failed`.
 primary until the swap), and a wait from the first lock of the switch to its commit, bounded by the drain threshold and
 `rebuild_switch_timeout`. `t/145` measures a reader during the operation (under a second) and checks the table against a model of four
 writers (inserts, updates, deletes, `COPY`).
+
+**Disk and WAL.** While an operation runs the destination servers hold a second copy of the table with its indexes (about twice the
+size of the table and its indexes in total), and after the switch the retained old copy stays on the map group primary for
+`table_cleanup_delay` (ten minutes by default): up to three times the size at the peak. Every row is written once more to the WAL of its
+destination (and of the destination's standbys), every change during the operation is one more log row on the map group primary, and
+the verification reads the old copy and the new table once. A table whose size does not fit that room twice cannot be rebuilt online.
+
+**What the online variant does not promise.**
+
+- A value drawn by an explicit `nextval()` of an identity or owned sequence in the few milliseconds between the read of the sequence state
+  and its rename in the swap (writers cannot insert meanwhile, a call of `nextval()` alone can) is given twice (the design says so too).
+- The remaining window of the statements that wait for a table that is being distributed ("Transactions that run at the same time"):
+  a statement that names a plain table and a distributed table together and propagates (a foreign key from the plain table to the
+  distributed one, possible only on a cluster with one shard group) lets go of the lock of the plain table before it takes the lock of
+  the catalog. A call that starts on the plain table in those few instructions is not seen by the decision of that statement, which
+  then runs on a table that has become partitioned. It needs a DDL statement and an administrator's call on one table at the same
+  moment; the effect is on that statement, not on rows.
 
 Fault points: `rebuild_after_preparing`, `rebuild_after_shadow`, `rebuild_after_capture`, `rebuild_copy_chunk`, `rebuild_after_copy`,
 `rebuild_replay_chunk`, `rebuild_before_switch`, `rebuild_switch_after_lock`, `rebuild_switch_after_final_replay`,

@@ -5691,6 +5691,78 @@ BEGIN
 END;
 $$;
 
+-- The code of non-superusers that a copy of the table would run with the rights of the caller.  The copy (and the
+-- replay, and the key capture) evaluates constraints, defaults, generated columns and index expressions, and every
+-- function behind them.  This follows the dependencies from the table, its columns' types, defaults, constraints and
+-- indexes to every function, operator, operator class, cast, domain (its constraints and default), range type and
+-- composite type they reach, and returns the user-defined functions owned by a role that is not a superuser.  Code of
+-- a superuser is trusted: whatever it calls, it called.  The default hash and btree operator classes of the column
+-- types are followed too (the routing hashes every distribution key).
+CREATE FUNCTION kingres.internal_untrusted_functions(p_relid regclass)
+    RETURNS TABLE (func text, owner name, via text)
+    LANGUAGE sql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+WITH RECURSIVE c AS (
+    SELECT 'pg_catalog.pg_proc'::pg_catalog.regclass::pg_catalog.oid AS proc,
+           'pg_catalog.pg_operator'::pg_catalog.regclass::pg_catalog.oid AS oper,
+           'pg_catalog.pg_type'::pg_catalog.regclass::pg_catalog.oid AS typ,
+           'pg_catalog.pg_opclass'::pg_catalog.regclass::pg_catalog.oid AS opclass,
+           'pg_catalog.pg_opfamily'::pg_catalog.regclass::pg_catalog.oid AS opfamily,
+           'pg_catalog.pg_constraint'::pg_catalog.regclass::pg_catalog.oid AS con,
+           'pg_catalog.pg_attrdef'::pg_catalog.regclass::pg_catalog.oid AS attrdef,
+           'pg_catalog.pg_class'::pg_catalog.regclass::pg_catalog.oid AS cls,
+           'pg_catalog.pg_amproc'::pg_catalog.regclass::pg_catalog.oid AS amproc,
+           'pg_catalog.pg_amop'::pg_catalog.regclass::pg_catalog.oid AS amop,
+           'pg_catalog.pg_cast'::pg_catalog.regclass::pg_catalog.oid AS cast
+), seed(classid, objid, via) AS (
+    SELECT c.typ, a.atttypid, pg_catalog.format('column "%s"', a.attname)
+      FROM c, pg_catalog.pg_attribute a
+     WHERE a.attrelid OPERATOR(pg_catalog.=) p_relid::pg_catalog.oid AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped
+    UNION
+    SELECT c.attrdef, ad.oid, 'a column default' FROM c, pg_catalog.pg_attrdef ad WHERE ad.adrelid OPERATOR(pg_catalog.=) p_relid::pg_catalog.oid
+    UNION
+    SELECT c.con, k.oid, pg_catalog.format('constraint "%s"', k.conname) FROM c, pg_catalog.pg_constraint k WHERE k.conrelid OPERATOR(pg_catalog.=) p_relid::pg_catalog.oid
+    UNION
+    SELECT c.cls, i.indexrelid, pg_catalog.format('index "%s"', i.indexrelid::pg_catalog.regclass) FROM c, pg_catalog.pg_index i WHERE i.indrelid OPERATOR(pg_catalog.=) p_relid::pg_catalog.oid
+    UNION
+    SELECT c.opclass, o, 'an index operator class' FROM c, pg_catalog.pg_index i, pg_catalog.unnest(i.indclass::pg_catalog.oid[]) o WHERE i.indrelid OPERATOR(pg_catalog.=) p_relid::pg_catalog.oid
+    UNION
+    SELECT c.opclass, oc.oid, pg_catalog.format('the operator class of column "%s"', a.attname)
+      FROM c, pg_catalog.pg_attribute a JOIN pg_catalog.pg_opclass oc ON oc.opcintype OPERATOR(pg_catalog.=) a.atttypid AND oc.opcdefault
+     WHERE a.attrelid OPERATOR(pg_catalog.=) p_relid::pg_catalog.oid AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped
+), walk(classid, objid, via) AS (
+    SELECT s.classid, s.objid, s.via FROM seed s WHERE s.objid OPERATOR(pg_catalog.>=) 16384
+    UNION
+    SELECT e.classid, e.objid, w.via
+      FROM walk w CROSS JOIN c CROSS JOIN LATERAL (
+            SELECT d.refclassid AS classid, d.refobjid AS objid
+              FROM pg_catalog.pg_depend d
+             WHERE d.classid OPERATOR(pg_catalog.=) w.classid AND d.objid OPERATOR(pg_catalog.=) w.objid
+               AND d.refclassid IN (c.proc, c.oper, c.typ, c.opclass, c.opfamily, c.con, c.attrdef, c.amproc, c.amop, c.cast)
+            UNION ALL
+            SELECT c.con, k.oid FROM pg_catalog.pg_constraint k WHERE w.classid OPERATOR(pg_catalog.=) c.typ AND k.contypid OPERATOR(pg_catalog.=) w.objid
+            UNION ALL
+            SELECT c.cls, t.typrelid FROM pg_catalog.pg_type t WHERE w.classid OPERATOR(pg_catalog.=) c.typ AND t.oid OPERATOR(pg_catalog.=) w.objid AND t.typrelid OPERATOR(pg_catalog.<>) 0
+            UNION ALL
+            SELECT c.opfamily, oc.opcfamily FROM pg_catalog.pg_opclass oc WHERE w.classid OPERATOR(pg_catalog.=) c.opclass AND oc.oid OPERATOR(pg_catalog.=) w.objid
+            UNION ALL
+            SELECT c.amproc, ap.oid FROM pg_catalog.pg_amproc ap WHERE w.classid OPERATOR(pg_catalog.=) c.opfamily AND ap.amprocfamily OPERATOR(pg_catalog.=) w.objid
+            UNION ALL
+            SELECT c.amop, ao.oid FROM pg_catalog.pg_amop ao WHERE w.classid OPERATOR(pg_catalog.=) c.opfamily AND ao.amopfamily OPERATOR(pg_catalog.=) w.objid
+            UNION ALL
+            SELECT c.proc, ca.castfunc FROM pg_catalog.pg_cast ca WHERE w.classid OPERATOR(pg_catalog.=) c.cast AND ca.oid OPERATOR(pg_catalog.=) w.objid AND ca.castfunc OPERATOR(pg_catalog.<>) 0
+           ) e
+     WHERE e.objid OPERATOR(pg_catalog.>=) 16384
+)
+SELECT DISTINCT pr.oid::pg_catalog.regprocedure::pg_catalog.text, ro.rolname, w.via
+  FROM walk w JOIN pg_catalog.pg_proc pr ON pr.oid OPERATOR(pg_catalog.=) w.objid
+  JOIN pg_catalog.pg_roles ro ON ro.oid OPERATOR(pg_catalog.=) pr.proowner
+ WHERE w.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_proc'::pg_catalog.regclass::pg_catalog.oid
+   AND pr.oid OPERATOR(pg_catalog.>=) 16384 AND NOT ro.rolsuper
+ ORDER BY 1;
+$$;
+
 -- ---------------------------------------------------------------------------
 -- The statements that recreate a table
 -- ---------------------------------------------------------------------------
@@ -6543,26 +6615,14 @@ BEGIN
                        'blocker', 'enum_distribution_column', v_col::pg_catalog.text,
                        pfx OPERATOR(pg_catalog.||) pg_catalog.format('column "%s" is an enum: the hash of an enum value depends on the OID of the value, which differs between the nodes', v_col)));
         END IF;
-        -- the functions that the copy runs (CHECK, defaults, generated columns, index expressions) must belong to a superuser:
-        -- the call runs them as the caller on every node
-        FOR r IN SELECT DISTINCT pr.oid::pg_catalog.regprocedure::pg_catalog.text AS name,
-                        (SELECT ro.rolname FROM pg_catalog.pg_roles ro WHERE ro.oid OPERATOR(pg_catalog.=) pr.proowner) AS owner
-                   FROM pg_catalog.pg_depend d
-                   JOIN pg_catalog.pg_proc pr ON pr.oid OPERATOR(pg_catalog.=) d.refobjid
-                  WHERE d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_proc'::pg_catalog.regclass
-                    AND pr.oid OPERATOR(pg_catalog.>=) 16384
-                    AND NOT (SELECT ro.rolsuper FROM pg_catalog.pg_roles ro WHERE ro.oid OPERATOR(pg_catalog.=) pr.proowner)
-                    AND ((d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_attrdef'::pg_catalog.regclass
-                          AND d.objid IN (SELECT ad.oid FROM pg_catalog.pg_attrdef ad WHERE ad.adrelid OPERATOR(pg_catalog.=) relation::pg_catalog.oid))
-                         OR (d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_constraint'::pg_catalog.regclass
-                             AND d.objid IN (SELECT k.oid FROM pg_catalog.pg_constraint k WHERE k.conrelid OPERATOR(pg_catalog.=) relation::pg_catalog.oid))
-                         OR (d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass
-                             AND d.objid IN (SELECT i.indexrelid FROM pg_catalog.pg_index i WHERE i.indrelid OPERATOR(pg_catalog.=) relation::pg_catalog.oid)))
-                  ORDER BY 1
+        -- the code that the copy runs (constraints, defaults, generated columns, index expressions, domains, operators, operator
+        -- classes, casts, range and composite types, and the functions behind them) must belong to a superuser: the call runs it
+        -- with the rights of the caller on every node
+        FOR r IN SELECT u.func AS name, u.owner AS owner, u.via AS via FROM kingres.internal_untrusted_functions(relation) u ORDER BY 1
         LOOP
             rep := rep OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_array(
                        'blocker', 'function_owner_not_superuser', r.name,
-                       pfx OPERATOR(pg_catalog.||) pg_catalog.format('function %s, used by a constraint, default or index of the table, belongs to the role "%s", who is not a superuser; the copy would run it with the rights of the caller on every node', r.name, r.owner)));
+                       pfx OPERATOR(pg_catalog.||) pg_catalog.format('function %s, reached from %s, belongs to the role "%s", who is not a superuser; the copy would run it with the rights of the caller on every node', r.name, r.via, r.owner)));
         END LOOP;
         -- what the other nodes must have: the roles of the table and the functions of its defaults
         SELECT pg_catalog.array_agg(DISTINCT s.ro) INTO names FROM (
@@ -6931,6 +6991,7 @@ REVOKE ALL ON FUNCTION
     kingres.internal_advance_sequence(regclass, regclass, name, bigint, bool),
     kingres.internal_rename_identity(regclass, name, name),
     kingres.internal_reset_acl(regclass, bool),
+    kingres.internal_untrusted_functions(regclass),
     kingres.internal_table_ddl(regclass, name, bool),
     kingres.internal_check_distributable(regclass, name, regclass, int),
     kingres.internal_copy_routed(regclass, name, name, text, name, int, int)
@@ -7023,6 +7084,7 @@ CREATE FUNCTION kingres.internal_capture_trigger()
     RETURNS trigger
     LANGUAGE plpgsql SECURITY DEFINER
     SET search_path = pg_catalog, kingres, pg_temp
+    SET extra_float_digits = 3
     AS $$
 DECLARE
     v_log  pg_catalog.text := TG_ARGV[0];
@@ -7036,15 +7098,15 @@ BEGIN
     END IF;
     IF TG_OP = 'INSERT' THEN
         EXECUTE pg_catalog.format('INSERT INTO %s (op, %s) SELECT ''I'', %s', v_log, v_cols, v_new)
-            USING pg_catalog.to_jsonb(NEW);
+            USING NEW;
     ELSIF TG_OP = 'DELETE' THEN
         EXECUTE pg_catalog.format('INSERT INTO %s (op, %s) SELECT ''D'', %s', v_log, v_cols, v_new)
-            USING pg_catalog.to_jsonb(OLD);
+            USING OLD;
     ELSE
         v_old := pg_catalog.replace(v_new, '$1', '$2');
         EXECUTE pg_catalog.format('INSERT INTO %s (op, %s) SELECT ''U'', %s UNION ALL SELECT ''D'', %s WHERE (%s) IS DISTINCT FROM (%s)',
                                   v_log, v_cols, v_new, v_old, v_old, v_new)
-            USING pg_catalog.to_jsonb(NEW), pg_catalog.to_jsonb(OLD);
+            USING NEW, OLD;
     END IF;
     RETURN NULL;
 END;
@@ -7160,6 +7222,28 @@ UPDATE kingres.table_operation o
  WHERE o.op_id OPERATOR(pg_catalog.=) p_op;
 $$;
 
+-- The name of a type with its domains taken away: the log of the capture stores the keys in the base type, so that
+-- no CHECK of a domain runs in the capture trigger (which runs with the rights of the extension's owner).
+CREATE FUNCTION kingres.internal_base_type(p_type oid, p_typmod int)
+    RETURNS text
+    LANGUAGE plpgsql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    t pg_catalog.record;
+BEGIN
+    LOOP
+        SELECT y.typtype, y.typbasetype, y.typtypmod INTO t FROM pg_catalog.pg_type y WHERE y.oid OPERATOR(pg_catalog.=) p_type;
+        EXIT WHEN t.typtype OPERATOR(pg_catalog.<>) 'd';
+        p_type := t.typbasetype;
+        IF t.typtypmod OPERATOR(pg_catalog.<>) -1 THEN
+            p_typmod := t.typtypmod;
+        END IF;
+    END LOOP;
+    RETURN pg_catalog.format_type(p_type, p_typmod);
+END;
+$$;
+
 -- The row identity of the log: the columns of the primary key, or of the first unique index over
 -- NOT NULL columns (no predicate, no expression).
 CREATE FUNCTION kingres.internal_log_key(p_relid regclass)
@@ -7168,7 +7252,7 @@ CREATE FUNCTION kingres.internal_log_key(p_relid regclass)
     SET search_path = pg_catalog, kingres, pg_temp
     AS $$
 SELECT pg_catalog.array_agg(a.attname::pg_catalog.text ORDER BY k.ord),
-       pg_catalog.array_agg(pg_catalog.format_type(a.atttypid, a.atttypmod) ORDER BY k.ord)
+       pg_catalog.array_agg(kingres.internal_base_type(a.atttypid, a.atttypmod) ORDER BY k.ord)
   FROM (SELECT i.indrelid, i.indkey
           FROM pg_catalog.pg_index i
          WHERE i.indrelid OPERATOR(pg_catalog.=) p_relid::pg_catalog.oid AND i.indisunique AND i.indpred IS NULL AND i.indisvalid
@@ -7387,7 +7471,7 @@ BEGIN
         EXECUTE pg_catalog.format('REVOKE ALL ON %s FROM PUBLIC', v_log);
     END IF;
     v_cols := (SELECT pg_catalog.string_agg(pg_catalog.format('k%s', g), ', ' ORDER BY g) FROM pg_catalog.generate_series(1, pg_catalog.cardinality(v_keys)) g);
-    v_exprs := (SELECT pg_catalog.string_agg(pg_catalog.format('($1 OPERATOR(pg_catalog.->>) %L)::%s', v_keys[g], v_types[g]), ', ' ORDER BY g)
+    v_exprs := (SELECT pg_catalog.string_agg(pg_catalog.format('($1).%I', v_keys[g]), ', ' ORDER BY g)
                   FROM pg_catalog.generate_series(1, pg_catalog.cardinality(v_keys)) g);
     IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t WHERE t.tgrelid OPERATOR(pg_catalog.=) v_rel::pg_catalog.oid AND t.tgname OPERATOR(pg_catalog.=) v_trg) THEN
         EXECUTE pg_catalog.format('CREATE TRIGGER %I AFTER INSERT OR UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION kingres.internal_capture_trigger(%L, %L, %L)',
@@ -7549,6 +7633,22 @@ BEGIN
 END;
 $$;
 
+-- A chunk of the replay in a session of its own.  A unique index other than the key can fail a chunk: a value that moved
+-- from one row to another (the first row's entry is in a later chunk) is held by the old row of the destination.  Every
+-- row that holds a stale value is in the log (it changed), so the whole backlog replayed in one chunk cannot conflict
+-- with itself: the chunk is repeated with all entries.
+CREATE FUNCTION kingres.internal_replay_run(p_self int, p_op bigint, p_batch int, p_ms int)
+    RETURNS text
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+BEGIN
+    RETURN kingres.internal_exec_scalar(p_self, pg_catalog.format('SELECT kingres.internal_replay_chunk(%s, %s)', p_op, p_batch), p_ms);
+EXCEPTION WHEN unique_violation THEN
+    RETURN kingres.internal_exec_scalar(p_self, pg_catalog.format('SELECT kingres.internal_replay_chunk(%s, %s)', p_op, 2147483647), p_ms);
+END;
+$$;
+
 -- ---- the switch ----
 
 -- Put the old table out of the way, in the transaction of the swap (design, "Switch", step 4): the
@@ -7601,8 +7701,15 @@ BEGIN
     EXECUTE pg_catalog.format('ALTER TABLE %I.%I SET SCHEMA kingres', v_nsp, v_new);
     EXECUTE pg_catalog.format('REVOKE ALL ON kingres.%I FROM PUBLIC', v_new);
     -- (a rename does not change privileges: whoever could read the table could read the copy)
-    FOR r IN SELECT DISTINCT x.grantee FROM pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) x
-              WHERE c.oid OPERATOR(pg_catalog.=) p_relid::pg_catalog.oid AND x.grantee OPERATOR(pg_catalog.<>) c.relowner AND x.grantee OPERATOR(pg_catalog.<>) 0
+    -- table privileges and column privileges (a role may hold only the second: REVOKE ALL on the table takes both)
+    FOR r IN SELECT DISTINCT s.grantee
+               FROM (SELECT x.grantee FROM pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) x
+                      WHERE c.oid OPERATOR(pg_catalog.=) p_relid::pg_catalog.oid AND x.grantee OPERATOR(pg_catalog.<>) c.relowner
+                     UNION
+                     SELECT x.grantee FROM pg_catalog.pg_attribute a, pg_catalog.pg_class c, pg_catalog.aclexplode(a.attacl) x
+                      WHERE a.attrelid OPERATOR(pg_catalog.=) p_relid::pg_catalog.oid AND a.attacl IS NOT NULL
+                        AND c.oid OPERATOR(pg_catalog.=) a.attrelid AND x.grantee OPERATOR(pg_catalog.<>) c.relowner) s
+              WHERE s.grantee OPERATOR(pg_catalog.<>) 0
     LOOP
         EXECUTE pg_catalog.format('REVOKE ALL ON kingres.%I FROM %I', v_new, (SELECT ro.rolname FROM pg_catalog.pg_roles ro WHERE ro.oid OPERATOR(pg_catalog.=) r.grantee));
     END LOOP;
@@ -7771,9 +7878,9 @@ BEGIN
     PERFORM kingres.internal_fault_point('rebuild_verify');
 
     IF NOT pg_catalog.current_setting('kingres_shard.rebuild_verify')::pg_catalog.bool THEN
-        UPDATE kingres.table_operation o SET verified = 'skipped' WHERE o.op_id OPERATOR(pg_catalog.=) p_op;
+        UPDATE kingres.table_operation o SET verified = 'skipped', detail = 'kingres_shard.rebuild_verify is off' WHERE o.op_id OPERATOR(pg_catalog.=) p_op;
     ELSIF v_item.old_name IS NULL OR pg_catalog.to_regclass(v_old) IS NULL THEN
-        UPDATE kingres.table_operation o SET verified = 'skipped' WHERE o.op_id OPERATOR(pg_catalog.=) p_op;
+        UPDATE kingres.table_operation o SET verified = 'skipped', detail = 'the old copy is gone' WHERE o.op_id OPERATOR(pg_catalog.=) p_op;
     ELSE
         SELECT d.n_rows, d.n_hash INTO v_orows, v_ohash FROM kingres.internal_table_digest(v_old::pg_catalog.regclass) d;
         FOR nd IN SELECT n.node_id FROM kingres.node n WHERE n.role OPERATOR(pg_catalog.=) 'primary' AND n.is_active ORDER BY n.node_id LOOP
@@ -7805,7 +7912,8 @@ BEGIN
         END IF;
         IF NOT v_ok AND v_newer OPERATOR(pg_catalog.>) 0 THEN
             -- the table was written to after the swap: the old copy cannot be compared with it
-            UPDATE kingres.table_operation o SET verified = 'skipped', detail = 'the table was written to after the switch; the comparison with the old copy is not possible'
+            UPDATE kingres.table_operation o SET verified = 'skipped',
+                   detail = pg_catalog.format('the table was written to after the switch (%s rows are newer than the swap); the comparison with the old copy is not possible, and it differs: %s', v_newer, v_why)
              WHERE o.op_id OPERATOR(pg_catalog.=) p_op;
         ELSIF NOT v_ok THEN
             UPDATE kingres.table_operation o SET verified = 'failed', detail = v_why, updated_at = pg_catalog.clock_timestamp()
@@ -7834,7 +7942,7 @@ BEGIN
     PERFORM kingres.internal_fault_point('rebuild_cleanup');
 
     DELETE FROM kingres.table_operation_lock l WHERE l.op_id OPERATOR(pg_catalog.=) p_op;
-    PERFORM kingres.internal_op_set(p_op, 'done', NULL);
+    PERFORM kingres.internal_op_set(p_op, 'done', (SELECT o.detail FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) p_op AND o.verified OPERATOR(pg_catalog.=) 'skipped'));
     RETURN 'done';
 END;
 $$;
@@ -8112,7 +8220,7 @@ BEGIN
                 v_prev := -1;
                 v_still := 0;
                 LOOP
-                    v_res := kingres.internal_exec_scalar(v_self, pg_catalog.format('SELECT kingres.internal_replay_chunk(%s, %s)', v_op, v_batch), v_chunk_ms);
+                    v_res := kingres.internal_replay_run(v_self, v_op, v_batch, v_chunk_ms);
                     v_backlog := kingres.internal_exec_scalar(v_self, pg_catalog.format('SELECT pg_catalog.count(*) FROM %s', v_spec OPERATOR(pg_catalog.->>) 'log'), v_ms)::pg_catalog.int8;
                     EXIT WHEN v_backlog OPERATOR(pg_catalog.<=) v_thr;
                     EXIT WHEN v_res::pg_catalog.int4 OPERATOR(pg_catalog.=) 0;
@@ -8143,7 +8251,8 @@ BEGIN
                         v_res := kingres.internal_exec_scalar(v_self, pg_catalog.format('SELECT kingres.internal_switch_attempt(%s)', v_op),
                                                               v_sw_ms OPERATOR(pg_catalog.+) v_ms * 2);
                         v_switched := true;
-                    EXCEPTION WHEN OTHERS THEN
+                    EXCEPTION WHEN OTHERS OR query_canceled THEN
+                        -- (the wait of the call for the attempt that runs out is a query_canceled)
                         GET STACKED DIAGNOSTICS v_state = RETURNED_SQLSTATE, v_diag = PG_EXCEPTION_DETAIL;
                         -- a switch that committed although the answer was lost is a switch
                         SELECT o.phase INTO v_phase FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) v_op;
@@ -8153,7 +8262,7 @@ BEGIN
                               AND EXISTS (SELECT 1 FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) v_op AND o.cancel_requested) THEN
                             -- the attempt saw the request to stop: the loop below sees it too
                             NULL;
-                        ELSIF v_state OPERATOR(pg_catalog.<>) '55P03' THEN
+                        ELSIF v_state OPERATOR(pg_catalog.<>) '55P03' AND v_state OPERATOR(pg_catalog.<>) '23505' THEN
                             RAISE;
                         ELSE
                             v_detail := pg_catalog.format('attempt %s: %s%s', v_att, SQLERRM,
@@ -8166,7 +8275,7 @@ BEGIN
                     EXIT WHEN EXISTS (SELECT 1 FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) v_op AND o.cancel_requested);
                     PERFORM pg_catalog.pg_sleep(0.2 OPERATOR(pg_catalog.+) pg_catalog.random() OPERATOR(pg_catalog.*) 0.5);
                     -- the log grew while the attempt waited
-                    v_res := kingres.internal_exec_scalar(v_self, pg_catalog.format('SELECT kingres.internal_replay_chunk(%s, %s)', v_op, v_batch), v_chunk_ms);
+                    v_res := kingres.internal_replay_run(v_self, v_op, v_batch, v_chunk_ms);
                 END LOOP;
                 IF v_switched THEN
                     PERFORM kingres.internal_fault_point('rebuild_after_switch');
@@ -8185,9 +8294,14 @@ BEGIN
                         USING ERRCODE = 'data_corrupted',
                               HINT = 'The old copy is kept; the data was not rolled back.';
                 END IF;
+                SELECT o.detail INTO v_detail FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) v_op AND o.verified OPERATOR(pg_catalog.=) 'skipped';
+                IF FOUND THEN
+                    RAISE WARNING 'the verification of table operation % was not done: %', v_op, COALESCE(v_detail, 'no reason was recorded')
+                        USING HINT = 'Compare the old copy (kingres.table_operations names it) with the new table before it is dropped.';
+                END IF;
             END IF;
         END LOOP;
-    EXCEPTION WHEN OTHERS THEN
+    EXCEPTION WHEN OTHERS OR query_canceled THEN
         PERFORM kingres.internal_op_unlock(v_op);
         RAISE;
     END;
@@ -8278,7 +8392,7 @@ BEGIN
     v_to := (SELECT s.setting::pg_catalog.int4 FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) 'kingres_shard.node_timeout');
     BEGIN
         PERFORM kingres.internal_exec_scalar(v_self, 'SELECT kingres.recover_prepared_transactions()', v_to * 4000);
-    EXCEPTION WHEN OTHERS THEN
+    EXCEPTION WHEN OTHERS OR query_canceled THEN
         RAISE WARNING 'kingres_shard: recovery of prepared transactions failed: %', SQLERRM;
     END;
 
@@ -8378,12 +8492,12 @@ BEGIN
     v_ms := (SELECT s.setting::pg_catalog.int4 FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) 'kingres_shard.node_timeout') * 6000;
     BEGIN
         v_phase := kingres.table_operation_advance(v_op, 'cleaning');
-    EXCEPTION WHEN OTHERS THEN
+    EXCEPTION WHEN OTHERS OR query_canceled THEN
         -- what did not switch is undone (an operation that switched answers 'switched')
         BEGIN
             PERFORM kingres.internal_exec_scalar(v_self,
                 pg_catalog.format('SELECT kingres.internal_op_undo(%s, ''failed'', %L)', v_op, SQLERRM), v_ms);
-        EXCEPTION WHEN OTHERS THEN
+        EXCEPTION WHEN OTHERS OR query_canceled THEN
             NULL;
         END;
         RAISE;
@@ -8417,11 +8531,11 @@ BEGIN
     v_ms := (SELECT s.setting::pg_catalog.int4 FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) 'kingres_shard.node_timeout') * 6000;
     BEGIN
         v_phase := kingres.table_operation_advance(v_op, 'cleaning');
-    EXCEPTION WHEN OTHERS THEN
+    EXCEPTION WHEN OTHERS OR query_canceled THEN
         BEGIN
             PERFORM kingres.internal_exec_scalar(v_self,
                 pg_catalog.format('SELECT kingres.internal_op_undo(%s, ''failed'', %L)', v_op, SQLERRM), v_ms);
-        EXCEPTION WHEN OTHERS THEN
+        EXCEPTION WHEN OTHERS OR query_canceled THEN
             NULL;
         END;
         RAISE;
@@ -8470,11 +8584,13 @@ REVOKE ALL ON FUNCTION
     kingres.internal_op_set(bigint, text, text),
     kingres.internal_op_spec(bigint, jsonb),
     kingres.internal_log_key(regclass),
+    kingres.internal_base_type(oid, int),
     kingres.internal_begin_table_operation(text, regclass, jsonb),
     kingres.begin_table_operation(text, regclass, jsonb),
     kingres.internal_op_capture(bigint),
     kingres.internal_op_copy_step(bigint),
     kingres.internal_replay_chunk(bigint, int),
+    kingres.internal_replay_run(int, bigint, int, int),
     kingres.internal_retire_table(regclass, bigint),
     kingres.internal_switch_attempt(bigint),
     kingres.internal_table_digest(regclass, xid8),

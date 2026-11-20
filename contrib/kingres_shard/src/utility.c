@@ -1410,9 +1410,8 @@ refuse_trigger_on_reference_table(CreateTrigStmt *stmt)
  * operation itself (forwarded sessions) are not refused.
  */
 static void
-claimed_table_check(RangeVar *rv)
+claimed_relid_check(Oid relid)
 {
-	Oid			relid;
 	Oid			argtypes[1] = {OIDOID};
 	Datum		values[1];
 	int			ret;
@@ -1420,13 +1419,21 @@ claimed_table_check(RangeVar *rv)
 	Oid			save_userid;
 	int			save_sec;
 
-	if (rv == NULL)
-		return;
 	if (!OidIsValid(kingres_shard_catalog_relid("table_operation_item")))
 		return;
-	relid = RangeVarGetRelid(rv, NoLock, true);
 	if (!OidIsValid(relid))
 		return;
+	/* an index is the table's: ALTER INDEX, DROP INDEX */
+	{
+		char		kind = get_rel_relkind(relid);
+
+		if (kind == RELKIND_INDEX || kind == RELKIND_PARTITIONED_INDEX)
+		{
+			relid = IndexGetRelation(relid, true);
+			if (!OidIsValid(relid))
+				return;
+		}
+	}
 	GetUserIdAndSecContext(&save_userid, &save_sec);
 	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, save_sec | SECURITY_LOCAL_USERID_CHANGE);
 	if (SPI_connect() != SPI_OK_CONNECT)
@@ -1457,6 +1464,23 @@ claimed_table_check(RangeVar *rv)
 }
 
 static void
+claimed_table_check(RangeVar *rv)
+{
+	if (rv == NULL)
+		return;
+	claimed_relid_check(RangeVarGetRelid(rv, NoLock, true));
+}
+
+/* the table of an object that DROP names as schema.table.name (a trigger, a rule, a policy) */
+static void
+claimed_table_of_name(List *names)
+{
+	if (names == NIL || list_length(names) < 2)
+		return;
+	claimed_table_check(makeRangeVarFromNameList(list_copy_head(names, list_length(names) - 1)));
+}
+
+static void
 refuse_ddl_on_claimed_table(Node *parsetree)
 {
 	switch (nodeTag(parsetree))
@@ -1473,6 +1497,18 @@ refuse_ddl_on_claimed_table(Node *parsetree)
 		case T_CreateTrigStmt:
 			claimed_table_check(((CreateTrigStmt *) parsetree)->relation);
 			break;
+		case T_AlterObjectSchemaStmt:
+			claimed_table_check(((AlterObjectSchemaStmt *) parsetree)->relation);
+			break;
+		case T_RuleStmt:
+			claimed_table_check(((RuleStmt *) parsetree)->relation);
+			break;
+		case T_CreatePolicyStmt:
+			claimed_table_check(((CreatePolicyStmt *) parsetree)->table);
+			break;
+		case T_AlterPolicyStmt:
+			claimed_table_check(((AlterPolicyStmt *) parsetree)->table);
+			break;
 		case T_TruncateStmt:
 			{
 				ListCell   *lc;
@@ -1486,10 +1522,25 @@ refuse_ddl_on_claimed_table(Node *parsetree)
 				DropStmt   *ds = (DropStmt *) parsetree;
 				ListCell   *lc;
 
-				if (ds->removeType != OBJECT_TABLE)
-					break;
 				foreach(lc, ds->objects)
-					claimed_table_check(makeRangeVarFromNameList((List *) lfirst(lc)));
+				{
+					switch (ds->removeType)
+					{
+						case OBJECT_TABLE:
+						case OBJECT_INDEX:
+							if (IsA(lfirst(lc), List))
+								claimed_table_check(makeRangeVarFromNameList((List *) lfirst(lc)));
+							break;
+						case OBJECT_TRIGGER:
+						case OBJECT_RULE:
+						case OBJECT_POLICY:
+							if (IsA(lfirst(lc), List))
+								claimed_table_of_name((List *) lfirst(lc));
+							break;
+						default:
+							break;
+					}
+				}
 				break;
 			}
 		default:
@@ -1584,7 +1635,7 @@ refuse_inheritance_of_reference_table(Node *parsetree)
 static List *wait_locked = NIL;
 
 static void
-wait_for_table_operation(RangeVar *rv)
+wait_for_table_operation(RangeVar *rv, AclMode needed)
 {
 	Oid			relid;
 	MemoryContext old;
@@ -1594,8 +1645,14 @@ wait_for_table_operation(RangeVar *rv)
 	relid = RangeVarGetRelid(rv, NoLock, true);
 	if (!OidIsValid(relid))
 		return;
+	/*
+	 * Only a role that has the right the statement needs waits: the lock is the one the statement would take
+	 * anyway, but a statement that fails its permission check (a GRANT of a role that may only read) must not
+	 * leave a lock that the role could not take with LOCK TABLE.  needed is the privilege of the statement, 0
+	 * for a statement of the owner.
+	 */
 	if (!object_ownercheck(RelationRelationId, relid, GetUserId()) &&
-		pg_class_aclmask(relid, GetUserId(), ACL_ALL_RIGHTS_RELATION, ACLMASK_ANY) == 0)
+		(needed == 0 || pg_class_aclmask(relid, GetUserId(), needed, ACLMASK_ANY) == 0))
 		return;
 	relid = RangeVarGetRelid(rv, RowExclusiveLock, true);
 	if (!OidIsValid(relid))
@@ -1625,36 +1682,36 @@ wait_for_statement_tables(Node *parsetree)
 	switch (nodeTag(parsetree))
 	{
 		case T_AlterTableStmt:
-			wait_for_table_operation(((AlterTableStmt *) parsetree)->relation);
+			wait_for_table_operation(((AlterTableStmt *) parsetree)->relation, 0);
 			break;
 		case T_RenameStmt:
-			wait_for_table_operation(((RenameStmt *) parsetree)->relation);
+			wait_for_table_operation(((RenameStmt *) parsetree)->relation, 0);
 			break;
 		case T_AlterObjectSchemaStmt:
-			wait_for_table_operation(((AlterObjectSchemaStmt *) parsetree)->relation);
+			wait_for_table_operation(((AlterObjectSchemaStmt *) parsetree)->relation, 0);
 			break;
 		case T_IndexStmt:
-			wait_for_table_operation(((IndexStmt *) parsetree)->relation);
+			wait_for_table_operation(((IndexStmt *) parsetree)->relation, 0);
 			break;
 		case T_CreateTrigStmt:
-			wait_for_table_operation(((CreateTrigStmt *) parsetree)->relation);
+			wait_for_table_operation(((CreateTrigStmt *) parsetree)->relation, ACL_TRIGGER);
 			break;
 		case T_RuleStmt:
-			wait_for_table_operation(((RuleStmt *) parsetree)->relation);
+			wait_for_table_operation(((RuleStmt *) parsetree)->relation, 0);
 			break;
 		case T_CreatePolicyStmt:
-			wait_for_table_operation(((CreatePolicyStmt *) parsetree)->table);
+			wait_for_table_operation(((CreatePolicyStmt *) parsetree)->table, 0);
 			break;
 		case T_AlterPolicyStmt:
-			wait_for_table_operation(((AlterPolicyStmt *) parsetree)->table);
+			wait_for_table_operation(((AlterPolicyStmt *) parsetree)->table, 0);
 			break;
 		case T_CopyStmt:
 			if (((CopyStmt *) parsetree)->is_from)
-				wait_for_table_operation(((CopyStmt *) parsetree)->relation);
+				wait_for_table_operation(((CopyStmt *) parsetree)->relation, ACL_INSERT);
 			break;
 		case T_TruncateStmt:
 			foreach(lc, ((TruncateStmt *) parsetree)->relations)
-				wait_for_table_operation((RangeVar *) lfirst(lc));
+				wait_for_table_operation((RangeVar *) lfirst(lc), ACL_TRUNCATE);
 			break;
 		case T_GrantStmt:
 			{
@@ -1663,7 +1720,8 @@ wait_for_statement_tables(Node *parsetree)
 				if (g->targtype == ACL_TARGET_OBJECT && g->objtype == OBJECT_TABLE)
 					foreach(lc, g->objects)
 						if (IsA(lfirst(lc), RangeVar))
-							wait_for_table_operation((RangeVar *) lfirst(lc));
+							/* the owner, or a role that holds a privilege with the grant option */
+							wait_for_table_operation((RangeVar *) lfirst(lc), ACL_GRANT_OPTION_FOR(ACL_ALL_RIGHTS_RELATION));
 			}
 			break;
 		case T_DropStmt:
@@ -1673,7 +1731,7 @@ wait_for_statement_tables(Node *parsetree)
 				if (ds->removeType == OBJECT_TABLE)
 					foreach(lc, ds->objects)
 						if (IsA(lfirst(lc), List))
-							wait_for_table_operation(makeRangeVarFromNameList((List *) lfirst(lc)));
+							wait_for_table_operation(makeRangeVarFromNameList((List *) lfirst(lc)), 0);
 			}
 			break;
 		default:
