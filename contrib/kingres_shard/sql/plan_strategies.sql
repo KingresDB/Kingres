@@ -178,6 +178,7 @@ UPDATE kingres.bucket_map SET state = 'moving' WHERE bucket IN (6, 7);
 INSERT INTO kingres.bucket_move (colocation_id, bucket, source_group, target_group, phase, started_at, updated_at)
 SELECT 1, b, 0, 1, 'copying', now(), now() FROM generate_series(6, 7) b;
 SELECT * FROM kingres.group_load();
+SELECT * FROM kingres.drain_status();
 SELECT seq, bucket, source_group, target_group FROM kingres.plan_rebalance();
 UPDATE kingres.bucket_map SET state = 'active';
 DELETE FROM kingres.bucket_move;
@@ -185,6 +186,12 @@ UPDATE kingres.node SET is_active = false WHERE group_id = 1;
 SELECT group_id, receiving, available, buckets FROM kingres.group_load();
 SELECT count(*) AS moves_to_a_group_without_a_primary FROM kingres.plan_rebalance();
 UPDATE kingres.node SET is_active = true WHERE group_id = 1;
+-- drained: may not receive, owns nothing, nothing arriving
+SELECT public.setup_nodes(3, ARRAY[2]);
+SELECT public.setup_colo(1, 8, ARRAY['0:4', '1:4']);
+SELECT * FROM kingres.drain_status();
+SELECT public.setup_colo(2, 6, ARRAY['2:6']);
+SELECT group_id, buckets, drained FROM kingres.drain_status() WHERE group_id = 2;
 UPDATE kingres.node SET should_have_shards = false;
 SELECT * FROM kingres.plan_rebalance();
 UPDATE kingres.node SET should_have_shards = true;

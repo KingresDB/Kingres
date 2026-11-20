@@ -2366,6 +2366,31 @@ Tests: the regression test `plan_strategies` (the examples of the design with th
 colocation groups, moving buckets, refusals; the disk-size simulation through `kingres.internal_plan_simulate()` with sizes as data) and `t/201_plan_disk_weights.pl`
 (real sizes on three groups, a plan executed, weights, a drain executed, a group that does not answer, who may plan).
 
+## Several moves at once, and the progress of a move (version 0.8, phase 10, increment P10.4)
+
+Moves of different buckets run together without anything special: every move has its own session, publication, slot, subscription and copy tables, and the
+only shared step, the switch, locks the parents of the colocation group's tables on the two nodes with `NOWAIT` and retries within `move_switch_attempts`.
+`t/202_concurrent_moves.pl` runs four moves at once with readers on three nodes: moves of one colocation group between disjoint pairs of groups, moves of
+two colocation groups between the same groups, two moves of one colocation group with the same source and target (each completes or fails cleanly and
+succeeds when started again), the same bucket twice (the second is refused), and checks every row and `check_cluster()` afterwards. A reader that overlaps a
+switch may get the retryable `KS001`; it never gets a wrong answer. The scheduler of the control plane still keeps moves that would lock the same
+tables on the same node apart (design 6.3), because a retry is a cost, not because it is unsafe.
+
+What a move costs the nodes, per move: on the map group primary the session that runs `move_bucket()` and its control sessions; on the source a WAL sender,
+a replication slot and a publication; on the target a subscription with its apply worker and, during the copy, a table synchronization worker. So
+`max_connections`, `max_wal_senders`, `max_replication_slots`, `max_logical_replication_workers` and `max_worker_processes` have to leave room for the
+number of moves that are allowed at once (`rebalance.maxConcurrentMoves`, default 4) on top of what the databases use; a node that runs out of
+connections makes the move fail with "too many clients" and the move is undone.
+
+- **`kingres.move_progress()`** (superusers; it asks the nodes) returns one row per unfinished move: `move_id`, `colocation_id`, `bucket`, `source_group`,
+  `target_group`, `phase`, `detail`, `started_at`, `updated_at`, `source_bytes` (the bucket's partitions on the source), `target_bytes` (the copy on the target;
+  NULL for either when the node does not answer) and `percent` (preparing 0; copying: the target's bytes over the source's, at most 89; catching_up 90;
+  switching 95; cleaning 100).
+- **`kingres.drain_status()`** (read only) returns one row per shard group: `receiving`, `available`, `buckets` (the map's), `arriving` and `leaving` (unfinished moves) and
+  `drained` (it may not receive, owns no bucket and none is arriving), which is what a drain waits for before the group is removed.
+
+Tests: `t/202_concurrent_moves.pl`, `t/203_move_progress.pl`, and `drain_status` in the regression test `plan_strategies`.
+
 ## High availability (version 0.5, phase 5)
 
 Version 0.5 is the part of high availability that lives in the extension

@@ -1145,6 +1145,103 @@ $$;
 COMMENT ON FUNCTION kingres.plan_rebalance(text, float8, int, bool, jsonb, int[], int[]) IS
     'The plan of a rebalance by simulation: by_bucket_count or by_disk_size, a threshold, drain_only, the load of other databases, groups to treat as not receiving; read only';
 
+-- ---------------------------------------------------------------------------
+-- P10.4: several moves at once (design/shard-phase10.md, sections 6.3 and 8.5).  Moves of different buckets never needed anything from the
+-- extension to run together (t/202 proves it, with readers running); what the scheduler of the control plane still lacks is one call that says
+-- how far every unfinished move is.
+-- ---------------------------------------------------------------------------
+
+-- The unfinished moves with the sizes that say how far each is: the bytes of the bucket's partitions on the source and the bytes of the
+-- standalone copy on the target (both read from the nodes; NULL when a node does not answer).  percent follows the design: preparing 0, copying the
+-- target's size over the source's (at most 89), catching_up 90, switching 95, cleaning 100.  Superusers only (it asks the nodes).
+CREATE FUNCTION kingres.move_progress()
+    RETURNS TABLE (move_id bigint, colocation_id int, bucket int, source_group int, target_group int, phase text, detail text,
+                   started_at timestamptz, updated_at timestamptz, source_bytes bigint, target_bytes bigint, percent int)
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    m        pg_catalog.record;
+    v_node   pg_catalog.int4;
+    v_src    pg_catalog.int8;
+    v_tgt    pg_catalog.int8;
+    v_pct    pg_catalog.int4;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    FOR m IN SELECT b.* FROM kingres.bucket_move b
+              WHERE b.phase IN ('preparing', 'copying', 'catching_up', 'switching', 'cleaning') ORDER BY b.move_id
+    LOOP
+        v_src := NULL; v_tgt := NULL;
+        v_node := kingres.internal_group_node(m.source_group);
+        IF v_node IS NOT NULL THEN
+            BEGIN
+                v_src := (kingres.internal_node_exec(v_node,
+                    pg_catalog.format('SELECT COALESCE(pg_catalog.sum(b.partition_size), 0)::pg_catalog.int8 FROM kingres.buckets b JOIN kingres.dist_table d ON d.relid OPERATOR(pg_catalog.=) b.table_name WHERE d.colocation_id OPERATOR(pg_catalog.=) %s AND b.bucket OPERATOR(pg_catalog.=) %s AND b.partition_size IS NOT NULL',
+                                      m.colocation_id, m.bucket), 10000) OPERATOR(pg_catalog.->) 0 OPERATOR(pg_catalog.->>) 0)::pg_catalog.int8;
+            EXCEPTION WHEN OTHERS THEN
+                v_src := NULL;
+            END;
+        END IF;
+        v_node := kingres.internal_group_node(m.target_group);
+        IF v_node IS NOT NULL THEN
+            BEGIN
+                v_tgt := (kingres.internal_node_exec(v_node,
+                    pg_catalog.format('SELECT COALESCE(pg_catalog.sum(pg_catalog.pg_total_relation_size(c.oid)), 0)::pg_catalog.int8 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_description d ON d.objoid OPERATOR(pg_catalog.=) c.oid AND d.classoid OPERATOR(pg_catalog.=) ''pg_catalog.pg_class''::pg_catalog.regclass WHERE c.relkind OPERATOR(pg_catalog.=) ''r'' AND d.description OPERATOR(pg_catalog.=) ''kingres_shard bucket move %s''',
+                                      m.move_id), 10000) OPERATOR(pg_catalog.->) 0 OPERATOR(pg_catalog.->>) 0)::pg_catalog.int8;
+            EXCEPTION WHEN OTHERS THEN
+                v_tgt := NULL;
+            END;
+        END IF;
+        v_pct := CASE m.phase
+                   WHEN 'preparing' THEN 0
+                   WHEN 'copying' THEN CASE WHEN COALESCE(v_src, 0) OPERATOR(pg_catalog.>) 0 AND v_tgt IS NOT NULL
+                                            THEN (CASE WHEN v_tgt * 100 / v_src OPERATOR(pg_catalog.>) 89 THEN 89 ELSE (v_tgt * 100 / v_src)::pg_catalog.int4 END) ELSE 0 END
+                   WHEN 'catching_up' THEN 90
+                   WHEN 'switching' THEN 95
+                   ELSE 100 END;
+        move_id := m.move_id; colocation_id := m.colocation_id; bucket := m.bucket;
+        source_group := m.source_group; target_group := m.target_group; phase := m.phase; detail := m.detail;
+        started_at := m.started_at; updated_at := m.updated_at; source_bytes := v_src; target_bytes := v_tgt; percent := v_pct;
+        RETURN NEXT;
+    END LOOP;
+END;
+$$;
+COMMENT ON FUNCTION kingres.move_progress() IS
+    'The unfinished bucket moves with the bytes of the bucket on the source and of its copy on the target, and a percent by phase; superusers only (it asks the nodes)';
+REVOKE ALL ON FUNCTION kingres.move_progress() FROM PUBLIC;
+
+-- What a drain waits for, one row per shard group: the buckets the map gives it, the buckets that are on their way to it (unfinished moves with the group as
+-- target) and away from it, and whether the group is drained: it may not receive buckets, owns none and none is arriving.  A group with a bucket that is
+-- leaving still owns it until the switch.  Read only.
+CREATE FUNCTION kingres.drain_status()
+    RETURNS TABLE (group_id int, receiving bool, available bool, buckets int, arriving int, leaving int, drained bool)
+    LANGUAGE sql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+WITH grp AS (
+    SELECT n.group_id,
+           pg_catalog.bool_or(n.role OPERATOR(pg_catalog.=) 'primary' AND n.is_active) AS avail,
+           pg_catalog.bool_or(n.role OPERATOR(pg_catalog.=) 'primary' AND n.is_active AND n.should_have_shards) AS recv
+      FROM kingres.node n GROUP BY n.group_id
+    UNION
+    SELECT m.group_id, false, false FROM kingres.bucket_map m WHERE NOT EXISTS (SELECT 1 FROM kingres.node n WHERE n.group_id OPERATOR(pg_catalog.=) m.group_id)
+),
+mv AS (
+    SELECT b.source_group, b.target_group FROM kingres.bucket_move b WHERE b.phase IN ('preparing', 'copying', 'catching_up', 'switching')
+)
+SELECT g.group_id, COALESCE(g.recv, false), COALESCE(g.avail, false),
+       (SELECT pg_catalog.count(*) FROM kingres.bucket_map m WHERE m.group_id OPERATOR(pg_catalog.=) g.group_id)::pg_catalog.int4,
+       (SELECT pg_catalog.count(*) FROM mv WHERE mv.target_group OPERATOR(pg_catalog.=) g.group_id)::pg_catalog.int4,
+       (SELECT pg_catalog.count(*) FROM mv WHERE mv.source_group OPERATOR(pg_catalog.=) g.group_id)::pg_catalog.int4,
+       NOT COALESCE(g.recv, false)
+         AND NOT EXISTS (SELECT 1 FROM kingres.bucket_map m WHERE m.group_id OPERATOR(pg_catalog.=) g.group_id)
+         AND NOT EXISTS (SELECT 1 FROM mv WHERE mv.target_group OPERATOR(pg_catalog.=) g.group_id)
+  FROM (SELECT DISTINCT ON (x.group_id) x.* FROM grp x ORDER BY x.group_id) g
+ ORDER BY g.group_id
+$$;
+COMMENT ON FUNCTION kingres.drain_status() IS
+    'Per shard group: the buckets it owns, the buckets arriving and leaving, and whether it is drained (may not receive, owns none, none arriving); read only';
+
 -- ===========================================================================
 -- END OF SECTION P10
 -- ===========================================================================
