@@ -191,12 +191,13 @@ func (r *Runner) Decide(ctx context.Context, req Request) (journal.Journal, erro
 		return journal.Journal{}, &Refusal{Code: "quorum_unavailable", Status: 503, Message: "This server cannot reach a majority of the servers; the map group is not promoted from a minority."}
 	}
 	if r.P.Live(ctx, req.OldServer) == "live" {
-		// The old server answers the liveness view: a partition on the leader's side, or a request of an operator for a switchover of the
-		// leader. Only an operator may go on: an automatic start for a server that is heard is refused (F4-05). B3 asks it to stop first.
+		// The old server answers the liveness view: a partition on the leader's side, or a request for a switchover of the leader. Neither is built
+		// (design, "the map group with a live old leader"): the calls that stop the old primary are the leader's, and this server is not the leader,
+		// so nothing here may pretend to ask it. An automatic start for a server that is heard stays the conflict of F4-05.
 		if nonEmpty(req.Trigger, "manual") == "automatic" {
 			return journal.Journal{}, &Refusal{Code: "conflict", Status: 409, Message: "The old server of the map group is live for this server; an automatic failover does not start."}
 		}
-		r.logf("mapgroup: the old server %s is live for this server; B3 asks it to demote", req.OldServer)
+		return journal.Journal{}, &Refusal{Code: "unsupported_operation", Status: 422, Message: "The failover of the map group while its server is alive is not supported yet; stop that server, or use the documented SQL of the sharding extension."}
 	}
 	id := strconv.FormatInt(r.now().UnixNano(), 36)
 	return r.Journal.Begin(id, req.OldServer, term, nonEmpty(req.Trigger, "manual"), req.RequestedBy, req.AllowDataLoss)
@@ -323,14 +324,11 @@ func (r *Runner) freeze(ctx context.Context, j journal.Journal) (bool, error) {
 	return false, r.Journal.Event(journal.StepFreeze, "frozen", nil)
 }
 
-// B3: as F3. A old server that answers is asked to demote first (design 3.5); then the fence lease is taken from a majority of all
-// the servers, which proves that a majority talks to this server, that the old holder's lease ran out at a majority and that it
-// can never be granted one again.
+// B3: as F3. The fence lease is taken from a majority of all the servers, which proves that a majority talks to this server, that the
+// old holder's lease ran out at a majority and that it can never be granted one again. An old server that is heard is not asked to
+// demote: the calls that stop a primary are the leader's, this server is not the leader, and Decide refuses a live old server until the
+// design "the map group with a live old leader" is built.
 func (r *Runner) takeFence(ctx context.Context, j journal.Journal) (bool, error) {
-	if st, err := r.P.State(ctx, j.OldServer); err == nil && len(st.OutOfRecovery()) > 0 {
-		ans, derr := r.P.Demote(ctx, j.OldServer, failover.DemoteRequest{Group: Group, Mode: "immediate", ExpectedTerm: j.Term, TransferTo: r.P.Self()})
-		_ = r.Journal.Event(journal.StepLease, "demote", map[string]any{"stopped": ans.Stopped, "transferred": ans.Transferred, "error": errText(derr)})
-	}
 	members, err := r.P.Members(ctx)
 	if err != nil {
 		return false, err

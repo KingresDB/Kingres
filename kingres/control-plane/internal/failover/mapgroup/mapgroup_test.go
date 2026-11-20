@@ -416,16 +416,21 @@ func TestDecideRefusals(t *testing.T) {
 	}
 }
 
-func TestAnOldServerThatAnswersIsAskedToDemoteFirst(t *testing.T) {
+func TestAnOldServerThatAnswersIsNotAskedToDemoteAndTheRequestIsRefused(t *testing.T) {
 	w := newWorld()
 	w.oldAlive = true
 	w.live["s1"] = "live"
-	r, _ := w.runner(t)
-	if _, err := r.Run(context.Background(), req()); err != nil {
-		t.Fatal(err)
+	r, js := w.runner(t)
+	_, err := r.Run(context.Background(), req())
+	var ref *Refusal
+	if !errors.As(err, &ref) || ref.Code != "unsupported_operation" || ref.Status != 422 {
+		t.Fatalf("a manual request for a live old server: %v", err)
 	}
-	if w.index("demote s1 to=s2") < 0 || w.index("demote s1 to=s2") > w.index("lease-fence s2") {
-		t.Fatalf("log:\n%s", strings.Join(w.log, "\n"))
+	if js.Active() {
+		t.Fatal("a refused request began a journal")
+	}
+	if w.count("demote") != 0 || w.count("lease-") != 0 {
+		t.Fatalf("a call was made to the live old server or a lease was taken:\n%s", strings.Join(w.log, "\n"))
 	}
 }
 
@@ -523,7 +528,7 @@ func tempDir(t *testing.T) string {
 	return d
 }
 
-// F4-05. An automatic start for an old server that this server hears is refused; an operator's request is not.
+// F4-05. An automatic start for an old server that this server hears is refused (conflict), and so is an operator's (unsupported_operation) until the live old leader is built.
 func TestAnAutomaticStartForALiveOldServerIsRefused(t *testing.T) {
 	w := newWorld()
 	w.live["s1"] = "live"
@@ -535,8 +540,9 @@ func TestAnAutomaticStartForALiveOldServerIsRefused(t *testing.T) {
 	if !errors.As(err, &ref) || ref.Code != "conflict" {
 		t.Fatalf("an automatic start for a live server: %v", err)
 	}
-	if _, err := r.Decide(context.Background(), req()); err != nil {
-		t.Fatalf("a manual request for a live server: %v", err)
+	_, err = r.Decide(context.Background(), req())
+	if !errors.As(err, &ref) || ref.Code != "unsupported_operation" {
+		t.Fatalf("a manual request for a live server is refused until it is built: %v", err)
 	}
 }
 
