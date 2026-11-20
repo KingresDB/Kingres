@@ -29,3 +29,14 @@ Standby management and failover are implemented in `kingresd`. Two primaries for
 - **Patroni with etcd, as in ADR 0012.** Proven, but it duplicates the instance manager and adds two runtimes to the package.
 - **Embedding etcd in kingresd and writing only the failover logic.** It would give a proven consensus store, at the cost of managing etcd membership inside the product; the lease protocol needs only "a majority acknowledged within a time bound", which the internal API already provides.
 - **Manual failover only.** Simpler and safe, but the roadmap requires automatic failover with safety rules.
+
+## Update 2026-11-21: what the lease became in parts 1 and 2
+
+The decision stands. What changed in the mechanism, so that the ADR matches the code (`internal/lease`, `docs/design/ha-phase5-part2.md`):
+
+- A lease can be held by a server that does not run the primary of the group: the **fence lease** of a failover is adopted (`Adopt`) by the leader and handed to the server of the standby (`Transfer`, `transferTo`), and the old holder can `Release` it at a clean stop. An adopted lease guards no instance until it is **attached** to the promoted one (`Attach`); an attached adoption is never forgotten by a late release of a failed task.
+- The grantors answer a request of another holder with the time to wait: the old lease plus the safety margin. The margin (`marginMs`) is part of `GET /lease/state` and the servers must agree on it.
+- A primary that was stopped without its lease is kept down by **markers** in the lease directory (`fenced`, `waitlease`, `relinquished`), per group, and by the start gate of the instance manager; the lease rounds start it again when they hold the lease and remove the markers. A planned switchover's rollback (`Resume`) writes the wait marker and does not start anything itself.
+- A promotion carries a proof: the catalog term, the fence of the task run and, for a planned switchover, the shutdown checkpoint that `switchover_verify` checks on the standby before `pg_promote`.
+- The read of the topology in a renewal round is bounded by one renewal period (a catalog that does not answer does not keep the rounds from being asked), a round is decided by the first majority and never waits for the slowest grantor, and the log of a lost lease says what the rounds saw.
+- Not changed: the lease is still the proof. The stop of an instance, the term and the fence are what a task checks around it, not instead of it.
