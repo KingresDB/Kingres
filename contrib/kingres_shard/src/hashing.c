@@ -96,7 +96,10 @@ kingres_shard_hash_of_value(Oid column_type, Oid collation, Oid value_type,
 int
 kingres_shard_bucket_for_hash(const KsColocation *coloc, uint64 hash)
 {
-	return kingres_shard_coloc_bucket_of_hash(coloc, hash);
+	/* the slot table of the layout: the same lookup PostgreSQL does with boundinfo->indexes for partitions of several moduli */
+	if (coloc->max_modulus < 1)
+		return -1;
+	return coloc->slot_bucket[hash % (uint64) coloc->max_modulus];
 }
 
 /*

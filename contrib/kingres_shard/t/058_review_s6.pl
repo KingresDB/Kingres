@@ -165,7 +165,7 @@ sub q1 { my ($n, $sql) = @_; return $n->safe_psql('postgres', $sql); }
 		UPDATE kingres.cluster_secret SET secret = decode(repeat('ab', 40), 'hex');
 	});
 	my $out = q1($n1, q{SELECT check_name || '|' || node_id || '|' || detail FROM kingres.check_cluster() ORDER BY 1});
-	like($out, qr/^extension_version_differs\|2\|the node runs kingres_shard 0\.4, this node runs kingres_shard 0\.7;/m,
+	like($out, qr/^extension_version_differs\|2\|the node runs kingres_shard 0\.4, this node runs kingres_shard 0.8;/m,
 		'S6-06: check_cluster names both versions of the node that refuses the session');
 	unlike($out, qr/node_unreachable/, 'S6-06: and does not call the node unreachable');
 	my $bucket = q1($n1, q{SELECT min(bucket) FROM kingres.bucket_map WHERE colocation_id = 1 AND group_id = 0});
@@ -194,7 +194,7 @@ sub q1 { my ($n, $sql) = @_; return $n->safe_psql('postgres', $sql); }
 		ALTER EXTENSION kingres_shard ADD FUNCTION kingres.internal_local_state();
 	});
 	$out = q1($n1, q{SELECT detail FROM kingres.check_cluster() WHERE check_name = 'extension_version_differs' AND node_id = 3});
-	like($out, qr/^the node runs a kingres_shard that does not report its version, this node runs kingres_shard 0\.7;/,
+	like($out, qr/^the node runs a kingres_shard that does not report its version, this node runs kingres_shard 0.8;/,
 		'S6-10: the message about a node that reports no version reads as a sentence');
 	unlike($out, qr/kingres_shard an older version/, 'S6-10: not "kingres_shard an older version"');
 }

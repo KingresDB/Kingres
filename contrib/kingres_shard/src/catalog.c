@@ -1091,20 +1091,6 @@ kingres_shard_bucket_group(const KsColocation *coloc, int bucket)
 }
 
 /*
- * The bucket that holds a hash value: the one that covers slot hash % max_modulus
- * (the same lookup PostgreSQL does with boundinfo->indexes for a table with partitions of
- * several moduli).  -1 when the layout has a gap there, which only a broken catalog has.
- * The one place that turns a hash into a bucket number (hashing.c calls it).
- */
-int
-kingres_shard_coloc_bucket_of_hash(const KsColocation *coloc, uint64 hash)
-{
-	if (coloc->max_modulus < 1)
-		return -1;
-	return coloc->slot_bucket[hash % (uint64) coloc->max_modulus];
-}
-
-/*
  * Making a layout: kingres_shard_coloc_begin() allocates it with no bucket, kingres_shard_coloc_add()
  * records one row of bucket_map, kingres_shard_coloc_finish() lists the buckets.  A row that cannot
  * belong (modulus that is not a divisor of max_modulus, remainder not below the modulus, a number

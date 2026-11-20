@@ -201,7 +201,7 @@ sub slurp
 	$n2->safe_psql('postgres', "UPDATE pg_catalog.pg_extension SET extversion = '0.4' WHERE extname = 'kingres_shard'");
 	my ($rc, $o, $e) = run_sql($n1, "\\set VERBOSITY verbose\nSELECT count(*) FROM public.t");
 	isnt($rc, 0, 'a node of another version: the scan fails');
-	like($e, qr/runs kingres_shard 0\.4, this node runs 0\.7/, 'and names the node and the versions');
+	like($e, qr/runs kingres_shard 0\.4, this node runs 0.8/, 'and names the node and the versions');
 	unlike($e, qr/KS001/, 'it is not the retryable error');
 	$n2->safe_psql('postgres', "UPDATE pg_catalog.pg_extension SET extversion = '0.8' WHERE extname = 'kingres_shard'");
 	is($n1->safe_psql('postgres', 'SELECT count(*) FROM public.t'), $total, 'with the version back the scan answers');

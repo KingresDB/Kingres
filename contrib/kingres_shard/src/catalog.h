@@ -138,7 +138,6 @@ extern int	kingres_shard_coloc_nbuckets(const KsColocation *coloc);
 extern int	kingres_shard_coloc_bucket(const KsColocation *coloc, int i);
 extern int	kingres_shard_bucket_modulus(const KsColocation *coloc, int bucket);
 extern int	kingres_shard_bucket_group(const KsColocation *coloc, int bucket);
-extern int	kingres_shard_coloc_bucket_of_hash(const KsColocation *coloc, uint64 hash);
 extern const KsNode *kingres_shard_group_primary(int group_id);
 extern const KsNode *kingres_shard_node_by_id(int node_id);
 extern Oid	kingres_shard_catalog_relid(const char *relname);
