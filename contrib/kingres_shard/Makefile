@@ -47,10 +47,11 @@ DATA = kingres_shard--0.1.sql kingres_shard--0.2.sql kingres_shard--0.3.sql \
 	kingres_shard--0.4.sql kingres_shard--0.1--0.2.sql kingres_shard--0.2--0.3.sql \
 	kingres_shard--0.3--0.4.sql kingres_shard--0.5.sql kingres_shard--0.4--0.5.sql \
 	kingres_shard--0.6.sql kingres_shard--0.5--0.6.sql \
-	kingres_shard--0.6--0.7.sql kingres_shard--0.7.sql
+	kingres_shard--0.6--0.7.sql kingres_shard--0.7.sql \
+	kingres_shard--0.7--0.8.sql kingres_shard--0.8.sql
 
 REGRESS = version catalog bucket_for bucket_lookup distribute distribute_rows sequence_options online_refusals routing_single security \
-	utility_guard routing_decisions reference ddl_single rebalance_plan bulk_plans pushdown_shippable pushdown_plans upgrade pg_facts
+	utility_guard routing_decisions reference ddl_single rebalance_plan bulk_plans pushdown_shippable pushdown_plans schema_catalog upgrade pg_facts
 # The tests need the extension preloaded (see kingres_shard.conf).
 REGRESS_OPTS = --temp-config $(srcdir)/kingres_shard.conf
 TAP_TESTS = 1

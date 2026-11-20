@@ -8,7 +8,7 @@ node as reference tables, and makes every statement correct on a cluster with
 several groups: a statement that touches one key goes to the group that owns
 it, and a statement that spans groups is answered by reading the other groups.
 
-This is version 0.7 (0.7 is the table lifecycle of phase 9 on top of 0.6; 0.6 is the version of phase 2b; 0.3 added moving buckets, phase 2a made every statement correct, 0.4 is the fix round of the reviews of 0.2 and 0.3, 0.5 is high availability: standby nodes, `promote_node`, prepared transactions across a failover, distributed deadlock detection and coordinated restore points; see "High availability" below; 0.6 is phase 2b and adds no SQL object, see "Installation" for why the version is raised). Phase 2b makes the common
+This is version 0.8 (0.8 is distributed schemas, phase 11, and elasticity, phase 10; 0.7 is the table lifecycle of phase 9 on top of 0.6; 0.6 is the version of phase 2b; 0.3 added moving buckets, phase 2a made every statement correct, 0.4 is the fix round of the reviews of 0.2 and 0.3, 0.5 is high availability: standby nodes, `promote_node`, prepared transactions across a failover, distributed deadlock detection and coordinated restore points; see "High availability" below; 0.6 is phase 2b and adds no SQL object, see "Installation" for why the version is raised). Phase 2b makes the common
 statements fast. The designs are in
 [`kingres/docs/design/shard-mvp.md`](../../kingres/docs/design/shard-mvp.md)
 (phase 1) and
@@ -296,7 +296,7 @@ PROVE_TESTS=t/013_dist_scan.pl kingres/dev/ext.sh kingres_shard tap
   second, fictitious shard group; `routing_decisions`: collations, functions
   and other nested contexts, forwarded sessions, decided with `EXPLAIN`;
   `reference`: reference tables on one node; `upgrade`: `ALTER EXTENSION ...
-  UPDATE` from 0.1, 0.2, 0.3, 0.4, 0.5 and 0.6 against a fresh 0.7 install; the same on both majors:
+  UPDATE` from 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 and 0.7 against a fresh 0.8 install; the same on both majors:
   the script of 0.3 names a column of `pg_stat_subscription_stats` that PostgreSQL 19
   renamed, so on 19 it creates `kingres.internal_move_subscription_status()` with its
   body check off and `ALTER EXTENSION ... UPDATE` to 0.4 replaces it with a body that
@@ -1852,6 +1852,36 @@ code allows, so any user may set it.  Comparing `kingres_sketch.self_test()` and
 `check_cluster` (phase 12); this step checks the version only.  Objects of an extension are allowed in the fragment of a closed
 query and of a partial aggregation only; the scan, the writes and the colocated `INSERT ... SELECT` never ship them.
 
+
+## Distributed schemas (phase 11, version 0.8)
+
+Design: [`shard-phase11.md`](../../kingres/docs/design/shard-phase11.md).  A **distributed schema** is a schema whose tables all live
+in one shard group (one tenant, or one microservice, per schema).  The design is built in increments; this is what exists so far.
+
+**Increment 1: the catalog, the views and the inventory.**  No statement is routed by schema and no schema is made distributed by the
+product yet: these are the objects the later increments use, tested with rows made by hand.
+
+- `kingres.colocation.kind` is `hash` (the buckets of hash-distributed tables) or `schema` (one bucket: the one group that holds a distributed
+  schema; `dist_column_type` is then null and `bucket_count` is 1).  `kingres.dist_table.method` gains `schema` (a table of a distributed
+  schema: no distribution column, the colocation group of the schema).
+- `kingres.dist_schema`: one row per distributed schema (`nsp` as a node-local `regnamespace`, the colocation group, `ship_functions`).
+  The catalog snapshot carries it by schema name, so a node that is given a snapshot must have the schema (an error names it).
+- `kingres.sharding_settings`: one row, the `mode` of the database (`row`, the default and the mode of every database before 0.8; `schema`;
+  `both`) and `distribute_new_schemas`.  `kingres.set_sharding_mode(mode, distribute_new_schemas)` changes it atomically (map group primary,
+  superuser): `row` to `both` and `schema` to `both` always; `both` or `schema` to `row` while a distributed schema exists, and `both` or `row`
+  to `schema` while a hash-distributed table exists, are refused with the schemas or tables named; `distribute_new_schemas` needs `schema` or `both`.
+- The delta functions (node-local, superuser, the same text on every node in one transaction in the later increments):
+  `internal_register_schema`, `internal_register_schema_table`, `internal_unregister_schema_table`, `internal_unregister_schema`,
+  `internal_set_schema_group`.  Dropping a registered schema forgets its rows (`kingres.forget_dropped_tables`).
+- `kingres.schemas`: one row per distributed schema with its owner, group and node, state, number of tables, size (known on the node of the owner
+  group only) and the target group of a running move.  `kingres.buckets` shows a schema table with bucket 0 and no partition.
+- `kingres.schema_inventory(schema)`: every object of the schema with `supported` and the reason when it is not (a hash or reference
+  table, an unlogged table, a materialized view, a rule, row-level security, extended statistics, a publication, an aggregate, a range type, a foreign key or an
+  inheritance across the border of the schema, a view that reads a table of another schema that is not a reference table, a `kingres_ledger` table, and a
+  system or already distributed schema).  It reads the catalog only and any role may call it.
+
+The SQL of phase 11 is a marked section ("PHASE 11") at the end of `kingres_shard--0.7--0.8.sql` and `kingres_shard--0.8.sql`.  The version handshake
+of `internal_check_node_versions()` asks for 0.8.
 
 ## Limitations in phase 2a
 

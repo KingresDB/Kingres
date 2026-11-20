@@ -273,7 +273,7 @@ for my $upto (undef, 'shadow', 'copying', 'catching_up')
 	like($err, qr/node 3 .*0\.6/s, 'handshake: a node with another version is named and the operation does not start');
 	is(q1($n1, "SELECT count(*) FROM kingres.table_operation WHERE spec->>'table' = 'hv'"), '0', 'handshake: nothing is recorded');
 	is(leftovers(), '0', 'handshake: nothing is left');
-	$n3->safe_psql('postgres', "UPDATE pg_extension SET extversion = '0.7' WHERE extname = 'kingres_shard'");
+	$n3->safe_psql('postgres', "UPDATE pg_extension SET extversion = '0.8' WHERE extname = 'kingres_shard'");
 	my ($rc, $o, $e) = run_sql($n1, "SELECT kingres.create_distributed_table_concurrently('public.hv', 'tenant')");
 	is($rc, 0, 'handshake: with the version back the operation runs') or diag($e);
 	$n1->safe_psql('postgres', 'SELECT kingres.cleanup_table_operations(true)');

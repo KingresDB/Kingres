@@ -64,6 +64,8 @@ install_data(
   'kingres_shard--0.5--0.6.sql',
   'kingres_shard--0.6--0.7.sql',
   'kingres_shard--0.7.sql',
+  'kingres_shard--0.7--0.8.sql',
+  'kingres_shard--0.8.sql',
   kwargs: contrib_data_args,
 )
 
@@ -91,6 +93,7 @@ tests += {
       'bulk_plans',
       'pushdown_shippable',
       'pushdown_plans',
+      'schema_catalog',
       'upgrade',
       'pg_facts',
     ],

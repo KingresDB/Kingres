@@ -68,7 +68,7 @@ my $x = make_node('rsx');
 q1($x, 'CREATE DATABASE restored1');
 my ($rc, $out, $err) = run_sql($x, '', extra_params => [ '-d', 'restored1', '-v', 'ON_ERROR_STOP=1', '-f', $clean ]);
 is($rc, 0, 'step 1: the dump is restored into a database that has no kingres_shard') or diag $err;
-is(q1($x, q{SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard'}, db => 'restored1'), '0.7', 'step 1: the dump made the extension');
+is(q1($x, q{SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard'}, db => 'restored1'), '0.8', 'step 1: the dump made the extension');
 is(q1($x, 'SELECT count(*) FROM kingres.node', db => 'restored1'), '0', 'step 1: it has no catalog');
 is(q1($x, 'SELECT count(*) FROM public.d', db => 'restored1'), $local2, 'step 1: the rows of the node are there');
 is(q1($x, q{SELECT count(*) FROM pg_inherits WHERE inhparent = 'public.d'::regclass}, db => 'restored1'), '1', 'step 1: the partitions are tables that the restored d has as partitions, with no cluster behind them');
