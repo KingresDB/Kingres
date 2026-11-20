@@ -1883,6 +1883,27 @@ product yet: these are the objects the later increments use, tested with rows ma
 The SQL of phase 11 is a marked section ("PHASE 11") at the end of `kingres_shard--0.7--0.8.sql` and `kingres_shard--0.8.sql`.  The version handshake
 of `internal_check_node_versions()` asks for 0.8.
 
+**Increment 2: reading a table of a distributed schema that another group holds, and the defence against reading the empty copy.**  The tables
+of a distributed schema exist on every node; the rows are on the one node (shard group) that holds the schema, the owner, and the copy on every
+other node is an empty "shell".  The catalog cache keeps these tables apart from the hash-distributed ones (`schema_tables`), so no code written
+for hash tables sees them.  Still no statement is routed whole and no schema is made distributed by the product: the rows of `dist_schema`
+and `dist_table` are made by hand with the delta functions, as the tests do.
+
+- A `SELECT` (or a read inside any statement) that names a shell is planned with the distributed scan in its single-source form: no local part,
+  one fragment `SELECT <columns> FROM <table> AS ks_t WHERE <shippable restrictions>` to the owner, the restrictions applied again here, the
+  placement checked before and after the cursor is declared.  Joins with other schemas, with local tables, with hash and reference tables,
+  subqueries, CTEs, aggregates, windows, parameters and generic plans are planned by PostgreSQL above the scan as for any scan.  On the
+  owner the table is read by the planner of PostgreSQL alone.
+- A write whose target is a shell is refused ("is not supported from shard group N yet", with the node to run it on in the hint); so are
+  `COPY` of the relation (`COPY t TO` would answer with no rows, `COPY t FROM` would write the empty copy), `FOR UPDATE`, and a write of a hash-distributed table
+  that reads a shell.  `COPY (SELECT ...) TO` works, and a read of a shell into a local table (`CREATE TABLE AS`, `INSERT ... SELECT`) works.  The same limit as for a hash
+  table holds: an `UPDATE` or `DELETE` that reads a shell in `FROM`, `USING` or a semi join needs the row identifier of the table it does not modify and is refused.
+- The end-of-planning check: after a statement has been planned, no scan of the plan may read a shell (a plan that does is `ERROR: internal error: a plan reads the local copy of
+  "s.t", which this node does not own`, SQLSTATE `XX000`).  The paths the routing cannot see, such as a SQL function that the planner expands into the statement
+  when `kingres_shard.enable_distributed_scan` is off, end here and never in an empty answer.
+- A session that another node opened (a forwarded session) that names a table of a distributed schema which this group does not hold gets the retryable
+  error `KS001` ("this node does not hold table ...").
+
 ## Limitations in phase 2a
 
 Read these first; each is a reviewed boundary, not an accident.
