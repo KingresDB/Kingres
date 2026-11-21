@@ -3247,7 +3247,7 @@ COMMENT ON FUNCTION kingres.distribute_schema(regnamespace, int) IS
 -- 'register_schema' (the schema that a CREATE SCHEMA made, in a database that distributes new schemas) and 'register_tables'
 -- (the tables the statement made).  The session that calls it runs as the role of the user whose statement it is, so the
 -- function checks its caller itself (a superuser, or a session that another node opened) and is not revoked from PUBLIC.
-CREATE FUNCTION kingres.internal_schema_delta(op text, nsp name, colocation_id int DEFAULT NULL, group_id int DEFAULT NULL)
+CREATE FUNCTION kingres.internal_schema_delta(op text, nsp name, colocation_id int DEFAULT NULL, group_id int DEFAULT NULL, rel text DEFAULT NULL)
     RETURNS int
     AS 'MODULE_PATHNAME', 'kingres_internal_schema_delta'
     LANGUAGE C
@@ -3991,6 +3991,264 @@ REVOKE ALL ON FUNCTION
 
 -- =========================================================================
 -- PHASE 11, increment 6                                                      [end]
+-- =========================================================================
+
+
+-- =========================================================================
+-- PHASE 11 (distributed schemas), step 10: single tables in and out (ALTER TABLE ... SET SCHEMA)   [begin]
+--
+-- design/shard-phase11.md 7.9 and 8.3.  A table moves across the border of a distributed schema when no row has to move: into a schema whose owner
+-- is the group of this node (or when the table is empty), out of a schema (the owner keeps the table and its rows, the other nodes drop their shells),
+-- between two schemas of one owner.  The hook (src/utility.c) asks internal_set_schema_check for the mode and the refusals, runs the statement here and
+-- the node-local steps below on every other node, in the one two-phase transaction of the statement.
+-- =========================================================================
+
+-- The kind of move that ALTER TABLE p_relid SET SCHEMA p_target is, and why it is refused (err), with a hint.
+--   mode 0: no distributed schema is involved; 1: into a distributed schema; 2: out of one; 3: from one to another of the same owner.
+CREATE FUNCTION kingres.internal_set_schema_check(p_relid oid, p_target oid)
+    RETURNS TABLE (mode int, owner_group int, err text, hint text)
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    c        pg_catalog.pg_class%ROWTYPE;
+    v_src    pg_catalog.int4;
+    v_dst    pg_catalog.int4;
+    v_sg     pg_catalog.int4;
+    v_dg     pg_catalog.int4;
+    v_local  pg_catalog.int4;
+    v_has    pg_catalog.bool;
+    r        pg_catalog.record;
+    v_other  pg_catalog.oid;
+    v_ons    pg_catalog.oid;
+    v_ref    pg_catalog.bool;
+    v_save   pg_catalog.text := pg_catalog.current_setting('kingres_shard.enable_routing');
+BEGIN
+    mode := 0; owner_group := NULL; err := NULL; hint := NULL;
+    SELECT * INTO c FROM pg_catalog.pg_class WHERE oid OPERATOR(pg_catalog.=) p_relid;
+    IF NOT FOUND THEN
+        RETURN NEXT;
+        RETURN;
+    END IF;
+    SELECT s.colocation_id, b.group_id INTO v_src, v_sg
+      FROM kingres.dist_schema s JOIN kingres.bucket_map b ON b.colocation_id OPERATOR(pg_catalog.=) s.colocation_id AND b.bucket OPERATOR(pg_catalog.=) 0
+     WHERE s.nsp::pg_catalog.oid OPERATOR(pg_catalog.=) c.relnamespace;
+    SELECT s.colocation_id, b.group_id INTO v_dst, v_dg
+      FROM kingres.dist_schema s JOIN kingres.bucket_map b ON b.colocation_id OPERATOR(pg_catalog.=) s.colocation_id AND b.bucket OPERATOR(pg_catalog.=) 0
+     WHERE s.nsp::pg_catalog.oid OPERATOR(pg_catalog.=) p_target;
+    IF (v_src IS NULL AND v_dst IS NULL) OR c.relnamespace OPERATOR(pg_catalog.=) p_target THEN
+        RETURN NEXT;
+        RETURN;
+    END IF;
+    hint := 'Recreate the object in the other schema.';
+    IF EXISTS (SELECT 1 FROM kingres.dist_table d WHERE d.relid::pg_catalog.oid OPERATOR(pg_catalog.=) p_relid AND d.method OPERATOR(pg_catalog.<>) 'schema') THEN
+        err := 'a hash-distributed or reference table cannot be moved into or out of a distributed schema';
+        RETURN NEXT;
+        RETURN;
+    END IF;
+    IF c.relkind OPERATOR(pg_catalog.<>) 'r' OR c.relispartition OR c.relhassubclass
+       OR EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid OPERATOR(pg_catalog.=) p_relid) THEN
+        err := 'only an ordinary table (not a partitioned table, a partition or a table with inheritance) can be moved into or out of a distributed schema';
+        RETURN NEXT;
+        RETURN;
+    END IF;
+    IF c.relpersistence OPERATOR(pg_catalog.<>) 'p' THEN
+        err := 'a temporary or unlogged table cannot be moved into or out of a distributed schema';
+        RETURN NEXT;
+        RETURN;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_trigger g WHERE g.tgrelid OPERATOR(pg_catalog.=) p_relid AND NOT g.tgisinternal) THEN
+        err := 'a table with a trigger cannot be moved into or out of a distributed schema';
+        hint := 'Drop the trigger, move the table, and create the trigger again.';
+        RETURN NEXT;
+        RETURN;
+    END IF;
+    IF v_src IS NULL THEN
+        mode := 1; owner_group := v_dg;
+    ELSIF v_dst IS NULL THEN
+        mode := 2; owner_group := v_sg;
+    ELSE
+        mode := 3; owner_group := v_dg;
+        IF v_sg OPERATOR(pg_catalog.<>) v_dg THEN
+            err := pg_catalog.format('the schemas are held by different shard groups (%s and %s): the rows would have to move', v_sg, v_dg);
+            hint := 'Use kingres.move_schema() to bring the two schemas to one group first.';
+            RETURN NEXT;
+            RETURN;
+        END IF;
+    END IF;
+    -- foreign keys: none may cross the border that the table crosses
+    FOR r IN SELECT k.conrelid, k.confrelid, k.conname FROM pg_catalog.pg_constraint k
+              WHERE k.contype OPERATOR(pg_catalog.=) 'f' AND (k.conrelid OPERATOR(pg_catalog.=) p_relid OR k.confrelid OPERATOR(pg_catalog.=) p_relid)
+    LOOP
+        v_other := CASE WHEN r.conrelid OPERATOR(pg_catalog.=) p_relid THEN r.confrelid ELSE r.conrelid END;
+        IF v_other OPERATOR(pg_catalog.=) p_relid THEN
+            CONTINUE;
+        END IF;
+        SELECT oc.relnamespace INTO v_ons FROM pg_catalog.pg_class oc WHERE oc.oid OPERATOR(pg_catalog.=) v_other;
+        v_ref := EXISTS (SELECT 1 FROM kingres.dist_table d WHERE d.relid::pg_catalog.oid OPERATOR(pg_catalog.=) v_other AND d.method OPERATOR(pg_catalog.=) 'reference');
+        IF mode = 1 AND r.conrelid OPERATOR(pg_catalog.=) p_relid AND (v_ons OPERATOR(pg_catalog.=) p_target OR v_ref) THEN
+            CONTINUE;
+        ELSIF mode = 3 AND v_ons OPERATOR(pg_catalog.<>) c.relnamespace AND (v_ons OPERATOR(pg_catalog.=) p_target OR v_ref) THEN
+            CONTINUE;
+        ELSIF mode = 2 AND v_ons OPERATOR(pg_catalog.<>) c.relnamespace THEN
+            CONTINUE;
+        END IF;
+        err := pg_catalog.format('the foreign key "%s" would cross the border of the distributed schema', r.conname);
+        hint := 'Drop the foreign key, or move the tables it joins together.';
+        RETURN NEXT;
+        RETURN;
+    END LOOP;
+    -- into a schema of another group: the rows must be on the owner, and they are here
+    IF mode = 1 THEN
+        SELECT n.group_id INTO v_local FROM kingres.local_node l JOIN kingres.node n ON n.node_id OPERATOR(pg_catalog.=) l.node_id;
+        IF v_local IS DISTINCT FROM v_dg THEN
+            PERFORM pg_catalog.set_config('kingres_shard.enable_routing', 'off', true);
+            EXECUTE pg_catalog.format('SELECT EXISTS (SELECT 1 FROM ONLY %s)', p_relid::pg_catalog.regclass) INTO v_has;
+            PERFORM pg_catalog.set_config('kingres_shard.enable_routing', v_save, true);
+            IF v_has THEN
+                err := pg_catalog.format('the table holds rows on shard group %s and the schema is held by group %s', v_local, v_dg);
+                hint := 'Create the table in the schema and copy the rows with INSERT ... SELECT, or empty the table first.';
+                RETURN NEXT;
+                RETURN;
+            END IF;
+        END IF;
+    END IF;
+    hint := NULL;
+    RETURN NEXT;
+END;
+$$;
+
+-- The statements that make a table of this node as a shell on another node (an ordinary table; the structure generator of the rebuild).
+CREATE FUNCTION kingres.internal_table_shell_statements(p_rel regclass)
+    RETURNS text[]
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    d       pg_catalog.record;
+    v_out   pg_catalog.text[] := ARRAY[]::pg_catalog.text[];
+    v_fk    pg_catalog.text[] := ARRAY[]::pg_catalog.text[];
+    v_ri    pg_catalog."char";
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    FOR d IN SELECT * FROM kingres.internal_table_ddl(p_rel, NULL) ORDER BY ord LOOP
+        IF d.scope OPERATOR(pg_catalog.=) 'remote_pre' OR d.scope OPERATOR(pg_catalog.=) 'both' THEN
+            v_out := v_out OPERATOR(pg_catalog.||) d.stmt;
+        ELSIF d.scope OPERATOR(pg_catalog.=) 'fk' THEN
+            v_fk := v_fk OPERATOR(pg_catalog.||) d.stmt;
+        ELSIF d.scope OPERATOR(pg_catalog.=) 'post' AND d.stmt NOT LIKE 'SELECT kingres.internal_advance_sequence%' THEN
+            v_out := v_out OPERATOR(pg_catalog.||) d.stmt;
+        END IF;
+    END LOOP;
+    SELECT c.relreplident INTO v_ri FROM pg_catalog.pg_class c WHERE c.oid OPERATOR(pg_catalog.=) p_rel::pg_catalog.oid;
+    IF v_ri OPERATOR(pg_catalog.=) 'f' THEN
+        v_out := v_out OPERATOR(pg_catalog.||) pg_catalog.format('ALTER TABLE %s REPLICA IDENTITY FULL', p_rel);
+    ELSIF v_ri OPERATOR(pg_catalog.=) 'n' THEN
+        v_out := v_out OPERATOR(pg_catalog.||) pg_catalog.format('ALTER TABLE %s REPLICA IDENTITY NOTHING', p_rel);
+    END IF;
+    RETURN v_out OPERATOR(pg_catalog.||) v_fk;
+END;
+$$;
+
+-- Node-local, after a statement that moved a table across the border of a distributed schema: the rows of kingres.dist_table follow
+-- the catalog of PostgreSQL (a table that left its schema is forgotten, a table that went to another distributed schema takes that schema's
+-- colocation group, a table that came is registered).  Returns the number of rows changed.
+CREATE FUNCTION kingres.internal_schema_reconcile()
+    RETURNS int
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    n pg_catalog.int4 := 0;
+    k pg_catalog.int4;
+    r pg_catalog.record;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    DELETE FROM kingres.dist_table d
+     WHERE d.method OPERATOR(pg_catalog.=) 'schema'
+       AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c JOIN kingres.dist_schema s ON s.nsp::pg_catalog.oid OPERATOR(pg_catalog.=) c.relnamespace
+                        WHERE c.oid OPERATOR(pg_catalog.=) d.relid::pg_catalog.oid);
+    GET DIAGNOSTICS k = ROW_COUNT;
+    n := n + k;
+    UPDATE kingres.dist_table d SET colocation_id = s.colocation_id
+      FROM pg_catalog.pg_class c JOIN kingres.dist_schema s ON s.nsp::pg_catalog.oid OPERATOR(pg_catalog.=) c.relnamespace
+     WHERE c.oid OPERATOR(pg_catalog.=) d.relid::pg_catalog.oid AND d.method OPERATOR(pg_catalog.=) 'schema' AND d.colocation_id OPERATOR(pg_catalog.<>) s.colocation_id;
+    GET DIAGNOSTICS k = ROW_COUNT;
+    n := n + k;
+    FOR r IN SELECT ns.nspname FROM kingres.dist_schema s JOIN pg_catalog.pg_namespace ns ON ns.oid OPERATOR(pg_catalog.=) s.nsp::pg_catalog.oid LOOP
+        n := n + kingres.internal_register_schema_tables(r.nspname);
+    END LOOP;
+    RETURN n;
+END;
+$$;
+
+-- Node-local: the shell p_rel (a table of a distributed schema that another group holds) has no row.
+CREATE FUNCTION kingres.internal_schema_assert_empty(p_rel text)
+    RETURNS void
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_rel  pg_catalog.regclass := pg_catalog.to_regclass(p_rel);
+    v_has  pg_catalog.bool;
+    v_save pg_catalog.text := pg_catalog.current_setting('kingres_shard.enable_routing');
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    IF v_rel IS NULL THEN
+        RAISE EXCEPTION 'table % does not exist on this node', p_rel USING ERRCODE = 'undefined_table';
+    END IF;
+    PERFORM pg_catalog.set_config('kingres_shard.enable_routing', 'off', true);
+    EXECUTE pg_catalog.format('SELECT EXISTS (SELECT 1 FROM ONLY %s)', v_rel) INTO v_has;
+    PERFORM pg_catalog.set_config('kingres_shard.enable_routing', v_save, true);
+    IF v_has THEN
+        RAISE EXCEPTION 'table % holds rows on this node, which is not the owner of its schema: it cannot leave the distributed schema', p_rel
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+END;
+$$;
+
+-- Node-local: the shell p_rel is forgotten and dropped (the owner keeps the table and its rows).
+CREATE FUNCTION kingres.internal_schema_drop_shell(p_rel text)
+    RETURNS void
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_rel  pg_catalog.regclass := pg_catalog.to_regclass(p_rel);
+    v_save pg_catalog.text := pg_catalog.current_setting('kingres_shard.enable_routing');
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    IF v_rel IS NULL THEN
+        RAISE EXCEPTION 'table % does not exist on this node', p_rel USING ERRCODE = 'undefined_table';
+    END IF;
+    PERFORM pg_catalog.set_config('kingres_shard.enable_routing', 'off', true);
+    DELETE FROM kingres.dist_table d WHERE d.relid OPERATOR(pg_catalog.=) v_rel AND d.method OPERATOR(pg_catalog.=) 'schema';
+    EXECUTE pg_catalog.format('DROP TABLE %s', v_rel);
+    PERFORM pg_catalog.set_config('kingres_shard.enable_routing', v_save, true);
+END;
+$$;
+
+COMMENT ON FUNCTION kingres.internal_set_schema_check(oid, oid) IS
+    'The kind of move that ALTER TABLE ... SET SCHEMA is for distributed schemas (0 none, 1 in, 2 out, 3 between two of one owner), and why it is refused';
+COMMENT ON FUNCTION kingres.internal_table_shell_statements(regclass) IS
+    'The statements that make an ordinary table of this node as an empty shell on another node';
+COMMENT ON FUNCTION kingres.internal_schema_reconcile() IS
+    'Node-local: the registered tables follow the schemas they are in';
+COMMENT ON FUNCTION kingres.internal_schema_assert_empty(text) IS
+    'Node-local: the shell has no row (raises otherwise)';
+COMMENT ON FUNCTION kingres.internal_schema_drop_shell(text) IS
+    'Node-local: forget and drop a shell';
+
+REVOKE ALL ON FUNCTION
+    kingres.internal_set_schema_check(oid, oid),
+    kingres.internal_table_shell_statements(regclass),
+    kingres.internal_schema_reconcile(),
+    kingres.internal_schema_assert_empty(text),
+    kingres.internal_schema_drop_shell(text)
+    FROM PUBLIC;
+
+-- =========================================================================
+-- PHASE 11, step 10                                                          [end]
 -- =========================================================================
 
 -- ===========================================================================

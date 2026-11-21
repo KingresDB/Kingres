@@ -64,7 +64,9 @@
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/xact.h"
+#include "catalog/namespace.h"
 #include "catalog/partition.h"
+#include "catalog/pg_namespace_d.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_collation_d.h"
 #include "catalog/pg_constraint.h"
@@ -2797,6 +2799,24 @@ paths_note_group(PathS *p, int group, bool ship)
 		p->ship_all = false;
 }
 
+/*
+ * A function, operator or aggregate that is not built in.  Only a function of a distributed schema is shipped (it exists on every node);
+ * a function of a local schema, of public or of an extension exists where it was made and is never shipped.  A function of a schema that
+ * does not ship functions keeps the statement at the origin (the scan), as before.
+ */
+static void
+paths_note_function(PathS *p, Oid funcid)
+{
+	const KsDistSchema *ds;
+
+	p->user_function = true;
+	ds = kingres_shard_lookup_dist_schema(p->cat, get_func_namespace(funcid));
+	if (ds == NULL)
+		paths_fail(p, "it calls a function that is not in a distributed schema");
+	else if (!ds->ship_functions)
+		p->ship_all = false;
+}
+
 static bool
 paths_walker(Node *node, void *context)
 {
@@ -2851,7 +2871,7 @@ paths_walker(Node *node, void *context)
 		FuncExpr   *fe = (FuncExpr *) node;
 
 		if (fe->funcid >= FirstNormalObjectId)
-			p->user_function = true;
+			paths_note_function(p, fe->funcid);
 		else if (fe->funcresulttype == INT8OID && fe->args != NIL)
 		{
 			char	   *fname = get_func_name(fe->funcid);
@@ -2888,19 +2908,49 @@ paths_walker(Node *node, void *context)
 
 		set_opfuncid(oe);
 		if (oe->opfuncid >= FirstNormalObjectId)
-			p->user_function = true;
+			paths_note_function(p, oe->opfuncid);
 	}
 	else if (IsA(node, Aggref))
 	{
 		if (((Aggref *) node)->aggfnoid >= FirstNormalObjectId)
-			p->user_function = true;
+			paths_note_function(p, ((Aggref *) node)->aggfnoid);
 	}
 	else if (IsA(node, WindowFunc))
 	{
 		if (((WindowFunc *) node)->winfnoid >= FirstNormalObjectId)
-			p->user_function = true;
+			paths_note_function(p, ((WindowFunc *) node)->winfnoid);
 	}
 	return expression_tree_walker(node, paths_walker, context);
+}
+
+/*
+ * The search_path of this session as the owner is to run a function body with it (design 6.4): pg_catalog first, then the schemas of the
+ * path that exist here, in order, and never the temporary schema (a temporary schema is private to a backend).  A schema that the owner
+ * does not have is ignored by the server there, as on a direct connection.
+ */
+static char *
+search_path_for_functions(void)
+{
+	List	   *oids = fetch_search_path(false);
+	StringInfoData buf;
+	ListCell   *lc;
+
+	initStringInfo(&buf);
+	appendStringInfoString(&buf, "pg_catalog");
+	foreach(lc, oids)
+	{
+		Oid			nsp = lfirst_oid(lc);
+		char	   *name;
+
+		if (isAnyTempNamespace(nsp) || nsp == PG_CATALOG_NAMESPACE)
+			continue;
+		name = get_namespace_name(nsp);
+		if (name == NULL)
+			continue;
+		appendStringInfo(&buf, ", %s", quote_identifier(name));
+	}
+	list_free(oids);
+	return buf.data;
 }
 
 /*
@@ -2961,8 +3011,9 @@ plan_schema_shell(Query *parse, const char *query_string, int cursorOptions,
 						 errmsg("shard group %d has no active primary node", ps.owner)));
 			is_write = parse->commandType != CMD_SELECT || parse->rowMarks != NIL ||
 				parse->hasModifyingCTE || contain_volatile_functions((Node *) parse);
-			return kingres_shard_make_remote_plan(parse, deparse_for_remote(parse), node->host, node->port,
-												  ps.owner, 0, is_write, ps.relids);
+			return kingres_shard_make_remote_plan_path(parse, deparse_for_remote(parse), node->host, node->port,
+													   ps.owner, 0, is_write, ps.relids,
+													   ps.user_function ? search_path_for_functions() : NULL);
 		}
 		why = ps.why;
 	}

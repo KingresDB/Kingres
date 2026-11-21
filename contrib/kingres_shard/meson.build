@@ -301,6 +301,8 @@ tests += {
       't/237_move_schema_cluster.pl',
       't/238_schema_convert_cluster.pl',
       't/239_schema_same_group_cluster.pl',
+      't/240_schema_ship_functions_cluster.pl',
+      't/241_schema_single_tables_cluster.pl',
     ],
   },
 }

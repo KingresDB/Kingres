@@ -407,9 +407,82 @@ kingres_shard_schema_ddl_interesting(Node *parsetree)
 	}
 }
 
+/*
+ * ALTER TABLE ... SET SCHEMA of an ordinary table, one of whose two schemas is distributed.  The origin asks kingres.internal_set_schema_check for the
+ * kind of move and the reason to refuse it; a session of another node only learns the schemas (the origin has decided).
+ */
+static void
+set_schema_table(Node *parsetree, Oid relid, Oid src_ns, Oid target, const KsCatalog *cat, bool forwarded, KsSchemaDdl *sd, NsSet *s)
+{
+	AlterObjectSchemaStmt *a = (AlterObjectSchemaStmt *) parsetree;
+
+	/* the border is crossed on purpose: only the distributed side is the statement's schema */
+	if (kingres_shard_lookup_dist_schema(cat, src_ns) != NULL)
+		ns_add(s, src_ns);
+	if (kingres_shard_lookup_dist_schema(cat, target) != NULL)
+		ns_add(s, target);
+	if (!forwarded)
+	{
+		Oid			argtypes[2] = {OIDOID, OIDOID};
+		Datum		values[2];
+		Oid			save_uid;
+		int			save_sec;
+		int			mode = 0;
+		int			owner = -1;
+		char	   *err = NULL;
+		char	   *hint = NULL;
+		MemoryContext callercxt = CurrentMemoryContext;
+
+		values[0] = ObjectIdGetDatum(relid);
+		values[1] = ObjectIdGetDatum(target);
+		GetUserIdAndSecContext(&save_uid, &save_sec);
+		SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, save_sec | SECURITY_LOCAL_USERID_CHANGE);
+		PG_TRY();
+		{
+			if (SPI_connect() != SPI_OK_CONNECT)
+				elog(ERROR, "SPI_connect failed");
+			if (SPI_execute_with_args("SELECT mode, owner_group, err, hint FROM " KINGRES_SHARD_SCHEMA ".internal_set_schema_check($1, $2)",
+									  2, argtypes, values, NULL, false, 1) == SPI_OK_SELECT && SPI_processed == 1)
+			{
+				HeapTuple	tup = SPI_tuptable->vals[0];
+				TupleDesc	td = SPI_tuptable->tupdesc;
+				bool		isnull;
+				MemoryContext cur = MemoryContextSwitchTo(callercxt);
+				char	   *v;
+
+				mode = DatumGetInt32(SPI_getbinval(tup, td, 1, &isnull));
+				owner = DatumGetInt32(SPI_getbinval(tup, td, 2, &isnull));
+				if (isnull)
+					owner = -1;
+				v = SPI_getvalue(tup, td, 3);
+				err = v != NULL ? pstrdup(v) : NULL;
+				v = SPI_getvalue(tup, td, 4);
+				hint = v != NULL ? pstrdup(v) : NULL;
+				MemoryContextSwitchTo(cur);
+			}
+			SPI_finish();
+		}
+		PG_FINALLY();
+		{
+			SetUserIdAndSecContext(save_uid, save_sec);
+		}
+		PG_END_TRY();
+		if (err != NULL)
+			refuse_message(sd, psprintf("ALTER TABLE ... SET SCHEMA: %s", err), hint);
+		sd->set_mode = mode;
+		sd->set_owner_group = owner;
+		sd->set_old_name = quote_qualified_identifier(get_namespace_name(src_ns), get_rel_name(relid));
+		sd->set_new_rel = makeRangeVar(pstrdup(a->newschema), pstrdup(get_rel_name(relid)), -1);
+		if (mode == 1 || mode == 3)
+			sd->verify_tables = lappend(sd->verify_tables, sd->set_new_rel);
+	}
+	finish(sd, s, cat, "ALTER ... SET SCHEMA");
+}
+
 void
 kingres_shard_schema_ddl_classify(Node *parsetree, const KsCatalog *cat, bool forwarded, KsSchemaDdl *sd)
 {
+
 	NsSet		s;
 	ListCell   *lc;
 
@@ -683,6 +756,24 @@ kingres_shard_schema_ddl_classify(Node *parsetree, const KsCatalog *cat, bool fo
 			{
 				AlterObjectSchemaStmt *a = (AlterObjectSchemaStmt *) parsetree;
 				Oid			target = a->newschema != NULL ? get_namespace_oid(a->newschema, true) : InvalidOid;
+
+				/* a table across the border of a distributed schema (design 7.9, 8.3) */
+				if (a->objectType == OBJECT_TABLE && a->relation != NULL && OidIsValid(target))
+				{
+					Oid			relid = RangeVarGetRelid(a->relation, NoLock, true);
+
+					if (OidIsValid(relid))
+					{
+						Oid			src_ns = get_rel_namespace(relid);
+
+						if (src_ns != target &&
+							(kingres_shard_lookup_dist_schema(cat, src_ns) != NULL || kingres_shard_lookup_dist_schema(cat, target) != NULL))
+						{
+							set_schema_table(parsetree, relid, src_ns, target, cat, forwarded, sd, &s);
+							break;
+						}
+					}
+				}
 
 				if (a->relation != NULL)
 					ns_add(&s, rv_ns(a->relation));
@@ -971,8 +1062,72 @@ kingres_shard_schema_sync_tables_local(const char *name)
 	return run_as_bootstrap("SELECT " KINGRES_SHARD_SCHEMA ".internal_register_schema_tables($1)", 1, argtypes, values, true);
 }
 
+int
+kingres_shard_schema_reconcile_local(void)
+{
+	return run_as_bootstrap("SELECT " KINGRES_SHARD_SCHEMA ".internal_schema_reconcile()", 0, NULL, NULL, true);
+}
+
+/* assert_empty or drop_shell of a shell, by its quoted, schema-qualified name */
+void
+kingres_shard_schema_table_op_local(const char *op, const char *rel)
+{
+	Oid			argtypes[1] = {TEXTOID};
+	Datum		values[1];
+
+	values[0] = CStringGetTextDatum(rel);
+	if (strcmp(op, "assert_empty") == 0)
+		(void) run_as_bootstrap("SELECT " KINGRES_SHARD_SCHEMA ".internal_schema_assert_empty($1)", 1, argtypes, values, false);
+	else
+		(void) run_as_bootstrap("SELECT " KINGRES_SHARD_SCHEMA ".internal_schema_drop_shell($1)", 1, argtypes, values, false);
+}
+
+/* The statements that make the table as a shell on another node (a list of char *). */
+List *
+kingres_shard_schema_table_statements_local(Oid relid)
+{
+	Oid			argtypes[1] = {OIDOID};
+	Datum		values[1];
+	List	   *result = NIL;
+	Oid			save_uid;
+	int			save_sec;
+	MemoryContext callercxt = CurrentMemoryContext;
+
+	values[0] = ObjectIdGetDatum(relid);
+	GetUserIdAndSecContext(&save_uid, &save_sec);
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, save_sec | SECURITY_LOCAL_USERID_CHANGE);
+	PG_TRY();
+	{
+		if (SPI_connect() != SPI_OK_CONNECT)
+			elog(ERROR, "SPI_connect failed");
+		if (SPI_execute_with_args("SELECT s FROM pg_catalog.unnest(" KINGRES_SHARD_SCHEMA ".internal_table_shell_statements($1::pg_catalog.oid::pg_catalog.regclass)) AS s",
+								  1, argtypes, values, NULL, false, 0) == SPI_OK_SELECT)
+		{
+			uint64		i;
+
+			for (i = 0; i < SPI_processed; i++)
+			{
+				char	   *v = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
+				MemoryContext cur = MemoryContextSwitchTo(callercxt);
+
+				if (v != NULL)
+					result = lappend(result, pstrdup(v));
+				MemoryContextSwitchTo(cur);
+			}
+		}
+		SPI_finish();
+	}
+	PG_FINALLY();
+	{
+		SetUserIdAndSecContext(save_uid, save_sec);
+	}
+	PG_END_TRY();
+	return result;
+}
+
 /*
- * The structure of a table of this node as a fingerprint (kingres.internal_table_fingerprint, 7.1).  The session
+ * The structure of a table of this node as a fingerprint (kingres.internal_table_fingerprint, 7.1).
+  The session
  * is the caller's: the same function runs, in the same transaction branch, on the other nodes (verify_remote), and
  * the function reads the catalogs of PostgreSQL only.
  */
@@ -1113,6 +1268,16 @@ kingres_internal_schema_delta(PG_FUNCTION_ARGS)
 	}
 	else if (strcmp(op, "register_tables") == 0)
 		result = kingres_shard_schema_sync_tables_local(NameStr(*nsp));
+	else if (strcmp(op, "reconcile") == 0)
+		result = kingres_shard_schema_reconcile_local();
+	else if (strcmp(op, "assert_empty") == 0 || strcmp(op, "drop_shell") == 0)
+	{
+		if (PG_NARGS() < 5 || PG_ARGISNULL(4))
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("%s needs the table", op)));
+		kingres_shard_schema_table_op_local(op, text_to_cstring(PG_GETARG_TEXT_PP(4)));
+	}
 	else
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),

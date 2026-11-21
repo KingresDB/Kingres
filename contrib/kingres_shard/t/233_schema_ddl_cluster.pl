@@ -210,6 +210,7 @@ same_everywhere(q{SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname
 # ---------------------------------------------------------------------------
 # E. what is refused
 # ---------------------------------------------------------------------------
+q1($n1, q{CREATE SEQUENCE public.lsq});
 for my $case (
 	[ 'a materialized view', q{CREATE MATERIALIZED VIEW t1.mv AS SELECT 1 AS x}, qr/CREATE MATERIALIZED VIEW is not supported in a distributed schema yet/ ],
 	[ 'CREATE TABLE AS', q{CREATE TABLE t1.ctas AS SELECT 1 AS x}, qr/CREATE TABLE AS or SELECT INTO is not supported in a distributed schema yet/ ],
@@ -220,8 +221,8 @@ for my $case (
 	[ 'extended statistics', q{CREATE STATISTICS st1 ON id, a_id FROM t1.b}, qr/CREATE STATISTICS is not supported in a distributed schema yet/ ],
 	[ 'a range type', q{CREATE TYPE t1.rng AS RANGE (subtype = int)}, qr/CREATE TYPE \.\.\. AS RANGE is not supported in a distributed schema yet/ ],
 	[ 'an aggregate', q{CREATE AGGREGATE t1.agg(int) (sfunc = int4pl, stype = int)}, qr/not supported in a distributed schema yet/ ],
-	[ 'SET SCHEMA out', q{ALTER TABLE t1.b SET SCHEMA public}, qr/SET SCHEMA into or out of a distributed schema is not supported yet/ ],
-	[ 'SET SCHEMA in', q{ALTER TABLE public.loc SET SCHEMA t1}, qr/SET SCHEMA into or out of a distributed schema is not supported yet/ ],
+	[ 'SET SCHEMA out (a view)', q{ALTER VIEW t1.va SET SCHEMA public}, qr/SET SCHEMA into or out of a distributed schema is not supported yet/ ],
+	[ 'SET SCHEMA in (a sequence)', q{ALTER SEQUENCE public.lsq SET SCHEMA t1}, qr/SET SCHEMA into or out of a distributed schema is not supported yet/ ],
 	[ 'TRUNCATE CASCADE', q{TRUNCATE t1.a CASCADE}, qr/TRUNCATE \.\.\. CASCADE is not supported in a distributed schema yet/ ],
 	[ 'a statement that names a distributed schema and another', q{DROP TABLE t1.b, public.loc}, qr/names a distributed schema and another schema/ ],
   )

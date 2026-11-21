@@ -1339,6 +1339,7 @@ statement_text(PlannedStmt *pstmt, const char *queryString)
 typedef struct DdlTarget
 {
 	int			node_id;
+	int			group_id;
 	char	   *host;
 	int			port;
 } DdlTarget;
@@ -2115,6 +2116,7 @@ kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
 	bool		authorized;
 	bool		saved_drop_authorized;
 	volatile bool internal_active = false;
+	bool		set_skip_local = false;
 
 	/* A session that claims to be forwarded must prove it before anything runs. */
 	(void) kingres_shard_session_forwarded();
@@ -2232,6 +2234,7 @@ kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
 						continue;
 					t = palloc(sizeof(DdlTarget));
 					t->node_id = n->node_id;
+					t->group_id = n->group_id;
 					t->host = pstrdup(n->host);
 					t->port = n->port;
 					targets = lappend(targets, t);
@@ -2255,6 +2258,14 @@ kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
 		return;
 	}
 
+	/* this node holds a shell of a table that leaves its schema: the shell is dropped, the statement is not run here (the owner runs it) */
+	if (have_sd && sd.set_mode == 2 && text != NULL && cat->local_group_id != sd.set_owner_group)
+	{
+		kingres_shard_schema_table_op_local("assert_empty", sd.set_old_name);
+		kingres_shard_schema_table_op_local("drop_shell", sd.set_old_name);
+		set_skip_local = true;
+	}
+
 	authorized = d.authorize || OidIsValid(d.rename_relid);
 	saved_drop_authorized = ddl_drop_authorized;
 	ddl_drop_authorized = authorized;
@@ -2262,7 +2273,12 @@ kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
 		ddl_authorized_depth++;
 	PG_TRY();
 	{
-		if (prev_ProcessUtility)
+		if (set_skip_local)
+		{
+			if (qc != NULL)
+				SetQueryCompletion(qc, CMDTAG_ALTER_TABLE, 0);
+		}
+		else if (prev_ProcessUtility)
 			prev_ProcessUtility(pstmt, queryString, readOnlyTree, context, params,
 								queryEnv, dest, qc);
 		else
@@ -2292,6 +2308,7 @@ kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
 		ListCell   *lc;
 		int			new_coloc = 0;
 		int			new_group = 0;
+		List	   *set_in_statements = NIL;
 
 		/* a new distributed schema: its colocation group and its group are chosen here, once, under the cluster lock */
 		if (have_sd && sd.create_schema)
@@ -2306,6 +2323,16 @@ kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
 			foreach(lc, sd.schema_names)
 				(void) kingres_shard_schema_sync_tables_local((char *) lfirst(lc));
 		}
+		else if (have_sd && sd.set_mode != 0 && !set_skip_local)
+			(void) kingres_shard_schema_reconcile_local();
+
+		/* a table that came into a distributed schema: the statements that make it, empty, on the other nodes */
+		if (have_sd && sd.set_mode == 1)
+		{
+			Oid			newid = RangeVarGetRelid(sd.set_new_rel, NoLock, false);
+
+			set_in_statements = kingres_shard_schema_table_statements_local(newid);
+		}
 
 		foreach(lc, targets)
 		{
@@ -2313,7 +2340,25 @@ kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
 			KsConn	   *kc = kingres_shard_get_conn(t->host, t->port, false, NULL);
 
 			kingres_shard_begin_write_xact(kc);
-			kingres_shard_exec_ddl(kc, text);
+			if (have_sd && sd.set_mode == 1)
+			{
+				ListCell   *ls;
+
+				foreach(ls, set_in_statements)
+					kingres_shard_exec_ddl(kc, (char *) lfirst(ls));
+			}
+			else if (have_sd && sd.set_mode == 2 && t->group_id != sd.set_owner_group)
+			{
+				/* a shell that leaves the schema: it must be empty, then it goes (nothing is propagated) */
+				kingres_shard_exec_ddl(kc, psprintf("SELECT " KINGRES_SHARD_SCHEMA ".internal_schema_delta('assert_empty', '', NULL, NULL, %s)",
+													quote_literal_cstr(sd.set_old_name)));
+				kingres_shard_exec_ddl(kc, psprintf("SELECT " KINGRES_SHARD_SCHEMA ".internal_schema_delta('drop_shell', '', NULL, NULL, %s)",
+													quote_literal_cstr(sd.set_old_name)));
+			}
+			else
+				kingres_shard_exec_ddl(kc, text);
+			if (have_sd && sd.set_mode != 0 && !(sd.set_mode == 2 && t->group_id != sd.set_owner_group))
+				kingres_shard_exec_ddl(kc, "SELECT " KINGRES_SHARD_SCHEMA ".internal_schema_delta('reconcile', '')");
 			if (have_sd && sd.create_schema)
 				kingres_shard_exec_ddl(kc, psprintf("SELECT " KINGRES_SHARD_SCHEMA ".internal_schema_delta('register_schema', %s, %d, %d)",
 													quote_literal_cstr(sd.create_name), new_coloc, new_group));

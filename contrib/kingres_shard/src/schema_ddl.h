@@ -37,6 +37,10 @@ typedef struct KsSchemaDdl
 	char	   *refuse_message;		/* the whole message when refuse_what is NULL and this is not */
 	char	   *refuse_hint;
 	List	   *verify_tables;		/* of RangeVar *: the tables whose structure is compared across the nodes afterwards */
+	int			set_mode;			/* ALTER TABLE ... SET SCHEMA: 1 into a distributed schema, 2 out of one, 3 between two of one owner */
+	int			set_owner_group;	/* the shard group that holds the rows (the owner of the schema involved) */
+	char	   *set_old_name;		/* the table before the statement, schema-qualified and quoted */
+	RangeVar   *set_new_rel;		/* the table after it */
 } KsSchemaDdl;
 
 extern bool kingres_shard_enable_schema_routing;
@@ -61,6 +65,9 @@ extern int	kingres_shard_schema_next_colocation(void);
 extern void kingres_shard_schema_register_local(const char *name, int colocation_id, int group_id);
 extern int	kingres_shard_schema_sync_tables_local(const char *name);
 extern char *kingres_shard_schema_fingerprint_local(Oid relid);
+extern List *kingres_shard_schema_table_statements_local(Oid relid);
+extern int	kingres_shard_schema_reconcile_local(void);
+extern void kingres_shard_schema_table_op_local(const char *op, const char *rel);
 extern void kingres_shard_schema_verify_remote(KsConn *kc, int node_id, Oid relid, const char *local_fingerprint);
 
 #endif							/* KINGRES_SHARD_SCHEMA_DDL_H */
