@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.14.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.17.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and, when it is built, the planned `kingres-cli` (it does not exist yet). Lint it and run the mechanical rule check with:
 
 ```
@@ -317,6 +317,24 @@ Where the architecture document leaves something open, the simplest option was c
     range and the cluster's replica count.
 
 ## Changelog
+
+### 0.17.0
+
+Revision written with the closing of phase 13 (`kingres/docs/design/config-phase13.md`). Summary for the panel:
+0 operations added (140 operations, 113 paths); one schema and one optional response property added; **no change that is not additive**.
+
+#### Breaking
+
+None.
+
+#### Additive
+
+- `ConfigChangePreview` has the optional `warnings` (`ConfigWarning`: `index`, `pointer`, `code`, `message`), the codes `config_value_unusual` and `config_reserved_connections`.
+  A warning never makes a request invalid; `valid` is still a function of `problems` only.
+
+#### Documentation
+
+- The text of `previewConfigChange` and `ConfigWarning` says what each code means. A client that does not know `warnings` works as before.
 
 ### 0.14.0
 

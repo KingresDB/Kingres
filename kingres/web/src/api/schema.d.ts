@@ -6137,6 +6137,21 @@ export interface components {
             /** @description A sentence, with PostgreSQL's own text for an invalid value. */
             message: string;
         };
+        /** @description Why one change of a valid request deserves a second look. */
+        ConfigWarning: {
+            /** @description Position in `changes`. */
+            index: number;
+            /** @description JSON pointer into the request, for example `/changes/0/value`. */
+            pointer: string;
+            /**
+             * @description `config_value_unusual` (a memory value more than ten times the parameter's default or below a tenth of it; exactly ten times and exactly a tenth
+             *     are not flagged) and `config_reserved_connections` (on some server `max_connections` would not exceed
+             *     `superuser_reserved_connections + reserved_connections`, so PostgreSQL would not start; the warning names the server). Clients must tolerate other values.
+             */
+            code: string;
+            /** @description A sentence. */
+            message: string;
+        };
         /** @description What a change does to one parameter on one server. */
         ConfigEffect: {
             serverId: components["schemas"]["ServerId"];
@@ -6171,6 +6186,11 @@ export interface components {
             /** @description True when `applyConfigChange` would accept the request. */
             valid: boolean;
             problems: components["schemas"]["ConfigProblem"][];
+            /**
+             * @description Things a valid change does that deserve a second look. A warning never makes the request invalid (`valid` depends on `problems` only) and
+             *     never stops `applyConfigChange`. Omitted by servers older than 0.17.0, so a client treats a missing property as an empty list.
+             */
+            warnings?: components["schemas"]["ConfigWarning"][];
             /** @description One entry per server and parameter that the change touches. */
             effects: components["schemas"]["ConfigEffect"][];
             /** @description The servers where at least one parameter would wait for a restart. */

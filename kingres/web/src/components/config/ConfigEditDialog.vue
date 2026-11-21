@@ -580,6 +580,23 @@ const valueId = 'cfg-value'
               </table>
             </TableWrap>
             <div
+              v-if="(preview.warnings ?? []).length > 0"
+              class="notice tone-warn"
+              role="status"
+              data-testid="preview-warnings"
+            >
+              <span aria-hidden="true">&#9650;</span>
+              <ul class="plain">
+                <li
+                  v-for="w in preview.warnings"
+                  :key="`${w.index}-${w.pointer}-${w.code}`"
+                  :data-code="w.code"
+                >
+                  <SafeName :value="w.message" kind="text" :max="400" />
+                </li>
+              </ul>
+            </div>
+            <div
               v-if="preview.restartServerIds.length > 0"
               class="notice tone-warn"
               data-testid="restart-note"

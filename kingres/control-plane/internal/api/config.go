@@ -79,6 +79,14 @@ type ConfigProblem struct {
 	Message string `json:"message"`
 }
 
+// ConfigWarning says that a valid change is unusual or risky. It never makes a request invalid.
+type ConfigWarning struct {
+	Index   int    `json:"index"`
+	Pointer string `json:"pointer"`
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
 // ConfigEffect is what a change does to one parameter on one server.
 type ConfigEffect struct {
 	ServerID    string  `json:"serverId"`
@@ -99,6 +107,7 @@ type ConfigRestartStep struct {
 type ConfigChangePreview struct {
 	Valid                bool                `json:"valid"`
 	Problems             []ConfigProblem     `json:"problems"`
+	Warnings             []ConfigWarning     `json:"warnings"`
 	Effects              []ConfigEffect      `json:"effects"`
 	RestartServerIDs     []string            `json:"restartServerIds"`
 	RestartOrder         []ConfigRestartStep `json:"restartOrder"`

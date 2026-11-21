@@ -31,6 +31,7 @@ type change struct {
 type checked struct {
 	changes  []change
 	problems []api.ConfigProblem
+	warnings []api.ConfigWarning
 }
 
 func prob(i int, field, code, msg string) api.ConfigProblem {
@@ -132,6 +133,9 @@ func (l *Leader) check(ctx context.Context, sn *snapshot, req api.ConfigChangeRe
 				bad("/value", "config_value_invalid", chk.Error)
 				continue
 			}
+			if w, ok := unusualWarning(i, meta, r); ok {
+				out.warnings = append(out.warnings, w)
+			}
 			v := r.Text
 			ch.Value = &v
 		}
@@ -184,7 +188,7 @@ func (l *Leader) Preview(ctx context.Context, req api.ConfigChangeRequest) (api.
 	if err != nil {
 		return api.ConfigChangePreview{}, err
 	}
-	out := api.ConfigChangePreview{Valid: len(ck.problems) == 0, Problems: ck.problems, Effects: []api.ConfigEffect{}, RestartServerIDs: []string{}, RestartOrder: []api.ConfigRestartStep{}}
+	out := api.ConfigChangePreview{Valid: len(ck.problems) == 0, Problems: ck.problems, Warnings: []api.ConfigWarning{}, Effects: []api.ConfigEffect{}, RestartServerIDs: []string{}, RestartOrder: []api.ConfigRestartStep{}}
 	if out.Problems == nil {
 		out.Problems = []api.ConfigProblem{}
 	}
@@ -192,6 +196,12 @@ func (l *Leader) Preview(ctx context.Context, req api.ConfigChangeRequest) (api.
 		return out, nil
 	}
 	after := applyToValues(sn.values, ck.changes)
+	out.Warnings = append(out.Warnings, ck.warnings...)
+	identity := make([]int, len(ck.changes))
+	for i := range identity {
+		identity[i] = i
+	}
+	out.Warnings = append(out.Warnings, reservedWarnings(sn, after, ck.changes, identity)...)
 	restart := map[string]bool{}
 	for _, name := range changedNames(ck.changes) {
 		meta := sn.metaBy[name]

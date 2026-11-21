@@ -18,6 +18,7 @@ import type {
   ConfigRestartStep,
   ConfigServerStatus,
   ConfigServerValue,
+  ConfigWarning,
   Task,
   ConfigLevel,
 } from '@/api/types'
@@ -515,6 +516,64 @@ function restartOrderOf(
   )
 }
 
+const MEMORY_UNITS = ['B', 'kB', '8kB']
+const RESERVED_SETTINGS = [
+  'max_connections',
+  'superuser_reserved_connections',
+  'reserved_connections',
+]
+
+/** The warnings of a valid preview: a memory value far from its default, and reserved connections that leave no room. */
+function warningsOf(s: MockState, checked: Checked[]): ConfigWarning[] {
+  const out: ConfigWarning[] = []
+  const at = (index: number, code: string, message: string): void => {
+    out.push({ index, pointer: `/changes/${index}/value`, code, message })
+  }
+  for (const c of checked) {
+    const def = c.def
+    if (c.value === null || def.type !== 'integer' || !MEMORY_UNITS.includes(def.unit ?? ''))
+      continue
+    const boot = Number(def.bootBase)
+    const r = checkConfigValue(c.value, specOf(def))
+    if (!r.ok || !(boot > 0)) continue
+    const base = Number(r.base)
+    if (base > boot * 10)
+      at(
+        c.index,
+        'config_value_unusual',
+        `${def.name} is more than ten times its default; this is unusual.`,
+      )
+    else if (base < boot / 10)
+      at(
+        c.index,
+        'config_value_unusual',
+        `${def.name} is below a tenth of its default; this is unusual.`,
+      )
+  }
+  const touched = checked.filter((c) => RESERVED_SETTINGS.includes(c.def.name))
+  if (touched.length > 0) {
+    const cfg = s.config
+    const next = applyToOverrides(cfg, checked, 'preview', cfg.revision + 1)
+    const last = touched[touched.length - 1] as Checked
+    for (const id of Object.keys(cfg.servers).sort()) {
+      const v = (name: string): number => Number(wantedValue(cfg, id, name, next).value)
+      const max = v('max_connections')
+      const su = v('superuser_reserved_connections')
+      const rs = v('reserved_connections')
+      if ([max, su, rs].some((n) => !Number.isFinite(n))) continue
+      if (max < su + rs + 1) {
+        at(
+          last.index,
+          'config_reserved_connections',
+          `On server ${id} max_connections (${max}) would be below superuser_reserved_connections (${su}) plus reserved_connections (${rs}) plus 1; PostgreSQL would not start.`,
+        )
+        break
+      }
+    }
+  }
+  return out
+}
+
 function preview(c: Ctx): ReturnType<Handler> {
   const req = body<S['ConfigChangeRequest']>(c)
   if (!Array.isArray(req.changes) || req.changes.length === 0)
@@ -529,6 +588,7 @@ function preview(c: Ctx): ReturnType<Handler> {
   return ok({
     valid: problems.length === 0,
     problems,
+    warnings: problems.length > 0 ? [] : warningsOf(c.s, checked),
     effects,
     restartServerIds,
     restartOrder: conflict ? [] : restartOrderOf(c.s, restartServerIds, dir),

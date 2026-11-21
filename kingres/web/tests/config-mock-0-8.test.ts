@@ -1017,3 +1017,59 @@ describe('who may do what', () => {
     await endpoints.getConfigSummary()
   })
 })
+
+describe('the warnings of a preview (contract 0.17.0)', () => {
+  it('flags a memory value above ten times or below a tenth of the default, not exactly ten times or a tenth', async () => {
+    await login()
+    // work_mem: default 4MB (4096 kB).
+    const w = async (v: string) =>
+      (await endpoints.previewConfigChange({ changes: [change('work_mem', v)] })).warnings ?? []
+    expect(await w('16MB')).toEqual([])
+    expect(await w('40MB')).toEqual([])
+    const high = await w('41MB')
+    expect(high).toHaveLength(1)
+    expect(high[0]).toMatchObject({
+      index: 0,
+      pointer: '/changes/0/value',
+      code: 'config_value_unusual',
+    })
+    expect((await w('409kB'))[0]?.code).toBe('config_value_unusual')
+    expect(await w('410kB')).toEqual([])
+  })
+
+  it('never flags a parameter that is not a memory size, and a removal', async () => {
+    await login()
+    const none = await endpoints.previewConfigChange({
+      changes: [change('statement_timeout', '24h'), change('work_mem', null)],
+    })
+    expect(none.valid).toBe(true)
+    expect(none.warnings ?? []).toEqual([])
+  })
+
+  it('warns when the reserved connections leave no room, and the preview stays valid', async () => {
+    await login()
+    const r = await endpoints.previewConfigChange({
+      changes: [change('superuser_reserved_connections', '100')],
+    })
+    expect(r.valid).toBe(true)
+    expect(r.problems).toEqual([])
+    expect(r.warnings).toHaveLength(1)
+    expect(r.warnings![0]).toMatchObject({ code: 'config_reserved_connections' })
+    // 3 + 96 + 1 = 100 is allowed.
+    const edge = await endpoints.previewConfigChange({
+      changes: [change('reserved_connections', '96')],
+    })
+    expect(edge.warnings ?? []).toEqual([])
+    const over = await endpoints.previewConfigChange({
+      changes: [change('reserved_connections', '97')],
+    })
+    expect(over.warnings).toHaveLength(1)
+  })
+
+  it('gives no warnings for an invalid request', async () => {
+    await login()
+    const r = await endpoints.previewConfigChange({ changes: [change('work_mem', '1GBx')] })
+    expect(r.valid).toBe(false)
+    expect(r.warnings ?? []).toEqual([])
+  })
+})

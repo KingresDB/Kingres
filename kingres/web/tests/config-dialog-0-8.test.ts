@@ -680,3 +680,26 @@ describe('restarting what waits', () => {
     expect(screen.queryByRole('dialog')).toBeNull()
   })
 })
+
+describe('the warnings of the preview (contract 0.17.0)', () => {
+  it('shows an unusual memory value as a warning and leaves Apply on', async () => {
+    const user = userEvent.setup()
+    const { dialog: d } = await openEdit(user, 'work_mem')
+    await type(user, d, '16MB')
+    await d.findByTestId('preview-sentence')
+    expect(d.queryByTestId('preview-warnings')).toBeNull()
+    await type(user, d, '1GB')
+    const box = await d.findByTestId('preview-warnings')
+    expect(box).toHaveTextContent('more than ten times its default')
+    await ready(d)
+  })
+
+  it('warns that reserved connections leave no room, and still lets the change be applied', async () => {
+    const user = userEvent.setup()
+    const { dialog: d } = await openEdit(user, 'superuser_reserved_connections')
+    await type(user, d, '100')
+    const box = await d.findByTestId('preview-warnings')
+    expect(box).toHaveTextContent('max_connections (100) would be below')
+    await ready(d)
+  })
+})

@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: KingresDB Management API
-  version: 0.14.0
+  version: 0.17.0
   summary: REST API of the KingresDB management panel, CLI and manager.
   description: |
     The single REST API served by `kingresd` on every KingresDB server. The web panel
@@ -9534,6 +9534,27 @@ components:
         message:
           type: string
           description: A sentence, with PostgreSQL's own text for an invalid value.
+    ConfigWarning:
+      type: object
+      description: Why one change of a valid request deserves a second look.
+      required: [index, pointer, code, message]
+      properties:
+        index:
+          type: integer
+          minimum: 0
+          description: Position in `changes`.
+        pointer:
+          type: string
+          description: JSON pointer into the request, for example `/changes/0/value`.
+        code:
+          type: string
+          description: |
+            `config_value_unusual` (a memory value more than ten times the parameter's default or below a tenth of it; exactly ten times and exactly a tenth
+            are not flagged) and `config_reserved_connections` (on some server `max_connections` would not exceed
+            `superuser_reserved_connections + reserved_connections`, so PostgreSQL would not start; the warning names the server). Clients must tolerate other values.
+        message:
+          type: string
+          description: A sentence.
     ConfigEffect:
       type: object
       description: What a change does to one parameter on one server.
@@ -9578,6 +9599,12 @@ components:
         problems:
           type: array
           items: { $ref: '#/components/schemas/ConfigProblem' }
+        warnings:
+          type: array
+          description: |
+            Things a valid change does that deserve a second look. A warning never makes the request invalid (`valid` depends on `problems` only) and
+            never stops `applyConfigChange`. Omitted by servers older than 0.17.0, so a client treats a missing property as an empty list.
+          items: { $ref: '#/components/schemas/ConfigWarning' }
         effects:
           type: array
           description: One entry per server and parameter that the change touches.
