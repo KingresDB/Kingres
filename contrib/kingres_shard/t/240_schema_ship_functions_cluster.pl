@@ -60,7 +60,9 @@ my $plan = sub { my ($n, $sql, $pre) = @_; return q1($n, ($pre // '') . "EXPLAIN
 is(q1($n1, q{SELECT ship_functions FROM kingres.dist_schema WHERE nsp = 'fa'::regnamespace}), 'f', 'the flag is off by default');
 like($plan->($n1, q{SELECT fa.plus(n) FROM fa.t WHERE id = 3}), qr/Kingres Distributed Scan/, 'a read that calls a function of the schema is the scan');
 is(q1($n1, q{SELECT fa.plus(n) FROM fa.t WHERE id = 3}), 1030, '... and the answer is right');
-fails($n1, q{INSERT INTO fa.t SELECT 100, fa.plus(1)}, qr/the schema does not ship functions/, 'a write that calls a function of the schema');
+q1($n1, q{INSERT INTO fa.t SELECT 99, fa.plus(1)});
+is(q1($n2, q{SELECT n FROM fa.t WHERE id = 99}), 1001, 'a write that calls a function of the schema, not shipped: the function is evaluated here, the row goes to the owner (row router)');
+q1($n2, q{DELETE FROM fa.t WHERE id = 99});
 
 # ---------------------------------------------------------------------------
 # B. on
@@ -91,7 +93,9 @@ is(prepared_count($_), 0, $_->name . ': nothing is prepared') for @nodes;
 # ---------------------------------------------------------------------------
 like($plan->($n1, q{SELECT public.lf(n) FROM fa.t WHERE id = 3}), qr/Kingres Distributed Scan/, 'a function of public is not shipped');
 is(q1($n1, q{SELECT public.lf(n) FROM fa.t WHERE id = 3}), 60, '... and the statement works: it runs here (the function exists on this node only)');
-fails($n1, q{INSERT INTO fa.t SELECT 101, public.lf(2)}, qr/calls a function that is not in a distributed schema/, 'a write that calls it is refused with the reason');
+q1($n1, q{INSERT INTO fa.t SELECT 101, public.lf(2)});
+is(q1($n2, q{SELECT n FROM fa.t WHERE id = 101}), 4, 'a write that calls it: evaluated here, the row goes to the owner');
+q1($n2, q{DELETE FROM fa.t WHERE id = 101});
 
 # ---------------------------------------------------------------------------
 # D. a schema that does not ship; another owner

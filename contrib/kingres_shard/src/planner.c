@@ -3044,6 +3044,18 @@ search_path_for_functions(void)
 	return buf.data;
 }
 
+char *
+kingres_shard_search_path_for_functions(void)
+{
+	return search_path_for_functions();
+}
+
+bool
+kingres_shard_table_runs_hidden_code(Oid relid)
+{
+	return table_runs_hidden_code(relid);
+}
+
 static bool
 statement_tables_run_hidden_code(List *relids)
 {

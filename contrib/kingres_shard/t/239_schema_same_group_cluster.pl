@@ -86,9 +86,11 @@ for my $n (@nodes)
 {
 	is(q1($n, $cross), '30:465', $n->name . ': a read over two schemas of different owners');
 }
-fails($n1, q{INSERT INTO sa.t SELECT id + 3000, x FROM sc.t}, qr/span|more than one|not supported/, 'a write that reads a schema of another owner');
+q1($n1, q{INSERT INTO sa.t SELECT id + 3000, x FROM sc.t});
+is(q1($n2, q{SELECT count(*) FROM sa.t WHERE id > 3000}), 30, 'a write that reads a schema of another owner goes to the owner through the row router');
+q1($n2, q{DELETE FROM sa.t WHERE id > 3000});
 fails($n3, q{UPDATE sa.t a SET v = c.x FROM sc.t c WHERE a.id = c.id}, qr/span|more than one|not supported/, 'an UPDATE that reads a schema of another owner');
-is(q1($n2, q{SELECT count(*) FROM sa.t WHERE id > 3000}), 0, '... nothing was written');
+is(q1($n2, q{SELECT count(*) FROM sa.t WHERE id > 3000}), 0, '... and the refused UPDATE wrote nothing');
 
 # ---------------------------------------------------------------------------
 # C. a prepared statement and a move, in one session

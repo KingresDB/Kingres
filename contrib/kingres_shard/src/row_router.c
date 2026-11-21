@@ -84,6 +84,7 @@
 #include "node_conn.h"
 #include "placement_check.h"
 #include "remote_scan.h"
+#include "planner.h"
 #include "row_router.h"
 #include "shippable.h"
 
@@ -726,6 +727,8 @@ make_destination(KsDestination *dest, KsBatchSpec *spec, const KsDistTable *dt,
 					 errmsg("shard group %d has no active primary node", kingres_shard_schema_table_owner(dt))));
 		dest->kind = KS_DEST_ONE_NODE;
 		dest->node_id = owner->node_id;
+		if (kingres_shard_table_runs_hidden_code(dt->relid))
+			dest->search_path = kingres_shard_search_path_for_functions();
 		dest->placement = NULL;
 		dest->key_attno = -1;
 		dest->expect_placement = 0;

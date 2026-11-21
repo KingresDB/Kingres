@@ -99,6 +99,7 @@ struct KsBatchSender
 	int			key_attno;
 	int64		expect_placement;
 	bool		check_identity;
+	char	   *search_path;
 	int			colocation_id;
 	int64		origin_identity;
 	bool		origin_has_parts;
@@ -321,6 +322,7 @@ kingres_shard_batch_begin(const KsDestination *dest, const KsBatchSpec *spec)
 	s->key_attno = dest->key_attno;
 	s->expect_placement = dest->expect_placement;
 	s->check_identity = dest->check_identity;
+	s->search_path = dest->search_path != NULL ? pstrdup(dest->search_path) : NULL;
 	s->ncols = list_length(spec->columns);
 	s->coltypes = palloc(sizeof(Oid) * Max(s->ncols, 1));
 	s->outfuncs = palloc0(sizeof(FmgrInfo) * Max(s->ncols, 1));
@@ -662,6 +664,13 @@ start_dest(KsBatchSender *s, KsBatchDest *d)
 		return;
 	d->kc = kingres_shard_get_conn(d->host, d->port, false, NULL);
 	kingres_shard_begin_write_xact(d->kc);
+	if (s->search_path != NULL)
+	{
+		const char *pv[1];
+
+		pv[0] = s->search_path;
+		PQclear(kingres_shard_exec_params(d->kc, "SELECT pg_catalog.set_config('search_path', $1, true)", 1, NULL, pv, true));
+	}
 
 	ectx.s = s;
 	ectx.d = d;
@@ -928,6 +937,14 @@ kingres_shard_batch_finish(KsBatchSender *s)
 			wait_for_batch(d);
 	}
 	kingres_shard_fault_point("bulk_after_last_batch");
+	if (s->search_path != NULL)
+		foreach(lc, s->dests)
+		{
+			KsBatchDest *d = (KsBatchDest *) lfirst(lc);
+
+			if (d->started && !d->is_local)
+				PQclear(kingres_shard_exec(d->kc, "SET LOCAL search_path = pg_catalog"));
+		}
 
 	/*
 	 * The map version rule for a write (design 10.2): every group that was written is
