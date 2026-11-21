@@ -565,6 +565,10 @@ func (r *Runner) promote(ctx context.Context, j journal.Journal) (bool, error) {
 		}
 		req.Checkpoint, req.ClusterState = cp, state
 	}
+	// The intent is on disk before the call (F5-03): a promotion that ran and is not yet recorded cannot be given up as if it had not happened.
+	if err := r.Journal.PromotionIntent(); err != nil {
+		return false, err
+	}
 	for try := 0; ; try++ {
 		ans, err := r.P.Promote(ctx, r.P.Self(), req)
 		switch {
@@ -583,7 +587,7 @@ func (r *Runner) promote(ctx context.Context, j journal.Journal) (bool, error) {
 				return false, &failover.PauseError{Reason: reason + "; the old leader could not be told (" + perr.Error() + "): start its server again"}
 			}
 			_ = r.Journal.Event(journal.StepPromote, "refused", map[string]any{"reason": reason})
-			if aerr := r.Journal.Abandon(reason); aerr != nil {
+			if aerr := r.Journal.AbandonUnpromoted(reason); aerr != nil {
 				return false, aerr
 			}
 			return false, failover.Fail(failover.CodeSwitchoverUnproven, false, "%s", reason)

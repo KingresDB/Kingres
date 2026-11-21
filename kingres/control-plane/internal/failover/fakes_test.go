@@ -70,6 +70,7 @@ type world struct {
 	mapStarts          []MapStartRequest
 	mapProofs          []MapProofRequest
 	noPromoteOnProof   bool
+	mapAbandonErr      error // the candidate answers the abandon with this (a 409 conflict: it promoted)
 	mapRefusal         string
 	mapStartErr        error
 	markErr            error   // the answer of the mark call
@@ -811,7 +812,7 @@ func (p fpeers) MapProof(_ context.Context, server string, r MapProofRequest) er
 
 func (p fpeers) MapAbandon(_ context.Context, server, reason string) error {
 	p.w.rec("map-abandon %s", server)
-	return nil
+	return p.w.mapAbandonErr
 }
 
 // group is the group that the world's fake catalog moves: 1, or 0 for a world of the map group.

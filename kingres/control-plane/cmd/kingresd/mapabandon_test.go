@@ -175,3 +175,29 @@ func TestTheMonitorLetsGoOfTheLeaseOfAStuckBootstrap(t *testing.T) {
 		t.Fatalf("an old bootstrap: released %d", seen.released)
 	}
 }
+
+// F5-03. The call that promotes was begun and its answer is not recorded: the bootstrap is given up only when the standby is asked and is still in
+// recovery; a standby that cannot be asked, or is out of recovery, keeps the bootstrap.
+func TestABegunPromotionIsGivenUpOnlyForAStandbyThatIsStillInRecovery(t *testing.T) {
+	cases := []struct {
+		name string
+		rec  func(context.Context) (bool, error)
+		want bool
+	}{
+		{"still a standby", func(context.Context) (bool, error) { return true, nil }, true},
+		{"promoted", func(context.Context) (bool, error) { return false, nil }, false},
+		{"cannot be asked", func(context.Context) (bool, error) { return false, errors.New("down") }, false},
+		{"no way to ask", nil, false},
+	}
+	for _, c := range cases {
+		m, js := abandonRig(t)
+		abandonWatch(m)
+		m.inRecovery = c.rec
+		_, _ = js.Begin("b1", "s1", 3, "manual", "alice", false)
+		_ = js.PromotionIntent()
+		ok, err := m.abandonLocal(context.Background(), "x")
+		if ok != c.want || (!c.want && err == nil) || js.Active() == c.want {
+			t.Errorf("%s: given up %v err %v active %v", c.name, ok, err, js.Active())
+		}
+	}
+}

@@ -299,13 +299,19 @@ var ErrPromoted = errors.New("journal: the standby was promoted; the bootstrap c
 
 // Abandon gives up a bootstrap that did not reach the promotion (F4-06): the gate of the engine opens, the monitor looks again, and a new
 // bootstrap may begin. After the promotion (B5) it is refused: the promoted instance holds the lease and the bootstrap must end.
-func (s *Store) Abandon(reason string) error {
+func (s *Store) Abandon(reason string) error { return s.abandon(reason, false) }
+
+// AbandonUnpromoted is Abandon for a caller that knows that nothing was promoted although the promoting call began: the callee refused before it changed
+// anything, or the instance was asked and is still in recovery (F5-03). Only a recorded promotion refuses it.
+func (s *Store) AbandonUnpromoted(reason string) error { return s.abandon(reason, true) }
+
+func (s *Store) abandon(reason string, unpromoted bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.j == nil || s.finishedLocked() || !s.j.Abandoned.IsZero() {
 		return nil
 	}
-	if !s.j.Done[StepPromote].IsZero() {
+	if !s.j.Done[StepPromote].IsZero() || (!unpromoted && s.promotionStartedLocked()) {
 		return ErrPromoted
 	}
 	s.j.Abandoned = s.now().UTC()
@@ -365,4 +371,39 @@ func (s *Store) SetProof(checkpoint, clusterState string) error {
 	}
 	s.j.Planned.Checkpoint, s.j.Planned.ClusterState = checkpoint, clusterState
 	return s.saveLocked()
+}
+
+// promotionStartedLocked says that the call that promotes was begun: the intent is recorded before the call, because the answer is recorded after it and a
+// promotion that ran and was not recorded (kingresd ended, or the answer is still on its way) must not be given up as if it had not happened (F5-03).
+func (s *Store) promotionStartedLocked() bool {
+	if s.j == nil {
+		return false
+	}
+	for _, e := range s.j.Events {
+		if e.Step == StepPromote && e.Kind == "promoting" {
+			return true
+		}
+	}
+	return false
+}
+
+// PromotionIntent records, once, that the call that promotes is about to be made.
+func (s *Store) PromotionIntent() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.j == nil {
+		return errors.New("journal: no bootstrap is in progress")
+	}
+	if s.promotionStartedLocked() {
+		return nil
+	}
+	s.j.Events = append(s.j.Events, Event{At: s.now().UTC(), Step: StepPromote, Kind: "promoting"})
+	return s.saveLocked()
+}
+
+// PromotionStarted says that the intent is recorded.
+func (s *Store) PromotionStarted() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.promotionStartedLocked()
 }

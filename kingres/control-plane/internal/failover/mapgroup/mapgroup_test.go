@@ -23,7 +23,8 @@ type world struct {
 	pulls                     int
 	pullCheckpoint, pullState string
 	pullErr                   error
-	promoteErr                error // the callee refuses a promotion that carries a proof
+	onPromote                 func() // runs inside the call that promotes (a test gives the bootstrap up there)
+	promoteErr                error  // the callee refuses a promotion that carries a proof
 	promoteReqs               []failover.PromoteRequest
 	freezeErr                 error // FreezeLocal fails from the second call on (the agent was lost with a restart)
 	freezes                   int
@@ -143,6 +144,11 @@ func (p ports) Lease(_ context.Context, s string, r failover.LeaseRequest) (fail
 	}
 }
 func (p ports) Promote(_ context.Context, s string, r failover.PromoteRequest) (failover.PromoteAnswer, error) {
+	p.w.mu.Lock()
+	p.w.mu.Unlock()
+	if p.w.onPromote != nil {
+		p.w.onPromote()
+	}
 	p.w.mu.Lock()
 	p.w.promoteReqs = append(p.w.promoteReqs, r)
 	if p.w.promoteErr != nil && r.Checkpoint != "" {
@@ -733,5 +739,19 @@ func TestAStateThatIsNotShutDownIsNotAProof(t *testing.T) {
 	var pe *failover.PauseError
 	if !errors.As(err, &pe) || len(w.promoteReqs) != 0 {
 		t.Fatalf("want a pause and no promotion: %v %+v", err, w.promoteReqs)
+	}
+}
+
+// F5-03. An abandon that arrives while the call that promotes is in flight is refused: the intent was written before the call.
+func TestAnAbandonWhilePromoteIsInFlightIsRefused(t *testing.T) {
+	w := newWorld()
+	r, js := w.runner(t)
+	var abandonErr error
+	w.onPromote = func() { abandonErr = js.Abandon("an operator") }
+	if _, err := r.Run(context.Background(), req()); err != nil {
+		t.Fatalf("%v\n%s", err, strings.Join(w.log, "\n"))
+	}
+	if !errors.Is(abandonErr, journal.ErrPromoted) {
+		t.Fatalf("the abandon during the promotion: %v", abandonErr)
 	}
 }

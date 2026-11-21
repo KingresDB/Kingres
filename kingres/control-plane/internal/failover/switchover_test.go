@@ -794,3 +794,46 @@ func TestARollbackAfterAStopThatDidNotReleaseTheLeaseStillReleasesTheCandidate(t
 		t.Fatalf("the rollback with unreadable rows:\n%s", strings.Join(w.log, "\n"))
 	}
 }
+
+// F5-03. The rollback asks the candidate first: when it answers that it promoted (or may have), nothing is rolled back: no lease is released and the old
+// leader is not resumed; the step ends as the hand-over it is. In an ordinary rollback the candidate is asked before the leases are released.
+func TestARollbackThatMeetsAPromotedCandidateLeavesTheOldLeaderHeld(t *testing.T) {
+	w := mapWorld()
+	w.dbDownAfterStop = true
+	w.mapRefusal = "the standby could not prove it"
+	w.mapAbandonErr = &CallError{Status: 409, Code: "conflict", Message: "it promoted"}
+	r := w.runner()
+	w.fakeClock(r)
+	raw, _ := json.Marshal(mapGracefulInput())
+	steps, serr := r.steps(raw)
+	if serr != nil {
+		t.Fatal(serr)
+	}
+	for _, s := range steps {
+		err := s.Run(context.Background(), &task.Env{Task: task.Task{ID: 1, Input: raw}})
+		var sk *task.SkipError
+		if err != nil && !errors.As(err, &sk) {
+			t.Fatalf("%s should end as a hand-over: %v\n%s", s.Name, err, strings.Join(w.log, "\n"))
+		}
+		if s.Name == StepName(0, StepStopClean) {
+			break // the old leader's task ends here: its database is stopped
+		}
+	}
+	if w.count("map-abandon s2") != 1 || w.count("resume s1") != 0 || w.count("lease-release") != 0 || w.count("unquiesce s1") != 0 {
+		t.Fatalf("a rollback ran although the candidate promoted:\n%s", strings.Join(w.log, "\n"))
+	}
+}
+
+func TestTheRollbackAsksTheCandidateBeforeItReleasesTheLeasesAndResumes(t *testing.T) {
+	w := mapWorld()
+	w.dbDownAfterStop = true
+	w.mapRefusal = "refused"
+	r := w.runner()
+	w.fakeClock(r)
+	_, err := runAll(t, r, mapGracefulInput())
+	failedWith(t, w, err, CodeSwitchoverUnproven)
+	a, l, rs := w.index("map-abandon s2"), w.index("lease-release"), w.index("resume s1")
+	if a < 0 || l < 0 || rs < 0 || !(a < l && a < rs) {
+		t.Fatalf("the order (abandon %d, release %d, resume %d):\n%s", a, l, rs, strings.Join(w.log, "\n"))
+	}
+}

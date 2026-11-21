@@ -134,17 +134,23 @@ func (r *Runner) chooseGraceful(ctx context.Context, env *task.Env, sc *stepCtx)
 // rollbackSwitchover undoes what a switchover did to the old primary, as far as the promotion has not happened (design 5.3). Every part
 // is idempotent and best effort: the leases of the run are released, the writes are let in again and the old primary, when it was
 // stopped, is started again by its lease manager (the wait marker). It never runs for a group that was promoted.
-func (r *Runner) rollbackSwitchover(ctx context.Context, taskID int64, in Input, g int32, newServer string, term int64) {
+func (r *Runner) rollbackSwitchover(ctx context.Context, taskID int64, in Input, g int32, newServer string, term int64) (handedOver bool) {
 	ctx = context.WithoutCancel(ctx)
+	if g == 0 && newServer != "" {
+		// The bootstrap of the candidate that this task started is asked FIRST (F5-03): it is given up (and lets go of its lease), or it answers that it promoted or
+		// may have, in which case nothing is rolled back: the old leader stays held back and the candidate goes on. Only then are the leases released and the old
+		// leader resumed.
+		if err := r.Peers.MapAbandon(ctx, newServer, "the planned switchover of the map group was rolled back"); err != nil {
+			if IsCode(err, "conflict") {
+				r.log().Warn("failover: the candidate of the map group promoted; the old leader stays held back and nothing is rolled back", "server", newServer)
+				return true
+			}
+			r.log().Warn("failover: the bootstrap of the map group could not be given up", "server", newServer, "error", err)
+		}
+	}
 	_, _ = r.Peers.Lease(ctx, r.Plan.Self(), LeaseRequest{Group: g, Role: LeaseRelease})
 	if newServer != "" && newServer != r.Plan.Self() {
 		_, _ = r.Peers.Lease(ctx, newServer, LeaseRequest{Group: g, Role: LeaseRelease})
-	}
-	if g == 0 && newServer != "" {
-		// The bootstrap of the candidate that this task started is given up: it would otherwise wait for a lease and a proof that do not come.
-		if err := r.Peers.MapAbandon(ctx, newServer, "the planned switchover of the map group was rolled back"); err != nil {
-			r.log().Warn("failover: the bootstrap of the map group could not be given up", "server", newServer, "error", err)
-		}
 	}
 	// An error is logged, never swallowed: a server that cannot be reached keeps its hold and its marker, and the loop of Repair undoes them when
 	// the server answers again (F4-02), whatever became of this task.
@@ -157,6 +163,7 @@ func (r *Runner) rollbackSwitchover(ctx context.Context, taskID int64, in Input,
 	r.mu.Lock()
 	delete(r.paused, pauseKey(taskID, g))
 	r.mu.Unlock()
+	return false
 }
 
 // rollbackFailed rolls back and returns the failure of the step.
@@ -177,7 +184,11 @@ func (sc *stepCtx) rollbackFailed(ctx context.Context, code string, retry bool, 
 	if run, err := sc.runRow(ctx); err == nil {
 		term = run.ExpectedTerm
 	}
-	sc.r.rollbackSwitchover(ctx, sc.env.Task.ID, sc.in, sc.group, newServer, term)
+	if sc.r.rollbackSwitchover(ctx, sc.env.Task.ID, sc.in, sc.group, newServer, term) {
+		// The candidate answered that it promoted (or may have): the group is handed over, not rolled back, and the step ends as the hand-over it is (F5-03).
+		sc.event(ctx, "handedOver", map[string]any{"code": code})
+		return nil
+	}
 	sc.event(ctx, "rolledBack", map[string]any{"code": code})
 	return fail(code, retry, format, a...)
 }
@@ -477,7 +488,7 @@ func (r *Runner) rollbackUnpromoted(ctx context.Context, t task.Task, in Input) 
 		if run, rerr := runRowOf(ctx, rows, in, g); rerr == nil {
 			term = run.ExpectedTerm
 		}
-		r.rollbackSwitchover(ctx, t.ID, in, g, gr.NewServer, term)
+		_ = r.rollbackSwitchover(ctx, t.ID, in, g, gr.NewServer, term)
 	}
 }
 
@@ -528,7 +539,7 @@ func (sc *stepCtx) restoreContinues(ctx context.Context, err error) error {
 	if run, rerr := sc.runRow(ctx); rerr == nil {
 		term = run.ExpectedTerm
 	}
-	sc.r.rollbackSwitchover(ctx, sc.env.Task.ID, sc.in, sc.group, gr.NewServer, term)
+	_ = sc.r.rollbackSwitchover(ctx, sc.env.Task.ID, sc.in, sc.group, gr.NewServer, term)
 	_ = sc.r.Peers.Unfreeze(ctx, sc.old(), sc.group)
 	text := fe.Code + ": " + fe.Message
 	if serr := sc.rows.Set(ctx, sc.group, GroupSet{State: ptr("failed"), Error: &text, Finished: true}); serr != nil {

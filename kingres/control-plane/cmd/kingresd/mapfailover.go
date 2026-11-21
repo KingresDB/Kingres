@@ -65,6 +65,9 @@ type mapFailover struct {
 	tellOldLeader func(ctx context.Context, oldServer string, taskID int64, reason string) error
 	// candidateCheck says whether a server hosts a ready standby of the map group (nil: read from the catalog of this server).
 	candidateCheck func(ctx context.Context, server string) bool
+	// inRecovery asks the instance of the standby that this server would promote whether it is still in recovery (nil: it cannot be asked, and a promotion that was begun is
+	// then never given up).
+	inRecovery func(ctx context.Context) (bool, error)
 
 	mu      sync.Mutex
 	running bool
@@ -84,6 +87,22 @@ func newMapFailover(dataDir string, svc *cluster.Service, self string, log *slog
 	}
 	m.tellOldLeader = func(ctx context.Context, oldServer string, taskID int64, reason string) error {
 		return m.peers.do(ctx, oldServer, http.MethodPost, "/failover/map/refused", mapRefusedBody{Reason: reason, TaskID: taskID}, nil)
+	}
+	m.inRecovery = func(ctx context.Context) (bool, error) {
+		cur, ok := m.journal.Current()
+		if !ok || cur.Pin == nil {
+			return true, nil // nothing is pinned: nothing was promoted
+		}
+		c, err := m.svc.InstanceConn(ctx, cur.Pin.Instance, sysdb.Database)
+		if err != nil {
+			return false, err
+		}
+		defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+		var rec bool
+		if err := c.QueryRow(ctx, `SELECT pg_is_in_recovery()`).Scan(&rec); err != nil {
+			return false, err
+		}
+		return rec, nil
 	}
 	m.runner = &mapgroup.Runner{P: &mapPorts{m: m}, Journal: js, Fault: faultErr,
 		Log: func(f string, a ...any) { log.Info(fmt.Sprintf(f, a...)) }}
@@ -703,9 +722,16 @@ func (m *mapFailover) abandonLocal(ctx context.Context, reason string) (bool, er
 		return false, nil
 	}
 	cur, _ := m.journal.Current()
-	if err := m.journal.Abandon(reason); err != nil {
+	err := m.journal.Abandon(reason)
+	if errors.Is(err, journal.ErrPromoted) && cur.Done[journal.StepPromote].IsZero() && m.inRecovery != nil {
+		// The call that promotes was begun and its answer is not recorded (F5-03): the bootstrap is given up only when the standby is asked and is still in recovery.
+		if rec, rerr := m.inRecovery(ctx); rerr == nil && rec {
+			err = m.journal.AbandonUnpromoted(reason)
+		}
+	}
+	if err != nil {
 		if errors.Is(err, journal.ErrPromoted) {
-			return false, problem.New(problem.Conflict, "The bootstrap of the map group already promoted its standby; it cannot be given up, and goes on to its end.")
+			return false, problem.New(problem.Conflict, "The bootstrap of the map group promoted its standby, or was about to and the standby cannot be shown to be a standby still; it cannot be given up, and goes on to its end.")
 		}
 		return false, err
 	}
