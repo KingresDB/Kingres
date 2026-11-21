@@ -9,7 +9,17 @@
 # a killed run are removed by the next run, by proof of ownership only.
 #
 # Usage (from kingres\control-plane):
-#   .\scripts\run-integration.ps1 [-Packages ./internal/instance,./internal/sysdb] [-Run TestName] [-Race] [-Install ~/kw-cp19/install]
+#   .\scripts\run-integration.ps1 [-Packages ./internal/instance,./internal/sysdb] [-Run TestName] [-Race] [-Install ~/kw-cp19/install] [-Lane 2]
+#
+# -Packages takes one package, or several as separate array elements (-Packages ./a, ./b); one
+# string with commas inside is not split.
+#
+# Lanes: runs of the same lane queue up behind one mutex; runs of different lanes run side by
+# side. A lane has its own staging directory and its own directory of binaries in WSL
+# (~/kw-cp/test/bin-<lane>); the run roots and the port slices of run-wsl-tests.sh already keep
+# concurrent runs apart. Give each lane its own installation (-Install) when the extensions
+# differ, since an installation is shared by every run that names it. No -Lane is the default
+# lane, the one every run used before lanes existed.
 param(
     [string[]]$Packages = @(),
     [string]$Run = '',
@@ -27,12 +37,17 @@ param(
     # A directory (a Windows path) where the tests keep the whole publication of a real cluster (KINGRES_PUBLICATION_FIXTURES inside WSL).
     [string]$Fixtures = '',
     # Further variables for the tests, NAME=value with plain characters, separated by semicolons (for example KINGRES_QUIET_MINUTES=10).
-    [string]$TestEnv = ''
+    [string]$TestEnv = '',
+    # The lane of the run (lower-case letters and digits); empty is the default lane.
+    [string]$Lane = ''
 )
 $ErrorActionPreference = 'Stop'
+if ($Lane -notmatch '^[a-z0-9]*$') { throw "-Lane must be lower-case letters and digits, got '$Lane'" }
+$laneSuffix = ''
+if ($Lane) { $laneSuffix = "-$Lane" }
 # Two runs would share the staging directory, ~/kw-cp/test/bin and the test ports: runs of
 # several people or agents on one machine queue up behind this mutex instead.
-$lock = New-Object System.Threading.Mutex($false, 'Global\kingres-cp-integration')
+$lock = New-Object System.Threading.Mutex($false, "Global\kingres-cp-integration$laneSuffix")
 try { [void]$lock.WaitOne() } catch [System.Threading.AbandonedMutexException] { }
 $module = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 Push-Location $module
@@ -44,7 +59,7 @@ try {
         try { $Packages = @(& go list -f '{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}' ./... | Where-Object { $_ }) } finally { Remove-Item Env:GOOS -ErrorAction SilentlyContinue }
     }
     function ConvertTo-WslPath([string]$p) { $p = [IO.Path]::GetFullPath($p); return '/mnt/' + $p.Substring(0,1).ToLower() + $p.Substring(2).Replace([string][char]92, '/') }
-    $stage = Join-Path ([IO.Path]::GetTempPath()) 'kingresd-wsl-tests'
+    $stage = Join-Path ([IO.Path]::GetTempPath()) "kingresd-wsl-tests$laneSuffix"
     $stage = [IO.Path]::GetFullPath($stage)
     if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
     New-Item -ItemType Directory $stage | Out-Null
@@ -83,16 +98,16 @@ try {
     # Copy into WSL so that the binaries run from the native file system.
     $wslStage = ConvertTo-WslPath $stage
     $wslScript = ConvertTo-WslPath (Join-Path $PSScriptRoot 'run-wsl-tests.sh')
-    & wsl.exe -d $Distro -u $WslUser bash -c "rm -rf ~/kw-cp/test/bin && mkdir -p ~/kw-cp/test/bin && cp '$wslStage'/kingresd '$wslStage'/kingres-verify '$wslStage'/*.test '$wslStage'/openapi.yaml '$wslStage'/README.md '$wslStage'/operations_gen.go.txt '$wslStage'/wsl-allowed-skips.txt ~/kw-cp/test/bin/ && cp -r '$wslStage'/fixtures ~/kw-cp/test/bin/ && chmod +x ~/kw-cp/test/bin/*.test ~/kw-cp/test/bin/kingresd ~/kw-cp/test/bin/kingres-verify && { if [ -f '$wslStage'/kingres-watchdog ]; then cp '$wslStage'/kingres-watchdog ~/kw-cp/test/bin/ && chmod +x ~/kw-cp/test/bin/kingres-watchdog; fi; }"
+    & wsl.exe -d $Distro -u $WslUser bash -c "rm -rf ~/kw-cp/test/bin$laneSuffix && mkdir -p ~/kw-cp/test/bin$laneSuffix && cp '$wslStage'/kingresd '$wslStage'/kingres-verify '$wslStage'/*.test '$wslStage'/openapi.yaml '$wslStage'/README.md '$wslStage'/operations_gen.go.txt '$wslStage'/wsl-allowed-skips.txt ~/kw-cp/test/bin$laneSuffix/ && cp -r '$wslStage'/fixtures ~/kw-cp/test/bin$laneSuffix/ && chmod +x ~/kw-cp/test/bin$laneSuffix/*.test ~/kw-cp/test/bin$laneSuffix/kingresd ~/kw-cp/test/bin$laneSuffix/kingres-verify && { if [ -f '$wslStage'/kingres-watchdog ]; then cp '$wslStage'/kingres-watchdog ~/kw-cp/test/bin$laneSuffix/ && chmod +x ~/kw-cp/test/bin$laneSuffix/kingres-watchdog; fi; }"
     if ($Install -and $Install -notmatch '^[A-Za-z0-9_./~$-]+$') { throw "-Install must be a plain path inside WSL, got '$Install'" }
-    $envInstall = ''
-    if ($Install) { $envInstall = "export KINGRES_INSTALL=$Install; " }
+    $envInstall = "export KINGRES_TEST_BIN=`$HOME/kw-cp/test/bin$laneSuffix; "
+    if ($Install) { $envInstall += "export KINGRES_INSTALL=$Install; " }
     if ($Fixtures) { New-Item -ItemType Directory -Force $Fixtures | Out-Null; $envInstall += "export KINGRES_PUBLICATION_FIXTURES='$(ConvertTo-WslPath $Fixtures)'; " }
     foreach ($kv in ($TestEnv -split ';' | Where-Object { $_ })) {
         if ($kv -notmatch '^[A-Z][A-Z0-9_]*=[A-Za-z0-9_./-]*$') { throw "-TestEnv holds a pair that is not NAME=value with plain characters: $kv" }
         $envInstall += "export $kv; "
     }
-    $bins = ($names | ForEach-Object { "`$HOME/kw-cp/test/bin/$_.test" }) -join ' '
+    $bins = ($names | ForEach-Object { "`$HOME/kw-cp/test/bin$laneSuffix/$_.test" }) -join ' '
     $flags = @()
     if ($Run) { $flags += "-test.run '$Run'" }
     if ($Count -gt 1) { $flags += "-test.count=$Count" }
