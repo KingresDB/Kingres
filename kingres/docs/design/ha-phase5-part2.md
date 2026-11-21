@@ -2666,3 +2666,23 @@ Evidence. Unit: `internal/lease` `TestHoldBackKeepsRenewingThroughASlowStop` (a 
 shown failing on the old code (`Relinquish` in place of `HoldBack`) and passing on the new, in the gate that follows.
 
 **Progress on the delta (2026-11-21, later).** The leader's side is built for a planned switchover (`graceful`) and the restore: `Preflight` accepts group 0 for them when the task runs on the old leader's own server (a hard failover of a live leader's server stays 422), `mapLast` puts group 0 last, `stopClean` starts the bootstrap (`MapStart`, planned) before the mark and sends the proof (`MapProof`) after the stop, a rollback gives the bootstrap up (`MapAbandon`), the bootstrap marks the task's group 0 row promoted with the new term (`RecordPlanned`) and `runRowOf` reads that term, and the steps `Stop the old primary cleanly`, `Verify`, `Lease`, `Hand the lease` and `Promote` of group 0 skip on the new leader when the standby is out of recovery. Cluster: `TestSwitchoverOfTheMapGroup` passes on PostgreSQL 18 (the task ends done on the new leader, the leader is the standby's server, nothing acknowledged is lost). Open points 1 (who restarts the old leader after a refused proof) and 2 (the fence of the re-run on a leader change at the stop) have no cluster test yet.
+
+**The two open points of the delta, settled (2026-11-21, last).**
+1. *The standby refuses the proof after the old leader has stopped.* No operator is needed, because nothing was promoted and the lease decides who may run. The candidate's call
+   to promote carries the proof, the callee runs `switchover_verify` first, and a refusal (`unprovable`, `standby_behind`) ends the bootstrap: the candidate **lets go of the fence
+   lease** it holds (so that the old leader can win its own lease: it was released by the clean stop), tells the old leader (`POST /failover/map/refused`, accepted only from the
+   server the old leader's task asked to start the bootstrap), records the event `refused`, gives the journal up and returns `switchover_unproven`. The old leader's task does not
+   end at the proof: `Stop the old primary cleanly` waits for the verdict (the candidate promoted, or refused, or `MapVerdictWait`, 6 min, passed) and on a refusal or silence rolls
+   back through the path of every failure: the lease is released, the old primary is resumed (`Manager.Resume`: the marker comes off and the wait marker is written, so the lease
+   manager starts the primary as soon as it holds the lease), the writes are let in again, the candidate's bootstrap is given up (`map/abandon`) and the task is recorded `failed`
+   once the old leader's database is back. A candidate that says nothing is waited for, and the lease keeps the two apart: the old leader cannot win the lease while the candidate
+   renews it, and the candidate cannot promote without the lease. The alert `failoverNeedsDecision` is raised by the candidate and says that the old leader is started again.
+   Fault: `promote:unproven` (mode `fail`) on the candidate. Cluster test: `TestSwitchoverOfTheMapGroupWhoseProofIsRefused`.
+2. *The leader changes at the stop (the old leader's kingresd ends after the clean stop, before its task sends the proof).* The old primary stays stopped: the relinquished marker is
+   on disk before the stop and keeps the start gate shut, and its lease was released. The candidate does not wait for ever: after `ProofPullAfter` (20 s) without the proof it
+   **reads it from the old leader's server** (`GET /failover/map/checkpoint`: pg_controldata of a primary that does not run, `409 not_stopped` when it does), takes it only when
+   the state is `shut down`, and promotes on it; the standby's `switchover_verify` checks it against what it replayed, exactly as for a proof that is sent. A restarted old leader
+   cannot finish the task (its database is the stopped instance), and the new leader's engine claims it, skips the steps that were done and finishes it; the calls that the finishing
+   steps make to the old primary's server wait 15 s (`OldServerWait`) instead of the minutes that a server that answers "not ready" makes a task step wait. There is no second
+   primary at any time: the old one cannot start (the marker, and the lease is held by the candidate from B3 on), and the candidate promotes only on a proof. Fault: `demote:exit`
+   (mode `exit`) on the old leader. Cluster test: `TestSwitchoverOfTheMapGroupWhoseOldLeaderEndsAtTheStop`.
