@@ -186,8 +186,9 @@ and the others get `r + i*m`. Two buckets that coexist never share a remainder
 (two different moduli with equal remainder overlap on slot `r`), so the key stays
 unique, the name `<table>_b<NNNN>` stays unique, and a group that was never split is
 unchanged: bucket `b` has modulus N and `b = hash % N`. The number is no longer
-below the bucket count, and `lpad(b::text, 4, '0')` produces a longer name for
-numbers of 10000 and more, which is still unique.
+below the bucket count. (`lpad(b::text, 4, '0')` does not produce a longer name for numbers of 10000 and
+more, it cuts the number to four digits, and the C code names the partition with the full number: bucket numbers
+are limited to 9999 and a split that would exceed it is refused, section 21.5.)
 
 Routing resolves `hash` to the bucket that covers `hash % max_modulus` through an
 array of `max_modulus` entries built from `bucket_map` (the same idea as
@@ -1586,3 +1587,188 @@ base the later increments extend. Departures from sections 6 and 9:
 - **Standbys.** A move changes the owner of the data, not where standbys are. A logical slot and a subscription exist on primaries that
   have standbys; the slot is not on the standby, so a failover during a move fails the move and the extension undoes it. Failover itself is
   not implemented in `kingresd`.
+
+## 21. The fixes for the review of phase 10 (2026-11-21)
+
+An independent review of the extension part of phase 10 (sections 3, 4, 7, 14 and 15 of this design, `contrib/kingres_shard`; the control plane and the console were not in
+the reviewed tree) found one critical defect, two high ones, six medium ones and seven low ones (P10R-01 to P10R-16). This section says what each was, what was done and which
+test and mutant stand for it. The files are `kingres_shard--0.7--0.8.sql` (the phase 10 part; `kingres_shard--0.8.sql` is generated from it by `mk-install-script.sh`),
+`README.md` of the extension and the tests `t/201`, `t/204`, `t/205`, `t/206` and the regression test `plan_strategies`. Every mutant below was applied to the installed script of
+PostgreSQL 18 and the named test failed; the unmutated script passes every test on 18 and 19.
+
+### 21.1 P10R-01 (critical): the recovery undid a switch that then committed
+
+**The defect.** The switch runs on the owning node. The backend there does not stop when the session that called it dies (it is in a lock wait or counting rows), so
+`resume_bucket_splits()` could ask "are the partitions switched?", get "no" for a switch that was a moment from committing, undo (its first statement waited for the
+switch's locks), and record the split as failed; the switch then committed. The map said modulus 8, the owner had two partitions of modulus 16, the old partitions stayed as orphans
+for ever, and the next `move_bucket()` copied one child and left the other: rows unreachable, and a key that could be inserted twice.
+
+**The fix** is a fence, in the way the phase 4 mover settles its switch by one record that both sides read, adapted to the fact that the decision here is on another node
+than the work:
+
+- the switch and the undo of one split take the same advisory transaction lock (`hashtext('kingres_split_switch')`, the split id) as their first act, so they never run together;
+  whoever comes second waits for the first to end (the undo for at most `move_switch_timeout` plus a lock timeout, the switch for the lock timeout) and then looks at the partitions;
+- `internal_split_undo()` looks at the bounds of the partitions after it holds the fence: switched means it undoes nothing and answers `switched`, so that the caller
+  (`resume_bucket_splits()`, or the error path of `split_bucket()`) writes the catalog; else it undoes and answers `undone`. `resume_bucket_splits()` no longer asks first;
+- the switch, once it holds the fence, returns at once when the partitions are switched already (a call that was retried after its answer was lost) and fails when its
+  children are gone (an undo ran): a switch that arrives late can never commit after an undo;
+- `move_bucket()` compares the bounds of the source's partitions with the bucket map (`internal_move_bounds()`) and refuses a bucket where they differ, with the difference in the
+  message, as the second line of defence against any other way to the same state.
+
+The design (14.1) lists fault points inside the switch: they now exist as `split_switch_after_lock` (after the locks of every table, once per table), `split_switch_after_verify`,
+`split_switch_after_detach`, `split_switch_after_attach`, and the undo has `split_undo_after_lock`, `split_undo_after_triggers`, `split_undo_after_children`. They run on the owning node (the
+setting of the session that runs the split is copied to its control sessions).
+
+**Tests.** `t/205` A: for each of the four points inside the switch the coordinator is terminated while the owner waits at the point, `resume_bucket_splits()` is called, it must not
+answer and not undo while the switch runs, and after the point is released the split is finished (not failed), the bucket and its twin have the new modulus in the map and on the
+owner, every row is read from every node, a move of the bucket carries every row, and a duplicate key is refused from every node. B: the undo is stopped at each of its three points, and
+once the owner's backend and once the session that runs the recovery is killed there: the undo is one transaction (nothing is half done), the next recovery completes it, nothing is left, a
+later split of the bucket works. F: a move of a bucket whose partitions are not the map's is refused. **Mutants:** M01 (the undo does not take the fence) and M02 (the undo does not look
+again after it) are killed by `t/205` A, M16 (no bounds check in the move) by `t/205` F.
+
+### 21.2 P10R-02 (high): a writer that is not a superuser could not write during the copy
+
+The capture trigger ran with the rights of whoever wrote the old partition, and the children were owned by the role that splits, so every write of an ordinary role (and of the
+owner of the table) into the splitting bucket failed with "permission denied" for the whole copy. The children and the trigger functions now belong to the owner of the table (as the
+bucket partitions do, and as the copy of a move makes them); the functions are `SECURITY DEFINER`, `search_path = pg_catalog, pg_temp` (the body schema-qualifies everything), revoked from
+`PUBLIC`. Making the function run as the superuser would have let the owner of a table run a CHECK constraint or a default of his as a superuser on every write of the splitting bucket, so the
+owner is the definer, and the owner of a table needs `USAGE` on its schema (the split is refused before anything is changed otherwise). **Test:** `t/206` A: a role with `INSERT, UPDATE, DELETE`, the
+owner, from every node, insert, update, delete during the copy; a role without the privilege is still refused by the table it writes; the functions and the children belong to the owner, the new
+partitions too. **Mutants:** M03 (no `SECURITY DEFINER`) and M03b (the children keep the splitting role as owner) are killed by it.
+
+### 21.3 P10R-03 (high): the copy did not converge under inserts at random keys
+
+The count of "rows held by writers" took a new snapshot after the batch, so every row inserted since with a key inside the batch's range counted as held, and with random keys every pass
+found some: the split failed after the whole copy. The batch now finds the rows of its range that it did not take in the same statement (same snapshot: new rows are not in it), and looks
+at those again in a second statement with a new snapshot; a row that is free is copied, one that is gone is dropped from the count, and only a row that exists and is still locked is held. A row
+a writer inserts is in its child by the trigger already. While a writer holds rows the passes now pause (0.2 s times the pass, at most 2 s), because ten quick passes ended a split whose writer
+needed a second to finish. **Tests:** `t/206` B (three sessions insert odd keys of the bucket at random, a few hundred a second, in a random order and for longer than the ten passes of a copy can last, while a bucket of
+25000 rows is split: it completes, every row that was written is there in the order it was written, no key twice) and C (a transaction holds a row with `FOR UPDATE`; the record shows the held row, the split does not switch, and when the transaction ends the row is copied: verify `none`, so that
+only the passes protect the row). **Mutants:** M04 (nothing is ever held) is killed by C, and M19 (the old batch function put back) by B: the split fails with "the copy does not converge", as it did in the reviewer's run.
+
+### 21.4 P10R-04 (medium): a deadlock was not retried, and readers got it
+
+`split_bucket()` retried only a lock timeout. It now retries `55P03`, `40P01` and the statement timeout of the switch, within `move_switch_attempts`, and takes the SQLSTATE of the remote
+error (it is passed on) instead of matching the text. The switch sets `deadlock_timeout = 100 ms` (the move does the same), so that a deadlock with an application transaction is found by the
+switch, which gives way, and not by a reader or a writer that waited longer. **Test:** `t/206` D: a writer holds `ROW EXCLUSIVE` on one table, the switch holds its lock on the first and waits at the
+fault point, the writer asks for the first: the switch asks for the second and finds the deadlock. The writer gets its lock without an error, the owner's log says "deadlock detected", the split is
+completed by the second attempt. **Mutants:** M05 (no retry of `40P01`) and M18 (the default deadlock timeout) are killed by D. What stays: a reader can still get `deadlock detected` when a
+deadlock involves three parties (a reader, a writer and the switch) and another party's timer fires first; the design's promise that `KS001` is the only reader failure holds to the extent that this
+does not occur, and the README says "retryable" for it as for a move.
+
+### 21.5 P10R-05 (medium): bucket numbers of 10000 and above
+
+`lpad` cuts: `lpad('12288', 4, '0')` is `1228`, so SQL named the partition of bucket 12288 `<table>_b1228` and the C code `<table>_b12288`; a split that made such a bucket failed after the full
+copy, and two partitions could have the same name. The same cut was in the views `kingres.buckets` and `kingres.partitions`, in `partition_leaves` and in the regular expressions `_b[0-9]{4}$` of the
+checks. Instead of changing every one of them, and the C code with them, a split whose new buckets would be numbered 10000 or more is refused before anything is recorded
+(`program_limit_exceeded`, with the number). A group starts with at most 4096 buckets, so only a split can reach such numbers; the limit is in the README under "Limits". The
+design text of section 1.3, which says that `lpad` "produces a longer name", is wrong and is corrected here: it does not. **Test:** `t/205` E (7 in 16, then 127 in 16, then 2047 in 16 is refused,
+2047 in 2 is allowed). **Mutant:** M06 (no limit) is killed by it.
+
+### 21.6 P10R-06 (medium): the live mark was not released after an error
+
+The session advisory lock of a split stayed after an error after the switch or after a failed undo, so `resume_bucket_splits()` thought the split alive until the session ended (a pooled
+session: never), and each failed split of a session leaked one lock. `split_bucket()` releases it on every way out. **Test:** `t/205` C (an error at `split_after_switch` in a session that stays
+open: the mark is gone, the session holds no advisory lock, the recovery settles the split at once). **Mutant:** M07 is killed by it.
+
+### 21.7 P10R-07 (medium): the plan stopped early with unequal weights
+
+The target was always the receiver of the least utilization, and a source with no bucket that improved that one pair was given up for the rest of the plan. The plan now tries the receivers in
+the order of their utilization and gives the source up only when none helps. With equal weights nothing changes (a bucket that helps the least utilized receiver helps the others as much or
+less: the regression test that compares the plan with `rebalance_plan()` over generated maps passes unchanged). **Test:** `plan_strategies` (weights 1, 1, 3, 1 with 1, 1, 3, 2 buckets: one move
+from group 3 to group 2, which the old plan did not make). **Mutant:** M08 (the first receiver only) is killed by it. The reviewer's fuzz (400 random clusters through
+`internal_plan_simulate`) found 16 stuck plans; the fix is the loop the example exercises, the fuzz itself was not re-run (see 21.14).
+
+### 21.8 P10R-08 (medium): the switch was not bounded by `move_switch_timeout`
+
+The locks had a bound, the verification, the detach and the attach, which run with the writers waiting, had only the statement timeout of the call (six node timeouts plus the switch timeout).
+The coordinator now sends the switch as one command of three statements in one transaction, the lock function, `SET LOCAL statement_timeout = move_switch_timeout` and the switch function. A
+statement timeout inside a function does not apply to the running statement, so the bound is set between two statements. A switch that runs past it is cut, rolls back and is tried again
+(21.4). **Test:** `t/205` D (`move_switch_timeout` 1 s, three attempts, a verification that does not end: the split gives up in seconds and says it did not finish; without the bound it waits for the
+call's, a minute). **Mutant:** M09 (statement timeout 0) is killed by it.
+
+### 21.9 The low findings
+
+- **P10R-09** (a distributed schema counted as the floor in `by_disk_size`): `internal_plan_inputs()` now reads, on the owning node, the size of the schema's tables as the size of the schema's one
+  bucket. `t/201` G (a schema of 17 MB raises the load of its group by its size, the plan does not move it). Mutant M12 killed.
+- **P10R-10** (who may plan): the README sentence was wrong; `plan_rebalance()` and `group_load()` are for superusers (the plan reads through functions that are not granted to others). The sentence is
+  corrected; `t/201` F now tests the role that has `SELECT` on `kingres.bucket_move` and `USAGE` on the schema (permission denied; `drain_status()` works). Mutant M14 (the helper granted to `PUBLIC`) killed.
+- **P10R-11** (the time bound of `check_cluster()`): see 21.10.
+- **P10R-12** (a false `bucket_layout` between the owner's switch and the catalog change): the partition check leaves out a colocation group with an unfinished split. `t/205` G holds a split at
+  `split_after_switch` and reads `check_cluster()`: nothing. Mutant M10 killed.
+- **P10R-13** (the waits of the undo): the undo has a lock timeout of its own (`max(200 ms, move_switch_timeout / 10)`, and the fence wait is bounded by the switch bound); a lock that is not got fails
+  the undo and the recovery tries again. `t/206` E: a writer that keeps the switch out for all its attempts and then keeps the undo out: the split gives up in seconds, names the writer
+  (`pid N: UPDATE ...`), leaves the record for the recovery and the recovery settles it when the writer has ended. Mutant M17 (no lock timeout in the undo) killed.
+- **P10R-14** (what `verify 'full'` proves): its repair is now `ON CONFLICT (key) DO UPDATE SET` every other column, so a child row with other values is brought to the partition's values, as the README
+  said. `t/204` C2 adds a child row with a wrong value. Mutant M11 killed. `'count'` still compares counts only, as the design says; a split with `'count'` trusts the triggers for content.
+- **P10R-15** (departures from the design): see 21.11.
+- **P10R-16** (tests): the promised cases that now exist are a foreign key between two colocated tables (`t/206`, split with `s2` referencing `s1`), a non-superuser writer, random-key inserts, a held row, a
+  deadlock, a writer that keeps the switch out with the blocker named, kills inside the switch and the undo, and a bucket number above 9999. The mutant that survived the regression tests,
+  the removal of the "arriving" condition of `drain_status().drained`, has a case in `plan_strategies` (a group that may not receive and owns nothing, with a move arriving, is not drained) and M15 is killed
+  by it. What is still not tested is in 21.12.
+
+### 21.10 P10R-11: the time bound of `check_cluster()`
+
+The README said at most `2 x T` (`node_timeout`) for each node that does not answer. The reviewer measured, with `node_timeout = 3` and a stopped postmaster, 16.9 s for one node and 31.7 s for two:
+10.05 s in the base check (the older code), 5.0 s in `internal_check_table_operations()`, which did not use the list of nodes that the base check found not answering (the layout and split
+checks of phase 10 did, and are right), and the rest in the other steps. The claim was never true for that case: a node that does not accept a new connection is waited for by the connect, which
+`node_connect_timeout` (C, 5 s by default) bounds and `node_timeout` does not; the base check connects to such a node twice and the table operations check once more.
+
+Fixed: the table operations check takes the list and asks no node on it. Measured again (`t/207`, T = 3, C = 2, the tests' own cluster of four nodes): a node whose cached sessions do not answer costs T
+(3.04 s; 6.03 s for two such nodes); a node whose postmaster is stopped costs 2 x C (4.09 s; 8.07 s for two; with the old table operations check 6.1 s and 12.1 s: mutant M13, killed by the test, whose bound
+is 2 x C plus 1.5 s); a node that is down is refused at once (0.09 s). The README states these three cases instead of `2 x T`. The base check is the older code and is not restructured (its two connects to a
+node could become one: left open, 21.12).
+
+### 21.11 P10R-15: departures from the design, and what the control plane calls
+
+The extension's departures stay (they are on purpose and in the README); this is what the part of the design that is not built (sections 5, 6, 9 and 15, the control plane) must use:
+
+- **The record of a split is `kingres.bucket_split`, not a row of `bucket_move` with `kind = 'split'`.** `resume_bucket_moves()`, `cancel_bucket_move()` and `cleanup_moved_buckets()` do not see a split. A control
+  plane that lost its connection to a split calls `resume_bucket_splits()` (it settles every split whose session is gone, and answers how many), stops one with `cancel_bucket_split(id)` (before its
+  switch) and drops the orphans with `cleanup_bucket_splits([force])`; the recovery worker calls both sets. The split is started with `split_bucket(colocation_id, bucket, parts, verify)` on the map group
+  primary, as a superuser, in a READ COMMITTED session that stays open for the whole split (the live mark is a session lock), and it returns the split id; progress is `kingres.bucket_split` (`phase`,
+  `detail`, `rows_done`, `rows_total`).
+- **The settings of the design for a split are constants:** `split_batch_rows` is 5000, `split_converge_passes` is 10, `max_bucket_modulus` is 65536 (checked by `split_bucket()`), and a split uses the
+  attempts and bounds of the move (`move_switch_attempts`, `move_switch_timeout`). The control plane does not set them.
+- **Names:** `check_cluster()` says `split_stalled` where the design says `operation_stalled`, and `extension_version_differs` where it says `extension_version`.
+- **The epoch of a split** is raised by the catalog change after the switch, not in the transaction that changes the partitions (design 7.1); the partition-identity check of scans covers the gap (the
+  children are new tables, so a scan that overlaps it fails with `KS001`).
+- **Fault points** exist inside the switch and the undo (21.1) in addition to the phase boundaries of design 14.1.
+- **Limits that the control plane should show:** bucket numbers up to 9999 (21.5); a split needs a primary key on every table; and the owner of every table of the group needs `USAGE` on its schema (21.2).
+
+### 21.12 Not done, and left open
+
+- A failover of the owning group during a split, a split with the S4-01 sequences, a split refused for a node of a mismatched version, and the comparison harness of phase 2a run with split groups
+  (design 14.1, 15) have no test in this round.
+- The plan fuzz of the reviewer (400 clusters) was not re-run after the fix; the regression test holds the example and the equal-weight comparison.
+- `drain_status().drained` does not consider moves in `cleaning` (the old copy is still on the group); the control plane waits for the cleanup too.
+- The base check of `check_cluster()` is the older code and keeps its own cost per node that does not accept a connection: two connects, 2 x `node_connect_timeout` (21.10).
+- A reader can still get `deadlock detected` when a deadlock involves more than the reader and the switch (21.4).
+- The undo that a failed `split_bucket()` runs can fail on a writer that holds the table; the record then waits for the recovery (the worker interval), and until then the triggers keep the children current.
+
+### 21.13 The mutants
+
+Each was applied by changing the installed install script of PostgreSQL 18 and running the named test, which failed; the script was restored afterwards.
+
+| Mutant | Change | Killed by |
+|---|---|---|
+| M01 | the undo does not take the fence of the switch | `t/205` A |
+| M02 | the undo does not look at the partitions again after the fence | `t/205` A |
+| M03 | the capture trigger function without `SECURITY DEFINER` | `t/206` A |
+| M03b | the children are owned by the role that splits | `t/206` A |
+| M04 | rows held by writers are never counted | `t/206` C |
+| M05 | no retry of a deadlock (`40P01`) in the switch | `t/206` D |
+| M06 | no limit on bucket numbers | `t/205` E |
+| M07 | the live mark is not released after an error after the switch | `t/205` C |
+| M08 | the plan gives a source up at the first receiver | `plan_strategies` |
+| M09 | no statement timeout between the two halves of the switch | `t/205` D |
+| M10 | `check_cluster()` compares the partitions of a group with an unfinished split | `t/205` G |
+| M11 | `verify 'full'` does not bring the values in line | `t/204` C2 |
+| M12 | a distributed schema counts as the floor | `t/201` G |
+| M13 | the table operations check asks nodes that did not answer | `t/207` |
+| M14 | the plan helpers are granted to `PUBLIC` | `t/201` F |
+| M15 | `drain_status().drained` ignores a move that is arriving | `plan_strategies` |
+| M16 | a move does not compare the source's bounds with the bucket map | `t/205` F |
+| M17 | the undo has no lock timeout | `t/206` E |
+| M18 | the switch keeps the default deadlock timeout | `t/206` D |
+| M19 | the old batch function (held rows counted with a new snapshot) | `t/206` B |

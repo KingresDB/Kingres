@@ -2500,9 +2500,11 @@ and what a group can hold ([`shard-phase10.md`](../../kingres/docs/design/shard-
   the group whose primary the node is (above 0, at most 1000, default 1). The two-argument form still exists and leaves the weight alone (the control plane asks for it
   by that signature). Map group primary only, superuser.
 - **`kingres.plan_rebalance(strategy, threshold, max_moves, drain_only, extra_load, exclude_groups, colocation_ids)`** returns
-  `(seq, colocation_id, bucket, source_group, target_group, cost, size_bytes, reason)`; read only, superuser or a role that may read `kingres.bucket_move`, on the map group primary.
+  `(seq, colocation_id, bucket, source_group, target_group, cost, size_bytes, reason)`; read only, superusers only, on the map group primary (the plan reads through functions that are not
+  granted to other roles: a role that may read `kingres.bucket_move` still gets "permission denied"; `drain_status()` is the one function of this part that such a role can call).
   - `strategy` is `by_bucket_count` (every bucket costs 1) or `by_disk_size` (the size of the bucket's partitions of every table of the colocation
-    group, read from the group that owns them, at least `kingres_shard.min_bucket_cost`, 1 MiB by default; it needs a superuser, and a group that
+    group, read from the group that owns them, at least `kingres_shard.min_bucket_cost`, 1 MiB by default; the one bucket of a distributed schema counts at the size of the
+    schema's tables on the node that holds them; it needs a superuser, and a group that
     does not answer is an error that names it: the plan does not guess).
   - A group may receive buckets when its primary is active and has `should_have_shards`; `exclude_groups` takes groups out of the receivers for a what-if
     drain; a group with no active primary is neither a receiver nor a source.
@@ -2511,7 +2513,9 @@ and what a group can hold ([`shard-phase10.md`](../../kingres/docs/design/shard-
     ideal (the total load, the load of drained groups included, per unit of the receivers' weight) by `abs(utilization - ideal) / ideal`.
   - The plan is a simulation: while a group that may not hold buckets still holds one, or a receiver deviates by more than `threshold` (default 0 by
     bucket count, 0.1 by disk size), the greatest drain source or the receiver of the greatest utilization gives its most costly bucket (ties: the higher
-    bucket number) to the receiver of the least utilization (ties: the lowest group id); a bucket of a receiver must bring the two utilizations closer.
+    bucket number) to the receiver of the least utilization (ties: the lowest group id); a bucket of a receiver must bring the two utilizations closer. When no bucket of
+    the source does that for the least utilized receiver, the next receiver in the order of utilization is tried, and the source is given up only when none helps (with unequal
+    weights the least utilized receiver is not always the one that can take a bucket).
     A bucket is planned once; a bucket that is moving counts at its target and is not planned; `drain_only` plans the drain moves only; `max_moves` caps the plan.
   - `reason` is `drain` for a move off a group that may not hold buckets and `balance` otherwise.
 - **`kingres.group_load(strategy, extra_load, exclude_groups)`** returns, for every group, `receiving`, `weight`, `buckets`, `load`, `utilization`,
@@ -2565,30 +2569,59 @@ How it works (design/shard-phase10.md, section 3):
 2. **Children and triggers**, on the owning node, in one transaction: for every table a standalone child per part (`LIKE` the table, with the `ks_bucket_check`
    constraint that makes the later attach scan-free) and a trigger on the old partition, `ENABLE ALWAYS` so that `session_replication_role = replica` does not skip it,
    that makes every change of the partition in the child that covers the row, in the writer's own transaction (a delete and an upsert; `TRUNCATE` truncates the
-   children). A write of the old partition by any means is therefore copied.
+   children). A write of the old partition by any means is therefore copied. The children and the trigger functions belong to the **owner of the table** and the
+   functions are `SECURITY DEFINER` with a fixed `search_path` (P10R-02): a writer of an ordinary role has the rights it has on the table, not on the children, and the
+   constraints and defaults of the table that the copy evaluates run as the owner, never as the superuser who splits. The owner must have `USAGE` on the schema of the
+   table, else the split is refused before anything is changed. The functions are revoked from `PUBLIC`.
 3. **Backfill**, in batches of 5000 rows each in a transaction of its own: the rows after the last key, those no writer holds (`FOR SHARE SKIP LOCKED`), are copied with
-   `ON CONFLICT DO NOTHING`. Passes repeat until one copies nothing and finds nothing held (at most 10).
-4. **Switch**, on the owning node, in one transaction: the tables and the old partitions are locked `SHARE` (writers wait, readers do not), each lock for at most
-   `max(200 ms, move_switch_timeout / 10)`; `verify 'count'` compares the number of rows of every old partition with its children and brings them in line if they differ
-   (`'full'` does it always, key by key; `'none'` trusts the triggers); the triggers go; the old partitions are detached as `kingres.orphan_s<id>_<n>` (readers wait from the
-   detach to the commit); the children are renamed to `<table>_bNNNN` and attached with the new modulus. A lock that is not got is retried up to
-   `move_switch_attempts` times with a growing pause; the last failure names the sessions in the way.
+   `ON CONFLICT DO NOTHING`. The rows of the batch's key range that it did not take are looked at again in a second statement with a new snapshot: those that are free now are
+   copied, those that are gone are forgotten, and only those that exist and are still locked count as "held by writers" (P10R-03). A row that a writer inserts meanwhile is in
+   its child already (the trigger) and is not in the range of the snapshot, so inserts at random keys do not keep a pass from converging. Passes repeat until one copies nothing
+   and finds nothing held (at most 10; while a writer holds rows the passes pause 0.2 s times their number, at most 2 s, so that ten passes last about eleven seconds). The batch
+   (5000 rows), the number of passes (10) and the parts (2, 4, 8, 16) are constants of the function, not settings.
+4. **Switch**, on the owning node, in one transaction that the coordinator sends as one command (the lock function, `SET LOCAL statement_timeout`, the switch function):
+   first the **fence**, an advisory lock that the undo of the same split takes too, so that a switch and an undo of one split never run at the same time (P10R-01); then the
+   tables and the old partitions are locked `SHARE` (writers wait, readers do not), each lock for at most `max(200 ms, move_switch_timeout / 10)`. From the first lock to the
+   commit the writers wait, and that time is bounded by `move_switch_timeout` as a whole (the statement timeout of the second half, P10R-08): `verify 'count'` compares the number
+   of rows of every old partition with its children and brings them in line if they differ (`'full'` does it always, key by key, **values included**: a row of a child that
+   differs from the partition's is brought to the partition's values, P10R-14; `'none'` trusts the triggers); the triggers go; the old partitions are detached as
+   `kingres.orphan_s<id>_<n>` (readers wait from the detach to the commit); the children are renamed to `<table>_bNNNN` and attached with the new modulus. The deadlock timeout of
+   the switch is 100 ms, so that a deadlock with an application transaction is found by the switch and it is the switch that fails, not a reader or a writer (P10R-04). A lock that is
+   not got, a deadlock and a switch that runs past its time are tried again up to `move_switch_attempts` times with a growing pause; the last failure names the sessions in the
+   way (or says that the switch did not finish).
 5. **The catalog** on the map group primary: the bucket's row becomes the children's, `max_modulus` and the epoch go up, the map is synchronized. This comes after the switch
    and not in the same two-phase transaction (a difference from the design): the children are on the same group as the bucket, so a router that still has the old layout
    reaches the right group and PostgreSQL prunes by the partitions it has; a scan that overlaps the two steps sees the epoch change and gets the retryable `KS001`.
 6. **Cleaning.** The orphans are dropped by `kingres.cleanup_bucket_splits()` after `move_cleanup_delay` (the recovery worker calls it).
 
-Failure and recovery: until the switch every failure undoes the split (`internal_split_undo`: the triggers, their functions and the children go, the bucket is `active`). A session
-that dies is settled by `kingres.resume_bucket_splits()` (the recovery worker calls it): a split whose partitions are not switched is undone, one whose partitions are switched gets its
-catalog. `kingres.cancel_bucket_split(id)` stops a split that has not reached its switch. `kingres.check_cluster()` says `split_stalled`, `split_trigger` and `split_child_table`.
+Failure and recovery: until the switch every failure undoes the split (`internal_split_undo`: the triggers, their functions and the children go, the bucket is `active`). The owner's
+backend does not stop when the session that called it dies, so a switch can still be running when the recovery looks (P10R-01): the undo is one transaction on the owner that
+**takes the fence first**, waits for a switch that is running (at most `move_switch_timeout` plus a lock timeout), and then looks at the partitions again: if they are switched it
+undoes nothing and says `switched` (the caller writes the catalog), else it undoes and says `undone`. A switch that arrives after an undo finds its children gone and fails. The locks of
+the undo are bounded (`max(200 ms, move_switch_timeout / 10)`, P10R-13): a lock that is not got makes the undo fail, the record stays unfinished and the recovery tries again. A session
+that dies is settled by `kingres.resume_bucket_splits()` (the recovery worker calls it), which runs that undo for every split whose session is gone. The live mark of a split is released
+on every way out of `split_bucket()`, also an error after the switch (P10R-06), so the recovery does not wait for a session that is still open. `kingres.cancel_bucket_split(id)` stops a split
+that has not reached its switch. `kingres.check_cluster()` says `split_stalled`, `split_trigger` and `split_child_table`.
 While a split runs, `create_distributed_table()` and the other changes of the group's tables are refused (the same check as for a move) and the bucket cannot be moved. The bucket
-map's state is `splitting`, and `kingres.bucket_split` is readable by superusers only.
+map's state is `splitting`, and `kingres.bucket_split` is readable by superusers only. `kingres.check_cluster()` does not compare the partitions of a colocation group that has an
+unfinished split with the bucket map: between the owner's switch and the catalog change (normally milliseconds, longer when a node is down) the bounds differ and that is no damage
+(P10R-12); a split that stopped is `split_stalled`. `move_bucket()` refuses a bucket whose partitions on the source do not have the bounds of the bucket map, and says what differs.
+
+**Limits.** Bucket numbers are limited to 9999 (P10R-05): the partition of bucket 12288 is `<table>_b12288` for the code of the extension and was `<table>_b1228` for the SQL functions
+(`lpad` cuts), so a split whose new buckets would be numbered 10000 or more is refused with a message before anything is recorded. A group starts with at most 4096 buckets, so a
+group of 8 buckets can be split about three times in 16 parts. The greatest modulus of a group, 65536, is checked by `split_bucket()` and is not a setting.
 
 Not done: a split of a user-partitioned table or of a columnar table (refused), a split by `parts` other than 2, 4, 8 or 16, the merge of buckets, and the split of several buckets of a group at once (one split per
 colocation group at a time).
 
-Tests: `t/204_split_bucket.pl` (splits, writers during every phase, bypasses, refusals, cancel, killed sessions and the worker, moves of the children, a table made later) and the regression test
-`bucket_layout` for the layouts a split makes.
+What the control plane calls: the record of a split is `kingres.bucket_split`, not a row of `bucket_move`, so `resume_bucket_moves()`, `cancel_bucket_move()` and `cleanup_moved_buckets()` do not
+see a split; it calls `resume_bucket_splits()` for a split whose connection it lost, `cancel_bucket_split()` to stop one and `cleanup_bucket_splits()` for the orphans (the recovery worker calls
+both sets). `check_cluster()` says `split_stalled` and `extension_version_differs` where the design says `operation_stalled` and `extension_version`.
+
+Tests: `t/204_split_bucket.pl` (splits, writers during every phase, bypasses, refusals, cancel, killed sessions and the worker, moves of the children, a table made later),
+`t/205_split_recovery.pl` (the coordinator dying at each fault point inside the switch with the recovery running meanwhile, the undo cut at each of its points, the live mark, the bound of the
+switch, bucket numbers, the bounds check of a move, `check_cluster()` in the gap), `t/206_split_writers.pl` (an ordinary role and the owner writing during the copy, inserts at random keys, a held
+row, a deadlock with a writer, a writer that keeps the switch out) and the regression test `bucket_layout` for the layouts a split makes.
 
 ## High availability (version 0.5, phase 5)
 
@@ -3217,7 +3250,7 @@ call a node silent that has answered). **What a call that is working costs while
 | every call below, against a node that answers every statement late but within `T` (0.5 x and 0.9 x `T` are measured, with one, two and four such nodes) | **it succeeds, with no `WARNING` and no `KS007`, nothing prepared, the work done on every node, in at most `s x T` seconds for each slow node** (`s` below) plus the work on the nodes that answer (a fraction of a second) | `t/102` (every call but `promote_node`), `t/103` (`promote_node`) |
 | `add_node`, `remove_node`, `sync_catalog`, `rotate_secret`, `recover_prepared_transactions`, `create_distributed_table`, `create_reference_table`, against a node that **stops answering** (silent after any chunk of any of its sessions, from the first to the last) | at most **`2 x T + 8 s`** from the first statement that is not answered, **plus `node_connect_timeout` once for connecting to it**: `T` and the cancel for a statement; at a `PREPARE TRANSACTION`, `T`, the cancel, and `max(T, min(T, 5) + 2)` more for the answer to its question, then the abort; a node that answers but whose standbys do not confirm: `min(T, 5) - 1` s per node, then `KS009` | `t/100` (every call, every position), `t/096` (the bound with the tolerance), `t/086` (a lock, a stopped backend), `t/091` (`KS009`) |
 | `promote_node` | at most **`3 x T` for each node that does not answer**; a node that does not answer is listed in `"unreached"` with a `WARNING` that names it, unless it is the node to promote, which refuses the call with `KS007` (whether it accepts the session and does not answer its first, its second or its third question: `t/096`), or a node that stops answering after the promotion has begun on it, which ends the call with `KS007` and changes nothing (repeat it after the node answers: `promoted`); a participant that stops answering during the commit: `2 x T + 8 s` as above | `t/086`, `t/096`, `t/101` (every position, for a participant and for the node to promote), `t/103` |
-| `check_cluster()` | at most **`2 x T` for each node that does not answer**; the node gets a row `node_unreachable` and the other nodes are still checked: the call does not fail as a whole | `t/086` |
+| `check_cluster()` | per node that does not answer, at most **`T`** when the sessions the caller has cached to it are stuck (the next statement is accepted and never answered), at most **`2 x node_connect_timeout`** when the node does not accept a new connection (its postmaster is stopped: the base check connects to a node twice; 10 s at the default `node_connect_timeout` of 5 s, whatever `T` is), and nothing but the refusal when the node is down; the layout, split and table operation checks ask no node that the base check found not answering (before P10R-11 the table operation check asked it a third time: 15 s per node at the default). The node gets a row `node_unreachable` and the other nodes are still checked: the call does not fail as a whole | `t/086`, `t/207` |
 | a call behind another call that changes the catalog | `T`, then `KS008` | `t/086` |
 | client timeout of the control plane for any of these calls | **without `control_call_timeout` there is no bound for a call that is working**: the formula above (`s x T` for each slow node) plus the bound for a silent node for each node that may be stuck, plus 10 s; its expiry means "did not finish" and is **not** proof of a local reason: a call that works through a slow node can run that long with the catalog lock held, so cancel it from another session (`pg_cancel_backend`) before starting another. With `n` nodes of which `k` may be stuck: `k x (3 x T + 8) + 10 s` is always enough for the silent ones. With `control_call_timeout = L` the call ends in at most `L` plus the time to cancel one statement | `t/086` (the bounds), `t/082` (a cancelled call), `t/107` (`control_call_timeout`) |
 | a call, with `kingres_shard.control_call_timeout` set | at most that many seconds plus the cancel of one statement, then `KS015` (S13-02). **Cut to what is left (review S14-02):** every statement of the call's sessions, the connect of a new session (its `connect_timeout`) and the first command of a new session. **Outside it, each with its own bound:** the raw sessions of `require_primaries_can_commit` (the start of `add_node`, `remove_node`, `rotate_secret`, `sync_catalog`), `ask_node` and the sessions of `promote_node` (`failover.c`), each bounded by `node_timeout` or `node_connect_timeout` per node, one after the other: with `k` silent nodes the worst case is `L + k x node_timeout` for these, not `L`. When the time runs out while a node is being waited for, `KS015` names that node (and says nothing is known against it) | `t/107` |

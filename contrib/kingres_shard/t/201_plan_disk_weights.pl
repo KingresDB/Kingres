@@ -10,6 +10,7 @@
 #   C. set_node_property() with a weight: every node has it, the old two-argument form still works, and the weight changes the plan
 #   D. a drain: should_have_shards = false and a plan with drain moves only; executing it empties the group
 #   E. a plan by disk size does not guess: with a group that does not answer it fails and names the group, a plan by bucket count still works
+#   G. a distributed schema counts at the size of its tables
 #   F. who may plan
 
 use strict;
@@ -151,6 +152,27 @@ q1($n1, q{SELECT kingres.set_node_property(3, true, 1)});
 is(q1($n1, q{SELECT count(*) FILTER (WHERE reason = 'drain') FROM kingres.plan_rebalance('by_bucket_count', exclude_groups => ARRAY[0])}), q1($n1, q{SELECT count(*) FROM kingres.bucket_map WHERE group_id = 0}), 'D: exclude_groups plans the drain of a group without changing it');
 
 # ---------------------------------------------------------------------------
+# G. a distributed schema counts at its size (P10R-09): its one bucket is the tables of the schema, not the minimum cost
+# ---------------------------------------------------------------------------
+{
+	my $before = q1($n1, q{SELECT load FROM kingres.group_load('by_disk_size') WHERE group_id = 1});
+	q1($n1, q{CREATE SCHEMA big; CREATE TABLE big.t (id int PRIMARY KEY, payload text)});
+	q1($n1, q{SELECT kingres.set_sharding_mode('both')});
+	q1($n1, q{SELECT kingres.distribute_schema('big', 1)});
+	q1($n1, q{INSERT INTO big.t SELECT g, (SELECT string_agg(md5(random()::text || g::text || i::text), '') FROM generate_series(1, 94) i) FROM generate_series(1, 4000) g});
+	q1($_, q{CHECKPOINT}) for @nodes;
+	my $size = q1($n2, q{SELECT sum(pg_total_relation_size(c.oid)) FROM pg_class c WHERE c.relnamespace = 'big'::regnamespace AND c.relkind IN ('r', 'p')});
+	cmp_ok($size, '>', 4 * 1048576, "G: the schema's tables are large ($size bytes)");
+	my $after = q1($n1, q{SELECT load FROM kingres.group_load('by_disk_size') WHERE group_id = 1});
+	cmp_ok($after - $before, '>=', $size - 65536, "G: the group of the schema carries the size of its tables, not the minimum cost of one bucket ($before before, $after after, $size of tables)");
+	is(q1($n1, q{SELECT count(*) FROM kingres.plan_rebalance('by_disk_size') WHERE colocation_id = (SELECT colocation_id FROM kingres.dist_schema WHERE nsp = 'big'::regnamespace)}), '0', 'G: and the plan does not move the schema as a bucket');
+	q1($n1, q{SELECT kingres.undistribute_schema('big')});
+	q1($n1, q{DROP SCHEMA IF EXISTS big CASCADE});
+	q1($n1, q{SELECT kingres.set_sharding_mode('row')});
+	is(q1($n1, q{SELECT count(*) FROM kingres.check_cluster()}), '0', 'G: check_cluster() finds nothing');
+}
+
+# ---------------------------------------------------------------------------
 # F. who may plan (before a node is stopped)
 # ---------------------------------------------------------------------------
 q1($n1, q{CREATE ROLE eve LOGIN});
@@ -159,6 +181,13 @@ isnt($rc, 0, 'F: a role that is not a superuser cannot plan by disk size (it rea
 like($err, qr/permission denied|must be superuser|superuser/i, 'F: with a permission error');
 ($rc, $out, $err) = run_sql($n1, q{SET ROLE eve; SELECT count(*) FROM kingres.group_load()});
 isnt($rc, 0, 'F: nor can it read the load: the plan reads the records of the moves, which only a superuser may');
+# P10R-10: a role that may read kingres.bucket_move does not plan with that alone: the plan reads through functions that only a superuser may call
+q1($n1, q{GRANT USAGE ON SCHEMA kingres TO eve; GRANT SELECT ON kingres.bucket_move TO eve});
+($rc, $out, $err) = run_sql($n1, q{SET ROLE eve; SELECT count(*) FROM kingres.plan_rebalance()});
+isnt($rc, 0, 'F: a role that may read kingres.bucket_move cannot plan');
+like($err, qr/permission denied/, 'F: with a permission error');
+($rc, $out, $err) = run_sql($n1, q{SET ROLE eve; SELECT count(*) FROM kingres.drain_status()});
+is($rc, 0, 'F: but drain_status() reads what it needs') or diag($err);
 
 # ---------------------------------------------------------------------------
 # E. a group that does not answer (group 1 still holds buckets; group 2 was drained)

@@ -227,10 +227,15 @@ DECLARE
     v_bucket pg_catalog.int4;
     v_want   pg_catalog.text;
     v_group  pg_catalog.int4;
+    v_colo   pg_catalog.int4;
+    v_busy   pg_catalog.int4[];
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM kingres.dist_table d WHERE d.method OPERATOR(pg_catalog.=) 'hash') THEN
         RETURN;
     END IF;
+    -- P10R-12: between the commit of the owner's switch and the catalog change of a split (normally milliseconds, longer when a node is down) the partitions have the new bounds and the
+    -- map the old ones, and that is no damage: a colocation group with an unfinished split is not compared (a split that stopped is said by split_stalled)
+    v_busy := COALESCE((SELECT pg_catalog.array_agg(b.colocation_id) FROM kingres.bucket_split b WHERE b.phase IN ('preparing', 'copying', 'catching_up', 'switching')), '{}'::pg_catalog.int4[]);
     FOR n IN SELECT nd.node_id AS id, nd.group_id AS grp FROM kingres.node nd WHERE nd.role OPERATOR(pg_catalog.=) 'primary' AND nd.is_active
                 AND NOT (nd.node_id OPERATOR(pg_catalog.=) ANY (p_skip)) ORDER BY nd.node_id LOOP
         BEGIN
@@ -245,13 +250,14 @@ BEGIN
         END;
         FOR e IN SELECT x FROM pg_catalog.jsonb_array_elements(r) x LOOP
             v_bucket := (pg_catalog.regexp_match(e OPERATOR(pg_catalog.->>) 1, '_b([0-9]+)$'))[1]::pg_catalog.int4;
-            SELECT pg_catalog.format('FOR VALUES WITH (modulus %s, remainder %s)', m.modulus, m.bucket), m.group_id
-              INTO v_want, v_group
+            SELECT pg_catalog.format('FOR VALUES WITH (modulus %s, remainder %s)', m.modulus, m.bucket), m.group_id, m.colocation_id
+              INTO v_want, v_group, v_colo
               FROM kingres.bucket_map m
               JOIN kingres.dist_table d ON d.colocation_id OPERATOR(pg_catalog.=) m.colocation_id
              WHERE d.relid OPERATOR(pg_catalog.=) (e OPERATOR(pg_catalog.->>) 0)::pg_catalog.regclass AND m.bucket OPERATOR(pg_catalog.=) v_bucket;
             -- a partition of a bucket that the group of the node does not own is partition_misplaced, said by the base check
-            IF FOUND AND v_group OPERATOR(pg_catalog.=) n.grp AND (e OPERATOR(pg_catalog.->>) 2) IS DISTINCT FROM v_want THEN
+            IF FOUND AND v_group OPERATOR(pg_catalog.=) n.grp AND (e OPERATOR(pg_catalog.->>) 2) IS DISTINCT FROM v_want
+               AND NOT (v_colo OPERATOR(pg_catalog.=) ANY (v_busy)) THEN
                 check_name := 'bucket_layout'; node_id := n.id; object := (e OPERATOR(pg_catalog.->>) 1);
                 detail := pg_catalog.format('the partition has the bounds "%s" but the bucket map says "%s"', e OPERATOR(pg_catalog.->>) 2, v_want);
                 RETURN NEXT;
@@ -261,6 +267,127 @@ BEGIN
 END;
 $$;
 REVOKE ALL ON FUNCTION kingres.internal_check_layout_partitions(int[]) FROM PUBLIC;
+
+-- On the source node of a move: the bucket partitions of the tables must have the bounds that the bucket map gives the bucket (P10R-01).  A node whose partitions are not the map's
+-- (a split that was settled wrongly, a manual change) must not have its bucket copied: the target would attach the partition with the map's bounds and the rows of the other
+-- children would be left behind.  Returns NULL, or a text that says what differs.
+CREATE FUNCTION kingres.internal_move_bounds(p_tables pg_catalog.jsonb, p_bucket int, p_modulus int)
+    RETURNS pg_catalog.text
+    LANGUAGE plpgsql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    t      pg_catalog.record;
+    v_bnd  pg_catalog.text;
+    v_want pg_catalog.text := pg_catalog.format('FOR VALUES WITH (modulus %s, remainder %s)', p_modulus, p_bucket);
+BEGIN
+    FOR t IN SELECT x.schema_name, x.table_name FROM pg_catalog.jsonb_to_recordset(p_tables) AS x(schema_name text, table_name text) LOOP
+        SELECT pg_catalog.pg_get_expr(c.relpartbound, c.oid) INTO v_bnd FROM pg_catalog.pg_class c
+         WHERE c.oid OPERATOR(pg_catalog.=) pg_catalog.to_regclass(pg_catalog.format('%I.%I', t.schema_name, kingres.internal_bucket_part_name(t.table_name, p_bucket)))::pg_catalog.oid;
+        IF v_bnd IS DISTINCT FROM v_want THEN
+            RETURN pg_catalog.format('the partition of bucket %s of %I.%I has the bounds "%s" and the bucket map says "%s"', p_bucket, t.schema_name, t.table_name, COALESCE(v_bnd, 'none'), v_want);
+        END IF;
+    END LOOP;
+    RETURN NULL;
+END;
+$$;
+REVOKE ALL ON FUNCTION kingres.internal_move_bounds(jsonb, int, int) FROM PUBLIC;
+
+-- P10R-11: the check of the objects that table operations leave leaves out the nodes that the base check found not answering, as the layout and split checks do: each call to a node that
+-- does not answer costs a node_timeout, and check_cluster() has a bound (README, "Bounds").
+DROP FUNCTION kingres.internal_check_table_operations();
+CREATE FUNCTION kingres.internal_check_table_operations(p_skip int[] DEFAULT '{}')
+    RETURNS TABLE (check_name text, node_id int, object text, detail text)
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_to   pg_catalog.int4;
+    n      pg_catalog.record;
+    o      pg_catalog.record;
+    r      pg_catalog.jsonb;
+    x      pg_catalog.text;
+    v_oid  pg_catalog.oid;
+    v_op   pg_catalog.int8;
+    v_live pg_catalog.bool;
+BEGIN
+    IF pg_catalog.to_regclass('kingres.table_operation') IS NULL THEN
+        RETURN;
+    END IF;
+    v_to := (SELECT s.setting::pg_catalog.int4 FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) 'kingres_shard.node_timeout');
+
+    FOR o IN SELECT t.op_id, t.phase, t.updated_at, t.verified FROM kingres.table_operation t WHERE NOT (t.spec OPERATOR(pg_catalog.?) 'mirror') ORDER BY t.op_id LOOP
+        IF o.phase IN ('preparing', 'shadow', 'copying', 'catching_up', 'switching', 'cleaning')
+           AND o.updated_at OPERATOR(pg_catalog.<) (pg_catalog.clock_timestamp() OPERATOR(pg_catalog.-) pg_catalog.make_interval(secs => v_to * 3))
+           AND NOT kingres.internal_op_alive(o.op_id) THEN
+            check_name := 'table_operation_stalled'; node_id := NULL;
+            object := pg_catalog.format('table operation %s', o.op_id);
+            detail := pg_catalog.format('in phase %s since %s and nobody runs it; kingres.table_operation_advance() continues it, kingres.cancel_table_operation() undoes it', o.phase, o.updated_at);
+            RETURN NEXT;
+        END IF;
+        IF o.verified OPERATOR(pg_catalog.=) 'failed' THEN
+            check_name := 'table_verification_failed'; node_id := NULL;
+            object := pg_catalog.format('table operation %s', o.op_id);
+            detail := 'the old copy and the new table differ; the old copy is kept as the evidence (kingres.cleanup_table_operations(true) drops it)';
+            RETURN NEXT;
+        END IF;
+    END LOOP;
+
+    FOR o IN SELECT c.relid::pg_catalog.oid AS oid, c.dropped_after FROM kingres.table_old_copy c
+              WHERE c.dropped_after OPERATOR(pg_catalog.<) (pg_catalog.clock_timestamp() OPERATOR(pg_catalog.-) interval '1 hour') ORDER BY c.dropped_after LOOP
+        check_name := 'old_table'; node_id := NULL;
+        object := COALESCE(o.oid::pg_catalog.regclass::pg_catalog.text, o.oid::pg_catalog.text);
+        detail := pg_catalog.format('the old copy of a replaced table was due for dropping at %s', o.dropped_after);
+        RETURN NEXT;
+    END LOOP;
+
+    -- the objects that operations make on the nodes: a shadow is kingres_shadow_<oid of the source>, a log and
+    -- the triggers carry the id of the operation
+    FOR n IN SELECT nd.node_id AS id FROM kingres.node nd WHERE nd.role OPERATOR(pg_catalog.=) 'primary' AND nd.is_active AND NOT (nd.node_id OPERATOR(pg_catalog.=) ANY (p_skip)) ORDER BY nd.node_id LOOP
+        BEGIN
+            r := kingres.internal_node_exec(n.id,
+                'SELECT pg_catalog.jsonb_build_object(''shadows'', COALESCE((SELECT pg_catalog.jsonb_agg(s.nspname OPERATOR(pg_catalog.||) ''.'' OPERATOR(pg_catalog.||) c.relname) '
+                'FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace s ON s.oid OPERATOR(pg_catalog.=) c.relnamespace '
+                'WHERE c.relname LIKE ''kingres\_shadow\_%'' AND c.relkind IN (''r'', ''p'')), ''[]''::pg_catalog.jsonb), '
+                '''logs'', COALESCE((SELECT pg_catalog.jsonb_agg(c.relname) FROM pg_catalog.pg_class c WHERE c.relnamespace OPERATOR(pg_catalog.=) ''kingres''::pg_catalog.regnamespace AND c.relname LIKE ''tlog\_%'' AND c.relkind OPERATOR(pg_catalog.=) ''r''), ''[]''::pg_catalog.jsonb), '
+                '''triggers'', COALESCE((SELECT pg_catalog.jsonb_agg(t.tgname) FROM pg_catalog.pg_trigger t WHERE NOT t.tgisinternal AND (t.tgname LIKE ''kingres\_capture\_%'' OR t.tgname LIKE ''kingres\_notrunc\_%'')), ''[]''::pg_catalog.jsonb))');
+            r := (r OPERATOR(pg_catalog.->) 0) OPERATOR(pg_catalog.->>) 0;
+        EXCEPTION WHEN OTHERS OR query_canceled THEN
+            CONTINUE;
+        END;
+        FOR x IN SELECT e FROM pg_catalog.jsonb_array_elements_text(r OPERATOR(pg_catalog.->) 'shadows') e LOOP
+            v_oid := NULLIF(pg_catalog.regexp_replace(x, '^.*kingres_shadow_', ''), '')::pg_catalog.oid;
+            IF NOT EXISTS (SELECT 1 FROM kingres.table_operation_item i JOIN kingres.table_operation t ON t.op_id OPERATOR(pg_catalog.=) i.op_id
+                            WHERE i.relid::pg_catalog.oid OPERATOR(pg_catalog.=) v_oid
+                              AND t.phase IN ('preparing', 'shadow', 'copying', 'catching_up', 'switching')) THEN
+                check_name := 'shadow_table'; node_id := n.id; object := x;
+                detail := 'the shadow table of a table operation that is not running';
+                RETURN NEXT;
+            END IF;
+        END LOOP;
+        FOR x IN SELECT e FROM pg_catalog.jsonb_array_elements_text(r OPERATOR(pg_catalog.->) 'logs') e LOOP
+            v_op := NULLIF(pg_catalog.split_part(x, '_', 2), '')::pg_catalog.int8;
+            IF NOT EXISTS (SELECT 1 FROM kingres.table_operation t WHERE t.op_id OPERATOR(pg_catalog.=) v_op
+                              AND t.phase IN ('preparing', 'shadow', 'copying', 'catching_up', 'switching')) THEN
+                check_name := 'log_table'; node_id := n.id; object := pg_catalog.format('kingres.%s', x);
+                detail := 'the capture log of a table operation that is not running';
+                RETURN NEXT;
+            END IF;
+        END LOOP;
+        FOR x IN SELECT e FROM pg_catalog.jsonb_array_elements_text(r OPERATOR(pg_catalog.->) 'triggers') e LOOP
+            v_op := NULLIF(pg_catalog.regexp_replace(x, '^kingres_(capture|notrunc)_', ''), '')::pg_catalog.int8;
+            IF NOT EXISTS (SELECT 1 FROM kingres.table_operation t WHERE t.op_id OPERATOR(pg_catalog.=) v_op
+                              AND t.phase IN ('preparing', 'shadow', 'copying', 'catching_up', 'switching')) THEN
+                check_name := 'capture_trigger'; node_id := n.id; object := x;
+                detail := 'a capture trigger of a table operation that is not running';
+                RETURN NEXT;
+            END IF;
+        END LOOP;
+    END LOOP;
+    RETURN;
+END;
+$$;
+REVOKE ALL ON FUNCTION kingres.internal_check_table_operations(int[]) FROM PUBLIC;
 
 CREATE OR REPLACE FUNCTION kingres.check_cluster(p_prepared_older_than interval DEFAULT interval '5 minutes')
     RETURNS TABLE (check_name text, node_id int, object text, detail text)
@@ -287,7 +414,7 @@ BEGIN
     RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_layout_partitions(v_skip) t;
     RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_splits(v_skip) t;
     RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_ledger(v_skip) t;
-    RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_table_operations() t;
+    RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_table_operations(v_skip) t;
     RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_partitions() t;
 END;
 $$;
@@ -443,6 +570,13 @@ BEGIN
     v_info := (kingres.internal_exec_scalar(v_src, pg_catalog.format(
                   'SELECT kingres.internal_move_inspect(''source'', %s, %s, %L::pg_catalog.jsonb)::pg_catalog.text',
                   v_bucket, v_modulus, v_tables::pg_catalog.text)))::pg_catalog.jsonb;
+    -- the partitions of the source are the bucket map's (a split settled wrongly would leave rows behind)
+    v_bad := kingres.internal_exec_scalar(v_src, pg_catalog.format('SELECT kingres.internal_move_bounds(%L::pg_catalog.jsonb, %s, %s)', v_tables::pg_catalog.text, v_bucket, v_modulus));
+    IF v_bad IS NOT NULL THEN
+        RAISE EXCEPTION 'bucket % of colocation group % cannot be moved: %', v_bucket, v_colo, v_bad
+            USING ERRCODE = 'object_not_in_prerequisite_state',
+                  HINT = 'See kingres.check_cluster() (bucket_layout) and kingres.bucket_split.';
+    END IF;
     PERFORM kingres.internal_exec_scalar(v_tgt, pg_catalog.format(
                   'SELECT kingres.internal_move_inspect(''target'', %s, %s, %L::pg_catalog.jsonb)::pg_catalog.text',
                   v_bucket, v_modulus, v_tables::pg_catalog.text));
@@ -945,7 +1079,10 @@ BEGIN
                         'SELECT d.colocation_id::pg_catalog.text OPERATOR(pg_catalog.||) '':'' OPERATOR(pg_catalog.||) b.bucket::pg_catalog.text AS k, '
                         'pg_catalog.sum(b.partition_size)::pg_catalog.int8 AS sz '
                         'FROM kingres.buckets b JOIN kingres.dist_table d ON d.relid OPERATOR(pg_catalog.=) b.table_name '
-                        'WHERE b.partition_size IS NOT NULL GROUP BY 1) s',
+                        'WHERE b.partition_size IS NOT NULL GROUP BY 1 '
+                        -- the one bucket of a distributed schema is its tables (P10R-09): the size is the tables' own, where the node holds them
+                        'UNION ALL SELECT d.colocation_id::pg_catalog.text OPERATOR(pg_catalog.||) '':0'', pg_catalog.sum(pg_catalog.pg_total_relation_size(d.relid))::pg_catalog.int8 '
+                        'FROM kingres.dist_table d WHERE d.method OPERATOR(pg_catalog.=) ''schema'' GROUP BY d.colocation_id) s',
                         10000) OPERATOR(pg_catalog.->) 0 OPERATOR(pg_catalog.->>) 0)::pg_catalog.jsonb);
             EXCEPTION WHEN OTHERS THEN
                 RAISE EXCEPTION 'the sizes of the buckets of shard group % cannot be read (%): a plan by disk size does not guess', g.group_id, SQLERRM
@@ -1031,6 +1168,7 @@ DECLARE
     g_recv   pg_catalog.bool[];
     g_avail  pg_catalog.bool[];
     g_cand   pg_catalog.bool[];
+    g_try    pg_catalog.bool[];
     i_c      pg_catalog.int4[];
     i_b      pg_catalog.int4[];
     i_owner  pg_catalog.int4[];
@@ -1133,40 +1271,44 @@ BEGIN
             END LOOP;
             EXIT WHEN s IS NULL;
         END IF;
-        -- the target: the receiver other than the source with the least utilization (ties: the lowest group id)
-        t := NULL; v_best_u := NULL;
-        FOR j IN 1 .. ng LOOP
-            IF g_recv[j] AND j OPERATOR(pg_catalog.<>) s THEN
-                v_u := (g_load[j] OPERATOR(pg_catalog.+) g_extra[j]) OPERATOR(pg_catalog./) g_w[j];
-                IF v_best_u IS NULL OR v_u OPERATOR(pg_catalog.<) v_best_u THEN
-                    t := j; v_best_u := v_u;
+        -- the target: the receiver other than the source with the least utilization (ties: the lowest group id); when no bucket of the source brings that pair closer
+        -- the next receiver in order of utilization is tried, and only when none has a bucket that helps is the source given up for the rest of the plan (P10R-07: with
+        -- unequal weights a receiver of a higher utilization can take a bucket that the least utilized one cannot, because its weight is larger)
+        g_try := pg_catalog.array_fill(false, ARRAY[ng]);
+        best := NULL;
+        LOOP
+            t := NULL; v_best_u := NULL;
+            FOR j IN 1 .. ng LOOP
+                IF g_recv[j] AND j OPERATOR(pg_catalog.<>) s AND NOT g_try[j] THEN
+                    v_u := (g_load[j] OPERATOR(pg_catalog.+) g_extra[j]) OPERATOR(pg_catalog./) g_w[j];
+                    IF v_best_u IS NULL OR v_u OPERATOR(pg_catalog.<) v_best_u THEN
+                        t := j; v_best_u := v_u;
+                    END IF;
                 END IF;
-            END IF;
+            END LOOP;
+            EXIT WHEN t IS NULL;
+            -- the bucket: by decreasing cost (ties: the higher bucket number, then the higher colocation id); a bucket of a receiver must
+            -- bring the two utilizations closer
+            v_us := (g_load[s] OPERATOR(pg_catalog.+) g_extra[s]) OPERATOR(pg_catalog./) g_w[s];
+            v_ut := (g_load[t] OPERATOR(pg_catalog.+) g_extra[t]) OPERATOR(pg_catalog./) g_w[t];
+            FOR k IN 1 .. ni LOOP
+                CONTINUE WHEN NOT i_mov[k] OR i_owner[k] OPERATOR(pg_catalog.<>) g_id[s];
+                IF NOT v_drain AND NOT (pg_catalog.abs((v_us OPERATOR(pg_catalog.-) (i_cost[k] OPERATOR(pg_catalog./) g_w[s])) OPERATOR(pg_catalog.-) (v_ut OPERATOR(pg_catalog.+) (i_cost[k] OPERATOR(pg_catalog./) g_w[t])))
+                                        OPERATOR(pg_catalog.<) pg_catalog.abs(v_us OPERATOR(pg_catalog.-) v_ut)) THEN
+                    CONTINUE;
+                END IF;
+                IF best IS NULL OR (i_cost[k], i_b[k], i_c[k]) OPERATOR(pg_catalog.>) (i_cost[best], i_b[best], i_c[best]) THEN
+                    best := k;
+                END IF;
+            END LOOP;
+            EXIT WHEN best IS NOT NULL;
+            g_try[t] := true;
         END LOOP;
-        IF t IS NULL THEN
-            IF v_drain THEN
+        IF best IS NULL THEN
+            IF v_drain AND NOT EXISTS (SELECT 1 FROM pg_catalog.generate_series(1, ng) q WHERE g_recv[q] AND q OPERATOR(pg_catalog.<>) s) THEN
                 RAISE EXCEPTION 'no shard group can receive buckets' USING ERRCODE = 'object_not_in_prerequisite_state',
                       HINT = 'Set should_have_shards on a node with kingres.set_node_property().';
             END IF;
-            g_cand[s] := false;
-            CONTINUE;
-        END IF;
-        -- the bucket: by decreasing cost (ties: the higher bucket number, then the higher colocation id); a bucket of a receiver must
-        -- bring the two utilizations closer
-        best := NULL;
-        v_us := (g_load[s] OPERATOR(pg_catalog.+) g_extra[s]) OPERATOR(pg_catalog./) g_w[s];
-        v_ut := (g_load[t] OPERATOR(pg_catalog.+) g_extra[t]) OPERATOR(pg_catalog./) g_w[t];
-        FOR k IN 1 .. ni LOOP
-            CONTINUE WHEN NOT i_mov[k] OR i_owner[k] OPERATOR(pg_catalog.<>) g_id[s];
-            IF NOT v_drain AND NOT (pg_catalog.abs((v_us OPERATOR(pg_catalog.-) (i_cost[k] OPERATOR(pg_catalog./) g_w[s])) OPERATOR(pg_catalog.-) (v_ut OPERATOR(pg_catalog.+) (i_cost[k] OPERATOR(pg_catalog./) g_w[t])))
-                                    OPERATOR(pg_catalog.<) pg_catalog.abs(v_us OPERATOR(pg_catalog.-) v_ut)) THEN
-                CONTINUE;
-            END IF;
-            IF best IS NULL OR (i_cost[k], i_b[k], i_c[k]) OPERATOR(pg_catalog.>) (i_cost[best], i_b[best], i_c[best]) THEN
-                best := k;
-            END IF;
-        END LOOP;
-        IF best IS NULL THEN
             g_cand[s] := false;
             CONTINUE;
         END IF;
@@ -1477,11 +1619,21 @@ DECLARE
     v_ins    pg_catalog.text;
     v_trunc  pg_catalog.text;
     v_body   pg_catalog.text;
+    v_owner  pg_catalog.text;
 BEGIN
     PERFORM kingres.internal_require_superuser();
     PERFORM pg_catalog.set_config('lock_timeout', p_lock_ms::pg_catalog.text, true);
     FOR el IN SELECT x FROM pg_catalog.jsonb_array_elements(p_inspect) x LOOP
         v_parent := pg_catalog.format('%I.%I', el OPERATOR(pg_catalog.->>) 'schema', el OPERATOR(pg_catalog.->>) 'table');
+        -- P10R-02: the children and the capture trigger belong to the owner of the table, as the bucket partitions do, and the trigger function runs with the
+        -- owner's rights.  Whoever writes the table writes the old partition and so fires the trigger; the child must take the row whatever rights the writer has
+        -- on it (none: the writer has them on the parent), and what the owner's constraints and defaults run as is the owner, never the superuser who splits.
+        SELECT r.rolname INTO v_owner FROM pg_catalog.pg_class c JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) c.relowner
+         WHERE c.oid OPERATOR(pg_catalog.=) v_parent::pg_catalog.regclass::pg_catalog.oid;
+        IF NOT pg_catalog.has_schema_privilege(v_owner, (el OPERATOR(pg_catalog.->>) 'schema'), 'USAGE') THEN
+            RAISE EXCEPTION 'the owner % of table % has no USAGE on its schema: the capture trigger of a split runs with the rights of the owner', v_owner, v_parent
+                USING ERRCODE = 'insufficient_privilege';
+        END IF;
         v_part := pg_catalog.format('%I.%I', el OPERATOR(pg_catalog.->>) 'schema', el OPERATOR(pg_catalog.->>) 'part');
         v_dist := pg_catalog.quote_ident(el OPERATOR(pg_catalog.->>) 'dist');
         v_with := CASE WHEN pg_catalog.jsonb_typeof(el OPERATOR(pg_catalog.->) 'reloptions') OPERATOR(pg_catalog.=) 'array'
@@ -1499,6 +1651,7 @@ BEGIN
             EXECUTE pg_catalog.format('ALTER TABLE %s ADD CONSTRAINT ks_bucket_check CHECK (pg_catalog.satisfies_hash_partition(%L::pg_catalog.regclass::pg_catalog.oid, %s, %s, %s))',
                                       v_child, v_parent, v_new, r, v_dist);
             EXECUTE pg_catalog.format('COMMENT ON TABLE %s IS %L', v_child, 'kingres_shard bucket split ' OPERATOR(pg_catalog.||) p_split::pg_catalog.text);
+            EXECUTE pg_catalog.format('ALTER TABLE %s OWNER TO %I', v_child, v_owner);
             v_del := v_del OPERATOR(pg_catalog.||) pg_catalog.format(E'        IF pg_catalog.satisfies_hash_partition(%L::pg_catalog.regclass::pg_catalog.oid, %s, %s, OLD.%s) THEN DELETE FROM %s WHERE %s; END IF;\n',
                                                                     v_parent, v_new, r, v_dist, v_child, v_pkm);
             v_ins := v_ins OPERATOR(pg_catalog.||) pg_catalog.format(E'        IF pg_catalog.satisfies_hash_partition(%L::pg_catalog.regclass::pg_catalog.oid, %s, %s, NEW.%s) THEN INSERT INTO %s (%s) VALUES (%s) ON CONFLICT (%s) DO UPDATE SET %s; END IF;\n',
@@ -1507,7 +1660,9 @@ BEGIN
         END LOOP;
         v_fn := pg_catalog.format('split_capture_%s_%s', p_split, el OPERATOR(pg_catalog.->>) 'ord');
         v_body := pg_catalog.format(E'BEGIN\n    IF TG_OP = ''TRUNCATE'' THEN\n        TRUNCATE %s;\n        RETURN NULL;\n    END IF;\n    IF TG_OP IN (''UPDATE'', ''DELETE'') THEN\n%s    END IF;\n    IF TG_OP IN (''INSERT'', ''UPDATE'') THEN\n%s    END IF;\n    RETURN NULL;\nEND', v_trunc, v_del, v_ins);
-        EXECUTE pg_catalog.format('CREATE FUNCTION kingres.%I() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS %L', v_fn, v_body);
+        EXECUTE pg_catalog.format('CREATE FUNCTION kingres.%I() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS %L', v_fn, v_body);
+        EXECUTE pg_catalog.format('REVOKE ALL ON FUNCTION kingres.%I() FROM PUBLIC', v_fn);
+        EXECUTE pg_catalog.format('ALTER FUNCTION kingres.%I() OWNER TO %I', v_fn, v_owner);
         PERFORM kingres.internal_ddl(pg_catalog.format('CREATE TRIGGER ks_split_capture_row AFTER INSERT OR UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION kingres.%I()', v_part, v_fn));
         PERFORM kingres.internal_ddl(pg_catalog.format('ALTER TABLE %s ENABLE ALWAYS TRIGGER ks_split_capture_row', v_part));
         PERFORM kingres.internal_ddl(pg_catalog.format('CREATE TRIGGER ks_split_capture_truncate AFTER TRUNCATE ON %s FOR EACH STATEMENT EXECUTE FUNCTION kingres.%I()', v_part, v_fn));
@@ -1519,7 +1674,9 @@ $$;
 -- On the owning node, in a transaction of its own: one batch of the backfill of one table.  The rows after p_last (a JSON object of the key) in key order, those that
 -- no writer holds, are locked FOR SHARE (a writer waits for the batch, the copy cannot resurrect a row that a delete removes) and copied into the child that covers
 -- them; a row that is there already is left.  Returns {n: rows taken, inserted: rows that were not in the children, last: the last key, skipped: rows in the range that
--- a writer held}.
+-- a writer still holds}.  The rows of the range that the batch did not take (locked by a writer, or gone since the snapshot) are looked at again in a second statement
+-- with a new snapshot: those that are free now are copied, those that are gone are forgotten, only those that exist and are still locked count as held.  A row that a
+-- writer inserted after the snapshot is not in the range at all (the trigger has put it in its child), so inserts at any key never keep a pass from converging (P10R-03).
 CREATE FUNCTION kingres.internal_split_batch(p_split bigint, p_bucket int, p_modulus int, p_parts int, p_el pg_catalog.jsonb, p_last pg_catalog.jsonb, p_batch int)
     RETURNS pg_catalog.jsonb
     LANGUAGE plpgsql
@@ -1532,20 +1689,26 @@ DECLARE
     v_dist   pg_catalog.text := pg_catalog.quote_ident(p_el OPERATOR(pg_catalog.->>) 'dist');
     v_pkl    pg_catalog.text;
     v_pkr    pg_catalog.text;
+    v_pkeq   pg_catalog.text;
     v_cond   pg_catalog.text;
-    v_sql    pg_catalog.text;
+    v_upper  pg_catalog.text;
     v_ctes   pg_catalog.text := '';
+    v_ctes2  pg_catalog.text := '';
     v_sum    pg_catalog.text := '';
+    v_sum2   pg_catalog.text := '';
     j        pg_catalog.int4;
     r        pg_catalog.int4;
     v_child  pg_catalog.text;
     v_res    pg_catalog.record;
-    v_skip   pg_catalog.int8;
-    v_upper  pg_catalog.text := '';
+    v_res2   pg_catalog.record;
+    v_miss   pg_catalog.jsonb;
+    v_held   pg_catalog.int8 := 0;
+    v_ins    pg_catalog.int8;
 BEGIN
     PERFORM kingres.internal_require_superuser();
-    SELECT pg_catalog.string_agg(pg_catalog.quote_ident(c), ', '), pg_catalog.string_agg('r.' OPERATOR(pg_catalog.||) pg_catalog.quote_ident(c), ', ')
-      INTO v_pkl, v_pkr FROM pg_catalog.jsonb_array_elements_text(p_el OPERATOR(pg_catalog.->) 'pk') c;
+    SELECT pg_catalog.string_agg(pg_catalog.quote_ident(c), ', '), pg_catalog.string_agg('r.' OPERATOR(pg_catalog.||) pg_catalog.quote_ident(c), ', '),
+           pg_catalog.string_agg(pg_catalog.format('b.%I OPERATOR(pg_catalog.=) p.%I', c, c), ' AND ')
+      INTO v_pkl, v_pkr, v_pkeq FROM pg_catalog.jsonb_array_elements_text(p_el OPERATOR(pg_catalog.->) 'pk') c;
     v_cond := CASE WHEN p_last IS NULL THEN 'true'
                    ELSE pg_catalog.format('(%s) OPERATOR(pg_catalog.>) (SELECT %s FROM pg_catalog.jsonb_populate_record(NULL::%s, %L::pg_catalog.jsonb) r)', v_pkl, v_pkr, v_part, p_last::pg_catalog.text) END;
     FOR j IN 0 .. p_parts OPERATOR(pg_catalog.-) 1 LOOP
@@ -1554,23 +1717,85 @@ BEGIN
         v_ctes := v_ctes OPERATOR(pg_catalog.||) pg_catalog.format(', i%s AS (INSERT INTO %s SELECT * FROM b WHERE pg_catalog.satisfies_hash_partition(%L::pg_catalog.regclass::pg_catalog.oid, %s, %s, %s) ON CONFLICT DO NOTHING RETURNING 1)',
                                                                   j, v_child, v_parent, v_new, r, v_dist);
         v_sum := v_sum OPERATOR(pg_catalog.||) pg_catalog.format(' OPERATOR(pg_catalog.+) (SELECT pg_catalog.count(*) FROM i%s)', j);
+        v_ctes2 := v_ctes2 OPERATOR(pg_catalog.||) pg_catalog.format(', i%s AS (INSERT INTO %s SELECT * FROM m WHERE pg_catalog.satisfies_hash_partition(%L::pg_catalog.regclass::pg_catalog.oid, %s, %s, %s) ON CONFLICT DO NOTHING RETURNING 1)',
+                                                                    j, v_child, v_parent, v_new, r, v_dist);
+        v_sum2 := v_sum2 OPERATOR(pg_catalog.||) pg_catalog.format(' OPERATOR(pg_catalog.+) (SELECT pg_catalog.count(*) FROM i%s)', j);
     END LOOP;
-    v_sql := pg_catalog.format('WITH b AS (SELECT * FROM %s WHERE %s ORDER BY %s LIMIT %s FOR SHARE SKIP LOCKED)%s SELECT (SELECT pg_catalog.count(*) FROM b) AS n, (0::pg_catalog.int8%s) AS ins, (SELECT pg_catalog.to_jsonb(x) FROM (SELECT %s FROM b ORDER BY %s DESC LIMIT 1) x) AS lastk',
-                               v_part, v_cond, v_pkl, p_batch, v_ctes, v_sum, v_pkl, v_pkl);
-    EXECUTE v_sql INTO v_res;
-    -- the rows of the range that a writer held and the batch skipped
-    IF v_res.n OPERATOR(pg_catalog.=) p_batch AND v_res.lastk IS NOT NULL THEN
-        v_upper := pg_catalog.format(' AND (%s) OPERATOR(pg_catalog.<=) (SELECT %s FROM pg_catalog.jsonb_populate_record(NULL::%s, %L::pg_catalog.jsonb) r)', v_pkl, v_pkr, v_part, v_res.lastk::pg_catalog.text);
+    -- the range of the batch ends at its last key when it is full (the rows after it are for the next batch); the rows of the range that the batch did not take
+    v_upper := pg_catalog.format('((SELECT pg_catalog.count(*) FROM b) OPERATOR(pg_catalog.<) %s OR (%s) OPERATOR(pg_catalog.<=) (SELECT %s FROM b ORDER BY %s DESC LIMIT 1))', p_batch, v_pkl, v_pkl, v_pkl);
+    EXECUTE pg_catalog.format('WITH b AS (SELECT * FROM %s WHERE %s ORDER BY %s LIMIT %s FOR SHARE SKIP LOCKED)%s '
+                              'SELECT (SELECT pg_catalog.count(*) FROM b) AS n, (0::pg_catalog.int8%s) AS ins, '
+                              '(SELECT pg_catalog.to_jsonb(x) FROM (SELECT %s FROM b ORDER BY %s DESC LIMIT 1) x) AS lastk, '
+                              '(SELECT pg_catalog.count(*) FROM %s p WHERE %s AND %s AND NOT EXISTS (SELECT 1 FROM b WHERE %s)) AS nmiss, '
+                              '(SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.to_jsonb(y)), ''[]''::pg_catalog.jsonb) FROM (SELECT %s FROM %s p WHERE %s AND %s AND NOT EXISTS (SELECT 1 FROM b WHERE %s) ORDER BY %s LIMIT 200) y) AS miss',
+                              v_part, v_cond, v_pkl, p_batch, v_ctes, v_sum, v_pkl, v_pkl,
+                              v_part, v_cond, v_upper, v_pkeq,
+                              v_pkl, v_part, v_cond, v_upper, v_pkeq, v_pkl)
+       INTO v_res;
+    v_ins := v_res.ins;
+    v_miss := v_res.miss;
+    v_held := v_res.nmiss OPERATOR(pg_catalog.-) pg_catalog.jsonb_array_length(v_miss);       -- more than the list holds: all of them count as held
+    IF pg_catalog.jsonb_array_length(v_miss) OPERATOR(pg_catalog.>) 0 THEN
+        EXECUTE pg_catalog.format('WITH k AS (SELECT * FROM pg_catalog.jsonb_populate_recordset(NULL::%s, %L::pg_catalog.jsonb)), '
+                                  'm AS (SELECT p.* FROM %s p WHERE (%s) IN (SELECT %s FROM k) FOR SHARE SKIP LOCKED)%s '
+                                  'SELECT (SELECT pg_catalog.count(*) FROM %s p WHERE (%s) IN (SELECT %s FROM k)) AS existing, (SELECT pg_catalog.count(*) FROM m) AS got, (0::pg_catalog.int8%s) AS ins',
+                                  v_part, v_miss::pg_catalog.text, v_part, v_pkl, v_pkl, v_ctes2, v_part, v_pkl, v_pkl, v_sum2)
+           INTO v_res2;
+        v_held := v_held OPERATOR(pg_catalog.+) (v_res2.existing OPERATOR(pg_catalog.-) v_res2.got);
+        v_ins := v_ins OPERATOR(pg_catalog.+) v_res2.ins;
     END IF;
-    EXECUTE pg_catalog.format('SELECT pg_catalog.count(*) FROM %s WHERE %s%s', v_part, v_cond, v_upper) INTO v_skip;
-    RETURN pg_catalog.jsonb_build_object('n', v_res.n, 'inserted', v_res.ins, 'last', v_res.lastk,
-                                         'skipped', CASE WHEN v_skip OPERATOR(pg_catalog.>) v_res.n THEN v_skip OPERATOR(pg_catalog.-) v_res.n ELSE 0 END);
+    RETURN pg_catalog.jsonb_build_object('n', v_res.n, 'inserted', v_ins, 'last', v_res.lastk, 'skipped', v_held);
 END;
 $$;
 
--- On the owning node, in one transaction: lock the tables, verify, drop the triggers, replace the old partitions by the children.  Writers of the tables on this node wait from the lock
--- to the commit (SHARE); readers wait for the detach only.  An error (a lock that is not got within p_lock_ms, a verification that fails) rolls everything back.
-CREATE FUNCTION kingres.internal_split_switch(p_split bigint, p_bucket int, p_modulus int, p_parts int, p_inspect pg_catalog.jsonb, p_lock_ms int, p_verify text)
+-- On the owning node, the first half of the switch, in the transaction that the second half finishes (the coordinator sends both in one command, with the
+-- statement timeout of the switch set between them): the fence, then the tables and the old partitions locked SHARE (writers wait from here to the commit, readers do
+-- not).  The fence is an advisory lock that the undo of the split takes too, so that a switch and an undo of one split never run at the same time (P10R-01): whoever
+-- comes second waits for the first to end and then looks at what is there.  Returns 'switched' when the partitions are switched already (a call that was retried after its
+-- answer was lost, or a recovery got there first), 'locked' otherwise.  A lock that is not got within p_lock_ms, or a deadlock (this session finds it first: its deadlock
+-- timeout is short), is an error and the coordinator tries again.
+CREATE FUNCTION kingres.internal_split_switch_lock(p_split bigint, p_colocation int, p_bucket int, p_modulus int, p_parts int, p_inspect pg_catalog.jsonb, p_lock_ms int)
+    RETURNS pg_catalog.text
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    el       pg_catalog.jsonb;
+    j        pg_catalog.int4;
+    r        pg_catalog.int4;
+    v_child  pg_catalog.text;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    PERFORM pg_catalog.set_config('lock_timeout', p_lock_ms::pg_catalog.text, true);
+    PERFORM pg_catalog.set_config('deadlock_timeout', '100ms', true);
+    PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('kingres_split_switch'), p_split::pg_catalog.int4);
+    IF kingres.internal_split_state(p_colocation, p_bucket, p_modulus OPERATOR(pg_catalog.*) p_parts) OPERATOR(pg_catalog.=) 'switched' THEN
+        RETURN 'switched';
+    END IF;
+    -- an undo that ran meanwhile took the children away: there is nothing to switch to
+    FOR el IN SELECT x FROM pg_catalog.jsonb_array_elements(p_inspect) x LOOP
+        FOR j IN 0 .. p_parts OPERATOR(pg_catalog.-) 1 LOOP
+            r := p_bucket OPERATOR(pg_catalog.+) (j OPERATOR(pg_catalog.*) p_modulus);
+            v_child := pg_catalog.format('%I.%I', el OPERATOR(pg_catalog.->>) 'schema', pg_catalog.format('%s_s%s_%s', el OPERATOR(pg_catalog.->>) 'table', p_split, r));
+            IF pg_catalog.to_regclass(v_child) IS NULL THEN
+                RAISE EXCEPTION 'the children of split % are gone (the split was undone)', p_split USING ERRCODE = 'object_not_in_prerequisite_state';
+            END IF;
+        END LOOP;
+    END LOOP;
+    FOR el IN SELECT x FROM pg_catalog.jsonb_array_elements(p_inspect) x LOOP
+        EXECUTE pg_catalog.format('LOCK TABLE ONLY %I.%I, ONLY %I.%I IN SHARE MODE', el OPERATOR(pg_catalog.->>) 'schema', el OPERATOR(pg_catalog.->>) 'table',
+                                  el OPERATOR(pg_catalog.->>) 'schema', el OPERATOR(pg_catalog.->>) 'part');
+        PERFORM kingres.internal_fault_point('split_switch_after_lock');
+    END LOOP;
+    RETURN 'locked';
+END;
+$$;
+
+-- On the owning node, the second half of the switch, in the transaction of the first: with the writers out the children must equal the partition (count, bring them in
+-- line once if they differ, count again), the triggers go, the old partitions are detached and the children, renamed, take their place.  Runs under the statement timeout
+-- that the coordinator sets between the two halves (move_switch_timeout), so that the verification, the detach and the attach, which all run with the writers waiting,
+-- have the bound the design promises (P10R-08).  An error rolls everything back.
+CREATE FUNCTION kingres.internal_split_switch(p_split bigint, p_colocation int, p_bucket int, p_modulus int, p_parts int, p_inspect pg_catalog.jsonb, p_verify text)
     RETURNS pg_catalog.jsonb
     LANGUAGE plpgsql
     SET search_path = pg_catalog, kingres, pg_temp
@@ -1585,6 +1810,9 @@ DECLARE
     v_child  pg_catalog.text;
     v_dist   pg_catalog.text;
     v_pkm    pg_catalog.text;
+    v_pkl    pg_catalog.text;
+    v_set    pg_catalog.text;
+    v_cols   pg_catalog.text;
     v_old    pg_catalog.int8;
     v_kids   pg_catalog.int8;
     v_n      pg_catalog.int8;
@@ -1592,12 +1820,9 @@ DECLARE
     v_rows   pg_catalog.int8 := 0;
 BEGIN
     PERFORM kingres.internal_require_superuser();
-    PERFORM pg_catalog.set_config('lock_timeout', p_lock_ms::pg_catalog.text, true);
-    FOR el IN SELECT x FROM pg_catalog.jsonb_array_elements(p_inspect) x LOOP
-        EXECUTE pg_catalog.format('LOCK TABLE ONLY %I.%I, ONLY %I.%I IN SHARE MODE', el OPERATOR(pg_catalog.->>) 'schema', el OPERATOR(pg_catalog.->>) 'table',
-                                  el OPERATOR(pg_catalog.->>) 'schema', el OPERATOR(pg_catalog.->>) 'part');
-    END LOOP;
-    -- with the writers out the children must equal the partition: count, bring them in line once if they differ, count again
+    IF kingres.internal_split_state(p_colocation, p_bucket, v_new) OPERATOR(pg_catalog.=) 'switched' THEN
+        RETURN pg_catalog.jsonb_build_object('rows', 0, 'already', true);
+    END IF;
     IF p_verify IN ('count', 'full') THEN
         FOR el IN SELECT x FROM pg_catalog.jsonb_array_elements(p_inspect) x LOOP
             v_parent := pg_catalog.format('%I.%I', el OPERATOR(pg_catalog.->>) 'schema', el OPERATOR(pg_catalog.->>) 'table');
@@ -1605,6 +1830,12 @@ BEGIN
             v_dist := pg_catalog.quote_ident(el OPERATOR(pg_catalog.->>) 'dist');
             SELECT pg_catalog.string_agg(pg_catalog.format('c.%I OPERATOR(pg_catalog.=) p.%I', k, k), ' AND ') INTO v_pkm
               FROM pg_catalog.jsonb_array_elements_text(el OPERATOR(pg_catalog.->) 'pk') k;
+            SELECT pg_catalog.string_agg(pg_catalog.quote_ident(k), ', ') INTO v_pkl FROM pg_catalog.jsonb_array_elements_text(el OPERATOR(pg_catalog.->) 'pk') k;
+            SELECT pg_catalog.string_agg(pg_catalog.quote_ident(k), ', ') INTO v_cols FROM pg_catalog.jsonb_array_elements_text(el OPERATOR(pg_catalog.->) 'cols') k;
+            -- 'full' makes the children equal in content: a row that exists with other values is brought to the partition's values (P10R-14)
+            SELECT pg_catalog.string_agg(pg_catalog.format('%I = EXCLUDED.%I', k, k), ', ') INTO v_set
+              FROM pg_catalog.jsonb_array_elements_text(el OPERATOR(pg_catalog.->) 'cols') k
+             WHERE NOT (k OPERATOR(pg_catalog.=) ANY (ARRAY(SELECT pg_catalog.jsonb_array_elements_text(el OPERATOR(pg_catalog.->) 'pk'))));
             FOR v_n IN 1 .. 2 LOOP
                 EXECUTE pg_catalog.format('SELECT pg_catalog.count(*) FROM %s', v_part) INTO v_old;
                 v_kids := 0;
@@ -1614,7 +1845,7 @@ BEGIN
                     EXECUTE pg_catalog.format('SELECT pg_catalog.count(*) FROM %s', v_child) INTO v_target;
                     v_kids := v_kids OPERATOR(pg_catalog.+) v_target::pg_catalog.int8;
                 END LOOP;
-                -- 'full' brings the children in line with the partition even when the counts agree (a child can miss a row and hold a stray one)
+                -- 'full' brings the children in line with the partition even when the counts agree (a child can miss a row, hold a stray one or hold other values)
                 EXIT WHEN v_kids OPERATOR(pg_catalog.=) v_old AND (p_verify OPERATOR(pg_catalog.=) 'count' OR v_n OPERATOR(pg_catalog.=) 2);
                 IF v_n OPERATOR(pg_catalog.=) 2 THEN
                     RAISE EXCEPTION 'the children of bucket % of table % hold % rows and the partition holds %', p_bucket, v_parent, v_kids, v_old
@@ -1624,13 +1855,15 @@ BEGIN
                     r := p_bucket OPERATOR(pg_catalog.+) (j OPERATOR(pg_catalog.*) p_modulus);
                     v_child := pg_catalog.format('%I.%I', el OPERATOR(pg_catalog.->>) 'schema', pg_catalog.format('%s_s%s_%s', el OPERATOR(pg_catalog.->>) 'table', p_split, r));
                     EXECUTE pg_catalog.format('DELETE FROM %s c WHERE NOT EXISTS (SELECT 1 FROM %s p WHERE %s)', v_child, v_part, v_pkm);
-                    EXECUTE pg_catalog.format('INSERT INTO %s SELECT p.* FROM %s p WHERE pg_catalog.satisfies_hash_partition(%L::pg_catalog.regclass::pg_catalog.oid, %s, %s, p.%s) ON CONFLICT DO NOTHING',
-                                              v_child, v_part, v_parent, v_new, r, v_dist);
+                    EXECUTE pg_catalog.format('INSERT INTO %s (%s) SELECT %s FROM %s p WHERE pg_catalog.satisfies_hash_partition(%L::pg_catalog.regclass::pg_catalog.oid, %s, %s, p.%s) ON CONFLICT (%s) %s',
+                                              v_child, v_cols, v_cols, v_part, v_parent, v_new, r, v_dist, v_pkl,
+                                              CASE WHEN v_set IS NULL OR p_verify OPERATOR(pg_catalog.<>) 'full' THEN 'DO NOTHING' ELSE 'DO UPDATE SET ' OPERATOR(pg_catalog.||) v_set END);
                 END LOOP;
             END LOOP;
             v_rows := v_rows OPERATOR(pg_catalog.+) v_old;
         END LOOP;
     END IF;
+    PERFORM kingres.internal_fault_point('split_switch_after_verify');
     -- the triggers and their functions go (the old partition must never write into a child again), the old partitions leave, the children take their place
     FOR el IN SELECT x FROM pg_catalog.jsonb_array_elements(p_inspect) x LOOP
         v_part := pg_catalog.format('%I.%I', el OPERATOR(pg_catalog.->>) 'schema', el OPERATOR(pg_catalog.->>) 'part');
@@ -1642,6 +1875,7 @@ BEGIN
         PERFORM kingres.internal_detach_bucket(pg_catalog.format('%I.%I', el OPERATOR(pg_catalog.->>) 'schema', el OPERATOR(pg_catalog.->>) 'table')::pg_catalog.regclass, p_bucket,
                                                pg_catalog.format('orphan_s%s_%s', p_split, el OPERATOR(pg_catalog.->>) 'ord'));
     END LOOP;
+    PERFORM kingres.internal_fault_point('split_switch_after_detach');
     FOR el IN SELECT x FROM pg_catalog.jsonb_array_elements(p_inspect) x ORDER BY (x OPERATOR(pg_catalog.->>) 'ord')::pg_catalog.int4 LOOP
         FOR j IN 0 .. p_parts OPERATOR(pg_catalog.-) 1 LOOP
             r := p_bucket OPERATOR(pg_catalog.+) (j OPERATOR(pg_catalog.*) p_modulus);
@@ -1650,35 +1884,8 @@ BEGIN
             PERFORM kingres.internal_attach_bucket(pg_catalog.format('%I.%I', el OPERATOR(pg_catalog.->>) 'schema', el OPERATOR(pg_catalog.->>) 'table')::pg_catalog.regclass, r, v_new);
         END LOOP;
     END LOOP;
+    PERFORM kingres.internal_fault_point('split_switch_after_attach');
     RETURN pg_catalog.jsonb_build_object('rows', v_rows);
-END;
-$$;
-
--- On the owning node: whatever a split that did not switch left (the triggers, their functions, the children); safe to run again.
-CREATE FUNCTION kingres.internal_split_undo(p_split bigint, p_colocation int, p_bucket int, p_modulus int, p_parts int)
-    RETURNS void
-    LANGUAGE plpgsql
-    SET search_path = pg_catalog, kingres, pg_temp
-    AS $$
-DECLARE
-    t      pg_catalog.record;
-    v_part pg_catalog.regclass;
-    j      pg_catalog.int4;
-    r      pg_catalog.int4;
-BEGIN
-    PERFORM kingres.internal_require_superuser();
-    FOR t IN SELECT * FROM kingres.internal_move_tables(p_colocation) ORDER BY ord LOOP
-        v_part := pg_catalog.to_regclass(pg_catalog.format('%I.%I', t.schema_name, kingres.internal_bucket_part_name(t.table_name, p_bucket)));
-        IF v_part IS NOT NULL THEN
-            PERFORM kingres.internal_ddl(pg_catalog.format('DROP TRIGGER IF EXISTS ks_split_capture_row ON %s', v_part));
-            PERFORM kingres.internal_ddl(pg_catalog.format('DROP TRIGGER IF EXISTS ks_split_capture_truncate ON %s', v_part));
-        END IF;
-        EXECUTE pg_catalog.format('DROP FUNCTION IF EXISTS kingres.%I()', pg_catalog.format('split_capture_%s_%s', p_split, t.ord));
-        FOR j IN 0 .. p_parts OPERATOR(pg_catalog.-) 1 LOOP
-            r := p_bucket OPERATOR(pg_catalog.+) (j OPERATOR(pg_catalog.*) p_modulus);
-            EXECUTE pg_catalog.format('DROP TABLE IF EXISTS %I.%I', t.schema_name, pg_catalog.format('%s_s%s_%s', t.table_name, p_split, r));
-        END LOOP;
-    END LOOP;
 END;
 $$;
 
@@ -1696,6 +1903,53 @@ BEGIN
     SELECT pg_catalog.pg_get_expr(c.relpartbound, c.oid) INTO v_bnd FROM pg_catalog.pg_class c
      WHERE c.oid OPERATOR(pg_catalog.=) pg_catalog.to_regclass(pg_catalog.format('%I.%I', t.schema_name, kingres.internal_bucket_part_name(t.table_name, p_bucket)))::pg_catalog.oid;
     RETURN CASE WHEN v_bnd IS NOT NULL AND v_bnd OPERATOR(pg_catalog.~) pg_catalog.format('modulus %s, ', p_newmod) THEN 'switched' ELSE 'not' END;
+END;
+$$;
+
+-- On the owning node: whatever a split that did not switch left (the triggers, their functions, the children); safe to run again.  One transaction, and it takes
+-- the fence of the switch first (P10R-01): a switch that is running (its coordinator may be dead) is waited for, within what a switch may take, and then the partitions
+-- are looked at again.  Returns 'switched' when they are switched (nothing is undone, the catalog must follow), 'undone' when the split is gone.  The locks of the
+-- undo are bounded (P10R-13): a lock that is not got is an error and the caller tries later.
+CREATE FUNCTION kingres.internal_split_undo(p_split bigint, p_colocation int, p_bucket int, p_modulus int, p_parts int)
+    RETURNS pg_catalog.text
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    t       pg_catalog.record;
+    v_part  pg_catalog.regclass;
+    j       pg_catalog.int4;
+    r       pg_catalog.int4;
+    v_sw_ms pg_catalog.int4 := (SELECT x.setting::pg_catalog.int4 FROM pg_catalog.pg_settings x WHERE x.name OPERATOR(pg_catalog.=) 'kingres_shard.move_switch_timeout');
+    v_lock_ms pg_catalog.int4;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    v_lock_ms := CASE WHEN v_sw_ms OPERATOR(pg_catalog./) 10 OPERATOR(pg_catalog.>) 200 THEN v_sw_ms OPERATOR(pg_catalog./) 10 ELSE 200 END;
+    PERFORM pg_catalog.set_config('deadlock_timeout', '100ms', true);
+    PERFORM pg_catalog.set_config('lock_timeout', (v_sw_ms OPERATOR(pg_catalog.+) v_lock_ms)::pg_catalog.text, true);
+    PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('kingres_split_switch'), p_split::pg_catalog.int4);
+    PERFORM pg_catalog.set_config('lock_timeout', v_lock_ms::pg_catalog.text, true);
+    IF kingres.internal_split_state(p_colocation, p_bucket, p_modulus OPERATOR(pg_catalog.*) p_parts) OPERATOR(pg_catalog.=) 'switched' THEN
+        RETURN 'switched';
+    END IF;
+    PERFORM kingres.internal_fault_point('split_undo_after_lock');
+    FOR t IN SELECT * FROM kingres.internal_move_tables(p_colocation) ORDER BY ord LOOP
+        v_part := pg_catalog.to_regclass(pg_catalog.format('%I.%I', t.schema_name, kingres.internal_bucket_part_name(t.table_name, p_bucket)));
+        IF v_part IS NOT NULL THEN
+            PERFORM kingres.internal_ddl(pg_catalog.format('DROP TRIGGER IF EXISTS ks_split_capture_row ON %s', v_part));
+            PERFORM kingres.internal_ddl(pg_catalog.format('DROP TRIGGER IF EXISTS ks_split_capture_truncate ON %s', v_part));
+        END IF;
+        EXECUTE pg_catalog.format('DROP FUNCTION IF EXISTS kingres.%I()', pg_catalog.format('split_capture_%s_%s', p_split, t.ord));
+    END LOOP;
+    PERFORM kingres.internal_fault_point('split_undo_after_triggers');
+    FOR t IN SELECT * FROM kingres.internal_move_tables(p_colocation) ORDER BY ord LOOP
+        FOR j IN 0 .. p_parts OPERATOR(pg_catalog.-) 1 LOOP
+            r := p_bucket OPERATOR(pg_catalog.+) (j OPERATOR(pg_catalog.*) p_modulus);
+            EXECUTE pg_catalog.format('DROP TABLE IF EXISTS %I.%I', t.schema_name, pg_catalog.format('%s_s%s_%s', t.table_name, p_split, r));
+        END LOOP;
+    END LOOP;
+    PERFORM kingres.internal_fault_point('split_undo_after_children');
+    RETURN 'undone';
 END;
 $$;
 
@@ -1838,7 +2092,9 @@ $$;
 
 -- Splits one bucket into parts (2, 4, 8 or 16) of a modulus parts times larger, in place: the children stay on the group of the bucket.  Map group primary, superuser,
 -- READ COMMITTED.  Returns the id of the record in kingres.bucket_split.  verify 'count' compares the number of rows of every table with its children under the switch lock
--- and brings the children in line when they differ; 'full' brings them in line always (key by key, both ways: it costs a pass over the bucket under the lock); 'none' trusts the triggers and the passes.
+-- and brings the children in line when they differ; 'full' brings them in line always (key by key, both ways, values included: it costs a pass over the bucket under the lock);
+-- 'none' trusts the triggers and the passes.  The batch of 5000 rows, the 10 passes and the 16 parts at most are constants of this function; the attempts of the switch and its
+-- bounds are the settings of the bucket move (move_switch_attempts, move_switch_timeout, README "Splitting a bucket").
 CREATE FUNCTION kingres.split_bucket(colocation_id int, bucket int, parts int DEFAULT 2, verify text DEFAULT 'count')
     RETURNS bigint
     LANGUAGE plpgsql
@@ -1873,9 +2129,11 @@ DECLARE
     v_done     pg_catalog.int8 := 0;
     v_att      pg_catalog.int4;
     v_err      pg_catalog.text;
+    v_sqlstate pg_catalog.text;
     v_cancel   pg_catalog.bool;
     v_pause    pg_catalog.float8;
     v_blockers pg_catalog.text;
+    v_res      pg_catalog.text;
     v_converged pg_catalog.bool := false;
 BEGIN
     PERFORM kingres.internal_require_superuser();
@@ -1907,6 +2165,12 @@ BEGIN
     END IF;
     IF v_mod OPERATOR(pg_catalog.*) v_parts OPERATOR(pg_catalog.>) 65536 THEN
         RAISE EXCEPTION 'a bucket of modulus % cannot be split in % parts: the greatest modulus of a group is 65536', v_mod, v_parts USING ERRCODE = 'program_limit_exceeded';
+    END IF;
+    -- P10R-05: the partition of bucket 12288 is named <table>_b12288 by the code of the extension and was named <table>_b1228 by the SQL functions (lpad cuts); no group has such a
+    -- bucket, because a group starts with at most 4096 and the names of the buckets of a split are the numbers 0 to 9999 until this limit is lifted
+    IF v_bucket OPERATOR(pg_catalog.+) ((v_parts OPERATOR(pg_catalog.-) 1) OPERATOR(pg_catalog.*) v_mod) OPERATOR(pg_catalog.>=) 10000 THEN
+        RAISE EXCEPTION 'bucket % of modulus % cannot be split in % parts: the new buckets would be numbered %, and bucket numbers are limited to 9999 (the names of the partitions of larger numbers are not the same in every part of the extension)',
+                        v_bucket, v_mod, v_parts, v_bucket OPERATOR(pg_catalog.+) ((v_parts OPERATOR(pg_catalog.-) 1) OPERATOR(pg_catalog.*) v_mod) USING ERRCODE = 'program_limit_exceeded';
     END IF;
     v_why := kingres.internal_split_allowed(v_colo);
     IF v_why IS NOT NULL THEN
@@ -1969,6 +2233,9 @@ BEGIN
             IF v_ins OPERATOR(pg_catalog.=) 0 AND v_skip OPERATOR(pg_catalog.=) 0 THEN
                 v_converged := true;
                 EXIT;
+            ELSIF v_skip OPERATOR(pg_catalog.>) 0 THEN
+                -- a writer holds rows: it needs time to end, the passes are not for spinning (P10R-03); the ten passes then last about ten seconds
+                PERFORM pg_catalog.pg_sleep(LEAST(2.0, 0.2 OPERATOR(pg_catalog.*) v_pass));
             END IF;
         END LOOP;
         IF NOT v_converged THEN
@@ -1984,13 +2251,18 @@ BEGIN
         LOOP
             v_att := v_att OPERATOR(pg_catalog.+) 1;
             BEGIN
-                PERFORM kingres.internal_exec_scalar(v_owner, pg_catalog.format('SELECT kingres.internal_split_switch(%s, %s, %s, %s, %L::pg_catalog.jsonb, %s, %L)',
-                                                      v_id, v_bucket, v_mod, v_parts, v_inspect::pg_catalog.text, v_lock_ms, v_verify), v_sw_ms OPERATOR(pg_catalog.+) v_node_ms * 6);
+                -- one command, one transaction on the owner: the fence and the locks, the statement timeout of the switch (the writers wait from the first lock to the commit,
+                -- and that is what move_switch_timeout bounds, P10R-08), then the verification, the detach and the attach
+                PERFORM kingres.internal_exec_scalar(v_owner, pg_catalog.format(
+                    'SELECT kingres.internal_split_switch_lock(%s, %s, %s, %s, %s, %L::pg_catalog.jsonb, %s); SET LOCAL statement_timeout = ''%sms''; '
+                    'SELECT kingres.internal_split_switch(%s, %s, %s, %s, %s, %L::pg_catalog.jsonb, %L)::pg_catalog.text',
+                    v_id, v_colo, v_bucket, v_mod, v_parts, v_inspect::pg_catalog.text, v_lock_ms, v_sw_ms,
+                    v_id, v_colo, v_bucket, v_mod, v_parts, v_inspect::pg_catalog.text, v_verify), v_sw_ms OPERATOR(pg_catalog.+) v_node_ms * 6);
                 v_stage := 3;
                 EXIT;
-            EXCEPTION WHEN OTHERS THEN
-                v_err := SQLERRM;
-                -- an answer that did not come may be a switch that committed: ask the node what it holds
+            EXCEPTION WHEN OTHERS OR query_canceled THEN
+                GET STACKED DIAGNOSTICS v_err = MESSAGE_TEXT, v_sqlstate = RETURNED_SQLSTATE;
+                -- an answer that did not come may be a switch that committed: ask the node what it holds (the fence makes a switch that still runs finish first)
                 BEGIN
                     IF kingres.internal_exec_scalar(v_owner, pg_catalog.format('SELECT kingres.internal_split_state(%s, %s, %s)', v_colo, v_bucket, v_mod OPERATOR(pg_catalog.*) v_parts)) OPERATOR(pg_catalog.=) 'switched' THEN
                         v_stage := 3;
@@ -1999,22 +2271,26 @@ BEGIN
                 EXCEPTION WHEN OTHERS THEN
                     RAISE EXCEPTION 'the switch of split % is not known: %', v_id, v_err USING ERRCODE = 'object_not_in_prerequisite_state';
                 END;
-                IF v_err OPERATOR(pg_catalog.~*) 'lock timeout' AND v_att OPERATOR(pg_catalog.<) v_max_att THEN
+                -- nothing was changed by a switch that waited too long for a lock, found a deadlock or ran past its time: it is tried again (P10R-04)
+                IF (v_sqlstate IN ('55P03', '40P01') OR (v_sqlstate OPERATOR(pg_catalog.=) '57014' AND v_err OPERATOR(pg_catalog.~) 'statement timeout')) AND v_att OPERATOR(pg_catalog.<) v_max_att THEN
+                    PERFORM kingres.internal_exec_scalar(v_self, pg_catalog.format('SELECT kingres.internal_split_set(%s, ''switching'', %L)', v_id,
+                                                          pg_catalog.format('switch attempt %s gave up: %s', v_att, pg_catalog.left(v_err, 200))));
                     PERFORM pg_catalog.pg_sleep(v_pause OPERATOR(pg_catalog.*) (0.5 OPERATOR(pg_catalog.+) pg_catalog.random()));
                     v_pause := CASE WHEN v_pause OPERATOR(pg_catalog.>) 2.5 THEN 5 ELSE v_pause OPERATOR(pg_catalog.*) 2 END;
+                ELSIF v_sqlstate = '55P03' THEN
+                    BEGIN
+                        v_blockers := kingres.internal_exec_scalar(v_owner, pg_catalog.format(
+                            'SELECT COALESCE(pg_catalog.string_agg(DISTINCT pg_catalog.format(''pid %%s: %%s'', l.pid, pg_catalog.left(a.query, 60)), ''; ''), '''') FROM pg_catalog.pg_locks l JOIN pg_catalog.pg_stat_activity a ON a.pid OPERATOR(pg_catalog.=) l.pid '
+                            'WHERE l.locktype OPERATOR(pg_catalog.=) ''relation'' AND l.granted AND l.pid OPERATOR(pg_catalog.<>) pg_catalog.pg_backend_pid() AND l.mode IN (''RowExclusiveLock'', ''ShareUpdateExclusiveLock'', ''ShareRowExclusiveLock'', ''ExclusiveLock'', ''AccessExclusiveLock'') '
+                            'AND l.relation IN (SELECT d.relid::pg_catalog.oid FROM kingres.dist_table d WHERE d.colocation_id OPERATOR(pg_catalog.=) %s)', v_colo));
+                    EXCEPTION WHEN OTHERS THEN
+                        v_blockers := '';
+                    END;
+                    RAISE EXCEPTION 'the switch of bucket % did not get its locks in % attempts: %', v_bucket, v_att, v_blockers USING ERRCODE = 'lock_not_available';
+                ELSIF v_sqlstate IN ('40P01', '57014') THEN
+                    RAISE EXCEPTION 'the switch of bucket % did not finish in % attempts: %', v_bucket, v_att, v_err USING ERRCODE = 'lock_not_available';
                 ELSE
-                    IF v_err OPERATOR(pg_catalog.~*) 'lock timeout' THEN
-                        BEGIN
-                            v_blockers := kingres.internal_exec_scalar(v_owner, pg_catalog.format(
-                                'SELECT COALESCE(pg_catalog.string_agg(DISTINCT pg_catalog.format(''pid %%s: %%s'', l.pid, pg_catalog.left(a.query, 60)), ''; ''), '''') FROM pg_catalog.pg_locks l JOIN pg_catalog.pg_stat_activity a ON a.pid OPERATOR(pg_catalog.=) l.pid '
-                                'WHERE l.locktype OPERATOR(pg_catalog.=) ''relation'' AND l.granted AND l.pid OPERATOR(pg_catalog.<>) pg_catalog.pg_backend_pid() AND l.mode IN (''RowExclusiveLock'', ''ShareUpdateExclusiveLock'', ''ShareRowExclusiveLock'', ''ExclusiveLock'', ''AccessExclusiveLock'') '
-                                'AND l.relation IN (SELECT d.relid::pg_catalog.oid FROM kingres.dist_table d WHERE d.colocation_id OPERATOR(pg_catalog.=) %s)', v_colo));
-                        EXCEPTION WHEN OTHERS THEN
-                            v_blockers := '';
-                        END;
-                        RAISE EXCEPTION 'the switch of bucket % did not get its locks in % attempts: %', v_bucket, v_att, v_blockers USING ERRCODE = 'lock_not_available';
-                    END IF;
-                    RAISE EXCEPTION '%', v_err;
+                    RAISE EXCEPTION '%', v_err USING ERRCODE = v_sqlstate;
                 END IF;
             END;
         END LOOP;
@@ -2023,18 +2299,26 @@ BEGIN
         PERFORM kingres.internal_exec_scalar(v_self, pg_catalog.format('SELECT kingres.internal_split_finish(%s)', v_id));
         v_stage := 4;
         PERFORM kingres.internal_fault_point('split_after_local');
-    EXCEPTION WHEN OTHERS THEN
+    EXCEPTION WHEN OTHERS OR query_canceled THEN
         v_err := SQLERRM;
         IF v_stage OPERATOR(pg_catalog.>=) 3 THEN
-            -- the partitions are switched: the worker (or the next resume_bucket_splits()) writes the catalog
+            -- the partitions are switched: the worker (or the next resume_bucket_splits()) writes the catalog; the live mark goes, so that it can (P10R-06)
+            PERFORM pg_catalog.pg_advisory_unlock(pg_catalog.hashtext('kingres_split'), v_id::pg_catalog.int4);
             RAISE;
         END IF;
         BEGIN
-            PERFORM kingres.internal_exec_scalar(v_owner, pg_catalog.format('SELECT kingres.internal_split_undo(%s, %s, %s, %s, %s)', v_id, v_colo, v_bucket, v_mod, v_parts), v_node_ms OPERATOR(pg_catalog.*) 6);
+            v_res := kingres.internal_exec_scalar(v_owner, pg_catalog.format('SELECT kingres.internal_split_undo(%s, %s, %s, %s, %s)', v_id, v_colo, v_bucket, v_mod, v_parts), v_sw_ms OPERATOR(pg_catalog.+) v_node_ms * 6);
+            IF v_res OPERATOR(pg_catalog.=) 'switched' THEN
+                -- the switch committed after all (the undo waited for it): the split is not undone, it is finished
+                PERFORM kingres.internal_exec_scalar(v_self, pg_catalog.format('SELECT kingres.internal_split_finish(%s)', v_id));
+                PERFORM pg_catalog.pg_advisory_unlock(pg_catalog.hashtext('kingres_split'), v_id::pg_catalog.int4);
+                RETURN v_id;
+            END IF;
             PERFORM kingres.internal_exec_scalar(v_self, pg_catalog.format('SELECT kingres.internal_split_fail(%s, %L, %L)', v_id, v_err, v_err OPERATOR(pg_catalog.~) 'was cancelled'));
-        EXCEPTION WHEN OTHERS THEN
+        EXCEPTION WHEN OTHERS OR query_canceled THEN
             NULL;       -- what could not be undone is left to resume_bucket_splits()
         END;
+        PERFORM pg_catalog.pg_advisory_unlock(pg_catalog.hashtext('kingres_split'), v_id::pg_catalog.int4);
         RAISE;
     END;
     PERFORM pg_catalog.pg_advisory_unlock(pg_catalog.hashtext('kingres_split'), v_id::pg_catalog.int4);
@@ -2069,7 +2353,8 @@ BEGIN
 END;
 $$;
 
--- Settles the splits whose session is gone: one that did not switch is undone, one whose partitions are switched gets its catalog.  Returns how many.
+-- Settles the splits whose session is gone: the undo, which waits for a switch that may still be running and looks at the partitions then, says whether the split is
+-- undone (the record says failed) or the partitions are switched (the catalog is written).  Returns how many (P10R-01).
 CREATE FUNCTION kingres.resume_bucket_splits()
     RETURNS int
     LANGUAGE plpgsql
@@ -2079,7 +2364,9 @@ DECLARE
     s       pg_catalog.record;
     n       pg_catalog.int4 := 0;
     v_owner pg_catalog.int4;
+    v_res   pg_catalog.text;
     v_node_ms pg_catalog.int4 := (SELECT x.setting::pg_catalog.int4 FROM pg_catalog.pg_settings x WHERE x.name OPERATOR(pg_catalog.=) 'kingres_shard.node_timeout') OPERATOR(pg_catalog.*) 1000;
+    v_sw_ms pg_catalog.int4 := (SELECT x.setting::pg_catalog.int4 FROM pg_catalog.pg_settings x WHERE x.name OPERATOR(pg_catalog.=) 'kingres_shard.move_switch_timeout');
 BEGIN
     PERFORM kingres.internal_require_superuser();
     PERFORM kingres.internal_require_map_group();
@@ -2088,16 +2375,16 @@ BEGIN
         BEGIN
             v_owner := kingres.internal_group_node(s.group_id);
             CONTINUE WHEN v_owner IS NULL;
-            IF s.phase OPERATOR(pg_catalog.=) 'switching'
-               AND kingres.internal_exec_scalar(v_owner, pg_catalog.format('SELECT kingres.internal_split_state(%s, %s, %s)', s.colocation_id, s.bucket, s.modulus OPERATOR(pg_catalog.*) s.parts)) OPERATOR(pg_catalog.=) 'switched' THEN
+            v_res := kingres.internal_exec_scalar(v_owner, pg_catalog.format('SELECT kingres.internal_split_undo(%s, %s, %s, %s, %s)', s.split_id, s.colocation_id, s.bucket, s.modulus, s.parts),
+                                                  v_sw_ms OPERATOR(pg_catalog.+) v_node_ms * 6);
+            IF v_res OPERATOR(pg_catalog.=) 'switched' THEN
                 PERFORM kingres.internal_split_finish(s.split_id);
             ELSE
-                PERFORM kingres.internal_exec_scalar(v_owner, pg_catalog.format('SELECT kingres.internal_split_undo(%s, %s, %s, %s, %s)', s.split_id, s.colocation_id, s.bucket, s.modulus, s.parts), v_node_ms OPERATOR(pg_catalog.*) 6);
                 PERFORM kingres.internal_split_fail(s.split_id, 'the session of the split ended before it switched', false);
             END IF;
             n := n OPERATOR(pg_catalog.+) 1;
         EXCEPTION WHEN OTHERS THEN
-            NULL;       -- a node that does not answer: the next pass tries again
+            NULL;       -- a node that does not answer, a lock that is not got: the next pass tries again
         END;
     END LOOP;
     RETURN n;
@@ -2190,7 +2477,7 @@ BEGIN
 END;
 $$;
 REVOKE ALL ON FUNCTION kingres.internal_split_inspect(int, int), kingres.internal_split_prepare(bigint, int, int, int, jsonb, int),
-    kingres.internal_split_batch(bigint, int, int, int, jsonb, jsonb, int), kingres.internal_split_switch(bigint, int, int, int, jsonb, int, text),
+    kingres.internal_split_batch(bigint, int, int, int, jsonb, jsonb, int), kingres.internal_split_switch(bigint, int, int, int, int, jsonb, text), kingres.internal_split_switch_lock(bigint, int, int, int, int, jsonb, int),
     kingres.internal_split_undo(bigint, int, int, int, int), kingres.internal_split_state(int, int, int), kingres.internal_split_drop_orphans(bigint),
     kingres.internal_split_begin(int, int, int, text, bigint), kingres.internal_split_set(bigint, text, text, bigint), kingres.internal_split_finish(bigint),
     kingres.internal_split_fail(bigint, text, bool), kingres.internal_split_lock(bigint), kingres.internal_split_alive(bigint), kingres.internal_split_allowed(int),

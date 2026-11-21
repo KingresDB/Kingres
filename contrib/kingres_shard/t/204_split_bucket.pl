@@ -284,6 +284,9 @@ sub do_writes
 	{
 		run_sql($nodes[$g], "DELETE FROM public.s1_s${sid}_$r WHERE id = $miss");
 		run_sql($nodes[$g], "INSERT INTO public.s1_s${sid}_$r VALUES ($stray, 'stray', 0)");
+		# a row that exists in the child with other values (P10R-14): 'full' makes the children equal in content
+		my $other = q1($nodes[$g], "SELECT id FROM public.s1_s${sid}_$r WHERE id <> $miss ORDER BY id LIMIT 1");
+		run_sql($nodes[$g], "UPDATE public.s1_s${sid}_$r SET v = 'wrong value' WHERE id = $other");
 	}
 	release($pid, $file);
 	like(out('c2'), qr/\n\s+\d+\n\(1 row\)/, 'C: the split completes') or diag(out('c2'));
