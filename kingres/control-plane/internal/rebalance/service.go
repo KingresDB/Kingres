@@ -567,8 +567,13 @@ func (s *Service) Status(ctx context.Context) (api.RebalanceStatus, error) {
 		}
 		pr := progressOf(run, moves)
 		st.Progress = &pr
+		if st.State == "stopped" {
+			// A stopped run has no move in flight: a move that the loss of its source left unfinished (a failover of the source)
+			// is settled by the extension when the rebalance is started again (resume_bucket_moves), not by this run.
+			pr.MovesInFlight = 0
+		}
 		for _, m := range moves {
-			if m.State != MoveRunning {
+			if m.State != MoveRunning || st.State == "stopped" {
 				continue
 			}
 			ph := m.Phase

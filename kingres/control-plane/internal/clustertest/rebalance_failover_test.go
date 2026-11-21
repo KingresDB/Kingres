@@ -72,7 +72,7 @@ func mvGateAt(t *testing.T, c *clustertest.Cluster, point string) (reached func(
 
 // mvCluster forms the cluster of foCluster, finds the victim group and drains the server old of its buckets (shouldHaveShards
 // false), so that a rebalance moves the buckets of group g away. The writers run through the servers in writeVia.
-func mvCluster(t *testing.T, lease ...string) (mvEnv, func(...*clustertest.Node)) {
+func mvCluster(t *testing.T, lease ...string) (*mvEnv, func(...*clustertest.Node)) {
 	t.Helper()
 	var c *clustertest.Cluster
 	var port int
@@ -85,7 +85,7 @@ func mvCluster(t *testing.T, lease ...string) (mvEnv, func(...*clustertest.Node)
 	leader := c.Leader()
 	g, old, nw := foVictim(t, c)
 	waitFacts(t, leader, g)
-	e := mvEnv{c: c, port: port, pool: pool, leader: leader, g: g, old: old, nw: nw}
+	e := &mvEnv{c: c, port: port, pool: pool, leader: leader, g: g, old: old, nw: nw}
 	leader.Expect(200, "PATCH", "/servers/"+old.Host, map[string]any{"shouldHaveShards": false})
 	start := func(via ...*clustertest.Node) {
 		e.w = startFoWriters(via, port, pool)
@@ -357,7 +357,7 @@ func TestFailoverDuringBucketMove(t *testing.T) {
 			if _, ok := mvFinishRun(t, leader, 10*time.Minute); !ok {
 				t.Errorf("the rebalance could not be started again after the failover")
 			}
-			mvEnd(t, e, mvDial(leader), survivors...)
+			mvEnd(t, *e, mvDial(leader), survivors...)
 		})
 	}
 }
@@ -428,7 +428,7 @@ func TestSwitchoverDuringBucketMove(t *testing.T) {
 	if _, ok := mvFinishRun(t, leader, 5*time.Minute); !ok {
 		t.Errorf("the rebalance could not be started again after the switchover")
 	}
-	mvEnd(t, e, mvDial(leader), mvWithout(e.c.Nodes, old)...)
+	mvEnd(t, *e, mvDial(leader), mvWithout(e.c.Nodes, old)...)
 }
 
 // T9, the map group. The leader's server (the primary of the map group, which also runs the rebalance and the extension session
