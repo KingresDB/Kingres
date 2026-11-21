@@ -232,6 +232,9 @@ func connectProblem(err error) error {
 // only the SQLSTATE and PostgreSQL's own message for errors the caller can act
 // on (which never contain passwords or verifiers).
 func PGProblem(err error) error {
+	if err == nil {
+		return nil // "return x, PGProblem(rows.Err())" must not turn a success into "the instance is not available"
+	}
 	var p *problem.Problem
 	if errors.As(err, &p) {
 		return p
