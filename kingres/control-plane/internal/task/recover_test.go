@@ -146,3 +146,38 @@ func TestEnvItemsAndCancelRequest(t *testing.T) {
 		t.Errorf("task = %s %+v", got.State, got.Error)
 	}
 }
+
+// The tasks of the schemas and a failover exclude each other in the memory store as the trigger of migration 0050 does in the
+// system database.
+func TestSchemaTasksAndAFailoverExcludeEachOther(t *testing.T) {
+	ctx := context.Background()
+	mk := func(kinds ...string) (*task.Engine, *task.MemStore) {
+		mem := task.NewMemStore()
+		var defs []task.Definition
+		for _, k := range kinds {
+			defs = append(defs, task.Definition{Kind: k, Steps: []task.Step{{Name: "x", Run: func(context.Context, *task.Env) error { return nil }}}})
+		}
+		e, err := task.NewEngine(mem, defs, task.Options{Holder: "A", Lease: time.Minute})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return e, mem
+	}
+	for _, k := range []string{"schema.distribute", "schema.move", "schema.undistribute"} {
+		e, _ := mk(k, "server.failover")
+		if _, err := e.Submit(ctx, "server.failover", task.Subject{Type: "server", ID: "a"}, nil, "u"); err != nil {
+			t.Fatal(err)
+		}
+		var x *task.ExcludedError
+		if _, err := e.Submit(ctx, k, task.Subject{Type: "schema", ID: "db/s"}, nil, "u"); !errors.As(err, &x) {
+			t.Errorf("%s while a failover is unfinished: %v, want an ExcludedError", k, err)
+		}
+		e2, _ := mk(k, "server.failover")
+		if _, err := e2.Submit(ctx, k, task.Subject{Type: "schema", ID: "db/s"}, nil, "u"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e2.Submit(ctx, "server.failover", task.Subject{Type: "server", ID: "a"}, nil, "u"); !errors.As(err, &x) {
+			t.Errorf("a failover while %s is unfinished: %v, want an ExcludedError", k, err)
+		}
+	}
+}
