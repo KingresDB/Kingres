@@ -612,7 +612,9 @@ peak resident size of the backend is the same to the megabyte).
 The call reads the rows after the lock that stops the writers is granted, with a snapshot taken then: what a transaction
 committed while the call waited for the lock (an update, a delete, an insert) is in the new table. For that the call
 runs only in a `READ COMMITTED` transaction and is refused in `REPEATABLE READ` and `SERIALIZABLE`, whose snapshot is older
-than the lock. A statement that was started before the call and waits for the table (`ALTER TABLE`, `RENAME`, `CREATE INDEX`,
+than the lock. The same rule holds for every blocking call of 9.4 and 9.5: `undistribute_table`, `alter_distributed_table` and the four partition
+functions refuse the other levels with SQLSTATE `25001` (`active_sql_transaction`, as the create call does) before they take a lock (a role with `default_transaction_isolation = 'repeatable read'` gets the
+refusal for a single statement, with the hint to run the call in `READ COMMITTED`), and the copy itself refuses a transaction snapshot as the last line (review P9C-01). A statement that was started before the call and waits for the table (`ALTER TABLE`, `RENAME`, `CREATE INDEX`,
 `TRUNCATE`, `GRANT`, `COPY ... FROM`, `DROP TABLE` and the others the hook looks at) first waits for the lock and decides
 afterwards, so it finds the table as the call left it and goes to every node. The statement takes a `ROW EXCLUSIVE` lock
 on the table for this, which every writer holds anyway. Only a role that has the right the statement needs takes it (the owner; `INSERT` for
@@ -661,13 +663,14 @@ blocker). Severity `blocker`: the call is refused. `warning`: carried differentl
 | `temporary_or_unlogged`, `inheritance`, `row_level_security`, `exclusion_constraint`, `trigger`, `rule`, `invalid_index`, `check_not_valid` | distribute, distribute_reference | the table has what stays refused (one row per constraint and per trigger) |
 | `tablespace` | distribute, distribute_reference | the table or one of its indexes is not in the default tablespace |
 | `ledger_table` | distribute, distribute_reference | a `kingres_ledger` table or the history table of one |
-| `dependent_object` | distribute, distribute_reference | a view, materialized view, publication or function that uses the table, or a column of another table with its row type |
+| `dependent_object` | distribute, distribute_reference | a view, materialized view, publication or function that uses the table, or a column of another table with its row type; for a partitioned table also a view on one of its partitions (the partitions are replaced too) |
 | `default_sequence_not_owned`, `function_owner_not_superuser` | distribute, distribute_reference | a default calls `nextval()` of a sequence that no column of the table owns; code of a role who is not a superuser is reached by the copy through a constraint, default, index, domain, operator, operator class, cast, range or composite type (the report says through what) |
 | `enum_distribution_column`, `collation_missing`, `schema_privilege` | distribute | the hash of the column is not the same on every node; another node lacks a collation of a column or `CREATE` on the schema for the owner |
 | `foreign_key_plain_table`, `foreign_key_other_group`, `foreign_key_not_distribution_column`, `referenced_by_plain_table`, `referenced_by_distributed_table` | distribute, distribute_reference | the foreign keys that stay refused |
 | `column_missing`, `no_hash_support`, `unique_without_distribution_column`, `name_too_long`, `name_in_use` | distribute | the distribution column is not usable, a unique key lacks it, the name leaves no room for `_bNNNN`, or a relation of a bucket partition's name or of the shadow's name exists, on this node or on another |
 | `no_key_for_online` | distribute with `mode = 'online'` | a primary key or a unique index over `NOT NULL` columns is needed (for increment 9.3) |
-| `group_busy` | distribute, undistribute, alter | the colocation group has an unfinished move or a table operation |
+| `group_busy` | distribute, undistribute, alter | the colocation group has an unfinished move or a table operation, or a bucket that is not active (the state of a bucket in `bucket_map` is `active` or `moving`; `orphan` is allowed by the CHECK of the column but nothing sets it, and the orphan table that a finished move leaves until its cleanup is not a state of a bucket, so such a group is free and `colocate_with => 'default'` joins it instead of making another); for `alter` also the group of `colocate_with` (the groups that `colocate_with => 'default'` would pick are those that are free) |
+| `deferrable_unique` | distribute, undistribute, alter with `mode = 'online'` | a unique or primary key constraint is `DEFERRABLE`: the online copy and replay write with `ON CONFLICT`, which PostgreSQL does not accept for it; use the blocking variant |
 | `role_missing`, `default_function_missing`, `node_unreachable` | distribute, distribute_reference | another node lacks a role of the table's owner or privileges, or a function of a column default; or it cannot be asked |
 | `not_carried` (warning), `rows` (note) | distribute, distribute_reference | what is not carried; the estimate of the rows that writers wait for |
 | `not_distributed`, `foreign_key_linked`, `target_group_invalid`, `group_busy`, `dependent_object` | undistribute | the table is not distributed or a reference table; a foreign key links it to another table of the catalog (undistribute them together with `cascade_via_foreign_keys`, or drop the key; a key from a distributed table to a reference table is kept); the target group has no active primary; a move or an operation uses the group; a view (or another object) uses a table that the call drops |
@@ -708,6 +711,17 @@ and sent to their new buckets; the old tables are dropped and the new ones take 
 new bucket count is a multiple of the old one, new bucket `b` is placed on the group of old bucket `b mod old count`. Without
 `cascade_to_colocated` only the table changes and it leaves its group (refused with `foreign_key_colocation` when a key depends on the
 colocation); with it every table of the group changes together (the distribution column must exist, with the same type, in every one).
+
+**The code of other roles.** The rule of `function_owner_not_superuser` is applied to every table that the call takes with it: the tables of the
+component of `undistribute_table(..., cascade_via_foreign_keys => true)` and the tables of the group of `alter_distributed_table(...,
+cascade_to_colocated => true)`; the detail of the blocker names the table (P9C-04). `t/197_review_p9c_blocking`.
+
+**Waiting.** A blocking call waits for its locks for as long as the writers hold them (it takes `EXCLUSIVE` on a node and then on the next, in node
+order). A writer that has locks on the next node and waits for the lock that the call holds on this one forms a distributed deadlock that
+PostgreSQL cannot see; `kingres.detect_distributed_deadlocks()` (and the pass of the recovery worker) cancels one of the two. Under writers that
+never pause between transactions that touch several nodes a blocking call can wait for minutes, and an online variant can fail to take its switch
+locks within `rebuild_switch_timeout` (it is undone, nothing is lost); give the call a quiet moment, or use the online variant, which waits for each node
+for a bounded time only (review P9C-13: with six such writers both online alters gave up after about a minute and the blocking alter waited until the deadlock detector was called by hand; with 30 ms between the transactions all five calls finished).
 
 **Limits of this increment.** All rows of a rebuild pass through the session of the map group primary (a distributed scan there, the batch
 sender to the destinations): the cost is the size of the table, not what it moves between nodes. Writers wait for the whole copy; the online
@@ -754,7 +768,7 @@ cancel, float keys written with `extra_float_digits = 0`).
 ### User-partitioned tables (increment 9.5)
 
 `create_distributed_table` takes a table that the user partitioned by RANGE or LIST (one level; ordinary partitions with nothing of their own: no
-index, constraint, default or storage parameter that the table lacks; at most `kingres_shard.max_partition_leaves` leaves, the bucket count times the
+index, constraint, default or storage parameter that the table lacks (the parameters of its TOAST table count, P9F-03: the report refuses it with `partition_local_object`); at most `kingres_shard.max_partition_leaves` leaves, the bucket count times the
 number of partitions; the blocking variant only, the online variants refuse it with `not_available_yet`). The layout is hash on top and the user's
 partitioning below: every node has the parent; a bucket partition `<table>_bNNNN` exists on the group that owns it and is itself
 `PARTITION BY <method> (<key>)`; inside it a leaf `<partition>_bNNNN` per user partition, with the bound of the partition (`DEFAULT` too). A user
@@ -770,14 +784,14 @@ node under the catalog lock; refused with `object_in_use` while a move or a tabl
 
 | Function | What happens |
 |---|---|
-| `kingres.create_partition(parent regclass, partition_name text, bound text, if_not_exists bool default false)` | One leaf `<partition_name>_bNNNN` per bucket, made like the bucket partition (`LIKE ... INCLUDING ALL`, same owner) and attached with the bound, which is the text that follows `FOR VALUES` (`FROM (...) TO (...)`, `IN (...)`) or `DEFAULT`; a bound with `;`, `--` or `/*` is refused. `ATTACH` locks each bucket partition `SHARE UPDATE EXCLUSIVE`: readers and writers go on; a default partition is scanned and locked `ACCESS EXCLUSIVE` until the commit, so writers of its rows wait. |
+| `kingres.create_partition(parent regclass, partition_name text, bound text, if_not_exists bool default false)` | One leaf `<partition_name>_bNNNN` per bucket, made like the bucket partition (`LIKE ... INCLUDING ALL`, same owner) and attached with the bound, which is the text that follows `FOR VALUES` (`FROM (...) TO (...)`, `IN (...)`) or `DEFAULT`; a bound with `;`, `--` or `/*` is refused; the words `FROM`, `IN`, `WITH` and `DEFAULT` are accepted in any case (the catalog keeps the text as given). `ATTACH` locks each bucket partition `SHARE UPDATE EXCLUSIVE`: readers and writers go on; a default partition is scanned and locked `ACCESS EXCLUSIVE` until the commit, so writers of its rows wait. |
 | `kingres.drop_partition(parent regclass, partition_name text, missing_ok bool default false)` | The leaves go on every node, and the row. |
-| `kingres.detach_partition(parent regclass, partition_name text)` | The partition becomes a distributed table of the same group and distribution column (a hash parent `<partition_name>` made like the table, the leaves moved under it); no row moves. Refused when the table has foreign keys. |
-| `kingres.attach_partition(parent regclass, partition regclass, bound text)` | A distributed table of the same group, on the same distribution column, in the schema of the table, without keys, becomes a partition: its bucket partitions become leaves; no row moves. An ordinary table is not attached by this function: create the partition and insert its rows. |
+| `kingres.detach_partition(parent regclass, partition_name text)` | The partition becomes a distributed table of the same group and distribution column (a hash parent `<partition_name>` made like the table, with its owner, its table privileges (with the grant option) and its comment, the leaves moved under it); no row moves. The privileges of columns are not carried. Refused when the table has foreign keys. |
+| `kingres.attach_partition(parent regclass, partition regclass, bound text)` | A distributed table of the same group, on the same distribution column, in the schema of the table, without keys, becomes a partition: its bucket partitions become leaves; no row moves. An ordinary table is not attached by this function: create the partition and insert its rows. The table must be like the partitioned table: a bucket move makes the leaves again from the definition of the partitioned table, so a check constraint, an index (compared by definition), a default, a storage parameter, an owner other than the table's, or privileges that differ from those of the partitioned table would be lost at the first move; the attach is refused naming each of them, and a table with the same privileges as the partitioned table is accepted (P9C-03, P9F-02). |
 
 The statements are mapped by the ProcessUtility hook (on the map group primary, routing on): `CREATE TABLE s PARTITION OF p FOR VALUES ...` calls
 `create_partition` (constants, casts of constants, `MINVALUE`, `MAXVALUE` and `DEFAULT` are written back; any other expression is refused with the hint
-to call the function; sub-partitioning, storage parameters, a tablespace, an access method and columns are refused), `ALTER TABLE p ATTACH PARTITION t`
+to call the function; a cast is written with its type modifier, so `5.7::numeric(3,0)` is the 6 that PostgreSQL makes of it; a partition in another schema than the table, an `UNLOGGED` or `TEMPORARY` partition are refused, and `IF NOT EXISTS` of a name that exists is a notice, as in PostgreSQL (P9C-09); sub-partitioning, storage parameters, a tablespace, an access method and columns are refused), `ALTER TABLE p ATTACH PARTITION t`
 calls `attach_partition` (an ordinary table is refused), `ALTER TABLE p DETACH PARTITION s` calls `detach_partition` (`CONCURRENTLY` is refused) and
 `DROP TABLE s` of a name that is a partition calls `drop_partition` (a drop of several names, with `CASCADE`, is left to PostgreSQL, which refuses
 it because the name is no table). `ALTER TABLE s`, `CREATE INDEX ON s` and `TRUNCATE s` of a partition name fail with PostgreSQL's "does not exist":
@@ -799,6 +813,8 @@ partition that is created while a move runs is refused by the guard of the group
 (`orphan_table`); the cleanup drops it. `t/193_partitioned_move` (the move, the tree and its bounds, the orphan with its leaves, the move back at once, a
 writer on another node during the move, an error at three points, the publication through the root).
 
+`dist_partition.bound` is the text of the bound as the user wrote it; for a `timestamptz` key it depends on the `TimeZone` of the session that wrote it, and it is informational: the leaves themselves are made with the bound that PostgreSQL computed and are the same on every node. A partition name may contain quotes and dots (`check_cluster()` reads the name of a leaf with `parse_ident`).
+
 **Queries.** The planner prunes both levels (the bucket partition by the key, the leaf by the interval); the pushdown, the fragment scan and the
 distributed scan take a user-partitioned table as they take a plain one, and the answers are those of the same table on one node, from every node and
 after every kind of change (`t/194_partitioned_queries`). No change of the planner or of the pushdown was needed.
@@ -816,12 +832,12 @@ Refused, before anything is made (the report says so with `dependent_object`, an
 trigger, with a rule of its own, with privileges on a column, one that a function uses the row type of, or that a publication publishes; and, for an
 undistribute, a view on a node other than the one that keeps the table (the table will not be there). The default `refuse` is unchanged. A view over a
 distributed table that is owned by another role than the session role is refused by the rule of the scan unless it is `security_invoker`; the recreated view has
-the owner and options it had. `t/195_dependent_views` (the default, every operation, views on views, a view on another node, privileges, owner, options, comments,
+the owner and options it had. The ACL of a recreated view is the one of the old view and nothing else (P9C-05): the default privileges of the schema (`ALTER DEFAULT PRIVILEGES`) gave the new view grants that the old one never had, so they are taken back, and the entries of the old ACL, the owner's own among them, follow. Not carried: the grantor of a grant that another role made with the grant option (every grant is made by the owner). `t/195_dependent_views` (the default, every operation, views on views, a view on another node, privileges, owner, options, comments,
 the refusals, an error at four points of the switch, a reader on another node that waits for the switch).
 
 ### Storage parameters (increment 9.9)
 
-A table with storage parameters (`fillfactor`, `autovacuum_*`, `toast.*`, ...) is distributed, made a reference table, rebuilt and moved with them (they
+A table with storage parameters (`fillfactor`, `autovacuum_*`, `toast.*`, ...; the parameters of the TOAST table are kept in the TOAST table's `reloptions`, so they are read from there and recorded as `toast.<name>`, P9C-08) is distributed, made a reference table, rebuilt and moved with them (they
 were refused before; the report now says `note: storage_parameters`). PostgreSQL does not allow them on a partitioned table, so a distributed table has them
 on its bucket partitions, and `kingres.dist_table.reloptions` (synchronized to every node) records them: the bucket partitions of the table that
 `create_distributed_table` (blocking and online) makes, of the table that `alter_distributed_table` (blocking and online) makes, and the ordinary table of
