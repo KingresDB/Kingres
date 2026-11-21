@@ -1812,6 +1812,8 @@ DECLARE
     v_pkm    pg_catalog.text;
     v_pkl    pg_catalog.text;
     v_set    pg_catalog.text;
+    v_dl     pg_catalog.text;
+    v_dr     pg_catalog.text;
     v_cols   pg_catalog.text;
     v_old    pg_catalog.int8;
     v_kids   pg_catalog.int8;
@@ -1836,6 +1838,10 @@ BEGIN
             SELECT pg_catalog.string_agg(pg_catalog.format('%I = EXCLUDED.%I', k, k), ', ') INTO v_set
               FROM pg_catalog.jsonb_array_elements_text(el OPERATOR(pg_catalog.->) 'cols') k
              WHERE NOT (k OPERATOR(pg_catalog.=) ANY (ARRAY(SELECT pg_catalog.jsonb_array_elements_text(el OPERATOR(pg_catalog.->) 'pk'))));
+            -- ... and only a row whose values differ is written (an equal row is left alone: no dead tuple, no work under the writers' lock, P10F-02)
+            SELECT pg_catalog.string_agg(pg_catalog.format('c.%I', k), ', '), pg_catalog.string_agg(pg_catalog.format('EXCLUDED.%I', k), ', ') INTO v_dl, v_dr
+              FROM pg_catalog.jsonb_array_elements_text(el OPERATOR(pg_catalog.->) 'cols') k
+             WHERE NOT (k OPERATOR(pg_catalog.=) ANY (ARRAY(SELECT pg_catalog.jsonb_array_elements_text(el OPERATOR(pg_catalog.->) 'pk'))));
             FOR v_n IN 1 .. 2 LOOP
                 EXECUTE pg_catalog.format('SELECT pg_catalog.count(*) FROM %s', v_part) INTO v_old;
                 v_kids := 0;
@@ -1855,9 +1861,10 @@ BEGIN
                     r := p_bucket OPERATOR(pg_catalog.+) (j OPERATOR(pg_catalog.*) p_modulus);
                     v_child := pg_catalog.format('%I.%I', el OPERATOR(pg_catalog.->>) 'schema', pg_catalog.format('%s_s%s_%s', el OPERATOR(pg_catalog.->>) 'table', p_split, r));
                     EXECUTE pg_catalog.format('DELETE FROM %s c WHERE NOT EXISTS (SELECT 1 FROM %s p WHERE %s)', v_child, v_part, v_pkm);
-                    EXECUTE pg_catalog.format('INSERT INTO %s (%s) SELECT %s FROM %s p WHERE pg_catalog.satisfies_hash_partition(%L::pg_catalog.regclass::pg_catalog.oid, %s, %s, p.%s) ON CONFLICT (%s) %s',
+                    EXECUTE pg_catalog.format('INSERT INTO %s AS c (%s) SELECT %s FROM %s p WHERE pg_catalog.satisfies_hash_partition(%L::pg_catalog.regclass::pg_catalog.oid, %s, %s, p.%s) ON CONFLICT (%s) %s',
                                               v_child, v_cols, v_cols, v_part, v_parent, v_new, r, v_dist, v_pkl,
-                                              CASE WHEN v_set IS NULL OR p_verify OPERATOR(pg_catalog.<>) 'full' THEN 'DO NOTHING' ELSE 'DO UPDATE SET ' OPERATOR(pg_catalog.||) v_set END);
+                                              CASE WHEN v_set IS NULL OR p_verify OPERATOR(pg_catalog.<>) 'full' THEN 'DO NOTHING'
+                                                   ELSE 'DO UPDATE SET ' OPERATOR(pg_catalog.||) v_set OPERATOR(pg_catalog.||) pg_catalog.format(' WHERE (%s) IS DISTINCT FROM (%s)', v_dl, v_dr) END);
                 END LOOP;
             END LOOP;
             v_rows := v_rows OPERATOR(pg_catalog.+) v_old;

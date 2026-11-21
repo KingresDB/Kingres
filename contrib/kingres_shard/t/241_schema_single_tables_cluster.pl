@@ -20,7 +20,7 @@ use lib $FindBin::RealBin;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
-use KingresShardTest qw(make_cluster run_sql prepared_count);
+use KingresShardTest qw(make_cluster run_sql prepared_count start_psql finish_psql);
 
 my @nodes = make_cluster('st', 3);
 my ($n1, $n2, $n3) = @nodes;
@@ -141,6 +141,18 @@ q1($n1, q{CREATE TABLE sg2.p (id int PRIMARY KEY); CREATE TABLE sg2.q (id int PR
 fails($n1, q{ALTER TABLE sg2.q SET SCHEMA public}, qr/the foreign key "q_p_fkey" would cross the border/, 'out with a foreign key to a table that stays');
 fails($n1, q{ALTER TABLE sg2.p SET SCHEMA public}, qr/the foreign key "q_p_fkey" would cross the border/, '... and with one from a table that stays');
 fails($n1, q{ALTER VIEW si1.nosuch SET SCHEMA public}, qr/does not exist/, 'a missing object is the error of PostgreSQL') if 0;
+
+# SET SCHEMA locks the table before it asks for rows (P11S-08): a row that a writer has not committed yet is seen after the writer commits
+q1($n1, q{CREATE TABLE public.rw (id int PRIMARY KEY)});
+{
+	my $writer = start_psql($n1, q{BEGIN; INSERT INTO public.rw VALUES (1); SELECT pg_sleep(3); COMMIT});
+	select(undef, undef, undef, 0.8);
+	my ($rc, $out, $err) = run_sql($n1, q{ALTER TABLE public.rw SET SCHEMA si1});
+	finish_psql($writer);
+	isnt($rc, 0, 'SET SCHEMA waits for a writer of the table and then sees its row');
+	like($err, qr/the table holds rows on shard group 0 and the schema is held by group 1/, '... so it is refused') or diag($err);
+	same_everywhere(q{SELECT to_regclass('si1.rw') IS NULL}, 't', '... and no shell was made');
+}
 
 # ---------------------------------------------------------------------------
 # E. the same everywhere

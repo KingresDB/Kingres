@@ -292,6 +292,7 @@ sub do_writes
 	like(out('c2'), qr/\n\s+\d+\n\(1 row\)/, 'C: the split completes') or diag(out('c2'));
 	q1($n1, q{SELECT kingres.cleanup_bucket_splits(true)});
 	model_check('C2');
+is(q1($nodes[$g], q{SELECT coalesce(sum(n_tup_upd), 0) FROM (SELECT pg_stat_force_next_flush()) f, pg_stat_all_tables WHERE relname IN ('s1_b0003', 's1_b0011')}), 2 * 2, "C2: verify 'full' wrote only the rows whose values differed (the two wrong values, one per child; the equal rows were not rewritten, P10F-02)");
 	is(clean(), '', 'C2: check_cluster() finds nothing');
 }
 

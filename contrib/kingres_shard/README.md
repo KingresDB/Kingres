@@ -205,10 +205,10 @@ the next increments and are not in this version.
   database, so every node needs a role of that name, and `pg_hba.conf` (and the
   password file, if used) must let the nodes in. Credentials are never stored
   in the catalog. SSL options are set with `kingres_shard.node_conninfo`.
-- `CREATE EXTENSION kingres_shard` installs version 0.7 (the `default_version` of the control file);
-  `ALTER EXTENSION kingres_shard UPDATE` upgrades a 0.1, 0.2, 0.3, 0.4, 0.5 or 0.6 installation
-  (the chain is 0.1 -> 0.2 -> 0.3 -> 0.4 -> 0.5 -> 0.6 -> 0.7, and the catalog is identical to a
-  fresh 0.7 one; the `upgrade` regression test compares the two). Transactions that 0.4
+- `CREATE EXTENSION kingres_shard` installs version 0.8 (the `default_version` of the control file);
+  `ALTER EXTENSION kingres_shard UPDATE` upgrades a 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 or 0.7 installation
+  (the chain is 0.1 -> 0.2 -> 0.3 -> 0.4 -> 0.5 -> 0.6 -> 0.7 -> 0.8, and the catalog is identical to a
+  fresh 0.8 one; the `upgrade` regression test compares the two). Transactions that 0.4
   prepared and that are pending at the upgrade are resolved in the old identifier format
   (see "Prepared transactions across a failover").
 - **Version 0.6 adds no table, view, function or column.** `kingres_shard--0.5--0.6.sql` holds
@@ -2025,6 +2025,15 @@ with the path of the session; the state of a sequence (`is_called`) is carried b
 phase of a switch can hand out a number the new owner hands out again (use the sequence as a column default); `nextval(<expression>)` on a sequence of a distributed schema runs on the node that executes it
 (use a constant regclass or the default); `ALTER TABLE ALL IN TABLESPACE` is node-local; default privileges that are not for one schema are not carried.
 
+**The fixes for the second review.**  A table of a schema that is being moved cannot get a ledger (`ledger_enable` refuses), the switch of a move looks at the pin again under its lock, and
+`distribute_schema` keeps a schema that holds a ledger table, empty or not, with the ledger's group.  A statement that is run whole on the owner for code it does not show (a function with
+`ship_functions`, a trigger, a default) runs with `kingres_shard.shipped_scope` on: the owner refuses (`KS001`) any table that code reads that is not a table of a distributed schema, a reference
+table, a hash-distributed table or a catalog, so a function cannot silently read the owner's own copy of a plain local table; the same holds for the batches of the row router.  `UNION ALL` with an
+expression column works through the distributed scan.  `CREATE TABLE IF NOT EXISTS ... AS` gives the notice, `CREATE TABLE AS EXECUTE` is refused.  A user trigger named `kingres_ledger_*` is an ordinary
+trigger (the ledger's own are known by their functions).  `ALTER TABLE ... SET SCHEMA` locks the table before it looks for rows.  The verification of a bucket split must fit in `move_switch_timeout`
+(see "Sizing of the verification"), and `verify 'full'` writes only the rows that differ.  Measured with `t/245_schema_scale_cluster.pl` (the numbers are in the design notes): the cost of a DDL statement
+grows with the number of distributed schemas (23 ms at 200 schemas, 174 ms on average at 2000) and `add_node` of a cluster with 2000 schemas fails for lack of locks; both are for step 12.
+
 
 ## Limitations in phase 2a
 
@@ -2623,9 +2632,11 @@ map's state is `splitting`, and `kingres.bucket_split` is readable by superusers
 unfinished split with the bucket map: between the owner's switch and the catalog change (normally milliseconds, longer when a node is down) the bounds differ and that is no damage
 (P10R-12); a split that stopped is `split_stalled`. `move_bucket()` refuses a bucket whose partitions on the source do not have the bounds of the bucket map, and says what differs.
 
+**Sizing of the verification (P10F-02).** The verification runs inside the bound of the switch, so the count of the rows of a bucket (and, for `'full'`, the comparison of its rows) must fit in `kingres_shard.move_switch_timeout` (default 10 s): a bucket that takes longer to count makes every attempt fail with "did not finish in N attempts", and the split is undone after the whole copy.  For a big bucket raise `move_switch_timeout` (it is a `USERSET` setting; the writers wait for that time at most), use `verify 'none'` and trust the triggers, or split a group while its buckets are small.  `'full'` writes only the rows whose values differ from the partition's (`IS DISTINCT FROM`), so a bucket whose children are right costs a read and no dead tuples.
+
 **Limits.** Bucket numbers are limited to 9999 (P10R-05): the partition of bucket 12288 is `<table>_b12288` for the code of the extension and was `<table>_b1228` for the SQL functions
 (`lpad` cuts), so a split whose new buckets would be numbered 10000 or more is refused with a message before anything is recorded. A group starts with at most 4096 buckets, so a
-group of 8 buckets can be split about three times in 16 parts. The greatest modulus of a group, 65536, is checked by `split_bucket()` and is not a setting.
+group of 8 buckets can be split about three times in 16 parts.  A group of 4096 buckets (the largest start) can be split once in 2 (its new remainders go up to 8191; the buckets of that result have the modulus 8192, and a second split of one of them would need remainders up to 16383, which the limit refuses), and a split in 4 or more is refused for most of its buckets (P10F-03): the limit comes from the naming of the partitions and a single naming function that prints longer numbers in full would lift it. The greatest modulus of a group, 65536, is checked by `split_bucket()` and is not a setting.
 
 Not done: a split of a user-partitioned table or of a columnar table (refused), a split by `parts` other than 2, 4, 8 or 16, the merge of buckets, and the split of several buckets of a group at once (one split per
 colocation group at a time).
