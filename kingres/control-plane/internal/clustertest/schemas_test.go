@@ -100,10 +100,9 @@ func TestDistributedSchemasThroughTheAPI(t *testing.T) {
 		if err := c.Nodes[0].ServicePG("sc").QueryRow(context.Background(), `SELECT count(*) FROM tenant1.items`).Scan(&n); err != nil || n != 200 {
 			t.Errorf("rows after the move: %d %v", n, err)
 		}
-		body = l.Expect(202, "DELETE", "/databases/sc/schemas/tenant1/distribution", nil)
-		l.WaitTaskDone(clustertest.TaskID(body), 3*time.Minute)
-		if d = l.Expect(200, "GET", "/databases/sc/schemas/tenant1", nil); d["distribution"] != nil {
-			t.Errorf("after make local: %v", d)
+		// The old copy is emptied after move_cleanup_delay; until then the schema cannot become local, and the answer says why.
+		if st, p := l.Do("DELETE", "/databases/sc/schemas/tenant1/distribution", nil, nil); st != 409 || p["code"] != "schema_move_in_progress" {
+			t.Errorf("make local while the old copy is cleaned: %d %v", st, p)
 		}
 	})
 
@@ -121,6 +120,12 @@ func TestDistributedSchemasThroughTheAPI(t *testing.T) {
 		st, p := l.Do("POST", "/databases/sc/schemas/nokey/moves", map[string]any{"targetShardGroupId": to}, nil)
 		if st != 422 || len(anyList(p["errors"])) == 0 {
 			t.Errorf("move without a key: %d %v", st, p)
+		}
+		// a distributed schema that never moved becomes local at once
+		body = l.Expect(202, "DELETE", "/databases/sc/schemas/nokey/distribution", nil)
+		l.WaitTaskDone(clustertest.TaskID(body), 3*time.Minute)
+		if d = l.Expect(200, "GET", "/databases/sc/schemas/nokey", nil); d["distribution"] != nil {
+			t.Errorf("after make local: %v", d)
 		}
 	})
 

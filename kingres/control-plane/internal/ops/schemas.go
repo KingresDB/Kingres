@@ -348,6 +348,9 @@ func (o *Ops) PrepareMoveSchema(ctx context.Context, db, schema string, req api.
 		if s.Distribution.ShardGroupID == req.TargetShardGroupID {
 			return problem.New(problem.Unprocessable, "The schema is on that shard group already.")
 		}
+		if err := cleaningMove(ctx, c, s.Distribution.ColocationID, schema); err != nil {
+			return err
+		}
 		ok, err := o.groupReceives(ctx, c, req.TargetShardGroupID)
 		if err != nil {
 			return err
@@ -374,6 +377,20 @@ func (o *Ops) PrepareMoveSchema(ctx context.Context, db, schema string, req api.
 	return in, err
 }
 
+// cleaningMove refuses an operation on a schema whose last move has not finished its cleaning: the old copy is emptied after
+// kingres_shard.move_cleanup_delay (10 minutes by default), and until then the extension answers "is being moved" to a move or
+// to undistribute_schema. The refusal says so before a task exists.
+func cleaningMove(ctx context.Context, c *pgx.Conn, colocation int32, schema string) error {
+	var cleaning bool
+	if err := c.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM kingres.bucket_move WHERE colocation_id = $1 AND phase = 'cleaning')`, colocation).Scan(&cleaning); err != nil {
+		return nil // a catalog without the table (an older extension) has nothing to wait for
+	}
+	if cleaning {
+		return problem.New(problem.SchemaMoveInProgress, fmt.Sprintf("The old copy of schema %q is still being cleaned up after its last move (kingres_shard.move_cleanup_delay); try again when that is done.", schema))
+	}
+	return nil
+}
+
 func (o *Ops) refusePin(ctx context.Context, c *pgx.Conn, colocation int32) error {
 	var pin *string
 	if err := c.QueryRow(ctx, `SELECT kingres.internal_schema_pinned($1)`, colocation).Scan(&pin); err == nil && pin != nil {
@@ -395,6 +412,9 @@ func (o *Ops) PrepareUndistributeSchema(ctx context.Context, db, schema string, 
 			return problem.New(problem.SchemaMoveInProgress, fmt.Sprintf("Schema %q is being moved.", schema))
 		}
 		if err := o.refusePin(ctx, c, s.Distribution.ColocationID); err != nil {
+			return err
+		}
+		if err := cleaningMove(ctx, c, s.Distribution.ColocationID, schema); err != nil {
 			return err
 		}
 		if target != nil && *target != s.Distribution.ShardGroupID {
