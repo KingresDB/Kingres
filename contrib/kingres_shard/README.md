@@ -22,8 +22,7 @@ increments 9.1 and 9.2) starts the table lifecycle: `create_distributed_table` a
 privileges, comments, sequences and foreign keys; `kingres.table_change_report()` says what
 stands in the way of a change of a table before it is tried; and the catalog holds what the
 rest of the phase needs (see "The table lifecycle (version 0.7)"). Increment 9.4 adds the blocking
-`undistribute_table` and `alter_distributed_table`. The online variants of those two and user partitions are
-the next increments and are not in this version.
+`undistribute_table` and `alter_distributed_table`. The online variants of those two are the next increments and are not in this version.
 
 ## How it works in one page
 
@@ -675,7 +674,7 @@ blocker). Severity `blocker`: the call is refused. `warning`: carried differentl
 | `not_carried` (warning), `rows` (note) | distribute, distribute_reference | what is not carried; the estimate of the rows that writers wait for |
 | `not_distributed`, `foreign_key_linked`, `target_group_invalid`, `group_busy`, `dependent_object` | undistribute | the table is not distributed or a reference table; a foreign key links it to another table of the catalog (undistribute them together with `cascade_via_foreign_keys`, or drop the key; a key from a distributed table to a reference table is kept); the target group has no active primary; a move or an operation uses the group; a view (or another object) uses a table that the call drops |
 | `not_distributed`, `bucket_count_invalid`, `colocate_with_not_distributed`, `foreign_key_colocation`, `unique_without_distribution_column`, `column_missing`, `no_hash_support`, `group_busy` | alter | the table is not distributed; the bucket count is out of range; the table to colocate with is not distributed; a key depends on the colocation of two tables (pass `cascade_to_colocated`); a unique index lacks the new distribution column; the column does not exist or cannot be hashed; a move or an operation uses the group |
-| `not_distributed`, `name_too_long`, `not_available_yet` | create_partition, attach_partition, detach_partition, drop_partition | user partitions are not in this version |
+| `not_distributed`, `name_too_long` | create_partition, attach_partition, detach_partition, drop_partition | the table is not a user-partitioned distributed hash table (`not_distributed`); the partition name leaves no room for `_bNNNN`. (`not_available_yet` is reported for undistribute and alter of a user-partitioned table only.) |
 
 `options` is what the call would be given: `column`, `colocate_with` (a table name, schema-qualified unless it is in `pg_catalog`
 or `kingres`: the report runs with a fixed `search_path`), `bucket_count`, `mode` for a distribution;

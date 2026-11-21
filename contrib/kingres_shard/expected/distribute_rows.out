@@ -402,18 +402,17 @@ SELECT severity, code, object FROM kingres.table_change_report('alter', 'dist_pa
 (1 row)
 
 SELECT severity, code, object FROM kingres.table_change_report('create_partition', 'dist_parent', '{"partition":"p1"}');
- severity |       code        |       object       
-----------+-------------------+--------------------
- blocker  | not_available_yet | public.dist_parent
+ severity |      code       |       object       
+----------+-----------------+--------------------
+ blocker  | not_distributed | public.dist_parent
 (1 row)
 
 SELECT severity, code, object FROM kingres.table_change_report('drop_partition', 'plain_parent', '{"partition":"a_partition_name_that_is_much_too_long_to_get_six_more_characters_"}');
- severity |       code        |                               object                               
-----------+-------------------+--------------------------------------------------------------------
- blocker  | not_distributed   | public.plain_parent
- blocker  | name_too_long     | a_partition_name_that_is_much_too_long_to_get_six_more_characters_
- blocker  | not_available_yet | public.plain_parent
-(3 rows)
+ severity |      code       |                               object                               
+----------+-----------------+--------------------------------------------------------------------
+ blocker  | not_distributed | public.plain_parent
+ blocker  | name_too_long   | a_partition_name_that_is_much_too_long_to_get_six_more_characters_
+(2 rows)
 
 -- the report and the checks of the create functions agree -------------------------------
 SELECT kingres.create_distributed_table('trg_t', 'id');

@@ -269,6 +269,7 @@ tests += {
       't/196_storage_parameters.pl',
       't/197_review_p9c_blocking.pl',
       't/198_review_p9c_partitions.pl',
+      't/199_partition_report.pl',
       't/120_colocated_insert_select.pl',
       't/121_insel_roundtrip_security.pl',
       't/122_insel_faults_moves.pl',
