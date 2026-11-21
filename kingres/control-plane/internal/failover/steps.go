@@ -199,6 +199,9 @@ type stepCtx struct {
 	group int32
 	key   string
 	env   *task.Env
+	// newServer is the server of the pinned standby when a step knows it from its own state and cannot read it from the group row: after the clean stop of
+	// the map group the system database is the stopped instance (F5-01).
+	newServer string
 }
 
 func (s *stepCtx) detail(ctx context.Context, format string, a ...any) {

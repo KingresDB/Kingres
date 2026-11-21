@@ -161,12 +161,23 @@ func (r *Runner) rollbackSwitchover(ctx context.Context, taskID int64, in Input,
 
 // rollbackFailed rolls back and returns the failure of the step.
 func (sc *stepCtx) rollbackFailed(ctx context.Context, code string, retry bool, format string, a ...any) error {
-	gr, _ := sc.row(ctx)
+	// The group row is not readable after the clean stop of the map group (the system database is the stopped instance), so the server of the new primary comes
+	// from the step when it knows it (F5-01); a term that cannot be read is -1 on purpose: the calls of the rollback then do not judge by it.
+	newServer := sc.newServer
+	gr, gerr := sc.row(ctx)
+	if newServer == "" {
+		newServer = gr.NewServer
+	}
+	if gerr == nil && (gr.State == "promoted" || gr.State == "done") {
+		// A group that was promoted is never rolled back (F5-06); the step fails with its own error.
+		sc.r.log().Warn("failover: a rollback was asked for a group that was promoted; nothing was undone", "group", sc.group, "code", code)
+		return fail(code, retry, format, a...)
+	}
 	term := int64(-1)
 	if run, err := sc.runRow(ctx); err == nil {
 		term = run.ExpectedTerm
 	}
-	sc.r.rollbackSwitchover(ctx, sc.env.Task.ID, sc.in, sc.group, gr.NewServer, term)
+	sc.r.rollbackSwitchover(ctx, sc.env.Task.ID, sc.in, sc.group, newServer, term)
 	sc.event(ctx, "rolledBack", map[string]any{"code": code})
 	return fail(code, retry, format, a...)
 }
@@ -257,6 +268,7 @@ func (r *Runner) stopClean(ctx context.Context, env *task.Env, sc *stepCtx) erro
 	if err != nil {
 		return err
 	}
+	sc.newServer = nw.Server
 	if sc.mapHandedOver(ctx, nw) {
 		return task.Skip("the map group was handed over already")
 	}

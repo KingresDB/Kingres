@@ -764,6 +764,7 @@ func TestARefusedProofAfterTheStopRollsTheMapGroupSwitchoverBack(t *testing.T) {
 // A candidate that says nothing is waited for, then the task rolls back as well (the lease keeps the two from running together).
 func TestACandidateThatNeverAnswersEndsTheMapGroupSwitchoverBySilence(t *testing.T) {
 	w := mapWorld()
+	w.dbDownAfterStop = true // as in the real system: the rows of the task are in the stopped instance (F5-01)
 	w.mapRefusal = ""
 	r := w.runner()
 	w.fakeClock(r)
@@ -774,5 +775,22 @@ func TestACandidateThatNeverAnswersEndsTheMapGroupSwitchoverBySilence(t *testing
 	failedWith(t, w, err, CodeSwitchoverUnproven)
 	if w.count("resume s1") != 1 {
 		t.Fatalf("the old leader was not resumed:\n%s", strings.Join(w.log, "\n"))
+	}
+}
+
+// F5-01. The clean stop did not release the lease at a majority (the old leader's renewal is back): the task rolls back with the rows unreadable and
+// still lets go of the candidate's lease, gives its bootstrap up, and resumes the old leader.
+func TestARollbackAfterAStopThatDidNotReleaseTheLeaseStillReleasesTheCandidate(t *testing.T) {
+	w := mapWorld()
+	w.dbDownAfterStop, w.notReleased = true, true
+	r := w.runner()
+	w.fakeClock(r)
+	name, err := runAll(t, r, mapGracefulInput())
+	failedWith(t, w, err, CodeSwitchoverUnproven)
+	if name != StepName(0, StepStopClean) {
+		t.Fatalf("the step: %s", name)
+	}
+	if w.count("lease-release s2") != 1 || w.count("map-abandon s2") != 1 || w.count("resume s1") != 1 {
+		t.Fatalf("the rollback with unreadable rows:\n%s", strings.Join(w.log, "\n"))
 	}
 }

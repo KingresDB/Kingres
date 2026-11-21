@@ -75,6 +75,7 @@ type world struct {
 	markErr            error   // the answer of the mark call
 	undoTerms          []int64 // the terms of the quiesce, unquiesce and resume calls
 	stopErr            error   // the answer of the clean stop call
+	dbDownAfterStop    bool    // the rows cannot be read after the clean stop (the map group: its system database is the stopped instance)
 	notReleased        bool    // the clean stop does not release the lease
 	markTerms          []int64
 	stopTerms          []int64
@@ -275,6 +276,11 @@ func (p fpeers) Demote(_ context.Context, server string, r DemoteRequest) (Demot
 		}
 		p.w.stopN++
 		p.w.mu.Unlock()
+		if p.w.dbDownAfterStop && p.w.rows != nil {
+			p.w.rows.mu.Lock()
+			p.w.rows.down = true
+			p.w.rows.mu.Unlock()
+		}
 		return DemoteAnswer{Stopped: true, ClusterState: state, Checkpoint: "0/6000028", Released: !p.w.notReleased}, nil
 	}
 	p.w.rec("demote %s to=%s", server, r.TransferTo)
@@ -496,11 +502,15 @@ type memRows struct {
 	events  []string
 	outcome string
 	lost    bool
+	down    bool // the system database is the stopped instance: nothing can be read or written (the map group after its clean stop)
 }
 
 func newMemRows() *memRows { return &memRows{groups: map[int32]*GroupRow{}} }
 
 func (m *memRows) check() error {
+	if m.down {
+		return errors.New("the system database is stopped")
+	}
 	if m.lost {
 		return ErrLeaseLost
 	}
@@ -527,11 +537,17 @@ func (m *memRows) Begin(_ context.Context, in Input, term int64, groups []GroupR
 func (m *memRows) Run(context.Context) (RunRow, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.down {
+		return RunRow{}, false, errors.New("the system database is stopped")
+	}
 	return m.run, m.have, nil
 }
 func (m *memRows) Group(_ context.Context, g int32) (GroupRow, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.down {
+		return GroupRow{}, false, errors.New("the system database is stopped")
+	}
 	r, ok := m.groups[g]
 	if !ok {
 		return GroupRow{}, false, nil
