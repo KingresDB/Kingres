@@ -58,10 +58,10 @@ Target: Ubuntu 24.04, amd64. Everything below was run on Windows 11 with WSL2
   their versions; the build stops when an extension of the source tree is not
   in the staged tree, or when a `--x.y.sql` or `--x--y.sql` script of it is
   missing from the staged tree or from the `DATA` list of its Makefile). This
-  release carries `kingres_shard` 0.7, `kingres_ledger` 0.3, `kingres_sketch`
+  release carries `kingres_shard` 0.8, `kingres_ledger` 0.3, `kingres_sketch`
   1.0, `kingres_timepart` 0.2 and `kingres_columnar` 0.2, with every install
   and update script of each (an instance made by an earlier package updates
-  with `ALTER EXTENSION ... UPDATE`: tested from `kingres_shard` 0.6,
+  with `ALTER EXTENSION ... UPDATE`: tested from `kingres_shard` 0.6 and 0.7,
   `kingres_ledger` 0.1, `kingres_timepart` 0.1 and `kingres_columnar` 0.1).
   `kingres_columnar` needs `shared_preload_libraries = 'kingres_columnar'` to
   write (it registers a WAL resource manager). **What the product preloads
@@ -594,7 +594,7 @@ the instance).
   untouched). The versions: `BUILD-INFO` lists every extension with its version, the
   catalog has the default version of each control file, the install and update scripts
   of this release are in the tree, and `ALTER EXTENSION ... UPDATE` takes a database
-  from the versions of the earlier package (`kingres_shard` 0.6, `kingres_ledger` 0.1,
+  from the versions of the earlier packages (`kingres_shard` 0.6, then, in a database of its own, 0.7 to 0.8, `kingres_ledger` 0.1,
   `kingres_timepart` 0.1, `kingres_columnar` 0.1) to the current ones; on the node,
   `kingres.create_distributed_table` of a table that holds 1000 rows keeps them all. **The other major** (needs
   `--other-deb`): with the cluster running and data present, the package of the
@@ -763,7 +763,7 @@ both majors, with the files of the package.
   dependency as full texts (only the dependency lists are shipped); NLS, GSSAPI,
   LDAP, PAM, JIT, PL languages.
 - Package upgrades are tested for a revision bump, and the extensions of a database made by
-  an earlier package are updated with `ALTER EXTENSION ... UPDATE` (from `kingres_shard` 0.6,
+  an earlier package are updated with `ALTER EXTENSION ... UPDATE` (from `kingres_shard` 0.6 and from 0.7,
   `kingres_ledger` 0.1, `kingres_timepart` 0.1 and `kingres_columnar` 0.1); there is no
   major-version path and no rollback; the instance is restarted on upgrade, and nothing here updates the extensions
   of existing databases for the administrator (the test does it by hand).

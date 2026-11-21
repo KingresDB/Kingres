@@ -95,9 +95,9 @@ check_extension_files() {
     done
     check_eq "${p}: BUILD-INFO lists the version of every extension, as its control file says" "${want}" \
         "$("$@" sed -n 's/^kingres extension versions: //p' /opt/kingres/share/BUILD-INFO 2>/dev/null)"
-    check_eq "${p}: the versions of this release (shard 0.7, ledger 0.3, sketch 1.0, timepart 0.2, columnar 0.2)" \
-        "kingres_columnar 0.2, kingres_ledger 0.3, kingres_shard 0.7, kingres_sketch 1.0, kingres_timepart 0.2" "${want}"
-    for e in kingres_shard--0.6--0.7 kingres_shard--0.6 kingres_shard--0.7 kingres_timepart--0.1--0.2 kingres_timepart--0.1 \
+    check_eq "${p}: the versions of this release (shard 0.8, ledger 0.3, sketch 1.0, timepart 0.2, columnar 0.2)" \
+        "kingres_columnar 0.2, kingres_ledger 0.3, kingres_shard 0.8, kingres_sketch 1.0, kingres_timepart 0.2" "${want}"
+    for e in kingres_shard--0.6--0.7 kingres_shard--0.7--0.8 kingres_shard--0.6 kingres_shard--0.7 kingres_shard--0.8 kingres_timepart--0.1--0.2 kingres_timepart--0.1 \
         kingres_columnar--0.1--0.2 kingres_columnar--0.1 kingres_ledger--0.2--0.3; do
         check "${p}: ${e}.sql is installed" "$@" test -f "${share}/${e}.sql"
     done
