@@ -23,7 +23,10 @@
 // any server). A proof is therefore sent to the manager leader only, which holds
 // every verifier and is trusted with everything anyway (a compromised leader is a
 // compromised cluster); the calls that go to every member (gather) carry an
-// assertion signed by the leader instead (assertion.go). A proof is bound to one
+// assertion signed by the leader instead (assertion.go). The one exception is the
+// request of an operator for the failover of the map group (KindMapStart), whose
+// receiver is the candidate that becomes the leader because the leader is gone
+// (ADR 0026): that server may learn the ClientKey of the operator. A proof is bound to one
 // request, one sender, one receiver and a short time window, and a changed
 // password stops it working.
 package fwdproof

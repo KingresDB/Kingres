@@ -169,6 +169,10 @@ verifier in its own PostgreSQL (`pg_authid.rolpassword`) before it does anything
   holds every verifier, runs every cluster operation and is trusted with everything already. **A compromised
   leader is a compromised cluster; that is inherent** (it is also the server that holds the CA key in the
   current design).
+  **One exception (F4-05, ADR 0026):** the request of an operator for the failover of the map group is sent with a proof of kind `mapStart` to the candidate that
+  promotes the map group, because the leader is the server that is gone. The candidate is the next leader and already holds every verifier, and may learn the
+  operator's ClientKey; it ends when the password changes. A session of the token kind has no proof key and gets `503 service_unavailable` for this operation when the
+  candidate is another server.
 - It refuses a proof whose `issuedAt` is more than two minutes from its clock and a nonce it has accepted before
   (a bounded replay cache that only fills with proofs that verified). The answer to a refused proof is
   `401 identity_unproven`; the forwarding server tells its client `401 unauthenticated` ("sign in again").

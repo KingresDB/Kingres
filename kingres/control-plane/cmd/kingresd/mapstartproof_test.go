@@ -116,3 +116,13 @@ func TestAMapStartOfAnOperatorIsProvenAndAnythingElseIsRefused(t *testing.T) {
 	_, _, err = openMapStart(ctx, &haDeps{}, "s1", send(mapStartBody{Server: "s0"}, id))
 	callErr(t, err, 401, "identity_unproven")
 }
+
+// F5-05. A session without a proof key (the token kind) cannot make the signed request: the operation says so (503 service_unavailable) and nothing is sent.
+func TestASessionWithoutAProofKeyCannotSignAMapStart(t *testing.T) {
+	m, _ := abandonRig(t)
+	m.self = "s1"
+	_, err := m.sign(internalapi.ForwardIdentity{Username: "alice", ClusterRoles: []string{"kingres_ops"}}, mapStartBody{Server: "s0"}, "s2")
+	if err == nil {
+		t.Fatal("a session without a proof key signed a request")
+	}
+}

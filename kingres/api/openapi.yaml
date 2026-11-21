@@ -1075,6 +1075,8 @@ paths:
         leader, and its task engine finishes the task (the task is read from the new leader once the old leader's system database is stopped). The
         steps of the map group that the old leader could not record are the ones before `Verify the new primary`. A hard failover of a server whose
         map group primary answers is still 422 `unsupported_operation`.
+        When the manager leader is gone and the request is answered by a server that is not the candidate, the request travels to the candidate with the proof of the
+        operator's session (ADR 0026); a session of the token kind has no proof key and gets 503 `service_unavailable` for this case.
 
         The task is `server.failover`, one block of steps per group (`TaskStep.shardGroupId`). A task that
         waits for an operator is `paused`; a repeat of this request for the same server resumes it. From the moment
