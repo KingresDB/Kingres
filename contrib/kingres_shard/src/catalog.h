@@ -58,6 +58,7 @@ typedef struct KsDistTable
 	NameData	dist_column;
 	bool		is_reference;	/* a reference table: no key, no colocation group */
 	bool		is_schema;		/* a table of a distributed schema (phase 11): one bucket, no key; kept in schema_tables, never in dist_tables */
+	bool		negative;		/* a lazily cached answer "this is not a table of a distributed schema" (never returned by a lookup) */
 } KsDistTable;
 
 /* A distributed schema (phase 11): the key is the OID of the schema on this node. */
@@ -67,6 +68,7 @@ typedef struct KsDistSchema
 	int			colocation_id;
 	KsColocation *coloc;
 	bool		ship_functions;
+	bool		negative;		/* a lazily cached answer "not a distributed schema" */
 } KsDistSchema;
 
 /* The sharding mode of the database (kingres.sharding_settings). */
@@ -109,11 +111,11 @@ typedef struct KsCatalog
 	List	   *nodes;			/* of KsNode * */
 	List	   *colocations;	/* of KsColocation * */
 	HTAB	   *dist_tables;	/* relid -> KsDistTable */
-	int			nschema_tables;
+	int			nschema_tables;	/* the number of rows of kingres.dist_table that are schema tables; the entries of schema_tables are made on demand (step 12) */
 	HTAB	   *schema_tables;	/* relid -> KsDistTable (is_schema) of the tables of distributed schemas; no code that
 								 * works on hash-distributed tables sees them (phase 11, design/shard-phase11.md 5.1) */
 	int			ndist_schemas;
-	HTAB	   *dist_schemas;	/* nsp OID -> KsDistSchema */
+	HTAB	   *dist_schemas;	/* nsp OID -> KsDistSchema, made on demand (step 12) */
 	KsShardingMode sharding_mode;	/* kingres.sharding_settings; KS_MODE_ROW when the table is not there (an older install) */
 	bool		distribute_new_schemas;
 } KsCatalog;
@@ -158,6 +160,7 @@ extern const KsColocation *kingres_shard_lookup_colocation(int colocation_id);
  */
 extern const KsDistTable *kingres_shard_lookup_schema_table(const KsCatalog *cat, Oid relid);
 extern int	kingres_shard_schema_table_owner(const KsDistTable *st);
+extern bool kingres_shard_catalog_incremental;
 extern const KsDistSchema *kingres_shard_lookup_dist_schema(const KsCatalog *cat, Oid nsp);
 extern const KsDistTable *kingres_shard_lookup_scan_table(const KsCatalog *cat, Oid relid);
 

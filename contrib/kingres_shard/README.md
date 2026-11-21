@@ -2034,6 +2034,15 @@ trigger (the ledger's own are known by their functions).  `ALTER TABLE ... SET S
 (see "Sizing of the verification"), and `verify 'full'` writes only the rows that differ.  Measured with `t/245_schema_scale_cluster.pl` (the numbers are in the design notes): the cost of a DDL statement
 grows with the number of distributed schemas (23 ms at 200 schemas, 174 ms on average at 2000) and `add_node` of a cluster with 2000 schemas fails for lack of locks; both are for step 12.
 
+**Step 12: the incremental cache of the catalog.**  A backend no longer reads every distributed schema and schema table when it loads the catalog: it counts them,
+and makes the entry of a schema table or a schema when a statement asks for it (one index scan of `kingres.dist_table` or `kingres.dist_schema`; "not a schema
+table" is cached too, until the next reload).  The colocation groups are found through a hash, not by a list search.  The trigger of a catalog change
+invalidates the relcache entries of the distributed tables that the change can touch (the tables whose rows this statement wrote in `dist_table`, the tables of the
+groups whose rows it wrote in `colocation`, `bucket_map` or `dist_schema`), not of every table of the database; a change of a node, of the settings, a
+`TRUNCATE` and a change of `dist_partition` still invalidate every one.  `kingres_shard.catalog_incremental = off` is the fallback with the old behaviour (the
+whole suite also runs with it, `KS_CATALOG_FULL=1`).  `kingres.internal_catalog_stats()` reports, for the backend, the loads, the lazy lookups and the
+invalidations sent (the tests read it).
+
 
 ## Limitations in phase 2a
 

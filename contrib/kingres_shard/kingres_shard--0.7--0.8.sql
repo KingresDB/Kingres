@@ -4763,6 +4763,28 @@ REVOKE ALL ON FUNCTION kingres.internal_schema_head(regnamespace), kingres.inter
 -- PHASE 11, the fixes for the review of increments 1 to 6                    [end]
 -- =========================================================================
 
+-- =========================================================================
+-- PHASE 11 (distributed schemas), step 12: the incremental cache of the catalog   [begin]
+--
+-- A backend makes the entry of a schema table or a distributed schema when a statement asks for it (the catalog load only counts them), and a
+-- change of the catalog invalidates the distributed tables that it touches, not every one.  This function reports what the backend did, for the tests;
+-- kingres_shard.catalog_incremental = off brings back the invalidation of every distributed table.
+-- =========================================================================
+
+CREATE FUNCTION kingres.internal_catalog_stats(OUT loads int8, OUT lazy_lookups int8, OUT invalidations int8)
+    RETURNS record
+    AS 'MODULE_PATHNAME', 'kingres_internal_catalog_stats'
+    LANGUAGE C
+    SET search_path = pg_catalog, kingres, pg_temp;
+
+COMMENT ON FUNCTION kingres.internal_catalog_stats() IS
+    'The loads of the catalog cache, the lazy lookups of schema tables and schemas, and the relcache invalidations sent for distributed tables, of this backend';
+REVOKE ALL ON FUNCTION kingres.internal_catalog_stats() FROM PUBLIC;
+
+-- =========================================================================
+-- PHASE 11, step 12, the incremental cache                                   [end]
+-- =========================================================================
+
 -- ===========================================================================
 -- END OF SECTION P11
 -- ===========================================================================

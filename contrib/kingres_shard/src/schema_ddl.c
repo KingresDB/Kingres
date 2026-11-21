@@ -82,6 +82,15 @@ static const struct config_enum_entry distribute_new_schemas_options[] = {
 void
 kingres_shard_schema_ddl_init(void)
 {
+	DefineCustomBoolVariable("kingres_shard.catalog_incremental",
+							 "Invalidate only the distributed tables that a catalog change touches.",
+							 "Off: every change of the catalog invalidates every distributed table (the fallback).",
+							 &kingres_shard_catalog_incremental,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	DefineCustomBoolVariable("kingres_shard.enable_schema_routing",
 							 "Run a statement on a distributed schema whole on the shard group that holds it.",
 							 "When off, such a statement is planned with the distributed scan (single-source form) and a write to a schema of another group is refused; used to compare the two paths.",
