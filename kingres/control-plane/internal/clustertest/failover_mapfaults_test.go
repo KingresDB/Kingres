@@ -112,6 +112,7 @@ func TestAnAbandonWhilePromoteIsInFlightLeavesExactlyOnePrimary(t *testing.T) {
 	nw.SetFaults(fault.Spec{FailoverPoint: "promote:slow", FailoverMode: "slow"})
 	id := mapSwitchoverRequest(t, leader, nw)
 	mapStopped(t, leader)
+	time.Sleep(8 * time.Second) // the proof is sent, the promoting call (held for 20 s) is in flight
 	st, body := nw.Do("POST", "/failover/map/abandon", map[string]any{"reason": "while the promotion is in flight"}, nil)
 	t.Logf("the abandon during the promotion: %d %v", st, body)
 	if st != 200 && st != 409 {
@@ -139,10 +140,19 @@ func TestAnAbandonWhilePromoteIsInFlightLeavesExactlyOnePrimary(t *testing.T) {
 	nw.Heal()
 	var oldPrimary, newPrimary bool
 	until(t, 5*time.Minute, "one primary of the map group", func() bool {
-		var so, sn failover.State
-		co, eo := nw.InternalCall(leader, "GET", "/failover/state?group=0", nil, &so)
-		cn, en := leader.InternalCall(nw, "GET", "/failover/state?group=0", nil, &sn)
-		if eo != nil || en != nil || co != 200 || cn != 200 {
+		// the state call is answered to the manager leader only: whichever server leads at the end asks (a server may ask itself)
+		stateOf := func(target *clustertest.Node) (failover.State, bool) {
+			for _, from := range []*clustertest.Node{nw, leader} {
+				var s failover.State
+				if code, err := from.InternalCall(target, "GET", "/failover/state?group=0", nil, &s); err == nil && code == 200 {
+					return s, true
+				}
+			}
+			return failover.State{}, false
+		}
+		so, ok1 := stateOf(leader)
+		sn, ok2 := stateOf(nw)
+		if !ok1 || !ok2 {
 			return false
 		}
 		oldPrimary, newPrimary = len(so.OutOfRecovery()) > 0, len(sn.OutOfRecovery()) > 0

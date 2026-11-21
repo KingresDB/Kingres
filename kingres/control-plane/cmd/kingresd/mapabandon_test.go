@@ -275,3 +275,21 @@ func TestThePlannedStartAndTheProofAreAcceptedFromTheOldServerOnly(t *testing.T)
 	}
 	callErr(t, proof("s1", "0/7000000"), 409, "conflict") // a differing second proof
 }
+
+// A planned switchover that was given up is not started again by the same task (its rollback could not be recorded, so the engine runs the step again).
+func TestAGivenUpPlannedSwitchoverIsNotStartedAgainByTheSameTask(t *testing.T) {
+	ctx := context.Background()
+	m, js := abandonRig(t)
+	d := &haDeps{MapFailover: m}
+	_, _ = js.Begin("b1", "s1", 3, "manual", "alice", false)
+	_, _ = js.SetPlanned(journal.Planned{TaskID: 7, StandbyID: 3})
+	if err := js.Abandon("rolled back"); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(mapStartBody{Server: "s1", Planned: &journal.Planned{TaskID: 7, StandbyID: 3}})
+	_, err := handleMapStart(ctx, d, "s1", b)
+	callErr(t, err, 409, "conflict")
+	if js.Active() {
+		t.Fatal("the same task began a second bootstrap")
+	}
+}

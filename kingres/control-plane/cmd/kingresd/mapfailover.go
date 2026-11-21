@@ -400,6 +400,12 @@ func handleMapStart(ctx context.Context, d *haDeps, caller string, body []byte) 
 		if caller != b.Server || b.Planned.TaskID <= 0 || b.Planned.StandbyID <= 0 {
 			return nil, &internalapi.CallError{Status: http.StatusForbidden, Code: "forbidden", Message: "A planned switchover of the map group is started by the task of the old leader, on its own server."}
 		}
+		// A planned switchover that was given up is not started again by the same task: the task could not record its rollback (its rows were in the stopped
+		// instance and its lease ran out), so the engine runs the step again when the old leader is back, and that run must end as a failure instead of
+		// beginning a second switchover (found by the cluster tests of the review of round 2).
+		if cur, ok := mf.journal.Current(); ok && !cur.Abandoned.IsZero() && cur.Planned != nil && cur.Planned.TaskID == b.Planned.TaskID {
+			return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "conflict", Message: "The planned switchover of this task was given up; it is not started again."}
+		}
 		b.Planned.Checkpoint, b.Planned.ClusterState = "", ""
 		b.AllowDataLoss = false
 	}
