@@ -1446,6 +1446,12 @@ func (r *Runner) checkCatalog(ctx context.Context, env *task.Env, sc *stepCtx) e
 			before := int64(0) // the term before is known for the system catalog only
 			if t.db == SystemDB {
 				before = run.ExpectedTerm
+				if sc.group == 0 && sc.in.graceful() {
+					// The term of the map group's own promotion is what the run row says after it (runRowOf): the term before it is the one the run began with.
+					if raw, ok, rerr := sc.rows.Run(ctx); rerr == nil && ok {
+						before = raw.ExpectedTerm
+					}
+				}
 			}
 			ok, why := catalogMatches(nodes, t.newID, t.oldID, term, before)
 			if ok {

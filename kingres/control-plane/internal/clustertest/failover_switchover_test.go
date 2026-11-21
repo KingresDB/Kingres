@@ -355,6 +355,15 @@ func TestSwitchoverOfTheMapGroup(t *testing.T) {
 	id := clustertest.TaskID(resp)
 	// The old leader's system database is stopped by the clean stop: the task is read from the new leader.
 	var task map[string]any
+	defer func() {
+		if t.Failed() {
+			st, body := nw.Do("GET", fmt.Sprintf("/tasks/%v", id), nil, nil)
+			t.Logf("task %v on the new leader (%d): %v", id, st, body)
+			t.Logf("failover status: %v", func() any { _, b := nw.Do("GET", "/failover", nil, nil); return b }())
+			t.Logf("new leader log: %s", nw.LogTail(14000))
+			t.Logf("old leader log: %s", leader.LogTail(8000))
+		}
+	}()
 	until(t, 10*time.Minute, "the task to end on the new leader", func() bool {
 		st, body := nw.Do("GET", fmt.Sprintf("/tasks/%v", id), nil, nil)
 		if st != 200 {
