@@ -933,6 +933,8 @@ stage_schemas_on_node(const char *host, int port, MemoryContext keepcxt, List **
 	 * must not carry into the cluster (P12R-04).
 	 */
 	conn = kingres_shard_connect_control(host, port, &err);
+	if (conn == NULL && names == NIL)
+		return 0;				/* nothing to make: the call goes on and meets the node itself, with its own error */
 	if (conn == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_CONNECTION_FAILURE),
