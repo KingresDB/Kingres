@@ -2314,7 +2314,6 @@ SELECT jsonb_build_object(
     'dist_schema', COALESCE((SELECT jsonb_agg(jsonb_build_object(
                                        'schema', ns.nspname,
                                        'colocation_id', s.colocation_id,
-                                       'created_at', s.created_at,
                                        'ship_functions', s.ship_functions)
                                      ORDER BY ns.nspname)
                               FROM kingres.dist_schema s
@@ -2324,7 +2323,7 @@ SELECT jsonb_build_object(
                                   '[]'::pg_catalog.jsonb));
 $$;
 
--- The same function as before, with the two tables.  A document without them comes from a map
+-- The same function as before, with the two tables (the creation time of a schema is not in the document: every node stamps its own, so it would make the catalogs differ).  A document without them comes from a map
 -- group primary that is not upgraded: the settings then stay as they are and there is no
 -- distributed schema.
 CREATE OR REPLACE FUNCTION kingres.internal_apply_catalog(snapshot pg_catalog.jsonb)
@@ -3060,7 +3059,7 @@ $$;
 
 GRANT EXECUTE ON FUNCTION kingres.internal_table_structure(regclass), kingres.internal_table_fingerprint(regclass) TO PUBLIC;
 
--- distribute_schema(nsp, group): the schema becomes a distributed schema of a group.  Increment 3 takes the empty schema:
+-- distribute_schema(nsp, group): the schema becomes a distributed schema of a group.  An empty schema (increment 3):
 -- it exists on this node, holds no object, and is created on every other node in the same two-phase transaction.  A schema
 -- with objects is the conversion of design 8.1 (a later increment).
 CREATE FUNCTION kingres.distribute_schema(nsp regnamespace, group_id int DEFAULT NULL)
@@ -3078,7 +3077,18 @@ DECLARE
     v_self   pg_catalog.int4;
     v_max    pg_catalog.int4;
     v_what   pg_catalog.text;
+    v_kind   pg_catalog.text;
+    v_obj    pg_catalog.text;
+    v_reason pg_catalog.text;
+    v_row    pg_catalog.bool;
+    v_has    pg_catalog.bool := false;
+    v_data   pg_catalog.bool := false;
+    v_own    pg_catalog.int4;
+    v_stmts  pg_catalog.text[];
+    v_one    pg_catalog.text;
+    v_fp     pg_catalog.text;
     nd       pg_catalog.record;
+    tb       pg_catalog.record;
 BEGIN
     PERFORM kingres.internal_require_superuser();
     LOCK TABLE kingres.map_version IN EXCLUSIVE MODE;
@@ -3111,7 +3121,7 @@ BEGIN
         RAISE EXCEPTION 'schema "%" is already distributed', v_name
             USING ERRCODE = 'duplicate_object';
     END IF;
-    -- the schema holds nothing: tables, indexes, sequences and views are in pg_class, functions in pg_proc, types in pg_type
+    -- what the schema holds: tables, indexes, sequences and views are in pg_class, functions in pg_proc, types in pg_type
     SELECT x.what INTO v_what
       FROM (SELECT 'relation ' || c.relname AS what FROM pg_catalog.pg_class c WHERE c.relnamespace OPERATOR(pg_catalog.=) nsp::pg_catalog.oid
             UNION ALL SELECT 'function ' || p.proname FROM pg_catalog.pg_proc p WHERE p.pronamespace OPERATOR(pg_catalog.=) nsp::pg_catalog.oid
@@ -3120,15 +3130,63 @@ BEGIN
             UNION ALL SELECT 'collation ' || co.collname FROM pg_catalog.pg_collation co WHERE co.collnamespace OPERATOR(pg_catalog.=) nsp::pg_catalog.oid) x
      ORDER BY x.what LIMIT 1;
     IF v_what IS NOT NULL THEN
-        RAISE EXCEPTION 'schema "%" holds objects: distributing a schema that is not empty is not supported yet', v_name
-            USING ERRCODE = 'feature_not_supported',
-                  DETAIL = pg_catalog.format('The first object is %s.', v_what),
-                  HINT = 'Distribute the schema while it is empty, then create its objects.';
+        -- the conversion of a schema that has objects (design 8.1): what the structure generator does not make is refused first
+        v_has := true;
+        SELECT i.object_kind, i.object_name, i.reason INTO v_kind, v_obj, v_reason
+          FROM kingres.schema_inventory(nsp) i WHERE NOT i.supported ORDER BY i.object_kind, i.object_name LIMIT 1;
+        IF FOUND THEN
+            RAISE EXCEPTION 'schema "%" cannot be distributed: % %: %', v_name, v_kind, v_obj, v_reason
+                USING ERRCODE = 'feature_not_supported',
+                      HINT = 'kingres.schema_inventory() lists every object of the schema and whether it is supported.';
+        END IF;
+        SELECT y.what INTO v_what
+          FROM (SELECT 'operator ' || o.oprname AS what FROM pg_catalog.pg_operator o WHERE o.oprnamespace OPERATOR(pg_catalog.=) nsp::pg_catalog.oid
+                UNION ALL SELECT 'collation ' || co.collname FROM pg_catalog.pg_collation co WHERE co.collnamespace OPERATOR(pg_catalog.=) nsp::pg_catalog.oid
+                UNION ALL SELECT 'operator class ' || oc.opcname FROM pg_catalog.pg_opclass oc WHERE oc.opcnamespace OPERATOR(pg_catalog.=) nsp::pg_catalog.oid
+                UNION ALL SELECT 'operator family ' || opf.opfname FROM pg_catalog.pg_opfamily opf WHERE opf.opfnamespace OPERATOR(pg_catalog.=) nsp::pg_catalog.oid
+                UNION ALL SELECT 'text search object ' || ts.cfgname FROM pg_catalog.pg_ts_config ts WHERE ts.cfgnamespace OPERATOR(pg_catalog.=) nsp::pg_catalog.oid
+                UNION ALL SELECT 'text search object ' || td.dictname FROM pg_catalog.pg_ts_dict td WHERE td.dictnamespace OPERATOR(pg_catalog.=) nsp::pg_catalog.oid
+                UNION ALL SELECT 'conversion ' || cv.conname FROM pg_catalog.pg_conversion cv WHERE cv.connamespace OPERATOR(pg_catalog.=) nsp::pg_catalog.oid
+                UNION ALL SELECT 'table inheritance of ' || ic.relname
+                            FROM pg_catalog.pg_inherits ih JOIN pg_catalog.pg_class ic ON ic.oid OPERATOR(pg_catalog.=) ih.inhrelid
+                            JOIN pg_catalog.pg_class pc ON pc.oid OPERATOR(pg_catalog.=) ih.inhparent
+                           WHERE ic.relnamespace OPERATOR(pg_catalog.=) nsp::pg_catalog.oid AND ic.relkind IN ('r', 'p') AND pc.relkind OPERATOR(pg_catalog.=) 'r') y
+         ORDER BY y.what LIMIT 1;
+        IF v_what IS NOT NULL THEN
+            RAISE EXCEPTION 'schema "%" cannot be distributed: % is not supported in a distributed schema yet', v_name, v_what
+                USING ERRCODE = 'feature_not_supported';
+        END IF;
+        -- no write meanwhile: the tables are locked (a read goes on) until the conversion commits
+        FOR nd IN SELECT c.oid::pg_catalog.regclass AS rel FROM pg_catalog.pg_class c
+                   WHERE c.relnamespace OPERATOR(pg_catalog.=) nsp::pg_catalog.oid AND c.relkind IN ('r', 'p') ORDER BY c.oid
+        LOOP
+            EXECUTE pg_catalog.format('LOCK TABLE %s IN SHARE ROW EXCLUSIVE MODE', nd.rel);
+        END LOOP;
+        FOR nd IN SELECT c.oid::pg_catalog.regclass AS rel FROM pg_catalog.pg_class c
+                   WHERE c.relnamespace OPERATOR(pg_catalog.=) nsp::pg_catalog.oid AND c.relkind OPERATOR(pg_catalog.=) 'r' ORDER BY c.oid
+        LOOP
+            EXECUTE pg_catalog.format('SELECT EXISTS (SELECT 1 FROM %s)', nd.rel) INTO v_row;
+            IF v_row THEN
+                v_data := true;
+                EXIT;
+            END IF;
+        END LOOP;
     END IF;
     v_max := pg_catalog.current_setting('kingres_shard.max_distributed_schemas')::pg_catalog.int4;
     IF (SELECT pg_catalog.count(*) FROM kingres.dist_schema) OPERATOR(pg_catalog.>=) v_max THEN
         RAISE EXCEPTION 'the database already has % distributed schemas, the limit of kingres_shard.max_distributed_schemas', v_max
             USING ERRCODE = 'program_limit_exceeded';
+    END IF;
+    SELECT l.node_id INTO v_self FROM kingres.local_node l;
+    IF v_data THEN
+        -- rows stay where they are: this node's group is the owner (design 8.1); another group is a move afterwards
+        SELECT n.group_id INTO v_own FROM kingres.node n WHERE n.node_id OPERATOR(pg_catalog.=) v_self;
+        IF v_group IS NOT NULL AND v_group OPERATOR(pg_catalog.<>) v_own THEN
+            RAISE EXCEPTION 'schema "%" holds rows on shard group %, not on group %', v_name, v_own, v_group
+                USING ERRCODE = 'feature_not_supported',
+                      HINT = pg_catalog.format('Distribute the schema in place (kingres.distribute_schema(%L)), then kingres.move_schema() it to group %s.', v_name, v_group);
+        END IF;
+        v_group := v_own;
     END IF;
     IF v_group IS NULL THEN
         v_group := NULLIF(pg_catalog.current_setting('kingres_shard.schema_placement_group')::pg_catalog.int4, -1);
@@ -3145,15 +3203,38 @@ BEGIN
         RAISE EXCEPTION 'no shard group can hold a schema'
             USING ERRCODE = 'object_not_in_prerequisite_state';
     END IF;
-    SELECT l.node_id INTO v_self FROM kingres.local_node l;
     v_coloc := pg_catalog.nextval('kingres.colocation_id_seq');
+    IF v_has THEN
+        v_stmts := kingres.internal_schema_structure(nsp);
+    ELSE
+        v_stmts := ARRAY[]::pg_catalog.text[];
+    END IF;
     PERFORM kingres.internal_register_schema(v_name, v_coloc, v_group);
+    PERFORM kingres.internal_register_schema_tables(v_name);
     FOR nd IN SELECT n.node_id FROM kingres.node n
                WHERE n.role OPERATOR(pg_catalog.=) 'primary' AND n.is_active AND n.node_id OPERATOR(pg_catalog.<>) v_self
                ORDER BY n.node_id
     LOOP
         PERFORM kingres.internal_branch_exec(nd.node_id, pg_catalog.format('CREATE SCHEMA %I AUTHORIZATION %I', v_name, v_owner));
+        FOREACH v_one IN ARRAY v_stmts LOOP
+            PERFORM kingres.internal_branch_exec(nd.node_id, v_one);
+        END LOOP;
         PERFORM kingres.internal_branch_exec(nd.node_id, pg_catalog.format('SELECT kingres.internal_register_schema(%L, %s, %s)', v_name, v_coloc, v_group));
+        IF v_has THEN
+            PERFORM kingres.internal_branch_exec(nd.node_id, pg_catalog.format('SELECT kingres.internal_register_schema_tables(%L)', v_name));
+            -- the same structure on the other node, table by table
+            FOR tb IN SELECT d.relid::pg_catalog.regclass AS rel FROM kingres.dist_table d
+                       WHERE d.colocation_id OPERATOR(pg_catalog.=) v_coloc ORDER BY d.relid::pg_catalog.oid
+            LOOP
+                v_fp := kingres.internal_branch_scalar(nd.node_id,
+                            pg_catalog.format('SELECT kingres.internal_table_fingerprint(%L::pg_catalog.regclass)', tb.rel::pg_catalog.text));
+                IF v_fp IS DISTINCT FROM kingres.internal_table_fingerprint(tb.rel) THEN
+                    RAISE EXCEPTION 'table % has another structure on node %: the conversion is rolled back', tb.rel, nd.node_id
+                        USING ERRCODE = 'object_not_in_prerequisite_state',
+                              HINT = 'Something in the table is not carried by the structure of the conversion (for example an index of a partition that has a name of its own).';
+                END IF;
+            END LOOP;
+        END IF;
     END LOOP;
     RETURN v_coloc;
 END;
@@ -3522,6 +3603,394 @@ REVOKE ALL ON FUNCTION
 
 -- =========================================================================
 -- PHASE 11, increment 5                                                      [end]
+-- =========================================================================
+
+
+-- =========================================================================
+-- PHASE 11 (distributed schemas), increment 6: conversion of a schema with data, undistribute_schema   [begin]
+--
+-- distribute_schema() takes a schema that holds objects and rows (design/shard-phase11.md section 8.1): the node that runs it
+-- (the map group primary) keeps the rows and becomes the owner; every other node receives the structure, empty, in the same
+-- two-phase transaction.  internal_schema_structure() makes the statements of that structure; undistribute_schema() undoes the
+-- conversion (8.2): the owner keeps its schema and its rows, the other nodes drop their shells.
+-- =========================================================================
+
+-- The GRANT statements of an access control list (an aclitem[]; the owner's entries first, so that the entries of other
+-- grantors find their grant option).  A list that is not null first takes the default privileges of PUBLIC away.
+CREATE FUNCTION kingres.internal_acl_statements(p_kind text, p_qname text, p_acl aclitem[], p_owner oid)
+    RETURNS text[]
+    LANGUAGE plpgsql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_out pg_catalog.text[] := ARRAY[]::pg_catalog.text[];
+    q     pg_catalog.record;
+BEGIN
+    IF p_acl IS NULL THEN
+        RETURN v_out;
+    END IF;
+    v_out := v_out OPERATOR(pg_catalog.||) pg_catalog.format('REVOKE ALL ON %s %s FROM PUBLIC', p_kind, p_qname);
+    FOR q IN
+        SELECT x.grantor, x.grantee, x.is_grantable,
+               pg_catalog.string_agg(x.privilege_type, ', ' ORDER BY x.privilege_type) AS privs
+          FROM pg_catalog.aclexplode(p_acl) x
+         GROUP BY x.grantor, x.grantee, x.is_grantable
+         ORDER BY (x.grantor OPERATOR(pg_catalog.=) p_owner) DESC, x.grantor, x.grantee, x.is_grantable
+    LOOP
+        IF q.grantor OPERATOR(pg_catalog.<>) p_owner THEN
+            v_out := v_out OPERATOR(pg_catalog.||) pg_catalog.format('SET LOCAL ROLE %I', pg_catalog.pg_get_userbyid(q.grantor));
+        END IF;
+        v_out := v_out OPERATOR(pg_catalog.||) pg_catalog.format('GRANT %s ON %s %s TO %s%s', q.privs, p_kind, p_qname,
+                       CASE WHEN q.grantee OPERATOR(pg_catalog.=) 0 THEN 'PUBLIC' ELSE pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(q.grantee)) END,
+                       CASE WHEN q.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END);
+        IF q.grantor OPERATOR(pg_catalog.<>) p_owner THEN
+            v_out := v_out OPERATOR(pg_catalog.||) 'RESET ROLE'::pg_catalog.text;
+        END IF;
+    END LOOP;
+    RETURN v_out;
+END;
+$$;
+
+-- The statements that make the structure of a schema (the schema itself exists): types, sequences, functions, tables with their
+-- constraints and indexes, partitions, foreign keys, views, the functions that return a row type, triggers; owners, privileges and
+-- comments.  The statements are in an order in which they run on an empty schema, and set check_function_bodies off for the
+-- functions (their bodies may name tables that come later).  Schema_inventory() has refused what this function does not make.
+CREATE FUNCTION kingres.internal_schema_structure(p_nsp regnamespace)
+    RETURNS text[]
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_oid    pg_catalog.oid := p_nsp::pg_catalog.oid;
+    v_name   pg_catalog.name;
+    v_nsprow pg_catalog.pg_namespace%ROWTYPE;
+    v_head   pg_catalog.text[] := ARRAY[]::pg_catalog.text[];
+    v_types  pg_catalog.text[] := ARRAY[]::pg_catalog.text[];
+    v_seqs   pg_catalog.text[] := ARRAY[]::pg_catalog.text[];
+    v_fn1    pg_catalog.text[] := ARRAY[]::pg_catalog.text[];
+    v_fn2    pg_catalog.text[] := ARRAY[]::pg_catalog.text[];
+    v_tab    pg_catalog.text[] := ARRAY[]::pg_catalog.text[];
+    v_fk     pg_catalog.text[] := ARRAY[]::pg_catalog.text[];
+    v_views  pg_catalog.text[] := ARRAY[]::pg_catalog.text[];
+    v_trg    pg_catalog.text[] := ARRAY[]::pg_catalog.text[];
+    r        pg_catalog.record;
+    d        pg_catalog.record;
+    c        pg_catalog.record;
+    qn       pg_catalog.text;
+    stmt     pg_catalog.text;
+    v_parent pg_catalog.text;
+    v_cmt    pg_catalog.text;
+BEGIN
+    SELECT * INTO v_nsprow FROM pg_catalog.pg_namespace WHERE oid OPERATOR(pg_catalog.=) v_oid;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'schema % does not exist', v_oid USING ERRCODE = 'invalid_schema_name';
+    END IF;
+    v_name := v_nsprow.nspname;
+    v_head := v_head OPERATOR(pg_catalog.||) 'SET LOCAL check_function_bodies = off'::pg_catalog.text;
+    v_head := v_head OPERATOR(pg_catalog.||) kingres.internal_acl_statements('SCHEMA', pg_catalog.quote_ident(v_name), v_nsprow.nspacl, v_nsprow.nspowner);
+    SELECT ds.description INTO v_cmt FROM pg_catalog.pg_description ds
+     WHERE ds.classoid OPERATOR(pg_catalog.=) 'pg_catalog.pg_namespace'::pg_catalog.regclass AND ds.objoid OPERATOR(pg_catalog.=) v_oid AND ds.objsubid OPERATOR(pg_catalog.=) 0;
+    IF v_cmt IS NOT NULL THEN
+        v_head := v_head OPERATOR(pg_catalog.||) pg_catalog.format('COMMENT ON SCHEMA %I IS %L', v_name, v_cmt);
+    END IF;
+
+    -- types: enums, domains, composite types (in the order they were made, which is the order of their dependencies)
+    FOR r IN
+        SELECT t.* FROM pg_catalog.pg_type t
+         WHERE t.typnamespace OPERATOR(pg_catalog.=) v_oid AND t.typtype IN ('e', 'd', 'c')
+           AND NOT (t.typcategory OPERATOR(pg_catalog.=) 'A' AND t.typelem OPERATOR(pg_catalog.<>) 0)
+           AND (t.typtype OPERATOR(pg_catalog.<>) 'c'
+                OR EXISTS (SELECT 1 FROM pg_catalog.pg_class rc WHERE rc.oid OPERATOR(pg_catalog.=) t.typrelid AND rc.relkind OPERATOR(pg_catalog.=) 'c'))
+         ORDER BY t.oid
+    LOOP
+        qn := pg_catalog.format('%I.%I', v_name, r.typname);
+        IF r.typtype OPERATOR(pg_catalog.=) 'e' THEN
+            v_types := v_types OPERATOR(pg_catalog.||) pg_catalog.format('CREATE TYPE %s AS ENUM (%s)', qn,
+                (SELECT pg_catalog.string_agg(pg_catalog.quote_literal(e.enumlabel), ', ' ORDER BY e.enumsortorder)
+                   FROM pg_catalog.pg_enum e WHERE e.enumtypid OPERATOR(pg_catalog.=) r.oid));
+        ELSIF r.typtype OPERATOR(pg_catalog.=) 'd' THEN
+            stmt := pg_catalog.format('CREATE DOMAIN %s AS %s', qn, pg_catalog.format_type(r.typbasetype, r.typtypmod));
+            IF r.typcollation OPERATOR(pg_catalog.<>) 0
+               AND r.typcollation OPERATOR(pg_catalog.<>) (SELECT bt.typcollation FROM pg_catalog.pg_type bt WHERE bt.oid OPERATOR(pg_catalog.=) r.typbasetype) THEN
+                stmt := stmt OPERATOR(pg_catalog.||) pg_catalog.format(' COLLATE %I.%I',
+                            (SELECT cn.nspname FROM pg_catalog.pg_collation co JOIN pg_catalog.pg_namespace cn ON cn.oid OPERATOR(pg_catalog.=) co.collnamespace WHERE co.oid OPERATOR(pg_catalog.=) r.typcollation),
+                            (SELECT co.collname FROM pg_catalog.pg_collation co WHERE co.oid OPERATOR(pg_catalog.=) r.typcollation));
+            END IF;
+            IF r.typdefault IS NOT NULL THEN
+                stmt := stmt OPERATOR(pg_catalog.||) ' DEFAULT ' OPERATOR(pg_catalog.||) r.typdefault;
+            END IF;
+            IF r.typnotnull THEN
+                stmt := stmt OPERATOR(pg_catalog.||) ' NOT NULL';
+            END IF;
+            v_types := v_types OPERATOR(pg_catalog.||) stmt;
+            FOR d IN SELECT k.conname, pg_catalog.pg_get_constraintdef(k.oid) AS def FROM pg_catalog.pg_constraint k
+                      WHERE k.contypid OPERATOR(pg_catalog.=) r.oid AND k.contype OPERATOR(pg_catalog.=) 'c' ORDER BY k.conname
+            LOOP
+                v_types := v_types OPERATOR(pg_catalog.||) pg_catalog.format('ALTER DOMAIN %s ADD CONSTRAINT %I %s', qn, d.conname, d.def);
+            END LOOP;
+        ELSE
+            v_types := v_types OPERATOR(pg_catalog.||) pg_catalog.format('CREATE TYPE %s AS (%s)', qn,
+                (SELECT pg_catalog.string_agg(pg_catalog.format('%I %s', a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod)), ', ' ORDER BY a.attnum)
+                   FROM pg_catalog.pg_attribute a
+                  WHERE a.attrelid OPERATOR(pg_catalog.=) r.typrelid AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped));
+        END IF;
+        v_types := v_types OPERATOR(pg_catalog.||) pg_catalog.format('ALTER TYPE %s OWNER TO %I', qn, pg_catalog.pg_get_userbyid(r.typowner));
+        v_types := v_types OPERATOR(pg_catalog.||) kingres.internal_acl_statements(CASE WHEN r.typtype OPERATOR(pg_catalog.=) 'd' THEN 'DOMAIN' ELSE 'TYPE' END, qn, r.typacl, r.typowner);
+        SELECT ds.description INTO v_cmt FROM pg_catalog.pg_description ds
+         WHERE ds.classoid OPERATOR(pg_catalog.=) 'pg_catalog.pg_type'::pg_catalog.regclass AND ds.objoid OPERATOR(pg_catalog.=) r.oid AND ds.objsubid OPERATOR(pg_catalog.=) 0;
+        IF v_cmt IS NOT NULL THEN
+            v_types := v_types OPERATOR(pg_catalog.||) pg_catalog.format('COMMENT ON %s %s IS %L', CASE WHEN r.typtype OPERATOR(pg_catalog.=) 'd' THEN 'DOMAIN' ELSE 'TYPE' END, qn, v_cmt);
+        END IF;
+    END LOOP;
+
+    -- sequences that no column owns (the others come with their table)
+    FOR r IN
+        SELECT c2.oid, c2.relname, c2.relowner, c2.relacl, sq.seqtypid, sq.seqstart, sq.seqincrement, sq.seqmax, sq.seqmin, sq.seqcache, sq.seqcycle
+          FROM pg_catalog.pg_class c2 JOIN pg_catalog.pg_sequence sq ON sq.seqrelid OPERATOR(pg_catalog.=) c2.oid
+         WHERE c2.relnamespace OPERATOR(pg_catalog.=) v_oid AND c2.relkind OPERATOR(pg_catalog.=) 'S'
+           AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend dp
+                            WHERE dp.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass AND dp.objid OPERATOR(pg_catalog.=) c2.oid
+                              AND dp.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass AND dp.deptype IN ('a', 'i'))
+         ORDER BY c2.oid
+    LOOP
+        qn := pg_catalog.format('%I.%I', v_name, r.relname);
+        v_seqs := v_seqs OPERATOR(pg_catalog.||) pg_catalog.format('CREATE SEQUENCE %s AS %s INCREMENT BY %s MINVALUE %s MAXVALUE %s START WITH %s CACHE %s %s',
+                       qn, pg_catalog.format_type(r.seqtypid, NULL), r.seqincrement, r.seqmin, r.seqmax, r.seqstart, r.seqcache,
+                       CASE WHEN r.seqcycle THEN 'CYCLE' ELSE 'NO CYCLE' END);
+        v_seqs := v_seqs OPERATOR(pg_catalog.||) pg_catalog.format('ALTER SEQUENCE %s OWNER TO %I', qn, pg_catalog.pg_get_userbyid(r.relowner));
+        v_seqs := v_seqs OPERATOR(pg_catalog.||) kingres.internal_acl_statements('SEQUENCE', qn, r.relacl, r.relowner);
+        SELECT ds.description INTO v_cmt FROM pg_catalog.pg_description ds
+         WHERE ds.classoid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass AND ds.objoid OPERATOR(pg_catalog.=) r.oid AND ds.objsubid OPERATOR(pg_catalog.=) 0;
+        IF v_cmt IS NOT NULL THEN
+            v_seqs := v_seqs OPERATOR(pg_catalog.||) pg_catalog.format('COMMENT ON SEQUENCE %s IS %L', qn, v_cmt);
+        END IF;
+    END LOOP;
+
+    -- functions and procedures; one that names the row type of a table or a view in its arguments or result comes after them
+    FOR r IN
+        SELECT p.oid, p.proname, p.prokind, p.proowner, p.proacl,
+               (EXISTS (SELECT 1 FROM pg_catalog.pg_type t JOIN pg_catalog.pg_class rc ON rc.oid OPERATOR(pg_catalog.=) t.typrelid
+                         WHERE rc.relkind IN ('r', 'p', 'v')
+                           AND t.oid OPERATOR(pg_catalog.=) ANY (ARRAY[p.prorettype] OPERATOR(pg_catalog.||) p.proargtypes::pg_catalog.oid[]
+                                                                 OPERATOR(pg_catalog.||) COALESCE(p.proallargtypes, '{}'::pg_catalog.oid[])))) AS needs_rel
+          FROM pg_catalog.pg_proc p
+         WHERE p.pronamespace OPERATOR(pg_catalog.=) v_oid AND p.prokind IN ('f', 'p')
+           AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend dp
+                            WHERE dp.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_proc'::pg_catalog.regclass
+                              AND dp.objid OPERATOR(pg_catalog.=) p.oid AND dp.deptype IN ('e', 'i'))
+         ORDER BY p.oid
+    LOOP
+        qn := pg_catalog.format('%I.%I(%s)', v_name, r.proname, pg_catalog.pg_get_function_identity_arguments(r.oid));
+        stmt := pg_catalog.pg_get_functiondef(r.oid);
+        IF NOT r.needs_rel THEN
+            v_fn1 := v_fn1 OPERATOR(pg_catalog.||) stmt;
+            v_fn1 := v_fn1 OPERATOR(pg_catalog.||) pg_catalog.format('ALTER %s %s OWNER TO %I', CASE r.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END, qn, pg_catalog.pg_get_userbyid(r.proowner));
+            v_fn1 := v_fn1 OPERATOR(pg_catalog.||) kingres.internal_acl_statements(CASE r.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END, qn, r.proacl, r.proowner);
+        ELSE
+            v_fn2 := v_fn2 OPERATOR(pg_catalog.||) stmt;
+            v_fn2 := v_fn2 OPERATOR(pg_catalog.||) pg_catalog.format('ALTER %s %s OWNER TO %I', CASE r.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END, qn, pg_catalog.pg_get_userbyid(r.proowner));
+            v_fn2 := v_fn2 OPERATOR(pg_catalog.||) kingres.internal_acl_statements(CASE r.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END, qn, r.proacl, r.proowner);
+        END IF;
+        SELECT ds.description INTO v_cmt FROM pg_catalog.pg_description ds
+         WHERE ds.classoid OPERATOR(pg_catalog.=) 'pg_catalog.pg_proc'::pg_catalog.regclass AND ds.objoid OPERATOR(pg_catalog.=) r.oid AND ds.objsubid OPERATOR(pg_catalog.=) 0;
+        IF v_cmt IS NOT NULL THEN
+            stmt := pg_catalog.format('COMMENT ON %s %s IS %L', CASE r.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END, qn, v_cmt);
+            IF r.needs_rel THEN v_fn2 := v_fn2 OPERATOR(pg_catalog.||) stmt; ELSE v_fn1 := v_fn1 OPERATOR(pg_catalog.||) stmt; END IF;
+        END IF;
+    END LOOP;
+
+    -- tables: the tables that are not partitions first (a partitioned table carries its PARTITION BY), then the partitions, parents before children
+    FOR r IN
+        SELECT c2.oid, c2.relname, c2.relkind, c2.relispartition, c2.relreplident
+          FROM pg_catalog.pg_class c2
+         WHERE c2.relnamespace OPERATOR(pg_catalog.=) v_oid AND c2.relkind IN ('r', 'p')
+         ORDER BY c2.relispartition, c2.oid
+    LOOP
+        qn := pg_catalog.format('%I.%I', v_name, r.relname);
+        IF r.relispartition THEN
+            SELECT pg_catalog.format('%I.%I', pn.nspname, pc.relname) INTO v_parent
+              FROM pg_catalog.pg_inherits i
+              JOIN pg_catalog.pg_class pc ON pc.oid OPERATOR(pg_catalog.=) i.inhparent
+              JOIN pg_catalog.pg_namespace pn ON pn.oid OPERATOR(pg_catalog.=) pc.relnamespace
+             WHERE i.inhrelid OPERATOR(pg_catalog.=) r.oid;
+            stmt := pg_catalog.format('CREATE TABLE %s PARTITION OF %s %s', qn, v_parent,
+                        (SELECT pg_catalog.pg_get_expr(c3.relpartbound, c3.oid) FROM pg_catalog.pg_class c3 WHERE c3.oid OPERATOR(pg_catalog.=) r.oid));
+            IF r.relkind OPERATOR(pg_catalog.=) 'p' THEN
+                stmt := stmt OPERATOR(pg_catalog.||) ' PARTITION BY ' OPERATOR(pg_catalog.||) pg_catalog.pg_get_partkeydef(r.oid);
+            END IF;
+            v_tab := v_tab OPERATOR(pg_catalog.||) stmt;
+            FOR d IN SELECT * FROM kingres.internal_table_ddl(r.oid::pg_catalog.regclass, NULL) ORDER BY ord LOOP
+                IF (d.scope OPERATOR(pg_catalog.=) 'post' AND d.stmt NOT LIKE 'SELECT kingres.internal_advance_sequence%')
+                   OR (d.scope OPERATOR(pg_catalog.=) 'both' AND d.stmt LIKE 'ALTER TABLE % OWNER TO %') THEN
+                    v_tab := v_tab OPERATOR(pg_catalog.||) d.stmt;
+                END IF;
+            END LOOP;
+        ELSE
+            FOR d IN SELECT * FROM kingres.internal_table_ddl(r.oid::pg_catalog.regclass, NULL) ORDER BY ord LOOP
+                IF d.scope OPERATOR(pg_catalog.=) 'remote_pre' OR d.scope OPERATOR(pg_catalog.=) 'both' THEN
+                    stmt := d.stmt;
+                    IF r.relkind OPERATOR(pg_catalog.=) 'p' AND d.scope OPERATOR(pg_catalog.=) 'both' AND stmt LIKE 'CREATE TABLE %' THEN
+                        stmt := stmt OPERATOR(pg_catalog.||) ' PARTITION BY ' OPERATOR(pg_catalog.||) pg_catalog.pg_get_partkeydef(r.oid);
+                    END IF;
+                    v_tab := v_tab OPERATOR(pg_catalog.||) stmt;
+                ELSIF d.scope OPERATOR(pg_catalog.=) 'fk' THEN
+                    v_fk := v_fk OPERATOR(pg_catalog.||) d.stmt;
+                ELSIF d.scope OPERATOR(pg_catalog.=) 'post' AND d.stmt NOT LIKE 'SELECT kingres.internal_advance_sequence%' THEN
+                    v_tab := v_tab OPERATOR(pg_catalog.||) d.stmt;
+                END IF;
+            END LOOP;
+        END IF;
+        IF r.relreplident OPERATOR(pg_catalog.=) 'f' THEN
+            v_tab := v_tab OPERATOR(pg_catalog.||) pg_catalog.format('ALTER TABLE %s REPLICA IDENTITY FULL', qn);
+        ELSIF r.relreplident OPERATOR(pg_catalog.=) 'n' THEN
+            v_tab := v_tab OPERATOR(pg_catalog.||) pg_catalog.format('ALTER TABLE %s REPLICA IDENTITY NOTHING', qn);
+        ELSIF r.relreplident OPERATOR(pg_catalog.=) 'i' THEN
+            v_tab := v_tab OPERATOR(pg_catalog.||) pg_catalog.format('ALTER TABLE %s REPLICA IDENTITY USING INDEX %I', qn,
+                        (SELECT ic.relname FROM pg_catalog.pg_index ix JOIN pg_catalog.pg_class ic ON ic.oid OPERATOR(pg_catalog.=) ix.indexrelid
+                          WHERE ix.indrelid OPERATOR(pg_catalog.=) r.oid AND ix.indisreplident));
+        END IF;
+    END LOOP;
+
+    -- views, in the order they were made
+    FOR r IN
+        SELECT c2.oid, c2.relname, c2.relowner, c2.relacl, c2.reloptions
+          FROM pg_catalog.pg_class c2
+         WHERE c2.relnamespace OPERATOR(pg_catalog.=) v_oid AND c2.relkind OPERATOR(pg_catalog.=) 'v'
+         ORDER BY c2.oid
+    LOOP
+        qn := pg_catalog.format('%I.%I', v_name, r.relname);
+        v_views := v_views OPERATOR(pg_catalog.||) pg_catalog.format('CREATE VIEW %s%s AS %s', qn,
+                        CASE WHEN r.reloptions IS NOT NULL THEN ' WITH (' OPERATOR(pg_catalog.||) pg_catalog.array_to_string(r.reloptions, ', ') OPERATOR(pg_catalog.||) ')' ELSE '' END,
+                        pg_catalog.regexp_replace(pg_catalog.pg_get_viewdef(r.oid, true), ';\s*$', ''));
+        v_views := v_views OPERATOR(pg_catalog.||) pg_catalog.format('ALTER VIEW %s OWNER TO %I', qn, pg_catalog.pg_get_userbyid(r.relowner));
+        v_views := v_views OPERATOR(pg_catalog.||) kingres.internal_acl_statements('TABLE', qn, r.relacl, r.relowner);
+        SELECT ds.description INTO v_cmt FROM pg_catalog.pg_description ds
+         WHERE ds.classoid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass AND ds.objoid OPERATOR(pg_catalog.=) r.oid AND ds.objsubid OPERATOR(pg_catalog.=) 0;
+        IF v_cmt IS NOT NULL THEN
+            v_views := v_views OPERATOR(pg_catalog.||) pg_catalog.format('COMMENT ON VIEW %s IS %L', qn, v_cmt);
+        END IF;
+    END LOOP;
+
+    -- triggers (those that a partitioned table's trigger made on its partitions come with the parent)
+    FOR r IN
+        SELECT g.oid, g.tgname, g.tgenabled, c2.relname
+          FROM pg_catalog.pg_trigger g JOIN pg_catalog.pg_class c2 ON c2.oid OPERATOR(pg_catalog.=) g.tgrelid
+         WHERE c2.relnamespace OPERATOR(pg_catalog.=) v_oid AND NOT g.tgisinternal AND g.tgparentid OPERATOR(pg_catalog.=) 0
+         ORDER BY g.oid
+    LOOP
+        v_trg := v_trg OPERATOR(pg_catalog.||) pg_catalog.pg_get_triggerdef(r.oid, true);
+        IF r.tgenabled OPERATOR(pg_catalog.<>) 'O' THEN
+            v_trg := v_trg OPERATOR(pg_catalog.||) pg_catalog.format('ALTER TABLE %I.%I %s TRIGGER %I', v_name, r.relname,
+                        CASE r.tgenabled WHEN 'D' THEN 'DISABLE' WHEN 'A' THEN 'ENABLE ALWAYS' ELSE 'ENABLE REPLICA' END, r.tgname);
+        END IF;
+    END LOOP;
+
+    RETURN v_head OPERATOR(pg_catalog.||) v_types OPERATOR(pg_catalog.||) v_seqs OPERATOR(pg_catalog.||) v_fn1 OPERATOR(pg_catalog.||) v_tab
+           OPERATOR(pg_catalog.||) v_fk OPERATOR(pg_catalog.||) v_views OPERATOR(pg_catalog.||) v_fn2 OPERATOR(pg_catalog.||) v_trg
+           OPERATOR(pg_catalog.||) 'RESET check_function_bodies'::pg_catalog.text;
+END;
+$$;
+
+-- undistribute_schema(nsp) (design 8.2): the schema is local again.  The owner keeps its rows; every other node drops the shells (the schema
+-- and what is in it) and forgets the schema; nothing is propagated (routing off, the extension's own statement).  The shells must be empty
+-- and no move may be running; the check and the change are one two-phase transaction.
+CREATE FUNCTION kingres.undistribute_schema(nsp regnamespace)
+    RETURNS void
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+#variable_conflict use_variable
+DECLARE
+    v_name   pg_catalog.name;
+    v_coloc  pg_catalog.int4;
+    v_group  pg_catalog.int4;
+    v_state  pg_catalog.text;
+    v_self   pg_catalog.int4;
+    v_first  pg_catalog.text;
+    v_save   pg_catalog.text;
+    nd       pg_catalog.record;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    LOCK TABLE kingres.map_version IN EXCLUSIVE MODE;
+    PERFORM kingres.internal_require_map_group();
+    IF pg_catalog.current_setting('transaction_isolation') OPERATOR(pg_catalog.<>) 'read committed' THEN
+        RAISE EXCEPTION 'undistribute_schema must run in a READ COMMITTED transaction'
+            USING ERRCODE = 'invalid_transaction_state';
+    END IF;
+    SELECT ns.nspname INTO v_name FROM pg_catalog.pg_namespace ns WHERE ns.oid OPERATOR(pg_catalog.=) nsp::pg_catalog.oid;
+    SELECT s.colocation_id, b.group_id, b.state INTO v_coloc, v_group, v_state
+      FROM kingres.dist_schema s
+      JOIN kingres.bucket_map b ON b.colocation_id OPERATOR(pg_catalog.=) s.colocation_id AND b.bucket OPERATOR(pg_catalog.=) 0
+     WHERE s.nsp OPERATOR(pg_catalog.=) nsp;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'schema % is not a distributed schema', COALESCE(v_name::pg_catalog.text, nsp::pg_catalog.oid::pg_catalog.text)
+            USING ERRCODE = 'undefined_object';
+    END IF;
+    IF v_state OPERATOR(pg_catalog.<>) 'active'
+       OR EXISTS (SELECT 1 FROM kingres.bucket_move mv
+                   WHERE mv.colocation_id OPERATOR(pg_catalog.=) v_coloc AND mv.phase NOT IN ('done', 'failed', 'cancelled')) THEN
+        RAISE EXCEPTION 'schema "%" is being moved: wait for the move to end or cancel it', v_name
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    SELECT l.node_id INTO v_self FROM kingres.local_node l;
+    v_save := pg_catalog.current_setting('kingres_shard.enable_routing');
+
+    -- the shells hold no row
+    FOR nd IN SELECT n.node_id, n.group_id FROM kingres.node n
+               WHERE n.role OPERATOR(pg_catalog.=) 'primary' AND n.is_active AND n.group_id OPERATOR(pg_catalog.<>) v_group
+               ORDER BY n.node_id
+    LOOP
+        IF nd.node_id OPERATOR(pg_catalog.=) v_self THEN
+            v_first := kingres.internal_schema_shells(v_coloc, true);
+            PERFORM pg_catalog.set_config('kingres_shard.enable_routing', v_save, true);
+        ELSE
+            v_first := kingres.internal_branch_scalar(nd.node_id, pg_catalog.format('SELECT kingres.internal_schema_shells(%s, true)', v_coloc));
+        END IF;
+        IF v_first IS NOT NULL THEN
+            RAISE EXCEPTION 'table % of schema "%" holds rows on node %: the schema cannot be undistributed', v_first, v_name, nd.node_id
+                USING ERRCODE = 'object_not_in_prerequisite_state',
+                      HINT = 'A shell holds rows only when something wrote to it with the routing off; empty it, or move the rows, first.';
+        END IF;
+    END LOOP;
+
+    -- the change, node by node
+    FOR nd IN SELECT n.node_id, n.group_id FROM kingres.node n
+               WHERE n.role OPERATOR(pg_catalog.=) 'primary' AND n.is_active
+               ORDER BY n.node_id
+    LOOP
+        IF nd.node_id OPERATOR(pg_catalog.=) v_self THEN
+            PERFORM pg_catalog.set_config('kingres_shard.enable_routing', 'off', true);
+            PERFORM kingres.internal_unregister_schema(v_name);
+            IF nd.group_id OPERATOR(pg_catalog.<>) v_group THEN
+                EXECUTE pg_catalog.format('DROP SCHEMA %I CASCADE', v_name);
+            END IF;
+            PERFORM pg_catalog.set_config('kingres_shard.enable_routing', v_save, true);
+        ELSE
+            PERFORM kingres.internal_branch_exec(nd.node_id, 'SET LOCAL kingres_shard.enable_routing = off');
+            PERFORM kingres.internal_branch_exec(nd.node_id, pg_catalog.format('SELECT kingres.internal_unregister_schema(%L)', v_name));
+            IF nd.group_id OPERATOR(pg_catalog.<>) v_group THEN
+                PERFORM kingres.internal_branch_exec(nd.node_id, pg_catalog.format('DROP SCHEMA %I CASCADE', v_name));
+            END IF;
+        END IF;
+    END LOOP;
+END;
+$$;
+
+COMMENT ON FUNCTION kingres.internal_acl_statements(text, text, aclitem[], oid) IS
+    'The GRANT statements of an access control list';
+COMMENT ON FUNCTION kingres.internal_schema_structure(regnamespace) IS
+    'The statements that make the structure of a schema on an empty schema of another node (types, sequences, functions, tables, partitions, keys, views, triggers, owners, privileges, comments)';
+COMMENT ON FUNCTION kingres.undistribute_schema(regnamespace) IS
+    'Make a distributed schema local again: the owner keeps the rows, the other nodes drop their empty shells (map group primary only)';
+
+REVOKE ALL ON FUNCTION
+    kingres.internal_acl_statements(text, text, aclitem[], oid),
+    kingres.internal_schema_structure(regnamespace),
+    kingres.undistribute_schema(regnamespace)
+    FROM PUBLIC;
+
+-- =========================================================================
+-- PHASE 11, increment 6                                                      [end]
 -- =========================================================================
 
 -- ===========================================================================

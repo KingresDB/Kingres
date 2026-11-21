@@ -618,6 +618,38 @@ wrap_insert_source(Query *query)
  * schema-qualify every relation, function and type.  The remote session runs
  * under the same settings.
  */
+/*
+ * insert_target_has_identity_always
+ *
+ * The rewriter put the default of a GENERATED ALWAYS identity column into the target list of an INSERT that did
+ * not name it, and the deparser prints that default as nextval('sequence').  The node that gets the text takes it
+ * for a value the user wrote, and refuses it unless the INSERT says OVERRIDING SYSTEM VALUE.
+ */
+static bool
+insert_target_has_identity_always(Query *query)
+{
+	RangeTblEntry *rte;
+	Relation	rel;
+	bool		found = false;
+
+	if (query->resultRelation <= 0)
+		return false;
+	rte = rt_fetch(query->resultRelation, query->rtable);
+	if (rte->rtekind != RTE_RELATION)
+		return false;
+	rel = table_open(rte->relid, NoLock);
+	for (int i = 0; i < rel->rd_att->natts; i++)
+	{
+		if (TupleDescAttr(rel->rd_att, i)->attidentity == ATTRIBUTE_IDENTITY_ALWAYS)
+		{
+			found = true;
+			break;
+		}
+	}
+	table_close(rel, NoLock);
+	return found;
+}
+
 static char *
 deparse_for_remote(Query *query)
 {
@@ -625,7 +657,11 @@ deparse_for_remote(Query *query)
 	char	   *sql;
 
 	if (query->commandType == CMD_INSERT)
+	{
+		if (query->override == OVERRIDING_NOT_SET && insert_target_has_identity_always(query))
+			query->override = OVERRIDING_SYSTEM_VALUE;
 		query = wrap_insert_source(query);
+	}
 	sql = pg_get_querydef(query, false);
 	kingres_shard_reset_transmission_modes(nest);
 	return sql;

@@ -1955,6 +1955,29 @@ the cleaning phase after `move_cleanup_delay` (`cleanup_moved_buckets(true)` at 
 again), resume and cancel work as for a bucket.  A schema without a table is not moved by a copy.  A plan of buckets (`plan_rebalance`, `rebalance_plan`) does not move a schema
 yet; the bucket of a schema counts in the load of its group.
 
+**Increment 6: a schema with data becomes distributed, `kingres.undistribute_schema(nsp)`, several schemas on one group.**  `kingres.distribute_schema(nsp, group_id)` also takes a schema that already
+has objects and rows (superuser, map group primary, READ COMMITTED).  The node that runs it keeps the rows and its group becomes the owner; a `group_id` of another group is refused while a table holds a row
+(the hint says: distribute in place, then `move_schema`), and any group is allowed while no table holds a row (the tables of this node become shells).  `kingres.schema_inventory(nsp)` is consulted first:
+what the structure generator does not make (a materialized view, a foreign table, a rule, row-level security, extended statistics, an aggregate, a range or base type, an unlogged table, a publication, an
+operator, a collation, an operator class or family, a text search object, a conversion, table inheritance outside partitioning) is refused with the object and the reason.  The tables are locked in
+SHARE ROW EXCLUSIVE (writers wait, readers go on) until the conversion commits.  `kingres.internal_schema_structure(nsp)` makes the statements of the structure: types (enum, domain, composite), sequences, functions
+that do not name a table's row type (with `check_function_bodies` off), tables with columns, identity and generated columns, defaults, keys, checks, indexes and storage options (the generator of the rebuild),
+partitioned tables and their partitions, foreign keys, views (with their options), the functions that return a table's row type, triggers (and their enabled state), the replica identity, owners, privileges
+(schema, type, sequence, function, table, view; the grantor's own role when it is not the owner) and comments.  Every other node runs them in one two-phase transaction with the creation of the schema, the
+registration of the schema and of every table, and the fingerprint of every table is compared with the owner's down the same connection: a structure that the statements did not reproduce (for example an index of a
+partition that has a name of its own) rolls the whole conversion back.  A node that cannot run a statement (a role that is missing there) rolls it back too; nothing is left on any node.  Default privileges
+(`ALTER DEFAULT PRIVILEGES`), event triggers and a column-level comment of a view are not carried.
+
+`kingres.undistribute_schema(nsp)` (superuser, map group primary) is the way back: the shells on every other node must be empty (a row in one is named and refuses, the hint says how it can happen) and no
+move of the schema may be running; the owner keeps its schema and its rows as a local schema, every other node drops its shells (`DROP SCHEMA ... CASCADE` with the routing off: nothing is propagated) and every node
+forgets the schema, its tables, its bucket and its colocation group, in one two-phase transaction.
+
+Several schemas may be held by one group (`schema_placement_group`, or the least loaded group at the time): a statement on tables of schemas of one owner is one closed statement on the owner, a read that mixes
+owners is read through the scan, a write that mixes owners is refused; a prepared statement is planned again when one of its schemas moves; a node with a stale map gets `KS001`.  Two details that the tests found
+and that changed other code: path S now sends `OVERRIDING SYSTEM VALUE` for an INSERT into a table with a GENERATED ALWAYS identity column (the deparsed text carries the default as `nextval()`, which the owner took for a value
+the user wrote); `ALTER TYPE ... OWNER TO` was classified through the wrong node type (an assertion failure in a build with assertions); the catalog document no longer holds the creation time of a schema (every node stamps its own,
+so the catalogs of the nodes looked different to `check_cluster`).
+
 
 ## Limitations in phase 2a
 

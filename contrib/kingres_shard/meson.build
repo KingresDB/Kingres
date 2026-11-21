@@ -299,6 +299,8 @@ tests += {
       't/235_schema_route_cluster.pl',
       't/236_schema_with_elasticity_cluster.pl',
       't/237_move_schema_cluster.pl',
+      't/238_schema_convert_cluster.pl',
+      't/239_schema_same_group_cluster.pl',
     ],
   },
 }

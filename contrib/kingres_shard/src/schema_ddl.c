@@ -212,6 +212,9 @@ object_ns(ObjectType objtype, Node *object)
 
 	if (object == NULL)
 		return InvalidOid;
+	/* ALTER TYPE ... OWNER TO and ALTER DOMAIN ... OWNER TO carry the type as a list of names, not as a TypeName */
+	if ((objtype == OBJECT_TYPE || objtype == OBJECT_DOMAIN) && IsA(object, List))
+		return typename_ns((List *) object);
 	addr = get_object_address(objtype, object, &rel, AccessShareLock, true);
 	if (OidIsValid(addr.objectId))
 	{

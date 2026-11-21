@@ -103,16 +103,15 @@ for my $case (
 	isnt($rc, 0, "refused: $case->[0]");
 	like($err, $case->[2], "... the message: $case->[0]") or diag($err);
 }
-q1($n1, q{CREATE SCHEMA full1; CREATE TABLE full1.t (id int)});
+q1($n1, q{CREATE SCHEMA full1; CREATE TABLE full1.t (id int); CREATE MATERIALIZED VIEW full1.mv AS SELECT 1 AS x});
 {
 	my ($rc, $out, $err) = run_sql($n1, q{SELECT kingres.distribute_schema('full1')});
-	isnt($rc, 0, 'a schema with a table is refused');
-	like($err, qr/holds objects.*not supported yet/, '... the message says the conversion is a later step') or diag($err);
-	like($err, qr/The first object is relation t/, '... and names the first object') or diag($err);
+	isnt($rc, 0, 'a schema with a materialized view is refused');
+	like($err, qr/cannot be distributed: materialized view full1.mv/, '... the message names the object') or diag($err);
 	q1($n1, q{DROP SCHEMA full1 CASCADE});
-	q1($n1, q{CREATE SCHEMA full2; CREATE FUNCTION full2.f() RETURNS int LANGUAGE sql AS 'SELECT 1'});
+	q1($n1, q{CREATE SCHEMA full2; CREATE AGGREGATE full2.ag(int) (sfunc = int4pl, stype = int)});
 	($rc, $out, $err) = run_sql($n1, q{SELECT kingres.distribute_schema('full2')});
-	like($err, qr/The first object is function f/, 'a function counts as an object') or diag($err);
+	like($err, qr/cannot be distributed: aggregate full2.ag/, 'an aggregate is refused') or diag($err);
 	q1($n1, q{DROP SCHEMA full2 CASCADE});
 }
 {
