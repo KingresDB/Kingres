@@ -595,6 +595,130 @@ SELECT kingres.timepart__special_table(:sr_oid, :sra_oid) IS NULL AS superuser_g
 (1 row)
 
 ------------------------------------------------------------------------
+-- 12. A check that is NOT ENFORCED (PostgreSQL 18 and later) is carried
+--     as it is, in both directions; it is not refused as NOT VALID
+------------------------------------------------------------------------
+CREATE TABLE tpw.ne (id int, ts timestamptz NOT NULL, note text) PARTITION BY RANGE (ts);
+CREATE TABLE tpw.ne_a PARTITION OF tpw.ne FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+INSERT INTO tpw.ne SELECT i, '2026-01-05 UTC', 'n' || i FROM generate_series(1, 100) i;
+ALTER TABLE tpw.ne_a ADD CONSTRAINT ne_chk CHECK (id < 5) NOT ENFORCED;
+CALL kingres.convert_partition('tpw.ne', 'tpw.ne_a');
+SELECT part, am FROM tpw.methods('tpw.ne');
+ part |    am    
+------+----------
+ ne_a | columnar
+(1 row)
+
+SELECT conname, convalidated, conenforced FROM pg_constraint
+ WHERE conrelid = 'tpw.ne_a'::regclass AND contype = 'c';
+ conname | convalidated | conenforced 
+---------+--------------+-------------
+ ne_chk  | f            | f
+(1 row)
+
+CALL kingres.convert_partition('tpw.ne', 'tpw.ne_a', 'heap');
+SELECT part, am FROM tpw.methods('tpw.ne');
+ part |  am  
+------+------
+ ne_a | heap
+(1 row)
+
+SELECT conname, convalidated, conenforced FROM pg_constraint
+ WHERE conrelid = 'tpw.ne_a'::regclass AND contype = 'c';
+ conname | convalidated | conenforced 
+---------+--------------+-------------
+ ne_chk  | f            | f
+(1 row)
+
+SELECT count(*) FROM tpw.ne;
+ count 
+-------
+   100
+(1 row)
+
+-- a check that is enforced and not valid is still refused
+ALTER TABLE tpw.ne_a ADD CONSTRAINT ne_nv CHECK (id < 500) NOT VALID;
+CALL kingres.convert_partition('tpw.ne', 'tpw.ne_a');
+ERROR:  conversion_refused: tpw.ne_a has the constraint "ne_nv" that is not validated (NOT VALID): the new table would have it validated, and a row that violates it would fail the copy
+ALTER TABLE tpw.ne_a DROP CONSTRAINT ne_nv;
+------------------------------------------------------------------------
+-- 13. A default partition that is itself partitioned is measured by its
+--     leaves
+------------------------------------------------------------------------
+CREATE TABLE tpw.sd (id int, ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+CREATE TABLE tpw.sd_a PARTITION OF tpw.sd FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+CREATE TABLE tpw.sd_d PARTITION OF tpw.sd DEFAULT PARTITION BY HASH (id);
+CREATE TABLE tpw.sd_d0 PARTITION OF tpw.sd_d FOR VALUES WITH (MODULUS 1, REMAINDER 0);
+INSERT INTO tpw.sd VALUES (1, '2026-01-05 UTC'), (2, '2027-01-05 UTC'), (3, '2027-01-06 UTC');
+SET kingres_timepart.convert_default_max_mb = 0;
+CALL kingres.convert_partition('tpw.sd', 'tpw.sd_a');
+ERROR:  conversion_refused: the default partition tpw.sd_d of 8192 bytes of tpw.sd would be scanned by the attach under ACCESS EXCLUSIVE on the table (kingres_timepart.convert_default_max_mb is 0)
+RESET kingres_timepart.convert_default_max_mb;
+SELECT part, am FROM tpw.methods('tpw.sd');
+ part |  am  
+------+------
+ sd_a | heap
+(1 row)
+
+CALL kingres.convert_partition('tpw.sd', 'tpw.sd_a');
+SELECT part, am FROM tpw.methods('tpw.sd');
+ part |    am    
+------+----------
+ sd_a | columnar
+(1 row)
+
+------------------------------------------------------------------------
+-- 14. A partition dropped between the plan and the block that locks it is a
+--     schema_changed, not a syntax error (the numbers of OIDs are masked)
+------------------------------------------------------------------------
+CREATE FUNCTION tpw.err_of(stmt text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    EXECUTE stmt;
+    RETURN 'no error';
+EXCEPTION WHEN OTHERS THEN
+    RETURN SQLSTATE || ' ' || regexp_replace(SQLERRM, '[0-9]+', 'N', 'g');
+END $$;
+CREATE TABLE tpw.dr (id int, ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+CREATE TABLE tpw.dr_a PARTITION OF tpw.dr FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+INSERT INTO tpw.dr VALUES (1, '2026-01-05 UTC');
+SELECT (kingres.timepart__convert_stmts('tpw.dr'::regclass::oid, 'tpw.dr_a'::regclass::oid,
+                                        'columnar'::name, NULL, NULL))[1] AS stmt \gset
+DROP TABLE tpw.dr_a;
+SELECT tpw.err_of(:'stmt');
+                                                          err_of                                                          
+--------------------------------------------------------------------------------------------------------------------------
+ 55P03 schema_changed: the partition with OID N was dropped before the conversion could lock it; the next run tries again
+(1 row)
+
+------------------------------------------------------------------------
+-- 15. The helper that knows about ledger and distributed tables is tied to the
+--     table: a table that is not a partition of it gets no answer, though the
+--     private catalog names it
+------------------------------------------------------------------------
+CREATE TABLE tpw.sp (id int, ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+CREATE TABLE tpw.sp_a PARTITION OF tpw.sp FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+CREATE TABLE tpw.sp_x (id int);
+ALTER TABLE tpw.sp OWNER TO tpw_owner;
+ALTER TABLE tpw.sp_a OWNER TO tpw_owner;
+CREATE TABLE kingres.dist_table (relid regclass);
+INSERT INTO kingres.dist_table VALUES ('tpw.sp_x'), ('tpw.sp_a');
+SELECT 'tpw.sp'::regclass::oid AS sp_oid, 'tpw.sp_a'::regclass::oid AS spa_oid, 'tpw.sp_x'::regclass::oid AS spx_oid \gset
+SET SESSION AUTHORIZATION tpw_owner;
+SELECT kingres.timepart__special_table(:sp_oid, :spx_oid) IS NULL AS other_table_gets_null;
+ other_table_gets_null 
+-----------------------
+ t
+(1 row)
+
+SELECT kingres.timepart__special_table(:sp_oid, :spa_oid) AS own_partition;
+ own_partition 
+---------------
+ distributed
+(1 row)
+
+RESET SESSION AUTHORIZATION;
+DROP TABLE kingres.dist_table;
+------------------------------------------------------------------------
 -- Clean up
 ------------------------------------------------------------------------
 SET client_min_messages = warning;

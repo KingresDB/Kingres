@@ -49,6 +49,7 @@
 #include "kingres_shard.h"
 #include "node_conn.h"
 #include "placement_check.h"
+#include "shippable.h"
 
 static int
 oid_cmp_for_sort(const void *a, const void *b)
@@ -92,6 +93,22 @@ kingres_shard_placement_check_plan(int colocation_id, int64 plan_placement)
 }
 
 /*
+ * The next item of the list "name:version[,name:version...]" of a probe (the one place that splits it; the list was
+ * checked by kingres_shard_ext_list_check, so no name has a ':' or a ','): the name and its length, and the rest of the
+ * list, NULL at the end.
+ */
+static const char *
+ext_item_next(const char *item, const char **name, size_t *namelen)
+{
+	const char *colon = strchr(item, ':');
+	const char *comma = strchr(item, ',');
+
+	*name = item;
+	*namelen = (size_t) (colon - item);
+	return comma != NULL ? comma + 1 : NULL;
+}
+
+/*
  * The question asked of every node before its cursor is opened: with the
  * parents named, so that the answer also makes the node's relcache entry of
  * each parent at least as new as the answer (kingres.internal_placement_hash).
@@ -119,17 +136,18 @@ kingres_shard_probe_before_sql(int colocation_id, int ntables, const Oid *relids
 	{
 		/* the extensions of the statement that the node has, "name:version" each: decided by the catalog of the node, not by the error of a parse (review P2F-01) */
 		const char *p = ext;
+		bool		first = true;
 
+		kingres_shard_ext_list_check(ext);
 		appendStringInfoString(&sql, ", (SELECT pg_catalog.string_agg(extname || ':' || extversion, ',' ORDER BY extname) FROM pg_catalog.pg_extension WHERE extname IN (");
-		while (*p)
+		while (p != NULL)
 		{
-			const char *colon = strchr(p, ':');
-			const char *comma = strchr(p, ',');
-			size_t		n = (colon != NULL && (comma == NULL || colon < comma)) ? (size_t) (colon - p) : (comma != NULL ? (size_t) (comma - p) : strlen(p));
-			char	   *name = pnstrdup(p, n);
+			const char *name;
+			size_t		n;
 
-			appendStringInfo(&sql, "%s%s", p == ext ? "" : ", ", quote_literal_cstr(name));
-			p = comma != NULL ? comma + 1 : p + strlen(p);
+			p = ext_item_next(p, &name, &n);
+			appendStringInfo(&sql, "%s%s", first ? "" : ", ", quote_literal_cstr(pnstrdup(name, n)));
+			first = false;
 		}
 		appendStringInfoString(&sql, "))");
 	}
@@ -251,20 +269,21 @@ kingres_shard_probe_read_before(KsConn *kc, PGresult *res, int ntables,
 		const char *have = PQgetisnull(res, 0, ncols - 1) ? "" : PQgetvalue(res, 0, ncols - 1);
 		const char *p = ext;
 
-		while (*p)
+		kingres_shard_ext_list_check(ext);
+		while (p != NULL)
 		{
-			const char *colon = strchr(p, ':');
-			const char *comma = strchr(p, ',');
-			size_t		n = (colon != NULL && (comma == NULL || colon < comma)) ? (size_t) (colon - p) : (comma != NULL ? (size_t) (comma - p) : strlen(p));
+			const char *pn;
+			size_t		n;
 			bool		found = false;
 			const char *q = have;
 
+			p = ext_item_next(p, &pn, &n);
 			while (*q)
 			{
 				const char *qc = strchr(q, ',');
 				size_t		ql = qc != NULL ? (size_t) (qc - q) : strlen(q);
 
-				if (ql > n && strncmp(q, p, n) == 0 && q[n] == ':')
+				if (ql > n && strncmp(q, pn, n) == 0 && q[n] == ':')
 					found = true;
 				q = qc != NULL ? qc + 1 : q + ql;
 			}
@@ -278,11 +297,10 @@ kingres_shard_probe_read_before(KsConn *kc, PGresult *res, int ntables,
 				ereport(ERROR,
 						(errcode(ERRCODE_KINGRES_STALE_MAP),
 						 errmsg("node %s:%d does not have an extension that the statement uses (%s)", host, port, names),
-						 errdetail("The extension %.*s is not installed in the database of that node.", (int) n, p),
+						 errdetail("The extension %.*s is not installed in the database of that node.", (int) n, pn),
 						 errhint("A repeat does not help until the extension is installed at the same version on every node; "
 								 "SET kingres_shard.shippable_extensions = 'none' reads the rows and runs the extension's functions here.")));
 			}
-			p = comma != NULL ? comma + 1 : p + strlen(p);
 		}
 	}
 
