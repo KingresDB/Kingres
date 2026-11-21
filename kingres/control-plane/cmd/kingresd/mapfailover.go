@@ -59,6 +59,13 @@ type mapFailover struct {
 	journal *journal.Store
 	runner  *mapgroup.Runner
 
+	// releaseFence lets go of the fence and holder lease that the bootstrap of this server holds for the map group; tellOldLeader tells the old leader of a planned
+	// switchover that its switchover is refused (its task rolls back). They are fields so that a test can see them called.
+	releaseFence  func(ctx context.Context) error
+	tellOldLeader func(ctx context.Context, oldServer string, taskID int64, reason string) error
+	// candidateCheck says whether a server hosts a ready standby of the map group (nil: read from the catalog of this server).
+	candidateCheck func(ctx context.Context, server string) bool
+
 	mu      sync.Mutex
 	running bool
 	lastErr string
@@ -71,6 +78,13 @@ func newMapFailover(dataDir string, svc *cluster.Service, self string, log *slog
 		return nil, err
 	}
 	m := &mapFailover{svc: svc, self: self, log: log, fd: fd, peers: peers, cat: cat, pl: pl, rr: rr, journal: js}
+	m.releaseFence = func(ctx context.Context) error {
+		_, err := m.peers.Lease(ctx, m.self, failover.LeaseRequest{Group: 0, Role: failover.LeaseRelease})
+		return err
+	}
+	m.tellOldLeader = func(ctx context.Context, oldServer string, taskID int64, reason string) error {
+		return m.peers.do(ctx, oldServer, http.MethodPost, "/failover/map/refused", mapRefusedBody{Reason: reason, TaskID: taskID}, nil)
+	}
 	m.runner = &mapgroup.Runner{P: &mapPorts{m: m}, Journal: js, Fault: faultErr,
 		Log: func(f string, a ...any) { log.Info(fmt.Sprintf(f, a...)) }}
 	return m, nil
@@ -684,10 +698,11 @@ type mapAbandonAnswer struct {
 
 // abandonLocal gives up the bootstrap in progress on this server; false when none is. A bootstrap that promoted the standby cannot be given
 // up (409): the promoted instance holds the lease and the bootstrap goes on to its end.
-func (m *mapFailover) abandonLocal(reason string) (bool, error) {
+func (m *mapFailover) abandonLocal(ctx context.Context, reason string) (bool, error) {
 	if !m.journal.Active() {
 		return false, nil
 	}
+	cur, _ := m.journal.Current()
 	if err := m.journal.Abandon(reason); err != nil {
 		if errors.Is(err, journal.ErrPromoted) {
 			return false, problem.New(problem.Conflict, "The bootstrap of the map group already promoted its standby; it cannot be given up, and goes on to its end.")
@@ -695,6 +710,18 @@ func (m *mapFailover) abandonLocal(reason string) (bool, error) {
 		return false, err
 	}
 	m.log.Warn("the bootstrap of the map group was given up", "reason", reason)
+	// What the bootstrap holds goes with it (F5-02): the fence and holder lease would otherwise be renewed for a bootstrap that no longer runs, and an old primary
+	// that is stopped could not win its lease again. A planned switchover also tells the old leader, whose task rolls back (F5-08).
+	if m.releaseFence != nil {
+		if err := m.releaseFence(ctx); err != nil {
+			m.log.Warn("letting go of the lease of the map group after giving the bootstrap up", "error", err)
+		}
+	}
+	if cur.Planned != nil && m.tellOldLeader != nil {
+		if err := m.tellOldLeader(ctx, cur.OldServer, cur.Planned.TaskID, reason); err != nil {
+			m.log.Warn("telling the old leader that its switchover of the map group was given up", "error", err)
+		}
+	}
 	return true, nil
 }
 
@@ -703,7 +730,7 @@ func (m *mapFailover) abandonLocal(reason string) (bool, error) {
 // this server can ask.
 func (m *mapFailover) Abandon(ctx context.Context, actor, reason string) (bool, error) {
 	reason = "given up by " + actor + ": " + reason
-	if ok, err := m.abandonLocal(reason); ok || err != nil {
+	if ok, err := m.abandonLocal(ctx, reason); ok || err != nil {
 		return ok, err
 	}
 	members, err := (&mapPorts{m: m}).Members(ctx)
@@ -736,7 +763,7 @@ func (m *mapFailover) Abandon(ctx context.Context, actor, reason string) (bool, 
 }
 
 // handleMapAbandon is the call of a server that was asked to give up the bootstrap: it acts on its own journal only.
-func handleMapAbandon(_ context.Context, d *haDeps, _ string, body []byte) (any, error) {
+func handleMapAbandon(ctx context.Context, d *haDeps, caller string, body []byte) (any, error) {
 	mf := d.MapFailover
 	if mf == nil {
 		return nil, notStarted
@@ -745,7 +772,14 @@ func handleMapAbandon(_ context.Context, d *haDeps, _ string, body []byte) (any,
 	if err := json.Unmarshal(body, &b); err != nil || b.Reason == "" || len(b.Reason) > 600 {
 		return nil, badBody("a reason")
 	}
-	ok, err := mf.abandonLocal(b.Reason)
+	// The bootstrap of a planned switchover is given up by the old leader or by a server that hosts a standby of the map group; an ordinary bootstrap by the
+	// server that received the operator's call (F4-06: it may be any server, the leader is the one that is gone) (F5-08).
+	if cur, active := mf.journal.Current(); active && mf.journal.Active() && cur.Planned != nil && caller != cur.OldServer && caller != mf.self {
+		if !mf.isCandidateServer(ctx, caller) {
+			return nil, &internalapi.CallError{Status: http.StatusForbidden, Code: "forbidden", Message: "Only the old leader or a server that hosts a standby of the map group gives up a planned switchover."}
+		}
+	}
+	ok, err := mf.abandonLocal(ctx, b.Reason)
 	if err != nil {
 		var p *problem.Problem
 		if errors.As(err, &p) {
@@ -890,6 +924,8 @@ const callMapRefused = "POST /failover/map/refused"
 
 type mapRefusedBody struct {
 	Reason string `json:"reason"`
+	// TaskID is the task of the old leader that asked for the bootstrap: a refusal of another task is not this task's (F5-09).
+	TaskID int64 `json:"taskId"`
 }
 
 // plannedBox is what the old leader's server remembers of the planned switchover its own task is running: the server of the candidate that it asked to
@@ -979,4 +1015,13 @@ func (p *mapPorts) PullProof(ctx context.Context, oldServer string) (string, str
 		return "", "", err
 	}
 	return out.Checkpoint, out.ClusterState, nil
+}
+
+// isCandidateServer says whether server hosts a ready standby of the map group.
+func (m *mapFailover) isCandidateServer(ctx context.Context, server string) bool {
+	if m.candidateCheck != nil {
+		return m.candidateCheck(ctx, server)
+	}
+	ok, _ := (&mapPorts{m: m}).isCandidate(ctx, server)
+	return ok
 }

@@ -89,10 +89,7 @@ func (mm *mapMonitor) step(ctx context.Context) bool {
 		if !ok || err != nil {
 			return false
 		}
-		if stuck, why := journal.Stuck(cur, term, time.Now(), mapAbandonAfter); stuck {
-			m.log.Warn("the bootstrap of the map group is given up", "reason", why)
-			_ = m.journal.Abandon(why)
-		}
+		m.abandonIfStuck(ctx, cur, term, time.Now())
 		if m.journal.Active() {
 			return false
 		}
@@ -156,4 +153,16 @@ func (mm *mapMonitor) step(ctx context.Context) bool {
 	}
 	mm.since = time.Time{}
 	return true
+}
+
+// abandonIfStuck gives up the bootstrap in progress when it did not reach the promotion and is older than mapAbandonAfter or of a term that the catalog
+// has left behind, and lets go of what it holds (F5-02).
+func (m *mapFailover) abandonIfStuck(ctx context.Context, cur journal.Journal, catalogTerm int64, now time.Time) bool {
+	stuck, why := journal.Stuck(cur, catalogTerm, now, mapAbandonAfter)
+	if !stuck {
+		return false
+	}
+	m.log.Warn("the bootstrap of the map group is given up", "reason", why)
+	ok, _ := m.abandonLocal(ctx, why)
+	return ok
 }

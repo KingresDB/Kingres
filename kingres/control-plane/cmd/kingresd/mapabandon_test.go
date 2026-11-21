@@ -3,10 +3,13 @@
 package main
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover/journal"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
@@ -28,14 +31,14 @@ func TestABootstrapThatDidNotPromoteCanBeGivenUp(t *testing.T) {
 	if _, err := js.Begin("b1", "s1", 3, "manual", "alice", false); err != nil {
 		t.Fatal(err)
 	}
-	ok, err := m.abandonLocal("stuck")
+	ok, err := m.abandonLocal(context.Background(), "stuck")
 	if err != nil || !ok {
 		t.Fatalf("abandon: %v %v", ok, err)
 	}
 	if js.Active() {
 		t.Fatal("the bootstrap is still in progress")
 	}
-	if ok, err := m.abandonLocal("again"); ok || err != nil {
+	if ok, err := m.abandonLocal(context.Background(), "again"); ok || err != nil {
 		t.Fatalf("a second call: %v %v", ok, err)
 	}
 }
@@ -49,7 +52,7 @@ func TestABootstrapThatPromotedCannotBeGivenUp(t *testing.T) {
 	if err := js.Done(journal.StepPromote); err != nil {
 		t.Fatal(err)
 	}
-	ok, err := m.abandonLocal("stuck")
+	ok, err := m.abandonLocal(context.Background(), "stuck")
 	var p *problem.Problem
 	if ok || !errors.As(err, &p) || p.Code != problem.Conflict {
 		t.Fatalf("abandon after the promotion: %v %v", ok, err)
@@ -62,7 +65,113 @@ func TestABootstrapThatPromotedCannotBeGivenUp(t *testing.T) {
 // Nothing in progress: false, no error.
 func TestNothingToGiveUp(t *testing.T) {
 	m, _ := abandonRig(t)
-	if ok, err := m.abandonLocal("x"); ok || err != nil {
+	if ok, err := m.abandonLocal(context.Background(), "x"); ok || err != nil {
 		t.Fatalf("%v %v", ok, err)
+	}
+}
+
+type abandonSeen struct {
+	released int
+	told     []string
+}
+
+func abandonWatch(m *mapFailover) *abandonSeen {
+	s := &abandonSeen{}
+	m.releaseFence = func(context.Context) error { s.released++; return nil }
+	m.tellOldLeader = func(_ context.Context, old string, task int64, _ string) error {
+		s.told = append(s.told, fmt.Sprintf("%s/%d", old, task))
+		return nil
+	}
+	return s
+}
+
+// F5-02. A bootstrap that is given up lets go of the fence and holder lease it holds: an old primary that is stopped must be able to win its lease again.
+func TestAnAbandonedBootstrapLetsGoOfItsLease(t *testing.T) {
+	m, js := abandonRig(t)
+	seen := abandonWatch(m)
+	if _, err := js.Begin("b1", "s1", 3, "manual", "alice", false); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := m.abandonLocal(context.Background(), "stuck"); err != nil || !ok {
+		t.Fatalf("%v %v", ok, err)
+	}
+	if seen.released != 1 || len(seen.told) != 0 {
+		t.Fatalf("released %d, told %v", seen.released, seen.told)
+	}
+	// nothing to give up: nothing released
+	if ok, _ := m.abandonLocal(context.Background(), "again"); ok || seen.released != 1 {
+		t.Fatalf("a second call released again: %v %d", ok, seen.released)
+	}
+}
+
+// A bootstrap that promoted keeps its lease.
+func TestABootstrapThatPromotedKeepsItsLease(t *testing.T) {
+	m, js := abandonRig(t)
+	seen := abandonWatch(m)
+	_, _ = js.Begin("b1", "s1", 3, "manual", "alice", false)
+	_ = js.Done(journal.StepPromote)
+	if _, err := m.abandonLocal(context.Background(), "x"); err == nil || seen.released != 0 {
+		t.Fatalf("%v released %d", err, seen.released)
+	}
+}
+
+// F5-08. A planned bootstrap that is given up also tells the old leader, whose task rolls back.
+func TestAGivenUpPlannedBootstrapTellsTheOldLeader(t *testing.T) {
+	m, js := abandonRig(t)
+	seen := abandonWatch(m)
+	_, _ = js.Begin("b1", "s1", 3, "manual", "alice", false)
+	_, _ = js.SetPlanned(journal.Planned{TaskID: 42, StandbyID: 3})
+	if ok, err := m.abandonLocal(context.Background(), "operator"); err != nil || !ok {
+		t.Fatalf("%v %v", ok, err)
+	}
+	if seen.released != 1 || len(seen.told) != 1 || seen.told[0] != "s1/42" {
+		t.Fatalf("released %d, told %v", seen.released, seen.told)
+	}
+}
+
+// F5-08. The call between servers: a planned bootstrap is given up by the old leader or a standby's server, not by any member.
+func TestOnlyTheOldLeaderOrACandidateGivesUpAPlannedBootstrap(t *testing.T) {
+	m, js := abandonRig(t)
+	abandonWatch(m)
+	m.candidateCheck = func(_ context.Context, s string) bool { return s == "s3" }
+	_, _ = js.Begin("b1", "s1", 3, "manual", "alice", false)
+	_, _ = js.SetPlanned(journal.Planned{TaskID: 42, StandbyID: 3})
+	d := &haDeps{MapFailover: m}
+	body := []byte(`{"reason":"x"}`)
+	_, err := handleMapAbandon(context.Background(), d, "s9", body)
+	callErr(t, err, 403, "forbidden")
+	if !js.Active() {
+		t.Fatal("a member that is not the old leader gave the bootstrap up")
+	}
+	out, err := handleMapAbandon(context.Background(), d, "s1", body)
+	if err != nil || out.(mapAbandonAnswer).Abandoned != true {
+		t.Fatalf("the old leader: %v %v", out, err)
+	}
+}
+
+func TestAStandbysServerMayGiveUpAPlannedBootstrap(t *testing.T) {
+	m, js := abandonRig(t)
+	abandonWatch(m)
+	m.candidateCheck = func(_ context.Context, s string) bool { return s == "s3" }
+	_, _ = js.Begin("b1", "s1", 3, "manual", "alice", false)
+	_, _ = js.SetPlanned(journal.Planned{TaskID: 42, StandbyID: 3})
+	if _, err := handleMapAbandon(context.Background(), &haDeps{MapFailover: m}, "s3", []byte(`{"reason":"x"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if js.Active() {
+		t.Fatal("not given up")
+	}
+}
+
+// F5-02. The monitor gives up a bootstrap that is stuck (older than the bound, or of a term the catalog has left) and lets go of its lease with it.
+func TestTheMonitorLetsGoOfTheLeaseOfAStuckBootstrap(t *testing.T) {
+	m, js := abandonRig(t)
+	seen := abandonWatch(m)
+	cur, _ := js.Begin("b1", "s1", 3, "automatic", "system", false)
+	if m.abandonIfStuck(context.Background(), cur, 3, cur.StartedAt.Add(time.Minute)) {
+		t.Fatal("a young bootstrap was given up")
+	}
+	if !m.abandonIfStuck(context.Background(), cur, 3, cur.StartedAt.Add(mapAbandonAfter+time.Minute)) || seen.released != 1 {
+		t.Fatalf("an old bootstrap: released %d", seen.released)
 	}
 }
