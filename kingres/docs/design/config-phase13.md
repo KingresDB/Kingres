@@ -801,7 +801,7 @@ above with the code and the tests. Everything else was built and tested; what wa
 | The preview warns that `max_connections` would not exceed the reserved connections ("Validation") | Not built: the preview had no place for a warning on a valid request | `warnings` added to `ConfigChangePreview` (contract 0.17.0, additive), code `config_reserved_connections`; `pgconfig/warnings.go`; the console shows it. Deviation: computed from the effective values, not read from layer 3 (see "Validation") |
 | The preview flags a value more than ten times or below a tenth of the default of a memory parameter ("Security") | Not built | Code `config_value_unusual`, with the edges tested (exactly ten times, exactly a tenth, other units, zero default, string); the console and its mock show both warnings |
 | Integration: `pg_file_settings` is clean after a cluster-level change | Only `pg_settings` was read | `TestConfigFileSettingsAreCleanOnEveryServer` |
-| Integration: a value that PostgreSQL rejects in the file, injected past the validator, restores the file and reports PostgreSQL's text | Only a server that cannot write its file was tested (`TestConfigFailedServerIsReported`, skipped when the tests run as a user that ignores directory modes) | `TestConfigValueRejectedByPostgreSQLInTheFileRestoresTheFile`: a time zone that no checker of `kingresd` knows is stored behind the validator |
+| Integration: a value that PostgreSQL rejects in the file, injected past the validator, restores the file and reports PostgreSQL's text |  Only a server that cannot write its file was tested (`TestConfigFailedServerIsReported`, skipped when the tests run as a user that ignores directory modes) | `TestConfigValueRejectedByPostgreSQLInTheFileRestoresTheFile`: a time zone that no checker of `kingresd` knows is stored behind the validator |
 | Integration: a database time zone is applied on every server "and on a standby by replay" | Only the primary instances were read | `TestConfigDatabaseTimeZoneReachesTheStandbys` reads a standby over its socket |
 | Integration: the preview on a real cluster | Only effects and problems were checked | `TestConfigPreviewWarnings`, with the answer checked against the contract |
 
@@ -813,3 +813,8 @@ entries (`clustertest/config_test.go`). The console unit and browser tests of th
 One test of the design cannot work exactly as written: "an invalid value in the file, injected past the validator" has no hook in `kingresd`
 (there is no fault point in the agent), so the test stores the value in `kingres_cp.config_value` directly, which is the same state, and
 removes it in its clean-up.
+
+The text that the console shows for a value that PostgreSQL refuses **in the file** is what `pg_file_settings.error` holds, which is
+`setting could not be applied` for every such value (PostgreSQL's own reason goes to its log only), with the name of the parameter. A
+message with PostgreSQL's reason (`invalid value for parameter "TimeZone"`) is given only by layer 3, before anything is written. The
+design's "reports PostgreSQL's text" for a rejected file is therefore this text; the test asserts it.

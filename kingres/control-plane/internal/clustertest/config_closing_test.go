@@ -35,9 +35,9 @@ func overrideFile(t *testing.T, n *clustertest.Node) string {
 func TestConfigFileSettingsAreCleanOnEveryServer(t *testing.T) {
 	c := sharedCluster(t)
 	leader := c.Nodes[0]
-	cfgApplyDone(t, leader, cfgChange("work_mem", "cluster", "", "24MB"), cfgChange("random_page_cost", "cluster", "", "2.5"))
+	cfgApplyDone(t, leader, cfgChange("commit_delay", "cluster", "", "50"), cfgChange("from_collapse_limit", "cluster", "", "12"))
 	t.Cleanup(func() {
-		cfgApplyDone(t, leader, cfgChange("work_mem", "cluster", "", nil), cfgChange("random_page_cost", "cluster", "", nil))
+		cfgApplyDone(t, leader, cfgChange("commit_delay", "cluster", "", nil), cfgChange("from_collapse_limit", "cluster", "", nil))
 	})
 	for _, n := range c.Nodes {
 		db := n.ServicePG("postgres")
@@ -58,17 +58,17 @@ func TestConfigFileSettingsAreCleanOnEveryServer(t *testing.T) {
 			seen[name] = applied
 		}
 		rows.Close()
-		if !seen["work_mem"] || !seen["random_page_cost"] {
+		if !seen["commit_delay"] || !seen["from_collapse_limit"] {
 			t.Errorf("node %d: the lines of the change are missing or not applied: %v", n.Index, seen)
 		}
 		var src string
-		if err := db.QueryRow(context.Background(), `SELECT source FROM pg_settings WHERE name = 'work_mem'`).Scan(&src); err != nil || src != "configuration file" {
-			t.Errorf("node %d: the source of work_mem is %q (%v)", n.Index, src, err)
+		if err := db.QueryRow(context.Background(), `SELECT source FROM pg_settings WHERE name = 'commit_delay'`).Scan(&src); err != nil || src != "configuration file" {
+			t.Errorf("node %d: the source of commit_delay is %q (%v)", n.Index, src, err)
 		}
-		if got := show(t, n, "postgres", "work_mem"); got != "24MB" {
-			t.Errorf("node %d: work_mem %s", n.Index, got)
+		if got := show(t, n, "postgres", "commit_delay"); got != "50" {
+			t.Errorf("node %d: commit_delay %s", n.Index, got)
 		}
-		if f := overrideFile(t, n); !strings.Contains(f, "work_mem") {
+		if f := overrideFile(t, n); !strings.Contains(f, "commit_delay") {
 			t.Errorf("node %d: the override file lacks the line: %q", n.Index, f)
 		}
 	}
@@ -111,9 +111,10 @@ func TestConfigValueRejectedByPostgreSQLInTheFileRestoresTheFile(t *testing.T) {
 		t.Fatalf("the task ended %v: %v", done["state"], done["error"])
 	}
 	sv := items(t, leader.Expect(200, "GET", "/config/servers", nil))
+	// pg_file_settings gives no more than "setting could not be applied" for a value that PostgreSQL refuses; the report names the parameter.
 	text := fmt.Sprint(sv)
-	if !strings.Contains(strings.ToLower(text), "time zone") && !strings.Contains(text, "Nowhere/City") {
-		t.Errorf("no failed server carries PostgreSQL's text: %v", sv)
+	if !strings.Contains(text, "name:timezone") || !strings.Contains(text, "could not be applied") {
+		t.Errorf("no failed server names the parameter and the text of pg_file_settings: %v", sv)
 	}
 	for _, n := range c.Nodes {
 		if got := overrideFile(t, n); got != files[n.Index] {
