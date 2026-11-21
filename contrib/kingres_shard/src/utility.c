@@ -222,6 +222,20 @@ schema_ctas(CreateTableAsStmt *ctas, QueryCompletion *qc)
 				 errmsg("CREATE TABLE AS into a distributed schema takes no storage option, tablespace, access method, ON COMMIT or UNLOGGED"),
 				 errhint("Create the table with CREATE TABLE, then INSERT ... SELECT.")));
 	q = castNode(Query, ctas->query);
+	if (q->commandType == CMD_UTILITY)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("CREATE TABLE AS EXECUTE into a distributed schema is not supported"),
+				 errhint("Write the query itself: CREATE TABLE ... AS SELECT ...")));
+	if (ctas->if_not_exists && OidIsValid(get_relname_relid(into->rel->relname, nsp)))
+	{
+		ereport(NOTICE,
+				(errcode(ERRCODE_DUPLICATE_TABLE),
+				 errmsg("relation \"%s\" already exists, skipping", into->rel->relname)));
+		if (qc != NULL)
+			SetQueryCompletion(qc, CMDTAG_SELECT, 0);
+		return true;
+	}
 	qname = quote_qualified_identifier(get_namespace_name(nsp), into->rel->relname);
 	initStringInfo(&cols);
 	foreach(lc, q->targetList)

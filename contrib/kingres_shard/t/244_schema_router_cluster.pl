@@ -9,7 +9,7 @@
 #   A. INSERT ... SELECT from a local table, a hash-distributed table, a table of another owner, a function: the rows are read here and go to the owner
 #   B. COPY FROM into a shell
 #   C. CREATE TABLE AS and SELECT INTO into a distributed schema
-#   D. prepared statements, errors that leave nothing behind, the owner moves while a statement is planned
+#   D. prepared statements, errors that leave nothing behind
 
 use strict;
 use warnings FATAL => 'all';

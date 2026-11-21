@@ -262,7 +262,8 @@ kl_check_distributed_owner(Oid relid)
 	ret = SPI_execute("SELECT pg_catalog.to_regclass('kingres.dist_schema') IS NOT NULL "
 					  "AND pg_catalog.to_regclass('kingres.bucket_map') IS NOT NULL "
 					  "AND pg_catalog.to_regclass('kingres.local_node') IS NOT NULL "
-					  "AND pg_catalog.to_regclass('kingres.node') IS NOT NULL",
+					  "AND pg_catalog.to_regclass('kingres.node') IS NOT NULL "
+					  "AND pg_catalog.to_regclass('kingres.bucket_move') IS NOT NULL",
 					  true, 1);
 	if (ret == SPI_OK_SELECT && SPI_processed == 1)
 	{
@@ -278,6 +279,8 @@ kl_check_distributed_owner(Oid relid)
 
 		values[0] = ObjectIdGetDatum(relid);
 		ret = SPI_execute_with_args("SELECT b.group_id, "
+									"(b.state OPERATOR(pg_catalog.<>) 'active' OR EXISTS (SELECT 1 FROM kingres.bucket_move m WHERE m.colocation_id OPERATOR(pg_catalog.=) s.colocation_id "
+									"AND m.phase NOT IN ('done', 'failed', 'cancelled'))), "
 									"(SELECT n.group_id FROM kingres.local_node l JOIN kingres.node n ON n.node_id OPERATOR(pg_catalog.=) l.node_id), "
 									"(SELECT pn.node_id FROM kingres.node pn WHERE pn.group_id OPERATOR(pg_catalog.=) b.group_id "
 									"AND pn.role OPERATOR(pg_catalog.=) 'primary' AND pn.is_active ORDER BY pn.node_id LIMIT 1) "
@@ -291,10 +294,19 @@ kl_check_distributed_owner(Oid relid)
 			TupleDesc	td = SPI_tuptable->tupdesc;
 			bool		n1,
 						n2,
-						n3;
+						n3,
+						n4;
 			int32		owner = DatumGetInt32(SPI_getbinval(tup, td, 1, &n1));
-			int32		local = DatumGetInt32(SPI_getbinval(tup, td, 2, &n2));
-			int32		node = DatumGetInt32(SPI_getbinval(tup, td, 3, &n3));
+			bool		moving = DatumGetBool(SPI_getbinval(tup, td, 2, &n4));
+			int32		local = DatumGetInt32(SPI_getbinval(tup, td, 3, &n2));
+			int32		node = DatumGetInt32(SPI_getbinval(tup, td, 4, &n3));
+
+			if (!n4 && moving)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("table \"%s\" is in a distributed schema that is being moved to another shard group", get_rel_name(relid)),
+						 errdetail("A ledger table pins its schema to the group that holds the ledger; a schema that is moving cannot get one."),
+						 errhint("Wait for the move to end (kingres.bucket_move), then run kingres.ledger_enable on the owner.")));
 
 			if (!n1 && !n2 && owner != local)
 			{

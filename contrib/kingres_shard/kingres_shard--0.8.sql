@@ -14778,7 +14778,8 @@ SELECT pg_catalog.format('%s|%s|%s|%s|%s',
                        FROM pg_catalog.pg_index i WHERE i.indrelid OPERATOR(pg_catalog.=) p_rel::pg_catalog.oid), ''),
            COALESCE((SELECT pg_catalog.string_agg(t.tgname, ',' ORDER BY t.tgname)
                        FROM pg_catalog.pg_trigger t WHERE t.tgrelid OPERATOR(pg_catalog.=) p_rel::pg_catalog.oid AND NOT t.tgisinternal
-                        AND t.tgname NOT LIKE 'kingres!_ledger!_%' ESCAPE '!'), ''));
+                        AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_proc lp WHERE lp.oid OPERATOR(pg_catalog.=) t.tgfoid AND lp.pronamespace OPERATOR(pg_catalog.=) 'kingres'::pg_catalog.regnamespace
+                                        AND lp.proname IN ('ledger_capture', 'ledger_block_modify'))), ''));
 $$;
 
 CREATE FUNCTION kingres.internal_table_fingerprint(p_rel regclass)
@@ -14815,6 +14816,7 @@ DECLARE
     v_row    pg_catalog.bool;
     v_has    pg_catalog.bool := false;
     v_data   pg_catalog.bool := false;
+    v_ledger pg_catalog.text;
     v_own    pg_catalog.int4;
     v_stmts  pg_catalog.text[];
     v_one    pg_catalog.text;
@@ -14910,11 +14912,19 @@ BEGIN
             USING ERRCODE = 'program_limit_exceeded';
     END IF;
     SELECT l.node_id INTO v_self FROM kingres.local_node l;
+    IF NOT v_data AND v_has AND pg_catalog.to_regclass('kingres.ledger_table') IS NOT NULL THEN
+        EXECUTE 'SELECT pg_catalog.string_agg(c.relname::pg_catalog.text, '', '' ORDER BY c.relname) FROM kingres.ledger_table t JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) t.relid::pg_catalog.oid WHERE c.relnamespace OPERATOR(pg_catalog.=) $1'
+           INTO v_ledger USING nsp::pg_catalog.oid;
+        IF v_ledger IS NOT NULL THEN
+            v_data := true;		-- the ledger is on this node: the schema stays here
+        END IF;
+    END IF;
     IF v_data THEN
         -- rows stay where they are: this node's group is the owner (design 8.1); another group is a move afterwards
         SELECT n.group_id INTO v_own FROM kingres.node n WHERE n.node_id OPERATOR(pg_catalog.=) v_self;
         IF v_group IS NOT NULL AND v_group OPERATOR(pg_catalog.<>) v_own THEN
-            RAISE EXCEPTION 'schema "%" holds rows on shard group %, not on group %', v_name, v_own, v_group
+            RAISE EXCEPTION 'schema "%" holds % on shard group %, not on group %', v_name,
+                            CASE WHEN v_ledger IS NOT NULL THEN pg_catalog.format('the ledger table(s) %s', v_ledger) ELSE 'rows' END, v_own, v_group
                 USING ERRCODE = 'feature_not_supported',
                       HINT = pg_catalog.format('Distribute the schema in place (kingres.distribute_schema(%L)), then kingres.move_schema() it to group %s.', v_name, v_group);
         END IF;
@@ -15621,7 +15631,8 @@ BEGIN
         SELECT g.oid, g.tgname, g.tgenabled, c2.relname
           FROM pg_catalog.pg_trigger g JOIN pg_catalog.pg_class c2 ON c2.oid OPERATOR(pg_catalog.=) g.tgrelid
          WHERE c2.relnamespace OPERATOR(pg_catalog.=) v_oid AND NOT g.tgisinternal AND g.tgparentid OPERATOR(pg_catalog.=) 0
-           AND g.tgname NOT LIKE 'kingres!_ledger!_%' ESCAPE '!'
+           AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_proc lp WHERE lp.oid OPERATOR(pg_catalog.=) g.tgfoid AND lp.pronamespace OPERATOR(pg_catalog.=) 'kingres'::pg_catalog.regnamespace
+                           AND lp.proname IN ('ledger_capture', 'ledger_block_modify'))
          ORDER BY g.oid
     LOOP
         v_trg := v_trg OPERATOR(pg_catalog.||) pg_catalog.pg_get_triggerdef(r.oid, true);
@@ -15859,6 +15870,7 @@ BEGIN
     IF mode = 1 THEN
         SELECT n.group_id INTO v_local FROM kingres.local_node l JOIN kingres.node n ON n.node_id OPERATOR(pg_catalog.=) l.node_id;
         IF v_local IS DISTINCT FROM v_dg THEN
+            EXECUTE pg_catalog.format('LOCK TABLE ONLY %s IN ACCESS EXCLUSIVE MODE', p_relid::pg_catalog.regclass);	-- the statement needs it; a row committed after the question cannot appear
             PERFORM pg_catalog.set_config('kingres_shard.enable_routing', 'off', true);
             EXECUTE pg_catalog.format('SELECT EXISTS (SELECT 1 FROM ONLY %s)', p_relid::pg_catalog.regclass) INTO v_has;
             PERFORM pg_catalog.set_config('kingres_shard.enable_routing', v_save, true);

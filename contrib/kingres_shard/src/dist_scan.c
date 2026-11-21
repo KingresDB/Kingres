@@ -526,10 +526,17 @@ ds_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 			}
 		}
 		if (!have)
-			ereport(ERROR,
-					(errcode(ERRCODE_INTERNAL_ERROR),
-					 errmsg("distributed scan of \"%s\": column %d is needed above the scan but the local scan does not return it",
-							relname, (int) v->varattno)));
+		{
+			/*
+			 * The planner put an expression of the table into the target list of the scan (a branch of a UNION ALL, a projection
+			 * that the scan supports): the columns it reads are fetched with the rows, as for the restrictions below (P11S-04).
+			 */
+			if (v->varattno < 0)
+				ds_error_system_columns(root, relname);
+			scan_tlist = lappend(scan_tlist,
+								 makeTargetEntry((Expr *) copyObject(v), ++resno, NULL, false));
+			attnos = lappend_int(attnos, v->varattno);
+		}
 	}
 
 	/* 2. The other columns that those expressions and the restrictions need. */

@@ -669,7 +669,7 @@ start_dest(KsBatchSender *s, KsBatchDest *d)
 		const char *pv[1];
 
 		pv[0] = s->search_path;
-		PQclear(kingres_shard_exec_params(d->kc, "SELECT pg_catalog.set_config('search_path', $1, true)", 1, NULL, pv, true));
+		PQclear(kingres_shard_exec_params(d->kc, "SELECT pg_catalog.set_config('search_path', $1, true), pg_catalog.set_config('kingres_shard.shipped_scope', 'on', true)", 1, NULL, pv, true));
 	}
 
 	ectx.s = s;
@@ -943,7 +943,7 @@ kingres_shard_batch_finish(KsBatchSender *s)
 			KsBatchDest *d = (KsBatchDest *) lfirst(lc);
 
 			if (d->started && !d->is_local)
-				PQclear(kingres_shard_exec(d->kc, "SET LOCAL search_path = pg_catalog"));
+				PQclear(kingres_shard_exec(d->kc, "SET LOCAL search_path = pg_catalog; SET LOCAL kingres_shard.shipped_scope = off"));
 		}
 
 	/*

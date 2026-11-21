@@ -590,7 +590,7 @@ fetch_remote(KsRemoteScanState *s)
 		PGresult   *sp;
 
 		pv[0] = s->search_path;
-		sp = kingres_shard_exec_params(kc, "SELECT pg_catalog.set_config('search_path', $1, true)", 1, NULL, pv, true);
+		sp = kingres_shard_exec_params(kc, "SELECT pg_catalog.set_config('search_path', $1, true), pg_catalog.set_config('kingres_shard.shipped_scope', 'on', true)", 1, NULL, pv, true);
 		if (sp == NULL || PQresultStatus(sp) != PGRES_TUPLES_OK)
 			kingres_shard_report_error(kc, sp, "set search_path");
 		PQclear(sp);
@@ -601,7 +601,7 @@ fetch_remote(KsRemoteScanState *s)
 		(PQresultStatus(res) == PGRES_COMMAND_OK || PQresultStatus(res) == PGRES_TUPLES_OK))
 	{
 		/* the connection's fixed settings again, for the statements that follow in this transaction */
-		PGresult   *back = kingres_shard_exec(kc, "SET LOCAL search_path = pg_catalog");
+		PGresult   *back = kingres_shard_exec(kc, "SET LOCAL search_path = pg_catalog; SET LOCAL kingres_shard.shipped_scope = off");
 
 		PQclear(back);
 	}

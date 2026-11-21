@@ -44,6 +44,7 @@ typedef struct KsSchemaDdl
 } KsSchemaDdl;
 
 extern bool kingres_shard_enable_schema_routing;
+extern bool kingres_shard_shipped_scope;
 
 extern void kingres_shard_schema_ddl_init(void);
 

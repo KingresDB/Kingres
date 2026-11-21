@@ -3345,6 +3345,60 @@ kingres_shard_planner_hook(Query *parse, const char *query_string,
  *
  * See the file header.
  */
+/*
+ * In the forwarded session of a statement that runs code the text does not show (a function of the schema, a trigger, a default), every
+ * table that a nested statement reads must be one that this node holds for the schema, a reference table or a catalog: a plain local
+ * table would be this node's copy, and the answer would change with the node that runs the statement (design 6.4: KS001).
+ */
+static bool
+shipped_scope_walker(Node *node, void *context)
+{
+	const KsCatalog *cat = (const KsCatalog *) context;
+
+	if (node == NULL)
+		return false;
+	if (IsA(node, Query))
+	{
+		Query	   *q = (Query *) node;
+		ListCell   *lc;
+
+		foreach(lc, q->rtable)
+		{
+			RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+			char		kind;
+			Oid			nsp;
+			const char *nspname;
+			const KsDistTable *dt;
+
+			if (rte->rtekind != RTE_RELATION)
+				continue;
+			kind = get_rel_relkind(rte->relid);
+			if (kind != RELKIND_RELATION && kind != RELKIND_PARTITIONED_TABLE && kind != RELKIND_FOREIGN_TABLE)
+				continue;
+			nsp = get_rel_namespace(rte->relid);
+			if (isAnyTempNamespace(nsp))
+				continue;
+			nspname = get_namespace_name(nsp);
+			if (nspname != NULL && (strcmp(nspname, "pg_catalog") == 0 || strcmp(nspname, "information_schema") == 0 ||
+									strcmp(nspname, "pg_toast") == 0 || strcmp(nspname, "kingres") == 0))
+				continue;
+			if (kingres_shard_lookup_schema_table(cat, rte->relid) != NULL)
+				continue;
+			dt = cat->ndist_tables > 0 ? hash_search(cat->dist_tables, &rte->relid, HASH_FIND, NULL) : NULL;
+			if (dt != NULL)
+				continue;
+			ereport(ERROR,
+					(errcode(ERRCODE_KINGRES_STALE_MAP),
+					 errmsg("table \"%s\" is read by code that a statement of another node runs here, and it is not a table of a distributed schema or a reference table",
+							qualified_name(rte->relid)),
+					 errdetail("This node has its own copy of the table; the node that sent the statement has another.  The statement is refused, not answered from the wrong copy."),
+					 errhint("Read the table in a statement of its own, or from a function that is not shipped (kingres.alter_distributed_schema ship_functions => false).")));
+		}
+		return query_tree_walker(q, shipped_scope_walker, context, 0);
+	}
+	return expression_tree_walker(node, shipped_scope_walker, context);
+}
+
 static PlannedStmt *
 planner_hook_body(Query *parse, const char *query_string,
 							int cursorOptions, ParamListInfo boundParams)
@@ -3403,6 +3457,13 @@ planner_hook_body(Query *parse, const char *query_string,
 		return pass_through(parse, query_string, cursorOptions, boundParams);
 	if (!kingres_shard_enable_routing || creating_extension)
 		return pass_through(parse, query_string, cursorOptions, boundParams);
+	if (kingres_shard_shipped_scope && kingres_shard_session_forwarded())
+	{
+		const KsCatalog *sc = kingres_shard_catalog();
+
+		if (sc->present)
+			(void) shipped_scope_walker((Node *) parse, (void *) sc);
+	}
 	if (parse->commandType != CMD_SELECT && parse->commandType != CMD_INSERT &&
 		parse->commandType != CMD_UPDATE && parse->commandType != CMD_DELETE &&
 		parse->commandType != CMD_MERGE)

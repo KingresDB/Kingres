@@ -69,6 +69,7 @@ PG_FUNCTION_INFO_V1(kingres_internal_schema_delta);
 int			kingres_shard_max_distributed_schemas = 10000;
 int			kingres_shard_schema_placement_group = -1;
 bool		kingres_shard_enable_schema_routing = true;
+bool		kingres_shard_shipped_scope = false;
 static int	distribute_new_schemas_setting = 0;	/* 0 default, 1 on, 2 off */
 
 static const struct config_enum_entry distribute_new_schemas_options[] = {
@@ -87,6 +88,14 @@ kingres_shard_schema_ddl_init(void)
 							 &kingres_shard_enable_schema_routing,
 							 true,
 							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("kingres_shard.shipped_scope",
+							 "Set by the origin of a statement that is run whole on the owner of a distributed schema and that runs code the statement does not show.",
+							 "While it is on, a statement planned in a forwarded session may read only tables of distributed schemas, reference tables and catalogs: another table would be this node's own copy, not the origin's (design 6.4).",
+							 &kingres_shard_shipped_scope,
+							 false,
+							 PGC_USERSET, GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
 							 NULL, NULL, NULL);
 
 	DefineCustomIntVariable("kingres_shard.max_distributed_schemas",
@@ -661,8 +670,10 @@ kingres_shard_schema_ddl_classify(Node *parsetree, const KsCatalog *cat, bool fo
 			{
 				CreateTrigStmt *t = (CreateTrigStmt *) parsetree;
 
-				/* the triggers of kingres_ledger belong to the node that holds the ledger table (design 11.1): not propagated */
-				if (t->trigname != NULL && strncmp(t->trigname, "kingres_ledger_", 15) == 0)
+				/* the triggers of kingres_ledger (its two functions) belong to the node that holds the ledger table (design 11.1): not propagated; a user trigger of that name is */
+				if (t->trigname != NULL && strncmp(t->trigname, "kingres_ledger_", 15) == 0 && list_length(t->funcname) == 2 &&
+					strcmp(strVal(linitial(t->funcname)), "kingres") == 0 &&
+					(strcmp(strVal(lsecond(t->funcname)), "ledger_capture") == 0 || strcmp(strVal(lsecond(t->funcname)), "ledger_block_modify") == 0))
 					break;
 				ns_add(&s, rv_ns(t->relation));
 				if (s.dist != NIL)

@@ -316,6 +316,8 @@ tests += {
       't/242_schema_ledger_cluster.pl',
       't/243_schema_review_cluster.pl',
       't/244_schema_router_cluster.pl',
+      't/245_schema_scale_cluster.pl',
+      't/246_schema_second_review_cluster.pl',
     ],
   },
 }

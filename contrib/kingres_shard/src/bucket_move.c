@@ -1454,6 +1454,19 @@ kingres_internal_switch_bucket(PG_FUNCTION_ARGS)
 		 * lock, so that no write to a table of the schema is running, and set on the target in this transaction, so that the
 		 * first nextval of the new owner is greater than anything the old one handed out (design/shard-phase11.md 7.5, 9.4).
 		 */
+		/* the pin of a ledger table holds for the whole move: asked again under the lock of the switch (a ledger_enable that ran during the copy is seen here) */
+		sql = psprintf("SELECT " KINGRES_SHARD_SCHEMA ".internal_schema_pinned(%d)", colocation_id);
+		res = ctl_must(srchost, srcport, sql, remaining_ms(deadline));
+		if (PQntuples(res) == 1 && !PQgetisnull(res, 0, 0))
+		{
+			char	   *why = pstrdup(PQgetvalue(res, 0, 0));
+
+			PQclear(res);
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("the schema cannot move any more: %s", why)));
+		}
+		PQclear(res);
 		/* the target is still a shell for the catalog: the statements of this step are the extension's own, not routed */
 		part_exec(&T, "SET LOCAL kingres_shard.enable_routing = off");
 		sql = psprintf("SELECT pg_catalog.format('SELECT pg_catalog.setval(%%L, %%s, %%s)', q.seq, q.last_value, q.is_called::pg_catalog.text) "
