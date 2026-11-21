@@ -1206,7 +1206,7 @@ BEGIN
                                'blocker', 'name_too_long', r.relname,
                                pfx OPERATOR(pg_catalog.||) pg_catalog.format('partition name "%s" is too long: leaf names append 6 characters (_bNNNN)', r.relname)));
                 END IF;
-                IF r.reloptions IS NOT NULL
+                IF kingres.internal_table_options(r.oid) IS NOT NULL
                    OR EXISTS (SELECT 1 FROM pg_catalog.pg_index x WHERE x.indrelid OPERATOR(pg_catalog.=) r.oid
                                 AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits ih WHERE ih.inhrelid OPERATOR(pg_catalog.=) x.indexrelid))
                    OR EXISTS (SELECT 1 FROM pg_catalog.pg_constraint k WHERE k.conrelid OPERATOR(pg_catalog.=) r.oid AND k.conislocal AND k.contype OPERATOR(pg_catalog.<>) 'n')
@@ -6278,8 +6278,12 @@ BEGIN
     IF tc.relowner OPERATOR(pg_catalog.<>) pc.relowner THEN
         RETURN NEXT pg_catalog.format('the owner is "%s", not "%s"', pg_catalog.pg_get_userbyid(tc.relowner), pg_catalog.pg_get_userbyid(pc.relowner));
     END IF;
-    IF tc.relacl IS NOT NULL AND tc.relacl::pg_catalog.text[] IS DISTINCT FROM pg_catalog.acldefault('r', tc.relowner)::pg_catalog.text[] THEN
-        RETURN NEXT 'privileges of its own';
+    -- the same privileges as the partitioned table are accepted (the owner is the same, so the entries compare as text); a table or a
+    -- parent without an ACL has the default one
+    IF (SELECT pg_catalog.array_agg(x::pg_catalog.text ORDER BY x::pg_catalog.text) FROM pg_catalog.unnest(COALESCE(tc.relacl, pg_catalog.acldefault('r', tc.relowner))) x)
+       IS DISTINCT FROM
+       (SELECT pg_catalog.array_agg(x::pg_catalog.text ORDER BY x::pg_catalog.text) FROM pg_catalog.unnest(COALESCE(pc.relacl, pg_catalog.acldefault('r', pc.relowner))) x) THEN
+        RETURN NEXT 'privileges that differ from those of the partitioned table';
     END IF;
     FOR r IN SELECT ic.relname AS name
                FROM pg_catalog.pg_index x JOIN pg_catalog.pg_class ic ON ic.oid OPERATOR(pg_catalog.=) x.indexrelid

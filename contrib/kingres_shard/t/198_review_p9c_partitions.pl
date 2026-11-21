@@ -48,14 +48,15 @@ sub new_table
 new_table('pa');
 sub attach_candidate
 {
-	my ($name, $qty, $before, $after, $schema, $with) = @_;
+	my ($name, $qty, $before, $after, $schema, $with, $parent) = @_;
+	$parent //= 'public.pa';
 	$with //= '';
 	$schema //= 'public';
 	$n1->safe_psql('postgres', qq{
 		CREATE TABLE $schema.$name (customer int NOT NULL, created date NOT NULL, id int NOT NULL, qty int $qty, PRIMARY KEY (customer, created, id)) $with;
 		$before
 		INSERT INTO $schema.$name SELECT g % 11, date '2026-03-01' + (g % 28), g, g % 40 FROM generate_series(1, 200) g;
-		SELECT kingres.create_distributed_table('$schema.$name', 'customer', colocate_with => 'public.pa');
+		SELECT kingres.create_distributed_table('$schema.$name', 'customer', colocate_with => '$parent');
 		$after
 	});
 }
@@ -66,7 +67,7 @@ my @own = (
 	['default',              'DEFAULT 5',                 '',                                          '',                                            qr/a default of its own on column "qty"/],
 	['owner',                '',                          '',                                          'ALTER TABLE public.ta_owner OWNER TO pc_own;', qr/the owner is "pc_own"/],
 	['storage parameters',   '',                          '',                                          '',                                            qr/storage parameters of its own/, 'WITH (fillfactor = 70)'],
-	['privileges',           '',                          '',                                          'GRANT SELECT ON public.ta_acl TO pc_r;',      qr/privileges of its own/],
+	['privileges',           '',                          '',                                          'GRANT SELECT ON public.ta_acl TO pc_r;',      qr/privileges that differ from those of the partitioned table/],
 );
 my %name = ('check constraint' => 'ta_chk', 'index' => 'ta_idx', 'default' => 'ta_def', 'owner' => 'ta_owner', 'privileges' => 'ta_acl', 'storage parameters' => 'ta_sp');
 for my $o (@own)
@@ -169,6 +170,10 @@ for my $level ('REPEATABLE READ', 'SERIALIZABLE')
 	like($err, qr/cannot run in a REPEATABLE READ or SERIALIZABLE transaction/, "C: $level: with the reason");
 }
 is(q1($n1, q{SELECT count(*) FROM pg_class WHERE relname LIKE 'pa\_iso%'}), '0', 'C: no leaf was made');
+{
+	my ($rc, $out, $err) = run_sql($n1, q{BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1; SELECT kingres.create_partition('public.pa', 'pa_iso', 'FROM (''2029-01-01'') TO (''2029-02-01'')'); COMMIT;}, extra_params => [ '-v', 'VERBOSITY=verbose' ]);
+	like($err, qr/ERROR:  25001:/, 'C: the SQLSTATE of the refusal is 25001 (P9F-04)');
+}
 
 # ---------------------------------------------------------------------------
 # D. P9C-09: the statement mapping
@@ -327,6 +332,85 @@ $n1->safe_psql('postgres', q{GRANT SELECT ON public.pd TO pc_r; GRANT UPDATE ON 
 	is(q1($n1, q{SELECT concat(has_table_privilege('pc_r', 'public.vv_plain', 'SELECT'), has_table_privilege('pc_r', 'public.vv_acl', 'SELECT'))}), 'ff', 'H: pc_r cannot read them');
 	is(q1($n1, q{SELECT concat(has_table_privilege('pc_vown', 'public.vv_plain', 'SELECT'), has_table_privilege('pc_vown', 'public.vv_plain', 'UPDATE'))}), 'tt', 'H: the owner of the view without an ACL has every privilege');
 	is($after, $before, 'H: the ACL and the owner of both views are exactly what they were (an owner who had given up a privilege does not get it back)');
+}
+
+# ---------------------------------------------------------------------------
+# I. P9F-02: the same privileges as the partitioned table are accepted, other privileges are refused
+# ---------------------------------------------------------------------------
+$_->safe_psql('postgres', q{ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE SELECT ON TABLES FROM pc_r}) for @nodes;    # section H gave pc_r the privilege of new tables
+new_table('pg');
+$n1->safe_psql('postgres', q{GRANT SELECT ON public.pg TO pc_r});
+attach_candidate('tg_same', '', '', 'GRANT SELECT ON public.tg_same TO pc_r;', undef, undef, 'public.pg');
+attach_candidate('tg_diff', '', '', 'GRANT UPDATE ON public.tg_diff TO pc_r;', undef, undef, 'public.pg');
+attach_candidate('tg_none', '', '', '', undef, undef, 'public.pg');
+{
+	my ($rc, $out, $err) = run_sql($n1, "SELECT kingres.attach_partition('public.pg', 'public.tg_diff', '$bound')");
+	isnt($rc, 0, 'I: a table with other privileges than the partitioned table is refused');
+	like($err, qr/privileges that differ from those of the partitioned table/, 'I: with the reason');
+	($rc, $out, $err) = run_sql($n1, "SELECT kingres.attach_partition('public.pg', 'public.tg_none', '$bound')");
+	isnt($rc, 0, 'I: a table without the privileges of the partitioned table is refused too');
+	($rc, $out, $err) = run_sql($n1, "SELECT kingres.attach_partition('public.pg', 'public.tg_same', '$bound')");
+	is($rc, 0, 'I: a table with the same privileges is accepted') or diag($err);
+	is(q1($n1, q{SELECT count(*) FROM kingres.dist_partition WHERE parent = 'public.pg'::regclass AND partition_name = 'tg_same'}), '1', 'I: and attached');
+}
+
+# ---------------------------------------------------------------------------
+# J. P9F-01: a cast to a type of a user schema in a bound, on and off the search_path of the caller
+# ---------------------------------------------------------------------------
+$_->safe_psql('postgres', q{CREATE TYPE public.shade AS ENUM ('a', 'b', 'c')}) for @nodes;
+$n1->safe_psql('postgres', q{
+	CREATE TABLE public.st (k int NOT NULL, s public.shade NOT NULL, PRIMARY KEY (k, s)) PARTITION BY LIST (s);
+	CREATE TABLE public.st_a PARTITION OF public.st FOR VALUES IN ('a');
+	SELECT kingres.create_distributed_table('public.st', 'k', bucket_count => 3);
+});
+$_->safe_psql('postgres', q{CREATE SCHEMA pc_ty; CREATE TYPE pc_ty.color AS ENUM ('red', 'green', 'blue', 'pink'); CREATE DOMAIN pc_ty.pos AS int CHECK (VALUE > 0)}) for @nodes;
+$n1->safe_psql('postgres', q{
+	CREATE TABLE public.lt (k int NOT NULL, c pc_ty.color NOT NULL, PRIMARY KEY (k, c)) PARTITION BY LIST (c);
+	CREATE TABLE public.lt_a PARTITION OF public.lt FOR VALUES IN ('red');
+	SELECT kingres.create_distributed_table('public.lt', 'k', bucket_count => 3);
+	CREATE TABLE public.dm (k int NOT NULL, p pc_ty.pos NOT NULL, PRIMARY KEY (k, p)) PARTITION BY RANGE (p);
+	CREATE TABLE public.dm_a PARTITION OF public.dm FOR VALUES FROM (1) TO (10);
+	SELECT kingres.create_distributed_table('public.dm', 'k', bucket_count => 3);
+});
+{
+	my $leaves = sub { my ($re) = @_; my $n = 0; $n += q1($_, "SELECT count(*) FROM pg_class WHERE relname ~ '$re'") for @nodes; return $n; };
+	my @cases = (
+		['a type of the public schema, written with it', q{CREATE TABLE public.st_b PARTITION OF public.st FOR VALUES IN ('b'::public.shade)}, 'st_b', q{IN ('b'::public.shade)}],
+		['an enum, off the search_path', q{CREATE TABLE public.lt_b PARTITION OF public.lt FOR VALUES IN ('blue'::pc_ty.color)}, 'lt_b', q{IN ('blue'::pc_ty.color)}],
+		['an enum, on the search_path',  q{SET search_path = public, pc_ty; CREATE TABLE public.lt_c PARTITION OF public.lt FOR VALUES IN ('green'::color)}, 'lt_c', q{IN ('green'::pc_ty.color)}],
+		['a domain, off the search_path', q{CREATE TABLE public.dm_b PARTITION OF public.dm FOR VALUES FROM (10::pc_ty.pos) TO (20::pc_ty.pos)}, 'dm_b', q{FROM (10::pc_ty.pos) TO (20::pc_ty.pos)}],
+		['a domain, on the search_path',  q{SET search_path = public, pc_ty; CREATE TABLE public.dm_c PARTITION OF public.dm FOR VALUES FROM (20::pos) TO (30::pos)}, 'dm_c', q{FROM (20::pc_ty.pos) TO (30::pc_ty.pos)}],
+	);
+	for my $c (@cases)
+	{
+		my ($what, $sql, $part, $bound) = @$c;
+		my ($rc, $out, $err) = run_sql($n1, $sql);
+		is($rc, 0, "J: a bound with a cast to $what") or diag($err);
+		is(q1($n1, "SELECT bound FROM kingres.dist_partition WHERE partition_name = '$part'"), $bound, "J: $what: the type is written with its schema");
+		is($leaves->("^${part}_b[0-9]{4}\$"), 3, "J: $what: the three leaves are made");
+	}
+	my ($rc, $out, $err) = run_sql($n1, q{INSERT INTO public.lt SELECT g, (ARRAY['red', 'green', 'blue'])[1 + g % 3]::pc_ty.color FROM generate_series(1, 30) g});
+	is($rc, 0, 'J: rows for the three partitions of the enum') or diag($err);
+	is(q1($n1, q{SELECT count(*) FROM public.lt WHERE c = 'blue'}), '10', 'J: found');
+	($rc, $out, $err) = run_sql($n1, q{INSERT INTO public.dm SELECT g, g FROM generate_series(1, 29) g});
+	is($rc, 0, 'J: rows for the three partitions of the domain') or diag($err);
+	is(q1($n1, q{SELECT count(*) FROM public.dm WHERE p >= 20}), '10', 'J: found');
+}
+
+# ---------------------------------------------------------------------------
+# K. P9F-03: a partition with a parameter of its TOAST table is refused at distribute time
+# ---------------------------------------------------------------------------
+$n1->safe_psql('postgres', q{
+	CREATE TABLE public.tp (k int NOT NULL, d date NOT NULL, v text, PRIMARY KEY (k, d)) PARTITION BY RANGE (d);
+	CREATE TABLE public.tp_a PARTITION OF public.tp FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+	ALTER TABLE public.tp_a SET (toast.autovacuum_enabled = false);
+});
+is(q1($n1, q{SELECT coalesce(string_agg(code, ','), '') FROM kingres.table_change_report('distribute', 'public.tp', '{"column":"k"}') WHERE severity = 'blocker'}), 'partition_local_object', 'K: the report refuses it');
+{
+	my ($rc, $out, $err) = run_sql($n1, q{SELECT kingres.create_distributed_table('public.tp', 'k')});
+	isnt($rc, 0, 'K: create_distributed_table is refused');
+	like($err, qr/storage parameter/, 'K: with the reason');
+	is(q1($n1, q{SELECT relkind FROM pg_class WHERE oid = 'public.tp'::regclass}), 'p', 'K: the table is as it was');
 }
 
 done_testing();

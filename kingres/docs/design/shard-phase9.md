@@ -865,7 +865,7 @@ options)`, the views `kingres.table_operations` and `kingres.partitions`, the ne
   call waited for the lock on the table, so a change committed by a transaction that was open when
   the call began was not copied. The copy (distributed and reference) now pushes a fresh snapshot
   after the lock and pops it when the cursor is closed. `REPEATABLE READ` and `SERIALIZABLE` are
-  refused with the reason (`55006`), since a transaction snapshot cannot be renewed. In the online
+  refused with the reason (`25001`, `active_sql_transaction`), since a transaction snapshot cannot be renewed. In the online
   engine the capture trigger is created under `SHARE ROW EXCLUSIVE`, which waits for every writer,
   and the switch replays under `EXCLUSIVE` with fresh statements. `t/150` races a writer that
   commits during the wait, for every kind of change, both variants and reference tables.
@@ -1236,14 +1236,15 @@ See the report. Files changed outside tests: src/dist_table.c, dist_table.h, kin
 ### The fixes for the review of 9.4, 9.5, 9.8 and 9.9 (2026-11-21)
 
 The independent review (`reviews/2026-11-21-kingres-shard-phase9-increments-4-9.md`, P9C-01 to P9C-14) is answered in `contrib/kingres_shard`; the
-tests are `t/197_review_p9c_blocking` and `t/198_review_p9c_partitions`. Every test that is new fails on the tree of the review (the red run) and
-passes on both majors.
+tests are `t/197_review_p9c_blocking` and `t/198_review_p9c_partitions`. The new tests pass on both majors. On the tree of the review (the red run, the sources of the parent) most of their assertions fail, but not all: the controls (a call in `READ COMMITTED`
+succeeds) and the negative-bound cases of t/198 pass there, and t/197 stops at its section E on the old code (the first call there is an error), so section F
+and the end of the file were checked with mutants, not with the red run.
 
 - **P9C-01 (critical).** The blocking `undistribute_table` and `alter_distributed_table` copied the rows of the local node's partitions through the
   snapshot of the caller's `REPEATABLE READ` or `SERIALIZABLE` transaction, which is older than the lock that stops the writers, compared the copy
   with a count taken through the same snapshot (so the check could not see the loss), and dropped the old table. The rule of P9A-01 is now the rule of
   every blocking call: `internal_require_read_committed()` is the first thing both calls and the four partition functions do (before any lock;
-  SQLSTATE `55006`, the same words as the create call), and the C copy refuses a transaction snapshot as the last line
+  SQLSTATE `25001`, the same words and code as the create call), and the C copy refuses a transaction snapshot as the last line
   (`kingres_shard_copy_routed_ex`). In `READ COMMITTED` every statement of the plpgsql body, the count included, takes a fresh snapshot after the lock, so
   the count that the copy is compared with is taken under the lock; a writer that commits while the call waits is in the new table (tested for both calls,
   with a digest). The partition functions copy no row; they read the catalog under the lock, and the same rule keeps them from deciding on a stale snapshot.
@@ -1255,7 +1256,7 @@ passes on both majors.
   per-leaf capture in the move, a second source of truth that `check_cluster()` would have to compare with the parent. The partition that
   `create_partition` makes cannot have these objects, so the attach is made equal to it: `internal_attach_differences(parent, table)` lists what the table
   has of its own (an index compared by its definition after `USING`, a check by name and definition, a default, storage parameters, another owner, privileges
-  that are not the default) and `attach_partition` refuses with each of them named. A table like the partitioned table is attached, and its leaves after a move
+  that differ from those of the partitioned table, P9F-02) and `attach_partition` refuses with each of them named. A table like the partitioned table is attached, and its leaves after a move
   have the definition of their siblings (tested). Not done: `check_cluster()` does not compare the leaves of a partition with the parent.
 - **P9C-04 (medium).** The report applies `function_owner_not_superuser` to every table that the call takes with it (the component of the foreign keys for an
   undistribute with `cascade_via_foreign_keys`, the group for an alter with `cascade_to_colocated`), names the table in the detail, and the calls refuse before
@@ -1282,5 +1283,27 @@ passes on both majors.
   PostgreSQL's "cannot drop table"; the time zone dependence of `dist_partition.bound`, the double disk use of the retained copies and the reference table that is not
   compared before an undistribute are documented.
 
-The mutants of the review that survived are killed: S18, S19, S22, C01, C02 and S10 (the reset of the ACL of a recreated view, in its new form). S04 (the count
+The mutants of the review that survived were run against the fixed tree on PostgreSQL 18 and are killed by t/197 and t/198: S18, S19, S22, C01, C02 and S10 (the reset of the ACL of a recreated view, in its new form). S04 (the count
 comparison of the undistribute) stays redundant in READ COMMITTED and is not tested separately.
+
+### The fixes for the review of the fixes (2026-11-21)
+
+The independent review of 286f63522c (`reviews/2026-11-21-kingres-shard-phase9-fixes.md`, P9F-01 to P9F-07; no critical, no high) is answered in a second
+commit; the tests are in t/197 and t/198.
+
+- **P9F-01 (medium, a regression).** The cast of a bound was written with `format_type_with_typemod`, which leaves the schema out when the type is visible in the
+  caller's `search_path`; the text is resolved later by a function with another `search_path`, so `'blue'::public.color` failed. It is written with
+  `format_type_extended` with `FORMAT_TYPE_FORCE_QUALIFY` for every type outside `pg_catalog` (`public.color`, `pc_ty.pos`); the built-in types stay as PostgreSQL writes them (`date`, `numeric(3,0)`, which t/191 expects), the modifier kept.
+  Tested with an enum and a domain in a user schema, the statement written on and off the `search_path`, and a built-in type with a modifier.
+- **P9F-02 (low).** The attach compares the table's privileges with those of the partitioned table (a missing ACL is the default one) and refuses only a difference;
+  the hint ("the same privileges") can now be followed. Tested: the same privileges are accepted, other privileges are refused.
+- **P9F-03 (low).** The check of the partitions of `create_distributed_table` reads `internal_table_options` (the table's parameters and those of its TOAST table), so a
+  partition with TOAST options is refused with `partition_local_object`. Decision: refuse, not carry: carrying needs the options on every leaf and in the move.
+- **P9F-04 (low).** The code was right (25001); the README and this document said 55006. Corrected, and t/197 and t/198 check the SQLSTATE.
+- **P9F-05.** The statements about the red run are corrected above.
+- **Open question: `orphan` buckets and `colocate_with => 'default'`.** `internal_group_busy` treats a bucket whose state is not `active` as busy. The state `orphan` of
+  `kingres.bucket_map` is allowed by the CHECK but nothing in the extension sets it: what a finished move leaves on the source is an orphan table (schema `kingres`),
+  not a state of the bucket, and the phase `cleaning` of the move is not a busy phase. So `'default'` does not make extra groups while an orphan waits for cleanup.
+  t/197 D asserts that the group is free while the move is in `cleaning` with its orphan table present.
+- P9F-06 (the version 0.7 is changed in place) and P9F-07 (claims not checked) are notes; a database made from the earlier build of 0.7 is made again, and the
+  deadlock pass of the recovery worker is described in the README as the mechanism that is there, not as something these tests show.

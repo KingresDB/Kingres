@@ -62,6 +62,7 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "access/table.h"
 #include "access/tupdesc.h"
 #include "access/xact.h"
@@ -71,6 +72,7 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_inherits.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/pg_type.h"
 #include "commands/copy.h"
 #include "commands/extension.h"
@@ -1793,9 +1795,20 @@ append_bound_expr(StringInfo buf, Node *e)
 		int32		typmod;
 
 		append_bound_expr(buf, tc->arg);
-		/* the type as PostgreSQL writes it, with its modifier and quoted where it must be (P9C-09) */
+		/* the type with its schema and its modifier: the text is resolved by a function with another search_path (P9C-09, P9F-01) */
 		typenameTypeIdAndMod(NULL, tc->typeName, &typoid, &typmod);
-		appendStringInfo(buf, "::%s", format_type_with_typemod(typoid, typmod));
+		{
+			/* a type of another schema than pg_catalog is written with its schema; the built-in types as PostgreSQL writes them (date, numeric(3,0)) */
+			int			flags = FORMAT_TYPE_TYPEMOD_GIVEN;
+			HeapTuple	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typoid));
+
+			if (!HeapTupleIsValid(tup))
+				elog(ERROR, "cache lookup failed for type %u", typoid);
+			if (((Form_pg_type) GETSTRUCT(tup))->typnamespace != PG_CATALOG_NAMESPACE)
+				flags |= FORMAT_TYPE_FORCE_QUALIFY;
+			ReleaseSysCache(tup);
+			appendStringInfo(buf, "::%s", format_type_extended(typoid, typmod, flags));
+		}
 		return;
 	}
 	if (IsA(e, A_Expr) && ((A_Expr *) e)->kind == AEXPR_OP && list_length(((A_Expr *) e)->name) == 1 &&

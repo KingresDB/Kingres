@@ -111,6 +111,12 @@ for my $c (@calls)
 		like($err, qr/\Q$fn\E cannot run in a REPEATABLE READ or SERIALIZABLE transaction/, "A $name: with the reason");
 	}
 	is(q1($n1, "SELECT count(*) FROM public.$t"), '100', "A $name: and unchanged");
+
+	# the SQLSTATE is 25001 (active_sql_transaction), as for the create call (P9F-04)
+	{
+		my ($rc, $out, $err) = run_sql($n1, "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1; " . sprintf($tpl, "rc_$name") . '; COMMIT;', extra_params => [ '-v', 'VERBOSITY=verbose' ]);
+		like($err, qr/ERROR:  25001:/, "A $name: the SQLSTATE of the refusal is 25001");
+	}
 }
 
 # the copy itself refuses a transaction snapshot: the last line, whoever calls it
@@ -228,6 +234,15 @@ $n1->safe_psql('postgres', q{
 	my ($mo, $me) = finish_psql($mv);
 	is($me, '', 'D: the move finishes') or diag($me);
 	for (1 .. 120) { last if q1($n1, "SELECT count(*) FROM kingres.bucket_move WHERE phase NOT IN ('cleaning', 'done', 'failed', 'undone')") eq '0'; select(undef, undef, undef, 0.5); }
+	# the orphan table of a finished move waits for its cleanup: the group is free, and 'default' does not need another one (open question of the review of the fixes)
+	{
+		my $ph = q1($n1, "SELECT phase FROM kingres.bucket_move WHERE colocation_id = $coloc2 ORDER BY move_id DESC LIMIT 1");
+		is(q1($n1, "SELECT kingres.internal_group_busy($coloc2) IS NULL"), 't', "D: the group is free while its move is in phase $ph");
+		my $orphans = 0;
+		$orphans += q1($_, q{SELECT count(*) FROM pg_class WHERE relnamespace = 'kingres'::regnamespace AND relname LIKE 'orphan%' AND relkind IN ('r', 'p')}) for @nodes;
+		cmp_ok($orphans, '>', 0, 'D: an orphan table is waiting for the cleanup') if $ph eq 'cleaning';
+		is(q1($n1, "SELECT count(*) FROM kingres.bucket_map WHERE colocation_id = $coloc2 AND state <> 'active'"), '0', 'D: and no bucket of the group is in another state than active');
+	}
 	q1($n1, q{SELECT kingres.cleanup_moved_buckets(true)});
 	($rc, $out, $err) = run_sql($n1, q{SELECT kingres.alter_distributed_table('public.g1', colocate_with => 'public.g2')});
 	is($rc, 0, 'D: when the move is over the same call works') or diag($err);
