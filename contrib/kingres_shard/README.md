@@ -2053,6 +2053,8 @@ complete, and a failure leaves nothing that the nodes of the cluster can see (th
 reads a reference table (a foreign key to it, a view over it) cannot be made before the reference tables are, so it is made in the last transaction: many of those would meet the lock limit
 again.  The tables of a distributed schema are empty shells on the new node: add_node no longer copies them as if they were reference tables.
 
+Measured with `t/245_schema_scale_cluster.pl` (three nodes, one machine; the full table is in the design notes): at 2000 schemas of 5 tables a DDL statement takes 52 ms on average (174 ms before step 12), the first statement of a new backend 9 to 15 ms (55 to 112 ms), the cache of a backend 0.7 MB (3.3 MB), a routed single-row INSERT 1.2 ms (5.8 ms), and `add_node` passes in 39 s in 500 batches (it failed for lack of locks); at 200 schemas the cost of a DDL statement is that of the two-phase commit (26 ms, as before).
+
 
 ## Limitations in phase 2a
 
