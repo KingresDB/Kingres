@@ -67,7 +67,7 @@ SELECT kingres.create_distributed_table('a_view', 'id');
 ERROR:  cannot distribute "a_view": it is not an ordinary table
 CREATE TABLE already_part (id int) PARTITION BY HASH (id);
 SELECT kingres.create_distributed_table('already_part', 'id');
-ERROR:  cannot distribute table "already_part": partitioned tables and partitions are not supported yet
+ERROR:  cannot distribute table "already_part": only tables partitioned by RANGE or LIST can be distributed
 CREATE TABLE trg (id int);
 CREATE FUNCTION trg_fn() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
 CREATE TRIGGER trg_t BEFORE INSERT ON trg FOR EACH ROW EXECUTE FUNCTION trg_fn();

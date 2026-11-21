@@ -172,6 +172,8 @@ extern PGDLLIMPORT int kingres_shard_move_switch_timeout;
 extern PGDLLIMPORT int kingres_shard_move_switch_attempts;
 extern PGDLLIMPORT int kingres_shard_move_cleanup_delay;
 extern PGDLLIMPORT int kingres_shard_rebuild_batch_rows;
+extern PGDLLIMPORT int kingres_shard_max_partition_leaves;
+extern PGDLLIMPORT int kingres_shard_dependent_views;
 extern PGDLLIMPORT int kingres_shard_rebuild_drain_threshold;
 extern PGDLLIMPORT int kingres_shard_rebuild_lock_timeout;
 extern PGDLLIMPORT int kingres_shard_rebuild_switch_timeout;

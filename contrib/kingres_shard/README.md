@@ -531,9 +531,9 @@ Views: `kingres.nodes` (`kingres.node` plus `is_local`) and
 `kingres.buckets` (table, bucket, partition name, group, owning node, state,
 and the partition size where the partition exists on this node).
 
-`create_distributed_table` takes an ordinary, permanent, non-partitioned table
+`create_distributed_table` takes an ordinary, permanent, table (or one partitioned by RANGE or LIST: see "User-partitioned tables")
 that may hold rows, without inheritance, triggers, rules, row-level security (enabled, forced or with a
-policy), storage parameters or exclusion constraints, on a type with a default hash operator
+policy) or exclusion constraints, on a type with a default hash operator
 class and extended hash function. Every unique constraint or unique index must
 include the distribution column; the error names the offending object. The
 table is recreated as a hash-partitioned table with the same columns,
@@ -634,7 +634,7 @@ again.
 | Foreign keys **to a distributed table** of the group the table joins, on the distribution column of both | carried (such a key exists on an ordinary table only while the cluster has one shard group, or when it was made with `enable_routing = off`: with several groups the hook refuses it at creation) |
 | A key from the table to itself | carried when it is on the distribution column on both sides; refused otherwise |
 | Foreign keys to an ordinary table, to a distributed table of another group, or without the distribution column; foreign keys from an ordinary table to the table | refused (`foreign_key_plain_table`, `foreign_key_other_group`, `foreign_key_not_distribution_column`, `referenced_by_plain_table`) |
-| Triggers, rules, row-level security (also `FORCE ROW LEVEL SECURITY` alone), exclusion constraints, invalid indexes, `CHECK` constraints that are `NOT VALID`, inheritance, partitioned tables and partitions (user partitions are increment 9.5), temporary and unlogged tables, storage parameters (increment 9.9), tablespaces, ledger tables and the history table of one, a table on a node that is not the map group primary | refused |
+| Triggers, rules, row-level security (also `FORCE ROW LEVEL SECURITY` alone), exclusion constraints, invalid indexes, `CHECK` constraints that are `NOT VALID`, inheritance, partitioned tables and partitions (user partitions are increment 9.5), temporary and unlogged tables, tablespaces, ledger tables and the history table of one, a table on a node that is not the map group primary | refused |
 | Views, materialized views, publications and functions that use the table's row type, and a column of another table that has the row type | refused (`dependent_object`): the table is replaced by a new one, and a rename would leave them on the old |
 | A column default that calls `nextval()` of a sequence that no column of the table owns; a collation that another node does not have; an owner who has `CREATE` on the schema here but not on another node; an enum as the distribution column (the hash of an enum value depends on the OID of the value, which differs between the nodes); a relation of the shadow's name on another node; any function that the copy would reach and that belongs to a role who is not a superuser: one a `CHECK`, default, generated column or index names, and also one behind a domain of a column (its checks and its default), an operator or operator class of an index, a cast, a range or composite type (the copy runs it with the rights of the caller on every node, and the code of a table's owner must not run as a superuser) | refused before anything is done (`default_sequence_not_owned`, `collation_missing`, `schema_privilege`, `enum_distribution_column`, `name_in_use`, `function_owner_not_superuser`) |
 | Statistics objects, per-column storage, compression and statistics target, attribute options, `CLUSTER ON`, replica identity | not carried (warning `not_carried`) |
@@ -655,8 +655,10 @@ blocker). Severity `blocker`: the call is refused. `warning`: carried differentl
 | `not_on_map_group` | all | this node is not the map group primary, or the cluster is not initialized |
 | `already_distributed` | distribute, distribute_reference | the table is distributed or a reference table already |
 | `not_ordinary_table` | distribute, distribute_reference | a view, a sequence, a foreign table, ... |
-| `partitioned_table` | distribute, distribute_reference | a partitioned table or a partition (until increment 9.5) |
-| `temporary_or_unlogged`, `inheritance`, `storage_parameters`, `row_level_security`, `exclusion_constraint`, `trigger`, `rule`, `invalid_index`, `check_not_valid` | distribute, distribute_reference | the table has what stays refused (one row per constraint and per trigger) |
+| `partitioned_table` | distribute, distribute_reference | a partition on its own, a table partitioned by HASH, or a partitioned reference table |
+| `subpartitioned`, `foreign_partition`, `partition_local_object`, `tablespace` | distribute | a partition that is itself partitioned or is not an ordinary table; a partition with an index, a constraint, a default or a storage parameter of its own, or in another tablespace |
+| `default_partition`, `distribution_column_is_partition_key` (warnings) | distribute | the table has a default partition (attaching a partition scans it in every bucket on every node); the distribution column is the partition key |
+| `temporary_or_unlogged`, `inheritance`, `row_level_security`, `exclusion_constraint`, `trigger`, `rule`, `invalid_index`, `check_not_valid` | distribute, distribute_reference | the table has what stays refused (one row per constraint and per trigger) |
 | `tablespace` | distribute, distribute_reference | the table or one of its indexes is not in the default tablespace |
 | `ledger_table` | distribute, distribute_reference | a `kingres_ledger` table or the history table of one |
 | `dependent_object` | distribute, distribute_reference | a view, materialized view, publication or function that uses the table, or a column of another table with its row type |
@@ -748,6 +750,85 @@ Fault points: the ones of the single-node variants at every phase, and `rebuild_
 `rebuild_switch_after_prepare` in the switch. Tests: `t/187_online_undistribute` and `t/188_online_alter` (a table of every kind of object
 while it is written from another node, a writer racing each of eleven points, an error at each point, refusals, the guard on every node,
 cancel, float keys written with `extra_float_digits = 0`).
+
+### User-partitioned tables (increment 9.5)
+
+`create_distributed_table` takes a table that the user partitioned by RANGE or LIST (one level; ordinary partitions with nothing of their own: no
+index, constraint, default or storage parameter that the table lacks; at most `kingres_shard.max_partition_leaves` leaves, the bucket count times the
+number of partitions; the blocking variant only, the online variants refuse it with `not_available_yet`). The layout is hash on top and the user's
+partitioning below: every node has the parent; a bucket partition `<table>_bNNNN` exists on the group that owns it and is itself
+`PARTITION BY <method> (<key>)`; inside it a leaf `<partition>_bNNNN` per user partition, with the bound of the partition (`DEFAULT` too). A user
+partition is a row of `kingres.dist_partition` (`parent`, `partition_name`, `bound`), not a table: `SELECT * FROM <partition>` does not work, query the
+table with the key condition (the planner prunes both levels). `kingres.dist_table.partition_method` and `partition_key` say how the table is
+partitioned; `kingres.partitions` lists the partitions with the size of their leaves on this node. The rows are copied from the parent and routed by
+PostgreSQL's own tuple routing at the owner; a row that fits no partition cannot exist in the source and would fail loudly. Writers of the table wait for
+the copy, as for any blocking creation. `t/189_partitioned_distribute` (a RANGE table with a default partition, a LIST table, the refusals, an error at
+every fault point of the creation).
+
+**Creating, dropping, detaching and attaching partitions.** Four functions (map group primary, superuser; one two-phase transaction on every
+node under the catalog lock; refused with `object_in_use` while a move or a table operation uses the group, so that a caller can retry):
+
+| Function | What happens |
+|---|---|
+| `kingres.create_partition(parent regclass, partition_name text, bound text, if_not_exists bool default false)` | One leaf `<partition_name>_bNNNN` per bucket, made like the bucket partition (`LIKE ... INCLUDING ALL`, same owner) and attached with the bound, which is the text that follows `FOR VALUES` (`FROM (...) TO (...)`, `IN (...)`) or `DEFAULT`; a bound with `;`, `--` or `/*` is refused. `ATTACH` locks each bucket partition `SHARE UPDATE EXCLUSIVE`: readers and writers go on; a default partition is scanned and locked `ACCESS EXCLUSIVE` until the commit, so writers of its rows wait. |
+| `kingres.drop_partition(parent regclass, partition_name text, missing_ok bool default false)` | The leaves go on every node, and the row. |
+| `kingres.detach_partition(parent regclass, partition_name text)` | The partition becomes a distributed table of the same group and distribution column (a hash parent `<partition_name>` made like the table, the leaves moved under it); no row moves. Refused when the table has foreign keys. |
+| `kingres.attach_partition(parent regclass, partition regclass, bound text)` | A distributed table of the same group, on the same distribution column, in the schema of the table, without keys, becomes a partition: its bucket partitions become leaves; no row moves. An ordinary table is not attached by this function: create the partition and insert its rows. |
+
+The statements are mapped by the ProcessUtility hook (on the map group primary, routing on): `CREATE TABLE s PARTITION OF p FOR VALUES ...` calls
+`create_partition` (constants, casts of constants, `MINVALUE`, `MAXVALUE` and `DEFAULT` are written back; any other expression is refused with the hint
+to call the function; sub-partitioning, storage parameters, a tablespace, an access method and columns are refused), `ALTER TABLE p ATTACH PARTITION t`
+calls `attach_partition` (an ordinary table is refused), `ALTER TABLE p DETACH PARTITION s` calls `detach_partition` (`CONCURRENTLY` is refused) and
+`DROP TABLE s` of a name that is a partition calls `drop_partition` (a drop of several names, with `CASCADE`, is left to PostgreSQL, which refuses
+it because the name is no table). `ALTER TABLE s`, `CREATE INDEX ON s` and `TRUNCATE s` of a partition name fail with PostgreSQL's "does not exist":
+run them on the table. A user-partitioned table cannot be undistributed or altered in this version (`not_available_yet`). Fault points:
+`partition_after_lock`, `partition_after_leaves`. Tests: `t/190_partition_functions` (every function, the refusals, an error at each fault point, a
+writer on another node racing a held `create_partition`, a busy group) and `t/191_partition_statements` (the statements).
+
+`kingres.partition_leaves(parent regclass, partition_name text)` returns `(node_id, bucket, leaf)` for every leaf of a partition, from the catalog; `check_cluster()`
+reports `dist_partition_mismatch` (node, leaf) for a leaf that the catalog lists and the node that owns its bucket does not have. `t/192_partition_catalog`.
+
+**Moving a bucket of a user-partitioned table.** The bucket partition `<table>_bNNNN` is a tree, and the move moves the tree: the copy on the target is
+made with the same key and one leaf per user partition, each with its bound, its owner and its access method (read from the source, so a leaf that was
+converted keeps its format); the check that makes the attach at the switch free of a scan is on the root and is inherited by the leaves; the publication
+of the source names the bucket partition and publishes through it (`publish_via_partition_root`, only when a table of the group is user-partitioned),
+so the number of table-sync workers does not grow with the number of leaves; the switch attaches and detaches the root as before. The orphan that the
+source keeps is the detached tree: its leaves and their indexes get names of the orphan and go to schema `kingres` with it, so that a bucket that comes
+back finds the names `<partition>_bNNNN` free, and dropping the orphan drops them. `kingres.buckets.partition_size` is the size of all the leaves. A
+partition that is created while a move runs is refused by the guard of the group. `check_cluster()` does not list an orphan that is a partitioned table
+(`orphan_table`); the cleanup drops it. `t/193_partitioned_move` (the move, the tree and its bounds, the orphan with its leaves, the move back at once, a
+writer on another node during the move, an error at three points, the publication through the root).
+
+**Queries.** The planner prunes both levels (the bucket partition by the key, the leaf by the interval); the pushdown, the fragment scan and the
+distributed scan take a user-partitioned table as they take a plain one, and the answers are those of the same table on one node, from every node and
+after every kind of change (`t/194_partitioned_queries`). No change of the planner or of the pushdown was needed.
+
+### Dependent views (increment 9.8)
+
+A table operation replaces the table by a new one, and a view is bound to a table by its OID, so by default a view that uses the table stops the
+operation (`dependent_object`, the view named). With `kingres_shard.dependent_views = 'recreate'` (a session setting; the online operations keep the value
+they were started with) the plain views that use the table, and the views that use those, are recreated: in the same transaction (the same locks) as the
+swap they are dropped, last first, and after the swap they are made again on the new table, first first, with the same definition (`pg_get_viewdef`), column
+names, owner, options (`security_barrier`, `security_invoker`, `check_option`), privileges (with the grant option, and `PUBLIC`) and comments (view and
+columns). It applies to `create_distributed_table`, `alter_distributed_table`, `undistribute_table` and the three online operations. A view that exists on
+another node than the map group primary (a view is local to the node where it was created) is recreated there; a distributed table is checked on every node.
+Refused, before anything is made (the report says so with `dependent_object`, and names the node): a materialized view that uses the table or a view; a view with a
+trigger, with a rule of its own, with privileges on a column, one that a function uses the row type of, or that a publication publishes; and, for an
+undistribute, a view on a node other than the one that keeps the table (the table will not be there). The default `refuse` is unchanged. A view over a
+distributed table that is owned by another role than the session role is refused by the rule of the scan unless it is `security_invoker`; the recreated view has
+the owner and options it had. `t/195_dependent_views` (the default, every operation, views on views, a view on another node, privileges, owner, options, comments,
+the refusals, an error at four points of the switch, a reader on another node that waits for the switch).
+
+### Storage parameters (increment 9.9)
+
+A table with storage parameters (`fillfactor`, `autovacuum_*`, `toast.*`, ...) is distributed, made a reference table, rebuilt and moved with them (they
+were refused before; the report now says `note: storage_parameters`). PostgreSQL does not allow them on a partitioned table, so a distributed table has them
+on its bucket partitions, and `kingres.dist_table.reloptions` (synchronized to every node) records them: the bucket partitions of the table that
+`create_distributed_table` (blocking and online) makes, of the table that `alter_distributed_table` (blocking and online) makes, and the ordinary table of
+`undistribute_table` (blocking and online) are made `WITH` them, and a bucket move makes its copy on the target `WITH` the parameters of the bucket partition on the
+source (`LIKE ... INCLUDING ALL` does not copy them). A reference table keeps its own. Not carried: the parameters of a partition of a user-partitioned table
+(`partition_local_object` refuses them as before), and a later `ALTER TABLE ... SET (...)` of a bucket partition (the record is the one of the last rebuild).
+`t/196_storage_parameters` (every operation, every node, the move, a table without parameters, the refusal for a partition).
 
 ### What 0.7 adds to the catalog
 
@@ -923,6 +1004,8 @@ the files of the extension, because the dump creates the extension.
 | `kingres_shard.enable_copy_routing` | on | Off: `COPY ... FROM` into a distributed table of a cluster with several groups is refused as in 0.5. `USERSET`. |
 | `kingres_shard.insert_batch_rows` | 1000 | Rows per batch that the row router sends to one group (1 to 100000). |
 | `kingres_shard.insert_batch_bytes` | 1MB | Text bytes per batch per group, the sum of the lengths of the values (16kB to 64MB). The memory of a bulk write is about two batches per group, whatever the number of rows. |
+| `kingres_shard.dependent_views` | refuse | `refuse` or `recreate`: what a table operation does with the plain views that use the table (see "Dependent views"). `USERSET`. |
+| `kingres_shard.max_partition_leaves` | 8192 | Most leaves (buckets times user partitions) one distributed table may have; a user-partitioned table over the limit is refused. `USERSET`. |
 | `kingres_shard.rebuild_batch_rows` | 10000 | Rows per chunk of the copy and of the replay of an online table operation (one transaction on every group it writes). `USERSET`. |
 | `kingres_shard.rebuild_drain_threshold` | 1000 | Entries of the capture log under which the switch is attempted. `USERSET`. |
 | `kingres_shard.rebuild_lock_timeout` | 200ms | The longest a lock request of the switch is queued behind other sessions. `USERSET`. |

@@ -195,6 +195,7 @@ kingres_internal_shadow_script(PG_FUNCTION_ARGS)
 	char	   *shadow;
 	DdlSet		ddl;
 	StringInfoData script;
+	char	   *with_clause;
 
 	require_superuser("kingres.internal_shadow_script()");
 	relname = get_rel_name(relid);
@@ -209,6 +210,7 @@ kingres_internal_shadow_script(PG_FUNCTION_ARGS)
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
 	kingres_shard_fetch_ddl(relid, column, true, &ddl, callercxt);
+	with_clause = kingres_shard_with_clause(relid, NULL, callercxt);
 	SPI_finish();
 
 	initStringInfo(&script);
@@ -224,7 +226,7 @@ kingres_internal_shadow_script(PG_FUNCTION_ARGS)
 					 errmsg("a distributed shadow needs a colocation group")));
 		placement = kingres_shard_load_placement(colocation_id);
 		/* a table that is rebuilt while the old one is in use cannot have its partitions under the final names yet */
-		kingres_shard_append_partitions(&script, nspname, partbase != NULL ? partbase : relname, shadow, placement, group);
+		kingres_shard_append_partitions(&script, nspname, partbase != NULL ? partbase : relname, shadow, placement, group, with_clause);
 	}
 	PG_RETURN_TEXT_P(cstring_to_text(script.data));
 }
@@ -291,6 +293,7 @@ kingres_internal_swap_table(PG_FUNCTION_ARGS)
 	Oid			oldrelid;
 	char	   *oldname;
 	char	   *fk_nv;
+	char	   *reloptions;
 	List	   *targets;
 	ListCell   *lc;
 	StringInfoData script;
@@ -315,6 +318,8 @@ kingres_internal_swap_table(PG_FUNCTION_ARGS)
 
 	/* The statements, read while the old table is whole (sequence states are the final ones). */
 	kingres_shard_fetch_ddl(relid, column, true, &ddl, callercxt);
+	reloptions = NULL;
+	(void) kingres_shard_with_clause(relid, &reloptions, callercxt);
 	fk_nv = fk_not_valid(ddl.fk.data);
 	{
 		MemoryContext old = MemoryContextSwitchTo(callercxt);
@@ -371,13 +376,15 @@ kingres_internal_swap_table(PG_FUNCTION_ARGS)
 	{
 		values[1] = CStringGetTextDatum(column);
 		values[2] = Int32GetDatum(colocation_id);
-		kingres_shard_run_spi("INSERT INTO " KINGRES_SHARD_SCHEMA ".dist_table (relid, method, dist_column, colocation_id) "
-							  "VALUES ($1::pg_catalog.oid::pg_catalog.regclass, 'hash', $2::pg_catalog.name, $3)",
+		kingres_shard_run_spi(psprintf("INSERT INTO " KINGRES_SHARD_SCHEMA ".dist_table (relid, method, dist_column, colocation_id, reloptions) "
+									   "VALUES ($1::pg_catalog.oid::pg_catalog.regclass, 'hash', $2::pg_catalog.name, $3, %s::pg_catalog.text[])",
+									   reloptions != NULL ? quote_literal_cstr(reloptions) : "NULL"),
 							  3, argtypes, values);
 	}
 	else
-		kingres_shard_run_spi("INSERT INTO " KINGRES_SHARD_SCHEMA ".dist_table (relid, method) "
-							  "VALUES ($1::pg_catalog.oid::pg_catalog.regclass, 'reference')",
+		kingres_shard_run_spi(psprintf("INSERT INTO " KINGRES_SHARD_SCHEMA ".dist_table (relid, method, reloptions) "
+									   "VALUES ($1::pg_catalog.oid::pg_catalog.regclass, 'reference', %s::pg_catalog.text[])",
+									   reloptions != NULL ? quote_literal_cstr(reloptions) : "NULL"),
 							  1, argtypes, values);
 
 	/* the transaction id of the swap on this node: what a later verification compares the rows' xmin with */
