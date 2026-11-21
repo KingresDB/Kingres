@@ -617,6 +617,7 @@ the instance).
   the manager's `/proc/PID/limits` shows a zero core limit, `BUILD-INFO` carries the SHA-256 of
   the installed binary) are in `test-deb.sh`, which needs Docker and a full build and was not run for
   this step.
+  **Owed for kingres_shard 0.8:** the Docker flows (`test-compose.sh`, `test-deb.sh`, `test-image.sh`: the version and script checks of `lib.sh`, the `ALTER EXTENSION ... UPDATE` steps of `flow.sh` from 0.6 and from 0.7) were changed to expect 0.8 and have not been run, because the build machine has no Docker; `test-verifier-package.sh` was run (23 checks), and `lib.sh` and `flow.sh` were checked for syntax and for the presence of every script they name in the tree and in `DATA`.
 - **`test-image.sh`**: the image builds under the name of its major; its labels
   (major, PostgreSQL version, KingresDB version, `AGPL-3.0-only AND PostgreSQL`)
   and `postgres --version` agree with the source tree; the five extensions are
