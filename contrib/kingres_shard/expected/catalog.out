@@ -234,7 +234,7 @@ SELECT name, setting, unit, context
                      name                     | setting | unit |  context  
 ----------------------------------------------+---------+------+-----------
  kingres_shard.add_node_batch_statements      | 100     |      | superuser
- kingres_shard.catalog_incremental            | on      |      | user
+ kingres_shard.catalog_incremental            | on      |      | superuser
  kingres_shard.control_call_timeout           | 0       | s    | user
  kingres_shard.deadlock_check_interval        | 0       | s    | sighup
  kingres_shard.deadlock_confirm_delay         | 200     | ms   | sighup

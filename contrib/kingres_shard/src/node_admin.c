@@ -839,8 +839,11 @@ int			kingres_shard_add_node_batch_statements = 100;
  * of the registration): the schema is made there, after them.
  */
 static bool
-stage_error_is_dependency(int sqlstate)
+stage_error_is_dependency(int sqlstate, const char *msg)
 {
+	/* a role that the node lacks is undefined_object too, and no later transaction makes it: that is an error of the call (P12R-05) */
+	if (sqlstate == ERRCODE_UNDEFINED_OBJECT && msg != NULL && strstr(msg, "role \"") != NULL)
+		return false;
 	return sqlstate == ERRCODE_UNDEFINED_TABLE || sqlstate == ERRCODE_UNDEFINED_OBJECT ||
 		sqlstate == ERRCODE_INVALID_SCHEMA_NAME || sqlstate == ERRCODE_UNDEFINED_FUNCTION;
 }
@@ -882,7 +885,7 @@ stage_exec_ok(PGconn *conn, const char *sql, const char *what)
  * in the last transaction.  Returns the number of schemas that are complete on the node.
  */
 static int
-stage_schemas_on_node(const char *host, int port, MemoryContext keepcxt, List **late_scripts, int *nlate)
+stage_schemas_on_node(const char *host, int port, MemoryContext keepcxt, List **late_scripts, int *nlate, bool *has_progress)
 {
 	MemoryContext callercxt = CurrentMemoryContext;
 	List	   *names = NIL;
@@ -907,6 +910,7 @@ stage_schemas_on_node(const char *host, int port, MemoryContext keepcxt, List **
 
 	*late_scripts = NIL;
 	*nlate = 0;
+	*has_progress = false;
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
 	spi_run("SELECT nsp::pg_catalog.text, script, digest, n FROM " KINGRES_SHARD_SCHEMA ".internal_add_node_schemas()",
@@ -923,9 +927,11 @@ stage_schemas_on_node(const char *host, int port, MemoryContext keepcxt, List **
 		MemoryContextSwitchTo(old);
 	}
 	SPI_finish();
-	if (names == NIL)
-		return 0;
 
+	/*
+	 * With no distributed schema the node is still asked: an earlier call may have left schemas and progress rows on it, which the registration
+	 * must not carry into the cluster (P12R-04).
+	 */
 	conn = kingres_shard_connect_control(host, port, &err);
 	if (conn == NULL)
 		ereport(ERROR,
@@ -941,6 +947,21 @@ stage_schemas_on_node(const char *host, int port, MemoryContext keepcxt, List **
 
 	PG_TRY();
 	{
+		if (names == NIL)
+		{
+			res = kingres_shard_bounded_exec(conn, "SELECT pg_catalog.to_regclass('" KINGRES_SHARD_SCHEMA ".add_node_progress') IS NOT NULL", true);
+			if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) != 1)
+				ereport(ERROR,
+						(errcode(ERRCODE_CONNECTION_FAILURE),
+						 errmsg("the new node %s:%d could not be asked what it holds", host, port)));
+			if (strcmp(PQgetvalue(res, 0, 0), "t") != 0)
+			{
+				PQclear(res);
+				goto stage_done;
+			}
+			PQclear(res);
+		}
+		*has_progress = true;
 		/* The extension is made in a transaction of its own: the batches need its table, and they commit before the registration. */
 		stage_exec_ok(conn, "CREATE EXTENSION IF NOT EXISTS kingres_shard", "making the extension");
 		res = kingres_shard_bounded_exec(conn,
@@ -972,7 +993,7 @@ stage_schemas_on_node(const char *host, int port, MemoryContext keepcxt, List **
 
 			memset(&cctl, 0, sizeof(cctl));
 			cctl.keysize = NAMEDATALEN;
-			cctl.entrysize = NAMEDATALEN + 40;
+			cctl.entrysize = NAMEDATALEN + 72;
 			cctl.hcxt = callercxt;
 			cur = hash_create("add_node current schemas", 256, &cctl, HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
 			forboth(l1, names, l3, digests)
@@ -980,7 +1001,7 @@ stage_schemas_on_node(const char *host, int port, MemoryContext keepcxt, List **
 				bool		found;
 				char	   *e = hash_search(cur, lfirst(l1), HASH_ENTER, &found);
 
-				strlcpy(e + NAMEDATALEN, (char *) lfirst(l3), 40);
+				strlcpy(e + NAMEDATALEN, (char *) lfirst(l3), 72);
 			}
 			for (i = 0; i < (uint64) PQntuples(res); i++)
 			{
@@ -1055,7 +1076,7 @@ stage_schemas_on_node(const char *host, int port, MemoryContext keepcxt, List **
 				continue;
 			}
 			sqlstate = kingres_shard_result_sqlstate(res);
-			if (stage_error_is_dependency(sqlstate))
+			if (stage_error_is_dependency(sqlstate, PQresultErrorMessage(res)))
 			{
 				/* Not yet: it reads a table that the registration makes.  What the statements did is undone with the savepoint. */
 				PQclear(res);
@@ -1086,6 +1107,8 @@ stage_schemas_on_node(const char *host, int port, MemoryContext keepcxt, List **
 			kingres_shard_fault_point("add_node_batch_done");
 			nbatches++;
 		}
+stage_done:
+		;
 	}
 	PG_CATCH();
 	{
@@ -1095,6 +1118,7 @@ stage_schemas_on_node(const char *host, int port, MemoryContext keepcxt, List **
 	PG_END_TRY();
 	PQfinish(conn);
 
+	if (names != NIL)
 	ereport(NOTICE,
 			(errmsg("add_node: %d distributed schemas are on the node in %d batches (%d were made by an earlier call, %d are made in the last transaction)",
 					staged, nbatches, skipped, *nlate)));
@@ -1370,6 +1394,7 @@ kingres_add_node_body(PG_FUNCTION_ARGS)
 	int			node_id;
 	MemoryContext fcxt = CurrentMemoryContext;	/* the context of the call: what the staging returns must outlive the SPI connection of this function */
 	int			staged_schemas = 0;
+	bool		has_progress = false;
 	List	   *late_scripts = NIL;
 	int			nlate = 0;
 	Oid			argtypes[5];
@@ -1479,7 +1504,7 @@ kingres_add_node_body(PG_FUNCTION_ARGS)
 	if (is_primary)
 	{
 		record_pending_node(host, port, 0);
-		staged_schemas = stage_schemas_on_node(host, port, fcxt, &late_scripts, &nlate);
+		staged_schemas = stage_schemas_on_node(host, port, fcxt, &late_scripts, &nlate, &has_progress);
 		kingres_shard_fault_point("add_node_staged");
 		kc = kingres_shard_get_conn(host, port, false, NULL);
 		kingres_shard_begin_write_xact(kc);
@@ -1585,7 +1610,7 @@ kingres_add_node_body(PG_FUNCTION_ARGS)
 
 	if (is_primary)
 	{
-		if (staged_schemas > 0)
+		if (staged_schemas > 0 || has_progress)
 		{
 			/*
 			 * Every schema that the batches made is on the node, or the node is not registered (a schema that went missing after its batch, or
@@ -1606,7 +1631,7 @@ kingres_add_node_body(PG_FUNCTION_ARGS)
 			PQclear(res);
 		}
 		create_tables_on_node(kc, late_scripts);
-		if (staged_schemas > 0)
+		if (staged_schemas > 0 || has_progress)
 			PQclear(kingres_shard_exec(kc, "DELETE FROM " KINGRES_SHARD_SCHEMA ".add_node_progress"));
 		snprintf(idbuf, sizeof(idbuf), "%d", node_id);
 		params[0] = idbuf;

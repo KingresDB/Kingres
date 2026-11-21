@@ -139,4 +139,21 @@ sub invalidations_of
 	is(q1($n1, q{SELECT group_id FROM kingres.schemas WHERE schema_name = 'tenant_5'}), $target, '... which is the group the schema moved to');
 }
 
+# D. the lookups take the primary key from the table they open (review P12R-03)
+{
+	my $h = $n3->background_psql('postgres', on_error_stop => 0);
+	is($h->query('SELECT count(*) FROM tenant_1.t1'), 0, 'D: a backend that has the catalog loaded');
+	q1($n1, q{REINDEX (CONCURRENTLY) TABLE kingres.dist_schema; REINDEX (CONCURRENTLY) TABLE kingres.dist_table});
+	is($h->query('SELECT count(*) FROM tenant_9.t1'), 0, 'D: after REINDEX CONCURRENTLY of the two tables it still finds a schema table it had not looked up');
+	is($h->query(q{INSERT INTO tenant_10.t1 VALUES (7, 'x') RETURNING id}), 7, 'D: ... and routes a write');
+	q1($n1, q{ALTER INDEX kingres.dist_table_pkey RENAME TO ks_renamed_pk});
+	is($h->query('SELECT count(*) FROM tenant_11.t1'), 0, 'D: an index that has another name is the same index');
+	q1($n1, q{ALTER INDEX kingres.ks_renamed_pk RENAME TO dist_table_pkey});
+	$h->quit;
+	# a table of the extension without its primary key is an error, never "a local table" (in a transaction that is rolled back)
+	my ($rc, $out, $err) = run_sql($n1, q{BEGIN; ALTER TABLE kingres.dist_schema DROP CONSTRAINT dist_schema_pkey; SELECT count(*) FROM tenant_12.t1; ROLLBACK});
+	like($err, qr/has no primary key/, 'D: without the primary key of dist_schema a statement on a schema table is refused with the reason, not answered from a local copy') or diag($err);
+	is(q1($n1, q{SELECT count(*) FROM tenant_12.t1}), 0, 'D: after the rollback it answers again');
+}
+
 done_testing();

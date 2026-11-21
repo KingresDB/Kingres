@@ -76,8 +76,6 @@ static struct
 	MemoryContext cxt;
 	KsCatalog	cat;
 	HTAB	   *cohash;			/* colocation id -> KsColocation *, of the cached list */
-	Oid			dist_table_pk;	/* the primary key indexes that the lazy lookups of schema tables and schemas use */
-	Oid			dist_schema_pk;
 }			ks;
 
 typedef struct ColocEntry
@@ -756,8 +754,6 @@ catalog_load(void)
 	ks.cxt = newcxt;
 	ks.cat = cat;
 	ks.cohash = cohash;
-	ks.dist_table_pk = OidIsValid(nsp) ? get_relname_relid("dist_table_pkey", nsp) : InvalidOid;
-	ks.dist_schema_pk = OidIsValid(nsp) ? get_relname_relid("dist_schema_pkey", nsp) : InvalidOid;
 	memcpy(ks.relids, relids, sizeof(relids));
 	if (prevcxt != NULL)
 		catalog_retire(prevcxt);
@@ -1116,12 +1112,23 @@ kingres_shard_lookup_dist_table(Oid relid)
  * transaction changed.
  */
 static HeapTuple
-lazy_fetch(Oid heapoid, Oid pkoid, Oid key, SysScanDesc *sd, Relation *rel, Snapshot *snap)
+lazy_fetch(Oid heapoid, Oid key, SysScanDesc *sd, Relation *rel, Snapshot *snap)
 {
 	ScanKeyData skey;
+	Oid			pkoid;
 
 	stat_lazy_lookups++;
 	*rel = table_open(heapoid, AccessShareLock);
+	/*
+	 * The index is the one that the open relation has now, not an OID kept from the load: REINDEX CONCURRENTLY replaces it without a write to the
+	 * catalog table, and an index that is missing must be an error, not "this is a local table" (P12R-03).
+	 */
+	pkoid = RelationGetPrimaryKeyIndex(*rel, true);
+	if (!OidIsValid(pkoid))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("the table \"%s\" of the extension has no primary key", RelationGetRelationName(*rel)),
+				 errhint("Restore the primary key of the table (kingres_shard 0.8 creates it).")));
 	*snap = RegisterSnapshot(IsInParallelMode() ? GetActiveSnapshot() : GetLatestSnapshot());
 	ScanKeyInit(&skey, 1, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(key));
 	*sd = systable_beginscan(*rel, pkoid, true, *snap, 1, &skey);
@@ -1148,9 +1155,9 @@ lazy_schema_table(Oid relid)
 	bool		is_schema = false;
 	int			cid = 0;
 
-	if (!OidIsValid(ks.dist_table_pk) || !OidIsValid(ks.relids[2]))
+	if (!OidIsValid(ks.relids[2]))
 		return NULL;
-	tup = lazy_fetch(ks.relids[2], ks.dist_table_pk, relid, &sd, &rel, &snap);
+	tup = lazy_fetch(ks.relids[2], relid, &sd, &rel, &snap);
 	if (tup != NULL)
 	{
 		TupleDesc	desc = RelationGetDescr(rel);
@@ -1217,14 +1224,14 @@ kingres_shard_lookup_dist_schema(const KsCatalog *cat, Oid nsp)
 	s = hash_search(cat->dist_schemas, &nsp, HASH_FIND, NULL);
 	if (s != NULL)
 		return s->negative ? NULL : s;
-	if (cat != &ks.cat || ks.loading || !OidIsValid(ks.dist_schema_pk))
+	if (cat != &ks.cat || ks.loading)
 		return NULL;
 	{
 		Oid			ds_rel = kingres_shard_catalog_relid("dist_schema");
 
 		if (!OidIsValid(ds_rel))
 			return NULL;
-		tup = lazy_fetch(ds_rel, ks.dist_schema_pk, nsp, &sd, &rel, &snap);
+		tup = lazy_fetch(ds_rel, nsp, &sd, &rel, &snap);
 		if (tup != NULL)
 		{
 			TupleDesc	desc = RelationGetDescr(rel);

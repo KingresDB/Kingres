@@ -5,10 +5,11 @@
 # mk-install-script.sh: write kingres_shard--0.8.sql, the install script of the current version: the 0.7
 # install script from its \echo line on, followed by the 0.7--0.8 upgrade script after its \echo line (the
 # convention of the older scripts; the "upgrade" regression test compares the catalogs of the two ways).
-# Run it in contrib/kingres_shard after every change of kingres_shard--0.7--0.8.sql.
+# Run it in contrib/kingres_shard after every change of kingres_shard--0.7--0.8.sql, kingres_shard--0.7.sql or kingres_shard--0.6--0.7.sql (a merge that
+# changes the 0.7 scripts too); t/250_install_script_current.pl fails when the committed file differs (KS_INSTALL_SCRIPT_OUT names another output file).
 set -eu
 d=$(cd "$(dirname "$0")" && pwd)
-out=$d/kingres_shard--0.8.sql
+out=${KS_INSTALL_SCRIPT_OUT:-$d/kingres_shard--0.8.sql}
 {
   cat <<'HDR'
 -- SPDX-License-Identifier: AGPL-3.0-only

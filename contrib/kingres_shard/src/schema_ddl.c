@@ -97,7 +97,7 @@ kingres_shard_schema_ddl_init(void)
 							 "Off: every change of the catalog invalidates every distributed table (the fallback).",
 							 &kingres_shard_catalog_incremental,
 							 true,
-							 PGC_USERSET,
+							 PGC_SUSET,
 							 0,
 							 NULL, NULL, NULL);
 

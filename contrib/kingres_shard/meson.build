@@ -322,6 +322,9 @@ tests += {
       't/246_schema_second_review_cluster.pl',
       't/247_catalog_incremental_cluster.pl',
       't/248_add_node_batches_cluster.pl',
+      't/249_split_verify_types.pl',
+      't/250_install_script_current.pl',
+      't/251_add_node_staging_leftovers.pl',
     ],
   },
 }

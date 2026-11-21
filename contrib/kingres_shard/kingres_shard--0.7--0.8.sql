@@ -1838,8 +1838,9 @@ BEGIN
             SELECT pg_catalog.string_agg(pg_catalog.format('%I = EXCLUDED.%I', k, k), ', ') INTO v_set
               FROM pg_catalog.jsonb_array_elements_text(el OPERATOR(pg_catalog.->) 'cols') k
              WHERE NOT (k OPERATOR(pg_catalog.=) ANY (ARRAY(SELECT pg_catalog.jsonb_array_elements_text(el OPERATOR(pg_catalog.->) 'pk'))));
-            -- ... and only a row whose values differ is written (an equal row is left alone: no dead tuple, no work under the writers' lock, P10F-02)
-            SELECT pg_catalog.string_agg(pg_catalog.format('c.%I', k), ', '), pg_catalog.string_agg(pg_catalog.format('EXCLUDED.%I', k), ', ') INTO v_dl, v_dr
+            -- ... and only a row whose values differ is written (an equal row is left alone: no dead tuple, no work under the writers' lock, P10F-02); the values are compared
+            -- as text in the byte order of the C collation: a json, xml or point column has no equality operator (P12R-01), and a nondeterministic collation must not call two strings equal
+            SELECT pg_catalog.string_agg(pg_catalog.format('c.%I::pg_catalog.text COLLATE "C"', k), ', '), pg_catalog.string_agg(pg_catalog.format('EXCLUDED.%I::pg_catalog.text COLLATE "C"', k), ', ') INTO v_dl, v_dr
               FROM pg_catalog.jsonb_array_elements_text(el OPERATOR(pg_catalog.->) 'cols') k
              WHERE NOT (k OPERATOR(pg_catalog.=) ANY (ARRAY(SELECT pg_catalog.jsonb_array_elements_text(el OPERATOR(pg_catalog.->) 'pk'))));
             FOR v_n IN 1 .. 2 LOOP
@@ -3330,7 +3331,7 @@ BEGIN
 END;
 $$;
 
--- The structure of a table as one text (and its md5, the fingerprint): columns (name, type, modifier, collation, not null, default, identity,
+-- The structure of a table as one text (and its sha256 in hex, the fingerprint: md5 is not available on a server in FIPS mode, P12R-07): columns (name, type, modifier, collation, not null, default, identity,
 -- generated), constraints, indexes and storage options, each sorted.  The same table has the same fingerprint on every
 -- node; the names of schemas are in it, the OIDs are not.  The search path is fixed so that the definitions print the same.
 -- The hook asks every node for it in the session of the user whose statement it is, so the function is executable by
@@ -3365,7 +3366,7 @@ CREATE FUNCTION kingres.internal_table_fingerprint(p_rel regclass)
     LANGUAGE sql STABLE
     SET search_path = pg_catalog, pg_temp
     AS $$
-SELECT pg_catalog.md5(kingres.internal_table_structure(p_rel));
+SELECT pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(kingres.internal_table_structure(p_rel), 'UTF8')), 'hex');
 $$;
 
 GRANT EXECUTE ON FUNCTION kingres.internal_table_structure(regclass), kingres.internal_table_fingerprint(regclass) TO PUBLIC;
@@ -4822,7 +4823,7 @@ CREATE FUNCTION kingres.internal_add_node_schemas()
     LANGUAGE sql STABLE
     SET search_path = pg_catalog, kingres, pg_temp
     AS $$
-SELECT ns.nspname, y.script, pg_catalog.md5(y.script), (pg_catalog.cardinality(st.a) OPERATOR(pg_catalog.+) 1)::pg_catalog.int4
+SELECT ns.nspname, y.script, pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(y.script, 'UTF8')), 'hex'), (pg_catalog.cardinality(st.a) OPERATOR(pg_catalog.+) 1)::pg_catalog.int4
   FROM kingres.dist_schema d
   JOIN pg_catalog.pg_namespace ns ON ns.oid OPERATOR(pg_catalog.=) d.nsp::pg_catalog.oid
   CROSS JOIN LATERAL (SELECT kingres.internal_schema_structure(d.nsp)) st(a)
