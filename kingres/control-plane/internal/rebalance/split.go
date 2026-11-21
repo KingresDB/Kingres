@@ -280,7 +280,18 @@ func (s *Service) splitDefinition() task.Definition {
 			}
 			return s.verifySplit(ctx, v)
 		}},
-	}}
+	}, Cancellable: splitCancellable}
+}
+
+// splitCancellable: a cancel ends the step that runs the split (the engine needs a guard to interrupt a step); once that step is done the split
+// is made and there is nothing left to cancel.
+func splitCancellable(t task.Task) bool {
+	for _, st := range t.Steps {
+		if st.Name == StepSplitRun {
+			return st.State != task.StepDone
+		}
+	}
+	return true
 }
 
 // splitRecord is the extension's record of a split.

@@ -6,6 +6,8 @@ package rebalance
 import (
 	"context"
 	"testing"
+
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
 )
 
 func TestSplitChildren(t *testing.T) {
@@ -53,5 +55,17 @@ func TestSplitRefusesABadRequestBeforeTouchingTheCluster(t *testing.T) {
 	s := &Service{}
 	if _, err := s.Split(context.Background(), "u", "db", 1, 3, SplitRequest{Parts: 5}); err == nil {
 		t.Fatal("parts 5 must be refused")
+	}
+}
+
+func TestSplitCancelGuard(t *testing.T) {
+	mk := func(state string) task.Task {
+		return task.Task{Steps: []task.StepState{{Name: StepSplitCheck, State: task.StepDone}, {Name: StepSplitRun, State: state}}}
+	}
+	if !splitCancellable(mk(task.StepRunning)) || !splitCancellable(mk(task.StepPending)) {
+		t.Error("a cancel is accepted while the split runs")
+	}
+	if splitCancellable(mk(task.StepDone)) {
+		t.Error("nothing is left to cancel when the split is done")
 	}
 }
