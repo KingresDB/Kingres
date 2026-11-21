@@ -433,7 +433,7 @@ func (s *Service) followSplit(ctx context.Context, env *task.Env, v splitInput, 
 func (s *Service) verifySplit(ctx context.Context, v splitInput) error {
 	var n int
 	err := s.Backend.with(ctx, v.Database, func(c *pgx.Conn) error {
-		return c.QueryRow(ctx, `SELECT count(*) FROM kingres.bucket_map WHERE colocation_id = $1 AND modulus = $3 * $4 AND bucket % $3 = $2 % $3`,
+		return c.QueryRow(ctx, `SELECT count(*) FROM kingres.bucket_map WHERE colocation_id = $1 AND modulus = $3::int * $4::int AND bucket % $3::int = $2::int % $3::int`,
 			v.Colocation, v.Bucket, v.Modulus, v.Parts).Scan(&n)
 	})
 	if err != nil {

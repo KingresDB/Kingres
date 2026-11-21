@@ -85,6 +85,7 @@ func p10Count(t *testing.T, n *clustertest.Node, db string) (int, int64) {
 
 // p10Writer inserts rows with ids from base on node n until stop is closed, and records every id that was acknowledged.
 type p10Writer struct {
+	once  sync.Once
 	wg    sync.WaitGroup
 	stop  chan struct{}
 	mu    sync.Mutex
@@ -94,6 +95,8 @@ type p10Writer struct {
 
 func p10Write(t *testing.T, n *clustertest.Node, db string, base int64) *p10Writer {
 	w := &p10Writer{stop: make(chan struct{})}
+	// A test that fails before it stops the writer must not leave it running: it shares the connection of the node with the next steps.
+	t.Cleanup(func() { w.halt() })
 	w.wg.Add(1)
 	go func() {
 		defer w.wg.Done()
@@ -127,10 +130,14 @@ func p10Write(t *testing.T, n *clustertest.Node, db string, base int64) *p10Writ
 }
 
 // finish stops the writer and returns how many rows it wrote and the sum of their ids.
+func (w *p10Writer) halt() {
+	w.once.Do(func() { close(w.stop) })
+	w.wg.Wait()
+}
+
 func (w *p10Writer) finish(t *testing.T) (int, int64) {
 	t.Helper()
-	close(w.stop)
-	w.wg.Wait()
+	w.halt()
 	if w.fails.Load() != 0 {
 		t.Errorf("a write never succeeded")
 	}
