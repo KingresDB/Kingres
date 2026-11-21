@@ -7016,9 +7016,9 @@ BEGIN
 
     ELSE
         -- create_partition, attach_partition, detach_partition, drop_partition
-        IF NOT is_dist OR v_dt.method OPERATOR(pg_catalog.<>) 'hash' THEN
+        IF NOT is_dist OR v_dt.method OPERATOR(pg_catalog.<>) 'hash' OR v_dt.partition_method IS NULL THEN
             rep := rep OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_array(
-                       'blocker', 'not_distributed', qname, pg_catalog.format('table "%s" is not a distributed table', rname)));
+                       'blocker', 'not_distributed', qname, pg_catalog.format('table "%s" is not a user-partitioned distributed table', rname)));
         END IF;
         IF options OPERATOR(pg_catalog.->>) 'partition' IS NOT NULL
            AND pg_catalog.octet_length(options OPERATOR(pg_catalog.->>) 'partition') OPERATOR(pg_catalog.+) 6 OPERATOR(pg_catalog.>) 63 THEN
@@ -7026,8 +7026,6 @@ BEGIN
                        'blocker', 'name_too_long', options OPERATOR(pg_catalog.->>) 'partition',
                        pg_catalog.format('partition name "%s" is too long: leaf names append 6 characters (_bNNNN)', options OPERATOR(pg_catalog.->>) 'partition')));
         END IF;
-        rep := rep OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_array(
-                   'blocker', 'not_available_yet', qname, 'user partitions of distributed tables are not available in this version'));
     END IF;
 
     -- a table that is rebuilt is copied into a new table, whose constraints, defaults and indexes run on every node with the rights of the
