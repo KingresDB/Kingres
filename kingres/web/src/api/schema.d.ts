@@ -1495,8 +1495,9 @@ export interface paths {
         /**
          * Get the current rebalance status
          * @description Whether a rebalance is needed, running, stopped or idle, with progress and the moves in flight.
-         *     `progress` and `inFlightMoves` describe the current run (a stopped run too) and are null or empty while
-         *     idle. `lastReport` is the summary of the most recent finished or failed run other than the current one (the
+         *     `progress` and `inFlightMoves` describe the current run and are null or empty while idle. A stopped run lists no move
+         *     in flight and reports `movesInFlight` 0: a move that the loss of its source left unfinished is settled by the
+         *     extension's recovery when the rebalance is started again. `lastReport` is the summary of the most recent finished or failed run other than the current one (the
          *     same object as the matching item of `GET /rebalance/reports`) and is null when no run has finished yet.
          *
          *     **States (0.9.0).** `idle`: no run is unfinished and the last one did not fail. `running`: the task runs.
