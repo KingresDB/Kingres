@@ -321,3 +321,44 @@ func TestRelinquishKeepsCheckingAndHoldsTheInstanceBack(t *testing.T) {
 
 // AnyFencedFile is the test's own look at the lease directory of a rig.
 func AnyFencedFile(rigDir string) bool { return AnyFenced(filepath.Join(rigDir, "lease")) }
+
+// The clean stop of a planned switchover holds the primary back but goes on renewing the lease until the stop is over: a shutdown that takes
+// longer than the lease has left (a slow walsender, a slow checkpoint: here, three lease durations of the fake clock) is not fenced in the middle,
+// which would make it an unclean one. When the stop ends cleanly the lease is released; when it does not, Relinquish ends the renewal and the
+// lease lapses and fences as before.
+func TestHoldBackKeepsRenewingThroughASlowStop(t *testing.T) {
+	ctx := context.Background()
+	r := newRig(t, []string{"a", "b", "c"}, true)
+	r.m.Renew(ctx)
+	if err := r.m.HoldBack(1); err != nil {
+		t.Fatal(err)
+	}
+	if err := Gate(filepath.Join(r.dir, "lease"), testPrimary)(1); err == nil {
+		t.Fatal("the primary of a group that is held back must not be started")
+	}
+	if r.m.Relinquished(1) {
+		t.Fatal("HoldBack stopped the renewal")
+	}
+	for elapsed := time.Duration(0); elapsed < 3*dur; elapsed += 2 * time.Second {
+		r.clk.Advance(2 * time.Second)
+		r.m.Renew(ctx)
+		r.settle(t)
+		r.m.Check(ctx)
+		if up, stops, _ := r.inst.state(); !up || stops != 0 {
+			t.Fatalf("the slow stop was fenced after %v: running=%v stops=%d", elapsed+2*time.Second, up, stops)
+		}
+		if !r.m.Holds(1) {
+			t.Fatalf("the lease was lost after %v", elapsed+2*time.Second)
+		}
+	}
+	// The stop did not end cleanly: the renewal ends, the lease lapses and the fence stops what still runs.
+	if err := r.m.Relinquish(1); err != nil {
+		t.Fatal(err)
+	}
+	r.clk.Advance(dur - margin + time.Millisecond)
+	r.m.Renew(ctx)
+	r.m.Check(ctx)
+	if up, stops, _ := r.inst.state(); up || stops != 1 {
+		t.Fatalf("a stop that did not end cleanly was not fenced when the lease lapsed: running=%v stops=%d", up, stops)
+	}
+}

@@ -21,7 +21,7 @@ $groups = [ordered]@{
     # T11, T11b, T11c: the old primary comes back, never comes back, runs unfenced.
     'old-primary'      = 'TestOldPrimaryReturns|TestOldPrimaryReturnsAndIsRebuiltByABaseBackup|TestOldPrimaryNeverReturns|TestOldPrimaryRunningUnfenced'
     # T12, T12b, T12c: the planned switchover, and the way back.
-    'switchover'       = 'TestSwitchoverOfAGroup|TestSwitchoverVerificationFails|TestSwitchoverWithAnUncleanStop|TestSwitchoverCancelBeforeAndAfterThePointOfNoReturn|TestSwitchoverSurvivesTheLeaderEndingWhileTheWritesAreStopped'
+    'switchover'       = 'TestSwitchoverOfAGroup|TestSwitchoverVerificationFails|TestSwitchoverWithAnUncleanStop|TestSwitchoverCancelBeforeAndAfterThePointOfNoReturn|TestSwitchoverSurvivesTheLeaderEndingWhileTheWritesAreStopped|TestSwitchoverSurvivesACleanStopThatOutlastsTheLease'
     'restore'          = 'TestSwitchoverAndBack|TestSwitchoverStatusNamesThePhaseAndThePause'
     # T6: the map group.
     'map-group'        = 'TestMapGroupPrimaryLost|TestMapGroupBootstrapSurvivesKingresdEnding|TestMapGroupEngineGateStaysClosedUntilTheBootstrapEnds'

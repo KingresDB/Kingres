@@ -291,12 +291,21 @@ func demoteClean(ctx context.Context, d *haDeps, r failover.DemoteRequest) (any,
 	if !ok {
 		return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "not_primary", Message: "This server runs no primary of the shard group."}
 	}
-	if err := d.LeaseMgr.Relinquish(r.Group); err != nil {
+	// The primary is held back from starting, but the lease is renewed until the stop is over: a slow clean stop must not run into the end of the lease and
+	// be fenced (it would then not be a clean one). A stop that does not end cleanly stops the renewal below, and the lease lapses and fences as before.
+	if err := d.LeaseMgr.HoldBack(r.Group); err != nil {
 		return nil, err
 	}
 	out := failover.DemoteAnswer{}
 	stopCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
+	// A test: the stop takes longer than the lease the old primary has left, as it does when a walsender or a checkpoint holds the shutdown.
+	if d.Fault.FailoverInjection("demote:slowstop") == "slow" {
+		select {
+		case <-time.After(20 * time.Second):
+		case <-stopCtx.Done():
+		}
+	}
 	// A fast shutdown, never an immediate one: an immediate stop is not a clean one, and the proof would be the only protection.
 	if err := d.Svc.Manager().Stop(stopCtx, li.ID); err != nil {
 		d.Log.Warn("failover: stopping the old primary cleanly", "group", r.Group, "instance", li.ID, "error", err)
@@ -304,6 +313,7 @@ func demoteClean(ctx context.Context, d *haDeps, r failover.DemoteRequest) (any,
 	running, err := d.Svc.Manager().Running(ctx, li.ID)
 	out.Stopped = err == nil && !running
 	if !out.Stopped {
+		_ = d.LeaseMgr.Relinquish(r.Group) // not stopped: the renewal ends, the lease lapses and the fence stops what runs
 		return out, nil
 	}
 	cd, err := d.Svc.Manager().ControlData(ctx, li.ID)
@@ -321,6 +331,8 @@ func demoteClean(ctx context.Context, d *haDeps, r failover.DemoteRequest) (any,
 		if rerr != nil {
 			d.Log.Warn("failover: the lease was not released; it runs out by itself", "group", r.Group, "error", rerr)
 		}
+	} else {
+		_ = d.LeaseMgr.Relinquish(r.Group) // not a clean stop: no renewal, the lease runs out by itself
 	}
 	return out, nil
 }

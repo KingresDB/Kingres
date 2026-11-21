@@ -295,3 +295,32 @@ func TestSwitchoverSurvivesTheLeaderEndingWhileTheWritesAreStopped(t *testing.T)
 		}
 	}
 }
+
+// The clean stop takes longer than the lease the old primary has left (the fault holds the stop for 20 s, the lease is 12 s with a margin of 3 s): this
+// is what a walsender of a bucket move that has to send what is pending, or a slow shutdown checkpoint, does, without depending on the load of the
+// machine. The lease is renewed until the stop is over, so the stop is not fenced in the middle and the switchover ends done.
+func TestSwitchoverSurvivesACleanStopThatOutlastsTheLease(t *testing.T) {
+	e := swCluster(t)
+	c, port, pool, leader, g, old, nw, w := e.c, e.port, e.pool, e.leader, e.g, e.old, e.nw, e.w
+	old.SetFaults(fault.Spec{FailoverPoint: "demote:slowstop", FailoverMode: "slow"})
+	id := swRequest(t, leader, old, nw, g)
+	swWait(t, e, id, 8*time.Minute)
+	if host := swPrimaryHost(t, leader, g); host != nw.Host {
+		t.Fatalf("the primary of group %d is on %s, want %s", g, host, nw.Host)
+	}
+	before := w.count()
+	until(t, 2*time.Minute, "writes after the switchover", func() bool { return w.count() > before+30 })
+	acked := w.Stop()
+	for _, n := range c.Nodes {
+		if n == old {
+			continue
+		}
+		have := foReadIDs(t, n, port, pool)
+		for rid := range acked {
+			if !have[rid] {
+				t.Errorf("acknowledged row %d is missing when read through %s", rid, n.Host)
+				break
+			}
+		}
+	}
+}

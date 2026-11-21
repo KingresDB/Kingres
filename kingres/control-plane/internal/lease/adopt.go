@@ -173,6 +173,18 @@ func (m *Manager) Relinquish(group int32) error {
 	return nil
 }
 
+// HoldBack writes the relinquished marker (the start gate then refuses to start the primary of the group) and does NOT stop renewing the lease. The clean
+// stop of a planned switchover uses it: a fast shutdown can take longer than the lease has left (a logical walsender of a bucket move that has to send
+// what is pending, a shutdown checkpoint on a slow disk), and a lease that stopped being renewed at its start lapses in the middle of it and is fenced,
+// which turns a slow clean stop into an unclean one. The renewal ends with Relinquish (a stop that did not end cleanly: the lease then lapses and the
+// fence stops what still runs) or ReleaseGroup (the clean stop: the lease is handed back at once).
+func (m *Manager) HoldBack(group int32) error {
+	if err := pki.WriteFile(MarkerPath(m.c.Dir, RelinquishedMarker, group), []byte("holding back\n"), 0o600); err != nil {
+		return fmt.Errorf("lease: writing the relinquished marker: %w", err)
+	}
+	return nil
+}
+
 // Unrelinquish removes the marker and renews the lease of the group again (a
 // cancelled switchover; a server that became a standby of the group).
 func (m *Manager) Unrelinquish(group int32) error {
