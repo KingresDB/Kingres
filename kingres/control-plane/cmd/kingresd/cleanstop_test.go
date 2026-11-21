@@ -69,3 +69,21 @@ func TestTheRenewalEndsOnEveryEndOfTheCleanStop(t *testing.T) {
 		}
 	}
 }
+
+// F5-12. The checkpoint of the stopped primary of the map group is given only while a marker holds it back, and never while it runs.
+func TestTheCheckpointIsGivenOnlyForAHeldBackStoppedPrimary(t *testing.T) {
+	ctx := context.Background()
+	stopped := &fakeStopper{running: false, state: "shut down"}
+	ans, err := mapCheckpoint(ctx, stopped, 1, true, true)
+	if cp, ok := ans.(failover.MapCheckpoint); err != nil || !ok || cp.Checkpoint != "0/6000028" || cp.ClusterState != "shut down" {
+		t.Fatalf("a held back stopped primary: %v %+v", err, ans)
+	}
+	_, err = mapCheckpoint(ctx, stopped, 1, false, true)
+	callErr(t, err, 409, "not_primary")
+	_, err = mapCheckpoint(ctx, stopped, 1, true, false)
+	callErr(t, err, 409, "not_held_back")
+	_, err = mapCheckpoint(ctx, &fakeStopper{running: true, state: "in production"}, 1, true, true)
+	callErr(t, err, 409, "not_stopped")
+	_, err = mapCheckpoint(ctx, &fakeStopper{running: false, cdErr: errors.New("no pg_controldata")}, 1, true, true)
+	callErr(t, err, 503, "unavailable")
+}

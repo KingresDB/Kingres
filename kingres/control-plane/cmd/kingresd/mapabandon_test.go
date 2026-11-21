@@ -239,3 +239,39 @@ func TestARefusalBelongsToTheTaskAndTheServerThatWereAsked(t *testing.T) {
 		t.Fatal("an old refusal survived a new start")
 	}
 }
+
+// F5-12. The planned form of map/start is accepted from the old server only and with a task and a standby; the proof is accepted from the old server only,
+// for a planned journal, once.
+func TestThePlannedStartAndTheProofAreAcceptedFromTheOldServerOnly(t *testing.T) {
+	ctx := context.Background()
+	m, js := abandonRig(t)
+	d := &haDeps{MapFailover: m}
+	start := func(caller string, p *journal.Planned) error {
+		b, _ := json.Marshal(mapStartBody{Server: "s1", Planned: p})
+		_, err := handleMapStart(ctx, d, caller, b)
+		return err
+	}
+	callErr(t, start("s9", &journal.Planned{TaskID: 7, StandbyID: 3}), 403, "forbidden") // not the old server
+	callErr(t, start("s1", &journal.Planned{TaskID: 0, StandbyID: 3}), 403, "forbidden") // no task
+	callErr(t, start("s1", &journal.Planned{TaskID: 7, StandbyID: 0}), 403, "forbidden") // no standby
+	if js.Active() {
+		t.Fatal("a refused start began a journal")
+	}
+	// the proof: no planned journal yet
+	proof := func(caller, cp string) error {
+		b, _ := json.Marshal(mapProofBody{Checkpoint: cp, ClusterState: "shut down"})
+		_, err := handleMapProof(ctx, d, caller, b)
+		return err
+	}
+	callErr(t, proof("s1", "0/1"), 409, "conflict")
+	_, _ = js.Begin("b1", "s1", 3, "manual", "alice", false)
+	_, _ = js.SetPlanned(journal.Planned{TaskID: 7, StandbyID: 3})
+	callErr(t, proof("s9", "0/1"), 403, "forbidden")
+	if err := proof("s1", "0/6000028"); err != nil {
+		t.Fatal(err)
+	}
+	if err := proof("s1", "0/6000028"); err != nil {
+		t.Fatalf("the same proof again: %v", err)
+	}
+	callErr(t, proof("s1", "0/7000000"), 409, "conflict") // a differing second proof
+}

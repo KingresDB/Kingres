@@ -1018,17 +1018,27 @@ const callMapCheckpoint = "GET /failover/map/checkpoint"
 // that is promoted on it checks it against what it replayed (switchover_verify), exactly as when the old leader's task sends it.
 func handleMapCheckpoint(ctx context.Context, d *haDeps, _ string, _ []byte) (any, error) {
 	li, ok := d.Svc.PrimaryOf(0)
-	if !ok {
+	held := d.LeaseMgr != nil && d.LeaseMgr.HeldBack(0)
+	return mapCheckpoint(ctx, d.Svc.Manager(), li.ID, ok, held)
+}
+
+// mapCheckpoint is handleMapCheckpoint on the parts that a test can stand in for. The answer is given only while a marker holds the primary of the map group back on
+// this server (a hand-over, a fence or a wait): a primary that the start gate would let start never gives one (F5-12).
+func mapCheckpoint(ctx context.Context, mgr stopManager, id int, hasPrimary, heldBack bool) (any, error) {
+	if !hasPrimary {
 		return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "not_primary", Message: "This server runs no primary of the map group."}
 	}
-	running, err := d.Svc.Manager().Running(ctx, li.ID)
+	if !heldBack {
+		return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "not_held_back", Message: "The primary of the map group is not held back from starting on this server."}
+	}
+	running, err := mgr.Running(ctx, id)
 	if err != nil {
 		return nil, &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The instance cannot be asked whether it runs."}
 	}
 	if running {
 		return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "not_stopped", Message: "The primary of the map group runs on this server."}
 	}
-	cd, err := d.Svc.Manager().ControlData(ctx, li.ID)
+	cd, err := mgr.ControlData(ctx, id)
 	if err != nil {
 		return nil, &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "pg_controldata cannot be read: " + err.Error()}
 	}
