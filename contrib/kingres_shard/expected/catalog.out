@@ -6,6 +6,7 @@ SELECT c.relname
   ORDER BY 1;
        relname        
 ----------------------
+ add_node_progress
  bucket_map
  bucket_move
  bucket_split
@@ -29,7 +30,7 @@ SELECT c.relname
  table_operation
  table_operation_item
  table_operation_lock
-(23 rows)
+(24 rows)
 
 SELECT conrelid::regclass AS tbl, conname, contype
   FROM pg_constraint
@@ -37,6 +38,7 @@ SELECT conrelid::regclass AS tbl, conname, contype
   ORDER BY 1::text, 2;
          tbl          |             conname             | contype 
 ----------------------+---------------------------------+---------
+ add_node_progress    | add_node_progress_pkey          | p
  bucket_map           | bucket_map_bucket_check         | c
  bucket_map           | bucket_map_colocation_id_fkey   | f
  bucket_map           | bucket_map_group_id_check       | c
@@ -90,7 +92,7 @@ SELECT conrelid::regclass AS tbl, conname, contype
  table_operation      | table_operation_phase_check     | c
  table_operation      | table_operation_pkey            | p
  table_operation      | table_operation_verified_check  | c
-(53 rows)
+(54 rows)
 
 -- Nothing is created outside the kingres schema.
 SELECT count(*) AS tables_outside_kingres
@@ -231,6 +233,8 @@ SELECT name, setting, unit, context
   FROM pg_settings WHERE name LIKE 'kingres_shard.%' ORDER BY name;
                      name                     | setting | unit |  context  
 ----------------------------------------------+---------+------+-----------
+ kingres_shard.add_node_batch_statements      | 100     |      | superuser
+ kingres_shard.catalog_incremental            | on      |      | user
  kingres_shard.control_call_timeout           | 0       | s    | user
  kingres_shard.deadlock_check_interval        | 0       | s    | sighup
  kingres_shard.deadlock_confirm_delay         | 200     | ms   | sighup
@@ -274,7 +278,7 @@ SELECT name, setting, unit, context
  kingres_shard.schema_placement_group         | -1      |      | superuser
  kingres_shard.shippable_extensions           | all     |      | user
  kingres_shard.table_cleanup_delay            | 600     | s    | user
-(43 rows)
+(45 rows)
 
 SET kingres_shard.default_bucket_count = 0;
 ERROR:  0 is outside the valid range for parameter "kingres_shard.default_bucket_count" (1 .. 4096)
