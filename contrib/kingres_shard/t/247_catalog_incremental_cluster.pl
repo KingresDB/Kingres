@@ -104,6 +104,19 @@ sub invalidations_of
 	cmp_ok($d5, '<=', 4, '... and not the others');
 }
 
+# B2. applying a whole catalog (sync_catalog, add_node) writes dist_table with one statement, so the trigger of the catalog changes fires a few times, not once per table
+{
+	my $out = q1($n2, q{
+		BEGIN;
+		SELECT n_tup_upd AS u0 FROM pg_stat_xact_user_tables WHERE relid = 'kingres.map_version'::regclass \gset
+		SELECT kingres.internal_apply_catalog(kingres.internal_catalog_snapshot());
+		SELECT n_tup_upd - :u0 FROM pg_stat_xact_user_tables WHERE relid = 'kingres.map_version'::regclass;
+		ROLLBACK;
+	});
+	my $fired = (split /\n/, $out)[-1];
+	cmp_ok($fired, '<=', 30, "applying a catalog of " . ($nsch * 2) . " schema tables fires the trigger of the catalog tables $fired times");
+}
+
 # C. the plan of a prepared statement follows a move of its schema
 {
 	my $own = q1($n1, q{SELECT group_id FROM kingres.schemas WHERE schema_name = 'tenant_5'});

@@ -14077,6 +14077,7 @@ DECLARE
     cur_term pg_catalog.int8;
     new_term pg_catalog.int8;
     v_max    pg_catalog.int4;
+    v_missing pg_catalog.text;
 BEGIN
     -- A node that holds a newer catalog refuses an older one, whoever sends it
     -- (a map group primary that was replaced and restarted; S7-06).  The sender
@@ -14104,55 +14105,63 @@ BEGIN
         SELECT * FROM pg_catalog.jsonb_populate_recordset(NULL::kingres.colocation,
                                     snapshot OPERATOR(pg_catalog.->) 'colocation');
 
-    FOR r IN SELECT * FROM pg_catalog.jsonb_to_recordset(snapshot OPERATOR(pg_catalog.->) 'dist_table')
-                  AS x(schema pg_catalog.text, name pg_catalog.text, method pg_catalog.text,
-                       dist_column pg_catalog.name, colocation_id pg_catalog.int4,
-                       partition_method pg_catalog.text, partition_key pg_catalog.text, reloptions pg_catalog.text[])
-    LOOP
-        rid := pg_catalog.to_regclass(pg_catalog.format('%I.%I', r.schema, r.name));
-        IF rid IS NULL THEN
-            RAISE EXCEPTION 'distributed table %.% does not exist on this node', r.schema, r.name
-                USING ERRCODE = 'undefined_table';
-        END IF;
-        INSERT INTO kingres.dist_table (relid, method, dist_column, colocation_id,
-                                        partition_method, partition_key, reloptions)
-        VALUES (rid, r.method, r.dist_column, r.colocation_id, r.partition_method, r.partition_key, r.reloptions);
-        -- Plans of statements on the table were made with the old catalog.
-        PERFORM kingres.internal_invalidate_relation(rid);
-    END LOOP;
+    -- The rows of dist_table and dist_partition are written by one statement each (step 12): a statement per row fired the trigger of
+    -- the catalog tables once for every table of the cluster, which is quadratic in the number of schema tables.  The trigger invalidates the
+    -- relations of the rows the statement wrote, so the plans that were made with the old catalog are replanned.
+    SELECT pg_catalog.format('%I.%I', x.schema, x.name) INTO v_missing
+      FROM pg_catalog.jsonb_to_recordset(snapshot OPERATOR(pg_catalog.->) 'dist_table')
+           AS x(schema pg_catalog.text, name pg_catalog.text)
+     WHERE pg_catalog.to_regclass(pg_catalog.format('%I.%I', x.schema, x.name)) IS NULL
+     LIMIT 1;
+    IF v_missing IS NOT NULL THEN
+        RAISE EXCEPTION 'distributed table % does not exist on this node', v_missing
+            USING ERRCODE = 'undefined_table';
+    END IF;
+    INSERT INTO kingres.dist_table (relid, method, dist_column, colocation_id, partition_method, partition_key, reloptions)
+    SELECT pg_catalog.to_regclass(pg_catalog.format('%I.%I', x.schema, x.name)), x.method, x.dist_column, x.colocation_id,
+           x.partition_method, x.partition_key, x.reloptions
+      FROM pg_catalog.jsonb_to_recordset(snapshot OPERATOR(pg_catalog.->) 'dist_table')
+           AS x(schema pg_catalog.text, name pg_catalog.text, method pg_catalog.text,
+                dist_column pg_catalog.name, colocation_id pg_catalog.int4,
+                partition_method pg_catalog.text, partition_key pg_catalog.text, reloptions pg_catalog.text[]);
 
-    FOR r IN SELECT * FROM pg_catalog.jsonb_to_recordset(
-                              COALESCE(snapshot OPERATOR(pg_catalog.->) 'dist_partition', '[]'::pg_catalog.jsonb))
-                  AS x(schema pg_catalog.text, name pg_catalog.text, partition_name pg_catalog.name,
-                       bound pg_catalog.text, created_at pg_catalog.timestamptz)
-    LOOP
-        rid := pg_catalog.to_regclass(pg_catalog.format('%I.%I', r.schema, r.name));
-        IF rid IS NULL THEN
-            RAISE EXCEPTION 'distributed table %.% does not exist on this node', r.schema, r.name
-                USING ERRCODE = 'undefined_table';
-        END IF;
-        INSERT INTO kingres.dist_partition (parent, partition_name, bound, created_at)
-        VALUES (rid, r.partition_name, r.bound, COALESCE(r.created_at, pg_catalog.now()));
-    END LOOP;
+    v_missing := NULL;
+    SELECT pg_catalog.format('%I.%I', x.schema, x.name) INTO v_missing
+      FROM pg_catalog.jsonb_to_recordset(COALESCE(snapshot OPERATOR(pg_catalog.->) 'dist_partition', '[]'::pg_catalog.jsonb))
+           AS x(schema pg_catalog.text, name pg_catalog.text)
+     WHERE pg_catalog.to_regclass(pg_catalog.format('%I.%I', x.schema, x.name)) IS NULL
+     LIMIT 1;
+    IF v_missing IS NOT NULL THEN
+        RAISE EXCEPTION 'distributed table % does not exist on this node', v_missing
+            USING ERRCODE = 'undefined_table';
+    END IF;
+    INSERT INTO kingres.dist_partition (parent, partition_name, bound, created_at)
+    SELECT pg_catalog.to_regclass(pg_catalog.format('%I.%I', x.schema, x.name)), x.partition_name, x.bound,
+           COALESCE(x.created_at, pg_catalog.now())
+      FROM pg_catalog.jsonb_to_recordset(COALESCE(snapshot OPERATOR(pg_catalog.->) 'dist_partition', '[]'::pg_catalog.jsonb))
+           AS x(schema pg_catalog.text, name pg_catalog.text, partition_name pg_catalog.name,
+                bound pg_catalog.text, created_at pg_catalog.timestamptz);
 
     INSERT INTO kingres.bucket_map
         SELECT * FROM pg_catalog.jsonb_populate_recordset(NULL::kingres.bucket_map,
                                     snapshot OPERATOR(pg_catalog.->) 'bucket_map');
 
     -- the distributed schemas, by name: the schema must exist on this node (a structure that was not made here is an error, not a gap)
-    FOR r IN SELECT * FROM pg_catalog.jsonb_to_recordset(
-                              COALESCE(snapshot OPERATOR(pg_catalog.->) 'dist_schema', '[]'::pg_catalog.jsonb))
-                  AS x(schema pg_catalog.text, colocation_id pg_catalog.int4, created_at pg_catalog.timestamptz,
-                       ship_functions pg_catalog.bool)
-    LOOP
-        rns := pg_catalog.to_regnamespace(pg_catalog.quote_ident(r.schema));
-        IF rns IS NULL THEN
-            RAISE EXCEPTION 'distributed schema % does not exist on this node', r.schema
-                USING ERRCODE = 'invalid_schema_name';
-        END IF;
-        INSERT INTO kingres.dist_schema (nsp, colocation_id, created_at, ship_functions)
-        VALUES (rns, r.colocation_id, COALESCE(r.created_at, pg_catalog.now()), COALESCE(r.ship_functions, false));
-    END LOOP;
+    v_missing := NULL;
+    SELECT x.schema INTO v_missing
+      FROM pg_catalog.jsonb_to_recordset(COALESCE(snapshot OPERATOR(pg_catalog.->) 'dist_schema', '[]'::pg_catalog.jsonb))
+           AS x(schema pg_catalog.text, colocation_id pg_catalog.int4, created_at pg_catalog.timestamptz, ship_functions pg_catalog.bool)
+     WHERE pg_catalog.to_regnamespace(pg_catalog.quote_ident(x.schema)) IS NULL
+     LIMIT 1;
+    IF v_missing IS NOT NULL THEN
+        RAISE EXCEPTION 'distributed schema % does not exist on this node', v_missing
+            USING ERRCODE = 'invalid_schema_name';
+    END IF;
+    INSERT INTO kingres.dist_schema (nsp, colocation_id, created_at, ship_functions)
+    SELECT pg_catalog.to_regnamespace(pg_catalog.quote_ident(x.schema)), x.colocation_id,
+           COALESCE(x.created_at, pg_catalog.now()), COALESCE(x.ship_functions, false)
+      FROM pg_catalog.jsonb_to_recordset(COALESCE(snapshot OPERATOR(pg_catalog.->) 'dist_schema', '[]'::pg_catalog.jsonb))
+           AS x(schema pg_catalog.text, colocation_id pg_catalog.int4, created_at pg_catalog.timestamptz, ship_functions pg_catalog.bool);
 
     IF snapshot OPERATOR(pg_catalog.?) 'sharding_settings'
        AND pg_catalog.jsonb_array_length(snapshot OPERATOR(pg_catalog.->) 'sharding_settings') OPERATOR(pg_catalog.>) 0 THEN

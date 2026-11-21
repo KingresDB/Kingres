@@ -2041,7 +2041,7 @@ invalidates the relcache entries of the distributed tables that the change can t
 groups whose rows it wrote in `colocation`, `bucket_map` or `dist_schema`), not of every table of the database; a change of a node, of the settings, a
 `TRUNCATE` and a change of `dist_partition` still invalidate every one.  `kingres_shard.catalog_incremental = off` is the fallback with the old behaviour (the
 whole suite also runs with it, `KS_CATALOG_FULL=1`).  `kingres.internal_catalog_stats()` reports, for the backend, the loads, the lazy lookups and the
-invalidations sent (the tests read it).
+invalidations sent (the tests read it).  A whole catalog that a node applies (`sync_catalog`, `add_node`) is written with one statement for each of `dist_table`, `dist_partition` and `dist_schema`, not one per table: a statement per row fired the trigger of the catalog changes once for every table of the cluster (quadratic; `add_node` of a cluster of 2000 schemas ran into `node_timeout` in the node that applied the catalog).
 
 **Step 12: `add_node` in batches of schemas.**  The distributed schemas of the cluster are made on the new node before it is registered, in transactions of their own, each at
 most `kingres_shard.add_node_batch_statements` statements (default 100; a schema is never split, so one schema bigger than that is a batch alone), so the locks of one transaction
