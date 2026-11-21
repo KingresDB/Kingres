@@ -254,10 +254,11 @@ func (s *Server) getTable(_ *call, w http.ResponseWriter, r *http.Request) error
 func (s *Server) listColocationGroups(_ *call, w http.ResponseWriter, r *http.Request) error {
 	pp := newParams(r)
 	db := pp.pathName("databaseName")
+	kind := pp.enum("kind", "hash", "schema")
 	if p := pp.err(); p != nil {
 		return p
 	}
-	items, err := s.deps.Store.ColocationGroups(r.Context(), db)
+	items, err := s.deps.Store.ColocationGroups(r.Context(), db, kind)
 	if err != nil {
 		return s.storeProblem(r, err, "Database \""+db+"\" does not exist.")
 	}
@@ -314,7 +315,8 @@ func (s *Server) listTasks(_ *call, w http.ResponseWriter, r *http.Request) erro
 			"replication.restorePreferredPrimaries", "ledger.verify", "networkAccess.apply", "replicate.apply",
 			"certificate.renew", "certificate.revoke", "standby.reconcile", "config.apply", "config.restart",
 			"ledger.key.create", "ledger.key.rotate", "ledger.key.retire", "ledger.key.revoke", "ledger.key.distribute",
-			"ledger.bundle.create", "ledger.epoch.start", "ledger.upgrade"),
+			"ledger.bundle.create", "ledger.epoch.start", "ledger.upgrade",
+			"schema.distribute", "schema.move", "schema.undistribute"),
 	}
 	page := pp.page()
 	if p := pp.err(); p != nil {
@@ -499,4 +501,44 @@ func normalizeLedgerCoverage(st *api.LedgerStatus) {
 		st.UncoveredShardGroupIDs = []int32{}
 		st.Complete = true
 	}
+}
+
+func (s *Server) listSchemas(_ *call, w http.ResponseWriter, r *http.Request) error {
+	pp := newParams(r)
+	db := pp.pathName("databaseName")
+	f := store.SchemaFilter{
+		Distributed:  pp.boolQuery("distributed"),
+		ShardGroupID: pp.int32Query("shardGroupId"),
+		State:        pp.enum("state", "active", "moving"),
+	}
+	page := pp.page()
+	if p := pp.err(); p != nil {
+		return p
+	}
+	v, err := s.deps.Store.Schemas(r.Context(), db, f, page)
+	if err != nil {
+		return s.storeProblem(r, err, "Database \""+db+"\" does not exist.")
+	}
+	if v.Items == nil {
+		v.Items = []api.SchemaSummary{}
+	}
+	s.writeJSON(w, r, http.StatusOK, v)
+	return nil
+}
+
+func (s *Server) getSchema(_ *call, w http.ResponseWriter, r *http.Request) error {
+	pp := newParams(r)
+	db, name := pp.pathName("databaseName"), pp.pathName("schemaName")
+	if p := pp.err(); p != nil {
+		return p
+	}
+	v, err := s.deps.Store.Schema(r.Context(), db, name)
+	if err != nil {
+		return s.storeProblem(r, err, "Schema \""+name+"\" does not exist in database \""+db+"\".")
+	}
+	if v.DistributionBlockers == nil {
+		v.DistributionBlockers = []api.SchemaBlocker{}
+	}
+	s.writeJSON(w, r, http.StatusOK, v)
+	return nil
 }

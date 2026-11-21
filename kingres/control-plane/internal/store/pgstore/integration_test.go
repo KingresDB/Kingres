@@ -310,17 +310,17 @@ func TestIntegrationTables(t *testing.T) {
 
 func TestIntegrationShardCatalog(t *testing.T) {
 	s := newTestStore(t)
-	groups, err := s.ColocationGroups(ctx(t), "kingres_cp")
+	groups, err := s.ColocationGroups(ctx(t), "kingres_cp", "")
 	if err != nil || len(groups) != 2 {
 		t.Fatalf("groups = %+v %v", groups, err)
 	}
-	if g := groups[0]; g.ColocationID != 1 || g.BucketCount != 8 || g.DistributionColumnType != "bigint" || g.TableCount != 2 || g.SizeBytes != nil {
+	if g := groups[0]; g.ColocationID != 1 || g.BucketCount != 8 || g.DistributionColumnType == nil || *g.DistributionColumnType != "bigint" || g.TableCount != 2 || g.SizeBytes != nil {
 		t.Errorf("group 1 = %+v", g)
 	}
-	if g := groups[1]; g.ColocationID != 2 || g.DistributionColumnType != "text" || g.TableCount != 0 {
+	if g := groups[1]; g.ColocationID != 2 || g.DistributionColumnType == nil || *g.DistributionColumnType != "text" || g.TableCount != 0 {
 		t.Errorf("group 2 = %+v", g)
 	}
-	if groups, err := s.ColocationGroups(ctx(t), "plain_cp"); err != nil || len(groups) != 0 || groups == nil {
+	if groups, err := s.ColocationGroups(ctx(t), "plain_cp", ""); err != nil || len(groups) != 0 || groups == nil {
 		t.Errorf("plain_cp groups = %+v %v", groups, err)
 	}
 

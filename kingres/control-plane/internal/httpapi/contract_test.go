@@ -37,8 +37,8 @@ func TestRoutingMatchesContract(t *testing.T) {
 	for _, op := range doc.Operations {
 		want[op.Method+" /api/v1"+op.Path] = op.ID
 	}
-	if len(want) != 132 {
-		t.Errorf("contract has %d operations, this test was written for 132", len(want))
+	if len(want) != 137 {
+		t.Errorf("contract has %d operations, this test was written for 137", len(want))
 	}
 	got := map[string]string{}
 	for _, r := range e.srv.Routes() {
@@ -184,7 +184,9 @@ func seed(e *env) {
 	settings := api.TableDetail{Table: api.Table{Schema: "public", Name: "settings", Classes: []string{"plain"}, HomeShardGroupID: ptr(int32(0))},
 		Columns: []api.TableColumn{{Name: "k", Type: "text", CanBeDistributionColumn: true, BlockingKeys: []string{}}, {Name: "v", Type: "jsonb", Nullable: true, DistributionBlockedReason: ptr("unsupportedType"), BlockingKeys: []string{}}}}
 	e.mem.TablesByDB["shop"] = []api.TableDetail{orders, settings}
-	e.mem.Colocation["shop"] = []api.ColocationGroup{{ColocationID: 1, BucketCount: 128, DistributionColumnType: "bigint", TableCount: 1, SizeBytes: &size}}
+	e.mem.Colocation["shop"] = []api.ColocationGroup{{ColocationID: 1, Kind: "hash", BucketCount: 128, DistributionColumnType: ptr("bigint"), TableCount: 1, SizeBytes: &size},
+		{ColocationID: 4, Kind: "schema", SchemaName: ptr("tenant_17"), BucketCount: 1, TableCount: 12, SizeBytes: &size}}
+	seedSchemas(e)
 	e.mem.BucketsByCG["shop"] = map[int32][]api.Bucket{1: {
 		{Bucket: 0, ShardGroupID: 0, State: "active", PrimaryServerID: &h1, ReplicaServerIDs: []string{h2}},
 		{Bucket: 1, ShardGroupID: 0, State: "moving", PrimaryServerID: nil, ReplicaServerIDs: []string{}},
@@ -257,6 +259,11 @@ func TestResponsesValidateAgainstContract(t *testing.T) {
 		{"listTables", "/api/v1/databases/shop/tables?class=ledger&limit=1"},
 		{"getTable", "/api/v1/databases/shop/schemas/public/tables/orders"},
 		{"listColocationGroups", "/api/v1/databases/shop/colocation-groups"},
+		{"listColocationGroups", "/api/v1/databases/shop/colocation-groups?kind=schema"},
+		{"listSchemas", "/api/v1/databases/shop/schemas"},
+		{"listSchemas", "/api/v1/databases/shop/schemas?distributed=true&state=active&shardGroupId=2&limit=1"},
+		{"getSchema", "/api/v1/databases/shop/schemas/tenant_17"},
+		{"getSchema", "/api/v1/databases/shop/schemas/reporting"},
 		{"listBuckets", "/api/v1/databases/shop/colocation-groups/1/buckets"},
 		{"getBucketDistribution", "/api/v1/databases/shop/bucket-distribution"},
 		{"listTasks", "/api/v1/tasks"},
@@ -351,7 +358,7 @@ func TestResponsesValidateAgainstContract(t *testing.T) {
 		for _, c := range calls {
 			switch c.op {
 			case "getServer", "getThisServerInstance", "getDatabase", "getTable", "listTables", "listBuckets",
-				"getBucketDistribution", "listColocationGroups", "getTask", "getLedgerStatus", "listLedgerBlocks", "getRole":
+				"getBucketDistribution", "listColocationGroups", "listSchemas", "getSchema", "getTask", "getLedgerStatus", "listLedgerBlocks", "getRole":
 				continue // these need a resource
 			}
 			w := e2.do(req{method: "GET", path: c.path, bearer: tok})
@@ -465,3 +472,22 @@ func TestFilterEnumsMatchTheContract(t *testing.T) {
 }
 
 func s2(e *env) map[string]handlerFunc { return e.srv.monitorHandlers() }
+
+// seedSchemas gives the fake store the schemas of the database shop: one distributed (with its server and a pinned reason), one that
+// is moving, and one local with blockers.
+func seedSchemas(e *env) {
+	size, rows, host := int64(52428800), int64(310000), "10.0.0.1"
+	moving := int32(1)
+	e.mem.SchemasByDB["shop"] = []api.SchemaSummary{
+		{Name: "reporting", Owner: "app", TableCount: 3},
+		{Name: "tenant_17", Owner: "app", TableCount: 12, SizeBytes: &size, EstimatedRows: &rows,
+			Distribution: &api.SchemaDistribution{State: "active", ColocationID: 4, ShardGroupID: 2, ServerID: &host}},
+		{Name: "tenant_18", Owner: "app", TableCount: 1,
+			Distribution: &api.SchemaDistribution{State: "moving", ColocationID: 5, ShardGroupID: 0, ServerID: &host, MovingToShardGroupID: &moving}},
+	}
+	id := int64(12)
+	e.mem.SchemaDetails["shop/tenant_17"] = api.SchemaDetail{SchemaSummary: e.mem.SchemasByDB["shop"][1], DistributionBlockers: []api.SchemaBlocker{},
+		Pinned: &api.SchemaPinned{Reason: "the schema holds the ledger table t"}, MoveInProgress: &id}
+	e.mem.SchemaDetails["shop/reporting"] = api.SchemaDetail{SchemaSummary: e.mem.SchemasByDB["shop"][0],
+		DistributionBlockers: []api.SchemaBlocker{{ObjectKind: "materialized view", ObjectName: "reporting.mv", Reason: "a materialized view is not supported in a distributed schema yet"}}}
+}

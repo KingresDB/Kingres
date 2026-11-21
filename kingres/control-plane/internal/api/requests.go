@@ -24,6 +24,10 @@ type DatabaseGeneralInput struct {
 type ShardingInput struct {
 	Enabled     bool `json:"enabled"`
 	BucketCount int  `json:"bucketCount,omitempty"`
+	// Mode is row (the default), schema or both (contract 0.15.0).
+	Mode string `json:"mode,omitempty"`
+	// DistributeNewSchemas distributes a schema that is created in the database by default (0.15.0).
+	DistributeNewSchemas bool `json:"distributeNewSchemas,omitempty"`
 }
 
 // ReplicationInput are the replication settings of a new database.
@@ -43,11 +47,9 @@ type DatabaseUpdateRequest struct {
 		Owner           string `json:"owner,omitempty"`
 		ConnectionLimit *int   `json:"connectionLimit,omitempty"`
 	} `json:"general,omitempty"`
-	Sharding *struct {
-		Enabled bool `json:"enabled"`
-	} `json:"sharding,omitempty"`
-	Replication *ReplicationInput `json:"replication,omitempty"`
-	Ledger      *LedgerInput      `json:"ledger,omitempty"`
+	Sharding    *DatabaseShardingUpdate `json:"sharding,omitempty"`
+	Replication *ReplicationInput       `json:"replication,omitempty"`
+	Ledger      *LedgerInput            `json:"ledger,omitempty"`
 }
 
 // DistributeTableRequest is the body of PUT .../distribution.
@@ -158,4 +160,12 @@ type ClusterSettingsUpdateRequest struct {
 	Clock *struct {
 		MaxDifferenceMs *int `json:"maxDifferenceMs,omitempty"`
 	} `json:"clock,omitempty"`
+}
+
+// DatabaseShardingUpdate is the sharding part of PATCH /databases/{databaseName} (contract 0.15.0: at least one
+// property; Enabled can only be true).
+type DatabaseShardingUpdate struct {
+	Enabled              *bool   `json:"enabled,omitempty"`
+	Mode                 *string `json:"mode,omitempty"`
+	DistributeNewSchemas *bool   `json:"distributeNewSchemas,omitempty"`
 }
