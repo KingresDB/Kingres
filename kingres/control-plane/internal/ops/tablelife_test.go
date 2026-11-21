@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
@@ -36,6 +38,8 @@ type fakeBackend struct {
 	servers     []string
 	// failOn is a phase whose Advance fails (a node is down).
 	failOn string
+	// lockFails is the number of Advance(..., "shadow") calls that fail because a transaction holds the table (55P03).
+	lockFails int
 }
 
 var phaseOrder = map[string]int{"preparing": 0, "shadow": 1, "copying": 2, "catching_up": 3, "switching": 4, "cleaning": 5, "done": 6}
@@ -77,6 +81,10 @@ func (f *fakeBackend) Advance(_ context.Context, _ tableParams, _ int64, to stri
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.log("advance " + to)
+	if to == "shadow" && f.lockFails > 0 {
+		f.lockFails--
+		return f.phase, "", &pgconn.PgError{Code: "55P03", Message: "could not lock table public.orders in SHARE ROW EXCLUSIVE mode", Detail: "Held by: pid 7"}
+	}
 	if f.failOn == to {
 		return f.phase, "", errors.New("node 3 is down")
 	}
@@ -603,5 +611,24 @@ func TestReportOptionsCarryTheDependentViewsSetting(t *testing.T) {
 	}
 	if k := reportKind(tableParams{Op: "partition", PartOp: "detach"}); k != "detach_partition" {
 		t.Errorf("kind %s", k)
+	}
+}
+
+func TestAStepWaitsForALongTransactionThatHoldsTheTable(t *testing.T) {
+	old := lockWait
+	lockWait = time.Millisecond
+	defer func() { lockWait = old }()
+	b := &fakeBackend{lockFails: 3}
+	_, e, _, _ := newTableOps(t, b, task.Options{})
+	tk, _ := e.Submit(context.Background(), KindTableDistribute, task.Subject{Type: "table", ID: "x"}, onlineParams("distribute"), "u")
+	if _, err := e.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := e.Get(context.Background(), tk.ID)
+	if got.State != task.Done {
+		t.Fatalf("%s %+v", got.State, got.Error)
+	}
+	if n := b.count("advance shadow"); n != 4 {
+		t.Errorf("the layout was asked for %d times, want 4 (three refused for the lock, one made)", n)
 	}
 }

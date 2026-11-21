@@ -49,6 +49,11 @@ var switchWait = 60 * time.Second
 // switchRounds bounds how often the switch step goes on after the blockers did not clear (a day at 60 s).
 var switchRounds = 1440
 
+// lockWait is how long a step waits before it asks again when the extension could not get a lock on the table in time (55P03: a long
+// transaction holds it). The extension refuses after rebuild_lock_timeout and says "the operation tries again"; the caller is the one that tries.
+// A variable so that tests can shorten it.
+var lockWait = 5 * time.Second
+
 // Step names (shown to users).
 const (
 	stepCheckTable = "Check the table"
@@ -252,11 +257,11 @@ func (o *Ops) tableSteps(p tableParams) []task.Step {
 			if op == 0 {
 				return &tableTaskError{code: task.CodeStepFailed, msg: "The operation of the extension does not exist (it was cancelled or finished)."}
 			}
-			if _, d, err := o.backend().Advance(ctx, p, op, to); err != nil {
+			var d string
+			if err := o.whileLocked(ctx, env, func() (e error) { _, d, e = o.backend().Advance(ctx, p, op, to); return e }); err != nil {
 				return err
-			} else if d != "" {
-				_ = env.SetDetail(ctx, d)
 			}
+			_ = env.SetDetail(ctx, d) // also clears what the wait for a lock showed
 			if detail != nil {
 				if s := detail(ctx, env, op); s != "" {
 					_ = env.SetDetail(ctx, s)
@@ -273,8 +278,7 @@ func (o *Ops) tableSteps(p tableParams) []task.Step {
 	}
 	return append(steps,
 		task.Step{Name: stepPrepare, Run: func(ctx context.Context, env *task.Env) error {
-			_, err := o.backend().Begin(ctx, p)
-			return err
+			return o.whileLocked(ctx, env, func() error { _, err := o.backend().Begin(ctx, p); return err })
 		}},
 		task.Step{Name: stepLayout, Run: adv("shadow", nil)},
 		task.Step{Name: stepCopy, Run: adv("copying", progress)},
@@ -456,7 +460,42 @@ func (o *Ops) stepFinishOp(ctx context.Context, env *task.Env, p tableParams) er
 
 func (o *Ops) stepPartition(ctx context.Context, env *task.Env, p tableParams) error {
 	_ = env.SetDetail(ctx, fmt.Sprintf("%s the partition on every server", strings.ToUpper(p.PartOp[:1])+p.PartOp[1:]))
-	return o.backend().Partition(ctx, p)
+	return o.whileLocked(ctx, env, func() error { return o.backend().Partition(ctx, p) })
+}
+
+// whileLocked runs f and, when it fails because a lock on the table was not granted in time (55P03), shows the holders in the detail of the task,
+// waits lockWait and runs it again, for as long as the holders stay (at most switchRounds times); a request to cancel ends the wait.
+func (o *Ops) whileLocked(ctx context.Context, env *task.Env, f func() error) error {
+	for round := 0; ; round++ {
+		err := f()
+		var pe *pgconn.PgError
+		if err == nil && round > 0 {
+			_ = env.SetDetail(ctx, "")
+		}
+		if err == nil || !errors.As(err, &pe) || pe.Code != "55P03" {
+			return err
+		}
+		if round >= switchRounds {
+			return &tableTaskError{code: CodeTableOpNotSwitched, retry: true, msg: pe.Message}
+		}
+		why := pe.Message
+		if pe.Detail != "" {
+			why += ". " + pe.Detail
+		}
+		if err := env.SetDetail(ctx, "Waiting for a lock: "+why); err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(lockWait):
+		}
+		if eng := o.Engine(); eng != nil {
+			if t, gerr := eng.Get(ctx, env.Task.ID); gerr == nil && t.CancelRequested {
+				return task.Pause("A cancel was requested while the task waited for a lock.")
+			}
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------
