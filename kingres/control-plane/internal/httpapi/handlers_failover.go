@@ -10,6 +10,7 @@ import (
 	"unicode"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
 )
@@ -161,7 +162,7 @@ func (s *Server) getFailoverReport(_ *call, w http.ResponseWriter, r *http.Reque
 type MapFailoverer interface {
 	// Handles says that a request for the failover of server is the failover of the map group that cannot go through the leader.
 	Handles(ctx context.Context, server string) bool
-	Start(ctx context.Context, actor, server string, req failover.Request) (task.Task, error)
+	Start(ctx context.Context, actor string, id internalapi.ForwardIdentity, server string, req failover.Request) (task.Task, error)
 	Active() bool
 	TaskZero() (task.Task, bool)
 	Status() (failover.Status, bool)
@@ -188,7 +189,7 @@ func (s *Server) mapFailoverIntercept(c *call, w http.ResponseWriter, r *http.Re
 		if req.DryRun {
 			return true, problem.New(problem.UnsupportedOp, "The plan of the failover of the map group cannot be asked while the manager leader is gone.")
 		}
-		t, err := mf.Start(r.Context(), c.session.Username, server, req)
+		t, err := mf.Start(r.Context(), c.session.Username, identityOf(c.session), server, req)
 		if err != nil {
 			return true, s.failoverProblem(r, err)
 		}

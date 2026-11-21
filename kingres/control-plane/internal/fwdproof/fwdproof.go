@@ -63,6 +63,8 @@ type Kind string
 const (
 	KindForward Kind = "forward"
 	KindGather  Kind = "gather"
+	// KindMapStart is the request of an operator for the failover of the map group that a member sends to the candidate (F4-05).
+	KindMapStart Kind = "mapStart"
 )
 
 // Proof is what travels with a request.

@@ -2525,7 +2525,7 @@ down: `takeFence` rolls it back through the path of every failure (`quorum_unava
 still holds. A plain failover still pauses.
 
 **Open after the review (listed for later):** F4-05, the decision `allowDataLoss` of an operator that a member carries in the body of `start` (a signed assertion of the
-operator's session is the remedy); F4-06 is closed in 0.15.0 (`abandonMapGroupBootstrap`).
+operator's session is the remedy, built 2026-11-21 as the signed form of `map/start`); F4-06 is closed in 0.15.0 (`abandonMapGroupBootstrap`).
 
 ### Increment 7, round 2 (the restore of the preferred primaries, the plan of a switchover, the phases, 2026-11-20)
 

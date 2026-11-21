@@ -4,6 +4,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,10 +20,12 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/auth"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/cluster"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover/journal"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover/mapgroup"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fwdproof"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pki"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
@@ -113,7 +117,7 @@ func (m *mapFailover) Active() bool { return m.active() }
 
 // Start answers a request for the failover of the map group (HTTP, on any server): the candidate runs the bootstrap, and the
 // answer is a task with id 0 while no task can be recorded (the journal's steps), or the recorded task.
-func (m *mapFailover) Start(ctx context.Context, actor, server string, req failover.Request) (task.Task, error) {
+func (m *mapFailover) Start(ctx context.Context, actor string, id internalapi.ForwardIdentity, server string, req failover.Request) (task.Task, error) {
 	if req.Mode != failover.ModeHard {
 		return task.Task{}, problem.New(problem.UnsupportedOp, "The map group is failed over in mode hard only.")
 	}
@@ -127,8 +131,14 @@ func (m *mapFailover) Start(ctx context.Context, actor, server string, req failo
 			return task.Task{}, err
 		}
 	} else {
+		// The candidate does not take the word of a member for what an operator asked (F4-05): the request travels with the proof of the operator's session,
+		// made over exactly these bytes, and the candidate checks it against the verifier of the role it holds in its copy of the system database.
+		signed, serr := m.sign(id, body, cand)
+		if serr != nil {
+			return task.Task{}, problem.New(problem.ServiceUnavailable, "The session cannot prove itself to the server that promotes the map group: "+serr.Error()).WithRetryAfter(5)
+		}
 		var out struct{}
-		if err := m.peers.do(ctx, cand, http.MethodPost, "/failover/map/start", body, &out); err != nil {
+		if err := m.peers.do(ctx, cand, http.MethodPost, "/failover/map/start", signed, &out); err != nil {
 			return task.Task{}, mapCallProblem(err)
 		}
 	}
@@ -340,14 +350,16 @@ func handleMapStart(ctx context.Context, d *haDeps, caller string, body []byte) 
 	if mf == nil {
 		return nil, notStarted
 	}
-	var b mapStartBody
-	if err := json.Unmarshal(body, &b); err != nil || b.Server == "" {
-		return nil, badBody("a map group failover request")
+	b, proven, err := openMapStart(ctx, d, caller, body)
+	if err != nil {
+		return nil, err
 	}
 	// The call is the request of an operator that a member received (F4-05): it is never automatic (the monitor of this server starts an
 	// automatic bootstrap itself), and it does not name the system as its author.
 	b.Trigger = "manual"
-	if b.RequestedBy == "" || b.RequestedBy == "system" {
+	if proven != "" {
+		b.RequestedBy = proven // the user the proof is about, whatever the request says
+	} else if b.RequestedBy == "" || b.RequestedBy == "system" {
 		b.RequestedBy = "operator (via " + caller + ")"
 	}
 	// A planned switchover is the old leader's own task: only that server may say so, and it says nothing about data loss (there is none to accept).
@@ -786,4 +798,87 @@ func (p *mapPorts) RecordPlanned(ctx context.Context, taskID, termAfter, timelin
 		SET state = 'promoted', term_after = $2, timeline = CASE WHEN $3 > 0 THEN $3 ELSE timeline END, promoted_at = COALESCE(promoted_at, now())
 		WHERE task_id = $1 AND group_id = 0 AND state IN ('pending', 'frozen', 'fenced', 'pinned', 'promoted')`, taskID, termAfter, timeline)
 	return err
+}
+
+// mapStartSigned is the body of POST /failover/map/start that a member sends for a request of an operator (F4-05): the request exactly as it was signed,
+// the identity the proof is about (never the key), and the proof.
+type mapStartSigned struct {
+	Request   json.RawMessage `json:"request"`
+	Username  string          `json:"username"`
+	Roles     []string        `json:"clusterRoles"`
+	RequestID string          `json:"requestId"`
+	Proof     *fwdproof.Proof `json:"proof"`
+}
+
+// mapStartMessage is what the proof of a map start covers: the kind, the two servers, the user and the roles, the operation and its parameter, and the
+// request bytes.
+func mapStartMessage(from, to string, s mapStartSigned, server string) fwdproof.Message {
+	return internalapi.ForwardRequest{Identity: internalapi.ForwardIdentity{Username: s.Username, ClusterRoles: s.Roles}, OperationID: "failoverServer",
+		PathParams: map[string]string{"serverId": server}, ContentType: "application/json", Body: s.Request, RequestID: s.RequestID}.ProofMessage(fwdproof.KindMapStart, from, to)
+}
+
+// sign makes the signed request for the candidate to.
+func (m *mapFailover) sign(id internalapi.ForwardIdentity, body mapStartBody, to string) (mapStartSigned, error) {
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return mapStartSigned{}, err
+	}
+	var nonce [8]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return mapStartSigned{}, err
+	}
+	s := mapStartSigned{Request: raw, Username: id.Username, Roles: id.ClusterRoles, RequestID: hex.EncodeToString(nonce[:])}
+	p, err := fwdproof.Sign(id.ProofKey, mapStartMessage(m.self, to, s, body.Server), time.Now())
+	if err != nil {
+		return mapStartSigned{}, err
+	}
+	s.Proof = &p
+	return s, nil
+}
+
+// openMapStart reads the body of POST /failover/map/start. A request of an operator is the signed form: it is accepted only when the proof of the
+// operator's session over exactly its bytes verifies (the same check as for a forwarded operation, against the verifier of the role in the copy of the
+// system database that this server holds) and the roles the proof names allow the failover (kingres_ops); the decision allowDataLoss it carries is then
+// the operator's, and the user it names is the author. The plain form is the planned switchover that the old leader's own task asks for and is
+// accepted from nobody else; any other plain request is refused, so a member that is not honest cannot set the decision or the author (F4-05).
+// It returns the request and the proven user ("" for the plain form).
+func openMapStart(ctx context.Context, d *haDeps, caller string, body []byte) (mapStartBody, string, error) {
+	var peek struct {
+		Request json.RawMessage `json:"request"`
+		Proof   json.RawMessage `json:"proof"`
+	}
+	_ = json.Unmarshal(body, &peek)
+	if peek.Request == nil && peek.Proof == nil {
+		var b mapStartBody
+		if err := json.Unmarshal(body, &b); err != nil || b.Server == "" {
+			return b, "", badBody("a map group failover request")
+		}
+		if b.Planned == nil {
+			return b, "", &internalapi.CallError{Status: http.StatusUnauthorized, Code: "identity_unproven", Message: "The request of an operator comes with the proof of the operator's session."}
+		}
+		return b, "", nil
+	}
+	var s mapStartSigned
+	if err := json.Unmarshal(body, &s); err != nil || s.Proof == nil || s.Username == "" || len(s.Request) == 0 {
+		return mapStartBody{}, "", badBody("a signed map group failover request")
+	}
+	var b mapStartBody
+	if err := json.Unmarshal(s.Request, &b); err != nil || b.Server == "" || b.Planned != nil {
+		return b, "", badBody("a map group failover request")
+	}
+	if d.IdentityCheck == nil {
+		return b, "", &internalapi.CallError{Status: http.StatusUnauthorized, Code: "identity_unproven", Message: "This server cannot check the proof of a session."}
+	}
+	fr := internalapi.ForwardRequest{Identity: internalapi.ForwardIdentity{Username: s.Username, ClusterRoles: s.Roles}, OperationID: "failoverServer",
+		PathParams: map[string]string{"serverId": b.Server}, ContentType: "application/json", Body: s.Request, RequestID: s.RequestID, Proof: s.Proof}
+	if err := d.IdentityCheck(ctx, fwdproof.KindMapStart, caller, fr); err != nil {
+		if errors.Is(err, fwdproof.ErrUnavailable) {
+			return b, "", &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The identity cannot be checked now."}
+		}
+		return b, "", &internalapi.CallError{Status: http.StatusUnauthorized, Code: "identity_unproven", Message: "The identity of the request is not proven."}
+	}
+	if !auth.Allows(auth.Normalize(s.Roles), auth.RoleOps) {
+		return b, "", &internalapi.CallError{Status: http.StatusForbidden, Code: "forbidden", Message: "The failover needs the role kingres_ops."}
+	}
+	return b, s.Username, nil
 }

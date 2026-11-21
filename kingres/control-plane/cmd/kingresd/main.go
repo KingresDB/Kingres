@@ -534,6 +534,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	}
 	foDeps.d = hd
 	hd.MapFailover = foDeps.mf
+	hd.IdentityCheck = newIdentityChecker(authn, serverHost)
 	if cfgp != nil {
 		cfgp.start(hd, haCalls)
 	}
