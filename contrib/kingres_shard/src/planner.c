@@ -2800,6 +2800,72 @@ paths_note_group(PathS *p, int group, bool ship)
 }
 
 /*
+ * A built-in that reads the state of the session that calls it: shipped as text it would be evaluated by the session of the owner (the
+ * schema of the origin, a setting of the origin, its backend).  Such a statement is not run whole on the owner (review P11R-04).
+ */
+static bool
+session_function(Oid funcid)
+{
+	char	   *n = get_func_name(funcid);
+	bool		r;
+
+	if (n == NULL)
+		return false;
+	r = strcmp(n, "current_schema") == 0 || strcmp(n, "current_schemas") == 0 || strcmp(n, "current_setting") == 0 ||
+		strcmp(n, "set_config") == 0 || strcmp(n, "pg_backend_pid") == 0 || strcmp(n, "inet_client_addr") == 0 ||
+		strcmp(n, "inet_client_port") == 0 || strcmp(n, "current_query") == 0 || strcmp(n, "pg_my_temp_schema") == 0 ||
+		strcmp(n, "pg_is_other_temp_schema") == 0 || strcmp(n, "session_user") == 0;
+	pfree(n);
+	return r;
+}
+
+/* does the expression call a function that is not built in? */
+static bool
+calls_user_function_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, FuncExpr) && ((FuncExpr *) node)->funcid >= FirstNormalObjectId)
+		return true;
+	if (IsA(node, OpExpr) || IsA(node, DistinctExpr) || IsA(node, NullIfExpr))
+	{
+		set_opfuncid((OpExpr *) node);
+		if (((OpExpr *) node)->opfuncid >= FirstNormalObjectId)
+			return true;
+	}
+	return expression_tree_walker(node, calls_user_function_walker, context);
+}
+
+/*
+ * A table of the statement whose triggers, defaults or checks run code that the statement text does not show (review P11R-05): that code runs
+ * on the owner with the search_path of the session that issued the statement, as it would on a direct connection.
+ */
+static bool
+table_runs_hidden_code(Oid relid)
+{
+	Relation	rel;
+	bool		hidden = false;
+
+	if (get_rel_relkind(relid) != RELKIND_RELATION && get_rel_relkind(relid) != RELKIND_PARTITIONED_TABLE)
+		return false;
+	rel = table_open(relid, NoLock);
+	if (rel->trigdesc != NULL && rel->trigdesc->numtriggers > 0)
+		hidden = true;
+	else if (rel->rd_att->constr != NULL)
+	{
+		TupleConstr *c = rel->rd_att->constr;
+		int			i;
+
+		for (i = 0; !hidden && i < c->num_defval; i++)
+			hidden = calls_user_function_walker(stringToNode(c->defval[i].adbin), NULL);
+		for (i = 0; !hidden && i < c->num_check; i++)
+			hidden = calls_user_function_walker(stringToNode(c->check[i].ccbin), NULL);
+	}
+	table_close(rel, NoLock);
+	return hidden;
+}
+
+/*
  * A function, operator or aggregate that is not built in.  Only a function of a distributed schema is shipped (it exists on every node);
  * a function of a local schema, of public or of an extension exists where it was made and is never shipped.  A function of a schema that
  * does not ship functions keeps the statement at the origin (the scan), as before.
@@ -2829,6 +2895,17 @@ paths_walker(Node *node, void *context)
 		Query	   *q = (Query *) node;
 		ListCell   *lc;
 
+		if (q->commandType == CMD_UPDATE)
+		{
+			/* SET col = DEFAULT of an identity column: the rewriter put nextval() there, which the owner takes for a value (review P11R-10) */
+			foreach(lc, q->targetList)
+			{
+				TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+				if (IsA(te->expr, NextValueExpr))
+					paths_fail(p, "it sets an identity column to DEFAULT");
+			}
+		}
 		foreach(lc, q->rtable)
 		{
 			RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
@@ -2870,6 +2947,8 @@ paths_walker(Node *node, void *context)
 	{
 		FuncExpr   *fe = (FuncExpr *) node;
 
+		if (fe->funcid < FirstNormalObjectId && session_function(fe->funcid))
+			paths_fail(p, "it calls a function that reads the state of the session (current_schema, current_setting, ...)");
 		if (fe->funcid >= FirstNormalObjectId)
 			paths_note_function(p, fe->funcid);
 		else if (fe->funcresulttype == INT8OID && fe->args != NIL)
@@ -2909,6 +2988,18 @@ paths_walker(Node *node, void *context)
 		set_opfuncid(oe);
 		if (oe->opfuncid >= FirstNormalObjectId)
 			paths_note_function(p, oe->opfuncid);
+	}
+	else if (IsA(node, DistinctExpr) || IsA(node, NullIfExpr))
+	{
+		set_opfuncid((OpExpr *) node);
+		if (((OpExpr *) node)->opfuncid >= FirstNormalObjectId)
+			paths_note_function(p, ((OpExpr *) node)->opfuncid);
+	}
+	else if (IsA(node, ScalarArrayOpExpr))
+	{
+		set_sa_opfuncid((ScalarArrayOpExpr *) node);
+		if (((ScalarArrayOpExpr *) node)->opfuncid >= FirstNormalObjectId)
+			paths_note_function(p, ((ScalarArrayOpExpr *) node)->opfuncid);
 	}
 	else if (IsA(node, Aggref))
 	{
@@ -2951,6 +3042,17 @@ search_path_for_functions(void)
 	}
 	list_free(oids);
 	return buf.data;
+}
+
+static bool
+statement_tables_run_hidden_code(List *relids)
+{
+	ListCell   *lc;
+
+	foreach(lc, relids)
+		if (table_runs_hidden_code(lfirst_oid(lc)))
+			return true;
+	return false;
 }
 
 /*
@@ -3013,7 +3115,7 @@ plan_schema_shell(Query *parse, const char *query_string, int cursorOptions,
 				parse->hasModifyingCTE || contain_volatile_functions((Node *) parse);
 			return kingres_shard_make_remote_plan_path(parse, deparse_for_remote(parse), node->host, node->port,
 													   ps.owner, 0, is_write, ps.relids,
-													   ps.user_function ? search_path_for_functions() : NULL);
+													   (ps.user_function || statement_tables_run_hidden_code(ps.relids)) ? search_path_for_functions() : NULL);
 		}
 		why = ps.why;
 	}

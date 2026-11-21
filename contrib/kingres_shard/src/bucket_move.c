@@ -1456,7 +1456,7 @@ kingres_internal_switch_bucket(PG_FUNCTION_ARGS)
 		 */
 		/* the target is still a shell for the catalog: the statements of this step are the extension's own, not routed */
 		part_exec(&T, "SET LOCAL kingres_shard.enable_routing = off");
-		sql = psprintf("SELECT pg_catalog.format('SELECT pg_catalog.setval(%%L, %%s, true)', q.seq, q.last_value) "
+		sql = psprintf("SELECT pg_catalog.format('SELECT pg_catalog.setval(%%L, %%s, %%s)', q.seq, q.last_value, q.is_called::pg_catalog.text) "
 					   "FROM " KINGRES_SHARD_SCHEMA ".internal_schema_sequence_state(%d) q", colocation_id);
 		res = ctl_must(srchost, srcport, sql, remaining_ms(deadline));
 		for (i = 0; i < (uint64) PQntuples(res); i++)

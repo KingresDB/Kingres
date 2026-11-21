@@ -398,6 +398,12 @@ BEGIN
                 USING ERRCODE = 'object_not_in_prerequisite_state',
                       HINT = 'A schema without a table is not moved by a copy; create its tables first.';
         END IF;
+        IF EXISTS (SELECT 1 FROM kingres.bucket_move b WHERE b.colocation_id OPERATOR(pg_catalog.=) v_colo AND b.phase OPERATOR(pg_catalog.=) 'cleaning'
+                      AND b.source_group OPERATOR(pg_catalog.=) v_target) THEN
+            RAISE EXCEPTION 'the old copy of the schema of colocation group % on shard group % is still being cleaned by an earlier move', v_colo, v_target
+                USING ERRCODE = 'object_in_use',
+                      HINT = 'Finish the cleaning first: kingres.cleanup_moved_buckets(true).';
+        END IF;
     ELSE
     SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('schema_name', t.schema_name, 'table_name', t.table_name) ORDER BY t.ord)
       INTO v_tables FROM kingres.internal_move_tables(v_colo) t;
@@ -2658,7 +2664,7 @@ CREATE VIEW kingres.schemas AS
            b.state,
            (SELECT pg_catalog.count(*) FROM kingres.dist_table d
              WHERE d.colocation_id OPERATOR(pg_catalog.=) s.colocation_id)::pg_catalog.int4 AS table_count,
-           CASE WHEN EXISTS (SELECT 1 FROM kingres.local_node l
+           CASE WHEN pg_catalog.current_setting('is_superuser') OPERATOR(pg_catalog.=) 'on' AND EXISTS (SELECT 1 FROM kingres.local_node l
                                JOIN kingres.node ln ON ln.node_id OPERATOR(pg_catalog.=) l.node_id
                               WHERE ln.group_id OPERATOR(pg_catalog.=) b.group_id AND ln.role OPERATOR(pg_catalog.=) 'primary')
                 THEN (SELECT pg_catalog.sum(pg_catalog.pg_total_relation_size(d.relid))::pg_catalog.int8
@@ -3002,13 +3008,13 @@ DECLARE
     n pg_catalog.int4 := 0;
 BEGIN
     PERFORM kingres.internal_require_superuser();
-    IF NOT EXISTS (SELECT 1 FROM kingres.dist_schema s WHERE s.nsp OPERATOR(pg_catalog.=) p_nsp::pg_catalog.regnamespace) THEN
+    IF NOT EXISTS (SELECT 1 FROM kingres.dist_schema s WHERE s.nsp OPERATOR(pg_catalog.=) pg_catalog.to_regnamespace(pg_catalog.quote_ident(p_nsp))) THEN
         RAISE EXCEPTION 'schema "%" is not a distributed schema on this node', p_nsp
             USING ERRCODE = 'undefined_object';
     END IF;
     FOR r IN SELECT c.oid::pg_catalog.regclass AS rel
                FROM pg_catalog.pg_class c
-              WHERE c.relnamespace OPERATOR(pg_catalog.=) p_nsp::pg_catalog.regnamespace
+              WHERE c.relnamespace OPERATOR(pg_catalog.=) pg_catalog.to_regnamespace(pg_catalog.quote_ident(p_nsp))
                 AND c.relkind IN ('r', 'p')
                 AND c.relpersistence OPERATOR(pg_catalog.<>) 't'
                 AND NOT EXISTS (SELECT 1 FROM kingres.dist_table d WHERE d.relid::pg_catalog.oid OPERATOR(pg_catalog.=) c.oid)
@@ -3208,7 +3214,7 @@ BEGIN
     IF v_has THEN
         v_stmts := kingres.internal_schema_structure(nsp);
     ELSE
-        v_stmts := ARRAY[]::pg_catalog.text[];
+        v_stmts := kingres.internal_schema_head(nsp);
     END IF;
     PERFORM kingres.internal_register_schema(v_name, v_coloc, v_group);
     PERFORM kingres.internal_register_schema_tables(v_name);
@@ -3327,18 +3333,33 @@ SELECT (pg_catalog.row_number() OVER (ORDER BY ns.nspname, c.relname))::pg_catal
  WHERE d.colocation_id OPERATOR(pg_catalog.=) p_colocation AND d.method OPERATOR(pg_catalog.=) 'schema' AND c.relkind OPERATOR(pg_catalog.=) 'r';
 $$;
 
--- The sequences of the schema that have been used, with their last value (read on the source under the lock of the switch).
+-- The sequences of the schema that have been used or set, with their state (read on the source under the lock of the switch): the last value
+-- and whether it has been handed out (setval(s, n, false) leaves the next nextval at n).
 CREATE FUNCTION kingres.internal_schema_sequence_state(p_colocation int)
-    RETURNS TABLE (seq text, last_value bigint)
-    LANGUAGE sql STABLE
+    RETURNS TABLE (seq text, last_value bigint, is_called bool)
+    LANGUAGE plpgsql
     SET search_path = pg_catalog, kingres, pg_temp
     AS $$
-SELECT q.seq, q.lv FROM (SELECT pg_catalog.format('%I.%I', ns.nspname, c.relname) AS seq, pg_catalog.pg_sequence_last_value(c.oid::pg_catalog.regclass) AS lv
-  FROM kingres.dist_schema s
-  JOIN pg_catalog.pg_namespace ns ON ns.oid OPERATOR(pg_catalog.=) s.nsp::pg_catalog.oid
-  JOIN pg_catalog.pg_class c ON c.relnamespace OPERATOR(pg_catalog.=) ns.oid AND c.relkind OPERATOR(pg_catalog.=) 'S'
- WHERE s.colocation_id OPERATOR(pg_catalog.=) p_colocation) q
- WHERE q.lv IS NOT NULL;
+DECLARE
+    r  pg_catalog.record;
+    lv pg_catalog.int8;
+    ic pg_catalog.bool;
+BEGIN
+    FOR r IN SELECT pg_catalog.format('%I.%I', ns.nspname, c.relname) AS q, sq.seqstart AS st
+               FROM kingres.dist_schema s
+               JOIN pg_catalog.pg_namespace ns ON ns.oid OPERATOR(pg_catalog.=) s.nsp::pg_catalog.oid
+               JOIN pg_catalog.pg_class c ON c.relnamespace OPERATOR(pg_catalog.=) ns.oid AND c.relkind OPERATOR(pg_catalog.=) 'S'
+               JOIN pg_catalog.pg_sequence sq ON sq.seqrelid OPERATOR(pg_catalog.=) c.oid
+              WHERE s.colocation_id OPERATOR(pg_catalog.=) p_colocation
+              ORDER BY ns.nspname, c.relname
+    LOOP
+        EXECUTE pg_catalog.format('SELECT last_value, is_called FROM %s', r.q) INTO lv, ic;
+        IF ic OR lv OPERATOR(pg_catalog.<>) r.st THEN
+            seq := r.q; last_value := lv; is_called := ic;
+            RETURN NEXT;
+        END IF;
+    END LOOP;
+END;
 $$;
 
 -- On the source: what keeps the schema from being copied by the replication, or NULL.  A table needs a key or a full replica identity (the
@@ -3552,8 +3573,11 @@ BEGIN
 
     BEGIN
         IF EXISTS (SELECT 1 FROM kingres.colocation c WHERE c.colocation_id OPERATOR(pg_catalog.=) m.colocation_id AND c.kind OPERATOR(pg_catalog.=) 'schema') THEN
-            -- the old copy of a distributed schema: its tables on the source, emptied (bounded lock wait)
-            PERFORM kingres.internal_node_exec(v_src, pg_catalog.format('SELECT kingres.internal_schema_shells(%s, false)', m.colocation_id), 60000);
+            -- the old copy of a distributed schema: its tables on the source, emptied (bounded lock wait); not when that group holds the schema again
+            IF NOT EXISTS (SELECT 1 FROM kingres.bucket_map bm WHERE bm.colocation_id OPERATOR(pg_catalog.=) m.colocation_id AND bm.bucket OPERATOR(pg_catalog.=) 0
+                              AND bm.group_id OPERATOR(pg_catalog.=) m.source_group) THEN
+                PERFORM kingres.internal_node_exec(v_src, pg_catalog.format('SELECT kingres.internal_schema_shells(%s, false)', m.colocation_id), 60000);
+            END IF;
         ELSE
             PERFORM kingres.internal_node_exec(v_src, pg_catalog.format('SELECT kingres.internal_drop_orphans(%s)', p_move), 60000);
         END IF;
@@ -3688,12 +3712,7 @@ BEGIN
     END IF;
     v_name := v_nsprow.nspname;
     v_head := v_head OPERATOR(pg_catalog.||) 'SET LOCAL check_function_bodies = off'::pg_catalog.text;
-    v_head := v_head OPERATOR(pg_catalog.||) kingres.internal_acl_statements('SCHEMA', pg_catalog.quote_ident(v_name), v_nsprow.nspacl, v_nsprow.nspowner);
-    SELECT ds.description INTO v_cmt FROM pg_catalog.pg_description ds
-     WHERE ds.classoid OPERATOR(pg_catalog.=) 'pg_catalog.pg_namespace'::pg_catalog.regclass AND ds.objoid OPERATOR(pg_catalog.=) v_oid AND ds.objsubid OPERATOR(pg_catalog.=) 0;
-    IF v_cmt IS NOT NULL THEN
-        v_head := v_head OPERATOR(pg_catalog.||) pg_catalog.format('COMMENT ON SCHEMA %I IS %L', v_name, v_cmt);
-    END IF;
+    v_head := v_head OPERATOR(pg_catalog.||) kingres.internal_schema_head(p_nsp);
 
     -- types: enums, domains, composite types (in the order they were made, which is the order of their dependencies)
     FOR r IN
@@ -4367,6 +4386,75 @@ REVOKE ALL ON FUNCTION kingres.internal_schema_pinned(int), kingres.internal_led
 
 -- =========================================================================
 -- PHASE 11, step 11                                                          [end]
+-- =========================================================================
+
+-- =========================================================================
+-- PHASE 11 (distributed schemas), the fixes for the review of increments 1 to 6   [begin]
+-- =========================================================================
+
+-- The statements that give a schema, on an empty schema of another node, its own privileges, its comment and the default privileges that
+-- are set for it (ALTER DEFAULT PRIVILEGES ... IN SCHEMA): the part of the structure that exists whether or not the schema holds objects.
+CREATE FUNCTION kingres.internal_schema_head(p_nsp regnamespace)
+    RETURNS text[]
+    LANGUAGE plpgsql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_oid    pg_catalog.oid := p_nsp::pg_catalog.oid;
+    ns       pg_catalog.pg_namespace%ROWTYPE;
+    v_out    pg_catalog.text[] := ARRAY[]::pg_catalog.text[];
+    v_cmt    pg_catalog.text;
+    r        pg_catalog.record;
+    q        pg_catalog.record;
+BEGIN
+    SELECT * INTO ns FROM pg_catalog.pg_namespace WHERE oid OPERATOR(pg_catalog.=) v_oid;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'schema % does not exist', v_oid USING ERRCODE = 'invalid_schema_name';
+    END IF;
+    v_out := v_out OPERATOR(pg_catalog.||) kingres.internal_acl_statements('SCHEMA', pg_catalog.quote_ident(ns.nspname), ns.nspacl, ns.nspowner);
+    SELECT ds.description INTO v_cmt FROM pg_catalog.pg_description ds
+     WHERE ds.classoid OPERATOR(pg_catalog.=) 'pg_catalog.pg_namespace'::pg_catalog.regclass AND ds.objoid OPERATOR(pg_catalog.=) v_oid AND ds.objsubid OPERATOR(pg_catalog.=) 0;
+    IF v_cmt IS NOT NULL THEN
+        v_out := v_out OPERATOR(pg_catalog.||) pg_catalog.format('COMMENT ON SCHEMA %I IS %L', ns.nspname, v_cmt);
+    END IF;
+    -- default privileges of the schema: for each role that set them, one ALTER DEFAULT PRIVILEGES per grantee
+    FOR r IN SELECT a.defaclrole, a.defaclobjtype, a.defaclacl FROM pg_catalog.pg_default_acl a
+              WHERE a.defaclnamespace OPERATOR(pg_catalog.=) v_oid ORDER BY a.oid
+    LOOP
+        FOR q IN SELECT x.grantee, x.is_grantable, pg_catalog.string_agg(x.privilege_type, ', ' ORDER BY x.privilege_type) AS privs
+                   FROM pg_catalog.aclexplode(r.defaclacl) x
+                  WHERE x.grantor OPERATOR(pg_catalog.=) r.defaclrole
+                  GROUP BY x.grantee, x.is_grantable ORDER BY x.grantee, x.is_grantable
+        LOOP
+            v_out := v_out OPERATOR(pg_catalog.||) pg_catalog.format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I GRANT %s ON %s TO %s%s',
+                        pg_catalog.pg_get_userbyid(r.defaclrole), ns.nspname, q.privs,
+                        CASE r.defaclobjtype WHEN 'r' THEN 'TABLES' WHEN 'S' THEN 'SEQUENCES' WHEN 'f' THEN 'FUNCTIONS' WHEN 'T' THEN 'TYPES' ELSE 'SCHEMAS' END,
+                        CASE WHEN q.grantee OPERATOR(pg_catalog.=) 0 THEN 'PUBLIC' ELSE pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(q.grantee)) END,
+                        CASE WHEN q.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END);
+        END LOOP;
+    END LOOP;
+    RETURN v_out;
+END;
+$$;
+
+-- Does one of the roles own a distributed schema, or a table of one?  (REASSIGN OWNED and DROP OWNED are run on this node only.)
+CREATE FUNCTION kingres.internal_roles_own_distributed(p_roles oid[])
+    RETURNS bool
+    LANGUAGE sql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+SELECT EXISTS (SELECT 1 FROM kingres.dist_schema s JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) s.nsp::pg_catalog.oid
+                WHERE n.nspowner OPERATOR(pg_catalog.=) ANY (p_roles))
+    OR EXISTS (SELECT 1 FROM kingres.dist_table d JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) d.relid::pg_catalog.oid
+                WHERE c.relowner OPERATOR(pg_catalog.=) ANY (p_roles));
+$$;
+
+COMMENT ON FUNCTION kingres.internal_schema_head(regnamespace) IS 'The statements for the privileges, comment and default privileges of a schema';
+COMMENT ON FUNCTION kingres.internal_roles_own_distributed(oid[]) IS 'Does one of the roles own a distributed schema or a distributed table?';
+REVOKE ALL ON FUNCTION kingres.internal_schema_head(regnamespace), kingres.internal_roles_own_distributed(oid[]) FROM PUBLIC;
+
+-- =========================================================================
+-- PHASE 11, the fixes for the review of increments 1 to 6                    [end]
 -- =========================================================================
 
 -- ===========================================================================

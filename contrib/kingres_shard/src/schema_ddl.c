@@ -386,6 +386,8 @@ kingres_shard_schema_ddl_interesting(Node *parsetree)
 		case T_AlterTypeStmt:
 		case T_DefineStmt:
 		case T_IndexStmt:
+		case T_ReassignOwnedStmt:
+		case T_CreateExtensionStmt:
 		case T_CreateTrigStmt:
 		case T_AlterTableStmt:
 		case T_RenameStmt:
@@ -411,6 +413,8 @@ kingres_shard_schema_ddl_interesting(Node *parsetree)
  * ALTER TABLE ... SET SCHEMA of an ordinary table, one of whose two schemas is distributed.  The origin asks kingres.internal_set_schema_check for the
  * kind of move and the reason to refuse it; a session of another node only learns the schemas (the origin has decided).
  */
+static int run_as_bootstrap(const char *sql, int nargs, Oid *argtypes, Datum *values, bool want_int);
+
 static void
 set_schema_table(Node *parsetree, Oid relid, Oid src_ns, Oid target, const KsCatalog *cat, bool forwarded, KsSchemaDdl *sd, NsSet *s)
 {
@@ -803,6 +807,62 @@ kingres_shard_schema_ddl_classify(Node *parsetree, const KsCatalog *cat, bool fo
 					refuse_message(sd, "ALTER ... SET SCHEMA into or out of a distributed schema is not supported yet",
 								   "Recreate the object in the other schema.");
 				finish(sd, &s, cat, "ALTER ... SET SCHEMA");
+			}
+			break;
+
+		case T_ReassignOwnedStmt:
+			{
+				/* the owners of a distributed schema and of its tables are the same on every node: this statement is run here only */
+				ReassignOwnedStmt *r = (ReassignOwnedStmt *) parsetree;
+				ListCell   *lcr;
+				List	   *roles = NIL;
+
+				if (forwarded || cat->ndist_schemas == 0)
+					break;
+				foreach(lcr, r->roles)
+				{
+					Oid			rid = get_rolespec_oid((RoleSpec *) lfirst(lcr), true);
+
+					if (OidIsValid(rid))
+						roles = lappend_oid(roles, rid);
+				}
+				if (roles != NIL)
+				{
+					Datum	   *elems = palloc(sizeof(Datum) * list_length(roles));
+					int			k = 0;
+					ArrayType  *arr;
+					Oid			argtypes[1] = {OIDARRAYOID};
+					Datum		values[1];
+					ListCell   *lcq;
+					bool		owns = false;
+
+					foreach(lcq, roles)
+						elems[k++] = ObjectIdGetDatum(lfirst_oid(lcq));
+					arr = construct_array_builtin(elems, k, OIDOID);
+					values[0] = PointerGetDatum(arr);
+					owns = run_as_bootstrap("SELECT CASE WHEN " KINGRES_SHARD_SCHEMA ".internal_roles_own_distributed($1) THEN 1 ELSE 0 END",
+											1, argtypes, values, true) != 0;
+					if (owns)
+						refuse_message(sd, "REASSIGN OWNED of a role that owns a distributed schema or one of its tables is not supported",
+									   "Change the owner of each object with ALTER ... OWNER TO, which is run on every node.");
+				}
+			}
+			break;
+
+		case T_CreateExtensionStmt:
+			{
+				CreateExtensionStmt *ce = (CreateExtensionStmt *) parsetree;
+				ListCell   *lce;
+
+				foreach(lce, ce->options)
+				{
+					DefElem    *de = lfirst_node(DefElem, lce);
+
+					if (strcmp(de->defname, "schema") == 0 && de->arg != NULL &&
+						kingres_shard_lookup_dist_schema(cat, get_namespace_oid(strVal(de->arg), true)) != NULL)
+						refuse_message(sd, "CREATE EXTENSION ... SCHEMA a distributed schema is not supported",
+									   "The objects of the extension would exist on this node only.");
+				}
 			}
 			break;
 
