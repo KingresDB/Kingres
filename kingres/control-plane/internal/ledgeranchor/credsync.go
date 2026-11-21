@@ -4,6 +4,7 @@ package ledgeranchor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -55,25 +56,27 @@ func (s *Service) credProblemList() map[int64]CredProblem {
 }
 
 // fetchMissing makes the credentials file of a target exist on this server: it asks the other holders for it. It reports whether the file is
-// there afterwards.
-func (s *Service) fetchMissing(ctx context.Context, t TargetRow) bool {
+// there afterwards, and, when it is not, whether that is because the holders could not all be asked (unreached: the file may exist, so the
+// caller waits and tries again) or because every holder said it has none (P7R-08).
+func (s *Service) fetchMissing(ctx context.Context, t TargetRow) (ok, unreached bool) {
 	if s.cfg.Creds.Has(t.ID) {
-		return true
+		return true, false
 	}
 	if s.cfg.Fetch == nil {
-		return false
+		return false, false
 	}
 	data, err := s.cfg.Fetch(ctx, t.ID)
 	if err != nil {
-		return false
+		// only a definite "every holder has none" is final: any other error (holders not reached, the list of holders not read) is not
+		return false, !errors.Is(err, ErrNoCredentials)
 	}
 	defer clear(data)
 	if err := s.cfg.Creds.Install(t.ID, t.Kind, data); err != nil {
 		s.log.Warn("the credentials file that another holder gave could not be installed", "target", t.ID, "error", errText(err))
-		return false
+		return false, false
 	}
 	s.log.Info("the credentials file of an anchor target was fetched from another holder", "target", t.ID)
-	return true
+	return true, false
 }
 
 // jobCredentials is one pass of ledger.anchor.credentials.
@@ -91,9 +94,12 @@ func (s *Service) jobCredentials(ctx context.Context, _ scheduler.Term) error {
 		if !t.CredentialsSet {
 			continue
 		}
-		if !s.fetchMissing(ctx, t) {
-			problems[t.ID] = CredProblem{Critical: t.Enabled, Text: fmt.Sprintf(
-				"This server has no credentials file for target %s and no other holder could give it: it cannot anchor at this target. Enter the credentials of the target again.", t.Name)}
+		if ok, unreached := s.fetchMissing(ctx, t); !ok {
+			text := fmt.Sprintf("This server has no credentials file for target %s and no other holder could give it: it cannot anchor at this target. Enter the credentials of the target again.", t.Name)
+			if unreached {
+				text = fmt.Sprintf("This server has no credentials file for target %s, and not every other holder could be asked for it (a holder did not answer): it cannot anchor at this target until one gives it. It is asked again every minute.", t.Name)
+			}
+			problems[t.ID] = CredProblem{Critical: t.Enabled, Text: text}
 			continue
 		}
 		ids = append(ids, t.ID)
@@ -126,7 +132,23 @@ func (s *Service) jobCredentials(ctx context.Context, _ scheduler.Term) error {
 					t.Name, strings.Join(lacking[id], ", "))}
 			}
 		}
-		for _, id := range sortedIDs(rep.Orphans) {
+		// A file that a holder has for a target that this pass did not see is the file of a deleted target only when the target is still
+		// absent after the holders were asked. CreateTarget commits the row first and writes the files after, so a file that the report
+		// shows belongs to a row that was committed before the report was made: a list of the targets read after the report holds it
+		// (P7R-10). A target created between the first read and the report is therefore never taken for an orphan; one that is deleted
+		// after the report loses its file at the next pass at the latest.
+		orphans := sortedIDs(rep.Orphans)
+		if len(orphans) > 0 && s.cfg.Undistribute != nil {
+			after, aerr := s.cfg.Store.Targets(ctx)
+			if aerr != nil {
+				s.log.Warn("the targets could not be read again, the files of deleted targets are left for the next pass", "error", errText(aerr))
+				orphans = nil
+			}
+			for _, t := range after {
+				known[t.ID] = true
+			}
+		}
+		for _, id := range orphans {
 			if known[id] || s.cfg.Undistribute == nil {
 				continue
 			}

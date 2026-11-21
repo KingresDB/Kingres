@@ -104,7 +104,7 @@ func (a *Agent) Handle(_ context.Context, key string, body []byte) (any, error) 
 		raw, err := a.Creds.Raw(in.TargetID)
 		switch {
 		case errors.Is(err, ErrNoCredentials):
-			return nil, bad("not_found", "This server has no credentials file for the target.", http.StatusNotFound)
+			return nil, bad("not_found", FetchNoneMessage, http.StatusNotFound)
 		case err != nil:
 			return nil, bad("credentials_invalid", "The credentials file could not be read.", http.StatusUnprocessableEntity)
 		}
@@ -122,3 +122,7 @@ func (a *Agent) Handle(_ context.Context, key string, body []byte) (any, error) 
 	}
 	return nil, bad("not_found", "No such call.", http.StatusNotFound)
 }
+
+// FetchNoneMessage is the text of the 404 answer of a holder that has no credentials file for the target. A 404 with another text (a server that
+// does not know the call) does not say that the holder has none (P7R-08).
+const FetchNoneMessage = "This server has no credentials file for the target."

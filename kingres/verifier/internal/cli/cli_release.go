@@ -132,6 +132,7 @@ func releaseVerifyRun(r *result, a releaseVerifyArgs) outcome {
 	}
 	r.ok("sums-format", fmt.Sprintf("the sums list %d file(s): %s", len(entries), listNames(entries)))
 	r.info = map[string]any{"key_id": fmt.Sprintf("%08x", key.ID()), "files": len(entries)}
+	shown := false // the RELEASE file was given and its content is shown
 	for _, b := range bins {
 		want := a.name
 		if want == "" {
@@ -146,6 +147,16 @@ func releaseVerifyRun(r *result, a releaseVerifyArgs) outcome {
 			return failedOut("binary", fmt.Errorf("%q has SHA-256 %s, the signed sums say %s for %s", b.path, hex.EncodeToString(got[:]), hex.EncodeToString(ent.Hash[:]), want))
 		}
 		r.ok("binary", fmt.Sprintf("%s is %s: SHA-256 %s", b.path, want, hex.EncodeToString(got[:])))
+		if want == release.InfoName {
+			// the file that says which release this is: its hash is in the signed sums, so what it says is signed
+			info, err := release.ParseInfo(b.data)
+			if err != nil {
+				return failedOut("release-info", fmt.Errorf("%q matches the signed sums and is not a RELEASE file of this format: %w", b.path, err))
+			}
+			shown = true
+			r.ok("release-info", fmt.Sprintf("the signed release file says: version %s, commit %s, commit date %s, built with %s", info.Version, info.Commit, info.Date, info.Go))
+			r.info["release_version"], r.info["release_commit"], r.info["release_date"], r.info["release_go"] = info.Version, info.Commit, info.Date, info.Go
+		}
 	}
 	r.word = "VERIFIED"
 	if len(bins) == 0 {
@@ -154,7 +165,13 @@ func releaseVerifyRun(r *result, a releaseVerifyArgs) outcome {
 	} else {
 		r.headline = fmt.Sprintf("%d binary(ies) match the sums signed by the release key", len(bins))
 	}
+	if _, listed := release.Find(entries, release.InfoName); listed && !shown {
+		r.notProved = append(r.notProved, "which release this is: the signed sums list a "+release.InfoName+" file with the version, commit and date; give it with --binary "+release.InfoName+" to see them")
+	} else if !listed {
+		r.notProved = append(r.notProved, "which release this is: the signed sums list no "+release.InfoName+" file (a release made before releases signed their version, or a build that is not a release)")
+	}
 	r.notProved = append(r.notProved,
+		"that this is the newest release: a genuine older release, with a known fault, verifies as well, and the signed files do not expire (a rollback to an older release cannot be seen from the files); compare the version above with the project's announcement of the newest release, which you must get from the project and not from the place the files came from",
 		"that the release key is the project's: it is what you passed with --key, so it is only as good as where you got it",
 		"that the binary is free of faults, only that it is the one the key holder signed the hash of",
 		"that the source was reviewed: build it yourself from the release tag and compare the SHA-256 (scripts/repro-check.sh shows how)")

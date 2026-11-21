@@ -236,9 +236,11 @@ type Walk struct {
 	EpochClosed map[string]EpochClosed
 	// UnauthorisedEpochClosed names the epochs that a skipped epoch-closed event is about (the lines are not trusted).
 	UnauthorisedEpochClosed map[string]uint64
-	Count                   int            // events read
-	Other                   map[string]int // verified events of a type this version does not interpret
-	Notes                   []string
+	// Restores are the verified restore-acknowledged events, in the order of their numbers.
+	Restores []RestoreAcknowledged
+	Count    int            // events read
+	Other    map[string]int // verified events of a type this version does not interpret
+	Notes    []string
 }
 
 // ChainKey is the key of a chain and epoch in Walk.Retired.
@@ -473,6 +475,8 @@ func (w *Walk) apply(prefix string, seq uint64, raw []byte, byFP map[string]*Key
 		return w.chainRetired(ev, authorised)
 	case TypeEpochClosed:
 		return w.epochClosed(ev, authorised)
+	case TypeRestoreAcknowledged:
+		return w.restoreAcknowledged(ev, authorised)
 	default:
 		w.Other[ev.Type]++
 	}

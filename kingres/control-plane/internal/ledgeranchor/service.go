@@ -112,6 +112,8 @@ type Service struct {
 	working map[[2]int64]bool
 	sem     chan struct{}
 	fatal   error
+	// fatalTerm is the term of the worker that found the error in fatal: another term never returns it (P7R-03).
+	fatalTerm scheduler.Term
 	// credProblems are the targets whose credentials this server or a holder lacks, by target id (see credsync.go).
 	credProblems map[int64]CredProblem
 }
@@ -300,4 +302,17 @@ func (s *Service) timeout(set, def time.Duration) time.Duration {
 		return set
 	}
 	return def
+}
+
+// credsUnreachedError is the build error of a target whose credentials file this server lacks, when the holders that might have it could
+// not all be asked (P7R-08). Unlike noCredsError it is not final.
+type credsUnreachedError struct{}
+
+func (credsUnreachedError) Error() string {
+	return "this server has no credentials file for the target, and not every other holder could be asked for it: it is asked again"
+}
+
+func isCredsUnreached(err error) bool {
+	var n credsUnreachedError
+	return errors.As(err, &n)
 }

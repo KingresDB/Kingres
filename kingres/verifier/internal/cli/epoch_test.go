@@ -37,8 +37,10 @@ type epochOpts struct {
 	finalSize       int  // what the event says (default 5)
 	eventSigners    []signer
 	noEvent         bool
-	forkedHeld      bool // the round the auditor holds names a history that the closed log does not have
-	heldBlocks      int  // blocks of a that the round the auditor holds names (default 5)
+	forkedHeld      bool   // the round the auditor holds names a history that the closed log does not have
+	heldBlocks      int    // blocks of a that the round the auditor holds names (default 5)
+	common          string // the common height the event states (default unknown)
+	frozenBlocks    int    // blocks the log of a at epoch 1 holds (default 5; the event and the members say 5)
 }
 
 func epochLines(c *chainFix, size int, common, kind string) []string {
@@ -50,11 +52,15 @@ func epochLines(c *chainFix, size int, common, kind string) []string {
 func newEpochWorld(t *testing.T, o epochOpts) *epochWorld {
 	t.Helper()
 	w := newWorld(t)
-	a1, b := makeChain(0xa1, 5, nil), makeChain(0xb2, 3, nil)
+	fb := o.frozenBlocks
+	if fb == 0 {
+		fb = 5
+	}
+	a1, b := makeChain(0xa1, fb, nil), makeChain(0xb2, 3, nil)
 	a2 := makeChainTx(0xa1, 7, nil, func(i int) uint64 { return uint64(500 + i) })
 	a2.epoch = 2
 	ew := &epochWorld{world: w, a1: a1, a2: a2, b: b}
-	w.addChain(a1, 5)
+	w.addChain(a1, fb)
 	w.addChain(b, 3)
 	heldA := a1
 	if o.forkedHeld {
@@ -77,9 +83,13 @@ func newEpochWorld(t *testing.T, o epochOpts) *epochWorld {
 		if ss == nil {
 			ss = []signer{w.s1}
 		}
-		lines := epochLines(a1, 5, "unknown", "restore")
+		common := o.common
+		if common == "" {
+			common = "unknown"
+		}
+		lines := epochLines(a1, 5, common, "restore")
 		if fin != 5 {
-			lines = epochLines(a1, fin, "unknown", "restore")
+			lines = epochLines(a1, fin, common, "restore")
 		}
 		w.event(0, "epoch-closed", ss, lines...)
 	}
@@ -296,4 +306,69 @@ func TestAShorterHeldHeadIsProvedAPrefixOfTheFrozenLog(t *testing.T) {
 	// the same shorter head, of a history the closed log does not have
 	ew = newEpochWorld(t, epochOpts{heldBlocks: 3, forkedHeld: true})
 	wantRun(t, 1, ew.aggArgs("--previous", ew.held, "--accept-epoch-closed", "0"), "FAILED at step continuity", "is not an extension of the log at size 3")
+}
+
+// P7R-02: an event that states a common height is tested, not believed. The event below says that the two histories share the
+// heights 0 to 3; a proof of block 3 of epoch 1 is in the bundle, and block 3 is not in the log of epoch 2 (another history). The
+// run must not say that the block is in the history that goes on, and must fail whatever is accepted.
+func TestBundleCommonHeightOfAnEventIsTestedAgainstTheNextEpochsLog(t *testing.T) {
+	ew := newEpochWorld(t, epochOpts{common: "3"})
+	ew.put("proofs/old.json", ew.a1.proofJSON(3, nil, 0))
+	ew.bundleJSON(map[string]string{"file": "proofs/old.json"})
+	out := wantRun(t, 1, ew.bundleArgs("--accept-epoch-closed", "0"), "FAILED at step epoch-closed", "proof 1 shows its block (height 3) in epoch 1",
+		"common height 3", "which says the block is in epoch 2 as well; it is not", "The event and the logs disagree")
+	if strings.Contains(out, "VERIFIED") || strings.Contains(out, "it is in the history that goes on as well") {
+		t.Fatalf("a false claim:\n%s", out)
+	}
+	// without the acceptance it is a failure as well
+	wantRun(t, 1, ew.bundleArgs(), "FAILED at step epoch-closed")
+	// a block above the common height keeps the old behaviour: a finding that needs the acceptance
+	ew.put("proofs/above.json", ew.a1.proofJSON(4, nil, 0))
+	ew.bundleJSON(map[string]string{"file": "proofs/above.json"})
+	wantRun(t, 0, ew.bundleArgs("--accept-epoch-closed", "0"), "VERIFIED:", "finding: proof 1 shows its block (height 4) in epoch 1")
+}
+
+// When the log of the next epoch is not in the bundle the verifier cannot test the statement, and then it does not make the claim.
+func TestBundleCommonHeightWithoutTheNextLogMakesNoClaim(t *testing.T) {
+	ew := newEpochWorld(t, epochOpts{common: "3", closingLeafLast: true})
+	ew.put("proofs/old.json", ew.a1.proofJSON(3, nil, 0))
+	ew.bundleJSON(map[string]string{"file": "proofs/old.json"})
+	out := wantRun(t, 0, ew.bundleArgs("--accept-epoch-closed", "0"), "VERIFIED:", "this run did not test that statement and does not show that the block is in the history that goes on")
+	if strings.Contains(out, "it is in the history that goes on as well") {
+		t.Fatalf("a claim that was not tested:\n%s", out)
+	}
+}
+
+// The single proof command opens only the log of the epoch it was given: it states the event's words and does not adopt them.
+func TestProofOfAClosedEpochDoesNotAdoptTheCommonHeightOfTheEvent(t *testing.T) {
+	ew := newEpochWorld(t, epochOpts{common: "3"})
+	ew.put("old.json", ew.a1.proofJSON(3, nil, 0))
+	out := wantRun(t, 0, []string{"proof", "--proof", filepath.Join(ew.dir, "old.json"), "--bundle", ew.dir, "--trust", ew.trust, "--now", nowArg19, "--log-leg", "chain", "--epoch", "1"}, "VERIFIED:")
+	if strings.Contains(out, "it is in the history that goes on as well") || !strings.Contains(out, "did not test that the block is in the history that goes on") {
+		t.Fatalf("%s", out)
+	}
+}
+
+// P7R-05, guard E06: with the head you hold shorter than the frozen log, an event that disagrees with the frozen log is refused
+// whatever is accepted. The frozen log holds 6 blocks, the event and the aggregate say 5.
+func TestAnEventThatDisagreesWithTheFrozenLogIsRefusedWhenComparingWithAHeldRound(t *testing.T) {
+	ew := newEpochWorld(t, epochOpts{frozenBlocks: 6})
+	wantRun(t, 1, ew.aggArgs("--previous", ew.held, "--accept-epoch-closed", "0"), "FAILED at step epoch-closed", "the event and the log it closes disagree", "the frozen log has size 6")
+}
+
+// P7R-05, guard E09: a closed log that continues past the size the event states is a failure whatever is accepted.
+func TestAClosedLogThatContinuesPastTheEventIsRefused(t *testing.T) {
+	ew := newEpochWorld(t, epochOpts{frozenBlocks: 6, closingLeafLast: true})
+	wantRun(t, 1, ew.aggArgs("--accept-epoch-closed", "0"), "FAILED at step epoch-closed", "a closed log continues")
+}
+
+// P7R-05, note E14: an acceptance that nothing used is reported, here a number that no event has next to one that is used.
+func TestAnAcceptanceThatNothingUsedIsReported(t *testing.T) {
+	ew := newEpochWorld(t, epochOpts{})
+	out := wantRun(t, 0, ew.aggArgs("--previous", ew.held, "--accept-epoch-closed", "0", "--accept-epoch-closed", "7"), "VERIFIED:", "--accept-epoch-closed 7 accepted nothing", "event 000007")
+	if strings.Contains(out, "--accept-epoch-closed 0 accepted nothing") {
+		t.Fatalf("the used acceptance is reported as unused:\n%s", out)
+	}
+	ew.bundleJSON()
+	wantRun(t, 0, ew.bundleArgs("--accept-epoch-closed", "0", "--accept-epoch-closed", "7"), "VERIFIED:", "--accept-epoch-closed 7 accepted nothing")
 }

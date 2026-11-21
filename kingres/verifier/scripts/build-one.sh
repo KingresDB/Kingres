@@ -24,8 +24,10 @@ esac
 mod="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 case "${output}" in /*) ;; *) output="$(pwd)/${output}" ;; esac
 
-unset GOFLAGS GOEXPERIMENT GOWORK GOPROXY GOAMD64 GOARM64 GO386 GOARM GOMIPS GOPPC64 CC CXX CGO_CFLAGS CGO_LDFLAGS
-export CGO_ENABLED=0 GOFLAGS=-mod=readonly GOAMD64=v1 GOARM64=v8.0 GOWORK=off GOTOOLCHAIN=local
+# GOENV=off: the file that `go env -w` writes is not read, so a setting made there (GOEXPERIMENT, GOFIPS140, GOFLAGS, ...)
+# cannot change the bytes (P7R-06). The variables that change the code the compiler makes are unset or fixed.
+unset GOFLAGS GOEXPERIMENT GOFIPS140 GODEBUG GOWORK GOPROXY GOAMD64 GOARM64 GO386 GOARM GOMIPS GOPPC64 GORISCV64 GOWASM CC CXX CGO_CFLAGS CGO_LDFLAGS
+export GOENV=off CGO_ENABLED=0 GOFLAGS=-mod=readonly GOAMD64=v1 GOARM64=v8.0 GOWORK=off GOTOOLCHAIN=local
 cd "${mod}"
 GOOS="${os}" GOARCH="${arch}" go build -trimpath -buildvcs=false \
     -ldflags "-s -w -buildid= -X main.version=${version}" \

@@ -4,6 +4,7 @@ package ledgeranchor
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -49,6 +50,46 @@ const (
 // ErrNoCredentials means the target has credentials set and this server has no file for them (it is not a holder, or
 // the key directory was restored without them).
 var ErrNoCredentials = errors.New("ledgeranchor: this server has no credentials file for the target")
+
+// ErrHoldersUnreached is the answer of Fetch when no holder gave the file and at least one could not be asked (it did not answer, or it
+// answered something that is no answer): the file may exist. It is not ErrNoCredentials, which says that every holder was asked and none
+// has the file. The first is a reason to wait and try again, the second a reason to ask the operator for the credentials (P7R-08).
+var ErrHoldersUnreached = errors.New("ledgeranchor: no holder gave the credentials file and not every holder could be asked")
+
+// HolderAnswer is what one holder said to the request for a credentials file.
+type HolderAnswer int
+
+const (
+	// HolderHasFile: it sent the file.
+	HolderHasFile HolderAnswer = iota
+	// HolderHasNone: it answered, and it has no file for the target.
+	HolderHasNone
+	// HolderUnreached: it did not answer, or its answer says nothing about the file (an error status, bytes that are no file).
+	HolderUnreached
+)
+
+// FetchFirst asks the hosts one after the other and returns the first file it gets. When none gives a file it returns
+// ErrNoCredentials if every host answered that it has none (also when there is no other host), and ErrHoldersUnreached otherwise.
+func FetchFirst(ctx context.Context, hosts []string, ask func(ctx context.Context, host string) ([]byte, HolderAnswer)) ([]byte, error) {
+	unreached := false
+	for _, h := range hosts {
+		if ctx.Err() != nil {
+			return nil, ErrHoldersUnreached
+		}
+		raw, ans := ask(ctx, h)
+		switch {
+		case ans == HolderHasFile && len(raw) > 0:
+			return raw, nil
+		case ans == HolderHasNone:
+		default:
+			unreached = true
+		}
+	}
+	if unreached {
+		return nil, ErrHoldersUnreached
+	}
+	return nil, ErrNoCredentials
+}
 
 // ErrCredentials means a credentials file cannot be read or opened. Its text names no content.
 var ErrCredentials = errors.New("ledgeranchor: the credentials file cannot be read or opened")

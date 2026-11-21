@@ -5,8 +5,10 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -18,6 +20,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/config"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgeranchor"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/membership"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/peerclient"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/scheduler"
 )
 
@@ -72,7 +75,9 @@ func newLedgerAnchor(cfg config.Config, dir string, sys func(ctx context.Context
 		}
 		return nil
 	}
-	// fetch asks the other holders, one after the other, for the credentials file of a target this server lacks (P7A-03)
+	// fetch asks the other holders, one after the other, for the credentials file of a target this server lacks (P7A-03). It answers
+	// ErrNoCredentials only when every holder answered that it has none; a holder that could not be asked makes it ErrHoldersUnreached,
+	// so that the records of the target wait and are not failed for good (P7R-08).
 	fetch := func(ctx context.Context, id int64) ([]byte, error) {
 		if members == nil {
 			return nil, ledgeranchor.ErrNoCredentials
@@ -81,18 +86,18 @@ func newLedgerAnchor(cfg config.Config, dir string, sys func(ctx context.Context
 		if err != nil {
 			return nil, err
 		}
-		for _, h := range hs {
+		return ledgeranchor.FetchFirst(ctx, hs, func(ctx context.Context, h string) ([]byte, ledgeranchor.HolderAnswer) {
 			var out ledgeranchor.FetchResponse
 			if err := members.Client.Do(ctx, h, "POST", "/ledger/anchor/credentials/fetch", ledgeranchor.FetchRequest{TargetID: id}, &out); err != nil {
-				continue
+				return nil, fetchAnswerOf(err)
 			}
 			raw, err := base64.StdEncoding.Strict().DecodeString(out.File)
 			out.File = ""
-			if err == nil && len(raw) > 0 {
-				return raw, nil
+			if err != nil || len(raw) == 0 {
+				return nil, ledgeranchor.HolderUnreached
 			}
-		}
-		return nil, ledgeranchor.ErrNoCredentials
+			return raw, ledgeranchor.HolderHasFile
+		})
 	}
 	// holderReport asks every other holder which files it has: the holders that lack a file of ids, and the files of targets that are gone
 	holderReport := func(ctx context.Context, ids []int64) (ledgeranchor.HolderReport, error) {
@@ -224,4 +229,14 @@ func anchorLimits(getenv func(string) string, log *slog.Logger) anchor.Limits {
 		}
 	}
 	return l
+}
+
+// fetchAnswerOf classifies the error of a request for a credentials file: the answer "not found" of a holder (404 not_found) says that the
+// holder was asked and has none; every other error (the holder did not answer, answered 503 or 422) says nothing about the file.
+func fetchAnswerOf(err error) ledgeranchor.HolderAnswer {
+	var ae *peerclient.APIError
+	if errors.As(err, &ae) && ae.Status == http.StatusNotFound && ae.Code == "not_found" && ae.Message == ledgeranchor.FetchNoneMessage {
+		return ledgeranchor.HolderHasNone
+	}
+	return ledgeranchor.HolderUnreached
 }

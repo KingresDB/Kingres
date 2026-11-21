@@ -466,8 +466,7 @@ func (f *File) Accept(db State, n RestoreNote) error {
 	nn := n
 	next.Restore = &nn
 	if data, err := os.ReadFile(f.path); err == nil { // #nosec G304 -- the key directory of the daemon
-		keep := fmt.Sprintf("%s.before-restore-%d", f.path, next.Generation)
-		if err := os.WriteFile(keep, data, 0o600); err != nil { // #nosec G306 -- mode 0600
+		if err := keepBeforeRestore(f.path, next.Generation, data); err != nil {
 			return errors.New("ledgerstate: the record to be replaced cannot be kept: nothing was changed")
 		}
 	}
@@ -532,4 +531,57 @@ func Confirmation(published, database State) string {
 	p.Restore = nil
 	h := sha256.Sum256([]byte("kingres restore confirmation 1\n" + sumOf(p) + "\n" + SumOf(database)))
 	return hex.EncodeToString(h[:8])
+}
+
+// keepBeforeRestore writes the record that an acceptance replaces beside the record, as <path>.before-restore-<generation>: into a temporary
+// file in the same directory, synced, then renamed, and the directory synced, so that after a crash the copy is whole or absent and never half
+// written (P7R-11). A copy that is already there is never written over: a record that was lost and made again from the database starts at
+// generation 0, and its acceptance would otherwise destroy the copy of an earlier one. The new copy then takes the name with a suffix .1, .2, ...
+func keepBeforeRestore(path string, generation int64, data []byte) error {
+	dir := filepath.Dir(path)
+	base := fmt.Sprintf("%s.before-restore-%d", path, generation)
+	final := base
+	for n := 1; ; n++ {
+		if _, err := os.Lstat(final); err != nil {
+			if os.IsNotExist(err) {
+				break
+			}
+			return err
+		}
+		if n > 100 {
+			return errors.New("too many copies")
+		}
+		final = fmt.Sprintf("%s.%d", base, n)
+	}
+	tmp, err := os.CreateTemp(dir, ".before-restore-*")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	fail := func(err error) error {
+		_ = tmp.Close()
+		_ = os.Remove(name)
+		return err
+	}
+	if runtime.GOOS != "windows" {
+		if err := tmp.Chmod(0o600); err != nil {
+			return fail(err)
+		}
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return fail(err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fail(err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(name)
+		return err
+	}
+	if err := os.Rename(name, final); err != nil {
+		_ = os.Remove(name)
+		return err
+	}
+	syncDir(dir)
+	return nil
 }
