@@ -1586,3 +1586,24 @@ base the later increments extend. Departures from sections 6 and 9:
 - **Standbys.** A move changes the owner of the data, not where standbys are. A logical slot and a subscription exist on primaries that
   have standbys; the slot is not on the standby, so a failover during a move fails the move and the extension undoes it. Failover itself is
   not implemented in `kingresd`.
+
+## 22. The control plane of increments 2 to 4 and the split as built (contract 0.16.0): decisions and departures
+
+**Decision: a drain is a task of kind `rebalance`, not of kind `server.drain` (departs from sections 9.1 and 11.3).** `drainServer` submits the task `rebalance` (subject `cluster`/`cluster`) with the
+options `trigger = drain`, `drainOnly`, the drained server, `removeWhenDone` and `acceptFewerReplicas`. Reason: everything the control plane already does for a rebalance is keyed by that kind and subject, and a drain must
+have all of it: the database triggers that exclude server operations and failovers (migrations 0009 to 0016, `KX001`/`KX002`), the in-memory exclusion of the task store, the pause of a rebalance by a failover (`mapgroup.go`),
+`rebalance_in_progress` for `PATCH /servers`, the counting in `facts.go` and the read model, one stop, resume and cancel path, the report with the id of the task, and the alert. A separate kind would need each of
+those places changed and tested again, and the design wants the same exclusion ("the rebalance lock is held for the duration"). The cost: the task list shows `rebalance` for a drain (the status and the report say
+`trigger: drain`), and a drain and a rebalance exclude each other, which they should. The extra steps of a drain are steps of the same task that a plain rebalance skips (`task.Skip`): the flag first, the wait until the
+server owns no bucket (including moves in `cleaning`), and the removal, which is the `server.remove` task started after the drain task has ended (the two exclude each other); a manager that restarts in between leaves the
+server drained and not removed.
+
+**Not built in this round: steps 4 and 5 of section 11.3** (hand-over of the map group, relocation of the standbys hosted on the server). `drainServer` refuses a server that runs the map group primary
+(`server_hosts_map_group`) and a drain that would leave fewer servers than `replicaCount + 1` (`replicas_cannot_be_kept`, `acceptFewerReplicas` overrides); `previewServerDrain` lists the groups whose standby runs on the server.
+
+**Automatic mode (section 8).** The safety rules are the pure function `SafetyBlockers`; an automatic run is paused by `autoGuard` before each move (`stoppedBy: safetyRule`) and resumed by the job when the rules have held for
+`settleSeconds`. The "last topology change" is the newest of `server.joined_at`, the end of a server task and `topology.changedAt`, which `updateServer` writes when it changes the flag or the weight. The disk rule uses the existing
+per-move check (`Disk`); the rules `maxStandbyLagBytes` and the window are settings, the lag rule is not evaluated yet (no lag source in the read model of the leader).
+
+**Split (section 9.3).** The preview cannot find a table without a primary key (the owner's tables are not readable from the map group primary); the extension refuses it when `split_bucket` starts and the task fails with
+`split_unsupported`. The task does not wait for the orphans to be dropped (`cleanup_bucket_splits` is the recovery worker's). The size estimate comes from the extension's plan inputs (`internal_plan_inputs('by_disk_size', ...)`).
