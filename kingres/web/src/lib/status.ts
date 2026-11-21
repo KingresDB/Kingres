@@ -214,6 +214,7 @@ export const ALERT_KIND_LABEL: Record<AlertKind, string> = {
   ledgerPublicationBehind: 'Ledger publication is behind',
   ledgerSignerUnavailable: 'Ledger checkpoints cannot be signed',
   ledgerDigestOverdue: 'No ledger digest for too long',
+  certificateAuthorityUnavailable: 'The certificate authority is not available',
 }
 
 /** The label of an alert kind; a kind from a newer server is shown as sent (through SafeName). */
@@ -254,6 +255,9 @@ export const TASK_KIND_LABEL: Record<TaskKind, string> = {
   'ledger.bundle.create': 'Create a ledger bundle',
   'ledger.epoch.start': 'Start a new ledger epoch',
   'ledger.upgrade': 'Upgrade the ledger extension',
+  'schema.distribute': 'Distribute a schema',
+  'schema.move': 'Move a schema to another server group',
+  'schema.undistribute': 'Make a schema local',
 }
 
 /**
@@ -346,6 +350,9 @@ export const AUDIT_ACTION_LABEL: Record<AuditAction, string> = {
   updateDatabase: 'Change a database',
   dropDatabase: 'Drop a database',
   distributeTable: 'Distribute a table',
+  distributeSchema: 'Distribute a schema',
+  undistributeSchema: 'Make a schema local',
+  moveSchema: 'Move a schema',
   enableTableLedger: 'Enable the ledger of a table',
   restorePreferredPrimaries: 'Restore preferred primaries',
   startRebalance: 'Start a rebalance',

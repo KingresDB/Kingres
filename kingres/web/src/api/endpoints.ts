@@ -193,10 +193,55 @@ export const endpoints = {
         body,
       }),
     ),
-  listColocationGroups: (databaseName: string) =>
+  /** `kind` (0.15.0): the Shards page asks for `hash`, so that the one-bucket group of every distributed schema stays out of it. */
+  listColocationGroups: (databaseName: string, kind?: 'hash' | 'schema') =>
     j(
       api.GET('/databases/{databaseName}/colocation-groups', {
-        params: { path: { databaseName } },
+        params: { path: { databaseName }, query: kind ? { kind } : {} },
+      }),
+    ),
+
+  // --- distributed schemas (0.15.0)
+  listSchemas: (
+    databaseName: string,
+    q: Page & { distributed?: boolean; shardGroupId?: number; state?: 'active' | 'moving' } = {},
+  ) =>
+    j(
+      api.GET('/databases/{databaseName}/schemas', {
+        params: { path: { databaseName }, query: { limit: 500, ...q } },
+      }),
+    ),
+  getSchema: (databaseName: string, schemaName: string) =>
+    j(
+      api.GET('/databases/{databaseName}/schemas/{schemaName}', {
+        params: { path: { databaseName, schemaName } },
+      }),
+    ),
+  distributeSchema: (
+    databaseName: string,
+    schemaName: string,
+    body: S['DistributeSchemaRequest'],
+  ) =>
+    j(
+      api.PUT('/databases/{databaseName}/schemas/{schemaName}/distribution', {
+        params: { path: { databaseName, schemaName } },
+        body,
+      }),
+    ),
+  undistributeSchema: (databaseName: string, schemaName: string, shardGroupId?: number) =>
+    j(
+      api.DELETE('/databases/{databaseName}/schemas/{schemaName}/distribution', {
+        params: {
+          path: { databaseName, schemaName },
+          query: shardGroupId === undefined ? {} : { shardGroupId },
+        },
+      }),
+    ),
+  moveSchema: (databaseName: string, schemaName: string, body: S['MoveSchemaRequest']) =>
+    j(
+      api.POST('/databases/{databaseName}/schemas/{schemaName}/moves', {
+        params: { path: { databaseName, schemaName } },
+        body,
       }),
     ),
   listBuckets: (

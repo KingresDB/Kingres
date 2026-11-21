@@ -6,6 +6,15 @@
 import { evaluateAccess } from '@/lib/network-rules'
 import { applyPending, configHandlers } from './config'
 import { ledgerHandlers } from './ledger'
+import {
+  cancelSchemaMove,
+  distributedSchemas,
+  modeOf,
+  schemaColocations,
+  schemaHandlers,
+  schemaMovesInFlight,
+  schemasOnServer,
+} from './schemas'
 import { AGGREGATE_SIZE, anchoringOf, digestAnchorsOf, l7, publicationOf } from './ledger-view'
 import type { HttpHandler } from 'msw'
 import type { components } from '@/api/schema'
@@ -320,23 +329,27 @@ function rebalanceStatusView(s: MockState): S['RebalanceStatus'] {
             bytesMoved: r.moves.slice(0, done).reduce((n, m) => n + (m.estimatedSizeBytes ?? 0), 0),
             percent: Math.round(fraction * 1000) / 10,
           },
-    inFlightMoves: inFlight.map((m) => {
-      // One move at a time: its phase follows the position inside the move.
-      const within = fraction * total - done
-      const phase = phases[Math.min(4, Math.floor(within * 5))] as (typeof phases)[number]
-      return {
-        databaseName: m.databaseName,
-        colocationId: m.colocationId,
-        bucket: m.bucket,
-        fromShardGroupId: m.fromShardGroupId,
-        toShardGroupId: m.toShardGroupId,
-        fromServerId: serverOfGroup(s, m.fromShardGroupId),
-        toServerId: serverOfGroup(s, m.toShardGroupId),
-        phase,
-        percent: [5, 30, 85, 95, 100][phases.indexOf(phase)] as number,
-        sizeBytes: m.estimatedSizeBytes,
-      }
-    }),
+    inFlightMoves: [
+      ...inFlight.map((m) => {
+        // One move at a time: its phase follows the position inside the move.
+        const within = fraction * total - done
+        const phase = phases[Math.min(4, Math.floor(within * 5))] as (typeof phases)[number]
+        return {
+          databaseName: m.databaseName,
+          colocationId: m.colocationId,
+          bucket: m.bucket,
+          fromShardGroupId: m.fromShardGroupId,
+          toShardGroupId: m.toShardGroupId,
+          fromServerId: serverOfGroup(s, m.fromShardGroupId),
+          toServerId: serverOfGroup(s, m.toShardGroupId),
+          phase,
+          percent: [5, 30, 85, 95, 100][phases.indexOf(phase)] as number,
+          sizeBytes: m.estimatedSizeBytes,
+        }
+      }),
+      // The move of a distributed schema (0.15.0) is listed with the bucket moves, with its schema name.
+      ...schemaMovesInFlight(s),
+    ],
     stoppedBy: r.state === 'stopped' || r.state === 'stopping' ? r.stoppedBy : null,
     pausedReason: r.state === 'stopped' ? r.pausedReason : null,
     lastReport: lastReportOf(s),
@@ -792,12 +805,13 @@ function createOptions(s: MockState): S['DatabaseCreateOptions'] {
     replicaCount: s.settings.defaultReplicaCount,
     defaultDurability: s.settings.defaultDurability,
     ledgerDigestIntervalSeconds: { default: 3600, minimum: 60, maximum: 86400 },
+    shardingModes: { modes: ['row', 'schema', 'both'], default: 'row' },
   }
 }
 
 function validateDatabase(s: MockState, b: S['DatabaseCreateRequest']): void {
   const options = createOptions(s)
-  const errors: { field: string; message: string }[] = []
+  const errors: { field: string; message: string; code?: string }[] = []
   if (!NAME_RE.test(b.name ?? ''))
     errors.push({
       field: 'name',
@@ -809,6 +823,25 @@ function validateDatabase(s: MockState, b: S['DatabaseCreateRequest']): void {
     errors.push({
       field: 'sharding.bucketCount',
       message: 'The bucket count must be between 1 and 4096.',
+    })
+  const mode = b.sharding?.mode ?? 'row'
+  if (b.sharding?.mode !== undefined && !['row', 'schema', 'both'].includes(b.sharding.mode))
+    errors.push({
+      field: 'sharding.mode',
+      message: 'Use row, schema or both.',
+      code: 'unknown_value',
+    })
+  if (b.sharding?.mode !== undefined && b.sharding.enabled !== true)
+    errors.push({
+      field: 'sharding.mode',
+      message: 'The sharding mode needs sharding to be enabled.',
+      code: 'invalid',
+    })
+  if (b.sharding?.distributeNewSchemas === true && mode === 'row')
+    errors.push({
+      field: 'sharding.distributeNewSchemas',
+      message: 'Schemas are distributed by default only in the mode schema or both.',
+      code: 'invalid',
     })
   const interval = b.ledger?.digestIntervalSeconds
   if (interval !== undefined && (interval < 60 || interval > 86400))
@@ -843,7 +876,10 @@ function newDatabase(s: MockState, b: S['DatabaseCreateRequest']): Database {
     },
     sharding: {
       enabled: b.sharding?.enabled ?? false,
-      bucketCount: b.sharding?.bucketCount ?? 128,
+      // The mode `schema` has no hash buckets (a bucket count that a client sends is ignored).
+      bucketCount: b.sharding?.mode === 'schema' ? null : (b.sharding?.bucketCount ?? 128),
+      mode: b.sharding?.mode ?? 'row',
+      distributeNewSchemas: b.sharding?.distributeNewSchemas ?? false,
     },
     replication: {
       durability: b.replication?.durability ?? s.settings.defaultDurability,
@@ -878,7 +914,12 @@ function databaseView(s: MockState, name: string): Database {
   return {
     ...rec.info,
     replication: { ...rec.info.replication, replicaCount: s.settings.defaultReplicaCount },
-    stats: { ...rec.info.stats, tableCount: rec.tables.length },
+    stats: {
+      ...rec.info.stats,
+      // A database whose tables are only counted (the schemas of `tenants`) keeps the count it was seeded with.
+      tableCount: rec.tables.length > 0 ? rec.tables.length : rec.info.stats.tableCount,
+      distributedSchemaCount: rec.info.sharding.enabled ? distributedSchemas(rec).length : 0,
+    },
     health: { underReplicatedBuckets: under, unavailableBuckets: unavailable },
     rebalanceRequired: s.rebalance.needed && rec.info.sharding.enabled,
     ledgerSummary: {
@@ -1325,6 +1366,7 @@ export function createHandlers(): HttpHandler[] {
   const h: Partial<Record<OperationId, Handler>> = {
     ...configHandlers(),
     ...ledgerHandlers(),
+    ...schemaHandlers(),
     getHealth: () => ok({ status: 'ok' }),
     getReadiness: (c) =>
       ok({
@@ -1944,6 +1986,42 @@ export function createHandlers(): HttpHandler[] {
       if (errors.length) throw validationFailed(errors)
       if (b.ledger?.mode === 'off' && info.ledger.mode !== 'off')
         throw problem('immutable_field', 'The ledger cannot be turned off once it is on.')
+      const sh = b.sharding
+      const newMode = sh?.mode ?? modeOf(rec)
+      if (sh?.mode !== undefined && !['row', 'schema', 'both'].includes(sh.mode))
+        throw validationFailed([
+          { field: 'sharding.mode', message: 'Use row, schema or both.', code: 'unknown_value' },
+        ])
+      if (
+        (sh?.mode !== undefined || sh?.distributeNewSchemas !== undefined) &&
+        !info.sharding.enabled &&
+        sh.enabled !== true
+      )
+        throw problem('conflict', 'Sharding is not enabled for this database.')
+      if (sh?.distributeNewSchemas === true && newMode === 'row')
+        throw validationFailed([
+          {
+            field: 'sharding.distributeNewSchemas',
+            message: 'Schemas are distributed by default only in the mode schema or both.',
+            code: 'invalid',
+          },
+        ])
+      if (sh?.mode !== undefined && sh.mode !== modeOf(rec)) {
+        const schemas = distributedSchemas(rec).map((x) => x.name)
+        const hash = rec.tables
+          .filter((t) => t.distribution?.method === 'hash')
+          .map((t) => `${t.schema}.${t.name}`)
+        if (sh.mode === 'row' && schemas.length > 0)
+          throw problem(
+            'sharding_mode_in_use',
+            `This database has distributed schemas, so it cannot be set to Rows only: ${schemas.join(', ')}.`,
+          )
+        if (sh.mode === 'schema' && hash.length > 0)
+          throw problem(
+            'sharding_mode_in_use',
+            `This database has hash-distributed tables, so it cannot be set to Schemas only: ${hash.join(', ')}.`,
+          )
+      }
       const needsTask =
         (b.sharding?.enabled === true && !info.sharding.enabled) ||
         (b.ledger?.mode && b.ledger.mode !== 'off' && info.ledger.mode === 'off')
@@ -1958,6 +2036,13 @@ export function createHandlers(): HttpHandler[] {
         if (b.ledger?.digestIntervalSeconds !== undefined)
           info.ledger.digestIntervalSeconds = b.ledger.digestIntervalSeconds
         if (b.sharding?.enabled) info.sharding.enabled = true
+        if (sh?.mode !== undefined) info.sharding.mode = sh.mode
+        if (sh?.mode !== undefined || sh?.distributeNewSchemas !== undefined)
+          // It stays what it was, except that a mode that does not allow it makes it false.
+          info.sharding.distributeNewSchemas =
+            newMode === 'row'
+              ? false
+              : (sh?.distributeNewSchemas ?? info.sharding.distributeNewSchemas ?? false)
       }
       if (!needsTask) {
         applyNow()
@@ -2135,7 +2220,15 @@ export function createHandlers(): HttpHandler[] {
         rec.info.ledger.mode = 'optIn'
       return ok(t)
     },
-    listColocationGroups: (c) => ok({ items: db(c.s, c.params.databaseName ?? '').colocations }),
+    listColocationGroups: (c) => {
+      const rec = db(c.s, c.params.databaseName ?? '')
+      const kind = c.url.searchParams.get('kind')
+      // A group without `kind` is a hash group (a server before 0.15.0 sends none); the groups of schemas come after.
+      const items = [...rec.colocations, ...schemaColocations(rec)].filter(
+        (g) => kind === null || (g.kind ?? 'hash') === kind,
+      )
+      return ok({ items })
+    },
     listBuckets: (c) => {
       const rec = db(c.s, c.params.databaseName ?? '')
       const buckets = rec.buckets.get(num(c, 'colocationId'))
@@ -2177,12 +2270,15 @@ export function createHandlers(): HttpHandler[] {
               rs += b.size ?? 0
             }
           }
+          // A distributed schema is one bucket of a group of kind `schema`, counted with the primary buckets too.
+          const own = only ? { count: 0, bytes: 0 } : schemasOnServer(c.s, rec, srv.id)
           return {
             serverId: srv.id,
-            primaryBuckets: pb,
+            primaryBuckets: pb + own.count,
             replicaBuckets: rb,
-            primarySizeBytes: ps,
+            primarySizeBytes: ps + own.bytes,
             replicaSizeBytes: rs,
+            primarySchemas: own.count,
           }
         }),
       } satisfies S['BucketDistribution'])
@@ -2416,6 +2512,7 @@ export function createHandlers(): HttpHandler[] {
       }
       // A failover stops before the promotion: its freezes are lifted and its report says cancelled (running or paused).
       if (rec.task.kind === 'server.failover') return ok(cancelFailover(c.s, rec))
+      if (rec.task.kind === 'schema.move') return ok(cancelSchemaMove(c.s, rec))
       if (rec.task.state !== 'running') throw problem('task_not_cancellable')
       rec.task.state = 'paused'
       rec.task.cancellable = false

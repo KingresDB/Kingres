@@ -228,6 +228,31 @@ interface BucketRec {
   size: number | null
 }
 
+/** A schema of a database (contract 0.15.0). `group` is the owner shard group of a distributed schema, null for a local one. */
+export interface SchemaRec {
+  name: string
+  owner: string
+  group: number | null
+  colocationId: number
+  state: 'active' | 'moving'
+  /** The target group of the move that runs. */
+  movingTo: number | null
+  /** The running task that moves (or makes local) the schema; `getSchema` reports it as `moveInProgress`. */
+  taskId: number | null
+  tableCount: number
+  /** Null when the server that answers does not hold the schema's tables. */
+  sizeBytes: number | null
+  estimatedRows: number | null
+  /** What keeps a local schema from being distributed (the output of `schema_inventory`). */
+  blockers: S['SchemaBlocker'][]
+  /** Why the schema cannot move or become local (a ledger table); null when it can. */
+  pinned: string | null
+  /** Tables that have neither a primary key nor REPLICA IDENTITY FULL (a move is refused for them unless asked). */
+  keyless: string[]
+  /** A move of this schema fails at its copy step (the schema `failme`). */
+  failsToMove?: boolean
+}
+
 export interface DbRec {
   info: Database
   tables: Table[]
@@ -235,6 +260,8 @@ export interface DbRec {
   buckets: Map<number, BucketRec[]>
   /** Columns to report instead of the built-in ones, by table name (hostile-data tests). */
   extraColumns?: Record<string, S['TableColumn'][]>
+  /** The schemas of the database (0.15.0); a database without them lists none. */
+  schemas?: SchemaRec[]
 }
 
 /** What a group's card says about failover (the mock's override, `setReadiness`). */
@@ -473,7 +500,7 @@ function seedDatabases(): DbRec[] {
   })
   const shop: DbRec = {
     info: base('shop', {
-      sharding: { enabled: true, bucketCount: 128 },
+      sharding: { enabled: true, bucketCount: 128, mode: 'row', distributeNewSchemas: false },
       ledger: { mode: 'appendOnly', digestIntervalSeconds: 3600 },
       ledgerSummary: { verificationState: 'passed', lastVerifiedBlockHeight: 1790 },
     }),
@@ -573,7 +600,112 @@ function seedDatabases(): DbRec[] {
     colocations: [],
     buckets: new Map(),
   }
-  return [shop, reports]
+  return [shop, reports, seedTenants(base)]
+}
+
+/**
+ * A database in the mode `schema` (contract 0.15.0). Its schemas cover what the panel has to show: distributed ones on
+ * every data group (one whose size is not known because the answering server does not hold it), local ones, a local one
+ * with blockers, one with tables that have no key, one that holds a ledger table (pinned) and `failme`, whose move fails.
+ */
+function seedTenants(base: (name: string, overrides: Partial<Database>) => Database): DbRec {
+  const schema = (s: Partial<SchemaRec> & Pick<SchemaRec, 'name'>): SchemaRec => ({
+    owner: 'app_rw',
+    group: null,
+    colocationId: 0,
+    state: 'active',
+    movingTo: null,
+    taskId: null,
+    tableCount: 3,
+    sizeBytes: 256 * 1024,
+    estimatedRows: 1_200,
+    blockers: [],
+    pinned: null,
+    keyless: [],
+    ...s,
+  })
+  const distributed = (
+    group: number,
+    colocationId: number,
+    s: Partial<SchemaRec> & { name: string },
+  ) => schema({ group, colocationId, ...s })
+  const schemas: SchemaRec[] = [
+    distributed(1, 4, {
+      name: 'tenant_acme',
+      tableCount: 12,
+      sizeBytes: 52 * MiB,
+      estimatedRows: 310_000,
+    }),
+    // The answering server does not hold the tables of this schema: no size, and no estimate either.
+    distributed(2, 5, {
+      name: 'tenant_globex',
+      tableCount: 7,
+      sizeBytes: null,
+      estimatedRows: null,
+    }),
+    distributed(3, 6, {
+      name: 'tenant_initech',
+      tableCount: 4,
+      sizeBytes: 3 * MiB,
+      keyless: ['tenant_initech.audit_log', 'tenant_initech.sessions'],
+    }),
+    distributed(1, 7, {
+      name: 'ledgered',
+      tableCount: 2,
+      sizeBytes: 1 * MiB,
+      pinned: 'The schema holds a ledger table (the ledger of a table is kept per node).',
+    }),
+    distributed(2, 8, { name: 'failme', tableCount: 5, sizeBytes: 9 * MiB, failsToMove: true }),
+    // `public` is listed like any schema, and is never distributable (the extension names it as its own blocker).
+    schema({
+      name: 'public',
+      tableCount: 1,
+      sizeBytes: 8 * 1024,
+      blockers: [
+        {
+          objectKind: 'schema',
+          objectName: 'public',
+          reason: 'the schema public cannot be distributed',
+        },
+      ],
+    }),
+    schema({ name: 'reporting', owner: 'analyst', tableCount: 3, sizeBytes: 80 * 1024 }),
+    schema({ name: 'scratch', tableCount: 0, sizeBytes: 0, estimatedRows: 0 }),
+    schema({ name: 'unsized', tableCount: 2, sizeBytes: null, estimatedRows: null }),
+    schema({
+      name: 'blocked_mv',
+      tableCount: 6,
+      sizeBytes: 4 * MiB,
+      blockers: [
+        {
+          objectKind: 'materialized view',
+          objectName: 'blocked_mv.orders_mv',
+          reason: 'materialized views are not supported in distributed schemas yet',
+        },
+        {
+          objectKind: 'foreign key',
+          objectName: 'blocked_mv.items_order_fk',
+          reason: 'a foreign key to a table of another schema is not supported',
+        },
+      ],
+    }),
+  ]
+  const rec: DbRec = {
+    info: base('tenants', {
+      sharding: { enabled: true, bucketCount: null, mode: 'schema', distributeNewSchemas: true },
+      stats: {
+        sizeBytes: 70 * MiB,
+        tableCount: 44,
+        activeConnections: 5,
+        transactionsPerSecond: 12,
+      },
+    }),
+    tables: [],
+    colocations: [],
+    buckets: new Map(),
+    schemas,
+  }
+  return rec
 }
 
 function seedLogs(): LogEntry[] {
