@@ -244,8 +244,9 @@ func TestSplitBucketOnACluster(t *testing.T) {
 		if st, p := l.Do("POST", fmt.Sprintf("/tasks/%v/cancel", id), nil, nil); st != 202 && st != 200 {
 			t.Fatalf("cancel: %d %v", st, p)
 		}
-		release()
+		// the engine looks for the request every second and interrupts the step while the extension still holds the split at its gate
 		task := l.WaitTask(id, 3*time.Minute)
+		release()
 		if task["state"] == "done" {
 			t.Fatalf("a cancelled split finished: %v", task)
 		}
