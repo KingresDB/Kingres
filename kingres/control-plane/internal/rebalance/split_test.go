@@ -5,6 +5,7 @@ package rebalance
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
@@ -67,5 +68,16 @@ func TestSplitCancelGuard(t *testing.T) {
 	}
 	if splitCancellable(mk(task.StepDone)) {
 		t.Error("nothing is left to cancel when the split is done")
+	}
+}
+
+func TestSplitCancelTooLateAndCancelledAreTruthful(t *testing.T) {
+	late := task.Task{Detail: splitTooLateText + " (switching)", Steps: []task.StepState{{Name: StepSplitRun, State: task.StepRunning}}}
+	if splitCancellable(late) {
+		t.Error("once the cancel came too late the engine must not end the task as cancelled")
+	}
+	var c task.Coded = splitCancelled{}
+	if c.TaskCode() != task.CodeCanceled || c.TaskRetryable() || !strings.Contains(c.Error(), "unchanged") {
+		t.Errorf("a split that was undone says so: %v", c)
 	}
 }

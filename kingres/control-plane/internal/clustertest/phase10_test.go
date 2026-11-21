@@ -244,11 +244,13 @@ func TestSplitBucketOnACluster(t *testing.T) {
 		if st, p := l.Do("POST", fmt.Sprintf("/tasks/%v/cancel", id), nil, nil); st != 202 && st != 200 {
 			t.Fatalf("cancel: %d %v", st, p)
 		}
-		// the engine looks for the request every second and interrupts the step while the extension still holds the split at its gate
-		task := l.WaitTask(id, 3*time.Minute)
+		// the step looks for the request every second and passes it on while the extension holds the split at its gate; the extension reads it in
+		// its backfill when the gate opens and undoes the split
+		time.Sleep(4 * time.Second)
 		release()
-		if task["state"] == "done" {
-			t.Fatalf("a cancelled split finished: %v", task)
+		task := l.WaitTask(id, 3*time.Minute)
+		if e, _ := task["error"].(map[string]any); task["state"] != "failed" || e == nil || e["code"] != "cancelled" || !strings.Contains(fmt.Sprint(e["message"]), "unchanged") {
+			t.Fatalf("a cancel before the backfill must end the task cancelled with the bucket unchanged: %v", task)
 		}
 		// the extension undoes the split in its own session once the gate is open: the task ends first
 		for end := time.Now().Add(2 * time.Minute); ; time.Sleep(time.Second) {
@@ -279,6 +281,31 @@ func TestSplitBucketOnACluster(t *testing.T) {
 		}
 	})
 
+	t.Run("a cancel after the backfill is too late: the task does not say cancelled and ends done with the children", func(t *testing.T) {
+		reached, release := p10Gate(t, c, "sp", "split_after_backfill")
+		defer release()
+		id := clustertest.TaskID(split(7, nil))
+		reached(2 * time.Minute)
+		if st, p := l.Do("POST", fmt.Sprintf("/tasks/%v/cancel", id), nil, nil); st != 202 && st != 200 {
+			t.Fatalf("cancel: %d %v", st, p)
+		}
+		time.Sleep(4 * time.Second) // the step passes the request on; the extension has no look at it after its backfill
+		release()
+		task := l.WaitTask(id, 5*time.Minute)
+		if task["state"] != "done" || task["error"] != nil {
+			t.Fatalf("a cancel after the backfill must not end the task cancelled: %v", task)
+		}
+		bs := p10Buckets(t, l, "sp")
+		if len(bs) != 12 || bs[15] == nil || bs[7]["modulus"] != float64(16) {
+			t.Fatalf("the split completed, the bucket list must show it: %v", bs)
+		}
+		for _, n := range c.Nodes {
+			if cnt, sum := p10Count(t, n, "sp"); cnt != rows+extra || sum != wantSum+extraSum {
+				t.Errorf("node %d after the late cancel: %d rows (sum %d)", n.Index, cnt, sum)
+			}
+		}
+	})
+
 	t.Run("the leader's kingresd restarts in the middle of a split and the task finishes", func(t *testing.T) {
 		reached, release := p10Gate(t, c, "sp", "split_after_backfill")
 		defer release()
@@ -291,7 +318,7 @@ func TestSplitBucketOnACluster(t *testing.T) {
 			t.Fatal("no sign-in after the restart")
 		}
 		l.WaitTaskDone(id, 8*time.Minute)
-		if len(p10Buckets(t, l, "sp")) != 12 {
+		if len(p10Buckets(t, l, "sp")) != 13 {
 			t.Fatalf("buckets after the restart: %v", p10Buckets(t, l, "sp"))
 		}
 		for _, n := range c.Nodes {

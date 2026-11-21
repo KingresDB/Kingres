@@ -266,7 +266,7 @@ func (s *Service) splitDefinition() task.Definition {
 			}
 			return nil
 		}},
-		{Name: StepSplitRun, Interruptible: true, Run: func(ctx context.Context, env *task.Env) error {
+		{Name: StepSplitRun, Run: func(ctx context.Context, env *task.Env) error {
 			v, err := in(env)
 			if err != nil {
 				return err
@@ -286,6 +286,9 @@ func (s *Service) splitDefinition() task.Definition {
 // splitCancellable: a cancel ends the step that runs the split (the engine needs a guard to interrupt a step); once that step is done the split
 // is made and there is nothing left to cancel.
 func splitCancellable(t task.Task) bool {
+	if strings.HasPrefix(t.Detail, splitTooLateText) {
+		return false // the split is past the point where a cancel can stop it: the task goes on and ends done
+	}
 	for _, st := range t.Steps {
 		if st.Name == StepSplitRun {
 			return st.State != task.StepDone
@@ -355,26 +358,70 @@ func (s *Service) runSplit(ctx context.Context, env *task.Env, v splitInput) err
 		})
 		finished <- result{id, err}
 	}()
+	// A cancel is the step's own business (the step is not interruptible: the engine would end the task as cancelled while the extension goes
+	// on). The step asks the extension to stop, which it does only during the backfill, and says truthfully what happened: the split was
+	// undone (the task fails with code cancelled and says the bucket is unchanged), or it came too late and the split completed (the task
+	// goes on and ends done, with the note in its detail).
+	asked, tooLate := false, false
 	for {
 		select {
 		case r := <-finished:
-			return s.settleSplit(ctx, v, r.id, r.err)
-		case <-ctx.Done():
-			// the person cancelled, or the lease was lost: cancel what has not reached its switch
-			if rec, found := s.findSplit(context.WithoutCancel(ctx), v); found && !splitDone(rec.Phase) {
-				_ = s.Backend.with(context.WithoutCancel(ctx), v.Database, func(c *pgx.Conn) error {
-					_, err := c.Exec(context.WithoutCancel(ctx), `SELECT kingres.cancel_bucket_split($1)`, rec.ID)
-					return err
-				})
+			err := s.settleSplit(ctx, v, r.id, r.err)
+			if err == nil && asked && !tooLate {
+				// the request was accepted and the split completed all the same: the backfill was over before the extension looked
+				tooLate = true
+				_ = env.SetDetail(ctx, splitTooLateText)
 			}
+			return err
+		case <-ctx.Done():
+			// a lost lease or a shutdown, not a cancel: the extension owns the split and the next holder of the task follows it
 			return ctx.Err()
 		case <-time.After(time.Second):
-			if rec, found := s.findSplit(ctx, v); found {
-				_ = env.SetDetail(ctx, splitDetail(rec))
+			rec, found := s.findSplit(ctx, v)
+			if !asked && found && s.cancelRequested(ctx, env) {
+				asked = true
+				if err := s.Backend.with(ctx, v.Database, func(c *pgx.Conn) error {
+					_, err := c.Exec(ctx, `SELECT kingres.cancel_bucket_split($1)`, rec.ID)
+					return err
+				}); err != nil {
+					// the extension refuses a split that is switching (or already made): too late, the split goes on and the task with it
+					tooLate = true
+				}
+			}
+			if found {
+				d := splitDetail(rec)
+				if tooLate {
+					d = splitTooLateText + " (" + d + ")"
+				}
+				_ = env.SetDetail(ctx, d)
 			}
 		}
 	}
 }
+
+// splitTooLateText is the detail of a split task whose cancel request could not stop the split. The cancel guard looks for it, so that the
+// engine does not end the task as cancelled when the step is done.
+const splitTooLateText = "The cancel request came too late: the split had passed its backfill and goes on to its end"
+
+// cancelRequested tells whether a person asked to cancel the task.
+func (s *Service) cancelRequested(ctx context.Context, env *task.Env) bool {
+	eng := s.Engine()
+	if eng == nil {
+		return false
+	}
+	t, err := eng.Get(ctx, env.Task.ID)
+	return err == nil && t.CancelRequested
+}
+
+// splitCancelled is the end of a split that a cancel stopped and the extension undid: the task fails with the code cancelled, and the
+// text says that nothing changed.
+type splitCancelled struct{}
+
+func (splitCancelled) Error() string {
+	return "The split was cancelled before its switch and undone: the bucket is unchanged."
+}
+func (splitCancelled) TaskCode() string    { return task.CodeCanceled }
+func (splitCancelled) TaskRetryable() bool { return false }
 
 func splitDetail(r splitRecord) string {
 	d := r.Phase
@@ -396,6 +443,8 @@ func (s *Service) settleSplit(ctx context.Context, v splitInput, id int64, callE
 	if errors.As(callErr, &pe) {
 		msg := clipText(pe.Message, 500)
 		switch {
+		case pe.Code == "KS0C1" || strings.Contains(pe.Message, "was cancelled"):
+			return splitCancelled{}
 		case pe.Code == "0A000" || strings.Contains(pe.Message, "primary key") || strings.Contains(pe.Message, "not supported"):
 			return problem.New(problem.SplitUnsupported, msg)
 		case strings.Contains(pe.Message, "is not active") || strings.Contains(pe.Message, "unfinished") || strings.Contains(pe.Message, "already"):
