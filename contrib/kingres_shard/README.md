@@ -1978,6 +1978,37 @@ and that changed other code: path S now sends `OVERRIDING SYSTEM VALUE` for an I
 the user wrote); `ALTER TYPE ... OWNER TO` was classified through the wrong node type (an assertion failure in a build with assertions); the catalog document no longer holds the creation time of a schema (every node stamps its own,
 so the catalogs of the nodes looked different to `check_cluster`).
 
+**Step 8: `ship_functions`.**  A statement that calls functions is run whole on the owner only when every function it calls is a function of a distributed schema whose `ship_functions` flag is on
+(`kingres.alter_distributed_schema(nsp, ship_functions => true)`); a function of `public`, of a local schema or of an extension exists where it was made and is never shipped, and such a statement is
+planned at the origin (a write is refused, with the reason).  The owner runs a shipped statement that calls functions with the `search_path` of the session that issued it (pg_catalog first, then the
+schemas of the path that exist here, never the temporary schema), so the unqualified names in a function body mean what they mean on a direct connection.  The same path is sent when a table of the statement
+has triggers or defaults or checks that call functions that are not built in.  A function body that touches the schema of another owner is refused by the owner (`KS001`, "does not hold table").  Statements that
+call a built-in that reads the session (`current_schema`, `current_setting`, `set_config`, `pg_backend_pid`, `inet_client_addr`, `current_query`, ...) are not shipped.
+
+**Step 10: single tables in and out.**  `ALTER TABLE ... SET SCHEMA` moves an ordinary table across the border of a distributed schema when no row has to move: into a schema (the structure is made empty on every
+other node and checked by fingerprint; the rows must be on the owner, that is the table must be empty or this node must hold the schema), out of a schema (the owner keeps the table and its rows as a local table, the
+other nodes drop their empty shells), between two schemas of one owner (the catalog follows the table).  Foreign keys that would cross the border, triggers, partitioned tables, partitions, tables with inheritance,
+unlogged and temporary tables, hash-distributed and reference tables, and schemas held by different groups are refused, with the reason and a hint.  Other objects keep the refusal "recreate it".
+
+**Step 11: ledger tables.**  A `kingres_ledger` table may be in a distributed schema; it lives on the owner.  `kingres.ledger_enable` run on a node that does not hold the schema is refused and names the owner's
+node; the capture triggers of the ledger are not propagated.  A schema with a ledger table is pinned: `move_schema` and `undistribute_schema` refuse with `schema_pinned` (the chain of the ledger is on the owner
+and no schema operation moves it) and the ledger hook keeps `DROP SCHEMA` from dropping it.  `distribute_schema` takes such a schema in place (the shells have no ledger trigger, which the table fingerprint ignores).
+`check_cluster` reports `ledger_on_non_owner` for a ledger table on a node that is not the owner of its schema.  An updatable ledger table (a history table) in a distributed schema is enabled before the schema is
+distributed or on the map group primary: the history table is made by DDL.
+
+**Step 9: writes that read other schemas or kinds.**  `INSERT ... SELECT` into a table of a distributed schema that another group holds, when the statement cannot be run whole on the owner (it reads a local table, a
+hash-distributed table, a table of another owner, a function), reads the rows here (the scan) and sends them to the owner through the row router of 2b with one destination; the owner applies the defaults, sequences
+and identity of its table, so only the columns the statement names are sent.  `RETURNING` and `ON CONFLICT DO NOTHING` work; `ON CONFLICT DO UPDATE`, `WITH` clauses and views with a check option keep the
+refusals of the router.  `COPY ... FROM` into such a table goes through the same destination (`kingres_shard.enable_copy_routing`).  `CREATE TABLE ... AS` and `SELECT ... INTO` a distributed schema are
+the creation of the empty table (DDL, so on the map group primary) followed by the `INSERT ... SELECT` of the same query; they take no storage option, tablespace, access method, ON COMMIT or UNLOGGED.
+
+**The fixes for the review of increments 1 to 6** (design notes, section of that name): a move back while the old copy is being cleaned is refused and the cleaning of a group that owns the schema again does nothing;
+schema names that are not plain lower case; the privileges, comment and default privileges of an empty schema reach every node; path S does not ship session built-ins, and the owner runs triggers and hidden defaults
+with the path of the session; the state of a sequence (`is_called`) is carried by a move; `REASSIGN OWNED` of a role that owns a distributed schema and `CREATE EXTENSION ... SCHEMA` a distributed schema are refused;
+`UPDATE ... SET identity = DEFAULT` is not shipped; `check_function_bodies` travels with DDL; `kingres.schemas.size_bytes` is for superusers.  Limits that stay: a standalone `nextval` on the old owner during the lock
+phase of a switch can hand out a number the new owner hands out again (use the sequence as a column default); `nextval(<expression>)` on a sequence of a distributed schema runs on the node that executes it
+(use a constant regclass or the default); `ALTER TABLE ALL IN TABLESPACE` is node-local; default privileges that are not for one schema are not carried.
+
 
 ## Limitations in phase 2a
 

@@ -447,6 +447,12 @@ kingres_shard_plan_row_router(Query *parse, const KsDistTable *dt, List *relids)
 		{
 			expr = (Node *) te->expr;
 			/*
+			 * A table of a distributed schema has one owner, which applies every default itself (a sequence, a function, an
+			 * identity column): a column the statement did not name is never sent (design 6.7, 7.5).
+			 */
+			if (dt->is_schema && !named)
+				continue;
+			/*
 			 * A column the statement did not name whose default is a constant is left out, so
 			 * that the group applies its own default and the column-level privileges behave as
 			 * on one node (11.2).  The key column and identity columns are always sent.
@@ -505,7 +511,7 @@ kingres_shard_plan_row_router(Query *parse, const KsDistTable *dt, List *relids)
 		cols = lappend(cols, c);
 		selexprs = lappend(selexprs, expr);
 	}
-	if (key_pos < 0)
+	if (key_pos < 0 && !dt->is_schema)
 		elog(ERROR, "the distribution column of \"%s\" is not among the columns of an INSERT", table);
 
 	/* The SELECT that gives the rows: the expressions of the target list, over the source. */
@@ -709,6 +715,21 @@ make_destination(KsDestination *dest, KsBatchSpec *spec, const KsDistTable *dt,
 	dest->placement = dt->coloc;
 	dest->key_attno = key_pos;
 	dest->expect_placement = placement;
+	if (dt->is_schema)
+	{
+		/* every row goes to the owner of the schema (design 6.7); a move in between makes the owner refuse the batch with KS001 */
+		const KsNode *owner = kingres_shard_group_primary(kingres_shard_schema_table_owner(dt));
+
+		if (owner == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("shard group %d has no active primary node", kingres_shard_schema_table_owner(dt))));
+		dest->kind = KS_DEST_ONE_NODE;
+		dest->node_id = owner->node_id;
+		dest->placement = NULL;
+		dest->key_attno = -1;
+		dest->expect_placement = 0;
+	}
 	memset(spec, 0, sizeof(*spec));
 	spec->columns = columns;
 	spec->overriding_system_value = overriding;
@@ -760,10 +781,12 @@ rr_run(KsRouterState *s)
 	/* The table must still be distributed and the bucket map the one the statement was planned with. */
 	cat = kingres_shard_catalog();
 	dt = hash_search(cat->dist_tables, &s->relid, HASH_FIND, NULL);
+	if (dt == NULL)
+		dt = kingres_shard_lookup_schema_table(cat, s->relid);
 	if (dt == NULL || dt->is_reference)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("table \"%s\" is no longer a hash-distributed table", s->table),
+				 errmsg("table \"%s\" is no longer a hash-distributed table or a table of a distributed schema", s->table),
 				 errhint("Repeat the statement; it is planned again.")));
 	kingres_shard_placement_check_plan(s->colocation_id, s->plan_placement);
 
@@ -1043,10 +1066,12 @@ kingres_shard_copy_from_routed(CopyStmt *stmt, const char *query_string)
 
 	cat = kingres_shard_catalog();
 	dt = hash_search(cat->dist_tables, &rel->rd_id, HASH_FIND, NULL);
+	if (dt == NULL)
+		dt = kingres_shard_lookup_schema_table(cat, rel->rd_id);
 	if (dt == NULL || dt->is_reference)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("table \"%s\" is not a hash-distributed table", RelationGetRelationName(rel))));
+				 errmsg("table \"%s\" is not a hash-distributed table or a table of a distributed schema", RelationGetRelationName(rel))));
 	placement = kingres_shard_placement_hash(dt->coloc);
 
 	/*
@@ -1064,6 +1089,8 @@ kingres_shard_copy_from_routed(CopyStmt *stmt, const char *query_string)
 			continue;
 		if (list_member_int(attnums, attno) || attno == dt->dist_attno)
 			send = true;
+		else if (dt->is_schema)
+			send = false;			/* the owner applies the defaults of a table of its schema */
 		else
 		{
 			Node	   *def = build_column_default(rel, attno);
@@ -1086,7 +1113,7 @@ kingres_shard_copy_from_routed(CopyStmt *stmt, const char *query_string)
 		sent_attnos = lappend_int(sent_attnos, attno);
 	}
 	nsent = list_length(columns);
-	if (key_pos < 0)
+	if (key_pos < 0 && !dt->is_schema)
 		elog(ERROR, "the distribution column is not among the columns of a COPY");
 
 	kingres_shard_placement_check_plan(dt->colocation_id, placement);

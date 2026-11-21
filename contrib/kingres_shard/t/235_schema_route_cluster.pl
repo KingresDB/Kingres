@@ -215,7 +215,9 @@ q1($n1, q{CREATE FUNCTION ra.plus(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SE
 	is(q1($n1, q{SELECT ra.plus(n) FROM ra.t WHERE id = 5}), 105, 'a function of the schema in a read: evaluated here, by the scan (the schema does not ship functions)');
 	my $plan = q1($n1, q{EXPLAIN (COSTS off) SELECT ra.plus(n) FROM ra.t WHERE id = 5});
 	like($plan, qr/Kingres Distributed Scan/, '... EXPLAIN shows the scan');
-	fails($n1, q{INSERT INTO ra.t (id, v, n) SELECT 7001, 'f', ra.plus(1)}, qr/calls a function that is not built in, and the schema does not ship functions/, 'a write that calls a function of the schema, not shipped');
+	q1($n1, q{INSERT INTO ra.t (id, v, n) SELECT 7001, 'f', ra.plus(1)});
+	is(q1($n2, q{SELECT n FROM ra.t WHERE id = 7001}), 101, 'a write that calls a function of a schema that does not ship: the function is evaluated here, the row goes to the owner (row router)');
+	q1($n2, q{DELETE FROM ra.t WHERE id = 7001});
 	q1($n1, q{SELECT kingres.alter_distributed_schema('ra', true)});
 	is(q1($n3, q{SELECT ship_functions FROM kingres.dist_schema WHERE nsp = 'ra'::regnamespace}), 't', 'ship_functions reached every node');
 	q1($n1, q{INSERT INTO ra.t (id, v, n) SELECT 7001, 'f', ra.plus(1)});
@@ -229,9 +231,13 @@ q1($n1, q{CREATE FUNCTION ra.plus(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SE
 # ---------------------------------------------------------------------------
 # G. what path S does not take
 # ---------------------------------------------------------------------------
-fails($n1, q{INSERT INTO ra.t (id, v) SELECT id + 7500, 'x' FROM rb.w}, qr/different shard groups hold|cannot be run whole on the owner/, 'a write that reads a schema of another owner');
+q1($n1, q{INSERT INTO ra.t (id, v) SELECT id + 7500, 'x' FROM rb.w});
+is(q1($n2, q{SELECT count(*) FROM ra.t WHERE id > 7500 AND v = 'x'}), q1($n3, q{SELECT count(*) FROM rb.w}), 'a write that reads a schema of another owner: the rows are read through the scan and go to the owner (row router)');
+q1($n2, q{DELETE FROM ra.t WHERE id > 7500 AND v = 'x'});
 fails($n1, q{UPDATE ra.t SET v = l.tag FROM public.loc l WHERE l.id = ra.t.id}, qr/not supported from shard group 0 yet|UPDATE, DELETE and MERGE that read/, 'a write that reads a local table');
-fails($n1, q{INSERT INTO ra.t (id, v) SELECT g + 7600, 'x' FROM public.h g2, generate_series(1, 2) g WHERE g2.id = 1}, qr/is not supported from shard group 0 yet/, 'a write that reads a hash-distributed table');
+q1($n1, q{INSERT INTO ra.t (id, v) SELECT g + 7600, 'x' FROM public.h g2, generate_series(1, 2) g WHERE g2.id = 1});
+is(q1($n2, q{SELECT count(*) FROM ra.t WHERE id IN (7601, 7602)}), 2, 'a write that reads a hash-distributed table goes to the owner through the row router');
+q1($n2, q{DELETE FROM ra.t WHERE id IN (7601, 7602)});
 q1($n1, q{MERGE INTO ra.t t USING ra.u u ON u.t_id = t.id WHEN MATCHED THEN UPDATE SET v = 'm' WHEN NOT MATCHED THEN DO NOTHING});
 is(q1($n2, q{SELECT count(*) FROM ra.t WHERE v = 'm'}), 40, 'MERGE of two tables of the schema is shipped whole');
 q1($n2, q{UPDATE ra.t SET v = 'row ' || id WHERE v = 'm'});

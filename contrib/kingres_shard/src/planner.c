@@ -3122,6 +3122,15 @@ plan_schema_shell(Query *parse, const char *query_string, int cursorOptions,
 	else
 		why = "kingres_shard.enable_schema_routing is off";
 
+	/* INSERT into a shell whose source path S cannot run on the owner (a local table, a hash table, another owner): the rows go to the owner through the row router (design 6.7) */
+	if (sf->write_shell && parse->commandType == CMD_INSERT && !IsInParallelMode())
+	{
+		const KsDistTable *st = kingres_shard_lookup_schema_table(cat, sf->write_relid);
+
+		if (st != NULL && kingres_shard_enable_schema_routing)
+			return kingres_shard_plan_row_router(parse, st, list_make1_oid(sf->write_relid));
+	}
+
 	if (sf->write_shell)
 	{
 		const KsNode *owner = kingres_shard_group_primary(sf->shell_group);

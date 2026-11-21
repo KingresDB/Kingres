@@ -213,8 +213,6 @@ same_everywhere(q{SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname
 q1($n1, q{CREATE SEQUENCE public.lsq});
 for my $case (
 	[ 'a materialized view', q{CREATE MATERIALIZED VIEW t1.mv AS SELECT 1 AS x}, qr/CREATE MATERIALIZED VIEW is not supported in a distributed schema yet/ ],
-	[ 'CREATE TABLE AS', q{CREATE TABLE t1.ctas AS SELECT 1 AS x}, qr/CREATE TABLE AS or SELECT INTO is not supported in a distributed schema yet/ ],
-	[ 'SELECT INTO', q{SELECT 1 AS x INTO t1.si}, qr/CREATE TABLE AS or SELECT INTO is not supported in a distributed schema yet/ ],
 	[ 'a rule', q{CREATE RULE r1 AS ON INSERT TO t1.b DO ALSO NOTHING}, qr/CREATE RULE is not supported in a distributed schema yet/ ],
 	[ 'a policy', q{CREATE POLICY p1 ON t1.b USING (true)}, qr/CREATE POLICY is not supported in a distributed schema yet/ ],
 	[ 'row-level security', q{ALTER TABLE t1.b ENABLE ROW LEVEL SECURITY}, qr/row-level security is not supported in a distributed schema yet/ ],

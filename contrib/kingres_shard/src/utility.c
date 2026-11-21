@@ -78,6 +78,7 @@
 #include "executor/spi.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
 #include "nodes/value.h"
 #include "parser/parse_type.h"
@@ -91,6 +92,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/ruleutils.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 
@@ -185,6 +187,73 @@ merge_schema_decision(UtilDecision *d, const KsSchemaDdl *sd)
 	d->authorize = true;
 	foreach(lc, sd->colocations)
 		d->colocations = list_append_unique_int(d->colocations, lfirst_int(lc));
+}
+
+/*
+ * CREATE TABLE ... AS and SELECT ... INTO a table of a distributed schema (design 6.7): the creation of the empty table, which every node runs
+ * like any CREATE TABLE of a distributed schema, then an INSERT ... SELECT of the same query, whose rows go to the owner (by the row router when
+ * this node does not hold the schema).  Returns false when the statement is not one of these (the ordinary path decides).
+ */
+static bool
+schema_ctas(CreateTableAsStmt *ctas, QueryCompletion *qc)
+{
+	IntoClause *into = ctas->into;
+	const KsCatalog *cat = kingres_shard_catalog();
+	Oid			nsp;
+	Query	   *q;
+	StringInfoData cols;
+	char	   *qname;
+	ListCell   *lc;
+	int			i = 0;
+	uint64		processed = 0;
+
+	if (!cat->present || cat->ndist_schemas == 0 || ctas->objtype != OBJECT_TABLE || into->rel == NULL ||
+		into->rel->relpersistence == RELPERSISTENCE_TEMP)
+		return false;
+	nsp = RangeVarGetCreationNamespace(into->rel);
+	if (kingres_shard_lookup_dist_schema(cat, nsp) == NULL)
+		return false;
+	if (into->rel->relpersistence != RELPERSISTENCE_PERMANENT || into->options != NIL || into->onCommit != ONCOMMIT_NOOP ||
+		into->tableSpaceName != NULL || into->accessMethod != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("CREATE TABLE AS into a distributed schema takes no storage option, tablespace, access method, ON COMMIT or UNLOGGED"),
+				 errhint("Create the table with CREATE TABLE, then INSERT ... SELECT.")));
+	q = castNode(Query, ctas->query);
+	qname = quote_qualified_identifier(get_namespace_name(nsp), into->rel->relname);
+	initStringInfo(&cols);
+	foreach(lc, q->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		const char *name;
+		Oid			coll;
+
+		if (te->resjunk)
+			continue;
+		name = (into->colNames != NIL && i < list_length(into->colNames)) ? strVal(list_nth(into->colNames, i)) : te->resname;
+		appendStringInfo(&cols, "%s%s %s", cols.len > 0 ? ", " : "", quote_identifier(name),
+						 format_type_with_typemod(exprType((Node *) te->expr), exprTypmod((Node *) te->expr)));
+		coll = exprCollation((Node *) te->expr);
+		if (OidIsValid(coll) && coll != get_typcollation(exprType((Node *) te->expr)))
+			appendStringInfo(&cols, " COLLATE %s", generate_collation_name(coll));
+		i++;
+	}
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	if (SPI_execute(psprintf("CREATE TABLE %s (%s)", qname, cols.data), false, 0) < 0)
+		elog(ERROR, "CREATE TABLE for CREATE TABLE AS failed");
+	if (!into->skipData)
+	{
+		char	   *sel = pg_get_querydef(q, false);
+
+		if (SPI_execute(psprintf("INSERT INTO %s %s", qname, sel), false, 0) != SPI_OK_INSERT)
+			elog(ERROR, "INSERT for CREATE TABLE AS failed");
+		processed = SPI_processed;
+	}
+	SPI_finish();
+	if (qc != NULL)
+		SetQueryCompletion(qc, ctas->is_select_into ? CMDTAG_SELECT : CMDTAG_SELECT, processed);
+	return true;
 }
 
 static void kingres_shard_process_utility(PlannedStmt *pstmt,
@@ -310,12 +379,17 @@ refuse_copy_of_schema_shell(CopyStmt *stmt)
 		return;
 	node = kingres_shard_group_primary(owner);
 	if (stmt->is_from)
+	{
+		/* the rows go to the owner through the row router (design 6.8 item 3); the handler is called by the caller */
+		if (kingres_shard_enable_copy_routing && stmt->query == NULL)
+			return;
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("COPY FROM into table \"%s\" of a distributed schema, which shard group %d holds, is not supported from shard group %d yet",
+				 errmsg("COPY FROM into table \"%s\" of a distributed schema, which shard group %d holds, is not supported from shard group %d with kingres_shard.enable_copy_routing off",
 						get_rel_name(relid), owner, cat->local_group_id),
 				 node ? errhint("Run COPY on node %d (%s:%d), the primary of shard group %d.",
 								node->node_id, node->host, node->port, owner) : 0));
+	}
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("COPY \"%s\" TO would read the empty copy of the table on this node; shard group %d holds the rows",
@@ -2121,6 +2195,12 @@ kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
 	/* A session that claims to be forwarded must prove it before anything runs. */
 	(void) kingres_shard_session_forwarded();
 
+	/* CREATE TABLE AS into a distributed schema: the empty table, then the rows (phase 11, design 6.7) */
+	if (IsA(parsetree, CreateTableAsStmt) && kingres_shard_enable_routing && !creating_extension && ddl_internal_depth == 0 &&
+		context != PROCESS_UTILITY_SUBCOMMAND && !kingres_shard_session_forwarded() &&
+		schema_ctas((CreateTableAsStmt *) parsetree, qc))
+		return;
+
 	memset(&d, 0, sizeof(d));
 	memset(&sd, 0, sizeof(sd));
 
@@ -2131,7 +2211,25 @@ kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
 	/* COPY of a table of a distributed schema that another group holds (phase 11, design 6.8). */
 	if (IsA(parsetree, CopyStmt) && kingres_shard_enable_routing && !creating_extension &&
 		!kingres_shard_session_forwarded())
+	{
 		refuse_copy_of_schema_shell((CopyStmt *) parsetree);
+		/* COPY FROM into a shell: the rows are sent to the owner */
+		if (((CopyStmt *) parsetree)->is_from && ((CopyStmt *) parsetree)->relation != NULL && ((CopyStmt *) parsetree)->query == NULL)
+		{
+			const KsCatalog *ccat = kingres_shard_catalog();
+			Oid			crel = ccat->present && ccat->nschema_tables > 0 ? rangevar_relid(((CopyStmt *) parsetree)->relation) : InvalidOid;
+			const KsDistTable *cst = OidIsValid(crel) ? kingres_shard_lookup_schema_table(ccat, crel) : NULL;
+
+			if (cst != NULL && kingres_shard_schema_table_owner(cst) != ccat->local_group_id)
+			{
+				uint64		processed = kingres_shard_copy_from_routed((CopyStmt *) parsetree, queryString);
+
+				if (qc != NULL)
+					SetQueryCompletion(qc, CMDTAG_COPY, processed);
+				return;
+			}
+		}
+	}
 
 	/* The source of an online table operation is not changed by anybody else until it ends. */
 	if (!creating_extension && !kingres_shard_session_forwarded())

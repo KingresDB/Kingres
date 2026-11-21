@@ -305,6 +305,7 @@ tests += {
       't/241_schema_single_tables_cluster.pl',
       't/242_schema_ledger_cluster.pl',
       't/243_schema_review_cluster.pl',
+      't/244_schema_router_cluster.pl',
     ],
   },
 }

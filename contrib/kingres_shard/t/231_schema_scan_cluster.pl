@@ -220,9 +220,10 @@ for my $n ($n1, $n3)
 	isnt($rc, 0, "$nm: COPY of the shell TO is refused");
 	like($err, qr/COPY "a" TO would read the empty copy of the table on this node; shard group $g2 holds the rows/, "$nm: ... with the reason") or diag($err);
 	like($err, qr/Use COPY \(SELECT \* FROM ten\.a\) TO/, "$nm: ... and the hint names the form that works");
-	($rc, $out, $err) = run_sql($n, q{COPY ten.a FROM STDIN});
-	isnt($rc, 0, "$nm: COPY FROM into the shell is refused");
-	like($err, qr/COPY FROM into table "a" of a distributed schema, which shard group $g2 holds/, "$nm: ... with the reason") or diag($err);
+	($rc, $out, $err) = run_sql($n, q{COPY ten.a (id, v) FROM PROGRAM 'printf "9001\tcp1\n9002\tcp2\n"'});
+	is($rc, 0, "$nm: COPY FROM into the shell loads the rows") or diag($err);
+	is(q1($n2, q{SELECT count(*) FROM ten.a WHERE id IN (9001, 9002)}), 2, "$nm: ... on the owner");
+	q1($n2, q{DELETE FROM ten.a WHERE id IN (9001, 9002)});
 	($rc, $out, $err) = run_sql($n, q{COPY (SELECT id, v FROM ten.a WHERE id <= 3 ORDER BY id) TO STDOUT});
 	is($rc, 0, "$nm: COPY (SELECT ...) TO works") or diag($err);
 	is($out, "1\trow 1\n2\trow 2\n3\trow 3", "$nm: ... with the rows of the owner");
