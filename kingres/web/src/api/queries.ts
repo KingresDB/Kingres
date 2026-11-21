@@ -97,6 +97,8 @@ export const keys = {
   database: (name: string) => ['database', name] as const,
   tables: (name: string) => ['tables', name] as const,
   colocation: (name: string) => ['colocation', name] as const,
+  schemas: (name: string) => ['schemas', name] as const,
+  schema: (db: string, schema: string) => ['schema', db, schema] as const,
   buckets: (name: string, colocationId: number) => ['buckets', name, colocationId] as const,
   bucketDistribution: (name: string, colocationId?: number) =>
     ['bucketDistribution', name, colocationId ?? null] as const,
@@ -239,11 +241,64 @@ export const useTables = (name: MaybeRefOrGetter<string>) =>
       fetchAllPages((cursor) => endpoints.listTables(toValue(name), cursor ? { cursor } : {})),
   })
 
-export const useColocationGroups = (name: MaybeRefOrGetter<string | null>) =>
+/**
+ * The colocation groups of a database. The Shards page passes `hash` (contract 0.15.0): a database that
+ * distributes schemas has one group of kind `schema` for every schema, thousands of them.
+ */
+export const useColocationGroups = (
+  name: MaybeRefOrGetter<string | null>,
+  kind?: 'hash' | 'schema',
+) =>
   useQuery({
-    queryKey: computed(() => keys.colocation(toValue(name) ?? '')),
-    queryFn: () => endpoints.listColocationGroups(toValue(name) ?? ''),
+    queryKey: computed(() => [...keys.colocation(toValue(name) ?? ''), kind ?? 'all']),
+    queryFn: () => endpoints.listColocationGroups(toValue(name) ?? '', kind),
     enabled: computed(() => toValue(name) !== null && toValue(name) !== ''),
+  })
+
+/** The schemas of a database (0.15.0), every page up to the bound. A task keeps them fresh by invalidating `keys.schemas`. */
+export const useSchemas = (
+  name: MaybeRefOrGetter<string>,
+  enabled: MaybeRefOrGetter<boolean> = true,
+) =>
+  useQuery({
+    queryKey: computed(() => keys.schemas(toValue(name))),
+    queryFn: () =>
+      fetchAllPages((cursor) => endpoints.listSchemas(toValue(name), cursor ? { cursor } : {})),
+    refetchInterval: every(POLL.normal),
+    enabled: computed(() => toValue(enabled)),
+  })
+
+/** One schema with what an action dialog needs before it offers the action (blockers, pin, move in progress). */
+export const useSchemaDetail = (db: string, schema: string) =>
+  useQuery({
+    queryKey: keys.schema(db, schema),
+    queryFn: () => endpoints.getSchema(db, schema),
+    // The dialog states what the server said when it opened; a moved or pinned schema is read again by the next dialog.
+    staleTime: 0,
+    gcTime: 0,
+  })
+
+/**
+ * The running moves of schemas of a database, by schema name: the list of schemas has the target group of a move but not its
+ * task, so the badge finds the task through the task list (subject id `database/schema`).
+ */
+export const useSchemaMoveTasks = (
+  name: MaybeRefOrGetter<string>,
+  enabled: MaybeRefOrGetter<boolean> = true,
+) =>
+  useQuery({
+    queryKey: computed(() => [...keys.tasks, 'schema.move', toValue(name)]),
+    queryFn: async () => {
+      const page = await endpoints.listTasks({ kind: 'schema.move', state: 'running', limit: 100 })
+      const prefix = `${toValue(name)}/`
+      const byName = new Map<string, number>()
+      for (const t of page.items)
+        if (t.subject?.type === 'schema' && t.subject.id.startsWith(prefix))
+          byName.set(t.subject.id.slice(prefix.length), t.id)
+      return byName
+    },
+    refetchInterval: every(POLL.fast),
+    enabled: computed(() => toValue(enabled)),
   })
 
 /** All buckets of one colocation group (follows cursors until the list ends). */

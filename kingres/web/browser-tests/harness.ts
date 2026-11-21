@@ -207,7 +207,11 @@ export const ROUTES = [
   '/servers/10.0.0.13',
   '/databases',
   '/databases/shop',
+  // 0.15.0: the database that distributes schemas (the Schemas section, with the hostile schema names of ?mock=hostile) and
+  // its Shards page (the schemas per server group).
+  '/databases/tenants',
   '/shards',
+  '/shards?db=tenants',
   '/replication',
   '/rebalance',
   '/security',
@@ -420,6 +424,47 @@ async function startFailover(page: Page, server: string, accept = false): Promis
   await page.waitForSelector('[role="dialog"] [role="progressbar"]', { timeout: 20_000 })
 }
 
+/** Clicks the input of the label in the open dialog whose text starts with `start` (a checkbox or a radio). */
+async function clickChoice(page: Page, start: string): Promise<void> {
+  const ok = await page.evaluate((text) => {
+    const label = [...document.querySelectorAll('[role="dialog"] label')].find((l) =>
+      l.textContent?.trim().startsWith(text),
+    )
+    const input = label?.querySelector('input') as HTMLInputElement | null
+    input?.click()
+    return !!input
+  }, start)
+  if (!ok) throw new Error(`No choice starting with ${JSON.stringify(start)}`)
+  await sleep(150)
+}
+
+/**
+ * Clicks a button of the row of a schema in the Schemas section (the hostile mock adds schemas whose names start with the
+ * same letters, so the row is found by its exact name).
+ */
+export async function schemaAction(page: Page, schema: string, action: string): Promise<void> {
+  const ok = await page.evaluate(
+    (name, label) => {
+      const row = [...document.querySelectorAll('[data-testid="schemas-table"] tbody tr')].find(
+        (r) => r.querySelector('th')?.textContent?.trim() === name,
+      )
+      const button = [...(row?.querySelectorAll('button') ?? [])].find((b) =>
+        b.textContent?.trim().startsWith(label),
+      )
+      button?.click()
+      return !!button
+    },
+    schema,
+    action,
+  )
+  if (!ok) throw new Error(`No ${action} button for the schema ${schema}`)
+  await dialogOpen(page)
+}
+
+/** Waits until the schemas of the page are listed. */
+const schemasListed = (page: Page): Promise<unknown> =>
+  page.waitForSelector('[data-testid="schemas-table"] tbody tr', { timeout: 30_000 })
+
 const closeDialogs = async (page: Page): Promise<void> => {
   await page.evaluate(() => {
     for (const b of document.querySelectorAll<HTMLElement>('[role="dialog"] .dlg-foot button'))
@@ -469,6 +514,133 @@ const freshFailover = async (page: Page): Promise<void> => {
  * and content-security-policy runs (W2-16).
  */
 export const STATES: PageState[] = [
+  {
+    // 0.15.0 (distributed schemas): the create dialog with Schemas chosen, the settings dialog and its refusal, and the
+    // three dialogs of the Schemas section. None of them changes the cluster, so they can be visited again and again.
+    name: 'create database dialog: Schemas, with the default for new schemas (0.15.0)',
+    route: '/databases',
+    open: async (page) => {
+      await clickText(page, 'Create database')
+      await dialogOpen(page)
+      await clickChoice(page, 'Spread this database')
+      await page.waitForSelector('[role="dialog"] input[type="radio"]', { timeout: 20_000 })
+      await clickChoice(page, 'Schemas:')
+      await sleep(200)
+    },
+    close: cancel,
+  },
+  {
+    name: 'database settings dialog: the mode and its refusal (0.15.0)',
+    route: '/databases/tenants',
+    open: async (page) => {
+      await clickText(page, 'Edit settings')
+      await dialogOpen(page)
+      await page.waitForSelector('[role="dialog"] input[type="radio"]', { timeout: 20_000 })
+      await clickChoice(page, 'Rows:')
+      await clickText(page, 'Save changes', '[role="dialog"] button')
+      await page.waitForSelector('[role="dialog"] [data-code="sharding_mode_in_use"]', {
+        timeout: 20_000,
+      })
+      await sleep(200)
+    },
+    close: cancel,
+  },
+  {
+    name: 'distribute schema dialog: the blockers (0.15.0)',
+    route: '/databases/tenants',
+    open: async (page) => {
+      await schemasListed(page)
+      await schemaAction(page, 'blocked_mv', 'Distribute schema')
+      await page.waitForSelector('[role="dialog"] [data-testid="schema-blockers"]', {
+        timeout: 20_000,
+      })
+      await sleep(200)
+    },
+    close: cancel,
+  },
+  {
+    name: 'distribute schema dialog: the choice of group (0.15.0)',
+    route: '/databases/tenants',
+    open: async (page) => {
+      await schemasListed(page)
+      await schemaAction(page, 'scratch', 'Distribute schema')
+      await page.waitForSelector('[role="dialog"] select', { timeout: 20_000 })
+      await sleep(200)
+    },
+    close: cancel,
+  },
+  {
+    name: 'move schema dialog (0.15.0)',
+    route: '/databases/tenants',
+    open: async (page) => {
+      await schemasListed(page)
+      await schemaAction(page, 'tenant_acme', 'Move schema')
+      await page.waitForSelector('[role="dialog"] select', { timeout: 20_000 })
+      await sleep(200)
+    },
+    close: cancel,
+  },
+  {
+    name: 'move schema dialog: tables without a key need a choice (0.15.0)',
+    route: '/databases/tenants',
+    open: async (page) => {
+      await schemasListed(page)
+      await schemaAction(page, 'tenant_initech', 'Move schema')
+      await page.waitForSelector('[role="dialog"] select', { timeout: 20_000 })
+      await page.select('[role="dialog"] select', '1')
+      await clickText(page, 'Move schema', '[role="dialog"] button')
+      await page.waitForSelector('[role="dialog"] [data-testid="keyless-tables"]', {
+        timeout: 20_000,
+      })
+      await sleep(200)
+    },
+    close: cancel,
+  },
+  {
+    name: 'move schema dialog: the schema is pinned by a ledger table (0.15.0)',
+    route: '/databases/tenants',
+    open: async (page) => {
+      await schemasListed(page)
+      await schemaAction(page, 'ledgered', 'Move schema')
+      await page.waitForSelector('[role="dialog"] [data-code="schema_pinned"]', { timeout: 20_000 })
+      await sleep(200)
+    },
+    close: cancel,
+  },
+  {
+    name: 'make schema local dialog (0.15.0)',
+    route: '/databases/tenants',
+    open: async (page) => {
+      await schemasListed(page)
+      await schemaAction(page, 'tenant_acme', 'Make local')
+      await page.waitForSelector('[role="dialog"] [data-testid="make-local-sentence"]', {
+        timeout: 20_000,
+      })
+      await sleep(200)
+    },
+    close: cancel,
+  },
+  {
+    // The move of `failme` fails at its copy step (the mock keeps the schema where it was, so the state can be visited again).
+    name: 'move schema dialog: a failed move (0.15.0)',
+    needsMock: true,
+    route: '/databases/tenants',
+    open: async (page) => {
+      await schemasListed(page)
+      await schemaAction(page, 'failme', 'Move schema')
+      await page.waitForSelector('[role="dialog"] select', { timeout: 20_000 })
+      await page.select('[role="dialog"] select', '1')
+      await clickText(page, 'Move schema', '[role="dialog"] button')
+      await page.waitForSelector('[role="dialog"] [data-testid="move-failed-note"]', {
+        timeout: 60_000,
+      })
+      await sleep(200)
+    },
+    close: async (page) => {
+      await clickText(page, 'Close', '[role="dialog"] .dlg-foot button')
+      await sleep(150)
+    },
+  },
   {
     // 0.9.0: the plan of a rebalance listed with its servers, and a start that the server refuses
     // (the mock refuses an empty plan with its own notice).

@@ -11,10 +11,18 @@ import { RouterLink } from 'vue-router'
 import TaskActionDialog from './TaskActionDialog.vue'
 import FormField from './FormField.vue'
 import QueryBoundary from './QueryBoundary.vue'
+import ShardingModeChoice from './ShardingModeChoice.vue'
 import { endpoints } from '@/api/endpoints'
 import { keys, useClusterSettings, useDatabaseCreateOptions, useRoles } from '@/api/queries'
 import type { DatabaseCreateRequest, Durability, LedgerMode } from '@/api/types'
 import { DURABILITY_LABEL, LEDGER_MODE_LABEL } from '@/lib/status'
+import {
+  canDistributeNew,
+  distributeNewDefault,
+  hasBuckets,
+  offeredModes,
+  type ShardingMode,
+} from '@/lib/sharding-mode'
 import { compact, firstError, identifier, integerBetween } from '@/lib/validators'
 
 const emit = defineEmits<{ close: []; done: [name: string] }>()
@@ -33,6 +41,8 @@ const form = reactive({
   collation: '',
   connectionLimit: -1,
   sharding: false,
+  shardMode: 'row' as ShardingMode,
+  distributeNew: false,
   bucketCount: 128,
   durability: 'sync' as Durability,
   ledgerMode: 'off' as LedgerMode,
@@ -48,6 +58,10 @@ watch(
     form.encoding = opts.encodings.find((e) => e.isDefault)?.name ?? opts.encodings[0]?.name ?? ''
     form.bucketCount = opts.bucketCount.default
     form.durability = opts.defaultDurability
+    const modes = offeredModes(opts.shardingModes?.modes)
+    const wanted = opts.shardingModes?.default
+    form.shardMode = modes.find((m) => m === wanted) ?? modes[0] ?? 'row'
+    form.distributeNew = distributeNewDefault(form.shardMode)
     form.digestInterval = opts.ledgerDigestIntervalSeconds.default
   },
   { immediate: true },
@@ -70,6 +84,13 @@ watch(
   { immediate: true },
 )
 
+/**
+ * The modes the server offers (contract 0.15.0). A server that sends none is older: sharding is by rows only and the panel
+ * shows no choice.
+ */
+const modes = computed(() => offeredModes(o.value?.shardingModes?.modes))
+const bucketsShown = computed(() => hasBuckets(form.shardMode))
+
 const errors = computed(() =>
   compact({
     name:
@@ -80,16 +101,17 @@ const errors = computed(() =>
       form.connectionLimit,
       integerBetween('The connection limit', -1, 1_000_000),
     ),
-    'sharding.bucketCount': form.sharding
-      ? firstError<number | null>(
-          form.bucketCount,
-          integerBetween(
-            'The bucket count',
-            o.value?.bucketCount.minimum ?? 1,
-            o.value?.bucketCount.maximum ?? 4096,
-          ),
-        )
-      : undefined,
+    'sharding.bucketCount':
+      form.sharding && bucketsShown.value
+        ? firstError<number | null>(
+            form.bucketCount,
+            integerBetween(
+              'The bucket count',
+              o.value?.bucketCount.minimum ?? 1,
+              o.value?.bucketCount.maximum ?? 4096,
+            ),
+          )
+        : undefined,
     'ledger.digestIntervalSeconds':
       form.ledgerMode !== 'off'
         ? firstError<number | null>(
@@ -109,6 +131,21 @@ function validate(): boolean {
   return Object.keys(errors.value).length === 0
 }
 
+/**
+ * What the server is told about sharding. The mode is sent for Schemas and Both only (Rows is what the server does when
+ * it hears none, so a request for Rows also works against a server before 0.15.0); the bucket count is not sent for
+ * Schemas, which has no hash buckets; the default for new schemas is sent only where the mode has schemas.
+ */
+function shardingPayload(): NonNullable<DatabaseCreateRequest['sharding']> {
+  if (!form.sharding) return { enabled: false, bucketCount: form.bucketCount }
+  return {
+    enabled: true,
+    ...(bucketsShown.value ? { bucketCount: form.bucketCount } : {}),
+    ...(form.shardMode !== 'row' ? { mode: form.shardMode } : {}),
+    ...(canDistributeNew(form.shardMode) ? { distributeNewSchemas: form.distributeNew } : {}),
+  }
+}
+
 function payload(): DatabaseCreateRequest {
   return {
     name: form.name,
@@ -118,7 +155,7 @@ function payload(): DatabaseCreateRequest {
       ...(form.collation ? { lcCollate: form.collation, lcCtype: form.collation } : {}),
       connectionLimit: form.connectionLimit,
     },
-    sharding: { enabled: form.sharding, bucketCount: form.bucketCount },
+    sharding: shardingPayload(),
     replication: { durability: form.durability },
     ledger: { mode: form.ledgerMode, digestIntervalSeconds: form.digestInterval },
   }
@@ -220,7 +257,14 @@ const errorFor = (field: string, server: Record<string, string>): string | undef
             <RouterLink :to="{ name: 'settings' }">cluster settings</RouterLink> first.
           </p>
           <p v-else class="hint muted">Sharding can be turned on later, but never off again.</p>
+          <ShardingModeChoice
+            v-if="form.sharding && modes.length > 0"
+            v-model:mode="form.shardMode"
+            v-model:distribute-new="form.distributeNew"
+            :modes="modes"
+          />
           <FormField
+            v-if="bucketsShown"
             v-slot="slot"
             label="Bucket count"
             :hint="`Default ${o?.bucketCount.default}, from ${o?.bucketCount.minimum} to ${o?.bucketCount.maximum}. Fixed after creation, like the number of vBuckets in Couchbase.`"

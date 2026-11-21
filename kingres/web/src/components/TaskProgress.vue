@@ -10,6 +10,9 @@ import { TASK_STATE } from '@/lib/status'
 import { skippedReason } from '@/lib/standby'
 import { hasGroupSteps, stepBlocks, stepName } from '@/lib/failover'
 import { keyTaskErrorHint } from '@/lib/ledger-signing'
+import { formatBytes, formatNumber } from '@/lib/format'
+import ProblemNotice from './ProblemNotice.vue'
+import { ApiError } from '@/api/problem'
 import type { Task, TaskStep } from '@/api/types'
 
 const props = defineProps<{ task: Task | null; pollError?: unknown }>()
@@ -69,6 +72,33 @@ const taskSkip = computed(() => skippedReason(props.task?.detail))
 const errorHint = computed(() =>
   props.task?.kind.startsWith('ledger.key.') ? keyTaskErrorHint(props.task.error?.code) : null,
 )
+/** What a step has done so far; the bytes of the copy of a schema move are shown as bytes (contract 0.15.0). */
+function stepItems(step: TaskStep): string | null {
+  if (step.itemsDone == null || step.itemsTotal == null) return null
+  if (props.task?.kind === 'schema.move')
+    return `${formatBytes(step.itemsDone)} of ${formatBytes(step.itemsTotal)}`
+  return `${formatNumber(step.itemsDone)} of ${formatNumber(step.itemsTotal)}`
+}
+/** A move that failed or was cancelled left the schema where it was (contract 0.15.0: `schema.move`). */
+const moveFailed = computed(
+  () => props.task?.kind === 'schema.move' && props.task.state === 'failed',
+)
+/**
+ * A schema that became pinned during a task (a ledger table appeared) ends the task with the code `schema_pinned`; it is
+ * shown as the problem notice of that code, as the request would have been refused with it.
+ */
+const pinnedProblem = computed(() => {
+  const error = props.task?.error
+  if (!error || (error.code !== 'schema_pinned' && error.code !== 'schema_move_in_progress'))
+    return null
+  return new ApiError({
+    type: 'about:blank',
+    title: error.code,
+    status: 409,
+    code: error.code,
+    detail: error.message,
+  })
+})
 watch(announcementKey, (key) => {
   if (key) announce(summary.value, props.task?.state === 'failed' ? 'assertive' : 'polite')
 })
@@ -116,6 +146,9 @@ watch(
             <span v-if="step.detail && step.detail !== task.detail" class="muted step-detail"
               ><SafeName :value="step.detail" kind="text" :max="200"
             /></span>
+            <span v-if="stepItems(step)" class="muted step-detail" data-testid="step-items">{{
+              stepItems(step)
+            }}</span>
             <span
               v-if="stepSkip(step) !== null"
               class="muted step-detail"
@@ -141,7 +174,8 @@ watch(
       replicate and are supervised) without being recorded in the sharding catalog, which needs the
       sharding extension 0.4.
     </p>
-    <p v-if="task.error" class="tone-danger notice" role="alert">
+    <ProblemNotice v-if="pinnedProblem" :error="pinnedProblem" />
+    <p v-else-if="task.error" class="tone-danger notice" role="alert">
       <span aria-hidden="true">&#10006;</span>
       <span
         ><SafeName :value="task.error.message" kind="text" :max="400" /><template
@@ -149,6 +183,12 @@ watch(
         >
           (step: <SafeName :value="task.error.step" kind="text" :max="80" />)</template
         ></span
+      >
+    </p>
+    <p v-if="moveFailed" class="notice tone-info" data-testid="move-failed-note" role="status">
+      <span aria-hidden="true">&#9432;</span>
+      <span
+        >The schema is still on its original group and in use. You can start the move again.</span
       >
     </p>
     <p v-if="errorHint" class="muted" data-testid="task-error-hint">{{ errorHint }}</p>

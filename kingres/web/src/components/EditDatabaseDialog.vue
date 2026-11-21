@@ -10,8 +10,11 @@ import TaskActionDialog from './TaskActionDialog.vue'
 import FormField from './FormField.vue'
 import NullableValue from './NullableValue.vue'
 import HiddenPreview from './HiddenPreview.vue'
+import ShardingModeChoice from './ShardingModeChoice.vue'
 import { endpoints } from '@/api/endpoints'
-import { keys } from '@/api/queries'
+import { keys, useDatabaseCreateOptions } from '@/api/queries'
+import { useSessionStore } from '@/stores/session'
+import { modeOf, offeredModes, type ShardingMode } from '@/lib/sharding-mode'
 import type { Database, DatabaseUpdateRequest, Durability, LedgerMode, Task } from '@/api/types'
 import { DURABILITY_LABEL, LEDGER_MODE_LABEL } from '@/lib/status'
 import { compact, firstError, integerBetween } from '@/lib/validators'
@@ -28,8 +31,17 @@ const orig = {
   durability: d.replication.durability ?? 'sync',
   ledgerMode: d.ledger.mode ?? 'off',
   digestInterval: d.ledger.digestIntervalSeconds ?? 3600,
+  mode: modeOf(d.sharding),
+  distributeNew: d.sharding.distributeNewSchemas ?? false,
 } as const
+// The sharding mode (contract 0.15.0) is offered where the server says it has modes; a role below kingres_admin sees it as text.
+const session = useSessionStore()
+const canChange = computed(() => session.can('updateDatabase'))
+const options = useDatabaseCreateOptions()
+const modes = computed(() => offeredModes(options.data.value?.shardingModes?.modes))
 const form = reactive({
+  mode: orig.mode as ShardingMode,
+  distributeNew: orig.distributeNew as boolean,
   owner: orig.owner as string,
   connectionLimit: orig.connectionLimit as number,
   durability: orig.durability as Durability,
@@ -51,7 +63,15 @@ const body = computed<DatabaseUpdateRequest>(() => {
   if (form.digestInterval !== orig.digestInterval)
     ledger.digestIntervalSeconds = form.digestInterval
   if (Object.keys(ledger).length) out.ledger = ledger
-  if (form.enableSharding) out.sharding = { enabled: true }
+  const sharding: NonNullable<DatabaseUpdateRequest['sharding']> = {}
+  if (form.enableSharding) sharding.enabled = true
+  if (modes.value.length > 0 && (d.sharding.enabled || form.enableSharding)) {
+    if (form.mode !== orig.mode) sharding.mode = form.mode
+    // The default for new schemas keeps its value when it is not sent, so it is sent only when it was changed.
+    if (form.distributeNew !== orig.distributeNew)
+      sharding.distributeNewSchemas = form.distributeNew
+  }
+  if (Object.keys(sharding).length) out.sharding = sharding
   return out
 })
 
@@ -183,6 +203,14 @@ async function start(): Promise<Task> {
           Turn on sharding (cannot be turned off again; existing tables stay plain until you
           distribute them)
         </label>
+        <ShardingModeChoice
+          v-if="modes.length > 0 && (d.sharding.enabled || form.enableSharding)"
+          v-model:mode="form.mode"
+          v-model:distribute-new="form.distributeNew"
+          :modes="modes"
+          :readonly="!canChange"
+          :reset-default="!d.sharding.enabled"
+        />
       </fieldset>
       <fieldset>
         <legend>Fixed after creation</legend>
@@ -197,7 +225,12 @@ async function start(): Promise<Task> {
             <NullableValue :value="d.general.lcCtype" />
           </dd>
           <dt>Bucket count</dt>
-          <dd><NullableValue :value="d.sharding.bucketCount" /></dd>
+          <dd>
+            <template v-if="d.sharding.enabled && orig.mode === 'schema'"
+              >Not used in the mode Schemas</template
+            >
+            <NullableValue v-else :value="d.sharding.bucketCount" />
+          </dd>
         </dl>
         <p class="hint muted">
           The replica count is a cluster setting and is changed in cluster settings.
