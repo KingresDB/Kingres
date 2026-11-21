@@ -942,3 +942,56 @@ func TestOnlyTheMapGroupOfAPlannedSwitchoverBoundsTheCallsToTheOldServer(t *test
 		}
 	}
 }
+
+// runAllCancelledAtTheStop runs the steps like runAll, with a context that the clean stop cancels (the engine cancels the context of a step whose task lease
+// cannot be renewed, which is what the stopped system database of the map group does ten seconds after the stop).
+func runAllCancelledAtTheStop(t *testing.T, w *world, r *Runner, in Input) (string, error) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.afterStop = cancel
+	raw, _ := json.Marshal(in)
+	steps, err := r.steps(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range steps {
+		err := s.Run(ctx, &task.Env{Task: task.Task{ID: 1, Input: raw}})
+		var sk *task.SkipError
+		if errors.As(err, &sk) {
+			continue
+		}
+		if err != nil {
+			return s.Name, err
+		}
+	}
+	return "", nil
+}
+
+// The cluster tests of the review of round 2 found it: the context of the step ends soon after the clean stop of the map group, and a step that ends with it
+// leaves the old primary stopped and held back, with nobody to roll back. A candidate that never promotes, and a proof that cannot be sent, roll back all the same.
+func TestTheRollbackOfTheMapGroupOutlivesTheContextOfTheStep(t *testing.T) {
+	w := mapWorld()
+	w.dbDownAfterStop, w.noPromoteOnProof = true, true
+	r := w.runner()
+	w.fakeClock(r)
+	r.MapVerdictWait = 3 * time.Second
+	_, err := runAllCancelledAtTheStop(t, w, r, mapGracefulInput())
+	failedWith(t, w, err, CodeSwitchoverUnproven)
+	if w.count("resume s1") != 1 || w.count("map-abandon s2") != 1 || w.count("lease-release s2") != 1 {
+		t.Fatalf("no rollback after the context ended:\n%s", strings.Join(w.log, "\n"))
+	}
+}
+
+func TestAProofThatCannotBeSentRollsTheMapGroupBack(t *testing.T) {
+	w := mapWorld()
+	w.dbDownAfterStop = true
+	w.mapProofErr = &CallError{Status: 409, Code: "conflict", Message: "No planned switchover of the map group is in progress on this server."}
+	r := w.runner()
+	w.fakeClock(r)
+	_, err := runAllCancelledAtTheStop(t, w, r, mapGracefulInput())
+	failedWith(t, w, err, CodeTargetUnavailable)
+	if w.count("resume s1") != 1 || w.count("map-abandon s2") != 1 {
+		t.Fatalf("no rollback after the proof failed:\n%s", strings.Join(w.log, "\n"))
+	}
+}

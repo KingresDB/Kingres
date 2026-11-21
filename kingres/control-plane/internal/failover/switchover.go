@@ -329,6 +329,10 @@ func (r *Runner) stopClean(ctx context.Context, env *task.Env, sc *stepCtx) erro
 	if sc.group == 0 {
 		// The old leader is stopped: nothing can be recorded by this task until the new leader's engine claims it. The proof goes to the candidate, which
 		// promotes on it after the standby has checked it against what it replayed.
+		// The lease of the task is in the stopped system database and cannot be renewed, so the engine cancels the context of the step ten seconds later. What
+		// follows must not end with it (found by the cluster tests of the review of round 2): the old primary is held back, the candidate may be given up or may
+		// never promote, and only this step can say that the switchover is rolled back. It runs on a context that is not cancelled, bounded by the verdict wait.
+		ctx = context.WithoutCancel(ctx)
 		var perr error
 		for i := 0; i < 5; i++ {
 			if perr = r.Peers.MapProof(ctx, nw.Server, MapProofRequest{Checkpoint: ans.Checkpoint, ClusterState: ans.ClusterState}); perr == nil {
@@ -339,7 +343,8 @@ func (r *Runner) stopClean(ctx context.Context, env *task.Env, sc *stepCtx) erro
 			}
 		}
 		if perr != nil {
-			return fail(CodeTargetUnavailable, true, "the proof of the clean stop could not be sent to %s: %v", nw.Server, perr)
+			// The candidate cannot take the proof (it was given up, or it cannot be reached): the rollback asks it first and starts the old leader again.
+			return sc.rollbackFailed(ctx, CodeTargetUnavailable, true, "the proof of the clean stop could not be sent to %s: %v", nw.Server, perr)
 		}
 		// The verdict: the candidate promotes on the proof (the standby is out of recovery), or it refuses (the standby cannot prove the stop) and tells this server.
 		// A refusal rolls this task back: the old leader's primary is started again by its lease manager, which wins the lease because the candidate let go

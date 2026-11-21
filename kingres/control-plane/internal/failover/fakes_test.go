@@ -70,6 +70,7 @@ type world struct {
 	mapStarts          []MapStartRequest
 	mapProofs          []MapProofRequest
 	noPromoteOnProof   bool
+	mapProofErr        error
 	stateDown          map[string]bool // the calls to this server fail (a transient error on the state read)
 	mapAbandonErr      error           // the candidate answers the abandon with this (a 409 conflict: it promoted)
 	mapRefusal         string
@@ -78,6 +79,7 @@ type world struct {
 	undoTerms          []int64 // the terms of the quiesce, unquiesce and resume calls
 	stopErr            error   // the answer of the clean stop call
 	dbDownAfterStop    bool    // the rows cannot be read after the clean stop (the map group: its system database is the stopped instance)
+	afterStop          func()  // called when the clean stop is done (a test cancels the context of the step, as the engine does when the task lease cannot be renewed)
 	notReleased        bool    // the clean stop does not release the lease
 	markTerms          []int64
 	stopTerms          []int64
@@ -285,6 +287,9 @@ func (p fpeers) Demote(_ context.Context, server string, r DemoteRequest) (Demot
 			p.w.rows.mu.Lock()
 			p.w.rows.down = true
 			p.w.rows.mu.Unlock()
+		}
+		if p.w.afterStop != nil {
+			p.w.afterStop()
 		}
 		return DemoteAnswer{Stopped: true, ClusterState: state, Checkpoint: "0/6000028", Released: !p.w.notReleased}, nil
 	}
@@ -811,7 +816,7 @@ func (p fpeers) MapProof(_ context.Context, server string, r MapProofRequest) er
 	}
 	p.w.mu.Unlock()
 	p.w.rec("map-proof %s", server)
-	return nil
+	return p.w.mapProofErr
 }
 
 func (p fpeers) MapAbandon(_ context.Context, server, reason string) error {
