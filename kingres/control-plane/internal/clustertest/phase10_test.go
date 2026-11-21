@@ -236,7 +236,8 @@ func TestSplitBucketOnACluster(t *testing.T) {
 	})
 
 	t.Run("a cancel before the switch undoes the split, and the bucket can be split again", func(t *testing.T) {
-		reached, release := p10Gate(t, c, "sp", "split_after_backfill")
+		// the extension looks at the request to cancel in its backfill (not after it), so the gate is before the backfill
+		reached, release := p10Gate(t, c, "sp", "split_after_triggers")
 		defer release()
 		id := clustertest.TaskID(split(5, nil))
 		reached(2 * time.Minute)
