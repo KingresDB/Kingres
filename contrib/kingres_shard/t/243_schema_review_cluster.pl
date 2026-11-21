@@ -112,7 +112,7 @@ is(q1($n1, q{SET app.tenant = '42'; SELECT current_setting('app.tenant', true) F
 is(q1($n1, q{SET kingres_shard.enable_schema_routing = off; SET app.tenant = '42'; SELECT current_setting('app.tenant', true) FROM s4.t LIMIT 1}), '42', '... with routing off too');
 q1($n1, q{SET search_path = s4; INSERT INTO t (v) VALUES ('via trigger')});
 is(q1($n2, q{SELECT count(*) FROM s4.audit WHERE msg = 'via trigger'}), 1, 'a trigger with an unqualified name works when the insert comes from another node');
-fails($n1, q{UPDATE s4.t SET id = DEFAULT WHERE v = 'x'}, qr/it sets an identity column to DEFAULT|can only be updated to DEFAULT/, 'UPDATE ... SET id = DEFAULT of a generated identity from another node');
+fails($n1, q{UPDATE s4.t SET id = DEFAULT WHERE v = 'x'}, qr/it sets an identity column to DEFAULT/, 'UPDATE ... SET id = DEFAULT of a generated identity from another node');
 q1($n1, q{SET check_function_bodies = off; CREATE FUNCTION s4.later() RETURNS int LANGUAGE sql AS 'SELECT count(*)::int FROM s4.notyet'});
 same_everywhere(q{SELECT count(*) FROM pg_proc WHERE proname = 'later'}, 1, 'check_function_bodies = off is carried by DDL');
 q1($n1, q{CREATE FUNCTION public.eqf(int, int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'SELECT $1 = $2'; CREATE OPERATOR public.=== (LEFTARG = int, RIGHTARG = int, FUNCTION = public.eqf)});
