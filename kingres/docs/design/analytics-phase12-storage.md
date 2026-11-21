@@ -1643,6 +1643,76 @@ edited in place and still give the same catalog (the `upgrade` test); there is n
 re-creates the extension. After the first release a change of the script is a new
 version with an upgrade script.
 
+### 10.4b The fixes for the review of the fixes (kingres_timepart 0.2, findings T13F-01 to T13F-08)
+
+The review of the fixes of 10.4a found no critical or high finding and one medium, all
+reproduced. The code is in `kingres_timepart--0.2.sql` and the same text in
+`kingres_timepart--0.1--0.2.sql` (still the same catalog, the `upgrade` test); the tests are
+`sql/timepart_convert_more.sql` (sections 12 to 15) and `t/009_convert_ddl_race.pl` (sections 4,
+7 and 8).
+
+**T13F-01 and T13F-02. Changes that need no lock on the table.** `GRANT`, `REVOKE`, `ALTER INDEX
+... RENAME`, `COMMENT ON INDEX` and `ALTER INDEX ... SET (...)` do not conflict with the
+`SHARE ROW EXCLUSIVE` lock of the conversion, so they can commit during the copy or during the
+wait of the swap, and the old partition (and the old index) that the swap drops would take them
+with it. The review proposed to read the ACL again after the lock or to detect the change. A
+re-read does not close the window (a `GRANT` can commit at any moment before the drop), and the
+indexes are built from a text read earlier, so the decision is to **detect and give way**: a new
+function, `timepart__convert_fp(partition)`, returns one document of everything that the
+conversion carries and that such a change can alter (the ACL of the table and of its columns, the
+comment, options, replica identity and tablespace of the table, and of every index the name,
+tablespace, options, comment, clustering mark, constraint name and comment and the statistics
+targets, ordered by the OID of the index so that a rename does not hide behind the order). The plan
+holds it (key `fp`); the block compares it, read again with the parent locked, with the one it got
+after the first lock, just before the detach, and raises `schema_changed` (55P03, the retry rule of
+the run is the one of T13-01) when they differ: nothing was changed, the old partition has the
+change, and the next call carries it. What is left is the window between that second reading and
+the drop, a few statements; it is documented in the README. The alternative of carrying the new
+state (read the ACL after the lock) was refused for the same window and because the index changes
+would need the plan to be read a third time under the strongest lock.
+
+**T13F-03. The tablespace of an index.** `pg_get_indexdef` has no `TABLESPACE` clause, so the plan
+now records `reltablespace` of each plain index (a constraint's definition carries its own), and
+the block runs the `CREATE INDEX` with `default_tablespace` set to it for that statement, and puts
+the setting back. No text of the index is parsed to put a clause in it.
+
+**T13F-04. NOT ENFORCED.** `convalidated` is false for `NOT VALID` and for `NOT ENFORCED`; only
+the first is refused. The refusal asks for `conenforced` where the catalog has the column, found in
+`pg_attribute` and run as dynamic SQL, not decided by the server version (the one-source rule keeps
+version tests in the compat headers; SQL looks at the catalog); a catalog without the column keeps
+the old query. `LIKE ... INCLUDING CONSTRAINTS` carries the flag, in both directions (tested on a
+partition whose rows violate the check).
+
+**T13F-05. A partitioned default partition.** The size is the sum of `pg_table_size` of the leaves
+of `pg_partition_tree` of the default partition (table, TOAST table and maps; the attach does not
+read indexes), not `pg_relation_size` of the partition itself, which is zero for a partitioned one.
+
+**T13F-06. A partition dropped before the block.** The block looks the OID up in `pg_class` before
+`LOCK TABLE`, and raises `schema_changed`; the handler also catches the syntax error that the digits
+of a dead OID give, for the race between the look-up and the lock (that handler can only be reached
+by a race, so no test fails without it).
+
+**T13F-07. Tests.** `t/009` section 8 renames the partition and creates another table of its
+name while the conversion waits: the check in `pg_locks` that the lock held is the partition's is
+the only thing that stops it, and section 7d runs the swap with `deadlock_timeout = 10 s` and a
+reader that holds the table for two seconds: the message says `within 500 ms`, the cap. The race
+tests make each change in a session that is already open the moment `pg_locks` shows the
+conversion waiting for `ACCESS EXCLUSIVE` on the parent; a try in which the conversion gave way
+before the change was made (a loaded machine) is made again.
+
+**T13F-08. special_table.** The second argument must be the table or one of its partitions
+(`pg_inherits`); any other OID gets null before the private catalogs are read.
+
+**Mutants** (one-line edits of both scripts, PostgreSQL 18; each is run with the pg_regress
+set or the TAP file that holds its test): the compare of the document removed (23 assertions of
+t/009 fail), the ACL left out of it (10), the index name left out (5), its options left out (5),
+its comment left out (5), the tablespace of an index not applied (2), the lock check removed (3),
+the cap raised to 60 s (2), the `conenforced` test removed, the size of the partition itself
+instead of its leaves, the look-up before the lock removed and the tie of `special_table`
+removed (each fails `timepart_convert_more`). The first run of the index-name mutant survived,
+because the document was ordered by the name and a rename changed the order; it is ordered by OID
+now, and the mutant is killed.
+
 ### 10.5 Locks at a glance
 
 | Action | Lock on the parent | Lock on the partition | Blocks readers of the parent | Blocks writers |
