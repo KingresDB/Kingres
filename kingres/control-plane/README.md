@@ -334,12 +334,12 @@ handlers in `internal/httpapi/handlers_config.go`, wiring in `cmd/kingresd/confi
 
 ## What is implemented
 
-The server implements revision **0.13.0** of the contract (132 operations, 108
+The server implements revision **0.15.0** of the contract (137 operations, 112
 paths; what is not done is in "Not done in this increment"). "Real" means the operation works against PostgreSQL or the local node
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **123 of 132 operations are real; 9 answer "not yet".** The eight ledger operations in that column (client keys, bundles, the signature policy of a table, the upgrade of the extension, the acknowledgement of a diverged chain) are built against the contract in the console, which tries them on its mock API; their implementation in `kingresd` is on a branch that is not merged yet.
+authenticated operation lists in 0.2.0. **123 of 137 operations are real; 14 answer "not yet".** The eight ledger operations in that column (client keys, bundles, the signature policy of a table, the upgrade of the extension, the acknowledgement of a diverged chain) are built against the contract in the console, which tries them on its mock API; their implementation in `kingresd` is on a branch that is not merged yet.
 
 | Tag | Real | Not yet |
 |---|---|---|
@@ -350,6 +350,7 @@ authenticated operation lists in 0.2.0. **123 of 132 operations are real; 9 answ
 | Roles | `listClusterRoles`, `listRoles`, `createRole`, `getRole`, `deleteRole`, `updateRole`, `setRoleClusterRoles`, `setRoleMemberships` |  |
 | Databases | `getDatabaseCreateOptions`, `listDatabases`, `createDatabase`, `getDatabase`, `dropDatabase`, `updateDatabase` |  |
 | Shards | `getBucketDistribution`, `listColocationGroups`, `listBuckets` |  |
+| Schemas |  | `listSchemas`, `getSchema`, `distributeSchema`, `undistributeSchema`, `moveSchema` |
 | Ledger | `getLedgerStatus`, `listLedgerBlocks`, `listLedgerDigests`, `generateLedgerDigest`, `startLedgerVerification`, `listLedgerStatus`, `createInclusionProof`, `listLedgerVerifications`, `getLedgerVerification`, `getLedgerSettings`, `updateLedgerSettings`, `getLedgerSigning`, `createLedgerSigningKey`, `retireLedgerSigningKey`, `revokeLedgerSigningKey`, `getLedgerTrustFile`, `getLedgerPublication`, `getLedgerAggregate`, `listLedgerAggregates`, `listLedgerAnchorTargets`, `createLedgerAnchorTarget`, `getLedgerAnchorTarget`, `updateLedgerAnchorTarget`, `deleteLedgerAnchorTarget`, `testLedgerAnchorTarget`, `listLedgerAnchors`, `anchorLedgerNow`, `retryLedgerAnchor`, `downloadLedgerAnchor` | `createLedgerBundle`, `getLedgerBundle`, `listLedgerClientKeys`, `registerLedgerClientKey`, `revokeLedgerClientKey`, `setTableSignaturePolicy`, `upgradeLedgerExtension`, `acknowledgeLedgerDivergence` |
 | Tables | `getTable`, `distributeTable`, `enableTableLedger`, `listTables` |  |
 | Grants | `listGrants`, `createGrant`, `revokeGrants`, `applyGrantTemplate` |  |
