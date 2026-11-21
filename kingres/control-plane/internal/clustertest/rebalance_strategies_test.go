@@ -70,10 +70,11 @@ func TestRebalanceStrategiesAndWeights(t *testing.T) {
 				t.Errorf("cost below the minimum: %v", mv)
 			}
 		}
-		// A threshold of 1 accepts any placement: nothing to do.
+		// An explicit threshold is used and shown. (One server holds everything here, so its deviation from the ideal is 2: even a
+		// threshold of 1 does not accept this placement, and the plan stays.)
 		plan = leader.Expect(200, "POST", "/rebalance/plan", map[string]any{"strategy": "byDiskSize", "threshold": 1})
-		if plan["needed"] != false {
-			t.Errorf("a threshold of 1 plans nothing: %v", plan)
+		if plan["threshold"] != float64(1) || plan["needed"] != true {
+			t.Errorf("explicit threshold: %v", plan)
 		}
 	})
 
@@ -100,7 +101,8 @@ func TestRebalanceStrategiesAndWeights(t *testing.T) {
 	t.Run("excluded servers are planned as drained", func(t *testing.T) {
 		plan := leader.Expect(200, "POST", "/rebalance/plan", map[string]any{"excludeServerIds": []string{b}, "moveLimit": 500})
 		im := planImpacts(plan)
-		if im[b]["primaryBucketsAfter"] != float64(0) || im[a]["primaryBucketsAfter"] != float64(8) || im[leader.Host]["primaryBucketsAfter"] != float64(8) {
+		// a server that ends with no bucket and had none is not listed at all
+		if got, ok := im[b]; ok && got["primaryBucketsAfter"] != float64(0) || im[a]["primaryBucketsAfter"] != float64(8) || im[leader.Host]["primaryBucketsAfter"] != float64(8) {
 			t.Errorf("placement without %s: %v", b, plan["serverImpacts"])
 		}
 	})

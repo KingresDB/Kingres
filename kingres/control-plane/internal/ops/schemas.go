@@ -75,6 +75,7 @@ func (o *Ops) schemaRows(ctx context.Context, c *pgx.Conn, only string) ([]api.S
 	}
 	rows, err := c.Query(ctx, q+` ORDER BY n.nspname COLLATE "C"`, args...)
 	if err != nil {
+		o.logSchemaErr("querying the schemas", "", err)
 		return nil, PGProblem(err)
 	}
 	defer rows.Close()
@@ -86,6 +87,7 @@ func (o *Ops) schemaRows(ctx context.Context, c *pgx.Conn, only string) ([]api.S
 		var size *int64
 		var tables int
 		if err := rows.Scan(&s.Name, &s.Owner, &colo, &group, &state, &server, &size, &moving, &tables, &s.EstimatedRows); err != nil {
+			o.logSchemaErr("reading a schema row", "", err)
 			return nil, PGProblem(err)
 		}
 		s.TableCount, s.SizeBytes = tables, size
@@ -98,6 +100,13 @@ func (o *Ops) schemaRows(ctx context.Context, c *pgx.Conn, only string) ([]api.S
 		out = append(out, s)
 	}
 	return out, PGProblem(rows.Err())
+}
+
+// logSchemaErr keeps the cause of a problem that the answer hides (PGProblem says only that the instance is not available).
+func (o *Ops) logSchemaErr(what, db string, err error) {
+	if o.Log != nil {
+		o.Log.Warn(what+" failed", "database", db, "error", err)
+	}
 }
 
 func (o *Ops) withDB(ctx context.Context, db string, f func(c *pgx.Conn) error) error {
@@ -117,6 +126,7 @@ func (o *Ops) withDB(ctx context.Context, db string, f func(c *pgx.Conn) error) 
 func (o *Ops) ListSchemas(ctx context.Context, db string, f SchemaFilter, p store.Page) (api.SchemaPage, error) {
 	var all []api.SchemaSummary
 	if err := o.withDB(ctx, db, func(c *pgx.Conn) (err error) { all, err = o.schemaRows(ctx, c, ""); return }); err != nil {
+		o.logSchemaErr("listing the schemas", db, err)
 		return api.SchemaPage{}, err
 	}
 	sel := all[:0]
