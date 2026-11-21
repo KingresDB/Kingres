@@ -4,6 +4,7 @@
 package rebalance
 
 import (
+	"context"
 	"testing"
 )
 
@@ -43,5 +44,14 @@ func TestSplitDone(t *testing.T) {
 		if splitDone(phase) != want {
 			t.Errorf("%s", phase)
 		}
+	}
+}
+
+// The request is normalized before the preview and before the task input is made: a start without verify must not record an empty one
+// (the first cluster run of the split failed with "verify must be count, full or none, not ").
+func TestSplitRefusesABadRequestBeforeTouchingTheCluster(t *testing.T) {
+	s := &Service{}
+	if _, err := s.Split(context.Background(), "u", "db", 1, 3, SplitRequest{Parts: 5}); err == nil {
+		t.Fatal("parts 5 must be refused")
 	}
 }

@@ -205,6 +205,9 @@ func (s *Service) unfinishedSplit(ctx context.Context, db string, colocation int
 // Split is splitBucket: refuses what the preview calls a blocker with the problem of the first one, and
 // starts the task.
 func (s *Service) Split(ctx context.Context, actor, db string, colocation, bucket int32, req SplitRequest) (task.Task, error) {
+	if errs := req.normalize(); len(errs) > 0 {
+		return task.Task{}, problem.Validation("The split request is invalid.", errs...)
+	}
 	pv, err := s.SplitPreview(ctx, db, colocation, bucket, req)
 	if err != nil {
 		return task.Task{}, err

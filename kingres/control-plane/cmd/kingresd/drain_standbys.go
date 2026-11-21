@@ -70,8 +70,14 @@ func wireStandbyRelocation(rbs *rebalance.Service, l *standby.Leader, o *ops.Ops
 		} else {
 			l.Kick()
 		}
+		// What is left to do: the standbys still on the server, and the groups that have fewer standbys on the other servers than the
+		// best-placed group (a group that lost its standby with the server waits for its replacement: make before break is the
+		// reconcile's business, the step waits for the end of it).
 		var n int
-		err = c.QueryRow(ctx, `SELECT count(*) FROM kingres.node WHERE host = $1 AND role = 'standby'`, server).Scan(&n)
+		err = c.QueryRow(ctx, `WITH per AS (
+				SELECT group_id, count(*) FILTER (WHERE role = 'standby' AND host <> $1) AS c FROM kingres.node GROUP BY group_id)
+			SELECT (SELECT count(*) FROM kingres.node WHERE host = $1 AND role = 'standby')::int
+			     + (SELECT count(*) FROM per WHERE c < (SELECT max(c) FROM per))::int`, server).Scan(&n)
 		return n, err
 	}
 }
