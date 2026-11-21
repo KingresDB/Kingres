@@ -147,6 +147,21 @@ type LedgerVerifyRequest struct {
 	Checks []string `json:"checks,omitempty"`
 }
 
+// RebalanceSettingsUpdate is the "rebalance" member of a settings update; every member is optional but one is
+// needed (contract 0.16.0 added all but the first).
+type RebalanceSettingsUpdate struct {
+	MaxConcurrentMoves  *int     `json:"maxConcurrentMoves,omitempty"`
+	Strategy            *string  `json:"strategy,omitempty"`
+	Threshold           *float64 `json:"threshold,omitempty"`
+	ThresholdSet        bool     `json:"-"`
+	MaxMovesPerServer   *int     `json:"maxMovesPerServer,omitempty"`
+	MaxMoveAttempts     *int     `json:"maxMoveAttempts,omitempty"`
+	MaxDiskUsedFraction *float64 `json:"maxDiskUsedFraction,omitempty"`
+	MaxStandbyLagBytes  *int64   `json:"maxStandbyLagBytes,omitempty"`
+	// Automatic is the automatic mode (contract 0.16.0).
+	Automatic *AutomaticSettingsUpdate `json:"automatic,omitempty"`
+}
+
 // ClusterSettingsUpdateRequest is the body of PATCH /settings/cluster.
 type ClusterSettingsUpdateRequest struct {
 	DefaultReplicaCount *int    `json:"defaultReplicaCount,omitempty"`
@@ -156,10 +171,8 @@ type ClusterSettingsUpdateRequest struct {
 		TimeoutSeconds *int  `json:"timeoutSeconds,omitempty"`
 		MaxCount       *int  `json:"maxCount,omitempty"`
 	} `json:"autoFailover,omitempty"`
-	Rebalance *struct {
-		MaxConcurrentMoves *int `json:"maxConcurrentMoves,omitempty"`
-	} `json:"rebalance,omitempty"`
-	Features *struct {
+	Rebalance *RebalanceSettingsUpdate `json:"rebalance,omitempty"`
+	Features  *struct {
 		Sharding *bool `json:"sharding,omitempty"`
 		Ledger   *bool `json:"ledger,omitempty"`
 	} `json:"features,omitempty"`

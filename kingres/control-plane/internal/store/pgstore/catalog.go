@@ -23,6 +23,8 @@ type node struct {
 	Active           bool
 	ShouldHaveShards bool
 	ServerGroup      *string
+	// Weight is kingres.node.weight, 0 when the extension has no such column.
+	Weight float64
 }
 
 // serverInfo is a machine: all nodes that share a host name.
@@ -37,6 +39,9 @@ type serverInfo struct {
 	Group  *string
 	Should bool
 	Active bool
+	// Weight is the weight of the nodes of the server (the largest, they are equal
+	// when the control plane set them); 0 when the extension has no weights.
+	Weight float64
 }
 
 // catalog is the cluster layout read from kingres.node.
@@ -67,7 +72,13 @@ func (s *Store) loadCatalog(ctx context.Context) (*catalog, error) {
 	if !ok {
 		return cat, nil
 	}
-	rows, err := p.Query(ctx, `SELECT node_id, group_id, host, port, role, is_active, should_have_shards, server_group
+	weightCol := "0::float8"
+	var hasWeight bool
+	if err := p.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute WHERE attrelid = 'kingres.node'::regclass
+		AND attname = 'weight' AND NOT attisdropped)`).Scan(&hasWeight); err == nil && hasWeight {
+		weightCol = "weight"
+	}
+	rows, err := p.Query(ctx, `SELECT node_id, group_id, host, port, role, is_active, should_have_shards, server_group, `+weightCol+`
 		FROM kingres.node ORDER BY node_id`)
 	if err != nil {
 		return nil, s.wrap("reading kingres.node", err)
@@ -75,7 +86,7 @@ func (s *Store) loadCatalog(ctx context.Context) (*catalog, error) {
 	defer rows.Close()
 	for rows.Next() {
 		var n node
-		if err := rows.Scan(&n.ID, &n.Group, &n.Host, &n.Port, &n.Role, &n.Active, &n.ShouldHaveShards, &n.ServerGroup); err != nil {
+		if err := rows.Scan(&n.ID, &n.Group, &n.Host, &n.Port, &n.Role, &n.Active, &n.ShouldHaveShards, &n.ServerGroup, &n.Weight); err != nil {
 			return nil, s.wrap("scanning kingres.node", err)
 		}
 		cat.nodes = append(cat.nodes, n)
@@ -101,6 +112,9 @@ func (s *Store) loadCatalog(ctx context.Context) (*catalog, error) {
 		}
 		if !n.ShouldHaveShards {
 			sv.Should = false
+		}
+		if n.Weight > sv.Weight {
+			sv.Weight = n.Weight
 		}
 		if n.ServerGroup != nil && sv.Group == nil {
 			g := *n.ServerGroup
@@ -374,7 +388,7 @@ func (s *Store) buildServers(ctx context.Context, cat *catalog, hold map[string]
 		server := api.Server{
 			ID: sv.ID, Address: net.JoinHostPort(sv.Host, s.opts.PanelPort), Hostname: sv.Host,
 			Status:      s.withLiveness(sv.ID, statusOf(sv, h.Primary, anyBuckets)),
-			ServerGroup: sv.Group, ShouldHaveShards: sv.Should,
+			ServerGroup: sv.Group, ShouldHaveShards: sv.Should, Weight: weightPtr(sv.Weight),
 			Version:   versionPtr(s.opts.Version),
 			Instances: make([]api.Instance, 0, len(sv.Nodes)), Buckets: h,
 		}
@@ -393,6 +407,14 @@ func (s *Store) buildServers(ctx context.Context, cat *catalog, hold map[string]
 	}
 	s.applyRecords(ctx, out)
 	return out
+}
+
+// weightPtr is the weight of a server, nil when the catalog has none.
+func weightPtr(w float64) *float64 {
+	if w <= 0 {
+		return nil
+	}
+	return &w
 }
 
 // localHost returns the host of this node from kingres.local_node, or "".

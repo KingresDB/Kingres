@@ -55,8 +55,10 @@ func New() *Store {
 		Settings: api.ClusterSettings{
 			DefaultReplicaCount: 1, DefaultDurability: "sync",
 			AutoFailover: api.AutoFailoverSettings{TimeoutSeconds: 120, MaxCount: 1},
-			Rebalance:    api.RebalanceSettings{MaxConcurrentMoves: 4},
-			Restart:      api.RestartState{ServerIDs: []string{}},
+			Rebalance: api.RebalanceSettings{MaxConcurrentMoves: 4, Strategy: "byBucketCount", MaxMovesPerServer: 2, MaxMoveAttempts: 3, MaxDiskUsedFraction: 0.85, MaxStandbyLagBytes: 64 << 20,
+				Automatic: &api.AutomaticSettings{Strategy: "byBucketCount", Threshold: 0.15, CheckIntervalSeconds: 60, SettleSeconds: 300,
+					SettleAfterTopologySeconds: 600, MinIntervalSeconds: 3600, FailoverSettleSeconds: 600}},
+			Restart: api.RestartState{ServerIDs: []string{}},
 		},
 		CreateOptions: api.DatabaseCreateOptions{
 			Encodings:                   []api.EncodingOption{{Name: "UTF8", IsDefault: true}},

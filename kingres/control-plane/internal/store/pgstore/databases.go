@@ -254,10 +254,11 @@ func (s *Store) ClusterSettings(ctx context.Context) (api.ClusterSettings, error
 		DefaultReplicaCount: cat.replicaCount(),
 		DefaultDurability:   durabilityOf(sc),
 		AutoFailover:        api.AutoFailoverSettings{Enabled: false, TimeoutSeconds: 120, MaxCount: 1},
-		Rebalance:           api.RebalanceSettings{MaxConcurrentMoves: 4},
-		Features:            api.FeatureFlags{Sharding: shard, Ledger: ledger},
-		Restart:             api.RestartState{ServerIDs: []string{}},
-		Clock:               &api.ClockSettings{MaxDifferenceMs: 1000},
+		Rebalance: api.RebalanceSettings{MaxConcurrentMoves: 4, Strategy: "byBucketCount", MaxMovesPerServer: 2, MaxMoveAttempts: 3,
+			MaxDiskUsedFraction: 0.85, MaxStandbyLagBytes: 64 << 20, Automatic: defaultAutomatic()},
+		Features: api.FeatureFlags{Sharding: shard, Ledger: ledger},
+		Restart:  api.RestartState{ServerIDs: []string{}},
+		Clock:    &api.ClockSettings{MaxDifferenceMs: 1000},
 	}
 	// Values the administrator set (kingres_cp.cluster_setting) win over the
 	// defaults derived from the catalogs.
@@ -308,6 +309,37 @@ func (s *Store) ClusterSettings(ctx context.Context) (api.ClusterSettings, error
 			case "rebalance.maxConcurrentMoves":
 				if json.Unmarshal(v, &n) == nil {
 					out.Rebalance.MaxConcurrentMoves = n
+				}
+			case "rebalance.strategy":
+				if json.Unmarshal(v, &str) == nil {
+					out.Rebalance.Strategy = str
+				}
+			case "rebalance.threshold":
+				var f float64
+				if json.Unmarshal(v, &f) == nil && string(v) != "null" {
+					out.Rebalance.Threshold = &f
+				}
+			case "rebalance.maxMovesPerServer":
+				if json.Unmarshal(v, &n) == nil {
+					out.Rebalance.MaxMovesPerServer = n
+				}
+			case "rebalance.maxMoveAttempts":
+				if json.Unmarshal(v, &n) == nil {
+					out.Rebalance.MaxMoveAttempts = n
+				}
+			case "rebalance.maxDiskUsedFraction":
+				var f float64
+				if json.Unmarshal(v, &f) == nil {
+					out.Rebalance.MaxDiskUsedFraction = f
+				}
+			case "rebalance.automatic.enabled", "rebalance.automatic.strategy", "rebalance.automatic.threshold", "rebalance.automatic.checkIntervalSeconds",
+				"rebalance.automatic.settleSeconds", "rebalance.automatic.settleAfterTopologySeconds", "rebalance.automatic.minIntervalSeconds",
+				"rebalance.automatic.failoverSettleSeconds", "rebalance.automatic.window":
+				applyAutomatic(out.Rebalance.Automatic, strings.TrimPrefix(k, "rebalance.automatic."), v)
+			case "rebalance.maxStandbyLagBytes":
+				var b int64
+				if json.Unmarshal(v, &b) == nil {
+					out.Rebalance.MaxStandbyLagBytes = b
 				}
 			}
 		}

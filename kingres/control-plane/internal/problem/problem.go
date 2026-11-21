@@ -89,6 +89,12 @@ const (
 	GroupDegraded       Code = "group_degraded"
 	InsufficientDisk    Code = "insufficient_disk"
 	NoReceivingServer   Code = "no_receiving_server"
+	// ReplicasCannotBeKept: a drain would leave fewer servers than the replica count needs (contract 0.16.0).
+	ReplicasCannotBeKept Code = "replicas_cannot_be_kept"
+	// BucketBusy: the bucket has a move or a split in progress (contract 0.16.0).
+	BucketBusy Code = "bucket_busy"
+	// SplitUnsupported: a table of the colocation group cannot be split (contract 0.16.0).
+	SplitUnsupported Code = "split_unsupported"
 	// Added in contract 0.10.0 (failover).
 	FailoverNeedsDecision Code = "failover_needs_decision"
 	LeaseSettingsDiffer   Code = "lease_settings_differ"
@@ -223,6 +229,9 @@ var specs = map[Code]struct {
 	GroupDegraded:                   {409, "Shard group degraded", "group-degraded"},
 	InsufficientDisk:                {409, "Insufficient disk space", "insufficient-disk"},
 	NoReceivingServer:               {409, "No receiving server", "no-receiving-server"},
+	ReplicasCannotBeKept:            {409, "Replicas cannot be kept", "replicas-cannot-be-kept"},
+	BucketBusy:                      {409, "Bucket busy", "bucket-busy"},
+	SplitUnsupported:                {422, "Split not supported", "split-unsupported"},
 	FailoverNeedsDecision:           {409, "The failover needs a decision", "failover-needs-decision"},
 	LeaseSettingsDiffer:             {409, "Lease settings differ", "lease-settings-differ"},
 	LedgerNotPublished:              {409, "The ledger is not published", "ledger-not-published"},
