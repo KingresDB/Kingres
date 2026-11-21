@@ -81,10 +81,6 @@ func (s *Service) restoreInput(ctx context.Context, actor string, nodes []Node, 
 		if p.Host == "" || p.Host == h.Host {
 			continue // at home (or without a primary: nothing to hand over)
 		}
-		if g == 0 {
-			in.Skipped = append(in.Skipped, SkippedGroup{Group: g, Reason: "mapGroup", Text: "The planned switchover of the map group is not supported yet."})
-			continue
-		}
 		recs, err := s.Runner.Plan.Standbys(ctx, g)
 		if err != nil {
 			return Input{}, problem.New(problem.ServiceUnavailable, "The standbys cannot be read now.").WithRetryAfter(5)

@@ -221,7 +221,7 @@ func (r *Runner) steps(input json.RawMessage) ([]task.Step, error) {
 		return nil, err
 	}
 	out := []task.Step{r.step(StepCheck, -1, StepCheck, false, r.check)}
-	for _, g := range in.Groups {
+	for _, g := range mapLast(in) {
 		g := g
 		if in.graceful() {
 			r.addGraceful(&out, g)
@@ -383,8 +383,10 @@ func (r *Runner) Preflight(ctx context.Context, in Input) *Refusal {
 		if !have[g] {
 			return &Refusal{Code: "unprocessable", Status: 422, Message: fmt.Sprintf("Server %s does not run the primary of shard group %d.", in.oldOf(g), g), Group: &g}
 		}
-		if g == 0 {
-			return &Refusal{Code: "unsupported_operation", Status: 422, Message: "The failover of the map group is not supported yet; the operator's way is the documented SQL of the sharding extension.", Group: &g}
+		if g == 0 && !in.graceful() {
+			// A hard failover of a server whose map group primary answers is not built (design, "the map group with a live old leader"): the bootstrap
+			// takes a server that is not heard, and a planned switchover of the map group is the task's own (mode graceful, restore).
+			return &Refusal{Code: "unsupported_operation", Status: 422, Message: "The failover of the map group while its server is alive is not supported yet; use mode graceful (a planned switchover), or the documented SQL of the sharding extension.", Group: &g}
 		}
 	}
 	if len(in.Groups) == 0 {
@@ -727,6 +729,11 @@ func (r *Runner) takeFence(ctx context.Context, env *task.Env, sc *stepCtx) erro
 	run, err := sc.runRow(ctx)
 	if err != nil {
 		return err
+	}
+	if sc.in.graceful() && sc.group == 0 {
+		if nw, _, perr := sc.pinnedStandby(ctx); perr == nil && sc.mapHandedOver(ctx, nw) {
+			return task.Skip("the map group was handed over already")
+		}
 	}
 	if err := sc.ensureFrozen(ctx); err != nil {
 		return err

@@ -355,3 +355,23 @@ func primaryRuns(ctx context.Context, d *haDeps, group int32) bool {
 	up, err := d.Svc.Manager().Running(ctx, li.ID)
 	return err == nil && up
 }
+
+// The calls of the planned switchover of the map group: the old leader's task starts the bootstrap of the candidate, sends it the proof of its clean
+// stop, and gives it up when the switchover is rolled back.
+func (p *foPeers) MapStart(ctx context.Context, server string, r failover.MapStartRequest) error {
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	return p.do(ctx, server, "POST", "/failover/map/start", r, nil)
+}
+
+func (p *foPeers) MapProof(ctx context.Context, server string, r failover.MapProofRequest) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	return p.do(ctx, server, "POST", "/failover/map/proof", r, nil)
+}
+
+func (p *foPeers) MapAbandon(ctx context.Context, server, reason string) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	return p.do(ctx, server, "POST", "/failover/map/abandon", mapAbandonBody{Reason: reason}, nil)
+}

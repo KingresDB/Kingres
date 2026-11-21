@@ -324,3 +324,70 @@ func TestSwitchoverSurvivesACleanStopThatOutlastsTheLease(t *testing.T) {
 		}
 	}
 }
+
+// The planned switchover of the map group (increment 7, round 2, design "the map group with a live old leader"): the leader's own task hands the map
+// group over. The bootstrap of the standby's server starts first and waits for the lease that the clean stop releases and for the proof, the old
+// leader stops cleanly, the new leader (the standby's server) promotes on the proof, and its engine finishes the task that the old leader could
+// not record. Nothing acknowledged is lost, the leader is the standby's server afterwards, and the task ends done.
+func TestSwitchoverOfTheMapGroup(t *testing.T) {
+	c, port, pool := foClusterWith(t, "-lease-duration", "12s", "-lease-renew", "2s", "-lease-margin", "3s")
+	leader := c.Leader()
+	views := topology(t, leader)[0]
+	if len(views) == 0 {
+		t.Fatalf("the map group has no standby: %v", topology(t, leader))
+	}
+	var nw *clustertest.Node
+	for _, n := range c.Nodes {
+		if n.Host == views[0].server {
+			nw = n
+		}
+	}
+	if nw == nil || nw == leader {
+		t.Fatalf("the standby of the map group is on %q", views[0].server)
+	}
+	w := startFoWriters(c.Nodes, port, pool)
+	until(t, time.Minute, "rows acknowledged before the switchover", func() bool { return w.count() > 40 })
+	st, resp := leader.DoThroughRestart("POST", "/servers/"+leader.Host+"/failover", map[string]any{"mode": "graceful", "shardGroupIds": []int{0},
+		"targets": []map[string]any{{"shardGroupId": 0, "serverId": nw.Host}}}, nil)
+	if st != 202 {
+		t.Fatalf("switchover request: %d %v\n%s", st, resp, leader.LogTail(3000))
+	}
+	id := clustertest.TaskID(resp)
+	// The old leader's system database is stopped by the clean stop: the task is read from the new leader.
+	var task map[string]any
+	until(t, 10*time.Minute, "the task to end on the new leader", func() bool {
+		st, body := nw.Do("GET", fmt.Sprintf("/tasks/%v", id), nil, nil)
+		if st != 200 {
+			return false
+		}
+		s, _ := body["state"].(string)
+		if s == "failed" || s == "done" {
+			task = body
+			return true
+		}
+		return false
+	})
+	if task["state"] != "done" {
+		t.Logf("new leader log: %s", nw.LogTail(12000))
+		t.Logf("old leader log: %s", leader.LogTail(8000))
+		t.Fatalf("the task ended %v: %v", task["state"], task["error"])
+	}
+	hosts, _ := primaryOf(t, nw)
+	if hosts[0] != nw.Host {
+		t.Fatalf("the primary of the map group is on %s, want %s", hosts[0], nw.Host)
+	}
+	body := nw.Expect(200, "GET", "/cluster", nil)
+	if ml, _ := body["managerLeader"].(map[string]any); ml == nil || ml["serverId"] != nw.Host {
+		t.Fatalf("the manager leader is %v, want %s", body["managerLeader"], nw.Host)
+	}
+	before := w.count()
+	until(t, 3*time.Minute, "writes after the switchover", func() bool { return w.count() > before+30 })
+	acked := w.Stop()
+	have := foReadIDs(t, nw, port, pool)
+	for rid := range acked {
+		if !have[rid] {
+			t.Errorf("acknowledged row %d is missing when read through %s", rid, nw.Host)
+			break
+		}
+	}
+}

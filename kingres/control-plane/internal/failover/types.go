@@ -431,6 +431,10 @@ type Peers interface {
 	Mark(ctx context.Context, server string, r MarkRequest) (MarkAnswer, error)
 	Verify(ctx context.Context, server string, r VerifyRequest) (VerifyAnswer, error)
 	Resume(ctx context.Context, server string, r ResumeRequest) error
+	// The calls of the planned switchover of the map group (the old leader's task talks to the bootstrap of the candidate).
+	MapStart(ctx context.Context, server string, r MapStartRequest) error
+	MapProof(ctx context.Context, server string, r MapProofRequest) error
+	MapAbandon(ctx context.Context, server, reason string) error
 }
 
 // Node is a row of kingres.node.
@@ -671,3 +675,25 @@ const CountAutomaticSQL = `WITH c AS (UPDATE kingres_cp.failover_run SET counted
 	INSERT INTO kingres_cp.cluster_setting (key, value)
 	SELECT 'autoFailover.eventsSinceReset', to_jsonb(coalesce((SELECT (value #>> '{}')::int FROM kingres_cp.cluster_setting WHERE key = 'autoFailover.eventsSinceReset'), 0) + 1) FROM c
 	ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`
+
+// MapPlanned is what the old leader's task tells the candidate that starts the bootstrap of a planned switchover of the map group: the id of its task and
+// the standby it chose (the same field names as journal.Planned).
+type MapPlanned struct {
+	TaskID    int64 `json:"taskId"`
+	StandbyID int64 `json:"standbyId"`
+}
+
+// MapStartRequest is the body of POST /failover/map/start for a planned switchover (cmd/kingresd mapStartBody).
+type MapStartRequest struct {
+	Server        string      `json:"server"`
+	RequestedBy   string      `json:"requestedBy"`
+	AllowDataLoss bool        `json:"allowDataLoss"`
+	Comment       string      `json:"comment"`
+	Planned       *MapPlanned `json:"planned,omitempty"`
+}
+
+// MapProofRequest is the body of POST /failover/map/proof: how the old leader was left by its clean stop.
+type MapProofRequest struct {
+	Checkpoint   string `json:"checkpoint"`
+	ClusterState string `json:"clusterState"`
+}

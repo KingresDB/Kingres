@@ -65,7 +65,11 @@ type world struct {
 	stopStates         []string
 	stopN              int
 	promoteReqs        []PromoteRequest
-	oldPreparedUnknown bool    // the old primary does not report a count of prepared transactions
+	oldPreparedUnknown bool // the old primary does not report a count of prepared transactions
+	mapGroup           bool // the group of the world is the map group (0), not 1
+	mapStarts          []MapStartRequest
+	mapProofs          []MapProofRequest
+	mapStartErr        error
 	markErr            error   // the answer of the mark call
 	undoTerms          []int64 // the terms of the quiesce, unquiesce and resume calls
 	stopErr            error   // the answer of the clean stop call
@@ -403,7 +407,7 @@ func (c fcat) PromoteNode(_ context.Context, db string, id int32) (PromoteResult
 		nodes := *c.list(db)
 		var oldID int32
 		for k := range nodes {
-			if nodes[k].Group == 1 && nodes[k].Role == "primary" {
+			if nodes[k].Group == c.w.group() && nodes[k].Role == "primary" {
 				oldID = nodes[k].ID
 			}
 		}
@@ -761,4 +765,37 @@ func (p fpeers) Resume(_ context.Context, server string, r ResumeRequest) error 
 	p.w.oldWritable = true
 	p.w.mu.Unlock()
 	return nil
+}
+
+// The calls of the planned switchover of the map group (the fake keeps what it was asked).
+func (p fpeers) MapStart(_ context.Context, server string, r MapStartRequest) error {
+	p.w.mu.Lock()
+	p.w.mapStarts = append(p.w.mapStarts, r)
+	p.w.mu.Unlock()
+	if err := p.unreach(server); err != nil {
+		return err
+	}
+	p.w.rec("map-start %s", server)
+	return p.w.mapStartErr
+}
+
+func (p fpeers) MapProof(_ context.Context, server string, r MapProofRequest) error {
+	p.w.mu.Lock()
+	p.w.mapProofs = append(p.w.mapProofs, r)
+	p.w.mu.Unlock()
+	p.w.rec("map-proof %s", server)
+	return nil
+}
+
+func (p fpeers) MapAbandon(_ context.Context, server, reason string) error {
+	p.w.rec("map-abandon %s", server)
+	return nil
+}
+
+// group is the group that the world's fake catalog moves: 1, or 0 for a world of the map group.
+func (w *world) group() int32 {
+	if w.mapGroup {
+		return 0
+	}
+	return 1
 }

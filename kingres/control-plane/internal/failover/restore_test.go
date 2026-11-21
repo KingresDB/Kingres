@@ -54,7 +54,7 @@ func TestRestoreFindsTheGroupsThatAreNotAtHome(t *testing.T) {
 	}
 }
 
-// A group whose preferred server has no ready standby is skipped with the reason, and so is the map group away from home.
+// A group whose preferred server has no ready standby is skipped with the reason, the map group (away from home) included.
 func TestRestoreSkipsWhatItCannotRestore(t *testing.T) {
 	w := restoreWorld()
 	w.standbys[0].State = "rebuilding"
@@ -65,7 +65,7 @@ func TestRestoreSkipsWhatItCannotRestore(t *testing.T) {
 	for _, sk := range in.Skipped {
 		reasons[sk.Group] = sk.Reason
 	}
-	if len(in.Groups) != 0 || reasons[1] != "preferredNotReady" || reasons[0] != "mapGroup" {
+	if len(in.Groups) != 0 || reasons[1] != "preferredNotReady" || reasons[0] != "preferredNotReady" {
 		t.Fatalf("%+v", in)
 	}
 }
@@ -260,5 +260,25 @@ func TestThePlanOfARestoreListsTheSkippedGroups(t *testing.T) {
 		if g.Skipped == nil || g.Skipped.Reason == "" || g.Skipped.Message == "" || g.ToServerID != nil || len(g.Steps) != 0 || len(g.Candidates) != 0 || !strings.Contains(g.DataLoss.Message, "Skipped (") {
 			t.Errorf("a skipped group: %+v", g)
 		}
+	}
+}
+
+// The map group away from home is restored like any group when its preferred server has a ready standby of it: it is in the input, with the server
+// that runs it now and the preferred one, and the steps put it last.
+func TestRestoreIncludesTheMapGroupAwayFromHome(t *testing.T) {
+	w := restoreWorld()
+	w.nodes[0].Host = "s2" // the map group runs away from its preferred server
+	w.nodes = append(w.nodes, Node{ID: -1, Group: 0, Host: "s1", Port: 5399, Role: "standby"})
+	w.standbys = append(w.standbys, StandbyRec{ID: 12, Group: 0, Server: "s1", InstanceID: 100, Port: 5399, State: "ready", CatalogNode: -1})
+	in := restoreInputOf(t, w)
+	has0 := false
+	for _, g := range in.Groups {
+		has0 = has0 || g == 0
+	}
+	if !has0 || in.Olds[0] != "s2" || in.Targets[0] != "s1" || len(in.Skipped) != 0 {
+		t.Fatalf("%+v", in)
+	}
+	if got := mapLast(in); got[len(got)-1] != 0 {
+		t.Fatalf("the map group is not last: %v", got)
 	}
 }
