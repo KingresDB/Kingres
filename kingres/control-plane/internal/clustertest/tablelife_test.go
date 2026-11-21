@@ -114,7 +114,9 @@ func TestTableLifecycle(t *testing.T) {
 			t.Fatalf("online: %v", got)
 		}
 		names := []string{}
-		for _, s := range got["steps"].([]any) {
+		prog, _ := got["progress"].(map[string]any)
+		steps, _ := prog["steps"].([]any)
+		for _, s := range steps {
 			names = append(names, s.(map[string]any)["name"].(string))
 		}
 		if !strings.Contains(strings.Join(names, "|"), "Copy rows") || !strings.Contains(strings.Join(names, "|"), "Switch") {
