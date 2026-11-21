@@ -336,8 +336,8 @@ None.
 
 #### Documentation
 
-- `failoverServer`, `mode: graceful` and `restorePreferredPrimaries`: a failover, a switchover or a restore that involves the map group while the server that runs its primary answers is
-  refused with 422 `unsupported_operation` in this version (the restore lists the map group as skipped, reason `mapGroup`).
+- `failoverServer`, `mode: graceful`: a planned switchover of the map group is accepted by the leader (that server) and handled as described; a hard failover of a server whose map group primary answers is
+  still refused with 422 `unsupported_operation`. `restorePreferredPrimaries` restores the map group like any group (skipped with `preferredNotReady` when its preferred server has no ready standby of it).
 
 ### 0.14.0
 

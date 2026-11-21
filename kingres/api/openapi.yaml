@@ -1059,7 +1059,7 @@ paths:
         that does not succeed in two minutes ends it with `cannot_quiesce`, and prepared transactions that do not end with
         `prepared_transactions_pending`. The task can be cancelled until the promotion has begun (`Task.cancellable`). Refused with 409
         `group_degraded` when no standby of a group streams from its primary (or the named target does not), and with 422
-        `unsupported_operation` for a request that includes the map group (name the other groups in `shardGroupIds`).
+        `unsupported_operation` for a hard failover of a server whose map group primary answers (see 0.15.0 below).
 
         **0.13.0, the map group.** The failover of the server that runs the primary of the map group (and the manager
         leader) is accepted by any server that does not hear it, in mode `hard` only (`dryRun` and `graceful` answer 422
@@ -1068,6 +1068,13 @@ paths:
         the client polls `GET /failover` (answered by that server) until `taskId` is not null, then `GET /tasks/{id}` on the new
         manager leader. The old leader's rebalance is paused (`stoppedBy` `safetyRule`). The key of the certificate authority is not
         copied to the new leader: the alert `certificateAuthorityUnavailable` says what the operator must do.
+
+        **0.15.0, a planned switchover of the map group.** `mode: graceful` for the server that runs the primary of the map group, sent to the
+        leader (that server) while it answers, is a switchover like any other, with the map group last: the task starts the bootstrap of the chosen
+        standby's server, stops the old leader cleanly and sends it the proof, the standby's server promotes on the proof and becomes the manager
+        leader, and its task engine finishes the task (the task is read from the new leader once the old leader's system database is stopped). The
+        steps of the map group that the old leader could not record are the ones before `Verify the new primary`. A hard failover of a server whose
+        map group primary answers is still 422 `unsupported_operation`.
 
         The task is `server.failover`, one block of steps per group (`TaskStep.shardGroupId`). A task that
         waits for an operator is `paused`; a repeat of this request for the same server resumes it. From the moment
@@ -2035,7 +2042,7 @@ paths:
         **0.13.0, how the restore works.** The task is `replication.restorePreferredPrimaries` (subject `replication` / `preferred-primaries`). The
         preferred server of a group is the server of its first node by id. A group whose primary is not there is handed back by the steps of a
         planned switchover (see `failoverServer`, mode `graceful`), one group at a time, from the server that took it over to the preferred server.
-        A group whose preferred server has no ready standby, and the map group (not supported yet), are left alone and listed in the report as
+        A group whose preferred server has no ready standby, is left alone and listed in the report as
         `skipped` with the reason (`preferredNotReady`, `mapGroup`). A group that fails before its promotion (a standby that is behind, a proof
         that cannot be made) is rolled back and reported `failed`; the task goes on with the next group and ends `partial`. 422 `unprocessable`
         when no group needs to be restored. The report has `kind` `restorePreferredPrimaries`, `mode` `restore` and `serverId` null.
@@ -6760,7 +6767,7 @@ components:
             reason:
               type: string
               enum: [preferredNotReady, mapGroup]
-              description: '`preferredNotReady`: the preferred server has no ready, registered standby of the group. `mapGroup`: the map group while its server is alive is not supported yet.'
+              description: '`preferredNotReady`: the preferred server has no ready, registered standby of the group. `mapGroup`: reserved; the map group is restored like any group since 0.15.0 and is skipped with `preferredNotReady` when its preferred server has no ready standby of it.'
             message: { type: string }
     FailoverCandidate:
       type: object
