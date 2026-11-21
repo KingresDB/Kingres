@@ -298,6 +298,7 @@ tests += {
       't/234_schema_modes_cluster.pl',
       't/235_schema_route_cluster.pl',
       't/236_schema_with_elasticity_cluster.pl',
+      't/237_move_schema_cluster.pl',
     ],
   },
 }

@@ -11541,6 +11541,8 @@ DECLARE
     v_attempts pg_catalog.int4 := 0;
     v_max_attempts pg_catalog.int4;
     v_wait_ms  pg_catalog.int4;
+    v_kind     pg_catalog.text;
+    v_bad      pg_catalog.text;
 BEGIN
     PERFORM kingres.internal_require_superuser();
     PERFORM kingres.internal_require_map_group();
@@ -11587,11 +11589,24 @@ BEGIN
             USING ERRCODE = 'object_in_use',
                   HINT = 'See kingres.bucket_move; a move can be cancelled with kingres.cancel_bucket_move().';
     END IF;
+    -- a group that holds a distributed schema (phase 11) has one bucket, which moves in place: the tables are the tables of the schema, the target
+    -- already has them (empty), nothing is attached or detached
+    SELECT c.kind INTO v_kind FROM kingres.colocation c WHERE c.colocation_id OPERATOR(pg_catalog.=) v_colo;
+    IF v_kind OPERATOR(pg_catalog.=) 'schema' THEN
+        SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('schema_name', t.schema_name, 'table_name', t.table_name) ORDER BY t.ord)
+          INTO v_tables FROM kingres.internal_schema_move_tables(v_colo) t;
+        IF v_tables IS NULL THEN
+            RAISE EXCEPTION 'the schema of colocation group % has no table to move', v_colo
+                USING ERRCODE = 'object_not_in_prerequisite_state',
+                      HINT = 'A schema without a table is not moved by a copy; create its tables first.';
+        END IF;
+    ELSE
     SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('schema_name', t.schema_name, 'table_name', t.table_name) ORDER BY t.ord)
       INTO v_tables FROM kingres.internal_move_tables(v_colo) t;
     IF v_tables IS NULL THEN
         RAISE EXCEPTION 'colocation group % has no distributed table', v_colo
             USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
     END IF;
     SELECT n.host, n.port INTO v_srcrow FROM kingres.node n WHERE n.node_id OPERATOR(pg_catalog.=) v_src;
     SELECT n.host, n.port INTO v_tgtrow FROM kingres.node n WHERE n.node_id OPERATOR(pg_catalog.=) v_tgt;
@@ -11607,12 +11622,27 @@ BEGIN
                   HINT = 'All nodes of a cluster must run the same major version of PostgreSQL.';
     END IF;
 
+    IF v_kind OPERATOR(pg_catalog.=) 'schema' THEN
+        -- the requirements of design 9.2: a key or a full replica identity on every table, no unlogged table; the shells of the target exist and are empty
+        v_bad := kingres.internal_exec_scalar(v_src, pg_catalog.format('SELECT kingres.internal_schema_precheck(%s)', v_colo));
+        IF v_bad IS NOT NULL THEN
+            RAISE EXCEPTION 'the schema of colocation group % cannot be moved: %', v_colo, v_bad
+                USING ERRCODE = 'object_not_in_prerequisite_state';
+        END IF;
+        v_bad := kingres.internal_exec_scalar(v_tgt, pg_catalog.format('SELECT kingres.internal_schema_shells(%s, true)', v_colo));
+        IF v_bad IS NOT NULL THEN
+            RAISE EXCEPTION 'table % of the schema is missing or not empty on the target node %', v_bad, v_tgt
+                USING ERRCODE = 'object_not_in_prerequisite_state',
+                      HINT = 'The tables of a distributed schema exist on every node; the shells are empty. See kingres.check_cluster().';
+        END IF;
+    ELSE
     v_info := (kingres.internal_exec_scalar(v_src, pg_catalog.format(
                   'SELECT kingres.internal_move_inspect(''source'', %s, %s, %L::pg_catalog.jsonb)::pg_catalog.text',
                   v_bucket, v_modulus, v_tables::pg_catalog.text)))::pg_catalog.jsonb;
     PERFORM kingres.internal_exec_scalar(v_tgt, pg_catalog.format(
                   'SELECT kingres.internal_move_inspect(''target'', %s, %s, %L::pg_catalog.jsonb)::pg_catalog.text',
                   v_bucket, v_modulus, v_tables::pg_catalog.text));
+    END IF;
     PERFORM kingres.internal_fault_point('move_after_precheck');
 
     -- 1. Preparing: the cluster lock, the record, the state "moving" on every node.
@@ -11631,11 +11661,16 @@ BEGIN
         -- 2. Copying.
         PERFORM kingres.internal_exec_scalar(v_self, pg_catalog.format(
             'SELECT kingres.internal_move_set(%s, ''copying'', ''creating the tables on the target'')', v_id));
-        PERFORM kingres.internal_exec_scalar(v_tgt, pg_catalog.format(
-            'SELECT kingres.internal_create_move_tables(%s, %s, %s, %L::pg_catalog.jsonb)', v_id, v_bucket, v_modulus, v_info::pg_catalog.text));
+        IF v_kind OPERATOR(pg_catalog.<>) 'schema' THEN
+            PERFORM kingres.internal_exec_scalar(v_tgt, pg_catalog.format(
+                'SELECT kingres.internal_create_move_tables(%s, %s, %s, %L::pg_catalog.jsonb)', v_id, v_bucket, v_modulus, v_info::pg_catalog.text));
+        END IF;
         PERFORM kingres.internal_fault_point('move_after_target_tables');
         PERFORM kingres.internal_exec_scalar(v_src, pg_catalog.format(
-            'SELECT kingres.internal_create_move_publication(%s, %s, %L::pg_catalog.jsonb)', v_id, v_bucket, v_tables::pg_catalog.text));
+            CASE WHEN v_kind OPERATOR(pg_catalog.=) 'schema'
+                 THEN 'SELECT kingres.internal_create_schema_move_publication(%s, %s, %L::pg_catalog.jsonb)'
+                 ELSE 'SELECT kingres.internal_create_move_publication(%s, %s, %L::pg_catalog.jsonb)' END,
+            v_id, v_bucket, v_tables::pg_catalog.text));
         PERFORM kingres.internal_fault_point('move_after_publication');
         -- The slot waits for the transactions that are running on the source
         -- (they may be long): its wait is bounded by a multiple of node_timeout.
@@ -14388,6 +14423,308 @@ $$;
 
 -- =========================================================================
 -- PHASE 11, increment 3                                                      [end]
+-- =========================================================================
+
+
+-- =========================================================================
+-- PHASE 11 (distributed schemas), increment 5: move_schema   [begin]
+--
+-- A distributed schema moves like a bucket (design/shard-phase11.md section 9): the same record (kingres.bucket_move with bucket 0), the same phases, the same
+-- replication and the same switch (src/bucket_move.c), except that the tables stay where they are: the target has them, empty, and the copy fills them; the
+-- switch changes the owner in the catalog and the sequences go over; the old copy is emptied (cleaning) instead of the orphan tables being dropped.
+-- move_bucket() is the one function that runs it; move_schema() is the name of the design.
+-- =========================================================================
+
+-- The tables that the replication of the schema carries: the tables that hold rows (a partitioned table holds none; its partitions are the tables).
+CREATE FUNCTION kingres.internal_schema_move_tables(p_colocation int)
+    RETURNS TABLE (ord int, schema_name text, table_name text)
+    LANGUAGE sql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+SELECT (pg_catalog.row_number() OVER (ORDER BY ns.nspname, c.relname))::pg_catalog.int4, ns.nspname::pg_catalog.text, c.relname::pg_catalog.text
+  FROM kingres.dist_table d
+  JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) d.relid::pg_catalog.oid
+  JOIN pg_catalog.pg_namespace ns ON ns.oid OPERATOR(pg_catalog.=) c.relnamespace
+ WHERE d.colocation_id OPERATOR(pg_catalog.=) p_colocation AND d.method OPERATOR(pg_catalog.=) 'schema' AND c.relkind OPERATOR(pg_catalog.=) 'r';
+$$;
+
+-- The sequences of the schema that have been used, with their last value (read on the source under the lock of the switch).
+CREATE FUNCTION kingres.internal_schema_sequence_state(p_colocation int)
+    RETURNS TABLE (seq text, last_value bigint)
+    LANGUAGE sql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+SELECT q.seq, q.lv FROM (SELECT pg_catalog.format('%I.%I', ns.nspname, c.relname) AS seq, pg_catalog.pg_sequence_last_value(c.oid::pg_catalog.regclass) AS lv
+  FROM kingres.dist_schema s
+  JOIN pg_catalog.pg_namespace ns ON ns.oid OPERATOR(pg_catalog.=) s.nsp::pg_catalog.oid
+  JOIN pg_catalog.pg_class c ON c.relnamespace OPERATOR(pg_catalog.=) ns.oid AND c.relkind OPERATOR(pg_catalog.=) 'S'
+ WHERE s.colocation_id OPERATOR(pg_catalog.=) p_colocation) q
+ WHERE q.lv IS NOT NULL;
+$$;
+
+-- On the source: what keeps the schema from being copied by the replication, or NULL.  A table needs a key or a full replica identity (the
+-- replication cannot apply an update or a delete otherwise); an unlogged table is not replicated.
+CREATE FUNCTION kingres.internal_schema_precheck(p_colocation int)
+    RETURNS text
+    LANGUAGE sql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+SELECT CASE
+         WHEN c.relpersistence OPERATOR(pg_catalog.<>) 'p' THEN pg_catalog.format('table %s is not logged: it is not replicated', c.oid::pg_catalog.regclass)
+         WHEN c.relreplident OPERATOR(pg_catalog.=) 'n' OR (c.relreplident OPERATOR(pg_catalog.=) 'd'
+              AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_index i WHERE i.indrelid OPERATOR(pg_catalog.=) c.oid AND i.indisprimary))
+              THEN pg_catalog.format('table %s has no primary key and no full replica identity', c.oid::pg_catalog.regclass)
+       END
+  FROM kingres.dist_table d
+  JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) d.relid::pg_catalog.oid
+ WHERE d.colocation_id OPERATOR(pg_catalog.=) p_colocation AND d.method OPERATOR(pg_catalog.=) 'schema' AND c.relkind OPERATOR(pg_catalog.=) 'r'
+   AND (c.relpersistence OPERATOR(pg_catalog.<>) 'p' OR c.relreplident OPERATOR(pg_catalog.=) 'n'
+        OR (c.relreplident OPERATOR(pg_catalog.=) 'd'
+            AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_index i WHERE i.indrelid OPERATOR(pg_catalog.=) c.oid AND i.indisprimary)))
+ ORDER BY c.oid
+ LIMIT 1;
+$$;
+
+-- On a node: the shells of the schema.  p_empty true: the name of the first table that has a row (or NULL when every table is empty);
+-- false: every table of the schema is emptied (TRUNCATE, the routing off: the extension's own statement), and the tables are returned.
+CREATE FUNCTION kingres.internal_schema_shells(p_colocation int, p_empty bool)
+    RETURNS text
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    r      pg_catalog.record;
+    v_has  pg_catalog.bool;
+    v_rels pg_catalog.text;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    PERFORM pg_catalog.set_config('kingres_shard.enable_routing', 'off', true);
+    IF p_empty THEN
+        FOR r IN SELECT pg_catalog.format('%I.%I', t.schema_name, t.table_name) AS q FROM kingres.internal_schema_move_tables(p_colocation) t ORDER BY t.ord LOOP
+            EXECUTE pg_catalog.format('SELECT EXISTS (SELECT 1 FROM %s)', r.q) INTO v_has;
+            IF v_has THEN
+                RETURN r.q;
+            END IF;
+        END LOOP;
+        RETURN NULL;
+    END IF;
+    PERFORM pg_catalog.set_config('lock_timeout', '5s', true);
+    SELECT pg_catalog.string_agg(pg_catalog.format('%I.%I', t.schema_name, t.table_name), ', ' ORDER BY t.ord) INTO v_rels
+      FROM kingres.internal_schema_move_tables(p_colocation) t;
+    IF v_rels IS NOT NULL THEN
+        EXECUTE 'TRUNCATE ' OPERATOR(pg_catalog.||) v_rels;
+    END IF;
+    RETURN v_rels;
+END;
+$$;
+
+-- On the source: the publication of the schema's tables (the tables that hold rows, by name) and the marker table.
+CREATE FUNCTION kingres.internal_create_schema_move_publication(p_move bigint, p_bucket int, p_tables jsonb)
+    RETURNS void
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_name pg_catalog.text := pg_catalog.format('ks_move_%s', p_move);
+    v_list pg_catalog.text;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    SELECT pg_catalog.string_agg(pg_catalog.format('%I.%I', x.schema_name, x.table_name), ', ') INTO v_list
+      FROM pg_catalog.jsonb_to_recordset(p_tables) AS x(schema_name text, table_name text);
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_publication p WHERE p.pubname OPERATOR(pg_catalog.=) v_name) THEN
+        EXECUTE pg_catalog.format('DROP PUBLICATION %I', v_name);
+    END IF;
+    EXECUTE pg_catalog.format('CREATE PUBLICATION %I FOR TABLE %s, kingres.move_marker WHERE (move_id = %s) '
+                              'WITH (publish = ''insert, update, delete, truncate'', publish_via_partition_root = false)',
+                              v_name, v_list, p_move);
+END;
+$$;
+
+-- The undo and the cleaning of a move know the two kinds of group (the copies of the 0.7 functions with a part for a schema).
+CREATE OR REPLACE FUNCTION kingres.internal_undo_move(p_move bigint, p_reason text, p_final text, p_owner bool)
+    RETURNS text
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    m        kingres.bucket_move%ROWTYPE;
+    v_src    pg_catalog.int4;
+    v_tgt    pg_catalog.int4;
+    v_tables pg_catalog.jsonb;
+    v_owner  pg_catalog.text;
+    v_group  pg_catalog.int4;
+    v_state  pg_catalog.text;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    PERFORM kingres.internal_require_map_group();
+    IF p_final NOT IN ('failed', 'cancelled') THEN
+        RAISE EXCEPTION 'invalid final phase "%"', p_final USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF NOT p_owner AND kingres.internal_move_alive(p_move) THEN
+        RETURN 'skipped';
+    END IF;
+    SELECT * INTO m FROM kingres.bucket_move b WHERE b.move_id OPERATOR(pg_catalog.=) p_move FOR UPDATE SKIP LOCKED;
+    IF NOT FOUND THEN
+        RETURN 'skipped';
+    END IF;
+    IF m.phase NOT IN ('preparing', 'copying', 'catching_up', 'switching') THEN
+        RETURN m.phase;
+    END IF;
+
+    -- A switch that committed is not undone.
+    SELECT b.group_id, b.state INTO v_group, v_state FROM kingres.bucket_map b
+     WHERE b.colocation_id OPERATOR(pg_catalog.=) m.colocation_id AND b.bucket OPERATOR(pg_catalog.=) m.bucket;
+    IF m.phase OPERATOR(pg_catalog.=) 'switching' AND v_group OPERATOR(pg_catalog.=) m.target_group AND v_state OPERATOR(pg_catalog.=) 'active' THEN
+        UPDATE kingres.bucket_move b SET phase = 'cleaning', detail = NULL, updated_at = pg_catalog.clock_timestamp(),
+               cleanup_after = pg_catalog.clock_timestamp() OPERATOR(pg_catalog.+) pg_catalog.make_interval(secs => 0)
+         WHERE b.move_id OPERATOR(pg_catalog.=) p_move;
+        RETURN 'switched';
+    END IF;
+
+    v_src := kingres.internal_group_node(m.source_group);
+    v_tgt := kingres.internal_group_node(m.target_group);
+    IF v_src IS NULL OR v_tgt IS NULL THEN
+        RAISE EXCEPTION 'shard group % or % has no active primary: cannot undo move %', m.source_group, m.target_group, p_move
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('schema_name', t.schema_name, 'table_name', t.table_name) ORDER BY t.ord)
+      INTO v_tables FROM kingres.internal_move_tables(m.colocation_id) t;
+
+    -- A prepared transaction of a switch that did not commit still holds the
+    -- locks of the tables; its resolution (kingres.recover_prepared_transactions(),
+    -- which the callers run first, in a session of its own) comes before the undo.
+
+    PERFORM kingres.internal_drop_move_subscription(v_tgt, pg_catalog.format('ks_move_%s', p_move));
+    PERFORM kingres.internal_fault_point('move_undo_after_subscription');
+    PERFORM kingres.internal_drop_move_replication(p_move, v_src, v_tgt);
+    IF v_tables IS NOT NULL THEN
+        PERFORM kingres.internal_node_exec(v_tgt, pg_catalog.format(
+            'SELECT kingres.internal_drop_move_tables(%s, %s, %L::pg_catalog.jsonb)', p_move, m.bucket, v_tables::pg_catalog.text), 120000);
+    END IF;
+    -- the shells of the target of a schema move hold what the copy had brought: empty them again (the move did not switch, so the owner is the source)
+    IF EXISTS (SELECT 1 FROM kingres.colocation c WHERE c.colocation_id OPERATOR(pg_catalog.=) m.colocation_id AND c.kind OPERATOR(pg_catalog.=) 'schema') THEN
+        PERFORM kingres.internal_node_exec(v_tgt, pg_catalog.format('SELECT kingres.internal_schema_shells(%s, false)', m.colocation_id), 120000);
+    END IF;
+    PERFORM kingres.internal_fault_point('move_undo_after_tables');
+
+    -- The cluster lock, only for the catalog change.
+    LOCK TABLE kingres.map_version IN EXCLUSIVE MODE;
+    UPDATE kingres.bucket_map b SET state = 'active'
+     WHERE b.colocation_id OPERATOR(pg_catalog.=) m.colocation_id AND b.bucket OPERATOR(pg_catalog.=) m.bucket
+       AND b.group_id OPERATOR(pg_catalog.=) m.source_group AND b.state OPERATOR(pg_catalog.=) 'moving';
+    UPDATE kingres.bucket_move b
+       SET phase = p_final, detail = p_reason, replication_dropped = true,
+           updated_at = pg_catalog.clock_timestamp(), finished_at = pg_catalog.clock_timestamp()
+     WHERE b.move_id OPERATOR(pg_catalog.=) p_move;
+    PERFORM kingres.sync_catalog();
+    RETURN 'undone';
+END;
+$$;
+
+
+CREATE OR REPLACE FUNCTION kingres.internal_continue_cleaning(p_move bigint, p_owner bool, p_force bool)
+    RETURNS text
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    m       kingres.bucket_move%ROWTYPE;
+    v_src   pg_catalog.int4;
+    v_tgt   pg_catalog.int4;
+    v_sql   pg_catalog.text;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    PERFORM kingres.internal_require_map_group();
+    IF NOT p_owner AND kingres.internal_move_alive(p_move) THEN
+        RETURN 'skipped';
+    END IF;
+    SELECT * INTO m FROM kingres.bucket_move b WHERE b.move_id OPERATOR(pg_catalog.=) p_move FOR UPDATE SKIP LOCKED;
+    IF NOT FOUND THEN
+        RETURN 'skipped';
+    END IF;
+    IF m.phase OPERATOR(pg_catalog.<>) 'cleaning' THEN
+        RETURN m.phase;
+    END IF;
+    v_src := kingres.internal_group_node(m.source_group);
+    v_tgt := kingres.internal_group_node(m.target_group);
+    IF v_src IS NULL OR v_tgt IS NULL THEN
+        RETURN 'waiting';
+    END IF;
+
+    IF NOT m.replication_dropped THEN
+        PERFORM kingres.internal_drop_move_replication(p_move, v_src, v_tgt);
+        UPDATE kingres.bucket_move b SET replication_dropped = true, updated_at = pg_catalog.clock_timestamp()
+         WHERE b.move_id OPERATOR(pg_catalog.=) p_move;
+    END IF;
+
+    IF NOT p_force AND pg_catalog.clock_timestamp() OPERATOR(pg_catalog.<) m.cleanup_after THEN
+        RETURN 'waiting';
+    END IF;
+
+    -- No transaction of this node may still be prepared on the source or the target:
+    -- a participant of the switch that is not committed has not detached (or
+    -- attached) yet, and the orphan tables do not exist before it has.
+    v_sql := pg_catalog.format('SELECT pg_catalog.count(*) FROM pg_catalog.pg_prepared_xacts WHERE gid LIKE %L',
+                               'kingres\_' OPERATOR(pg_catalog.||) (SELECT l.node_id::pg_catalog.text FROM kingres.local_node l) OPERATOR(pg_catalog.||) '\_%');
+    IF kingres.internal_exec_scalar(v_src, v_sql, 20000) IS DISTINCT FROM '0'
+       OR kingres.internal_exec_scalar(v_tgt, v_sql, 20000) IS DISTINCT FROM '0' THEN
+        RETURN 'waiting';
+    END IF;
+
+    BEGIN
+        IF EXISTS (SELECT 1 FROM kingres.colocation c WHERE c.colocation_id OPERATOR(pg_catalog.=) m.colocation_id AND c.kind OPERATOR(pg_catalog.=) 'schema') THEN
+            -- the old copy of a distributed schema: its tables on the source, emptied (bounded lock wait)
+            PERFORM kingres.internal_node_exec(v_src, pg_catalog.format('SELECT kingres.internal_schema_shells(%s, false)', m.colocation_id), 60000);
+        ELSE
+            PERFORM kingres.internal_node_exec(v_src, pg_catalog.format('SELECT kingres.internal_drop_orphans(%s)', p_move), 60000);
+        END IF;
+    EXCEPTION WHEN lock_not_available OR query_canceled THEN
+        UPDATE kingres.bucket_move b SET detail = 'waiting for readers of the old partitions to finish', updated_at = pg_catalog.clock_timestamp()
+         WHERE b.move_id OPERATOR(pg_catalog.=) p_move;
+        RETURN 'waiting';
+    END;
+    PERFORM kingres.internal_fault_point('move_cleanup_after_orphans');
+    UPDATE kingres.bucket_move b
+       SET phase = 'done', detail = NULL, updated_at = pg_catalog.clock_timestamp(), finished_at = pg_catalog.clock_timestamp()
+     WHERE b.move_id OPERATOR(pg_catalog.=) p_move;
+    RETURN 'done';
+END;
+$$;
+
+
+-- The name of the design: the schema moves to a shard group, as a bucket does.  Returns the id of its row in kingres.bucket_move.
+CREATE FUNCTION kingres.move_schema(nsp regnamespace, target_group int)
+    RETURNS bigint
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_colo pg_catalog.int4;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    SELECT s.colocation_id INTO v_colo FROM kingres.dist_schema s WHERE s.nsp OPERATOR(pg_catalog.=) move_schema.nsp;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'schema % is not a distributed schema', nsp::pg_catalog.oid
+            USING ERRCODE = 'undefined_object';
+    END IF;
+    RETURN kingres.move_bucket(v_colo, 0, target_group);
+END;
+$$;
+
+COMMENT ON FUNCTION kingres.move_schema(regnamespace, int) IS
+    'Move a distributed schema to another shard group with logical replication, in place; returns the id of its row in kingres.bucket_move (map group primary, superuser)';
+
+REVOKE ALL ON FUNCTION
+    kingres.internal_schema_move_tables(int),
+    kingres.internal_schema_sequence_state(int),
+    kingres.internal_schema_precheck(int),
+    kingres.internal_schema_shells(int, bool),
+    kingres.internal_create_schema_move_publication(bigint, int, jsonb),
+    kingres.move_schema(regnamespace, int)
+    FROM PUBLIC;
+
+-- =========================================================================
+-- PHASE 11, increment 5                                                      [end]
 -- =========================================================================
 
 -- ===========================================================================

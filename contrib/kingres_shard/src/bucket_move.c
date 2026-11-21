@@ -1237,6 +1237,7 @@ kingres_internal_switch_bucket(PG_FUNCTION_ARGS)
 	int			source_group;
 	int			target_group;
 	int			bucket_count;
+	bool		is_schema = false;	/* the group holds a distributed schema (phase 11): tables in place, no partitions */
 	char	   *phase;
 	List	   *tables = NIL;
 	const KsNode *src;
@@ -1301,11 +1302,12 @@ kingres_internal_switch_bucket(PG_FUNCTION_ARGS)
 
 	argtypes[0] = INT4OID;
 	values[0] = Int32GetDatum(colocation_id);
-	if (SPI_execute_with_args("SELECT bucket_count FROM " KINGRES_SHARD_SCHEMA ".colocation "
+	if (SPI_execute_with_args("SELECT bucket_count, kind FROM " KINGRES_SHARD_SCHEMA ".colocation "
 							  "WHERE colocation_id OPERATOR(pg_catalog.=) $1",
 							  1, argtypes, values, NULL, true, 0) != SPI_OK_SELECT || SPI_processed != 1)
 		elog(ERROR, "colocation group %d does not exist", colocation_id);
 	bucket_count = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+	is_schema = (strcmp(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2), "schema") == 0);
 	/* the modulus of the bucket: the bucket count today, a modulus of its own when buckets can be split */
 	{
 		const KsColocation *co = kingres_shard_lookup_colocation(colocation_id);
@@ -1314,7 +1316,9 @@ kingres_internal_switch_bucket(PG_FUNCTION_ARGS)
 			bucket_count = kingres_shard_bucket_modulus(co, bucket);
 	}
 
-	if (SPI_execute_with_args("SELECT schema_name, table_name FROM " KINGRES_SHARD_SCHEMA ".internal_move_tables($1) ORDER BY ord",
+	if (SPI_execute_with_args(is_schema ?
+							  "SELECT schema_name, table_name FROM " KINGRES_SHARD_SCHEMA ".internal_schema_move_tables($1) ORDER BY ord" :
+							  "SELECT schema_name, table_name FROM " KINGRES_SHARD_SCHEMA ".internal_move_tables($1) ORDER BY ord",
 							  1, argtypes, values, NULL, true, 0) != SPI_OK_SELECT || SPI_processed == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -1371,7 +1375,7 @@ kingres_internal_switch_bucket(PG_FUNCTION_ARGS)
 	 */
 	T = part_begin("target", tgthost, tgtport, tgt_local, deadline, lock_ms);
 	S = part_begin("source", srchost, srcport, src_local, deadline, lock_ms);
-	refuse_long_holders(&S, tables, true, "ACCESS EXCLUSIVE", LOCK_MODES_ALL, lock_ms);
+	refuse_long_holders(&S, tables, !is_schema, is_schema ? "SHARE" : "ACCESS EXCLUSIVE", is_schema ? LOCK_MODES_AGAINST_SHARE : LOCK_MODES_ALL, lock_ms);
 	refuse_long_holders(&T, tables, false, "SHARE ROW EXCLUSIVE", LOCK_MODES_AGAINST_SHARE_ROW_EXCLUSIVE, lock_ms);
 
 	/*
@@ -1398,7 +1402,7 @@ kingres_internal_switch_bucket(PG_FUNCTION_ARGS)
 	 * write is running when the marker below is committed, and none can start
 	 * before the commit of the switch (review finding S4-03).
 	 */
-	try_lock_phase(&S, tables, true, "SHARE", LOCK_MODES_AGAINST_SHARE, lock_ms);
+	try_lock_phase(&S, tables, !is_schema, "SHARE", LOCK_MODES_AGAINST_SHARE, lock_ms);
 	kingres_shard_fault_point("move_switch_after_lock");
 
 	/*
@@ -1441,7 +1445,27 @@ kingres_internal_switch_bucket(PG_FUNCTION_ARGS)
 	 * is caught by the map version rule instead of by a lock (dist_scan.c: every
 	 * fragment compares the version of its node with its origin's after it holds
 	 * its locks).
-	 */	foreach(lc, tables)
+	 */
+	if (is_schema)
+	{
+		/*
+		 * A distributed schema moves in place: nothing is attached or detached (the target has the tables, empty, and the
+		 * copy filled them).  The state of the sequences of the schema is not replicated: it is read on the source under the
+		 * lock, so that no write to a table of the schema is running, and set on the target in this transaction, so that the
+		 * first nextval of the new owner is greater than anything the old one handed out (design/shard-phase11.md 7.5, 9.4).
+		 */
+		/* the target is still a shell for the catalog: the statements of this step are the extension's own, not routed */
+		part_exec(&T, "SET LOCAL kingres_shard.enable_routing = off");
+		sql = psprintf("SELECT pg_catalog.format('SELECT pg_catalog.setval(%%L, %%s, true)', q.seq, q.last_value) "
+					   "FROM " KINGRES_SHARD_SCHEMA ".internal_schema_sequence_state(%d) q", colocation_id);
+		res = ctl_must(srchost, srcport, sql, remaining_ms(deadline));
+		for (i = 0; i < (uint64) PQntuples(res); i++)
+			part_exec(&T, PQgetvalue(res, (int) i, 0));
+		PQclear(res);
+		kingres_shard_fault_point("move_switch_after_attach");
+	}
+	else
+	foreach(lc, tables)
 	{
 		MoveTable  *t = (MoveTable *) lfirst(lc);
 
@@ -1449,7 +1473,8 @@ kingres_internal_switch_bucket(PG_FUNCTION_ARGS)
 					   quote_literal_cstr(t->qualified), bucket, bucket_count);
 		part_exec(&T, sql);
 	}
-	kingres_shard_fault_point("move_switch_after_attach");
+	if (!is_schema)
+		kingres_shard_fault_point("move_switch_after_attach");
 
 	/*
 	 * 5. The source: detach, the referencing tables first.  The detach needs the
@@ -1459,8 +1484,9 @@ kingres_internal_switch_bucket(PG_FUNCTION_ARGS)
 	 * are tried for here, without queueing, while only the writers wait (they have
 	 * since the SHARE lock), and the DETACH then finds them held.
 	 */
-	try_lock_phase(&S, tables, true, "ACCESS EXCLUSIVE", LOCK_MODES_ALL, lock_ms);
-	ord = list_length(tables);
+	if (!is_schema)
+		try_lock_phase(&S, tables, true, "ACCESS EXCLUSIVE", LOCK_MODES_ALL, lock_ms);
+	ord = is_schema ? 0 : list_length(tables);
 	for (i = ord; i > 0; i--)
 	{
 		MoveTable  *t = (MoveTable *) list_nth(tables, i - 1);
@@ -1469,7 +1495,8 @@ kingres_internal_switch_bucket(PG_FUNCTION_ARGS)
 					   quote_literal_cstr(t->qualified), bucket, move_id, (int) i);
 		part_exec(&S, sql);
 	}
-	kingres_shard_fault_point("move_switch_after_detach");
+	if (!is_schema)
+		kingres_shard_fault_point("move_switch_after_detach");
 
 	/* 6. The map, on this node and, through the synchronization, on every other. */
 	if (SPI_connect() != SPI_OK_CONNECT)

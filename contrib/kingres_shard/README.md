@@ -1945,6 +1945,16 @@ and `dist_table` are made by hand with the delta functions, as the tests do.
   distributed scan and a write to a schema of another group is refused.  The tests compare the answers of the two paths (ADR 0022).
 - A scrollable cursor, and everything that path S does not take, is answered by the scan; the reads that mix schemas of two owners, local tables, hash tables or
   reference tables that are written are read through the scan, one fragment per schema.
+**Increment 5: `kingres.move_schema(nsp, target_group)`** (superuser, map group primary; `move_bucket(colocation_id, 0, target)` of the schema group is the same move).  A distributed
+schema moves like a bucket: the same record (`kingres.bucket_move`), phases, replication and switch, except that the tables stay where they are.  The target
+has the tables, empty (the move checks that, and that every table has a primary key or a full replica identity and is logged); a publication of the tables that
+hold rows and the marker table, a subscription that copies into the existing tables, the catch-up, then the switch: the tables are locked in SHARE on the source (writers wait, readers go on,
+bounded attempts), a marker proves the copy complete, the state of the sequences is read on the source and set on the target in the switch's transaction, and the owner
+and the placement epoch change in the two-phase transaction.  Nothing is attached or detached.  A writer that meets the switch gets `KS001` and repeats.  The old copy is emptied by
+the cleaning phase after `move_cleanup_delay` (`cleanup_moved_buckets(true)` at once).  A move that fails before the switch is undone (the shells of the target are emptied
+again), resume and cancel work as for a bucket.  A schema without a table is not moved by a copy.  A plan of buckets (`plan_rebalance`, `rebalance_plan`) does not move a schema
+yet; the bucket of a schema counts in the load of its group.
+
 
 ## Limitations in phase 2a
 
