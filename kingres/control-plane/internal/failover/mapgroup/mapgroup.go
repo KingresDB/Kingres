@@ -55,6 +55,9 @@ type Ports interface {
 	// RecordTask inserts the task of the failover into the (now writable) system database, steps up to F7 done, and writes the
 	// report rows from the journal. It is idempotent for one journal id and returns the id of the task.
 	RecordTask(ctx context.Context, j journal.Journal) (int64, error)
+	// RecordPlanned marks the group 0 row of the old leader's task (a planned switchover) promoted, with the term and the timeline of the promotion, in the system
+	// database that this server promoted: the steps that the new leader's engine runs again read the term from it. It is idempotent.
+	RecordPlanned(ctx context.Context, taskID, termAfter, timeline int64) error
 	// CheckAuthority says whether this server holds the key of the certificate authority (pki/ca.key). The leader holds it and no other
 	// server does: the new leader of a map group failover has none unless an operator put it there (design 3.4, 11.2).
 	CheckAuthority(ctx context.Context) (bool, error)
@@ -679,8 +682,24 @@ func (r *Runner) makeLeader(ctx context.Context, j journal.Journal) (bool, error
 	if !cur.Recorded {
 		id := int64(0)
 		if cur.Planned != nil {
-			// The task is the old leader's: its row was replicated to this server before the stop and the engine claims it once the gate is open.
+			// The task is the old leader's: its row was replicated to this server before the stop and the engine claims it once the gate is open. Its group 0 row
+			// says promoted, with the new term, so that the steps the engine runs again use the term that now holds.
 			id = cur.Planned.TaskID
+			term, _, terr := r.P.CatalogTerm(ctx)
+			if terr != nil {
+				return false, fmt.Errorf("reading the catalog term: %w", terr)
+			}
+			var timeline int64
+			for _, e := range cur.Events {
+				if e.Kind == "promoted" {
+					if tl, ok := e.Detail["timeline"].(float64); ok {
+						timeline = int64(tl)
+					}
+				}
+			}
+			if err := r.P.RecordPlanned(ctx, id, term, timeline); err != nil {
+				return false, fmt.Errorf("marking the map group of the task promoted: %w", err)
+			}
 		} else {
 			var err error
 			if id, err = r.P.RecordTask(ctx, cur); err != nil {

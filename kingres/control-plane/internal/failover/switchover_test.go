@@ -673,7 +673,7 @@ func TestTheNewLeaderRunsAgainWhatTheOldLeaderCouldNotRecord(t *testing.T) {
 	}
 	// The new leader's engine: every step of the map group that is not recorded runs again, the stop first.
 	for _, s := range steps {
-		if s.Name != StepName(0, StepStopClean) && s.Name != StepName(0, StepVerify) && s.Name != StepName(0, StepLease) {
+		if s.Name != StepName(0, StepStopClean) && s.Name != StepName(0, StepVerify) && s.Name != StepName(0, StepLease) && s.Name != StepName(0, StepHandOver) && s.Name != StepName(0, StepPromote) {
 			continue
 		}
 		env := &task.Env{Task: task.Task{ID: 1, Input: raw}}

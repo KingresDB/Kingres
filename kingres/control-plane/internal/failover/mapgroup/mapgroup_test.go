@@ -587,6 +587,9 @@ func TestAPlannedSwitchoverOfTheMapGroupWaitsForTheProofAndRecordsNoTask(t *test
 	if len(w.promoteReqs) != 1 || w.promoteReqs[0].Checkpoint != "0/6000028" || w.promoteReqs[0].ClusterState != "shut down" || w.promoteReqs[0].StandbyID != 10 {
 		t.Fatalf("the promotion did not carry the proof: %+v", w.promoteReqs)
 	}
+	if w.count("record-planned 77") != 1 {
+		t.Fatalf("the group 0 row of the leader's task was not marked promoted:\n%s", strings.Join(w.log, "\n"))
+	}
 	if w.count("record-task") != 0 {
 		t.Fatalf("a task was recorded for a planned switchover:\n%s", strings.Join(w.log, "\n"))
 	}
@@ -640,4 +643,9 @@ func TestAPlannedRequestNeedsALiveOldServer(t *testing.T) {
 	if !errors.As(err, &ref) || ref.Code != "conflict" || js.Active() {
 		t.Fatalf("a planned request for a dead server: %v", err)
 	}
+}
+
+func (p ports) RecordPlanned(_ context.Context, taskID, termAfter, timeline int64) error {
+	p.w.rec("record-planned %d term=%d timeline=%d", taskID, termAfter, timeline)
+	return nil
 }

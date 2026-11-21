@@ -773,3 +773,17 @@ func handleMapProof(_ context.Context, d *haDeps, caller string, body []byte) (a
 	}
 	return struct{}{}, nil
 }
+
+// RecordPlanned marks the group 0 row of the old leader's task promoted, with the term after the promotion and the timeline, in the system database that
+// this server promoted. The steps of the map group that the new leader's engine runs again read the term from the row (runRowOf).
+func (p *mapPorts) RecordPlanned(ctx context.Context, taskID, termAfter, timeline int64) error {
+	c, err := p.m.sysConn(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	_, err = c.Exec(ctx, `UPDATE kingres_cp.failover_group
+		SET state = 'promoted', term_after = $2, timeline = CASE WHEN $3 > 0 THEN $3 ELSE timeline END, promoted_at = COALESCE(promoted_at, now())
+		WHERE task_id = $1 AND group_id = 0 AND state IN ('pending', 'frozen', 'fenced', 'pinned', 'promoted')`, taskID, termAfter, timeline)
+	return err
+}

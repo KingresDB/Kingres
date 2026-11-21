@@ -330,6 +330,13 @@ func runRowOf(ctx context.Context, rows Rows, in Input, group int32) (RunRow, er
 			run.ExpectedTerm = *gr.TermAfter
 		}
 	}
+	// The map group of a planned switchover is promoted by the bootstrap of the candidate, which raised the term; the new leader's engine runs the steps
+	// that were not recorded with the term its row says (RecordPlanned).
+	if group == 0 && in.graceful() {
+		if gr, found, gerr := rows.Group(ctx, 0); gerr == nil && found && gr.TermAfter != nil && *gr.TermAfter > run.ExpectedTerm {
+			run.ExpectedTerm = *gr.TermAfter
+		}
+	}
 	return run, nil
 }
 
@@ -1057,6 +1064,9 @@ func (r *Runner) handOver(ctx context.Context, env *task.Env, sc *stepCtx) error
 	if err != nil {
 		return err
 	}
+	if sc.mapHandedOver(ctx, nw) {
+		return task.Skip("the map group was handed over already")
+	}
 	// A repeated run: the new server holds the lease already, or has been promoted.
 	if st, err := r.Peers.State(ctx, nw.Server, sc.group); err == nil && st.Holds && st.Adopted != "" {
 		return task.Skip("the new server holds the lease already")
@@ -1125,6 +1135,11 @@ func (r *Runner) promote(ctx context.Context, env *task.Env, sc *stepCtx) error 
 	nw, _, err := sc.pinnedStandby(ctx)
 	if err != nil {
 		return err
+	}
+	if sc.mapHandedOver(ctx, nw) {
+		// The bootstrap of the candidate promoted it (the proof and the lease were its own); what this step records is already in the row.
+		sc.event(ctx, "promoted", map[string]any{"status": "handedOver"})
+		return task.Skip("the map group was promoted by the bootstrap of the new leader")
 	}
 	req := PromoteRequest{Group: sc.group, StandbyID: nw.ID, InstanceID: nw.InstanceID, ExpectedTerm: run.ExpectedTerm}
 	if sc.in.graceful() {
