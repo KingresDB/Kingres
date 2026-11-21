@@ -979,6 +979,10 @@ func handleFailoverPromote(ctx context.Context, d *haDeps, body []byte) (any, er
 			}
 			return nil, &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The proof cannot be asked: " + verr.Error()}
 		}
+		// A test: the standby cannot prove it (the proof of the planned switchover of the map group is refused after the old leader stopped).
+		if d.Fault.FailoverInjection("promote:unproven") == "fail" {
+			ok = false
+		}
 		if !ok {
 			return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "standby_behind", Message: "The standby does not hold everything the old primary wrote."}
 		}
@@ -1079,6 +1083,12 @@ func registerFailoverCallee(d *haDeps) {
 	})
 	d.Calls.Register(callMapAbandon, func(ctx context.Context, caller string, body []byte) (any, error) {
 		return handleMapAbandon(ctx, d, caller, body)
+	})
+	d.Calls.Register(callMapCheckpoint, func(ctx context.Context, caller string, body []byte) (any, error) {
+		return handleMapCheckpoint(ctx, d, caller, body)
+	})
+	d.Calls.Register(callMapRefused, func(ctx context.Context, caller string, body []byte) (any, error) {
+		return handleMapRefused(ctx, d, caller, body)
 	})
 	d.Calls.Register(callMapProof, func(ctx context.Context, caller string, body []byte) (any, error) {
 		return handleMapProof(ctx, d, caller, body)

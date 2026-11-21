@@ -90,6 +90,7 @@ type Runner struct {
 	DrainEvery         time.Duration // (default 10 s)
 	MarkWait           time.Duration // the wait for the standby to replay the mark (default 10 s)
 	VerifyWait         time.Duration // the proof is repeated this long (default 30 s)
+	MapVerdictWait     time.Duration // the old leader of a planned switchover of the map group waits this long for the candidate to promote or to refuse (default 6 min)
 	// PromoteNode are the bounds of the repeat loop of kingres.promote_node.
 	PromoteNode PromoteOptions
 	// PositionTimeout is the time of one read of a position (default 5 s).

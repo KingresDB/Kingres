@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -331,6 +332,10 @@ func demoteClean(ctx context.Context, d *haDeps, r failover.DemoteRequest) (any,
 		if rerr != nil {
 			d.Log.Warn("failover: the lease was not released; it runs out by itself", "group", r.Group, "error", rerr)
 		}
+		// A test: kingresd ends right after the clean stop, before the leader's task can send the proof (the leader changes at the stop).
+		if d.Fault.FailoverInjection("demote:exit") == "exit" {
+			os.Exit(137)
+		}
 	} else {
 		_ = d.LeaseMgr.Relinquish(r.Group) // not a clean stop: no renewal, the lease runs out by itself
 	}
@@ -359,6 +364,7 @@ func primaryRuns(ctx context.Context, d *haDeps, group int32) bool {
 // The calls of the planned switchover of the map group: the old leader's task starts the bootstrap of the candidate, sends it the proof of its clean
 // stop, and gives it up when the switchover is rolled back.
 func (p *foPeers) MapStart(ctx context.Context, server string, r failover.MapStartRequest) error {
+	mapPlanned.started(server)
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	return p.do(ctx, server, "POST", "/failover/map/start", r, nil)
@@ -375,3 +381,6 @@ func (p *foPeers) MapAbandon(ctx context.Context, server, reason string) error {
 	defer cancel()
 	return p.do(ctx, server, "POST", "/failover/map/abandon", mapAbandonBody{Reason: reason}, nil)
 }
+
+// MapRefusal is the refusal of the proof that the candidate of the planned switchover of the map group reported to this server (the old leader's).
+func (p *foPeers) MapRefusal(context.Context) (string, bool) { return mapPlanned.refusal() }

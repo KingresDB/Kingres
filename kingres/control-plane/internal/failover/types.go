@@ -435,6 +435,8 @@ type Peers interface {
 	MapStart(ctx context.Context, server string, r MapStartRequest) error
 	MapProof(ctx context.Context, server string, r MapProofRequest) error
 	MapAbandon(ctx context.Context, server, reason string) error
+	// MapRefusal is the refusal of the proof that the candidate reported to this server, the old leader's (local: the task runs here).
+	MapRefusal(ctx context.Context) (string, bool)
 }
 
 // Node is a row of kingres.node.
@@ -694,6 +696,12 @@ type MapStartRequest struct {
 
 // MapProofRequest is the body of POST /failover/map/proof: how the old leader was left by its clean stop.
 type MapProofRequest struct {
+	Checkpoint   string `json:"checkpoint"`
+	ClusterState string `json:"clusterState"`
+}
+
+// MapCheckpoint is the answer of GET /failover/map/checkpoint: how the stopped primary of the map group was left.
+type MapCheckpoint struct {
 	Checkpoint   string `json:"checkpoint"`
 	ClusterState string `json:"clusterState"`
 }

@@ -400,3 +400,146 @@ func TestSwitchoverOfTheMapGroup(t *testing.T) {
 		}
 	}
 }
+
+// mapSwitchoverEnv forms the cluster of the map group tests and starts the writers.
+func mapSwitchoverEnv(t *testing.T) (c *clustertest.Cluster, port int, pool *x509.CertPool, leader, nw *clustertest.Node, w *foWriters) {
+	t.Helper()
+	c, port, pool = foClusterWith(t, "-lease-duration", "12s", "-lease-renew", "2s", "-lease-margin", "3s")
+	leader = c.Leader()
+	views := topology(t, leader)[0]
+	if len(views) == 0 {
+		t.Fatalf("the map group has no standby: %v", topology(t, leader))
+	}
+	for _, n := range c.Nodes {
+		if n.Host == views[0].server {
+			nw = n
+		}
+	}
+	if nw == nil || nw == leader {
+		t.Fatalf("the standby of the map group is on %q", views[0].server)
+	}
+	w = startFoWriters(c.Nodes, port, pool)
+	until(t, time.Minute, "rows acknowledged before the switchover", func() bool { return w.count() > 40 })
+	return
+}
+
+func mapSwitchoverRequest(t *testing.T, leader, nw *clustertest.Node) any {
+	t.Helper()
+	st, resp := leader.DoThroughRestart("POST", "/servers/"+leader.Host+"/failover", map[string]any{"mode": "graceful", "shardGroupIds": []int{0},
+		"targets": []map[string]any{{"shardGroupId": 0, "serverId": nw.Host}}}, nil)
+	if st != 202 {
+		t.Fatalf("switchover request: %d %v\n%s", st, resp, leader.LogTail(3000))
+	}
+	return clustertest.TaskID(resp)
+}
+
+// The standby cannot prove the stop after the old leader stopped (the fault makes the proof in the promoting call false): nothing is promoted, the
+// candidate lets go of the lease and tells the old leader, the old leader's task rolls back and its primary is started again by its lease manager, the
+// writes go on, no acknowledged row is lost and the standby never became a primary. The task is read from the old leader once its instance is back.
+func TestSwitchoverOfTheMapGroupWhoseProofIsRefused(t *testing.T) {
+	c, port, pool, leader, nw, w := mapSwitchoverEnv(t)
+	nw.SetFaults(fault.Spec{FailoverPoint: "promote:unproven", FailoverMode: "fail"})
+	id := mapSwitchoverRequest(t, leader, nw)
+	var task map[string]any
+	defer func() {
+		if t.Failed() {
+			t.Logf("task %v: %v", id, task)
+			t.Logf("old leader log: %s", leader.LogTail(12000))
+			t.Logf("candidate log: %s", nw.LogTail(8000))
+		}
+	}()
+	until(t, 10*time.Minute, "the task to end on the old leader once its instance is back", func() bool {
+		st, body := leader.Do("GET", fmt.Sprintf("/tasks/%v", id), nil, nil)
+		if st != 200 {
+			return false
+		}
+		if s, _ := body["state"].(string); s == "failed" || s == "done" {
+			task = body
+			return true
+		}
+		return false
+	})
+	if e, _ := task["error"].(map[string]any); task["state"] != "failed" || e == nil || e["code"] != failover.CodeSwitchoverUnproven {
+		t.Fatalf("the task: %v", task)
+	}
+	nw.Heal()
+	until(t, 5*time.Minute, "the old leader to hold the map group again", func() bool {
+		hosts, _ := primaryOf(t, leader)
+		return hosts[0] == leader.Host
+	})
+	var st failover.State
+	if code, err := leader.InternalCall(nw, "GET", "/failover/state?group=0", nil, &st); err != nil || code != 200 || len(st.OutOfRecovery()) != 0 {
+		t.Errorf("the standby of the map group is a primary: %d %v %+v", code, err, st)
+	}
+	before := w.count()
+	until(t, 5*time.Minute, "writes after the rollback", func() bool { return w.count() > before+30 })
+	acked := w.Stop()
+	for _, n := range c.Nodes {
+		have := foReadIDs(t, n, port, pool)
+		for rid := range acked {
+			if !have[rid] {
+				t.Errorf("acknowledged row %d is missing when read through %s", rid, n.Host)
+				break
+			}
+		}
+	}
+}
+
+// The old leader's kingresd ends right after the clean stop (the leader changes at the stop), before its task could send the proof. The old primary stays
+// stopped (its marker holds it back, its lease was released), the candidate reads the proof from the old leader's server once that is back, promotes on
+// it, becomes the leader and finishes the task; there is never a second primary, and nothing acknowledged is lost.
+func TestSwitchoverOfTheMapGroupWhoseOldLeaderEndsAtTheStop(t *testing.T) {
+	c, port, pool, leader, nw, w := mapSwitchoverEnv(t)
+	leader.SetFaults(fault.Spec{FailoverPoint: "demote:exit", FailoverMode: "exit"})
+	id := mapSwitchoverRequest(t, leader, nw)
+	var task map[string]any
+	defer func() {
+		if t.Failed() {
+			t.Logf("task %v: %v", id, task)
+			t.Logf("candidate log: %s", nw.LogTail(14000))
+			t.Logf("old leader log: %s", leader.LogTail(8000))
+		}
+	}()
+	until(t, 5*time.Minute, "the old leader's kingresd to end after the clean stop", func() bool {
+		st, _ := leader.Do("GET", "/healthz", nil, nil)
+		return st != 200
+	})
+	leader.Kill() // reaps the process
+	leader.Heal()
+	time.Sleep(5 * time.Second) // the old leader is away for a while: the candidate waits for the proof
+	leader.Start()
+	until(t, 10*time.Minute, "the task to end on the new leader", func() bool {
+		st, body := nw.Do("GET", fmt.Sprintf("/tasks/%v", id), nil, nil)
+		if st != 200 {
+			return false
+		}
+		if s, _ := body["state"].(string); s == "failed" || s == "done" {
+			task = body
+			return true
+		}
+		return false
+	})
+	if task["state"] != "done" {
+		t.Fatalf("the task ended %v: %v", task["state"], task["error"])
+	}
+	hosts, _ := primaryOf(t, nw)
+	if hosts[0] != nw.Host {
+		t.Fatalf("the primary of the map group is on %s, want %s", hosts[0], nw.Host)
+	}
+	// the old leader's primary was never started again
+	var st failover.State
+	if code, err := nw.InternalCall(leader, "GET", "/failover/state?group=0", nil, &st); err == nil && code == 200 && len(st.OutOfRecovery()) != 0 {
+		t.Errorf("the old leader runs a primary of the map group: %+v", st)
+	}
+	before := w.count()
+	until(t, 3*time.Minute, "writes after the switchover", func() bool { return w.count() > before+30 })
+	acked := w.Stop()
+	have := foReadIDs(t, nw, port, pool)
+	for rid := range acked {
+		if !have[rid] {
+			t.Errorf("acknowledged row %d is missing when read through %s", rid, nw.Host)
+			break
+		}
+	}
+	_ = c
+}

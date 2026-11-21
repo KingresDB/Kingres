@@ -316,6 +316,27 @@ func (r *Runner) stopClean(ctx context.Context, env *task.Env, sc *stepCtx) erro
 		if perr != nil {
 			return fail(CodeTargetUnavailable, true, "the proof of the clean stop could not be sent to %s: %v", nw.Server, perr)
 		}
+		// The verdict: the candidate promotes on the proof (the standby is out of recovery), or it refuses (the standby cannot prove the stop) and tells this server.
+		// A refusal rolls this task back: the old leader's primary is started again by its lease manager, which wins the lease because the candidate let go
+		// of it; a candidate that says nothing is waited for, and the lease decides who may run.
+		deadline := r.now().Add(orDur(r.MapVerdictWait, 6*time.Minute))
+		for {
+			if reason, refused := r.Peers.MapRefusal(ctx); refused {
+				return sc.rollbackFailed(ctx, CodeSwitchoverUnproven, true, "the standby of the map group could not prove the clean stop of the old leader (%s); the old leader is started again", reason)
+			}
+			if st, serr := r.Peers.State(ctx, nw.Server, sc.group); serr == nil && len(st.OutOfRecovery()) > 0 {
+				return nil
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if !r.now().Before(deadline) {
+				return sc.rollbackFailed(ctx, CodeSwitchoverUnproven, true, "the candidate of the map group did not promote after the clean stop of the old leader; the old leader is started again")
+			}
+			if err := r.sleep(ctx, time.Second); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }

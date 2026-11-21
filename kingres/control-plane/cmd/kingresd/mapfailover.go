@@ -882,3 +882,101 @@ func openMapStart(ctx context.Context, d *haDeps, caller string, body []byte) (m
 	}
 	return b, s.Username, nil
 }
+
+// ---------------------------------------------------------------------------------
+// A planned switchover of the map group whose proof is refused after the old leader stopped
+
+const callMapRefused = "POST /failover/map/refused"
+
+type mapRefusedBody struct {
+	Reason string `json:"reason"`
+}
+
+// plannedBox is what the old leader's server remembers of the planned switchover its own task is running: the server of the candidate that it asked to
+// start the bootstrap, and the refusal that the candidate reported. A refusal is accepted from that server only.
+type plannedBox struct {
+	mu      sync.Mutex
+	to      string
+	refused string
+}
+
+var mapPlanned = &plannedBox{}
+
+func (b *plannedBox) started(server string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.to, b.refused = server, ""
+}
+
+func (b *plannedBox) refuse(server, reason string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.to == "" || b.to != server {
+		return false
+	}
+	b.refused = reason
+	return true
+}
+
+func (b *plannedBox) refusal() (string, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.refused, b.refused != ""
+}
+
+// handleMapRefused is the call of the candidate to the old leader (this server) that the standby could not prove the old leader's stop: the task that is
+// waiting for the verdict rolls back and the old leader's primary is started again by its lease manager.
+func handleMapRefused(_ context.Context, _ *haDeps, caller string, body []byte) (any, error) {
+	var b mapRefusedBody
+	if err := json.Unmarshal(body, &b); err != nil || b.Reason == "" || len(b.Reason) > 600 {
+		return nil, badBody("a reason")
+	}
+	if !mapPlanned.refuse(caller, b.Reason) {
+		return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "conflict", Message: "No planned switchover of the map group was started on this server for the caller."}
+	}
+	return struct{}{}, nil
+}
+
+// PlannedRefused lets go of the fence lease that this server holds for the map group and tells the old leader.
+func (p *mapPorts) PlannedRefused(ctx context.Context, oldServer, reason string) error {
+	if _, err := p.m.peers.Lease(ctx, p.m.self, failover.LeaseRequest{Group: 0, Role: failover.LeaseRelease}); err != nil {
+		return fmt.Errorf("letting go of the lease of the map group: %w", err)
+	}
+	return p.m.peers.do(ctx, oldServer, http.MethodPost, "/failover/map/refused", mapRefusedBody{Reason: reason}, nil)
+}
+
+// ---------------------------------------------------------------------------------
+// The proof that the candidate reads itself when the old leader's task cannot send it (the leader's kingresd ended after the clean stop)
+
+const callMapCheckpoint = "GET /failover/map/checkpoint"
+
+// handleMapCheckpoint answers how the stopped primary of the map group on this server was left: the shutdown checkpoint and the state of the cluster. It
+// is a read of pg_controldata of an instance that does not run (409 not_stopped when it does), so it gives away nothing and changes nothing; the standby
+// that is promoted on it checks it against what it replayed (switchover_verify), exactly as when the old leader's task sends it.
+func handleMapCheckpoint(ctx context.Context, d *haDeps, _ string, _ []byte) (any, error) {
+	li, ok := d.Svc.PrimaryOf(0)
+	if !ok {
+		return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "not_primary", Message: "This server runs no primary of the map group."}
+	}
+	running, err := d.Svc.Manager().Running(ctx, li.ID)
+	if err != nil {
+		return nil, &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The instance cannot be asked whether it runs."}
+	}
+	if running {
+		return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "not_stopped", Message: "The primary of the map group runs on this server."}
+	}
+	cd, err := d.Svc.Manager().ControlData(ctx, li.ID)
+	if err != nil {
+		return nil, &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "pg_controldata cannot be read: " + err.Error()}
+	}
+	return failover.MapCheckpoint{Checkpoint: cd["Latest checkpoint location"], ClusterState: cd["Database cluster state"]}, nil
+}
+
+// PullProof reads the proof from the old leader's server.
+func (p *mapPorts) PullProof(ctx context.Context, oldServer string) (string, string, error) {
+	var out failover.MapCheckpoint
+	if err := p.m.peers.do(ctx, oldServer, http.MethodGet, "/failover/map/checkpoint", nil, &out); err != nil {
+		return "", "", err
+	}
+	return out.Checkpoint, out.ClusterState, nil
+}

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
 )
@@ -737,5 +738,41 @@ func TestThePreflightOfTheMapGroup(t *testing.T) {
 	w.self = "s3"
 	if ref := w.runner().Preflight(context.Background(), mapGracefulInput()); ref == nil || ref.Code != "unsupported_operation" {
 		t.Fatalf("not on the leader's server: %+v", ref)
+	}
+}
+
+// The standby refuses the proof after the old leader stopped: the candidate reports it, the old leader's task rolls back, the old leader is resumed
+// (its lease manager starts the primary, the candidate let go of the lease) and the writes are let in again; nothing was promoted.
+func TestARefusedProofAfterTheStopRollsTheMapGroupSwitchoverBack(t *testing.T) {
+	w := mapWorld()
+	w.mapRefusal = "the standby does not hold everything the old primary wrote"
+	r := w.runner()
+	w.fakeClock(r)
+	name, err := runAll(t, r, mapGracefulInput())
+	failedWith(t, w, err, CodeSwitchoverUnproven)
+	if name != StepName(0, StepStopClean) {
+		t.Fatalf("the step: %s", name)
+	}
+	if w.count("resume s1") != 1 || w.count("unquiesce s1") < 1 || w.count("map-abandon s2") != 1 {
+		t.Fatalf("the rollback:\n%s", strings.Join(w.log, "\n"))
+	}
+	if w.count("promote s2") != 0 || w.promoted["s2"] {
+		t.Fatal("the standby was promoted although the proof was refused")
+	}
+}
+
+// A candidate that says nothing is waited for, then the task rolls back as well (the lease keeps the two from running together).
+func TestACandidateThatNeverAnswersEndsTheMapGroupSwitchoverBySilence(t *testing.T) {
+	w := mapWorld()
+	w.mapRefusal = ""
+	r := w.runner()
+	w.fakeClock(r)
+	r.MapVerdictWait = 3 * time.Second
+	// the fake candidate does not promote: this world answers State with the standby still in recovery
+	w.noPromoteOnProof = true
+	_, err := runAll(t, r, mapGracefulInput())
+	failedWith(t, w, err, CodeSwitchoverUnproven)
+	if w.count("resume s1") != 1 {
+		t.Fatalf("the old leader was not resumed:\n%s", strings.Join(w.log, "\n"))
 	}
 }

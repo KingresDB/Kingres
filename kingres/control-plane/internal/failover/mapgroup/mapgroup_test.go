@@ -19,28 +19,32 @@ import (
 // world models three servers: s1 ran the primary of the map group and the leader (it is dead), s2 (this server) and s3 host the
 // standbys 10 and 11 of group 0 (nodes 4 and 5).
 type world struct {
-	mu          sync.Mutex
-	promoteReqs []failover.PromoteRequest
-	freezeErr   error // FreezeLocal fails from the second call on (the agent was lost with a restart)
-	freezes     int
-	log         []string
-	self        string
-	term        int64
-	primary     string
-	standbys    []failover.StandbyRec
-	pos         map[string]failover.Position
-	posErr      map[string]error
-	live        map[string]string
-	oldAlive    bool
-	promoted    map[string]bool
-	leaseHeld   bool
-	rebalance   int
-	taskID      int64
-	recorded    int
-	alerts      []string
-	facts       failover.GroupFacts
-	nodes       []failover.Node
-	noCA        bool
+	mu                        sync.Mutex
+	pulls                     int
+	pullCheckpoint, pullState string
+	pullErr                   error
+	promoteErr                error // the callee refuses a promotion that carries a proof
+	promoteReqs               []failover.PromoteRequest
+	freezeErr                 error // FreezeLocal fails from the second call on (the agent was lost with a restart)
+	freezes                   int
+	log                       []string
+	self                      string
+	term                      int64
+	primary                   string
+	standbys                  []failover.StandbyRec
+	pos                       map[string]failover.Position
+	posErr                    map[string]error
+	live                      map[string]string
+	oldAlive                  bool
+	promoted                  map[string]bool
+	leaseHeld                 bool
+	rebalance                 int
+	taskID                    int64
+	recorded                  int
+	alerts                    []string
+	facts                     failover.GroupFacts
+	nodes                     []failover.Node
+	noCA                      bool
 }
 
 func newWorld() *world {
@@ -141,6 +145,10 @@ func (p ports) Lease(_ context.Context, s string, r failover.LeaseRequest) (fail
 func (p ports) Promote(_ context.Context, s string, r failover.PromoteRequest) (failover.PromoteAnswer, error) {
 	p.w.mu.Lock()
 	p.w.promoteReqs = append(p.w.promoteReqs, r)
+	if p.w.promoteErr != nil && r.Checkpoint != "" {
+		p.w.mu.Unlock()
+		return failover.PromoteAnswer{}, p.w.promoteErr
+	}
 	already := p.w.promoted[s]
 	p.w.promoted[s] = true
 	p.w.mu.Unlock()
@@ -648,4 +656,82 @@ func TestAPlannedRequestNeedsALiveOldServer(t *testing.T) {
 func (p ports) RecordPlanned(_ context.Context, taskID, termAfter, timeline int64) error {
 	p.w.rec("record-planned %d term=%d timeline=%d", taskID, termAfter, timeline)
 	return nil
+}
+
+func (p ports) PlannedRefused(_ context.Context, oldServer, reason string) error {
+	p.w.rec("planned-refused %s", oldServer)
+	return nil
+}
+
+// The standby refuses the proof after the old leader stopped: the candidate lets go of the lease and tells the old leader (planned-refused), gives the
+// bootstrap up and promotes nothing; the old leader's task rolls back and starts its primary again.
+func TestARefusedProofGivesTheBootstrapUpAndTellsTheOldLeader(t *testing.T) {
+	w := newWorld()
+	w.live["s1"] = "live"
+	w.promoteErr = &failover.CallError{Status: 409, Code: "unprovable", Message: "the standby is behind"}
+	r, js := w.runner(t)
+	rq := req()
+	rq.Planned = &journal.Planned{TaskID: 77, StandbyID: 10}
+	if _, err := r.Decide(context.Background(), rq); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.SetProof("0/6000028", "shut down"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := r.Run(context.Background(), rq)
+	var fe *failover.Error
+	if !errors.As(err, &fe) || fe.Code != failover.CodeSwitchoverUnproven {
+		t.Fatalf("want switchover_unproven: %v\n%s", err, strings.Join(w.log, "\n"))
+	}
+	if w.count("planned-refused s1") != 1 || w.count("promote s2") != 0 {
+		t.Fatalf("the refusal:\n%s", strings.Join(w.log, "\n"))
+	}
+	if js.Active() {
+		t.Fatal("the bootstrap is still in progress after the refusal")
+	}
+}
+
+func (p ports) PullProof(_ context.Context, oldServer string) (string, string, error) {
+	p.w.mu.Lock()
+	defer p.w.mu.Unlock()
+	p.w.pulls++
+	if p.w.pullErr != nil {
+		return "", "", p.w.pullErr
+	}
+	return p.w.pullCheckpoint, p.w.pullState, nil
+}
+
+// The old leader's kingresd ended after the clean stop and did not send the proof: the candidate reads it from the old leader's server once the wait
+// has lasted ProofPullAfter, and promotes on it. A state other than "shut down" is not a proof, and is not taken.
+func TestTheCandidateReadsTheProofItselfWhenTheOldLeaderCannotSendIt(t *testing.T) {
+	w := newWorld()
+	w.live["s1"] = "live"
+	w.pullCheckpoint, w.pullState = "0/6000028", "shut down"
+	r, js := w.runner(t)
+	rq := req()
+	rq.Planned = &journal.Planned{TaskID: 77, StandbyID: 10}
+	if _, err := r.Run(context.Background(), rq); err != nil {
+		t.Fatalf("%v\n%s", err, strings.Join(w.log, "\n"))
+	}
+	if len(w.promoteReqs) != 1 || w.promoteReqs[0].Checkpoint != "0/6000028" || w.pulls < 1 {
+		t.Fatalf("the promotion did not carry the proof that was read: %+v (pulls %d)", w.promoteReqs, w.pulls)
+	}
+	if cur, _ := js.Current(); cur.Planned == nil || cur.Planned.Checkpoint != "0/6000028" {
+		t.Fatalf("%+v", cur.Planned)
+	}
+}
+
+func TestAStateThatIsNotShutDownIsNotAProof(t *testing.T) {
+	w := newWorld()
+	w.live["s1"] = "live"
+	w.pullCheckpoint, w.pullState = "0/6000028", "in production"
+	r, _ := w.runner(t)
+	r.ProofWait = 3 * time.Minute
+	rq := req()
+	rq.Planned = &journal.Planned{TaskID: 77, StandbyID: 10}
+	_, err := r.Run(context.Background(), rq)
+	var pe *failover.PauseError
+	if !errors.As(err, &pe) || len(w.promoteReqs) != 0 {
+		t.Fatalf("want a pause and no promotion: %v %+v", err, w.promoteReqs)
+	}
 }

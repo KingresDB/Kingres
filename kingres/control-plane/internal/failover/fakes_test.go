@@ -69,6 +69,8 @@ type world struct {
 	mapGroup           bool // the group of the world is the map group (0), not 1
 	mapStarts          []MapStartRequest
 	mapProofs          []MapProofRequest
+	noPromoteOnProof   bool
+	mapRefusal         string
 	mapStartErr        error
 	markErr            error   // the answer of the mark call
 	undoTerms          []int64 // the terms of the quiesce, unquiesce and resume calls
@@ -782,6 +784,10 @@ func (p fpeers) MapStart(_ context.Context, server string, r MapStartRequest) er
 func (p fpeers) MapProof(_ context.Context, server string, r MapProofRequest) error {
 	p.w.mu.Lock()
 	p.w.mapProofs = append(p.w.mapProofs, r)
+	if p.w.mapRefusal == "" && !p.w.noPromoteOnProof {
+		// the candidate promotes on the proof, and holds the lease
+		p.w.promoted[server], p.w.lease[server] = true, true
+	}
 	p.w.mu.Unlock()
 	p.w.rec("map-proof %s", server)
 	return nil
@@ -798,4 +804,10 @@ func (w *world) group() int32 {
 		return 0
 	}
 	return 1
+}
+
+func (p fpeers) MapRefusal(context.Context) (string, bool) {
+	p.w.mu.Lock()
+	defer p.w.mu.Unlock()
+	return p.w.mapRefusal, p.w.mapRefusal != ""
 }
