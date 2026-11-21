@@ -16,6 +16,7 @@ import CreateDatabaseDialog from '@/components/CreateDatabaseDialog.vue'
 import { useDatabaseCreateOptions, useDatabases } from '@/api/queries'
 import { DATABASE_STATUS, DURABILITY_LABEL, LEDGER_MODE_LABEL, LEDGER_STATE } from '@/lib/status'
 import { formatBytes, formatNumber } from '@/lib/format'
+import { modeOf } from '@/lib/sharding-mode'
 
 const databases = useDatabases()
 // Loaded ahead of the dialog, so that it opens with its choices and defaults in place.
@@ -80,9 +81,13 @@ const creating = ref(false)
             <td><StatusBadge :meta="DATABASE_STATUS[d.status]" /></td>
             <td><NullableValue :value="d.general.owner" safe /></td>
             <td>
-              <template v-if="d.sharding.enabled"
-                >On, <NullableValue :value="d.sharding.bucketCount" :format="(n) => `${n} buckets`"
-              /></template>
+              <template v-if="d.sharding.enabled">
+                <template v-if="modeOf(d.sharding) === 'schema'">On, schemas</template>
+                <template v-else
+                  >On, <template v-if="modeOf(d.sharding) === 'both'">rows and schemas, </template
+                  ><NullableValue :value="d.sharding.bucketCount" :format="(n) => `${n} buckets`"
+                /></template>
+              </template>
               <template v-else>Off</template>
               <div v-if="d.rebalanceRequired" class="muted">Rebalance needed</div>
             </td>
