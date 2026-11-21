@@ -123,8 +123,8 @@ func TestTableLifecycle(t *testing.T) {
 			t.Errorf("an online task has the steps of the online copy, got %v", names)
 		}
 		tlSame(t, c, `SELECT count(*) FROM onl`, 20000+written.Load())
-		if n := tlLeftovers(t, c); n != 0 {
-			t.Errorf("%d leftovers", n)
+		if n, what := tlSettled(t, c); n != 0 {
+			t.Errorf("%d leftovers: %s", n, what)
 		}
 	})
 
@@ -198,8 +198,8 @@ func TestTableLifecycle(t *testing.T) {
 			if e, _ := got["error"].(map[string]any); e == nil || e["code"] != "cancelled" {
 				t.Errorf("a cancelled task ends with code cancelled: %v", got["error"])
 			}
-			if n := tlLeftovers(t, c); n != 0 {
-				t.Errorf("%d leftovers after a cancel", n)
+			if n, what := tlSettled(t, c); n != 0 {
+				t.Errorf("%d leftovers after a cancel: %s", n, what)
 			}
 			if n := tlCount(t, leader, `SELECT count(*) FROM kingres.dist_table WHERE relid = 'cnc'::regclass`); n != 0 {
 				t.Errorf("a cancelled table is distributed")
@@ -301,4 +301,25 @@ func TestTableLifecycle(t *testing.T) {
 			t.Errorf("the comment of the view is gone")
 		}
 	})
+}
+
+// tlSettled waits for the cleanup of a failed or cancelled task: the engine records the task as failed first and then runs its compensation
+// (cancel_table_operation), so the leftovers go a moment after the state changes. It returns the count after at most 30 s and says which kind is left.
+func tlSettled(t *testing.T, c *clustertest.Cluster) (int64, string) {
+	t.Helper()
+	var n int64
+	for end := time.Now().Add(30 * time.Second); ; time.Sleep(200 * time.Millisecond) {
+		if n = tlLeftovers(t, c); n == 0 || time.Now().After(end) {
+			break
+		}
+	}
+	if n == 0 {
+		return 0, ""
+	}
+	var what []string
+	for _, nd := range c.Nodes {
+		what = append(what, fmt.Sprintf("node %d: shadow or log tables %d", nd.Index, tlCount(t, nd, `SELECT count(*) FROM pg_class WHERE relname LIKE 'kingres\_shadow\_%' OR relname LIKE 'tlog\_%'`)))
+	}
+	what = append(what, fmt.Sprintf("unfinished operations %d", tlCount(t, c.Leader(), `SELECT count(*) FROM kingres.table_operation WHERE phase NOT IN ('done', 'failed', 'cancelled')`)))
+	return n, strings.Join(what, "; ")
 }
