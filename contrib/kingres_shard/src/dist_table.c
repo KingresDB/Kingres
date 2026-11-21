@@ -758,43 +758,6 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 	/* The storage parameters of the table: the bucket partitions get them (a partitioned table cannot have them). */
 	with_clause = kingres_shard_with_clause(relid, &reloptions, callercxt);
 
-	/*
-	 * 2b. A table the user partitioned: its partitions are recreated as leaves inside every bucket partition
-	 * (design, feature 4).  The layout is read now, while the source is whole; the number of leaves is bounded.
-	 */
-	argtypes[0] = OIDOID;
-	values[0] = ObjectIdGetDatum(relid);
-	kingres_shard_run_spi("SELECT partby, name::pg_catalog.text, bound FROM " KINGRES_SHARD_SCHEMA
-						  ".internal_partition_layout($1::pg_catalog.oid::pg_catalog.regclass) ORDER BY ord",
-						  1, argtypes, values);
-	{
-		MemoryContext old = MemoryContextSwitchTo(callercxt);
-
-		for (i = 0; i < SPI_processed; i++)
-		{
-			if (partby == NULL)
-				partby = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
-			leafnames = lappend(leafnames, SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2));
-			leafbounds = lappend(leafbounds, SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 3));
-		}
-		if (partby == NULL && get_rel_relkind(relid) == RELKIND_PARTITIONED_TABLE)
-		{
-			/* partitioned and without a partition: the layout still has the key */
-			SPI_execute_with_args("SELECT pg_catalog.pg_get_partkeydef($1::pg_catalog.oid)", 1, argtypes, values, NULL, false, 0);
-			partby = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
-		}
-		MemoryContextSwitchTo(old);
-	}
-	if (partby != NULL && (uint64) nbuckets * (uint64) list_length(leafnames) > (uint64) kingres_shard_max_partition_leaves)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("table \"%s\" would have %d leaves (%d buckets, %d partitions); kingres_shard.max_partition_leaves is %d",
-						relname, nbuckets * list_length(leafnames), nbuckets, list_length(leafnames),
-						kingres_shard_max_partition_leaves)));
-
-	/* The storage parameters of the table: the bucket partitions get them (a partitioned table cannot have them). */
-	with_clause = kingres_shard_with_clause(relid, &reloptions, callercxt);
-
 	/* 3. The statements that recreate the table (before it is replaced). */
 	kingres_shard_fetch_ddl(relid, column, true, &ddl, callercxt);
 
