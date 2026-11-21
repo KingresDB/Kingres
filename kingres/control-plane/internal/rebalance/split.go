@@ -263,7 +263,7 @@ func (s *Service) splitDefinition() task.Definition {
 			}
 			return nil
 		}},
-		{Name: StepSplitRun, Run: func(ctx context.Context, env *task.Env) error {
+		{Name: StepSplitRun, Interruptible: true, Run: func(ctx context.Context, env *task.Env) error {
 			v, err := in(env)
 			if err != nil {
 				return err
