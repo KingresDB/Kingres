@@ -339,7 +339,7 @@ paths; what is not done is in "Not done in this increment"). "Real" means the op
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **143 of 144 operations are real; 1 answer "not yet".**
+authenticated operation lists in 0.2.0. **148 of 149 operations are real; 1 answer "not yet".**
 
 | Tag | Real | Not yet |
 |---|---|---|
@@ -349,6 +349,7 @@ authenticated operation lists in 0.2.0. **143 of 144 operations are real; 1 answ
 | Cluster | `getCluster`, `getClusterSummary` |  |
 | Roles | `listClusterRoles`, `listRoles`, `createRole`, `getRole`, `deleteRole`, `updateRole`, `setRoleClusterRoles`, `setRoleMemberships` |  |
 | Databases | `getDatabaseCreateOptions`, `listDatabases`, `createDatabase`, `getDatabase`, `dropDatabase`, `updateDatabase` |  |
+| Schemas | `listSchemas`, `getSchema`, `distributeSchema`, `undistributeSchema`, `moveSchema` |  |
 | Shards | `getBucketDistribution`, `listColocationGroups`, `listBuckets`, `previewBucketSplit`, `splitBucket` |  |
 | Ledger | `getLedgerStatus`, `listLedgerBlocks`, `listLedgerDigests`, `generateLedgerDigest`, `startLedgerVerification`, `listLedgerStatus`, `createInclusionProof`, `listLedgerVerifications`, `getLedgerVerification`, `getLedgerSettings`, `updateLedgerSettings`, `getLedgerSigning`, `createLedgerSigningKey`, `retireLedgerSigningKey`, `revokeLedgerSigningKey`, `getLedgerTrustFile`, `getLedgerPublication`, `getLedgerAggregate`, `listLedgerAggregates`, `listLedgerAnchorTargets`, `createLedgerAnchorTarget`, `getLedgerAnchorTarget`, `updateLedgerAnchorTarget`, `deleteLedgerAnchorTarget`, `testLedgerAnchorTarget`, `listLedgerAnchors`, `anchorLedgerNow`, `retryLedgerAnchor`, `downloadLedgerAnchor`, `listLedgerClientKeys`, `registerLedgerClientKey`, `revokeLedgerClientKey`, `setTableSignaturePolicy`, `upgradeLedgerExtension`, `createLedgerBundle`, `getLedgerBundle`, `acknowledgeLedgerDivergence` | |
 | Tables | `getTable`, `distributeTable`, `enableTableLedger`, `listTables`, `previewTableChange`, `undistributeTable`, `alterTableDistribution`, `listTablePartitions`, `createTablePartition`, `attachTablePartition`, `detachTablePartition`, `dropTablePartition` |  |
@@ -3545,3 +3546,25 @@ The preview does not look for a table without a primary key: the extension refus
 
 Tests: unit tests in `internal/rebalance` (`options_test.go`, `drain_test.go`, `automatic_test.go`, `split_test.go`), `internal/ops` and `internal/api`; the cluster test `internal/clustertest/rebalance_strategies_test.go`
 (strategies, weights, exclusion, settings, a drain-only run) needs the 0.8 extension in the installation of the tests (`scripts/install-extensions.sh`).
+
+## Distributed schemas (phase 11, step 13, contract 0.16.0)
+
+Design: [shard-phase11.md](../docs/design/shard-phase11.md), sections 13 and 16. The extension (0.8) does the work; `internal/ops/schemas.go` lists the schemas, refuses what can be refused before a task exists and runs three tasks,
+`internal/httpapi/handlers_schemas.go` has the five operations (`listSchemas`, `getSchema`, `distributeSchema`, `undistributeSchema`, `moveSchema`).
+
+- **Reading.** A schema is listed from the map group primary (this server): every schema that is not a system schema, joined with `kingres.schemas` (group, state, size, target of a move) when the extension has it; a database without the extension 0.8, or
+  without sharding, lists its schemas with `distribution: null`. `getSchema` adds the blockers (`kingres.schema_inventory`, the unsupported rows), the pin (`kingres.internal_schema_pinned`, for example a ledger table), the unfinished `schema.move`
+  task of the schema and the tables that have neither a primary key nor a replica identity.
+- **Tasks** (subject type `schema`, id `database/schema`, one unfinished task per schema): `schema.distribute` (`Check the schema`, `Set REPLICA IDENTITY FULL` when asked, `Make the schema distributed` through `distribute_schema`, `Verify on every server`),
+  `schema.move` (`Check the move`, `Copy the data` through `move_schema` in a session of its own with the phase of `bucket_move` as detail, `Switch`, `Clean up the old copy`; cancelled with `cancel_bucket_move` until the switch, the task does not wait for the
+  old copy to be emptied) and `schema.undistribute` (`Check the schema`, `Move first` when a target is given, `Make the schema local`, `Verify on every server`). A step that repeats after a restart reads the catalog first and does nothing when its result is there.
+  *Departure from the design:* `Make the schema distributed` is not marked `NonIdempotent`; it reads `kingres.schemas` first, which is the design's own remedy and makes a repeat harmless, so a crash does not fail the task with `step_interrupted`.
+- **Refusals before a task exists:** `schema_not_distributable` (422, the objects in `errors`), `conflict` (already distributed, local, or the mode is `row`), `schema_move_in_progress`, `schema_pinned`, `rebalance_in_progress` (a move waits for a rebalance),
+  422 `unprocessable` (target group missing, not receiving, or the current one; tables without a key unless `setReplicaIdentityFull`).
+- **The sharding mode.** `createDatabase` takes `sharding.mode` and `distributeNewSchemas` and calls `kingres.set_sharding_mode` after the extension is installed; `updateDatabase` changes them synchronously, and a refusal of the extension is 409 `sharding_mode_in_use`.
+  `Database.sharding` shows `mode` and `distributeNewSchemas` (read from `kingres.sharding_settings`), `bucketCount` is null in mode `schema`, `stats.distributedSchemaCount` counts `kingres.dist_schema`, `getDatabaseCreateOptions` lists `shardingModes`.
+  `listColocationGroups` has `kind` and `schemaName`.
+- **Not done:** `inFlightMoves[].kind` and `schemaName` of the rebalance status, `BucketDistribution.servers[].primarySchemas`, the schema units in the rebalance plan (the extension does not plan them yet), and the schema moves made by a drain (a drain moves buckets only; schemas stay on the server).
+
+Tests: `internal/ops/schemas_test.go` (blockers, error mapping, hostile names, the cancel guard) and the cluster test `internal/clustertest/schemas_test.go` (list, blockers, distribute, move with the rows checked, make local, the replica identity,
+the mode refusal), which needs the 0.8 extension in the installation of the tests.

@@ -63,6 +63,10 @@ type dbProbe struct {
 	// bucketCount is the largest colocation bucket count; nil when the
 	// database has no colocation group.
 	bucketCount *int
+	// mode and distributeNew are the sharding mode of the database (extension 0.8); "" for an older one.
+	mode          string
+	distributeNew bool
+	schemaCount   *int
 }
 
 func (s *Store) probeDatabase(ctx context.Context, db string) dbProbe {
@@ -87,6 +91,17 @@ SELECT (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relname
 		var n *int
 		if err := p.QueryRow(ctx, "SELECT max(bucket_count) FROM kingres.colocation").Scan(&n); err == nil {
 			probe.bucketCount = n
+		}
+		var hasMode bool
+		if err := p.QueryRow(ctx, "SELECT to_regclass('kingres.sharding_settings') IS NOT NULL").Scan(&hasMode); err == nil && hasMode {
+			_ = p.QueryRow(ctx, "SELECT mode, distribute_new_schemas FROM kingres.sharding_settings").Scan(&probe.mode, &probe.distributeNew)
+			var n int
+			if err := p.QueryRow(ctx, "SELECT count(*) FROM kingres.dist_schema").Scan(&n); err == nil {
+				probe.schemaCount = &n
+			}
+			if probe.mode == "schema" {
+				probe.bucketCount = nil
+			}
 		}
 	}
 	return probe
@@ -350,6 +365,14 @@ func (s *Store) ClusterSettings(ctx context.Context) (api.ClusterSettings, error
 	return out, nil
 }
 
+func modeFlag(p dbProbe) *bool {
+	if p.mode == "" {
+		return nil
+	}
+	b := p.distributeNew
+	return &b
+}
+
 // newDatabase builds the response for one database. Values that no catalog
 // provides are left nil, which the API reports as null ("not available"):
 // the ledger mode and digest interval (not stored anywhere), the commit rate
@@ -361,7 +384,7 @@ func newDatabase(r databaseRow, probe dbProbe, replicas int, durability string) 
 		Name: r.name, Status: "ready",
 		General: api.DatabaseGeneral{Owner: &r.owner, Encoding: &r.encoding, LCCollate: &r.collate,
 			LCCtype: &r.ctype, ConnectionLimit: &r.connLimit},
-		Sharding:    api.ShardingSettings{Enabled: probe.hasShard, BucketCount: probe.bucketCount},
+		Sharding:    api.ShardingSettings{Enabled: probe.hasShard, BucketCount: probe.bucketCount, Mode: probe.mode, DistributeNewSchemas: modeFlag(probe)},
 		Replication: api.ReplicationSettings{Durability: &durability, ReplicaCount: replicas},
 		Stats:       api.DatabaseStats{SizeBytes: &r.sizeBytes, ActiveConnections: &r.connections},
 		Health:      api.DatabaseHealth{UnderReplicatedBuckets: &zero, UnavailableBuckets: &zero},
@@ -369,6 +392,7 @@ func newDatabase(r databaseRow, probe dbProbe, replicas int, durability string) 
 	if probe.ok {
 		tables := probe.tableCount
 		db.Stats.TableCount = &tables
+		db.Stats.DistributedSchemaCount = probe.schemaCount
 	}
 	if !probe.hasLedger {
 		off := "off"
@@ -391,7 +415,8 @@ func (s *Store) DatabaseCreateOptions(ctx context.Context) (api.DatabaseCreateOp
 	}
 	out := api.DatabaseCreateOptions{
 		Encodings: []api.EncodingOption{}, Collations: []api.CollationOption{},
-		BucketCount:                 api.IntegerRange{Default: 128, Minimum: 1, Maximum: 4096},
+		BucketCount:   api.IntegerRange{Default: 128, Minimum: 1, Maximum: 4096},
+		ShardingModes: []string{"row", "schema", "both"}, ShardingModeDefault: "row",
 		LedgerDigestIntervalSeconds: api.IntegerRange{Default: 3600, Minimum: 60, Maximum: 86400},
 	}
 	var defEnc, defCollate string

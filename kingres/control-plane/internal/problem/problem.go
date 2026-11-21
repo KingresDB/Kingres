@@ -91,6 +91,11 @@ const (
 	NoReceivingServer   Code = "no_receiving_server"
 	// ReplicasCannotBeKept: a drain would leave fewer servers than the replica count needs (contract 0.16.0).
 	ReplicasCannotBeKept Code = "replicas_cannot_be_kept"
+	// Distributed schemas (contract 0.16.0).
+	ShardingModeInUse      Code = "sharding_mode_in_use"
+	SchemaNotDistributable Code = "schema_not_distributable"
+	SchemaPinned           Code = "schema_pinned"
+	SchemaMoveInProgress   Code = "schema_move_in_progress"
 	// BucketBusy: the bucket has a move or a split in progress (contract 0.16.0).
 	BucketBusy Code = "bucket_busy"
 	// SplitUnsupported: a table of the colocation group cannot be split (contract 0.16.0).
@@ -230,6 +235,10 @@ var specs = map[Code]struct {
 	InsufficientDisk:                {409, "Insufficient disk space", "insufficient-disk"},
 	NoReceivingServer:               {409, "No receiving server", "no-receiving-server"},
 	ReplicasCannotBeKept:            {409, "Replicas cannot be kept", "replicas-cannot-be-kept"},
+	ShardingModeInUse:               {409, "Sharding mode in use", "sharding-mode-in-use"},
+	SchemaNotDistributable:          {422, "Schema not distributable", "schema-not-distributable"},
+	SchemaPinned:                    {409, "Schema pinned", "schema-pinned"},
+	SchemaMoveInProgress:            {409, "Schema move in progress", "schema-move-in-progress"},
 	BucketBusy:                      {409, "Bucket busy", "bucket-busy"},
 	SplitUnsupported:                {422, "Split not supported", "split-unsupported"},
 	FailoverNeedsDecision:           {409, "The failover needs a decision", "failover-needs-decision"},

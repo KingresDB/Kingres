@@ -102,6 +102,9 @@ export const keys = {
     ['bucketDistribution', name, colocationId ?? null] as const,
   topology: ['topology'] as const,
   rebalance: ['rebalance'] as const,
+  schemas: (name: string) => ['schemas', name] as const,
+  schema: (name: string, schema: string) => ['schema', name, schema] as const,
+  drainPreview: (id: string) => ['drainPreview', id] as const,
   rebalanceReports: ['rebalanceReports'] as const,
   failover: ['failover'] as const,
   failoverReport: (id: number) => ['failoverReport', id] as const,
@@ -237,6 +240,35 @@ export const useTables = (name: MaybeRefOrGetter<string>) =>
     queryKey: computed(() => keys.tables(toValue(name))),
     queryFn: () =>
       fetchAllPages((cursor) => endpoints.listTables(toValue(name), cursor ? { cursor } : {})),
+  })
+
+/** All schemas of a database (follows cursors). */
+export const useSchemas = (name: MaybeRefOrGetter<string>) =>
+  useQuery({
+    queryKey: computed(() => keys.schemas(toValue(name))),
+    queryFn: async () => {
+      const out: Awaited<ReturnType<typeof endpoints.listSchemas>>['items'] = []
+      let cursor: string | undefined
+      do {
+        const page = await endpoints.listSchemas(toValue(name), cursor ? { cursor } : {})
+        out.push(...page.items)
+        cursor = page.nextCursor ?? undefined
+      } while (cursor)
+      return out
+    },
+    refetchInterval: 15_000,
+  })
+
+export const useSchemaDetail = (name: MaybeRefOrGetter<string>, schema: MaybeRefOrGetter<string>) =>
+  useQuery({
+    queryKey: computed(() => keys.schema(toValue(name), toValue(schema))),
+    queryFn: () => endpoints.getSchema(toValue(name), toValue(schema)),
+  })
+
+export const useDrainPreview = (id: MaybeRefOrGetter<string>) =>
+  useQuery({
+    queryKey: computed(() => keys.drainPreview(toValue(id))),
+    queryFn: () => endpoints.previewServerDrain(toValue(id)),
   })
 
 export const useColocationGroups = (name: MaybeRefOrGetter<string | null>) =>

@@ -151,6 +151,7 @@ Each task kind has exactly one `subject.type`; `subject.id` is always a string.
 | `database.create`, `database.update`, `database.drop` | `database` | the database name |
 | `table.distribute`, `table.undistribute`, `table.alter`, `table.partition` | `table` | `database/schema.table` (0.14.0: the table the request named; one table task per colocation group) |
 | `rebalance` | `cluster` | `cluster` (0.9.0; one rebalance at a time, cluster-wide; the task id is the report id): steps `Check that the cluster can rebalance`, `Compute the plan`, `Move buckets`, `Write the report`; a stopped run is `paused` |
+| `schema.distribute`, `schema.move`, `schema.undistribute` (0.16.0) | `schema` | `database/schema`: steps `Check the schema`, `Set REPLICA IDENTITY FULL`, `Make the schema distributed`, `Verify on every server`; `Check the move`, `Copy the data`, `Switch`, `Clean up the old copy`; `Check the schema`, `Move first`, `Make the schema local`, `Verify on every server`; one schema task at a time per schema |
 | `bucket.split` (0.16.0) | `bucket` | `database/colocationId/bucket`: steps `Check that the split can start`, `Split the bucket`, `Check the new buckets`; one split per colocation group at a time |
 | `replication.restorePreferredPrimaries` | `replication` | `preferred-primaries` (0.10.0: answers `unsupported_operation` until the switchover is built) |
 | `ledger.verify` | `ledgerVerification` | the **database name**: the verification id exists only after the run (see `LedgerVerification.taskId`) |
@@ -323,7 +324,7 @@ Where the architecture document leaves something open, the simplest option was c
 
 Revision written with the control plane of phases 10 (elasticity) and 11 (distributed schemas) of `kingres/docs/design/shard-phase10.md` and `shard-phase11.md`. It is built in increments; this
 entry grows with them. Summary for the panel:
-4 operations added (144 operations, 117 paths) so far (`drainServer`, `previewServerDrain`, `previewBucketSplit`, `splitBucket`); the six rebalance operations, `updateServer` and the cluster settings gain optional members; **no change that is not additive**.
+9 operations added (149 operations, 121 paths) (`drainServer`, `previewServerDrain`, `previewBucketSplit`, `splitBucket`, `listSchemas`, `getSchema`, `distributeSchema`, `undistributeSchema`, `moveSchema`); the six rebalance operations, `updateServer` and the cluster settings gain optional members; **no change that is not additive**.
 
 #### Breaking
 
@@ -344,6 +345,11 @@ None.
   `database/colocationId/bucket`): replace one bucket by 2, 4, 8 or 16 of a larger modulus on the same shard group. New schemas `BucketSplitRequest`, `BucketSplitPreview`, `BucketSplitChild`;
   `BucketState` has `splitting`; `ColocationGroup` has the optional `baseBucketCount`, `maxModulus`, `kind` and `schemaName` (`bucketCount` is now the current number of buckets); `Bucket` has `modulus` and
   `remainder`; `listColocationGroups` has the query `kind`; `TaskKind` has `bucket.split`, `TaskSubject.type` has `bucket`; `AuditAction` has `splitBucket`.
+- Distributed schemas (phase 11), tag `Schemas`: `listSchemas` and `getSchema` (`kingres_readonly`), `distributeSchema` and `undistributeSchema` (`kingres_admin`), `moveSchema` (`kingres_ops`); new schemas
+  `SchemaSummary`, `SchemaDistribution`, `SchemaDetail`, `SchemaBlocker`, `SchemaPage`, `DistributeSchemaRequest`, `MoveSchemaRequest`; task kinds `schema.distribute`, `schema.move`, `schema.undistribute` (subject type `schema`);
+  problem codes `sharding_mode_in_use`, `schema_not_distributable`, `schema_pinned`, `schema_move_in_progress`. The sharding mode: `ShardingCreateSettings` and `ShardingSettings` have `mode` (`row`, `schema`, `both`; the new
+  schema `ShardingMode`) and `distributeNewSchemas`, `bucketCount` is no longer required in a create request, `updateDatabase` takes `sharding.mode` and `sharding.distributeNewSchemas` (and `enabled` is optional),
+  `DatabaseCreateOptions` has `shardingModes`, `DatabaseStats` has `distributedSchemaCount`, `TableDistribution.method` has `schema`.
 - The automatic mode: `RebalanceSettings.automatic` (new schema `RebalanceAutomaticSettings`, with `RebalanceWindow`), updated through `RebalanceAutomaticSettingsUpdate`, and
   `RebalanceStatus.automatic` (`RebalanceAutomaticStatus`: whether it is on, when it looks next, what the last look decided and which rules held it back). `AlertKind` has `rebalanceFailed`.
 - `RebalanceSettings` has `strategy`, `threshold`, `maxMovesPerServer`, `maxMoveAttempts`, `maxDiskUsedFraction` and `maxStandbyLagBytes`; `updateClusterSettings` takes them in the new

@@ -64,6 +64,8 @@ tags:
     description: Tables of a database and the distribute-table action.
   - name: Shards
     description: Bucket map, colocation groups and per-server bucket distribution.
+  - name: Schemas
+    description: Schemas of a database and the distributed schemas (a schema that lives in one shard group).
   - name: Replication
     description: Shard group topology, lag, replication slots, preferred primaries.
   - name: Rebalance
@@ -1561,6 +1563,161 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /databases/{databaseName}/schemas:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+    get:
+      operationId: listSchemas
+      summary: List the schemas of a database
+      description: |
+        Added in 0.16.0. Every schema of the database that is not a system schema, ordered by name, with its distribution: a distributed schema
+        lives in one shard group (`distribution` not null), a local one does not (`distribution` null; also in a database without sharding).
+        `sizeBytes` is known for a distributed schema only (null is "not available", never 0). Schema names can be any text: show them as text.
+        Filters: `distributed`, `shardGroupId`, `state`.
+      tags: [Schemas]
+      x-required-role: kingres_readonly
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: distributed
+          in: query
+          required: false
+          description: Only distributed (true) or only local (false) schemas.
+          schema: { type: boolean }
+        - name: shardGroupId
+          in: query
+          required: false
+          description: Only the schemas that live in this shard group.
+          schema: { type: integer, format: int32 }
+        - name: state
+          in: query
+          required: false
+          description: Only distributed schemas in this state.
+          schema: { type: string, enum: [active, moving] }
+      responses:
+        '200':
+          description: A page of schemas.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SchemaPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /databases/{databaseName}/schemas/{schemaName}:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+      - $ref: '#/components/parameters/SchemaName'
+    get:
+      operationId: getSchema
+      summary: Get a schema
+      description: |
+        Added in 0.16.0. The summary of the schema, the objects that keep a local schema from being distributed (`distributionBlockers`, from
+        `kingres.schema_inventory`), why a distributed schema cannot move or become local (`pinned`, for example a ledger table), the task of a
+        move that is running (`moveInProgress`) and the tables that have no primary key and no replica identity (a move needs one of them).
+      tags: [Schemas]
+      x-required-role: kingres_readonly
+      responses:
+        '200':
+          description: The schema.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SchemaDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /databases/{databaseName}/schemas/{schemaName}/distribution:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+      - $ref: '#/components/parameters/SchemaName'
+    put:
+      operationId: distributeSchema
+      summary: Distribute a schema
+      description: |
+        Added in 0.16.0. Makes a local schema a distributed one: the data stays where it is (on the server that runs the map group primary, or on the
+        group named in `shardGroupId` while no table holds a row), the other servers receive empty tables, and every statement on the schema is then
+        routed to its group. Returns a task of kind `schema.distribute` (subject type `schema`, id `database/schema`). Refused with 409 `conflict` for a schema
+        that is distributed already or a database whose sharding mode is `row`, and with 422 `schema_not_distributable` (the objects in `errors`, `field`
+        the object and `message` its kind and reason) for a schema with unsupported objects. `setReplicaIdentityFull` makes the tables without a key movable.
+        Needs `kingres_admin`.
+      tags: [Schemas]
+      x-required-role: kingres_admin
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DistributeSchemaRequest' }
+      responses:
+        '202': { $ref: '#/components/responses/AcceptedTask' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+    delete:
+      operationId: undistributeSchema
+      summary: Make a distributed schema local
+      description: |
+        Added in 0.16.0. The way back: the schema stays on its group as a local schema and every other server drops its empty tables. With
+        `shardGroupId` the schema is moved to that group first. Returns a task of kind `schema.undistribute`. Refused with 409 `schema_pinned` (a ledger table),
+        `schema_move_in_progress` and `conflict` (the schema is local). Needs `kingres_admin`.
+      tags: [Schemas]
+      x-required-role: kingres_admin
+      parameters:
+        - name: shardGroupId
+          in: query
+          required: false
+          description: Move the schema to this group first.
+          schema: { type: integer, format: int32 }
+      responses:
+        '202': { $ref: '#/components/responses/AcceptedTask' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /databases/{databaseName}/schemas/{schemaName}/moves:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+      - $ref: '#/components/parameters/SchemaName'
+    post:
+      operationId: moveSchema
+      summary: Move a distributed schema to another shard group
+      description: |
+        Added in 0.16.0. Moves the data of the schema to the target group while the schema stays in service (`kingres.move_schema`); writers of the schema wait
+        for the switch only. Returns a task of kind `schema.move` with the steps `Check the move`, `Copy the data` (the detail shows the phase), `Switch` and
+        `Clean up the old copy` (the task does not wait for the old copy to be emptied). A cancel is accepted until the switch has started. A failed or cancelled move leaves the
+        schema active on its group. Refused with 409 `rebalance_in_progress`, `schema_move_in_progress`, `schema_pinned`, `conflict` (the schema is local); 422 `unprocessable` for a target
+        that does not exist, should not hold shards or is the current group, and for tables without a key unless `setReplicaIdentityFull`. Needs `kingres_ops`.
+      tags: [Schemas]
+      x-required-role: kingres_ops
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MoveSchemaRequest' }
+      responses:
+        '202': { $ref: '#/components/responses/AcceptedTask' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
         '422': { $ref: '#/components/responses/UnprocessableEntity' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /databases/{databaseName}/schemas/{schemaName}/tables/{tableName}:
@@ -5336,6 +5493,10 @@ components:
         - insufficient_disk
         - no_receiving_server
         - replicas_cannot_be_kept
+        - sharding_mode_in_use
+        - schema_not_distributable
+        - schema_pinned
+        - schema_move_in_progress
         - bucket_busy
         - split_unsupported
         - failover_needs_decision
@@ -7177,12 +7338,21 @@ components:
             - 'null'
           minimum: 1
           maximum: 4096
-          description: Number of hash buckets per colocation group. Fixed at creation (immutable). Null when not available.
+          description: Number of hash buckets per colocation group. Fixed at creation (immutable). Null when not available, and in mode `schema`.
           x-immutable: true
+        mode:
+          $ref: '#/components/schemas/ShardingMode'
+        distributeNewSchemas:
+          type: boolean
+          description: Added in 0.16.0, optional. Whether a schema created in the database is placed on a shard group by itself.
+    ShardingMode:
+      type: string
+      description: 'Added in 0.16.0. How tables are sharded: `row` (the default; a table is split into buckets by a column), `schema` (each schema lives in one shard group) or `both`. Clients must tolerate other values.'
+      enum: [row, schema, both]
     ShardingCreateSettings:
       type: object
       description: Sharding settings of a create request. A group that is present must be complete.
-      required: [enabled, bucketCount]
+      required: [enabled]
       properties:
         enabled:
           type: boolean
@@ -7193,8 +7363,14 @@ components:
           minimum: 1
           maximum: 4096
           default: 128
-          description: Number of hash buckets per colocation group, 1 to 4096, default 128. Fixed at creation (immutable).
+          description: Number of hash buckets per colocation group, 1 to 4096, default 128. Fixed at creation (immutable). Optional since 0.16.0 (it was required) and ignored in mode `schema`.
           x-immutable: true
+        mode:
+          $ref: '#/components/schemas/ShardingMode'
+        distributeNewSchemas:
+          type: boolean
+          default: false
+          description: Added in 0.16.0. Place every schema created in the database on a shard group. Only with mode `schema` or `both`.
     ReplicationSettings:
       type: object
       description: Replication settings as read back (response only; the create request uses `ReplicationCreateSettings`).
@@ -7255,6 +7431,12 @@ components:
       description: Live statistics of a database. A statistic the backend cannot measure is null ("not available"), never 0.
       required: [sizeBytes, tableCount, activeConnections, transactionsPerSecond]
       properties:
+        distributedSchemaCount:
+          type:
+            - integer
+            - 'null'
+          minimum: 0
+          description: Added in 0.16.0, optional. Distributed schemas; null when not available.
         sizeBytes:
           type:
             - integer
@@ -7407,12 +7589,18 @@ components:
         sharding:
           type: object
           description: Sharding changes.
-          required: [enabled]
+          minProperties: 1
+          additionalProperties: false
           properties:
             enabled:
               type: boolean
               enum: [true]
               description: Turn sharding on. Turning it off is not possible.
+            mode:
+              $ref: '#/components/schemas/ShardingMode'
+            distributeNewSchemas:
+              type: boolean
+              description: 'Added in 0.16.0. Default for new schemas. Changing the mode is synchronous (200); it is refused with 409 `sharding_mode_in_use` while schemas or tables of the other kind exist.'
         replication:
           type: object
           description: Replication changes.
@@ -7451,6 +7639,12 @@ components:
       description: What the create-database dialog offers.
       required: [encodings, collations, bucketCount, replicaCount, defaultDurability, ledgerDigestIntervalSeconds]
       properties:
+        shardingModes:
+          type: array
+          description: Added in 0.16.0, optional. The values of `sharding.mode`.
+          items: { $ref: '#/components/schemas/ShardingMode' }
+        shardingModeDefault:
+          $ref: '#/components/schemas/ShardingMode'
         encodings:
           type: array
           description: Valid values of `general.encoding`.
@@ -7516,8 +7710,8 @@ components:
       properties:
         method:
           type: string
-          enum: [hash, reference]
-          description: '`hash` distributes rows by hash of the column; `reference` copies the table to every group.'
+          enum: [hash, reference, schema]
+          description: '`hash` distributes rows by hash of the column; `reference` copies the table to every group; `schema` (0.16.0) the table belongs to a distributed schema and lives in its one group. Clients must tolerate other values.'
         column:
           type:
             - string
@@ -7894,6 +8088,153 @@ components:
       type: string
       description: '`active` normal; `moving` being copied to another group; `orphan` left-over shard awaiting deferred cleanup; `splitting` (0.16.0) being replaced by buckets of a larger modulus. Clients must tolerate other values.'
       enum: [active, moving, orphan, splitting]
+    SchemaDistribution:
+      type: object
+      description: Where a distributed schema lives.
+      required: [state, colocationId, shardGroupId, serverId, movingToShardGroupId]
+      properties:
+        state:
+          type: string
+          description: '`active` or `moving`. Clients must tolerate other values.'
+        colocationId:
+          type: integer
+          format: int32
+          description: The colocation group of the schema (one bucket).
+        shardGroupId:
+          type: integer
+          format: int32
+          description: The shard group that holds the schema.
+        serverId:
+          oneOf:
+            - $ref: '#/components/schemas/ServerId'
+            - type: 'null'
+          description: The server that runs the primary of the group; null when it has none.
+        movingToShardGroupId:
+          type:
+            - integer
+            - 'null'
+          format: int32
+          description: The target of a running move.
+    SchemaSummary:
+      type: object
+      description: One schema of a database.
+      required: [name, owner, distribution, tableCount, sizeBytes, estimatedRows]
+      properties:
+        name:
+          type: string
+          description: Schema name; any text.
+        owner:
+          type: string
+          description: Owner role.
+        distribution:
+          oneOf:
+            - $ref: '#/components/schemas/SchemaDistribution'
+            - type: 'null'
+          description: Null for a local schema.
+        tableCount:
+          type: integer
+          minimum: 0
+          description: Tables (partitions not counted).
+        sizeBytes:
+          type:
+            - integer
+            - 'null'
+          format: int64
+          minimum: 0
+          description: Bytes of the tables of a distributed schema; null when not available.
+        estimatedRows:
+          type:
+            - integer
+            - 'null'
+          format: int64
+          minimum: 0
+          description: The planner's estimate of the rows; null when not available.
+    SchemaBlocker:
+      type: object
+      description: An object that keeps a schema from being distributed.
+      required: [objectKind, objectName, reason]
+      properties:
+        objectKind:
+          type: string
+          description: Kind of the object.
+        objectName:
+          type: string
+          description: Name of the object.
+        reason:
+          type: string
+          description: Why it is not supported.
+    SchemaDetail:
+      description: A schema with what stands in the way of distributing or moving it.
+      allOf:
+        - $ref: '#/components/schemas/SchemaSummary'
+        - type: object
+          required: [distributionBlockers, pinned, moveInProgress, tablesWithoutReplicaIdentity]
+          properties:
+            distributionBlockers:
+              type: array
+              description: For a local schema, the unsupported objects; empty when it can be distributed.
+              items: { $ref: '#/components/schemas/SchemaBlocker' }
+            pinned:
+              oneOf:
+                - type: object
+                  description: Why the schema cannot move or become local.
+                  required: [reason]
+                  properties:
+                    reason:
+                      type: string
+                      description: The reason, for example a ledger table.
+                - type: 'null'
+              description: Null when nothing pins the schema.
+            moveInProgress:
+              type:
+                - integer
+                - 'null'
+              format: int64
+              description: The task of a move that is running.
+            tablesWithoutReplicaIdentity:
+              type: array
+              description: Tables with no primary key and no replica identity; a move needs one of them (`setReplicaIdentityFull` makes them movable).
+              items: { type: string }
+    SchemaPage:
+      type: object
+      description: A page of schemas.
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          description: Schemas, ordered by name.
+          items: { $ref: '#/components/schemas/SchemaSummary' }
+        nextCursor:
+          $ref: '#/components/schemas/NextCursor'
+    DistributeSchemaRequest:
+      type: object
+      description: Added in 0.16.0. Body of `distributeSchema`; every member is optional.
+      additionalProperties: false
+      properties:
+        shardGroupId:
+          type:
+            - integer
+            - 'null'
+          format: int32
+          description: The group that holds the schema; null or absent keeps the data where it is.
+        setReplicaIdentityFull:
+          type: boolean
+          default: false
+          description: Set REPLICA IDENTITY FULL on the tables that have no key, so that the schema can be moved later.
+    MoveSchemaRequest:
+      type: object
+      description: Added in 0.16.0. Body of `moveSchema`.
+      required: [targetShardGroupId]
+      additionalProperties: false
+      properties:
+        targetShardGroupId:
+          type: integer
+          format: int32
+          description: The group the schema moves to.
+        setReplicaIdentityFull:
+          type: boolean
+          default: false
+          description: Set REPLICA IDENTITY FULL on the tables that have no key (required to go on when there are any).
     BucketSplitRequest:
       type: object
       description: Added in 0.16.0. Body of `splitBucket` and `previewBucketSplit`; every member is optional.
@@ -8902,6 +9243,9 @@ components:
         - table.distribute
         - rebalance
         - bucket.split
+        - schema.distribute
+        - schema.move
+        - schema.undistribute
         - replication.restorePreferredPrimaries
         - ledger.verify
         - networkAccess.apply
@@ -9014,7 +9358,7 @@ components:
       properties:
         type:
           type: string
-          enum: [cluster, server, instance, database, table, rebalance, replication, ledgerVerification, networkAccess, config, ledgerKey, bucket]
+          enum: [cluster, server, instance, database, table, rebalance, replication, ledgerVerification, networkAccess, config, ledgerKey, bucket, schema]
           description: Resource type.
         id:
           type: string
@@ -9540,6 +9884,9 @@ components:
         - drainServer
         - splitBucket
         - previewBucketSplit
+        - distributeSchema
+        - undistributeSchema
+        - moveSchema
     AuditEvent:
       type: object
       description: One audit log entry.

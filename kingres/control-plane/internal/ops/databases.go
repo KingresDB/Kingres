@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
@@ -52,6 +53,8 @@ type createParams struct {
 	Servers        []string `json:"servers,omitempty"`
 	Sharding       bool     `json:"sharding"`
 	BucketCount    int      `json:"bucketCount"`
+	ShardingMode   string   `json:"shardingMode,omitempty"`
+	DistributeNew  bool     `json:"distributeNewSchemas,omitempty"`
 	Durability     string   `json:"durability"`
 	LedgerMode     string   `json:"ledgerMode"`
 	DigestInterval int      `json:"digestIntervalSeconds"`
@@ -61,7 +64,7 @@ type createParams struct {
 // Definitions returns the task definitions of this package; the engine that
 // runs them is built by the caller (cluster wiring).
 func (o *Ops) Definitions() []task.Definition {
-	return append(o.baseDefinitions(), o.tableDefinitions()...)
+	return append(append(o.baseDefinitions(), o.tableDefinitions()...), o.schemaDefinitions()...)
 }
 
 func (o *Ops) baseDefinitions() []task.Definition {
@@ -195,6 +198,17 @@ func (o *Ops) PrepareCreateDatabase(ctx context.Context, actor string, req api.D
 	}
 	if s := req.Sharding; s != nil {
 		p.Sharding = s.Enabled
+		if s.Mode != "" && s.Mode != "row" && s.Mode != "schema" && s.Mode != "both" {
+			errs = append(errs, field("/sharding/mode", "must be row, schema or both", "enum"))
+		}
+		if s.Mode != "" && s.Mode != "row" && !s.Enabled {
+			errs = append(errs, field("/sharding/mode", "needs sharding to be enabled", "invalid_combination"))
+		}
+		if s.DistributeNewSchemas != nil && *s.DistributeNewSchemas && s.Mode != "schema" && s.Mode != "both" {
+			errs = append(errs, field("/sharding/distributeNewSchemas", "needs the mode schema or both", "invalid_combination"))
+		}
+		p.ShardingMode = s.Mode
+		p.DistributeNew = s.DistributeNewSchemas != nil && *s.DistributeNewSchemas
 		if s.BucketCount != 0 {
 			if s.BucketCount < 1 || s.BucketCount > 4096 {
 				errs = append(errs, field("/sharding/bucketCount", "must be between 1 and 4096", "out_of_range"))
@@ -321,7 +335,7 @@ func (o *Ops) stepRecordSettings(ctx context.Context, env *task.Env) error {
 	if err != nil {
 		return err
 	}
-	return o.asService(ctx, sysdb.Database, func(tx pgx.Tx) error {
+	if err := o.asService(ctx, sysdb.Database, func(tx pgx.Tx) error {
 		bc := any(nil)
 		if p.Sharding {
 			bc = p.BucketCount
@@ -337,6 +351,43 @@ func (o *Ops) stepRecordSettings(ctx context.Context, env *task.Env) error {
 			return err
 		}
 		return o.setDurability(ctx, tx, p.Name, p.Durability)
+	}); err != nil {
+		return err
+	}
+	if p.Sharding && (p.ShardingMode == "schema" || p.ShardingMode == "both") {
+		return o.setShardingMode(ctx, p.Name, p.ShardingMode, &p.DistributeNew)
+	}
+	return nil
+}
+
+// setShardingMode calls kingres.set_sharding_mode in the database (map group primary: this server). A refusal of the
+// extension (it names the schemas or tables that stand in the way) is 409 sharding_mode_in_use.
+func (o *Ops) setShardingMode(ctx context.Context, db, mode string, distributeNew *bool) error {
+	return o.withDB(ctx, db, func(c *pgx.Conn) error {
+		var has bool
+		if err := c.QueryRow(ctx, `SELECT to_regprocedure('kingres.set_sharding_mode(text,boolean)') IS NOT NULL`).Scan(&has); err != nil {
+			return PGProblem(err)
+		}
+		if !has {
+			return problem.New(problem.UnsupportedOp, "The sharding extension of database "+db+" is older than 0.8; it has no sharding modes.")
+		}
+		var dn any
+		if distributeNew != nil {
+			dn = *distributeNew
+		}
+		if mode == "" { // keep the mode, change only the default for new schemas
+			if err := c.QueryRow(ctx, `SELECT mode FROM kingres.sharding_settings`).Scan(&mode); err != nil {
+				return PGProblem(err)
+			}
+		}
+		if _, err := c.Exec(ctx, `SELECT kingres.set_sharding_mode($1, $2)`, mode, dn); err != nil {
+			var pe *pgconn.PgError
+			if errors.As(err, &pe) && (pe.Code == "55000" || pe.Code == "0A000") {
+				return problem.New(problem.ShardingModeInUse, pe.Message)
+			}
+			return PGProblem(err)
+		}
+		return nil
 	})
 }
 
@@ -439,8 +490,16 @@ func (o *Ops) UpdateDatabase(ctx context.Context, actor, name string, req api.Da
 			errs = append(errs, field("/replication/durability", "must be async, sync or syncApply", "enum"))
 		}
 	}
-	if s := req.Sharding; s != nil && !s.Enabled {
+	if s := req.Sharding; s != nil && s.Enabled != nil && !*s.Enabled {
 		return problem.New(problem.ImmutableField, "Sharding cannot be turned off.")
+	}
+	if s := req.Sharding; s != nil {
+		if s.Enabled == nil && s.Mode == nil && s.DistributeNewSchemas == nil {
+			errs = append(errs, field("/sharding", "at least one property is required", "required"))
+		}
+		if s.Mode != nil && *s.Mode != "row" && *s.Mode != "schema" && *s.Mode != "both" {
+			errs = append(errs, field("/sharding/mode", "must be row, schema or both", "enum"))
+		}
 	}
 	if l := req.Ledger; l != nil {
 		switch l.Mode {
@@ -495,11 +554,24 @@ func (o *Ops) UpdateDatabase(ctx context.Context, actor, name string, req api.Da
 			}
 			return err
 		}
-		if s := req.Sharding; s != nil && s.Enabled && !sharding {
+		if s := req.Sharding; s != nil && s.Enabled != nil && *s.Enabled && !sharding {
 			if err := o.installExtensions(ctx, name, true, false); err != nil {
 				return err
 			}
 			if _, err := tx.Exec(ctx, "UPDATE kingres_cp.database_setting SET sharding_enabled = true, bucket_count = coalesce(bucket_count, 128) WHERE database_name = $1", name); err != nil {
+				return err
+			}
+			sharding = true
+		}
+		if s := req.Sharding; s != nil && (s.Mode != nil || s.DistributeNewSchemas != nil) {
+			if !sharding {
+				return problem.New(problem.Conflict, "Sharding is not enabled in this database; enable it first.")
+			}
+			mode := ""
+			if s.Mode != nil {
+				mode = *s.Mode
+			}
+			if err := o.setShardingMode(ctx, name, mode, s.DistributeNewSchemas); err != nil {
 				return err
 			}
 		}

@@ -26,6 +26,10 @@ type DatabaseGeneralInput struct {
 type ShardingInput struct {
 	Enabled     bool `json:"enabled"`
 	BucketCount int  `json:"bucketCount,omitempty"`
+	// Mode is row (the default), schema or both (contract 0.16.0).
+	Mode string `json:"mode,omitempty"`
+	// DistributeNewSchemas places every new schema on a shard group; only with mode schema or both.
+	DistributeNewSchemas *bool `json:"distributeNewSchemas,omitempty"`
 }
 
 // ReplicationInput are the replication settings of a new database.
@@ -45,11 +49,16 @@ type DatabaseUpdateRequest struct {
 		Owner           string `json:"owner,omitempty"`
 		ConnectionLimit *int   `json:"connectionLimit,omitempty"`
 	} `json:"general,omitempty"`
-	Sharding *struct {
-		Enabled bool `json:"enabled"`
-	} `json:"sharding,omitempty"`
-	Replication *ReplicationInput `json:"replication,omitempty"`
-	Ledger      *LedgerInput      `json:"ledger,omitempty"`
+	Sharding    *DatabaseShardingUpdate `json:"sharding,omitempty"`
+	Replication *ReplicationInput       `json:"replication,omitempty"`
+	Ledger      *LedgerInput            `json:"ledger,omitempty"`
+}
+
+// DatabaseShardingUpdate is the "sharding" member of updateDatabase: every member is optional, one is needed (contract 0.16.0).
+type DatabaseShardingUpdate struct {
+	Enabled              *bool   `json:"enabled,omitempty"`
+	Mode                 *string `json:"mode,omitempty"`
+	DistributeNewSchemas *bool   `json:"distributeNewSchemas,omitempty"`
 }
 
 // DistributeTableRequest is the body of PUT .../distribution.

@@ -382,7 +382,7 @@ const MUST_MENTION = {
   '0.10.0': ['getFailoverStatus', 'listFailoverReports', 'getFailoverReport', 'resetAutoFailoverCounter', 'failover_needs_decision', 'quorum_unavailable', 'lease_settings_differ', 'allowDataLoss', 'shardGroupId', 'additive'],
   '0.11.0': ['getLedgerSigning', 'createLedgerSigningKey', 'getLedgerTrustFile', 'getLedgerAggregate', 'createLedgerAnchorTarget', 'ledger_not_published', 'origin_prefix_locked', 'signing_key_missing', 'last_signing_key', 'chain_not_diverged', 'ledgerSignerUnavailable', 'ledger.key.create', 'aggregateSize', 'additive'],
   '0.13.0': ['certificateAuthorityUnavailable', 'failoverServer', 'taskId', 'additive'],
-  '0.16.0': ['byDiskSize', 'RebalanceOptions', 'weight', 'RebalanceSettingsUpdate', 'excludeServerIds', 'drainServer', 'previewServerDrain', 'replicas_cannot_be_kept', 'RebalanceAutomaticSettings', 'rebalanceFailed', 'previewBucketSplit', 'splitBucket', 'bucket.split', 'splitting', 'additive'],
+  '0.16.0': ['byDiskSize', 'RebalanceOptions', 'weight', 'RebalanceSettingsUpdate', 'excludeServerIds', 'drainServer', 'previewServerDrain', 'replicas_cannot_be_kept', 'RebalanceAutomaticSettings', 'rebalanceFailed', 'previewBucketSplit', 'splitBucket', 'bucket.split', 'splitting', 'listSchemas', 'distributeSchema', 'moveSchema', 'schema_pinned', 'ShardingMode', 'additive'],
   '0.14.0': ['previewTableChange', 'undistributeTable', 'alterTableDistribution', 'createTablePartition', 'table_not_eligible', 'dependentViews', 'additive'],
   '0.12.0': ['completedWithWarnings', 'failover_needs_decision', 'plan', 'notScheduled', 'additive'],
   '0.9.0': ['startRebalance', 'previewRebalancePlan', 'nothing_to_rebalance', 'cluster_inconsistent', 'skipped', 'ledgerSummary', 'Prefer', 'additive'],
