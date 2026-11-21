@@ -339,6 +339,10 @@ func cleanStop(ctx context.Context, mgr stopManager, lm stopLeases, fh *fault.Ho
 		return out, nil
 	}
 	cd, err := mgr.ControlData(ctx, id)
+	if fh.FailoverInjection("demote:controldata") == "fail" {
+		// A test: pg_controldata cannot be read after the stop.
+		cd, err = nil, errors.New("injected: pg_controldata failed")
+	}
 	if err != nil {
 		// The instance is stopped and the answer cannot be given: the renewal ends here too (F5-07), or the lease of a primary that does not run would be renewed until a repair.
 		_ = lm.Relinquish(group)

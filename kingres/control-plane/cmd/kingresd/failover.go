@@ -906,6 +906,17 @@ func handleFailoverPromote(ctx context.Context, d *haDeps, body []byte) (any, er
 	if d.LeaseMgr == nil || d.Standby == nil {
 		return nil, notStarted
 	}
+	// Tests of the planned switchover of the map group: the call answers "unavailable" for as long as the fault is in force (a candidate that never promotes),
+	// or holds for 20 s before it does anything (an abandon that arrives while the call is in flight).
+	if d.Fault.FailoverInjection("promote:unavailable") == "unavailable" {
+		return nil, &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The instance cannot be reached."}
+	}
+	if d.Fault.FailoverInjection("promote:slow") == "slow" {
+		select {
+		case <-time.After(20 * time.Second):
+		case <-ctx.Done():
+		}
+	}
 	started := time.Now()
 	// The promotion runs under the standby agent's lifecycle lock: the agent proves that a directory is a standby and
 	// removes or rebuilds it under the same lock, so a removal cannot be between the proof and the delete while this
@@ -965,6 +976,10 @@ func handleFailoverPromote(ctx context.Context, d *haDeps, body []byte) (any, er
 	//    primary wrote up to its shutdown checkpoint, and nothing beyond it. A standby that is behind, or an old primary that was
 	//    started again and wrote more, is refused before anything is changed: the call is still before the point of no return.
 	if r.Checkpoint != "" && !r.ReapplyList {
+		// A test: the standby has not replayed the shutdown checkpoint yet, for the first FailoverTimes calls (replication lag after the stop).
+		if d.Fault.FailoverInjectionOnce("promote:behind") == "fail" {
+			return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "standby_behind", Message: "The standby does not hold everything the old primary wrote."}
+		}
 		vc, verr := d.Svc.InstanceConn(ctx, li.ID, dbOrSystem(""))
 		if verr != nil {
 			return nil, &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The proof cannot be asked: the instance cannot be reached."}
