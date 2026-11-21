@@ -75,6 +75,10 @@ type Leader struct {
 	ReplaceAfter time.Duration
 	// Dead says that the leader's liveness view calls a server dead (nil: none is).
 	Dead func(server string) bool
+	// Excluded names the servers that are taken out of the ring: a server that is being drained keeps no standby and gets none
+	// (design shard-phase10.md 11.3 step 5). The reconcile then places the standbys it hosted on the servers that remain and removes
+	// the old ones. nil: none.
+	Excluded func(ctx context.Context) map[string]bool
 
 	st   store
 	kick chan struct{}
@@ -193,7 +197,27 @@ func (l *Leader) readTopology(ctx context.Context) (topology, error) {
 		}
 		t.groups = append(t.groups, groupInfo{ID: g, Primary: host, Port: port})
 	}
-	return t, rows.Err()
+	if err := rows.Err(); err != nil {
+		return t, err
+	}
+	if l.Excluded != nil {
+		t.ring = WithoutServers(t.ring, l.Excluded(ctx))
+	}
+	return t, nil
+}
+
+// WithoutServers is the ring without the excluded servers (the order of the rest is kept).
+func WithoutServers(ring []Server, excluded map[string]bool) []Server {
+	if len(excluded) == 0 {
+		return ring
+	}
+	out := make([]Server, 0, len(ring))
+	for _, s := range ring {
+		if !excluded[s.ID] {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func (l *Leader) replicas(ctx context.Context) (int, error) {

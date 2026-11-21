@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 )
@@ -79,5 +80,42 @@ func TestPlanAddsTheDrainedServerToTheExclusion(t *testing.T) {
 	// the same rule as PG.Plan applies, tested on the options (the SQL is covered by the cluster tests)
 	if needsExtension08(o) != true {
 		t.Fatal("a drain needs plan_rebalance")
+	}
+}
+
+func TestDrainStandbyStep(t *testing.T) {
+	ctx := context.Background()
+	s := &Service{}
+	// not a drain, or no standby management: skipped
+	if err := s.stepDrainStandbys(ctx, nil, nil, Options{}); err == nil {
+		t.Error("a rebalance skips the step")
+	}
+	if err := s.stepDrainStandbys(ctx, nil, nil, Options{DrainServer: "a"}); err == nil {
+		t.Error("a build without the hook skips the step")
+	}
+	// the standbys leave in two rounds
+	left := []int{2, 1, 0}
+	calls := 0
+	s = &Service{DrainWait: time.Minute, DrainPoll: time.Millisecond, RelocateStandbys: func(context.Context, string) (int, error) {
+		n := left[min(calls, len(left)-1)]
+		calls++
+		return n, nil
+	}}
+	if err := s.stepDrainStandbys(ctx, nil, nil, Options{DrainServer: "a"}); err != nil || calls != 3 {
+		t.Fatalf("relocation in rounds: %v after %d calls", err, calls)
+	}
+	// nobody can take them: without acceptFewerReplicas the step fails with its code, with it the step ends
+	stuck := &Service{DrainWait: 5 * time.Millisecond, DrainPoll: time.Millisecond, RelocateStandbys: func(context.Context, string) (int, error) { return 1, nil }}
+	err := stuck.stepDrainStandbys(ctx, nil, nil, Options{DrainServer: "a"})
+	if err == nil || codeOf(t, err) != problem.ReplicasCannotBeKept {
+		t.Fatalf("stuck standbys: %v", err)
+	}
+	if err := stuck.stepDrainStandbys(ctx, nil, nil, Options{DrainServer: "a", AcceptFewerReplicas: true}); err != nil {
+		t.Fatalf("accepted: %v", err)
+	}
+	// a failure of the hook is the failure of the step
+	boom := &Service{RelocateStandbys: func(context.Context, string) (int, error) { return 0, errors.New("boom") }}
+	if err := boom.stepDrainStandbys(ctx, nil, nil, Options{DrainServer: "a"}); err == nil {
+		t.Fatal("the error of the hook")
 	}
 }

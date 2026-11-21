@@ -57,8 +57,13 @@ type Service struct {
 	SetShouldHaveShards func(ctx context.Context, server string, want bool) error
 	// RemoveServer starts the task server.remove (a drain with removeWhenDone, after the drain task ended).
 	RemoveServer func(ctx context.Context, actor, id string) (task.Task, error)
+	// RelocateStandbys takes the server out of the ring of the standbys, asks for a reconcile and returns how many standbys the server
+	// still hosts. nil: the step is skipped.
+	RelocateStandbys func(ctx context.Context, server string) (int, error)
 	// DrainWait bounds the wait for the server to own no bucket (default 30 minutes).
 	DrainWait time.Duration
+	// DrainPoll is the pause between two looks at a drain (default 3 s).
+	DrainPoll time.Duration
 	// IsLeader tells whether this server is the manager leader; the automatic job does nothing elsewhere. nil: always.
 	IsLeader func(ctx context.Context) bool
 }
@@ -98,6 +103,7 @@ func (s *Service) Definitions() []task.Definition {
 			step(StepPlan, s.stepPlan),
 			step(StepMove, s.stepMove),
 			step(StepDrainEmpty, s.stepDrainEmpty),
+			step(StepDrainStandbys, s.stepDrainStandbys),
 			step(StepWrite, s.stepWrite),
 			step(StepDrainEnd, s.stepDrainEnd),
 		},

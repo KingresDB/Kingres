@@ -35,9 +35,10 @@ import (
 
 // Drain step names (shown to users); the first of a rebalance's steps is shared.
 const (
-	StepDrainFlag  = "Stop new buckets from landing on the server"
-	StepDrainEmpty = "Wait until the server owns no bucket"
-	StepDrainEnd   = "Remove the server"
+	StepDrainFlag     = "Stop new buckets from landing on the server"
+	StepDrainEmpty    = "Wait until the server owns no bucket"
+	StepDrainStandbys = "Relocate the standbys hosted on the server"
+	StepDrainEnd      = "Remove the server"
 )
 
 // DrainRequest is the body of drainServer.
@@ -284,6 +285,13 @@ func (s *Service) stepDrainEmpty(ctx context.Context, env *task.Env, _ *PGRows, 
 	}
 }
 
+func (s *Service) drainPoll() time.Duration {
+	if s.DrainPoll > 0 {
+		return s.DrainPoll
+	}
+	return 3 * time.Second
+}
+
 func (s *Service) drainWait() time.Duration {
 	if s.DrainWait > 0 {
 		return s.DrainWait
@@ -313,6 +321,46 @@ func (s *Service) bucketsOn(ctx context.Context, server string) (int, error) {
 		total += n
 	}
 	return total, nil
+}
+
+// stepDrainStandbys takes the server out of the ring of the standbys and waits until it hosts none (design 11.3 step 5): the
+// reconcile of phase 5 creates the replacements on the servers that remain before it removes the old ones. With
+// acceptFewerReplicas a group that cannot be placed anywhere else stays with fewer standbys after the wait; without it the
+// step fails and the operator lowers the replica count. A drain without the hook (a build without standby management) skips it.
+func (s *Service) stepDrainStandbys(ctx context.Context, env *task.Env, _ *PGRows, o Options) error {
+	if o.DrainServer == "" {
+		return task.Skip("not a drain")
+	}
+	if s.RelocateStandbys == nil {
+		return task.Skip("this build does not manage standbys")
+	}
+	deadline := time.Now().Add(s.drainWait())
+	for {
+		left, err := s.RelocateStandbys(ctx, o.DrainServer)
+		if err != nil {
+			return err
+		}
+		if left == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			if o.AcceptFewerReplicas {
+				if env != nil {
+					_ = env.SetDetail(ctx, fmt.Sprintf("%d standbys stay on %s: no other server can take them", left, o.DrainServer))
+				}
+				return nil
+			}
+			return problem.New(problem.ReplicasCannotBeKept, fmt.Sprintf("%d standbys are still on server %s and no other server can take them; lower the replica count or accept fewer copies.", left, o.DrainServer))
+		}
+		if env != nil {
+			_ = env.SetDetail(ctx, fmt.Sprintf("%d standbys are still on %s", left, o.DrainServer))
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(s.drainPoll()):
+		}
+	}
 }
 
 // stepDrainEnd starts the removal of the server after this task has ended (a drain with removeWhenDone only).

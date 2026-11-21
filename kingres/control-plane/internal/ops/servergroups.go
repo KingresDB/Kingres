@@ -319,6 +319,13 @@ func (o *Ops) UpdateServer(ctx context.Context, serverID string, cur ServerPlace
 			if err := o.setShouldHaveShards(ctx, serverID, *req.ShouldHaveShards); err != nil {
 				return err
 			}
+			if *req.ShouldHaveShards {
+				// a server given back to service is a place for standbys again (it was taken out of their ring by a drain)
+				if _, err := tx.Exec(ctx, `UPDATE kingres_cp.cluster_setting SET value = coalesce((SELECT jsonb_agg(x) FROM jsonb_array_elements_text(value) x
+					WHERE x <> $1), '[]'::jsonb), updated_at = now() WHERE key = $2`, serverID, DrainExcludedKey); err != nil {
+					return err
+				}
+			}
 		}
 		if changeWeight {
 			return o.setWeight(ctx, serverID, *req.Weight)
@@ -326,6 +333,9 @@ func (o *Ops) UpdateServer(ctx context.Context, serverID string, cur ServerPlace
 		return nil
 	}))
 }
+
+// DrainExcludedKey is the cluster setting that lists the servers a drain has taken out of the ring of the standbys.
+const DrainExcludedKey = "drain.excludedServers"
 
 // SetShouldHaveShards writes the flag of a server to the shard catalog of every database (the drain uses it).
 func (o *Ops) SetShouldHaveShards(ctx context.Context, server string, want bool) error {

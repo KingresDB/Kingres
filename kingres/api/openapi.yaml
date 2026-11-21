@@ -1120,13 +1120,15 @@ paths:
         task, and no other rebalance or change of the servers can run meanwhile.
 
         Refused before a task exists: 404 for an unknown server; 409 `last_server`; 409 `no_receiving_server` (no other server runs a
-        primary and should hold shards); 409 `server_hosts_map_group` (this revision does not hand the map group over: fail it over first);
+        primary and should hold shards); 409 `server_hosts_map_group` (this revision does not hand the map group over: fail it over first, "not built yet");
         409 `replicas_cannot_be_kept` (fewer servers than `replicaCount + 1` would remain; `acceptFewerReplicas` overrides); 409
         `group_degraded` (a group of the server has fewer healthy standbys than the replica count); 409 `rebalance_in_progress` and
         `operation_in_progress`; 422 `node_state_invalid` for a `dead` server; 422 `unprocessable` when the server holds ordinary
-        (not distributed) tables that leave with it and `acknowledgeLocalData` is not true. This revision does not relocate standbys
-        that the server hosts: the groups are listed by `previewServerDrain` (`standbyShardGroupIds`) and the replica count is not
-        reduced by the drain itself. Needs `kingres_ops`.
+        (not distributed) tables that leave with it and `acknowledgeLocalData` is not true. The standbys that the server hosts are
+        relocated by the step `Relocate the standbys hosted on the server`: the server is taken out of the ring of the standbys, the reconcile of the standbys
+        places the replacements on the other servers before it removes the old ones, and the step waits until none is left (the groups are listed by
+        `previewServerDrain`, `standbyShardGroupIds`); when another server cannot take them the task fails with `replicas_cannot_be_kept` unless `acceptFewerReplicas`.
+        A server that runs the primary of the map group is refused (this revision has no hand-over of the map group). Needs `kingres_ops`.
       tags: [Servers]
       x-required-role: kingres_ops
       requestBody:
@@ -8809,6 +8811,14 @@ components:
           minimum: 0
           maximum: 1000
           description: Priority from 0 to 1000; higher moves run earlier.
+        kind:
+          type: string
+          description: 'Added in 0.16.0, optional. `move` (the default) or `schema`: a unit of the plan that is a distributed schema. The extension does not plan schemas yet; a panel shows them when a server sends them.'
+        schemaName:
+          type:
+            - string
+            - 'null'
+          description: Added in 0.16.0, optional. The schema, for kind `schema`.
         cost:
           type: integer
           format: int64
@@ -8921,6 +8931,14 @@ components:
         toServerId:
           type: string
           description: Added in 0.9.0, optional. The server that runs the primary of the destination group.
+        kind:
+          type: string
+          description: 'Added in 0.16.0, optional. What moves: `move` (a bucket, the default), `split` (a bucket is being split) or `schema` (a distributed schema, one bucket of its own group). Clients must tolerate other values.'
+        schemaName:
+          type:
+            - string
+            - 'null'
+          description: Added in 0.16.0, optional. The schema, for kind `schema`; a name can be any text, so show it as text.
         phase:
           type: string
           enum: [prepare, copy, catchUp, switch, cleanup]

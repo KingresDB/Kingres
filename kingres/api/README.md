@@ -350,6 +350,7 @@ None.
   problem codes `sharding_mode_in_use`, `schema_not_distributable`, `schema_pinned`, `schema_move_in_progress`. The sharding mode: `ShardingCreateSettings` and `ShardingSettings` have `mode` (`row`, `schema`, `both`; the new
   schema `ShardingMode`) and `distributeNewSchemas`, `bucketCount` is no longer required in a create request, `updateDatabase` takes `sharding.mode` and `sharding.distributeNewSchemas` (and `enabled` is optional),
   `DatabaseCreateOptions` has `shardingModes`, `DatabaseStats` has `distributedSchemaCount`, `TableDistribution.method` has `schema`.
+- `BucketMove` (the moves in flight) and `PlannedMove` have the optional `kind` (`move`, `split` or `schema`) and `schemaName`; the extension plans no schema yet, a panel shows one when a server sends it.
 - The automatic mode: `RebalanceSettings.automatic` (new schema `RebalanceAutomaticSettings`, with `RebalanceWindow`), updated through `RebalanceAutomaticSettingsUpdate`, and
   `RebalanceStatus.automatic` (`RebalanceAutomaticStatus`: whether it is on, when it looks next, what the last look decided and which rules held it back). `AlertKind` has `rebalanceFailed`.
 - `RebalanceSettings` has `strategy`, `threshold`, `maxMovesPerServer`, `maxMoveAttempts`, `maxDiskUsedFraction` and `maxStandbyLagBytes`; `updateClusterSettings` takes them in the new

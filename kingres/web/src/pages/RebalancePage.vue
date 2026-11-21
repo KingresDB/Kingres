@@ -289,7 +289,15 @@ const stoppedByText = computed(() =>
                 :key="`${m.databaseName}-${m.colocationId}-${m.bucket}`"
               >
                 <td><SafeName :value="m.databaseName" :max="60" /></td>
-                <td class="num">{{ m.bucket }}</td>
+                <td class="num" :data-kind="m.kind ?? 'move'">
+                  <template v-if="m.kind === 'schema'"
+                    >Schema <SafeName :value="m.schemaName ?? ''" :max="60"
+                  /></template>
+                  <template v-else
+                    >{{ m.bucket
+                    }}<span v-if="m.kind === 'split'" class="muted"> (splitting)</span></template
+                  >
+                </td>
                 <td>
                   <SafeName v-if="m.fromServerId" :value="m.fromServerId" :max="80" />
                   <template v-else>group {{ m.fromShardGroupId }}</template>
@@ -481,7 +489,17 @@ const stoppedByText = computed(() =>
                     :key="`${m.databaseName}-${m.colocationId}-${m.bucket}`"
                   >
                     <td><SafeName :value="m.databaseName" :max="60" /></td>
-                    <td class="num">{{ m.bucket }}</td>
+                    <td class="num" :data-kind="m.kind ?? 'move'">
+                      <template v-if="m.kind === 'schema'"
+                        >Schema <SafeName :value="m.schemaName ?? ''" :max="60"
+                      /></template>
+                      <template v-else
+                        >{{ m.bucket
+                        }}<span v-if="m.kind === 'split'" class="muted">
+                          (splitting)</span
+                        ></template
+                      >
+                    </td>
                     <td>
                       <SafeName v-if="m.fromServerId" :value="m.fromServerId" :max="80" />
                       <template v-else>group {{ m.fromShardGroupId }}</template>

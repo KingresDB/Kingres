@@ -100,6 +100,9 @@ type PlannedMove struct {
 	FromServerID       string `json:"fromServerId,omitempty"`
 	ToServerID         string `json:"toServerId,omitempty"`
 	EstimatedSizeBytes *int64 `json:"estimatedSizeBytes"`
+	// Kind is move or schema and SchemaName the schema (contract 0.16.0, optional; the extension plans no schema yet).
+	Kind       string  `json:"kind,omitempty"`
+	SchemaName *string `json:"schemaName,omitempty"`
 	// Cost is what the plan counted for the bucket: 1, or its bytes by disk size (contract 0.16.0, optional).
 	Cost *int64 `json:"cost,omitempty"`
 	// Reason is balance or drain (contract 0.16.0, optional).
@@ -140,16 +143,19 @@ type RebalancePlan struct {
 
 // BucketMove is a move in flight.
 type BucketMove struct {
-	DatabaseName     string  `json:"databaseName"`
-	ColocationID     int32   `json:"colocationId"`
-	Bucket           int32   `json:"bucket"`
-	FromShardGroupID int32   `json:"fromShardGroupId"`
-	ToShardGroupID   int32   `json:"toShardGroupId"`
-	FromServerID     string  `json:"fromServerId,omitempty"`
-	ToServerID       string  `json:"toServerId,omitempty"`
-	Phase            string  `json:"phase"`
-	Percent          float64 `json:"percent"`
-	SizeBytes        *int64  `json:"sizeBytes"`
+	DatabaseName     string `json:"databaseName"`
+	ColocationID     int32  `json:"colocationId"`
+	Bucket           int32  `json:"bucket"`
+	FromShardGroupID int32  `json:"fromShardGroupId"`
+	ToShardGroupID   int32  `json:"toShardGroupId"`
+	FromServerID     string `json:"fromServerId,omitempty"`
+	ToServerID       string `json:"toServerId,omitempty"`
+	// Kind is move, split or schema and SchemaName the schema (contract 0.16.0, optional).
+	Kind       string  `json:"kind,omitempty"`
+	SchemaName *string `json:"schemaName,omitempty"`
+	Phase      string  `json:"phase"`
+	Percent    float64 `json:"percent"`
+	SizeBytes  *int64  `json:"sizeBytes"`
 }
 
 // RebalanceProgress are the counters of a run.

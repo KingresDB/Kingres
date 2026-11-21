@@ -355,6 +355,9 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		if members != nil {
 			rbs.RemoveServer = members.RemoveServer
 		}
+		if stby != nil && stby.leader != nil {
+			wireStandbyRelocation(rbs, stby.leader, opsSvc, svc)
+		}
 		deps.Rebalance = rbs
 	}
 	foDeps := &failoverDeps{}

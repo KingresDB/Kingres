@@ -1607,3 +1607,15 @@ per-move check (`Disk`); the rules `maxStandbyLagBytes` and the window are setti
 
 **Split (section 9.3).** The preview cannot find a table without a primary key (the owner's tables are not readable from the map group primary); the extension refuses it when `split_bucket` starts and the task fails with
 `split_unsupported`. The task does not wait for the orphans to be dropped (`cleanup_bucket_splits` is the recovery worker's). The size estimate comes from the extension's plan inputs (`internal_plan_inputs('by_disk_size', ...)`).
+
+**Corrections to section 22 (same round).**
+
+- *`Make the schema distributed` of phase 11 is not marked `NonIdempotent` (departs from shard-phase11.md 13.1).* The design marks the step so that an interrupted run fails with `step_interrupted` instead of calling
+  `distribute_schema` twice. The step reads `kingres.schemas` before it calls the function and does nothing when the schema is distributed already, which is the design's own remedy for a retry ("its result is known by reading
+  `kingres.dist_schema`"). The function is one two-phase transaction, so after an interruption the schema is either distributed or not, and the read says which. With the mark, a crash of the leader between the call and the record of
+  the step would fail a task whose work is done and ask a person to look; without it the task finishes. A call that was cut while still running is refused by the extension as "already distributed" only if the transaction committed, which is the case the read finds first.
+- *Step 5 of the drain (section 11.3, the standbys hosted on the server) is built; step 4 (the map group) is not built yet.* Step 5 is the standby reconcile of phase 5 (`standby.Leader`) with the draining server taken out of its ring
+  (the hook `Excluded`, fed by the cluster setting `drain.excludedServers`, which a return to service clears), then a wait until no `kingres.node` row of role standby is on the server. It has unit tests (`standby/exclusion_test.go`, `rebalance/drain_test.go`)
+  and no cluster test yet. Step 4 (the map group) is the planned switchover of the map group of the failover branch
+  (the old leader hands the bootstrap to a standby of group 0 on another server, `server.failover` graceful for group 0), after which the drain task continues on the new leader. Until step 4 exists `drainServer` refuses a server that
+  runs the map group primary (`server_hosts_map_group`); a server whose standbys the others cannot take fails the relocation step with `replicas_cannot_be_kept` (or ends it with fewer standbys under `acceptFewerReplicas`).

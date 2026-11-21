@@ -763,7 +763,7 @@ The console is Vue 3 with TypeScript; the generated types come from `kingres/api
 - **Mock.** `src/mocks/elasticity.ts` has the new operations: schemas `failme` (the task fails), `analytics` (a blocker), `ledgerdocs` (pinned), `nokey` (a table without a key), a hostile name, and distributed ones; a drain, a split, weights, settings of
   the automatic mode.
 - **Tests.** `tests/elasticity-0-16.test.ts` (18 tests: the options and the automatic card for both roles, the weight and its validation, the drain, the return to service, the split, the schemas list with a hostile name, the blockers, a failing task,
-  the replica identity, a pinned schema, the typed confirmation, the read-only role, the create dialog). Not done: axe checks of the new dialogs in the browser tests, the layout at 320 px, and the schema moves in the in-flight list of the rebalance page.
+  the replica identity, a pinned schema, the typed confirmation, the read-only role, the create dialog). `browser-tests/elasticity-0-16.test.ts` opens the drain, weight, split and schema dialogs and the automatic card in a real browser and runs axe (colour contrast included) in light and dark at 1366 and 320 pixels, and checks that the page does not scroll sideways. The in-flight list and the plan show a unit of kind `schema` (the schema name as text) and a bucket that is being split; the mock server of the console never sends one, so a test makes the answer up. The extension does not plan schemas yet.
 
 ## What the panel does for contract 0.8.0
 

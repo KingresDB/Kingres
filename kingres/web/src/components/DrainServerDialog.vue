@@ -78,8 +78,8 @@ const start = () =>
         </ul>
         <p v-if="p.standbyShardGroupIds.length" class="muted" data-testid="drain-standbys">
           The server hosts a standby of the shard groups {{ p.standbyShardGroupIds.join(', ') }}.
-          This version does not move them: lower the replica count first if the servers that remain
-          cannot hold them.
+          They are moved to the other servers first. If the servers that remain cannot hold them,
+          lower the replica count first or accept fewer copies.
         </p>
         <div v-if="p.localData.length" data-testid="drain-local">
           <p class="notice tone-warn">

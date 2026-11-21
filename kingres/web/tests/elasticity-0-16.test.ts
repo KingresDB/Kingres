@@ -5,6 +5,8 @@
 import { describe, expect, it } from 'vitest'
 import { screen, waitFor, within } from '@testing-library/vue'
 import userEvent from '@testing-library/user-event'
+import { http, HttpResponse } from 'msw'
+import { mockServer } from '@/mocks/server'
 import { getState } from '@/mocks/http'
 import { renderApp, settled } from './helpers'
 
@@ -243,5 +245,53 @@ describe('Create database: the sharding mode', () => {
     const created = getState().databases.find((d) => d.info.name === 'tenants')!
     expect(created.info.sharding.mode).toBe('schema')
     expect(created.info.sharding.distributeNewSchemas).toBe(true)
+  })
+})
+
+describe('Rebalance page: units that are not buckets', () => {
+  it('shows a schema move and a split in the list of moves in flight, the schema name as text', async () => {
+    const move = (kind: string, bucket: number, schemaName: string | null) => ({
+      databaseName: 'shop',
+      colocationId: 7,
+      bucket,
+      fromShardGroupId: 1,
+      toShardGroupId: 2,
+      kind,
+      schemaName,
+      phase: 'copy',
+      percent: 40,
+      sizeBytes: 1000,
+    })
+    mockServer.use(
+      http.get('*/api/v1/rebalance', () =>
+        HttpResponse.json({
+          state: 'running',
+          needed: false,
+          reasons: [],
+          taskId: 5,
+          startedAt: new Date().toISOString(),
+          options: null,
+          progress: {
+            movesTotal: 2,
+            movesDone: 0,
+            movesInFlight: 2,
+            movesFailed: 0,
+            movesSkipped: 0,
+            bytesMoved: 0,
+            percent: 10,
+          },
+          inFlightMoves: [move('schema', 0, '<b>tenant</b>'), move('split', 17, null)],
+          stoppedBy: null,
+          pausedReason: null,
+          lastReport: null,
+        }),
+      ),
+    )
+    await renderApp('/rebalance')
+    await settled()
+    const cell = await screen.findByText('<b>tenant</b>')
+    expect(cell.closest('td')).toHaveTextContent(/^Schema /)
+    expect(cell.closest('td')?.querySelector('b')).toBeNull()
+    expect(await screen.findByText(/splitting/)).toBeInTheDocument()
   })
 })
