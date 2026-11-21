@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"os"
 	"sync"
@@ -14,8 +15,10 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fault"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/instance"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/lease"
 )
 
 // The planned switchover on the server of the old primary and on the server of the standby (design ha-phase5-part2.md, 5.2): stop the
@@ -292,52 +295,72 @@ func demoteClean(ctx context.Context, d *haDeps, r failover.DemoteRequest) (any,
 	if !ok {
 		return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "not_primary", Message: "This server runs no primary of the shard group."}
 	}
+	return cleanStop(ctx, d.Svc.Manager(), d.LeaseMgr, d.Fault, d.Log, li.ID, r.Group)
+}
+
+// The parts of the instance manager and of the lease manager that the clean stop uses, so that a test can stand in for them.
+type stopManager interface {
+	Stop(ctx context.Context, id int) error
+	Running(ctx context.Context, id int) (bool, error)
+	ControlData(ctx context.Context, id int) (map[string]string, error)
+}
+
+type stopLeases interface {
+	HoldBack(group int32) error
+	Relinquish(group int32) error
+	ReleaseGroup(ctx context.Context, group int32) (lease.TransferResult, error)
+}
+
+// cleanStop is the stop of demoteClean for the instance id of group.
+func cleanStop(ctx context.Context, mgr stopManager, lm stopLeases, fh *fault.Hook, log *slog.Logger, id int, group int32) (any, error) {
 	// The primary is held back from starting, but the lease is renewed until the stop is over: a slow clean stop must not run into the end of the lease and
 	// be fenced (it would then not be a clean one). A stop that does not end cleanly stops the renewal below, and the lease lapses and fences as before.
-	if err := d.LeaseMgr.HoldBack(r.Group); err != nil {
+	if err := lm.HoldBack(group); err != nil {
 		return nil, err
 	}
 	out := failover.DemoteAnswer{}
 	stopCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
 	// A test: the stop takes longer than the lease the old primary has left, as it does when a walsender or a checkpoint holds the shutdown.
-	if d.Fault.FailoverInjection("demote:slowstop") == "slow" {
+	if fh.FailoverInjection("demote:slowstop") == "slow" {
 		select {
 		case <-time.After(20 * time.Second):
 		case <-stopCtx.Done():
 		}
 	}
 	// A fast shutdown, never an immediate one: an immediate stop is not a clean one, and the proof would be the only protection.
-	if err := d.Svc.Manager().Stop(stopCtx, li.ID); err != nil {
-		d.Log.Warn("failover: stopping the old primary cleanly", "group", r.Group, "instance", li.ID, "error", err)
+	if err := mgr.Stop(stopCtx, id); err != nil {
+		log.Warn("failover: stopping the old primary cleanly", "group", group, "instance", id, "error", err)
 	}
-	running, err := d.Svc.Manager().Running(ctx, li.ID)
+	running, err := mgr.Running(ctx, id)
 	out.Stopped = err == nil && !running
 	if !out.Stopped {
-		_ = d.LeaseMgr.Relinquish(r.Group) // not stopped: the renewal ends, the lease lapses and the fence stops what runs
+		_ = lm.Relinquish(group) // not stopped: the renewal ends, the lease lapses and the fence stops what runs
 		return out, nil
 	}
-	cd, err := d.Svc.Manager().ControlData(ctx, li.ID)
+	cd, err := mgr.ControlData(ctx, id)
 	if err != nil {
+		// The instance is stopped and the answer cannot be given: the renewal ends here too (F5-07), or the lease of a primary that does not run would be renewed until a repair.
+		_ = lm.Relinquish(group)
 		return nil, &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "pg_controldata cannot be read: " + err.Error()}
 	}
 	out.ClusterState = cd["Database cluster state"]
-	if d.Fault.FailoverInjection("demote:state") == "fail" {
+	if fh.FailoverInjection("demote:state") == "fail" {
 		out.ClusterState = "in production" // a test: the stop was not a clean one
 	}
 	out.Checkpoint = cd["Latest checkpoint location"]
 	if out.ClusterState == "shut down" {
-		res, rerr := d.LeaseMgr.ReleaseGroup(ctx, r.Group)
+		res, rerr := lm.ReleaseGroup(ctx, group)
 		out.Released = rerr == nil && res.Granted >= res.Need
 		if rerr != nil {
-			d.Log.Warn("failover: the lease was not released; it runs out by itself", "group", r.Group, "error", rerr)
+			log.Warn("failover: the lease was not released; it runs out by itself", "group", group, "error", rerr)
 		}
 		// A test: kingresd ends right after the clean stop, before the leader's task can send the proof (the leader changes at the stop).
-		if d.Fault.FailoverInjection("demote:exit") == "exit" {
+		if fh.FailoverInjection("demote:exit") == "exit" {
 			os.Exit(137)
 		}
 	} else {
-		_ = d.LeaseMgr.Relinquish(r.Group) // not a clean stop: no renewal, the lease runs out by itself
+		_ = lm.Relinquish(group) // not a clean stop: no renewal, the lease runs out by itself
 	}
 	return out, nil
 }
