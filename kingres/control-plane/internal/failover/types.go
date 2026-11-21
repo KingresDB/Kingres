@@ -436,7 +436,7 @@ type Peers interface {
 	MapProof(ctx context.Context, server string, r MapProofRequest) error
 	MapAbandon(ctx context.Context, server, reason string) error
 	// MapRefusal is the refusal of the proof that the candidate reported to this server, the old leader's (local: the task runs here).
-	MapRefusal(ctx context.Context) (string, bool)
+	MapRefusal(ctx context.Context, taskID int64) (string, bool)
 }
 
 // Node is a row of kingres.node.

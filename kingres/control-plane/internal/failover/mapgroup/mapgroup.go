@@ -60,7 +60,7 @@ type Ports interface {
 	RecordPlanned(ctx context.Context, taskID, termAfter, timeline int64) error
 	// PlannedRefused is what a planned switchover of the map group does when the standby could not prove the old leader's stop: this server lets go of the fence
 	// lease it holds (so that the old leader can win its own lease again) and tells the old leader, whose task rolls back and starts its primary again.
-	PlannedRefused(ctx context.Context, oldServer, reason string) error
+	PlannedRefused(ctx context.Context, oldServer string, taskID int64, reason string) error
 	// PullProof reads how the stopped primary of the map group was left from the old leader's server (its kingresd answers while its instance is held back), for the
 	// case that the old leader's task, which sends the proof, did not (its kingresd ended after the stop).
 	PullProof(ctx context.Context, oldServer string) (checkpoint, clusterState string, err error)
@@ -109,6 +109,7 @@ type Runner struct {
 
 	FreezeTTL      time.Duration // default 10 min
 	LeaseWait      time.Duration // the wait for the old lease, default 25 s
+	VerifyWait     time.Duration // a standby that has not replayed the shutdown checkpoint yet is asked again for this long, default 30 s
 	PlannedWait    time.Duration // the wait for the old leader's lease in a planned switchover (it is released by its clean stop), default 4 min
 	ProofWait      time.Duration // the wait for the proof of the clean stop in a planned switchover, default 4 min
 	ProofPullAfter time.Duration // the proof is read from the old leader's server when its task did not send it by then, default 20 s
@@ -569,11 +570,15 @@ func (r *Runner) promote(ctx context.Context, j journal.Journal) (bool, error) {
 	if err := r.Journal.PromotionIntent(); err != nil {
 		return false, err
 	}
+	behindUntil := r.now().Add(dur(r.VerifyWait, 30*time.Second))
 	for try := 0; ; try++ {
 		ans, err := r.P.Promote(ctx, r.P.Self(), req)
 		switch {
 		case err == nil:
 			return false, r.Journal.Event(journal.StepPromote, "promoted", map[string]any{"status": ans.Status, "timeline": ans.Timeline, "lsn": ans.Lsn})
+		case failover.IsCode(err, "standby_behind") && r.now().Before(behindUntil):
+			// The standby has not replayed the shutdown checkpoint yet (replication lag, a loaded machine): the ordinary groups wait for it for VerifyWait and so does
+			// this bootstrap; a proof that can never be made (unprovable) is refused at once (F5-04).
 		case failover.IsCode(err, "unprovable"), failover.IsCode(err, "standby_behind"):
 			// Nothing was promoted, and the old leader is stopped: this server cannot start it again (that is the leader's call). It asks for a decision.
 			if j.Planned == nil {
@@ -583,12 +588,15 @@ func (r *Runner) promote(ctx context.Context, j journal.Journal) (bool, error) {
 			// starts its primary again (the lease decides who may run: it is free now). The bootstrap is given up.
 			reason := "the standby of the map group cannot prove that it holds everything the old leader wrote (" + err.Error() + ")"
 			r.P.Alert(ctx, "failoverNeedsDecision", "critical", "group:0", "The planned switchover of the map group was refused after the old leader stopped: "+reason+"; the old leader is started again.", true)
-			if perr := r.P.PlannedRefused(ctx, j.OldServer, reason); perr != nil {
-				return false, &failover.PauseError{Reason: reason + "; the old leader could not be told (" + perr.Error() + "): start its server again"}
-			}
-			_ = r.Journal.Event(journal.StepPromote, "refused", map[string]any{"reason": reason})
+			// The journal is given up whether or not the old leader could be told (F5-09): the lease is let go of already, and a journal that stays active would keep the
+			// gate of this server closed and a later repeat could promote after the old leader's task was rolled back.
+			perr := r.P.PlannedRefused(ctx, j.OldServer, j.Planned.TaskID, reason)
+			_ = r.Journal.Event(journal.StepPromote, "refused", map[string]any{"reason": reason, "toldTheOldLeader": perr == nil})
 			if aerr := r.Journal.AbandonUnpromoted(reason); aerr != nil {
 				return false, aerr
+			}
+			if perr != nil {
+				return false, failover.Fail(failover.CodeSwitchoverUnproven, false, "%s; the old leader could not be told (%v): its task rolls back by its own wait", reason, perr)
 			}
 			return false, failover.Fail(failover.CodeSwitchoverUnproven, false, "%s", reason)
 		case failover.IsCode(err, "stale_term"):

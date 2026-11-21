@@ -823,7 +823,7 @@ func (w *world) group() int32 {
 	return 1
 }
 
-func (p fpeers) MapRefusal(context.Context) (string, bool) {
+func (p fpeers) MapRefusal(_ context.Context, _ int64) (string, bool) {
 	p.w.mu.Lock()
 	defer p.w.mu.Unlock()
 	return p.w.mapRefusal, p.w.mapRefusal != ""

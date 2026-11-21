@@ -344,7 +344,7 @@ func (r *Runner) stopClean(ctx context.Context, env *task.Env, sc *stepCtx) erro
 		// of it; a candidate that says nothing is waited for, and the lease decides who may run.
 		deadline := r.now().Add(orDur(r.MapVerdictWait, 6*time.Minute))
 		for {
-			if reason, refused := r.Peers.MapRefusal(ctx); refused {
+			if reason, refused := r.Peers.MapRefusal(ctx, env.Task.ID); refused {
 				return sc.rollbackFailed(ctx, CodeSwitchoverUnproven, true, "the standby of the map group could not prove the clean stop of the old leader (%s); the old leader is started again", reason)
 			}
 			if st, serr := r.Peers.State(ctx, nw.Server, sc.group); serr == nil && len(st.OutOfRecovery()) > 0 {

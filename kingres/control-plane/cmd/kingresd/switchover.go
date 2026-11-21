@@ -364,7 +364,9 @@ func primaryRuns(ctx context.Context, d *haDeps, group int32) bool {
 // The calls of the planned switchover of the map group: the old leader's task starts the bootstrap of the candidate, sends it the proof of its clean
 // stop, and gives it up when the switchover is rolled back.
 func (p *foPeers) MapStart(ctx context.Context, server string, r failover.MapStartRequest) error {
-	mapPlanned.started(server)
+	if r.Planned != nil {
+		mapPlanned.started(server, r.Planned.TaskID)
+	}
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	return p.do(ctx, server, "POST", "/failover/map/start", r, nil)
@@ -383,4 +385,6 @@ func (p *foPeers) MapAbandon(ctx context.Context, server, reason string) error {
 }
 
 // MapRefusal is the refusal of the proof that the candidate of the planned switchover of the map group reported to this server (the old leader's).
-func (p *foPeers) MapRefusal(context.Context) (string, bool) { return mapPlanned.refusal() }
+func (p *foPeers) MapRefusal(_ context.Context, taskID int64) (string, bool) {
+	return mapPlanned.refusal(taskID)
+}

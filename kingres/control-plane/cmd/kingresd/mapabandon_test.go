@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -199,5 +200,42 @@ func TestABegunPromotionIsGivenUpOnlyForAStandbyThatIsStillInRecovery(t *testing
 		if ok != c.want || (!c.want && err == nil) || js.Active() == c.want {
 			t.Errorf("%s: given up %v err %v active %v", c.name, ok, err, js.Active())
 		}
+	}
+}
+
+// F5-09, F5-12. A refusal belongs to the task that asked for the bootstrap and to the server it asked: another caller, another task or an old refusal is not
+// this task's, and a new start clears it.
+func TestARefusalBelongsToTheTaskAndTheServerThatWereAsked(t *testing.T) {
+	saved := mapPlanned
+	mapPlanned = &plannedBox{}
+	defer func() { mapPlanned = saved }()
+	ctx := context.Background()
+	body := func(task int64) []byte {
+		b, _ := json.Marshal(mapRefusedBody{Reason: "no proof", TaskID: task})
+		return b
+	}
+	// nothing was started: refused
+	_, err := handleMapRefused(ctx, &haDeps{}, "s2", body(7))
+	callErr(t, err, 409, "conflict")
+	mapPlanned.started("s2", 7)
+	_, err = handleMapRefused(ctx, &haDeps{}, "s3", body(7)) // another server
+	callErr(t, err, 409, "conflict")
+	_, err = handleMapRefused(ctx, &haDeps{}, "s2", body(8)) // another task
+	callErr(t, err, 409, "conflict")
+	if _, ok := mapPlanned.refusal(7); ok {
+		t.Fatal("a refusal that was not accepted is remembered")
+	}
+	if _, err = handleMapRefused(ctx, &haDeps{}, "s2", body(7)); err != nil {
+		t.Fatal(err)
+	}
+	if r, ok := mapPlanned.refusal(7); !ok || r != "no proof" {
+		t.Fatalf("%q %v", r, ok)
+	}
+	if _, ok := mapPlanned.refusal(8); ok {
+		t.Fatal("the refusal of task 7 answers for task 8")
+	}
+	mapPlanned.started("s2", 9) // a new task clears it
+	if _, ok := mapPlanned.refusal(7); ok {
+		t.Fatal("an old refusal survived a new start")
 	}
 }

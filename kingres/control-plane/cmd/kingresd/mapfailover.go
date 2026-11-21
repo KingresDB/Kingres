@@ -959,31 +959,32 @@ type mapRefusedBody struct {
 type plannedBox struct {
 	mu      sync.Mutex
 	to      string
+	task    int64
 	refused string
 }
 
 var mapPlanned = &plannedBox{}
 
-func (b *plannedBox) started(server string) {
+func (b *plannedBox) started(server string, taskID int64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.to, b.refused = server, ""
+	b.to, b.task, b.refused = server, taskID, ""
 }
 
-func (b *plannedBox) refuse(server, reason string) bool {
+func (b *plannedBox) refuse(server string, taskID int64, reason string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.to == "" || b.to != server {
+	if b.to == "" || b.to != server || b.task != taskID {
 		return false
 	}
 	b.refused = reason
 	return true
 }
 
-func (b *plannedBox) refusal() (string, bool) {
+func (b *plannedBox) refusal(taskID int64) (string, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.refused, b.refused != ""
+	return b.refused, b.task == taskID && b.refused != ""
 }
 
 // handleMapRefused is the call of the candidate to the old leader (this server) that the standby could not prove the old leader's stop: the task that is
@@ -993,18 +994,18 @@ func handleMapRefused(_ context.Context, _ *haDeps, caller string, body []byte) 
 	if err := json.Unmarshal(body, &b); err != nil || b.Reason == "" || len(b.Reason) > 600 {
 		return nil, badBody("a reason")
 	}
-	if !mapPlanned.refuse(caller, b.Reason) {
+	if !mapPlanned.refuse(caller, b.TaskID, b.Reason) {
 		return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "conflict", Message: "No planned switchover of the map group was started on this server for the caller."}
 	}
 	return struct{}{}, nil
 }
 
 // PlannedRefused lets go of the fence lease that this server holds for the map group and tells the old leader.
-func (p *mapPorts) PlannedRefused(ctx context.Context, oldServer, reason string) error {
-	if _, err := p.m.peers.Lease(ctx, p.m.self, failover.LeaseRequest{Group: 0, Role: failover.LeaseRelease}); err != nil {
+func (p *mapPorts) PlannedRefused(ctx context.Context, oldServer string, taskID int64, reason string) error {
+	if err := p.m.releaseFence(ctx); err != nil {
 		return fmt.Errorf("letting go of the lease of the map group: %w", err)
 	}
-	return p.m.peers.do(ctx, oldServer, http.MethodPost, "/failover/map/refused", mapRefusedBody{Reason: reason}, nil)
+	return p.m.tellOldLeader(ctx, oldServer, taskID, reason)
 }
 
 // ---------------------------------------------------------------------------------
