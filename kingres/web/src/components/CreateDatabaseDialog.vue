@@ -34,6 +34,8 @@ const form = reactive({
   connectionLimit: -1,
   sharding: false,
   bucketCount: 128,
+  shardingMode: 'row' as 'row' | 'schema' | 'both',
+  distributeNewSchemas: false,
   durability: 'sync' as Durability,
   ledgerMode: 'off' as LedgerMode,
   digestInterval: 3600,
@@ -80,16 +82,17 @@ const errors = computed(() =>
       form.connectionLimit,
       integerBetween('The connection limit', -1, 1_000_000),
     ),
-    'sharding.bucketCount': form.sharding
-      ? firstError<number | null>(
-          form.bucketCount,
-          integerBetween(
-            'The bucket count',
-            o.value?.bucketCount.minimum ?? 1,
-            o.value?.bucketCount.maximum ?? 4096,
-          ),
-        )
-      : undefined,
+    'sharding.bucketCount':
+      form.sharding && form.shardingMode !== 'schema'
+        ? firstError<number | null>(
+            form.bucketCount,
+            integerBetween(
+              'The bucket count',
+              o.value?.bucketCount.minimum ?? 1,
+              o.value?.bucketCount.maximum ?? 4096,
+            ),
+          )
+        : undefined,
     'ledger.digestIntervalSeconds':
       form.ledgerMode !== 'off'
         ? firstError<number | null>(
@@ -118,7 +121,13 @@ function payload(): DatabaseCreateRequest {
       ...(form.collation ? { lcCollate: form.collation, lcCtype: form.collation } : {}),
       connectionLimit: form.connectionLimit,
     },
-    sharding: { enabled: form.sharding, bucketCount: form.bucketCount },
+    sharding: {
+      enabled: form.sharding,
+      ...(form.shardingMode !== 'schema' ? { bucketCount: form.bucketCount } : {}),
+      ...(form.sharding && form.shardingMode !== 'row'
+        ? { mode: form.shardingMode, distributeNewSchemas: form.distributeNewSchemas }
+        : {}),
+    },
     replication: { durability: form.durability },
     ledger: { mode: form.ledgerMode, digestIntervalSeconds: form.digestInterval },
   }
@@ -220,7 +229,33 @@ const errorFor = (field: string, server: Record<string, string>): string | undef
             <RouterLink :to="{ name: 'settings' }">cluster settings</RouterLink> first.
           </p>
           <p v-else class="hint muted">Sharding can be turned on later, but never off again.</p>
+          <fieldset v-if="form.sharding" data-testid="sharding-mode">
+            <legend>Shard by</legend>
+            <label class="check"
+              ><input v-model="form.shardingMode" type="radio" value="row" /> Rows: a table is split
+              into buckets by a column.</label
+            >
+            <label class="check"
+              ><input v-model="form.shardingMode" type="radio" value="schema" /> Schemas: each
+              schema (a tenant or a service) lives on one server group, and every table in it with
+              it.</label
+            >
+            <label class="check"
+              ><input v-model="form.shardingMode" type="radio" value="both" /> Both: choose per
+              table or per schema.</label
+            >
+            <label v-if="form.shardingMode !== 'row'" class="check" data-testid="distribute-new">
+              <input v-model="form.distributeNewSchemas" type="checkbox" />
+              Distribute new schemas automatically
+            </label>
+            <p v-if="form.shardingMode !== 'row'" class="hint muted">
+              Every schema created in this database is placed on a server group and kept there.
+              Tables in it can use any constraint or query. Schemas created by an extension, public
+              and system schemas are not distributed.
+            </p>
+          </fieldset>
           <FormField
+            v-if="form.shardingMode !== 'schema'"
             v-slot="slot"
             label="Bucket count"
             :hint="`Default ${o?.bucketCount.default}, from ${o?.bucketCount.minimum} to ${o?.bucketCount.maximum}. Fixed after creation, like the number of vBuckets in Couchbase.`"

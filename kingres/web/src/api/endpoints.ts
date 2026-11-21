@@ -220,10 +220,13 @@ export const endpoints = {
     body: S['BucketSplitRequest'],
   ) =>
     j(
-      api.POST('/databases/{databaseName}/colocation-groups/{colocationId}/buckets/{bucket}/split-preview', {
-        params: { path: { databaseName, colocationId, bucket } },
-        body,
-      }),
+      api.POST(
+        '/databases/{databaseName}/colocation-groups/{colocationId}/buckets/{bucket}/split-preview',
+        {
+          params: { path: { databaseName, colocationId, bucket } },
+          body,
+        },
+      ),
     ),
   splitBucket: (
     databaseName: string,
@@ -232,10 +235,13 @@ export const endpoints = {
     body: S['BucketSplitRequest'],
   ) =>
     j(
-      api.POST('/databases/{databaseName}/colocation-groups/{colocationId}/buckets/{bucket}/split', {
-        params: { path: { databaseName, colocationId, bucket } },
-        body,
-      }),
+      api.POST(
+        '/databases/{databaseName}/colocation-groups/{colocationId}/buckets/{bucket}/split',
+        {
+          params: { path: { databaseName, colocationId, bucket } },
+          body,
+        },
+      ),
     ),
   listSchemas: (
     databaseName: string,
@@ -252,7 +258,11 @@ export const endpoints = {
         params: { path: { databaseName, schemaName } },
       }),
     ),
-  distributeSchema: (databaseName: string, schemaName: string, body: S['DistributeSchemaRequest']) =>
+  distributeSchema: (
+    databaseName: string,
+    schemaName: string,
+    body: S['DistributeSchemaRequest'],
+  ) =>
     j(
       api.PUT('/databases/{databaseName}/schemas/{schemaName}/distribution', {
         params: { path: { databaseName, schemaName } },

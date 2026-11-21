@@ -184,6 +184,8 @@ interface ServerRec {
   status: ServerStatus
   serverGroup: string | null
   shouldHaveShards: boolean
+  /** The capacity of the server relative to the others (contract 0.16.0); absent means 1. */
+  weight?: number
   version: string
   joinedAt: string
   startedAt: number
@@ -330,6 +332,8 @@ export interface MockState {
   nextAuditId: number
   alerts: Alert[]
   settings: ClusterSettings
+  /** The server a drain is emptying, null otherwise (the status says trigger drain meanwhile). */
+  drain: string | null
   rebalance: {
     needed: boolean
     reasons: S['RebalanceReason'][]
@@ -379,6 +383,19 @@ export interface MockState {
 // --- helpers ----------------------------------------------------------------------------------
 
 export const nowIso = (): string => new Date().toISOString()
+
+/** The automatic rebalance as a cluster that never changed it has it (contract 0.16.0): off. */
+export const DEFAULT_AUTOMATIC: NonNullable<S['RebalanceSettings']['automatic']> = {
+  enabled: false,
+  strategy: 'byBucketCount',
+  threshold: 0.15,
+  checkIntervalSeconds: 60,
+  settleSeconds: 300,
+  settleAfterTopologySeconds: 600,
+  minIntervalSeconds: 3600,
+  failoverSettleSeconds: 600,
+  window: null,
+}
 const ago = (seconds: number): string => new Date(Date.now() - seconds * 1000).toISOString()
 const ahead = (seconds: number): string => new Date(Date.now() + seconds * 1000).toISOString()
 
@@ -451,7 +468,7 @@ function seedDatabases(): DbRec[] {
       lcCtype: 'en_US.UTF-8',
       connectionLimit: -1,
     },
-    sharding: { enabled: false, bucketCount: 128 },
+    sharding: { enabled: false, bucketCount: 128, mode: 'row', distributeNewSchemas: false },
     replication: { durability: 'sync', replicaCount: 1 },
     ledger: { mode: 'off', digestIntervalSeconds: 3600 },
     stats: { sizeBytes: 0, tableCount: 0, activeConnections: 0, transactionsPerSecond: 0 },
@@ -473,7 +490,7 @@ function seedDatabases(): DbRec[] {
   })
   const shop: DbRec = {
     info: base('shop', {
-      sharding: { enabled: true, bucketCount: 128 },
+      sharding: { enabled: true, bucketCount: 128, mode: 'both', distributeNewSchemas: false },
       ledger: { mode: 'appendOnly', digestIntervalSeconds: 3600 },
       ledgerSummary: { verificationState: 'passed', lastVerifiedBlockHeight: 1790 },
     }),
@@ -881,12 +898,22 @@ export function createMockState(options: { uninitialized?: boolean } = {}): Mock
       defaultReplicaCount: 1,
       defaultDurability: 'sync',
       autoFailover: { enabled: true, timeoutSeconds: 120, maxCount: 1, eventsSinceReset: 0 },
-      rebalance: { maxConcurrentMoves: 4 },
+      rebalance: {
+        maxConcurrentMoves: 4,
+        strategy: 'byBucketCount',
+        threshold: null,
+        maxMovesPerServer: 2,
+        maxMoveAttempts: 3,
+        maxDiskUsedFraction: 0.85,
+        maxStandbyLagBytes: 67108864,
+        automatic: { ...DEFAULT_AUTOMATIC },
+      },
       features: { sharding: true, ledger: true },
       clock: { maxDifferenceMs: 1000 },
       restart: { required: false, serverIds: [] },
     },
     failover: { reports: [], runs: [] },
+    drain: null,
     rebalance: {
       needed: false,
       reasons: [],
@@ -1467,6 +1494,7 @@ export function serverView(s: MockState, rec: ServerRec): Server {
     status: effectiveStatus(rec),
     serverGroup: rec.serverGroup,
     shouldHaveShards: rec.shouldHaveShards,
+    weight: rec.weight ?? 1,
     isManagerLeader: rec.id === '10.0.0.11',
     certificateExpiresAt: rec.certificateExpiresAt ?? null,
     certificateRevokedAt: rec.certificateRevokedAt ?? null,

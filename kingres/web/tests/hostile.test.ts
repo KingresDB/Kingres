@@ -128,7 +128,12 @@ describe('detail pages and dialogs show hostile names safely', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
     await load('/databases/shop')
     await waitFor(() => expect(document.body.textContent).toMatch(/U\+202E/))
-    expect(within(screen.getByRole('table')).getAllByRole('rowheader').length).toBeGreaterThan(10)
+    // the page has the Schemas table (0.16.0) and the Tables table: the tables of the database are the one with its own caption
+    expect(
+      within(screen.getByRole('table', { name: /tables of the database/i })).getAllByRole(
+        'rowheader',
+      ).length,
+    ).toBeGreaterThan(10)
     expectSafePage()
     expect(warn.mock.calls.flat().join(' ')).not.toMatch(/duplicate keys/i)
     warn.mockRestore()

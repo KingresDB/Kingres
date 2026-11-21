@@ -11,6 +11,8 @@ import PageHeader from '@/components/PageHeader.vue'
 import QueryBoundary from '@/components/QueryBoundary.vue'
 import BucketGrid from '@/components/BucketGrid.vue'
 import NullableValue from '@/components/NullableValue.vue'
+import GateButton from '@/components/GateButton.vue'
+import BucketSplitDialog from '@/components/BucketSplitDialog.vue'
 import {
   useAllBuckets,
   useBucketDistribution,
@@ -33,6 +35,7 @@ const serverFilter = ref<string>(typeof route.query.server === 'string' ? route.
 const stateFilter = ref<'' | 'moving' | 'orphan'>('')
 const lookup = ref('')
 const selected = ref<Bucket | null>(null)
+const splitting = ref<number | null>(null)
 
 // Default to the first sharded database once the list is known.
 watch(
@@ -45,10 +48,14 @@ watch(
 )
 
 const colocations = useColocationGroups(() => dbName.value || null)
+// The Shards page shows the groups of hash-distributed tables; a distributed schema has a group of one bucket of its own.
+const hashGroups = computed(
+  () => colocations.data.value?.items.filter((g) => (g.kind ?? 'hash') === 'hash') ?? [],
+)
 watch(
   () => colocations.data.value,
-  (data) => {
-    const items = data?.items ?? []
+  () => {
+    const items = hashGroups.value
     if (colocationId.value === null || !items.some((g) => g.colocationId === colocationId.value)) {
       colocationId.value = items[0]?.colocationId ?? null
     }
@@ -130,11 +137,7 @@ function findBucket(): void {
         <div class="field">
           <label for="f-col">Colocation group</label>
           <select id="f-col" v-model="colocationId">
-            <option
-              v-for="g in colocations.data.value?.items"
-              :key="g.colocationId"
-              :value="g.colocationId"
-            >
+            <option v-for="g in hashGroups" :key="g.colocationId" :value="g.colocationId">
               {{ g.colocationId }} ({{ g.tableCount }} tables, {{ g.distributionColumnType }})
             </option>
           </select>
@@ -205,6 +208,9 @@ function findBucket(): void {
                   (moving to group {{ selected.movingToShardGroupId }})</template
                 ></span
               >
+              <span v-if="selected.modulus"
+                >Hashes: remainder {{ selected.remainder }} modulo {{ selected.modulus }}</span
+              >
               <span
                 >Primary on server {{ selected.primaryServerId ?? '-' }}, replicas on
                 {{
@@ -213,6 +219,18 @@ function findBucket(): void {
                     : 'none'
                 }}, <NullableValue :value="selected.sizeBytes" :format="formatBytes"
               /></span>
+              <div>
+                <GateButton
+                  op="splitBucket"
+                  small
+                  :blocked-reason="
+                    selected.state === 'active' ? '' : 'Only an active bucket can be split.'
+                  "
+                  data-testid="split-bucket"
+                  @click="splitting = selected.bucket"
+                  >Split bucket</GateButton
+                >
+              </div>
             </div>
           </div>
           <p v-else-if="lookup" class="muted">No bucket with that number in this group.</p>
@@ -294,4 +312,11 @@ function findBucket(): void {
       </section>
     </div>
   </QueryBoundary>
+  <BucketSplitDialog
+    v-if="splitting !== null && colocationId !== null"
+    :database-name="dbName"
+    :colocation-id="colocationId"
+    :bucket="splitting"
+    @close="splitting = null"
+  />
 </template>
