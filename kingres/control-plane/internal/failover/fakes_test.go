@@ -70,7 +70,8 @@ type world struct {
 	mapStarts          []MapStartRequest
 	mapProofs          []MapProofRequest
 	noPromoteOnProof   bool
-	mapAbandonErr      error // the candidate answers the abandon with this (a 409 conflict: it promoted)
+	stateDown          map[string]bool // the calls to this server fail (a transient error on the state read)
+	mapAbandonErr      error           // the candidate answers the abandon with this (a 409 conflict: it promoted)
 	mapRefusal         string
 	mapStartErr        error
 	markErr            error   // the answer of the mark call
@@ -159,6 +160,9 @@ func (w *world) count(prefix string) int {
 type fpeers struct{ w *world }
 
 func (p fpeers) unreach(server string) error {
+	if p.w.stateDown[server] {
+		return ErrUnreachable
+	}
 	if server == p.w.oldSrv && !p.w.oldAlive {
 		return ErrUnreachable
 	}

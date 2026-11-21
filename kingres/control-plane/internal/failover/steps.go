@@ -743,8 +743,12 @@ func (r *Runner) takeFence(ctx context.Context, env *task.Env, sc *stepCtx) erro
 		return err
 	}
 	if sc.in.graceful() && sc.group == 0 {
-		if nw, _, perr := sc.pinnedStandby(ctx); perr == nil && sc.mapHandedOver(ctx, nw) {
-			return task.Skip("the map group was handed over already")
+		if nw, _, perr := sc.pinnedStandby(ctx); perr == nil {
+			if handed, herr := sc.mapHandedOver(ctx, nw); herr != nil {
+				return herr
+			} else if handed {
+				return task.Skip("the map group was handed over already")
+			}
 		}
 	}
 	if err := sc.ensureFrozen(ctx); err != nil {
@@ -1069,7 +1073,9 @@ func (r *Runner) handOver(ctx context.Context, env *task.Env, sc *stepCtx) error
 	if err != nil {
 		return err
 	}
-	if sc.mapHandedOver(ctx, nw) {
+	if handed, herr := sc.mapHandedOver(ctx, nw); herr != nil {
+		return herr
+	} else if handed {
 		return task.Skip("the map group was handed over already")
 	}
 	// A repeated run: the new server holds the lease already, or has been promoted.
@@ -1141,7 +1147,9 @@ func (r *Runner) promote(ctx context.Context, env *task.Env, sc *stepCtx) error 
 	if err != nil {
 		return err
 	}
-	if sc.mapHandedOver(ctx, nw) {
+	if handed, herr := sc.mapHandedOver(ctx, nw); herr != nil {
+		return herr
+	} else if handed {
 		// The bootstrap of the candidate promoted it (the proof and the lease were its own); what this step records is already in the row.
 		sc.event(ctx, "promoted", map[string]any{"status": "handedOver"})
 		return task.Skip("the map group was promoted by the bootstrap of the new leader")

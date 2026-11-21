@@ -280,7 +280,9 @@ func (r *Runner) stopClean(ctx context.Context, env *task.Env, sc *stepCtx) erro
 		return err
 	}
 	sc.newServer = nw.Server
-	if sc.mapHandedOver(ctx, nw) {
+	if handed, herr := sc.mapHandedOver(ctx, nw); herr != nil {
+		return herr
+	} else if handed {
 		return task.Skip("the map group was handed over already")
 	}
 	if sc.group == 0 {
@@ -376,7 +378,9 @@ func (r *Runner) verify(ctx context.Context, env *task.Env, sc *stepCtx) error {
 	if err != nil {
 		return err
 	}
-	if sc.mapHandedOver(ctx, nw) {
+	if handed, herr := sc.mapHandedOver(ctx, nw); herr != nil {
+		return herr
+	} else if handed {
 		return task.Skip("the map group was handed over already")
 	}
 	// Read the shutdown checkpoint again (the stop is idempotent): it is what the proof is made of.
@@ -554,12 +558,26 @@ func (sc *stepCtx) restoreContinues(ctx context.Context, err error) error {
 // bootstrap of the candidate promoted it). The steps of the map group that the old leader's task could not record (its instance is the system
 // database, and it was stopped) run again on the new leader's engine, and each of them that would act on the old leader or on the promotion
 // skips when this is true.
-func (sc *stepCtx) mapHandedOver(ctx context.Context, nw StandbyRec) bool {
+func (sc *stepCtx) mapHandedOver(ctx context.Context, nw StandbyRec) (bool, error) {
 	if sc.group != 0 {
-		return false
+		return false, nil
 	}
-	st, err := sc.r.Peers.State(ctx, nw.Server, sc.group)
-	return err == nil && len(st.OutOfRecovery()) > 0
+	// A state that cannot be read is not "not handed over" (F5-06): the steps that are right only when the group was not handed over (the start of a bootstrap,
+	// the clean stop) must not run on a failed read, so the read is repeated and then the step fails and is retried.
+	var err error
+	for i := 0; i < 3; i++ {
+		var st State
+		if st, err = sc.r.Peers.State(ctx, nw.Server, sc.group); err == nil {
+			return len(st.OutOfRecovery()) > 0, nil
+		}
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		if serr := sc.r.sleep(ctx, time.Second); serr != nil {
+			return false, serr
+		}
+	}
+	return false, err
 }
 
 // mapLast is the order of the groups of a planned switchover: the map group is the last. Its hand-over ends the old leader's task (its system

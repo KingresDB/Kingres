@@ -837,3 +837,78 @@ func TestTheRollbackAsksTheCandidateBeforeItReleasesTheLeasesAndResumes(t *testi
 		t.Fatalf("the order (abandon %d, release %d, resume %d):\n%s", a, l, rs, strings.Join(w.log, "\n"))
 	}
 }
+
+// F5-06. On the new leader's engine, a state that cannot be read is not "the map group was not handed over": the step fails and is retried, and nothing is
+// started, stopped or rolled back.
+func TestAStateThatCannotBeReadIsNotReadAsNotHandedOver(t *testing.T) {
+	w := mapWorld()
+	r := w.runner()
+	w.fakeClock(r)
+	raw, _ := json.Marshal(mapGracefulInput())
+	steps, err := r.steps(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range steps {
+		if s.Name == StepName(0, StepStopClean) {
+			break
+		}
+		if err := s.Run(context.Background(), &task.Env{Task: task.Task{ID: 1, Input: raw}}); err != nil {
+			var sk *task.SkipError
+			if !errors.As(err, &sk) {
+				t.Fatalf("%s: %v", s.Name, err)
+			}
+		}
+	}
+	// the promotion happened elsewhere and this server cannot read the state of the standby now
+	w.promoted["s2"], w.lease["s2"] = true, true
+	w.stateDown = map[string]bool{"s2": true}
+	mark := len(w.log)
+	for _, s := range steps {
+		if s.Name != StepName(0, StepStopClean) {
+			continue
+		}
+		err := s.Run(context.Background(), &task.Env{Task: task.Task{ID: 1, Input: raw}})
+		var sk *task.SkipError
+		if err == nil || errors.As(err, &sk) {
+			t.Fatalf("the step went on with a state that could not be read: %v", err)
+		}
+	}
+	after := strings.Join(w.log[mark:], "\n")
+	for _, c := range []string{"map-start", "mark ", "demote", "resume", "unquiesce", "lease-release", "map-abandon"} {
+		if strings.Contains(after, c) {
+			t.Errorf("a failed read started or undid something (%s):\n%s", c, after)
+		}
+	}
+}
+
+// A rollback is never made for a group whose row says promoted.
+func TestAGroupThatWasPromotedIsNeverRolledBack(t *testing.T) {
+	w := gracefulWorld()
+	r := w.runner()
+	w.fakeClock(r)
+	w.stopState = "in production" // the stop is not clean: the step would roll back
+	raw, _ := json.Marshal(gracefulInput())
+	steps, _ := r.steps(raw)
+	for _, s := range steps {
+		if s.Name == StepName(1, StepStopClean) {
+			w.rows.mu.Lock()
+			w.rows.groups[1].State = "promoted"
+			w.rows.mu.Unlock()
+			mark := len(w.log)
+			err := s.Run(context.Background(), &task.Env{Task: task.Task{ID: 1, Input: raw}})
+			failedWith(t, w, err, CodeSwitchoverUnproven)
+			if after := strings.Join(w.log[mark:], "\n"); strings.Contains(after, "resume") || strings.Contains(after, "lease-release") {
+				t.Fatalf("a promoted group was rolled back:\n%s", after)
+			}
+			return
+		}
+		if err := s.Run(context.Background(), &task.Env{Task: task.Task{ID: 1, Input: raw}}); err != nil {
+			var sk *task.SkipError
+			if !errors.As(err, &sk) {
+				t.Fatalf("%s: %v", s.Name, err)
+			}
+		}
+	}
+	t.Fatal("no stop step")
+}
