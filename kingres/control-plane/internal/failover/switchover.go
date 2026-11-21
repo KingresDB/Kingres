@@ -290,6 +290,11 @@ func (r *Runner) stopClean(ctx context.Context, env *task.Env, sc *stepCtx) erro
 		// leader is stopped. A request that was made before (a repeated run) finds the journal in progress.
 		if err := r.Peers.MapStart(ctx, nw.Server, MapStartRequest{Server: sc.old(), RequestedBy: sc.in.RequestedBy, Comment: sc.in.Comment,
 			Planned: &MapPlanned{TaskID: env.Task.ID, StandbyID: nw.ID}}); err != nil {
+			if IsCode(err, "conflict") {
+				// The candidate gave this very switchover up: it was rolled back while the system database was stopped, so the engine could not record it and runs
+				// the step again. It ends as the rollback it was, with the code of a switchover that could not be proven.
+				return sc.rollbackFailed(ctx, CodeSwitchoverUnproven, true, "the planned switchover of the map group was given up and rolled back before; the old leader was started again (%v)", err)
+			}
 			return sc.rollbackFailed(ctx, CodeTargetUnavailable, true, "the bootstrap of the map group could not be started on %s: %v", nw.Server, err)
 		}
 	}

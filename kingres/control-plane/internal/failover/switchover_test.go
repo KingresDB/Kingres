@@ -995,3 +995,17 @@ func TestAProofThatCannotBeSentRollsTheMapGroupBack(t *testing.T) {
 		t.Fatalf("no rollback after the proof failed:\n%s", strings.Join(w.log, "\n"))
 	}
 }
+
+// A run of the step after the switchover was given up (its rollback could not be recorded) ends as the rollback it was: switchover_unproven, with the
+// old leader resumed, and no second switchover begins.
+func TestAMapGroupSwitchoverThatWasGivenUpEndsAsUnprovenWhenTheStepRunsAgain(t *testing.T) {
+	w := mapWorld()
+	w.mapStartErr = &CallError{Status: 409, Code: "conflict", Message: "The planned switchover of this task was given up; it is not started again."}
+	r := w.runner()
+	w.fakeClock(r)
+	_, err := runAll(t, r, mapGracefulInput())
+	failedWith(t, w, err, CodeSwitchoverUnproven)
+	if w.count("demote-fast s1") != 0 || w.count("resume s1") != 1 {
+		t.Fatalf("a second switchover began or the old leader was not resumed:\n%s", strings.Join(w.log, "\n"))
+	}
+}
