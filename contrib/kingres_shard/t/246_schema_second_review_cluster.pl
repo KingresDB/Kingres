@@ -102,6 +102,7 @@ q1($n1, q{CREATE TABLE ra.tg (id int PRIMARY KEY, v text);
           CREATE FUNCTION ra.tgf() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN NEW.v := (SELECT count(*) FROM public.loc)::text; RETURN NEW; END';
           CREATE TRIGGER tg_b BEFORE INSERT ON ra.tg FOR EACH ROW EXECUTE FUNCTION ra.tgf()});
 fails($n3, q{INSERT INTO ra.tg (id) VALUES (1)}, qr/is read by code that a statement of another node runs here/, 'a trigger that reads a plain local table, from another node');
+fails($n3, q{INSERT INTO ra.tg (id, v) SELECT id + 50, tag FROM public.loc}, qr/is read by code that a statement of another node runs here/, 'the same for rows that the row router sends');
 q1($n2, q{INSERT INTO ra.tg (id) VALUES (2)});
 is(q1($n2, q{SELECT v FROM ra.tg WHERE id = 2}), 6, 'on the owner it reads the owner table');
 
