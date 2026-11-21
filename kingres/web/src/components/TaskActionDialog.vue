@@ -29,6 +29,8 @@ const props = withDefaults(
     wide?: boolean
     /** True while the confirm button must stay disabled for a reason the dialog itself explains. */
     confirmDisabled?: boolean
+    /** Why the button is disabled, said in words next to it and to a screen reader (used with `confirmDisabled`). */
+    confirmDisabledReason?: string
   }>(),
   {
     danger: false,
@@ -37,8 +39,11 @@ const props = withDefaults(
     invalidate: () => [],
     wide: false,
     confirmDisabled: false,
+    confirmDisabledReason: '',
   },
 )
+const reasonId = `confirm-reason-${Math.random().toString(36).slice(2, 9)}`
+const showReason = computed(() => props.confirmDisabled && props.confirmDisabledReason !== '')
 const emit = defineEmits<{ close: []; done: [task: Task] }>()
 
 const typed = ref('')
@@ -104,10 +109,13 @@ async function confirm(): Promise<void> {
           class="btn"
           :class="danger ? 'btn-danger' : 'btn-primary'"
           :disabled="!typedOk || confirmDisabled || action.isStarting.value"
+          :title="showReason ? confirmDisabledReason : undefined"
+          :aria-describedby="showReason ? reasonId : undefined"
           @click="confirm"
         >
           {{ confirmLabel }}
         </button>
+        <span v-if="showReason" :id="reasonId" class="sr-only">{{ confirmDisabledReason }}</span>
       </template>
       <button v-else type="button" class="btn btn-primary" @click="emit('close')">
         {{ action.isActive.value ? 'Hide (keeps running)' : 'Close' }}

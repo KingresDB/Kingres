@@ -311,8 +311,7 @@ export function beginSchemaMove(
   target: number,
   setIdentity: boolean,
 ) {
-  let task: S['Task'] | null = null
-  const id = () => (task as S['Task']).id
+  const subjectId = `${rec.info.name}/${sr.name}`
   sr.state = 'moving'
   sr.movingTo = target
   const settle = () => {
@@ -320,7 +319,7 @@ export function beginSchemaMove(
     sr.movingTo = null
     sr.taskId = null
   }
-  task = createTask(s, {
+  const task = createTask(s, {
     kind: 'schema.move',
     subject: SCHEMA_SUBJECT(rec, sr),
     steps: [
@@ -333,11 +332,22 @@ export function beginSchemaMove(
     skippedStep: setIdentity ? undefined : 'Set REPLICA IDENTITY FULL',
     cancellable: true,
     durationMs: 4000,
-    failWith: sr.failsToMove
-      ? `The copy of schema "${sr.name}" to shard group ${target} failed: the target ran out of disk space.`
+    // The copy (the third of five steps) is where it fails, whatever the clock says.
+    failAt: sr.failsToMove
+      ? {
+          fraction: 0.5,
+          code: 'insufficient_disk',
+          message: `The copy of schema "${sr.name}" to shard group ${target} failed: the target ran out of disk space.`,
+        }
       : undefined,
     onProgress: (fraction) => {
-      const rec2 = s.tasks.find((t) => t.task.id === id())
+      // The task is not returned yet when the first tick runs, so it is found by its subject.
+      const rec2 = s.tasks.find(
+        (t) =>
+          t.task.kind === 'schema.move' &&
+          t.task.state === 'running' &&
+          t.task.subject?.id === subjectId,
+      )
       const step = rec2?.task.progress.steps[2]
       const total = sr.sizeBytes ?? 8 * 1024 * 1024
       if (step) {

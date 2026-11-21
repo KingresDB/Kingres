@@ -16,6 +16,8 @@ import TaskActionDialog from '@/components/TaskActionDialog.vue'
 import EditDatabaseDialog from '@/components/EditDatabaseDialog.vue'
 import DistributeTableDialog from '@/components/DistributeTableDialog.vue'
 import EnableLedgerDialog from '@/components/EnableLedgerDialog.vue'
+import SchemasSection from '@/components/SchemasSection.vue'
+import { MODE_LABEL, modeOf } from '@/lib/sharding-mode'
 import { endpoints } from '@/api/endpoints'
 import { keys, useDatabase, useTables } from '@/api/queries'
 import { DATABASE_STATUS, DURABILITY_LABEL, LEDGER_MODE_LABEL, LEDGER_STATE } from '@/lib/status'
@@ -63,6 +65,7 @@ const createdText = computed(() => {
     : `Created by ${by} on ${formatDateTime(d.createdAt)}`
 })
 const shardingOn = computed(() => db.value?.sharding.enabled === true)
+const mode = computed(() => (db.value ? modeOf(db.value.sharding) : 'row'))
 </script>
 
 <template>
@@ -121,9 +124,33 @@ const shardingOn = computed(() => db.value?.sharding.enabled === true)
               >
               <template v-else>Off <span class="muted">(can be turned on)</span></template>
             </dd>
+            <template v-if="shardingOn">
+              <dt>Shard by</dt>
+              <dd data-testid="sharding-mode">{{ MODE_LABEL[mode] }}</dd>
+              <template v-if="mode !== 'row'">
+                <dt>New schemas</dt>
+                <dd data-testid="distribute-new">
+                  {{
+                    db.sharding.distributeNewSchemas === true
+                      ? 'Distributed automatically'
+                      : 'Stay local until distributed'
+                  }}
+                </dd>
+                <dt>Distributed schemas</dt>
+                <dd>
+                  <NullableValue :value="db.stats.distributedSchemaCount" :format="formatNumber" />
+                </dd>
+              </template>
+            </template>
             <dt>Bucket count</dt>
             <dd>
-              <NullableValue :value="db.sharding.bucketCount" /> <span class="muted">(fixed)</span>
+              <span v-if="shardingOn && mode === 'schema'" class="muted"
+                >Not used in the mode Schemas</span
+              >
+              <template v-else>
+                <NullableValue :value="db.sharding.bucketCount" />
+                <span class="muted"> (fixed)</span>
+              </template>
             </dd>
             <dt>Durability</dt>
             <dd>
@@ -263,6 +290,8 @@ const shardingOn = computed(() => db.value?.sharding.enabled === true)
           </p>
         </QueryBoundary>
       </section>
+
+      <SchemasSection :database-name="db.name" :sharding-on="shardingOn" :mode="mode" />
     </div>
   </QueryBoundary>
 
