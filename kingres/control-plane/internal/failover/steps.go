@@ -1892,8 +1892,13 @@ func (r *Runner) promoteNodePastPromotion(ctx context.Context, sc *stepCtx, nw S
 
 // The calls to the old primary's server after the promotion are best effort: its server may be down, or up with its instance held back, in which case it
 // answers "not ready" and a task step would wait for it for minutes (peerclient.NotReadyBound), which stops the failover for a server that is not
-// needed any more (the case of the old leader of a planned switchover of the map group that restarted). They wait for OldServerWait and go on.
+// needed any more (the case of the old leader of a planned switchover of the map group that restarted). They wait for OldServerWait and go on. Only the map group of a planned switchover is bounded: there the old leader's instance is the stopped system database.
 func (sc *stepCtx) oldCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	if sc.group != 0 || !sc.in.graceful() {
+		// Every other group keeps the long wait of a task step: the check that stops an old primary that still runs (the fence of last resort) is reached when the old
+		// server answers late or "not ready", and the lease fences in any case, but the alert and the immediate stop are worth the wait there (F5-10).
+		return ctx, func() {}
+	}
 	return context.WithTimeout(ctx, orDur(sc.r.OldServerWait, 15*time.Second))
 }
 

@@ -912,3 +912,33 @@ func TestAGroupThatWasPromotedIsNeverRolledBack(t *testing.T) {
 	}
 	t.Fatal("no stop step")
 }
+
+// F5-10. The short wait for the old server's answers is the map group's of a planned switchover; every other group and mode keeps the long wait.
+func TestOnlyTheMapGroupOfAPlannedSwitchoverBoundsTheCallsToTheOldServer(t *testing.T) {
+	ctx := context.Background()
+	has := func(sc *stepCtx) bool {
+		c, cancel := sc.oldCtx(ctx)
+		defer cancel()
+		_, ok := c.Deadline()
+		return ok
+	}
+	r := &Runner{}
+	if !has(&stepCtx{r: r, in: Input{Mode: ModeGraceful}, group: 0}) {
+		t.Error("the map group of a planned switchover is not bounded")
+	}
+	if !has(&stepCtx{r: r, in: Input{Mode: ModeRestore}, group: 0}) {
+		t.Error("the map group of a restore is not bounded")
+	}
+	for _, c := range []struct {
+		name string
+		sc   *stepCtx
+	}{
+		{"an ordinary group of a switchover", &stepCtx{r: r, in: Input{Mode: ModeGraceful}, group: 2}},
+		{"an ordinary group of a hard failover", &stepCtx{r: r, in: Input{Mode: ModeHard}, group: 2}},
+		{"the map group of a hard failover", &stepCtx{r: r, in: Input{Mode: ModeHard}, group: 0}},
+	} {
+		if has(c.sc) {
+			t.Errorf("%s is bounded: the fence of last resort would be skipped after 15 s", c.name)
+		}
+	}
+}
