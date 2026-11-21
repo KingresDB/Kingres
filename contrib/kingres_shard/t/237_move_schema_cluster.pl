@@ -92,8 +92,8 @@ q1($n1, q{CREATE SCHEMA mv_local_x; });
 # C. a move that fails before the switch is undone
 # ---------------------------------------------------------------------------
 {
-	my ($rc, $out, $err) = run_sql($n1, q{SET kingres_shard.fault_injection = 'move_after_subscription:error'; SET kingres_shard.node_timeout = 5; SELECT kingres.move_schema('mv', 2)});
-	isnt($rc, 0, 'a move that fails while it copies');
+	my ($rc, $out, $err) = run_sql($n1, q{SET kingres_shard.fault_injection = 'move_after_catchup:error'; SET kingres_shard.node_timeout = 5; SELECT kingres.move_schema('mv', 2)});
+	isnt($rc, 0, 'a move that fails after the copy is complete (the shells of the target hold the rows)');
 	my $id = q1($n1, "SELECT max(move_id) FROM kingres.bucket_move WHERE colocation_id = $coloc");
 	like(q1($n1, "SELECT phase FROM kingres.bucket_move WHERE move_id = $id"), qr/^(failed|cancelled)$/, '... is recorded as failed') or diag(q1($n1, 'SELECT * FROM kingres.bucket_move'));
 	is(q1($n1, q{SELECT group_id || ':' || state FROM kingres.schemas WHERE schema_name = 'mv'}), '1:active', '... and the schema is where it was, active');
