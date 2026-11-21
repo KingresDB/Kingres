@@ -5,6 +5,7 @@ package clustertest_test
 import (
 	"crypto/x509"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -495,9 +496,14 @@ func TestSwitchoverOfTheMapGroupWhoseOldLeaderEndsAtTheStop(t *testing.T) {
 	var task map[string]any
 	defer func() {
 		if t.Failed() {
-			t.Logf("task %v: %v", id, task)
-			t.Logf("candidate log: %s", nw.LogTail(14000))
-			t.Logf("old leader log: %s", leader.LogTail(8000))
+			st0, body0 := nw.Do("GET", fmt.Sprintf("/tasks/%v", id), nil, nil)
+			t.Logf("task %v on the new leader (%d): %v", id, st0, body0)
+			_, fs := nw.Do("GET", "/failover", nil, nil)
+			t.Logf("failover status on the new leader: %v", fs)
+			nw.DumpGoroutines()
+			t.Logf("stacks of the new leader: %s", stuckStacks(nw.LogTail(400000)))
+			t.Logf("candidate log: %s", quietLog(nw.LogTail(200000)))
+			t.Logf("old leader log: %s", quietLog(leader.LogTail(30000)))
 		}
 	}()
 	until(t, 5*time.Minute, "the old leader's kingresd to end after the clean stop", func() bool {
@@ -542,4 +548,39 @@ func TestSwitchoverOfTheMapGroupWhoseOldLeaderEndsAtTheStop(t *testing.T) {
 		}
 	}
 	_ = c
+}
+
+// quietLog drops the lines of a log that only repeat (a lost credential holder, a forward that waits), so that what a failure left is readable.
+func quietLog(s string) string {
+	var keep []string
+	for _, l := range strings.Split(s, "\n") {
+		if strings.Contains(l, "credentials did not answer") || strings.Contains(l, "forwarding to the manager leader failed") || strings.Contains(l, "the repair of switchovers cannot read") ||
+			strings.Contains(l, "internal call failed") || strings.Contains(l, "monitor connection") {
+			continue
+		}
+		keep = append(keep, l)
+	}
+	if len(keep) > 120 {
+		keep = keep[len(keep)-120:]
+	}
+	return strings.Join(keep, "\n")
+}
+
+// stuckStacks keeps, from the goroutine dump that DumpGoroutines made, the stacks that are in the failover or in the task engine.
+func stuckStacks(log string) string {
+	i := strings.Index(log, "SIGQUIT")
+	if i < 0 {
+		return "(no goroutine dump)"
+	}
+	var keep []string
+	for _, st := range strings.Split(log[i:], "\n\n") {
+		if strings.Contains(st, "internal/failover") || strings.Contains(st, "task.(*Engine)") || strings.Contains(st, "peerclient") {
+			keep = append(keep, st)
+		}
+	}
+	out := strings.Join(keep, "\n\n")
+	if len(out) > 9000 {
+		out = out[:9000]
+	}
+	return out
 }

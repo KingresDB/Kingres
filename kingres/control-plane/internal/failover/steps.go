@@ -90,6 +90,7 @@ type Runner struct {
 	DrainEvery         time.Duration // (default 10 s)
 	MarkWait           time.Duration // the wait for the standby to replay the mark (default 10 s)
 	VerifyWait         time.Duration // the proof is repeated this long (default 30 s)
+	OldServerWait      time.Duration // the calls to the old primary's server after the promotion wait this long (default 15 s)
 	MapVerdictWait     time.Duration // the old leader of a planned switchover of the map group waits this long for the candidate to promote or to refuse (default 6 min)
 	// PromoteNode are the bounds of the repeat loop of kingres.promote_node.
 	PromoteNode PromoteOptions
@@ -1471,7 +1472,7 @@ func (r *Runner) checkCatalog(ctx context.Context, env *task.Env, sc *stepCtx) e
 		}
 	}
 	// The fence of last resort.
-	if st, err := r.Peers.State(ctx, sc.old(), sc.group); err == nil {
+	if st, err := sc.oldState(ctx); err == nil {
 		if len(st.OutOfRecovery()) > 0 {
 			r.Plan.Alert(ctx, "oldPrimaryRunning", "critical", subjectOf(sc.group, sc.old()), fmt.Sprintf("The old primary of shard group %d is running on %s after the catalog moved; it is being stopped.", sc.group, sc.old()), true)
 			if _, derr := r.Peers.Demote(ctx, sc.old(), DemoteRequest{Group: sc.group, Mode: "immediate", ExpectedTerm: run.ExpectedTerm}); derr != nil && !errors.Is(derr, ErrUnreachable) {
@@ -1586,7 +1587,7 @@ func (r *Runner) records(ctx context.Context, env *task.Env, sc *stepCtx) error 
 	}
 	// The directory of the old primary, when its server answers: it is the instance whose role file says primary of the
 	// group (stopped by the demote). A server that does not answer finds its own directory when it is rebuilt.
-	if st, err := r.Peers.State(ctx, sc.old(), sc.group); err == nil {
+	if st, err := sc.oldState(ctx); err == nil {
 		for _, i := range st.Instances {
 			if i.Group == sc.group && i.Role == "primary" && !i.Running {
 				old.InstanceID = i.ID
@@ -1718,15 +1719,15 @@ func (r *Runner) unfreeze(ctx context.Context, env *task.Env, sc *stepCtx) error
 		if run, rerr := sc.runRow(ctx); rerr == nil {
 			term = run.ExpectedTerm
 		}
-		if err := r.Peers.Unquiesce(ctx, sc.old(), QuiesceRequest{Group: sc.group, ExpectedTerm: term}); err != nil && !errors.Is(err, ErrUnreachable) && !IsCode(err, "no_instance") {
+		if err := sc.oldUnquiesce(ctx, term); err != nil && !errors.Is(err, ErrUnreachable) && !IsCode(err, "no_instance") {
 			r.log().Warn("failover: putting the access rules back", "group", sc.group, "error", err)
 		}
 	}
-	if err := r.Peers.Unfreeze(ctx, sc.old(), sc.group); err != nil && !errors.Is(err, ErrUnreachable) && !IsCode(err, "no_instance") {
+	if err := sc.oldUnfreeze(ctx); err != nil && !errors.Is(err, ErrUnreachable) && !IsCode(err, "no_instance") {
 		r.log().Warn("failover: lifting the freeze", "group", sc.group, "server", sc.old(), "error", err)
 	}
 	old := "waitingForServer"
-	if st, err := r.Peers.State(ctx, sc.old(), sc.group); err == nil && len(st.OutOfRecovery()) == 0 {
+	if st, err := sc.oldState(ctx); err == nil && len(st.OutOfRecovery()) == 0 {
 		old = "rebuildScheduled" // the reconcile loop rebuilds it (oldprimary.go in internal/standby)
 	}
 	if err := sc.rows.Set(ctx, sc.group, GroupSet{State: ptr("done"), OldPrimary: &old, Finished: true}); err != nil {
@@ -1876,4 +1877,38 @@ func (r *Runner) promoteNodePastPromotion(ctx context.Context, sc *stepCtx, nw S
 		return out, sc.targetsPause(ctx, err)
 	}
 	return out, err
+}
+
+// The calls to the old primary's server after the promotion are best effort: its server may be down, or up with its instance held back, in which case it
+// answers "not ready" and a task step would wait for it for minutes (peerclient.NotReadyBound), which stops the failover for a server that is not
+// needed any more (the case of the old leader of a planned switchover of the map group that restarted). They wait for OldServerWait and go on.
+func (sc *stepCtx) oldCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, orDur(sc.r.OldServerWait, 15*time.Second))
+}
+
+// oldErr reports a wait that ran out as a server that did not answer, unless the step's own context ended.
+func (sc *stepCtx) oldErr(ctx, octx context.Context, err error) error {
+	if err != nil && octx.Err() != nil && ctx.Err() == nil {
+		return fmt.Errorf("%w: %v", ErrUnreachable, err)
+	}
+	return err
+}
+
+func (sc *stepCtx) oldState(ctx context.Context) (State, error) {
+	oc, cancel := sc.oldCtx(ctx)
+	defer cancel()
+	st, err := sc.r.Peers.State(oc, sc.old(), sc.group)
+	return st, sc.oldErr(ctx, oc, err)
+}
+
+func (sc *stepCtx) oldUnquiesce(ctx context.Context, term int64) error {
+	oc, cancel := sc.oldCtx(ctx)
+	defer cancel()
+	return sc.oldErr(ctx, oc, sc.r.Peers.Unquiesce(oc, sc.old(), QuiesceRequest{Group: sc.group, ExpectedTerm: term}))
+}
+
+func (sc *stepCtx) oldUnfreeze(ctx context.Context) error {
+	oc, cancel := sc.oldCtx(ctx)
+	defer cancel()
+	return sc.oldErr(ctx, oc, sc.r.Peers.Unfreeze(oc, sc.old(), sc.group))
 }
