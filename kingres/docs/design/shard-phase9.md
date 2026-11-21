@@ -1232,3 +1232,55 @@ Tests: t/196_storage_parameters. Mutants x01-x13.
 #### Results and files
 
 See the report. Files changed outside tests: src/dist_table.c, dist_table.h, kingres_shard.c, kingres_shard.h, rebuild.c, the SQL delta; planner and pushdown files untouched.
+
+### The fixes for the review of 9.4, 9.5, 9.8 and 9.9 (2026-11-21)
+
+The independent review (`reviews/2026-11-21-kingres-shard-phase9-increments-4-9.md`, P9C-01 to P9C-14) is answered in `contrib/kingres_shard`; the
+tests are `t/197_review_p9c_blocking` and `t/198_review_p9c_partitions`. Every test that is new fails on the tree of the review (the red run) and
+passes on both majors.
+
+- **P9C-01 (critical).** The blocking `undistribute_table` and `alter_distributed_table` copied the rows of the local node's partitions through the
+  snapshot of the caller's `REPEATABLE READ` or `SERIALIZABLE` transaction, which is older than the lock that stops the writers, compared the copy
+  with a count taken through the same snapshot (so the check could not see the loss), and dropped the old table. The rule of P9A-01 is now the rule of
+  every blocking call: `internal_require_read_committed()` is the first thing both calls and the four partition functions do (before any lock;
+  SQLSTATE `55006`, the same words as the create call), and the C copy refuses a transaction snapshot as the last line
+  (`kingres_shard_copy_routed_ex`). In `READ COMMITTED` every statement of the plpgsql body, the count included, takes a fresh snapshot after the lock, so
+  the count that the copy is compared with is taken under the lock; a writer that commits while the call waits is in the new table (tested for both calls,
+  with a digest). The partition functions copy no row; they read the catalog under the lock, and the same rule keeps them from deciding on a stale snapshot.
+- **P9C-02 (high).** The scan's remote cursors are closed when their connection is idle; the batch sender had a batch in flight on the same connection, so
+  the `CLOSE` was skipped and the node could not drop the table ("being used by active queries"). The copy now finishes the sender before it closes its
+  portal. Tested with 30000 rows (alter, undistribute to another group) and a reference table of 6000 rows.
+- **P9C-03 (high).** Decision: refuse, do not carry. A bucket move makes a leaf again from the definition of the partitioned table (`LIKE ... INCLUDING ALL`
+  of its bucket partition, `PARTITION OF`); carrying what one leaf has of its own (indexes, checks, owner, privileges, defaults, parameters) would need a
+  per-leaf capture in the move, a second source of truth that `check_cluster()` would have to compare with the parent. The partition that
+  `create_partition` makes cannot have these objects, so the attach is made equal to it: `internal_attach_differences(parent, table)` lists what the table
+  has of its own (an index compared by its definition after `USING`, a check by name and definition, a default, storage parameters, another owner, privileges
+  that are not the default) and `attach_partition` refuses with each of them named. A table like the partitioned table is attached, and its leaves after a move
+  have the definition of their siblings (tested). Not done: `check_cluster()` does not compare the leaves of a partition with the parent.
+- **P9C-04 (medium).** The report applies `function_owner_not_superuser` to every table that the call takes with it (the component of the foreign keys for an
+  undistribute with `cascade_via_foreign_keys`, the group for an alter with `cascade_to_colocated`), names the table in the detail, and the calls refuse before
+  anything is copied.
+- **P9C-05 (medium).** `internal_view_recreate` takes back every grant that the default privileges of the schema gave the new view (`internal_reset_acl`), when
+  the new view has an ACL at all (a view made where nothing is granted by default keeps the NULL ACL of the old one); the capture now includes the entries of the
+  owner, so an owner who had given up a privilege does not get it back. Not done: the grantor of a grant that another role made with the grant option (all grants
+  are made by the owner). Decision: the chain of grantors that the table path rebuilds with `SET LOCAL ROLE` was not copied for views, because a view with grants
+  by roles other than its owner is rare and the privileges themselves are the same.
+- **P9C-06 (medium).** `alter_distributed_table(colocate_with => <table>)` checks the group of that table with `internal_group_busy()` (a table operation, a move in a
+  busy phase, a bucket that is not `active`), in the report and so in the call; the groups that `colocate_with => 'default'` searches (blocking, online) are the free
+  ones.
+- **P9C-07 (medium).** The report refuses a `DEFERRABLE` unique or primary key constraint for the online forms (`deferrable_unique`); the blocking forms accept it.
+- **P9C-08 (low).** Carried, not documented away: the options of the TOAST table are read from the TOAST table (`internal_table_options`), recorded and applied as
+  `toast.<name>` for distribute, alter, undistribute, reference tables and the bucket move.
+- **P9C-09 (low).** The statement mapping refuses a partition in another schema, an `UNLOGGED` or `TEMPORARY` partition, answers `IF NOT EXISTS` of an existing
+  partition with the notice of PostgreSQL, and writes a cast with `format_type_with_typemod` (the modifier and the quoting are kept).
+- **P9C-10 (low).** `detach_partition` gives the new table the table privileges (with grant option) and the comment of the table; column privileges are not carried.
+- **P9C-11 (low).** `check_cluster()` reads the leaf name with `parse_ident`.
+- **P9C-12 (low).** `FROM`, `IN`, `WITH` and `DEFAULT` are accepted in any case.
+- **P9C-13 (note).** Documented in the README (the waits of the blocking calls, the deadlock detector, what the online forms do). No change: the behaviour is that of
+  the locks, and the recovery worker's pass over distributed deadlocks was not shown to be missing.
+- **P9C-14 (note).** A view on a partition of a table that is distributed is a blocker of the report (`dependent_object`, the view and the partition named) instead of
+  PostgreSQL's "cannot drop table"; the time zone dependence of `dist_partition.bound`, the double disk use of the retained copies and the reference table that is not
+  compared before an undistribute are documented.
+
+The mutants of the review that survived are killed: S18, S19, S22, C01, C02 and S10 (the reset of the ACL of a recreated view, in its new form). S04 (the count
+comparison of the undistribute) stays redundant in READ COMMITTED and is not tested separately.

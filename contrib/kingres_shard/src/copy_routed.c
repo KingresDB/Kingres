@@ -27,6 +27,7 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/xact.h"
 #include "catalog/pg_type_d.h"
 #include "executor/spi.h"
 #include "fmgr.h"
@@ -114,6 +115,17 @@ kingres_shard_copy_routed_ex(Oid source, const char *dest_schema, const char *de
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_TABLE),
 				 errmsg("relation with OID %u does not exist", source)));
+
+	/*
+	 * The rows are read with a snapshot taken here, after the lock that stops the writers.  A transaction that holds one snapshot for
+	 * its whole life (REPEATABLE READ, SERIALIZABLE) cannot take another, and would copy the rows as they were before the lock
+	 * (P9C-01).  The calls refuse these levels before they take the lock; this is the last line.
+	 */
+	if (IsolationUsesXactSnapshot())
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("the copy of table \"%s\" cannot run in a REPEATABLE READ or SERIALIZABLE transaction", src_table),
+				 errhint("Run the call in a READ COMMITTED transaction.")));
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
@@ -324,11 +336,16 @@ kingres_shard_copy_routed_ex(Oid source, const char *dest_schema, const char *de
 		nread += (int64) nproc;
 		SPI_freetuptable(tuptable);
 	}
+	/*
+	 * The batches in flight use the connections on which the remote cursors of the scan are open, and
+	 * a cursor is closed only when its connection is idle.  The sender finishes first, so that the
+	 * cursors are closed: left open, a cursor keeps the table, and the node cannot drop it ("cannot
+	 * DROP TABLE ... because it is being used by active queries in this session", P9C-02).
+	 */
+	acked = kingres_shard_batch_finish(sender);
 	SPI_cursor_close(portal);
 	PopActiveSnapshot();
 	SPI_freeplan(plan);
-
-	acked = kingres_shard_batch_finish(sender);
 	kingres_shard_batch_end(sender);
 	AtEOXact_GUC(true, guc_nest);
 	SPI_finish();

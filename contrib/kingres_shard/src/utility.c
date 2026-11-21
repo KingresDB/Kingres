@@ -1789,8 +1789,13 @@ append_bound_expr(StringInfo buf, Node *e)
 	{
 		TypeCast   *tc = (TypeCast *) e;
 
+		Oid			typoid;
+		int32		typmod;
+
 		append_bound_expr(buf, tc->arg);
-		appendStringInfo(buf, "::%s", TypeNameToString(tc->typeName));
+		/* the type as PostgreSQL writes it, with its modifier and quoted where it must be (P9C-09) */
+		typenameTypeIdAndMod(NULL, tc->typeName, &typoid, &typmod);
+		appendStringInfo(buf, "::%s", format_type_with_typemod(typoid, typmod));
 		return;
 	}
 	if (IsA(e, A_Expr) && ((A_Expr *) e)->kind == AEXPR_OP && list_length(((A_Expr *) e)->name) == 1 &&
@@ -1893,6 +1898,26 @@ is_user_partitioned(Oid relid)
 	return result;
 }
 
+/* Is there a user partition of that name of the table? */
+static bool
+user_partition_exists(Oid parent, const char *name)
+{
+	Oid			argtypes[2] = {OIDOID, TEXTOID};
+	Datum		values[2];
+	bool		result;
+
+	values[0] = ObjectIdGetDatum(parent);
+	values[1] = CStringGetTextDatum(name);
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	if (SPI_execute_with_args("SELECT 1 FROM " KINGRES_SHARD_SCHEMA ".dist_partition WHERE parent = $1::pg_catalog.oid::pg_catalog.regclass AND partition_name = $2",
+							  2, argtypes, values, NULL, true, 1) < 0)
+		elog(ERROR, "could not read the catalog");
+	result = SPI_processed > 0;
+	SPI_finish();
+	return result;
+}
+
 static void
 call_partition_function(const char *sql, int nargs, Oid *argtypes, Datum *values)
 {
@@ -1924,6 +1949,32 @@ map_partition_statement(Node *parsetree, QueryCompletion *qc)
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							errmsg("a partition of a distributed table is created with its bound only"),
 							errhint("Sub-partitioning, storage parameters, a tablespace, an access method and columns are not accepted here.")));
+		/*
+		 * What the statement says and the mapping does not carry is refused, not ignored (P9C-09): the leaves are made in the
+		 * schema of the table, as permanent tables; and IF NOT EXISTS is answered as PostgreSQL does, with a notice.
+		 */
+		if (stmt->relation->relpersistence != RELPERSISTENCE_PERMANENT)
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("a partition of a distributed table is a permanent table"),
+							errhint("UNLOGGED and TEMPORARY are not accepted here.")));
+		{
+			Oid			nsp = stmt->relation->schemaname != NULL ? get_namespace_oid(stmt->relation->schemaname, false)
+				: RangeVarGetCreationNamespace(stmt->relation);
+
+			if (nsp != get_rel_namespace(parent))
+				ereport(ERROR, (errcode(ERRCODE_INVALID_SCHEMA_NAME),
+								errmsg("the partition must be in the schema of the table"),
+								errhint("Write the schema of the table in front of the name of the partition.")));
+			if (stmt->if_not_exists &&
+				(OidIsValid(get_relname_relid(stmt->relation->relname, nsp)) || user_partition_exists(parent, stmt->relation->relname)))
+			{
+				ereport(NOTICE, (errcode(ERRCODE_DUPLICATE_TABLE),
+								 errmsg("relation \"%s\" already exists, skipping", stmt->relation->relname)));
+				if (qc != NULL)
+					SetQueryCompletion(qc, CMDTAG_CREATE_TABLE, 0);
+				return true;
+			}
+		}
 		argtypes[0] = OIDOID;
 		argtypes[1] = TEXTOID;
 		argtypes[2] = TEXTOID;
