@@ -2619,3 +2619,48 @@ start the old leader again), B7 records no task but names the old leader's. On t
 `POST /failover/map/proof` takes the proof from the old server only. **Not built:** the leader's side (the `Preflight` and `Resolve` that accept group 0 with a live old server,
 group 0 last in the order of a switchover and a restore, the step that calls `map/start` and the clean stop that sends the proof, the idempotent re-run of the steps on the new
 leader) and every cluster test; the four open points stand. Until they are built the 422 for the map group with a live old leader is unchanged, so nothing reaches the callee side.
+
+### The clean stop holds the primary back and keeps its lease (`HoldBack`, 2026-11-21): the safety argument
+
+What changed. `demoteClean` (the callee of the clean stop of a planned switchover) used to call `Relinquish` before the fast shutdown: the marker `relinquished.<group>` was
+written and the renewal of the lease stopped, and the lease then ran out `duration - margin` after the last round, in the middle of a slow shutdown (a shutdown checkpoint on a
+slow disk, a walsender that has to send what is pending, a loaded machine). The lease manager fenced the instance with an immediate stop, the state was `shutting down`, and the
+step refused (`switchover_unproven`), safely but needlessly. Now `HoldBack` writes the same marker and does **not** stop the renewal; the renewal ends with `ReleaseGroup` when the
+stop was clean (the lease is handed back at once) and with `Relinquish` when it was not (not stopped, or a state other than `shut down`), after which the lease runs out and the
+fence stops whatever still runs, as before. The stop is bounded by its own context (120 s), not by the lease.
+
+What must stay true, and why it does.
+
+1. **A primary never acts beyond its lease.** The lease is renewed only by this kingresd's rounds, each of which needs a majority, and a renewal gives at most `duration` from its own
+   start. So the primary's authority ends at the last renewal plus `duration - margin` whatever happens next; `HoldBack` only moves the last renewal later, to the end of the stop.
+   During the held stop the primary does not write for clients: the hold rules of the quiesce (`pg_hba.conf` replaced, the sessions ended) were in force before the stop was asked for, and a
+   postmaster that is shutting down accepts no new connection. What it still does is what a shutdown does (the checkpoint, the walsenders sending the WAL that is pending to the standbys
+   and the subscribers), and the proof (`switchover_verify` against the shutdown checkpoint, state `shut down`) is the only thing a promotion rests on.
+2. **kingresd dies during the held stop.** The renewals stop with the process. The instance (the postmaster is not a child of kingresd) either finishes its shutdown by itself, which is
+   a clean stop whose lease then runs out at the grantors with nobody to renew it, or it hangs, and the watchdog (for an enforced group, which a switchover group always is: it has a
+   standby) stops it immediately when the lease file runs out, `duration - margin` after the last renewal, and writes the `fenced` marker. A restarted kingresd reads the marker
+   (`loadRelinquished`): the group is relinquished again in memory, so the restarted process does **not** renew it, which is the behaviour from before this change; and the primary is not
+   started (point 4). The leader's task, or the next run of it, repeats the stop (`demote fast` is idempotent: it finds the instance stopped, reads the checkpoint, and releases the
+   lease), or finds the state not `shut down` and rolls back or pauses; nothing is promoted without the proof.
+3. **The leader changes during the held stop.** The callee finishes the stop it began (it is local to the old primary's server). If the connection of the superseded run drops, the
+   request context ends: `Stop` is cut short, `Running` cannot be asked, the answer is `stopped: false`, and the callee ends the renewal (`Relinquish`) before it returns, so the lease
+   runs out and the watchdog or the lease manager fences what still runs; the new run, with a higher epoch, is the only one the callee accepts (the fence), reads the state again, and
+   takes the lease through the ordinary wait. The calls of the old run that arrive late are refused by the fence and the term. A second `demote fast` while the first still runs waits on
+   the lifecycle lock of the instance and finds it stopped. The repair loop does not undo the hold while a failover task is unfinished (a task whose lease expired counts as
+   unfinished), so it cannot resume the old primary under the new run.
+4. **The start gate.** The marker is on disk before the stop is asked for (`pki.WriteFile` is an atomic replace), so from the first moment of the held stop no start of the primary of
+   the group is accepted by this server: `lease.Gate` refuses on `relinquished`, `fenced` and `waitlease`, and the lease manager starts a primary only for `fenced` and `waitlease`
+   (`Waiting`), never for `relinquished`. The marker goes away only with `Unrelinquish` (the rollback, `Manager.Resume`, which then writes the wait marker when the instance does not run, so
+   that the rounds start it once the lease is held; with the renewal going on, that is at the next round) or with `BecameStandby` (the old primary rebuilt as a standby, after the role
+   file says standby). A fence that fires while the hold is on adds `fenced`; both markers refuse a start.
+5. **What did not change.** Another server cannot be granted the lease while the old one is renewed, exactly as before; the lease is still handed to the new holder only after the
+   release or the lapse; the old primary is still never promoted back by itself; `Relinquish` is still what ends the renewal of a stop that did not end cleanly; and the lapse of the
+   lease still fences, which is the safety of every other path.
+
+The cost, stated: a hung shutdown now holds the lease for up to the 120 s of the stop context instead of for `duration - margin`. During that time the group has no primary that takes
+clients (it is quiesced, and then shutting down) and no other holder; the task fails after it with the same refusal as before and rolls back, and the group takes writes again when the
+old primary is resumed. A shorter bound can be set by the stop context, not by the lease.
+
+Evidence. Unit: `internal/lease` `TestHoldBackKeepsRenewingThroughASlowStop` (a stop of three lease durations is not fenced; after `Relinquish` the lapse fences). Cluster:
+`TestSwitchoverSurvivesACleanStopThatOutlastsTheLease` (the fault `demote:slowstop` holds the stop for 20 s against a lease of 12 s with a margin of 3 s). The cluster test is to be
+shown failing on the old code (`Relinquish` in place of `HoldBack`) and passing on the new, in the gate that follows.
