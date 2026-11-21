@@ -2041,11 +2041,11 @@ paths:
         **0.10.0.** The body is optional: `shardGroupIds` limits the groups, `dryRun` answers 200
         `FailoverPlan` and changes nothing. Refused with the same 409 codes as `failoverServer`.
 
-        **0.13.0, how the restore works.** The task is `replication.restorePreferredPrimaries` (subject `replication` / `preferred-primaries`). The
+        **How the restore works (the text of 0.15.0).** The task is `replication.restorePreferredPrimaries` (subject `replication` / `preferred-primaries`). The
         preferred server of a group is the server of its first node by id. A group whose primary is not there is handed back by the steps of a
         planned switchover (see `failoverServer`, mode `graceful`), one group at a time, from the server that took it over to the preferred server.
         A group whose preferred server has no ready standby, is left alone and listed in the report as
-        `skipped` with the reason (`preferredNotReady`, `mapGroup`). A group that fails before its promotion (a standby that is behind, a proof
+        `skipped` with the reason `preferredNotReady` (`mapGroup` is reserved and is not produced since the map group is restored like any group). A group that fails before its promotion (a standby that is behind, a proof
         that cannot be made) is rolled back and reported `failed`; the task goes on with the next group and ends `partial`. 422 `unprocessable`
         when no group needs to be restored. The report has `kind` `restorePreferredPrimaries`, `mode` `restore` and `serverId` null.
       tags: [Replication]
@@ -2108,7 +2108,7 @@ paths:
         newer term; this operation gives it up at once, so that the gate of the task engine opens and a new request can begin. It is answered by any
         server (the leader may be the server that is gone): the server asks the servers that host a ready standby of the map group and gives up the
         bootstrap that one of them runs. `abandoned` is false when no bootstrap is in progress. A bootstrap that already promoted the standby cannot
-        be given up (409 `conflict`): the promoted instance holds the lease and the bootstrap goes on to its end. The audit event is `abandonMapGroupBootstrap`.
+        be given up (409 `conflict`): the promoted instance holds the lease and the bootstrap goes on to its end. The audit event is `abandonMapGroupBootstrap`. It needs `kingres_admin`, one role above the failover it undoes (`kingres_ops`): it discards what a bootstrap did and, for a planned switchover, makes the old leader roll back.
       tags: [Replication]
       x-required-role: kingres_admin
       requestBody:

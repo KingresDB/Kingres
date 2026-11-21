@@ -336,6 +336,7 @@ None.
 
 #### Documentation
 
+- `restorePreferredPrimaries` (contract of 0.10.0, implemented): no change of schema. The task kind is `replication.restorePreferredPrimaries` with the subject `replication` / `preferred-primaries`; the groups that are left alone are reported `skipped` with the reason in `error` (`preferredNotReady`); a group that fails before its promotion is `failed` and the task ends `partial`; 422 `unprocessable` when nothing needs to be restored. `GET /failover` names the phase of a group of a switchover or a restore (`quiescing`, `waitingForTransactions`, `stopping`, `verifying`, ...) and `writesPausedSince` while its writes are stopped.
 - `failoverServer`, `mode: graceful`: a planned switchover of the map group is accepted by the leader (that server) and handled as described; a hard failover of a server whose map group primary answers is
   still refused with 422 `unsupported_operation`. `restorePreferredPrimaries` restores the map group like any group (skipped with `preferredNotReady` when its preferred server has no ready standby of it).
 
@@ -387,11 +388,6 @@ None.
 
 #### Documentation
 
-- `restorePreferredPrimaries` (0.10.0 contract, implemented now): no change of schema. The task kind is `replication.restorePreferredPrimaries` with the subject
-  `replication` / `preferred-primaries`; the groups that are left alone are reported `skipped` with the reason in `error` (`preferredNotReady`, `mapGroup`); a
-  group that fails before its promotion is `failed` and the task ends `partial`; 422 `unprocessable` when nothing needs to be restored. `GET /failover` names the
-  phase of a group of a switchover or a restore (`quiescing`, `waitingForTransactions`, `stopping`, `verifying`, ...) and `writesPausedSince` while its writes are
-  stopped.
 - The planned switchover (`failoverServer` with `mode: graceful`, ordinary groups): no change of schema. The text of the operation lists the steps and the
   task error codes `standby_behind`, `switchover_unproven`, `cannot_quiesce` and `prepared_transactions_pending`; `group_degraded` (409) is used for the
   first time (no standby streams from the primary); a request that includes the map group still answers 422 `unsupported_operation`. The console
