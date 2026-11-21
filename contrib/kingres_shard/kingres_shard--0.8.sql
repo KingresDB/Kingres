@@ -11489,6 +11489,7 @@ BEGIN
     RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_layout() t;
     RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_layout_partitions(v_skip) t;
     RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_splits(v_skip) t;
+    RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_ledger(v_skip) t;
     RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_table_operations() t;
     RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_partitions() t;
 END;
@@ -13956,7 +13957,7 @@ BEGIN
     -- tables and partitioned tables
     SELECT CASE c.relkind WHEN 'p' THEN 'partitioned table' ELSE 'table' END,
            pg_catalog.quote_ident(v_name) || '.' || pg_catalog.quote_ident(c.relname),
-           (c.relpersistence OPERATOR(pg_catalog.=) 'p' AND dt.method IS NULL AND NOT c.oid OPERATOR(pg_catalog.=) ANY (v_ledger)
+           (c.relpersistence OPERATOR(pg_catalog.=) 'p' AND dt.method IS NULL
             AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i
                               JOIN pg_catalog.pg_class pc ON pc.oid OPERATOR(pg_catalog.=) i.inhparent
                              WHERE i.inhrelid OPERATOR(pg_catalog.=) c.oid AND pc.relnamespace OPERATOR(pg_catalog.<>) v_oid)
@@ -13968,7 +13969,6 @@ BEGIN
                 WHEN dt.method OPERATOR(pg_catalog.=) 'hash' THEN 'a hash-distributed table'
                 WHEN dt.method OPERATOR(pg_catalog.=) 'reference' THEN 'a reference table'
                 WHEN dt.method OPERATOR(pg_catalog.=) 'schema' THEN 'already a table of a distributed schema'
-                WHEN c.oid OPERATOR(pg_catalog.=) ANY (v_ledger) THEN 'a kingres_ledger table'
                 WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i
                               JOIN pg_catalog.pg_class pc ON pc.oid OPERATOR(pg_catalog.=) i.inhparent
                              WHERE i.inhrelid OPERATOR(pg_catalog.=) c.oid AND pc.relnamespace OPERATOR(pg_catalog.<>) v_oid)
@@ -14249,7 +14249,8 @@ SELECT pg_catalog.format('%s|%s|%s|%s|%s',
            COALESCE((SELECT pg_catalog.string_agg(pg_catalog.pg_get_indexdef(i.indexrelid), ',' ORDER BY pg_catalog.pg_get_indexdef(i.indexrelid))
                        FROM pg_catalog.pg_index i WHERE i.indrelid OPERATOR(pg_catalog.=) p_rel::pg_catalog.oid), ''),
            COALESCE((SELECT pg_catalog.string_agg(t.tgname, ',' ORDER BY t.tgname)
-                       FROM pg_catalog.pg_trigger t WHERE t.tgrelid OPERATOR(pg_catalog.=) p_rel::pg_catalog.oid AND NOT t.tgisinternal), ''));
+                       FROM pg_catalog.pg_trigger t WHERE t.tgrelid OPERATOR(pg_catalog.=) p_rel::pg_catalog.oid AND NOT t.tgisinternal
+                        AND t.tgname NOT LIKE 'kingres!_ledger!_%' ESCAPE '!'), ''));
 $$;
 
 CREATE FUNCTION kingres.internal_table_fingerprint(p_rel regclass)
@@ -14550,7 +14551,7 @@ CREATE FUNCTION kingres.internal_schema_precheck(p_colocation int)
     LANGUAGE sql STABLE
     SET search_path = pg_catalog, kingres, pg_temp
     AS $$
-SELECT CASE
+SELECT COALESCE(kingres.internal_schema_pinned(p_colocation), (SELECT CASE
          WHEN c.relpersistence OPERATOR(pg_catalog.<>) 'p' THEN pg_catalog.format('table %s is not logged: it is not replicated', c.oid::pg_catalog.regclass)
          WHEN c.relreplident OPERATOR(pg_catalog.=) 'n' OR (c.relreplident OPERATOR(pg_catalog.=) 'd'
               AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_index i WHERE i.indrelid OPERATOR(pg_catalog.=) c.oid AND i.indisprimary))
@@ -14563,7 +14564,7 @@ SELECT CASE
         OR (c.relreplident OPERATOR(pg_catalog.=) 'd'
             AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_index i WHERE i.indrelid OPERATOR(pg_catalog.=) c.oid AND i.indisprimary)))
  ORDER BY c.oid
- LIMIT 1;
+ LIMIT 1));
 $$;
 
 -- On a node: the shells of the schema.  p_empty true: the name of the first table that has a row (or NULL when every table is empty);
@@ -15079,6 +15080,7 @@ BEGIN
         SELECT g.oid, g.tgname, g.tgenabled, c2.relname
           FROM pg_catalog.pg_trigger g JOIN pg_catalog.pg_class c2 ON c2.oid OPERATOR(pg_catalog.=) g.tgrelid
          WHERE c2.relnamespace OPERATOR(pg_catalog.=) v_oid AND NOT g.tgisinternal AND g.tgparentid OPERATOR(pg_catalog.=) 0
+           AND g.tgname NOT LIKE 'kingres!_ledger!_%' ESCAPE '!'
          ORDER BY g.oid
     LOOP
         v_trg := v_trg OPERATOR(pg_catalog.||) pg_catalog.pg_get_triggerdef(r.oid, true);
@@ -15111,6 +15113,7 @@ DECLARE
     v_self   pg_catalog.int4;
     v_first  pg_catalog.text;
     v_save   pg_catalog.text;
+    v_owner_node pg_catalog.int4;
     nd       pg_catalog.record;
 BEGIN
     PERFORM kingres.internal_require_superuser();
@@ -15137,6 +15140,16 @@ BEGIN
     END IF;
     SELECT l.node_id INTO v_self FROM kingres.local_node l;
     v_save := pg_catalog.current_setting('kingres_shard.enable_routing');
+
+    -- a schema that holds a ledger table cannot be undistributed (the chain of the ledger is on the owner and no schema operation moves it)
+    SELECT n.node_id INTO v_owner_node FROM kingres.node n
+     WHERE n.group_id OPERATOR(pg_catalog.=) v_group AND n.role OPERATOR(pg_catalog.=) 'primary' AND n.is_active;
+    v_first := CASE WHEN v_owner_node OPERATOR(pg_catalog.=) v_self THEN kingres.internal_schema_pinned(v_coloc)
+                    ELSE kingres.internal_branch_scalar(v_owner_node, pg_catalog.format('SELECT kingres.internal_schema_pinned(%s)', v_coloc)) END;
+    IF v_first IS NOT NULL THEN
+        RAISE EXCEPTION '%', v_first USING ERRCODE = 'object_not_in_prerequisite_state',
+              HINT = 'Only the per-shard ledger of a later phase could move a ledger with its schema.';
+    END IF;
 
     -- the shells hold no row
     FOR nd IN SELECT n.node_id, n.group_id FROM kingres.node n
@@ -15452,6 +15465,111 @@ REVOKE ALL ON FUNCTION
 
 -- =========================================================================
 -- PHASE 11, step 10                                                          [end]
+-- =========================================================================
+
+-- =========================================================================
+-- PHASE 11 (distributed schemas), step 11: ledger tables   [begin]
+--
+-- design/shard-phase11.md 11.1.  A ledger table (kingres_ledger) may be in a distributed schema and then lives entirely on the owner: ledger_enable is run on the
+-- owner's primary (kingres_ledger refuses it elsewhere), the shells are plain tables, and the schema is pinned: its ledger chain is in the schema kingres of the
+-- owner, which no schema operation moves, so the schema cannot be moved or undistributed (and PostgreSQL's ledger hook refuses to drop its tables).
+-- =========================================================================
+
+-- Node-local: why the schema of the colocation group cannot move (it holds a ledger table on this node), or NULL.
+CREATE FUNCTION kingres.internal_schema_pinned(p_colocation int)
+    RETURNS text
+    LANGUAGE plpgsql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_nsp   pg_catalog.oid;
+    v_name  pg_catalog.name;
+    v_group pg_catalog.int4;
+    v_list  pg_catalog.text;
+BEGIN
+    IF pg_catalog.to_regclass('kingres.ledger_table') IS NULL THEN
+        RETURN NULL;
+    END IF;
+    SELECT s.nsp::pg_catalog.oid, ns.nspname, b.group_id INTO v_nsp, v_name, v_group
+      FROM kingres.dist_schema s
+      JOIN pg_catalog.pg_namespace ns ON ns.oid OPERATOR(pg_catalog.=) s.nsp::pg_catalog.oid
+      JOIN kingres.bucket_map b ON b.colocation_id OPERATOR(pg_catalog.=) s.colocation_id AND b.bucket OPERATOR(pg_catalog.=) 0
+     WHERE s.colocation_id OPERATOR(pg_catalog.=) p_colocation;
+    IF v_nsp IS NULL THEN
+        RETURN NULL;
+    END IF;
+    EXECUTE 'SELECT pg_catalog.string_agg(c.relname::pg_catalog.text, '', '' ORDER BY c.relname) FROM kingres.ledger_table t '
+            'JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) t.relid::pg_catalog.oid WHERE c.relnamespace OPERATOR(pg_catalog.=) $1'
+       INTO v_list USING v_nsp;
+    IF v_list IS NULL THEN
+        RETURN NULL;
+    END IF;
+    RETURN pg_catalog.format('schema_pinned: schema "%s" holds the ledger table(s) %s on shard group %s; the chain of the ledger is on that group and a schema operation would leave it behind', v_name, v_list, v_group);
+END;
+$$;
+
+-- Node-local: the tables of this node that kingres_ledger registered and that are in a distributed schema that another group holds, as a JSON array of names.
+CREATE FUNCTION kingres.internal_ledger_misplaced()
+    RETURNS pg_catalog.jsonb
+    LANGUAGE plpgsql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_local pg_catalog.int4;
+    v_res   pg_catalog.jsonb;
+BEGIN
+    IF pg_catalog.to_regclass('kingres.ledger_table') IS NULL THEN
+        RETURN '[]'::pg_catalog.jsonb;
+    END IF;
+    SELECT n.group_id INTO v_local FROM kingres.local_node l JOIN kingres.node n ON n.node_id OPERATOR(pg_catalog.=) l.node_id;
+    EXECUTE 'SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.format(''%s.%s'', ns.nspname, c.relname) ORDER BY ns.nspname, c.relname), ''[]''::pg_catalog.jsonb) '
+            'FROM kingres.ledger_table t JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) t.relid::pg_catalog.oid '
+            'JOIN pg_catalog.pg_namespace ns ON ns.oid OPERATOR(pg_catalog.=) c.relnamespace '
+            'JOIN kingres.dist_schema s ON s.nsp::pg_catalog.oid OPERATOR(pg_catalog.=) c.relnamespace '
+            'JOIN kingres.bucket_map b ON b.colocation_id OPERATOR(pg_catalog.=) s.colocation_id AND b.bucket OPERATOR(pg_catalog.=) 0 '
+            'WHERE b.group_id OPERATOR(pg_catalog.<>) $1'
+       INTO v_res USING v_local;
+    RETURN v_res;
+END;
+$$;
+
+-- check_cluster: a ledger table registered on a node that is not the owner of its schema (ledger_enable was run on a shell).
+CREATE FUNCTION kingres.internal_check_ledger(p_skip int[] DEFAULT '{}')
+    RETURNS TABLE (check_name text, node_id int, object text, detail text)
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    n pg_catalog.record;
+    r pg_catalog.jsonb;
+    e pg_catalog.text;
+BEGIN
+    IF pg_catalog.to_regclass('kingres.dist_schema') IS NULL THEN
+        RETURN;
+    END IF;
+    FOR n IN SELECT nd.node_id AS id FROM kingres.node nd WHERE nd.role OPERATOR(pg_catalog.=) 'primary' AND nd.is_active
+                AND NOT (nd.node_id OPERATOR(pg_catalog.=) ANY (p_skip)) ORDER BY nd.node_id LOOP
+        BEGIN
+            r := kingres.internal_node_exec(n.id, 'SELECT kingres.internal_ledger_misplaced()::pg_catalog.text');
+            r := (((r OPERATOR(pg_catalog.->) 0) OPERATOR(pg_catalog.->>) 0))::pg_catalog.jsonb;
+        EXCEPTION WHEN OTHERS OR query_canceled THEN
+            CONTINUE;
+        END;
+        FOR e IN SELECT x FROM pg_catalog.jsonb_array_elements_text(r) x LOOP
+            check_name := 'ledger_on_non_owner'; node_id := n.id; object := e;
+            detail := 'the table is a ledger table of this node, and its schema is distributed and held by another shard group: its rows are on the owner, so this ledger covers none of them';
+            RETURN NEXT;
+        END LOOP;
+    END LOOP;
+END;
+$$;
+
+COMMENT ON FUNCTION kingres.internal_schema_pinned(int) IS 'Node-local: why the schema cannot move (it holds a ledger table here), or NULL';
+COMMENT ON FUNCTION kingres.internal_ledger_misplaced() IS 'Node-local: the ledger tables of this node that are in a distributed schema of another group';
+REVOKE ALL ON FUNCTION kingres.internal_schema_pinned(int), kingres.internal_ledger_misplaced(), kingres.internal_check_ledger(int[]) FROM PUBLIC;
+
+-- =========================================================================
+-- PHASE 11, step 11                                                          [end]
 -- =========================================================================
 
 -- ===========================================================================

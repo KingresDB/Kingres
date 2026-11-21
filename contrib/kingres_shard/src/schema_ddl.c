@@ -657,6 +657,9 @@ kingres_shard_schema_ddl_classify(Node *parsetree, const KsCatalog *cat, bool fo
 			{
 				CreateTrigStmt *t = (CreateTrigStmt *) parsetree;
 
+				/* the triggers of kingres_ledger belong to the node that holds the ledger table (design 11.1): not propagated */
+				if (t->trigname != NULL && strncmp(t->trigname, "kingres_ledger_", 15) == 0)
+					break;
 				ns_add(&s, rv_ns(t->relation));
 				if (s.dist != NIL)
 					sd->verify_tables = lappend(sd->verify_tables, t->relation);
@@ -668,6 +671,23 @@ kingres_shard_schema_ddl_classify(Node *parsetree, const KsCatalog *cat, bool fo
 			{
 				AlterTableStmt *a = (AlterTableStmt *) parsetree;
 				Oid			ns = rv_ns(a->relation);
+
+				/* ENABLE ALWAYS TRIGGER of a trigger of kingres_ledger (the last step of ledger_enable) is as node-local as the trigger */
+				if (a->cmds != NIL)
+				{
+					ListCell   *lc_l;
+					bool		all_ledger = true;
+
+					foreach(lc_l, a->cmds)
+					{
+						AlterTableCmd *lcmd = lfirst_node(AlterTableCmd, lc_l);
+
+						if (lcmd->subtype != AT_EnableAlwaysTrig || lcmd->name == NULL || strncmp(lcmd->name, "kingres_ledger_", 15) != 0)
+							all_ledger = false;
+					}
+					if (all_ledger)
+						break;
+				}
 
 				ns_add(&s, ns);
 				/* a key from a table outside a distributed schema to a table of one is refused too */

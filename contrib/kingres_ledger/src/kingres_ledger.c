@@ -247,6 +247,71 @@ kl_check_owner(Oid relid)
 }
 
 /*
+ * A table of a distributed schema (kingres_shard, phase 11) lives on the primary of the shard group that holds its schema: the other nodes
+ * have empty shells of it.  A ledger on a shell would cover none of its rows, so ledger_enable refuses a table whose schema another group
+ * holds and names the node to run it on.  Nothing is checked when kingres_shard is not installed in this database.
+ */
+static void
+kl_check_distributed_owner(Oid relid)
+{
+	int			ret;
+	bool		ok = false;
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		return;
+	ret = SPI_execute("SELECT pg_catalog.to_regclass('kingres.dist_schema') IS NOT NULL "
+					  "AND pg_catalog.to_regclass('kingres.bucket_map') IS NOT NULL "
+					  "AND pg_catalog.to_regclass('kingres.local_node') IS NOT NULL "
+					  "AND pg_catalog.to_regclass('kingres.node') IS NOT NULL",
+					  true, 1);
+	if (ret == SPI_OK_SELECT && SPI_processed == 1)
+	{
+		bool		isnull;
+		Datum		d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+
+		ok = !isnull && DatumGetBool(d);
+	}
+	if (ok)
+	{
+		Oid			argtypes[1] = {OIDOID};
+		Datum		values[1];
+
+		values[0] = ObjectIdGetDatum(relid);
+		ret = SPI_execute_with_args("SELECT b.group_id, "
+									"(SELECT n.group_id FROM kingres.local_node l JOIN kingres.node n ON n.node_id OPERATOR(pg_catalog.=) l.node_id), "
+									"(SELECT pn.node_id FROM kingres.node pn WHERE pn.group_id OPERATOR(pg_catalog.=) b.group_id "
+									"AND pn.role OPERATOR(pg_catalog.=) 'primary' AND pn.is_active ORDER BY pn.node_id LIMIT 1) "
+									"FROM kingres.dist_schema s "
+									"JOIN kingres.bucket_map b ON b.colocation_id OPERATOR(pg_catalog.=) s.colocation_id AND b.bucket OPERATOR(pg_catalog.=) 0 "
+									"WHERE s.nsp::pg_catalog.oid OPERATOR(pg_catalog.=) (SELECT c.relnamespace FROM pg_catalog.pg_class c WHERE c.oid OPERATOR(pg_catalog.=) $1)",
+									1, argtypes, values, NULL, true, 1);
+		if (ret == SPI_OK_SELECT && SPI_processed == 1)
+		{
+			HeapTuple	tup = SPI_tuptable->vals[0];
+			TupleDesc	td = SPI_tuptable->tupdesc;
+			bool		n1,
+						n2,
+						n3;
+			int32		owner = DatumGetInt32(SPI_getbinval(tup, td, 1, &n1));
+			int32		local = DatumGetInt32(SPI_getbinval(tup, td, 2, &n2));
+			int32		node = DatumGetInt32(SPI_getbinval(tup, td, 3, &n3));
+
+			if (!n1 && !n2 && owner != local)
+			{
+				char	   *rname = pstrdup(get_rel_name(relid));
+
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("table \"%s\" is in a distributed schema that shard group %d holds, not this node's group", rname, owner),
+						 errdetail("The rows of the table are on the owner; a ledger on this node would cover none of them."),
+						 !n3 ? errhint("Run kingres.ledger_enable on node %d, the primary of shard group %d.", node, owner) : 0));
+			}
+		}
+	}
+	SPI_finish();
+}
+
+/*
  * kingres.ledger_lock_table(relation regclass) returns void
  *		Lock a table in SHARE ROW EXCLUSIVE mode, by OID, on behalf of the role
  *		that called ledger_enable.  The caller must own the table.  Locking by
@@ -265,6 +330,7 @@ kingres_ledger_lock_table(PG_FUNCTION_ARGS)
 
 	kl_require_own_statement("ledger_enable");
 	kl_check_owner(relid);
+	kl_check_distributed_owner(relid);
 	/*
 	 * The order of the locks is checked before the wait for the table (L19-04):
 	 * a caller that holds a later lock of the extension and then waits for a

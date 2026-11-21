@@ -303,6 +303,7 @@ tests += {
       't/239_schema_same_group_cluster.pl',
       't/240_schema_ship_functions_cluster.pl',
       't/241_schema_single_tables_cluster.pl',
+      't/242_schema_ledger_cluster.pl',
     ],
   },
 }
