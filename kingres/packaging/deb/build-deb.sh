@@ -93,6 +93,10 @@ if [ -x "${root}${prefix}/bin/kingres-verify" ]; then
 fi
 
 # ---- service, configuration, documentation ----------------------------------
+# The unit must switch core dumps off: the daemon can hold the ledger signing key in memory
+# (ledger-phase7.md, 3.2.2).  A unit that lost the line does not build.
+grep -qx "LimitCORE=0" "${here}/kingres.service" || die "kingres.service has no LimitCORE=0 line"
+
 install -D -m 0644 "${here}/kingres.service" "${root}/usr/lib/systemd/system/kingres.service"
 install -D -m 0644 "${here}/kingresd.json" "${root}/etc/kingres/kingresd.json"
 install -D -m 0600 "${here}/kingresd.env" "${root}/etc/kingres/kingresd.env"
@@ -135,7 +139,7 @@ done
 man_page kingresd 8 "the KingresDB node service: management panel, REST API and instance manager" \
 "kingresd serves the web management panel and the REST API on one port (default 127.0.0.1:8091). It is started by the systemd unit kingres.service as the user kingres. Settings come from a JSON file (option -config, default /etc/kingres/kingresd.json), from environment variables KINGRES_* (see /etc/kingres/kingresd.env) and from command-line options, in increasing precedence. Run kingresd -h for the list. While the node is uninitialized, the one-time setup token is in /var/lib/kingres/setup-token."
 man_page kingres-verify 1 "verify the tamper-evident ledger of KingresDB without trusting the database" \
-"kingres-verify checks the digests and inclusion proofs of the kingres_ledger extension independently of the server. Run kingres-verify --help for its commands."
+"kingres-verify checks the digests and inclusion proofs of the kingres_ledger extension independently of the server. Run kingres-verify --help for its commands. This copy came with the package and is for convenience only: an auditor must not rely on a verifier that came from the cluster it is meant to check. Get the verifier from the source repository at a release tag or from the release files, and check it with kingres-verify release verify (see the README of the verifier)."
 if [ ! -x "${root}${prefix}/bin/kingres-verify" ]; then
     rm -f "${root}/usr/share/man/man1/kingres-verify.1.gz"
 fi

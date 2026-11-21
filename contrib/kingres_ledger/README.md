@@ -568,8 +568,7 @@ build that left it out would lose that coverage. It can only be set by a superus
 who can stop the server anyway; it makes `ledger_register_table` wait, inside the time
 that it credits, and a cancel or a terminate ends the wait.
 
-Errors raised by the extension: SQLSTATE `KL001` (modification of an
-append-only table), `KL002` (statement rejected by the protection hook or by
+Errors raised by the extension: SQLSTATE `KL001` (an `UPDATE`, `DELETE` or `TRUNCATE` of an append-only ledger table or of a table of the extension's own ledger catalog, with the message `table "<name>" is an append-only ledger table`; a `TRUNCATE` of an updatable table says `... is an updatable ledger table and cannot be truncated`), `KL002` (statement rejected by the protection hook or by
 the event trigger), `KL003` (library not preloaded), `KL004` (the previous block
 is closed ahead of the clock), `KL005` (the SQL of the extension is older than the
 library: `cannot write to table "...": the SQL of extension "kingres_ledger" is
@@ -1805,7 +1804,7 @@ member of `pg_read_all_data`, the owner of an application table and a role with
    deletes a row of those tables, before any row is built, with `cannot write
    to table "<name>": only the code of the ledger writes its tables` (SQLSTATE
    `42501`; an `UPDATE` or `DELETE` of the append-only tables says `table "<name>"
-   is an append-only ledger table`, `KL001`, as it always did). The hook has the
+   is an append-only ledger table`, `KL001`, as it always did; so does a `TRUNCATE`, through the triggers and the utility hook). The hook has the
    same signature on PostgreSQL 18 and 19. It is called from
    `ExecCheckPermissions` (`src/backend/executor/execMain.c`) for every plan
    that `ExecutorStart` starts, for `COPY FROM` (`DoCopy` in `copy.c`), for the

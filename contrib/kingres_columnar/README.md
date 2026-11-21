@@ -99,7 +99,10 @@ denied for table", tested in `columnar_security`).  `columnar_set_options` and
 | `kingres_columnar.vacuum_truncate_lock_timeout` | 5s | Developer setting, superuser only: how long the truncation of a `VACUUM` asks for its exclusive lock (every 50 ms) before it gives up for this visit.  The default is heap's 5 seconds; the tests raise it so that a verdict does not depend on how fast the machine is, or lower it to see the give-up quickly. |
 | `kingres_columnar.max_stripe_rows` | 10000000 | Developer setting, superuser only: lowers the most rows the writer puts in one stripe (and the size above which `columnar_check` reports a stripe), so the limit can be tested with a few thousand rows. It cannot raise the compiled limit and does not touch the reader, so no value can make a table unreadable. |
 | `kingres_columnar.reserve_row_numbers` | off | Developer setting, superuser only, for tests (0.2, C6a): the session reserves row numbers when it inserts (see "Reserved row numbers"). A row then has its TID when the insert returns, `INSERT ... RETURNING ctid` shows it, and it is the TID the row keeps. Off: nothing changes, the same stripes and the same row numbers as 0.1. It decides per buffer, when the buffer is made: set it before the first write of a transaction. It is ignored for a table whose file is of format version 2 (written by 0.1) and while the stripe catalog is the one of 0.1. Until a table with an index switches the reservation on by itself (C6b) this is the only way to get it. |
-| `kingres_columnar.reserve_gate`, `kingres_columnar.reserve_gate_at` | 0, 0 | Developer settings, superuser only, for tests: a writer that reserves waits, at the point `reserve_gate_at` names (1 the numbers are taken from the metapage, 2 the reserved catalog row is inserted, 3 the pages of the stripe are written, 4 the reserved row is updated), for as long as a session of a superuser holds the advisory lock `pg_advisory_lock(reserve_gate, 0)`, as `check_gate` does for the check. `t/046` stops the server at each of them. 0 is no gate; the wait is bounded (two minutes) and can be cancelled. |
+| `kingres_columnar.reserve_min_rows` | 64 | Developer setting, superuser only (0.2, C13-02): how many row numbers a writer reserves at first for a table that has an index; the reservation grows in place while its buffer fills, up to the stripe size.  0: a whole stripe's worth, as 0.2 did before C13 (the tests of C6a that describe that layout set it).  It can be set in `postgresql.conf` (the extension's settings of the write path could not be before C13: they were defined after the extension's prefix was reserved, so a line in the file was dropped with a warning). |
+| `kingres_columnar.vacuum_compact_stripes` | 128 | Superuser only (0.2, C13-05): `VACUUM` merges the small stripes of a table when at least this many are smaller than a sixteenth of the stripe size; 0 turns it off.  The merge is the last step of the `VACUUM`, is skipped when 90 percent of the table's row numbers are used, and an error in it is a WARNING, not a failed `VACUUM` (C14-02). |
+| `kingres_columnar.vacuum_compact_rows` | 1000000 | Superuser only (0.2, C14-03): the most rows one `VACUUM` copies when it merges small stripes (only stripes smaller than a sixteenth of the stripe size are merged); the rest is merged by the next `VACUUM`.  0: no limit.  See "Subtransactions" below for what the merge costs the rest of the cluster. |
+| `kingres_columnar.reserve_gate`, `kingres_columnar.reserve_gate_at` | 0, 0 | Developer settings, superuser only, for tests: a writer that reserves waits, at the point `reserve_gate_at` names (1 the numbers are taken from the metapage, 2 the reserved catalog row is inserted, 3 the pages of the stripe are written, 4 the reserved row is updated; 6 an index vacuum has read the metapage and the catalog and not yet scanned the index, 7 a VACUUM has done its merge of small stripes), for as long as a session of a superuser holds the advisory lock `pg_advisory_lock(reserve_gate, 0)`, as `check_gate` does for the check. `t/046` stops the server at each of them. 0 is no gate; the wait is bounded (two minutes) and can be cancelled. |
 | `kingres_columnar.fault_point`, `kingres_columnar.fault_nth` | off, 0 | Developer settings, superuser only, present only when the server is built with assertions (`USE_ASSERT_CHECKING`): make the nth allocation of the write path (`alloc`), the nth relation of a subtransaction's hand-over to its parent (`merge`) or the nth relation of a flush (`flush`) fail once with "out of memory". Used by `t/016_atomic_handover.pl`; absent from production builds. |
 | `kingres_columnar.enable_custom_scan` | on | Use the Columnar Scan (projection, skipping). |
 | `kingres_columnar.enable_chunk_skipping` | on | Use minimum and maximum to skip. |
@@ -343,7 +346,7 @@ metapage has its own checksum. A damaged byte inside a stripe page is caught by
 the chunk checksum; page checksums, when enabled, catch it earlier.
 
 
-## B-tree indexes (0.2, increments C6b and C6c)
+## B-tree indexes (0.2, increments C6b, C6c and C13)
 
 `CREATE INDEX` on a columnar table builds a B-tree over the rows of
 the table, and index scans find rows by TID: a TID is a row number
@@ -407,13 +410,12 @@ ACCESS METHOD` in both directions, `TRUNCATE`, `REINDEX`).
   `VACUUM`.  The index file does not shrink (a B-tree only reuses freed pages; the
   index of the heap twin and this one are of the same size after the same work), the
   garbage entries are gone (`t/056`: a million rolled-back entries are removed).
-  The numbers of an aborted writer are **never given back** to the metapage, and this is not a
-  cost that a later version should remove: a rolled-back writer has index entries for its
-  numbers (they are made when the row is inserted), and a number that is used again by another
-  row would make such an entry find the other row, with a key that is not its key; only the
-  unused tail of a *committed* buffer, which has no row and no entry, is returned.  The address
-  space (2^32 blocks of 2048 numbers) is used a little faster by workloads that roll back large
-  buffers.
+  The numbers of **rows** that were put in are **never given back** to the metapage: a rolled-back writer
+  has index entries for them (they are made when the row is inserted), and a number that is used again by
+  another row would make such an entry find the other row, with a key that is not its key.  What can go
+  back is the unused tail of a reservation, after the last row's number: at the flush of a buffer
+  that commits, and, since C13, at the **next reservation of the session** for the unused tail of a
+  buffer that an abort dropped (see "What gives the numbers back, and what does not").
 * **Compaction of a table with indexes (0.2, C6d).**  `columnar_compact` works on a table that has
   indexes of any kind this version allows (unique and primary keys too).  The copies of the rows get
   new row numbers, so after the copy **each index gets an entry for each copied row**
@@ -438,6 +440,20 @@ ACCESS METHOD` in both directions, `TRUNCATE`, `REINDEX`).
   for numbers of stripes that never committed, which are filtered like those of a rolled-back
   writer and removed the same way.  A table that is compacted again and again between vacuums
   grows its indexes by the copied rows each time; vacuum after compacting.
+* **An index built or rebuilt while an older snapshot lives (C13-01).**  `CREATE INDEX` and `REINDEX`
+  (and the build behind `ALTER TABLE ... SET ACCESS METHOD`) put into the index the rows of the stripes visible
+  now **and** those of the stripes only an older snapshot can still see (a compaction replaced them and no
+  VACUUM has made them removable yet), the second kind as "not alive", the way heap indexes recently dead tuples:
+  without them a REPEATABLE READ snapshot older than a compaction found no row through an index created after
+  it, while its sequential scan found all of them.  In a unique build the copies repeat the keys of the replaced
+  rows, which is no duplicate (not alive rows are kept out of the uniqueness check).  In a parallel build the leader
+  alone indexes the replaced stripes.  The next `VACUUM` removes the entries once no snapshot can see those stripes
+  (`t/063`).
+* **`amcheck` (C13-04)** works: `bt_index_check` and `bt_index_parent_check`, **with `heapallindexed` too** (it
+  reads the table through the access method's index build with a concurrent index description, accepted for an index
+  that is valid and ready; `CREATE INDEX CONCURRENTLY` and `REINDEX CONCURRENTLY` build indexes that are not ready
+  and stay refused with their own message).  `heapallindexed` reports a row that has no entry and so finds what
+  `columnar_check_indexes` finds, without its limit of 50 million entries and its superuser rule (`t/065`).
 * **`kingres.columnar_check_indexes(rel regclass)`** (superuser by default; `REVOKE`d
   from `PUBLIC`): reads every index of the table in full and the rows of the stripes
   as of now, and returns one row `index_entry_missing` for an index that has no entry
@@ -473,9 +489,12 @@ ACCESS METHOD` in both directions, `TRUNCATE`, `REINDEX`).
 A B-tree index needs a row's TID when the row is inserted, and other sessions
 need to see that a writer is working on a range of row numbers.  Until 0.2 the
 numbers were given when a stripe was written, at the flush, long after the
-insert.  A write buffer that **reserves** takes the numbers of a whole stripe
-(`stripe_row_count`, 150000 by default) from the metapage when its first row goes
-in, and inserts the stripe's catalog row in the state `reserved`, by the
+insert.  A write buffer that **reserves** takes **a small block of numbers** (since C13: 64, or what
+the session's last buffer of the table needed, rounded up to a power of two; the developer setting
+`kingres_columnar.reserve_min_rows`, 0 for the whole stripe of 0.2 before C13) from the metapage when its first row goes
+in, and grows the block in place while the buffer fills and it is still the end of the numbers (up to
+`stripe_row_count`, 150000 by default: a load by one session is one stripe, as before; the claim row
+of the catalog grows with it), and inserts the stripe's catalog row in the state `reserved`, by the
 transaction (or subtransaction) that inserts the row.  The rows after it have the
 numbers after it, so a row has its TID when the insert returns it (block
 `number / 2048`, offset `number % 2048 + 1`, as every scan shows it), and it is
@@ -513,25 +532,40 @@ transaction has not yet written shows the same TIDs.
   reserved after it), under the lock of the metapage, and only after the
   catalog row says how many numbers the stripe has (`RETURN`); a transaction that
   commits with a few rows and nobody after it wastes nothing.  Otherwise the numbers stay
-  unused, **a gap**: a reservation behind another writer's, and every reservation
-  of a transaction or subtransaction that **aborts** (an abort callback may not
-  touch the file, so nothing is given back there, and the numbers of a row that was
-  handed out are never given back in any case: an index entry may name them).
-  **The worst case of waste** is one reservation, `stripe_row_count` numbers (150000
-  by default, 10 000 000 at most), for every writer that aborts or ends behind another;
-  a table has about 8.8 x 10^12 numbers (the TID space), so 58 million such
-  writers at the default size, or 880 000 at the largest, use them up, after which
-  an insert fails with "has no row numbers left" and the table is to be rewritten
-  (`VACUUM FULL`).  The numbers are not reused: no number that a row has or had, or
-  that a live writer holds, is ever handed to another row (`t/047`).
+  unused, **a gap**: a reservation behind another writer's.  A transaction or subtransaction that
+  **aborts** cannot touch the file in its abort callback, so it notes the unused tail of its reservation
+  (the numbers after the rows that were put in: the numbers of a row are never given back, an index
+  entry may name them) and the session gives it back at its next reservation for the table, when it is
+  still the end of the numbers (C13-02).  **The worst case of waste** is now **one small reservation** (64
+  numbers, or the block the session's last buffer of the table needed) for every writer that aborts or
+  commits while another has reserved after it, and what an aborting session gets back when
+  nobody interleaves.  A table has about 8.8 x 10^12 numbers (the TID space): one session that
+  aborts in a loop wastes about the numbers of its rows (measured: 3000 aborted one-row subtransactions
+  use about 3000 numbers, where each used 150 000 before); two or more sessions that interleave their
+  aborts waste up to 64 each time, so using the numbers up takes at least 1.4 x 10^11 aborted
+  transactions: at the rate one session was measured at (about 120 000 aborts per second) about two weeks of
+  continuous attack by two sessions or more, and a few days with many cores; it is a bound, not a proof of
+  safety against a determined role with a connection to spare; and **any role that may INSERT can reach this bound, nothing else gives it more**.  When the
+  numbers are used up an insert fails with "has no row numbers left"; the table's **owner** recovers it by
+  rewriting the table (`VACUUM FULL`, or `ALTER TABLE ... SET ACCESS METHOD columnar`), which starts the numbers
+  again; a WARNING at 90 percent used (once in a session) says so in time.  The numbers are
+  not reused otherwise: no number that a row has or had, or that a live writer holds, is ever handed
+  to another row (`t/047`, `t/066`).
 * **Subtransactions (decision 3 of C6a).**  A buffer that reserves is never merged
   into another.  A committing subtransaction **writes such a buffer as a stripe of its own**
   (its own flush, the `own_flush` path) instead of handing the rows to the parent, so
   the rows keep the numbers and the stripe row the subtransaction inserted; one that
   a cursor still reads cannot be written, and becomes the parent's, which writes it.
-  The cost is **one stripe per savepoint (or `EXCEPTION` block) that wrote**, however few rows,
+  The cost is **one stripe per savepoint (or `EXCEPTION` block) that wrote**, however few rows
+  (a stripe, a page of 8 kB and a row of the stripe catalog each),
   where without reservation the rows of savepoints merge into the parent's buffer
-  and make full stripes; `columnar_compact` repairs it, and renumbers the rows (below).
+  and make full stripes.  **It is bounded since C13-05**: `VACUUM` merges the small stripes when at least
+  `kingres_columnar.vacuum_compact_stripes` (128; 0 turns it off) of them are smaller than a sixteenth of the stripe
+  size, as `columnar_compact` does with its defaults (the indexes get entries for the copies; the replaced
+  stripes' blocks are listed free by the next `VACUUM` and reused), so a table that takes a savepoint per row is as
+  large as that many stripes until its next vacuum (autovacuum runs after the inserts it counts, as for any
+  append-only table), not for good; `columnar_compact` does it by hand, and renumbers the rows (below).
+  **Operations notes (C14).**  The merge is the last step of a `VACUUM`, it runs under the transaction id the `VACUUM` then gets, and **that id holds back the cleanup horizon of every table in the cluster until the `VACUUM` of the table ends**: a lazy `VACUUM` normally takes no part in the horizon, and this one does, for the time of the merge.  The time is bounded: only stripes smaller than a sixteenth of the stripe size are copied, and at most `kingres_columnar.vacuum_compact_rows` (1 000 000) rows in one `VACUUM`; a table with more is merged over several vacuums.  The copies take new row numbers and the numbers of the replaced stripes are not used again, so **a merge burns row numbers** (about the number of rows it copies); it is skipped when 90 percent of the numbers are used, and the table's owner who sees the warning about the numbers should rewrite the table (below).  A writer that reserves row numbers for a table with an index updates the claim row of the stripe catalog each time its reservation grows (about a dozen times for a full stripe of a bulk load), which is catalog churn a bulk load of an indexed table pays that a load without an index does not.  The unused tail of an aborted writer's reservation is given back by its next reservation only when no index vacuum of the table is running (C14-01): it stays a gap then, at most the small reservation.  An autovacuum that is cancelled in its merge (a DDL storm on the table) leaves the pages it wrote as blocks no stripe uses (the next `VACUUM` lists them free) and the numbers they took are gone.
   The coalescing of the buffers that cursors kept apart leaves buffers that
   reserve alone, too.  Nothing that reserves holds a list of reserved runs in the merge code.
 * **Which tables, which sessions.**  Only a table whose file is of format version 3, in a
@@ -649,7 +683,10 @@ All with SQLSTATE `0A000`.
   `SET ACCESS METHOD` make are no new rows and are not logged.  **What is still refused**: a publication
   that would include the stripe catalog `kingres.columnar_stripe` (`FOR ALL TABLES`, `FOR TABLES IN
   SCHEMA kingres`), when a columnar table exists or is made: its rows describe the files of one server
-  and must not be applied by a subscriber; list the tables (`FOR TABLE ...`) instead.  Tested in
+  and must not be applied by a subscriber; list the tables (`FOR TABLE ...`) instead.  **A column added
+  with a default after rows were inserted in the same transaction** (the ALTER comes before the stripe is written) is
+  logged with the value a scan returns for those rows, the default, not NULL (C13-03, `t/064`); a heap row is decoded as
+  it was when it was inserted, with no such column, and a subscriber gives it its own default.  Tested in
   `t/061_logical.pl` against a subscriber row by row.
 * A row cannot be fetched by TID (C6b). `ctid` shows a number made from the row's
   position; without reserved row numbers it is not stable and means nothing, and
@@ -746,6 +783,17 @@ stripe visible now uses, listed or not; what the next stripes will reuse is part
 said that reusing the space was left out on purpose (C10-06, C11-06) for the cost of an exclusive
 lock at every vacuum; the shared lock above is not that cost, and the design's walk of the stripe
 headers is not needed: the stripe catalog already says what is used.
+
+**Operations notes for tables with indexes (C13).**  (1) `columnar_compact` holds `SHARE UPDATE EXCLUSIVE` on the
+table, which conflicts with `VACUUM` and with another compaction (it is not a writer's lock): no index vacuum and no
+free-space pass runs while a compaction writes its copies and their index entries, and the other way round; readers
+and writers go on.  (2) A compaction that is **prepared** (`PREPARE TRANSACTION` after `columnar_compact`) holds that lock
+until `COMMIT PREPARED` or `ROLLBACK PREPARED`, so `VACUUM` of the table waits for it, as it would for heap; index
+vacuum and the reuse of free space are delayed with it: end prepared transactions.  (3) The rows of the stripe catalog
+`kingres.columnar_stripe` show up in the output of `test_decoding` (it has no publication filter) beside the table's own
+inserts, as any table's do; a publication never includes the catalog (see "Logical replication"), and a slot of a
+custom plugin must filter it out.  (4) A role that may `INSERT` into a table with an index can make it use numbers,
+see "What gives the numbers back, and what does not" for how fast and how the owner recovers.
 
 How the stripe rows of a file that goes away are removed.  Correctness never
 depends on an event trigger firing; the triggers are only a way to do it earlier.
@@ -1053,8 +1101,9 @@ Memory and costs worth knowing:
   at pre-commit: 100 000 stripes and 819 200 000 bytes on disk (8 192 bytes, one
   page, for each row of 4 bytes), written in 2.6 s, read by a full scan in 0.52 s
   where the same rows in one stripe take 0.006 s (`t/030_late_stripes.pl` pins
-  the shape with 5 000 rows).  `VACUUM` does not join the stripes (an earlier
-  comment in the code said it did); `columnar_compact` does (0.9 s for those
+  the shape with 5 000 rows).  `VACUUM` joins them when at least 128 are
+  smaller than a sixteenth of the stripe (since C13-05; an earlier version of this paragraph said it does not, and `t/030` runs
+  with the merge turned off to pin the shape); `columnar_compact` does at once (0.9 s for those
   100 000 rows, to one stripe of 245 760 bytes), but the pages of the old
   stripes stay in the file until `VACUUM FULL` returns them.  An operator whose
   module writes late runs `columnar_compact` and, to return the space, `VACUUM

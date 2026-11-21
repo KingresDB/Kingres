@@ -22,7 +22,7 @@ Directories marked "planned" do not exist yet or are empty.
   kingres/
     README.md                      Project entry point
     api/                           OpenAPI contract (openapi.yaml); the REST API is defined here first
-    control-plane/                 Go module: kingresd and kingres-cli
+    control-plane/                 Go module: kingresd and kingres-watchdog (kingres-cli is planned)
       cmd/                           One subdirectory per executable (main packages only)
       internal/                      All other Go packages (agent, manager, router, task engine, REST handlers)
     web/                           Vue 3 and TypeScript panel

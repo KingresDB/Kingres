@@ -1026,6 +1026,33 @@ kc_catalog_update_reserved(Relation rel, const KcStripeInfo *si,
 }
 
 /* Delete the reserved row of a reservation that is given up (no row went in). */
+/*
+ * The reserved row of this transaction claims more numbers now (C13-02: a reservation that grows
+ * in place while its buffer fills): the same row, with the larger row_count.  The caller has
+ * taken the numbers from the metapage under the reservation lock and passes the command first
+ * (the row must not have been made by the running command).
+ */
+void
+kc_catalog_resize_reserved(Relation rel, const KcStripeInfo *si)
+{
+	Relation	cat = table_open(kc_catalog_oid(), RowExclusiveLock);
+	Datum		v[Natts_kc_stripe];
+	bool		n[Natts_kc_stripe];
+	bytea	   *cp = kc_make_bytea(NULL, 0);
+	bytea	   *cs = kc_make_bytea(NULL, 0);
+	HeapTuple	tup;
+	ItemPointerData tid;
+
+	kc_find_reserved(cat, kc_rel_ident(rel)->uid, si->stripe_id, &tid);
+	kc_catalog_values(rel, si, cp, cs, false, true, v, n);
+	tup = heap_form_tuple(RelationGetDescr(cat), v, n);
+	CatalogTupleUpdate(cat, &tid, tup);
+	heap_freetuple(tup);
+	pfree(cp);
+	pfree(cs);
+	table_close(cat, RowExclusiveLock);
+}
+
 void
 kc_catalog_delete_reserved(Relation rel, uint64 stripe_id)
 {
@@ -2135,4 +2162,64 @@ kc_catalog_live_blocks(Relation rel, TransactionId oldest, int *n_out, Transacti
 	}
 	*n_out = m;
 	return r;
+}
+
+/*
+ * The stripes that an older snapshot may still see and a current one does not (C13-01): versions
+ * whose writer committed and whose deleter (a compaction) is this transaction or committed but
+ * not before the oldest transaction any snapshot may have, so they are not removable yet.  An
+ * index that is built or rebuilt now must have an entry for the rows of these stripes as well as
+ * for those of the stripes visible now, or a snapshot older than the compaction that reads
+ * through the index finds none of its rows (the sequential scan of the same snapshot does).  Heap
+ * indexes recently dead tuples for the same reason.  The caller holds a lock that keeps a
+ * compaction and a vacuum of the table out.
+ */
+KcStripeInfo *
+kc_catalog_load_dead(Relation rel, TransactionId oldest, int *nstripes)
+{
+	Relation	cat = table_open(kc_catalog_oid(), AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	KcStripeInfo *res = NULL;
+	int			n = 0;
+	int			cap = 0;
+
+	ScanKeyInit(&key, Anum_kc_uid, BTEqualStrategyNumber, F_INT8EQ,
+				Int64GetDatum((int64) kc_rel_ident(rel)->uid));
+	scan = systable_beginscan(cat, kc_catalog_index_oid(), true, SnapshotAny, 1, &key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		HeapTupleHeader th = tup->t_data;
+		TransactionId x;
+		TransactionId xmax;
+		KcVer		v;
+
+		if (kc_tuple_is_reserved(cat, tup))
+			continue;
+		v = kc_version_status(th, &x);
+		if (v != KC_VER_COMMITTED || !kc_version_superseded(th))
+			continue;
+		xmax = HeapTupleHeaderGetUpdateXid(th);
+		if (TransactionIdIsCurrentTransactionId(xmax))
+			;					/* deleted by this transaction: other snapshots still see it */
+		else if (TransactionIdIsInProgress(xmax) || !TransactionIdDidCommit(xmax))
+			continue;			/* its deleter is running elsewhere (a lock keeps that out) or aborted: it is visible, not dead */
+		else if (TransactionIdPrecedes(xmax, oldest))
+			continue;			/* nobody can see it any more */
+		if (n == cap)
+		{
+			cap = cap ? cap * 2 : 16;
+			res = res ? repalloc(res, sizeof(KcStripeInfo) * cap)
+				: palloc(sizeof(KcStripeInfo) * cap);
+		}
+		kc_stripe_from_tuple(cat, tup, &res[n]);
+		if (res[n].block_count == 0)
+			continue;
+		n++;
+	}
+	systable_endscan(scan);
+	table_close(cat, AccessShareLock);
+	*nstripes = n;
+	return res;
 }

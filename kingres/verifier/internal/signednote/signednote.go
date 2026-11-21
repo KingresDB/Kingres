@@ -123,7 +123,7 @@ func (k Key) ID() uint32 { return KeyID(k.Name, k.Public) }
 // "Verifier keys"). The key id must match the one computed from the name and
 // the key: the specification says they MUST.
 func ParseVKey(s string) (Key, error) {
-	parts := strings.Split(s, "+")
+	parts := strings.SplitN(s, "+", 3) // the base64 part may itself hold plus signs
 	if len(parts) != 3 {
 		return Key{}, errors.New("verifier key must have three parts separated by plus signs")
 	}

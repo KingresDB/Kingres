@@ -2,7 +2,7 @@
 # kingresd: the KingresDB control plane
 
 `kingresd` is the control-plane server of KingresDB. It serves the management
-REST API that the web panel and `kingres-cli` use
+REST API that the web panel uses (and that the planned `kingres-cli`, not built yet, will use)
 (`kingres/api/openapi.yaml`, conventions in `kingres/api/README.md`) and the
 embedded web panel, on one port (default `127.0.0.1:8091`). It runs on every
 server of a cluster.
@@ -11,8 +11,9 @@ This is the **third increment** (several servers). The second added the instance
 system database, cluster creation (`init-cluster`) and the operations behind the Databases, Security, Query and
 Settings pages; the third lets a second and a third server join (`joinCluster`, `addServer`), removes an empty
 server (`removeServer`) and makes the cluster-wide operations run on every server (see
-[Running several servers](#running-several-servers)). Rebalance, failover, restoring preferred primaries
-still answer the contract's "not supported yet" problem. The fourth step added server groups, leaving a cluster,
+[Running several servers](#running-several-servers)). At that time rebalance, failover, restoring preferred primaries
+still answered the contract's "not supported yet" problem (rebalance and failover are built since; the table
+under "What is implemented" is current, and only `restorePreferredPrimaries` and eight ledger operations still answer so). The fourth step added server groups, leaving a cluster,
 instance start and stop, local settings, inclusion proofs and verification records, security headers and
 crash-injection tests of the task engine. The fifth step (contract 0.5.0) added certificate renewal and revocation,
 the cluster-wide logs, alerts and metrics, the alert kinds that nothing raised, and the corrections listed in
@@ -174,7 +175,7 @@ server at start. The DSN is never logged.
 | `version-check-interval` | `KINGRES_VERSION_CHECK_INTERVAL` | `1m` | how often the manager leader compares the versions of the servers (`versionMismatch`) |
 | `gather-timeout` | `KINGRES_GATHER_TIMEOUT` | `3s` | the time one server gets to answer its part of a cluster-wide read of logs, alerts or metrics |
 | `allow-remote-setup` | `KINGRES_ALLOW_REMOTE_SETUP` | `false` | `true` lets the setup operations come from non-loopback addresses while uninitialized (containers listening on `0.0.0.0`); the setup token is still required |
-| `-version` | | | prints version, contract revision (0.8.0) and build commit (`-ldflags "-X main.commit=..."`, else `unknown`) |
+| `-version` | | | prints version, contract revision and build commit; the revision it prints is the constant `contractRevision` in `cmd/kingresd/main.go`, which still reads 0.8.0 although the server implements 0.13.0 (the constant is stale; it is not the revision the server implements) (`-ldflags "-X main.commit=..."`, else `unknown`) |
 | `-stop-instances` | | | stops the managed instances (fast shutdown) and exits |
 | `tls-cert-file`, `tls-key-file` | `KINGRES_TLS_CERT_FILE`, `KINGRES_TLS_KEY_FILE` | none | enable HTTPS (both or neither) |
 
@@ -338,7 +339,7 @@ paths; what is not done is in "Not done in this increment"). "Real" means the op
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **123 of 132 operations are real; 9 answer "not yet".**
+authenticated operation lists in 0.2.0. **123 of 132 operations are real; 9 answer "not yet".** The eight ledger operations in that column (client keys, bundles, the signature policy of a table, the upgrade of the extension, the acknowledgement of a diverged chain) are built against the contract in the console, which tries them on its mock API; their implementation in `kingresd` is on a branch that is not merged yet.
 
 | Tag | Real | Not yet |
 |---|---|---|
@@ -730,8 +731,8 @@ server, a join that was refused (wrong fingerprint, wrong credentials, the clust
 `setupTask.state = failed` in `GET /setup/state`; the setup token is still valid and `join-cluster` can be called
 again. A pending server that has no unfinished task is revoked and forgotten by the leader's hourly check (and at start) once it is older than 15 minutes.
 
-**Revoking a certificate.** The leader keeps the revoked serial numbers in `<data-dir>/pki/revoked.json`
-(serial numbers in hex, with the time). Removing a server revokes every certificate that was issued to it, and
+**Revoking a certificate.** The leader (the server that holds the CA) keeps the revoked serial numbers in `<data-dir>/pki/revoked.json`
+(serial numbers in hex, with the time); every server keeps a copy for its internal API in `revoked-serials.json`, and the list in the format PostgreSQL reads in `revoked.crl`. Removing a server revokes every certificate that was issued to it, and
 `revokeServerCertificates` revokes them without removing the server (see "Certificates: renewal and revocation").
 The list is distributed immediately: the internal API of every server and, through `ssl_crl_file`, every PostgreSQL
 instance refuse the certificate from then on (a reload is enough).
@@ -951,7 +952,7 @@ a second one; a kind whose reading was not measured is neither raised nor cleare
 | `ledgerPendingTooOld` | the oldest pending ledger transaction of a database (`kingres.ledger_pending`) has waited `ledger-pending-max-age` (default 5 min; `critical` at twelve times that). The extension records no time for a pending entry, so the monitor remembers the lowest pending transaction number and when it first saw it (`monitor.PendingTracker`); when another entry becomes the oldest the age starts again (an under-estimate), and a restart of kingresd forgets it | the queue of that database is empty or its oldest entry changed | every server, per database, every third monitor round | `TestPendingTrackerCountsTheAgeOfTheOldestPendingEntry`, `TestEvaluateLedgerPendingTooOld`; `TestLedgerPendingTooOldAlert` (block builder switched off and on in a real instance) |
 | `versionMismatch` | the servers that answer `GET /internal/v1/state` report different KingresDB (kingresd) versions, PostgreSQL versions, or versions of `kingres_shard` / `kingres_ledger` (the `default_version` their instance offers); message lists what differs and on which servers | the servers agree; with fewer than two answers nothing changes | the manager leader, subject `cluster`, every `version-check-interval` | `TestEvaluateVersions`, `TestVersionMismatchAlertLifecycle` (raised once through repeated checks, unchanged while a server does not answer, cleared). Not tested with two real binaries of different versions: the test environment has one |
 
-Limit: an alert is kept by the server that raised it, so after a change of the manager leader (not implemented) the
+Limit: an alert is kept by the server that raised it, so after a change of the manager leader (by the failover of the map group, increment 5) the
 cluster-wide alerts of the old leader stay open there until it evaluates them again.
 
 ### Listings with a hard cap
@@ -1084,10 +1085,13 @@ No task kind of the product is marked `NonIdempotent` today (all steps check wha
 
 ## Not done in this increment, and the manager's state on a leader change
 
-**Not done** (each still answers 422 `unsupported_operation`, or is unchanged): rebalance, failover and restoring
-preferred primaries (8 operations answer "not yet"), a way back for a server with buckets whose certificates were
-revoked (it needs rebalance), the rotation of the CA itself, and any change of the manager leader (the three bullets
-below). Certificate renewal and revocation, the dedicated problem for a leader without the CA key, cluster-wide
+**Not done** (each still answers 422 `unsupported_operation`, or is unchanged; this paragraph is from the third
+increment, and rebalance and failover are built since, see the table above and the later sections):
+restoring preferred primaries (9 operations answer "not yet" now: this one and the eight ledger operations of
+client keys, bundles and divergence), a way back for a server with buckets whose certificates were
+revoked (it needs rebalance; rebalance exists now), the rotation of the CA itself, and a change of the manager leader without the CA key (the three bullets
+below; a leader change by the failover of the map group is built since, increment 5, but the key of the CA is not
+escrowed). Certificate renewal and revocation, the dedicated problem for a leader without the CA key, cluster-wide
 logs, alerts and metrics and the four alert kinds that nothing raised are done (see "Fifth increment"). Server groups, `updateServer`, inclusion proofs, ledger verification records, instance start and
 stop, leave-cluster and local settings are done (see their sections).
 
@@ -1095,11 +1099,13 @@ stop, leave-cluster and local settings are done (see their sections).
 (`<data-dir>/pki/ca.key`), the revocation list (`revoked.json`), the task engine (rows of `kingres_system` on the
 leader's instance), the directory of internal addresses (`peers.json`, on every server), the audit file
 (`audit.jsonl`, per server) and the session store (memory, per server) belong to the first server today. A leader
-change (not implemented) has to move the CA key and the revocation list (encrypted, to the standby leader) and the
+change has to move the CA key and the revocation list (encrypted, to the standby leader) and the
 `kingres_cp` schema (it lives in the map group and follows it); followers already re-read the leader from the catalog
-every 2 s. Until then the limitation is: **if the manager leader is not the server that holds the CA, operations that
+every 2 s. The failover of the map group (increment 5, "The map group" below) changes the leader but does not move the CA key: the new leader raises the alert `certificateAuthorityUnavailable` until the operator restores `pki/ca.key` and `pki/revoked.json` from the old leader's backup. The limitation therefore stands: **if the manager leader is not the server that holds the CA, operations that
 need the CA (adding a server, removing one, certificate operations) cannot work**; the cluster keeps running on its
 existing certificates until they expire (one year). See `docs/design/ha-phase5.md`.
+
+**Restoring the system database.** After a restore of `kingres_system` from a backup, restart every `kingresd` of the cluster. The manager leader raises the term of the ledger (`kingres_cp.ledger_cluster.term`) when it takes over, and every write of the ledger's key set checks that the stored term is the one the leader holds in memory; a restored database holds an older term, so those writes fail with `term_over` until the leader has taken over again, which a restart does (see "The scheduler and the term").
 
 ## Design notes (where the specification was silent or was changed)
 

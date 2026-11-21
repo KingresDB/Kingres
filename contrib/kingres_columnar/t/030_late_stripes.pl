@@ -49,9 +49,10 @@ $node->psql('postgres', "BEGIN; SET LOCAL kcprobe.commit_sql = 'COPY batch (a) F
 is(q1("SELECT count(*) FROM batch"), $N, "a late COPY of $N rows: all there");
 cmp_ok(q1("SELECT count(*) FROM kingres.columnar_stripes('batch')"), '<=', 5, '... in a few stripes, not one per row');
 
-# VACUUM does not join them; columnar_compact does
-q1("VACUUM late");
-is(q1("SELECT count(*) FROM kingres.columnar_stripes('late')"), $N, 'VACUUM leaves the stripes as they are');
+# VACUUM joins them when there are many (C13-05, kingres_columnar.vacuum_compact_stripes, 128 by default); with the setting at 0 it
+# leaves them as they are, and columnar_compact joins them
+q1("SET kingres_columnar.vacuum_compact_stripes = 0; VACUUM late");
+is(q1("SELECT count(*) FROM kingres.columnar_stripes('late')"), $N, 'VACUUM with the merge turned off leaves the stripes as they are');
 my $before = q1("SELECT pg_relation_size('late')");
 q1("SELECT kingres.columnar_compact('late', 1000000)");
 cmp_ok(q1("SELECT count(*) FROM kingres.columnar_stripes('late')"), '<=', 2, 'columnar_compact joins them');

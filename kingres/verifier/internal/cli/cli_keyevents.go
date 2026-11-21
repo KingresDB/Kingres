@@ -111,9 +111,11 @@ func (in *logInputs) applyEvents() error {
 		}
 		return &pubError{pubMalformed, "the events", werr}
 	}
+	in.walk = w
 	var kn []string
 	in.trust, kn = applyKeyEvents(in.trust, w)
 	in.notes = append(in.notes, kn...)
 	in.notes = append(in.notes, skippedNotes(w)...)
+	in.notes = append(in.notes, in.closedEpochNote(w)...)
 	return nil
 }

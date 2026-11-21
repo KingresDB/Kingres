@@ -865,7 +865,7 @@ options)`, the views `kingres.table_operations` and `kingres.partitions`, the ne
   call waited for the lock on the table, so a change committed by a transaction that was open when
   the call began was not copied. The copy (distributed and reference) now pushes a fresh snapshot
   after the lock and pops it when the cursor is closed. `REPEATABLE READ` and `SERIALIZABLE` are
-  refused with the reason (`55006`), since a transaction snapshot cannot be renewed. In the online
+  refused with the reason (`25001`, `active_sql_transaction`), since a transaction snapshot cannot be renewed. In the online
   engine the capture trigger is created under `SHARE ROW EXCLUSIVE`, which waits for every writer,
   and the switch replays under `EXCLUSIVE` with fresh statements. `t/150` races a writer that
   commits during the wait, for every kind of change, both variants and reference tables.
@@ -1086,3 +1086,224 @@ node at the three points of the switch, and one that loses a row from the old co
 which the verification must report.
 
 **Not done.** Several tables at once online, and the control plane and console (9.6).
+
+### Increment 9.5, user-partitioned tables (2026-11-20)
+
+A table partitioned by the user (RANGE or LIST) can be distributed: every leaf is distributed in the colocation of the parent, the four partition functions and the statements keep the tree the same on every node, the bucket move copies the tree, and queries read the tree. Notes from the build follow.
+
+#### Answers to the two open questions (experiments on 18.7 and 19rc2, identical results)
+
+1. `ATTACH PARTITION` with a CHECK equal to the bound.
+   - A CHECK that is only the user's bound (`t >= .. AND t < ..`) does NOT make the attach skip the scan ("verifying table leaf"): the partition
+     constraint of a leaf also contains the constraints of its ancestors (the hash condition of the bucket partition).
+   - A CHECK that includes the hash condition (`satisfies_hash_partition('<root>'::regclass, m, r, key) AND <bound>`) IS recognised
+     ("partition constraint for table ... is implied by existing constraints"), no scan.
+   - Consequence for the design: the CHECK(satisfies_hash_partition ...) on the bucket partition (phase 4 puts it there) is inherited by a leaf made with
+     `LIKE <bucket partition> INCLUDING ALL`; adding only the bound as a second CHECK then makes the leaf attach without a scan (measured: leaf3 and p_b1
+     above). The bucket partition attached to the root with the hash CHECK on it is also implied (no scan).
+   - A DEFAULT partition under the bucket partition is ALWAYS scanned by an attach, whatever checks the new leaf has ("verifying table p_b0_def"), and it is
+     locked `ACCESS EXCLUSIVE` for the rest of the transaction. `ATTACH` locks the bucket partition `SHARE UPDATE EXCLUSIVE`; `CREATE TABLE ... PARTITION OF`
+     locks it AND the default partition `ACCESS EXCLUSIVE`. So the design's choice (create a leaf by `ATTACH`) holds, and the `default_partition` warning is
+     right: the cost is one scan of the default leaf per bucket and node, and the default leaf is blocked for the whole two-phase commit.
+2. `publish_via_partition_root = true` on a partitioned root.
+   - The initial copy reads the root (60 rows arrive, routed by the subscriber into its own leaves 36/24); update, delete and insert are applied through the root;
+     the root with a primary key and replica identity `d` (default) is enough; a row filter on the partitioned root in such a publication is accepted.
+   - The subscriber needs the partition tree (or at least a matching partitioned table) with the leaf that the row belongs to: a change for a bound
+     with no leaf on the subscriber fails in the apply worker and is retried, so the move's target must create every leaf before the subscription starts and
+     a leaf created on the source during a move is refused (the design already refuses DDL on a group that moves).
+   - Not yet checked: phase 4's marker table and its `pg_subscription_rel` checks against a partitioned root (the table in `pg_subscription_rel` is the root's
+     leaves or the root, depending on the version: to be read from bucket_move.c in step 5, with a test).
+
+#### Step 2: blocking create_distributed_table of a RANGE or LIST table
+
+- The report (`table_change_report`, kind distribute) replaces the blanket blocker with: `partitioned_table` (a partition on its own, HASH strategy, a
+  partitioned reference table), `subpartitioned`, `foreign_partition`, `partition_local_object` (index, constraint, default or storage parameter of the
+  partition that the table lacks), `tablespace`, `name_too_long`; warnings `default_partition` and `distribution_column_is_partition_key`; the online
+  variant refuses with `not_available_yet`.
+- `internal_partition_layout(relid)` returns the key text (`pg_get_partkeydef`) and one row per partition (bound without `FOR VALUES`, `DEFAULT` for the
+  default partition); `dist_table.c` makes every bucket partition `PARTITION BY <method> (<key>)` with one leaf per user partition, here and on every node
+  (`kingres_shard_append_partition_tree`), copies from the parent (tuple routing at the owner places each row), and `internal_set_partitioning` records
+  `partition_method`, `partition_key` and the `dist_partition` rows. The swap drops the source parent and with it its partitions.
+- New setting `kingres_shard.max_partition_leaves` (default 8192), checked in C once the bucket count is known.
+
+#### Step 3: the four partition functions and the statements (lessons)
+
+- Functions: `create_partition`, `drop_partition`, `detach_partition`, `attach_partition`, built on `internal_leaf_op` (node-local, per owned bucket),
+  `internal_leaf_everywhere` (per node, routing off, bound validated: no `;`, `--`, `/*`, must start with FROM, IN, WITH or be DEFAULT) and
+  `internal_partition_context` (superuser, map group, version, catalog lock, busy group check). Fault points `partition_after_lock` and
+  `partition_after_leaves`.
+- Decision: a leaf is made `LIKE <bucket partition> INCLUDING ALL` and attached; no equal CHECK is added, because the leaf is empty (the experiments say
+  a CHECK would only matter for a populated table, and then it must include the hash condition).
+- Decision: `attach_partition` takes a distributed table of the group only; the ordinary-table form of the design (copy through the router, consume the table)
+  is not built: the caller creates the partition and inserts the rows. `detach_partition` and `attach_partition` refuse tables with foreign keys.
+- The hook (`utility.c`, `map_partition_statement`): the raw tree of a partition bound holds expressions, not `PartitionRangeDatum`; `MINVALUE` and `MAXVALUE`
+  are column references (found by the first run, which crashed the backend on a cast: fixed). Constants, casts of constants and negative numbers are
+  written back; anything else is refused with the hint to call the function.
+- A user-partitioned table cannot be undistributed or altered yet (`not_available_yet` in the report).
+- Not done in step 3: the ordinary-table attach, `ALTER TABLE s`/`CREATE INDEX ON s` messages naming the parent (PostgreSQL's "does not exist" stands),
+  foreign keys on detach and attach.
+
+#### Step 4: partition_leaves and the check
+
+- `kingres.partition_leaves(parent, partition_name)` from the catalog (node, bucket, leaf); `check_cluster()` reports `dist_partition_mismatch` for a leaf that
+  the catalog lists and its owner node does not have (one query per node). t/192, 5 mutants killed.
+
+#### Step 5: the bucket move
+
+- The source's `internal_move_inspect` adds the tree (`internal_move_tree`: key, leaves with bound and access method); `internal_create_move_tables` makes the
+  target copy `PARTITION BY` the key, one leaf per user partition with `USING <access method>` (so a converted leaf keeps its format; phase 12's requirement),
+  owners of the leaves follow the table; the `ks_bucket_check` on the root is inherited by the leaves, so the attach at the switch scans nothing (the
+  experiments above); the publication uses `publish_via_partition_root = true` when a table of the group is partitioned; `internal_detach_bucket` (C) renames the
+  leaves and their indexes to names of the orphan and moves them to schema `kingres` so a bucket that returns finds the names free; `internal_drop_orphans`
+  and `internal_drop_move_tables` take partitioned tables; the view `kingres.buckets` sums the leaf sizes over `pg_partition_tree`.
+- Found by the first run of t/193: a writer on another node gets "the bucket map changed while the statement was running ... Repeat the statement" at
+  the switch (existing behaviour, retryable); the test's writer repeats. The orphan listing of `check_cluster()` (`orphan_table`) does not include a partitioned
+  orphan: the 0.6 function was not redefined for it; the cleanup drops it.
+- Mutants: v01-v11 (10 run, v03 not testable: the test build has only the heap access method); v02 (publication without the root) survived the first run
+  because the leaf names are the same on both sides: killed by a test that holds the move after the slot and reads `pubviaroot` and `pg_publication_tables`.
+- Old move tests (t/025-037, t/074, t/083) pass on both majors with the changes.
+
+#### Step 6: queries
+
+- No change to planner.c, fragment_scan.c, shippable.c or pushdown.c was needed: with a user-partitioned table the plain-table paths give single-node answers
+  from every node (t/194, 119 tests), closed aggregates are fragment scans, key plus interval prune to one bucket partition and one leaf (+ the default one).
+
+#### Files changed outside tests, for the 2b reviewers
+
+- src/utility.c (the hook mapping, a new static section before the hook function), src/dist_table.c / dist_table.h (`kingres_shard_append_partition_tree`, the layout in
+  the creation), src/kingres_shard.c / .h (one setting), src/bucket_move.c (leaves in `internal_detach_bucket`), the SQL delta. Not touched: planner.c,
+  fragment_scan.c, shippable.c, pushdown.c, rebuild.c, copy_routed.c.
+
+#### Not done in 9.5
+
+- `create_distributed_table_concurrently` of a partitioned table, undistribute and alter of a user-partitioned table (refused with `not_available_yet`).
+- Attaching an ordinary table to a distributed partitioned table by a function (the design's copy-and-consume form); foreign keys on detach and attach.
+- `ALTER TABLE s`/`CREATE INDEX ON s` of a logical partition name: PostgreSQL's "does not exist" stands.
+- `orphan_table` of check_cluster for a partitioned orphan; the access-method mutant (needs a second access method).
+- Not run: the whole TAP suite, t/046, the in-tree meson run; the cluster mutex was not taken.
+
+### Increments 9.8, dependent views, and 9.9, storage parameters (2026-11-20)
+
+#### 9.8: kingres_shard.dependent_views = 'recreate'
+
+Design decisions
+- The option is a session setting, not an argument: the public functions have fixed signatures and the design's option belongs to the control plane request
+  (9.6 maps it to the setting). `refuse` (default) keeps today's behaviour; `recreate` drops and recreates. An online operation reads the setting once, in
+  `begin_table_operation`, and keeps it in its spec (a session that finishes it later does not change what it does with the views); the options of the
+  report carry it too, because the control sessions that check a request again do not have the caller's setting.
+- `internal_view_capture(regclass[])` (node-local): the plain views that depend on the tables, transitively, in an order in which they can be created (a view after
+  the views it uses), with definition (`pg_get_viewdef`), column names, owner, reloptions, privileges (`aclexplode`, with the grant option and PUBLIC),
+  view and column comments. `blockers` lists what cannot be recreated: a materialized view, a rule other than the view's own, a trigger, privileges on a
+  column, a function that uses the row type, a publication of the view, a dependency cycle.
+- Where: blocking `create_distributed_table` (C, local node), `alter_distributed_table`, `undistribute_table`, the single-node switch of the online engine and
+  `internal_switch_attempt_dist`. The views are captured on every node that holds the table (a view is local to the node where it was created), dropped in the
+  transaction of the swap (last first) and recreated after it (first first). Recreating is inside the same transaction and the same locks as the swap.
+- The report (`table_change_report`) with `recreate`: the views are not blockers; what cannot be recreated is a `dependent_object` blocker naming the node;
+  for an undistribute a view on a node other than the one that keeps the table is a blocker ("the table will be on node N only"). Everything is refused before
+  anything is made, and no operation is recorded.
+
+Lessons of the build
+- Reading a view (`pg_get_viewdef`, deparse) takes a lock on the tables it uses: capturing on another node after the switch took ACCESS EXCLUSIVE there
+  waits forever. The capture of `internal_switch_attempt_dist` is made before the ACCESS EXCLUSIVE loop. The check of the report runs in a control session on every
+  node (this one too): in the caller's transaction it left a lock on the source that the switch (another session) needed, and the operation deadlocked with its own caller.
+- The first plan recreated views on every node on undistribute; the table is gone from the others, so it is now a refusal.
+- The scan's rule that a distributed table read through a view of another owner needs `security_invoker` shows in the tests: the views over distributed tables are `security_invoker`.
+
+Tests: t/195_dependent_views (default refuses; every operation, blocking and online; views on views (the view that sorts before the one it uses); a view on node 2;
+privileges, owner, options, comments identical; the views are bound to the new table; refusals (materialized view on a table and on a view, trigger, column privilege, rule;
+a view on node 3 of a distributed table; undistribute with a view on node 2); an error at four points of the switch and in the blocking alter after the drop; a reader of a view on
+node 2 waits for the switch and reads through the new table). Mutants w01-w15, all killed (the order mutant needed the test with the alphabetically earlier view name).
+
+#### 9.9: storage parameters carried
+
+Design decisions
+- `kingres.dist_table.reloptions text[]`, synchronized (the catalog snapshot carries it). A partitioned parent cannot have storage parameters, so they are on the
+  bucket partitions; the record is what every later table gets.
+- `internal_reloptions_of(regclass)`: the recorded ones of a distributed table, else the table's own; `internal_with_clause(text[])`.
+- Applied: blocking create (C: `kingres_shard_append_partitions` with a WITH clause on every node), the shadow script of the rebuild engine (create and alter
+  online), `internal_table_ddl` for a plain target (undistribute, reference tables), the bucket move (the source's bucket partition reloptions travel in
+  `internal_move_inspect`, the target copy is made WITH them). Recorded: the C create, the C swap of the single-node engine, blocking alter, online alter.
+- The report: `storage_parameters` is a note, not a blocker.
+- Not done: the parameters of a partition of a user-partitioned table (still `partition_local_object`), and keeping the record in step with a later `ALTER TABLE ... SET`
+  on a bucket partition.
+
+Tests: t/196_storage_parameters. Mutants x01-x13.
+
+#### Results and files
+
+See the report. Files changed outside tests: src/dist_table.c, dist_table.h, kingres_shard.c, kingres_shard.h, rebuild.c, the SQL delta; planner and pushdown files untouched.
+
+### The fixes for the review of 9.4, 9.5, 9.8 and 9.9 (2026-11-21)
+
+The independent review (`reviews/2026-11-21-kingres-shard-phase9-increments-4-9.md`, P9C-01 to P9C-14) is answered in `contrib/kingres_shard`; the
+tests are `t/197_review_p9c_blocking` and `t/198_review_p9c_partitions`. The new tests pass on both majors. On the tree of the review (the red run, the sources of the parent) most of their assertions fail, but not all: the controls (a call in `READ COMMITTED`
+succeeds) and the negative-bound cases of t/198 pass there, and t/197 stops at its section E on the old code (the first call there is an error), so section F
+and the end of the file were checked with mutants, not with the red run.
+
+- **P9C-01 (critical).** The blocking `undistribute_table` and `alter_distributed_table` copied the rows of the local node's partitions through the
+  snapshot of the caller's `REPEATABLE READ` or `SERIALIZABLE` transaction, which is older than the lock that stops the writers, compared the copy
+  with a count taken through the same snapshot (so the check could not see the loss), and dropped the old table. The rule of P9A-01 is now the rule of
+  every blocking call: `internal_require_read_committed()` is the first thing both calls and the four partition functions do (before any lock;
+  SQLSTATE `25001`, the same words and code as the create call), and the C copy refuses a transaction snapshot as the last line
+  (`kingres_shard_copy_routed_ex`). In `READ COMMITTED` every statement of the plpgsql body, the count included, takes a fresh snapshot after the lock, so
+  the count that the copy is compared with is taken under the lock; a writer that commits while the call waits is in the new table (tested for both calls,
+  with a digest). The partition functions copy no row; they read the catalog under the lock, and the same rule keeps them from deciding on a stale snapshot.
+- **P9C-02 (high).** The scan's remote cursors are closed when their connection is idle; the batch sender had a batch in flight on the same connection, so
+  the `CLOSE` was skipped and the node could not drop the table ("being used by active queries"). The copy now finishes the sender before it closes its
+  portal. Tested with 30000 rows (alter, undistribute to another group) and a reference table of 6000 rows.
+- **P9C-03 (high).** Decision: refuse, do not carry. A bucket move makes a leaf again from the definition of the partitioned table (`LIKE ... INCLUDING ALL`
+  of its bucket partition, `PARTITION OF`); carrying what one leaf has of its own (indexes, checks, owner, privileges, defaults, parameters) would need a
+  per-leaf capture in the move, a second source of truth that `check_cluster()` would have to compare with the parent. The partition that
+  `create_partition` makes cannot have these objects, so the attach is made equal to it: `internal_attach_differences(parent, table)` lists what the table
+  has of its own (an index compared by its definition after `USING`, a check by name and definition, a default, storage parameters, another owner, privileges
+  that differ from those of the partitioned table, P9F-02) and `attach_partition` refuses with each of them named. A table like the partitioned table is attached, and its leaves after a move
+  have the definition of their siblings (tested). Not done: `check_cluster()` does not compare the leaves of a partition with the parent.
+- **P9C-04 (medium).** The report applies `function_owner_not_superuser` to every table that the call takes with it (the component of the foreign keys for an
+  undistribute with `cascade_via_foreign_keys`, the group for an alter with `cascade_to_colocated`), names the table in the detail, and the calls refuse before
+  anything is copied.
+- **P9C-05 (medium).** `internal_view_recreate` takes back every grant that the default privileges of the schema gave the new view (`internal_reset_acl`), when
+  the new view has an ACL at all (a view made where nothing is granted by default keeps the NULL ACL of the old one); the capture now includes the entries of the
+  owner, so an owner who had given up a privilege does not get it back. Not done: the grantor of a grant that another role made with the grant option (all grants
+  are made by the owner). Decision: the chain of grantors that the table path rebuilds with `SET LOCAL ROLE` was not copied for views, because a view with grants
+  by roles other than its owner is rare and the privileges themselves are the same.
+- **P9C-06 (medium).** `alter_distributed_table(colocate_with => <table>)` checks the group of that table with `internal_group_busy()` (a table operation, a move in a
+  busy phase, a bucket that is not `active`), in the report and so in the call; the groups that `colocate_with => 'default'` searches (blocking, online) are the free
+  ones.
+- **P9C-07 (medium).** The report refuses a `DEFERRABLE` unique or primary key constraint for the online forms (`deferrable_unique`); the blocking forms accept it.
+- **P9C-08 (low).** Carried, not documented away: the options of the TOAST table are read from the TOAST table (`internal_table_options`), recorded and applied as
+  `toast.<name>` for distribute, alter, undistribute, reference tables and the bucket move.
+- **P9C-09 (low).** The statement mapping refuses a partition in another schema, an `UNLOGGED` or `TEMPORARY` partition, answers `IF NOT EXISTS` of an existing
+  partition with the notice of PostgreSQL, and writes a cast with `format_type_with_typemod` (the modifier and the quoting are kept).
+- **P9C-10 (low).** `detach_partition` gives the new table the table privileges (with grant option) and the comment of the table; column privileges are not carried.
+- **P9C-11 (low).** `check_cluster()` reads the leaf name with `parse_ident`.
+- **P9C-12 (low).** `FROM`, `IN`, `WITH` and `DEFAULT` are accepted in any case.
+- **P9C-13 (note).** Documented in the README (the waits of the blocking calls, the deadlock detector, what the online forms do). No change: the behaviour is that of
+  the locks, and the recovery worker's pass over distributed deadlocks was not shown to be missing.
+- **P9C-14 (note).** A view on a partition of a table that is distributed is a blocker of the report (`dependent_object`, the view and the partition named) instead of
+  PostgreSQL's "cannot drop table"; the time zone dependence of `dist_partition.bound`, the double disk use of the retained copies and the reference table that is not
+  compared before an undistribute are documented.
+
+The mutants of the review that survived were run against the fixed tree on PostgreSQL 18 and are killed by t/197 and t/198: S18, S19, S22, C01, C02 and S10 (the reset of the ACL of a recreated view, in its new form). S04 (the count
+comparison of the undistribute) stays redundant in READ COMMITTED and is not tested separately.
+
+### The fixes for the review of the fixes (2026-11-21)
+
+The independent review of 286f63522c (`reviews/2026-11-21-kingres-shard-phase9-fixes.md`, P9F-01 to P9F-07; no critical, no high) is answered in a second
+commit; the tests are in t/197 and t/198.
+
+- **P9F-01 (medium, a regression).** The cast of a bound was written with `format_type_with_typemod`, which leaves the schema out when the type is visible in the
+  caller's `search_path`; the text is resolved later by a function with another `search_path`, so `'blue'::public.color` failed. It is written with
+  `format_type_extended` with `FORMAT_TYPE_FORCE_QUALIFY` for every type outside `pg_catalog` (`public.color`, `pc_ty.pos`); the built-in types stay as PostgreSQL writes them (`date`, `numeric(3,0)`, which t/191 expects), the modifier kept.
+  Tested with an enum and a domain in a user schema, the statement written on and off the `search_path`, and a built-in type with a modifier.
+- **P9F-02 (low).** The attach compares the table's privileges with those of the partitioned table (a missing ACL is the default one) and refuses only a difference;
+  the hint ("the same privileges") can now be followed. Tested: the same privileges are accepted, other privileges are refused.
+- **P9F-03 (low).** The check of the partitions of `create_distributed_table` reads `internal_table_options` (the table's parameters and those of its TOAST table), so a
+  partition with TOAST options is refused with `partition_local_object`. Decision: refuse, not carry: carrying needs the options on every leaf and in the move.
+- **P9F-04 (low).** The code was right (25001); the README and this document said 55006. Corrected, and t/197 and t/198 check the SQLSTATE.
+- **P9F-05.** The statements about the red run are corrected above.
+- **Open question: `orphan` buckets and `colocate_with => 'default'`.** `internal_group_busy` treats a bucket whose state is not `active` as busy. The state `orphan` of
+  `kingres.bucket_map` is allowed by the CHECK but nothing in the extension sets it: what a finished move leaves on the source is an orphan table (schema `kingres`),
+  not a state of the bucket, and the phase `cleaning` of the move is not a busy phase. So `'default'` does not make extra groups while an orphan waits for cleanup.
+  t/197 D asserts that the group is free while the move is in `cleaning` with its orphan table present.
+- P9F-06 (the version 0.7 is changed in place) and P9F-07 (claims not checked) are notes; a database made from the earlier build of 0.7 is made again, and the
+  deadlock pass of the recovery worker is described in the README as the mechanism that is there, not as something these tests show.

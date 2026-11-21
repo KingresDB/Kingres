@@ -237,7 +237,7 @@ Engine data: `pg_stat_replication`, `pg_stat_wal_receiver`, `pg_replication_slot
 
 - The PostgreSQL fork binaries and the `kingres_shard` and `kingres_ledger` extensions.
 - `kingresd`, one Go binary that contains the agent (instance lifecycle), the manager, the client router, the REST API, and the web panel as embedded static files. `kingres-agent` and `kingres-manager` in the architecture above are roles inside this one binary, not separate installs.
-- `kingres-cli` and the standalone ledger verifier.
+- The standalone ledger verifier, and `kingres-cli` (planned; it is not built yet: `kingres/control-plane/cmd` has only `kingresd` and `kingres-watchdog`).
 - *(Not built; superseded by [ADR 0021](adr/0021-failover-in-kingresd.md).)* An etcd member embedded in `kingresd`, so that no separate etcd install is needed; etcd publishes a Go package for embedding a server ([etcd embed package](https://pkg.go.dev/go.etcd.io/etcd/server/v3/embed)).
 - *(Not built; superseded by [ADR 0021](adr/0021-failover-in-kingresd.md).)* Patroni with its Python runtime, bundled inside the package. The alternative is to implement failover natively in the agent and drop the Python dependency; that is more work and is only worth doing if bundling Python proves to be a packaging problem.
 - *(Not built; superseded by [ADR 0020](adr/0020-no-bundled-metrics-store.md).)* A single-binary metrics store (Prometheus or VictoriaMetrics) for the panel's charts.
@@ -251,7 +251,7 @@ One systemd unit (`kingres.service` as built) runs `kingresd`, which starts and 
 3. **Create a new cluster:** set the administrator account, data paths and memory quotas, and choose the features to enable (sharding, ledger, default replica count). The agent initializes the map group primary and the first shard group primary and starts a single-member etcd.
 4. **Join an existing cluster:** enter the address of any existing node and the administrator credentials. The node registers with the manager leader, receives the cluster certificates and configuration, creates the primary of a new shard group and the standby of a neighboring group, and appears on the Servers page as "pending rebalance". As in Couchbase, adding a node and rebalancing are two separate steps; data moves only when the administrator starts a rebalance.
 
-The same two paths are available as `kingres-cli cluster init` and `kingres-cli node join`.
+The same two paths are planned for `kingres-cli` as `kingres-cli cluster init` and `kingres-cli node join`; `kingres-cli` is not built, and the REST operations `initCluster` and `joinCluster` do the work.
 
 **A panel on every node, with two scopes.**
 
@@ -478,6 +478,8 @@ The table is kept as the record of the options that were considered.
 | 8 | Blockchain scope | Ledger tables and external anchoring only; also multi-node consensus | Ledger and anchoring only, unless there is a concrete consortium use case | Phase 6 |
 | 9 | First operating system for the package | Ubuntu/Debian; RHEL family | Ubuntu 24.04 LTS and Debian first | Phase 3 |
 | 10 | Panel accounts | PostgreSQL roles; a separate panel user store | PostgreSQL roles, one user list | Phase 4 |
+
+**Note of 2026-11-20 on decision 3:** the project owner chose the AGPL, not the recommended PostgreSQL License: KingresDB's own code is AGPL-3.0-only since 2026-11-15 ([ADR 0024](adr/0024-agpl-for-kingresdb-code.md), which supersedes [ADR 0004](adr/0004-postgresql-license-no-citus-code.md) in its choice of licence). PostgreSQL's own code keeps the PostgreSQL License. Other statements of this document that recommend the PostgreSQL License for KingresDB's own code are superseded by that ADR in the same way.
 
 Not a design decision but still open: a legal review of the name and of the trademark policy before any public release.
 

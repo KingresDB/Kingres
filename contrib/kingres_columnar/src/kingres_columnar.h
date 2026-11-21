@@ -299,6 +299,8 @@ extern int	kc_guc_write_buffer_kb;
 extern int	kc_guc_max_stripe_rows;
 extern int	kc_guc_orphan_notes_max;
 extern int	kc_guc_truncate_lock_timeout;
+extern int	kc_guc_vacuum_compact_stripes;
+extern int	kc_guc_vacuum_compact_rows;
 extern bool kc_guc_reserve_rows;
 extern int	kc_guc_reserve_gate;
 extern int	kc_guc_reserve_gate_at;
@@ -357,6 +359,7 @@ typedef struct KcIdent
 extern const KcIdent *kc_rel_ident(Relation rel);
 extern void kc_check_snapshot_age(Relation rel, Snapshot snap);
 extern void kc_meta_read(Relation rel, KcMetaData *out);
+extern bool kc_meta_extend(Relation rel, uint64 expected_end, uint32 extra);
 extern void kc_meta_allocate(Relation rel, uint32 nrows, uint64 *stripe_id,
 							 uint64 *first_row);
 extern bool kc_meta_return(Relation rel, uint64 first_row, uint32 nrows);
@@ -426,6 +429,7 @@ extern bool kc_catalog_lock_nowait(KcCatLocks *l, LOCKMODE mode);
 extern void kc_catalog_unlock(KcCatLocks *l);
 extern void kc_catalog_snapshot_report_conflicts(Snapshot snap, bool is_mvcc);
 extern KcStripeInfo *kc_catalog_load(Relation rel, Snapshot snap, int *nstripes);
+extern KcStripeInfo *kc_catalog_load_dead(Relation rel, TransactionId oldest, int *nstripes);
 extern void kc_catalog_insert(Relation rel, const KcStripeInfo *si,
 							  const char *cid_points, int cid_len,
 							  const char *col_stats, int stats_len, bool frozen,
@@ -435,6 +439,7 @@ extern void kc_catalog_insert_reserved(Relation rel, const KcStripeInfo *si);
 extern void kc_catalog_update_reserved(Relation rel, const KcStripeInfo *si,
 									   const char *cid_points, int cid_len,
 									   const char *col_stats, int stats_len);
+extern void kc_catalog_resize_reserved(Relation rel, const KcStripeInfo *si);
 extern void kc_catalog_delete_reserved(Relation rel, uint64 stripe_id);
 extern int	kc_catalog_count_reserved(Relation rel, Snapshot snap);
 
@@ -455,6 +460,13 @@ extern KcRowRange *kc_catalog_live_ranges(Relation rel, TransactionId oldest, ui
 										  int *n_out, uint64 *low);
 extern void kc_reserve_lock(Relation rel, LOCKMODE mode);
 extern void kc_reserve_unlock(Relation rel, LOCKMODE mode);
+extern bool kc_vacuum_lock(Relation rel, LOCKMODE mode, bool wait);
+extern void kc_vacuum_unlock(Relation rel, LOCKMODE mode);
+extern void kc_reserve_gate(int point);
+
+/* points of kingres_columnar.reserve_gate_at in the vacuum (testing); 1 to 4 are the writer's, in kc_write.c */
+#define KC_RES_VAC_RANGES	6	/* an index vacuum has its ranges, has not scanned the index (C14-01) */
+#define KC_RES_VAC_MERGED	7	/* the merge of a VACUUM is done, the freeze not yet (C14-06) */
 extern bool kc_scan_dirty_fetch(Relation rel, ItemPointer tid, Snapshot snap, TupleTableSlot *slot);
 extern void kc_index_vacuum(Relation rel, bool skip, double live_rows, BufferAccessStrategy bstrategy);
 
@@ -743,7 +755,7 @@ extern void kc_cscan_init(void);
  * ------------------------------------------------------------------------
  */
 extern void kc_relation_vacuum(KC_VACUUM_PARAMS);
-extern int	kc_compact(Relation rel, uint32 min_rows);
+extern int	kc_compact(Relation rel, uint32 min_rows, uint64 max_rows);
 
 /* ------------------------------------------------------------------------
  * kingres_columnar.c

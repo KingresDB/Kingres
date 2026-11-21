@@ -72,6 +72,7 @@ Commands:
   bundle        verify (verify) or copy (fetch) a bundle or a publication
   monitor       watch a publication for a rollback, a fork or a rewrite
   attestation   verify a client attestation of a ledger entry
+  release       check the signed sums note of a release, and binaries against it
   trust         create (init), print (show) or follow the key events of (follow) a trust file
   version       print the version
 
@@ -154,8 +155,10 @@ func dispatch(args []string, stdout, stderr io.Writer, version string) int {
 		return e.runMonitor(args[1:])
 	case "attestation":
 		return e.runAttestation(args[1:])
+	case "release":
+		return e.runRelease(args[1:])
 	}
-	fmt.Fprintf(stderr, "kingres-verify: unknown command %s, expected one of proof, row-hash, digest-chain, blocks, checkpoint, consistency, aggregate, anchors, bundle, monitor, attestation, trust, version\n", untrusted(fmt.Sprintf("%q", args[0])))
+	fmt.Fprintf(stderr, "kingres-verify: unknown command %s, expected one of proof, row-hash, digest-chain, blocks, checkpoint, consistency, aggregate, anchors, bundle, monitor, attestation, release, trust, version\n", untrusted(fmt.Sprintf("%q", args[0])))
 	return exit(ExitUsage)
 }
 
@@ -225,12 +228,14 @@ func (e *env) runProof(args []string) int {
 	epoch := fs.Uint64("epoch", 0, "with --bundle: the epoch of the chain log (default: the only one in the source)")
 	aggID := fs.String("aggregate-id", "", "with --bundle --log-leg aggregate: the aggregate id (default: the only one in the source)")
 	nowFlag := fs.String("now", "", "with --bundle: time for key validity windows, RFC 3339 (default: system clock)")
+	var acceptEpoch logListFlag
+	fs.Var(&acceptEpoch, "accept-epoch-closed", "with --bundle --log-leg aggregate: the number of an epoch-closed event whose finding you accept (repeatable)")
 	if code, done := e.parseFlags(fs, args); done {
 		return code
 	}
 	if *bundle != "" {
 		return e.runProofLeg(*asJSON, proofLegArgs{proofPath: *proofPath, digest: *digestPath, bundle: *bundle, leg: *logLeg, trust: *trustPath, aggID: *aggID, epoch: *epoch,
-			tableID: *tableID, rowHash: *rowHash, op: *opFlag, now: nowOf(fs, nowFlag)})
+			tableID: *tableID, rowHash: *rowHash, op: *opFlag, acceptEpoch: acceptEpoch, now: nowOf(fs, nowFlag)})
 	}
 	const cmd = "proof"
 	for _, c := range [][2]string{{"proof", *proofPath}, {"digest", *digestPath}} {

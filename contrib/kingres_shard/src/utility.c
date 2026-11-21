@@ -62,6 +62,7 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "access/table.h"
 #include "access/tupdesc.h"
 #include "access/xact.h"
@@ -71,6 +72,7 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_inherits.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/pg_type.h"
 #include "commands/copy.h"
 #include "commands/extension.h"
@@ -1931,8 +1933,24 @@ append_bound_expr(StringInfo buf, Node *e)
 	{
 		TypeCast   *tc = (TypeCast *) e;
 
+		Oid			typoid;
+		int32		typmod;
+
 		append_bound_expr(buf, tc->arg);
-		appendStringInfo(buf, "::%s", TypeNameToString(tc->typeName));
+		/* the type with its schema and its modifier: the text is resolved by a function with another search_path (P9C-09, P9F-01) */
+		typenameTypeIdAndMod(NULL, tc->typeName, &typoid, &typmod);
+		{
+			/* a type of another schema than pg_catalog is written with its schema; the built-in types as PostgreSQL writes them (date, numeric(3,0)) */
+			int			flags = FORMAT_TYPE_TYPEMOD_GIVEN;
+			HeapTuple	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typoid));
+
+			if (!HeapTupleIsValid(tup))
+				elog(ERROR, "cache lookup failed for type %u", typoid);
+			if (((Form_pg_type) GETSTRUCT(tup))->typnamespace != PG_CATALOG_NAMESPACE)
+				flags |= FORMAT_TYPE_FORCE_QUALIFY;
+			ReleaseSysCache(tup);
+			appendStringInfo(buf, "::%s", format_type_extended(typoid, typmod, flags));
+		}
 		return;
 	}
 	if (IsA(e, A_Expr) && ((A_Expr *) e)->kind == AEXPR_OP && list_length(((A_Expr *) e)->name) == 1 &&
@@ -2035,6 +2053,26 @@ is_user_partitioned(Oid relid)
 	return result;
 }
 
+/* Is there a user partition of that name of the table? */
+static bool
+user_partition_exists(Oid parent, const char *name)
+{
+	Oid			argtypes[2] = {OIDOID, TEXTOID};
+	Datum		values[2];
+	bool		result;
+
+	values[0] = ObjectIdGetDatum(parent);
+	values[1] = CStringGetTextDatum(name);
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	if (SPI_execute_with_args("SELECT 1 FROM " KINGRES_SHARD_SCHEMA ".dist_partition WHERE parent = $1::pg_catalog.oid::pg_catalog.regclass AND partition_name = $2",
+							  2, argtypes, values, NULL, true, 1) < 0)
+		elog(ERROR, "could not read the catalog");
+	result = SPI_processed > 0;
+	SPI_finish();
+	return result;
+}
+
 static void
 call_partition_function(const char *sql, int nargs, Oid *argtypes, Datum *values)
 {
@@ -2066,6 +2104,32 @@ map_partition_statement(Node *parsetree, QueryCompletion *qc)
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							errmsg("a partition of a distributed table is created with its bound only"),
 							errhint("Sub-partitioning, storage parameters, a tablespace, an access method and columns are not accepted here.")));
+		/*
+		 * What the statement says and the mapping does not carry is refused, not ignored (P9C-09): the leaves are made in the
+		 * schema of the table, as permanent tables; and IF NOT EXISTS is answered as PostgreSQL does, with a notice.
+		 */
+		if (stmt->relation->relpersistence != RELPERSISTENCE_PERMANENT)
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("a partition of a distributed table is a permanent table"),
+							errhint("UNLOGGED and TEMPORARY are not accepted here.")));
+		{
+			Oid			nsp = stmt->relation->schemaname != NULL ? get_namespace_oid(stmt->relation->schemaname, false)
+				: RangeVarGetCreationNamespace(stmt->relation);
+
+			if (nsp != get_rel_namespace(parent))
+				ereport(ERROR, (errcode(ERRCODE_INVALID_SCHEMA_NAME),
+								errmsg("the partition must be in the schema of the table"),
+								errhint("Write the schema of the table in front of the name of the partition.")));
+			if (stmt->if_not_exists &&
+				(OidIsValid(get_relname_relid(stmt->relation->relname, nsp)) || user_partition_exists(parent, stmt->relation->relname)))
+			{
+				ereport(NOTICE, (errcode(ERRCODE_DUPLICATE_TABLE),
+								 errmsg("relation \"%s\" already exists, skipping", stmt->relation->relname)));
+				if (qc != NULL)
+					SetQueryCompletion(qc, CMDTAG_CREATE_TABLE, 0);
+				return true;
+			}
+		}
 		argtypes[0] = OIDOID;
 		argtypes[1] = TEXTOID;
 		argtypes[2] = TEXTOID;

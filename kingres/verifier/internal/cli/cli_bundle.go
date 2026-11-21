@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/bundleidx"
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/events"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/proof"
 )
 
@@ -45,21 +46,30 @@ type bundleVerifyArgs struct {
 	requireAnchors     int
 	requireAttestation bool
 	attTable           int64
+	acceptEpoch        []string
+	wormURLs, headers  []string
 	now                nowArg
 }
 
 func (e *env) runBundleVerify(args []string) int {
-	fs, asJSON := e.newFlagsWithExit("bundle verify", "--trust FILE BUNDLE [--require-anchors N] [--require-attestation] [--attestation-table-id N] [--now TIME]",
+	fs, asJSON := e.newFlagsWithExit("bundle verify", "--trust FILE BUNDLE [--require-anchors N] [--require-attestation] [--attestation-table-id N] [--accept-epoch-closed SEQ ...] [--worm-url [ID=]URL ...] [--btc-header HEIGHT:HEX80 ...] [--now TIME]",
 		"Verify everything that applies in a bundle (a directory, a .tar.gz or an https address): bundle.json is only an\n"+
 			"index, and every fact is re-derived. Every checkpoint of every log in the layout is verified, the tiles are\n"+
 			"bound to the signed root, every entry is checked (block headers: heights, links, times; aggregate leaves:\n"+
 			"sequence and times), every aggregate's last leaf against its chain logs, every proof against the signed\n"+
-			"chain log (and against the aggregate when it names the chain), every attestation. Anchors are not verified\n"+
-			"by this version: a bundle that lists them, or --require-anchors above 0, ends with status 3.", exitTextWith3)
+			"chain log (and against the aggregate when it names the chain), every attestation. The anchors of every\n"+
+			"aggregate checkpoint of the bundle are verified as the anchors command does (the means are --worm-url, --btc-header\n"+
+			"and the tsa_roots of the trust file: an anchor without its means is status 3, or a note when --require-anchors N is\n"+
+			"given and N anchors verified). An epoch that a verified epoch-closed event closed is a failure at step epoch-closed\n"+
+			"that says what the event states, unless --accept-epoch-closed SEQ names the event: then it is printed as a finding.", exitTextWith3)
 	trustPath := fs.String("trust", "", "trust file (JSON)")
-	reqAnch := fs.Int("require-anchors", 0, "fail (status 3) unless this many anchors were verified: anchors are a later step, so any N above 0 ends with 3")
+	reqAnch := fs.Int("require-anchors", 0, "status 3 unless at least this many anchors were verified (then an anchor that could not be verified is a note)")
 	reqAtt := fs.Bool("require-attestation", false, "a proof in the bundle without an attestation is a failure")
 	attTable := fs.Int64("attestation-table-id", -1, "the table_id of kingres.ledger_attestation, needed to check the attestations of the bundle")
+	var acceptEpoch, wormURLs, headers logListFlag
+	fs.Var(&acceptEpoch, "accept-epoch-closed", "the number of an epoch-closed event whose finding you accept (repeatable)")
+	fs.Var(&wormURLs, "worm-url", "URL of the WORM object version (anonymous or presigned), or TARGET=URL (repeatable)")
+	fs.Var(&headers, "btc-header", "HEIGHT:HEX of a Bitcoin block header (80 bytes, 160 hex digits) you obtained yourself (repeatable)")
 	nowFlag := fs.String("now", "", "time for key validity windows, RFC 3339 (default: system clock)")
 	if code, done := e.parseFlags(fs, args); done {
 		return code
@@ -70,7 +80,7 @@ func (e *env) runBundleVerify(args []string) int {
 	if fs.NArg() != 1 {
 		o = inputOut(errors.New("give exactly one bundle: a directory, a .tar.gz file or an https address"))
 	} else {
-		o = e.bundleVerifyRun(r, bundleVerifyArgs{trust: *trustPath, bundle: fs.Arg(0), requireAnchors: *reqAnch, requireAttestation: *reqAtt, attTable: *attTable, now: nowOf(fs, nowFlag)})
+		o = e.bundleVerifyRun(r, bundleVerifyArgs{trust: *trustPath, bundle: fs.Arg(0), requireAnchors: *reqAnch, requireAttestation: *reqAtt, attTable: *attTable, acceptEpoch: acceptEpoch, wormURLs: wormURLs, headers: headers, now: nowOf(fs, nowFlag)})
 	}
 	switch o.kind {
 	case outInput:
@@ -91,6 +101,14 @@ type foundLog struct {
 func (e *env) bundleVerifyRun(r *result, a bundleVerifyArgs) outcome {
 	if a.requireAnchors < 0 {
 		return inputOut(errors.New("--require-anchors must not be negative"))
+	}
+	acc, err := newEpochAccept(a.acceptEpoch)
+	if err != nil {
+		return inputOut(err)
+	}
+	aopts, err := parseAnchorMeans(a.wormURLs, a.headers)
+	if err != nil {
+		return inputOut(err)
 	}
 	p, err := loadPubInputs(a.trust, a.bundle, a.now)
 	if err != nil {
@@ -161,6 +179,9 @@ func (e *env) bundleVerifyRun(r *result, a bundleVerifyArgs) outcome {
 	addInc := func(o outcome) { inc = append(inc, o.missing...) }
 	aggMembers := map[string]map[string]uint32{} // aggregate id -> chain id -> epoch of a member of its last leaf
 	nChains, nAggs := 0, 0
+	bc := newBundleChains()
+	var aggLogs []*openedLog
+	var inClosed []proofInClosed
 	// chain logs first, then aggregates
 	for _, s := range slugs {
 		fl := logs[s]
@@ -182,6 +203,7 @@ func (e *env) bundleVerifyRun(r *result, a bundleVerifyArgs) outcome {
 		cid, _ := hex.DecodeString(fl.spec.id)
 		var c32 [32]byte
 		copy(c32[:], cid)
+		bc.add(c32, uint32(fl.spec.epoch), ol) // #nosec G115 -- the epoch has at most 9 digits
 		res, out := auditChainLog(ol, c32, 0)
 		if out.kind == outIncomplete {
 			addInc(out)
@@ -208,7 +230,7 @@ func (e *env) bundleVerifyRun(r *result, a bundleVerifyArgs) outcome {
 		if fl.spec.kind != "aggregate" {
 			continue
 		}
-		rep, out := p.verifyAggregate(r, fl.spec.id, aggOptions{})
+		rep, out := p.verifyAggregate(r, fl.spec.id, aggOptions{accept: acc})
 		if out.kind == outIncomplete {
 			addInc(out)
 			continue
@@ -241,6 +263,7 @@ func (e *env) bundleVerifyRun(r *result, a bundleVerifyArgs) outcome {
 			}
 			aggMembers[fl.spec.id] = m
 		}
+		aggLogs = append(aggLogs, rep.log)
 		nAggs++
 	}
 	// proofs and attestations
@@ -255,9 +278,8 @@ func (e *env) bundleVerifyRun(r *result, a bundleVerifyArgs) outcome {
 			}
 			return o
 		}
-		sub := &result{cmd: r.cmd}
 		var pr proof.Proof
-		out := e.proofLegCore(sub, p, bytesOpener(data), proof.Expect{}, proofLegArgs{leg: "chain"}, &pr)
+		chosen, sub, out := e.proofEpochs(r, p, data, bc, &pr)
 		if out.kind == outIncomplete {
 			addInc(out)
 			continue
@@ -279,7 +301,19 @@ func (e *env) bundleVerifyRun(r *result, a bundleVerifyArgs) outcome {
 				aggID, epoch = id, ep
 			}
 		}
-		if aggID != "" {
+		if chosen > 0 && len(bc.epochs[pr.ChainID]) > 1 {
+			r.notes = append(r.notes, fmt.Sprintf("%s: the block is shown in epoch %d of the chain, of %d epoch(s) in the bundle", label, chosen, len(bc.epochs[pr.ChainID])))
+		}
+		if chosen > 0 {
+			if w, werr := p.events(); werr == nil && w != nil {
+				if _, closed := w.EpochClosed[events.ChainKey(pr.ChainID, chosen)]; closed {
+					inClosed = append(inClosed, proofInClosed{label: label, chain: pr.ChainID, epoch: chosen, height: pr.Block.Height})
+				}
+			}
+		}
+		if aggID != "" && chosen > 0 && epoch != chosen {
+			r.notes = append(r.notes, fmt.Sprintf("%s: the aggregate log %s covers epoch %d of the chain and the block is in epoch %d, so the aggregate leg was not made", label, aggID[:8], epoch, chosen))
+		} else if aggID != "" {
 			sub2 := &result{cmd: r.cmd}
 			out := e.proofLegCore(sub2, p, bytesOpener(data), proof.Expect{}, proofLegArgs{leg: "aggregate", aggID: aggID, epoch: uint64(epoch)}, nil)
 			if !out.ok() {
@@ -321,7 +355,7 @@ func (e *env) bundleVerifyRun(r *result, a bundleVerifyArgs) outcome {
 			return o
 		}
 		sub3 := &result{cmd: r.cmd}
-		out = e.attestCore(sub3, attestInput{an: &anchorer{p: p, leg: "chain"}, rowOpen: bytesOpener(data), attOpen: bytesOpener(attData), attCols: colsData,
+		out = e.attestCore(sub3, attestInput{an: &anchorer{p: p, leg: "chain", epoch: uint64(chosen)}, rowOpen: bytesOpener(data), attOpen: bytesOpener(attData), attCols: colsData,
 			attTableID: uint32(a.attTable), trust: p, exp: proof.Expect{}}) // #nosec G115 -- range checked
 		if !out.ok() {
 			if out.kind == outFailed {
@@ -336,6 +370,13 @@ func (e *env) bundleVerifyRun(r *result, a bundleVerifyArgs) outcome {
 		r.ok(label+" attestation", sub3.headline)
 		r.notes = appendNew(r.notes, sub3.notes)
 		r.notProved = appendNew(r.notProved, sub3.notProved)
+	}
+	// the epochs: a closed epoch is a finding, a failure unless accepted (the verdict is held until the end, so that a failure of
+	// anchors that is found below is not hidden by it)
+	epochInfo, epochOut := p.auditEpochs(r, bc, inClosed, acc)
+	if epochOut.kind == outIncomplete {
+		addInc(epochOut)
+		epochOut = outcome{}
 	}
 	// events: a bundle that carries them is checked as `aggregate` checks them
 	if w, werr := p.events(); werr == nil && w.Count > 0 {
@@ -352,19 +393,43 @@ func (e *env) bundleVerifyRun(r *result, a bundleVerifyArgs) outcome {
 		}
 	}
 	// anchors
-	if len(ix.Anchors) > 0 {
-		inc = append(inc, fmt.Sprintf("the bundle lists %d anchor file(s) and this version does not verify anchors (WORM, RFC 3161, OpenTimestamps): they were not checked", len(ix.Anchors)))
+	anchorsVerified, anchorsUnver, ao := e.bundleAnchors(r, p, aggLogs, ix.Anchors, aopts)
+	if !ao.ok() {
+		return ao
+	}
+	if anchorsVerified > 0 {
+		r.ok("anchors", fmt.Sprintf("%d anchor(s) of the aggregate checkpoint(s) of the bundle verified (each digest recomputed from the signed log, the evidence believed in nothing)", anchorsVerified))
+		r.notes = appendNew(r.notes, []string{"anchors: every time printed is what the outside party says (a store, a time-stamp authority, a Bitcoin miner); no revocation status of a time-stamp certificate was read, and a Bitcoin header is shown to meet its own work target only"})
 	}
 	if a.requireAnchors > 0 {
-		inc = append(inc, fmt.Sprintf("--require-anchors %d: no anchor was verified, because this version cannot verify one", a.requireAnchors))
+		// the count decides: what else could not be checked is a note
+		for _, u := range anchorsUnver {
+			r.notes = append(r.notes, "not required, and not verified: "+u)
+		}
+		if anchorsVerified < a.requireAnchors {
+			inc = append(inc, fmt.Sprintf("--require-anchors %d: %d anchor(s) verified", a.requireAnchors, anchorsVerified))
+		}
+	} else {
+		inc = append(inc, anchorsUnver...)
+	}
+	if !epochOut.ok() {
+		return epochOut
+	}
+	r.notes = append(r.notes, acc.unusedNotes()...)
+	timeClaim := "when anything in the bundle was made: no anchor was verified, every time is the signer's claim"
+	if anchorsVerified > 0 {
+		timeClaim = "when anything in the bundle was made that no verified anchor covers: block and event times are the signer's claim, and an anchor shows only that one digest existed by its time"
 	}
 	r.notProved = appendNew(r.notProved, []string{
-		"when anything in the bundle was made: no anchor was checked, every time is the signer's claim",
+		timeClaim,
 		"that the signer shows the same history to everyone: a split view needs witnesses or a monitor",
 		"that these are the latest checkpoints: an older genuine bundle verifies too; compare with a checkpoint you hold (checkpoint --state, monitor)",
 		aggregateGlobalSnapshot,
 		"that the trust file was obtained outside the cluster: that is your responsibility"})
-	r.info = map[string]any{"chain_logs": nChains, "aggregate_logs": nAggs, "proofs": len(ix.Proofs), "anchors_listed": len(ix.Anchors), "anchors_verified": 0}
+	r.info = map[string]any{"chain_logs": nChains, "aggregate_logs": nAggs, "proofs": len(ix.Proofs), "anchors_listed": len(ix.Anchors), "anchors_verified": anchorsVerified}
+	if len(epochInfo) > 0 {
+		r.info["epochs_closed"] = epochInfo
+	}
 	r.headline = fmt.Sprintf("the bundle holds %d chain log(s), %d aggregate log(s) and %d proof(s), and everything in it that was checked is consistent.", nChains, nAggs, len(ix.Proofs))
 	if len(inc) > 0 {
 		return outcome{kind: outIncomplete, missing: inc}

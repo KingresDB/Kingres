@@ -223,13 +223,13 @@ func TestBundleVerifyRefusesALyingIndexAndAMissingOne(t *testing.T) {
 	wantRun(t, 0, w.bundleArgs(), "is in the layout and not in bundle.json")
 }
 
-func TestBundleVerifyAnchorsAreNotVerifiedAndSaySo(t *testing.T) {
+func TestBundleVerifyWithoutAnchorsSaysSoAndASillyIndexPathIsNotRead(t *testing.T) {
 	w, _, _ := stdWorld(t)
 	w.bundleJSON()
-	wantRun(t, 3, w.bundleArgs("--require-anchors", "1"), "INCOMPLETE", "no anchor was verified")
+	wantRun(t, 3, w.bundleArgs("--require-anchors", "1"), "INCOMPLETE", "--require-anchors 1: 0 anchor(s) verified")
 	b, _ := os.ReadFile(filepath.Join(w.dir, "bundle.json"))
 	w.put("bundle.json", []byte(strings.Replace(string(b), `"anchors":[]`, `"anchors":["a/x/anchors/2/1.json"]`, 1)))
-	wantRun(t, 3, w.bundleArgs(), "INCOMPLETE", "1 anchor file(s)")
+	wantRun(t, 3, w.bundleArgs(), "INCOMPLETE", "1 anchor file(s)", "is not a path of the layout")
 }
 
 func TestBundleVerifyChecksProofsOnBothLegsAndRefusesATamperedOne(t *testing.T) {

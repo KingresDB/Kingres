@@ -1528,6 +1528,121 @@ before it and prefers partitioning for large tables. There is no build-and-swap
 for a non-partition table in this part: dependent views, foreign keys and
 publications make the swap much more than a rename (open question 8).
 
+### 10.4a Fixes of the review of the conversion (kingres_timepart 0.2, findings T13-01 to T13-14)
+
+Decisions, in the order of the findings. The code is in
+`contrib/kingres_timepart/kingres_timepart--0.2.sql` (and the same text in
+`kingres_timepart--0.1--0.2.sql`); the tests are `sql/timepart_convert_more.sql`
+and `t/009_convert_ddl_race.pl`.
+
+**T13-01. Read the catalog after the lock.** The statements of a conversion used
+to be built before `LOCK TABLE <partition>`, which can wait for writers for
+`create_lock_timeout_ms`; a session that held a lock on the partition could add a
+column, create an index or drop a column before it committed, and the copy then
+lost the new column (null for every row) and the new index. Now everything the
+conversion reads from the catalog (the refusals, the names, the bound, the column
+list, the sort, the tablespace, the index statements and what is needed to carry
+over) is made by one function, `timepart__convert_plan`, which is VOLATILE (a new
+snapshot for every statement). `timepart__convert_stmts` calls it once, before any
+lock, only to refuse early; the DO block it returns holds the OIDs of the table and
+the partition and the caller's arguments, no name, and calls the plan again right
+after the lock. A fingerprint compared after the lock was the other choice; it
+would turn the race into an error, where the plan turns it into a correct copy.
+The lock is taken by the name of the moment (from the OID); if the name no longer
+exists, the block fails with `schema_changed` (SQLSTATE 55P03: retryable, the
+policy run records it as a failed action and is due again within five minutes), and
+the block checks in `pg_locks` that the lock it holds is on the OID it means. The
+swap needed no change: a session that waits for the partition while it holds the
+table is the cycle that the swap already breaks by giving way.
+
+**T13-02. Not MVCC-safe, as TRUNCATE and the rewriting forms of ALTER TABLE.**
+The new partition is filled by the conversion's transaction, so a REPEATABLE READ
+or SERIALIZABLE snapshot older than the swap, on a table that the transaction has
+not read yet, finds the partition empty. No swap of one table for another in one
+transaction can avoid it (the rows would need an older xmin, and only COPY FREEZE
+into a table made in the same transaction gives that, from a client, not from SQL
+inside a block). Detecting the snapshot is not possible either: the isolation
+level of another session is not visible, `backend_xmin` of other roles' sessions
+is not visible to an owner, and waiting for older snapshots as CREATE INDEX
+CONCURRENTLY does needs two transactions, because a snapshot taken after the wait
+and before the commit is as old as one taken before it. So this is a documented
+limit: the README says which transactions are affected (READ COMMITTED statements
+are not: they take their snapshot after the lock; a transaction that has read the
+table is not: the swap gives way to it; `pg_dump` is not once it has locked the
+tables) and `t/009_convert_ddl_race.pl` keeps the behaviour under test. The claim
+"never neither" of the README is now limited to statements.
+
+**T13-03. Publication of the copy.** A heap target is refused when a publication
+of the partition's schema, or of all tables, would take in the new table at its
+creation and publish the copy under its temporary name. (A publication of all
+tables cannot even be created while kingres_columnar is installed; the check is
+there for the order of events in which it was.) The columnar target keeps its
+refusal of every publication that would include the partition.
+
+**T13-04, T13-05. What LIKE does not carry.** After the attach the enabled state of
+each cloned trigger is put back (`DISABLE`, `ENABLE REPLICA`, `ENABLE ALWAYS`). The
+storage parameters of the table and of its TOAST table, the statistics target and
+the options of each column (not the server's own version stamp `pg_attver`), the
+statistics target of an index expression and the clustering index are carried;
+each is a statement of its own in a sub-block, so a parameter that the target
+access method does not accept is a WARNING and the rest goes on. The storage
+parameters are set after the load and the indexes: `parallel_workers` set before
+makes a columnar table refuse a parallel index build of rows that the transaction
+has not written, and a fillfactor set after the load applies to what is written
+next, as it would after an ordinary ALTER TABLE. A columnar table has no TOAST
+table, so those parameters do not go to it and do not come back.
+
+**T13-06. NOT VALID.** Refused, by name (CHECK and NOT NULL). Recreating the
+constraint NOT VALID after the load was the other choice; refusing is the rule of
+this extension for what the new table cannot carry exactly.
+
+**T13-07. Grantor.** The privileges that the owner took from itself are revoked
+again on the new table. A privilege that a role other than the owner granted (with
+GRANT OPTION passed on) is refused: GRANT cannot name another grantor for a
+non-superuser, and the owner as grantor would change what REVOKE ... CASCADE does.
+
+**T13-08. Dependents.** The refusal reads `pg_depend` for every normal dependency
+on the partition, on its row type and on the array type of the row type, except the
+partition's own objects (generated column expressions, constraints, triggers,
+policies, indexes), and names the first with `pg_describe_object`. DROP TABLE
+without CASCADE would stop at exactly those, after the whole copy and in every run.
+
+**T13-09. Names.** The temporary names of the indexes are
+`kc_<12 characters of md5 of the partition name>_<n>`: short, the same on every
+call, no cut by characters. They are checked against existing relations.
+
+**T13-10. Default partition.** Refused when it is larger than the setting
+`kingres_timepart.convert_default_max_mb` (default 256, 0 to 1048576): the attach
+scans it under ACCESS EXCLUSIVE on the table and `lock_timeout` does not bound a
+scan. A helper CHECK on the default partition (NOT VALID, then VALIDATE) would
+keep SHARE ROW EXCLUSIVE on it to the commit, which is worse for its writers.
+
+**T13-11. Files after a crash.** Documented, with a query that lists the files of
+the database directory that no `pg_class` row names; nothing in the extension can
+remove them.
+
+**T13-12, T13-13. Tests.** Survivors of the review's mutants are now killed: M15
+replica identity, M32 constraint comments, M34 default privileges, M37 another
+table access method, M18 the grid in the plan of a run (`timepart_convert_more`);
+M23 the session_user rule, as a superuser that has done SET ROLE (the same file);
+M16 the tablespace and M04/M05/M40 the wait of the swap (`t/009`). M26 stays
+equivalent.
+
+**T13-14. Helpers.** `timepart__special_table` (SECURITY DEFINER, reads the private
+catalogs of the ledger and the distributed tables) answers only a superuser or a
+role that has the privileges of the owner of the table, judged by `session_user`
+(inside a SECURITY DEFINER function nothing else says who called it). The other
+helpers that PUBLIC may execute read `pg_catalog` only and are left as they are.
+The new `timepart__convert_plan` is among them: it runs as the owner, after the
+lock, so the owner needs USAGE on the schema `kingres`, as for every function of
+the extension.
+
+**Version.** 0.2 has not been released (no beta, no tag), so its two scripts were
+edited in place and still give the same catalog (the `upgrade` test); there is no
+0.2--0.3 script. A database that installed 0.2 from a development build earlier
+re-creates the extension. After the first release a change of the script is a new
+version with an upgrade script.
+
 ### 10.5 Locks at a glance
 
 | Action | Lock on the parent | Lock on the partition | Blocks readers of the parent | Blocks writers |
@@ -2712,3 +2827,173 @@ the new table; unique indexes of the parent wait for C6c.
   never vacuumed; older snapshots, failed loads in the middle and at the end of the file, exact
   and one-block-short runs, a writer in flight, two crashes, a hot standby with and without
   feedback, four writers. All 12 one-line mutants are killed.
+
+### The fixes of the review of C5 to C8, and of its second look (2026-11-20)
+
+One source for PostgreSQL 18 and 19. No change of the on-disk format and none of the SQL scripts, so the version stays 0.2. Every finding was reproduced by a test before it was fixed. Reviews: [first](../reviews/2026-11-20-kingres-columnar-c5-c8.md), [of the fixes, with a second look](../reviews/2026-11-20-kingres-columnar-c13-fixes.md).
+
+Every finding was reproduced by a test before it was fixed (the test failed on the unfixed code, the way the review said).
+
+#### C13-01 (high): an old snapshot loses its rows through an index built or rebuilt after a compaction
+
+**Reproduced** with `t/063` (5 of its 6 parts failed: CREATE INDEX, REINDEX after VACUUM, CREATE UNIQUE INDEX, partial and
+expression indexes, a parallel build).  A detail that matters for the test: a REPEATABLE READ session that has read the
+table already holds a lock on its indexes (the planner opens them), so a REINDEX waits for it; the snapshot must be taken by a
+statement that does not open the table (`SELECT 1`), as the review said.
+
+**Decision: index every version any snapshot may see, as heap does** (not `indcheckxmin`).  `indcheckxmin` makes the planner
+ignore the index for snapshots older than the index's xmin; it works for a CREATE INDEX but a REINDEX that finds the flag already
+set does not give the index a new xmin, the planner decision is per backend and per plan (a cached plan keeps using the
+index), and it leaves the old reader with a sequential scan where the design (C6d) promised it its rows through the old entries.
+What is done: the build (`kc_index_build_range_scan`) indexes, besides the stripes visible now, the rows of the stripes
+returned by the new `kc_catalog_load_dead`: versions whose writer committed, not reserved, deleted by this transaction or by a
+committed one that does not precede the oldest xmin (not removable yet).  They are passed to the callback as "not alive", which the
+B-tree build keeps out of the uniqueness check (the copies repeat their keys) and otherwise treats as entries.  The next VACUUM
+removes the entries when the stripes become removable (the live-range rule of C6c).  The build holds SHARE on the table, so no
+compaction or vacuum is running; a prune of the stripe catalog by its own autovacuum could change the list between processes, so
+in a **parallel build only the leader** does the pass (a participant that read a different list would break the shared stripe
+counter).  An amcheck read (C13-04) skips the pass.
+
+Tests: `t/063_index_old_snapshot.pl` (CREATE INDEX, REINDEX after compaction and VACUUM, CREATE UNIQUE INDEX with an insert of a duplicate
+still refused, partial and expression indexes, VACUUM after the snapshot ends removes the entries and `columnar_check_indexes` is clean, a parallel build).
+
+#### C13-02 (high): row numbers used up by aborted transactions
+
+**Reproduced** with `t/066`: 3000 aborted one-row subtransactions used 450 000 000 numbers (150 000 each), two interleaved sessions 90 000 000
+for 600 aborts, 600 interleaved commits 45 000 300 for 600 rows.
+
+**What was done** (the reviewer's first two suggestions together, and a third for the end of the numbers):
+1. A reservation starts **small**: `kingres_columnar.reserve_min_rows` (default 64), or what the session's last buffer of the table needed (rounded up to a power of
+   two; forgotten after an abort).  It **grows in place** while the buffer fills, when it is still the end of the numbers (`kc_meta_extend`; the
+   claim row of the catalog is resized under the reservation lock, with the command counter passed as at a flush, `kc_catalog_resize_reserved`), up to the stripe
+   size: a load by one session is still one stripe (`t/066`: 20 000 rows one stripe, 300 000 rows at most four; two loaders at once give only correct rows).  If it cannot grow
+   (another writer reserved after it) the buffer is written and the next reservation starts at twice the size.
+2. **The unused tail of an aborted writer's reservation is given back** at the session's next reservation for the table, when it is still the end of the numbers
+   (`kc_note_abandoned`, `kc_apply_abandoned`; the abort callback itself may not touch the file).  Only the numbers **after the rows that were put in the buffer**:
+   those rows have index entries, and a number given back and used by another row would make a stale entry find it with the wrong key.  `t/066` has that case
+   (an aborted insert, then another: different TIDs, the aborted key finds nothing through the index).
+3. A **WARNING at 90 percent** of the numbers (once in a session for a table) and a clearer error with the way out (VACUUM FULL / SET ACCESS METHOD, which the owner can do) at the end;
+   `t/066` patches the metapage on disk (page checksum off for that node) to test the warning, the error, and the recovery.
+
+**What remains, and who can reach it.**  One session aborting in a loop wastes about the numbers of its rows (3000 aborts: about 3000 numbers).  Two or more sessions
+that interleave their aborts waste up to the small reservation (64) each: 8.8 x 10^12 / 64 = 1.4 x 10^11 aborts to end a table, about two weeks at the measured 120 000 per second
+per session by two sessions, a few days with many cores.  Any role with INSERT can do it (the README says so); the owner recovers (`VACUUM FULL`).  Not done: handing the numbers
+that index vacuum has proved unnamed back to a free-number list in the metapage (the reviewer's third idea); it would remove the bound, at the price of a second persistent structure.
+
+Side effects: the old C6a tests (t/044, 045, 047, regression `columnar_reserve`) describe the layout of a reservation of a whole stripe: they run with `reserve_min_rows = 0`.  The
+settings of the write path (`reserve_*`, now `reserve_min_rows`) could not be set in `postgresql.conf` before: `_PG_init` reserved the prefix before `kc_write_init` defined them, so a
+line in the file was dropped with a warning.  The call moved to the end of `_PG_init`.
+
+#### C13-03 (medium): decoding gave NULL for a column added with a default after the rows were buffered
+
+**Reproduced** with `t/064` (test_decoding: `z[integer]:null` where a scan returns 5).  `kc_log_logical_rows` padded rows narrower than the table with NULL, the way the old flush
+did before the buffer was widened; it now uses `getmissingattr` (a dropped column stays NULL), the function the widening and the scan use.  The review said a heap
+row is completed by the decoder with the default; measured here, a heap row is decoded **as it was inserted, without the new column at all** (a subscriber gives it its
+own default).  The columnar row now carries what a scan returns, which is what makes a subscriber equal the publisher when its column has the same default or none.
+`t/064` states both.  A volatile default (`clock_timestamp()`) rewrites the table, so there is nothing to decode for the copies, as for heap.
+
+#### C13-04 (medium): amcheck heapallindexed
+
+**Reproduced** with `t/065` (every `heapallindexed` form failed with the concurrent-build message).  **Supported**: a concurrent index description on an index that is valid and
+ready is a read of the index against the table (amcheck), not a build; `CREATE INDEX CONCURRENTLY` and the copy `REINDEX CONCURRENTLY` makes are not ready and are refused with
+their own message.  An amcheck read skips the pass over recently dead stripes.  `t/065`: unique, composite DESC, partial and expression indexes after inserts, rollbacks, a compaction and a VACUUM
+pass `bt_index_check` and `bt_index_parent_check` with `heapallindexed`; a transaction with rows of its own passes; an index that was not ready while rows went in is **found** by
+`heapallindexed` ("lacks matching index tuple"); the concurrent builds stay refused and leave nothing.
+
+#### C13-05 (medium): one stripe per savepoint
+
+**Reproduced** with `t/067` (400 one-row subtransactions: 400 stripes and more than 400 pages).  Merging the sub's rows into the parent's buffer is not possible without renumbering
+(the numbers are in the index), so the cost is **bounded by VACUUM**: `kc_vacuum_compact_small` merges the small stripes (under a quarter of the stripe size, `columnar_compact`'s default) when at least
+`kingres_columnar.vacuum_compact_stripes` (128; 0 off) stripes are smaller than a sixteenth of the stripe size.  The indexes get entries for the copies (C6d), the replaced stripes' blocks are listed
+by the next VACUUM and reused (C8), an older snapshot keeps reading its rows (`t/067` part 3).  Autovacuum runs after the inserts it counts, so the cost is a table of that many small stripes
+until its next vacuum, not for good.  Cost of the choice: a vacuum of a table with many small stripes does the copy; it holds `SHARE UPDATE EXCLUSIVE` as it does anyway.
+
+#### C13-06 (low), and the notes
+
+C13-06: the comment on `kc_compact_index_entries` now says `SHARE UPDATE EXCLUSIVE` (it conflicts with VACUUM and another compaction: no index vacuum and no free-space pass run while a compaction
+writes its copies and entries, and the free-space pass relies on that) and says which lock the entries take on the indexes; `kc_compact_index_entries` and `kc_index_vacuum` `Assert` that the
+caller holds the lock.  The reviewer's statement that index vacuum "would remove entries of numbers that have no claim yet" is not what happens (the copies' stripe rows exist before their
+entries are made, and index vacuum keeps what a running writer holds), so the comment gives the other reason.  C13-07 (a prepared compaction blocks VACUUM): README "Operations notes".
+C13-08 (test_decoding shows the stripe catalog): README, same place.  C13-09 (a mutant that does not build): nothing to fix; my mutants are built clean as well.
+
+#### Tests
+
+New: `t/063` (C13-01), `t/064` (C13-03), `t/065` (C13-04), `t/066` (C13-02), `t/067` (C13-05).  Changed: `t/044`, `t/045`, `t/047` and regression `columnar_reserve` (the legacy layout), regression
+`columnar_setup` (two new settings), `columnar_reserve` expected (an aborted subtransaction's tail is reused: the TID of a later row is smaller).  Both build files list every new test (checked with a loop).
+
+#### A defect found in the first fix of C13-05, by t/004
+
+The first full run of the finished work failed `t/004_concurrent.pl` on both majors (the ids of the table held 6 500 duplicates; `t/004` runs `columnar_compact` and
+`VACUUM` in a loop next to writers and readers).  It passed alone and in earlier full runs, and failed in one run of six (measured): a race.  Cause: **a lazy VACUUM runs with `PROC_IN_VACUUM`,
+and `GetSnapshotData` leaves such a process's transaction id out of every snapshot** (procarray.c: "Skip over backends doing logical decoding ... and ones running LAZY VACUUM"; vacuum.c:
+"when we are in a lazy VACUUM and have PROC_IN_VACUUM set, we mustn't do any regular updates").  A compaction inside VACUUM (my C13-05) inserts the copies and deletes the old stripe rows with that
+id; a reader whose snapshot does not list it judges the two kinds of rows at different moments (before and after the commit) and sees the old stripes and the copies: duplicates.
+Measured: with `vacuum_compact_stripes = 0` in `t/004`, 20 runs of 20 pass; with the default, 1 of 6 failed and both full runs of the suite failed.
+Fix: the compaction runs only when the vacuum's transaction has no id yet (the call is the first thing `kc_relation_vacuum` does that can write) and clears `PROC_IN_VACUUM` first, under `ProcArrayLock`, in
+`MyProc` and in `ProcGlobal->statusFlags` (the way vacuum.c sets it), so that every snapshot taken from then on lists the id once assigned, and one taken before has an xmax at or below it, which counts it as running.  The
+reconcile of the catalog's orphan rows (older code; deletes rows of files that no longer exist, which no snapshot judges) now comes after it.
+
+#### Results
+
+PG 18: regression 17 of 17, TAP 67 files, 11163 tests, all passed; PG 19: regression 17 of 17, TAP 67 files, 11166 tests, all passed.  TRAP lines 0 and leak warnings 0 in every log of both runs.
+`t/004` (the test that found the defect above) 24 of 24 on PG 18 after the fix.  The in-tree suite of the server was not run (no change outside `contrib/kingres_columnar`).
+
+Mutants (PG 18, one line each, a clean build each; `c13-mut.sh`): G01 dead pass skipped (t/063), G02 dead rows passed as alive (t/063, the unique build), G03 workers also index them (t/063, the parallel build),
+G05 the transaction's own deletions ignored (t/063 part 7), G06 NULL instead of the missing value (t/064), G07 check read never accepted (t/065), G09 the abandoned tail never applied (t/066), G10 the tail includes the
+rows' own numbers (t/066, the stale entry), G11 a reservation extended although not the end (t/066, a TID twice), G12 always a whole stripe reserved (t/066), G13 the warning at 99 percent (t/066), G14 merge when any small stripe exists
+(t/067), G15 no merge in VACUUM (t/067): killed.  Survivors, each argued: **G04** (live stripes also passed as dead: the later tests of the transaction ids of the deleter already skip a version that has no deleter, so the first test is only a fast path),
+**G08** (any concurrent description accepted as a check: the utility hook refuses CREATE INDEX CONCURRENTLY and REINDEX CONCURRENTLY before the access method sees them, so the valid-and-ready test is defence in depth; G07 shows the gate is used),
+**G16** (the doubling of the next reservation after a reservation that could not grow: a performance knob for concurrent loaders, no test can say how large a stripe must be).  Not covered by a one-line mutant: the clearing of PROC_IN_VACUUM (the
+failure it prevents is a race, 1 run of 6 of `t/004`; with the clearing removed `t/004` would have to be run in a loop, which I did on the unfixed code: 1 of 6 failed, and 20 of 20 pass with the merge off), the `Assert`s of C13-06 (assertion builds only).
+
+#### C14: the fixes for the review of the C13 fixes
+
+Commits after 7d927f54a6: 38bcd6148e (C14-01), f5f1f77b5f (C14-05, C14-07), b077a254e7 (C14-02, C14-03, C14-04, C14-06).  No format, SQL or WAL change.
+
+#### C14-01 (critical): the give-back of a reservation tail raced an index vacuum
+
+Cause (as the review says): the claim row of an aborted writer is dead and does not lower the vacuum's `low`; the vacuum had read `next_row` above the tail; the tail went back to the metapage, the next reservation took
+those numbers and its rows committed, and the vacuum, still working from its older ranges, called their index entries dead and deleted them (a unique index then took a duplicate).
+Decision: **the safe option.**  The index vacuum holds a new advisory lock (class 0x4B43, field 8, `kc_vacuum_lock`) EXCLUSIVE from before it reads the metapage and catalog until its scan of the last index is done; every give-back
+(`kc_give_back_tail`, so all three callers, not only the next-reservation one) takes it SHARE **without waiting** and, when it is held, leaves the numbers a gap.  Why not the alternative (let the vacuum lower `low` for dead claims, or
+re-read after the scan): the claim to numbers that were given back is exactly what cannot be told from the catalog at a moment, and a re-check after the scan cannot undo deletions.  The cost is bounded by C13-02 (a gap is at most the small reservation, 64 numbers) and only
+for the writers that abort while an index vacuum runs; a writer never waits for the vacuum.  Test `t/068`: a unique-indexed table, session A aborts an insert (its tail is noted), the vacuum is stopped by the developer gate (`reserve_gate_at` 6) between its ranges and its scan, A inserts 20 rows, the gate opens.
+Checks: the index finds the 20 rows and all 30, the unique index refuses a duplicate, `columnar_check_indexes` is clean, and without a vacuum the tail is still given back.  Before the fix (mutant H01, the lock test removed) it fails: index finds 0 of 20, 10 of 30, the duplicate is accepted.
+
+#### C14-02 (medium): an error in the merge failed the whole VACUUM
+
+The merge is now the **last** step of `kc_relation_vacuum` (after the index vacuum, the free list, the metapage freeze and the truncation, so none of them can be lost to it), is skipped when 90 percent of the row numbers are used (the copies need numbers, the replaced stripes' numbers are not used again),
+and runs in an internal subtransaction whose error is caught and reported as a WARNING ("the merge of the small stripes of ... was given up"); errors of class 57 (cancel, shutdown) are rethrown.  Test `t/069` part 1: a table patched to `max - 10` with 200 one-row stripes is vacuumed twice without error (before: "no row numbers left" from every VACUUM);
+and, in assertion builds, a fault in the merge is a warning, the stripes and rows are as before, and the next VACUUM merges.  Mutants: H04 (no 90 percent skip) and H05 (every error rethrown) killed.
+
+#### C14-03 (medium): the merge held the horizon and copied too much
+
+Chosen: bound it, and say so (not a separate call: autovacuum must keep doing it, which is what C13-05 was for).  Only stripes smaller than a sixteenth of the stripe size are copied (the threshold that counts them; before it was a quarter), at most `kingres_columnar.vacuum_compact_rows` (new, 1 000 000; 0 no limit) rows per VACUUM, the rest by the next;
+and it is last, so the id it needs is held only from the merge to the end of the VACUUM of this table.  It still **holds the cleanup horizon of the cluster for that time** (a lazy vacuum normally does not): README operations notes say so, and that a merge burns row numbers, that bulk loads of an indexed table update the claim row at each growth, that the give-back is skipped while an index vacuum runs,
+and what an aborted merge leaves.  Test `t/069` part 2: 20 stripes of 10 000 rows (more than a sixteenth of the stripe size) stay, 130 one-row stripes are merged; with a cap of 100 rows one VACUUM leaves about 300 of 400 stripes, the next merges more, and the VACUUM stops at fewer than 128 small ones.  Mutants H07 (quarter again), H08 (no cap): killed.
+Not done: the review's test that the horizon of another table is free after the merge has committed (the merge's id lives until the VACUUM ends, which is the end of the transaction: nothing to observe in between that is not the id itself, which part 3 shows).
+
+#### C14-04 (low): the horizon seen by other backends can go backwards for a moment when the flag is cleared
+
+Decision: **documented, not closed.**  The merge is now the last step and bounded, so the window is the end of a VACUUM; what could be hurt is the dead-stripe pass of an index build (C13-01), which includes more stripes with a smaller horizon, among them stripes whose blocks a vacuum of this table already listed free.
+Closing it needs the free list's horizon stored in the metapage (a format change, and the format is fixed for this beta line) or a merge in a transaction of its own (not possible inside the table access method's vacuum callback).  The coincidence needs a vacuum of the table to compute its horizon in the window, a stripe to be deleted in it, and an index to be built afterwards; I did not construct it either.  Recorded in the comment at the clearing and here, for the next format version.
+
+#### C14-05 (low): the build's dead pass in the leader only
+
+A comment at the place (kc_am.c) says why it is complete (the leader always takes part in a B-tree parallel build, a compile-time choice) and what a change must do.  No test: a leader-less build cannot be made in this build, and the review's second option (a count exposed to a test module) would add a symbol for a case that cannot be reached.
+
+#### C14-06 (note): nothing distinguished the clearing of PROC_IN_VACUUM from its absence
+
+A gate (`reserve_gate_at` 7) after the merge; `t/069` part 3 stops the VACUUM there with its id held, lets another transaction complete (so the id is below the xmax of a snapshot: an id at or above the xmax is running anyway, the first version of the test missed that), and asks another session for `pg_snapshot_xip(pg_current_snapshot())`: the VACUUM's `backend_xid` must be in it.  Mutant H06 (never clear) is killed deterministically; it survived t/004 four times and the review's reader loop.
+
+#### C14-07 (note)
+
+The message at the end of the numbers keeps its words (tests and users match them) and its detail now says what the reservation needed and what was left.  The churn of the claim row and the merge's effect on the numbers are in the README.  An aborted merging autovacuum: the merge runs in a subtransaction, so an error leaves nothing but the written pages (listed free by the next VACUUM) and the burned numbers;
+a cancel is rethrown after the subtransaction is rolled back.  No test of the DDL-storm case.
+
+#### Tests and results of C14
+
+New: `t/068` (C14-01), `t/069` (C14-02, C14-03, C14-06); both listed in meson.build.  Mutants (PG 18, `c13-mut.sh`): H01 (give-back ignores the lock), H02 (the vacuum takes no lock), H03 (lock released before the scan), H04, H05, H06, H07, H08: **8 of 8 killed**.
+
+Full suite at the final commit 923f7c2a50 (private installs, clean `-Werror` build, 0 warnings): PG 18: regression 17 of 17 (the first run failed only `columnar_setup`, whose expected output did not list the new setting; fixed in the last commit and rerun: 17 of 17), TAP 69 files, 11198 tests, all passed;
+PG 19: regression 17 of 17, TAP 69 files, 11201 tests, all passed.  TRAP lines 0 and leak warnings 0 in every log of both runs.  The fault-injection part of `t/069` ran (the build has assertions; mutant H05 died by the injected "out of memory").

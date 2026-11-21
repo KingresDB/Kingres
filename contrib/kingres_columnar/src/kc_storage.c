@@ -559,6 +559,8 @@ kc_meta_log_and_release(Relation rel, Buffer buf)
  * next row numbers.  Row numbers need not be dense: a crash after this and
  * before the stripe is complete only skips numbers.
  */
+static void kc_warn_numbers_running_out(Relation rel, uint64 next_row);
+
 void
 kc_meta_allocate(Relation rel, uint32 nrows, uint64 *stripe_id,
 				 uint64 *first_row)
@@ -577,7 +579,11 @@ kc_meta_allocate(Relation rel, uint32 nrows, uint64 *stripe_id,
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("columnar table \"%s\" has no row numbers left",
-						RelationGetRelationName(rel))));
+						RelationGetRelationName(rel)),
+				 errdetail("A reservation needs %llu numbers and %llu are left.  Row numbers are taken for the rows of a table that has an index when they are inserted, and the numbers of rows that were never written (aborted writers, gaps between concurrent writers) are not used again.",
+						   (unsigned long long) nrows,
+						   (unsigned long long) (m->next_row < KC_MAX_ROW_NUMBER ? KC_MAX_ROW_NUMBER - m->next_row : 0)),
+				 errhint("Rewrite the table, which starts its numbers again: VACUUM FULL, or ALTER TABLE ... SET ACCESS METHOD columnar (the owner of the table can do either).")));
 
 	START_CRIT_SECTION();
 	m->next_row += nrows;
@@ -587,6 +593,62 @@ kc_meta_allocate(Relation rel, uint32 nrows, uint64 *stripe_id,
 	kc_meta_log_and_release(rel, buf);
 	END_CRIT_SECTION();
 	UnlockReleaseBuffer(buf);
+	kc_warn_numbers_running_out(rel, *first_row + nrows);
+}
+
+/*
+ * A warning, once in a session for a table, when 90 percent of the table's row numbers are used
+ * (C13-02): numbers are never reused, so a table that takes them without writing rows (aborted
+ * writers, gaps) can run out, and the owner should know in time.
+ */
+static void
+kc_warn_numbers_running_out(Relation rel, uint64 next_row)
+{
+	static Oid	warned_relid = InvalidOid;
+	static uint64 warned_uid = 0;
+
+	if (next_row < KC_MAX_ROW_NUMBER / 100 * 90)
+		return;
+	if (warned_relid == RelationGetRelid(rel) && warned_uid == kc_rel_ident(rel)->uid)
+		return;
+	warned_relid = RelationGetRelid(rel);
+	warned_uid = kc_rel_ident(rel)->uid;
+	ereport(WARNING,
+			(errmsg("columnar table \"%s\" has used %d percent of its row numbers",
+					RelationGetRelationName(rel), (int) (next_row / (KC_MAX_ROW_NUMBER / 100))),
+			 errdetail("Row numbers of rows that were never written (aborted writers, gaps between concurrent writers) are not used again, and when they are all used no row can be inserted."),
+			 errhint("Rewrite the table, which starts its numbers again: VACUUM FULL, or ALTER TABLE ... SET ACCESS METHOD columnar.")));
+}
+
+/*
+ * Take extra more numbers right after a reservation that ends at expected_end, when that is
+ * still the end of the numbers (C13-02): the reservation of a buffer that goes on filling grows
+ * in place, so a writer that starts with a small reservation does not end up with many small
+ * stripes.  False when another writer has taken numbers since, or the numbers would run past the end.
+ */
+bool
+kc_meta_extend(Relation rel, uint64 expected_end, uint32 extra)
+{
+	Buffer		buf = ReadBuffer(rel, 0);
+	Page		page;
+	KcMetaData *m;
+
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(buf);
+	m = kc_meta_check(rel, page);
+	if (m->next_row != expected_end || extra == 0 || m->next_row > KC_MAX_ROW_NUMBER - extra)
+	{
+		UnlockReleaseBuffer(buf);
+		return false;
+	}
+	START_CRIT_SECTION();
+	m->next_row += extra;
+	kc_meta_seal(m);
+	MarkBufferDirty(buf);
+	kc_meta_log_and_release(rel, buf);
+	END_CRIT_SECTION();
+	UnlockReleaseBuffer(buf);
+	return true;
 }
 
 /*

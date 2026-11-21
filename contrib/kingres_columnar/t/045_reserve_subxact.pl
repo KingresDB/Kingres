@@ -27,7 +27,8 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
-my $node = new_node('rsub');
+my $node = new_node('rsub', conf => "kingres_columnar.reserve_min_rows = 0
+");
 my $seed = $ENV{KC_SEED} // (time() ^ ($$ << 8)) & 0x7fffffff;
 srand($seed);
 note("seed $seed");

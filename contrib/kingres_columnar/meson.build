@@ -147,6 +147,13 @@ tests += {
       't/060_compact_index_crash_standby.pl',
       't/061_logical.pl',
       't/062_free_extents.pl',
+      't/063_index_old_snapshot.pl',
+      't/064_decode_missing.pl',
+      't/065_amcheck.pl',
+      't/066_row_number_waste.pl',
+      't/067_vacuum_compacts.pl',
+      't/068_vacuum_giveback.pl',
+      't/069_vacuum_merge_safe.pl',
     ],
   },
 }
