@@ -1066,3 +1066,23 @@ func (r *PGRows) SetMark(ctx context.Context, seq int, mark int64) error {
 		return err
 	})
 }
+
+// SchemaOf is the name of the distributed schema whose one bucket is colocation group colo of database db, nil for a group of
+// hash buckets (and for a database whose extension has no distributed schemas): the moves in flight of a status say which of
+// the two they are (contract 0.15.0).
+func (b *PG) SchemaOf(ctx context.Context, db string, colo int32) (*string, error) {
+	var name *string
+	err := b.with(ctx, db, func(c *pgx.Conn) error {
+		var has bool
+		if err := c.QueryRow(ctx, `SELECT to_regclass('kingres.dist_schema') IS NOT NULL`).Scan(&has); err != nil || !has {
+			return err
+		}
+		err := c.QueryRow(ctx, `SELECT n.nspname::text FROM kingres.dist_schema s JOIN pg_catalog.pg_namespace n ON n.oid = s.nsp::pg_catalog.oid
+			WHERE s.colocation_id = $1`, colo).Scan(&name)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		return err
+	})
+	return name, err
+}

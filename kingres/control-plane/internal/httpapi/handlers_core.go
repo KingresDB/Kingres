@@ -88,6 +88,8 @@ func (s *Server) coreHandlers() map[string]handlerFunc {
 		"listTables":            s.listTables,
 		"getTable":              s.getTable,
 		"listColocationGroups":  s.listColocationGroups,
+		"listSchemas":           s.listSchemas,
+		"getSchema":             s.getSchema,
 		"listBuckets":           s.listBuckets,
 		"getBucketDistribution": s.getBucketDistribution,
 

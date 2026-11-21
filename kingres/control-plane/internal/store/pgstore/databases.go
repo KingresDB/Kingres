@@ -63,6 +63,11 @@ type dbProbe struct {
 	// bucketCount is the largest colocation bucket count; nil when the
 	// database has no colocation group.
 	bucketCount *int
+	// mode, distributeNew and schemas are the sharding mode, its default for new schemas and the number of distributed
+	// schemas (kingres_shard 0.8); mode is empty for an older extension, which is mode row.
+	mode       string
+	distribute bool
+	schemas    int
 }
 
 func (s *Store) probeDatabase(ctx context.Context, db string) dbProbe {
@@ -84,8 +89,18 @@ SELECT (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relname
 	}
 	probe.ok = true
 	if probe.hasShard {
+		var settings bool
+		if err := p.QueryRow(ctx, `SELECT to_regclass('kingres.sharding_settings') IS NOT NULL`).Scan(&settings); err == nil && settings {
+			_ = p.QueryRow(ctx, `SELECT g.mode, g.distribute_new_schemas, (SELECT count(*) FROM kingres.dist_schema)::int
+				FROM kingres.sharding_settings g`).Scan(&probe.mode, &probe.distribute, &probe.schemas)
+		}
+		// the bucket count is the one of the hash groups; the group of a distributed schema has one bucket
 		var n *int
-		if err := p.QueryRow(ctx, "SELECT max(bucket_count) FROM kingres.colocation").Scan(&n); err == nil {
+		q := "SELECT max(bucket_count) FROM kingres.colocation"
+		if settings {
+			q += " WHERE kind = 'hash'"
+		}
+		if err := p.QueryRow(ctx, q).Scan(&n); err == nil {
 			probe.bucketCount = n
 		}
 	}
@@ -152,6 +167,9 @@ func (s *Store) buildDatabases(ctx context.Context, name string) ([]api.Database
 			if st.sharding && st.bucketCnt != nil && db.Sharding.BucketCount == nil {
 				db.Sharding.BucketCount = st.bucketCnt
 			}
+		}
+		if db.Sharding.Mode == "schema" {
+			db.Sharding.BucketCount = nil // the mode schema has no hash buckets, whatever was recorded at creation
 		}
 		if probe.hasShard {
 			stats, _, err := s.bucketStats(ctx, r.name, nil)
@@ -338,6 +356,20 @@ func newDatabase(r databaseRow, probe dbProbe, replicas int, durability string) 
 		tables := probe.tableCount
 		db.Stats.TableCount = &tables
 	}
+	if probe.hasShard {
+		db.Sharding.Mode, db.Sharding.DistributeNewSchemas = "row", probe.distribute
+		if probe.mode != "" {
+			db.Sharding.Mode = probe.mode
+		}
+		if db.Sharding.Mode == "schema" {
+			db.Sharding.BucketCount = nil // no hash buckets in this mode
+		}
+		schemas := probe.schemas
+		db.Stats.DistributedSchemaCount = &schemas
+	} else {
+		zeroSchemas := 0
+		db.Stats.DistributedSchemaCount = &zeroSchemas
+	}
 	if !probe.hasLedger {
 		off := "off"
 		db.Ledger.Mode = &off // no ledger catalog: the ledger is certainly off
@@ -361,6 +393,7 @@ func (s *Store) DatabaseCreateOptions(ctx context.Context) (api.DatabaseCreateOp
 		Encodings: []api.EncodingOption{}, Collations: []api.CollationOption{},
 		BucketCount:                 api.IntegerRange{Default: 128, Minimum: 1, Maximum: 4096},
 		LedgerDigestIntervalSeconds: api.IntegerRange{Default: 3600, Minimum: 60, Maximum: 86400},
+		ShardingModes:               &api.ShardingModes{Modes: []string{"row", "schema", "both"}, Default: "row"},
 	}
 	var defEnc, defCollate string
 	if err := p.QueryRow(ctx, `SELECT pg_encoding_to_char(encoding), coalesce(datcollate, '')

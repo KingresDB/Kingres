@@ -339,7 +339,7 @@ paths; what is not done is in "Not done in this increment"). "Real" means the op
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **123 of 137 operations are real; 14 answer "not yet".** The eight ledger operations in that column (client keys, bundles, the signature policy of a table, the upgrade of the extension, the acknowledgement of a diverged chain) are built against the contract in the console, which tries them on its mock API; their implementation in `kingresd` is on a branch that is not merged yet.
+authenticated operation lists in 0.2.0. **128 of 137 operations are real; 9 answer "not yet".** The eight ledger operations in that column (client keys, bundles, the signature policy of a table, the upgrade of the extension, the acknowledgement of a diverged chain) are built against the contract in the console, which tries them on its mock API; their implementation in `kingresd` is on a branch that is not merged yet.
 
 | Tag | Real | Not yet |
 |---|---|---|
@@ -350,7 +350,7 @@ authenticated operation lists in 0.2.0. **123 of 137 operations are real; 14 ans
 | Roles | `listClusterRoles`, `listRoles`, `createRole`, `getRole`, `deleteRole`, `updateRole`, `setRoleClusterRoles`, `setRoleMemberships` |  |
 | Databases | `getDatabaseCreateOptions`, `listDatabases`, `createDatabase`, `getDatabase`, `dropDatabase`, `updateDatabase` |  |
 | Shards | `getBucketDistribution`, `listColocationGroups`, `listBuckets` |  |
-| Schemas |  | `listSchemas`, `getSchema`, `distributeSchema`, `undistributeSchema`, `moveSchema` |
+| Schemas | `listSchemas`, `getSchema`, `distributeSchema`, `undistributeSchema`, `moveSchema` |  |
 | Ledger | `getLedgerStatus`, `listLedgerBlocks`, `listLedgerDigests`, `generateLedgerDigest`, `startLedgerVerification`, `listLedgerStatus`, `createInclusionProof`, `listLedgerVerifications`, `getLedgerVerification`, `getLedgerSettings`, `updateLedgerSettings`, `getLedgerSigning`, `createLedgerSigningKey`, `retireLedgerSigningKey`, `revokeLedgerSigningKey`, `getLedgerTrustFile`, `getLedgerPublication`, `getLedgerAggregate`, `listLedgerAggregates`, `listLedgerAnchorTargets`, `createLedgerAnchorTarget`, `getLedgerAnchorTarget`, `updateLedgerAnchorTarget`, `deleteLedgerAnchorTarget`, `testLedgerAnchorTarget`, `listLedgerAnchors`, `anchorLedgerNow`, `retryLedgerAnchor`, `downloadLedgerAnchor` | `createLedgerBundle`, `getLedgerBundle`, `listLedgerClientKeys`, `registerLedgerClientKey`, `revokeLedgerClientKey`, `setTableSignaturePolicy`, `upgradeLedgerExtension`, `acknowledgeLedgerDivergence` |
 | Tables | `getTable`, `distributeTable`, `enableTableLedger`, `listTables` |  |
 | Grants | `listGrants`, `createGrant`, `revokeGrants`, `applyGrantTemplate` |  |
@@ -1069,6 +1069,9 @@ first step that is not recorded `done`. What the engine promises:
 - A `NonIdempotent` step that was recorded `running` but not `done` is **not** run again: the task fails with the
   code `step_interrupted` (not retryable) and names the step, because it is unknown whether the effect happened. The
   steps after it do not run. A crash before the `running` record leaves the step untouched, so it runs once.
+  A `NonIdempotent` step that has a `Recover` is asked first (contract 0.15.0, the schema tasks): `Recover` reads
+  the effect (for the step that distributes a schema, `kingres.dist_schema`), and `true` records the step as `done`
+  without running it, `false` runs it (the effect is provably not there), and an error is `step_interrupted` as before.
 - A task whose process died is never lost and never stays `running` forever: once the lease expired it is resumed or
   failed as above, as long as some server runs the engine. A task that has all steps `done` is recorded `done`.
 - Secrets live only in the process that started the task; a resumed step that needs one fails with
@@ -3394,3 +3397,67 @@ submission is partial and passes it to `Resume` at the next attempt, and notes c
   the sessions and the drop).
 * **"Anchored" through the header source (not done):** the OTS library has no exported way to inject the proof-of-work check, and a real block header cannot be matched to the merkle root a calendar returns, so the outcome
   "anchored" through the wiring cannot be shown without a library change. The claim path is tested up to `claimed`.
+
+## Distributed schemas (phase 11, step 13; contract 0.15.0)
+
+The control plane of `kingres.distribute_schema`, `move_schema` and `undistribute_schema` (design `docs/design/shard-phase11.md`, sections 10 and
+13). The panel (step 14) and the documentation of the extension (step 15) are not part of it. The contract number is 0.15.0 because phase 10 holds
+0.14.0 on another branch; the changelog entry of the API README counts from 0.13.0 and must be merged with the one of 0.14.0. Five operations (tag
+`Schemas`): `listSchemas`, `getSchema` (reads, `kingres_readonly`), `distributeSchema`, `undistributeSchema` (`kingres_admin`) and `moveSchema`
+(`kingres_ops`, like `startRebalance`). Everything runs on the manager leader, which is the server of the map group primary, as the table and database
+tasks do: the mutating operations are forwarded to it, and the two reads are leader-bound because the record of a move (`kingres.bucket_move`) is in the
+catalog of the map group and the task in the leader's system database.
+
+**Tasks.** Subject type `schema`, id `database/schema` (a database name has no slash, so the first slash splits it).
+
+| Kind | Steps |
+|---|---|
+| `schema.distribute` | `Check the schema` (`schema_inventory`; the blockers), `Set REPLICA IDENTITY FULL` (skipped unless asked), `Make the schema distributed` (`NonIdempotent` with a `Recover`), `Verify on every server` (the schema is distributed and has the same tables on every active primary; `check_cluster` rows that name the schema) |
+| `schema.undistribute` | `Check the schema`, `Move first` (skipped unless a group was named and differs; the same code as the move), `Make the schema local` (`NonIdempotent` with a `Recover`; ends the cleaning of an old copy of a move first, because the extension refuses while a move is in the phase `cleaning`), `Verify on every server` (exactly one server has the schema) |
+| `schema.move` | `Check the move`, `Set REPLICA IDENTITY FULL` (skipped unless asked), `Copy the data`, `Switch`, `Clean up the old copy` |
+
+*Decisions where the design leaves a choice or cannot work as written.*
+
+- The step that must not run twice cannot be both `NonIdempotent` and read its effect on a retry with the engine as it was (a `NonIdempotent` step found
+  running failed the task before it ran). `task.Step.Recover` is new: called for such a step, it says whether the effect is there. The distribute and the
+  make-local steps read `kingres.dist_schema`; when the effect is not there they ask `recover_prepared_transactions()` to settle what the cut call left
+  prepared on the other nodes, and the step runs again. A step with no `Recover`, or whose `Recover` fails, is `step_interrupted` as before.
+- `move_schema` is one call that holds the whole move (the extension's own session does the phases), so one step has to hold the connection. `Copy the data`
+  holds the call and polls `kingres.bucket_move` on a second connection; its task `detail` is `<phase>: <text>` and `itemsDone`/`itemsTotal` (new:
+  `Env.SetItems`, kept in the step of the task row) are bytes: the size of the schema's tables on the target over the size on the source. `Switch` verifies
+  the result (the bucket map says the target and `active`); the phase `switching` is visible through the detail of `Copy the data`. `Clean up the old copy`
+  does not wait for the extension's delay (`kingres_shard.move_cleanup_delay`): the task is `done` at the phase `cleaning` and says so in its detail.
+- A step repeated after the leader was killed follows a move that is there: the schema on the target is done; an unfinished move to the same target is
+  followed (after `resume_bucket_moves()`), with up to ten minutes for the extension's recovery; a move that ended without effect is started again, three
+  times at most.
+- Cancel: the engine looks at a cancel mark only between steps, so `Env.CancelRequested` lets the copy step see it. Before the phase `switching` the step
+  calls `cancel_bucket_move`, the extension undoes the move and the task fails with the code `cancelled`, the schema `active` on the source. From the phase
+  `switching` (detail, or the steps `Switch` and `Clean up the old copy` started) the guard `schemaMoveCancellable` answers `task_not_cancellable`; the
+  read of the task (`Task.cancellable`) has the same rule in its SQL (`pgstore/tasks.go`).
+- Failover exclusion: migration 0050 is a second trigger on `kingres_cp.task` (a function of its own, so that it does not depend on the text of
+  `task_exclusion()` that another line of work replaces): the three kinds and a failover exclude each other (KX006 and KX007, as the database tasks do).
+  A rebalance is refused by `moveSchema` in Go (`rebalance_in_progress`), not by the database.
+- `distributeSchema` and `moveSchema` have an optional `setReplicaIdentityFull` in the body (the design text lists it for the task but not for the body).
+  A move of a schema with a table that has no key and no full identity is refused at once (422 `unprocessable`, the tables named) unless it is asked.
+- A schema that was made local on a server other than the leader is not visible on the leader: `getSchema` answers 404 there. That is what a local
+  schema is in this design.
+- A database whose extension is older than kingres_shard 0.8 lists its schemas as local ones; `distributeSchema` and the mode change answer 422
+  `unsupported_operation` for it, and a database with no sharding 409 `conflict`.
+- The rebalance of this branch plans with `kingres.rebalance_plan()`, which leaves the bucket of a schema group where it is (it counts in the load of its
+  group). So no rebalance run issues a schema move here: `RebalanceStatus.inFlightMoves[]` carries `kind` and `schemaName` (read from
+  `kingres.dist_schema`, `rebalance.PG.SchemaOf`), which says `hash` for every move that exists. The rebalance of schemas is phase 10's `plan_rebalance`
+  scheduler, on another branch; its unit of a plan is `(colocation_id, 0)`, which this code already reports.
+- Known limit seen in the tests: when the nodes are slow to answer the marker of the switch while a writer runs, the extension's switch can fail with a
+  timeout it does not retry; the move is then left to the extension's recovery, which undoes it, and the task fails (retryable). The control plane reports
+  it and does not hide it.
+
+**Database level (design 10).** `ShardingCreateSettings.mode` and `distributeNewSchemas` (default `row`, false) are applied by a task step after every server
+was registered; `bucketCount` is ignored and recorded as null in the mode `schema`. `PATCH /databases/{name}` with `sharding.mode` or
+`sharding.distributeNewSchemas` is synchronous and calls `kingres.set_sharding_mode`; its refusal for a kind that exists (SQLSTATE 55000) is
+409 `sharding_mode_in_use` with the extension's detail (the schemas or tables named), and the combination it refuses (22023) is a validation error.
+
+**Names.** A schema or database name is never put into SQL text by concatenation: the extension is called with the schema looked up by its exact name in
+`pg_namespace`, identifiers go through `sqlx`, and what is sent to a node is quoted with `sqlx.QuoteLiteral`.
+
+**Tests.** `internal/clustertest/schemas_test.go`, `schemas_resume_test.go` and `schemas_rebalance_test.go` (real instances; the leader's `kingresd` is
+killed at every step), `internal/ops/schemas_test.go`, `internal/httpapi/schemas_http_test.go`, `internal/task/recover_test.go`.

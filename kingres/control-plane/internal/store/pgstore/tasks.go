@@ -16,7 +16,11 @@ import (
 
 // Tasks live in kingres_cp.task of the system database (migration 1, see
 // package sysdb); the database of the service DSN is the system database.
-const taskColumns = `id, kind, state, subject_type, subject_id, progress, error, (state IN ('pending', 'running') AND kind NOT IN ('instance.start', 'instance.stop', 'instance.restart')), created_at, updated_at, created_by`
+const taskColumns = `id, kind, state, subject_type, subject_id, progress, error, (state IN ('pending', 'running') AND kind NOT IN ('instance.start', 'instance.stop', 'instance.restart')
+	-- the move of a schema (and the move first of its undistribution) can be stopped until the phase switching (internal/ops, schemaMoveCancellable)
+	AND NOT (kind IN ('schema.move', 'schema.undistribute') AND (coalesce(progress->>'detail', '') ~ '^(switching|cleaning|done)'
+		OR EXISTS (SELECT 1 FROM jsonb_array_elements(coalesce(progress->'steps', '[]'::jsonb)) s
+			WHERE s->>'name' IN ('Switch', 'Clean up the old copy', 'Make the schema local') AND s->>'state' <> 'pending')))), created_at, updated_at, created_by`
 
 type taskRow struct {
 	id          int64

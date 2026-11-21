@@ -40,6 +40,9 @@ func (s *Server) opsHandlers() map[string]handlerFunc {
 		"updateDatabase":            s.updateDatabase,
 		"dropDatabase":              s.dropDatabase,
 		"distributeTable":           s.distributeTable,
+		"distributeSchema":          s.distributeSchema,
+		"undistributeSchema":        s.undistributeSchema,
+		"moveSchema":                s.moveSchema,
 		"enableTableLedger":         s.enableTableLedger,
 		"executeQuery":              s.executeQuery,
 		"cancelStatement":           s.cancelStatement,
@@ -726,4 +729,76 @@ func (s *Server) resetAutoFailoverCounter(c *call, w http.ResponseWriter, r *htt
 	}
 	s.writeJSON(w, r, http.StatusOK, out)
 	return nil
+}
+
+// startSchemaTask is what the three schema operations share after their input was prepared: the task is started on the subject
+// "database/schema" and answered with 202.
+func (s *Server) startSchemaTask(c *call, w http.ResponseWriter, r *http.Request, o *ops.Ops, kind, db, schema string, in any) error {
+	t, err := o.StartTask(r.Context(), kind, "schema", db+"/"+schema, in, c.session.Username)
+	if err != nil {
+		return s.taskProblem(r, err)
+	}
+	c.addDetails(map[string]any{"database": db, "schema": schema, "taskId": t.ID})
+	s.accepted(w, r, t)
+	return nil
+}
+
+func (s *Server) distributeSchema(c *call, w http.ResponseWriter, r *http.Request) error {
+	o, err := s.needOps()
+	if err != nil {
+		return err
+	}
+	pp := newParams(r)
+	db, schema := pp.pathName("databaseName"), pp.pathName("schemaName")
+	if p := pp.err(); p != nil {
+		return p
+	}
+	var req api.DistributeSchemaRequest
+	if err := s.optionalBody(w, r, &req); err != nil {
+		return err
+	}
+	in, err := o.PrepareDistributeSchema(r.Context(), db, schema, req)
+	if err != nil {
+		return err
+	}
+	return s.startSchemaTask(c, w, r, o, ops.KindSchemaDistribute, db, schema, in)
+}
+
+func (s *Server) undistributeSchema(c *call, w http.ResponseWriter, r *http.Request) error {
+	o, err := s.needOps()
+	if err != nil {
+		return err
+	}
+	pp := newParams(r)
+	db, schema := pp.pathName("databaseName"), pp.pathName("schemaName")
+	group := pp.int32Query("shardGroupId")
+	if p := pp.err(); p != nil {
+		return p
+	}
+	in, err := o.PrepareUndistributeSchema(r.Context(), db, schema, group)
+	if err != nil {
+		return err
+	}
+	return s.startSchemaTask(c, w, r, o, ops.KindSchemaUndistribute, db, schema, in)
+}
+
+func (s *Server) moveSchema(c *call, w http.ResponseWriter, r *http.Request) error {
+	o, err := s.needOps()
+	if err != nil {
+		return err
+	}
+	pp := newParams(r)
+	db, schema := pp.pathName("databaseName"), pp.pathName("schemaName")
+	if p := pp.err(); p != nil {
+		return p
+	}
+	var req api.MoveSchemaRequest
+	if err := s.body(w, r, &req); err != nil {
+		return err
+	}
+	in, err := o.PrepareMoveSchema(r.Context(), db, schema, req)
+	if err != nil {
+		return err
+	}
+	return s.startSchemaTask(c, w, r, o, ops.KindSchemaMove, db, schema, in)
 }
