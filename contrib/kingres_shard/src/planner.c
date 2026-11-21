@@ -1281,6 +1281,8 @@ check_marker_installed_versions(const char *marker_ext)
 
 	if (marker_ext == NULL)
 		return;
+	/* the list is split below at ',' and ':': it is of the exact form, or it is refused (review S13F-02) */
+	kingres_shard_ext_list_check(marker_ext);
 	copy = pstrdup(marker_ext);
 	for (tok = strtok(copy, ","); tok != NULL; tok = strtok(NULL, ","))
 	{
@@ -1328,6 +1330,8 @@ check_marker_extensions(const char *marker_ext, const char *used)
 
 	if (marker_ext == NULL && used == NULL)
 		return;
+	kingres_shard_ext_list_check(marker_ext);
+	kingres_shard_ext_list_check(used);
 	if (marker_ext != NULL)
 	{
 		copy = pstrdup(marker_ext);

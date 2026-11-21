@@ -22,8 +22,7 @@ increments 9.1 and 9.2) starts the table lifecycle: `create_distributed_table` a
 privileges, comments, sequences and foreign keys; `kingres.table_change_report()` says what
 stands in the way of a change of a table before it is tried; and the catalog holds what the
 rest of the phase needs (see "The table lifecycle (version 0.7)"). Increment 9.4 adds the blocking
-`undistribute_table` and `alter_distributed_table`. The online variants of those two and user partitions are
-the next increments and are not in this version.
+`undistribute_table` and `alter_distributed_table`. The online variants of those two are the next increments and are not in this version.
 
 ## How it works in one page
 
@@ -675,7 +674,7 @@ blocker). Severity `blocker`: the call is refused. `warning`: carried differentl
 | `not_carried` (warning), `rows` (note) | distribute, distribute_reference | what is not carried; the estimate of the rows that writers wait for |
 | `not_distributed`, `foreign_key_linked`, `target_group_invalid`, `group_busy`, `dependent_object` | undistribute | the table is not distributed or a reference table; a foreign key links it to another table of the catalog (undistribute them together with `cascade_via_foreign_keys`, or drop the key; a key from a distributed table to a reference table is kept); the target group has no active primary; a move or an operation uses the group; a view (or another object) uses a table that the call drops |
 | `not_distributed`, `bucket_count_invalid`, `colocate_with_not_distributed`, `foreign_key_colocation`, `unique_without_distribution_column`, `column_missing`, `no_hash_support`, `group_busy` | alter | the table is not distributed; the bucket count is out of range; the table to colocate with is not distributed; a key depends on the colocation of two tables (pass `cascade_to_colocated`); a unique index lacks the new distribution column; the column does not exist or cannot be hashed; a move or an operation uses the group |
-| `not_distributed`, `name_too_long`, `not_available_yet` | create_partition, attach_partition, detach_partition, drop_partition | user partitions are not in this version |
+| `not_distributed`, `name_too_long` | create_partition, attach_partition, detach_partition, drop_partition | the table is not a user-partitioned distributed hash table (`not_distributed`); the partition name leaves no room for `_bNNNN`. (`not_available_yet` is reported for undistribute and alter of a user-partitioned table only.) |
 
 `options` is what the call would be given: `column`, `colocate_with` (a table name, schema-qualified unless it is in `pg_catalog`
 or `kingres`: the report runs with a fixed `search_path`), `bucket_count`, `mode` for a distribution;
@@ -1861,6 +1860,21 @@ decision is the group's catalog, not the error of a parse, so no other error is 
 one place where a shipped statement can fail for a reason the scan would not have; the escape is
 `SET kingres_shard.shippable_extensions = 'none'`, with which the node that runs the statement reads the rows and runs the
 aggregate itself.
+
+The list in the marker has one exact form, `name:version[,name:version...]`, split at `,` and at `:`, so a name or a version is made of
+letters, digits, `_`, `.` and `-` and nothing else; an object of an extension whose name or version has another character is not
+shipped, and a list that has another form (an empty name or version, an item without a version, a second colon) is refused wherever it
+is split: by the group that receives the fragment and by the probe of the sender, with `0A000` ("the list of extensions of a shipped
+statement is not of the form name:version[,name:version...]"), not as a stale map, since a repeat gives the same answer.  The list
+that is compiled in has `kingres_sketch` only, whose name and version are of that form (`t/176_extension_list_format.pl`).
+
+**A limit: the schema of the extension.**  The text of a shipped statement names the extension's schema as the node that sends it has it
+(`kingres_sketch.approx_count_distinct(...)`), and the probe compares the name of the extension with the node's catalog, not its schema.  An
+extension at the same version in another schema on a node would give that group's own `3F000` or `42883`, not `KS001`.  It cannot
+happen for the extensions of the compiled-in list: the control file of `kingres_sketch` is not relocatable and names its schema
+(`schema = kingres_sketch`), so `CREATE EXTENSION ... SCHEMA other` and `ALTER EXTENSION ... SET SCHEMA` are refused.  `t/176_extension_list_format.pl`
+(section C) pins that premise, so that a change of the control file, or a second extension on the list that can be relocated, is noticed;
+such an extension needs the schema in the probe before it is added to the list.
 
 `kingres_shard.shippable_extensions` (`USERSET`, default `all`) is `all`, `none` or a comma-separated list of names from the
 compiled-in list; another name is an error when it is set.  It is read at the node that runs the statement and only narrows what the

@@ -3425,3 +3425,40 @@ Each finding was reproduced before the change. The new tests are t/173 to t/175.
   a comment and a semicolon.
 
 Six mutants of the fixes, one at a time on 19, are all killed.
+
+### The fixes for the review of the fixes of step 13 (2026-11-21)
+
+The review found two low findings, neither reproduced. The new test is t/176.
+
+- **S13F-02, the format of the list of extensions.** The list `name:version[,name:version...]` of a
+  marker and of a probe was split at `,` and at `:` in four places (two in `placement_check.c`, two
+  in `planner.c`), and the marker parser accepts both characters. A name with a colon would be cut
+  at the first one: the probe would ask for a shorter name and report a node that has the extension
+  as lacking it. The format is now exact, and checked in one place: a name or a version is made of
+  letters, digits, `_`, `.` and `-` (`kingres_shard_ext_token_ok`, `shippable.c`);
+  `kingres_shard_ext_list_check` refuses a list of another form (empty name or version, an item
+  without a version, a second colon, an empty item) with `0A000` and a message that names the form
+  (not a stale map: a repeat gives the same answer), before it is split, in the group that receives
+  the fragment (both functions of `planner.c`) and in both functions of the probe. An object of an
+  extension whose name or version has another character is not shippable (`ext_object_ok`), so
+  the sender never makes such a list; the compiled-in list has only `kingres_sketch`, so that guard
+  has no test that could reach it, and is a defence for a list that grows. The two splits of
+  `placement_check.c` are one helper now (`ext_item_next`). t/176 B sends nine forms of bad list in
+  forged fragments of both kinds to a group.
+- **S13F-01, an extension in another schema on a node.** Decided as a limit, with a test, not as
+  a detection. The text of a shipped statement names the extension's schema as the sender has it, so
+  the node would have to be asked for its schema too, and the extension list would need a third
+  field. It cannot happen today: the control file of `kingres_sketch` is not relocatable and names
+  its schema, so `CREATE EXTENSION ... SCHEMA other` and `ALTER EXTENSION ... SET SCHEMA` are
+  refused by PostgreSQL (and a control file that is relocatable and names a schema is itself
+  refused). A test that builds the state is therefore not possible; t/176 C pins the premise
+  (both statements fail with the messages above, in a database of its own, before anything else
+  uses the extension), and the README names the limit and says that an extension that can be
+  relocated needs the schema in the probe before it goes on the list.
+
+Mutants of the fixes, one at a time on 18: the check removed from `check_marker_installed_versions`
+(t/176 B fails, more than 20 assertions); the check relaxed to accept `:` in a token (12); the split of the
+probe giving the name with its version (12 of t/176 and 7 of t/173, which no longer finds a node
+that has the extension); the control file made relocatable (t/176 C). The check removed from
+`check_marker_extensions` and from the one of `used` survives and is equivalent: the first function
+of the group has refused the same marker before, and `used` is made by the group's own analysis.

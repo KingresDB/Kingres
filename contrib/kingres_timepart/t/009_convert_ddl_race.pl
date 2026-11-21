@@ -15,13 +15,24 @@
 #
 # And three things around the swap that the other tests do not pin:
 #
-#   * the tablespace of the partition goes to the new partition, both ways;
+#   * the tablespace of the partition, and of each of its indexes, goes to the new
+#     partition, both ways;
 #   * a reader of the table that holds ACCESS SHARE on it makes the swap give
 #     way after the short wait (about half a second), not after the lock
 #     timeout of the conversion, and the conversion says that it gave way;
 #   * a writer through the table that waits for the partition makes the swap
 #     give way before it asks for its lock (the message says which session
 #     the conversion saw).
+#
+# And the changes that need no lock on the table (review T13F-01, T13F-02, T13F-07):
+#
+#   * a GRANT, a REVOKE, and the rename, comment and storage parameters of an
+#     index, committed while the swap waits for its lock: the conversion gives
+#     way (schema_changed) and the partition keeps the change; the next call
+#     carries it;
+#   * the cap of the swap wait: 500 ms, whatever deadlock_timeout is;
+#   * the name of the partition taken by another table while the conversion
+#     waits for its lock: the check of the lock that is held refuses it.
 #
 # And a limit that the README names, so that a change in it is noticed: a
 # REPEATABLE READ transaction whose snapshot is older than the swap and that
@@ -255,13 +266,24 @@ sub tablespace_of
 	return q1(qq{SELECT coalesce((SELECT spcname FROM pg_tablespace WHERE oid = c.reltablespace), 'default') FROM pg_class c WHERE c.oid = '$t'::regclass});
 }
 is(tablespace_of('evt_p1'), 'tpts', '4: the partition is in the tablespace');
+# a plain index in the tablespace, and one in the default tablespace (the
+# tablespace of an index is its own, not the table's)
+q1(q{CREATE INDEX evt_ix_ts ON evt_p1 (v) TABLESPACE tpts; CREATE INDEX evt_ix_def ON evt_p1 (id, v)});
+sub index_spaces
+{
+	return q1(q{SELECT string_agg(c.relname || ':' || coalesce((SELECT spcname FROM pg_tablespace WHERE oid = c.reltablespace), 'default'), ',' ORDER BY c.relname)
+		FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE i.indrelid = 'evt_p1'::regclass AND c.relname LIKE 'evt\_ix%'});
+}
+is(index_spaces(), 'evt_ix_def:default,evt_ix_ts:tpts', '4: the indexes are in their tablespaces');
 q1(q{CALL kingres.convert_partition('evt', 'evt_p1', 'columnar')});
 is(methods('evt'), 'evt_p1:columnar,evt_p2:heap', '4: converted to columnar');
 is(tablespace_of('evt_p1'), 'tpts', '4: the new partition is in the tablespace');
+is(index_spaces(), 'evt_ix_def:default,evt_ix_ts:tpts', '4: and each index is in its own tablespace');
 is(tablespace_of('evt_p2'), 'default', '4: the other partition is not');
 q1(q{CALL kingres.convert_partition('evt', 'evt_p1', 'heap')});
 is(methods('evt'), 'evt_p1:heap,evt_p2:heap', '4: and back to heap');
 is(tablespace_of('evt_p1'), 'tpts', '4: still in the tablespace');
+is(index_spaces(), 'evt_ix_def:default,evt_ix_ts:tpts', '4: and each index still in its own tablespace');
 is(q1(q{SELECT count(*) FROM evt}), '500', '4: with every row');
 
 # ---- 5. The swap gives way after the short wait, and says why.
@@ -303,6 +325,155 @@ is($w->{status}, 0, '5: the writer went on') or diag $w->{err};
 is(q1(q{SELECT count(*) FROM evs WHERE id = 900}), '1', '5: its row is in the old partition');
 is(methods('evs'), 'evs_p1:heap', '5: the partition is heap');
 is(strays(), '0', '5: no stray table');
+
+# ---- 7. A change that needs no lock on the table, committed while the swap
+#         waits for its lock, is not lost: the conversion gives way and the
+#         partition keeps the change.  GRANT, REVOKE, and the rename, comment and
+#         storage parameters of an index take no lock that the conversion's lock
+#         on the partition keeps out.  The reader holds the table, so the swap
+#         waits (up to half a second); the change is made in a session that is
+#         already open, the moment the swap is seen waiting.
+q1(q{
+CREATE ROLE tpg_b NOLOGIN;
+CREATE TABLE evg (id bigint, ts timestamptz NOT NULL, v int, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+CREATE TABLE evg_p1 PARTITION OF evg FOR VALUES FROM ('2026-01-01 UTC') TO ('2026-02-01 UTC');
+INSERT INTO evg SELECT i, '2026-01-10 UTC', i FROM generate_series(1, 300) i;
+CREATE INDEX evg_ix ON evg_p1 (v);
+CREATE INDEX evg_ix_b ON evg_p1 (id, v);
+GRANT SELECT ON evg_p1 TO tpg_b;
+});
+
+sub swap_waiting_sql
+{
+	my ($t) = @_;
+	return qq{SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+		WHERE c.relname = '$t' AND l.mode = 'AccessExclusiveLock' AND NOT l.granted};
+}
+
+# Run one conversion of evg_p1 to the method $am while $change commits during
+# the swap's wait; returns the handle.  A try in which the swap gave way before
+# the change was made (a loaded machine) is made again, with a change that
+# is put back first by $undo.
+sub raced_conversion
+{
+	my ($am, $change, $undo, $deadlock) = @_;
+	my $h;
+	for my $try (1 .. 6)
+	{
+		my $rdr = $node->background_psql('postgres');
+		my $chg = $node->background_psql('postgres');
+		$rdr->query_safe(q{BEGIN; SELECT count(*) FROM evg;});
+		$h = spawn(qq{SET kingres_timepart.create_lock_timeout_ms = 10000;\n}
+			. (defined $deadlock ? "SET deadlock_timeout = '$deadlock';\n" : '')
+			. qq{CALL kingres.convert_partition('evg', 'evg_p1', '$am');\n});
+		my $seen = wait_for(swap_waiting_sql('evg'), 'the swap to wait for the table');
+		$chg->query_safe($change) if $seen;
+		$rdr->query_safe(q{COMMIT});
+		finish($h);
+		$rdr->quit;
+		$chg->quit;
+		last unless $h->{err} =~ /ERROR:  swap_lock_timeout/ && defined $undo;
+		diag("try $try: the swap gave way before the change was made; again");
+		q1($undo);
+	}
+	return $h;
+}
+
+sub has_priv
+{
+	return q1(q{SELECT has_table_privilege('tpg_b', 'evg_p1', 'select')});
+}
+
+# 7a. REVOKE
+my $h = raced_conversion('columnar', q{REVOKE SELECT ON evg_p1 FROM tpg_b}, q{GRANT SELECT ON evg_p1 TO tpg_b});
+isnt($h->{status}, 0, '7a: the conversion gave way to the REVOKE');
+like($h->{err}, qr/ERROR:  schema_changed: the privileges, or the names, comments or options of the indexes/, '7a: with schema_changed');
+is(methods('evg'), 'evg_p1:heap', '7a: the partition is as it was');
+is(has_priv(), 'f', '7a: the REVOKE stands (the new table did not bring the privilege back)');
+is(strays(), '0', '7a: no stray table');
+$h = finish(spawn(q{CALL kingres.convert_partition('evg', 'evg_p1', 'columnar');}));
+is($h->{status}, 0, '7a: the next call converts') or diag $h->{err};
+is(has_priv(), 'f', '7a: and the new partition does not have the privilege');
+
+# 7b. GRANT
+$h = raced_conversion('heap', q{GRANT SELECT ON evg_p1 TO tpg_b}, q{REVOKE SELECT ON evg_p1 FROM tpg_b});
+isnt($h->{status}, 0, '7b: the conversion gave way to the GRANT');
+like($h->{err}, qr/ERROR:  schema_changed: the privileges/, '7b: with schema_changed');
+is(methods('evg'), 'evg_p1:columnar', '7b: the partition is as it was');
+is(has_priv(), 't', '7b: the GRANT stands');
+$h = finish(spawn(q{CALL kingres.convert_partition('evg', 'evg_p1', 'heap');}));
+is($h->{status}, 0, '7b: the next call converts') or diag $h->{err};
+is(has_priv(), 't', '7b: and the new partition has the privilege');
+
+# 7c. the rename, the comment and the options of an index
+my @idx = (
+	[ 'rename',  q{ALTER INDEX evg_ix RENAME TO evg_ix_renamed}, q{ALTER INDEX IF EXISTS evg_ix_renamed RENAME TO evg_ix} ],
+	[ 'comment', q{COMMENT ON INDEX evg_ix_b IS 'a late comment'}, q{COMMENT ON INDEX evg_ix_b IS NULL} ],
+	[ 'options', q{ALTER INDEX evg_ix_b SET (fillfactor = 50)}, q{ALTER INDEX evg_ix_b RESET (fillfactor)} ],
+);
+my $am = 'columnar';
+for my $c7 (@idx)
+{
+	my ($what, $sql, $undo) = @$c7;
+	$h = raced_conversion($am, $sql, $undo);
+	isnt($h->{status}, 0, "7c: the conversion gave way to the index $what");
+	like($h->{err}, qr/ERROR:  schema_changed: the privileges, or the names, comments or options of the indexes/, "7c: $what: with schema_changed");
+	is(methods('evg'), 'evg_p1:' . ($am eq 'columnar' ? 'heap' : 'columnar'), "7c: $what: the partition is as it was");
+	is(strays(), '0', "7c: $what: no stray table");
+	# the change stands on the partition, and a call that is not raced carries it
+	$h = finish(spawn(qq{CALL kingres.convert_partition('evg', 'evg_p1', '$am');}));
+	is($h->{status}, 0, "7c: $what: the next call converts") or diag $h->{err};
+	$am = $am eq 'columnar' ? 'heap' : 'columnar';
+}
+is(q1(q{SELECT string_agg(c.relname || ':' || coalesce(obj_description(c.oid, 'pg_class'), '-') || ':' || coalesce(c.reloptions::text, '-'), ',' ORDER BY c.relname)
+	FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE i.indrelid = 'evg_p1'::regclass AND c.relname LIKE 'evg\_ix%'}),
+	'evg_ix_b:a late comment:{fillfactor=50},evg_ix_renamed:-:-',
+	'7c: the late rename, comment and option are on the converted partition');
+
+# ---- 7d. The cap of the swap wait is 500 ms, though deadlock_timeout is much
+#          larger (the wait is the smaller of 500 ms and half of it).
+{
+	my $rdr = $node->background_psql('postgres');
+	$rdr->query_safe(q{BEGIN; SELECT count(*) FROM evg;});
+	$h = spawn(qq{SET kingres_timepart.create_lock_timeout_ms = 10000;\nSET deadlock_timeout = '10s';\n}
+		. qq{CALL kingres.convert_partition('evg', 'evg_p1', '$am');\n});
+	wait_for(swap_waiting_sql('evg'), 'the swap to wait for the table');
+	usleep(2_000_000);    # longer than the cap, much shorter than half of ten seconds
+	$rdr->query_safe(q{COMMIT});
+	finish($h);
+	$rdr->quit;
+}
+isnt($h->{status}, 0, '7d: the conversion gave way to the reader');
+like($h->{err}, qr/ERROR:  swap_lock_timeout: [\w."]+ could not be locked within 500 ms/,
+	'7d: it waited 500 ms, the cap, not half of a deadlock_timeout of ten seconds');
+
+# ---- 8. The name of the partition is another table when the conversion gets
+#         its lock: the lock that was granted is not the partition's.
+q1(q{
+CREATE TABLE evn (id bigint, ts timestamptz NOT NULL, v int, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+CREATE TABLE evn_p1 PARTITION OF evn FOR VALUES FROM ('2026-01-01 UTC') TO ('2026-02-01 UTC');
+INSERT INTO evn SELECT i, '2026-01-10 UTC', i FROM generate_series(1, 100) i;
+});
+$a = $node->background_psql('postgres');
+$a->query_safe(q{BEGIN; INSERT INTO evn (id, ts, v) VALUES (5000, '2026-01-11 UTC', 1);});
+$c = spawn(q{
+SET kingres_timepart.create_lock_timeout_ms = 60000;
+CALL kingres.convert_partition('evn', 'evn_p1', 'columnar');
+});
+wait_for(waiting_sql('%convert_partition%'), 'the conversion to wait for the lock of the partition');
+$a->query_safe(q{
+ALTER TABLE evn_p1 RENAME TO evn_p1_old;
+CREATE TABLE evn_p1 (id bigint, ts timestamptz, v int);
+COMMIT;
+});
+finish($c);
+isnt($c->{status}, 0, '8: the conversion did not go on');
+like($c->{err}, qr/ERROR:  schema_changed: the partition with OID \d+ was renamed or dropped while the conversion waited for its lock, and its name is another table now/,
+	'8: it says that the name is another table now');
+is(q1(q{SELECT string_agg(c.relname || ':' || a.amname, ',' ORDER BY c.relname) FROM pg_class c JOIN pg_am a ON a.oid = c.relam
+	WHERE c.relname IN ('evn_p1', 'evn_p1_old')}), 'evn_p1:heap,evn_p1_old:heap', '8: both tables are as they were');
+is(strays(), '0', '8: no stray table');
+$a->quit;
 
 # ---- 6. The limit: a REPEATABLE READ snapshot older than the swap, on a table
 #         that the transaction has not read yet, finds the converted partition empty.

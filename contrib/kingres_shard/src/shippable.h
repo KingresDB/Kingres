@@ -65,6 +65,9 @@ extern PGDLLIMPORT char *kingres_shard_shippable_extensions;
 extern bool kingres_shard_shippable_extension_known(const char *name);
 extern bool kingres_shard_extension_aggregate_ok(Oid aggfnoid);
 extern char *kingres_shard_shippable_ext_used(void);
+extern bool kingres_shard_ext_token_ok(const char *s, size_t len);
+extern bool kingres_shard_ext_list_valid(const char *list);
+extern void kingres_shard_ext_list_check(const char *list);
 extern char *kingres_shard_extension_version(const char *name);
 
 extern bool kingres_shard_stmt_shippable_partial(Query *query, int colocation_id,

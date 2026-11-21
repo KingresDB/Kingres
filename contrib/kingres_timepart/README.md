@@ -470,7 +470,8 @@ function or procedure (checked by the test `timepart_retention`).
   login role (`session_user`): a superuser, or a role that has the privileges of
   the table's owner; any other role gets `permission denied`, so the function
   cannot be used to ask the private catalogs about a table that is not
-  yours. The other helpers that `PUBLIC` may execute read `pg_catalog` only.
+  yours; its second argument must be the table or one of its partitions, and
+  any other table gets no answer. The other helpers that `PUBLIC` may execute read `pg_catalog` only.
 - **Policy and history tables.** The base tables (`*_data`) grant nothing to
   `PUBLIC` and have no row-level security; roles reach them through
   `security_barrier` views owned by the extension owner, whose condition
@@ -687,8 +688,10 @@ heap, change it, convert it again.
 columns and their defaults, comments and storage settings, the `CHECK` and `NOT
 NULL` constraints (all validated: see "What is refused"), the stored generated
 columns (recomputed), the owner, the table comment, the tablespace, the
-replica identity `FULL` or `NOTHING`, all indexes with their names and
-comments (the comments of primary key and unique constraints too), and the
+replica identity `FULL` or `NOTHING`, all indexes with their names,
+comments and tablespaces (the comments of primary key and unique constraints
+too; a plain index is made in its own tablespace, which need not be the
+table's), and the
 following, which `CREATE TABLE ... (LIKE ...)` does not carry and the
 conversion sets itself:
 
@@ -712,6 +715,26 @@ conversion sets itself:
   statistics target of an index expression, and the index that the table is
   clustered on (`CLUSTER ON`, the marker only);
 * Triggers of the parent are cloned by the attach, as for any partition.
+
+**What changes while the copy runs.** The lock on the partition keeps out its
+writers and every change of its structure that needs a lock on the table, and
+what is read after the lock (above) is what is copied. A few changes need no
+lock on the table at all: `GRANT` and `REVOKE` (table and column level), and
+`ALTER INDEX ... RENAME`, `COMMENT ON INDEX` and `ALTER INDEX ... SET (...)`.
+They can commit while the copy runs, or while the swap waits for its lock, and
+the old partition, which the swap drops, would take them with it. So the
+conversion keeps a document of everything of that kind that it carries (the
+privileges, and of every index the name, tablespace, storage parameters,
+comment, clustering mark, constraint name and comment and the statistics
+targets) and reads it again when it holds the lock on the parent, just before
+the detach. If the two differ it fails with `schema_changed` (SQLSTATE `55P03`,
+retryable; for a policy run the action is `failed` and the next run is due
+within five minutes), the old partition keeps the change, and the next call
+carries it. A change made in the few statements between that second reading and
+the drop of the old partition is not seen by it, and is lost with the old
+partition, as a `GRANT` that races with a `DROP TABLE` is.
+`t/009_convert_ddl_race.pl` makes each of the changes above while the swap
+waits.
 
 The options (`columnar_options`) are set before the first row is
 written; without them the new table takes the `kingres_columnar.*` settings of
@@ -861,7 +884,9 @@ silently:
   foreign key;
 * the partition has a `CHECK` or `NOT NULL` constraint that is not validated
   (`NOT VALID`): the new table would have it validated, and a row that
-  violates it would fail the copy, in every run; validate it or drop it;
+  violates it would fail the copy, in every run; validate it or drop it. A
+  `CHECK` that is `NOT ENFORCED` (PostgreSQL 18 and later) is not refused: no
+  row can fail on it, and the new table has it as it was, in both directions;
 * a privilege on the partition or on a column of it was granted by a role that
   is not the owner (see "What the new partition is");
 * another object depends on the partition or on its row type: a function with
@@ -875,7 +900,9 @@ silently:
   `ATTACH PARTITION` scans the default partition under `ACCESS EXCLUSIVE` on the
   table to check that it holds no row of the new range, which stalls every
   reader and writer of the table for about 50 ms per million rows, and
-  `lock_timeout` does not bound a scan. A policy table has no default partition
+  `lock_timeout` does not bound a scan. A default partition that is itself
+  partitioned is measured by the size of its leaves (table, TOAST table and
+  maps, not the indexes). A policy table has no default partition
   (see "Default partition"); this is for a conversion by hand;
 * for `heap`, a publication of the partition's schema or of all tables: it would
   take in the new table the moment it is created and publish every row of the
@@ -1059,9 +1086,10 @@ not edited: `kingres_timepart--0.1.sql` is as it was.
 
 Version 0.2 itself has not been released (no beta, no tag), so the review of
 the conversion (`kingres/docs/reviews/2026-11-20-kingres-timepart-0.2.md`) was
-fixed in `kingres_timepart--0.2.sql` and in `kingres_timepart--0.1--0.2.sql`,
-which still give the same catalog; there is no `0.2--0.3` script. The fixes add
-one function (`timepart__convert_plan`), change `timepart__convert_refusal`,
+fixed, and then the review of those fixes, in `kingres_timepart--0.2.sql` and in
+`kingres_timepart--0.1--0.2.sql`, which still give the same catalog; there is
+no `0.2--0.3` script. The fixes add two functions (`timepart__convert_plan`,
+`timepart__convert_fp`), change `timepart__convert_refusal`,
 `timepart__convert_stmts`, `timepart__special_table` and two lines of
 `timepart_run_action` and `timepart__finish_run` (the retry of `schema_changed`),
 and add one setting (`kingres_timepart.convert_default_max_mb`). A database
@@ -1244,7 +1272,7 @@ partition or its row type, a large default partition, a publication of the
 schema; a name of multibyte letters with two indexes; another table access
 method; a partition off the grid in the convert phase of a run; a superuser
 that switched to the owner; the helper that knows the ledger and distributed
-tables), `timepart_drop` (`DROP EXTENSION` and `CREATE EXTENSION`, also where
+tables, and that it answers only about the table and its own partitions; a `NOT ENFORCED` check carried both ways; a default partition that is itself partitioned; a partition dropped between the plan and the block), `timepart_drop` (`DROP EXTENSION` and `CREATE EXTENSION`, also where
 the user has objects of the same names), and `upgrade` (0.1 to 0.2 against a new installation of 0.2)).
 `timepart_convert` needs `kingres_columnar` in the installation and preloaded
 (`kingres_timepart.conf` does it; for a build outside the tree, install
@@ -1272,8 +1300,12 @@ conversion), `008_convert_prepared.pl` (a prepared transaction that holds a
 row, a row through the parent, or a read, also across a restart and through
 the policy), `009_convert_ddl_race.pl` (a column added and filled and a unique
 index created, a column dropped, and the partition renamed, each while the
-conversion waits for its lock; the tablespace; the swap that gives way after the
-short wait and says why, to a reader and to a writer; the limit of the
+conversion waits for its lock; the name of the partition taken by another table
+while the conversion waits; the tablespace of the table and of its indexes; the
+swap that gives way after the short wait and says why, to a reader and to a
+writer, and the cap of 500 ms of that wait; a `GRANT`, a `REVOKE` and the
+rename, comment and storage parameters of an index, each committed while the
+swap waits (the conversion gives way and the change stands); the limit of the
 `REPEATABLE READ` snapshot).
 
 Build and test against a KingresDB installation, out of tree (install
