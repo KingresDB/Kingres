@@ -248,10 +248,11 @@ func TestSplitBucketOnACluster(t *testing.T) {
 		if task["state"] == "done" {
 			t.Fatalf("a cancelled split finished: %v", task)
 		}
-		bs := p10Buckets(t, l, "sp")
-		if len(bs) != 10 || bs[5]["state"] != "active" {
-			t.Fatalf("buckets after the cancel: %v", bs)
-		}
+		// the extension undoes the split in its own session once the gate is open: the task ends first
+		until(t, 2*time.Minute, "the cancelled split to be undone", func() bool {
+			bs := p10Buckets(t, l, "sp")
+			return len(bs) == 10 && bs[5]["state"] == "active"
+		})
 		for _, n := range c.Nodes {
 			if cnt, sum := p10Count(t, n, "sp"); cnt != rows+extra || sum != wantSum+extraSum {
 				t.Errorf("node %d after the cancel: %d rows (sum %d)", n.Index, cnt, sum)
@@ -304,6 +305,12 @@ func TestDrainOnACluster(t *testing.T) {
 	waitStandbys(t, c, 1)
 	l := c.Leader()
 	victim := c.Nodes[2]
+	// the standbys are in the topology before every one of them is registered in the sharding catalog
+	until(t, 2*time.Minute, "every standby to be registered in the catalog", func() bool {
+		var n int
+		err := l.ServicePG("rb").QueryRow(context.Background(), `SELECT count(*) FROM kingres.node WHERE role = 'standby' AND is_active`).Scan(&n)
+		return err == nil && n >= len(c.Nodes)
+	})
 	wantSum := int64(rows) * int64(rows+1) / 2
 	p10Cleanup(t, c, "3s")
 
