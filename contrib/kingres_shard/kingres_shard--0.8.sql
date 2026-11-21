@@ -11418,7 +11418,7 @@ $$;
 REVOKE ALL ON FUNCTION kingres.internal_check_layout() FROM PUBLIC;
 
 -- The bounds of every bucket partition on every node against the bucket map.
-CREATE FUNCTION kingres.internal_check_layout_partitions()
+CREATE FUNCTION kingres.internal_check_layout_partitions(p_skip int[] DEFAULT '{}')
     RETURNS TABLE (check_name text, node_id int, object text, detail text)
     LANGUAGE plpgsql
     SET search_path = pg_catalog, kingres, pg_temp
@@ -11434,7 +11434,8 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM kingres.dist_table d WHERE d.method OPERATOR(pg_catalog.=) 'hash') THEN
         RETURN;
     END IF;
-    FOR n IN SELECT nd.node_id AS id, nd.group_id AS grp FROM kingres.node nd WHERE nd.role OPERATOR(pg_catalog.=) 'primary' AND nd.is_active ORDER BY nd.node_id LOOP
+    FOR n IN SELECT nd.node_id AS id, nd.group_id AS grp FROM kingres.node nd WHERE nd.role OPERATOR(pg_catalog.=) 'primary' AND nd.is_active
+                AND NOT (nd.node_id OPERATOR(pg_catalog.=) ANY (p_skip)) ORDER BY nd.node_id LOOP
         BEGIN
             r := kingres.internal_node_exec(n.id,
                 'SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_array(d.relid::pg_catalog.regclass::pg_catalog.text, c.relname::pg_catalog.text, pg_catalog.pg_get_expr(c.relpartbound, c.oid))), ''[]''::pg_catalog.jsonb)::pg_catalog.text '
@@ -11462,20 +11463,32 @@ BEGIN
     END LOOP;
 END;
 $$;
-REVOKE ALL ON FUNCTION kingres.internal_check_layout_partitions() FROM PUBLIC;
+REVOKE ALL ON FUNCTION kingres.internal_check_layout_partitions(int[]) FROM PUBLIC;
 
 CREATE OR REPLACE FUNCTION kingres.check_cluster(p_prepared_older_than interval DEFAULT interval '5 minutes')
     RETURNS TABLE (check_name text, node_id int, object text, detail text)
     LANGUAGE plpgsql
     SET search_path = pg_catalog, kingres, pg_temp
     AS $$
+DECLARE
+    b      pg_catalog.record;
+    v_skip pg_catalog.int4[] := '{}';
 BEGIN
-    -- the base check counts the buckets of a group against its bucket_count; the layout check does it for groups with split buckets too
-    RETURN QUERY SELECT b.check_name, b.node_id, b.object, b.detail FROM kingres.internal_check_cluster_base(p_prepared_older_than) b
-                  WHERE b.check_name OPERATOR(pg_catalog.<>) 'bucket_map_incomplete';
+    -- the base check counts the buckets of a group against its bucket_count; the layout check does it for groups with split buckets too.
+    -- The checks of the layout and of the splits ask every node: they leave out a node that the base check found not answering (each call
+    -- to such a node costs a node_timeout, and check_cluster has a bound, README "Bounds").
+    FOR b IN SELECT x.check_name, x.node_id, x.object, x.detail FROM kingres.internal_check_cluster_base(p_prepared_older_than) x LOOP
+        IF b.check_name OPERATOR(pg_catalog.=) 'node_unreachable' AND b.node_id IS NOT NULL THEN
+            v_skip := v_skip OPERATOR(pg_catalog.||) b.node_id;
+        END IF;
+        IF b.check_name OPERATOR(pg_catalog.<>) 'bucket_map_incomplete' THEN
+            check_name := b.check_name; node_id := b.node_id; object := b.object; detail := b.detail;
+            RETURN NEXT;
+        END IF;
+    END LOOP;
     RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_layout() t;
-    RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_layout_partitions() t;
-    RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_splits() t;
+    RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_layout_partitions(v_skip) t;
+    RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_splits(v_skip) t;
     RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_table_operations() t;
     RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_partitions() t;
 END;
@@ -13281,7 +13294,7 @@ END;
 $$;
 
 -- check_cluster(): a split that is not alive and has not moved for twice the node timeout; a capture trigger or a child table of a split that is not running.
-CREATE FUNCTION kingres.internal_check_splits()
+CREATE FUNCTION kingres.internal_check_splits(p_skip int[] DEFAULT '{}')
     RETURNS TABLE (check_name text, node_id int, object text, detail text)
     LANGUAGE plpgsql
     SET search_path = pg_catalog, kingres, pg_temp
@@ -13308,7 +13321,8 @@ BEGIN
             RETURN NEXT;
         END IF;
     END LOOP;
-    FOR n IN SELECT nd.node_id AS id FROM kingres.node nd WHERE nd.role OPERATOR(pg_catalog.=) 'primary' AND nd.is_active ORDER BY nd.node_id LOOP
+    FOR n IN SELECT nd.node_id AS id FROM kingres.node nd WHERE nd.role OPERATOR(pg_catalog.=) 'primary' AND nd.is_active
+                AND NOT (nd.node_id OPERATOR(pg_catalog.=) ANY (p_skip)) ORDER BY nd.node_id LOOP
         BEGIN
             r := kingres.internal_node_exec(n.id,
                 'SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_array(k, nm)), ''[]''::pg_catalog.jsonb)::pg_catalog.text FROM ('
@@ -13342,7 +13356,7 @@ REVOKE ALL ON FUNCTION kingres.internal_split_inspect(int, int), kingres.interna
     kingres.internal_split_begin(int, int, int, text, bigint), kingres.internal_split_set(bigint, text, text, bigint), kingres.internal_split_finish(bigint),
     kingres.internal_split_fail(bigint, text, bool), kingres.internal_split_lock(bigint), kingres.internal_split_alive(bigint), kingres.internal_split_allowed(int),
     kingres.split_bucket(int, int, int, text), kingres.cancel_bucket_split(bigint), kingres.resume_bucket_splits(), kingres.cleanup_bucket_splits(bool),
-    kingres.internal_check_splits() FROM PUBLIC;
+    kingres.internal_check_splits(int[]) FROM PUBLIC;
 -- ===========================================================================
 -- END OF SECTION P10
 -- ===========================================================================
