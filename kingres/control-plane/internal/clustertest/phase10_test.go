@@ -250,10 +250,23 @@ func TestSplitBucketOnACluster(t *testing.T) {
 			t.Fatalf("a cancelled split finished: %v", task)
 		}
 		// the extension undoes the split in its own session once the gate is open: the task ends first
-		until(t, 2*time.Minute, "the cancelled split to be undone", func() bool {
+		for end := time.Now().Add(2 * time.Minute); ; time.Sleep(time.Second) {
 			bs := p10Buckets(t, l, "sp")
-			return len(bs) == 10 && bs[5]["state"] == "active"
-		})
+			if len(bs) == 10 && bs[5]["state"] == "active" {
+				break
+			}
+			if time.Now().After(end) {
+				var rec string
+				rows, _ := l.ServicePG("sp").Query(context.Background(),
+					"SELECT split_id || ' ' || bucket || ' ' || phase || ' ' || coalesce(detail, '') || ' cancel=' || cancel_requested FROM kingres.bucket_split ORDER BY split_id")
+				for rows != nil && rows.Next() {
+					var x string
+					_ = rows.Scan(&x)
+					rec += x + "; "
+				}
+				t.Fatalf("the cancelled split was not undone: %d buckets, bucket 5 %v; splits: %s task: %v "+"%s", len(bs), bs[5], rec, task, l.LogTail(2500))
+			}
+		}
 		for _, n := range c.Nodes {
 			if cnt, sum := p10Count(t, n, "sp"); cnt != rows+extra || sum != wantSum+extraSum {
 				t.Errorf("node %d after the cancel: %d rows (sum %d)", n.Index, cnt, sum)
