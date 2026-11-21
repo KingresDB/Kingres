@@ -254,6 +254,7 @@ tests += {
       't/173_extension_absent_cases.pl',
       't/174_rechecks_after_declare.pl',
       't/175_distribute_hostile_columns.pl',
+      't/176_extension_list_format.pl',
       't/185_undistribute.pl',
       't/186_alter.pl',
       't/187_online_undistribute.pl',

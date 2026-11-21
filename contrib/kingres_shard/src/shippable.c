@@ -119,6 +119,67 @@ kingres_shard_shippable_extension_known(const char *name)
 	return false;
 }
 
+/*
+ * The list of extensions that a marker and a probe carry is "name:version[,name:version...]", split at ',' and at ':'.  The format
+ * is exact only if no name and no version has either character, so a name or a version is made of letters, digits, '_', '.' and '-'
+ * and nothing else (review S13F-02).  The extensions of the compiled-in list have such names; an object of an extension whose
+ * name or version has another character is not shippable (the statement then reads the rows, as for any object that is not on the
+ * list), and a list that does not have the exact form is refused wherever it is split (kingres_shard_ext_list_check).
+ */
+bool
+kingres_shard_ext_token_ok(const char *s, size_t len)
+{
+	size_t		i;
+
+	if (len == 0)
+		return false;
+	for (i = 0; i < len; i++)
+	{
+		char		c = s[i];
+
+		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-'))
+			return false;
+	}
+	return true;
+}
+
+/* Is the list exactly "name:version" items joined by ','?  NULL (no extension) is. */
+bool
+kingres_shard_ext_list_valid(const char *list)
+{
+	const char *p = list;
+
+	if (list == NULL)
+		return true;
+	for (;;)
+	{
+		const char *colon = strchr(p, ':');
+		const char *comma = strchr(p, ',');
+		const char *end = comma != NULL ? comma : p + strlen(p);
+
+		if (colon == NULL || colon >= end)
+			return false;
+		if (!kingres_shard_ext_token_ok(p, (size_t) (colon - p)) ||
+			!kingres_shard_ext_token_ok(colon + 1, (size_t) (end - colon - 1)))
+			return false;
+		if (comma == NULL)
+			return true;
+		p = comma + 1;
+	}
+}
+
+/* The list of a marker or of a statement that is not of the exact form is refused before it is split. */
+void
+kingres_shard_ext_list_check(const char *list)
+{
+	if (!kingres_shard_ext_list_valid(list))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the list of extensions of a shipped statement is not of the form name:version[,name:version...]"),
+				 errdetail("Names and versions are made of letters, digits, '_', '.' and '-'; the list is \"%s\".", list),
+				 errhint("This is not a change of the bucket map: repeating the statement does not help.")));
+}
+
 /* The statement modes that carry the extensions they use in their marker allow them; the others never do. */
 static bool ship_allow_ext = false;
 static List *ship_used_ext = NIL;	/* of char *: "name:version" of every extension the walk used */
@@ -206,6 +267,9 @@ ext_object_ok(Oid classid, Oid objid)
 	version = isnull ? NULL : TextDatumGetCString(d);
 	ReleaseSysCache(etup);
 	if (version == NULL)
+		return false;
+	/* a name or a version that the format of the list cannot carry (S13F-02) */
+	if (!kingres_shard_ext_token_ok(extname, strlen(extname)) || !kingres_shard_ext_token_ok(version, strlen(version)))
 		return false;
 	for (i = 0; e->versions[i] != NULL; i++)
 		if (strcmp(e->versions[i], version) == 0)
