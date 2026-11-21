@@ -33,6 +33,7 @@
 #include "miscadmin.h"
 #include "nodes/value.h"
 #include "parser/parse_func.h"
+#include "utils/array.h"
 #include "utils/resowner.h"
 #include "storage/lmgr.h"
 #include "storage/proc.h"
@@ -830,6 +831,276 @@ copy_acls_to_node(KsConn *kc)
 	PQclear(kingres_shard_exec(kc, script.data));
 }
 
+/* How many statements a batch of schemas holds at most (a schema is never split: a single bigger schema is a batch of its own). */
+int			kingres_shard_add_node_batch_statements = 100;
+
+/*
+ * The errors that say a schema reads something that the new node does not have yet (a reference table, which is made in the transaction
+ * of the registration): the schema is made there, after them.
+ */
+static bool
+stage_error_is_dependency(int sqlstate)
+{
+	return sqlstate == ERRCODE_UNDEFINED_TABLE || sqlstate == ERRCODE_UNDEFINED_OBJECT ||
+		sqlstate == ERRCODE_INVALID_SCHEMA_NAME || sqlstate == ERRCODE_UNDEFINED_FUNCTION;
+}
+
+static void
+stage_exec_ok(PGconn *conn, const char *sql, const char *what)
+{
+	PGresult   *res = kingres_shard_bounded_exec(conn, sql, true);
+
+	if (res == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("the new node stopped answering while %s", what),
+				 errhint("Repeat add_node(): the schemas that are complete on the node are kept.")));
+	if (PQresultStatus(res) != PGRES_COMMAND_OK && PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		char	   *msg = pstrdup(PQresultErrorMessage(res));
+		int			state = kingres_shard_result_sqlstate(res);
+
+		PQclear(res);
+		ereport(ERROR,
+				(errcode(state != 0 ? state : ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("the new node refused a statement while %s", what),
+				 errdetail_internal("%s", kingres_shard_scrub_conn_error(msg)),
+				 errhint("Fix the cause and repeat add_node(): the schemas that are complete on the node are kept.")));
+	}
+	PQclear(res);
+}
+
+/*
+ * stage_schemas_on_node
+ *
+ * The distributed schemas of the cluster are made on the new node before it is registered, in transactions of their own, a batch of schemas
+ * each, so that no transaction holds more locks than kingres_shard.add_node_batch_statements allows (a transaction that made every schema
+ * ran out of lock table slots, max_locks_per_transaction, from about a thousand schemas on).  The node is not in the catalog yet, so no
+ * statement can reach what is half done; what a batch completed is in kingres.add_node_progress on the node, with the digest of the
+ * statements, so that a repeated call skips it and the registration (create_tables_on_node, the last transaction) checks that every schema
+ * is there and removes the rows.  A schema that cannot be made yet because it reads a reference table is returned in *late_scripts and made
+ * in the last transaction.  Returns the number of schemas that are complete on the node.
+ */
+static int
+stage_schemas_on_node(const char *host, int port, MemoryContext keepcxt, List **late_scripts, int *nlate)
+{
+	MemoryContext callercxt = CurrentMemoryContext;
+	List	   *names = NIL;
+	List	   *scripts = NIL;
+	List	   *digests = NIL;
+	List	   *weights = NIL;
+	ListCell   *l1;
+	ListCell   *l2;
+	ListCell   *l3;
+	ListCell   *l4;
+	uint64		i;
+	PGconn	   *conn;
+	char	   *err = NULL;
+	PGresult   *res;
+	HTAB	   *done;
+	HASHCTL		ctl;
+	int			staged = 0;
+	int			skipped = 0;
+	int			nbatches = 0;
+	int			weight = 0;
+	bool		open = false;
+
+	*late_scripts = NIL;
+	*nlate = 0;
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	spi_run("SELECT nsp::pg_catalog.text, script, digest, n FROM " KINGRES_SHARD_SCHEMA ".internal_add_node_schemas()",
+			SPI_OK_SELECT, 0, NULL, NULL);
+	for (i = 0; i < SPI_processed; i++)
+	{
+		MemoryContext old = MemoryContextSwitchTo(callercxt);
+		bool		isnull;
+
+		names = lappend(names, SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1));
+		scripts = lappend(scripts, SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2));
+		digests = lappend(digests, SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 3));
+		weights = lappend_int(weights, DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 4, &isnull)));
+		MemoryContextSwitchTo(old);
+	}
+	SPI_finish();
+	if (names == NIL)
+		return 0;
+
+	conn = kingres_shard_connect_control(host, port, &err);
+	if (conn == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("could not connect to the new node %s:%d to make the distributed schemas", host, port),
+				 errdetail_internal("%s", err ? err : "")));
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = NAMEDATALEN;
+	ctl.entrysize = NAMEDATALEN;
+	ctl.hcxt = callercxt;
+	done = hash_create("add_node staged schemas", 256, &ctl, HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
+
+	PG_TRY();
+	{
+		/* The extension is made in a transaction of its own: the batches need its table, and they commit before the registration. */
+		stage_exec_ok(conn, "CREATE EXTENSION IF NOT EXISTS kingres_shard", "making the extension");
+		res = kingres_shard_bounded_exec(conn,
+										 "SELECT (SELECT count(*) FROM " KINGRES_SHARD_SCHEMA ".local_node) + "
+										 "(SELECT count(*) FROM " KINGRES_SHARD_SCHEMA ".dist_table)", true);
+		if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) != 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_CONNECTION_FAILURE),
+					 errmsg("the new node %s:%d could not be asked what it holds", host, port),
+					 errhint("The extension on the node may be another version: run ALTER EXTENSION kingres_shard UPDATE there.")));
+		if (strcmp(PQgetvalue(res, 0, 0), "0") != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("node %s:%d already belongs to a cluster", host, port)));
+		PQclear(res);
+		res = kingres_shard_bounded_exec(conn, "SELECT nsp::pg_catalog.text, digest FROM " KINGRES_SHARD_SCHEMA ".add_node_progress", true);
+		if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("the new node %s:%d has no table " KINGRES_SHARD_SCHEMA ".add_node_progress", host, port),
+					 errhint("The node runs another version of kingres_shard: run ALTER EXTENSION kingres_shard UPDATE there, or DROP EXTENSION kingres_shard.")));
+		/*
+		 * What an earlier call made: kept when the schema is still a distributed schema with the same statements; a schema that went, or
+		 * that changed meanwhile, is dropped here (the progress row proves that this call made it) and made again below.
+		 */
+		{
+			HASHCTL		cctl;
+			HTAB	   *cur;
+
+			memset(&cctl, 0, sizeof(cctl));
+			cctl.keysize = NAMEDATALEN;
+			cctl.entrysize = NAMEDATALEN + 40;
+			cctl.hcxt = callercxt;
+			cur = hash_create("add_node current schemas", 256, &cctl, HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
+			forboth(l1, names, l3, digests)
+			{
+				bool		found;
+				char	   *e = hash_search(cur, lfirst(l1), HASH_ENTER, &found);
+
+				strlcpy(e + NAMEDATALEN, (char *) lfirst(l3), 40);
+			}
+			for (i = 0; i < (uint64) PQntuples(res); i++)
+			{
+				char	   *pn = PQgetvalue(res, (int) i, 0);
+				char	   *e = hash_search(cur, pn, HASH_FIND, NULL);
+
+				if (e != NULL && strcmp(e + NAMEDATALEN, PQgetvalue(res, (int) i, 1)) == 0)
+				{
+					bool		found;
+
+					hash_search(done, pn, HASH_ENTER, &found);
+				}
+				else
+				{
+					StringInfoData drop;
+
+					initStringInfo(&drop);
+					appendStringInfo(&drop, "DROP SCHEMA IF EXISTS %s CASCADE;\nDELETE FROM " KINGRES_SHARD_SCHEMA ".add_node_progress WHERE nsp OPERATOR(pg_catalog.=) %s",
+									 quote_identifier(pn), quote_literal_cstr(pn));
+					stage_exec_ok(conn, drop.data, "dropping a schema that changed since an earlier call");
+				}
+			}
+		}
+		PQclear(res);
+
+		forfour(l1, names, l2, scripts, l3, digests, l4, weights)
+		{
+			char	   *nm = (char *) lfirst(l1);
+			char	   *script = (char *) lfirst(l2);
+			char	   *digest = (char *) lfirst(l3);
+			int			w = lfirst_int(l4);
+			bool		have = hash_search(done, nm, HASH_FIND, NULL) != NULL;
+			StringInfoData sql;
+			int			sqlstate;
+
+			CHECK_FOR_INTERRUPTS();
+			if (have)
+			{
+				skipped++;
+				staged++;
+				continue;
+			}
+			if (open && weight + w > kingres_shard_add_node_batch_statements)
+			{
+				stage_exec_ok(conn, "COMMIT", "completing a batch of schemas");
+				kingres_shard_fault_point("add_node_batch_done");
+				open = false;
+				weight = 0;
+				nbatches++;
+			}
+			if (!open)
+			{
+				stage_exec_ok(conn, "BEGIN", "starting a batch of schemas");
+				open = true;
+			}
+			stage_exec_ok(conn, "SAVEPOINT ks_stage", "making a schema");
+			initStringInfo(&sql);
+			appendStringInfo(&sql, "%s;\nINSERT INTO " KINGRES_SHARD_SCHEMA ".add_node_progress (nsp, digest) VALUES (%s, %s)",
+							 script, quote_literal_cstr(nm), quote_literal_cstr(digest));
+			res = kingres_shard_bounded_exec(conn, sql.data, true);
+			if (res == NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_CONNECTION_FAILURE),
+						 errmsg("the new node stopped answering while it made the schema \"%s\"", nm),
+						 errhint("Repeat add_node(): the schemas that are complete on the node are kept.")));
+			if (PQresultStatus(res) == PGRES_COMMAND_OK || PQresultStatus(res) == PGRES_TUPLES_OK)
+			{
+				PQclear(res);
+				stage_exec_ok(conn, "RELEASE SAVEPOINT ks_stage", "making a schema");
+				weight += w;
+				staged++;
+				continue;
+			}
+			sqlstate = kingres_shard_result_sqlstate(res);
+			if (stage_error_is_dependency(sqlstate))
+			{
+				/* Not yet: it reads a table that the registration makes.  What the statements did is undone with the savepoint. */
+				PQclear(res);
+				stage_exec_ok(conn, "ROLLBACK TO SAVEPOINT ks_stage", "making a schema");
+				{
+					MemoryContext old = MemoryContextSwitchTo(keepcxt);
+
+					*late_scripts = lappend(*late_scripts, pstrdup(script));
+					MemoryContextSwitchTo(old);
+				}
+				(*nlate)++;
+				continue;
+			}
+			{
+				char	   *msg = pstrdup(PQresultErrorMessage(res));
+
+				PQclear(res);
+				ereport(ERROR,
+						(errcode(sqlstate != 0 ? sqlstate : ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("the new node refused a statement of the schema \"%s\"", nm),
+						 errdetail_internal("%s", kingres_shard_scrub_conn_error(msg)),
+						 errhint("Fix the cause (a role that the schema names may be missing on the node) and repeat add_node(): the schemas that are complete on the node are kept.")));
+			}
+		}
+		if (open)
+		{
+			stage_exec_ok(conn, "COMMIT", "completing a batch of schemas");
+			kingres_shard_fault_point("add_node_batch_done");
+			nbatches++;
+		}
+	}
+	PG_CATCH();
+	{
+		PQfinish(conn);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	PQfinish(conn);
+
+	ereport(NOTICE,
+			(errmsg("add_node: %d distributed schemas are on the node in %d batches (%d were made by an earlier call, %d are made in the last transaction)",
+					staged, nbatches, skipped, *nlate)));
+	return staged;
+}
+
 /*
  * create_tables_on_node
  *
@@ -839,7 +1110,7 @@ copy_acls_to_node(KsConn *kc)
  * are no partitions to create.
  */
 static void
-create_tables_on_node(KsConn *kc)
+create_tables_on_node(KsConn *kc, List *late_scripts)
 {
 	MemoryContext callercxt = CurrentMemoryContext;
 	List	   *relids = NIL;
@@ -852,7 +1123,7 @@ create_tables_on_node(KsConn *kc)
 		elog(ERROR, "SPI_connect failed");
 	/* Reference tables have no column: hash tables first, in colocation order. */
 	spi_run("SELECT relid::pg_catalog.oid, dist_column::pg_catalog.text FROM "
-			KINGRES_SHARD_SCHEMA ".dist_table ORDER BY colocation_id NULLS LAST, relid::pg_catalog.oid",
+			KINGRES_SHARD_SCHEMA ".dist_table WHERE method OPERATOR(pg_catalog.<>) 'schema' ORDER BY colocation_id NULLS LAST, relid::pg_catalog.oid",
 			SPI_OK_SELECT, 0, NULL, NULL);
 	for (i = 0; i < SPI_processed; i++)
 	{
@@ -894,6 +1165,12 @@ create_tables_on_node(KsConn *kc)
 			PQclear(res);
 		}
 	}
+
+	/*
+	 * The schemas that could not be made before (they read a reference table), now that the reference tables exist in this transaction.
+	 */
+	foreach(lc1, late_scripts)
+		PQclear(kingres_shard_exec(kc, (char *) lfirst(lc1)));
 
 	/* Owners were set with the tables; the privileges follow now that every table exists. */
 	copy_acls_to_node(kc);
@@ -1091,6 +1368,10 @@ kingres_add_node_body(PG_FUNCTION_ARGS)
 	char	   *role;
 	bool		is_primary;
 	int			node_id;
+	MemoryContext fcxt = CurrentMemoryContext;	/* the context of the call: what the staging returns must outlive the SPI connection of this function */
+	int			staged_schemas = 0;
+	List	   *late_scripts = NIL;
+	int			nlate = 0;
 	Oid			argtypes[5];
 	Datum		values[5];
 	KsConn	   *kc = NULL;
@@ -1198,6 +1479,8 @@ kingres_add_node_body(PG_FUNCTION_ARGS)
 	if (is_primary)
 	{
 		record_pending_node(host, port, 0);
+		staged_schemas = stage_schemas_on_node(host, port, fcxt, &late_scripts, &nlate);
+		kingres_shard_fault_point("add_node_staged");
 		kc = kingres_shard_get_conn(host, port, false, NULL);
 		kingres_shard_begin_write_xact(kc);
 		check_acl_roles_on_node(kc, host, port);
@@ -1302,7 +1585,29 @@ kingres_add_node_body(PG_FUNCTION_ARGS)
 
 	if (is_primary)
 	{
-		create_tables_on_node(kc);
+		if (staged_schemas > 0)
+		{
+			/*
+			 * Every schema that the batches made is on the node, or the node is not registered (a schema that went missing after its batch, or
+			 * a progress that does not match what is there).
+			 */
+			res = kingres_shard_exec(kc,
+									 "SELECT (SELECT count(*) FROM " KINGRES_SHARD_SCHEMA ".add_node_progress), "
+									 "(SELECT count(*) FROM pg_catalog.pg_namespace n JOIN " KINGRES_SHARD_SCHEMA ".add_node_progress p ON p.nsp OPERATOR(pg_catalog.=) n.nspname)");
+			if (PQntuples(res) != 1 || atoi(PQgetvalue(res, 0, 0)) != staged_schemas ||
+				atoi(PQgetvalue(res, 0, 1)) != staged_schemas)
+			{
+				PQclear(res);
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("the new node %s:%d does not hold every distributed schema of the cluster", host, port),
+						 errhint("Repeat add_node(): the batches that are complete are kept.")));
+			}
+			PQclear(res);
+		}
+		create_tables_on_node(kc, late_scripts);
+		if (staged_schemas > 0)
+			PQclear(kingres_shard_exec(kc, "DELETE FROM " KINGRES_SHARD_SCHEMA ".add_node_progress"));
 		snprintf(idbuf, sizeof(idbuf), "%d", node_id);
 		params[0] = idbuf;
 		res = kingres_shard_exec_params(kc,

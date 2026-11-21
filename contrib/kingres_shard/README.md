@@ -504,7 +504,7 @@ schema through `"$user"`; qualify names or fix `search_path`.
 |---|---|
 | `kingres.version() returns text` | The KingresDB product version. |
 | `kingres.init_cluster(host text, port int)` | Register this node as node 1 of group 0. |
-| `kingres.add_node(host text, port int, group_id int default null, role text default 'primary') returns int` | Map group primary only. Registers a node (a new group when `group_id` is null), creates the extension there, creates the distributed and reference tables (with the rows of the reference tables and the foreign keys), sets its `local_node`, and copies the catalog, all in one two-phase transaction. A `standby` is only registered (it must name the group of its primary; when it can be reached it must be in recovery, of the same major and a copy of that primary). |
+| `kingres.add_node(host text, port int, group_id int default null, role text default 'primary') returns int` | Map group primary only. Registers a node (a new group when `group_id` is null), creates the extension there, makes the distributed schemas in batches (see "Step 12"), creates the distributed and reference tables (with the rows of the reference tables and the foreign keys), sets its `local_node`, and copies the catalog, all in one two-phase transaction. A `standby` is only registered (it must name the group of its primary; when it can be reached it must be in recovery, of the same major and a copy of that primary). |
 | `kingres.remove_node(node_id int)` | Unregister a node whose group owns no buckets (a standby: whatever its group owns; a primary that has standbys: not before them); its catalog is cleared if reachable. |
 | `kingres.promote_node(node_id int) returns jsonb` | Superuser. Makes a promoted standby the primary of its group and the former primary a standby, in one two-phase transaction; raises the map version and the catalog term; resumable; skips the nodes it cannot reach and lists them. Refuses, changing nothing, when the node that commits cannot get its synchronous standbys to confirm. Answers `{"status": "promoted"|"completed"|"already", "term", "unreached"}`. On the map group primary, for group 0 on the promoted node itself. See "High availability". |
 | `kingres.catalog_status` (view) | The catalog term of this node, whether it has been superseded as the map group primary, and its map version. For superusers; exists on every node. |
@@ -2042,6 +2042,16 @@ groups whose rows it wrote in `colocation`, `bucket_map` or `dist_schema`), not 
 `TRUNCATE` and a change of `dist_partition` still invalidate every one.  `kingres_shard.catalog_incremental = off` is the fallback with the old behaviour (the
 whole suite also runs with it, `KS_CATALOG_FULL=1`).  `kingres.internal_catalog_stats()` reports, for the backend, the loads, the lazy lookups and the
 invalidations sent (the tests read it).
+
+**Step 12: `add_node` in batches of schemas.**  The distributed schemas of the cluster are made on the new node before it is registered, in transactions of their own, each at
+most `kingres_shard.add_node_batch_statements` statements (default 100; a schema is never split, so one schema bigger than that is a batch alone), so the locks of one transaction
+stay bounded however many schemas the cluster has (a single transaction for all of them ran out of `max_locks_per_transaction` slots at about a thousand schemas).  What a batch
+completed is recorded on the new node in `kingres.add_node_progress` (the schema and the digest of the statements that made it): a call that is repeated after a failure keeps the
+schemas that are done, drops and makes again a schema that changed or went in the meantime, and goes on with the rest; the call says what it kept (a NOTICE).  The node is registered
+only by the last transaction, which first checks that every schema the batches made is on the node and removes the progress rows, so nothing is routed to the node before it is
+complete, and a failure leaves nothing that the nodes of the cluster can see (the extension and the finished batches stay on the new node, which belongs to no cluster).  A schema that
+reads a reference table (a foreign key to it, a view over it) cannot be made before the reference tables are, so it is made in the last transaction: many of those would meet the lock limit
+again.  The tables of a distributed schema are empty shells on the new node: add_node no longer copies them as if they were reference tables.
 
 
 ## Limitations in phase 2a

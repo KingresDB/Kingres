@@ -67,6 +67,7 @@ PG_FUNCTION_INFO_V1(kingres_internal_schema_delta);
 
 /* kingres_shard.max_distributed_schemas, kingres_shard.schema_placement_group, kingres_shard.distribute_new_schemas */
 int			kingres_shard_max_distributed_schemas = 10000;
+extern int	kingres_shard_add_node_batch_statements;
 int			kingres_shard_schema_placement_group = -1;
 bool		kingres_shard_enable_schema_routing = true;
 bool		kingres_shard_shipped_scope = false;
@@ -82,6 +83,15 @@ static const struct config_enum_entry distribute_new_schemas_options[] = {
 void
 kingres_shard_schema_ddl_init(void)
 {
+	DefineCustomIntVariable("kingres_shard.add_node_batch_statements",
+							"How many statements one transaction of add_node() runs on the new node when it makes the distributed schemas.",
+							"The locks of a transaction grow with its statements; a batch ends before it would pass this number (a schema is never split).",
+							&kingres_shard_add_node_batch_statements,
+							100, 1, 100000,
+							PGC_SUSET,
+							0,
+							NULL, NULL, NULL);
+
 	DefineCustomBoolVariable("kingres_shard.catalog_incremental",
 							 "Invalidate only the distributed tables that a catalog change touches.",
 							 "Off: every change of the catalog invalidates every distributed table (the fallback).",

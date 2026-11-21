@@ -16223,6 +16223,49 @@ REVOKE ALL ON FUNCTION kingres.internal_catalog_stats() FROM PUBLIC;
 -- PHASE 11, step 12, the incremental cache                                   [end]
 -- =========================================================================
 
+-- =========================================================================
+-- PHASE 11 (distributed schemas), step 12: add_node in batches of schemas   [begin]
+--
+-- add_node() makes the distributed schemas of the cluster on the new node in transactions of their own, a batch of schemas each
+-- (kingres_shard.add_node_batch_statements), so that the locks of one transaction stay bounded however many schemas the cluster has.  The
+-- node is registered only by the last transaction, so nothing routes to a schema of the node before every one is complete.  This table, on
+-- the new node, records what a batch finished (the schema and the digest of the statements that made it): a call that is repeated after a
+-- failure skips the schemas that are done, and the last transaction removes the rows.  The table is node-local and is not in the catalog
+-- snapshot.
+-- =========================================================================
+
+CREATE TABLE kingres.add_node_progress (
+    nsp       name        NOT NULL,
+    digest    text        NOT NULL,
+    staged_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+    CONSTRAINT add_node_progress_pkey PRIMARY KEY (nsp)
+);
+
+COMMENT ON TABLE kingres.add_node_progress IS
+    'On a node that add_node() is filling: the distributed schemas whose batch is complete (node-local, removed when the node is registered)';
+REVOKE ALL ON TABLE kingres.add_node_progress FROM PUBLIC;
+
+-- The schemas to make on a new node, with the statements and their digest, in one pass over the catalog (called by add_node on the map group primary).
+CREATE FUNCTION kingres.internal_add_node_schemas()
+    RETURNS TABLE (nsp name, script text, digest text, n int)
+    LANGUAGE sql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+SELECT ns.nspname, y.script, pg_catalog.md5(y.script), (pg_catalog.cardinality(st.a) OPERATOR(pg_catalog.+) 1)::pg_catalog.int4
+  FROM kingres.dist_schema d
+  JOIN pg_catalog.pg_namespace ns ON ns.oid OPERATOR(pg_catalog.=) d.nsp::pg_catalog.oid
+  CROSS JOIN LATERAL (SELECT kingres.internal_schema_structure(d.nsp)) st(a)
+  CROSS JOIN LATERAL (SELECT pg_catalog.format('CREATE SCHEMA %I AUTHORIZATION %I', ns.nspname, pg_catalog.pg_get_userbyid(ns.nspowner))
+                             OPERATOR(pg_catalog.||) E';\n' OPERATOR(pg_catalog.||) pg_catalog.array_to_string(st.a, E';\n')) y(script)
+ ORDER BY ns.nspname;
+$$;
+
+REVOKE ALL ON FUNCTION kingres.internal_add_node_schemas() FROM PUBLIC;
+
+-- =========================================================================
+-- PHASE 11, step 12, add_node                                                [end]
+-- =========================================================================
+
 -- ===========================================================================
 -- END OF SECTION P11
 -- ===========================================================================

@@ -319,6 +319,7 @@ tests += {
       't/245_schema_scale_cluster.pl',
       't/246_schema_second_review_cluster.pl',
       't/247_catalog_incremental_cluster.pl',
+      't/248_add_node_batches_cluster.pl',
     ],
   },
 }
