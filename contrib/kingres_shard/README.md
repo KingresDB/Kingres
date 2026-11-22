@@ -8,7 +8,7 @@ node as reference tables, and makes every statement correct on a cluster with
 several groups: a statement that touches one key goes to the group that owns
 it, and a statement that spans groups is answered by reading the other groups.
 
-This is version 0.7 (0.7 is the table lifecycle of phase 9 on top of 0.6; 0.6 is the version of phase 2b; 0.3 added moving buckets, phase 2a made every statement correct, 0.4 is the fix round of the reviews of 0.2 and 0.3, 0.5 is high availability: standby nodes, `promote_node`, prepared transactions across a failover, distributed deadlock detection and coordinated restore points; see "High availability" below; 0.6 is phase 2b and adds no SQL object, see "Installation" for why the version is raised). Phase 2b makes the common
+This is version 0.8 (0.8 is the bucket layout of phase 10, see "The bucket layout (version 0.8)", and the schemas of phase 11; 0.7 is the table lifecycle of phase 9 on top of 0.6; 0.6 is the version of phase 2b; 0.3 added moving buckets, phase 2a made every statement correct, 0.4 is the fix round of the reviews of 0.2 and 0.3, 0.5 is high availability: standby nodes, `promote_node`, prepared transactions across a failover, distributed deadlock detection and coordinated restore points; see "High availability" below; 0.6 is phase 2b and adds no SQL object, see "Installation" for why the version is raised). Phase 2b makes the common
 statements fast. The designs are in
 [`kingres/docs/design/shard-mvp.md`](../../kingres/docs/design/shard-mvp.md)
 (phase 1) and
@@ -204,10 +204,10 @@ rest of the phase needs (see "The table lifecycle (version 0.7)"). Increment 9.4
   database, so every node needs a role of that name, and `pg_hba.conf` (and the
   password file, if used) must let the nodes in. Credentials are never stored
   in the catalog. SSL options are set with `kingres_shard.node_conninfo`.
-- `CREATE EXTENSION kingres_shard` installs version 0.7 (the `default_version` of the control file);
-  `ALTER EXTENSION kingres_shard UPDATE` upgrades a 0.1, 0.2, 0.3, 0.4, 0.5 or 0.6 installation
-  (the chain is 0.1 -> 0.2 -> 0.3 -> 0.4 -> 0.5 -> 0.6 -> 0.7, and the catalog is identical to a
-  fresh 0.7 one; the `upgrade` regression test compares the two). Transactions that 0.4
+- `CREATE EXTENSION kingres_shard` installs version 0.8 (the `default_version` of the control file);
+  `ALTER EXTENSION kingres_shard UPDATE` upgrades a 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 or 0.7 installation
+  (the chain is 0.1 -> 0.2 -> 0.3 -> 0.4 -> 0.5 -> 0.6 -> 0.7 -> 0.8, and the catalog is identical to a
+  fresh 0.8 one; the `upgrade` regression test compares the two). Transactions that 0.4
   prepared and that are pending at the upgrade are resolved in the old identifier format
   (see "Prepared transactions across a failover").
 - **Version 0.6 adds no table, view, function or column.** `kingres_shard--0.5--0.6.sql` holds
@@ -295,7 +295,7 @@ PROVE_TESTS=t/013_dist_scan.pl kingres/dev/ext.sh kingres_shard tap
   second, fictitious shard group; `routing_decisions`: collations, functions
   and other nested contexts, forwarded sessions, decided with `EXPLAIN`;
   `reference`: reference tables on one node; `upgrade`: `ALTER EXTENSION ...
-  UPDATE` from 0.1, 0.2, 0.3, 0.4, 0.5 and 0.6 against a fresh 0.7 install; the same on both majors:
+  UPDATE` from 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 and 0.7 against a fresh 0.8 install; the same on both majors:
   the script of 0.3 names a column of `pg_stat_subscription_stats` that PostgreSQL 19
   renamed, so on 19 it creates `kingres.internal_move_subscription_status()` with its
   body check off and `ALTER EXTENSION ... UPDATE` to 0.4 replaces it with a body that
@@ -503,7 +503,7 @@ schema through `"$user"`; qualify names or fix `search_path`.
 |---|---|
 | `kingres.version() returns text` | The KingresDB product version. |
 | `kingres.init_cluster(host text, port int)` | Register this node as node 1 of group 0. |
-| `kingres.add_node(host text, port int, group_id int default null, role text default 'primary') returns int` | Map group primary only. Registers a node (a new group when `group_id` is null), creates the extension there, creates the distributed and reference tables (with the rows of the reference tables and the foreign keys), sets its `local_node`, and copies the catalog, all in one two-phase transaction. A `standby` is only registered (it must name the group of its primary; when it can be reached it must be in recovery, of the same major and a copy of that primary). |
+| `kingres.add_node(host text, port int, group_id int default null, role text default 'primary') returns int` | Map group primary only. Registers a node (a new group when `group_id` is null), creates the extension there, makes the distributed schemas in batches (see "Step 12"), creates the distributed and reference tables (with the rows of the reference tables and the foreign keys), sets its `local_node`, and copies the catalog, all in one two-phase transaction. A `standby` is only registered (it must name the group of its primary; when it can be reached it must be in recovery, of the same major and a copy of that primary). |
 | `kingres.remove_node(node_id int)` | Unregister a node whose group owns no buckets (a standby: whatever its group owns; a primary that has standbys: not before them); its catalog is cleared if reachable. |
 | `kingres.promote_node(node_id int) returns jsonb` | Superuser. Makes a promoted standby the primary of its group and the former primary a standby, in one two-phase transaction; raises the map version and the catalog term; resumable; skips the nodes it cannot reach and lists them. Refuses, changing nothing, when the node that commits cannot get its synchronous standbys to confirm. Answers `{"status": "promoted"|"completed"|"already", "term", "unreached"}`. On the map group primary, for group 0 on the promoted node itself. See "High availability". |
 | `kingres.catalog_status` (view) | The catalog term of this node, whether it has been superseded as the map group primary, and its map version. For superusers; exists on every node. |
@@ -1883,6 +1883,224 @@ code allows, so any user may set it.  Comparing `kingres_sketch.self_test()` and
 query and of a partial aggregation only; the scan, the writes and the colocated `INSERT ... SELECT` never ship them.
 
 
+## Distributed schemas (phase 11, version 0.8)
+
+Design: [`shard-phase11.md`](../../kingres/docs/design/shard-phase11.md).  A **distributed schema** is a schema whose tables all live
+in one shard group (one tenant, or one microservice, per schema).  The design is built in increments; this is what exists so far.
+
+**Increment 1: the catalog, the views and the inventory.**  No statement is routed by schema and no schema is made distributed by the
+product yet: these are the objects the later increments use, tested with rows made by hand.
+
+- `kingres.colocation.kind` is `hash` (the buckets of hash-distributed tables) or `schema` (one bucket: the one group that holds a distributed
+  schema; `dist_column_type` is then null and `bucket_count` is 1).  `kingres.dist_table.method` gains `schema` (a table of a distributed
+  schema: no distribution column, the colocation group of the schema).
+- `kingres.dist_schema`: one row per distributed schema (`nsp` as a node-local `regnamespace`, the colocation group, `ship_functions`).
+  The catalog snapshot carries it by schema name, so a node that is given a snapshot must have the schema (an error names it).
+- `kingres.sharding_settings`: one row, the `mode` of the database (`row`, the default and the mode of every database before 0.8; `schema`;
+  `both`) and `distribute_new_schemas`.  `kingres.set_sharding_mode(mode, distribute_new_schemas)` changes it atomically (map group primary,
+  superuser): `row` to `both` and `schema` to `both` always; `both` or `schema` to `row` while a distributed schema exists, and `both` or `row`
+  to `schema` while a hash-distributed table exists, are refused with the schemas or tables named; `distribute_new_schemas` needs `schema` or `both`.
+- The delta functions (node-local, superuser, the same text on every node in one transaction in the later increments):
+  `internal_register_schema`, `internal_register_schema_table`, `internal_unregister_schema_table`, `internal_unregister_schema`,
+  `internal_set_schema_group`.  Dropping a registered schema forgets its rows (`kingres.forget_dropped_tables`).
+- `kingres.schemas`: one row per distributed schema with its owner, group and node, state, number of tables, size (known on the node of the owner
+  group only) and the target group of a running move.  `kingres.buckets` shows a schema table with bucket 0 and no partition.
+- `kingres.schema_inventory(schema)`: every object of the schema with `supported` and the reason when it is not (a hash or reference
+  table, an unlogged table, a materialized view, a rule, row-level security, extended statistics, a publication, an aggregate, a range type, a foreign key or an
+  inheritance across the border of the schema, a view that reads a table of another schema that is not a reference table, a `kingres_ledger` table, and a
+  system or already distributed schema).  It reads the catalog only and any role may call it.
+
+The SQL of phase 11 is a marked section ("PHASE 11") at the end of `kingres_shard--0.7--0.8.sql` and `kingres_shard--0.8.sql`.  The version handshake
+of `internal_check_node_versions()` asks for 0.8.
+
+**Increment 2: reading a table of a distributed schema that another group holds, and the defence against reading the empty copy.**  The tables
+of a distributed schema exist on every node; the rows are on the one node (shard group) that holds the schema, the owner, and the copy on every
+other node is an empty "shell".  The catalog cache keeps these tables apart from the hash-distributed ones (`schema_tables`), so no code written
+for hash tables sees them.  Still no statement is routed whole and no schema is made distributed by the product: the rows of `dist_schema`
+and `dist_table` are made by hand with the delta functions, as the tests do.
+
+- A `SELECT` (or a read inside any statement) that names a shell is planned with the distributed scan in its single-source form: no local part,
+  one fragment `SELECT <columns> FROM <table> AS ks_t WHERE <shippable restrictions>` to the owner, the restrictions applied again here, the
+  placement checked before and after the cursor is declared.  Joins with other schemas, with local tables, with hash and reference tables,
+  subqueries, CTEs, aggregates, windows, parameters and generic plans are planned by PostgreSQL above the scan as for any scan.  On the
+  owner the table is read by the planner of PostgreSQL alone.
+- A write whose target is a shell is refused ("is not supported from shard group N yet", with the node to run it on in the hint); so are
+  `COPY` of the relation (`COPY t TO` would answer with no rows, `COPY t FROM` would write the empty copy), `FOR UPDATE`, and a write of a hash-distributed table
+  that reads a shell.  `COPY (SELECT ...) TO` works, and a read of a shell into a local table (`CREATE TABLE AS`, `INSERT ... SELECT`) works.  The same limit as for a hash
+  table holds: an `UPDATE` or `DELETE` that reads a shell in `FROM`, `USING` or a semi join needs the row identifier of the table it does not modify and is refused.
+- The end-of-planning check: after a statement has been planned, no scan of the plan may read a shell (a plan that does is `ERROR: internal error: a plan reads the local copy of
+  "s.t", which this node does not own`, SQLSTATE `XX000`).  The paths the routing cannot see, such as a SQL function that the planner expands into the statement
+  when `kingres_shard.enable_distributed_scan` is off, end here and never in an empty answer.
+- A session that another node opened (a forwarded session) that names a table of a distributed schema which this group does not hold gets the retryable
+  error `KS001` ("this node does not hold table ...").
+
+**Increment 3: DDL on a distributed schema, `distribute_schema` of an empty schema, `CREATE SCHEMA` that distributes.**
+
+- `kingres.distribute_schema(nsp regnamespace, group_id int default null) returns int` (superuser, map group primary, read committed, mode `schema`
+  or `both`): the schema must exist and hold no object; it is created on every other node with its owner and registered everywhere in the same
+  two-phase transaction.  The group is the one with the fewest distributed schemas among the groups whose primary is active and should have shards (the
+  lowest group on a tie), the one named, or the one of `kingres_shard.schema_placement_group` (superuser, session).  A system schema, `public`, the schema of an
+  extension and a schema that is already distributed are refused; a schema that holds objects is refused until the conversion of a later increment.
+- A statement whose object is in a distributed schema is run on the map group primary and then on every other node in the same two-phase transaction, as
+  the DDL on a hash-distributed table is: `CREATE`/`ALTER`/`DROP TABLE` (also partitioned tables and `PARTITION OF`), indexes (`CONCURRENTLY` is
+  refused), views, sequences, functions and procedures, enum, composite and domain types, `COMMENT`, `GRANT`/`REVOKE` (also `ON ALL TABLES IN SCHEMA`
+  and `ALTER DEFAULT PRIVILEGES IN SCHEMA`), triggers, `TRUNCATE`, renames and `OWNER TO`.  Every table the statement makes is registered as a schema table on every
+  node (`kingres.internal_schema_delta`, a node-local step that runs with the rights of the bootstrap superuser; the caller is an ordinary role).  After a
+  `CREATE`, `ALTER` or `CREATE INDEX` on a table the map group primary asks every node for the structure of the table in the same transaction
+  (`kingres.internal_table_structure`, `internal_table_fingerprint`) and the whole statement is rolled back when one differs.
+- Refused in a distributed schema, with `<statement> is not supported in a distributed schema yet`: `CREATE MATERIALIZED VIEW`, `CREATE TABLE AS`, `SELECT INTO`, rules,
+  policies and row-level security, extended statistics, foreign tables, range types, aggregates and operators and the other `CREATE` forms of `DefineStmt`,
+  `TRUNCATE ... CASCADE`, `ALTER ... SET SCHEMA` into or out of a distributed schema, a statement that names a distributed schema and another schema, a foreign key from a table of a
+  distributed schema to anything but the same schema or a reference table, a foreign key from outside to a table of a distributed schema, and a partition or
+  parent in another schema.  A statement that is none of these kinds is run on this node only, as before.
+- `CREATE SCHEMA` in a database that distributes new schemas (`kingres.set_sharding_mode(mode, true)`, or `kingres_shard.distribute_new_schemas = on` for the session of a
+  superuser; an ordinary role cannot opt out) creates the schema on every node and registers it, on the map group primary.  `CREATE SCHEMA ... CREATE TABLE ...`
+  (elements) is refused there.  The limit `kingres_shard.max_distributed_schemas` (default 10000, a guess) bounds the number of schemas.
+- `create_distributed_table` is refused in the mode `schema` and for a table of a distributed schema; `create_reference_table` is refused for a table of a distributed schema and
+  stays allowed in the mode `schema`.
+
+**Increment 4: path S, the statement that the owner runs whole.**
+
+- A statement (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`, with subqueries, CTEs including those that write, windows, aggregates, joins, set operations, `FOR UPDATE`,
+  `ON CONFLICT` and `RETURNING`) whose tables are all tables of distributed schemas held by **one** other shard group, or reference tables that it only reads, is
+  deparsed and sent whole to the primary of that group, which plans and runs it with its own statistics and indexes (`Kingres Remote Statement` in `EXPLAIN`).
+  The decision does not depend on a key, so a generic plan is routed too.  The answer of a statement that is shipped is the answer of the same statement on the owner.
+- The sequences of a schema are the owner's: `nextval`, `currval` and `setval` with a constant sequence name count as the schema, so `SELECT nextval('s.seq')` on another
+  node is shipped, and the default of a `serial` column is evaluated by the owner.  `lastval()`, a sequence given by an expression and a sequence read as a table are not
+  shipped (a statement that needs one of them together with a table of another kind is refused with the reason).
+- A function, operator or aggregate that is not built in makes the statement stay with the distributed scan (the function is then evaluated on this node) unless the schema has
+  `ship_functions` (`kingres.alter_distributed_schema(nsp, ship_functions)`, superuser, map group primary; the catalog goes to every node).  A write that cannot be shipped
+  is refused and the detail names the reason (a local or hash-distributed table, two owners, a function that is not shipped, a write to a reference table).
+- `kingres_shard.enable_schema_routing` (default on, any role): off, a statement on a distributed schema is never shipped whole, a read is planned with the
+  distributed scan and a write to a schema of another group is refused.  The tests compare the answers of the two paths (ADR 0022).
+- A scrollable cursor, and everything that path S does not take, is answered by the scan; the reads that mix schemas of two owners, local tables, hash tables or
+  reference tables that are written are read through the scan, one fragment per schema.
+**Increment 5: `kingres.move_schema(nsp, target_group)`** (superuser, map group primary; `move_bucket(colocation_id, 0, target)` of the schema group is the same move).  A distributed
+schema moves like a bucket: the same record (`kingres.bucket_move`), phases, replication and switch, except that the tables stay where they are.  The target
+has the tables, empty (the move checks that, and that every table has a primary key or a full replica identity and is logged); a publication of the tables that
+hold rows and the marker table, a subscription that copies into the existing tables, the catch-up, then the switch: the tables are locked in SHARE on the source (writers wait, readers go on,
+bounded attempts), a marker proves the copy complete, the state of the sequences is read on the source and set on the target in the switch's transaction, and the owner
+and the placement epoch change in the two-phase transaction.  Nothing is attached or detached.  A writer that meets the switch gets `KS001` and repeats.  The old copy is emptied by
+the cleaning phase after `move_cleanup_delay` (`cleanup_moved_buckets(true)` at once).  A move that fails before the switch is undone (the shells of the target are emptied
+again), resume and cancel work as for a bucket.  A schema without a table is not moved by a copy.  A plan of buckets (`plan_rebalance`, `rebalance_plan`) does not move a schema
+yet; the bucket of a schema counts in the load of its group.
+
+**Increment 6: a schema with data becomes distributed, `kingres.undistribute_schema(nsp)`, several schemas on one group.**  `kingres.distribute_schema(nsp, group_id)` also takes a schema that already
+has objects and rows (superuser, map group primary, READ COMMITTED).  The node that runs it keeps the rows and its group becomes the owner; a `group_id` of another group is refused while a table holds a row
+(the hint says: distribute in place, then `move_schema`), and any group is allowed while no table holds a row (the tables of this node become shells).  `kingres.schema_inventory(nsp)` is consulted first:
+what the structure generator does not make (a materialized view, a foreign table, a rule, row-level security, extended statistics, an aggregate, a range or base type, an unlogged table, a publication, an
+operator, a collation, an operator class or family, a text search object, a conversion, table inheritance outside partitioning) is refused with the object and the reason.  The tables are locked in
+SHARE ROW EXCLUSIVE (writers wait, readers go on) until the conversion commits.  `kingres.internal_schema_structure(nsp)` makes the statements of the structure: types (enum, domain, composite), sequences, functions
+that do not name a table's row type (with `check_function_bodies` off), tables with columns, identity and generated columns, defaults, keys, checks, indexes and storage options (the generator of the rebuild),
+partitioned tables and their partitions, foreign keys, views (with their options), the functions that return a table's row type, triggers (and their enabled state), the replica identity, owners, privileges
+(schema, type, sequence, function, table, view; the grantor's own role when it is not the owner) and comments.  Every other node runs them in one two-phase transaction with the creation of the schema, the
+registration of the schema and of every table, and the fingerprint of every table is compared with the owner's down the same connection: a structure that the statements did not reproduce (for example an index of a
+partition that has a name of its own) rolls the whole conversion back.  A node that cannot run a statement (a role that is missing there) rolls it back too; nothing is left on any node.  Default privileges
+(`ALTER DEFAULT PRIVILEGES`), event triggers and a column-level comment of a view are not carried.
+
+`kingres.undistribute_schema(nsp)` (superuser, map group primary) is the way back: the shells on every other node must be empty (a row in one is named and refuses, the hint says how it can happen) and no
+move of the schema may be running; the owner keeps its schema and its rows as a local schema, every other node drops its shells (`DROP SCHEMA ... CASCADE` with the routing off: nothing is propagated) and every node
+forgets the schema, its tables, its bucket and its colocation group, in one two-phase transaction.
+
+Several schemas may be held by one group (`schema_placement_group`, or the least loaded group at the time): a statement on tables of schemas of one owner is one closed statement on the owner, a read that mixes
+owners is read through the scan, a write that mixes owners is refused; a prepared statement is planned again when one of its schemas moves; a node with a stale map gets `KS001`.  Two details that the tests found
+and that changed other code: path S now sends `OVERRIDING SYSTEM VALUE` for an INSERT into a table with a GENERATED ALWAYS identity column (the deparsed text carries the default as `nextval()`, which the owner took for a value
+the user wrote); `ALTER TYPE ... OWNER TO` was classified through the wrong node type (an assertion failure in a build with assertions); the catalog document no longer holds the creation time of a schema (every node stamps its own,
+so the catalogs of the nodes looked different to `check_cluster`).
+
+**Step 8: `ship_functions`.**  A statement that calls functions is run whole on the owner only when every function it calls is a function of a distributed schema whose `ship_functions` flag is on
+(`kingres.alter_distributed_schema(nsp, ship_functions => true)`); a function of `public`, of a local schema or of an extension exists where it was made and is never shipped, and such a statement is
+planned at the origin (a write is refused, with the reason).  The owner runs a shipped statement that calls functions with the `search_path` of the session that issued it (pg_catalog first, then the
+schemas of the path that exist here, never the temporary schema), so the unqualified names in a function body mean what they mean on a direct connection.  The same path is sent when a table of the statement
+has triggers or defaults or checks that call functions that are not built in.  A function body that touches the schema of another owner is refused by the owner (`KS001`, "does not hold table").  Statements that
+call a built-in that reads the session (`current_schema`, `current_setting`, `set_config`, `pg_backend_pid`, `inet_client_addr`, `current_query`, ...) are not shipped.
+
+**Step 10: single tables in and out.**  `ALTER TABLE ... SET SCHEMA` moves an ordinary table across the border of a distributed schema when no row has to move: into a schema (the structure is made empty on every
+other node and checked by fingerprint; the rows must be on the owner, that is the table must be empty or this node must hold the schema), out of a schema (the owner keeps the table and its rows as a local table, the
+other nodes drop their empty shells), between two schemas of one owner (the catalog follows the table).  Foreign keys that would cross the border, triggers, partitioned tables, partitions, tables with inheritance,
+unlogged and temporary tables, hash-distributed and reference tables, and schemas held by different groups are refused, with the reason and a hint.  Other objects keep the refusal "recreate it".
+
+**Step 11: ledger tables.**  A `kingres_ledger` table may be in a distributed schema; it lives on the owner.  `kingres.ledger_enable` run on a node that does not hold the schema is refused and names the owner's
+node; the capture triggers of the ledger are not propagated.  A schema with a ledger table is pinned: `move_schema` and `undistribute_schema` refuse with `schema_pinned` (the chain of the ledger is on the owner
+and no schema operation moves it) and the ledger hook keeps `DROP SCHEMA` from dropping it.  `distribute_schema` takes such a schema in place (the shells have no ledger trigger, which the table fingerprint ignores).
+`check_cluster` reports `ledger_on_non_owner` for a ledger table on a node that is not the owner of its schema.  An updatable ledger table (a history table) in a distributed schema is enabled before the schema is
+distributed or on the map group primary: the history table is made by DDL.
+
+**Step 9: writes that read other schemas or kinds.**  `INSERT ... SELECT` into a table of a distributed schema that another group holds, when the statement cannot be run whole on the owner (it reads a local table, a
+hash-distributed table, a table of another owner, a function), reads the rows here (the scan) and sends them to the owner through the row router of 2b with one destination; the owner applies the defaults, sequences
+and identity of its table, so only the columns the statement names are sent.  `RETURNING` and `ON CONFLICT DO NOTHING` work; `ON CONFLICT DO UPDATE`, `WITH` clauses and views with a check option keep the
+refusals of the router.  `COPY ... FROM` into such a table goes through the same destination (`kingres_shard.enable_copy_routing`).  `CREATE TABLE ... AS` and `SELECT ... INTO` a distributed schema are
+the creation of the empty table (DDL, so on the map group primary) followed by the `INSERT ... SELECT` of the same query; they take no storage option, tablespace, access method, ON COMMIT or UNLOGGED.
+
+**The fixes for the review of increments 1 to 6** (design notes, section of that name): a move back while the old copy is being cleaned is refused and the cleaning of a group that owns the schema again does nothing;
+schema names that are not plain lower case; the privileges, comment and default privileges of an empty schema reach every node; path S does not ship session built-ins, and the owner runs triggers and hidden defaults
+with the path of the session; the state of a sequence (`is_called`) is carried by a move; `REASSIGN OWNED` of a role that owns a distributed schema and `CREATE EXTENSION ... SCHEMA` a distributed schema are refused;
+`UPDATE ... SET identity = DEFAULT` is not shipped; `check_function_bodies` travels with DDL; `kingres.schemas.size_bytes` is for superusers.  Limits that stay: a standalone `nextval` on the old owner during the lock
+phase of a switch can hand out a number the new owner hands out again (use the sequence as a column default); `nextval(<expression>)` on a sequence of a distributed schema runs on the node that executes it
+(use a constant regclass or the default); `ALTER TABLE ALL IN TABLESPACE` is node-local; default privileges that are not for one schema are not carried.
+
+**The fixes for the second review.**  A table of a schema that is being moved cannot get a ledger (`ledger_enable` refuses), the switch of a move looks at the pin again under its lock, and
+`distribute_schema` keeps a schema that holds a ledger table, empty or not, with the ledger's group.  A statement that is run whole on the owner for code it does not show (a function with
+`ship_functions`, a trigger, a default) runs with `kingres_shard.shipped_scope` on: the owner refuses (`KS001`) any table that code reads that is not a table of a distributed schema, a reference
+table, a hash-distributed table or a catalog, so a function cannot silently read the owner's own copy of a plain local table; the same holds for the batches of the row router.  `UNION ALL` with an
+expression column works through the distributed scan.  `CREATE TABLE IF NOT EXISTS ... AS` gives the notice, `CREATE TABLE AS EXECUTE` is refused.  A user trigger named `kingres_ledger_*` is an ordinary
+trigger (the ledger's own are known by their functions).  `ALTER TABLE ... SET SCHEMA` locks the table before it looks for rows.  The verification of a bucket split must fit in `move_switch_timeout`
+(see "Sizing of the verification"), and `verify 'full'` writes only the rows that differ.  Measured with `t/245_schema_scale_cluster.pl` (the numbers are in the design notes): the cost of a DDL statement
+grows with the number of distributed schemas (23 ms at 200 schemas, 174 ms on average at 2000) and `add_node` of a cluster with 2000 schemas fails for lack of locks; both are for step 12.
+
+**Step 12: the incremental cache of the catalog.**  A backend no longer reads every distributed schema and schema table when it loads the catalog: it counts them,
+and makes the entry of a schema table or a schema when a statement asks for it (one index scan of `kingres.dist_table` or `kingres.dist_schema`; "not a schema
+table" is cached too, until the next reload).  The colocation groups are found through a hash, not by a list search.  The trigger of a catalog change
+invalidates the relcache entries of the distributed tables that the change can touch (the tables whose rows this statement wrote in `dist_table`, the tables of the
+groups whose rows it wrote in `colocation`, `bucket_map` or `dist_schema`), not of every table of the database; a change of a node, of the settings, a
+`TRUNCATE` and a change of `dist_partition` still invalidate every one.  `kingres_shard.catalog_incremental = off` is the fallback with the old behaviour (the
+whole suite also runs with it, `KS_CATALOG_FULL=1`).  `kingres.internal_catalog_stats()` reports, for the backend, the loads, the lazy lookups and the
+invalidations sent (the tests read it).  A whole catalog that a node applies (`sync_catalog`, `add_node`) is written with one statement for each of `dist_table`, `dist_partition` and `dist_schema`, not one per table: a statement per row fired the trigger of the catalog changes once for every table of the cluster (quadratic; `add_node` of a cluster of 2000 schemas ran into `node_timeout` in the node that applied the catalog).  Limits that remain (review P12R-06 and P12R-07): the trigger finds the rows a statement wrote, so a row that the statement deleted (`undistribute_schema`, a pure DELETE of a bucket map row) invalidates no table by itself (the other paths of those operations invalidate the relation; the cache is dropped in every case); a transaction that makes N schemas runs the trigger N times, each reading the catalog tables whole, which is quadratic in N; `kingres_shard.catalog_incremental` can be set by a superuser only; the digests of `add_node` and the structure fingerprint are sha256, not md5 (a FIPS-mode server has no md5).
+
+**Step 12: `add_node` in batches of schemas.**  The distributed schemas of the cluster are made on the new node before it is registered, in transactions of their own, each at
+most `kingres_shard.add_node_batch_statements` statements (default 100; a schema is never split, so one schema bigger than that is a batch alone), so the locks of one transaction
+stay bounded however many schemas the cluster has (a single transaction for all of them ran out of `max_locks_per_transaction` slots at about a thousand schemas).  What a batch
+completed is recorded on the new node in `kingres.add_node_progress` (the schema and the digest of the statements that made it): a call that is repeated after a failure keeps the
+schemas that are done, drops and makes again a schema that changed or went in the meantime, and goes on with the rest; the call says what it kept (a NOTICE).  The node is registered
+only by the last transaction, which first checks that every schema the batches made is on the node and removes the progress rows, so nothing is routed to the node before it is
+complete, and a failure leaves nothing that the nodes of the cluster can see (the extension and the finished batches stay on the new node, which belongs to no cluster).  A schema that
+reads a reference table (a foreign key to it, a view over it) cannot be made before the reference tables are, so it is made in the last transaction: many of those would meet the lock limit
+again.  The tables of a distributed schema are empty shells on the new node: add_node no longer copies them as if they were reference tables.
+
+Measured with `t/245_schema_scale_cluster.pl` (three nodes, one machine; the full table is in the design notes): at 2000 schemas of 5 tables a DDL statement takes 52 ms on average (174 ms before step 12), the first statement of a new backend 9 to 15 ms (55 to 112 ms), the cache of a backend 0.7 MB (3.3 MB), a routed single-row INSERT 1.2 ms (5.8 ms), and `add_node` passes in 39 s in 500 batches (it failed for lack of locks); at 200 schemas the cost of a DDL statement is that of the two-phase commit (26 ms, as before).
+
+
+**Using distributed schemas, and what they cannot do (step 15).**
+
+To use them: on the map group primary, `SELECT kingres.set_sharding_mode('schema', true)` (or `'both'`: hash-distributed tables and distributed schemas together), then create a schema per tenant or
+service.  A new schema is placed on the group that holds the fewest schemas for its weight (`kingres_shard.schema_placement_group` or the `group_id` of `distribute_schema` overrides) and its tables are made on
+every node, empty except on the owner.  Connect to any node: a statement on the schema is shipped whole to its owner; a statement that mixes schemas of two owners, local, hash or reference tables is answered by
+the distributed scan.  `kingres.move_schema(schema, group)` moves a schema online; `kingres.distribute_schema(schema)` and `kingres.undistribute_schema(schema)` convert an existing schema in place; the control plane
+and the panel of the product (branch cp-1011, not part of this extension's tree) run the same operations as tasks.
+
+Limits of this version:
+
+- DDL on a distributed schema runs on the map group primary only.  Clients that create tenants connect there (the control plane does).
+- A table of a distributed schema is on one group, so a tenant cannot be larger than the disk of one group; a schema cannot be split (the split of phase 10 is for the buckets of hash-distributed tables).
+- Statements that touch two distributed schemas on different groups, a schema and a hash table, or a schema and a local table are answered by the distributed scan: correct, and slow for large inputs
+  (no repartitioning).  There is no global snapshot across groups (the note of phase 2a).
+- A function runs at the origin unless its schema has `ship_functions`; a function that touches another schema from inside a shipped statement raises `KS001`.  `lastval()` and `currval()` are not reliable across a
+  routed statement; a `nextval` with an argument that is not a constant runs where the statement runs.
+- Refused in a distributed schema: materialized views, rules, row-level security and policies, extended statistics, foreign tables, publications, event triggers, operators, aggregates, range types, table
+  inheritance, `CREATE SCHEMA` with elements; unlogged tables cannot be in a schema that is moved.
+- A schema with a ledger table cannot be moved, made local or dropped (`schema_pinned`).
+- The writers of a schema wait during the switch of its move (an attempt of normally tens of milliseconds, at most `move_switch_timeout`); the old copy stays until `move_cleanup_delay` and takes disk space on the
+  source; a move back to a group whose old copy is not yet emptied is refused.  A plan of buckets (`plan_rebalance`, `rebalance_plan`) does not move a schema; the bucket of a schema counts in the load of its
+  group.
+- `kingres_shard.max_distributed_schemas` (default 10000, a guess) bounds the number of schemas; every DDL statement is a two-phase transaction on every node; `add_node` makes the schemas in batches (see
+  "Step 12") and its time grows with the number of objects; a schema that reads a reference table is made in its last transaction.
+- `VACUUM`, `ANALYZE`, `REINDEX` and `CLUSTER` of a schema table act on the node they run on (autovacuum maintains the owner's copy).
+- Roles, tablespaces and extensions are not synchronized (the existing limit): a role that owns a schema or an object in it must exist on every node before the schema is distributed or the node is added.
+- Local helper schemas in a database that distributes by default need a superuser to create them (`SET kingres_shard.distribute_new_schemas = off`).
+- Review P12R-06/07 limits are in the paragraph of step 12 above.
+
+The tests of this phase are `t/230` to `t/251`; the numbers of the measured cost are in the design notes and in the paragraph of step 12.
+
 ## Limitations in phase 2a
 
 Read these first; each is a reviewed boundary, not an accident.
@@ -2333,6 +2551,170 @@ needs `cleanup_moved_buckets(true)` after the move (review finding S4-10).
   moved to this node after the snapshot of the transaction was taken") and can be
   retried. `COPY (SELECT ...) TO` reads like any `SELECT`; `COPY ... FROM` into a
   distributed table is routed by the row router, which fails with the retryable `KS001` when a bucket moved between its plan and its first batch and otherwise makes the switch of a move wait for it (section "Bulk writes through the row router").
+
+## The bucket layout (version 0.8, phase 10, increment P10.1)
+
+[`shard-phase10.md`](../../kingres/docs/design/shard-phase10.md) lets one bucket be split into several without touching the others.
+Version 0.8 prepares the catalog and every place that routes by bucket for it; nothing in this version splits a bucket yet.
+
+- **A bucket is a hash partition `(MODULUS m, REMAINDER r)`, and its number is its remainder `r`.** `kingres.bucket_map` has a `modulus`
+  column for it; `kingres.colocation.bucket_count` stays what a new table of the group asks for (the base modulus), and the number of
+  buckets is the number of rows of `bucket_map`. `kingres.colocation.max_modulus` is the greatest modulus of the group (the base
+  `bucket_count` until a split). The buckets of a group cover each slot `0 .. max_modulus - 1` of `hash % max_modulus` exactly once.
+  PostgreSQL accepts such a table (moduli that divide the next larger one, partitions that share no slot).
+- **The bucket of a key is a lookup, not `hash % bucket_count`.** The cache of the catalog builds, for each group, a table with one entry per
+  slot (the same idea as `boundinfo->indexes` of PostgreSQL), and `kingres_shard_bucket_for_hash()` reads it. Everything that routes (the planner,
+  the row router, `COPY`, the pushdown, `kingres.bucket_for()`) goes through it; the code that creates or attaches a bucket partition asks
+  `kingres_shard_bucket_modulus()`. A key whose slot no bucket covers is an error that names the slot, never a wrong bucket.
+- **`kingres.colocation.placement_epoch`** counts the switches of a group (a move now, a split later), in the transaction that changes the
+  partitions. The placement hash that a scan compares before and after it starts includes it, so a bucket that moves away and comes back
+  inside the window of a statement no longer restores the hash (review finding S4-01).
+- **`kingres.bucket_range(colocation_id, bucket)`** returns the modulus and the remainder; `kingres.buckets` has a `modulus` column.
+- **`check_cluster()`** says `bucket_map_incomplete` for a group that was never split and lacks a bucket (as before), and `bucket_layout` for any
+  other flaw: buckets that do not cover each slot exactly once, or a bucket partition on a node whose bounds differ from the bucket map.
+- **Upgrade and rows of the older form.** `ALTER EXTENSION kingres_shard UPDATE` gives every bucket the modulus `bucket_count`; a row that
+  does not say its modulus or the `max_modulus` (an `INSERT` of the older form, a catalog document of a map group that is not upgraded yet)
+  gets the layout of a group that was never split, through the trigger `kingres.internal_layout_defaults()`.
+- **Moves.** `move_bucket()` copies a bucket with its own modulus and raises the epoch. `rebalance_plan()` counts the buckets of a group, not its
+  `bucket_count`. A new table colocated with a split group has the buckets of the group; `alter_distributed_table()` into a group of its own
+  that is like a split group makes the same buckets, moduli and owners.
+
+Tests: the regression test `bucket_layout` (mixed moduli against the partition PostgreSQL stores a row in, the layout checks) and `t/200_bucket_layout.pl`
+(splits made by hand on a cluster, reads and writes from every node, moves of the split children, the epoch, new tables, `check_cluster()`).
+
+## Weights and the plan of a rebalance (version 0.8, phase 10, increment P10.3)
+
+`kingres.rebalance_plan()` (phase 4) balances the number of buckets of each colocation group. Version 0.8 adds a plan that knows what a bucket costs
+and what a group can hold ([`shard-phase10.md`](../../kingres/docs/design/shard-phase10.md), sections 4 and 5). `rebalance_plan()` stays as it was.
+
+- **`kingres.set_node_property(node_id, should_have_shards, weight)`**: NULL leaves a property as it is; `kingres.node.weight` is the capacity of
+  the group whose primary the node is (above 0, at most 1000, default 1). The two-argument form still exists and leaves the weight alone (the control plane asks for it
+  by that signature). Map group primary only, superuser.
+- **`kingres.plan_rebalance(strategy, threshold, max_moves, drain_only, extra_load, exclude_groups, colocation_ids)`** returns
+  `(seq, colocation_id, bucket, source_group, target_group, cost, size_bytes, reason)`; read only, superusers only, on the map group primary (the plan reads through functions that are not
+  granted to other roles: a role that may read `kingres.bucket_move` still gets "permission denied"; `drain_status()` is the one function of this part that such a role can call).
+  - `strategy` is `by_bucket_count` (every bucket costs 1) or `by_disk_size` (the size of the bucket's partitions of every table of the colocation
+    group, read from the group that owns them, at least `kingres_shard.min_bucket_cost`, 1 MiB by default; the one bucket of a distributed schema counts at the size of the
+    schema's tables on the node that holds them; it needs a superuser, and a group that
+    does not answer is an error that names it: the plan does not guess).
+  - A group may receive buckets when its primary is active and has `should_have_shards`; `exclude_groups` takes groups out of the receivers for a what-if
+    drain; a group with no active primary is neither a receiver nor a source.
+  - The load of a group is the sum of the costs of its buckets over **all** colocation groups; its utilization is the load plus `extra_load` (the load of
+    other databases, a JSON object of group id to a number in the unit of the strategy, receivers only) per unit of weight. A receiver deviates from the
+    ideal (the total load, the load of drained groups included, per unit of the receivers' weight) by `abs(utilization - ideal) / ideal`.
+  - The plan is a simulation: while a group that may not hold buckets still holds one, or a receiver deviates by more than `threshold` (default 0 by
+    bucket count, 0.1 by disk size), the greatest drain source or the receiver of the greatest utilization gives its most costly bucket (ties: the higher
+    bucket number) to the receiver of the least utilization (ties: the lowest group id); a bucket of a receiver must bring the two utilizations closer. When no bucket of
+    the source does that for the least utilized receiver, the next receiver in the order of utilization is tried, and the source is given up only when none helps (with unequal
+    weights the least utilized receiver is not always the one that can take a bucket).
+    A bucket is planned once; a bucket that is moving counts at its target and is not planned; `drain_only` plans the drain moves only; `max_moves` caps the plan.
+  - `reason` is `drain` for a move off a group that may not hold buckets and `balance` otherwise.
+- **`kingres.group_load(strategy, extra_load, exclude_groups)`** returns, for every group, `receiving`, `weight`, `buckets`, `load`, `utilization`,
+  `deviation` and `available`.
+- With equal weights, one colocation group and threshold 0 the plan has the number of moves and the counts of `rebalance_plan()` (a regression test
+  compares them over generated maps). With several colocation groups it balances the sum, not each colocation group.
+
+Tests: the regression test `plan_strategies` (the examples of the design with their move counts, weights, drain, `exclude_groups`, `extra_load`, several
+colocation groups, moving buckets, refusals; the disk-size simulation through `kingres.internal_plan_simulate()` with sizes as data) and `t/201_plan_disk_weights.pl`
+(real sizes on three groups, a plan executed, weights, a drain executed, a group that does not answer, who may plan).
+
+## Several moves at once, and the progress of a move (version 0.8, phase 10, increment P10.4)
+
+Moves of different buckets run together without anything special: every move has its own session, publication, slot, subscription and copy tables, and the
+only shared step, the switch, locks the parents of the colocation group's tables on the two nodes with `NOWAIT` and retries within `move_switch_attempts`.
+`t/202_concurrent_moves.pl` runs four moves at once with readers on three nodes: moves of one colocation group between disjoint pairs of groups, moves of
+two colocation groups between the same groups, two moves of one colocation group with the same source and target (each completes or fails cleanly and
+succeeds when started again), the same bucket twice (the second is refused), and checks every row and `check_cluster()` afterwards. A reader that overlaps a
+switch may get the retryable `KS001`; it never gets a wrong answer. The scheduler of the control plane still keeps moves that would lock the same
+tables on the same node apart (design 6.3), because a retry is a cost, not because it is unsafe.
+
+What a move costs the nodes, per move: on the map group primary the session that runs `move_bucket()` and its control sessions; on the source a WAL sender,
+a replication slot and a publication; on the target a subscription with its apply worker and, during the copy, a table synchronization worker. So
+`max_connections`, `max_wal_senders`, `max_replication_slots`, `max_logical_replication_workers` and `max_worker_processes` have to leave room for the
+number of moves that are allowed at once (`rebalance.maxConcurrentMoves`, default 4) on top of what the databases use; a node that runs out of
+connections makes the move fail with "too many clients" and the move is undone.
+
+- **`kingres.move_progress()`** (superusers; it asks the nodes) returns one row per unfinished move: `move_id`, `colocation_id`, `bucket`, `source_group`,
+  `target_group`, `phase`, `detail`, `started_at`, `updated_at`, `source_bytes` (the bucket's partitions on the source), `target_bytes` (the copy on the target;
+  NULL for either when the node does not answer) and `percent` (preparing 0; copying: the target's bytes over the source's, at most 89; catching_up 90;
+  switching 95; cleaning 100).
+- **`kingres.drain_status()`** (read only) returns one row per shard group: `receiving`, `available`, `buckets` (the map's), `arriving` and `leaving` (unfinished moves) and
+  `drained` (it may not receive, owns no bucket and none is arriving), which is what a drain waits for before the group is removed.
+
+Tests: `t/202_concurrent_moves.pl`, `t/203_move_progress.pl`, and `drain_status` in the regression test `plan_strategies`.
+
+## Splitting a bucket (version 0.8, phase 10, increment P10.5)
+
+`kingres.split_bucket(colocation_id, bucket, parts DEFAULT 2, verify DEFAULT 'count')` replaces the partition of one bucket, in every table of its
+colocation group, by `parts` (2, 4, 8 or 16) partitions of a modulus `parts` times larger. It runs on the map group primary, as a superuser, in a
+READ COMMITTED session (it follows the progress of other nodes), and returns the id of its record in `kingres.bucket_split`. The children stay on the
+group of the bucket: the new buckets are `bucket + i * modulus` for `i = 0 .. parts - 1`, the bucket keeps its number for `i = 0`, `max_modulus` of the group
+goes up and the placement epoch counts the switch. Move the children apart afterwards with `move_bucket()` or a rebalance.
+
+How it works (design/shard-phase10.md, section 3):
+
+1. **Preparing.** The preconditions are checked on the owning node before anything is recorded: every table has a primary key; none is partitioned by the user,
+   none has a generated or an identity column, every bucket partition is a plain heap table (a columnar table cannot be split); the bucket is `active`; no split
+   of the colocation group is unfinished; `kingres.internal_split_allowed()` (a hook that the line of work of distributed schemas redefines to refuse a group that
+   holds a schema) says yes. The record is made, the bucket's state becomes `splitting` on every node.
+2. **Children and triggers**, on the owning node, in one transaction: for every table a standalone child per part (`LIKE` the table, with the `ks_bucket_check`
+   constraint that makes the later attach scan-free) and a trigger on the old partition, `ENABLE ALWAYS` so that `session_replication_role = replica` does not skip it,
+   that makes every change of the partition in the child that covers the row, in the writer's own transaction (a delete and an upsert; `TRUNCATE` truncates the
+   children). A write of the old partition by any means is therefore copied. The children and the trigger functions belong to the **owner of the table** and the
+   functions are `SECURITY DEFINER` with a fixed `search_path` (P10R-02): a writer of an ordinary role has the rights it has on the table, not on the children, and the
+   constraints and defaults of the table that the copy evaluates run as the owner, never as the superuser who splits. The owner must have `USAGE` on the schema of the
+   table, else the split is refused before anything is changed. The functions are revoked from `PUBLIC`.
+3. **Backfill**, in batches of 5000 rows each in a transaction of its own: the rows after the last key, those no writer holds (`FOR SHARE SKIP LOCKED`), are copied with
+   `ON CONFLICT DO NOTHING`. The rows of the batch's key range that it did not take are looked at again in a second statement with a new snapshot: those that are free now are
+   copied, those that are gone are forgotten, and only those that exist and are still locked count as "held by writers" (P10R-03). A row that a writer inserts meanwhile is in
+   its child already (the trigger) and is not in the range of the snapshot, so inserts at random keys do not keep a pass from converging. Passes repeat until one copies nothing
+   and finds nothing held (at most 10; while a writer holds rows the passes pause 0.2 s times their number, at most 2 s, so that ten passes last about eleven seconds). The batch
+   (5000 rows), the number of passes (10) and the parts (2, 4, 8, 16) are constants of the function, not settings.
+4. **Switch**, on the owning node, in one transaction that the coordinator sends as one command (the lock function, `SET LOCAL statement_timeout`, the switch function):
+   first the **fence**, an advisory lock that the undo of the same split takes too, so that a switch and an undo of one split never run at the same time (P10R-01); then the
+   tables and the old partitions are locked `SHARE` (writers wait, readers do not), each lock for at most `max(200 ms, move_switch_timeout / 10)`. From the first lock to the
+   commit the writers wait, and that time is bounded by `move_switch_timeout` as a whole (the statement timeout of the second half, P10R-08): `verify 'count'` compares the number
+   of rows of every old partition with its children and brings them in line if they differ (`'full'` does it always, key by key, **values included**: a row of a child that
+   differs from the partition's is brought to the partition's values, P10R-14; `'none'` trusts the triggers); the triggers go; the old partitions are detached as
+   `kingres.orphan_s<id>_<n>` (readers wait from the detach to the commit); the children are renamed to `<table>_bNNNN` and attached with the new modulus. The deadlock timeout of
+   the switch is 100 ms, so that a deadlock with an application transaction is found by the switch and it is the switch that fails, not a reader or a writer (P10R-04). A lock that is
+   not got, a deadlock and a switch that runs past its time are tried again up to `move_switch_attempts` times with a growing pause; the last failure names the sessions in the
+   way (or says that the switch did not finish).
+5. **The catalog** on the map group primary: the bucket's row becomes the children's, `max_modulus` and the epoch go up, the map is synchronized. This comes after the switch
+   and not in the same two-phase transaction (a difference from the design): the children are on the same group as the bucket, so a router that still has the old layout
+   reaches the right group and PostgreSQL prunes by the partitions it has; a scan that overlaps the two steps sees the epoch change and gets the retryable `KS001`.
+6. **Cleaning.** The orphans are dropped by `kingres.cleanup_bucket_splits()` after `move_cleanup_delay` (the recovery worker calls it).
+
+Failure and recovery: until the switch every failure undoes the split (`internal_split_undo`: the triggers, their functions and the children go, the bucket is `active`). The owner's
+backend does not stop when the session that called it dies, so a switch can still be running when the recovery looks (P10R-01): the undo is one transaction on the owner that
+**takes the fence first**, waits for a switch that is running (at most `move_switch_timeout` plus a lock timeout), and then looks at the partitions again: if they are switched it
+undoes nothing and says `switched` (the caller writes the catalog), else it undoes and says `undone`. A switch that arrives after an undo finds its children gone and fails. The locks of
+the undo are bounded (`max(200 ms, move_switch_timeout / 10)`, P10R-13): a lock that is not got makes the undo fail, the record stays unfinished and the recovery tries again. A session
+that dies is settled by `kingres.resume_bucket_splits()` (the recovery worker calls it), which runs that undo for every split whose session is gone. The live mark of a split is released
+on every way out of `split_bucket()`, also an error after the switch (P10R-06), so the recovery does not wait for a session that is still open. `kingres.cancel_bucket_split(id)` stops a split
+that has not reached its switch. `kingres.check_cluster()` says `split_stalled`, `split_trigger` and `split_child_table`.
+While a split runs, `create_distributed_table()` and the other changes of the group's tables are refused (the same check as for a move) and the bucket cannot be moved. The bucket
+map's state is `splitting`, and `kingres.bucket_split` is readable by superusers only. `kingres.check_cluster()` does not compare the partitions of a colocation group that has an
+unfinished split with the bucket map: between the owner's switch and the catalog change (normally milliseconds, longer when a node is down) the bounds differ and that is no damage
+(P10R-12); a split that stopped is `split_stalled`. `move_bucket()` refuses a bucket whose partitions on the source do not have the bounds of the bucket map, and says what differs.
+
+**Sizing of the verification (P10F-02).** The verification runs inside the bound of the switch, so the count of the rows of a bucket (and, for `'full'`, the comparison of its rows) must fit in `kingres_shard.move_switch_timeout` (default 10 s): a bucket that takes longer to count makes every attempt fail with "did not finish in N attempts", and the split is undone after the whole copy.  For a big bucket raise `move_switch_timeout` (it is a `USERSET` setting; the writers wait for that time at most), use `verify 'none'` and trust the triggers, or split a group while its buckets are small.  `'full'` writes only the rows whose values differ from the partition's (`IS DISTINCT FROM`), so a bucket whose children are right costs a read and no dead tuples.
+
+**Limits.** Bucket numbers are limited to 9999 (P10R-05): the partition of bucket 12288 is `<table>_b12288` for the code of the extension and was `<table>_b1228` for the SQL functions
+(`lpad` cuts), so a split whose new buckets would be numbered 10000 or more is refused with a message before anything is recorded. A group starts with at most 4096 buckets, so a
+group of 8 buckets can be split about three times in 16 parts.  A group of 4096 buckets (the largest start) can be split once in 2 (its new remainders go up to 8191; the buckets of that result have the modulus 8192, and a second split of one of them would need remainders up to 16383, which the limit refuses), and a split in 4 or more is refused for most of its buckets (P10F-03): the limit comes from the naming of the partitions and a single naming function that prints longer numbers in full would lift it. The greatest modulus of a group, 65536, is checked by `split_bucket()` and is not a setting.
+
+Not done: a split of a user-partitioned table or of a columnar table (refused), a split by `parts` other than 2, 4, 8 or 16, the merge of buckets, and the split of several buckets of a group at once (one split per
+colocation group at a time).
+
+What the control plane calls: the record of a split is `kingres.bucket_split`, not a row of `bucket_move`, so `resume_bucket_moves()`, `cancel_bucket_move()` and `cleanup_moved_buckets()` do not
+see a split; it calls `resume_bucket_splits()` for a split whose connection it lost, `cancel_bucket_split()` to stop one and `cleanup_bucket_splits()` for the orphans (the recovery worker calls
+both sets). `check_cluster()` says `split_stalled` and `extension_version_differs` where the design says `operation_stalled` and `extension_version`.
+
+Tests: `t/204_split_bucket.pl` (splits, writers during every phase, bypasses, refusals, cancel, killed sessions and the worker, moves of the children, a table made later),
+`t/205_split_recovery.pl` (the coordinator dying at each fault point inside the switch with the recovery running meanwhile, the undo cut at each of its points, the live mark, the bound of the
+switch, bucket numbers, the bounds check of a move, `check_cluster()` in the gap), `t/206_split_writers.pl` (an ordinary role and the owner writing during the copy, inserts at random keys, a held
+row, a deadlock with a writer, a writer that keeps the switch out) and the regression test `bucket_layout` for the layouts a split makes.
 
 ## High availability (version 0.5, phase 5)
 
@@ -2961,7 +3343,7 @@ call a node silent that has answered). **What a call that is working costs while
 | every call below, against a node that answers every statement late but within `T` (0.5 x and 0.9 x `T` are measured, with one, two and four such nodes) | **it succeeds, with no `WARNING` and no `KS007`, nothing prepared, the work done on every node, in at most `s x T` seconds for each slow node** (`s` below) plus the work on the nodes that answer (a fraction of a second) | `t/102` (every call but `promote_node`), `t/103` (`promote_node`) |
 | `add_node`, `remove_node`, `sync_catalog`, `rotate_secret`, `recover_prepared_transactions`, `create_distributed_table`, `create_reference_table`, against a node that **stops answering** (silent after any chunk of any of its sessions, from the first to the last) | at most **`2 x T + 8 s`** from the first statement that is not answered, **plus `node_connect_timeout` once for connecting to it**: `T` and the cancel for a statement; at a `PREPARE TRANSACTION`, `T`, the cancel, and `max(T, min(T, 5) + 2)` more for the answer to its question, then the abort; a node that answers but whose standbys do not confirm: `min(T, 5) - 1` s per node, then `KS009` | `t/100` (every call, every position), `t/096` (the bound with the tolerance), `t/086` (a lock, a stopped backend), `t/091` (`KS009`) |
 | `promote_node` | at most **`3 x T` for each node that does not answer**; a node that does not answer is listed in `"unreached"` with a `WARNING` that names it, unless it is the node to promote, which refuses the call with `KS007` (whether it accepts the session and does not answer its first, its second or its third question: `t/096`), or a node that stops answering after the promotion has begun on it, which ends the call with `KS007` and changes nothing (repeat it after the node answers: `promoted`); a participant that stops answering during the commit: `2 x T + 8 s` as above | `t/086`, `t/096`, `t/101` (every position, for a participant and for the node to promote), `t/103` |
-| `check_cluster()` | at most **`2 x T` for each node that does not answer**; the node gets a row `node_unreachable` and the other nodes are still checked: the call does not fail as a whole | `t/086` |
+| `check_cluster()` | per node that does not answer, at most **`T`** when the sessions the caller has cached to it are stuck (the next statement is accepted and never answered), at most **`2 x node_connect_timeout`** when the node does not accept a new connection (its postmaster is stopped: the base check connects to a node twice; 10 s at the default `node_connect_timeout` of 5 s, whatever `T` is), and nothing but the refusal when the node is down; the layout, split and table operation checks ask no node that the base check found not answering (before P10R-11 the table operation check asked it a third time: 15 s per node at the default). The node gets a row `node_unreachable` and the other nodes are still checked: the call does not fail as a whole | `t/086`, `t/207` |
 | a call behind another call that changes the catalog | `T`, then `KS008` | `t/086` |
 | client timeout of the control plane for any of these calls | **without `control_call_timeout` there is no bound for a call that is working**: the formula above (`s x T` for each slow node) plus the bound for a silent node for each node that may be stuck, plus 10 s; its expiry means "did not finish" and is **not** proof of a local reason: a call that works through a slow node can run that long with the catalog lock held, so cancel it from another session (`pg_cancel_backend`) before starting another. With `n` nodes of which `k` may be stuck: `k x (3 x T + 8) + 10 s` is always enough for the silent ones. With `control_call_timeout = L` the call ends in at most `L` plus the time to cancel one statement | `t/086` (the bounds), `t/082` (a cancelled call), `t/107` (`control_call_timeout`) |
 | a call, with `kingres_shard.control_call_timeout` set | at most that many seconds plus the cancel of one statement, then `KS015` (S13-02). **Cut to what is left (review S14-02):** every statement of the call's sessions, the connect of a new session (its `connect_timeout`) and the first command of a new session. **Outside it, each with its own bound:** the raw sessions of `require_primaries_can_commit` (the start of `add_node`, `remove_node`, `rotate_secret`, `sync_catalog`), `ask_node` and the sessions of `promote_node` (`failover.c`), each bounded by `node_timeout` or `node_connect_timeout` per node, one after the other: with `k` silent nodes the worst case is `L + k x node_timeout` for these, not `L`. When the time runs out while a node is being waited for, `KS015` names that node (and says nothing is known against it) | `t/107` |

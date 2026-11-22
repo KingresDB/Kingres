@@ -56,6 +56,7 @@ typedef struct KsDestination
 	int			node_id;		/* KS_DEST_ONE_NODE */
 	int64		expect_placement;	/* the placement number the caller decided with; 0: no check */
 	bool		check_identity;	/* a table that is not in the catalog: check its partitions */
+	const char *search_path;	/* the owner runs the batches under this search_path (triggers and defaults with unqualified names), or NULL */
 } KsDestination;
 
 /*

@@ -102,7 +102,8 @@
 	"SET LOCAL IntervalStyle = 'postgres'; " \
 	"SET LOCAL extra_float_digits = 3; " \
 	"SET LOCAL standard_conforming_strings = on; " \
-	"SET LOCAL bytea_output = 'hex'; "
+	"SET LOCAL bytea_output = 'hex'; " \
+	"RESET check_function_bodies; "
 
 
 static HTAB *conn_hash = NULL;
@@ -3646,7 +3647,7 @@ conn_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 void
 kingres_shard_exec_ddl(KsConn *kc, const char *stmt)
 {
-	const char *params[6];
+	const char *params[7];
 	PGresult   *res;
 
 	params[0] = GetConfigOption("search_path", false, false);
@@ -3655,14 +3656,16 @@ kingres_shard_exec_ddl(KsConn *kc, const char *stmt)
 	params[3] = GetConfigOption("standard_conforming_strings", false, false);
 	params[4] = GetConfigOption("bytea_output", false, false);
 	params[5] = GetConfigOption("extra_float_digits", false, false);
+	params[6] = GetConfigOption("check_function_bodies", false, false);
 	res = kingres_shard_exec_params(kc,
 									 "SELECT pg_catalog.set_config('search_path', $1, true), "
 									 "pg_catalog.set_config('DateStyle', $2, true), "
 									 "pg_catalog.set_config('IntervalStyle', $3, true), "
 									 "pg_catalog.set_config('standard_conforming_strings', $4, true), "
 									 "pg_catalog.set_config('bytea_output', $5, true), "
-									 "pg_catalog.set_config('extra_float_digits', $6, true)",
-									 6, NULL, params, true);
+									 "pg_catalog.set_config('extra_float_digits', $6, true), "
+									 "pg_catalog.set_config('check_function_bodies', $7, true)",
+									 7, NULL, params, true);
 	PQclear(res);
 	kc->tz_applied[0] = '\0';
 	res = kingres_shard_exec(kc, stmt);

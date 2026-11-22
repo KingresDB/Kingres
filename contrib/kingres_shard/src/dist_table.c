@@ -543,6 +543,28 @@ kingres_shard_remote_tail_script(const DdlSet *ddl)
 }
 
 /*
+ * The sharding model of the database (phase 11, design/shard-phase11.md 5.4 and 10): a table of a distributed schema is
+ * a schema table and nothing else, and in the mode "schema" no table is hash-distributed.  A reference table is allowed
+ * in the mode "schema" (a tenant's keys point to it), in a local schema.
+ */
+static void
+check_table_for_sharding_mode(Oid relid, bool hash)
+{
+	const KsCatalog *cat = kingres_shard_catalog();
+
+	if (kingres_shard_lookup_dist_schema(cat, get_rel_namespace(relid)) != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("table \"%s\" is in a distributed schema, which holds only schema tables", get_rel_name(relid)),
+				 errhint("Use a table of another schema.")));
+	if (hash && cat->sharding_mode == KS_MODE_SCHEMA)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("create_distributed_table is not available in the sharding mode \"schema\""),
+				 errhint("Run kingres.set_sharding_mode('both') to distribute tables by key and schemas in one database.")));
+}
+
+/*
  * kingres.create_distributed_table(relation regclass, dist_column name,
  *									 colocate_with regclass, bucket_count int)
  *
@@ -567,7 +589,6 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 	int			colocation_id;
 	int			nbuckets;
 	KsColocation *placement;
-	int		   *groups;
 	int			local_group;
 	DdlSet		ddl;
 	Oid			argtypes[4];
@@ -593,6 +614,7 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 	require_current_sql_objects();
 	kingres_shard_lock_catalog();
 	kingres_shard_require_map_group();
+	check_table_for_sharding_mode(relid, true);
 	local_group = kingres_shard_catalog()->local_group_id;
 
 	if (requested < 0)
@@ -657,30 +679,45 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 	/* A table added to a group whose bucket is being moved, or that an operation uses, would be missed. */
 	kingres_shard_assert_no_move(colocation_id);
 
-	groups = MemoryContextAlloc(callercxt, sizeof(int) * nbuckets);
-	for (i = 0; i < (uint64) nbuckets; i++)
-		groups[i] = -1;
-	argtypes[0] = INT4OID;
-	values[0] = Int32GetDatum(colocation_id);
-	kingres_shard_run_spi("SELECT bucket, group_id FROM " KINGRES_SHARD_SCHEMA ".bucket_map "
-			"WHERE colocation_id = $1 ORDER BY bucket",
-			1, argtypes, values);
-	for (i = 0; i < SPI_processed; i++)
+	/*
+	 * The layout of the group as of this transaction (the cache of the catalog may not have it
+	 * yet): the buckets with their moduli and owners.  A group that was split has more buckets than
+	 * bucket_count and buckets of several moduli, and the partitions of the new table follow it.
+	 */
 	{
-		int			b = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i],
-													SPI_tuptable->tupdesc, 1, &isnull));
-		int			g = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i],
-													SPI_tuptable->tupdesc, 2, &isnull));
+		int			maxmod;
+		int64		epoch;
+		uint64		nrows;
+		int		   *rows;
+		MemoryContext old;
 
-		if (b >= 0 && b < nbuckets)
-			groups[b] = g;
-	}
-	/* the layout of the group as of this transaction (the cache of the catalog may not have it yet) */
-	{
-		MemoryContext old = MemoryContextSwitchTo(callercxt);
-
-		placement = kingres_shard_coloc_make(colocation_id, nbuckets, coltype, collation, groups);
+		argtypes[0] = INT4OID;
+		values[0] = Int32GetDatum(colocation_id);
+		kingres_shard_run_spi("SELECT max_modulus, placement_epoch FROM " KINGRES_SHARD_SCHEMA ".colocation "
+							  "WHERE colocation_id = $1",
+							  1, argtypes, values);
+		if (SPI_processed != 1)
+			elog(ERROR, "colocation group %d does not exist", colocation_id);
+		maxmod = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+		epoch = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull));
+		kingres_shard_run_spi("SELECT bucket, group_id, modulus FROM " KINGRES_SHARD_SCHEMA ".bucket_map "
+							  "WHERE colocation_id = $1 ORDER BY bucket",
+							  1, argtypes, values);
+		nrows = SPI_processed;
+		rows = MemoryContextAlloc(callercxt, sizeof(int) * 3 * Max(nrows, 1));
+		for (i = 0; i < nrows; i++)
+		{
+			rows[3 * i] = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
+			rows[3 * i + 1] = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2, &isnull));
+			rows[3 * i + 2] = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 3, &isnull));
+		}
+		old = MemoryContextSwitchTo(callercxt);
+		placement = kingres_shard_coloc_begin(colocation_id, nbuckets, maxmod, epoch, coltype, collation);
+		for (i = 0; i < nrows; i++)
+			kingres_shard_coloc_add(placement, rows[3 * i], rows[3 * i + 2], rows[3 * i + 1]);
+		kingres_shard_coloc_finish(placement);
 		MemoryContextSwitchTo(old);
+		pfree(rows);
 	}
 
 	/*
@@ -710,6 +747,7 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 		}
 		MemoryContextSwitchTo(old);
 	}
+	nbuckets = kingres_shard_coloc_nbuckets(placement);	/* the buckets of the group, which a split group has more of than bucket_count */
 	if (partby != NULL && (uint64) nbuckets * (uint64) list_length(leafnames) > (uint64) kingres_shard_max_partition_leaves)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
@@ -1063,6 +1101,7 @@ kingres_create_reference_table_body(PG_FUNCTION_ARGS)
 	require_current_sql_objects();
 	kingres_shard_lock_catalog();
 	kingres_shard_require_map_group();
+	check_table_for_sharding_mode(relid, false);
 	require_read_committed();
 	LockRelationOid(relid, ExclusiveLock);
 
