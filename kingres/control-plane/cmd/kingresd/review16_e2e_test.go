@@ -146,6 +146,9 @@ func TestMarkerVerifyRejectsWhatItDidNotMake(t *testing.T) {
 		{"a check constraint", "alter table kingres_transfer.import_marker add constraint evil check (nonce <> 'zz')", "alter table kingres_transfer.import_marker drop constraint evil"},
 		{"an index", "create index evil_i on kingres_transfer.import_marker (task_id)", "drop index kingres_transfer.evil_i"},
 		{"a create grant on the schema", "grant create on schema kingres_transfer to public", "revoke create on schema kingres_transfer from public"},
+		{"a column grant on the secret", "grant select (k) on kingres_transfer.secret to public", "revoke select (k) on kingres_transfer.secret from public"},
+		{"a storage option", "alter table kingres_transfer.import_marker set (fillfactor = 50)", "alter table kingres_transfer.import_marker reset (fillfactor)"},
+		{"a column of another type", "alter table kingres_transfer.import_marker alter column rows type numeric", "alter table kingres_transfer.import_marker alter column rows type bigint"},
 		{"a select grant on the secret", "grant select on kingres_transfer.secret to public", "revoke select on kingres_transfer.secret from public"},
 	} {
 		e.svcExecDB(t, "db_xfer", c.plant)
@@ -236,5 +239,72 @@ func TestExportShowsItsGuardAndSettingsShowTheImportCap(t *testing.T) {
 	dt, _ := st["dataTransfer"].(map[string]any)
 	if dt["maxAtomicBytes"] != float64(25165824) {
 		t.Errorf("the cap of one import in the settings: %v", dt["maxAtomicBytes"])
+	}
+}
+
+// DX17-01: a database owner plants the schema, a secret table and a trigger in the window between the owner test and the creation of the objects. The service role must not
+// insert into the planted table before the structure is verified: the import fails closed and the trigger never runs.
+func TestMarkerPlantedInTheRaceWindow(t *testing.T) {
+	e, off := transferOn(t)
+	defer off()
+	q := xferDB(t, e, "db_race")
+	q("create table if not exists public.rw_t (id int)")
+	uid := e.uploadFile(t, []byte("1\n"))
+	ops.ImportFault = func(p string, _ uint32) error {
+		if p == "beforeMarkerCreate" {
+			ops.ImportFault = nil
+			q("create schema kingres_transfer")
+			q("create table kingres_transfer.secret (singleton boolean primary key default true, k bytea not null)")
+			q("create function kingres_transfer.boom() returns trigger language plpgsql as $$ begin create role kg_pwned2 superuser; return new; end $$")
+			q("create trigger boom before insert on kingres_transfer.secret for each row execute function kingres_transfer.boom()")
+		}
+		return nil
+	}
+	defer func() { ops.ImportFault = nil }()
+	task := e.startImport(t, "db_race", "rw_t", map[string]any{"uploadId": uid, "header": "none", "keepUpload": true})
+	if task["state"] != "failed" || taskCode(task) != "forbidden" {
+		t.Errorf("an import with a schema planted in the race window: %v", task["error"])
+	}
+	if got := e.svcRow(t, "postgres", "select count(*) from pg_roles where rolname = 'kg_pwned2'"); got != "0" {
+		t.Errorf("the planted trigger ran as the service role: %s", got)
+	}
+	q("drop schema kingres_transfer cascade")
+	e.serviceExec(t, "drop role if exists kg_pwned2")
+}
+
+// DX17-02: a lock on the secret table that a role with write rights on all data can hold ends the load step after the lock timeout, with a retryable code, instead of waiting for ever.
+func TestMarkerLockHeldBeforeTheLoadEndsRetryable(t *testing.T) {
+	e, off := transferOn(t)
+	defer off()
+	q := xferDB(t, e, "db_xfer")
+	uid := firstImport(t, e, q, "db_xfer", "lh_t")
+	holder := e.serviceConn(t, "db_xfer")
+	var tx interface{ Rollback(context.Context) error }
+	ops.ImportFault = func(p string, _ uint32) error {
+		if p == "afterCheck" {
+			ops.ImportFault = nil
+			x, err := holder.Begin(context.Background())
+			if err != nil {
+				t.Error(err)
+				return nil
+			}
+			tx = x
+			if _, err := x.Exec(context.Background(), "lock table kingres_transfer.secret in access exclusive mode"); err != nil {
+				t.Error(err)
+			}
+		}
+		return nil
+	}
+	defer func() { ops.ImportFault = nil }()
+	task := e.startImport(t, "db_xfer", "lh_t", map[string]any{"uploadId": uid, "header": "none"})
+	if tx != nil {
+		_ = tx.Rollback(context.Background())
+	}
+	er, _ := task["error"].(map[string]any)
+	if task["state"] != "failed" || taskCode(task) != "transfer_session_lost" || er["retryable"] != true {
+		t.Errorf("an import while the secret table is locked: %v", task["error"])
+	}
+	if task := e.startImport(t, "db_xfer", "lh_t", map[string]any{"uploadId": uid, "header": "none"}); task["state"] != "done" {
+		t.Errorf("the import after the lock was released: %v", task["error"])
 	}
 }

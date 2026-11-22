@@ -47,7 +47,7 @@ BEGIN
   IF p_nonce IS NULL OR p_task IS NULL OR p_rows IS NULL OR p_tag IS NULL OR v_k IS NULL OR pg_catalog.length(v_k) <> 32 OR p_nonce !~ '^[0-9a-f]{32}$' THEN
     RAISE EXCEPTION 'invalid marker';
   END IF;
-  IF pg_catalog.sha256(pg_catalog.sha256('\x32'::bytea || v_k) || pg_catalog.sha256(pg_catalog.sha256('\x31'::bytea || v_k) || pg_catalog.convert_to(p_nonce || ':' || p_task::text || ':' || p_rows::text, 'UTF8'))) IS DISTINCT FROM p_tag THEN
+  IF pg_catalog.sha256(pg_catalog.sha256(pg_catalog.decode('32', 'hex') || v_k) || pg_catalog.sha256(pg_catalog.sha256(pg_catalog.decode('31', 'hex') || v_k) || pg_catalog.convert_to(p_nonce || ':' || p_task::text || ':' || p_rows::text, 'UTF8'))) IS DISTINCT FROM p_tag THEN
     RAISE EXCEPTION 'invalid marker';
   END IF;
   INSERT INTO kingres_transfer.import_marker (nonce, task_id, state, rows) VALUES (p_nonce, p_task, 'committed', p_rows);
@@ -57,9 +57,9 @@ END
 // errMarkerSchema says that the schema of the marker is not the service role's own.
 var errMarkerSchema = errors.New("the schema of the marker is not owned by the service role")
 
-// markerVerifySQL is true when everything in the schema is what ensureMarker made. $1 is the body of the function. The two temporary tables hold the expected
+// markerStructSQL is true when everything in the schema is what ensureMarker made. $1 is the body of the function. The two temporary tables hold the expected
 // definitions, so that the constraints are compared as this server prints them.
-const markerVerifySQL = `
+const markerStructSQL = `
 WITH me AS (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = current_user),
      ns AS (SELECT oid, nspowner, nspacl FROM pg_catalog.pg_namespace WHERE nspname = 'kingres_transfer'),
      tabs AS (SELECT c.oid FROM pg_catalog.pg_class c, ns WHERE c.relnamespace = ns.oid AND c.relkind = 'r')
@@ -69,12 +69,9 @@ SELECT (SELECT nspowner FROM ns) = (SELECT oid FROM me)
   AND (SELECT count(*) FROM tabs) = 2
   AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c, ns, me WHERE c.relnamespace = ns.oid AND c.relowner <> me.oid)
   AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c, ns WHERE c.relnamespace = ns.oid AND (c.relhastriggers OR c.relhasrules OR c.relispartition OR c.relkind = 'p'))
-  AND (SELECT count(*) FROM pg_catalog.pg_class c, ns WHERE c.relnamespace = ns.oid AND c.relkind = 'r' AND c.relrowsecurity) = 2
   AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid, ns WHERE c.relnamespace = ns.oid)
   AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_rewrite r JOIN pg_catalog.pg_class c ON c.oid = r.ev_class, ns WHERE c.relnamespace = ns.oid)
   AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_policy p JOIN pg_catalog.pg_class c ON c.oid = p.polrelid, ns WHERE c.relnamespace = ns.oid)
-  AND (SELECT string_agg(attname, ',' ORDER BY attnum) FROM pg_catalog.pg_attribute WHERE attrelid = 'kingres_transfer.import_marker'::pg_catalog.regclass AND attnum > 0 AND NOT attisdropped) = 'nonce,task_id,state,rows,at'
-  AND (SELECT string_agg(attname, ',' ORDER BY attnum) FROM pg_catalog.pg_attribute WHERE attrelid = 'kingres_transfer.secret'::pg_catalog.regclass AND attnum > 0 AND NOT attisdropped) = 'singleton,k'
   AND (SELECT string_agg(pg_catalog.pg_get_expr(adbin, adrelid), ',' ORDER BY adnum) FROM pg_catalog.pg_attrdef WHERE adrelid = 'kingres_transfer.import_marker'::pg_catalog.regclass) = 'now()'
   AND (SELECT string_agg(pg_catalog.pg_get_expr(adbin, adrelid), ',' ORDER BY adnum) FROM pg_catalog.pg_attrdef WHERE adrelid = 'kingres_transfer.secret'::pg_catalog.regclass) = 'true'
   AND (SELECT coalesce(string_agg(pg_catalog.pg_get_constraintdef(oid), ';' ORDER BY pg_catalog.pg_get_constraintdef(oid)), '') FROM pg_catalog.pg_constraint WHERE conrelid = 'kingres_transfer.import_marker'::pg_catalog.regclass AND contype IN ('c', 'p', 'u', 'f', 'x', 't'))
@@ -91,14 +88,41 @@ SELECT (SELECT nspowner FROM ns) = (SELECT oid FROM me)
         OR (d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass AND d.objid IN (SELECT p.oid FROM pg_catalog.pg_proc p, ns WHERE p.pronamespace = ns.oid))))
   AND (SELECT count(*) FROM pg_catalog.pg_proc p, ns WHERE p.pronamespace = ns.oid) = 1
   AND EXISTS (SELECT 1 FROM pg_catalog.pg_proc p, ns, me WHERE p.pronamespace = ns.oid AND p.proname = 'mark' AND p.proowner = me.oid AND p.prosecdef
-              AND p.prosrc = $1 AND p.proconfig = ARRAY['search_path=pg_catalog']::text[] AND p.prolang = (SELECT oid FROM pg_catalog.pg_language WHERE lanname = 'plpgsql'))
+              AND p.prosrc = $1 AND p.proconfig = ARRAY['search_path=pg_catalog', 'lock_timeout=10s']::text[] AND p.prolang = (SELECT oid FROM pg_catalog.pg_language WHERE lanname = 'plpgsql'))
+  AND (SELECT string_agg(attname || ':' || atttypid::pg_catalog.text || ':' || attnotnull::pg_catalog.text || ':' || attcollation::pg_catalog.text || ':' || attidentity::pg_catalog.text || ':' || attgenerated::pg_catalog.text, ',' ORDER BY attnum) FROM pg_catalog.pg_attribute WHERE attrelid = 'kingres_transfer.import_marker'::pg_catalog.regclass AND attnum > 0 AND NOT attisdropped)
+    = (SELECT string_agg(attname || ':' || atttypid::pg_catalog.text || ':' || attnotnull::pg_catalog.text || ':' || attcollation::pg_catalog.text || ':' || attidentity::pg_catalog.text || ':' || attgenerated::pg_catalog.text, ',' ORDER BY attnum) FROM pg_catalog.pg_attribute WHERE attrelid = 'pg_temp.mk_expect_marker'::pg_catalog.regclass AND attnum > 0 AND NOT attisdropped)
+  AND (SELECT string_agg(attname || ':' || atttypid::pg_catalog.text || ':' || attnotnull::pg_catalog.text || ':' || attcollation::pg_catalog.text || ':' || attidentity::pg_catalog.text || ':' || attgenerated::pg_catalog.text, ',' ORDER BY attnum) FROM pg_catalog.pg_attribute WHERE attrelid = 'kingres_transfer.secret'::pg_catalog.regclass AND attnum > 0 AND NOT attisdropped)
+    = (SELECT string_agg(attname || ':' || atttypid::pg_catalog.text || ':' || attnotnull::pg_catalog.text || ':' || attcollation::pg_catalog.text || ':' || attidentity::pg_catalog.text || ':' || attgenerated::pg_catalog.text, ',' ORDER BY attnum) FROM pg_catalog.pg_attribute WHERE attrelid = 'pg_temp.mk_expect_secret'::pg_catalog.regclass AND attnum > 0 AND NOT attisdropped)
+  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a WHERE a.attrelid IN (SELECT oid FROM tabs) AND a.attacl IS NOT NULL)
+  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid IN (SELECT oid FROM tabs) AND c.reloptions IS NOT NULL)
+  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid IN (SELECT oid FROM tabs) OR i.inhparent IN (SELECT oid FROM tabs))
+  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_publication_rel r WHERE r.prrelid IN (SELECT oid FROM tabs))
+  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_publication_namespace o, ns WHERE o.pnnspid = ns.oid)
+  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_operator o, ns WHERE o.oprnamespace = ns.oid)
+  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_collation o, ns WHERE o.collnamespace = ns.oid)
+  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_conversion o, ns WHERE o.connamespace = ns.oid)
+  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_statistic_ext o, ns WHERE o.stxnamespace = ns.oid)
+  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_opclass o, ns WHERE o.opcnamespace = ns.oid)
+  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_opfamily o, ns WHERE o.opfnamespace = ns.oid)
+  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_ts_config o, ns WHERE o.cfgnamespace = ns.oid)
+  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_ts_dict o, ns WHERE o.dictnamespace = ns.oid)
+  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_ts_parser o, ns WHERE o.prsnamespace = ns.oid)
+  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_ts_template o, ns WHERE o.tmplnamespace = ns.oid)
   AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_type t, ns WHERE t.typnamespace = ns.oid AND t.typtype NOT IN ('c', 'b') AND t.typrelid = 0)
+`
+
+// markerFinalSQL is the part of the check that needs the row security and the secret row: it runs after them.
+const markerFinalSQL = `
+WITH ns AS (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = 'kingres_transfer')
+SELECT (SELECT count(*) FROM pg_catalog.pg_class c, ns WHERE c.relnamespace = ns.oid AND c.relkind = 'r' AND c.relrowsecurity) = 2
   AND (SELECT count(*) FROM kingres_transfer.secret) = 1
   AND (SELECT pg_catalog.length(k) FROM kingres_transfer.secret) = 32
 `
 
-// verifyMarker runs markerVerifySQL in tx (after it made the two temporary tables of the expected definitions).
-func verifyMarker(ctx context.Context, tx pgx.Tx) (bool, error) {
+// verifyMarkerStruct makes the two temporary tables of the expected definitions and runs the structural check: owner, tables, triggers, rules, policies, columns,
+// constraints, indexes, grants, objects of the schema and the function. It reads and runs nothing of the objects. ensureMarker runs it before any write to an object
+// that existed before its transaction (DX17-01).
+func verifyMarkerStruct(ctx context.Context, tx pgx.Tx) (bool, error) {
 	for _, s := range []string{
 		"CREATE TEMP TABLE mk_expect_marker (nonce text PRIMARY KEY CHECK (length(nonce) = 32), task_id bigint NOT NULL, state text NOT NULL CHECK (state IN ('committed', 'aborted')), rows bigint NOT NULL, at timestamptz NOT NULL DEFAULT now()) ON COMMIT DROP",
 		"CREATE TEMP TABLE mk_expect_secret (singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton), k bytea NOT NULL) ON COMMIT DROP",
@@ -108,10 +132,28 @@ func verifyMarker(ctx context.Context, tx pgx.Tx) (bool, error) {
 		}
 	}
 	var ok bool
-	if err := tx.QueryRow(ctx, markerVerifySQL, markFuncBody).Scan(&ok); err != nil {
+	if err := tx.QueryRow(ctx, markerStructSQL, markFuncBody).Scan(&ok); err != nil {
 		return false, err
 	}
 	return ok, nil
+}
+
+// verifyMarkerFinal checks the row security and the secret row.
+func verifyMarkerFinal(ctx context.Context, tx pgx.Tx) (bool, error) {
+	var ok bool
+	if err := tx.QueryRow(ctx, markerFinalSQL).Scan(&ok); err != nil {
+		return false, err
+	}
+	return ok, nil
+}
+
+// verifyMarker is the whole check, for a transaction that only reads (the load step).
+func verifyMarker(ctx context.Context, tx pgx.Tx) (bool, error) {
+	ok, err := verifyMarkerStruct(ctx, tx)
+	if err != nil || !ok {
+		return false, err
+	}
+	return verifyMarkerFinal(ctx, tx)
 }
 
 // markerRaceCodes are the codes that a creation that raced another one ends with; the whole creation is tried again.
@@ -191,10 +233,35 @@ func (o *Ops) ensureMarkerOnce(ctx context.Context, db string, open []int64) err
 				return e
 			}
 		}
+		// A fault point of the tests, between the owner test and the creation: the window that a database owner could use.
+		_ = importFault("beforeMarkerCreate", nil)
 		for _, s := range []string{
 			"CREATE SCHEMA IF NOT EXISTS kingres_transfer",
 			"CREATE TABLE IF NOT EXISTS " + markerTable + " (nonce text PRIMARY KEY CHECK (length(nonce) = 32), task_id bigint NOT NULL, state text NOT NULL CHECK (state IN ('committed', 'aborted')), rows bigint NOT NULL, at timestamptz NOT NULL DEFAULT now())",
 			"CREATE TABLE IF NOT EXISTS kingres_transfer.secret (singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton), k bytea NOT NULL)",
+		} {
+			if _, e := tx.Exec(ctx, s); e != nil {
+				return e
+			}
+		}
+		var exists bool
+		if e := tx.QueryRow(ctx, `SELECT pg_catalog.to_regprocedure('kingres_transfer.mark(text, bigint, bigint, bytea)') IS NOT NULL`).Scan(&exists); e != nil {
+			return e
+		}
+		if !exists {
+			if _, e := tx.Exec(ctx, "CREATE FUNCTION kingres_transfer.mark(p_nonce text, p_task bigint, p_rows bigint, p_tag bytea) RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog SET lock_timeout = '10s' AS $f$"+markFuncBody+"$f$"); e != nil {
+				return e
+			}
+		}
+		// Verify first: nothing is altered or written on an object that existed before this transaction until the structure is the one the service role made.
+		verified, e := verifyMarkerStruct(ctx, tx)
+		if e != nil {
+			return e
+		}
+		if !verified {
+			return errMarkerNotVerified
+		}
+		for _, s := range []string{
 			"ALTER TABLE " + markerTable + " ENABLE ROW LEVEL SECURITY",
 			"ALTER TABLE kingres_transfer.secret ENABLE ROW LEVEL SECURITY",
 		} {
@@ -206,20 +273,9 @@ func (o *Ops) ensureMarkerOnce(ctx context.Context, db string, open []int64) err
 		if _, e := tx.Exec(ctx, "INSERT INTO kingres_transfer.secret (k) VALUES ($1) ON CONFLICT DO NOTHING", key); e != nil {
 			return e
 		}
-		var exists bool
-		if e := tx.QueryRow(ctx, `SELECT pg_catalog.to_regprocedure('kingres_transfer.mark(text, bigint, bigint, bytea)') IS NOT NULL`).Scan(&exists); e != nil {
+		if final, e := verifyMarkerFinal(ctx, tx); e != nil {
 			return e
-		}
-		if !exists {
-			if _, e := tx.Exec(ctx, "CREATE FUNCTION kingres_transfer.mark(p_nonce text, p_task bigint, p_rows bigint, p_tag bytea) RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $f$"+markFuncBody+"$f$"); e != nil {
-				return e
-			}
-		}
-		verified, e := verifyMarker(ctx, tx)
-		if e != nil {
-			return e
-		}
-		if !verified {
+		} else if !final {
 			return errMarkerNotVerified
 		}
 		// Only after the check, so that nothing is granted or written on an object that the service role did not make.
@@ -242,8 +298,10 @@ func (o *Ops) ensureMarkerOnce(ctx context.Context, db string, open []int64) err
 func (o *Ops) markerSecret(ctx context.Context, db string) ([]byte, error) {
 	var k []byte
 	err := o.asService(ctx, db, func(tx pgx.Tx) error {
-		if _, e := tx.Exec(ctx, "SET LOCAL search_path = pg_catalog"); e != nil {
-			return e
+		for _, st := range []string{"SET LOCAL search_path = pg_catalog", "SET LOCAL lock_timeout = '10s'"} {
+			if _, e := tx.Exec(ctx, st); e != nil {
+				return e
+			}
 		}
 		ok, e := verifyMarker(ctx, tx)
 		if e != nil {
