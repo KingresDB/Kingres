@@ -7,7 +7,7 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
-## 2026-11-22: phase 11 (distributed schemas) steps 12 to 15: the scale work, the control plane, the panel and the documentation
+## 2026-11-22: phase 11 (distributed schemas), the extension: the scale work (step 12), the review fixes and the documentation (step 15)
 
 Covers the work on branch shard-p1011 after the second review of phase 11 (the review fixes of 2026-11-21 are in the entry of that day).
 
@@ -24,37 +24,31 @@ Covers the work on branch shard-p1011 after the second review of phase 11 (the r
   `kingres_shard--0.8.sql` is checked against `mk-install-script.sh` (`t/250`) and was regenerated after the merge of `ext-partfix` (a fresh 0.8 install had its partition blocker back); the lazy
   lookups take the primary key index from the open table, not an OID kept at load (REINDEX CONCURRENTLY, a renamed or missing index, `t/247`); `add_node` cleans the new node when there is no
   schema left to make and a missing role is an error of the call (`t/251`); sha256 digests; `catalog_incremental` is `PGC_SUSET`.
-- **Step 13, the control plane** (`kingres/control-plane`, `kingres/api`, contract 0.15.0): five operations (`listSchemas`, `getSchema`, `distributeSchema`, `undistributeSchema`,
-  `moveSchema`), three task kinds (`schema.distribute`, `schema.move`, `schema.undistribute`) with the steps of the design, four problem codes, the database `mode` and
-  `distributeNewSchemas`, colocation `kind`, in-flight moves of kind schema.  The task engine gained `Step.Recover` (a NonIdempotent step reads its own effect when found running),
-  `Env.SetItems` and `Env.CancelRequested`, and migration 0050 makes the schema tasks and a failover exclude each other.  Cluster tests on PostgreSQL 18 and 19: distribute, move with a
-  writer, kill and resume at 17 points, undistribute, rebalance with a schema present.
-- **Step 14, the panel** (`kingres/web`): the create and settings dialogs with Rows, Schemas and Both, the Schemas section of the database page with the Distribute, Move and Make-local
-  dialogs, the Shards and Rebalance pages, the mock API, the generated types for 0.15.0.
-- **Step 15, the documentation**: the section of the extension README ("Distributed schemas", with how to use them and the limits), `kingres/api/README.md`, `kingres/web/README.md`,
-  `kingres/control-plane/README.md` and this entry.
+- **Steps 13 and 14, the control plane and the panel, are not part of this branch.**  They were built here (contract 0.15.0, five operations, three task kinds, the task engine's `Step.Recover`, migration
+  0050, the panel's dialogs) and then taken out again: the branch cp-1011 already carries the control plane and the console of phases 10 and 11 (contract 0.16.0, after failover 0.15.0 and cp-push
+  0.14.0), in its fixed merge order.  The work stays on the branch `p11-cp-steps13-14` (8c9488e9aa) for a comparison with cp-1011.
+- **Step 15, the documentation**: the section of the extension README ("Distributed schemas", with how to use them and the limits) and this entry.
 
 ### How it was verified
 
-- `kingres_shard` at the tip of shard-p1011 (clean -Werror builds, regress, every TAP file) on PostgreSQL 18.7 and 19rc2: 48828 tests on 18 and 48794 on 19 (218 files each), in tree 218 of 219 (the one skipped is `046_two_majors`, as always) and `kingres_ledger` 39 of 39.  The files that touch the catalog cache also pass with `KS_CATALOG_FULL=1` (31 files, 4317 tests on each major).
-- Mutants: step 12 (b) six, (a) seven, the apply of a catalog one, the review fixes six; the control plane 30 (17 unit, 13 cluster); the panel 41.  Every one is killed by a named test.
-- Control plane: `go build`, `go vet`, `go test` of ops, httpapi, task and contract pass; the cluster tests pass on both majors; `check-contract.mjs` passes.
-- Panel: lint, type check, `api:check`, build, 1528 unit tests and 58 browser tests.
+- `kingres_shard` at the tip with the extension changes (clean -Werror builds, regress, every TAP file) on PostgreSQL 18.7 and 19rc2: 48828 tests on 18 and 48794 on 19 (218 files each), in tree
+  218 of 219 (the one skipped is `046_two_majors`, as always) and `kingres_ledger` 39 of 39.  The files that touch the catalog cache also pass with `KS_CATALOG_FULL=1` (31 files, 4317 tests on each
+  major).  Those runs were made with the control plane and panel merged; they do not run any of their code.
+- Mutants: step 12 (b) six, (a) seven, the apply of a catalog one, the review fixes six; every one is killed by a named test.
 
 ### Decisions and deviations
 
-- The contract is numbered 0.15.0 because phase 10 holds 0.14.0 on its own branch; the changelog entry counts from 0.13.0 and has to be merged with 0.14.0's at the integration.  Migration 0050
-  may need renumbering the same way.
-- `move_schema` is one blocking call, so the task's copy step holds the call and polls `kingres.bucket_move`; the task ends at `cleaning` with a note (design 13.1).
-- The rebalance preview has no schema units: `kingres.rebalance_plan()` plans buckets only; schema moves show in the moves in flight.
-- The extension's `check_cluster` has no schema checks of its own yet (design 9.10); the verify step of the tasks compares per-node state itself.
+- The control plane and the panel of distributed schemas come from cp-1011.  What the work on `p11-cp-steps13-14` has that cp-1011 may lack (the exclusion of the schema tasks and a failover, `Step.Recover`
+  for a NonIdempotent step, the detail that names keyless tables before a move) is for a later comparison.
+- The extension's `check_cluster` has no schema checks of its own yet (design 9.10).
+- The rebalance plan (`rebalance_plan()`) plans buckets only; it does not move a schema.
 
 ### Still open
 
-- Independent reviews of steps 13 to 15.
-- Integration: phase 10's contract (0.14.0), its migration and its scheduler (which would issue schema moves in a rebalance) with this branch.
+- Independent review of the extension work of this entry.
+- The comparison of `p11-cp-steps13-14` with cp-1011.
 - A load that is incremental per colocation group, if 2000 schemas are not enough (the DDL statement still grows from 26 to 52 ms between 200 and 2000 schemas).
-- A flake seen once by the step 13 author: the switch of a move under a running writer timed out on a node and the move was undone; not understood.
+- A flake seen once under the control plane work: the switch of a move under a running writer timed out on a node and the move was undone; not understood.
 
 ### Core patches
 

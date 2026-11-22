@@ -2076,7 +2076,7 @@ To use them: on the map group primary, `SELECT kingres.set_sharding_mode('schema
 service.  A new schema is placed on the group that holds the fewest schemas for its weight (`kingres_shard.schema_placement_group` or the `group_id` of `distribute_schema` overrides) and its tables are made on
 every node, empty except on the owner.  Connect to any node: a statement on the schema is shipped whole to its owner; a statement that mixes schemas of two owners, local, hash or reference tables is answered by
 the distributed scan.  `kingres.move_schema(schema, group)` moves a schema online; `kingres.distribute_schema(schema)` and `kingres.undistribute_schema(schema)` convert an existing schema in place; the control plane
-(`kingres/control-plane`, contract 0.15.0) and the panel (`kingres/web`) run the same operations as tasks.
+and the panel of the product (branch cp-1011, not part of this extension's tree) run the same operations as tasks.
 
 Limits of this version:
 
