@@ -15,6 +15,7 @@ import (
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/cluster"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/leader"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/peerclient"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pki"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
@@ -412,5 +413,38 @@ func TestEscrowCallsAreLeaderOnly(t *testing.T) {
 		if internalapi.Calls[k] != internalapi.LeaderOnly {
 			t.Errorf("%s is not LeaderOnly", k)
 		}
+	}
+}
+
+// A server that holds a CA key but is not the leader (an old leader that came back) sends nothing: its copies would be stale.
+func TestAFormerLeaderThatStillHoldsTheKeySendsNothing(t *testing.T) {
+	c := newEscrowCluster(t, "db1", "db2")
+	ctx := context.Background()
+	if _, err := c.leader().SetEscrow(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	before := len(c.calls)
+	// A revocation that the copies do not hold yet: a sender would have something to send.
+	lca, _ := c.leader().Svc.CA()
+	if err := lca.Revoke("aa77", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	other := ""
+	c.leader().Leaders = leader.New(func(context.Context) (string, error) { return other, nil }, time.Hour, time.Now)
+	other = "db2" // the cluster's leader is db2 now
+	if err := c.leader().SyncEscrow(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.calls) != before {
+		t.Fatalf("a server that is not the leader sent copies: %v", c.calls[before:])
+	}
+	// When it is the leader again it sends again.
+	c.leader().Leaders.Invalidate()
+	other = "db1"
+	if err := c.leader().SyncEscrow(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.calls) == before {
+		t.Fatal("the leader sent nothing after a revocation")
 	}
 }

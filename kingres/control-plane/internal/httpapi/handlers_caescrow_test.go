@@ -115,3 +115,12 @@ func TestCaEscrowWithoutSupport(t *testing.T) {
 	e.initialize()
 	wantProblem(t, e.do(req{method: "GET", path: "/api/v1/certificate-authority/escrow", bearer: e.token(auth.RoleAdmin)}), 422, "unsupported_operation")
 }
+
+// The escrow lives on the leader: a server that is not the leader forwards all three operations, the read as well.
+func TestCaEscrowOperationsAreAnsweredByTheLeader(t *testing.T) {
+	for _, id := range []string{"getCaEscrow", "setCaEscrow", "rotateCaEscrow"} {
+		if !forwardsToLeader(operationOf(t, id)) {
+			t.Errorf("%s is not forwarded to the leader", id)
+		}
+	}
+}
