@@ -44,7 +44,7 @@ func TestCSVCheck(t *testing.T) {
 		{"encoding lower case", CSV{Encoding: "utf8"}, "/encoding"},
 		{"quote the delimiter", CSV{Delimiter: ";", Quote: ";"}, "/quote"},
 		{"quote two bytes", CSV{Quote: `""`}, "/quote"},
-		{"quote not ASCII", CSV{Quote: "«"}, "/quote"},
+		{"quote not ASCII", CSV{Quote: "\xc2\xab"}, "/quote"},
 		{"quote a control character", CSV{Quote: "\x01"}, "/quote"},
 		{"quote a backslash", CSV{Quote: `\`}, "/quote"},
 		{"quote a dot", CSV{Quote: "."}, "/quote"},

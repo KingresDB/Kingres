@@ -242,11 +242,11 @@ func TestSafeErrorOfTheRouter(t *testing.T) {
 	shardErr := &pgconn.PgError{
 		Code: "23505", Message: `duplicate key value violates unique constraint "dtab_b0001_pkey"`, Detail: "Key (id)=(7) already exists.",
 		TableName: "dtab_b0001", SchemaName: "public", ConstraintName: "dtab_b0001_pkey",
-		Where: "remote node /home/kingres/kw-cp/test/xaIiixiYMs:20861\nbulk insert of public.dtab, batch 1 to group 0",
+		Where: "remote node /srv/nodes/xaIiixiYMs:20861\nbulk insert of public.dtab, batch 1 to group 0",
 	}
 	e := SafeError(shardErr).ForTarget("public", "dtab")
 	out := e.Error()
-	for _, bad := range []string{"_b0001", "xaIiixiYMs", "/home/", "20861", "Key (id)", "duplicate key", "bulk insert"} {
+	for _, bad := range []string{"_b0001", "xaIiixiYMs", "/srv/", "20861", "Key (id)", "duplicate key", "bulk insert"} {
 		if strings.Contains(out, bad) {
 			t.Errorf("%q reaches the output: %q", bad, out)
 		}
