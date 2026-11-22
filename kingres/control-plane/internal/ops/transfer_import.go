@@ -62,6 +62,8 @@ type importParams struct {
 	Reference    bool                `json:"reference,omitempty"`
 	MaxBytes     int64               `json:"maxBytes"`
 	Owner        transfer.Identity   `json:"owner"`
+	// MarkerNonce is the random key of the marker of this import (see transfer_marker.go).
+	MarkerNonce string `json:"markerNonce"`
 }
 
 // ImportFault is the fault point hook of the tests (nil in production): it is called with the name of a point of the commit protocol and the process id of
@@ -312,7 +314,11 @@ func (o *Ops) StartImport(ctx context.Context, actor, db, schema, table string, 
 		return task.Task{}, err
 	}
 	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
-	if err := refuseDangerousRole(ctx, conn); err != nil {
+	bad, derr := dangerousRole(ctx, conn)
+	if derr != nil {
+		return task.Task{}, derr
+	}
+	if bad {
 		return task.Task{}, problem.New(problem.Forbidden, "An import runs the triggers, defaults and checks of the table as the signed-in role, so it is refused for a role with the SUPERUSER, REPLICATION or BYPASSRLS attribute or with access to server files, programs or logs; sign in as another role.")
 	}
 	cols, types, err := o.importTarget(ctx, conn, schema, table, req.Columns, class)
@@ -332,7 +338,11 @@ func (o *Ops) StartImport(ctx context.Context, actor, db, schema, table string, 
 	if _, err := transfer.CopyFromSQL(schema, table, cols, csv, header, req.ForceNotNull, req.ForceNull); err != nil {
 		return task.Task{}, problem.Validation("The import request is invalid.", field("/columns", "a name is not valid", "pattern"))
 	}
-	p := importParams{UploadID: up.ID, Database: db, Schema: schema, Table: table, Columns: cols, ColumnTypes: types, CSV: csv, Header: header, ForceNotNull: req.ForceNotNull,
+	nonce, nerr := newMarkerNonce()
+	if nerr != nil {
+		return task.Task{}, nerr
+	}
+	p := importParams{MarkerNonce: nonce, UploadID: up.ID, Database: db, Schema: schema, Table: table, Columns: cols, ColumnTypes: types, CSV: csv, Header: header, ForceNotNull: req.ForceNotNull,
 		ForceNull: req.ForceNull, Gzip: gz, SkipBOM: skipBOM, KeepUpload: req.KeepUpload, Reference: class == "reference", MaxBytes: cap, Owner: who}
 	t, err := o.StartTask(ctx, KindTableImport, "table", db+"/"+schema+"."+table, p, actor)
 	if err != nil {
@@ -560,54 +570,6 @@ func (p *progressReader) Read(b []byte) (int, error) {
 	return n, err
 }
 
-// markerTable is the table, in the database of the target, that decides the outcome of an import (DX14-01). The load inserts a row for its task into it inside
-// the transaction of the load, so the row commits with the data or not at all (for a routed table inside the same two-phase commit). A run that finds the intent
-// asks the marker: a row "committed" says the rows are in; otherwise the run inserts a row "aborted" for the task, which waits for a transaction that holds the
-// key and, once inserted, makes the commit of any transaction of that task impossible (it would fail on the key): the rows are then provably not stored.
-const markerTable = "kingres_transfer.import_marker"
-
-// ensureMarker makes the schema, the table and the function that writes into it, with the service role. The table belongs to the service role and no other
-// role can touch it; the role of an import writes its row through the function, which runs as the service role. No privilege is granted to the role itself, so
-// that dropping the role is never blocked by it. A role that calls the function with the id of a task it does not own can only make that task fail on the key.
-func (o *Ops) ensureMarker(ctx context.Context, db, _ string) error {
-	return wrap(o.asService(ctx, db, func(tx pgx.Tx) error {
-		for _, s := range []string{
-			"CREATE SCHEMA IF NOT EXISTS kingres_transfer",
-			"CREATE TABLE IF NOT EXISTS " + markerTable + " (task_id bigint PRIMARY KEY, state text NOT NULL CHECK (state IN ('committed', 'aborted')), rows bigint NOT NULL, at timestamptz NOT NULL DEFAULT now())",
-			"CREATE OR REPLACE FUNCTION kingres_transfer.mark(t bigint, n bigint) RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog AS $f$ INSERT INTO kingres_transfer.import_marker (task_id, state, rows) VALUES (t, 'committed', n) $f$",
-			"REVOKE ALL ON TABLE " + markerTable + " FROM PUBLIC",
-			"GRANT USAGE ON SCHEMA kingres_transfer TO PUBLIC",
-			"GRANT EXECUTE ON FUNCTION kingres_transfer.mark(bigint, bigint) TO PUBLIC",
-		} {
-			if _, err := tx.Exec(ctx, s); err != nil {
-				return err
-			}
-		}
-		return nil
-	}))
-}
-
-// decideOutcome settles whether the transaction of a task committed. It is only called for a task that wrote its intent. committed is true when the marker says
-// the rows are in; false means a marker "aborted" now exists and the transaction can never commit. err is set when the question could not be answered (the
-// lock on the key was not given in a minute: a transaction in doubt holds it), and the outcome is then unknown.
-func (o *Ops) decideOutcome(ctx context.Context, db string, taskID int64) (committed bool, rows int64, err error) {
-	err = o.asService(ctx, db, func(tx pgx.Tx) error {
-		if _, e := tx.Exec(ctx, "SET LOCAL lock_timeout = '60s'"); e != nil {
-			return e
-		}
-		if _, e := tx.Exec(ctx, "INSERT INTO "+markerTable+" (task_id, state, rows) VALUES ($1, 'aborted', -1) ON CONFLICT (task_id) DO NOTHING", taskID); e != nil {
-			return e
-		}
-		var state string
-		if e := tx.QueryRow(ctx, "SELECT state, rows FROM "+markerTable+" WHERE task_id = $1", taskID).Scan(&state, &rows); e != nil {
-			return e
-		}
-		committed = state == "committed"
-		return nil
-	})
-	return committed, rows, err
-}
-
 // resolveAfterIntent turns the question "did it commit" into the answer of the task: done when the marker is there, a retryable failure with the proof when it
 // is not, an unknown outcome when it cannot be asked.
 func (o *Ops) resolveAfterIntent(ctx context.Context, env *task.Env, p importParams) error {
@@ -615,7 +577,7 @@ func (o *Ops) resolveAfterIntent(ctx context.Context, env *task.Env, p importPar
 	if up, gerr := o.records().Get(ctx, p.UploadID); gerr != nil || up.ServerID != o.ServerHost {
 		return o.unknownOutcome(env.Task)
 	}
-	committed, rows, err := o.decideOutcome(ctx, p.Database, env.Task.ID)
+	committed, rows, err := o.decideOutcome(ctx, p, env.Task.ID)
 	switch {
 	case err != nil:
 		return o.unknownOutcome(env.Task)
@@ -653,7 +615,15 @@ func (o *Ops) stepImportLoad(ctx context.Context, env *task.Env) error {
 	}
 	// The connection and its transaction belong to this run and end with it, whatever happens (a lease that is lost stands the run down without a hook).
 	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
-	if err := refuseDangerousRole(ctx, conn); err != nil {
+	bad, derr := dangerousRole(ctx, conn)
+	if derr != nil {
+		return transfer.Errorf(transfer.CodeSessionLost, true, "the check of the role could not be made now; repeat the operation")
+	}
+	secret, serr := o.markerSecret(ctx, p.Database)
+	if serr != nil {
+		return transfer.Errorf(transfer.CodeSessionLost, true, "the marker of the database could not be read now; repeat the operation")
+	}
+	if bad {
 		return transfer.Errorf(transfer.CodeForbidden, false, "the role has the SUPERUSER, REPLICATION or BYPASSRLS attribute or access to server files, programs or logs; an import runs the triggers and defaults of the table as that role")
 	}
 	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
@@ -709,7 +679,7 @@ func (o *Ops) stepImportLoad(ctx context.Context, env *task.Env) error {
 	}
 	_ = importFault("beforeIntent", conn)
 	// The marker commits with the rows or not at all. A second marker of the same task (a run that raced this one) fails here, and nothing commits.
-	if _, err := tx.Exec(ctx, "SELECT kingres_transfer.mark($1, $2)", env.Task.ID, tag); err != nil {
+	if _, err := tx.Exec(ctx, "SELECT kingres_transfer.mark($1, $2, $3, $4)", p.MarkerNonce, env.Task.ID, tag, markerTag(secret, p.MarkerNonce, env.Task.ID, tag)); err != nil {
 		return transfer.Errorf(transfer.CodeCopyInterrupted, true, "the marker of the import could not be written; nothing was stored, repeat the operation")
 	}
 	// A connection that broke since the load: nothing was committed, the transaction died with it, and the import may be repeated.
@@ -856,7 +826,7 @@ func (o *Ops) stepImportCommit(ctx context.Context, env *task.Env) error {
 	var state string
 	var rows int64
 	if err := o.asService(ctx, p.Database, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx, "SELECT state, rows FROM "+markerTable+" WHERE task_id = $1", env.Task.ID).Scan(&state, &rows)
+		return tx.QueryRow(ctx, "SELECT state, rows FROM "+markerTable+" WHERE nonce = $1", p.MarkerNonce).Scan(&state, &rows)
 	}); err != nil || state != "committed" {
 		return o.unknownOutcome(env.Task)
 	}

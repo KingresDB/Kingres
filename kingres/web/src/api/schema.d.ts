@@ -1286,7 +1286,7 @@ export interface paths {
          *     whose buckets are all on one group are one snapshot (`single-snapshot`); a table over several groups is read per group (`per-group`) and the groups'
          *     snapshots are not one instant. Writers are not stopped. **There is no global snapshot.** Two exports of a table that give the same SHA-256 saw the same data.
          *
-         *     `spreadsheetSafe` (default `true`) prefixes with an apostrophe a text cell that a spreadsheet would read as a formula. It is lossy and **not a security feature**.
+         *     `spreadsheetSafe` (default `true`) prefixes with an apostrophe a text cell that a spreadsheet would read as a formula. It is lossy and **not a security feature**. With a header, a column name that starts like a formula gets the apostrophe too, so import such a file with `header: skip` (`match` compares the names).
          *     The task codes of a failed export are: `export_too_large`, `insufficient_disk`, `transfer_quota_exceeded`, `transfer_timeout`, `transfer_leader_changed` (retryable),
          *     `transfer_session_lost` (retryable), `transfer_key_lost`, `copy_interrupted` (retryable), `forbidden` (the role lost its right between two steps), `cancelled`.
          *     The error of a task never carries a value, a row or text of the server.
@@ -1329,7 +1329,7 @@ export interface paths {
          *     several groups); 422 `import_header_mismatch` (`header: match` failed; the first difference is named), `import_ledger_policy` (a ledger table whose signature policy is
          *     `required`), `import_too_large`, `import_end_marker` (the file has an unquoted `\.` line; the line number is given) and `validation_failed`.
          *
-         *     The task `table.import` has the steps *Check the upload*, *Check the table*, *Load rows* (the load and the commit), *Confirm the commit* and *Clean up*. `Task.cancellable` is true until the commit has been
+         *     A task that is `done` means that the local commit happened; on a distributed table a group whose `COMMIT PREPARED` is still pending may show its rows a moment later. A task can fail `forbidden` when the schema `kingres_transfer` of the database is not the control plane's own (an operator must remove it); a transient failure of the role check is retryable (`transfer_session_lost`). The task `table.import` has the steps *Check the upload*, *Check the table*, *Load rows* (the load and the commit), *Confirm the commit* and *Clean up*. `Task.cancellable` is true until the commit has been
          *     sent. The outcome of the commit is read from a marker that commits with the rows: a commit that did not happen fails with `copy_interrupted` (retryable) and nothing stored; a task that fails after the commit was sent and whose marker could not be read (a change of leader, a lock wait that ran out) has the code `import_outcome_unknown` (`retryable: false`): **N rows may have been loaded; check
          *     the table before repeating the import.** Other task codes: `row_count_mismatch`, `transfer_timeout`, `transfer_leader_changed` (retryable), `transfer_session_lost`
          *     (retryable), `copy_interrupted` (retryable), `forbidden`, `cancelled`, and `sql_error` with a `sqlState`. **No error of a task, no problem and no audit event carries a value,
