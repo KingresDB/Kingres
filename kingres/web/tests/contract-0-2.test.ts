@@ -153,7 +153,10 @@ describe('distribute table with columns from the contract', () => {
     expect(within(blocked).getByText(/cannot be hashed into buckets/i)).toBeInTheDocument()
     expect(within(blocked).getByText('tags')).toBeInTheDocument()
 
-    await user.click(within(dialog).getByRole('button', { name: /^distribute table$/i }))
+    // The start button waits for the preview of the change (what the sharding extension says about the table).
+    const start = within(dialog).getByRole('button', { name: /^distribute table$/i })
+    await waitFor(() => expect(start).toBeEnabled())
+    await user.click(start)
     expect(await within(dialog).findByText('Finished.')).toBeInTheDocument()
     const t = getState().databases[0]!.tables.find((x) => x.name === 'notes')
     expect(t?.distribution?.column).toBe('note_id')

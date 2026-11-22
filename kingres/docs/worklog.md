@@ -7,6 +7,80 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-22: the table page and the table dialogs of the console (phase 9, increment 9.7) moved onto the control plane of 9.6
+
+Branch web-15b (from m18) carries the one console commit of web-15 for increment 9.7, cherry-picked so that the history stays one commit. web-15 also holds the failover console of contract 0.15.0, which m18 does not have; it is not taken here.
+
+### What was done
+
+- The table page `/databases/<name>/tables/<schema>/<table>`, the dialogs distribute, undistribute, change the distribution, create, attach, detach and drop a partition, the preview panel and the task panel, from web-15.
+- The conflicts (README, browser harness, `mocks/http.ts`, `mocks/state.ts`) all came from the 0.15.0 failover console; only the 0.14.0 table parts were kept. The fixed-shape mock handlers that 9.6 put on m18 for the eight operations were replaced by the mock of 9.7 (`src/mocks/tables.ts`); the generated types, operations and problem codes are those of m18, and no stand-in type is left. A doc comment that had slipped above a new constant in `handlers.ts` was put back.
+- Checked against shard-phase9.md: each of the eight operations of 9.6 has its UI (the preview in every dialog, undistribute, alter, create, attach, detach, drop, the list of partitions). Not done as the design describes: the progress indicator on a row of the tables list and the badge on the Shards page need an `operation` field on `Table`, which contract 0.14.0 does not have; "distribute with related tables" (control plane and dialog) stays open, as the README says. The reviews in kingres/docs/reviews say nothing about the console of 9.7 (the review of increments 4 to 9 lists the console as not in the commits).
+
+### How it was checked
+
+- `npm run typecheck`, `npm run lint` (eslint and prettier) and `npm run api:check`: clean.
+- `npx vitest run`: 92 files, 1513 tests passed.
+- `npm run test:browser` (Chrome): 3 files, 46 tests passed (axe in light and dark at 1366 and 320 px, layout, content security policy), including the table route and the four table states.
+- Mutants, each caught by the tests and reverted: a blocked change no longer holds the start; the partition name limit raised by 100 bytes; "Cancel the task" shown for a task that cannot be cancelled.
+- `go test ./internal/...` on Windows: every package passes except `internal/pgconninfo`, whose test binary Windows refuses to run ("Access is denied", a build failure, repeated). No Go file is changed here. `internalapi` and `ledgersign` failed once under the load of the browser run and passed alone.
+
+### Still open
+
+- The progress indicators that need `Table.operation`; distribute with related tables.
+- Not pushed.
+
+---
+
+## 2026-11-22: phase 11 (distributed schemas), the extension: the scale work (step 12), the review fixes and the documentation (step 15)
+
+Covers the work on branch shard-p1011 after the second review of phase 11 (the review fixes of 2026-11-21 are in the entry of that day).
+
+### What was done
+
+- **Step 12, the scale work** (`contrib/kingres_shard`).  The measurements of `t/245` (2000 schemas of 5 tables) showed three growths and a failure; each is fixed and measured (design notes, "Step 12"):
+  the catalog cache of a backend makes the entry of a schema table or schema when a statement asks (one index scan, "not a schema table" cached), and colocation groups are found through a hash;
+  the trigger of a catalog change invalidates the tables it touches, not every table (`kingres_shard.catalog_incremental = off`, superuser only, is the fallback, and the third profile of the
+  harness `KS_CATALOG_FULL=1` runs the suite with it); a node applies a whole catalog with one statement per table; `add_node` makes the schemas on the new node before it is registered, in
+  batches of `kingres_shard.add_node_batch_statements` statements, resumable (`kingres.add_node_progress`), and registers it in one last transaction that checks completeness.  At 2000
+  schemas: a DDL statement 52 ms (174), the first statement of a backend 9 to 15 ms (55 to 112), the cache of a backend 0.7 MB (3.3), a routed INSERT 1.2 ms (5.8), `add_node` 39 s in 500
+  batches (it failed for lack of locks).
+- **The review of step 12 (P12R-01 to P12R-07)**, fixed: `split_bucket(verify => 'full')` compares as text (a json, xml or point column has no equality operator, `t/249`); the generated
+  `kingres_shard--0.8.sql` is checked against `mk-install-script.sh` (`t/250`) and was regenerated after the merge of `ext-partfix` (a fresh 0.8 install had its partition blocker back); the lazy
+  lookups take the primary key index from the open table, not an OID kept at load (REINDEX CONCURRENTLY, a renamed or missing index, `t/247`); `add_node` cleans the new node when there is no
+  schema left to make and a missing role is an error of the call (`t/251`); sha256 digests; `catalog_incremental` is `PGC_SUSET`.
+- **Steps 13 and 14, the control plane and the panel, are not part of this branch.**  They were built here (contract 0.15.0, five operations, three task kinds, the task engine's `Step.Recover`, migration
+  0050, the panel's dialogs) and then taken out again: the branch cp-1011 already carries the control plane and the console of phases 10 and 11 (contract 0.16.0, after failover 0.15.0 and cp-push
+  0.14.0), in its fixed merge order.  The work stays on the branch `p11-cp-steps13-14` (8c9488e9aa) for a comparison with cp-1011.
+- **Step 15, the documentation**: the section of the extension README ("Distributed schemas", with how to use them and the limits) and this entry.
+
+### How it was verified
+
+- `kingres_shard` at the tip with the extension changes (clean -Werror builds, regress, every TAP file) on PostgreSQL 18.7 and 19rc2: 48828 tests on 18 and 48794 on 19 (218 files each), in tree
+  218 of 219 (the one skipped is `046_two_majors`, as always) and `kingres_ledger` 39 of 39.  The files that touch the catalog cache also pass with `KS_CATALOG_FULL=1` (31 files, 4317 tests on each
+  major).  Those runs were made with the control plane and panel merged; they do not run any of their code.
+- Mutants: step 12 (b) six, (a) seven, the apply of a catalog one, the review fixes six; every one is killed by a named test.
+
+### Decisions and deviations
+
+- The control plane and the panel of distributed schemas come from cp-1011.  What the work on `p11-cp-steps13-14` has that cp-1011 may lack (the exclusion of the schema tasks and a failover, `Step.Recover`
+  for a NonIdempotent step, the detail that names keyless tables before a move) is for a later comparison.
+- The extension's `check_cluster` has no schema checks of its own yet (design 9.10).
+- The rebalance plan (`rebalance_plan()`) plans buckets only; it does not move a schema.
+
+### Still open
+
+- Independent review of the extension work of this entry.
+- The comparison of `p11-cp-steps13-14` with cp-1011.
+- A load that is incremental per colocation group, if 2000 schemas are not enough (the DDL statement still grows from 26 to 52 ms between 200 and 2000 schemas).
+- A flake seen once under the control plane work: the switch of a move under a running writer timed out on a node and the move was undone; not understood.
+
+### Core patches
+
+None.
+
+---
+
 ## 2026-11-20: automatic failover, the last steps of phase 2b and their review, the second review of phase 9 and its fixes, and two npm alerts
 
 Covers 2026-11-20 from the morning, after the third entry of 2026-11-19.

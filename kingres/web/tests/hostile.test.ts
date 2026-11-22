@@ -194,7 +194,10 @@ describe('detail pages and dialogs show hostile names safely', () => {
         bodies.push(await request.clone().json())
     })
     await user.selectOptions(target, same[1] as HTMLElement)
-    await user.click(within(dialog).getByRole('button', { name: /^distribute table$/i }))
+    // The start button waits for the preview of the change (what the sharding extension says about the table).
+    const start = within(dialog).getByRole('button', { name: /^distribute table$/i })
+    await waitFor(() => expect(start).toBeEnabled())
+    await user.click(start)
     await waitFor(() => expect(bodies).toHaveLength(1))
     expect(bodies[0]).toMatchObject({ colocateWith: { schema: 'x.y', table: 'z' } })
   })

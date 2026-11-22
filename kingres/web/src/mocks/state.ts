@@ -134,6 +134,14 @@ export const mockConfig = {
   failoverSwitchoverBehind: false,
   /** 0.12.0: a finished failover ends `completedWithWarnings` (the check of the cluster reported something). */
   failoverWarnings: false,
+  /** 0.14.0 (increment 9.7): a change of a table fails at its start (`space`: not enough free space) or in the copy (`copy`). */
+  tableFail: null as null | 'space' | 'copy',
+  /** The tasks of a table take a minute, so that their progress and Cancel can be tried. */
+  tableSlow: false,
+  /** A bucket move or another operation holds the colocation groups: a change of a distributed table is refused. */
+  tableBusy: false,
+  /** Tables that have foreign keys to an ordinary table (the report of the extension lists them). */
+  tableForeignKeys: [] as string[],
   /** 0.12.0: a refusal `failover_needs_decision` carries no plan (a server of 0.11.0): the console asks with a dry run. */
   failoverNoPlan: false,
   failoverReadiness: {} as Record<number, FailoverReadinessState>,
@@ -320,6 +328,8 @@ export interface MockState {
   groups: GroupRec[]
   serverGroups: { name: string; description: string }[]
   databases: DbRec[]
+  /** The user partitions of the partitioned tables, by `database/schema.table` (0.14.0, increment 9.7). */
+  partitions?: Record<string, components['schemas']['TablePartition'][]>
   tasks: TaskRec[]
   nextTaskId: number
   roles: Role[]
