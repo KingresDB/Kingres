@@ -295,5 +295,16 @@ func TestAnAbandonWaitsForAPromotionThatIsRunningInsideTheLock(t *testing.T) {
 	if hosts[0] != nw.Host {
 		t.Fatalf("the primary of the map group is on %s, want %s", hosts[0], nw.Host)
 	}
-	mapAcked(t, c, port, pool, w)
+	// The switchover is done: the old leader is a standby to be, and its entry point need not read yet; what was acknowledged is read through the new leader.
+	_ = c
+	before := w.count()
+	until(t, 3*time.Minute, "writes after the switchover", func() bool { return w.count() > before+30 })
+	acked := w.Stop()
+	have := foReadIDs(t, nw, port, pool)
+	for rid := range acked {
+		if !have[rid] {
+			t.Errorf("acknowledged row %d is missing when read through %s", rid, nw.Host)
+			break
+		}
+	}
 }
