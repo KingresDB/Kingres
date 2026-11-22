@@ -26,8 +26,10 @@ The last open item of phase 5: after a failover of the leader's server, the new 
 ### How it was verified
 
 - Unit tests: `internal/pki/escrow_test.go`, `internal/membership/escrow_test.go`, `internal/httpapi/handlers_caescrow_test.go`; the contract check (`node api/scripts/check-contract.mjs`), the generated operation table and the
-  README table test. Cluster tests (`internal/clustertest/caescrow_test.go`): the failover of the leader's server with the escrow on, and with a tampered copy. The results per major and the mutants
-  are in the report of the run (below).
+  README table test. Cluster tests (`internal/clustertest/caescrow_test.go`): the failover of the leader's server with the escrow on, and with a tampered copy. Results: both cluster tests pass on PostgreSQL 18 and 19 (lane l7, private installs of the extensions of 908518fa05).
+  Mutants killed: a recipient or the adoption that skips the check against `ca.crt`, no replay check, no label check, no merge of the revocation list, an adoption over a held key, no pruning of old escrow keys,
+  a content hash that ignores the revocation list, no drop of a server that is no longer a member, a recipient outside the standbys, no resend after a revocation, a non-leader that sends, escrow calls not `LeaderOnly`
+  or not dispatched, and (cluster, 18) a `CheckAuthority` that does not adopt. The cluster test found one defect that no unit test had: the three calls were missing from `internalapi.handled` and answered an empty body.
 
 ### Decisions and deviations
 
