@@ -265,6 +265,9 @@ type DemoteAnswer struct {
 // QuiesceRequest is the body of POST /failover/quiesce and /unquiesce.
 type QuiesceRequest struct {
 	Group int32 `json:"group"`
+	// ExpectedTerm is the catalog term the caller knows (F4-09): the undo calls cannot carry the fence of a task run (the repair of a switchover has
+	// none), so a call of a run or of a leader that is behind the catalog is refused by the term.
+	ExpectedTerm int64 `json:"expectedTerm"`
 }
 
 // QuiesceAnswer says whether no client session of the instance is left.
@@ -302,7 +305,8 @@ type VerifyAnswer struct {
 
 // ResumeRequest is the body of POST /failover/resume: the rollback of a switchover whose old primary was stopped.
 type ResumeRequest struct {
-	Group int32 `json:"group"`
+	Group        int32 `json:"group"`
+	ExpectedTerm int64 `json:"expectedTerm"`
 }
 
 // Lease roles of POST /failover/lease.
@@ -343,6 +347,11 @@ type PromoteRequest struct {
 	// ReapplyList only writes the empty synchronous_standby_names again (a KS009 for the
 	// new primary's own list) and answers as a repeat would.
 	ReapplyList bool `json:"reapplyList,omitempty"`
+	// Checkpoint and ClusterState are the shutdown checkpoint and the state of the old primary's cluster, for a planned switchover: the callee
+	// makes the proof (switchover_verify) again in the call that promotes, so that nothing that happened after the first proof is promoted over
+	// (F4-07).
+	Checkpoint   string `json:"checkpoint,omitempty"`
+	ClusterState string `json:"clusterState,omitempty"`
 }
 
 // PromoteAnswer is the answer of POST /failover/promote.

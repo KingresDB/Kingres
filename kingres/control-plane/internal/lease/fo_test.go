@@ -15,7 +15,7 @@ import (
 // catalog) is held back by the marker of any group. PrepareStart migrates a legacy marker to per group markers
 // and removes the legacy file before the instance is started; the gate must still hold it.
 func TestTheGateOfAnInstanceWithoutAGroupHoldsForMigratedMarkers(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempDir(t)
 	if err := os.WriteFile(filepath.Join(dir, FencedMarker), []byte("fenced\n"), 0o600); err != nil { // left by the earlier version
 		t.Fatal(err)
 	}

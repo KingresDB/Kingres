@@ -124,10 +124,10 @@ func TestTheDatabaseStoreKeepsTheRulesOfTheStore(t *testing.T) {
 	row := e.row(rs[1].ID)
 	other := row
 	other.LastError = "x"
-	if err := st.Apply(e.ctx(), e.term, other, row.Version); err != nil {
+	if err := st.Apply(e.ctx(), e.term, other, row.Version, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.Apply(e.ctx(), e.term, row, row.Version); !errors.Is(err, ErrConflict) {
+	if err := st.Apply(e.ctx(), e.term, row, row.Version, 0); !errors.Is(err, ErrConflict) {
 		t.Fatalf("a stale write: %v", err)
 	}
 	// a deposed leader writes nothing
@@ -139,7 +139,7 @@ func TestTheDatabaseStoreKeepsTheRulesOfTheStore(t *testing.T) {
 	if _, err := st.Begin(e.ctx(), e.term, before.ID, e.clock.Now()); !errors.Is(err, scheduler.ErrDeposed) {
 		t.Errorf("Begin: %v", err)
 	}
-	if err := st.Apply(e.ctx(), e.term, before, before.Version); !errors.Is(err, scheduler.ErrDeposed) {
+	if err := st.Apply(e.ctx(), e.term, before, before.Version, 0); !errors.Is(err, scheduler.ErrDeposed) {
 		t.Errorf("Apply: %v", err)
 	}
 	if _, err := e.svc.CreateTarget(e.ctx(), "a", api.LedgerAnchorTargetCreate{Kind: "worm", Name: "x", Config: e.wormConfig(nil)}); err == nil {

@@ -76,7 +76,7 @@ func TestInternalAPIOfARunningServer(t *testing.T) {
 		t.Errorf("version: %d %v %v", st, out, err)
 	}
 	// A certificate of another CA is refused.
-	other, err := pki.CreateCA(filepath.Join(t.TempDir(), "pki"), "other", time.Now())
+	other, err := pki.CreateCA(filepath.Join(tempDir(t), "pki"), "other", time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}

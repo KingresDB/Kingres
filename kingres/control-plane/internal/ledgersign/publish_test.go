@@ -201,3 +201,35 @@ func realEvent(t *testing.T, e *env, have []ledgersign.EventRow, typ, subject st
 	}
 	return ledgersign.EventRow{Seq: seq, Type: typ, Subject: subject, Note: note, CreatedAt: e.clk.Now()}
 }
+
+// brokenRecord is a record of what was published whose file cannot be written.
+type brokenRecord struct {
+	recorded int
+	broken   bool
+}
+
+func (b *brokenRecord) AllowEvent(int64, []byte) error { return nil }
+func (b *brokenRecord) RecordEvent(int64, []byte) error {
+	b.recorded++
+	if b.broken {
+		return errors.New("no space left on the device")
+	}
+	return nil
+}
+
+// P7A-11: an event that was stored while the record of what was published could not be written is an error of the call, not a line of the log.
+func TestAnEventWhoseRecordCannotBeWrittenIsAnError(t *testing.T) {
+	ctx := context.Background()
+	br := &brokenRecord{}
+	e := newEnv(t, memFactory, func(e *env) { e.published = br })
+	e.create(0)
+	br.recorded, br.broken = 0, true
+	_, err := e.svc.AppendEvent(ctx, ledgersign.EventChainRetired, strings.Repeat("ab", 32)+":1", []ledgersign.EventField{{Name: "chain", Value: strings.Repeat("ab", 32)}})
+	if err == nil || !strings.Contains(err.Error(), "could not be written") || br.recorded != 1 {
+		t.Fatalf("an event whose record cannot be written: %v (recorded %d)", err, br.recorded)
+	}
+	// the event is stored, and a repeat finds it
+	if n := len(load(t, e).Events); n < 2 {
+		t.Errorf("%d events", n)
+	}
+}

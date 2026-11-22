@@ -330,10 +330,19 @@ func (s *Service) mutate(ctx context.Context, f func(v *view, now time.Time) (*C
 		switch err := s.cfg.Store.Commit(ctx, term, v.snap.Revision, *ch); {
 		case err == nil:
 			if s.cfg.Published != nil {
+				var werr error
 				for _, e := range ch.Events {
-					if err := s.cfg.Published.RecordEvent(e.Seq, e.Note); err != nil && s.cfg.Log != nil {
-						s.cfg.Log.Error("an event was stored and could not be noted in the record of what was published", "seq", e.Seq, "error", err.Error())
+					if err := s.cfg.Published.RecordEvent(e.Seq, e.Note); err != nil {
+						if s.cfg.Log != nil {
+							s.cfg.Log.Error("an event was stored and could not be noted in the record of what was published", "seq", e.Seq, "error", err.Error())
+						}
+						werr = err
 					}
+				}
+				if werr != nil {
+					// The event is stored; the record, which guards every later signature, could not be written (a full disk is not a crash). The
+					// task that made the event fails and says so, and nothing is signed until the record is written again (P7A-11).
+					return &coded{code: "published_state_write", msg: "the event was stored, but the record of what was published could not be written: " + werr.Error(), retryable: true}
 				}
 			}
 			return nil

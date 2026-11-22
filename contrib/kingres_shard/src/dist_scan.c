@@ -265,8 +265,8 @@ ds_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	cat = kingres_shard_catalog();
 	if (!cat->present)
 		return;
-	dt = hash_search(cat->dist_tables, &rte->relid, HASH_FIND, NULL);
-	if (dt == NULL || dt->is_reference)
+	dt = kingres_shard_lookup_scan_table(cat, rte->relid);
+	if (dt == NULL)
 		return;
 	/* A constant false restriction: no row anywhere. */
 	if (has_constant_false(rel->baserestrictinfo))
@@ -281,7 +281,7 @@ ds_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	 * the parameters; the count here only prices the scan, and a plan that prunes
 	 * every remote group keeps its scan node, whose plan number check protects it.
 	 */
-	prune_terms = kingres_shard_prune_terms(dt, rel->relid, rel->baserestrictinfo);
+	prune_terms = dt->is_schema ? NIL : kingres_shard_prune_terms(dt, rel->relid, rel->baserestrictinfo);
 	if (prune_terms != NIL)
 		remote = remote_groups_of(dt, cat, prune_terms, root->glob->boundParams, NULL, NULL);
 
@@ -318,6 +318,15 @@ ds_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	 * scan reads nothing, and every group is asked.
 	 */
 	if (cat->local_group_id < 0)
+		best = (Path *) create_group_result_path(root, rel, rel->reltarget,
+										   list_make1(makeBoolConst(false, false)));
+
+	/*
+	 * A table of a distributed schema that another group holds (a shell here): the local copy is
+	 * never read, whatever it contains.  The scan has no local part and one fragment, to the owner
+	 * (design/shard-phase11.md, 6.6).  When the owner is this group the check above has returned.
+	 */
+	if (dt->is_schema)
 		best = (Path *) create_group_result_path(root, rel, rel->reltarget,
 										   list_make1(makeBoolConst(false, false)));
 
@@ -421,9 +430,9 @@ ds_error_system_columns(PlannerInfo *root, const char *relname)
 static int64
 plan_placement(Oid relid)
 {
-	const KsDistTable *dt = kingres_shard_lookup_dist_table(relid);
+	const KsDistTable *dt = kingres_shard_lookup_scan_table(kingres_shard_catalog(), relid);
 
-	if (dt == NULL || dt->is_reference)
+	if (dt == NULL)
 		return 0;
 	return kingres_shard_placement_hash(dt->coloc);
 }
@@ -517,10 +526,17 @@ ds_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 			}
 		}
 		if (!have)
-			ereport(ERROR,
-					(errcode(ERRCODE_INTERNAL_ERROR),
-					 errmsg("distributed scan of \"%s\": column %d is needed above the scan but the local scan does not return it",
-							relname, (int) v->varattno)));
+		{
+			/*
+			 * The planner put an expression of the table into the target list of the scan (a branch of a UNION ALL, a projection
+			 * that the scan supports): the columns it reads are fetched with the rows, as for the restrictions below (P11S-04).
+			 */
+			if (v->varattno < 0)
+				ds_error_system_columns(root, relname);
+			scan_tlist = lappend(scan_tlist,
+								 makeTargetEntry((Expr *) copyObject(v), ++resno, NULL, false));
+			attnos = lappend_int(attnos, v->varattno);
+		}
 	}
 
 	/* 2. The other columns that those expressions and the restrictions need. */
@@ -758,7 +774,7 @@ ds_start(KsDistScanState *s)
 {
 	EState	   *estate = s->css.ss.ps.state;
 	const KsCatalog *cat = kingres_shard_catalog();
-	const KsDistTable *dt = hash_search(cat->dist_tables, &s->relid, HASH_FIND, NULL);
+	const KsDistTable *dt = kingres_shard_lookup_scan_table(cat, s->relid);
 	MemoryContext old;
 	MemoryContext startcxt;
 	const char **values;
@@ -766,7 +782,7 @@ ds_start(KsDistScanState *s)
 	int			nparams;
 	KsFragStart st;
 
-	if (dt == NULL || dt->is_reference)
+	if (dt == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("table %u is no longer a distributed table", s->relid)));
@@ -991,7 +1007,7 @@ ds_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 {
 	KsDistScanState *s = (KsDistScanState *) node;
 	const KsCatalog *cat = kingres_shard_catalog();
-	const KsDistTable *dt = hash_search(cat->dist_tables, &s->relid, HASH_FIND, NULL);
+	const KsDistTable *dt = kingres_shard_lookup_scan_table(cat, s->relid);
 	StringInfoData flat;
 	const char *p;
 	bool		pending_space = false;
@@ -999,7 +1015,7 @@ ds_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 	int			nall = 0;
 	bool		pruned = false;
 
-	if (dt != NULL && !dt->is_reference)
+	if (dt != NULL)
 		remote = remote_groups_of(dt, cat, s->prune_terms,
 								  node->ss.ps.state->es_param_list_info, &nall, &pruned);
 	if (pruned && list_length(remote) < nall)

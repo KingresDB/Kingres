@@ -39,7 +39,7 @@ func swCluster(t *testing.T) swEnv {
 
 func swRequest(t *testing.T, leader, old, nw *clustertest.Node, g int) any {
 	t.Helper()
-	st, resp := leader.Do("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "graceful", "shardGroupIds": []int{g},
+	st, resp := leader.DoThroughRestart("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "graceful", "shardGroupIds": []int{g},
 		"targets": []map[string]any{{"shardGroupId": g, "serverId": nw.Host}}}, nil)
 	if st != 202 {
 		t.Fatalf("switchover request: %d %v\n%s", st, resp, leader.LogTail(3000))
@@ -110,6 +110,14 @@ func TestSwitchoverOfAGroup(t *testing.T) {
 			}
 		}
 		return false
+	})
+	// And kingresd can read it: the record says "ready" when the standby streams, which needs nothing of kingresd on that server, so the test asks
+	// the way the failover itself does, through the position call (kingresd on the old server connects to the instance over its socket). After a
+	// clean switchover pg_rewind copies nothing, and the instance once kept the rules of the primary it was, so this call failed.
+	until(t, 3*time.Minute, "kingresd to read the position of the old primary that is a standby now", func() bool {
+		var pos failover.Position
+		code, err := leader.InternalCall(old, "GET", fmt.Sprintf("/failover/position?group=%d", g), nil, &pos)
+		return err == nil && code == 200 && pos.InRecovery && pos.ReceiverState == "streaming"
 	})
 }
 
@@ -191,7 +199,11 @@ func TestSwitchoverCancelBeforeAndAfterThePointOfNoReturn(t *testing.T) {
 	if st != 200 && st != 202 {
 		t.Fatalf("cancel before the point of no return: %d %v", st, resp)
 	}
-	foWaitTask(t, leader, id, 3*time.Minute, "failed")
+	// The cancel ends the step that was waiting (F4-08): within seconds, with the code of a cancel, not after the two minutes that the step waits.
+	cancelled := foWaitTask(t, leader, id, 45*time.Second, "failed")
+	if e, _ := cancelled["error"].(map[string]any); e == nil || e["code"] != "cancelled" {
+		t.Fatalf("the task did not end by the cancel: %v", cancelled["error"])
+	}
 	swAfterRollback(t, c, port, pool, leader, g, old, w)
 
 	// After the promotion: the task pauses at the catalog step, which is past the point of no return.
@@ -206,7 +218,7 @@ func TestSwitchoverCancelBeforeAndAfterThePointOfNoReturn(t *testing.T) {
 		t.Fatalf("cancel after the promotion: %d %v", st, p)
 	}
 	leader.Heal()
-	st, resp = leader.Do("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "graceful", "shardGroupIds": []int{g}}, nil)
+	st, resp = leader.DoThroughRestart("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "graceful", "shardGroupIds": []int{g}}, nil)
 	if st != 202 && st != 200 {
 		t.Fatalf("the repeated request: %d %v", st, resp)
 	}

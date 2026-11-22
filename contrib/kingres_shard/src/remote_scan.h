@@ -28,6 +28,8 @@ extern PlannedStmt *kingres_shard_wrap_plan(Query *parse, CustomScan *cscan,
 											 List *relids, bool returns_rows);
 extern const char **kingres_shard_params_to_text(ParamListInfo params,
 												  Oid **types_out, int *nparams_out);
+extern PlannedStmt *kingres_shard_make_remote_plan_path(Query *parse, char *sql, const char *host, int port, int group_id, int bucket,
+														 bool is_write, List *relids, const char *search_path);
 extern PlannedStmt *kingres_shard_make_remote_plan(Query *parse, char *sql,
 													const char *host, int port,
 													int group_id, int bucket,

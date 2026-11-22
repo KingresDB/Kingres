@@ -65,7 +65,7 @@ var leaderBoundReads = map[string]bool{
 	// The logs, the aggregates and the digests of the publication are in the leader's system database (phase 7, steps 5 and 6).
 	"getLedgerPublication": true, "getLedgerAggregate": true, "listLedgerAggregates": true, "listLedgerDigests": true,
 	// The anchor targets and records are in the leader's system database too (phase 7, step 10).
-	"listLedgerAnchorTargets": true, "getLedgerAnchorTarget": true, "listLedgerAnchors": true, "downloadLedgerAnchor": true,
+	"listLedgerAnchorTargets": true, "getLedgerAnchorTarget": true, "listLedgerAnchors": true, "downloadLedgerAnchor": true, "getLedgerBundle": true,
 }
 
 // forwardsToLeader tells whether an operation is run by the leader. Mutating

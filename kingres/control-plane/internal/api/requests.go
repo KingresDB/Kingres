@@ -2,6 +2,8 @@
 
 package api
 
+import "time"
+
 // DatabaseCreateRequest is the body of POST /databases.
 type DatabaseCreateRequest struct {
 	Name        string                `json:"name"`
@@ -55,6 +57,11 @@ type DistributeTableRequest struct {
 	Method             string    `json:"method"`
 	DistributionColumn string    `json:"distributionColumn,omitempty"`
 	ColocateWith       *TableRef `json:"colocateWith,omitempty"`
+	// Added in contract 0.14.0: the bucket count of a new colocation group, how the rows are copied (auto, online, blocking) and what to do with
+	// the plain views that use the table (refuse, recreate).
+	BucketCount    *int   `json:"bucketCount,omitempty"`
+	Mode           string `json:"mode,omitempty"`
+	DependentViews string `json:"dependentViews,omitempty"`
 }
 
 // TableRef names a table.
@@ -136,6 +143,8 @@ type LedgerDigestPage struct {
 type LedgerVerifyRequest struct {
 	Scope    string `json:"scope,omitempty"`
 	DigestID *int64 `json:"digestId,omitempty"`
+	// Checks (contract 0.11.0): chain (the default), publication, anchors.
+	Checks []string `json:"checks,omitempty"`
 }
 
 // ClusterSettingsUpdateRequest is the body of PATCH /settings/cluster.
@@ -158,4 +167,53 @@ type ClusterSettingsUpdateRequest struct {
 	Clock *struct {
 		MaxDifferenceMs *int `json:"maxDifferenceMs,omitempty"`
 	} `json:"clock,omitempty"`
+}
+
+// LedgerClientKey is a registered client key of the ledger (contract 0.11.0).
+type LedgerClientKey struct {
+	KeyID            string     `json:"keyId"`
+	PublicKey        string     `json:"publicKey"`
+	RoleName         *string    `json:"roleName"`
+	Label            string     `json:"label"`
+	RegisteredBy     string     `json:"registeredBy"`
+	RegisteredAt     time.Time  `json:"registeredAt"`
+	RevokedAt        *time.Time `json:"revokedAt"`
+	RevocationReason *string    `json:"revocationReason"`
+}
+
+// LedgerClientKeyList is the answer of listLedgerClientKeys.
+type LedgerClientKeyList struct {
+	Items []LedgerClientKey `json:"items"`
+}
+
+// RegisterLedgerClientKeyRequest is the body of POST .../ledger/client-keys.
+type RegisterLedgerClientKeyRequest struct {
+	PublicKey string `json:"publicKey"`
+	RoleName  string `json:"roleName,omitempty"`
+	Label     string `json:"label"`
+}
+
+// RevokeLedgerClientKeyRequest is the body of POST .../client-keys/{keyId}/revoke.
+type RevokeLedgerClientKeyRequest struct {
+	Reason string `json:"reason"`
+}
+
+// SignaturePolicyRequest is the body of PUT .../ledger/signature-policy.
+type SignaturePolicyRequest struct {
+	Policy string `json:"policy"`
+}
+
+// LedgerBundleRequest is the body of POST .../ledger/bundles.
+type LedgerBundleRequest struct {
+	Logs           []string                `json:"logs,omitempty"`
+	SinceSize      *int64                  `json:"sinceSize,omitempty"`
+	IncludeAnchors *bool                   `json:"includeAnchors"`
+	Proofs         []InclusionProofRequest `json:"proofs,omitempty"`
+}
+
+// AcknowledgeLedgerDivergenceRequest is the body of POST .../ledger/chains/{shardGroupId}/acknowledge.
+type AcknowledgeLedgerDivergenceRequest struct {
+	Kind    string `json:"kind"`
+	Reason  string `json:"reason"`
+	Confirm string `json:"confirm"`
 }

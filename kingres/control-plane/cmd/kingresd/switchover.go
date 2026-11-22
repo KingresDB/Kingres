@@ -57,6 +57,21 @@ func (q *quiesceSet) has(g int32) bool {
 	return q.groups[g]
 }
 
+// quiescedNow says that the writes of the group are stopped on this server: the memory of this process, or the hold rules on disk (a restart
+// of kingresd in the middle of a switchover keeps the rules, F4-12, so the entry point and the state call follow the file).
+func quiescedNow(d *haDeps, g int32) bool {
+	if quiesced.has(g) {
+		return true
+	}
+	if d == nil || d.Svc == nil || d.Svc.Manager() == nil {
+		return false
+	}
+	if li, ok := d.Svc.PrimaryOf(g); ok {
+		return d.Svc.Manager().Quiesced(li.ID)
+	}
+	return false
+}
+
 func (p *foPeers) Quiesce(ctx context.Context, server string, r failover.QuiesceRequest) (failover.QuiesceAnswer, error) {
 	var out failover.QuiesceAnswer
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
@@ -103,21 +118,36 @@ func handleFailoverQuiesce(ctx context.Context, d *haDeps, body []byte) (any, er
 	if err := requireGroup(body, "a quiesce request"); err != nil {
 		return nil, err
 	}
+	// The undo calls cannot carry the fence of a task run (the repair of a switchover has none): the term is what refuses a caller that is behind (F4-09).
+	if err := staleTerm(ctx, d, r.ExpectedTerm, false); err != nil {
+		return nil, err
+	}
 	li, ok := d.Svc.PrimaryOf(r.Group)
 	if !ok {
 		return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "not_primary", Message: "This server runs no primary of the shard group."}
-	}
-	quiesced.set(r.Group, true)
-	if err := d.Svc.Manager().Quiesce(ctx, li.ID); err != nil {
-		return nil, err
 	}
 	c, err := d.Svc.InstanceConn(ctx, li.ID, "postgres")
 	if err != nil {
 		return nil, &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The instance cannot be reached."}
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
-	// The sessions of kingresd (the service role, and the private socket) stay; every other client session is ended.
-	const where = `backend_type = 'client backend' AND pid <> pg_backend_pid() AND client_addr IS NOT NULL AND usename <> $1`
+	quiesced.set(r.Group, true)
+	first := !d.Svc.Manager().Quiesced(li.ID)
+	var loadedBefore time.Time
+	_ = c.QueryRow(ctx, `SELECT pg_conf_load_time()`).Scan(&loadedBefore)
+	if err := d.Svc.Manager().Quiesce(ctx, li.ID); err != nil {
+		return nil, err
+	}
+	// The reload is asked, not done: the answer waits until the postmaster has loaded the hold rules (F4-11).
+	for deadline := time.Now().Add(10 * time.Second); first && time.Now().Before(deadline); {
+		var loaded time.Time
+		if c.QueryRow(ctx, `SELECT pg_conf_load_time()`).Scan(&loaded) == nil && loaded.After(loadedBefore) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	// The sessions of kingresd (the service role) stay; every other client session is ended, on the local socket as well (F4-11).
+	const where = `backend_type = 'client backend' AND pid <> pg_backend_pid() AND usename <> $1`
 	if _, err := c.Exec(ctx, `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE `+where, instance.ServiceRole); err != nil {
 		return nil, err
 	}
@@ -141,12 +171,17 @@ func handleFailoverUnquiesce(ctx context.Context, d *haDeps, body []byte) (any, 
 	if err := requireGroup(body, "a quiesce request"); err != nil {
 		return nil, err
 	}
-	quiesced.set(r.Group, false)
+	// The undo calls cannot carry the fence of a task run (the repair of a switchover has none): the term is what refuses a caller that is behind (F4-09).
+	if err := staleTerm(ctx, d, r.ExpectedTerm, false); err != nil {
+		return nil, err
+	}
+	// The rules first, the entry point after: a failed restore leaves the hold in place (and visible), for the repair to finish.
 	if li, ok := d.Svc.PrimaryOf(r.Group); ok {
 		if err := d.Svc.Manager().Unquiesce(ctx, li.ID); err != nil {
 			return nil, err
 		}
 	}
+	quiesced.set(r.Group, false)
 	return struct{}{}, nil
 }
 
@@ -158,6 +193,9 @@ func handleFailoverMark(ctx context.Context, d *haDeps, body []byte) (any, error
 	}
 	if err := requireGroup(body, "a mark request"); err != nil {
 		return nil, err
+	}
+	if r.ExpectedTerm < 0 {
+		return nil, badBody("a mark request with the term of the run")
 	}
 	if err := staleTerm(ctx, d, r.ExpectedTerm, true); err != nil {
 		return nil, err
@@ -232,6 +270,10 @@ func handleFailoverResume(ctx context.Context, d *haDeps, body []byte) (any, err
 	if err := requireGroup(body, "a resume request"); err != nil {
 		return nil, err
 	}
+	// The undo calls cannot carry the fence of a task run (the repair of a switchover has none): the term is what refuses a caller that is behind (F4-09).
+	if err := staleTerm(ctx, d, r.ExpectedTerm, false); err != nil {
+		return nil, err
+	}
 	if d.LeaseMgr == nil {
 		return nil, notStarted
 	}
@@ -289,4 +331,15 @@ func registerSwitchoverCallee(reg func(key string, h func(ctx context.Context, d
 	reg(callFailoverMark, handleFailoverMark)
 	reg(callFailoverVerify, handleFailoverVerify)
 	reg(callFailoverResume, handleFailoverResume)
+}
+
+// primaryRuns says that the instance of the primary of the group on this server runs: its catalog can then be read, and a term that
+// cannot be read is a refusal.
+func primaryRuns(ctx context.Context, d *haDeps, group int32) bool {
+	li, ok := d.Svc.PrimaryOf(group)
+	if !ok {
+		return false
+	}
+	up, err := d.Svc.Manager().Running(ctx, li.ID)
+	return err == nil && up
 }

@@ -2007,6 +2007,135 @@ export function createHandlers(): HttpHandler[] {
         ),
       )
     },
+    // The table lifecycle of contract 0.14.0: the mock answers with the shape of the contract and changes little (increment 9.7 gives the panel its dialogs).
+    previewTableChange: (c) => {
+      db(c.s, c.params.databaseName ?? '')
+      return ok({
+        blockers: [],
+        warnings: [],
+        notes: [],
+        affectedTables: [],
+        estimate: {
+          rows: null,
+          bytes: null,
+          modeRecommended: 'blocking',
+          onlineAvailable: false,
+          onlineUnavailableReason: 'The mock has no online copy.',
+          writersBlocked: 'wholeCopy',
+        },
+      } satisfies S['TableChangePreview'])
+    },
+    listTablePartitions: () =>
+      ok({ items: [], nextCursor: null } satisfies S['TablePartitionPage']),
+    undistributeTable: (c) => {
+      refuseDuringFailover(c.s)
+      const rec = db(c.s, c.params.databaseName ?? '')
+      const t = rec.tables.find(
+        (x) => x.schema === c.params.schemaName && x.name === c.params.tableName,
+      )
+      if (!t) throw problem('not_found', 'Table does not exist.')
+      return accepted(
+        createTask(c.s, {
+          kind: 'table.undistribute',
+          subject: { type: 'table', id: `${rec.info.name}.${t.schema}.${t.name}` },
+          steps: ['Check the table', 'Copy rows', 'Switch'],
+          apply: () => {
+            t.classes = ['plain']
+            t.distribution = null
+          },
+        }),
+      )
+    },
+    alterTableDistribution: (c) => {
+      refuseDuringFailover(c.s)
+      const rec = db(c.s, c.params.databaseName ?? '')
+      const t = rec.tables.find(
+        (x) => x.schema === c.params.schemaName && x.name === c.params.tableName,
+      )
+      if (!t) throw problem('not_found', 'Table does not exist.')
+      return accepted(
+        createTask(c.s, {
+          kind: 'table.alter',
+          subject: { type: 'table', id: `${rec.info.name}.${t.schema}.${t.name}` },
+          steps: ['Check the table', 'Copy rows', 'Switch'],
+          apply: () => {
+            void t
+          },
+        }),
+      )
+    },
+    createTablePartition: (c) => {
+      refuseDuringFailover(c.s)
+      const rec = db(c.s, c.params.databaseName ?? '')
+      const t = rec.tables.find(
+        (x) => x.schema === c.params.schemaName && x.name === c.params.tableName,
+      )
+      if (!t) throw problem('not_found', 'Table does not exist.')
+      return accepted(
+        createTask(c.s, {
+          kind: 'table.partition',
+          subject: { type: 'table', id: `${rec.info.name}.${t.schema}.${t.name}` },
+          steps: ['Check the request', 'Change the partitions on every server'],
+          apply: () => {
+            void t
+          },
+        }),
+      )
+    },
+    attachTablePartition: (c) => {
+      refuseDuringFailover(c.s)
+      const rec = db(c.s, c.params.databaseName ?? '')
+      const t = rec.tables.find(
+        (x) => x.schema === c.params.schemaName && x.name === c.params.tableName,
+      )
+      if (!t) throw problem('not_found', 'Table does not exist.')
+      return accepted(
+        createTask(c.s, {
+          kind: 'table.partition',
+          subject: { type: 'table', id: `${rec.info.name}.${t.schema}.${t.name}` },
+          steps: ['Check the request', 'Change the partitions on every server'],
+          apply: () => {
+            void t
+          },
+        }),
+      )
+    },
+    detachTablePartition: (c) => {
+      refuseDuringFailover(c.s)
+      const rec = db(c.s, c.params.databaseName ?? '')
+      const t = rec.tables.find(
+        (x) => x.schema === c.params.schemaName && x.name === c.params.tableName,
+      )
+      if (!t) throw problem('not_found', 'Table does not exist.')
+      return accepted(
+        createTask(c.s, {
+          kind: 'table.partition',
+          subject: { type: 'table', id: `${rec.info.name}.${t.schema}.${t.name}` },
+          steps: ['Check the request', 'Change the partitions on every server'],
+          apply: () => {
+            void t
+          },
+        }),
+      )
+    },
+    dropTablePartition: (c) => {
+      refuseDuringFailover(c.s)
+      const rec = db(c.s, c.params.databaseName ?? '')
+      const t = rec.tables.find(
+        (x) => x.schema === c.params.schemaName && x.name === c.params.tableName,
+      )
+      if (!t) throw problem('not_found', 'Table does not exist.')
+      return accepted(
+        createTask(c.s, {
+          kind: 'table.partition',
+          subject: { type: 'table', id: `${rec.info.name}.${t.schema}.${t.name}` },
+          steps: ['Check the request', 'Change the partitions on every server'],
+          apply: () => {
+            void t
+          },
+        }),
+      )
+    },
     getTable: (c) => {
       const rec = db(c.s, c.params.databaseName ?? '')
       const t = rec.tables.find(

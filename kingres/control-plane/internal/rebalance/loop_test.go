@@ -52,7 +52,7 @@ func (r *memRows) SetPlanned(_ context.Context, n int) error {
 	r.run.Planned = n
 	return nil
 }
-func (r *memRows) StartMove(_ context.Context, m Move, from, to string, attempts int) (int, error) {
+func (r *memRows) StartMove(_ context.Context, m Move, from, to string, attempts int, mark int64) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if err := r.guard(); err != nil {
@@ -64,12 +64,12 @@ func (r *memRows) StartMove(_ context.Context, m Move, from, to string, attempts
 	for i := range r.moves {
 		x := &r.moves[i]
 		if x.Move.Key() == m.Key() && x.Round == r.run.Round && (x.State == MoveFailed || x.State == MoveCancelled) {
-			x.State, x.Attempts, x.FinishedAt, x.Error = MoveRunning, attempts, nil, ""
+			x.State, x.Attempts, x.FinishedAt, x.Error, x.After, x.Marked = MoveRunning, attempts, nil, "", mark, true
 			return x.Seq, nil
 		}
 	}
 	seq := len(r.moves) + 1
-	r.moves = append(r.moves, MoveRow{Seq: seq, Move: m, FromServer: from, ToServer: to, State: MoveRunning, Attempts: attempts, Size: m.Size, StartedAt: time.Unix(1000, 0), Round: r.run.Round})
+	r.moves = append(r.moves, MoveRow{Seq: seq, Move: m, FromServer: from, ToServer: to, State: MoveRunning, Attempts: attempts, Size: m.Size, StartedAt: time.Unix(1000, 0), Round: r.run.Round, After: mark, Marked: true})
 	return seq, nil
 }
 func (r *memRows) UpdateMove(_ context.Context, seq int, ext int64, phase string, pct float64) error {
@@ -576,17 +576,6 @@ func (r *memRows) UndoStart(_ context.Context, seq, attempts int, why string) er
 	}
 	now := time.Unix(5000, 0)
 	x.State, x.Attempts, x.FinishedAt, x.Error = MoveFailed, attempts-1, &now, why
-	return nil
-}
-
-// SetMark keeps the mark with the row, as the real rows do.
-func (r *memRows) SetMark(_ context.Context, seq int, mark int64) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if err := r.guard(); err != nil {
-		return err
-	}
-	r.moves[seq-1].After, r.moves[seq-1].Marked = mark, true
 	return nil
 }
 

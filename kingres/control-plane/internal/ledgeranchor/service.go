@@ -38,6 +38,11 @@ const (
 	// MaxParallelTargets is how many targets one pass works on at the same time: a target that hangs for its
 	// timeout holds one place, not the pass.
 	MaxParallelTargets = 8
+	// PassWait is the longest a pass of the submit or upgrade job waits for its workers: a target that takes longer keeps its worker and the
+	// pass returns (P7A-04), so that one calendar or bucket that hangs does not hold the others.
+	PassWait = 20 * time.Second
+	// CredentialsEvery is the period of the job that brings the credentials files of the holders to the state of the targets (P7A-03).
+	CredentialsEvery = 60 * time.Second
 )
 
 // OpenAlert is an open alert of one of the kinds of this package.
@@ -66,6 +71,15 @@ type Config struct {
 	// Undistribute takes it away; both are best effort and their errors are logged (correction 181).
 	Distribute   func(ctx context.Context, id int64, kind string, file []byte) error
 	Undistribute func(ctx context.Context, id int64) error
+	// Fetch asks the other holders for the credentials file of a target that this server has none of (a server that became the leader
+	// without it, a host restored without its key directory) and returns the first one it gets, ErrNoCredentials when no holder has it.
+	// Holders asks every other holder which files it has and returns, for the targets in ids, the holders that lack the file, and the files
+	// that a holder has for a target that no longer exists. Both are what the job "ledger.anchor.credentials" uses (P7A-03); without them
+	// that job only looks at this server.
+	Fetch   func(ctx context.Context, id int64) ([]byte, error)
+	Holders func(ctx context.Context, ids []int64) (HolderReport, error)
+	// PassWait replaces the constant of that name (tests).
+	PassWait time.Duration
 	// Limits bound the retries of a record (the settings anchor.maxRetryAttempts and anchor.maxRetryAgeHours of the
 	// wiring; zero fields mean the defaults of the library).
 	Limits anchor.Limits
@@ -93,6 +107,13 @@ type Service struct {
 	inflight    map[int64]bool
 	dutyLogged  map[int64]time.Time
 	exporters   map[string]exporter
+	// working has the workers of a pass that have not ended (one for a set of records and a target); sem bounds the workers; fatal is the
+	// error that ends the term, found by a worker that ended after its pass did.
+	working map[[2]int64]bool
+	sem     chan struct{}
+	fatal   error
+	// credProblems are the targets whose credentials this server or a holder lacks, by target id (see credsync.go).
+	credProblems map[int64]CredProblem
 }
 
 // New builds a Service.
@@ -113,7 +134,8 @@ func New(cfg Config) (*Service, error) {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	s := &Service{cfg: cfg, log: log, inflight: map[int64]bool{}, exporters: map[string]exporter{}}
+	s := &Service{cfg: cfg, log: log, inflight: map[int64]bool{}, exporters: map[string]exporter{},
+		working: map[[2]int64]bool{}, sem: make(chan struct{}, MaxParallelTargets), credProblems: map[int64]CredProblem{}}
 	warnHeaderTable(log, cfg.Clock())
 	for _, k := range kinds {
 		for f, fn := range k.Exports {
@@ -131,6 +153,7 @@ func (s *Service) Jobs() []scheduler.Job {
 		{Name: "ledger.anchor.submit", Every: SubmitEvery, Jitter: 0.1, Run: s.jobSubmit},
 		{Name: "ledger.anchor.upgrade", Every: UpgradeEvery, Jitter: 0.1, Run: s.jobUpgrade},
 		{Name: "ledger.anchor.monitor", Every: Tick, Run: s.jobMonitor},
+		{Name: "ledger.anchor.credentials", Every: CredentialsEvery, Run: s.jobCredentials},
 	}
 }
 
@@ -199,13 +222,13 @@ func (s *Service) build(row TargetRow) (*Built, error) {
 	case credPath != "":
 		creds, err = ReadCredentialsFile(credPath, k.Name)
 		if err != nil {
-			return nil, fmt.Errorf("the credentials file named by credentialsPath cannot be read (it must be a regular file that only its owner can read, with the members of the kind): %w", errors.Unwrap(err))
+			return nil, fmt.Errorf("the credentials file named by credentialsPath cannot be used: %s", credFileProblem(err))
 		}
 	case row.CredentialsSet:
 		creds, err = s.cfg.Creds.Get(row.ID, k.Name)
 		switch {
 		case errors.Is(err, ErrNoCredentials):
-			return nil, errors.New("this server has no credentials file for the target (it is not a holder, or the key directory was restored without it): enter the credentials again")
+			return nil, noCredsError{}
 		case err != nil:
 			return nil, errors.New("the credentials file of the target cannot be opened with the passphrase file of this server")
 		}
@@ -247,6 +270,18 @@ func (s *Service) build(row TargetRow) (*Built, error) {
 		return nil, redactErr(err, creds)
 	}
 	return &Built{Target: t, Kind: k, Red: anchor.NewRedactor(creds.Secrets()...), Info: info, Config: norm}, nil
+}
+
+// noCredsError is the build error of a target whose credentials file this server lacks.
+type noCredsError struct{}
+
+func (noCredsError) Error() string {
+	return "this server has no credentials file for the target (it is not a holder, or the key directory was restored without it, and no other holder could give it): enter the credentials again"
+}
+
+func isNoCredentials(err error) bool {
+	var n noCredsError
+	return errors.As(err, &n)
 }
 
 // redactErr is err as a text with every credential value removed.

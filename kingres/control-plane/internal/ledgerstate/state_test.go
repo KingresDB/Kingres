@@ -121,3 +121,125 @@ func TestEventsAreNotAppendedAfterAnOlderDatabase(t *testing.T) {
 		t.Errorf("a second note for number 1: %v", err)
 	}
 }
+
+// P7A-14: a record that would be larger than a file may be is not written (a file that is larger is read as damaged at the next start, and a
+// damaged record refuses every signature); the record on the disk stays the last one that was written, and nothing is signed until it can be.
+func TestARecordThatWouldBeTooLargeIsNotWrittenAndNothingIsAllowedUntilItIs(t *testing.T) {
+	dir := t.TempDir()
+	f, _ := ledgerstate.Open(dir)
+	if err := f.RecordCheckpoint("o1", 5, rootA); err != nil {
+		t.Fatal(err)
+	}
+	defer ledgerstate.SetMaxFile(300)()
+	var err error
+	for i := 0; i < 20 && err == nil; i++ {
+		err = f.RecordCheckpoint("origin-number-"+string(rune('a'+i)), 7, rootB)
+	}
+	if err == nil {
+		t.Fatal("a record larger than the file limit was written")
+	}
+	// the file on the disk is the last good one, and it opens
+	g, _ := ledgerstate.Open(dir)
+	if g.Damaged() || !g.Initialized() {
+		t.Fatalf("the file on the disk is damaged or gone: damaged %v", g.Damaged())
+	}
+	// the memory is current and the file is behind: no signature is allowed until the write succeeds
+	if err := f.Allow("o1", 6, rootA); !errors.Is(err, ledgerstate.ErrNotWritten) {
+		t.Errorf("Allow while the record cannot be written: %v", err)
+	}
+	if err := f.AllowEvent(0, nil); !errors.Is(err, ledgerstate.ErrNotWritten) {
+		t.Errorf("AllowEvent: %v", err)
+	}
+}
+
+// P7A-11: a write that failed is made again before the next signature is allowed.
+func TestAWriteThatFailedIsMadeAgainBeforeTheNextSignatureIsAllowed(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "keys")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	f, _ := ledgerstate.Open(dir)
+	if err := f.RecordCheckpoint("o", 5, rootA); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.RecordCheckpoint("o", 6, rootB); err == nil {
+		t.Fatal("a write into a directory that is gone succeeded")
+	}
+	if err := f.Allow("o", 7, rootA); !errors.Is(err, ledgerstate.ErrNotWritten) {
+		t.Fatalf("Allow: %v", err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Allow("o", 7, rootA); err != nil {
+		t.Fatalf("Allow after the directory is back: %v", err)
+	}
+	g, _ := ledgerstate.Open(dir)
+	if g.Snapshot().Logs["o"].Size != 6 {
+		t.Errorf("what was recorded is not on the disk: %+v", g.Snapshot())
+	}
+}
+
+// P7A-02: the acceptance of a restore.
+func TestTheAcceptanceOfARestoreReplacesTheRecordKeepsTheOldOneAndWinsTheMerge(t *testing.T) {
+	dir := t.TempDir()
+	f, _ := ledgerstate.Open(dir)
+	_ = f.RecordCheckpoint("o", 9, rootA)
+	_ = f.RecordEvent(0, []byte("e0"))
+	_ = f.RecordEvent(1, []byte("e1"))
+	old := f.Snapshot()
+	db := ledgerstate.State{Logs: map[string]ledgerstate.Mark{"o": {Size: 4, Root: "04"}}, Events: 1, EventHash: ledgerstate.EventHashOf([]byte("e0"))}
+	if err := f.Accept(db, ledgerstate.RestoreNote{Reason: "r", Actor: "a"}); err != nil {
+		t.Fatal(err)
+	}
+	cur := f.Snapshot()
+	if cur.Generation != 1 || cur.Logs["o"].Size != 4 || cur.Events != 1 || cur.Restore == nil || cur.Restore.Reason != "r" {
+		t.Fatalf("after Accept: %+v", cur)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ledgerstate.FileName+".before-restore-1")); err != nil {
+		t.Errorf("the old record was not kept: %v", err)
+	}
+	// it survives a restart with its note, and the confirmation file is read as the format says
+	g, _ := ledgerstate.Open(dir)
+	if g.Snapshot().Generation != 1 || g.Snapshot().Restore == nil || g.Damaged() {
+		t.Fatalf("after a restart: %+v", g.Snapshot())
+	}
+	if err := g.ClearRestore(); err != nil || g.Snapshot().Restore != nil {
+		t.Errorf("ClearRestore: %v", err)
+	}
+	// a holder with the old record takes the new one; the new one is not lowered by the old
+	h, _ := ledgerstate.Open(t.TempDir())
+	_ = h.Merge(old)
+	if err := h.Merge(cur); err != nil || h.Snapshot().Logs["o"].Size != 4 || h.Snapshot().Generation != 1 {
+		t.Errorf("the holder: %v %+v", err, h.Snapshot())
+	}
+	if err := h.Merge(old); err != nil || h.Snapshot().Logs["o"].Size != 4 {
+		t.Errorf("the old record took the floor back: %v %+v", err, h.Snapshot())
+	}
+	// the confirmation depends on both states and on nothing else
+	c1 := ledgerstate.Confirmation(old, db)
+	if len(c1) != 16 || c1 != ledgerstate.Confirmation(old, db) {
+		t.Errorf("confirmation %q", c1)
+	}
+	db2 := ledgerstate.State{Logs: map[string]ledgerstate.Mark{"o": {Size: 5, Root: "05"}}, Events: 1, EventHash: db.EventHash}
+	if c1 == ledgerstate.Confirmation(old, db2) || c1 == ledgerstate.Confirmation(cur, db) {
+		t.Error("the confirmation does not depend on the situation")
+	}
+	// the file of the confirmation
+	p := filepath.Join(dir, ledgerstate.AcceptFileName)
+	_ = os.WriteFile(p, []byte(" "+c1+" \nthe backup of Monday\nsecond line\n"), 0o600)
+	if tok, reason := g.AcceptToken(); tok != c1 || reason != "the backup of Monday second line" {
+		t.Errorf("token %q reason %q", tok, reason)
+	}
+	_ = os.WriteFile(p, []byte(c1+"\ncafé\n"), 0o600)
+	if _, reason := g.AcceptToken(); reason != "" {
+		t.Errorf("a reason that is not ASCII was taken: %q", reason)
+	}
+	g.ConsumeAcceptToken()
+	if tok, _ := g.AcceptToken(); tok != "" {
+		t.Error("the file was not consumed")
+	}
+}

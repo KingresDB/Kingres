@@ -49,7 +49,12 @@ INSERT INTO kingres.colocation VALUES (2, 0, 'int4', 0);
 INSERT INTO kingres.colocation VALUES (2, 4097, 'int4', 0);
 INSERT INTO kingres.bucket_map VALUES (9, 0, 0);
 INSERT INTO kingres.bucket_map VALUES (1, 0, 0);
-INSERT INTO kingres.bucket_map VALUES (1, 20, 0, 'broken');
+INSERT INTO kingres.bucket_map VALUES (1, 2, 0, 'broken');
+-- the bucket layout of 0.8: a bucket is below its modulus, a modulus divides max_modulus of the group
+INSERT INTO kingres.bucket_map VALUES (1, 20, 0, 'active');
+INSERT INTO kingres.bucket_map VALUES (1, 0, 0, 'active', 0);
+INSERT INTO kingres.colocation VALUES (2, 4, 'int4', 0, 0);
+INSERT INTO kingres.colocation VALUES (2, 4, 'int4', 0, 65537);
 INSERT INTO kingres.dist_table VALUES ('pg_class'::regclass, 'range', 'oid', 1);
 INSERT INTO kingres.dist_table VALUES ('pg_class'::regclass, 'hash', 'oid', 9);
 INSERT INTO kingres.map_version VALUES (5);

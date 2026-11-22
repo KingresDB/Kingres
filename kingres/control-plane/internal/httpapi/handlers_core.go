@@ -52,6 +52,12 @@ func (s *Server) handlers() map[string]handlerFunc {
 	for k, v := range s.ledgerAnchorHandlers() {
 		m[k] = v
 	}
+	for k, v := range s.ledgerBundleHandlers() {
+		m[k] = v
+	}
+	for k, v := range s.ledgerClientHandlers() {
+		m[k] = v
+	}
 	for k, v := range s.ledgerPublicationHandlers() {
 		m[k] = v
 	}

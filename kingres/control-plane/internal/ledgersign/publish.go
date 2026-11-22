@@ -18,6 +18,8 @@ import (
 // Types of the events the collector publishes (design 3.2.4 and 5.5).
 const (
 	EventChainRetired = "chain-retired"
+	// EventEpochClosed ends the epoch of a chain log that diverged (design 9.4): the operator acknowledged a restore or a loss at failover.
+	EventEpochClosed = "epoch-closed"
 )
 
 // EventField is a "name: value" line of an event.

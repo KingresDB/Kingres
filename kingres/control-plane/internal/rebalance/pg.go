@@ -456,18 +456,31 @@ func (b *PG) RunMove(ctx context.Context, m Move, after int64) error {
 	hold := start.Add(b.guardHold())
 	nextAlive := start.Add(guardKeepAlive)
 	ctxDone := ctx.Done()
+	// observed is false while the last look at the extension's record failed: the loop then knows nothing about
+	// the call (P4D-02).
+	observed := true
 	for {
 		select {
 		case err := <-errc:
 			return asMoveError(err)
 		case <-ctxDone:
-			// The run ended before the extension recorded the move: nobody can find the call, so it goes.
+			// The run ended before the loop saw a record. One last look (P4D-08): the extension may have recorded the move
+			// in the last poll, and a recorded move is the extension's and is not cancelled. An unrecorded call cannot be
+			// found by anybody, so it goes.
+			lctx, lcancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+			e, found, ferr := b.findMove(lctx, watch, m.Colocation, m.Bucket, Ref{After: after}, 0)
+			lcancel()
+			if ferr == nil && found && e.id > after {
+				g.release()
+				return asMoveError(<-errc)
+			}
 			cancel()
 			<-errc
 			return ctx.Err()
 		case <-time.After(100 * time.Millisecond):
 		}
 		e, found, ferr := b.findMove(ctx, watch, m.Colocation, m.Bucket, Ref{After: after}, 0)
+		observed = ferr == nil
 		if ferr != nil {
 			// ST-02: a failed observation says nothing about the call. The session is made again; the loop goes on.
 			reopen()
@@ -492,13 +505,16 @@ func (b *PG) RunMove(ctx context.Context, m Move, after int64) error {
 			}
 		}
 		if now.After(hold) {
-			if now.Sub(start) >= b.maxCallWait() {
+			// The bound applies to a call that was looked at. When the last look failed the record may exist (possibly in
+			// "switching"), and cancelling then is the cancel that ST-02 removed (P4D-02). The wait then ends with the call,
+			// with the lease (the guard) or with the run (ctx).
+			if now.Sub(start) >= b.maxCallWait() && observed {
 				return withdraw(fmt.Errorf("the extension did not record the move within %s", b.maxCallWait()))
 			}
 			running, rerr := b.callRunning(ctx, watch, pid)
 			if rerr != nil {
 				// ST-02: "unknown" is not "not running": a call whose state is unknown is never cancelled. The wait is
-				// bounded by maxCallWait above; the observation goes on a new session.
+				// bounded by maxCallWait above while the observation works; the observation goes on a new session.
 				reopen()
 				running = true
 			}
@@ -841,7 +857,7 @@ func (r *PGRows) SetPlanned(ctx context.Context, n int) error {
 }
 
 // StartMove implements Rows.
-func (r *PGRows) StartMove(ctx context.Context, m Move, fromServer, toServer string, attempts int) (int, error) {
+func (r *PGRows) StartMove(ctx context.Context, m Move, fromServer, toServer string, attempts int, mark int64) (int, error) {
 	var seq int
 	err := r.leased(ctx, func(tx pgx.Tx) error {
 		// ST-06: the write is repeated when its answer was lost. The row of this attempt that the first execution
@@ -853,18 +869,18 @@ func (r *PGRows) StartMove(ctx context.Context, m Move, fromServer, toServer str
 			return nil
 		}
 		err := tx.QueryRow(ctx, `UPDATE kingres_cp.rebalance_move SET state = 'running', attempts = $5, phase = NULL, percent = 0, move_id = NULL,
-			started_at = clock_timestamp(), finished_at = NULL, error = NULL, ext_mark = NULL, from_group = $6, to_group = $7, from_server = $8, to_server = $9
+			started_at = clock_timestamp(), finished_at = NULL, error = NULL, ext_mark = $10, from_group = $6, to_group = $7, from_server = $8, to_server = $9
 			WHERE task_id = $1 AND database_name = $2 AND colocation_id = $3 AND bucket = $4 AND state IN ('failed', 'cancelled', 'skipped')
 			AND round = (SELECT round FROM kingres_cp.rebalance_run WHERE task_id = $1)
-			RETURNING seq`, r.TaskID, m.Database, m.Colocation, m.Bucket, attempts, m.From, m.To, fromServer, toServer).Scan(&seq)
+			RETURNING seq`, r.TaskID, m.Database, m.Colocation, m.Bucket, attempts, m.From, m.To, fromServer, toServer, mark).Scan(&seq)
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
 		return tx.QueryRow(ctx, `INSERT INTO kingres_cp.rebalance_move (task_id, seq, database_name, colocation_id, bucket, from_group, to_group,
-			from_server, to_server, state, attempts, size_bytes, started_at, round)
-			SELECT $1, coalesce(max(seq), 0) + 1, $2, $3, $4, $5, $6, $7, $8, 'running', $9, $10, clock_timestamp(), (SELECT round FROM kingres_cp.rebalance_run WHERE task_id = $1)
+			from_server, to_server, state, attempts, size_bytes, started_at, round, ext_mark)
+			SELECT $1, coalesce(max(seq), 0) + 1, $2, $3, $4, $5, $6, $7, $8, 'running', $9, $10, clock_timestamp(), (SELECT round FROM kingres_cp.rebalance_run WHERE task_id = $1), $11::bigint
 			FROM kingres_cp.rebalance_move WHERE task_id = $1 RETURNING seq`,
-			r.TaskID, m.Database, m.Colocation, m.Bucket, m.From, m.To, fromServer, toServer, attempts, m.Size).Scan(&seq)
+			r.TaskID, m.Database, m.Colocation, m.Bucket, m.From, m.To, fromServer, toServer, attempts, m.Size, mark).Scan(&seq)
 	})
 	return seq, err
 }
@@ -1056,13 +1072,4 @@ func (b *PG) maxCallWait() time.Duration {
 		return b.MaxCallWait
 	}
 	return guardMaxWait
-}
-
-// SetMark implements Rows: the mark is kept with the row of the move, so that a holder that takes over
-// finds the record of the call without comparing clocks (ST-05).
-func (r *PGRows) SetMark(ctx context.Context, seq int, mark int64) error {
-	return r.leased(ctx, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `UPDATE kingres_cp.rebalance_move SET ext_mark = $3 WHERE task_id = $1 AND seq = $2`, r.TaskID, seq, mark)
-		return err
-	})
 }

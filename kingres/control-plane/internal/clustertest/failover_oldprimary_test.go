@@ -174,7 +174,7 @@ func opScenario(t *testing.T, failRewind, back bool) {
 	old.Kill()
 	old.StopInstance()
 	old.StopStandbys()
-	st, resp := leader.Do("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard", "allowDataLoss": true, "comment": "T11"}, nil)
+	st, resp := leader.DoThroughRestart("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard", "allowDataLoss": true, "comment": "T11"}, nil)
 	if st != 202 {
 		t.Fatalf("failover request: %d %v", st, resp)
 	}
@@ -307,7 +307,7 @@ func opScenario(t *testing.T, failRewind, back bool) {
 		nw.Kill()
 		nw.StopInstance()
 		nw.StopStandbys()
-		st, resp2 := leader.Do("POST", "/servers/"+nw.Host+"/failover", map[string]any{"mode": "hard", "allowDataLoss": true, "comment": "T11 back"}, nil)
+		st, resp2 := leader.DoThroughRestart("POST", "/servers/"+nw.Host+"/failover", map[string]any{"mode": "hard", "allowDataLoss": true, "comment": "T11 back"}, nil)
 		if st != 202 {
 			t.Fatalf("the second failover: %d %v", st, resp2)
 		}
@@ -353,7 +353,7 @@ func TestOldPrimaryNeverReturns(t *testing.T) {
 	old.Kill()
 	old.StopInstance()
 	old.StopStandbys()
-	st, resp := leader.Do("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard", "comment": "T11b"}, nil)
+	st, resp := leader.DoThroughRestart("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard", "comment": "T11b"}, nil)
 	if st != 202 {
 		t.Fatalf("failover request: %d %v", st, resp)
 	}

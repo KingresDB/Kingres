@@ -334,12 +334,12 @@ handlers in `internal/httpapi/handlers_config.go`, wiring in `cmd/kingresd/confi
 
 ## What is implemented
 
-The server implements revision **0.13.0** of the contract (132 operations, 108
+The server implements revision **0.14.0** of the contract (140 operations, 113
 paths; what is not done is in "Not done in this increment"). "Real" means the operation works against PostgreSQL or the local node
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **123 of 132 operations are real; 9 answer "not yet".** The eight ledger operations in that column (client keys, bundles, the signature policy of a table, the upgrade of the extension, the acknowledgement of a diverged chain) are built against the contract in the console, which tries them on its mock API; their implementation in `kingresd` is on a branch that is not merged yet.
+authenticated operation lists in 0.2.0. **139 of 140 operations are real; 1 answer "not yet".**
 
 | Tag | Real | Not yet |
 |---|---|---|
@@ -350,8 +350,8 @@ authenticated operation lists in 0.2.0. **123 of 132 operations are real; 9 answ
 | Roles | `listClusterRoles`, `listRoles`, `createRole`, `getRole`, `deleteRole`, `updateRole`, `setRoleClusterRoles`, `setRoleMemberships` |  |
 | Databases | `getDatabaseCreateOptions`, `listDatabases`, `createDatabase`, `getDatabase`, `dropDatabase`, `updateDatabase` |  |
 | Shards | `getBucketDistribution`, `listColocationGroups`, `listBuckets` |  |
-| Ledger | `getLedgerStatus`, `listLedgerBlocks`, `listLedgerDigests`, `generateLedgerDigest`, `startLedgerVerification`, `listLedgerStatus`, `createInclusionProof`, `listLedgerVerifications`, `getLedgerVerification`, `getLedgerSettings`, `updateLedgerSettings`, `getLedgerSigning`, `createLedgerSigningKey`, `retireLedgerSigningKey`, `revokeLedgerSigningKey`, `getLedgerTrustFile`, `getLedgerPublication`, `getLedgerAggregate`, `listLedgerAggregates`, `listLedgerAnchorTargets`, `createLedgerAnchorTarget`, `getLedgerAnchorTarget`, `updateLedgerAnchorTarget`, `deleteLedgerAnchorTarget`, `testLedgerAnchorTarget`, `listLedgerAnchors`, `anchorLedgerNow`, `retryLedgerAnchor`, `downloadLedgerAnchor` | `createLedgerBundle`, `getLedgerBundle`, `listLedgerClientKeys`, `registerLedgerClientKey`, `revokeLedgerClientKey`, `setTableSignaturePolicy`, `upgradeLedgerExtension`, `acknowledgeLedgerDivergence` |
-| Tables | `getTable`, `distributeTable`, `enableTableLedger`, `listTables` |  |
+| Ledger | `getLedgerStatus`, `listLedgerBlocks`, `listLedgerDigests`, `generateLedgerDigest`, `startLedgerVerification`, `listLedgerStatus`, `createInclusionProof`, `listLedgerVerifications`, `getLedgerVerification`, `getLedgerSettings`, `updateLedgerSettings`, `getLedgerSigning`, `createLedgerSigningKey`, `retireLedgerSigningKey`, `revokeLedgerSigningKey`, `getLedgerTrustFile`, `getLedgerPublication`, `getLedgerAggregate`, `listLedgerAggregates`, `listLedgerAnchorTargets`, `createLedgerAnchorTarget`, `getLedgerAnchorTarget`, `updateLedgerAnchorTarget`, `deleteLedgerAnchorTarget`, `testLedgerAnchorTarget`, `listLedgerAnchors`, `anchorLedgerNow`, `retryLedgerAnchor`, `downloadLedgerAnchor`, `listLedgerClientKeys`, `registerLedgerClientKey`, `revokeLedgerClientKey`, `setTableSignaturePolicy`, `upgradeLedgerExtension`, `createLedgerBundle`, `getLedgerBundle`, `acknowledgeLedgerDivergence` | |
+| Tables | `getTable`, `distributeTable`, `enableTableLedger`, `listTables`, `previewTableChange`, `undistributeTable`, `alterTableDistribution`, `listTablePartitions`, `createTablePartition`, `attachTablePartition`, `detachTablePartition`, `dropTablePartition` |  |
 | Grants | `listGrants`, `createGrant`, `revokeGrants`, `applyGrantTemplate` |  |
 | Health | `getHealth`, `getReadiness` |  |
 | Logs | `listLogs` |  |
@@ -539,7 +539,7 @@ Four failures that showed only in a complete run on a loaded machine led to thes
   waits a minute between two attempts for one server; the wait now applies to a repeat of an attempt at the same configuration (by its hash)
   that was not seen to work: a server that is seen up to date is forgotten, so one whose group changed a minute after an earlier catch-up is not left behind. Found by
   running `TestConfigServerGroupAndServerLevels` several times against one cluster. A server that keeps failing is tried again after one minute, then two,
-  four and eight, at most ten minutes (`retryWait`, review ST-08); the task list is not pruned (open).
+  four and eight, at most ten minutes (`retryWait`, review ST-08); the task list is not pruned (a decision, see "Closing review of phase 4", P4D-04).
 - **One start or stop of an instance at a time.** The restart of a standby failed after 60 s with `pg_ctl stop: server does not shut
   down` although the instance had shut down and was running again: `pg_ctl stop -w` waits until the pid file is gone, and the agent
   of the standbys had started the standby again in the moment it was down, which put a new pid file there. That hang is what made
@@ -2577,7 +2577,7 @@ another holder took over, in the complete runs, showed what the first of them hi
 - **RBR-05, a move is found by an identity.** Before the call `Backend.Mark` reads the highest move id of the extension; the record of the call is
   the one of the bucket with a higher id. No clock of this process is compared with the extension's. A row left by an earlier holder that never saw
   its record is found by the mark that is kept with the row (migration 0012, `rebalance_move.ext_mark`, written before the call), so that a holder that
-  takes over has it and no clock is compared (review ST-05). Only a row made before the mark was kept is found by the time it was started, with a
+  takes over has it and no clock is compared (review ST-05); since P4D-03 the mark is taken before the row and written in the statement that makes it. Only a row made before the mark was kept is found by the time it was started, with a
   tolerance of 10 s for the difference of the two clocks. A recovery of a move that is not settled waits as long as its session is alive (the
   extension's `internal_move_alive`) and for at most `RecoverWait` otherwise (ST-07).
 - **RBR-06, rebalance and failover.** The design of the failover (`kingres/docs/design/ha-phase5-part2.md`, section 4.5) stops the rebalance first,
@@ -2751,8 +2751,8 @@ Separate from the increments above (own files and tests; see the report of the w
   `TestSwitchingEnforcementOnAndOffNeverFencesAHealthyPrimary` (a cluster: the replica count to 0 and back three times, every instance sampled
   every 100 ms, no fault hook), and `TestRemovingAServerCostsNoOtherGroupItsLease` now runs with real standbys and without `ForceEnforce`.
 - **ST-02, an observation that failed was read as "not running".** In `RunMove` an error of `findMove` or of `callRunning` is "unknown": the
-  observation session is made again and the loop goes on; a call whose state is unknown is never withdrawn (the bound `maxCallWait` still ends the
-  wait). Test: `TestABrokenObservationSessionDoesNotCancelARecordedMove` (a real PostgreSQL, the observation session terminated with
+  observation session is made again and the loop goes on; a call whose state is unknown is never withdrawn (the bound `maxCallWait` ends the
+  wait of a call that was looked at, not of one whose last look failed: P4D-02). Test: `TestABrokenObservationSessionDoesNotCancelARecordedMove` (a real PostgreSQL, the observation session terminated with
   `pg_terminate_backend`, the extension's record inserted afterwards).
 - **ST-03, a repeated call repeated its work.** `/standby/rebuild` is a no-op for a standby that is of the generation asked for (the generation
   is in the standby's meta file; the rewind path updates it); `/config/restart` from a task step carries `ifPending` and is a no-op for an
@@ -2764,6 +2764,44 @@ Separate from the increments above (own files and tests; see the report of the w
   (the marker the fence wrote is there). Tests: `TestTheLifecycleLockWaitEndsWithTheContext`, `TestAFenceDoesNotWaitForAStartAndTheStartDoesNotSurviveIt`.
 - **ST-12, statements that were not true:** the text of RBR-05 above is corrected.
 - **Not done in this step:** ST-11, ST-13. ST-05 to ST-10 were fixed by the next round (see "Rebalancing after the second review" and the review of 2026-11-18).
+
+### Closing review of phase 4 (P4D-01 to P4D-08 of 2026-11-20): what was done
+
+Review: `kingres/docs/reviews/2026-11-20-kingresd-rebalance-closing.md`.
+
+- **P4D-01, a failover with a move in flight, end to end.** `internal/clustertest/rebalance_failover_test.go`:
+  `TestFailoverDuringBucketMove` (the automatic failover with the source of the move lost while the move is held in `copying` and in `switching`),
+  `TestSwitchoverDuringBucketMove` (a switchover is refused with `rebalance_in_progress` while a move runs; the stop cancels the move; the switchover then
+  runs; the rebalance started again finishes) and `TestMapGroupFailoverDuringBucketMove` (the leader's server, which runs the rebalance and the extension
+  session of the move, is lost with a move held in its copy). Every case ends with the same checks: no acknowledged row is lost and no id is there twice,
+  every bucket has one owner and the same map is read on every server that is up, no move of the extension is unfinished, `check_cluster()` has nothing that
+  forbids a move, and every move of the run's report has an outcome. What the tests do not do: hold the other phases (`preparing`, `catching_up`,
+  `cleaning`), and make the standby of the map group replay less than the move's record (it is synchronous); the extension's own TAP test `054` covers the
+  failover in the middle of a move for the extension alone.
+- **P4D-02, both arms of the ST-02 fix are pinned, and the bound no longer cancels a recorded move.** Tests in `internal/rebalance/p4d_pg_test.go`:
+  `TestADeadObservationSessionIsReopenedAndTheRecordIsSeen` (the guard is let go while the call runs, which needs the new session),
+  `TestACallThatCannotBeObservedIsNotCancelled` (an error of the running-check is not "not running", and `maxCallWait` does not withdraw a call whose last
+  look failed). The decision: the 5 minute bound applies to a call that was looked at. When the last look at the record failed, the record may exist (even in
+  `switching`), and cancelling then is the cancel that ST-02 removed; the wait then ends with the call, with the lease (the guard) or with the run. A call that
+  is observed and still not recorded after `maxCallWait` is withdrawn as before.
+- **P4D-03, the mark is written with the row.** `Backend.Mark` is read before the row is made and `Rows.StartMove` writes it in the same statement
+  (`SetMark` is gone), so a row never exists without a mark; the match by time stays for the rows made before migration 0012 only. A mark that cannot be
+  had starts nothing and leaves no row. Tests: `TestTheMarkOfAMoveIsWrittenWithItsRow`, `TestAMoveWhoseMarkCannotBeHadLeavesNoRow`.
+- **P4D-04, finished tasks are not pruned: a decision, not a fix.** A prune is not a small change: `rebalance_run` and `failover_run` (and their moves, events and
+  reports) are keyed by the task id, the audit log and the panel name task ids, and a failover task is the record that a promotion was made. Deleting rows of
+  `kingres_cp.task` needs a retention rule that no document has yet (which kinds, how old, whether the report outlives the task row, what the panel shows for a
+  report whose task is gone). Until then the growth is bounded at the source: the retry wait of the configuration loop (1, 2, 4, 8, then 10 minutes) makes a server
+  that never applies a configuration cost about 144 tasks a day, and other kinds are started by people or rarely. It stays open as a known limit of the task engine.
+- **P4D-05, `ifPending` is pinned by a unit test.** `TestARestartCallWithIfPendingRestartsOnlyWhatIsPending` (`internal/pgconfig`, Linux, an agent over a fake `pg_ctl`
+  and a stand-in for the question "does this instance have to be restarted now"): nothing pending means nothing is restarted, without `ifPending` it is, with a pending
+  setting it is. The cluster test `TestARepeatedRestartCallRestartsOnlyWhatIsPending` stays.
+- **P4D-06**, the README row of phase 4, is the owner's to change.
+- **P4D-07, a move started by hand and the preflight of a failover: documented, not changed.** `RebalanceRunning` looks at tasks of kind `rebalance` only, so a live move that
+  a person started with `kingres.move_bucket` does not make a manual failover or a switchover refuse. The data is protected by the extension (its own recovery settles a move
+  whose source or target is failed over, TAP test `054`, and the move worker); what is lost is the operator's early warning. A check that asked the extension for a live move on
+  every map group primary would add a call to the preflight of every failover for a case that is rare and safe; it is left for the day a move is started from the panel.
+- **P4D-08, one last look before the cancel.** When the run ends before the loop saw a record, `RunMove` reads the record once more (own context, two seconds) and, if the
+  extension recorded the move in the last poll, does not cancel the call. Test: `TestARecordWrittenAsTheRunEndsIsNotCancelled`.
 
 ### Review FO-01 to FO-16 of 2026-11-17 (the failover increments 0 to 2): what was fixed in this step
 
@@ -3286,7 +3324,7 @@ vanished database.
   hash of the last one (package `ledgerstate`; mode 0600, written atomically, with a checksum; no secret). The aggregate leaf and the events hold a clock time and what the chains looked like then, so they are not
   reproducible, and a restore of `kingres_cp` from an older backup made the publisher sign a second root for a size and a second event for a number with no alert. Now every round, every retirement and every key task that
   appends an event begins by comparing the database with the record: a database that holds less than was published, or another root at a published size, or another last event, refuses the round (nothing is signed or
-  written) and raises the critical alert `ledgerSignerUnavailable` with the subject `published-state`; it clears itself when the database holds what was published. Before a checkpoint is signed the record is asked
+  written) and raises the critical alert `ledgerSignerUnavailable` with the subject `published-state`; it clears itself when the database holds what was published, or when an operator accepts the loss (see "The review of the wiring of anchoring and its fixes", restore of the system database). Before a checkpoint is signed the record is asked
   again (`Allow`), so a size that was published is never signed with other content whatever the database holds. The record is updated after the store accepted a checkpoint or an event; a crash in between leaves
   it one behind the database, which is harmless. It is not signed: whoever can write the key directory can already sign with the keys. A **damaged** file refuses everything until an operator removes it.
 * **Every holder.** The leader sends its record to the holders at every pass of the job `ledger.state.sync` (internal call `ledger/state/merge`: the larger size per log, the larger event count; two copies that
@@ -3393,3 +3431,74 @@ submission is partial and passes it to `Resume` at the next attempt, and notes c
   the sessions and the drop).
 * **"Anchored" through the header source (not done):** the OTS library has no exported way to inject the proof-of-work check, and a real block header cannot be matched to the merkle root a calendar returns, so the outcome
   "anchored" through the wiring cannot be shown without a library change. The claim path is tested up to `claimed`.
+
+### Client keys, the upgrade, bundles and the audit (phase 7, steps 17 and 20; corrections 207 to 211)
+
+* **Client keys, signature policy, upgrade (step 17).** Every shard group has its own registry (the tables of `kingres_ledger` 0.3 are ledger tables of that group's chain), so `registerLedgerClientKey`,
+  `revokeLedgerClientKey` and `setTableSignaturePolicy` run on every server through the apply kind `ledger.client`: a check here and on every reachable server first (a group on 0.2 refuses the whole operation and is
+  named), then the change here, then on the other servers; an unreachable server gets the task `replicate.apply`. Every apply is idempotent. `upgradeLedgerExtension` starts the task `ledger.upgrade` (subject
+  `database/<name>`, one step for this server and one for each other); 0.3 is detected by object (`kingres.ledger_client_key`), not by number. The API names a key by the first 8 hexadecimal characters of its 16-byte
+  id, and refuses a registration whose short id belongs to another key. Who registered and who revoked is in `kingres_cp.ledger_client_key_actor` (migration 0033), because the extension records only the service role.
+* **A group added later (correction 211).** When the log of a chain is created for the first time, the collector calls `Ops.SyncClientKeys`, which copies the registry of this server's group (the manager leader's) to
+  the other servers, revocations included (idempotent). The policies are not copied: a ledger table lives on one group, so a new group has none. Limit: it runs in the publication's round, so a cluster whose
+  publication is off is not synced until it is on.
+* **Bundles (step 20).** `createLedgerBundle` gives the bundle a number (migration 0034), starts the task `ledger.bundle.create` and writes `bundle N` in its detail (what the console reads). The task writes
+  `<data dir>/ledger/bundles/bundle-N.tar.gz` (the layout of the publication restricted to the database's logs, the events, the key ring, `logs.json`, the evidence files with `includeAnchors`, the proofs asked for as
+  `proofs/proof-N.json`, and `bundle.json`). `getLedgerBundle` is answered by the manager leader (which built it), 404 for another database's bundle, 410 after 24 hours (the file is removed then). A bundle is lost
+  with a change of the leader (the record names the server).
+* **The audit of the publication.** `startLedgerVerification` accepts `checks`: `chain` (always run: the task leaves the extension's record), `publication` (every tile and entry bundle of the database's stored logs against
+  the root of the latest checkpoint, and the stored note against the stored size and root; the findings are in the error of the task) and `anchors` (422 `unsupported_operation`: not built). The per-check member of
+  `LedgerVerification` is a proposal for 0.13.0 (`p7c-work/contract-0.13.0-ledger.yaml`); until it is in the contract the outcome is the state of the task and its error.
+* **The new epoch (step 20).** `acknowledgeLedgerDivergence` (400 for a wrong `confirm`, kind or reason; 409 `chain_not_diverged`) starts the task `ledger.epoch.start`: `Collector.StartEpoch` signs and publishes the event `epoch-closed` (lines `chain`, `epoch`, `final-size`, `final-root`, `common-height`, `kind`, `reason`, `acknowledged-by`), closes the old log (kept and served, detail `retired: epoch-closed (was diverged: ...)`), creates the log of epoch e+1 empty (same chain id, origin `./e<e+1>`), clears the alert and appends the aggregate leaf that flags the old member retired and diverged; the next round builds the new log from block 0 and the next leaf names it. Every step is idempotent and resumable. `common-height` is `unknown` in this version: the highest height whose hash is the same in both histories needs the old blocks, and only the published entries have them (a proposal for the design, correction 213).
+* **Not built yet:** the scheduled audit job, and the
+  check of the anchors.
+
+### The review of the wiring of anchoring and its fixes (corrections 230 to 245)
+
+The review ([report](../docs/reviews/2026-11-20-kingresd-anchoring-wiring-and-publication-fixes.md)) found one high, five medium, eight low defects and three notes (P7A-01 to P7A-17). Each is fixed with a test that fails for a one-line mutant that brings the defect back; the fixes are not reviewed yet.
+
+* **Restoring the system database (P7A-02, [ADR 0025](../docs/adr/0025-restore-of-the-system-database-is-accepted-by-an-operator.md), design 9.4).** The chain logs are derived again from the chains; the aggregate log and the events are not, and no computation brings them back. A restored database that is behind `published.json` is refused with the critical alert `ledgerSignerUnavailable` (subject `published-state`), which now says what was published, what the database holds and a confirmation of sixteen hexadecimal digits. The procedure: (1) read the alert and check that the database really was restored and that no newer backup of it exists; (2) restart every `kingresd` after the restore of the system database (as before); (3) on the host of the manager leader write the confirmation of the alert, and on a second line a reason of up to 200 printable ASCII characters, into `<ledger-keys-dir>/accept-restore`; (4) the leader makes the record what the database holds, one generation higher, keeps the old record as `published.json.before-restore-<generation>`, removes the file, and publishes the signed event `restore-acknowledged` before it signs anything else. The other holders take the new generation when the leader sends its record. The logs fork against a mirror that holds the old checkpoints; the event is the public statement of that. A confirmation of another situation is ignored.
+* **The due list (P7A-01).** `Store.Due(set, perTarget)` selects by state and by due time in the query (pending for the submit job, submitted and claimed for the upgrade job) and limits to 100 records for each target; tests on the memory store and on PostgreSQL.
+* **Credentials (P7A-03).** The job `ledger.anchor.credentials` (every 60 s, on the leader) fetches the files this server lacks from the other holders (`credentials/fetch`), gives the holders the files they lack (`credentials/list` says which) and takes away the files of deleted targets; what it cannot do is the alert `ledgerAnchorFailed` with the subject `target:<id>|credentials`. A target that cannot be built fails its records at once (`target_unbuildable`) with the cause in the alert; Retry after the fix. The REST answer of a create or update does not change (201, 200); a failed distribution is an alert within 10 s.
+* **Passes (P7A-04).** One worker for each target, the pass waits 20 s at most; a hung target keeps its worker and does not hold the others.
+* **Evidence (P7A-05, P7A-09).** A receipt is compared with the record before it makes it anchored (the key and the sum of the note, the digest, the imprint of the token); the evidence file `json` is for an anchored record only (404 otherwise), with the time of the anchoring.
+* **A chain that answers another chain id (P7A-06)** is retired only when the same id answers in every round for 30 minutes (the same time as for a database that vanished); an alert from the first answer. The clock is in memory (P7A-16): a change of leader starts it again. This is in `ledgerround/chain.go`.
+* **Results of old configurations (P7A-07), stale failures (P7A-08), redaction (P7A-10), the text of a `credentialsPath` failure (P7A-12), concurrent enqueue (P7A-13).** As in corrections 236 to 243 of the design. A TSA username and password are at least four characters.
+* **The record of what was published (P7A-11, P7A-14).** A write that fails (disk full, directory gone, more than 32 MiB) leaves the record in memory current and the file behind; nothing is signed, and the critical alert stands, until it is written (it is tried before the next signature). The rename is followed by a sync of the directory.
+* **Decisions (P7A-15).** Written in correction 244 of the design: paths of `credentialsPath` and `caBundlePath`, addresses as IPs, what `kingres_readonly` reads, the probe objects of the Test in a bucket with a compliance retention, and `anchor_minimum`. They are decisions that stand, not defects.
+* **Not done:** a recovery of the lost rows of the aggregate log and the events from a mirror (it would keep the history unbroken; ADR 0025 names it); a console action for the acceptance; a cluster test of a restore of `kingres_cp` from a backup.
+## Table lifecycle (contract 0.14.0, increment 9.6 of the shard design)
+
+`distributeTable` (changed: a table with rows can be distributed), `undistributeTable`, `alterTableDistribution` and the five partition operations
+(`listTablePartitions`, `createTablePartition`, `attachTablePartition`, `detachTablePartition`, `dropTablePartition`) start tasks of kind `table.distribute`,
+`table.undistribute`, `table.alter` and `table.partition` (subject `table`, id `database/schema.table`); `previewTableChange` answers synchronously. The code is
+in `internal/ops/tablelife.go` (steps and the database side), `internal/ops/tableprep.go` (what is checked before a task exists), `internal/httpapi/handlers_tables.go`
+and `internal/api/tables_lifecycle.go`. They need `kingres_shard` 0.7 with its increments 9.3 to 9.9; without the report function the operations answer 422 `unsupported_operation`.
+
+- **Before the task exists.** The request is validated, the table is read, and `kingres.table_change_report` runs for the mode the task will use; a blocker is a 422
+  `table_not_eligible` with `blockers` (the lines of the report). `mode` `auto` is online when the online report has no blocker and the table has more than
+  100000 estimated rows, otherwise blocking; `online` and `blocking` ask for one and are refused with the blockers of that mode. An unfinished rebalance
+  answers 409 `rebalance_in_progress` (a rebalance that starts later is not stopped by a table task yet: see "Not done"). A busy colocation group is refused by the extension
+  and the task fails retryable with code `operation_in_progress`.
+- **Steps (online).** Check the table, (Find linked tables for an undistribute, Plan the change for an alter), Check free space, Prepare (`begin_table_operation`, which finds
+  an operation that is unfinished for the table, so the step is idempotent), Create the new layout (`table_operation_advance(..., 'shadow')`), Copy rows, Catch up with writers,
+  Switch, Verify and clean up. Blocking: Check the table, Check free space, Copy rows and switch (one call of the blocking function; writers wait), Verify and clean up. Partition tasks:
+  Check the request, Change the partitions on every server, Verify and clean up. A task recorded before this version (input without `v`) still runs its one step.
+- **Free space.** The estimate (rows and bytes of the table with its partitions; a distributed table's local partitions times the groups) is compared with the free space of each
+  destination server (a share of the data plus half again plus 64 MiB; an undistribute needs the whole table on its target). `Ops.DiskFree` tells it; `kingresd` knows the data directory of
+  its own server only, so other servers are not checked from here and the step is skipped when this server has no probe.
+- **The switch and `paused`.** When the attempts of the extension are used up (a long transaction holds the table) the step shows the blockers in the task's detail ("Waiting to switch: ...")
+  and tries again every 60 seconds, for as long as they hold (a day, then the task fails retryable with `switch_not_possible`). It does not use the engine's paused state: nothing resumes a paused table task, so the wait stays inside the step;
+  a cancel request is looked at between the attempts.
+- **Cancel and failure.** `Cancellable` is true until the switch is done (a blocking task: until its one call runs). A cancel, or a failure, of an online task that has not switched calls
+  `cancel_table_operation`, so nothing is left; a node that cannot be reached keeps its leftovers, named by the extension, for the recovery worker. A task killed with the process goes on at the first step that is not done (tests: `internal/ops/tablelife_test.go`, a crash at every step).
+- **dependentViews.** `recreate` sets `kingres_shard.dependent_views` for the operation (`SET` on the service connection of the blocking call, and in the options of `begin_table_operation`, which keeps it in the operation); `refuse` is the default.
+- **Table.partitioning** (optional) is read from `kingres.dist_table` by `listTables` and `getTable`.
+
+Tests. Unit (no database): `go test ./internal/ops ./internal/httpapi ./internal/contract ./internal/problem ./internal/api` (a fake database side: steps, crash at every step, cancel while the switch waits,
+blockers, free space, validation). Integration, with a cluster: `internal/clustertest/tablelife_test.go` (`TestTableLifecycle`: distribute with rows blocking and online with a writer on another server, a table
+that is refused, alter, undistribute, a cancel, a switch held by a transaction, partitions, views), run only with `scripts/run-integration.ps1 -Packages ./internal/clustertest -Run TestTableLifecycle` after the extension of this
+increment is installed in the installation of the tests.
+
+Not done: the rebalance does not look for an unfinished table task before it moves a bucket of the group (the extension refuses a move of a group that an operation claims; the rebalance then reports the move as failed); `Table.operation`
+(the unfinished task of a table) of the design is not in the contract yet; `relatedTables` of the distribute request (distribute with related tables) is increment 9.7; the free space of other servers.

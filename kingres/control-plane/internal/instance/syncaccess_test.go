@@ -82,3 +82,29 @@ func TestTheStandbyRuleIsNotAddedTwice(t *testing.T) {
 		t.Fatalf("the rule is there %d times:\n%s", n, hba)
 	}
 }
+
+// An old primary that was rebuilt as a standby of the new one and is the only instance of its server has to be reachable by kingresd: a
+// clean switchover leaves nothing for pg_rewind to copy, so the rule of the unix socket is added to its own files, once.
+func TestTheOnlyInstanceThatIsACopyGetsTheRuleOfTheSocket(t *testing.T) {
+	m := accessRig(t, 1)
+	if err := m.WriteRole(1, Role{Group: 1, Role: RoleStandby, Origin: OriginCopy}); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	changed, err := m.SyncAccess(ctx, 1, 1, "kingres")
+	if err != nil || !changed {
+		t.Fatalf("first round: %v %v", changed, err)
+	}
+	if changed, err := m.SyncAccess(ctx, 1, 1, "kingres"); err != nil || changed {
+		t.Fatalf("a second round changed something: %v %v", changed, err)
+	}
+	data, _ := m.DataDir(1)
+	hba, _ := os.ReadFile(filepath.Join(data, "pg_hba.conf"))
+	ident, _ := os.ReadFile(filepath.Join(data, "pg_ident.conf"))
+	if n := strings.Count(string(hba), "peer map="+StandbyIdentMap); n != 1 {
+		t.Fatalf("the rule is in pg_hba.conf %d times:\n%s", n, hba)
+	}
+	if !strings.Contains(string(ident), StandbyIdentMap+` "kingres" `+ServiceRole) {
+		t.Fatalf("pg_ident.conf lacks the mapping:\n%s", ident)
+	}
+}

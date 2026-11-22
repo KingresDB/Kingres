@@ -435,6 +435,20 @@ func (s PGStore) Enqueue(ctx context.Context, term scheduler.Term, e Enqueue) (R
 		created = err == nil
 		return err
 	})
+	if isUnique(err) {
+		// a concurrent enqueue (the job and "Anchor now" run on the same leader) inserted the record between our look and our insert: the
+		// checkpoint is covered, which is the answer of the first look (P7A-13)
+		var r Row
+		rerr := s.read(ctx, func(c *pgx.Conn) error {
+			var qerr error
+			r, qerr = scanRow(c.QueryRow(ctx, `SELECT `+rowCols+` FROM kingres_cp.ledger_anchor a
+				WHERE a.target_id = $1 AND a.log_id = $2 AND a.size >= $3 ORDER BY a.size LIMIT 1`, e.Target.ID, e.Agg.LogID, e.Agg.Size), false)
+			return qerr
+		})
+		if rerr == nil {
+			return r, false, nil
+		}
+	}
 	return out, created, err
 }
 
@@ -470,7 +484,7 @@ func (s PGStore) Begin(ctx context.Context, term scheduler.Term, id int64, now t
 }
 
 // Apply implements Store.
-func (s PGStore) Apply(ctx context.Context, term scheduler.Term, w Row, expect int64) error {
+func (s PGStore) Apply(ctx context.Context, term scheduler.Term, w Row, expect int64, targetRev int64) error {
 	var ev *string
 	if len(w.Evidence) > 0 {
 		x := string(w.Evidence)
@@ -484,9 +498,10 @@ func (s PGStore) Apply(ctx context.Context, term scheduler.Term, w Row, expect i
 	return s.write(ctx, term, "apply", func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `UPDATE kingres_cp.ledger_anchor SET state = $2, attempts = $3, refusals = $4, retryables = $5, failing_since = $6,
 			next_attempt_at = $7, evidence = $8, evidence_time = $9, anchored_at = $10, last_error = $11, error_code = $12, alert = $13, created_at = $14,
-			submit_start = $15, generation = $16, version = version + 1, updated_at = now() WHERE id = $1 AND version = $17`,
+			submit_start = $15, generation = $16, version = version + 1, updated_at = now() WHERE id = $1 AND version = $17
+			AND ($18::bigint = 0 OR EXISTS (SELECT 1 FROM kingres_cp.ledger_anchor_target t WHERE t.id = target_id AND t.enabled AND t.revision = $18))`,
 			w.ID, string(w.State), w.Attempts, w.Refusals, w.Retryables, w.FailingSince, w.NextAttemptAt, ev, w.EvidenceTime, w.AnchoredAt,
-			w.LastError, w.ErrorCode, w.Alert, w.CreatedAt, start, int32(w.Generation), expect) //nolint:gosec // at most 1000
+			w.LastError, w.ErrorCode, w.Alert, w.CreatedAt, start, int32(w.Generation), expect, targetRev) //nolint:gosec // at most 1000
 		if err != nil {
 			return err
 		}
@@ -507,15 +522,23 @@ func (s PGStore) Apply(ctx context.Context, term scheduler.Term, w Row, expect i
 	})
 }
 
-// Due implements Store.
-func (s PGStore) Due(ctx context.Context, now time.Time, limit int) ([]Row, error) {
+// Due implements Store: the state and the due time are in the query and the limit is applied to what is left, for each target (P7A-01).
+func (s PGStore) Due(ctx context.Context, now time.Time, set DueSet, perTarget int) ([]Row, error) {
 	var out []Row
+	states := `x.state = 'pending'`
+	if set == DueUpgrade {
+		states = `x.state IN ('submitted', 'claimed')`
+	}
+	if perTarget <= 0 {
+		perTarget = 1 << 30
+	}
 	err := s.read(ctx, func(c *pgx.Conn) error {
 		rows, err := c.Query(ctx, `SELECT `+rowCols+noteSel+` FROM kingres_cp.ledger_anchor a
-			JOIN kingres_cp.ledger_anchor_target t ON t.id = a.target_id
-			WHERE t.enabled AND a.state IN ('pending', 'submitted', 'claimed')
-			  AND (a.next_attempt_at IS NULL OR a.next_attempt_at <= $1 OR a.state = 'claimed')
-			ORDER BY a.id LIMIT $2`, now.UTC(), limit)
+			WHERE a.id IN (SELECT q.id FROM (
+				SELECT x.id, row_number() OVER (PARTITION BY x.target_id ORDER BY x.id) AS rn
+				FROM kingres_cp.ledger_anchor x JOIN kingres_cp.ledger_anchor_target t ON t.id = x.target_id
+				WHERE t.enabled AND `+states+` AND (x.next_attempt_at IS NULL OR x.next_attempt_at <= $1)) q WHERE q.rn <= $2)
+			ORDER BY a.id`, now.UTC(), perTarget)
 		if err != nil {
 			return err
 		}
@@ -530,6 +553,15 @@ func (s PGStore) Due(ctx context.Context, now time.Time, limit int) ([]Row, erro
 		return rows.Err()
 	})
 	return out, err
+}
+
+// Newer implements Store.
+func (s PGStore) Newer(ctx context.Context, targetID, logID, size int64) (bool, error) {
+	var ok bool
+	err := s.read(ctx, func(c *pgx.Conn) error {
+		return c.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM kingres_cp.ledger_anchor WHERE target_id = $1 AND log_id = $2 AND size > $3)`, targetID, logID, size).Scan(&ok)
+	})
+	return ok, err
 }
 
 // NewestAnchored implements Store.
@@ -565,7 +597,9 @@ func (s PGStore) Failures(ctx context.Context) ([]Row, error) {
 	var out []Row
 	err := s.read(ctx, func(c *pgx.Conn) error {
 		rows, err := c.Query(ctx, `SELECT `+rowCols+` FROM kingres_cp.ledger_anchor a
-			WHERE a.state IN ('failed', 'expired') AND a.alert <> '' AND a.target_id IS NOT NULL ORDER BY a.id`)
+			WHERE a.state IN ('failed', 'expired') AND a.alert <> '' AND a.target_id IS NOT NULL
+			  AND NOT EXISTS (SELECT 1 FROM kingres_cp.ledger_anchor n WHERE n.target_id = a.target_id AND n.log_id = a.log_id AND n.size > a.size AND n.state = 'anchored')
+			ORDER BY a.id`)
 		if err != nil {
 			return err
 		}

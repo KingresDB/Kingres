@@ -66,6 +66,11 @@ type Kind struct {
 	Timeouts func(cfg json.RawMessage) (submitted, claimed time.Duration)
 	// PriorEvidence returns the evidence that a failed call left in its error (OpenTimestamps: what the calendars that answered gave), which the record must keep (duty 12).
 	PriorEvidence func(err error) (json.RawMessage, bool)
+	// Binds checks that the evidence a call returned (canonical, valid for the kind) is the evidence of this record: what the evidence
+	// states of the checkpoint (the key and the digest of the stored note, the digest, the imprint of the token) is what the row
+	// holds. It is the second check behind the library's own, at the one place where a record becomes anchored (P7A-05); an error fails
+	// the record for good.
+	Binds func(r Row, evidence json.RawMessage) error
 	// Exports are the file formats besides JSON that downloadLedgerAnchor can write for the kind ("ots", "tsr").
 	Exports map[string]func(Row) ([]byte, error)
 }

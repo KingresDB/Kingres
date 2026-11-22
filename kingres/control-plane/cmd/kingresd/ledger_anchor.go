@@ -72,7 +72,65 @@ func newLedgerAnchor(cfg config.Config, dir string, sys func(ctx context.Context
 		}
 		return nil
 	}
+	// fetch asks the other holders, one after the other, for the credentials file of a target this server lacks (P7A-03)
+	fetch := func(ctx context.Context, id int64) ([]byte, error) {
+		if members == nil {
+			return nil, ledgeranchor.ErrNoCredentials
+		}
+		hs, err := holders(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, h := range hs {
+			var out ledgeranchor.FetchResponse
+			if err := members.Client.Do(ctx, h, "POST", "/ledger/anchor/credentials/fetch", ledgeranchor.FetchRequest{TargetID: id}, &out); err != nil {
+				continue
+			}
+			raw, err := base64.StdEncoding.Strict().DecodeString(out.File)
+			out.File = ""
+			if err == nil && len(raw) > 0 {
+				return raw, nil
+			}
+		}
+		return nil, ledgeranchor.ErrNoCredentials
+	}
+	// holderReport asks every other holder which files it has: the holders that lack a file of ids, and the files of targets that are gone
+	holderReport := func(ctx context.Context, ids []int64) (ledgeranchor.HolderReport, error) {
+		rep := ledgeranchor.HolderReport{Lacking: map[int64][]string{}, Orphans: map[int64][]string{}}
+		if members == nil {
+			return rep, nil
+		}
+		hs, err := holders(ctx)
+		if err != nil {
+			return rep, err
+		}
+		for _, h := range hs {
+			var out ledgeranchor.ListResponse
+			if err := members.Client.Do(ctx, h, "POST", "/ledger/anchor/credentials/list", struct{}{}, &out); err != nil {
+				rep.Unreached = append(rep.Unreached, h)
+				continue
+			}
+			have := map[int64]bool{}
+			for _, id := range out.IDs {
+				have[id] = true
+			}
+			want := map[int64]bool{}
+			for _, id := range ids {
+				want[id] = true
+				if !have[id] {
+					rep.Lacking[id] = append(rep.Lacking[id], h)
+				}
+			}
+			for id := range have {
+				if !want[id] {
+					rep.Orphans[id] = append(rep.Orphans[id], h)
+				}
+			}
+		}
+		return rep, nil
+	}
 	svc, err := ledgeranchor.New(ledgeranchor.Config{
+		Fetch: fetch, Holders: holderReport,
 		Store: ledgeranchor.PGStore{Sys: sys}, Creds: creds, Term: sched.Term, Log: log.With("component", "ledger-anchor"),
 		Alert: alert, Limits: anchorLimits(os.Getenv, log),
 		OpenAlerts: func(ctx context.Context) ([]ledgeranchor.OpenAlert, error) {

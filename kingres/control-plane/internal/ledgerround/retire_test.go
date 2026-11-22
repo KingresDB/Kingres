@@ -239,6 +239,8 @@ func TestAChainThatWasReplacedRetiresTheOldLogAndStartsANewOne(t *testing.T) {
 	e := newEnv(t, a)
 	e.round()
 	e.src.chains[0] = newChain(99, 2)
+	e.round() // the first answer: nothing is retired (P7A-06)
+	e.advance(DefaultMissingFor + time.Minute)
 	e.round()
 	var chains int
 	for _, l := range e.logs() {

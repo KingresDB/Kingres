@@ -235,6 +235,8 @@ type env struct {
 	now    time.Time
 	mu     sync.Mutex
 	alerts []string
+	// alertTexts are the messages of the alerts that were raised
+	alertTexts []string
 	// exists answers DatabaseExists (nil: the collector is not given one)
 	exists func(db string) (bool, error)
 	// published and pull are the record of what was published and the call that asks the other holders for theirs (nil: none)
@@ -273,6 +275,9 @@ func (e *env) collector() *Collector {
 				state = "raise"
 			}
 			e.alerts = append(e.alerts, fmt.Sprintf("%s/%s/%s/%s", kind, state, severity, subject))
+			if raise {
+				e.alertTexts = append(e.alertTexts, msg)
+			}
 		}})
 	if err != nil {
 		e.t.Fatal(err)
@@ -405,4 +410,16 @@ func (m *mangledSource) Read(ctx context.Context, g Group, req ReadRequest) (Rea
 		return resp, err
 	}
 	return m.f(req, resp), nil
+}
+
+// hasAlertText reports whether the message of a raised alert holds the text.
+func (e *env) hasAlertText(text string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, m := range e.alertTexts {
+		if strings.Contains(m, text) {
+			return true
+		}
+	}
+	return false
 }

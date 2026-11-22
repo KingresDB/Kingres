@@ -36,7 +36,8 @@ set -uo pipefail
 
 INSTALL="${KINGRES_INSTALL:-$HOME/kw-cp/install}"
 TESTDIR="$HOME/kw-cp/test"
-BIN="$TESTDIR/bin"
+# The binaries of the run; run-integration.ps1 gives each lane a directory of its own.
+BIN="${KINGRES_TEST_BIN:-$TESTDIR/bin}"
 LEDGER="$TESTDIR/ledger"
 SLICES="$TESTDIR/slices"
 PORT_LO=20000

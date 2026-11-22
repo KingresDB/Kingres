@@ -19,7 +19,7 @@ import (
 // the old holder cannot be granted it again.
 func TestTransferOnlyFromTheHolderAndAtomically(t *testing.T) {
 	clk := clock.NewFake(time.Unix(0, 0))
-	g := newGrantor(t, clk, t.TempDir())
+	g := newGrantor(t, clk, tempDir(t))
 	_, _ = g.Grant(1, "a", dur, false)
 	clk.Advance(3 * time.Second) // a's lease has not run out
 	if r, _ := g.Transfer(1, "b", "c", dur); r.Granted || r.Holder != "a" || r.WaitMs <= 0 {
@@ -49,7 +49,7 @@ func TestTransferOnlyFromTheHolderAndAtomically(t *testing.T) {
 // The transfer is on disk before it is answered and survives a restart of the
 // grantor, which then refuses the old holder for duration plus margin.
 func TestTransferIsPersistedBeforeTheAnswerAndSurvivesARestart(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempDir(t)
 	clk := clock.NewFake(time.Unix(0, 0))
 	g := newGrantor(t, clk, dir)
 	_, _ = g.Grant(1, "a", dur, false)
@@ -67,7 +67,7 @@ func TestTransferIsPersistedBeforeTheAnswerAndSurvivesARestart(t *testing.T) {
 
 // A transfer that cannot be recorded is refused and changes nothing.
 func TestTransferThatCannotBeRecordedIsRefused(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempDir(t)
 	clk := clock.NewFake(time.Unix(0, 0))
 	g := newGrantor(t, clk, dir)
 	_, _ = g.Grant(1, "a", dur, false)
@@ -87,7 +87,7 @@ func TestTransferThatCannotBeRecordedIsRefused(t *testing.T) {
 
 // release deletes the grant of the holder at once; nobody else can release it.
 func TestReleaseFreesTheLeaseAtOnceForTheHolderOnly(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempDir(t)
 	clk := clock.NewFake(time.Unix(0, 0))
 	g := newGrantor(t, clk, dir)
 	_, _ = g.Grant(1, "a", dur, false)

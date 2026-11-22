@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
 )
@@ -481,5 +482,44 @@ func TestAnInstanceThatIsStartingIsWaitedFor(t *testing.T) {
 	}
 	if w.count("promote s2") != 1 {
 		t.Fatalf("promoted %d times", w.count("promote s2"))
+	}
+}
+
+// F-gate8. The new primary's instance is down when the catalog step asks it (its kingresd ended, the lease ran out, the watchdog
+// stopped it): after the point of no return the step hands the lease to its server again, asks for the promotion again (it answers
+// "already") and tries the call a second time; when that does not end either, the task pauses and does not fail.
+func catalogDownScript(n int) []any {
+	var s []any
+	for i := 0; i < n; i++ {
+		s = append(s, &SQLError{Code: "08001", Text: "could not connect to node 5, which is to become the primary of group 1"})
+	}
+	return s
+}
+
+func TestANewPrimaryThatIsDownAtTheCatalogStepIsWokenOnce(t *testing.T) {
+	w := newWorld()
+	r := w.runner()
+	r.PromoteNode.WaitBound = 50 * time.Millisecond
+	w.fakeClock(r)
+	// 52 refused calls end the first wait (1 ms per pause, bound 50 ms); the second wait meets the first success.
+	w.catScript = catalogDownScript(52)
+	if name, err := runAll(t, r, hardInput()); err != nil {
+		t.Fatalf("%s: %v", name, err)
+	}
+	if w.count("promote-already s2") < 1 {
+		t.Errorf("the promotion was not asked for again: %v", w.log)
+	}
+}
+
+func TestANewPrimaryThatStaysDownPausesTheCatalogStepAfterThePromotion(t *testing.T) {
+	w := newWorld()
+	r := w.runner()
+	r.PromoteNode.WaitBound = 50 * time.Millisecond
+	w.fakeClock(r)
+	w.catScript = catalogDownScript(10000)
+	name, err := runAll(t, r, hardInput())
+	var pe *PauseError
+	if !errors.As(err, &pe) || name != StepName(1, StepCatalog) {
+		t.Fatalf("%s: %v (a failed task is not what the operator meets after the promotion)", name, err)
 	}
 }

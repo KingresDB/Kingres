@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover/journal"
 )
 
 // The candidate monitor of the map group (design ha-phase5-part2.md, 3.4 and 4.1): on every server that hosts a ready standby of group 0,
@@ -16,7 +17,10 @@ import (
 // lease makes the choice safe whatever the order (one holder), and B4 hands the journal to a better candidate by position.
 
 // mapStagger is the wait per rank.
-const mapStagger = 30 * time.Second
+const mapStagger = 90 * time.Second
+
+// mapAbandonAfter is how long a bootstrap that did not reach the promotion may stand before the monitor gives it up.
+const mapAbandonAfter = 15 * time.Minute
 
 type mapMonitor struct {
 	m              *mapFailover
@@ -76,10 +80,23 @@ func (mm *mapMonitor) rank(ports *mapPorts, ctx context.Context) (int, bool) {
 // step is one look. It returns true when it asked for the bootstrap.
 func (mm *mapMonitor) step(ctx context.Context) bool {
 	m := mm.m
-	if m.journal.Active() {
-		return false
-	}
 	ports := &mapPorts{m: m}
+	if m.journal.Active() {
+		// A bootstrap that did not reach the promotion and is old, or of a term the catalog has left behind, is given up (F4-06): the loser of
+		// two candidates, or a start against a server that was not lost, must not keep this monitor, the gate and the status for ever.
+		cur, ok := m.journal.Current()
+		term, _, err := ports.CatalogTerm(ctx)
+		if !ok || err != nil {
+			return false
+		}
+		if stuck, why := journal.Stuck(cur, term, time.Now(), mapAbandonAfter); stuck {
+			m.log.Warn("the bootstrap of the map group is given up", "reason", why)
+			_ = m.journal.Abandon(why)
+		}
+		if m.journal.Active() {
+			return false
+		}
+	}
 	rank, ok := mm.rank(ports, ctx)
 	if !ok {
 		return false
@@ -115,7 +132,12 @@ func (mm *mapMonitor) step(ctx context.Context) bool {
 	if sv.Dead && sv.Silence >= st.EffectiveTimeout() {
 		sv.NotLiveFor, sv.Answered = corroborate(ctx, m, members, primary)
 	}
-	d := failover.Evaluate(failover.AutoView{Settings: st, Servers: []failover.AutoServer{sv}, HearsMajority: live*2 > len(members), Now: time.Now()})
+	// The cool-down of the map group is the time since its last bootstrap ended (F4-14); a bootstrap in progress was left above.
+	view := failover.AutoView{Settings: st, Servers: []failover.AutoServer{sv}, HearsMajority: live*2 > len(members), Now: time.Now()}
+	if cur, ok := m.journal.Current(); ok && !cur.Done[journal.StepGateOpen].IsZero() {
+		view.LastEnded = map[int32]time.Time{0: cur.Done[journal.StepGateOpen]}
+	}
+	d := failover.Evaluate(view)
 	if d.Start == "" {
 		mm.since = time.Time{}
 		return false

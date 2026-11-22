@@ -5,8 +5,8 @@ package failover
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
@@ -42,7 +42,10 @@ func (in Input) graceful() bool { return in.Mode == ModeGraceful }
 // addGraceful appends the steps of one group of a switchover.
 func (r *Runner) addGraceful(out *[]task.Step, g int32) {
 	add := func(name string, irreversible bool, f stepFunc) {
-		*out = append(*out, r.step(StepName(g, name), g, name, irreversible, f))
+		st := r.step(StepName(g, name), g, name, irreversible, f)
+		// A cancel ends a step before the promotion while it runs, not at its end (F4-08); the promotion and what follows are never interrupted.
+		st.Interruptible = !pastPromotion(name)
+		*out = append(*out, st)
 	}
 	add(StepFreeze, false, r.freeze)
 	add(StepChoose, false, r.chooseGraceful)
@@ -130,17 +133,19 @@ func (r *Runner) chooseGraceful(ctx context.Context, env *task.Env, sc *stepCtx)
 // rollbackSwitchover undoes what a switchover did to the old primary, as far as the promotion has not happened (design 5.3). Every part
 // is idempotent and best effort: the leases of the run are released, the writes are let in again and the old primary, when it was
 // stopped, is started again by its lease manager (the wait marker). It never runs for a group that was promoted.
-func (r *Runner) rollbackSwitchover(ctx context.Context, taskID int64, in Input, g int32, newServer string) {
+func (r *Runner) rollbackSwitchover(ctx context.Context, taskID int64, in Input, g int32, newServer string, term int64) {
 	ctx = context.WithoutCancel(ctx)
 	_, _ = r.Peers.Lease(ctx, r.Plan.Self(), LeaseRequest{Group: g, Role: LeaseRelease})
 	if newServer != "" && newServer != r.Plan.Self() {
 		_, _ = r.Peers.Lease(ctx, newServer, LeaseRequest{Group: g, Role: LeaseRelease})
 	}
-	if err := r.Peers.Resume(ctx, in.ServerID, ResumeRequest{Group: g}); err != nil && !errors.Is(err, ErrUnreachable) && !IsCode(err, "no_instance") {
-		r.log().Warn("failover: resuming the old primary after a switchover that did not finish", "group", g, "error", err)
+	// An error is logged, never swallowed: a server that cannot be reached keeps its hold and its marker, and the loop of Repair undoes them when
+	// the server answers again (F4-02), whatever became of this task.
+	if err := r.Peers.Resume(ctx, in.ServerID, ResumeRequest{Group: g, ExpectedTerm: term}); err != nil {
+		r.log().Warn("failover: the old primary could not be resumed; the repair of switchovers will try again", "group", g, "server", in.ServerID, "error", err)
 	}
-	if err := r.Peers.Unquiesce(ctx, in.ServerID, QuiesceRequest{Group: g}); err != nil && !errors.Is(err, ErrUnreachable) && !IsCode(err, "no_instance") {
-		r.log().Warn("failover: letting the writes in again", "group", g, "error", err)
+	if err := r.Peers.Unquiesce(ctx, in.ServerID, QuiesceRequest{Group: g, ExpectedTerm: term}); err != nil {
+		r.log().Warn("failover: the writes could not be let in again; the repair of switchovers will try again", "group", g, "server", in.ServerID, "error", err)
 	}
 	r.mu.Lock()
 	delete(r.paused, pauseKey(taskID, g))
@@ -150,7 +155,11 @@ func (r *Runner) rollbackSwitchover(ctx context.Context, taskID int64, in Input,
 // rollbackFailed rolls back and returns the failure of the step.
 func (sc *stepCtx) rollbackFailed(ctx context.Context, code string, retry bool, format string, a ...any) error {
 	gr, _ := sc.row(ctx)
-	sc.r.rollbackSwitchover(ctx, sc.env.Task.ID, sc.in, sc.group, gr.NewServer)
+	term := int64(-1)
+	if run, err := sc.runRow(ctx); err == nil {
+		term = run.ExpectedTerm
+	}
+	sc.r.rollbackSwitchover(ctx, sc.env.Task.ID, sc.in, sc.group, gr.NewServer, term)
 	sc.event(ctx, "rolledBack", map[string]any{"code": code})
 	return fail(code, retry, format, a...)
 }
@@ -162,9 +171,14 @@ func (r *Runner) quiesce(ctx context.Context, env *task.Env, sc *stepCtx) error 
 	if err := sc.ensureFrozen(ctx); err != nil {
 		return err
 	}
+	run, rerr := sc.runRow(ctx)
+	if rerr != nil {
+		return rerr
+	}
+	qterm := run.ExpectedTerm
 	deadline := r.now().Add(orDur(r.QuiesceWait, 2*time.Minute))
 	for {
-		ans, err := r.Peers.Quiesce(ctx, sc.old(), QuiesceRequest{Group: sc.group})
+		ans, err := r.Peers.Quiesce(ctx, sc.old(), QuiesceRequest{Group: sc.group, ExpectedTerm: qterm})
 		if err == nil && ans.Quiesced {
 			r.mu.Lock()
 			if r.paused == nil {
@@ -382,6 +396,39 @@ func (r *Runner) rollbackUnpromoted(ctx context.Context, t task.Task, in Input) 
 		case "pending", "promoted", "done", "failed", "skipped":
 			continue
 		}
-		r.rollbackSwitchover(ctx, t.ID, in, g, gr.NewServer)
+		// A step from the promotion on that failed is past the point of no return (design 5.3, F4-03): the promote call may have taken effect
+		// although it did not answer (promote_timeout), so the old primary is not resumed and no lease is released.
+		if t.Error != nil && failedPastPromotion(t.Error.Step, g) {
+			r.log().Warn("failover: not rolling back a group whose promotion began", "group", g, "step", t.Error.Step)
+			continue
+		}
+		term := int64(-1)
+		if run, rerr := runRowOf(ctx, rows, in, g); rerr == nil {
+			term = run.ExpectedTerm
+		}
+		r.rollbackSwitchover(ctx, t.ID, in, g, gr.NewServer, term)
 	}
+}
+
+// pastPromotion says whether the step key is the promotion or one of the steps after it.
+func pastPromotion(key string) bool {
+	seen := false
+	for _, k := range switchoverSteps {
+		if k == StepPromote {
+			seen = true
+		}
+		if k == key {
+			return seen
+		}
+	}
+	return false
+}
+
+// failedPastPromotion says whether the step name ("Group 3: Promote the standby") is a step of group g from the promotion on.
+func failedPastPromotion(step string, g int32) bool {
+	prefix := StepName(g, "")
+	if !strings.HasPrefix(step, prefix) {
+		return false
+	}
+	return pastPromotion(strings.TrimPrefix(step, prefix))
 }

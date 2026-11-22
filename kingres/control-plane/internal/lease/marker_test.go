@@ -18,7 +18,7 @@ func write(t *testing.T, p string) {
 // The markers are per group: the fence of one group never holds back the instance
 // of another, which is the point of the instance mapping.
 func TestMarkersAreForOneGroup(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempDir(t)
 	write(t, FencedPath(dir, 2))
 	groupOf := func(id int) (int32, bool) { return int32(id), true }
 	if err := Gate(dir, groupOf)(2); err == nil {
@@ -39,7 +39,7 @@ func TestMarkersAreForOneGroup(t *testing.T) {
 // the lease manager has seen the catalog, then it is renamed to the groups of the
 // server: an upgrade never loses a fence, and never keeps one for ever.
 func TestLegacyMarkersHoldAndAreMigrated(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempDir(t)
 	write(t, filepath.Join(dir, FencedMarker))
 	write(t, filepath.Join(dir, WaitMarker))
 	if !markerExists(dir, FencedMarker, 7) || !waitMarkerExists(dir, 7) {

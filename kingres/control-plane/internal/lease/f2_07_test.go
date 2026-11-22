@@ -13,7 +13,7 @@ import (
 // get no answer for a long time the file keeps changing, so the watchdog does not stop a healthy single-copy primary.
 func TestTheIdleWatchdogFileIsRefreshedWithoutARound(t *testing.T) {
 	r := newRig(t, []string{"a", "b", "c"}, false)
-	wf := filepath.Join(t.TempDir(), "lease.json")
+	wf := filepath.Join(tempDir(t), "lease.json")
 	if err := os.WriteFile(wf, []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
 	}

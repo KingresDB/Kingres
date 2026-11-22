@@ -3,6 +3,8 @@
 package ledgeranchor
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/url"
@@ -20,8 +22,30 @@ func init() {
 		CredentialsAllowed:  true,
 		Normalize:           normalizeWORM,
 		Build:               buildWORM,
+		Binds:               bindsWORM,
 		Timeouts:            func(json.RawMessage) (time.Duration, time.Duration) { return 0, 0 },
 	})
+}
+
+// bindsWORM: the key of the object ends with "<aggregate id>/<size>[.g<generation>].note" of this record, and the object is the signed note
+// of the row (its SHA-256 and its length).
+func bindsWORM(r Row, raw json.RawMessage) error {
+	ev, err := anchor.ParseWORMEvidence(raw)
+	if err != nil {
+		return err
+	}
+	tail := strings.TrimPrefix(worm.ObjectKeyGen("p", r.AggregateID, r.Size, r.Generation), "p/")
+	if ev.Key != tail && !strings.HasSuffix(ev.Key, "/"+tail) {
+		return errors.New("the object key of the evidence is not the key of this checkpoint")
+	}
+	if len(r.Note) == 0 {
+		return errors.New("the record has no note to compare the evidence with")
+	}
+	sum := sha256.Sum256(r.Note)
+	if ev.ObjectSHA256 != hex.EncodeToString(sum[:]) || ev.ContentLength != uint64(len(r.Note)) {
+		return errors.New("the object of the evidence is not the signed note of this checkpoint")
+	}
+	return nil
 }
 
 func normalizeWORM(raw json.RawMessage) (json.RawMessage, Info, error) {

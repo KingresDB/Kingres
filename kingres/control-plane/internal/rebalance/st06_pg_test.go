@@ -19,11 +19,11 @@ func TestARepeatedStartMoveAndAddSkippedDoNotDuplicateRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := Move{Database: "shop", Colocation: 0, Bucket: 3, From: 1, To: 2}
-	a, err := rows.StartMove(ctx, m, "s1", "s2", 1)
+	a, err := rows.StartMove(ctx, m, "s1", "s2", 1, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := rows.StartMove(ctx, m, "s1", "s2", 1) // the same attempt, repeated
+	b, err := rows.StartMove(ctx, m, "s1", "s2", 1, 0) // the same attempt, repeated
 	if err != nil || a != b {
 		t.Fatalf("a repeated start made seq %d after %d (%v)", b, a, err)
 	}
@@ -44,7 +44,7 @@ func TestARepeatedStartMoveAndAddSkippedDoNotDuplicateRows(t *testing.T) {
 	if err := rows.FinishMove(ctx, a, "failed", "x", "", nil); err != nil {
 		t.Fatal(err)
 	}
-	if c, err := rows.StartMove(ctx, m, "s1", "s2", 2); err != nil || c != a {
+	if c, err := rows.StartMove(ctx, m, "s1", "s2", 2, 0); err != nil || c != a {
 		t.Fatalf("the next attempt must reuse the row: %d %v", c, err)
 	}
 }
