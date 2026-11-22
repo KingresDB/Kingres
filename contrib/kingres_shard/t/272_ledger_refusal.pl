@@ -81,7 +81,7 @@ is(qs($n1, q{SELECT count(*) FROM kingres.check_cluster() WHERE check_name = 'le
 # the history table of an updatable ledger table counts too
 qs($n1, "INSERT INTO kingres.dist_table (relid, method) VALUES ('$history'::regclass, 'reference')");
 is(qs($n1, q{SELECT string_agg(node_id || ':' || object, ',' ORDER BY node_id) FROM kingres.check_cluster() WHERE check_name = 'ledger_distributed_table'}),
-	"1:$history", 'check_cluster names the history table of an updatable ledger table that is a reference table');
+	"1:" . ($history =~ /\./ ? $history : "public.$history"), 'check_cluster names the history table of an updatable ledger table that is a reference table');
 qs($n1, "DELETE FROM kingres.dist_table WHERE relid = '$history'::regclass");
 is(prepared_count($_), '0', 'nothing is prepared on ' . $_->name) for ($n1, $n2);
 done_testing();

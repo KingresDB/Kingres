@@ -7,6 +7,60 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-22: phase 12, the sharding extension: columnar tables in kingres_shard 0.9, the explicit refusal of ledger tables, and approximate count(DISTINCT)
+
+Covers branch p12-storage (from p12f-fix, kingres_shard 0.8 with the review fixes of step 12).  Version 0.9 is new: the other writer of kingres_shard (shard-p12) adds no SQL object and stays at 0.8, so the integrator merges the two and resolves the version.
+
+### What was done
+
+- **Version 0.9.**  `kingres_shard--0.8--0.9.sql`, the generated `kingres_shard--0.9.sql` (the 0.8 install script followed by the upgrade script; `mk-install-script.sh` now writes both scripts and `t/250` checks both), the control file, `Makefile`, `meson.build`, the C version
+  string, the version handshake (`internal_check_node_versions` asks for 0.9) and the `upgrade` regression test (the step from 0.8 on its own, and 0.9 at the end of every chain).
+- **St-S1, the access method is carried** (`t/270`).  `internal_table_ddl` names the access method of the source (`USING columnar`) in the statement that makes the table and its shadow, so `create_distributed_table`, the blocking rebuilds,
+  `undistribute_table` and `add_node` keep it; every bucket partition and leaf that is not heap gets `REPLICA IDENTITY FULL`; a user-partitioned table keeps the access method of each leaf (`internal_partition_layout` has an `am` column); the report
+  gains `access_method_missing`, `columnar_reference_table` (a reference table stays heap, design 9.5) and the note `columnar_storage` (the 0.8 report is kept as `internal_table_change_report_base` and the 0.9 report calls it).  A defect found on the
+  way: `add_node` onto a node that already had `kingres_columnar` or `kingres_ledger` failed after `PREPARE` ("function internal_sync_confirm does not exist": the schema `kingres` exists there and the function does not, which the check accepted only
+  for a missing schema).
+- **St-S2, refusals** (`t/271`).  The online variants of the lifecycle capture changes with a row trigger, which columnar does not support: the report has the blocker `columnar_online`, so the call is refused before an operation is recorded.  The split
+  refusal has the words of the design.  `kingres_ledger` rule L1 (`t/040_columnar_refused` in kingres_ledger): `ledger_enable` refuses a table whose access method is not heap, in C inside `ledger_lock_table`, so kingres_ledger stays at 0.3; `SET ACCESS METHOD`
+  on a ledger table is rejected by the existing rewrite trigger (the test shows it).
+- **Phase 7 step 25** (`t/272`).  A ledger table, or the history table of one, is refused by `create_distributed_table`, `create_reference_table` and their online variants with SQLSTATE `KS016` and a message of its own (the detail lists every blocker with its
+  code); `check_cluster` reports `ledger_distributed_table` for a ledger table that the catalog distributes or makes a reference table.
+- **Q-S5, `count_distinct_mode`** (`t/273`).  `kingres_shard.count_distinct_mode` (`exact` or `approximate`) and `count_distinct_error_rate`; the planner hook rewrites `count(DISTINCT x)` of every level that reads a hash-distributed table into
+  `kingres_sketch.approx_count_distinct(x, p)`; the new file `src/count_distinct.c`, one call in `planner.c`, `kingres_shard_extension_usable` in `shippable.c`.
+- **St-S3, bucket moves of columnar relations** (`t/274`, `t/271`).  The copy is made `USING` the access method of the source, a leaf that is not heap has `REPLICA IDENTITY FULL`, the move works with `kingres_columnar` 0.2 or later and is refused with the words of
+  the design with 0.1; inserts during a move, the move back, and a user-partitioned bucket with a columnar and a heap leaf are tested.
+
+### How it was verified
+
+- Every behaviour has a TAP test that fails without it; each was checked with a one-line mutant (clean build with -Werror against PostgreSQL 19 and the test run):  S1 seven, S2 four, rule L1 one, step 25 five, Q-S5 eleven, S3 four, every one killed except one (and the mutants that did not build or did not apply were redone as others):
+  the check `get_typtype(base) != TYPTYPE_BASE` in `count_distinct.c` is redundant with the check of the extended hash function (a record has none in the type cache), so no test can tell the two apart.
+- The full suites are recorded in the section below ("Gate").
+
+### Decisions and deviations
+
+- **Reference tables are not columnar** (design 9.5 recommends it; the S1 row of the plan says "carry"): `create_reference_table` refuses a columnar table with `columnar_reference_table`.
+- **The online variants are refused for columnar**, not made to work: their capture trigger is a row-level AFTER trigger.  The blocking variants work.
+- **The compaction before the switch (S3) is not done.**  The move would have to call `columnar_compact` inside `move_bucket`, a 450-line function; the stripes of the initial copy are full, only the changes of the move make small stripes.  The README says to run
+  `kingres.columnar_compact` afterwards.  The options of `columnar_set_options` are not carried to the copy either.
+- **The refusal for old kingres_columnar** is made by version (0.2 or later), so the refusal of S2 became the check of S3 rather than a second code path.
+- **L1 is in C**, so the ledger extension needs no new version.  The other half of L1 (`convert_partition` and `columnar_*` refuse a ledger table) belongs to kingres_timepart and kingres_columnar and is not done here.
+- **`EXPLAIN` does not print the line `Rewritten: count(DISTINCT x) -> approximate (p = 14)`** of the design; the aggregate shows as `approx_count_distinct(...)`.
+- The rewrite runs before the shortcut for a cluster of one shard group, so an answer does not depend on the number of groups.
+
+### Still open
+
+- The control plane and console parts of phase 12 (Q-C1, Q-W1, the storage and partitioning operations) are not in this branch.
+- Columnar tables in a distributed schema (phase 11) are not tested: the shells are made with the access method now (`internal_table_ddl` is shared), which needs `kingres_columnar` on every node.
+- Moves of a schema (`move_schema`) were not exercised with a columnar table.
+- Merge: `kingres_shard.h` (the version define), `Makefile` and `meson.build` (data files, objects), `mk-install-script.sh`, the README, `planner.c` (one call), `shippable.c` (one function at the end) and `node_conn.c` (one condition) are the files that the shard-p12 branch may also change.
+
+### Gate
+
+- `kingres_shard` at the tip before the last three fixes (clean -Werror builds with no warning, regress 23 of 23, every TAP file) on PostgreSQL 18 and 19: 223 files, 47924 tests on 18 and 48436 on 19.  Eight files failed in that run, each for a reason that was then fixed and the files run again on the fixed tree on both
+  majors (10 files, all passing): six tests that name the version of the extension in an expected message (t/036, 047, 058, 105, 140, 148 ask for 0.9 now), `t/098` (no file but the lookup names the extended hash function: `count_distinct.c` asks the type cache for the finfo), and `t/272` (a regclass printed with and without its schema).
+  An earlier gate of the S1 commit alone had the same version failures and one failure of `t/085` on 18 that did not repeat (a wait for a WAL segment; it passes alone).
+- `kingres_ledger` (regress and 39 TAP files, 2587 tests) on 18 and 19 with the check of rule L1: all pass.
+
 ## 2026-11-22: phase 11 (distributed schemas), the extension: the scale work (step 12), the review fixes and the documentation (step 15)
 
 Covers the work on branch shard-p1011 after the second review of phase 11 (the review fixes of 2026-11-21 are in the entry of that day).
