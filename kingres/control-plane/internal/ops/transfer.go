@@ -80,7 +80,11 @@ func (o *Ops) transferNow() time.Time {
 
 func (o *Ops) records() transfer.Records {
 	return transfer.Records{Run: func(ctx context.Context, f func(tx pgx.Tx) error) error {
-		return wrap(o.asService(ctx, sysdb.Database, f))
+		err := o.asService(ctx, sysdb.Database, f)
+		if errors.Is(err, transfer.ErrNotFound) {
+			return err
+		}
+		return wrap(err)
 	}}
 }
 

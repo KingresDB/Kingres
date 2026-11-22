@@ -42,6 +42,11 @@ const (
 	CodeForbidden      = "forbidden"
 	CodeCancelled      = "cancelled"
 	CodeSQLError       = "sql_error"
+	// The codes of an import that the control plane itself finds: the header, the end marker line, a record or a file that is too large.
+	CodeImportHeader    = "import_header_mismatch"
+	CodeImportEndMarker = "import_end_marker"
+	CodeRecordTooLarge  = "import_record_too_large"
+	CodeImportTooLarge  = "import_too_large"
 	// CodeInternal is every failure the server does not describe to the client.
 	CodeInternal = "internal_error"
 )

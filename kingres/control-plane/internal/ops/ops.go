@@ -122,6 +122,9 @@ type Ops struct {
 	// xferSt is the staging store and the master key, opened at the first use (transfer.go).
 	xferMu sync.Mutex
 	xferSt *xferState
+	// loads are the open transactions of the imports between the step that loads and the step that commits (transfer_import.go).
+	loadMu sync.Mutex
+	loads  map[int64]*pendingLoad
 }
 
 // SetEngine installs the task engine once the system database exists.

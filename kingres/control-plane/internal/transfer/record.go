@@ -123,9 +123,12 @@ func (rs Records) Get(ctx context.Context, id int64) (Record, error) {
 	err := rs.Run(ctx, func(tx pgx.Tx) error {
 		var e error
 		out, e = scanRecord(tx.QueryRow(ctx, `SELECT `+recordColumns+` FROM kingres_cp.data_transfer WHERE transfer_id = $1`, id))
+		if errors.Is(e, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
 		return e
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, ErrNotFound) {
 		return Record{}, ErrNotFound
 	}
 	return out, err
