@@ -23,7 +23,9 @@
 
 #include "access/attnum.h"
 #include "nodes/parsenodes.h"
+#include "nodes/params.h"
 #include "nodes/pg_list.h"
+#include "utils/memutils.h"
 
 /* kingres_shard.enable_distributed_merge: off gives the refusals of phase 2a */
 extern PGDLLIMPORT bool kingres_shard_enable_distributed_merge;
@@ -70,6 +72,24 @@ typedef struct KsMergeShip
 } KsMergeShip;
 
 extern bool kingres_shard_merge_build_ship(Query *q, const KsMerge *m, KsMergeShip *sh, const char **why);
+
+/* The marker that starts the text of a MERGE fragment: the placement number it was decided with, and
+ * the number of shipped sub-selects (0: colocated, 1: a routed source). */
+#define KS_MERGE_MARKER_PREFIX "/* kingres:merge-fragment "
+extern char *kingres_shard_merge_marker(int64 place, int rp);
+extern bool kingres_shard_parse_merge_marker(const char *query_string, int64 *place, int *rp);
+
+/* The text of an M1 statement as the groups get it (without the marker); NULL with *why when a group would not accept it. */
+extern char *kingres_shard_merge_text_colocated(Query *parse, const char **why);
+
+/* M3: the rows of the source of a MERGE, kept by the group that owns the bucket of their key. */
+typedef struct KsMergeShares KsMergeShares;
+
+extern KsMergeShares *kingres_shard_merge_collect(const char *source_sql, ParamListInfo params,
+												  int ncols, int colocation_id, List *group_ids,
+												  MemoryContext cxt);
+extern const char *kingres_shard_merge_share_array(KsMergeShares *sh, int group_id, int col);
+extern int64 kingres_shard_merge_share_rows(KsMergeShares *sh, int group_id);
 
 /*
  * Decide a MERGE whose target is a distributed table.  True with *m filled when the statement is

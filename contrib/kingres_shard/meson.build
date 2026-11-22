@@ -329,6 +329,7 @@ tests += {
       't/249_split_verify_types.pl',
       't/250_install_script_current.pl',
       't/251_add_node_staging_leftovers.pl',
+      't/263_merge_colocated.pl',
     ],
   },
 }

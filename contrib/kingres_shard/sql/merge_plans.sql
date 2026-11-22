@@ -37,7 +37,10 @@ CREATE FUNCTION merge_verdict(q text) RETURNS text LANGUAGE plpgsql AS $$
 DECLARE l text; r text := 'other'; dt text;
 BEGIN
   FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
-    IF l ~ 'Kingres' THEN r := regexp_replace(l, '^ *', ''); END IF;
+    IF l ~ 'Kingres|Pushed|Remote SQL|Nodes' THEN
+      r := CASE WHEN r = 'other' THEN '' ELSE r || ' ## ' END
+           || regexp_replace(regexp_replace(l, '^ *', ''), 'place=-?[0-9]+', 'place=N');
+    END IF;
   END LOOP;
   RETURN r;
 EXCEPTION WHEN OTHERS THEN
@@ -82,10 +85,37 @@ SELECT merge_verdict('MERGE INTO d USING plain p JOIN plain q ON p.x = q.x ON d.
 SELECT merge_verdict('MERGE INTO d USING d dd ON d.n = dd.n WHEN MATCHED THEN DELETE');
 
 -- ---------------------------------------------------------------------------
--- Shapes that are accepted (a later part of this file shows their plans).
+-- M1, colocated (7.3): the statement runs whole on every group of the target.
 -- ---------------------------------------------------------------------------
 SELECT merge_verdict('MERGE INTO d USING s ON d.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v');
+SELECT merge_verdict('MERGE INTO d USING s ON d.id = s.id WHEN MATCHED AND s.n > 3 THEN DELETE WHEN NOT MATCHED THEN INSERT (id, v, n) VALUES (s.id, s.v, s.n)');
+SELECT merge_verdict('MERGE INTO d USING s JOIN o ON s.id = o.id ON d.id = s.id WHEN MATCHED THEN UPDATE SET v = o.w');
+-- only reference tables in USING, and an action on the target rows that no source row matches
+SELECT merge_verdict('MERGE INTO d USING r ON d.n = r.k WHEN MATCHED THEN UPDATE SET v = r.label WHEN NOT MATCHED BY SOURCE THEN DELETE');
+SELECT merge_verdict('MERGE INTO d USING s ON d.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v RETURNING merge_action(), d.id');
+
+-- ---------------------------------------------------------------------------
+-- M3, routed source (7.4): the source is read here and each row goes to the group of its key.
+-- ---------------------------------------------------------------------------
 SELECT merge_verdict('MERGE INTO d USING plain p ON d.id = p.x WHEN NOT MATCHED THEN INSERT (id, v) VALUES (p.x, p.y)');
+SELECT merge_verdict('MERGE INTO d USING (VALUES (1, ''a''), (2, ''b'')) AS v(k, t) ON d.id = v.k WHEN MATCHED THEN UPDATE SET v = v.t WHEN NOT MATCHED THEN INSERT (id, v) VALUES (v.k, v.t)');
+-- a table of another colocation group, a distributed table joined on a column other than its key,
+-- a reference table that must give rows to a NOT MATCHED action
+SELECT merge_verdict('MERGE INTO d USING away ON d.id = away.id WHEN MATCHED THEN DELETE');
+SELECT merge_verdict('MERGE INTO d USING s ON d.id = s.g WHEN MATCHED THEN DELETE');
+SELECT merge_verdict('MERGE INTO d USING r ON d.id = r.k WHEN NOT MATCHED THEN INSERT (id, v) VALUES (r.k, r.label)');
+-- an aggregate as the source, with an action that no group may skip
+SELECT merge_verdict('MERGE INTO d USING (SELECT g, count(*) AS c FROM s GROUP BY g) q ON d.id = q.g WHEN MATCHED THEN UPDATE SET n = q.c WHEN NOT MATCHED BY SOURCE THEN DELETE');
+-- the key expression is an expression of the source
+SELECT merge_verdict('MERGE INTO d USING plain p ON d.id = p.x + 1 WHEN MATCHED THEN DELETE');
+-- with a bound parameter
+PREPARE mp(int) AS MERGE INTO d USING plain p ON d.id = p.x WHEN MATCHED AND p.x > $1 THEN DELETE;
+SELECT merge_verdict('EXECUTE mp(3)');
+DEALLOCATE mp;
+-- the switch of the setting
+SET kingres_shard.enable_distributed_merge = off;
+SELECT merge_verdict('MERGE INTO d USING plain p ON d.id = p.x WHEN MATCHED THEN DELETE');
+RESET kingres_shard.enable_distributed_merge;
 
 -- ---------------------------------------------------------------------------
 -- Clean up

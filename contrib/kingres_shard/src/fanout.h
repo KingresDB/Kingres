@@ -27,6 +27,7 @@ typedef struct KsFanTarget
 	char	   *host;
 	int			port;
 	bool		is_local;
+	int			group_id;		/* the shard group of the node (a write to a distributed table; -1 when not set) */
 } KsFanTarget;
 
 extern void kingres_shard_fanout_init(void);
@@ -48,6 +49,10 @@ extern PlannedStmt *kingres_shard_make_fanout_plan(Query *parse, char *sql,
  * statement was decided with; relids are the relations of the statement (the plan remembers what
  * each was and checks it when it starts).
  */
+/* A MERGE that every group runs (colocated: mergeinfo NIL) or whose source this node reads and routes (mergeinfo: source SELECT, shipped columns, first array parameter, no group is skipped). */
+extern PlannedStmt *kingres_shard_make_merge_plan(Query *parse, char *sql, List *targets, int64 place, List *relids,
+												   List *mergeinfo);
+
 extern PlannedStmt *kingres_shard_make_insert_select_plan(Query *parse, char *sql, List *targets,
 														   int64 place, List *relids);
 

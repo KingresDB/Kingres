@@ -39,10 +39,12 @@
 #include "catalog/pg_collation_d.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_type_d.h"
+#include "executor/spi.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/params.h"
 #include "optimizer/optimizer.h"
 #include "parser/analyze.h"
 #include "parser/parse_node.h"
@@ -53,12 +55,14 @@
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/ruleutils.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 
 #include "catalog.h"
+#include "hashing.h"
 #include "kingres_shard.h"
 #include "merge.h"
 #include "node_conn.h"
@@ -1053,4 +1057,291 @@ kingres_shard_merge_classify(Query *parse, KsMerge *m)
 		merge_refuse(tdt, why1);
 	merge_refuse(tdt, why3 != NULL ? why3 : why1);
 	return false;				/* not reached */
+}
+
+/* ======================================================================
+ * The marker of a MERGE fragment, and the text of M1
+ * ====================================================================== */
+
+char *
+kingres_shard_merge_marker(int64 place, int rp)
+{
+	return psprintf(KS_MERGE_MARKER_PREFIX "place=" INT64_FORMAT " rp=%d */ ", place, rp);
+}
+
+bool
+kingres_shard_parse_merge_marker(const char *query_string, int64 *place, int *rp)
+{
+	const char *p;
+	char	   *end;
+
+	if (query_string == NULL ||
+		strncmp(query_string, KS_MERGE_MARKER_PREFIX, strlen(KS_MERGE_MARKER_PREFIX)) != 0)
+		return false;
+	p = query_string + strlen(KS_MERGE_MARKER_PREFIX);
+	if (strncmp(p, "place=", 6) != 0)
+		return false;
+	p += 6;
+	*place = strtoll(p, &end, 10);
+	if (end == p || strncmp(end, " rp=", 4) != 0)
+		return false;
+	p = end + 4;
+	*rp = (int) strtol(p, &end, 10);
+	if (end == p || *rp < 0 || *rp > 1)
+		return false;
+	return strncmp(end, " */ ", 4) == 0;
+}
+
+/*
+ * The text of an M1 statement as the groups get it: the statement deparsed qualified under the
+ * transmission modes, and decided once more on the parse of that text, as a group decides.  NULL
+ * with *why when a group would not accept it.
+ */
+char *
+kingres_shard_merge_text_colocated(Query *parse, const char **why)
+{
+	ParamTypes	pt = {NULL, 0};
+	char	   *body;
+	Query	   *rq;
+	KsMerge		m2;
+	int			nest;
+	int			i;
+
+	nest = kingres_shard_set_transmission_modes();
+	body = pg_get_querydef(parse, false);
+	kingres_shard_reset_transmission_modes(nest);
+
+	(void) merge_param_types_walker((Node *) parse, &pt);
+	for (i = 0; i < pt.n; i++)
+		if (!OidIsValid(pt.types[i]))
+			pt.types[i] = TEXTOID;
+	rq = merge_parse_text(body, pt.types, pt.n, why);
+	if (rq == NULL)
+		return NULL;
+	if (!kingres_shard_merge_fragment_analyze(rq, 0, &m2, why))
+		return NULL;
+	return body;
+}
+
+/* ======================================================================
+ * M3: the rows of the source, by the group that owns their key
+ * ====================================================================== */
+
+typedef struct MgShare
+{
+	int			group_id;
+	int64		nrows;
+	StringInfoData *cols;
+} MgShare;
+
+struct KsMergeShares
+{
+	int			ncols;
+	int			ngroups;
+	MgShare    *g;
+	int64		bytes;
+	int64		rows;
+};
+
+static void
+mg_append_element(StringInfo buf, bool first, const char *text)
+{
+	const char *p;
+
+	if (!first)
+		appendStringInfoChar(buf, ',');
+	if (text == NULL)
+	{
+		appendStringInfoString(buf, "NULL");
+		return;
+	}
+	appendStringInfoChar(buf, '"');
+	for (p = text; *p; p++)
+	{
+		if (*p == '"' || *p == '\\')
+			appendStringInfoChar(buf, '\\');
+		appendStringInfoChar(buf, *p);
+	}
+	appendStringInfoChar(buf, '"');
+}
+
+KsMergeShares *
+kingres_shard_merge_collect(const char *source_sql, ParamListInfo params, int ncols, int colocation_id,
+							List *group_ids, MemoryContext cxt)
+{
+	KsMergeShares *sh;
+	MemoryContext old = MemoryContextSwitchTo(cxt);
+	const KsColocation *coloc = kingres_shard_lookup_colocation(colocation_id);
+	int			n = params ? params->numParams : 0;
+	Oid		   *argtypes = palloc(sizeof(Oid) * Max(n, 1));
+	Datum	   *values = palloc(sizeof(Datum) * Max(n, 1));
+	char	   *nulls = palloc(Max(n, 1));
+	int64		limit = (int64) kingres_shard_merge_max_source_kb * 1024;
+	FmgrInfo   *outf = NULL;
+	Oid			route_type = InvalidOid;
+	Portal		portal;
+	int			i;
+	ListCell   *lc;
+	int			nest;
+	MemoryContext rowcxt;
+
+	if (coloc == NULL)
+		elog(ERROR, "colocation group %d of a MERGE is not in the catalog", colocation_id);
+	sh = palloc0(sizeof(KsMergeShares));
+	sh->ncols = ncols;
+	sh->ngroups = list_length(group_ids);
+	sh->g = palloc0(sizeof(MgShare) * Max(sh->ngroups, 1));
+	i = 0;
+	foreach(lc, group_ids)
+	{
+		int			j;
+
+		sh->g[i].group_id = lfirst_int(lc);
+		sh->g[i].cols = palloc0(sizeof(StringInfoData) * ncols);
+		for (j = 0; j < ncols; j++)
+			initStringInfo(&sh->g[i].cols[j]);
+		i++;
+	}
+	for (i = 0; i < n; i++)
+	{
+		ParamExternData *prm;
+		ParamExternData workspace;
+
+		if (params->paramFetch != NULL)
+			prm = params->paramFetch(params, i + 1, false, &workspace);
+		else
+			prm = &params->params[i];
+		argtypes[i] = OidIsValid(prm->ptype) ? prm->ptype : TEXTOID;
+		values[i] = prm->value;
+		nulls[i] = (prm->isnull || !OidIsValid(prm->ptype)) ? 'n' : ' ';
+	}
+	rowcxt = AllocSetContextCreate(cxt, "kingres_shard merge row", ALLOCSET_SMALL_SIZES);
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	portal = SPI_cursor_open_with_args(NULL, source_sql, n, argtypes, values, nulls, true, CURSOR_OPT_NO_SCROLL);
+	if (portal == NULL)
+		elog(ERROR, "could not open the cursor of the source of a MERGE");
+	nest = kingres_shard_set_transmission_modes();
+	PG_TRY();
+	{
+		for (;;)
+		{
+			uint64		k;
+
+			SPI_cursor_fetch(portal, true, 256);
+			if (SPI_processed == 0)
+				break;
+			if (outf == NULL)
+			{
+				TupleDesc	td = SPI_tuptable->tupdesc;
+				int			c;
+
+				if (td->natts != ncols + 1)
+					elog(ERROR, "the source of a MERGE returned %d columns, expected %d", td->natts, ncols + 1);
+				outf = MemoryContextAlloc(cxt, sizeof(FmgrInfo) * (ncols + 1));
+				for (c = 0; c <= ncols; c++)
+				{
+					Oid			ofunc;
+					bool		isvarlena;
+
+					getTypeOutputInfo(TupleDescAttr(td, c)->atttypid, &ofunc, &isvarlena);
+					fmgr_info_cxt(ofunc, &outf[c], cxt);
+				}
+				route_type = TupleDescAttr(td, ncols)->atttypid;
+			}
+			for (k = 0; k < SPI_processed; k++)
+			{
+				HeapTuple	tup = SPI_tuptable->vals[k];
+				TupleDesc	td = SPI_tuptable->tupdesc;
+				bool		isnull;
+				Datum		kd = SPI_getbinval(tup, td, ncols + 1, &isnull);
+				int			bucket;
+				int			g;
+				MgShare    *share = NULL;
+				int			j;
+
+				CHECK_FOR_INTERRUPTS();
+				/* a NULL key hashes like the router's: tuple routing puts the inserted row into the bucket of slot 0 */
+				if (!kingres_shard_try_bucket(coloc->dist_type, coloc->collation, coloc, route_type, kd, isnull, &bucket))
+					ereport(ERROR,
+							(errcode(ERRCODE_DATATYPE_MISMATCH),
+							 errmsg("the key expression of a MERGE cannot be placed in the bucket map")));
+				g = kingres_shard_bucket_group(coloc, bucket);
+				if (g < 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							 errmsg("bucket %d of colocation group %d has no owner", bucket, colocation_id)));
+				for (j = 0; j < sh->ngroups; j++)
+					if (sh->g[j].group_id == g)
+					{
+						share = &sh->g[j];
+						break;
+					}
+				if (share == NULL)
+					continue;
+				for (j = 0; j < ncols; j++)
+				{
+					bool		cnull;
+					Datum		d = SPI_getbinval(tup, td, j + 1, &cnull);
+					MemoryContext prev = MemoryContextSwitchTo(rowcxt);
+					char	   *txt = cnull ? NULL : OutputFunctionCall(&outf[j], d);
+					int			before = share->cols[j].len;
+
+					MemoryContextSwitchTo(prev);
+					mg_append_element(&share->cols[j], share->nrows == 0, txt);
+					sh->bytes += share->cols[j].len - before;
+					MemoryContextReset(rowcxt);
+				}
+				share->nrows++;
+				sh->rows++;
+				if (sh->bytes > limit)
+					ereport(ERROR,
+							(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+							 errmsg("the source of this MERGE needs more than kingres_shard.merge_max_source_bytes (%d kB)",
+									kingres_shard_merge_max_source_kb),
+							 errhint("Split the source by key range (one MERGE for each range), or raise the setting.")));
+			}
+			SPI_freetuptable(SPI_tuptable);
+		}
+	}
+	PG_FINALLY();
+	{
+		kingres_shard_reset_transmission_modes(nest);
+	}
+	PG_END_TRY();
+	SPI_cursor_close(portal);
+	SPI_finish();
+	MemoryContextDelete(rowcxt);
+	MemoryContextSwitchTo(old);
+	return sh;
+}
+
+static MgShare *
+mg_find_share(KsMergeShares *sh, int group_id)
+{
+	int			i;
+
+	for (i = 0; i < sh->ngroups; i++)
+		if (sh->g[i].group_id == group_id)
+			return &sh->g[i];
+	return NULL;
+}
+
+const char *
+kingres_shard_merge_share_array(KsMergeShares *sh, int group_id, int col)
+{
+	MgShare    *g = mg_find_share(sh, group_id);
+
+	if (g == NULL)
+		return "{}";
+	return psprintf("{%s}", g->cols[col].data);
+}
+
+int64
+kingres_shard_merge_share_rows(KsMergeShares *sh, int group_id)
+{
+	MgShare    *g = mg_find_share(sh, group_id);
+
+	return g == NULL ? 0 : g->nrows;
 }
