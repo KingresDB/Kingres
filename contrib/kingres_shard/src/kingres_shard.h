@@ -121,6 +121,12 @@
 #define ERRCODE_KINGRES_CALL_TIMEOUT MAKE_SQLSTATE('K','S','0','1','5')
 
 /*
+ * SQLSTATE of "this table is a ledger table (or the history table of one) of kingres_ledger and cannot be distributed or made a reference
+ * table" (phase 7 step 25, internal_raise_blockers in the SQL of 0.9).  Raised by SQL; the macro documents the code.  Not a retry.
+ */
+#define ERRCODE_KINGRES_LEDGER_TABLE MAKE_SQLSTATE('K','S','0','1','6')
+
+/*
  * The text that starts the statement of every fragment of a distributed scan
  * (dist_scan.c).  A forwarded session runs a plain read of a distributed table
  * as the local rows of the table only when the statement carries it; without

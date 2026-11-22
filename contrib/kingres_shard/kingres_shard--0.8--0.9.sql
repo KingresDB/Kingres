@@ -733,3 +733,134 @@ BEGIN
     RETURN v_out;
 END;
 $$;
+
+-- ---------------------------------------------------------------------------
+-- Phase 7 step 25: a ledger table is refused explicitly (SQLSTATE KS016)
+-- ---------------------------------------------------------------------------
+
+-- internal_raise_blockers(): the blockers of a call become one error, as before; when one of them is a ledger table (or the history table of
+-- one), the error is its own: SQLSTATE KS016, the message says what the table is and that it stays where it is, and the detail lists every
+-- blocker with its code.  The calls of create_distributed_table() and create_reference_table() raise it, the online variants too.
+CREATE OR REPLACE FUNCTION kingres.internal_raise_blockers(p_kind text, p_relid regclass, p_options jsonb)
+    RETURNS void
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_rows  pg_catalog.text[];
+    v_codes pg_catalog.text[];
+    v_n     pg_catalog.int4;
+    v_state pg_catalog.text := 'feature_not_supported';
+    v_detail pg_catalog.text;
+BEGIN
+    SELECT pg_catalog.array_agg(t.detail ORDER BY t.o), pg_catalog.array_agg(t.code ORDER BY t.o)
+      INTO v_rows, v_codes
+      FROM (SELECT r.detail, r.code, pg_catalog.row_number() OVER () AS o
+              FROM kingres.table_change_report(p_kind, p_relid, p_options) r
+             WHERE r.severity OPERATOR(pg_catalog.=) 'blocker') t;
+    v_n := COALESCE(pg_catalog.cardinality(v_rows), 0);
+    IF v_n OPERATOR(pg_catalog.=) 0 THEN
+        RETURN;
+    END IF;
+    v_detail := (SELECT pg_catalog.string_agg(pg_catalog.format('%s: %s', v_codes[i], v_rows[i]), E'\n' ORDER BY i)
+                   FROM pg_catalog.generate_subscripts(v_rows, 1) AS i);
+    IF 'ledger_table' OPERATOR(pg_catalog.=) ANY (v_codes) THEN
+        RAISE EXCEPTION '%', pg_catalog.format('cannot %s: table "%s" is a ledger table (or the history table of one) and stays where it is',
+                                               CASE WHEN p_kind OPERATOR(pg_catalog.=) 'distribute_reference' THEN 'make it a reference table' ELSE 'distribute it' END,
+                                               p_relid)
+            USING ERRCODE = 'KS016',
+                  DETAIL = v_detail,
+                  HINT = 'A ledger table keeps its chain, its capture trigger and its protection on one node.  Distribute a table that is not under the ledger, or keep this one as an ordinary table.';
+    END IF;
+    IF v_n OPERATOR(pg_catalog.=) 1 THEN
+        v_state := CASE v_codes[1]
+                       WHEN 'already_distributed' THEN 'duplicate_object'
+                       WHEN 'not_ordinary_table' THEN 'wrong_object_type'
+                       WHEN 'column_missing' THEN 'undefined_column'
+                       WHEN 'unique_without_distribution_column' THEN 'invalid_table_definition'
+                       WHEN 'name_too_long' THEN 'invalid_name'
+                       WHEN 'not_on_map_group' THEN 'object_not_in_prerequisite_state'
+                       WHEN 'group_busy' THEN 'object_in_use'
+                       ELSE 'feature_not_supported' END;
+        RAISE EXCEPTION '%', v_rows[1] USING ERRCODE = v_state;
+    END IF;
+    RAISE EXCEPTION '% problems prevent the change of table "%"', v_n, p_relid
+        USING ERRCODE = 'feature_not_supported',
+              DETAIL = v_detail,
+              HINT = 'kingres.table_change_report() lists them with the warnings and notes.';
+END;
+$$;
+
+-- check_cluster(): a ledger table (or the history table of one) that is also a distributed table or a reference table.  ledger_enable runs on
+-- one node; a reference table has a copy on every node, so a ledger on one of them covers one copy only, and a distributed table cannot be one.
+-- Node-local: the names of the tables of this node that kingres_ledger registered and that the catalog of the cluster distributes, as a JSON array.
+CREATE FUNCTION kingres.internal_ledger_distributed()
+    RETURNS pg_catalog.jsonb
+    LANGUAGE plpgsql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_out pg_catalog.jsonb;
+    v_hist pg_catalog.text := '';
+BEGIN
+    IF pg_catalog.to_regclass('kingres.ledger_table') IS NULL THEN
+        RETURN '[]'::pg_catalog.jsonb;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a
+                WHERE a.attrelid OPERATOR(pg_catalog.=) 'kingres.ledger_table'::pg_catalog.regclass
+                  AND a.attname OPERATOR(pg_catalog.=) 'history_relid' AND NOT a.attisdropped) THEN
+        v_hist := ' UNION SELECT t.history_relid::pg_catalog.oid FROM kingres.ledger_table t WHERE t.history_relid IS NOT NULL';
+    END IF;
+    EXECUTE pg_catalog.format(
+        'SELECT COALESCE(pg_catalog.jsonb_agg(x.o::pg_catalog.regclass::pg_catalog.text ORDER BY x.o::pg_catalog.regclass::pg_catalog.text), ''[]''::pg_catalog.jsonb) '
+        'FROM (SELECT t.relid::pg_catalog.oid AS o FROM kingres.ledger_table t%s) x '
+        'WHERE EXISTS (SELECT 1 FROM kingres.dist_table d WHERE d.method OPERATOR(pg_catalog.<>) ''schema'' '
+        'AND (d.relid::pg_catalog.oid OPERATOR(pg_catalog.=) x.o OR d.relid::pg_catalog.oid OPERATOR(pg_catalog.=) COALESCE(pg_catalog.pg_partition_root(x.o::pg_catalog.regclass)::pg_catalog.oid, 0::pg_catalog.oid)))',
+        v_hist)
+       INTO v_out;
+    RETURN v_out;
+END;
+$$;
+COMMENT ON FUNCTION kingres.internal_ledger_distributed() IS 'Node-local: the ledger tables of this node that are distributed tables or reference tables, as a JSON array';
+REVOKE ALL ON FUNCTION kingres.internal_ledger_distributed() FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION kingres.internal_check_ledger(p_skip int[] DEFAULT '{}')
+    RETURNS TABLE (check_name text, node_id int, object text, detail text)
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    n pg_catalog.record;
+    r pg_catalog.jsonb;
+    e pg_catalog.text;
+BEGIN
+    IF pg_catalog.to_regclass('kingres.dist_schema') IS NULL THEN
+        RETURN;
+    END IF;
+    FOR n IN SELECT nd.node_id AS id FROM kingres.node nd WHERE nd.role OPERATOR(pg_catalog.=) 'primary' AND nd.is_active
+                AND NOT (nd.node_id OPERATOR(pg_catalog.=) ANY (p_skip)) ORDER BY nd.node_id LOOP
+        BEGIN
+            r := kingres.internal_node_exec(n.id, 'SELECT kingres.internal_ledger_misplaced()::pg_catalog.text');
+            r := (((r OPERATOR(pg_catalog.->) 0) OPERATOR(pg_catalog.->>) 0))::pg_catalog.jsonb;
+        EXCEPTION WHEN OTHERS OR query_canceled THEN
+            CONTINUE;
+        END;
+        FOR e IN SELECT x FROM pg_catalog.jsonb_array_elements_text(r) x LOOP
+            check_name := 'ledger_on_non_owner'; node_id := n.id; object := e;
+            detail := 'the table is a ledger table of this node, and its schema is distributed and held by another shard group: its rows are on the owner, so this ledger covers none of them';
+            RETURN NEXT;
+        END LOOP;
+        BEGIN
+            r := kingres.internal_node_exec(n.id, 'SELECT kingres.internal_ledger_distributed()::pg_catalog.text');
+            r := (((r OPERATOR(pg_catalog.->) 0) OPERATOR(pg_catalog.->>) 0))::pg_catalog.jsonb;
+        EXCEPTION WHEN OTHERS OR query_canceled THEN
+            CONTINUE;
+        END;
+        FOR e IN SELECT x FROM pg_catalog.jsonb_array_elements_text(r) x LOOP
+            check_name := 'ledger_distributed_table'; node_id := n.id; object := e;
+            detail := 'the table is a ledger table of this node and also a distributed or reference table: a ledger covers the rows of one node only, so this one proves nothing about the table as a whole (kingres_shard refuses to distribute a ledger table; the ledger was enabled afterwards)';
+            RETURN NEXT;
+        END LOOP;
+    END LOOP;
+END;
+$$;
