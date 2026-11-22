@@ -410,31 +410,36 @@ const entries: Record<ProblemCode, Entry> = {
   extension_unavailable: {
     tone: 'warning',
     heading: 'The extension is not available on a server',
-    message: 'A server has no package for the extension, or the database lacks it. Install the package on that server and try again.',
+    message:
+      'A server has no package for the extension, or the database lacks it. Install the package on that server and try again.',
     withDetail: true,
   },
   extension_version_mismatch: {
     tone: 'warning',
     heading: 'The servers run different versions of the extension',
-    message: 'Every server of the database must run the same version. Update the extension on the servers named below, then try again.',
+    message:
+      'Every server of the database must run the same version. Update the extension on the servers named below, then try again.',
     withDetail: true,
   },
   sketch_hash_mismatch: {
     tone: 'danger',
     heading: 'The servers disagree on the sketch hash',
-    message: 'The known-answer values hash differently on the servers named below, so sketches built on them would not merge. Check that they run the same build.',
+    message:
+      'The known-answer values hash differently on the servers named below, so sketches built on them would not merge. Check that they run the same build.',
     withDetail: true,
   },
   extension_missing: {
     tone: 'warning',
     heading: 'An extension is missing',
-    message: 'The extension is not installed in the database, or its library is not preloaded on a server. The detail names the extension and the servers.',
+    message:
+      'The extension is not installed in the database, or its library is not preloaded on a server. The detail names the extension and the servers.',
     withDetail: true,
   },
   conversion_refused: {
     tone: 'warning',
     heading: 'The storage format cannot be changed',
-    message: 'The detail lists the reasons (a ledger table, indexes, triggers, a publication, a default partition). Remove them and try again.',
+    message:
+      'The detail lists the reasons (a ledger table, indexes, triggers, a publication, a default partition). Remove them and try again.',
     withDetail: true,
   },
   partition_policy_conflict: {
