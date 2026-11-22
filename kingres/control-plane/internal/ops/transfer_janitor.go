@@ -123,3 +123,31 @@ func (o *Ops) TransferSweep(ctx context.Context) (SweepReport, error) {
 	}
 	return rep, nil
 }
+
+// TransferStats is what the metrics and the alert of the data transfer read: the bytes the reservations hold, the free bytes of the file system of the staging
+// directory, the quota, the running transfers and the files that are kept. ok is false on a server that never opened its staging directory (it holds no file).
+func (o *Ops) TransferStats(ctx context.Context) (used, free, quota int64, running, staged int, ok bool) {
+	o.xferMu.Lock()
+	x := o.xferSt
+	o.xferMu.Unlock()
+	if x == nil {
+		return 0, 0, 0, 0, 0, false
+	}
+	for _, h := range x.store.Holds() {
+		used += h.Bytes
+	}
+	sp, err := x.store.Space()
+	if err != nil {
+		return 0, 0, 0, 0, 0, false
+	}
+	free = int64(sp.Free)
+	quota = staging.DefaultQuota(sp.Total)
+	if st, serr := o.settings(ctx); serr == nil && st.StagingQuotaBytes > 0 {
+		quota = st.StagingQuotaBytes
+	}
+	_ = o.asService(ctx, sysdb.Database, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT count(*) FILTER (WHERE state IN ('receiving', 'building'))::int, count(*) FILTER (WHERE state = 'ready')::int
+			FROM kingres_cp.data_transfer WHERE server_id = $1`, o.ServerHost).Scan(&running, &staged)
+	})
+	return used, free, quota, running, staged, true
+}

@@ -4,12 +4,14 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/audit"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/auth"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/config"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/monitor"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ops"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/scheduler"
 )
@@ -45,4 +47,41 @@ func transferJanitorJob(o *ops.Ops) scheduler.Job {
 		_, err := o.TransferSweep(ctx)
 		return err
 	}}
+}
+
+// transferMetrics is the Extra of the monitor: the staging use and the counts of the data transfer of this server.
+func transferMetrics(o *ops.Ops) func(context.Context) map[string]float64 {
+	return func(ctx context.Context) map[string]float64 {
+		if o == nil {
+			return nil
+		}
+		used, free, _, running, staged, ok := o.TransferStats(ctx)
+		if !ok {
+			return nil
+		}
+		return map[string]float64{"transferStagingUsedBytes": float64(used), "transferStagingFreeBytes": float64(free), "transfersRunning": float64(running), "transfersStaged": float64(staged)}
+	}
+}
+
+// transferProbe raises the alert transferStagingLow when the reservations hold 90 percent of the quota (critical at 98), or when the file system of the staging
+// directory has less free than a tenth of the quota and the reservations still need room.
+func transferProbe(o *ops.Ops, host string) func(context.Context, time.Time) ([]monitor.Condition, map[string]bool) {
+	return func(ctx context.Context, _ time.Time) ([]monitor.Condition, map[string]bool) {
+		if o == nil {
+			return nil, nil
+		}
+		used, _, quota, _, _, ok := o.TransferStats(ctx)
+		if !ok || quota <= 0 {
+			return nil, nil
+		}
+		kinds := map[string]bool{"transferStagingLow": true}
+		pct := float64(used) * 100 / float64(quota)
+		switch {
+		case pct >= 98:
+			return []monitor.Condition{{Kind: "transferStagingLow", Severity: "critical", Subject: "server:" + host, Message: fmt.Sprintf("The staging area of the data transfer on server %s is %.0f%% of its quota.", host, pct)}}, kinds
+		case pct >= 90:
+			return []monitor.Condition{{Kind: "transferStagingLow", Severity: "warning", Subject: "server:" + host, Message: fmt.Sprintf("The staging area of the data transfer on server %s is %.0f%% of its quota.", host, pct)}}, kinds
+		}
+		return nil, kinds
+	}
 }

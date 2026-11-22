@@ -376,6 +376,7 @@ None.
 - `ClusterSettings.dataTransfer` (optional) and `ClusterSettingsUpdateRequest.dataTransfer`: `enabled` (default false), `retentionHours`, `maxFileBytes`, `stagingQuotaBytes`, `maxConcurrent`.
 - `ProblemCode` has `data_transfer_disabled`, `insecure_transport`, `transfer_quota_exceeded`, `upload_incomplete`, `upload_offset_mismatch`, `chunk_too_large`, `upload_checksum_mismatch`,
   `import_header_mismatch`, `import_ledger_policy`, `import_too_large`, `import_end_marker` and `export_untrusted_code`; `Problem` has the optional `reasons`; an expired file is 410 with the code `not_found`.
+- `MetricName` has `transferStagingUsedBytes`, `transferStagingFreeBytes`, `transfersRunning` and `transfersStaged`, and `AlertKind` has `transferStagingLow` (added later in 0.19.0, before its release).
 - `TaskKind` has `table.export` and `table.import`; `AuditAction` has `exportTable`, `importTable`, `createDataUpload`, `deleteDataUpload`, `downloadDataExport`, `deleteDataExport`, `dataTransfer.completed`
   and `dataTransfer.purged` (`uploadDataChunk` is not audited).
 - Schemas: `ExportTableRequest`, `ImportTableRequest` (closed), `CreateDataUploadRequest`, `DataUpload`, `DataExport`, `DataExportPage`, `TableConsistency`, `DataTransferSettings`, `DataTransferSettingsUpdate`.
