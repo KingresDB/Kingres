@@ -8051,6 +8051,8 @@ export interface components {
             rows?: number | null;
             /** @description One entry for the table; null while it is built. */
             consistency?: components["schemas"]["TableConsistency"][] | null;
+            /** @description Whether the file was written with the spreadsheet guard (`spreadsheetSafe` of the request); null while it is built. Added to 0.19.0 before its release. */
+            spreadsheetSafe?: boolean | null;
             /** @description Whether row-level security shortened the file. Always false: a table with row-level security is exported only with `row_security = off`, so a policy that hides rows fails the export. */
             rlsApplied?: boolean;
             /**
@@ -8109,6 +8111,11 @@ export interface components {
              * @default 2
              */
             maxConcurrent: number;
+            /**
+             * Format: int64
+             * @description The largest decompressed file that one import accepts on the server that answers (a flag of the server, 256 MiB for a reference table whatever the flag). Not part of the update; added to 0.19.0 before its release.
+             */
+            readonly maxAtomicBytes?: number;
         };
         /** @description Added in 0.19.0. A partial update of `DataTransferSettings`. */
         DataTransferSettingsUpdate: {

@@ -369,6 +369,9 @@ func (o *Ops) isGzip(x *xferState, rec transfer.Record) bool {
 	return n == 2 && magic[0] == 0x1f && magic[1] == 0x8b
 }
 
+// MaxAtomicBytes is the effective cap of one import (the flag of the server), for the settings.
+func (o *Ops) MaxAtomicBytes() int64 { return o.maxAtomic() }
+
 func (o *Ops) maxAtomic() int64 {
 	if o.Transfer != nil && o.Transfer.MaxAtomicBytes > 0 {
 		return o.Transfer.MaxAtomicBytes

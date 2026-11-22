@@ -66,22 +66,24 @@ type TableConsistency struct {
 
 // DataExport is a staged export file.
 type DataExport struct {
-	ExportID     string             `json:"exportId"`
-	Kind         string             `json:"kind"`
-	State        string             `json:"state"`
-	Database     *string            `json:"database"`
-	Schema       *string            `json:"schema"`
-	Table        *string            `json:"table"`
-	SizeBytes    *int64             `json:"sizeBytes"`
-	SHA256       *string            `json:"sha256"`
-	Rows         *int64             `json:"rows"`
-	Consistency  []TableConsistency `json:"consistency"`
-	RLSApplied   bool               `json:"rlsApplied"`
-	Format       string             `json:"format,omitempty"`
-	TaskID       int64              `json:"taskId,omitempty"`
-	CreatedAt    time.Time          `json:"createdAt"`
-	ExpiresAt    time.Time          `json:"expiresAt"`
-	DownloadedAt *time.Time         `json:"downloadedAt"`
+	ExportID    string             `json:"exportId"`
+	Kind        string             `json:"kind"`
+	State       string             `json:"state"`
+	Database    *string            `json:"database"`
+	Schema      *string            `json:"schema"`
+	Table       *string            `json:"table"`
+	SizeBytes   *int64             `json:"sizeBytes"`
+	SHA256      *string            `json:"sha256"`
+	Rows        *int64             `json:"rows"`
+	Consistency []TableConsistency `json:"consistency"`
+	RLSApplied  bool               `json:"rlsApplied"`
+	// SpreadsheetSafe says whether the file was written with the spreadsheet guard (null while it is built).
+	SpreadsheetSafe *bool      `json:"spreadsheetSafe"`
+	Format          string     `json:"format,omitempty"`
+	TaskID          int64      `json:"taskId,omitempty"`
+	CreatedAt       time.Time  `json:"createdAt"`
+	ExpiresAt       time.Time  `json:"expiresAt"`
+	DownloadedAt    *time.Time `json:"downloadedAt"`
 }
 
 // DataExportPage is a page of exports.

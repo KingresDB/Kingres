@@ -699,8 +699,18 @@ func (s *Server) updateClusterSettings(c *call, w http.ResponseWriter, r *http.R
 	if err != nil {
 		return s.storeProblem(r, err, "")
 	}
+	s.showMaxAtomic(&out)
 	s.writeJSON(w, r, http.StatusOK, out)
 	return nil
+}
+
+// showMaxAtomic adds the cap of one import of this server to the data transfer settings (read only, not stored).
+func (s *Server) showMaxAtomic(v *api.ClusterSettings) {
+	if v.DataTransfer != nil && s.deps.Ops != nil {
+		dt := *v.DataTransfer
+		dt.MaxAtomicBytes = s.deps.Ops.MaxAtomicBytes()
+		v.DataTransfer = &dt
+	}
 }
 
 // cancelStatement ends the caller's own running workbench statement (contract

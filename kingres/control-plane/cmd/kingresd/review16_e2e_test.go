@@ -215,3 +215,26 @@ func (e *cp) svcExecDB(t testing.TB, db, sql string) {
 		t.Fatalf("%s: %v", sql, err)
 	}
 }
+
+// The two additions to 0.19.0 asked for by the console: DataExport.spreadsheetSafe and the effective cap of one import in the data transfer settings.
+func TestExportShowsItsGuardAndSettingsShowTheImportCap(t *testing.T) {
+	e, off := transferOn(t)
+	defer off()
+	q := xferDB(t, e, "db_xfer")
+	q("create table if not exists public.cn_t (id int)")
+	_, on := e.startExport(t, "db_xfer", "cn_t", map[string]any{})
+	_, offID := e.startExport(t, "db_xfer", "cn_t", map[string]any{"spreadsheetSafe": false})
+	if got := e.expect(t, 200, "GET", "/data-exports/"+on, nil)["spreadsheetSafe"]; got != true {
+		t.Errorf("the export with the guard: %v", got)
+	}
+	if got := e.expect(t, 200, "GET", "/data-exports/"+offID, nil)["spreadsheetSafe"]; got != false {
+		t.Errorf("the export without the guard: %v", got)
+	}
+	e.expect(t, 204, "DELETE", "/data-exports/"+on, nil)
+	e.expect(t, 204, "DELETE", "/data-exports/"+offID, nil)
+	st := e.expect(t, 200, "GET", "/settings/cluster", nil)
+	dt, _ := st["dataTransfer"].(map[string]any)
+	if dt["maxAtomicBytes"] != float64(25165824) {
+		t.Errorf("the cap of one import in the settings: %v", dt["maxAtomicBytes"])
+	}
+}

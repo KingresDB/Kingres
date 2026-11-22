@@ -637,6 +637,8 @@ func exportView(rec transfer.Record) api.DataExport {
 			out.Rows = &r
 			out.Consistency = rep.Consistency
 			out.RLSApplied = rep.RLSApplied
+			safe := rep.Safe
+			out.SpreadsheetSafe = &safe
 		}
 	}
 	return out

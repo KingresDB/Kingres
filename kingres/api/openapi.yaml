@@ -12334,6 +12334,11 @@ components:
             - 'null'
           items: { $ref: '#/components/schemas/TableConsistency' }
           description: One entry for the table; null while it is built.
+        spreadsheetSafe:
+          type:
+            - boolean
+            - 'null'
+          description: Whether the file was written with the spreadsheet guard (`spreadsheetSafe` of the request); null while it is built. Added to 0.19.0 before its release.
         rlsApplied:
           type: boolean
           description: "Whether row-level security shortened the file. Always false: a table with row-level security is exported only with `row_security = off`, so a policy that hides rows fails the export."
@@ -12400,6 +12405,11 @@ components:
           maximum: 16
           default: 2
           description: Transfers running at once in the cluster (one per role).
+        maxAtomicBytes:
+          type: integer
+          format: int64
+          readOnly: true
+          description: The largest decompressed file that one import accepts on the server that answers (a flag of the server, 256 MiB for a reference table whatever the flag). Not part of the update; added to 0.19.0 before its release.
     DataTransferSettingsUpdate:
       type: object
       description: Added in 0.19.0. A partial update of `DataTransferSettings`.
