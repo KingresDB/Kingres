@@ -159,7 +159,7 @@ SELECT * FROM kingres.partitions;
 SELECT nextval('kingres.colocation_id_seq');
 SELECT * FROM kingres.table_change_report('distribute', 'sec_t', '{"column":"id"}');
 SELECT kingres.internal_copy_routed('sec_t', 'public', 'sec_t', 'every_node');
-SELECT kingres.internal_require_version('0.8');
+SELECT kingres.internal_require_version('0.9');
 SELECT kingres.create_distributed_table('sec_t', 'id');
 SELECT kingres.create_reference_table('sec_t');
 RESET ROLE;

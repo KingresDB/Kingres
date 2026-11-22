@@ -22,7 +22,7 @@
 #include "fmgr.h"
 
 /* The version of the extension this library belongs to (the SQL objects of every node must match). */
-#define KINGRES_SHARD_EXT_VERSION "0.8"
+#define KINGRES_SHARD_EXT_VERSION "0.9"
 #include "nodes/params.h"
 #include "nodes/parsenodes.h"
 #include "nodes/plannodes.h"
