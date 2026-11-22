@@ -204,7 +204,7 @@ func TestJanitorReportsLostReadyRows(t *testing.T) {
 func TestJanitorNeverDeletesAFileThatDoesNotMatch(t *testing.T) {
 	s, _ := testStore(t, nil)
 	rnd := rand.New(rand.NewSource(99)) //nolint:gosec // test
-	alphabet := []string{"transfer-", "transfer", "-", ".", "kdx", "part", "KDX", "0", "1", "9", "42", " ", "~", "bak", "tmp", "x", "é", "..", "_"}
+	alphabet := []string{"transfer-", "transfer", "-", ".", "kdx", "part", "KDX", "0", "1", "9", "42", " ", "~", "bak", "tmp", "x", "\xc3\xa9", "..", "_"}
 	want := map[string]bool{}
 	matching := 0
 	for i := 0; i < 600; i++ {
