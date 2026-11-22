@@ -7,6 +7,35 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-22 (third entry): fixes for the second review of the phase 12 control plane (P12D-01 to P12D-09)
+
+Branch `p12-cp`. The review is [reviews/2026-11-22-control-plane-phase12-fixes.md](reviews/2026-11-22-control-plane-phase12-fixes.md); its "Fixes" section lists every finding with the change and the test.
+
+### What was done
+
+- A scheduled run is compared with the last run of its policy (a clock that stepped is refused, one alert); a failure before any run exists backs off on the policy itself; the library check covers standbys; the preload list keeps the library of an instance that had it.
+- The decision for non-superuser owners: the cluster setting `analytics.allowNonSuperuserOwners` (default off, contract 0.18.0), the refusal codes, one alert instead of a retry, and the corrected trust text. `tableOwner` and `ownerTrusted` on the policy and the storage preview.
+- Lows: reader stall shortened (200 ms) and described, alerts of dropped databases cleared, one alert per refusal, `maintainRunning` fails closed, back-off on the last run.
+- Contract changes for the console are in `p12cp/contract-changes.txt` (items 14 to 17).
+
+### How it was verified
+
+PostgreSQL 18 and 19.0, lane l1: the PG-backed tests of `internal/ops`, `internal/instance`, `internal/store/pgstore` and the two cluster tests. Unit tests of `ops`, `partsched`, `monitor`, `api`, `contract`; `check-contract.mjs`. Mutants are in the report.
+
+### Decisions and deviations
+
+- The setting is a cluster setting read from `kingres_cp.cluster_setting` at each use; a system database without it means off.
+
+### Still open
+
+- A cluster test that restarts one server with the library missing.
+
+### Core patches
+
+None.
+
+---
+
 ## 2026-11-22 (second entry): fixes for the independent review of the phase 12 control plane (P12C-01 to P12C-16), and the console's contract notes
 
 Branch `p12-cp`. The review is [reviews/2026-11-22-control-plane-phase12.md](reviews/2026-11-22-control-plane-phase12.md); its "Fixes" section lists every finding with the change and the test.
