@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -64,6 +65,7 @@ func TestOpenRefusesBadMarker(t *testing.T) {
 		"other text":  []byte("something else\n"),
 		"extra bytes": []byte(markerText + "x"),
 		"empty":       {},
+		"same size":   []byte(strings.Replace(markerText, "transfer", "transfeR", 1)),
 	} {
 		d := filepath.Join(t.TempDir(), "bad")
 		if err := os.Mkdir(d, 0o700); err != nil {

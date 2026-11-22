@@ -26,6 +26,8 @@ type faultFS struct {
 	space      Space
 	budget     int64 // bytes that may still be written; negative means no limit
 	beforeLink func()
+	afterLink  func()
+	beforeOpen func(name string, flag int)
 	written    int64
 	files      []File
 }
@@ -59,10 +61,17 @@ func (f *faultFS) Link(a, b string) error {
 	if f.beforeLink != nil {
 		f.beforeLink()
 	}
-	return f.OSFS.Link(a, b)
+	err := f.OSFS.Link(a, b)
+	if err == nil && f.afterLink != nil {
+		f.afterLink()
+	}
+	return err
 }
 
 func (f *faultFS) OpenFile(name string, flag int, perm fs.FileMode) (File, error) {
+	if f.beforeOpen != nil {
+		f.beforeOpen(name, flag)
+	}
 	file, err := f.OSFS.OpenFile(name, flag, perm)
 	if err != nil {
 		return nil, err
