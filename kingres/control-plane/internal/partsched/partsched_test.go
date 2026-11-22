@@ -1,0 +1,301 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+package partsched
+
+import (
+	"context"
+	"errors"
+	"sort"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// fakeBackend is the cluster as the scheduler sees it: policies with a time they are due, the tables that have an unfinished task, and the findings.
+type fakeBackend struct {
+	mu       sync.Mutex
+	policies map[string]time.Time // subject -> next_run_at
+	running  map[string]bool      // unfinished task of the subject
+	started  []string
+	failOn   map[string]error
+	dueErr   error
+	checks   []Check
+	asOfSeen []time.Time
+}
+
+func newFake() *fakeBackend {
+	return &fakeBackend{policies: map[string]time.Time{}, running: map[string]bool{}, failOn: map[string]error{}}
+}
+
+func split(subject string) Due {
+	db, rest, _ := strings.Cut(subject, "/")
+	sch, tbl, _ := strings.Cut(rest, ".")
+	return Due{Database: db, Schema: sch, Table: tbl}
+}
+
+func (f *fakeBackend) Due(_ context.Context, asOf time.Time) ([]Due, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.asOfSeen = append(f.asOfSeen, asOf)
+	if f.dueErr != nil {
+		return nil, f.dueErr
+	}
+	var out []Due
+	for s, at := range f.policies {
+		if !at.After(asOf) {
+			out = append(out, split(s))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Subject() < out[j].Subject() })
+	return out, nil
+}
+
+func (f *fakeBackend) Start(_ context.Context, d Due, _ time.Time) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s := d.Subject()
+	if err := f.failOn[s]; err != nil {
+		return false, err
+	}
+	if f.running[s] {
+		return false, nil
+	}
+	f.running[s] = true
+	f.started = append(f.started, s)
+	return true, nil
+}
+
+func (f *fakeBackend) Checks(context.Context) ([]Check, error) { return f.checks, nil }
+
+type fakeAlerts struct {
+	mu        sync.Mutex
+	open      map[OpenAlert]string
+	raised    int
+	cleared   []OpenAlert
+	failRaise error
+}
+
+func newAlerts() *fakeAlerts { return &fakeAlerts{open: map[OpenAlert]string{}} }
+
+func (a *fakeAlerts) Open(context.Context, []string) ([]OpenAlert, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var out []OpenAlert
+	for k := range a.open {
+		out = append(out, k)
+	}
+	return out, nil
+}
+
+func (a *fakeAlerts) Raise(_ context.Context, kind, severity, subject, message string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.failRaise != nil {
+		return a.failRaise
+	}
+	a.raised++
+	a.open[OpenAlert{kind, subject}] = severity + ": " + message
+	return nil
+}
+
+func (a *fakeAlerts) Clear(_ context.Context, kind, subject string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.cleared = append(a.cleared, OpenAlert{kind, subject})
+	delete(a.open, OpenAlert{kind, subject})
+	return nil
+}
+
+type fakeClock struct{ t time.Time }
+
+func (c *fakeClock) Now() time.Time { return c.t }
+
+func newSched(t *testing.T, b Backend, a Alerts, clk *fakeClock) *Scheduler {
+	t.Helper()
+	s, err := New(Config{Backend: b, Alerts: a, Now: clk.Now, Interval: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func TestTickStartsWhatIsDueAndAsksWithTheInjectedClock(t *testing.T) {
+	clk := &fakeClock{t: time.Date(2026, 11, 22, 10, 0, 0, 0, time.UTC)}
+	b := newFake()
+	b.policies["shop/public.events"] = clk.t.Add(-time.Minute)
+	b.policies["shop/public.logs"] = clk.t // due at exactly now
+	b.policies["shop/public.later"] = clk.t.Add(time.Second)
+	b.policies["crm/public.audit"] = clk.t.Add(-time.Hour)
+	s := newSched(t, b, nil, clk)
+	got, err := s.Tick(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, d := range got {
+		names = append(names, d.Subject())
+	}
+	if strings.Join(names, ",") != "crm/public.audit,shop/public.events,shop/public.logs" {
+		t.Errorf("started %v", names)
+	}
+	if len(b.asOfSeen) != 1 || !b.asOfSeen[0].Equal(clk.t) {
+		t.Errorf("asked at %v, the clock says %v", b.asOfSeen, clk.t)
+	}
+	// time passes: the one that was not due is
+	clk.t = clk.t.Add(2 * time.Second)
+	b.running = map[string]bool{}
+	got, _ = s.Tick(context.Background())
+	if len(got) != 4 {
+		t.Errorf("after two seconds: %v", got)
+	}
+}
+
+func TestOneTaskPerSubjectAndTheNextTickStartsAgainWhenItEnds(t *testing.T) {
+	clk := &fakeClock{t: time.Date(2026, 11, 22, 10, 0, 0, 0, time.UTC)}
+	b := newFake()
+	b.policies["shop/public.events"] = clk.t.Add(-time.Hour)
+	s := newSched(t, b, nil, clk)
+	if got, _ := s.Tick(context.Background()); len(got) != 1 {
+		t.Fatalf("first tick: %v", got)
+	}
+	// the task is still running at the next ticks: nothing new, however long it takes
+	for i := 0; i < 3; i++ {
+		clk.t = clk.t.Add(time.Minute)
+		if got, err := s.Tick(context.Background()); err != nil || len(got) != 0 {
+			t.Fatalf("tick %d while the task runs: %v %v", i, got, err)
+		}
+	}
+	if len(b.started) != 1 {
+		t.Fatalf("started %v", b.started)
+	}
+	// it ends (the policy is due again after run_every)
+	b.running["shop/public.events"] = false
+	if got, _ := s.Tick(context.Background()); len(got) != 1 {
+		t.Errorf("after the task ended: %v", got)
+	}
+	if ticks, started, failures := s.Counts(); ticks != 5 || started != 2 || failures != 0 {
+		t.Errorf("counts %d %d %d", ticks, started, failures)
+	}
+}
+
+func TestAFailureToStartDoesNotStopTheOthersAndIsTriedAgain(t *testing.T) {
+	clk := &fakeClock{t: time.Date(2026, 11, 22, 10, 0, 0, 0, time.UTC)}
+	b := newFake()
+	b.policies["a/public.t1"] = clk.t
+	b.policies["b/public.t2"] = clk.t
+	b.failOn["a/public.t1"] = errors.New("the library is not preloaded")
+	s := newSched(t, b, nil, clk)
+	got, err := s.Tick(context.Background())
+	if err != nil || len(got) != 1 || got[0].Subject() != "b/public.t2" {
+		t.Fatalf("%v %v", got, err)
+	}
+	if _, _, failures := s.Counts(); failures != 1 {
+		t.Errorf("failures %d", failures)
+	}
+	delete(b.failOn, "a/public.t1")
+	got, _ = s.Tick(context.Background())
+	if len(got) != 1 || got[0].Subject() != "a/public.t1" {
+		t.Errorf("the next tick: %v", got)
+	}
+}
+
+func TestADueErrorStartsNothing(t *testing.T) {
+	b := newFake()
+	b.dueErr = errors.New("the instance is in recovery")
+	s := newSched(t, b, nil, &fakeClock{t: time.Now()})
+	got, err := s.Tick(context.Background())
+	if err == nil || len(got) != 0 || len(b.started) != 0 {
+		t.Errorf("%v %v %v", got, err, b.started)
+	}
+}
+
+func TestACancelledContextStopsTheTick(t *testing.T) {
+	clk := &fakeClock{t: time.Now()}
+	b := newFake()
+	for _, n := range []string{"a/s.t1", "a/s.t2", "a/s.t3"} {
+		b.policies[n] = clk.t
+	}
+	s := newSched(t, b, nil, clk)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	got, err := s.Tick(ctx)
+	if !errors.Is(err, context.Canceled) || len(got) != 0 {
+		t.Errorf("%v %v", got, err)
+	}
+}
+
+func TestJobs(t *testing.T) {
+	b := newFake()
+	s, err := New(Config{Backend: b})
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs := s.Jobs()
+	if len(jobs) != 1 || jobs[0].Name != JobSchedule || jobs[0].Every != time.Minute {
+		t.Errorf("without alerts: %+v", jobs)
+	}
+	s, _ = New(Config{Backend: b, Alerts: newAlerts(), Interval: 30 * time.Second, AlertEvery: 3 * time.Minute})
+	jobs = s.Jobs()
+	if len(jobs) != 2 || jobs[0].Every != 30*time.Second || jobs[1].Name != JobAlerts || jobs[1].Every != 3*time.Minute {
+		t.Errorf("with alerts: %+v", jobs)
+	}
+	if _, err := New(Config{}); err == nil {
+		t.Error("no backend accepted")
+	}
+}
+
+func TestAlertsAreRaisedAndClearedFromTheChecks(t *testing.T) {
+	clk := &fakeClock{t: time.Now()}
+	b := newFake()
+	a := newAlerts()
+	s := newSched(t, b, a, clk)
+	b.checks = []Check{
+		{Database: "shop", Schema: "public", Table: "events", Problem: "ahead_low", Detail: "ends in 1 day"},
+		{Database: "shop", Schema: "public", Table: "logs", Problem: "last_run_failed", Detail: "failed: lock_timeout"},
+		{Database: "shop", Schema: "public", Table: "other", Problem: "misaligned"}, // not an alert
+		{Database: "shop", Schema: "public", Table: "other", Problem: "retire_blocked"},
+	}
+	if err := s.CheckAlerts(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(a.open) != 2 {
+		t.Fatalf("open alerts %v", a.open)
+	}
+	if _, ok := a.open[OpenAlert{AlertAheadLow, "database:shop|table:public.events"}]; !ok {
+		t.Errorf("no partitionsAheadLow: %v", a.open)
+	}
+	if v, ok := a.open[OpenAlert{AlertPolicyFailed, "database:shop|table:public.logs"}]; !ok || !strings.Contains(v, "lock_timeout") {
+		t.Errorf("no partitionPolicyFailed: %v", a.open)
+	}
+	// a second pass with the same findings raises them again (an upsert) and clears nothing
+	if err := s.CheckAlerts(context.Background()); err != nil || len(a.cleared) != 0 || len(a.open) != 2 {
+		t.Errorf("second pass: %v, cleared %v, open %v", err, a.cleared, a.open)
+	}
+	// the policy of events was fixed
+	b.checks = b.checks[1:2]
+	if err := s.CheckAlerts(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(a.cleared) != 1 || a.cleared[0] != (OpenAlert{AlertAheadLow, "database:shop|table:public.events"}) || len(a.open) != 1 {
+		t.Errorf("cleared %v, open %v", a.cleared, a.open)
+	}
+	// nothing is wrong any more
+	b.checks = nil
+	if err := s.CheckAlerts(context.Background()); err != nil || len(a.open) != 0 {
+		t.Errorf("%v %v", err, a.open)
+	}
+}
+
+func TestAnAlertThatCannotBeRaisedDoesNotStopTheClearing(t *testing.T) {
+	b := newFake()
+	a := newAlerts()
+	a.open[OpenAlert{AlertAheadLow, "database:gone|table:public.t"}] = "warning: old"
+	a.failRaise = errors.New("the system database is busy")
+	s := newSched(t, b, a, &fakeClock{t: time.Now()})
+	b.checks = []Check{{Database: "shop", Schema: "public", Table: "events", Problem: "ahead_low"}}
+	err := s.CheckAlerts(context.Background())
+	if err == nil || len(a.cleared) != 1 {
+		t.Errorf("err %v, cleared %v", err, a.cleared)
+	}
+}

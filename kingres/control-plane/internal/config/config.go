@@ -111,6 +111,8 @@ type Config struct {
 	// before it tries a bucket move that failed again (default 30s).
 	RebalanceRetryBackoff time.Duration
 	GatherTimeout         time.Duration
+	// PartitionSchedulerInterval is how often the manager leader asks which time-partitioning policies are due (default 1m).
+	PartitionSchedulerInterval time.Duration
 	// LedgerKeysDir is the directory of the private signing keys of the ledger (design ledger-phase7.md, 3.2.2); empty
 	// means <DataDir>/ledger/keys. LedgerKeyPassphraseFile names the file with the passphrase that seals the key
 	// files; empty keeps them in clear text, like ca.key. The passphrase is read from the file, never from the
@@ -302,6 +304,8 @@ var settings = []setting{
 		apply: dur(func(c *Config) *time.Duration { return &c.VersionCheckInterval })},
 	{key: "gather-timeout", env: "KINGRES_GATHER_TIMEOUT", usage: "time one server gets to answer its part of a cluster-wide read of logs, alerts or metrics (default 3s)",
 		apply: dur(func(c *Config) *time.Duration { return &c.GatherTimeout })},
+	{key: "partition-scheduler-interval", env: "KINGRES_PARTITION_SCHEDULER_INTERVAL", usage: "how often the manager leader asks which time-partitioning policies are due (default 1m)",
+		apply: dur(func(c *Config) *time.Duration { return &c.PartitionSchedulerInterval })},
 }
 
 // Defaults returns the built-in configuration.
@@ -327,7 +331,7 @@ func Defaults() Config {
 		PGListen:            "127.0.0.1",
 		CertificateLifetime: 365 * 24 * time.Hour, CertificateRenewFraction: 1.0 / 3.0,
 		CertificateCheckInterval: time.Hour, CertificateRetryInterval: time.Minute,
-		MonitorInterval: 10 * time.Second, LedgerPendingMaxAge: 5 * time.Minute, VersionCheckInterval: time.Minute, RebalanceRetryBackoff: 30 * time.Second, GatherTimeout: 3 * time.Second,
+		MonitorInterval: 10 * time.Second, LedgerPendingMaxAge: 5 * time.Minute, VersionCheckInterval: time.Minute, RebalanceRetryBackoff: 30 * time.Second, GatherTimeout: 3 * time.Second, PartitionSchedulerInterval: time.Minute,
 		HA: DefaultHA(),
 	}
 }

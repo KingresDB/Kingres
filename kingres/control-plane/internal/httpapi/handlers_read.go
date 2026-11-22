@@ -222,8 +222,9 @@ func (s *Server) listTables(_ *call, w http.ResponseWriter, r *http.Request) err
 	pp := newParams(r)
 	db := pp.pathName("databaseName")
 	f := store.TableFilter{
-		Schema: pp.maxLen("schema", 63),
-		Class:  pp.enum("class", "plain", "distributed", "reference", "ledger"),
+		Schema:  pp.maxLen("schema", 63),
+		Class:   pp.enum("class", "plain", "distributed", "reference", "ledger"),
+		Storage: pp.enum("storage", "heap", "columnar"),
 	}
 	page := pp.page()
 	if p := pp.err(); p != nil {
