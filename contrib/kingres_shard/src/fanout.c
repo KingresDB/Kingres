@@ -778,12 +778,20 @@ run_local(KsFanoutState *s, ParamListInfo params, bool keep_rows, int nextra, co
 	uint64		processed;
 
 	/* the arrays of a routed source (text[] in text form) follow the parameters of the statement */
-	for (i = 0; i < nextra; i++)
+	if (nextra > 0)
 	{
-		argtypes[n + i] = TEXTARRAYOID;
-		values[n + i] = DirectFunctionCall3(array_in, CStringGetDatum(extra[i]),
-											ObjectIdGetDatum(TEXTOID), Int32GetDatum(-1));
-		nulls[n + i] = ' ';
+		FmgrInfo	finfo;
+		Oid			infunc;
+		Oid			ioparam;
+
+		getTypeInputInfo(TEXTARRAYOID, &infunc, &ioparam);
+		fmgr_info(infunc, &finfo);
+		for (i = 0; i < nextra; i++)
+		{
+			argtypes[n + i] = TEXTARRAYOID;
+			values[n + i] = InputFunctionCall(&finfo, unconstify(char *, extra[i]), ioparam, -1);
+			nulls[n + i] = ' ';
+		}
 	}
 
 	for (i = 0; i < n; i++)
@@ -1378,25 +1386,16 @@ fo_rescan(CustomScanState *node)
 {
 }
 
-static void
-fo_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
+/* The text of a statement on one line (white space runs become one blank), for EXPLAIN. */
+static char *
+flatten_sql(const char *sql)
 {
-	KsFanoutState *s = (KsFanoutState *) node;
 	StringInfoData flat;
 	const char *p;
 	bool		pending_space = false;
 
-	if (s->kind == FO_KIND_INSERT_SELECT)
-		ExplainPropertyText("Pushed", "colocated INSERT ... SELECT (every group reads and writes its own buckets)", es);
-	else if (s->kind == FO_KIND_MERGE)
-		ExplainPropertyText("Pushed", "colocated MERGE (every group owning a bucket of the target runs it over its own buckets)", es);
-	else if (s->kind == FO_KIND_MERGE_ROUTED)
-		ExplainPropertyText("Pushed", "MERGE with a routed source (this node reads the source and sends each row to the group of its key)", es);
-	ExplainPropertyInteger("Nodes", NULL, list_length(s->targets), es);
-	ExplainPropertyText("Result", s->all_rows ? "sum over the nodes" : "reference table: copies must agree", es);
-
 	initStringInfo(&flat);
-	for (p = s->sql; *p; p++)
+	for (p = sql; *p; p++)
 	{
 		if (*p == '\n' || *p == '\r' || *p == '\t' || *p == ' ')
 		{
@@ -1408,5 +1407,24 @@ fo_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 		pending_space = false;
 		appendStringInfoChar(&flat, *p);
 	}
-	ExplainPropertyText("Remote SQL", flat.data, es);
+	return flat.data;
+}
+
+static void
+fo_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
+{
+	KsFanoutState *s = (KsFanoutState *) node;
+
+	if (s->kind == FO_KIND_INSERT_SELECT)
+		ExplainPropertyText("Pushed", "colocated INSERT ... SELECT (every group reads and writes its own buckets)", es);
+	else if (s->kind == FO_KIND_MERGE)
+		ExplainPropertyText("Pushed", "colocated MERGE (every group owning a bucket of the target runs it over its own buckets)", es);
+	else if (s->kind == FO_KIND_MERGE_ROUTED)
+	{
+		ExplainPropertyText("Pushed", "MERGE with a routed source (this node reads the source and sends each row to the group of its key)", es);
+		ExplainPropertyText("Source SQL", flatten_sql(strVal(list_nth(s->mergeinfo, FO_MI_SOURCE_SQL))), es);
+	}
+	ExplainPropertyInteger("Nodes", NULL, list_length(s->targets), es);
+	ExplainPropertyText("Result", s->all_rows ? "sum over the nodes" : "reference table: copies must agree", es);
+	ExplainPropertyText("Remote SQL", flatten_sql(s->sql), es);
 }

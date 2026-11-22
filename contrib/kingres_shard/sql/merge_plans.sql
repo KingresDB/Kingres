@@ -37,7 +37,7 @@ CREATE FUNCTION merge_verdict(q text) RETURNS text LANGUAGE plpgsql AS $$
 DECLARE l text; r text := 'other'; dt text;
 BEGIN
   FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
-    IF l ~ 'Kingres|Pushed|Remote SQL|Nodes' THEN
+    IF l ~ 'Kingres|Pushed|Remote SQL|Source SQL|Nodes' THEN
       r := CASE WHEN r = 'other' THEN '' ELSE r || ' ## ' END
            || regexp_replace(regexp_replace(l, '^ *', ''), 'place=-?[0-9]+', 'place=N');
     END IF;
