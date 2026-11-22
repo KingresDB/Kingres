@@ -6,7 +6,7 @@
 // debounced), then the task with a state per server and a Retry. The same dialog reverts a change (the earlier value is
 // put back, previewed like any change) and sets the time zone. Nothing is restarted by a change: a setting that needs a
 // restart is shown as pending, and the restart is a decision of its own.
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useQuery } from '@tanstack/vue-query'
 import AppDialog from '@/components/AppDialog.vue'
 import GateButton from '@/components/GateButton.vue'
@@ -234,6 +234,10 @@ async function apply(how: 'first' | 'retry'): Promise<void> {
 const openedAt = Date.now()
 const summary = useConfigSummary()
 const seenRevision = ref<number | null>(null)
+// A summary fetched a moment before the dialog opened is still fresh (staleTime), so ask again: the revision must be one answered after the dialog opened.
+onMounted(() => {
+  void summary.refetch()
+})
 watch(
   () => [summary.data.value?.revision, summary.dataUpdatedAt.value] as const,
   ([rev, at]) => {
