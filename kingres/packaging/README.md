@@ -21,12 +21,12 @@ package, and tests each of them.
 
 KingresDB is released for PostgreSQL 18 and for PostgreSQL 19
 ([../docs/dev/releases.md](../docs/dev/releases.md)); the product branches are
-`kingres-18` (PostgreSQL 18.7) and `kingres-19` (PostgreSQL 19rc2 until the final
-release of 19 exists), with the same KingresDB directories. The packaging builds
+`kingres-18` (PostgreSQL 18.7) and `kingres-19` (PostgreSQL 19.0, released 2026-11-16; the branch was on 19rc2 before),
+with the same KingresDB directories. The packaging builds
 either from **the source it is given**; the major is never typed a second time:
 
 - `build/source-info.sh SRC` reads `kingres_version` and the version of the
-  `project()` call of `SRC/meson.build` (`18.7`, `19rc2`), derives the major (the
+  `project()` call of `SRC/meson.build` (`18.7`, `19.0`), derives the major (the
   leading integer, which must be 18 or 19) and the names below. `build.sh`,
   `docker/build-image.sh` and the tests all use it, and `build.sh` checks the
   result against the server it built (`PG_MAJORVERSION`, `postgres --version`).
@@ -38,8 +38,8 @@ either from **the source it is given**; the major is never typed a second time:
 |---|---|---|
 | Debian package | `kingres_0.1.0+pg18-<revision>_amd64.deb` | `kingres_0.1.0+pg19-<revision>_amd64.deb` |
 | Image | `kingres:0.1.0-pg18` | `kingres:0.1.0-pg19` |
-| `share/BUILD-INFO` | `PostgreSQL: 18.7 (major 18)` | `PostgreSQL: 19rc2 (major 19)` |
-| Image labels | `org.kingres.postgresql.major=18`, `.version=18.7`, `org.opencontainers.image.version=0.1.0-pg18` | the same with 19 and `19rc2` |
+| `share/BUILD-INFO` | `PostgreSQL: 18.7 (major 18)` | `PostgreSQL: 19.0 (major 19)` |
+| Image labels | `org.kingres.postgresql.major=18`, `.version=18.7`, `org.opencontainers.image.version=0.1.0-pg18` | the same with 19 and `19.0` |
 
 `kingres:<version>` without a suffix is not produced.
 
@@ -51,7 +51,7 @@ Target: Ubuntu 24.04, amd64. Everything below was run on Windows 11 with WSL2
 
 ## What the package contains
 
-- The PostgreSQL based server of the major that was built (18.7 or 19rc2: `postgres`,
+- The PostgreSQL based server of the major that was built (18.7 or 19.0: `postgres`,
   `initdb`, `pg_ctl`, ...), its client programs, all contrib modules, and the five
   KingresDB extensions: `kingres_columnar`, `kingres_ledger`, `kingres_shard`,
   `kingres_sketch` and `kingres_timepart` (`share/BUILD-INFO` lists them and
@@ -112,7 +112,7 @@ build/build.sh [--rev REV] [--overlay PATH]... [--work DIR] [--prefix /opt/kingr
 ```
 
 `REV` is a commit or a product branch: `--rev kingres-18` builds PostgreSQL 18.7
-with KingresDB, `--rev kingres-19` builds PostgreSQL 19rc2 with KingresDB. The
+with KingresDB, `--rev kingres-19` builds PostgreSQL 19.0 with KingresDB. The
 recipe is the same; the major is the one of the tree (`build/source-info.sh`).
 Always build from a branch or commit, never from a working tree that holds
 unfinished work.
@@ -198,7 +198,7 @@ data directory of one major does not start under the other.
 - Labels: `org.opencontainers.image.version` (`0.1.0-pg18`),
   `org.opencontainers.image.licenses` (`AGPL-3.0-only AND PostgreSQL`),
   `org.opencontainers.image.revision`, `org.kingres.version`,
-  `org.kingres.postgresql.version` (`18.7`, `19rc2`) and
+  `org.kingres.postgresql.version` (`18.7`, `19.0`) and
   `org.kingres.postgresql.major` (`18`, `19`). The image carries the licence
   documents in `/usr/share/doc/kingres/` (`copyright`, `AGPL-3.0.txt`, the two
   dependency lists), the same as the package.
