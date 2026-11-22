@@ -342,6 +342,9 @@ func (o *Ops) StartExport(ctx context.Context, actor, db, schema, table string, 
 	if err := o.concurrency(ctx, st, actor); err != nil {
 		return task.Task{}, err
 	}
+	if StartGap != nil {
+		StartGap()
+	}
 	conn, err := o.roleConn(ctx, db, actor)
 	if err != nil {
 		return task.Task{}, err

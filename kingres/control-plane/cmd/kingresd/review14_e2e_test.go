@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ops"
 )
@@ -208,7 +209,9 @@ func TestOneTransferPerRoleUnderRace(t *testing.T) {
 	tok := e.accountWithRole(t, "xfer_race", "kingres_admin")
 	q("grant select on public.race_t to xfer_race")
 	as := e.as(tok)
-	for round := 0; round < 4; round++ {
+	ops.StartGap = func() { time.Sleep(600 * time.Millisecond) }
+	defer func() { ops.StartGap = nil }()
+	for round := 0; round < 2; round++ {
 		var wg sync.WaitGroup
 		codes := make([]int, 2)
 		bodies := make([]map[string]any, 2)

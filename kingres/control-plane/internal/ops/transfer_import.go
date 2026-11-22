@@ -68,6 +68,9 @@ type importParams struct {
 // the backend of the import, so that a test can end the connection at that point. The points are "beforeStart" (the first step of the task, no connection), "beforeCheck" (the table check of the task, no connection), "beforeIntent", "intentWrite", "afterIntent" and "afterCommit".
 var ImportFault func(point string, backendPID uint32) error
 
+// StartGap is called by a test between the check of the limits of the transfers and the start of the task, to widen the window that startMu closes.
+var StartGap func()
+
 func importFault(point string, conn *pgx.Conn) error {
 	if ImportFault != nil {
 		var pid uint32
@@ -300,6 +303,9 @@ func (o *Ops) StartImport(ctx context.Context, actor, db, schema, table string, 
 	defer o.startMu.Unlock()
 	if err := o.concurrency(ctx, st, actor); err != nil {
 		return task.Task{}, err
+	}
+	if StartGap != nil {
+		StartGap()
 	}
 	conn, err := o.roleConn(ctx, db, actor)
 	if err != nil {

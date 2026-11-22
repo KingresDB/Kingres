@@ -363,10 +363,17 @@ the value it changes). The consistency label is `single-snapshot` for a local or
 **there is no global snapshot**. A table with row-level security is exported only by its owner or a role with `BYPASSRLS`, and a read that would run a function
 of another role needs `acknowledgeOtherRolesCode`.
 
-**Import.** All or nothing: `BEGIN`, `COPY ... FROM STDIN`, the count of the server compared with the records the scanner counted, the commit intent written in the
-detail of the task under the lease, `COMMIT`. The step that loads keeps the open transaction in memory for the step that commits; a restart ends it with the
-connection, so the commit step finds nothing and fails `copy_interrupted` (retryable, nothing stored). A task that finds the intent without the commit recorded
-fails `import_outcome_unknown` and is never retried. A cancel is accepted until the intent is written. A reference table is loaded through a temporary table and
+**Import.** All or nothing, in one step (*Load rows*): `BEGIN`, `COPY ... FROM STDIN`, the count of the server compared with the records the scanner counted, an
+insert into `kingres_transfer.import_marker` (a row keyed by the task id, written through a security definer function, so the role needs no grant and can still be
+dropped), the commit intent written in the detail of the task under the lease, `COMMIT`. No transaction lives between steps. The marker commits with the rows or not at
+all, so after any interruption the answer to "did it commit" is read from the database: a run that finds the intent asks the marker; a row `committed` finishes the task
+(*Confirm the commit* records the count and the audit event); otherwise the run inserts a tombstone `aborted` for the task (it waits up to 60 seconds for a transaction
+that holds the key) after which no transaction of that task can commit, and fails `copy_interrupted` (retryable) with the proof that nothing was stored. `nothing was
+stored` is never said without that proof. When the question cannot be asked (the lock wait ran out, or the marker is on the server that was the leader before a
+change of leader) the task fails `import_outcome_unknown` and is never retried. A cancel is accepted until the intent is written. The role is refused at the request
+and in the step when it has SUPERUSER, REPLICATION or BYPASSRLS or reaches server files, programs or logs (an import runs the triggers and defaults of the table as that
+role). The setting `dataTransfer.enabled` is read again by the first step of a task: turning it off ends a task that has not begun to move data; a task that is moving
+data is cancelled with `cancelTask`. The marker table is local to the database of the server that loaded (design: a reference table for the batch import of 14c). A reference table is loaded through a temporary table and
 inserts from typed arrays (`unnest($1::int[], ...)`), cap 256 MiB, and refuses array columns. The scanner refuses an unquoted `\.` line (`import_end_marker`;
 on PostgreSQL 18 and 19 it is data in CSV, the refusal is the conservative choice) and a record above 16 MiB; a gzip stream is counted against the limit. **Identity
 columns of a distributed table draw from the sequence of the node the statement runs on** (design F18): rows loaded without the column from different servers can
@@ -389,7 +396,7 @@ Run the PostgreSQL ones with `scripts\run-integration.ps1 -Packages ./cmd/kingre
 server that holds the files) and the alert `transferStagingLow` (warning at 90 percent of the staging quota, critical at 98).
 
 **Fault tests added after the first review round.** `TestImportRecordNearTheLimit` (15.5 MiB through PostgreSQL, 16 MiB and 1 byte refused), `TestImportCancelAfterTheIntent` (409,
-the import completes once), `TestImportLeaseLostBeforeTheIntent` (the write of the intent refused: nothing stored, no doubled rows), `TestExportUntrustedFunction` (a policy
+the import completes once), `TestImportLeaseLostBeforeTheIntent` (the write of the intent refused: a take-over loads once, no doubled rows), `TestImportCrashAfterCommit` (the lease lost after COMMIT: the marker finishes the task with exactly the rows), `TestImportCommitFaultPoints` (a connection killed after the intent: the marker proves that nothing was stored), the tests of the fixes of the review in `review14_e2e_test.go`, `TestExportUntrustedFunction` (a policy
 of another role: `export_untrusted_code`), `TestStagingMetricsAndAlert`, and on three servers `TestDataTransferLeaderRestartMidTransfer` and
 `TestDataTransferShardGroupLostMidCopy` (rows are all or none; no prepared transaction is left).
 
