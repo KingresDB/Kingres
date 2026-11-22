@@ -54,9 +54,15 @@
 //   ?anchors=all|disabled|testfail|testwarn|refuse:<code>   0.11.0 (console part B): see the README
 //   ?anchors=<a>,<b>,...          0.11.0: none (alert ledgerNotAnchored) | required (the same, a warning) | ok | behind | failed
 //                                 (a WORM target "archive-worm" exists, with the newest aggregate anchored in time, late or not)
+//   ?analytics=<a>,<b>,...        0.18.0 (phase 12; combinable with a comma): on (approximate aggregates are on in shop) | timeseries (in shop: the table
+//                                 clicks that can be converted, and metrics, partitioned by day, with a policy, its runs and columnar partitions)
+//                                 | ahead-low (the same, with one day ahead and the alert partitionsAheadLow) | sketch:missing|mismatch|hash
+//                                 | columnar:missing | timepart:missing | convert:fail | run:lock|name|fail | publication
+//                                 | old (the 11 new operations answer 422 unsupported_operation)
 //   ?clock=off:<server>:<ms>      the clock of that server is that many milliseconds ahead (negative: behind).
 //   ?clock=unreachable:<server>   the clock of that server cannot be read.
 import { seedPartitioned } from './tables'
+import { applyAnalyticsSwitch } from './analytics'
 import type { MockState } from './state'
 import { loseLease, mockConfig, silenceServer, stallStandby } from './state'
 import { FAIL_STEPS, raiseAutoFailoverLimit, seedAutomaticFailover } from './failover'
@@ -243,6 +249,7 @@ export function applySwitches(params: URLSearchParams, s: MockState): void {
   }
   for (const entry of (params.get('failover') ?? '').split(',')) applyFailoverSwitch(entry, s)
   for (const entry of (params.get('tables') ?? '').split(',')) applyTablesSwitch(entry, s)
+  for (const entry of (params.get('analytics') ?? '').split(',')) applyAnalyticsSwitch(entry, s)
   if (params.get('phase7') === 'today') answerAsTheServerDoesToday(s)
   for (const entry of (params.get('signing') ?? '').split(',')) applySigningSwitch(entry, s)
   for (const entry of (params.get('publication') ?? '').split(',')) {

@@ -6,6 +6,7 @@
 import { evaluateAccess } from '@/lib/network-rules'
 import { applyPending, configHandlers } from './config'
 import { ledgerHandlers } from './ledger'
+import { analyticsHandlers, describePartitions, describeTable, explainPlan } from './analytics'
 import { AGGREGATE_SIZE, anchoringOf, digestAnchorsOf, l7, publicationOf } from './ledger-view'
 import type { HttpHandler } from 'msw'
 import type { components } from '@/api/schema'
@@ -65,7 +66,6 @@ import {
 } from './failover'
 import {
   columnDefsOf,
-  partitionsOf,
   previewChange,
   startAlter,
   startDistribute,
@@ -1225,6 +1225,13 @@ function runQuery(ctx: Ctx): S['QueryResult'] {
     throw problem('unprocessable', 'A value of column "doc" is larger than 1 MiB.')
   if (/\bbusyrole\b/i.test(sql))
     throw problem('workbench_busy', 'This role already runs two statements on this server.')
+  const plan = explainPlan(ctx.s, b.database, sql)
+  if (plan)
+    return done(
+      [{ name: 'QUERY PLAN', type: 'text' }],
+      plan.map((line) => [line]),
+      'EXPLAIN',
+    )
   let m = /^select\s+1(\s+as\s+(\w+))?$/i.exec(sql)
   if (m) return done([{ name: m[2] ?? '?column?', type: 'int4' }], [[1]])
   if (/^select\s+version\(\)$/i.test(sql))
@@ -1331,6 +1338,7 @@ export function createHandlers(): HttpHandler[] {
   const h: Partial<Record<OperationId, Handler>> = {
     ...configHandlers(),
     ...ledgerHandlers(),
+    ...analyticsHandlers(),
     getHealth: () => ok({ status: 'ok' }),
     getReadiness: (c) =>
       ok({
@@ -2002,13 +2010,25 @@ export function createHandlers(): HttpHandler[] {
       const rec = db(c.s, c.params.databaseName ?? '')
       const schema = c.url.searchParams.get('schema')
       const cls = c.url.searchParams.get('class')
+      const storage = c.url.searchParams.get('storage')
+      if (storage !== null && storage !== 'heap' && storage !== 'columnar')
+        throw validationFailed([{ field: 'storage', message: 'Use heap or columnar.' }])
       return ok(
         paginate(
-          rec.tables.filter(
-            (t) =>
-              (!schema || t.schema === schema) &&
-              (!cls || t.classes.includes(cls as Table['classes'][number])),
-          ),
+          rec.tables
+            .filter(
+              (t) =>
+                (!schema || t.schema === schema) &&
+                (!cls || t.classes.includes(cls as Table['classes'][number])),
+            )
+            .map((t) => describeTable(c.s, rec, t))
+            // A partitioned table matches columnar when any of its partitions is columnar (contract 0.18.0).
+            .filter((t) => {
+              if (storage === null) return true
+              const pf = t.storage?.partitionFormats
+              if (pf) return storage === 'columnar' ? pf.columnar > 0 : pf.heap > 0
+              return (t.storage?.accessMethod ?? 'heap') === storage
+            }),
           c.url,
         ),
       )
@@ -2025,7 +2045,7 @@ export function createHandlers(): HttpHandler[] {
     },
     listTablePartitions: (c) => {
       const { s, rec, t } = tableOf(c)
-      return ok(paginate(partitionsOf(s, rec, t), c.url))
+      return ok(paginate(describePartitions(s, rec, t), c.url))
     },
     undistributeTable: (c) => {
       refuseDuringFailover(c.s)
@@ -2099,7 +2119,7 @@ export function createHandlers(): HttpHandler[] {
       )
       if (!t) throw problem('not_found', 'Table does not exist.')
       return ok({
-        ...t,
+        ...describeTable(c.s, rec, t),
         columns: rec.extraColumns?.[t.name] ?? columnsFor(rec, t),
       } satisfies S['TableDetail'])
     },
@@ -2447,7 +2467,7 @@ export function createHandlers(): HttpHandler[] {
       // A failover stops before the promotion: its freezes are lifted and its report says cancelled (running or paused).
       if (rec.task.kind === 'server.failover') return ok(cancelFailover(c.s, rec))
       if (rec.task.state !== 'running') throw problem('task_not_cancellable')
-      if (rec.task.kind.startsWith('table.')) {
+      if (rec.task.kind.startsWith('table.') || rec.task.kind === 'partition.maintain') {
         // A change of a table stops at the next step and leaves the table as it was (the result is never applied).
         rec.task.state = 'failed'
         rec.task.cancellable = false

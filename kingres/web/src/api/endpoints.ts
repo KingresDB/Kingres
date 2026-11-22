@@ -295,6 +295,128 @@ export const endpoints = {
         { params: { path: { databaseName, schemaName, tableName, partitionName } } },
       ),
     ),
+  // --- analytics: approximate aggregates, storage format, time partitioning (contract 0.18.0)
+  getApproximateAggregates: (databaseName: string) =>
+    j(
+      api.GET('/databases/{databaseName}/approximate-aggregates', {
+        params: { path: { databaseName } },
+      }),
+    ),
+  configureApproximateAggregates: (databaseName: string, body: S['ApproximateAggregatesRequest']) =>
+    j(
+      api.PUT('/databases/{databaseName}/approximate-aggregates', {
+        params: { path: { databaseName } },
+        body,
+      }),
+    ),
+  setTableStorage: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    body: S['TableStorageRequest'],
+  ) =>
+    j(
+      api.PUT('/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/storage', {
+        params: { path: { databaseName, schemaName, tableName } },
+        body,
+      }),
+    ),
+  setPartitionStorage: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    partitionName: string,
+    body: S['PartitionStorageRequest'],
+  ) =>
+    j(
+      api.PUT(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partitions/{partitionName}/storage',
+        { params: { path: { databaseName, schemaName, tableName, partitionName } }, body },
+      ),
+    ),
+  getPartitionPolicy: (databaseName: string, schemaName: string, tableName: string) =>
+    j(
+      api.GET(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partition-policy',
+        {
+          params: { path: { databaseName, schemaName, tableName } },
+        },
+      ),
+    ),
+  putPartitionPolicy: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    body: S['PartitionPolicyRequest'],
+  ) =>
+    j(
+      api.PUT(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partition-policy',
+        {
+          params: { path: { databaseName, schemaName, tableName } },
+          body,
+        },
+      ),
+    ),
+  deletePartitionPolicy: (databaseName: string, schemaName: string, tableName: string) =>
+    j(
+      api.DELETE(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partition-policy',
+        { params: { path: { databaseName, schemaName, tableName } } },
+      ),
+    ),
+  runPartitionPolicy: (databaseName: string, schemaName: string, tableName: string) =>
+    j(
+      api.POST(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partition-policy/runs',
+        { params: { path: { databaseName, schemaName, tableName } }, body: {} },
+      ),
+    ),
+  listPartitionPolicyRuns: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    q: Page & { state?: S['PartitionRunState'] } = {},
+  ) =>
+    j(
+      api.GET(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partition-policy/runs',
+        {
+          params: {
+            path: { databaseName, schemaName, tableName },
+            query: { limit: 50, ...q },
+          },
+        },
+      ),
+    ),
+  getPartitionPolicyRun: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    runId: number,
+  ) =>
+    j(
+      api.GET(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partition-policy/runs/{runId}',
+        { params: { path: { databaseName, schemaName, tableName, runId } } },
+      ),
+    ),
+  /** A dry run: what a run would do now, with the stored policy or with the policy in the request. Nothing changes. */
+  planPartitionPolicy: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    policy?: S['PartitionPolicyRequest'],
+  ) =>
+    j(
+      api.POST(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partition-policy/plan',
+        {
+          params: { path: { databaseName, schemaName, tableName } },
+          body: policy ? { policy } : {},
+        },
+      ),
+    ),
   listColocationGroups: (databaseName: string) =>
     j(
       api.GET('/databases/{databaseName}/colocation-groups', {

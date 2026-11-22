@@ -279,7 +279,11 @@ describe('the mock: partitions', () => {
     expect(page.items[2]).toMatchObject({ isDefault: true, bound: 'DEFAULT' })
     expect((await endpoints.listTablePartitions('shop', 'public', 'orders')).items).toEqual([])
     const detail = await endpoints.getTable('shop', 'public', 'measurements')
-    expect(detail.partitioning).toEqual({ method: 'range', key: 'taken_at', partitionCount: 3 })
+    expect(detail.partitioning).toMatchObject({
+      method: 'range',
+      key: 'taken_at',
+      partitionCount: 3,
+    })
   })
 
   it('creates a partition (409 when it exists, unless ifNotExists), and the count follows', async () => {

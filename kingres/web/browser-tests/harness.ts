@@ -525,7 +525,7 @@ async function openTablePage(page: Page, table: string): Promise<void> {
  * leave-cluster and instance dialogs, and the state of a stopped system database. Used by the axe, layout
  * and content-security-policy runs (W2-16).
  */
-export const STATES: PageState[] = [
+const BASE_STATES: PageState[] = [
   {
     // 0.9.0: the plan of a rebalance listed with its servers, and a start that the server refuses
     // (the mock refuses an empty plan with its own notice).
@@ -1370,3 +1370,184 @@ export const STATES: PageState[] = [
     },
   },
 ]
+
+/** Puts the states of phase 12 (contract 0.18.0) back as they were: the switches off, the tables, partitions and policies of the states gone. */
+const freshAnalytics = async (page: Page): Promise<void> => {
+  await setMock(page, { tableSlow: false, taskDurationMs: 800 })
+  await page.evaluate(() => {
+    const mock = (
+      window as unknown as {
+        __kingresMock: {
+          state: () => {
+            databases: { info: { name: string }; tables: { name: string }[] }[]
+            partitions?: Record<string, unknown>
+            analytics?: unknown
+            alerts: { kind: string }[]
+          }
+        }
+      }
+    ).__kingresMock
+    const s = mock.state()
+    const shop = s.databases.find((d) => d.info.name === 'shop')
+    if (shop) shop.tables = shop.tables.filter((t) => t.name !== 'clicks' && t.name !== 'metrics')
+    if (s.partitions) delete s.partitions['shop/public.metrics']
+    delete s.analytics
+    s.alerts = s.alerts.filter(
+      (a) => a.kind !== 'partitionsAheadLow' && a.kind !== 'partitionPolicyFailed',
+    )
+    ;(
+      window as unknown as { __queryClient: { invalidateQueries: () => unknown } }
+    ).__queryClient.invalidateQueries()
+  })
+  await sleep(300)
+}
+
+/** The pages and dialogs of phase 12: the card and dialog of approximate aggregates, the Storage column, the table page with its partitions, policy and runs, their dialogs, and the plan summary of the workbench. */
+export const ANALYTICS_STATES: PageState[] = [
+  {
+    name: 'database page: approximate aggregates, on (0.18.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await freshAnalytics(page)
+      await urlSwitch(page, 'analytics', 'on')
+      await page.waitForSelector('[data-testid="aggregates-facts"]', { timeout: 20_000 })
+      await page.waitForFunction(
+        () =>
+          document
+            .querySelector('[data-testid="aggregates-mode"]')
+            ?.textContent?.includes('Approximate'),
+        { timeout: 20_000 },
+      )
+      await sleep(250)
+    },
+    close: freshAnalytics,
+  },
+  {
+    name: 'approximate aggregates dialog, with the consequence (0.18.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await freshAnalytics(page)
+      await page.waitForSelector(
+        '[data-testid="aggregates-configure"]:not([aria-disabled="true"])',
+        {
+          timeout: 20_000,
+        },
+      )
+      await page.click('[data-testid="aggregates-configure"]')
+      await dialogOpen(page)
+      await page.click('#aa-enabled')
+      await page.select('[data-testid="aa-mode"]', 'approximate')
+      await page.waitForSelector('[data-testid="aa-consequence"]', { timeout: 10_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await closeDialogs(page)
+      await freshAnalytics(page)
+    },
+  },
+  {
+    name: 'tables list: the Storage column and its filter (0.18.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await freshAnalytics(page)
+      await urlSwitch(page, 'analytics', 'timeseries')
+      await page.waitForSelector('[data-testid="storage-mixed"]', { timeout: 20_000 })
+      await sleep(250)
+    },
+    close: freshAnalytics,
+  },
+  {
+    name: 'table page: storage, partitions, policy and runs (0.18.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await freshAnalytics(page)
+      await urlSwitch(page, 'analytics', 'timeseries')
+      await openTablePage(page, 'metrics')
+      await page.waitForSelector('[data-testid="policy-runs"]', { timeout: 20_000 })
+      await sleep(250)
+    },
+    close: freshAnalytics,
+  },
+  {
+    name: 'convert storage dialog of a partition (0.18.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await freshAnalytics(page)
+      await urlSwitch(page, 'analytics', 'timeseries')
+      await openTablePage(page, 'metrics')
+      await clickWhenThere(page, '[data-testid^="convert-metrics_p"]:not([aria-disabled="true"])')
+      await dialogOpen(page)
+      await page.waitForSelector('[data-testid="storage-partition-note"]', { timeout: 10_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await closeDialogs(page)
+      await freshAnalytics(page)
+    },
+  },
+  {
+    name: 'time-partitioning policy dialog with a preview that deletes (0.18.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await freshAnalytics(page)
+      await urlSwitch(page, 'analytics', 'timeseries')
+      await openTablePage(page, 'metrics')
+      await clickWhenThere(page, '[data-testid="policy-edit"]:not([aria-disabled="true"])')
+      await dialogOpen(page)
+      await page.waitForSelector('[data-testid="policy-form"]', { timeout: 20_000 })
+      await page.$eval('[data-testid="policy-retention"]', (el) => {
+        ;(el as HTMLInputElement).value = '5'
+        el.dispatchEvent(new Event('input', { bubbles: true }))
+      })
+      await page.click('[data-testid="policy-preview"]')
+      await page.waitForSelector('[data-testid="policy-preview-deletes"]', { timeout: 20_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await closeDialogs(page)
+      await freshAnalytics(page)
+    },
+  },
+  {
+    name: 'run now dialog and a run with its actions (0.18.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await freshAnalytics(page)
+      await urlSwitch(page, 'analytics', 'timeseries')
+      await openTablePage(page, 'metrics')
+      await clickWhenThere(page, '[data-testid^="run-open-"]')
+      await dialogOpen(page)
+      await page.waitForSelector('[data-testid="run-details"]', { timeout: 20_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await closeDialogs(page)
+      await freshAnalytics(page)
+    },
+  },
+  {
+    name: 'workbench: the summary above a plan (0.18.0)',
+    needsMock: true,
+    route: '/workbench',
+    open: async (page) => {
+      await freshAnalytics(page)
+      await page.$eval('#w-sql', (el) => {
+        ;(el as HTMLTextAreaElement).value =
+          'explain select * from orders o join events e on o.customer_id = e.customer_id'
+        el.dispatchEvent(new Event('input', { bubbles: true }))
+      })
+      await clickText(page, 'Run')
+      await page.waitForSelector('[data-testid="plan-summary"]', { timeout: 20_000 })
+      await sleep(250)
+    },
+  },
+]
+
+export const STATES: PageState[] = [...BASE_STATES, ...ANALYTICS_STATES]
