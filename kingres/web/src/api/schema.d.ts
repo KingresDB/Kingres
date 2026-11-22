@@ -4496,7 +4496,7 @@ export interface components {
             method: "clean" | "pgRewind" | "baseBackup" | null;
             /**
              * Format: int64
-             * @description What the old primary wrote after the point where the histories parted (the writes that were discarded). Zero when its WAL ends before that point. Null when the instance had not finished its crash recovery and the end of its WAL could not be told (then `message` says so), and for a base backup.
+             * @description What the old primary wrote after the point where the histories parted (the writes that were discarded), at least: the distance to its shutdown checkpoint, whose own record is not counted. Zero when its WAL ends before that point. Null when the instance had not finished its crash recovery and the end of its WAL could not be told (then `message` says so), and for a base backup.
              */
             divergenceBytes: number | null;
             /** Format: int64 */

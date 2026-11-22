@@ -76,12 +76,12 @@ func TestTheDivergenceIsMeasuredFromAShutDownDirectory(t *testing.T) {
 	const rewind = "pg_rewind: servers diverged at WAL location 0/3000060 on timeline 1\n"
 	var measured OldPrimaryInfo
 	completeFromRewind(&measured, rewind, "0/3100000", true)
-	if measured.DivergenceBytes == nil || *measured.DivergenceBytes != 0x3100000-0x3000060 || !strings.Contains(measured.Message, "measured from the shutdown checkpoint") {
+	if measured.DivergenceBytes == nil || *measured.DivergenceBytes != 0x3100000-0x3000060 || !strings.Contains(measured.Message, "the distance to the shutdown checkpoint") {
 		t.Fatalf("%+v", measured)
 	}
 	var none OldPrimaryInfo
 	completeFromRewind(&none, rewind, "0/2000000", true)
-	if none.DivergenceBytes == nil || *none.DivergenceBytes != 0 || !strings.Contains(none.Message, "wrote nothing after the divergence") {
+	if none.DivergenceBytes == nil || *none.DivergenceBytes != 0 || !strings.Contains(none.Message, "wrote nothing after the divergence but its shutdown checkpoint") {
 		t.Fatalf("an old WAL that ends before the divergence: %+v", none)
 	}
 	var unknown OldPrimaryInfo

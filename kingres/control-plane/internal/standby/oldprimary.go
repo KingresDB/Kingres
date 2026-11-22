@@ -389,14 +389,14 @@ func completeFromRewind(info *OldPrimaryInfo, out, lastCheckpoint string, shutDo
 	switch {
 	case ok && shutDown:
 		info.DivergenceBytes = &d
-		info.Message += " The bytes written after the divergence are measured from the shutdown checkpoint of the old primary."
+		info.Message += " The bytes written after the divergence are at least the distance to the shutdown checkpoint of the old primary (the record itself is not counted)."
 	case ok:
 		info.DivergenceBytes = &d
 		info.Message += " The bytes written after the divergence are at least the distance to the last checkpoint."
 	case shutDown:
 		zero := int64(0)
 		info.DivergenceBytes = &zero
-		info.Message += " The old primary's WAL ends before that point: it wrote nothing after the divergence that the new primary does not hold."
+		info.Message += " The old primary's WAL ends before that point: it wrote nothing after the divergence but its shutdown checkpoint."
 	}
 }
 
