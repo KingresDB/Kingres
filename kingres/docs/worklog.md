@@ -7,6 +7,27 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-22: the console of phase 12 follows the settled contract, the owners of tables, and the independent review
+
+Continues the entry below on branch p12-web.
+
+### What was done
+
+- Merged p12-cp twice (`22a40eb52f`, `a8a770e771`; contract still 0.18.0): the `dryRun` preview and typed blockers of a storage change, the table in the alert subject, sentence step names, the enumerated shapes of `partitionEvery`, the bound of `asOf`, a put refused during a run, the cluster setting `analytics.allowNonSuperuserOwners` (a switch on the Settings page with its consequence and a confirmation to turn it on), `tableOwner` and `ownerTrusted` (an owner notice with a link to the setting), the blocker `owner_not_trusted`, and the refusal of a policy put and run for an owner that is not trusted. The mock follows each of them.
+- Fixed the findings P12W1 to P12W10 of the independent review ([the review](reviews/2026-11-22-console-phase12.md), section Fixes): sizes never made up, no Save over a policy that was not read, Run now held and red, a re-enabled drop policy needs preview and name, values the form cannot show are kept, real multi-unit intervals, a mock that finds indexes and triggers only when the task runs, field errors by JSON pointer, the smaller points.
+
+### How it was checked
+
+- typecheck, lint, `api:check`, the full vitest suite and the browser suite: full vitest 95 files, 1727 tests pass; browser suite 4 files, 48 tests pass; typecheck, lint and api:check clean.
+- New mutants, all caught: trusting owners without asking, a policy put accepted for an untrusted owner, the setting not making an owner trusted, the owner notice for a trusted owner, a run for an untrusted owner not refused, Save over an unread policy, Run now not held on a failed plan, a kept value rewritten, a drop policy turned on without preview, a size shown as 0, a 404 of another instance taken for no policy, field errors read by the bare name, a run that sends `asOf`, a plan with invented sizes, an unknown format counted as Row; the earlier survivors M6, M8 and M17 of the review are caught by tests of their own.
+
+### Still open
+
+- The end-to-end run against a real `kingresd`.
+- Not pushed.
+
+---
+
 ## 2026-11-22: the analytics console (phase 12, steps W1 and W2) on contract 0.18.0
 
 Branch p12-web, from the contract commit `7d43a79a3f` of p12-cp. The table page of increment 9.7 (branch web-15b, one commit) is not on kingres-18, and the Storage column, the partitions panel and the policy need it, so that commit is taken first (cherry-picked, the same change). The control plane of phase 12 is built on p12-cp by another writer; nothing in `kingres/api` or in Go is changed here.
