@@ -7,6 +7,54 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-22: phase 12 control plane (contract 0.18.0): approximate aggregates, storage conversion, time-partitioning policies and their scheduler, and the preload of kingres_columnar
+
+Branch `p12-cp` (worktree of its own), from `kingres-18` at e279c14091. Items St-P1 to St-P5 and Q-C1 of the inventory of 2026-11-22; the console parts (W1, W2, Q-W1)
+are on `p12-web`.
+
+### What was done
+
+- **Contract 0.18.0** (own commit): 11 operations (`getApproximateAggregates`, `configureApproximateAggregates`, `setTableStorage`, `setPartitionStorage`, `getPartitionPolicy`,
+  `putPartitionPolicy`, `deletePartitionPolicy`, `runPartitionPolicy`, `listPartitionPolicyRuns`, `getPartitionPolicyRun`, `planPartitionPolicy`), three task kinds, six problem codes, two alert
+  kinds, six audit actions, the optional `storage` and `partitioning` members of `Table`, the query parameter `storage`. `listTablePartitions` (0.14.0) is extended, not duplicated. Numbered 0.18.0
+  because the other branches take 0.15.0 to 0.17.0; the integrator renumbers (and the migrations 0035 and 0036). The generated files, the labels and the mock statuses of the panel follow.
+- **The release blocker**: `instance.PreloadLibraries` is `kingres_shard,kingres_ledger,kingres_columnar`; `EnsureConfig` brings an older `kingres-managed.conf` up to date at the start of `kingresd`;
+  `kingres_timepart` and `kingres_sketch` need no preload (read in their READMEs and tested). The flow test and the text of the packaging README follow.
+- **Q-C1** `database.approximateAggregates` (five steps, one install step per server), migration 0035, the closed `apply` kinds `extension.check`, `extension.install`, `extension.verify`, `database.settings`,
+  and a read of another server through the internal call `exec` (`membership.Manager.Query`).
+- **St-P2** `storage` and `partitioning` in `listTables`/`getTable` (pgstore), the filter, `listTablePartitions` for ordinary partitioned tables, the install of `kingres_columnar` and `kingres_timepart` in every
+  database that is made (and, through the existing copy of the extension list, on every server that is added).
+- **St-P3** `table.setStorage` for a table and for a partition. **St-P4** the policy resources. **St-P5** `internal/partsched`, `partition.maintain`, `runPartitionPolicy`, the runs, the alerts and the
+  counters on `/metrics`; migration 0036.
+- Documentation: `kingres/control-plane/README.md` (section "Analytics"), `kingres/api/README.md` (changelog 0.18.0, task kinds), `internal-api.md`, `kingres/packaging/README.md`.
+
+### How it was verified
+
+See the tests named in the README section. On PostgreSQL 18 and 19, lane l1, private installations built from e279c14091 (`install-extensions.sh` now builds the five extensions):
+`TestApproximateAggregates`, `TestTableStorageAndPartitionPolicies` (cluster tests, three servers), `TestIntegrationSetStorage*`, `TestIntegrationPartitionPolicyResource`, `TestIntegrationMaintain*`,
+`TestIntegrationPartitionScheduler*`, `TestIntegrationTableStorage`, and the tests of `internal/instance`. Unit: `go test ./internal/ops ./internal/partsched ./internal/httpapi ./internal/api ./internal/problem ./internal/store/...`,
+`node scripts/check-contract.mjs`, `npm run api:check`, `vue-tsc`. Mutants: see the list in the report of the round.
+
+### Decisions and deviations
+
+- A database that was made before this version gets `kingres_columnar` and `kingres_timepart` at the first use of a storage or policy operation, where the design answers `extension_missing` for an extension that is not
+  installed (nothing in the contract installs them). `extension_missing` stays for a package without the extension and for a library that is not preloaded.
+- Storage and policy operations work on the instance of this server (where the leader runs). A plain table of another group's instance is not found; distributed tables are D1a and D1b.
+- Step names are sentences (house style) and not the single words of the design table. `itemsDone` and `itemsTotal` of the convert step are not set (the environment of a step has no call for them yet).
+- `createdBy` of a policy is the service role; the audit log has the role that asked.
+- `database.approximateAggregates` is not in the exclusion rules of the task table (a failover does not stop it); the engine's one task per subject covers the second request.
+
+### Still open
+
+- Cluster test with a server whose package has another `kingres_sketch` version (all servers of the tests share one installation).
+- D1a, D1b (policies and conversion on distributed tables), S3 and the console steps.
+- Retention and conversion of the columnar partitions need `kingres_columnar` 0.2 in the packages of every server of a cluster: a mixed cluster is not checked by `partition.maintain`.
+
+### Core patches
+
+None.
+
+
 ## 2026-11-20: automatic failover, the last steps of phase 2b and their review, the second review of phase 9 and its fixes, and two npm alerts
 
 Covers 2026-11-20 from the morning, after the third entry of 2026-11-19.

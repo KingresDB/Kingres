@@ -339,7 +339,7 @@ paths; what is not done is in "Not done in this increment"). "Real" means the op
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **139 of 151 operations are real; 12 answer "not yet".**
+authenticated operation lists in 0.2.0. **150 of 151 operations are real; 1 answer "not yet".**
 
 | Tag | Real | Not yet |
 |---|---|---|
@@ -348,10 +348,10 @@ authenticated operation lists in 0.2.0. **139 of 151 operations are real; 12 ans
 | Auth | `login`, `logout`, `getSession` |  |
 | Cluster | `getCluster`, `getClusterSummary` |  |
 | Roles | `listClusterRoles`, `listRoles`, `createRole`, `getRole`, `deleteRole`, `updateRole`, `setRoleClusterRoles`, `setRoleMemberships` |  |
-| Databases | `getDatabaseCreateOptions`, `listDatabases`, `createDatabase`, `getDatabase`, `dropDatabase`, `updateDatabase` | `getApproximateAggregates`, `configureApproximateAggregates` |
+| Databases | `getDatabaseCreateOptions`, `listDatabases`, `createDatabase`, `getDatabase`, `dropDatabase`, `updateDatabase`, `getApproximateAggregates`, `configureApproximateAggregates` |  |
 | Shards | `getBucketDistribution`, `listColocationGroups`, `listBuckets` |  |
 | Ledger | `getLedgerStatus`, `listLedgerBlocks`, `listLedgerDigests`, `generateLedgerDigest`, `startLedgerVerification`, `listLedgerStatus`, `createInclusionProof`, `listLedgerVerifications`, `getLedgerVerification`, `getLedgerSettings`, `updateLedgerSettings`, `getLedgerSigning`, `createLedgerSigningKey`, `retireLedgerSigningKey`, `revokeLedgerSigningKey`, `getLedgerTrustFile`, `getLedgerPublication`, `getLedgerAggregate`, `listLedgerAggregates`, `listLedgerAnchorTargets`, `createLedgerAnchorTarget`, `getLedgerAnchorTarget`, `updateLedgerAnchorTarget`, `deleteLedgerAnchorTarget`, `testLedgerAnchorTarget`, `listLedgerAnchors`, `anchorLedgerNow`, `retryLedgerAnchor`, `downloadLedgerAnchor`, `listLedgerClientKeys`, `registerLedgerClientKey`, `revokeLedgerClientKey`, `setTableSignaturePolicy`, `upgradeLedgerExtension`, `createLedgerBundle`, `getLedgerBundle`, `acknowledgeLedgerDivergence` | |
-| Tables | `getTable`, `distributeTable`, `enableTableLedger`, `listTables`, `previewTableChange`, `undistributeTable`, `alterTableDistribution`, `listTablePartitions`, `createTablePartition`, `attachTablePartition`, `detachTablePartition`, `dropTablePartition` | `setTableStorage`, `setPartitionStorage`, `getPartitionPolicy`, `putPartitionPolicy`, `deletePartitionPolicy`, `runPartitionPolicy`, `listPartitionPolicyRuns`, `getPartitionPolicyRun`, `planPartitionPolicy` |
+| Tables | `getTable`, `distributeTable`, `enableTableLedger`, `listTables`, `previewTableChange`, `undistributeTable`, `alterTableDistribution`, `listTablePartitions`, `createTablePartition`, `attachTablePartition`, `detachTablePartition`, `dropTablePartition`, `setTableStorage`, `setPartitionStorage`, `getPartitionPolicy`, `putPartitionPolicy`, `deletePartitionPolicy`, `runPartitionPolicy`, `listPartitionPolicyRuns`, `getPartitionPolicyRun`, `planPartitionPolicy` |  |
 | Grants | `listGrants`, `createGrant`, `revokeGrants`, `applyGrantTemplate` |  |
 | Health | `getHealth`, `getReadiness` |  |
 | Logs | `listLogs` |  |
@@ -3502,3 +3502,84 @@ increment is installed in the installation of the tests.
 
 Not done: the rebalance does not look for an unfinished table task before it moves a bucket of the group (the extension refuses a move of a group that an operation claims; the rebalance then reports the move as failed); `Table.operation`
 (the unfinished task of a table) of the design is not in the contract yet; `relatedTables` of the distribute request (distribute with related tables) is increment 9.7; the free space of other servers.
+
+## Analytics: approximate aggregates, storage and time partitioning (phase 12, contract 0.18.0)
+
+Designs: `kingres/docs/design/analytics-phase12-queries.md` section 12 and `analytics-phase12-storage.md` sections 10.6 and 13. The contract is revision 0.18.0
+(11 operations, three task kinds, six problem codes, two alert kinds); it is numbered 0.18.0 because other branches take 0.15.0 to 0.17.0, and the integrator
+renumbers at the merge (so are the migrations 0035 and 0036). Every operation acts on the tables and databases of **this server's instance**, where the
+manager leader runs: a plain table that lives on another group's instance is not found here (distributed tables and their partitions are a later step,
+D1a and D1b of the design).
+
+### Preload (the fix that the analytics needed)
+
+`shared_preload_libraries` of every instance is `kingres_shard,kingres_ledger,kingres_columnar` (`instance.PreloadLibraries`). Without `kingres_columnar`
+nothing can write a columnar table and `kingres_timepart` refuses every conversion; `kingres_timepart` and `kingres_sketch` need no preload. An instance made
+by an earlier package has the old list in `kingres-managed.conf`: `EnsureConfig` (run when `kingresd` starts) rewrites the file when the list differs, and
+the new list takes effect at the next restart of the instance. A server whose instance has not been restarted answers `409 extension_missing` (naming the
+library and the server) to a storage conversion, and says what to do.
+
+### Extensions in databases and on new servers
+
+`database.create` installs `kingres_columnar` and `kingres_timepart` (`installAnalytics`, on this server and, through the apply kind `database.create`, on every
+other server) when the package of the server contains them; an older package makes a database without them, as before. `kingres_sketch` is not installed by
+`database.create`: the task `database.approximateAggregates` installs it. A server that is added gets every extension that is installed in a database of the
+leader (`globals/apply` already copies the list), the three of this phase included, and the database settings (`ALTER DATABASE ... SET`) with them. A database
+that was made before this version gets `kingres_columnar` and `kingres_timepart` at the first use of a storage or policy operation (`ensureExtensions`; a
+deviation from the design, which answers `extension_missing` for an extension that is not installed: there would be no way to install it from the console).
+
+New closed kinds of the internal call `apply` (leader only): `extension.check`, `extension.install`, `extension.verify` and `database.settings`. They carry a database
+and an extension name of a closed list (`kingres_sketch`, `kingres_columnar`, `kingres_timepart`) and never SQL. A refusal that matters comes back as an internal
+error with the problem code (`extension_unavailable`, `extension_version_mismatch`, `sketch_hash_mismatch`, `extension_missing`), which `healable` does not retry. The
+leader reads the version that another server has installed with the internal call `exec` (read-only statement; `ops.RemoteQuerier`, implemented by
+`membership.Manager.Query`), so `getApproximateAggregates` is one of the leader-bound reads (a follower forwards it).
+
+### `database.approximateAggregates`
+
+Subject: the database (the subject of `database.update`, so a second `database.*` task on it is `409 operation_in_progress`). Steps: `Check the servers` (this server
+first: its default version is the one the others must have; then every other server), one `Install the extension on server <id>` for each server, `Verify versions
+and hashes` (versions and `kingres_sketch.self_test()` of every server; it names **every** server that differs, with the code of the first), `Apply the database settings`
+(`kingres_shard.count_distinct_mode`, `count_distinct_error_rate`, `enable_sketch_pushdown`, on every server; a server whose `kingres_shard` does not know a setting
+skips it and the step says so in its detail) and `Record the settings` (migration 0035: three columns of `kingres_cp.database_setting`). A server that cannot be reached is
+waited for, with the server named in the detail, as in every cluster-wide task. Turning it off sets `count_distinct_mode` to `exact` and the pushdown off, resets the error
+rate and never drops the extension. `getApproximateAggregates` shows the setting and the installed version of each server (`ok`, `notInstalled`, `versionMismatch`,
+`unreachable`); `Database.approximateAggregates` carries the setting.
+
+### `table.setStorage`
+
+`setTableStorage` and `setPartitionStorage` start the task (subject `database/schema.table`, or `database/schema.partition`). Steps for a table: `Check the table`, `Convert the storage`
+(`ALTER TABLE ... SET ACCESS METHOD`, one transaction under an `ACCESS EXCLUSIVE` lock, which the step says; the options of the request are set as the `kingres_columnar.*` settings
+of that transaction) and `Analyze the table`; for a partition `Check the partition`, `Convert the partition` (`CALL kingres.convert_partition`: the new partition is built aside and swapped in)
+and `Analyze the partition`. The request is checked as the first step would check it, before a task exists (`409 conversion_refused` with the reasons: a partitioned table has no storage of
+its own, a ledger table, a distributed table, a publication, foreign keys, and for a partition the reasons of `kingres.timepart__convert_refusal`), and again by the step, because the state can
+change in between. A table that already has the format is not converted (the step says so). The convert step can be cancelled while it runs; the conversion is one transaction and rolls back.
+`listTables` and `getTable` carry `storage` (access method, partition formats, the totals and options of the columnar format) and, for a table that is range-partitioned on one time column,
+`partitioning.columnType`, `hasPolicy` and `defaultPartition`; `listTables?storage=` filters (a partitioned table matches when any partition does). `listTablePartitions` also lists the partitions
+of an ordinary range- or list-partitioned table, with access method, bounds, size and compression ratio.
+
+### Policies and `partition.maintain`
+
+`getPartitionPolicy`, `putPartitionPolicy`, `deletePartitionPolicy` and `planPartitionPolicy` are synchronous and call `kingres.timepart_set_policy`, `timepart_unset_policy`, `timepart_plan` (and
+`timepart__plan_rows` for a policy that is only in the request). A duration is an ISO 8601 text checked by a pattern here and by the extension (the grid, the time zone, the retention against the
+partition size), and a refusal of the extension becomes a `400` with the field it names or `409 partition_policy_conflict` (not range-partitioned on a time column, a default partition). A policy that
+is put is due at once (`nextRunAt` is now). `createdBy` is the PostgreSQL role that wrote the policy, which is the service role; the audit log has the signed-in role.
+
+`runPartitionPolicy` and the scheduler start `partition.maintain` (subject `database/schema.table`). Steps: `Begin the run`, `Create partitions`, `Convert partitions`, `Retire partitions`, `Finish the run`. `begin`
+looks for the run of this task (`kingres_cp.partition_run_task`, migration 0036) before it makes one with `kingres.timepart_begin_run`, and waits while another run of the table is going (the reason is in the
+detail); each phase is `CALL kingres.timepart_run_phase`, which records every action before and after it, so a task taken over after a crash goes on with the action it was in; `finish` closes the run. An action
+that fails (a lock timeout) does not fail the step: the run ends `partial` and the next run tries again; an SQL error of a step fails the task and marks the run `failed`. The runs are the records of the extension
+(`kingres.timepart_run`, `timepart_run_action`) with the task and the role that asked from `partition_run_task`; a run made from SQL is shown as `manual`.
+
+`internal/partsched` is the scheduler: two jobs of `internal/scheduler` (they run on the manager leader only, with its term): `partition.schedule` every `partition-scheduler-interval` (default 1m; environment
+`KINGRES_PARTITION_SCHEDULER_INTERVAL`) asks `kingres.timepart_due(now)` in every database that has `kingres_timepart` and starts one task for each table that has no unfinished task (it holds no state: after a change of
+the leader the new leader asks again), and `partition.alerts` every five minutes reads `kingres.timepart_check()` and raises or clears `partitionsAheadLow` and `partitionPolicyFailed` (the last run failed, or was
+`partial` twice in a row), subject `database:<db>|table:<schema>.<table>`. The counters `kingres_partition_runs_total`, `kingres_partition_runs_failed_total` and `kingres_partition_actions_failed_total` are on `/metrics`.
+
+### Tests
+
+Unit: `internal/ops` (`approx_test.go`: the five steps with fake servers, a version that differs, a package that lacks the extension, the hash, a server that is down, a failure at every call, the process that dies at every
+call), `internal/partsched` (a fake clock and backend). PostgreSQL-backed (`scripts\run-integration.ps1 -Packages ./internal/ops,./internal/store/pgstore,./internal/instance -Run ...`):
+`TestIntegrationSetStorage*`, `TestIntegrationPartitionPolicyResource`, `TestIntegrationMaintain*` (a run, a locked partition, a task interrupted at each of its five steps), `TestIntegrationPartitionScheduler*`,
+`TestIntegrationTableStorage` (pgstore), `TestEnsureConfigBringsThePreloadUpToDate`. Cluster tests of three servers: `TestApproximateAggregates` and `TestTableStorageAndPartitionPolicies` in `internal/clustertest`.
+Not covered: a server whose package has another version of `kingres_sketch` (all servers of the tests share one installation; the case is in the unit tests), and the library not preloaded on a running instance
+(unit test with a fake backend).
