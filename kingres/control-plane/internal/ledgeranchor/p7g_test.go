@@ -905,3 +905,24 @@ func TestAHolderReportKeepsTheGenerationAndTheDigestOfEachCopy(t *testing.T) {
 		t.Fatalf("%+v", rep.Lacking)
 	}
 }
+
+// A newer file that this server cannot store (its passphrase file cannot be read) is waited for, as a full disk is: it is a matter of this server
+// and not of the file (P7G-04).
+func TestANewerFileThatThisServerCannotStoreIsWaitedFor(t *testing.T) {
+	e, _, raw := staleLeader(t)
+	e.svc.cfg.FetchFrom = func(context.Context, string, int64) ([]byte, error) { return append([]byte(nil), raw...), nil }
+	e.creds.passFile = e.dir + "/there-is-no-passphrase-file" // a plain file is still read, and nothing can be written under it
+	if err := e.runSubmit(); err != nil {
+		t.Fatal(err)
+	}
+	r := e.rows()[0]
+	if r.State == anchor.StateFailed || r.ErrorCode != "credentials_stale" {
+		t.Fatalf("state %s code %q: a failure of this server must be waited for", r.State, r.ErrorCode)
+	}
+	if err := e.svc.jobCredentials(e.ctx(), e.term); err != nil {
+		t.Fatal(err)
+	}
+	if p := e.svc.credProblemList()[1]; !strings.Contains(p.Text, "asked again every minute") || !strings.Contains(p.Text, "could not be stored here") {
+		t.Fatalf("%+v", p)
+	}
+}

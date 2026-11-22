@@ -206,3 +206,15 @@ func TestTwoCutsOfOneGenerationWithOtherReplacedRecordsAreBothRead(t *testing.T)
 		t.Fatalf("a repetition was read:\n%s", out)
 	}
 }
+
+// The generation and the replaced record are both part of what makes an event a repetition: a later generation that replaced the same record
+// is a new event.
+func TestALaterGenerationWithTheSameReplacedRecordIsNotARepetition(t *testing.T) {
+	w, _, _ := stdWorld(t)
+	w.event(0, "restore-acknowledged", []signer{w.s1}, restoreLines(1, 9, 2, 4, 1)...)
+	w.event(1, "restore-acknowledged", []signer{w.s1}, restoreLines(2, 9, 2, 4, 1)...)
+	out := wantRun(t, 0, w.aggArgs(), "VERIFIED:", "verified event 000000 (restore-acknowledged, generation 1", "verified event 000001 (restore-acknowledged, generation 2")
+	if strings.Contains(out, "acknowledged twice") {
+		t.Fatalf("%s", out)
+	}
+}
