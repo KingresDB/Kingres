@@ -150,7 +150,7 @@ Each task kind has exactly one `subject.type`; `subject.id` is always a string.
 | `instance.start`, `instance.stop`, `instance.restart` | `instance` | the instance id (`node_id`) as a decimal string |
 | `database.create`, `database.update`, `database.drop` | `database` | the database name |
 | `table.distribute`, `table.undistribute`, `table.alter`, `table.partition` | `table` | `database/schema.table` (0.14.0: the table the request named; one table task per colocation group) |
-| `table.export`, `table.import` (0.19.0) | `table` | `database/schema.table`: one unfinished task per table. `table.export` steps: `Check the request`, `Read the table class`, `Write the file`, `Seal`; its `detail` is `transfer <id>` when done. `table.import` steps: `Check the upload`, `Check the table`, `Load rows`, `Commit`, `Clean up`; `Task.cancellable` is false once the commit was sent |
+| `table.export`, `table.import` (0.19.0) | `table` | `database/schema.table`: one unfinished task per table. `table.export` steps: `Check the request`, `Read the table class`, `Write the file`, `Seal`; its `detail` is `transfer <id>` when done. `table.import` steps: `Check the upload`, `Check the table`, `Load rows` (load and commit), `Confirm the commit`, `Clean up`; `Task.cancellable` is false once the commit was sent |
 | `rebalance` | `cluster` | `cluster` (0.9.0; one rebalance at a time, cluster-wide; the task id is the report id): steps `Check that the cluster can rebalance`, `Compute the plan`, `Move buckets`, `Write the report`; a stopped run is `paused` |
 | `replication.restorePreferredPrimaries` | `replication` | `preferred-primaries` (0.10.0: answers `unsupported_operation` until the switchover is built) |
 | `ledger.verify` | `ledgerVerification` | the **database name**: the verification id exists only after the run (see `LedgerVerification.taskId`) |
@@ -242,8 +242,8 @@ Tag `Data transfer`: export a table to a CSV file, upload a CSV file, import it 
   from a declared one) and the upload is `complete`.
 - **Download.** `Range` (one range) answers 206 with `Content-Range`; every answer has `Content-Length`, `Accept-Ranges`, `ETag` (the SHA-256),
   `Content-Disposition` (a name the server builds), `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`. 410: expired. 416: bad range.
-- **Import is all or nothing.** One transaction: the number of rows PostgreSQL reports must equal the number of records the control plane counted, or nothing is stored. A task
-  that fails after the commit was sent with an unknown outcome has the code `import_outcome_unknown` (not retryable): check the table before repeating.
+- **Import is all or nothing.** One transaction: the number of rows PostgreSQL reports must equal the number of records the control plane counted, or nothing is stored. The outcome
+  is read from a marker that commits with the rows; only when it cannot be read (a change of leader) does a task fail with `import_outcome_unknown` (not retryable): check the table before repeating.
 - **Error text.** No problem, task error, task detail or audit event of a data transfer carries a value, a row, a key or the message of PostgreSQL. The text is a fixed sentence per
   SQLSTATE, the names of the column and the constraint, and the absolute line number.
 - **Task codes** (`TaskError.code`): `export_too_large`, `insufficient_disk`, `transfer_quota_exceeded`, `transfer_timeout`, `transfer_leader_changed` (retryable),

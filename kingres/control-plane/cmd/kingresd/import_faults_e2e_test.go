@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -180,7 +181,9 @@ func TestImportCrashAfterCommit(t *testing.T) {
 	if got := count(t, q, "ac_t"); got != "[[3]]" {
 		t.Errorf("rows after the crash after COMMIT: %s", got)
 	}
-	if got := fmt.Sprint(q("select state, rows::text from kingres_transfer.import_marker")["rows"]); !strings.Contains(got, "committed 3") {
-		t.Errorf("marker: %s", got)
+	var state string
+	var rows int64
+	if err := e.serviceConn(t, "db_xfer").QueryRow(context.Background(), "select state, rows from kingres_transfer.import_marker order by at desc limit 1").Scan(&state, &rows); err != nil || state != "committed" || rows != 3 {
+		t.Errorf("marker: %s %d %v", state, rows, err)
 	}
 }

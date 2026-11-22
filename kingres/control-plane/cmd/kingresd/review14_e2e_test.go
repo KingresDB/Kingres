@@ -200,14 +200,15 @@ func TestExportSuperuserAndForcedRowSecurity(t *testing.T) {
 	}
 }
 
-// DX14-12: two requests of one role at the same time start one task, not two.
+// DX14-12: two requests of one role (for two tables, so that the rule of one task per table does not decide) at the same time start one task, not two.
 func TestOneTransferPerRoleUnderRace(t *testing.T) {
 	e, off := transferOn(t)
 	defer off()
 	q := xferDB(t, e, "db_xfer")
-	q("create table if not exists public.race_t (id int)")
+	q("create table if not exists public.race_a (id int)")
+	q("create table if not exists public.race_b (id int)")
 	tok := e.accountWithRole(t, "xfer_race", "kingres_admin")
-	q("grant select on public.race_t to xfer_race")
+	q("grant select on public.race_a, public.race_b to xfer_race")
 	as := e.as(tok)
 	ops.StartGap = func() { time.Sleep(600 * time.Millisecond) }
 	defer func() { ops.StartGap = nil }()
@@ -219,7 +220,7 @@ func TestOneTransferPerRoleUnderRace(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				codes[i], bodies[i], _ = as.call("POST", "/databases/db_xfer/schemas/public/tables/race_t/export", map[string]any{}, nil)
+				codes[i], bodies[i], _ = as.call("POST", "/databases/db_xfer/schemas/public/tables/race_"+string(rune('a'+i))+"/export", map[string]any{}, nil)
 			}()
 		}
 		wg.Wait()
@@ -239,7 +240,7 @@ func TestOneTransferPerRoleUnderRace(t *testing.T) {
 			t.Fatalf("round %d: %d requests were accepted (%v)", round, ok, codes)
 		}
 	}
-	q("revoke all on public.race_t from xfer_race")
+	q("revoke all on public.race_a, public.race_b from xfer_race")
 	e.expect(t, 204, "DELETE", "/roles/xfer_race", nil)
 }
 

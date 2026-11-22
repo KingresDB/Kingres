@@ -253,7 +253,11 @@ func CopyToSQL(schema, table string, columns []ExportColumn, c CSV, header, only
 			sel = append(sel, "CASE WHEN "+id.String()+"::text ~ "+pat+" THEN '''' || "+id.String()+"::text ELSE "+id.String()+"::text END AS "+alias)
 			continue
 		}
-		sel = append(sel, id.String()+" AS "+alias)
+		if alias != id.String() {
+			sel = append(sel, id.String()+" AS "+alias)
+			continue
+		}
+		sel = append(sel, id.String())
 	}
 	if len(sel) == 0 {
 		return "", fmt.Errorf("an export needs at least one column")

@@ -574,7 +574,7 @@ Steps of `table.import`: *Check the upload* (complete, the caller's, size and SH
 table* (class, privileges, header, ledger policy, row-level security, table task running?), *Load rows*
 (`NonIdempotent`; `Interruptible` until the intent; `itemsDone` = bytes of the file consumed by `COPY`, `itemsTotal`
 = file size; **`pg_stat_progress_copy` is not updated by routed `COPY` (F7), so the count is the control plane's own**),
-*Commit* (the intent and the commit), *Clean up* (delete the upload unless `keepUpload`). `statement_timeout` is the
+*Commit* (the intent and the commit; built as one step *Load rows*, then *Confirm the commit*), *Clean up* (delete the upload unless `keepUpload`). `statement_timeout` is the
 time left of `transfer-max-duration`; a timeout fails the task `transfer_timeout` and rolls back. Between steps the
 role is checked again (cluster role, `rolcanlogin`, `rolvaliduntil`, still the same role identity, DXR-23): a role that
 lost its right ends the task `forbidden`, with nothing stored.
@@ -1828,3 +1828,31 @@ found 27 points. Each is either a change of the design or a reason why not; "Pha
 | DXR-26 spreadsheet guard | low | Pattern extended (`\|`, `%`, full-width, no-break space); the dialog says it is **not a security feature** | "Spreadsheet safety" | 14a |
 | DXR-27 checksum entered by the user | low | `sha256` on upload is for command-line clients; the console shows the export's SHA-256 and the import dialog takes `expectedSha256` | "Uploads", "Known limits" | 14a, 14c |
 
+
+### Changes made after the independent review of 14a (2026-11-22)
+
+The review is `docs/reviews/2026-11-22-data-export-import-14a.md`; its section "Fixes" says what was done for each finding. Where the text above and this
+section differ, this section is right.
+
+- **The outcome of an import is decided by a marker (DX14-01).** The table `kingres_transfer.import_marker (task_id bigint primary key, state, rows, at)` is made in the
+  database of the target by the service role, and belongs to it; no privilege is granted to the importing role (so dropping the role is not blocked), which writes its row
+  through the security definer function `kingres_transfer.mark(task_id, rows)` inside the transaction of the load. The row commits with the rows (inside the same
+  two-phase commit for a routed table) or not at all. A run that finds the intent asks `INSERT ... 'aborted' ON CONFLICT DO NOTHING` and reads the row back: a row
+  `committed` is the proof that the rows are in; a row `aborted` that was inserted makes any later commit of that task fail on the key, so it is the proof that nothing was
+  stored (the insert waits up to 60 seconds for a transaction that holds the key). A statement of the text above that is not true as built: the marker table is **local**
+  to the database of the server that loaded, not a reference table; after a change of leader the marker cannot be read from the new leader, and the task fails
+  `import_outcome_unknown` (the case the design left for "unknown until observed"). The reference-table form belongs to the batch import of 14c.
+- **One step loads and commits (DX14-07).** *Load rows* does `BEGIN`, the load, the checks, the marker, the intent and `COMMIT` and ends with the commit done or an error; the
+  open transaction is never kept between steps, so a stand-down cannot leave one without an owner (the connection is closed by the step, and the server ends an idle
+  transaction after the time that is left of the task). *Commit* is now *Confirm the commit*: it reads the marker, records the count and writes the audit event.
+- **The staged files are adopted at the first use (DX14-02)**, so the sum that the quota checks includes the files that were there when the process started.
+- **Roles (DX14-03).** An import is refused at the request (403) and in the step for a role with SUPERUSER, REPLICATION or BYPASSRLS or access to server files, programs or
+  logs. The owner test of the export compares the owner of the table with the role (`relowner = the oid of current_user`), not `pg_has_role`, which is true for a superuser.
+- **Spreadsheet guard (DX14-04, DX14-11).** The header cells are cells: a risky column name is given an apostrophe in front through the alias of the column (up to 63 bytes),
+  and `xml` columns and domains over `xml` are text for the guard.
+- **Checks repeated (DX14-05, DX14-09).** The export repeats the checks of the request (the table, the columns, the untrusted code) in its first step; the import compares the
+  types of the columns too (for a reference table they build the typed-array cast).
+- **Smaller points (DX14-06, 08, 10, 12).** A poll of an upload on a server that is not the one that holds it no longer marks it lost. The cap on a plain file is applied
+  after reading the first two bytes of the staged file (a gzip file is not capped by its compressed size). `skipBom` is for UTF-8 only; for another encoding it is refused
+  (400) when named and ignored by default. One transfer per role is race free (a lock from the check to the start of the task); a refused request leaves no record; the
+  first step of a task reads `dataTransfer.enabled` again (a task that is moving data is cancelled with `cancelTask`).

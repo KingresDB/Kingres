@@ -1276,7 +1276,7 @@ export interface paths {
          *     Needs `kingres_admin`, the cluster setting `dataTransfer.enabled` (403 `data_transfer_disabled` while it is off), a request that arrived
          *     over TLS (403 `insecure_transport`), and the PostgreSQL privilege `SELECT` on every exported column (the connection is the role's).
          *     A table that does not exist is 404; a view, a foreign table, a bucket partition named directly and a table of the schemas `kingres`,
-         *     `pg_catalog` and `information_schema` are 422 `table_not_eligible` with `blockers`. 422 `export_untrusted_code`: the table is owned by another
+         *     `pg_catalog` and `information_schema` are 403 `forbidden` for a role with SUPERUSER, REPLICATION or BYPASSRLS or access to server files, programs or logs; 422 `table_not_eligible` with `blockers`. 422 `export_untrusted_code`: the table is owned by another
          *     role and a column that is read calls a function owned by a role that is neither the caller nor a superuser (`acknowledgeOtherRolesCode`
          *     accepts the risk); 409 `insufficient_disk`: the staging area has too little free space; 400 `validation_failed` for an option that is not valid.
          *     409 `operation_in_progress`: the table has an unfinished task, or the cluster or the role is at the limit `maxConcurrent`;
@@ -1329,8 +1329,8 @@ export interface paths {
          *     several groups); 422 `import_header_mismatch` (`header: match` failed; the first difference is named), `import_ledger_policy` (a ledger table whose signature policy is
          *     `required`), `import_too_large`, `import_end_marker` (the file has an unquoted `\.` line; the line number is given) and `validation_failed`.
          *
-         *     The task `table.import` has the steps *Check the upload*, *Check the table*, *Load rows*, *Commit* and *Clean up*. `Task.cancellable` is true until the commit has been
-         *     sent. A task that fails after the commit was sent with an unknown outcome has the code `import_outcome_unknown` (`retryable: false`): **N rows may have been loaded; check
+         *     The task `table.import` has the steps *Check the upload*, *Check the table*, *Load rows* (the load and the commit), *Confirm the commit* and *Clean up*. `Task.cancellable` is true until the commit has been
+         *     sent. The outcome of the commit is read from a marker that commits with the rows: a commit that did not happen fails with `copy_interrupted` (retryable) and nothing stored; a task that fails after the commit was sent and whose marker could not be read (a change of leader, a lock wait that ran out) has the code `import_outcome_unknown` (`retryable: false`): **N rows may have been loaded; check
          *     the table before repeating the import.** Other task codes: `row_count_mismatch`, `transfer_timeout`, `transfer_leader_changed` (retryable), `transfer_session_lost`
          *     (retryable), `copy_interrupted` (retryable), `forbidden`, `cancelled`, and `sql_error` with a `sqlState`. **No error of a task, no problem and no audit event carries a value,
          *     a row, a key or the text of PostgreSQL**: the message is a fixed sentence per SQLSTATE plus the names of the column and the constraint and the absolute line number.
@@ -8274,7 +8274,7 @@ export interface components {
         };
         /**
          * @description The import was accepted and runs as the task `table.import` (added in 0.19.0). Poll `GET /tasks/{taskId}` (the `Location` header). A failed task never carries a value or text of the
-         *     server; `import_outcome_unknown` means that the commit was sent and its outcome is not known.
+         *     server; `import_outcome_unknown` means that the commit was sent and its outcome could not be read from the marker in the database.
          */
         AcceptedTableImport: {
             headers: {
