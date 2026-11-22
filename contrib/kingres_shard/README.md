@@ -2205,7 +2205,7 @@ Measured with `t/245_schema_scale_cluster.pl` (three nodes, one machine; the ful
   (the fingerprint of the table differs from the map group primary's), `stray_schema_rows` (the empty copy of a table that another group holds has rows, outside a move
   that has the group as source or target) and `schema_catalog_differs` (the schemas, their groups, states, placement epochs and numbers of tables differ from the map
   group primary's); the checks of the moves (slots, publications, subscriptions, a bucket that is moving without a move) apply to a schema's bucket because it is in
-  `bucket_map`.  It stays a structural check: it does not compare the rows of a copy with its source.  Tests: `t/270` and `t/271`.
+  `bucket_map`.  It stays a structural check: it does not compare the rows of a copy with its source.  Tests: `t/276` and `t/277`.
 
 **Using distributed schemas, and what they cannot do (step 15).**
 

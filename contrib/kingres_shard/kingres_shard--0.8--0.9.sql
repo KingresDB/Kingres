@@ -1023,3 +1023,352 @@ BEGIN
     END LOOP;
 END;
 $$;
+
+-- ---------------------------------------------------------------------------
+-- The leftovers of phase 11 (design/shard-phase11.md 9.9 and 9.10): the schemas in the rebalance plan and the drain, and the schema checks of
+-- check_cluster.  internal_plan_inputs() and check_cluster() are replaced; the functions of the block below are new.
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION kingres.internal_plan_inputs(p_strategy text, p_extra jsonb, p_exclude int[], p_colos int[])
+    RETURNS jsonb
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_groups pg_catalog.jsonb;
+    v_items  pg_catalog.jsonb;
+    v_min    pg_catalog.int8;
+    v_sizes  pg_catalog.jsonb := '{}';
+    v_pinned pg_catalog.jsonb := '[]';
+    g        pg_catalog.record;
+    v_node   pg_catalog.int4;
+BEGIN
+    IF p_strategy IS NULL OR p_strategy NOT IN ('by_bucket_count', 'by_disk_size') THEN
+        RAISE EXCEPTION 'unknown rebalance strategy "%" (by_bucket_count or by_disk_size)', p_strategy
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF p_extra IS NOT NULL AND pg_catalog.jsonb_typeof(p_extra) IS DISTINCT FROM 'object' THEN
+        RAISE EXCEPTION 'extra_load must be a JSON object of group id to load' USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    v_min := (SELECT s.setting::pg_catalog.int8 FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) 'kingres_shard.min_bucket_cost') * 1024;
+
+    SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+               'id', x.group_id, 'avail', x.node_id IS NOT NULL,
+               'recv', x.node_id IS NOT NULL AND x.should AND NOT (x.group_id OPERATOR(pg_catalog.=) ANY (COALESCE(p_exclude, '{}'::pg_catalog.int4[]))),
+               'w', COALESCE(x.weight, 1),
+               'extra', CASE WHEN x.node_id IS NOT NULL AND x.should AND NOT (x.group_id OPERATOR(pg_catalog.=) ANY (COALESCE(p_exclude, '{}'::pg_catalog.int4[])))
+                             THEN COALESCE((p_extra OPERATOR(pg_catalog.->>) x.group_id::pg_catalog.text)::pg_catalog.float8, 0) ELSE 0 END)
+               ORDER BY x.group_id), '[]'::pg_catalog.jsonb)
+      INTO v_groups
+      FROM (SELECT gr.group_id,
+                   (SELECT n.node_id FROM kingres.node n WHERE n.group_id OPERATOR(pg_catalog.=) gr.group_id AND n.role OPERATOR(pg_catalog.=) 'primary' AND n.is_active) AS node_id,
+                   COALESCE((SELECT n.should_have_shards FROM kingres.node n WHERE n.group_id OPERATOR(pg_catalog.=) gr.group_id AND n.role OPERATOR(pg_catalog.=) 'primary' AND n.is_active), false) AS should,
+                   (SELECT n.weight FROM kingres.node n WHERE n.group_id OPERATOR(pg_catalog.=) gr.group_id AND n.role OPERATOR(pg_catalog.=) 'primary' AND n.is_active) AS weight
+              FROM (SELECT n.group_id FROM kingres.node n UNION SELECT m.group_id FROM kingres.bucket_map m) gr) x;
+
+    IF p_strategy OPERATOR(pg_catalog.=) 'by_disk_size' THEN
+        PERFORM kingres.internal_require_superuser();
+        -- the sizes of the bucket partitions of every table of every colocation group, from the node that owns them now
+        FOR g IN SELECT DISTINCT m.group_id FROM kingres.bucket_map m ORDER BY m.group_id LOOP
+            v_node := kingres.internal_group_node(g.group_id);
+            IF v_node IS NULL THEN
+                CONTINUE;           -- a group without a primary is not planned
+            END IF;
+            BEGIN
+                v_sizes := v_sizes OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_object(g.group_id::pg_catalog.text,
+                    (kingres.internal_node_exec(v_node,
+                        'SELECT COALESCE(pg_catalog.jsonb_object_agg(s.k, s.sz), ''{}''::pg_catalog.jsonb)::pg_catalog.text FROM ('
+                        'SELECT d.colocation_id::pg_catalog.text OPERATOR(pg_catalog.||) '':'' OPERATOR(pg_catalog.||) b.bucket::pg_catalog.text AS k, '
+                        'pg_catalog.sum(b.partition_size)::pg_catalog.int8 AS sz '
+                        'FROM kingres.buckets b JOIN kingres.dist_table d ON d.relid OPERATOR(pg_catalog.=) b.table_name '
+                        'WHERE b.partition_size IS NOT NULL GROUP BY 1 '
+                        -- the one bucket of a distributed schema is its tables (P10R-09): the size is the tables' own, where the node holds them
+                        'UNION ALL SELECT d.colocation_id::pg_catalog.text OPERATOR(pg_catalog.||) '':0'', pg_catalog.sum(pg_catalog.pg_total_relation_size(d.relid))::pg_catalog.int8 '
+                        'FROM kingres.dist_table d WHERE d.method OPERATOR(pg_catalog.=) ''schema'' GROUP BY d.colocation_id) s',
+                        10000) OPERATOR(pg_catalog.->) 0 OPERATOR(pg_catalog.->>) 0)::pg_catalog.jsonb);
+            EXCEPTION WHEN OTHERS THEN
+                RAISE EXCEPTION 'the sizes of the buckets of shard group % cannot be read (%): a plan by disk size does not guess', g.group_id, SQLERRM
+                    USING ERRCODE = 'object_not_in_prerequisite_state';
+            END;
+        END LOOP;
+    END IF;
+
+    -- The schemas that a plan must not move (a ledger table pins them, design 9.9): the owner knows.  Only a superuser can ask the nodes; for any other
+    -- caller the plan does not know the pins, and the move of a pinned schema is refused when it is tried.  A group that does not answer is not planned either.
+    IF pg_catalog.current_setting('is_superuser') OPERATOR(pg_catalog.=) 'on' THEN
+        FOR g IN SELECT DISTINCT m.group_id FROM kingres.bucket_map m JOIN kingres.colocation c ON c.colocation_id OPERATOR(pg_catalog.=) m.colocation_id
+                  WHERE c.kind OPERATOR(pg_catalog.=) 'schema' ORDER BY m.group_id LOOP
+            v_node := kingres.internal_group_node(g.group_id);
+            IF v_node IS NULL THEN
+                CONTINUE;
+            END IF;
+            BEGIN
+                v_pinned := v_pinned OPERATOR(pg_catalog.||)
+                    (((kingres.internal_node_exec(v_node, 'SELECT kingres.internal_pinned_schemas()::pg_catalog.text', 10000) OPERATOR(pg_catalog.->) 0) OPERATOR(pg_catalog.->>) 0))::pg_catalog.jsonb;
+            EXCEPTION WHEN OTHERS THEN
+                NULL;
+            END;
+        END LOOP;
+    END IF;
+
+    SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+               'c', q.colocation_id, 'b', q.bucket, 'owner', q.owner, 'phys', q.group_id,
+               'mov', q.mov, 'size', q.size,
+               'cost', CASE WHEN p_strategy OPERATOR(pg_catalog.=) 'by_disk_size' THEN (CASE WHEN COALESCE(q.size, 0) OPERATOR(pg_catalog.>) v_min THEN q.size ELSE v_min END) ELSE 1 END)
+               ORDER BY q.colocation_id, q.bucket), '[]'::pg_catalog.jsonb)
+      INTO v_items
+      FROM (SELECT m.colocation_id, m.bucket, m.group_id,
+                   COALESCE((SELECT b.target_group FROM kingres.bucket_move b
+                              WHERE b.colocation_id OPERATOR(pg_catalog.=) m.colocation_id AND b.bucket OPERATOR(pg_catalog.=) m.bucket
+                                AND b.phase IN ('preparing', 'copying', 'catching_up', 'switching')), m.group_id) AS owner,
+                   m.state OPERATOR(pg_catalog.=) 'active' AND (p_colos IS NULL OR m.colocation_id OPERATOR(pg_catalog.=) ANY (p_colos))
+                   -- the bucket of a distributed schema is an item like any other (design 9.9), unless a ledger table pins the schema: it counts in the
+                   -- load of its group and stays
+                   AND NOT (v_pinned OPERATOR(pg_catalog.@>) pg_catalog.jsonb_build_array(m.colocation_id)) AS mov,
+                   (v_sizes OPERATOR(pg_catalog.->) m.group_id::pg_catalog.text OPERATOR(pg_catalog.->>) (m.colocation_id::pg_catalog.text OPERATOR(pg_catalog.||) ':' OPERATOR(pg_catalog.||) m.bucket::pg_catalog.text))::pg_catalog.int8 AS size
+              FROM kingres.bucket_map m) q;
+    RETURN pg_catalog.jsonb_build_object('groups', v_groups, 'items', v_items);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION kingres.check_cluster(p_prepared_older_than interval DEFAULT interval '5 minutes')
+    RETURNS TABLE (check_name text, node_id int, object text, detail text)
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    b      pg_catalog.record;
+    v_skip pg_catalog.int4[] := '{}';
+BEGIN
+    -- the base check counts the buckets of a group against its bucket_count; the layout check does it for groups with split buckets too.
+    -- The checks of the layout and of the splits ask every node: they leave out a node that the base check found not answering (each call
+    -- to such a node costs a node_timeout, and check_cluster has a bound, README "Bounds").
+    FOR b IN SELECT x.check_name, x.node_id, x.object, x.detail FROM kingres.internal_check_cluster_base(p_prepared_older_than) x LOOP
+        IF b.check_name OPERATOR(pg_catalog.=) 'node_unreachable' AND b.node_id IS NOT NULL THEN
+            v_skip := v_skip OPERATOR(pg_catalog.||) b.node_id;
+        END IF;
+        IF b.check_name OPERATOR(pg_catalog.<>) 'bucket_map_incomplete' THEN
+            check_name := b.check_name; node_id := b.node_id; object := b.object; detail := b.detail;
+            RETURN NEXT;
+        END IF;
+    END LOOP;
+    RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_layout() t;
+    RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_layout_partitions(v_skip) t;
+    RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_splits(v_skip) t;
+    RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_ledger(v_skip) t;
+    RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_schemas(v_skip) t;
+    RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_table_operations(v_skip) t;
+    RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_partitions() t;
+END;
+$$;
+
+-- =========================================================================
+-- PHASE 11 (distributed schemas), the leftovers of steps 6 and 15 of the design: the schema items of the rebalance and the drain (9.9) and the checks
+-- of check_cluster (9.10)   [begin]
+-- =========================================================================
+
+-- Node-local: the colocation groups of the distributed schemas that a ledger table pins on this node, as a JSON array.  The plan of a rebalance
+-- asks the owners (a pinned schema is not an item of the plan, 9.9).
+CREATE FUNCTION kingres.internal_pinned_schemas()
+    RETURNS pg_catalog.jsonb
+    LANGUAGE sql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+SELECT COALESCE(pg_catalog.jsonb_agg(s.colocation_id ORDER BY s.colocation_id), '[]'::pg_catalog.jsonb)
+  FROM kingres.dist_schema s
+ WHERE kingres.internal_schema_pinned(s.colocation_id) IS NOT NULL;
+$$;
+
+-- Node-local: the distributed schemas whose bucket this node's group owns, as a JSON array of {colocation_id, size, blocker}: the bytes of their tables
+-- (tables, indexes, TOAST) and what keeps them from moving (a ledger pin, an unlogged table, a table with neither a key nor a full replica identity), or null.
+CREATE FUNCTION kingres.internal_schemas_report()
+    RETURNS pg_catalog.jsonb
+    LANGUAGE sql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+           'colocation_id', s.colocation_id,
+           'size', (SELECT COALESCE(pg_catalog.sum(pg_catalog.pg_total_relation_size(d.relid)), 0)
+                      FROM kingres.dist_table d WHERE d.colocation_id OPERATOR(pg_catalog.=) s.colocation_id AND d.method OPERATOR(pg_catalog.=) 'schema'),
+           'blocker', kingres.internal_schema_precheck(s.colocation_id)) ORDER BY s.colocation_id), '[]'::pg_catalog.jsonb)
+  FROM kingres.dist_schema s
+  JOIN kingres.bucket_map b ON b.colocation_id OPERATOR(pg_catalog.=) s.colocation_id AND b.bucket OPERATOR(pg_catalog.=) 0
+  JOIN kingres.node n ON n.group_id OPERATOR(pg_catalog.=) b.group_id AND n.node_id OPERATOR(pg_catalog.=) (SELECT l.node_id FROM kingres.local_node l);
+$$;
+
+-- The distributed schemas that a shard group holds, with their sizes and what would keep each from moving: what a drain of the group has to move, and what
+-- would stop it (design 9.9, the preview of a drain).  A group that does not answer gives its schemas with a null size and the reason in blocker.
+-- Superusers only (it asks the owner).
+CREATE FUNCTION kingres.schemas_on_group(p_group int)
+    RETURNS TABLE (schema_name text, colocation_id int, state text, size_bytes bigint, blocker text)
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_node   pg_catalog.int4 := kingres.internal_group_node(p_group);
+    v_rep    pg_catalog.jsonb;
+    v_err    pg_catalog.text;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    IF v_node IS NULL THEN
+        v_err := pg_catalog.format('shard group %s has no active primary: its schemas cannot be asked', p_group);
+    ELSE
+        BEGIN
+            v_rep := (((kingres.internal_node_exec(v_node, 'SELECT kingres.internal_schemas_report()::pg_catalog.text', 10000) OPERATOR(pg_catalog.->) 0) OPERATOR(pg_catalog.->>) 0))::pg_catalog.jsonb;
+        EXCEPTION WHEN OTHERS THEN
+            v_err := pg_catalog.format('shard group %s did not answer: %s', p_group, SQLERRM);
+        END;
+    END IF;
+    RETURN QUERY
+    SELECT ns.nspname::pg_catalog.text, s.colocation_id, m.state,
+           (r.size)::pg_catalog.int8,
+           COALESCE(v_err, r.blocker)
+      FROM kingres.dist_schema s
+      JOIN pg_catalog.pg_namespace ns ON ns.oid OPERATOR(pg_catalog.=) s.nsp::pg_catalog.oid
+      JOIN kingres.bucket_map m ON m.colocation_id OPERATOR(pg_catalog.=) s.colocation_id AND m.bucket OPERATOR(pg_catalog.=) 0
+      LEFT JOIN pg_catalog.jsonb_to_recordset(COALESCE(v_rep, '[]'::pg_catalog.jsonb)) AS r(colocation_id int, size int8, blocker text)
+             ON r.colocation_id OPERATOR(pg_catalog.=) s.colocation_id
+     WHERE m.group_id OPERATOR(pg_catalog.=) p_group
+     ORDER BY ns.nspname;
+END;
+$$;
+
+-- Node-local, for check_cluster (design 9.10): the digest of what this node says about the distributed schemas in its catalog, by names: each schema
+-- with the group and the state of its bucket, the placement epoch of its colocation group and the number of its schema tables.  The map group primary
+-- compares its own digest with the one of every node.
+CREATE FUNCTION kingres.internal_schema_catalog_digest()
+    RETURNS text
+    LANGUAGE sql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+SELECT pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(COALESCE(pg_catalog.string_agg(
+           pg_catalog.format('%s|%s|%s|%s|%s|%s', ns.nspname, s.colocation_id, b.group_id, b.state, c.placement_epoch,
+                             (SELECT pg_catalog.count(*) FROM kingres.dist_table d WHERE d.colocation_id OPERATOR(pg_catalog.=) s.colocation_id AND d.method OPERATOR(pg_catalog.=) 'schema')),
+           ';' ORDER BY ns.nspname), ''), 'UTF8')), 'hex')
+  FROM kingres.dist_schema s
+  JOIN pg_catalog.pg_namespace ns ON ns.oid OPERATOR(pg_catalog.=) s.nsp::pg_catalog.oid
+  JOIN kingres.bucket_map b ON b.colocation_id OPERATOR(pg_catalog.=) s.colocation_id AND b.bucket OPERATOR(pg_catalog.=) 0
+  JOIN kingres.colocation c ON c.colocation_id OPERATOR(pg_catalog.=) s.colocation_id;
+$$;
+
+-- Node-local, for check_cluster: what is wrong on this node with the distributed schemas, given what the map group primary expects
+-- (p_expect: {"digest": ..., "schemas": [{"nsp", "owner", "busy": [groups], "tables": [{"q", "fp"}]}]}).  A JSON array of {check, object, detail}.
+CREATE FUNCTION kingres.internal_check_schemas_local(p_expect pg_catalog.jsonb)
+    RETURNS pg_catalog.jsonb
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_group pg_catalog.int4;
+    v_out   pg_catalog.jsonb := '[]'::pg_catalog.jsonb;
+    e       pg_catalog.record;
+    t       pg_catalog.record;
+    v_rel   pg_catalog.regclass;
+    v_has   pg_catalog.bool;
+    v_fp    pg_catalog.text;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    PERFORM pg_catalog.set_config('kingres_shard.enable_routing', 'off', true);
+    SELECT n.group_id INTO v_group FROM kingres.local_node l JOIN kingres.node n ON n.node_id OPERATOR(pg_catalog.=) l.node_id;
+    FOR e IN SELECT * FROM pg_catalog.jsonb_to_recordset(p_expect OPERATOR(pg_catalog.->) 'schemas') AS x(nsp text, owner int, busy jsonb, tables jsonb) LOOP
+        IF pg_catalog.to_regnamespace(pg_catalog.quote_ident(e.nsp)) IS NULL THEN
+            v_out := v_out OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('check', 'schema_missing', 'object', e.nsp,
+                        'detail', 'the schema is a distributed schema of the map group and does not exist on this node'));
+            CONTINUE;
+        END IF;
+        FOR t IN SELECT * FROM pg_catalog.jsonb_to_recordset(e.tables) AS y(q text, fp text) LOOP
+            v_rel := pg_catalog.to_regclass(t.q);
+            IF v_rel IS NULL THEN
+                v_out := v_out OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('check', 'schema_table_missing', 'object', t.q,
+                            'detail', 'a table of a distributed schema does not exist on this node'));
+                CONTINUE;
+            END IF;
+            v_fp := kingres.internal_table_fingerprint(v_rel);
+            IF v_fp IS DISTINCT FROM t.fp THEN
+                v_out := v_out OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('check', 'schema_structure_differs', 'object', t.q,
+                            'detail', 'the structure of the table on this node is not the structure on the map group primary (columns, constraints, indexes, triggers)'));
+            END IF;
+            -- the empty copy of a table that another group holds: no row, except while a move of the schema is on its way to or from this group
+            IF v_group OPERATOR(pg_catalog.<>) e.owner AND NOT (e.busy OPERATOR(pg_catalog.@>) pg_catalog.jsonb_build_array(v_group)) THEN
+                EXECUTE pg_catalog.format('SELECT EXISTS (SELECT 1 FROM %s)', v_rel) INTO v_has;
+                IF v_has THEN
+                    v_out := v_out OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('check', 'stray_schema_rows', 'object', t.q,
+                                'detail', pg_catalog.format('the table holds rows on shard group %s, and the schema is held by shard group %s: a statement that reached the empty copy wrote there', v_group, e.owner)));
+                END IF;
+            END IF;
+        END LOOP;
+    END LOOP;
+    IF kingres.internal_schema_catalog_digest() IS DISTINCT FROM (p_expect OPERATOR(pg_catalog.->>) 'digest') THEN
+        v_out := v_out OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('check', 'schema_catalog_differs', 'object', NULL,
+                    'detail', 'the rows of dist_schema and of the schema tables of dist_table (schema, colocation group, group, state, placement epoch, number of tables) differ from the map group primary'));
+    END IF;
+    RETURN v_out;
+END;
+$$;
+
+-- check_cluster on the map group primary (design 9.10): what every active primary says about the distributed schemas.  A structural check: it does
+-- not compare the rows of a copy with its source (the check of a move does not either, review S4-10).
+CREATE FUNCTION kingres.internal_check_schemas(p_skip int[] DEFAULT '{}')
+    RETURNS TABLE (check_name text, node_id int, object text, detail text)
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_expect pg_catalog.jsonb;
+    n        pg_catalog.record;
+    r        pg_catalog.jsonb;
+    f        pg_catalog.record;
+BEGIN
+    IF pg_catalog.to_regclass('kingres.dist_schema') IS NULL OR NOT EXISTS (SELECT 1 FROM kingres.dist_schema) THEN
+        RETURN;
+    END IF;
+    SELECT pg_catalog.jsonb_build_object(
+               'digest', kingres.internal_schema_catalog_digest(),
+               'schemas', COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+                   'nsp', ns.nspname, 'owner', b.group_id,
+                   'busy', (SELECT COALESCE(pg_catalog.jsonb_agg(DISTINCT g.grp), '[]'::pg_catalog.jsonb)
+                              FROM kingres.bucket_move mv
+                              CROSS JOIN LATERAL (VALUES (mv.source_group), (mv.target_group)) g(grp)
+                             WHERE mv.colocation_id OPERATOR(pg_catalog.=) s.colocation_id
+                               AND mv.phase IN ('preparing', 'copying', 'catching_up', 'switching', 'cleaning')),
+                   'tables', (SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+                                         'q', d.relid::pg_catalog.regclass::pg_catalog.text, 'fp', kingres.internal_table_fingerprint(d.relid)) ORDER BY d.relid::pg_catalog.oid), '[]'::pg_catalog.jsonb)
+                                FROM kingres.dist_table d WHERE d.colocation_id OPERATOR(pg_catalog.=) s.colocation_id AND d.method OPERATOR(pg_catalog.=) 'schema')
+                   ) ORDER BY ns.nspname), '[]'::pg_catalog.jsonb))
+      INTO v_expect
+      FROM kingres.dist_schema s
+      JOIN pg_catalog.pg_namespace ns ON ns.oid OPERATOR(pg_catalog.=) s.nsp::pg_catalog.oid
+      JOIN kingres.bucket_map b ON b.colocation_id OPERATOR(pg_catalog.=) s.colocation_id AND b.bucket OPERATOR(pg_catalog.=) 0;
+    FOR n IN SELECT nd.node_id AS id FROM kingres.node nd WHERE nd.role OPERATOR(pg_catalog.=) 'primary' AND nd.is_active
+                AND NOT (nd.node_id OPERATOR(pg_catalog.=) ANY (p_skip)) ORDER BY nd.node_id LOOP
+        BEGIN
+            r := kingres.internal_node_exec(n.id, pg_catalog.format('SELECT kingres.internal_check_schemas_local(%L::pg_catalog.jsonb)::pg_catalog.text', v_expect::pg_catalog.text), 60000);
+            r := (((r OPERATOR(pg_catalog.->) 0) OPERATOR(pg_catalog.->>) 0))::pg_catalog.jsonb;
+        EXCEPTION WHEN OTHERS OR query_canceled THEN
+            CONTINUE;
+        END;
+        FOR f IN SELECT x."check" AS c, x.object AS o, x.detail AS d FROM pg_catalog.jsonb_to_recordset(r) AS x("check" text, object text, detail text) LOOP
+            check_name := f.c; node_id := n.id; object := f.o; detail := f.d;
+            RETURN NEXT;
+        END LOOP;
+    END LOOP;
+END;
+$$;
+
+COMMENT ON FUNCTION kingres.internal_pinned_schemas() IS 'Node-local: the colocation groups of the distributed schemas that a ledger table pins here';
+COMMENT ON FUNCTION kingres.internal_schemas_report() IS 'Node-local: the distributed schemas that this node''s group owns, with sizes and what keeps each from moving';
+COMMENT ON FUNCTION kingres.schemas_on_group(int) IS 'The distributed schemas of a shard group with their sizes and what would keep each from moving (the preview of a drain); superusers only';
+COMMENT ON FUNCTION kingres.internal_schema_catalog_digest() IS 'Node-local: the digest of the distributed schemas of this node''s catalog, by names';
+COMMENT ON FUNCTION kingres.internal_check_schemas_local(jsonb) IS 'Node-local: what is wrong here with the distributed schemas, given what the map group primary expects';
+REVOKE ALL ON FUNCTION
+    kingres.internal_pinned_schemas(),
+    kingres.internal_schemas_report(),
+    kingres.schemas_on_group(int),
+    kingres.internal_schema_catalog_digest(),
+    kingres.internal_check_schemas_local(jsonb),
+    kingres.internal_check_schemas(int[])
+    FROM PUBLIC;
+
+-- =========================================================================
+-- PHASE 11, the leftovers                                                    [end]
+-- =========================================================================

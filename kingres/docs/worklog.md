@@ -22,10 +22,9 @@ Covers branch p11-left (from shard-p12), design [shard-phase11.md](design/shard-
 - **`check_cluster`.**  New `internal_check_schemas()`: for every active primary, `schema_missing`, `schema_table_missing`, `schema_structure_differs` (the table fingerprint), `stray_schema_rows` (rows in the
   empty copy of a table of another group's schema, outside a move that has the group as source or target) and `schema_catalog_differs` (a digest of the schemas, their groups, states, placement epochs and
   numbers of tables, by names).  The node does the work (`internal_check_schemas_local`) from what the map group primary expects.
-- Tests `t/270` (the plan, the pinned schema, the drain, placement, removal) and `t/271` (every check, a move, a clean cluster); `t/236` section C now says what it always meant (the plan of phase 4 does not move a schema).
+- Tests `t/276` (the plan, the pinned schema, the drain, placement, removal) and `t/277` (every check, a move, a clean cluster); `t/236` section C now says what it always meant (the plan of phase 4 does not move a schema).
   Each change has a mutant that a test kills.
-- **SQL.**  The changes are in the 0.8 scripts (`kingres_shard--0.7--0.8.sql`, regenerated `kingres_shard--0.8.sql`): they replace the bodies of three functions of 0.8 that is not released and add six
-  functions.  If the integration prefers them in 0.9 (the branch p12-storage has the 0.8 to 0.9 script), the new block "the leftovers of steps 6 and 15" and the three edited places move as they are.
+- **SQL.**  The changes are in `kingres_shard--0.8--0.9.sql` (0.8 is released and its scripts are as they were): `CREATE OR REPLACE` of `internal_plan_inputs()` and `check_cluster()` and a block of six new functions; `kingres_shard--0.9.sql` is regenerated with `mk-install-script.sh`.  The branch contains `p12-storage` (kingres_shard 0.9, columnar) merged in; the tests of this work are `t/276` and `t/277` (`t/270` to `t/275` are the columnar and count-distinct tests of p12-storage, which `meson.build` now lists too).
 
 ### How it was verified
 

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Portions Copyright (c) 2026, RooyeKhat Media Co
 #
-# t/271_schema_check_cluster.pl
+# t/277_schema_check_cluster.pl
 #
 # Phase 11 (design/shard-phase11.md 9.10): kingres.check_cluster() looks at the distributed schemas of every node.  A clean cluster, and a cluster after a move,
 # have no finding; each way of going wrong is a finding of its own: schema_missing, schema_table_missing, schema_structure_differs, stray_schema_rows,

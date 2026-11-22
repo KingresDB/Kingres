@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Portions Copyright (c) 2026, RooyeKhat Media Co
 #
-# t/270_schema_rebalance_plan.pl
+# t/276_schema_rebalance_plan.pl
 #
 # Phase 11 (design/shard-phase11.md 9.9): a distributed schema is one more item of the plan of a rebalance and of a drain.
 #
