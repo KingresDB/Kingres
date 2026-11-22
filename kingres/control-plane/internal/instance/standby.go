@@ -92,7 +92,7 @@ func (m *Manager) InitStandby(ctx context.Context, s StandbySpec) (err error) {
 		return invalid("socket directory path %q is too long (limit 90 bytes)", trunc(sock))
 	}
 	s.Settings.SocketDir = filepath.ToSlash(sock)
-	s.Settings.Preload = m.preloadList()
+	s.Settings.Preload = m.preloadListFor(s.ID)
 	managed, err := RenderManaged(s.Settings)
 	if err != nil {
 		return err
@@ -321,7 +321,7 @@ func (m *Manager) RebaseStandby(ctx context.Context, id int, s StandbySpec) erro
 	if s.Settings.Port == 0 {
 		s.Settings.Port = mk.Port
 	}
-	s.Settings.Preload = m.preloadList()
+	s.Settings.Preload = m.preloadListFor(id)
 	managed, err := RenderManaged(s.Settings)
 	if err != nil {
 		return err
