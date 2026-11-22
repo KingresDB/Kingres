@@ -27,10 +27,12 @@ type fakeExt struct {
 	installed map[string]string // extension -> installed version
 	selfTest  string
 	preloaded map[string]bool
-	settings  map[string]string
-	unknown   map[string]bool // settings this server's kingres_shard does not know
-	installs  int
-	failOnce  string // "install" or "settings": the next such call fails once
+	// notLoadedOn, when set, is what PreloadedOnAll names for a library that is not loaded (the instances of the server, standbys included).
+	notLoadedOn []string
+	settings    map[string]string
+	unknown     map[string]bool // settings this server's kingres_shard does not know
+	installs    int
+	failOnce    string // "install" or "settings": the next such call fails once
 }
 
 func newFakeExt() *fakeExt {
@@ -68,6 +70,16 @@ func (f *fakeExt) SelfTest(context.Context, string) (string, error) { return f.s
 
 func (f *fakeExt) Preloaded(_ context.Context, lib string) (bool, error) {
 	return f.preloaded[lib], nil
+}
+
+func (f *fakeExt) PreloadedOnAll(_ context.Context, lib string) ([]string, error) {
+	if f.preloaded[lib] {
+		return nil, nil
+	}
+	if f.notLoadedOn != nil {
+		return f.notLoadedOn, nil
+	}
+	return []string{"instance 1 (primary)"}, nil
 }
 
 func (f *fakeExt) SetDatabaseSettings(_ context.Context, _ string, s map[string]string) ([]string, error) {

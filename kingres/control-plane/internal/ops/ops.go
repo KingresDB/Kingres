@@ -50,6 +50,8 @@ type RoleConnector interface {
 
 // Ops carries the dependencies of the operations.
 type Ops struct {
+	// failed remembers when a partition.maintain task of a table last failed (the back-off of a failure before any run exists).
+	failed failedTasks
 	// Service opens service connections; Roles opens role connections.
 	Service ServiceConnector
 	Roles   RoleConnector

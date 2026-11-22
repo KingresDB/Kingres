@@ -112,6 +112,7 @@ func TestIntegrationAPartitionOfANonSuperuserOwnerConverts(t *testing.T) {
 		`INSERT INTO public.ev SELECT '2026-01-05 00:00:00+00'::timestamptz + g * interval '1 minute', g FROM generate_series(1, 500) g`,
 		`CREATE TABLE public.plain_t (id int)`, `INSERT INTO public.plain_t VALUES (1)`,
 		`ALTER TABLE public.ev OWNER TO app_owner`, `ALTER TABLE public.ev_1 OWNER TO app_owner`, `ALTER TABLE public.plain_t OWNER TO app_owner`)
+	allowOwners(t, c, true)
 	in, err := o.PrepareSetStorage(ctx, "admin", "postgres", "public", "ev", "ev_1", api.TableStorageRequest{AccessMethod: "columnar"})
 	if err != nil {
 		t.Fatal(err)

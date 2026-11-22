@@ -47,10 +47,12 @@ const (
 	stepStorageAnalyzeP   = "Analyze the partition"
 )
 
-// Timings that tests shorten: the lock_timeout of one try, the pause between tries, and how long a step tries before it fails with operation_in_progress.
+// Timings that tests shorten: the lock_timeout of one try, the pause between tries, and how long a step tries before it fails with operation_in_progress. While the
+// conversion waits for a lock that a long transaction holds, a reader that arrives waits behind its request for at most the lock_timeout (200 ms) in every cycle of
+// lock_timeout plus pause (3.2 s): readers are slowed by that much, not blocked for the whole wait.
 var (
-	storageLockTimeout = 3 * time.Second
-	storageLockPause   = 2 * time.Second
+	storageLockTimeout = 200 * time.Millisecond
+	storageLockPause   = 3 * time.Second
 	storageLockLimit   = 10 * time.Minute
 )
 
@@ -209,6 +211,10 @@ func (o *Ops) PreviewSetStorage(ctx context.Context, actor, db, schema, table, p
 	prev.Target = p.AccessMethod
 	prev.Notes = append(prev.Notes, info.notes...)
 	if info.known {
+		trusted := info.trusted
+		prev.TableOwner, prev.OwnerTrusted = info.owner, &trusted
+	}
+	if info.known {
 		cur := info.am
 		if info.kind == "p" {
 			prev.Current = nil
@@ -247,7 +253,9 @@ func (o *Ops) checkSetStorage(ctx context.Context, actor, db, schema, table, par
 		return p, storageInfo{}, err
 	}
 	p.Database, p.Schema, p.Table, p.Partition, p.Actor = db, schema, table, partition, actor
-	if o.maintainRunning(ctx, db, schema, table) {
+	if running, err := o.maintainRunning(ctx, db, schema, table); err != nil {
+		return p, storageInfo{}, err
+	} else if running {
 		return p, storageInfo{}, problem.New(problem.OperationInProgress, "A partition.maintain task is running for the table; convert when it has ended.")
 	}
 	if err := o.ensureStorageExtensions(ctx, p, !dry); err != nil {
@@ -332,13 +340,13 @@ func (o *Ops) ensureExtensionsOpt(ctx context.Context, db string, exts []string,
 			}
 		}
 		if e == ExtColumnar && preload {
-			ok, err := b.Preloaded(ctx, e)
+			missing, err := b.PreloadedOnAll(ctx, e)
 			if err != nil {
 				return wrap(err)
 			}
-			if !ok {
-				return problem.New(problem.ExtensionMissing, fmt.Sprintf("The library %s is not loaded by server %s: its instance was started before the library was added to shared_preload_libraries. "+
-					"Restart the instance of that server (the setting is managed by kingresd and cannot be edited), standbys first, then try again.", e, o.ServerHost))
+			if len(missing) > 0 {
+				return problem.New(problem.ExtensionMissing, fmt.Sprintf("The library %s is not loaded by %s of server %s: it was started before the library was added to shared_preload_libraries. "+
+					"Restart it (the setting is managed by kingresd and cannot be edited), standbys first, then try again.", e, strings.Join(missing, ", "), o.ServerHost))
 			}
 		}
 	}
@@ -353,6 +361,9 @@ type storageInfo struct {
 	// same: the format is the requested one and there is nothing to do; sameWithOptions: the format is the requested one (columnar) and options were given.
 	same, sameWithOptions bool
 	notes                 []string
+	// owner is the owner of the table or partition, trusted whether the operations are open for it now.
+	owner   string
+	trusted bool
 }
 
 // storageRefusals lists the reasons why the conversion cannot be done now, as typed blockers; none means that it can. A table or partition that already
@@ -374,7 +385,25 @@ func (o *Ops) storageRefusals(ctx context.Context, p storageParams) ([]api.Table
 			}
 			return err
 		}
-		info = storageInfo{known: true, kind: kind, am: am}
+		info = storageInfo{known: true, kind: kind, am: am, trusted: true}
+		owners := make([]ownerInfo, 0, 2)
+		for _, n := range []string{firstNonEmpty(p.Partition, p.Table), p.Table} {
+			w, err := tableOwnerOf(ctx, tx, p.Schema, n)
+			if err != nil {
+				return err
+			}
+			owners = append(owners, w)
+			if p.Partition == "" {
+				break
+			}
+		}
+		info.owner = owners[0].Name
+		allowed, err := o.nonSuperuserOwnersAllowed(ctx)
+		if err != nil {
+			return err
+		}
+		untrusted := untrustedOwner(allowed, owners...)
+		info.trusted = untrusted == ""
 		if p.Partition != "" && !parentOK {
 			return problem.New(problem.NotFound, fmt.Sprintf("%s.%s is not a partition of %s.%s (a partition is addressed in the schema of its table).", p.Schema, p.Partition, p.Schema, p.Table))
 		}
@@ -383,6 +412,9 @@ func (o *Ops) storageRefusals(ctx context.Context, p storageParams) ([]api.Table
 			return nil // nothing to do
 		}
 		info.sameWithOptions = am == p.AccessMethod
+		if untrusted != "" {
+			blockers = append(blockers, api.TableBlocker{Code: "owner_not_trusted", Object: p.Schema + "." + firstNonEmpty(p.Partition, p.Table), Message: ownerNotTrustedText(untrusted)})
+		}
 		add := func(code, object, msg string) {
 			blockers = append(blockers, api.TableBlocker{Code: code, Object: object, Message: msg})
 		}
@@ -393,7 +425,7 @@ func (o *Ops) storageRefusals(ctx context.Context, p storageParams) ([]api.Table
 		case p.Partition == "" && isPart:
 			add("partition", obj, "this is a partition, use the operation for a partition")
 		}
-		if len(blockers) > 0 {
+		if len(blockers) > 0 && (kind == "p" || p.Partition == "" && isPart) {
 			return nil
 		}
 		if p.Partition == "" {
