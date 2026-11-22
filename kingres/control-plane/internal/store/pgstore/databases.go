@@ -12,6 +12,7 @@ import (
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/store"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/transfer"
 )
 
 // databaseRow is a row of pg_database with the size and connection count.
@@ -259,6 +260,8 @@ func (s *Store) ClusterSettings(ctx context.Context) (api.ClusterSettings, error
 		Restart:             api.RestartState{ServerIDs: []string{}},
 		Clock:               &api.ClockSettings{MaxDifferenceMs: 1000},
 	}
+	dt := transfer.DefaultSettings()
+	out.DataTransfer = dt.API()
 	// Values the administrator set (kingres_cp.cluster_setting) win over the
 	// defaults derived from the catalogs.
 	if ok, _ := s.regclassExists(ctx, p, "kingres_cp.cluster_setting"); ok {
@@ -309,8 +312,11 @@ func (s *Store) ClusterSettings(ctx context.Context) (api.ClusterSettings, error
 				if json.Unmarshal(v, &n) == nil {
 					out.Rebalance.MaxConcurrentMoves = n
 				}
+			default:
+				dt.Apply(k, v)
 			}
 		}
+		out.DataTransfer = dt.API()
 		if err := rows.Err(); err != nil {
 			return out, s.wrap("reading kingres_cp.cluster_setting", err)
 		}

@@ -167,6 +167,17 @@ type ClusterSettingsUpdateRequest struct {
 	Clock *struct {
 		MaxDifferenceMs *int `json:"maxDifferenceMs,omitempty"`
 	} `json:"clock,omitempty"`
+	// DataTransfer is added in contract 0.19.0.
+	DataTransfer *DataTransferSettingsUpdate `json:"dataTransfer,omitempty"`
+}
+
+// DataTransferSettingsUpdate is a partial update of DataTransferSettings (contract 0.19.0).
+type DataTransferSettingsUpdate struct {
+	Enabled           *bool  `json:"enabled,omitempty"`
+	RetentionHours    *int   `json:"retentionHours,omitempty"`
+	MaxFileBytes      *int64 `json:"maxFileBytes,omitempty"`
+	StagingQuotaBytes *int64 `json:"stagingQuotaBytes,omitempty"`
+	MaxConcurrent     *int   `json:"maxConcurrent,omitempty"`
 }
 
 // LedgerClientKey is a registered client key of the ledger (contract 0.11.0).

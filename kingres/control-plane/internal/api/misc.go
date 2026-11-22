@@ -289,6 +289,22 @@ type ClusterSettings struct {
 	Restart RestartState `json:"restart"`
 	// Clock holds the clock settings (contract 0.8.0).
 	Clock *ClockSettings `json:"clock,omitempty"`
+	// DataTransfer holds the settings of the table export and import (contract 0.19.0).
+	DataTransfer *DataTransferSettings `json:"dataTransfer,omitempty"`
+}
+
+// DataTransferSettings are the cluster settings of the data transfer (contract 0.19.0).
+type DataTransferSettings struct {
+	// Enabled is false until an administrator turns the data transfer on.
+	Enabled bool `json:"enabled"`
+	// RetentionHours is how long an export file is kept by default.
+	RetentionHours int `json:"retentionHours"`
+	// MaxFileBytes is the largest staged file.
+	MaxFileBytes int64 `json:"maxFileBytes"`
+	// StagingQuotaBytes is the sum of the reservations of the staging area.
+	StagingQuotaBytes int64 `json:"stagingQuotaBytes"`
+	// MaxConcurrent is the number of transfers running at once in the cluster.
+	MaxConcurrent int `json:"maxConcurrent"`
 }
 
 // ClockSettings are the clock settings of the cluster.

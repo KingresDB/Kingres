@@ -664,9 +664,23 @@ func (s *Server) updateClusterSettings(c *call, w http.ResponseWriter, r *http.R
 	if err := s.body(w, r, &req); err != nil {
 		return err
 	}
+	// The audit event of a change of the data transfer setting names the old and the new values (never data).
+	var oldDT *api.DataTransferSettings
+	if req.DataTransfer != nil {
+		if cur, err := s.deps.Store.ClusterSettings(r.Context()); err == nil {
+			oldDT = cur.DataTransfer
+		}
+	}
 	started, err := o.UpdateClusterSettings(r.Context(), c.session.Username, req)
 	if err != nil {
 		return err
+	}
+	if req.DataTransfer != nil {
+		d := map[string]any{"old": oldDT}
+		if cur, err := s.deps.Store.ClusterSettings(r.Context()); err == nil {
+			d["new"] = cur.DataTransfer
+		}
+		c.addDetails(map[string]any{"dataTransfer": d})
 	}
 	// An update that started a task (a new replica count starts standby.reconcile) answers 202
 	// with the Task and a Location, as every operation that starts a task does, to a client that

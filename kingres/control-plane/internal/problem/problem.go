@@ -100,6 +100,19 @@ const (
 	ChainNotDiverged   Code = "chain_not_diverged"
 	// Added in contract 0.14.0 (the table lifecycle): the table cannot take the requested change; Blockers says why.
 	TableNotEligible Code = "table_not_eligible"
+	// Added in contract 0.19.0 (data transfer).
+	DataTransferDisabled   Code = "data_transfer_disabled"
+	InsecureTransport      Code = "insecure_transport"
+	TransferQuotaExceeded  Code = "transfer_quota_exceeded"
+	UploadIncomplete       Code = "upload_incomplete"
+	UploadOffsetMismatch   Code = "upload_offset_mismatch"
+	ChunkTooLarge          Code = "chunk_too_large"
+	UploadChecksumMismatch Code = "upload_checksum_mismatch"
+	ImportHeaderMismatch   Code = "import_header_mismatch"
+	ImportLedgerPolicy     Code = "import_ledger_policy"
+	ImportTooLarge         Code = "import_too_large"
+	ImportEndMarker        Code = "import_end_marker"
+	ExportUntrustedCode    Code = "export_untrusted_code"
 )
 
 // FieldError is one entry of the "errors" extension (schema ValidationIssue).
@@ -142,6 +155,8 @@ type Problem struct {
 	Plan any `json:"plan,omitempty"`
 	// Blockers are the lines of the report of the sharding extension that make a table not eligible (table_not_eligible; contract 0.14.0).
 	Blockers any `json:"blockers,omitempty"`
+	// Reasons are further reasons in the shape of Blockers (contract 0.19.0, optional).
+	Reasons any `json:"reasons,omitempty"`
 
 	// retryAfter, when positive, is sent as a Retry-After header (seconds).
 	retryAfter int
@@ -231,6 +246,18 @@ var specs = map[Code]struct {
 	LastSigningKey:                  {409, "Last signing key", "last-signing-key"},
 	ChainNotDiverged:                {409, "The chain is not diverged", "chain-not-diverged"},
 	TableNotEligible:                {422, "The table cannot take this change", "table-not-eligible"},
+	DataTransferDisabled:            {403, "Data transfer is disabled", "data-transfer-disabled"},
+	InsecureTransport:               {403, "Insecure transport", "insecure-transport"},
+	TransferQuotaExceeded:           {409, "Staging quota exceeded", "transfer-quota-exceeded"},
+	UploadIncomplete:                {409, "Upload incomplete", "upload-incomplete"},
+	UploadOffsetMismatch:            {409, "Upload offset mismatch", "upload-offset-mismatch"},
+	ChunkTooLarge:                   {413, "Chunk too large", "chunk-too-large"},
+	UploadChecksumMismatch:          {422, "Upload checksum mismatch", "upload-checksum-mismatch"},
+	ImportHeaderMismatch:            {422, "The header does not match", "import-header-mismatch"},
+	ImportLedgerPolicy:              {422, "The ledger policy refuses unsigned writes", "import-ledger-policy"},
+	ImportTooLarge:                  {422, "The file is too large to import", "import-too-large"},
+	ImportEndMarker:                 {422, "The file has an end-of-data line", "import-end-marker"},
+	ExportUntrustedCode:             {422, "The read would run code of another role", "export-untrusted-code"},
 }
 
 // New returns a Problem for the code with the standard status, title and
