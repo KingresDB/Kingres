@@ -73,3 +73,73 @@ func TestMoveCancellableUntilTheSwitch(t *testing.T) {
 		t.Error("not cancellable when finished")
 	}
 }
+
+// The switch of a move happens inside the call of the copy step, so the guard reads the phase that the step records: a request that
+// arrives while the extension is switching (or after the call has ended) is refused, and so is the mark of one that arrived before.
+func TestMoveCancelGuardFollowsThePhaseOfTheCopyStep(t *testing.T) {
+	copying := func(detail string, copy string) task.Task {
+		return task.Task{Detail: detail, Steps: []task.StepState{{Name: stepMoveCheck, State: task.StepDone}, {Name: stepMoveCopy, State: copy}}}
+	}
+	for detail, want := range map[string]bool{
+		"preparing: checking and recording the move":                true,
+		"copying: copying the rows to shard group 2":                true,
+		"catching_up: the copy on shard group 2 catches up":         true,
+		"switching: the writers of this schema wait for the switch": false,
+		"cleaning: the schema is served by its new group":           false,
+		"done: ": false,
+		moveTooLateText + " (copying: copying the rows to shard group 2)": false,
+		"": true,
+	} {
+		if got := moveCancellable(copying(detail, task.StepRunning)); got != want {
+			t.Errorf("detail %q: cancellable %v, want %v", detail, got, want)
+		}
+	}
+	// the copy step is done: the schema is on its target, the mark of a request that came late is not followed
+	if moveCancellable(copying("", task.StepDone)) {
+		t.Error("not cancellable once the copy step is done")
+	}
+}
+
+func TestUndistributeCancelGuard(t *testing.T) {
+	mk := func(detail string, states ...string) task.Task {
+		names := []string{stepUndistCheck, stepUndistMoveFirst, stepUndistMake}
+		t := task.Task{Detail: detail}
+		for i, s := range states {
+			t.Steps = append(t.Steps, task.StepState{Name: names[i], State: s})
+		}
+		return t
+	}
+	if !undistributeCancellable(mk("", task.StepRunning)) {
+		t.Error("cancellable in the check")
+	}
+	if !undistributeCancellable(mk("copying: x", task.StepDone, task.StepRunning)) {
+		t.Error("cancellable while the move first copies")
+	}
+	if undistributeCancellable(mk("switching: x", task.StepDone, task.StepRunning)) {
+		t.Error("not cancellable while the move first switches")
+	}
+	// the move first is over (its detail still says cleaning): the task can still be cancelled before the schema is made local
+	if !undistributeCancellable(mk("cleaning: x", task.StepDone, task.StepDone, task.StepPending)) {
+		t.Error("cancellable between the move first and the making local")
+	}
+	if undistributeCancellable(mk("", task.StepDone, task.StepDone, task.StepRunning)) {
+		t.Error("not cancellable while the schema is made local")
+	}
+}
+
+func TestMoveRecordEnds(t *testing.T) {
+	for phase, want := range map[string]bool{"preparing": false, "copying": false, "catching_up": false, "switching": false, "cleaning": true, "done": true, "failed": true, "cancelled": true} {
+		if got := (moveRecord{Phase: phase}).terminal(); got != want {
+			t.Errorf("%s terminal %v", phase, got)
+		}
+	}
+	for phase, want := range map[string]bool{"preparing": true, "copying": true, "catching_up": true, "switching": false, "cleaning": false} {
+		if got := (moveRecord{Phase: phase}).stoppable(); got != want {
+			t.Errorf("%s stoppable %v", phase, got)
+		}
+	}
+	var coded task.Coded = moveCancelled{group: 3}
+	if coded.TaskCode() != task.CodeCanceled || coded.TaskRetryable() {
+		t.Error("an undone move fails with the code cancelled")
+	}
+}

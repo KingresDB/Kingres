@@ -337,6 +337,9 @@ func (s *Server) listTasks(_ *call, w http.ResponseWriter, r *http.Request) erro
 	if err != nil {
 		return s.storeProblem(r, err, "")
 	}
+	for i := range v.Items {
+		v.Items[i] = withCancelGuard(v.Items[i])
+	}
 	s.writeJSON(w, r, http.StatusOK, v)
 	return nil
 }
@@ -351,6 +354,7 @@ func (s *Server) getTask(_ *call, w http.ResponseWriter, r *http.Request) error 
 	if err != nil {
 		return s.storeProblem(r, err, "Task "+r.PathValue("taskId")+" does not exist.")
 	}
+	t = withCancelGuard(t)
 	s.writeJSON(w, r, http.StatusOK, t)
 	return nil
 }

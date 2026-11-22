@@ -1069,6 +1069,8 @@ first step that is not recorded `done`. What the engine promises:
 - A `NonIdempotent` step that was recorded `running` but not `done` is **not** run again: the task fails with the
   code `step_interrupted` (not retryable) and names the step, because it is unknown whether the effect happened. The
   steps after it do not run. A crash before the `running` record leaves the step untouched, so it runs once.
+  A step that can read its own effect has a `Recover` (`task.Step.Recover`): it is asked first, `true` records the step `done` without
+  running it, `false` (the effect is provably not there) runs it, and an error is `step_interrupted` as before. A step that cannot tell must not have one.
 - A task whose process died is never lost and never stays `running` forever: once the lease expired it is resumed or
   failed as above, as long as some server runs the engine. A task that has all steps `done` is recorded `done`.
 - Secrets live only in the process that started the task; a resumed step that needs one fails with
@@ -1082,7 +1084,7 @@ hook end the process: `crash_test.go` simulates the death with a store that refu
 (`TestTaskEngineSurvivesAKilledProcess`, real PostgreSQL, WSL) starts the test binary as helper processes that
 `os.Exit(137)` at each point, then a second process takes the task over; the steps count their runs in a side file.
 The real task `server.add` is killed with SIGKILL at each of its steps by `TestJoinInterruptedAtEveryStepResumes`.
-No task kind of the product is marked `NonIdempotent` today (all steps check what exists before they create).
+Only the two steps of the distributed schemas that call the extension once (`Make the schema distributed`, `Make the schema local`) are marked `NonIdempotent`, with a `Recover` (see Distributed schemas); every other step checks what exists before it creates.
 
 ## Not done in this increment, and the manager's state on a leader change
 
@@ -3565,13 +3567,24 @@ Design: [shard-phase11.md](../docs/design/shard-phase11.md), sections 13 and 16.
 - **Tasks** (subject type `schema`, id `database/schema`, one unfinished task per schema): `schema.distribute` (`Check the schema`, `Set REPLICA IDENTITY FULL` when asked, `Make the schema distributed` through `distribute_schema`, `Verify on every server`),
   `schema.move` (`Check the move`, `Copy the data` through `move_schema` in a session of its own with the phase of `bucket_move` as detail, `Switch`, `Clean up the old copy`; cancelled with `cancel_bucket_move` until the switch, the task does not wait for the
   old copy to be emptied) and `schema.undistribute` (`Check the schema`, `Move first` when a target is given, `Make the schema local`, `Verify on every server`). A step that repeats after a restart reads the catalog first and does nothing when its result is there.
-  *Departure from the design:* `Make the schema distributed` is not marked `NonIdempotent`; it reads `kingres.schemas` first, which is the design's own remedy and makes a repeat harmless, so a crash does not fail the task with `step_interrupted`.
+  `Make the schema distributed` and `Make the schema local` are `NonIdempotent` with a `Recover`: a leader killed inside the call of the extension (which prepares a transaction on the other nodes first) leaves the step recorded `running`; the next leader reads whether the schema is distributed (or local), records the step `done` when it is, and otherwise asks `kingres.recover_prepared_transactions()` to settle what the cut call left prepared before the call is made again.
 - **Refusals before a task exists:** `schema_not_distributable` (422, the objects in `errors`), `conflict` (already distributed, local, or the mode is `row`), `schema_move_in_progress`, `schema_pinned`, `rebalance_in_progress` (a move waits for a rebalance),
   422 `unprocessable` (target group missing, not receiving, or the current one; tables without a key unless `setReplicaIdentityFull`).
+- **Tables that a move cannot copy** are those whose replica identity is NOTHING (a primary key does not help) and those with the default identity and no primary key; the 422 names every one of them in `errors` (code `replica_identity_missing`) and in its text.
+  The same check, without the way out, refuses a `Make local` that names a group to move to first (`undistributeSchema` has no `setReplicaIdentityFull`): no task is made that would fail in its second step.
+- **Exclusion.** Migration `0041_schema_tasks_exclusion.sql` is a second trigger on `kingres_cp.task`: the three schema kinds and a failover (or the restore of preferred primaries) exclude each other (KX007 for the schema task, KX006 for the failover), and `schema.move` and
+  `schema.undistribute` (which may move the schema first) and a rebalance exclude each other (KX002, KX001); `schema.distribute` moves nothing and lives beside a rebalance. The answer is 409 `operation_in_progress` naming the other kind (a rebalance that is refused keeps
+  `rebalance_in_progress`); `task.MemStore` follows the same rules. A paused failover or rebalance still excludes, as for the other kinds.
+- **Cancel.** The step `Copy the data` (and `Move first`) is not interruptible: it polls the cancel mark itself (`task.Env.CancelRequested`) and asks the extension to stop the move only while the phase is `preparing`, `copying` or `catching_up` (`cancel_bucket_move`).
+  The answer is truthful: the extension undid the move and the task **fails with the code `cancelled`** and says the schema is unchanged, on its old group; or the request came in the switch (the extension refuses), the task goes on, ends `done` and says so in its detail.
+  The guard (`moveCancellable`, `undistributeCancellable`) refuses a request (409 `task_not_cancellable`) from the phase `switching` on, read from the detail the step records, and once the copy step is done; the mark of a request that arrived before is not followed.
+  A cancel of a `Make local` that is moving first is a cancel of that move; once `Make the schema local` has started, there is nothing to cancel. `getTask`, `listTasks` and the answer of the cancel narrow `cancellable` with the guard of the kind (`withCancelGuard`), so the console shows no Cancel button for a move that is switching.
+- **After a leader change** the copy step finds the move that the dead leader left in `kingres.bucket_move`: one to the same group is followed (after `resume_bucket_moves()`, up to ten minutes for the extension's own recovery), one to another group is a `schema_move_in_progress`,
+  and a move that ended `failed` is started again, up to three times, unless a person asked to cancel.
 - **The sharding mode.** `createDatabase` takes `sharding.mode` and `distributeNewSchemas` and calls `kingres.set_sharding_mode` after the extension is installed; `updateDatabase` changes them synchronously, and a refusal of the extension is 409 `sharding_mode_in_use`.
   `Database.sharding` shows `mode` and `distributeNewSchemas` (read from `kingres.sharding_settings`), `bucketCount` is null in mode `schema`, `stats.distributedSchemaCount` counts `kingres.dist_schema`, `getDatabaseCreateOptions` lists `shardingModes`.
   `listColocationGroups` has `kind` and `schemaName`.
 - **Not done:** `inFlightMoves[].kind` and `schemaName` of the rebalance status, `BucketDistribution.servers[].primarySchemas`, the schema units in the rebalance plan (the extension does not plan them yet), and the schema moves made by a drain (a drain moves buckets only; schemas stay on the server).
 
 Tests: `internal/ops/schemas_test.go` (blockers, error mapping, hostile names, the cancel guard) and the cluster test `internal/clustertest/schemas_test.go` (list, blockers, distribute, move with the rows checked, make local, the replica identity,
-the mode refusal), which needs the 0.8 extension in the installation of the tests.
+the mode refusal), `internal/clustertest/schemas_tasks_test.go` (tables a move cannot copy, the cancel before and after the switch, the exclusion of a rebalance and a failover, a move followed after the leader was killed, the distribute step killed before and after its effect), `internal/task/recover_test.go` (`Recover`, `CancelRequested`, the exclusion in the memory store) and `internal/rebalance/failover_exclusion_pg_test.go` (the trigger of migration 0041); they need the 0.8 extension in the installation of the tests.

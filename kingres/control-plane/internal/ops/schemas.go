@@ -214,11 +214,14 @@ func (o *Ops) GetSchema(ctx context.Context, db, name string) (api.SchemaDetail,
 	return d, nil
 }
 
-// keylessTables are the tables that have no primary key and no replica identity index or FULL: a move cannot replicate them.
+// keylessTables are the tables that a move cannot replicate: the replica identity is NOTHING (whatever keys the table has, an
+// update or a delete carries no old row), or it is the default and the table has no primary key. A table with an identity index
+// or FULL is not listed.
 func keylessTables(ctx context.Context, c *pgx.Conn, schema string) ([]string, error) {
 	rows, err := c.Query(ctx, `SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE n.nspname = $1 AND c.relkind IN ('r', 'p') AND NOT c.relispartition AND c.relreplident IN ('d', 'n')
-		AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary) ORDER BY c.relname COLLATE "C"`, schema)
+		WHERE n.nspname = $1 AND c.relkind IN ('r', 'p') AND NOT c.relispartition
+		AND (c.relreplident = 'n' OR (c.relreplident = 'd'
+			AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary))) ORDER BY c.relname COLLATE "C"`, schema)
 	if err != nil {
 		return nil, err
 	}
@@ -361,20 +364,31 @@ func (o *Ops) PrepareMoveSchema(ctx context.Context, db, schema string, req api.
 		if o.rebalanceActive(ctx) {
 			return problem.New(problem.RebalanceInProgress, "A rebalance is running; a move of a schema waits for it.")
 		}
-		keyless, err := keylessTables(ctx, c, schema)
-		if err != nil {
-			return PGProblem(err)
-		}
-		if len(keyless) > 0 && !req.SetReplicaIdentityFull {
-			p := problem.New(problem.Unprocessable, "Tables without a primary key or replica identity cannot be moved; set REPLICA IDENTITY FULL on them (setReplicaIdentityFull).")
-			for _, t := range keyless {
-				p.Errors = append(p.Errors, problem.FieldError{Field: t, Message: "no primary key and no replica identity", Code: "replica_identity_missing"})
+		if !req.SetReplicaIdentityFull {
+			if err := refuseKeyless(ctx, c, schema, "Tables without a primary key or replica identity cannot be moved; set REPLICA IDENTITY FULL on them (setReplicaIdentityFull)"); err != nil {
+				return err
 			}
-			return p
 		}
 		return o.refusePin(ctx, c, s.Distribution.ColocationID)
 	})
 	return in, err
+}
+
+// refuseKeyless is the 422 of a move of a schema that has tables the move cannot replicate: the text says what to do and every table
+// is an entry of errors (code replica_identity_missing). nil when there is none.
+func refuseKeyless(ctx context.Context, c *pgx.Conn, schema, what string) error {
+	keyless, err := keylessTables(ctx, c, schema)
+	if err != nil {
+		return PGProblem(err)
+	}
+	if len(keyless) == 0 {
+		return nil
+	}
+	p := problem.New(problem.Unprocessable, fmt.Sprintf("%s: %s.", what, strings.Join(keyless, ", ")))
+	for _, t := range keyless {
+		p.Errors = append(p.Errors, problem.FieldError{Field: t, Message: "no primary key and no replica identity", Code: "replica_identity_missing"})
+	}
+	return p
 }
 
 // cleaningMove refuses an operation on a schema whose last move has not finished its cleaning: the old copy is emptied after
@@ -425,6 +439,13 @@ func (o *Ops) PrepareUndistributeSchema(ctx context.Context, db, schema string, 
 			if !ok {
 				return problem.New(problem.Unprocessable, fmt.Sprintf("Shard group %d does not exist or should not hold shards.", *target))
 			}
+			// the move first is a move: its tables need a key as much as a move of their own (the request has no setReplicaIdentityFull)
+			if err := refuseKeyless(ctx, c, schema, "Tables without a primary key or replica identity cannot be moved first; move the schema with setReplicaIdentityFull, or add a key"); err != nil {
+				return err
+			}
+			if o.rebalanceActive(ctx) {
+				return problem.New(problem.RebalanceInProgress, "A rebalance is running; moving a schema first waits for it.")
+			}
 			in.Target, in.HasTarget = *target, true
 		}
 		return nil
@@ -454,31 +475,74 @@ func (o *Ops) schemaDefinitions() []task.Definition {
 		{Kind: KindSchemaDistribute, Steps: []task.Step{
 			{Name: stepSchemaCheck, Run: o.sDistCheck},
 			{Name: stepSchemaIdentity, Run: o.sDistIdentity},
-			{Name: stepSchemaMake, NonIdempotent: false, Run: o.sDistMake},
+			// distribute_schema is one call that creates the schema on every node and registers it, in a transaction that is
+			// prepared on the other nodes first: a run that ended in it asks the catalog whether it took effect, and settles what
+			// a cut call left prepared before it runs the call again (Recover).
+			{Name: stepSchemaMake, NonIdempotent: true, Run: o.sDistMake, Recover: o.recoverDistribute},
 			{Name: stepSchemaVerify, Run: o.sVerifyDistributed},
 		}},
 		{Kind: KindSchemaMove, Steps: []task.Step{
 			{Name: stepMoveCheck, Run: o.sMoveCheck},
-			{Name: stepMoveCopy, Interruptible: true, Run: o.sMoveRun},
+			// Not interruptible: the engine would end the task as cancelled while the extension goes on with the move. The step
+			// asks the extension to stop (before its switch) and says truthfully what happened (see runSchemaMove).
+			{Name: stepMoveCopy, Run: o.sMoveRun},
 			{Name: stepMoveSwitch, Run: o.sMoveSwitch},
 			{Name: stepMoveClean, Run: o.sMoveClean},
 		}, Cancellable: moveCancellable},
 		{Kind: KindSchemaUndistribute, Steps: []task.Step{
 			{Name: stepUndistCheck, Run: o.sUndistCheck},
 			{Name: stepUndistMoveFirst, Run: o.sUndistMoveFirst},
-			{Name: stepUndistMake, Run: o.sUndistMake},
+			{Name: stepUndistMake, NonIdempotent: true, Run: o.sUndistMake, Recover: o.recoverUndistribute},
 			{Name: stepSchemaVerify, Run: o.sVerifyLocal},
-		}},
+		}, Cancellable: undistributeCancellable},
 	}
 }
 
-// moveCancellable: a cancel is accepted until the switch has started (design 13.1).
+// moveSwitchedDetail are the prefixes of the detail of a task that moves a schema once the move is in or past its switch (the
+// phases of the extension's record). From the phase switching the move rolls forward only, so a cancel request is refused, and the
+// mark of one that arrived before is not followed.
+var moveSwitchedDetail = []string{"switching", "cleaning", "done", moveTooLateText}
+
+// moveTooLateText is the detail of a move whose cancel request could not stop it (it came in or after the switch).
+const moveTooLateText = "The cancel request came too late"
+
+func switchPassed(detail string) bool {
+	for _, p := range moveSwitchedDetail {
+		if strings.HasPrefix(detail, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// moveCancellable: a cancel is accepted until the switch of the extension has started. The switch happens inside the call of the
+// copy step, so the guard looks at the phase that the step records in the detail, and at the steps: once the copy step is done the
+// schema is on its target and there is nothing left to cancel (design 13.1).
 func moveCancellable(t task.Task) bool {
-	switch stepState(t, stepMoveSwitch) {
-	case task.StepDone, task.StepRunning:
+	for _, name := range []string{stepMoveCopy, stepMoveSwitch, stepMoveClean} {
+		if stepState(t, name) == task.StepDone {
+			return false
+		}
+	}
+	for _, name := range []string{stepMoveSwitch, stepMoveClean} {
+		if stepState(t, name) == task.StepRunning {
+			return false
+		}
+	}
+	return !switchPassed(t.Detail)
+}
+
+// undistributeCancellable: the move first is cancellable as a move is, and the task between the move first and the making of the
+// schema local too (the schema then stays distributed on its new group); the making local is not.
+func undistributeCancellable(t task.Task) bool {
+	switch stepState(t, stepUndistMake) {
+	case task.StepRunning, task.StepDone:
 		return false
 	}
-	return stepState(t, stepMoveClean) != task.StepDone
+	if stepState(t, stepUndistMoveFirst) == task.StepRunning {
+		return !switchPassed(t.Detail)
+	}
+	return true
 }
 
 func schemaIn(env *task.Env) (schemaInput, error) { return inputOf[schemaInput](env.Task) }
@@ -546,6 +610,49 @@ func (o *Ops) sDistMake(ctx context.Context, env *task.Env) error {
 		_, err := c.Exec(ctx, `SELECT kingres.distribute_schema($1::regnamespace, $2::int)`, quoteIdent(in.Schema), g)
 		return schemaError(err)
 	})
+}
+
+// recoverDistribute and recoverUndistribute are the Recover of the two steps that call the extension once and must not call it twice:
+// they read whether the call took effect (the schema is distributed, or local). When it did not, what the cut call left prepared on
+// the other nodes is settled first (kingres.recover_prepared_transactions), because a prepared transaction holds locks that would
+// make the call that runs again wait or fail.
+func (o *Ops) recoverDistribute(ctx context.Context, env *task.Env) (bool, error) {
+	return o.recoverCall(ctx, env, true)
+}
+
+func (o *Ops) recoverUndistribute(ctx context.Context, env *task.Env) (bool, error) {
+	return o.recoverCall(ctx, env, false)
+}
+
+func (o *Ops) recoverCall(ctx context.Context, env *task.Env, wantDistributed bool) (bool, error) {
+	in, err := schemaIn(env)
+	if err != nil {
+		return false, err
+	}
+	took := false
+	err = o.withDB(ctx, in.Database, func(c *pgx.Conn) error {
+		rows, err := o.schemaRows(ctx, c, in.Schema)
+		if err != nil {
+			return err
+		}
+		if len(rows) == 0 && !wantDistributed {
+			// a schema made local on another group is not on the map group any more
+			took = true
+			return nil
+		}
+		if len(rows) != 1 {
+			return errors.New("the schema is not there")
+		}
+		if (rows[0].Distribution != nil) == wantDistributed {
+			took = true
+			return nil
+		}
+		if _, err := c.Exec(ctx, `SELECT kingres.recover_prepared_transactions()`); err != nil {
+			return PGProblem(err)
+		}
+		return nil
+	})
+	return took, err
 }
 
 // schemaError maps an error of the extension to a problem.
@@ -629,62 +736,249 @@ func (o *Ops) sMoveRun(ctx context.Context, env *task.Env) error {
 	return o.runSchemaMove(ctx, env, in)
 }
 
+// moveRecord is the extension's record of a move of the schema's bucket (kingres.bucket_move).
+type moveRecord struct {
+	ID            int64
+	Phase, Detail string
+	Source        int32
+	Target        int32
+}
+
+// terminal: the move has ended (cleaning is the end of the work of a move: the schema is served by the target and the old copy is
+// emptied after kingres_shard.move_cleanup_delay).
+func (m moveRecord) terminal() bool {
+	switch m.Phase {
+	case "cleaning", "done", "failed", "cancelled":
+		return true
+	}
+	return false
+}
+
+// movePhases that a cancel can still stop (the extension refuses cancel_bucket_move in the others).
+func (m moveRecord) stoppable() bool {
+	return m.Phase == "preparing" || m.Phase == "copying" || m.Phase == "catching_up"
+}
+
+const (
+	// moveWaitMax is how long a run waits for the extension to settle a move that an earlier run left (the session that ran it
+	// is gone; resume_bucket_moves undoes it or finishes it).
+	moveWaitMax = 10 * time.Minute
+	// moveEndWait is how long a run waits for the call to return after the record has ended (the call drops the replication; what
+	// it leaves, the recovery repeats).
+	moveEndWait = 3 * time.Minute
+	// moveTries is how many times a move that ended without effect (failed) is started again.
+	moveTries = 3
+)
+
+// latestMove reads the newest record of the schema's colocation group with an id above after.
+func latestMove(ctx context.Context, c *pgx.Conn, colo int32, after int64) (moveRecord, bool, error) {
+	var m moveRecord
+	err := c.QueryRow(ctx, `SELECT move_id, phase, coalesce(detail, ''), source_group, target_group FROM kingres.bucket_move
+		WHERE colocation_id = $1 AND move_id > $2 ORDER BY move_id DESC LIMIT 1`, colo, after).Scan(&m.ID, &m.Phase, &m.Detail, &m.Source, &m.Target)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return m, false, nil
+	}
+	return m, err == nil, err
+}
+
+// moveCancelled is the end of a move that a cancel stopped before its switch and the extension undid: the task fails with the code
+// cancelled and says that the schema is where it was.
+type moveCancelled struct{ group int32 }
+
+func (e moveCancelled) Error() string {
+	return fmt.Sprintf("The move was cancelled before its switch and undone: the schema is unchanged, on shard group %d.", e.group)
+}
+func (moveCancelled) TaskCode() string    { return task.CodeCanceled }
+func (moveCancelled) TaskRetryable() bool { return false }
+
+// runSchemaMove makes the schema moved to the target and returns when the switch is done (the phase is cleaning or done). It is the
+// work of the step "Copy the data" and, for make local, of "Move first". It is safe to run again after a leader change: a schema that
+// is on its target is done, a move that an earlier run left is followed (after the extension was asked to settle it), and a move that
+// ended without effect is started again, up to three times.
+//
+// A cancel is the step's own business (the engine looks at the mark only between steps, and the step is not interruptible: the engine
+// would end the task as cancelled while the extension goes on). Before the switch the step asks the extension to stop, and the
+// answer is truthful: the move was undone (the task fails with the code cancelled), or it came too late and the task goes on to its
+// end with the note in its detail.
 func (o *Ops) runSchemaMove(ctx context.Context, env *task.Env, in schemaInput) error {
 	var colo int32
-	var done bool
+	var onTarget bool
 	if err := o.withDB(ctx, in.Database, func(c *pgx.Conn) error {
 		s, err := o.distributedRow(ctx, c, in.Database, in.Schema)
 		if err != nil {
 			return err
 		}
 		colo = s.Distribution.ColocationID
-		done = s.Distribution.ShardGroupID == in.Target && s.Distribution.State == "active"
-		if !done && in.ReplicaIDFull {
+		onTarget = s.Distribution.ShardGroupID == in.Target && s.Distribution.State == "active"
+		if !onTarget && in.ReplicaIDFull {
 			return o.setIdentityFull(ctx, c, in.Schema)
 		}
 		return nil
 	}); err != nil {
 		return err
 	}
-	if done {
+	if onTarget {
 		return nil
 	}
-	finished := make(chan error, 1)
-	go func() {
-		finished <- o.withDB(context.WithoutCancel(ctx), in.Database, func(c *pgx.Conn) error {
-			_, err := c.Exec(context.WithoutCancel(ctx), `SELECT kingres.move_schema($1::regnamespace, $2::int)`, quoteIdent(in.Schema), in.Target)
-			return schemaError(err)
-		})
-	}()
-	for {
-		select {
-		case err := <-finished:
+	watch, err := o.Service.ServiceConn(ctx, in.Database)
+	if err != nil {
+		return connectProblem(err)
+	}
+	defer func() { _ = watch.Close(context.WithoutCancel(ctx)) }()
+	asked := false
+	for try := 0; try < moveTries; try++ {
+		s, err := o.distributedRow(ctx, watch, in.Database, in.Schema)
+		if err != nil {
 			return err
-		case <-ctx.Done():
-			// cancel a move that has not reached its switch; one that has runs to its end
-			_ = o.withDB(context.WithoutCancel(ctx), in.Database, func(c *pgx.Conn) error {
-				_, err := c.Exec(context.WithoutCancel(ctx), `SELECT kingres.cancel_bucket_move(move_id) FROM kingres.bucket_move
-					WHERE colocation_id = $1 AND phase IN ('preparing', 'copying', 'catching_up')`, colo)
-				return err
-			})
-			return ctx.Err()
-		case <-time.After(time.Second):
-			_ = o.withDB(ctx, in.Database, func(c *pgx.Conn) error {
-				var phase, detail *string
-				if err := c.QueryRow(ctx, `SELECT phase, detail FROM kingres.bucket_move WHERE colocation_id = $1 ORDER BY move_id DESC LIMIT 1`, colo).Scan(&phase, &detail); err == nil && phase != nil {
-					d := *phase
-					if detail != nil && *detail != "" {
-						d += " (" + *detail + ")"
-					}
-					if *phase == "switching" {
-						d = "Switching: writers of this schema wait. " + d
-					}
-					_ = env.SetDetail(ctx, d)
-				}
-				return nil
-			})
+		}
+		if s.Distribution.ShardGroupID == in.Target && s.Distribution.State == "active" {
+			return nil
+		}
+		left, found, err := latestMove(ctx, watch, colo, 0)
+		if err != nil {
+			return PGProblem(err)
+		}
+		var end moveRecord
+		if found && !left.terminal() {
+			// a move that an earlier run started: its session may be gone, the extension settles those
+			if left.Target != in.Target {
+				return problem.New(problem.SchemaMoveInProgress, fmt.Sprintf("Schema %q is already moving to shard group %d.", in.Schema, left.Target))
+			}
+			_, _ = watch.Exec(ctx, `SELECT kingres.resume_bucket_moves()`)
+			end, err = o.followMove(ctx, env, watch, colo, left.ID-1, nil, moveWaitMax, &asked)
+		} else {
+			var mark int64
+			if found {
+				mark = left.ID
+			}
+			errc := make(chan error, 1)
+			// The call is made in a session of its own that stays open until the move has ended: its live mark is a session
+			// lock, which is how the extension tells a running move from an abandoned one.
+			go func() {
+				errc <- o.withDB(context.WithoutCancel(ctx), in.Database, func(c *pgx.Conn) error {
+					_, err := c.Exec(context.WithoutCancel(ctx), `SELECT kingres.move_schema($1::regnamespace, $2::int)`, quoteIdent(in.Schema), in.Target)
+					return schemaError(err)
+				})
+			}()
+			end, err = o.followMove(ctx, env, watch, colo, mark, errc, 0, &asked)
+		}
+		if err != nil {
+			return err
+		}
+		switch end.Phase {
+		case "cleaning", "done":
+			if asked {
+				// the request was accepted and the move completed all the same: the extension looked after its switch
+				_ = env.SetDetail(ctx, moveTooLateText+": the move had passed the point where it can be undone, and it completed")
+			}
+			return nil
+		case "cancelled":
+			return moveCancelled{group: end.Source}
+		}
+		// failed: look again, and start again unless a person asked to stop it
+		if asked || try == moveTries-1 {
+			return fmt.Errorf("the move failed: %s", end.Detail)
 		}
 	}
+	return errors.New("the move did not end in a switch")
+}
+
+// followMove polls the record of the move until it has ended and the call that runs it (errc; nil when no call of this run does) has
+// returned, reports the phase in the detail of the task, and asks the extension to stop the move when a cancel was requested and the
+// move has not reached its switch. bound > 0 limits how long it waits for a move that nobody of this run drives. asked is set when a
+// cancel request was handed to the extension.
+func (o *Ops) followMove(ctx context.Context, env *task.Env, watch *pgx.Conn, colo int32, mark int64, errc <-chan error, bound time.Duration, asked *bool) (moveRecord, error) {
+	var (
+		last     moveRecord
+		have     bool
+		callErr  error
+		callDone = errc == nil
+		tooLate  bool
+		lastText string
+		started  = time.Now()
+		endSeen  time.Time
+	)
+	for {
+		if callDone && have && last.terminal() {
+			return last, nil
+		}
+		if bound > 0 && time.Since(started) > bound {
+			return last, fmt.Errorf("the move is still not settled after %s; run kingres.resume_bucket_moves() on the map group primary and check kingres.check_cluster()", bound)
+		}
+		select {
+		case <-ctx.Done():
+			// a lost lease or a shutdown, not a cancel: the extension owns the move and the next holder of the task follows it
+			return last, ctx.Err()
+		case callErr = <-errc:
+			callDone = true
+			errc = nil
+		case <-time.After(time.Second):
+		}
+		m, found, err := latestMove(ctx, watch, colo, mark)
+		if err != nil {
+			return last, PGProblem(err)
+		}
+		if found {
+			last, have = m, true
+		}
+		if callDone && !have {
+			// the call ended without recording a move: it refused
+			if callErr != nil {
+				return last, callErr
+			}
+			return last, errors.New("the move was not recorded")
+		}
+		if !have {
+			continue
+		}
+		if last.terminal() && !callDone {
+			// the switch is done; what the call still does is the dropping of the replication, which the recovery repeats
+			if endSeen.IsZero() {
+				endSeen = time.Now()
+			} else if time.Since(endSeen) > moveEndWait {
+				return last, nil
+			}
+		}
+		if !*asked && !tooLate && env.CancelRequested(ctx) {
+			if last.stoppable() {
+				if _, err := watch.Exec(ctx, `SELECT kingres.cancel_bucket_move($1)`, last.ID); err != nil {
+					// the extension refuses a move that is switching (or made): too late, the move goes on and the task with it
+					tooLate = true
+				} else {
+					*asked = true
+				}
+			} else if !last.terminal() {
+				tooLate = true // switching
+			}
+		}
+		text := last.Phase + ": " + movePhaseText(last)
+		if tooLate {
+			text = moveTooLateText + " (" + text + ")"
+		}
+		if text != lastText {
+			lastText = text
+			_ = env.SetDetail(ctx, text)
+		}
+	}
+}
+
+func movePhaseText(m moveRecord) string {
+	switch m.Phase {
+	case "preparing":
+		return "checking and recording the move"
+	case "copying":
+		return fmt.Sprintf("copying the rows to shard group %d", m.Target)
+	case "catching_up":
+		return fmt.Sprintf("the copy on shard group %d catches up with the changes", m.Target)
+	case "switching":
+		return "the writers of this schema wait for the switch"
+	case "cleaning":
+		return "the schema is served by its new group; the old copy is emptied after kingres_shard.move_cleanup_delay"
+	}
+	if m.Detail != "" {
+		return m.Detail
+	}
+	return "move " + m.Phase
 }
 
 // sMoveSwitch checks that the schema is on the target (the switch happens inside the extension's call).
