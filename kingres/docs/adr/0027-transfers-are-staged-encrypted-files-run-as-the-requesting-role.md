@@ -22,7 +22,7 @@ archive into a new database. Four facts of the code decide how:
 
 ## Decision
 
-1. **An export is a task that writes a staged file; the browser downloads the file.** The file lives on the leader, is
+1. **An export is a task that writes a staged file; the browser downloads the file.** The work is released in three phases (14a table transfers, 14b database export and validation, 14c database import); an import is one explicit transaction with a commit intent, and batches are deferred until they can be made exactly-once with a marker in the same transaction. The file lives on the leader, is
    sealed segment by segment with AES-256-GCM under a per-file key wrapped by a master key outside the staging
    directory, has a retention time (24 hours by default), a quota and a free-space reserve, and is served with
    `Range` through a streaming relay from any server. The audit event carries the final size and SHA-256.
@@ -34,7 +34,7 @@ archive into a new database. Four facts of the code decide how:
    dangerous roles that the workbench applies, statement by statement, after the whole plan was lexed and checked
    against an allowlist, on a connection to the new database that the import created and marked. Distribution, ledger
    and time-partition policies are recreated from a structured catalog document with the service role, never from SQL
-   in the archive. Code (functions, triggers) is refused unless the request asks for it and says so in words.
+   in the archive. Code (functions, triggers) is **refused always**, and the archive's statements are accepted only by a shape grammar that consumes whole statements (review DXR-04, DXR-22); the guarantee rests on PostgreSQL's privileges.
 4. **A leader change ends a transfer** (`transfer_leader_changed`, retryable) and nothing is adopted by a new leader;
    a failed database import drops only the database that carries its own marker.
 

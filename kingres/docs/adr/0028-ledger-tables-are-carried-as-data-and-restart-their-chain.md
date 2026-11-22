@@ -21,7 +21,7 @@ people read "ledger" as "tamper evident" and a copy is not the original chain.
    its chain, read without writing (no digest is generated).
 2. The history rows of an updatable table are exported as a data entry for the record and are **not loaded**.
 3. A ledger table is **imported** by loading its rows first and then calling `ledger_enable(table, mode)`, which enters
-   every existing row as the first entries of a **new chain**. The policy `required` of the source is not restored.
+   every existing row as the first entries of a **new chain**. The ledger policy of the source (`required`) is set again after the load and the verification, and the report says which tables had it; time-partition policies come back disabled.
 4. The import is **refused unless the request says `acknowledgeLedgerRestart: true`** when the archive has a ledger table;
    the refusal names the tables.
 5. On the new database `ledger_verify()` verifies the new chain and returns no rows. It says nothing about the source's
