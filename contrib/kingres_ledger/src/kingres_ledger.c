@@ -24,7 +24,9 @@
 #include "access/table.h"
 #include "catalog/namespace.h"
 #include "catalog/objectaddress.h"
+#include "catalog/pg_am_d.h"
 #include "catalog/pg_class.h"
+#include "commands/defrem.h"
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "lib/stringinfo.h"
@@ -324,6 +326,33 @@ kl_check_distributed_owner(Oid relid)
 }
 
 /*
+ * kl_check_storage
+ *		A ledger table is a heap table (design analytics-phase12-storage 9.6, rule L1).  The capture code writes the history
+ *		row through the table access method and reads old tuples as heap tuples, the row hashes are recomputed from heap
+ *		tuples, and nothing of it is tested against another storage, so a table of another access method (columnar) cannot be
+ *		put under the ledger.  The reverse is the event trigger: ALTER TABLE ... SET ACCESS METHOD rewrites the table, and a
+ *		rewrite of a ledger table is rejected.
+ */
+static void
+kl_check_storage(Oid relid)
+{
+	HeapTuple	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	Oid			am;
+
+	if (!HeapTupleIsValid(tp))
+		return;
+	am = ((Form_pg_class) GETSTRUCT(tp))->relam;
+	ReleaseSysCache(tp);
+	if (OidIsValid(am) && am != HEAP_TABLE_AM_OID)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("table \"%s\" uses the access method \"%s\" and cannot be a ledger table",
+						get_rel_name(relid), get_am_name(am)),
+				 errdetail("The ledger is built and verified for heap tables: its capture trigger and its row hashes read heap tuples."),
+				 errhint("Use a heap table for the ledger.")));
+}
+
+/*
  * kingres.ledger_lock_table(relation regclass) returns void
  *		Lock a table in SHARE ROW EXCLUSIVE mode, by OID, on behalf of the role
  *		that called ledger_enable.  The caller must own the table.  Locking by
@@ -352,6 +381,7 @@ kingres_ledger_lock_table(PG_FUNCTION_ARGS)
 	kl_check_lock_order(KL_REGISTRY_LOCK_SUBID);
 	LockRelationOid(relid, ShareRowExclusiveLock);
 	kl_check_owner(relid);
+	kl_check_storage(relid);
 
 	/*
 	 * The identifier of the table is the next free one of the registry, taken

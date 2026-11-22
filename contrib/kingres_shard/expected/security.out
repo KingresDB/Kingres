@@ -226,7 +226,7 @@ SELECT * FROM kingres.table_change_report('distribute', 'sec_t', '{"column":"id"
 ERROR:  permission denied for function table_change_report
 SELECT kingres.internal_copy_routed('sec_t', 'public', 'sec_t', 'every_node');
 ERROR:  permission denied for function internal_copy_routed
-SELECT kingres.internal_require_version('0.8');
+SELECT kingres.internal_require_version('0.9');
 ERROR:  permission denied for function internal_require_version
 SELECT kingres.create_distributed_table('sec_t', 'id');
 ERROR:  permission denied for function create_distributed_table

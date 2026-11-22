@@ -1297,3 +1297,29 @@ kingres_shard_extension_version(const char *name)
 	ReleaseSysCache(etup);
 	return version;
 }
+
+/*
+ * Is the installed extension of this name one that the list of design 5.5 accepts: in the list, allowed by
+ * kingres_shard.shippable_extensions, and at a version the list names?  (count_distinct.c asks it before it rewrites a statement to
+ * use the functions of kingres_sketch.)
+ */
+bool
+kingres_shard_extension_usable(const char *name)
+{
+	const KsShippableExtension *e = NULL;
+	char	   *version;
+	int			i;
+
+	for (i = 0; shippable_extensions[i].name != NULL; i++)
+		if (strcmp(shippable_extensions[i].name, name) == 0)
+			e = &shippable_extensions[i];
+	if (e == NULL || !ext_setting_allows(name))
+		return false;
+	version = kingres_shard_extension_version(name);
+	if (version == NULL)
+		return false;
+	for (i = 0; e->versions[i] != NULL; i++)
+		if (strcmp(e->versions[i], version) == 0)
+			return true;
+	return false;
+}
