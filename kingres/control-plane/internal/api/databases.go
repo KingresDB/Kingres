@@ -23,9 +23,9 @@ type ShardingSettings struct {
 	// BucketCount is the number of hash buckets per colocation group; null
 	// when not available.
 	BucketCount *int `json:"bucketCount"`
-	// Mode is row, schema or both (contract 0.16.0, optional); BucketCount is null in mode schema.
+	// Mode is row, schema or both (contract 0.15.0, optional); BucketCount is null in mode schema.
 	Mode string `json:"mode,omitempty"`
-	// DistributeNewSchemas tells whether a new schema is placed on a shard group by itself (contract 0.16.0, optional).
+	// DistributeNewSchemas tells whether a new schema is placed on a shard group by itself (contract 0.15.0, optional).
 	DistributeNewSchemas *bool `json:"distributeNewSchemas,omitempty"`
 }
 
@@ -49,7 +49,7 @@ type LedgerSettings struct {
 type DatabaseStats struct {
 	// SizeBytes is the size of the database.
 	SizeBytes *int64 `json:"sizeBytes"`
-	// DistributedSchemaCount is the number of distributed schemas (contract 0.16.0, optional).
+	// DistributedSchemaCount is the number of distributed schemas (contract 0.15.0, optional).
 	DistributedSchemaCount *int `json:"distributedSchemaCount,omitempty"`
 	// TableCount is the number of user tables.
 	TableCount *int `json:"tableCount"`
@@ -207,14 +207,14 @@ type ColocationGroup struct {
 	TableCount int `json:"tableCount"`
 	// SizeBytes is the size of the group's data; null when not available.
 	SizeBytes *int64 `json:"sizeBytes"`
-	// BaseBucketCount is the number of buckets the group was made with (contract 0.16.0, optional); BucketCount is the
+	// BaseBucketCount is the number of buckets the group was made with (contract 0.15.0, optional); BucketCount is the
 	// current number, which a split raises.
 	BaseBucketCount *int `json:"baseBucketCount,omitempty"`
-	// MaxModulus is the greatest modulus of a bucket of the group (contract 0.16.0, optional).
+	// MaxModulus is the greatest modulus of a bucket of the group (contract 0.15.0, optional).
 	MaxModulus *int `json:"maxModulus,omitempty"`
-	// Kind is hash or schema (contract 0.16.0, optional): a schema group has one bucket and holds one distributed schema.
+	// Kind is hash or schema (contract 0.15.0, optional): a schema group has one bucket and holds one distributed schema.
 	Kind string `json:"kind,omitempty"`
-	// SchemaName is the distributed schema of a schema group, null for a hash group (contract 0.16.0, optional).
+	// SchemaName is the distributed schema of a schema group, null for a hash group (contract 0.15.0, optional).
 	SchemaName *string `json:"schemaName,omitempty"`
 }
 
@@ -241,7 +241,7 @@ type Bucket struct {
 	// MovingToShardGroupID is the destination while moving.
 	MovingToShardGroupID *int32 `json:"movingToShardGroupId"`
 	// Modulus and Remainder say which hashes the bucket holds: the remainder of the hash modulo the modulus; the
-	// remainder equals the bucket number (contract 0.16.0, optional).
+	// remainder equals the bucket number (contract 0.15.0, optional).
 	Modulus   *int `json:"modulus,omitempty"`
 	Remainder *int `json:"remainder,omitempty"`
 }
@@ -318,7 +318,7 @@ type DatabaseCreateOptions struct {
 	ReplicaCount int `json:"replicaCount"`
 	// DefaultDurability is the default durability level.
 	DefaultDurability string `json:"defaultDurability"`
-	// ShardingModes are the values of the sharding mode and ShardingModeDefault the default (contract 0.16.0, optional).
+	// ShardingModes are the values of the sharding mode and ShardingModeDefault the default (contract 0.15.0, optional).
 	ShardingModes       []string `json:"shardingModes,omitempty"`
 	ShardingModeDefault string   `json:"shardingModeDefault,omitempty"`
 	// LedgerDigestIntervalSeconds is the ledger digest interval range.

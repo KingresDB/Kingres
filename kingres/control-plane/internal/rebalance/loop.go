@@ -39,7 +39,7 @@ type Options struct {
 	Databases []string `json:"databases,omitempty"`
 	// MaxConcurrentMoves is accepted and recorded; this increment runs one move at a time.
 	MaxConcurrentMoves int `json:"maxConcurrentMoves,omitempty"`
-	// Strategy is byBucketCount or byDiskSize (contract 0.16.0); empty takes the cluster setting.
+	// Strategy is byBucketCount or byDiskSize (contract 0.15.0); empty takes the cluster setting.
 	Strategy string `json:"strategy,omitempty"`
 	// Threshold is the largest deviation from the ideal that is accepted, 0 to 1; nil takes the strategy's default.
 	Threshold *float64 `json:"threshold,omitempty"`

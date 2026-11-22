@@ -193,7 +193,7 @@ type Server struct {
 	// ShouldHaveShards tells whether rebalance may place buckets here.
 	ShouldHaveShards bool `json:"shouldHaveShards"`
 	// Weight is the capacity of the server relative to the others (contract
-	// 0.16.0, optional): a server of weight 2 receives twice the load of one of
+	// 0.15.0, optional): a server of weight 2 receives twice the load of one of
 	// weight 1. Absent from a cluster whose extension has no weights.
 	Weight *float64 `json:"weight,omitempty"`
 	// IsManagerLeader tells whether the active manager runs here.

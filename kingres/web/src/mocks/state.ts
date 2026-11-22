@@ -201,7 +201,7 @@ interface ServerRec {
   status: ServerStatus
   serverGroup: string | null
   shouldHaveShards: boolean
-  /** The capacity of the server relative to the others (contract 0.16.0); absent means 1. */
+  /** The capacity of the server relative to the others (contract 0.15.0); absent means 1. */
   weight?: number
   version: string
   joinedAt: string
@@ -406,7 +406,7 @@ export interface MockState {
 
 export const nowIso = (): string => new Date().toISOString()
 
-/** The automatic rebalance as a cluster that never changed it has it (contract 0.16.0): off. */
+/** The automatic rebalance as a cluster that never changed it has it (contract 0.15.0): off. */
 export const DEFAULT_AUTOMATIC: NonNullable<S['RebalanceSettings']['automatic']> = {
   enabled: false,
   strategy: 'byBucketCount',

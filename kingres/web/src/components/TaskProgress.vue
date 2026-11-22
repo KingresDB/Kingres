@@ -72,7 +72,7 @@ const errorHint = computed(() =>
   props.task?.kind.startsWith('ledger.key.') ? keyTaskErrorHint(props.task.error?.code) : null,
 )
 // A schema that became pinned during a task (a ledger table appeared), or that another move holds, ends the task with that code
-// (contract 0.16.0); it is shown as the problem notice of the code, as the request would have been refused with it.
+// (contract 0.15.0); it is shown as the problem notice of the code, as the request would have been refused with it.
 const schemaProblem = computed(() => {
   const error = props.task?.error
   if (!error || (error.code !== 'schema_pinned' && error.code !== 'schema_move_in_progress'))

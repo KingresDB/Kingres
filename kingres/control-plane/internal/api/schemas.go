@@ -3,7 +3,7 @@
 
 package api
 
-// Distributed schemas (contract 0.16.0, phase 11).
+// Distributed schemas (contract 0.15.0, phase 11).
 
 // SchemaDistribution says where a distributed schema lives.
 type SchemaDistribution struct {
@@ -58,7 +58,7 @@ type SchemaDetail struct {
 // DistributeSchemaRequest is the body of distributeSchema.
 type DistributeSchemaRequest struct {
 	ShardGroupID *int32 `json:"shardGroupId,omitempty"`
-	// SetReplicaIdentityFull makes the tables without a key movable (contract 0.16.0).
+	// SetReplicaIdentityFull makes the tables without a key movable (contract 0.15.0).
 	SetReplicaIdentityFull bool `json:"setReplicaIdentityFull,omitempty"`
 }
 

@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <script setup lang="ts">
-// The automatic rebalance (contract 0.16.0): off by default, changed by an administrator only (the button is a GateButton),
+// The automatic rebalance (contract 0.15.0): off by default, changed by an administrator only (the button is a GateButton),
 // shown to everyone who can read the cluster settings. The card says what the mode needs before it is switched on.
 import { computed, reactive, ref, watch } from 'vue'
 import { useMutation, useQueryClient } from '@tanstack/vue-query'

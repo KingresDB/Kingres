@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <script setup lang="ts">
-// Split a bucket (contract 0.16.0): the preview shows the new buckets, the disk the split needs and what stands in the
+// Split a bucket (contract 0.15.0): the preview shows the new buckets, the disk the split needs and what stands in the
 // way; a split is permanent (there is no merge), which is why the action needs the administrator role.
 import { computed, ref } from 'vue'
 import { useQuery } from '@tanstack/vue-query'

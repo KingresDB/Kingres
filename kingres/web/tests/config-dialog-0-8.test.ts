@@ -741,7 +741,7 @@ describe('restarting what waits', () => {
   })
 })
 
-describe('the warnings of the preview (contract 0.17.0)', () => {
+describe('the warnings of the preview (contract 0.16.0)', () => {
   it('shows an unusual memory value as a warning and leaves Apply on', async () => {
     const user = userEvent.setup()
     const { dialog: d } = await openEdit(user, 'work_mem')

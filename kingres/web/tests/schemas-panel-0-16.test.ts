@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
-// What the panel of the distributed schemas (contract 0.16.0) says beyond the dialogs of the first pass: the group and the replica
+// What the panel of the distributed schemas (contract 0.15.0) says beyond the dialogs of the first pass: the group and the replica
 // identity of a distribution, the setting "distribute new schemas" when the mode changes, the words of a schema task that ends in
 // a refusal or fails, and the schemas per server group on the Shards page. Against the mock API.
 import { describe, expect, it } from 'vitest'

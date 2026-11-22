@@ -10,7 +10,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ops"
 )
 
-// Distributed schemas (contract 0.16.0, design shard-phase11.md, section 13).
+// Distributed schemas (contract 0.15.0, design shard-phase11.md, section 13).
 
 func (s *Server) schemaHandlers() map[string]handlerFunc {
 	return map[string]handlerFunc{

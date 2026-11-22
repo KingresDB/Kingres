@@ -8,7 +8,7 @@ import "time"
 type RebalanceOptions struct {
 	Databases          []string `json:"databases,omitempty"`
 	MaxConcurrentMoves int      `json:"maxConcurrentMoves,omitempty"`
-	// Strategy is byBucketCount or byDiskSize (contract 0.16.0).
+	// Strategy is byBucketCount or byDiskSize (contract 0.15.0).
 	Strategy string `json:"strategy,omitempty"`
 	// Threshold is the largest accepted deviation from the ideal load, 0 to 1.
 	Threshold *float64 `json:"threshold,omitempty"`
@@ -23,7 +23,7 @@ type RebalanceOptions struct {
 }
 
 // RebalancePlanRequest is the body of previewRebalancePlan.
-// BucketSplitChild is one bucket a split makes (contract 0.16.0).
+// BucketSplitChild is one bucket a split makes (contract 0.15.0).
 type BucketSplitChild struct {
 	Bucket             int    `json:"bucket"`
 	Modulus            int    `json:"modulus"`
@@ -47,7 +47,7 @@ type BucketSplitRequest struct {
 	Verify string `json:"verify,omitempty"`
 }
 
-// DrainBlocker is something that stops a drain (contract 0.16.0).
+// DrainBlocker is something that stops a drain (contract 0.15.0).
 type DrainBlocker struct {
 	Code   string `json:"code"`
 	Detail string `json:"detail"`
@@ -60,7 +60,7 @@ type DrainLocalData struct {
 	SizeBytes    *int64 `json:"sizeBytes"`
 }
 
-// DrainPreview is the answer of previewServerDrain (contract 0.16.0).
+// DrainPreview is the answer of previewServerDrain (contract 0.15.0).
 type DrainPreview struct {
 	ServerID        string           `json:"serverId"`
 	CanDrain        bool             `json:"canDrain"`
@@ -75,7 +75,7 @@ type DrainPreview struct {
 	Warnings        []string         `json:"warnings"`
 }
 
-// DrainRequest is the body of drainServer (contract 0.16.0).
+// DrainRequest is the body of drainServer (contract 0.15.0).
 type DrainRequest struct {
 	RemoveWhenDone       bool `json:"removeWhenDone,omitempty"`
 	MaxConcurrentMoves   int  `json:"maxConcurrentMoves,omitempty"`
@@ -86,7 +86,7 @@ type DrainRequest struct {
 type RebalancePlanRequest struct {
 	RebalanceOptions
 	MoveLimit int `json:"moveLimit,omitempty"`
-	// ExcludeServerIDs plans as if these servers should not hold shards (contract 0.16.0).
+	// ExcludeServerIDs plans as if these servers should not hold shards (contract 0.15.0).
 	ExcludeServerIDs []string `json:"excludeServerIds,omitempty"`
 }
 
@@ -100,12 +100,12 @@ type PlannedMove struct {
 	FromServerID       string `json:"fromServerId,omitempty"`
 	ToServerID         string `json:"toServerId,omitempty"`
 	EstimatedSizeBytes *int64 `json:"estimatedSizeBytes"`
-	// Kind is move or schema and SchemaName the schema (contract 0.16.0, optional; the extension plans no schema yet).
+	// Kind is move or schema and SchemaName the schema (contract 0.15.0, optional; the extension plans no schema yet).
 	Kind       string  `json:"kind,omitempty"`
 	SchemaName *string `json:"schemaName,omitempty"`
-	// Cost is what the plan counted for the bucket: 1, or its bytes by disk size (contract 0.16.0, optional).
+	// Cost is what the plan counted for the bucket: 1, or its bytes by disk size (contract 0.15.0, optional).
 	Cost *int64 `json:"cost,omitempty"`
-	// Reason is balance or drain (contract 0.16.0, optional).
+	// Reason is balance or drain (contract 0.15.0, optional).
 	Reason string `json:"reason,omitempty"`
 	Rank   int    `json:"rank"`
 }
@@ -122,7 +122,7 @@ type ServerImpact struct {
 	ServerID             string `json:"serverId"`
 	PrimaryBucketsBefore int    `json:"primaryBucketsBefore"`
 	PrimaryBucketsAfter  int    `json:"primaryBucketsAfter"`
-	// LoadBefore and LoadAfter are the load of the server by the strategy: buckets, or bytes (contract 0.16.0, optional).
+	// LoadBefore and LoadAfter are the load of the server by the strategy: buckets, or bytes (contract 0.15.0, optional).
 	LoadBefore *float64 `json:"loadBefore,omitempty"`
 	LoadAfter  *float64 `json:"loadAfter,omitempty"`
 }
@@ -135,7 +135,7 @@ type RebalancePlan struct {
 	Moves         []PlannedMove  `json:"moves"`
 	ServerImpacts []ServerImpact `json:"serverImpacts"`
 	Warnings      []string       `json:"warnings"`
-	// Strategy, Threshold and Imbalance (the largest deviation of a receiver from the ideal now) are added in contract 0.16.0.
+	// Strategy, Threshold and Imbalance (the largest deviation of a receiver from the ideal now) are added in contract 0.15.0.
 	Strategy  string   `json:"strategy,omitempty"`
 	Threshold *float64 `json:"threshold,omitempty"`
 	Imbalance *float64 `json:"imbalance,omitempty"`
@@ -150,7 +150,7 @@ type BucketMove struct {
 	ToShardGroupID   int32  `json:"toShardGroupId"`
 	FromServerID     string `json:"fromServerId,omitempty"`
 	ToServerID       string `json:"toServerId,omitempty"`
-	// Kind is move, split or schema and SchemaName the schema (contract 0.16.0, optional).
+	// Kind is move, split or schema and SchemaName the schema (contract 0.15.0, optional).
 	Kind       string  `json:"kind,omitempty"`
 	SchemaName *string `json:"schemaName,omitempty"`
 	Phase      string  `json:"phase"`
@@ -182,11 +182,11 @@ type RebalanceStatus struct {
 	StoppedBy     *string                 `json:"stoppedBy"`
 	PausedReason  *string                 `json:"pausedReason"`
 	LastReport    *RebalanceReportSummary `json:"lastReport"`
-	// Strategy, Threshold and Trigger of the current run (contract 0.16.0, optional).
+	// Strategy, Threshold and Trigger of the current run (contract 0.15.0, optional).
 	Strategy  string   `json:"strategy,omitempty"`
 	Threshold *float64 `json:"threshold,omitempty"`
 	Trigger   string   `json:"trigger,omitempty"`
-	// Automatic is the state of the automatic mode (contract 0.16.0, optional).
+	// Automatic is the state of the automatic mode (contract 0.15.0, optional).
 	Automatic *RebalanceAutomatic `json:"automatic,omitempty"`
 }
 
@@ -221,7 +221,7 @@ type RebalanceReportSummary struct {
 	StartedAt  time.Time         `json:"startedAt"`
 	FinishedAt time.Time         `json:"finishedAt"`
 	Options    *RebalanceOptions `json:"options,omitempty"`
-	// Trigger, Strategy and Threshold of the run (contract 0.16.0, optional).
+	// Trigger, Strategy and Threshold of the run (contract 0.15.0, optional).
 	Trigger   string       `json:"trigger,omitempty"`
 	Strategy  string       `json:"strategy,omitempty"`
 	Threshold *float64     `json:"threshold,omitempty"`
@@ -250,7 +250,7 @@ type ReportMove struct {
 	Outcome          string  `json:"outcome"`
 	Attempts         int     `json:"attempts"`
 	SkipReason       *string `json:"skipReason"`
-	// Reason is balance or drain (contract 0.16.0, optional).
+	// Reason is balance or drain (contract 0.15.0, optional).
 	Reason          string  `json:"reason,omitempty"`
 	DurationSeconds float64 `json:"durationSeconds"`
 	Error           *string `json:"error"`

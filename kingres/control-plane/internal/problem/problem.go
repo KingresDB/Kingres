@@ -89,16 +89,16 @@ const (
 	GroupDegraded       Code = "group_degraded"
 	InsufficientDisk    Code = "insufficient_disk"
 	NoReceivingServer   Code = "no_receiving_server"
-	// ReplicasCannotBeKept: a drain would leave fewer servers than the replica count needs (contract 0.16.0).
+	// ReplicasCannotBeKept: a drain would leave fewer servers than the replica count needs (contract 0.15.0).
 	ReplicasCannotBeKept Code = "replicas_cannot_be_kept"
-	// Distributed schemas (contract 0.16.0).
+	// Distributed schemas (contract 0.15.0).
 	ShardingModeInUse      Code = "sharding_mode_in_use"
 	SchemaNotDistributable Code = "schema_not_distributable"
 	SchemaPinned           Code = "schema_pinned"
 	SchemaMoveInProgress   Code = "schema_move_in_progress"
-	// BucketBusy: the bucket has a move or a split in progress (contract 0.16.0).
+	// BucketBusy: the bucket has a move or a split in progress (contract 0.15.0).
 	BucketBusy Code = "bucket_busy"
-	// SplitUnsupported: a table of the colocation group cannot be split (contract 0.16.0).
+	// SplitUnsupported: a table of the colocation group cannot be split (contract 0.15.0).
 	SplitUnsupported Code = "split_unsupported"
 	// Added in contract 0.10.0 (failover).
 	FailoverNeedsDecision Code = "failover_needs_decision"

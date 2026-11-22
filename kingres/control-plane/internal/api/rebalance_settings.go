@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 )
 
-// AutomaticWindow is the time of day in which an automatic run may start (contract 0.16.0).
+// AutomaticWindow is the time of day in which an automatic run may start (contract 0.15.0).
 type AutomaticWindow struct {
 	From     string `json:"from"`
 	To       string `json:"to"`

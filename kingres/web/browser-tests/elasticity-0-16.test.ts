@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
-// Contract 0.16.0 in a real browser: the dialogs of the drain, the weight, the split and the schemas, and the automatic card
+// Contract 0.15.0 in a real browser: the dialogs of the drain, the weight, the split and the schemas, and the automatic card
 // of the Rebalance page, pass axe (colour contrast included, in light and dark) and do not push the page sideways at 1366 and 320 pixels.
 import { createRequire } from 'node:module'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -82,7 +82,7 @@ async function check(
   }
 }
 
-describe('contract 0.16.0 in a real browser', () => {
+describe('contract 0.15.0 in a real browser', () => {
   it('the dialogs of the servers page and the automatic card', async () => {
     const failures: string[] = []
     await check(failures, '/servers', 'drain dialog', async () => {

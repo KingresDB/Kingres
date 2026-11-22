@@ -14,13 +14,13 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 )
 
-// The strategies of contract 0.16.0 and the names the extension uses (design 4.2).
+// The strategies of contract 0.15.0 and the names the extension uses (design 4.2).
 const (
 	ByBucketCount = "byBucketCount"
 	ByDiskSize    = "byDiskSize"
 )
 
-// Triggers of a run (contract 0.16.0, RebalanceStatus.trigger).
+// Triggers of a run (contract 0.15.0, RebalanceStatus.trigger).
 const (
 	TriggerManual    = "manual"
 	TriggerAutomatic = "automatic"
@@ -161,7 +161,7 @@ func OptionsFromAPI(r api.RebalanceOptions) Options {
 		CleanupDelaySeconds: r.CleanupDelaySeconds}
 }
 
-// validateNew checks the members of the options that contract 0.16.0 added.
+// validateNew checks the members of the options that contract 0.15.0 added.
 func validateNew(o Options) []problem.FieldError {
 	var errs []problem.FieldError
 	if o.Strategy != "" && o.Strategy != ByBucketCount && o.Strategy != ByDiskSize {

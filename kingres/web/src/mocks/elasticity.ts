@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
-// The mock of contract 0.16.0 (phases 10 and 11): the drain of a server, the split of a bucket, the schemas of a database and the
+// The mock of contract 0.15.0 (phases 10 and 11): the drain of a server, the split of a bucket, the schemas of a database and the
 // distribution of a schema. Schemas named `failme` fail their task, `analytics` has an object that cannot be distributed,
 // `ledgerdocs` is pinned by a ledger table, `nokey` has a table without a key, and one name is hostile on purpose.
 import type { components } from '@/api/schema'
@@ -109,7 +109,7 @@ function schema(rec: DbRec & { schemas?: MockSchema[] }, name: string): MockSche
   return m
 }
 
-/** Adds what contract 0.16.0 says about a run to the status of the mock. */
+/** Adds what contract 0.15.0 says about a run to the status of the mock. */
 export function decorateStatus(s: MockState, st: S['RebalanceStatus']): S['RebalanceStatus'] {
   const auto = s.settings.rebalance.automatic
   return {

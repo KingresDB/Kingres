@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
-// The console of contract 0.16.0: strategies, weights, drain, automatic mode and split (phase 10) and the schemas of a
+// The console of contract 0.15.0: strategies, weights, drain, automatic mode and split (phase 10) and the schemas of a
 // database (phase 11), against the mock API.
 import { describe, expect, it } from 'vitest'
 import { screen, waitFor, within } from '@testing-library/vue'

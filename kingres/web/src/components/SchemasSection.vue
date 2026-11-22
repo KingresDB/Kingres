@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <script setup lang="ts">
-// The Schemas section of the database page (contract 0.16.0): every schema with its distribution and the three actions.
+// The Schemas section of the database page (contract 0.15.0): every schema with its distribution and the three actions.
 // The buttons are GateButtons: a read-only role sees them disabled with the role that is needed.
 import { ref } from 'vue'
 import { RouterLink } from 'vue-router'

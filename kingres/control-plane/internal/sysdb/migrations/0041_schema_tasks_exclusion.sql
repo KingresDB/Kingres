@@ -1,6 +1,6 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
 -- Copyright (c) 2026 RooyeKhat Media Co
--- kingres_cp 41: the tasks of the distributed schemas exclude a failover and a rebalance (contract 0.16.0, phase 11).
+-- kingres_cp 41: the tasks of the distributed schemas exclude a failover and a rebalance (contract 0.15.0, phase 11).
 -- Applied inside one transaction by internal/sysdb; do not add BEGIN/COMMIT.
 --
 -- A schema that is distributed, moved or made local while the catalogs are being failed over node by node would be found by the

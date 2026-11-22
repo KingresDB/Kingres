@@ -762,7 +762,7 @@ export interface paths {
         put?: never;
         /**
          * Drain a server
-         * @description Added in 0.16.0. Makes a server removable: sets its `shouldHaveShards` to false, moves every bucket its shard groups own to
+         * @description Added in 0.15.0. Makes a server removable: sets its `shouldHaveShards` to false, moves every bucket its shard groups own to
          *     the other servers (the run of `startRebalance` with `drainOnly`, the strategy and threshold of the cluster settings), waits
          *     until the server owns no bucket and none is on its way, and, with `removeWhenDone`, removes the server with the task of
          *     `removeServer`. The cluster stays in service. A drain is a **task of kind `rebalance`** (not a kind of its own): the run is
@@ -801,7 +801,7 @@ export interface paths {
         };
         /**
          * Preview the drain of a server
-         * @description Added in 0.16.0. What `drainServer` would do now and what stands in its way, without changing anything: the moves (the plan
+         * @description Added in 0.15.0. What `drainServer` would do now and what stands in its way, without changing anything: the moves (the plan
          *     of `previewRebalancePlan` with the server excluded and `drainOnly`), their bytes, the groups whose standby runs on the server,
          *     whether the replica count can be kept on the servers that remain, the databases in which the server holds ordinary tables that
          *     leave with it, and the blockers (each with the problem code `drainServer` would answer). 404 for an unknown server.
@@ -1079,7 +1079,7 @@ export interface paths {
         };
         /**
          * List the schemas of a database
-         * @description Added in 0.16.0. Every schema of the database that is not a system schema, ordered by name, with its distribution: a distributed schema
+         * @description Added in 0.15.0. Every schema of the database that is not a system schema, ordered by name, with its distribution: a distributed schema
          *     lives in one shard group (`distribution` not null), a local one does not (`distribution` null; also in a database without sharding).
          *     `sizeBytes` is known for a distributed schema only (null is "not available", never 0). Schema names can be any text: show them as text.
          *     Filters: `distributed`, `shardGroupId`, `state`.
@@ -1107,7 +1107,7 @@ export interface paths {
         };
         /**
          * Get a schema
-         * @description Added in 0.16.0. The summary of the schema, the objects that keep a local schema from being distributed (`distributionBlockers`, from
+         * @description Added in 0.15.0. The summary of the schema, the objects that keep a local schema from being distributed (`distributionBlockers`, from
          *     `kingres.schema_inventory`), why a distributed schema cannot move or become local (`pinned`, for example a ledger table), the task of a
          *     move that is running (`moveInProgress`) and the tables that have no primary key and no replica identity (a move needs one of them).
          */
@@ -1135,7 +1135,7 @@ export interface paths {
         get?: never;
         /**
          * Distribute a schema
-         * @description Added in 0.16.0. Makes a local schema a distributed one: the data stays where it is (on the server that runs the map group primary, or on the
+         * @description Added in 0.15.0. Makes a local schema a distributed one: the data stays where it is (on the server that runs the map group primary, or on the
          *     group named in `shardGroupId` while no table holds a row), the other servers receive empty tables, and every statement on the schema is then
          *     routed to its group. Returns a task of kind `schema.distribute` (subject type `schema`, id `database/schema`). Refused with 409 `conflict` for a schema
          *     that is distributed already or a database whose sharding mode is `row`, and with 422 `schema_not_distributable` (the objects in `errors`, `field`
@@ -1146,7 +1146,7 @@ export interface paths {
         post?: never;
         /**
          * Make a distributed schema local
-         * @description Added in 0.16.0. The way back: the schema stays on its group as a local schema and every other server drops its empty tables. With
+         * @description Added in 0.15.0. The way back: the schema stays on its group as a local schema and every other server drops its empty tables. With
          *     `shardGroupId` the schema is moved to that group first. Returns a task of kind `schema.undistribute`. Refused with 409 `schema_pinned` (a ledger table),
          *     `schema_move_in_progress` and `conflict` (the schema is local). Needs `kingres_admin`.
          */
@@ -1172,7 +1172,7 @@ export interface paths {
         put?: never;
         /**
          * Move a distributed schema to another shard group
-         * @description Added in 0.16.0. Moves the data of the schema to the target group while the schema stays in service (`kingres.move_schema`); writers of the schema wait
+         * @description Added in 0.15.0. Moves the data of the schema to the target group while the schema stays in service (`kingres.move_schema`); writers of the schema wait
          *     for the switch only. Returns a task of kind `schema.move` with the steps `Check the move`, `Copy the data` (the detail shows the phase), `Switch` and
          *     `Clean up the old copy` (the task does not wait for the old copy to be emptied). A cancel is accepted until the switch has started. A failed or cancelled move leaves the
          *     schema active on its group. Refused with 409 `rebalance_in_progress`, `schema_move_in_progress`, `schema_pinned`, `conflict` (the schema is local); 422 `unprocessable` for a target
@@ -1475,7 +1475,7 @@ export interface paths {
         };
         /**
          * List colocation groups
-         * @description Colocation groups of a sharded database. Tables in one group share one bucket map. Not paginated. Since 0.16.0 the query `kind` (`hash` or `schema`) selects one kind (the Shards page asks for `hash`, so that the one-bucket groups of thousands of distributed schemas do not swamp it).
+         * @description Colocation groups of a sharded database. Tables in one group share one bucket map. Not paginated. Since 0.15.0 the query `kind` (`hash` or `schema`) selects one kind (the Shards page asks for `hash`, so that the one-bucket groups of thousands of distributed schemas do not swamp it).
          */
         get: operations["listColocationGroups"];
         put?: never;
@@ -1504,7 +1504,7 @@ export interface paths {
         put?: never;
         /**
          * Preview the split of a bucket
-         * @description Added in 0.16.0. What `splitBucket` would make of the bucket and what stands in its way, without changing anything: the new
+         * @description Added in 0.15.0. What `splitBucket` would make of the bucket and what stands in its way, without changing anything: the new
          *     buckets (number, modulus, remainder), the estimated size of each, the disk the owning server (and its standbys) needs until the
          *     old partitions are dropped, and the blockers, each with the problem code `splitBucket` would answer (`bucket_busy` for a bucket
          *     that moves or splits, `group_degraded`, `insufficient_disk`, `split_unsupported`). A table without a primary key is refused
@@ -1536,7 +1536,7 @@ export interface paths {
         put?: never;
         /**
          * Split a bucket
-         * @description Added in 0.16.0. Replaces the bucket, in every table of its colocation group, by `parts` (2, 4, 8 or 16) buckets of a modulus
+         * @description Added in 0.15.0. Replaces the bucket, in every table of its colocation group, by `parts` (2, 4, 8 or 16) buckets of a modulus
          *     `parts` times larger, on the shard group that owns it (`kingres.split_bucket`): the new buckets are `bucket + i * modulus`
          *     for `i` from 0 (the bucket keeps its number for 0), `ColocationGroup.maxModulus` goes up and the bucket map has `parts - 1`
          *     rows more. The children stay on the group; move them apart afterwards with a rebalance. Writers of the group's tables wait for
@@ -2357,13 +2357,13 @@ export interface paths {
          *     and starts the task `config.apply`: it checks the request again, records the change, then writes the
          *     override file of each server, checks it with PostgreSQL, reloads and reads the effective values back, one step
          *     per server. A parameter that needs a restart is reported `pendingRestart` per server; nothing is restarted
-         *     (see `restartPendingInstances`). A server that is down is recorded as waiting and the task goes on and ends without it (changed in 0.17.0: before, the task waited for it and blocked every later change); the leader brings it up to date within a minute of its return
+         *     (see `restartPendingInstances`). A server that is down is recorded as waiting and the task goes on and ends without it (changed in 0.16.0: before, the task waited for it and blocked every later change); the leader brings it up to date within a minute of its return
          *     (`listConfigServers` shows it as `waiting`). A server that fails does not stop the others: the task ends failed with `config_incomplete`, and the
          *     steps and `listConfigServers` say which servers applied, wait for a restart, failed or wait. Refused with 400
          *     `validation_failed` (a value that is not valid for its parameter; `errors[]` names the change) and 422
          *     `config_parameter_managed`, `config_parameter_refused`, `config_level_not_allowed` and `config_value_below_floor`;
-         *     404 `not_found` for an unknown server group, server or database; 409 `config_change_superseded` when `expectedRevision` is older than a change of a value the request changes (0.17.0); 409 `operation_in_progress` while another
-         *     configuration task runs. Nothing is written before every change has passed. A stored value can always be removed (`value: null`), also when its parameter has become managed or refused since it was set (0.17.0). The audit event has the checked changes with the old and the normalized new value, the servers and the task id; a refused request is audited with the names and levels only, never a value.
+         *     404 `not_found` for an unknown server group, server or database; 409 `config_change_superseded` when `expectedRevision` is older than a change of a value the request changes (0.16.0); 409 `operation_in_progress` while another
+         *     configuration task runs. Nothing is written before every change has passed. A stored value can always be removed (`value: null`), also when its parameter has become managed or refused since it was set (0.16.0). The audit event has the checked changes with the old and the normalized new value, the servers and the task id; a refused request is audited with the names and levels only, never a value.
          */
         post: operations["applyConfigChange"];
         delete?: never;
@@ -4338,7 +4338,7 @@ export interface components {
             serverGroup: string | null;
             /** @description Whether rebalance may place buckets on this server; false drains it. */
             shouldHaveShards: boolean;
-            /** @description Added in 0.16.0, optional (absent when the sharding extension has no weights). The capacity of the server relative to the others (default 1). */
+            /** @description Added in 0.15.0, optional (absent when the sharding extension has no weights). The capacity of the server relative to the others (default 1). */
             weight?: number;
             /** @description Whether the active manager runs here. */
             isManagerLeader: boolean;
@@ -4449,7 +4449,7 @@ export interface components {
             allowUnpinned?: boolean;
         };
         /**
-         * @description Partial update of a server. Only these three members exist (`weight` since 0.16.0); every other property of `Server` is
+         * @description Partial update of a server. Only these three members exist (`weight` since 0.15.0); every other property of `Server` is
          *     read-only and is refused with 400 `validation_failed`.
          */
         ServerUpdateRequest: {
@@ -4457,7 +4457,7 @@ export interface components {
             serverGroup?: string | null;
             /** @description False excludes the server from bucket placement at the next rebalance. */
             shouldHaveShards?: boolean;
-            /** @description Added in 0.16.0. The capacity of the server relative to the others (default 1): a server of weight 2 receives twice the buckets, or bytes, of one of weight 1. A change is written to every node of the server and shows at the next rebalance; it needs the sharding extension 0.8 (422 `unsupported_operation` otherwise). */
+            /** @description Added in 0.15.0. The capacity of the server relative to the others (default 1): a server of weight 2 receives twice the buckets, or bytes, of one of weight 1. A change is written to every node of the server and shows at the next rebalance; it needs the sharding extension 0.8 (422 `unsupported_operation` otherwise). */
             weight?: number;
         };
         /** @description Failover options. Members after `mode` were added in 0.10.0 and are optional. */
@@ -4789,11 +4789,11 @@ export interface components {
             /** @description Number of hash buckets per colocation group. Fixed at creation (immutable). Null when not available, and in mode `schema`. */
             bucketCount: number | null;
             mode?: components["schemas"]["ShardingMode"];
-            /** @description Added in 0.16.0, optional. Whether a schema created in the database is placed on a shard group by itself. */
+            /** @description Added in 0.15.0, optional. Whether a schema created in the database is placed on a shard group by itself. */
             distributeNewSchemas?: boolean;
         };
         /**
-         * @description Added in 0.16.0. How tables are sharded: `row` (the default; a table is split into buckets by a column), `schema` (each schema lives in one shard group) or `both`. Clients must tolerate other values.
+         * @description Added in 0.15.0. How tables are sharded: `row` (the default; a table is split into buckets by a column), `schema` (each schema lives in one shard group) or `both`. Clients must tolerate other values.
          * @enum {string}
          */
         ShardingMode: "row" | "schema" | "both";
@@ -4805,13 +4805,13 @@ export interface components {
              */
             enabled: boolean;
             /**
-             * @description Number of hash buckets per colocation group, 1 to 4096, default 128. Fixed at creation (immutable). Optional since 0.16.0 (it was required) and ignored in mode `schema`.
+             * @description Number of hash buckets per colocation group, 1 to 4096, default 128. Fixed at creation (immutable). Optional since 0.15.0 (it was required) and ignored in mode `schema`.
              * @default 128
              */
             bucketCount?: number;
             mode?: components["schemas"]["ShardingMode"];
             /**
-             * @description Added in 0.16.0. Place every schema created in the database on a shard group. Only with mode `schema` or `both`.
+             * @description Added in 0.15.0. Place every schema created in the database on a shard group. Only with mode `schema` or `both`.
              * @default false
              */
             distributeNewSchemas?: boolean;
@@ -4849,7 +4849,7 @@ export interface components {
         };
         /** @description Live statistics of a database. A statistic the backend cannot measure is null ("not available"), never 0. */
         DatabaseStats: {
-            /** @description Added in 0.16.0, optional. Distributed schemas; null when not available. */
+            /** @description Added in 0.15.0, optional. Distributed schemas; null when not available. */
             distributedSchemaCount?: number | null;
             /**
              * Format: int64
@@ -4941,7 +4941,7 @@ export interface components {
                  */
                 enabled?: true;
                 mode?: components["schemas"]["ShardingMode"];
-                /** @description Added in 0.16.0. Default for new schemas. Changing the mode is synchronous (200); it is refused with 409 `sharding_mode_in_use` while schemas or tables of the other kind exist. */
+                /** @description Added in 0.15.0. Default for new schemas. Changing the mode is synchronous (200); it is refused with 409 `sharding_mode_in_use` while schemas or tables of the other kind exist. */
                 distributeNewSchemas?: boolean;
             };
             /** @description Replication changes. */
@@ -4966,7 +4966,7 @@ export interface components {
         };
         /** @description What the create-database dialog offers. */
         DatabaseCreateOptions: {
-            /** @description Added in 0.16.0, optional. The values of `sharding.mode`. */
+            /** @description Added in 0.15.0, optional. The values of `sharding.mode`. */
             shardingModes?: components["schemas"]["ShardingMode"][];
             shardingModeDefault?: components["schemas"]["ShardingMode"];
             /** @description Valid values of `general.encoding`. */
@@ -5005,7 +5005,7 @@ export interface components {
         /** @description How a distributed or reference table is spread over shard groups. */
         TableDistribution: {
             /**
-             * @description `hash` distributes rows by hash of the column; `reference` copies the table to every group; `schema` (0.16.0) the table belongs to a distributed schema and lives in its one group. Clients must tolerate other values.
+             * @description `hash` distributes rows by hash of the column; `reference` copies the table to every group; `schema` (0.15.0) the table belongs to a distributed schema and lives in its one group. Clients must tolerate other values.
              * @enum {string}
              */
             method: "hash" | "reference" | "schema";
@@ -5268,7 +5268,7 @@ export interface components {
         /** @description Added in 0.14.0. Reserved for options; the body may be absent. */
         DetachTablePartitionRequest: Record<string, never>;
         /**
-         * @description `active` normal; `moving` being copied to another group; `orphan` left-over shard awaiting deferred cleanup; `splitting` (0.16.0) being replaced by buckets of a larger modulus. Clients must tolerate other values.
+         * @description `active` normal; `moving` being copied to another group; `orphan` left-over shard awaiting deferred cleanup; `splitting` (0.15.0) being replaced by buckets of a larger modulus. Clients must tolerate other values.
          * @enum {string}
          */
         BucketState: "active" | "moving" | "orphan" | "splitting";
@@ -5347,7 +5347,7 @@ export interface components {
             items: components["schemas"]["SchemaSummary"][];
             nextCursor: components["schemas"]["NextCursor"];
         };
-        /** @description Added in 0.16.0. Body of `distributeSchema`; every member is optional. */
+        /** @description Added in 0.15.0. Body of `distributeSchema`; every member is optional. */
         DistributeSchemaRequest: {
             /**
              * Format: int32
@@ -5360,7 +5360,7 @@ export interface components {
              */
             setReplicaIdentityFull?: boolean;
         };
-        /** @description Added in 0.16.0. Body of `moveSchema`. */
+        /** @description Added in 0.15.0. Body of `moveSchema`. */
         MoveSchemaRequest: {
             /**
              * Format: int32
@@ -5373,7 +5373,7 @@ export interface components {
              */
             setReplicaIdentityFull?: boolean;
         };
-        /** @description Added in 0.16.0. Body of `splitBucket` and `previewBucketSplit`; every member is optional. */
+        /** @description Added in 0.15.0. Body of `splitBucket` and `previewBucketSplit`; every member is optional. */
         BucketSplitRequest: {
             /**
              * @description Into how many buckets the bucket is split.
@@ -5402,7 +5402,7 @@ export interface components {
              */
             estimatedSizeBytes: number | null;
         };
-        /** @description Added in 0.16.0. What a split would make and what stands in its way. */
+        /** @description Added in 0.15.0. What a split would make and what stands in its way. */
         BucketSplitPreview: {
             /** @description True when no blocker exists. */
             canSplit: boolean;
@@ -5441,13 +5441,13 @@ export interface components {
              * @description Size of the group's data (primary copies); null when not available.
              */
             sizeBytes: number | null;
-            /** @description Added in 0.16.0, optional. The number of buckets the group was made with; `bucketCount` is the current number, which a split raises. */
+            /** @description Added in 0.15.0, optional. The number of buckets the group was made with; `bucketCount` is the current number, which a split raises. */
             baseBucketCount?: number;
-            /** @description Added in 0.16.0, optional. The greatest modulus of a bucket of the group (the base count until a split). */
+            /** @description Added in 0.15.0, optional. The greatest modulus of a bucket of the group (the base count until a split). */
             maxModulus?: number;
-            /** @description Added in 0.16.0, optional. `hash` (the buckets of hash-distributed tables) or `schema` (one bucket: the group that holds one distributed schema). Clients must tolerate other values. */
+            /** @description Added in 0.15.0, optional. `hash` (the buckets of hash-distributed tables) or `schema` (one bucket: the group that holds one distributed schema). Clients must tolerate other values. */
             kind?: string;
-            /** @description Added in 0.16.0, optional. The distributed schema of a `schema` group; null for a `hash` group. A name can be any text, so show it as text. */
+            /** @description Added in 0.15.0, optional. The distributed schema of a `schema` group; null for a `hash` group. A name can be any text, so show it as text. */
             schemaName?: string | null;
         };
         /** @description Colocation groups of a database. */
@@ -5459,9 +5459,9 @@ export interface components {
         Bucket: {
             /** @description Bucket number: `hash(key)` reduced to the number of buckets of the colocation group (`ColocationGroup.bucketCount`) by the sharding extension's own hash function, which is not PostgreSQL's `hashtext` followed by a modulo; use `kingres.bucket_for` to find the bucket of a value. */
             bucket: number;
-            /** @description Added in 0.16.0, optional. The modulus of the bucket (it holds the hashes whose remainder modulo `modulus` is `remainder`); equal to the base bucket count until a split. */
+            /** @description Added in 0.15.0, optional. The modulus of the bucket (it holds the hashes whose remainder modulo `modulus` is `remainder`); equal to the base bucket count until a split. */
             modulus?: number;
-            /** @description Added in 0.16.0, optional. Equal to `bucket`. */
+            /** @description Added in 0.15.0, optional. Equal to `bucket`. */
             remainder?: number;
             /**
              * Format: int32
@@ -5645,18 +5645,18 @@ export interface components {
             /** @description Concurrent bucket moves; defaults to 1 when omitted and is recorded as sent (or 1). **This version runs one move at a time** whatever the value (0.9.0). */
             maxConcurrentMoves?: number;
             strategy?: components["schemas"]["RebalanceStrategy"];
-            /** @description Added in 0.16.0. The largest deviation of a server from the ideal load that is accepted: nothing moves while every server is within it. Default: the cluster setting, else 0 by `byBucketCount` and 0.1 by `byDiskSize`. The answer shows the value used. */
+            /** @description Added in 0.15.0. The largest deviation of a server from the ideal load that is accepted: nothing moves while every server is within it. Default: the cluster setting, else 0 by `byBucketCount` and 0.1 by `byDiskSize`. The answer shows the value used. */
             threshold?: number;
-            /** @description Added in 0.16.0. Move only the buckets off servers that should not hold shards (`shouldHaveShards` false); nothing else is balanced. */
+            /** @description Added in 0.15.0. Move only the buckets off servers that should not hold shards (`shouldHaveShards` false); nothing else is balanced. */
             drainOnly?: boolean;
-            /** @description Added in 0.16.0. Moves that may involve one server as source or target at once. Default: the cluster setting (2). */
+            /** @description Added in 0.15.0. Moves that may involve one server as source or target at once. Default: the cluster setting (2). */
             maxMovesPerServer?: number;
-            /** @description Added in 0.16.0. Clears the suspension that failed moves of an earlier run left (a manual start acknowledges them anyway). */
+            /** @description Added in 0.15.0. Clears the suspension that failed moves of an earlier run left (a manual start acknowledges them anyway). */
             acknowledgeFailures?: boolean;
-            /** @description Added in 0.16.0. Overrides, for this run, the delay before the source copy of a moved bucket is dropped. */
+            /** @description Added in 0.15.0. Overrides, for this run, the delay before the source copy of a moved bucket is dropped. */
             cleanupDelaySeconds?: number;
         };
-        /** @description Added in 0.16.0. Body of `drainServer`; every member is optional. */
+        /** @description Added in 0.15.0. Body of `drainServer`; every member is optional. */
         DrainRequest: {
             /**
              * @description Remove the server (the task of `removeServer`) when it owns no bucket. Made after the drain task has ended; if the manager restarts in between, the server stays drained and the operator removes it.
@@ -5683,7 +5683,7 @@ export interface components {
             /** @description What is wrong. */
             detail: string;
         };
-        /** @description Added in 0.16.0. What a drain would do now. */
+        /** @description Added in 0.15.0. What a drain would do now. */
         DrainPreview: {
             serverId: components["schemas"]["ServerId"];
             /** @description True when no blocker exists. */
@@ -5720,7 +5720,7 @@ export interface components {
             warnings: string[];
         };
         /**
-         * @description Added in 0.16.0. How a bucket is counted: `byBucketCount` every bucket counts 1; `byDiskSize` a bucket counts its bytes (at least 1 MiB). Clients must tolerate other values.
+         * @description Added in 0.15.0. How a bucket is counted: `byBucketCount` every bucket counts 1; `byDiskSize` a bucket counts its bytes (at least 1 MiB). Clients must tolerate other values.
          * @enum {string}
          */
         RebalanceStrategy: "byBucketCount" | "byDiskSize";
@@ -5731,7 +5731,7 @@ export interface components {
              * @default 200
              */
             moveLimit?: number;
-            /** @description Added in 0.16.0. Plan as if these servers should not hold shards: the preview of a drain. */
+            /** @description Added in 0.15.0. Plan as if these servers should not hold shards: the preview of a drain. */
             excludeServerIds?: components["schemas"]["ServerId"][];
         };
         /** @description One bucket move of a plan. */
@@ -5766,16 +5766,16 @@ export interface components {
             estimatedSizeBytes: number | null;
             /** @description Priority from 0 to 1000; higher moves run earlier. */
             rank: number;
-            /** @description Added in 0.16.0, optional. `move` (the default) or `schema`: a unit of the plan that is a distributed schema. The extension does not plan schemas yet; a panel shows them when a server sends them. */
+            /** @description Added in 0.15.0, optional. `move` (the default) or `schema`: a unit of the plan that is a distributed schema. The extension does not plan schemas yet; a panel shows them when a server sends them. */
             kind?: string;
-            /** @description Added in 0.16.0, optional. The schema, for kind `schema`. */
+            /** @description Added in 0.15.0, optional. The schema, for kind `schema`. */
             schemaName?: string | null;
             /**
              * Format: int64
-             * @description Added in 0.16.0, optional. What the plan counted for the bucket: 1 by `byBucketCount`, its bytes by `byDiskSize`.
+             * @description Added in 0.15.0, optional. What the plan counted for the bucket: 1 by `byBucketCount`, its bytes by `byDiskSize`.
              */
             cost?: number;
-            /** @description Added in 0.16.0, optional. `balance` or `drain` (a move off a server that should not hold shards). Clients must tolerate other values. */
+            /** @description Added in 0.15.0, optional. `balance` or `drain` (a move off a server that should not hold shards). Clients must tolerate other values. */
             reason?: string;
         };
         /** @description A rebalance plan preview. */
@@ -5805,17 +5805,17 @@ export interface components {
                 primaryBucketsBefore: number;
                 /** @description Primary buckets after the plan. */
                 primaryBucketsAfter: number;
-                /** @description Added in 0.16.0, optional. The load of the server by the strategy now (buckets, or bytes). */
+                /** @description Added in 0.15.0, optional. The load of the server by the strategy now (buckets, or bytes). */
                 loadBefore?: number;
-                /** @description Added in 0.16.0, optional. The load after the plan. */
+                /** @description Added in 0.15.0, optional. The load after the plan. */
                 loadAfter?: number;
             }[];
-            /** @description Conditions the operator should know about, for example tables without a replica identity. Since 0.16.0 also `groupUnavailable: ...` for a shard group without a primary, whose buckets are not planned. */
+            /** @description Conditions the operator should know about, for example tables without a replica identity. Since 0.15.0 also `groupUnavailable: ...` for a shard group without a primary, whose buckets are not planned. */
             warnings: string[];
             strategy?: components["schemas"]["RebalanceStrategy"];
-            /** @description Added in 0.16.0, optional. The threshold the plan used. */
+            /** @description Added in 0.15.0, optional. The threshold the plan used. */
             threshold?: number;
-            /** @description Added in 0.16.0, optional. The largest deviation of a server from the ideal load now (0.1 is 10 percent); the plan brings every server within `threshold`. */
+            /** @description Added in 0.15.0, optional. The largest deviation of a server from the ideal load now (0.1 is 10 percent); the plan brings every server within `threshold`. */
             imbalance?: number;
         };
         /** @description A bucket move in flight. */
@@ -5843,9 +5843,9 @@ export interface components {
             fromServerId?: string;
             /** @description Added in 0.9.0, optional. The server that runs the primary of the destination group. */
             toServerId?: string;
-            /** @description Added in 0.16.0, optional. What moves: `move` (a bucket, the default), `split` (a bucket is being split) or `schema` (a distributed schema, one bucket of its own group). Clients must tolerate other values. */
+            /** @description Added in 0.15.0, optional. What moves: `move` (a bucket, the default), `split` (a bucket is being split) or `schema` (a distributed schema, one bucket of its own group). Clients must tolerate other values. */
             kind?: string;
-            /** @description Added in 0.16.0, optional. The schema, for kind `schema`; a name can be any text, so show it as text. */
+            /** @description Added in 0.15.0, optional. The schema, for kind `schema`; a name can be any text, so show it as text. */
             schemaName?: string | null;
             /**
              * @description Current phase of the move: the extension's `preparing`, `copying`, `catching_up`, `switching` and
@@ -5916,9 +5916,9 @@ export interface components {
             /** @description Summary of the most recent finished or failed run other than the current one, so the page can show what happened last while `progress` is null; null when no run has finished yet. */
             lastReport: components["schemas"]["RebalanceReportSummary"] | null;
             strategy?: components["schemas"]["RebalanceStrategy"];
-            /** @description Added in 0.16.0, optional. The threshold of the current run. */
+            /** @description Added in 0.15.0, optional. The threshold of the current run. */
             threshold?: number;
-            /** @description Added in 0.16.0, optional. What started the current run: `manual`, `automatic` or `drain`. Clients must tolerate other values. */
+            /** @description Added in 0.15.0, optional. What started the current run: `manual`, `automatic` or `drain`. Clients must tolerate other values. */
             trigger?: string;
             automatic?: components["schemas"]["RebalanceAutomaticStatus"];
         };
@@ -5945,10 +5945,10 @@ export interface components {
              */
             finishedAt: string;
             options?: components["schemas"]["RebalanceOptions"];
-            /** @description Added in 0.16.0, optional. `manual`, `automatic` or `drain`. */
+            /** @description Added in 0.15.0, optional. `manual`, `automatic` or `drain`. */
             trigger?: string;
             strategy?: components["schemas"]["RebalanceStrategy"];
-            /** @description Added in 0.16.0, optional. The threshold the run used. */
+            /** @description Added in 0.15.0, optional. The threshold the run used. */
             threshold?: number;
             /** @description Added in 0.9.0, optional. For outcome `stopped`: `operator` or `safetyRule`; for outcome `cancelled`: `operator`. */
             stoppedBy?: string | null;
@@ -6006,7 +6006,7 @@ export interface components {
                 toServerId?: string;
                 /** @description Added in 0.9.0, optional. How many times the move was tried. */
                 attempts?: number;
-                /** @description Added in 0.16.0, optional. `balance` or `drain`. */
+                /** @description Added in 0.15.0, optional. `balance` or `drain`. */
                 reason?: string;
                 /** @description Added in 0.9.0, optional. For outcome `skipped`: `stopped` (cancelled by a stop), `targetDiskLow`, `groupDegraded` or `groupLeaseLost`. Clients must tolerate other values. */
                 skipReason?: string | null;
@@ -6500,7 +6500,7 @@ export interface components {
                 serverIds: components["schemas"]["ServerId"][];
             };
         };
-        /** @description Rebalance defaults. The members after `maxConcurrentMoves` were added in 0.16.0 and are optional (an older server omits them). */
+        /** @description Rebalance defaults. The members after `maxConcurrentMoves` were added in 0.15.0 and are optional (an older server omits them). */
         RebalanceSettings: {
             /**
              * @description Default number of concurrent bucket moves.
@@ -6533,7 +6533,7 @@ export interface components {
             maxStandbyLagBytes?: number;
             automatic?: components["schemas"]["RebalanceAutomaticSettings"];
         };
-        /** @description Added in 0.16.0. A time of day; `from` later than `to` wraps over midnight. */
+        /** @description Added in 0.15.0. A time of day; `from` later than `to` wraps over midnight. */
         RebalanceWindow: {
             /** @description Start, HH:MM. */
             from: string;
@@ -6542,7 +6542,7 @@ export interface components {
             /** @description IANA time zone name. */
             timeZone: string;
         };
-        /** @description Added in 0.16.0. The automatic mode (role `kingres_admin` to change). It runs on the manager leader, is off by default and never starts while a safety rule fails (a failover, a group without a healthy standby or a primary, a server that is not live, a failed earlier move, an inconsistent cluster). */
+        /** @description Added in 0.15.0. The automatic mode (role `kingres_admin` to change). It runs on the manager leader, is off by default and never starts while a safety rule fails (a failover, a group without a healthy standby or a primary, a server that is not live, a failed earlier move, an inconsistent cluster). */
         RebalanceAutomaticSettings: {
             /** @description Whether the manager starts a rebalance by itself. Off by default. */
             enabled: boolean;
@@ -6580,7 +6580,7 @@ export interface components {
             /** @description The time of day in which a run may start; null means any time. */
             window: components["schemas"]["RebalanceWindow"] | null;
         };
-        /** @description Added in 0.16.0. Partial update of the automatic mode; `window` null removes the window. */
+        /** @description Added in 0.15.0. Partial update of the automatic mode; `window` null removes the window. */
         RebalanceAutomaticSettingsUpdate: {
             /** @description Whether the manager starts a rebalance by itself. Off by default. */
             enabled?: boolean;
@@ -6618,7 +6618,7 @@ export interface components {
             /** @description The time of day in which a run may start; null means any time. */
             window?: components["schemas"]["RebalanceWindow"] | null;
         };
-        /** @description Added in 0.16.0. What the automatic mode did last. */
+        /** @description Added in 0.15.0. What the automatic mode did last. */
         RebalanceAutomaticStatus: {
             /** @description Whether the mode is on. */
             enabled: boolean;
@@ -6640,7 +6640,7 @@ export interface components {
                 blockedBy: string[];
             } | null;
         };
-        /** @description Added in 0.16.0. Partial update of the rebalance settings; every member is optional but one is needed. `threshold` null takes the strategy default again. */
+        /** @description Added in 0.15.0. Partial update of the rebalance settings; every member is optional but one is needed. `threshold` null takes the strategy default again. */
         RebalanceSettingsUpdate: {
             /** @description Default number of concurrent bucket moves. */
             maxConcurrentMoves?: number;
@@ -6837,7 +6837,7 @@ export interface components {
             changes: components["schemas"]["ConfigChangeItem"][];
             /**
              * Format: int64
-             * @description Added in 0.17.0, optional. The configuration revision the client saw (`ConfigParameter.overrides[].revision`, or
+             * @description Added in 0.16.0, optional. The configuration revision the client saw (`ConfigParameter.overrides[].revision`, or
              *     `ConfigParameterList.revision`; 0 when it saw no stored value). `applyConfigChange` answers 409
              *     `config_change_superseded` when a value the request changes was changed by a later revision, unless it already holds the
              *     wanted value (so the repeat of a request whose change was recorded passes). Without it nothing is compared and the
@@ -6910,7 +6910,7 @@ export interface components {
             problems: components["schemas"]["ConfigProblem"][];
             /**
              * @description Things a valid change does that deserve a second look. A warning never makes the request invalid (`valid` depends on `problems` only) and
-             *     never stops `applyConfigChange`. Omitted by servers older than 0.17.0, so a client treats a missing property as an empty list.
+             *     never stops `applyConfigChange`. Omitted by servers older than 0.16.0, so a client treats a missing property as an empty list.
              */
             warnings?: components["schemas"]["ConfigWarning"][];
             /** @description One entry per server and parameter that the change touches. */
@@ -8186,7 +8186,7 @@ export interface components {
             confirm: string;
         };
         /**
-         * @description Alert type. Clients must tolerate kinds they do not know. Added in 0.16.0: `rebalanceFailed` (the last automatic rebalance failed and the mode is suspended until an operator starts a rebalance; subject `cluster`; `warning`). Added in 0.13.0: `certificateAuthorityUnavailable` (the map group was failed over and the new manager leader holds no key of the certificate authority, so no certificate can be issued, renewed or revoked until the operator restores `pki/ca.key` and `pki/revoked.json` from the backup of the old leader; subject `cluster`; `critical`). Added in 0.11.0 (ledger phase 7; subjects at `AlertSubject`): `ledgerNotAnchored` (a database has ledger tables and no anchor target is enabled; `info`, `warning` when the setting `anchor.required` is on), `ledgerAnchorBehind` (`warning`, `critical`), `ledgerAnchorFailed` (an anchor record is `failed` or `expired`; `critical`), `ledgerAnchorConflict` (the store holds a different object under the name of an anchor; `critical`), `ledgerChainDiverged` (a chain no longer extends its published log; `critical`), `ledgerGroupUnread` (a shard group's chain could not be read; `warning`, `critical`), `ledgerPublicationBehind` (the newest signed checkpoint of a chain is older than five publication intervals while its head advanced; `warning`), `ledgerSignerUnavailable` (no checkpoint could be signed for two rounds, or the key set is damaged, or the key file is missing on the leader; `critical`) and `ledgerDigestOverdue` (no digest within twice `digestIntervalSeconds`; `warning`). Added in 0.8.0: `clockDifference` (a server's clock differs from the manager leader's by more than `ClusterSettings.clock.maxDifferenceMs`, less the uncertainty of the measurement; `warning`, `critical` at ten times the threshold; `kingresd` does not set the system clock, run NTP or chrony). Added in 0.7.0: `leaseLost` (the `kingresd` that
+         * @description Alert type. Clients must tolerate kinds they do not know. Added in 0.15.0: `rebalanceFailed` (the last automatic rebalance failed and the mode is suspended until an operator starts a rebalance; subject `cluster`; `warning`). Added in 0.13.0: `certificateAuthorityUnavailable` (the map group was failed over and the new manager leader holds no key of the certificate authority, so no certificate can be issued, renewed or revoked until the operator restores `pki/ca.key` and `pki/revoked.json` from the backup of the old leader; subject `cluster`; `critical`). Added in 0.11.0 (ledger phase 7; subjects at `AlertSubject`): `ledgerNotAnchored` (a database has ledger tables and no anchor target is enabled; `info`, `warning` when the setting `anchor.required` is on), `ledgerAnchorBehind` (`warning`, `critical`), `ledgerAnchorFailed` (an anchor record is `failed` or `expired`; `critical`), `ledgerAnchorConflict` (the store holds a different object under the name of an anchor; `critical`), `ledgerChainDiverged` (a chain no longer extends its published log; `critical`), `ledgerGroupUnread` (a shard group's chain could not be read; `warning`, `critical`), `ledgerPublicationBehind` (the newest signed checkpoint of a chain is older than five publication intervals while its head advanced; `warning`), `ledgerSignerUnavailable` (no checkpoint could be signed for two rounds, or the key set is damaged, or the key file is missing on the leader; `critical`) and `ledgerDigestOverdue` (no digest within twice `digestIntervalSeconds`; `warning`). Added in 0.8.0: `clockDifference` (a server's clock differs from the manager leader's by more than `ClusterSettings.clock.maxDifferenceMs`, less the uncertainty of the measurement; `warning`, `critical` at ten times the threshold; `kingresd` does not set the system clock, run NTP or chrony). Added in 0.7.0: `leaseLost` (the `kingresd` that
          *     runs the primary of a shard group could not renew the group's lease in time; for a group with a standby the
          *     instance was stopped (fenced), for a group without one it keeps running and this alert is the only effect;
          *     `critical`), `groupWithoutSynchronousStandby` (the group's standby has been unreachable for longer than the
@@ -10198,7 +10198,7 @@ export interface operations {
     listColocationGroups: {
         parameters: {
             query?: {
-                /** @description Added in 0.16.0. Only the groups of this kind. */
+                /** @description Added in 0.15.0. Only the groups of this kind. */
                 kind?: "hash" | "schema";
             };
             header?: never;

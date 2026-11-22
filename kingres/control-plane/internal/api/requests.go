@@ -26,7 +26,7 @@ type DatabaseGeneralInput struct {
 type ShardingInput struct {
 	Enabled     bool `json:"enabled"`
 	BucketCount int  `json:"bucketCount,omitempty"`
-	// Mode is row (the default), schema or both (contract 0.16.0).
+	// Mode is row (the default), schema or both (contract 0.15.0).
 	Mode string `json:"mode,omitempty"`
 	// DistributeNewSchemas places every new schema on a shard group; only with mode schema or both.
 	DistributeNewSchemas *bool `json:"distributeNewSchemas,omitempty"`
@@ -54,7 +54,7 @@ type DatabaseUpdateRequest struct {
 	Ledger      *LedgerInput            `json:"ledger,omitempty"`
 }
 
-// DatabaseShardingUpdate is the "sharding" member of updateDatabase: every member is optional, one is needed (contract 0.16.0).
+// DatabaseShardingUpdate is the "sharding" member of updateDatabase: every member is optional, one is needed (contract 0.15.0).
 type DatabaseShardingUpdate struct {
 	Enabled              *bool   `json:"enabled,omitempty"`
 	Mode                 *string `json:"mode,omitempty"`
@@ -157,7 +157,7 @@ type LedgerVerifyRequest struct {
 }
 
 // RebalanceSettingsUpdate is the "rebalance" member of a settings update; every member is optional but one is
-// needed (contract 0.16.0 added all but the first).
+// needed (contract 0.15.0 added all but the first).
 type RebalanceSettingsUpdate struct {
 	MaxConcurrentMoves  *int     `json:"maxConcurrentMoves,omitempty"`
 	Strategy            *string  `json:"strategy,omitempty"`
@@ -167,7 +167,7 @@ type RebalanceSettingsUpdate struct {
 	MaxMoveAttempts     *int     `json:"maxMoveAttempts,omitempty"`
 	MaxDiskUsedFraction *float64 `json:"maxDiskUsedFraction,omitempty"`
 	MaxStandbyLagBytes  *int64   `json:"maxStandbyLagBytes,omitempty"`
-	// Automatic is the automatic mode (contract 0.16.0).
+	// Automatic is the automatic mode (contract 0.15.0).
 	Automatic *AutomaticSettingsUpdate `json:"automatic,omitempty"`
 }
 

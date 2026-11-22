@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <script setup lang="ts">
-// The weight of a server (contract 0.16.0): its capacity relative to the others. A server of weight 2 gets twice the
+// The weight of a server (contract 0.15.0): its capacity relative to the others. A server of weight 2 gets twice the
 // buckets (or bytes) of one of weight 1 at the next rebalance.
 import { computed, ref } from 'vue'
 import { useMutation, useQueryClient } from '@tanstack/vue-query'

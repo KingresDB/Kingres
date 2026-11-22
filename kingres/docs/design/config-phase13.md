@@ -359,7 +359,7 @@ the **order** of restarts and not of the stored values (below); `max_wal_senders
 `superuser_reserved_connections + reserved_connections + 1`, which PostgreSQL checks itself at start (the preview
 reads it from layer 3 and warns, it is not a hand-written table).
 
-**As built (contract 0.17.0):** the warning is `config_reserved_connections` in the new `warnings` of the preview. `postgres -C` does not
+**As built (contract 0.16.0):** the warning is `config_reserved_connections` in the new `warnings` of the preview. `postgres -C` does not
 check this rule (PostgreSQL checks it at the start of the postmaster, after the dry run), and `pg_file_settings` does not report it, so there
 is no layer-3 reading to use. The leader computes the sum from the values the change gives (the stored values that decide on each server, else
 the running ones) and warns for the first server where `max_connections < superuser_reserved_connections + reserved_connections + 1`. It is a
@@ -566,7 +566,7 @@ A new tag `Configuration`. All answers are `application/json` and every operatio
 |---|---|---|---|
 | `listConfigParameters` | `GET /config/parameters` | `kingres_readonly` | `ConfigParameterList` (`items`, `nextCursor`, `revision`, `partial`, `missingServers`). Query: `q` (name and description), `category`, `changed` (has an override), `differing` (values differ between servers), `pendingRestart`, `kind` (`settable`, `managed`, `refused`), `limit` (1 to 500, default 50 like the other lists), `cursor`. Keyset by name |
 | `getConfigParameter` | `GET /config/parameters/{name}` | `kingres_readonly` | `ConfigParameter` (404 `config_parameter_unknown`) |
-| `previewConfigChange` | `POST /config/changes/preview` | `kingres_admin` | `ConfigChangePreview`: `valid`, `problems[]` (per change: pointer, code, message), `effects[]` (per server and parameter: before, after, how it takes effect: `unchanged`, `reload`, `restart`, `waits` for a server that is down), `restartServerIds`, `restartOrder[]` and `restartOrderConflict`, and (0.17.0) the optional `warnings[]` (`index`, `pointer`, `code`, `message`: `config_value_unusual`, `config_reserved_connections`; never a reason for `valid` to be false). Status 200 also when `valid` is false (it is a question, not a request). Admin because it takes the same body as the change and reads nothing a readonly role needs; the console shows it to admins only |
+| `previewConfigChange` | `POST /config/changes/preview` | `kingres_admin` | `ConfigChangePreview`: `valid`, `problems[]` (per change: pointer, code, message), `effects[]` (per server and parameter: before, after, how it takes effect: `unchanged`, `reload`, `restart`, `waits` for a server that is down), `restartServerIds`, `restartOrder[]` and `restartOrderConflict`, and (0.16.0) the optional `warnings[]` (`index`, `pointer`, `code`, `message`: `config_value_unusual`, `config_reserved_connections`; never a reason for `valid` to be false). Status 200 also when `valid` is false (it is a question, not a request). Admin because it takes the same body as the change and reads nothing a readonly role needs; the console shows it to admins only |
 | `applyConfigChange` | `POST /config/changes` | `kingres_admin` | 202 `Task` (kind `config.apply`) with `Location`; 400 `validation_failed` / `config_value_invalid`, 422 `config_parameter_managed`, `config_parameter_refused`, `config_level_not_allowed`, `config_value_below_floor`, 404 `not_found` for an unknown server group, server or database, 409 `operation_in_progress` |
 | `listConfigChanges` | `GET /config/changes` | `kingres_readonly` | `ConfigChangeList` (history, newest first, keyset by `changeId`); query `name`, `level`, `scopeId`, `limit`, `cursor` |
 | `revertConfigChange` | `POST /config/changes/{changeId}/revert` | `kingres_admin` | 202 `Task`; 404 unknown change, 409 `config_change_superseded` |
@@ -720,7 +720,7 @@ that is off on one server and the time zone `Asia/Tehran`. Switches (mock only):
   limited by the guard's usual limits; `postgres -C` runs one at a time with a 10-second limit.
 - **Denial of service by settings**: floors protect `kingresd`'s own needs (above); everything else is the
   administrator's responsibility and the preview says when a value is far outside the default (a value more than
-  ten times the default of a memory parameter, or below a tenth, is flagged "unusual", not refused). Built in contract 0.17.0 as
+  ten times the default of a memory parameter, or below a tenth, is flagged "unusual", not refused). Built in contract 0.16.0 as
   the warning `config_value_unusual`: exactly ten times and exactly a tenth are not flagged, a parameter that is not a memory size
   (unit `B`, `kB` or `8kB`) is never flagged, and nor is a default of zero or a removal of a value.
 - **Roles**: the read operations are `kingres_readonly` like the other readers; a `kingres_stats` account
@@ -830,7 +830,7 @@ above with the code and the tests. Everything else was built and tested; what wa
 
 | What the design says | Found | Done |
 |---|---|---|
-| The preview warns that `max_connections` would not exceed the reserved connections ("Validation") | Not built: the preview had no place for a warning on a valid request | `warnings` added to `ConfigChangePreview` (contract 0.17.0, additive), code `config_reserved_connections`; `pgconfig/warnings.go`; the console shows it. Deviation: computed from the effective values, not read from layer 3 (see "Validation") |
+| The preview warns that `max_connections` would not exceed the reserved connections ("Validation") | Not built: the preview had no place for a warning on a valid request | `warnings` added to `ConfigChangePreview` (contract 0.16.0, additive), code `config_reserved_connections`; `pgconfig/warnings.go`; the console shows it. Deviation: computed from the effective values, not read from layer 3 (see "Validation") |
 | The preview flags a value more than ten times or below a tenth of the default of a memory parameter ("Security") | Not built | Code `config_value_unusual`, with the edges tested (exactly ten times, exactly a tenth, other units, zero default, string); the console and its mock show both warnings |
 | Integration: `pg_file_settings` is clean after a cluster-level change | Only `pg_settings` was read | `TestConfigFileSettingsAreCleanOnEveryServer` |
 | Integration: a value that PostgreSQL rejects in the file, injected past the validator, restores the file and reports PostgreSQL's text |  Only a server that cannot write its file was tested (`TestConfigFailedServerIsReported`, skipped when the tests run as a user that ignores directory modes) | `TestConfigValueRejectedByPostgreSQLInTheFileRestoresTheFile`: a time zone that no checker of `kingresd` knows is stored behind the validator |

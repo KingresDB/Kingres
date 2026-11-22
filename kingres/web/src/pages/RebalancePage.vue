@@ -48,7 +48,7 @@ const STATE_META: Record<RebalanceStatus['state'], StatusMeta> = tolerant({
 // Options shared by preview and start.
 const selectedDbs = ref<string[]>([])
 const maxMoves = ref<number | null>(null)
-// Contract 0.16.0: the strategy, the threshold, drain-only and the moves per server. Empty means the cluster setting.
+// Contract 0.15.0: the strategy, the threshold, drain-only and the moves per server. Empty means the cluster setting.
 const strategy = ref<'' | 'byBucketCount' | 'byDiskSize'>('')
 const threshold = ref<number | null>(null)
 const drainOnly = ref(false)

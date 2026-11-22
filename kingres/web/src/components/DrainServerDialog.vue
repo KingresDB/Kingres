@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <script setup lang="ts">
-// Drain a server (contract 0.16.0): the preview says what would move and what stands in the way, then the
+// Drain a server (contract 0.15.0): the preview says what would move and what stands in the way, then the
 // operation starts the task. A drain is a rebalance run (trigger "drain"); the Rebalance page shows its progress.
 import { computed, reactive } from 'vue'
 import SafeName from './SafeName.vue'

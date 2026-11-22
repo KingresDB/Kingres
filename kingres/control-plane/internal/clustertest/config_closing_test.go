@@ -173,7 +173,7 @@ func TestConfigDatabaseTimeZoneReachesTheStandbys(t *testing.T) {
 	}
 }
 
-// The warnings of the preview (contract 0.17.0) on a real cluster: they never make a request invalid, the
+// The warnings of the preview (contract 0.16.0) on a real cluster: they never make a request invalid, the
 // answer matches the contract, and the unusual-value rule has its edges at ten times and a tenth of the
 // default of PostgreSQL.
 func TestConfigPreviewWarnings(t *testing.T) {

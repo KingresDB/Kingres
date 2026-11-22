@@ -128,7 +128,7 @@ describe('detail pages and dialogs show hostile names safely', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
     await load('/databases/shop')
     await waitFor(() => expect(document.body.textContent).toMatch(/U\+202E/))
-    // the page has the Schemas table (0.16.0) and the Tables table: the tables of the database are the one with its own caption
+    // the page has the Schemas table (0.15.0) and the Tables table: the tables of the database are the one with its own caption
     expect(
       within(screen.getByRole('table', { name: /tables of the database/i })).getAllByRole(
         'rowheader',

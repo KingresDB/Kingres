@@ -7,6 +7,12 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-22 (staging branch g15): cp-1011, p13-fix and web-15b merged, contract revisions renumbered
+
+The staging branch g15 (from kingres-18) merges cp-1011, p13-fix and web-15b. The contract revisions are renumbered in merge order so that they follow kingres-18's 0.14.0: the control plane of phases 10 and 11 (written as 0.16.0 in cp-1011) is 0.15.0, and the closing of phase 13 (written as 0.17.0 in p13-fix) is 0.16.0. Entries of this log and the review files that were written on those branches still say 0.16.0 and 0.17.0; read them as 0.15.0 and 0.16.0. The failover branch, which carries an older 0.15.0, is renumbered when it merges. Generated files were regenerated; no migration numbers collide (cp-1011 has 0040 and 0041, p13-fix has none).
+
+---
+
 ## 2026-11-22 (second entry): the fixes for the review of the fixes of phase 13
 
 ### What was done

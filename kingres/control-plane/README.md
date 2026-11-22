@@ -306,7 +306,7 @@ handlers in `internal/httpapi/handlers_config.go`, wiring in `cmd/kingresd/confi
   PostgreSQL 18 shows `archive_command` and `restore_command` to every database user, so they are refused by name and
   their value is never returned by this API. Cluster-only parameters (`TimeZone`, `lc_*`, `DateStyle`,
   `kingres_shard.default_bucket_count`, ...) cannot be set per server group or server.
-- **Warnings of the preview** (contract 0.17.0, `pgconfig/warnings.go`) never make a request invalid: `config_value_unusual`
+- **Warnings of the preview** (contract 0.16.0, `pgconfig/warnings.go`) never make a request invalid: `config_value_unusual`
   for a memory value above ten times or below a tenth of the default of the parameter (exactly ten times and a tenth
   pass; a default of zero never warns), and `config_reserved_connections` when on some server `max_connections` would
   not exceed `superuser_reserved_connections + reserved_connections`. The sum is computed from the values the change
@@ -342,7 +342,7 @@ handlers in `internal/httpapi/handlers_config.go`, wiring in `cmd/kingresd/confi
 
 ## What is implemented
 
-The server implements revision **0.17.0** of the contract (140 operations, 113
+The server implements revision **0.16.0** of the contract (140 operations, 113
 paths; what is not done is in "Not done in this increment"). "Real" means the operation works against PostgreSQL or the local node
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
@@ -3514,10 +3514,10 @@ increment is installed in the installation of the tests.
 Not done: the rebalance does not look for an unfinished table task before it moves a bucket of the group (the extension refuses a move of a group that an operation claims; the rebalance then reports the move as failed); `Table.operation`
 (the unfinished task of a table) of the design is not in the contract yet; `relatedTables` of the distribute request (distribute with related tables) is increment 9.7; the free space of other servers.
 
-## Elasticity (phase 10, contract 0.16.0): strategies and weights, drain, automatic mode, split
+## Elasticity (phase 10, contract 0.15.0): strategies and weights, drain, automatic mode, split
 
 Design: [shard-phase10.md](../docs/design/shard-phase10.md), sections 4, 6, 8, 9, 11 and 21.11. The first increment (the six rebalance operations by bucket count) was built earlier (contract 0.9.0);
-this is what 0.16.0 adds. All of it needs the sharding extension 0.8; against an older one the plan stays the plan by bucket count (`kingres.rebalance_plan()`) and anything else is refused with
+this is what 0.15.0 adds. All of it needs the sharding extension 0.8; against an older one the plan stays the plan by bucket count (`kingres.rebalance_plan()`) and anything else is refused with
 422 `unsupported_operation`.
 
 **Strategies, threshold, weights (increment 2).** `rebalance.Options` has `strategy` (`byBucketCount`, `byDiskSize`), `threshold`, `drainOnly`, `maxMovesPerServer`, `acknowledgeFailures`,
@@ -3564,7 +3564,7 @@ The preview does not look for a table without a primary key: the extension refus
 Tests: unit tests in `internal/rebalance` (`options_test.go`, `drain_test.go`, `automatic_test.go`, `split_test.go`), `internal/ops` and `internal/api`; the cluster test `internal/clustertest/rebalance_strategies_test.go`
 (strategies, weights, exclusion, settings, a drain-only run) needs the 0.8 extension in the installation of the tests (`scripts/install-extensions.sh`).
 
-## Distributed schemas (phase 11, step 13, contract 0.16.0)
+## Distributed schemas (phase 11, step 13, contract 0.15.0)
 
 Design: [shard-phase11.md](../docs/design/shard-phase11.md), sections 13 and 16. The extension (0.8) does the work; `internal/ops/schemas.go` lists the schemas, refuses what can be refused before a task exists and runs three tasks,
 `internal/httpapi/handlers_schemas.go` has the five operations (`listSchemas`, `getSchema`, `distributeSchema`, `undistributeSchema`, `moveSchema`).

@@ -1018,7 +1018,7 @@ describe('who may do what', () => {
   })
 })
 
-describe('the warnings of a preview (contract 0.17.0)', () => {
+describe('the warnings of a preview (contract 0.16.0)', () => {
   it('flags a memory value above ten times or below a tenth of the default, not exactly ten times or a tenth', async () => {
     await login()
     // work_mem: default 4MB (4096 kB).

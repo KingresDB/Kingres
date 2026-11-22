@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.17.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.16.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and, when it is built, the planned `kingres-cli` (it does not exist yet). Lint it and run the mechanical rule check with:
 
 ```
@@ -151,8 +151,8 @@ Each task kind has exactly one `subject.type`; `subject.id` is always a string.
 | `database.create`, `database.update`, `database.drop` | `database` | the database name |
 | `table.distribute`, `table.undistribute`, `table.alter`, `table.partition` | `table` | `database/schema.table` (0.14.0: the table the request named; one table task per colocation group) |
 | `rebalance` | `cluster` | `cluster` (0.9.0; one rebalance at a time, cluster-wide; the task id is the report id): steps `Check that the cluster can rebalance`, `Compute the plan`, `Move buckets`, `Write the report`; a stopped run is `paused` |
-| `schema.distribute`, `schema.move`, `schema.undistribute` (0.16.0) | `schema` | `database/schema`: steps `Check the schema`, `Set REPLICA IDENTITY FULL`, `Make the schema distributed`, `Verify on every server`; `Check the move`, `Copy the data`, `Switch`, `Clean up the old copy`; `Check the schema`, `Move first`, `Make the schema local`, `Verify on every server`; one schema task at a time per schema |
-| `bucket.split` (0.16.0) | `bucket` | `database/colocationId/bucket`: steps `Check that the split can start`, `Split the bucket`, `Check the new buckets`; one split per colocation group at a time |
+| `schema.distribute`, `schema.move`, `schema.undistribute` (0.15.0) | `schema` | `database/schema`: steps `Check the schema`, `Set REPLICA IDENTITY FULL`, `Make the schema distributed`, `Verify on every server`; `Check the move`, `Copy the data`, `Switch`, `Clean up the old copy`; `Check the schema`, `Move first`, `Make the schema local`, `Verify on every server`; one schema task at a time per schema |
+| `bucket.split` (0.15.0) | `bucket` | `database/colocationId/bucket`: steps `Check that the split can start`, `Split the bucket`, `Check the new buckets`; one split per colocation group at a time |
 | `replication.restorePreferredPrimaries` | `replication` | `preferred-primaries` (0.10.0: answers `unsupported_operation` until the switchover is built) |
 | `ledger.verify` | `ledgerVerification` | the **database name**: the verification id exists only after the run (see `LedgerVerification.taskId`) |
 | `ledger.key.create`, `ledger.key.rotate`, `ledger.key.retire`, `ledger.key.revoke`, `ledger.key.distribute` (0.11.0) | `ledgerKey` | `signing`: the signing keys of the ledger; one key task at a time, cluster-wide. `ledger.key.create` makes the first key (generate, store, distribute, event, activate); `ledger.key.rotate` adds the next key and starts the overlap; `ledger.key.retire` and `ledger.key.revoke` end a key; `ledger.key.distribute` brings the holders of the key up to date (started by `kingresd` when the holders change). No private key, seed or passphrase is ever in a step, a detail, a result or an error |
@@ -320,10 +320,10 @@ Where the architecture document leaves something open, the simplest option was c
 
 ## Changelog
 
-### 0.17.0
+### 0.16.0
 
 Revision written with the closing of phase 13 (`kingres/docs/design/config-phase13.md`). Summary for the panel:
-0 operations added (140 operations, 113 paths); one schema, one optional response property and one optional request property added; **no change that is not additive**.
+0 operations added (149 operations, 121 paths); one schema, one optional response property and one optional request property added; **no change that is not additive**.
 
 #### Breaking
 
@@ -343,7 +343,7 @@ None.
 
 - The text of `previewConfigChange` and `ConfigWarning` says what each code means. A client that does not know `warnings` works as before.
 
-### 0.16.0
+### 0.15.0
 
 Revision written with the control plane of phases 10 (elasticity) and 11 (distributed schemas) of `kingres/docs/design/shard-phase10.md` and `shard-phase11.md`. It is built in increments; this
 entry grows with them. Summary for the panel:

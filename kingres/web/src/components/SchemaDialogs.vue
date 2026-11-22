@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <script setup lang="ts">
-// The three dialogs of a distributed schema (contract 0.16.0, design shard-phase11.md, section 14.2): distribute a local
+// The three dialogs of a distributed schema (contract 0.15.0, design shard-phase11.md, section 14.2): distribute a local
 // schema (the blockers are listed and the button waits while there are any), move one to another shard group (with the
 // tables that need REPLICA IDENTITY FULL), and make one local (type the name to confirm). Names can be hostile: they are
 // shown through SafeName and the confirmation types the real name.

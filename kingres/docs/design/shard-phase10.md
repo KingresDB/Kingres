@@ -1773,7 +1773,7 @@ Each was applied by changing the installed install script of PostgreSQL 18 and r
 | M18 | the switch keeps the default deadlock timeout | `t/206` D |
 | M19 | the old batch function (held rows counted with a new snapshot) | `t/206` B |
 
-## 22. The control plane of increments 2 to 4 and the split as built (contract 0.16.0): decisions and departures
+## 22. The control plane of increments 2 to 4 and the split as built (contract 0.15.0): decisions and departures
 
 **Decision: a drain is a task of kind `rebalance`, not of kind `server.drain` (departs from sections 9.1 and 11.3).** `drainServer` submits the task `rebalance` (subject `cluster`/`cluster`) with the
 options `trigger = drain`, `drainOnly`, the drained server, `removeWhenDone` and `acceptFewerReplicas`. Reason: everything the control plane already does for a rebalance is keyed by that kind and subject, and a drain must
