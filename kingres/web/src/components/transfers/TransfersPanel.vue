@@ -24,6 +24,8 @@ import type { DataExport } from '@/api/types'
 import { EXPORT_STATE } from '@/lib/status'
 import { formatBytes, formatDateTime, formatNumber } from '@/lib/format'
 import { formatLabel } from '@/lib/transfer'
+import { forgetUpload, listStoredUploads, type StoredUpload } from '@/lib/upload-store'
+import { ApiError } from '@/api/problem'
 
 const props = defineProps<{
   /** Only the files of this database (the page of a database); the panel says how many others exist. */
@@ -42,6 +44,24 @@ const shown = computed(() =>
   props.database === undefined ? all.value : all.value.filter((e) => e.database === props.database),
 )
 const others = computed(() => all.value.length - shown.value.length)
+
+/** The uploads this tab started and has not finished with (the tab's own memory; the server lists none). */
+const uploads = ref<StoredUpload[]>(listStoredUploads())
+const uploadError = ref<unknown>(null)
+async function deleteUpload(u: StoredUpload): Promise<void> {
+  uploadError.value = null
+  try {
+    await endpoints.deleteDataUpload(u.uploadId)
+  } catch (error) {
+    // A missing upload is already gone; any other refusal is shown and the upload is kept in the list.
+    if (!(error instanceof ApiError && error.status === 404)) {
+      uploadError.value = error
+      return
+    }
+  }
+  forgetUpload(u.uploadId)
+  uploads.value = listStoredUploads()
+}
 
 const downloading = ref<DataExport | null>(null)
 const deleting = ref<DataExport | null>(null)
@@ -155,6 +175,33 @@ function levels(e: DataExport): string {
         <span>More files exist than are shown here.</span>
       </p>
     </QueryBoundary>
+    <section
+      v-if="allowed && !off && uploads.length"
+      aria-labelledby="uploads-h"
+      class="stack"
+      data-testid="stored-uploads"
+    >
+      <h3 id="uploads-h">Uploads of this tab</h3>
+      <p class="muted">
+        Files this tab started to upload and has not imported. Choosing the same file in the import
+        dialog continues the upload. Delete one to free its room on the server.
+      </p>
+      <ul class="stack" style="gap: var(--s-1)">
+        <li v-for="u in uploads" :key="u.uploadId" class="row-between">
+          <span
+            ><SafeName :value="u.fileName" :max="80" />
+            <span class="muted"
+              >({{ formatBytes(u.sizeBytes) }}, for
+              <SafeName :value="`${u.database}.${u.schema}.${u.table}`" :max="80" />)</span
+            ></span
+          >
+          <GateButton op="deleteDataUpload" small variant="danger" @click="deleteUpload(u)">
+            Delete upload
+          </GateButton>
+        </li>
+      </ul>
+      <ProblemNotice v-if="uploadError" :error="uploadError" />
+    </section>
   </section>
 
   <DownloadExportDialog v-if="downloading" :file="downloading" @close="downloading = null" />

@@ -7,6 +7,7 @@
 import { ref } from 'vue'
 import GateButton from '@/components/GateButton.vue'
 import ExportTableDialog from './ExportTableDialog.vue'
+import ImportTableDialog from './ImportTableDialog.vue'
 import { useTransferGate } from '@/composables/useTransferGate'
 import type { Table } from '@/api/types'
 
@@ -16,7 +17,7 @@ const gate = useTransferGate(
   () => props.table.schema,
   () => props.table.name,
 )
-const open = ref<'export' | null>(null)
+const open = ref<'export' | 'import' | null>(null)
 </script>
 
 <template>
@@ -29,8 +30,23 @@ const open = ref<'export' | null>(null)
   >
     Export CSV
   </GateButton>
+  <GateButton
+    op="importTable"
+    small
+    :blocked-reason="gate.reason.value"
+    data-testid="import-csv"
+    @click="open = 'import'"
+  >
+    Import CSV
+  </GateButton>
   <ExportTableDialog
     v-if="open === 'export'"
+    :database-name="databaseName"
+    :table="table"
+    @close="open = null"
+  />
+  <ImportTableDialog
+    v-if="open === 'import'"
     :database-name="databaseName"
     :table="table"
     @close="open = null"

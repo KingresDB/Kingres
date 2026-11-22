@@ -666,6 +666,8 @@ export const endpoints = {
     if (held === null) throw new Error('The server did not say where the upload is.')
     return { offset: held, conflict: false }
   },
+  /** Asks whether the session is alive without sending the person away when it is not (the uploader asks between chunks). */
+  refreshSession: () => j(api.GET('/auth/session'), { keepSession: true }),
   deleteDataUpload: (uploadId: string) =>
     j(api.DELETE('/data-uploads/{uploadId}', { params: { path: { uploadId } } }), {
       keepSession: true,

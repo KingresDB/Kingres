@@ -6,8 +6,10 @@
 // Delete, and the states in which it shows no list (setting off, role too low).
 import { webcrypto } from 'node:crypto'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { screen, waitFor, within } from '@testing-library/vue'
+import { cleanup, screen, waitFor, within } from '@testing-library/vue'
 import userEvent from '@testing-library/user-event'
+import { endpoints } from '@/api/endpoints'
+import { listStoredUploads, rememberUpload } from '@/lib/upload-store'
 import { getState } from '@/mocks/http'
 import { applySwitches } from '@/mocks/switches'
 import { renderApp } from './helpers'
@@ -190,5 +192,52 @@ describe('Transfers panel', () => {
     expect(
       getState().transfer.exports.find((e) => e.meta.table === 'orders')?.meta.downloadedAt,
     ).not.toBeNull()
+  })
+})
+
+describe('Transfers panel, uploads of this tab', () => {
+  it('lists the uploads this tab remembers and deletes one on the server and in the memory', async () => {
+    const user = userEvent.setup()
+    await renderApp('/databases')
+    const created = await endpoints.createDataUpload({
+      purpose: 'tableImport',
+      sizeBytes: 1000,
+      fileName: 'a.csv',
+    })
+    rememberUpload({
+      uploadId: created.uploadId,
+      fileName: 'a.csv',
+      sizeBytes: 1000,
+      lastModified: 1,
+      database: 'shop',
+      schema: 'public',
+      table: 'notes',
+    })
+    cleanup()
+    await renderApp('/databases')
+    const list = await screen.findByTestId('stored-uploads')
+    expect(list).toHaveTextContent('a.csv')
+    expect(list).toHaveTextContent('shop.public.notes')
+    await user.click(within(list).getByRole('button', { name: /delete upload/i }))
+    await waitFor(() => expect(screen.queryByTestId('stored-uploads')).toBeNull())
+    expect(getState().transfer.uploads).toEqual([])
+    expect(listStoredUploads()).toEqual([])
+  })
+
+  it('forgets an upload the server no longer has (404) without a message', async () => {
+    const user = userEvent.setup()
+    rememberUpload({
+      uploadId: '999',
+      fileName: 'gone.csv',
+      sizeBytes: 1,
+      lastModified: 1,
+      database: 'shop',
+      schema: 'public',
+      table: 'notes',
+    })
+    await renderApp('/databases')
+    const list = await screen.findByTestId('stored-uploads')
+    await user.click(within(list).getByRole('button', { name: /delete upload/i }))
+    await waitFor(() => expect(screen.queryByTestId('stored-uploads')).toBeNull())
   })
 })
