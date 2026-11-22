@@ -46,6 +46,7 @@
 #include "hashing.h"
 #include "kingres_shard.h"
 #include "node_conn.h"
+#include "pushdown.h"
 #include "repartition.h"
 
 static Oid
@@ -564,6 +565,8 @@ kingres_shard_repart_prepare(Query *parse, const char **why)
 		cands = lappend(cands, cand);
 	}
 	ncands = list_length(cands);
+	if (ncands == 0 && c.outer_rti != 0)
+		RP_NO("with a LEFT JOIN only the table on its nullable side can be moved, and the others do not leave it one key class to be aligned with");
 	if (ncands == 0)
 		RP_NO("the distributed tables are not joined so that one repartition aligns them (the other tables must share one key class and the shipped table must equate a column with it)");
 
@@ -587,7 +590,12 @@ kingres_shard_repart_prepare(Query *parse, const char **why)
 	pi->ext = NULL;
 	pi->join = true;
 	pi->closed = false;
-	pi->partial = false;
+	/* J2: an aggregation above the join can be done in two steps by the groups (fs_partial_paths_one) */
+	{
+		const char *preason = NULL;
+
+		pi->partial = kingres_shard_enable_partial_aggregation && kingres_shard_partial_shape_ok(parse, false, &preason);
+	}
 	pi->ship = ship;
 	pi->repart = cands;
 	return pi;

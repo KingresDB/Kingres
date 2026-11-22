@@ -23,7 +23,7 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 use KingresShardTest qw(make_cluster run_sql);
 
-my ($n1, $n2) = make_cluster('rs', 2, extra => "kingres_shard.enable_repartition_join = force\n");
+my ($n1, $n2) = make_cluster('rs', 2, extra => "kingres_shard.enable_repartition_join = force\nkingres_shard.enable_partial_aggregation = on\n");
 $n1->safe_psql('postgres', q{
 	CREATE TABLE public.o (id int PRIMARY KEY, cust int, amount int);
 	SELECT kingres.create_distributed_table('public.o', 'id', bucket_count => 12);
@@ -104,6 +104,43 @@ for my $f (@forged)
 # D
 ($rc, $out, $err) = as_node($n2, 2, "/* kingres:query-fragment place=1 rp=1 */ DECLARE ks_f NO SCROLL CURSOR FOR $text\n\\bind '$ids' '$custs' \\g");
 isnt($rc, 0, 'D: a placement that is not the group\'s is refused');
+like($err, qr/KS001|bucket map of this node is not the one/, '... as a stale map, which a repeat can cure') or diag($err);
+
+# E: the first step of a partial aggregation over a repartitioned join (J2): the same rules, and the marker of the partial fragment has rp too
+($rc, my $pplan, $err) = run_sql($n1, q{EXPLAIN (VERBOSE, COSTS OFF) SELECT cu.name, count(*), sum(o.amount) FROM public.o JOIN public.cu ON cu.id = o.cust GROUP BY cu.name});
+my ($ptext) = $pplan =~ /Remote SQL: (.*)$/m;
+ok(defined $ptext && $pplan =~ /partial aggregate/, 'E: the grouped aggregate is a partial aggregation over the repartitioned join') or diag($pplan . $err);
+$ptext =~ s/UNNEST\(\$1, \$2\)/UNNEST(\$1::text[], \$2::text[])/ or die 'the shape of the text changed';
+sub pfragment
+{
+	my ($marker_tail, $body, @args) = @_;
+	my $sql = "/* kingres:partial-fragment place=$PLACE$marker_tail */ DECLARE ks_f NO SCROLL CURSOR FOR $body";
+	return @args ? "$sql\n\\bind " . join(' ', map { "'$_'" } @args) . " \\g" : $sql;
+}
+($rc, $out, $err) = as_node($n2, 2, pfragment(' rp=1', $ptext, $ids, $custs));
+is($rc, 0, 'E: the partial text with its marker and its arrays runs on a group') or diag($err);
+($rc, $out, $err) = as_node($n2, 2, pfragment('', $ptext, $ids, $custs));
+isnt($rc, 0, 'E: a partial text with a moved table and a marker without rp is refused');
+unlike($err, qr/KS001/, '... not as a stale map');
+($rc, $out, $err) = as_node($n2, 2, pfragment(' rp=2', $ptext, $ids, $custs));
+isnt($rc, 0, 'E: rp=2 on a partial text with one moved table is refused');
+unlike($err, qr/KS001/, '... not as a stale map');
+($rc, $out, $err) = as_node($n2, 2, pfragment(' rp=1', q{SELECT o.amount, count(*) FROM public.o GROUP BY o.amount}));
+isnt($rc, 0, 'E: rp=1 on a partial text without a moved table is refused');
+unlike($err, qr/KS001/, '... not as a stale map');
+($rc, $out, $err) = as_node($n2, 2, pfragment(' rp=0', $ptext, $ids, $custs));
+isnt($rc, 0, 'E: rp=0 is not a valid marker');
+for my $f (@forged)
+{
+	my ($name, $sub, $nargs) = @$f;
+	my $body = "SELECT cu.name, count(*) FROM ($sub) o JOIN public.cu ON cu.id = o.cust GROUP BY cu.name";
+	my @args = ($ids, $custs)[0 .. $nargs - 1];
+	($rc, $out, $err) = as_node($n2, 2, pfragment(' rp=1', $body, @args));
+	isnt($rc, 0, "E: $name, in a partial aggregation: refused");
+	unlike($err, qr/KS001/, '... not as a stale map');
+}
+($rc, $out, $err) = as_node($n2, 2, "/* kingres:partial-fragment place=1 rp=1 */ DECLARE ks_f NO SCROLL CURSOR FOR $ptext\n\\bind '$ids' '$custs' \\g");
+isnt($rc, 0, 'E: a placement that is not the group\'s is refused');
 like($err, qr/KS001|bucket map of this node is not the one/, '... as a stale map, which a repeat can cure') or diag($err);
 
 done_testing();

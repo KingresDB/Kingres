@@ -1188,17 +1188,32 @@ kingres_shard_query_fragment_analyze(Query *query, KsQueryFragment *qf, const ch
 char *
 kingres_shard_partial_marker(int64 place, const char *ext)
 {
+	return kingres_shard_partial_marker_rp(place, ext, 0);
+}
+
+/* J2: the marker of a partial aggregation over a repartitioned join carries rp=<number of shipped relations>, as a closed query's does */
+char *
+kingres_shard_partial_marker_rp(int64 place, const char *ext, int rp)
+{
+	if (rp > 0)
+	{
+		if (ext != NULL)
+			return psprintf(KS_PARTIAL_MARKER_PREFIX "place=" INT64_FORMAT " ext=%s rp=%d */ ", place, ext, rp);
+		return psprintf(KS_PARTIAL_MARKER_PREFIX "place=" INT64_FORMAT " rp=%d */ ", place, rp);
+	}
 	if (ext != NULL)
 		return psprintf(KS_PARTIAL_MARKER_PREFIX "place=" INT64_FORMAT " ext=%s */ ", place, ext);
 	return psprintf(KS_PARTIAL_MARKER_PREFIX "place=" INT64_FORMAT " */ ", place);
 }
 
 bool
-kingres_shard_parse_partial_marker(const char *query_string, int64 *place, char **ext)
+kingres_shard_parse_partial_marker(const char *query_string, int64 *place, char **ext, int *rp)
 {
 	const char *p;
 	char	   *end;
 
+	if (rp != NULL)
+		*rp = 0;
 	if (query_string == NULL ||
 		strncmp(query_string, KS_PARTIAL_MARKER_PREFIX, strlen(KS_PARTIAL_MARKER_PREFIX)) != 0)
 		return false;
@@ -1227,6 +1242,17 @@ kingres_shard_parse_partial_marker(const char *query_string, int64 *place, char 
 		if (ext != NULL)
 			*ext = pnstrdup(e, q - e);
 		end = (char *) q;
+	}
+	if (strncmp(end, " rp=", 4) == 0)
+	{
+		char	   *e2;
+		long		v = strtol(end + 4, &e2, 10);
+
+		if (e2 == end + 4 || v < 1 || v > 8)
+			return false;
+		if (rp != NULL)
+			*rp = (int) v;
+		end = e2;
 	}
 	return strncmp(end, " */ ", 4) == 0;
 }

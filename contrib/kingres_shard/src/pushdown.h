@@ -160,7 +160,8 @@ extern bool kingres_shard_parse_query_marker_rp(const char *query_string, int64 
 /* A partial aggregation (design 7): every group aggregates its own rows and returns the partial states. */
 #define KS_PARTIAL_MARKER_PREFIX "/* kingres:partial-fragment "
 extern char *kingres_shard_partial_marker(int64 place, const char *ext);
-extern bool kingres_shard_parse_partial_marker(const char *query_string, int64 *place, char **ext);
+extern char *kingres_shard_partial_marker_rp(int64 place, const char *ext, int rp);
+extern bool kingres_shard_parse_partial_marker(const char *query_string, int64 *place, char **ext, int *rp);
 
 typedef struct KsQueryFragment
 {

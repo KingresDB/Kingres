@@ -1485,14 +1485,16 @@ plan_forwarded(Query *parse, const char *query_string, int cursorOptions,
 	{
 		int64		place;
 		char	   *marker_ext = NULL;
+		int			marker_prp = 0;
 
-		if (kingres_shard_parse_partial_marker(query_string, &place, &marker_ext))
+		if (kingres_shard_parse_partial_marker(query_string, &place, &marker_ext, &marker_prp))
 		{
 			KsQueryFragment qf;
 			const char *why = NULL;
 
 			if ((check_marker_installed_versions(marker_ext), true) &&
 				kingres_shard_partial_fragment_analyze(parse, &qf, &why) &&
+				(marker_prp == qf.pd.nshipped || (why = "the shipped relations of the text are not the ones the marker counts", false)) &&
 				(check_marker_extensions(marker_ext, qf.ext), true))
 			{
 				PlannedStmt *pstmt = plan_partial_fragment(parse, query_string, cursorOptions, boundParams,
@@ -3542,7 +3544,7 @@ planner_hook_body(Query *parse, const char *query_string,
 
 		/* this node's own part of a partial aggregation returns partial states as the others do */
 		if (parse->commandType == CMD_SELECT && query_string != NULL &&
-			kingres_shard_parse_partial_marker(query_string, &pplace, NULL))
+			kingres_shard_parse_partial_marker(query_string, &pplace, NULL, NULL))
 			return plan_partial_fragment(parse, query_string, cursorOptions, boundParams, cat, a.ndist_rtes, true);
 		return pass_through(parse, query_string, cursorOptions, boundParams);
 	}

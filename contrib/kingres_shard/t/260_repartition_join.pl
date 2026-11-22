@@ -25,6 +25,7 @@ use KingresShardTest qw(run_sql);
 use KingresShardCompare;
 
 my $c = KingresShardCompare->new('rj', extra => "kingres_shard.enable_repartition_join = force
+kingres_shard.enable_partial_aggregation = on
 ");
 my ($n1, $n2, $n3) = $c->nodes;
 my @nodes = ($n1, $n2, $n3);
@@ -80,6 +81,7 @@ my @rep = (
 	[ 'LEFT JOIN: a condition of the ON clause on the moved table', q{SELECT cu.id, o.id, o.amount FROM public.cu LEFT JOIN public.o ON o.cust = cu.id AND o.amount > 90}, 0 ],
 	[ 'LEFT JOIN: a count of the matches', q{SELECT cu.region, count(o.id) FROM public.cu LEFT JOIN public.o ON o.cust = cu.id GROUP BY cu.region ORDER BY 1}, 1 ],
 	[ 'LEFT JOIN: a condition on the preserved side in the WHERE', q{SELECT cu.id, o.id FROM public.cu LEFT JOIN public.o ON o.cust = cu.id WHERE cu.region = 2}, 0 ],
+	[ 'an equality on the distribution key of the moved table', q{SELECT o.id, cu.name FROM public.o JOIN public.cu ON cu.id = o.cust WHERE o.id = 6}, 0 ],
 	[ 'a restriction on the key of the other table', q{SELECT o.id, cu.name FROM public.o JOIN public.cu ON cu.id = o.cust WHERE cu.id = 17}, 0 ],
 );
 for my $q (@rep)
@@ -237,5 +239,43 @@ for my $q (@not)
 		}
 	}
 }
+
+# ---------------------------------------------------------------------------
+# E. J2: aggregates above the repartitioned join: every group aggregates the rows of the join it holds, this node combines
+# ---------------------------------------------------------------------------
+my $PA = 'Pushed: repartitioned join, partial aggregate';
+my @agg = (
+	[ 'a count and a sum, grouped by a column of the other table', q{SELECT cu.region, count(*), sum(o.amount) FROM public.o JOIN public.cu ON cu.id = o.cust GROUP BY cu.region ORDER BY 1}, 1 ],
+	[ 'grouped by a column of the moved table', q{SELECT o.note, count(*), min(cu.id), max(cu.id) FROM public.o JOIN public.cu ON cu.id = o.cust GROUP BY o.note ORDER BY 1}, 1 ],
+	[ 'grouped by the key that aligns the tables', q{SELECT cu.id, count(*), sum(o.amount) FROM public.o JOIN public.cu ON cu.id = o.cust GROUP BY cu.id ORDER BY 1}, 1 ],
+	[ 'grouped by the column of the moved table that is the key', q{SELECT o.cust, count(*) FROM public.o JOIN public.cu ON cu.id = o.cust GROUP BY o.cust ORDER BY 1}, 1 ],
+	[ 'no grouping', q{SELECT count(*), sum(o.amount), avg(o.amount), min(cu.name), max(cu.name) FROM public.o JOIN public.cu ON cu.id = o.cust}, 0 ],
+	[ 'HAVING on an aggregate', q{SELECT cu.region, count(*) FROM public.o JOIN public.cu ON cu.id = o.cust GROUP BY cu.region HAVING count(*) > 100 ORDER BY 1}, 1 ],
+	[ 'ORDER BY an aggregate with a LIMIT', q{SELECT o.note, sum(o.amount) AS s FROM public.o JOIN public.cu ON cu.id = o.cust GROUP BY o.note ORDER BY s DESC, o.note LIMIT 5}, 1 ],
+	[ 'a FILTER', q{SELECT cu.region, count(*) FILTER (WHERE o.amount > 50), sum(o.amount) FILTER (WHERE o.note = 'n3') FROM public.o JOIN public.cu ON cu.id = o.cust GROUP BY cu.region ORDER BY 1}, 1 ],
+	[ 'an equality on the distribution key of the moved table (it must not prune the groups)', q{SELECT cu.region, count(*) FROM public.o JOIN public.cu ON cu.id = o.cust WHERE o.id = 6 GROUP BY cu.region ORDER BY 1}, 1 ],
+	[ 'a grouping by an expression', q{SELECT (o.amount % 4) AS b, count(*) FROM public.o JOIN public.cu ON cu.id = o.cust GROUP BY 1 ORDER BY 1}, 1 ],
+	[ 'three tables and a reference table', q{SELECT rg.label, count(*), sum(it.sku) FROM public.o JOIN public.cu ON cu.id = o.cust JOIN public.it ON it.id = cu.id JOIN public.rg ON rg.k = cu.region GROUP BY rg.label ORDER BY 1}, 1 ],
+	[ 'a LEFT JOIN to the moved table, count of the matches', q{SELECT cu.region, count(o.id), sum(o.amount) FROM public.cu LEFT JOIN public.o ON o.cust = cu.id GROUP BY cu.region ORDER BY 1}, 1 ],
+	[ 'a LEFT JOIN, no grouping', q{SELECT count(*), count(o.id) FROM public.cu LEFT JOIN public.o ON o.cust = cu.id}, 0 ],
+	[ 'an aggregate over an empty join', q{SELECT count(*), sum(o.amount) FROM public.o JOIN public.cu ON cu.id = o.cust WHERE cu.id < 0}, 0 ],
+	[ 'a grouped aggregate over an empty join', q{SELECT cu.region, count(*) FROM public.o JOIN public.cu ON cu.id = o.cust WHERE cu.id < 0 GROUP BY cu.region}, 0 ],
+	[ 'array_agg (combined in any order)', q{SELECT cu.region, count(*), array_length(array_agg(o.id), 1) FROM public.o JOIN public.cu ON cu.id = o.cust GROUP BY cu.region ORDER BY 1}, 1 ],
+);
+for my $q (@agg)
+{
+	my ($name, $sql, $ordered) = @$q;
+	$c->compare("repartition aggregate: $name", $sql, ordered => $ordered, plans => \@PLANS, profiles => 0, normalize => 1, path => [ $FS, $PA ]);
+}
+# what is not split stays above the join: the same answers, the join's rows come to this node
+for my $q ([ 'count(DISTINCT)', q{SELECT cu.region, count(DISTINCT o.note) FROM public.o JOIN public.cu ON cu.id = o.cust GROUP BY cu.region ORDER BY 1} ],
+		   [ 'string_agg with ORDER BY inside', q{SELECT cu.region, string_agg(o.note, ',' ORDER BY o.id) FROM public.o JOIN public.cu ON cu.id = o.cust WHERE o.id < 200 GROUP BY cu.region ORDER BY 1} ])
+{
+	my ($name, $sql) = @$q;
+	$c->compare("repartition aggregate: $name is not split", $sql, ordered => 1, plans => \@PLANS, profiles => 0, normalize => 1, path => [ $FS, $RJ ]);
+	unlike(plan_of($n1, $sql), qr/\Q$PA\E/, "repartition aggregate: $name: no partial aggregation");
+}
+unlike(plan_of($n1, $agg[0][1], 'SET kingres_shard.enable_partial_aggregation = off; '), qr/\Q$PA\E/, 'enable_partial_aggregation = off: the join rows come to this node');
+unlike(plan_of($n1, $agg[0][1], 'SET kingres_shard.enable_repartition_join = off; '), qr/\Q$RJ\E/, 'enable_repartition_join = off: no repartitioned join');
 
 done_testing();
