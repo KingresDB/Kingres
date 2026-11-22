@@ -193,6 +193,7 @@ whose hash the key holder signed, and that it can be rebuilt from the source you
 | 2 | usage or input error: a flag is missing or wrong, a file or directory **you named** cannot be read (it is absent, not a regular file, too large) or is malformed (digest, columns file, trust file, state file), or no key of the trust file can be used at the time given, or **a checkpoint you hold** (`--state`, `--old FILE`) cannot serve as your anchor (no key of the trust file signed it; for a plain note given as `--old FILE` also: only a revoked key, or one beyond its `max_tree_size`, signed it; see "Checkpoints you hold"), or the state file stayed locked by another run for 10 seconds, or the lock file belongs to another user, or **the result could not be written** to the standard output (a full disk, a short write, a closed pipe: the line `could not be written to the standard output` is on the standard error; a closed descriptor: see "The standard output"), in text and in `--json`, on every command: a verdict nobody could read is not status 0. A run whose verdict is not 0 keeps its status when its output cannot be written; nothing was verified |
 | 3 | incomplete: nothing failed, but **something that was asked for could not be checked with the inputs and flags given**: the publication does not contain it (a checkpoint, a tile, the directory of a log) or the source cannot be reached; `INCOMPLETE` is printed and the missing items are listed; `VERIFIED` is never printed. **Treat 3 as an alert, never as "probably fine"**: a publisher must serve the tiles of every checkpoint it signed, so one that withholds exactly the tiles that would show a fork gets status 3 and not status 1, and a missing file is at best neglect. The commands that read a publication or a bundle can end with 3 (`checkpoint`, `consistency`, `aggregate`, `anchors`, `attestation`, `bundle` and `monitor`); the commands that check one given proof, block export or digest list do not; a failure always wins over an incomplete check |
 | 4 | a fork or a rollback was found, which is what status 1 says for it, **and the conflicting checkpoint could not be saved** (every name for the evidence is taken by a file with other content, or the disk refuses it); `FAILED at step fork` (or `rollback`) is printed with a note that says `was NOT saved`. The finding stands and is as serious as a 1: act on the fork and save the note you were shown yourself. Only `checkpoint --state` can end with 4 |
+| 5 | only `release verify`: the signature and the hashes are genuine and the set was made by a dry run (the signed `RELEASE` file says the commit or its date is `unknown`): a signed build that is not a release. `--accept-dry-run` gives 0. It is not in the table of commands below, which lists the statuses of a pass or a failure |
 
 A malformed **proof** or **block export** is a failed verification (status 1, step
 `parse`): it is the thing under test. A malformed **digest** is an input error
@@ -223,7 +224,7 @@ unknown subcommand.
 | `bundle fetch` | 0, 1, 2, 3 |
 | `monitor` | 0, 1, 2, 3 |
 | `attestation` | 0, 1, 2, 3 |
-| `release verify` | 0, 1, 2, 5 (a genuine set made by a dry run: `--accept-dry-run` gives 0) |
+| `release verify` | 0, 1, 2 |
 | `trust init` | 0, 2 |
 | `trust show` | 0, 2 |
 | `trust follow` | 0, 1, 2, 3 |
