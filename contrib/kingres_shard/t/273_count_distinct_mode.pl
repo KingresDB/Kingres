@@ -106,6 +106,22 @@ is(one('SELECT count(*) FROM (SELECT count(DISTINCT u) AS c FROM public.loc) x, 
 is(one('SELECT count(DISTINCT u) FROM public.ev WHERE false', $A), '0', 'an empty input counts 0');
 is(one('SELECT count(DISTINCT u) FROM public.ev WHERE id = 5', $A), '1', 'a statement routed to one bucket counts 1');
 
+# the plans say the same: what is left alone keeps count(DISTINCT), what is rewritten loses it
+for my $c (['an aggregate with ORDER BY', 'SELECT count(DISTINCT u ORDER BY u) FROM public.ev', 0],
+           ['a row-typed argument', 'SELECT count(DISTINCT (u, grp)) FROM public.ev', 0],
+           ['an array argument', 'SELECT count(DISTINCT ARRAY[u]) FROM public.ev', 0],
+           ['HAVING', 'SELECT grp FROM public.ev GROUP BY grp HAVING count(DISTINCT u) > 2000', 1],
+           ['a FILTER', 'SELECT count(DISTINCT u) FILTER (WHERE grp = 2) FROM public.ev', 1],
+           ['a sub-select', 'SELECT sum(c) FROM (SELECT grp, count(DISTINCT u) AS c FROM public.ev GROUP BY grp) x', 1],
+           ['a reference table', 'SELECT count(DISTINCT u) FROM public.ref', 0])
+{
+	my ($name, $sql, $rewritten) = @$c;
+	my $p = plan_of($sql, $A);
+	if ($rewritten) { like($p, qr/approx_count_distinct/, "plan: $name is rewritten"); unlike($p, qr/count\(DISTINCT/, "plan: ... and has no count(DISTINCT)"); }
+	else { like($p, qr/count\(DISTINCT/, "plan: $name keeps count(DISTINCT)"); unlike($p, qr/approx_count_distinct/, "plan: ... and has no sketch"); }
+}
+
+
 # a session sets it for itself; another session is not affected
 is(one('SELECT count(DISTINCT u) FROM public.ev'), '3000', 'a session that did not set it is exact');
 # ALTER DATABASE SET: the way the console turns it on

@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Portions Copyright (c) 2026, RooyeKhat Media Co
 #
-# t/271_columnar_refusals.pl: what a columnar distributed table refuses (design/analytics-phase12-storage.md, 9.3, 9.7, increment S2).
+# t/271_columnar_refusals.pl: what a columnar distributed table refuses (design/analytics-phase12-storage.md, 9.3, 9.7, increments S2 and S3).
 #   * the online variants of the table lifecycle (they capture changes with a row trigger, which columnar does not support) are
 #     refused by the report, before anything is made;
-#   * a bucket move that would carry a columnar relation is refused in "preparing", whether the relation is a bucket partition, a table
-#     of the colocation group that is not the first, or a leaf of a user-partitioned table; nothing is left behind;
+#   * a bucket move that would carry a columnar relation is refused in "preparing" when the installed kingres_columnar (0.1) cannot decode
+#     its changes, as a group, with nothing left behind, and works after the upgrade to 0.2;
 #   * a split of a columnar table is refused with the words of the design;
-#   * a heap group moves as before.
 # Needs kingres_columnar built and installed into the same installation as kingres_shard.
 
 use strict;
@@ -61,61 +60,54 @@ is(qs($n1, 'SELECT count(*) FROM kingres.table_operation'), '0', 'no operation i
 qs($n1, "SELECT kingres.alter_distributed_table('public.cc', bucket_count => 4)");
 is(qs($n2, 'SELECT count(*) || \',\' || sum(id) FROM public.cc'), '400,80200', 'the blocking variant works: the table is whole');
 
-# a bucket move refuses a columnar bucket partition, in preparing
-my $C = qs($n1, "SELECT colocation_id FROM kingres.dist_table WHERE relid = 'public.cc'::regclass");
-my $before = qs($n1, "SELECT string_agg(bucket || ':' || group_id, ',' ORDER BY bucket) FROM kingres.bucket_map WHERE colocation_id = $C");
-my $src = bucket_group($C, 1);
-my $dst = 1 - $src;
-($st, $msg) = state_of("kingres.move_bucket($C, 1, $dst)");
-is($st, '0A000', 'move_bucket of a columnar bucket: feature_not_supported');
-like($msg, qr/^bucket move refused: relation "public\.cc_b0001" has columnar storage/, '... with the words of the design and the name of the partition');
-is(qs($n1, "SELECT string_agg(bucket || ':' || group_id, ',' ORDER BY bucket) FROM kingres.bucket_map WHERE colocation_id = $C"), $before, 'the bucket map is as it was');
-is(leftovers($n1), '0,0,0,0', 'nothing is left on the source (subscriptions, slots, publications, copy tables)');
-is(leftovers($n2), '0,0,0,0', 'nor on the target');
-is(qs($n1, "SELECT count(*) FROM kingres.bucket_move WHERE phase NOT IN ('done', 'failed', 'cancelled')") , '0', 'and no move is in progress');
-
-# a heap table colocated with it: the group is refused as a whole, naming the columnar table
-qs($n1, q{
-	CREATE TABLE public.hh (id int PRIMARY KEY, v text);
-	INSERT INTO public.hh SELECT g, 'h' || g FROM generate_series(1, 100) g;
-});
-qs($n1, "SELECT kingres.create_distributed_table('public.hh', 'id', colocate_with => 'public.cc')");
-($st, $msg) = state_of("kingres.move_bucket($C, 1, $dst)");
-like($msg, qr/relation "public\.cc_b0001" has columnar storage/, 'a group of a columnar and a heap table is refused, naming the columnar table');
-
-# a heap-only group moves as before
-qs($n1, q{
-	CREATE TABLE public.hz (id int PRIMARY KEY, v text);
-	INSERT INTO public.hz SELECT g, 'z' || g FROM generate_series(1, 200) g;
-});
-qs($n1, "SELECT kingres.create_distributed_table('public.hz', 'id', bucket_count => 6)");
-my $H = qs($n1, "SELECT colocation_id FROM kingres.dist_table WHERE relid = 'public.hz'::regclass");
-isnt($H, $C, 'the heap table is in a group of its own');
-my $hsrc = bucket_group($H, 2);
-my ($rc, undef, $err) = run_sql($n1, "SELECT kingres.move_bucket($H, 2, " . (1 - $hsrc) . ")");
-is($rc, 0, 'a heap group still moves') or diag($err);
-is(bucket_group($H, 2), 1 - $hsrc, '... and the bucket is on the other group');
-is(qs($n2, 'SELECT count(*) FROM public.hz'), '200', '... with every row');
-
-# a leaf of a user-partitioned table that is columnar
-qs($n1, q{
-	CREATE TABLE public.up (id int, d date, v text, PRIMARY KEY (id, d)) PARTITION BY RANGE (d);
-	CREATE TABLE public.up_old PARTITION OF public.up FOR VALUES FROM ('2020-01-01') TO ('2021-01-01') USING columnar;
-	CREATE TABLE public.up_new PARTITION OF public.up FOR VALUES FROM ('2021-01-01') TO ('2022-01-01');
-	INSERT INTO public.up SELECT g, '2020-06-01'::date + (g % 300), 'u' || g FROM generate_series(1, 300) g;
-});
-qs($n1, "SELECT kingres.create_distributed_table('public.up', 'id', bucket_count => 5)");
-my $U = qs($n1, "SELECT colocation_id FROM kingres.dist_table WHERE relid = 'public.up'::regclass");
-my $lo = leftovers($n1) . ';' . leftovers($n2);
-($st, $msg) = state_of("kingres.move_bucket($U, 0, " . (1 - bucket_group($U, 0)) . ")");
-is($st, '0A000', 'a user-partitioned bucket with a columnar leaf is refused');
-like($msg, qr/relation "public\.up_old_b0000" has columnar storage/, '... naming the leaf');
-is(leftovers($n1) . ';' . leftovers($n2), $lo, 'nothing is left behind (what the move of the heap group left, the copy that waits for its cleanup, is all there is)');
-
 # a split of a columnar table is refused with the words of the design
+my $C = qs($n1, "SELECT colocation_id FROM kingres.dist_table WHERE relid = 'public.cc'::regclass");
 ($st, $msg) = state_of("kingres.split_bucket($C, 1, 2)");
 is($st, '0A000', 'split_bucket of a columnar table: feature_not_supported');
 like($msg, qr/^bucket split refused: table "public\.cc" is columnar; a split needs a primary key, row locks and update triggers/, '... with the words of the design');
 
-is(prepared_count($_), '0', 'nothing is prepared on ' . $_->name) for ($n1, $n2);
+# a bucket move refuses a columnar relation when the installed kingres_columnar cannot decode its changes (version 0.1), in
+# preparing, before anything is made.  (With kingres_columnar 0.2 the move works: t/274.)
+my ($m1, $m2) = make_cluster('co', 2, logical => 1, extra => "shared_preload_libraries = 'kingres_shard,kingres_columnar'\n");
+$_->safe_psql('postgres', q{CREATE EXTENSION kingres_columnar VERSION '0.1'}) for ($m1, $m2);
+is(qs($m1, q{SELECT extversion FROM pg_extension WHERE extname = 'kingres_columnar'}), '0.1', 'the second cluster has kingres_columnar 0.1');
+qs($m1, q{
+	CREATE TABLE public.cc (id int, v text) USING columnar;
+	INSERT INTO public.cc SELECT g, 'c' || g FROM generate_series(1, 400) g;
+	SELECT kingres.create_distributed_table('public.cc', 'id', bucket_count => 4);
+	CREATE TABLE public.hh (id int PRIMARY KEY, v text);
+	INSERT INTO public.hh SELECT g, 'h' || g FROM generate_series(1, 100) g;
+	SELECT kingres.create_distributed_table('public.hh', 'id', colocate_with => 'public.cc');
+});
+sub state_m
+{
+	my ($sql) = @_;
+	my (undef, undef, $err) = run_sql($m1, "\\set VERBOSITY verbose\nSELECT $sql");
+	return ($err =~ /ERROR:\s+(\w{5}):\s+([^\n]*)\n(.*)/s) ? ($1, $2, $3) : ('none', $err, '');
+}
+sub leftovers_m
+{
+	my ($n) = @_;
+	return qs($n, q{SELECT (SELECT count(*) FROM pg_subscription) || ',' || (SELECT count(*) FROM pg_replication_slots) || ',' || (SELECT count(*) FROM pg_publication)
+	                || ',' || (SELECT count(*) FROM pg_class WHERE obj_description(oid, 'pg_class') LIKE 'kingres_shard bucket move%')});
+}
+my $MC = qs($m1, "SELECT colocation_id FROM kingres.dist_table WHERE relid = 'public.cc'::regclass");
+my $before = qs($m1, "SELECT string_agg(bucket || ':' || group_id, ',' ORDER BY bucket) FROM kingres.bucket_map WHERE colocation_id = $MC");
+my $from = qs($m1, "SELECT group_id FROM kingres.bucket_map WHERE colocation_id = $MC AND bucket = 1");
+my ($mst, $mmsg, $mrest) = state_m("kingres.move_bucket($MC, 1, " . (1 - $from) . ")");
+is($mst, '0A000', 'move_bucket with kingres_columnar 0.1: feature_not_supported');
+like($mmsg, qr/^bucket move refused: relation "public\.cc_b0001" has columnar storage, and the installed kingres_columnar cannot decode its changes$/, '... with the words of the design and the name of the partition');
+like($mrest, qr/HINT:\s+Move buckets of this table after kingres_columnar is upgraded to a version that supports logical decoding \(0\.2\), or convert the table to row storage/, '... and its hint');
+is(qs($m1, "SELECT string_agg(bucket || ':' || group_id, ',' ORDER BY bucket) FROM kingres.bucket_map WHERE colocation_id = $MC"), $before, 'the bucket map is as it was');
+is(leftovers_m($m1) . ';' . leftovers_m($m2), '0,0,0,0;0,0,0,0', 'nothing is left behind (subscriptions, slots, publications, copy tables)');
+is(qs($m1, "SELECT count(*) FROM kingres.bucket_move WHERE phase NOT IN ('done', 'failed', 'cancelled')"), '0', 'and no move is in progress');
+# a heap table of the group does not move alone: the group is refused as a whole, with the name of the columnar relation
+($mst, $mmsg) = state_m("kingres.move_bucket($MC, 1, " . (1 - $from) . ")");
+like($mmsg, qr/relation "public\.cc_b0001" has columnar storage/, 'a group of a columnar and a heap table is refused as a whole');
+# upgraded, the same call works
+qs($_, q{ALTER EXTENSION kingres_columnar UPDATE TO '0.2'}) for ($m1, $m2);
+my ($rc, undef, $err) = run_sql($m1, "SELECT kingres.move_bucket($MC, 1, " . (1 - $from) . ")");
+is($rc, 0, 'after ALTER EXTENSION kingres_columnar UPDATE the bucket moves') or diag($err);
+
+is(prepared_count($_), '0', 'nothing is prepared on ' . $_->name) for ($n1, $n2, $m1, $m2);
 done_testing();

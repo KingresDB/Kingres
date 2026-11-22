@@ -2304,15 +2304,35 @@ parent (a columnar leaf for cold data next to heap leaves); `internal_partition_
   with `mode = 'online'`, for a table whose access method is not heap), so the call is refused with SQLSTATE `0A000` before an operation
   is recorded, and the message names the blocking variant.  The blocking variants (`create_distributed_table`, `alter_distributed_table`,
   `undistribute_table`) copy through the row router and work on a columnar table; they are the way to rebuild one.
-- **A bucket move.**  `move_bucket` refuses in `preparing`, before it changes anything, when a bucket partition of any table of the colocation
-  group (or a leaf of a user-partitioned one) has another access method than heap: SQLSTATE `0A000`, `bucket move refused: relation
-  "public.cc_b0001" has columnar storage, which this version does not move`.  The group is refused as a whole, naming the first such relation,
-  so a heap table colocated with a columnar one cannot move on its own either (increment S3 lifts this).
+- **A bucket move** works when the installed `kingres_columnar` decodes its changes (0.2 or later, increment S3, below).  With 0.1, or with another access method than columnar,
+  `move_bucket` refuses in `preparing`, before it changes anything: SQLSTATE `0A000`, `bucket move refused: relation "public.cc_b0001" has columnar storage, and the
+  installed kingres_columnar cannot decode its changes` (hint: upgrade to 0.2, or convert the table to row storage).  The group is refused as a whole, naming the first such
+  relation, so a heap table colocated with a columnar one cannot move on its own either.
 - **A split.**  `split_bucket` of a group with a columnar table is refused in the same place with the words of the design: `bucket split refused:
   table "public.cc" is columnar; a split needs a primary key, row locks and update triggers on the table, which columnar tables do not have`
   (`0A000`).  A split stays refused for a columnar table in every version of this part.
 - **The ledger (rule L1).**  A ledger table cannot be columnar and the reverse: see the README of `kingres_ledger` (`ledger_enable` refuses a columnar table;
   a rewrite by `SET ACCESS METHOD` of a ledger table is rejected).
+
+### Bucket moves of columnar relations (increment S3)
+
+A bucket of a columnar distributed table moves like any other (design 9.3 and 11.6), by logical replication between the nodes:
+
+- **The copy has the access method of the source.**  `internal_move_inspect` on the source answers with the access method of each bucket partition that is not heap, and
+  `internal_create_move_tables` creates the copy on the target `USING columnar`, with the storage parameters and `REPLICA IDENTITY FULL` of the source partition (the leaves of
+  a user-partitioned bucket are created with their own access methods, each non-heap leaf with `REPLICA IDENTITY FULL`).  Heap and columnar leaves can sit in one tree.
+- **The initial copy** is the table synchronization of the subscription (`COPY` of the rows, which the target stores in full stripes); **the changes** made while the move runs are
+  the inserts that `kingres_columnar` 0.2 decodes (only inserts exist: no `UPDATE` or `DELETE` can reach a columnar table).  The publisher needs `wal_level = logical` and the
+  library preloaded, as for any columnar write; the target must have `kingres_columnar` (its parent table is columnar, so the access method is there).
+- **What is checked:** the installed `kingres_columnar` is 0.2 or later on the source (otherwise the refusal above), the access method is columnar (another one is refused),
+  and the target can make the table (its parent has the access method).
+- The switch, the old copy kept until `move_cleanup_delay` and `check_cluster` are the same as for a heap bucket.  The switch of a user-partitioned bucket publishes the root with
+  `publish_via_partition_root`; a columnar leaf is delivered to the target's tree like a heap leaf (`t/274`: rows inserted during the move into both kinds of leaf).
+
+Not done: the design has the move call `columnar_compact` on the copy before the switch, to merge the small stripes that the apply worker makes; version 0.9 does not
+(the stripes of the initial copy are full; the stripes of the changes of the move are as many as the source transactions: run `kingres.columnar_compact` on the bucket partition
+afterwards when many small transactions wrote during a long move).  The options of `columnar_set_options` of a bucket partition (compression, stripe size) are not carried to
+the copy either.  Test: `t/274_columnar_move`.
 
 ## Approximate `count(DISTINCT x)` (version 0.9, phase 12)
 

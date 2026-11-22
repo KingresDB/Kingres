@@ -537,7 +537,8 @@ REVOKE ALL ON FUNCTION kingres.table_change_report(text, regclass, jsonb), kingr
 -- ---------------------------------------------------------------------------
 
 -- internal_move_inspect(): on the source, a bucket partition or a leaf of a user-partitioned bucket partition that is not heap stops the
--- move in "preparing", before anything is made, with a stable text.  (Increment S3 lifts this refusal for the access method columnar.)
+-- move in "preparing", before anything is made, with a stable text, unless the access method is columnar and the installed kingres_columnar decodes
+-- its changes (0.2, increment S3): then the answer carries the access method of the bucket partition for the copy.
 CREATE OR REPLACE FUNCTION kingres.internal_move_inspect(p_role text, p_bucket int, p_bucket_count int, p_tables jsonb)
     RETURNS jsonb
     LANGUAGE plpgsql
@@ -557,6 +558,9 @@ DECLARE
     v_col     pg_catalog.text;
     v_origins pg_catalog.text;
     v_columnar pg_catalog.text;
+    v_amname pg_catalog.text;
+    v_colver pg_catalog.text;
+    v_bam    pg_catalog.text;
 BEGIN
     PERFORM kingres.internal_require_superuser();
     SELECT l.node_id INTO v_node FROM kingres.local_node l;
@@ -623,7 +627,9 @@ BEGIN
                           DETAIL = 'Logical replication needs a primary key or REPLICA IDENTITY FULL to replicate updates and deletes of the bucket.',
                           HINT = pg_catalog.format('Add a primary key, or set REPLICA IDENTITY FULL on the bucket partitions of %I.%I on the node that has them (ALTER TABLE is not propagated for it: superuser, kingres_shard.enable_routing = off).', t.schema_name, t.table_name);
             END IF;
-            SELECT pg_catalog.format('%I.%I', ln.nspname, lc.relname) INTO v_columnar
+            -- S3: a relation that is not heap moves when its changes can be decoded: the copy is made with its access method (the
+            -- answer carries it), the initial copy is the stripe-wise COPY and the changes are the decoded inserts of kingres_columnar 0.2.
+            SELECT pg_catalog.format('%I.%I', ln.nspname, lc.relname), a.amname INTO v_columnar, v_amname
               FROM pg_catalog.pg_partition_tree(v_oid) pt
               JOIN pg_catalog.pg_class lc ON lc.oid OPERATOR(pg_catalog.=) pt.relid
               JOIN pg_catalog.pg_namespace ln ON ln.oid OPERATOR(pg_catalog.=) lc.relnamespace
@@ -631,10 +637,19 @@ BEGIN
              WHERE lc.relkind OPERATOR(pg_catalog.=) 'r' AND a.amname OPERATOR(pg_catalog.<>) 'heap'
              ORDER BY lc.relname LIMIT 1;
             IF v_columnar IS NOT NULL THEN
-                RAISE EXCEPTION 'bucket move refused: relation "%" has columnar storage, which this version does not move', v_columnar
-                    USING ERRCODE = '0A000',
-                          HINT = 'Convert the table to row storage, or move its buckets after a version of kingres_shard that moves columnar relations.';
+                IF v_amname OPERATOR(pg_catalog.<>) 'columnar' THEN
+                    RAISE EXCEPTION 'bucket move refused: relation "%" uses the access method "%", which a bucket move does not carry', v_columnar, v_amname
+                        USING ERRCODE = '0A000';
+                END IF;
+                SELECT e.extversion INTO v_colver FROM pg_catalog.pg_extension e WHERE e.extname OPERATOR(pg_catalog.=) 'kingres_columnar';
+                IF v_colver IS NULL OR pg_catalog.string_to_array(v_colver, '.')::pg_catalog.int4[] OPERATOR(pg_catalog.<) ARRAY[0, 2] THEN
+                    RAISE EXCEPTION 'bucket move refused: relation "%" has columnar storage, and the installed kingres_columnar cannot decode its changes', v_columnar
+                        USING ERRCODE = '0A000',
+                              HINT = 'Move buckets of this table after kingres_columnar is upgraded to a version that supports logical decoding (0.2), or convert the table to row storage';
+                END IF;
             END IF;
+            SELECT a.amname INTO v_bam FROM pg_catalog.pg_class c JOIN pg_catalog.pg_am a ON a.oid OPERATOR(pg_catalog.=) c.relam
+             WHERE c.oid OPERATOR(pg_catalog.=) v_oid AND c.relkind OPERATOR(pg_catalog.=) 'r' AND a.amname OPERATOR(pg_catalog.<>) 'heap';
             IF v_ident OPERATOR(pg_catalog.=) 'i' THEN
                 RAISE EXCEPTION 'table "%.%" uses REPLICA IDENTITY USING INDEX, which a bucket move does not support yet', t.schema_name, t.table_name
                     USING ERRCODE = 'feature_not_supported',
@@ -649,7 +664,8 @@ BEGIN
             END IF;
             v_out := v_out OPERATOR(pg_catalog.||) (pg_catalog.jsonb_build_object(
                 'schema_name', t.schema_name, 'table_name', t.table_name, 'replident', v_ident)
-                OPERATOR(pg_catalog.||) kingres.internal_move_tree(v_oid));
+                OPERATOR(pg_catalog.||) kingres.internal_move_tree(v_oid)
+                OPERATOR(pg_catalog.||) CASE WHEN v_bam IS NULL THEN '{}'::pg_catalog.jsonb ELSE pg_catalog.jsonb_build_object('am', v_bam) END);
         ELSE
             IF v_oid IS NOT NULL THEN
                 RAISE EXCEPTION 'relation "%.%" already exists on node %', t.schema_name, v_part, v_node
@@ -861,6 +877,66 @@ BEGIN
             detail := 'the table is a ledger table of this node and also a distributed or reference table: a ledger covers the rows of one node only, so this one proves nothing about the table as a whole (kingres_shard refuses to distribute a ledger table; the ledger was enabled afterwards)';
             RETURN NEXT;
         END LOOP;
+    END LOOP;
+END;
+$$;
+
+-- S3: internal_create_move_tables(): the copy of a bucket partition is made with the access method of the source partition (design 11.6).
+CREATE OR REPLACE FUNCTION kingres.internal_create_move_tables(p_move bigint, p_bucket int, p_bucket_count int, p_tables jsonb)
+    RETURNS void
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    t       pg_catalog.record;
+    v_part  pg_catalog.text;
+    v_col   pg_catalog.text;
+    v_owner pg_catalog.text;
+    v_parent pg_catalog.regclass;
+    l       pg_catalog.record;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    FOR t IN SELECT x.schema_name, x.table_name, x.replident, x.partby, x.leaves, x.reloptions, x.am
+               FROM pg_catalog.jsonb_to_recordset(p_tables) AS x(schema_name text, table_name text, replident text, partby text, leaves jsonb, reloptions text[], am text)
+    LOOP
+        v_part := kingres.internal_bucket_part_name(t.table_name, p_bucket);
+        v_parent := pg_catalog.format('%I.%I', t.schema_name, t.table_name)::pg_catalog.regclass;
+        SELECT d.dist_column INTO v_col FROM kingres.dist_table d WHERE d.relid OPERATOR(pg_catalog.=) v_parent;
+        SELECT r.rolname INTO v_owner FROM pg_catalog.pg_class c JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) c.relowner
+         WHERE c.oid OPERATOR(pg_catalog.=) v_parent::pg_catalog.oid;
+        IF pg_catalog.to_regclass(pg_catalog.format('%I.%I', t.schema_name, v_part)) IS NOT NULL THEN
+            CONTINUE;	-- made by an earlier attempt of this move
+        END IF;
+        -- LIKE copies neither the storage parameters nor the access method: they are those of the bucket partition on the source
+        EXECUTE pg_catalog.format('CREATE TABLE %I.%I (LIKE %I.%I INCLUDING ALL)%s%s %s',
+                                  t.schema_name, v_part, t.schema_name, t.table_name,
+                                  CASE WHEN t.partby IS NOT NULL THEN ' PARTITION BY ' OPERATOR(pg_catalog.||) t.partby ELSE '' END,
+                                  CASE WHEN t.am IS NOT NULL THEN pg_catalog.format(' USING %I', t.am) ELSE '' END,
+                                  kingres.internal_with_clause(t.reloptions));
+        IF t.partby IS NOT NULL THEN
+            -- a user-partitioned bucket partition: the copy is the same tree, a leaf per user partition with its bound and its access method
+            FOR l IN SELECT y.name, y.bound, y.am FROM pg_catalog.jsonb_to_recordset(t.leaves) AS y(name text, bound text, am text) ORDER BY y.name LOOP
+                EXECUTE pg_catalog.format('CREATE TABLE %I.%I PARTITION OF %I.%I %s USING %I', t.schema_name, l.name, t.schema_name, v_part, l.bound, l.am);
+                IF l.am OPERATOR(pg_catalog.<>) 'heap' THEN
+                    -- a leaf that is not heap names its rows for a later move the way the bucket partitions of the table do
+                    EXECUTE pg_catalog.format('ALTER TABLE %I.%I REPLICA IDENTITY FULL', t.schema_name, l.name);
+                END IF;
+            END LOOP;
+        END IF;
+        EXECUTE pg_catalog.format('ALTER TABLE %I.%I ADD CONSTRAINT ks_bucket_check CHECK '
+                                  '(pg_catalog.satisfies_hash_partition(%L::pg_catalog.regclass, %s, %s, %I))',
+                                  t.schema_name, v_part, v_parent::pg_catalog.text, p_bucket_count, p_bucket, v_col);
+        IF t.replident OPERATOR(pg_catalog.=) 'f' THEN
+            EXECUTE pg_catalog.format('ALTER TABLE %I.%I REPLICA IDENTITY FULL', t.schema_name, v_part);
+        END IF;
+        EXECUTE pg_catalog.format('ALTER TABLE %I.%I OWNER TO %I', t.schema_name, v_part, v_owner);
+        IF t.partby IS NOT NULL THEN
+            FOR l IN SELECT y.name FROM pg_catalog.jsonb_to_recordset(t.leaves) AS y(name text) LOOP
+                EXECUTE pg_catalog.format('ALTER TABLE %I.%I OWNER TO %I', t.schema_name, l.name, v_owner);
+            END LOOP;
+        END IF;
+        EXECUTE pg_catalog.format('COMMENT ON TABLE %I.%I IS %L', t.schema_name, v_part,
+                                  'kingres_shard bucket move ' OPERATOR(pg_catalog.||) p_move::pg_catalog.text);
     END LOOP;
 END;
 $$;
