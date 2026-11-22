@@ -27,9 +27,12 @@ type mapCluster struct {
 	standbyGroup int
 }
 
-func newMapCluster(t *testing.T) *mapCluster {
+func newMapCluster(t *testing.T) *mapCluster { return newMapClusterWith(t) }
+
+// newMapClusterWith is newMapCluster with more flags for every kingresd.
+func newMapClusterWith(t *testing.T, extra ...string) *mapCluster {
 	t.Helper()
-	c, port, pool := foClusterWith(t, "-lease-duration", "12s", "-lease-renew", "2s", "-lease-margin", "3s")
+	c, port, pool := foClusterWith(t, append([]string{"-lease-duration", "12s", "-lease-renew", "2s", "-lease-margin", "3s"}, extra...)...)
 	m := &mapCluster{c: c, port: port, pool: pool, old: c.Leader()}
 	for _, n := range catalogStandbys(t, m.old) {
 		if n.group == 0 {

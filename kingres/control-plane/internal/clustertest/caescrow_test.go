@@ -64,7 +64,9 @@ func escrowFile(n *clustertest.Node, name string) string {
 // TestCAEscrowMapGroupFailover: with the escrow on, the failover of the leader's server leaves the new leader with the CA key, without an
 // alert, and its certificate authority issues the certificates of the other servers by itself.
 func TestCAEscrowMapGroupFailover(t *testing.T) {
-	m := newMapCluster(t)
+	// Certificates that live 30 minutes and are renewed when 90 percent of the lifetime is left: every server asks the leader for a new one
+	// every few minutes, so the renewals after the failover are done by the job, not by a request.
+	m := newMapClusterWith(t, "-certificate-lifetime", "30m", "-certificate-renew-fraction", "0.9", "-certificate-check-interval", "5s", "-certificate-retry-interval", "5s")
 	switchEscrowOn(t, m.old, m.cand)
 	// Only the standby's server holds a copy; the key is not readable in the file, and the new leader does not hold ca.key yet.
 	if !fileExists(escrowFile(m.cand, pki.EscrowBlobFile)) {
@@ -84,8 +86,6 @@ func TestCAEscrowMapGroupFailover(t *testing.T) {
 	if strings.Contains(blob, caKey) {
 		t.Fatal("the sealed copy holds the CA key")
 	}
-	oldSerial := certOf(t, m.other).SerialNumber
-
 	foKillServer(m.old)
 	m.request(t, m.other)
 	id := m.recordedTask(t)
@@ -105,16 +105,14 @@ func TestCAEscrowMapGroupFailover(t *testing.T) {
 	}
 
 	// Without any request, the other server's renewal job asks the new leader for a certificate and gets one.
-	m.other.Stop()
-	m.other.Extra = append(m.other.Extra, "-certificate-renew-fraction", "0.99", "-certificate-check-interval", "400ms", "-certificate-retry-interval", "300ms")
-	m.other.Start()
-	until(t, 3*time.Minute, "a certificate of the new leader on the other server", func() bool {
+	adoptedSerial := certOf(t, m.other).SerialNumber
+	until(t, 6*time.Minute, "a certificate of the new leader on the other server", func() bool {
 		b, err := os.ReadFile(filepath.Join(m.other.DataDir, "pki", pki.ServerCertFile))
 		if err != nil {
 			return false
 		}
 		c, err := pki.ParseCertPEM(b)
-		return err == nil && c.SerialNumber.Cmp(oldSerial) != 0
+		return err == nil && c.SerialNumber.Cmp(adoptedSerial) != 0
 	})
 	// The certificate is the CA's: the CA certificate is the one every server holds, and it verifies it.
 	pool := x509.NewCertPool()
