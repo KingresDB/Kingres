@@ -62,3 +62,29 @@ This is not a precedent: the branches are not rewritten or force-pushed in ordin
 GitHub Actions is switched off for the repository, by decision of the project owner: no check of this project runs on GitHub, and no workflow of the project is published. The tree of PostgreSQL 19 contains upstream's own workflow file (`.github/workflows/pg-ci.yml`); it stays in the tree unchanged, as every upstream file does, and does not run. Every check named in this document is run on a developer's machine with the scripts in `kingres/dev`, `kingres/control-plane/scripts`, `kingres/web` and `kingres/packaging/test`, and its result is recorded in the work log.
 
 Pushing `kingres-19` needs credentials that may write workflow files whenever that upstream file changes, which happens when the branch moves to a new upstream tag.
+
+## The release script
+
+[`kingres/packaging/release/release.sh`](../../packaging/release/release.sh) makes a release from the two product branches. The header of the script is its full reference; this is what it does and does not do.
+
+```
+kingres/packaging/release/release.sh --version <version> --commit18 <sha> --commit19 <sha> \
+    --checks-file <record> --out <dir> [--work <dir>] [--revision N] [--skip-images] [--sign-tags] [--dry-run]
+```
+
+1. **Gates** (all are checked, every failure is listed, nothing is built if one fails): a clean working tree; `kingres-18` and `kingres-19` at the commits you name; `kingres_version` of `meson.build` equal to `--version` on both; PostgreSQL major 18 and 19 and both final releases (a pre-release such as `19rc2` is refused); `contrib/kingres_*` and `kingres` identical on both commits; neither tag exists; `kingres/CHANGELOG.md` has a section `## [<version>]` without a `### Pending` part; the release-notes template exists; the record of the final checks says every required check passed on the right commit; the output directory is empty; Docker is available unless `--skip-images` is given.
+2. **Builds**, per major, from the commit of the branch: `build/build.sh`, `deb/build-deb.sh` and, unless skipped, `docker/build-image.sh` and `docker save`. Artifacts go to `<dir>/pg18` and `<dir>/pg19`.
+3. **Checksums**: `<dir>/SHA256SUMS`, checked with `sha256sum -c` before the script goes on. They are not signed.
+4. **Release notes**: `<dir>/RELEASE-NOTES.md`, made from [`kingres/docs/release-notes-template.md`](../release-notes-template.md) with the changelog section, the artifacts and the recorded checks.
+5. **Tags**: `kingres-<version>-pg18` and `kingres-<version>-pg19` are created **locally** as annotated tags (signed with `--sign-tags`) on the two commits, as the very last step.
+6. It prints the manual steps and stops: pushing the branches and the tags, and creating the GitHub release of each tag with its files. **The script never pushes and never contacts GitHub.** No GitHub Actions are used.
+
+`--dry-run` runs every gate and prints the plan and the manual steps; it builds nothing, writes nothing and creates no tag, and exits non-zero when a gate fails.
+
+**The record of the final checks** is a text file that whoever ran the checks keeps, one line per run: `<commit> <major> <check> <pass|fail> [text]`, where `<major>` is `18`, `19` or `all`. The required checks are the list under "What a release is" above: for each major `tree-build` (builds without a warning), `core-regress` (the upstream suite), `extension-suites` (every KingresDB extension in tree), `integration` (the control plane's suite), `package-deb`, `package-image` and `package-compose` (the last two are not required with `--skip-images`), and for `all` the `console` checks. A later line replaces an earlier one, and a check recorded on another commit does not count. The script does not run these multi-hour suites; it refuses to release without them.
+
+**Without Docker.** A build machine without Docker can build the packages; use `--skip-images`. The script then says so, the notes say the images were not built, and the image checks are not required. Build and test the images on a machine with Docker before a release that is meant to carry them.
+
+**Test.** `kingres/packaging/test/test-release.sh` runs the real script against a small test repository with stand-ins for the three build scripts and for docker, and checks every gate, the dry run, the checksums, the notes, the tags and that nothing is pushed.
+
+After the script: push, then publish. Signing the checksums, signing packages and images and publishing them are the project owner's decisions and are not part of the script. No release is tagged before every phase of the first release is finished ([../architecture.md](../architecture.md), "Scope of the first release").

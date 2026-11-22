@@ -16,6 +16,7 @@ package, and tests each of them.
 | Debian package | `deb/` | `kingres_<version>+pg18-<revision>_amd64.deb` or `kingres_<version>+pg19-<revision>_amd64.deb` with the `kingres.service` unit |
 | Artifact tests | `test/` | Image, compose and package tests (the package test runs systemd in a container); each is run once per major |
 | Where the checks run | developer machines | Every check of this directory runs on a developer's machine (see [Tests of the artifacts](#tests-of-the-artifacts)); no CI workflow of this project exists, runs or is published on GitHub, by decision of the project owner |
+| Release script | `release/release.sh` | Checks the two product branches, requires the record of the final checks, builds the package and the image per major, writes `SHA256SUMS` and the release notes and prepares (never pushes) the two tags; see [../docs/dev/releases.md](../docs/dev/releases.md), "The release script" |
 
 ## One release per PostgreSQL major
 
@@ -540,6 +541,7 @@ test/test-image.sh   --rev kingres-19 [--port 58790]       # build the image, ru
 test/test-compose.sh --rev kingres-19 [--port-base 58700]  # three nodes joined into one cluster
 test/test-deb.sh --deb FILE --other-deb FILE --work WORK   # install ... purge under systemd
 test/test-verifier-package.sh [--work DIR]                 # the verifier in the package, no Docker
+test/test-release.sh [--work DIR]                          # the release script, no Docker, no build
 ```
 
 Each test is run once per major, on the source of that major. The image and
