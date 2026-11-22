@@ -130,9 +130,12 @@ const abandon = useMutation({
   mutationFn: () => endpoints.abandonMapGroupBootstrap('given up from the console'),
   onSuccess: (r) => {
     abandonError.value = null
+    const resumed = r.resumedServerId
+      ? ` The primary of the map group on ${r.resumedServerId} is started again.`
+      : ''
     abandonNote.value = r.abandoned
-      ? 'The bootstrap was given up. The old manager takes over again.'
-      : 'No bootstrap of the map group is in progress.'
+      ? `The bootstrap was given up.${resumed}`
+      : `No bootstrap of the map group is in progress.${resumed}`
   },
   onError: (e) => {
     abandonError.value = e
