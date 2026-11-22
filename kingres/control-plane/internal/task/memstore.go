@@ -54,6 +54,18 @@ func cp(t *Task) Task {
 	return c
 }
 
+// ActiveFor implements ActiveStore.
+func (m *MemStore) ActiveFor(_ context.Context, kind, subjType, subjID string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, t := range m.tasks {
+		if t.Kind == kind && t.SubjectType == subjType && t.SubjectID == subjID && t.State.Active() {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // Create implements Store.
 func (m *MemStore) Create(_ context.Context, t Task) (Task, error) {
 	m.mu.Lock()

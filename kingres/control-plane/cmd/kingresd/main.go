@@ -290,6 +290,9 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	if proxy != nil {
 		deps.Proxy = proxy
 	}
+	if opsSvc != nil {
+		deps.ExtraMetrics = partitionMetrics(opsSvc)
+	}
 	if svc.Enabled() {
 		deps.LocalSettings, err = localsettings.New(localsettings.Options{
 			DataDir: cfg.DataDir, Instances: svc.Manager(), InstanceID: cluster.NodeID, PGPort: cfg.PGPort, Level: &logLevel, Log: log})
@@ -335,6 +338,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		receiver = &membership.Receiver{M: members, Authn: joinAuthn, VerifyToken: svc.VerifyToken}
 		members.OnCertificateInstalled = func() { pc.ForgetAll(); members.Client.ForgetAll(); certHooks.run() }
 		opsSvc.Fanout, opsSvc.Local, opsSvc.InstanceOwner = members, svc, members.InstanceBelongsTo
+		opsSvc.Remote = members
 		stby, err = newStandbyParts(cfg, svc, serverHost, log, members.Audit, members, opsSvc, haReg)
 		if err != nil {
 			return fmt.Errorf("preparing the standbys: %w", err)

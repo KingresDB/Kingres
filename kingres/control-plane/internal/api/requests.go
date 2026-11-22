@@ -189,6 +189,10 @@ type ClusterSettingsUpdateRequest struct {
 	Clock *struct {
 		MaxDifferenceMs *int `json:"maxDifferenceMs,omitempty"`
 	} `json:"clock,omitempty"`
+	// Analytics is added in contract 0.17.0.
+	Analytics *struct {
+		AllowNonSuperuserOwners *bool `json:"allowNonSuperuserOwners,omitempty"`
+	} `json:"analytics,omitempty"`
 }
 
 // LedgerClientKey is a registered client key of the ledger (contract 0.11.0).

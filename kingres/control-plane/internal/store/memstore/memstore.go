@@ -187,6 +187,9 @@ func (s *Store) Tables(_ context.Context, db string, f store.TableFilter, p stor
 		if f.Class != "" && !contains(t.Classes, f.Class) {
 			continue
 		}
+		if f.Storage != "" && !store.StorageMatches(t.Table, f.Storage) {
+			continue
+		}
 		sel = append(sel, t)
 	}
 	sort.Slice(sel, func(i, j int) bool {

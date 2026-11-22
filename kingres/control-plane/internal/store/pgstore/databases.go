@@ -164,6 +164,7 @@ func (s *Store) buildDatabases(ctx context.Context, name string) ([]api.Database
 			by, at, mode := st.createdBy, st.createdAt, st.ledgerMode
 			db.CreatedBy, db.CreatedAt = &by, &at
 			db.Ledger.Mode, db.Ledger.DigestIntervalSeconds = &mode, st.digest
+			db.ApproximateAggregates = &api.DatabaseApproximate{Enabled: st.approxEnabled, CountDistinct: st.approxDistinct}
 			if st.sharding && st.bucketCnt != nil && db.Sharding.BucketCount == nil {
 				db.Sharding.BucketCount = st.bucketCnt
 			}
@@ -271,9 +272,10 @@ func (s *Store) ClusterSettings(ctx context.Context) (api.ClusterSettings, error
 		AutoFailover:        api.AutoFailoverSettings{Enabled: false, TimeoutSeconds: 120, MaxCount: 1},
 		Rebalance: api.RebalanceSettings{MaxConcurrentMoves: 4, Strategy: "byBucketCount", MaxMovesPerServer: 2, MaxMoveAttempts: 3,
 			MaxDiskUsedFraction: 0.85, MaxStandbyLagBytes: 64 << 20, Automatic: defaultAutomatic()},
-		Features: api.FeatureFlags{Sharding: shard, Ledger: ledger},
-		Restart:  api.RestartState{ServerIDs: []string{}},
-		Clock:    &api.ClockSettings{MaxDifferenceMs: 1000},
+		Features:  api.FeatureFlags{Sharding: shard, Ledger: ledger},
+		Restart:   api.RestartState{ServerIDs: []string{}},
+		Clock:     &api.ClockSettings{MaxDifferenceMs: 1000},
+		Analytics: &api.AnalyticsSettings{},
 	}
 	// Values the administrator set (kingres_cp.cluster_setting) win over the
 	// defaults derived from the catalogs.
@@ -320,6 +322,10 @@ func (s *Store) ClusterSettings(ctx context.Context) (api.ClusterSettings, error
 			case "clock.maxDifferenceMs":
 				if json.Unmarshal(v, &n) == nil {
 					out.Clock = &api.ClockSettings{MaxDifferenceMs: n}
+				}
+			case "analytics.allowNonSuperuserOwners":
+				if json.Unmarshal(v, &b) == nil {
+					out.Analytics = &api.AnalyticsSettings{AllowNonSuperuserOwners: b}
 				}
 			case "rebalance.maxConcurrentMoves":
 				if json.Unmarshal(v, &n) == nil {

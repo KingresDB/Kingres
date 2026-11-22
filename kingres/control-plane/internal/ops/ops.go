@@ -50,6 +50,8 @@ type RoleConnector interface {
 
 // Ops carries the dependencies of the operations.
 type Ops struct {
+	// failed remembers when a partition.maintain task of a table last failed (the back-off of a failure before any run exists).
+	failed failedTasks
 	// Service opens service connections; Roles opens role connections.
 	Service ServiceConnector
 	Roles   RoleConnector
@@ -105,6 +107,14 @@ type Ops struct {
 	BundleDir   string
 	// DiskFree, when set, tells the free space of the disk of a server (the table lifecycle checks the destinations before it copies); nil skips the check.
 	DiskFree DiskFree
+	// Remote reads from another server (the extension versions of getApproximateAggregates); nil: the other servers show as unreachable.
+	Remote RemoteQuerier
+	// extBackendOverride replaces the local PostgreSQL side of the extension steps (tests).
+	extBackendOverride extBackend
+	// metrics counts the runs of time-partitioning policies (maintain.go).
+	metrics partitionMetrics
+	// approxRecordOverride replaces the write of the setting into the system database (tests).
+	approxRecordOverride func(context.Context, approxParams) error
 	// tableBackendOverride replaces the database side of the table tasks (tests).
 	tableBackendOverride tableBackend
 	// BG bounds background task runs; Wait waits for them.

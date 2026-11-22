@@ -60,7 +60,7 @@ var ManagedParameters = map[string]Reason{
 	"syslog_ident":                      logging("the logs go to the files the console reads."),
 	"syslog_sequence_numbers":           logging("the logs go to the files the console reads."),
 	"syslog_split_messages":             logging("the logs go to the files the console reads."),
-	"shared_preload_libraries":          managed("the extensions of the cluster (kingres_shard, kingres_ledger) are loaded through it."),
+	"shared_preload_libraries":          managed("the extensions of the cluster (kingres_shard, kingres_ledger, kingres_columnar) are loaded through it."),
 	"ssl":                               managed("kingresd sets the TLS files of the cluster certificates."),
 	"ssl_cert_file":                     managed("the cluster certificate of this server."),
 	"ssl_key_file":                      managed("the key of the cluster certificate of this server."),

@@ -156,15 +156,15 @@ flow_wait_task() {
 
 # flow_check_extensions PREFIX: every KingresDB extension can be created in a
 # database of the running node (a scratch database, dropped afterwards).
-# kingres_columnar is not preloaded by the product: as its README says, it
-# loads, it reads (no rows) and it refuses a write.
+# kingres_columnar is preloaded by the product (it registers a WAL resource
+# manager), so a columnar table can be created and written.
 # It needs SERVICE_PSQL, a command prefix like PSQL_CMD that runs psql as the
 # service role kingresd (a superuser; CREATE EXTENSION needs one and the
 # administrator of the flow is not), with its password from the node's
 # service-credentials file.
 flow_check_extensions() {
     local p="$1" e out
-    check_eq "${p}: the instance preloads kingres_shard and kingres_ledger, not kingres_columnar" "kingres_shard,kingres_ledger" \
+    check_eq "${p}: the instance preloads kingres_shard, kingres_ledger and kingres_columnar" "kingres_shard,kingres_ledger,kingres_columnar" \
         "$(svc -d postgres -Atc 'show shared_preload_libraries' 2>/dev/null)"
     check "${p}: create the scratch database ext_check" svc -d postgres -v ON_ERROR_STOP=1 -c 'create database ext_check'
     # kingres_shard first, as the product creates them; the other order is
@@ -178,10 +178,8 @@ flow_check_extensions() {
     done
     check_eq "${p}: all five are in pg_extension" "${KINGRES_EXTENSIONS}" \
         "$(svc -d ext_check -Atc "select string_agg(extname, ' ' order by extname) from pg_extension where extname like 'kingres%'" 2>/dev/null)"
-    # Without the preload the node's server refuses even to create a columnar table
-    # (the message names shared_preload_libraries).
-    out="$(svc -d ext_check -v ON_ERROR_STOP=1 -c 'create table public.col_t (a int) using columnar' 2>&1 || true)"
-    check "${p}: a columnar table is refused without the preload (${out:0:100})" bash -c 'grep -q "shared_preload_libraries" <<<"$1"' _ "${out}"
+    # The library is preloaded, so a columnar table can be created and written.
+    check "${p}: a columnar table can be created and written (the library is preloaded)" svc -d ext_check -v ON_ERROR_STOP=1 \n        -c 'create table public.col_t (a int) using columnar' -c 'insert into public.col_t values (1)'
     check "${p}: drop the scratch database" svc -d postgres -v ON_ERROR_STOP=1 -c 'drop database ext_check'
     # The order must not matter: every extension that uses the schema kingres
     # installs whether or not another one made the schema first.  An earlier

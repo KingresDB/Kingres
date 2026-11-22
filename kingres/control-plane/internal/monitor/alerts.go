@@ -348,8 +348,14 @@ func parseSubject(subject string) api.AlertSubject {
 				g := int32(n)
 				out.ShardGroupID = &g
 			}
+		case strings.HasPrefix(seg, "tableschema:"):
+			v := api.SubjectUnescape(seg[len("tableschema:"):])
+			out.TableSchema = &v
+		case strings.HasPrefix(seg, "tablename:"):
+			v := api.SubjectUnescape(seg[len("tablename:"):])
+			out.TableName = &v
 		case strings.HasPrefix(seg, "database:"):
-			v := seg[len("database:"):]
+			v := api.SubjectUnescape(seg[len("database:"):])
 			out.DatabaseName = &v
 		case strings.HasPrefix(seg, "task:"):
 			if n, err := strconv.ParseInt(seg[len("task:"):], 10, 64); err == nil && n > 0 {

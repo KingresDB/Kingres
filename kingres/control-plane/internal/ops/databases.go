@@ -73,6 +73,9 @@ func (o *Ops) baseDefinitions() []task.Definition {
 		o.ledgerUpgradeDefinition(),
 		o.ledgerBundleDefinition(),
 		o.ledgerEpochDefinition(),
+		o.approxDefinition(),
+		o.storageDefinition(),
+		o.maintainDefinition(),
 		{Kind: KindDatabaseCreate, Dynamic: func(in json.RawMessage) ([]task.Step, error) {
 			p, err := rawInput[createParams](in)
 			if err != nil {
@@ -317,6 +320,28 @@ func (o *Ops) installExtensions(ctx context.Context, db string, sharding, ledger
 	if ledger {
 		if _, err := c.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS kingres_ledger"); err != nil {
 			return fmt.Errorf("installing kingres_ledger: %w", err)
+		}
+	}
+	return o.installAnalytics(ctx, db)
+}
+
+// installAnalytics installs the storage and partitioning extensions of phase 12, kingres_columnar and kingres_timepart, in a database that is made
+// on this server (the other servers do it in the same step of their own, and a server that is added later gets every extension of the database
+// from the leader). An extension that the package of this server does not contain is left out: a database must still be made with an older package.
+// kingres_sketch is not installed here; the task database.approximateAggregates does it.
+func (o *Ops) installAnalytics(ctx context.Context, db string) error {
+	b := o.ext()
+	for _, e := range []string{ExtColumnar, ExtTimepart} {
+		v, err := b.Available(ctx, db, e)
+		if err != nil {
+			return fmt.Errorf("looking for %s: %w", e, err)
+		}
+		if v == "" {
+			o.Log.Info("the package of this server does not contain an extension; the database is made without it", "extension", e, "database", db)
+			continue
+		}
+		if err := b.Install(ctx, db, e); err != nil {
+			return fmt.Errorf("installing %s: %w", e, err)
 		}
 	}
 	return nil

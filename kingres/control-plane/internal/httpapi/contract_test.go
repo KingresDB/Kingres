@@ -37,8 +37,8 @@ func TestRoutingMatchesContract(t *testing.T) {
 	for _, op := range doc.Operations {
 		want[op.Method+" /api/v1"+op.Path] = op.ID
 	}
-	if len(want) != 149 {
-		t.Errorf("contract has %d operations, this test was written for 149", len(want))
+	if len(want) != 160 {
+		t.Errorf("contract has %d operations, this test was written for 160", len(want))
 	}
 	got := map[string]string{}
 	for _, r := range e.srv.Routes() {
@@ -310,6 +310,9 @@ func TestResponsesValidateAgainstContract(t *testing.T) {
 	}
 	for id := range e.srv.ledgerAnchorHandlers() {
 		mutating[id] = true // validated in ledger_anchor_http_test.go with a fake service
+	}
+	for id := range e.srv.analyticsHandlers() {
+		mutating[id] = true // need the system database and the servers; validated by the cluster tests of package clustertest (approx_test.go) and the integration tests of package ops
 	}
 	for id := range e.srv.serverGroupHandlers() {
 		mutating[id] = true // need the system database; validated in cmd/kingresd/servergroups_e2e_test.go

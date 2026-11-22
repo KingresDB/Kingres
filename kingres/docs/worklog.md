@@ -94,6 +94,29 @@ the reference tables only).
 - M5 and a local source that does not exist on every node (see the fixes above).
 - Integration with phase 10's scheduler and the control plane of cp-1011 (`MERGE` and the repartitioned join add no REST surface).
 
+## 2026-11-22 (third entry): fixes for the second review of the phase 12 control plane (P12D-01 to P12D-09)
+
+Branch `p12-cp`. The review is [reviews/2026-11-22-control-plane-phase12-fixes.md](reviews/2026-11-22-control-plane-phase12-fixes.md); its "Fixes" section lists every finding with the change and the test.
+
+### What was done
+
+- A scheduled run is compared with the last run of its policy (a clock that stepped is refused, one alert); a failure before any run exists backs off on the policy itself; the library check covers standbys; the preload list keeps the library of an instance that had it.
+- The decision for non-superuser owners: the cluster setting `analytics.allowNonSuperuserOwners` (default off, contract 0.18.0), the refusal codes, one alert instead of a retry, and the corrected trust text. `tableOwner` and `ownerTrusted` on the policy and the storage preview.
+- Lows: reader stall shortened (200 ms) and described, alerts of dropped databases cleared, one alert per refusal, `maintainRunning` fails closed, back-off on the last run.
+- Contract changes for the console are in `p12cp/contract-changes.txt` (items 14 to 17).
+
+### How it was verified
+
+PostgreSQL 18 and 19.0, lane l1: the PG-backed tests of `internal/ops`, `internal/instance`, `internal/store/pgstore` and the two cluster tests. Unit tests of `ops`, `partsched`, `monitor`, `api`, `contract`; `check-contract.mjs`. Mutants are in the report.
+
+### Decisions and deviations
+
+- The setting is a cluster setting read from `kingres_cp.cluster_setting` at each use; a system database without it means off.
+
+### Still open
+
+- A cluster test that restarts one server with the library missing.
+
 ### Core patches
 
 None.
@@ -130,6 +153,35 @@ None.
 
 See the report: no cluster test with a promoted standby (unit test of the order only), no test that induces a failure of the hidden-set read inside `State`, the derived default of a removed
 override is not known to the preview warning, and the mock of the console still models the old waiting task.
+
+## 2026-11-22 (second entry): fixes for the independent review of the phase 12 control plane (P12C-01 to P12C-16), and the console's contract notes
+
+Branch `p12-cp`. The review is [reviews/2026-11-22-control-plane-phase12.md](reviews/2026-11-22-control-plane-phase12.md); its "Fixes" section lists every finding with the change and the test.
+
+### What was done
+
+- The four high findings: the time of a run is the time of the server (within five minutes, for a request and for the scheduler), a run is always closed with `timepart_finish_run` (begin failure, step failure, the hook of the kind) so that a failing
+  policy does not start a task at every tick, `kingres_columnar` goes into `shared_preload_libraries` only when the installation has the library (a rewrite is logged and reloaded, the conversion needs the library on every server), and the conversion and the runs share
+  one rule for the owners of tables (`trust_table_owners` on, documented).
+- The mediums and lows: columnar options on a columnar table, lock waits with `lock_timeout` and retry, a missing run is an error, alerts of databases that were not read are left alone, a scheduled run does not need the library, reads never install an extension,
+  the limit to the leader's instance is in the contract text and the 404, `put` during a run, `Engine.ActiveFor`, versions as numbers.
+- Contract text and shapes for the console (still 0.18.0): `dryRun` and `TableStoragePreview`, typed `blockers` on `conversion_refused`, `tableSchema` and `tableName` of `AlertSubject`, the shapes of `partitionEvery`, the bound of `asOf`; listed in `p12cp/contract-changes.txt`.
+
+### How it was verified
+
+PostgreSQL 18 and 19.0 (the private installations were refreshed from `~/kw-int/pg`, extensions built from e279c14091), lane l1: the PG-backed tests of `internal/ops`, `internal/store/pgstore`, `internal/instance` and the two cluster tests of three servers
+(`TestApproximateAggregates`, `TestTableStorageAndPartitionPolicies`). Unit tests of `ops`, `partsched`, `task`, `monitor`, `api`, `problem`, `contract`; `check-contract.mjs`; `vue-tsc`. `httpapi` has one test that fails now and then on Windows on the cleanup of its temporary
+directory (`TestSettingsOperations`), not on an assertion. The mutants of the round are in the report.
+
+### Decisions and deviations
+
+- The sound rule for the owners of tables is trust, as the extension offers it: a refusal of non-superuser owners (or a cluster setting) was not built; the contract text says what the setting gives away. It is a question for the project owner.
+- The restart order of the preload change is the operator's: the restart of the console orders standbys and primaries by the rule of the configuration design, which was written for settings that go up; for a list of libraries the safe order (standbys first) is documented, not enforced.
+
+### Still open
+
+- A cluster test that restarts one server with the library missing (the logic is tested with a fake installation).
+- The cluster setting for non-superuser owners, if wanted.
 
 ### Core patches
 
@@ -288,6 +340,49 @@ Covers the work on branch shard-p1011 after the second review of phase 11 (the r
 - A load that is incremental per colocation group, if 2000 schemas are not enough (the DDL statement still grows from 26 to 52 ms between 200 and 2000 schemas).
 - A flake seen once under the control plane work: the switch of a move under a running writer timed out on a node and the move was undone; not understood.
 
+## 2026-11-22: phase 12 control plane (contract 0.18.0): approximate aggregates, storage conversion, time-partitioning policies and their scheduler, and the preload of kingres_columnar
+
+Branch `p12-cp` (worktree of its own), from `kingres-18` at e279c14091. Items St-P1 to St-P5 and Q-C1 of the inventory of 2026-11-22; the console parts (W1, W2, Q-W1)
+are on `p12-web`.
+
+### What was done
+
+- **Contract 0.18.0** (own commit): 11 operations (`getApproximateAggregates`, `configureApproximateAggregates`, `setTableStorage`, `setPartitionStorage`, `getPartitionPolicy`,
+  `putPartitionPolicy`, `deletePartitionPolicy`, `runPartitionPolicy`, `listPartitionPolicyRuns`, `getPartitionPolicyRun`, `planPartitionPolicy`), three task kinds, six problem codes, two alert
+  kinds, six audit actions, the optional `storage` and `partitioning` members of `Table`, the query parameter `storage`. `listTablePartitions` (0.14.0) is extended, not duplicated. Numbered 0.18.0
+  because the other branches take 0.15.0 to 0.17.0; the integrator renumbers (and the migrations 0035 and 0036). The generated files, the labels and the mock statuses of the panel follow.
+- **The release blocker**: `instance.PreloadLibraries` is `kingres_shard,kingres_ledger,kingres_columnar`; `EnsureConfig` brings an older `kingres-managed.conf` up to date at the start of `kingresd`;
+  `kingres_timepart` and `kingres_sketch` need no preload (read in their READMEs and tested). The flow test and the text of the packaging README follow.
+- **Q-C1** `database.approximateAggregates` (five steps, one install step per server), migration 0035, the closed `apply` kinds `extension.check`, `extension.install`, `extension.verify`, `database.settings`,
+  and a read of another server through the internal call `exec` (`membership.Manager.Query`).
+- **St-P2** `storage` and `partitioning` in `listTables`/`getTable` (pgstore), the filter, `listTablePartitions` for ordinary partitioned tables, the install of `kingres_columnar` and `kingres_timepart` in every
+  database that is made (and, through the existing copy of the extension list, on every server that is added).
+- **St-P3** `table.setStorage` for a table and for a partition. **St-P4** the policy resources. **St-P5** `internal/partsched`, `partition.maintain`, `runPartitionPolicy`, the runs, the alerts and the
+  counters on `/metrics`; migration 0036.
+- Documentation: `kingres/control-plane/README.md` (section "Analytics"), `kingres/api/README.md` (changelog 0.18.0, task kinds), `internal-api.md`, `kingres/packaging/README.md`.
+
+### How it was verified
+
+See the tests named in the README section. On PostgreSQL 18 and 19, lane l1, private installations built from e279c14091 (`install-extensions.sh` now builds the five extensions):
+`TestApproximateAggregates`, `TestTableStorageAndPartitionPolicies` (cluster tests, three servers), `TestIntegrationSetStorage*`, `TestIntegrationPartitionPolicyResource`, `TestIntegrationMaintain*`,
+`TestIntegrationPartitionScheduler*`, `TestIntegrationTableStorage`, and the tests of `internal/instance`. Unit: `go test ./internal/ops ./internal/partsched ./internal/httpapi ./internal/api ./internal/problem ./internal/store/...`,
+`node scripts/check-contract.mjs`, `npm run api:check`, `vue-tsc`. Mutants: see the list in the report of the round.
+
+### Decisions and deviations
+
+- A database that was made before this version gets `kingres_columnar` and `kingres_timepart` at the first use of a storage or policy operation, where the design answers `extension_missing` for an extension that is not
+  installed (nothing in the contract installs them). `extension_missing` stays for a package without the extension and for a library that is not preloaded.
+- Storage and policy operations work on the instance of this server (where the leader runs). A plain table of another group's instance is not found; distributed tables are D1a and D1b.
+- Step names are sentences (house style) and not the single words of the design table. `itemsDone` and `itemsTotal` of the convert step are not set (the environment of a step has no call for them yet).
+- `createdBy` of a policy is the service role; the audit log has the role that asked.
+- `database.approximateAggregates` is not in the exclusion rules of the task table (a failover does not stop it); the engine's one task per subject covers the second request.
+
+### Still open
+
+- Cluster test with a server whose package has another `kingres_sketch` version (all servers of the tests share one installation).
+- D1a, D1b (policies and conversion on distributed tables), S3 and the console steps.
+- Retention and conversion of the columnar partitions need `kingres_columnar` 0.2 in the packages of every server of a cluster: a mixed cluster is not checked by `partition.maintain`.
+
 ### Core patches
 
 None.
@@ -322,6 +417,7 @@ l1); each new test against a mutant (the table in the review file).
 - A make local whose schema has no row on the map group is taken as made, which is also true for a dropped schema.
 
 ---
+
 
 ## 2026-11-20: automatic failover, the last steps of phase 2b and their review, the second review of phase 9 and its fixes, and two npm alerts
 

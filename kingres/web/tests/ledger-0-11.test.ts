@@ -142,8 +142,8 @@ describe('words of 0.11.0', () => {
     }
   })
 
-  it('the 28 operations are in the contract: 149 in all (0.15.0)', () => {
-    expect(Object.keys(operations)).toHaveLength(149)
+  it('the 28 operations are in the contract: 160 in all (0.17.0)', () => {
+    expect(Object.keys(operations)).toHaveLength(160)
     for (const a of NEW_ACTIONS) expect(a in operations, a).toBe(true)
   })
 })

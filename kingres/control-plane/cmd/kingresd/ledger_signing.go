@@ -330,6 +330,9 @@ func newLedgerParts(cfg config.Config, svc *cluster.Service, self string, log *s
 	if err != nil {
 		return nil, err
 	}
+	if err := addPartitionJobs(sched, opsSvc, sys, cfg.PartitionSchedulerInterval, log); err != nil {
+		return nil, err
+	}
 	return &ledgerParts{svc: s, sched: sched, coll: coll, listener: listener, anchor: anch, log: log}, nil
 }
 

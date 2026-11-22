@@ -101,6 +101,8 @@ type Database struct {
 	LedgerSummary DatabaseLedgerSummary `json:"ledgerSummary"`
 	// RebalanceRequired tells whether buckets need rebalancing.
 	RebalanceRequired bool `json:"rebalanceRequired"`
+	// ApproximateAggregates is the approximate-aggregates setting (contract 0.17.0, optional).
+	ApproximateAggregates *DatabaseApproximate `json:"approximateAggregates,omitempty"`
 	// CreatedBy is the role that created the database.
 	CreatedBy *string `json:"createdBy"`
 	// CreatedAt is the creation time.
@@ -153,6 +155,8 @@ type Table struct {
 	SizeBytes *int64 `json:"sizeBytes"`
 	// Partitioning says how the user partitioned a distributed table (contract 0.14.0, optional); null when it is not partitioned.
 	Partitioning *TablePartitioning `json:"partitioning,omitempty"`
+	// Storage is the storage format (contract 0.17.0, optional); null when it is not known.
+	Storage *TableStorage `json:"storage,omitempty"`
 }
 
 // TablePartitioning is the partitioning member of Table.
@@ -160,6 +164,10 @@ type TablePartitioning struct {
 	Method         string `json:"method"`
 	Key            string `json:"key"`
 	PartitionCount int    `json:"partitionCount"`
+	// ColumnType, HasPolicy and DefaultPartition (contract 0.17.0, optional) are set for a table that is range-partitioned on one time column.
+	ColumnType       string `json:"columnType,omitempty"`
+	HasPolicy        *bool  `json:"hasPolicy,omitempty"`
+	DefaultPartition *bool  `json:"defaultPartition,omitempty"`
 }
 
 // TableColumn is a column of a table with its eligibility as distribution

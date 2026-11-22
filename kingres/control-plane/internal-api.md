@@ -247,6 +247,17 @@ An alert's id is `ordinal << 32 | local id`: the ordinal is the number the leade
 cluster, below 2^53 (what a browser holds in a JSON number), and tells the receiving server which server holds
 the alert, so `acknowledgeAlert` goes straight to it (it audits the acknowledgement, once).
 
+## Extensions and database settings (phase 12)
+
+Four more closed kinds of `POST /internal/v1/apply` (leader only, parameters are structured values, never SQL): `extension.check` (`{database, extension, version?, preload?}`:
+the package of this server has the extension, at that default version; with `preload` its library is in `shared_preload_libraries`), `extension.install`
+(`CREATE EXTENSION IF NOT EXISTS`, or `ALTER EXTENSION ... UPDATE` when it is installed at another version), `extension.verify` (`{database, extension, version, hash?}`: the installed version
+and, for `kingres_sketch`, `self_test()`) and `database.settings` (`{database, settings}`: `ALTER DATABASE ... SET`, or `RESET` for an empty value, of a closed list of three
+`kingres_shard` settings; a setting that the server does not know is skipped). The extension is one of `kingres_sketch`, `kingres_columnar` and `kingres_timepart`. A refusal that the
+leader must tell apart comes back with the status of the problem and its code in `code`: `422 extension_unavailable`, `409 extension_version_mismatch`, `409 sketch_hash_mismatch` and
+`409 extension_missing`; `healable` does not retry them. The leader also uses `POST /internal/v1/exec` for one read-only statement per server (the version of `kingres_sketch` that a server
+has installed, for `getApproximateAggregates`); that is the first caller of `exec` in the product.
+
 ## Certificate renewal
 
 Every server renews its own certificate (the server certificate and the client certificate are one certificate)

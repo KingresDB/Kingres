@@ -65,11 +65,12 @@ Target: Ubuntu 24.04, amd64. Everything below was run on Windows 11 with WSL2
   `kingres_ledger` 0.1, `kingres_timepart` 0.1 and `kingres_columnar` 0.1).
   `kingres_columnar` needs `shared_preload_libraries = 'kingres_columnar'` to
   write (it registers a WAL resource manager). **What the product preloads
-  today, and what it should preload, is described in
+  is described in
   [The preload of `kingres_columnar`](#the-preload-of-kingres_columnar).** In
-  short: `kingresd` preloads `kingres_shard,kingres_ledger` and not
-  `kingres_columnar`; without the preload `CREATE EXTENSION` works, a columnar
-  table can be read, and creating one, a write, and the conversion of a
+  short: since phase 12 `kingresd` preloads `kingres_shard,kingres_ledger,kingres_columnar`
+  (`instance.PreloadLibraries`; an instance made by an earlier package gets the new list when
+  `kingresd` starts and the instance is restarted); without the preload `CREATE EXTENSION` works,
+  a columnar table can be read, and creating one, a write, and the conversion of a
   partition to columnar storage by `kingres_timepart` are refused with a message
   that names `shared_preload_libraries`. The other four extensions need no
   preload except `kingres_shard` and `kingres_ledger`.
@@ -732,6 +733,9 @@ dead weight in the package without it. What it costs every backend, from reading
   recovery, base backups, `pg_rewind`) and on **every standby** of it, or the server may fail
   to start or to replay. So the preload is a property of the whole cluster, and it must
   never be taken away from an instance that holds columnar data.
+
+**Done (phase 12 control plane):** `RenderManaged` has the new list (`instance.PreloadLibraries`), `EnsureConfig` re-renders
+`kingres-managed.conf` when its list differs, the tests and `managed.go` follow, and the flow test of this directory expects the new list. The text below is the analysis that led to it.
 
 **Upgrade of an existing cluster.** `kingres-managed.conf` is written when an instance is
 created and rewritten only by `WriteManaged` (a settings change); `EnsureConfig` at the start

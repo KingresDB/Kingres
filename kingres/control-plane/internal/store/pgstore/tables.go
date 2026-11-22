@@ -46,7 +46,7 @@ func classPredicate(class string, hasShard, hasLedger bool) string {
 // tableQuery builds the table listing query for the catalog objects that
 // exist in the database; $1 and $2 filter the schema and the name, $3 and $4 are
 // the position to continue after (NULL: from the start), $5 the number of rows.
-func tableQuery(hasShard, hasLedger, hasUpdatable bool, class string) string {
+func tableQuery(hasShard, hasLedger, hasUpdatable bool, class, storage string) string {
 	dist := "NULL::text, NULL::text, NULL::int, NULL::int"
 	distJoin := ""
 	if hasShard {
@@ -88,13 +88,14 @@ WHERE c.relkind IN ('r', 'p') AND NOT c.relispartition
   AND ($1 = '' OR n.nspname = $1) AND ($2 = '' OR c.relname = $2)
   AND ($3::text IS NULL OR (n.nspname, c.relname) > ($3, $4))
   AND ` + classPredicate(class, hasShard, hasLedger) + `
+  AND ` + storagePredicate(storage) + `
 ORDER BY n.nspname, c.relname
 LIMIT $5::int`
 }
 
 // readTables reads the tables of a database; schema and name filter when
 // non-empty.
-func (s *Store) readTables(ctx context.Context, h *dbHandle, schema, name, class string, after []string, limit int) ([]api.Table, error) {
+func (s *Store) readTables(ctx context.Context, h *dbHandle, schema, name, class, storage string, after []string, limit int) ([]api.Table, error) {
 	cat, err := s.loadCatalog(ctx)
 	if err != nil {
 		return nil, err
@@ -127,7 +128,7 @@ func (s *Store) readTables(ctx context.Context, h *dbHandle, schema, name, class
 	if after != nil {
 		as, an = after[0], after[1]
 	}
-	rows, err := h.pool.Query(ctx, tableQuery(hasShard, hasLedger, hasUpdatable, class), schema, name, as, an, limit)
+	rows, err := h.pool.Query(ctx, tableQuery(hasShard, hasLedger, hasUpdatable, class, storage), schema, name, as, an, limit)
 	if err != nil {
 		return nil, s.wrap("listing tables", err)
 	}
@@ -179,10 +180,13 @@ func (s *Store) readTables(ctx context.Context, h *dbHandle, schema, name, class
 		}
 		return t, nil
 	})
-	if err != nil || !hasShard {
+	if err != nil {
 		return out, err
 	}
-	s.addPartitioning(ctx, h, out)
+	if hasShard {
+		s.addPartitioning(ctx, h, out)
+	}
+	s.addStorage(ctx, h, out)
 	return out, nil
 }
 
@@ -249,7 +253,7 @@ func (s *Store) Tables(ctx context.Context, db string, f store.TableFilter, p st
 	}
 	// Keyset paging in SQL on (schema, name): the database builds one more row than
 	// the page, never the whole list of tables.
-	all, err := s.readTables(ctx, h, f.Schema, "", f.Class, after, p.Limit+1)
+	all, err := s.readTables(ctx, h, f.Schema, "", f.Class, f.Storage, after, p.Limit+1)
 	if err != nil {
 		return api.TablePage{}, err
 	}
@@ -266,7 +270,7 @@ func (s *Store) Table(ctx context.Context, db, schema, name string) (api.TableDe
 	if err != nil {
 		return api.TableDetail{}, err
 	}
-	all, err := s.readTables(ctx, h, schema, name, "", nil, 1)
+	all, err := s.readTables(ctx, h, schema, name, "", "", nil, 1)
 	if err != nil {
 		return api.TableDetail{}, err
 	}

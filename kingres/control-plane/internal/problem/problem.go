@@ -111,6 +111,13 @@ const (
 	ChainNotDiverged   Code = "chain_not_diverged"
 	// Added in contract 0.14.0 (the table lifecycle): the table cannot take the requested change; Blockers says why.
 	TableNotEligible Code = "table_not_eligible"
+	// Added in contract 0.17.0 (phase 12): the extensions of the analytics, the storage format and the time-partitioning policy.
+	ExtensionUnavailable     Code = "extension_unavailable"
+	ExtensionVersionMismatch Code = "extension_version_mismatch"
+	SketchHashMismatch       Code = "sketch_hash_mismatch"
+	ExtensionMissing         Code = "extension_missing"
+	ConversionRefused        Code = "conversion_refused"
+	PartitionPolicyConflict  Code = "partition_policy_conflict"
 )
 
 // FieldError is one entry of the "errors" extension (schema ValidationIssue).
@@ -249,6 +256,12 @@ var specs = map[Code]struct {
 	LastSigningKey:                  {409, "Last signing key", "last-signing-key"},
 	ChainNotDiverged:                {409, "The chain is not diverged", "chain-not-diverged"},
 	TableNotEligible:                {422, "The table cannot take this change", "table-not-eligible"},
+	ExtensionUnavailable:            {422, "The extension is not available", "extension-unavailable"},
+	ExtensionVersionMismatch:        {409, "The extension versions differ", "extension-version-mismatch"},
+	SketchHashMismatch:              {409, "The sketch hashes differ", "sketch-hash-mismatch"},
+	ExtensionMissing:                {409, "An extension is missing", "extension-missing"},
+	ConversionRefused:               {409, "The storage format cannot be changed", "conversion-refused"},
+	PartitionPolicyConflict:         {409, "The table cannot have this policy", "partition-policy-conflict"},
 }
 
 // New returns a Problem for the code with the standard status, title and

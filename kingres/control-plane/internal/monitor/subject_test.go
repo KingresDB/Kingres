@@ -25,3 +25,15 @@ func TestParseSubjectIsTyped(t *testing.T) {
 		t.Errorf("cluster subject must be empty: %+v", s)
 	}
 }
+
+// A partition alert names its table in typed members, with a name that has a dot, a bar or a percent sign in it read back as it was (no parsing of an
+// aspect, no ambiguity).
+func TestParseSubjectOfAPartitionAlert(t *testing.T) {
+	s := parseSubject("database:shop|tableschema:pub%7Clic|tablename:ev.ents%25")
+	if s.DatabaseName == nil || *s.DatabaseName != "shop" || s.TableSchema == nil || *s.TableSchema != "pub|lic" || s.TableName == nil || *s.TableName != "ev.ents%" || s.Aspect != nil {
+		t.Errorf("%+v", s)
+	}
+	if s := parseSubject("database:shop|ca"); s.TableName != nil || s.TableSchema != nil {
+		t.Errorf("an alert that is not about a table: %+v", s)
+	}
+}
