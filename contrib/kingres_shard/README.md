@@ -8,7 +8,7 @@ node as reference tables, and makes every statement correct on a cluster with
 several groups: a statement that touches one key goes to the group that owns
 it, and a statement that spans groups is answered by reading the other groups.
 
-This is version 0.8 (0.8 is the bucket layout of phase 10, see "The bucket layout (version 0.8)", and the schemas of phase 11; 0.7 is the table lifecycle of phase 9 on top of 0.6; 0.6 is the version of phase 2b; 0.3 added moving buckets, phase 2a made every statement correct, 0.4 is the fix round of the reviews of 0.2 and 0.3, 0.5 is high availability: standby nodes, `promote_node`, prepared transactions across a failover, distributed deadlock detection and coordinated restore points; see "High availability" below; 0.6 is phase 2b and adds no SQL object, see "Installation" for why the version is raised). Phase 2b makes the common
+This is version 0.9 (0.9 is columnar storage in the sharding extension and the approximate `count(DISTINCT)` of phase 12, see "Columnar storage (version 0.9)"; 0.8 is the bucket layout of phase 10, see "The bucket layout (version 0.8)", and the schemas of phase 11; 0.7 is the table lifecycle of phase 9 on top of 0.6; 0.6 is the version of phase 2b; 0.3 added moving buckets, phase 2a made every statement correct, 0.4 is the fix round of the reviews of 0.2 and 0.3, 0.5 is high availability: standby nodes, `promote_node`, prepared transactions across a failover, distributed deadlock detection and coordinated restore points; see "High availability" below; 0.6 is phase 2b and adds no SQL object, see "Installation" for why the version is raised). Phase 2b makes the common
 statements fast. The designs are in
 [`kingres/docs/design/shard-mvp.md`](../../kingres/docs/design/shard-mvp.md)
 (phase 1) and
@@ -204,10 +204,10 @@ rest of the phase needs (see "The table lifecycle (version 0.7)"). Increment 9.4
   database, so every node needs a role of that name, and `pg_hba.conf` (and the
   password file, if used) must let the nodes in. Credentials are never stored
   in the catalog. SSL options are set with `kingres_shard.node_conninfo`.
-- `CREATE EXTENSION kingres_shard` installs version 0.8 (the `default_version` of the control file);
-  `ALTER EXTENSION kingres_shard UPDATE` upgrades a 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 or 0.7 installation
-  (the chain is 0.1 -> 0.2 -> 0.3 -> 0.4 -> 0.5 -> 0.6 -> 0.7 -> 0.8, and the catalog is identical to a
-  fresh 0.8 one; the `upgrade` regression test compares the two). Transactions that 0.4
+- `CREATE EXTENSION kingres_shard` installs version 0.9 (the `default_version` of the control file);
+  `ALTER EXTENSION kingres_shard UPDATE` upgrades a 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7 or 0.8 installation
+  (the chain is 0.1 -> 0.2 -> 0.3 -> 0.4 -> 0.5 -> 0.6 -> 0.7 -> 0.8 -> 0.9, and the catalog is identical to a
+  fresh 0.9 one; the `upgrade` regression test compares the two). Transactions that 0.4
   prepared and that are pending at the upgrade are resolved in the old identifier format
   (see "Prepared transactions across a failover").
 - **Version 0.6 adds no table, view, function or column.** `kingres_shard--0.5--0.6.sql` holds
@@ -295,7 +295,7 @@ PROVE_TESTS=t/013_dist_scan.pl kingres/dev/ext.sh kingres_shard tap
   second, fictitious shard group; `routing_decisions`: collations, functions
   and other nested contexts, forwarded sessions, decided with `EXPLAIN`;
   `reference`: reference tables on one node; `upgrade`: `ALTER EXTENSION ...
-  UPDATE` from 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 and 0.7 against a fresh 0.8 install; the same on both majors:
+  UPDATE` from 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7 and 0.8 against a fresh 0.9 install; the same on both majors:
   the script of 0.3 names a column of `pg_stat_subscription_stats` that PostgreSQL 19
   renamed, so on 19 it creates `kingres.internal_move_subscription_status()` with its
   body check off and `ALTER EXTENSION ... UPDATE` to 0.4 replaces it with a body that
@@ -1911,7 +1911,7 @@ product yet: these are the objects the later increments use, tested with rows ma
   system or already distributed schema).  It reads the catalog only and any role may call it.
 
 The SQL of phase 11 is a marked section ("PHASE 11") at the end of `kingres_shard--0.7--0.8.sql` and `kingres_shard--0.8.sql`.  The version handshake
-of `internal_check_node_versions()` asks for 0.8.
+of `internal_check_node_versions()` asks for 0.9 since version 0.9 (the SQL of 0.9 is `kingres_shard--0.8--0.9.sql`; `kingres_shard--0.9.sql` is generated from the 0.8 install script and it by `mk-install-script.sh`, which `t/250` checks for both versions).
 
 **Increment 2: reading a table of a distributed schema that another group holds, and the defence against reading the empty copy.**  The tables
 of a distributed schema exist on every node; the rows are on the one node (shard group) that holds the schema, the owner, and the copy on every
