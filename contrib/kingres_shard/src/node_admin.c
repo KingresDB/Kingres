@@ -738,6 +738,25 @@ kingres_rotate_secret(PG_FUNCTION_ARGS)
 	"ORDER BY 1"
 
 /*
+ * The names of the roles that own, or hold privileges on, what the distributed schemas hold (their tables, functions, types, default privileges and the
+ * schemas themselves): the staging of a schema needs them on the new node (P12F-02).
+ */
+#define SCHEMA_ROLES_SQL \
+	"WITH sc AS (SELECT nsp::pg_catalog.oid AS oid FROM " KINGRES_SHARD_SCHEMA ".dist_schema), " \
+	"obj AS (" \
+	" SELECT nspowner AS own, nspacl AS acl FROM pg_namespace WHERE oid IN (SELECT oid FROM sc) " \
+	" UNION ALL SELECT relowner, relacl FROM pg_class WHERE relnamespace IN (SELECT oid FROM sc) " \
+	" UNION ALL SELECT proowner, proacl FROM pg_proc WHERE pronamespace IN (SELECT oid FROM sc) " \
+	" UNION ALL SELECT typowner, typacl FROM pg_type WHERE typnamespace IN (SELECT oid FROM sc) " \
+	" UNION ALL SELECT defaclrole, defaclacl FROM pg_default_acl WHERE defaclnamespace IN (SELECT oid FROM sc)) " \
+	"SELECT DISTINCT rolname FROM (" \
+	" SELECT r.rolname::pg_catalog.text AS rolname FROM obj o JOIN pg_roles r ON r.oid = o.own " \
+	" UNION ALL " \
+	" SELECT g.rolname::pg_catalog.text FROM obj o CROSS JOIN LATERAL pg_catalog.aclexplode(o.acl) x " \
+	"   JOIN pg_roles g ON g.oid = x.grantee) s " \
+	"ORDER BY 1"
+
+/*
  * acl_query
  *
  * The first column of every row of one of the queries above, as strings in the
@@ -831,6 +850,45 @@ copy_acls_to_node(KsConn *kc)
 	PQclear(kingres_shard_exec(kc, script.data));
 }
 
+/*
+ * stage_check_roles
+ *
+ * The roles that the distributed schemas name (owners and grantees) must exist on the new node before a schema is made there.  The node
+ * says "role does not exist" with the same error code as a reference table that is not made yet, and only the text tells the two apart,
+ * which depends on the language of the node.  This check is a query on pg_roles, so it does not (P12F-02, and the pre-check that the
+ * review of the step 12 fixes asked for).
+ */
+static void
+stage_check_roles(PGconn *conn, const char *host, int port)
+{
+	List	   *roles = acl_query(SCHEMA_ROLES_SQL);
+	StringInfoData array;
+	PGresult   *res;
+	ListCell   *lc;
+
+	if (roles == NIL)
+		return;
+	initStringInfo(&array);
+	foreach(lc, roles)
+		appendStringInfo(&array, "%s%s", array.len ? ", " : "", quote_literal_cstr((char *) lfirst(lc)));
+	res = kingres_shard_bounded_exec(conn,
+									 psprintf("SELECT pg_catalog.string_agg(r, ', ' ORDER BY r) "
+											  "FROM pg_catalog.unnest(ARRAY[%s]::pg_catalog.text[]) AS r "
+											  "WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles x "
+											  "WHERE x.rolname OPERATOR(pg_catalog.=) r)", array.data), true);
+	if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("the new node %s:%d could not be asked which roles it has", host, port)));
+	if (!PQgetisnull(res, 0, 0))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("cannot add node %s:%d: the roles %s own objects of the distributed schemas or hold privileges on them and do not exist on the new node",
+						host, port, PQgetvalue(res, 0, 0)),
+				 errhint("Create the roles on the new node (CREATE ROLE, with the same names), then repeat add_node().")));
+	PQclear(res);
+}
+
 /* How many statements a batch of schemas holds at most (a schema is never split: a single bigger schema is a batch of its own). */
 int			kingres_shard_add_node_batch_statements = 100;
 
@@ -841,8 +899,13 @@ int			kingres_shard_add_node_batch_statements = 100;
 static bool
 stage_error_is_dependency(int sqlstate, const char *msg)
 {
-	/* a role that the node lacks is undefined_object too, and no later transaction makes it: that is an error of the call (P12R-05) */
-	if (sqlstate == ERRCODE_UNDEFINED_OBJECT && msg != NULL && strstr(msg, "role \"") != NULL)
+	/*
+	 * A role that the node lacks is undefined_object too, and no later transaction makes it: that is an error of the call (P12R-05).  The
+	 * roles that the schemas name are checked before the staging (stage_check_roles); this is the second line for a role that check does not
+	 * see (a default privilege, a policy).  The text is the primary message of the node, whose language the staging session has set to C
+	 * (P12F-02), and it must begin with the word, so a table that has such a name in its text is not taken for a role.
+	 */
+	if (sqlstate == ERRCODE_UNDEFINED_OBJECT && msg != NULL && strncmp(msg, "role \"", 6) == 0)
 		return false;
 	return sqlstate == ERRCODE_UNDEFINED_TABLE || sqlstate == ERRCODE_UNDEFINED_OBJECT ||
 		sqlstate == ERRCODE_INVALID_SCHEMA_NAME || sqlstate == ERRCODE_UNDEFINED_FUNCTION;
@@ -965,6 +1028,8 @@ stage_schemas_on_node(const char *host, int port, MemoryContext keepcxt, List **
 		}
 		*has_progress = true;
 		/* The extension is made in a transaction of its own: the batches need its table, and they commit before the registration. */
+		/* the messages of this session are in English, whatever the node is set to: the second line for a missing role reads one (P12F-02) */
+		stage_exec_ok(conn, "SET lc_messages = 'C'", "setting the language of the messages");
 		stage_exec_ok(conn, "CREATE EXTENSION IF NOT EXISTS kingres_shard", "making the extension");
 		res = kingres_shard_bounded_exec(conn,
 										 "SELECT (SELECT count(*) FROM " KINGRES_SHARD_SCHEMA ".local_node) + "
@@ -1029,6 +1094,9 @@ stage_schemas_on_node(const char *host, int port, MemoryContext keepcxt, List **
 		}
 		PQclear(res);
 
+		if (names != NIL)
+			stage_check_roles(conn, host, port);
+
 		forfour(l1, names, l2, scripts, l3, digests, l4, weights)
 		{
 			char	   *nm = (char *) lfirst(l1);
@@ -1078,7 +1146,7 @@ stage_schemas_on_node(const char *host, int port, MemoryContext keepcxt, List **
 				continue;
 			}
 			sqlstate = kingres_shard_result_sqlstate(res);
-			if (stage_error_is_dependency(sqlstate, PQresultErrorMessage(res)))
+			if (stage_error_is_dependency(sqlstate, PQresultErrorField(res, PG_DIAG_MESSAGE_PRIMARY)))
 			{
 				/* Not yet: it reads a table that the registration makes.  What the statements did is undone with the savepoint. */
 				PQclear(res);
@@ -1510,6 +1578,7 @@ kingres_add_node_body(PG_FUNCTION_ARGS)
 		kingres_shard_fault_point("add_node_staged");
 		kc = kingres_shard_get_conn(host, port, false, NULL);
 		kingres_shard_begin_write_xact(kc);
+		kc->new_node = true;
 		check_acl_roles_on_node(kc, host, port);
 		res = kingres_shard_exec(kc, "CREATE EXTENSION IF NOT EXISTS kingres_shard");
 		PQclear(res);

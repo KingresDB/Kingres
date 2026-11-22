@@ -52,15 +52,22 @@ my $n4 = new_node('sl4');
 
 # B
 {
-	q1($_, q{CREATE ROLE ghost}) for (@nodes, $n4);
-	q1($n1, q{CREATE SCHEMA s3; CREATE TABLE s3.t (id int PRIMARY KEY); CREATE FUNCTION s3.f() RETURNS int LANGUAGE sql AS 'SELECT 1'; ALTER FUNCTION s3.f() OWNER TO ghost});
+	q1($_, q{CREATE ROLE ghost; CREATE ROLE ghost2}) for (@nodes, $n4);
+	q1($n1, q{CREATE SCHEMA s3; CREATE TABLE s3.t (id int PRIMARY KEY); CREATE FUNCTION s3.f() RETURNS int LANGUAGE sql AS 'SELECT 1'; ALTER FUNCTION s3.f() OWNER TO ghost; ALTER DEFAULT PRIVILEGES FOR ROLE ghost IN SCHEMA s3 GRANT SELECT ON TABLES TO ghost2});
 	my $n5 = new_node('sl5');
 	my ($rc, $out, $err) = run_sql($n1, sprintf("SELECT kingres.add_node('%s', %d)", $n5->host, $n5->port));
 	isnt($rc, 0, 'B: a role that the new node lacks refuses the call');
-	like($err, qr/role "ghost" does not exist/, 'B: ... with the message of the node');
-	like($err, qr/Fix the cause .* and repeat add_node\(\)/, 'B: ... and the hint to repeat the call (it was not deferred to the last transaction)') or diag($err);
+	# the roles of the schemas are looked up on the node before a schema is made there, so the answer does not depend on the language of its messages (P12F-02)
+	like($err, qr/the roles ghost, ghost2 own objects of the distributed schemas or hold privileges on them and do not exist on the new node/, 'B: ... naming the role') or diag($err);
+	like($err, qr/HINT:.*Create the roles on the new node .* then repeat add_node\(\)/s, 'B: ... and the hint to create it and repeat the call') or diag($err);
+	is(q1($n5, q{SELECT count(*) FROM pg_namespace WHERE nspname = 's3'}), 0, 'B: no schema was made on the node');
 	is(q1($n1, q{SELECT count(*) FROM kingres.node}), 4, 'B: the node is not registered');
 	q1($n5, q{CREATE ROLE ghost});
+	# a role that only a default privilege of the schema names is found the same way
+	($rc, $out, $err) = run_sql($n1, sprintf("SELECT kingres.add_node('%s', %d)", $n5->host, $n5->port));
+	isnt($rc, 0, 'B: a role of a default privilege that the node lacks refuses the call');
+	like($err, qr/the roles ghost2 own objects/, 'B: ... naming it') or diag($err);
+	q1($n5, q{CREATE ROLE ghost2});
 	($rc, $out, $err) = run_sql($n1, sprintf("SELECT kingres.add_node('%s', %d)", $n5->host, $n5->port));
 	is($rc, 0, 'B: with the role the call succeeds') or diag($err);
 	like($err, qr/1 distributed schemas are on the node in 1 batches \(\d+ were made by an earlier call, 0 are made in the last transaction\)/, 'B: the schema was made in a batch');

@@ -6,6 +6,7 @@ kingres_shard_sources = files(
   'src/bucket_move.c',
   'src/catalog.c',
   'src/copy_routed.c',
+  'src/count_distinct.c',
   'src/dist_scan.c',
   'src/dist_table.c',
   'src/fanout.c',
@@ -70,6 +71,8 @@ install_data(
   'kingres_shard--0.7.sql',
   'kingres_shard--0.7--0.8.sql',
   'kingres_shard--0.8.sql',
+  'kingres_shard--0.8--0.9.sql',
+  'kingres_shard--0.9.sql',
   kwargs: contrib_data_args,
 )
 

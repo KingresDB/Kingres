@@ -236,6 +236,8 @@ SELECT name, setting, unit, context
  kingres_shard.add_node_batch_statements      | 100     |      | superuser
  kingres_shard.catalog_incremental            | on      |      | superuser
  kingres_shard.control_call_timeout           | 0       | s    | user
+ kingres_shard.count_distinct_error_rate      | 0.01    |      | user
+ kingres_shard.count_distinct_mode            | exact   |      | user
  kingres_shard.deadlock_check_interval        | 0       | s    | sighup
  kingres_shard.deadlock_confirm_delay         | 200     | ms   | sighup
  kingres_shard.decision_retention             | 300     | s    | sighup
@@ -282,7 +284,7 @@ SELECT name, setting, unit, context
  kingres_shard.schema_placement_group         | -1      |      | superuser
  kingres_shard.shippable_extensions           | all     |      | user
  kingres_shard.table_cleanup_delay            | 600     | s    | user
-(49 rows)
+(51 rows)
 
 SET kingres_shard.default_bucket_count = 0;
 ERROR:  0 is outside the valid range for parameter "kingres_shard.default_bucket_count" (1 .. 4096)

@@ -8,7 +8,7 @@ node as reference tables, and makes every statement correct on a cluster with
 several groups: a statement that touches one key goes to the group that owns
 it, and a statement that spans groups is answered by reading the other groups.
 
-This is version 0.8 (0.8 is the bucket layout of phase 10, see "The bucket layout (version 0.8)", and the schemas of phase 11; 0.7 is the table lifecycle of phase 9 on top of 0.6; 0.6 is the version of phase 2b; 0.3 added moving buckets, phase 2a made every statement correct, 0.4 is the fix round of the reviews of 0.2 and 0.3, 0.5 is high availability: standby nodes, `promote_node`, prepared transactions across a failover, distributed deadlock detection and coordinated restore points; see "High availability" below; 0.6 is phase 2b and adds no SQL object, see "Installation" for why the version is raised). Phase 2b makes the common
+This is version 0.9 (0.9 is columnar storage in the sharding extension and the approximate `count(DISTINCT)` of phase 12, see "Columnar storage (version 0.9)"; 0.8 is the bucket layout of phase 10, see "The bucket layout (version 0.8)", and the schemas of phase 11; 0.7 is the table lifecycle of phase 9 on top of 0.6; 0.6 is the version of phase 2b; 0.3 added moving buckets, phase 2a made every statement correct, 0.4 is the fix round of the reviews of 0.2 and 0.3, 0.5 is high availability: standby nodes, `promote_node`, prepared transactions across a failover, distributed deadlock detection and coordinated restore points; see "High availability" below; 0.6 is phase 2b and adds no SQL object, see "Installation" for why the version is raised). Phase 2b makes the common
 statements fast. The designs are in
 [`kingres/docs/design/shard-mvp.md`](../../kingres/docs/design/shard-mvp.md)
 (phase 1) and
@@ -204,10 +204,10 @@ rest of the phase needs (see "The table lifecycle (version 0.7)"). Increment 9.4
   database, so every node needs a role of that name, and `pg_hba.conf` (and the
   password file, if used) must let the nodes in. Credentials are never stored
   in the catalog. SSL options are set with `kingres_shard.node_conninfo`.
-- `CREATE EXTENSION kingres_shard` installs version 0.8 (the `default_version` of the control file);
-  `ALTER EXTENSION kingres_shard UPDATE` upgrades a 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 or 0.7 installation
-  (the chain is 0.1 -> 0.2 -> 0.3 -> 0.4 -> 0.5 -> 0.6 -> 0.7 -> 0.8, and the catalog is identical to a
-  fresh 0.8 one; the `upgrade` regression test compares the two). Transactions that 0.4
+- `CREATE EXTENSION kingres_shard` installs version 0.9 (the `default_version` of the control file);
+  `ALTER EXTENSION kingres_shard UPDATE` upgrades a 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7 or 0.8 installation
+  (the chain is 0.1 -> 0.2 -> 0.3 -> 0.4 -> 0.5 -> 0.6 -> 0.7 -> 0.8 -> 0.9, and the catalog is identical to a
+  fresh 0.9 one; the `upgrade` regression test compares the two). Transactions that 0.4
   prepared and that are pending at the upgrade are resolved in the old identifier format
   (see "Prepared transactions across a failover").
 - **Version 0.6 adds no table, view, function or column.** `kingres_shard--0.5--0.6.sql` holds
@@ -295,7 +295,7 @@ PROVE_TESTS=t/013_dist_scan.pl kingres/dev/ext.sh kingres_shard tap
   second, fictitious shard group; `routing_decisions`: collations, functions
   and other nested contexts, forwarded sessions, decided with `EXPLAIN`;
   `reference`: reference tables on one node; `upgrade`: `ALTER EXTENSION ...
-  UPDATE` from 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 and 0.7 against a fresh 0.8 install; the same on both majors:
+  UPDATE` from 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7 and 0.8 against a fresh 0.9 install; the same on both majors:
   the script of 0.3 names a column of `pg_stat_subscription_stats` that PostgreSQL 19
   renamed, so on 19 it creates `kingres.internal_move_subscription_status()` with its
   body check off and `ALTER EXTENSION ... UPDATE` to 0.4 replaces it with a body that
@@ -2031,7 +2031,7 @@ product yet: these are the objects the later increments use, tested with rows ma
   system or already distributed schema).  It reads the catalog only and any role may call it.
 
 The SQL of phase 11 is a marked section ("PHASE 11") at the end of `kingres_shard--0.7--0.8.sql` and `kingres_shard--0.8.sql`.  The version handshake
-of `internal_check_node_versions()` asks for 0.8.
+of `internal_check_node_versions()` asks for 0.9 since version 0.9 (the SQL of 0.9 is `kingres_shard--0.8--0.9.sql`; `kingres_shard--0.9.sql` is generated from the 0.8 install script and it by `mk-install-script.sh`, which `t/250` checks for both versions).
 
 **Increment 2: reading a table of a distributed schema that another group holds, and the defence against reading the empty copy.**  The tables
 of a distributed schema exist on every node; the rows are on the one node (shard group) that holds the schema, the owner, and the copy on every
@@ -2218,6 +2218,8 @@ Limits of this version:
 - Roles, tablespaces and extensions are not synchronized (the existing limit): a role that owns a schema or an object in it must exist on every node before the schema is distributed or the node is added.
 - Local helper schemas in a database that distributes by default need a superuser to create them (`SET kingres_shard.distribute_new_schemas = off`).
 - Review P12R-06/07 limits are in the paragraph of step 12 above.
+- A catalog table of the extension (`dist_schema`, `dist_table`) that has lost its primary key is read without an index (slower) and each backend warns once; restore it with `ALTER TABLE kingres.<table> ADD PRIMARY KEY (<column>)` (P12F-01).
+- `add_node` looks up the roles that the distributed schemas name on the new node before making any schema there, so a missing role is reported at once whatever the language of the node (P12F-02).  Default privileges and function owners are included.
 
 The tests of this phase are `t/230` to `t/251`; the numbers of the measured cost are in the design notes and in the paragraph of step 12.
 
@@ -2384,6 +2386,114 @@ Read these first; each is a reviewed boundary, not an accident.
   is no pool shared between backends.
 - `dist_collation` is an OID; non-default, non-deterministic collations are
   not portable between nodes.
+
+## Columnar storage (version 0.9, phase 12)
+
+Design: [`analytics-phase12-storage.md`](../../kingres/docs/design/analytics-phase12-storage.md), section 9.  Version 0.9 makes the
+extension work with tables of the access method `columnar` (`kingres_columnar`, which must be installed on every node and preloaded
+where the tables are written).  The version adds no table to the catalog; the scripts are `kingres_shard--0.8--0.9.sql` and the
+generated `kingres_shard--0.9.sql`.
+
+### The access method is carried (increment S1)
+
+`create_distributed_table` (blocking and `_concurrently`), `alter_distributed_table`, `undistribute_table` and the node that joins
+through `add_node` all recreate a table from `kingres.internal_table_ddl()`, which now names the access method of the source
+(`USING columnar`; heap is the default and is not named).  The partitioned parent of a distributed table has the access method, so
+every bucket partition made with `CREATE TABLE ... PARTITION OF` has it; the shadow of a rebuild is made the same way, so a columnar
+table stays columnar through every operation of the table lifecycle, and `undistribute_table` gives a columnar table back.
+A user-partitioned table (increment 9.5) keeps the access method of **each leaf**: a leaf may differ from its siblings and from the
+parent (a columnar leaf for cold data next to heap leaves); `internal_partition_layout()` has a fifth column, `am`.
+
+- **REPLICA IDENTITY FULL.** A columnar table has no primary key unless the user made one, and a bucket move needs a primary key or
+  `REPLICA IDENTITY FULL` (phase 4).  Every bucket partition and every leaf of another access method than heap is created with
+  `REPLICA IDENTITY FULL`.  No `UPDATE` or `DELETE` can reach it (the access method refuses them), so the identity only satisfies the
+  check of the move.
+- **The report.**  `table_change_report('distribute', ...)` gains `access_method_missing` (a blocker: a node lacks the access method; create the
+  extension there first) and the note `columnar_storage`; `table_change_report('distribute_reference', ...)` gains the blocker
+  `columnar_reference_table`: a reference table is a heap table in this version (design 9.5), so `create_reference_table` refuses a columnar
+  table and leaves it alone.  The report of 0.8 is kept as `kingres.internal_table_change_report_base()` and the report of 0.9 calls it and
+  adds these rows.
+- **Writes.** `INSERT`, `COPY FROM` and the batches of the row router work on a columnar distributed table; `UPDATE` and `DELETE` are
+  refused by the access method on the group that holds a matching row, and the two-phase transaction rolls the rest back.
+- **`add_node`** onto a node that has `kingres_columnar` (or `kingres_ledger`) installed works: the schema `kingres` is shared, and the check
+  of the prepared transaction no longer takes "the function does not exist" for a failure when the extension of this very transaction is
+  the one that makes the function.  That holds only for the node that `add_node` is adding (a flag on its connection): a participant of the cluster that lacks
+  `internal_sync_confirm` fails the transaction (review P12S-04, `t/275`).  A node without the access method is refused with the error of the node (`access method "columnar" does not
+  exist`) and joins nothing.
+
+### What a columnar distributed table refuses (increment S2)
+
+- **The online variants.**  `create_distributed_table_concurrently`, `create_reference_table_concurrently`, `alter_distributed_table_concurrently` and
+  `undistribute_table_concurrently` capture the changes of the source with a row trigger, which a columnar table does not support
+  (`row-level AFTER triggers on columnar tables are not supported`).  The report says so first: the blocker `columnar_online` (every kind
+  with `mode = 'online'`, for a table whose access method is not heap), so the call is refused with SQLSTATE `0A000` before an operation
+  is recorded, and the message names the blocking variant.  The blocking variants (`create_distributed_table`, `alter_distributed_table`,
+  `undistribute_table`) copy through the row router and work on a columnar table; they are the way to rebuild one.
+- **A bucket move** works when the installed `kingres_columnar` decodes its changes (0.2 or later, increment S3, below).  With 0.1, or with another access method than columnar,
+  `move_bucket` refuses in `preparing`, before it changes anything: SQLSTATE `0A000`, `bucket move refused: relation "public.cc_b0001" has columnar storage, and the
+  installed kingres_columnar cannot decode its changes` (hint: upgrade to 0.2, or convert the table to row storage).  The group is refused as a whole, naming the first such
+  relation, so a heap table colocated with a columnar one cannot move on its own either.
+- **A split.**  `split_bucket` of a group with a columnar table is refused in the same place with the words of the design: `bucket split refused:
+  table "public.cc" is columnar; a split needs a primary key, row locks and update triggers on the table, which columnar tables do not have`
+  (`0A000`).  A split stays refused for a columnar table in every version of this part.
+- **The ledger (rule L1).**  A ledger table cannot be columnar and the reverse: see the README of `kingres_ledger` (`ledger_enable` refuses a columnar table;
+  a rewrite by `SET ACCESS METHOD` of a ledger table is rejected).
+
+### Bucket moves of columnar relations (increment S3)
+
+A bucket of a columnar distributed table moves like any other (design 9.3 and 11.6), by logical replication between the nodes:
+
+- **The copy has the access method of the source.**  `internal_move_inspect` on the source answers with the access method of each bucket partition that is not heap, and
+  `internal_create_move_tables` creates the copy on the target `USING columnar`, with the storage parameters and `REPLICA IDENTITY FULL` of the source partition (the leaves of
+  a user-partitioned bucket are created with their own access methods, each non-heap leaf with `REPLICA IDENTITY FULL`).  Heap and columnar leaves can sit in one tree.
+- **The initial copy** is the table synchronization of the subscription (`COPY` of the rows, which the target stores in full stripes); **the changes** made while the move runs are
+  the inserts that `kingres_columnar` 0.2 decodes (only inserts exist: no `UPDATE` or `DELETE` can reach a columnar table).  The publisher needs `wal_level = logical` and the
+  library preloaded, as for any columnar write; the target must have `kingres_columnar` (its parent table is columnar, so the access method is there).
+- **What is checked:** the installed `kingres_columnar` is 0.2 or later on the source (otherwise the refusal above), the access method is columnar (another one is refused),
+  and the target can make the table (its parent has the access method).
+- The switch, the old copy kept until `move_cleanup_delay` and `check_cluster` are the same as for a heap bucket.  The switch of a user-partitioned bucket publishes the root with
+  `publish_via_partition_root`; a columnar leaf is delivered to the target's tree like a heap leaf (`t/274`: rows inserted during the move into both kinds of leaf).
+
+Not done: the design has the move call `columnar_compact` on the copy before the switch, to merge the small stripes that the apply worker makes; version 0.9 does not
+(the stripes of the initial copy are full; the stripes of the changes of the move are as many as the source transactions: run `kingres.columnar_compact` on the bucket partition
+afterwards when many small transactions wrote during a long move).  Test: `t/274_columnar_move`.
+
+**The options of a columnar table are carried** (review P12S-03): the compression, its level, the rows per stripe and per chunk that `columnar_set_options` gave a table are read
+by `kingres.internal_columnar_args()` and applied with `columnar_set_options` to every bucket partition that `create_distributed_table` and the rebuilds make, to the plain table
+that `undistribute_table` makes, to each leaf of a user-partitioned table, and to the copy of a bucket move (the bucket partition and each leaf).  For a distributed table that is rebuilt or
+undistributed the options are those of its first columnar bucket partition by name on the node that runs the call (a node that holds none gives the defaults).
+
+## Approximate `count(DISTINCT x)` (version 0.9, phase 12)
+
+Design: [`analytics-phase12-queries.md`](../../kingres/docs/design/analytics-phase12-queries.md), section 9.8.  Two settings, both `USERSET`:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `kingres_shard.count_distinct_mode` | `exact` | `exact` or `approximate`. **The one setting that changes results**: it is never on by default, and the web console turns it on for a database with `ALTER DATABASE ... SET`. A session can set it for itself. |
+| `kingres_shard.count_distinct_error_rate` | `0.01` | 0.0005 to 0.1.  The precision `p` of the sketch is the smallest from 4 to 18 with `1.04 / sqrt(2^p)` not above the rate: 0.01 gives 14, 0.005 gives 16, 0.1 gives 7, 0.0005 is capped at 18. |
+
+With `approximate` the planner hook rewrites, before the statement is analyzed, in **every query level that reads a hash-distributed table in its own range table** (a sub-select, a CTE, a sub-link and the top level are levels; a level that has none, a reference table or a local table stays exact), each
+
+```
+count(DISTINCT e) [FILTER (WHERE ...)]      ->      kingres_sketch.approx_count_distinct(e, p) [FILTER (WHERE ...)]
+```
+
+in the target list and in `HAVING`.  The `Aggref` keeps its place, its filter and its level; the function is replaced, `DISTINCT` is cleared and `p` is added as a
+constant.  The new aggregate has a combine function and serial functions, so the statement takes the partial aggregation of phase 2b
+(`enable_partial_aggregation`) and every shard group answers with one sketch per group value, at most 12 KB at `p = 14`, not with its rows.  The answer is the number
+that `approx_count_distinct(e, p)` gives on the same rows (the merge of sketches is exact), within `1.04 / sqrt(2^p)` of the exact one.
+
+Left alone, the statement stays exact: an argument of a type that is not a built-in scalar type with an extended hash function (a user type, an array, a range, an enum, a record,
+`oid` and the `reg*` types, whose hash depends on an object identifier), `count(DISTINCT e ORDER BY ...)`, and an aggregate of another level than the one that reads the
+table.  The rewrite is made for the session that plans the statement: a view or a function defined while the setting was on is planned with the setting of the session that runs
+it, and a change of either setting drops the cached plans (generic plans of prepared statements and of function bodies are planned again), so a statement never keeps the rewrite, or the lack of it, of a setting that is gone.  It is made before the shortcut for a cluster of one shard group, so the answer does not depend on the number of
+groups.
+
+It needs `kingres_sketch` at a version that the list of "Objects of extensions" accepts and `kingres_shard.shippable_extensions` that allows it.  Without it the setting does
+nothing and raises one warning per session (`count_distinct_mode is approximate but kingres_sketch is not installed in this database, or its version is not one that kingres_shard
+accepts`).  The sketch is looked up only when a statement has a count(DISTINCT) that can be rewritten, and only a role that has USAGE on the schema of `kingres_sketch` and EXECUTE on `approx_count_distinct` gets it; for any other role
+the statement stays exact, with one warning per session (`... this role may not use kingres_sketch ...`), and no other statement of the role is affected (review P12S-01).  `EXPLAIN` shows `approx_count_distinct(...)` in the aggregate; the design's extra line `Rewritten: count(DISTINCT x) -> approximate (p = 14)` is not printed in 0.9.
+Test: `t/273_count_distinct_mode`.
 
 ## Moving buckets and rebalancing (version 0.3, phase 4)
 
@@ -2613,7 +2723,9 @@ read is not reported as one that differs), `secret_missing` (the node holds no c
 `server_major_differs` (the node runs another PostgreSQL major than the map
 group primary); and for every reference table `reference_table_differs` (a node whose copy has other rows);
 and for the online table operations (9.3) `table_operation_stalled`, `shadow_table`, `log_table`, `capture_trigger`,
-`old_table` and `table_verification_failed` (see "The online variants").
+`old_table` and `table_verification_failed` (see "The online variants"); and `ledger_distributed_table` (a table of `kingres_ledger` that the catalog also
+distributes, or a reference table: ledgers cover one node, so such a ledger proves nothing about the whole table; `ledger_enable` cannot make the state,
+a restored cluster or a catalog edited by hand can, `t/272`).
 No rows means consistent, in this sense: it is a **structural** check (catalogs, which
 partitions exist where, what a move left behind). It never compares the rows, indexes,
 constraints or replica identity of a partition with its parent, so a copy that diverged
@@ -3370,6 +3482,7 @@ same thing for each.
 | `KS014` | two nodes hold cluster secrets that do not match, and the error does not say which of the two is behind: the node that refused (a standby that missed a rotation after the previous secret was no longer kept, asked about or to be promoted) **or the node that asked** (a map standby that missed a rotation and runs `promote_node` itself: the proof it sends is made with a secret that every other node has dropped), or a rotation was refused because a standby has not confirmed the last one. The first is decided by a fact the node reports (S12-05): the node refuses the proof of the session with **its own SQLSTATE `KS014`**, which it gives only when the proof does not match its secret; a node that belongs to a cluster but holds no secret refuses an ordinary role with `28000` and the detail "holds no cluster secret", which is **not** `KS014` (run `sync_catalog()` on MAP). The words of the message are the same for both and are never matched | **not a retry**: for the refused rotation, start the standby and let it replay, run `recover_prepared_transactions()` until it has confirmed, rotate again (or `remove_node` it); for a promotion, **first tell the two apart, then rebuild the one that is behind**: ask a third node of the cluster (a session from it to each of the two, or the same call from it); the caller that every other node refuses is the stale one, the node that only one node refuses is the one that is behind. Rebuild the stale one from a node that has the current secret (`remove_node`, `add_node`) or promote another standby of the group; never rebuild a healthy node because it was the first to refuse | "node N does not accept the session of this node: the two hold cluster secrets that do not match, and either may be the one that is behind" (the hint names both possibilities and says how to tell them apart), "the cluster secret cannot be rotated again yet: standby N has not confirmed the last rotation" | `t/095`, `t/101` (the rotation refused after a failover), `t/104` (the two refusals of a proof told apart) |
 | `55P03` | the node's own lock wait ended: the first statement of a session of a call runs with a `lock_timeout` of three quarters of `T` (the statement itself, not the check of the session's proof, which runs before that setting takes effect: a wait of the proof for a lock is `KS007` unless the role or database of the node has a shorter `lock_timeout`, S13-03), and every statement does when the administrator gave the node's database or role a shorter `lock_timeout` (`ALTER ROLE ... SET`, `ALTER DATABASE ... SET`): another session holds a lock that the call needs. **A lock wait on a node without a `lock_timeout` of its own is not this answer**: it lasts `T` and is `KS007` | repeat when the lock is gone (look at `pg_locks` on the node named) | "lock not available on node N (H:P): ..." | `t/086` (the first statement), `t/104` (the role's `lock_timeout`) |
 | `KS015` | the call took longer than `kingres_shard.control_call_timeout` **as a whole** (S13-02): the setting is `0` (no limit) unless the caller sets it. **It says nothing about any node**: every statement that was answered was answered in time, or the wait that was cut off was cut off by what was left of the call's time. It must not be read as "fence the node" | nothing was kept (the state is the one of any call that failed); repeat the call with a longer `control_call_timeout` or none, and look at the nodes that were slow only if it keeps happening | "the call took longer than kingres_shard.control_call_timeout (N seconds) as a whole"; the detail names the node the call was waiting for, when there was one, and says that nothing says it is dead or slow | `t/107` |
+| `KS016` | the table is a ledger table (or the history table of one) of `kingres_ledger`, and so is refused by `create_distributed_table`, `create_reference_table` and their online variants (phase 7 step 25) | not a retry: keep the table as an ordinary table, or distribute a table that is not under the ledger | "cannot distribute it: table \"led_a\" is a ledger table (or the history table of one) and stays where it is"; the detail lists every blocker with its code (`ledger_table: ...`) | `t/272` |
 | `25001` | `recover_prepared_transactions()` and `promote_node()` (which runs a recovery pass first) in a `REPEATABLE READ` or `SERIALIZABLE` transaction: the call reads what other sessions committed meanwhile, which that snapshot does not show. A role whose `default_transaction_isolation` is one of them gets this for every call | run it in a `READ COMMITTED` transaction: `BEGIN ISOLATION LEVEL READ COMMITTED; SELECT kingres.promote_node(N); COMMIT;`, or give the role of the control plane `default_transaction_isolation = 'read committed'`. Nothing was changed | "recover_prepared_transactions() must run in a READ COMMITTED transaction" | `t/104` (recovery), `t/101` (`promote_node`) |
 | `40P01` | distributed deadlock victim | retry the transaction | "distributed deadlock detected" | `t/052`, `t/065` |
 | `55000` | the rest: a mistake of whoever calls (a node that is not a standby, a node of another major or extension version, the library not loaded, "not initialized"); no control plane reacts to them automatically | fix the input | (many) | `t/045`, `t/046`, `t/048`, `t/091` |
@@ -3380,7 +3493,7 @@ the control plane (fix a list, wait for PostgreSQL, stop and ask a human, run re
 refusals that all say "this is the wrong node" ask the same (call another node), so they share
 `KS010`. `KS007` and `55P03` are told apart because the first must never be repeated against the
 same node and the second may be, once the lock is gone. The remaining `55000` answers are errors of
-the input, which a human reads. The `KS003` slot is not used; `KS015` is the next free code of the series.
+the input, which a human reads. The `KS003` slot is not used; `KS016` is the next free code of the series.
 
 #### Bounds that apply to every call
 

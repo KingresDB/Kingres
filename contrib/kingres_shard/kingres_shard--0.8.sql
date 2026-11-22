@@ -13235,6 +13235,7 @@ CREATE FUNCTION kingres.internal_split_switch(p_split bigint, p_colocation int, 
     RETURNS pg_catalog.jsonb
     LANGUAGE plpgsql
     SET search_path = pg_catalog, kingres, pg_temp
+    SET extra_float_digits = 3
     AS $$
 DECLARE
     el       pg_catalog.jsonb;
