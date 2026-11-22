@@ -482,3 +482,9 @@ func (m *Manager) Resume(ctx context.Context, group int32) error {
 	}
 	return pki.WriteFile(MarkerPath(m.c.Dir, WaitMarker, group), []byte("waiting for the group lease\n"), 0o600)
 }
+
+// HandOverMarked says that the hand-over marker of the group is on disk: the primary was stopped for a planned switchover (or is being) and the start gate refuses it,
+// and nothing but Resume or a transfer to another server ends that. The wait marker and the fence marker are not this: the lease rounds end them by themselves.
+func (m *Manager) HandOverMarked(group int32) bool {
+	return markerExists(m.c.Dir, RelinquishedMarker, group)
+}

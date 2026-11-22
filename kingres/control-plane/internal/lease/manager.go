@@ -136,6 +136,9 @@ type Manager struct {
 	seq    uint64
 	base   uint64 // distinguishes the sequence numbers of one process start from the next
 
+	// wmu is held while the watchdog file of a group is written, from the reading of the state to the end of the write (F6-05); it is taken before mu.
+	wmu sync.Mutex
+
 	op sync.Mutex // serializes fencing and starting the instance
 
 	// rmu is held by a renewal round of a group while it runs; a release takes it after the group is marked as

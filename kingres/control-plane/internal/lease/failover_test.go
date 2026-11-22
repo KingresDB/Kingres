@@ -379,3 +379,33 @@ func TestTheWatchdogFileOfAGroupWhoseStateWasDroppedIsNotWritten(t *testing.T) {
 	r.m.mu.Unlock()
 	r.m.writeWatchdogFile(1) // must not panic
 }
+
+// F6-05. The three writers of the watchdog file (a round, the idle refresh, the Off file of a demotion) write under one lock, from the reading of the state to the end
+// of the write: a round that took its sequence number before a demotion cannot write after the demotion's Off file and arm the watchdog of a standby.
+func TestTheWritersOfTheWatchdogFileExcludeEachOther(t *testing.T) {
+	ctx := context.Background()
+	r := newRig(t, []string{"a", "b", "c"}, true)
+	wf := filepath.Join(r.dir, "instance", "lease.json")
+	if err := os.MkdirAll(filepath.Dir(wf), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	r.m.c.WatchdogFile = wf
+	r.m.Renew(ctx)
+	for name, write := range map[string]func(){
+		"a round":      func() { r.m.writeWatchdogFile(1) },
+		"the idle one": func() { r.m.writeWatchdogIdle(wf) },
+		"the Off file": func() { r.m.writeWatchdogOff(wf) },
+	} {
+		r.m.wmu.Lock() // another writer is in the middle of its write
+		done := make(chan struct{})
+		go func() { write(); close(done) }()
+		select {
+		case <-done:
+			r.m.wmu.Unlock()
+			t.Fatalf("%s wrote while another writer held the lock of the file", name)
+		case <-time.After(150 * time.Millisecond):
+		}
+		r.m.wmu.Unlock()
+		<-done
+	}
+}

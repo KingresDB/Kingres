@@ -56,6 +56,10 @@ func (m *Manager) writeWatchdogFile(group int32) {
 		m.writeWatchdogIdle(wf)
 		return
 	}
+	// The state is read and the file is written under one lock (F6-05): a round that took its sequence number before a demotion wrote the file of "not a primary" cannot write after it
+	// and arm the watchdog of an instance that is a standby now. The demotion deletes the state first, so a round that comes after it finds none.
+	m.wmu.Lock()
+	defer m.wmu.Unlock()
 	m.mu.Lock()
 	st := m.groups[group]
 	if st == nil {
@@ -91,6 +95,8 @@ func (m *Manager) writeWatchdogIdle(wf string) {
 	if _, err := os.Stat(filepath.Clean(wf)); err != nil {
 		return
 	}
+	m.wmu.Lock()
+	defer m.wmu.Unlock()
 	m.mu.Lock()
 	m.seq++
 	seq := m.seq
@@ -103,6 +109,8 @@ func (m *Manager) writeWatchdogOff(wf string) {
 	if _, err := os.Stat(filepath.Clean(wf)); err != nil {
 		return
 	}
+	m.wmu.Lock()
+	defer m.wmu.Unlock()
 	m.mu.Lock()
 	m.seq++
 	seq := m.seq
