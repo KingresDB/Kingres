@@ -120,8 +120,11 @@ type extBackend interface {
 	Install(ctx context.Context, db, ext string) error
 	// SelfTest returns kingres_sketch.self_test().
 	SelfTest(ctx context.Context, db string) (string, error)
-	// Preloaded says whether the library is in shared_preload_libraries.
+	// Preloaded says whether the library is in shared_preload_libraries of the instance of this server.
 	Preloaded(ctx context.Context, lib string) (bool, error)
+	// PreloadedOnAll returns the instances of this server, standbys included, that are running and have not loaded the library, as text that names them. An instance that is
+	// not running loads it when it starts.
+	PreloadedOnAll(ctx context.Context, lib string) ([]string, error)
 	// SetDatabaseSettings sets the settings that the server knows (an empty value resets one) and returns the names it did not know.
 	SetDatabaseSettings(ctx context.Context, db string, settings map[string]string) (unknown []string, err error)
 }
@@ -217,6 +220,33 @@ func (p pgExt) Preloaded(ctx context.Context, lib string) (bool, error) {
 	return libraryListed(s, lib), nil
 }
 
+func (p pgExt) PreloadedOnAll(ctx context.Context, lib string) ([]string, error) {
+	if p.o.Local == nil {
+		ok, err := p.Preloaded(ctx, lib)
+		if err != nil || ok {
+			return nil, err
+		}
+		return []string{"the instance of this server"}, nil
+	}
+	var missing []string
+	for _, li := range p.o.Local.LocalInstances() {
+		c, err := p.o.Local.InstanceConn(ctx, li.ID, "postgres")
+		if err != nil {
+			continue // not running (or not reachable now): it loads the list when it starts
+		}
+		var s string
+		err = c.QueryRow(ctx, "SELECT current_setting('shared_preload_libraries')").Scan(&s)
+		_ = c.Close(context.WithoutCancel(ctx))
+		if err != nil {
+			continue
+		}
+		if !libraryListed(s, lib) {
+			missing = append(missing, fmt.Sprintf("instance %d (%s)", li.ID, li.Role.Role))
+		}
+	}
+	return missing, nil
+}
+
 // libraryListed reads a shared_preload_libraries value: names separated by commas, with optional blanks and double quotes.
 func libraryListed(list, lib string) bool {
 	for _, n := range strings.Split(list, ",") {
@@ -282,12 +312,12 @@ func (o *Ops) extCheckLocal(ctx context.Context, p extensionOp) error {
 		return extErr(problem.ExtensionVersionMismatch, "this server has %s %s, the others have %s", p.Extension, v, p.Version)
 	}
 	if p.Preload {
-		ok, err := b.Preloaded(ctx, p.Extension)
+		missing, err := b.PreloadedOnAll(ctx, p.Extension)
 		if err != nil {
 			return err
 		}
-		if !ok {
-			return extErr(problem.ExtensionMissing, "the library %s is not loaded by this server: its instance was started before the library was added to shared_preload_libraries, so restart the instance", p.Extension)
+		if len(missing) > 0 {
+			return extErr(problem.ExtensionMissing, "the library %s is not loaded by %s of this server: it was started before the library was added to shared_preload_libraries, so restart it (standbys first)", p.Extension, strings.Join(missing, ", "))
 		}
 	}
 	return nil

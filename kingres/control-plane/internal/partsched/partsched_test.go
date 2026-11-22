@@ -23,8 +23,8 @@ type fakeBackend struct {
 	checks    []Check
 	asOfSeen  []time.Time
 	startAsOf []time.Time
-	// read is the list of databases that Checks says it read; nil means the databases of the findings.
-	read []string
+	// unread is the list of databases that exist and that Checks could not read.
+	unread []string
 }
 
 func newFake() *fakeBackend {
@@ -71,18 +71,7 @@ func (f *fakeBackend) Start(_ context.Context, d Due, asOf time.Time) (bool, err
 }
 
 func (f *fakeBackend) Checks(context.Context) ([]Check, []string, error) {
-	if f.read != nil {
-		return f.checks, f.read, nil
-	}
-	seen := map[string]bool{}
-	var dbs []string
-	for _, c := range f.checks {
-		if !seen[c.Database] {
-			seen[c.Database] = true
-			dbs = append(dbs, c.Database)
-		}
-	}
-	return f.checks, dbs, nil
+	return f.checks, f.unread, nil
 }
 
 type fakeAlerts struct {
@@ -293,7 +282,6 @@ func TestAlertsAreRaisedAndClearedFromTheChecks(t *testing.T) {
 		t.Errorf("second pass: %v, cleared %v, open %v", err, a.cleared, a.open)
 	}
 	// the policy of events was fixed
-	b.read = []string{"shop"}
 	b.checks = b.checks[1:2]
 	if err := s.CheckAlerts(context.Background()); err != nil {
 		t.Fatal(err)
@@ -310,7 +298,6 @@ func TestAlertsAreRaisedAndClearedFromTheChecks(t *testing.T) {
 
 func TestAnAlertThatCannotBeRaisedDoesNotStopTheClearing(t *testing.T) {
 	b := newFake()
-	b.read = []string{"gone", "shop"}
 	a := newAlerts()
 	a.open[OpenAlert{AlertAheadLow, "database:gone|tableschema:public|tablename:t"}] = "warning: old"
 	a.failRaise = errors.New("the system database is busy")
@@ -331,7 +318,7 @@ func TestAnAlertOfADatabaseThatWasNotReadIsLeftAlone(t *testing.T) {
 	keep := OpenAlert{AlertPolicyFailed, "database:shop|tableschema:public|tablename:logs"}
 	other := OpenAlert{AlertPolicyFailed, "database:crm|tableschema:public|tablename:audit"}
 	a.open[keep], a.open[other] = "warning: x", "warning: y"
-	b.read = []string{"crm"} // shop could not be read
+	b.unread = []string{"shop"} // shop exists and could not be read
 	if err := s.CheckAlerts(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -341,7 +328,7 @@ func TestAnAlertOfADatabaseThatWasNotReadIsLeftAlone(t *testing.T) {
 	if _, ok := a.open[other]; ok {
 		t.Error("the alert of a database that was read and has no finding stayed")
 	}
-	b.read = []string{"crm", "shop"}
+	b.unread = nil
 	if err := s.CheckAlerts(context.Background()); err != nil || len(a.open) != 0 {
 		t.Errorf("shop read and fine: %v %v", err, a.open)
 	}
@@ -356,5 +343,63 @@ func TestAlertSubjectsEscapeNames(t *testing.T) {
 	}
 	if got := subjectDatabase(k.Subject); got != "sh|op" {
 		t.Errorf("database %q", got)
+	}
+}
+
+// A policy that cannot run because its clock is not credible or its owner is not trusted is one alert for the table, not a failure at every tick: the failures are
+// not counted, the alert stays while the reason does, and goes when it does.
+func TestAClockOrBlockedPolicyIsOneAlertAndNotAFailurePerTick(t *testing.T) {
+	clk := &fakeClock{t: time.Date(2026, 11, 22, 10, 0, 0, 0, time.UTC)}
+	b := newFake()
+	a := newAlerts()
+	s := newSched(t, b, a, clk)
+	b.policies["shop/public.clock"] = clk.t
+	b.policies["shop/public.owner"] = clk.t
+	b.policies["shop/public.fine"] = clk.t
+	b.failOn["shop/public.clock"] = &ClockError{Msg: "the clock of the leader is 9m0s ahead of the instance"}
+	b.failOn["shop/public.owner"] = &BlockedError{Msg: "the owner is not a superuser and the cluster setting is off"}
+	for i := 0; i < 4; i++ {
+		started, err := s.Tick(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 && (len(started) != 1 || started[0].Table != "fine") {
+			t.Fatalf("started %v", started)
+		}
+		b.running = map[string]bool{}
+		if err := s.CheckAlerts(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, failures := s.Counts(); failures != 0 {
+		t.Errorf("%d failures counted for refusals that are alerts", failures)
+	}
+	if len(a.open) != 2 || a.raised != 8 { // an upsert at every pass; two alerts open
+		t.Errorf("open %v, raised %d", a.open, a.raised)
+	}
+	for _, tbl := range []string{"clock", "owner"} {
+		if _, ok := a.open[OpenAlert{AlertPolicyFailed, "database:shop|tableschema:public|tablename:" + tbl}]; !ok {
+			t.Errorf("no alert for %s: %v", tbl, a.open)
+		}
+	}
+	// the reasons go: the next tick starts them and the alerts are cleared
+	delete(b.failOn, "shop/public.clock")
+	delete(b.failOn, "shop/public.owner")
+	if started, _ := s.Tick(context.Background()); len(started) != 3 {
+		t.Errorf("started %v", started)
+	}
+	if err := s.CheckAlerts(context.Background()); err != nil || len(a.open) != 0 {
+		t.Errorf("%v %v", err, a.open)
+	}
+}
+
+// An alert of a database that is gone, or has no extension any more, is cleared (it is not among the databases that could not be read).
+func TestAnAlertOfADroppedDatabaseIsCleared(t *testing.T) {
+	b := newFake()
+	a := newAlerts()
+	s := newSched(t, b, a, &fakeClock{t: time.Now()})
+	a.open[OpenAlert{AlertAheadLow, "database:dropped|tableschema:public|tablename:t"}] = "warning: x"
+	if err := s.CheckAlerts(context.Background()); err != nil || len(a.open) != 0 {
+		t.Errorf("%v %v", err, a.open)
 	}
 }

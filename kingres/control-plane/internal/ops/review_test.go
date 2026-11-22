@@ -84,6 +84,10 @@ func TestMaintainTimingsHaveSaneDefaults(t *testing.T) {
 	if maintainSkew != 5*time.Minute || maintainBackoff != 5*time.Minute {
 		t.Errorf("skew %v backoff %v", maintainSkew, maintainBackoff)
 	}
+	// P12D-05: a reader of the table waits behind a conversion that asks for its lock for this long at a time, so it stays short
+	if storageLockTimeout > 500*time.Millisecond || maintainHorizon != 7*24*time.Hour {
+		t.Errorf("lock timeout %v horizon %v", storageLockTimeout, maintainHorizon)
+	}
 }
 
 // A conversion to columnar needs the library loaded on every server of the cluster, not on the leader only: a standby that cannot replay the WAL of the

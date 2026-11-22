@@ -6,12 +6,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/partsched"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
@@ -50,6 +52,9 @@ var (
 	maintainSkew = 5 * time.Minute
 	// maintainBackoff is how long a table whose last run failed is left alone by the scheduler, in addition to the next_run_at that the end of a run sets.
 	maintainBackoff = 5 * time.Minute
+	// maintainHorizon, with the policy's create_ahead, is how long after the last run of a policy a scheduled run may be for: a stop of kingresd that is longer, or a clock that
+	// stepped forward by more, is refused with a ClockError.
+	maintainHorizon = 7 * 24 * time.Hour
 )
 
 // maintainParams is the input of the task.
@@ -92,28 +97,63 @@ func (o *Ops) PrepareMaintain(ctx context.Context, actor, db, schema, table stri
 		return nil, err
 	}
 	var columnarAfter bool
-	var now time.Time
-	err := o.policyTx(ctx, db, func(tx pgx.Tx) error {
+	var now, last time.Time
+	var runEverySecs, aheadSecs float64
+	var owner ownerInfo
+	allowed, err := o.nonSuperuserOwnersAllowed(ctx)
+	if err != nil {
+		return nil, err
+	}
+	err = o.policyTx(ctx, db, func(tx pgx.Tx) error {
 		if err := requirePartitioned(ctx, tx, schema, table); err != nil {
 			return err
 		}
-		err := tx.QueryRow(ctx, `SELECT columnar_after IS NOT NULL, now() FROM kingres.timepart_policy WHERE schema_name = $1 AND table_name = $2`, schema, table).Scan(&columnarAfter, &now)
+		// The last run of the policy (or the policy itself, for one that never ran) is what a time is compared with: a clock of the host that stepped forward moves the
+		// instance and the leader alike, and only the policy's own history shows it.
+		err := tx.QueryRow(ctx, `SELECT p.columnar_after IS NOT NULL, now(),
+			coalesce((SELECT max(r.as_of) FROM kingres.timepart_run r WHERE r.schema_name = p.schema_name AND r.table_name = p.table_name), p.updated_at),
+			extract(epoch FROM p.run_every)::float8, extract(epoch FROM p.create_ahead)::float8
+			FROM kingres.timepart_policy p WHERE p.schema_name = $1 AND p.table_name = $2`, schema, table).Scan(&columnarAfter, &now, &last, &runEverySecs, &aheadSecs)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return problem.New(problem.NotFound, fmt.Sprintf("Table %s.%s has no partitioning policy.", schema, table))
 		}
+		if err != nil {
+			return err
+		}
+		owner, err = tableOwnerOf(ctx, tx, schema, table)
 		return err
 	})
 	if err != nil {
 		return nil, wrap(err)
 	}
-	now = now.UTC()
+	if who := untrustedOwner(allowed, owner); who != "" {
+		if trigger == "schedule" {
+			return nil, &partsched.BlockedError{Msg: ownerNotTrustedText(who)}
+		}
+		return nil, ownerRefusal(who)
+	}
+	now, last = now.UTC(), last.UTC()
 	at := now
 	if asOf != nil {
 		at = asOf.UTC()
 		if d := at.Sub(now); d > maintainSkew || d < -maintainSkew {
+			if trigger == "schedule" {
+				return nil, &partsched.ClockError{Msg: fmt.Sprintf("the clock of the leader (%s) differs from the clock of the instance (%s) by more than %s", at.Format(time.RFC3339), now.Format(time.RFC3339), maintainSkew)}
+			}
 			return nil, problem.Validation("The time of the run is not the time of the server.", field("/asOf", fmt.Sprintf("must be within %s of the time of the server (%s)", maintainSkew, now.Format(time.RFC3339)), "out_of_range"))
 		}
 	}
+	// A scheduled run is for the time of the clock, and the clock of the host can step (an NTP step, a resumed virtual machine, a date set by hand): the instance and the
+	// leader then agree on a time that retention would act on. A time far after the last run of the policy is such a step, or a stop of kingresd longer than the policy can
+	// bridge; either way a person looks: one alert, and a run by hand (which is bounded by the instance's time only) goes on when the time is right.
+	if trigger == "schedule" && !last.IsZero() {
+		horizon := maintainHorizon + time.Duration(aheadSecs*float64(time.Second))
+		if gap := at.Sub(last); gap > horizon {
+			return nil, &partsched.ClockError{Msg: fmt.Sprintf("the time of this run (%s) is %s after the last run of the policy (%s), more than the %s that a stop of kingresd is allowed to be: the clock of the host may have jumped. "+
+				"Run the policy by hand when the time is right", at.Format(time.RFC3339), gap.Round(time.Minute), last.Format(time.RFC3339), horizon.Round(time.Hour))}
+		}
+	}
+	_ = runEverySecs
 	if columnarAfter && trigger != "schedule" {
 		if err := o.ensureExtensions(ctx, db, []string{ExtColumnar}, true); err != nil {
 			return nil, err
@@ -125,10 +165,10 @@ func (o *Ops) PrepareMaintain(ctx context.Context, actor, db, schema, table stri
 // StartMaintain starts the task for a table whose policy is due (the scheduler). It reports false, without an error, when a task of the table is
 // unfinished or when the last run of the table failed less than maintainBackoff ago: the scheduler asks again at the next tick.
 func (o *Ops) StartMaintain(ctx context.Context, db, schema, table string, asOf time.Time) (bool, error) {
-	if o.maintainRunning(ctx, db, schema, table) {
-		return false, nil
+	if running, err := o.maintainRunning(ctx, db, schema, table); err != nil || running {
+		return false, err
 	}
-	if o.recentlyFailed(ctx, db, schema, table) {
+	if o.taskFailedRecently(subjectOf(db, schema, table)) || o.recentlyFailed(ctx, db, schema, table) {
 		return false, nil
 	}
 	in, err := o.PrepareMaintain(ctx, "system", db, schema, table, &asOf, "schedule")
@@ -149,10 +189,53 @@ func (o *Ops) StartMaintain(ctx context.Context, db, schema, table string, asOf 
 func (o *Ops) recentlyFailed(ctx context.Context, db, schema, table string) bool {
 	var yes bool
 	err := o.policyTx(ctx, db, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM kingres.timepart_run r WHERE r.schema_name = $1 AND r.table_name = $2 AND r.state = 'failed'
-			AND r.finished_at > now() - make_interval(secs => $3::float8))`, schema, table, maintainBackoff.Seconds()).Scan(&yes)
+		// the last run only: a run that succeeded after a failure lifts the back-off
+		err := tx.QueryRow(ctx, `SELECT r.state = 'failed' AND r.finished_at > now() - make_interval(secs => $3::float8) FROM kingres.timepart_run r
+			WHERE r.schema_name = $1 AND r.table_name = $2 ORDER BY r.run_id DESC LIMIT 1`, schema, table, maintainBackoff.Seconds()).Scan(&yes)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		return err
 	})
 	return err == nil && yes
+}
+
+// failedTasks remembers, by subject, when a task partition.maintain last failed: a failure before any run exists (begin_run raises) leaves no failed run to
+// back off from, and without this the scheduler would start a task at every tick. The state is in this process: the policy itself carries the same failure in
+// its next_run_at (maintainOnFail), which survives a change of the leader.
+type failedTasks struct {
+	sync.Mutex
+	at map[string]time.Time
+}
+
+func (o *Ops) noteTaskFailure(subject string) {
+	o.failed.Lock()
+	defer o.failed.Unlock()
+	if o.failed.at == nil {
+		o.failed.at = map[string]time.Time{}
+	}
+	o.failed.at[subject] = time.Now()
+}
+
+func (o *Ops) noteTaskSuccess(subject string) {
+	o.failed.Lock()
+	defer o.failed.Unlock()
+	delete(o.failed.at, subject)
+}
+
+func (o *Ops) taskFailedRecently(subject string) bool {
+	o.failed.Lock()
+	defer o.failed.Unlock()
+	at, ok := o.failed.at[subject]
+	return ok && time.Since(at) < maintainBackoff
+}
+
+// moveSchedule moves the next run of the policy by the back-off: the failure of a task that had no run to close is recorded on the policy itself.
+func (o *Ops) moveSchedule(ctx context.Context, db, schema, table string) {
+	_ = o.policyTx(ctx, db, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE kingres.timepart_policy SET next_run_at = now() + make_interval(secs => $3::float8) WHERE schema_name = $1 AND table_name = $2`, schema, table, maintainBackoff.Seconds())
+		return err
+	})
 }
 
 // maintainConn opens a service connection to the database of the table that trusts the owners of the tables; see trustedConn.
@@ -233,7 +316,18 @@ func (o *Ops) stepMaintainBegin(ctx context.Context, env *task.Env) error {
 	if run, err := o.runOfTask(ctx, p.Database, env.Task.ID); err != nil {
 		return err
 	} else if run != 0 {
-		return nil // the run of an earlier pass of this step; the next steps read its state
+		// The run of an earlier pass of this step. If that pass died after the extension recorded the run as failed and before it was closed, the reason is not lost.
+		state, errText, err := o.runInfo(ctx, p.Database, run)
+		if err != nil {
+			return err
+		}
+		if state == "failed" {
+			if err := o.finishRun(ctx, p.Database, run); err != nil {
+				return err
+			}
+			return &extError{code: problem.PartitionPolicyConflict, msg: "The run could not begin: " + errText}
+		}
+		return nil
 	}
 	asOf, err := time.Parse(time.RFC3339Nano, p.AsOf)
 	if err != nil {
@@ -378,8 +472,13 @@ func (o *Ops) maintainOnFail(ctx context.Context, t task.Task) {
 	if err != nil {
 		return
 	}
+	o.noteTaskFailure(p.subject())
 	run, err := o.runOfTask(ctx, p.Database, t.ID)
-	if err != nil || run == 0 {
+	if err != nil {
+		return
+	}
+	if run == 0 { // the task failed before it had a run (begin_run raised): the failure is on the policy
+		o.moveSchedule(ctx, p.Database, p.Schema, p.Table)
 		return
 	}
 	state, _, err := o.runInfo(ctx, p.Database, run)
@@ -407,6 +506,7 @@ func (o *Ops) stepMaintainFinish(ctx context.Context, env *task.Env) error {
 	if err != nil {
 		return err
 	}
+	o.noteTaskSuccess(p.subject())
 	if state == "running" { // the first close of this run
 		o.countRun(final)
 		if n := o.failedActions(ctx, p.Database, run); n > 0 {

@@ -1311,8 +1311,7 @@ export interface paths {
          *     library that is not preloaded the remedy is to restart the instance of that server (the setting `shared_preload_libraries` is managed). The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so.
          *     With `dryRun=true` nothing is started: the answer is 200 `TableStoragePreview` with the same reasons as `blockers`, and no task exists. Changing the options of a table that is
          *     columnar already sets them for the stripes written from then on (the step says so).
-         *     The conversion runs with the `kingres_timepart.trust_table_owners` setting on, as `partition.maintain` does: the code of a non-superuser owner of the table (an index expression, a
-         *     default) runs in the session of the service role for the time of the step. See `putPartitionPolicy`.
+         *     The conversion runs with the `kingres_timepart.trust_table_owners` setting on, as `partition.maintain` does: The conversion and the runs of a policy drive the DDL of `kingres_timepart` with its setting `trust_table_owners` on: the code of the owner of a table (an index expression, a check, a default) runs **as that owner, inside the session of the service role (a superuser)**, and what it leaves behind in that session (a deferred trigger, a temporary object, a changed setting) would run later with the rights of the service role; the session is closed when the call ends, and the extension refuses the known ways to leave such residue, but the guarantee is the trust in the owner. A policy is also repeated by the scheduler without a person in the loop. Therefore a table whose owner is not a superuser is refused (`conversion_refused` with the blocker `owner_not_trusted`, `partition_policy_conflict` for a policy and a run) unless the cluster setting `analytics.allowNonSuperuserOwners` is on (default off).
          */
         put: operations["setTableStorage"];
         post?: never;
@@ -1380,8 +1379,7 @@ export interface paths {
          *     scheduler takes the table at its next tick. Durations are ISO 8601 (`P1D`, `P1M`, `PT6H`). 400 `validation_failed` with the JSON pointer of the field;
          *     409 `partition_policy_conflict` when the table is not range-partitioned on a `date`, `timestamp` or `timestamptz` column; 409 `extension_missing`
          *     when `kingres_timepart` is not installed in the database and cannot be installed (the package of the server lacks it). 409 `operation_in_progress` while a run of the policy is going (its end would
-         *     move the schedule). The runs of a policy execute with `kingres_timepart.trust_table_owners` on: for a table that a non-superuser owns, the code of that owner (an index expression, a default) runs in the
-         *     session of the service role while a partition is made, attached or converted. Set a policy only for tables whose owner is trusted as the administrator is. `createdBy` of the answer is the service role.
+         *     move the schedule). The conversion and the runs of a policy drive the DDL of `kingres_timepart` with its setting `trust_table_owners` on: the code of the owner of a table (an index expression, a check, a default) runs **as that owner, inside the session of the service role (a superuser)**, and what it leaves behind in that session (a deferred trigger, a temporary object, a changed setting) would run later with the rights of the service role; the session is closed when the call ends, and the extension refuses the known ways to leave such residue, but the guarantee is the trust in the owner. A policy is also repeated by the scheduler without a person in the loop. Therefore a table whose owner is not a superuser is refused (`conversion_refused` with the blocker `owner_not_trusted`, `partition_policy_conflict` for a policy and a run) unless the cluster setting `analytics.allowNonSuperuserOwners` is on (default off). The answer shows the owner (`tableOwner`) and whether it is trusted now (`ownerTrusted`). `createdBy` of the answer is the service role.
          *     The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so.
          */
         put: operations["putPartitionPolicy"];
@@ -5812,9 +5810,13 @@ export interface components {
             /** @description The access method of the table or partition now; null for a partitioned table. */
             current: string | null;
             target: components["schemas"]["TableStorageAccessMethod"];
+            /** @description Added in 0.18.0, optional. The role that owns the table or partition. */
+            tableOwner?: string;
+            /** @description Added in 0.18.0, optional. False when the owner is not a superuser and the cluster setting analytics.allowNonSuperuserOwners is off (the blocker owner_not_trusted). */
+            ownerTrusted?: boolean;
             /** @description False when the request would be refused (`blockers` is not empty) or when there is nothing to do. */
             willConvert: boolean;
-            /** @description The reasons the request would be refused with 409 `conversion_refused`; the codes are `partitioned_table`, `partition`, `ledger_table`, `distributed_table`, `publication`, `foreign_keys` and `other` (the text of the extension). */
+            /** @description The reasons the request would be refused with 409 `conversion_refused`; the codes are `partitioned_table`, `partition`, `ledger_table`, `distributed_table`, `publication`, `foreign_keys`, `owner_not_trusted` and `other` (the text of the extension). */
             blockers: components["schemas"]["TableBlocker"][];
             /** @description What else the operator should know, as text, for example that the table is converted under an `ACCESS EXCLUSIVE` lock or that it has the format already. */
             notes: string[];
@@ -5891,6 +5893,10 @@ export interface components {
         };
         /** @description Added in 0.18.0. The request, as stored, plus the state of the policy. */
         PartitionPolicy: components["schemas"]["PartitionPolicyRequest"] & {
+            /** @description Added in 0.18.0, optional. The role that owns the table. */
+            tableOwner?: string;
+            /** @description Added in 0.18.0, optional. Whether runs of the policy are allowed for this owner now: a superuser, or `ClusterSettings.analytics.allowNonSuperuserOwners` is on. When false the policy is not run and one alert says so. */
+            ownerTrusted?: boolean;
             partitionColumn: string;
             /** @enum {string} */
             partitionColumnType: "date" | "timestamp" | "timestamptz";
@@ -6420,6 +6426,14 @@ export interface components {
                  */
                 maxDifferenceMs: number;
             };
+            /** @description Added in 0.18.0, optional. Settings of the analytics. */
+            analytics?: {
+                /**
+                 * @description When true, a table whose owner is not a superuser may be converted between heap and columnar and may have a time-partitioning policy that runs (the code of the owner then runs in the session of the service role, see `setTableStorage`). Default false.
+                 * @default false
+                 */
+                allowNonSuperuserOwners: boolean;
+            };
             /** @description Pending restart caused by enabling a feature. */
             restart: {
                 /** @description True while some server must restart to load an enabled extension. */
@@ -6455,6 +6469,11 @@ export interface components {
             clock?: {
                 /** @description New threshold of the alert `clockDifference`. */
                 maxDifferenceMs?: number;
+            };
+            /** @description Added in 0.18.0. Analytics settings. */
+            analytics?: {
+                /** @description See `ClusterSettings.analytics`. Turning it on is a decision about the trust in the owners of the tables; it can be turned off again, and a policy that is refused then raises one alert. */
+                allowNonSuperuserOwners?: boolean;
             };
             /** @description Features to turn on. `false` is rejected for a feature that is already on. */
             features?: {

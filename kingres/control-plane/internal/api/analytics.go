@@ -126,6 +126,9 @@ type PartitionPolicy struct {
 	Health              PartitionPolicyHealth `json:"health"`
 	CreatedBy           string                `json:"createdBy"`
 	UpdatedAt           Time                  `json:"updatedAt"`
+	// TableOwner and OwnerTrusted (optional) say who owns the table and whether runs are allowed for that owner now.
+	TableOwner   string `json:"tableOwner,omitempty"`
+	OwnerTrusted *bool  `json:"ownerTrusted,omitempty"`
 }
 
 // PartitionAction is one action of a run or of a plan.
@@ -187,6 +190,9 @@ type TableStoragePreview struct {
 	WillConvert bool           `json:"willConvert"`
 	Blockers    []TableBlocker `json:"blockers"`
 	Notes       []string       `json:"notes"`
+	// TableOwner and OwnerTrusted (optional) say who owns the table and whether the analytics operations may run for that owner now.
+	TableOwner   string `json:"tableOwner,omitempty"`
+	OwnerTrusted *bool  `json:"ownerTrusted,omitempty"`
 }
 
 // SubjectEscape and SubjectUnescape make a name safe for a segment of the stored subject of an alert (segments are separated by "|").

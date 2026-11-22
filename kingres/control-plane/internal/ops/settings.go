@@ -76,6 +76,13 @@ func (o *Ops) UpdateClusterSettings(ctx context.Context, actor string, req api.C
 			set["clock.maxDifferenceMs"] = *c.MaxDifferenceMs
 		}
 	}
+	if a := req.Analytics; a != nil {
+		if a.AllowNonSuperuserOwners == nil {
+			errs = append(errs, field("/analytics", "allowNonSuperuserOwners is required", "required"))
+		} else {
+			set[settingNonSuperuserOwners] = *a.AllowNonSuperuserOwners
+		}
+	}
 	var wantShard, wantLedger bool
 	if f := req.Features; f != nil {
 		if f.Sharding == nil && f.Ledger == nil {

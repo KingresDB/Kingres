@@ -62,6 +62,7 @@ func TestIntegrationAFailedBeginMovesTheScheduleAndNothingStorms(t *testing.T) {
 	o, c, _, _ := policyOps(t)
 	ctx := context.Background()
 	execAll(t, c, `CREATE ROLE app_owner NOLOGIN`)
+	allowOwners(t, c, true) // the owner is not a superuser: the setting is on, so that begin_run is what refuses
 	if _, err := o.PutPartitionPolicy(ctx, "admin", "postgres", "public", "ev", dailyPolicy()); err != nil {
 		t.Fatal(err)
 	}

@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -35,6 +36,18 @@ const (
 	AlertPolicyFailed = "partitionPolicyFailed"
 )
 
+// ClockError is returned by Backend.Start for a policy whose scheduled time is not credible: the clock of the leader differs from the one of the instance, or
+// it jumped far ahead of the last run of the policy. The scheduler does not count it as a failure at every tick: it says so once and raises one alert for the policy.
+type ClockError struct{ Msg string }
+
+func (e *ClockError) Error() string { return e.Msg }
+
+// BlockedError is returned by Backend.Start for a policy that cannot run until an administrator changes something (the owner of the table is not trusted). Like
+// ClockError it is one alert, not a failure at every tick.
+type BlockedError struct{ Msg string }
+
+func (e *BlockedError) Error() string { return e.Msg }
+
 // Due is a policy that is due.
 type Due struct{ Database, Schema, Table string }
 
@@ -53,9 +66,9 @@ type Backend interface {
 	Due(ctx context.Context, asOf time.Time) ([]Due, error)
 	// Start starts a run for a due policy. It reports false, without an error, when a task of the table is unfinished.
 	Start(ctx context.Context, d Due, asOf time.Time) (bool, error)
-	// Checks returns the findings of kingres.timepart_check in every database that has kingres_timepart, and the databases that it could read: a database that could not be read
-	// says nothing, so the alerts of its tables are neither raised nor cleared.
-	Checks(ctx context.Context) (checks []Check, read []string, err error)
+	// Checks returns the findings of kingres.timepart_check in every database that has kingres_timepart, and the databases that exist but could not be read this time: such a
+	// database says nothing, so the alerts of its tables are neither raised nor cleared. An alert of a database that is gone, or has no kingres_timepart any more, is cleared.
+	Checks(ctx context.Context) (checks []Check, unread []string, err error)
 }
 
 // OpenAlert is an alert that is open.
@@ -84,6 +97,9 @@ type Scheduler struct {
 	cfg Config
 	// ticks, started and failures count the passes, the tasks started and the policies that could not be started (tests, metrics).
 	ticks, started, failures atomic.Int64
+	// issues are the policies of the last tick that Start refused with a ClockError or a BlockedError, by policy; mu guards it.
+	mu     sync.Mutex
+	issues map[Due]string
 }
 
 // New builds a scheduler.
@@ -130,11 +146,28 @@ func (s *Scheduler) Tick(ctx context.Context) ([]Due, error) {
 		return nil, fmt.Errorf("partsched: asking what is due: %w", err)
 	}
 	var started []Due
+	issues := map[Due]string{}
+	defer func() {
+		s.mu.Lock()
+		for d, msg := range issues {
+			if s.issues[d] != msg {
+				s.cfg.Log.Warn("a partition policy is not run until something changes", "table", d.Subject(), "reason", msg)
+			}
+		}
+		s.issues = issues
+		s.mu.Unlock()
+	}()
 	for _, d := range due {
 		if ctx.Err() != nil {
 			return started, ctx.Err()
 		}
 		ok, err := s.cfg.Backend.Start(ctx, d, now)
+		var ce *ClockError
+		var be *BlockedError
+		if errors.As(err, &ce) || errors.As(err, &be) {
+			issues[d] = err.Error()
+			continue
+		}
 		if err != nil {
 			s.failures.Add(1)
 			s.cfg.Log.Warn("a partition policy could not be started", "table", d.Subject(), "error", err)
@@ -165,11 +198,16 @@ func (s *Scheduler) CheckAlerts(ctx context.Context) error {
 	if s.cfg.Alerts == nil {
 		return nil
 	}
-	checks, read, err := s.cfg.Backend.Checks(ctx)
+	checks, unread, err := s.cfg.Backend.Checks(ctx)
 	if err != nil {
 		return fmt.Errorf("partsched: reading the checks: %w", err)
 	}
 	want := map[OpenAlert]string{}
+	s.mu.Lock()
+	for d, msg := range s.issues {
+		want[alertKey(AlertPolicyFailed, Check{Database: d.Database, Schema: d.Schema, Table: d.Table})] = fmt.Sprintf("The partitioning policy of %s.%s in database %s is not run: %s", d.Schema, d.Table, d.Database, msg)
+	}
+	s.mu.Unlock()
 	for _, c := range checks {
 		switch c.Problem {
 		case "ahead_low":
@@ -193,16 +231,16 @@ func (s *Scheduler) CheckAlerts(ctx context.Context) error {
 			first = err
 		}
 	}
-	readDB := map[string]bool{}
-	for _, d := range read {
-		readDB[d] = true
+	unreadDB := map[string]bool{}
+	for _, d := range unread {
+		unreadDB[d] = true
 	}
 	for _, o := range open {
 		if _, ok := want[o]; ok {
 			continue
 		}
-		if !readDB[subjectDatabase(o.Subject)] {
-			continue // its database was not read this time: the alert stays as it is
+		if unreadDB[subjectDatabase(o.Subject)] {
+			continue // its database exists and could not be read this time: the alert stays as it is
 		}
 		if err := s.cfg.Alerts.Clear(ctx, o.Kind, o.Subject); err != nil && first == nil {
 			first = err

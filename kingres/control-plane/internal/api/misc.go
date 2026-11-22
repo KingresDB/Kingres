@@ -289,6 +289,14 @@ type ClusterSettings struct {
 	Restart RestartState `json:"restart"`
 	// Clock holds the clock settings (contract 0.8.0).
 	Clock *ClockSettings `json:"clock,omitempty"`
+	// Analytics holds the settings of the analytics (contract 0.18.0).
+	Analytics *AnalyticsSettings `json:"analytics,omitempty"`
+}
+
+// AnalyticsSettings are the analytics settings of the cluster.
+type AnalyticsSettings struct {
+	// AllowNonSuperuserOwners allows conversions and policy runs for tables whose owner is not a superuser (default false).
+	AllowNonSuperuserOwners bool `json:"allowNonSuperuserOwners"`
 }
 
 // ClockSettings are the clock settings of the cluster.

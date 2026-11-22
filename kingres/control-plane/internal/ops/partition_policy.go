@@ -223,7 +223,10 @@ func (o *Ops) GetPartitionPolicy(ctx context.Context, db, schema, table string) 
 			return err
 		}
 		out, err = readPolicy(ctx, tx, schema, table)
-		return err
+		if err != nil {
+			return err
+		}
+		return o.fillOwner(ctx, tx, &out, schema, table)
 	})
 	return out, wrap(err)
 }
@@ -322,12 +325,25 @@ func (o *Ops) PutPartitionPolicy(ctx context.Context, actor, db, schema, table s
 	if err := o.ensureExtensions(ctx, db, need, a.columnar != nil); err != nil {
 		return out, err
 	}
-	if o.maintainRunning(ctx, db, schema, table) {
+	if running, err := o.maintainRunning(ctx, db, schema, table); err != nil {
+		return out, err
+	} else if running {
 		return out, problem.New(problem.OperationInProgress, "A partition.maintain task is running for this table; its end moves the schedule. Set the policy when it has ended.")
+	}
+	allowed, err := o.nonSuperuserOwnersAllowed(ctx)
+	if err != nil {
+		return out, err
 	}
 	err = o.policyTx(ctx, db, func(tx pgx.Tx) error {
 		if err := requirePartitioned(ctx, tx, schema, table); err != nil {
 			return err
+		}
+		w, err := tableOwnerOf(ctx, tx, schema, table)
+		if err != nil {
+			return err
+		}
+		if who := untrustedOwner(allowed, w); who != "" {
+			return ownerRefusal(who)
 		}
 		if _, err := tx.Exec(ctx, `SELECT kingres.timepart_set_policy($1::regclass, $2::interval, $3::interval, $4::interval, $5, $6::interval, $7::text[], $8::jsonb, $9, $10::interval, $11)`,
 			qualified(schema, table), a.every, a.ahead, a.retention, a.action, a.columnar, nullableList(a.sortBy), a.options, a.timezone, a.runEvery, a.enabled); err != nil {
@@ -338,7 +354,10 @@ func (o *Ops) PutPartitionPolicy(ctx context.Context, actor, db, schema, table s
 			return err
 		}
 		out, err = readPolicy(ctx, tx, schema, table)
-		return err
+		if err != nil {
+			return err
+		}
+		return o.fillOwner(ctx, tx, &out, schema, table)
 	})
 	return out, err
 }
@@ -353,7 +372,9 @@ func (o *Ops) DeletePartitionPolicy(ctx context.Context, db, schema, table strin
 	} else if !ok {
 		return noPolicy(schema, table, false)
 	}
-	if o.maintainRunning(ctx, db, schema, table) {
+	if running, err := o.maintainRunning(ctx, db, schema, table); err != nil {
+		return err
+	} else if running {
 		return problem.New(problem.OperationInProgress, "A partition.maintain task is running for this table.")
 	}
 	err := o.policyTx(ctx, db, func(tx pgx.Tx) error {
@@ -449,13 +470,17 @@ func utc(t *time.Time) *time.Time {
 func subjectOf(db, schema, table string) string { return db + "/" + schema + "." + table }
 
 // maintainRunning tells whether a task partition.maintain is unfinished for the table (asked of the task store by kind and subject, not in a window of the newest tasks).
-func (o *Ops) maintainRunning(ctx context.Context, db, schema, table string) bool {
+// It fails closed: when the task store cannot answer, the caller is told so and does not go ahead (a delete or a put during a run, a second run).
+func (o *Ops) maintainRunning(ctx context.Context, db, schema, table string) (bool, error) {
 	eng := o.Engine()
 	if eng == nil {
-		return false
+		return false, nil
 	}
 	yes, err := eng.ActiveFor(ctx, KindMaintain, "table", subjectOf(db, schema, table))
-	return err == nil && yes
+	if err != nil {
+		return false, problem.New(problem.ServiceUnavailable, "The task store cannot say whether a run of this policy is going; try again.").WithRetryAfter(5)
+	}
+	return yes, nil
 }
 
 var _ = sqlx.Fixed("")

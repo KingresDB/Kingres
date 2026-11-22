@@ -259,6 +259,7 @@ func (s *Store) ClusterSettings(ctx context.Context) (api.ClusterSettings, error
 		Features:            api.FeatureFlags{Sharding: shard, Ledger: ledger},
 		Restart:             api.RestartState{ServerIDs: []string{}},
 		Clock:               &api.ClockSettings{MaxDifferenceMs: 1000},
+		Analytics:           &api.AnalyticsSettings{},
 	}
 	// Values the administrator set (kingres_cp.cluster_setting) win over the
 	// defaults derived from the catalogs.
@@ -305,6 +306,10 @@ func (s *Store) ClusterSettings(ctx context.Context) (api.ClusterSettings, error
 			case "clock.maxDifferenceMs":
 				if json.Unmarshal(v, &n) == nil {
 					out.Clock = &api.ClockSettings{MaxDifferenceMs: n}
+				}
+			case "analytics.allowNonSuperuserOwners":
+				if json.Unmarshal(v, &b) == nil {
+					out.Analytics = &api.AnalyticsSettings{AllowNonSuperuserOwners: b}
 				}
 			case "rebalance.maxConcurrentMoves":
 				if json.Unmarshal(v, &n) == nil {

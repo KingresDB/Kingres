@@ -289,8 +289,11 @@ func fakeInstallation(t *testing.T, withColumnar bool) (bin string) {
 	script := "#!/bin/sh\necho " + lib + "\n"
 	for _, prog := range []string{"pg_config", "initdb", "pg_ctl"} { // the manager wants initdb and pg_ctl to exist; only pg_config is run
 		body := "#!/bin/sh\nexit 1\n"
-		if prog == "pg_config" {
+		switch prog {
+		case "pg_config":
 			body = script
+		case "pg_ctl": // status says running while the file "running" exists (exit 3 otherwise); reload is written to pg_ctl.log
+			body = "#!/bin/sh\ncase \"$1\" in\nstatus) [ -f '" + dir + "/running' ] && exit 0; exit 3;;\nreload) echo reload >> '" + dir + "/pg_ctl.log';;\nesac\n"
 		}
 		if err := os.WriteFile(filepath.Join(bin, prog), []byte(body), 0o755); err != nil {
 			t.Fatal(err)
@@ -346,22 +349,26 @@ func TestPreloadLeavesOutALibraryThatTheInstallationLacks(t *testing.T) {
 	if got, _ := os.ReadFile(path); preloadOf(string(got)) != "kingres_shard,kingres_ledger" {
 		t.Errorf("the list became %q", preloadOf(string(got)))
 	}
-	// a file that already names the library (a package that was removed again) is made right
+	if _, err := os.Stat(filepath.Join(filepath.Dir(filepath.Dir(path)), columnarMarker)); err == nil {
+		t.Error("an instance that never had the library has the marker")
+	}
+	// An instance whose file names the library has had it: it may have columnar tables, and a package upgrade that removes the old library file for a moment
+	// must not take the library out of its list (the next restart would start without the resource manager and the tables could not be read). The list stays,
+	// the marker is written, and every later write keeps it.
 	m2, path2 := managedInstance(t, bin, PreloadLibraries)
-	changed, err := m2.EnsureConfig(1)
-	if err != nil || !changed {
-		t.Fatalf("EnsureConfig on a list that names a missing library: %v %v", changed, err)
+	if changed, err := m2.EnsureConfig(1); err != nil || changed {
+		t.Fatalf("EnsureConfig on a list that names a library that is missing now: %v %v", changed, err)
 	}
-	if got, _ := os.ReadFile(path2); preloadOf(string(got)) != "kingres_shard,kingres_ledger" || !strings.Contains(string(got), "work_mem = '8MB'") {
-		t.Errorf("after the repair:\n%s", got)
-	}
-	// and the settings that the manager writes later do not bring it back, and the saved settings do not keep the fallback
 	if err := m2.WriteManaged(1, ManagedSettings{Port: 5432}); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := os.ReadFile(path2); preloadOf(string(got)) != "kingres_shard,kingres_ledger" {
-		t.Errorf("a later write: %q", preloadOf(string(got)))
+	if got, _ := os.ReadFile(path2); preloadOf(string(got)) != PreloadLibraries {
+		t.Errorf("a later write took the library out: %q", preloadOf(string(got)))
 	}
+	if m2.preloadListFor(1) != PreloadLibraries || m2.preloadListFor(2) != "kingres_shard,kingres_ledger" {
+		t.Errorf("an instance that had the library keeps it (%q), a new one does not (%q)", m2.preloadListFor(1), m2.preloadListFor(2))
+	}
+	// the saved settings do not keep the list the manager chose
 	s, err := m2.Settings(1)
 	if err != nil || s.Preload != "" {
 		t.Errorf("saved settings %+v %v", s, err)
@@ -381,5 +388,31 @@ func TestEnsureConfigAddsTheLibraryWhenTheInstallationHasIt(t *testing.T) {
 	}
 	if changed, err := m.EnsureConfig(1); err != nil || changed {
 		t.Errorf("a current file was rewritten: %v %v", changed, err)
+	}
+}
+
+// A running instance is reloaded when its list changes (so that PostgreSQL shows the setting as pending a restart); an instance that is not running, and a list
+// that did not change, cause no reload.
+func TestEnsureConfigReloadsARunningInstanceOnlyWhenTheListChanged(t *testing.T) {
+	bin := fakeInstallation(t, true)
+	dir := filepath.Dir(bin)
+	reloads := func() int {
+		b, _ := os.ReadFile(filepath.Join(dir, "pg_ctl.log"))
+		return strings.Count(string(b), "reload")
+	}
+	m, _ := managedInstance(t, bin, "kingres_shard,kingres_ledger")
+	if changed, err := m.EnsureConfig(1); err != nil || !changed || reloads() != 0 {
+		t.Fatalf("not running: %v %v, %d reloads", changed, err, reloads())
+	}
+	// back to the old list, now running
+	m2, _ := managedInstance(t, bin, "kingres_shard,kingres_ledger")
+	if err := os.WriteFile(filepath.Join(dir, "running"), []byte("1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := m2.EnsureConfig(1); err != nil || !changed || reloads() != 1 {
+		t.Fatalf("running: %v %v, %d reloads", changed, err, reloads())
+	}
+	if changed, err := m2.EnsureConfig(1); err != nil || changed || reloads() != 1 {
+		t.Errorf("a list that did not change: %v %v, %d reloads", changed, err, reloads())
 	}
 }
