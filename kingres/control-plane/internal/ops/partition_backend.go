@@ -94,14 +94,14 @@ func (b PartitionBackend) Start(ctx context.Context, d partsched.Due, asOf time.
 }
 
 // Checks implements partsched.Backend. A run that was partial counts as a failure for the alert only when the run before it was partial too. It also returns the
-// databases it read, so that an alert of a database that could not be read is left as it is.
+// databases it could not read (unread), so that an alert of such a database is left as it is; a database that has no kingres_timepart any more is in neither list.
 func (b PartitionBackend) Checks(ctx context.Context) ([]partsched.Check, []string, error) {
 	dbs, err := b.databasesWithTimepart(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
 	var out []partsched.Check
-	var read []string
+	var unread []string // the databases that exist and could not be read this time (their alerts are left as they are)
 	for _, db := range dbs {
 		err := b.O.asService(ctx, db, func(tx pgx.Tx) error {
 			rows, err := tx.Query(ctx, `SELECT schema_name::text, table_name::text, problem, coalesce(detail, '') FROM kingres.timepart_check()`)
@@ -136,11 +136,10 @@ func (b PartitionBackend) Checks(ctx context.Context) ([]partsched.Check, []stri
 		})
 		if err != nil {
 			b.O.Log.Warn("reading the check of the policies of a database failed", "database", db, "error", err)
-			continue
+			unread = append(unread, db)
 		}
-		read = append(read, db)
 	}
-	return out, read, nil
+	return out, unread, nil
 }
 
 // secondPartial says whether the run before the last one was partial too: one partial run is a lock that was held, two in a row is a policy that does not get

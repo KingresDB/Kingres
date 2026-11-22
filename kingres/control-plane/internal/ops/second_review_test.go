@@ -292,3 +292,25 @@ func TestAStandbyThatDidNotLoadTheLibraryBlocksAConversion(t *testing.T) {
 		t.Fatal("no refusal")
 	}
 }
+
+// P12D-06: Checks names the databases it could not read, and only those.
+func TestIntegrationChecksNameTheDatabasesThatCouldNotBeRead(t *testing.T) {
+	o, c, _, _ := policyOps(t)
+	ctx := context.Background()
+	if _, err := o.PutPartitionPolicy(ctx, "admin", "postgres", "public", "ev", dailyPolicy()); err != nil {
+		t.Fatal(err)
+	}
+	_, unread, err := (PartitionBackend{O: o}).Checks(ctx)
+	if err != nil || len(unread) != 0 {
+		t.Fatalf("a database that is read: %v %v", unread, err)
+	}
+	execAll(t, c, `ALTER FUNCTION kingres.timepart_check() RENAME TO timepart_check_x`)
+	checks, unread, err := (PartitionBackend{O: o}).Checks(ctx)
+	if err != nil || len(checks) != 0 || len(unread) != 1 || unread[0] != "postgres" {
+		t.Fatalf("a database that cannot be read: %v %v %v", checks, unread, err)
+	}
+	execAll(t, c, `ALTER FUNCTION kingres.timepart_check_x() RENAME TO timepart_check`, `DROP EXTENSION kingres_timepart CASCADE`)
+	if _, unread, err := (PartitionBackend{O: o}).Checks(ctx); err != nil || len(unread) != 0 {
+		t.Errorf("a database whose extension is gone is not unread: %v %v", unread, err)
+	}
+}
