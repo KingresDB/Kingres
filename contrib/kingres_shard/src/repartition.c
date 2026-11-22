@@ -87,9 +87,9 @@ kingres_shard_repartition_init(void)
 							 NULL, NULL, NULL);
 	DefineCustomIntVariable("kingres_shard.repartition_max_bytes",
 							"The most that this node holds of the rows of a table that a repartitioned join moves.",
-							"A statement that would hold more fails (the planner does not choose the path when its estimate is above half of this).",
+							"A statement that would hold more fails (the planner does not choose the path when its estimate is above half of this).  At most 512MB: the rows travel as one text array, which cannot be larger than 1GB.",
 							&kingres_shard_repartition_max_kb,
-							65536, 1024, MAX_KILOBYTES,
+							65536, 1024, 524288,
 							PGC_USERSET, GUC_UNIT_KB,
 							NULL, NULL, NULL);
 }

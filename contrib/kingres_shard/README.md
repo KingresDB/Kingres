@@ -1620,7 +1620,8 @@ that is not distributed ...), `switched off by kingres_shard.enable_repartition_
 repartitioned plan`.
 
 **Settings.**  `kingres_shard.enable_repartition_join` (`off`, `on` by cost, `force` for the tests) and
-`kingres_shard.repartition_max_bytes` (default 64 MB): the most text that one moved table may need at this node, and for a
+`kingres_shard.repartition_max_bytes` (default 64 MB, 1 MB to 512 MB: the rows of a group travel as one text array, which cannot
+be larger than 1 GB): the most text that one moved table may need at this node, and for a
 broadcast table the share of one group.  The planner does not choose a moved side that it estimates above half of it, and the
 executor stops a statement that would hold more with an error that names the setting (the one place where a read fails instead of
 falling back, because the plan cannot change once it runs).  Fault points: `rp_after_ship`, `rp_before_fragment`.

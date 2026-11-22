@@ -289,4 +289,22 @@ table(q{CREATE TABLE public.tdr (k int PRIMARY KEY, label text, ts timestamptz D
 	}
 }
 
+# ---------------------------------------------------------------------------
+# D. the largest value of repartition_max_bytes
+# ---------------------------------------------------------------------------
+{
+	my ($rc, $out, $err) = run_sql($nodes[0], q{SET kingres_shard.repartition_max_bytes = '1GB'});
+	isnt($rc, 0, 'D: repartition_max_bytes cannot be set to 1GB (the rows of a group travel as one text array)');
+	like($err, qr/524288 \.\. 1024|outside the valid range|invalid value/, '... the error names the valid range') or diag($err);
+	($rc, $out, $err) = run_sql($nodes[0], q{SET kingres_shard.repartition_max_bytes = '512MB'; SHOW kingres_shard.repartition_max_bytes});
+	is($rc, 0, 'D: 512MB is accepted') or diag($err);
+	is($out, '512MB', '... and is what the setting shows');
+	($rc, $out, $err) = run_sql($nodes[0], q{SET kingres_shard.repartition_max_bytes = 524289; SHOW kingres_shard.repartition_max_bytes});
+	isnt($rc, 0, 'D: 524289 kB, one above 512MB, is refused');
+	($rc, $out, $err) = run_sql($nodes[0], q{SET kingres_shard.repartition_max_bytes = '512MB'; SET kingres_shard.enable_repartition_join = force; SELECT count(*) FROM public.t a JOIN public.s b ON b.w = a.n});
+	is($rc, 0, 'D: a repartitioned join runs under the largest value') or diag($err);
+	($rc, my $out2, $err) = run_sql($single, q{SELECT count(*) FROM public.t a JOIN public.s b ON b.w = a.n});
+	is($out, $out2, '... and gives the single node\'s count');
+}
+
 done_testing();
