@@ -1111,6 +1111,8 @@ kingres_shard_lookup_dist_table(Oid relid)
  * for the number of schemas of the database (step 12).  The scans use the snapshot of the loader, so they see what this
  * transaction changed.
  */
+static bool lazy_no_pk_warned = false;
+
 static HeapTuple
 lazy_fetch(Oid heapoid, Oid key, SysScanDesc *sd, Relation *rel, Snapshot *snap)
 {
@@ -1121,17 +1123,31 @@ lazy_fetch(Oid heapoid, Oid key, SysScanDesc *sd, Relation *rel, Snapshot *snap)
 	*rel = table_open(heapoid, AccessShareLock);
 	/*
 	 * The index is the one that the open relation has now, not an OID kept from the load: REINDEX CONCURRENTLY replaces it without a write to the
-	 * catalog table, and an index that is missing must be an error, not "this is a local table" (P12R-03).
+	 * catalog table (P12R-03).  A table that has lost its primary key is scanned with no index: the answer stays right (it is never "this is a
+	 * local table"), only slower, and the statements that restore the key (ALTER TABLE ... ADD PRIMARY KEY, CREATE UNIQUE INDEX) and every
+	 * unrelated statement still run, which an error here would forbid (P12F-01).  The cache is not touched: it holds the answers, not the way
+	 * they were found.  The warning comes once for a backend, and again if the key came back and went again.
 	 */
 	pkoid = RelationGetPrimaryKeyIndex(*rel, true);
 	if (!OidIsValid(pkoid))
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("the table \"%s\" of the extension has no primary key", RelationGetRelationName(*rel)),
-				 errhint("Restore the primary key of the table (kingres_shard 0.8 creates it).")));
+	{
+		if (!lazy_no_pk_warned)
+		{
+			lazy_no_pk_warned = true;
+			ereport(WARNING,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("the table \"%s\" of the extension has no primary key; it is read without an index, which is slower",
+							RelationGetRelationName(*rel)),
+					 errhint("Restore the primary key, for example ALTER TABLE kingres.%s ADD PRIMARY KEY (%s).",
+							 RelationGetRelationName(*rel),
+							 heapoid == ks.relids[2] ? "relid" : "nsp")));
+		}
+	}
+	else
+		lazy_no_pk_warned = false;
 	*snap = RegisterSnapshot(IsInParallelMode() ? GetActiveSnapshot() : GetLatestSnapshot());
 	ScanKeyInit(&skey, 1, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(key));
-	*sd = systable_beginscan(*rel, pkoid, true, *snap, 1, &skey);
+	*sd = systable_beginscan(*rel, pkoid, OidIsValid(pkoid), *snap, 1, &skey);
 	return systable_getnext(*sd);
 }
 

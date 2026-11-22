@@ -2098,6 +2098,8 @@ Limits of this version:
 - Roles, tablespaces and extensions are not synchronized (the existing limit): a role that owns a schema or an object in it must exist on every node before the schema is distributed or the node is added.
 - Local helper schemas in a database that distributes by default need a superuser to create them (`SET kingres_shard.distribute_new_schemas = off`).
 - Review P12R-06/07 limits are in the paragraph of step 12 above.
+- A catalog table of the extension (`dist_schema`, `dist_table`) that has lost its primary key is read without an index (slower) and each backend warns once; restore it with `ALTER TABLE kingres.<table> ADD PRIMARY KEY (<column>)` (P12F-01).
+- `add_node` looks up the roles that the distributed schemas name on the new node before making any schema there, so a missing role is reported at once whatever the language of the node (P12F-02).  Default privileges and function owners are included.
 
 The tests of this phase are `t/230` to `t/251`; the numbers of the measured cost are in the design notes and in the paragraph of step 12.
 

@@ -45,4 +45,7 @@ is(digest($_), $base, 'node ' . $_->name . ' reads the same rows after the split
 is(q1($n1, "SELECT count(*) FROM kingres.bucket_map WHERE colocation_id = $C AND modulus = 16"), 2, '... and the bucket is two buckets of modulus 16');
 is(q1($n1, q{SELECT coalesce(string_agg(check_name, ','), '') FROM kingres.check_cluster()}), '', 'check_cluster() finds nothing');
 
+# the float text of the comparison must not depend on the session that calls the function (review P12F-03)
+is(q1($n1, q{SELECT p.proconfig::text FROM pg_proc p WHERE p.oid = (SELECT oid FROM pg_proc WHERE proname = 'internal_split_switch' AND pronamespace = 'kingres'::regnamespace)}), '{"search_path=pg_catalog, kingres, pg_temp",extra_float_digits=3}', 'internal_split_switch sets extra_float_digits = 3 itself');
+
 done_testing();
