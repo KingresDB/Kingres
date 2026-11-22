@@ -2296,6 +2296,24 @@ parent (a columnar leaf for cold data next to heap leaves); `internal_partition_
   the one that makes the function.  A node without the access method is refused with the error of the node (`access method "columnar" does not
   exist`) and joins nothing.
 
+### What a columnar distributed table refuses (increment S2)
+
+- **The online variants.**  `create_distributed_table_concurrently`, `create_reference_table_concurrently`, `alter_distributed_table_concurrently` and
+  `undistribute_table_concurrently` capture the changes of the source with a row trigger, which a columnar table does not support
+  (`row-level AFTER triggers on columnar tables are not supported`).  The report says so first: the blocker `columnar_online` (every kind
+  with `mode = 'online'`, for a table whose access method is not heap), so the call is refused with SQLSTATE `0A000` before an operation
+  is recorded, and the message names the blocking variant.  The blocking variants (`create_distributed_table`, `alter_distributed_table`,
+  `undistribute_table`) copy through the row router and work on a columnar table; they are the way to rebuild one.
+- **A bucket move.**  `move_bucket` refuses in `preparing`, before it changes anything, when a bucket partition of any table of the colocation
+  group (or a leaf of a user-partitioned one) has another access method than heap: SQLSTATE `0A000`, `bucket move refused: relation
+  "public.cc_b0001" has columnar storage, which this version does not move`.  The group is refused as a whole, naming the first such relation,
+  so a heap table colocated with a columnar one cannot move on its own either (increment S3 lifts this).
+- **A split.**  `split_bucket` of a group with a columnar table is refused in the same place with the words of the design: `bucket split refused:
+  table "public.cc" is columnar; a split needs a primary key, row locks and update triggers on the table, which columnar tables do not have`
+  (`0A000`).  A split stays refused for a columnar table in every version of this part.
+- **The ledger (rule L1).**  A ledger table cannot be columnar and the reverse: see the README of `kingres_ledger` (`ledger_enable` refuses a columnar table;
+  a rewrite by `SET ACCESS METHOD` of a ledger table is rejected).
+
 ## Moving buckets and rebalancing (version 0.3, phase 4)
 
 Design: [`kingres/docs/design/shard-phase4.md`](../../kingres/docs/design/shard-phase4.md)

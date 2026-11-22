@@ -16724,7 +16724,8 @@ REVOKE ALL ON FUNCTION kingres.internal_partition_layout(regclass) FROM PUBLIC;
 -- distributed yet and whose access method is not heap:
 --   columnar_reference_table (blocker, distribute_reference): a reference table is heap in this version (design 9.5);
 --   access_method_missing (blocker, distribute): a node lacks the access method, so the table could not be made there;
---   columnar_storage (note, distribute): what the table becomes.
+--   columnar_storage (note, distribute): what the table becomes;
+--   columnar_online (blocker, every kind with mode online): the online variants capture changes with a row trigger, which columnar does not support.
 ALTER FUNCTION kingres.table_change_report(text, regclass, jsonb) RENAME TO internal_table_change_report_base;
 
 CREATE FUNCTION kingres.table_change_report(kind text, relation regclass,
@@ -16744,7 +16745,7 @@ DECLARE
 BEGIN
     RETURN QUERY SELECT b.severity, b.code, b.object, b.detail
                    FROM kingres.internal_table_change_report_base(kind, relation, options) b;
-    IF kind NOT IN ('distribute', 'distribute_reference') THEN
+    IF kind NOT IN ('distribute', 'distribute_reference', 'undistribute', 'alter') THEN
         RETURN;
     END IF;
     SELECT a.amname, pg_catalog.format('%I.%I', n.nspname, k.relname) INTO v_am, v_rel
@@ -16753,8 +16754,17 @@ BEGIN
       JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) k.relnamespace
      WHERE k.oid OPERATOR(pg_catalog.=) relation::pg_catalog.oid AND k.relkind OPERATOR(pg_catalog.=) ANY (ARRAY['r', 'p']::pg_catalog."char"[])
        AND a.amname OPERATOR(pg_catalog.<>) 'heap'
-       AND NOT EXISTS (SELECT 1 FROM kingres.dist_table d WHERE d.relid OPERATOR(pg_catalog.=) relation);
+       AND (kind OPERATOR(pg_catalog.<>) ALL (ARRAY['distribute', 'distribute_reference'])
+            OR NOT EXISTS (SELECT 1 FROM kingres.dist_table d WHERE d.relid OPERATOR(pg_catalog.=) relation));
     IF v_am IS NULL THEN
+        RETURN;
+    END IF;
+    -- the online variants capture the changes of the source with a row trigger, which a columnar table does not support
+    IF options OPERATOR(pg_catalog.->>) 'mode' OPERATOR(pg_catalog.=) 'online' THEN
+        RETURN QUERY SELECT 'blocker'::pg_catalog.text, 'columnar_online'::pg_catalog.text, v_rel,
+                            pg_catalog.format('cannot change table "%s": the online variants capture changes with a row trigger, which the access method "%s" does not support; use the blocking variant', relation::pg_catalog.regclass::pg_catalog.text, v_am);
+    END IF;
+    IF kind OPERATOR(pg_catalog.=) ANY (ARRAY['undistribute', 'alter']) THEN
         RETURN;
     END IF;
     v_pfx := CASE kind WHEN 'distribute' THEN pg_catalog.format('cannot distribute table "%s": ', relation::pg_catalog.regclass::pg_catalog.text)
@@ -16793,3 +16803,205 @@ COMMENT ON FUNCTION kingres.table_change_report(text, regclass, jsonb) IS
 COMMENT ON FUNCTION kingres.internal_table_change_report_base(text, regclass, jsonb) IS
     'The report of 0.8, which table_change_report() extends with the rows about the storage of the table';
 REVOKE ALL ON FUNCTION kingres.table_change_report(text, regclass, jsonb), kingres.internal_table_change_report_base(text, regclass, jsonb) FROM PUBLIC;
+
+-- ---------------------------------------------------------------------------
+-- S2: a bucket move refuses a columnar relation (design 9.3, 9.7)
+-- ---------------------------------------------------------------------------
+
+-- internal_move_inspect(): on the source, a bucket partition or a leaf of a user-partitioned bucket partition that is not heap stops the
+-- move in "preparing", before anything is made, with a stable text.  (Increment S3 lifts this refusal for the access method columnar.)
+CREATE OR REPLACE FUNCTION kingres.internal_move_inspect(p_role text, p_bucket int, p_bucket_count int, p_tables jsonb)
+    RETURNS jsonb
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    t         pg_catalog.record;
+    v_ntab    pg_catalog.int4 := pg_catalog.jsonb_array_length(p_tables);
+    v_sync    pg_catalog.int4 := LEAST(pg_catalog.current_setting('max_sync_workers_per_subscription')::pg_catalog.int4, v_ntab + 1);
+    v_free    pg_catalog.int4;
+    v_node    pg_catalog.int4;
+    v_out     pg_catalog.jsonb := '[]'::pg_catalog.jsonb;
+    v_part    pg_catalog.text;
+    v_oid     pg_catalog.oid;
+    v_ident   pg_catalog.text;
+    v_pk      pg_catalog.bool;
+    v_col     pg_catalog.text;
+    v_origins pg_catalog.text;
+    v_columnar pg_catalog.text;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    SELECT l.node_id INTO v_node FROM kingres.local_node l;
+
+    IF pg_catalog.current_setting('wal_level') OPERATOR(pg_catalog.<>) 'logical' THEN
+        RAISE EXCEPTION 'wal_level is "%" on node %, a bucket move needs wal_level = logical', pg_catalog.current_setting('wal_level'), v_node
+            USING ERRCODE = 'object_not_in_prerequisite_state',
+                  HINT = 'Set wal_level = logical on every node and restart them.';
+    END IF;
+    IF pg_catalog.current_setting('max_logical_replication_workers')::pg_catalog.int4 < 1 + v_sync THEN
+        RAISE EXCEPTION 'max_logical_replication_workers is %, node % needs at least %',
+            pg_catalog.current_setting('max_logical_replication_workers'), v_node, 1 + v_sync
+            USING ERRCODE = 'object_not_in_prerequisite_state',
+                  HINT = 'Raise max_logical_replication_workers (and max_worker_processes) and restart the node.';
+    END IF;
+
+    IF p_role OPERATOR(pg_catalog.=) 'source' THEN
+        SELECT pg_catalog.current_setting('max_replication_slots')::pg_catalog.int4 - pg_catalog.count(*)
+          INTO v_free FROM pg_catalog.pg_replication_slots;
+        IF v_free < 1 + v_sync THEN
+            RAISE EXCEPTION 'node % has % free replication slots (max_replication_slots = %), a move needs %',
+                v_node, v_free, pg_catalog.current_setting('max_replication_slots'), 1 + v_sync
+                USING ERRCODE = 'object_not_in_prerequisite_state',
+                      HINT = 'Raise max_replication_slots and restart the node, or finish the moves that hold slots.';
+        END IF;
+        SELECT pg_catalog.current_setting('max_wal_senders')::pg_catalog.int4 - pg_catalog.count(*)
+          INTO v_free FROM pg_catalog.pg_stat_replication;
+        IF v_free < 1 + v_sync THEN
+            RAISE EXCEPTION 'node % has % free WAL senders (max_wal_senders = %), a move needs %',
+                v_node, v_free, pg_catalog.current_setting('max_wal_senders'), 1 + v_sync
+                USING ERRCODE = 'object_not_in_prerequisite_state',
+                      HINT = 'Raise max_wal_senders and restart the node.';
+        END IF;
+    ELSE
+        v_origins := pg_catalog.current_setting('max_active_replication_origins', true);
+        IF v_origins IS NOT NULL THEN
+            SELECT v_origins::pg_catalog.int4 - pg_catalog.count(*) INTO v_free FROM pg_catalog.pg_replication_origin;
+            IF v_free < 1 + v_sync THEN
+                RAISE EXCEPTION 'node % has % free replication origins (max_active_replication_origins = %), a move needs %',
+                    v_node, v_free, v_origins, 1 + v_sync
+                    USING ERRCODE = 'object_not_in_prerequisite_state',
+                          HINT = 'Raise max_active_replication_origins and restart the node.';
+            END IF;
+        END IF;
+    END IF;
+
+    FOR t IN SELECT x.schema_name, x.table_name
+               FROM pg_catalog.jsonb_to_recordset(p_tables) AS x(schema_name text, table_name text)
+    LOOP
+        v_part := kingres.internal_bucket_part_name(t.table_name, p_bucket);
+        v_oid := pg_catalog.to_regclass(pg_catalog.format('%I.%I', t.schema_name, v_part));
+        IF p_role OPERATOR(pg_catalog.=) 'source' THEN
+            IF v_oid IS NULL OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c
+                                             WHERE c.oid OPERATOR(pg_catalog.=) v_oid AND c.relispartition) THEN
+                RAISE EXCEPTION 'bucket partition "%.%" is not attached on node %', t.schema_name, v_part, v_node
+                    USING ERRCODE = 'object_not_in_prerequisite_state';
+            END IF;
+            SELECT c.relreplident::pg_catalog.text INTO v_ident FROM pg_catalog.pg_class c WHERE c.oid OPERATOR(pg_catalog.=) v_oid;
+            SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_index i
+                            WHERE i.indrelid OPERATOR(pg_catalog.=) v_oid AND i.indisprimary) INTO v_pk;
+            IF v_ident OPERATOR(pg_catalog.=) 'n' OR (v_ident OPERATOR(pg_catalog.=) 'd' AND NOT v_pk) THEN
+                RAISE EXCEPTION 'table "%.%" has no replica identity', t.schema_name, t.table_name
+                    USING ERRCODE = 'object_not_in_prerequisite_state',
+                          DETAIL = 'Logical replication needs a primary key or REPLICA IDENTITY FULL to replicate updates and deletes of the bucket.',
+                          HINT = pg_catalog.format('Add a primary key, or set REPLICA IDENTITY FULL on the bucket partitions of %I.%I on the node that has them (ALTER TABLE is not propagated for it: superuser, kingres_shard.enable_routing = off).', t.schema_name, t.table_name);
+            END IF;
+            SELECT pg_catalog.format('%I.%I', ln.nspname, lc.relname) INTO v_columnar
+              FROM pg_catalog.pg_partition_tree(v_oid) pt
+              JOIN pg_catalog.pg_class lc ON lc.oid OPERATOR(pg_catalog.=) pt.relid
+              JOIN pg_catalog.pg_namespace ln ON ln.oid OPERATOR(pg_catalog.=) lc.relnamespace
+              JOIN pg_catalog.pg_am a ON a.oid OPERATOR(pg_catalog.=) lc.relam
+             WHERE lc.relkind OPERATOR(pg_catalog.=) 'r' AND a.amname OPERATOR(pg_catalog.<>) 'heap'
+             ORDER BY lc.relname LIMIT 1;
+            IF v_columnar IS NOT NULL THEN
+                RAISE EXCEPTION 'bucket move refused: relation "%" has columnar storage, which this version does not move', v_columnar
+                    USING ERRCODE = '0A000',
+                          HINT = 'Convert the table to row storage, or move its buckets after a version of kingres_shard that moves columnar relations.';
+            END IF;
+            IF v_ident OPERATOR(pg_catalog.=) 'i' THEN
+                RAISE EXCEPTION 'table "%.%" uses REPLICA IDENTITY USING INDEX, which a bucket move does not support yet', t.schema_name, t.table_name
+                    USING ERRCODE = 'feature_not_supported',
+                          HINT = 'Use a primary key or REPLICA IDENTITY FULL.';
+            END IF;
+            SELECT a.attname INTO v_col FROM pg_catalog.pg_attribute a
+             WHERE a.attrelid OPERATOR(pg_catalog.=) v_oid AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped
+               AND a.attidentity OPERATOR(pg_catalog.<>) '' LIMIT 1;
+            IF FOUND THEN
+                RAISE EXCEPTION 'column "%" of table "%.%" is an identity column, which a bucket move does not support yet', v_col, t.schema_name, t.table_name
+                    USING ERRCODE = 'feature_not_supported';
+            END IF;
+            v_out := v_out OPERATOR(pg_catalog.||) (pg_catalog.jsonb_build_object(
+                'schema_name', t.schema_name, 'table_name', t.table_name, 'replident', v_ident)
+                OPERATOR(pg_catalog.||) kingres.internal_move_tree(v_oid));
+        ELSE
+            IF v_oid IS NOT NULL THEN
+                RAISE EXCEPTION 'relation "%.%" already exists on node %', t.schema_name, v_part, v_node
+                    USING ERRCODE = 'duplicate_table',
+                          HINT = 'It may be left over from an earlier move; see kingres.check_cluster().';
+            END IF;
+            IF pg_catalog.to_regclass(pg_catalog.format('%I.%I', t.schema_name, t.table_name)) IS NULL THEN
+                RAISE EXCEPTION 'table "%.%" does not exist on node %', t.schema_name, t.table_name, v_node
+                    USING ERRCODE = 'undefined_table';
+            END IF;
+            v_out := v_out OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_object(
+                'schema_name', t.schema_name, 'table_name', t.table_name);
+        END IF;
+    END LOOP;
+    RETURN v_out;
+END;
+$$;
+
+-- internal_split_inspect(): the refusal of a table that is not heap says why, in the words of the design (9.7): a split needs a primary
+-- key, row locks and update triggers, which a columnar table does not have.
+CREATE OR REPLACE FUNCTION kingres.internal_split_inspect(p_colocation int, p_bucket int)
+    RETURNS pg_catalog.jsonb
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    t      pg_catalog.record;
+    v_rel  pg_catalog.regclass;
+    v_part pg_catalog.regclass;
+    v_pk   pg_catalog.text[];
+    v_cols pg_catalog.text[];
+    v_dist pg_catalog.name;
+    v_pm   pg_catalog.text;
+    v_kind pg_catalog."char";
+    v_am   pg_catalog.oid;
+    v_opts pg_catalog.text[];
+    v_rows pg_catalog.float8;
+    v_out  pg_catalog.jsonb := '[]'::pg_catalog.jsonb;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    FOR t IN SELECT * FROM kingres.internal_move_tables(p_colocation) ORDER BY ord LOOP
+        v_rel := pg_catalog.format('%I.%I', t.schema_name, t.table_name)::pg_catalog.regclass;
+        SELECT d.dist_column, d.partition_method INTO v_dist, v_pm FROM kingres.dist_table d WHERE d.relid OPERATOR(pg_catalog.=) v_rel;
+        IF v_pm IS NOT NULL THEN
+            RAISE EXCEPTION 'table % is partitioned by the user: a split of its buckets is not supported yet', v_rel USING ERRCODE = 'feature_not_supported';
+        END IF;
+        v_part := pg_catalog.to_regclass(pg_catalog.format('%I.%I', t.schema_name, kingres.internal_bucket_part_name(t.table_name, p_bucket)));
+        IF v_part IS NULL THEN
+            RAISE EXCEPTION 'the partition of bucket % of table % is not on this node', p_bucket, v_rel USING ERRCODE = 'object_not_in_prerequisite_state';
+        END IF;
+        SELECT c.relkind, c.relam, c.reloptions, c.reltuples INTO v_kind, v_am, v_opts, v_rows FROM pg_catalog.pg_class c WHERE c.oid OPERATOR(pg_catalog.=) v_part::pg_catalog.oid;
+        IF v_kind OPERATOR(pg_catalog.<>) 'r' THEN
+            RAISE EXCEPTION 'the partition % is itself partitioned: a split of its bucket is not supported yet', v_part USING ERRCODE = 'feature_not_supported';
+        END IF;
+        IF v_am OPERATOR(pg_catalog.<>) (SELECT a.oid FROM pg_catalog.pg_am a WHERE a.amname OPERATOR(pg_catalog.=) 'heap') THEN
+            RAISE EXCEPTION 'bucket split refused: table "%" is columnar; a split needs a primary key, row locks and update triggers on the table, which columnar tables do not have', v_rel
+                USING ERRCODE = 'feature_not_supported',
+                      HINT = 'Convert the table to row storage first.';
+        END IF;
+        SELECT pg_catalog.array_agg(a.attname::pg_catalog.text ORDER BY k.ord) INTO v_pk
+          FROM pg_catalog.pg_index i
+          CROSS JOIN LATERAL pg_catalog.unnest(i.indkey::pg_catalog.int2[]) WITH ORDINALITY k(attnum, ord)
+          JOIN pg_catalog.pg_attribute a ON a.attrelid OPERATOR(pg_catalog.=) i.indrelid AND a.attnum OPERATOR(pg_catalog.=) k.attnum
+         WHERE i.indrelid OPERATOR(pg_catalog.=) v_rel::pg_catalog.oid AND i.indisprimary;
+        IF v_pk IS NULL THEN
+            RAISE EXCEPTION 'table % has no primary key: a split matches the rows of the children by key', v_rel USING ERRCODE = 'object_not_in_prerequisite_state';
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a WHERE a.attrelid OPERATOR(pg_catalog.=) v_rel::pg_catalog.oid AND a.attnum OPERATOR(pg_catalog.>) 0
+                      AND NOT a.attisdropped AND (a.attgenerated OPERATOR(pg_catalog.<>) '' OR a.attidentity OPERATOR(pg_catalog.<>) '')) THEN
+            RAISE EXCEPTION 'table % has a generated or an identity column: a bucket of such a table cannot be split yet', v_rel USING ERRCODE = 'feature_not_supported';
+        END IF;
+        SELECT pg_catalog.array_agg(a.attname::pg_catalog.text ORDER BY a.attnum) INTO v_cols
+          FROM pg_catalog.pg_attribute a WHERE a.attrelid OPERATOR(pg_catalog.=) v_rel::pg_catalog.oid AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped;
+        v_out := v_out OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
+                    'ord', t.ord, 'schema', t.schema_name, 'table', t.table_name,
+                    'part', kingres.internal_bucket_part_name(t.table_name, p_bucket), 'dist', v_dist,
+                    'pk', pg_catalog.to_jsonb(v_pk), 'cols', pg_catalog.to_jsonb(v_cols),
+                    'reloptions', COALESCE(pg_catalog.to_jsonb(v_opts), 'null'::pg_catalog.jsonb),
+                    'rows', CASE WHEN v_rows OPERATOR(pg_catalog.>) 0 THEN v_rows::pg_catalog.int8 ELSE 0 END));
+    END LOOP;
+    RETURN v_out;
+END;
+$$;
