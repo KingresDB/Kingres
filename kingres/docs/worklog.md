@@ -36,8 +36,7 @@ Covers the work on branch shard-p1011 after the second review of phase 11 (the r
 
 ### How it was verified
 
-- `kingres_shard` at the tip of shard-p1011 (clean -Werror builds, regress, every TAP file) on PostgreSQL 18.7 and 19rc2: 48828 tests on 18 and 48794 on 19 (218 files each), in tree: see the
-  integrator's gate for the merged tree.  The files that touch the catalog cache also pass with `KS_CATALOG_FULL=1` (31 files, 4317 tests on each major).
+- `kingres_shard` at the tip of shard-p1011 (clean -Werror builds, regress, every TAP file) on PostgreSQL 18.7 and 19rc2: 48828 tests on 18 and 48794 on 19 (218 files each), in tree 218 of 219 (the one skipped is `046_two_majors`, as always) and `kingres_ledger` 39 of 39.  The files that touch the catalog cache also pass with `KS_CATALOG_FULL=1` (31 files, 4317 tests on each major).
 - Mutants: step 12 (b) six, (a) seven, the apply of a catalog one, the review fixes six; the control plane 30 (17 unit, 13 cluster); the panel 41.  Every one is killed by a named test.
 - Control plane: `go build`, `go vet`, `go test` of ops, httpapi, task and contract pass; the cluster tests pass on both majors; `check-contract.mjs` passes.
 - Panel: lint, type check, `api:check`, build, 1528 unit tests and 58 browser tests.
