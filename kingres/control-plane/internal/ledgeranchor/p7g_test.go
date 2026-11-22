@@ -926,3 +926,27 @@ func TestANewerFileThatThisServerCannotStoreIsWaitedFor(t *testing.T) {
 		t.Fatalf("%+v", p)
 	}
 }
+
+func TestTheNoteOfAFailureToTakeANewerFileIsDroppedWithItsTarget(t *testing.T) {
+	e, id, _ := staleLeader(t)
+	e.svc.cfg.FetchFrom = func(context.Context, string, int64) ([]byte, error) { return nil, errors.New("h3 went away") }
+	_ = e.runSubmit()
+	e.svc.mu.Lock()
+	n := len(e.svc.credStaleSince)
+	e.svc.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("the failure was not noted (%d)", n)
+	}
+	if err := e.svc.DeleteTarget(e.ctx(), id); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.svc.jobCredentials(e.ctx(), e.term); err != nil {
+		t.Fatal(err)
+	}
+	e.svc.mu.Lock()
+	n = len(e.svc.credStaleSince)
+	e.svc.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d notes are kept for a target that is gone", n)
+	}
+}

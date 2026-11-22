@@ -279,8 +279,15 @@ func TestReleaseVerifyMarksASignedSetWhoseCommitIsUnknown(t *testing.T) {
 		if code != ExitNotRelease || !strings.HasPrefix(out, "VERIFIED (NOT A RELEASE):") || strings.HasPrefix(out, "VERIFIED:") || !strings.Contains(out, "not a release") || !strings.Contains(out, "note: finding:") {
 			t.Errorf("%s: %d\n%s%s", name, code, out, errs)
 		}
-		if _, out, _ := run(t, append(a, "--json")...); !strings.Contains(out, `"not_a_release": true`) {
+		if _, out, _ := run(t, append(append([]string{}, a...), "--json")...); !strings.Contains(out, `"not_a_release": true`) {
 			t.Errorf("%s: the JSON does not say it:\n%s", name, out)
+		}
+		// status 5 for a script that tests only the status (also with --json), and 0 for whoever asks for the set
+		if code, _, _ := run(t, append(append([]string{}, a...), "--json")...); code != ExitNotRelease {
+			t.Errorf("%s: the status with --json is %d", name, code)
+		}
+		if code, out, _ := run(t, append(append([]string{}, a...), "--accept-dry-run")...); code != 0 || !strings.HasPrefix(out, "VERIFIED (NOT A RELEASE):") {
+			t.Errorf("%s with --accept-dry-run: %d\n%s", name, code, out)
 		}
 	}
 	// a real release is a plain VERIFIED and says nothing of the kind
