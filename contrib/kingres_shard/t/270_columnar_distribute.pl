@@ -100,6 +100,7 @@ is(qs($n1, 'SELECT count(*) FROM kingres.dist_table WHERE relid = \'public.rc\':
 qs($n1, q{
 	CREATE TABLE public.up (id int, d date, v text) PARTITION BY RANGE (d);
 	CREATE TABLE public.up_old PARTITION OF public.up FOR VALUES FROM ('2020-01-01') TO ('2021-01-01') USING columnar;
+	SELECT kingres.columnar_set_options('public.up_old', compression => 'none', stripe_row_count => 25000, chunk_row_count => 2500);
 	CREATE TABLE public.up_new PARTITION OF public.up FOR VALUES FROM ('2021-01-01') TO ('2022-01-01') USING heap;
 	INSERT INTO public.up SELECT g, '2020-06-01'::date + (g % 300), 'u' || g FROM generate_series(1, 400) g;
 });
@@ -110,6 +111,7 @@ for my $n ($n1, $n2)
 	                          FROM pg_class c LEFT JOIN pg_am a ON a.oid = c.relam
 	                         WHERE c.relname ~ '^up_(old|new)_b[0-9]+$'}),
 		'up_new=heap/d,up_old=columnar/f', 'the leaves of the user-partitioned table keep their access methods on ' . $n->name);
+	is(qs($n, q{SELECT coalesce(string_agg(DISTINCT o.compression || '/' || o.stripe_row_count || '/' || o.chunk_row_count, ','), 'none-found') FROM pg_class c, LATERAL kingres.columnar_options(c.oid::regclass) o WHERE c.relname ~ '^up_old_b[0-9]+$'}), 'none/25000/2500', 'and the options of the columnar leaf on ' . $n->name);
 }
 is(qs($n1, 'SELECT count(*) FROM public.up'), '400', 'the rows of the user-partitioned table are there');
 
@@ -125,6 +127,27 @@ for my $n ($n1, $n2)
 	is(ams($n, 'ev'), 'columnar columnar/f', 'alter_distributed_table: still columnar with REPLICA IDENTITY FULL on ' . $n->name);
 	is(qs($n, 'SELECT count(*) || \',\' || sum(id) FROM public.ev'), '2150,2312325', 'and whole on ' . $n->name);
 }
+
+# the options of a columnar table (columnar_set_options) are carried: create_distributed_table, alter_distributed_table, undistribute_table (P12S-03)
+qs($n1, q{
+	CREATE TABLE public.oc (id int, v text) USING columnar;
+	INSERT INTO public.oc SELECT g, 'o' || g FROM generate_series(1, 300) g;
+	SELECT kingres.columnar_set_options('public.oc', compression => 'none', stripe_row_count => 20000, chunk_row_count => 5000);
+});
+sub options_of
+{
+	my ($n, $t) = @_;
+	return qs($n, qq{SELECT coalesce(string_agg(DISTINCT o.compression || '/' || o.stripe_row_count || '/' || o.chunk_row_count, ','), 'none-found')
+	                  FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid, LATERAL kingres.columnar_options(c.oid::regclass) o
+	                 WHERE i.inhparent = 'public.$t'::regclass});
+}
+qs($n1, "SELECT kingres.create_distributed_table('public.oc', 'id', bucket_count => 4)");
+is(options_of($_, 'oc'), 'none/20000/5000', 'create_distributed_table carries the options of the columnar table to every bucket partition on ' . $_->name) for ($n1, $n2);
+qs($n1, "SELECT kingres.alter_distributed_table('public.oc', bucket_count => 6)");
+is(options_of($_, 'oc'), 'none/20000/5000', 'alter_distributed_table keeps them on ' . $_->name) for ($n1, $n2);
+qs($n1, "SELECT kingres.undistribute_table('public.oc')");
+is(qs($n1, q{SELECT o.compression || '/' || o.stripe_row_count || '/' || o.chunk_row_count FROM kingres.columnar_options('public.oc') o}), 'none/20000/5000', 'undistribute_table gives the options back');
+is(qs($n1, 'SELECT count(*) FROM public.oc'), '300', 'with its rows');
 
 # a node that joins later gets the parent with its access method; without the access method it is refused and nothing is left
 my $n3 = KingresShardTest::make_node('cd3', extra => "shared_preload_libraries = 'kingres_shard,kingres_columnar'\n");

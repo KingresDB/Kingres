@@ -66,6 +66,24 @@ my $C = qs($n1, "SELECT colocation_id FROM kingres.dist_table WHERE relid = 'pub
 is($st, '0A000', 'split_bucket of a columnar table: feature_not_supported');
 like($msg, qr/^bucket split refused: table "public\.cc" is columnar; a split needs a primary key, row locks and update triggers/, '... with the words of the design');
 
+# every relation of a bucket is looked at, not the first: a leaf of another access method than columnar stops the move even when a
+# columnar leaf sorts before it (review P12S-05).  A second table access method over the heap handler stands for it.
+$_->safe_psql('postgres', 'CREATE ACCESS METHOD heap2 TYPE TABLE HANDLER heap_tableam_handler') for ($n1, $n2);
+qs($n1, q{
+	CREATE TABLE public.up2 (id int, d date, v text, PRIMARY KEY (id, d)) PARTITION BY RANGE (d);
+	CREATE TABLE public.up2_a PARTITION OF public.up2 FOR VALUES FROM ('2020-01-01') TO ('2021-01-01') USING columnar;
+	CREATE TABLE public.up2_b PARTITION OF public.up2 FOR VALUES FROM ('2021-01-01') TO ('2022-01-01') USING heap2;
+	INSERT INTO public.up2 SELECT g, CASE WHEN g % 2 = 0 THEN '2020-06-01'::date ELSE '2021-06-01'::date END, 'u' || g FROM generate_series(1, 100) g;
+	SELECT kingres.create_distributed_table('public.up2', 'id', bucket_count => 3);
+});
+{
+	my $U2 = qs($n1, "SELECT colocation_id FROM kingres.dist_table WHERE relid = 'public.up2'::regclass");
+	my $from2 = qs($n1, "SELECT group_id FROM kingres.bucket_map WHERE colocation_id = $U2 AND bucket = 0");
+	my ($st2, $msg2) = state_of("kingres.move_bucket($U2, 0, " . (1 - $from2) . ")");
+	is($st2, '0A000', 'a bucket with a columnar leaf and a leaf of another access method is refused');
+	like($msg2, qr/^bucket move refused: relation "public\.up2_b_b0000" uses the access method "heap2", which a bucket move does not carry$/, '... naming the leaf of the other access method');
+}
+
 # a bucket move refuses a columnar relation when the installed kingres_columnar cannot decode its changes (version 0.1), in
 # preparing, before anything is made.  (With kingres_columnar 0.2 the move works: t/274.)
 my ($m1, $m2) = make_cluster('co', 2, logical => 1, extra => "shared_preload_libraries = 'kingres_shard,kingres_columnar'\n");

@@ -130,6 +130,81 @@ is(one('SELECT count(DISTINCT u) FROM public.ev'), one("SELECT $K.approx_count_d
 qs($n1, 'ALTER DATABASE postgres RESET kingres_shard.count_distinct_mode');
 is(one('SELECT count(DISTINCT u) FROM public.ev'), '3000', 'and reset it is exact again');
 
+# the types whose hash depends on an object identifier stay exact (review P12S-06)
+qs($n1, q{
+	CREATE TABLE public.oidt (id int PRIMARY KEY, o oid, rc regclass, ov oidvector);
+	INSERT INTO public.oidt SELECT g, g % 10, 'pg_class'::regclass, '1 2'::oidvector FROM generate_series(1, 100) g;
+	SELECT kingres.create_distributed_table('public.oidt', 'id', bucket_count => 4);
+});
+for my $col (qw(o rc ov))
+{
+	my $sql = "SELECT count(DISTINCT $col) FROM public.oidt";
+	unlike(plan_of($sql, $A), qr/approx_count_distinct/, "plan: count(DISTINCT $col) of an oid-like type is not rewritten");
+	is(one($sql, $A), one($sql), "count(DISTINCT $col) gives the exact answer in approximate mode");
+}
+
+# a role that may not use kingres_sketch is not locked out, and gets the exact answer (review P12S-01)
+qs($_, "CREATE ROLE appu LOGIN") for ($n1, $n2);
+qs($n1, "GRANT SELECT ON public.ev TO appu");
+qs($n1, "ALTER DATABASE postgres SET kingres_shard.count_distinct_mode = 'approximate'");
+{
+	my ($rc, $out, $err) = run_sql($n1, "SET ROLE appu; SELECT 1; SELECT count(*) FROM public.ev; SELECT count(DISTINCT u) FROM public.ev; SELECT count(DISTINCT u) FROM public.ev;");
+	is($rc, 0, 'a role without USAGE on the schema of kingres_sketch: no statement fails') or diag($err);
+	is($out =~ s/\s+//gr, '13000030003000', '... and count(DISTINCT) stays exact');
+	my $w = () = $err =~ /this role may not use kingres_sketch/g;
+	is($w, 1, '... with one warning for the session');
+}
+qs($_, "GRANT USAGE ON SCHEMA kingres_sketch TO appu") for ($n1, $n2);
+is(one("SET ROLE appu; SELECT count(DISTINCT u) FROM public.ev"), one("SELECT $K.approx_count_distinct(u, 14) FROM public.ev"), 'with USAGE on the schema the role gets the sketch');
+qs($n1, "REVOKE ALL ON FUNCTION $K.approx_count_distinct(anyelement, int) FROM PUBLIC");
+{
+	my ($rc, $out, $err) = run_sql($n1, "SET ROLE appu; SELECT count(DISTINCT u) FROM public.ev;");
+	is($rc, 0, 'without EXECUTE on the aggregate the statement does not fail') or diag($err);
+	is($out =~ s/\s+//gr, '3000', '... and stays exact');
+	like($err, qr/this role may not use kingres_sketch/, '... with the warning');
+}
+qs($n1, "GRANT ALL ON FUNCTION $K.approx_count_distinct(anyelement, int) TO PUBLIC");
+qs($n1, "ALTER DATABASE postgres RESET kingres_shard.count_distinct_mode");
+qs($_, "REVOKE USAGE ON SCHEMA kingres_sketch FROM appu") for ($n1, $n2);
+
+# a cached plan does not keep the rewrite when the setting changes, in either direction (review P12S-02)
+{
+	my $cached = "SET plan_cache_mode = force_generic_plan; PREPARE pq AS SELECT count(DISTINCT id) FROM public.ev; ";
+	my $exact_id = one('SELECT count(DISTINCT id) FROM public.ev');
+	my $approx_id = one("SELECT $K.approx_count_distinct(id, 14) FROM public.ev");
+	diag("count(DISTINCT id): exact $exact_id, approximate $approx_id");
+	my ($rc, $out, $err) = run_sql($n1, $cached . "EXECUTE pq; SET kingres_shard.count_distinct_mode = 'approximate'; EXECUTE pq; SET kingres_shard.count_distinct_mode = 'exact'; EXECUTE pq;");
+	is($rc, 0, 'a prepared statement runs through three changes of the setting') or diag($err);
+	is(join(',', split /\s+/, $out), "$exact_id,$approx_id,$exact_id", 'exact, then approximate, then exact again: the generic plan is not kept');
+	($rc, $out, $err) = run_sql($n1, $cached . "EXECUTE pq; SET kingres_shard.count_distinct_mode = 'approximate'; EXPLAIN (COSTS OFF) EXECUTE pq; SET kingres_shard.count_distinct_mode = 'exact'; EXPLAIN (COSTS OFF) EXECUTE pq;");
+	my @plans = split /QUERY PLAN/, $out;
+	is(scalar(grep { /approx_count_distinct/ } @plans), 1, 'EXPLAIN EXECUTE: the plan after SET approximate has the sketch, the other plans do not');
+	# a function body is planned once per session: the same
+	qs($n1, q{CREATE FUNCTION public.cdf() RETURNS bigint LANGUAGE plpgsql AS $f$ BEGIN RETURN (SELECT count(DISTINCT id) FROM public.ev); END $f$});
+	($rc, $out, $err) = run_sql($n1, "SELECT public.cdf(); SELECT public.cdf(); SELECT public.cdf(); SET kingres_shard.count_distinct_mode = 'approximate'; SELECT public.cdf(); SET kingres_shard.count_distinct_mode = 'exact'; SELECT public.cdf();");
+	is(join(',', split /\s+/, $out), "$exact_id,$exact_id,$exact_id,$approx_id,$exact_id", 'a plpgsql function follows the setting too');
+	# the error rate is part of the plan
+	($rc, $out, $err) = run_sql($n1, $cached . "SET kingres_shard.count_distinct_mode = 'approximate'; EXECUTE pq; SET kingres_shard.count_distinct_error_rate = 0.005; EXECUTE pq;");
+	my @v = split /\s+/, $out;
+	is($v[1], one("SELECT $K.approx_count_distinct(id, 16) FROM public.ev"), 'a change of the error rate drops the cached plan too');
+	qs($n1, 'DROP FUNCTION public.cdf()');
+}
+
+# one shard group: the answer does not depend on the number of groups (review P12S-06)
+{
+	my ($s1) = make_cluster('cd1', 1);
+	$s1->safe_psql('postgres', q{
+		CREATE EXTENSION kingres_sketch;
+		CREATE TABLE public.one (id int PRIMARY KEY, u int);
+		INSERT INTO public.one SELECT g, g % 500 FROM generate_series(1, 5000) g;
+		SELECT kingres.create_distributed_table('public.one', 'id', bucket_count => 4);
+	});
+	my ($rc, $out, $err) = run_sql($s1, "SET kingres_shard.count_distinct_mode = 'approximate'; EXPLAIN (VERBOSE, COSTS OFF) SELECT count(DISTINCT u) FROM public.one");
+	like($out, qr/approx_count_distinct/, 'with one shard group the statement is rewritten too');
+	is($s1->safe_psql('postgres', "SET kingres_shard.count_distinct_mode = 'approximate'; SELECT count(DISTINCT u) FROM public.one"),
+		$s1->safe_psql('postgres', "SELECT $K.approx_count_distinct(u, 14) FROM public.one"), '... and gives the number of the sketch');
+}
+
 # kingres_shard.shippable_extensions = none: the sketch may not be used, so the setting does nothing either
 {
 	my ($rc, $out, $err) = run_sql($n1, $A . "SET kingres_shard.shippable_extensions = 'none'; SELECT count(DISTINCT u) FROM public.ev");

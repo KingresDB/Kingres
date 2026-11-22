@@ -1578,6 +1578,7 @@ kingres_add_node_body(PG_FUNCTION_ARGS)
 		kingres_shard_fault_point("add_node_staged");
 		kc = kingres_shard_get_conn(host, port, false, NULL);
 		kingres_shard_begin_write_xact(kc);
+		kc->new_node = true;
 		check_acl_roles_on_node(kc, host, port);
 		res = kingres_shard_exec(kc, "CREATE EXTENSION IF NOT EXISTS kingres_shard");
 		PQclear(res);

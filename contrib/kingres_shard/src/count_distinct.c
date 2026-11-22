@@ -34,15 +34,19 @@
 #include "access/transam.h"
 #include "catalog/dependency.h"
 #include "catalog/pg_aggregate.h"
+#include "catalog/pg_namespace_d.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "commands/extension.h"
+#include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/parse_func.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
+#include "utils/acl.h"
 #include "utils/lsyscache.h"
+#include "utils/plancache.h"
 #include "utils/typcache.h"
 
 #include "catalog.h"
@@ -65,12 +69,84 @@ static const struct config_enum_entry count_distinct_modes[] = {
 typedef struct CdContext
 {
 	const KsCatalog *cat;
-	Oid			fnoid;			/* approx_count_distinct(anyelement, int) */
+	Oid			fnoid;			/* approx_count_distinct(anyelement, int), resolved when the first eligible aggregate is met */
+	bool		resolved;
+	bool		usable;
 	int			precision;
 	int			nrewritten;
 } CdContext;
 
 static bool warned_missing = false;
+static bool warned_privilege = false;
+
+/*
+ * The function of the rewrite, looked up when the first eligible count(DISTINCT) is met, never for a statement that has none (P12S-01):
+ * an ordinary role must not be locked out of the database by a setting.  The role needs USAGE on the schema of kingres_sketch and EXECUTE
+ * on the aggregate; without either, or without the extension at a version that is accepted, the statement stays exact and one warning
+ * is raised for the session.
+ */
+static bool
+cd_resolve(CdContext *cx)
+{
+	Oid			argtypes[2] = {ANYELEMENTOID, INT4OID};
+	Oid			extoid;
+	Oid			nspoid;
+
+	if (cx->resolved)
+		return cx->usable;
+	cx->resolved = true;
+	cx->usable = false;
+	extoid = get_extension_oid(KS_SKETCH_EXTENSION, true);
+	if (!OidIsValid(extoid) || !kingres_shard_extension_usable(KS_SKETCH_EXTENSION))
+	{
+		if (!warned_missing)
+		{
+			warned_missing = true;
+			ereport(WARNING,
+					(errmsg("count_distinct_mode is approximate but kingres_sketch is not installed in this database, or its version is not one that kingres_shard accepts"),
+					 errhint("count(DISTINCT x) stays exact.")));
+		}
+		return false;
+	}
+	nspoid = get_extension_schema(extoid);
+	if (object_aclcheck(NamespaceRelationId, nspoid, GetUserId(), ACL_USAGE) == ACLCHECK_OK)
+	{
+		cx->fnoid = LookupFuncName(list_make2(makeString(get_namespace_name(nspoid)), makeString("approx_count_distinct")),
+								   2, argtypes, true);
+		if (OidIsValid(cx->fnoid) && getExtensionOfObject(ProcedureRelationId, cx->fnoid) != extoid)
+			cx->fnoid = InvalidOid;
+		if (OidIsValid(cx->fnoid) && object_aclcheck(ProcedureRelationId, cx->fnoid, GetUserId(), ACL_EXECUTE) != ACLCHECK_OK)
+			cx->fnoid = InvalidOid;
+	}
+	if (!OidIsValid(cx->fnoid))
+	{
+		if (!warned_privilege)
+		{
+			warned_privilege = true;
+			ereport(WARNING,
+					(errmsg("count_distinct_mode is approximate but this role may not use kingres_sketch (it needs USAGE on its schema and EXECUTE on approx_count_distinct)"),
+					 errhint("count(DISTINCT x) stays exact for this role.")));
+		}
+		return false;
+	}
+	cx->usable = true;
+	return true;
+}
+
+/* a cached plan was made with the setting that was in force: a change of the setting, in either direction, drops the cached plans (P12S-02) */
+static void
+assign_count_distinct_mode(int newval, void *extra)
+{
+	if (newval != kingres_shard_count_distinct_mode)
+		ResetPlanCache();
+}
+
+static void
+assign_count_distinct_error_rate(double newval, void *extra)
+{
+	if (newval != kingres_shard_count_distinct_error_rate)
+		ResetPlanCache();
+}
 
 void
 kingres_shard_count_distinct_init(void)
@@ -82,14 +158,14 @@ kingres_shard_count_distinct_init(void)
 							 KS_COUNT_DISTINCT_EXACT,
 							 count_distinct_modes,
 							 PGC_USERSET, 0,
-							 NULL, NULL, NULL);
+							 NULL, assign_count_distinct_mode, NULL);
 	DefineCustomRealVariable("kingres_shard.count_distinct_error_rate",
 							 "The relative standard error asked of count_distinct_mode = approximate.",
 							 "The precision of the sketch is the smallest p from 4 to 18 with 1.04 / sqrt(2^p) not above this rate: 0.01 gives p = 14, 0.005 gives p = 16.",
 							 &kingres_shard_count_distinct_error_rate,
 							 0.01, 0.0005, 0.1,
 							 PGC_USERSET, 0,
-							 NULL, NULL, NULL);
+							 NULL, assign_count_distinct_error_rate, NULL);
 }
 
 /* The precision of a sketch with at most this relative standard error. */
@@ -148,9 +224,15 @@ agg_mutator(Node *node, void *context)
 		return NULL;
 	if (IsA(node, Aggref) && agg_eligible((Aggref *) node, &argtype))
 	{
-		Aggref	   *n = (Aggref *) copyObject(node);
-		TargetEntry *te = (TargetEntry *) copyObject(linitial(n->args));
-		Const	   *p = makeConst(INT4OID, -1, InvalidOid, sizeof(int32), Int32GetDatum(cx->precision), false, true);
+		Aggref	   *n;
+		TargetEntry *te;
+		Const	   *p;
+
+		if (!cd_resolve(cx))
+			return node;			/* stays exact */
+		n = (Aggref *) copyObject(node);
+		te = (TargetEntry *) copyObject(linitial(n->args));
+		p = makeConst(INT4OID, -1, InvalidOid, sizeof(int32), Int32GetDatum(cx->precision), false, true);
 
 		te->ressortgroupref = 0;	/* it named the DISTINCT clause, which is gone */
 		n->aggfnoid = cx->fnoid;
@@ -221,33 +303,14 @@ int
 kingres_shard_apply_count_distinct(Query *parse, const KsCatalog *cat)
 {
 	CdContext	cx;
-	Oid			argtypes[2] = {ANYELEMENTOID, INT4OID};
-	Oid			extoid;
 
 	if (kingres_shard_count_distinct_mode != KS_COUNT_DISTINCT_APPROXIMATE ||
 		cat == NULL || !cat->present || cat->dist_tables == NULL)
 		return 0;
 
-	extoid = get_extension_oid(KS_SKETCH_EXTENSION, true);
 	cx.fnoid = InvalidOid;
-	if (OidIsValid(extoid) && kingres_shard_extension_usable(KS_SKETCH_EXTENSION))
-	{
-		cx.fnoid = LookupFuncName(list_make2(makeString(KS_SKETCH_EXTENSION), makeString("approx_count_distinct")),
-								  2, argtypes, true);
-		if (OidIsValid(cx.fnoid) && getExtensionOfObject(ProcedureRelationId, cx.fnoid) != extoid)
-			cx.fnoid = InvalidOid;
-	}
-	if (!OidIsValid(cx.fnoid))
-	{
-		if (!warned_missing)
-		{
-			warned_missing = true;
-			ereport(WARNING,
-					(errmsg("count_distinct_mode is approximate but kingres_sketch is not installed in this database, or its version is not one that kingres_shard accepts"),
-					 errhint("count(DISTINCT x) stays exact.")));
-		}
-		return 0;
-	}
+	cx.resolved = false;
+	cx.usable = false;
 	cx.cat = cat;
 	cx.precision = kingres_shard_count_distinct_precision(kingres_shard_count_distinct_error_rate);
 	cx.nrewritten = 0;

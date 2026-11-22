@@ -70,6 +70,48 @@ SELECT COALESCE((SELECT pg_catalog.format(' USING %I', a.amname)
 $$;
 REVOKE ALL ON FUNCTION kingres.internal_am_clause(regclass) FROM PUBLIC;
 
+-- ---------------------------------------------------------------------------
+-- The options of a columnar table are carried (review P12S-03)
+-- ---------------------------------------------------------------------------
+
+-- The options that kingres_columnar keeps for a table (compression, level, rows per stripe, rows per chunk) as the arguments of
+-- columnar_set_options(): "'zstd', 3, 150000, 10000".  For a partitioned table the options of its first columnar leaf (by name) on this node.
+-- NULL when the table is not columnar, kingres_columnar is not installed, or no such leaf is here.
+CREATE FUNCTION kingres.internal_columnar_args(p_relid regclass)
+    RETURNS pg_catalog.text
+    LANGUAGE plpgsql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_rel  pg_catalog.regclass := p_relid;
+    v_kind pg_catalog."char";
+    v_out  pg_catalog.text;
+BEGIN
+    IF pg_catalog.to_regprocedure('kingres.columnar_options(regclass)') IS NULL THEN
+        RETURN NULL;
+    END IF;
+    SELECT c.relkind INTO v_kind FROM pg_catalog.pg_class c WHERE c.oid OPERATOR(pg_catalog.=) p_relid::pg_catalog.oid;
+    IF v_kind OPERATOR(pg_catalog.=) 'p' THEN
+        SELECT c.oid::pg_catalog.regclass INTO v_rel
+          FROM pg_catalog.pg_partition_tree(p_relid) pt
+          JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) pt.relid
+          JOIN pg_catalog.pg_am a ON a.oid OPERATOR(pg_catalog.=) c.relam
+         WHERE pt.isleaf AND a.amname OPERATOR(pg_catalog.=) 'columnar'
+         ORDER BY c.relname LIMIT 1;
+        IF NOT FOUND THEN
+            RETURN NULL;
+        END IF;
+    ELSIF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_am a ON a.oid OPERATOR(pg_catalog.=) c.relam
+                       WHERE c.oid OPERATOR(pg_catalog.=) p_relid::pg_catalog.oid AND a.amname OPERATOR(pg_catalog.=) 'columnar') THEN
+        RETURN NULL;
+    END IF;
+    EXECUTE 'SELECT pg_catalog.format(''%L, %s, %s, %s'', o.compression, o.compression_level, o.stripe_row_count, o.chunk_row_count) FROM kingres.columnar_options($1) o'
+       INTO v_out USING v_rel;
+    RETURN v_out;
+END;
+$$;
+REVOKE ALL ON FUNCTION kingres.internal_columnar_args(regclass) FROM PUBLIC;
+
 -- internal_table_ddl(): the statement that makes the table (and its shadow) names the access method.
 CREATE OR REPLACE FUNCTION kingres.internal_table_ddl(p_relid regclass, p_column name, p_shadow bool DEFAULT false)
     RETURNS TABLE (ord pg_catalog.int4, scope pg_catalog.text, stmt pg_catalog.text)
@@ -194,6 +236,13 @@ BEGIN
         stmt := format('CREATE TABLE %s (%s) PARTITION BY HASH (%I)%s', qtarget, coldefs, p_column, kingres.internal_am_clause(p_relid));
     END IF;
     RETURN NEXT;
+    -- the options of a columnar table (compression, stripe and chunk size) are kept for a plain table; the bucket partitions of a distributed
+    -- table get theirs from the script that makes them
+    IF p_column IS NULL AND kingres.internal_columnar_args(p_relid) IS NOT NULL THEN
+        n := n + 1; ord := n; scope := 'both';
+        stmt := format('SELECT kingres.columnar_set_options(%L::pg_catalog.regclass, %s)', qtarget, kingres.internal_columnar_args(p_relid));
+        RETURN NEXT;
+    END IF;
 
     -- The identity columns of the new table: their sequences get the old names and
     -- the values the rows need.
@@ -426,7 +475,7 @@ $$;
 -- keep the storage they had.
 DROP FUNCTION kingres.internal_partition_layout(regclass);
 CREATE FUNCTION kingres.internal_partition_layout(p_relid regclass)
-    RETURNS TABLE (partby pg_catalog.text, ord pg_catalog.int4, name pg_catalog.name, bound pg_catalog.text, am pg_catalog.name)
+    RETURNS TABLE (partby pg_catalog.text, ord pg_catalog.int4, name pg_catalog.name, bound pg_catalog.text, am pg_catalog.name, opts pg_catalog.text)
     LANGUAGE sql STABLE
     SET search_path = pg_catalog, kingres, pg_temp
     AS $$
@@ -434,7 +483,8 @@ SELECT pg_catalog.pg_get_partkeydef(p_relid::pg_catalog.oid),
        (pg_catalog.row_number() OVER (ORDER BY pc.relname))::pg_catalog.int4,
        pc.relname,
        pg_catalog.regexp_replace(pg_catalog.pg_get_expr(pc.relpartbound, pc.oid), '^FOR VALUES ', ''),
-       COALESCE((SELECT a.amname FROM pg_catalog.pg_am a WHERE a.oid OPERATOR(pg_catalog.=) pc.relam), 'heap'::pg_catalog.name)
+       COALESCE((SELECT a.amname FROM pg_catalog.pg_am a WHERE a.oid OPERATOR(pg_catalog.=) pc.relam), 'heap'::pg_catalog.name),
+       kingres.internal_columnar_args(pc.oid::pg_catalog.regclass)
   FROM pg_catalog.pg_inherits i
   JOIN pg_catalog.pg_class pc ON pc.oid OPERATOR(pg_catalog.=) i.inhrelid
  WHERE i.inhparent OPERATOR(pg_catalog.=) p_relid::pg_catalog.oid
@@ -629,18 +679,26 @@ BEGIN
             END IF;
             -- S3: a relation that is not heap moves when its changes can be decoded: the copy is made with its access method (the
             -- answer carries it), the initial copy is the stripe-wise COPY and the changes are the decoded inserts of kingres_columnar 0.2.
+            -- every relation of the tree is looked at, not the first: one that is neither heap nor columnar stops the move
             SELECT pg_catalog.format('%I.%I', ln.nspname, lc.relname), a.amname INTO v_columnar, v_amname
               FROM pg_catalog.pg_partition_tree(v_oid) pt
               JOIN pg_catalog.pg_class lc ON lc.oid OPERATOR(pg_catalog.=) pt.relid
               JOIN pg_catalog.pg_namespace ln ON ln.oid OPERATOR(pg_catalog.=) lc.relnamespace
               JOIN pg_catalog.pg_am a ON a.oid OPERATOR(pg_catalog.=) lc.relam
-             WHERE lc.relkind OPERATOR(pg_catalog.=) 'r' AND a.amname OPERATOR(pg_catalog.<>) 'heap'
+             WHERE lc.relkind OPERATOR(pg_catalog.=) 'r' AND a.amname OPERATOR(pg_catalog.<>) 'heap' AND a.amname OPERATOR(pg_catalog.<>) 'columnar'
              ORDER BY lc.relname LIMIT 1;
             IF v_columnar IS NOT NULL THEN
-                IF v_amname OPERATOR(pg_catalog.<>) 'columnar' THEN
-                    RAISE EXCEPTION 'bucket move refused: relation "%" uses the access method "%", which a bucket move does not carry', v_columnar, v_amname
-                        USING ERRCODE = '0A000';
-                END IF;
+                RAISE EXCEPTION 'bucket move refused: relation "%" uses the access method "%", which a bucket move does not carry', v_columnar, v_amname
+                    USING ERRCODE = '0A000';
+            END IF;
+            SELECT pg_catalog.format('%I.%I', ln.nspname, lc.relname) INTO v_columnar
+              FROM pg_catalog.pg_partition_tree(v_oid) pt
+              JOIN pg_catalog.pg_class lc ON lc.oid OPERATOR(pg_catalog.=) pt.relid
+              JOIN pg_catalog.pg_namespace ln ON ln.oid OPERATOR(pg_catalog.=) lc.relnamespace
+              JOIN pg_catalog.pg_am a ON a.oid OPERATOR(pg_catalog.=) lc.relam
+             WHERE lc.relkind OPERATOR(pg_catalog.=) 'r' AND a.amname OPERATOR(pg_catalog.=) 'columnar'
+             ORDER BY lc.relname LIMIT 1;
+            IF v_columnar IS NOT NULL THEN
                 SELECT e.extversion INTO v_colver FROM pg_catalog.pg_extension e WHERE e.extname OPERATOR(pg_catalog.=) 'kingres_columnar';
                 IF v_colver IS NULL OR pg_catalog.string_to_array(v_colver, '.')::pg_catalog.int4[] OPERATOR(pg_catalog.<) ARRAY[0, 2] THEN
                     RAISE EXCEPTION 'bucket move refused: relation "%" has columnar storage, and the installed kingres_columnar cannot decode its changes', v_columnar
@@ -665,7 +723,7 @@ BEGIN
             v_out := v_out OPERATOR(pg_catalog.||) (pg_catalog.jsonb_build_object(
                 'schema_name', t.schema_name, 'table_name', t.table_name, 'replident', v_ident)
                 OPERATOR(pg_catalog.||) kingres.internal_move_tree(v_oid)
-                OPERATOR(pg_catalog.||) CASE WHEN v_bam IS NULL THEN '{}'::pg_catalog.jsonb ELSE pg_catalog.jsonb_build_object('am', v_bam) END);
+                OPERATOR(pg_catalog.||) CASE WHEN v_bam IS NULL THEN '{}'::pg_catalog.jsonb ELSE pg_catalog.jsonb_build_object('am', v_bam, 'opts', kingres.internal_columnar_args(v_oid::pg_catalog.regclass)) END);
         ELSE
             IF v_oid IS NOT NULL THEN
                 RAISE EXCEPTION 'relation "%.%" already exists on node %', t.schema_name, v_part, v_node
@@ -881,6 +939,25 @@ BEGIN
 END;
 $$;
 
+-- internal_move_tree(): the answer for a user-partitioned bucket also carries the columnar options of each leaf.
+CREATE OR REPLACE FUNCTION kingres.internal_move_tree(p_oid oid)
+    RETURNS jsonb
+    LANGUAGE sql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+SELECT pg_catalog.jsonb_build_object('reloptions', pg_catalog.to_jsonb(kingres.internal_table_options(c.oid))) OPERATOR(pg_catalog.||) CASE WHEN c.relkind OPERATOR(pg_catalog.=) 'p'
+            THEN pg_catalog.jsonb_build_object(
+                     'partby', pg_catalog.pg_get_partkeydef(c.oid),
+                     'leaves', COALESCE((SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+                                                'name', lc.relname, 'bound', pg_catalog.pg_get_expr(lc.relpartbound, lc.oid), 'am', COALESCE(a.amname, 'heap'), 'opts', kingres.internal_columnar_args(lc.oid::pg_catalog.regclass))
+                                            ORDER BY lc.relname)
+                                           FROM pg_catalog.pg_inherits i JOIN pg_catalog.pg_class lc ON lc.oid OPERATOR(pg_catalog.=) i.inhrelid
+                                           LEFT JOIN pg_catalog.pg_am a ON a.oid OPERATOR(pg_catalog.=) lc.relam
+                                          WHERE i.inhparent OPERATOR(pg_catalog.=) c.oid), '[]'::pg_catalog.jsonb))
+            ELSE '{}'::pg_catalog.jsonb END
+  FROM pg_catalog.pg_class c WHERE c.oid OPERATOR(pg_catalog.=) p_oid;
+$$;
+
 -- S3: internal_create_move_tables(): the copy of a bucket partition is made with the access method of the source partition (design 11.6).
 CREATE OR REPLACE FUNCTION kingres.internal_create_move_tables(p_move bigint, p_bucket int, p_bucket_count int, p_tables jsonb)
     RETURNS void
@@ -896,8 +973,8 @@ DECLARE
     l       pg_catalog.record;
 BEGIN
     PERFORM kingres.internal_require_superuser();
-    FOR t IN SELECT x.schema_name, x.table_name, x.replident, x.partby, x.leaves, x.reloptions, x.am
-               FROM pg_catalog.jsonb_to_recordset(p_tables) AS x(schema_name text, table_name text, replident text, partby text, leaves jsonb, reloptions text[], am text)
+    FOR t IN SELECT x.schema_name, x.table_name, x.replident, x.partby, x.leaves, x.reloptions, x.am, x.opts
+               FROM pg_catalog.jsonb_to_recordset(p_tables) AS x(schema_name text, table_name text, replident text, partby text, leaves jsonb, reloptions text[], am text, opts text)
     LOOP
         v_part := kingres.internal_bucket_part_name(t.table_name, p_bucket);
         v_parent := pg_catalog.format('%I.%I', t.schema_name, t.table_name)::pg_catalog.regclass;
@@ -913,13 +990,19 @@ BEGIN
                                   CASE WHEN t.partby IS NOT NULL THEN ' PARTITION BY ' OPERATOR(pg_catalog.||) t.partby ELSE '' END,
                                   CASE WHEN t.am IS NOT NULL THEN pg_catalog.format(' USING %I', t.am) ELSE '' END,
                                   kingres.internal_with_clause(t.reloptions));
+        IF t.opts IS NOT NULL AND t.partby IS NULL THEN
+            EXECUTE pg_catalog.format('SELECT kingres.columnar_set_options(%L::pg_catalog.regclass, %s)', pg_catalog.format('%I.%I', t.schema_name, v_part), t.opts);
+        END IF;
         IF t.partby IS NOT NULL THEN
             -- a user-partitioned bucket partition: the copy is the same tree, a leaf per user partition with its bound and its access method
-            FOR l IN SELECT y.name, y.bound, y.am FROM pg_catalog.jsonb_to_recordset(t.leaves) AS y(name text, bound text, am text) ORDER BY y.name LOOP
+            FOR l IN SELECT y.name, y.bound, y.am, y.opts FROM pg_catalog.jsonb_to_recordset(t.leaves) AS y(name text, bound text, am text, opts text) ORDER BY y.name LOOP
                 EXECUTE pg_catalog.format('CREATE TABLE %I.%I PARTITION OF %I.%I %s USING %I', t.schema_name, l.name, t.schema_name, v_part, l.bound, l.am);
                 IF l.am OPERATOR(pg_catalog.<>) 'heap' THEN
                     -- a leaf that is not heap names its rows for a later move the way the bucket partitions of the table do
                     EXECUTE pg_catalog.format('ALTER TABLE %I.%I REPLICA IDENTITY FULL', t.schema_name, l.name);
+                END IF;
+                IF l.opts IS NOT NULL THEN
+                    EXECUTE pg_catalog.format('SELECT kingres.columnar_set_options(%L::pg_catalog.regclass, %s)', pg_catalog.format('%I.%I', t.schema_name, l.name), l.opts);
                 END IF;
             END LOOP;
         END IF;

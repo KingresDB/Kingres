@@ -29,6 +29,7 @@ qs($n1, q{
 	    FROM generate_series(1, 3000) g;
 	CREATE TABLE public.hh (id int PRIMARY KEY, v text);
 	INSERT INTO public.hh SELECT g, 'h' || g FROM generate_series(1, 500) g;
+	SELECT kingres.columnar_set_options('public.cc', compression => 'none', stripe_row_count => 30000, chunk_row_count => 7000);
 	SELECT kingres.create_distributed_table('public.cc', 'id', bucket_count => 4);
 	SELECT kingres.create_distributed_table('public.hh', 'id', colocate_with => 'public.cc');
 });
@@ -36,6 +37,11 @@ my $C = qs($n1, "SELECT colocation_id FROM kingres.dist_table WHERE relid = 'pub
 sub group_of { my ($c, $b) = @_; return qs($n1, "SELECT group_id FROM kingres.bucket_map WHERE colocation_id = $c AND bucket = $b"); }
 sub node_of { my ($g) = @_; return $g == 0 ? $n1 : $n2; }
 sub digest { my ($t) = @_; return qs($n1, "SELECT count(*) || ':' || md5(string_agg(x::text, '|' ORDER BY id)) FROM public.$t x"); }
+sub opts_of
+{
+	my ($n, $part) = @_;
+	return qs($n, qq{SELECT o.compression || '/' || o.stripe_row_count || '/' || o.chunk_row_count FROM kingres.columnar_options('public.$part') o});
+}
 sub part_state
 {
 	my ($n, $part) = @_;
@@ -55,6 +61,7 @@ my ($rc, $out, $err) = run_sql($n1, "SELECT kingres.move_bucket($C, 1, $dst)");
 is($rc, 0, 'move_bucket of a bucket of a columnar and a heap table') or diag($err);
 is(group_of($C, 1), $dst, 'the bucket is on the other group');
 is(part_state(node_of($dst), 'cc_b0001'), 'columnar/f/true', 'the copy is columnar, with REPLICA IDENTITY FULL, attached');
+is(opts_of(node_of($dst), 'cc_b0001'), 'none/30000/7000', 'the copy has the options of the source partition (review P12S-03)');
 is(part_state(node_of($dst), 'hh_b0001'), 'heap/d/true', 'the heap table of the group moved as a heap table');
 is(digest('cc'), $cc0, 'the columnar table is whole: the same rows, byte for byte, from node 1');
 is(digest('hh'), $hh0, 'the heap table is whole');
@@ -99,6 +106,7 @@ qs($n1, 'SELECT kingres.cleanup_moved_buckets(true)');
 qs($n1, q{
 	CREATE TABLE public.up (id int, d date, v text, PRIMARY KEY (id, d)) PARTITION BY RANGE (d);
 	CREATE TABLE public.up_old PARTITION OF public.up FOR VALUES FROM ('2020-01-01') TO ('2021-01-01') USING columnar;
+	SELECT kingres.columnar_set_options('public.up_old', compression => 'none', stripe_row_count => 40000, chunk_row_count => 3000);
 	CREATE TABLE public.up_new PARTITION OF public.up FOR VALUES FROM ('2021-01-01') TO ('2022-01-01');
 	INSERT INTO public.up SELECT g, CASE WHEN g % 2 = 0 THEN '2020-06-01'::date ELSE '2021-06-01'::date END + (g % 200), 'u' || g FROM generate_series(1, 600) g;
 	SELECT kingres.create_distributed_table('public.up', 'id', bucket_count => 5);
@@ -110,6 +118,7 @@ my $ufrom = group_of($U, 0);
 is($rc, 0, 'move_bucket of a user-partitioned bucket with a columnar leaf') or diag($err);
 is(group_of($U, 0), 1 - $ufrom, 'the bucket moved');
 is(part_state(node_of(1 - $ufrom), 'up_old_b0000'), 'columnar/f/true', 'the columnar leaf arrived columnar');
+is(opts_of(node_of(1 - $ufrom), 'up_old_b0000'), 'none/40000/3000', 'the columnar leaf has the options of its source leaf');
 is(part_state(node_of(1 - $ufrom), 'up_new_b0000'), 'heap/d/true', 'the heap leaf arrived heap');
 is(digest('up'), $up0, 'the user-partitioned table is whole');
 qs($n1, 'SELECT kingres.cleanup_moved_buckets(true)');

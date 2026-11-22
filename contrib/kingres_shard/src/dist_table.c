@@ -255,7 +255,7 @@ kingres_shard_remote_fk_script(Oid relid, const char *column)
 void
 kingres_shard_append_partitions(StringInfo buf, const char *nsp, const char *prefix, const char *parent,
 				  const KsColocation *coloc, int group, const char *with_clause,
-				  bool replica_full)
+				  bool replica_full, const char *columnar_args)
 {
 	int			i;
 
@@ -275,6 +275,9 @@ kingres_shard_append_partitions(StringInfo buf, const char *nsp, const char *pre
 		/* a bucket partition of another storage than heap has no primary key to name its rows in a move: REPLICA IDENTITY FULL (it never sees an UPDATE or a DELETE) */
 		if (replica_full)
 			appendStringInfo(buf, "ALTER TABLE %s.%s REPLICA IDENTITY FULL;\n", quote_identifier(nsp), quote_identifier(part));
+		if (columnar_args != NULL)
+			appendStringInfo(buf, "SELECT " KINGRES_SHARD_SCHEMA ".columnar_set_options(%s::pg_catalog.regclass, %s);\n",
+							 quote_literal_cstr(psprintf("%s.%s", quote_identifier(nsp), quote_identifier(part))), columnar_args);
 		pfree(part);
 	}
 }
@@ -304,6 +307,29 @@ kingres_shard_with_clause(Oid relid, char **reloptions_literal, MemoryContext cx
 		result = pstrdup("");
 	if (reloptions_literal != NULL)
 		*reloptions_literal = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
+	MemoryContextSwitchTo(old);
+	return result;
+}
+
+/*
+ * columnar_args
+ *
+ * The arguments of kingres.columnar_set_options() that carry the options of a columnar table (compression, level, rows per stripe and
+ * per chunk) to the bucket partitions made from it, or NULL when the table has none (review P12S-03).  Needs an SPI connection.
+ */
+char *
+kingres_shard_columnar_args(Oid relid, MemoryContext cxt)
+{
+	Oid			argtypes[1] = {OIDOID};
+	Datum		values[1];
+	char	   *result;
+	MemoryContext old;
+
+	values[0] = ObjectIdGetDatum(relid);
+	kingres_shard_run_spi("SELECT " KINGRES_SHARD_SCHEMA ".internal_columnar_args($1::pg_catalog.oid::pg_catalog.regclass)",
+						  1, argtypes, values);
+	old = MemoryContextSwitchTo(cxt);
+	result = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
 	MemoryContextSwitchTo(old);
 	return result;
 }
@@ -339,7 +365,7 @@ kingres_shard_uses_non_heap_am(Oid relid)
 void
 kingres_shard_append_partition_tree(StringInfo buf, const char *nsp, const char *prefix, const char *parent,
 									const KsColocation *coloc, int group, const char *partby,
-									List *leafnames, List *leafbounds, List *leafams)
+									List *leafnames, List *leafbounds, List *leafams, List *leafopts)
 {
 	int			i;
 
@@ -350,6 +376,7 @@ kingres_shard_append_partition_tree(StringInfo buf, const char *nsp, const char 
 		ListCell   *ln;
 		ListCell   *lb;
 		ListCell   *la;
+		ListCell   *lo;
 
 		if (kingres_shard_bucket_group(coloc, b) != group)
 			continue;
@@ -359,7 +386,7 @@ kingres_shard_append_partition_tree(StringInfo buf, const char *nsp, const char 
 						 quote_identifier(nsp), quote_identifier(part),
 						 quote_identifier(nsp), quote_identifier(parent),
 						 kingres_shard_bucket_modulus(coloc, b), b, partby);
-		forthree(ln, leafnames, lb, leafbounds, la, leafams)
+		forfour(ln, leafnames, lb, leafbounds, la, leafams, lo, leafopts)
 		{
 			char	   *leaf = psprintf("%s_b%04d", (char *) lfirst(ln), b);
 			const char *am = (const char *) lfirst(la);
@@ -373,6 +400,9 @@ kingres_shard_append_partition_tree(StringInfo buf, const char *nsp, const char 
 			if (strcmp(am, "heap") != 0)
 				appendStringInfo(buf, "ALTER TABLE %s.%s REPLICA IDENTITY FULL;\n",
 								 quote_identifier(nsp), quote_identifier(leaf));
+			if (lfirst(lo) != NULL)
+				appendStringInfo(buf, "SELECT " KINGRES_SHARD_SCHEMA ".columnar_set_options(%s::pg_catalog.regclass, %s);\n",
+								 quote_literal_cstr(psprintf("%s.%s", quote_identifier(nsp), quote_identifier(leaf))), (char *) lfirst(lo));
 			pfree(leaf);
 		}
 		pfree(part);
@@ -643,6 +673,8 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 	List	   *leafnames = NIL;
 	List	   *leafbounds = NIL;
 	List	   *leafams = NIL;
+	List	   *leafopts = NIL;
+	char	   *columnar_args = NULL;
 	bool		replica_full;
 	int64		nread = 0;
 	int64		nacked = 0;
@@ -762,7 +794,7 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 	 */
 	argtypes[0] = OIDOID;
 	values[0] = ObjectIdGetDatum(relid);
-	kingres_shard_run_spi("SELECT partby, name::pg_catalog.text, bound, am::pg_catalog.text FROM " KINGRES_SHARD_SCHEMA
+	kingres_shard_run_spi("SELECT partby, name::pg_catalog.text, bound, am::pg_catalog.text, opts FROM " KINGRES_SHARD_SCHEMA
 						  ".internal_partition_layout($1::pg_catalog.oid::pg_catalog.regclass) ORDER BY ord",
 						  1, argtypes, values);
 	{
@@ -775,6 +807,7 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 			leafnames = lappend(leafnames, SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2));
 			leafbounds = lappend(leafbounds, SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 3));
 			leafams = lappend(leafams, SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 4));
+			leafopts = lappend(leafopts, SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 5));
 		}
 		if (partby == NULL && get_rel_relkind(relid) == RELKIND_PARTITIONED_TABLE)
 		{
@@ -794,6 +827,7 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 
 	/* a table of another storage than heap: its bucket partitions get REPLICA IDENTITY FULL */
 	replica_full = kingres_shard_uses_non_heap_am(relid);
+	columnar_args = replica_full ? kingres_shard_columnar_args(relid, callercxt) : NULL;
 
 	/* The storage parameters of the table: the bucket partitions get them (a partitioned table cannot have them). */
 	with_clause = kingres_shard_with_clause(relid, &reloptions, callercxt);
@@ -814,9 +848,9 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 	resetStringInfo(&script);
 	appendStringInfoString(&script, ddl.both.data);
 	if (partby != NULL)
-		kingres_shard_append_partition_tree(&script, nspname, relname, shadow, placement, local_group, partby, leafnames, leafbounds, leafams);
+		kingres_shard_append_partition_tree(&script, nspname, relname, shadow, placement, local_group, partby, leafnames, leafbounds, leafams, leafopts);
 	else
-		kingres_shard_append_partitions(&script, nspname, relname, shadow, placement, local_group, with_clause, replica_full);
+		kingres_shard_append_partitions(&script, nspname, relname, shadow, placement, local_group, with_clause, replica_full, columnar_args);
 	kingres_shard_run_spi(script.data, 0, NULL, NULL);
 
 	/*
@@ -837,9 +871,9 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 		appendStringInfoString(&script, ddl.remote_pre.data);
 		appendStringInfoString(&script, ddl.both.data);
 		if (partby != NULL)
-			kingres_shard_append_partition_tree(&script, nspname, relname, shadow, placement, n->group_id, partby, leafnames, leafbounds, leafams);
+			kingres_shard_append_partition_tree(&script, nspname, relname, shadow, placement, n->group_id, partby, leafnames, leafbounds, leafams, leafopts);
 		else
-			kingres_shard_append_partitions(&script, nspname, relname, shadow, placement, n->group_id, with_clause, replica_full);
+			kingres_shard_append_partitions(&script, nspname, relname, shadow, placement, n->group_id, with_clause, replica_full, columnar_args);
 		kingres_shard_exec_on_node(kc, script.data);
 	}
 	kingres_shard_fault_point("distribute_after_shadow");
