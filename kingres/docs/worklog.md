@@ -7,6 +7,62 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-22: phase 11 (distributed schemas) steps 12 to 15: the scale work, the control plane, the panel and the documentation
+
+Covers the work on branch shard-p1011 after the second review of phase 11 (the review fixes of 2026-11-21 are in the entry of that day).
+
+### What was done
+
+- **Step 12, the scale work** (`contrib/kingres_shard`).  The measurements of `t/245` (2000 schemas of 5 tables) showed three growths and a failure; each is fixed and measured (design notes, "Step 12"):
+  the catalog cache of a backend makes the entry of a schema table or schema when a statement asks (one index scan, "not a schema table" cached), and colocation groups are found through a hash;
+  the trigger of a catalog change invalidates the tables it touches, not every table (`kingres_shard.catalog_incremental = off`, superuser only, is the fallback, and the third profile of the
+  harness `KS_CATALOG_FULL=1` runs the suite with it); a node applies a whole catalog with one statement per table; `add_node` makes the schemas on the new node before it is registered, in
+  batches of `kingres_shard.add_node_batch_statements` statements, resumable (`kingres.add_node_progress`), and registers it in one last transaction that checks completeness.  At 2000
+  schemas: a DDL statement 52 ms (174), the first statement of a backend 9 to 15 ms (55 to 112), the cache of a backend 0.7 MB (3.3), a routed INSERT 1.2 ms (5.8), `add_node` 39 s in 500
+  batches (it failed for lack of locks).
+- **The review of step 12 (P12R-01 to P12R-07)**, fixed: `split_bucket(verify => 'full')` compares as text (a json, xml or point column has no equality operator, `t/249`); the generated
+  `kingres_shard--0.8.sql` is checked against `mk-install-script.sh` (`t/250`) and was regenerated after the merge of `ext-partfix` (a fresh 0.8 install had its partition blocker back); the lazy
+  lookups take the primary key index from the open table, not an OID kept at load (REINDEX CONCURRENTLY, a renamed or missing index, `t/247`); `add_node` cleans the new node when there is no
+  schema left to make and a missing role is an error of the call (`t/251`); sha256 digests; `catalog_incremental` is `PGC_SUSET`.
+- **Step 13, the control plane** (`kingres/control-plane`, `kingres/api`, contract 0.15.0): five operations (`listSchemas`, `getSchema`, `distributeSchema`, `undistributeSchema`,
+  `moveSchema`), three task kinds (`schema.distribute`, `schema.move`, `schema.undistribute`) with the steps of the design, four problem codes, the database `mode` and
+  `distributeNewSchemas`, colocation `kind`, in-flight moves of kind schema.  The task engine gained `Step.Recover` (a NonIdempotent step reads its own effect when found running),
+  `Env.SetItems` and `Env.CancelRequested`, and migration 0050 makes the schema tasks and a failover exclude each other.  Cluster tests on PostgreSQL 18 and 19: distribute, move with a
+  writer, kill and resume at 17 points, undistribute, rebalance with a schema present.
+- **Step 14, the panel** (`kingres/web`): the create and settings dialogs with Rows, Schemas and Both, the Schemas section of the database page with the Distribute, Move and Make-local
+  dialogs, the Shards and Rebalance pages, the mock API, the generated types for 0.15.0.
+- **Step 15, the documentation**: the section of the extension README ("Distributed schemas", with how to use them and the limits), `kingres/api/README.md`, `kingres/web/README.md`,
+  `kingres/control-plane/README.md` and this entry.
+
+### How it was verified
+
+- `kingres_shard` at the tip of shard-p1011 (clean -Werror builds, regress, every TAP file) on PostgreSQL 18.7 and 19rc2: 48828 tests on 18 and 48794 on 19 (218 files each), in tree: see the
+  integrator's gate for the merged tree.  The files that touch the catalog cache also pass with `KS_CATALOG_FULL=1` (31 files, 4317 tests on each major).
+- Mutants: step 12 (b) six, (a) seven, the apply of a catalog one, the review fixes six; the control plane 30 (17 unit, 13 cluster); the panel 41.  Every one is killed by a named test.
+- Control plane: `go build`, `go vet`, `go test` of ops, httpapi, task and contract pass; the cluster tests pass on both majors; `check-contract.mjs` passes.
+- Panel: lint, type check, `api:check`, build, 1528 unit tests and 58 browser tests.
+
+### Decisions and deviations
+
+- The contract is numbered 0.15.0 because phase 10 holds 0.14.0 on its own branch; the changelog entry counts from 0.13.0 and has to be merged with 0.14.0's at the integration.  Migration 0050
+  may need renumbering the same way.
+- `move_schema` is one blocking call, so the task's copy step holds the call and polls `kingres.bucket_move`; the task ends at `cleaning` with a note (design 13.1).
+- The rebalance preview has no schema units: `kingres.rebalance_plan()` plans buckets only; schema moves show in the moves in flight.
+- The extension's `check_cluster` has no schema checks of its own yet (design 9.10); the verify step of the tasks compares per-node state itself.
+
+### Still open
+
+- Independent reviews of steps 13 to 15.
+- Integration: phase 10's contract (0.14.0), its migration and its scheduler (which would issue schema moves in a rebalance) with this branch.
+- A load that is incremental per colocation group, if 2000 schemas are not enough (the DDL statement still grows from 26 to 52 ms between 200 and 2000 schemas).
+- A flake seen once by the step 13 author: the switch of a move under a running writer timed out on a node and the move was undone; not understood.
+
+### Core patches
+
+None.
+
+---
+
 ## 2026-11-20: automatic failover, the last steps of phase 2b and their review, the second review of phase 9 and its fixes, and two npm alerts
 
 Covers 2026-11-20 from the morning, after the third entry of 2026-11-19.

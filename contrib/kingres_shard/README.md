@@ -2070,6 +2070,37 @@ again.  The tables of a distributed schema are empty shells on the new node: add
 Measured with `t/245_schema_scale_cluster.pl` (three nodes, one machine; the full table is in the design notes): at 2000 schemas of 5 tables a DDL statement takes 52 ms on average (174 ms before step 12), the first statement of a new backend 9 to 15 ms (55 to 112 ms), the cache of a backend 0.7 MB (3.3 MB), a routed single-row INSERT 1.2 ms (5.8 ms), and `add_node` passes in 39 s in 500 batches (it failed for lack of locks); at 200 schemas the cost of a DDL statement is that of the two-phase commit (26 ms, as before).
 
 
+**Using distributed schemas, and what they cannot do (step 15).**
+
+To use them: on the map group primary, `SELECT kingres.set_sharding_mode('schema', true)` (or `'both'`: hash-distributed tables and distributed schemas together), then create a schema per tenant or
+service.  A new schema is placed on the group that holds the fewest schemas for its weight (`kingres_shard.schema_placement_group` or the `group_id` of `distribute_schema` overrides) and its tables are made on
+every node, empty except on the owner.  Connect to any node: a statement on the schema is shipped whole to its owner; a statement that mixes schemas of two owners, local, hash or reference tables is answered by
+the distributed scan.  `kingres.move_schema(schema, group)` moves a schema online; `kingres.distribute_schema(schema)` and `kingres.undistribute_schema(schema)` convert an existing schema in place; the control plane
+(`kingres/control-plane`, contract 0.15.0) and the panel (`kingres/web`) run the same operations as tasks.
+
+Limits of this version:
+
+- DDL on a distributed schema runs on the map group primary only.  Clients that create tenants connect there (the control plane does).
+- A table of a distributed schema is on one group, so a tenant cannot be larger than the disk of one group; a schema cannot be split (the split of phase 10 is for the buckets of hash-distributed tables).
+- Statements that touch two distributed schemas on different groups, a schema and a hash table, or a schema and a local table are answered by the distributed scan: correct, and slow for large inputs
+  (no repartitioning).  There is no global snapshot across groups (the note of phase 2a).
+- A function runs at the origin unless its schema has `ship_functions`; a function that touches another schema from inside a shipped statement raises `KS001`.  `lastval()` and `currval()` are not reliable across a
+  routed statement; a `nextval` with an argument that is not a constant runs where the statement runs.
+- Refused in a distributed schema: materialized views, rules, row-level security and policies, extended statistics, foreign tables, publications, event triggers, operators, aggregates, range types, table
+  inheritance, `CREATE SCHEMA` with elements; unlogged tables cannot be in a schema that is moved.
+- A schema with a ledger table cannot be moved, made local or dropped (`schema_pinned`).
+- The writers of a schema wait during the switch of its move (an attempt of normally tens of milliseconds, at most `move_switch_timeout`); the old copy stays until `move_cleanup_delay` and takes disk space on the
+  source; a move back to a group whose old copy is not yet emptied is refused.  A plan of buckets (`plan_rebalance`, `rebalance_plan`) does not move a schema; the bucket of a schema counts in the load of its
+  group.
+- `kingres_shard.max_distributed_schemas` (default 10000, a guess) bounds the number of schemas; every DDL statement is a two-phase transaction on every node; `add_node` makes the schemas in batches (see
+  "Step 12") and its time grows with the number of objects; a schema that reads a reference table is made in its last transaction.
+- `VACUUM`, `ANALYZE`, `REINDEX` and `CLUSTER` of a schema table act on the node they run on (autovacuum maintains the owner's copy).
+- Roles, tablespaces and extensions are not synchronized (the existing limit): a role that owns a schema or an object in it must exist on every node before the schema is distributed or the node is added.
+- Local helper schemas in a database that distributes by default need a superuser to create them (`SET kingres_shard.distribute_new_schemas = off`).
+- Review P12R-06/07 limits are in the paragraph of step 12 above.
+
+The tests of this phase are `t/230` to `t/251`; the numbers of the measured cost are in the design notes and in the paragraph of step 12.
+
 ## Limitations in phase 2a
 
 Read these first; each is a reviewed boundary, not an accident.
