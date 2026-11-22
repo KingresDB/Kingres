@@ -635,13 +635,21 @@ export function transferHandlers(columnsOf: ColumnsOf): Partial<Record<Operation
       if (cutBreak !== null || cutShort !== null) {
         const cut = Math.min(cutBreak ?? cutShort ?? slice.length, slice.length)
         const fail = cutBreak !== null
+        // The bytes are delivered first and the end (or the failure) comes with the next read: `error()` would
+        // throw away a chunk that is queued and not yet read.
+        let sent = false
         return {
           status,
-          headers,
+          // A stream that ends early without an error is a proxy that cut the body: it has no length to disagree with.
+          headers: fail
+            ? headers
+            : Object.fromEntries(Object.entries(headers).filter(([k]) => k !== 'Content-Length')),
           stream: new ReadableStream<Uint8Array>({
-            start(controller) {
-              controller.enqueue(slice.slice(0, cut))
-              if (fail) controller.error(new TypeError('network error'))
+            pull(controller) {
+              if (!sent) {
+                sent = true
+                controller.enqueue(slice.slice(0, cut))
+              } else if (fail) controller.error(new TypeError('network error'))
               else controller.close()
             },
           }),

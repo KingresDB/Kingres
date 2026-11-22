@@ -11,7 +11,7 @@ import { tickTasks } from '@/mocks/state'
 export const SEGMENT = 65536
 
 /** `length` bytes of printable text (the same every time). */
-export function bytesOf(length: number): Uint8Array {
+export function bytesOf(length: number): Uint8Array<ArrayBuffer> {
   const out = new Uint8Array(length)
   for (let i = 0; i < length; i += 1) out[i] = 97 + (i % 26)
   return out

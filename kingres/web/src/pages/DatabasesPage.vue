@@ -13,6 +13,7 @@ import NotAvailable from '@/components/NotAvailable.vue'
 import SafeName from '@/components/SafeName.vue'
 import { isAddressableSegment } from '@/lib/path-segment'
 import CreateDatabaseDialog from '@/components/CreateDatabaseDialog.vue'
+import TransfersPanel from '@/components/transfers/TransfersPanel.vue'
 import { useDatabaseCreateOptions, useDatabases } from '@/api/queries'
 import { DATABASE_STATUS, DURABILITY_LABEL, LEDGER_MODE_LABEL, LEDGER_STATE } from '@/lib/status'
 import { formatBytes, formatNumber } from '@/lib/format'
@@ -132,6 +133,8 @@ const creating = ref(false)
       </table>
     </TableWrap>
   </QueryBoundary>
+
+  <div style="margin-top: var(--s-5)"><TransfersPanel /></div>
 
   <CreateDatabaseDialog v-if="creating" @close="creating = false" />
 </template>

@@ -16,6 +16,7 @@ import TaskActionDialog from '@/components/TaskActionDialog.vue'
 import EditDatabaseDialog from '@/components/EditDatabaseDialog.vue'
 import DistributeTableDialog from '@/components/DistributeTableDialog.vue'
 import EnableLedgerDialog from '@/components/EnableLedgerDialog.vue'
+import TransfersPanel from '@/components/transfers/TransfersPanel.vue'
 import { endpoints } from '@/api/endpoints'
 import { keys, useDatabase, useTables } from '@/api/queries'
 import { DATABASE_STATUS, DURABILITY_LABEL, LEDGER_MODE_LABEL, LEDGER_STATE } from '@/lib/status'
@@ -263,6 +264,7 @@ const shardingOn = computed(() => db.value?.sharding.enabled === true)
           </p>
         </QueryBoundary>
       </section>
+      <TransfersPanel :database="db.name" />
     </div>
   </QueryBoundary>
 

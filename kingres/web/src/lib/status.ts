@@ -17,6 +17,8 @@ import type {
   ReplicationMember,
   Database,
   ClusterOverview,
+  DataExport,
+  DataUpload,
 } from '@/api/types'
 import { safeText } from './safe-text'
 
@@ -90,6 +92,44 @@ export const TASK_STATE: Record<TaskState, StatusMeta> = tolerant({
   paused: { tone: 'warn', icon: WARN, label: 'Paused' },
   failed: { tone: 'danger', icon: BAD, label: 'Failed' },
   done: { tone: 'ok', icon: OK, label: 'Done' },
+})
+
+/** The state of a staged export file (contract 0.19.0). */
+export const EXPORT_STATE: Record<DataExport['state'], StatusMeta> = tolerant({
+  building: { tone: 'info', icon: HALF, label: 'Being written' },
+  ready: { tone: 'ok', icon: OK, label: 'Ready' },
+  failed: {
+    tone: 'danger',
+    icon: BAD,
+    label: 'Failed',
+    hint: 'The task failed and the partial file was removed.',
+  },
+  expired: {
+    tone: 'neutral',
+    icon: RING,
+    label: 'Expired',
+    hint: 'The retention time has passed; the file is deleted.',
+  },
+  lost: {
+    tone: 'warn',
+    icon: WARN,
+    label: 'Lost',
+    hint: 'The file or its key is gone from the server.',
+  },
+  deleted: { tone: 'neutral', icon: RING, label: 'Deleted' },
+})
+
+/** The state of an upload (contract 0.19.0). */
+export const UPLOAD_STATE: Record<DataUpload['state'], StatusMeta> = tolerant({
+  receiving: { tone: 'info', icon: HALF, label: 'Receiving' },
+  complete: { tone: 'ok', icon: OK, label: 'Complete' },
+  lost: {
+    tone: 'warn',
+    icon: WARN,
+    label: 'Lost',
+    hint: 'The staged file is gone; start a new upload.',
+  },
+  deleted: { tone: 'neutral', icon: RING, label: 'Deleted' },
 })
 
 export const SEVERITY: Record<AlertSeverity, StatusMeta> = tolerant({
