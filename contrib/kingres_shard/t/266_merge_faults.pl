@@ -14,6 +14,8 @@
 #   C. a group that dies in the middle; the origin that dies after the prepare and after its own commit
 #   D. a bucket that moves between the plan and the run, after the first group ran, after every group ran; a prepared statement
 #      planned before a move
+#   E. (review P12M-04) the same faults for the MERGE into a reference table (M4, M5): an error at every point, a cancel, a node that
+#      dies, an origin that dies; nothing is prepared and every node's copy is the state before or the state after
 
 use strict;
 use warnings FATAL => 'all';
@@ -44,6 +46,11 @@ sub setup3
 		INSERT INTO public.src SELECT g, 'v' || g FROM generate_series(1, $ROWS) g;
 		CREATE TABLE public.loc (x int, y text);
 		INSERT INTO public.loc SELECT g, 'v' || g FROM generate_series(1, $ROWS) g;
+		CREATE TABLE public.rsrc (k int PRIMARY KEY, v text);
+		SELECT kingres.create_reference_table('public.rsrc');
+			INSERT INTO public.rsrc VALUES @{[ join(", ", map { "($_, 'v$_')" } (1 .. $ROWS)) ]};
+		CREATE TABLE public.rdst (k int PRIMARY KEY, v text);
+		SELECT kingres.create_reference_table('public.rdst');
 	});
 	$n[0]->safe_psql('postgres', 'SELECT kingres.recover_prepared_transactions()');
 	return @n;
@@ -292,6 +299,118 @@ for my $shape (['colocated', $M1], ['routed', $M3])
 		clean_state(\@m, 'public.dst', $ROWS, "$sname: a prepared statement planned before a move is planned again and works");
 		release_node($_) for @m;
 	}
+}
+
+# ---------------------------------------------------------------------------
+# E. the MERGE into a reference table: the same faults (review P12M-04)
+# ---------------------------------------------------------------------------
+# M4 reads a reference table, M5 reads a local table and ships it to every node.  The statement runs on every node; after any fault
+# every node's copy is the state before (no row) or the state after ($ROWS rows, the same on every node), and nothing is prepared.
+{
+	my @rn = setup3('mr');
+	my ($r1, $r2, $r3) = @rn;
+	# M5 takes the writer lock of every table of the statement on every node, so the local source must exist on every node (see the report of the review fixes)
+	$_->safe_psql('postgres', "CREATE TABLE public.loc (x int, y text); INSERT INTO public.loc SELECT g, 'v' || g FROM generate_series(1, $ROWS) g") for ($r2, $r3);
+	my $R4 = q{MERGE INTO public.rdst USING public.rsrc ON rdst.k = rsrc.k WHEN NOT MATCHED THEN INSERT (k, v) VALUES (rsrc.k, rsrc.v)};
+	my $R5 = q{MERGE INTO public.rdst USING public.loc ON rdst.k = loc.x WHEN NOT MATCHED THEN INSERT (k, v) VALUES (loc.x, loc.y)};
+	like(plan_of($r1, $R4), qr/Remote SQL: \/\* kingres:reference-write \*\/ MERGE/, 'M4: the statement of the tests is written to every node');
+	like(plan_of($r1, $R5), qr/Remote SQL: \/\* kingres:reference-write \*\/ MERGE.*unnest/is, 'M5: the statement of the tests ships its source to every node');
+	my $after = $r1->safe_psql('postgres', q{SELECT count(*) || '/' || md5(string_agg(k || ':' || v, ',' ORDER BY k)) FROM public.rsrc});
+	my $ref_state = sub {
+		my ($nd) = @_;
+		return $nd->safe_psql('postgres', q{SELECT count(*) || '/' || coalesce(md5(string_agg(k || ':' || v, ',' ORDER BY k)), '') FROM public.rdst});
+	};
+	my $ref_clean = sub {
+		my ($want, $label) = @_;
+		my $expect = $want ? $after : '0/';
+		is($ref_state->($_), $expect, "$label: the copy on " . $_->name . ($want ? " is the state after" : " is the state before")) for @rn;
+		is(prepared_count($_), 0, "$label: nothing is prepared on " . $_->name) for @rn;
+	};
+	my $ref_gate = sub {
+		my ($node, $point, $stmt, $during, $tag) = @_;
+		my $gate = "$tmp/gate_mr_$tag";
+		append_to_file($gate, 'x');
+		my $sess = start_psql($node, "SET kingres_shard.fault_injection = '$point:wait:$gate'; $stmt");
+		ok(wait_for_fault_file("$gate.reached", 60), "the statement waits at $point ($tag)");
+		$during->();
+		unlink $gate;
+		return finish_psql($sess);
+	};
+
+	# an error at every point
+	for my $shape (['M4', $R4], ['M5', $R5])
+	{
+		my ($sname, $stmt) = @$shape;
+		for my $variant ('', ' RETURNING rdst.k')
+		{
+			for my $point (@points)
+			{
+				my ($rc, $out, $err) = run_sql($r1, "SET kingres_shard.fault_injection = '$point:error'; $stmt$variant");
+				isnt($rc, 0, "$sname: an error at $point fails the statement$variant");
+				like($err, qr/injected failure at \Q$point\E/, '... with that error (the point was reached)');
+				$ref_clean->(0, "$sname: after an error at $point$variant");
+				my ($rc2, $o2, $e2) = run_sql($r1, "$stmt$variant");
+				is($rc2, 0, "$sname: the next statement works after $point") or diag($e2);
+				$ref_clean->(1, "$sname: after the next statement ($point)");
+				$r1->safe_psql('postgres', 'DELETE FROM public.rdst');
+			}
+		}
+	}
+
+	# a cancel at every wait
+	{
+		my $n = 0;
+		for my $shape (['M4', $R4], ['M5', $R5])
+		{
+			my ($sname, $stmt) = @$shape;
+			for my $point (qw(merge_before_first_group merge_between_groups merge_before_commit))
+			{
+				my $gate = "$tmp/gate_mrb_" . $n++;
+				append_to_file($gate, 'x');
+				my $sess = start_psql($r1, "SET kingres_shard.fault_injection = '$point:wait:$gate';
+					DO \$\$ BEGIN
+					  BEGIN $stmt; EXCEPTION WHEN query_canceled THEN RAISE NOTICE 'cancelled at $point'; END;
+					  $stmt;
+					END \$\$");
+				ok(wait_for_fault_file("$gate.reached", 30), "$sname: the statement waits at $point");
+				my $pid = $r1->safe_psql('postgres',
+					"SELECT pid FROM pg_stat_activity WHERE query LIKE '%$point:wait:$gate%' AND pid <> pg_backend_pid()");
+				$r1->safe_psql('postgres', "SELECT pg_cancel_backend($pid)");
+				unlink $gate;
+				my ($out, $err) = finish_psql($sess);
+				like($err, qr/cancelled at \Q$point\E/, "$sname: a cancel at $point is caught by the block");
+				unlike($err, qr/ERROR/, '... and the transaction goes on without an error');
+				$ref_clean->(1, "$sname: after a cancel at $point and the next statement");
+				$r1->safe_psql('postgres', 'DELETE FROM public.rdst');
+			}
+		}
+	}
+
+	# a node that dies in the middle
+	for my $shape (['M4', $R4], ['M5', $R5])
+	{
+		my ($sname, $stmt) = @$shape;
+		my ($out, $err) = $ref_gate->($r1, 'merge_between_groups', $stmt, sub { $r3->stop('immediate') }, "die_$sname");
+		isnt($err, '', "$sname: a node that died fails the statement");
+		like($err, qr/connect|connection|lost|terminat|FATAL|server closed|failed/i, '... with a connection error');
+		$r3->start;
+		$r3->poll_query_until('postgres', 'SELECT true');
+		$ref_clean->(0, "$sname: after a node died in the middle of the statement");
+	}
+
+	# the origin dies after the prepare, and after its own commit
+	for my $x (['M4', $R4, 'after_prepare', 0], ['M5', $R5, 'after_commit', 1])
+	{
+		my ($sname, $stmt, $point, $want) = @$x;
+		my ($rc, $out, $err) = run_sql($r1, "SET kingres_shard.fault_injection = '$point:kill'; $stmt");
+		isnt($rc, 0, "$sname: the origin dies at $point");
+		$r1->stop('immediate', fail_ok => 1);
+		$r1->start;
+		$r1->safe_psql('postgres', 'SELECT kingres.recover_prepared_transactions()');
+		$ref_clean->($want, "$sname: after recovery of a crash at $point");
+		$r1->safe_psql('postgres', 'DELETE FROM public.rdst');
+	}
+	release_node($_) for @rn;
 }
 
 done_testing();

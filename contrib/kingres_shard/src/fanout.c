@@ -90,10 +90,13 @@
 #define FO_KIND_INSERT_SELECT	1	/* a colocated INSERT ... SELECT, shipped whole (design 11.7) */
 #define FO_KIND_MERGE			2	/* a colocated MERGE, shipped whole (phase 12, design 7.3) */
 #define FO_KIND_MERGE_ROUTED	3	/* a MERGE whose source the origin reads and routes (design 7.4) */
+#define FO_KIND_MERGE_REF		4	/* a MERGE into a reference table (M4, M5): the same statement on every node (design 7.5) */
 
 /* A write to a distributed table that every group runs, and whose relations are checked again when it starts. */
 #define FO_IS_DIST_WRITE(k) ((k) == FO_KIND_INSERT_SELECT || (k) == FO_KIND_MERGE || (k) == FO_KIND_MERGE_ROUTED)
 #define FO_IS_MERGE(k) ((k) == FO_KIND_MERGE || (k) == FO_KIND_MERGE_ROUTED)
+/* the points merge_before_first_group, merge_between_groups and merge_before_commit fire for every MERGE that goes to several nodes */
+#define FO_FIRES_MERGE_POINTS(k) (FO_IS_MERGE(k) || (k) == FO_KIND_MERGE_REF)
 
 /* The list of FO_PRIV_MERGEINFO: the SELECT that reads the source, the shipped columns, the first array parameter, whether a group is never skipped. */
 #define FO_MI_SOURCE_SQL	0
@@ -520,7 +523,7 @@ PlannedStmt *
 kingres_shard_make_fanout_plan_shipped(Query *parse, char *sql, List *targets, List *relids, List *locknames,
 									   List *mergeinfo)
 {
-	return make_fanout_plan(parse, sql, targets, false, relids, locknames, FO_KIND_WRITE, 0, mergeinfo);
+	return make_fanout_plan(parse, sql, targets, false, relids, locknames, FO_KIND_MERGE_REF, 0, mergeinfo);
 }
 
 /*
@@ -1231,7 +1234,7 @@ run_all(KsFanoutState *s)
 		/* a point per group: kill:n or wait stops the statement between two groups */
 		if (s->kind == FO_KIND_INSERT_SELECT)
 			kingres_shard_fault_point("insel_before_group");
-		if (FO_IS_MERGE(s->kind))
+		if (FO_FIRES_MERGE_POINTS(s->kind))
 			kingres_shard_fault_point(nran == 0 ? "merge_before_first_group" : "merge_between_groups");
 		nran++;
 
@@ -1312,7 +1315,7 @@ run_all(KsFanoutState *s)
 	if (s->kind == FO_KIND_INSERT_SELECT)
 		kingres_shard_fault_point("insel_before_recheck");
 	/* the groups have all run; the transaction commits (two-phase when several groups wrote) after this */
-	if (FO_IS_MERGE(s->kind))
+	if (FO_FIRES_MERGE_POINTS(s->kind))
 		kingres_shard_fault_point("merge_before_commit");
 
 	/*
