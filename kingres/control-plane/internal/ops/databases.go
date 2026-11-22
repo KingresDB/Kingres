@@ -70,6 +70,8 @@ func (o *Ops) baseDefinitions() []task.Definition {
 		o.ledgerUpgradeDefinition(),
 		o.ledgerBundleDefinition(),
 		o.ledgerEpochDefinition(),
+		o.exportDefinition(),
+		o.importDefinition(),
 		{Kind: KindDatabaseCreate, Dynamic: func(in json.RawMessage) ([]task.Step, error) {
 			p, err := rawInput[createParams](in)
 			if err != nil {

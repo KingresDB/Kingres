@@ -62,11 +62,19 @@ func (s *Server) serveOp(op contract.Operation, h handlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		st := stateOf(r)
 		st.operation = op.ID
-		ctx, cancel := context.WithTimeout(r.Context(), s.deps.RequestTimeout)
-		defer cancel()
-		r = r.WithContext(ctx)
-		if op.Mutating() {
-			r.Body = http.MaxBytesReader(w, r.Body, s.deps.MaxBodyBytes)
+		if op.Streams != "" {
+			// A streaming operation (x-streams of the contract) leaves the request timeout and the body limit of the other operations:
+			// its body is a chunk of an upload or its answer a file, and the idle deadlines move with the bytes (package relay).
+			var cancelStream context.CancelFunc
+			r, cancelStream = s.streamLimits(op, w, r)
+			defer cancelStream()
+		} else {
+			ctx, cancel := context.WithTimeout(r.Context(), s.deps.RequestTimeout)
+			defer cancel()
+			r = r.WithContext(ctx)
+			if op.Mutating() {
+				r.Body = http.MaxBytesReader(w, r.Body, s.deps.MaxBodyBytes)
+			}
 		}
 		rec := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 		c := &call{op: op, ip: clientIP(r)}
@@ -91,6 +99,11 @@ func (s *Server) serveOp(op contract.Operation, h handlerFunc) http.Handler {
 					writeProblem(rec, r, p)
 				}
 			}
+			return
+		}
+		// The setting of the data transfer is read by the server that runs the operation, the leader.
+		if p := s.transferEnabled(c, r); p != nil {
+			writeProblem(rec, r, p)
 			return
 		}
 		if p := s.auditReady(c, r); p != nil {
@@ -160,6 +173,9 @@ func (s *Server) guard(c *call, r *http.Request) *problem.Problem {
 		if p := s.checkSession(c, r); p != nil {
 			return p
 		}
+	}
+	if p := s.transferTLS(c, r); p != nil {
+		return p
 	}
 	if p := s.checkQuery(op, r); p != nil {
 		return p

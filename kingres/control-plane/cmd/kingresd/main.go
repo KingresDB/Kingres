@@ -278,6 +278,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		}
 		ring = monitor.NewRing(1440, 2000)
 		opsSvc = &ops.Ops{Service: svc, Roles: proxy, Instances: svc.Manager(), WritableIDs: svc.WritableIDs, ServerHost: serverHost, PGPort: cfg.PGPort, Log: log, DiskFree: diskFreeOf(serverHost, cfg.DataDir)}
+		opsSvc.Transfer = transferConfig(cfg, checkedAuthn, auditFn(sink, log))
 	}
 	deps := httpapi.Deps{
 		Logger: log, Store: pg, Setup: node, Sessions: sessions, Authenticator: checkedAuthn, Audit: sink,
@@ -558,6 +559,11 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 						return internalapi.ForwardResponse{}, fmt.Errorf("%q is not a server of this cluster", peer)
 					}
 					return api.ServeForwarded(ctx, peer, fr)
+				}, forwardStream: func(ctx context.Context, peer string, fr internalapi.ForwardRequest, body io.Reader, w http.ResponseWriter) error {
+					if _, ok := peerDir.Get(peer); !ok {
+						return fmt.Errorf("%q is not a server of this cluster", peer)
+					}
+					return api.ServeForwardedStream(ctx, peer, fr, body, w)
 				}, gather: func(ctx context.Context, peer string, fr internalapi.ForwardRequest) (internalapi.ForwardResponse, error) {
 					// Every server of the cluster may ask; it must be a member (CP-07).
 					if _, ok := peerDir.Get(peer); !ok {

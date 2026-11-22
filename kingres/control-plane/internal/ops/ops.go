@@ -103,6 +103,8 @@ type Ops struct {
 	// LedgerAudit is the check "publication" of a verification: the findings of the audit of the stored logs of a database (nil: not supported).
 	LedgerAudit func(ctx context.Context, db string) ([]string, error)
 	BundleDir   string
+	// Transfer configures the data transfer (contract 0.19.0); nil: this server does not offer it.
+	Transfer *TransferConfig
 	// DiskFree, when set, tells the free space of the disk of a server (the table lifecycle checks the destinations before it copies); nil skips the check.
 	DiskFree DiskFree
 	// tableBackendOverride replaces the database side of the table tasks (tests).
@@ -117,6 +119,12 @@ type Ops struct {
 	life       lifecycle
 	// stmts tracks the running workbench statements (cancel.go).
 	stmts statements
+	// xferSt is the staging store and the master key, opened at the first use (transfer.go).
+	xferMu sync.Mutex
+	xferSt *xferState
+	// loads are the open transactions of the imports between the step that loads and the step that commits (transfer_import.go).
+	loadMu sync.Mutex
+	loads  map[int64]*pendingLoad
 }
 
 // SetEngine installs the task engine once the system database exists.

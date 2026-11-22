@@ -12,6 +12,7 @@ import (
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/store"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/transfer"
 )
 
 // Store is the fake. Set Err to make every method fail with that error, for
@@ -57,6 +58,7 @@ func New() *Store {
 			AutoFailover: api.AutoFailoverSettings{TimeoutSeconds: 120, MaxCount: 1},
 			Rebalance:    api.RebalanceSettings{MaxConcurrentMoves: 4},
 			Restart:      api.RestartState{ServerIDs: []string{}},
+			DataTransfer: transfer.DefaultSettings().API(),
 		},
 		CreateOptions: api.DatabaseCreateOptions{
 			Encodings:                   []api.EncodingOption{{Name: "UTF8", IsDefault: true}},

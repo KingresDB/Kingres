@@ -62,6 +62,8 @@ type Node struct {
 	// ForceEnforce makes the node enforce lease self-fencing for every group (set
 	// before SetFaults; see fault.Spec).
 	ForceEnforce bool
+	// TLS says that the public listener of the node serves HTTPS (FormTLS): the data transfer refuses plain HTTP.
+	TLS bool
 
 	mu     sync.Mutex
 	cmd    *exec.Cmd
@@ -289,7 +291,13 @@ func (n *Node) LogTail(max int) string {
 func (n *Node) Log() string { b, _ := os.ReadFile(n.LogFile); return string(b) }
 
 // Base is the URL prefix of the REST API.
-func (n *Node) Base() string { return fmt.Sprintf("http://%s:%d/api/v1", n.Host, n.APIPort) }
+func (n *Node) Base() string {
+	scheme := "http"
+	if n.TLS {
+		scheme = "https"
+	}
+	return fmt.Sprintf("%s://%s:%d/api/v1", scheme, n.Host, n.APIPort)
+}
 
 // InternalAddr is host:port of the internal API.
 func (n *Node) InternalAddr() string { return fmt.Sprintf("%s:%d", n.Host, n.IntPort) }

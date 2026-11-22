@@ -43,6 +43,8 @@ func sessionOps() []contract.Operation {
 func TestRoleMatrix(t *testing.T) {
 	e := newEnv(t)
 	e.initialize()
+	// The data transfer operations are refused over plain HTTP and while the setting is off; the matrix is about the roles.
+	setTransfer(e, true)
 	tokens := map[string]string{}
 	for _, r := range auth.ClusterRoles {
 		tokens[r] = e.token(r)
@@ -58,7 +60,7 @@ func TestRoleMatrix(t *testing.T) {
 			if op.ID == "logout" {
 				tok = e.token(role)
 			}
-			w := e.do(req{method: op.Method, path: concretePath(op.Path), bearer: tok, body: bodyFor(op)})
+			w := e.do(req{method: op.Method, path: concretePath(op.Path), bearer: tok, body: bodyFor(op), tls: true})
 			allowed := auth.Allows([]string{role}, op.Role)
 			switch {
 			case !allowed && w.Code != http.StatusForbidden:

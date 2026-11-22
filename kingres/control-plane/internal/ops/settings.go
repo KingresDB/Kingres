@@ -12,6 +12,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/transfer"
 )
 
 // UpdateClusterSettings validates the whole request, then stores the values
@@ -74,6 +75,13 @@ func (o *Ops) UpdateClusterSettings(ctx context.Context, actor string, req api.C
 				errs = append(errs, field("/clock/maxDifferenceMs", "must be 10 to 600000", "out_of_range"))
 			}
 			set["clock.maxDifferenceMs"] = *c.MaxDifferenceMs
+		}
+	}
+	if d := req.DataTransfer; d != nil {
+		vals, derrs := transfer.Validate(d)
+		errs = append(errs, derrs...)
+		for k, v := range vals {
+			set[k] = v
 		}
 	}
 	var wantShard, wantLedger bool

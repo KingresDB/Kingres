@@ -332,14 +332,68 @@ handlers in `internal/httpapi/handlers_config.go`, wiring in `cmd/kingresd/confi
   task, the order of standbys and primaries, refused and invalid values, a server that is down, a server that fails,
   database and cluster time zones, the clock difference, history and revert, audit, roles.
 
+## Data transfer: table CSV export and import (phase 14a, contract 0.19.0)
+
+Design: [../docs/design/data-export-import.md](../docs/design/data-export-import.md) (its last section before "Known limits" says where the code
+differs from the text). Ten operations, tag `Data transfer`: two tasks (`table.export`, `table.import`) and eight operations on staged files.
+
+**Who and what is checked.** Every operation needs `kingres_admin`, the cluster setting `dataTransfer.enabled` (off by default; the leader reads it, a
+follower cannot) and a request that arrived over TLS (the server that received it decides; start `kingresd` with `-tls-cert-file` and `-tls-key-file`).
+The data is bound by the PostgreSQL privileges of the signed-in role: the connection of an export or an import is the role's. A staged file belongs to
+its creator by **name and OID**; another role sees 404 (also another administrator), only a delete is open to every administrator. The role is checked again
+at the start of every step and before the commit (`CurrentRoles`, the OID): a role that signed out, was demoted, expired or was replaced ends the task with
+the code `forbidden` and stores nothing.
+
+**Where files live.** `-transfer-dir` (default `<data-dir>/transfer`, mode 0700, marked by `.kingres-transfer`; refused when it is not empty and unmarked, or is or
+holds the data directory), the master key `-transfer-key-file` (default `<data-dir>/transfer.key`, never inside the staging directory, in file-level
+backups of the data directory), `-transfer-max-duration` (24h; the COPY carries the time left as its `statement_timeout`) and `-max-atomic-bytes` (2 GiB of
+decompressed CSV per import). Files are sealed in 64 KiB segments with AES-256-GCM (package `staging`, increment CP2). Limits and the janitor are
+in the design note; the janitor runs on the leader every 5 minutes and once before the first transfer, expires files, deletes the files of dropped roles and
+stops when the files show an id the system database never issued (a restored database).
+
+**Streaming relay.** `uploadDataChunk` and `downloadDataExport` carry `x-streams`; they leave the 30 s request timeout and the 1 MiB body limit and use idle
+deadlines that move with the bytes (package `relay`, `internal-api.md`, "The streaming relay"). A follower relays them to the leader through
+`POST /internal/v1/forward-stream` without buffering. Spike S1 moved 5 GiB each way with a heap growth of 3 and 13 MiB.
+
+**Export.** One `COPY (SELECT ...) TO STDOUT` of the table in a read-only `READ COMMITTED` transaction of the role, `row_security = off`, fixed session formats
+(`DateStyle`, `IntervalStyle`, `extra_float_digits`, `bytea_output`, `TimeZone`, `lc_monetary`, `client_encoding`), through the compression and the seal; at most
+three attempts for a read that a moved bucket or a lost connection interrupted. The statement is built from names that passed `sqlx` and from checked options;
+`spreadsheetSafe` (default on) prefixes risky text cells with an apostrophe in SQL (a convenience, not a security feature; it loses the padding of `char(n)` and
+the value it changes). The consistency label is `single-snapshot` for a local or reference table and for a distributed table on one group, `per-group` otherwise;
+**there is no global snapshot**. A table with row-level security is exported only by its owner or a role with `BYPASSRLS`, and a read that would run a function
+of another role needs `acknowledgeOtherRolesCode`.
+
+**Import.** All or nothing: `BEGIN`, `COPY ... FROM STDIN`, the count of the server compared with the records the scanner counted, the commit intent written in the
+detail of the task under the lease, `COMMIT`. The step that loads keeps the open transaction in memory for the step that commits; a restart ends it with the
+connection, so the commit step finds nothing and fails `copy_interrupted` (retryable, nothing stored). A task that finds the intent without the commit recorded
+fails `import_outcome_unknown` and is never retried. A cancel is accepted until the intent is written. A reference table is loaded through a temporary table and
+inserts from typed arrays (`unnest($1::int[], ...)`), cap 256 MiB, and refuses array columns. The scanner refuses an unquoted `\.` line (`import_end_marker`;
+on PostgreSQL 18 and 19 it is data in CSV, the refusal is the conservative choice) and a record above 16 MiB; a gzip stream is counted against the limit. **Identity
+columns of a distributed table draw from the sequence of the node the statement runs on** (design F18): rows loaded without the column from different servers can
+repeat values; list the column in the file.
+
+**Errors.** One function, `transfer.SafeError`, builds every error of a transfer from the SQLSTATE, a sentence per state, the names of the schema, table, column and
+constraint (the table is the task's own; a bucket partition name is dropped) and the absolute line number; never the message, detail, hint, context or the row, and
+never the `where` of the router (it holds the socket directory of a node). No problem, task error, task detail, audit event or log line of a transfer has a value
+of the data (tests plant a canary in the failing row of every class).
+
+**Tests.** `internal/relay` (spike S1, `KINGRES_SPIKE_BYTES=5368709120` for the full size), `internal/transfer` (SafeError, scanner, options, record; the record tests
+need PostgreSQL), `internal/staging` (CP2), `internal/httpapi` (guards, relay), `internal/internalapi` (the call against a real mutual TLS listener),
+`cmd/kingresd` (`TestUpload*`, `TestExport*`, `TestImport*`: real kingresd over HTTPS, `-max-atomic-bytes 4194304`), `internal/clustertest`
+(`TestDataTransferThroughAFollower`: three servers, uploads, downloads, import and export through followers, a follower that dies in the middle of an upload).
+Run the PostgreSQL ones with `scripts\run-integration.ps1 -Packages ./cmd/kingresd -Run 'TestUpload|TestExport|TestImport'` on both majors.
+
+**Not built in 14a.** Batches, `skipRows`, `onError` (the router refuses `ON_ERROR`; the console never offers it, nor `LOG_VERBOSITY`), the leader-change fault tests of
+every step of a real failover, the metrics and alerts for staging disk use (the metric names of the contract are a closed list).
+
 ## What is implemented
 
-The server implements revision **0.14.0** of the contract (140 operations, 113
+The server implements revision **0.19.0** of the contract (150 operations, 120
 paths; what is not done is in "Not done in this increment"). "Real" means the operation works against PostgreSQL or the local node
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **139 of 140 operations are real; 1 answer "not yet".**
+authenticated operation lists in 0.2.0. **149 of 150 operations are real; 1 answer "not yet".**
 
 | Tag | Real | Not yet |
 |---|---|---|
@@ -364,6 +418,7 @@ authenticated operation lists in 0.2.0. **139 of 140 operations are real; 1 answ
 | Configuration | `listConfigParameters`, `getConfigParameter`, `previewConfigChange`, `applyConfigChange`, `listConfigChanges`, `revertConfigChange`, `listConfigServers`, `getConfigSummary`, `getClusterTime`, `listTimeZones`, `restartPendingInstances` |  |
 | Settings | `getClusterSettings`, `updateClusterSettings`, `resetAutoFailoverCounter` |  |
 | Network access | `getNetworkAccess`, `replaceNetworkAccess` |  |
+| Data transfer | `exportTable`, `importTable`, `createDataUpload`, `getDataUpload`, `uploadDataChunk`, `deleteDataUpload`, `listDataExports`, `getDataExport`, `downloadDataExport`, `deleteDataExport` |  |
 | Setup | `initCluster`, `joinCluster`, `getNodeState`, `checkSetupToken` |  |
 | Tasks | `listTasks`, `getTask`, `cancelTask` |  |
 | This server | `getThisServer`, `listThisServerInstances`, `getThisServerInstance`, `restartThisServerInstance`, `listThisServerLogs`, `getThisServerResources`, `startThisServerInstance`, `stopThisServerInstance`, `leaveCluster`, `getThisServerSettings`, `updateThisServerSettings` |  |

@@ -5,6 +5,7 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -83,6 +84,12 @@ type env struct {
 
 func newEnv(t *testing.T, mods ...func(*Deps)) *env {
 	t.Helper()
+	return newEnvWith(t, (*Server).handlers, mods...)
+}
+
+// newEnvWith is newEnv with the handler registry given, so that a test can put its own handler where the server has none yet.
+func newEnvWith(t *testing.T, registry func(*Server) map[string]handlerFunc, mods ...func(*Deps)) *env {
+	t.Helper()
 	clock := &fakeClock{t: time.Date(2026, 11, 14, 10, 0, 0, 0, time.UTC)}
 	logs := &bytes.Buffer{}
 	logger := slog.New(slog.NewTextHandler(&lockedWriter{w: logs}, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -108,7 +115,7 @@ func newEnv(t *testing.T, mods ...func(*Deps)) *env {
 	for _, m := range mods {
 		m(&d)
 	}
-	e.srv, err = New(d)
+	e.srv, err = build(d, registry)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,6 +151,8 @@ type req struct {
 	cookie       string
 	bearer       string
 	remote       string
+	// tls makes the request look as if it arrived over TLS.
+	tls bool
 }
 
 func (e *env) do(r req) *httptest.ResponseRecorder {
@@ -180,6 +189,9 @@ func (e *env) do(r req) *httptest.ResponseRecorder {
 		hr.RemoteAddr = r.remote
 	} else {
 		hr.RemoteAddr = "127.0.0.1:4000"
+	}
+	if r.tls {
+		hr.TLS = &tls.ConnectionState{Version: tls.VersionTLS13}
 	}
 	w := httptest.NewRecorder()
 	e.srv.ServeHTTP(w, hr)

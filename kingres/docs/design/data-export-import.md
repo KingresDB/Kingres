@@ -1660,6 +1660,95 @@ About 12 weeks of one writer; C1 and the console can overlap.
 Batches with the marker (section "Batches"), "continue" from the markers, and reference tables in several transactions:
 L, own review, started only when the owner asks.
 
+## Results of the spikes and changes made by the code (phase 14a)
+
+This section is written by the control-plane writer of 14a and says where the code differs from the text above, and why. The text above is left
+as the design was reviewed; where the two disagree, this section is right.
+
+### Spike S1: the relay (2026-11-22)
+
+**Result: passed.** `internal/relay/spike_test.go` runs a follower and a leader as two TLS servers with the limits of the real ones (read
+timeout 30 s, write timeout 60 s, header timeout 10 s on both; the leader is HTTP/1.1 as the internal listener is), relays an upload and a
+download through the frame, and drives them from a client on HTTP/1.1 and on HTTP/2.
+
+| Scenario | Result |
+|---|---|
+| 5 GiB up (in 64 MiB chunks, the sum of each chunk checked by the leader) and 5 GiB down (SHA-256 of the whole) through the follower | all bytes arrive; HTTP/1.1 73 s (140 MiB/s each way), HTTP/2 48 s (215 MiB/s each way); **heap growth 3 MiB (HTTP/1.1) and 13 MiB (HTTP/2)** over a run that moves 10 GiB |
+| deadlines with short limits (read 1 s, write 1.5 s, idle 0.8 s) | a steady stream of 4 s is not ended, on either protocol; a client that stops for the idle time is ended after the idle time and the leader sees the error |
+| client, leader and follower each end the connection in the middle of an upload or a download | the other sides see an error, nobody hangs, goroutines return to the starting count; a download cut by the leader reaches the client as a short body with its Content-Length (an error to the client) |
+| frames: larger than 64 KiB, cut, empty, not JSON, unknown member, data after the value, wrong type | refused by `relay.ReadFrame`; the sender refuses to send a frame above 64 KiB |
+| headers outside the allowlist (`Set-Cookie`) | not relayed |
+
+What the spike changed in the design:
+
+1. **The idle body moves the write deadline too.** The answer of an upload (204) is written when its last byte was read, minutes after the request
+   began, and the write timeout of the server counts from the start of the request: without a write deadline that moves, the answer of every upload
+   longer than the write timeout fails (on HTTP/1.1 as `tls: bad record MAC` at the client, on HTTP/2 as `INTERNAL_ERROR`). `relay.IdleBody` therefore
+   sets both deadlines with every read, and gives the write a time of its own when the read ends in an error, so that the error can be answered.
+2. **HTTP/2 needs nothing special.** `http.ResponseController` moves the deadlines of a stream on HTTP/2 as on HTTP/1.1 (tested above), so nothing in the
+   design is assumed about it any more.
+3. The leader side needs no change of the internal server: its read timeout is moved by the same wrapper and its answer is written through
+   `deadlineWriter`, which already reaches the connection through `Unwrap`.
+
+The same scenarios run again as cluster tests through a real follower (CP3).
+
+### Spike S2: the router's COPY (V3 to V7)
+
+The result is `dx/s2-result.md` of the second writer (2026-11-22, PostgreSQL 18.7 and 19.0, identical answers). What it changes, as the code applies it:
+
+1. **V3: reference tables are importable in 14a, with the typed-array form**, not the text-array form with casts: the router refuses any cast of text in
+   the select list of an insert into a reference table (`0A000`, the write is replayed on every node), and accepts `INSERT ... SELECT u.c1, u.c2 FROM
+   unnest($1::int[], $2::text[]) AS u(c1, c2)` with typed arrays and multi-row `VALUES`. The statement parses the values once on the origin, under the
+   fixed session formats. A test checks that the checksum of the table is equal on every node after the import.
+2. **V6: `header: match` is done by PostgreSQL on every target.** The exception "the control plane reads the first record" is removed. A mismatch is
+   `22P04` whose message echoes the header text, so it is mapped to the sentence "the header of the file does not match the columns" and the task code
+   `import_header_mismatch`; the first difference is **not** named (it would be file content). It is a code of the failed task; `importTable` does not answer
+   422 `import_header_mismatch` in this version (the code stays in the contract for the day a request-time check exists).
+3. **V6: the unquoted `\.` line** is data in CSV on PostgreSQL 18 and 19, routed and local. The rejection (`import_end_marker`) is kept for the first release
+   as the conservative choice, and the code says so; it rejects a legal file (a one-column file whose rows can be `\.`) and is to be dropped when the same
+   test passes on every supported major.
+4. **V7: what errors carry.** The router errors for `23xxx` have **no** table, column or constraint field (or a bucket partition name `dtab_b0000`
+   in them) and no line number, and `where` carries the unix socket directory of a node. `SafeError` therefore takes names only from fields that are
+   present and do not look like a bucket partition (`_bNNNN`), never from the text, adds the target table from the task (`Error.ForTarget`), and says
+   "the row that failed is not known" for a class 23 error without a line. Tests: no `_bNNNN` name and no socket path reaches any output.
+5. **V4: the label is `per-group` for a partitioned table too**; `per-group-and-partition` stays in the contract enum and is never written.
+6. **V7: identity columns.** A `GENERATED ALWAYS AS IDENTITY` column may be listed in the file; a stored generated column may not (`42P10`, as designed).
+   The sequences of a distributed table are node-local (F18): rows loaded without the identity column from different entry nodes can repeat values. The
+   README says so; the console shows a warning for such a table (a contract-free text).
+
+### Other changes made by the code
+
+- **Role identity (CP1):** `kingres_cp.data_transfer` keeps the role by **name and OID**. PostgreSQL has no creation time for a role, so "OID with the role
+  creation identity" is the OID: a role dropped and made again under the same name has another OID (checked at every step and at every read).
+- **The record has two more columns, `reserved_bytes` and `updated_at`**: the reservation of the staging quota that a file holds (the sum is what the
+  quota is checked against) and the last time bytes arrived (the janitor rule "nothing received for 48 hours").
+- **The setting is read by the leader only.** The guard `dataTransfer.enabled` runs on the server that runs the operation, because the setting is in
+  the system database of the leader; a follower checks TLS, the session and the role, and relays. The TLS check is made by the server that received the request.
+- **`ClusterSettings.dataTransfer.stagingQuotaBytes`** shows 100 GiB while the administrator has not set it; the effective default, the smaller of 100 GiB and a quarter of
+  the file system, is applied where the staging directory is known (the staging store).
+- **Contract 0.19.0 lists only the values of this revision** for the enums that 14b extends (`DataUpload.state`, `DataExport.kind` and `format`, `purpose`,
+  `TableConsistency.level`), and only `ImportTableRequest` is a closed schema.
+- **`maxAtomicBytes` is a flag** and is not in the setting (the console states 2 GiB).
+- **Load and commit are two steps that share an open transaction in memory** (the design lists them as two steps and a transaction cannot span a restart). The step
+  "Load rows" is not engine-NonIdempotent: a run that finds nothing committed may run again. The commit step writes the intent (`commit sent for N rows`) into the task
+  detail under the lease, and a run that finds the marker fails `import_outcome_unknown` with its own code (the engine's `step_interrupted` would have been the code
+  otherwise). A connection that died before the intent is found by a `SELECT 1` before the intent is written: nothing stored, `copy_interrupted`, retryable.
+  `Task.cancellable` is false from the intent on. Fault hooks: `ops.ImportFault`.
+- **Request time and step time.** `exportTable` and `importTable` do the checks of the first step at the request (so that the contract's 404, 409 and 422 answers exist)
+  and the steps do the role check and the table check again. The record and the reservation are made at the request; a refused request leaves a record in the state
+  failed, which the janitor prunes after seven days.
+- **The reservation of an upload is the declared size plus the overhead of the sealed form** (header and a tag per segment), and the export estimate is the local size
+  times the groups times 1.5 (10 for a columnar table), at least 64 MiB and at most the largest file.
+- **Reference tables refuse array columns**: `unnest` of a typed array flattens an array column. A reference table is always loaded through the temporary table (the
+  direct COPY is refused on several groups), with the cap of 256 MiB (a constant, not a flag).
+- **Header match** is PostgreSQL's (S2); the header text is never passed on, so the task code is `import_header_mismatch` without the first difference.
+- **`maxConcurrent`** is one transfer per role and the setting in the cluster, counted from the unfinished tasks of the two kinds.
+- **The cluster test harness serves HTTPS for the data transfer** (`clustertest.FormTLS`, the TLS cluster of `cmd/kingresd`), because the operations refuse plain HTTP.
+- **Not covered by tests in this increment:** the leader-change fault points of a real failover at every step (the leader that holds the files is gone: the codes
+  `transfer_leader_changed` and `transfer_session_lost` are in the code and tested only for the records they read), `KS001` and a bucket move during a routed COPY, a
+  group that fails at COMMIT, a record near 16 MiB through PostgreSQL (the scanner is tested at the limit), the untrusted-code check against a role other than the owner
+  (the query runs in every export; no table in the tests has a function of another role), and metrics and alerts for the staging disk.
+
 ## Known limits
 
 - **No global snapshot.** A distributed table over several groups is exported per group; the labels say so. A database

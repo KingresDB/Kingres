@@ -52,6 +52,7 @@ version 1, the caller \"2\"."}` when the number is missing or different.
 | `POST /internal/v1/exec` | leader | one statement on a local database through the local socket |
 | `POST /internal/v1/forward` | member, answered only by the leader | one operation of the public contract, run as the identity the forwarding server proves with the proof of a session (see "Forwarded identities need a proof") |
 | `POST /internal/v1/gather` | any peer, with an assertion of the leader | this server's part of a cluster-wide read (`listLogs`, `listAlerts`, `queryMetrics`) or the acknowledgement of an alert it holds, run as the identity the leader's assertion vouches for; a request that carries a proof is refused; see "Cluster-wide reads" |
+| `POST /internal/v1/forward-stream` | member, answered only by the leader | a streaming operation of the data transfer: a frame, then raw bytes each way (see "The streaming relay") |
 | `POST /internal/v1/gather-authorize` | member, answered only by the leader | the asking server sends the gather request with the proof of the user's session; the leader checks it as for `forward` and answers with an assertion signed with the key of its own server certificate |
 | `POST /internal/v1/pki/renew` | member, answered only by the leader | the caller asks the CA holder for a new certificate for itself; see "Certificate renewal" |
 | `GET /internal/v1/pki/csr` | leader | a certificate request for this server's names, made from its key |
@@ -215,6 +216,36 @@ user's ClientKey or any password-equivalent can be derived (forward goes to the 
 assertion), and it cannot make the leader or another member accept an identity it cannot prove. What a compromised
 **leader** can do: everything (it holds the CA key, every verifier, the system database, and receives every
 proof); that is inherent to a design in which the leader runs the cluster operations and checks the proofs.
+
+## The streaming relay (data transfer, contract 0.19.0)
+
+`POST /internal/v1/forward-stream` relays the two operations of the contract that carry a body of any size (`uploadDataChunk`,
+`x-streams: upload`, and `downloadDataExport`, `x-streams: download`). `forward` cannot: it reads the body whole, answers into a buffer of
+32 MiB and accepts 16 MiB. The call is **member-only and answered only by the manager leader** (policy `ToLeader`; the membership check is
+made by the backend, as for `forward`, so that a stopped instance answers in the documented way). The version of the internal protocol stays `1`:
+it is a new call only.
+
+| Direction | Frame | Content |
+|---|---|---|
+| request | 4-byte big-endian length (1 to 65536), then JSON | the members of `forward` without `body`: `operationId`, `pathParams`, `query`, `identity`, `requestId`, `sourceAddress`, `source`, `proof`, and `header`: the request headers the operation uses, only `Range`, `Upload-Offset`, `Content-Length` and `Content-Type` (any other name is refused) |
+| request | then | the raw body: the chunk of an upload (at most 256 MiB, **no 16 MiB limit**); nothing for a download |
+| response | 4-byte length, then JSON | `{status, header}`: the status of the operation and the headers of the allowlist `Content-Type`, `Location`, `Retry-After`, `Allow`, `Content-Language`, `Preference-Applied`, `Content-Disposition`, `Content-Length`, `Content-Range`, `Accept-Ranges`, `ETag`, `Upload-Offset`, `Cache-Control`, `X-Content-Type-Options` |
+| response | then | the raw bytes, flushed as they are written (none for a 204) |
+
+- The proof is checked exactly as for `forward`, with the **kind `forward-stream`** (a proof made for `forward` does not hold here), and it
+  binds the frame, **including the `header` members**; it does not cover the raw body (bytes of any size on the mutual TLS connection between
+  two members). A frame larger than 64 KiB is `413 frame_too_large`, a frame that is cut, empty, not JSON, with an unknown member, with a `body`, with
+  an assertion or with a header of another call is `400 bad_request`, a proof that does not hold `401 identity_unproven`, and nothing runs in any of these cases.
+- The leader runs the operation through the same pipeline as a public request (role check, the setting `dataTransfer.enabled`, handler, audit);
+  the audit event of a download is written when its stream ends.
+- **Deadlines.** The server has a read timeout of 30 s of the whole request, which a chunk of minutes would break. The stream operation
+  moves the read and the write deadline of the connection with every read and every write (`http.ResponseController`, package `relay`): a
+  stream that makes progress is not ended, one that stops for 60 s is. The request context of an upload chunk ends after 15 minutes. HTTP/2 on the public side
+  and HTTP/1.1 on the internal side were both tested (spike S1, see the design note).
+- **Nothing is buffered** beyond one segment of 64 KiB on either server. A stream that fails after the frame went out cannot change its status:
+  the leader cuts the connection (a short body for the client of the follower) and the Content-Length of a download makes it visible.
+- The calling server uses a client of its own without the overall 30 s limit of the other calls, and never repeats a stream call (a body that
+  was read cannot be read again; the console resumes an upload at the offset the server holds).
 
 ## Cluster-wide reads (gather)
 
@@ -487,7 +518,7 @@ fence token; a client time limit that ended after the connection was made is not
 | `POST /failover/promote` | `already` for an instance that is out of recovery (it re-applies the empty list and attaches the lease); a promotion that did not finish is asked again |
 | `POST /standby/repoint` | no-op when `primary_conninfo` and the slot are the ones asked for; only waits for the walreceiver |
 | `POST /lease/grant` | a renewal; `transferTo` by the caller that is no longer the holder is refused (`granted: false`); `release` of a free group answers `granted: true` |
-| `POST /task/record`, `/settle`, `/reserve`, `/leave-cluster`, `/leave-status`, `/add-server`, `/forward`, `/pki/renew`, `/exec`, `/heartbeat` | made by servers outside a step, or repeated by design; not repeated by the client |
+| `POST /task/record`, `/settle`, `/reserve`, `/leave-cluster`, `/leave-status`, `/add-server`, `/forward`, `/forward-stream`, `/pki/renew`, `/exec`, `/heartbeat` | made by servers outside a step, or repeated by design; not repeated by the client |
 | `GET` calls | reads |
 
 The failover steps (increment 3) are no-ops on a second execution in the same way: each checks what exists before it acts (the pinned standby in
