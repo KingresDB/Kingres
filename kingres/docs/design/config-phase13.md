@@ -183,6 +183,7 @@ Policy additions (not superuser-only, still refused):
   with `unix_socket_directories`, and so are `log_destination` and the `syslog_*` parameters (another destination leaves the collector
   files, which the console reads, empty). `log_line_prefix` and `log_error_verbosity` stay settable: nothing of the console parses the
   line shape.
+- (second review, P13S-02 to P13S-09) `log_transaction_sample_rate`, `log_statement_sample_rate` and `log_min_duration_sample` are managed (they write statement text to  the log), `log_file_mode` is managed; `archive_mode` (WAL piles up without a command), `client_encoding` (the own connections of `kingresd` send none),  `restart_after_crash`, `recovery_min_apply_delay` and `max_slot_wal_keep_size` are refused; `max_worker_processes` has a floor of 8 ("Managed parameters", floors).
 
 A **stored value whose name later becomes managed or refused** (an upgrade adds a name to a list) is never written and never blocks an
 apply: the leader leaves it out of the request, the server leaves it out of the file with a warning, and its **removal** (`value: null`)
@@ -490,9 +491,11 @@ instances that wait for a restart, **one server at a time**, and stops at the fi
    or stop meanwhile, the wait for the system database), every instance through the manager's lease gate, and the pair order uses the
    primary of each group as the leader last saw it (`group_replication_state`), not instance 1 of the server the standby was created
    for. Before the instance is stopped, PostgreSQL's parser checks the whole configuration (`postgres -C`), and a refused file stops
-   the restart. When the instance cannot start with the new file (a memory size the host cannot give), the last file it ran with
-   (`kingres-config.conf.good`) is put back, the instance is started again and the task fails with that text; the stored value stays, and
-   the operator removes or reverts it.
+   the restart. *As built after the second review (P13S-01):* every successful start of an instance keeps its override file as
+   `kingres-config.conf.good`, and the **manager** tries a start that fails with the override file once more with that file (or the empty
+   one when none was kept, never the file that the last change replaced), for every start: the restart of the task, a reboot, a crash, an
+   operator. It leaves a mark that the task reads, and the task fails with the text of PostgreSQL; the stored value stays, and the operator
+   removes or reverts it. A second failure leaves the instance down and says so.
 4. After each instance the step reads `pending_restart` again and records the state.
 
 A `config.restart` task is not started while a `config.apply` task is unfinished (409).
@@ -866,3 +869,14 @@ The text that the console shows for a value that PostgreSQL refuses **in the fil
 `setting could not be applied` for every such value (PostgreSQL's own reason goes to its log only), with the name of the parameter. A
 message with PostgreSQL's reason (`invalid value for parameter "TimeZone"`) is given only by layer 3, before anything is written. The
 design's "reports PostgreSQL's text" for a rejected file is therefore this text; the test asserts it.
+
+**The review of the fixes (2026-11-22, second)** ([reviews/2026-11-22-config-phase13-fixes.md](../reviews/2026-11-22-config-phase13-fixes.md), P13S-01 to P13S-09) found that the rollback of
+a restart had no good file in the common case and could fall back to a bad one, and more parameters that hurt a cluster. What changed in the design:
+
+| What the design said | Found | Done |
+|---|---|---|
+| A restart that cannot start puts the last good file back | The good file existed only after an apply that left nothing pending; with two changes before one restart the previous file was the bad one; a reboot or crash had no rollback (P13S-01) | Every successful start keeps the file as good; the manager retries a failed start with it (or the empty file) for every start; see "Restart" |
+| The managed and refused lists | Statement text through the sample-rate parameters, `archive_mode` without a command, `client_encoding`, `restart_after_crash`, `recovery_min_apply_delay`, `max_slot_wal_keep_size`, `log_file_mode` (P13S-02, 03, 06, 09) | Managed (the sample rates, `log_file_mode`) or refused (the others); "Refused parameters" |
+| Floors protect the needs of `kingresd` | `max_worker_processes = 1` silently left the workers of the extensions out (P13S-04) | Floor of 8 |
+| The loop compares the file of the server | Only instance 1: a standby never converged and a copied standby kept the source's server-level values (P13S-05) | The hash covers every instance; `InitStandby` writes the file of this server |
+| One configuration task at a time | A check followed by a start; `expectedRevision` checked before the record step only (P13S-07) | One step under a mutex of the leader; the record step checks the revision again under an advisory lock; the dialog waits for the revision |

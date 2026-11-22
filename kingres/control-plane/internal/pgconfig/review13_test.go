@@ -197,3 +197,54 @@ func TestTaskErrorsAreCoded(t *testing.T) {
 		t.Error("a failed validation is not retryable")
 	}
 }
+
+// P13S-02, P13S-03, P13S-06, P13S-09: the parameters that write statement text to the log, keep the WAL of a server without
+// a command to archive it, change the client encoding of the own connections of kingresd, delay or stop a server.
+func TestMoreParametersAreNotSettable(t *testing.T) {
+	for _, name := range []string{"log_transaction_sample_rate", "log_statement_sample_rate", "log_min_duration_sample", "log_file_mode"} {
+		if c := Classify(Setting{Name: name, Context: "sighup"}, false); c.Kind != KindManaged {
+			t.Errorf("%s: %+v", name, c)
+		}
+		if !Dropped(name) {
+			t.Errorf("%s is not dropped", name)
+		}
+	}
+	for _, name := range []string{"archive_mode", "client_encoding", "restart_after_crash", "recovery_min_apply_delay", "max_slot_wal_keep_size"} {
+		if c := Classify(Setting{Name: name, Context: "user"}, false); c.Kind != KindRefused {
+			t.Errorf("%s: %+v", name, c)
+		}
+		if !Dropped(name) {
+			t.Errorf("%s is not dropped", name)
+		}
+	}
+}
+
+// P13S-04: max_worker_processes has a floor, so that the workers of the extensions are not silently left out.
+func TestMaxWorkerProcessesHasAFloor(t *testing.T) {
+	if m, why, ok := Floor("max_worker_processes", 1); !ok || m != 8 || why == "" {
+		t.Errorf("floor %d %q %v", m, why, ok)
+	}
+}
+
+// P13S-07: a request made against an older revision is refused when it would overwrite a later change, and passes when the
+// value already is the wanted one.
+func TestSupersedes(t *testing.T) {
+	a, b := "1", "2"
+	for _, tc := range []struct {
+		name          string
+		last, want    int64
+		current, wish *string
+		refused       bool
+	}{
+		{"nothing changed since", 5, 5, &a, &b, false},
+		{"changed since, another value", 6, 5, &a, &b, true},
+		{"changed since, the wanted value already", 6, 5, &b, &b, false},
+		{"removed since, a value wanted", 6, 5, nil, &b, true},
+		{"removed since, a removal wanted", 6, 5, nil, nil, false},
+		{"set since, a removal wanted", 6, 5, &a, nil, true},
+	} {
+		if got := supersedes(tc.last, tc.want, tc.current, tc.wish); got != tc.refused {
+			t.Errorf("%s: %v, want %v", tc.name, got, tc.refused)
+		}
+	}
+}

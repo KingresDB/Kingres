@@ -54,9 +54,6 @@ func (l *Leader) StartRestart(ctx context.Context, actor string, req api.Restart
 	if len(pending) == 0 {
 		return task.Task{}, problem.New(problem.NothingPending, "No instance waits for a restart.")
 	}
-	if l.busy(ctx) {
-		return task.Task{}, problem.New(problem.OperationInProgress, "Another configuration task is still running.")
-	}
 	order, conflict := restartOrder(sn, pending, pendingValues(sn))
 	if conflict != "" {
 		return task.Task{}, problem.New(problem.ConfigRestartOrder, conflict)
@@ -69,7 +66,7 @@ func (l *Leader) StartRestart(ctx context.Context, actor string, req api.Restart
 		}
 		in.Order = append(in.Order, restartEntry{Server: st.Server, Instance: st.Instance, Role: st.Role})
 	}
-	return l.StartTask(ctx, KindRestart, SubjectType, SubjectRestart, in, actor)
+	return l.startConfigTask(ctx, KindRestart, SubjectType, SubjectRestart, in, actor)
 }
 
 func instancePending(sn *snapshot, server string, inst int) bool {

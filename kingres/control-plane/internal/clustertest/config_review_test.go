@@ -92,6 +92,8 @@ func TestConfigSettingsThatStopTheServerAreNotSettable(t *testing.T) {
 		{"unix_socket_permissions", "0", "config_parameter_managed"}, {"unix_socket_group", "nosuchgroup", "config_parameter_managed"},
 		{"log_destination", "syslog", "config_parameter_managed"}, {"huge_pages", "on", "config_parameter_refused"},
 		{"ssl_crl_dir", "/nonexistent", "config_parameter_refused"}, {"event_source", "x", "config_parameter_refused"},
+		{"archive_mode", "on", "config_parameter_refused"}, {"client_encoding", "LATIN1", "config_parameter_refused"}, {"restart_after_crash", "off", "config_parameter_refused"},
+		{"log_transaction_sample_rate", "1", "config_parameter_managed"}, {"log_file_mode", "0000", "config_parameter_managed"},
 	} {
 		if code := problemCode(t, leader, 422, cfgChange(tc.name, "cluster", "", tc.value)); code != tc.code {
 			t.Errorf("%s: code %q, want %s", tc.name, code, tc.code)
@@ -110,6 +112,9 @@ func TestConfigRestartThatCannotStartRollsBack(t *testing.T) {
 	leader, n2 := c.Nodes[0], c.Nodes[2]
 	before := show(t, n2, "postgres", "shared_buffers")
 	cfgApplyDone(t, leader, cfgChange("shared_buffers", "server", n2.Host, "4000GB"))
+	// A second change before the restart: the file that it replaces (the previous one) holds the bad value (P13S-01).
+	cfgApplyDone(t, leader, cfgChange("geqo_threshold", "server", n2.Host, "16"))
+	t.Cleanup(func() { cfgApplyDone(t, leader, cfgChange("geqo_threshold", "server", n2.Host, nil)) })
 	removed := false
 	t.Cleanup(func() {
 		if !removed {

@@ -8,7 +8,7 @@
 import { describe, expect, it } from 'vitest'
 import { screen, waitFor, within } from '@testing-library/vue'
 import userEvent from '@testing-library/user-event'
-import { http, HttpResponse } from 'msw'
+import { delay, http, HttpResponse } from 'msw'
 import { mockServer } from '@/mocks/server'
 import { getState } from '@/mocks/http'
 import {
@@ -478,6 +478,44 @@ describe('applying', () => {
     expect((await d.findByRole('alert')).getAttribute('data-code')).toBe('config_change_superseded')
     expect(bodies).toHaveLength(1)
     expect(bodies[0]!.expectedRevision).toBe(seen)
+  })
+
+  it('does not enable Apply before the revision is known, and goes without it when it cannot be read (P13S-07)', async () => {
+    mockServer.use(http.get('*/api/v1/config/summary', async () => delay('infinite')))
+    const user = userEvent.setup()
+    const { dialog: d } = await openEdit(user, 'work_mem')
+    await type(user, d, '16MB')
+    await d.findByTestId('preview-sentence')
+    expect(d.getByRole('button', { name: /^Apply/ })).toHaveAttribute('aria-disabled', 'true')
+  })
+
+  it('goes without the revision when the summary cannot be read', async () => {
+    mockServer.use(
+      http.get('*/api/v1/config/summary', () =>
+        HttpResponse.json(
+          { type: 'about:blank', title: 'x', status: 503, code: 'service_unavailable' },
+          { status: 503 },
+        ),
+      ),
+    )
+    const user = userEvent.setup()
+    const { dialog: d } = await openEdit(user, 'work_mem')
+    await type(user, d, '16MB')
+    await ready(d)
+    const bodies: { expectedRevision?: number }[] = []
+    mockServer.use(
+      http.post('*/api/v1/config/changes', async ({ request }) => {
+        bodies.push((await request.json()) as { expectedRevision?: number })
+        return HttpResponse.json(
+          { type: 'about:blank', title: 'x', status: 409, code: 'operation_in_progress' },
+          { status: 409 },
+        )
+      }),
+    )
+    await user.click(d.getByRole('button', { name: /^Apply/ }))
+    await d.findByRole('alert')
+    expect(bodies[0]).toBeDefined()
+    expect(bodies[0]!.expectedRevision).toBeUndefined()
   })
 })
 

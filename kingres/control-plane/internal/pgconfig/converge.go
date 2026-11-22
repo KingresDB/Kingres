@@ -84,7 +84,7 @@ func (l *Leader) Run(ctx context.Context) {
 			continue
 		}
 		l.Log.Info("bringing servers up to date with the stored configuration", "servers", need)
-		if _, err := l.StartTask(ctx, KindApply, SubjectType, SubjectApply, applyInput{Actor: "system", Servers: need}, "system"); err != nil {
+		if _, err := l.startConfigTask(ctx, KindApply, SubjectType, SubjectApply, applyInput{Actor: "system", Servers: need}, "system"); err != nil {
 			l.Log.Warn("starting the task that brings servers up to date failed", "error", err)
 		}
 	}

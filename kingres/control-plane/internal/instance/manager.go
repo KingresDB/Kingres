@@ -369,10 +369,25 @@ func (m *Manager) start(ctx context.Context, id int) error {
 		return fmt.Errorf("instance: creating the socket directory: %w", err)
 	}
 	data, _ := m.DataDir(id)
-	out, err := m.run(ctx, "pg_ctl", "start", "-D", data, "-w", "-t", secs(m.startTO),
-		"-l", filepath.Join(data, "kingres-startup.log"))
+	pgStart := func() (string, error) {
+		return m.run(ctx, "pg_ctl", "start", "-D", data, "-w", "-t", secs(m.startTO),
+			"-l", filepath.Join(data, "kingres-startup.log"))
+	}
+	out, err := pgStart()
 	if err != nil {
-		return fmt.Errorf("instance: pg_ctl start: %w: %s", err, out)
+		// A start that fails on an override file of the console (a value the host cannot honour) is tried once more with the
+		// last file the instance ran with, whoever starts it: a restart of the configuration task, the start after a
+		// reboot or a crash, the start of an operator. The fact is left in a mark for the task that asked (P13S-01).
+		if up, _ := m.Running(ctx, id); !up && m.fallBackToGoodConfig(id, firstLineOf(out+" "+err.Error())) {
+			out, err = pgStart()
+		}
+		if err != nil {
+			return fmt.Errorf("instance: pg_ctl start: %w: %s", err, out)
+		}
+	}
+	// The instance started with this file: every value of it was read at the start, so it is the last good one.
+	if gerr := m.MarkConfigGood(id); gerr != nil && !os.IsNotExist(gerr) {
+		m.log.Warn("keeping the running override file failed", "instance", id, "error", gerr)
 	}
 	// A fence that arrived while the start ran wrote its marker and found nothing to stop (FO-14): the gate is asked
 	// again, and an instance that came up against it is stopped at once, whoever started it.

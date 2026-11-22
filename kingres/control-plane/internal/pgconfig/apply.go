@@ -23,6 +23,8 @@ type applyInput struct {
 	Actor   string   `json:"actor"`
 	Servers []string `json:"servers"`
 	Reverts int64    `json:"reverts,omitempty"`
+	// Expected is the revision the client saw; the record step checks it again inside its transaction (P13S-07).
+	Expected *int64 `json:"expected,omitempty"`
 }
 
 // busy reports whether a configuration task (apply or restart) is unfinished.
@@ -53,16 +55,13 @@ func (l *Leader) StartApply(ctx context.Context, actor string, req api.ConfigCha
 			return task.Task{}, ApplyInfo{}, err
 		}
 	}
-	if l.busy(ctx) {
-		return task.Task{}, ApplyInfo{}, problem.New(problem.OperationInProgress, "Another configuration task is still running.")
-	}
 	sortChanges(ck.changes)
 	var servers []string
 	for _, s := range sn.servers {
 		servers = append(servers, s.ID)
 	}
 	info := ApplyInfo{Changes: describe(sn.values, ck.changes), Servers: servers, BasedOn: sn.rev}
-	t, err := l.StartTask(ctx, KindApply, SubjectType, SubjectApply, applyInput{Changes: ck.changes, Actor: actor, Servers: servers, Reverts: reverts}, actor)
+	t, err := l.startConfigTask(ctx, KindApply, SubjectType, SubjectApply, applyInput{Changes: ck.changes, Actor: actor, Servers: servers, Reverts: reverts, Expected: req.ExpectedRevision}, actor)
 	return t, info, err
 }
 
@@ -74,9 +73,6 @@ func (l *Leader) checkExpected(ctx context.Context, sn *snapshot, cs []change, e
 		if err != nil {
 			return serviceDown(err)
 		}
-		if last <= expected {
-			continue
-		}
 		var cur *string
 		for _, v := range sn.values {
 			if v.Name == c.Name && v.Level == c.Level && v.Scope == c.Scope {
@@ -84,7 +80,7 @@ func (l *Leader) checkExpected(ctx context.Context, sn *snapshot, cs []change, e
 				cur = &x
 			}
 		}
-		if (cur == nil) == (c.Value == nil) && (cur == nil || *cur == *c.Value) {
+		if !supersedes(last, expected, cur, c.Value) {
 			continue
 		}
 		return problem.New(problem.ConfigChangeSuperseded, fmt.Sprintf("%s was changed by revision %d after the one you saw (%d); look at it again.", c.Name, last, expected))
@@ -189,6 +185,7 @@ func (l *Leader) stepRecord(ctx context.Context, env *task.Env, in applyInput) e
 			return err
 		}
 		defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+		// One record step at a time: the check of the revision the client saw and the write are one decision (P13S-07).		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('kingres_cp.config_record'))`); err != nil {			return err		}
 		var have int
 		if err := tx.QueryRow(ctx, `SELECT count(*) FROM kingres_cp.config_change WHERE task_id = $1`, env.Task.ID).Scan(&have); err != nil {
 			return err
@@ -211,6 +208,15 @@ func (l *Leader) stepRecord(ctx context.Context, env *task.Env, in applyInput) e
 			case errors.Is(err, pgx.ErrNoRows):
 			default:
 				return err
+			}
+			if in.Expected != nil {
+				var last int64
+				if err := tx.QueryRow(ctx, `SELECT coalesce(max(revision), 0) FROM kingres_cp.config_change WHERE level = $1 AND scope_id = $2 AND name = $3`, ch.Level, ch.Scope, ch.Name).Scan(&last); err != nil {
+					return err
+				}
+				if supersedes(last, *in.Expected, old, ch.Value) {
+					return &taskError{code: "config_change_superseded", msg: fmt.Sprintf("%s was changed by revision %d after the one the request was made against (%d); nothing was recorded", ch.Name, last, *in.Expected)}
+				}
 			}
 			if (old == nil) == (ch.Value == nil) && (old == nil || *old == *ch.Value) {
 				continue
@@ -444,3 +450,24 @@ type taskError struct {
 func (e *taskError) Error() string       { return e.code + ": " + e.msg }
 func (e *taskError) TaskCode() string    { return e.code }
 func (e *taskError) TaskRetryable() bool { return e.retry }
+
+// startConfigTask starts a configuration task unless another one is unfinished. The check and the start are one step
+// under a mutex of the leader, so two requests cannot both pass the check (P13S-07).
+func (l *Leader) startConfigTask(ctx context.Context, kind, subjType, subjID string, input any, actor string) (task.Task, error) {
+	l.startMu.Lock()
+	defer l.startMu.Unlock()
+	if l.busy(ctx) {
+		return task.Task{}, problem.New(problem.OperationInProgress, "Another configuration task is still running.")
+	}
+	return l.StartTask(ctx, kind, subjType, subjID, input, actor)
+}
+
+// supersedes says whether a change would overwrite a change the client has not seen: the value was changed by a revision
+// later than the one the client saw, and does not hold the wanted value already.
+func supersedes(last, expected int64, current, wanted *string) bool {
+	if last <= expected {
+		return false
+	}
+	same := (current == nil) == (wanted == nil) && (current == nil || *current == *wanted)
+	return !same
+}

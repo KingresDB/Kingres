@@ -51,7 +51,9 @@ type Leader struct {
 	ClockEvery time.Duration
 
 	st store
-	tm timeCache
+	// startMu makes the check "no configuration task is unfinished" and the start of a task one step, for the apply and the restart (they have different subjects, so the engine would let both run) (P13S-07).
+	startMu sync.Mutex
+	tm      timeCache
 }
 
 // NewLeader prepares the leader's side.

@@ -135,6 +135,9 @@ func (m *Manager) InitStandby(ctx context.Context, s StandbySpec) (err error) {
 	if err := os.WriteFile(filepath.Join(data, "kingres-managed.conf"), []byte(managed), 0o600); err != nil {
 		return err
 	}
+	if err := m.seedStandbyOverride(data); err != nil {
+		return err
+	}
 	if err := m.saveSettings(s.ID, s.Settings); err != nil {
 		return err
 	}
@@ -372,4 +375,22 @@ func withStandbyIdentLine(ident, osUser string, isCopy bool) string {
 		ident += "\n"
 	}
 	return ident + line
+}
+
+// seedStandbyOverride gives a standby copy the override file of this server instead of the one the base backup carried.
+// The copy holds the file of the server that ran the primary, with its server-level values; this server's instance 1 holds
+// what the configuration task wrote for it, or the empty file when it holds nothing (P13S-05). The files that belong to
+// the instance that was copied (the last good file, the previous one, the rollback mark) are removed.
+func (m *Manager) seedStandbyOverride(data string) error {
+	override := EmptyConfigText
+	if t, err := m.ReadConfig(1); err == nil && t != "" {
+		override = t
+	}
+	if err := writeAtomic(filepath.Join(data, ConfigFileName), []byte(override)); err != nil {
+		return err
+	}
+	for _, suffix := range []string{".good", ".prev", ".rolledback"} {
+		_ = os.Remove(filepath.Join(data, ConfigFileName+suffix))
+	}
+	return nil
 }

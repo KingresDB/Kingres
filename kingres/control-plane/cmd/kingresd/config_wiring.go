@@ -65,6 +65,7 @@ func (p *configParts) start(d *haDeps, calls *callTable) {
 			if _, err := m.EnsureConfig(id); err != nil {
 				d.Log.Warn("preparing the instance for configuration failed", "instance", id, "error", err)
 			}
+			m.AdoptGoodConfig(context.Background(), id)
 		}
 	}
 	d.WG.Add(1)

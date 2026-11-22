@@ -309,8 +309,16 @@ const total = computed(
 const sentence = computed(() =>
   changeSentence(changing.value, total.value, preview.value?.restartServerIds.length ?? 0),
 )
+// Apply waits for the revision the person saw (P13S-07): a request without it would overwrite a change nobody told them of.
+// When the summary cannot be read at all, the request goes without it and the last request wins, as before.
+const revisionKnown = computed(() => seenRevision.value !== null || summary.isError.value)
 const canApply = computed(
-  () => preview.value !== null && preview.value.valid && !previewing.value && changing.value > 0,
+  () =>
+    preview.value !== null &&
+    preview.value.valid &&
+    !previewing.value &&
+    changing.value > 0 &&
+    (props.revert !== undefined || revisionKnown.value),
 )
 
 const task = computed(() => action.task.value)

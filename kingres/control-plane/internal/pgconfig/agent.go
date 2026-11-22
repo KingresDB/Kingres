@@ -373,10 +373,7 @@ func (a *Agent) State(ctx context.Context, req StateRequest) (StateResponse, err
 		}
 		resp.Instances = append(resp.Instances, info)
 	}
-	if t, err := a.mgr().ReadConfig(cluster.NodeID); err == nil {
-		resp.Revision = instance.ConfigRevision(t)
-		resp.ConfigHash = HashOf(t)
-	}
+	resp.Revision, resp.ConfigHash = a.configIdentity()
 	return resp, nil
 }
 
@@ -625,11 +622,7 @@ func (a *Agent) Apply(ctx context.Context, req ApplyRequest) (ApplyResponse, err
 			if err != nil {
 				return err
 			}
-			clean := true // the running instance holds what the file says: the file is the last known good one
 			for _, s := range after {
-				if s.PendingRestart || s.Error != "" {
-					clean = false
-				}
 				ln := strings.ToLower(s.Name)
 				if !names[ln] {
 					continue
@@ -645,11 +638,6 @@ func (a *Agent) Apply(ctx context.Context, req ApplyRequest) (ApplyResponse, err
 					worse(ln, StateFailed, shown, "", fmt.Sprintf("PostgreSQL did not take the value (it runs %s)", shown))
 				default:
 					worse(ln, StateApplied, shown, "", "")
-				}
-			}
-			if clean {
-				if gerr := a.mgr().MarkConfigGood(id); gerr != nil {
-					a.log().Warn("keeping the running override file failed", "instance", id, "error", gerr)
 				}
 			}
 			return nil
@@ -917,33 +905,18 @@ func (a *Agent) RestartInstance(ctx context.Context, id int, ifPending bool) err
 // ran with is put back and the instance is started again, so that a value that passed every check but the host
 // cannot honour (a memory size, for instance) does not leave the server down (P13R-02).
 func (a *Agent) restartAndWait(ctx context.Context, id int) error {
+	_, _ = a.mgr().TakeRollbackMark(id) // a mark of an earlier start is not this restart's
 	if err := a.mgr().Restart(ctx, id); err != nil {
-		up, _ := a.mgr().Running(context.WithoutCancel(ctx), id)
-		if up {
-			return err
-		}
-		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Minute)
-		defer cancel()
-		restored, rerr := a.mgr().RestoreGoodConfig(id)
-		if rerr == nil && !restored {
-			rerr = a.mgr().RestoreConfig(id)
-		}
-		if rerr == nil {
-			rerr = a.mgr().Start(rctx, id)
-		}
-		if rerr != nil {
-			return fmt.Errorf("instance %d did not start with the new configuration (%v) and could not be started again with the previous file: %w", id, firstLine(err.Error()), rerr)
-		}
-		_ = a.waitBack(rctx, id)
-		return fmt.Errorf("instance %d did not start with the new configuration (%s); the previous file was put back and the instance runs again; remove the value that caused it", id, firstLine(err.Error()))
+		return fmt.Errorf("instance %d did not start (the last good override file was tried as well): %w", id, err)
 	}
-	if err := a.waitBack(ctx, id); err != nil {
-		return err
+	// The manager starts an instance that cannot start with its override file again with the last good one (it does so for
+	// every start, also after a reboot); the mark says that it did (P13S-01).
+	why, rolledBack := a.mgr().TakeRollbackMark(id)
+	if rolledBack {
+		_ = a.waitBack(ctx, id)
+		return fmt.Errorf("instance %d did not start with the new configuration (%s); the previous file was put back and the instance runs again; remove the value that caused it", id, why)
 	}
-	if err := a.mgr().MarkConfigGood(id); err != nil {
-		a.log().Warn("keeping the running override file failed", "instance", id, "error", err)
-	}
-	return nil
+	return a.waitBack(ctx, id)
 }
 
 // waitBack waits until the instance accepts connections (and a standby streams).
@@ -1073,4 +1046,39 @@ func (a *Agent) restartNeeded(ctx context.Context, id int) bool {
 		return true
 	}
 	return n > 0
+}
+
+// configIdentity returns the revision and the hash of the override files of this server: when every instance that
+// has a data directory holds the same file, its hash and revision; else the lowest revision and a hash that no
+// rendered file has, so that the leader's loop brings the server up to date (a standby that was copied from
+// another server holds that server's file, P13S-05).
+func (a *Agent) configIdentity() (int64, string) {
+	var rev int64 = -1
+	hashes := map[string]bool{}
+	var one string
+	for _, id := range a.instanceIDs() {
+		data, err := a.mgr().DataDir(id)
+		if err != nil {
+			continue
+		}
+		if st, serr := os.Stat(data); serr != nil || !st.IsDir() {
+			continue // a standby that is still being created has no data directory yet
+		}
+		t, err := a.mgr().ReadConfig(id)
+		if err != nil {
+			continue
+		}
+		if r := instance.ConfigRevision(t); rev < 0 || r < rev {
+			rev = r
+		}
+		one = HashOf(t)
+		hashes[one] = true
+	}
+	switch {
+	case len(hashes) == 0:
+		return 0, ""
+	case len(hashes) == 1:
+		return rev, one
+	}
+	return rev, "mixed:" + strings.Join(sortedKeys(hashes), ",")
 }

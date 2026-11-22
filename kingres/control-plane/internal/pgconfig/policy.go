@@ -122,6 +122,10 @@ var refusedReason = map[string]instance.Reason{
 
 // refusedByPolicy are parameters refused although PostgreSQL does not hide them.
 var refusedByPolicy = map[string]instance.Reason{
+	"archive_mode":                  {Code: instance.ReasonUnsafe, Text: "archiving needs an archive command, which cannot be set here, and without one every WAL segment is kept until the disk is full; set it on the server."},
+	"restart_after_crash":           {Code: instance.ReasonUnsafe, Text: "with it off a crash leaves the instance down until someone starts it."},
+	"recovery_min_apply_delay":      {Code: instance.ReasonUnsafe, Text: "it delays a standby, and with it a failover and a synchronous commit."},
+	"max_slot_wal_keep_size":        {Code: instance.ReasonUnsafe, Text: "a small value invalidates the replication slot of a standby that lags; set it on the server."},
 	"fsync":                         {Code: instance.ReasonUnsafe, Text: "with it off a crash can corrupt a server that the cluster believes holds acknowledged commits."},
 	"full_page_writes":              {Code: instance.ReasonUnsafe, Text: "with it off a crash can corrupt a server that the cluster believes holds acknowledged commits."},
 	"kingres_shard.fault_injection": {Code: instance.ReasonDeveloper, Text: "a test hook of the sharding extension."},
@@ -152,6 +156,7 @@ var controlPlaneSettings = map[string]bool{
 	"default_tablespace":                  true,
 	"temp_tablespaces":                    true,
 	"check_function_bodies":               true,
+	"client_encoding":                     true,
 }
 
 var controlPlaneReason = instance.Reason{Code: instance.ReasonControlPlane, Text: "it changes how kingresd's own sessions behave (a read-only default or a timeout stops the task engine, a changed search path changes what its statements mean); set it for a role on the server."}
@@ -278,6 +283,8 @@ func CheckLevel(s Setting, c Class, level string) (code, msg string) {
 // parameter (a count). replicas is the cluster's replica count.
 func Floor(name string, replicas int) (min int64, reason string, ok bool) {
 	switch strings.ToLower(name) {
+	case "max_worker_processes":
+		return 8, "the launchers and workers of kingres_shard and kingres_ledger (a block worker for each ledger database, the recovery and learn workers) and the launcher of logical replication need slots; below 8 they are silently not started", true
 	case "max_prepared_transactions":
 		return 1, "the sharding extension needs two-phase commit (at least 1)", true
 	case "max_wal_senders":

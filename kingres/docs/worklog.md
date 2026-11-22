@@ -7,6 +7,35 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-22 (second entry): the fixes for the review of the fixes of phase 13
+
+### What was done
+
+- The review ([reviews/2026-11-22-config-phase13-fixes.md](reviews/2026-11-22-config-phase13-fixes.md)) found 5 medium and 4 low findings (P13S-01 to P13S-09, no critical or high). All are fixed or answered on `p13-fix`; the report has a "Fixes" section.
+- P13S-01: every successful start keeps the override file as the last good one; the manager retries a failed start with it (the empty file when none, never the previous one), for every start (the restart task, a reboot, a crash, an operator), with a mark the task reads.
+- P13S-02, 03, 06, 09: the sample-rate log parameters and `log_file_mode` are managed; `archive_mode`, `client_encoding`, `restart_after_crash`, `recovery_min_apply_delay`, `max_slot_wal_keep_size` are refused. P13S-04: floor of 8 for `max_worker_processes`.
+- P13S-05: the hash of a server covers every instance, and a copied standby gets the override file of its own server. P13S-07: `expectedRevision` is checked again in the record step, the start of a configuration task is one step under a mutex, the dialog waits for the revision.
+
+### How it was verified
+
+- Mutants: 5 for the rollback and the identity (killed by the new tests), 7 for the lists, the floor, `supersedes` and the standby file, 1 for the dialog; all killed.
+- PostgreSQL 18 and 19.0 (private installs, lane l5): `pgconfig`, `instance`, `httpapi`, `ops`, `standby` packages (318 passing tests each) and the 23 `TestConfig*` cluster tests.
+- Console: typecheck, lint, 1464 unit tests, `api:check`; `check-contract.mjs` holds. The browser tests were not run again (only a text and a disabled state of the dialog changed since the last run).
+
+### Decisions and deviations
+
+- The exclusion of `config.apply` and `config.restart` is a mutex of the leader, not a rule of the engine (see the report).
+
+### Still open
+
+See "What is left" of the report: no state on the server page for a start that went back to the good file at a reboot; no floors for `max_parallel_workers` and `max_locks_per_transaction`.
+
+### Core patches
+
+None.
+
+---
+
 ## 2026-11-22: the fixes for the first independent review of phase 13 (configuration from the console)
 
 ### What was done
