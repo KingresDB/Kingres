@@ -100,6 +100,13 @@ export const keys = {
     ['tablePartitions', db, schema, table] as const,
   tableChange: (db: string, schema: string, table: string, request: string) =>
     ['tableChange', db, schema, table, request] as const,
+  approximateAggregates: (name: string) => ['approximateAggregates', name] as const,
+  partitionPolicy: (db: string, schema: string, table: string) =>
+    ['partitionPolicy', db, schema, table] as const,
+  partitionRuns: (db: string, schema: string, table: string) =>
+    ['partitionRuns', db, schema, table] as const,
+  partitionRun: (db: string, schema: string, table: string, id: number) =>
+    ['partitionRun', db, schema, table, id] as const,
   colocation: (name: string) => ['colocation', name] as const,
   buckets: (name: string, colocationId: number) => ['buckets', name, colocationId] as const,
   bucketDistribution: (name: string, colocationId?: number) =>
@@ -296,6 +303,95 @@ export const useTableChangePreview = (
     retry: false,
     staleTime: 0,
     gcTime: 0,
+  })
+
+/** The approximate-aggregates setting of a database and the state of the extension on every server (contract 0.18.0). */
+export const useApproximateAggregates = (
+  name: MaybeRefOrGetter<string>,
+  enabled: MaybeRefOrGetter<boolean> = true,
+) =>
+  useQuery({
+    queryKey: computed(() => keys.approximateAggregates(toValue(name))),
+    queryFn: () => endpoints.getApproximateAggregates(toValue(name)),
+    enabled: computed(() => toValue(enabled)),
+    refetchInterval: every(POLL.normal),
+  })
+
+/**
+ * The time-partitioning policy of a table. A table with no policy answers 404; that is an answer (null), not a failure.
+ * Any other problem, and 422 unsupported_operation of an older server, stay errors.
+ */
+export const usePartitionPolicy = (
+  db: MaybeRefOrGetter<string>,
+  schema: MaybeRefOrGetter<string>,
+  table: MaybeRefOrGetter<string>,
+  enabled: MaybeRefOrGetter<boolean> = true,
+) =>
+  useQuery({
+    queryKey: computed(() => keys.partitionPolicy(toValue(db), toValue(schema), toValue(table))),
+    queryFn: async () => {
+      try {
+        return await endpoints.getPartitionPolicy(toValue(db), toValue(schema), toValue(table))
+      } catch (e) {
+        // A 404 for "no policy" is an answer; a 404 that says the table is not on the instance of the manager leader (another
+        // shard group) is not: the panel then shows the error and offers no "Set a policy" that would fail the same way.
+        if (
+          e instanceof ApiError &&
+          e.status === 404 &&
+          !/another shard group|instance of the manager leader|not on this instance/i.test(
+            e.problem.detail ?? '',
+          )
+        )
+          return null
+        throw e
+      }
+    },
+    enabled: computed(() => toValue(enabled)),
+    refetchInterval: every(POLL.normal),
+  })
+
+/** The runs of the policy of a table, newest first (the actions of a listed run are empty: read the run for them). */
+export const usePartitionRuns = (
+  db: MaybeRefOrGetter<string>,
+  schema: MaybeRefOrGetter<string>,
+  table: MaybeRefOrGetter<string>,
+  enabled: MaybeRefOrGetter<boolean> = true,
+) =>
+  useQuery({
+    queryKey: computed(() => keys.partitionRuns(toValue(db), toValue(schema), toValue(table))),
+    queryFn: () =>
+      fetchAllPages((cursor) =>
+        endpoints.listPartitionPolicyRuns(
+          toValue(db),
+          toValue(schema),
+          toValue(table),
+          cursor ? { cursor } : {},
+        ),
+      ),
+    enabled: computed(() => toValue(enabled)),
+    refetchInterval: every(POLL.normal),
+  })
+
+/** One run with its actions. */
+export const usePartitionRun = (
+  db: MaybeRefOrGetter<string>,
+  schema: MaybeRefOrGetter<string>,
+  table: MaybeRefOrGetter<string>,
+  id: MaybeRefOrGetter<number | null>,
+) =>
+  useQuery({
+    queryKey: computed(() =>
+      keys.partitionRun(toValue(db), toValue(schema), toValue(table), toValue(id) ?? -1),
+    ),
+    queryFn: () =>
+      endpoints.getPartitionPolicyRun(
+        toValue(db),
+        toValue(schema),
+        toValue(table),
+        toValue(id) as number,
+      ),
+    enabled: computed(() => toValue(id) !== null),
+    refetchInterval: every(POLL.normal),
   })
 
 export const useDatabase = (name: MaybeRefOrGetter<string>) =>

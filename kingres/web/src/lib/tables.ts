@@ -18,6 +18,9 @@ export const TABLE_TASK_KINDS = [
   'table.undistribute',
   'table.alter',
   'table.partition',
+  // Phase 12 (contract 0.18.0): the storage format of the table, and a run of its time-partitioning policy.
+  'table.setStorage',
+  'partition.maintain',
 ] as const
 
 /** The largest partition name: leaf names append `_bNNNN` to it (contract `CreateTablePartitionRequest.name`). */
@@ -68,6 +71,13 @@ const BLOCKER_LABEL: Record<string, string> = {
   not_plain: 'The table is already distributed',
   ledger_table: 'A ledger table',
   user_partitioned: 'A user-partitioned table',
+  // Phase 12 (contract 0.18.0, `TableStoragePreview` and `conversion_refused`).
+  partition: 'A partition that cannot be converted',
+  distributed_table: 'A distributed table',
+  publication: 'A publication',
+  foreign_keys: 'Foreign keys',
+  other: 'Refused by the extension',
+  owner_not_trusted: 'The owner of the table is not trusted',
   free_space: 'Not enough free space',
 }
 
@@ -130,17 +140,23 @@ export function tableSubjectId(database: string, schema: string, table: string):
   return `${database}/${schema}.${table}`
 }
 
+/**
+ * The tasks of one table. "partitions" are the names of its partitions: the task table.setStorage of one partition has the
+ * subject database/schema.partition (contract 0.18.0), and it holds the table too.
+ */
 export function tasksOfTable(
   tasks: Task[],
   database: string,
   schema: string,
   table: string,
+  partitions: readonly string[] = [],
 ): Task[] {
   const id = tableSubjectId(database, schema, table)
+  const parts = new Set(partitions.map((p) => tableSubjectId(database, schema, p)))
   return tasks.filter(
     (t) =>
       t.subject?.type === 'table' &&
-      t.subject?.id === id &&
+      (t.subject?.id === id || (t.kind === 'table.setStorage' && parts.has(t.subject?.id ?? ''))) &&
       (TABLE_TASK_KINDS as readonly string[]).includes(t.kind),
   )
 }
@@ -166,9 +182,10 @@ export function runningTaskOfTable(
   database: string,
   schema: string,
   table: string,
+  partitions: readonly string[] = [],
 ): Task | null {
   return (
-    tasksOfTable(tasks, database, schema, table).find(
+    tasksOfTable(tasks, database, schema, table, partitions).find(
       (t) => t.state === 'pending' || t.state === 'running' || t.state === 'paused',
     ) ?? null
   )

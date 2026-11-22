@@ -13,11 +13,12 @@ import TableWrap from '@/components/TableWrap.vue'
 import { endpoints } from '@/api/endpoints'
 import { ApiError, isSessionLost } from '@/api/problem'
 import { useAnnounce } from '@/composables/useAnnounce'
-import { useDatabases } from '@/api/queries'
+import { useApproximateAggregates, useDatabases } from '@/api/queries'
 import { formatNumber } from '@/lib/format'
 import { vBlockEnterSubmit } from '@/lib/forms'
 import { hasHidden, safeText } from '@/lib/safe-text'
 import { firstError, integerBetween } from '@/lib/validators'
+import { planLines, summarizePlan } from '@/lib/plan-summary'
 import { useSessionStore } from '@/stores/session'
 import type { QueryResult } from '@/api/types'
 
@@ -28,6 +29,14 @@ const session = useSessionStore()
 const announce = useAnnounce()
 const databases = useDatabases()
 const database = ref('')
+/** Whether the database has the sketch types (contract 0.18.0); the help text next to the editor lists the functions. */
+const aggregates = useApproximateAggregates(
+  () => database.value,
+  () => database.value !== '',
+)
+const sketchesOn = computed(() => aggregates.data.value?.enabled === true)
+const SKETCH_FUNCTIONS =
+  'hll_add_agg, hll_union_agg, hll_cardinality, approx_count_distinct, topn_add_agg, topn_union_agg, topn_list, tdigest_agg, tdigest_quantile'
 const sql = ref('select * from orders')
 const rowLimit = ref<number | string>(1000)
 /** Seconds; empty means the server default (30 s). */
@@ -244,6 +253,12 @@ const errorHint = computed(() => {
     return 'One database role can run at most two statements at a time on one server (the server runs four in all). A statement that you stopped waiting for still counts until it ends. Wait for one to finish, or cancel one, and run this statement again; it was not started.'
   return ''
 })
+/** The lines of an EXPLAIN result (first column QUERY PLAN) and the one-line summary read from them; null for any other result. */
+const plan = computed(() => {
+  const r = result.value
+  const lines = r ? planLines(r.data) : null
+  return lines ? { lines, summary: summarizePlan(lines) } : null
+})
 const hiddenRows = computed(() => (result.value?.data.rows.length ?? 0) - shownRows.value.length)
 </script>
 
@@ -259,7 +274,8 @@ const hiddenRows = computed(() => (result.value?.data.rows.length ?? 0) - shownR
       <strong><SafeName :value="session.username ?? ''" kind="text" :max="40" /></strong>. INSERT,
       UPDATE, DELETE and DDL statements are executed, not simulated, and are recorded in the audit
       log. There is no read-only mode in the API. A result cut at the row limit does not stop a
-      statement that changes data: it is still carried out and committed.
+      statement that changes data: it is still carried out and committed. EXPLAIN ANALYZE and MERGE
+      run the statement too.
     </span>
   </p>
   <form v-block-enter-submit class="stack" @submit.prevent>
@@ -322,6 +338,10 @@ const hiddenRows = computed(() => (result.value?.data.rows.length ?? 0) - shownR
       <strong>Cancel statement</strong> asks the server to end the statement now; it is rolled back.
       <strong>Stop waiting</strong> only stops this page from waiting: the statement keeps running
       on the server and keeps one of your two workbench slots until it ends.
+    </p>
+    <p v-if="sketchesOn" class="hint muted" data-testid="sketch-help">
+      Approximate aggregates are on for this database. Functions of the sketch types hll, topn and
+      tdigest: {{ SKETCH_FUNCTIONS }}.
     </p>
     <div class="field">
       <label for="w-sql">SQL (Ctrl+Enter runs)</label>
@@ -412,7 +432,31 @@ const hiddenRows = computed(() => (result.value?.data.rows.length ?? 0) - shownR
           result.
         </span>
       </p>
-      <TableWrap>
+      <div v-if="plan" class="stack" data-testid="plan">
+        <p v-if="plan.summary" class="notice tone-info" role="status" data-testid="plan-summary">
+          <span aria-hidden="true">&#9432;</span>
+          <span>
+            <strong>Path: {{ plan.summary.path }}</strong
+            ><template v-if="plan.summary.groups"> ({{ plan.summary.groups }} groups)</template>.
+            <template v-for="n in plan.summary.notUsed" :key="'n' + n"
+              ><span data-testid="plan-not-used">
+                Not used: <SafeName :value="n" kind="text" :max="300" />.</span
+              ></template
+            >
+            <template v-for="r in plan.summary.rewritten" :key="'r' + r"
+              ><span data-testid="plan-rewritten">
+                Rewritten: <SafeName :value="r" kind="text" :max="300" />.</span
+              ></template
+            >
+          </span>
+        </p>
+        <pre
+          class="mono plan"
+          data-testid="plan-text"
+        ><template v-for="(line, i) in plan.lines" :key="i"><template v-if="plain(line)">{{ line }}</template><SafeName v-else :value="line" kind="text" :max="LONG" />
+</template></pre>
+      </div>
+      <TableWrap v-else>
         <table class="table">
           <caption class="sr-only">
             Query result
@@ -466,5 +510,10 @@ const hiddenRows = computed(() => (result.value?.data.rows.length ?? 0) - shownR
 <style scoped>
 .is-stale {
   opacity: 0.7;
+}
+.plan {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 </style>

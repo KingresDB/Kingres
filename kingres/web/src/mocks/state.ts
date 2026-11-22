@@ -39,6 +39,7 @@ import type {
 } from '@/api/types'
 import { createConfigState, type ConfigState } from './config-data'
 import { createLedger7State, type Ledger7State } from './ledger-data'
+import type { AnalyticsState } from './analytics'
 
 type S = components['schemas']
 
@@ -344,6 +345,8 @@ export interface MockState {
   databases: DbRec[]
   /** The user partitions of the partitioned tables, by `database/schema.table` (0.14.0, increment 9.7). */
   partitions?: Record<string, components['schemas']['TablePartition'][]>
+  /** Phase 12 (0.18.0): approximate aggregates, storage, policies and runs; see mocks/analytics.ts. */
+  analytics?: AnalyticsState
   tasks: TaskRec[]
   nextTaskId: number
   roles: Role[]
@@ -931,6 +934,7 @@ export function createMockState(options: { uninitialized?: boolean } = {}): Mock
         automatic: { ...DEFAULT_AUTOMATIC },
       },
       features: { sharding: true, ledger: true },
+      analytics: { allowNonSuperuserOwners: false },
       clock: { maxDifferenceMs: 1000 },
       restart: { required: false, serverIds: [] },
     },

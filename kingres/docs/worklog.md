@@ -96,26 +96,69 @@ the reference tables only).
 
 ## 2026-11-22 (third entry): fixes for the second review of the phase 12 control plane (P12D-01 to P12D-09)
 
-Branch `p12-cp`. The review is [reviews/2026-11-22-control-plane-phase12-fixes.md](reviews/2026-11-22-control-plane-phase12-fixes.md); its "Fixes" section lists every finding with the change and the test.
+## 2026-11-22: the console of phase 12 follows the settled contract, the owners of tables, and the independent review
+
+Continues the entry below on branch p12-web.
 
 ### What was done
 
-- A scheduled run is compared with the last run of its policy (a clock that stepped is refused, one alert); a failure before any run exists backs off on the policy itself; the library check covers standbys; the preload list keeps the library of an instance that had it.
-- The decision for non-superuser owners: the cluster setting `analytics.allowNonSuperuserOwners` (default off, contract 0.18.0), the refusal codes, one alert instead of a retry, and the corrected trust text. `tableOwner` and `ownerTrusted` on the policy and the storage preview.
-- Lows: reader stall shortened (200 ms) and described, alerts of dropped databases cleared, one alert per refusal, `maintainRunning` fails closed, back-off on the last run.
-- Contract changes for the console are in `p12cp/contract-changes.txt` (items 14 to 17).
+- Merged p12-cp twice (`22a40eb52f`, `a8a770e771`; contract still 0.18.0): the `dryRun` preview and typed blockers of a storage change, the table in the alert subject, sentence step names, the enumerated shapes of `partitionEvery`, the bound of `asOf`, a put refused during a run, the cluster setting `analytics.allowNonSuperuserOwners` (a switch on the Settings page with its consequence and a confirmation to turn it on), `tableOwner` and `ownerTrusted` (an owner notice with a link to the setting), the blocker `owner_not_trusted`, and the refusal of a policy put and run for an owner that is not trusted. The mock follows each of them.
+- Fixed the findings P12W1 to P12W10 of the independent review ([the review](reviews/2026-11-22-console-phase12.md), section Fixes): sizes never made up, no Save over a policy that was not read, Run now held and red, a re-enabled drop policy needs preview and name, values the form cannot show are kept, real multi-unit intervals, a mock that finds indexes and triggers only when the task runs, field errors by JSON pointer, the smaller points.
 
-### How it was verified
+### How it was checked
 
-PostgreSQL 18 and 19.0, lane l1: the PG-backed tests of `internal/ops`, `internal/instance`, `internal/store/pgstore` and the two cluster tests. Unit tests of `ops`, `partsched`, `monitor`, `api`, `contract`; `check-contract.mjs`. Mutants are in the report.
-
-### Decisions and deviations
-
-- The setting is a cluster setting read from `kingres_cp.cluster_setting` at each use; a system database without it means off.
+- typecheck, lint, `api:check`, the full vitest suite and the browser suite: full vitest 95 files, 1727 tests pass; browser suite 4 files, 48 tests pass; typecheck, lint and api:check clean.
+- New mutants, all caught: trusting owners without asking, a policy put accepted for an untrusted owner, the setting not making an owner trusted, the owner notice for a trusted owner, a run for an untrusted owner not refused, Save over an unread policy, Run now not held on a failed plan, a kept value rewritten, a drop policy turned on without preview, a size shown as 0, a 404 of another instance taken for no policy, field errors read by the bare name, a run that sends `asOf`, a plan with invented sizes, an unknown format counted as Row; the earlier survivors M6, M8 and M17 of the review are caught by tests of their own.
 
 ### Still open
 
-- A cluster test that restarts one server with the library missing.
+- The end-to-end run against a real `kingresd`.
+- Not pushed.
+
+---
+
+## 2026-11-22: the analytics console (phase 12, steps W1 and W2) on contract 0.18.0
+
+Branch p12-web, from the contract commit `7d43a79a3f` of p12-cp. The table page of increment 9.7 (branch web-15b, one commit) is not on kingres-18, and the Storage column, the partitions panel and the policy need it, so that commit is taken first (cherry-picked, the same change). The control plane of phase 12 is built on p12-cp by another writer; nothing in `kingres/api` or in Go is changed here.
+
+### What was done
+
+- **Approximate aggregates** (inventory row Q-W1): `ApproximateAggregatesCard` on the database page and `ApproximateAggregatesDialog` (a switch, the mode of count(DISTINCT), the error rate in percent, the consequence in words, the task with its five steps). The three new problem codes of the extension have their own words.
+- **Plan summary** (Q-W1, and the phase 2b item "EXPLAIN path summary in the workbench"): `lib/plan-summary.ts` reads the lines `Pushed:`, `Repartition:`, `Pushdown: not used:`, `Rewritten:` and `Remote groups:` of an EXPLAIN result and shows one line above the monospaced plan (path, why not, rewrite); no line it knows, no summary. The help text with the sketch functions appears when the database has the extension; the note says EXPLAIN ANALYZE and MERGE run the statement.
+- **Storage** (St-W1): `StorageBadge` and the Storage column and filter of the tables list; the Storage row, the format, range, rows and ratio of each partition, a filter by format and a marker with progress on the row of a partition that is being converted, on the table page.
+- **Policy and runs** (St-W1, St-W2): `PartitionPolicyPanel` (policy, health line, next and last run, runs list), `PartitionRunDialog` (a run with its actions, failures in words), `PartitionPolicyDialog` (the form, **Preview** through `planPartitionPolicy`, the field errors from the JSON pointers, the table name typed when a retention is new or shorter, and a preview of the form as it is then), `RunPolicyDialog` (the plan first, then the task), `RemovePolicyDialog`, and the link of the two new alert kinds to the table.
+- **Convert storage** (St-W2): `SetStorageDialog` for a table or one partition (codec, level, stripe and chunk rows, sort order of a partition, what the console already knows that stops it, the reasons of `conversion_refused` listed, cancel until the switch).
+- **Mock** (`src/mocks/analytics.ts`, switch `?analytics=`): all eleven operations as the contract says, including the tasks, the problem codes, the idempotency of configure and put, the dry run that changes nothing, the 404 of a table without a policy, the roles and `unsupported_operation` on an older server. `describeTable` adds `storage` and the new members of `partitioning`; `listTablePartitions` answers the format, range, rows and ratio.
+- README of the web panel: a section for the analytics console and the switch `?analytics=`. The notes on what the contract does not say are in the report of the writer (11 items: the subject of the partition alerts, no preview of a storage change, no way to install kingres_columnar, the step names, the shapes of the intervals, and others).
+- A separate commit formats three files that were unformatted before this work (`api/problem.ts`, `contract-0-4.test.ts`, `kind-labels.test.ts`); `npm run lint` fails without it.
+
+### How it was checked
+
+- `npm run typecheck`, `npm run lint` (eslint and prettier) and `npm run api:check` (the generated files are up to date with the contract at `7d43a79a3f`): clean.
+- `npx vitest run` (two workers): 95 files, 1685 tests passed (after the merge of the settled contract of p12-cp, `22a40eb52f`: dryRun preview, typed blockers, alert subject members, sentence step names, asOf bound, put refused during a run; mutants for these were added and caught). New: `analytics-lib-0-18` (46), `analytics-mock-0-18` (49), `analytics-ui-0-18` (65). One existing test, in `hostile.test.ts`, asked for "the table" of the database page and now names it, because the page has a second table (the servers of the card). `tables-0-14-mock.test.ts` compares `partitioning` with `toMatchObject` now, because 0.18.0 adds members to it. The full run once showed `task-notices.test.ts` timing out under load; it passes alone and in the later full run.
+- `npm run test:browser` (Chrome): 4 files, 48 tests passed. The new file runs the eight states of phase 12 through axe in light and dark at 1366 and 320 px (no violation) and checks that no page scrolls sideways and that each dialog and its buttons stay inside the window at 1366 and 320 px.
+- Mutants, each caught and reverted (the tree was clean after each): a new or shorter retention no longer needs the name typed; a missing ratio shown as `0.0 x`; a repartitioned join read as a colocated one (survived at first because the Repartition line gave the same answer; a test of the Pushed line alone was added, then caught); the mock accepts a columnar_after longer than the retention; the mock does not refuse a conversion for its reasons; the mock plan changes the partitions; a blocked storage change can still start; saving a retention does not ask for the name; saving a retention needs no preview; a preview of an older form is taken for the current one; the error rate of the dialog is not checked; a conversion of a partition does not hold the table page; the Storage filter shows every table; the plan is audited or needs admin (role change); a server without the sketch package is not refused; a hidden character of a server id shown as it is; in the browser: a select without a label (axe), a 900 px wide grid at 320 px (layout), an unnamed button (axe).
+- `git diff --check`, the scan for the project name misspelt with a double s, and the scan for local paths in the changed files: clean.
+
+### Decisions and deviations
+
+- The Storage filter is made in the panel from `Table.storage`; the server's `storage` parameter is implemented in the mock but not sent (the whole list is read anyway).
+- `Convert storage` is not offered for a distributed table or for the partitions of one (the release has heap distributed partitions only; D1b is later).
+- The alert link reads the table from `AlertSubject.tableSchema` and `tableName` (settled in the contract after the first version of this entry, which read it from `aspect`).
+- The mock uses the sentence step names of the settled README for `table.setStorage` and `partition.maintain`, and a disable of approximate aggregates runs the same five steps as an enable.
+
+### Still open
+
+- The contract notes (11 items) for the writer of the control plane.
+- No install action for `kingres_columnar` (no operation for it); no preview for a storage change; the alert subject of the partition alerts; the distributed tables.
+- The end-to-end run against a real `kingresd` once the control plane of phase 12 is built.
+- Not pushed.
+
+### Core patches
+
+none
+
+---
 
 ### Core patches
 
@@ -339,6 +382,28 @@ Covers the work on branch shard-p1011 after the second review of phase 11 (the r
 - The comparison of `p11-cp-steps13-14` with cp-1011.
 - A load that is incremental per colocation group, if 2000 schemas are not enough (the DDL statement still grows from 26 to 52 ms between 200 and 2000 schemas).
 - A flake seen once under the control plane work: the switch of a move under a running writer timed out on a node and the move was undone; not understood.
+## 2026-11-22 (third entry): fixes for the second review of the phase 12 control plane (P12D-01 to P12D-09)
+
+Branch `p12-cp`. The review is [reviews/2026-11-22-control-plane-phase12-fixes.md](reviews/2026-11-22-control-plane-phase12-fixes.md); its "Fixes" section lists every finding with the change and the test.
+
+### What was done
+
+- A scheduled run is compared with the last run of its policy (a clock that stepped is refused, one alert); a failure before any run exists backs off on the policy itself; the library check covers standbys; the preload list keeps the library of an instance that had it.
+- The decision for non-superuser owners: the cluster setting `analytics.allowNonSuperuserOwners` (default off, contract 0.18.0), the refusal codes, one alert instead of a retry, and the corrected trust text. `tableOwner` and `ownerTrusted` on the policy and the storage preview.
+- Lows: reader stall shortened (200 ms) and described, alerts of dropped databases cleared, one alert per refusal, `maintainRunning` fails closed, back-off on the last run.
+- Contract changes for the console are in `p12cp/contract-changes.txt` (items 14 to 17).
+
+### How it was verified
+
+PostgreSQL 18 and 19.0, lane l1: the PG-backed tests of `internal/ops`, `internal/instance`, `internal/store/pgstore` and the two cluster tests. Unit tests of `ops`, `partsched`, `monitor`, `api`, `contract`; `check-contract.mjs`. Mutants are in the report.
+
+### Decisions and deviations
+
+- The setting is a cluster setting read from `kingres_cp.cluster_setting` at each use; a system database without it means off.
+
+### Still open
+
+- A cluster test that restarts one server with the library missing.
 
 ## 2026-11-22: phase 12 control plane (contract 0.18.0): approximate aggregates, storage conversion, time-partitioning policies and their scheduler, and the preload of kingres_columnar
 

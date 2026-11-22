@@ -56,6 +56,20 @@ async function startedTask(answer: Promise<Task | S['FailoverPlan']>): Promise<T
   return result
 }
 
+/** A storage change without `dryRun` answers a task; a preview can not come back (the panel never asks for it there). */
+async function storageTask(answer: Promise<unknown>): Promise<Task> {
+  const r = await unwrap(answer as never)
+  if (!('id' in (r as object))) throw new Error('The server answered with a preview, not a task.')
+  return r as Task
+}
+/** A storage change with `dryRun` answers the preview; a task can not come back. */
+async function storagePreview(answer: Promise<unknown>): Promise<S['TableStoragePreview']> {
+  const r = await unwrap(answer as never)
+  if (!('willConvert' in (r as object)))
+    throw new Error('The server answered with a task, not a preview.')
+  return r as S['TableStoragePreview']
+}
+
 export interface Page {
   limit?: number
   cursor?: string
@@ -297,6 +311,166 @@ export const endpoints = {
       api.DELETE(
         '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partitions/{partitionName}',
         { params: { path: { databaseName, schemaName, tableName, partitionName } } },
+      ),
+    ),
+  // --- analytics: approximate aggregates, storage format, time partitioning (contract 0.18.0)
+  getApproximateAggregates: (databaseName: string) =>
+    j(
+      api.GET('/databases/{databaseName}/approximate-aggregates', {
+        params: { path: { databaseName } },
+      }),
+    ),
+  configureApproximateAggregates: (databaseName: string, body: S['ApproximateAggregatesRequest']) =>
+    j(
+      api.PUT('/databases/{databaseName}/approximate-aggregates', {
+        params: { path: { databaseName } },
+        body,
+      }),
+    ),
+  setTableStorage: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    body: S['TableStorageRequest'],
+  ) =>
+    storageTask(
+      api.PUT('/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/storage', {
+        params: { path: { databaseName, schemaName, tableName } },
+        body,
+      }),
+    ),
+  setPartitionStorage: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    partitionName: string,
+    body: S['PartitionStorageRequest'],
+  ) =>
+    storageTask(
+      api.PUT(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partitions/{partitionName}/storage',
+        { params: { path: { databaseName, schemaName, tableName, partitionName } }, body },
+      ),
+    ),
+  /** What a storage change of a table would do (`dryRun=true`): the blockers and notes, no task. */
+  previewTableStorage: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    body: S['TableStorageRequest'],
+  ) =>
+    storagePreview(
+      api.PUT('/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/storage', {
+        params: { path: { databaseName, schemaName, tableName }, query: { dryRun: true } },
+        body,
+      }),
+    ),
+  previewPartitionStorage: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    partitionName: string,
+    body: S['PartitionStorageRequest'],
+  ) =>
+    storagePreview(
+      api.PUT(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partitions/{partitionName}/storage',
+        {
+          params: {
+            path: { databaseName, schemaName, tableName, partitionName },
+            query: { dryRun: true },
+          },
+          body,
+        },
+      ),
+    ),
+  getPartitionPolicy: (databaseName: string, schemaName: string, tableName: string) =>
+    j(
+      api.GET(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partition-policy',
+        {
+          params: { path: { databaseName, schemaName, tableName } },
+        },
+      ),
+    ),
+  putPartitionPolicy: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    body: S['PartitionPolicyRequest'],
+  ) =>
+    j(
+      api.PUT(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partition-policy',
+        {
+          params: { path: { databaseName, schemaName, tableName } },
+          body,
+        },
+      ),
+    ),
+  deletePartitionPolicy: (databaseName: string, schemaName: string, tableName: string) =>
+    j(
+      api.DELETE(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partition-policy',
+        { params: { path: { databaseName, schemaName, tableName } } },
+      ),
+    ),
+  /** `asOf` is for tests and dry replays: within five minutes of the time of the instance. The panel never sends it. */
+  runPartitionPolicy: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    body: S['RunPartitionPolicyRequest'] = {},
+  ) =>
+    j(
+      api.POST(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partition-policy/runs',
+        { params: { path: { databaseName, schemaName, tableName } }, body },
+      ),
+    ),
+  listPartitionPolicyRuns: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    q: Page & { state?: S['PartitionRunState'] } = {},
+  ) =>
+    j(
+      api.GET(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partition-policy/runs',
+        {
+          params: {
+            path: { databaseName, schemaName, tableName },
+            query: { limit: 50, ...q },
+          },
+        },
+      ),
+    ),
+  getPartitionPolicyRun: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    runId: number,
+  ) =>
+    j(
+      api.GET(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partition-policy/runs/{runId}',
+        { params: { path: { databaseName, schemaName, tableName, runId } } },
+      ),
+    ),
+  /** A dry run: what a run would do now, with the stored policy or with the policy in the request. Nothing changes. */
+  planPartitionPolicy: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    policy?: S['PartitionPolicyRequest'],
+  ) =>
+    j(
+      api.POST(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partition-policy/plan',
+        {
+          params: { path: { databaseName, schemaName, tableName } },
+          body: policy ? { policy } : {},
+        },
       ),
     ),
   listColocationGroups: (databaseName: string) =>

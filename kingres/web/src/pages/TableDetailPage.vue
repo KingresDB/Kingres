@@ -21,9 +21,13 @@ import CreatePartitionDialog from '@/components/tables/CreatePartitionDialog.vue
 import AttachPartitionDialog from '@/components/tables/AttachPartitionDialog.vue'
 import PartitionActionDialog from '@/components/tables/PartitionActionDialog.vue'
 import TableTasksPanel from '@/components/tables/TableTasksPanel.vue'
+import StorageBadge from '@/components/tables/StorageBadge.vue'
+import SetStorageDialog from '@/components/tables/SetStorageDialog.vue'
+import PartitionPolicyPanel from '@/components/tables/PartitionPolicyPanel.vue'
 import { useDatabase, useTable, useTablePartitions, useTables, useTasks } from '@/api/queries'
 import { formatBytes, formatNumber } from '@/lib/format'
-import { TABLE_TASKS_LIMIT, runningTaskOfTable } from '@/lib/tables'
+import { TABLE_TASKS_LIMIT, runningTaskOfTable, tasksOfTable } from '@/lib/tables'
+import { partitionStorageMeta, ratioText, type StorageFilter } from '@/lib/analytics'
 import type { TablePartition, TableClass } from '@/api/types'
 
 const props = defineProps<{ name: string; schema: string; table: string }>()
@@ -66,10 +70,42 @@ const partitions = useTablePartitions(
   partitioned,
 )
 const partitionRows = computed(() => partitions.data.value?.items ?? [])
+/** The Storage filter of the partitions (contract 0.18.0: the format of each partition). */
+const formatFilter = ref<StorageFilter>('all')
+const shownPartitions = computed(() =>
+  partitionRows.value.filter(
+    (p) => formatFilter.value === 'all' || p.accessMethod === formatFilter.value,
+  ),
+)
+const partitionNames = computed(() => partitionRows.value.map((p) => p.name))
+/** The conversion of a partition that runs now, by partition name (its row says so and shows the progress). */
+const converting = computed(() => {
+  const out = new Map<string, number>()
+  for (const task of tasksOfTable(
+    tasks.data.value?.items ?? [],
+    props.name,
+    props.schema,
+    props.table,
+    partitionNames.value,
+  ))
+    if (task.kind === 'table.setStorage' && (task.state === 'running' || task.state === 'paused')) {
+      const id = task.subject?.id ?? ''
+      const name = partitionNames.value.find((n) => id === `${props.name}/${props.schema}.${n}`)
+      if (name !== undefined) out.set(name, task.progress.percent)
+    }
+  return out
+})
+const columnarOf = computed(() => t.value?.storage?.columnar ?? null)
 
 /** The change that is running now: it holds the table, so no other change starts until it ends. */
 const holding = computed(() =>
-  runningTaskOfTable(tasks.data.value?.items ?? [], props.name, props.schema, props.table),
+  runningTaskOfTable(
+    tasks.data.value?.items ?? [],
+    props.name,
+    props.schema,
+    props.table,
+    partitionNames.value,
+  ),
 )
 const heldReason = computed(() =>
   holding.value ? `A change of this table is running (task ${holding.value.id}).` : '',
@@ -88,11 +124,34 @@ const alterReason = computed(
     (partitioned.value ? 'A user-partitioned table cannot be altered in this version.' : ''),
 )
 
+const storageReason = computed(() => {
+  if (heldReason.value) return heldReason.value
+  if (isDistributed.value || isReference.value)
+    return 'Converting a distributed table is not available in this version.'
+  if (partitioned.value) return 'Convert one partition at a time, in the partitions list below.'
+  return ''
+})
+const convertPartitionReason = computed(() => {
+  if (heldReason.value) return heldReason.value
+  if (isDistributed.value)
+    return 'Converting the partitions of a distributed table is not available in this version.'
+  return ''
+})
+
 const dialog = ref<
-  'distribute' | 'undistribute' | 'alter' | 'create' | 'attach' | 'detach' | 'drop' | null
+  | 'distribute'
+  | 'undistribute'
+  | 'alter'
+  | 'create'
+  | 'attach'
+  | 'detach'
+  | 'drop'
+  | 'storage'
+  | 'convert'
+  | null
 >(null)
 const picked = ref<TablePartition | null>(null)
-function openPartition(kind: 'detach' | 'drop', p: TablePartition): void {
+function openPartition(kind: 'detach' | 'drop' | 'convert', p: TablePartition): void {
   picked.value = p
   dialog.value = kind
 }
@@ -139,6 +198,16 @@ const title = computed(() => `Table ${props.schema}.${props.table}`)
       >
         Change the distribution
       </GateButton>
+      <GateButton
+        v-if="!isDistributed || partitioned"
+        op="setTableStorage"
+        data-testid="convert-storage"
+        :disabled="!t"
+        :blocked-reason="storageReason"
+        @click="dialog = 'storage'"
+      >
+        Convert storage
+      </GateButton>
     </template>
   </PageHeader>
   <p>
@@ -171,6 +240,18 @@ const title = computed(() => `Table ${props.schema}.${props.table}`)
           <dd><NullableValue :value="t.estimatedRows" :format="formatNumber" /></dd>
           <dt>Size</dt>
           <dd><NullableValue :value="t.sizeBytes" :format="formatBytes" /></dd>
+          <dt>Storage</dt>
+          <dd data-testid="table-storage">
+            <StorageBadge :table="t" />
+            <span v-if="columnarOf" class="muted" data-testid="table-storage-detail">
+              {{ formatNumber(columnarOf.stripes) }} stripes,
+              {{ formatBytes(columnarOf.bytesOnDisk) }} on disk of
+              {{ formatBytes(columnarOf.bytesUncompressed) }}
+              <template v-if="columnarOf.compression"
+                >(<SafeName :value="columnarOf.compression" kind="text" :max="20" />)</template
+              >
+            </span>
+          </dd>
           <template v-if="t.distribution">
             <dt>Distribution</dt>
             <dd data-testid="table-distribution">
@@ -244,14 +325,14 @@ const title = computed(() => `Table ${props.schema}.${props.table}`)
       </section>
 
       <section
-        v-if="isDistributed"
+        v-if="isDistributed || partitioned"
         class="stack"
         aria-labelledby="table-partitions-h"
         data-testid="table-partitions"
       >
         <div class="row-between">
           <h2 id="table-partitions-h">Partitions</h2>
-          <span v-if="partitioned" class="row">
+          <span v-if="partitioned && isDistributed" class="row">
             <GateButton
               op="createTablePartition"
               small
@@ -276,13 +357,27 @@ const title = computed(() => `Table ${props.schema}.${props.table}`)
           This table is not partitioned by the user. A table that was created as a RANGE or LIST
           partitioned table has partitions here once it is distributed.
         </p>
+        <div v-if="partitioned" class="field" style="max-width: 16em">
+          <label for="partition-format">Format</label>
+          <select id="partition-format" v-model="formatFilter" data-testid="partition-format">
+            <option value="all">All formats</option>
+            <option value="heap">Row</option>
+            <option value="columnar">Columnar</option>
+          </select>
+        </div>
         <QueryBoundary
-          v-else
+          v-if="partitioned"
           :loading="partitions.isPending.value"
           :error="partitions.error.value"
-          :empty="partitionRows.length === 0"
-          empty-title="No partitions"
-          empty-hint="Create a partition, or attach a distributed table of this colocation group."
+          :empty="shownPartitions.length === 0"
+          :empty-title="
+            partitionRows.length === 0 ? 'No partitions' : 'No partition in this format'
+          "
+          :empty-hint="
+            partitionRows.length === 0
+              ? 'Create a partition, or attach a distributed table of this colocation group.'
+              : 'Choose another format.'
+          "
           @retry="partitions.refetch()"
         >
           <TableWrap>
@@ -294,13 +389,16 @@ const title = computed(() => `Table ${props.schema}.${props.table}`)
                 <tr>
                   <th scope="col">Partition</th>
                   <th scope="col">Bound</th>
-                  <th scope="col" class="num">Leaves</th>
+                  <th scope="col">Format</th>
+                  <th v-if="isDistributed" scope="col" class="num">Leaves</th>
                   <th scope="col" class="num">Size on this server</th>
+                  <th scope="col" class="num">Rows (estimate)</th>
+                  <th scope="col" class="num">Ratio</th>
                   <th scope="col">Actions</th>
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="p in partitionRows" :key="p.name" :data-testid="`partition-${p.name}`">
+                <tr v-for="p in shownPartitions" :key="p.name" :data-testid="`partition-${p.name}`">
                   <th scope="row" class="mono">
                     <SafeName :value="p.name" :max="80" />
                     <span v-if="p.isDefault" class="badge tone-neutral"> Default</span>
@@ -308,29 +406,66 @@ const title = computed(() => `Table ${props.schema}.${props.table}`)
                   <td class="mono">
                     <SafeName :value="p.bound" kind="text" :max="200" />
                   </td>
-                  <td class="num">{{ formatNumber(p.leafCount) }}</td>
+                  <td :data-testid="`format-${p.name}`">
+                    <span
+                      v-if="converting.has(p.name)"
+                      class="badge tone-info"
+                      role="status"
+                      :data-testid="`converting-${p.name}`"
+                    >
+                      <span aria-hidden="true">&#9680;</span>
+                      <span>Converting, {{ Math.round(converting.get(p.name) ?? 0) }} percent</span>
+                    </span>
+                    <StatusBadge
+                      v-else-if="partitionStorageMeta(p)"
+                      :meta="partitionStorageMeta(p)!"
+                    />
+                    <NullableValue v-else :value="p.accessMethod" safe />
+                  </td>
+                  <td v-if="isDistributed" class="num">{{ formatNumber(p.leafCount) }}</td>
                   <td class="num"><NullableValue :value="p.sizeBytes" :format="formatBytes" /></td>
+                  <td class="num">
+                    <NullableValue :value="p.estimatedRows" :format="formatNumber" />
+                  </td>
+                  <td class="num" :data-testid="`ratio-${p.name}`">
+                    <NullableValue :value="ratioText(p.compressionRatio)" />
+                  </td>
                   <td>
                     <div class="row">
                       <GateButton
-                        op="detachTablePartition"
+                        op="setPartitionStorage"
                         small
-                        :blocked-reason="heldReason"
-                        :data-testid="`detach-${p.name}`"
-                        @click="openPartition('detach', p)"
+                        :blocked-reason="
+                          p.isDefault
+                            ? 'A default partition cannot be converted.'
+                            : convertPartitionReason
+                        "
+                        :data-testid="`convert-${p.name}`"
+                        @click="openPartition('convert', p)"
                       >
-                        Detach
+                        Convert storage
                       </GateButton>
-                      <GateButton
-                        op="dropTablePartition"
-                        small
-                        variant="danger"
-                        :blocked-reason="heldReason"
-                        :data-testid="`drop-${p.name}`"
-                        @click="openPartition('drop', p)"
-                      >
-                        Drop
-                      </GateButton>
+                      <template v-if="isDistributed">
+                        <GateButton
+                          op="detachTablePartition"
+                          small
+                          :blocked-reason="heldReason"
+                          :data-testid="`detach-${p.name}`"
+                          @click="openPartition('detach', p)"
+                        >
+                          Detach
+                        </GateButton>
+                        <GateButton
+                          op="dropTablePartition"
+                          small
+                          variant="danger"
+                          :blocked-reason="heldReason"
+                          :data-testid="`drop-${p.name}`"
+                          @click="openPartition('drop', p)"
+                        >
+                          Drop
+                        </GateButton>
+                      </template>
                     </div>
                   </td>
                 </tr>
@@ -339,6 +474,13 @@ const title = computed(() => `Table ${props.schema}.${props.table}`)
           </TableWrap>
         </QueryBoundary>
       </section>
+
+      <PartitionPolicyPanel
+        v-if="partitioned && (isPlain || isDistributed)"
+        :database-name="name"
+        :table="t"
+        :held-reason="heldReason"
+      />
     </div>
   </QueryBoundary>
 
@@ -347,6 +489,19 @@ const title = computed(() => `Table ${props.schema}.${props.table}`)
     :database-name="name"
     :table="t"
     :candidates="distributedAll"
+    @close="closeDialog"
+  />
+  <SetStorageDialog
+    v-if="dialog === 'storage' && t"
+    :database-name="name"
+    :table="t"
+    @close="closeDialog"
+  />
+  <SetStorageDialog
+    v-if="dialog === 'convert' && t && picked"
+    :database-name="name"
+    :table="t"
+    :partition="picked"
     @close="closeDialog"
   />
   <UndistributeTableDialog

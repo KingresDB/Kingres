@@ -126,10 +126,20 @@ const isPartitioned = (t: Table): boolean => t.partitioning != null
 /** The partitions of every user-partitioned table: `database/schema.table` to its list. */
 export const partitionsOf = (s: MockState, rec: DbRec, t: Table): S['TablePartition'][] =>
   s.partitions?.[`${rec.info.name}/${name(t)}`] ?? []
-function setPartitions(s: MockState, rec: DbRec, t: Table, list: S['TablePartition'][]): void {
+export function setPartitionList(
+  s: MockState,
+  rec: DbRec,
+  t: Table,
+  list: S['TablePartition'][],
+): void {
   s.partitions ??= {}
   s.partitions[`${rec.info.name}/${name(t)}`] = list
   if (t.partitioning) t.partitioning = { ...t.partitioning, partitionCount: list.length }
+}
+/** The two bounds of a range partition from the text that follows FOR VALUES (null for a list partition or DEFAULT). */
+const rangeOf = (bound: string): { from: string | null; to: string | null } => {
+  const m = /^FROM\s*\('([^']*)'\)\s*TO\s*\('([^']*)'\)$/i.exec(bound.trim())
+  return { from: m?.[1] ?? null, to: m?.[2] ?? null }
 }
 const partitionOf = (bound: string, method: 'range' | 'list', leafCount: number, n: string) =>
   ({
@@ -139,6 +149,11 @@ const partitionOf = (bound: string, method: 'range' | 'list', leafCount: number,
     isDefault: /^default$/i.test(bound.trim()),
     leafCount,
     sizeBytes: 40 * MiB,
+    accessMethod: 'heap',
+    rangeFrom: method === 'range' ? rangeOf(bound).from : null,
+    rangeTo: method === 'range' ? rangeOf(bound).to : null,
+    estimatedRows: Math.round((40 * MiB) / 96),
+    compressionRatio: null,
   }) satisfies S['TablePartition']
 
 /** `?tables=partitions`: a distributed table that the user partitioned by range, with three partitions, and a table to attach. */
@@ -189,7 +204,7 @@ export function seedPartitioned(s: MockState): void {
     sizeBytes: 90 * MiB,
   })
   rec.info.stats.tableCount = (rec.info.stats.tableCount ?? 0) + 2
-  setPartitions(s, rec, m, [
+  setPartitionList(s, rec, m, [
     partitionOf("FROM ('2026-01-01') TO ('2026-02-01')", 'range', 32, 'measurements_2026_01'),
     partitionOf("FROM ('2026-02-01') TO ('2026-03-01')", 'range', 32, 'measurements_2026_02'),
     partitionOf('DEFAULT', 'range', 32, 'measurements_default'),
@@ -935,14 +950,14 @@ export function startPartition(s: MockState, rec: DbRec, t: Table, change: Parti
       const leaves = t.distribution?.bucketCount ?? 32
       if (change.kind === 'create') {
         if (!now.some((x) => x.name === change.body.name))
-          setPartitions(s, rec, t, [
+          setPartitionList(s, rec, t, [
             ...now,
             partitionOf(change.body.bound.trim(), method, leaves, change.body.name),
           ])
       } else if (change.kind === 'attach') {
         const other = findTable(rec, change.body.table)
         if (other) {
-          setPartitions(s, rec, t, [
+          setPartitionList(s, rec, t, [
             ...now,
             partitionOf(change.body.bound.trim(), method, leaves, other.name),
           ])
@@ -952,7 +967,7 @@ export function startPartition(s: MockState, rec: DbRec, t: Table, change: Parti
         }
       } else if (change.kind === 'detach') {
         const gone = now.find((x) => x.name === change.partition)
-        setPartitions(
+        setPartitionList(
           s,
           rec,
           t,
@@ -973,7 +988,7 @@ export function startPartition(s: MockState, rec: DbRec, t: Table, change: Parti
           recount(rec)
         }
       } else {
-        setPartitions(
+        setPartitionList(
           s,
           rec,
           t,
