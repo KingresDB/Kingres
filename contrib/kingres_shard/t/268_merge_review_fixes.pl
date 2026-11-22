@@ -252,4 +252,41 @@ for my $who ('rlsu', undef)
 # the tables that these statements did not change are the single node's, and a plain table of the same rows still takes the pushed path
 like(plan_of($nodes[0], q{MERGE INTO public.t USING public.s ON t.id = s.id WHEN MATCHED THEN UPDATE SET n = 99}), qr/Pushed: colocated MERGE/, 'a MERGE into the table itself is still pushed');
 
+# ---------------------------------------------------------------------------
+# C. a column with a stable default that the INSERT action does not list
+# ---------------------------------------------------------------------------
+table(q{CREATE TABLE public.td (id int PRIMARY KEY, v text, ts timestamptz DEFAULT now(), who text DEFAULT current_user, cfg text DEFAULT current_setting('application_name'))},
+	q{; SELECT kingres.create_distributed_table('public.td', 'id', colocate_with => 'public.t')});
+table(q{CREATE TABLE public.tdr (k int PRIMARY KEY, label text, ts timestamptz DEFAULT now())},
+	q{; SELECT kingres.create_reference_table('public.tdr')});
+{
+	my @cases = (
+		[ 'M1', q{MERGE INTO public.td USING public.s ON td.id = s.id WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, 'd')}, 'public.td', 'id', 'ts' ],
+		[ 'M3', q{MERGE INTO public.td USING public.loc ON td.id = loc.x WHEN NOT MATCHED THEN INSERT (id, v) VALUES (loc.x, loc.y)}, 'public.td', 'id', 'ts' ],
+		[ 'M4', q{MERGE INTO public.tdr USING public.rf ON tdr.k = rf.k WHEN NOT MATCHED THEN INSERT (k, label) VALUES (rf.k, rf.label)}, 'public.tdr', 'k', 'ts' ],
+		[ 'M5', q{MERGE INTO public.tdr USING public.loc ON tdr.k = loc.x WHEN NOT MATCHED THEN INSERT (k, label) VALUES (loc.x, loc.y)}, 'public.tdr', 'k', 'ts' ],
+		[ 'M1, a column that lists current_user as its default', q{MERGE INTO public.td USING public.s ON td.id = s.id WHEN NOT MATCHED THEN INSERT (id, v, ts, cfg) VALUES (s.id, 'd', '2026-01-01 00:00:00+00', 'x')}, 'public.td', 'id', 'who' ],
+		[ 'M3, a column whose default is current_setting()', q{MERGE INTO public.td USING public.loc ON td.id = loc.x WHEN NOT MATCHED THEN INSERT (id, v, ts, who) VALUES (loc.x, loc.y, '2026-01-01 00:00:00+00', 'x')}, 'public.td', 'id', 'cfg' ],
+	);
+	for my $case (@cases)
+	{
+		my ($name, $sql, $table, $order, $col) = @$case;
+		my ($rd, $od, $ed) = run_sql($nodes[1], $sql);
+		isnt($rd, 0, "$name: refused");
+		like($ed, qr/column "\Q$col\E" of the target has a default that is stable/, "$name: the message names the column ($col)") or diag($ed);
+		like($ed, qr/give it a value in the INSERT list/, "$name: and says what to do");
+		$c->compare_tables($table, order_by => $order, name => "$name: $table unchanged");
+	}
+	# giving every such column a value in the INSERT list works, and equals the single node
+	my $ok1 = q{MERGE INTO public.td USING public.s ON td.id = s.id WHEN NOT MATCHED THEN INSERT (id, v, ts, who, cfg) VALUES (s.id, 'd', '2026-02-02 00:00:00+00', 'me', 'cfg')};
+	my $ok3 = q{MERGE INTO public.td USING public.loc ON td.id = loc.x WHEN NOT MATCHED THEN INSERT (id, v, ts, who, cfg) VALUES (loc.x, loc.y, '2026-03-03 00:00:00+00', 'me', 'cfg')};
+	my $ok4 = q{MERGE INTO public.tdr USING public.rf ON tdr.k = rf.k WHEN NOT MATCHED THEN INSERT (k, label, ts) VALUES (rf.k, rf.label, '2026-04-04 00:00:00+00')};
+	for my $x (['M1', $ok1, 'public.td', 'id'], ['M3', $ok3, 'public.td', 'id'], ['M4', $ok4, 'public.tdr', 'k'])
+	{
+		my ($name, $sql, $table, $order) = @$x;
+		$c->compare_dml("$name with a value for every stable default", $sql, node => 2);
+		$c->compare_tables($table, order_by => $order, name => "$name with a value for every stable default: $table");
+	}
+}
+
 done_testing();

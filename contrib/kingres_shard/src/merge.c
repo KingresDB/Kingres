@@ -50,6 +50,7 @@
 #include "parser/parse_node.h"
 #include "parser/parse_relation.h"
 #include "parser/parsetree.h"
+#include "rewrite/rewriteHandler.h"
 #include "tcop/tcopprot.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -256,6 +257,49 @@ mg_view_in_rtable(Query *q)
 	} while (0)
 
 /*
+ * A column that the INSERT action does not list is filled with its default.  A default that is stable
+ * (now(), current_user, current_setting()) would be computed by each group for itself, which can differ
+ * from group to group; the refusal names the column and the way out (review P12M-06).  Volatile defaults
+ * (a sequence, an identity column, random()) are refused by the volatile-value rule of the callers.
+ */
+static bool
+mg_stable_default_insert(Query *q, Oid relid, const char **why)
+{
+	ListCell   *lc;
+
+	foreach(lc, q->mergeActionList)
+	{
+		MergeAction *ma = lfirst_node(MergeAction, lc);
+		ListCell   *lc2;
+		Relation	rel = NULL;
+		const char *colname = NULL;
+
+		if (ma->commandType != CMD_INSERT)
+			continue;
+		foreach(lc2, ma->targetList)
+		{
+			TargetEntry *te = lfirst_node(TargetEntry, lc2);
+			Node	   *def;
+
+			if (te->resjunk || colname != NULL)
+				continue;
+			if (contain_volatile_functions((Node *) te->expr) || !contain_mutable_functions((Node *) te->expr))
+				continue;
+			if (rel == NULL)
+				rel = table_open(relid, NoLock);
+			def = build_column_default(rel, te->resno);
+			if (def != NULL && equal(def, te->expr))
+				colname = pstrdup(NameStr(TupleDescAttr(rel->rd_att, te->resno - 1)->attname));
+		}
+		if (rel != NULL)
+			table_close(rel, NoLock);
+		if (colname != NULL)
+			MG_NO(psprintf("column \"%s\" of the target has a default that is stable (now(), current_user, current_setting()), which each group would compute for itself: give it a value in the INSERT list", colname));
+	}
+	return true;
+}
+
+/*
  * What the deparsed text of a MERGE cannot carry about its target: the policies of row-level security and the
  * CHECK OPTION of a view (withCheckOptions), the filter of a row-level security policy or of a security_barrier
  * view (securityQuals), the rights of the owner of a view (checkAsUser), and the view itself (its filter, in
@@ -298,6 +342,8 @@ merge_common(Query *q, const KsDistTable *tdt, const char **why)
 		MG_NO("the target has a trigger or a rule, which would run on the shard groups");
 	if (!mg_unique_indexes_carry_key(trte->relid, tdt->dist_attno, tdt->coloc->collation))
 		MG_NO("a unique index of the target does not include the distribution column under the collation of its distribution");
+	if (!mg_stable_default_insert(q, trte->relid, why))
+		return false;
 
 	foreach(lc, q->mergeActionList)
 	{
@@ -1498,6 +1544,8 @@ kingres_shard_merge_ref_fragment_analyze(Query *q, int *nshipped, const char **w
 		return false;
 	if (mg_target_has_user_code(trte->relid))
 		MG_NO("the target has a trigger or a rule, which would run on every node");
+	if (!mg_stable_default_insert(q, trte->relid, why))
+		return false;
 	foreach(lc, q->rtable)
 	{
 		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
