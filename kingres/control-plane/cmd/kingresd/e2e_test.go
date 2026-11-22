@@ -92,8 +92,8 @@ func newServerWith(t testing.TB, useTLS bool) *cp {
 		"-login-rate-limit", "1000", "-internal-listen", e.internal, "-pg-bin-dir", pgtest.BinDir(), "-pg-port", fmt.Sprint(e.pgPort), "-server-host", "127.0.0.1"}
 	if useTLS {
 		crt, key := writeSelfSigned(t, root)
-		// The cluster that serves HTTPS is the one of the data transfer tests: a small cap on an import makes the limits quick to test.
-		args = append(args, "-tls-cert-file", crt, "-tls-key-file", key, "-max-atomic-bytes", "4194304")
+		// The cluster that serves HTTPS is the one of the data transfer tests: a cap of 24 MiB on an import keeps the limit tests quick and leaves room for a record of 15 MiB.
+		args = append(args, "-tls-cert-file", crt, "-tls-key-file", key, "-max-atomic-bytes", "25165824")
 		e.client = tlsClient()
 	}
 	e.args = args
@@ -403,7 +403,11 @@ func (e *cp) startManager(t testing.TB) {
 	go func() { e.done <- run(ctx, e.args, noEnv, e.logs, ready) }()
 	select {
 	case addr := <-ready:
-		e.base = "http://" + addr + "/api/v1"
+		scheme := "http"
+		if strings.HasPrefix(e.base, "https") {
+			scheme = "https"
+		}
+		e.base = scheme + "://" + addr + "/api/v1"
 	case err := <-e.done:
 		t.Fatalf("kingresd exited early: %v\n%s", err, tail(e.logs.String(), 3000))
 	case <-time.After(60 * time.Second):

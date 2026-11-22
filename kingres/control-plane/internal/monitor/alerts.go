@@ -30,7 +30,7 @@ const (
 )
 
 // Managed lists the alert kinds the checks own; others are never cleared by them.
-var Managed = []string{"serverDown", "serverSuspect", "diskSpaceLow", "memoryPressure", "replicationLagHigh", "certificateExpiring", "ledgerPendingTooOld", "versionMismatch", "certificateRenewalFailed", "replicationPending", "leaseLost", "groupWithoutSynchronousStandby", "groupUnderReplicated", "clockDifference"}
+var Managed = []string{"serverDown", "serverSuspect", "diskSpaceLow", "memoryPressure", "replicationLagHigh", "certificateExpiring", "ledgerPendingTooOld", "versionMismatch", "certificateRenewalFailed", "replicationPending", "leaseLost", "groupWithoutSynchronousStandby", "groupUnderReplicated", "clockDifference", "transferStagingLow"}
 
 // Readings are the inputs of the checks; nil means "not measured", which
 // neither raises nor clears an alert.
@@ -178,7 +178,7 @@ var titles = map[string]string{
 	"replicationLagHigh": "Replication lag high", "certificateExpiring": "Certificate expiring",
 	"ledgerPendingTooOld": "Ledger entries pending for too long", "versionMismatch": "KingresDB versions differ",
 	"certificateRenewalFailed": "Certificate renewal failed", "replicationPending": "A server is behind on role and grant changes", "leaseLost": "A group lease was lost",
-	"groupWithoutSynchronousStandby": "A shard group runs without a synchronous standby", "groupUnderReplicated": "A shard group has too few standbys", "clockDifference": "A server's clock is off",
+	"groupWithoutSynchronousStandby": "A shard group runs without a synchronous standby", "groupUnderReplicated": "A shard group has too few standbys", "clockDifference": "A server's clock is off", "transferStagingLow": "The staging area of the data transfer is nearly full",
 	"oldPrimaryNotStopped": "An old primary could not be stopped", "oldPrimaryRunning": "An old primary is running", "oldPrimaryNotRebuilt": "An old primary has not been turned into a standby",
 }
 

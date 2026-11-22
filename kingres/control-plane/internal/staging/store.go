@@ -517,6 +517,9 @@ func (r *Reservation) Release() {
 	}
 }
 
+// Space is the total and the free bytes of the file system of the staging directory.
+func (s *Store) Space() (Space, error) { return s.fs.Space(s.dir) }
+
 // SetQuota changes the quota of the sum of the reservations (zero: the default of the file system). The cluster setting
 // stagingQuotaBytes can change while kingresd runs; reservations that exist stay, the next Reserve and the next growth see the new value.
 func (s *Store) SetQuota(n int64) {

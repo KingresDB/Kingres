@@ -448,8 +448,8 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 			opsSvc.SetEngine(eng)
 			run := &monitor.Runner{Src: monSource{svc}, Ring: ring, Host: serverHost, Leases: func() []ha.LeaseInfo { return haReg.Leases().Info() }, DataDir: filepath.Join(cfg.DataDir, "instances"), Log: log, System: "kingres_system",
 				Interval: cfg.MonitorInterval, LedgerPendingMaxAge: cfg.LedgerPendingMaxAge, RenewFraction: cfg.CertificateRenewFraction,
-				Probes: probesOf(stby),
-				Cert:   svc.ServerCertificate, CA: func() *x509.Certificate {
+				Probes: append(probesOf(stby), transferProbe(opsSvc, serverHost)), Extra: transferMetrics(opsSvc),
+				Cert: svc.ServerCertificate, CA: func() *x509.Certificate {
 					if ca, err := svc.CA(); err == nil {
 						return ca.Cert()
 					}

@@ -258,3 +258,46 @@ func jsonOf(b []byte) map[string]any {
 	}
 	return out
 }
+
+// The staging use is a metric and an alert: reservations that hold 95 percent of the quota raise transferStagingLow (warning) and show in the metrics;
+// the alert clears when the room is freed.
+func TestStagingMetricsAndAlert(t *testing.T) {
+	e, off := transferOn(t)
+	defer off()
+	e.expect(t, 200, "PATCH", "/settings/cluster", map[string]any{"dataTransfer": map[string]any{"stagingQuotaBytes": 800 << 20}})
+	up := e.expect(t, 201, "POST", "/data-uploads", map[string]any{"purpose": "tableImport", "sizeBytes": 760 << 20})
+	alert := func() bool {
+		out := e.expect(t, 200, "GET", "/alerts?limit=200", nil)
+		for _, it := range out["items"].([]any) {
+			a := it.(map[string]any)
+			if a["kind"] == "transferStagingLow" && a["resolvedAt"] == nil {
+				return a["severity"] == "warning"
+			}
+		}
+		return false
+	}
+	deadline := time.Now().Add(60 * time.Second)
+	for !alert() && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Second)
+	}
+	if !alert() {
+		t.Fatal("no transferStagingLow alert although 95 percent of the quota is reserved")
+	}
+	now := time.Now().UTC()
+	q := "/metrics/query?metric=transferStagingUsedBytes&from=" + now.Add(-5*time.Minute).Format(time.RFC3339) + "&to=" + now.Add(time.Minute).Format(time.RFC3339) + "&step=60"
+	m := e.expect(t, 200, "GET", q, nil)
+	if !strings.Contains(toJSON(m), "transferStagingUsedBytes") || len(m["series"].([]any)) == 0 {
+		t.Errorf("the metric: %v", m)
+	}
+	e.expect(t, 204, "DELETE", "/data-uploads/"+up["uploadId"].(string), nil)
+	deadline = time.Now().Add(60 * time.Second)
+	for alert() && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Second)
+	}
+	if alert() {
+		now2 := time.Now().UTC()
+		m2 := e.expect(t, 200, "GET", "/metrics/query?metric=transferStagingUsedBytes&step=60&from="+now2.Add(-3*time.Minute).Format(time.RFC3339)+"&to="+now2.Add(time.Minute).Format(time.RFC3339), nil)
+		t.Errorf("the alert did not clear after the room was freed; metric %v", toJSON(m2))
+	}
+	e.expect(t, 200, "PATCH", "/settings/cluster", map[string]any{"dataTransfer": map[string]any{"stagingQuotaBytes": 1 << 30}})
+}

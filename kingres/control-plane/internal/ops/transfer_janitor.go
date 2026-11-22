@@ -84,6 +84,13 @@ func (o *Ops) TransferSweep(ctx context.Context) (SweepReport, error) {
 	}
 	sr, err := x.store.Sweep(staging.SweepInput{HighestID: highest, Rows: rows, ReadyIDs: ready})
 	if errors.Is(err, staging.ErrRestoredDatabase) {
+		// A transfer made between the read of the rows and the listing of the directory has a higher id than the one read: read again before the alarm.
+		if again, merr := o.records().MaxID(ctx); merr == nil && again > highest {
+			highest = again
+			sr, err = x.store.Sweep(staging.SweepInput{HighestID: highest, Rows: rows, ReadyIDs: ready})
+		}
+	}
+	if errors.Is(err, staging.ErrRestoredDatabase) {
 		rep.Restored = true
 		o.Log.Error("the staging directory holds files with ids the system database never issued; it looks restored from an older copy, so no file is deleted until an operator looks at it")
 		return rep, nil
@@ -122,4 +129,32 @@ func (o *Ops) TransferSweep(ctx context.Context) (SweepReport, error) {
 		o.Transfer.Audit(ctx, "dataTransfer.purged", map[string]any{"expired": rep.Expired, "deleted": rep.Deleted, "lost": rep.Lost, "files": len(sr.Deleted)})
 	}
 	return rep, nil
+}
+
+// TransferStats is what the metrics and the alert of the data transfer read: the bytes the reservations hold, the free bytes of the file system of the staging
+// directory, the quota, the running transfers and the files that are kept. ok is false on a server that never opened its staging directory (it holds no file).
+func (o *Ops) TransferStats(ctx context.Context) (used, free, quota int64, running, staged int, ok bool) {
+	o.xferMu.Lock()
+	x := o.xferSt
+	o.xferMu.Unlock()
+	if x == nil {
+		return 0, 0, 0, 0, 0, false
+	}
+	for _, h := range x.store.Holds() {
+		used += h.Bytes
+	}
+	sp, err := x.store.Space()
+	if err != nil {
+		return 0, 0, 0, 0, 0, false
+	}
+	free = int64(sp.Free)
+	quota = staging.DefaultQuota(sp.Total)
+	if st, serr := o.settings(ctx); serr == nil && st.StagingQuotaBytes > 0 {
+		quota = st.StagingQuotaBytes
+	}
+	_ = o.asService(ctx, sysdb.Database, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT count(*) FILTER (WHERE state IN ('receiving', 'building'))::int, count(*) FILTER (WHERE state = 'ready')::int
+			FROM kingres_cp.data_transfer WHERE server_id = $1`, o.ServerHost).Scan(&running, &staged)
+	})
+	return used, free, quota, running, staged, true
 }

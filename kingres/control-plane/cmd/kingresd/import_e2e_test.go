@@ -120,11 +120,10 @@ func TestImportRoundTripAndOptions(t *testing.T) {
 	}
 	e.expect(t, 204, "DELETE", "/data-uploads/"+uid, nil)
 
-	// Options: no header, a semicolon, a null text, an apostrophe as the quote, a BOM, another encoding, gzip found by itself.
+	// Options: no header, a semicolon, a null text, an apostrophe as the quote, another encoding, gzip found by itself.
 	q("create table if not exists public.opt_t (a int, b text, c text)")
 	q("truncate public.opt_t")
 	var plain bytes.Buffer
-	plain.Write([]byte{0xEF, 0xBB, 0xBF})
 	plain.WriteString("1;'it''s; ok';NULL\n2;caf" + string(rune(0xe9)) + ";\n")
 	latin := bytes.ReplaceAll(plain.Bytes(), []byte("caf\xc3\xa9"), []byte("caf\xe9"))
 	var gz bytes.Buffer
@@ -272,7 +271,7 @@ func TestImportRowCountMismatchRollsBack(t *testing.T) {
 	}
 }
 
-// The end marker, a quoted one, the header, and the limits of the file (the flag max-atomic-bytes is 4 MiB in this cluster).
+// The end marker, a quoted one, the header, and the limits of the file (the flag max-atomic-bytes is 24 MiB in this cluster).
 func TestImportFileRules(t *testing.T) {
 	e, off := transferOn(t)
 	defer off()
@@ -311,7 +310,7 @@ func TestImportFileRules(t *testing.T) {
 		t.Errorf("a matching header: %v", task["error"])
 	}
 	// Limits: a file above the cap is refused at the request; a gzip bomb is stopped by the count of its expansion; a record above 16 MiB by the scanner.
-	big := bytes.Repeat([]byte("1,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"), 80000)
+	big := bytes.Repeat([]byte("1,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"), 420000)
 	uid := e.uploadFile(t, big)
 	st, out, _ := e.call("POST", "/databases/db_xfer/schemas/public/tables/fr_t/import", map[string]any{"uploadId": uid, "header": "none"}, nil)
 	if st != 422 || problemCode(out) != "import_too_large" {
@@ -460,7 +459,7 @@ func TestImportTargets(t *testing.T) {
 }
 
 // The commit protocol at its fault points: a connection that dies before the intent leaves nothing stored and a retryable code, a clean repeat works; a
-// connection that dies after the intent is an unknown outcome that is never retried, and is said so.
+// connection that dies after the intent is settled by the marker that commits with the rows (here: not committed, so a retryable failure with the proof).
 func TestImportCommitFaultPoints(t *testing.T) {
 	e, off := transferOn(t)
 	defer off()
@@ -469,11 +468,12 @@ func TestImportCommitFaultPoints(t *testing.T) {
 	q("truncate public.fp_t")
 	uid := e.uploadFile(t, []byte("1,a\n2,b\n3,c\n"))
 	kill := func(point string) {
-		ops.ImportFault = func(p string, pid uint32) {
+		ops.ImportFault = func(p string, pid uint32) error {
 			if p == point {
 				ops.ImportFault = nil
 				e.expect(t, 200, "POST", "/query", map[string]any{"database": "postgres", "sql": "select pg_terminate_backend(" + strconv.Itoa(int(pid)) + ")"})
 			}
+			return nil
 		}
 	}
 	defer func() { ops.ImportFault = nil }()
@@ -494,11 +494,9 @@ func TestImportCommitFaultPoints(t *testing.T) {
 	kill("afterIntent")
 	task = e.startImport(t, "db_xfer", "fp_t", map[string]any{"uploadId": uid, "header": "none", "keepUpload": true})
 	er, _ = task["error"].(map[string]any)
-	if task["state"] != "failed" || taskCode(task) != "import_outcome_unknown" || er["retryable"] != false || !strings.Contains(taskMessage(task), "may have been loaded") {
+	// The marker in the database is the proof: the connection died before COMMIT, so the marker did not commit and nothing was stored (DX14-01).
+	if task["state"] != "failed" || taskCode(task) != "copy_interrupted" || er["retryable"] != true || !strings.Contains(taskMessage(task), "marker") {
 		t.Errorf("a connection that died after the intent: %v", task["error"])
-	}
-	if d, _ := task["detail"].(string); !strings.Contains(d, "commit sent for 3 rows") {
-		t.Errorf("the intent is not in the detail: %q", d)
 	}
 	if task["cancellable"] != false {
 		t.Errorf("a task past the intent is cancellable: %v", task["cancellable"])

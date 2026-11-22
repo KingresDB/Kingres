@@ -574,7 +574,7 @@ Steps of `table.import`: *Check the upload* (complete, the caller's, size and SH
 table* (class, privileges, header, ledger policy, row-level security, table task running?), *Load rows*
 (`NonIdempotent`; `Interruptible` until the intent; `itemsDone` = bytes of the file consumed by `COPY`, `itemsTotal`
 = file size; **`pg_stat_progress_copy` is not updated by routed `COPY` (F7), so the count is the control plane's own**),
-*Commit* (the intent and the commit), *Clean up* (delete the upload unless `keepUpload`). `statement_timeout` is the
+*Commit* (the intent and the commit; built as one step *Load rows*, then *Confirm the commit*), *Clean up* (delete the upload unless `keepUpload`). `statement_timeout` is the
 time left of `transfer-max-duration`; a timeout fails the task `transfer_timeout` and rolls back. Between steps the
 role is checked again (cluster role, `rolcanlogin`, `rolvaliduntil`, still the same role identity, DXR-23): a role that
 lost its right ends the task `forbidden`, with nothing stored.
@@ -1744,7 +1744,14 @@ The result is `dx/s2-result.md` of the second writer (2026-11-22, PostgreSQL 18.
 - **Header match** is PostgreSQL's (S2); the header text is never passed on, so the task code is `import_header_mismatch` without the first difference.
 - **`maxConcurrent`** is one transfer per role and the setting in the cluster, counted from the unfinished tasks of the two kinds.
 - **The cluster test harness serves HTTPS for the data transfer** (`clustertest.FormTLS`, the TLS cluster of `cmd/kingresd`), because the operations refuse plain HTTP.
-- **Not covered by tests in this increment:** the leader-change fault points of a real failover at every step (the leader that holds the files is gone: the codes
+- **Metrics and an alert were added to contract 0.19.0 before its release:** the metric names transferStagingUsedBytes, transferStagingFreeBytes, transfersRunning and
+  transfersStaged, and the alert kind transferStagingLow (90 and 98 percent of the quota); the monitor of the leader samples them from the staging store.
+- **The hook `ops.ImportFault`** has the points beforeIntent, intentWrite (an error stands for the refusal of the write of the intent, a lost lease) and afterIntent.
+- **Fault tests that were added later:** a record of 15.5 MiB through PostgreSQL, a cancel after the intent, a refused write of the intent, the untrusted-code check with a function of
+  another role, a restart of the leader in the middle of an import and of an export, a shard group stopped in the middle of a routed COPY (the import ends copy_interrupted, retryable,
+  and the table has none of the rows or all). Still not covered: a real failover of the manager leader (the files of the old leader are on its disk, so every step ends transfer_leader_changed;
+  only the codes and the record reads are tested), KS001 from a bucket move during a routed COPY, and a group lost exactly at COMMIT.
+- **Not covered by tests in the first increments (some of the items are covered above):** the leader-change fault points of a real failover at every step (the leader that holds the files is gone: the codes
   `transfer_leader_changed` and `transfer_session_lost` are in the code and tested only for the records they read), `KS001` and a bucket move during a routed COPY, a
   group that fails at COMMIT, a record near 16 MiB through PostgreSQL (the scanner is tested at the limit), the untrusted-code check against a role other than the owner
   (the query runs in every export; no table in the tests has a function of another role), and metrics and alerts for the staging disk.
@@ -1821,3 +1828,31 @@ found 27 points. Each is either a change of the design or a reason why not; "Pha
 | DXR-26 spreadsheet guard | low | Pattern extended (`\|`, `%`, full-width, no-break space); the dialog says it is **not a security feature** | "Spreadsheet safety" | 14a |
 | DXR-27 checksum entered by the user | low | `sha256` on upload is for command-line clients; the console shows the export's SHA-256 and the import dialog takes `expectedSha256` | "Uploads", "Known limits" | 14a, 14c |
 
+
+### Changes made after the independent review of 14a (2026-11-22)
+
+The review is `docs/reviews/2026-11-22-data-export-import-14a.md`; its section "Fixes" says what was done for each finding. Where the text above and this
+section differ, this section is right.
+
+- **The outcome of an import is decided by a marker (DX14-01).** The table `kingres_transfer.import_marker (task_id bigint primary key, state, rows, at)` is made in the
+  database of the target by the service role, and belongs to it; no privilege is granted to the importing role (so dropping the role is not blocked), which writes its row
+  through the security definer function `kingres_transfer.mark(task_id, rows)` inside the transaction of the load. The row commits with the rows (inside the same
+  two-phase commit for a routed table) or not at all. A run that finds the intent asks `INSERT ... 'aborted' ON CONFLICT DO NOTHING` and reads the row back: a row
+  `committed` is the proof that the rows are in; a row `aborted` that was inserted makes any later commit of that task fail on the key, so it is the proof that nothing was
+  stored (the insert waits up to 60 seconds for a transaction that holds the key). A statement of the text above that is not true as built: the marker table is **local**
+  to the database of the server that loaded, not a reference table; after a change of leader the marker cannot be read from the new leader, and the task fails
+  `import_outcome_unknown` (the case the design left for "unknown until observed"). The reference-table form belongs to the batch import of 14c.
+- **One step loads and commits (DX14-07).** *Load rows* does `BEGIN`, the load, the checks, the marker, the intent and `COMMIT` and ends with the commit done or an error; the
+  open transaction is never kept between steps, so a stand-down cannot leave one without an owner (the connection is closed by the step, and the server ends an idle
+  transaction after the time that is left of the task). *Commit* is now *Confirm the commit*: it reads the marker, records the count and writes the audit event.
+- **The staged files are adopted at the first use (DX14-02)**, so the sum that the quota checks includes the files that were there when the process started.
+- **Roles (DX14-03).** An import is refused at the request (403) and in the step for a role with SUPERUSER, REPLICATION or BYPASSRLS or access to server files, programs or
+  logs. The owner test of the export compares the owner of the table with the role (`relowner = the oid of current_user`), not `pg_has_role`, which is true for a superuser.
+- **Spreadsheet guard (DX14-04, DX14-11).** The header cells are cells: a risky column name is given an apostrophe in front through the alias of the column (up to 63 bytes),
+  and `xml` columns and domains over `xml` are text for the guard.
+- **Checks repeated (DX14-05, DX14-09).** The export repeats the checks of the request (the table, the columns, the untrusted code) in its first step; the import compares the
+  types of the columns too (for a reference table they build the typed-array cast).
+- **Smaller points (DX14-06, 08, 10, 12).** A poll of an upload on a server that is not the one that holds it no longer marks it lost. The cap on a plain file is applied
+  after reading the first two bytes of the staged file (a gzip file is not capped by its compressed size). `skipBom` is for UTF-8 only; for another encoding it is refused
+  (400) when named and ignored by default. One transfer per role is race free (a lock from the check to the start of the task); a refused request leaves no record; the
+  first step of a task reads `dataTransfer.enabled` again (a task that is moving data is cancelled with `cancelTask`).

@@ -61,6 +61,27 @@ entry covers the console only. No Go code and no contract text was changed.
 
 None.
 
+## 2026-11-22 (later): fixes of the independent review of phase 14a
+
+### What was done
+
+- The review (0 critical, 1 high, 4 medium, 7 low) is in `docs/reviews/2026-11-22-data-export-import-14a.md` with a section "Fixes". The high finding (the commit intent
+  was overwritten after COMMIT, so a re-run said "nothing stored" and a retry doubled the rows) is fixed by a marker row that commits with the data; load and commit are one
+  step. The mediums: the staged files are adopted at start (quota), a dangerous role is refused for import and the owner test of the export no longer trusts a superuser, the
+  header cells are guarded, the checks of the export are repeated at step time. The lows: no `lost` mark from a poll, the size cap reads the file, the column types are compared,
+  `skipBom` only for UTF-8, xml guarded, the janitor re-reads before its alarm, one transfer per role without a race, refused requests leave no record.
+- Contract 0.19.0 texts only (steps, the 403 and 400 cases, `import_outcome_unknown` now rare); logged in `contract-changes.txt`.
+
+### How it was verified
+
+- New tests (`review14_e2e_test.go`, `review14_restart_e2e_test.go`, `TestImportCrashAfterCommit`) on PostgreSQL 18 and 19; each was shown to fail with its fix removed (mutants:
+  header guard, owner test, dangerous role, skipBom, types, lock, adoption, setting, record removal, gzip look, marker read, `row_security`, untrusted check).
+
+### Still open
+
+- The xml guard cannot be run here (the test build of PostgreSQL has no libxml); the janitor retry has no test that fails without it (the race needs a hook inside the sweep).
+- A real failover of the leader at every step and a shard group lost exactly at COMMIT, as before.
+
 ---
 
 ## 2026-11-22: data export and import of tables (phase 14a, control plane): contract 0.19.0, the relay, uploads, downloads, the export and the import

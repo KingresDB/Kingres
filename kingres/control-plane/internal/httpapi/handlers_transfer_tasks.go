@@ -32,7 +32,7 @@ func (s *Server) exportTable(c *call, w http.ResponseWriter, r *http.Request) er
 		null = len(*req.NullString)
 	}
 	c.addDetails(map[string]any{"database": db, "schema": schema, "table": table, "delimiter": req.Delimiter, "nullStringLength": null, "encoding": req.Encoding,
-		"compression": req.Compression, "spreadsheetSafe": req.SpreadsheetSafe == nil || *req.SpreadsheetSafe, "columns": len(req.Columns), "taskId": t.ID})
+		"compression": req.Compression, "spreadsheetSafe": req.SpreadsheetSafe == nil || *req.SpreadsheetSafe, "columns": len(req.Columns), "acknowledgeOtherRolesCode": req.AcknowledgeOtherRolesCode, "taskId": t.ID})
 	s.accepted(w, r, t)
 	return nil
 }

@@ -238,10 +238,23 @@ func CopyToSQL(schema, table string, columns []ExportColumn, c CSV, header, only
 		if err != nil {
 			return "", err
 		}
+		alias := id.String()
+		if safe && header && RiskyCell(col.Name) {
+			// The header cells are cells too (DX14-04): the name is given an apostrophe in front, within the 63 bytes of an identifier.
+			al, aerr := sqlx.NewIdent(clipName("'" + col.Name))
+			if aerr != nil {
+				return "", aerr
+			}
+			alias = al.String()
+		}
 		if safe && col.Stringy {
 			// A risky cell gets an apostrophe in front; the others are the text of the value. The guard is a convenience for spreadsheets and
 			// loses what it changes (the padding of a char(n) as well): the dialog says so.
-			sel = append(sel, "CASE WHEN "+id.String()+"::text ~ "+pat+" THEN '''' || "+id.String()+"::text ELSE "+id.String()+"::text END AS "+id.String())
+			sel = append(sel, "CASE WHEN "+id.String()+"::text ~ "+pat+" THEN '''' || "+id.String()+"::text ELSE "+id.String()+"::text END AS "+alias)
+			continue
+		}
+		if alias != id.String() {
+			sel = append(sel, id.String()+" AS "+alias)
 			continue
 		}
 		sel = append(sel, id.String())
@@ -279,4 +292,33 @@ func SessionFormats(encoding string) ([]string, error) {
 		"SET LOCAL lc_monetary = 'C'",
 		"SET LOCAL client_encoding = '" + encoding + "'",
 	}, nil
+}
+
+// RiskyCell is the Go form of the spreadsheet guard for a single text (a header cell): it begins, after tabs, carriage returns, no-break spaces or spaces,
+// with one of = + @ | % -, or with a tab or carriage return, or with a full-width = + - or @.
+func RiskyCell(v string) bool {
+	t := strings.TrimLeft(v, "	  ")
+	if t != "" && strings.ContainsRune("=+@|%-", rune(t[0])) {
+		return true
+	}
+	if v == "" {
+		return false
+	}
+	switch r := []rune(v)[0]; r {
+	case '	', '', 0xff1d, 0xff0b, 0xff0d, 0xff20:
+		return true
+	}
+	return false
+}
+
+// clipName cuts a name to 63 bytes on a character boundary.
+func clipName(n string) string {
+	if len(n) <= 63 {
+		return n
+	}
+	b := []byte(n[:63])
+	for len(b) > 0 && !utf8.Valid(b) {
+		b = b[:len(b)-1]
+	}
+	return string(b)
 }
