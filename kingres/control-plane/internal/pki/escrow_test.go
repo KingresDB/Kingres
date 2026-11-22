@@ -79,9 +79,15 @@ func TestEscrowRoundTripGivesTheNewLeaderTheCA(t *testing.T) {
 	if fi, err := os.Stat(filepath.Join(dir, CAKeyFile)); err != nil || fi.Mode().Perm()&0o077 != 0 && !isWindows() {
 		t.Errorf("ca.key mode %v %v", fi, err)
 	}
-	// A second adoption does nothing.
-	if res, err := AdoptEscrow(dir, "b", t0); err != nil || res != AdoptHeld {
+	// A second adoption does nothing: a revocation made since is not undone by the older copy.
+	if err := nca.Revoke("cafe02", t0.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := AdoptEscrow(dir, "b", t0.Add(3*time.Hour)); err != nil || res != AdoptHeld {
 		t.Errorf("second adopt: %v %v", res, err)
+	}
+	if again, err := LoadCA(dir); err != nil || !again.IsRevoked("cafe02") {
+		t.Errorf("a second adoption undid a revocation: %v", err)
 	}
 }
 
@@ -316,5 +322,23 @@ func TestEscrowStateRoundTrip(t *testing.T) {
 	got, err := LoadEscrowState(dir)
 	if err != nil || !got.Enabled || got.Generation != 3 || got.Recipients["b"].KeyID != "k" {
 		t.Fatalf("%+v %v", got, err)
+	}
+}
+
+// A blob that opens (it was sealed to this server's public key) but is labelled for another server is refused: the label
+// is checked as well as the additional data.
+func TestABlobLabelledForAnotherServerIsRefused(t *testing.T) {
+	ca := newCA(t)
+	dir := member(t, ca)
+	kid, pub, err := RecipientOffer(dir, false, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := SealCA(ca, "c", kid, pub, 1, t0) // sealed to b's key, labelled c
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := StoreEscrow(dir, "b", b); !errors.Is(err, ErrEscrowRefused) {
+		t.Fatalf("stored a blob labelled for another server: %v", err)
 	}
 }
