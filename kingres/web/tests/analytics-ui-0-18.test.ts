@@ -484,6 +484,34 @@ describe('the table page: storage and partitions', () => {
     expect(within(refusal).getByTestId('table-blockers')).toHaveTextContent(/is in a publication/i)
   })
 
+  it('Convert stays off while the server checks the change', async () => {
+    sw('analytics=timeseries')
+    const { http, HttpResponse, delay } = await import('msw')
+    mockServer.use(
+      http.put('*/storage', async ({ request }) => {
+        if (new URL(request.url).searchParams.get('dryRun') !== 'true')
+          return HttpResponse.json({}, { status: 500 })
+        await delay(400)
+        return HttpResponse.json({
+          current: 'heap',
+          target: 'columnar',
+          willConvert: true,
+          blockers: [],
+          notes: [],
+        })
+      }),
+    )
+    const user = userEvent.setup()
+    await renderApp(table('clicks'))
+    await user.click(await screen.findByTestId('convert-storage'))
+    const dialog = await dialogOf(/^convert storage of table clicks/i)
+    const start = dialog.getByRole('button', { name: /^convert$/i })
+    expect(await dialog.findByTestId('storage-preview-loading')).toBeInTheDocument()
+    expect(start).toBeDisabled()
+    await enabled(start)
+    expect(dialog.queryByTestId('storage-preview-loading')).not.toBeInTheDocument()
+  })
+
   it('the preview of a change that can be made lists its notes and lets it start', async () => {
     sw('analytics=timeseries')
     const user = userEvent.setup()
