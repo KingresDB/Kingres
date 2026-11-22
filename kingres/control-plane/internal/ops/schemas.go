@@ -219,7 +219,7 @@ func (o *Ops) GetSchema(ctx context.Context, db, name string) (api.SchemaDetail,
 // or FULL is not listed.
 func keylessTables(ctx context.Context, c *pgx.Conn, schema string) ([]string, error) {
 	rows, err := c.Query(ctx, `SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE n.nspname = $1 AND c.relkind IN ('r', 'p') AND NOT c.relispartition
+		WHERE n.nspname = $1 AND c.relkind IN ('r', 'p')
 		AND (c.relreplident = 'n' OR (c.relreplident = 'd'
 			AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary))) ORDER BY c.relname COLLATE "C"`, schema)
 	if err != nil {
@@ -608,8 +608,25 @@ func (o *Ops) sDistMake(ctx context.Context, env *task.Env) error {
 			g = *in.GroupID
 		}
 		_, err := c.Exec(ctx, `SELECT kingres.distribute_schema($1::regnamespace, $2::int)`, quoteIdent(in.Schema), g)
-		return schemaError(err)
+		return o.settledAfter(ctx, c, in.Schema, true, schemaError(err))
 	})
+}
+
+// settledAfter turns the failure of a call of the extension into success when the schema is in the state the call was to make it: a
+// backend of a dead leader may have been between its prepare and its commit when the step was recovered, and the call that ran again
+// then waited for it and found the work done ("already distributed"). Any other failure stays.
+func (o *Ops) settledAfter(ctx context.Context, c *pgx.Conn, schema string, wantDistributed bool, callErr error) error {
+	if callErr == nil {
+		return nil
+	}
+	rows, err := o.schemaRows(context.WithoutCancel(ctx), c, schema)
+	if err == nil && len(rows) == 1 && (rows[0].Distribution != nil) == wantDistributed {
+		if o.Log != nil {
+			o.Log.Info("a call of the extension failed but the schema is in the state it was to make", "schema", schema, "error", callErr)
+		}
+		return nil
+	}
+	return callErr
 }
 
 // recoverDistribute and recoverUndistribute are the Recover of the two steps that call the extension once and must not call it twice:
@@ -646,6 +663,9 @@ func (o *Ops) recoverCall(ctx context.Context, env *task.Env, wantDistributed bo
 		if (rows[0].Distribution != nil) == wantDistributed {
 			took = true
 			return nil
+		}
+		if o.Log != nil {
+			o.Log.Info("a schema step that was cut off has not taken effect; settling what it left prepared", "database", in.Database, "schema", in.Schema, "distribute", wantDistributed)
 		}
 		if _, err := c.Exec(ctx, `SELECT kingres.recover_prepared_transactions()`); err != nil {
 			return PGProblem(err)
@@ -889,15 +909,19 @@ func (o *Ops) runSchemaMove(ctx context.Context, env *task.Env, in schemaInput) 
 // cancel request was handed to the extension.
 func (o *Ops) followMove(ctx context.Context, env *task.Env, watch *pgx.Conn, colo int32, mark int64, errc <-chan error, bound time.Duration, asked *bool) (moveRecord, error) {
 	var (
-		last     moveRecord
-		have     bool
-		callErr  error
-		callDone = errc == nil
-		tooLate  bool
-		lastText string
-		started  = time.Now()
-		endSeen  time.Time
+		last        moveRecord
+		have        bool
+		callErr     error
+		callDone    = errc == nil
+		tooLate     bool
+		lastText    string
+		started     = time.Now()
+		endSeen     time.Time
+		callEnd     = time.Now()
+		nextResume  time.Time
+		cancelFails int
 	)
+	resumeEvery := o.resumeInterval(ctx, watch)
 	for {
 		if callDone && have && last.terminal() {
 			return last, nil
@@ -911,6 +935,7 @@ func (o *Ops) followMove(ctx context.Context, env *task.Env, watch *pgx.Conn, co
 			return last, ctx.Err()
 		case callErr = <-errc:
 			callDone = true
+			callEnd = time.Now()
 			errc = nil
 		case <-time.After(time.Second):
 		}
@@ -931,6 +956,21 @@ func (o *Ops) followMove(ctx context.Context, env *task.Env, watch *pgx.Conn, co
 		if !have {
 			continue
 		}
+		if callDone && !last.terminal() {
+			// Nobody of this run drives the move any more (its call returned, or it was left by a dead leader): the extension settles it
+			// (resume_bucket_moves undoes a move whose session is gone, and skips one whose last change is younger than twice its node
+			// timeout), so the control plane asks again and again instead of waiting for the recovery worker, and gives up after a bound.
+			if time.Since(callEnd) > moveWaitMax {
+				return last, fmt.Errorf("the move is not settled %s after its call ended (%s); run kingres.resume_bucket_moves() on the map group primary and check kingres.check_cluster()", moveWaitMax, errText(callErr))
+			}
+			if time.Now().After(nextResume) {
+				if o.Log != nil {
+					o.Log.Info("asking the extension to settle a move that no call of this run drives", "colocation", colo, "phase", last.Phase)
+				}
+				_, _ = watch.Exec(ctx, `SELECT kingres.resume_bucket_moves()`)
+				nextResume = time.Now().Add(resumeEvery)
+			}
+		}
 		if last.terminal() && !callDone {
 			// the switch is done; what the call still does is the dropping of the replication, which the recovery repeats
 			if endSeen.IsZero() {
@@ -942,8 +982,14 @@ func (o *Ops) followMove(ctx context.Context, env *task.Env, watch *pgx.Conn, co
 		if !*asked && !tooLate && env.CancelRequested(ctx) {
 			if last.stoppable() {
 				if _, err := watch.Exec(ctx, `SELECT kingres.cancel_bucket_move($1)`, last.ID); err != nil {
-					// the extension refuses a move that is switching (or made): too late, the move goes on and the task with it
-					tooLate = true
+					if cancelRefused(err) {
+						// the extension refuses a move that is switching (or made): too late, the move goes on and the task with it
+						tooLate = true
+					} else if cancelFails++; cancelFails >= 5 {
+						// not a refusal: the request could not be handed over; it is said, and the task does not pretend it was too late
+						_ = env.SetDetail(ctx, "The cancel request could not be handed to the extension: "+err.Error())
+						cancelFails = 0
+					}
 				} else {
 					*asked = true
 				}
@@ -1001,6 +1047,9 @@ func (o *Ops) sMoveSwitch(ctx context.Context, env *task.Env) error {
 
 // sMoveClean does not wait for the old copy to be emptied (after move_cleanup_delay): the schema is served by the target.
 func (o *Ops) sMoveClean(ctx context.Context, env *task.Env) error {
+	if strings.HasPrefix(env.Task.Detail, moveTooLateText) {
+		return nil // the note of a cancel request that came too late stays on the task
+	}
 	_ = env.SetDetail(ctx, "The old copy is emptied by the sharding extension after kingres_shard.move_cleanup_delay.")
 	return nil
 }
@@ -1033,7 +1082,12 @@ func (o *Ops) sUndistMoveFirst(ctx context.Context, env *task.Env) error {
 	if !in.HasTarget {
 		return task.Skip("the schema is made local where it is")
 	}
-	return o.runSchemaMove(ctx, env, in)
+	if err := o.runSchemaMove(ctx, env, in); err != nil {
+		return err
+	}
+	// A cancel between this step and the making local leaves the schema distributed on its new group; the task says so.
+	_ = env.SetDetail(ctx, fmt.Sprintf("The schema has moved to shard group %d; if the task is cancelled before it is made local, it stays distributed there.", in.Target))
+	return nil
 }
 
 func (o *Ops) sUndistMake(ctx context.Context, env *task.Env) error {
@@ -1045,10 +1099,64 @@ func (o *Ops) sUndistMake(ctx context.Context, env *task.Env) error {
 		if rows, err := o.schemaRows(ctx, c, in.Schema); err == nil && len(rows) == 1 && rows[0].Distribution == nil {
 			return nil
 		}
+		if in.HasTarget {
+			if err := finishCleaning(ctx, c, in.Colocation); err != nil {
+				return err
+			}
+		}
 		_, err := c.Exec(ctx, `SELECT kingres.undistribute_schema($1::regnamespace)`, quoteIdent(in.Schema))
-		return schemaError(err)
+		return o.settledAfter(ctx, c, in.Schema, false, schemaError(err))
 	})
 }
 
 // SchemaSubjectID is the subject id of a schema task.
 func SchemaSubjectID(db, schema string) string { return db + "/" + schema }
+
+// resumeInterval is how often a task that waits for the extension to settle a move asks it to: twice the node timeout of the
+// extension (it leaves a move in preparing or switching alone while its last change is younger than that) and a second.
+func (o *Ops) resumeInterval(ctx context.Context, c *pgx.Conn) time.Duration {
+	var sec int
+	if err := c.QueryRow(ctx, `SELECT setting::int FROM pg_settings WHERE name = 'kingres_shard.node_timeout'`).Scan(&sec); err != nil || sec <= 0 {
+		sec = 10
+	}
+	return time.Duration(2*sec+1) * time.Second
+}
+
+func errText(err error) string {
+	if err == nil {
+		return "no error"
+	}
+	return err.Error()
+}
+
+// cancelRefused tells the refusal of cancel_bucket_move for a move that is switching or made (SQLSTATE 55000, object_not_in_prerequisite_state)
+// from a failure of the call itself (a lost connection, a timeout): only the first is "too late"; the second is tried again.
+func cancelRefused(err error) bool {
+	var pe *pgconn.PgError
+	return errors.As(err, &pe) && pe.Code == "55000"
+}
+
+// finishCleaning ends at once the cleaning of the old copy that the move first of a make local left: the extension refuses to make a
+// schema local while a move of it is in the phase cleaning, and its delay is ten minutes by default. It is the call that
+// kingres.cleanup_moved_buckets makes, for the moves of this colocation group only, so that other schemas keep their delay. A
+// cleaning that an earlier move left was refused when the request arrived (cleaningMove), so what is found here is this task's own.
+func finishCleaning(ctx context.Context, c *pgx.Conn, colocation int32) error {
+	rows, err := c.Query(ctx, `SELECT move_id FROM kingres.bucket_move WHERE colocation_id = $1 AND phase = 'cleaning' ORDER BY move_id`, colocation)
+	if err != nil {
+		return PGProblem(err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil || len(ids) == 0 {
+		return PGProblem(err)
+	}
+	var self int32
+	if err := c.QueryRow(ctx, `SELECT node_id FROM kingres.local_node`).Scan(&self); err != nil {
+		return PGProblem(err)
+	}
+	for _, id := range ids {
+		if _, err := c.Exec(ctx, `SELECT kingres.internal_exec_scalar($1, $2, 20000)`, self, fmt.Sprintf("SELECT kingres.internal_continue_cleaning(%d, false, true)", id)); err != nil {
+			return fmt.Errorf("ending the cleaning of move %d: %w", id, err)
+		}
+	}
+	return nil
+}

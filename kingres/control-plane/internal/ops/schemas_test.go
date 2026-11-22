@@ -4,8 +4,11 @@
 package ops
 
 import (
+	"context"
 	"errors"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 
@@ -141,5 +144,45 @@ func TestMoveRecordEnds(t *testing.T) {
 	var coded task.Coded = moveCancelled{group: 3}
 	if coded.TaskCode() != task.CodeCanceled || coded.TaskRetryable() {
 		t.Error("an undone move fails with the code cancelled")
+	}
+}
+
+// Only the refusal of the extension for a move that is switching is "too late"; a failure of the call itself is tried again.
+func TestCancelRefusedIsTheExtensionsRefusalOnly(t *testing.T) {
+	if !cancelRefused(&pgconn.PgError{Code: "55000", Message: "bucket move 3 is switching and cannot be cancelled"}) {
+		t.Error("55000 is the refusal")
+	}
+	for _, err := range []error{errors.New("conn closed"), &pgconn.PgError{Code: "57014", Message: "canceling statement due to statement timeout"}, &pgconn.PgError{Code: "08006"}, nil} {
+		if cancelRefused(err) {
+			t.Errorf("%v is not a refusal", err)
+		}
+	}
+}
+
+// The note of a cancel request that came too late stays on the task when the clean-up step runs; any other detail is replaced.
+func TestCleanUpStepKeepsTheLateCancelNote(t *testing.T) {
+	for _, tc := range []struct {
+		first    string
+		wantKept bool
+	}{{moveTooLateText + ": the move had passed the point", true}, {"cleaning: the schema is served by its new group", false}} {
+		mem := task.NewMemStore()
+		o := &Ops{}
+		def := task.Definition{Kind: "test.move", Steps: []task.Step{
+			{Name: "copy", Run: func(ctx context.Context, env *task.Env) error { return env.SetDetail(ctx, tc.first) }},
+			{Name: "clean", Run: o.sMoveClean},
+		}}
+		eng, err := task.NewEngine(mem, []task.Definition{def}, task.Options{Holder: "A", Lease: time.Minute})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx := context.Background()
+		tk, _ := eng.Submit(ctx, "test.move", task.Subject{Type: "schema", ID: "d/s"}, nil, "u")
+		if _, err := eng.RunOnce(ctx); err != nil {
+			t.Fatal(err)
+		}
+		got, _ := eng.Get(ctx, tk.ID)
+		if kept := strings.HasPrefix(got.Detail, moveTooLateText); kept != tc.wantKept {
+			t.Errorf("detail %q after the clean-up step, kept %v, want %v", got.Detail, kept, tc.wantKept)
+		}
 	}
 }

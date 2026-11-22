@@ -129,21 +129,25 @@ func TestSchemaTasksOnACluster(t *testing.T) {
 		skExec(t, c, "sk", `ALTER TABLE kn.nothing REPLICA IDENTITY NOTHING`)
 		skExec(t, c, "sk", `CREATE TABLE kn.nokey (a int, b text)`)
 		skExec(t, c, "sk", `CREATE TABLE kn.fine (id bigint PRIMARY KEY)`)
+		// a partition of a keyed table can have an identity of its own
+		skExec(t, c, "sk", `CREATE TABLE kn.parted (id bigint PRIMARY KEY, v text) PARTITION BY RANGE (id)`)
+		skExec(t, c, "sk", `CREATE TABLE kn.parted_p1 PARTITION OF kn.parted FOR VALUES FROM (0) TO (1000000)`)
+		skExec(t, c, "sk", `ALTER TABLE kn.parted_p1 REPLICA IDENTITY NOTHING`)
 		skExec(t, c, "sk", `INSERT INTO kn.nothing SELECT g, 'n' FROM generate_series(1, 50) g`)
 		skExec(t, c, "sk", `INSERT INTO kn.nokey SELECT g, 'k' FROM generate_series(1, 50) g`)
 		skDistribute(t, l, "kn")
 		d := l.Expect(200, "GET", "/databases/sk/schemas/kn", nil)
-		if got := strings.Join(toStrings(d["tablesWithoutReplicaIdentity"]), ","); got != "nokey,nothing" {
+		if got := strings.Join(toStrings(d["tablesWithoutReplicaIdentity"]), ","); got != "nokey,nothing,parted_p1" {
 			t.Fatalf("tables without a replica identity: %q", got)
 		}
 		// 1. a move
 		st, p := l.Do("POST", "/databases/sk/schemas/kn/moves", map[string]any{"targetShardGroupId": 1}, nil)
-		if st != 422 || strings.Join(skNames(p), ",") != "nokey,nothing" {
+		if st != 422 || strings.Join(skNames(p), ",") != "nokey,nothing,parted_p1" {
 			t.Fatalf("move: %d %v", st, p)
 		}
 		// 2. the move first of a make local is a move: it is refused before a task exists
 		st, p = l.Do("DELETE", "/databases/sk/schemas/kn/distribution?shardGroupId=1", nil, nil)
-		if st != 422 || strings.Join(skNames(p), ",") != "nokey,nothing" {
+		if st != 422 || strings.Join(skNames(p), ",") != "nokey,nothing,parted_p1" {
 			t.Fatalf("make local with a move first: %d %v", st, p)
 		}
 		if tasks := anyList(l.Expect(200, "GET", "/tasks?kind=schema.undistribute&limit=5", nil)["items"]); len(tasks) != 0 {
@@ -155,13 +159,25 @@ func TestSchemaTasksOnACluster(t *testing.T) {
 		if d := skDistribution(t, l, "kn"); d == nil || d["shardGroupId"] != float64(1) {
 			t.Fatalf("distribution after the move: %v", d)
 		}
-		for _, tbl := range []string{"nothing", "nokey"} {
+		for _, tbl := range []string{"nothing", "nokey", "parted_p1"} {
 			if skInt(t, c.Nodes[1], "sk", `SELECT count(*) FROM pg_class WHERE oid = $1::regclass AND relreplident = 'f'`, "kn."+tbl) != 1 {
 				t.Errorf("kn.%s has no full replica identity on the new owner", tbl)
 			}
 		}
 		if got := skInt(t, c.Nodes[1], "sk", `SELECT count(*) FROM kn.nothing`); got != 50 {
 			t.Errorf("rows of kn.nothing on the owner: %d", got)
+		}
+		// Once the old copy is emptied, a make local that moves it first ends on the other group and the task says where the schema went
+		// (a cancel before the making local would leave it there).
+		until(t, 3*time.Minute, "the old copy of the move to be emptied", func() bool {
+			return skInt(t, l, "sk", `SELECT count(*) FROM kingres.bucket_move WHERE phase = 'cleaning'`) == 0
+		})
+		local := l.WaitTaskDone(clustertest.TaskID(l.Expect(202, "DELETE", "/databases/sk/schemas/kn/distribution?shardGroupId=2", nil)), 6*time.Minute)
+		if d, _ := local["detail"].(string); !strings.Contains(d, "has moved to shard group 2") {
+			t.Errorf("detail of the make local that moved first: %q", d)
+		}
+		if got := skInt(t, c.Nodes[2], "sk", `SELECT count(*) FROM kn.nothing`); got != 50 {
+			t.Errorf("rows of kn.nothing on the new owner: %d", got)
 		}
 	})
 
@@ -324,6 +340,175 @@ func TestSchemaTasksOnACluster(t *testing.T) {
 			})
 		}
 	})
+
+	// A call of the extension that the death of the leader cut off is not made twice. The backend of the extension outlives kingresd,
+	// so the new leader finds the step recorded as running with the effect not there (the backend waits for a lock that the test
+	// holds), asks the extension to settle what is prepared, and calls it again; the two calls meet, and the second finds the work done.
+	// lockRel holds a table (the tables of a schema, or the map version that the extension locks first) in a transaction of the test in a transaction of the test, so that the call of the extension waits for the lock.
+	lockRel := func(rel, mode, fn string) func() (func() bool, func()) {
+		return func() (func() bool, func()) {
+			hold := l.ServicePG("sk")
+			for _, q := range []string{`BEGIN`, `LOCK TABLE ` + rel + ` IN ` + mode + ` MODE`} {
+				if _, err := hold.Exec(context.Background(), q); err != nil {
+					t.Fatal(err)
+				}
+			}
+			return func() bool {
+					return skInt(t, l, "postgres", `SELECT count(*) FROM pg_stat_activity WHERE datname = 'sk' AND wait_event_type = 'Lock' AND query LIKE '%`+fn+`%'`) > 0
+				}, func() {
+					_, _ = hold.Exec(context.Background(), `ROLLBACK`)
+					_ = hold.Close(context.Background())
+				}
+		}
+	}
+	cutInCall := func(t *testing.T, schema, method, path string, block func() (blocked func() bool, release func()), prepare func(), done func()) {
+		skMake(t, c, schema, 200)
+		prepare()
+		blocked, release := block()
+		defer release()
+		body := l.Expect(202, method, path, nil)
+		id := clustertest.TaskID(body)
+		until(t, time.Minute, "the call of the extension to be held", blocked)
+		l.Kill()
+		l.Start()
+		until(t, 3*time.Minute, "the restarted leader accepts a sign-in", func() bool { return l.Login(clustertest.AdminUser, clustertest.AdminPass) })
+		until(t, 3*time.Minute, "the new run to settle the cut step", func() bool {
+			log := l.LogTail(8000000)
+			return strings.Contains(log, "settling what it left prepared") && strings.Contains(log, `"schema":"`+schema+`"`)
+		})
+		release()
+		task := l.WaitTask(id, 5*time.Minute)
+		if task["state"] != "done" {
+			t.Fatalf("task after the takeover: %v %v\n%s", task["state"], task["error"], l.LogTail(3000))
+		}
+		done()
+	}
+	t.Run("a distribute cut off in the call is settled and not made twice", func(t *testing.T) {
+		const schema = "ic"
+		cutInCall(t, schema, "PUT", "/databases/sk/schemas/"+schema+"/distribution", lockRel(schema+".t", "ACCESS EXCLUSIVE", "distribute_schema"), func() {}, func() {
+			if skDistribution(t, l, schema) == nil {
+				t.Fatalf("no distribution after the task")
+			}
+			if got := skInt(t, l, "sk", `SELECT count(*) FROM kingres.dist_schema s JOIN pg_namespace n ON n.oid = s.nsp::oid WHERE n.nspname = $1`, schema); got != 1 {
+				t.Errorf("%d rows of dist_schema", got)
+			}
+			for _, n := range c.Nodes {
+				if got := skInt(t, n, "sk", `SELECT count(*) FROM `+schema+`.t`); got != 200 {
+					t.Errorf("node %d reads %d rows", n.Index, got)
+				}
+			}
+		})
+	})
+
+	t.Run("a make local cut off in the call is settled and not made twice", func(t *testing.T) {
+		const schema = "iu"
+		cutInCall(t, schema, "DELETE", "/databases/sk/schemas/"+schema+"/distribution", lockRel("kingres.map_version", "SHARE", "undistribute_schema"), func() { skDistribute(t, l, schema) }, func() {
+			if d := skDistribution(t, l, schema); d != nil {
+				t.Errorf("still distributed: %v", d)
+			}
+			if got := skInt(t, l, "sk", `SELECT count(*) FROM `+schema+`.t`); got != 200 {
+				t.Errorf("rows after make local: %d", got)
+			}
+		})
+	})
+
+	// The other direction of the exclusion at the request: a schema move while a rebalance runs is refused (the trigger is the backstop).
+	t.Run("a schema move is refused while a rebalance runs", func(t *testing.T) {
+		skMake(t, c, "rr", 500)
+		skDistribute(t, l, "rr")
+		from := skDistribution(t, l, "rr")["shardGroupId"]
+		to := 1
+		if from == float64(1) {
+			to = 2
+		}
+		reached, release := p10Gate(t, c, "sk", "move_after_catchup")
+		defer release()
+		rid := clustertest.TaskID(l.Expect(202, "POST", "/rebalance", nil))
+		reached(3 * time.Minute)
+		if st, b := l.Do("POST", "/databases/sk/schemas/rr/moves", map[string]any{"targetShardGroupId": to}, nil); st != 409 || b["code"] != "rebalance_in_progress" {
+			t.Errorf("a schema move while a rebalance runs: %d %v", st, b)
+		}
+		if st, b := l.Do("DELETE", "/databases/sk/schemas/rr/distribution?shardGroupId="+fmt.Sprint(to), nil, nil); st != 409 || b["code"] != "rebalance_in_progress" {
+			t.Errorf("a make local that moves first while a rebalance runs: %d %v", st, b)
+		}
+		release()
+		l.WaitTask(rid, 10*time.Minute)
+	})
+
+	// The session of the extension that runs move_schema dies (killed backend), with kingresd alive: the call returns an error while the
+	// record is still open. The task asks the extension to settle it itself (the recovery worker is made slow so that it cannot be what
+	// does it), the move is undone, and the step starts it again.
+	t.Run("a move whose session died is settled by the task and started again", func(t *testing.T) {
+		pg := l.ServicePG("postgres")
+		defer func() { _ = pg.Close(context.Background()) }()
+		for _, q := range []string{`ALTER SYSTEM SET kingres_shard.recovery_interval = 3600`, `SELECT pg_reload_conf()`} {
+			if _, err := pg.Exec(context.Background(), q); err != nil {
+				t.Fatal(err)
+			}
+		}
+		defer func() {
+			for _, q := range []string{`ALTER SYSTEM RESET kingres_shard.recovery_interval`, `SELECT pg_reload_conf()`} {
+				_, _ = pg.Exec(context.Background(), q)
+			}
+		}()
+		skMake(t, c, "tk", 3000)
+		skDistribute(t, l, "tk")
+		from := skDistribution(t, l, "tk")["shardGroupId"]
+		to := 1
+		if from == float64(1) {
+			to = 2
+		}
+		reached, release := p10Gate(t, c, "sk", "move_after_catchup")
+		defer release()
+		id := clustertest.TaskID(l.Expect(202, "POST", "/databases/sk/schemas/tk/moves", map[string]any{"targetShardGroupId": to}))
+		reached(3 * time.Minute)
+		skTerminateMove(t, l)
+		release()
+		task := l.WaitTask(id, 4*time.Minute)
+		if task["state"] != "done" {
+			t.Fatalf("task after the session died: %v %v\n%s", task["state"], task["error"], l.LogTail(3000))
+		}
+		if !strings.Contains(l.LogTail(8000000), "asking the extension to settle a move that no call of this run drives") {
+			t.Errorf("the task never asked the extension to settle the move")
+		}
+		if d := skDistribution(t, l, "tk"); d == nil || d["shardGroupId"] != float64(to) || d["state"] != "active" {
+			t.Errorf("distribution: %v", d)
+		}
+		if got := skInt(t, l, "sk", `SELECT count(*) FROM tk.t`); got != 3000 {
+			t.Errorf("rows after the move: %d", got)
+		}
+	})
+
+	// The leader dies and so does the session that runs the move: the new leader finds a record that nobody drives, the extension
+	// undoes it, and the step starts the move again.
+	t.Run("a move whose leader and session both died is undone and started again", func(t *testing.T) {
+		skMake(t, c, "td", 3000)
+		skDistribute(t, l, "td")
+		from := skDistribution(t, l, "td")["shardGroupId"]
+		to := 1
+		if from == float64(1) {
+			to = 2
+		}
+		reached, release := p10Gate(t, c, "sk", "move_after_catchup")
+		defer release()
+		id := clustertest.TaskID(l.Expect(202, "POST", "/databases/sk/schemas/td/moves", map[string]any{"targetShardGroupId": to}))
+		reached(3 * time.Minute)
+		l.Kill()
+		skTerminateMove(t, l)
+		release()
+		l.Start()
+		until(t, 3*time.Minute, "the restarted leader accepts a sign-in", func() bool { return l.Login(clustertest.AdminUser, clustertest.AdminPass) })
+		task := l.WaitTask(id, 8*time.Minute)
+		if task["state"] != "done" {
+			t.Fatalf("task after the takeover: %v %v\n%s", task["state"], task["error"], l.LogTail(3000))
+		}
+		if d := skDistribution(t, l, "td"); d == nil || d["shardGroupId"] != float64(to) || d["state"] != "active" {
+			t.Errorf("distribution: %v", d)
+		}
+		if got := skInt(t, l, "sk", `SELECT count(*) FROM td.t`); got != 3000 {
+			t.Errorf("rows after the move: %d", got)
+		}
+	})
 }
 
 func toStrings(v any) []string {
@@ -354,4 +539,17 @@ func skMoves(t *testing.T, l *clustertest.Node) string {
 		out = append(out, fmt.Sprintf("%d/%d %s %q", id, colo, phase, detail))
 	}
 	return strings.Join(out, "; ")
+}
+
+// skTerminateMove ends the backend that runs move_schema on the leader's instance (the session of the extension, not kingresd).
+func skTerminateMove(t *testing.T, l *clustertest.Node) {
+	t.Helper()
+	conn := l.ServicePG("postgres")
+	defer func() { _ = conn.Close(context.Background()) }()
+	var n int
+	err := conn.QueryRow(context.Background(), `SELECT count(*) FROM (SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+		WHERE datname = 'sk' AND state = 'active' AND query LIKE '%kingres.move_schema%' AND pid <> pg_backend_pid()) x`).Scan(&n)
+	if err != nil || n != 1 {
+		t.Fatalf("ending the backend of move_schema: %d backends, %v", n, err)
+	}
 }
