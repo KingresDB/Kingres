@@ -22,6 +22,7 @@ OBJS = \
 	src/ha.o \
 	src/hashing.o \
 	src/kingres_shard.o \
+	src/merge.o \
 	src/node_admin.o \
 	src/node_conn.o \
 	src/placement_check.o \
@@ -53,7 +54,7 @@ DATA = kingres_shard--0.1.sql kingres_shard--0.2.sql kingres_shard--0.3.sql \
 	kingres_shard--0.7--0.8.sql kingres_shard--0.8.sql
 
 REGRESS = version catalog bucket_for bucket_lookup bucket_layout distribute distribute_rows sequence_options online_refusals routing_single security \
-	utility_guard routing_decisions reference ddl_single rebalance_plan plan_strategies bulk_plans pushdown_shippable pushdown_plans repartition_plans schema_catalog upgrade pg_facts
+	utility_guard routing_decisions reference ddl_single rebalance_plan plan_strategies bulk_plans pushdown_shippable pushdown_plans repartition_plans merge_plans schema_catalog upgrade pg_facts
 # The tests need the extension preloaded (see kingres_shard.conf).
 REGRESS_OPTS = --temp-config $(srcdir)/kingres_shard.conf
 TAP_TESTS = 1

@@ -72,6 +72,7 @@ typedef struct ShipCtx
 	bool		statement;		/* a whole statement, not one clause */
 	Oid			shipped_relid;	/* statement mode: the table being written */
 	Query	   *top;			/* statement mode: the statement itself */
+	bool		merge_ok;		/* the top level may be a MERGE (design 7): its ON clause and actions are walked */
 	int			colocation_id;	/* multi-relation mode (design 5, 11.7): every distributed table of
 								 * this colocation group may be read, at the one source level the
 								 * analysis of pushdown.c found; else 0 */
@@ -716,7 +717,7 @@ query_ok(Query *q, ShipCtx *ctx)
 		return false;
 	if (q != ctx->top && q->commandType != CMD_SELECT)
 		return fail(ctx, "it has a data-modifying statement inside a subquery or a WITH clause");
-	if (q->commandType == CMD_MERGE || q->commandType == CMD_UTILITY)
+	if (q->commandType == CMD_UTILITY || (q->commandType == CMD_MERGE && !(ctx->merge_ok && q == ctx->top)))
 		return fail(ctx, "it is a MERGE or a utility statement");
 	if (q->rowMarks != NIL)
 		return fail(ctx, "it has a row locking clause");
@@ -1051,6 +1052,22 @@ ship_walker(Node *node, ShipCtx *ctx)
 				break;
 			}
 
+		case T_MergeAction:
+			if (!ctx->statement || !ctx->merge_ok)
+				return fail(ctx, "it has the structure of a whole statement");
+			break;
+
+		case T_MergeSupportFunc:
+			{
+				MergeSupportFunc *mf = (MergeSupportFunc *) node;
+
+				if (!ctx->statement || !ctx->merge_ok)
+					return fail(ctx, "it has the structure of a whole statement");
+				if (!type_ok(mf->msftype) || !collation_ok(mf->msfcollid))
+					return fail(ctx, "it uses a type or collation that is not built in");
+				break;
+			}
+
 		case T_OnConflictExpr:
 			if (!ctx->statement)
 				return fail(ctx, "it has the structure of a whole statement");
@@ -1149,6 +1166,57 @@ kingres_shard_stmt_shippable_colocated(Query *query, Oid target_relid, int coloc
 	ctx.statement = true;
 	ctx.shipped_relid = target_relid;
 	ctx.colocation_id = colocation_id;
+	ctx.top = query;
+	bad = query_ok(query, &ctx);
+	if (bad && reason != NULL)
+		*reason = ctx.reason ? ctx.reason : "it cannot be shipped";
+	return !bad;
+}
+
+/*
+ * A MERGE of a distributed table (design 7): the statement a group runs, whose relations are the
+ * target, the distributed tables of the colocation group, reference tables and the sub-select of
+ * a shipped source.  Whether the tables are joined so that this is right is the analysis of
+ * merge.c; this walker judges the expressions (the ON clause, the conditions, SET, VALUES, RETURNING).
+ */
+bool
+kingres_shard_stmt_shippable_merge(Query *query, int colocation_id, const char **reason)
+{
+	ShipCtx		ctx;
+	bool		bad;
+
+	Assert(colocation_id != 0);
+	ship_allow_ext = false;
+	ship_used_ext = NIL;
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.statement = true;
+	ctx.merge_ok = true;
+	ctx.shipped_relid = InvalidOid;
+	ctx.colocation_id = colocation_id;
+	ctx.top = query;
+	bad = query_ok(query, &ctx);
+	if (bad && reason != NULL)
+		*reason = ctx.reason ? ctx.reason : "it cannot be shipped";
+	return !bad;
+}
+
+/*
+ * A MERGE into a reference table (design 7.5, M4 and M5): the rule of a write that runs on every node (the target
+ * is the one table written, the other relations are reference tables or the sub-select of a shipped source)
+ * applied to the MERGE node kinds.
+ */
+bool
+kingres_shard_stmt_shippable_merge_ref(Query *query, Oid target_relid, const char **reason)
+{
+	ShipCtx		ctx;
+	bool		bad;
+
+	ship_allow_ext = false;
+	ship_used_ext = NIL;
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.statement = true;
+	ctx.merge_ok = true;
+	ctx.shipped_relid = target_relid;
 	ctx.top = query;
 	bad = query_ok(query, &ctx);
 	if (bad && reason != NULL)
