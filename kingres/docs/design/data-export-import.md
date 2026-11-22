@@ -1744,7 +1744,14 @@ The result is `dx/s2-result.md` of the second writer (2026-11-22, PostgreSQL 18.
 - **Header match** is PostgreSQL's (S2); the header text is never passed on, so the task code is `import_header_mismatch` without the first difference.
 - **`maxConcurrent`** is one transfer per role and the setting in the cluster, counted from the unfinished tasks of the two kinds.
 - **The cluster test harness serves HTTPS for the data transfer** (`clustertest.FormTLS`, the TLS cluster of `cmd/kingresd`), because the operations refuse plain HTTP.
-- **Not covered by tests in this increment:** the leader-change fault points of a real failover at every step (the leader that holds the files is gone: the codes
+- **Metrics and an alert were added to contract 0.19.0 before its release:** the metric names transferStagingUsedBytes, transferStagingFreeBytes, transfersRunning and
+  transfersStaged, and the alert kind transferStagingLow (90 and 98 percent of the quota); the monitor of the leader samples them from the staging store.
+- **The hook `ops.ImportFault`** has the points beforeIntent, intentWrite (an error stands for the refusal of the write of the intent, a lost lease) and afterIntent.
+- **Fault tests that were added later:** a record of 15.5 MiB through PostgreSQL, a cancel after the intent, a refused write of the intent, the untrusted-code check with a function of
+  another role, a restart of the leader in the middle of an import and of an export, a shard group stopped in the middle of a routed COPY (the import ends copy_interrupted, retryable,
+  and the table has none of the rows or all). Still not covered: a real failover of the manager leader (the files of the old leader are on its disk, so every step ends transfer_leader_changed;
+  only the codes and the record reads are tested), KS001 from a bucket move during a routed COPY, and a group lost exactly at COMMIT.
+- **Not covered by tests in the first increments (some of the items are covered above):** the leader-change fault points of a real failover at every step (the leader that holds the files is gone: the codes
   `transfer_leader_changed` and `transfer_session_lost` are in the code and tested only for the records they read), `KS001` and a bucket move during a routed COPY, a
   group that fails at COMMIT, a record near 16 MiB through PostgreSQL (the scanner is tested at the limit), the untrusted-code check against a role other than the owner
   (the query runs in every export; no table in the tests has a function of another role), and metrics and alerts for the staging disk.

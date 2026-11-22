@@ -272,7 +272,7 @@ func TestImportRowCountMismatchRollsBack(t *testing.T) {
 	}
 }
 
-// The end marker, a quoted one, the header, and the limits of the file (the flag max-atomic-bytes is 4 MiB in this cluster).
+// The end marker, a quoted one, the header, and the limits of the file (the flag max-atomic-bytes is 24 MiB in this cluster).
 func TestImportFileRules(t *testing.T) {
 	e, off := transferOn(t)
 	defer off()
@@ -311,7 +311,7 @@ func TestImportFileRules(t *testing.T) {
 		t.Errorf("a matching header: %v", task["error"])
 	}
 	// Limits: a file above the cap is refused at the request; a gzip bomb is stopped by the count of its expansion; a record above 16 MiB by the scanner.
-	big := bytes.Repeat([]byte("1,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"), 80000)
+	big := bytes.Repeat([]byte("1,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"), 420000)
 	uid := e.uploadFile(t, big)
 	st, out, _ := e.call("POST", "/databases/db_xfer/schemas/public/tables/fr_t/import", map[string]any{"uploadId": uid, "header": "none"}, nil)
 	if st != 422 || problemCode(out) != "import_too_large" {
@@ -469,11 +469,12 @@ func TestImportCommitFaultPoints(t *testing.T) {
 	q("truncate public.fp_t")
 	uid := e.uploadFile(t, []byte("1,a\n2,b\n3,c\n"))
 	kill := func(point string) {
-		ops.ImportFault = func(p string, pid uint32) {
+		ops.ImportFault = func(p string, pid uint32) error {
 			if p == point {
 				ops.ImportFault = nil
 				e.expect(t, 200, "POST", "/query", map[string]any{"database": "postgres", "sql": "select pg_terminate_backend(" + strconv.Itoa(int(pid)) + ")"})
 			}
+			return nil
 		}
 	}
 	defer func() { ops.ImportFault = nil }()

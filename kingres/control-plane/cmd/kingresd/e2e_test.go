@@ -92,8 +92,8 @@ func newServerWith(t testing.TB, useTLS bool) *cp {
 		"-login-rate-limit", "1000", "-internal-listen", e.internal, "-pg-bin-dir", pgtest.BinDir(), "-pg-port", fmt.Sprint(e.pgPort), "-server-host", "127.0.0.1"}
 	if useTLS {
 		crt, key := writeSelfSigned(t, root)
-		// The cluster that serves HTTPS is the one of the data transfer tests: a small cap on an import makes the limits quick to test.
-		args = append(args, "-tls-cert-file", crt, "-tls-key-file", key, "-max-atomic-bytes", "4194304")
+		// The cluster that serves HTTPS is the one of the data transfer tests: a cap of 24 MiB on an import keeps the limit tests quick and leaves room for a record of 15 MiB.
+		args = append(args, "-tls-cert-file", crt, "-tls-key-file", key, "-max-atomic-bytes", "25165824")
 		e.client = tlsClient()
 	}
 	e.args = args

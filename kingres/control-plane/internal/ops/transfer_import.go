@@ -66,12 +66,13 @@ type importParams struct {
 
 // ImportFault is the fault point hook of the tests (nil in production): it is called with the name of a point of the commit protocol and the process id of
 // the backend of the import, so that a test can end the connection at that point. The points are "beforeIntent" and "afterIntent".
-var ImportFault func(point string, backendPID uint32)
+var ImportFault func(point string, backendPID uint32) error
 
-func importFault(point string, pl *pendingLoad) {
+func importFault(point string, pl *pendingLoad) error {
 	if ImportFault != nil {
-		ImportFault(point, pl.conn.PgConn().PID())
+		return ImportFault(point, pl.conn.PgConn().PID())
 	}
+	return nil
 }
 
 // pendingLoad is the open transaction between the step that loads and the step that commits. It lives in memory: a restart ends it with the
@@ -749,18 +750,22 @@ func (o *Ops) stepImportCommit(ctx context.Context, env *task.Env) error {
 		pl.rollback(ctx)
 		return err
 	}
-	importFault("beforeIntent", pl)
+	_ = importFault("beforeIntent", pl)
 	// A connection that broke since the load: nothing was committed, the transaction died with it, and the import may be repeated.
 	if _, err := pl.tx.Exec(ctx, "SELECT 1"); err != nil {
 		pl.rollback(ctx)
 		return transfer.Errorf(transfer.CodeCopyInterrupted, true, "the connection to the database broke before the commit; nothing was stored, repeat the operation")
 	}
 	// The intent is written under the lease before COMMIT is sent: a leader that lost its lease cannot record it, so it cannot commit.
-	if err := env.SetDetail(ctx, intentMarker+strconv.FormatInt(pl.rows, 10)+" rows"); err != nil {
+	werr := importFault("intentWrite", pl)
+	if werr == nil {
+		werr = env.SetDetail(ctx, intentMarker+strconv.FormatInt(pl.rows, 10)+" rows")
+	}
+	if err := werr; err != nil {
 		pl.rollback(ctx)
 		return err
 	}
-	importFault("afterIntent", pl)
+	_ = importFault("afterIntent", pl)
 	// After the intent there is no cancel: the commit is not tied to the context of the request.
 	bg, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
 	defer cancel()

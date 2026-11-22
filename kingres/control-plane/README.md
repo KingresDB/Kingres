@@ -383,8 +383,15 @@ need PostgreSQL), `internal/staging` (CP2), `internal/httpapi` (guards, relay), 
 (`TestDataTransferThroughAFollower`: three servers, uploads, downloads, import and export through followers, a follower that dies in the middle of an upload).
 Run the PostgreSQL ones with `scripts\run-integration.ps1 -Packages ./cmd/kingresd -Run 'TestUpload|TestExport|TestImport'` on both majors.
 
-**Not built in 14a.** Batches, `skipRows`, `onError` (the router refuses `ON_ERROR`; the console never offers it, nor `LOG_VERBOSITY`), the leader-change fault tests of
-every step of a real failover, the metrics and alerts for staging disk use (the metric names of the contract are a closed list).
+**Not built in 14a.** Batches, `skipRows`, `onError` (the router refuses `ON_ERROR`; the console never offers it, nor `LOG_VERBOSITY`), a real failover of the manager leader at every step (the tests restart the leader on its own disk and stop a shard group instead).
+
+**Metrics and alert (added to 0.19.0 before its release).** `transferStagingUsedBytes`, `transferStagingFreeBytes`, `transfersRunning`, `transfersStaged` (server metrics of the
+server that holds the files) and the alert `transferStagingLow` (warning at 90 percent of the staging quota, critical at 98).
+
+**Fault tests added after the first review round.** `TestImportRecordNearTheLimit` (15.5 MiB through PostgreSQL, 16 MiB and 1 byte refused), `TestImportCancelAfterTheIntent` (409,
+the import completes once), `TestImportLeaseLostBeforeTheIntent` (the write of the intent refused: nothing stored, no doubled rows), `TestExportUntrustedFunction` (a policy
+of another role: `export_untrusted_code`), `TestStagingMetricsAndAlert`, and on three servers `TestDataTransferLeaderRestartMidTransfer` and
+`TestDataTransferShardGroupLostMidCopy` (rows are all or none; no prepared transaction is left).
 
 ## What is implemented
 
