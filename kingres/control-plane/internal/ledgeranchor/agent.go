@@ -29,7 +29,7 @@ const (
 var Calls = []string{CallCredentialsInstall, CallCredentialsRemove, CallCredentialsList, CallCredentialsFetch}
 
 // ListResponse is the answer of CallCredentialsList: the target ids that the server has a file for, and for each file that can be opened
-// the digest of what it holds and when it was written (P7F-01; an older server sends no copies, and the leader then cannot tell a stale file).
+// its rotation generation and the keyed digest of what it holds (P7F-01; an older server sends no copies, and the leader then cannot tell a stale file).
 type ListResponse struct {
 	IDs    []int64    `json:"ids"`
 	Copies []CopyInfo `json:"copies,omitempty"`
@@ -83,6 +83,9 @@ func (a *Agent) Handle(_ context.Context, key string, body []byte) (any, error) 
 			return nil, bad("bad_request", "The kind is not known on this server.", http.StatusBadRequest)
 		}
 		if err := a.Creds.Install(in.TargetID, in.Kind, raw); err != nil {
+			if errors.Is(err, ErrOlderGeneration) {
+				return nil, bad("older_generation", "This server holds a newer credentials file for the target, or a different one of the same generation.", http.StatusConflict)
+			}
 			if errors.Is(err, ErrInstallWrite) {
 				return nil, bad("credentials_not_written", "The credentials file could not be written on this server.", http.StatusInternalServerError)
 			}

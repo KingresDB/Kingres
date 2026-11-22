@@ -258,10 +258,15 @@ func TestATargetCreatedWhileTheHoldersAreAskedKeepsItsFiles(t *testing.T) {
 		removed = append(removed, id)
 		return nil
 	}
+	var lateID int64
 	e.svc.cfg.Holders = func(context.Context, []int64) (HolderReport, error) {
 		// CreateTarget has committed the row of a second target and given the file to the holders; the job has read the list of the targets before
-		late := e.addWorm("late")
-		return HolderReport{Orphans: map[int64][]string{late.ID: {"h2", "h3"}, 77: {"h2"}}}, nil
+		// (creating the target asks the holders for the generation too: only the first question makes the target)
+		if lateID == 0 {
+			lateID = -1
+			lateID = e.addWorm("late").ID
+		}
+		return HolderReport{Orphans: map[int64][]string{lateID: {"h2", "h3"}, 77: {"h2"}}}, nil
 	}
 	if err := e.svc.jobCredentials(e.ctx(), e.term); err != nil {
 		t.Fatal(err)

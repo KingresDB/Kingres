@@ -15,438 +15,71 @@ import (
 	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/anchor"
-	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/scheduler"
 )
 
-// The tests of the fixes of the review of the fixes P7R (docs/reviews/2026-11-22-ledger-phase7-p7r-fixes.md): P7F-01, P7F-02, P7F-05.
+// The tests of the fixes of the review of the fixes P7R (docs/reviews/2026-11-22-ledger-phase7-p7r-fixes.md): P7F-02, P7F-05 and the
+// parts of P7F-01 that do not depend on how copies are ordered. The ordering of copies (the rotation generation) is tested in p7g_test.go.
 
 // staleCreds are credentials of the right shape that the fake store refuses (the old ones of a rotation).
 func staleCreds() Creds {
 	return Creds{"accessKeyId": anchor.Secret(testKeyID), "secretAccessKey": anchor.Secret("an-old-secret-that-was-rotated-out-0001")}
 }
 
-// ageFile sets the time at which the credentials file of a target was written.
-func ageFile(t *testing.T, e *env, id int64, at time.Time) {
+func newStamp(t *testing.T) string {
 	t.Helper()
-	if err := os.Chtimes(e.creds.path(id), at, at); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// ---- P7F-01: the digest of a credentials file ----
-
-func TestTheDigestOfACredentialsFileIsTheSameWhenSealedAndChangesWithAnyValue(t *testing.T) {
-	e := newEnv(t)
-	tg := e.addWorm("vault")
-	plain, err := e.creds.Digest(tg.ID)
-	if err != nil || len(plain.Digest) != 64 || plain.Installed.IsZero() {
-		t.Fatalf("%+v %v", plain, err)
-	}
-	// the same credentials in a file that another server sealed under its own passphrase (another salt and nonce) have the same digest
-	pf := e.dir + "/pass"
-	if err := os.WriteFile(pf, []byte("a passphrase of this test\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	sealed, err := NewCredStore(t.TempDir(), pf)
+	s, err := NewStamp()
 	if err != nil {
 		t.Fatal(err)
 	}
-	sealed.Iterations, sealed.MinIterations = 2000, 1000
-	c, err := e.creds.Get(tg.ID, "worm")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := sealed.Put(tg.ID, c); err != nil {
-		t.Fatal(err)
-	}
-	if raw, _ := sealed.Raw(tg.ID); strings.Contains(string(raw), testSecret) {
-		t.Fatal("the sealed file is not sealed")
-	}
-	sd, err := sealed.Digest(tg.ID)
-	if err != nil || sd.Digest != plain.Digest {
-		t.Fatalf("sealed %+v plain %+v %v", sd, plain, err)
-	}
-	// another value, another member, another target: another digest
-	other := Creds{"accessKeyId": c["accessKeyId"], "secretAccessKey": c["secretAccessKey"] + "x"}
-	if _, err := e.creds.Put(tg.ID, other); err != nil {
-		t.Fatal(err)
-	}
-	if d, _ := e.creds.Digest(tg.ID); d.Digest == plain.Digest {
-		t.Error("another secret gives the same digest")
-	}
-	if _, err := e.creds.Put(tg.ID, Creds{"accessKeyId": c["accessKeyId"], "secretAccessKey": c["secretAccessKey"], "sessionToken": "a-token"}); err != nil {
-		t.Fatal(err)
-	}
-	if d, _ := e.creds.Digest(tg.ID); d.Digest == plain.Digest {
-		t.Error("another member gives the same digest")
-	}
-	if _, err := e.creds.Put(tg.ID+1, c); err != nil {
-		t.Fatal(err)
-	}
-	if d, _ := e.creds.Digest(tg.ID + 1); d.Digest == plain.Digest {
-		t.Error("another target gives the same digest")
-	}
-	if _, err := e.creds.Digest(99); !errors.Is(err, ErrNoCredentials) {
-		t.Errorf("a missing file: %v", err)
-	}
-	if strings.Contains(plain.Digest, testSecret) {
-		t.Error("the digest holds the secret")
-	}
+	return s
 }
 
-func TestTheListAnswerCarriesTheDigestsAndAHolderReportKeepsThem(t *testing.T) {
-	e := newEnv(t)
-	tg := e.addWorm("vault")
-	a := &Agent{Creds: e.creds}
-	out, err := a.Handle(e.ctx(), CallCredentialsList, []byte("{}"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	lr := out.(ListResponse)
-	d, _ := e.creds.Digest(tg.ID)
-	if len(lr.IDs) != 1 || len(lr.Copies) != 1 || lr.Copies[0] != d {
-		t.Fatalf("%+v want digest %+v", lr, d)
-	}
-	b, _ := json.Marshal(lr)
-	if strings.Contains(string(b), testSecret) {
-		t.Fatal("the answer holds a secret")
-	}
-	rep := NewHolderReport()
-	rep.Add("h2", lr, []int64{tg.ID, 5})
-	rep.Add("h3", ListResponse{IDs: []int64{tg.ID, 77}}, []int64{tg.ID, 5}) // an older server: the file, no copies
-	if got := rep.Copies[tg.ID]; len(got) != 1 || got[0].Host != "h2" || got[0].Digest != d.Digest || !got[0].Installed.Equal(d.Installed) {
-		t.Fatalf("copies %+v", got)
-	}
-	if len(rep.Lacking[5]) != 2 || len(rep.Orphans[77]) != 1 || rep.Orphans[77][0] != "h3" {
-		t.Fatalf("lacking %v orphans %v", rep.Lacking, rep.Orphans)
-	}
-}
-
-func TestJudgingTheCopiesOfTheHolders(t *testing.T) {
-	now := time.Now()
-	own := CopyInfo{Digest: "a", Installed: now}
-	h := func(host, d string, at time.Time) HolderCopy { return HolderCopy{Host: host, Digest: d, Installed: at} }
-	newer, stale := judgeCopies(own, []HolderCopy{h("h2", "a", now.Add(time.Hour)), h("h3", "b", now.Add(-time.Hour)), h("h4", "c", time.Time{}), h("h5", "d", now.Add(time.Minute)), h("h6", "e", now.Add(time.Hour))})
-	if newer == nil || newer.Host != "h6" {
-		t.Fatalf("newer %+v, want the newest of the files that differ and are newer (h6)", newer)
-	}
-	if strings.Join(stale, ",") != "h3,h4" {
-		t.Fatalf("stale %v, want h3 (older) and h4 (age not known)", stale)
-	}
-	if n, s := judgeCopies(own, []HolderCopy{h("h2", "a", now.Add(-time.Hour))}); n != nil || len(s) != 0 {
-		t.Fatalf("a holder with the same digest is current whatever its age: %v %v", n, s)
-	}
-	if n, s := judgeCopies(CopyInfo{Digest: "a"}, []HolderCopy{h("h2", "b", now)}); n != nil || len(s) != 1 {
-		t.Fatalf("a leader whose age is not known keeps its file: %v %v", n, s)
-	}
-	if n, s := judgeCopies(own, []HolderCopy{{Host: "h2"}}); n != nil || len(s) != 0 {
-		t.Fatalf("a holder that says nothing is not stale: %v %v", n, s)
-	}
-}
-
-// ---- P7F-01: the rotation that a holder missed is given again, and the alert stays until every holder is current ----
-
-// rotated is a leader that has changed the credentials of its target while h2 was down: the leader's file is new, h2 still has the old one.
-type rotated struct {
-	e        *env
-	id       int64
-	mu       sync.Mutex
-	given    int
-	failGive bool
-	hold     func() HolderReport
-}
-
-func newRotated(t *testing.T) *rotated {
-	t.Helper()
-	r := &rotated{e: newEnv(t)}
-	e := r.e
-	e.svc.cfg.Distribute = func(context.Context, int64, string, []byte) error {
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		if r.failGive {
-			return errors.New("not reached: h2")
-		}
-		r.given++
-		return nil
-	}
-	tg := e.addWorm("vault")
-	r.id = tg.ID
-	// the rotation: h2 does not get it
-	r.failGive = true
-	if _, err := e.svc.UpdateTarget(e.ctx(), tg.ID, api.LedgerAnchorTargetUpdate{Credentials: wormCreds()}); err != nil {
-		t.Fatal(err)
-	}
-	r.failGive = false
-	r.given = 0
-	_ = e.runMonitor()
-	if e.alerts.severity(AlertFailed, "target:1|credentials") != "warning" {
-		t.Fatalf("no alert after the failed distribution: %s", e.alerts.all())
-	}
-	now := time.Now()
-	ageFile(t, e, tg.ID, now)
-	e.svc.cfg.Holders = func(context.Context, []int64) (HolderReport, error) { return r.hold(), nil }
-	// h2 has an older file, h3 the current one
-	cur, _ := e.creds.Digest(tg.ID)
-	r.hold = func() HolderReport {
-		rep := NewHolderReport()
-		rep.Copies[tg.ID] = []HolderCopy{{Host: "h2", Digest: "0ld" + cur.Digest[3:], Installed: now.Add(-48 * time.Hour)}, {Host: "h3", Digest: cur.Digest, Installed: now}}
-		return rep
-	}
-	return r
-}
-
-func TestARotationThatAHolderMissedIsGivenAgainAndTheAlertGoesOnlyThen(t *testing.T) {
-	r := newRotated(t)
-	e := r.e
-	// the holder is still down: the file cannot be given, and the alert stays, with a text that is true
-	r.failGive = true
-	if err := e.svc.jobCredentials(e.ctx(), e.term); err != nil {
-		t.Fatal(err)
-	}
-	_ = e.runMonitor()
-	if e.alerts.severity(AlertFailed, "target:1|credentials") != "warning" || !strings.Contains(e.alerts.all(), "h2") {
-		t.Fatalf("the alert went although h2 holds the old file: %s", e.alerts.all())
-	}
-	// the holder is up: the job gives the file again (the old code gave a file only to a holder that had none)
-	r.failGive = false
-	if err := e.svc.jobCredentials(e.ctx(), e.term); err != nil {
-		t.Fatal(err)
-	}
-	if r.given != 1 {
-		t.Fatalf("the file was given %d times to the holders, want 1", r.given)
-	}
-	_ = e.runMonitor()
-	if sev := e.alerts.severity(AlertFailed, "target:1|credentials"); sev != "" {
-		t.Fatalf("the alert stays after every holder was given the file: %s", e.alerts.all())
-	}
-	// every holder is current: nothing is given again
-	r.hold = func() HolderReport {
-		cur, _ := e.creds.Digest(r.id)
-		rep := NewHolderReport()
-		rep.Copies[r.id] = []HolderCopy{{Host: "h2", Digest: cur.Digest, Installed: time.Now()}, {Host: "h3", Digest: cur.Digest, Installed: time.Now()}}
-		return rep
-	}
-	if err := e.svc.jobCredentials(e.ctx(), e.term); err != nil {
-		t.Fatal(err)
-	}
-	if r.given != 1 {
-		t.Fatalf("a current holder was given the file again (%d)", r.given)
-	}
-}
-
-func TestTheAlertOfAMissedRotationStaysWhileAHolderCannotBeAsked(t *testing.T) {
-	r := newRotated(t)
-	e := r.e
-	// h2 does not answer the question, the others are current: the pass does not know that h2 is, and the alert that says the file is given again
-	// every minute stays
-	r.hold = func() HolderReport {
-		cur, _ := e.creds.Digest(r.id)
-		rep := NewHolderReport()
-		rep.Copies[r.id] = []HolderCopy{{Host: "h3", Digest: cur.Digest, Installed: time.Now()}}
-		rep.Unreached = []string{"h2"}
-		return rep
-	}
-	for i := 0; i < 2; i++ {
-		if err := e.svc.jobCredentials(e.ctx(), e.term); err != nil {
-			t.Fatal(err)
-		}
-		_ = e.runMonitor()
-		if e.alerts.severity(AlertFailed, "target:1|credentials") != "warning" {
-			t.Fatalf("pass %d wiped the alert of a holder that was not asked: %s", i, e.alerts.all())
-		}
-	}
-	if !strings.Contains(e.alerts.all(), "given again every minute") {
-		t.Fatalf("the text: %s", e.alerts.all())
-	}
-	// h2 answers and is current: the alert goes
-	r.hold = func() HolderReport {
-		cur, _ := e.creds.Digest(r.id)
-		rep := NewHolderReport()
-		rep.Copies[r.id] = []HolderCopy{{Host: "h2", Digest: cur.Digest, Installed: time.Now()}, {Host: "h3", Digest: cur.Digest, Installed: time.Now()}}
-		return rep
-	}
-	if err := e.svc.jobCredentials(e.ctx(), e.term); err != nil {
-		t.Fatal(err)
-	}
-	_ = e.runMonitor()
-	if sev := e.alerts.severity(AlertFailed, "target:1|credentials"); sev != "" {
-		t.Fatalf("the alert stays although every holder is current: %s", e.alerts.all())
-	}
-}
-
-func TestAFailedRedeliveryOfAStaleCopyKeepsTheAlertAndNamesTheHolder(t *testing.T) {
-	r := newRotated(t)
-	e := r.e
-	r.failGive = true
-	for i := 0; i < 2; i++ {
-		if err := e.svc.jobCredentials(e.ctx(), e.term); err != nil {
-			t.Fatal(err)
-		}
-	}
-	_ = e.runMonitor()
-	all := e.alerts.all()
-	if e.alerts.severity(AlertFailed, "target:1|credentials") != "warning" || !strings.Contains(all, "h2") || strings.Contains(all, "h3") || !strings.Contains(all, "older") {
-		t.Fatalf("the alert: %s", all)
-	}
-}
-
-// ---- P7F-01: a leader that missed the rotation does not anchor with the old credentials ----
-
-// staleLeader is a leader whose file is the old credentials, written two days ago, while holder h3 has the current ones written a moment ago.
-func staleLeader(t *testing.T) (e *env, id int64, current []byte) {
-	t.Helper()
-	e = newEnv(t)
-	tg := e.addWorm("vault")
-	id = tg.ID
-	raw, err := e.creds.Raw(id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cur, _ := e.creds.Digest(id)
-	if _, err := e.creds.Put(id, staleCreds()); err != nil {
-		t.Fatal(err)
-	}
-	ageFile(t, e, id, time.Now().Add(-48*time.Hour))
-	e.svc.cfg.Holders = func(context.Context, []int64) (HolderReport, error) {
-		rep := NewHolderReport()
-		rep.Copies[id] = []HolderCopy{{Host: "h3", Digest: cur.Digest, Installed: time.Now()}}
-		return rep, nil
-	}
-	e.putAgg("shop", 3)
-	if err := e.runEnqueue(); err != nil {
-		t.Fatal(err)
-	}
-	return e, id, raw
-}
-
-func TestALeaderThatMissedARotationTakesTheNewFileBeforeItAnchors(t *testing.T) {
-	e, id, raw := staleLeader(t)
-	var asked []string
-	e.svc.cfg.FetchFrom = func(_ context.Context, host string, tid int64) ([]byte, error) {
-		asked = append(asked, host)
-		return append([]byte(nil), raw...), nil
-	}
-	if err := e.runSubmit(); err != nil {
-		t.Fatal(err)
-	}
-	if len(asked) != 1 || asked[0] != "h3" {
-		t.Fatalf("asked %v, want h3 once", asked)
-	}
-	rows := e.rows()
-	if len(rows) != 1 || rows[0].State != anchor.StateAnchored {
-		t.Fatalf("the record was not anchored with the current credentials: %+v", rows)
-	}
-	for _, r := range e.s3.requests() {
-		if strings.Contains(r.header.Get("Authorization"), "an-old-secret") {
-			t.Fatal("a request was signed with the old secret")
-		}
-	}
-	c, err := e.creds.Get(id, "worm")
-	if err != nil || c["secretAccessKey"].Reveal() != testSecret {
-		t.Fatalf("the file of the leader was not replaced: %v", err)
-	}
-	// the answer is believed for a while: the next pass does not ask again
-	e.putAgg("shop", 5)
-	_ = e.runEnqueue()
-	_ = e.runSubmit()
-	if len(asked) != 1 {
-		t.Fatalf("asked again within the time the answer is believed: %v", asked)
-	}
-}
-
-func TestALeaderThatMissedARotationAndCannotTakeTheNewFileDoesNotAnchor(t *testing.T) {
-	e, id, _ := staleLeader(t)
-	e.svc.cfg.FetchFrom = func(context.Context, string, int64) ([]byte, error) { return nil, errors.New("h3 went away") }
-	if err := e.runSubmit(); err != nil {
-		t.Fatal(err)
-	}
-	if n := len(e.s3.requests()); n != 0 {
-		t.Fatalf("%d requests were made to the store with credentials that a holder has newer", n)
-	}
-	r := e.rows()[0]
-	if r.State == anchor.StateAnchored || r.State == anchor.StateFailed || r.ErrorCode != "credentials_stale" {
-		t.Fatalf("the record: state %s code %q: it must wait for the newer file, not fail", r.State, r.ErrorCode)
-	}
-	_ = id
-}
-
-func TestALeaderWhoseHoldersCannotBeAskedAnchorsWithItsOwnFile(t *testing.T) {
-	e, _, _ := staleLeader(t)
-	e.svc.cfg.Holders = func(context.Context, []int64) (HolderReport, error) {
-		return NewHolderReport(), errors.New("no holder answers")
-	}
-	called := false
-	e.svc.cfg.FetchFrom = func(context.Context, string, int64) ([]byte, error) { called = true; return nil, errors.New("no") }
-	if err := e.runSubmit(); err != nil {
-		t.Fatal(err)
-	}
-	if called {
-		t.Error("a holder was asked for a file although none could be asked about it")
-	}
-	if len(e.s3.requests()) == 0 {
-		t.Fatal("a leader whose holders do not answer (the old leader is down) must go on with the file it has")
-	}
-}
-
-func TestTheCredentialsJobOfALeaderThatMissedARotationTakesTheNewFileAndGivesNothingAway(t *testing.T) {
-	e, id, raw := staleLeader(t)
-	given := 0
-	e.svc.cfg.Distribute = func(context.Context, int64, string, []byte) error { given++; return nil }
-	e.svc.cfg.FetchFrom = func(context.Context, string, int64) ([]byte, error) { return append([]byte(nil), raw...), nil }
-	if err := e.svc.jobCredentials(e.ctx(), e.term); err != nil {
-		t.Fatal(err)
-	}
-	c, err := e.creds.Get(id, "worm")
-	if err != nil || c["secretAccessKey"].Reveal() != testSecret {
-		t.Fatalf("the file of the leader was not replaced: %v", err)
-	}
-	if given != 0 {
-		t.Fatalf("the leader gave away its file %d times although the holder that is current has the same one", given)
-	}
-	// when the newer file cannot be taken, the old one is not given to the holders either, and the alert is critical
-	if _, err := e.creds.Put(id, staleCreds()); err != nil {
-		t.Fatal(err)
-	}
-	ageFile(t, e, id, time.Now().Add(-48*time.Hour))
-	e.svc.cfg.FetchFrom = func(context.Context, string, int64) ([]byte, error) { return nil, errors.New("h3 went away") }
-	e.svc.cfg.Holders = func(context.Context, []int64) (HolderReport, error) {
-		cur := e.mustDigestOf(raw, id)
-		rep := NewHolderReport()
-		rep.Copies[id] = []HolderCopy{{Host: "h3", Digest: cur, Installed: time.Now()}, {Host: "h2", Digest: "x", Installed: time.Now().Add(-72 * time.Hour)}}
-		return rep, nil
-	}
-	if err := e.svc.jobCredentials(e.ctx(), e.term); err != nil {
-		t.Fatal(err)
-	}
-	if given != 0 {
-		t.Fatalf("a leader gave away a file that a holder has newer (%d)", given)
-	}
-	_ = e.runMonitor()
-	if e.alerts.severity(AlertFailed, "target:1|credentials") != "critical" || !strings.Contains(e.alerts.all(), "older credentials file") {
-		t.Fatalf("the alert: %s", e.alerts.all())
-	}
-}
-
-// mustDigestOf is the digest that a file of the given bytes has under this store.
-func (e *env) mustDigestOf(raw []byte, id int64) string {
+// infoOfFile is what a server that holds the file raw says about it.
+func (e *env) infoOfFile(raw []byte, id int64) CopyInfo {
 	e.t.Helper()
 	other, err := NewCredStore(e.t.TempDir(), "")
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	c, err := e.creds.Decode(raw, "worm")
-	if err != nil {
-		e.t.Fatal(err)
-	}
-	if _, err := other.Put(id, c); err != nil {
+	if err := other.Install(id, "worm", append([]byte(nil), raw...)); err != nil {
 		e.t.Fatal(err)
 	}
 	d, err := other.Digest(id)
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	return d.Digest
+	return d
+}
+
+// staleLeader is a leader whose file is the old credentials of generation 2, while holder h3 has the current ones of generation 5.
+func staleLeader(t *testing.T) (e *env, id int64, current []byte) {
+	t.Helper()
+	e = newEnv(t)
+	tg := e.addWorm("vault")
+	id = tg.ID
+	valid, err := e.creds.Get(id, "worm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err = e.creds.Encode(valid, 5, newStamp(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur := e.infoOfFile(current, id)
+	if _, err := e.creds.write(id, staleCreds(), 2, newStamp(t)); err != nil {
+		t.Fatal(err)
+	}
+	e.svc.cfg.Holders = func(context.Context, []int64) (HolderReport, error) {
+		rep := NewHolderReport()
+		rep.Copies[id] = []HolderCopy{{Host: "h3", Generation: cur.Generation, Digest: cur.Digest}}
+		return rep, nil
+	}
+	e.putAgg("shop", 3)
+	if err := e.runEnqueue(); err != nil {
+		t.Fatal(err)
+	}
+	return e, id, current
 }
 
 // ---- P7F-02: a file that was given and could not be written is not "every holder has none" ----
@@ -475,7 +108,7 @@ func TestAFetchedFileThatCannotBeWrittenIsNotEveryHolderHavingNone(t *testing.T)
 	}
 	_ = e.runMonitor()
 	all := e.alerts.all()
-	if strings.Contains(all, "no other holder could give it") || !strings.Contains(all, "could not be written here") || e.alerts.severity(AlertFailed, "target:1|credentials") != "critical" {
+	if strings.Contains(all, "no other holder could give it") || !strings.Contains(all, "could not be stored here") || e.alerts.severity(AlertFailed, "target:1|credentials") != "critical" {
 		t.Fatalf("the alert: %s", all)
 	}
 	// and the records wait, they do not fail for good
@@ -495,8 +128,8 @@ func TestAFetchedFileThatCannotBeWrittenIsNotEveryHolderHavingNone(t *testing.T)
 	}
 	// a file that does not open here is still final: only the operator can help
 	e.svc.cfg.Fetch = func(context.Context, int64) ([]byte, error) { return []byte("not a credentials file"), nil }
-	if got := e.svc.fetchMissing(e.ctx(), trow); got != fetchNone {
-		t.Fatalf("a file that does not decode: %v, want none", got)
+	if got := e.svc.fetchMissing(e.ctx(), trow); got != fetchUnopenable {
+		t.Fatalf("a file that does not decode: %v, want unopenable (final, with its own text)", got)
 	}
 }
 
@@ -537,6 +170,38 @@ func TestAnErrorOfALaterTermIsNotHiddenByAnEarlierOne(t *testing.T) {
 	e.svc.setFatal(3, errors.New("second"))
 	if err := e.svc.takeFatal(3); err != first {
 		t.Fatalf("%v", err)
+	}
+}
+
+// The wire form of the list answer: what a holder sends is what the leader reads (generation and digest), and the answer of a server that sends
+// no copies is read as a list of files without a digest.
+func TestTheListAnswerSurvivesTheWire(t *testing.T) {
+	e := newEnv(t)
+	tg := e.addWorm("vault")
+	out, err := (&Agent{Creds: e.creds}).Handle(e.ctx(), CallCredentialsList, []byte("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back ListResponse
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatal(err)
+	}
+	d, _ := e.creds.Digest(tg.ID)
+	if len(back.Copies) != 1 || back.Copies[0] != d || d.Generation != 1 {
+		t.Fatalf("%s -> %+v", b, back)
+	}
+	var old ListResponse
+	if err := json.Unmarshal([]byte(`{"ids":[1,2]}`), &old); err != nil || len(old.IDs) != 2 || len(old.Copies) != 0 {
+		t.Fatalf("%+v %v", old, err)
+	}
+	rep := NewHolderReport()
+	rep.Add("h9", old, []int64{1, 2})
+	if len(rep.Copies) != 0 || len(rep.Lacking) != 0 {
+		t.Fatalf("a server that sends no copies has the files and says nothing of them: %+v", rep)
 	}
 }
 
@@ -624,38 +289,11 @@ func TestTheHoldersAreAskedBeforeATargetIsBuiltOnlyOnceInTheGateTime(t *testing.
 	if calls != 3 {
 		t.Fatalf("%d questions in a new term, want 3", calls)
 	}
-}
-
-// The wire form of the list answer: what a holder sends is what the leader reads, with the time to the nanosecond, and the answer of a server
-// that sends no copies is read as a list of files without a digest.
-func TestTheListAnswerSurvivesTheWire(t *testing.T) {
-	e := newEnv(t)
-	tg := e.addWorm("vault")
-	at := time.Date(2026, 11, 20, 8, 30, 15, 123456789, time.UTC)
-	ageFile(t, e, tg.ID, at)
-	out, err := (&Agent{Creds: e.creds}).Handle(e.ctx(), CallCredentialsList, []byte("{}"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, err := json.Marshal(out)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var back ListResponse
-	if err := json.Unmarshal(b, &back); err != nil {
-		t.Fatal(err)
-	}
-	d, _ := e.creds.Digest(tg.ID)
-	if len(back.Copies) != 1 || back.Copies[0].Digest != d.Digest || !back.Copies[0].Installed.Equal(at.Truncate(time.Nanosecond)) && back.Copies[0].Installed.Sub(at).Abs() > time.Second {
-		t.Fatalf("%s -> %+v", b, back)
-	}
-	var old ListResponse
-	if err := json.Unmarshal([]byte(`{"ids":[1,2]}`), &old); err != nil || len(old.IDs) != 2 || len(old.Copies) != 0 {
-		t.Fatalf("%+v %v", old, err)
-	}
-	rep := NewHolderReport()
-	rep.Add("h9", old, []int64{1, 2})
-	if len(rep.Copies) != 0 || len(rep.Lacking) != 0 {
-		t.Fatalf("a server that sends no copies has the files and says nothing of them: %+v", rep)
+	// and the entry of the term that is over is dropped (P7G-06)
+	e.svc.mu.Lock()
+	n := len(e.svc.credGate)
+	e.svc.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("%d entries of the gate are kept, want the one of the term that runs", n)
 	}
 }

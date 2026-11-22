@@ -19,18 +19,21 @@ import (
 // gives the holders the files they lack or hold in an older version and takes away those of targets that are gone, and it keeps what it could not
 // do as a problem that the monitor raises as an alert (ledgerAnchorFailed, subject "target:<id>|credentials") until it is done.
 //
-// A holder is current when the digest of what it holds equals the digest of the leader's file (P7F-01). When the digests differ the file that was
-// written last is the right one: the holders say when their file was written, a holder whose file is newer than the leader's gives it to the
-// leader (a server that became the leader after a rotation it missed), and the leader gives its own to the holders whose file is older or
-// whose age is not known. A leader never gives away a file that a reachable holder has newer, and never anchors with one (the gate in
-// workTarget).
+// Which copy is the newer one is decided by the rotation generation, a counter that is inside the file (P7G-02): every change of the credentials
+// writes a file with a generation one above the highest that the leader and the holders it could ask hold. A holder is current when its generation
+// and the digest of its file equal the leader's. A holder with a higher generation gives its file to the leader (a server that became the leader
+// after a rotation it missed); a holder with a lower one is given the leader's file. Two files of the same generation that differ (two rotations
+// at once) are given to nobody: both stay, and the alert asks the operator to enter the credentials again, which makes a generation above both.
+// No time decides anything: not the time of the file system, which a restore from a backup resets, and not a time that a holder reports. A server
+// also refuses to write a file of a lower generation over a higher one (CredStore.Install), whoever sends it. A leader never anchors with a file
+// that a reachable holder has newer (the gate in workTarget).
 
 // HolderCopy is what a holder says about the file it has for a target.
 type HolderCopy struct {
-	Host   string
-	Digest string
-	// Installed is when the holder wrote the file; zero when it did not say.
-	Installed time.Time
+	Host string
+	// Generation is the rotation counter of the file; Digest the keyed digest of its content (empty when the file has no stamp).
+	Generation uint64
+	Digest     string
 }
 
 // HolderReport is what the other holders say about their credentials files.
@@ -73,25 +76,47 @@ func (s *Service) credProblemList() map[int64]CredProblem {
 	return out
 }
 
-// judgeCopies compares the copy of this server with those of the holders. newer is the holder whose copy differs and was written after this
-// server's (the newest such); stale lists the holders whose copy differs and is not newer (older, or of an age that is not known on one side:
-// the leader's copy is taken for the right one then).
-func judgeCopies(own CopyInfo, others []HolderCopy) (newer *HolderCopy, stale []string) {
+// judgeCopies compares the copy of this server with those of the holders. newer is the holder with the highest generation above this server's
+// (the first of them by name when two share it); stale lists the holders with a lower generation; conflict lists the holders with the same
+// generation and another digest. A holder with the same generation and the same digest is current, and so is one of generation 0 when either
+// side has no stamp (files of earlier versions cannot be told apart).
+func judgeCopies(own CopyInfo, others []HolderCopy) (newer *HolderCopy, stale, conflict []string) {
 	for i := range others {
 		o := others[i]
-		if o.Digest == "" || o.Digest == own.Digest {
-			continue
-		}
-		if !o.Installed.IsZero() && !own.Installed.IsZero() && o.Installed.After(own.Installed) {
-			if newer == nil || o.Installed.After(newer.Installed) {
+		switch {
+		case o.Generation > own.Generation:
+			if newer == nil || o.Generation > newer.Generation || o.Generation == newer.Generation && o.Host < newer.Host {
 				newer = &o
 			}
-			continue
+		case o.Generation < own.Generation:
+			stale = append(stale, o.Host)
+		case sameDigest(o.Digest, own.Digest) || o.Digest == "" || own.Digest == "":
+		default:
+			conflict = append(conflict, o.Host)
 		}
-		stale = append(stale, o.Host)
 	}
 	sort.Strings(stale)
-	return newer, stale
+	sort.Strings(conflict)
+	return newer, stale, conflict
+}
+
+// generationFloor is the highest generation that a holder reports for a target: a leader that rotates credentials writes a generation above it.
+// Holders that cannot be asked are not in it (a holder that has a higher one refuses the file, which is an alert).
+func (s *Service) generationFloor(ctx context.Context, id int64) uint64 {
+	if s.cfg.Holders == nil {
+		return 0
+	}
+	rep, err := s.cfg.Holders(ctx, []int64{id})
+	if err != nil {
+		return 0
+	}
+	var floor uint64
+	for _, c := range rep.Copies[id] {
+		if c.Generation > floor {
+			floor = c.Generation
+		}
+	}
+	return floor
 }
 
 // fetchOutcome is the result of fetchMissing.
@@ -104,8 +129,12 @@ const (
 	fetchNone
 	// fetchUnreached: the holders could not all be asked, the file may exist (P7R-08).
 	fetchUnreached
-	// fetchNotInstalled: a holder gave a file and this server could not write it (P7F-02): a matter of this server, a retry later may work.
+	// fetchNotInstalled: a holder gave a file and this server could not store it (P7F-02, P7G-04: the disk, or the passphrase file that could
+	// not be read): a matter of this server, a retry later may work.
 	fetchNotInstalled
+	// fetchUnopenable: a holder gave a file that this server cannot open (it is sealed under another passphrase, or it is not a credentials
+	// file): the operator must help.
+	fetchUnopenable
 )
 
 // fetchMissing makes the credentials file of a target exist on this server: it asks the other holders for it. It reports whether the file is
@@ -128,47 +157,102 @@ func (s *Service) fetchMissing(ctx context.Context, t TargetRow) fetchOutcome {
 	defer clear(data)
 	if err := s.cfg.Creds.Install(t.ID, t.Kind, data); err != nil {
 		s.log.Warn("the credentials file that another holder gave could not be installed", "target", t.ID, "error", errText(err))
-		// a file that this server cannot open is the same as no file (the passphrase differs: only the operator can help); a disk that could not
-		// be written is not, and the holders still have the file
+		// a disk that could not be written or a passphrase file that could not be read is a matter of this server and the holders still have
+		// the file; a file that does not open here is not
 		if errors.Is(err, ErrInstallWrite) {
 			return fetchNotInstalled
 		}
-		return fetchNone
+		return fetchUnopenable
 	}
 	s.log.Info("the credentials file of an anchor target was fetched from another holder", "target", t.ID)
 	return fetchOK
 }
 
-// takeNewer replaces the file of this server by the newer copy of a holder (P7F-01).
+// takeKind says why a newer file could not be taken.
+type takeKind int
+
+const (
+	// takeFetch: the holder did not give the file.
+	takeFetch takeKind = iota
+	// takeLocal: this server could not store it (disk, passphrase file).
+	takeLocal
+	// takeUnopenable: the file does not open here: only the operator can help.
+	takeUnopenable
+	// takeOlder: the file the holder gave is older than the one here, or another of the same generation, whatever the holder said.
+	takeOlder
+)
+
+type takeError struct {
+	kind  takeKind
+	cause error
+}
+
+func (e takeError) Error() string { return e.cause.Error() }
+
+// takeNewer replaces the file of this server by the newer copy of a holder (P7F-01). The holder's file must be newer in fact: Install refuses a
+// file of a lower generation, so a holder that said it has a newer file and gives an older one is refused (P7G-02).
 func (s *Service) takeNewer(ctx context.Context, t TargetRow, from HolderCopy) error {
 	if s.cfg.FetchFrom == nil {
-		return errors.New("this server cannot ask a holder for its file")
+		return takeError{takeFetch, errors.New("this server cannot ask a holder for its file")}
 	}
 	data, err := s.cfg.FetchFrom(ctx, from.Host, t.ID)
 	if err != nil {
-		return fmt.Errorf("the file could not be fetched from %s: %s", from.Host, errText(err))
+		return takeError{takeFetch, fmt.Errorf("the file could not be fetched from %s: %s", from.Host, errText(err))}
 	}
 	defer clear(data)
 	if err := s.cfg.Creds.Install(t.ID, t.Kind, data); err != nil {
-		return fmt.Errorf("the file of %s could not be installed here: %s", from.Host, errText(err))
+		switch {
+		case errors.Is(err, ErrOlderGeneration):
+			return takeError{takeOlder, fmt.Errorf("the holder %s said it has generation %d and gave a file that is older than the one of this server or another of the same generation", from.Host, from.Generation)}
+		case errors.Is(err, ErrInstallWrite):
+			return takeError{takeLocal, fmt.Errorf("the file of %s could not be stored here: %s", from.Host, errText(err))}
+		}
+		return takeError{takeUnopenable, fmt.Errorf("the file of %s cannot be opened with the passphrase file of this server: %s", from.Host, errText(err))}
 	}
-	s.log.Warn("this server held an older credentials file than a holder; it was replaced by the newer one", "target", t.ID, "holder", from.Host)
+	s.log.Warn("this server held an older credentials file than a holder; it was replaced by the newer one", "target", t.ID, "holder", from.Host, "generation", from.Generation)
 	return nil
 }
 
 // CredGateTTL is how long a check that this server holds the current credentials of a target is believed (P7F-01).
 const CredGateTTL = 30 * time.Second
 
+// CredStaleLimit is how long a newer file that cannot be taken is waited for: after it the records of the target fail for good, with an alert, and
+// an operator uses Retry (P7G-04). A file that does not open here does not wait at all.
+const CredStaleLimit = 30 * time.Minute
+
 type credGateKey struct {
 	id   int64
 	term scheduler.Term
 }
 
+// staleFailure notes that the newer file of a target could not be taken and says whether the waiting is over. final is true for a file that
+// cannot be opened here and for a failure that lasted CredStaleLimit.
+func (s *Service) staleFailure(id int64, kind takeKind) (final bool) {
+	if kind == takeUnopenable {
+		return true
+	}
+	now := s.now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	since, ok := s.credStaleSince[id]
+	if !ok {
+		s.credStaleSince[id] = now
+		return false
+	}
+	return now.Sub(since) >= CredStaleLimit
+}
+
+func (s *Service) staleCleared(id int64) {
+	s.mu.Lock()
+	delete(s.credStaleSince, id)
+	s.mu.Unlock()
+}
+
 // ensureCurrent is the gate before a target is built: a server that became the leader holds the file it was given, which may be one
-// that a rotation it missed made stale. It asks the holders and, when one has a file that was written after this server's and differs, takes
-// that file before anything is anchored with the old one. An error means the newer file is known to exist and could not be taken: the
-// caller must not anchor. Holders that cannot be asked are no evidence either way (right after a failover the old leader is down), so
-// they do not stop anything. The answer is kept for CredGateTTL.
+// that a rotation it missed made stale. It asks the holders and, when one has a file of a higher generation, takes that file before anything is
+// anchored with the old one. An error means the newer file is known to exist and could not be taken: the caller must not anchor. Holders that
+// cannot be asked are no evidence either way (right after a failover the old leader is down), so they do not stop anything. The answer is kept
+// for CredGateTTL.
 func (s *Service) ensureCurrent(ctx context.Context, term scheduler.Term, t TargetRow) error {
 	if s.cfg.Holders == nil || !t.CredentialsSet {
 		return nil
@@ -187,20 +271,29 @@ func (s *Service) ensureCurrent(ctx context.Context, term scheduler.Term, t Targ
 	}
 	rep, herr := s.cfg.Holders(ctx, []int64{t.ID})
 	if herr == nil {
-		if newer, _ := judgeCopies(own, rep.Copies[t.ID]); newer != nil {
+		if newer, _, _ := judgeCopies(own, rep.Copies[t.ID]); newer != nil {
 			if err := s.takeNewer(ctx, t, *newer); err != nil {
-				return credsStaleError{cause: err}
+				var te takeError
+				errors.As(err, &te)
+				return credsStaleError{cause: err, final: s.staleFailure(t.ID, te.kind)}
 			}
+			s.staleCleared(t.ID)
 		}
 	}
 	s.mu.Lock()
+	// the entries of other terms are of no use any more
+	for k := range s.credGate {
+		if k.term != term {
+			delete(s.credGate, k)
+		}
+	}
 	s.credGate[key] = now
 	s.mu.Unlock()
 	return nil
 }
 
 // jobCredentials is one pass of ledger.anchor.credentials.
-func (s *Service) jobCredentials(ctx context.Context, _ scheduler.Term) error {
+func (s *Service) jobCredentials(ctx context.Context, term scheduler.Term) error {
 	targets, err := s.cfg.Store.Targets(ctx)
 	if err != nil {
 		return err
@@ -220,7 +313,9 @@ func (s *Service) jobCredentials(ctx context.Context, _ scheduler.Term) error {
 			case fetchUnreached:
 				text = fmt.Sprintf("This server has no credentials file for target %s, and not every other holder could be asked for it (a holder did not answer): it cannot anchor at this target until one gives it. It is asked again every minute.", t.Name)
 			case fetchNotInstalled:
-				text = fmt.Sprintf("This server has no credentials file for target %s: a holder gave it and it could not be written here (check the disk and the permissions of the key directory). It is asked again every minute.", t.Name)
+				text = fmt.Sprintf("This server has no credentials file for target %s: a holder gave it and it could not be stored here (check the disk, the permissions of the key directory and the passphrase file). It is asked again every minute.", t.Name)
+			case fetchUnopenable:
+				text = fmt.Sprintf("This server has no credentials file for target %s: a holder gave one that cannot be opened with the passphrase file of this server (another passphrase, or a plain server and a sealed file). Give the servers the same passphrase file or enter the credentials of the target again.", t.Name)
 			default:
 				text = fmt.Sprintf("This server has no credentials file for target %s and no other holder could give it: it cannot anchor at this target. Enter the credentials of the target again.", t.Name)
 			}
@@ -251,23 +346,35 @@ func (s *Service) jobCredentials(ctx context.Context, _ scheduler.Term) error {
 			if derr != nil {
 				continue
 			}
-			newer, stale := judgeCopies(own, rep.Copies[id])
+			newer, stale, conflict := judgeCopies(own, rep.Copies[id])
 			if newer != nil {
 				// this server holds the older file (it became the leader after a rotation it missed): it takes the newer one and gives
 				// nothing away before that
 				if terr := s.takeNewer(ctx, t, *newer); terr != nil {
-					problems[id] = CredProblem{Critical: t.Enabled, Text: fmt.Sprintf("This server holds an older credentials file for target %s than the holder %s and could not take the newer one (%s): it does not anchor at this target until it has. It is asked again every minute.", t.Name, newer.Host, errText(terr))}
+					var te takeError
+					errors.As(terr, &te)
+					final := s.staleFailure(id, te.kind)
+					text := fmt.Sprintf("This server holds an older credentials file for target %s than the holder %s (generation %d against %d) and could not take the newer one (%s): it does not anchor at this target until it has. It is asked again every minute.", t.Name, newer.Host, newer.Generation, own.Generation, errText(terr))
+					if final {
+						text = fmt.Sprintf("This server holds an older credentials file for target %s than the holder %s (generation %d against %d) and could not take the newer one (%s): the records of the target failed and are not tried again until Retry. Fix the cause or enter the credentials of the target again.", t.Name, newer.Host, newer.Generation, own.Generation, errText(terr))
+					}
+					problems[id] = CredProblem{Critical: t.Enabled, Text: text}
 					delete(behind, id)
 					continue
 				}
+				s.staleCleared(id)
 				own, derr = s.cfg.Creds.Digest(id)
 				if derr != nil {
 					continue
 				}
-				_, stale = judgeCopies(own, rep.Copies[id])
+				_, stale, conflict = judgeCopies(own, rep.Copies[id])
 			}
 			if len(stale) > 0 {
 				behind[id] = append(behind[id], stale...)
+			}
+			if len(conflict) > 0 {
+				// two rotations of one generation: neither is given over the other
+				problems[id] = CredProblem{Text: fmt.Sprintf("The holders %s hold another credentials file for target %s than this server, of the same generation %d (two changes of the credentials were made at once): neither is given to the other. Enter the credentials of the target again: that makes a newer generation that every holder takes.", strings.Join(conflict, ", "), t.Name, own.Generation)}
 			}
 		}
 		for _, id := range sortedIDs(behind) {
@@ -286,7 +393,7 @@ func (s *Service) jobCredentials(ctx context.Context, _ scheduler.Term) error {
 			if derr != nil {
 				problems[id] = CredProblem{Text: fmt.Sprintf("The credentials file of target %s could not be given to the holders %s (they have none or an older one): after a change of the leader one of them cannot anchor at this target correctly. It is given again every minute.",
 					t.Name, strings.Join(hosts, ", "))}
-			} else {
+			} else if _, bad := problems[id]; !bad {
 				delivered[id] = true
 			}
 		}
@@ -333,6 +440,17 @@ func (s *Service) jobCredentials(ctx context.Context, _ scheduler.Term) error {
 		}
 	}
 	s.credProblems = problems
+	// what is kept for a target that is gone, or for a term that is over, is dropped
+	for k := range s.credGate {
+		if !known[k.id] || k.term != term {
+			delete(s.credGate, k)
+		}
+	}
+	for id := range s.credStaleSince {
+		if !known[id] {
+			delete(s.credStaleSince, id)
+		}
+	}
 	s.mu.Unlock()
 	return nil
 }
@@ -377,7 +495,7 @@ func (r *HolderReport) Add(host string, out ListResponse, ids []int64) {
 		if !have[id] {
 			r.Lacking[id] = append(r.Lacking[id], host)
 		} else if c, ok := info[id]; ok {
-			r.Copies[id] = append(r.Copies[id], HolderCopy{Host: host, Digest: c.Digest, Installed: c.Installed})
+			r.Copies[id] = append(r.Copies[id], HolderCopy{Host: host, Generation: c.Generation, Digest: c.Digest})
 		}
 	}
 	for id := range have {

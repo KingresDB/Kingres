@@ -256,7 +256,7 @@ func joinKinds() string {
 
 // putCreds writes the file of a target on this server and hands it to the other holders (best effort).
 func (s *Service) putCreds(ctx context.Context, id int64, kind string, c Creds) error {
-	data, err := s.cfg.Creds.Put(id, c)
+	data, err := s.cfg.Creds.Rotate(id, c, s.generationFloor(ctx, id))
 	if err != nil {
 		return err
 	}

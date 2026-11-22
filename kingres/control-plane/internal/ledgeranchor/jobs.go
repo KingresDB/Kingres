@@ -282,6 +282,11 @@ func (s *Service) work(ctx context.Context, term scheduler.Term, trow TargetRow,
 	}
 	if berr != nil {
 		if isCredsStale(berr) {
+			var se credsStaleError
+			if errors.As(berr, &se) && se.final {
+				// the newer file cannot be taken and will not be: the records fail, an operator uses Retry after the fix (P7G-04)
+				return s.fail(ctx, term, row, anchor.Errorf(anchor.ClassPermanent, row.Kind, "target", "credentials_stale", "%s", errText(berr)), nil, trow.Revision)
+			}
 			return s.fail(ctx, term, row, anchor.Errorf(anchor.ClassRetryable, row.Kind, "target", "credentials_stale", "%s", errText(berr)), nil, trow.Revision)
 		}
 		if isCredsUnreached(berr) {

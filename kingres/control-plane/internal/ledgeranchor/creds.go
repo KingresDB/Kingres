@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -21,7 +22,6 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
-	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/anchor"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgerkeys"
@@ -93,6 +93,9 @@ func FetchFirst(ctx context.Context, hosts []string, ask func(ctx context.Contex
 	}
 	return nil, ErrNoCredentials
 }
+
+// ErrPassphraseFile is the error of a passphrase file that cannot be read: a matter of this server (P7G-04). It is an ErrCredentials.
+var ErrPassphraseFile = fmt.Errorf("%w (the passphrase file cannot be read)", ErrCredentials)
 
 // ErrInstallWrite is part of the error of Install when the file was good and writing it failed (P7F-02).
 var ErrInstallWrite = errors.New("ledgeranchor: the credentials file could not be written on this server")
@@ -302,7 +305,7 @@ func (s *CredStore) passphrase() (ledgerkeys.Passphrase, error) {
 	}
 	p, err := ledgerkeys.ReadPassphraseFile(s.passFile)
 	if err != nil {
-		return ledgerkeys.Passphrase{}, ErrCredentials
+		return ledgerkeys.Passphrase{}, ErrPassphraseFile
 	}
 	return p, nil
 }
@@ -314,12 +317,60 @@ func credHeader(iterations uint32, salt []byte) []byte {
 	return append(h, salt...)
 }
 
-// Encode returns the file for the credentials.
-func (s *CredStore) Encode(c Creds) ([]byte, error) {
-	plain, err := c.plain()
+// A credentials file holds, besides the credentials, the rotation generation and the stamp of the rotation (P7G-02): the generation is a counter
+// that every change of the credentials raises, the stamp is 16 random bytes that a rotation makes once and every copy keeps. Both are inside
+// the file body (inside the sealed text for a sealed file, so they are authenticated), never in the time of the file system: a file restored
+// from a backup, or a server whose clock is ahead, does not look newer. A file that an earlier version wrote has neither: it is generation 0
+// without a stamp.
+//
+//	{"credentials":{...},"generation":3,"stamp":"<32 hex>"}
+const (
+	// MaxCredGeneration bounds the counter that a file may carry.
+	MaxCredGeneration = 1 << 40
+	credStampLen      = 16
+)
+
+// credBody is the JSON object of the body of a file (the plain line, or the text that is sealed).
+type credBody struct {
+	Credentials json.RawMessage `json:"credentials"`
+	Generation  uint64          `json:"generation"`
+	Stamp       string          `json:"stamp"`
+}
+
+func validStamp(s string) bool {
+	if len(s) != 2*credStampLen {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if !(s[i] >= '0' && s[i] <= '9' || s[i] >= 'a' && s[i] <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// NewStamp makes the stamp of a rotation.
+func NewStamp() (string, error) {
+	b := make([]byte, credStampLen)
+	if _, err := io.ReadFull(rand.Reader, b); err != nil {
+		return "", ErrCredentials
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// Encode returns the file for the credentials of the generation gen with the stamp of its rotation.
+func (s *CredStore) Encode(c Creds, gen uint64, stamp string) ([]byte, error) {
+	if gen > MaxCredGeneration || (gen == 0) != (stamp == "") || stamp != "" && !validStamp(stamp) {
+		return nil, ErrCredentials
+	}
+	members, err := c.plain()
 	if err != nil {
 		return nil, ErrCredentials
 	}
+	defer clear(members)
+	plain := []byte(`{"credentials":`)
+	plain = append(plain, members...)
+	plain = append(plain, `,"generation":`+strconv.FormatUint(gen, 10)+`,"stamp":"`+stamp+`"}`...)
 	defer clear(plain)
 	pass, err := s.passphrase()
 	if err != nil {
@@ -327,9 +378,9 @@ func (s *CredStore) Encode(c Creds) ([]byte, error) {
 	}
 	defer pass.Destroy()
 	if !pass.IsSet() {
-		out := []byte(CredMagic + "\n" + `{"credentials":`)
+		out := []byte(CredMagic + "\n")
 		out = append(out, plain...)
-		return append(out, '}', '\n'), nil
+		return append(out, '\n'), nil
 	}
 	rd := s.Rand
 	if rd == nil {
@@ -369,33 +420,78 @@ func credAEAD(p ledgerkeys.Passphrase, iterations uint32, salt []byte) (cipher.A
 	return cipher.NewGCM(blk)
 }
 
+// Stored is what a credentials file holds.
+type Stored struct {
+	Creds      Creds
+	Generation uint64
+	// Stamp is the stamp of the rotation, empty for a file of an earlier version (generation 0).
+	Stamp string
+}
+
 // Decode reads a file made by Encode (a sealed one needs the passphrase file of this server; a plain one is
 // accepted whether or not this server seals).
 func (s *CredStore) Decode(data []byte, kind string) (Creds, error) {
-	body, err := s.openBody(data)
+	st, err := s.DecodeFile(data, kind)
 	if err != nil {
 		return nil, err
 	}
-	defer clear(body)
-	c, err := ParseCreds(kind, body)
-	if err != nil || c == nil {
-		return nil, ErrCredentials
-	}
-	return c, nil
+	return st.Creds, nil
 }
 
-// openBody returns the JSON object of the credentials that a file holds, opened when it is sealed. The caller clears it.
-func (s *CredStore) openBody(data []byte) ([]byte, error) {
+// DecodeFile reads the credentials, the generation and the stamp of a file. A file that an earlier version wrote is generation 0 without a stamp.
+func (s *CredStore) DecodeFile(data []byte, kind string) (Stored, error) {
+	b, err := s.openBody(data)
+	if err != nil {
+		return Stored{}, err
+	}
+	defer clear(b.Members)
+	c, err := ParseCreds(kind, b.Members)
+	if err != nil || c == nil {
+		return Stored{}, ErrCredentials
+	}
+	return Stored{Creds: c, Generation: b.Generation, Stamp: b.Stamp}, nil
+}
+
+// openedBody is the members of a file as JSON, with the generation and the stamp.
+type openedBody struct {
+	Members    []byte
+	Generation uint64
+	Stamp      string
+}
+
+// parseBody splits the text of a file body: the new form is an object with the members of credentials, a generation and a stamp, the old form
+// is the object of the members.
+func parseBody(text []byte, line bool) (openedBody, error) {
+	if line {
+		var ok bool
+		if text, ok = bytes.CutSuffix(text, []byte("\n")); !ok {
+			return openedBody{}, ErrCredentials
+		}
+	}
+	if !bytes.HasPrefix(text, []byte(`{"credentials":`)) {
+		return openedBody{Members: bytes.Clone(text)}, nil // an earlier version: the members only
+	}
+	var cb credBody
+	dec := json.NewDecoder(bytes.NewReader(text))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&cb); err != nil || dec.More() || len(cb.Credentials) == 0 || cb.Generation > MaxCredGeneration || cb.Generation == 0 && cb.Stamp != "" ||
+		cb.Generation > 0 && !validStamp(cb.Stamp) {
+		return openedBody{}, ErrCredentials
+	}
+	return openedBody{Members: bytes.Clone(cb.Credentials), Generation: cb.Generation, Stamp: cb.Stamp}, nil
+}
+
+// openBody returns the body of a file, opened when it is sealed. The caller clears Members.
+func (s *CredStore) openBody(data []byte) (openedBody, error) {
 	rest, ok := bytes.CutPrefix(data, []byte(CredMagic+"\n"))
 	if !ok || len(data) > MaxCredFile {
-		return nil, ErrCredentials
+		return openedBody{}, ErrCredentials
 	}
-	if plain, ok := bytes.CutPrefix(rest, []byte(`{"credentials":`)); ok {
-		body, ok := bytes.CutSuffix(plain, []byte("}\n"))
-		if !ok {
-			return nil, ErrCredentials
+	if bytes.HasPrefix(rest, []byte(`{"credentials":`)) {
+		if !bytes.HasSuffix(rest, []byte("}\n")) {
+			return openedBody{}, ErrCredentials
 		}
-		return bytes.Clone(body), nil
+		return parseBody(rest, true)
 	}
 	var env struct {
 		KDF        string `json:"kdf"`
@@ -407,41 +503,72 @@ func (s *CredStore) openBody(data []byte) ([]byte, error) {
 	dec := json.NewDecoder(bytes.NewReader(rest))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&env); err != nil || env.KDF != credKDF || env.Iterations < s.MinIterations || env.Iterations > ledgerkeys.MaxIterations {
-		return nil, ErrCredentials
+		return openedBody{}, ErrCredentials
 	}
 	salt, err1 := base64.StdEncoding.Strict().DecodeString(env.Salt)
 	nonce, err2 := base64.StdEncoding.Strict().DecodeString(env.Nonce)
 	ct, err3 := base64.StdEncoding.Strict().DecodeString(env.Ciphertext)
 	if err1 != nil || err2 != nil || err3 != nil || len(salt) != credSalt || len(nonce) != credNonce || len(ct) > MaxCredFile {
-		return nil, ErrCredentials
+		return openedBody{}, ErrCredentials
 	}
 	pass, err := s.passphrase()
 	if err != nil {
-		return nil, err
+		return openedBody{}, err
 	}
 	defer pass.Destroy()
 	if !pass.IsSet() {
-		return nil, ErrCredentials
+		return openedBody{}, ErrCredentials
 	}
 	aead, err := credAEAD(pass, uint32(env.Iterations), salt) //nolint:gosec // bounded above
 	if err != nil {
-		return nil, err
+		return openedBody{}, err
 	}
 	plain, err := aead.Open(nil, nonce, ct, credHeader(uint32(env.Iterations), salt)) //nolint:gosec // as above
 	if err != nil {
-		return nil, ErrCredentials
+		return openedBody{}, ErrCredentials
 	}
-	return plain, nil
+	defer clear(plain)
+	return parseBody(plain, false)
 }
 
-// CopyInfo says which credentials a server holds for a target without saying what they are: Digest is a SHA-256 over the id and the
-// members with their values in a fixed order (the same for a plain and a sealed file, and whatever the salt of the sealing), Installed is
-// when the file was last written on that server. Two servers that hold the same credentials give the same digest (P7F-01). The call that
-// carries it is LeaderOnly and goes between servers that hold the secrets themselves.
+// CopyInfo says which credentials a server holds for a target without saying what they are. Generation is the rotation counter of the file
+// (0 for a file of an earlier version). Digest is an HMAC-SHA256, keyed with the stamp of the rotation (which is in the file and is never sent
+// by this call), over a fixed label, the id, the generation and the members with their values in a fixed order: two copies of one rotation
+// give the same digest, and nobody who sees a digest and not the file can test guesses of a secret against it (P7G-05). It is empty for a file
+// without a stamp.
 type CopyInfo struct {
-	ID        int64     `json:"id"`
-	Digest    string    `json:"digest"`
-	Installed time.Time `json:"installed"`
+	ID         int64  `json:"id"`
+	Generation uint64 `json:"generation"`
+	Digest     string `json:"digest,omitempty"`
+}
+
+// digestOf computes the digest of a file's content.
+func digestOf(id int64, st Stored) (string, error) {
+	if st.Stamp == "" {
+		return "", nil
+	}
+	key, err := hex.DecodeString(st.Stamp)
+	if err != nil {
+		return "", ErrCredentials
+	}
+	m := map[string]string{}
+	for k, v := range st.Creds {
+		m[k] = v.Reveal()
+	}
+	canon, err := json.Marshal(m)
+	if err != nil {
+		return "", ErrCredentials
+	}
+	defer clear(canon)
+	h := hmac.New(sha256.New, key)
+	h.Write([]byte("kingres-anchor-credentials-digest\x00" + strconv.FormatInt(id, 10) + "\x00" + strconv.FormatUint(st.Generation, 10) + "\x00"))
+	h.Write(canon)
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// sameDigest compares two digests in constant time; an empty digest equals nothing.
+func sameDigest(a, b string) bool {
+	return a != "" && b != "" && hmac.Equal([]byte(a), []byte(b))
 }
 
 // Digest describes the file of a target on this server.
@@ -454,34 +581,48 @@ func (s *CredStore) Digest(id int64) (CopyInfo, error) {
 		return CopyInfo{}, err
 	}
 	defer clear(data)
-	body, err := s.openBody(data)
+	b, err := s.openBody(data)
 	if err != nil {
 		return CopyInfo{}, err
 	}
-	defer clear(body)
+	defer clear(b.Members)
 	var m map[string]string
-	if err := json.Unmarshal(body, &m); err != nil || len(m) == 0 {
+	if err := json.Unmarshal(b.Members, &m); err != nil || len(m) == 0 {
 		return CopyInfo{}, ErrCredentials
 	}
-	canon, err := json.Marshal(m)
+	cr := Creds{}
+	for k, v := range m {
+		cr[k] = anchor.Secret(v)
+	}
+	d, err := digestOf(id, Stored{Creds: cr, Generation: b.Generation, Stamp: b.Stamp})
 	if err != nil {
-		return CopyInfo{}, ErrCredentials
+		return CopyInfo{}, err
 	}
-	defer clear(canon)
-	h := sha256.New()
-	h.Write([]byte("kingres-anchor-credentials-digest\x00" + strconv.FormatInt(id, 10) + "\x00"))
-	h.Write(canon)
-	info := CopyInfo{ID: id, Digest: hex.EncodeToString(h.Sum(nil))}
-	if st, err := os.Lstat(s.path(id)); err == nil {
-		info.Installed = st.ModTime().UTC()
-	}
-	return info, nil
+	return CopyInfo{ID: id, Generation: b.Generation, Digest: d}, nil
 }
 
-// Put writes the file of a target atomically, mode 0600, replacing one that exists. It returns the bytes written so
-// that the leader can hand them to the other holders (never a passphrase; the callee seals them again).
-func (s *CredStore) Put(id int64, c Creds) ([]byte, error) {
-	data, err := s.Encode(c)
+// Put writes the file of a target atomically, mode 0600, replacing one that exists: a rotation. The generation is one above the generation of the
+// file that is there and one above floor (the highest generation that a holder has: a leader that missed a rotation must not give a lower
+// number than the others hold), and the rotation has a stamp of its own. It returns the bytes written so that the leader can hand them to the
+// other holders (never a passphrase; the callee seals them again).
+func (s *CredStore) Put(id int64, c Creds) ([]byte, error) { return s.Rotate(id, c, 0) }
+
+// Rotate is Put with a floor for the generation.
+func (s *CredStore) Rotate(id int64, c Creds, floor uint64) ([]byte, error) {
+	gen := floor
+	if cur, err := s.Digest(id); err == nil && cur.Generation > gen {
+		gen = cur.Generation
+	}
+	gen++
+	stamp, err := NewStamp()
+	if err != nil {
+		return nil, err
+	}
+	return s.write(id, c, gen, stamp)
+}
+
+func (s *CredStore) write(id int64, c Creds, gen uint64, stamp string) ([]byte, error) {
+	data, err := s.Encode(c, gen, stamp)
 	if err != nil {
 		return nil, err
 	}
@@ -492,17 +633,40 @@ func (s *CredStore) Put(id int64, c Creds) ([]byte, error) {
 	return data, nil
 }
 
-// Install writes a file received from the leader: it must decode here (so a holder with another passphrase says
-// so), and it is written again under this server's own sealing.
+// ErrOlderGeneration means that a file was refused because the file this server has is of a higher generation, or of the same generation from
+// another rotation: an older or a rival file is never written over a newer one (P7G-02).
+var ErrOlderGeneration = errors.New("ledgeranchor: this server holds a newer credentials file for the target, or a different one of the same generation")
+
+// Install writes a file received from another server, with the generation and the stamp it carries: it must decode here (so a holder with
+// another passphrase says so), and it is written again under this server's own sealing. A file of a lower generation than the one that is here,
+// or of the same generation and another rotation, is refused with ErrOlderGeneration.
 //
-// A file that does not decode here is ErrCredentials. A file that decodes and cannot be written (a full or unwritable disk) is ErrInstallWrite
-// as well as ErrCredentials, so that a caller can tell a bad file from a bad disk (P7F-02).
+// A file that does not decode here is ErrCredentials. A failure of this server (a full or unwritable disk, a passphrase file that cannot be read)
+// is ErrInstallWrite as well, so that a caller can tell a bad file from a bad server (P7F-02, P7G-04).
 func (s *CredStore) Install(id int64, kind string, data []byte) error {
-	c, err := s.Decode(data, kind)
+	st, err := s.DecodeFile(data, kind)
 	if err != nil {
+		if errors.Is(err, ErrPassphraseFile) {
+			return fmt.Errorf("%w: %w", ErrInstallWrite, err)
+		}
 		return err
 	}
-	if _, err = s.Put(id, c); err != nil {
+	if cur, cerr := s.Digest(id); cerr == nil {
+		if st.Generation < cur.Generation {
+			return ErrOlderGeneration
+		}
+		if st.Generation == cur.Generation {
+			d, derr := digestOf(id, st)
+			if derr != nil {
+				return derr
+			}
+			// two files of generation 0 (earlier versions) cannot be told apart: the later one is written, as before
+			if (d != "" || cur.Digest != "") && !sameDigest(d, cur.Digest) {
+				return ErrOlderGeneration
+			}
+		}
+	}
+	if _, err = s.write(id, st.Creds, st.Generation, st.Stamp); err != nil {
 		return fmt.Errorf("%w: %w", ErrInstallWrite, err)
 	}
 	return nil

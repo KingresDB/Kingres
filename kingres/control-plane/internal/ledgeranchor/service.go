@@ -120,6 +120,8 @@ type Service struct {
 	credProblems map[int64]CredProblem
 	// credGate is when each target was last checked against the holders in each term (see ensureCurrent).
 	credGate map[credGateKey]time.Time
+	// credStaleSince is when the newer file of a target first could not be taken (see staleFailure).
+	credStaleSince map[int64]time.Time
 }
 
 // New builds a Service.
@@ -141,7 +143,7 @@ func New(cfg Config) (*Service, error) {
 		log = slog.New(slog.DiscardHandler)
 	}
 	s := &Service{cfg: cfg, log: log, inflight: map[int64]bool{}, exporters: map[string]exporter{},
-		working: map[[2]int64]bool{}, sem: make(chan struct{}, MaxParallelTargets), credProblems: map[int64]CredProblem{}, credGate: map[credGateKey]time.Time{}}
+		working: map[[2]int64]bool{}, sem: make(chan struct{}, MaxParallelTargets), credProblems: map[int64]CredProblem{}, credGate: map[credGateKey]time.Time{}, credStaleSince: map[int64]time.Time{}}
 	warnHeaderTable(log, cfg.Clock())
 	for _, k := range kinds {
 		for f, fn := range k.Exports {
@@ -326,7 +328,11 @@ func isCredsUnreached(err error) bool {
 
 // credsStaleError is the build error of a target whose credentials file on this server is known to be older than a holder's, when the newer
 // one could not be taken (P7F-01). It is not final: the records wait and the check is made again.
-type credsStaleError struct{ cause error }
+type credsStaleError struct {
+	cause error
+	// final: the waiting is over (a file that does not open here, or a failure that lasted CredStaleLimit): the records fail for good
+	final bool
+}
 
 func (e credsStaleError) Error() string {
 	return "a holder has newer credentials for the target than this server and they could not be taken from it: the records wait (" + e.cause.Error() + ")"
