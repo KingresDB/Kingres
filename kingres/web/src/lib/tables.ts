@@ -145,7 +145,22 @@ export function tasksOfTable(
   )
 }
 
-/** The task that holds the table now, if any: a change of it is running or waits. */
+/**
+ * What a dialog says after a task was cancelled. The control plane records the task as cancelled first and undoes the change after
+ * that, and it can fail to reach a server, so this never says that the table is as it was; the detail of the task, shown with it,
+ * says what the control plane reports (the undo done, or running, or a server that is cleaned up when it returns).
+ */
+export const CANCELLED_TEXT =
+  'Cancelled. The control plane undoes what the change had begun; what it reports about that is shown here and may name a server that is cleaned up when it returns.'
+
+/** How many of the newest tasks the page reads to find the changes of its table (the contract cannot filter by subject). */
+export const TABLE_TASKS_LIMIT = 200
+
+/**
+ * The task that holds the table now, if any: a change of it waits to start, runs or is paused. This is an early hint only: a task
+ * older than the newest TABLE_TASKS_LIMIT is not seen, and the server stays the authority (409 `operation_in_progress`, which the
+ * dialogs show in words).
+ */
 export function runningTaskOfTable(
   tasks: Task[],
   database: string,
@@ -154,7 +169,7 @@ export function runningTaskOfTable(
 ): Task | null {
   return (
     tasksOfTable(tasks, database, schema, table).find(
-      (t) => t.state === 'running' || t.state === 'paused',
+      (t) => t.state === 'pending' || t.state === 'running' || t.state === 'paused',
     ) ?? null
   )
 }

@@ -196,17 +196,21 @@ describe('distribute', () => {
     expect(await axe(screen.getByRole('dialog'))).toHaveNoViolations()
   })
 
-  it('Cancel the task stops a copy and says the table is as it was', async () => {
+  it('Cancel the task stops a copy, says that the change is being undone, and then what the control plane reports', async () => {
     const user = userEvent.setup()
-    sw('tables=slow')
+    sw('tables=slow,undo:600')
     const dialog = await open(user)
     const start = dialog.getByRole('button', { name: /^distribute table$/i })
     await enabled(start)
     await user.click(start)
     await user.click(await dialog.findByTestId('cancel-task'))
-    expect(await dialog.findByTestId('task-cancelled')).toHaveTextContent(
-      /table is as it was before/i,
-    )
+    const cancelled = await dialog.findByTestId('task-cancelled')
+    expect(cancelled).toHaveTextContent(/cancelled/i)
+    expect(cancelled).not.toHaveTextContent(/as it was/i)
+    expect(await dialog.findByText(/undoing the change on every server/i)).toBeInTheDocument()
+    expect(
+      await dialog.findByText(/the change was undone on every server/i, {}, { timeout: 30_000 }),
+    ).toBeInTheDocument()
     expect(dialog.queryByTestId('cancel-task')).not.toBeInTheDocument()
     expect(shopTable('notes').distribution).toBeNull()
   })
@@ -246,6 +250,9 @@ describe('undistribute', () => {
     await waitFor(() => expect(dialog.queryByTestId('table-blockers')).not.toBeInTheDocument())
     await user.selectOptions(dialog.getByTestId('undistribute-group'), '2')
     const start = dialog.getByRole('button', { name: /^undistribute table$/i })
+    await waitFor(() => expect(dialog.getByTestId('table-change-eligible')).toBeInTheDocument())
+    expect(start).toBeDisabled() // the name of the table is not typed yet
+    await user.type(dialog.getByLabelText(/to confirm/i), 'customers')
     await enabled(start)
     await user.click(start)
     expect(await dialog.findByText('Finished.')).toBeInTheDocument()
@@ -257,6 +264,22 @@ describe('undistribute', () => {
     })
     expect(shopTable('orders').distribution).toBeNull()
     expect(shopTable('customers').homeShardGroupId).toBe(2)
+  })
+
+  it('warns in the danger tone that the table will live on one server, and needs its name typed', async () => {
+    const user = userEvent.setup()
+    const dialog = await open(user, 'events')
+    expect(dialog.getByTestId('undistribute-warning')).toHaveTextContent(
+      /will live on one server\. its data must fit there/i,
+    )
+    expect(dialog.getByTestId('undistribute-warning')).toHaveClass('tone-danger')
+    const start = dialog.getByRole('button', { name: /^undistribute table$/i })
+    await dialog.findByTestId('table-change-eligible')
+    expect(start).toBeDisabled()
+    await user.type(dialog.getByLabelText(/to confirm/i), 'event')
+    expect(start).toBeDisabled()
+    await user.type(dialog.getByLabelText(/to confirm/i), 's')
+    await enabled(start)
   })
 
   it('an online copy that the table cannot have is shown with its reason and cannot be chosen', async () => {
@@ -512,7 +535,8 @@ describe('the changes of a table that run, and have run', () => {
     await user.click(within(running).getByTestId('table-task-cancel'))
     const failed = await screen.findByTestId('table-task-failed')
     expect(failed).toHaveTextContent(/cancelled/i)
-    expect(failed).toHaveTextContent(/table is as it was before/i)
+    expect(failed).not.toHaveTextContent(/as it was/i)
+    expect(failed).toHaveTextContent(/control plane undoes what the change had begun/i)
     expect(failed).toHaveAttribute('role', 'status')
   })
 

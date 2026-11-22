@@ -17,7 +17,7 @@ import TableChangeRefusal from './TableChangeRefusal.vue'
 import { endpoints } from '@/api/endpoints'
 import { keys, useTableDetail } from '@/api/queries'
 import { useTableChange } from '@/composables/useTableChange'
-import { bucketCountError } from '@/lib/tables'
+import { CANCELLED_TEXT, bucketCountError } from '@/lib/tables'
 import type {
   AlterTableDistributionRequest,
   DependentViews,
@@ -100,6 +100,22 @@ const multiple = computed(
     bucketNumber.value % current.value.bucketCount === 0,
 )
 
+/**
+ * Whether rows move: a change of the column or of the colocation rebuilds the table, and so does a bucket count that is not a multiple of
+ * the old one. When they do (and the table has rows, or the number is unknown) the name of the table has to be typed.
+ */
+const movesRows = computed(() => {
+  const r = request()
+  const onlyBuckets =
+    r.distributionColumn === undefined &&
+    r.colocateWith === undefined &&
+    r.bucketCount !== undefined
+  return changesSomething.value && !(onlyBuckets && multiple.value)
+})
+const confirmName = computed(() =>
+  movesRows.value && props.table.estimatedRows !== 0 ? props.table.name : undefined,
+)
+
 const change = useTableChange(
   () => props.databaseName,
   () => props.table.schema,
@@ -131,6 +147,8 @@ const start = () =>
   <TaskActionDialog
     :title="`Change the distribution of ${table.schema}.${table.name}`"
     confirm-label="Change the distribution"
+    :danger="confirmName !== undefined"
+    :type-to-confirm="confirmName"
     :start="start"
     :validate="validate"
     :confirm-disabled="change.holdsStart.value"
@@ -141,7 +159,7 @@ const start = () =>
       keys.colocation(databaseName),
     ]"
     cancelable
-    cancelled-text="The change was cancelled. The table is as it was before."
+    :cancelled-text="CANCELLED_TEXT"
     wide
     @close="emit('close')"
   >
@@ -216,6 +234,18 @@ const start = () =>
         </label>
         <p v-if="submitted && nothingError" class="error" role="alert" data-testid="alter-nothing">
           {{ nothingError }}
+        </p>
+        <p
+          v-if="movesRows"
+          class="notice tone-danger"
+          role="alert"
+          data-testid="alter-moves-warning"
+        >
+          <span aria-hidden="true">&#10006;</span>
+          <span
+            >Rows move: the table is rebuilt on its new buckets, which can take long for a large
+            table. In blocking mode writers wait for the whole copy.</span
+          >
         </p>
         <TableChangeOptions
           v-model:mode="form.mode"

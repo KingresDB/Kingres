@@ -4,6 +4,7 @@
 // The two choices every copy of a table has (contract 0.14.0): how the rows are copied (`mode`) and what happens to the plain views
 // that use the table (`dependentViews`). An online copy is offered only when the preview says it is possible; when it is not,
 // the reason is shown next to the choice and the choice stays visible.
+import { useId } from 'vue'
 import { DEPENDENT_VIEWS_HINT, DEPENDENT_VIEWS_LABEL, MODE_HINT, MODE_LABEL } from '@/lib/tables'
 import SafeName from '../SafeName.vue'
 import type { DependentViews, TableChangeMode } from '@/api/types'
@@ -29,6 +30,8 @@ withDefaults(
     blockingOnly: false,
   },
 )
+/** One name per group of radios, so that the arrow keys move through the options and the group is one tab stop. */
+const groupId = useId()
 const MODES: TableChangeMode[] = ['auto', 'online', 'blocking']
 </script>
 
@@ -49,6 +52,7 @@ const MODES: TableChangeMode[] = ['auto', 'online', 'blocking']
         <input
           v-model="mode"
           type="radio"
+          :name="`${groupId}-mode`"
           :value="m"
           :disabled="(m !== 'blocking' && blockingOnly) || (m === 'online' && !onlineAvailable)"
         />
@@ -67,7 +71,7 @@ const MODES: TableChangeMode[] = ['auto', 'online', 'blocking']
     <fieldset v-if="showViews" data-testid="table-change-views">
       <legend>Views that use the table</legend>
       <label v-for="v in ['refuse', 'recreate'] as const" :key="v" class="check">
-        <input v-model="views" type="radio" :value="v" />
+        <input v-model="views" type="radio" :name="`${groupId}-views`" :value="v" />
         {{ DEPENDENT_VIEWS_LABEL[v] }}
         <span class="muted"> - {{ DEPENDENT_VIEWS_HINT[v] }}</span>
       </label>

@@ -6,7 +6,7 @@
 // rows to copy, the mode of the copy, the bucket count of a new colocation group and what happens to the views that use the
 // table are asked here, and the preview says what the sharding extension finds before anything starts: a blocker keeps the
 // start button off, and a refusal (422 `table_not_eligible`) lists the same lines.
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, reactive, ref, useId, watch } from 'vue'
 import { safeText } from '@/lib/safe-text'
 import SafeName from './SafeName.vue'
 import TaskActionDialog from './TaskActionDialog.vue'
@@ -18,7 +18,7 @@ import TableChangeRefusal from './tables/TableChangeRefusal.vue'
 import { endpoints } from '@/api/endpoints'
 import { keys, useTableDetail } from '@/api/queries'
 import { useTableChange } from '@/composables/useTableChange'
-import { bucketCountError, ONLINE_ROWS_THRESHOLD } from '@/lib/tables'
+import { bucketCountError, CANCELLED_TEXT, ONLINE_ROWS_THRESHOLD } from '@/lib/tables'
 import { formatNumber } from '@/lib/format'
 import type {
   DependentViews,
@@ -28,6 +28,8 @@ import type {
   TableChangeMode,
 } from '@/api/types'
 
+/** One name for the two radios of the method, so that the arrow keys move between them. */
+const methodGroup = `${useId()}-method`
 const props = defineProps<{ databaseName: string; table: Table; candidates: Table[] }>()
 const emit = defineEmits<{ close: [] }>()
 
@@ -134,7 +136,7 @@ const start = () =>
       keys.colocation(databaseName),
     ]"
     cancelable
-    cancelled-text="The distribution was cancelled. The table is as it was before."
+    :cancelled-text="CANCELLED_TEXT"
     wide
     @close="emit('close')"
   >
@@ -165,12 +167,12 @@ const start = () =>
         <fieldset>
           <legend>Method</legend>
           <label class="check"
-            ><input v-model="form.method" type="radio" value="hash" /> Hash-distributed by a
-            column</label
+            ><input v-model="form.method" type="radio" :name="methodGroup" value="hash" />
+            Hash-distributed by a column</label
           >
           <label class="check"
-            ><input v-model="form.method" type="radio" value="reference" /> Reference table (a full
-            copy on every group)</label
+            ><input v-model="form.method" type="radio" :name="methodGroup" value="reference" />
+            Reference table (a full copy on every group)</label
           >
         </fieldset>
         <template v-if="form.method === 'hash'">

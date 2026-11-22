@@ -140,6 +140,15 @@ export const mockConfig = {
   tableSlow: false,
   /** A bucket move or another operation holds the colocation groups: a change of a distributed table is refused. */
   tableBusy: false,
+  /** The next change of a table waits at its switch for a transaction that holds the table (paused, with the blockers in the detail). */
+  tableBlocked: false,
+  /** The next change of a table ends with `verification_failed` after its switch (the old copy is kept). */
+  tableVerifyFails: false,
+  /** The next change of a table is accepted and stays `pending`. */
+  tablePending: false,
+  /** How long the undo of a cancelled table task takes to be reported (ms), and whether it fails on one server. */
+  tableUndoMs: 1500,
+  tableUndoFails: false,
   /** Tables that have foreign keys to an ordinary table (the report of the extension lists them). */
   tableForeignKeys: [] as string[],
   /** 0.12.0: a refusal `failover_needs_decision` carries no plan (a server of 0.11.0): the console asks with a dry run. */
@@ -304,6 +313,9 @@ export interface TaskRec {
   onPause?: () => void
   /** 0.9.0: the step that skips itself on purpose; the task records it as `skipped` (the reason is the task detail). */
   skippedStep?: string
+  /** A cancelled table task is recorded as failed first and its undo is reported later: at this time the detail becomes `settleDetail`. */
+  settleAt?: number
+  settleDetail?: string
   applied: boolean
   /** True for tasks created before the node was initialized (readable with the setup token). */
   setup: boolean
@@ -1925,6 +1937,11 @@ export function tickTasks(s: MockState): void {
   const now = Date.now()
   for (const rec of s.tasks) {
     const t = rec.task
+    if (rec.settleAt !== undefined && now >= rec.settleAt && t.state === 'failed') {
+      t.detail = rec.settleDetail ?? null
+      t.updatedAt = nowIso()
+      rec.settleAt = undefined
+    }
     if (t.state !== 'running') continue
     let fraction = rec.durationMs <= 0 ? 1 : Math.min(1, (now - rec.startedAt) / rec.durationMs)
     // A step that waits for a server holds the whole task, which never gives up (`config.apply`).

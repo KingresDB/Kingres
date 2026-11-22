@@ -17,6 +17,7 @@ import {
   partitionBoundError,
   partitionNameError,
   utf8Length,
+  CANCELLED_TEXT,
 } from '@/lib/tables'
 import type { Table } from '@/api/types'
 
@@ -69,7 +70,7 @@ const start = () =>
       keys.tablePartitions(databaseName, table.schema, table.name),
     ]"
     cancelable
-    cancelled-text="The task was cancelled. No partition was created."
+    :cancelled-text="CANCELLED_TEXT"
     wide
     @close="emit('close')"
   >

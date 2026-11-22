@@ -23,7 +23,7 @@ import PartitionActionDialog from '@/components/tables/PartitionActionDialog.vue
 import TableTasksPanel from '@/components/tables/TableTasksPanel.vue'
 import { useDatabase, useTable, useTablePartitions, useTables, useTasks } from '@/api/queries'
 import { formatBytes, formatNumber } from '@/lib/format'
-import { runningTaskOfTable } from '@/lib/tables'
+import { TABLE_TASKS_LIMIT, runningTaskOfTable } from '@/lib/tables'
 import type { TablePartition, TableClass } from '@/api/types'
 
 const props = defineProps<{ name: string; schema: string; table: string }>()
@@ -34,7 +34,7 @@ const detail = useTable(
   () => props.table,
 )
 const all = useTables(() => props.name)
-const tasks = useTasks(50)
+const tasks = useTasks(TABLE_TASKS_LIMIT)
 const t = computed(() => detail.data.value)
 
 const CLASS_LABEL: Record<TableClass, string> = {

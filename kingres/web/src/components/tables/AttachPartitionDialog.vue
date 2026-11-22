@@ -12,7 +12,7 @@ import TableChangeRefusal from './TableChangeRefusal.vue'
 import { endpoints } from '@/api/endpoints'
 import { keys } from '@/api/queries'
 import { useTableChange } from '@/composables/useTableChange'
-import { partitionBoundError } from '@/lib/tables'
+import { CANCELLED_TEXT, partitionBoundError } from '@/lib/tables'
 import type { Table } from '@/api/types'
 
 const props = defineProps<{ databaseName: string; table: Table; candidates: Table[] }>()
@@ -79,7 +79,7 @@ const start = () => {
       keys.colocation(databaseName),
     ]"
     cancelable
-    cancelled-text="The task was cancelled. Nothing was attached."
+    :cancelled-text="CANCELLED_TEXT"
     wide
     @close="emit('close')"
   >

@@ -549,7 +549,11 @@ function refuseWhenHeld(s: MockState, rec: DbRec, t: Table): void {
   tickTasks(s)
   const group = t.distribution?.colocationId
   const held = s.tasks.some((r) => {
-    if (r.task.state !== 'running' || !TABLE_KINDS.includes(r.task.kind)) return false
+    if (
+      !['pending', 'running', 'paused'].includes(r.task.state) ||
+      !TABLE_KINDS.includes(r.task.kind)
+    )
+      return false
     const id = r.task.subject?.id ?? ''
     if (!id.startsWith(`${rec.info.name}/`)) return false
     if (id === `${rec.info.name}/${name(t)}`) return true
@@ -569,6 +573,14 @@ function refuseWhenBlocked(p: Preview): void {
     throw problem('table_not_eligible', 'The table cannot take this change as it is.', {
       blockers: p.blockers,
     })
+}
+
+/** A task that ends in the verification after its switch (the old copy is kept); the text is the one of the control plane. */
+const VERIFY_FAIL = {
+  fraction: 0.85,
+  code: 'verification_failed',
+  message:
+    'The new table differs from the old copy, which is kept for inspection (kingres.table_operations names it).',
 }
 
 /** The switch is the point from which a task goes on to its end. */
@@ -601,14 +613,25 @@ function startTask(
           }
         : undefined
   const id = s.nextTaskId
-  return createTask(s, {
+  const blockedDetail =
+    'Waiting to switch: pid 4123 (role app) holds a lock on the table and has run for 3 minutes.'
+  const created = createTask(s, {
     kind,
     subject: subjectOf(rec, t),
     steps,
     cancellable: opts.cancellable,
     durationMs: mockConfig.tableSlow ? 60_000 : undefined,
     uncapped: mockConfig.tableSlow,
-    failAt,
+    failAt: failAt ?? (mockConfig.tableVerifyFails ? VERIFY_FAIL : undefined),
+    ...(mockConfig.tableBlocked
+      ? {
+          pauseAt: 0.5,
+          onPause: () => {
+            const r = s.tasks.find((x) => x.task.id === id)
+            if (r) r.task.detail = blockedDetail
+          },
+        }
+      : {}),
     onProgress: (fraction) => {
       const r = s.tasks.find((x) => x.task.id === id)
       if (r && r.task.state === 'running' && fraction >= SWITCH_AT && opts.cancellable)
@@ -616,6 +639,19 @@ function startTask(
     },
     apply,
   })
+  if (!mockConfig.tablePending) return created
+  // Accepted and not started: the task engine has not picked it up yet.
+  const pending = s.tasks.find((x) => x.task.id === id)
+  if (!pending) return created
+  pending.task.state = 'pending'
+  pending.task.cancellable = false
+  pending.task.progress.percent = 0
+  pending.task.progress.currentStep = null
+  pending.task.progress.steps = pending.task.progress.steps.map((st) => ({
+    ...st,
+    state: 'pending' as const,
+  }))
+  return structuredClone(pending.task)
 }
 
 function newColocation(

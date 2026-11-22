@@ -2446,8 +2446,10 @@ export function createHandlers(): HttpHandler[] {
       }
       // A failover stops before the promotion: its freezes are lifted and its report says cancelled (running or paused).
       if (rec.task.kind === 'server.failover') return ok(cancelFailover(c.s, rec))
-      if (rec.task.state !== 'running') throw problem('task_not_cancellable')
-      if (rec.task.kind.startsWith('table.')) {
+      const tableTask = rec.task.kind.startsWith('table.')
+      if (rec.task.state !== 'running' && !(tableTask && rec.task.state === 'paused'))
+        throw problem('task_not_cancellable')
+      if (tableTask) {
         // A change of a table stops at the next step and leaves the table as it was (the result is never applied).
         rec.task.state = 'failed'
         rec.task.cancellable = false
@@ -2462,6 +2464,12 @@ export function createHandlers(): HttpHandler[] {
             ? st
             : { ...st, state: st.state === 'running' ? 'failed' : 'skipped' },
         )
+        // The control plane records the task as cancelled first and undoes the change after that: the detail says so until it has.
+        rec.task.detail = 'Undoing the change on every server.'
+        rec.settleAt = Date.now() + mockConfig.tableUndoMs
+        rec.settleDetail = mockConfig.tableUndoFails
+          ? 'The change could not be undone on server 10.0.0.13, which did not answer. It is cleaned up when that server returns.'
+          : 'The change was undone on every server.'
         rec.task.updatedAt = nowIso()
         return ok(rec.task)
       }

@@ -4,7 +4,7 @@
 // The changes of one table that the control plane runs or has run lately (tasks `table.distribute`, `table.undistribute`,
 // `table.alter` and `table.partition`, contract 0.14.0): the one that runs, with its steps, and Cancel while the task can be
 // cancelled; the last one that failed, in words, with the step and the code; and the last one that finished. A cancelled task
-// says that the table is as it was. The change buttons of the page are off while one runs.
+// says what the control plane reports about undoing it (never that the table is as it was). The change buttons of the page are off while one runs.
 import { computed } from 'vue'
 import { useMutation, useQueryClient } from '@tanstack/vue-query'
 import GateButton from '../GateButton.vue'
@@ -16,17 +16,20 @@ import { endpoints } from '@/api/endpoints'
 import { keys, useTasks } from '@/api/queries'
 import { TASK_KIND_LABEL, TASK_STATE } from '@/lib/status'
 import { formatDateTime } from '@/lib/format'
-import { tasksOfTable } from '@/lib/tables'
+import { CANCELLED_TEXT, TABLE_TASKS_LIMIT, tasksOfTable } from '@/lib/tables'
 import type { Task } from '@/api/types'
 
 const props = defineProps<{ database: string; schema: string; table: string }>()
-const tasks = useTasks(50)
+const tasks = useTasks(TABLE_TASKS_LIMIT)
 const client = useQueryClient()
 const mine = computed(() =>
   tasksOfTable(tasks.data.value?.items ?? [], props.database, props.schema, props.table),
 )
 const running = computed(
-  () => mine.value.find((t) => t.state === 'running' || t.state === 'paused') ?? null,
+  () =>
+    mine.value.find(
+      (t) => t.state === 'pending' || t.state === 'running' || t.state === 'paused',
+    ) ?? null,
 )
 const lastFailed = computed(() => mine.value.find((t) => t.state === 'failed') ?? null)
 const lastDone = computed(() => mine.value.find((t) => t.state === 'done') ?? null)
@@ -49,7 +52,7 @@ const cancel = useMutation({
 const cancelBlocked = (t: Task): string =>
   t.cancellable ? '' : 'This task cannot be cancelled now: it is at a step that goes on to its end.'
 const kindLabel = (t: Task): string => TASK_KIND_LABEL[t.kind] ?? t.kind
-/** A cancelled task leaves the table as it was; any other failure is shown as the server said it. */
+/** A cancelled task is recorded as failed with the code `cancelled`; any other failure is shown as the server said it. */
 const cancelled = (t: Task): boolean => t.error?.code === 'cancelled'
 </script>
 
@@ -96,9 +99,12 @@ const cancelled = (t: Task): boolean => t.error?.code === 'cancelled'
           {{ kindLabel(failureShown) }}:
           {{ cancelled(failureShown) ? 'cancelled' : 'failed' }}
         </strong>
-        <span v-if="cancelled(failureShown)"
-          >The change was cancelled. The table is as it was before.</span
-        >
+        <template v-if="cancelled(failureShown)">
+          <span>{{ CANCELLED_TEXT }}</span>
+          <span v-if="failureShown.detail" data-testid="table-task-detail"
+            ><SafeName :value="failureShown.detail" kind="text" :max="400" multiline
+          /></span>
+        </template>
         <template v-else>
           <span v-if="failureShown.error"
             ><SafeName :value="failureShown.error.message" kind="text" :max="400" multiline
@@ -106,9 +112,18 @@ const cancelled = (t: Task): boolean => t.error?.code === 'cancelled'
           <span v-if="failureShown.error?.step" class="muted"
             >At the step <SafeName :value="failureShown.error.step" kind="text" :max="120" />.</span
           >
+          <span v-if="failureShown.detail" data-testid="table-task-detail"
+            ><SafeName :value="failureShown.detail" kind="text" :max="400" multiline
+          /></span>
+          <span
+            v-if="failureShown.error?.code === 'verification_failed'"
+            data-testid="table-task-verification"
+          >
+            The old copy was kept for inspection, and the new table was not used. Ask an
+            administrator to look at it before anything is changed again.
+          </span>
           <span class="muted">
-            The table stays as it was unless the message says what is left to do. Task
-            {{ failureShown.id }}.
+            Read the message and the detail for what is left to do. Task {{ failureShown.id }}.
           </span>
         </template>
       </div>

@@ -14,6 +14,7 @@ import { endpoints } from '@/api/endpoints'
 import { keys } from '@/api/queries'
 import { useTableChange } from '@/composables/useTableChange'
 import { formatBytes } from '@/lib/format'
+import { CANCELLED_TEXT } from '@/lib/tables'
 import type { Table, TablePartition } from '@/api/types'
 
 const props = defineProps<{
@@ -65,7 +66,7 @@ const start = () =>
       keys.colocation(databaseName),
     ]"
     cancelable
-    cancelled-text="The task was cancelled. The partition is as it was."
+    :cancelled-text="CANCELLED_TEXT"
     @close="emit('close')"
   >
     <template #error="{ error }">

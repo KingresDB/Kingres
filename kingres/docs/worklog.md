@@ -25,6 +25,10 @@ Branch web-15b (from m18) carries the one console commit of web-15 for increment
 - Mutants, each caught by the tests and reverted: a blocked change no longer holds the start; the partition name limit raised by 100 bytes; "Cancel the task" shown for a task that cannot be cancelled.
 - `go test ./internal/...` on Windows: every package passes except `internal/pgconninfo`, whose test binary Windows refuses to run ("Access is denied", a build failure, repeated). No Go file is changed here. `internalapi` and `ledgersign` failed once under the load of the browser run and passed alone.
 
+### The review of the console (2026-11-22) and its fixes
+
+The independent review (docs/reviews/2026-11-22-console-phase9-7.md, no critical or high finding) had seven findings, all fixed in a second commit on web-15b: type-to-confirm and the danger tone for undistribute and alter (C97R-001); no claim that a cancelled task left the table as it was, the detail of the task shown and read again after a cancel (C97R-002); the mock switches blockme, diffme, pending, undo:<ms> and undo:fail with tests of the paused, verification-failed and pending states (C97R-003); a test that the start waits for the preview (C97R-004); a name on every group of radios (C97R-005); a test of the 57 bytes with two-byte letters (C97R-006); pending tasks hold the buttons and the page reads 200 tasks (C97R-007). The runs and the mutants are in the Fixes section of the review and in the final report of the work.
+
 ### Still open
 
 - The progress indicators that need `Table.operation`; distribute with related tables.

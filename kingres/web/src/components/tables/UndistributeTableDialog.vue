@@ -15,6 +15,7 @@ import { endpoints } from '@/api/endpoints'
 import { keys, useTopology } from '@/api/queries'
 import { useTableChange } from '@/composables/useTableChange'
 import { formatNumber } from '@/lib/format'
+import { CANCELLED_TEXT } from '@/lib/tables'
 import type { DependentViews, Table, TableChangeMode } from '@/api/types'
 
 const props = defineProps<{ databaseName: string; table: Table }>()
@@ -55,6 +56,8 @@ const onlineAvailable = computed(() => change.preview.value?.estimate.onlineAvai
 watch(onlineAvailable, (available) => {
   if (!available && form.mode === 'online') form.mode = 'auto'
 })
+/** The rows of the table go to one server; with rows (or an unknown number) the name has to be typed. */
+const confirmName = computed(() => (props.table.estimatedRows === 0 ? undefined : props.table.name))
 const start = () =>
   endpoints.undistributeTable(props.databaseName, props.table.schema, props.table.name, query())
 </script>
@@ -63,6 +66,8 @@ const start = () =>
   <TaskActionDialog
     :title="`Undistribute ${table.schema}.${table.name}`"
     confirm-label="Undistribute table"
+    danger
+    :type-to-confirm="confirmName"
     :start="start"
     :confirm-disabled="change.holdsStart.value"
     :invalidate="[
@@ -72,7 +77,7 @@ const start = () =>
       keys.colocation(databaseName),
     ]"
     cancelable
-    cancelled-text="The change was cancelled. The table is as it was before."
+    :cancelled-text="CANCELLED_TEXT"
     wide
     @close="emit('close')"
   >
@@ -84,6 +89,13 @@ const start = () =>
         The table becomes an ordinary table on one server: its rows are copied there from every
         shard group, and the shards are removed. The server must have room for the whole table, and
         that is checked first. Reads go on; for writers see the choice below.
+      </p>
+      <p class="notice tone-danger" role="alert" data-testid="undistribute-warning">
+        <span aria-hidden="true">&#10006;</span>
+        <span
+          >The table will live on one server. Its data must fit there. The copy can take hours for a
+          large table.</span
+        >
       </p>
       <p v-if="table.estimatedRows !== null" data-testid="undistribute-rows">
         This table has about {{ formatNumber(table.estimatedRows) }} rows.
