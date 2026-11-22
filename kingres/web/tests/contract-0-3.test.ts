@@ -25,7 +25,7 @@ describe('stats-only dashboard uses getClusterSummary', () => {
     expect(within(summary).getByText('Healthy')).toBeInTheDocument()
     expect(within(summary).getByText('prod-eu')).toBeInTheDocument()
     expect(within(summary).getByText('Servers').nextElementSibling).toHaveTextContent('3')
-    expect(within(summary).getByText('Databases').nextElementSibling).toHaveTextContent('3')
+    expect(within(summary).getByText('Databases').nextElementSibling).toHaveTextContent('2')
     // One alert of the seed, and clockDifference for the server whose clock is 1.82 s off (0.8.0).
     expect(within(summary).getByText('Open alerts').nextElementSibling).toHaveTextContent('2')
   })

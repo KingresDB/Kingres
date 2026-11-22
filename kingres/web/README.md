@@ -430,7 +430,6 @@ and talk to the mock API through MSW in Node, so the same handlers serve `npm ru
 | `config-page-0-8.test.ts`, `config-dialog-0-8.test.ts`                                                                         | 0.8.0: the page (every state, every role, the filters in the address, paging, the four server states) and the dialogs (levels, live validation of every type, preview, apply, retry, remove an override, revert and superseded, restart)                                                                                                                                                     |
 | `config-time-0-8.test.ts`, `config-hostile-0-8.test.ts`                                                                        | 0.8.0: the Time tab, the dashboard card and its links, the server section, the alert; every place a value or name is shown with hostile data                                                                                                                                                                                                                                                 |
 | `audit-metrics-0-7.test.ts`, `a11y-0-7.test.ts`                                                                                | 0.7.0: audit labels and filter, the client entry point group; axe and live regions for the new states                                                                                                                                                                                                                                                                                        |
-| `sharding-mode-0-15.test.ts`, `schemas-0-15.test.ts`, `schemas-shards-0-15.test.ts`                                            | 0.15.0: the create and settings dialogs with Rows, Schemas and Both, the Schemas section, the three dialogs, the roles, the task states, the mock operations, the Shards and Rebalance pages                                                                                                                                                                                                 |
 | `ledger-0-6.test.ts`, `workbench-0-6.test.ts`                                                                                  | Passed-but-incomplete badges, uncovered shard groups in list, dialog and next to downloads, LedgerProofBlock, truncated DML was applied, timeout and size limits                                                                                                                                                                                                                             |
 
 jsdom has no layout engine, so axe cannot compute colour contrast there; that is why contrast is tested from the
@@ -438,8 +437,8 @@ tokens instead.
 
 ## Contract revisions and the checks against them
 
-The generated files (`src/api/schema.d.ts`, `src/api/operations.generated.ts`) follow contract **0.15.0** (generated again in step 14 of phase 11; the newest note of a revision in them is "Added in 0.15.0"). Before that they were at 0.12.0 while the contract had gone on, so the regeneration also brought in what 0.13.0 added (the alert `certificateAuthorityUnavailable`, which now has words) together with the 0.15.0 operations, schemas and codes listed below. `npm run api:check` and the contract tests compare
-with `kingres/api/openapi.yaml`. While the working tree holds a draft of a later revision they fail, and that failure says nothing about the
+The generated files (`src/api/schema.d.ts`, `src/api/operations.generated.ts`) follow contract **0.12.0** (the last one generated from, in commit "the panel follows contract 0.12.0"; the newest note of a revision in them is "Added in 0.12.0"). The revision of `kingres/api/openapi.yaml` is now **0.13.0** (the switchover of a group, the failover of the map group, the alert `certificateAuthorityUnavailable`), which the generated files do not contain yet. `npm run api:check` and the contract tests compare
+with that file. While the working tree holds a draft of a later revision they fail, and that failure says nothing about the
 panel; to check against another copy of the contract (for example the committed one), point `KINGRES_API_SPEC` at it:
 
 ```
@@ -524,44 +523,6 @@ The Ledger page has a sixth tab, **Client keys** (`?tab=clients`, after Anchorin
 - **Mock.** `?bundle=expired` (a bundle answers 410), `?bundle=refuse:<code>` (a bundle or an acknowledgement answers that code), `?publication=reopened`; `?phase7=today` is the server of today.
 - **Waits for the contract or the server.** The result of the bundle task (an id) is read from the task detail; a verification record has no member that says which checks ran; one proof per bundle is offered
   (the contract takes a list). Tests: `ledger-ops-0-11.test.ts`; the browser tests have three new states (the bundle dialog, the acknowledgement dialog, the audit card).
-
-## What the panel does for contract 0.15.0 (distributed schemas, step 14 of phase 11)
-
-Contract 0.15.0 adds five operations (the tag `Schemas`: `listSchemas`, `getSchema`, `distributeSchema`, `undistributeSchema`, `moveSchema`; 137 in all), the sharding
-mode of a database (`row`, `schema`, `both`) with `distributeNewSchemas`, colocation groups of kind `schema`, `BucketMove.kind` and `schemaName`, `primarySchemas`, three task kinds
-and four problem codes (`sharding_mode_in_use`, `schema_not_distributable`, `schema_pinned`, `schema_move_in_progress`). Design: `docs/design/shard-phase11.md`, sections 13.2, 14 and 15.4.
-
-- **Create database** (`CreateDatabaseDialog.vue`, `ShardingModeChoice.vue`): once sharding is on and the server offers modes (`shardingModes` of the create options; a server that sends none
-  gets the dialog as it was), "Shard by" Rows (the default), Schemas or Both with a sentence each. The bucket count is shown for Rows and Both. "Distribute new schemas automatically" is
-  shown for Schemas (checked) and Both (unchecked). Rows sends neither `mode` nor `distributeNewSchemas`, so the request also works against a server before 0.15.0; Schemas sends no bucket count.
-- **Database settings** (`EditDatabaseDialog.vue`): the same choice for a database with sharding on (the default for new schemas keeps its value when the mode changes, and becomes false in
-  Rows), the mode choice when sharding is turned on, the bucket count as "Not used in the mode Schemas", and the refusal 409 `sharding_mode_in_use` as the problem notice with the server's
-  words about what is in the way. A role below `kingres_admin` cannot open the dialog (the button is a `GateButton`), and the dialog shows the mode as text for such a role anyway; the database
-  page states the mode, the default and the number of distributed schemas as text for every role.
-- **The Schemas section** (`SchemasSection.vue`, under Tables): name through `SafeName`, owner, "Local" / "Distributed" / "Moving to group N" (the link to the task is found through
-  `listTasks(kind schema.move, state running)`, subject id `database/schema`, because `SchemaSummary` has the target group but not the task), server group and server, tables, size
-  (`n/a` for null). The actions are `GateButton`s: Distribute schema and Make local need `kingres_admin`, Move schema `kingres_ops`; a moving schema has all of them disabled with the reason, Distribute is
-  disabled with the reason in the mode Rows and without sharding. `kingres_stats` has no access to the page.
-- **Distribute schema** (`DistributeSchemaDialog.vue`): `getSchema` first; the blockers (`distributionBlockers`) are listed and the button stays disabled and says why (`TaskActionDialog` has
-  `confirmDisabledReason`); optional group (an empty schema goes there, a schema with rows stays where its rows are) and the optional `setReplicaIdentityFull`; the task follows in the dialog.
-- **Move schema** (`MoveSchemaDialog.vue`): the groups of `useShardGroupChoices` (not the map group, not the current one, only groups whose server has `shouldHaveShards`), the warning about the
-  moment of the switch, the steps and the bytes of the copy (`itemsDone` of "Copy the data"), and for a failed move the failed step, the error and "The schema is still on its original group and in
-  use. You can start the move again." (`TaskProgress.vue`, so the Tasks page shows it too).
-- **Make local** (`MakeLocalDialog.vue`): the typed name (`TypeToConfirm`), the sentence about the group the schema ends up on, the optional "Move to group first".
-- **Shards page**: only `kind=hash` colocation groups; "Distributed schemas per server group" (a count and a size; a size that no server knows is `n/a`, a group where some are not known says how many);
-  `primarySchemas` among the primary buckets; the schema moves that run now; a database with only distributed schemas says it has no bucket map. The page also keeps `?db=` while the database list is still empty.
-  **Rebalance page**: a move of kind `schema` in the moves in flight is told by its schema name.
-- **Where the design and the contract differ.** (1) The contract lists no table that lacks a primary key before a move: `getSchema` has no such member and `Table` no key information. The Move dialog therefore
-  sends the move and, when the server refuses it with 422 `unprocessable` naming the tables (the refusal is recognised by the words "REPLICA IDENTITY" in its `detail`, which is the only place the
-  tables are named), shows them and requires the checkbox before it sends again. (2) The plan preview of a rebalance (`PlannedMove`) has neither `kind` nor `schemaName` in 0.15.0, and the control plane plans
-  buckets only, so the preview lists no schema units; schema moves appear in `RebalanceStatus.inFlightMoves` (the mock puts them there while a schema moves). (3) `listSchemas` has no task id for a
-  moving schema (see above).
-- **Mock** (`src/mocks/schemas.ts`, `state.ts`): the database `tenants` in the mode `schema` with distributed schemas on the three groups (one without a known size), local schemas, `public` (never distributable),
-  `blocked_mv` (two blockers), `tenant_initech` (tables without a key), `ledgered` (pinned) and `failme` (its move fails at the copy step); `?mock=hostile` adds schemas with hostile names and hostile blockers;
-  `beginSchemaMove` starts a move for a test that needs a moving schema. The mock refuses as the control plane does (409 `conflict`, `schema_pinned`, `schema_move_in_progress`, `rebalance_in_progress`, 422
-  `schema_not_distributable` with the blockers in `errors`, 422 `unprocessable`), changes the mode with 409 `sharding_mode_in_use`, and cancels a move before its switch.
-- **Tests.** `sharding-mode-0-15.test.ts`, `schemas-0-15.test.ts`, `schemas-shards-0-15.test.ts`; the browser tests have the states of the dialogs in `STATES`, `/databases/tenants` and `/shards?db=tenants` in
-  `ROUTES` (so layout and axe run on them) and `browser-tests/schemas.test.ts` (1366, 683 and 320 pixels, the keyboard).
 
 ## What the panel does for contract 0.12.0
 

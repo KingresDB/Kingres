@@ -92,7 +92,7 @@ describe('the level', () => {
       within(d.getByRole('combobox', { name: 'Database' }))
         .getAllByRole('option')
         .map((o) => o.textContent),
-    ).toEqual(['shop', 'reports', 'tenants'])
+    ).toEqual(['shop', 'reports'])
   })
 
   it('switches off the levels a parameter that must be equal on every server does not have, and says why', async () => {

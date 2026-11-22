@@ -714,25 +714,7 @@ export interface paths {
          *     422 `node_state_invalid` for `graceful` on a server that is not `live`, 422 `unprocessable` for a group
          *     the server is not primary of or a target that is not a standby of the group. While `kingresd` lacks a
          *     part of the design, the request answers 422 `unsupported_operation`: this revision's server implements
-         *     `hard` and `graceful` for ordinary groups.
-         *
-         *     **0.13.0, the planned switchover (`graceful`).** For each group, in this order: the writes of the group stop on the old primary
-         *     (new connections go elsewhere, the other sessions are ended), the distributed transactions end, the old primary stops with a fast
-         *     shutdown and releases its lease, the standby that streams from it is proven to hold everything the old primary wrote, and only then
-         *     is it promoted. A standby that is behind, or a proof that cannot be made, rolls the group back (the old primary starts again, the
-         *     writes are let in again) and the task ends `failed` with the code `standby_behind` or `switchover_unproven`; a stop of the writes
-         *     that does not succeed in two minutes ends it with `cannot_quiesce`, and prepared transactions that do not end with
-         *     `prepared_transactions_pending`. The task can be cancelled until the promotion has begun (`Task.cancellable`). Refused with 409
-         *     `group_degraded` when no standby of a group streams from its primary (or the named target does not), and with 422
-         *     `unsupported_operation` for a request that includes the map group (name the other groups in `shardGroupIds`).
-         *
-         *     **0.13.0, the map group.** The failover of the server that runs the primary of the map group (and the manager
-         *     leader) is accepted by any server that does not hear it, in mode `hard` only (`dryRun` and `graceful` answer 422
-         *     `unsupported_operation`): the server asks a server that hosts a ready standby of the map group to run the bootstrap, and
-         *     answers 202 with a Task whose `id` is 0, `state` `running` and the steps of the bootstrap, with `Location: /api/v1/failover`;
-         *     the client polls `GET /failover` (answered by that server) until `taskId` is not null, then `GET /tasks/{id}` on the new
-         *     manager leader. The old leader's rebalance is paused (`stoppedBy` `safetyRule`). The key of the certificate authority is not
-         *     copied to the new leader: the alert `certificateAuthorityUnavailable` says what the operator must do.
+         *     `hard` for ordinary groups only.
          *
          *     The task is `server.failover`, one block of steps per group (`TaskStep.shardGroupId`). A task that
          *     waits for an operator is `paused`; a repeat of this request for the same server resumes it. From the moment
@@ -970,8 +952,6 @@ export interface paths {
          * Update a database
          * @description Changes mutable settings. Owner, connection limit and durability are applied synchronously and
          *     return 200. Enabling sharding or the ledger needs background work and returns 202 with a task.
-         *     The sharding mode and `distributeNewSchemas` (0.15.0) are synchronous too: 200 with the database, or 409
-         *     `sharding_mode_in_use` when the change is refused because the other kind of distribution exists.
          *     The replica count is a cluster setting and is not accepted here (`PATCH /settings/cluster`).
          *     Sending an immutable field with a different value returns 409 (`immutable_field`). Sharding and
          *     the ledger can be turned on but never off (`422`).
@@ -996,150 +976,6 @@ export interface paths {
         get: operations["listTables"];
         put?: never;
         post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/databases/{databaseName}/schemas": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Database name. */
-                databaseName: components["parameters"]["DatabaseName"];
-            };
-            cookie?: never;
-        };
-        /**
-         * List the schemas of a database
-         * @description Added in 0.15.0 (distributed schemas). The user schemas of the database (not `pg_*`, `information_schema`, `kingres`,
-         *     `kingres_cp`, and not the schema of an extension), ordered by name, with cursor pagination. A schema that is
-         *     distributed has `distribution` (its owner shard group, its colocation group, its state); a local schema, and every
-         *     schema of a database without sharding, has `distribution: null`. `sizeBytes` is known only where the schema's tables
-         *     are held (the owner's server answers it; elsewhere it is null), and `estimatedRows` is the sum of the planner's
-         *     estimates (null when a table was never analyzed). The filters apply to the distribution: `distributed=false` lists
-         *     the local schemas, `shardGroupId` and `state` list the distributed schemas of that group or in that state.
-         */
-        get: operations["listSchemas"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/databases/{databaseName}/schemas/{schemaName}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Database name. */
-                databaseName: components["parameters"]["DatabaseName"];
-                /** @description Schema name. */
-                schemaName: components["parameters"]["SchemaName"];
-            };
-            cookie?: never;
-        };
-        /**
-         * Get a schema
-         * @description Added in 0.15.0. The summary of the schema and, for what a console needs before it offers an action:
-         *     `distributionBlockers` (the objects of the schema that `kingres.schema_inventory` marks as not supported, each with
-         *     the reason; empty when the schema can be distributed, and for a schema that is already distributed), `pinned` (why
-         *     the schema cannot move or become local: it holds a ledger table; null otherwise) and `moveInProgress` (the id of the
-         *     task that moves the schema, null when none does). The names in `distributionBlockers[].objectName` are quoted as
-         *     PostgreSQL quotes them.
-         */
-        get: operations["getSchema"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/databases/{databaseName}/schemas/{schemaName}/distribution": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Database name. */
-                databaseName: components["parameters"]["DatabaseName"];
-                /** @description Schema name. */
-                schemaName: components["parameters"]["SchemaName"];
-            };
-            cookie?: never;
-        };
-        get?: never;
-        /**
-         * Distribute a schema
-         * @description Added in 0.15.0. Makes a local schema a distributed schema: all its tables live on one shard group and
-         *     are routed there (`kingres.distribute_schema`). Needs the database to have sharding enabled and its sharding mode
-         *     to be `schema` or `both` (409 `conflict` otherwise; change the mode with `PATCH /databases/{databaseName}`).
-         *     The request is checked at once: a schema that the extension cannot distribute is refused with 422
-         *     `schema_not_distributable`, whose `errors` list the blockers (`field` is the object, `code` the reason), and a
-         *     schema that is already distributed with 409 `conflict`. Otherwise it returns a task of kind `schema.distribute`
-         *     (subject type `schema`, id `database/schema`) whose steps are `Check the schema`, `Set REPLICA IDENTITY FULL` (only
-         *     with `setReplicaIdentityFull`; skipped otherwise), `Make the schema distributed` (never run twice: a task that was
-         *     interrupted there reads the catalog and records the result, or fails with `step_interrupted` when it cannot tell)
-         *     and `Verify on every server`. A schema that has rows is distributed where its rows are (the group of the map
-         *     group's server): `shardGroupId` for another group is refused by the extension (the task fails with its
-         *     reason; distribute in place, then move). An empty schema goes to `shardGroupId`, or to the group the placement rule
-         *     chooses when it is null or omitted.
-         */
-        put: operations["distributeSchema"];
-        post?: never;
-        /**
-         * Make a distributed schema local again
-         * @description Added in 0.15.0. The schema becomes a local schema on one server (`kingres.undistribute_schema`): its tables stay
-         *     where they are, the copies on the other servers are removed. With `shardGroupId` the schema is first moved to that
-         *     group (the nested step `Move first`), so that the local schema ends up where the caller wants it; without it, or when
-         *     the schema is already there, it becomes local on the group that owns it. Returns a task of kind `schema.undistribute`
-         *     (subject type `schema`, id `database/schema`) with the steps `Check the schema`, `Move first` (skipped when it has
-         *     nothing to do), `Make the schema local` and `Verify on every server`. A schema that holds a ledger table cannot become
-         *     local (409 `schema_pinned`), a schema that is moving is refused with 409 `schema_move_in_progress`, and a schema that is
-         *     not distributed with 409 `conflict`.
-         */
-        delete: operations["undistributeSchema"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/databases/{databaseName}/schemas/{schemaName}/moves": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Database name. */
-                databaseName: components["parameters"]["DatabaseName"];
-                /** @description Schema name. */
-                schemaName: components["parameters"]["SchemaName"];
-            };
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Move a distributed schema to another shard group
-         * @description Added in 0.15.0. Moves the schema with logical replication while writers go on (`kingres.move_schema`); only
-         *     the writers of this schema wait, for the moment of the switch. Returns a task of kind `schema.move` (subject type
-         *     `schema`, id `database/schema`) with the steps `Check the move`, `Set REPLICA IDENTITY FULL` (only with
-         *     `setReplicaIdentityFull`; skipped otherwise), `Copy the data` (`itemsDone` and `itemsTotal` are bytes; the step's
-         *     `detail` names the phase), `Switch` (the writers of the schema wait; the step is shown while the phase is
-         *     `switching`) and `Clean up the old copy` (the task is `done` at the phase `cleaning` with a note: the schema is
-         *     already served by the target and the old copy is emptied after `kingres_shard.move_cleanup_delay`).
-         *     `POST /tasks/{taskId}/cancel` stops the move and leaves the schema `active` on the source while the phase is before
-         *     `switching`; after that the task is not cancellable (409 `task_not_cancellable`). Needs `kingres_ops`, like
-         *     `startRebalance`. Refused with 409 `rebalance_in_progress` while a rebalance runs, 409 `schema_move_in_progress` while
-         *     the schema is already moving, 409 `schema_pinned` for a schema that holds a ledger table, 409 `conflict` for a schema
-         *     that is not distributed or is already on the target group, and 422 `unprocessable` when a table lacks a primary key
-         *     or `REPLICA IDENTITY FULL` and `setReplicaIdentityFull` is not true (the tables are named).
-         */
-        post: operations["moveSchema"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1255,8 +1091,6 @@ export interface paths {
         /**
          * List colocation groups
          * @description Colocation groups of a sharded database. Tables in one group share one bucket map. Not paginated.
-         *     Since 0.15.0 every distributed schema has a group of kind `schema` (one bucket), so a database with
-         *     thousands of schemas has thousands of groups: a client that shows hash buckets asks for `kind=hash`.
          */
         get: operations["listColocationGroups"];
         put?: never;
@@ -3192,21 +3026,13 @@ export interface components {
          *     `server_hosts_map_group`, `last_server` (`removeServer`, `leaveCluster`), `server_group_not_empty`
          *     (`deleteServerGroup`), `ledger_entry_pending` (`createInclusionProof`).
          *
-         *     Added in 0.15.0 (distributed schemas): `sharding_mode_in_use` (409: `updateDatabase` changes the sharding mode while the
-         *     other kind of distribution exists; `detail` names what is in the way), `schema_not_distributable` (422: `distributeSchema`;
-         *     `errors` are the blockers, `field` the object and `code` the reason), `schema_pinned` (409: `moveSchema`,
-         *     `undistributeSchema` for a schema that holds a ledger table), `schema_move_in_progress` (409: `moveSchema`,
-         *     `undistributeSchema` while the schema moves, or a second move of it). A schema that is already distributed, or is not, is
-         *     the generic `conflict`; `moveSchema` answers `rebalance_in_progress` while a rebalance runs. Clients must tolerate codes
-         *     they do not know.
-         *
          *     Added in 0.11.0 (409, ledger phase 7): `ledger_not_published` (the database has no published aggregate: `getLedgerAggregate`, `anchorLedgerNow`, `createLedgerBundle`), `origin_prefix_locked` (`updateLedgerSettings`: a checkpoint exists, the prefix cannot change), `signing_key_missing` (`createLedgerSigningKey` for a rotation when no key is active; `getLedgerTrustFile` when no key exists), `last_signing_key` (`retireLedgerSigningKey`, `revokeLedgerSigningKey`: no other key is active and in force) and `chain_not_diverged` (`acknowledgeLedgerDivergence`). Clients must tolerate codes they do not know.
          *
          *     Added in 0.9.0 (409, rebalancing): `nothing_to_rebalance` (`startRebalance`: the plan is empty),
          *     `rebalance_not_running` (`stopRebalance`), `cluster_inconsistent` (`kingres.check_cluster()` reports something that
          *     makes moving buckets unsafe), `version_mismatch` (the servers do not run the same version of the sharding
          *     extension and the same PostgreSQL major), `failover_in_progress`, `no_receiving_server` (no server should hold
-         *     shards). `insufficient_disk` is reserved for a later increment and `group_degraded` is used by `failoverServer` in mode `graceful` since 0.13.0 (a move that meets them is
+         *     shards). `group_degraded` and `insufficient_disk` are reserved for later increments (a move that meets them is
          *     skipped and reported, not refused). `leader_unavailable` (503) names, in `serverIds`, servers that can be opened
          *     instead. Clients must tolerate codes they do not know.
          *
@@ -3233,7 +3059,7 @@ export interface components {
          *     system database was stopped on purpose; start it with `startThisServerInstance`).
          * @enum {string}
          */
-        ProblemCode: "bad_request" | "validation_failed" | "unauthenticated" | "invalid_credentials" | "session_expired" | "csrf_token_invalid" | "forbidden" | "setup_token_invalid" | "not_found" | "method_not_allowed" | "conflict" | "already_exists" | "immutable_field" | "rebalance_in_progress" | "operation_in_progress" | "task_not_cancellable" | "last_admin" | "role_in_use" | "optimistic_lock_failed" | "no_replica_available" | "instance_already_running" | "instance_already_stopped" | "server_owns_buckets" | "server_hosts_map_group" | "last_server" | "server_group_not_empty" | "ledger_entry_pending" | "quorum_unavailable" | "system_database_stopped" | "unprocessable" | "sql_error" | "unsupported_operation" | "node_state_invalid" | "node_uninitialized" | "map_group_unavailable" | "leader_unavailable" | "rate_limited" | "service_unavailable" | "internal_error" | "certificate_revoked" | "certificate_authority_unavailable" | "internal_api_disabled" | "workbench_busy" | "config_parameter_unknown" | "config_parameter_managed" | "config_parameter_refused" | "config_level_not_allowed" | "config_value_below_floor" | "config_change_superseded" | "config_restart_order_conflict" | "nothing_pending" | "nothing_to_rebalance" | "rebalance_not_running" | "cluster_inconsistent" | "version_mismatch" | "failover_in_progress" | "group_degraded" | "insufficient_disk" | "no_receiving_server" | "failover_needs_decision" | "lease_settings_differ" | "ledger_not_published" | "origin_prefix_locked" | "signing_key_missing" | "last_signing_key" | "chain_not_diverged" | "sharding_mode_in_use" | "schema_not_distributable" | "schema_pinned" | "schema_move_in_progress";
+        ProblemCode: "bad_request" | "validation_failed" | "unauthenticated" | "invalid_credentials" | "session_expired" | "csrf_token_invalid" | "forbidden" | "setup_token_invalid" | "not_found" | "method_not_allowed" | "conflict" | "already_exists" | "immutable_field" | "rebalance_in_progress" | "operation_in_progress" | "task_not_cancellable" | "last_admin" | "role_in_use" | "optimistic_lock_failed" | "no_replica_available" | "instance_already_running" | "instance_already_stopped" | "server_owns_buckets" | "server_hosts_map_group" | "last_server" | "server_group_not_empty" | "ledger_entry_pending" | "quorum_unavailable" | "system_database_stopped" | "unprocessable" | "sql_error" | "unsupported_operation" | "node_state_invalid" | "node_uninitialized" | "map_group_unavailable" | "leader_unavailable" | "rate_limited" | "service_unavailable" | "internal_error" | "certificate_revoked" | "certificate_authority_unavailable" | "internal_api_disabled" | "workbench_busy" | "config_parameter_unknown" | "config_parameter_managed" | "config_parameter_refused" | "config_level_not_allowed" | "config_value_below_floor" | "config_change_superseded" | "config_restart_order_conflict" | "nothing_pending" | "nothing_to_rebalance" | "rebalance_not_running" | "cluster_inconsistent" | "version_mismatch" | "failover_in_progress" | "group_degraded" | "insufficient_disk" | "no_receiving_server" | "failover_needs_decision" | "lease_settings_differ" | "ledger_not_published" | "origin_prefix_locked" | "signing_key_missing" | "last_signing_key" | "chain_not_diverged";
         /** @description One invalid field of a request. */
         ValidationIssue: {
             /** @description JSON Pointer (RFC 6901) to the invalid property of the request body, or the name of the invalid query or path parameter. */
@@ -4497,17 +4323,10 @@ export interface components {
         ShardingSettings: {
             /** @description Whether tables of this database can be distributed. Can be turned on later, never off. */
             enabled: boolean;
-            /** @description Number of hash buckets per colocation group. Fixed at creation (immutable). Null when not available, and (0.15.0) null in the mode `schema`, which has no hash buckets. */
+            /** @description Number of hash buckets per colocation group. Fixed at creation (immutable). Null when not available. */
             bucketCount: number | null;
-            /**
-             * @description Added in 0.15.0, optional (a server before 0.15.0 does not send it; read it as `row`). `row`: hash-distributed tables only (every database before 0.15.0); `schema`: distributed schemas and reference tables; `both`. Read from the database's `kingres.sharding_settings`; `row` for a database whose extension is older than kingres_shard 0.8. Clients must tolerate values they do not know.
-             * @enum {string}
-             */
-            mode?: "row" | "schema" | "both";
-            /** @description Added in 0.15.0, optional. Whether a schema created in this database is distributed by default; only true in the mode `schema` or `both`. */
-            distributeNewSchemas?: boolean;
         };
-        /** @description Sharding settings of a create request. A group that is present must have `enabled`; `bucketCount` is required except in the mode `schema` (0.15.0). */
+        /** @description Sharding settings of a create request. A group that is present must be complete. */
         ShardingCreateSettings: {
             /**
              * @description Whether tables of this database can be distributed. Can be turned on later, never off.
@@ -4515,21 +4334,10 @@ export interface components {
              */
             enabled: boolean;
             /**
-             * @description Number of hash buckets per colocation group, 1 to 4096, default 128. Fixed at creation (immutable). In the mode `schema` (0.15.0) it is optional and ignored; a client that still sends it is accepted.
+             * @description Number of hash buckets per colocation group, 1 to 4096, default 128. Fixed at creation (immutable).
              * @default 128
              */
-            bucketCount?: number;
-            /**
-             * @description Added in 0.15.0. The sharding mode: `row` (hash-distributed tables; the default, what every database had before), `schema` (distributed schemas and reference tables) or `both`. Needs sharding to be enabled and kingres_shard 0.8. It can be changed later with `PATCH /databases/{databaseName}`.
-             * @default row
-             * @enum {string}
-             */
-            mode?: "row" | "schema" | "both";
-            /**
-             * @description Added in 0.15.0. Distribute a schema that is created in the database by default. True only with the mode `schema` or `both` (422 `validation_failed` otherwise). The console offers true for `schema` and false for `both`.
-             * @default false
-             */
-            distributeNewSchemas?: boolean;
+            bucketCount: number;
         };
         /** @description Replication settings as read back (response only; the create request uses `ReplicationCreateSettings`). */
         ReplicationSettings: {
@@ -4575,8 +4383,6 @@ export interface components {
             activeConnections: number | null;
             /** @description Committed transactions per second (recent average); null when not available. */
             transactionsPerSecond: number | null;
-            /** @description Added in 0.15.0, optional. Number of distributed schemas; null when not available, and 0 for a database without sharding or in the mode `row`. */
-            distributedSchemaCount?: number | null;
         };
         /** @description Replication health of a database. Null counters mean "not available" (no bucket map yet), never 0. */
         DatabaseHealth: {
@@ -4648,24 +4454,13 @@ export interface components {
                 /** @description New connection limit; -1 is unlimited. */
                 connectionLimit?: number;
             };
-            /** @description Sharding changes. Since 0.15.0 `enabled` is optional (at least one property). */
+            /** @description Sharding changes. */
             sharding?: {
                 /**
                  * @description Turn sharding on. Turning it off is not possible.
                  * @enum {boolean}
                  */
-                enabled?: true;
-                /**
-                 * @description Added in 0.15.0. The sharding mode (`kingres.set_sharding_mode`, atomic on every node, synchronous: 200).
-                 *     `row` to `both` and `schema` to `both` are always allowed. `both` to `row` is refused while a distributed
-                 *     schema exists, `both` to `schema` while a hash-distributed table exists, and `row` to `schema` and `schema`
-                 *     to `row` while the other kind exists: 409 `sharding_mode_in_use`, whose `detail` names what is in the way.
-                 *     A database whose extension is older than kingres_shard 0.8 answers 422 `unsupported_operation`.
-                 * @enum {string}
-                 */
-                mode?: "row" | "schema" | "both";
-                /** @description Added in 0.15.0. Distribute a schema created in the database by default. True needs the mode `schema` or `both` (the new one, when `mode` is sent too); when omitted it keeps its value, except that it becomes false in a mode that does not allow it. */
-                distributeNewSchemas?: boolean;
+                enabled: true;
             };
             /** @description Replication changes. */
             replication?: {
@@ -4712,16 +4507,6 @@ export interface components {
             defaultDurability: components["schemas"]["Durability"];
             /** @description Automatic digest interval of the ledger; default 3600, range 60 to 86400. */
             ledgerDigestIntervalSeconds: components["schemas"]["IntegerRange"];
-            /** @description Added in 0.15.0, optional. The sharding modes that `sharding.mode` accepts at creation and which one is used when it is omitted. */
-            shardingModes?: {
-                /** @description The three modes, in the order a dialog shows them. */
-                modes: ("row" | "schema" | "both")[];
-                /**
-                 * @description The mode of a database created without `sharding.mode`.
-                 * @enum {string}
-                 */
-                default: "row" | "schema" | "both";
-            };
         };
         /**
          * @description A table has one or more classes. `plain` is a normal table on its home shard group; `distributed` is
@@ -4735,10 +4520,10 @@ export interface components {
         /** @description How a distributed or reference table is spread over shard groups. */
         TableDistribution: {
             /**
-             * @description `hash` distributes rows by hash of the column; `reference` copies the table to every group; `schema` (0.15.0) is a table of a distributed schema: `column` is null, `bucketCount` is 1, `colocationId` is the schema's group, and the table is on one shard group (`Table.homeShardGroupId`). Clients must tolerate methods they do not know.
+             * @description `hash` distributes rows by hash of the column; `reference` copies the table to every group.
              * @enum {string}
              */
-            method: "hash" | "reference" | "schema";
+            method: "hash" | "reference";
             /** @description Distribution column; null for reference tables. */
             column: string | null;
             /**
@@ -4773,7 +4558,7 @@ export interface components {
             ledger: components["schemas"]["TableLedger"] | null;
             /**
              * Format: int32
-             * @description Shard group (`group_id`; 0 is the map group, the default home) holding a plain table; null for hash-distributed and reference tables. Since 0.15.0 it is the owner group of the schema for a table of a distributed schema (method `schema`).
+             * @description Shard group (`group_id`; 0 is the map group, the default home) holding a plain table; null for distributed and reference tables.
              */
             homeShardGroupId: number | null;
             /**
@@ -4850,133 +4635,22 @@ export interface components {
             /** @description Existing distributed table whose colocation group to join; null creates or reuses a group by column type. */
             colocateWith?: components["schemas"]["TableRef"] | null;
         };
-        /** @description Added in 0.15.0. Where a distributed schema lives. */
-        SchemaDistribution: {
-            /**
-             * @description `moving` while a move of the schema is between its start and its switch (writers still go to the owner).
-             * @enum {string}
-             */
-            state: "active" | "moving";
-            /**
-             * Format: int32
-             * @description The colocation group of kind `schema` that holds the schema's one bucket.
-             */
-            colocationId: number;
-            /**
-             * Format: int32
-             * @description The shard group that owns the schema.
-             */
-            shardGroupId: number;
-            /** @description The server that runs the primary of the owner group; null while the group has no primary. */
-            serverId: components["schemas"]["ServerId"] | null;
-            /**
-             * Format: int32
-             * @description The target group of the running move; null when none runs.
-             */
-            movingToShardGroupId: number | null;
-        };
-        /** @description Added in 0.15.0. A schema of a database and, when it is distributed, where it lives. */
-        SchemaSummary: {
-            /** @description Schema name. */
-            name: string;
-            /** @description Owner role. */
-            owner: string;
-            /** @description Null for a local schema and for every schema of a database without sharding. */
-            distribution: components["schemas"]["SchemaDistribution"] | null;
-            /** @description Tables of the schema (partitions are not counted). */
-            tableCount: number;
-            /**
-             * Format: int64
-             * @description Size of the schema's tables, indexes and TOAST; null when the server that answers does not hold them.
-             */
-            sizeBytes: number | null;
-            /**
-             * Format: int64
-             * @description Sum of the planner's row estimates; null when a table has never been analyzed or its data is on another server.
-             */
-            estimatedRows: number | null;
-        };
-        /** @description Added in 0.15.0. An object that keeps a schema from being distributed. */
-        SchemaBlocker: {
-            /** @description The kind of the object as `kingres.schema_inventory` names it, for example `table`, `view`, `foreign key`. Clients must tolerate kinds they do not know. */
-            objectKind: string;
-            /** @description The object, quoted as PostgreSQL quotes it. */
-            objectName: string;
-            /** @description Why the object is not supported. */
-            reason: string;
-        };
-        /** @description Added in 0.15.0. Why a schema cannot move or become local. */
-        SchemaPinned: {
-            /** @description The reason, for example that the schema holds a ledger table (the ledger of a table is kept per node). */
-            reason: string;
-        };
-        /** @description Added in 0.15.0. A schema with what a console needs before it offers an action. */
-        SchemaDetail: components["schemas"]["SchemaSummary"] & {
-            /** @description The objects that keep the schema from being distributed; empty when it can be, and for a schema that is distributed. */
-            distributionBlockers: components["schemas"]["SchemaBlocker"][];
-            /** @description Why the schema cannot move or become local; null when it can. */
-            pinned: components["schemas"]["SchemaPinned"] | null;
-            /**
-             * Format: int64
-             * @description The id of the unfinished task `schema.move` (or `schema.undistribute`) of this schema; null when none.
-             */
-            moveInProgress: number | null;
-        };
-        /** @description Added in 0.15.0. A page of schemas. */
-        SchemaPage: {
-            /** @description The schemas. */
-            items: components["schemas"]["SchemaSummary"][];
-            nextCursor: components["schemas"]["NextCursor"];
-        };
-        /** @description Added in 0.15.0. How to distribute a schema. Every property is optional; the body may be omitted. */
-        DistributeSchemaRequest: {
-            /**
-             * Format: int32
-             * @description The shard group that should own the schema; null or omitted lets the placement rule choose. A schema that has rows stays where its rows are.
-             */
-            shardGroupId?: number | null;
-            /**
-             * @description Run `ALTER TABLE ... REPLICA IDENTITY FULL` on every table of the schema that has no primary key, so that the schema can be moved later. A change of the user's tables, so it is only done on request.
-             * @default false
-             */
-            setReplicaIdentityFull?: boolean;
-        };
-        /** @description Added in 0.15.0. Where to move a distributed schema. */
-        MoveSchemaRequest: {
-            /**
-             * Format: int32
-             * @description The shard group that should own the schema afterwards. It must be a group whose primary should hold shards.
-             */
-            targetShardGroupId: number;
-            /**
-             * @description Run `ALTER TABLE ... REPLICA IDENTITY FULL` (propagated) on every table of the schema that has neither a primary key nor a full replica identity, before the move. A change of the user's tables, so it is only done on request.
-             * @default false
-             */
-            setReplicaIdentityFull?: boolean;
-        };
         /**
          * @description `active` normal; `moving` being copied to another group; `orphan` left-over shard awaiting deferred cleanup.
          * @enum {string}
          */
         BucketState: "active" | "moving" | "orphan";
-        /** @description Tables that share one bucket map. Since 0.15.0 a group is of kind `hash` or `schema` (the one bucket of a distributed schema). */
+        /** @description Tables that share one bucket map. */
         ColocationGroup: {
             /**
              * Format: int32
              * @description Colocation group identifier.
              */
             colocationId: number;
-            /**
-             * @description Added in 0.15.0, optional (read a missing `kind` as `hash`). `schema` is the group of one distributed schema, with one bucket (`bucketCount` 1). Clients must tolerate kinds they do not know.
-             * @enum {string}
-             */
-            kind?: "hash" | "schema";
-            /** @description Added in 0.15.0, optional. The distributed schema of a group of kind `schema`; null for a group of kind `hash`. */
-            schemaName?: string | null;
             /** @description Number of buckets. */
             bucketCount: number;
-            /** @description PostgreSQL type of the distribution column; null (0.15.0) for a group of kind `schema`, which has no distribution column. */
-            distributionColumnType: string | null;
+            /** @description PostgreSQL type of the distribution column. */
+            distributionColumnType: string;
             /** @description Tables in the group. */
             tableCount: number;
             /**
@@ -5043,8 +4717,6 @@ export interface components {
              * @description Bytes of replica copies; null when bucket sizes are not available.
              */
             replicaSizeBytes: number | null;
-            /** @description Added in 0.15.0, optional. Distributed schemas (each is one bucket of a colocation group of kind `schema`) whose primary copy is here; they are also counted in `primaryBuckets`. */
-            primarySchemas?: number;
         };
         /** @description Bucket counts and sizes per server. */
         BucketDistribution: {
@@ -5250,15 +4922,8 @@ export interface components {
             /** @description Conditions the operator should know about, for example tables without a replica identity. */
             warnings: string[];
         };
-        /** @description A bucket move in flight. Since 0.15.0 it can also be the move of a distributed schema (`kind` `schema`; its `bucket` is 0). */
+        /** @description A bucket move in flight. */
         BucketMove: {
-            /**
-             * @description Added in 0.15.0, optional (read a missing `kind` as `hash`). `schema` is the move of a distributed schema.
-             * @enum {string}
-             */
-            kind?: "hash" | "schema";
-            /** @description Added in 0.15.0, optional. The schema that moves, for `kind` `schema`; null for a bucket of a hash group. */
-            schemaName?: string | null;
             /** @description Database. */
             databaseName: string;
             /**
@@ -5469,10 +5134,10 @@ export interface components {
         TaskState: "pending" | "running" | "paused" | "failed" | "done";
         /**
          * @description Kind of task. Each kind has one fixed `subject.type`; the table is in the README
-         *     (section "Task kinds and subjects"). `standby.reconcile` is added in 0.7.0; the `ledger.key.*`, `ledger.bundle.create`, `ledger.epoch.start` and `ledger.upgrade` kinds in 0.11.0; `schema.distribute`, `schema.move` and `schema.undistribute` (subject type `schema`) in 0.15.0.
+         *     (section "Task kinds and subjects"). `standby.reconcile` is added in 0.7.0; the `ledger.key.*`, `ledger.bundle.create`, `ledger.epoch.start` and `ledger.upgrade` kinds in 0.11.0.
          * @enum {string}
          */
-        TaskKind: "cluster.init" | "cluster.join" | "server.add" | "server.remove" | "server.failover" | "server.leave" | "instance.start" | "instance.stop" | "instance.restart" | "database.create" | "database.update" | "database.drop" | "table.distribute" | "rebalance" | "replication.restorePreferredPrimaries" | "ledger.verify" | "networkAccess.apply" | "replicate.apply" | "certificate.renew" | "certificate.revoke" | "standby.reconcile" | "config.apply" | "config.restart" | "ledger.key.create" | "ledger.key.rotate" | "ledger.key.retire" | "ledger.key.revoke" | "ledger.key.distribute" | "ledger.bundle.create" | "ledger.epoch.start" | "ledger.upgrade" | "schema.distribute" | "schema.move" | "schema.undistribute";
+        TaskKind: "cluster.init" | "cluster.join" | "server.add" | "server.remove" | "server.failover" | "server.leave" | "instance.start" | "instance.stop" | "instance.restart" | "database.create" | "database.update" | "database.drop" | "table.distribute" | "rebalance" | "replication.restorePreferredPrimaries" | "ledger.verify" | "networkAccess.apply" | "replicate.apply" | "certificate.renew" | "certificate.revoke" | "standby.reconcile" | "config.apply" | "config.restart" | "ledger.key.create" | "ledger.key.rotate" | "ledger.key.retire" | "ledger.key.revoke" | "ledger.key.distribute" | "ledger.bundle.create" | "ledger.epoch.start" | "ledger.upgrade";
         /** @description One step of a task. */
         TaskStep: {
             /** @description Step name. */
@@ -5530,10 +5195,10 @@ export interface components {
              * @description Resource type.
              * @enum {string}
              */
-            type: "cluster" | "server" | "instance" | "database" | "table" | "rebalance" | "replication" | "ledgerVerification" | "networkAccess" | "config" | "ledgerKey" | "schema";
+            type: "cluster" | "server" | "instance" | "database" | "table" | "rebalance" | "replication" | "ledgerVerification" | "networkAccess" | "config" | "ledgerKey";
             /**
              * @description Resource identifier: database name; server id (`ServerId`); instance id (`node_id`) as a decimal
-             *     string; `database/schema.table` for a table; `database/schema` for a schema (type `schema`, 0.15.0); the verification id; the task id for a rebalance;
+             *     string; `database/schema.table` for a table; the verification id; the task id for a rebalance;
              *     the literal `cluster`, `preferred-primaries`, `network-access` or (0.11.0, type `ledgerKey`) `signing` for the singleton subjects.
              *     See the README table "Task kinds and subjects".
              */
@@ -5543,7 +5208,7 @@ export interface components {
         Task: {
             /**
              * Format: int64
-             * @description Task identifier (`task_id` in `kingres.task`). From 0.13.0 the id is 0 for the task that stands for the bootstrap of a map group failover while no task can be recorded (the system database is not writable yet); `GET /tasks/0` on the server that runs the bootstrap answers it, and `GET /failover` names the recorded task (`taskId`) once it exists. Id 0 never names a stored task.
+             * @description Task identifier (`task_id` in `kingres.task`).
              */
             id: number;
             /**
@@ -5828,7 +5493,7 @@ export interface components {
          *     `failure`. Read-only operations are not audited except `executeQuery`.
          * @enum {string}
          */
-        AuditAction: "login" | "logout" | "loginFailed" | "setupTokenRejected" | "initCluster" | "joinCluster" | "updateThisServerSettings" | "restartThisServerInstance" | "stopThisServerInstance" | "startThisServerInstance" | "leaveCluster" | "addServer" | "updateServer" | "removeServer" | "failoverServer" | "autoFailover" | "createServerGroup" | "deleteServerGroup" | "createDatabase" | "updateDatabase" | "dropDatabase" | "distributeTable" | "distributeSchema" | "undistributeSchema" | "moveSchema" | "enableTableLedger" | "restorePreferredPrimaries" | "startRebalance" | "stopRebalance" | "cancelTask" | "createRole" | "updateRole" | "deleteRole" | "setRoleMemberships" | "setRoleClusterRoles" | "createGrant" | "revokeGrants" | "applyGrantTemplate" | "replaceNetworkAccess" | "updateClusterSettings" | "generateLedgerDigest" | "startLedgerVerification" | "executeQuery" | "acknowledgeAlert" | "renewServerCertificates" | "revokeServerCertificates" | "certificateRenewed" | "certificateRenewalFailed" | "cancelStatement" | "leaseLost" | "leaseFenced" | "leaseAcquired" | "standbyCreated" | "standbyRemoved" | "standbyRebuilt" | "standbyInstanceStarted" | "standbyInstanceRemoved" | "standbyInstanceRebuilt" | "synchronousStandbyNamesChanged" | "replicationSlotDropped" | "applyConfigChange" | "revertConfigChange" | "restartPendingInstances" | "resetAutoFailoverCounter" | "failoverGroupStarted" | "failoverGroupPromoted" | "failoverGroupFailed" | "oldPrimaryRebuilt" | "updateLedgerSettings" | "createLedgerSigningKey" | "retireLedgerSigningKey" | "revokeLedgerSigningKey" | "createLedgerAnchorTarget" | "updateLedgerAnchorTarget" | "deleteLedgerAnchorTarget" | "testLedgerAnchorTarget" | "anchorLedgerNow" | "retryLedgerAnchor" | "createLedgerBundle" | "registerLedgerClientKey" | "revokeLedgerClientKey" | "setTableSignaturePolicy" | "upgradeLedgerExtension" | "acknowledgeLedgerDivergence";
+        AuditAction: "login" | "logout" | "loginFailed" | "setupTokenRejected" | "initCluster" | "joinCluster" | "updateThisServerSettings" | "restartThisServerInstance" | "stopThisServerInstance" | "startThisServerInstance" | "leaveCluster" | "addServer" | "updateServer" | "removeServer" | "failoverServer" | "autoFailover" | "createServerGroup" | "deleteServerGroup" | "createDatabase" | "updateDatabase" | "dropDatabase" | "distributeTable" | "enableTableLedger" | "restorePreferredPrimaries" | "startRebalance" | "stopRebalance" | "cancelTask" | "createRole" | "updateRole" | "deleteRole" | "setRoleMemberships" | "setRoleClusterRoles" | "createGrant" | "revokeGrants" | "applyGrantTemplate" | "replaceNetworkAccess" | "updateClusterSettings" | "generateLedgerDigest" | "startLedgerVerification" | "executeQuery" | "acknowledgeAlert" | "renewServerCertificates" | "revokeServerCertificates" | "certificateRenewed" | "certificateRenewalFailed" | "cancelStatement" | "leaseLost" | "leaseFenced" | "leaseAcquired" | "standbyCreated" | "standbyRemoved" | "standbyRebuilt" | "standbyInstanceStarted" | "standbyInstanceRemoved" | "standbyInstanceRebuilt" | "synchronousStandbyNamesChanged" | "replicationSlotDropped" | "applyConfigChange" | "revertConfigChange" | "restartPendingInstances" | "resetAutoFailoverCounter" | "failoverGroupStarted" | "failoverGroupPromoted" | "failoverGroupFailed" | "oldPrimaryRebuilt" | "updateLedgerSettings" | "createLedgerSigningKey" | "retireLedgerSigningKey" | "revokeLedgerSigningKey" | "createLedgerAnchorTarget" | "updateLedgerAnchorTarget" | "deleteLedgerAnchorTarget" | "testLedgerAnchorTarget" | "anchorLedgerNow" | "retryLedgerAnchor" | "createLedgerBundle" | "registerLedgerClientKey" | "revokeLedgerClientKey" | "setTableSignaturePolicy" | "upgradeLedgerExtension" | "acknowledgeLedgerDivergence";
         /** @description One audit log entry. */
         AuditEvent: {
             /**
@@ -7427,7 +7092,7 @@ export interface components {
             confirm: string;
         };
         /**
-         * @description Alert type. Clients must tolerate kinds they do not know. Added in 0.13.0: `certificateAuthorityUnavailable` (the map group was failed over and the new manager leader holds no key of the certificate authority, so no certificate can be issued, renewed or revoked until the operator restores `pki/ca.key` and `pki/revoked.json` from the backup of the old leader; subject `cluster`; `critical`). Added in 0.11.0 (ledger phase 7; subjects at `AlertSubject`): `ledgerNotAnchored` (a database has ledger tables and no anchor target is enabled; `info`, `warning` when the setting `anchor.required` is on), `ledgerAnchorBehind` (`warning`, `critical`), `ledgerAnchorFailed` (an anchor record is `failed` or `expired`; `critical`), `ledgerAnchorConflict` (the store holds a different object under the name of an anchor; `critical`), `ledgerChainDiverged` (a chain no longer extends its published log; `critical`), `ledgerGroupUnread` (a shard group's chain could not be read; `warning`, `critical`), `ledgerPublicationBehind` (the newest signed checkpoint of a chain is older than five publication intervals while its head advanced; `warning`), `ledgerSignerUnavailable` (no checkpoint could be signed for two rounds, or the key set is damaged, or the key file is missing on the leader; `critical`) and `ledgerDigestOverdue` (no digest within twice `digestIntervalSeconds`; `warning`). Added in 0.8.0: `clockDifference` (a server's clock differs from the manager leader's by more than `ClusterSettings.clock.maxDifferenceMs`, less the uncertainty of the measurement; `warning`, `critical` at ten times the threshold; `kingresd` does not set the system clock, run NTP or chrony). Added in 0.7.0: `leaseLost` (the `kingresd` that
+         * @description Alert type. Clients must tolerate kinds they do not know. Added in 0.11.0 (ledger phase 7; subjects at `AlertSubject`): `ledgerNotAnchored` (a database has ledger tables and no anchor target is enabled; `info`, `warning` when the setting `anchor.required` is on), `ledgerAnchorBehind` (`warning`, `critical`), `ledgerAnchorFailed` (an anchor record is `failed` or `expired`; `critical`), `ledgerAnchorConflict` (the store holds a different object under the name of an anchor; `critical`), `ledgerChainDiverged` (a chain no longer extends its published log; `critical`), `ledgerGroupUnread` (a shard group's chain could not be read; `warning`, `critical`), `ledgerPublicationBehind` (the newest signed checkpoint of a chain is older than five publication intervals while its head advanced; `warning`), `ledgerSignerUnavailable` (no checkpoint could be signed for two rounds, or the key set is damaged, or the key file is missing on the leader; `critical`) and `ledgerDigestOverdue` (no digest within twice `digestIntervalSeconds`; `warning`). Added in 0.8.0: `clockDifference` (a server's clock differs from the manager leader's by more than `ClusterSettings.clock.maxDifferenceMs`, less the uncertainty of the measurement; `warning`, `critical` at ten times the threshold; `kingresd` does not set the system clock, run NTP or chrony). Added in 0.7.0: `leaseLost` (the `kingresd` that
          *     runs the primary of a shard group could not renew the group's lease in time; for a group with a standby the
          *     instance was stopped (fenced), for a group without one it keeps running and this alert is the only effect;
          *     `critical`), `groupWithoutSynchronousStandby` (the group's standby has been unreachable for longer than the
@@ -7441,7 +7106,7 @@ export interface components {
          *     `server:<leader>|behind:<server>`, `warning` after a minute, `critical` after ten).
          * @enum {string}
          */
-        AlertKind: "serverDown" | "serverSuspect" | "underReplicatedBuckets" | "unavailableBuckets" | "replicationLagHigh" | "diskSpaceLow" | "memoryPressure" | "rebalanceNeeded" | "autoFailoverTriggered" | "autoFailoverLimitReached" | "mapGroupUnavailable" | "ledgerVerificationFailed" | "ledgerPendingTooOld" | "versionMismatch" | "certificateExpiring" | "certificateRenewalFailed" | "replicationPending" | "taskFailed" | "leaseLost" | "groupWithoutSynchronousStandby" | "groupUnderReplicated" | "clockDifference" | "failoverNeedsDecision" | "failoverBlocked" | "failoverDataLoss" | "splitPromotion" | "oldPrimaryRunning" | "oldPrimaryNotStopped" | "oldPrimaryNotRebuilt" | "ledgerNotAnchored" | "ledgerAnchorBehind" | "ledgerAnchorFailed" | "ledgerAnchorConflict" | "ledgerChainDiverged" | "ledgerGroupUnread" | "ledgerPublicationBehind" | "ledgerSignerUnavailable" | "ledgerDigestOverdue" | "certificateAuthorityUnavailable";
+        AlertKind: "serverDown" | "serverSuspect" | "underReplicatedBuckets" | "unavailableBuckets" | "replicationLagHigh" | "diskSpaceLow" | "memoryPressure" | "rebalanceNeeded" | "autoFailoverTriggered" | "autoFailoverLimitReached" | "mapGroupUnavailable" | "ledgerVerificationFailed" | "ledgerPendingTooOld" | "versionMismatch" | "certificateExpiring" | "certificateRenewalFailed" | "replicationPending" | "taskFailed" | "leaseLost" | "groupWithoutSynchronousStandby" | "groupUnderReplicated" | "clockDifference" | "failoverNeedsDecision" | "failoverBlocked" | "failoverDataLoss" | "splitPromotion" | "oldPrimaryRunning" | "oldPrimaryNotStopped" | "oldPrimaryNotRebuilt" | "ledgerNotAnchored" | "ledgerAnchorBehind" | "ledgerAnchorFailed" | "ledgerAnchorConflict" | "ledgerChainDiverged" | "ledgerGroupUnread" | "ledgerPublicationBehind" | "ledgerSignerUnavailable" | "ledgerDigestOverdue";
         /** @description An alert. */
         Alert: {
             /**
@@ -7641,7 +7306,7 @@ export interface components {
          *     `last_admin`, `role_in_use`, `optimistic_lock_failed`, `no_replica_available`,
          *     `instance_already_running`, `instance_already_stopped`, `server_owns_buckets`,
          *     `server_hosts_map_group`, `last_server`, `server_group_not_empty`, `ledger_entry_pending`,
-         *     `certificate_revoked`, and since 0.15.0 `sharding_mode_in_use`, `schema_pinned` and `schema_move_in_progress` (each operation's description says which of them it can answer). Nothing was changed.
+         *     `certificate_revoked` (each operation's description says which of them it can answer). Nothing was changed.
          */
         Conflict: {
             headers: {
@@ -8850,164 +8515,6 @@ export interface operations {
             503: components["responses"]["ServiceUnavailable"];
         };
     };
-    listSchemas: {
-        parameters: {
-            query?: {
-                /** @description Maximum number of items to return. */
-                limit?: components["parameters"]["Limit"];
-                /** @description Opaque cursor taken from `nextCursor` of the previous page. Omit for the first page. */
-                cursor?: components["parameters"]["Cursor"];
-                /** @description `true` lists only distributed schemas, `false` only local ones. */
-                distributed?: boolean;
-                /** @description Only the distributed schemas that this shard group owns. */
-                shardGroupId?: number;
-                /** @description Only the distributed schemas in this state. */
-                state?: "active" | "moving";
-            };
-            header?: never;
-            path: {
-                /** @description Database name. */
-                databaseName: components["parameters"]["DatabaseName"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description A page of schemas. */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["SchemaPage"];
-                };
-            };
-            400: components["responses"]["BadRequest"];
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            404: components["responses"]["NotFound"];
-            405: components["responses"]["MethodNotAllowed"];
-            422: components["responses"]["UnprocessableEntity"];
-            503: components["responses"]["ServiceUnavailable"];
-        };
-    };
-    getSchema: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Database name. */
-                databaseName: components["parameters"]["DatabaseName"];
-                /** @description Schema name. */
-                schemaName: components["parameters"]["SchemaName"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description The schema. */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["SchemaDetail"];
-                };
-            };
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            404: components["responses"]["NotFound"];
-            405: components["responses"]["MethodNotAllowed"];
-            422: components["responses"]["UnprocessableEntity"];
-            503: components["responses"]["ServiceUnavailable"];
-        };
-    };
-    distributeSchema: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Database name. */
-                databaseName: components["parameters"]["DatabaseName"];
-                /** @description Schema name. */
-                schemaName: components["parameters"]["SchemaName"];
-            };
-            cookie?: never;
-        };
-        requestBody?: {
-            content: {
-                "application/json": components["schemas"]["DistributeSchemaRequest"];
-            };
-        };
-        responses: {
-            202: components["responses"]["AcceptedTask"];
-            400: components["responses"]["BadRequest"];
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            404: components["responses"]["NotFound"];
-            405: components["responses"]["MethodNotAllowed"];
-            409: components["responses"]["Conflict"];
-            422: components["responses"]["UnprocessableEntity"];
-            503: components["responses"]["ServiceUnavailable"];
-        };
-    };
-    undistributeSchema: {
-        parameters: {
-            query?: {
-                /** @description Move the schema to this shard group before it becomes local. */
-                shardGroupId?: number;
-            };
-            header?: never;
-            path: {
-                /** @description Database name. */
-                databaseName: components["parameters"]["DatabaseName"];
-                /** @description Schema name. */
-                schemaName: components["parameters"]["SchemaName"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            202: components["responses"]["AcceptedTask"];
-            400: components["responses"]["BadRequest"];
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            404: components["responses"]["NotFound"];
-            405: components["responses"]["MethodNotAllowed"];
-            409: components["responses"]["Conflict"];
-            422: components["responses"]["UnprocessableEntity"];
-            503: components["responses"]["ServiceUnavailable"];
-        };
-    };
-    moveSchema: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Database name. */
-                databaseName: components["parameters"]["DatabaseName"];
-                /** @description Schema name. */
-                schemaName: components["parameters"]["SchemaName"];
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["MoveSchemaRequest"];
-            };
-        };
-        responses: {
-            202: components["responses"]["AcceptedTask"];
-            400: components["responses"]["BadRequest"];
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            404: components["responses"]["NotFound"];
-            405: components["responses"]["MethodNotAllowed"];
-            409: components["responses"]["Conflict"];
-            422: components["responses"]["UnprocessableEntity"];
-            503: components["responses"]["ServiceUnavailable"];
-        };
-    };
     getTable: {
         parameters: {
             query?: never;
@@ -9113,10 +8620,7 @@ export interface operations {
     };
     listColocationGroups: {
         parameters: {
-            query?: {
-                /** @description Added in 0.15.0. Only the groups of this kind. */
-                kind?: "hash" | "schema";
-            };
+            query?: never;
             header?: never;
             path: {
                 /** @description Database name. */
@@ -9135,7 +8639,6 @@ export interface operations {
                     "application/json": components["schemas"]["ColocationGroupList"];
                 };
             };
-            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];

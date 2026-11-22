@@ -11,14 +11,11 @@ import PageHeader from '@/components/PageHeader.vue'
 import QueryBoundary from '@/components/QueryBoundary.vue'
 import BucketGrid from '@/components/BucketGrid.vue'
 import NullableValue from '@/components/NullableValue.vue'
-import SafeName from '@/components/SafeName.vue'
 import {
   useAllBuckets,
   useBucketDistribution,
   useColocationGroups,
   useDatabases,
-  useRebalanceStatus,
-  useSchemas,
   useServers,
 } from '@/api/queries'
 import { formatBytes, formatNumber } from '@/lib/format'
@@ -41,16 +38,13 @@ const selected = ref<Bucket | null>(null)
 watch(
   sharded,
   (list) => {
-    // The list is empty until it has been read: a database named in the address (`?db=`) must survive that.
-    if (list.length === 0) return
     if (!dbName.value || !list.some((d) => d.name === dbName.value))
       dbName.value = list[0]?.name ?? ''
   },
   { immediate: true },
 )
 
-// Only the hash groups (contract 0.15.0): a database that distributes schemas has one group of kind `schema` for every schema.
-const colocations = useColocationGroups(() => dbName.value || null, 'hash')
+const colocations = useColocationGroups(() => dbName.value || null)
 watch(
   () => colocations.data.value,
   (data) => {
@@ -69,50 +63,6 @@ const buckets = useAllBuckets(
 const distribution = useBucketDistribution(
   () => dbName.value || null,
   () => colocationId.value ?? undefined,
-)
-
-// Distributed schemas per server group (a count and a size), and the moves of schemas that run now.
-const schemas = useSchemas(
-  () => dbName.value,
-  () => !!dbName.value,
-)
-const rebalance = useRebalanceStatus()
-interface GroupSchemas {
-  groupId: number
-  serverId: string | null
-  count: number
-  bytes: number
-  /** Schemas whose size is not known here (null, shown as "n/a", never as 0). */
-  unknown: number
-}
-const schemasPerGroup = computed<GroupSchemas[]>(() => {
-  const byGroup = new Map<number, GroupSchemas>()
-  for (const s of schemas.data.value?.items ?? []) {
-    const d = s.distribution
-    if (!d) continue
-    const row = byGroup.get(d.shardGroupId) ?? {
-      groupId: d.shardGroupId,
-      serverId: d.serverId,
-      count: 0,
-      bytes: 0,
-      unknown: 0,
-    }
-    row.count += 1
-    if (s.sizeBytes === null) row.unknown += 1
-    else row.bytes += s.sizeBytes
-    byGroup.set(d.shardGroupId, row)
-  }
-  return [...byGroup.values()].sort((a, b) => a.groupId - b.groupId)
-})
-const schemaMoves = computed(
-  () =>
-    rebalance.data.value?.inFlightMoves?.filter(
-      (m) => m.kind === 'schema' && m.databaseName === dbName.value,
-    ) ?? [],
-)
-// `primarySchemas` is optional, and 0 for a database that distributes none: the column is for a database that does.
-const hasSchemaCounts = computed(() =>
-  distribution.data.value?.servers.some((s) => (s.primarySchemas ?? 0) > 0),
 )
 
 watch([dbName, serverFilter], () => {
@@ -222,15 +172,11 @@ function findBucket(): void {
       </form>
 
       <QueryBoundary
-        :loading="buckets.isPending.value && !!dbName && colocationId !== null"
+        :loading="buckets.isPending.value && !!dbName"
         :error="buckets.error.value"
         :empty="items.length === 0"
         empty-title="No buckets"
-        :empty-hint="
-          colocationId === null
-            ? 'This database has no hash-distributed tables, so there is no bucket map. Its distributed schemas are listed below.'
-            : 'This colocation group has no buckets yet.'
-        "
+        empty-hint="This colocation group has no buckets yet."
         @retry="buckets.refetch()"
       >
         <section class="card stack" aria-labelledby="map-h">
@@ -300,73 +246,6 @@ function findBucket(): void {
         </section>
       </QueryBoundary>
 
-      <section v-if="schemasPerGroup.length" class="card" aria-labelledby="schemas-group-h">
-        <h2 id="schemas-group-h">Distributed schemas per server group</h2>
-        <TableWrap>
-          <table class="table" data-testid="schemas-per-group">
-            <caption class="sr-only">
-              Distributed schemas, their number and size, per server group
-            </caption>
-            <thead>
-              <tr>
-                <th scope="col">Server group</th>
-                <th scope="col">Server</th>
-                <th scope="col" class="num">Schemas</th>
-                <th scope="col" class="num">Size</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="g in schemasPerGroup" :key="g.groupId">
-                <th scope="row">Group {{ g.groupId }}</th>
-                <td>
-                  <SafeName v-if="g.serverId" :value="g.serverId" :max="60" />
-                  <template v-else>-</template>
-                </td>
-                <td class="num">{{ g.count }}</td>
-                <td class="num">
-                  <NullableValue
-                    :value="g.unknown === g.count ? null : g.bytes"
-                    :format="formatBytes"
-                  />
-                  <span v-if="g.unknown > 0 && g.unknown < g.count" class="muted">
-                    (and {{ g.unknown }} not known)</span
-                  >
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </TableWrap>
-      </section>
-
-      <section v-if="schemaMoves.length" class="card" aria-labelledby="schema-moves-h">
-        <h2 id="schema-moves-h">Schema moves in flight</h2>
-        <TableWrap>
-          <table class="table" data-testid="schema-moves">
-            <caption class="sr-only">
-              Moves of distributed schemas that run now
-            </caption>
-            <thead>
-              <tr>
-                <th scope="col">Schema</th>
-                <th scope="col">From</th>
-                <th scope="col">To</th>
-                <th scope="col" class="num">Done</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="m in schemaMoves" :key="`${m.colocationId}-${m.schemaName}`">
-                <th scope="row" class="mono">
-                  <SafeName :value="m.schemaName ?? '?'" :max="80" />
-                </th>
-                <td>Group {{ m.fromShardGroupId }}</td>
-                <td>Group {{ m.toShardGroupId }}</td>
-                <td class="num">{{ Math.round(m.percent) }}%</td>
-              </tr>
-            </tbody>
-          </table>
-        </TableWrap>
-      </section>
-
       <section class="card" aria-labelledby="per-server-h">
         <h2 id="per-server-h">Buckets per server</h2>
         <QueryBoundary
@@ -382,7 +261,6 @@ function findBucket(): void {
                 <tr>
                   <th scope="col">Server</th>
                   <th scope="col" class="num">Primary buckets</th>
-                  <th v-if="hasSchemaCounts" scope="col" class="num">Of them schemas</th>
                   <th scope="col" class="num">Primary size</th>
                   <th scope="col" class="num">Replica buckets</th>
                   <th scope="col" class="num">Replica size</th>
@@ -401,7 +279,6 @@ function findBucket(): void {
                     </button>
                   </th>
                   <td class="num">{{ s.primaryBuckets }}</td>
-                  <td v-if="hasSchemaCounts" class="num">{{ s.primarySchemas ?? 0 }}</td>
                   <td class="num">
                     <NullableValue :value="s.primarySizeBytes" :format="formatBytes" />
                   </td>

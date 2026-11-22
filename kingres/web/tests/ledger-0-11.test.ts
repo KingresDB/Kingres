@@ -142,8 +142,8 @@ describe('words of 0.11.0', () => {
     }
   })
 
-  it('the 28 operations are in the contract: 132 in all at 0.11.0 (0.15.0 added five; schemas-0-15.test.ts counts them)', () => {
-    expect(Object.keys(operations).length).toBeGreaterThanOrEqual(132)
+  it('the 28 operations are in the contract: 132 in all', () => {
+    expect(Object.keys(operations)).toHaveLength(132)
     for (const a of NEW_ACTIONS) expect(a in operations, a).toBe(true)
   })
 })

@@ -527,7 +527,6 @@ describe('applying a change', () => {
     expect(time.databases).toEqual([
       { name: 'shop', timeZone: 'Europe/Paris' },
       { name: 'reports', timeZone: 'Europe/Berlin' },
-      { name: 'tenants', timeZone: null },
     ])
   })
 
@@ -851,7 +850,6 @@ describe('time', () => {
     expect(t.databases).toEqual([
       { name: 'shop', timeZone: null },
       { name: 'reports', timeZone: 'Europe/Berlin' },
-      { name: 'tenants', timeZone: null },
     ])
   })
 

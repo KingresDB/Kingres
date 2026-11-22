@@ -425,34 +425,6 @@ const entries: Record<ProblemCode, Entry> = {
     message: 'No server should hold shards. Allow at least one server to hold shards first.',
     withDetail: true,
   },
-  sharding_mode_in_use: {
-    tone: 'warning',
-    heading: 'The sharding mode is in use',
-    message:
-      'The other kind of distribution exists in this database, so the mode cannot be changed this way. Move or make local what is in the way first.',
-    withDetail: true,
-  },
-  schema_not_distributable: {
-    tone: 'warning',
-    heading: 'The schema cannot be distributed',
-    message:
-      'The schema holds objects that distributed schemas do not support yet. They are listed below; change or drop them first.',
-    withDetail: true,
-  },
-  schema_pinned: {
-    tone: 'warning',
-    heading: 'The schema is pinned to its server',
-    message:
-      'The schema holds a ledger table, and the ledger of a table is kept on one server, so the schema can neither move nor become local.',
-    withDetail: true,
-  },
-  schema_move_in_progress: {
-    tone: 'warning',
-    heading: 'The schema is moving',
-    message: 'A move of this schema is running. Wait until it has finished, then try again.',
-    withDetail: true,
-    retryable: true,
-  },
   quorum_unavailable: {
     tone: 'danger',
     heading: 'No quorum',

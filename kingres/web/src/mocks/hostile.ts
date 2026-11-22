@@ -144,32 +144,6 @@ export function seedHostile(s: MockState): void {
     }
   }
 
-  // Hostile schema names (contract 0.15.0): anyone who may create a schema chooses its name. Every other one is
-  // distributed; one local schema has blockers whose object names and reasons are hostile too.
-  const tenants = s.databases.find((d) => d.info.name === 'tenants')
-  if (tenants?.schemas) {
-    const local = tenants.schemas.find((x) => x.group === null && x.blockers.length === 0)
-    if (local) {
-      HOSTILE_NAMES.forEach((name, i) => {
-        tenants.schemas?.push({
-          ...structuredClone(local),
-          name,
-          group: i % 2 === 0 ? (i % 3) + 1 : null,
-          colocationId: 100 + i,
-          sizeBytes: i % 3 === 0 ? null : 1024 * (i + 1),
-        })
-      })
-      tenants.schemas.push({
-        ...structuredClone(local),
-        name: `blocked${cp(0x202e)}`,
-        blockers: [
-          { objectKind: HOSTILE.markup, objectName: HOSTILE.breakout, reason: HOSTILE.reversed },
-          { objectKind: 'table', objectName: HOSTILE.zeroWidth, reason: HOSTILE.newline },
-        ],
-      })
-    }
-  }
-
   s.serverGroups.push(
     { name: HOSTILE.markup, description: HOSTILE.newline },
     { name: HOSTILE.reversed, description: HOSTILE.controls },

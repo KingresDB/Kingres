@@ -57,7 +57,7 @@ describe('Create database dialog', () => {
       within(dialog).getByText(/bucket count must be a whole number between 1 and 4096/i),
     ).toBeInTheDocument()
     expect(within(dialog).getByLabelText(/^name/i)).toHaveAttribute('aria-invalid', 'true')
-    expect(getState().databases.map((d) => d.info.name)).toEqual(['shop', 'reports', 'tenants'])
+    expect(getState().databases.map((d) => d.info.name)).toEqual(['shop', 'reports'])
     expect(getState().tasks).toHaveLength(0)
   })
 

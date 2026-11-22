@@ -22,18 +22,12 @@ describe('labels', () => {
     // oldPrimaryRunning, oldPrimaryNotStopped and oldPrimaryNotRebuilt: 29.
     // 0.11.0 added nine for the ledger of phase 7: ledgerNotAnchored, ledgerAnchorBehind, ledgerAnchorFailed,
     // ledgerAnchorConflict, ledgerChainDiverged, ledgerGroupUnread, ledgerPublicationBehind, ledgerSignerUnavailable and
-    // ledgerDigestOverdue: 38. The generated types of 0.15.0 also have certificateAuthorityUnavailable (a kind of 0.5.0
-    // whose words were missing): 39.
-    expect(Object.keys(ALERT_KIND_LABEL)).toHaveLength(39)
+    // ledgerDigestOverdue: 38.
+    expect(Object.keys(ALERT_KIND_LABEL)).toHaveLength(38)
     // 18 in 0.4.0, plus the two certificate kinds (0.5.0), standby.reconcile (0.7.0), config.apply and config.restart (0.8.0).
     // 0.11.0 added eight: ledger.key.create, .rotate, .retire, .revoke, .distribute, ledger.bundle.create, ledger.epoch.start
-    // and ledger.upgrade: 31. 0.15.0 added schema.distribute, schema.move and schema.undistribute: 34.
-    expect(Object.keys(TASK_KIND_LABEL)).toHaveLength(34)
-    for (const k of ['schema.distribute', 'schema.move', 'schema.undistribute'])
-      expect(taskKindLabel(k), k).not.toBe(k)
-    expect(alertKindLabel('certificateAuthorityUnavailable')).not.toBe(
-      'certificateAuthorityUnavailable',
-    )
+    // and ledger.upgrade: 31.
+    expect(Object.keys(TASK_KIND_LABEL)).toHaveLength(31)
   })
   it('shows an unknown kind as sent', () => {
     expect(alertKindLabel('somethingNew')).toBe('somethingNew')

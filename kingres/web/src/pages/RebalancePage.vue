@@ -261,11 +261,7 @@ const stoppedByText = computed(() =>
                 :key="`${m.databaseName}-${m.colocationId}-${m.bucket}`"
               >
                 <td><SafeName :value="m.databaseName" :max="60" /></td>
-                <!-- The move of a distributed schema (contract 0.15.0) is told by the name of the schema; its bucket is always 0. -->
-                <td v-if="m.kind === 'schema'" class="num" data-testid="schema-move">
-                  Schema <SafeName :value="m.schemaName ?? '?'" :max="80" />
-                </td>
-                <td v-else class="num">{{ m.bucket }}</td>
+                <td class="num">{{ m.bucket }}</td>
                 <td>
                   <SafeName v-if="m.fromServerId" :value="m.fromServerId" :max="80" />
                   <template v-else>group {{ m.fromShardGroupId }}</template>
