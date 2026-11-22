@@ -4494,7 +4494,10 @@ export interface components {
             state: "notScheduled" | "rebuildScheduled" | "rebuilding" | "standby" | "waitingForServer" | "removed" | "failed";
             /** @enum {string|null} */
             method: "clean" | "pgRewind" | "baseBackup" | null;
-            /** Format: int64 */
+            /**
+             * Format: int64
+             * @description What the old primary wrote after the point where the histories parted (the writes that were discarded). Zero when its WAL ends before that point. Null when the instance had not finished its crash recovery and the end of its WAL could not be told (then `message` says so), and for a base backup.
+             */
             divergenceBytes: number | null;
             /** Format: int64 */
             rewindBytes: number | null;

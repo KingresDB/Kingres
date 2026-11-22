@@ -6941,7 +6941,7 @@ components:
       properties:
         state: { type: string, enum: [notScheduled, rebuildScheduled, rebuilding, standby, waitingForServer, removed, failed], description: '`notScheduled`: no rebuild of the old primary is scheduled for the group (for a record of an earlier revision of kingresd that never rebuilt it, and for a group whose old primary has no directory to rebuild); it stays stopped and fenced until an operator acts. From 0.12.0 kingresd rebuilds the old primary of an ordinary group by itself (`rebuildScheduled`, `rebuilding`, `standby`).' }
         method: { type: [string, 'null'], enum: [clean, pgRewind, baseBackup, null] }
-        divergenceBytes: { type: [integer, 'null'], format: int64 }
+        divergenceBytes: { type: [integer, 'null'], format: int64, description: 'What the old primary wrote after the point where the histories parted (the writes that were discarded). Zero when its WAL ends before that point. Null when the instance had not finished its crash recovery and the end of its WAL could not be told (then `message` says so), and for a base backup.' }
         rewindBytes: { type: [integer, 'null'], format: int64 }
         message: { type: [string, 'null'] }
     FailoverEvent:

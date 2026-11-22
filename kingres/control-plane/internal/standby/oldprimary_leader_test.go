@@ -3,6 +3,7 @@
 package standby
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -50,20 +51,47 @@ func TestDiffPlacesNoNewStandbyOnADeadServer(t *testing.T) {
 // What the rewind itself printed completes a report whose dry run was refused (a primary that needed crash recovery).
 func TestTheReportIsCompletedFromTheRewindItself(t *testing.T) {
 	var info OldPrimaryInfo
-	completeFromRewind(&info, "pg_rewind: servers diverged at WAL location 0/3000060 on timeline 1\npg_rewind: need to copy 3 MB (total source directory size is 40 MB)\n", "0/3100000")
+	completeFromRewind(&info, "pg_rewind: servers diverged at WAL location 0/3000060 on timeline 1\npg_rewind: need to copy 3 MB (total source directory size is 40 MB)\n", "0/3100000", false)
 	if info.DivergenceLsn != "0/3000060" || info.RewindBytes == nil || *info.RewindBytes != 3<<20 || info.DivergenceBytes == nil || *info.DivergenceBytes != 0x3100000-0x3000060 {
 		t.Fatalf("%+v", info)
 	}
 	// a checkpoint before the divergence says nothing about the bytes
 	var early OldPrimaryInfo
-	completeFromRewind(&early, "pg_rewind: servers diverged at WAL location 0/3000060 on timeline 1\n", "0/2000000")
+	completeFromRewind(&early, "pg_rewind: servers diverged at WAL location 0/3000060 on timeline 1\n", "0/2000000", false)
 	if early.DivergenceBytes != nil || early.DivergenceLsn == "" || early.Message == "" {
 		t.Fatalf("%+v", early)
 	}
 	// what the dry run measured is kept
 	kept := OldPrimaryInfo{DivergenceLsn: "0/1"}
-	completeFromRewind(&kept, "pg_rewind: servers diverged at WAL location 0/9 on timeline 1\n", "")
+	completeFromRewind(&kept, "pg_rewind: servers diverged at WAL location 0/9 on timeline 1\n", "", false)
 	if kept.DivergenceLsn != "0/1" {
 		t.Fatalf("%+v", kept)
+	}
+}
+
+// A directory that is shut down has finished its crash recovery, so its last checkpoint is the end of the old WAL: the bytes after the divergence are measured, and
+// they are zero when that end is before the point where the histories parted (the new primary held more than the old one wrote). A directory that is not shut down
+// gives a lower bound, or nothing when the checkpoint is before the divergence; the message says which.
+func TestTheDivergenceIsMeasuredFromAShutDownDirectory(t *testing.T) {
+	const rewind = "pg_rewind: servers diverged at WAL location 0/3000060 on timeline 1\n"
+	var measured OldPrimaryInfo
+	completeFromRewind(&measured, rewind, "0/3100000", true)
+	if measured.DivergenceBytes == nil || *measured.DivergenceBytes != 0x3100000-0x3000060 || !strings.Contains(measured.Message, "measured from the shutdown checkpoint") {
+		t.Fatalf("%+v", measured)
+	}
+	var none OldPrimaryInfo
+	completeFromRewind(&none, rewind, "0/2000000", true)
+	if none.DivergenceBytes == nil || *none.DivergenceBytes != 0 || !strings.Contains(none.Message, "wrote nothing after the divergence") {
+		t.Fatalf("an old WAL that ends before the divergence: %+v", none)
+	}
+	var unknown OldPrimaryInfo
+	completeFromRewind(&unknown, rewind, "0/2000000", false)
+	if unknown.DivergenceBytes != nil || !strings.Contains(unknown.Message, "could not measure the old WAL") {
+		t.Fatalf("a checkpoint before the divergence of a directory that was not shut down says nothing: %+v", unknown)
+	}
+	var lower OldPrimaryInfo
+	completeFromRewind(&lower, rewind, "0/3100000", false)
+	if lower.DivergenceBytes == nil || !strings.Contains(lower.Message, "at least") {
+		t.Fatalf("%+v", lower)
 	}
 }
