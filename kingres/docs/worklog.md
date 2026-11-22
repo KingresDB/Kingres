@@ -57,6 +57,26 @@ None.
 
 ---
 
+
+## 2026-11-22: the open low finding and notes of the second look at the fixes of C13 (C14-08, C14-09, C14-10)
+
+### What was done
+
+- **kingres_columnar** (branch c14-low). C14-08: a developer gate (point 8 of `kingres_columnar.reserve_gate_at`) between the vacuum lock and the read of the ranges, and `t/070`
+  stops the index vacuum there and checks that a writer's give-back is refused. C14-10: the skipped merge of a `VACUUM` that already has a transaction id says so at `DEBUG1`, with
+  a test through a dropped table's orphan catalog rows. C14-09: the README states the cost of the refused give-back with its rate.
+
+### How it was verified
+
+- `t/070` passes; the mutants "lock after the ranges" (C14-08) and "message at DEBUG5" (C14-10) each fail it. The full suite of the extension runs on PostgreSQL 18 and 19.
+
+### Still open
+
+- Nothing from the second look at C13: C14-04 stays documented only, as the review says.
+
+---
+
+
 ## 2026-11-20: automatic failover, the last steps of phase 2b and their review, the second review of phase 9 and its fixes, and two npm alerts
 
 Covers 2026-11-20 from the morning, after the third entry of 2026-11-19.
