@@ -194,10 +194,10 @@ func TestAFileFetchedByAServerWithoutOneIsBoundedAgainstTheReportOfTheHolders(t 
 	}
 	e.svc.cfg.Holders = func(context.Context, []int64) (HolderReport, error) {
 		rep := NewHolderReport()
-		rep.Copies[tg.ID] = []HolderCopy{{Host: "h2", Generation: 50, Digest: "x"}}
+		rep.Copies[tg.ID] = []HolderCopy{{Host: "h2", Generation: 150, Digest: "x"}}
 		return rep, nil
 	}
-	good, _ := e.creds.Encode(creds2(), 50, newStamp(t))
+	good, _ := e.creds.Encode(creds2(), 150, newStamp(t))
 	poisoned, _ := e.creds.Encode(creds2(), 1<<30, newStamp(t))
 	e.svc.cfg.Fetch = func(context.Context, int64) ([]byte, error) { return append([]byte(nil), poisoned...), nil }
 	if got := e.svc.fetchMissing(e.ctx(), trow); got != fetchRefused {
@@ -286,5 +286,23 @@ func TestALeaderWithoutAFileDoesNotChangeTheCredentialsWhileTheHoldersHaveOne(t 
 	v, _ = e.svc.generationView(e.ctx(), tg.ID)
 	if v.floor != 0 || v.known != 100 {
 		t.Fatalf("%+v", v)
+	}
+}
+
+// The reference of the bound travels with the file: a holder with no file takes the leader's file above MaxLeaderJump only because the leader
+// saw the holders that high.
+func TestTheLeadersReferenceReachesTheHolderThatHasNoFile(t *testing.T) {
+	e := newEnv(t)
+	file, _ := e.creds.Encode(creds2(), MaxLeaderJump+5, newStamp(t))
+	fresh := func() *Agent {
+		s, _ := NewCredStore(t.TempDir(), "")
+		s.Iterations, s.MinIterations = 2000, 1000
+		return &Agent{Creds: s}
+	}
+	if _, err := fresh().Handle(context.Background(), CallCredentialsInstall, installBody(t, 1, file, 0)); err == nil {
+		t.Fatal("a first file above the bound was taken with nothing known")
+	}
+	if _, err := fresh().Handle(context.Background(), CallCredentialsInstall, installBody(t, 1, file, 10)); err != nil {
+		t.Fatalf("a first file that the leader saw the holders near: %v", err)
 	}
 }
