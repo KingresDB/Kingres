@@ -255,3 +255,92 @@ func TestAFailoverAndDatabaseChangesExcludeEachOther(t *testing.T) {
 		}
 	}
 }
+
+// Migration 0041: the tasks of the distributed schemas and a failover exclude each other (KX006, KX007), and the two that move a
+// bucket (schema.move, schema.undistribute) and a rebalance exclude each other (KX001, KX002); schema.distribute does not move one
+// and lives beside a rebalance. An ended task frees the way.
+func TestSchemaTasksExcludeAFailoverAndARebalanceInTheDatabase(t *testing.T) {
+	e := newEnvNoTask(t)
+	ctx := context.Background()
+	insert := func(kind, state string) (int64, error) {
+		var id int64
+		err := e.sys.QueryRow(ctx, `INSERT INTO kingres_cp.task (kind, state, subject_type, subject_id, created_by) VALUES ($1, $2, 'schema', $1, 'test') RETURNING id`,
+			kind, state).Scan(&id)
+		return id, err
+	}
+	code := func(err error) string {
+		var pe *pgconn.PgError
+		if errors.As(err, &pe) {
+			return pe.Code
+		}
+		return "none"
+	}
+	schemaKinds := []string{"schema.distribute", "schema.move", "schema.undistribute"}
+	// a failover first
+	for _, fo := range []string{kindFailover, kindRestore} {
+		foID, err := insert(fo, "running")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, k := range schemaKinds {
+			if _, err := insert(k, "pending"); code(err) != "KX007" {
+				t.Fatalf("%s while %s runs: %v", k, fo, err)
+			}
+		}
+		e.setState(t, foID, "paused")
+		if _, err := insert("schema.move", "pending"); code(err) != "KX007" {
+			t.Fatalf("a paused %s still excludes: %v", fo, err)
+		}
+		e.setState(t, foID, "done")
+	}
+	// a schema task first
+	for _, k := range schemaKinds {
+		id, err := insert(k, "running")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, fo := range []string{kindFailover, kindRestore} {
+			if _, err := insert(fo, "pending"); code(err) != "KX006" {
+				t.Fatalf("%s while %s runs: %v", fo, k, err)
+			}
+		}
+		moves := k != "schema.distribute"
+		_, err = insert("rebalance", "pending")
+		switch {
+		case moves && code(err) != "KX001":
+			t.Fatalf("a rebalance while %s runs: %v", k, err)
+		case !moves && err != nil:
+			t.Fatalf("a rebalance beside %s: %v", k, err)
+		}
+		if !moves {
+			if _, err := e.sys.Exec(ctx, `UPDATE kingres_cp.task SET state = 'done' WHERE kind = 'rebalance'`); err != nil {
+				t.Fatal(err)
+			}
+		}
+		e.setState(t, id, "done")
+	}
+	// a rebalance first
+	rb, err := insert("rebalance", "running")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range schemaKinds {
+		_, err := insert(k, "pending")
+		if k == "schema.distribute" && err != nil {
+			t.Fatalf("%s beside a rebalance: %v", k, err)
+		}
+		if k != "schema.distribute" && code(err) != "KX002" {
+			t.Fatalf("%s while a rebalance runs: %v", k, err)
+		}
+	}
+	e.setState(t, rb, "done")
+	if _, err := insert(kindFailover, "pending"); code(err) != "KX006" {
+		t.Fatalf("the schema.distribute task of the last step is still unfinished: %v", err)
+	}
+	if _, err := e.sys.Exec(ctx, `UPDATE kingres_cp.task SET state = 'done' WHERE kind LIKE 'schema.%'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := insert(kindFailover, "pending"); err != nil {
+		t.Fatalf("after every schema task ended: %v", err)
+	}
+}
