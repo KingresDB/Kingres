@@ -705,3 +705,10 @@ type MapCheckpoint struct {
 	Checkpoint   string `json:"checkpoint"`
 	ClusterState string `json:"clusterState"`
 }
+
+// MapAbandonResult is what giving up a bootstrap of the map group did (contract 0.15.0). ResumedServer names the server whose primary of the map group, held back
+// for a planned switchover, was started again by it; it is empty when there was none to start.
+type MapAbandonResult struct {
+	Abandoned     bool   `json:"abandoned"`
+	ResumedServer string `json:"resumedServerId,omitempty"`
+}

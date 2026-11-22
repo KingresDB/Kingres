@@ -1009,3 +1009,20 @@ func TestAMapGroupSwitchoverThatWasGivenUpEndsAsUnprovenWhenTheStepRunsAgain(t *
 		t.Fatalf("a second switchover began or the old leader was not resumed:\n%s", strings.Join(w.log, "\n"))
 	}
 }
+
+// F6-04. The candidate cannot be reached when the rollback asks it to give the bootstrap up (an answer that is not a conflict, so it is not known whether it promoted,
+// and the rows are in the stopped system database): the rollback goes on, because the lease decides which of the two primaries may run, and not silently: the
+// old leader is resumed and the candidate's lease is released at its own server (which refuses it for a promoted, attached instance). The choice is this test.
+func TestARollbackThatCannotAskTheCandidateGoesOnAndTheLeaseDecides(t *testing.T) {
+	w := mapWorld()
+	w.dbDownAfterStop = true
+	w.mapRefusal = "refused"
+	w.mapAbandonErr = errors.New("the candidate cannot be reached")
+	r := w.runner()
+	w.fakeClock(r)
+	_, err := runAll(t, r, mapGracefulInput())
+	failedWith(t, w, err, CodeSwitchoverUnproven)
+	if w.count("map-abandon s2") != 1 || w.count("resume s1") != 1 || w.count("lease-release s2") != 1 {
+		t.Fatalf("the rollback that could not ask the candidate:\n%s", strings.Join(w.log, "\n"))
+	}
+}

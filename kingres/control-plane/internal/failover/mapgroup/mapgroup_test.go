@@ -26,6 +26,8 @@ type world struct {
 	refusedErr                error  // telling the old leader fails
 	behind                    int    // the callee answers standby_behind this many times before it promotes
 	onPromote                 func() // runs inside the call that promotes (a test gives the bootstrap up there)
+	resumeOldErr              error  // the answer of the call that asks the old leader to end its hold
+	onResumeOld               func() // runs inside the call that asks the old leader to end its hold
 	promoteErr                error  // the callee refuses a promotion that carries a proof
 	promoteReqs               []failover.PromoteRequest
 	freezeErr                 error // FreezeLocal fails from the second call on (the agent was lost with a restart)
@@ -676,6 +678,14 @@ func (p ports) PlannedRefused(_ context.Context, oldServer string, taskID int64,
 	return p.w.refusedErr
 }
 
+func (p ports) ResumeOldLeader(_ context.Context, oldServer string) error {
+	p.w.rec("resume-old-leader %s", oldServer)
+	if p.w.onResumeOld != nil {
+		p.w.onResumeOld()
+	}
+	return p.w.resumeOldErr
+}
+
 // The standby refuses the proof after the old leader stopped: the candidate lets go of the lease and tells the old leader (planned-refused), gives the
 // bootstrap up and promotes nothing; the old leader's task rolls back and starts its primary again.
 func TestARefusedProofGivesTheBootstrapUpAndTellsTheOldLeader(t *testing.T) {
@@ -814,5 +824,62 @@ func TestAGivenUpJournalDoesNotDependOnTellingTheOldLeader(t *testing.T) {
 	var fe *failover.Error
 	if !errors.As(err, &fe) || js.Active() {
 		t.Fatalf("a journal that could not tell the old leader stays active: %v active=%v", err, js.Active())
+	}
+}
+
+// F6-02. The bootstrap that is given up while the promoting call is repeated (the standby answers standby_behind) does not call again: another call would promote
+// a standby whose lease was let go of, behind the back of the journal.
+func TestAGivenUpBootstrapDoesNotRepeatThePromotingCall(t *testing.T) {
+	w := newWorld()
+	w.live["s1"] = "live"
+	w.behind = 1000
+	r, js := w.runner(t)
+	r.VerifyWait = time.Hour
+	rq := req()
+	rq.Planned = &journal.Planned{TaskID: 77, StandbyID: 10}
+	_, _ = r.Decide(context.Background(), rq)
+	_ = js.SetProof("0/6000028", "shut down")
+	calls := 0
+	w.onPromote = func() {
+		calls++
+		if calls == 2 {
+			if err := js.AbandonUnpromoted("an operator"); err != nil {
+				t.Errorf("the abandon between two calls: %v", err)
+			}
+		}
+	}
+	_, err := r.Run(context.Background(), rq)
+	if err == nil {
+		t.Fatalf("the bootstrap that was given up went on:\n%s", strings.Join(w.log, "\n"))
+	}
+	if calls != 2 {
+		t.Fatalf("the promoting call was made %d times; it must stop after the abandon (2)", calls)
+	}
+}
+
+// F6-01. A refused proof gives the bootstrap up and then asks the old leader's server to end the hold of its primary: the old leader waits for as long as a
+// bootstrap that names it is active, so the call comes after the journal is given up, and a failure of the call does not undo the refusal.
+func TestARefusedProofAsksTheOldLeaderToEndItsHoldAfterTheJournalIsGivenUp(t *testing.T) {
+	w := newWorld()
+	w.live["s1"] = "live"
+	w.promoteErr = &failover.CallError{Status: 409, Code: "unprovable", Message: "the standby is behind"}
+	w.resumeOldErr = errors.New("the old leader cannot be reached")
+	r, js := w.runner(t)
+	activeAtTheCall := true
+	w.onResumeOld = func() { activeAtTheCall = js.Active() }
+	rq := req()
+	rq.Planned = &journal.Planned{TaskID: 77, StandbyID: 10}
+	_, _ = r.Decide(context.Background(), rq)
+	_ = js.SetProof("0/6000028", "shut down")
+	_, err := r.Run(context.Background(), rq)
+	var fe *failover.Error
+	if !errors.As(err, &fe) || fe.Code != failover.CodeSwitchoverUnproven {
+		t.Fatalf("want switchover_unproven: %v", err)
+	}
+	if w.count("resume-old-leader s1") != 1 {
+		t.Fatalf("the old leader was not asked to end its hold:\n%s", strings.Join(w.log, "\n"))
+	}
+	if activeAtTheCall {
+		t.Fatal("the old leader was asked while the bootstrap that names it was still active")
 	}
 }

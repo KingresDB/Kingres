@@ -145,7 +145,12 @@ func (r *Runner) rollbackSwitchover(ctx context.Context, taskID int64, in Input,
 				r.log().Warn("failover: the candidate of the map group promoted; the old leader stays held back and nothing is rolled back", "server", newServer)
 				return true
 			}
-			r.log().Warn("failover: the bootstrap of the map group could not be given up", "server", newServer, "error", err)
+			// An answer other than a conflict (the candidate cannot be reached) does not say that nothing was promoted, and the rows that would say so are in the
+			// stopped system database (F6-04). The rollback goes on all the same, and that is safe against two primaries only because of the lease: the candidate's
+			// own kingresd renews its lease and attaches a promoted instance to it, so this server's primary, started again, cannot win the lease from a promoted
+			// candidate and waits for it (the wait marker). The risk is therefore named in the log and never taken silently.
+			r.log().Warn("failover: the bootstrap of the map group could not be given up and it is not known whether the candidate promoted; the old leader is started again and the lease decides which of the two runs",
+				"server", newServer, "error", err)
 		}
 	}
 	_, _ = r.Peers.Lease(ctx, r.Plan.Self(), LeaseRequest{Group: g, Role: LeaseRelease})
@@ -153,7 +158,8 @@ func (r *Runner) rollbackSwitchover(ctx context.Context, taskID int64, in Input,
 		_, _ = r.Peers.Lease(ctx, newServer, LeaseRequest{Group: g, Role: LeaseRelease})
 	}
 	// An error is logged, never swallowed: a server that cannot be reached keeps its hold and its marker, and the loop of Repair undoes them when
-	// the server answers again (F4-02), whatever became of this task.
+	// the server answers again (F4-02), whatever became of this task. The map group is not in that loop: its old leader resolves a hold that nothing owns
+	// by itself (F6-01, resolveHeldBack of kingresd).
 	if err := r.Peers.Resume(ctx, in.oldOf(g), ResumeRequest{Group: g, ExpectedTerm: term}); err != nil {
 		r.log().Warn("failover: the old primary could not be resumed; the repair of switchovers will try again", "group", g, "server", in.oldOf(g), "error", err)
 	}

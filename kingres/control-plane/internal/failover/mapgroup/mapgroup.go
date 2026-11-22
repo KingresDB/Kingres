@@ -61,6 +61,9 @@ type Ports interface {
 	// PlannedRefused is what a planned switchover of the map group does when the standby could not prove the old leader's stop: this server lets go of the fence
 	// lease it holds (so that the old leader can win its own lease again) and tells the old leader, whose task rolls back and starts its primary again.
 	PlannedRefused(ctx context.Context, oldServer string, taskID int64, reason string) error
+	// ResumeOldLeader asks the old leader's server to end the hold of its primary of the map group, once this bootstrap is given up (F6-01): its task may be gone, and the system
+	// database is the primary that is held back, so nothing else would. Best effort; the old leader's own loop does it as well.
+	ResumeOldLeader(ctx context.Context, oldServer string) error
 	// PullProof reads how the stopped primary of the map group was left from the old leader's server (its kingresd answers while its instance is held back), for the
 	// case that the old leader's task, which sends the proof, did not (its kingresd ended after the stop).
 	PullProof(ctx context.Context, oldServer string) (checkpoint, clusterState string, err error)
@@ -572,6 +575,10 @@ func (r *Runner) promote(ctx context.Context, j journal.Journal) (bool, error) {
 	}
 	behindUntil := r.now().Add(dur(r.VerifyWait, 30*time.Second))
 	for try := 0; ; try++ {
+		if try > 0 && !r.Journal.Active() {
+			// The bootstrap was given up while the call was repeated (F6-02): another call would promote a standby whose lease was let go of, behind the back of the journal.
+			return false, failover.Fail(failover.CodeSwitchoverUnproven, false, "the bootstrap of the map group was given up while the promotion was repeated; nothing more is done")
+		}
 		ans, err := r.P.Promote(ctx, r.P.Self(), req)
 		switch {
 		case err == nil:
@@ -594,6 +601,10 @@ func (r *Runner) promote(ctx context.Context, j journal.Journal) (bool, error) {
 			_ = r.Journal.Event(journal.StepPromote, "refused", map[string]any{"reason": reason, "toldTheOldLeader": perr == nil})
 			if aerr := r.Journal.AbandonUnpromoted(reason); aerr != nil {
 				return false, aerr
+			}
+			// Only now can the old leader resolve its hold: a bootstrap that names it and is active is what makes it wait (F6-01).
+			if rerr := r.P.ResumeOldLeader(ctx, j.OldServer); rerr != nil {
+				_ = r.Journal.Event(journal.StepPromote, "oldLeaderNotResumed", map[string]any{"error": rerr.Error()})
 			}
 			if perr != nil {
 				return false, failover.Fail(failover.CodeSwitchoverUnproven, false, "%s; the old leader could not be told (%v): its task rolls back by its own wait", reason, perr)
