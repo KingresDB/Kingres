@@ -103,7 +103,11 @@ describe('approximate aggregates', () => {
   it('turning it off makes count(DISTINCT) exact and never takes the extension away', async () => {
     sw('analytics=on')
     const task = await endpoints.configureApproximateAggregates('shop', { enabled: false })
+    // A disable runs the same five steps as an enable; the install steps find the extension installed and do nothing.
     expect(task.progress.steps.map((s) => s.name)).toEqual([
+      'Check the servers',
+      ...getState().servers.map((s) => `Install the extension on server ${s.id}`),
+      'Verify versions and hashes',
       'Apply the database settings',
       'Record the settings',
     ])
@@ -261,7 +265,11 @@ describe('the storage format of a table', () => {
     ok(task, 'Task')
     expect(task.kind).toBe('table.setStorage')
     expect(task.subject).toEqual({ type: 'table', id: 'shop/public.clicks' })
-    expect(task.progress.steps.map((s) => s.name)).toEqual(['check', 'convert', 'analyze'])
+    expect(task.progress.steps.map((s) => s.name)).toEqual([
+      'Check the table',
+      'Convert the storage',
+      'Analyze the table',
+    ])
     expect(task.detail).toMatch(/ACCESS EXCLUSIVE/)
     await settled(task.id)
     const t = await endpoints.getTable('shop', 'public', 'clicks')
@@ -651,11 +659,11 @@ describe('the time-partitioning policy', () => {
     expect(task.kind).toBe('partition.maintain')
     expect(task.subject).toEqual({ type: 'table', id: 'shop/public.metrics' })
     expect(task.progress.steps.map((s) => s.name)).toEqual([
-      'begin',
-      'create',
-      'convert',
-      'retire',
-      'finish',
+      'Begin the run',
+      'Create partitions',
+      'Convert partitions',
+      'Retire partitions',
+      'Finish the run',
     ])
     const running = await endpoints.listPartitionPolicyRuns('shop', 'public', 'metrics')
     expect(running.items[0]).toMatchObject({
@@ -784,7 +792,12 @@ describe('the time-partitioning policy', () => {
   it('the alert partitionsAheadLow is raised with the table', async () => {
     sw('analytics=ahead-low')
     const alert = getState().alerts.find((a) => a.kind === 'partitionsAheadLow')
-    expect(alert?.subject).toMatchObject({ databaseName: 'shop', aspect: 'table:public.metrics' })
+    expect(alert?.subject).toMatchObject({
+      databaseName: 'shop',
+      tableSchema: 'public',
+      tableName: 'metrics',
+      aspect: null,
+    })
     expect(
       (await endpoints.getPartitionPolicy('shop', 'public', 'metrics')).health.problems,
     ).toContain('aheadLow')
@@ -908,5 +921,174 @@ describe('the workbench EXPLAIN of the mock', () => {
     expect((await explain(sql)).join('\n')).toMatch(
       /Rewritten: count\(DISTINCT customer_id\) -> approximate \(p = 14\)/,
     )
+  })
+})
+
+describe('the settled contract of 0.18.0 (review of the control plane)', () => {
+  const policy = { partitionEvery: 'P1D', createAhead: 'P7D' } as const
+  const dry = (db: string, table: string, body: object, partition?: string) =>
+    fetch(
+      `/api/v1/databases/${db}/schemas/public/tables/${table}${partition ? `/partitions/${partition}` : ''}/storage?dryRun=true`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      },
+    )
+  void dry
+
+  it('dryRun answers 200 TableStoragePreview with the typed blockers and the notes, and starts no task', async () => {
+    sw('analytics=timeseries')
+    const ok1 = await endpoints.previewTableStorage('shop', 'public', 'clicks', {
+      accessMethod: 'columnar',
+    })
+    ok(ok1, 'TableStoragePreview')
+    expect(ok1).toMatchObject({
+      current: 'heap',
+      target: 'columnar',
+      willConvert: true,
+      blockers: [],
+    })
+    expect(ok1.notes.join(' ')).toMatch(/ACCESS EXCLUSIVE/)
+    const notes = await endpoints.previewTableStorage('shop', 'public', 'notes', {
+      accessMethod: 'columnar',
+    })
+    expect(notes.willConvert).toBe(false)
+    expect(notes.blockers.map((b) => b.code)).toEqual(['other'])
+    expect(notes.blockers[0]!.message).toMatch(/notes_pkey/)
+    const parent = await endpoints.previewTableStorage('shop', 'public', 'metrics', {
+      accessMethod: 'columnar',
+    })
+    expect(parent.current).toBeNull()
+    expect(parent.blockers.map((b) => b.code)).toContain('partitioned_table')
+    const dist = await endpoints.previewTableStorage('shop', 'public', 'customers', {
+      accessMethod: 'columnar',
+    })
+    expect(dist.blockers.map((b) => b.code)).toContain('distributed_table')
+    const same = await endpoints.previewTableStorage('shop', 'public', 'clicks', {
+      accessMethod: 'heap',
+    })
+    expect(same).toMatchObject({ willConvert: false })
+    expect(same.notes.join(' ')).toMatch(/stored as rows already/)
+    expect(getState().tasks.some((t) => t.task.kind === 'table.setStorage')).toBe(false)
+    expect(getState().audit.some((e) => e.action === 'setTableStorage')).toBe(false)
+  })
+
+  it('dryRun of a partition says the swap, and its blockers (a default partition, a publication)', async () => {
+    sw('analytics=timeseries')
+    const heap = (await partitions()).find((p) => p.accessMethod === 'heap')!
+    const p = await endpoints.previewPartitionStorage('shop', 'public', 'metrics', heap.name, {
+      accessMethod: 'columnar',
+    })
+    expect(p).toMatchObject({ current: 'heap', willConvert: true })
+    getState().analytics!.knobs.publication = true
+    const pub = await endpoints.previewPartitionStorage('shop', 'public', 'metrics', heap.name, {
+      accessMethod: 'columnar',
+    })
+    expect(pub.blockers.map((b) => b.code)).toEqual(['publication'])
+  })
+
+  it('a dryRun is refused for the same extension and validation reasons as the change', async () => {
+    sw('analytics=timeseries,columnar:missing')
+    expect(
+      (
+        await refused(
+          endpoints.previewTableStorage('shop', 'public', 'clicks', { accessMethod: 'columnar' }),
+        )
+      ).code,
+    ).toBe('extension_missing')
+    getState().analytics!.knobs.columnarMissing = false
+    expect(
+      (
+        await refused(
+          endpoints.previewTableStorage('shop', 'public', 'clicks', {
+            accessMethod: 'columnar',
+            compressionLevel: 99,
+          }),
+        )
+      ).status,
+    ).toBe(400)
+  })
+
+  it('conversion_refused carries the typed blockers, and the detail repeats them as text', async () => {
+    sw('analytics=timeseries,publication')
+    const error = await endpoints
+      .setTableStorage('shop', 'public', 'clicks', { accessMethod: 'columnar' })
+      .then(
+        () => null,
+        (e: unknown) => e as ApiError,
+      )
+    expect(error?.problem.blockers).toEqual([
+      { code: 'publication', object: 'public.clicks', message: 'is in a publication' },
+    ])
+    expect(error?.problem.detail).toBe('is in a publication')
+  })
+
+  it('runPartitionPolicy: asOf must be within five minutes of now (400 on /asOf), the plan keeps a free asOf', async () => {
+    sw('analytics=timeseries')
+    const old = new Date(Date.now() - 3_600_000).toISOString()
+    const bad = await refused(
+      endpoints.runPartitionPolicy('shop', 'public', 'metrics', { asOf: old }),
+    )
+    expect(bad).toMatchObject({ status: 400, code: 'validation_failed' })
+    expect(bad.errors.map((e) => e.field)).toEqual(['/asOf'])
+    expect(getState().tasks.some((t) => t.task.kind === 'partition.maintain')).toBe(false)
+    const near = new Date(Date.now() - 60_000).toISOString()
+    const task = await endpoints.runPartitionPolicy('shop', 'public', 'metrics', { asOf: near })
+    expect(task.kind).toBe('partition.maintain')
+    const plan = await endpoints.planPartitionPolicy('shop', 'public', 'metrics')
+    expect(plan.actions.length).toBeGreaterThan(0)
+  })
+
+  it('putPartitionPolicy is 409 operation_in_progress while a run of the policy goes on', async () => {
+    sw('analytics=timeseries')
+    mockConfig.taskDurationMs = 60_000
+    await endpoints.runPartitionPolicy('shop', 'public', 'metrics')
+    expect(
+      (await refused(endpoints.putPartitionPolicy('shop', 'public', 'metrics', policy))).code,
+    ).toBe('operation_in_progress')
+  })
+
+  it('getPartitionPolicy: 404 with a text of its own when kingres_timepart is not installed; the runs are an empty page', async () => {
+    sw('analytics=timeseries,timepart:missing')
+    const e = await refused(endpoints.getPartitionPolicy('shop', 'public', 'metrics'))
+    expect(e.status).toBe(404)
+    expect(e.detail).toMatch(/kingres_timepart is not installed/)
+    expect((await endpoints.listPartitionPolicyRuns('shop', 'public', 'metrics')).items).toEqual([])
+    const none = await refused(endpoints.getPartitionPolicy('shop', 'public', 'nothing'))
+    expect(none.detail).toMatch(/does not exist/)
+  })
+
+  it('extension_missing says the remedy: restart the instance of the named server, there is no install action', async () => {
+    sw('analytics=timeseries,columnar:missing')
+    const e = await refused(
+      endpoints.setTableStorage('shop', 'public', 'clicks', { accessMethod: 'columnar' }),
+    )
+    expect(e.detail).toMatch(/Restart the instance of that server/)
+    expect(e.detail).toMatch(/no install action/)
+  })
+
+  it('the shapes of partitionEvery of the contract', async () => {
+    sw('analytics=timeseries')
+    const put = (partitionEvery: string) =>
+      endpoints.putPartitionPolicy('shop', 'public', 'metrics', { partitionEvery })
+    for (const good of [
+      'PT1H',
+      'PT12H',
+      'P1D',
+      'P7D',
+      'P3660D',
+      'P1M',
+      'P3M',
+      'P6M',
+      'P1Y',
+      'P1000Y',
+    ])
+      expect((await put(good)).partitionEvery).toBe(good)
+    for (const bad of ['PT5H', 'PT24H', 'P3661D', 'P1W', 'P5M', 'P12M', 'P1001Y', 'P1DT1H'])
+      expect(
+        (await refused(put(bad))).errors.map((x) => x.field),
+        bad,
+      ).toEqual(['/partitionEvery'])
   })
 })

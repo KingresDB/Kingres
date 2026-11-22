@@ -8,12 +8,14 @@
 // distributed table). What only the server knows (an index, a trigger, a publication) comes back as a 409 `conversion_refused`
 // with its reasons in a list. The task can be cancelled until its switch; the table is then as it was.
 import { computed, reactive, ref } from 'vue'
+import { useQuery } from '@tanstack/vue-query'
+import TableBlockerList from './TableBlockerList.vue'
 import TaskActionDialog from '../TaskActionDialog.vue'
 import FormField from '../FormField.vue'
 import ProblemNotice from '../ProblemNotice.vue'
 import SafeName from '../SafeName.vue'
 import { endpoints } from '@/api/endpoints'
-import { ApiError } from '@/api/problem'
+import { ApiError, isUnsupported } from '@/api/problem'
 import { keys } from '@/api/queries'
 import { formatBytes } from '@/lib/format'
 import {
@@ -124,8 +126,57 @@ const start = () =>
         body.value,
       )
 
-const refusal = (error: unknown): string[] =>
+// The server's own check before anything starts (`dryRun`): the blockers and the notes of this request. A server that cannot
+// preview (422 unsupported_operation) does not stop the change: the 409 comes back after the start, with the same blockers.
+const askable = computed(() => blockers.value.length === 0 && !same.value && valid.value)
+const preview = useQuery({
+  queryKey: computed(() => [
+    'storagePreview',
+    props.databaseName,
+    props.table.schema,
+    props.table.name,
+    props.partition?.name ?? null,
+    JSON.stringify(body.value),
+  ]),
+  queryFn: () =>
+    props.partition
+      ? endpoints.previewPartitionStorage(
+          props.databaseName,
+          props.table.schema,
+          props.table.name,
+          props.partition.name,
+          body.value,
+        )
+      : endpoints.previewTableStorage(
+          props.databaseName,
+          props.table.schema,
+          props.table.name,
+          body.value,
+        ),
+  enabled: askable,
+  retry: false,
+  staleTime: 0,
+  gcTime: 0,
+})
+const previewUnavailable = computed(() => isUnsupported(preview.error.value))
+const serverBlockers = computed(() => (askable.value ? (preview.data.value?.blockers ?? []) : []))
+const serverNotes = computed(() => (askable.value ? (preview.data.value?.notes ?? []) : []))
+const previewHolds = computed(
+  () =>
+    askable.value &&
+    (preview.isFetching.value ||
+      serverBlockers.value.length > 0 ||
+      (preview.error.value !== null && !previewUnavailable.value)),
+)
+// The blockers of a refusal after the start: typed in `Problem.blockers`; `detail` repeats them as text.
+const refusalBlockers = (error: unknown) =>
   error instanceof ApiError && error.code === 'conversion_refused'
+    ? (error.problem.blockers ?? [])
+    : []
+const refusal = (error: unknown): string[] =>
+  error instanceof ApiError &&
+  error.code === 'conversion_refused' &&
+  (error.problem.blockers ?? []).length === 0
     ? refusalReasons(error.problem.detail)
     : []
 </script>
@@ -136,7 +187,7 @@ const refusal = (error: unknown): string[] =>
     confirm-label="Convert"
     :start="start"
     :validate="validate"
-    :confirm-disabled="blockers.length > 0 || same"
+    :confirm-disabled="blockers.length > 0 || same || previewHolds"
     :invalidate="[
       keys.tables(databaseName),
       keys.table(databaseName, table.schema, table.name),
@@ -150,6 +201,11 @@ const refusal = (error: unknown): string[] =>
     <template #error="{ error }">
       <div class="stack" data-testid="storage-refusal">
         <ProblemNotice :error="error" />
+        <TableBlockerList
+          :lines="refusalBlockers(error)"
+          tone="blocker"
+          heading="What stops this change"
+        />
         <ul v-if="refusal(error).length > 0" class="reasons" data-testid="storage-reasons">
           <li v-for="(r, i) in refusal(error)" :key="i">
             <SafeName :value="r" kind="text" :max="300" />
@@ -202,6 +258,33 @@ const refusal = (error: unknown): string[] =>
           (heap): the usual format.</label
         >
       </fieldset>
+      <div v-if="askable" class="stack" data-testid="storage-preview">
+        <p
+          v-if="preview.isFetching.value"
+          class="muted"
+          role="status"
+          data-testid="storage-preview-loading"
+        >
+          Checking the change...
+        </p>
+        <ProblemNotice
+          v-else-if="preview.error.value && !previewUnavailable"
+          :error="preview.error.value"
+          @retry="preview.refetch()"
+        />
+        <template v-else>
+          <TableBlockerList
+            :lines="serverBlockers"
+            tone="blocker"
+            heading="What stops this change"
+          />
+          <ul v-if="serverNotes.length > 0" class="reasons" data-testid="storage-notes">
+            <li v-for="(n, i) in serverNotes" :key="i">
+              <SafeName :value="n" kind="text" :max="300" />
+            </li>
+          </ul>
+        </template>
+      </div>
       <p v-if="same && blockers.length === 0" class="muted" data-testid="storage-same">
         It is stored in this format already. Choose the other one.
       </p>

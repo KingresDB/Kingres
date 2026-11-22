@@ -198,7 +198,7 @@ export function isoSeconds(text: string | null | undefined): number | null {
 export const INTERVAL_PRESETS: { value: string; label: string }[] = [
   { value: 'PT1H', label: 'Hour' },
   { value: 'P1D', label: 'Day' },
-  { value: 'P1W', label: 'Week' },
+  { value: 'P7D', label: 'Week (7 days)' },
   { value: 'P1M', label: 'Month' },
   { value: 'P1Y', label: 'Year' },
   { value: 'custom', label: 'Every N hours or days...' },

@@ -301,7 +301,13 @@ function configureAggregates(
         'Apply the database settings',
         'Record the settings',
       ]
-    : ['Apply the database settings', 'Record the settings']
+    : [
+        'Check the servers',
+        ...ids.map((id) => `Install the extension on server ${id}`),
+        'Verify versions and hashes',
+        'Apply the database settings',
+        'Record the settings',
+      ]
   const hashFails = b.enabled === true && knobs.sketch === 'hash'
   return createTask(s, {
     kind: 'database.approximateAggregates',
@@ -369,8 +375,16 @@ function checkStorageBody(b: S['PartitionStorageRequest']): void {
   if (errors.length > 0) throw validationFailed(errors)
 }
 
-function refuseConversion(reasons: string[]): void {
-  if (reasons.length > 0) throw problem('conversion_refused', reasons.join('\n'), undefined)
+type Blocker = S['TableBlocker']
+const blocker = (code: string, object: string, message: string): Blocker => ({
+  code,
+  object,
+  message,
+})
+/** 409 `conversion_refused`: the typed blockers in `Problem.blockers`, and `detail` repeats them as text. */
+function refuseConversion(blockers: Blocker[]): void {
+  if (blockers.length > 0)
+    throw problem('conversion_refused', blockers.map((b) => b.message).join('\n'), { blockers })
 }
 
 function requireExtensions(s: MockState, target: string, partition: boolean): void {
@@ -378,41 +392,95 @@ function requireExtensions(s: MockState, target: string, partition: boolean): vo
   if (target === 'columnar' && k.columnarMissing)
     throw problem(
       'extension_missing',
-      'kingres_columnar is not installed in this database, or its library is not preloaded on server 10.0.0.12 (shared_preload_libraries).',
+      'kingres_columnar is not installed in this database, or its library is not preloaded on server 10.0.0.12. Restart the instance of that server to load it (shared_preload_libraries is managed); there is no install action for it.',
     )
   if (partition && k.timepartMissing)
-    throw problem('extension_missing', 'kingres_timepart is not installed in this database.')
+    throw problem(
+      'extension_missing',
+      'kingres_timepart is not installed in this database, or its library is not preloaded on server 10.0.0.12. Restart the instance of that server to load it (shared_preload_libraries is managed); there is no install action for it.',
+    )
 }
 
-/** What a conversion of a table or partition cannot be done for: the reasons the 409 lists. */
-function reasonsFor(s: MockState, t: Table, target: string): string[] {
-  const r: string[] = []
-  if (t.classes.includes('ledger')) r.push('is a ledger table')
+/** What a conversion of a table cannot be done for, as typed blockers (contract 0.18.0). */
+function blockersFor(s: MockState, t: Table, target: string): Blocker[] {
+  const r: Blocker[] = []
+  const obj = `${t.schema}.${t.name}`
+  if (t.partitioning)
+    r.push(
+      blocker(
+        'partitioned_table',
+        obj,
+        'a partition that is a parent: convert one partition at a time, or set a time-partitioning policy',
+      ),
+    )
+  if (t.distribution)
+    r.push(
+      blocker(
+        'distributed_table',
+        obj,
+        'is distributed: converting a distributed table is not available in this version',
+      ),
+    )
+  if (t.classes.includes('ledger')) r.push(blocker('ledger_table', obj, 'is a ledger table'))
   if (target === 'columnar') {
     if (!NO_INDEXES.has(t.name) && !t.name.startsWith('metrics_'))
-      r.push(`has an index (${t.name}_pkey): columnar tables have no indexes in this version`)
-    for (const trg of TRIGGERS[t.name] ?? []) r.push(`has a trigger (${trg})`)
+      r.push(
+        blocker(
+          'other',
+          `${t.name}_pkey`,
+          `has an index (${t.name}_pkey): columnar tables have no indexes in this version`,
+        ),
+      )
+    for (const trg of TRIGGERS[t.name] ?? [])
+      r.push(blocker('other', trg, `has a trigger (${trg})`))
   }
-  if (analyticsOf(s).knobs.publication) r.push('is in a publication')
+  if (analyticsOf(s).knobs.publication) r.push(blocker('publication', obj, 'is in a publication'))
   return r
 }
 
-function startSetStorage(s: MockState, rec: DbRec, t: Table, b: S['TableStorageRequest']): Task {
+function storagePreview(
+  current: string | null,
+  target: 'heap' | 'columnar',
+  blockers: Blocker[],
+  partition: boolean,
+): S['TableStoragePreview'] {
+  const notes: string[] = []
+  if (current === target) notes.push(`stored as ${target === 'heap' ? 'rows' : 'columns'} already`)
+  else if (!partition)
+    notes.push(
+      'ALTER TABLE ... SET ACCESS METHOD takes an ACCESS EXCLUSIVE lock on the table until it ends.',
+    )
+  else notes.push('The partition is built aside and swapped in one short step.')
+  return {
+    current,
+    target,
+    willConvert: blockers.length === 0 && current !== target,
+    blockers,
+    notes,
+  }
+}
+
+/** The checks of `setTableStorage`; with `dryRun` the preview, otherwise the refusal or the task. */
+function setTableStorage(
+  s: MockState,
+  rec: DbRec,
+  t: Table,
+  b: S['TableStorageRequest'],
+  dryRun: boolean,
+): Task | S['TableStoragePreview'] {
   checkStorageBody(b)
-  if (t.partitioning)
-    throw problem(
-      'conversion_refused',
-      'a partition that is a parent: convert one partition at a time, or set a time-partitioning policy',
-    )
-  if (t.distribution)
-    throw problem(
-      'conversion_refused',
-      'is distributed: converting a distributed table is not available in this version',
-    )
   requireExtensions(s, b.accessMethod, false)
-  if ((t.storage?.accessMethod ?? 'heap') === b.accessMethod && b.accessMethod === 'heap')
-    throw problem('conversion_refused', 'is stored as rows already')
-  refuseConversion(reasonsFor(s, t, b.accessMethod))
+  const current = t.partitioning ? null : (t.storage?.accessMethod ?? 'heap')
+  const blockers = blockersFor(s, t, b.accessMethod)
+  if (dryRun) return storagePreview(current, b.accessMethod, blockers, false)
+  // Heap to heap changes nothing; columnar to columnar sets the options for new stripes.
+  if (current === 'heap' && b.accessMethod === 'heap')
+    blockers.push(blocker('other', `${t.schema}.${t.name}`, 'is stored as rows already'))
+  refuseConversion(blockers)
+  return startSetStorage(s, rec, t, b)
+}
+
+function startSetStorage(s: MockState, rec: DbRec, t: Table, b: S['TableStorageRequest']): Task {
   const id = keyOf(rec, t)
   if (
     holdsTable(s, id, [
@@ -432,7 +500,7 @@ function startSetStorage(s: MockState, rec: DbRec, t: Table, b: S['TableStorageR
   return createTask(s, {
     kind: 'table.setStorage',
     subject: { type: 'table', id },
-    steps: ['check', 'convert', 'analyze'],
+    steps: ['Check the table', 'Convert the storage', 'Analyze the table'],
     detail:
       'ALTER TABLE ... SET ACCESS METHOD takes an ACCESS EXCLUSIVE lock on the table until it ends.',
     cancellable: true,
@@ -487,7 +555,8 @@ function startSetPartitionStorage(
   t: Table,
   partition: string,
   b: S['PartitionStorageRequest'],
-): Task {
+  dryRun: boolean,
+): Task | S['TableStoragePreview'] {
   const list = partitionsOf(s, rec, t)
   const p = list.find((x) => x.name === partition)
   if (!t.partitioning || !p) throw problem('not_found', `Partition "${partition}" does not exist.`)
@@ -497,23 +566,41 @@ function startSetPartitionStorage(
   if (bad !== undefined)
     throw validationFailed([{ field: 'sortBy', message: `The table has no column "${bad}".` }])
   requireExtensions(s, b.accessMethod, true)
-  const reasons: string[] = []
-  if (p.isDefault) reasons.push('is a default partition')
+  const current = p.accessMethod ?? 'heap'
+  const blockers: Blocker[] = []
+  if (p.isDefault) blockers.push(blocker('partition', partition, 'is a default partition'))
   if (t.distribution)
-    reasons.push(
-      'belongs to a distributed table: converting its partitions is not available in this version',
+    blockers.push(
+      blocker(
+        'distributed_table',
+        `${t.schema}.${t.name}`,
+        'belongs to a distributed table: converting its partitions is not available in this version',
+      ),
     )
-  if ((p.accessMethod ?? 'heap') === b.accessMethod)
-    reasons.push(`is stored as ${b.accessMethod === 'heap' ? 'rows' : 'columns'} already`)
   if (b.accessMethod === 'columnar') {
-    for (const trg of TRIGGERS[t.name] ?? []) reasons.push(`has a trigger (${trg})`)
+    for (const trg of TRIGGERS[t.name] ?? [])
+      blockers.push(blocker('other', trg, `has a trigger (${trg})`))
     if (!NO_INDEXES.has(t.name))
-      reasons.push(
-        `the table has an index (${t.name}_pkey): columnar partitions have no indexes in this version`,
+      blockers.push(
+        blocker(
+          'other',
+          `${t.name}_pkey`,
+          `the table has an index (${t.name}_pkey): columnar partitions have no indexes in this version`,
+        ),
       )
   }
-  if (analyticsOf(s).knobs.publication) reasons.push('is in a publication')
-  refuseConversion(reasons)
+  if (analyticsOf(s).knobs.publication)
+    blockers.push(blocker('publication', partition, 'is in a publication'))
+  if (dryRun) return storagePreview(current, b.accessMethod, blockers, true)
+  if (current === b.accessMethod)
+    blockers.push(
+      blocker(
+        'other',
+        partition,
+        `is stored as ${b.accessMethod === 'heap' ? 'rows' : 'columns'} already`,
+      ),
+    )
+  refuseConversion(blockers)
   const subject = `${rec.info.name}/${t.schema}.${partition}`
   if (
     holdsTable(s, subject, ['table.setStorage']) ||
@@ -527,7 +614,7 @@ function startSetPartitionStorage(
   return createTask(s, {
     kind: 'table.setStorage',
     subject: { type: 'table', id: subject },
-    steps: ['check', 'convert', 'analyze'],
+    steps: ['Check the partition', 'Convert the partition', 'Analyze the partition'],
     cancellable: true,
     failAt: fails
       ? {
@@ -574,7 +661,11 @@ function convertPartition(
 const ISO_RE = /^P(?!$)(\d+Y)?(\d+M)?(\d+W)?(\d+D)?(T(?=\d)(\d+H)?(\d+M)?(\d+S)?)?$/
 const HOUR_DIVISORS = [1, 2, 3, 4, 6, 8, 12]
 
-function validatePolicy(b: Partial<PolicyRequest>, timezones = true): Required<PolicyRequest> {
+function validatePolicy(
+  b: Partial<PolicyRequest>,
+  timeType: string | null = null,
+  timezones = true,
+): Required<PolicyRequest> {
   const errors: { field: string; message: string }[] = []
   const bad = (field: string, message: string) => errors.push({ field: `/${field}`, message })
   const duration = (field: string, v: unknown, required: boolean): string | null => {
@@ -591,11 +682,16 @@ function validatePolicy(b: Partial<PolicyRequest>, timezones = true): Required<P
   const every = duration('partitionEvery', b.partitionEvery, true)
   if (every) {
     const sp = splitIso(every)
-    if (sp?.unit === 'hour' && !HOUR_DIVISORS.includes(sp.count))
-      bad('partitionEvery', 'Use a number of hours that divides a day: 1, 2, 3, 4, 6, 8 or 12.')
-    if (sp && sp.unit !== 'hour' && sp.unit !== 'day' && sp.count !== 1)
-      bad('partitionEvery', 'A week, a month and a year can be used once: P1W, P1M, P1Y.')
-    if (sp?.unit === 'day' && sp.count > 31) bad('partitionEvery', 'Use at most 31 days.')
+    const shape =
+      'Use PT1H, PT2H, PT3H, PT4H, PT6H, PT8H or PT12H, P<n>D (n 1 to 3660), P1M, P2M, P3M, P4M, P6M or P<n>Y (n 1 to 1000).'
+    if (sp?.unit === 'week') bad('partitionEvery', 'A week is P7D. ' + shape)
+    else if (sp?.unit === 'hour' && !HOUR_DIVISORS.includes(sp.count)) bad('partitionEvery', shape)
+    else if (sp?.unit === 'day' && sp.count > 3660) bad('partitionEvery', shape)
+    else if (sp?.unit === 'month' && ![1, 2, 3, 4, 6].includes(sp.count))
+      bad('partitionEvery', shape)
+    else if (sp?.unit === 'year' && sp.count > 1000) bad('partitionEvery', shape)
+    if (sp?.unit === 'hour' && timeType === 'date')
+      bad('partitionEvery', 'A partition of hours needs a timestamp column, not a date column.')
   }
   const ahead = duration('createAhead', b.createAhead ?? 'P7D', false) ?? 'P7D'
   const retention = duration('retention', b.retention, false)
@@ -685,7 +781,7 @@ function policyView(s: MockState, rec: DbRec, t: Table): Policy {
 }
 
 function putPolicy(s: MockState, rec: DbRec, t: Table, b: Partial<PolicyRequest>): Policy {
-  const req = validatePolicy(b)
+  const req = validatePolicy(b, timeColumnType(t))
   if (!timeColumnType(t))
     throw problem(
       'partition_policy_conflict',
@@ -695,6 +791,11 @@ function putPolicy(s: MockState, rec: DbRec, t: Table, b: Partial<PolicyRequest>
     throw problem('extension_missing', 'kingres_timepart is not installed in this database.')
   const key = keyOf(rec, t)
   const a = analyticsOf(s)
+  if (holdsTable(s, key, ['partition.maintain']))
+    throw problem(
+      'operation_in_progress',
+      'A run of this policy is going on. Try again when it has ended.',
+    )
   const before = a.policies[key]
   a.policies[key] = {
     req,
@@ -815,6 +916,10 @@ function startRun(s: MockState, rec: DbRec, t: Table, asOfText?: string): Task {
     const d = new Date(asOfText)
     if (Number.isNaN(d.getTime()))
       throw validationFailed([{ field: '/asOf', message: 'Give a date and time.' }])
+    if (Math.abs(d.getTime() - Date.now()) > 5 * 60_000)
+      throw validationFailed([
+        { field: '/asOf', message: 'Use a time within five minutes of the time of the instance.' },
+      ])
     asOf = d
   }
   tickTasks(s)
@@ -842,7 +947,13 @@ function startRun(s: MockState, rec: DbRec, t: Table, asOfText?: string): Task {
   const task = createTask(s, {
     kind: 'partition.maintain',
     subject: { type: 'table', id: key },
-    steps: ['begin', 'create', 'convert', 'retire', 'finish'],
+    steps: [
+      'Begin the run',
+      'Create partitions',
+      'Convert partitions',
+      'Retire partitions',
+      'Finish the run',
+    ],
     cancellable: true,
     failWith: knobs.runFails
       ? 'The run could not take the lock on the table and gave up.'
@@ -931,9 +1042,14 @@ export function raisePolicyAlert(
   t: Table,
   kind: 'partitionsAheadLow' | 'partitionPolicyFailed',
 ): void {
-  const aspect = `table:${t.schema}.${t.name}`
   if (
-    s.alerts.some((a) => a.kind === kind && a.state !== 'resolved' && a.subject?.aspect === aspect)
+    s.alerts.some(
+      (a) =>
+        a.kind === kind &&
+        a.state !== 'resolved' &&
+        a.subject?.tableSchema === t.schema &&
+        a.subject?.tableName === t.name,
+    )
   )
     return
   s.alerts.unshift({
@@ -957,7 +1073,9 @@ export function raisePolicyAlert(
       behindServerId: null,
       shardGroupId: null,
       databaseName: rec.info.name,
-      aspect,
+      aspect: null,
+      tableSchema: t.schema,
+      tableName: t.name,
     },
   })
 }
@@ -1246,22 +1364,34 @@ export function analyticsHandlers(): Partial<Record<OperationId, Handler>> {
       ),
     setTableStorage: (c) => {
       const { rec, t } = tableOf(c.s, c.params)
-      return accepted(startSetStorage(c.s, rec, t, (c.body ?? {}) as S['TableStorageRequest']))
+      const out = setTableStorage(
+        c.s,
+        rec,
+        t,
+        (c.body ?? {}) as S['TableStorageRequest'],
+        c.url.searchParams.get('dryRun') === 'true',
+      )
+      return 'willConvert' in out ? ok(out) : accepted(out)
     },
     setPartitionStorage: (c) => {
       const { rec, t } = tableOf(c.s, c.params)
-      return accepted(
-        startSetPartitionStorage(
-          c.s,
-          rec,
-          t,
-          c.params.partitionName ?? '',
-          (c.body ?? {}) as S['PartitionStorageRequest'],
-        ),
+      const out = startSetPartitionStorage(
+        c.s,
+        rec,
+        t,
+        c.params.partitionName ?? '',
+        (c.body ?? {}) as S['PartitionStorageRequest'],
+        c.url.searchParams.get('dryRun') === 'true',
       )
+      return 'willConvert' in out ? ok(out) : accepted(out)
     },
     getPartitionPolicy: (c) => {
       const { rec, t } = tableOf(c.s, c.params)
+      if (analyticsOf(c.s).knobs.timepartMissing)
+        throw problem(
+          'not_found',
+          'kingres_timepart is not installed in this database, so the table has no policy.',
+        )
       return ok(policyView(c.s, rec, t))
     },
     putPartitionPolicy: (c) => {
@@ -1289,6 +1419,7 @@ export function analyticsHandlers(): Partial<Record<OperationId, Handler>> {
     listPartitionPolicyRuns: (c) => {
       const { rec, t } = tableOf(c.s, c.params)
       syncRuns(c.s)
+      if (analyticsOf(c.s).knobs.timepartMissing) return ok({ items: [], nextCursor: null })
       const state = c.url.searchParams.get('state')
       if (state !== null && !['running', 'done', 'partial', 'failed'].includes(state))
         throw validationFailed([

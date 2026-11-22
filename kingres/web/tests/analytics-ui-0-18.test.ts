@@ -26,10 +26,13 @@ const enabled = async (b: HTMLElement) => waitFor(() => expect(b).toBeEnabled())
 const bodies: unknown[] = []
 let capture: { method: string; suffix: string } | null = null
 mockServer.events.on('request:start', async ({ request }) => {
+  const url = new URL(request.url)
+  // A request with dryRun only asks; it is not a change.
   if (
     capture &&
     request.method === capture.method &&
-    new URL(request.url).pathname.endsWith(capture.suffix)
+    url.pathname.endsWith(capture.suffix) &&
+    url.searchParams.get('dryRun') !== 'true'
   )
     bodies.push(await request.clone().json())
 })
@@ -328,8 +331,13 @@ describe('the Storage column of the tables list', () => {
   })
 })
 
-const await_json = () => (body: unknown) =>
-  new Response(JSON.stringify(body), { headers: { 'Content-Type': 'application/json' } })
+const await_json =
+  () =>
+  (body: unknown, status = 200) =>
+    new Response(JSON.stringify(body), {
+      status,
+      headers: { 'Content-Type': status >= 400 ? 'application/problem+json' : 'application/json' },
+    })
 
 describe('the table page: storage and partitions', () => {
   it('says the format of the table and of each partition, with the ratio and the rows', async () => {
@@ -432,11 +440,59 @@ describe('the table page: storage and partitions', () => {
     expect(dialog.getByTestId('storage-table-note')).toHaveTextContent(
       /blocks readers and writers/i,
     )
-    await user.click(dialog.getByRole('button', { name: /^convert$/i }))
+    // The server's own check (dryRun) comes before the start: its blockers are listed and Convert stays off.
+    const blockers = await dialog.findByTestId('table-blockers')
+    expect(blockers).toHaveTextContent(/a publication/i)
+    expect(blockers).toHaveTextContent(/is in a publication/i)
+    expect(dialog.getByRole('button', { name: /^convert$/i })).toBeDisabled()
+    expect(getState().tasks.some((t) => t.task.kind === 'table.setStorage')).toBe(false)
+  })
+
+  it('when the server cannot preview, the start is asked and the refusal comes back with its typed blockers', async () => {
+    sw('analytics=timeseries,publication')
+    mockServer.use(
+      (await import('msw')).http.put('*/storage', ({ request }) =>
+        new URL(request.url).searchParams.get('dryRun') === 'true'
+          ? await_json()(
+              { type: 'about:blank', title: 'x', status: 422, code: 'unsupported_operation' },
+              422,
+            )
+          : await_json()(
+              {
+                type: 'about:blank',
+                title: 'x',
+                status: 409,
+                code: 'conversion_refused',
+                detail: 'is in a publication',
+                blockers: [
+                  { code: 'publication', object: 'public.clicks', message: 'is in a publication' },
+                ],
+              },
+              409,
+            ),
+      ),
+    )
+    const user = userEvent.setup()
+    await renderApp(table('clicks'))
+    await user.click(await screen.findByTestId('convert-storage'))
+    const dialog = await dialogOf(/^convert storage of table clicks/i)
+    const start = dialog.getByRole('button', { name: /^convert$/i })
+    await enabled(start)
+    await user.click(start)
     const refusal = await dialog.findByTestId('storage-refusal')
     expect(refusal).toHaveTextContent('The storage format cannot be changed')
-    expect(within(refusal).getByTestId('storage-reasons')).toHaveTextContent(/is in a publication/i)
-    expect(getState().tasks.some((t) => t.task.kind === 'table.setStorage')).toBe(false)
+    expect(within(refusal).getByTestId('table-blockers')).toHaveTextContent(/is in a publication/i)
+  })
+
+  it('the preview of a change that can be made lists its notes and lets it start', async () => {
+    sw('analytics=timeseries')
+    const user = userEvent.setup()
+    await renderApp(table('clicks'))
+    await user.click(await screen.findByTestId('convert-storage'))
+    const dialog = await dialogOf(/^convert storage of table clicks/i)
+    expect(await dialog.findByTestId('storage-notes')).toHaveTextContent(/ACCESS EXCLUSIVE/)
+    await enabled(dialog.getByRole('button', { name: /^convert$/i }))
+    expect(dialog.queryByTestId('table-blockers')).not.toBeInTheDocument()
   })
 
   it('several reasons are several lines', async () => {
@@ -444,11 +500,11 @@ describe('the table page: storage and partitions', () => {
     await renderApp('/databases/reports/tables/public/exports')
     await user.click(await screen.findByTestId('convert-storage'))
     const dialog = await dialogOf(/^convert storage of table exports/i)
-    await user.click(dialog.getByRole('button', { name: /^convert$/i }))
-    const reasons = await dialog.findByTestId('storage-reasons')
+    const reasons = await dialog.findByTestId('table-blockers')
     expect(within(reasons).getAllByRole('listitem').length).toBeGreaterThanOrEqual(2)
     expect(reasons).toHaveTextContent(/exports_pkey/)
     expect(reasons).toHaveTextContent(/exports_audit/)
+    expect(dialog.getByRole('button', { name: /^convert$/i })).toBeDisabled()
   })
 
   it('what the console knows stops the start before it asks: a ledger table', async () => {
@@ -906,7 +962,7 @@ describe('the alerts of the scheduler', () => {
     expect(await screen.findByTestId('policy-panel')).toBeInTheDocument()
   })
 
-  it('a qualifier that does not read like a table is shown as sent', async () => {
+  it('an alert with no table in its subject links to nothing and shows the qualifier as sent', async () => {
     sw('analytics=timeseries')
     getState().alerts.unshift({
       id: 999,

@@ -95,15 +95,14 @@ const ledgerLinkText = computed(() => {
         ? 'Publication of the ledger'
         : 'Ledger page'
 })
-// 0.18.0: an alert about a time-partitioning policy links to the partitions panel of the table. The contract names the database
-// only; the control plane sends the table as `aspect` `table:<schema>.<table>` (see the contract notes of the console), and a
-// qualifier that does not read like that is shown as sent.
+// 0.18.0: an alert about a time-partitioning policy names its table in the typed members `tableSchema` and `tableName` of the
+// subject and links to the partitions panel of that table. The names are used as they are: a name with a dot is unambiguous.
 const isPolicyAlert = computed(() =>
   ['partitionsAheadLow', 'partitionPolicyFailed'].includes(props.alert.kind),
 )
 const policyTable = computed(() => {
-  const m = /^table:([^.]+)\.(.+)$/.exec(subject.value.aspect ?? '')
-  return m && subject.value.databaseName ? { schema: m[1] as string, table: m[2] as string } : null
+  const s = subject.value as { tableSchema?: string | null; tableName?: string | null }
+  return s.tableSchema && s.tableName ? { schema: s.tableSchema, table: s.tableName } : null
 })
 const canTable = computed(() => session.can('getTable'))
 const isPending = computed(() => props.alert.kind === 'replicationPending')

@@ -71,6 +71,12 @@ const BLOCKER_LABEL: Record<string, string> = {
   not_plain: 'The table is already distributed',
   ledger_table: 'A ledger table',
   user_partitioned: 'A user-partitioned table',
+  // Phase 12 (contract 0.18.0, `TableStoragePreview` and `conversion_refused`).
+  partition: 'A partition that cannot be converted',
+  distributed_table: 'A distributed table',
+  publication: 'A publication',
+  foreign_keys: 'Foreign keys',
+  other: 'Refused by the extension',
   free_space: 'Not enough free space',
 }
 

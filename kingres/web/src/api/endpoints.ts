@@ -56,6 +56,20 @@ async function startedTask(answer: Promise<Task | S['FailoverPlan']>): Promise<T
   return result
 }
 
+/** A storage change without `dryRun` answers a task; a preview can not come back (the panel never asks for it there). */
+async function storageTask(answer: Promise<unknown>): Promise<Task> {
+  const r = await unwrap(answer as never)
+  if (!('id' in (r as object))) throw new Error('The server answered with a preview, not a task.')
+  return r as Task
+}
+/** A storage change with `dryRun` answers the preview; a task can not come back. */
+async function storagePreview(answer: Promise<unknown>): Promise<S['TableStoragePreview']> {
+  const r = await unwrap(answer as never)
+  if (!('willConvert' in (r as object)))
+    throw new Error('The server answered with a task, not a preview.')
+  return r as S['TableStoragePreview']
+}
+
 export interface Page {
   limit?: number
   cursor?: string
@@ -315,7 +329,7 @@ export const endpoints = {
     tableName: string,
     body: S['TableStorageRequest'],
   ) =>
-    j(
+    storageTask(
       api.PUT('/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/storage', {
         params: { path: { databaseName, schemaName, tableName } },
         body,
@@ -328,10 +342,42 @@ export const endpoints = {
     partitionName: string,
     body: S['PartitionStorageRequest'],
   ) =>
-    j(
+    storageTask(
       api.PUT(
         '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partitions/{partitionName}/storage',
         { params: { path: { databaseName, schemaName, tableName, partitionName } }, body },
+      ),
+    ),
+  /** What a storage change of a table would do (`dryRun=true`): the blockers and notes, no task. */
+  previewTableStorage: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    body: S['TableStorageRequest'],
+  ) =>
+    storagePreview(
+      api.PUT('/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/storage', {
+        params: { path: { databaseName, schemaName, tableName }, query: { dryRun: true } },
+        body,
+      }),
+    ),
+  previewPartitionStorage: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    partitionName: string,
+    body: S['PartitionStorageRequest'],
+  ) =>
+    storagePreview(
+      api.PUT(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partitions/{partitionName}/storage',
+        {
+          params: {
+            path: { databaseName, schemaName, tableName, partitionName },
+            query: { dryRun: true },
+          },
+          body,
+        },
       ),
     ),
   getPartitionPolicy: (databaseName: string, schemaName: string, tableName: string) =>
@@ -365,11 +411,17 @@ export const endpoints = {
         { params: { path: { databaseName, schemaName, tableName } } },
       ),
     ),
-  runPartitionPolicy: (databaseName: string, schemaName: string, tableName: string) =>
+  /** `asOf` is for tests and dry replays: within five minutes of the time of the instance. The panel never sends it. */
+  runPartitionPolicy: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    body: S['RunPartitionPolicyRequest'] = {},
+  ) =>
     j(
       api.POST(
         '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partition-policy/runs',
-        { params: { path: { databaseName, schemaName, tableName } }, body: {} },
+        { params: { path: { databaseName, schemaName, tableName } }, body },
       ),
     ),
   listPartitionPolicyRuns: (
