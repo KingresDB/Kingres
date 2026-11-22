@@ -245,6 +245,7 @@ SELECT name, setting, unit, context
  kingres_shard.enable_bulk_routing            | on      |      | user
  kingres_shard.enable_colocated_insert_select | on      |      | user
  kingres_shard.enable_copy_routing            | on      |      | user
+ kingres_shard.enable_distributed_merge       | on      |      | user
  kingres_shard.enable_distributed_scan        | on      |      | user
  kingres_shard.enable_partial_aggregation     | on      |      | user
  kingres_shard.enable_pushdown                | on      |      | user
@@ -260,6 +261,7 @@ SELECT name, setting, unit, context
  kingres_shard.insert_batch_rows              | 1000    |      | user
  kingres_shard.max_distributed_schemas        | 10000   |      | sighup
  kingres_shard.max_partition_leaves           | 8192    |      | user
+ kingres_shard.merge_max_source_bytes         | 65536   | kB   | user
  kingres_shard.min_bucket_cost                | 1024    | kB   | user
  kingres_shard.move_catchup_threshold         | 1024    | kB   | user
  kingres_shard.move_cleanup_delay             | 600     | s    | user
@@ -280,7 +282,7 @@ SELECT name, setting, unit, context
  kingres_shard.schema_placement_group         | -1      |      | superuser
  kingres_shard.shippable_extensions           | all     |      | user
  kingres_shard.table_cleanup_delay            | 600     | s    | user
-(47 rows)
+(49 rows)
 
 SET kingres_shard.default_bucket_count = 0;
 ERROR:  0 is outside the valid range for parameter "kingres_shard.default_bucket_count" (1 .. 4096)

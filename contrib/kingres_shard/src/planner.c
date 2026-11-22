@@ -106,6 +106,7 @@
 #include "forward_auth.h"
 #include "hashing.h"
 #include "kingres_shard.h"
+#include "merge.h"
 #include "node_conn.h"
 #include "pg_compat.h"
 #include "planner.h"
@@ -3488,6 +3489,22 @@ planner_hook_body(Query *parse, const char *query_string,
 		return pass_through(parse, query_string, cursorOptions, boundParams);
 
 	refuse_bucket_partition_write(parse, cat);
+
+	/*
+	 * Phase 12, design 7: a MERGE into a distributed table.  The decision reads the catalog and
+	 * may reload this backend's cache, so nothing taken from it before is used after it (the
+	 * analysis below starts from the new cache).  A statement of a shape that no path accepts is
+	 * refused here, before any group has run anything; with the switch off the statement goes on
+	 * to the refusals of phase 2a.
+	 */
+	if (parse->commandType == CMD_MERGE && kingres_shard_enable_distributed_merge &&
+		!this_is_local_part && !kingres_shard_session_forwarded())
+	{
+		KsMerge		mg;
+
+		(void) kingres_shard_merge_classify(parse, &mg);
+		cat = kingres_shard_catalog();
+	}
 
 	/*
 	 * The analysis and the refresh of the partition lists take locks, which process invalidations

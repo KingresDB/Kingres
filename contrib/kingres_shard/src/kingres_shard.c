@@ -47,6 +47,7 @@
 #include "catalog.h"
 #include "dist_scan.h"
 #include "fragment_scan.h"
+#include "merge.h"
 #include "repartition.h"
 #include "fanout.h"
 #include "forward_auth.h"
@@ -499,6 +500,7 @@ _PG_init(void)
 							NULL, NULL, NULL);
 
 	kingres_shard_repartition_init();
+	kingres_shard_merge_init();
 	MarkGUCPrefixReserved("kingres_shard");
 
 	/* Two-phase commit needs prepared transactions on every node. */
