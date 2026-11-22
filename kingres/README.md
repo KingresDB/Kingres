@@ -22,7 +22,7 @@ The design is in [docs/architecture.md](docs/architecture.md). It separates sour
 
 ## Status
 
-There is one product branch per PostgreSQL major, with the same KingresDB code on each: `kingres-18` on upstream tag `REL_18_7`, and `kingres-19` on `REL_19_RC2` (a pre-release until PostgreSQL 19 is released); see [docs/dev/releases.md](docs/dev/releases.md). Each row carries its own dates (the rows were updated up to 2026-11-20), by phase of the roadmap in [docs/architecture.md](docs/architecture.md):
+There is one product branch per PostgreSQL major, with the same KingresDB code on each: `kingres-18` on upstream tag `REL_18_7`, and `kingres-19` on `REL_19_0` (PostgreSQL 19.0, released upstream on 2026-11-16; the branch moved from `REL_19_RC2` on 2026-11-22); see [docs/dev/releases.md](docs/dev/releases.md). Each row carries its own dates (the rows were updated up to 2026-11-20), by phase of the roadmap in [docs/architecture.md](docs/architecture.md):
 
 | Phase | State |
 |---|---|

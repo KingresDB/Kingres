@@ -12,6 +12,7 @@ This document turns the architecture document's "Branch choice and mirror mechan
 - Git is configured with `core.autocrlf=false` and `core.eol=lf`. The tree must stay LF on Windows.
 - PostgreSQL 18 is supported until 2030-11-14. PostgreSQL 19 GA is scheduled for 2026-11-19 (architecture document, citing the versioning policy and the PG19 RC1 announcement).
 - The newest upstream tag of PostgreSQL 19 on 2026-11-15 is `REL_19_RC2`; there is no `REL_19_0` yet. The core patches that existed then, KP-0001 to KP-0003 (`meson.build`, `contrib/meson.build`, `README.md`), applied to `REL_19_RC2` without a change (checked 2026-11-15 with `git apply`). The register has four entries now; KP-0004 (the `LICENSE` file) is applied on `kingres-19` as well.
+- PostgreSQL 19.0 was released on 2026-11-16 (`REL_19_0`). `kingres-19` merged `REL_19_0` on 2026-11-22; the core patches needed no change (see [releases.md](releases.md), "State on 2026-11-22").
 
 ## Branches
 
