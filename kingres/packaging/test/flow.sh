@@ -215,11 +215,20 @@ flow_check_extension_versions() {
         check "${p}: ALTER EXTENSION ${e} UPDATE" svc -d ext_upgrade -v ON_ERROR_STOP=1 -c "alter extension ${e} update"
     done
     check_eq "${p}: every extension is at the default version of this package" \
-        "kingres_columnar 0.2 kingres_ledger 0.3 kingres_shard 0.7 kingres_sketch 1.0 kingres_timepart 0.2" \
+        "kingres_columnar 0.2 kingres_ledger 0.3 kingres_shard 0.8 kingres_sketch 1.0 kingres_timepart 0.2" \
         "$(svc -d ext_upgrade -Atc "select string_agg(extname || ' ' || extversion, ' ' order by extname) from pg_extension where extname like 'kingres%'" 2>/dev/null)"
     check "${p}: the updated kingres_timepart has the conversion procedure of 0.2" \
         svc -d ext_upgrade -v ON_ERROR_STOP=1 -c "select 'kingres.convert_partition'::regproc" -c "select 'kingres.table_change_report'::regproc"
     check "${p}: drop the scratch database ext_upgrade" svc -d postgres -v ON_ERROR_STOP=1 -c 'drop database ext_upgrade'
+    # the step of this release: kingres_shard 0.7 (the previous package) to 0.8 (distributed schemas, the bucket layout, splits)
+    check "${p}: create the scratch database ext_upgrade78" svc -d postgres -v ON_ERROR_STOP=1 -c 'create database ext_upgrade78'
+    check "${p}: install kingres_shard 0.7" svc -d ext_upgrade78 -v ON_ERROR_STOP=1 -c "create extension kingres_shard version '0.7'"
+    check "${p}: ALTER EXTENSION kingres_shard UPDATE (0.7 to 0.8)" svc -d ext_upgrade78 -v ON_ERROR_STOP=1 -c "alter extension kingres_shard update"
+    check_eq "${p}: kingres_shard is at 0.8" "kingres_shard 0.8" \
+        "$(svc -d ext_upgrade78 -Atc "select extname || ' ' || extversion from pg_extension where extname = 'kingres_shard'" 2>/dev/null)"
+    check "${p}: the 0.8 objects are there (schemas view, distribute_schema, split_bucket)" svc -d ext_upgrade78 -v ON_ERROR_STOP=1 \
+        -c "select 'kingres.schemas'::regclass" -c "select 'kingres.distribute_schema'::regproc" -c "select 'kingres.split_bucket'::regproc"
+    check "${p}: drop the scratch database ext_upgrade78" svc -d postgres -v ON_ERROR_STOP=1 -c 'drop database ext_upgrade78'
 }
 
 # flow_check_distribute_rows PREFIX: create_distributed_table of a table that

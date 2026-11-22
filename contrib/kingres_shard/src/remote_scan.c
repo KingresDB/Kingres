@@ -78,6 +78,7 @@
 #define KS_PRIV_IS_WRITE	5	/* Integer: the statement writes */
 #define KS_PRIV_DEFERRED	6	/* Integer: fails when started */
 #define KS_PRIV_RETURNS_ROWS 7	/* Integer: result rows are returned */
+#define KS_PRIV_PATH		8	/* String: the search_path the statement runs under on the owner (optional) */
 
 
 /* Depth of retries in progress: a retried statement is not retried again. */
@@ -88,6 +89,7 @@ typedef struct KsRemoteScanState
 {
 	CustomScanState css;
 	char	   *sql;
+	char	   *search_path;
 	char	   *host;
 	int			port;
 	int			group_id;
@@ -243,6 +245,18 @@ kingres_shard_make_remote_plan(Query *parse, char *sql, const char *host,
 								int port, int group_id, int bucket,
 								bool is_write, List *relids)
 {
+	return kingres_shard_make_remote_plan_path(parse, sql, host, port, group_id, bucket, is_write, relids, NULL);
+}
+
+/*
+ * The same, for a statement that calls functions of a distributed schema: the owner runs it with search_path set to the path given
+ * (the one of the session that issued it), so that the bodies of the functions resolve their names as they do here.
+ */
+PlannedStmt *
+kingres_shard_make_remote_plan_path(Query *parse, char *sql, const char *host,
+									int port, int group_id, int bucket,
+									bool is_write, List *relids, const char *search_path)
+{
 	bool		returns_rows = (parse->commandType == CMD_SELECT ||
 								parse->returningList != NIL);
 	List	   *private;
@@ -253,6 +267,8 @@ kingres_shard_make_remote_plan(Query *parse, char *sql, const char *host,
 	private = lappend(private, makeInteger(is_write ? 1 : 0));
 	private = lappend(private, makeInteger(0));
 	private = lappend(private, makeInteger(returns_rows ? 1 : 0));
+	if (search_path != NULL)
+		private = lappend(private, makeString(pstrdup(search_path)));
 
 	return kingres_shard_wrap_plan(parse, kingres_shard_build_scan(parse, private, returns_rows), relids,
 					 returns_rows);
@@ -303,6 +319,7 @@ ks_create_scan_state(CustomScan *cscan)
 	s->is_write = intVal(list_nth(p, KS_PRIV_IS_WRITE)) != 0;
 	s->deferred = intVal(list_nth(p, KS_PRIV_DEFERRED)) != 0;
 	s->returns_rows = intVal(list_nth(p, KS_PRIV_RETURNS_ROWS)) != 0;
+	s->search_path = list_length(p) > KS_PRIV_PATH ? pstrdup(strVal(list_nth(p, KS_PRIV_PATH))) : NULL;
 	return (Node *) s;
 }
 
@@ -567,8 +584,27 @@ fetch_remote(KsRemoteScanState *s)
 	kingres_shard_begin_xact(kc);
 	fresh = (kc->nstatements == 0);
 
+	if (s->search_path != NULL)
+	{
+		const char *pv[1];
+		PGresult   *sp;
+
+		pv[0] = s->search_path;
+		sp = kingres_shard_exec_params(kc, "SELECT pg_catalog.set_config('search_path', $1, true), pg_catalog.set_config('kingres_shard.shipped_scope', 'on', true)", 1, NULL, pv, true);
+		if (sp == NULL || PQresultStatus(sp) != PGRES_TUPLES_OK)
+			kingres_shard_report_error(kc, sp, "set search_path");
+		PQclear(sp);
+	}
 	values = kingres_shard_params_to_text(params, &types, &nparams);
 	res = kingres_shard_exec_params(kc, s->sql, nparams, types, values, false);
+	if (s->search_path != NULL && res != NULL &&
+		(PQresultStatus(res) == PGRES_COMMAND_OK || PQresultStatus(res) == PGRES_TUPLES_OK))
+	{
+		/* the connection's fixed settings again, for the statements that follow in this transaction */
+		PGresult   *back = kingres_shard_exec(kc, "SET LOCAL search_path = pg_catalog; SET LOCAL kingres_shard.shipped_scope = off");
+
+		PQclear(back);
+	}
 
 	/*
 	 * A statement that was not carried out is an error, never "zero rows" (S11-01, S11-12): the

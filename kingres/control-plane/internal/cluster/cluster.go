@@ -341,6 +341,7 @@ func (s *Service) connect(ctx context.Context, db string) (*pgx.Conn, error) {
 	}
 	cfg.ConnectTimeout = 5 * time.Second
 	cfg.RuntimeParams["application_name"] = "kingresd-setup"
+	safeServiceSession(cfg)
 	return pgx.ConnectConfig(ctx, cfg)
 }
 
@@ -429,3 +430,11 @@ func (s *Service) SystemDSN() string {
 // PublishSystemDSN gives the sinks of OnDSN the system DSN as it is now: after a promotion of the map group the engine and the store
 // move to the promoted instance.
 func (s *Service) PublishSystemDSN() { s.publishDSN() }
+
+// safeServiceSession fixes the search path of a service connection in its startup parameters, which outrank the settings of a database and of a role. The
+// owner of a database can run ALTER DATABASE ... SET search_path, and a service session that took it would resolve an unqualified operator or function to
+// an object that the owner planted and run it as the service role (a superuser). The service role's own statements name what they use; pg_catalog is the
+// only schema that they search.
+func safeServiceSession(cfg *pgx.ConnConfig) {
+	cfg.RuntimeParams["search_path"] = "pg_catalog"
+}
