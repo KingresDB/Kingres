@@ -126,6 +126,7 @@ export function defaultDataTransferSettings(): S['DataTransferSettings'] {
     maxFileBytes: 20 * GiB,
     stagingQuotaBytes: 100 * GiB,
     maxConcurrent: 2,
+    maxAtomicBytes: 2 * GiB,
   }
 }
 

@@ -8,16 +8,17 @@
 // of a download, and a panel that follows the uploads of the tab.
 import { webcrypto } from 'node:crypto'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { screen, waitFor, within } from '@testing-library/vue'
+import { cleanup, screen, waitFor, within } from '@testing-library/vue'
 import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'
 import { endpoints } from '@/api/endpoints'
 import { mockServer } from '@/mocks/server'
-import { getState } from '@/mocks/http'
+import { getState, resetMockState } from '@/mocks/http'
+import { applySwitches } from '@/mocks/switches'
 import { transferSwitches } from '@/mocks/transfer-data'
 import ExportDownload from '@/components/transfers/ExportDownload.vue'
 import UploadStatus from '@/components/transfers/UploadStatus.vue'
-import { GIB, MIB } from '@/lib/transfer'
+import { atomicCapFor, GIB, MIB } from '@/lib/transfer'
 import {
   fingerprintFile,
   findStoredUpload,
@@ -420,3 +421,86 @@ describe('DXW-08 and DXW-07: the download component', () => {
     expect(saved).toEqual([e.sizeBytes])
   })
 })
+
+describe('DataExport.spreadsheetSafe and DataTransferSettings.maxAtomicBytes', () => {
+  it('the download dialog warns about a file written with the guard off, says what the guard did when it was on, and says it does not know when it is null', async () => {
+    const expected = {
+      off: ['download-spreadsheet-off', /guard off/i],
+      on: ['download-spreadsheet-on', /not a security feature/i],
+      unknown: ['download-spreadsheet-note', /does not say which option/i],
+    } as const
+    const values = { off: false, on: true, unknown: null }
+    for (const key of ['off', 'on', 'unknown'] as const) {
+      const user = userEvent.setup()
+      applySwitches(new URLSearchParams('transfer=exports'), getState())
+      getState().transfer.exports.find((e) => e.meta.table === 'orders')!.meta.spreadsheetSafe =
+        values[key]
+      await renderApp('/databases')
+      const panel = await screen.findByTestId('transfers-panel')
+      const row = (await within(panel).findByText('shop.public.orders')).closest(
+        'tr',
+      ) as HTMLElement
+      await user.click(within(row).getByRole('button', { name: /download the file/i }))
+      const dialog = await screen.findByRole('dialog')
+      expect(within(dialog).getByTestId(expected[key][0])).toHaveTextContent(expected[key][1])
+      cleanup()
+      resetMockState()
+    }
+  })
+
+  it('the mock records the option of the export', async () => {
+    await renderApp('/databases')
+    const off = await runTask(
+      await endpoints.exportTable('shop', 'public', 'notes', { spreadsheetSafe: false }),
+    )
+    const on = await runTask(await endpoints.exportTable('shop', 'public', 'notes', {}))
+    const get = async (t: typeof off) =>
+      endpoints.getDataExport(/^transfer (\d+)$/.exec(t.detail ?? '')?.[1] as string)
+    expect((await get(off)).spreadsheetSafe).toBe(false)
+    expect((await get(on)).spreadsheetSafe).toBe(true)
+  })
+
+  it('the import cap is the one the server reports, and 256 MiB at most for a reference table', async () => {
+    expect(atomicCapFor(['plain'], 100 * MIB)).toBe(100 * MIB)
+    expect(atomicCapFor(['plain'])).toBe(2 * GIB)
+    expect(atomicCapFor(['reference'], 3 * GIB)).toBe(256 * MIB)
+    expect(atomicCapFor(['reference'], 100 * MIB)).toBe(100 * MIB)
+    expect(atomicCapFor(['distributed'], 4 * GIB)).toBe(4 * GIB)
+    const user = userEvent.setup()
+    setCap(100 * MIB)
+    await renderApp('/databases/shop')
+    const dialog = await openImport('notes', user)
+    const big = csv()
+    Object.defineProperty(big, 'size', { value: 150 * MIB })
+    await choose(dialog, big, user)
+    expect(within(dialog).getByTestId('file-refused')).toHaveTextContent(/at most 100 MiB/i)
+    expect(within(dialog).getByTestId('to-options')).toBeDisabled()
+  })
+
+  it('the mock refuses an import above the cap of the setting', async () => {
+    await renderApp('/databases')
+    setCap(100 * MIB)
+    const up = await endpoints.createDataUpload({
+      purpose: 'tableImport',
+      sizeBytes: 150 * MIB,
+      fileName: 'x.csv',
+    })
+    getState().transfer.uploads[0]!.upload.state = 'complete'
+    await expect(
+      endpoints.importTable('shop', 'public', 'notes', { uploadId: up.uploadId }),
+    ).rejects.toMatchObject({
+      code: 'import_too_large',
+    })
+  })
+
+  it('the settings page says the cap the server reports', async () => {
+    setCap(512 * MIB)
+    await renderApp('/settings')
+    expect(await screen.findByTestId('data-transfer-state')).toHaveTextContent(/512 MiB of data/)
+  })
+})
+
+/** `maxAtomicBytes` is read-only in the contract (the server reports it); the mock's state sets it. */
+function setCap(bytes: number): void {
+  ;(getState().settings.dataTransfer as { maxAtomicBytes?: number }).maxAtomicBytes = bytes
+}

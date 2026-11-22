@@ -206,6 +206,7 @@ function newExport(
     rows: null,
     consistency: null,
     rlsApplied: false,
+    spreadsheetSafe: null,
     format: b.compression === 'gzip' ? 'csv.gz' : 'csv',
     taskId,
     createdAt: nowIso(),
@@ -242,6 +243,7 @@ function seal(
   e.content = content
   e.encoding = b.encoding ?? 'UTF8'
   e.meta.state = 'ready'
+  e.meta.spreadsheetSafe = b.spreadsheetSafe ?? true
   e.meta.sizeBytes = content.length
   e.meta.sha256 = sha256Hex(content)
   e.meta.rows = rows
@@ -397,7 +399,10 @@ export function transferHandlers(columnsOf: ColumnsOf): Partial<Record<Operation
         throw problem('upload_incomplete', 'The upload has not received all its bytes.')
       if (t.name === FIXTURE_TABLES.blockme)
         throw problem('operation_in_progress', 'An operation on this table is running.')
-      const cap = t.classes.includes('reference') ? MAX_ATOMIC_REFERENCE : MAX_ATOMIC
+      const serverCap = settings(s).maxAtomicBytes ?? MAX_ATOMIC
+      const cap = t.classes.includes('reference')
+        ? Math.min(serverCap, MAX_ATOMIC_REFERENCE)
+        : serverCap
       if (u.upload.sizeBytes > cap || u.fileName === FIXTURE_FILES.toobig)
         throw problem(
           'import_too_large',

@@ -46,7 +46,9 @@ const detail = useTableDetail(props.databaseName, props.table.schema, props.tabl
 const off = computed(() => settings.data.value?.dataTransfer?.enabled === false)
 const maxFileBytes = computed(() => settings.data.value?.dataTransfer?.maxFileBytes ?? null)
 /** The most data one import of this table takes: 2 GiB, and 256 MiB for a reference table (written on every group). */
-const cap = computed(() => atomicCapFor(props.table.classes))
+const cap = computed(() =>
+  atomicCapFor(props.table.classes, settings.data.value?.dataTransfer?.maxAtomicBytes),
+)
 const allColumns = computed(() => detail.data.value?.columns.map((c) => c.name) ?? [])
 
 const form = reactive(defaultImportForm())

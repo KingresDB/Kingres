@@ -348,7 +348,8 @@ function submit(): void {
             disabled with this reason. Turning it on is recorded in the audit log.</template
           >
           A transfer works only over HTTPS. An import is all or nothing and takes at most
-          {{ formatBytes(MAX_ATOMIC_BYTES) }} of data; split a larger file.
+          {{ formatBytes(s.dataTransfer.maxAtomicBytes ?? MAX_ATOMIC_BYTES) }} of data (256 MiB for
+          a reference table); split a larger file.
         </p>
         <FormField
           v-slot="slot"

@@ -19,8 +19,14 @@ export const MAX_ATOMIC_BYTES = 2 * GIB
 export const MAX_ATOMIC_REFERENCE_BYTES = 256 * MIB
 
 /** The most data one import takes for a table with these classes (contract text of `importTable`). */
-export function atomicCapFor(classes: readonly string[]): number {
-  return classes.includes('reference') ? MAX_ATOMIC_REFERENCE_BYTES : MAX_ATOMIC_BYTES
+export function atomicCapFor(classes: readonly string[], fromServer?: number | null): number {
+  // The server says its own cap (`dataTransfer.maxAtomicBytes`); a server that does not has the default of the contract text.
+  const cap =
+    fromServer !== undefined && fromServer !== null && fromServer > 0
+      ? fromServer
+      : MAX_ATOMIC_BYTES
+  // A reference table is written on every group: 256 MiB whatever the flag says.
+  return classes.includes('reference') ? Math.min(cap, MAX_ATOMIC_REFERENCE_BYTES) : cap
 }
 
 /** The most a download keeps in memory when the browser cannot write to a file as it goes. */

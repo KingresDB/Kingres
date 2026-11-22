@@ -43,6 +43,7 @@ function seedExport(
               },
             ],
       rlsApplied: false,
+      spreadsheetSafe: state === 'building' ? null : table !== 'customers',
       format: 'csv',
       taskId: 1,
       createdAt: nowIso(),

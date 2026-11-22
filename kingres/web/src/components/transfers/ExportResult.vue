@@ -70,7 +70,11 @@ const file = useDataExport(exportId)
           <span aria-hidden="true">{{ c.level === 'single-snapshot' ? 'ⓘ' : '▲' }}</span>
           <span>{{ consistencySentence(c) }}</span>
         </div>
-        <p v-if="props.spreadsheetSafe" class="muted" data-testid="export-lossy">
+        <p
+          v-if="file.data.value.spreadsheetSafe ?? props.spreadsheetSafe"
+          class="muted"
+          data-testid="export-lossy"
+        >
           Text values that begin with a formula character were changed with an apostrophe in front
           (a header cell too). Importing this file puts the apostrophe into the table; import it
           with the first line ignored. The guard looks at the type of a column: a json or an array

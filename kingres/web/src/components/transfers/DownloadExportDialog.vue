@@ -36,7 +36,29 @@ const emit = defineEmits<{ close: [] }>()
       <dt>Kept until</dt>
       <dd>{{ formatDateTime(file.expiresAt) }}</dd>
     </dl>
-    <p class="muted" data-testid="download-spreadsheet-note">
+    <p
+      v-if="file.spreadsheetSafe === false"
+      class="notice tone-warn"
+      role="alert"
+      data-testid="download-spreadsheet-off"
+    >
+      <span aria-hidden="true">&#9650;</span>
+      <span
+        >This file was written with the spreadsheet guard <strong>off</strong>: its values are
+        exact. Do not open it in a spreadsheet; a value that begins with = + - @ can run as a
+        formula there.</span
+      >
+    </p>
+    <p
+      v-else-if="file.spreadsheetSafe === true"
+      class="muted"
+      data-testid="download-spreadsheet-on"
+    >
+      This file was written with the spreadsheet guard: text values that begin with a formula
+      character have an apostrophe in front (importing it puts the apostrophe in). The guard changes
+      text columns only; a json or array value is not changed, and it is not a security feature.
+    </p>
+    <p v-else class="muted" data-testid="download-spreadsheet-note">
       If this file was exported with the spreadsheet guard off, or holds json or array values, do
       not open it in a spreadsheet: a value that begins with = + - @ can run as a formula there. The
       guard changes text columns only and is not a security feature. This list does not say which
