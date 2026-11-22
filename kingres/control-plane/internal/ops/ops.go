@@ -182,7 +182,13 @@ func (o *Ops) asRole(ctx context.Context, db, role string, f func(tx pgx.Tx) err
 		return connectProblem(err)
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
-	return inTx(ctx, c, f)
+	return inTx(ctx, c, func(tx pgx.Tx) error {
+		// The startup parameter fixes the path of the session; this keeps it for the transaction whatever the code before did to the session.
+		if _, err := tx.Exec(ctx, "SET LOCAL search_path = pg_catalog"); err != nil {
+			return err
+		}
+		return f(tx)
+	})
 }
 
 // asService runs f in a transaction on a service connection to db.
