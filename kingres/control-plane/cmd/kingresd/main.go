@@ -558,6 +558,11 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 						return internalapi.ForwardResponse{}, fmt.Errorf("%q is not a server of this cluster", peer)
 					}
 					return api.ServeForwarded(ctx, peer, fr)
+				}, forwardStream: func(ctx context.Context, peer string, fr internalapi.ForwardRequest, body io.Reader, w http.ResponseWriter) error {
+					if _, ok := peerDir.Get(peer); !ok {
+						return fmt.Errorf("%q is not a server of this cluster", peer)
+					}
+					return api.ServeForwardedStream(ctx, peer, fr, body, w)
 				}, gather: func(ctx context.Context, peer string, fr internalapi.ForwardRequest) (internalapi.ForwardResponse, error) {
 					// Every server of the cluster may ask; it must be a member (CP-07).
 					if _, ok := peerDir.Get(peer); !ok {
