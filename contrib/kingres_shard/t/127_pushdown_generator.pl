@@ -31,6 +31,7 @@ use KingresShardTest qw(not_shipped_ok run_sql);
 use KingresShardCompare;
 
 my $c = KingresShardCompare->new('pgen', extra => "kingres_shard.enable_partial_aggregation = off" . "
+kingres_shard.enable_repartition_join = off
 ");
 my @nodes = $c->nodes;
 my $single = $c->single;

@@ -36,6 +36,64 @@ The staging branch g15 (from kingres-18) merges cp-1011, p13-fix and web-15b. Th
 
 See "What is left" of the report: no state on the server page for a start that went back to the good file at a reboot; no floors for `max_parallel_workers` and `max_locks_per_transaction`.
 
+## 2026-11-22 (second entry): phase 12, the sharding part: the repartitioned join and MERGE on distributed tables
+
+Covers branch shard-p12, rebased onto the staging branch m18 (kingres-18 with the 0.8 tree of shard-p1011 merged).  Design:
+[analytics-phase12-queries.md](design/analytics-phase12-queries.md), sections 3 to 7; the sketch extension and the rollup tasks of that note are not part of this entry.
+
+### What was done
+
+- **The base.**  shard-p12 (J1 and J2 step 1, built on shard-p10) was rebased onto m18; one conflict, the settings list of `expected/catalog.out`.  No SQL object is added by any of this work
+  (the design says the upgrade script stays a guard), so there is still one upgrade path and `kingres_shard--0.8.sql` is unchanged; `t/250` passes.  Two scratch scripts that had been
+  committed at the repository root were removed.
+- **The repartitioned join** (`src/repartition.c`, `src/fragment_scan.c`): J1 and J2 step 1 as before, then a partial aggregation above the repartitioned join (the groups aggregate their rows of
+  the join, the origin combines; the partial marker carries `rp=<n>`), the behaviour under bucket moves (fault points `rp_after_ship` and `rp_before_fragment`; a stale map gives `KS001`, never a wrong
+  answer; `t/262`), the equivalence generator `t/267` (seeded, four profiles against the single node), regress `repartition_plans`, the `EXPLAIN` lines of design 4.12 (what moved, or "Repartition: not used:
+  <reason>"), and a broadcast side (a table that has no routable key is sent whole to every group; inner joins and the nullable side of a LEFT JOIN; bounded by `repartition_max_bytes`).
+- **`MERGE` on distributed tables** (`src/merge.c`, `src/planner.c`, `src/fanout.c`): the settings `enable_distributed_merge` and `merge_max_source_bytes`; M1 (a colocated MERGE runs on every group that owns a
+  target bucket), M3 (a routed source: the origin reads the source and sends each row to the owner of its key), M6 (a local target, a ledger table included, with a source fenced by `OFFSET 0`, which
+  works with the real planner on both majors), M4 and M5 (a reference target with constants or reference tables, or a source that the origin reads once and sends to every node); fault points
+  `merge_before_first_group`, `merge_between_groups`, `merge_before_commit`; tests `t/263` to `t/266` and regress `merge_plans`.  Every shape that is not accepted is refused with its own message, as before.
+- The tests and mutants of each piece are in the commits; every mutant that survived is explained there (defence in depth, cost-only, or equivalent).
+
+### How it was verified
+
+- At the tip (clean -Werror builds, regress, every TAP file) on PostgreSQL 18.7 and 19rc2: 226 files, 57203 tests on 18 and 57234 on 19; the one failure was `t/043_reference_paths` (it expected the old
+  refusal of `MERGE` into a reference table, which M4 now runs; the test was changed and passes).  In tree: see the message of the integration.
+- The neighbours of the changed code (t/112 to t/160, t/260 to t/267) were also run by the authors of each piece on PG19.
+
+### Decisions and deviations
+
+- A preserved moved side of a LEFT JOIN, dual repartition, a closed whole-statement fragment above the repartitioned join, and extension objects in the text of a repartitioned join are **not built**: each is
+  refused with its reason and the complete scan answers.  The reasons are in the README ("The repartitioned join").  A preserved moved side is believed provable (NULL keys go once to one group; ON conditions on
+  the preserved table stay in the text; no pruning from the nullable side) but needs a partitioned role for a shipped relation in the group's analysis, which is shared with the closed queries of 2b.
+- The marker of a MERGE fragment is `kingres:merge-fragment place=N rp=K`, in the style of the existing kinds, not `kingres:frag v=2 kind=merge` as the design says.
+- M3 and M5 need the source to be one relation (a join in `USING` goes in a sub-select); M1 accepts a join of colocated tables.  A key restriction in `ON` does not prune the groups of M1 (always correct).
+- A NULL route key is hashed like a NULL in the row router and in tuple routing, which is the design's slot-0 rule without a special case.
+
+### The fixes for the review
+
+The independent review of this branch ([2026-11-22-kingres-shard-phase12-joins-merge.md](reviews/2026-11-22-kingres-shard-phase12-joins-merge.md);
+the repartitioned join held, MERGE had one silent wrong answer) is fixed on branch p12-fix, one commit for each finding, each with a test that fails
+without it (the section "Fixes" of the review lists the commits, the tests and the mutants).  P12M-01: a prepared MERGE that declares a parameter it does not
+use no longer shifts the arrays of a shipped source (the origin sends the parameters that the text uses, then the arrays; `t/268` section A, nine types in
+three positions for M1, M3, M4, M5 and M6).  P12M-02: a MERGE through a view is refused explicitly, and the guards for the target (CHECK OPTION, row-level
+security, view owner, view) run on the statement as written for every shape.  The fixing found a case that the review had not: a security_barrier view over a
+reference table was accepted by M5 after M4 had refused it, and the text of M5 has no filter, so every node changed rows that the view hides; the guards
+now run before M4 and M5 are tried.  P12M-03: a source row of a group that is not a planned target is KS001, not dropped (new fault point
+`merge_before_collect`).  P12M-04: the merge fault points fire for M4 and M5 (`t/266` section E).  P12M-05: two stale README passages.  P12M-06: the refusal for
+a stable default names the column.  P12J-01: `repartition_max_bytes` is capped at 512MB.  P12J-02: the group-side rule for a preserved moved side is pinned
+by forged fragments (`t/261` section G).  Not changed, and open: M5 takes the writer lock of every relation of the statement on every node, so a local source
+that exists on one node only is refused with "reference table ... does not exist on this node" (a refusal, not a wrong answer; the lock names should come from
+the reference tables only).
+
+### Still open
+
+- The four items above that are not built.
+- An independent review of the fixes of the review of this branch.
+- M5 and a local source that does not exist on every node (see the fixes above).
+- Integration with phase 10's scheduler and the control plane of cp-1011 (`MERGE` and the repartitioned join add no REST surface).
+
 ### Core patches
 
 None.

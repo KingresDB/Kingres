@@ -106,10 +106,12 @@
 #include "forward_auth.h"
 #include "hashing.h"
 #include "kingres_shard.h"
+#include "merge.h"
 #include "node_conn.h"
 #include "pg_compat.h"
 #include "planner.h"
 #include "pushdown.h"
+#include "repartition.h"
 #include "remote_scan.h"
 #include "row_router.h"
 #include "schema_ddl.h"
@@ -773,10 +775,11 @@ fanout_targets(const KsColocation *coloc, const KsCatalog *cat)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("shard group %d has no active primary node", g)));
-		t = palloc(sizeof(KsFanTarget));
+		t = palloc0(sizeof(KsFanTarget));
 		t->host = n->host;
 		t->port = n->port;
 		t->is_local = (g == cat->local_group_id);
+		t->group_id = g;
 		targets = lappend(targets, t);
 	}
 	return targets;
@@ -970,6 +973,80 @@ plan_colocated_insert_select(Query *parse)
 	return kingres_shard_make_insert_select_plan(parse, sql, fanout_targets(coloc, cat), place,
 												 is.relids);
 }
+
+/*
+ * plan_merge
+ *
+ * Phase 12, design 7: a MERGE into a distributed table, decided by kingres_shard_merge_classify().
+ * Colocated (M1): the statement is shipped as written to every group that owns a bucket of the
+ * target.  Routed source (M3): the statement with a sub-select over unnest() in place of its source
+ * is shipped, and this node reads the source and sends each group the rows of its keys.  The text is
+ * decided once more on its parse, as a group decides it (merge.c).
+ */
+static PlannedStmt *
+plan_merge(Query *parse, KsMerge *m)
+{
+	const KsCatalog *cat;
+	const KsColocation *coloc;
+	const char *why = NULL;
+	char	   *body;
+	char	   *sql;
+	int64		place;
+	int			rp;
+	List	   *mi = NIL;
+	List	   *relids;
+	ListCell   *lc;
+
+	if (IsInParallelMode())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a statement for several shard groups cannot be run from a parallel worker")));
+	foreach(lc, parse->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+		if (rte->rtekind == RTE_RELATION)
+			kingres_shard_refuse_view_owner(parse, rte);
+	}
+
+	if (m->kind == KS_MERGE_COLOCATED)
+	{
+		body = kingres_shard_merge_text_colocated(parse, &why);
+		rp = 0;
+	}
+	else
+	{
+		KsMergeShip sh;
+
+		if (!kingres_shard_merge_build_ship(parse, m, &sh, &why))
+			body = NULL;
+		else
+		{
+			body = sh.text;
+			mi = list_make4(makeString(sh.source_sql), makeInteger(sh.ncols), makeInteger(sh.first_param),
+							makeInteger(m->has_nmbs ? 1 : 0));
+		}
+		rp = 1;
+	}
+	if (body == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("this MERGE cannot be run on the shard groups"),
+				 errdetail("The groups would not accept its text: %s.", why)));
+
+	/* the analyses read the catalog cache, which a call of theirs may have reloaded */
+	cat = kingres_shard_catalog();
+	coloc = kingres_shard_lookup_colocation(m->colocation_id);
+	if (coloc == NULL)
+		elog(ERROR, "colocation group %d of a MERGE is not in the catalog", m->colocation_id);
+	place = kingres_shard_placement_hash(coloc);
+	sql = psprintf("%s%s", kingres_shard_merge_marker(place, rp), body);
+	relids = list_make1_oid(m->target_relid);
+	foreach(lc, m->relids)
+		relids = list_append_unique_oid(relids, lfirst_oid(lc));
+	return kingres_shard_make_merge_plan(parse, sql, fanout_targets(coloc, cat), place, relids, mi);
+}
+
 
 /*
  * all_buckets_local
@@ -1443,13 +1520,16 @@ plan_forwarded(Query *parse, const char *query_string, int cursorOptions,
 		int64		place;
 		char	   *marker_ext = NULL;
 
-		if (kingres_shard_parse_query_marker(query_string, &place, &marker_ext))
+		int			marker_rp = 0;
+
+		if (kingres_shard_parse_query_marker_rp(query_string, &place, &marker_ext, &marker_rp))
 		{
 			KsQueryFragment qf;
 			const char *why = NULL;
 
 			if ((check_marker_installed_versions(marker_ext), true) &&
 				kingres_shard_query_fragment_analyze(parse, &qf, &why) &&
+				(marker_rp == qf.pd.nshipped || (why = "the shipped relations of the text are not the ones the marker counts", false)) &&
 				(check_marker_extensions(marker_ext, qf.ext), true))
 			{
 				PlannedStmt *pstmt = plan_locally(parse, query_string, cursorOptions, boundParams,
@@ -1481,14 +1561,16 @@ plan_forwarded(Query *parse, const char *query_string, int cursorOptions,
 	{
 		int64		place;
 		char	   *marker_ext = NULL;
+		int			marker_prp = 0;
 
-		if (kingres_shard_parse_partial_marker(query_string, &place, &marker_ext))
+		if (kingres_shard_parse_partial_marker(query_string, &place, &marker_ext, &marker_prp))
 		{
 			KsQueryFragment qf;
 			const char *why = NULL;
 
 			if ((check_marker_installed_versions(marker_ext), true) &&
 				kingres_shard_partial_fragment_analyze(parse, &qf, &why) &&
+				(marker_prp == qf.pd.nshipped || (why = "the shipped relations of the text are not the ones the marker counts", false)) &&
 				(check_marker_extensions(marker_ext, qf.ext), true))
 			{
 				PlannedStmt *pstmt = plan_partial_fragment(parse, query_string, cursorOptions, boundParams,
@@ -1506,6 +1588,44 @@ plan_forwarded(Query *parse, const char *query_string, int cursorOptions,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("this node does not accept the fragment that another node sent it"),
 					 errdetail("The statement is not a partial aggregation that this node runs: %s.", why),
+					 errhint("This is not a change of the bucket map: repeating the statement does not help.")));
+		}
+	}
+
+	/*
+	 * A MERGE that another node ships (phase 12, design 7.3 and 7.4).  This node decides on the parse of
+	 * the text it received, with the function the sender used on the same text
+	 * (kingres_shard_merge_fragment_analyze), and runs it over its own buckets and, for a routed source,
+	 * the rows that were sent here.  Anything that function does not recognise is refused, not run.
+	 */
+	if (parse->commandType == CMD_MERGE && query_string != NULL)
+	{
+		int64		place;
+		int			rp = 0;
+
+		if (kingres_shard_parse_merge_marker(query_string, &place, &rp))
+		{
+			KsMerge		mg;
+			const char *why = NULL;
+
+			if (kingres_shard_merge_fragment_analyze(parse, rp, &mg, &why))
+			{
+				PlannedStmt *pstmt = plan_locally(parse, query_string, cursorOptions, boundParams,
+												  cat, a->ndist_rtes);
+
+				/* after planning (the target is locked ROW EXCLUSIVE, the sources ACCESS SHARE) */
+				if (kingres_shard_placement_hash_now(mg.colocation_id) != place)
+					ereport(ERROR,
+							(errcode(ERRCODE_KINGRES_STALE_MAP),
+							 errmsg("the bucket map of this node is not the one the statement was shipped with (stale map version " INT64_FORMAT ")",
+									cat->map_version),
+							 errhint("A bucket moved between shard groups, or the primary of a group changed; repeat the statement.")));
+				return pstmt;
+			}
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("this node does not accept the fragment that another node sent it"),
+					 errdetail("The statement is not a MERGE that this node runs: %s.", why),
 					 errhint("This is not a change of the bucket map: repeating the statement does not help.")));
 		}
 	}
@@ -1612,6 +1732,7 @@ plan_forwarded(Query *parse, const char *query_string, int cursorOptions,
 		   strncmp(query_string, KS_WRITE_MARKER, strlen(KS_WRITE_MARKER)) == 0 ||
 		   strncmp(query_string, KS_INSERT_MARKER_PREFIX, strlen(KS_INSERT_MARKER_PREFIX)) == 0)) ||
 		 strncmp(query_string, KS_INSERT_SELECT_MARKER_PREFIX, strlen(KS_INSERT_SELECT_MARKER_PREFIX)) == 0 ||
+		 strncmp(query_string, KS_MERGE_MARKER_PREFIX, strlen(KS_MERGE_MARKER_PREFIX)) == 0 ||
 		 strncmp(query_string, KS_QUERY_MARKER_PREFIX, strlen(KS_QUERY_MARKER_PREFIX)) == 0 ||
 		 strncmp(query_string, KS_PARTIAL_MARKER_PREFIX, strlen(KS_PARTIAL_MARKER_PREFIX)) == 0))
 		ereport(ERROR,
@@ -1883,7 +2004,7 @@ plan_reference_write(Query *parse, Oid target, const KsCatalog *cat)
 	foreach(lc, nodes)
 	{
 		KsNode	   *n = (KsNode *) lfirst(lc);
-		KsFanTarget *t = palloc(sizeof(KsFanTarget));
+		KsFanTarget *t = palloc0(sizeof(KsFanTarget));
 
 		t->host = n->host;
 		t->port = n->port;
@@ -1895,6 +2016,91 @@ plan_reference_write(Query *parse, Oid target, const KsCatalog *cat)
 	return kingres_shard_make_fanout_plan(parse, sql, targets, false,
 										   list_make1_oid(target),
 										   reference_lock_names(parse, cat));
+}
+
+/*
+ * plan_merge_reference
+ *
+ * Phase 12, design 7.5: a MERGE into a reference table.  M4: the statement itself runs on every node
+ * (it reads reference tables, VALUES and constants).  M5: its source is one other relation (a
+ * distributed table, a local table, a sub-select over them): this node reads the source once, takes
+ * the writer locks first (as every write to a reference table does), and every node runs the MERGE
+ * over the same rows, which a sub-select over unnest() of array parameters stands for.  The nodes,
+ * the locks, the order and the check that the copies agree are those of plan_reference_write.
+ */
+static PlannedStmt *
+plan_merge_reference(Query *parse, Oid target)
+{
+	KsMerge		m;
+	const char *why = NULL;
+	char	   *body = NULL;
+	List	   *mi = NIL;
+	List	   *nodes = NIL;
+	List	   *targets = NIL;
+	List	   *relids = NIL;
+	List	   *locks;
+	const KsCatalog *cat;
+	ListCell   *lc;
+
+	if (IsInParallelMode())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a write to a reference table cannot be run from a parallel worker")));
+	if (!kingres_shard_merge_classify_ref(parse, &m))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("MERGE into a reference table is not supported yet")));
+	if (m.kind == KS_MERGE_REFERENCE)
+		body = kingres_shard_merge_text_reference(parse, &why);
+	else
+	{
+		KsMergeShip sh;
+
+		if (kingres_shard_merge_build_ship(parse, &m, &sh, &why))
+		{
+			body = sh.text;
+			mi = list_make4(makeString(sh.source_sql), makeInteger(sh.ncols), makeInteger(sh.first_param),
+							makeInteger(1));
+		}
+	}
+	if (body == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("this MERGE into reference table \"%s\" cannot be run on every node", get_rel_name(target)),
+				 errdetail("The nodes would not accept its text: %s.", why)));
+
+	/* the analyses read the catalog cache, which a call of theirs may have reloaded */
+	cat = kingres_shard_catalog();
+	foreach(lc, cat->nodes)
+	{
+		KsNode	   *n = (KsNode *) lfirst(lc);
+
+		if (n->is_active && n->is_primary)
+			nodes = lappend(nodes, n);
+	}
+	list_sort(nodes, compare_nodes_by_id);
+	foreach(lc, nodes)
+	{
+		KsNode	   *n = (KsNode *) lfirst(lc);
+		KsFanTarget *t = palloc0(sizeof(KsFanTarget));
+
+		t->host = n->host;
+		t->port = n->port;
+		t->is_local = (n->node_id == cat->local_node_id);
+		targets = lappend(targets, t);
+	}
+	/* the reference tables of the statement (a distributed or local source is read here, not on the nodes) */
+	relids = list_make1_oid(target);
+	foreach(lc, m.relids)
+	{
+		const KsDistTable *dt = kingres_shard_lookup_dist_table(lfirst_oid(lc));
+
+		if (dt != NULL && dt->is_reference)
+			relids = list_append_unique_oid(relids, lfirst_oid(lc));
+	}
+	locks = reference_lock_names(parse, cat);
+	return kingres_shard_make_fanout_plan_shipped(parse, psprintf("%s%s", KS_REFWRITE_MARKER, body), targets, relids,
+												  locks, mi);
 }
 
 /*
@@ -2337,6 +2543,7 @@ plan_with_scan(Query *parse, const char *query_string, int cursorOptions,
 		(void) kingres_shard_distscan_set_active(false);
 		(void) kingres_shard_pushdown_info_set(old_pi);
 		(void) kingres_shard_pushdown_reason_swap(old_reason);
+		kingres_shard_repart_note_reset();
 	}
 	PG_END_TRY();
 	AtEOXact_GUC(true, nest);
@@ -3486,6 +3693,23 @@ planner_hook_body(Query *parse, const char *query_string,
 	refuse_bucket_partition_write(parse, cat);
 
 	/*
+	 * Phase 12, design 7: a MERGE into a distributed table.  The decision reads the catalog and
+	 * may reload this backend's cache, so nothing taken from it before is used after it (the
+	 * analysis below starts from the new cache).  A statement of a shape that no path accepts is
+	 * refused here, before any group has run anything; with the switch off the statement goes on
+	 * to the refusals of phase 2a.
+	 */
+	if (parse->commandType == CMD_MERGE && kingres_shard_enable_distributed_merge &&
+		!this_is_local_part && !kingres_shard_session_forwarded())
+	{
+		KsMerge		mg;
+
+		if (kingres_shard_merge_classify(parse, &mg))
+			return plan_merge(parse, &mg);
+		cat = kingres_shard_catalog();
+	}
+
+	/*
 	 * The analysis and the refresh of the partition lists take locks, which process invalidations
 	 * and can make this backend load the catalog cache again (every time under
 	 * debug_discard_caches): the cache that `a` points into is then gone.  The analysis is made
@@ -3538,7 +3762,7 @@ planner_hook_body(Query *parse, const char *query_string,
 
 		/* this node's own part of a partial aggregation returns partial states as the others do */
 		if (parse->commandType == CMD_SELECT && query_string != NULL &&
-			kingres_shard_parse_partial_marker(query_string, &pplace, NULL))
+			kingres_shard_parse_partial_marker(query_string, &pplace, NULL, NULL))
 			return plan_partial_fragment(parse, query_string, cursorOptions, boundParams, cat, a.ndist_rtes, true);
 		return pass_through(parse, query_string, cursorOptions, boundParams);
 	}
@@ -3571,6 +3795,8 @@ planner_hook_body(Query *parse, const char *query_string,
 
 		if (OidIsValid(reftarget))
 		{
+			if (parse->commandType == CMD_MERGE && kingres_shard_enable_distributed_merge)
+				return plan_merge_reference(parse, reftarget);
 			if (a.refs != NIL)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -3582,6 +3808,23 @@ planner_hook_body(Query *parse, const char *query_string,
 
 	if (a.refs == NIL)
 	{
+		/*
+		 * The text of a MERGE into a reference table (M4, M5) that another node sends: this node decides on its parse, with
+		 * the function the sender used, and refuses what it does not recognise (a forged text is never run).
+		 */
+		if (kingres_shard_session_forwarded() && parse->commandType == CMD_MERGE && query_string != NULL &&
+			strncmp(query_string, KS_REFWRITE_MARKER, strlen(KS_REFWRITE_MARKER)) == 0)
+		{
+			const char *why = NULL;
+			int			nsh = 0;
+
+			if (!kingres_shard_merge_ref_fragment_analyze(parse, &nsh, &why))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("this node does not accept the fragment that another node sent it"),
+						 errdetail("The statement is not a MERGE into a reference table that this node runs: %s.", why),
+						 errhint("This is not a change of the bucket map: repeating the statement does not help.")));
+		}
 		/*
 		 * No distributed table in the statement as written: the planner may
 		 * still find one (it expands a SQL-language function into the
@@ -3596,6 +3839,26 @@ planner_hook_body(Query *parse, const char *query_string,
 	if (kingres_shard_session_forwarded())
 		return plan_forwarded(parse, query_string, cursorOptions, boundParams,
 							  &a, cat);
+
+	/*
+	 * Phase 12, design 7.6: a MERGE into a local table that reads distributed tables.  PostgreSQL asks for the
+	 * row identifier of every relation of such a statement that is a table and is not the target, and the
+	 * distributed scan has none to give; each distributed table of USING is read through a sub-select with
+	 * OFFSET 0 instead (merge.c), which the planner does not pull up and marks with a copy of the row.  The
+	 * statement is then planned with the distributed scan; the target keeps its triggers, a ledger table's
+	 * capture trigger among them.
+	 */
+	if (parse->commandType == CMD_MERGE && kingres_shard_enable_distributed_merge &&
+		kingres_shard_enable_distributed_scan && parse->resultRelation > 0)
+	{
+		RangeTblEntry *mtrte = rt_fetch(parse->resultRelation, parse->rtable);
+
+		if (mtrte->rtekind == RTE_RELATION &&
+			hash_search(cat->dist_tables, &mtrte->relid, HASH_FIND, NULL) == NULL &&
+			kingres_shard_lookup_scan_table(cat, mtrte->relid) == NULL &&
+			kingres_shard_merge_fence_sources(parse) > 0)
+			return plan_with_scan(parse, query_string, cursorOptions, boundParams, NULL, NULL);
+	}
 
 	/* A row cannot change its key: it might have to move to another shard group. */
 	if (parse->commandType == CMD_UPDATE && parse->resultRelation > 0)
@@ -3762,6 +4025,8 @@ planner_hook_body(Query *parse, const char *query_string,
 				pi = pushdown_prepare(parse, &why);
 				if (pi == NULL && why != NULL)
 					ereport(DEBUG1, (errmsg_internal("kingres_shard: no pushdown: %s", why)));
+				/* phase 12 (J1): a join on columns other than the key, by moving one table (repartition.c) */
+				pi = kingres_shard_repart_attach(parse, pi);
 			}
 			return plan_with_scan(parse, query_string, cursorOptions, boundParams, pi, why);
 		}

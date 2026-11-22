@@ -24,6 +24,7 @@
 #include "nodes/params.h"
 #include "nodes/parsenodes.h"
 #include "nodes/pg_list.h"
+#include "nodes/plannodes.h"
 
 #include "catalog.h"
 #include "node_conn.h"
@@ -95,6 +96,8 @@ typedef struct KsFragStart
 	int			nparams;
 	const Oid  *ptypes;
 	const char *const *pvalues;
+	/* J1: the values of the parameters of one group (the arrays of the shipped relation differ), NULL: pvalues for all */
+	const char *const *(*group_values) (void *arg, int group_id);
 	void		(*local_open) (void *arg);
 	void		(*after_check) (void *arg);
 	void	   *arg;
@@ -186,6 +189,7 @@ typedef struct KsPushdownInfo
 	void	   *join_done;		/* the join relation that has its fragment path */
 	bool		partial;		/* a partial aggregation (design 7): sql and ncols are made by the path, which knows the partial target */
 	Query	   *ship;			/* partial: a copy of the query, to deparse with the select list of the partial target */
+	List	   *repart;			/* J1: of KsRepartCand *: the relations that can be shipped (repartition.h); join is also set */
 } KsPushdownInfo;
 
 extern void kingres_shard_fragment_scan_init(void);
@@ -199,5 +203,8 @@ extern KsPushdownInfo *kingres_shard_pushdown_info_set(KsPushdownInfo *info);
  */
 extern const char *kingres_shard_pushdown_reason_swap(const char *reason);
 extern const char *kingres_shard_pushdown_reason(void);
+
+/* Is the plan node a Fragment Scan?  EXPLAIN: the scan that feeds a repartitioned join does not say why the join was not made. */
+extern bool kingres_shard_is_fragment_scan_plan(Plan *plan);
 
 #endif							/* KINGRES_SHARD_FRAGMENT_SCAN_H */

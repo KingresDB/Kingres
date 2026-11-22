@@ -1016,6 +1016,8 @@ the files of the extension, because the dump creates the extension.
 | `kingres_shard.shippable_extensions` | all | all, none, or a list of names from the list compiled into the library (see "Objects of extensions"): which extensions' objects may be shipped to the groups. A narrowing only. `USERSET`. |
 | `kingres_shard.enable_bulk_routing` | on | Off: an `INSERT` that goes to several shard groups is refused as in 0.5 (a multi-row `VALUES`, `INSERT ... SELECT`, a single row whose key is not a constant). A single row with a constant key never needed the router and is not affected. `USERSET`; it grants nothing. |
 | `kingres_shard.enable_colocated_insert_select` | on | Off: a colocated `INSERT ... SELECT` is not shipped whole: it goes through the row router when it can (no `ON CONFLICT DO UPDATE`) and is refused when it cannot. `USERSET`; it chooses among statements that give the same answer, and grants nothing. A cached plan keeps the path it was made with (as for every planner setting). |
+| `kingres_shard.enable_distributed_merge` | on | Off: a `MERGE` into a distributed table, a reference table or a local table that reads distributed tables is refused with the messages of phase 2a (see "`MERGE` on distributed tables"). `USERSET`; it chooses among statements that give the same answer, and grants nothing. |
+| `kingres_shard.merge_max_source_bytes` | 64MB | The most that the origin holds of the source rows of a `MERGE` that it routes to the groups (1MB to 512MB, in the unit kB). A `MERGE` whose source is larger fails before any group has run anything, with code `54000`. `USERSET`. |
 | `kingres_shard.enable_copy_routing` | on | Off: `COPY ... FROM` into a distributed table of a cluster with several groups is refused as in 0.5. `USERSET`. |
 | `kingres_shard.insert_batch_rows` | 1000 | Rows per batch that the row router sends to one group (1 to 100000). |
 | `kingres_shard.insert_batch_bytes` | 1MB | Text bytes per batch per group, the sum of the lengths of the values (16kB to 64MB). The memory of a bulk write is about two batches per group, whatever the number of rows. |
@@ -1326,7 +1328,8 @@ The decision for each path (tested in `t/043_reference_paths.pl`):
 | a stored generated column whose expression calls a function that is declared `IMMUTABLE` and is not | **the extension trusts the declaration**, as PostgreSQL does for an index (S6-05): every node computes the column itself with that function. A function that is declared immutable and reads something of its node (a port, a setting, a table of the node) gives a different value in each copy; `check_cluster()` finds the copies that differ (`reference_table_differs`). Declare such a function `STABLE` or `VOLATILE`, and it is refused in a write |
 | a rule on an ordinary table whose action writes the table | **refused** ("cannot be run on every node": the rule's action reads the rule's table) |
 | a data-modifying `WITH` | **refused** ("a write to a reference table inside a WITH clause or a subquery is not supported yet") |
-| `MERGE`, `COPY ... FROM` | **refused** |
+| `MERGE` into the table | runs on every node since phase 12 (shapes M4 and M5 of "MERGE on distributed tables": the statement reads reference tables, `VALUES` and constants, or one relation that this node reads once and sends to every node); refused with the condition named when it cannot run on every node (a volatile value, a stable default of a column the `INSERT` does not list, a view, row-level security, a trigger or a rule) |
+| `COPY ... FROM` | **refused** |
 | `TRUNCATE` | propagated, from the map group primary only |
 | the actions of foreign keys between reference tables (`ON DELETE CASCADE`, `SET NULL`, `ON UPDATE CASCADE`) | every node does its own part of the cascade once; the writer locks cover every reference table reachable through foreign keys |
 | a plan made before the table became a reference table, or before the cluster had several nodes (a prepared statement, a PL/pgSQL function, a driver's statement) | `create_reference_table()` and every catalog change invalidate the plans of the tables, so the plan is made again; as a backstop the executor refuses a write to a reference table that a plan would make on this node only (`reference table "t" cannot be written by this plan ...`, repeat the statement) |
@@ -1527,6 +1530,123 @@ subquery or join on it or on another distributed table), reference tables
 allowed, only built-in immutable functions and operators. An `UPDATE` that
 assigns the distribution column is refused. Otherwise it fails with `this
 UPDATE/DELETE spans shard groups and cannot be shipped`.
+
+## `MERGE` on distributed tables (phase 12, version 0.8)
+
+A `MERGE` runs on the shard groups in one of five ways, chosen by what its target and its `USING` clause are.
+Every other `MERGE` is refused with an error that names the condition that is not met, before any group has
+run anything. `kingres_shard.enable_distributed_merge = off` gives the messages of phase 2a again.
+
+| Target | `USING` | Path |
+|---|---|---|
+| distributed | tables of the target's colocation group joined to the target on their distribution keys, and reference tables; or reference tables only | **M1**, colocated: the whole statement runs on every group that owns a bucket of the target |
+| distributed | one relation of any kind (a local table, `VALUES`, a sub-select with an aggregate, a table of another colocation group, a table joined on another column, a reference table), and `ON` has `target.key = <expression of that relation>` | **M3**, routed source: this node reads the source and sends each row to the group that owns the bucket of the expression |
+| reference | reference tables, `VALUES`, constants | **M4**: the statement runs on every node (node id order, the writer locks, the copies must agree) |
+| reference | one relation of any kind | **M5**: this node reads the source once and every node merges the same rows |
+| local (a ledger table too) | distributed tables | **M6**: each distributed table of `USING` is read through a sub-select with `OFFSET 0`; the target keeps its triggers |
+
+How it is done. M1 deparses the statement as written and sends it to every group that owns a bucket of the target,
+**including a group that has no matching source row**, because `WHEN NOT MATCHED BY SOURCE` acts on target rows with
+no source row. M3 replaces the relation of `USING` by `(SELECT u.c1::type AS col, ... FROM unnest($n::text[], ...) AS u(c1, ...))`
+(one text array for each column the statement uses) and gives each group the rows of its keys; a group with no row of the
+source is skipped unless the statement has a `NOT MATCHED BY SOURCE` action. A row whose key expression is `NULL` goes to the
+group of the bucket that a `NULL` key hashes to, where an `INSERT` action puts the row as one node would. The command tag
+count is the sum of the groups' counts, `RETURNING` rows (with `merge_action()`) are the groups' rows put together, and the
+groups commit together by the two-phase path. The statement is atomic: an error on any group, `cannot affect row a second
+time` included, leaves no change anywhere (the fault points `merge_before_first_group`, `merge_between_groups`, `merge_before_commit` and, for a shipped source,
+`merge_before_collect` fire for every shape, M4 and M5 included, and are used by `t/266`).
+
+Refused, with the condition named: a `WITH` clause; a sub-select in an expression (`ON`, a `WHEN` condition, `SET`, `VALUES`,
+`RETURNING`) of a distributed target; a `USING` clause that is a join or several relations when the source has to be routed
+or shipped (put the join in a sub-select); an `ON` clause that does not equate the distribution column with a column or
+expression of the source; an `UPDATE` action that assigns the distribution column; an `INSERT` action whose distribution
+column is not the key the statement is colocated or routed by; a volatile value (a sequence, an identity column, `random()`):
+each group would compute its own, so give the column a value in the `INSERT` list; the same for a column that the `INSERT`
+does not list and whose `DEFAULT` is stable (`now()`, `current_user`, `current_setting()`): the refusal names the column;
+an expression that is not built in and immutable; a target with a trigger or a rule, or with row-level security; a `MERGE`
+through a view of any kind (a plain view, a `security_barrier` view, a view `WITH CHECK OPTION`, a view of another owner:
+the filter of a view is not part of the text of a `MERGE`, so the statement could change rows the view does not show; write
+the `MERGE` against the table); a column of the source with a type that is not built in or a collation other than the
+default (the source is shipped as text).
+
+A prepared `MERGE` may declare parameters that its text does not use, in any position and of any type: the origin sends the
+parameters that the text uses, and the arrays of a shipped source (M3, M5) are numbered after them.
+
+Snapshot. In M3 and M5 the source is read here, before the groups run: it is the snapshot of the start of the statement,
+and a source row that changes afterwards is not read again. Each group reads its target in its own statement snapshot, and
+`READ COMMITTED` re-evaluates a concurrently updated target row as on one node. In M5 the writer locks of the reference
+tables are taken before the source is read. A bucket that moves while the statement runs fails it with `KS001` and a
+change of nothing (the placement of the groups is checked when the statement starts and again after every group ran); the
+statement can be repeated. A group refuses a `MERGE` fragment that is not of a shape its own analysis accepts, and a text that
+claims to be one is never run.
+
+Limits of this increment: M3 and M5 need the source to be one relation (a `USING` join is written as a sub-select); a key
+restriction in `ON` does not prune the groups of an M1 statement (every group owning buckets of the target runs it, which is
+always correct); `merge_max_source_bytes` bounds the rows that the origin holds, and for M5 every node receives all of them;
+a `MERGE` on a hot standby is refused as every write is.
+
+## The repartitioned join (phase 12, version 0.8)
+
+A join of distributed tables on columns other than their distribution column cannot run on the groups as it stands: the rows that
+meet are on different groups.  The distributed scan (phase 2a) answers such a statement by bringing every row to this node.  The
+repartitioned join (design `analytics-phase12-queries.md`, section 4) moves less: one table is read by this node, and its rows are
+sent to the groups that can join them with their own rows of the other tables.  The complete scan stays the fallback of every
+statement (ADR 0022): a join that no path here can prove correct is planned exactly as before, and the reason is in the `DEBUG1`
+message of the planner and in `EXPLAIN (VERBOSE)`.
+
+**Which table moves.**  A distributed table R can be the moved one when all the other distributed tables of the statement are
+aligned with each other (their distribution columns are in one class of the equalities of the statement, or there is only one of
+them) and share one colocation group.  Reference tables are on every group and take no part.  Two ways to move R:
+
+* *Routed.*  R has a column that the statement equates (hash-joinable equality, equal types or the integer family, deterministic
+  collation) with the distribution column of the other tables.  Each row of R goes to the one group that owns the bucket of that
+  column's value in the colocation layout of the other tables (the same lookup as the row router), so the join is local there.  A
+  NULL key joins nothing and the row is dropped.
+* *Broadcast.*  R has no such column (the join is on an expression, an inequality, columns that are not keys, or the types or the
+  collation do not match).  Every row of R goes to every group that is asked.  Every group joins its own rows of the other tables
+  with all of R, and a row of the result is formed from rows of the others that are on one group only, so no row of the result is
+  repeated or missing.  A table that can be routed is routed (it sends one copy of each row, not one for every group).
+
+With a LEFT JOIN, only the table on its nullable side (one table) can move, routed or broadcast: the preserved side stays where it
+is, so that each of its rows is emitted once, by its own group.  A condition of the ON clause on the moved table is applied by its
+scan; a condition of the WHERE that names only the moved table is refused (it applies after the join, to the rows that were filled
+with NULLs).  What moves is only the columns that the statement needs.  Aggregates above the join are split in two as for a closed
+query (the groups aggregate the rows of the join they hold, this node combines).
+
+**What the groups check.**  The text that a group runs is the statement with the moved table replaced by a sub-select of casts of
+the columns of `unnest()` over `text[]` parameters.  The group accepts a sub-select of exactly that shape and no other, counts them,
+and refuses the text unless their number is the `rp=<n>` of the marker; it then applies the rules of every closed fragment (the
+proof of the sending node, the placement of the map, the shippability of every expression).  A forged text is a plain refusal, never
+a stale map.  A bucket that moves while the statement runs ends in the retryable KS001 or in the baseline answer, never in a wrong
+one (t/262).
+
+**EXPLAIN.**  The plan of a repartitioned join has a line `Repartition: o by cust -> placement of colocation 1 (12 buckets)` or
+`Repartition: o broadcast (to 3 groups)` (with the estimated rows when costs are on).  `EXPLAIN (VERBOSE)` of a statement that was
+a candidate (two distributed tables or more, tables only) and was not repartitioned has `Repartition: not used: <reason>` on its
+Distributed Scan: the reason of the planner (an outer join that is not one LEFT JOIN to a table, tables that are not aligned, a table
+that is not distributed ...), `switched off by kingres_shard.enable_repartition_join`, or `cost: the scan is cheaper than a
+repartitioned plan`.
+
+**Settings.**  `kingres_shard.enable_repartition_join` (`off`, `on` by cost, `force` for the tests) and
+`kingres_shard.repartition_max_bytes` (default 64 MB, 1 MB to 512 MB: the rows of a group travel as one text array, which cannot
+be larger than 1 GB): the most text that one moved table may need at this node, and for a
+broadcast table the share of one group.  The planner does not choose a moved side that it estimates above half of it, and the
+executor stops a statement that would hold more with an error that names the setting (the one place where a read fails instead of
+falling back, because the plan cannot change once it runs).  Fault points: `rp_after_ship`, `rp_before_fragment`.
+
+**Not done (the complete scan answers them).**
+
+* A preserved side that moves (`o LEFT JOIN c` with `o` moved, `c` staying).  It can be made correct: every `o` row goes to the group
+  of its key, a NULL key goes once to one group, a condition of the ON clause that names only `o` stays in the text (it decides the
+  NULLs, not the presence of the row), no pruning is taken from the restrictions of `c`.  What is missing is on the group: its
+  analysis (`pushdown.c`) reads a shipped relation like a reference table, so it refuses it on the preserved side of an outer join
+  (every group would emit its unmatched rows), and a partitioned role for a shipped relation needs a way for the group to check
+  that the key column is the one the rows were routed by.  That is a change of the analysis that the closed queries of phase 2b
+  share, and it was not made.
+* Two moved tables at once (dual repartition, or a routed table with a broadcast one, or two broadcast tables), and a statement with
+  no table that stays: the executor ships one relation, and a group that holds none of the tables of the statement has nothing to
+  prove the placement with.
+* A broadcast table of which no column is needed above the join (`count(*)` over a cross join): there is no column to send.
 
 ## Bulk writes through the row router (phase 2b, steps 3 and 4)
 
@@ -1748,7 +1868,7 @@ every node and runs every node as the origin.
 
 Switches: `kingres_shard.enable_pushdown` and `kingres_shard.enable_pushdown_closed`.  Fault points of the tests:
 `frag_before_probe`, `frag_after_probe_before`, `frag_after_declare`, `frag_local_open`, `frag_after_probe_after`,
-`frag_first_fetch`, `frag_before_fetch`, `frag_wait_batch`, `frag_local_fetch`, `frag_declared_g<n>`; the windows of the defences against a catalog that changed after the plan (t/136): `insel_before_rels_check`, `insel_before_start_check`, `insel_before_text_parse`, `query_before_text_parse`.  A statement
+`frag_first_fetch`, `frag_before_fetch`, `frag_wait_batch`, `frag_local_fetch`, `frag_declared_g<n>`; of the repartitioned join (phase 12, after its moved rows are collected and before its fragments start): `rp_after_ship`, `rp_before_fragment`; the windows of the defences against a catalog that changed after the plan (t/136): `insel_before_rels_check`, `insel_before_start_check`, `insel_before_text_parse`, `query_before_text_parse`.  A statement
 that is cancelled, or fails, while a group runs its part asks the group to stop it (bounded), so a group that is
 blocked by a lock does not hold the end of the statement for `node_timeout`.
 
@@ -2136,16 +2256,20 @@ Read these first; each is a reviewed boundary, not an accident.
     combine function when the query is not closed (`json_agg`, `jsonb_agg`, `*_object_agg`, `range_agg`, `xmlagg`), `DISTINCT` or
     `ORDER BY` inside an aggregate call, statements with sub-selects, CTEs, views, local tables, tables of
     two colocation groups, a table with row-level security, and a statement that locks rows.
-- **Writes that span groups.** `MERGE` and an `UPDATE` or `DELETE` that cannot be
-  shipped are refused. A write that uses a function that is not built in cannot be
-  shipped. (A multi-row `INSERT`, `INSERT ... SELECT` and `COPY ... FROM` into a
+- **Writes that span groups.** An `UPDATE` or `DELETE` that cannot be shipped is
+  refused. A write that uses a function that is not built in cannot be shipped.
+  (A multi-row `INSERT`, `INSERT ... SELECT` and `COPY ... FROM` into a
   distributed table are no longer refused: see "Bulk writes through the row router",
-  which lists what is still refused for them.)
-- **UPDATE ... FROM, DELETE ... USING and MERGE that read a distributed table
+  which lists what is still refused for them.  A `MERGE` into a distributed table
+  or into a reference table runs since phase 12: see "MERGE on distributed tables",
+  which lists the shapes and what is still refused.)
+- **UPDATE ... FROM and DELETE ... USING that read a distributed table
   and write another table** are refused ("UPDATE, DELETE and MERGE that read
   distributed table ... are not supported"): PostgreSQL asks for the row
-  identifier of every table it does not modify. Only `INSERT ... SELECT` and
-  `CREATE TABLE AS` can write an ordinary table from a distributed one (S2-18).
+  identifier of every table it does not modify. `INSERT ... SELECT`,
+  `CREATE TABLE AS` and, since phase 12, a `MERGE` into a local table (shape M6,
+  which reads each distributed table of `USING` through a sub-select) can write an
+  ordinary table from a distributed one (S2-18).
 - **Nodes must agree.** `add_node()` refuses a node whose default collation,
   `LC_CTYPE`, collation provider or collation library version differs from the
   map group primary's, or that runs another version of the extension; a
