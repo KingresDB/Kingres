@@ -56,6 +56,7 @@
 //                                 (a WORM target "archive-worm" exists, with the newest aggregate anchored in time, late or not)
 //   ?clock=off:<server>:<ms>      the clock of that server is that many milliseconds ahead (negative: behind).
 //   ?clock=unreachable:<server>   the clock of that server cannot be read.
+import { seedPartitioned } from './tables'
 import type { MockState } from './state'
 import { loseLease, mockConfig, silenceServer, stallStandby } from './state'
 import { FAIL_STEPS, raiseAutoFailoverLimit, seedAutomaticFailover } from './failover'
@@ -76,6 +77,21 @@ import {
 } from './config'
 
 /** One value of `?failover=` (several: comma). Unknown values are ignored. */
+/**
+ * `?tables=` (0.14.0, increment 9.7): `partitions` adds a distributed table that the user partitioned by range (with three partitions) and a
+ * table that can be attached to it; `fail:space` and `fail:copy` make the next changes of a table fail; `slow` makes them take a minute;
+ * `busy` says that another operation holds the colocation groups; `fk:<table>` gives a table a foreign key to an ordinary table.
+ */
+function applyTablesSwitch(entry: string, s: MockState): void {
+  if (entry === 'partitions') seedPartitioned(s)
+  if (entry === 'fail:space') mockConfig.tableFail = 'space'
+  if (entry === 'fail:copy') mockConfig.tableFail = 'copy'
+  if (entry === 'slow') mockConfig.tableSlow = true
+  if (entry === 'busy') mockConfig.tableBusy = true
+  const fk = /^fk:(.+)$/.exec(entry)
+  if (fk) mockConfig.tableForeignKeys.push(fk[1] as string)
+}
+
 function applyFailoverSwitch(entry: string, s: MockState): void {
   if (entry === 'dataloss') mockConfig.failoverDataLoss = true
   if (entry === 'needs-decision') mockConfig.failoverNeedsDecision = true
@@ -226,6 +242,7 @@ export function applySwitches(params: URLSearchParams, s: MockState): void {
     if (entry === 'slow') mockConfig.rebalanceSlow = true
   }
   for (const entry of (params.get('failover') ?? '').split(',')) applyFailoverSwitch(entry, s)
+  for (const entry of (params.get('tables') ?? '').split(',')) applyTablesSwitch(entry, s)
   if (params.get('phase7') === 'today') answerAsTheServerDoesToday(s)
   for (const entry of (params.get('signing') ?? '').split(',')) applySigningSwitch(entry, s)
   for (const entry of (params.get('publication') ?? '').split(',')) {

@@ -301,6 +301,16 @@ export async function runFlow(ctx) {
       .catch(() => '')
     notes.push(`blocked columns text: ${blocked}`)
     await shot('10-distribute-dialog')
+    // The start button waits for the preview of the change (contract 0.14.0, previewTableChange).
+    await page.waitForFunction(
+      () => {
+        const b = [...document.querySelectorAll('[role=dialog] .dlg-foot button')].find(
+          (x) => x.textContent.trim() === 'Distribute table',
+        )
+        return !!b && !b.disabled
+      },
+      { timeout: 30000 },
+    )
     await ui.click('Distribute table', { within: '[role=dialog] .dlg-foot' })
     await ui.waitForText('Finished.', 60000)
     await ui.click('Close', { within: '[role=dialog]' })
