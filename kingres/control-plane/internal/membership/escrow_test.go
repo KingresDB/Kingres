@@ -448,3 +448,13 @@ func TestAFormerLeaderThatStillHoldsTheKeySendsNothing(t *testing.T) {
 		t.Fatal("the leader sent nothing after a revocation")
 	}
 }
+
+// Every escrow call is dispatched to the backend (internalapi.handled); a call that is in the authorization table but is not
+// dispatched answers an empty body (found by the cluster test).
+func TestEscrowCallsAreDispatched(t *testing.T) {
+	for _, k := range []string{"POST /pki/escrow/offer", "POST /pki/escrow/store", "POST /pki/escrow/drop"} {
+		if !internalapi.Handled(k) {
+			t.Errorf("%s is not dispatched to the backend", k)
+		}
+	}
+}

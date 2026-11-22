@@ -42,6 +42,11 @@ func switchEscrowOn(t *testing.T, leader *clustertest.Node, cand *clustertest.No
 	if st["enabled"] != true || st["holdsKey"] != true {
 		t.Fatalf("status after switching on: %v", st)
 	}
+	defer func() {
+		if t.Failed() {
+			t.Logf("escrow status: %v / leader log: %s", escrowStatus(t, leader), leader.LogTail(5000))
+		}
+	}()
 	until(t, 3*time.Minute, "the sealed copy on the standby's server", func() bool {
 		s := escrowStatus(t, leader)
 		return s["complete"] == true
