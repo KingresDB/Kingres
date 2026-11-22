@@ -348,13 +348,13 @@ func (e *env) applyState(r *result, in *logInputs, cp *checkpoint.Checkpoint, se
 		if held.weak {
 			cause = fmt.Errorf("the checkpoint has size %d, smaller than %d, the size of the checkpoint in your state: the log went back, an old checkpoint is being shown, or your state is wrong: %s. %s", cp.Size, old.Size, weakCause(held), weakAdvice(old.Size))
 		}
-		return e.conflict(r, asJSON, keys, path, "rollback", cp, canon, held, cause), true
+		return e.conflict(r, asJSON, keys, path, "rollback", cp, canon, held, in.withRestore(cause)), true
 	case cp.Size == old.Size && cp.Root != old.Root:
 		cause := fmt.Errorf("two trusted checkpoints of this log have the same size %d and different roots (%x and %x): the log has two histories", cp.Size, old.Root, cp.Root)
 		if held.weak {
 			cause = fmt.Errorf("the checkpoint in your state and the one served have the same size %d and different roots (%x held, %x served); the served one is signed by a key that the trust file counts, but %s. %s", old.Size, old.Root, cp.Root, weakCause(held), weakAdvice(old.Size))
 		}
-		return e.conflict(r, asJSON, keys, path, "fork", cp, canon, held, cause), true
+		return e.conflict(r, asJSON, keys, path, "fork", cp, canon, held, in.withRestore(cause)), true
 	case cp.Size == old.Size:
 		r.ok("state", fmt.Sprintf("same size and root as the last verified checkpoint (%d): nothing to prove", old.Size))
 		write = false
@@ -394,7 +394,7 @@ func (e *env) applyState(r *result, in *logInputs, cp *checkpoint.Checkpoint, se
 				if held.weak {
 					cause = fmt.Errorf("the log at size %d does not extend the log at size %d of your state (%w); the served checkpoint is signed by a key that the trust file counts, but %s. %s", cp.Size, old.Size, perr, weakCause(held), weakAdvice(old.Size))
 				}
-				return e.conflict(r, asJSON, keys, path, "fork", cp, canon, held, cause), true
+				return e.conflict(r, asJSON, keys, path, "fork", cp, canon, held, in.withRestore(cause)), true
 			}
 			var ie *inputErr
 			if errors.As(perr, &ie) {

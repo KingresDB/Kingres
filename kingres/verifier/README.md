@@ -84,6 +84,7 @@ release and at each later one (no tag exists before the first):
 |---|---|
 | `kingres-verify-linux-amd64`, `kingres-verify-linux-arm64`, `kingres-verify-darwin-arm64`, `kingres-verify-windows-amd64.exe` | the binaries |
 | `SHA256SUMS` | one line per binary in the form `sha256sum -c` reads: 64 lower case hex characters, two spaces, the file name |
+| `RELEASE` | which release this is: the version, the commit, the commit date (UTC) and the Go release that built the files, five lines; it is listed in `SHA256SUMS` like a binary, so the signature covers it (P7R-07) |
 | `SHA256SUMS.note` | a signed note (the format of the checkpoints) whose text is exactly `SHA256SUMS`, signed with the release key: Ed25519, key name `kingres-verify-release` |
 
 Check them **before you run anything**, with a verifier you already trust (a build of your own, or
@@ -100,7 +101,7 @@ kingres-verify release verify --sums SHA256SUMS --note SHA256SUMS.note \
 the note is signed by that key, its text is the sums file, and every `--binary` has the SHA-256 of
 its line (the line is found by the file's name; `--name` says which line a renamed file is).
 Statuses: 0 verified; 1 a check failed, the step is named (`note-parse`, `note-signature`,
-`note-text`, `sums-format`, `binary`) and `VERIFIED` is not printed; 2 a flag or file is wrong, or
+`note-text`, `sums-format`, `binary`, `release-info`) and `VERIFIED` is not printed; 2 a flag or file is wrong, or
 the key cannot be read. Status 3 is not used: every check that is asked for is made or fails.
 With no `--binary` the note alone is checked, and the output says that no binary was.
 
@@ -130,6 +131,17 @@ an output directory that is not empty, and a key file that others can read. It b
 files, writes `SHA256SUMS`, checks it with `sha256sum -c`, signs it, and verifies the note it just
 made with `release verify` before it prints anything. `--unsigned` builds and sums without a note
 and says in capitals that the result is not a release.
+
+`release verify` shows what the signed `RELEASE` file says when you give it as a binary (`--binary RELEASE`, step `release-info`: version, commit, commit date, Go release), and it says in
+"not proved" that **this is the newest release** cannot be seen from the files: a genuine older release, with a known fault, verifies as well, and the signed files do not expire (a rollback
+to an older release is not detectable from them). Compare the version with the project's announcement of the newest release, which you must get from the project and not from the place the
+files came from. When the sums list no `RELEASE` file the output says so. When the signed `RELEASE` file says the commit or its date is `unknown` (a set that `release.sh --dry-run` signed from a tree that was not clean or not at the tag), the verdict is `VERIFIED (NOT A RELEASE)` and the exit status is 5, so that a script that tests only the status does not take it for a release; `--accept-dry-run` gives status 0 for whoever wants such a set (the verdict word stays).
+
+`release.sh` makes a **signed** release only from a clean checkout whose `HEAD` is exactly the tag of the version (`--tag NAME`, default `v<version>`, as in `v0.1.0`): it refuses a tree
+with any change, tracked or not, a tag that does not exist, a `HEAD` that is not the tag, and a directory that is not a git checkout, and it never creates a tag. `--dry-run` (with `--key-file`) makes and
+signs the files anyway for a trial, says in capitals that the result is **not a release**, and records the commit in `RELEASE` as `unknown`. `build-one.sh` sets `GOENV=off` and unsets
+`GOEXPERIMENT`, `GOFIPS140` and `GODEBUG`, so that a setting made with `go env -w` on the machine of the releaser cannot change the bytes; `repro-check.sh` builds one more binary under a hostile Go environment (a
+Go environment file that sets `GOEXPERIMENT` and `GOFIPS140`, and the same variables exported) and requires the same bytes.
 
 **Checking that the build is reproducible.** `scripts/repro-check.sh` copies the source twice into
 directories of different depth and name length, gives each its own empty Go build cache and GOPATH,
@@ -181,6 +193,7 @@ whose hash the key holder signed, and that it can be rebuilt from the source you
 | 2 | usage or input error: a flag is missing or wrong, a file or directory **you named** cannot be read (it is absent, not a regular file, too large) or is malformed (digest, columns file, trust file, state file), or no key of the trust file can be used at the time given, or **a checkpoint you hold** (`--state`, `--old FILE`) cannot serve as your anchor (no key of the trust file signed it; for a plain note given as `--old FILE` also: only a revoked key, or one beyond its `max_tree_size`, signed it; see "Checkpoints you hold"), or the state file stayed locked by another run for 10 seconds, or the lock file belongs to another user, or **the result could not be written** to the standard output (a full disk, a short write, a closed pipe: the line `could not be written to the standard output` is on the standard error; a closed descriptor: see "The standard output"), in text and in `--json`, on every command: a verdict nobody could read is not status 0. A run whose verdict is not 0 keeps its status when its output cannot be written; nothing was verified |
 | 3 | incomplete: nothing failed, but **something that was asked for could not be checked with the inputs and flags given**: the publication does not contain it (a checkpoint, a tile, the directory of a log) or the source cannot be reached; `INCOMPLETE` is printed and the missing items are listed; `VERIFIED` is never printed. **Treat 3 as an alert, never as "probably fine"**: a publisher must serve the tiles of every checkpoint it signed, so one that withholds exactly the tiles that would show a fork gets status 3 and not status 1, and a missing file is at best neglect. The commands that read a publication or a bundle can end with 3 (`checkpoint`, `consistency`, `aggregate`, `anchors`, `attestation`, `bundle` and `monitor`); the commands that check one given proof, block export or digest list do not; a failure always wins over an incomplete check |
 | 4 | a fork or a rollback was found, which is what status 1 says for it, **and the conflicting checkpoint could not be saved** (every name for the evidence is taken by a file with other content, or the disk refuses it); `FAILED at step fork` (or `rollback`) is printed with a note that says `was NOT saved`. The finding stands and is as serious as a 1: act on the fork and save the note you were shown yourself. Only `checkpoint --state` can end with 4 |
+| 5 | only `release verify`: the signature and the hashes are genuine and the set was made by a dry run (the signed `RELEASE` file says the commit or its date is `unknown`): a signed build that is not a release. `--accept-dry-run` gives 0. It is not in the table of commands below, which lists the statuses of a pass or a failure |
 
 A malformed **proof** or **block export** is a failed verification (status 1, step
 `parse`): it is the thing under test. A malformed **digest** is an input error
@@ -2166,10 +2179,10 @@ restore happened as described.**
 | `checkpoint`, `consistency` inside one epoch | the log is of an epoch that a verified event closed | 0 as before, and the note "finding: this log is of an epoch that a verified event closed, and it is frozen" with the statement of the event | the same |
 | `consistency --log chain:ID:eN --old NOTE` | the note is a checkpoint of the same chain at **another epoch** that a verified event closed | 1, step `epoch-closed` (the verified event, its statement, and "different logs: the tree of one is not a prefix of the other"), both checkpoints are verified first. When no verified event closed that epoch the note is not a checkpoint of this log, status 2, as before. A held size or root that contradicts the event is also step `epoch-closed` | there is no flag: nothing is proved, so nothing is accepted |
 | `proof --bundle --log-leg aggregate` | the chain of the proof is a member in a round where its epoch is closed (flagged 0x06) | as `aggregate` for that member | as `aggregate` |
-| `proof --bundle` | the block is shown in an epoch that a verified event closed | 0, with the note "finding: the block is shown in epoch *e*, which a verified event closed ... this run does not show that the block is in the history that goes on", and "by that statement it is in the history that goes on as well" when the event gives a common height at or above the block | the same |
+| `proof --bundle` | the block is shown in an epoch that a verified event closed | 0, with the note "finding: the block is shown in epoch *e*, which a verified event closed ... this run does not show that the block is in the history that goes on"; when the event gives a common height at or above the block the note quotes it and says that this command did not open the log of the next epoch, so it did not test that the block is in the history that goes on (P7R-02) | the same |
 | `proof --log-leg aggregate` | the chain of the proof is of a closed epoch that the last round no longer names | 1, step `member`, with the finding and what to do instead (show the block through the signed chain log, and an aggregate checkpoint you hold from before the closing) | the same |
 | `bundle verify` | the bundle holds the log of an epoch *e + 1* of a chain and no verified event closed epoch *e* | 1, step `epoch-closed`: the event was withheld, or this is not the publication; "an event that no authorised key signed" is said when there is one | 1, the same |
-| `bundle verify` | a verified event closed an epoch of a chain the bundle holds | 1, step `epoch-closed` with the statement; when the closed log is in the bundle, its signed size and root must be the event's `final-size` and `final-root` (a difference is 1 whatever is accepted); a proof whose block is in the closed epoch (found by trying the epochs newest first) is named in the same failure unless the event states a common height at or above the block | 0, with the step `finding epoch-closed` that says what was accepted and what was compared (the frozen log, and whether the log of the next epoch is in the bundle) |
+| `bundle verify` | a verified event closed an epoch of a chain the bundle holds | 1, step `epoch-closed` with the statement; when the closed log is in the bundle, its signed size and root must be the event's `final-size` and `final-root` (a difference is 1 whatever is accepted); a proof whose block is in the closed epoch (found by trying the epochs newest first) is named in the same failure unless the event states a common height at or above the block: that statement is tested, not believed (P7R-02): the block must be leaf *h* of the signed log of epoch *e + 1* in the bundle, and a block that is not there is 1, step `epoch-closed` ("the event and the logs disagree"), whatever is accepted; without that log in the bundle the note says the statement was not tested | 0, with the step `finding epoch-closed` that says what was accepted and what was compared (the frozen log, and whether the log of the next epoch is in the bundle) |
 | `monitor` | a verified `epoch-closed` event in the publication | 0 (nothing changes), and a note "finding: ..." on every poll: the closed log stays frozen, the log of the next epoch is another log, and a state kept for one is not a state of the other | the same |
 
 A chain log of the bundle with several epochs: a proof is shown in the epochs newest first, and the first whose log holds the block at its height is the one
@@ -2198,8 +2211,19 @@ the finding; do not put it in a script that is meant to notice a restore.
 **What an auditor may conclude.** VERIFIED from `bundle verify` with `--accept-epoch-closed`: everything it verified without the flag, and that the history of every closed epoch
 the bundle holds is a frozen log whose size and root the signed event states, that each later epoch is introduced by such an event, and that you accepted the cut. **Not** that the
 history above the common height was lost for the reason the operator gave, how many transactions were in it (the publication keeps hashes, not rows), or that a block of a closed
-epoch is in the history that goes on (only the common height of the event, when it states one, says so, and it is the operator's statement). A verification of the new epoch alone is
+epoch is in the history that goes on (only the common height of the event, when it states one, says so, and it is the operator's statement; `bundle verify` tests it against the log of the next epoch when the bundle holds that log). A verification of the new epoch alone is
 a statement about the new epoch alone.
+
+**The event `restore-acknowledged`** (P7R-09, design 9.4, ADR 0025). When an operator accepts that the system database of the cluster was restored to an older state than
+what was published, the publisher signs this event and goes on from the restored database: the aggregate log and the events are cut there. The verifier reads it as it
+reads `epoch-closed` (the lines `generation` from 1, `published-events`, `published-logs`, `published-state-sha256`, `database-events`, `database-logs`,
+`database-state-sha256`, `reason`, `acknowledged-by`; a missing, extra or malformed line, or the same generation twice, ends the run; an event that no authorised key signed
+is skipped and listed, and explains nothing). Where it reads the events it says so in a note, `finding: the publication holds a verified event 000007 (restore-acknowledged, generation 1, ...)`:
+`aggregate`, `bundle verify`, `monitor`, and `checkpoint`/`consistency` of the aggregate log (the chain logs are not cut by a restore and say nothing). And the failure of a comparison
+of the aggregate log with a checkpoint you hold (`aggregate --previous`: step `rollback`, `fork` or `continuity` after a fork; `consistency` and `checkpoint --state` of the aggregate
+log; `monitor`) names the event: "if the checkpoint you hold is from before that event, this explains the failure". The event is the operator's statement signed by an authorised key.
+It explains why a fork exists; it does not show that the cut was honest, and a checkpoint you hold from after the event is not explained by it. Nothing is accepted by a flag and the
+exit status of a failure does not change.
 
 **Tests and what is not tested here.** The tests build the whole publication of a restore from the documents (`epoch_test.go`: the aggregate rounds 0 to 3, the event, the frozen log of epoch 1
 and the log of epoch 2 with another history, a held checkpoint) and not from the code of `kingresd`; every case of the table above is a test, with the sign of the cases that must stay failures.

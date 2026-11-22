@@ -67,13 +67,32 @@ build() { # build N SRC
 build 1 "${src1}"
 build 2 "${src2}"
 
+# The Go environment of the machine must not change the bytes (P7R-06): one more build of the first target, with a Go environment
+# file ("go env -w") and exported variables that all change the code the compiler makes. build-one.sh sets GOENV=off and unsets the
+# variables, so the bytes must be the same as those of build 1. A script that lets the setting through fails here.
+iso_t="$(printf '%s\n' "${targets:-linux/amd64}" | awk '{print $1}')"
+iso_os="${iso_t%/*}"
+iso_arch="${iso_t#*/}"
+iso_name="kingres-verify-${iso_os}-${iso_arch}"
+[ "${iso_os}" = windows ] && iso_name="${iso_name}.exe"
+printf 'GOEXPERIMENT=nogreenteagc\nGOFIPS140=v1.0.0\nGOFLAGS=-ldflags=-X=main.version=hostile\n' >"${run}/hostile.env"
+printf '== build 3 (a hostile Go environment) of %s\n' "${iso_name}"
+GOENV="${run}/hostile.env" GOEXPERIMENT=nosizespecializedmalloc GOFIPS140=v1.0.0 \
+    GOCACHE="${run}/cache-3" GOPATH="${run}/gopath-3" GOMODCACHE="${run}/gopath-3/pkg/mod" \
+    bash "${src1}/scripts/build-one.sh" "${iso_os}" "${iso_arch}" "${version}" "${run}/hostile-${iso_name}" >"${run}/log-3.txt" 2>&1 ||
+    { cat "${run}/log-3.txt" >&2; die "build 3 failed"; }
+
 status=0
 if ! diff -r "${run}/out-1" "${run}/out-2" >/dev/null; then
     status=1
 fi
+if ! cmp -s "${run}/out-1/${iso_name}" "${run}/hostile-${iso_name}"; then
+    status=1
+    printf 'differs under a hostile Go environment (a go env -w file, GOEXPERIMENT, GOFIPS140): %s\n' "${iso_name}"
+fi
 if [ "${status}" -eq 0 ]; then
     n="$(wc -l <"${run}/out-1/SHA256SUMS" | tr -d ' ')"
-    printf 'REPRODUCIBLE: %s files, identical from %s and from %s\n' "${n}" "${src1#"${run}"/}" "${src2#"${run}"/}"
+    printf 'REPRODUCIBLE: %s files, identical from %s and from %s, and %s is the same under a hostile Go environment\n' "${n}" "${src1#"${run}"/}" "${src2#"${run}"/}" "${iso_name}"
     cat "${run}/out-1/SHA256SUMS"
 else
     printf 'NOT REPRODUCIBLE: the two builds differ\n--- build 1\n'

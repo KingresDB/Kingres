@@ -312,9 +312,9 @@ func (p *pubInputs) continuity(r *result, rep *aggReport, o aggOptions) outcome 
 	ol, prev := rep.log, o.previous
 	switch {
 	case prev.Size > ol.cp.Size:
-		return failedOut("rollback", fmt.Errorf("the aggregate checkpoint has size %d, smaller than %d, the size of the checkpoint you hold: the aggregate log went back, or an old checkpoint is being shown", ol.cp.Size, prev.Size))
+		return failedOut("rollback", fmt.Errorf("the aggregate checkpoint has size %d, smaller than %d, the size of the checkpoint you hold: the aggregate log went back, or an old checkpoint is being shown%s", ol.cp.Size, prev.Size, p.restoreRemark()))
 	case prev.Size == ol.cp.Size && prev.Root != ol.cp.Root:
-		return failedOut("fork", fmt.Errorf("two trusted checkpoints of the aggregate log have the same size %d and different roots (%x held, %x served): the aggregate log has two histories", prev.Size, prev.Root, ol.cp.Root))
+		return failedOut("fork", fmt.Errorf("two trusted checkpoints of the aggregate log have the same size %d and different roots (%x held, %x served): the aggregate log has two histories%s", prev.Size, prev.Root, ol.cp.Root, p.restoreRemark()))
 	}
 	path, err := ol.reader.ConsistencyProof(prev.Size)
 	if err != nil {
@@ -325,7 +325,7 @@ func (p *pubInputs) continuity(r *result, rep *aggReport, o aggOptions) outcome 
 		if errors.Is(err, merkle.ErrOldRoot) {
 			step = "fork"
 		}
-		return failedOut(step, fmt.Errorf("the aggregate log at size %d does not extend the log at size %d that you hold: %w", ol.cp.Size, prev.Size, err))
+		return failedOut(step, fmt.Errorf("the aggregate log at size %d does not extend the log at size %d that you hold: %w%s", ol.cp.Size, prev.Size, err, p.forkRemark(step)))
 	}
 	r.ok("aggregate-consistency", fmt.Sprintf("RFC 9162 2.1.4.2: the aggregate log at size %d extends the one you hold at size %d", ol.cp.Size, prev.Size))
 	if prev.Size == 0 || prev.Size == ol.cp.Size {
@@ -517,6 +517,7 @@ func (e *env) aggregateRun(r *result, trustPath, source, aggID, previous, chains
 		return out
 	}
 	r.notes = append(r.notes, p.closedEpochNotes(rep)...)
+	r.notes = append(r.notes, p.restoreNotes()...)
 	if len(rep.closed) > 0 {
 		if r.info == nil {
 			r.info = map[string]any{}

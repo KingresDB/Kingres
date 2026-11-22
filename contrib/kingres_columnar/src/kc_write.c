@@ -4407,8 +4407,8 @@ kc_write_init(void)
 							NULL, &kc_guc_reserve_min, 64, 0, 10000000,
 							PGC_SUSET, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 	DefineCustomIntVariable("kingres_columnar.reserve_gate_at",
-							"The point of the reservation where reserve_gate waits: 1 numbers taken, 2 reserved row inserted, 3 pages written, 4 row updated, 6 an index vacuum has its ranges, 7 the merge of a VACUUM is done (testing).",
-							NULL, &kc_guc_reserve_gate_at, 0, 0, 7,
+							"The point of the reservation where reserve_gate waits: 1 numbers taken, 2 reserved row inserted, 3 pages written, 4 row updated, 6 an index vacuum has its ranges, 7 the merge of a VACUUM is done, 8 an index vacuum holds its lock and has not read its ranges (testing).",
+							NULL, &kc_guc_reserve_gate_at, 0, 0, 8,
 							PGC_SUSET, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 
 #ifdef USE_ASSERT_CHECKING

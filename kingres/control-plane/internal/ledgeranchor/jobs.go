@@ -93,7 +93,7 @@ func (s *Service) jobUpgrade(ctx context.Context, term scheduler.Term) error {
 // at most PassWait, and a target that is still being worked on (it hangs for its timeouts on each of its records) keeps its worker and is
 // left alone by the next passes until it ends, while the other targets are worked on in every pass.
 func (s *Service) pass(ctx context.Context, term scheduler.Term, set DueSet) error {
-	if err := s.takeFatal(); err != nil {
+	if err := s.takeFatal(term); err != nil {
 		return err
 	}
 	now := s.now()
@@ -135,7 +135,7 @@ func (s *Service) pass(ctx context.Context, term scheduler.Term, set DueSet) err
 				return
 			}
 			if err := s.workTarget(ctx, term, id, list); err != nil {
-				s.setFatal(err)
+				s.setFatal(term, err)
 			}
 		}(id, byTarget[id])
 	}
@@ -154,7 +154,7 @@ func (s *Service) pass(ctx context.Context, term scheduler.Term, set DueSet) err
 			i = started
 		}
 	}
-	return s.takeFatal()
+	return s.takeFatal(term)
 }
 
 // beginTarget takes the worker of a target for a set of records (false when one is running); endTarget gives it back.
@@ -175,20 +175,28 @@ func (s *Service) endTarget(set DueSet, id int64) {
 	s.mu.Unlock()
 }
 
-// setFatal keeps the error that ends the term (a deposed leader) for the pass that returns it: a worker may end after its pass did.
-func (s *Service) setFatal(err error) {
+// setFatal keeps the error that ends a term (a deposed leader) for the pass of that term that returns it: a worker may end after its
+// pass did. The error is kept with the term of the worker (P7R-03). The error of a later term replaces one of an earlier term that is still kept,
+// and the error of an earlier term never replaces one of a later term: a stale error cannot hide the news of the term that is running (P7F-05).
+func (s *Service) setFatal(term scheduler.Term, err error) {
 	s.mu.Lock()
-	if s.fatal == nil {
-		s.fatal = err
+	if s.fatal == nil || term > s.fatalTerm {
+		s.fatal, s.fatalTerm = err, term
 	}
 	s.mu.Unlock()
 }
 
-func (s *Service) takeFatal() error {
+// takeFatal returns the kept error when it was found in the term of the pass that asks, and drops it in either case: the error of a
+// worker of an earlier term says that that term is over, which is no news to a pass of a later one, and ending the later term for it
+// would be a flap of the leadership for nothing.
+func (s *Service) takeFatal(term scheduler.Term) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	err := s.fatal
+	err, from := s.fatal, s.fatalTerm
 	s.fatal = nil
+	if from != term {
+		return nil
+	}
 	return err
 }
 
@@ -198,10 +206,25 @@ func (s *Service) workTarget(ctx context.Context, term scheduler.Term, id int64,
 	if err != nil {
 		return nil
 	}
-	b, berr := s.build(trow)
-	if berr != nil && isNoCredentials(berr) && s.fetchMissing(ctx, trow) {
-		// a server that became the leader without the file asks the other holders for it before it gives up (P7A-03)
+	// a server that became the leader after a rotation it missed does not anchor with the old credentials (P7F-01)
+	var b *Built
+	var berr error
+	if gerr := s.ensureCurrent(ctx, term, trow); gerr != nil {
+		berr = gerr
+	} else {
 		b, berr = s.build(trow)
+	}
+	if berr != nil && isNoCredentials(berr) {
+		// a server that became the leader without the file asks the other holders for it before it gives up (P7A-03). When no holder
+		// gave it and not every holder could be asked, the file may exist: the records wait and try again, they do not fail (P7R-08)
+		switch s.fetchMissing(ctx, trow) {
+		case fetchOK:
+			b, berr = s.build(trow)
+		case fetchUnreached:
+			berr = credsUnreachedError{}
+		case fetchNotInstalled:
+			berr = credsUnreachedError{notInstalled: true}
+		}
 	}
 	for _, r := range list {
 		if ctx.Err() != nil {
@@ -258,6 +281,18 @@ func (s *Service) work(ctx context.Context, term scheduler.Term, trow TargetRow,
 		}
 	}
 	if berr != nil {
+		if isCredsStale(berr) {
+			var se credsStaleError
+			if errors.As(berr, &se) && se.final {
+				// the newer file cannot be taken and will not be: the records fail, an operator uses Retry after the fix (P7G-04)
+				return s.fail(ctx, term, row, anchor.Errorf(anchor.ClassPermanent, row.Kind, "target", "credentials_stale", "%s", errText(berr)), nil, trow.Revision)
+			}
+			return s.fail(ctx, term, row, anchor.Errorf(anchor.ClassRetryable, row.Kind, "target", "credentials_stale", "%s", errText(berr)), nil, trow.Revision)
+		}
+		if isCredsUnreached(berr) {
+			// the file may exist on a holder that does not answer: a retry with backoff, as for any target that cannot be reached (P7R-08)
+			return s.fail(ctx, term, row, anchor.Errorf(anchor.ClassRetryable, row.Kind, "target", "credentials_unreached", "%s", errText(berr)), nil, trow.Revision)
+		}
 		// The target cannot be built: the credentials or the configuration are wrong or missing on this server. Nothing a later call does
 		// changes that, so the record fails at once, with the cause in its text and in the alert of 6.9, and an operator uses Retry after
 		// the fix (P7A-03); a retry with backoff would say nothing for hours.
