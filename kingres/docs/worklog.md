@@ -7,6 +7,46 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-22 (third entry): phase 11 leftovers in kingres_shard: the schemas in the rebalance plan and the drain, and the schema checks of check_cluster
+
+Covers branch p11-left (from shard-p12), design [shard-phase11.md](design/shard-phase11.md) sections 9.9 and 9.10.
+
+### What was done
+
+- **The rebalance plan.**  `kingres.plan_rebalance()` and `group_load()` now plan a distributed schema as an item `(colocation_id, 0)` like a bucket (before, the plan counted the schema
+  in the load of its group and never moved it).  A schema that a ledger table pins is not an item and stays as fixed load; the owners are asked for the pins
+  (`internal_pinned_schemas()`, node-local) when the caller is a superuser.  The sizes under `by_disk_size` were already read from the owner (review P10R-09).
+- **The drain.**  A drain is a rebalance with `drain_only`, so its plan holds the schemas of the group with `reason = 'drain'`.  New: `kingres.schemas_on_group(group)` (superuser), the schemas of
+  a group with sizes and blockers (a ledger pin, an unlogged table, a table with neither a key nor a full replica identity), which is what the preview of a drain needs.  `set_node_property(node, false)`
+  already kept new schemas off the group and `remove_node` already refuses a group that owns a bucket; both are now tested for schemas.
+- **`check_cluster`.**  New `internal_check_schemas()`: for every active primary, `schema_missing`, `schema_table_missing`, `schema_structure_differs` (the table fingerprint), `stray_schema_rows` (rows in the
+  empty copy of a table of another group's schema, outside a move that has the group as source or target) and `schema_catalog_differs` (a digest of the schemas, their groups, states, placement epochs and
+  numbers of tables, by names).  The node does the work (`internal_check_schemas_local`) from what the map group primary expects.
+- Tests `t/270` (the plan, the pinned schema, the drain, placement, removal) and `t/271` (every check, a move, a clean cluster); `t/236` section C now says what it always meant (the plan of phase 4 does not move a schema).
+  Each change has a mutant that a test kills.
+- **SQL.**  The changes are in the 0.8 scripts (`kingres_shard--0.7--0.8.sql`, regenerated `kingres_shard--0.8.sql`): they replace the bodies of three functions of 0.8 that is not released and add six
+  functions.  If the integration prefers them in 0.9 (the branch p12-storage has the 0.8 to 0.9 script), the new block "the leftovers of steps 6 and 15" and the three edited places move as they are.
+
+### How it was verified
+
+See the integration note of this branch (full suite, both majors).
+
+### Decisions and deviations
+
+- A non-superuser's plan does not know the pins (only a superuser can ask the nodes); the move of a pinned schema is refused when tried.
+- `drain_status()` is unchanged (it counts a schema's bucket among the buckets of its group); the schemas of a group come from `schemas_on_group()`.
+- The message of `remove_node` still says "buckets", not "schemas" (the function is in `node_admin.c`, which the 0.9 work changes).
+
+### Still open
+
+- The step 6 of the drain in the control plane (reading the schemas again) and `previewServerDrain` belong to cp-1011 and can now call `schemas_on_group()`.
+
+### Core patches
+
+None.
+
+---
+
 ## 2026-11-22 (second entry): phase 12, the sharding part: the repartitioned join and MERGE on distributed tables
 
 Covers branch shard-p12, rebased onto the staging branch m18 (kingres-18 with the 0.8 tree of shard-p1011 merged).  Design:

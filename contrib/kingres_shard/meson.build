@@ -330,6 +330,8 @@ tests += {
       't/249_split_verify_types.pl',
       't/250_install_script_current.pl',
       't/251_add_node_staging_leftovers.pl',
+      't/270_schema_rebalance_plan.pl',
+      't/271_schema_check_cluster.pl',
       't/260_repartition_join.pl',
       't/261_repartition_security.pl',
       't/262_repartition_moves.pl',
