@@ -36,6 +36,8 @@
  */
 #include "postgres.h"
 
+#include "catalog/pg_class.h"
+#include "catalog/pg_am_d.h"
 #include "catalog/pg_type_d.h"
 #include "executor/spi.h"
 #include "fmgr.h"
@@ -48,6 +50,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 #include "utils/typcache.h"
 
 #include "bucket_move.h"
@@ -251,7 +254,8 @@ kingres_shard_remote_fk_script(Oid relid, const char *column)
  */
 void
 kingres_shard_append_partitions(StringInfo buf, const char *nsp, const char *prefix, const char *parent,
-				  const KsColocation *coloc, int group, const char *with_clause)
+				  const KsColocation *coloc, int group, const char *with_clause,
+				  bool replica_full)
 {
 	int			i;
 
@@ -268,6 +272,9 @@ kingres_shard_append_partitions(StringInfo buf, const char *nsp, const char *pre
 						 quote_identifier(nsp), quote_identifier(part),
 						 quote_identifier(nsp), quote_identifier(parent),
 						 kingres_shard_bucket_modulus(coloc, b), b, with_clause != NULL ? with_clause : "");
+		/* a bucket partition of another storage than heap has no primary key to name its rows in a move: REPLICA IDENTITY FULL (it never sees an UPDATE or a DELETE) */
+		if (replica_full)
+			appendStringInfo(buf, "ALTER TABLE %s.%s REPLICA IDENTITY FULL;\n", quote_identifier(nsp), quote_identifier(part));
 		pfree(part);
 	}
 }
@@ -302,6 +309,27 @@ kingres_shard_with_clause(Oid relid, char **reloptions_literal, MemoryContext cx
 }
 
 /*
+ * uses_non_heap_am
+ *
+ * True when the table (a plain table, or the partitioned parent) has an access method other than heap, columnar for the
+ * tables of this release.  Such a table's bucket partitions carry REPLICA IDENTITY FULL (design 9.3 of the storage part of
+ * phase 12): the bucket move requires a primary key or REPLICA IDENTITY FULL, and a columnar table has no primary key unless
+ * the user made one.  A partitioned table that names no access method has none (relam 0): heap.
+ */
+bool
+kingres_shard_uses_non_heap_am(Oid relid)
+{
+	HeapTuple	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	Oid			am;
+
+	if (!HeapTupleIsValid(tp))
+		return false;
+	am = ((Form_pg_class) GETSTRUCT(tp))->relam;
+	ReleaseSysCache(tp);
+	return OidIsValid(am) && am != HEAP_TABLE_AM_OID;
+}
+
+/*
  * append_partition_tree
  *
  * As append_partitions, for a table the user partitioned: the bucket partition is created PARTITION BY <partby>
@@ -311,7 +339,7 @@ kingres_shard_with_clause(Oid relid, char **reloptions_literal, MemoryContext cx
 void
 kingres_shard_append_partition_tree(StringInfo buf, const char *nsp, const char *prefix, const char *parent,
 									const KsColocation *coloc, int group, const char *partby,
-									List *leafnames, List *leafbounds)
+									List *leafnames, List *leafbounds, List *leafams)
 {
 	int			i;
 
@@ -321,6 +349,7 @@ kingres_shard_append_partition_tree(StringInfo buf, const char *nsp, const char 
 		char	   *part;
 		ListCell   *ln;
 		ListCell   *lb;
+		ListCell   *la;
 
 		if (kingres_shard_bucket_group(coloc, b) != group)
 			continue;
@@ -330,15 +359,20 @@ kingres_shard_append_partition_tree(StringInfo buf, const char *nsp, const char 
 						 quote_identifier(nsp), quote_identifier(part),
 						 quote_identifier(nsp), quote_identifier(parent),
 						 kingres_shard_bucket_modulus(coloc, b), b, partby);
-		forboth(ln, leafnames, lb, leafbounds)
+		forthree(ln, leafnames, lb, leafbounds, la, leafams)
 		{
 			char	   *leaf = psprintf("%s_b%04d", (char *) lfirst(ln), b);
+			const char *am = (const char *) lfirst(la);
 
-			appendStringInfo(buf, "CREATE TABLE %s.%s PARTITION OF %s.%s %s%s;\n",
+			/* the leaf has the storage it had in the source: a leaf may differ from its siblings and from the parent */
+			appendStringInfo(buf, "CREATE TABLE %s.%s PARTITION OF %s.%s %s%s USING %s;\n",
 							 quote_identifier(nsp), quote_identifier(leaf),
 							 quote_identifier(nsp), quote_identifier(part),
 							 strcmp((char *) lfirst(lb), "DEFAULT") == 0 ? "" : "FOR VALUES ",
-							 (char *) lfirst(lb));
+							 (char *) lfirst(lb), quote_identifier(am));
+			if (strcmp(am, "heap") != 0)
+				appendStringInfo(buf, "ALTER TABLE %s.%s REPLICA IDENTITY FULL;\n",
+								 quote_identifier(nsp), quote_identifier(leaf));
 			pfree(leaf);
 		}
 		pfree(part);
@@ -608,6 +642,8 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 	char	   *reloptions = NULL;
 	List	   *leafnames = NIL;
 	List	   *leafbounds = NIL;
+	List	   *leafams = NIL;
+	bool		replica_full;
 	int64		nread = 0;
 	int64		nacked = 0;
 
@@ -726,7 +762,7 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 	 */
 	argtypes[0] = OIDOID;
 	values[0] = ObjectIdGetDatum(relid);
-	kingres_shard_run_spi("SELECT partby, name::pg_catalog.text, bound FROM " KINGRES_SHARD_SCHEMA
+	kingres_shard_run_spi("SELECT partby, name::pg_catalog.text, bound, am::pg_catalog.text FROM " KINGRES_SHARD_SCHEMA
 						  ".internal_partition_layout($1::pg_catalog.oid::pg_catalog.regclass) ORDER BY ord",
 						  1, argtypes, values);
 	{
@@ -738,6 +774,7 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 				partby = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
 			leafnames = lappend(leafnames, SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2));
 			leafbounds = lappend(leafbounds, SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 3));
+			leafams = lappend(leafams, SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 4));
 		}
 		if (partby == NULL && get_rel_relkind(relid) == RELKIND_PARTITIONED_TABLE)
 		{
@@ -754,6 +791,9 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 				 errmsg("table \"%s\" would have %d leaves (%d buckets, %d partitions); kingres_shard.max_partition_leaves is %d",
 						relname, nbuckets * list_length(leafnames), nbuckets, list_length(leafnames),
 						kingres_shard_max_partition_leaves)));
+
+	/* a table of another storage than heap: its bucket partitions get REPLICA IDENTITY FULL */
+	replica_full = kingres_shard_uses_non_heap_am(relid);
 
 	/* The storage parameters of the table: the bucket partitions get them (a partitioned table cannot have them). */
 	with_clause = kingres_shard_with_clause(relid, &reloptions, callercxt);
@@ -774,9 +814,9 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 	resetStringInfo(&script);
 	appendStringInfoString(&script, ddl.both.data);
 	if (partby != NULL)
-		kingres_shard_append_partition_tree(&script, nspname, relname, shadow, placement, local_group, partby, leafnames, leafbounds);
+		kingres_shard_append_partition_tree(&script, nspname, relname, shadow, placement, local_group, partby, leafnames, leafbounds, leafams);
 	else
-		kingres_shard_append_partitions(&script, nspname, relname, shadow, placement, local_group, with_clause);
+		kingres_shard_append_partitions(&script, nspname, relname, shadow, placement, local_group, with_clause, replica_full);
 	kingres_shard_run_spi(script.data, 0, NULL, NULL);
 
 	/*
@@ -797,9 +837,9 @@ kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 		appendStringInfoString(&script, ddl.remote_pre.data);
 		appendStringInfoString(&script, ddl.both.data);
 		if (partby != NULL)
-			kingres_shard_append_partition_tree(&script, nspname, relname, shadow, placement, n->group_id, partby, leafnames, leafbounds);
+			kingres_shard_append_partition_tree(&script, nspname, relname, shadow, placement, n->group_id, partby, leafnames, leafbounds, leafams);
 		else
-			kingres_shard_append_partitions(&script, nspname, relname, shadow, placement, n->group_id, with_clause);
+			kingres_shard_append_partitions(&script, nspname, relname, shadow, placement, n->group_id, with_clause, replica_full);
 		kingres_shard_exec_on_node(kc, script.data);
 	}
 	kingres_shard_fault_point("distribute_after_shadow");

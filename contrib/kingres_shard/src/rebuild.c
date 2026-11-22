@@ -196,6 +196,7 @@ kingres_internal_shadow_script(PG_FUNCTION_ARGS)
 	DdlSet		ddl;
 	StringInfoData script;
 	char	   *with_clause;
+	bool		replica_full;
 
 	require_superuser("kingres.internal_shadow_script()");
 	relname = get_rel_name(relid);
@@ -211,6 +212,7 @@ kingres_internal_shadow_script(PG_FUNCTION_ARGS)
 		elog(ERROR, "SPI_connect failed");
 	kingres_shard_fetch_ddl(relid, column, true, &ddl, callercxt);
 	with_clause = kingres_shard_with_clause(relid, NULL, callercxt);
+	replica_full = kingres_shard_uses_non_heap_am(relid);
 	SPI_finish();
 
 	initStringInfo(&script);
@@ -226,7 +228,7 @@ kingres_internal_shadow_script(PG_FUNCTION_ARGS)
 					 errmsg("a distributed shadow needs a colocation group")));
 		placement = kingres_shard_load_placement(colocation_id);
 		/* a table that is rebuilt while the old one is in use cannot have its partitions under the final names yet */
-		kingres_shard_append_partitions(&script, nspname, partbase != NULL ? partbase : relname, shadow, placement, group, with_clause);
+		kingres_shard_append_partitions(&script, nspname, partbase != NULL ? partbase : relname, shadow, placement, group, with_clause, replica_full);
 	}
 	PG_RETURN_TEXT_P(cstring_to_text(script.data));
 }

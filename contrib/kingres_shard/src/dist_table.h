@@ -45,9 +45,13 @@ extern void kingres_shard_fetch_ddl(Oid relid, const char *column, bool shadow, 
 /* The same for a table the user partitioned: each bucket partition is itself PARTITION BY <partby> with one leaf per user partition. */
 extern void kingres_shard_append_partition_tree(StringInfo buf, const char *nsp, const char *prefix, const char *parent,
 								  const KsColocation *coloc, int group, const char *partby,
-								  List *leafnames, List *leafbounds);
+								  List *leafnames, List *leafbounds, List *leafams);
+/* replica_full: the partitions have a storage that is not heap, whose changes a move must be able to name: REPLICA IDENTITY FULL (design 9.3) */
 extern void kingres_shard_append_partitions(StringInfo buf, const char *nsp, const char *prefix,
-											const char *parent, const KsColocation *coloc, int group, const char *with_clause);
+											const char *parent, const KsColocation *coloc, int group, const char *with_clause,
+											bool replica_full);
+/* true when the table (or the partitioned parent) has an access method other than heap */
+extern bool kingres_shard_uses_non_heap_am(Oid relid);
 /* the storage parameters, as a WITH (...) clause for CREATE TABLE, of the table (the recorded ones of a distributed table); never NULL */
 extern char *kingres_shard_with_clause(Oid relid, char **reloptions_literal, MemoryContext cxt);
 extern List *kingres_shard_remote_primaries(MemoryContext callercxt);

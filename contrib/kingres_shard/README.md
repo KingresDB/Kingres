@@ -2263,6 +2263,39 @@ Read these first; each is a reviewed boundary, not an accident.
 - `dist_collation` is an OID; non-default, non-deterministic collations are
   not portable between nodes.
 
+## Columnar storage (version 0.9, phase 12)
+
+Design: [`analytics-phase12-storage.md`](../../kingres/docs/design/analytics-phase12-storage.md), section 9.  Version 0.9 makes the
+extension work with tables of the access method `columnar` (`kingres_columnar`, which must be installed on every node and preloaded
+where the tables are written).  The version adds no table to the catalog; the scripts are `kingres_shard--0.8--0.9.sql` and the
+generated `kingres_shard--0.9.sql`.
+
+### The access method is carried (increment S1)
+
+`create_distributed_table` (blocking and `_concurrently`), `alter_distributed_table`, `undistribute_table` and the node that joins
+through `add_node` all recreate a table from `kingres.internal_table_ddl()`, which now names the access method of the source
+(`USING columnar`; heap is the default and is not named).  The partitioned parent of a distributed table has the access method, so
+every bucket partition made with `CREATE TABLE ... PARTITION OF` has it; the shadow of a rebuild is made the same way, so a columnar
+table stays columnar through every operation of the table lifecycle, and `undistribute_table` gives a columnar table back.
+A user-partitioned table (increment 9.5) keeps the access method of **each leaf**: a leaf may differ from its siblings and from the
+parent (a columnar leaf for cold data next to heap leaves); `internal_partition_layout()` has a fifth column, `am`.
+
+- **REPLICA IDENTITY FULL.** A columnar table has no primary key unless the user made one, and a bucket move needs a primary key or
+  `REPLICA IDENTITY FULL` (phase 4).  Every bucket partition and every leaf of another access method than heap is created with
+  `REPLICA IDENTITY FULL`.  No `UPDATE` or `DELETE` can reach it (the access method refuses them), so the identity only satisfies the
+  check of the move.
+- **The report.**  `table_change_report('distribute', ...)` gains `access_method_missing` (a blocker: a node lacks the access method; create the
+  extension there first) and the note `columnar_storage`; `table_change_report('distribute_reference', ...)` gains the blocker
+  `columnar_reference_table`: a reference table is a heap table in this version (design 9.5), so `create_reference_table` refuses a columnar
+  table and leaves it alone.  The report of 0.8 is kept as `kingres.internal_table_change_report_base()` and the report of 0.9 calls it and
+  adds these rows.
+- **Writes.** `INSERT`, `COPY FROM` and the batches of the row router work on a columnar distributed table; `UPDATE` and `DELETE` are
+  refused by the access method on the group that holds a matching row, and the two-phase transaction rolls the rest back.
+- **`add_node`** onto a node that has `kingres_columnar` (or `kingres_ledger`) installed works: the schema `kingres` is shared, and the check
+  of the prepared transaction no longer takes "the function does not exist" for a failure when the extension of this very transaction is
+  the one that makes the function.  A node without the access method is refused with the error of the node (`access method "columnar" does not
+  exist`) and joins nothing.
+
 ## Moving buckets and rebalancing (version 0.3, phase 4)
 
 Design: [`kingres/docs/design/shard-phase4.md`](../../kingres/docs/design/shard-phase4.md)

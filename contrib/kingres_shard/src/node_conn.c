@@ -2942,10 +2942,12 @@ prepare_one(KsConn *kc)
 	 * schema to ask after the PREPARE: the objects are in the prepared transaction.
 	 * It is not part of the cluster yet, so no group of it has a standby that
 	 * could matter; the error "schema does not exist" is then the answer "nothing
-	 * to confirm".
+	 * to confirm".  The schema "kingres" is shared with kingres_columnar and kingres_ledger: a node that has one of them
+	 * has the schema and not the function, which is the same case (undefined_function).
 	 */
 	schema_missing = (prepared && res != NULL && PQresultStatus(res) == PGRES_FATAL_ERROR &&
-					  kingres_shard_result_sqlstate(res) == ERRCODE_INVALID_SCHEMA_NAME);
+					  (kingres_shard_result_sqlstate(res) == ERRCODE_INVALID_SCHEMA_NAME ||
+					   kingres_shard_result_sqlstate(res) == ERRCODE_UNDEFINED_FUNCTION));
 	if (!schema_missing &&
 		(res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK || confirmed != 1))
 	{
