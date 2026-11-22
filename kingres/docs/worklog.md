@@ -7,6 +7,43 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-22: the fixes for the first independent review of phase 13 (configuration from the console)
+
+### What was done
+
+- The review ([reviews/2026-11-22-config-phase13.md](reviews/2026-11-22-config-phase13.md)) found 2 high, 5 medium and 8 low findings. All 15 are fixed or answered on
+  branch `p13-fix` (made from `p13-fin`, contract 0.17.0, which is unreleased and was changed in place); the report has a "Fixes" section that maps each finding to its commit and test.
+- High: the parameters that change how the sessions of `kingresd` itself behave (`default_transaction_read_only`, timeouts, `search_path`, ...) are refused at every
+  level; `unix_socket_permissions`, `unix_socket_group`, `huge_pages`, every `ssl*` and others are managed or refused; a restart is checked with `postgres -C` first, and a restart
+  that cannot start puts the last good override file back and starts the instance again.
+- Medium: a server that is down no longer keeps the apply task open (it is recorded as `waiting` and the convergence loop brings it up to date); the hidden set fails closed;
+  a stored value whose name became managed or refused is skipped and can always be removed; the restart goes through the instance lifecycle of the operations code and finds the
+  primary of each group from the leader's record; the time-zone tests use a zone that is not the host's.
+- Low: tests for the executed restart order, leading zeros and the audit; the audit details; the task codes; the reserved-connections warning; `expectedRevision` in the contract; the
+  console sends it. Contract 0.17.0 gained the optional `expectedRevision` of `ConfigChangeRequest` (additive).
+
+### How it was verified
+
+- Every fix has a test that fails without it; each was checked with a mutant (listed in the report): 10 cluster mutants and 13 unit mutants, all killed.
+- PostgreSQL 18 and 19 (private installs, lane l5): the `pgconfig`, `instance`, `httpapi` and `ops` packages, and the whole `TestConfig*` set of the cluster tests (23 tests) on three servers.
+- Console: typecheck, lint, the whole unit suite (90 files, 1462 tests), the browser tests (layout, CSP, axe), `api:check`; `node kingres/api/scripts/check-contract.mjs` holds.
+
+### Decisions and deviations
+
+- The apply task no longer waits for a server that is down (design "Failure cases" changed). Audit details carry `basedOnRevision` and the task id instead of the revision, which is allocated after the audit event.
+- `log_line_prefix` and `log_error_verbosity` stay settable (the console does not parse log lines). The console mock still models a waiting task for a server that is down.
+
+### Still open
+
+See the report: no cluster test with a promoted standby (unit test of the order only), no test that induces a failure of the hidden-set read inside `State`, the derived default of a removed
+override is not known to the preview warning, and the mock of the console still models the old waiting task.
+
+### Core patches
+
+None.
+
+---
+
 ## 2026-11-20: automatic failover, the last steps of phase 2b and their review, the second review of phase 9 and its fixes, and two npm alerts
 
 Covers 2026-11-20 from the morning, after the third entry of 2026-11-19.
