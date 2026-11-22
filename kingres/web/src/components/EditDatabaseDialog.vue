@@ -4,7 +4,7 @@
 // Edit the mutable settings of a database. Fixed settings (name, encoding, collation, bucket
 // count) are listed read-only with the reason. PATCH answers 200 for instant changes and 202 + Task
 // when background work is needed (turning on sharding or the ledger).
-import { computed, reactive, ref } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import SafeName from './SafeName.vue'
 import TaskActionDialog from './TaskActionDialog.vue'
 import FormField from './FormField.vue'
@@ -42,6 +42,14 @@ const form = reactive({
 })
 const session = useSessionStore()
 const canChangeMode = computed(() => session.can('updateDatabase'))
+// The mode Rows has no schemas to distribute: the setting goes off with it (the server refuses true with Rows), and a mode that
+// has schemas keeps the value the database has.
+watch(
+  () => form.mode,
+  (mode) => {
+    if (mode === 'row') form.distributeNew = false
+  },
+)
 const submitted = ref(false)
 
 const body = computed<DatabaseUpdateRequest>(() => {

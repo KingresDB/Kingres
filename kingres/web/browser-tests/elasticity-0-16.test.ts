@@ -116,6 +116,29 @@ describe('contract 0.16.0 in a real browser', () => {
         '[data-testid="schema-blockers"], [role="dialog"] .field, [role="dialog"] p',
       )
     })
+    await check(
+      failures,
+      '/databases/shop',
+      'distribute schema dialog with its choices',
+      async () => {
+        await page.evaluate(() => {
+          const row = [...document.querySelectorAll('[data-testid="schema-row"]')].find((r) =>
+            r.textContent?.includes('legacy'),
+          )
+          ;(row?.querySelector('[data-testid="distribute-schema"]') as HTMLElement | null)?.click()
+        })
+        await page.waitForSelector('[role="dialog"] select')
+      },
+    )
+    await check(
+      failures,
+      '/shards?db=shop',
+      'schemas per server group',
+      async () => {
+        await page.waitForSelector('[data-testid="schemas-per-group"]')
+      },
+      null,
+    )
     await check(failures, '/databases/shop', 'move schema dialog', async () => {
       await clickText(page, 'Move schema')
       await page.waitForSelector('[role="dialog"]')

@@ -18,8 +18,10 @@ import {
   useBucketDistribution,
   useColocationGroups,
   useDatabases,
+  useSchemas,
   useServers,
 } from '@/api/queries'
+import SafeName from '@/components/SafeName.vue'
 import { formatBytes, formatNumber } from '@/lib/format'
 import type { Bucket } from '@/api/types'
 
@@ -71,6 +73,36 @@ const distribution = useBucketDistribution(
   () => dbName.value || null,
   () => colocationId.value ?? undefined,
 )
+
+// Distributed schemas per server group (a count and a size), for a database that has any (design shard-phase11.md, 14.2).
+const schemas = useSchemas(() => dbName.value)
+interface GroupSchemas {
+  groupId: number
+  serverId: string | null
+  count: number
+  bytes: number
+  /** Schemas whose size is not known here (null, shown as "n/a", never as 0). */
+  unknown: number
+}
+const schemasPerGroup = computed<GroupSchemas[]>(() => {
+  const byGroup = new Map<number, GroupSchemas>()
+  for (const s of schemas.data.value ?? []) {
+    const d = s.distribution
+    if (!d) continue
+    const row = byGroup.get(d.shardGroupId) ?? {
+      groupId: d.shardGroupId,
+      serverId: d.serverId ?? null,
+      count: 0,
+      bytes: 0,
+      unknown: 0,
+    }
+    row.count += 1
+    if (s.sizeBytes === null || s.sizeBytes === undefined) row.unknown += 1
+    else row.bytes += s.sizeBytes
+    byGroup.set(d.shardGroupId, row)
+  }
+  return [...byGroup.values()].sort((a, b) => a.groupId - b.groupId)
+})
 
 watch([dbName, serverFilter], () => {
   void router.replace({
@@ -263,6 +295,44 @@ function findBucket(): void {
           </TableWrap>
         </section>
       </QueryBoundary>
+
+      <section v-if="schemasPerGroup.length" class="card" aria-labelledby="schemas-group-h">
+        <h2 id="schemas-group-h">Distributed schemas per server group</h2>
+        <TableWrap>
+          <table class="table" data-testid="schemas-per-group">
+            <caption class="sr-only">
+              Distributed schemas, their number and size, per server group
+            </caption>
+            <thead>
+              <tr>
+                <th scope="col">Server group</th>
+                <th scope="col">Server</th>
+                <th scope="col" class="num">Schemas</th>
+                <th scope="col" class="num">Size</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="g in schemasPerGroup" :key="g.groupId">
+                <th scope="row">Group {{ g.groupId }}</th>
+                <td>
+                  <SafeName v-if="g.serverId" :value="g.serverId" :max="60" />
+                  <template v-else>-</template>
+                </td>
+                <td class="num">{{ g.count }}</td>
+                <td class="num">
+                  <NullableValue
+                    :value="g.unknown === g.count ? null : g.bytes"
+                    :format="formatBytes"
+                  />
+                  <span v-if="g.unknown > 0 && g.unknown < g.count" class="muted">
+                    (and {{ g.unknown }} not known)</span
+                  >
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </TableWrap>
+      </section>
 
       <section class="card" aria-labelledby="per-server-h">
         <h2 id="per-server-h">Buckets per server</h2>

@@ -764,6 +764,10 @@ The console is Vue 3 with TypeScript; the generated types come from `kingres/api
   the automatic mode.
 - **Tests.** `tests/elasticity-0-16.test.ts` (18 tests: the options and the automatic card for both roles, the weight and its validation, the drain, the return to service, the split, the schemas list with a hostile name, the blockers, a failing task,
   the replica identity, a pinned schema, the typed confirmation, the read-only role, the create dialog). `browser-tests/elasticity-0-16.test.ts` opens the drain, weight, split and schema dialogs and the automatic card in a real browser and runs axe (colour contrast included) in light and dark at 1366 and 320 pixels, and checks that the page does not scroll sideways. The in-flight list and the plan show a unit of kind `schema` (the schema name as text) and a bucket that is being split; the mock server of the console never sends one, so a test makes the answer up. The extension does not plan schemas yet.
+- **Schemas, the second pass** (`tests/schemas-panel-0-16.test.ts`, 8 tests). The create dialog sets "Distribute new schemas automatically" with the mode (checked for Schemas, unchecked for Rows and Both, as the design says) and the settings dialog
+  switches it off with Rows. Distribute schema offers "Place on server group" (automatic keeps the schema where it is) and "Also set REPLICA IDENTITY FULL on the tables that have no primary key"; neither is offered while the schema has blockers. A schema task that ends
+  in `schema_pinned` or `schema_move_in_progress` is shown as the problem notice of that code, and a `schema.move` that failed says "The schema is still on its original group and in use. You can start the move again." The Shards page lists the distributed schemas per server group
+  (a count and a size, "not known" never as 0).
 
 ## What the panel does for contract 0.8.0
 

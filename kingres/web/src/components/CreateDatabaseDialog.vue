@@ -42,6 +42,15 @@ const form = reactive({
 })
 const submitted = ref(false)
 
+// Choosing a mode sets the default of "Distribute new schemas automatically": checked for Schemas, unchecked for Rows and Both
+// (design shard-phase11.md, 10 and 14.1: a database that mixes kinds must not distribute a schema that was meant to be local).
+watch(
+  () => form.shardingMode,
+  (mode) => {
+    form.distributeNewSchemas = mode === 'schema'
+  },
+)
+
 // Take the defaults from the server once they are known.
 watch(
   o,

@@ -10,6 +10,8 @@ import { TASK_STATE } from '@/lib/status'
 import { skippedReason } from '@/lib/standby'
 import { hasGroupSteps, stepBlocks, stepName } from '@/lib/failover'
 import { keyTaskErrorHint } from '@/lib/ledger-signing'
+import ProblemNotice from './ProblemNotice.vue'
+import { ApiError } from '@/api/problem'
 import type { Task, TaskStep } from '@/api/types'
 
 const props = defineProps<{ task: Task | null; pollError?: unknown }>()
@@ -68,6 +70,24 @@ const taskSkip = computed(() => skippedReason(props.task?.detail))
 // 0.11.0: a key task of the ledger has words for the error codes it can end with (the code itself is not shown as text).
 const errorHint = computed(() =>
   props.task?.kind.startsWith('ledger.key.') ? keyTaskErrorHint(props.task.error?.code) : null,
+)
+// A schema that became pinned during a task (a ledger table appeared), or that another move holds, ends the task with that code
+// (contract 0.16.0); it is shown as the problem notice of the code, as the request would have been refused with it.
+const schemaProblem = computed(() => {
+  const error = props.task?.error
+  if (!error || (error.code !== 'schema_pinned' && error.code !== 'schema_move_in_progress'))
+    return null
+  return new ApiError({
+    type: 'about:blank',
+    title: error.code,
+    status: 409,
+    code: error.code,
+    detail: error.message,
+  })
+})
+// A move that failed or was cancelled left the schema where it was, in use (a move that is past its switch does not fail).
+const moveFailed = computed(
+  () => props.task?.kind === 'schema.move' && props.task.state === 'failed',
 )
 watch(announcementKey, (key) => {
   if (key) announce(summary.value, props.task?.state === 'failed' ? 'assertive' : 'polite')
@@ -141,7 +161,8 @@ watch(
       replicate and are supervised) without being recorded in the sharding catalog, which needs the
       sharding extension 0.4.
     </p>
-    <p v-if="task.error" class="tone-danger notice" role="alert">
+    <ProblemNotice v-if="schemaProblem" :error="schemaProblem" />
+    <p v-else-if="task.error" class="tone-danger notice" role="alert">
       <span aria-hidden="true">&#10006;</span>
       <span
         ><SafeName :value="task.error.message" kind="text" :max="400" /><template
@@ -149,6 +170,12 @@ watch(
         >
           (step: <SafeName :value="task.error.step" kind="text" :max="80" />)</template
         ></span
+      >
+    </p>
+    <p v-if="moveFailed" class="notice tone-info" data-testid="move-failed-note" role="status">
+      <span aria-hidden="true">&#9432;</span>
+      <span
+        >The schema is still on its original group and in use. You can start the move again.</span
       >
     </p>
     <p v-if="errorHint" class="muted" data-testid="task-error-hint">{{ errorHint }}</p>

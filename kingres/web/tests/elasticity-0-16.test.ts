@@ -239,7 +239,13 @@ describe('Create database: the sharding mode', () => {
     expect(within(mode).getByRole('radio', { name: /rows/i })).toBeChecked()
     await user.click(within(mode).getByRole('radio', { name: /schemas/i }))
     expect(within(dialog).queryByLabelText(/bucket count/i)).not.toBeInTheDocument()
-    await user.click(within(dialog).getByTestId('distribute-new').querySelector('input')!)
+    // Schemas: the box is checked by itself (design 10); Both: unchecked; back to Schemas: checked again
+    const box = () => within(dialog).getByTestId('distribute-new').querySelector('input')!
+    expect(box()).toBeChecked()
+    await user.click(within(mode).getByRole('radio', { name: /both/i }))
+    expect(box()).not.toBeChecked()
+    await user.click(within(mode).getByRole('radio', { name: /schemas/i }))
+    expect(box()).toBeChecked()
     await user.click(within(dialog).getByRole('button', { name: /^create database$/i }))
     await within(dialog).findByText('Finished.', {}, { timeout: 8000 })
     const created = getState().databases.find((d) => d.info.name === 'tenants')!

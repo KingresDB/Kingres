@@ -68,7 +68,10 @@ const validate = (): boolean => {
 
 const start = () => {
   if (props.kind === 'distribute')
-    return endpoints.distributeSchema(props.databaseName, props.schema.name, {})
+    return endpoints.distributeSchema(props.databaseName, props.schema.name, {
+      ...(form.target !== '' ? { shardGroupId: Number(form.target) } : {}),
+      ...(form.identityFull ? { setReplicaIdentityFull: true } : {}),
+    })
   if (props.kind === 'move')
     return endpoints.moveSchema(props.databaseName, props.schema.name, {
       targetShardGroupId: Number(form.target),
@@ -149,6 +152,24 @@ const CONFIRM = {
               </tbody>
             </table>
           </div>
+          <template v-else>
+            <FormField
+              v-slot="slot"
+              label="Place on server group"
+              hint="Automatic keeps the schema where it is and puts empty tables on the other servers; a schema that has rows stays where its rows are."
+            >
+              <select v-bind="slot" v-model="form.target" data-autofocus>
+                <option value="">Automatic (in place)</option>
+                <option v-for="g in groups" :key="g.id" :value="String(g.id)">
+                  Shard group {{ g.id }}
+                </option>
+              </select>
+            </FormField>
+            <label class="check"
+              ><input v-model="form.identityFull" type="checkbox" /> Also set REPLICA IDENTITY FULL
+              on the tables that have no primary key, so that the schema can be moved later</label
+            >
+          </template>
         </template>
 
         <template v-else>
