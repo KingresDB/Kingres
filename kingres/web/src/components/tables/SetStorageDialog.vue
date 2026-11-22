@@ -25,6 +25,7 @@ import {
   COMPRESSION_LEVEL_MAX,
   COMPRESSION_LEVEL_MIN,
   STRIPE_ROWS_MIN,
+  byPointer,
   refusalReasons,
   type ColumnarCompression,
   type PartitionStorageRequest,
@@ -73,7 +74,13 @@ const blockers = computed<string[]>(() => {
   if (props.partition?.isDefault) out.push('A default partition cannot be converted.')
   return out
 })
-const same = computed(() => currentMethod.value === form.target)
+// A table that is columnar already can be asked for columnar again: it sets the options of the new stripes.
+const same = computed(
+  () => currentMethod.value === form.target && (!!props.partition || form.target === 'heap'),
+)
+const optionsOnly = computed(
+  () => !props.partition && currentMethod.value === 'columnar' && form.target === 'columnar',
+)
 const columnar = computed(() => form.target === 'columnar')
 const levelError = computed(() => {
   if (!columnar.value || form.compression !== 'zstd') return undefined
@@ -215,7 +222,7 @@ const refusal = (error: unknown): string[] =>
         </ul>
       </div>
     </template>
-    <template #default="{ fieldErrors }">
+    <template #default="{ fieldErrors: rawErrors }">
       <p>
         <template v-if="partition"
           >Partition <strong><SafeName :value="partition.name" :max="80" /></strong> of table
@@ -233,6 +240,13 @@ const refusal = (error: unknown): string[] =>
               ? 'rows'
               : 'an unknown format'
         }}</strong>.
+      </p>
+      <p v-if="optionsOnly" class="notice tone-info" data-testid="storage-options-only">
+        <span aria-hidden="true">&#9432;</span>
+        <span
+          >The table is stored as columns already. This sets the options for the stripes that are
+          written from now on; the stripes that exist stay as they are.</span
+        >
       </p>
       <p
         v-for="b in blockers"
@@ -305,7 +319,7 @@ const refusal = (error: unknown): string[] =>
           <FormField
             v-if="form.compression === 'zstd'"
             label="Level"
-            :error="(submitted ? levelError : undefined) ?? fieldErrors.compressionLevel"
+            :error="(submitted ? levelError : undefined) ?? byPointer(rawErrors).compressionLevel"
           >
             <template #default="{ id, ...aria }">
               <input
@@ -326,7 +340,7 @@ const refusal = (error: unknown): string[] =>
           v-if="partition"
           label="Sort rows by (columns, separated by commas)"
           hint="Orders the rows of the partition, which helps the skipping of stripes."
-          :error="fieldErrors.sortBy"
+          :error="byPointer(rawErrors).sortBy"
         >
           <template #default="{ id, ...aria }">
             <input
@@ -345,7 +359,7 @@ const refusal = (error: unknown): string[] =>
           <div class="form-row">
             <FormField
               label="Rows per stripe"
-              :error="(submitted ? stripeError : undefined) ?? fieldErrors.stripeRowCount"
+              :error="(submitted ? stripeError : undefined) ?? byPointer(rawErrors).stripeRowCount"
               :hint="`${STRIPE_ROWS_MIN} or more. Empty keeps the default.`"
             >
               <template #default="{ id, ...aria }">
@@ -363,7 +377,7 @@ const refusal = (error: unknown): string[] =>
             </FormField>
             <FormField
               label="Rows per chunk group"
-              :error="(submitted ? chunkError : undefined) ?? fieldErrors.chunkRowCount"
+              :error="(submitted ? chunkError : undefined) ?? byPointer(rawErrors).chunkRowCount"
               :hint="`${CHUNK_ROWS_MIN} or more. Empty keeps the default.`"
             >
               <template #default="{ id, ...aria }">
@@ -395,6 +409,10 @@ const refusal = (error: unknown): string[] =>
           Converting rewrites the table and blocks readers and writers until it finishes. Use time
           partitioning for large tables.
         </span>
+      </p>
+      <p v-if="!partition && columnar" class="muted" data-testid="storage-late-note">
+        An index or a trigger on the table is found when the task runs: the task then fails at the
+        step that converts, and the table stays as it was.
       </p>
     </template>
   </TaskActionDialog>

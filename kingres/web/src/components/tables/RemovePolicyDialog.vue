@@ -35,6 +35,7 @@ const remove = useMutation({
   <ConfirmDialog
     :title="`Remove the policy of ${table.schema}.${table.name}`"
     confirm-label="Remove policy"
+    danger
     :busy="remove.isPending.value"
     @cancel="emit('close')"
     @confirm="remove.mutate()"

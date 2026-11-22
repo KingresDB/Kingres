@@ -7,6 +7,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   actionCounts,
+  byPointer,
   actionDetailText,
   durationText,
   formOf,
@@ -46,13 +47,18 @@ describe('durations', () => {
   it('says a duration in words and keeps what it cannot read', () => {
     expect(durationText('P7D')).toBe('7 days')
     expect(durationText('PT1H')).toBe('1 hour')
-    expect(durationText('P1DT12H')).toBe('P1DT12H')
+    // Several units and a fraction of a second, as the server prints an interval.
+    expect(durationText('P1DT12H')).toBe('1 day 12 hours')
+    expect(durationText('P6DT23H59M58.123456S')).toBe('6 days 23 hours')
+    expect(durationText('PT59M58.4S')).toBe('59 minutes 58 seconds')
+    expect(durationText('not a duration')).toBe('not a duration')
     expect(durationText(null)).toBe('')
   })
   it('compares two durations by length', () => {
     expect(isoSeconds('P1D')).toBe(86400)
     expect(isoSeconds('P1M')).toBeGreaterThan(isoSeconds('P4W') as number)
     expect(isoSeconds('nonsense')).toBeNull()
+    expect(isoSeconds('P6DT23H59M58.5S')).toBeCloseTo(6 * 86400 + 23 * 3600 + 59 * 60 + 58.5)
   })
 })
 
@@ -344,5 +350,106 @@ describe('the summary of an EXPLAIN', () => {
       'b',
       'c',
     ])
+  })
+})
+
+describe('what the form cannot show is kept as it is (P12W5)', () => {
+  const base: PartitionPolicyRequest = {
+    partitionEvery: 'P1D',
+    createAhead: 'P7D',
+    retention: 'P90D',
+    retentionAction: 'drop',
+  }
+  it.each(['P2M', 'P3M', 'P4M', 'P6M', 'P2Y', 'P10Y'])(
+    'an interval of %s is sent back as it is',
+    (every) => {
+      const form = formOf({ ...base, partitionEvery: every })
+      expect(form.keep.partitionEvery).toBe(every)
+      expect(requestOf(form).partitionEvery).toBe(every)
+      // The person changes it: the form's own value is sent.
+      delete form.keep.partitionEvery
+      expect(requestOf(form).partitionEvery).toBe('P1D')
+    },
+  )
+  it('a duration of several units is sent back as it is, in each field', () => {
+    const stored: PartitionPolicyRequest = {
+      ...base,
+      createAhead: 'P7DT12H',
+      retention: 'P1DT12H',
+      columnarAfter: 'P2DT6H',
+      runEvery: 'PT1H30M',
+    }
+    const form = formOf(stored)
+    expect(Object.keys(form.keep).sort()).toEqual([
+      'columnarAfter',
+      'createAhead',
+      'retention',
+      'runEvery',
+    ])
+    const sent = requestOf(form)
+    expect(sent).toMatchObject({
+      createAhead: 'P7DT12H',
+      retention: 'P1DT12H',
+      columnarAfter: 'P2DT6H',
+      runEvery: 'PT1H30M',
+    })
+  })
+  it('a value that the form can show is not kept', () => {
+    expect(formOf(base).keep).toEqual({})
+  })
+})
+
+describe('when a save makes the next run delete data (P12W4)', () => {
+  const base: PartitionPolicyRequest = {
+    partitionEvery: 'P1D',
+    retention: 'P30D',
+    retentionAction: 'drop',
+    timezone: 'UTC',
+    enabled: false,
+  }
+  it('turning a policy with a drop retention on does', () => {
+    expect(lowersRetention(base, { ...base, enabled: true })).toBe(true)
+  })
+  it('changing the interval or the time zone of a drop retention does, an unrelated change does not', () => {
+    const on = { ...base, enabled: true }
+    expect(lowersRetention(on, { ...on, partitionEvery: 'P7D' })).toBe(true)
+    expect(lowersRetention(on, { ...on, timezone: 'Europe/Berlin' })).toBe(true)
+    expect(lowersRetention(on, { ...on, createAhead: 'P9D' })).toBe(false)
+    expect(lowersRetention(on, { ...on, retention: 'P60D' })).toBe(false)
+  })
+  it('a detach retention that is turned on does not need it, a policy that stays off does not', () => {
+    expect(
+      lowersRetention(
+        { ...base, retentionAction: 'detach' },
+        { ...base, retentionAction: 'detach', enabled: true },
+      ),
+    ).toBe(false)
+    expect(lowersRetention(base, { ...base, createAhead: 'P9D' })).toBe(false)
+  })
+})
+
+describe('the health line of a real interval (P12W6)', () => {
+  it('reads several units and a fraction, and keeps the warning', () => {
+    expect(
+      healthText({ partitionsAhead: 'P6DT23H59M58.123456S', ok: true, problems: [] }, 'P7D'),
+    ).toBe('6 days 23 hours ahead.')
+    expect(
+      healthText(
+        { partitionsAhead: 'P2DT3H59M58.123456S', ok: false, problems: ['aheadLow'] },
+        'P7D',
+      ),
+    ).toBe('2 days 3 hours ahead, below the 7 days the policy keeps.')
+  })
+})
+
+describe('field errors by JSON pointer (P12W8)', () => {
+  it('keys the errors by the bare field name', () => {
+    expect(
+      byPointer({ '/compressionLevel': 'a', stripeRowCount: 'b', '/columnarSortBy/0': 'c' }),
+    ).toEqual({
+      compressionLevel: 'a',
+      stripeRowCount: 'b',
+      columnarSortBy: 'c',
+    })
   })
 })

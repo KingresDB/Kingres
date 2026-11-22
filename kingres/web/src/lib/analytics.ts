@@ -179,19 +179,67 @@ export function splitIso(
   return count > 0 ? { count, unit: unit as DurationUnit } : null
 }
 
-/** `P7D` -> `7 days`, `PT1H` -> `1 hour`; anything else is returned as it was given. */
+/** The units of any ISO 8601 duration, as the server prints an interval (`P6DT23H59M58.123456S`); null when it is not one. */
+export function parseIsoFull(text: string | null | undefined): {
+  years: number
+  months: number
+  weeks: number
+  days: number
+  hours: number
+  minutes: number
+  seconds: number
+} | null {
+  if (!text || text === 'P' || text.endsWith('T')) return null
+  const m =
+    /^P(?:(\d+)Y)?(?:(\d+)M)?(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?$/.exec(
+      text,
+    )
+  if (!m) return null
+  const n = (v: string | undefined) => (v === undefined ? 0 : Number(v))
+  return {
+    years: n(m[1]),
+    months: n(m[2]),
+    weeks: n(m[3]),
+    days: n(m[4]),
+    hours: n(m[5]),
+    minutes: n(m[6]),
+    seconds: n(m[7]),
+  }
+}
+
+/** `P7D` -> `7 days`, `PT1H` -> `1 hour`, `P6DT23H59M58.1S` -> `6 days 23 hours`; a text that is not a duration is returned as given. */
 export function durationText(text: string | null | undefined): string {
   const s = splitIso(text)
-  if (!s) return text ?? ''
-  return `${s.count} ${s.unit}${s.count === 1 ? '' : 's'}`
+  if (s) return `${s.count} ${s.unit}${s.count === 1 ? '' : 's'}`
+  const p = parseIsoFull(text)
+  if (!p) return text ?? ''
+  const units: [number, string][] = [
+    [p.years, 'year'],
+    [p.months, 'month'],
+    [p.weeks, 'week'],
+    [p.days, 'day'],
+    [p.hours, 'hour'],
+    [p.minutes, 'minute'],
+    [Math.round(p.seconds), 'second'],
+  ]
+  const shown = units.filter(([v]) => v > 0).slice(0, 2)
+  if (shown.length === 0) return text ?? ''
+  return shown.map(([v, u]) => `${v} ${u}${v === 1 ? '' : 's'}`).join(' ')
 }
 
 /** An approximate length in seconds, to compare two durations (a month is 30 days, a year 365). */
 export function isoSeconds(text: string | null | undefined): number | null {
-  const s = splitIso(text)
-  if (!s) return null
-  const unit = { hour: 3600, day: 86400, week: 604800, month: 2_592_000, year: 31_536_000 }[s.unit]
-  return s.count * unit
+  const p = parseIsoFull(text)
+  if (!p) return null
+  const total =
+    p.years * 31_536_000 +
+    p.months * 2_592_000 +
+    p.weeks * 604_800 +
+    p.days * 86_400 +
+    p.hours * 3600 +
+    p.minutes * 60 +
+    p.seconds
+  return total > 0 ? total : null
 }
 
 /** The partition intervals that a policy may use: one of each unit, plus `every N` for the divisors (the dialog's select). */
@@ -226,7 +274,12 @@ export interface PolicyForm {
   runEveryCount: number | string
   runEveryUnit: DurationUnit
   enabled: boolean
+  /** Stored values the form cannot show (several units, months, years): kept as they are and sent back unchanged until the person changes them. */
+  keep: Partial<Record<KeptField, string>>
 }
+
+export type KeptField =
+  'partitionEvery' | 'createAhead' | 'retention' | 'columnarAfter' | 'runEvery'
 
 export const DEFAULT_POLICY: PolicyForm = {
   interval: 'P1D',
@@ -248,40 +301,41 @@ export const DEFAULT_POLICY: PolicyForm = {
   runEveryCount: 1,
   runEveryUnit: 'hour',
   enabled: true,
+  keep: {},
 }
 
-/** The form of a stored policy (a duration of several units is not offered: the form starts from the default for it). */
+/** The form of a stored policy. A value the form cannot show is kept as it is (`keep`) and sent back unchanged. */
 export function formOf(p: PartitionPolicyRequest | null | undefined): PolicyForm {
-  const f: PolicyForm = { ...DEFAULT_POLICY }
+  const f: PolicyForm = { ...DEFAULT_POLICY, keep: {} }
   if (!p) return f
   const preset = INTERVAL_PRESETS.some((x) => x.value === p.partitionEvery && x.value !== 'custom')
   if (preset) f.interval = p.partitionEvery
   else {
     const s = splitIso(p.partitionEvery)
-    f.interval = 'custom'
     if (s && (s.unit === 'hour' || s.unit === 'day')) {
+      f.interval = 'custom'
       f.customCount = s.count
       f.customUnit = s.unit
-    }
+    } else f.keep.partitionEvery = p.partitionEvery
   }
   const ahead = splitIso(p.createAhead ?? 'P7D')
   if (ahead) {
     f.aheadCount = ahead.count
     f.aheadUnit = ahead.unit
-  }
+  } else if (p.createAhead) f.keep.createAhead = p.createAhead
   const ret = splitIso(p.retention)
   f.retentionOn = Boolean(p.retention)
   if (ret) {
     f.retentionCount = ret.count
     f.retentionUnit = ret.unit
-  }
+  } else if (p.retention) f.keep.retention = p.retention
   f.retentionAction = p.retentionAction ?? 'drop'
   const col = splitIso(p.columnarAfter)
   f.columnarOn = Boolean(p.columnarAfter)
   if (col) {
     f.columnarCount = col.count
     f.columnarUnit = col.unit
-  }
+  } else if (p.columnarAfter) f.keep.columnarAfter = p.columnarAfter
   f.compression = p.compression ?? 'zstd'
   f.compressionLevel = p.compressionLevel ?? 3
   f.sortBy = (p.columnarSortBy ?? []).join(', ')
@@ -290,7 +344,7 @@ export function formOf(p: PartitionPolicyRequest | null | undefined): PolicyForm
   if (every) {
     f.runEveryCount = every.count
     f.runEveryUnit = every.unit
-  }
+  } else if (p.runEvery) f.keep.runEvery = p.runEvery
   f.enabled = p.enabled ?? true
   return f
 }
@@ -298,39 +352,66 @@ export function formOf(p: PartitionPolicyRequest | null | undefined): PolicyForm
 /** The request of a form. A number that is not a whole number is sent as it is; the server answers with the JSON pointer. */
 export function requestOf(f: PolicyForm): PartitionPolicyRequest {
   const n = (v: number | string): number => (typeof v === 'number' ? v : Number(v))
-  const every = f.interval === 'custom' ? isoOf(n(f.customCount), f.customUnit) : f.interval
+  const every =
+    f.keep.partitionEvery ??
+    (f.interval === 'custom' ? isoOf(n(f.customCount), f.customUnit) : f.interval)
   const sort = f.sortBy
     .split(',')
     .map((x) => x.trim())
     .filter((x) => x !== '')
   return {
     partitionEvery: every,
-    createAhead: isoOf(n(f.aheadCount), f.aheadUnit),
-    retention: f.retentionOn ? isoOf(n(f.retentionCount), f.retentionUnit) : null,
+    createAhead: f.keep.createAhead ?? isoOf(n(f.aheadCount), f.aheadUnit),
+    retention: f.retentionOn
+      ? (f.keep.retention ?? isoOf(n(f.retentionCount), f.retentionUnit))
+      : null,
     retentionAction: f.retentionAction,
-    columnarAfter: f.columnarOn ? isoOf(n(f.columnarCount), f.columnarUnit) : null,
+    columnarAfter: f.columnarOn
+      ? (f.keep.columnarAfter ?? isoOf(n(f.columnarCount), f.columnarUnit))
+      : null,
     columnarSortBy: f.columnarOn && sort.length > 0 ? sort : null,
     compression: f.columnarOn ? f.compression : null,
     compressionLevel: f.columnarOn && f.compression === 'zstd' ? n(f.compressionLevel) : null,
     timezone: f.timezone.trim() === '' ? 'UTC' : f.timezone.trim(),
-    runEvery: isoOf(n(f.runEveryCount), f.runEveryUnit),
+    runEvery: f.keep.runEvery ?? isoOf(n(f.runEveryCount), f.runEveryUnit),
     enabled: f.enabled,
   }
 }
 
-/** True when saving this request deletes or hides data that the stored policy keeps (a new retention, or a shorter one). */
+/**
+ * True when saving this request makes the next run delete or hide data that the stored policy would not: a new retention, a shorter
+ * one, detach turned into drop, and, for a retention that drops, a policy that was off and is on, or one whose interval or time
+ * zone (which move the cutoff) changed. Such a save needs the preview of the form as it is and the name of the table.
+ */
 export function lowersRetention(
   stored: PartitionPolicyRequest | null | undefined,
   next: PartitionPolicyRequest,
 ): boolean {
-  if (!next.retention) return false
+  if (!next.retention || next.enabled === false) return false
   if (!stored || !stored.retention) return true
   const a = isoSeconds(stored.retention)
   const b = isoSeconds(next.retention)
-  if (a === null || b === null) return stored.retention !== next.retention
-  return (
-    b < a || (stored.retentionAction !== next.retentionAction && next.retentionAction === 'drop')
+  if (a === null || b === null ? stored.retention !== next.retention : b < a) return true
+  if (stored.retentionAction !== next.retentionAction && next.retentionAction === 'drop')
+    return true
+  if (
+    next.retentionAction !== 'detach' &&
+    (stored.enabled === false ||
+      stored.partitionEvery !== next.partitionEvery ||
+      (stored.timezone ?? 'UTC') !== (next.timezone ?? 'UTC'))
   )
+    return true
+  return false
+}
+
+/** Field errors of a problem by the JSON pointer the server sends (`/compressionLevel`), keyed by the bare field name. */
+export function byPointer(errors: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [k, v] of Object.entries(errors)) {
+    const field = pointerField(k)
+    if (!(field in out)) out[field] = v
+  }
+  return out
 }
 
 // --- problems of a request, by field --------------------------------------------------------------------

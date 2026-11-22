@@ -130,7 +130,7 @@ describe('approximate aggregates', () => {
     )
     expect(off.status).toBe(400)
     expect(off.code).toBe('validation_failed')
-    expect(off.errors.map((e) => e.field)).toEqual(['countDistinct'])
+    expect(off.errors.map((e) => e.field)).toEqual(['/countDistinct'])
     for (const errorRate of [0.0004, 0.11, 0]) {
       const bad = await refused(
         endpoints.configureApproximateAggregates('shop', {
@@ -139,7 +139,7 @@ describe('approximate aggregates', () => {
           errorRate,
         }),
       )
-      expect(bad.errors.map((e) => e.field)).toEqual(['errorRate'])
+      expect(bad.errors.map((e) => e.field)).toEqual(['/errorRate'])
     }
     expect((await endpoints.getApproximateAggregates('shop')).enabled).toBe(false)
   })
@@ -199,23 +199,58 @@ describe('the storage format of a table', () => {
     expect((await endpoints.getTable('shop', 'public', 'notes')).storage?.accessMethod).toBe('heap')
   })
 
-  it('a table with indexes, a trigger or a ledger is refused with its reasons, and nothing changes', async () => {
-    const notes = await refused(
-      endpoints.setTableStorage('shop', 'public', 'notes', { accessMethod: 'columnar' }),
+  it('an index or a trigger is found when the task runs: the preview has no blocker, the task fails at the convert step, the table is as it was', async () => {
+    const pre = await endpoints.previewTableStorage('shop', 'public', 'notes', {
+      accessMethod: 'columnar',
+    })
+    expect(pre).toMatchObject({ willConvert: true, blockers: [] })
+    const task = await endpoints.setTableStorage('shop', 'public', 'notes', {
+      accessMethod: 'columnar',
+    })
+    await settled(task.id, 'failed')
+    const failed = await endpoints.getTask(task.id)
+    expect(failed.error?.code).toBe('conversion_refused')
+    expect(failed.error?.message).toMatch(/has an index \(notes_pkey\)/)
+    expect(failed.error?.step).toBe('Convert the storage')
+    const exports = await endpoints.setTableStorage('reports', 'public', 'exports', {
+      accessMethod: 'columnar',
+    })
+    await settled(exports.id, 'failed')
+    expect((await endpoints.getTask(exports.id)).error?.message).toMatch(
+      /has a trigger \(exports_audit\)/,
     )
-    expect(notes).toMatchObject({ status: 409, code: 'conversion_refused' })
-    expect(notes.detail).toMatch(/has an index \(notes_pkey\)/)
-    const exports = await refused(
-      endpoints.setTableStorage('reports', 'public', 'exports', { accessMethod: 'columnar' }),
-    )
-    expect(exports.detail).toMatch(/has a trigger \(exports_audit\)/)
+    expect((await endpoints.getTable('shop', 'public', 'notes')).storage?.accessMethod).toBe('heap')
+  })
+
+  it('a ledger table is refused before the task, with the blocker', async () => {
     shop().tables.find((t) => t.name === 'notes')!.classes = ['ledger']
     const ledger = await refused(
       endpoints.setTableStorage('shop', 'public', 'notes', { accessMethod: 'columnar' }),
     )
+    expect(ledger).toMatchObject({ status: 409, code: 'conversion_refused' })
     expect(ledger.detail).toMatch(/is a ledger table/)
-    expect(ledger.detail?.split('\n').length).toBeGreaterThan(1)
-    expect((await endpoints.getTable('shop', 'public', 'notes')).storage?.accessMethod).toBe('heap')
+  })
+
+  it('a table that is columnar already can be asked for columnar again: it sets the options', async () => {
+    sw('analytics=timeseries')
+    const first = await endpoints.setTableStorage('shop', 'public', 'clicks', {
+      accessMethod: 'columnar',
+    })
+    await settled(first.id)
+    const pre = await endpoints.previewTableStorage('shop', 'public', 'clicks', {
+      accessMethod: 'columnar',
+      compression: 'lz4',
+    })
+    expect(pre).toMatchObject({ current: 'columnar', willConvert: true, blockers: [] })
+    expect(pre.notes.join(' ')).toMatch(/options apply to the new stripes/)
+    const again = await endpoints.setTableStorage('shop', 'public', 'clicks', {
+      accessMethod: 'columnar',
+      compression: 'lz4',
+    })
+    await settled(again.id)
+    expect(
+      (await endpoints.getTable('shop', 'public', 'clicks')).storage?.columnar?.compression,
+    ).toBe('lz4')
   })
 
   it('a table that is partitioned, or distributed, is refused', async () => {
@@ -244,14 +279,14 @@ describe('the storage format of a table', () => {
     )
     expect(bad.status).toBe(400)
     expect(bad.errors.map((e) => e.field).sort()).toEqual([
-      'chunkRowCount',
-      'compressionLevel',
-      'stripeRowCount',
+      '/chunkRowCount',
+      '/compressionLevel',
+      '/stripeRowCount',
     ])
     const method = await refused(
       endpoints.setTableStorage('shop', 'public', 'clicks', { accessMethod: 'tape' as never }),
     )
-    expect(method.errors.map((e) => e.field)).toEqual(['accessMethod'])
+    expect(method.errors.map((e) => e.field)).toEqual(['/accessMethod'])
   })
 
   it('converts a table that can be converted: a task with the three steps, the format and the size change, and back', async () => {
@@ -401,7 +436,7 @@ describe('the storage format of a partition', () => {
       }),
     )
     expect(sort).toMatchObject({ status: 400, code: 'validation_failed' })
-    expect(sort.errors.map((e) => e.field)).toEqual(['sortBy'])
+    expect(sort.errors.map((e) => e.field)).toEqual(['/sortBy'])
     const same = await refused(
       endpoints.setPartitionStorage('shop', 'public', 'metrics', heap.name, {
         accessMethod: 'heap',
@@ -514,7 +549,8 @@ describe('the time-partitioning policy', () => {
       partitionEvery: 'P1D',
       createdBy: 'admin',
     })
-    expect(p.health.partitionsAhead).toBe('P2D')
+    // An interval as the server prints it: several units and a fraction of a second.
+    expect(p.health.partitionsAhead).toMatch(/^P2DT(\d+H)?(\d+M)?\d+\.123456S$/)
     expect(p.health.problems).toContain('aheadLow')
     expect(p.lastRun?.state).toBe('done')
     expect(Date.parse(p.nextRunAt as string)).toBeGreaterThan(Date.now() - 1000)
@@ -621,7 +657,9 @@ describe('the time-partitioning policy', () => {
     })
     const drops = plan.actions.filter((a) => a.kind === 'drop')
     expect(drops.length).toBeGreaterThanOrEqual(3)
-    expect(drops.every((a) => (a.bytesBefore ?? 0) > 0 && a.bytesAfter === null)).toBe(true)
+    // The plan of the real server carries no sizes: none is made up.
+    expect(drops.every((a) => a.bytesBefore === null && a.bytesAfter === null)).toBe(true)
+    expect(plan.actions.every((a) => a.bytesBefore === null && a.bytesAfter === null)).toBe(true)
     const detach = await endpoints.planPartitionPolicy('shop', 'public', 'metrics', {
       ...policy,
       retention: 'P3D',
@@ -953,9 +991,8 @@ describe('the settled contract of 0.18.0 (review of the control plane)', () => {
     const notes = await endpoints.previewTableStorage('shop', 'public', 'notes', {
       accessMethod: 'columnar',
     })
-    expect(notes.willConvert).toBe(false)
-    expect(notes.blockers.map((b) => b.code)).toEqual(['other'])
-    expect(notes.blockers[0]!.message).toMatch(/notes_pkey/)
+    // An index is not preflighted by the server: no blocker here.
+    expect(notes).toMatchObject({ willConvert: true, blockers: [] })
     const parent = await endpoints.previewTableStorage('shop', 'public', 'metrics', {
       accessMethod: 'columnar',
     })
@@ -1167,6 +1204,33 @@ describe('the owners of the tables (contract 0.18.0, items 14 to 16)', () => {
     ).toBe(true)
     expect((await endpoints.runPartitionPolicy('shop', 'public', 'metrics')).kind).toBe(
       'partition.maintain',
+    )
+  })
+})
+
+describe('sizes of a run (P12W1)', () => {
+  it('a run fills the sizes that the plan does not have', async () => {
+    sw('analytics=timeseries')
+    await endpoints.putPartitionPolicy('shop', 'public', 'metrics', {
+      partitionEvery: 'P1D',
+      retention: 'P5D',
+      retentionAction: 'drop',
+    })
+    const task = await endpoints.runPartitionPolicy('shop', 'public', 'metrics')
+    await settled(task.id)
+    const run = (await endpoints.listPartitionPolicyRuns('shop', 'public', 'metrics')).items[0]!
+    const detail = await endpoints.getPartitionPolicyRun('shop', 'public', 'metrics', run.id)
+    const drops = detail.actions.filter((a) => a.kind === 'drop')
+    expect(drops.length).toBeGreaterThan(0)
+    expect(drops.every((a) => (a.bytesBefore ?? 0) > 0)).toBe(true)
+  })
+  it('a task that is waiting or paused holds the table like a running one', async () => {
+    sw('analytics=timeseries')
+    mockConfig.taskDurationMs = 60_000
+    const task = await endpoints.runPartitionPolicy('shop', 'public', 'metrics')
+    getState().tasks.find((x) => x.task.id === task.id)!.task.state = 'paused'
+    expect((await refused(endpoints.runPartitionPolicy('shop', 'public', 'metrics'))).code).toBe(
+      'operation_in_progress',
     )
   })
 })

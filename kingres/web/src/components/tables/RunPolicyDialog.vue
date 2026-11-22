@@ -3,15 +3,18 @@
 <script setup lang="ts">
 // "Run now" for a time-partitioning policy (contract 0.18.0, `runPartitionPolicy`, kingres_admin; the task `partition.maintain`).
 // The dialog first asks the server what the run would do (`planPartitionPolicy`, a dry run) and lists it, so that a person sees
-// what would be dropped before confirming. A second run while one goes on is 409 `operation_in_progress`.
+// which partitions would be dropped before confirming. The run cannot start while the plan is being read, when it could not be
+// read, or when it is older than a minute (it is read again). The button is red when the plan drops partitions. The panel never
+// sends `asOf`: the run takes the time of the server. A second run while one goes on is 409 `operation_in_progress`.
 import { useQuery } from '@tanstack/vue-query'
 import { computed } from 'vue'
 import TaskActionDialog from '../TaskActionDialog.vue'
 import ProblemNotice from '../ProblemNotice.vue'
 import PartitionActionsTable from './PartitionActionsTable.vue'
+import PlanRemovals from './PlanRemovals.vue'
 import { endpoints } from '@/api/endpoints'
 import { keys } from '@/api/queries'
-import { formatBytes } from '@/lib/format'
+import { formatDateTime } from '@/lib/format'
 import type { Table } from '@/api/types'
 
 const props = defineProps<{ databaseName: string; table: Table }>()
@@ -28,13 +31,16 @@ const plan = useQuery({
   retry: false,
   staleTime: 0,
   gcTime: 0,
+  refetchOnWindowFocus: false,
+  // A plan older than a minute is read again, so that the list above the button is what the run would do now.
+  refetchInterval: 60_000,
 })
 const actions = computed(() => plan.data.value?.actions ?? [])
-const removed = computed(() =>
-  actions.value.filter((a) => a.kind === 'drop' || a.kind === 'detach'),
-)
 const dropped = computed(() => actions.value.filter((a) => a.kind === 'drop'))
-const droppedBytes = computed(() => dropped.value.reduce((a, x) => a + (x.bytesBefore ?? 0), 0))
+const detached = computed(() => actions.value.filter((a) => a.kind === 'detach'))
+const held = computed(
+  () => plan.isPending.value || plan.isFetching.value || plan.isError.value || !plan.data.value,
+)
 const start = () =>
   endpoints.runPartitionPolicy(props.databaseName, props.table.schema, props.table.name)
 </script>
@@ -43,8 +49,9 @@ const start = () =>
   <TaskActionDialog
     :title="`Run the policy of ${table.schema}.${table.name} now`"
     confirm-label="Run now"
+    :danger="dropped.length > 0"
     :start="start"
-    :confirm-disabled="plan.isPending.value"
+    :confirm-disabled="held"
     :invalidate="[
       keys.partitionPolicy(databaseName, table.schema, table.name),
       keys.partitionRuns(databaseName, table.schema, table.name),
@@ -62,8 +69,16 @@ const start = () =>
     <div v-if="plan.isPending.value" class="muted" role="status" data-testid="run-plan-loading">
       Reading the plan...
     </div>
-    <ProblemNotice v-else-if="plan.error.value" :error="plan.error.value" @retry="plan.refetch()" />
-    <template v-else>
+    <ProblemNotice
+      v-else-if="plan.isError.value"
+      :error="plan.error.value"
+      @retry="plan.refetch()"
+    />
+    <template v-else-if="plan.data.value">
+      <p class="muted" role="status" data-testid="run-plan-asof">
+        Plan made at {{ formatDateTime(plan.data.value.asOf)
+        }}<template v-if="plan.isFetching.value">; reading it again...</template>.
+      </p>
       <PartitionActionsTable
         v-if="actions.length > 0"
         :actions="actions"
@@ -71,20 +86,8 @@ const start = () =>
         caption="What the run would do"
       />
       <p v-else class="muted" data-testid="run-plan-empty">The run would find nothing to do.</p>
-      <p
-        v-if="dropped.length > 0"
-        class="notice tone-danger"
-        role="alert"
-        data-testid="run-plan-deletes"
-      >
-        <span aria-hidden="true">&#10006;</span>
-        <span>
-          The run drops {{ dropped.length }}
-          {{ dropped.length === 1 ? 'partition' : 'partitions' }} and deletes
-          {{ formatBytes(droppedBytes) }} of data. This cannot be undone.
-        </span>
-      </p>
-      <p v-else-if="removed.length > 0" class="muted">
+      <PlanRemovals :actions="actions" testid="run-plan-deletes" tail="This cannot be undone." />
+      <p v-if="dropped.length === 0 && detached.length > 0" class="muted">
         Detached partitions keep their rows as tables of their own.
       </p>
     </template>

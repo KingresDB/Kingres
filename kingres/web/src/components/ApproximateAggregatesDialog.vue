@@ -14,6 +14,7 @@ import {
   ERROR_RATE_DEFAULT_PERCENT,
   ERROR_RATE_MAX_PERCENT,
   ERROR_RATE_MIN_PERCENT,
+  byPointer,
   percentToRate,
   rateToPercent,
   type ApproximateAggregates,
@@ -72,7 +73,7 @@ const confirmLabel = computed(() => (form.enabled ? 'Save and install' : 'Turn o
     ]"
     @close="emit('close')"
   >
-    <template #default="{ fieldErrors }">
+    <template #default="{ fieldErrors: rawErrors }">
       <p>
         Database <strong><SafeName :value="databaseName" :max="80" /></strong>. The task installs
         the extension on every server, checks that every server runs the same version and gives the
@@ -86,7 +87,7 @@ const confirmLabel = computed(() => (form.enabled ? 'Save and install' : 'Turn o
       </div>
       <FormField
         label="count(DISTINCT)"
-        :error="fieldErrors.countDistinct"
+        :error="byPointer(rawErrors).countDistinct"
         hint="Exact is the default and changes only if you choose the approximate mode."
       >
         <template #default="{ id, ...aria }">
@@ -105,7 +106,7 @@ const confirmLabel = computed(() => (form.enabled ? 'Save and install' : 'Turn o
       <FormField
         v-if="approximate"
         label="Error rate (percent)"
-        :error="(submitted ? percentError : undefined) ?? fieldErrors.errorRate"
+        :error="(submitted ? percentError : undefined) ?? byPointer(rawErrors).errorRate"
         :hint="`From ${ERROR_RATE_MIN_PERCENT} to ${ERROR_RATE_MAX_PERCENT}. A lower rate needs more memory per sketch.`"
       >
         <template #default="{ id, ...aria }">

@@ -61,6 +61,7 @@ const retentionText = (x: NonNullable<typeof p.value>) =>
       <h2 id="policy-h">Time partitioning</h2>
       <span class="row">
         <GateButton
+          v-if="!policy.error.value"
           op="putPartitionPolicy"
           small
           data-testid="policy-edit"

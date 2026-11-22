@@ -74,7 +74,7 @@ const partitionRows = computed(() => partitions.data.value?.items ?? [])
 const formatFilter = ref<StorageFilter>('all')
 const shownPartitions = computed(() =>
   partitionRows.value.filter(
-    (p) => formatFilter.value === 'all' || (p.accessMethod ?? 'heap') === formatFilter.value,
+    (p) => formatFilter.value === 'all' || p.accessMethod === formatFilter.value,
   ),
 )
 const partitionNames = computed(() => partitionRows.value.map((p) => p.name))

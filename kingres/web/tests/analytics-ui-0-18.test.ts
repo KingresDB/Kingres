@@ -523,16 +523,44 @@ describe('the table page: storage and partitions', () => {
     expect(dialog.queryByTestId('table-blockers')).not.toBeInTheDocument()
   })
 
-  it('several reasons are several lines', async () => {
+  it('an index or a trigger fails the task at the convert step, in words, and the dialog says it is found then', async () => {
     const user = userEvent.setup()
+    mockConfig.taskDurationMs = 80
     await renderApp('/databases/reports/tables/public/exports')
     await user.click(await screen.findByTestId('convert-storage'))
     const dialog = await dialogOf(/^convert storage of table exports/i)
-    const reasons = await dialog.findByTestId('table-blockers')
-    expect(within(reasons).getAllByRole('listitem').length).toBeGreaterThanOrEqual(2)
-    expect(reasons).toHaveTextContent(/exports_pkey/)
-    expect(reasons).toHaveTextContent(/exports_audit/)
-    expect(dialog.getByRole('button', { name: /^convert$/i })).toBeDisabled()
+    expect(dialog.getByTestId('storage-late-note')).toHaveTextContent(/found when the task runs/i)
+    const start = dialog.getByRole('button', { name: /^convert$/i })
+    await enabled(start)
+    expect(dialog.queryByTestId('table-blockers')).not.toBeInTheDocument()
+    await user.click(start)
+    expect(
+      await dialog.findByText(
+        /has an index \(exports_pkey\).*has a trigger \(exports_audit\)/i,
+        {},
+        { timeout: 30_000 },
+      ),
+    ).toBeInTheDocument()
+  })
+
+  it('a table that is columnar already can be converted again: it says it sets the options', async () => {
+    sw('analytics=timeseries')
+    const user = userEvent.setup()
+    mockConfig.taskDurationMs = 60
+    await signedIn()
+    const first = await endpoints.setTableStorage('shop', 'public', 'clicks', {
+      accessMethod: 'columnar',
+    })
+    await waitFor(async () => expect((await endpoints.getTask(first.id)).state).toBe('done'))
+    await renderApp(table('clicks'))
+    await user.click(await screen.findByTestId('convert-storage'))
+    const dialog = await dialogOf(/^convert storage of table clicks/i)
+    await user.click(dialog.getByTestId('storage-columnar'))
+    expect(await dialog.findByTestId('storage-options-only')).toHaveTextContent(
+      /options for the stripes/i,
+    )
+    await enabled(dialog.getByRole('button', { name: /^convert$/i }))
+    expect(dialog.queryByTestId('storage-same')).not.toBeInTheDocument()
   })
 
   it('what the console knows stops the start before it asks: a ledger table', async () => {
@@ -621,7 +649,7 @@ describe('the policy panel and its runs', () => {
     await renderApp(table('metrics'))
     const facts = within(await screen.findByTestId('policy-facts'))
     expect(facts.getByTestId('policy-ahead-text')).toHaveTextContent(
-      /2 days ahead, below the 7 days the policy keeps/i,
+      /2 days \d+ (hours?|minutes?) ahead, below the 7 days the policy keeps/i,
     )
     expect(facts.getByTestId('policy-health')).toHaveAttribute('data-ok', 'false')
     expect(facts.getByTestId('policy-problems')).toHaveTextContent(
@@ -696,7 +724,7 @@ describe('the policy panel and its runs', () => {
     await user.click(await screen.findByTestId('policy-run'))
     const dialog = await dialogOf(/^run the policy of public\.metrics now/i)
     expect(await dialog.findByTestId('run-plan-deletes')).toHaveTextContent(
-      /drops \d+ partitions and deletes/i,
+      /dropping \d+ partitions deletes their rows\. the size of the data is not known/i,
     )
     expect(dialog.getByTestId('partition-actions')).toHaveTextContent('Drop')
     await user.click(dialog.getByRole('button', { name: /^run now$/i }))
@@ -807,7 +835,7 @@ describe('the time-partitioning policy dialog', () => {
     await user.click(dialog.getByTestId('policy-preview'))
     const deletes = await dialog.findByTestId('policy-preview-deletes')
     expect(deletes).toHaveTextContent(
-      /deletes .* of data\. saving the policy deletes nothing now; the next run does/i,
+      /dropping \d+ partitions deletes their rows\. the size of the data is not known\. saving the policy deletes nothing now; the next run does/i,
     )
     expect(save).toBeDisabled()
     await user.type(dialog.getByLabelText(/type .*metrics.* to confirm/i), 'metrics')
@@ -1206,5 +1234,326 @@ describe('the owners of the tables in the console (contract 0.18.0)', () => {
     await renderApp(table('metrics'))
     expect(await screen.findByTestId('policy-owner')).toHaveTextContent('postgres (trusted)')
     expect(screen.queryByTestId('owner-not-trusted')).not.toBeInTheDocument()
+  })
+})
+
+describe('the fixes of the independent review (P12W1 to P12W10)', () => {
+  const { http, HttpResponse } = {} as never as { http: never; HttpResponse: never }
+  void http
+  void HttpResponse
+  const msw = () => import('msw')
+
+  it('P12W1: a plan without sizes says the size is not known, names the partitions, and never says 0 B', async () => {
+    sw('analytics=timeseries')
+    const user = userEvent.setup()
+    mockConfig.taskDurationMs = 80
+    await signedIn()
+    await endpoints.putPartitionPolicy('shop', 'public', 'metrics', {
+      partitionEvery: 'P1D',
+      retention: 'P5D',
+      retentionAction: 'drop',
+    })
+    await renderApp(table('metrics'))
+    await user.click(await screen.findByTestId('policy-run'))
+    const dialog = await dialogOf(/^run the policy of public\.metrics now/i)
+    const notice = await dialog.findByTestId('run-plan-deletes')
+    expect(notice).toHaveTextContent(/the size of the data is not known/i)
+    expect(notice).not.toHaveTextContent(/0 B/)
+    expect(within(notice).getByTestId('plan-drops').querySelectorAll('li').length).toBeGreaterThan(
+      0,
+    )
+    expect(within(notice).getByTestId('plan-drops')).toHaveTextContent(/metrics_p\d{8}/)
+  })
+
+  it('P12W1: a size that the server sent for every dropped partition is shown', async () => {
+    const { http, HttpResponse } = await msw()
+    sw('analytics=timeseries')
+    mockServer.use(
+      http.post('*/partition-policy/plan', () =>
+        HttpResponse.json({
+          asOf: new Date().toISOString(),
+          actions: [
+            {
+              seq: 1,
+              kind: 'drop',
+              partition: 'a',
+              state: 'planned',
+              bytesBefore: 3 * 1024 * 1024,
+            },
+            { seq: 2, kind: 'drop', partition: 'b', state: 'planned', bytesBefore: 1024 * 1024 },
+          ],
+        }),
+      ),
+    )
+    const user = userEvent.setup()
+    await renderApp(table('metrics'))
+    await user.click(await screen.findByTestId('policy-run'))
+    const dialog = await dialogOf(/^run the policy of public\.metrics now/i)
+    expect(await dialog.findByTestId('run-plan-deletes')).toHaveTextContent(
+      /the size of the data is 4\.0 MiB/i,
+    )
+  })
+
+  it('P12W2: a policy that could not be read is never replaced by the defaults', async () => {
+    const { http, HttpResponse } = await msw()
+    sw('analytics=timeseries')
+    mockServer.use(
+      http.get('*/partition-policy', () =>
+        HttpResponse.json(
+          { type: 'about:blank', title: 'x', status: 500, code: 'internal_error' },
+          { status: 500 },
+        ),
+      ),
+    )
+    const user = userEvent.setup()
+    await renderApp(table('metrics'))
+    // The panel itself shows the failure; the edit button is not offered over a failed read.
+    await waitFor(() =>
+      expect(
+        within(screen.getByTestId('policy-panel')).getAllByRole('alert').length,
+      ).toBeGreaterThan(0),
+    )
+    expect(screen.queryByTestId('policy-edit')).not.toBeInTheDocument()
+    // The list of tables opens the same dialog: its form stays hidden and Save is not there.
+    await user.click(screen.getByRole('link', { name: /database shop/i }))
+    await user.click(await screen.findByTestId('policy-metrics'))
+    const dialog = await dialogOf(/^time partitioning of public\.metrics/i)
+    await waitFor(() => expect(dialog.getAllByRole('alert').length).toBeGreaterThan(0))
+    expect(dialog.queryByTestId('policy-form')).not.toBeInTheDocument()
+    expect(dialog.queryByTestId('policy-save')).not.toBeInTheDocument()
+    expect(getState().analytics!.policies['shop/public.metrics']!.req.retention).toBe('P90D')
+  })
+
+  it('P12W3: Run now stays off when the plan could not be read, and the panel never sends asOf', async () => {
+    const { http, HttpResponse } = await msw()
+    sw('analytics=timeseries')
+    mockServer.use(
+      http.post('*/partition-policy/plan', () =>
+        HttpResponse.json(
+          { type: 'about:blank', title: 'x', status: 500, code: 'internal_error' },
+          { status: 500 },
+        ),
+      ),
+    )
+    const user = userEvent.setup()
+    await renderApp(table('metrics'))
+    await user.click(await screen.findByTestId('policy-run'))
+    const dialog = await dialogOf(/^run the policy of public\.metrics now/i)
+    await waitFor(() => expect(dialog.getAllByRole('alert').length).toBeGreaterThan(0))
+    expect(dialog.getByRole('button', { name: /^run now$/i })).toBeDisabled()
+    expect(getState().tasks.some((t) => t.task.kind === 'partition.maintain')).toBe(false)
+  })
+
+  it('P12W3 (M8): the request of Run now has an empty body', async () => {
+    sw('analytics=timeseries')
+    const user = userEvent.setup()
+    mockConfig.taskDurationMs = 80
+    recordBodies('POST', '/partition-policy/runs')
+    await renderApp(table('metrics'))
+    await user.click(await screen.findByTestId('policy-run'))
+    const dialog = await dialogOf(/^run the policy of public\.metrics now/i)
+    const start = await dialog.findByRole('button', { name: /^run now$/i })
+    await enabled(start)
+    await user.click(start)
+    await dialog.findByText('Finished.')
+    expect(bodies).toEqual([{}])
+  })
+
+  it('P12W3: Run now is red when the plan drops, and not when it only creates', async () => {
+    sw('analytics=timeseries')
+    const user = userEvent.setup()
+    await renderApp(table('metrics'))
+    await user.click(await screen.findByTestId('policy-run'))
+    let dialog = await dialogOf(/^run the policy of public\.metrics now/i)
+    const start = await dialog.findByRole('button', { name: /^run now$/i })
+    await enabled(start)
+    expect(start).not.toHaveClass('btn-danger')
+    await user.click(dialog.getByRole('button', { name: /^cancel$/i }))
+    await signedIn()
+    await endpoints.putPartitionPolicy('shop', 'public', 'metrics', {
+      partitionEvery: 'P1D',
+      retention: 'P5D',
+      retentionAction: 'drop',
+    })
+    await user.click(await screen.findByTestId('policy-run'))
+    dialog = await dialogOf(/^run the policy of public\.metrics now/i)
+    await dialog.findByTestId('run-plan-deletes')
+    await waitFor(() =>
+      expect(dialog.getByRole('button', { name: /^run now$/i })).toHaveClass('btn-danger'),
+    )
+  })
+
+  it('P12W4: turning on a policy that drops needs the preview and the name', async () => {
+    sw('analytics=timeseries')
+    await signedIn()
+    await endpoints.putPartitionPolicy('shop', 'public', 'metrics', {
+      partitionEvery: 'P1D',
+      retention: 'P5D',
+      retentionAction: 'drop',
+      enabled: false,
+    })
+    const user = userEvent.setup()
+    await renderApp(table('metrics'))
+    await user.click(await screen.findByTestId('policy-edit'))
+    const dialog = await dialogOf(/^time partitioning of public\.metrics/i)
+    await dialog.findByTestId('policy-form')
+    await user.click(dialog.getByTestId('policy-enabled'))
+    expect(await dialog.findByTestId('policy-need-preview')).toBeInTheDocument()
+    expect(dialog.getByTestId('policy-save')).toBeDisabled()
+  })
+
+  it('P12W5: a quarterly policy keeps its interval when only the retention is changed', async () => {
+    sw('analytics=timeseries')
+    await signedIn()
+    await endpoints.putPartitionPolicy('shop', 'public', 'metrics', {
+      partitionEvery: 'P3M',
+      retention: 'P90D',
+      retentionAction: 'drop',
+    })
+    const user = userEvent.setup()
+    recordBodies('PUT', '/partition-policy')
+    await renderApp(table('metrics'))
+    await user.click(await screen.findByTestId('policy-edit'))
+    const dialog = await dialogOf(/^time partitioning of public\.metrics/i)
+    expect(await dialog.findByTestId('policy-kept')).toHaveTextContent(
+      /P3M.*3 months.*kept as it is/i,
+    )
+    await clear(user, dialog.getByTestId('policy-retention'), '120')
+    const save = dialog.getByTestId('policy-save')
+    await enabled(save)
+    await user.click(save)
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+    expect(bodies[0]).toMatchObject({ partitionEvery: 'P3M', retention: 'P120D' })
+  })
+
+  it('P12W5: the person can change a kept value, then the form value is sent', async () => {
+    sw('analytics=timeseries')
+    await signedIn()
+    await endpoints.putPartitionPolicy('shop', 'public', 'metrics', { partitionEvery: 'P6M' })
+    const user = userEvent.setup()
+    recordBodies('PUT', '/partition-policy')
+    await renderApp(table('metrics'))
+    await user.click(await screen.findByTestId('policy-edit'))
+    const dialog = await dialogOf(/^time partitioning of public\.metrics/i)
+    await dialog.findByTestId('policy-kept')
+    await user.click(dialog.getByRole('button', { name: /change it/i }))
+    await waitFor(() => expect(dialog.queryByTestId('policy-kept')).not.toBeInTheDocument())
+    const save = dialog.getByTestId('policy-save')
+    await enabled(save)
+    await user.click(save)
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+    expect(bodies[0]).toMatchObject({ partitionEvery: 'P1D' })
+  })
+
+  it('P12W8: an error of the server on /compressionLevel is shown next to its field', async () => {
+    const { http, HttpResponse } = await msw()
+    sw('analytics=timeseries')
+    mockServer.use(
+      http.put('*/storage', ({ request }) =>
+        new URL(request.url).searchParams.get('dryRun') === 'true'
+          ? HttpResponse.json({
+              current: 'heap',
+              target: 'columnar',
+              willConvert: true,
+              blockers: [],
+              notes: [],
+            })
+          : HttpResponse.json(
+              {
+                type: 'about:blank',
+                title: 'x',
+                status: 400,
+                code: 'validation_failed',
+                errors: [{ field: '/compressionLevel', message: 'The server wants 1 to 19.' }],
+              },
+              { status: 400 },
+            ),
+      ),
+    )
+    const user = userEvent.setup()
+    await renderApp(table('clicks'))
+    await user.click(await screen.findByTestId('convert-storage'))
+    const dialog = await dialogOf(/^convert storage of table clicks/i)
+    const start = dialog.getByRole('button', { name: /^convert$/i })
+    await enabled(start)
+    await user.click(start)
+    expect(
+      await dialog.findByText('The server wants 1 to 19.', { selector: '.error' }),
+    ).toBeInTheDocument()
+  })
+
+  it('P12W10: the unit fields have names of their own', async () => {
+    sw('analytics=timeseries')
+    const user = userEvent.setup()
+    await renderApp(table('metrics'))
+    await user.click(await screen.findByTestId('policy-edit'))
+    const dialog = await dialogOf(/^time partitioning of public\.metrics/i)
+    await dialog.findByTestId('policy-form')
+    for (const name of [
+      'Create ahead unit',
+      'Retention unit',
+      'Convert-after unit',
+      'Run every unit',
+    ])
+      expect(dialog.getByLabelText(name)).toBeInTheDocument()
+    expect(dialog.queryAllByLabelText('Unit')).toHaveLength(0)
+  })
+
+  it('P12W10: a 404 that says the table is on another instance is an error, not "no policy"', async () => {
+    const { http, HttpResponse } = await msw()
+    sw('analytics=timeseries')
+    mockServer.use(
+      http.get('*/partition-policy', () =>
+        HttpResponse.json(
+          {
+            type: 'about:blank',
+            title: 'x',
+            status: 404,
+            code: 'not_found',
+            detail: 'The table is not on the instance of the manager leader (another shard group).',
+          },
+          { status: 404 },
+        ),
+      ),
+    )
+    await renderApp(table('metrics'))
+    const panel = within(await screen.findByTestId('policy-panel'))
+    await waitFor(() => expect(panel.getAllByRole('alert').length).toBeGreaterThan(0))
+    expect(panel.queryByTestId('policy-none')).not.toBeInTheDocument()
+    expect(panel.queryByTestId('policy-edit')).not.toBeInTheDocument()
+  })
+
+  it('P12W10: a partition whose format is not known is not counted as a row partition', async () => {
+    sw('analytics=timeseries')
+    const user = userEvent.setup()
+    await signedIn()
+    const list = getState().partitions!['shop/public.metrics']!
+    list.find((p) => p.accessMethod === 'heap')!.accessMethod = null
+    await renderApp(table('metrics'))
+    const rows = within(await screen.findByTestId('partition-list'))
+    await user.selectOptions(screen.getByTestId('partition-format'), 'heap')
+    expect(rows.getAllByRole('row').slice(1)).toHaveLength(7)
+  })
+})
+
+describe('the detach path of the preview (P12W9, M17)', () => {
+  it('says how many partitions the next run would detach, and does not call it a deletion', async () => {
+    sw('analytics=timeseries')
+    const user = userEvent.setup()
+    await signedIn()
+    await endpoints.putPartitionPolicy('shop', 'public', 'metrics', {
+      partitionEvery: 'P1D',
+      retention: 'P5D',
+      retentionAction: 'detach',
+    })
+    await renderApp(table('metrics'))
+    await user.click(await screen.findByTestId('policy-edit'))
+    const dialog = await dialogOf(/^time partitioning of public\.metrics/i)
+    await dialog.findByTestId('policy-form')
+    await user.click(dialog.getByTestId('policy-preview'))
+    expect(await dialog.findByTestId('policy-preview-summary')).toHaveTextContent(
+      /drop 0 and detach [1-9]\d*/i,
+    )
+    expect(dialog.queryByTestId('policy-preview-deletes')).not.toBeInTheDocument()
   })
 })

@@ -120,9 +120,13 @@ const partitionName = (table: string, from: Date, unit: DurationUnit) =>
   `${table}_p${from.getUTCFullYear()}${pad(from.getUTCMonth() + 1)}${pad(from.getUTCDate())}${unit === 'hour' ? pad(from.getUTCHours()) : ''}`
 /** A length of time as an ISO 8601 duration (the health line): whole days, or whole hours below a day. */
 function isoFromMs(ms: number): string {
-  const m = Math.max(0, ms)
-  if (m >= DAY) return `P${Math.floor(m / DAY)}D`
-  return `PT${Math.floor(m / 3_600_000)}H`
+  // As the server prints an interval (iso_8601): several units and a fraction of a second, for example P2DT3H59M58.123456S.
+  const total = Math.max(0, Math.floor(ms / 1000))
+  const d = Math.floor(total / 86_400)
+  const h = Math.floor((total % 86_400) / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = total % 60
+  return `P${d > 0 ? `${d}D` : ''}T${h > 0 ? `${h}H` : ''}${m > 0 ? `${m}M` : ''}${s}.123456S`
 }
 
 const TIME_TYPES = ['date', 'timestamp', 'timestamptz']
@@ -193,7 +197,7 @@ export function describeTable(s: MockState, rec: DbRec, t: Table): Table {
 export const describePartitions = (s: MockState, rec: DbRec, t: Table): S['TablePartition'][] =>
   partitionsOf(s, rec, t).map((p) => ({
     ...p,
-    accessMethod: p.accessMethod ?? 'heap',
+    accessMethod: p.accessMethod === undefined ? 'heap' : p.accessMethod,
     rangeFrom: p.rangeFrom ?? null,
     rangeTo: p.rangeTo ?? null,
     estimatedRows: p.estimatedRows ?? Math.round((p.sizeBytes ?? 0) / 96),
@@ -256,19 +260,19 @@ function configureAggregates(
   const rec = databaseOf(s, name)
   const errors: { field: string; message: string }[] = []
   if (typeof b.enabled !== 'boolean')
-    errors.push({ field: 'enabled', message: 'Say true or false.' })
+    errors.push({ field: '/enabled', message: 'Say true or false.' })
   const mode = b.countDistinct ?? 'exact'
   if (mode !== 'exact' && mode !== 'approximate')
-    errors.push({ field: 'countDistinct', message: 'Use exact or approximate.' })
+    errors.push({ field: '/countDistinct', message: 'Use exact or approximate.' })
   if (b.enabled === false && mode === 'approximate')
     errors.push({
-      field: 'countDistinct',
+      field: '/countDistinct',
       message: 'The approximate mode needs the setting to be on.',
     })
   const rate = b.errorRate ?? 0.01
   if (typeof rate !== 'number' || !(rate >= 0.0005 && rate <= 0.1))
     errors.push({
-      field: 'errorRate',
+      field: '/errorRate',
       message: 'Use a rate from 0.0005 to 0.1 (0.05 to 10 percent).',
     })
   if (errors.length > 0) throw validationFailed(errors)
@@ -350,31 +354,34 @@ function findTable(rec: DbRec, schema: string, name: string): Table {
 const holdsTable = (s: MockState, id: string, kinds: string[]): boolean => {
   tickTasks(s)
   return s.tasks.some(
-    (r) => r.task.state === 'running' && kinds.includes(r.task.kind) && r.task.subject?.id === id,
+    (r) =>
+      ['pending', 'running', 'paused'].includes(r.task.state) &&
+      kinds.includes(r.task.kind) &&
+      r.task.subject?.id === id,
   )
 }
 
 function checkStorageBody(b: S['PartitionStorageRequest']): void {
   const errors: { field: string; message: string }[] = []
   if (b.accessMethod !== 'heap' && b.accessMethod !== 'columnar')
-    errors.push({ field: 'accessMethod', message: 'Use heap or columnar.' })
+    errors.push({ field: '/accessMethod', message: 'Use heap or columnar.' })
   if (b.compression !== undefined && !['none', 'pglz', 'lz4', 'zstd'].includes(b.compression))
-    errors.push({ field: 'compression', message: 'Use none, pglz, lz4 or zstd.' })
+    errors.push({ field: '/compression', message: 'Use none, pglz, lz4 or zstd.' })
   if (
     b.compressionLevel !== undefined &&
     !(Number.isInteger(b.compressionLevel) && b.compressionLevel >= 1 && b.compressionLevel <= 19)
   )
-    errors.push({ field: 'compressionLevel', message: 'Use a whole number from 1 to 19.' })
+    errors.push({ field: '/compressionLevel', message: 'Use a whole number from 1 to 19.' })
   if (
     b.stripeRowCount !== undefined &&
     !(Number.isInteger(b.stripeRowCount) && b.stripeRowCount >= 1000)
   )
-    errors.push({ field: 'stripeRowCount', message: 'Use a whole number of 1000 or more.' })
+    errors.push({ field: '/stripeRowCount', message: 'Use a whole number of 1000 or more.' })
   if (
     b.chunkRowCount !== undefined &&
     !(Number.isInteger(b.chunkRowCount) && b.chunkRowCount >= 100)
   )
-    errors.push({ field: 'chunkRowCount', message: 'Use a whole number of 100 or more.' })
+    errors.push({ field: '/chunkRowCount', message: 'Use a whole number of 100 or more.' })
   if (errors.length > 0) throw validationFailed(errors)
 }
 
@@ -405,7 +412,7 @@ function requireExtensions(s: MockState, target: string, partition: boolean): vo
 }
 
 /** What a conversion of a table cannot be done for, as typed blockers (contract 0.18.0). */
-function blockersFor(s: MockState, t: Table, target: string): Blocker[] {
+function blockersFor(s: MockState, t: Table): Blocker[] {
   const r: Blocker[] = []
   const obj = `${t.schema}.${t.name}`
   if (t.partitioning)
@@ -425,18 +432,6 @@ function blockersFor(s: MockState, t: Table, target: string): Blocker[] {
       ),
     )
   if (t.classes.includes('ledger')) r.push(blocker('ledger_table', obj, 'is a ledger table'))
-  if (target === 'columnar') {
-    if (!NO_INDEXES.has(t.name) && !t.name.startsWith('metrics_'))
-      r.push(
-        blocker(
-          'other',
-          `${t.name}_pkey`,
-          `has an index (${t.name}_pkey): columnar tables have no indexes in this version`,
-        ),
-      )
-    for (const trg of TRIGGERS[t.name] ?? [])
-      r.push(blocker('other', trg, `has a trigger (${trg})`))
-  }
   if (analyticsOf(s).knobs.publication) r.push(blocker('publication', obj, 'is in a publication'))
   r.push(...ownerBlockers(s, obj))
   return r
@@ -461,6 +456,21 @@ function refuseUntrustedOwner(s: MockState): void {
   if (!ownerInfo(s).ownerTrusted) throw problem('partition_policy_conflict', OWNER_TEXT)
 }
 
+/** What PostgreSQL refuses only when the convert step runs (the server does not look for it before): an index, a trigger. */
+function lateReasons(t: Table, target: string): string[] {
+  const out: string[] = []
+  if (target !== 'columnar') return out
+  if (!NO_INDEXES.has(t.name) && !t.name.startsWith('metrics_'))
+    out.push(`has an index (${t.name}_pkey): columnar tables have no indexes in this version`)
+  for (const trg of TRIGGERS[t.name] ?? []) out.push(`has a trigger (${trg})`)
+  return out
+}
+const lateFailure = (reasons: string[]) => ({
+  fraction: 0.5,
+  code: 'conversion_refused',
+  message: reasons.join('; ') + '. The table is as it was.',
+})
+
 function storagePreview(
   current: string | null,
   target: 'heap' | 'columnar',
@@ -469,7 +479,11 @@ function storagePreview(
   owner: { tableOwner: string; ownerTrusted: boolean },
 ): S['TableStoragePreview'] {
   const notes: string[] = []
-  if (current === target) notes.push(`stored as ${target === 'heap' ? 'rows' : 'columns'} already`)
+  const options = !partition && target === 'columnar'
+  if (current === target && options)
+    notes.push('stored as columns already: the options apply to the new stripes')
+  else if (current === target)
+    notes.push(`stored as ${target === 'heap' ? 'rows' : 'columns'} already`)
   else if (!partition)
     notes.push(
       'ALTER TABLE ... SET ACCESS METHOD takes an ACCESS EXCLUSIVE lock on the table until it ends.',
@@ -478,7 +492,7 @@ function storagePreview(
   return {
     current,
     target,
-    willConvert: blockers.length === 0 && current !== target,
+    willConvert: blockers.length === 0 && (current !== target || options),
     blockers,
     notes,
     ...owner,
@@ -496,7 +510,7 @@ function setTableStorage(
   checkStorageBody(b)
   requireExtensions(s, b.accessMethod, false)
   const current = t.partitioning ? null : (t.storage?.accessMethod ?? 'heap')
-  const blockers = blockersFor(s, t, b.accessMethod)
+  const blockers = blockersFor(s, t)
   if (dryRun) return storagePreview(current, b.accessMethod, blockers, false, ownerInfo(s))
   // Heap to heap changes nothing; columnar to columnar sets the options for new stripes.
   if (current === 'heap' && b.accessMethod === 'heap')
@@ -521,6 +535,7 @@ function startSetStorage(s: MockState, rec: DbRec, t: Table, b: S['TableStorageR
       'A change of this table is running. Try again when it has ended.',
     )
   const fails = analyticsOf(s).knobs.convertFails
+  const late = lateReasons(t, b.accessMethod)
   const taskId = s.nextTaskId
   return createTask(s, {
     kind: 'table.setStorage',
@@ -531,14 +546,17 @@ function startSetStorage(s: MockState, rec: DbRec, t: Table, b: S['TableStorageR
     cancellable: true,
     durationMs: mockConfig.tableSlow ? 60_000 : undefined,
     uncapped: mockConfig.tableSlow,
-    failAt: fails
-      ? {
-          fraction: 0.5,
-          code: 'insufficient_space',
-          message:
-            'Not enough free space on server 10.0.0.12 for the new copy of the table. The table is as it was.',
-        }
-      : undefined,
+    failAt:
+      late.length > 0
+        ? lateFailure(late)
+        : fails
+          ? {
+              fraction: 0.5,
+              code: 'insufficient_space',
+              message:
+                'Not enough free space on server 10.0.0.12 for the new copy of the table. The table is as it was.',
+            }
+          : undefined,
     onProgress: (f) => {
       const r = s.tasks.find((x) => x.task.id === taskId)
       if (r && r.task.state === 'running' && f >= 0.7) r.task.cancellable = false
@@ -589,7 +607,7 @@ function startSetPartitionStorage(
   const known = columnDefsOf(t).map((c) => c.name)
   const bad = (b.sortBy ?? []).find((c) => !known.includes(c))
   if (bad !== undefined)
-    throw validationFailed([{ field: 'sortBy', message: `The table has no column "${bad}".` }])
+    throw validationFailed([{ field: '/sortBy', message: `The table has no column "${bad}".` }])
   requireExtensions(s, b.accessMethod, true)
   const current = p.accessMethod ?? 'heap'
   const blockers: Blocker[] = []
@@ -602,18 +620,6 @@ function startSetPartitionStorage(
         'belongs to a distributed table: converting its partitions is not available in this version',
       ),
     )
-  if (b.accessMethod === 'columnar') {
-    for (const trg of TRIGGERS[t.name] ?? [])
-      blockers.push(blocker('other', trg, `has a trigger (${trg})`))
-    if (!NO_INDEXES.has(t.name))
-      blockers.push(
-        blocker(
-          'other',
-          `${t.name}_pkey`,
-          `the table has an index (${t.name}_pkey): columnar partitions have no indexes in this version`,
-        ),
-      )
-  }
   if (analyticsOf(s).knobs.publication)
     blockers.push(blocker('publication', partition, 'is in a publication'))
   blockers.push(...ownerBlockers(s, `${t.schema}.${t.name}`))
@@ -637,18 +643,22 @@ function startSetPartitionStorage(
       'A change of this partition, or a run of its policy, is running.',
     )
   const fails = analyticsOf(s).knobs.convertFails
+  const late = lateReasons(t, b.accessMethod)
   return createTask(s, {
     kind: 'table.setStorage',
     subject: { type: 'table', id: subject },
     steps: ['Check the partition', 'Convert the partition', 'Analyze the partition'],
     cancellable: true,
-    failAt: fails
-      ? {
-          fraction: 0.5,
-          code: 'insufficient_space',
-          message: `Not enough free space to build the new copy of ${partition}. The partition is as it was.`,
-        }
-      : undefined,
+    failAt:
+      late.length > 0
+        ? lateFailure(late)
+        : fails
+          ? {
+              fraction: 0.5,
+              code: 'insufficient_space',
+              message: `Not enough free space to build the new copy of ${partition}. The partition is as it was.`,
+            }
+          : undefined,
     apply: () => {
       convertPartition(s, rec, t, partition, b.accessMethod, b.compression)
     },
@@ -700,7 +710,7 @@ function validatePolicy(
       return null
     }
     if (typeof v !== 'string' || !ISO_RE.test(v) || isoSeconds(v) === null) {
-      bad(field, 'Use a duration of one unit in ISO 8601, such as P1D, P1M or PT6H.')
+      bad(field, 'Use a duration in ISO 8601, such as P1D, P1M or PT6H.')
       return null
     }
     return v
@@ -708,6 +718,11 @@ function validatePolicy(
   const every = duration('partitionEvery', b.partitionEvery, true)
   if (every) {
     const sp = splitIso(every)
+    if (sp === null)
+      bad(
+        'partitionEvery',
+        'Use one unit: PT<n>H, P<n>D, P<n>M or P<n>Y, for the values that the contract lists.',
+      )
     const shape =
       'Use PT1H, PT2H, PT3H, PT4H, PT6H, PT8H or PT12H, P<n>D (n 1 to 3660), P1M, P2M, P3M, P4M, P6M or P<n>Y (n 1 to 1000).'
     if (sp?.unit === 'week') bad('partitionEvery', 'A week is P7D. ' + shape)
@@ -899,8 +914,9 @@ export function planActions(
           partition: x.name,
           rangeFrom: parseBound(x.rangeFrom)?.toISOString() ?? null,
           rangeTo: end.toISOString(),
-          bytesBefore: x.sizeBytes,
-          bytesAfter: x.sizeBytes === null ? null : Math.round(x.sizeBytes / 6.2),
+          // The plan of the real server carries no sizes; a run fills them in.
+          bytesBefore: null,
+          bytesAfter: null,
         })
     }
   }
@@ -911,7 +927,7 @@ export function planActions(
         partition: x.name,
         rangeFrom: parseBound(x.rangeFrom)?.toISOString() ?? null,
         rangeTo: parseBound(x.rangeTo)?.toISOString() ?? null,
-        bytesBefore: x.sizeBytes,
+        bytesBefore: null,
         bytesAfter: null,
       })
   return actions
@@ -1043,13 +1059,14 @@ function finishRun(s: MockState, rec: DbRec, t: Table, run: Run): void {
       const r = convertPartition(s, rec, t, act.partition, 'columnar')
       return { ...base, state: 'done' as const, bytesBefore: r.before, bytesAfter: r.after }
     }
+    const before = list.find((x) => x.name === act.partition)?.sizeBytes ?? null
     setPartitionList(
       s,
       rec,
       t,
       list.filter((x) => x.name !== act.partition),
     )
-    return { ...base, state: 'done' as const }
+    return { ...base, state: 'done' as const, bytesBefore: before, bytesAfter: null }
   })
   // A convert that the knob made fail keeps its detail in words the scheduler uses.
   run.actions = run.actions.map((x) =>

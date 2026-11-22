@@ -18,14 +18,16 @@ import SafeName from '../SafeName.vue'
 import TypeToConfirm from '../TypeToConfirm.vue'
 import PartitionActionsTable from './PartitionActionsTable.vue'
 import OwnerNotice from './OwnerNotice.vue'
+import PlanRemovals from './PlanRemovals.vue'
 import { endpoints } from '@/api/endpoints'
 import { describeProblem } from '@/api/problem'
 import { keys, usePartitionPolicy } from '@/api/queries'
-import { formatBytes } from '@/lib/format'
 import {
   COMPRESSION_LABEL,
   DEFAULT_POLICY,
   DURATION_UNITS,
+  durationText,
+  type KeptField,
   INTERVAL_PRESETS,
   formOf,
   lowersRetention,
@@ -52,23 +54,14 @@ const stored = usePartitionPolicy(
 
 const form = reactive<PolicyForm>({ ...DEFAULT_POLICY })
 const loaded = ref(false)
-// The form starts from the stored policy once it has been read (a table with none starts from the defaults).
+// The form starts from the stored policy once it has been READ (a table with none, a 404, starts from the defaults). A policy
+// that could not be read never turns into the defaults: the form stays hidden and Save is off.
 watch(
-  () => stored.data.value,
-  (policy) => {
-    if (loaded.value || stored.isPending.value) return
-    Object.assign(form, formOf(policy ?? null))
+  () => stored.isSuccess.value,
+  (ok) => {
+    if (!ok || loaded.value) return
+    Object.assign(form, formOf(stored.data.value ?? null))
     loaded.value = true
-  },
-  { immediate: true },
-)
-watch(
-  () => stored.isPending.value,
-  (pending) => {
-    if (!pending && !loaded.value) {
-      Object.assign(form, formOf(stored.data.value ?? null))
-      loaded.value = true
-    }
   },
   { immediate: true },
 )
@@ -81,6 +74,20 @@ watch(
   },
 )
 const request = computed(() => requestOf(form))
+const KEPT_LABEL: Record<KeptField, string> = {
+  partitionEvery: 'interval of a partition',
+  createAhead: 'time to create ahead',
+  retention: 'retention',
+  columnarAfter: 'time to convert after',
+  runEvery: 'time between runs',
+}
+const kept = computed(() =>
+  (Object.keys(form.keep) as KeptField[]).map((key) => ({
+    key,
+    label: KEPT_LABEL[key],
+    value: form.keep[key] as string,
+  })),
+)
 
 const positive = (v: number | string): boolean =>
   typeof v === 'number' && Number.isInteger(v) && v >= 1
@@ -121,13 +128,11 @@ const fresh = computed(
 const summary = computed(() => {
   const actions = previewed.value?.plan.actions ?? []
   const n = (k: string) => actions.filter((a) => a.kind === k).length
-  const removed = actions.filter((a) => a.kind === 'drop' || a.kind === 'detach')
   return {
     create: n('create'),
     convert: n('convert'),
     drop: n('drop'),
     detach: n('detach'),
-    removedBytes: removed.reduce((a, x) => a + (x.bytesBefore ?? 0), 0),
   }
 })
 
@@ -173,7 +178,13 @@ const serverErrors = computed<Record<string, string>>(() => {
 const err = (field: string): string | undefined => errors.value[field] ?? serverErrors.value[field]
 const busy = computed(() => save.isPending.value)
 const canSave = computed(
-  () => loaded.value && valid.value && typedOk.value && !previewNeeded.value && !busy.value,
+  () =>
+    loaded.value &&
+    stored.isSuccess.value &&
+    valid.value &&
+    typedOk.value &&
+    !previewNeeded.value &&
+    !busy.value,
 )
 const EXAMPLE = computed(
   () =>
@@ -230,8 +241,26 @@ const EXAMPLE = computed(
           <span class="muted"> ({{ table.partitioning?.columnType }}, read from the table)</span>
         </p>
 
+        <div v-if="kept.length > 0" class="stack" data-testid="policy-kept">
+          <p v-for="k in kept" :key="k.key" class="notice tone-info" role="status">
+            <span aria-hidden="true">&#9432;</span>
+            <span>
+              The stored {{ k.label }} is
+              <code><SafeName :value="k.value" kind="text" :max="60" /></code> ({{
+                durationText(k.value)
+              }}). The form cannot show it, so it is kept as it is and saved unchanged.
+              <button type="button" class="btn btn-small" @click="delete form.keep[k.key]">
+                Change it
+              </button>
+            </span>
+          </p>
+        </div>
         <div class="form-row">
-          <FormField label="Each partition covers" :error="err('partitionEvery')">
+          <FormField
+            v-if="!form.keep.partitionEvery"
+            label="Each partition covers"
+            :error="err('partitionEvery')"
+          >
             <template #default="{ id, ...aria }">
               <select :id="id" v-model="form.interval" data-testid="policy-interval" v-bind="aria">
                 <option v-for="p in INTERVAL_PRESETS" :key="p.value" :value="p.value">
@@ -266,7 +295,7 @@ const EXAMPLE = computed(
                 </select>
               </template>
             </FormField>
-            <FormField label="Unit">
+            <FormField label="Interval unit">
               <template #default="{ id, ...aria }">
                 <select
                   :id="id"
@@ -284,6 +313,7 @@ const EXAMPLE = computed(
 
         <div class="form-row">
           <FormField
+            v-if="!form.keep.createAhead"
             label="Create ahead"
             hint="How far in advance partitions exist; keep it larger than a typical bucket move."
             :error="err('createAhead')"
@@ -301,7 +331,7 @@ const EXAMPLE = computed(
               />
             </template>
           </FormField>
-          <FormField label="Unit">
+          <FormField v-if="!form.keep.createAhead" label="Create ahead unit">
             <template #default="{ id, ...aria }">
               <select :id="id" v-model="form.aheadUnit" v-bind="aria">
                 <option v-for="u in DURATION_UNITS" :key="u" :value="u">{{ u }}s</option>
@@ -317,7 +347,11 @@ const EXAMPLE = computed(
             Remove partitions that end before</label
           >
           <div v-if="form.retentionOn" class="form-row">
-            <FormField label="Older than" :error="err('retention')">
+            <FormField
+              v-if="!form.keep.retention"
+              label="Remove older than"
+              :error="err('retention')"
+            >
               <template #default="{ id, ...aria }">
                 <input
                   :id="id"
@@ -331,7 +365,7 @@ const EXAMPLE = computed(
                 />
               </template>
             </FormField>
-            <FormField label="Unit">
+            <FormField v-if="!form.keep.retention" label="Retention unit">
               <template #default="{ id, ...aria }">
                 <select :id="id" v-model="form.retentionUnit" v-bind="aria">
                   <option v-for="u in DURATION_UNITS" :key="u" :value="u">{{ u }}s</option>
@@ -362,7 +396,11 @@ const EXAMPLE = computed(
           >
           <template v-if="form.columnarOn">
             <div class="form-row">
-              <FormField label="Older than" :error="err('columnarAfter')">
+              <FormField
+                v-if="!form.keep.columnarAfter"
+                label="Convert older than"
+                :error="err('columnarAfter')"
+              >
                 <template #default="{ id, ...aria }">
                   <input
                     :id="id"
@@ -376,7 +414,7 @@ const EXAMPLE = computed(
                   />
                 </template>
               </FormField>
-              <FormField label="Unit">
+              <FormField v-if="!form.keep.columnarAfter" label="Convert-after unit">
                 <template #default="{ id, ...aria }">
                   <select :id="id" v-model="form.columnarUnit" v-bind="aria">
                     <option v-for="u in DURATION_UNITS" :key="u" :value="u">{{ u }}s</option>
@@ -449,7 +487,7 @@ const EXAMPLE = computed(
               />
             </template>
           </FormField>
-          <FormField label="Run every" :error="err('runEvery')">
+          <FormField v-if="!form.keep.runEvery" label="Run every" :error="err('runEvery')">
             <template #default="{ id, ...aria }">
               <input
                 :id="id"
@@ -462,7 +500,7 @@ const EXAMPLE = computed(
               />
             </template>
           </FormField>
-          <FormField label="Unit">
+          <FormField v-if="!form.keep.runEvery" label="Run every unit">
             <template #default="{ id, ...aria }">
               <select :id="id" v-model="form.runEveryUnit" v-bind="aria">
                 <option v-for="u in DURATION_UNITS" :key="u" :value="u">{{ u }}s</option>
@@ -502,25 +540,16 @@ const EXAMPLE = computed(
               >
             </p>
             <div :class="{ 'is-stale': !fresh }" class="stack" data-testid="policy-preview-result">
-              <p data-testid="policy-preview-summary">
+              <p data-testid="policy-preview-summary" role="status">
                 The next run would create {{ summary.create }}
                 {{ summary.create === 1 ? 'partition' : 'partitions' }}, convert
                 {{ summary.convert }}, drop {{ summary.drop }} and detach {{ summary.detach }}.
               </p>
-              <p
-                v-if="summary.drop > 0"
-                class="notice tone-danger"
-                role="alert"
-                data-testid="policy-preview-deletes"
-              >
-                <span aria-hidden="true">&#10006;</span>
-                <span>
-                  Dropping {{ summary.drop }}
-                  {{ summary.drop === 1 ? 'partition' : 'partitions' }} deletes
-                  {{ formatBytes(summary.removedBytes) }} of data. Saving the policy deletes nothing
-                  now; the next run does.
-                </span>
-              </p>
+              <PlanRemovals
+                :actions="previewed.plan.actions"
+                testid="policy-preview-deletes"
+                tail="Saving the policy deletes nothing now; the next run does."
+              />
               <PartitionActionsTable
                 v-if="previewed.plan.actions.length > 0"
                 :actions="previewed.plan.actions"
@@ -556,7 +585,7 @@ const EXAMPLE = computed(
         {{ usable ? 'Cancel' : 'Close' }}
       </button>
       <button
-        v-if="usable"
+        v-if="usable && !stored.error.value"
         type="button"
         class="btn btn-primary"
         data-testid="policy-save"

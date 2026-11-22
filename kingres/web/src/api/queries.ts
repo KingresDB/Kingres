@@ -330,7 +330,16 @@ export const usePartitionPolicy = (
       try {
         return await endpoints.getPartitionPolicy(toValue(db), toValue(schema), toValue(table))
       } catch (e) {
-        if (e instanceof ApiError && e.status === 404) return null
+        // A 404 for "no policy" is an answer; a 404 that says the table is not on the instance of the manager leader (another
+        // shard group) is not: the panel then shows the error and offers no "Set a policy" that would fail the same way.
+        if (
+          e instanceof ApiError &&
+          e.status === 404 &&
+          !/another shard group|instance of the manager leader|not on this instance/i.test(
+            e.problem.detail ?? '',
+          )
+        )
+          return null
         throw e
       }
     },
