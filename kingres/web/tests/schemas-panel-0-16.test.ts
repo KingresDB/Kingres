@@ -142,6 +142,35 @@ describe('A schema task that ends badly', () => {
     )
   })
 
+  it('does not say it for a move that failed in its switch, where the schema may be on neither group', async () => {
+    const view = await renderComponent(TaskProgress, {
+      task: task({
+        error: {
+          code: 'step_failed',
+          message: 'the schema is on shard group 3, not on 2',
+          retryable: true,
+          step: 'Switch',
+        },
+      }),
+    })
+    await screen.findByText(/not on 2/)
+    expect(view.queryByTestId('move-failed-note')).not.toBeInTheDocument()
+  })
+
+  it('says it for a move that was cancelled', async () => {
+    await renderComponent(TaskProgress, {
+      task: task({
+        error: {
+          code: 'cancelled',
+          message: 'The move was cancelled',
+          retryable: false,
+          step: 'Copy the data',
+        },
+      }),
+    })
+    expect(await screen.findByTestId('move-failed-note')).toBeInTheDocument()
+  })
+
   it('does not say it for a move that is done, or for another kind that failed', async () => {
     const done = await renderComponent(TaskProgress, {
       task: task({ state: 'done', error: null }),

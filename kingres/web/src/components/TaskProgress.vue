@@ -85,10 +85,17 @@ const schemaProblem = computed(() => {
     detail: error.message,
   })
 })
-// A move that failed or was cancelled left the schema where it was, in use (a move that is past its switch does not fail).
-const moveFailed = computed(
-  () => props.task?.kind === 'schema.move' && props.task.state === 'failed',
-)
+// A move that failed in its check or its copy, or was cancelled, left the schema where it was, in use (the copy is undone before its
+// switch). A move that failed in a later step (the check of the switch) did not: it says nothing about where the schema is.
+const moveFailed = computed(() => {
+  const t = props.task
+  if (t?.kind !== 'schema.move' || t.state !== 'failed') return false
+  return (
+    t.error?.code === 'cancelled' ||
+    t.error?.step === 'Check the move' ||
+    t.error?.step === 'Copy the data'
+  )
+})
 watch(announcementKey, (key) => {
   if (key) announce(summary.value, props.task?.state === 'failed' ? 'assertive' : 'polite')
 })
