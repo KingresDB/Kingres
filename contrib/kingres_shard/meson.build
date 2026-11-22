@@ -332,6 +332,7 @@ tests += {
       't/263_merge_colocated.pl',
       't/264_merge_routed.pl',
       't/265_merge_reference_local.pl',
+      't/266_merge_faults.pl',
     ],
   },
 }

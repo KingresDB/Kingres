@@ -1016,6 +1016,8 @@ the files of the extension, because the dump creates the extension.
 | `kingres_shard.shippable_extensions` | all | all, none, or a list of names from the list compiled into the library (see "Objects of extensions"): which extensions' objects may be shipped to the groups. A narrowing only. `USERSET`. |
 | `kingres_shard.enable_bulk_routing` | on | Off: an `INSERT` that goes to several shard groups is refused as in 0.5 (a multi-row `VALUES`, `INSERT ... SELECT`, a single row whose key is not a constant). A single row with a constant key never needed the router and is not affected. `USERSET`; it grants nothing. |
 | `kingres_shard.enable_colocated_insert_select` | on | Off: a colocated `INSERT ... SELECT` is not shipped whole: it goes through the row router when it can (no `ON CONFLICT DO UPDATE`) and is refused when it cannot. `USERSET`; it chooses among statements that give the same answer, and grants nothing. A cached plan keeps the path it was made with (as for every planner setting). |
+| `kingres_shard.enable_distributed_merge` | on | Off: a `MERGE` into a distributed table, a reference table or a local table that reads distributed tables is refused with the messages of phase 2a (see "`MERGE` on distributed tables"). `USERSET`; it chooses among statements that give the same answer, and grants nothing. |
+| `kingres_shard.merge_max_source_bytes` | 64MB | The most that the origin holds of the source rows of a `MERGE` that it routes to the groups (1MB to 512MB, in the unit kB). A `MERGE` whose source is larger fails before any group has run anything, with code `54000`. `USERSET`. |
 | `kingres_shard.enable_copy_routing` | on | Off: `COPY ... FROM` into a distributed table of a cluster with several groups is refused as in 0.5. `USERSET`. |
 | `kingres_shard.insert_batch_rows` | 1000 | Rows per batch that the row router sends to one group (1 to 100000). |
 | `kingres_shard.insert_batch_bytes` | 1MB | Text bytes per batch per group, the sum of the lengths of the values (16kB to 64MB). The memory of a bulk write is about two batches per group, whatever the number of rows. |
@@ -1527,6 +1529,53 @@ subquery or join on it or on another distributed table), reference tables
 allowed, only built-in immutable functions and operators. An `UPDATE` that
 assigns the distribution column is refused. Otherwise it fails with `this
 UPDATE/DELETE spans shard groups and cannot be shipped`.
+
+## `MERGE` on distributed tables (phase 12, version 0.8)
+
+A `MERGE` runs on the shard groups in one of five ways, chosen by what its target and its `USING` clause are.
+Every other `MERGE` is refused with an error that names the condition that is not met, before any group has
+run anything. `kingres_shard.enable_distributed_merge = off` gives the messages of phase 2a again.
+
+| Target | `USING` | Path |
+|---|---|---|
+| distributed | tables of the target's colocation group joined to the target on their distribution keys, and reference tables; or reference tables only | **M1**, colocated: the whole statement runs on every group that owns a bucket of the target |
+| distributed | one relation of any kind (a local table, `VALUES`, a sub-select with an aggregate, a table of another colocation group, a table joined on another column, a reference table), and `ON` has `target.key = <expression of that relation>` | **M3**, routed source: this node reads the source and sends each row to the group that owns the bucket of the expression |
+| reference | reference tables, `VALUES`, constants | **M4**: the statement runs on every node (node id order, the writer locks, the copies must agree) |
+| reference | one relation of any kind | **M5**: this node reads the source once and every node merges the same rows |
+| local (a ledger table too) | distributed tables | **M6**: each distributed table of `USING` is read through a sub-select with `OFFSET 0`; the target keeps its triggers |
+
+How it is done. M1 deparses the statement as written and sends it to every group that owns a bucket of the target,
+**including a group that has no matching source row**, because `WHEN NOT MATCHED BY SOURCE` acts on target rows with
+no source row. M3 replaces the relation of `USING` by `(SELECT u.c1::type AS col, ... FROM unnest($n::text[], ...) AS u(c1, ...))`
+(one text array for each column the statement uses) and gives each group the rows of its keys; a group with no row of the
+source is skipped unless the statement has a `NOT MATCHED BY SOURCE` action. A row whose key expression is `NULL` goes to the
+group of the bucket that a `NULL` key hashes to, where an `INSERT` action puts the row as one node would. The command tag
+count is the sum of the groups' counts, `RETURNING` rows (with `merge_action()`) are the groups' rows put together, and the
+groups commit together by the two-phase path. The statement is atomic: an error on any group, `cannot affect row a second
+time` included, leaves no change anywhere (the fault points `merge_before_first_group`, `merge_between_groups` and
+`merge_before_commit` are used by `t/266`).
+
+Refused, with the condition named: a `WITH` clause; a sub-select in an expression (`ON`, a `WHEN` condition, `SET`, `VALUES`,
+`RETURNING`) of a distributed target; a `USING` clause that is a join or several relations when the source has to be routed
+or shipped (put the join in a sub-select); an `ON` clause that does not equate the distribution column with a column or
+expression of the source; an `UPDATE` action that assigns the distribution column; an `INSERT` action whose distribution
+column is not the key the statement is colocated or routed by; a volatile value (a sequence, an identity column, `random()`):
+each group would compute its own, so give the column a value in the `INSERT` list; an expression that is not built in and
+immutable; a target with a trigger or a rule, row-level security, or a view of another owner; a column of the source with a
+type that is not built in or a collation other than the default (the source is shipped as text).
+
+Snapshot. In M3 and M5 the source is read here, before the groups run: it is the snapshot of the start of the statement,
+and a source row that changes afterwards is not read again. Each group reads its target in its own statement snapshot, and
+`READ COMMITTED` re-evaluates a concurrently updated target row as on one node. In M5 the writer locks of the reference
+tables are taken before the source is read. A bucket that moves while the statement runs fails it with `KS001` and a
+change of nothing (the placement of the groups is checked when the statement starts and again after every group ran); the
+statement can be repeated. A group refuses a `MERGE` fragment that is not of a shape its own analysis accepts, and a text that
+claims to be one is never run.
+
+Limits of this increment: M3 and M5 need the source to be one relation (a `USING` join is written as a sub-select); a key
+restriction in `ON` does not prune the groups of an M1 statement (every group owning buckets of the target runs it, which is
+always correct); `merge_max_source_bytes` bounds the rows that the origin holds, and for M5 every node receives all of them;
+a `MERGE` on a hot standby is refused as every write is.
 
 ## Bulk writes through the row router (phase 2b, steps 3 and 4)
 
