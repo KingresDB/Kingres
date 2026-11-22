@@ -362,3 +362,20 @@ func TestHoldBackKeepsRenewingThroughASlowStop(t *testing.T) {
 		t.Fatalf("a stop that did not end cleanly was not fenced when the lease lapsed: running=%v stops=%d", up, stops)
 	}
 }
+
+// The state of a group that a release or a demotion dropped between a round and the write of the watchdog file is not dereferenced (a cluster test of the
+// rollback of a map group switchover crashed kingresd on it).
+func TestTheWatchdogFileOfAGroupWhoseStateWasDroppedIsNotWritten(t *testing.T) {
+	ctx := context.Background()
+	r := newRig(t, []string{"a", "b", "c"}, true)
+	wf := filepath.Join(r.dir, "instance", "lease.json")
+	if err := os.MkdirAll(filepath.Dir(wf), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	r.m.c.WatchdogFile = wf
+	r.m.Renew(ctx)
+	r.m.mu.Lock()
+	delete(r.m.groups, 1)
+	r.m.mu.Unlock()
+	r.m.writeWatchdogFile(1) // must not panic
+}

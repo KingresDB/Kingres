@@ -58,6 +58,12 @@ func (m *Manager) writeWatchdogFile(group int32) {
 	}
 	m.mu.Lock()
 	st := m.groups[group]
+	if st == nil {
+		// The state of the group was dropped (a release, an end of adoption, a demotion) between the round that found the lease valid and this write: there
+		// is nothing to write for a lease that is not held any more. Found by a cluster test of the rollback of a map group switchover (a nil dereference).
+		m.mu.Unlock()
+		return
+	}
 	rem := (st.validUntil - m.c.Margin - m.c.Clock.Mono()).Milliseconds()
 	m.seq++
 	seq := m.seq
