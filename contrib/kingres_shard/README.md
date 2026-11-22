@@ -1748,7 +1748,7 @@ every node and runs every node as the origin.
 
 Switches: `kingres_shard.enable_pushdown` and `kingres_shard.enable_pushdown_closed`.  Fault points of the tests:
 `frag_before_probe`, `frag_after_probe_before`, `frag_after_declare`, `frag_local_open`, `frag_after_probe_after`,
-`frag_first_fetch`, `frag_before_fetch`, `frag_wait_batch`, `frag_local_fetch`, `frag_declared_g<n>`; the windows of the defences against a catalog that changed after the plan (t/136): `insel_before_rels_check`, `insel_before_start_check`, `insel_before_text_parse`, `query_before_text_parse`.  A statement
+`frag_first_fetch`, `frag_before_fetch`, `frag_wait_batch`, `frag_local_fetch`, `frag_declared_g<n>`; of the repartitioned join (phase 12, after its moved rows are collected and before its fragments start): `rp_after_ship`, `rp_before_fragment`; the windows of the defences against a catalog that changed after the plan (t/136): `insel_before_rels_check`, `insel_before_start_check`, `insel_before_text_parse`, `query_before_text_parse`.  A statement
 that is cancelled, or fails, while a group runs its part asks the group to stop it (bounded), so a group that is
 blocked by a lock does not hold the end of the statement for `node_timeout`.
 

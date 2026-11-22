@@ -2532,6 +2532,8 @@ fs_start(KsFragScanState *s)
 		s->rp_ran = true;
 		MemoryContextReset(s->rp_cxt);
 		s->rp_rows = kingres_shard_repart_collect((PlanState *) linitial(s->css.custom_ps), coloc, s->rp_cols, s->rp_keypos, groups, s->rp_cxt);
+		/* design 4.10: a move that commits here is found by the placement check of the groups (KS001), never a wrong answer */
+		kingres_shard_fault_point("rp_after_ship");
 		/* the arrays come after the statement's own parameters; their values are the group's own */
 		v2 = palloc0(sizeof(char *) * (nparams + k));
 		t2 = palloc0(sizeof(Oid) * (nparams + k));
@@ -2573,6 +2575,8 @@ fs_start(KsFragScanState *s)
 	st.fp_after_check = "frag_after_probe_after";
 	st.fp_first_fetch = "frag_first_fetch";
 	st.fp_declared_prefix = "frag_";
+	if (s->rp_cols != NIL)
+		kingres_shard_fault_point("rp_before_fragment");
 	PG_TRY();
 	{
 		kingres_shard_fragset_start(&s->fs, &st);
