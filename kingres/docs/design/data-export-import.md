@@ -1729,6 +1729,25 @@ The result is `dx/s2-result.md` of the second writer (2026-11-22, PostgreSQL 18.
 - **Contract 0.19.0 lists only the values of this revision** for the enums that 14b extends (`DataUpload.state`, `DataExport.kind` and `format`, `purpose`,
   `TableConsistency.level`), and only `ImportTableRequest` is a closed schema.
 - **`maxAtomicBytes` is a flag** and is not in the setting (the console states 2 GiB).
+- **Load and commit are two steps that share an open transaction in memory** (the design lists them as two steps and a transaction cannot span a restart). The step
+  "Load rows" is not engine-NonIdempotent: a run that finds nothing committed may run again. The commit step writes the intent (`commit sent for N rows`) into the task
+  detail under the lease, and a run that finds the marker fails `import_outcome_unknown` with its own code (the engine's `step_interrupted` would have been the code
+  otherwise). A connection that died before the intent is found by a `SELECT 1` before the intent is written: nothing stored, `copy_interrupted`, retryable.
+  `Task.cancellable` is false from the intent on. Fault hooks: `ops.ImportFault`.
+- **Request time and step time.** `exportTable` and `importTable` do the checks of the first step at the request (so that the contract's 404, 409 and 422 answers exist)
+  and the steps do the role check and the table check again. The record and the reservation are made at the request; a refused request leaves a record in the state
+  failed, which the janitor prunes after seven days.
+- **The reservation of an upload is the declared size plus the overhead of the sealed form** (header and a tag per segment), and the export estimate is the local size
+  times the groups times 1.5 (10 for a columnar table), at least 64 MiB and at most the largest file.
+- **Reference tables refuse array columns**: `unnest` of a typed array flattens an array column. A reference table is always loaded through the temporary table (the
+  direct COPY is refused on several groups), with the cap of 256 MiB (a constant, not a flag).
+- **Header match** is PostgreSQL's (S2); the header text is never passed on, so the task code is `import_header_mismatch` without the first difference.
+- **`maxConcurrent`** is one transfer per role and the setting in the cluster, counted from the unfinished tasks of the two kinds.
+- **The cluster test harness serves HTTPS for the data transfer** (`clustertest.FormTLS`, the TLS cluster of `cmd/kingresd`), because the operations refuse plain HTTP.
+- **Not covered by tests in this increment:** the leader-change fault points of a real failover at every step (the leader that holds the files is gone: the codes
+  `transfer_leader_changed` and `transfer_session_lost` are in the code and tested only for the records they read), `KS001` and a bucket move during a routed COPY, a
+  group that fails at COMMIT, a record near 16 MiB through PostgreSQL (the scanner is tested at the limit), the untrusted-code check against a role other than the owner
+  (the query runs in every export; no table in the tests has a function of another role), and metrics and alerts for the staging disk.
 
 ## Known limits
 

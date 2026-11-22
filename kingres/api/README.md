@@ -247,7 +247,11 @@ Tag `Data transfer`: export a table to a CSV file, upload a CSV file, import it 
 - **Error text.** No problem, task error, task detail or audit event of a data transfer carries a value, a row, a key or the message of PostgreSQL. The text is a fixed sentence per
   SQLSTATE, the names of the column and the constraint, and the absolute line number.
 - **Task codes** (`TaskError.code`): `export_too_large`, `insufficient_disk`, `transfer_quota_exceeded`, `transfer_timeout`, `transfer_leader_changed` (retryable),
-  `transfer_session_lost` (retryable), `transfer_key_lost`, `copy_interrupted` (retryable), `row_count_mismatch`, `import_outcome_unknown`, `forbidden`, `cancelled`, `sql_error`.
+  `transfer_session_lost` (retryable), `transfer_key_lost`, `copy_interrupted` (retryable), `row_count_mismatch`, `import_outcome_unknown`, `forbidden`, `cancelled`, `sql_error`; the import finds
+  in the file itself: `import_header_mismatch` (`header: match` failed; PostgreSQL checks it at load time and its text is not passed on), `import_end_marker` (with the line),
+  `import_record_too_large` (with the line) and `import_too_large` (the decompressed file passes the limit).
+- **Identity columns.** The sequences behind the identity or serial columns of a distributed table are node-local: rows loaded without the column from different servers
+  can repeat values. List the column in the file. The console should warn for such a table.
 - **Audit.** The mutating operations, `downloadDataExport` (a read, audited because data leaves; written when the stream ends), and the system events `dataTransfer.completed` and
   `dataTransfer.purged`. An upload chunk is not an event.
 

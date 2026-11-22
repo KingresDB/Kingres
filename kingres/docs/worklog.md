@@ -7,6 +7,32 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-22: data export and import of tables (phase 14a, control plane): contract 0.19.0, the relay, uploads, downloads, the export and the import
+
+### What was done
+
+- **Contract 0.19.0** (cb4afe3757): ten operations, the vendor extension `x-streams`, the setting `dataTransfer`, twelve problem codes, two task kinds, the
+  checker rules and the generated files; two texts corrected later (validation_failed is 400, insufficient_disk 409).
+- **CP1:** the table `kingres_cp.data_transfer` (migration 0035), the setting, the flags, the check of the role between steps, `transfer.SafeError` with the canary and
+  fuzz tests. **CP2** came from the second writer (`internal/staging`, merged). **S1:** the relay spike (5 GiB each way, heap growth 3 and 13 MiB; it found that the idle
+  body must move the write deadline too). **CP3:** `POST /internal/v1/forward-stream`, the guards (TLS, the setting), uploads, downloads with Range, the janitor.
+  **CP4:** the task `table.export`. **CP5:** the task `table.import` (all or nothing, the commit intent, reference tables through typed arrays, S2 applied).
+- The design note has a section with the spike results and every place where the code differs from the text.
+
+### How it was verified
+
+- Unit tests of the relay, the internal call against a real mutual TLS listener, the guards and the relayed operations, SafeError (canary in every class, fuzz), the scanner
+  (against a reference, fuzz), the options and statements; PostgreSQL 18 and 19: the record and the setting, uploads, exports, downloads, imports of every kind of table, the
+  error classes with a canary, the commit fault points, cancel, demotion; three servers: uploads, import, export and download through followers, a follower that dies
+  in the middle of an upload.
+- Mutants killed: SafeError copying the message; the body limit on the relay call; the proof check of the relay; the TLS guard; the setting guard; the stream limits and
+  the relay in the guard; the chunk timeout; four of the scanner (quote toggle, record limit, the end-marker check; the fourth was not confirmed); the count comparison
+  of the import.
+
+### Still open
+
+- The independent review of the relay and of the import transaction, the leader-change fault tests of a real failover at every step, the console (second writer), the batches (14a+).
+
 ## 2026-11-20: automatic failover, the last steps of phase 2b and their review, the second review of phase 9 and its fixes, and two npm alerts
 
 Covers 2026-11-20 from the morning, after the third entry of 2026-11-19.
