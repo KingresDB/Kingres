@@ -108,6 +108,28 @@ The independent review (docs/reviews/2026-11-22-console-phase9-7.md, no critical
 
 ---
 
+## 2026-11-22 (later): the search path of the service connections (DX16-01, branch sp-fix)
+
+### What was done
+
+- A security review found that a service connection set no search_path: the owner of a database can run `ALTER DATABASE ... SET search_path = <own schema>, pg_catalog`, plant an
+  operator of the same signature in that schema, and the service role (a superuser) resolves an unqualified comparison of the control plane to it and runs its function. The three
+  places that open a service connection (`Service.connect`, `InstanceConn`, `RemoteConn`) now set `search_path=pg_catalog` in the startup parameters, which outrank the settings of a
+  database and of a role, and `asService` repeats it with `SET LOCAL` as the first statement of every transaction. The control plane was audited by running the whole end-to-end
+  suite with the path: no statement relied on another schema.
+
+### How it was verified
+
+- `TestServiceSessionIgnoresTheSearchPathOfTheDatabase` plants the schema, the operator (regclass, regclass) and the database setting, then runs a distribution of a reference table (the
+  check compares two regclass values): without the fix a role `kg_sp_pwned` with SUPERUSER exists afterwards, with it none. PostgreSQL 18 and 19: the whole `cmd/kingresd` suite passes;
+  the first 35 tests of `internal/clustertest` (failover, standbys) passed on 18 before the run was stopped for time.
+
+### Still open
+
+- The connections that the sharding extension opens to other nodes are not audited here.
+
+---
+
 ## 2026-11-22: phase 11 (distributed schemas), the extension: the scale work (step 12), the review fixes and the documentation (step 15)
 
 Covers the work on branch shard-p1011 after the second review of phase 11 (the review fixes of 2026-11-21 are in the entry of that day).
