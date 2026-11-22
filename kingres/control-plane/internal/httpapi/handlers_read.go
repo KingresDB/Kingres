@@ -257,9 +257,22 @@ func (s *Server) listColocationGroups(_ *call, w http.ResponseWriter, r *http.Re
 	if p := pp.err(); p != nil {
 		return p
 	}
+	kind := pp.enum("kind", "hash", "schema")
+	if p := pp.err(); p != nil {
+		return p
+	}
 	items, err := s.deps.Store.ColocationGroups(r.Context(), db)
 	if err != nil {
 		return s.storeProblem(r, err, "Database \""+db+"\" does not exist.")
+	}
+	if kind != "" {
+		kept := items[:0:0]
+		for _, g := range items {
+			if k := g.Kind; k == kind || k == "" && kind == "hash" {
+				kept = append(kept, g)
+			}
+		}
+		items = kept
 	}
 	s.writeJSON(w, r, http.StatusOK, api.ColocationGroupList{Items: nonNil(items)})
 	return nil
@@ -272,7 +285,7 @@ func (s *Server) listBuckets(_ *call, w http.ResponseWriter, r *http.Request) er
 	f := store.BucketFilter{
 		ShardGroupID: pp.int32Query("shardGroupId"),
 		ServerID:     pp.serverIDQuery("serverId"),
-		State:        pp.enum("state", "active", "moving", "orphan"),
+		State:        pp.enum("state", "active", "moving", "orphan", "splitting"),
 	}
 	page := pp.page()
 	if p := pp.err(); p != nil {
@@ -310,7 +323,7 @@ func (s *Server) listTasks(_ *call, w http.ResponseWriter, r *http.Request) erro
 		State: pp.enum("state", "pending", "running", "paused", "failed", "done"),
 		Kind: pp.enum("kind", "cluster.init", "cluster.join", "server.add", "server.remove", "server.failover",
 			"server.leave", "instance.start", "instance.stop", "instance.restart", "database.create",
-			"database.update", "database.drop", "table.distribute", "table.undistribute", "table.alter", "table.partition", "rebalance",
+			"database.update", "database.drop", "table.distribute", "table.undistribute", "table.alter", "table.partition", "rebalance", "bucket.split", "schema.distribute", "schema.move", "schema.undistribute",
 			"replication.restorePreferredPrimaries", "ledger.verify", "networkAccess.apply", "replicate.apply",
 			"certificate.renew", "certificate.revoke", "standby.reconcile", "config.apply", "config.restart",
 			"ledger.key.create", "ledger.key.rotate", "ledger.key.retire", "ledger.key.revoke", "ledger.key.distribute",
@@ -323,6 +336,9 @@ func (s *Server) listTasks(_ *call, w http.ResponseWriter, r *http.Request) erro
 	v, err := s.deps.Store.Tasks(r.Context(), f, page)
 	if err != nil {
 		return s.storeProblem(r, err, "")
+	}
+	for i := range v.Items {
+		v.Items[i] = withCancelGuard(v.Items[i])
 	}
 	s.writeJSON(w, r, http.StatusOK, v)
 	return nil
@@ -338,6 +354,7 @@ func (s *Server) getTask(_ *call, w http.ResponseWriter, r *http.Request) error 
 	if err != nil {
 		return s.storeProblem(r, err, "Task "+r.PathValue("taskId")+" does not exist.")
 	}
+	t = withCancelGuard(t)
 	s.writeJSON(w, r, http.StatusOK, t)
 	return nil
 }

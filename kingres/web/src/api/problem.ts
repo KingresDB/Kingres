@@ -426,6 +426,52 @@ const entries: Record<ProblemCode, Entry> = {
     message: 'The target server does not have the free disk space the move needs.',
     withDetail: true,
   },
+  replicas_cannot_be_kept: {
+    tone: 'warning',
+    heading: 'The replica count cannot be kept',
+    message:
+      'Fewer servers would remain than the replica count needs. Lower the replica count first, or accept fewer copies.',
+    withDetail: true,
+  },
+  bucket_busy: {
+    tone: 'warning',
+    heading: 'The bucket is busy',
+    message: 'The bucket is being moved or split. Try again when that has ended.',
+    withDetail: true,
+  },
+  split_unsupported: {
+    tone: 'warning',
+    heading: 'This bucket cannot be split',
+    message:
+      'A table of the colocation group, or the size of the bucket number, does not allow a split.',
+    withDetail: true,
+  },
+  sharding_mode_in_use: {
+    tone: 'warning',
+    heading: 'The sharding mode is in use',
+    message:
+      'The database has schemas or tables of the other kind, so the mode cannot be changed this way.',
+    withDetail: true,
+  },
+  schema_not_distributable: {
+    tone: 'warning',
+    heading: 'This schema cannot be distributed',
+    message: 'The schema holds objects that a distributed schema does not support yet.',
+    withDetail: true,
+  },
+  schema_pinned: {
+    tone: 'warning',
+    heading: 'The schema is pinned',
+    message:
+      'The schema holds a table that keeps it on its shard group (for example a ledger table).',
+    withDetail: true,
+  },
+  schema_move_in_progress: {
+    tone: 'warning',
+    heading: 'The schema is being moved',
+    message: 'Wait until the move has ended.',
+    withDetail: true,
+  },
   no_receiving_server: {
     tone: 'warning',
     heading: 'No server can receive buckets',

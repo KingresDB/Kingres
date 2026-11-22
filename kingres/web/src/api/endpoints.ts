@@ -113,6 +113,10 @@ export const endpoints = {
   addServer: (body: S['AddServerRequest']) => j(api.POST('/servers', { body })),
   updateServer: (serverId: ServerId, body: S['ServerUpdateRequest']) =>
     j(api.PATCH('/servers/{serverId}', { params: { path: { serverId } }, body })),
+  previewServerDrain: (serverId: ServerId) =>
+    j(api.GET('/servers/{serverId}/drain-preview', { params: { path: { serverId } } })),
+  drainServer: (serverId: ServerId, body: S['DrainRequest']) =>
+    j(api.POST('/servers/{serverId}/drain', { params: { path: { serverId } }, body })),
   removeServer: (serverId: ServerId) =>
     j(api.DELETE('/servers/{serverId}', { params: { path: { serverId } } })),
   /**
@@ -207,6 +211,75 @@ export const endpoints = {
     j(
       api.GET('/databases/{databaseName}/colocation-groups/{colocationId}/buckets', {
         params: { path: { databaseName, colocationId }, query: { limit: 500, ...q } },
+      }),
+    ),
+  previewBucketSplit: (
+    databaseName: string,
+    colocationId: number,
+    bucket: number,
+    body: S['BucketSplitRequest'],
+  ) =>
+    j(
+      api.POST(
+        '/databases/{databaseName}/colocation-groups/{colocationId}/buckets/{bucket}/split-preview',
+        {
+          params: { path: { databaseName, colocationId, bucket } },
+          body,
+        },
+      ),
+    ),
+  splitBucket: (
+    databaseName: string,
+    colocationId: number,
+    bucket: number,
+    body: S['BucketSplitRequest'],
+  ) =>
+    j(
+      api.POST(
+        '/databases/{databaseName}/colocation-groups/{colocationId}/buckets/{bucket}/split',
+        {
+          params: { path: { databaseName, colocationId, bucket } },
+          body,
+        },
+      ),
+    ),
+  listSchemas: (
+    databaseName: string,
+    q: Page & { distributed?: boolean; shardGroupId?: number; state?: 'active' | 'moving' } = {},
+  ) =>
+    j(
+      api.GET('/databases/{databaseName}/schemas', {
+        params: { path: { databaseName }, query: { limit: 500, ...q } },
+      }),
+    ),
+  getSchema: (databaseName: string, schemaName: string) =>
+    j(
+      api.GET('/databases/{databaseName}/schemas/{schemaName}', {
+        params: { path: { databaseName, schemaName } },
+      }),
+    ),
+  distributeSchema: (
+    databaseName: string,
+    schemaName: string,
+    body: S['DistributeSchemaRequest'],
+  ) =>
+    j(
+      api.PUT('/databases/{databaseName}/schemas/{schemaName}/distribution', {
+        params: { path: { databaseName, schemaName } },
+        body,
+      }),
+    ),
+  undistributeSchema: (databaseName: string, schemaName: string, shardGroupId?: number) =>
+    j(
+      api.DELETE('/databases/{databaseName}/schemas/{schemaName}/distribution', {
+        params: { path: { databaseName, schemaName }, query: { shardGroupId } },
+      }),
+    ),
+  moveSchema: (databaseName: string, schemaName: string, body: S['MoveSchemaRequest']) =>
+    j(
+      api.POST('/databases/{databaseName}/schemas/{schemaName}/moves', {
+        params: { path: { databaseName, schemaName } },
+        body,
       }),
     ),
   getBucketDistribution: (databaseName: string, colocationId?: number) =>

@@ -263,6 +263,21 @@ type AutoFailoverSettings struct {
 type RebalanceSettings struct {
 	// MaxConcurrentMoves is the default number of concurrent bucket moves.
 	MaxConcurrentMoves int `json:"maxConcurrentMoves"`
+	// The members below are added in contract 0.16.0 (optional in a request, always present in an answer).
+	// Strategy is the default strategy: byBucketCount or byDiskSize.
+	Strategy string `json:"strategy,omitempty"`
+	// Threshold is the default threshold; null takes the strategy's own (0, or 0.1 by disk size).
+	Threshold *float64 `json:"threshold"`
+	// MaxMovesPerServer is the limit of moves that involve one server (default 2).
+	MaxMovesPerServer int `json:"maxMovesPerServer,omitempty"`
+	// MaxMoveAttempts is how often a failed move is tried in one run (default 3).
+	MaxMoveAttempts int `json:"maxMoveAttempts,omitempty"`
+	// MaxDiskUsedFraction is the share of a data volume a move may fill (default 0.85).
+	MaxDiskUsedFraction float64 `json:"maxDiskUsedFraction,omitempty"`
+	// MaxStandbyLagBytes is the lag of a standby above which a group counts as degraded (default 64 MiB).
+	MaxStandbyLagBytes int64 `json:"maxStandbyLagBytes,omitempty"`
+	// Automatic is the automatic mode, off by default (contract 0.16.0).
+	Automatic *AutomaticSettings `json:"automatic,omitempty"`
 }
 
 // RestartState is the pending-restart part of the cluster settings.

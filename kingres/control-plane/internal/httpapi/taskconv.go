@@ -61,3 +61,21 @@ func taskToAPI(t task.Task) api.Task {
 }
 
 func itoa64(n int64) string { return strconv.FormatInt(n, 10) }
+
+// withCancelGuard narrows the cancellable flag of a task that the store read to what the cancel guard of its kind says now: the store
+// knows only the state, and a guard looks at the steps and the detail (a schema move that is in its switch, a failover past its
+// promotion). A kind without a guard keeps the flag.
+func withCancelGuard(t api.Task) api.Task {
+	if !t.Cancellable {
+		return t
+	}
+	g := task.Task{Kind: t.Kind, State: task.State(t.State)}
+	if t.Detail != nil {
+		g.Detail = *t.Detail
+	}
+	for _, s := range t.Progress.Steps {
+		g.Steps = append(g.Steps, task.StepState{Name: s.Name, State: s.State})
+	}
+	t.Cancellable = task.Cancellable(g)
+	return t
+}

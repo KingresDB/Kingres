@@ -56,6 +56,35 @@ None.
 
 ---
 
+## 2026-11-22: fixes for the review of the schema tasks port on cp-1011
+
+### What was done
+
+- The review of the three port commits (`reviews/2026-11-22-cp-1011-schema-tasks-port.md`, no critical or high finding) was
+  fixed: `Recover` cut off by a shutdown no longer fails the task (SP1); the move step asks the extension to settle a move that no
+  call drives, repeatedly, and has a bound on the fresh path (SP3); only the extension's refusal of a cancel is "too late" (SP4); the
+  late-cancel note survives the clean-up step (SP5); the make steps accept a failed call that took effect (SP6); the web note for a
+  failed move names only the cases where the schema stayed (SP7); partitions are checked for a replica identity (SP8); a make local
+  that moved first says where the schema went (SP9); migration 0041 and the memory store also exclude `schema.move` and
+  `schema.undistribute` against `server.add`, `server.remove` and `server.leave` (SP11).
+- A make local with a move first could never finish within the cleaning delay; it now ends the cleaning of its own move first.
+- Tests: kills inside the call of the extension (distribute, make local), the other direction of the rebalance exclusion at the
+  request, a terminated move backend with and without the leader, unit tests for the engine and the guards.
+
+### How it was verified
+
+Unit tests of task, ops, httpapi, rebalance, sysdb and failover; the web unit tests (1484) and the browser test of the schema
+dialogs; the trigger tests and `TestSchemaTasksOnACluster` and `TestDistributedSchemasThroughTheAPI` on PostgreSQL 18 and 19 (lane
+l1); each new test against a mutant (the table in the review file).
+
+### Still open
+
+- A prepared transaction left by a cut `distribute_schema` cannot be made on demand (no fault point in the call): the test covers the
+  branch of `Recover` and the meeting of the two calls, not the resolution of a real leftover.
+- A make local whose schema has no row on the map group is taken as made, which is also true for a dropped schema.
+
+---
+
 ## 2026-11-20: automatic failover, the last steps of phase 2b and their review, the second review of phase 9 and its fixes, and two npm alerts
 
 Covers 2026-11-20 from the morning, after the third entry of 2026-11-19.

@@ -352,6 +352,12 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	if opsSvc != nil && svc.Enabled() {
 		rbs = newRebalance(svc, opsSvc, pg, haReg, log, auditFn(sink, log))
 		rbs.Backoff = cfg.RebalanceRetryBackoff
+		if members != nil {
+			rbs.RemoveServer = members.RemoveServer
+		}
+		if stby != nil && stby.leader != nil {
+			wireStandbyRelocation(rbs, stby.leader, opsSvc, svc)
+		}
 		deps.Rebalance = rbs
 	}
 	foDeps := &failoverDeps{}
@@ -465,6 +471,12 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 			if lgs != nil {
 				wg.Add(1)
 				go func() { defer wg.Done(); lgs.run(bgCtx) }()
+			}
+			if rbs != nil {
+				// the automatic rebalance (off unless the cluster setting is on); it does nothing on a server that is not the leader
+				rbs.IsLeader = func(ctx context.Context) bool { id, err := leaders.Get(ctx); return err == nil && id == serverHost }
+				wg.Add(1)
+				go func() { defer wg.Done(); rbs.RunAuto(bgCtx) }()
 			}
 			if fos != nil && foDeps.mf != nil {
 				auto := newAutoFailover(foDeps.mf, fos, rbs, leaders, serverHost, cfg.HA.FailureTimeout, log)

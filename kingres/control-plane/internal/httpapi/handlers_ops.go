@@ -539,6 +539,7 @@ func (s *Server) cancelTask(_ *call, w http.ResponseWriter, r *http.Request) err
 	if err != nil {
 		return s.storeProblem(r, err, "No such task.")
 	}
+	t = withCancelGuard(t)
 	s.writeJSON(w, r, http.StatusOK, t)
 	return nil
 }

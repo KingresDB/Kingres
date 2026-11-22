@@ -15,6 +15,7 @@ import { safeText } from '@/lib/safe-text'
 import TaskActionDialog from '@/components/TaskActionDialog.vue'
 import EditDatabaseDialog from '@/components/EditDatabaseDialog.vue'
 import DistributeTableDialog from '@/components/DistributeTableDialog.vue'
+import SchemasSection from '@/components/SchemasSection.vue'
 import EnableLedgerDialog from '@/components/EnableLedgerDialog.vue'
 import { endpoints } from '@/api/endpoints'
 import { keys, useDatabase, useTables } from '@/api/queries'
@@ -176,6 +177,8 @@ const shardingOn = computed(() => db.value?.sharding.enabled === true)
           >
         </div>
       </section>
+
+      <SchemasSection :database-name="name" :mode="db.sharding.mode" />
 
       <section aria-labelledby="tables-h" class="stack">
         <h2 id="tables-h">Tables</h2>

@@ -5,7 +5,9 @@
 // response bodies are typed with the generated schema types.
 import { evaluateAccess } from '@/lib/network-rules'
 import { applyPending, configHandlers } from './config'
+import { DEFAULT_AUTOMATIC } from './state'
 import { ledgerHandlers } from './ledger'
+import { decorateStatus, distributedSchemaCount, elasticityHandlers } from './elasticity'
 import { AGGREGATE_SIZE, anchoringOf, digestAnchorsOf, l7, publicationOf } from './ledger-view'
 import type { HttpHandler } from 'msw'
 import type { components } from '@/api/schema'
@@ -843,7 +845,9 @@ function newDatabase(s: MockState, b: S['DatabaseCreateRequest']): Database {
     },
     sharding: {
       enabled: b.sharding?.enabled ?? false,
-      bucketCount: b.sharding?.bucketCount ?? 128,
+      bucketCount: b.sharding?.mode === 'schema' ? null : (b.sharding?.bucketCount ?? 128),
+      mode: b.sharding?.enabled ? (b.sharding?.mode ?? 'row') : 'row',
+      distributeNewSchemas: b.sharding?.distributeNewSchemas ?? false,
     },
     replication: {
       durability: b.replication?.durability ?? s.settings.defaultDurability,
@@ -1325,6 +1329,7 @@ export function createHandlers(): HttpHandler[] {
   const h: Partial<Record<OperationId, Handler>> = {
     ...configHandlers(),
     ...ledgerHandlers(),
+    ...elasticityHandlers(),
     getHealth: () => ok({ status: 'ok' }),
     getReadiness: (c) =>
       ok({
@@ -1687,7 +1692,7 @@ export function createHandlers(): HttpHandler[] {
       const s = c.s
       const rec = server(s, c.params.serverId ?? '')
       const b = body<S['ServerUpdateRequest']>(c)
-      const known = ['serverGroup', 'shouldHaveShards']
+      const known = ['serverGroup', 'shouldHaveShards', 'weight']
       const keys = Object.keys(b)
       if (keys.length === 0)
         throw validationFailed([{ field: '', message: 'Give serverGroup or shouldHaveShards.' }])
@@ -1714,6 +1719,13 @@ export function createHandlers(): HttpHandler[] {
         markRebalance(s, 'serverGroupChanged')
       }
       if (placementChanges) rec.shouldHaveShards = b.shouldHaveShards as boolean
+      if (b.weight !== undefined) {
+        if (typeof b.weight !== 'number' || !(b.weight > 0) || b.weight > 1000)
+          throw validationFailed([
+            { field: '/weight', message: 'Must be above 0 and at most 1000.' },
+          ])
+        rec.weight = b.weight
+      }
       return ok(serverView(s, rec))
     },
     removeServer: (c) => {
@@ -1944,6 +1956,13 @@ export function createHandlers(): HttpHandler[] {
       if (errors.length) throw validationFailed(errors)
       if (b.ledger?.mode === 'off' && info.ledger.mode !== 'off')
         throw problem('immutable_field', 'The ledger cannot be turned off once it is on.')
+      if (b.sharding?.mode !== undefined && !info.sharding.enabled && !b.sharding.enabled)
+        throw problem('conflict', 'Sharding is not enabled in this database; enable it first.')
+      if (b.sharding?.mode === 'row' && distributedSchemaCount(rec) > 0)
+        throw problem(
+          'sharding_mode_in_use',
+          'This database has distributed schemas, so it cannot be set to Rows only.',
+        )
       const needsTask =
         (b.sharding?.enabled === true && !info.sharding.enabled) ||
         (b.ledger?.mode && b.ledger.mode !== 'off' && info.ledger.mode === 'off')
@@ -1958,6 +1977,9 @@ export function createHandlers(): HttpHandler[] {
         if (b.ledger?.digestIntervalSeconds !== undefined)
           info.ledger.digestIntervalSeconds = b.ledger.digestIntervalSeconds
         if (b.sharding?.enabled) info.sharding.enabled = true
+        if (b.sharding?.mode) info.sharding.mode = b.sharding.mode
+        if (b.sharding?.distributeNewSchemas !== undefined)
+          info.sharding.distributeNewSchemas = b.sharding.distributeNewSchemas
       }
       if (!needsTask) {
         applyNow()
@@ -2347,14 +2369,19 @@ export function createHandlers(): HttpHandler[] {
         }),
       )
     },
-    getRebalanceStatus: (c) => ok(rebalanceStatusView(c.s)),
+    getRebalanceStatus: (c) => ok(decorateStatus(c.s, rebalanceStatusView(c.s))),
     previewRebalancePlan: (c) => {
       const b = body<S['RebalancePlanRequest']>(c)
       const plan = planView(c.s, b.moveLimit ?? 200, b.databases)
       const named = {
         ...plan,
+        strategy: b.strategy ?? c.s.settings.rebalance.strategy ?? 'byBucketCount',
+        threshold: b.threshold ?? (b.strategy === 'byDiskSize' ? 0.1 : 0),
+        imbalance: plan.needed ? 0.34 : 0,
         moves: plan.moves.map((m) => ({
           ...m,
+          reason: 'balance',
+          cost: b.strategy === 'byDiskSize' ? (m.estimatedSizeBytes ?? 1048576) : 1,
           fromServerId: serverOfGroup(c.s, m.fromShardGroupId),
           toServerId: serverOfGroup(c.s, m.toShardGroupId),
         })),
@@ -2857,7 +2884,19 @@ export function createHandlers(): HttpHandler[] {
           ...cur.autoFailover,
           ...Object.fromEntries(Object.entries(b.autoFailover).filter(([, v]) => v !== undefined)),
         }
-      if (b.rebalance) cur.rebalance = { ...cur.rebalance, ...b.rebalance }
+      if (b.rebalance) {
+        const { automatic, threshold, ...rest } = b.rebalance
+        cur.rebalance = { ...cur.rebalance, ...rest }
+        if (threshold !== undefined) cur.rebalance.threshold = threshold
+        if (automatic) {
+          const { window, ...flat } = automatic
+          cur.rebalance.automatic = {
+            ...(cur.rebalance.automatic ?? DEFAULT_AUTOMATIC),
+            ...Object.fromEntries(Object.entries(flat).filter(([, v]) => v !== undefined)),
+          } as typeof DEFAULT_AUTOMATIC
+          if (window !== undefined) cur.rebalance.automatic.window = window
+        }
+      }
       if (b.clock?.maxDifferenceMs !== undefined)
         cur.clock = { maxDifferenceMs: b.clock.maxDifferenceMs }
       if (b.features?.sharding && !cur.features.sharding) {

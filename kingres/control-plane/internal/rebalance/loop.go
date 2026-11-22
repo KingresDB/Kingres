@@ -39,6 +39,26 @@ type Options struct {
 	Databases []string `json:"databases,omitempty"`
 	// MaxConcurrentMoves is accepted and recorded; this increment runs one move at a time.
 	MaxConcurrentMoves int `json:"maxConcurrentMoves,omitempty"`
+	// Strategy is byBucketCount or byDiskSize (contract 0.16.0); empty takes the cluster setting.
+	Strategy string `json:"strategy,omitempty"`
+	// Threshold is the largest deviation from the ideal that is accepted, 0 to 1; nil takes the strategy's default.
+	Threshold *float64 `json:"threshold,omitempty"`
+	// DrainOnly plans only the moves off servers that should not hold shards.
+	DrainOnly bool `json:"drainOnly,omitempty"`
+	// MaxMovesPerServer limits the moves that involve one server as source or target.
+	MaxMovesPerServer int `json:"maxMovesPerServer,omitempty"`
+	// AcknowledgeFailures clears a suspension by failed moves (a manual start).
+	AcknowledgeFailures bool `json:"acknowledgeFailures,omitempty"`
+	// CleanupDelaySeconds overrides the delay before the source orphan is dropped, for this run.
+	CleanupDelaySeconds int `json:"cleanupDelaySeconds,omitempty"`
+	// ExcludeServers plans as if these servers should not hold shards (a preview of a drain); never stored.
+	ExcludeServers []string `json:"-"`
+	// Trigger is manual, automatic or drain.
+	Trigger string `json:"trigger,omitempty"`
+	// DrainServer, RemoveWhenDone and AcceptFewerReplicas make the run a drain of that server (design 11).
+	DrainServer         string `json:"drainServer,omitempty"`
+	RemoveWhenDone      bool   `json:"removeWhenDone,omitempty"`
+	AcceptFewerReplicas bool   `json:"acceptFewerReplicas,omitempty"`
 }
 
 // Move is one bucket move: the bucket of a colocation group of a database from a
@@ -50,6 +70,10 @@ type Move struct {
 	From, To   int32
 	// Size is the estimated bytes to copy, nil when unknown.
 	Size *int64
+	// Cost is what the plan counted for the bucket (1, or its bytes by disk size); 0 when unknown.
+	Cost int64
+	// Reason is balance or drain; empty when unknown.
+	Reason string
 }
 
 // Key identifies the bucket, whatever the groups.
@@ -182,7 +206,7 @@ type Backend interface {
 	Check(ctx context.Context, dbs []string) error
 	// Plan is the moves the extension would do now, databases in the order given,
 	// each database's moves in the extension's order.
-	Plan(ctx context.Context, dbs []string) ([]Move, error)
+	Plan(ctx context.Context, dbs []string, o Options) ([]Move, error)
 	Placement(ctx context.Context, dbs []string) ([]Placement, error)
 	// ServerOf names the server that runs the primary of a group.
 	ServerOf(ctx context.Context, db string, group int32) string
@@ -271,6 +295,9 @@ type Loop struct {
 	// OnProgress is called after each recorded change of a move (the audit and tests).
 	OnProgress func(MoveRow)
 	Log        *slog.Logger
+	// Guard is asked, before each move of a run that was started by the automatic mode, whether a safety rule of
+	// design 8.3 stops it; a *problem.Problem is the refusal. nil: no rule beyond the checks of Backend.Check.
+	Guard func(ctx context.Context, o Options) error
 
 	// notStartedRun counts the tries in a row that started no move (see notStarted).
 	notStartedRun int
@@ -368,8 +395,13 @@ func (l *Loop) moves(ctx context.Context, opts Options) error {
 		if err := l.inspect(ctx, func() error { return l.Backend.Check(ctx, dbs) }); err != nil {
 			return l.safetyStop(ctx, err)
 		}
+		if opts.Trigger == TriggerAutomatic && l.Guard != nil {
+			if err := l.Guard(ctx, opts); err != nil {
+				return l.safetyStop(ctx, err)
+			}
+		}
 		var plan []Move
-		if err := l.inspect(ctx, func() (err error) { plan, err = l.Backend.Plan(ctx, dbs); return }); err != nil {
+		if err := l.inspect(ctx, func() (err error) { plan, err = l.Backend.Plan(ctx, dbs, opts); return }); err != nil {
 			return l.safetyStop(ctx, err)
 		}
 		rows, err = l.Rows.Moves(ctx)

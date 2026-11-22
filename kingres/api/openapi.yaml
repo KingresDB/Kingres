@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: KingresDB Management API
-  version: 0.14.0
+  version: 0.16.0
   summary: REST API of the KingresDB management panel, CLI and manager.
   description: |
     The single REST API served by `kingresd` on every KingresDB server. The web panel
@@ -64,6 +64,8 @@ tags:
     description: Tables of a database and the distribute-table action.
   - name: Shards
     description: Bucket map, colocation groups and per-server bucket distribution.
+  - name: Schemas
+    description: Schemas of a database and the distributed schemas (a schema that lives in one shard group).
   - name: Replication
     description: Shard group topology, lag, replication slots, preferred primaries.
   - name: Rebalance
@@ -1101,6 +1103,76 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '422': { $ref: '#/components/responses/UnprocessableEntity' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /servers/{serverId}/drain:
+    parameters:
+      - $ref: '#/components/parameters/ServerId'
+    post:
+      operationId: drainServer
+      summary: Drain a server
+      description: |
+        Added in 0.16.0. Makes a server removable: sets its `shouldHaveShards` to false, moves every bucket its shard groups own to
+        the other servers (the run of `startRebalance` with `drainOnly`, the strategy and threshold of the cluster settings), waits
+        until the server owns no bucket and none is on its way, and, with `removeWhenDone`, removes the server with the task of
+        `removeServer`. The cluster stays in service. A drain is a **task of kind `rebalance`** (not a kind of its own): the run is
+        the rebalance of the cluster, so `getRebalanceStatus` shows it (`trigger` `drain`), `stopRebalance` stops it, a new `POST
+        /rebalance` or `drainServer` goes on with a stopped one, `cancelTask` ends it (the flag stays false: the server stays
+        `draining` until it is given back with `PATCH /servers/{serverId}` `shouldHaveShards: true`), the report has the id of the
+        task, and no other rebalance or change of the servers can run meanwhile.
+
+        Refused before a task exists: 404 for an unknown server; 409 `last_server`; 409 `no_receiving_server` (no other server runs a
+        primary and should hold shards); 409 `server_hosts_map_group` (this revision does not hand the map group over: fail it over first, "not built yet");
+        409 `replicas_cannot_be_kept` (fewer servers than `replicaCount + 1` would remain; `acceptFewerReplicas` overrides); 409
+        `group_degraded` (a group of the server has fewer healthy standbys than the replica count); 409 `rebalance_in_progress` and
+        `operation_in_progress`; 422 `node_state_invalid` for a `dead` server; 422 `unprocessable` when the server holds ordinary
+        (not distributed) tables that leave with it and `acknowledgeLocalData` is not true. The standbys that the server hosts are
+        relocated by the step `Relocate the standbys hosted on the server`: the server is taken out of the ring of the standbys, the reconcile of the standbys
+        places the replacements on the other servers before it removes the old ones, and the step waits until none is left (the groups are listed by
+        `previewServerDrain`, `standbyShardGroupIds`); when another server cannot take them the task fails with `replicas_cannot_be_kept` unless `acceptFewerReplicas`.
+        A server that runs the primary of the map group is refused (this revision has no hand-over of the map group). Needs `kingres_ops`.
+      tags: [Servers]
+      x-required-role: kingres_ops
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DrainRequest' }
+            examples:
+              drainAndRemove: { value: { removeWhenDone: true } }
+      responses:
+        '202': { $ref: '#/components/responses/AcceptedTask' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /servers/{serverId}/drain-preview:
+    parameters:
+      - $ref: '#/components/parameters/ServerId'
+    get:
+      operationId: previewServerDrain
+      summary: Preview the drain of a server
+      description: |
+        Added in 0.16.0. What `drainServer` would do now and what stands in its way, without changing anything: the moves (the plan
+        of `previewRebalancePlan` with the server excluded and `drainOnly`), their bytes, the groups whose standby runs on the server,
+        whether the replica count can be kept on the servers that remain, the databases in which the server holds ordinary tables that
+        leave with it, and the blockers (each with the problem code `drainServer` would answer). 404 for an unknown server.
+      tags: [Servers]
+      x-required-role: kingres_readonly
+      responses:
+        '200':
+          description: The preview.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DrainPreview' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /servers/{serverId}/certificates/renewals:
     parameters:
       - $ref: '#/components/parameters/ServerId'
@@ -1495,6 +1567,161 @@ paths:
         '405': { $ref: '#/components/responses/MethodNotAllowed' }
         '422': { $ref: '#/components/responses/UnprocessableEntity' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /databases/{databaseName}/schemas:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+    get:
+      operationId: listSchemas
+      summary: List the schemas of a database
+      description: |
+        Added in 0.16.0. Every schema of the database that is not a system schema, ordered by name, with its distribution: a distributed schema
+        lives in one shard group (`distribution` not null), a local one does not (`distribution` null; also in a database without sharding).
+        `sizeBytes` is known for a distributed schema only (null is "not available", never 0). Schema names can be any text: show them as text.
+        Filters: `distributed`, `shardGroupId`, `state`.
+      tags: [Schemas]
+      x-required-role: kingres_readonly
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: distributed
+          in: query
+          required: false
+          description: Only distributed (true) or only local (false) schemas.
+          schema: { type: boolean }
+        - name: shardGroupId
+          in: query
+          required: false
+          description: Only the schemas that live in this shard group.
+          schema: { type: integer, format: int32 }
+        - name: state
+          in: query
+          required: false
+          description: Only distributed schemas in this state.
+          schema: { type: string, enum: [active, moving] }
+      responses:
+        '200':
+          description: A page of schemas.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SchemaPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /databases/{databaseName}/schemas/{schemaName}:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+      - $ref: '#/components/parameters/SchemaName'
+    get:
+      operationId: getSchema
+      summary: Get a schema
+      description: |
+        Added in 0.16.0. The summary of the schema, the objects that keep a local schema from being distributed (`distributionBlockers`, from
+        `kingres.schema_inventory`), why a distributed schema cannot move or become local (`pinned`, for example a ledger table), the task of a
+        move that is running (`moveInProgress`) and the tables that have no primary key and no replica identity (a move needs one of them).
+      tags: [Schemas]
+      x-required-role: kingres_readonly
+      responses:
+        '200':
+          description: The schema.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SchemaDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /databases/{databaseName}/schemas/{schemaName}/distribution:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+      - $ref: '#/components/parameters/SchemaName'
+    put:
+      operationId: distributeSchema
+      summary: Distribute a schema
+      description: |
+        Added in 0.16.0. Makes a local schema a distributed one: the data stays where it is (on the server that runs the map group primary, or on the
+        group named in `shardGroupId` while no table holds a row), the other servers receive empty tables, and every statement on the schema is then
+        routed to its group. Returns a task of kind `schema.distribute` (subject type `schema`, id `database/schema`). Refused with 409 `conflict` for a schema
+        that is distributed already or a database whose sharding mode is `row`, and with 422 `schema_not_distributable` (the objects in `errors`, `field`
+        the object and `message` its kind and reason) for a schema with unsupported objects. `setReplicaIdentityFull` makes the tables without a key movable.
+        Needs `kingres_admin`.
+      tags: [Schemas]
+      x-required-role: kingres_admin
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DistributeSchemaRequest' }
+      responses:
+        '202': { $ref: '#/components/responses/AcceptedTask' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+    delete:
+      operationId: undistributeSchema
+      summary: Make a distributed schema local
+      description: |
+        Added in 0.16.0. The way back: the schema stays on its group as a local schema and every other server drops its empty tables. With
+        `shardGroupId` the schema is moved to that group first. Returns a task of kind `schema.undistribute`. Refused with 409 `schema_pinned` (a ledger table),
+        `schema_move_in_progress` and `conflict` (the schema is local). Needs `kingres_admin`.
+      tags: [Schemas]
+      x-required-role: kingres_admin
+      parameters:
+        - name: shardGroupId
+          in: query
+          required: false
+          description: Move the schema to this group first.
+          schema: { type: integer, format: int32 }
+      responses:
+        '202': { $ref: '#/components/responses/AcceptedTask' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /databases/{databaseName}/schemas/{schemaName}/moves:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+      - $ref: '#/components/parameters/SchemaName'
+    post:
+      operationId: moveSchema
+      summary: Move a distributed schema to another shard group
+      description: |
+        Added in 0.16.0. Moves the data of the schema to the target group while the schema stays in service (`kingres.move_schema`); writers of the schema wait
+        for the switch only. Returns a task of kind `schema.move` with the steps `Check the move`, `Copy the data` (the detail shows the phase), `Switch` and
+        `Clean up the old copy` (the task does not wait for the old copy to be emptied). A cancel is accepted until the switch has started. A failed or cancelled move leaves the
+        schema active on its group. Refused with 409 `rebalance_in_progress`, `schema_move_in_progress`, `schema_pinned`, `conflict` (the schema is local); 422 `unprocessable` for a target
+        that does not exist, should not hold shards or is the current group, and for tables without a key unless `setReplicaIdentityFull`. Needs `kingres_ops`.
+      tags: [Schemas]
+      x-required-role: kingres_ops
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MoveSchemaRequest' }
+      responses:
+        '202': { $ref: '#/components/responses/AcceptedTask' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /databases/{databaseName}/schemas/{schemaName}/tables/{tableName}:
     parameters:
       - $ref: '#/components/parameters/DatabaseName'
@@ -1874,9 +2101,15 @@ paths:
     get:
       operationId: listColocationGroups
       summary: List colocation groups
-      description: Colocation groups of a sharded database. Tables in one group share one bucket map. Not paginated.
+      description: Colocation groups of a sharded database. Tables in one group share one bucket map. Not paginated. Since 0.16.0 the query `kind` (`hash` or `schema`) selects one kind (the Shards page asks for `hash`, so that the one-bucket groups of thousands of distributed schemas do not swamp it).
       tags: [Shards]
       x-required-role: kingres_readonly
+      parameters:
+        - name: kind
+          in: query
+          required: false
+          description: Added in 0.16.0. Only the groups of this kind.
+          schema: { type: string, enum: [hash, schema] }
       responses:
         '200':
           description: Colocation groups.
@@ -1888,10 +2121,85 @@ paths:
                   value:
                     items:
                       - { colocationId: 1, bucketCount: 128, distributionColumnType: bigint, tableCount: 5, sizeBytes: 2147483648 }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /databases/{databaseName}/colocation-groups/{colocationId}/buckets/{bucket}/split-preview:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+      - $ref: '#/components/parameters/ColocationId'
+      - $ref: '#/components/parameters/BucketNumber'
+    post:
+      operationId: previewBucketSplit
+      summary: Preview the split of a bucket
+      description: |
+        Added in 0.16.0. What `splitBucket` would make of the bucket and what stands in its way, without changing anything: the new
+        buckets (number, modulus, remainder), the estimated size of each, the disk the owning server (and its standbys) needs until the
+        old partitions are dropped, and the blockers, each with the problem code `splitBucket` would answer (`bucket_busy` for a bucket
+        that moves or splits, `group_degraded`, `insufficient_disk`, `split_unsupported`). A table without a primary key is refused
+        by the sharding extension when the split starts, not here (the control plane cannot read the owner's tables): the task then
+        fails with `split_unsupported`. 404 for an unknown database, colocation group or bucket.
+      tags: [Shards]
+      x-required-role: kingres_readonly
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BucketSplitRequest' }
+      responses:
+        '200':
+          description: The preview.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BucketSplitPreview' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /databases/{databaseName}/colocation-groups/{colocationId}/buckets/{bucket}/split:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+      - $ref: '#/components/parameters/ColocationId'
+      - $ref: '#/components/parameters/BucketNumber'
+    post:
+      operationId: splitBucket
+      summary: Split a bucket
+      description: |
+        Added in 0.16.0. Replaces the bucket, in every table of its colocation group, by `parts` (2, 4, 8 or 16) buckets of a modulus
+        `parts` times larger, on the shard group that owns it (`kingres.split_bucket`): the new buckets are `bucket + i * modulus`
+        for `i` from 0 (the bucket keeps its number for 0), `ColocationGroup.maxModulus` goes up and the bucket map has `parts - 1`
+        rows more. The children stay on the group; move them apart afterwards with a rebalance. Writers of the group's tables wait for
+        the switch only (bounded by `kingres_shard.move_switch_timeout`); readers go on. A split cannot be undone (there is no merge),
+        which is why it needs `kingres_admin`. One split at a time per colocation group. Returns a task of kind `bucket.split`
+        (subject type `bucket`, id `database/colocationId/bucket`) with the steps `Check that the split can start`, `Split the
+        bucket` (the detail shows the phase and the rows copied) and `Check the new buckets`; the old partitions are dropped by
+        the extension after `move_cleanup_delay` and the task does not wait for that. Cancelling the task cancels a split that has not
+        reached its switch. Refused with the problem of the first blocker of `previewBucketSplit` (409 `bucket_busy`, `group_degraded`,
+        `insufficient_disk`; 422 `split_unsupported`).
+      tags: [Shards]
+      x-required-role: kingres_admin
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BucketSplitRequest' }
+            examples:
+              four: { value: { parts: 4 } }
+      responses:
+        '202': { $ref: '#/components/responses/AcceptedTask' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
         '422': { $ref: '#/components/responses/UnprocessableEntity' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /databases/{databaseName}/colocation-groups/{colocationId}/buckets:
@@ -4831,6 +5139,12 @@ components:
       required: true
       description: Colocation group identifier.
       schema: { type: integer, format: int32 }
+    BucketNumber:
+      name: bucket
+      in: path
+      required: true
+      description: Bucket number.
+      schema: { type: integer, format: int32, minimum: 0 }
     RoleName:
       name: roleName
       in: path
@@ -5180,6 +5494,13 @@ components:
         - group_degraded
         - insufficient_disk
         - no_receiving_server
+        - replicas_cannot_be_kept
+        - sharding_mode_in_use
+        - schema_not_distributable
+        - schema_pinned
+        - schema_move_in_progress
+        - bucket_busy
+        - split_unsupported
         - failover_needs_decision
         - lease_settings_differ
         - ledger_not_published
@@ -6398,6 +6719,11 @@ components:
         shouldHaveShards:
           type: boolean
           description: Whether rebalance may place buckets on this server; false drains it.
+        weight:
+          type: number
+          exclusiveMinimum: 0
+          maximum: 1000
+          description: 'Added in 0.16.0, optional (absent when the sharding extension has no weights). The capacity of the server relative to the others (default 1).'
         isManagerLeader:
           type: boolean
           description: Whether the active manager runs here.
@@ -6562,7 +6888,7 @@ components:
     ServerUpdateRequest:
       type: object
       description: |
-        Partial update of a server. Only these two members exist; every other property of `Server` is
+        Partial update of a server. Only these three members exist (`weight` since 0.16.0); every other property of `Server` is
         read-only and is refused with 400 `validation_failed`.
       minProperties: 1
       additionalProperties: false
@@ -6575,6 +6901,11 @@ components:
         shouldHaveShards:
           type: boolean
           description: False excludes the server from bucket placement at the next rebalance.
+        weight:
+          type: number
+          exclusiveMinimum: 0
+          maximum: 1000
+          description: 'Added in 0.16.0. The capacity of the server relative to the others (default 1): a server of weight 2 receives twice the buckets, or bytes, of one of weight 1. A change is written to every node of the server and shows at the next rebalance; it needs the sharding extension 0.8 (422 `unsupported_operation` otherwise).'
     FailoverRequest:
       type: object
       description: Failover options. Members after `mode` were added in 0.10.0 and are optional.
@@ -7009,12 +7340,21 @@ components:
             - 'null'
           minimum: 1
           maximum: 4096
-          description: Number of hash buckets per colocation group. Fixed at creation (immutable). Null when not available.
+          description: Number of hash buckets per colocation group. Fixed at creation (immutable). Null when not available, and in mode `schema`.
           x-immutable: true
+        mode:
+          $ref: '#/components/schemas/ShardingMode'
+        distributeNewSchemas:
+          type: boolean
+          description: Added in 0.16.0, optional. Whether a schema created in the database is placed on a shard group by itself.
+    ShardingMode:
+      type: string
+      description: 'Added in 0.16.0. How tables are sharded: `row` (the default; a table is split into buckets by a column), `schema` (each schema lives in one shard group) or `both`. Clients must tolerate other values.'
+      enum: [row, schema, both]
     ShardingCreateSettings:
       type: object
       description: Sharding settings of a create request. A group that is present must be complete.
-      required: [enabled, bucketCount]
+      required: [enabled]
       properties:
         enabled:
           type: boolean
@@ -7025,8 +7365,14 @@ components:
           minimum: 1
           maximum: 4096
           default: 128
-          description: Number of hash buckets per colocation group, 1 to 4096, default 128. Fixed at creation (immutable).
+          description: Number of hash buckets per colocation group, 1 to 4096, default 128. Fixed at creation (immutable). Optional since 0.16.0 (it was required) and ignored in mode `schema`.
           x-immutable: true
+        mode:
+          $ref: '#/components/schemas/ShardingMode'
+        distributeNewSchemas:
+          type: boolean
+          default: false
+          description: Added in 0.16.0. Place every schema created in the database on a shard group. Only with mode `schema` or `both`.
     ReplicationSettings:
       type: object
       description: Replication settings as read back (response only; the create request uses `ReplicationCreateSettings`).
@@ -7087,6 +7433,12 @@ components:
       description: Live statistics of a database. A statistic the backend cannot measure is null ("not available"), never 0.
       required: [sizeBytes, tableCount, activeConnections, transactionsPerSecond]
       properties:
+        distributedSchemaCount:
+          type:
+            - integer
+            - 'null'
+          minimum: 0
+          description: Added in 0.16.0, optional. Distributed schemas; null when not available.
         sizeBytes:
           type:
             - integer
@@ -7239,12 +7591,18 @@ components:
         sharding:
           type: object
           description: Sharding changes.
-          required: [enabled]
+          minProperties: 1
+          additionalProperties: false
           properties:
             enabled:
               type: boolean
               enum: [true]
               description: Turn sharding on. Turning it off is not possible.
+            mode:
+              $ref: '#/components/schemas/ShardingMode'
+            distributeNewSchemas:
+              type: boolean
+              description: 'Added in 0.16.0. Default for new schemas. Changing the mode is synchronous (200); it is refused with 409 `sharding_mode_in_use` while schemas or tables of the other kind exist.'
         replication:
           type: object
           description: Replication changes.
@@ -7283,6 +7641,12 @@ components:
       description: What the create-database dialog offers.
       required: [encodings, collations, bucketCount, replicaCount, defaultDurability, ledgerDigestIntervalSeconds]
       properties:
+        shardingModes:
+          type: array
+          description: Added in 0.16.0, optional. The values of `sharding.mode`.
+          items: { $ref: '#/components/schemas/ShardingMode' }
+        shardingModeDefault:
+          $ref: '#/components/schemas/ShardingMode'
         encodings:
           type: array
           description: Valid values of `general.encoding`.
@@ -7348,8 +7712,8 @@ components:
       properties:
         method:
           type: string
-          enum: [hash, reference]
-          description: '`hash` distributes rows by hash of the column; `reference` copies the table to every group.'
+          enum: [hash, reference, schema]
+          description: '`hash` distributes rows by hash of the column; `reference` copies the table to every group; `schema` (0.16.0) the table belongs to a distributed schema and lives in its one group. Clients must tolerate other values.'
         column:
           type:
             - string
@@ -7724,8 +8088,225 @@ components:
     # ------------------------------------------------------------------ shards
     BucketState:
       type: string
-      description: '`active` normal; `moving` being copied to another group; `orphan` left-over shard awaiting deferred cleanup.'
-      enum: [active, moving, orphan]
+      description: '`active` normal; `moving` being copied to another group; `orphan` left-over shard awaiting deferred cleanup; `splitting` (0.16.0) being replaced by buckets of a larger modulus. Clients must tolerate other values.'
+      enum: [active, moving, orphan, splitting]
+    SchemaDistribution:
+      type: object
+      description: Where a distributed schema lives.
+      required: [state, colocationId, shardGroupId, serverId, movingToShardGroupId]
+      properties:
+        state:
+          type: string
+          description: '`active` or `moving`. Clients must tolerate other values.'
+        colocationId:
+          type: integer
+          format: int32
+          description: The colocation group of the schema (one bucket).
+        shardGroupId:
+          type: integer
+          format: int32
+          description: The shard group that holds the schema.
+        serverId:
+          oneOf:
+            - $ref: '#/components/schemas/ServerId'
+            - type: 'null'
+          description: The server that runs the primary of the group; null when it has none.
+        movingToShardGroupId:
+          type:
+            - integer
+            - 'null'
+          format: int32
+          description: The target of a running move.
+    SchemaSummary:
+      type: object
+      description: One schema of a database.
+      required: [name, owner, distribution, tableCount, sizeBytes, estimatedRows]
+      properties:
+        name:
+          type: string
+          description: Schema name; any text.
+        owner:
+          type: string
+          description: Owner role.
+        distribution:
+          oneOf:
+            - $ref: '#/components/schemas/SchemaDistribution'
+            - type: 'null'
+          description: Null for a local schema.
+        tableCount:
+          type: integer
+          minimum: 0
+          description: Tables (partitions not counted).
+        sizeBytes:
+          type:
+            - integer
+            - 'null'
+          format: int64
+          minimum: 0
+          description: Bytes of the tables of a distributed schema; null when not available.
+        estimatedRows:
+          type:
+            - integer
+            - 'null'
+          format: int64
+          minimum: 0
+          description: The planner's estimate of the rows; null when not available.
+    SchemaBlocker:
+      type: object
+      description: An object that keeps a schema from being distributed.
+      required: [objectKind, objectName, reason]
+      properties:
+        objectKind:
+          type: string
+          description: Kind of the object.
+        objectName:
+          type: string
+          description: Name of the object.
+        reason:
+          type: string
+          description: Why it is not supported.
+    SchemaDetail:
+      description: A schema with what stands in the way of distributing or moving it.
+      allOf:
+        - $ref: '#/components/schemas/SchemaSummary'
+        - type: object
+          required: [distributionBlockers, pinned, moveInProgress, tablesWithoutReplicaIdentity]
+          properties:
+            distributionBlockers:
+              type: array
+              description: For a local schema, the unsupported objects; empty when it can be distributed.
+              items: { $ref: '#/components/schemas/SchemaBlocker' }
+            pinned:
+              oneOf:
+                - type: object
+                  description: Why the schema cannot move or become local.
+                  required: [reason]
+                  properties:
+                    reason:
+                      type: string
+                      description: The reason, for example a ledger table.
+                - type: 'null'
+              description: Null when nothing pins the schema.
+            moveInProgress:
+              type:
+                - integer
+                - 'null'
+              format: int64
+              description: The task of a move that is running.
+            tablesWithoutReplicaIdentity:
+              type: array
+              description: Tables with no primary key and no replica identity; a move needs one of them (`setReplicaIdentityFull` makes them movable).
+              items: { type: string }
+    SchemaPage:
+      type: object
+      description: A page of schemas.
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          description: Schemas, ordered by name.
+          items: { $ref: '#/components/schemas/SchemaSummary' }
+        nextCursor:
+          $ref: '#/components/schemas/NextCursor'
+    DistributeSchemaRequest:
+      type: object
+      description: Added in 0.16.0. Body of `distributeSchema`; every member is optional.
+      additionalProperties: false
+      properties:
+        shardGroupId:
+          type:
+            - integer
+            - 'null'
+          format: int32
+          description: The group that holds the schema; null or absent keeps the data where it is.
+        setReplicaIdentityFull:
+          type: boolean
+          default: false
+          description: Set REPLICA IDENTITY FULL on the tables that have no key, so that the schema can be moved later.
+    MoveSchemaRequest:
+      type: object
+      description: Added in 0.16.0. Body of `moveSchema`.
+      required: [targetShardGroupId]
+      additionalProperties: false
+      properties:
+        targetShardGroupId:
+          type: integer
+          format: int32
+          description: The group the schema moves to.
+        setReplicaIdentityFull:
+          type: boolean
+          default: false
+          description: Set REPLICA IDENTITY FULL on the tables that have no key (required to go on when there are any).
+    BucketSplitRequest:
+      type: object
+      description: Added in 0.16.0. Body of `splitBucket` and `previewBucketSplit`; every member is optional.
+      additionalProperties: false
+      properties:
+        parts:
+          type: integer
+          enum: [2, 4, 8, 16]
+          default: 2
+          description: Into how many buckets the bucket is split.
+        verify:
+          type: string
+          enum: [count, none]
+          default: count
+          description: How the extension checks the copy before the switch; `count` compares the row count of every old partition with its children, `none` trusts the triggers that kept the children current.
+    BucketSplitChild:
+      type: object
+      description: One bucket a split makes.
+      required: [bucket, modulus, remainder, estimatedSizeBytes]
+      properties:
+        bucket:
+          type: integer
+          minimum: 0
+          description: Bucket number (equal to `remainder`).
+        modulus:
+          type: integer
+          minimum: 1
+          description: The modulus of the new bucket.
+        remainder:
+          type: integer
+          minimum: 0
+          description: The remainder of the hash modulo `modulus` that the bucket holds.
+        estimatedSizeBytes:
+          type:
+            - integer
+            - 'null'
+          format: int64
+          minimum: 0
+          description: A share of the size of the bucket; null when the size is not known.
+    BucketSplitPreview:
+      type: object
+      description: Added in 0.16.0. What a split would make and what stands in its way.
+      required: [canSplit, parts, children, estimatedSizeBytes, extraDiskBytes, blockers]
+      properties:
+        canSplit:
+          type: boolean
+          description: True when no blocker exists.
+        parts:
+          type: integer
+          description: The parts asked for (default 2).
+        children:
+          type: array
+          description: The buckets the split makes, the first with the number of the bucket.
+          items: { $ref: '#/components/schemas/BucketSplitChild' }
+        estimatedSizeBytes:
+          type:
+            - integer
+            - 'null'
+          format: int64
+          description: The size of the bucket over the tables of its group; null when not known.
+        extraDiskBytes:
+          type:
+            - integer
+            - 'null'
+          format: int64
+          description: Disk the owning server, and each standby of its group, needs until the old partitions are dropped (about the size of the bucket).
+        blockers:
+          type: array
+          description: What stands in the way; empty when `canSplit`.
+          items: { $ref: '#/components/schemas/DrainBlocker' }
     ColocationGroup:
       type: object
       description: Tables that share one bucket map.
@@ -7753,6 +8334,22 @@ components:
           format: int64
           minimum: 0
           description: Size of the group's data (primary copies); null when not available.
+        baseBucketCount:
+          type: integer
+          minimum: 1
+          description: Added in 0.16.0, optional. The number of buckets the group was made with; `bucketCount` is the current number, which a split raises.
+        maxModulus:
+          type: integer
+          minimum: 1
+          description: Added in 0.16.0, optional. The greatest modulus of a bucket of the group (the base count until a split).
+        kind:
+          type: string
+          description: 'Added in 0.16.0, optional. `hash` (the buckets of hash-distributed tables) or `schema` (one bucket: the group that holds one distributed schema). Clients must tolerate other values.'
+        schemaName:
+          type:
+            - string
+            - 'null'
+          description: Added in 0.16.0, optional. The distributed schema of a `schema` group; null for a `hash` group. A name can be any text, so show it as text.
     ColocationGroupList:
       type: object
       description: Colocation groups of a database.
@@ -7771,6 +8368,14 @@ components:
           type: integer
           minimum: 0
           description: 'Bucket number: `hash(key)` reduced to the number of buckets of the colocation group (`ColocationGroup.bucketCount`) by the sharding extension''s own hash function, which is not PostgreSQL''s `hashtext` followed by a modulo; use `kingres.bucket_for` to find the bucket of a value.'
+        modulus:
+          type: integer
+          minimum: 1
+          description: Added in 0.16.0, optional. The modulus of the bucket (it holds the hashes whose remainder modulo `modulus` is `remainder`); equal to the base bucket count until a split.
+        remainder:
+          type: integer
+          minimum: 0
+          description: Added in 0.16.0, optional. Equal to `bucket`.
         shardGroupId:
           type: integer
           format: int32
@@ -8025,6 +8630,129 @@ components:
           minimum: 1
           maximum: 64
           description: Concurrent bucket moves; defaults to 1 when omitted and is recorded as sent (or 1). **This version runs one move at a time** whatever the value (0.9.0).
+        strategy:
+          $ref: '#/components/schemas/RebalanceStrategy'
+        threshold:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: 'Added in 0.16.0. The largest deviation of a server from the ideal load that is accepted: nothing moves while every server is within it. Default: the cluster setting, else 0 by `byBucketCount` and 0.1 by `byDiskSize`. The answer shows the value used.'
+        drainOnly:
+          type: boolean
+          description: 'Added in 0.16.0. Move only the buckets off servers that should not hold shards (`shouldHaveShards` false); nothing else is balanced.'
+        maxMovesPerServer:
+          type: integer
+          minimum: 1
+          maximum: 16
+          description: 'Added in 0.16.0. Moves that may involve one server as source or target at once. Default: the cluster setting (2).'
+        acknowledgeFailures:
+          type: boolean
+          description: 'Added in 0.16.0. Clears the suspension that failed moves of an earlier run left (a manual start acknowledges them anyway).'
+        cleanupDelaySeconds:
+          type: integer
+          minimum: 0
+          maximum: 86400
+          description: 'Added in 0.16.0. Overrides, for this run, the delay before the source copy of a moved bucket is dropped.'
+    DrainRequest:
+      type: object
+      description: Added in 0.16.0. Body of `drainServer`; every member is optional.
+      additionalProperties: false
+      properties:
+        removeWhenDone:
+          type: boolean
+          default: false
+          description: Remove the server (the task of `removeServer`) when it owns no bucket. Made after the drain task has ended; if the manager restarts in between, the server stays drained and the operator removes it.
+        maxConcurrentMoves:
+          type: integer
+          minimum: 1
+          maximum: 64
+          description: Concurrent moves (see `RebalanceOptions`).
+        acceptFewerReplicas:
+          type: boolean
+          default: false
+          description: Go on although fewer servers than `replicaCount + 1` would remain.
+        acknowledgeLocalData:
+          type: boolean
+          default: false
+          description: Go on although the server holds ordinary tables whose data leaves with it.
+    DrainBlocker:
+      type: object
+      description: Something that stands in the way of a drain.
+      required: [code, detail]
+      properties:
+        code:
+          type: string
+          description: The problem code `drainServer` would answer with (`last_server`, `no_receiving_server`, `server_hosts_map_group`, `replicas_cannot_be_kept`, `group_degraded`, `node_state_invalid`). Clients must tolerate other values.
+        detail:
+          type: string
+          description: What is wrong.
+    DrainPreview:
+      type: object
+      description: Added in 0.16.0. What a drain would do now.
+      required: [serverId, canDrain, moveCount, totalBytes, moves, standbyShardGroupIds, canKeepReplicas, localData, blockers, warnings]
+      properties:
+        serverId:
+          $ref: '#/components/schemas/ServerId'
+        canDrain:
+          type: boolean
+          description: True when no blocker exists.
+        strategy:
+          $ref: '#/components/schemas/RebalanceStrategy'
+        moveCount:
+          type: integer
+          minimum: 0
+          description: Moves of the plan.
+        totalBytes:
+          type:
+            - integer
+            - 'null'
+          format: int64
+          minimum: 0
+          description: Bytes to copy; null when sizes are not available.
+        moves:
+          type: array
+          description: The first moves of the plan (at most 200).
+          items: { $ref: '#/components/schemas/PlannedMove' }
+        standbyShardGroupIds:
+          type: array
+          description: The groups whose standby instance runs on the server. This revision does not relocate them.
+          items: { type: integer, format: int32 }
+        canKeepReplicas:
+          type: boolean
+          description: Whether the servers that remain are enough for the replica count (no server may hold two instances of a group).
+        localData:
+          type: array
+          description: Databases in which the server holds ordinary tables; their data leaves with the server.
+          items:
+            type: object
+            description: One database.
+            required: [databaseName, tableCount, sizeBytes]
+            properties:
+              databaseName:
+                type: string
+                description: Database.
+              tableCount:
+                type: integer
+                minimum: 0
+                description: Ordinary tables.
+              sizeBytes:
+                type:
+                  - integer
+                  - 'null'
+                format: int64
+                description: Their size; null when not known.
+        blockers:
+          type: array
+          description: What stands in the way; empty when `canDrain`.
+          items: { $ref: '#/components/schemas/DrainBlocker' }
+        warnings:
+          type: array
+          description: Conditions to know about (see `RebalancePlan.warnings`).
+          items: { type: string }
+    RebalanceStrategy:
+      type: string
+      description: 'Added in 0.16.0. How a bucket is counted: `byBucketCount` every bucket counts 1; `byDiskSize` a bucket counts its bytes (at least 1 MiB). Clients must tolerate other values.'
+      enum: [byBucketCount, byDiskSize]
     RebalancePlanRequest:
       description: Options of a plan preview.
       allOf:
@@ -8037,6 +8765,10 @@ components:
               maximum: 5000
               default: 200
               description: Maximum number of moves listed in the response.
+            excludeServerIds:
+              type: array
+              description: 'Added in 0.16.0. Plan as if these servers should not hold shards: the preview of a drain.'
+              items: { $ref: '#/components/schemas/ServerId' }
     PlannedMove:
       type: object
       description: One bucket move of a plan.
@@ -8079,6 +8811,22 @@ components:
           minimum: 0
           maximum: 1000
           description: Priority from 0 to 1000; higher moves run earlier.
+        kind:
+          type: string
+          description: 'Added in 0.16.0, optional. `move` (the default) or `schema`: a unit of the plan that is a distributed schema. The extension does not plan schemas yet; a panel shows them when a server sends them.'
+        schemaName:
+          type:
+            - string
+            - 'null'
+          description: Added in 0.16.0, optional. The schema, for kind `schema`.
+        cost:
+          type: integer
+          format: int64
+          minimum: 0
+          description: 'Added in 0.16.0, optional. What the plan counted for the bucket: 1 by `byBucketCount`, its bytes by `byDiskSize`.'
+        reason:
+          type: string
+          description: 'Added in 0.16.0, optional. `balance` or `drain` (a move off a server that should not hold shards). Clients must tolerate other values.'
     RebalancePlan:
       type: object
       description: A rebalance plan preview.
@@ -8134,10 +8882,25 @@ components:
                 type: integer
                 minimum: 0
                 description: Primary buckets after the plan.
+              loadBefore:
+                type: number
+                description: Added in 0.16.0, optional. The load of the server by the strategy now (buckets, or bytes).
+              loadAfter:
+                type: number
+                description: Added in 0.16.0, optional. The load after the plan.
         warnings:
           type: array
-          description: Conditions the operator should know about, for example tables without a replica identity.
+          description: 'Conditions the operator should know about, for example tables without a replica identity. Since 0.16.0 also `groupUnavailable: ...` for a shard group without a primary, whose buckets are not planned.'
           items: { type: string }
+        strategy:
+          $ref: '#/components/schemas/RebalanceStrategy'
+        threshold:
+          type: number
+          description: Added in 0.16.0, optional. The threshold the plan used.
+        imbalance:
+          type: number
+          minimum: 0
+          description: Added in 0.16.0, optional. The largest deviation of a server from the ideal load now (0.1 is 10 percent); the plan brings every server within `threshold`.
     BucketMove:
       type: object
       description: A bucket move in flight.
@@ -8168,6 +8931,14 @@ components:
         toServerId:
           type: string
           description: Added in 0.9.0, optional. The server that runs the primary of the destination group.
+        kind:
+          type: string
+          description: 'Added in 0.16.0, optional. What moves: `move` (a bucket, the default), `split` (a bucket is being split) or `schema` (a distributed schema, one bucket of its own group). Clients must tolerate other values.'
+        schemaName:
+          type:
+            - string
+            - 'null'
+          description: Added in 0.16.0, optional. The schema, for kind `schema`; a name can be any text, so show it as text.
         phase:
           type: string
           enum: [prepare, copy, catchUp, switch, cleanup]
@@ -8279,6 +9050,16 @@ components:
             - $ref: '#/components/schemas/RebalanceReportSummary'
             - type: 'null'
           description: Summary of the most recent finished or failed run other than the current one, so the page can show what happened last while `progress` is null; null when no run has finished yet.
+        strategy:
+          $ref: '#/components/schemas/RebalanceStrategy'
+        threshold:
+          type: number
+          description: Added in 0.16.0, optional. The threshold of the current run.
+        trigger:
+          type: string
+          description: 'Added in 0.16.0, optional. What started the current run: `manual`, `automatic` or `drain`. Clients must tolerate other values.'
+        automatic:
+          $ref: '#/components/schemas/RebalanceAutomaticStatus'
     RebalanceReportSummary:
       type: object
       description: Summary of one rebalance run.
@@ -8302,6 +9083,14 @@ components:
           description: End time.
         options:
           $ref: '#/components/schemas/RebalanceOptions'
+        trigger:
+          type: string
+          description: 'Added in 0.16.0, optional. `manual`, `automatic` or `drain`.'
+        strategy:
+          $ref: '#/components/schemas/RebalanceStrategy'
+        threshold:
+          type: number
+          description: Added in 0.16.0, optional. The threshold the run used.
         stoppedBy:
           type:
             - string
@@ -8394,6 +9183,9 @@ components:
                     type: integer
                     minimum: 0
                     description: Added in 0.9.0, optional. How many times the move was tried.
+                  reason:
+                    type: string
+                    description: 'Added in 0.16.0, optional. `balance` or `drain`.'
                   skipReason:
                     type:
                       - string
@@ -8468,6 +9260,10 @@ components:
         - database.drop
         - table.distribute
         - rebalance
+        - bucket.split
+        - schema.distribute
+        - schema.move
+        - schema.undistribute
         - replication.restorePreferredPrimaries
         - ledger.verify
         - networkAccess.apply
@@ -8580,7 +9376,7 @@ components:
       properties:
         type:
           type: string
-          enum: [cluster, server, instance, database, table, rebalance, replication, ledgerVerification, networkAccess, config, ledgerKey]
+          enum: [cluster, server, instance, database, table, rebalance, replication, ledgerVerification, networkAccess, config, ledgerKey, bucket, schema]
           description: Resource type.
         id:
           type: string
@@ -9103,6 +9899,12 @@ components:
         - attachTablePartition
         - detachTablePartition
         - dropTablePartition
+        - drainServer
+        - splitBucket
+        - previewBucketSplit
+        - distributeSchema
+        - undistributeSchema
+        - moveSchema
     AuditEvent:
       type: object
       description: One audit log entry.
@@ -9247,7 +10049,7 @@ components:
               items: { $ref: '#/components/schemas/ServerId' }
     RebalanceSettings:
       type: object
-      description: Rebalance defaults.
+      description: Rebalance defaults. The members after `maxConcurrentMoves` were added in 0.16.0 and are optional (an older server omits them).
       required: [maxConcurrentMoves]
       properties:
         maxConcurrentMoves:
@@ -9256,6 +10058,237 @@ components:
           maximum: 64
           default: 4
           description: Default number of concurrent bucket moves.
+        strategy:
+          $ref: '#/components/schemas/RebalanceStrategy'
+        threshold:
+          type:
+            - number
+            - 'null'
+          minimum: 0
+          maximum: 1
+          description: Default threshold; null takes the strategy's own (0, or 0.1 by `byDiskSize`).
+        maxMovesPerServer:
+          type: integer
+          minimum: 1
+          maximum: 16
+          default: 2
+          description: Moves that may involve one server at once.
+        maxMoveAttempts:
+          type: integer
+          minimum: 1
+          maximum: 20
+          default: 3
+          description: How often a failed move is tried in one run; then the run fails with the move reported.
+        maxDiskUsedFraction:
+          type: number
+          minimum: 0.5
+          maximum: 0.99
+          default: 0.85
+          description: A move is not started when the data volume of the target, or of a server that hosts a standby of the target, would be fuller than this.
+        maxStandbyLagBytes:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 67108864
+          description: A standby that lags by more than this makes its group degraded for the safety rules.
+        automatic:
+          $ref: '#/components/schemas/RebalanceAutomaticSettings'
+    RebalanceWindow:
+      type: object
+      description: Added in 0.16.0. A time of day; `from` later than `to` wraps over midnight.
+      required: [from, to, timeZone]
+      properties:
+        from:
+          type: string
+          pattern: '^([01][0-9]|2[0-3]):[0-5][0-9]$'
+          description: Start, HH:MM.
+        to:
+          type: string
+          pattern: '^([01][0-9]|2[0-3]):[0-5][0-9]$'
+          description: End, HH:MM.
+        timeZone:
+          type: string
+          description: IANA time zone name.
+    RebalanceAutomaticSettings:
+      type: object
+      description: Added in 0.16.0. The automatic mode (role `kingres_admin` to change). It runs on the manager leader, is off by default and never starts while a safety rule fails (a failover, a group without a healthy standby or a primary, a server that is not live, a failed earlier move, an inconsistent cluster).
+      required: [enabled, strategy, threshold, checkIntervalSeconds, settleSeconds, settleAfterTopologySeconds, minIntervalSeconds, failoverSettleSeconds, window]
+      properties:
+        enabled:
+          type: boolean
+          description: Whether the manager starts a rebalance by itself. Off by default.
+        strategy:
+          $ref: '#/components/schemas/RebalanceStrategy'
+        threshold:
+          type: number
+          exclusiveMinimum: 0
+          maximum: 1
+          default: 0.15
+          description: The deviation from the ideal load that is worth a run (larger than the manual default so that the mode does not churn).
+        checkIntervalSeconds:
+          type: integer
+          minimum: 5
+          maximum: 86400
+          default: 60
+          description: How often the manager looks.
+        settleSeconds:
+          type: integer
+          minimum: 0
+          maximum: 86400
+          default: 300
+          description: The imbalance must have held this long before a run starts.
+        settleAfterTopologySeconds:
+          type: integer
+          minimum: 0
+          maximum: 86400
+          default: 600
+          description: Seconds to wait after the last change of the servers (a server added or removed, a flag or a weight changed, a failover).
+        minIntervalSeconds:
+          type: integer
+          minimum: 0
+          maximum: 604800
+          default: 3600
+          description: Seconds between the end of one automatic run and the start of the next, except for a new server that waits for a rebalance and a drain flag.
+        failoverSettleSeconds:
+          type: integer
+          minimum: 0
+          maximum: 86400
+          default: 600
+          description: Seconds after a change of a primary during which no run starts.
+        window:
+          oneOf:
+            - $ref: '#/components/schemas/RebalanceWindow'
+            - type: 'null'
+          description: The time of day in which a run may start; null means any time.
+
+    RebalanceAutomaticSettingsUpdate:
+      type: object
+      description: Added in 0.16.0. Partial update of the automatic mode; `window` null removes the window.
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        enabled:
+          type: boolean
+          description: Whether the manager starts a rebalance by itself. Off by default.
+        strategy:
+          $ref: '#/components/schemas/RebalanceStrategy'
+        threshold:
+          type: number
+          exclusiveMinimum: 0
+          maximum: 1
+          default: 0.15
+          description: The deviation from the ideal load that is worth a run (larger than the manual default so that the mode does not churn).
+        checkIntervalSeconds:
+          type: integer
+          minimum: 5
+          maximum: 86400
+          default: 60
+          description: How often the manager looks.
+        settleSeconds:
+          type: integer
+          minimum: 0
+          maximum: 86400
+          default: 300
+          description: The imbalance must have held this long before a run starts.
+        settleAfterTopologySeconds:
+          type: integer
+          minimum: 0
+          maximum: 86400
+          default: 600
+          description: Seconds to wait after the last change of the servers (a server added or removed, a flag or a weight changed, a failover).
+        minIntervalSeconds:
+          type: integer
+          minimum: 0
+          maximum: 604800
+          default: 3600
+          description: Seconds between the end of one automatic run and the start of the next, except for a new server that waits for a rebalance and a drain flag.
+        failoverSettleSeconds:
+          type: integer
+          minimum: 0
+          maximum: 86400
+          default: 600
+          description: Seconds after a change of a primary during which no run starts.
+        window:
+          oneOf:
+            - $ref: '#/components/schemas/RebalanceWindow'
+            - type: 'null'
+          description: The time of day in which a run may start; null means any time.
+
+    RebalanceAutomaticStatus:
+      type: object
+      description: Added in 0.16.0. What the automatic mode did last.
+      required: [enabled, nextCheckAt, lastEvaluation]
+      properties:
+        enabled:
+          type: boolean
+          description: Whether the mode is on.
+        nextCheckAt:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: When the manager looks next; null while the mode is off or has not looked yet.
+        lastEvaluation:
+          oneOf:
+            - type: object
+              description: The last look.
+              required: [at, outcome, blockedBy]
+              properties:
+                at:
+                  type: string
+                  format: date-time
+                  description: When.
+                outcome:
+                  type: string
+                  description: '`started` a run was started; `nothingToDo` the placement is balanced or a run is under way; `blocked` a rule stopped it (see `blockedBy`); `settling` the imbalance is too young or too soon after a change. Clients must tolerate other values.'
+                blockedBy:
+                  type: array
+                  description: 'The rules that held it back: `window`, `failover`, `groupDegraded`, `groupUnavailable`, `servers`, `moveFailed`, `consistency`, `operatorStopped`, `running`.'
+                  items: { type: string }
+            - type: 'null'
+          description: The last look; null before the first one.
+    RebalanceSettingsUpdate:
+      type: object
+      description: 'Added in 0.16.0. Partial update of the rebalance settings; every member is optional but one is needed. `threshold` null takes the strategy default again.'
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        maxConcurrentMoves:
+          type: integer
+          minimum: 1
+          maximum: 64
+          description: Default number of concurrent bucket moves.
+        strategy:
+          $ref: '#/components/schemas/RebalanceStrategy'
+        threshold:
+          type:
+            - number
+            - 'null'
+          minimum: 0
+          maximum: 1
+          description: Default threshold.
+        maxMovesPerServer:
+          type: integer
+          minimum: 1
+          maximum: 16
+          description: Moves that may involve one server at once.
+        maxMoveAttempts:
+          type: integer
+          minimum: 1
+          maximum: 20
+          description: Attempts per move.
+        maxDiskUsedFraction:
+          type: number
+          minimum: 0.5
+          maximum: 0.99
+          description: Disk limit of a move.
+        maxStandbyLagBytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Standby lag limit.
+        automatic:
+          $ref: '#/components/schemas/RebalanceAutomaticSettingsUpdate'
     ClusterSettingsUpdateRequest:
       type: object
       description: Partial update of cluster settings.
@@ -9287,7 +10320,7 @@ components:
               maximum: 100
               description: Maximum automatic failovers.
         rebalance:
-          $ref: '#/components/schemas/RebalanceSettings'
+          $ref: '#/components/schemas/RebalanceSettingsUpdate'
         clock:
           type: object
           description: Added in 0.8.0. Clock settings.
@@ -11102,7 +12135,7 @@ components:
     AlertKind:
       type: string
       description: |
-        Alert type. Clients must tolerate kinds they do not know. Added in 0.13.0: `certificateAuthorityUnavailable` (the map group was failed over and the new manager leader holds no key of the certificate authority, so no certificate can be issued, renewed or revoked until the operator restores `pki/ca.key` and `pki/revoked.json` from the backup of the old leader; subject `cluster`; `critical`). Added in 0.11.0 (ledger phase 7; subjects at `AlertSubject`): `ledgerNotAnchored` (a database has ledger tables and no anchor target is enabled; `info`, `warning` when the setting `anchor.required` is on), `ledgerAnchorBehind` (`warning`, `critical`), `ledgerAnchorFailed` (an anchor record is `failed` or `expired`; `critical`), `ledgerAnchorConflict` (the store holds a different object under the name of an anchor; `critical`), `ledgerChainDiverged` (a chain no longer extends its published log; `critical`), `ledgerGroupUnread` (a shard group's chain could not be read; `warning`, `critical`), `ledgerPublicationBehind` (the newest signed checkpoint of a chain is older than five publication intervals while its head advanced; `warning`), `ledgerSignerUnavailable` (no checkpoint could be signed for two rounds, or the key set is damaged, or the key file is missing on the leader; `critical`) and `ledgerDigestOverdue` (no digest within twice `digestIntervalSeconds`; `warning`). Added in 0.8.0: `clockDifference` (a server's clock differs from the manager leader's by more than `ClusterSettings.clock.maxDifferenceMs`, less the uncertainty of the measurement; `warning`, `critical` at ten times the threshold; `kingresd` does not set the system clock, run NTP or chrony). Added in 0.7.0: `leaseLost` (the `kingresd` that
+        Alert type. Clients must tolerate kinds they do not know. Added in 0.16.0: `rebalanceFailed` (the last automatic rebalance failed and the mode is suspended until an operator starts a rebalance; subject `cluster`; `warning`). Added in 0.13.0: `certificateAuthorityUnavailable` (the map group was failed over and the new manager leader holds no key of the certificate authority, so no certificate can be issued, renewed or revoked until the operator restores `pki/ca.key` and `pki/revoked.json` from the backup of the old leader; subject `cluster`; `critical`). Added in 0.11.0 (ledger phase 7; subjects at `AlertSubject`): `ledgerNotAnchored` (a database has ledger tables and no anchor target is enabled; `info`, `warning` when the setting `anchor.required` is on), `ledgerAnchorBehind` (`warning`, `critical`), `ledgerAnchorFailed` (an anchor record is `failed` or `expired`; `critical`), `ledgerAnchorConflict` (the store holds a different object under the name of an anchor; `critical`), `ledgerChainDiverged` (a chain no longer extends its published log; `critical`), `ledgerGroupUnread` (a shard group's chain could not be read; `warning`, `critical`), `ledgerPublicationBehind` (the newest signed checkpoint of a chain is older than five publication intervals while its head advanced; `warning`), `ledgerSignerUnavailable` (no checkpoint could be signed for two rounds, or the key set is damaged, or the key file is missing on the leader; `critical`) and `ledgerDigestOverdue` (no digest within twice `digestIntervalSeconds`; `warning`). Added in 0.8.0: `clockDifference` (a server's clock differs from the manager leader's by more than `ClusterSettings.clock.maxDifferenceMs`, less the uncertainty of the measurement; `warning`, `critical` at ten times the threshold; `kingresd` does not set the system clock, run NTP or chrony). Added in 0.7.0: `leaseLost` (the `kingresd` that
         runs the primary of a shard group could not renew the group's lease in time; for a group with a standby the
         instance was stopped (fenced), for a group without one it keeps running and this alert is the only effect;
         `critical`), `groupWithoutSynchronousStandby` (the group's standby has been unreachable for longer than the
@@ -11133,6 +12166,7 @@ components:
         - certificateRenewalFailed
         - replicationPending
         - taskFailed
+        - rebalanceFailed
         - leaseLost
         - groupWithoutSynchronousStandby
         - groupUnderReplicated

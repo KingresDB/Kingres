@@ -10,6 +10,10 @@ import QueryBoundary from '@/components/QueryBoundary.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
 import GateButton from '@/components/GateButton.vue'
 import ServerActions from '@/components/ServerActions.vue'
+import DrainServerDialog from '@/components/DrainServerDialog.vue'
+import ServerWeightDialog from '@/components/ServerWeightDialog.vue'
+import { useMutation, useQueryClient } from '@tanstack/vue-query'
+import { endpoints } from '@/api/endpoints'
 import FailoverDialog from '@/components/FailoverDialog.vue'
 import FailoverProgress from '@/components/FailoverProgress.vue'
 import ServerGroupsPanel from '@/components/ServerGroupsPanel.vue'
@@ -32,9 +36,20 @@ const servers = useServers()
 const rows = computed(() => servers.data.value?.items ?? [])
 
 /** The dialog being shown: which action on which server. */
-const dialog = ref<{ kind: 'add' | 'restore' | 'failover' | 'remove'; server?: Server } | null>(
-  null,
-)
+const dialog = ref<{
+  kind: 'add' | 'restore' | 'failover' | 'remove' | 'drain' | 'weight'
+  server?: Server
+} | null>(null)
+
+// Return to service: a drained server takes buckets again at the next rebalance.
+const client = useQueryClient()
+const giveBack = useMutation({
+  mutationFn: (id: string) => endpoints.updateServer(id, { shouldHaveShards: true }),
+  onSettled: () => {
+    void client.invalidateQueries({ queryKey: keys.servers })
+    void client.invalidateQueries({ queryKey: keys.rebalance })
+  },
+})
 </script>
 
 <template>
@@ -70,6 +85,7 @@ const dialog = ref<{ kind: 'add' | 'restore' | 'failover' | 'remove'; server?: S
             <th scope="col">Server group</th>
             <th scope="col">Instances</th>
             <th scope="col" class="num">Buckets (primary / replica)</th>
+            <th scope="col" class="num">Weight</th>
             <th scope="col" class="num">Size</th>
             <th scope="col" class="num">Max lag</th>
             <th scope="col">Resources</th>
@@ -118,6 +134,7 @@ const dialog = ref<{ kind: 'add' | 'restore' | 'failover' | 'remove'; server?: S
               </ul>
             </td>
             <td class="num">{{ s.buckets.primary }} / {{ s.buckets.replica }}</td>
+            <td class="num" data-testid="server-weight">{{ s.weight ?? 1 }}</td>
             <td class="num nowrap"><NullableValue :value="s.sizeBytes" :format="formatBytes" /></td>
             <td class="num nowrap">
               <NullableValue :value="s.replicationLagMaxSeconds" :format="(v) => formatLag(v)" />
@@ -159,6 +176,30 @@ const dialog = ref<{ kind: 'add' | 'restore' | 'failover' | 'remove'; server?: S
                   >{{ s.status === 'dead' ? 'Fail over' : 'Failover' }}</GateButton
                 >
                 <GateButton
+                  v-if="s.shouldHaveShards"
+                  op="drainServer"
+                  small
+                  data-testid="drain-server"
+                  @click="dialog = { kind: 'drain', server: s }"
+                  >Drain</GateButton
+                >
+                <GateButton
+                  v-else
+                  op="updateServer"
+                  small
+                  data-testid="return-to-service"
+                  :disabled="giveBack.isPending.value"
+                  @click="giveBack.mutate(s.id)"
+                  >Return to service</GateButton
+                >
+                <GateButton
+                  op="updateServer"
+                  small
+                  data-testid="server-weight-edit"
+                  @click="dialog = { kind: 'weight', server: s }"
+                  >Weight</GateButton
+                >
+                <GateButton
                   op="removeServer"
                   small
                   variant="danger"
@@ -187,8 +228,20 @@ const dialog = ref<{ kind: 'add' | 'restore' | 'failover' | 'remove'; server?: S
     :invalidate="[keys.servers, keys.topology]"
     @close="dialog = null"
   />
+  <DrainServerDialog
+    v-else-if="dialog?.kind === 'drain' && dialog.server"
+    :server="dialog.server"
+    @close="dialog = null"
+  />
+  <ServerWeightDialog
+    v-else-if="dialog?.kind === 'weight' && dialog.server"
+    :server="dialog.server"
+    @close="dialog = null"
+  />
   <ServerActions
-    v-else-if="dialog && dialog.kind !== 'failover'"
+    v-else-if="
+      dialog && dialog.kind !== 'failover' && dialog.kind !== 'drain' && dialog.kind !== 'weight'
+    "
     :kind="dialog.kind"
     :server="dialog.server"
     :invalidate="[keys.servers, keys.topology]"

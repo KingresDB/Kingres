@@ -339,7 +339,7 @@ paths; what is not done is in "Not done in this increment"). "Real" means the op
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **139 of 140 operations are real; 1 answer "not yet".**
+authenticated operation lists in 0.2.0. **148 of 149 operations are real; 1 answer "not yet".**
 
 | Tag | Real | Not yet |
 |---|---|---|
@@ -349,7 +349,8 @@ authenticated operation lists in 0.2.0. **139 of 140 operations are real; 1 answ
 | Cluster | `getCluster`, `getClusterSummary` |  |
 | Roles | `listClusterRoles`, `listRoles`, `createRole`, `getRole`, `deleteRole`, `updateRole`, `setRoleClusterRoles`, `setRoleMemberships` |  |
 | Databases | `getDatabaseCreateOptions`, `listDatabases`, `createDatabase`, `getDatabase`, `dropDatabase`, `updateDatabase` |  |
-| Shards | `getBucketDistribution`, `listColocationGroups`, `listBuckets` |  |
+| Schemas | `listSchemas`, `getSchema`, `distributeSchema`, `undistributeSchema`, `moveSchema` |  |
+| Shards | `getBucketDistribution`, `listColocationGroups`, `listBuckets`, `previewBucketSplit`, `splitBucket` |  |
 | Ledger | `getLedgerStatus`, `listLedgerBlocks`, `listLedgerDigests`, `generateLedgerDigest`, `startLedgerVerification`, `listLedgerStatus`, `createInclusionProof`, `listLedgerVerifications`, `getLedgerVerification`, `getLedgerSettings`, `updateLedgerSettings`, `getLedgerSigning`, `createLedgerSigningKey`, `retireLedgerSigningKey`, `revokeLedgerSigningKey`, `getLedgerTrustFile`, `getLedgerPublication`, `getLedgerAggregate`, `listLedgerAggregates`, `listLedgerAnchorTargets`, `createLedgerAnchorTarget`, `getLedgerAnchorTarget`, `updateLedgerAnchorTarget`, `deleteLedgerAnchorTarget`, `testLedgerAnchorTarget`, `listLedgerAnchors`, `anchorLedgerNow`, `retryLedgerAnchor`, `downloadLedgerAnchor`, `listLedgerClientKeys`, `registerLedgerClientKey`, `revokeLedgerClientKey`, `setTableSignaturePolicy`, `upgradeLedgerExtension`, `createLedgerBundle`, `getLedgerBundle`, `acknowledgeLedgerDivergence` | |
 | Tables | `getTable`, `distributeTable`, `enableTableLedger`, `listTables`, `previewTableChange`, `undistributeTable`, `alterTableDistribution`, `listTablePartitions`, `createTablePartition`, `attachTablePartition`, `detachTablePartition`, `dropTablePartition` |  |
 | Grants | `listGrants`, `createGrant`, `revokeGrants`, `applyGrantTemplate` |  |
@@ -360,7 +361,7 @@ authenticated operation lists in 0.2.0. **139 of 140 operations are real; 1 answ
 | Rebalance | `getRebalanceStatus`, `startRebalance`, `previewRebalancePlan`, `listRebalanceReports`, `getRebalanceReport`, `stopRebalance` |  |
 | Replication | `getReplicationTopology`, `getFailoverStatus`, `listFailoverReports`, `getFailoverReport` | `restorePreferredPrimaries` |
 | Server groups | `listServerGroups`, `createServerGroup`, `deleteServerGroup` |  |
-| Servers | `listServers`, `getServer`, `addServer`, `removeServer`, `updateServer`, `renewServerCertificates`, `revokeServerCertificates`, `failoverServer` |  |
+| Servers | `listServers`, `getServer`, `addServer`, `removeServer`, `updateServer`, `renewServerCertificates`, `revokeServerCertificates`, `failoverServer`, `drainServer`, `previewServerDrain` |  |
 | Configuration | `listConfigParameters`, `getConfigParameter`, `previewConfigChange`, `applyConfigChange`, `listConfigChanges`, `revertConfigChange`, `listConfigServers`, `getConfigSummary`, `getClusterTime`, `listTimeZones`, `restartPendingInstances` |  |
 | Settings | `getClusterSettings`, `updateClusterSettings`, `resetAutoFailoverCounter` |  |
 | Network access | `getNetworkAccess`, `replaceNetworkAccess` |  |
@@ -1068,6 +1069,8 @@ first step that is not recorded `done`. What the engine promises:
 - A `NonIdempotent` step that was recorded `running` but not `done` is **not** run again: the task fails with the
   code `step_interrupted` (not retryable) and names the step, because it is unknown whether the effect happened. The
   steps after it do not run. A crash before the `running` record leaves the step untouched, so it runs once.
+  A step that can read its own effect has a `Recover` (`task.Step.Recover`): it is asked first, `true` records the step `done` without
+  running it, `false` (the effect is provably not there) runs it, and an error is `step_interrupted` as before. A step that cannot tell must not have one.
 - A task whose process died is never lost and never stays `running` forever: once the lease expired it is resumed or
   failed as above, as long as some server runs the engine. A task that has all steps `done` is recorded `done`.
 - Secrets live only in the process that started the task; a resumed step that needs one fails with
@@ -1081,7 +1084,7 @@ hook end the process: `crash_test.go` simulates the death with a store that refu
 (`TestTaskEngineSurvivesAKilledProcess`, real PostgreSQL, WSL) starts the test binary as helper processes that
 `os.Exit(137)` at each point, then a second process takes the task over; the steps count their runs in a side file.
 The real task `server.add` is killed with SIGKILL at each of its steps by `TestJoinInterruptedAtEveryStepResumes`.
-No task kind of the product is marked `NonIdempotent` today (all steps check what exists before they create).
+Only the two steps of the distributed schemas that call the extension once (`Make the schema distributed`, `Make the schema local`) are marked `NonIdempotent`, with a `Recover` (see Distributed schemas); every other step checks what exists before it creates.
 
 ## Not done in this increment, and the manager's state on a leader change
 
@@ -3502,3 +3505,87 @@ increment is installed in the installation of the tests.
 
 Not done: the rebalance does not look for an unfinished table task before it moves a bucket of the group (the extension refuses a move of a group that an operation claims; the rebalance then reports the move as failed); `Table.operation`
 (the unfinished task of a table) of the design is not in the contract yet; `relatedTables` of the distribute request (distribute with related tables) is increment 9.7; the free space of other servers.
+
+## Elasticity (phase 10, contract 0.16.0): strategies and weights, drain, automatic mode, split
+
+Design: [shard-phase10.md](../docs/design/shard-phase10.md), sections 4, 6, 8, 9, 11 and 21.11. The first increment (the six rebalance operations by bucket count) was built earlier (contract 0.9.0);
+this is what 0.16.0 adds. All of it needs the sharding extension 0.8; against an older one the plan stays the plan by bucket count (`kingres.rebalance_plan()`) and anything else is refused with
+422 `unsupported_operation`.
+
+**Strategies, threshold, weights (increment 2).** `rebalance.Options` has `strategy` (`byBucketCount`, `byDiskSize`), `threshold`, `drainOnly`, `maxMovesPerServer`, `acknowledgeFailures`,
+`cleanupDelaySeconds` and the trigger of the run; `Resolve` fills what a request leaves out from the cluster settings (`kingres_cp.cluster_setting`, keys `rebalance.*`) and the default threshold of the
+strategy (0 by bucket count, 0.1 by disk size), so the run records what it really used. `PG.Plan` calls `kingres.plan_rebalance(strategy, threshold, NULL, drain_only, extra_load, exclude_groups, NULL)`
+on the map group primary of the database, with the load of the other databases as `extra_load` (their `group_load`, matched to the groups of this database by the host and port of the primary, because group numbers belong to one
+catalog each), and `excludeServerIds` as `exclude_groups`. `previewRebalancePlan` adds the strategy, the threshold, `imbalance` (the worst deviation of a receiver, from `group_load`), `loadBefore` and `loadAfter` per
+server and the warning `groupUnavailable`. The weight of a server is `kingres.node.weight` (the same on every node row of the server); `PATCH /servers/{id}` with `weight` writes it with
+`set_node_property(node, NULL, weight)` and `Server.weight` reads it (absent when the column does not exist). The new settings are `rebalance.strategy`, `threshold`, `maxMovesPerServer`, `maxMoveAttempts`,
+`maxDiskUsedFraction` and `maxStandbyLagBytes`; `updateClusterSettings` takes them in `RebalanceSettingsUpdate` (every member optional). Migration `0040_rebalance_phase10.sql` adds `reason` and `cost` to
+`rebalance_move` (it has a number range of its own so that it does not collide with the failover and ledger migrations).
+
+**Drain (increment 3).** `previewServerDrain` and `drainServer` (`internal/rebalance/drain.go`). *Departure from the design:* a drain is a task of kind `rebalance` (subject `cluster/cluster`) whose options say
+trigger `drain` and name the server, not a task of kind `server.drain`. The exclusion of server operations (the triggers of migrations 0009 to 0016), the stop, the resume, the report, the alert and the pause of a
+rebalance by a failover then hold for a drain without a second copy; a drain cannot run beside a rebalance, which the design wanted anyway. The task has the extra steps that only a drain runs (a rebalance
+skips them): `Stop new buckets from landing on the server` (the flag goes to false first), the usual `Compute the plan` and `Move buckets` (with the server added to the excluded groups), `Wait until the server owns no bucket`
+(no bucket on its groups, and no move away from it still in `cleaning`, which lasts as long as `move_cleanup_delay`), `Write the report` and `Remove the server` (only with `removeWhenDone`: the removal is the task of
+`removeServer`, started after the drain task has ended because the two exclude each other; if the manager restarts in between, the server stays drained and the operator removes it). Refused before a task
+exists: an unknown server (404), `last_server`, `no_receiving_server`, `server_hosts_map_group`, `replicas_cannot_be_kept` (fewer servers than `replicaCount + 1` would remain; `acceptFewerReplicas` overrides), `group_degraded`,
+`node_state_invalid` for a dead server, and 422 when the server holds ordinary tables that leave with it (`acknowledgeLocalData`). The standbys that the server hosts are relocated by the step `Relocate the standbys hosted on the server` (step 5 of the design): the server
+is put in the cluster setting `drain.excludedServers`, `standby.Leader` (hook `Excluded`, `standby.WithoutServers`) leaves it out of the ring, the reconcile creates the replacements on the other servers before it removes the old ones, and the
+step waits until `kingres.node` has no standby on the server; a group that no other server can take makes the step fail with `replicas_cannot_be_kept`, or stay with fewer standbys with `acceptFewerReplicas`. A server given back to service (`shouldHaveShards` true)
+leaves the setting. **Not built yet:** the hand-over of the map group (step 4: refused with `server_hosts_map_group`; it will be the planned switchover of the map group of the failover branch, see design section 22). Cancelling the task keeps the flag false (the server stays `draining`).
+
+**Automatic mode (increment 4).** `internal/rebalance/automatic.go`. The job `RunAuto` runs on the manager leader (`IsLeader`) every `checkIntervalSeconds`; it does nothing while `rebalance.automatic.enabled` is false (the default).
+The decision is the pure function `Evaluate(settings, facts)`: the window; the plan with the automatic strategy and threshold (default 0.15); the imbalance held for `settleSeconds`; the last change of the servers older than
+`settleAfterTopologySeconds`; `minIntervalSeconds` since the last automatic run (waived by a server that waits for a rebalance and by a drain flag); and no safety rule (`SafetyBlockers`: a failover, or a primary changed within `failoverSettleSeconds`,
+a group without a primary or without the standbys the replica count asks for, a server that is dead or suspect or an unfinished change of the servers, a failed earlier move that nobody acknowledged, a cluster check that fails).
+The timers are rows of the system database (`autostate.*`, `topology.changedAt`, the end of the last automatic run), so a new leader does not restart them. An automatic run asks `autoGuard` before each move and
+pauses (stopped by `safetyRule`) when a rule fails; the job resumes it when the rules have held for `settleSeconds`; a run that an operator stopped is left alone. A failed automatic run raises the alert `rebalanceFailed`
+and suspends the mode until an operator starts a rebalance (a manual start acknowledges it). `RebalanceStatus.automatic` shows the last evaluation.
+
+**Split (design step 6).** `previewBucketSplit` and `splitBucket` (`internal/rebalance/split.go`), task kind `bucket.split` (subject `bucket`, id `database/colocationId/bucket`): `Check that the split can start`,
+`Split the bucket` (calls `kingres.split_bucket` in a session of its own and follows `kingres.bucket_split` for the detail; a lost lease or a cancel calls `cancel_bucket_split`; a step repeated after a takeover finds the record and
+settles it with `resume_bucket_splits()`), `Check the new buckets`. The orphans are dropped by the extension after `move_cleanup_delay` (`cleanup_bucket_splits`, called by its recovery worker); the task does not wait for that.
+**Cancelling a split, and its limit.** The extension looks at a request to cancel (`cancel_bucket_split(id)`) only during the backfill, before each batch of rows is copied; after the backfill it cannot stop the split, and it refuses the request while the split is switching.
+The step `Split the bucket` is not interruptible by the engine (an interrupted step ends the task as cancelled whatever the extension does). The step itself watches for the request (every second), passes it on and says truthfully what came of it:
+(a) the request reached the backfill: the extension undoes the split (the children and the triggers go, the bucket is `active` again) and the task **fails with the code `cancelled`** and the text "The split was cancelled before its switch and undone: the bucket is unchanged"; the bucket can be split again;
+(b) the request came too late (the extension refused it, or accepted it and the split completed all the same): the task records in its detail "The cancel request came too late: the split had passed its backfill and goes on to its end", **goes on and ends `done`** (the step `Check the new buckets` runs), and the bucket list shows the children. A task is therefore never `cancelled` while the split completes.
+The cancel guard of the kind (`splitCancellable`) accepts a cancel until the split step is done or the "too late" note is recorded; a cancel after that is answered 409 `task_not_cancellable`, which is the truthful answer. A split whose session is lost (a restart of `kingresd`) is not touched by a lost lease or a shutdown: the task is taken over, finds the record and settles it with
+`resume_bucket_splits()`. The cluster test of the split shows both cases (the gate `split_after_triggers` for the undo, `split_after_backfill` for the late cancel, which ends done with the children in the bucket list).
+The preview does not look for a table without a primary key: the extension refuses it when the split starts and the task fails with `split_unsupported`. `listColocationGroups` and `listBuckets` read `max_modulus`, `modulus` and `kind`.
+
+Tests: unit tests in `internal/rebalance` (`options_test.go`, `drain_test.go`, `automatic_test.go`, `split_test.go`), `internal/ops` and `internal/api`; the cluster test `internal/clustertest/rebalance_strategies_test.go`
+(strategies, weights, exclusion, settings, a drain-only run) needs the 0.8 extension in the installation of the tests (`scripts/install-extensions.sh`).
+
+## Distributed schemas (phase 11, step 13, contract 0.16.0)
+
+Design: [shard-phase11.md](../docs/design/shard-phase11.md), sections 13 and 16. The extension (0.8) does the work; `internal/ops/schemas.go` lists the schemas, refuses what can be refused before a task exists and runs three tasks,
+`internal/httpapi/handlers_schemas.go` has the five operations (`listSchemas`, `getSchema`, `distributeSchema`, `undistributeSchema`, `moveSchema`).
+
+- **Reading.** A schema is listed from the map group primary (this server): every schema that is not a system schema, joined with `kingres.schemas` (group, state, size, target of a move) when the extension has it; a database without the extension 0.8, or
+  without sharding, lists its schemas with `distribution: null`. `getSchema` adds the blockers (`kingres.schema_inventory`, the unsupported rows), the pin (`kingres.internal_schema_pinned`, for example a ledger table), the unfinished `schema.move`
+  task of the schema and the tables that have neither a primary key nor a replica identity.
+- **Tasks** (subject type `schema`, id `database/schema`, one unfinished task per schema): `schema.distribute` (`Check the schema`, `Set REPLICA IDENTITY FULL` when asked, `Make the schema distributed` through `distribute_schema`, `Verify on every server`),
+  `schema.move` (`Check the move`, `Copy the data` through `move_schema` in a session of its own with the phase of `bucket_move` as detail, `Switch`, `Clean up the old copy`; cancelled with `cancel_bucket_move` until the switch, the task does not wait for the
+  old copy to be emptied) and `schema.undistribute` (`Check the schema`, `Move first` when a target is given, `Make the schema local`, `Verify on every server`). A step that repeats after a restart reads the catalog first and does nothing when its result is there.
+  `Make the schema distributed` and `Make the schema local` are `NonIdempotent` with a `Recover`: a leader killed inside the call of the extension (which prepares a transaction on the other nodes first) leaves the step recorded `running`; the next leader reads whether the schema is distributed (or local), records the step `done` when it is, and otherwise asks `kingres.recover_prepared_transactions()` to settle what the cut call left prepared before the call is made again.
+- **Refusals before a task exists:** `schema_not_distributable` (422, the objects in `errors`), `conflict` (already distributed, local, or the mode is `row`), `schema_move_in_progress`, `schema_pinned`, `rebalance_in_progress` (a move waits for a rebalance),
+  422 `unprocessable` (target group missing, not receiving, or the current one; tables without a key unless `setReplicaIdentityFull`).
+- **Tables that a move cannot copy** are those whose replica identity is NOTHING (a primary key does not help) and those with the default identity and no primary key; the 422 names every one of them in `errors` (code `replica_identity_missing`) and in its text.
+  The same check, without the way out, refuses a `Make local` that names a group to move to first (`undistributeSchema` has no `setReplicaIdentityFull`): no task is made that would fail in its second step.
+- **Exclusion.** Migration `0041_schema_tasks_exclusion.sql` is a second trigger on `kingres_cp.task`: the three schema kinds and a failover (or the restore of preferred primaries) exclude each other (KX007 for the schema task, KX006 for the failover), and `schema.move` and
+  `schema.undistribute` (which may move the schema first) and a rebalance exclude each other (KX002, KX001); `schema.distribute` moves nothing and lives beside a rebalance. They also exclude `server.add`, `server.remove` and `server.leave`, both ways (KX007 for the schema task, KX006 for the server task), since a move to a group whose server is being joined or removed must not run. The answer is 409 `operation_in_progress` naming the other kind (a rebalance that is refused keeps
+  `rebalance_in_progress`); `task.MemStore` follows the same rules. A paused failover or rebalance still excludes, as for the other kinds.
+- **Cancel.** The step `Copy the data` (and `Move first`) is not interruptible: it polls the cancel mark itself (`task.Env.CancelRequested`) and asks the extension to stop the move only while the phase is `preparing`, `copying` or `catching_up` (`cancel_bucket_move`).
+  The answer is truthful: the extension undid the move and the task **fails with the code `cancelled`** and says the schema is unchanged, on its old group; or the request came in the switch (the extension refuses), the task goes on, ends `done` and says so in its detail.
+  The guard (`moveCancellable`, `undistributeCancellable`) refuses a request (409 `task_not_cancellable`) from the phase `switching` on, read from the detail the step records, and once the copy step is done; the mark of a request that arrived before is not followed.
+  A cancel of a `Make local` that is moving first is a cancel of that move; once `Make the schema local` has started, there is nothing to cancel. `getTask`, `listTasks` and the answer of the cancel narrow `cancellable` with the guard of the kind (`withCancelGuard`), so the console shows no Cancel button for a move that is switching.
+- **After a leader change, or a dead session** the copy step finds the move that nobody drives in `kingres.bucket_move` (a record that a dead leader left, or one whose call returned an error): the task asks the extension to settle it, now and then again every twice `kingres_shard.node_timeout` plus a second (`resume_bucket_moves()` skips a move in preparing or switching younger than that), and gives up ten minutes after the call ended; one to the same group is followed, one to another group is a `schema_move_in_progress`,
+  and a move that ended `failed` is started again, up to three times, unless a person asked to cancel.
+  A failed call of `distribute_schema` or `undistribute_schema` whose schema is in the state the call was to make counts as made (a backend of a dead leader may have finished it while the step was recovered). `Make the schema local` after a `Move first` ends the cleaning of its own move at once (`internal_continue_cleaning`), because the extension refuses while a move of the schema is cleaning; `Move first` records where the schema went, which is what a cancel before the making local leaves. Only SQLSTATE 55000 of `cancel_bucket_move` means too late; other failures are tried again.
+- **The sharding mode.** `createDatabase` takes `sharding.mode` and `distributeNewSchemas` and calls `kingres.set_sharding_mode` after the extension is installed; `updateDatabase` changes them synchronously, and a refusal of the extension is 409 `sharding_mode_in_use`.
+  `Database.sharding` shows `mode` and `distributeNewSchemas` (read from `kingres.sharding_settings`), `bucketCount` is null in mode `schema`, `stats.distributedSchemaCount` counts `kingres.dist_schema`, `getDatabaseCreateOptions` lists `shardingModes`.
+  `listColocationGroups` has `kind` and `schemaName`.
+- **Not done:** `inFlightMoves[].kind` and `schemaName` of the rebalance status, `BucketDistribution.servers[].primarySchemas`, the schema units in the rebalance plan (the extension does not plan them yet), and the schema moves made by a drain (a drain moves buckets only; schemas stay on the server).
+
+Tests: `internal/ops/schemas_test.go` (blockers, error mapping, hostile names, the cancel guard) and the cluster test `internal/clustertest/schemas_test.go` (list, blockers, distribute, move with the rows checked, make local, the replica identity,
+the mode refusal), `internal/clustertest/schemas_tasks_test.go` (tables a move cannot copy, the cancel before and after the switch, the exclusion of a rebalance and a failover, a move followed after the leader was killed, the distribute step killed before and after its effect), `internal/task/recover_test.go` (`Recover`, `CancelRequested`, the exclusion in the memory store) and `internal/rebalance/failover_exclusion_pg_test.go` (the trigger of migration 0041); they need the 0.8 extension in the installation of the tests.

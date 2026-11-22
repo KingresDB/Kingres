@@ -4,7 +4,7 @@
 // Edit the mutable settings of a database. Fixed settings (name, encoding, collation, bucket
 // count) are listed read-only with the reason. PATCH answers 200 for instant changes and 202 + Task
 // when background work is needed (turning on sharding or the ledger).
-import { computed, reactive, ref } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import SafeName from './SafeName.vue'
 import TaskActionDialog from './TaskActionDialog.vue'
 import FormField from './FormField.vue'
@@ -12,6 +12,7 @@ import NullableValue from './NullableValue.vue'
 import HiddenPreview from './HiddenPreview.vue'
 import { endpoints } from '@/api/endpoints'
 import { keys } from '@/api/queries'
+import { useSessionStore } from '@/stores/session'
 import type { Database, DatabaseUpdateRequest, Durability, LedgerMode, Task } from '@/api/types'
 import { DURABILITY_LABEL, LEDGER_MODE_LABEL } from '@/lib/status'
 import { compact, firstError, integerBetween } from '@/lib/validators'
@@ -36,7 +37,19 @@ const form = reactive({
   ledgerMode: orig.ledgerMode as LedgerMode,
   digestInterval: orig.digestInterval as number,
   enableSharding: false,
+  mode: (d.sharding.mode ?? 'row') as 'row' | 'schema' | 'both',
+  distributeNew: d.sharding.distributeNewSchemas ?? false,
 })
+const session = useSessionStore()
+const canChangeMode = computed(() => session.can('updateDatabase'))
+// The mode Rows has no schemas to distribute: the setting goes off with it (the server refuses true with Rows), and a mode that
+// has schemas keeps the value the database has.
+watch(
+  () => form.mode,
+  (mode) => {
+    if (mode === 'row') form.distributeNew = false
+  },
+)
 const submitted = ref(false)
 
 const body = computed<DatabaseUpdateRequest>(() => {
@@ -51,7 +64,15 @@ const body = computed<DatabaseUpdateRequest>(() => {
   if (form.digestInterval !== orig.digestInterval)
     ledger.digestIntervalSeconds = form.digestInterval
   if (Object.keys(ledger).length) out.ledger = ledger
-  if (form.enableSharding) out.sharding = { enabled: true }
+  const sharding: NonNullable<DatabaseUpdateRequest['sharding']> = {}
+  if (form.enableSharding) sharding.enabled = true
+  if (d.sharding.mode !== undefined && form.mode !== d.sharding.mode) sharding.mode = form.mode
+  if (
+    d.sharding.mode !== undefined &&
+    form.distributeNew !== (d.sharding.distributeNewSchemas ?? false)
+  )
+    sharding.distributeNewSchemas = form.distributeNew
+  if (Object.keys(sharding).length) out.sharding = sharding
   return out
 })
 
@@ -178,6 +199,26 @@ async function start(): Promise<Task> {
             max="86400"
           />
         </FormField>
+        <div v-if="d.sharding.enabled && d.sharding.mode" data-testid="edit-sharding-mode">
+          <FormField v-slot="slot" label="Shard by">
+            <select v-bind="slot" v-model="form.mode" :disabled="!canChangeMode">
+              <option value="row">Rows</option>
+              <option value="schema">Schemas</option>
+              <option value="both">Both</option>
+            </select>
+          </FormField>
+          <label class="check">
+            <input
+              v-model="form.distributeNew"
+              type="checkbox"
+              :disabled="!canChangeMode || form.mode === 'row'"
+            />
+            Distribute new schemas automatically
+          </label>
+          <p v-if="!canChangeMode" class="hint muted">
+            Changing the mode needs the administrator role.
+          </p>
+        </div>
         <label v-if="!d.sharding.enabled" class="check">
           <input v-model="form.enableSharding" type="checkbox" />
           Turn on sharding (cannot be turned off again; existing tables stay plain until you
@@ -197,7 +238,9 @@ async function start(): Promise<Task> {
             <NullableValue :value="d.general.lcCtype" />
           </dd>
           <dt>Bucket count</dt>
-          <dd><NullableValue :value="d.sharding.bucketCount" /></dd>
+          <dd>
+            <NullableValue :value="d.sharding.bucketCount" />
+          </dd>
         </dl>
         <p class="hint muted">
           The replica count is a cluster setting and is changed in cluster settings.

@@ -28,8 +28,140 @@ type Rebalancer interface {
 	Report(ctx context.Context, id int64) (api.RebalanceReport, error)
 }
 
+// Drainer is what the HTTP layer needs of the drain of a server; the rebalance service implements it next to Rebalancer.
+type Drainer interface {
+	DrainPreview(ctx context.Context, serverID string) (api.DrainPreview, error)
+	Drain(ctx context.Context, actor, serverID string, req rebalance.DrainRequest) (task.Task, error)
+}
+
+func (s *Server) needDrain() (Drainer, error) {
+	rb, err := s.needRebalance()
+	if err != nil {
+		return nil, err
+	}
+	d, ok := rb.(Drainer)
+	if !ok {
+		return nil, problem.New(problem.UnsupportedOp, "This server cannot drain a server.")
+	}
+	return d, nil
+}
+
+func (s *Server) previewServerDrain(_ *call, w http.ResponseWriter, r *http.Request) error {
+	d, err := s.needDrain()
+	if err != nil {
+		return err
+	}
+	pp := newParams(r)
+	id := pp.pathServerID("serverId")
+	if p := pp.err(); p != nil {
+		return p
+	}
+	out, err := d.DrainPreview(r.Context(), id)
+	if err != nil {
+		return s.rebalanceProblem(r, err)
+	}
+	s.writeJSON(w, r, http.StatusOK, out)
+	return nil
+}
+
+func (s *Server) drainServer(c *call, w http.ResponseWriter, r *http.Request) error {
+	d, err := s.needDrain()
+	if err != nil {
+		return err
+	}
+	pp := newParams(r)
+	id := pp.pathServerID("serverId")
+	if p := pp.err(); p != nil {
+		return p
+	}
+	var req api.DrainRequest
+	if err := s.optionalBody(w, r, &req); err != nil {
+		return err
+	}
+	if req.MaxConcurrentMoves < 0 || req.MaxConcurrentMoves > 64 {
+		return problem.Validation("The drain request is invalid.", problem.FieldError{Field: "/maxConcurrentMoves", Message: "must be 1 to 64", Code: "out_of_range"})
+	}
+	t, err := d.Drain(r.Context(), c.session.Username, id, rebalance.DrainRequest{RemoveWhenDone: req.RemoveWhenDone,
+		MaxConcurrentMoves: req.MaxConcurrentMoves, AcceptFewerReplicas: req.AcceptFewerReplicas, AcknowledgeLocal: req.AcknowledgeLocalData})
+	if err != nil {
+		return s.rebalanceProblem(r, err)
+	}
+	c.addDetails(map[string]any{"taskId": t.ID, "serverId": id, "removeWhenDone": req.RemoveWhenDone})
+	s.accepted(w, r, t)
+	return nil
+}
+
+// Splitter is what the HTTP layer needs of the split of a bucket; the rebalance service implements it.
+type Splitter interface {
+	SplitPreview(ctx context.Context, db string, colocation, bucket int32, req rebalance.SplitRequest) (api.BucketSplitPreview, error)
+	Split(ctx context.Context, actor, db string, colocation, bucket int32, req rebalance.SplitRequest) (task.Task, error)
+}
+
+func (s *Server) needSplit() (Splitter, error) {
+	rb, err := s.needRebalance()
+	if err != nil {
+		return nil, err
+	}
+	sp, ok := rb.(Splitter)
+	if !ok {
+		return nil, problem.New(problem.UnsupportedOp, "This server cannot split buckets.")
+	}
+	return sp, nil
+}
+
+func (s *Server) splitArgs(w http.ResponseWriter, r *http.Request) (db string, colocation, bucket int32, req api.BucketSplitRequest, err error) {
+	pp := newParams(r)
+	db = pp.pathName("databaseName")
+	colocation = pp.pathInt32("colocationId")
+	bucket = pp.pathInt32("bucket")
+	if p := pp.err(); p != nil {
+		return db, colocation, bucket, req, p
+	}
+	err = s.optionalBody(w, r, &req)
+	return db, colocation, bucket, req, err
+}
+
+func (s *Server) previewBucketSplit(_ *call, w http.ResponseWriter, r *http.Request) error {
+	sp, err := s.needSplit()
+	if err != nil {
+		return err
+	}
+	db, colo, bucket, req, err := s.splitArgs(w, r)
+	if err != nil {
+		return err
+	}
+	out, err := sp.SplitPreview(r.Context(), db, colo, bucket, rebalance.SplitRequest{Parts: req.Parts, Verify: req.Verify})
+	if err != nil {
+		return s.rebalanceProblem(r, err)
+	}
+	s.writeJSON(w, r, http.StatusOK, out)
+	return nil
+}
+
+func (s *Server) splitBucket(c *call, w http.ResponseWriter, r *http.Request) error {
+	sp, err := s.needSplit()
+	if err != nil {
+		return err
+	}
+	db, colo, bucket, req, err := s.splitArgs(w, r)
+	if err != nil {
+		return err
+	}
+	t, err := sp.Split(r.Context(), c.session.Username, db, colo, bucket, rebalance.SplitRequest{Parts: req.Parts, Verify: req.Verify})
+	if err != nil {
+		return s.rebalanceProblem(r, err)
+	}
+	c.addDetails(map[string]any{"taskId": t.ID, "databaseName": db, "colocationId": colo, "bucket": bucket, "parts": req.Parts})
+	s.accepted(w, r, t)
+	return nil
+}
+
 func (s *Server) rebalanceHandlers() map[string]handlerFunc {
 	return map[string]handlerFunc{
+		"previewBucketSplit":   s.previewBucketSplit,
+		"splitBucket":          s.splitBucket,
+		"drainServer":          s.drainServer,
+		"previewServerDrain":   s.previewServerDrain,
 		"getRebalanceStatus":   s.getRebalanceStatus,
 		"startRebalance":       s.startRebalance,
 		"previewRebalancePlan": s.previewRebalancePlan,
@@ -110,7 +242,7 @@ func (s *Server) startRebalance(c *call, w http.ResponseWriter, r *http.Request)
 	if err := s.optionalBody(w, r, &req); err != nil {
 		return err
 	}
-	t, err := rb.Start(r.Context(), c.session.Username, rebalance.Options{Databases: req.Databases, MaxConcurrentMoves: req.MaxConcurrentMoves})
+	t, err := rb.Start(r.Context(), c.session.Username, rebalance.OptionsFromAPI(req))
 	if err != nil {
 		return s.rebalanceProblem(r, err)
 	}

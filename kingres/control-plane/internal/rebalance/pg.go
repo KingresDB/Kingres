@@ -33,7 +33,7 @@ type Conns interface {
 var forbidding = map[string]bool{
 	"catalog_differs": true, "partition_missing": true, "partition_misplaced": true, "stray_bucket_table": true,
 	"bucket_map_incomplete": true, "group_without_primary": true, "bucket_moving_without_move": true,
-	"move_without_moving_bucket": true, "node_unreachable": true, "extension_version_differs": true,
+	"move_without_moving_bucket": true, "node_unreachable": true, "bucket_layout": true, "split_stalled": true, "extension_version_differs": true,
 	"server_major_differs": true, "secret_missing": true, "stalled_move": true,
 }
 
@@ -243,8 +243,8 @@ func clipText(s string, n int) string {
 	return s
 }
 
-// Plan implements Backend.
-func (b *PG) Plan(ctx context.Context, dbs []string) ([]Move, error) {
+// planLegacy is the plan of the extension before 0.8: rebalance_plan(), by bucket count.
+func (b *PG) planLegacy(ctx context.Context, dbs []string) ([]Move, error) {
 	var out []Move
 	for _, db := range dbs {
 		err := b.with(ctx, db, func(c *pgx.Conn) error {
@@ -877,12 +877,19 @@ func (r *PGRows) StartMove(ctx context.Context, m Move, fromServer, toServer str
 			return err
 		}
 		return tx.QueryRow(ctx, `INSERT INTO kingres_cp.rebalance_move (task_id, seq, database_name, colocation_id, bucket, from_group, to_group,
-			from_server, to_server, state, attempts, size_bytes, started_at, round, ext_mark)
-			SELECT $1, coalesce(max(seq), 0) + 1, $2, $3, $4, $5, $6, $7, $8, 'running', $9, $10, clock_timestamp(), (SELECT round FROM kingres_cp.rebalance_run WHERE task_id = $1), $11::bigint
+			from_server, to_server, state, attempts, size_bytes, started_at, round, ext_mark, reason, cost)
+			SELECT $1, coalesce(max(seq), 0) + 1, $2, $3, $4, $5, $6, $7, $8, 'running', $9, $10, clock_timestamp(), (SELECT round FROM kingres_cp.rebalance_run WHERE task_id = $1), $11::bigint, $12, $13
 			FROM kingres_cp.rebalance_move WHERE task_id = $1 RETURNING seq`,
-			r.TaskID, m.Database, m.Colocation, m.Bucket, m.From, m.To, fromServer, toServer, attempts, m.Size, mark).Scan(&seq)
+			r.TaskID, m.Database, m.Colocation, m.Bucket, m.From, m.To, fromServer, toServer, attempts, m.Size, mark, nullIfEmpty(m.Reason), m.Cost).Scan(&seq)
 	})
 	return seq, err
+}
+
+func nullIfEmpty(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }
 
 // UpdateMove implements Rows.
@@ -923,7 +930,7 @@ func (r *PGRows) AddSkipped(ctx context.Context, m Move, fromServer, toServer, r
 }
 
 const moveCols = `seq, database_name, colocation_id, bucket, from_group, to_group, coalesce(from_server, ''), coalesce(to_server, ''), state, attempts,
-	coalesce(move_id, 0), coalesce(phase, ''), percent, size_bytes, started_at, finished_at, coalesce(error, ''), round, ext_mark`
+	coalesce(move_id, 0), coalesce(phase, ''), percent, size_bytes, started_at, finished_at, coalesce(error, ''), round, ext_mark, coalesce(reason, ''), coalesce(cost, 0)`
 
 // ScanMove reads a move from a row of moveCols.
 func ScanMove(row pgx.Row) (MoveRow, error) {
@@ -931,7 +938,7 @@ func ScanMove(row pgx.Row) (MoveRow, error) {
 	var pct float32
 	var mark *int64
 	err := row.Scan(&m.Seq, &m.Move.Database, &m.Move.Colocation, &m.Move.Bucket, &m.Move.From, &m.Move.To, &m.FromServer, &m.ToServer,
-		&m.State, &m.Attempts, &m.ExtMoveID, &m.Phase, &pct, &m.Size, &m.StartedAt, &m.FinishedAt, &m.Error, &m.Round, &mark)
+		&m.State, &m.Attempts, &m.ExtMoveID, &m.Phase, &pct, &m.Size, &m.StartedAt, &m.FinishedAt, &m.Error, &m.Round, &mark, &m.Move.Reason, &m.Move.Cost)
 	if mark != nil {
 		m.After, m.Marked = *mark, true
 	}

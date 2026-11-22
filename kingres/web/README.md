@@ -744,6 +744,31 @@ work is increment 8 of the design ("The console", in three parts that follow inc
   the reset dialog, the banner while a run goes on, the banner waiting for you) in the axe, layout and content-security runs, and the banner is
   checked at 1366, 683 and 320 px.
 
+## What the panel does for contract 0.16.0 (phases 10 and 11)
+
+The console is Vue 3 with TypeScript; the generated types come from `kingres/api/openapi.yaml` (`npm run api:generate`, checked by `npm run api:check`). New in this revision:
+
+- **Rebalance page.** The options have the strategy (by bucket count or by disk size), the threshold, "only move off servers that should not hold shards" and the moves per server; empty means the cluster setting. The plan preview
+  says the strategy, the threshold and how far the servers are from the ideal, shows the load of each server before and after and why each move is made (balance or drain). The status says what started the run (a person, the automatic mode,
+  a drain) and the past reports say it too. `RebalanceAutomaticCard.vue` shows the automatic mode (off by default), what it did at its last look and which rule held it back; the settings and the switch are buttons that need the administrator role.
+- **Servers page.** A weight column and a dialog to change it (`ServerWeightDialog.vue`; nothing moves until the next rebalance), a Drain button with the preview of the drain (`DrainServerDialog.vue`: the moves, the blockers each with its
+  words, the standbys the server hosts, the ordinary tables that leave with it and the two acknowledgements) and, for a server that does not hold shards, "Return to service". A drain is a rebalance task, so its progress is on the Rebalance page.
+- **Shards page.** A bucket shows its modulus and remainder and has "Split bucket" (`BucketSplitDialog.vue`: the number of new buckets, the preview with the disk it needs and the blockers; a split cannot be undone). The page lists the colocation
+  groups of kind `hash` only, so that the one-bucket groups of distributed schemas do not swamp it.
+- **Databases.** The create dialog has "Shard by" (rows, schemas, both) and "Distribute new schemas automatically"; the bucket count is shown for rows and both. The settings dialog changes the mode and the default (read-only text for roles that cannot
+  update the database; a refusal is shown with its problem code `sharding_mode_in_use`).
+- **Schemas** on the database page (`SchemasSection.vue`, `SchemaDialogs.vue`): the list with the distribution, the server group, the tables and the size ("not available", never 0); Distribute schema (the blockers of `getSchema` are listed and the
+  button waits while there are any), Move schema (the target group and the tables that need REPLICA IDENTITY FULL; a pinned schema says why it cannot move) and Make local (type the name; an optional move first). Schema names are shown through
+  `SafeName`, so a hostile name is text. The buttons are `GateButton`s: a read-only role sees them disabled with the role they need.
+- **Mock.** `src/mocks/elasticity.ts` has the new operations: schemas `failme` (the task fails), `analytics` (a blocker), `ledgerdocs` (pinned), `nokey` (a table without a key), a hostile name, and distributed ones; a drain, a split, weights, settings of
+  the automatic mode.
+- **Tests.** `tests/elasticity-0-16.test.ts` (18 tests: the options and the automatic card for both roles, the weight and its validation, the drain, the return to service, the split, the schemas list with a hostile name, the blockers, a failing task,
+  the replica identity, a pinned schema, the typed confirmation, the read-only role, the create dialog). `browser-tests/elasticity-0-16.test.ts` opens the drain, weight, split and schema dialogs and the automatic card in a real browser and runs axe (colour contrast included) in light and dark at 1366 and 320 pixels, and checks that the page does not scroll sideways. The in-flight list and the plan show a unit of kind `schema` (the schema name as text) and a bucket that is being split; the mock server of the console never sends one, so a test makes the answer up. The extension does not plan schemas yet.
+- **Schemas, the second pass** (`tests/schemas-panel-0-16.test.ts`, 8 tests). The create dialog sets "Distribute new schemas automatically" with the mode (checked for Schemas, unchecked for Rows and Both, as the design says) and the settings dialog
+  switches it off with Rows. Distribute schema offers "Place on server group" (automatic keeps the schema where it is) and "Also set REPLICA IDENTITY FULL on the tables that have no primary key"; neither is offered while the schema has blockers. A schema task that ends
+  in `schema_pinned` or `schema_move_in_progress` is shown as the problem notice of that code, and a `schema.move` that failed says "The schema is still on its original group and in use. You can start the move again." The Shards page lists the distributed schemas per server group
+  (a count and a size, "not known" never as 0).
+
 ## What the panel does for contract 0.8.0
 
 Phase 13, configuration from the console (design: `kingres/docs/design/config-phase13.md`). Contract 0.8.0 adds 11 operations (100

@@ -151,6 +151,8 @@ Each task kind has exactly one `subject.type`; `subject.id` is always a string.
 | `database.create`, `database.update`, `database.drop` | `database` | the database name |
 | `table.distribute`, `table.undistribute`, `table.alter`, `table.partition` | `table` | `database/schema.table` (0.14.0: the table the request named; one table task per colocation group) |
 | `rebalance` | `cluster` | `cluster` (0.9.0; one rebalance at a time, cluster-wide; the task id is the report id): steps `Check that the cluster can rebalance`, `Compute the plan`, `Move buckets`, `Write the report`; a stopped run is `paused` |
+| `schema.distribute`, `schema.move`, `schema.undistribute` (0.16.0) | `schema` | `database/schema`: steps `Check the schema`, `Set REPLICA IDENTITY FULL`, `Make the schema distributed`, `Verify on every server`; `Check the move`, `Copy the data`, `Switch`, `Clean up the old copy`; `Check the schema`, `Move first`, `Make the schema local`, `Verify on every server`; one schema task at a time per schema |
+| `bucket.split` (0.16.0) | `bucket` | `database/colocationId/bucket`: steps `Check that the split can start`, `Split the bucket`, `Check the new buckets`; one split per colocation group at a time |
 | `replication.restorePreferredPrimaries` | `replication` | `preferred-primaries` (0.10.0: answers `unsupported_operation` until the switchover is built) |
 | `ledger.verify` | `ledgerVerification` | the **database name**: the verification id exists only after the run (see `LedgerVerification.taskId`) |
 | `ledger.key.create`, `ledger.key.rotate`, `ledger.key.retire`, `ledger.key.revoke`, `ledger.key.distribute` (0.11.0) | `ledgerKey` | `signing`: the signing keys of the ledger; one key task at a time, cluster-wide. `ledger.key.create` makes the first key (generate, store, distribute, event, activate); `ledger.key.rotate` adds the next key and starts the overlap; `ledger.key.retire` and `ledger.key.revoke` end a key; `ledger.key.distribute` brings the holders of the key up to date (started by `kingresd` when the holders change). No private key, seed or passphrase is ever in a step, a detail, a result or an error |
@@ -317,6 +319,46 @@ Where the architecture document leaves something open, the simplest option was c
     range and the cluster's replica count.
 
 ## Changelog
+
+### 0.16.0
+
+Revision written with the control plane of phases 10 (elasticity) and 11 (distributed schemas) of `kingres/docs/design/shard-phase10.md` and `shard-phase11.md`. It is built in increments; this
+entry grows with them. Summary for the panel:
+9 operations added (149 operations, 121 paths) (`drainServer`, `previewServerDrain`, `previewBucketSplit`, `splitBucket`, `listSchemas`, `getSchema`, `distributeSchema`, `undistributeSchema`, `moveSchema`); the six rebalance operations, `updateServer` and the cluster settings gain optional members; **no change that is not additive**.
+
+#### Breaking
+
+None.
+
+#### Additive
+
+- `RebalanceOptions` (the request of `startRebalance` and `previewRebalancePlan`, and the `options` of the status and the reports) has `strategy` (`byBucketCount` or `byDiskSize`, the new schema
+  `RebalanceStrategy`), `threshold`, `drainOnly`, `maxMovesPerServer`, `acknowledgeFailures` and `cleanupDelaySeconds`; `RebalancePlanRequest` has `excludeServerIds` (plan as if these servers
+  should not hold shards: the preview of a drain).
+- `PlannedMove` has `cost` and `reason` (`balance` or `drain`); `RebalancePlan` has `strategy`, `threshold` and `imbalance`, and its server impacts `loadBefore` and `loadAfter`;
+  `RebalanceStatus` has `strategy`, `threshold` and `trigger`; `RebalanceReportSummary` has `trigger`, `strategy` and `threshold`; a report move has `reason`.
+- `Server` has the optional `weight`, and `updateServer` accepts it (above 0, at most 1000): the capacity of the server relative to the others. It needs the sharding extension 0.8.
+- `drainServer` (`POST /servers/{serverId}/drain`, `kingres_ops`) and `previewServerDrain` (`GET /servers/{serverId}/drain-preview`): empty a server so that it can be removed. A drain is a task of kind
+  `rebalance` (trigger `drain`), not a new kind: the status, the stop, the report and the exclusion of server operations are the rebalance's. New schemas `DrainRequest`, `DrainBlocker`, `DrainPreview`;
+  new problem codes `replicas_cannot_be_kept`, `bucket_busy` and `split_unsupported` (the last two are for the split, below); `AuditAction` has `drainServer`.
+- `previewBucketSplit` (`POST .../buckets/{bucket}/split-preview`, `kingres_readonly`) and `splitBucket` (`POST .../buckets/{bucket}/split`, `kingres_admin`, task kind `bucket.split`, subject type `bucket`, id
+  `database/colocationId/bucket`): replace one bucket by 2, 4, 8 or 16 of a larger modulus on the same shard group. New schemas `BucketSplitRequest`, `BucketSplitPreview`, `BucketSplitChild`;
+  `BucketState` has `splitting`; `ColocationGroup` has the optional `baseBucketCount`, `maxModulus`, `kind` and `schemaName` (`bucketCount` is now the current number of buckets); `Bucket` has `modulus` and
+  `remainder`; `listColocationGroups` has the query `kind`; `TaskKind` has `bucket.split`, `TaskSubject.type` has `bucket`; `AuditAction` has `splitBucket`.
+- Distributed schemas (phase 11), tag `Schemas`: `listSchemas` and `getSchema` (`kingres_readonly`), `distributeSchema` and `undistributeSchema` (`kingres_admin`), `moveSchema` (`kingres_ops`); new schemas
+  `SchemaSummary`, `SchemaDistribution`, `SchemaDetail`, `SchemaBlocker`, `SchemaPage`, `DistributeSchemaRequest`, `MoveSchemaRequest`; task kinds `schema.distribute`, `schema.move`, `schema.undistribute` (subject type `schema`);
+  problem codes `sharding_mode_in_use`, `schema_not_distributable`, `schema_pinned`, `schema_move_in_progress`. The sharding mode: `ShardingCreateSettings` and `ShardingSettings` have `mode` (`row`, `schema`, `both`; the new
+  schema `ShardingMode`) and `distributeNewSchemas`, `bucketCount` is no longer required in a create request, `updateDatabase` takes `sharding.mode` and `sharding.distributeNewSchemas` (and `enabled` is optional),
+  `DatabaseCreateOptions` has `shardingModes`, `DatabaseStats` has `distributedSchemaCount`, `TableDistribution.method` has `schema`.
+- `BucketMove` (the moves in flight) and `PlannedMove` have the optional `kind` (`move`, `split` or `schema`) and `schemaName`; the extension plans no schema yet, a panel shows one when a server sends it.
+- The automatic mode: `RebalanceSettings.automatic` (new schema `RebalanceAutomaticSettings`, with `RebalanceWindow`), updated through `RebalanceAutomaticSettingsUpdate`, and
+  `RebalanceStatus.automatic` (`RebalanceAutomaticStatus`: whether it is on, when it looks next, what the last look decided and which rules held it back). `AlertKind` has `rebalanceFailed`.
+- `RebalanceSettings` has `strategy`, `threshold`, `maxMovesPerServer`, `maxMoveAttempts`, `maxDiskUsedFraction` and `maxStandbyLagBytes`; `updateClusterSettings` takes them in the new
+  `RebalanceSettingsUpdate`, in which every member is optional (`maxConcurrentMoves` was required before).
+
+#### Documentation
+
+- A client that does not know the new members works as before. The plan of an older extension (before 0.8) is still the plan by bucket count; asking for anything else is refused with 422 `unsupported_operation`.
 
 ### 0.14.0
 
