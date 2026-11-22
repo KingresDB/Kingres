@@ -44,6 +44,7 @@ type releaseVerifyArgs struct {
 	sums, note, key string
 	binaries        []string
 	name            string
+	acceptDryRun    bool
 }
 
 func (e *env) runReleaseVerify(args []string) int {
@@ -59,6 +60,7 @@ func (e *env) runReleaseVerify(args []string) int {
 	note := fs.String("note", "", "the SHA256SUMS.note file (a signed note over the sums)")
 	key := fs.String("key", "", "the release key: base64 of the 32 byte Ed25519 public key, or the full verifier key string")
 	name := fs.String("name", "", "the name of the release file the (one) --binary is, when the file was renamed")
+	acceptDryRun := fs.Bool("accept-dry-run", false, "exit 0 for a set that a dry run signed (the signed RELEASE file says the commit is unknown); without it such a set ends with status 5, and the verdict says NOT A RELEASE in both cases")
 	var bins stringList
 	fs.Var(&bins, "binary", "a binary to check against the sums; may be given more than once")
 	if code, done := e.parseFlags(fs, args); done {
@@ -70,7 +72,7 @@ func (e *env) runReleaseVerify(args []string) int {
 	if fs.NArg() != 0 {
 		o = inputOut(errors.New("unexpected argument " + fmt.Sprintf("%q", fs.Arg(0)) + ": files are given with --sums, --note and --binary"))
 	} else {
-		o = releaseVerifyRun(r, releaseVerifyArgs{sums: *sums, note: *note, key: *key, binaries: bins, name: *name})
+		o = releaseVerifyRun(r, releaseVerifyArgs{sums: *sums, note: *note, key: *key, binaries: bins, name: *name, acceptDryRun: *acceptDryRun})
 	}
 	switch o.kind {
 	case outInput:
@@ -173,6 +175,9 @@ func releaseVerifyRun(r *result, a releaseVerifyArgs) outcome {
 	}
 	if notARelease {
 		r.word = "VERIFIED (NOT A RELEASE)"
+		if !a.acceptDryRun {
+			r.exit = ExitNotRelease
+		}
 		r.headline += "; BUT the signed RELEASE file says the commit is unknown: this set was made by a dry run, from a checkout that was not clean or not at a release tag, so it is a signed build and not a release"
 		r.notes = append(r.notes, "finding: the signed RELEASE file records commit or date \"unknown\" (scripts/release.sh --dry-run). The signature is the release key's and the hashes match, and that is all the run shows: the set was not made from a clean tagged checkout, it must not be taken for a release and it cannot be reproduced from a tag")
 	}

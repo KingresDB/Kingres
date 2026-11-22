@@ -135,7 +135,7 @@ and says in capitals that the result is not a release.
 `release verify` shows what the signed `RELEASE` file says when you give it as a binary (`--binary RELEASE`, step `release-info`: version, commit, commit date, Go release), and it says in
 "not proved" that **this is the newest release** cannot be seen from the files: a genuine older release, with a known fault, verifies as well, and the signed files do not expire (a rollback
 to an older release is not detectable from them). Compare the version with the project's announcement of the newest release, which you must get from the project and not from the place the
-files came from. When the sums list no `RELEASE` file the output says so.
+files came from. When the sums list no `RELEASE` file the output says so. When the signed `RELEASE` file says the commit or its date is `unknown` (a set that `release.sh --dry-run` signed from a tree that was not clean or not at the tag), the verdict is `VERIFIED (NOT A RELEASE)` and the exit status is 5, so that a script that tests only the status does not take it for a release; `--accept-dry-run` gives status 0 for whoever wants such a set (the verdict word stays).
 
 `release.sh` makes a **signed** release only from a clean checkout whose `HEAD` is exactly the tag of the version (`--tag NAME`, default `v<version>`, as in `v0.1.0`): it refuses a tree
 with any change, tracked or not, a tag that does not exist, a `HEAD` that is not the tag, and a directory that is not a git checkout, and it never creates a tag. `--dry-run` (with `--key-file`) makes and
@@ -223,7 +223,7 @@ unknown subcommand.
 | `bundle fetch` | 0, 1, 2, 3 |
 | `monitor` | 0, 1, 2, 3 |
 | `attestation` | 0, 1, 2, 3 |
-| `release verify` | 0, 1, 2 |
+| `release verify` | 0, 1, 2, 5 (a genuine set made by a dry run: `--accept-dry-run` gives 0) |
 | `trust init` | 0, 2 |
 | `trust show` | 0, 2 |
 | `trust follow` | 0, 1, 2, 3 |

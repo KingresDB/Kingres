@@ -271,11 +271,12 @@ func TestReleaseVerifyMarksASignedSetWhoseCommitIsUnknown(t *testing.T) {
 		return []string{"release", "verify", "--sums", writeTemp(t, d, "SHA256SUMS", string(sums)), "--note", writeTemp(t, d, "SHA256SUMS.note", string(note)), "--key", key, "--binary", writeTemp(t, d, release.InfoName, string(info))}
 	}
 	for name, a := range map[string][]string{
-		"commit unknown": args("unknown", "unknown"),
-		"date unknown":   args(strings.Repeat("c0", 20), "unknown"),
+		"commit and date unknown": args("unknown", "unknown"),
+		"commit unknown":          args("unknown", "2026-11-21T10:00:00Z"),
+		"date unknown":            args(strings.Repeat("c0", 20), "unknown"),
 	} {
 		code, out, errs := run(t, a...)
-		if code != 0 || !strings.HasPrefix(out, "VERIFIED (NOT A RELEASE):") || strings.HasPrefix(out, "VERIFIED:") || !strings.Contains(out, "not a release") || !strings.Contains(out, "note: finding:") {
+		if code != ExitNotRelease || !strings.HasPrefix(out, "VERIFIED (NOT A RELEASE):") || strings.HasPrefix(out, "VERIFIED:") || !strings.Contains(out, "not a release") || !strings.Contains(out, "note: finding:") {
 			t.Errorf("%s: %d\n%s%s", name, code, out, errs)
 		}
 		if _, out, _ := run(t, append(a, "--json")...); !strings.Contains(out, `"not_a_release": true`) {

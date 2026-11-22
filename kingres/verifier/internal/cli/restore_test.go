@@ -183,3 +183,26 @@ func TestOnlyAForkIsExplainedByARestoreEventAndADamagedTileIsNot(t *testing.T) {
 		t.Errorf("a fork is explained without an event: %q", got)
 	}
 }
+
+// P7G-01: a record that was lost and made again from the database reaches a generation number that an earlier restore had. The publisher announces
+// the second cut under another subject, and the verifier reads both events: the same generation with another replaced record is a second cut, the
+// same generation with the same replaced record is a repetition and is not read.
+func TestTwoCutsOfOneGenerationWithOtherReplacedRecordsAreBothRead(t *testing.T) {
+	second := restoreLines(1, 11, 3, 6, 2)
+	second[3] = "published-state-sha256: " + sha2hex // another replaced record
+	w, _, _ := stdWorld(t)
+	w.event(0, "restore-acknowledged", []signer{w.s1}, restoreLines(1, 9, 2, 4, 1)...)
+	w.event(1, "restore-acknowledged", []signer{w.s1}, second...)
+	out := wantRun(t, 0, w.aggArgs(), "VERIFIED:", "verified event 000000 (restore-acknowledged, generation 1", "verified event 000001 (restore-acknowledged, generation 1")
+	if strings.Contains(out, "not in the form the publisher writes") || strings.Contains(out, "acknowledged twice") {
+		t.Fatalf("a second cut of one generation was refused:\n%s", out)
+	}
+	// a true repetition (the same generation and the same replaced record) is not read
+	w2, _, _ := stdWorld(t)
+	w2.event(0, "restore-acknowledged", []signer{w2.s1}, restoreLines(1, 9, 2, 4, 1)...)
+	w2.event(1, "restore-acknowledged", []signer{w2.s1}, restoreLines(1, 11, 3, 6, 2)...)
+	out = wantRun(t, 0, w2.aggArgs(), "VERIFIED:", "verified event 000000", "finding: event 000001 is signed by an authorised key", "acknowledged twice")
+	if strings.Contains(out, "verified event 000001") {
+		t.Fatalf("a repetition was read:\n%s", out)
+	}
+}

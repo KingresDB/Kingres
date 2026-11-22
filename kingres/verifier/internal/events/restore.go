@@ -11,7 +11,7 @@ import (
 // The event restore-acknowledged (ledger-phase7.md 9.4, ADR 0025): an operator accepted that the system database of the cluster was restored to an
 // older state than what was published, and the publisher goes on from the restored database. The text:
 //
-//	generation: <n>                  the generation of the record of what was published, from 1 (the count of accepted restores)
+//	generation: <n>                  the generation of the record of what was published, from 1 (the count of accepted restores; a record made again from the database may reach a number twice, with another replaced record)
 //	published-events: <n>            the events the replaced record held
 //	published-logs: <n>              the logs it held
 //	published-state-sha256: <64 hex> the SHA-256 of that record's state
@@ -118,9 +118,12 @@ func (w *Walk) readRestoreAcknowledged(ev *Event, authorised []*Key) error {
 		}
 	}
 	r.Reason, r.AcknowledgedBy = ev.Fields["reason"], ev.Fields["acknowledged-by"]
+	// A record that was lost and made again from the database starts at generation 0 and reaches a number that an earlier restore had: the
+	// second cut has the same generation and replaced another record (P7G-01). Only the same generation with the same replaced record is a
+	// repetition of one event.
 	for _, prev := range w.Restores {
-		if prev.Generation == r.Generation {
-			return fmt.Errorf("the generation %s is acknowledged twice", strconv.FormatUint(r.Generation, 10))
+		if prev.Generation == r.Generation && prev.PublishedSHA == r.PublishedSHA {
+			return fmt.Errorf("the generation %s with the same replaced record is acknowledged twice", strconv.FormatUint(r.Generation, 10))
 		}
 	}
 	for _, k := range authorised {
