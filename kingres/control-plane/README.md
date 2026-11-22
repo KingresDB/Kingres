@@ -306,6 +306,11 @@ handlers in `internal/httpapi/handlers_config.go`, wiring in `cmd/kingresd/confi
   PostgreSQL 18 shows `archive_command` and `restore_command` to every database user, so they are refused by name and
   their value is never returned by this API. Cluster-only parameters (`TimeZone`, `lc_*`, `DateStyle`,
   `kingres_shard.default_bucket_count`, ...) cannot be set per server group or server.
+- **Warnings of the preview** (contract 0.17.0, `pgconfig/warnings.go`) never make a request invalid: `config_value_unusual`
+  for a memory value above ten times or below a tenth of the default of the parameter (exactly ten times and a tenth
+  pass; a default of zero never warns), and `config_reserved_connections` when on some server `max_connections` would
+  not exceed `superuser_reserved_connections + reserved_connections`. The sum is computed from the values the change
+  gives and the running ones (a hand-written rule; `postgres -C` does not check it, PostgreSQL checks it at the start).
 - **Validation** is PostgreSQL's: `pg_settings` (type, unit, range, enum), then `set_config` in a rolled-back
   transaction or `postgres -C` for the value, then `pg_file_settings` on the written file before it is reloaded
   (a bad file is replaced by the previous one and never loaded). Nothing is written before every change of a
@@ -330,11 +335,14 @@ handlers in `internal/httpapi/handlers_config.go`, wiring in `cmd/kingresd/confi
   the override file with hostile values, the check before the reload. On three servers
   (`internal/clustertest/config_test.go`): cluster, group and server levels, removal, pending restart and the restart
   task, the order of standbys and primaries, refused and invalid values, a server that is down, a server that fails,
-  database and cluster time zones, the clock difference, history and revert, audit, roles.
+  database and cluster time zones, the clock difference, history and revert, audit, roles. The tests that the check of
+  the phase against its design found missing are in `config_closing_test.go`: `pg_file_settings` clean on every server, a
+  value that PostgreSQL rejects in the file (the file is restored and the text is reported), a database time zone seen
+  on a standby, and the warnings of the preview.
 
 ## What is implemented
 
-The server implements revision **0.14.0** of the contract (140 operations, 113
+The server implements revision **0.17.0** of the contract (140 operations, 113
 paths; what is not done is in "Not done in this increment"). "Real" means the operation works against PostgreSQL or the local node
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**

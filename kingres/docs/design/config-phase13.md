@@ -168,7 +168,26 @@ Policy additions (not superuser-only, still refused):
   acknowledged commits (the durability promise of ADR 0011);
 - `kingres_shard.fault_injection`, `kingres_shard.forwarded`, `kingres_shard.forward_token`: test hooks and
   per-session internals of the sharding extension;
-- parameters of context `internal` (cannot be set at all).
+- parameters of context `internal` (cannot be set at all);
+- (review P13R-01) the parameters that change how every session of `kingresd` itself behaves, because its service connections, also
+  those to `kingres_system`, take the cluster's and the database's defaults: `default_transaction_read_only`,
+  `transaction_read_only`, `default_transaction_isolation`, `transaction_isolation`, `session_replication_role`, `statement_timeout`,
+  `lock_timeout`, `idle_in_transaction_session_timeout`, `idle_session_timeout`, `transaction_timeout`, `search_path`, `row_security`,
+  `default_table_access_method`, `default_tablespace`, `temp_tablespaces` and `check_function_bodies` (reason code `controlPlaneSession`).
+  A cluster-wide `default_transaction_read_only = on` had put the task engine, the alert updater and the standby code into read-only
+  transactions with no way back from the console. They remain settable for one role on the server, outside the console;
+- (review P13R-02) the parameters that PostgreSQL accepts in a file and then fails to start with when the host cannot honour them: `huge_pages`,
+  `huge_page_size`, `shared_memory_type`, `dynamic_shared_memory_type`, `min_dynamic_shared_memory`, `bonjour`, `bonjour_name`, `event_source`
+  (reason code `startRisk`), and **every parameter whose name starts with `ssl`** (a bad value or a missing file stops the postmaster or
+  cuts `kingresd` off; the ones the cluster sets itself stay `managed`). `unix_socket_permissions` and `unix_socket_group` are managed
+  with `unix_socket_directories`, and so are `log_destination` and the `syslog_*` parameters (another destination leaves the collector
+  files, which the console reads, empty). `log_line_prefix` and `log_error_verbosity` stay settable: nothing of the console parses the
+  line shape.
+- (second review, P13S-02 to P13S-09) `log_transaction_sample_rate`, `log_statement_sample_rate` and `log_min_duration_sample` are managed (they write statement text to  the log), `log_file_mode` is managed; `archive_mode` (WAL piles up without a command), `client_encoding` (the own connections of `kingresd` send none),  `restart_after_crash`, `recovery_min_apply_delay` and `max_slot_wal_keep_size` are refused; `max_worker_processes` has a floor of 8 ("Managed parameters", floors).
+
+A **stored value whose name later becomes managed or refused** (an upgrade adds a name to a list) is never written and never blocks an
+apply: the leader leaves it out of the request, the server leaves it out of the file with a warning, and its **removal** (`value: null`)
+is accepted for any stored value whatever the parameter has become, also when its server group or database is gone (review P13R-05).
 
 Both the managed and the refused rows are returned by the API with `kind: managed` or `kind: refused`, the
 reason code and a sentence, so the console shows them read-only with the reason instead of hiding them.
@@ -340,6 +359,12 @@ the **order** of restarts and not of the stored values (below); `max_wal_senders
 `superuser_reserved_connections + reserved_connections + 1`, which PostgreSQL checks itself at start (the preview
 reads it from layer 3 and warns, it is not a hand-written table).
 
+**As built (contract 0.17.0):** the warning is `config_reserved_connections` in the new `warnings` of the preview. `postgres -C` does not
+check this rule (PostgreSQL checks it at the start of the postmaster, after the dry run), and `pg_file_settings` does not report it, so there
+is no layer-3 reading to use. The leader computes the sum from the values the change gives (the stored values that decide on each server, else
+the running ones) and warns for the first server where `max_connections < superuser_reserved_connections + reserved_connections + 1`. It is a
+warning and not a problem because the file is valid and the instance runs until its next start; `valid` stays a function of `problems` only.
+
 ## Applying a change
 
 The task kind is `config.apply`, the subject is `{type: config, id: cluster}` (one unfinished configuration task
@@ -397,12 +422,13 @@ The server answers `{state, parameters: [{name, state, runningValue, error}]}`; 
   on 10.0.0.11, 10.0.0.13; failed on 10.0.0.12: invalid value for parameter ...". Nothing is hidden: the page lists
   the server as failed and the **Retry** action sends the same internal call again (it is idempotent), and the
   operator may instead revert the change, which is a new change.
-- **Server is down or unreachable.** The step waits (`onServer`): the task detail says "Waiting for server X",
-  `config_server_state` says `waiting`, the monitor's alert `replicationPending` already covers servers that stay
-  behind (its subject names the behind server). The task never gives up (as `replicate.apply`); a leader that
-  changes resumes it (the task is a row, with a lease). A server that is **stopped by the operator** shows
-  `waiting` too, and gets the file when it returns; a cancelled task (`cancelTask`) leaves the revision recorded
-  and the servers that were not reached `waiting` with the page offering Retry.
+- **Server is down or unreachable.** *As built after the review (P13R-03):* the step tries once, records the server as
+  `waiting` (`config_server_state`), says so in the task detail and **goes on to the next server**; the task ends `done` and no
+  later change is kept out. The leader's convergence loop (every 30 seconds, `converge.go`) compares the hash of the file a
+  server holds with the one the stored values give and brings the server up to date within a minute of its return. The
+  design first said that the step waits and that the task never gives up (as `replicate.apply`); the review showed that a stopped
+  server in the middle then kept the servers after it from the change and every later change (409
+  `operation_in_progress`) out for as long as it was down. A server that is **stopped by the operator** shows `waiting` too.
 - **Instance of a server is stopped but the server is reachable.** The file is written (step 4's `postgres -C`
   check) and the state is `applied` with the detail "instance not running: read at start".
 - **Crash of `kingresd` between write and reload.** The file is already the wanted one; the resumed step finds it
@@ -427,8 +453,11 @@ with 422 when the old value is no longer valid (a parameter's range depends on t
 
 Every accepted change is audited under the operation id (`applyConfigChange`, `revertConfigChange`,
 `restartPendingInstances`, added to the closed enum `AuditAction`), a denied or failed call too. `details` of
-`applyConfigChange` is `{revision, changes: [{name, level, scopeId, oldValue, newValue}], servers}` and the
-resource is `config` / the revision. `taskId` is the task. Values are those that may be shown to every database
+`applyConfigChange` is `{basedOnRevision, changes: [{name, level, scopeId, oldValue, newValue}], servers, taskId}`
+and the resource is `config` (review P13R-12: the revision the change gets is allocated by the task after the audit event is
+written, so the event carries the revision it was checked against and the task id, whose `config_change` rows have the revision;
+`newValue` is the normalized text that is written, and `revertConfigChange` carries `reverts` and the same fields). A request that
+is refused is audited too, with `attempted: [{name, level, scopeId, remove}]` and **never a value**. Values are those that may be shown to every database
 user (section "Security"); a value of a refused or hidden parameter can never be in a change, so none can be in
 the audit. The history that the page lists (`listConfigChanges`) is `config_change`: it carries the same data and
 the link to the revert.
@@ -457,7 +486,16 @@ instances that wait for a restart, **one server at a time**, and stops at the fi
    connections and (for a standby) streams again, up to 120 seconds, before the next.
 3. Each instance is stopped and started with the existing instance operations (`instance.stop`, `instance.start`
    semantics; the restart of the instance that holds the system database follows the existing refusal
-   (409) unless it is the only way, and says so).
+   (409) unless it is the only way, and says so). *As built after the review (P13R-06, P13R-02):* the instance that holds the system
+   database goes through the lifecycle of the operations code (`Ops.BeginConfigRestart`: the state "restarting", the refusal of a start
+   or stop meanwhile, the wait for the system database), every instance through the manager's lease gate, and the pair order uses the
+   primary of each group as the leader last saw it (`group_replication_state`), not instance 1 of the server the standby was created
+   for. Before the instance is stopped, PostgreSQL's parser checks the whole configuration (`postgres -C`), and a refused file stops
+   the restart. *As built after the second review (P13S-01):* every successful start of an instance keeps its override file as
+   `kingres-config.conf.good`, and the **manager** tries a start that fails with the override file once more with that file (or the empty
+   one when none was kept, never the file that the last change replaced), for every start: the restart of the task, a reboot, a crash, an
+   operator. It leaves a mark that the task reads, and the task fails with the text of PostgreSQL; the stored value stays, and the operator
+   removes or reverts it. A second failure leaves the instance down and says so.
 4. After each instance the step reads `pending_restart` again and records the state.
 
 A `config.restart` task is not started while a `config.apply` task is unfinished (409).
@@ -528,7 +566,7 @@ A new tag `Configuration`. All answers are `application/json` and every operatio
 |---|---|---|---|
 | `listConfigParameters` | `GET /config/parameters` | `kingres_readonly` | `ConfigParameterList` (`items`, `nextCursor`, `revision`, `partial`, `missingServers`). Query: `q` (name and description), `category`, `changed` (has an override), `differing` (values differ between servers), `pendingRestart`, `kind` (`settable`, `managed`, `refused`), `limit` (1 to 500, default 50 like the other lists), `cursor`. Keyset by name |
 | `getConfigParameter` | `GET /config/parameters/{name}` | `kingres_readonly` | `ConfigParameter` (404 `config_parameter_unknown`) |
-| `previewConfigChange` | `POST /config/changes/preview` | `kingres_admin` | `ConfigChangePreview`: `valid`, `problems[]` (per change: pointer, code, message), `effects[]` (per server and parameter: before, after, how it takes effect: `unchanged`, `reload`, `restart`, `waits` for a server that is down), `restartServerIds`, `restartOrder[]` and `restartOrderConflict`. Status 200 also when `valid` is false (it is a question, not a request). Admin because it takes the same body as the change and reads nothing a readonly role needs; the console shows it to admins only |
+| `previewConfigChange` | `POST /config/changes/preview` | `kingres_admin` | `ConfigChangePreview`: `valid`, `problems[]` (per change: pointer, code, message), `effects[]` (per server and parameter: before, after, how it takes effect: `unchanged`, `reload`, `restart`, `waits` for a server that is down), `restartServerIds`, `restartOrder[]` and `restartOrderConflict`, and (0.17.0) the optional `warnings[]` (`index`, `pointer`, `code`, `message`: `config_value_unusual`, `config_reserved_connections`; never a reason for `valid` to be false). Status 200 also when `valid` is false (it is a question, not a request). Admin because it takes the same body as the change and reads nothing a readonly role needs; the console shows it to admins only |
 | `applyConfigChange` | `POST /config/changes` | `kingres_admin` | 202 `Task` (kind `config.apply`) with `Location`; 400 `validation_failed` / `config_value_invalid`, 422 `config_parameter_managed`, `config_parameter_refused`, `config_level_not_allowed`, `config_value_below_floor`, 404 `not_found` for an unknown server group, server or database, 409 `operation_in_progress` |
 | `listConfigChanges` | `GET /config/changes` | `kingres_readonly` | `ConfigChangeList` (history, newest first, keyset by `changeId`); query `name`, `level`, `scopeId`, `limit`, `cursor` |
 | `revertConfigChange` | `POST /config/changes/{changeId}/revert` | `kingres_admin` | 202 `Task`; 404 unknown change, 409 `config_change_superseded` |
@@ -682,7 +720,9 @@ that is off on one server and the time zone `Asia/Tehran`. Switches (mock only):
   limited by the guard's usual limits; `postgres -C` runs one at a time with a 10-second limit.
 - **Denial of service by settings**: floors protect `kingresd`'s own needs (above); everything else is the
   administrator's responsibility and the preview says when a value is far outside the default (a value more than
-  ten times the default of a memory parameter, or below a tenth, is flagged "unusual", not refused).
+  ten times the default of a memory parameter, or below a tenth, is flagged "unusual", not refused). Built in contract 0.17.0 as
+  the warning `config_value_unusual`: exactly ten times and exactly a tenth are not flagged, a parameter that is not a memory size
+  (unit `B`, `kB` or `8kB`) is never flagged, and nor is a default of zero or a removal of a value.
 - **Roles**: the read operations are `kingres_readonly` like the other readers; a `kingres_stats` account
   cannot reach them; the changes are `kingres_admin`; every change is audited with old and new value.
 - **The managed file keeps priority**: a configuration override can never beat a managed setting, because the
@@ -782,3 +822,61 @@ Each increment builds and passes its own tests; the contract checker passes from
 - **Values that PostgreSQL shows but kingresd does not.** The value of a parameter whose name says it runs a command or
   loads code (`archive_command`, `restore_command`, ...) is never returned, although PostgreSQL 18 shows it to every
   database user.
+
+## The check against the design
+
+A check of phase 13 against this design (2026-11-21; its result was first only a line in the README and the work log) compared the sections
+above with the code and the tests. Everything else was built and tested; what was missing, and what was done:
+
+| What the design says | Found | Done |
+|---|---|---|
+| The preview warns that `max_connections` would not exceed the reserved connections ("Validation") | Not built: the preview had no place for a warning on a valid request | `warnings` added to `ConfigChangePreview` (contract 0.17.0, additive), code `config_reserved_connections`; `pgconfig/warnings.go`; the console shows it. Deviation: computed from the effective values, not read from layer 3 (see "Validation") |
+| The preview flags a value more than ten times or below a tenth of the default of a memory parameter ("Security") | Not built | Code `config_value_unusual`, with the edges tested (exactly ten times, exactly a tenth, other units, zero default, string); the console and its mock show both warnings |
+| Integration: `pg_file_settings` is clean after a cluster-level change | Only `pg_settings` was read | `TestConfigFileSettingsAreCleanOnEveryServer` |
+| Integration: a value that PostgreSQL rejects in the file, injected past the validator, restores the file and reports PostgreSQL's text |  Only a server that cannot write its file was tested (`TestConfigFailedServerIsReported`, skipped when the tests run as a user that ignores directory modes) | `TestConfigValueRejectedByPostgreSQLInTheFileRestoresTheFile`: a time zone that no checker of `kingresd` knows is stored behind the validator |
+| Integration: a database time zone is applied on every server "and on a standby by replay" | Only the primary instances were read | `TestConfigDatabaseTimeZoneReachesTheStandbys` reads a standby over its socket |
+| Integration: the preview on a real cluster | Only effects and problems were checked | `TestConfigPreviewWarnings`, with the answer checked against the contract |
+
+**The independent review of 2026-11-22** ([reviews/2026-11-22-config-phase13.md](../reviews/2026-11-22-config-phase13.md), P13R-01 to P13R-15) compared the code
+with this design again and found places where the design itself was wrong or silent. What changed in the design (the sections above say it where it applies):
+
+| What the design said | Found | Done |
+|---|---|---|
+| Everything not refused is settable | `default_transaction_read_only` and the other session defaults put the control plane into read-only mode with no way back (P13R-01) | They are refused at every level (reason `controlPlaneSession`); "Refused parameters" lists them |
+| The managed list protects the connection (`listen_addresses`, `port`, `unix_socket_directories`) | `unix_socket_permissions`, `unix_socket_group`, `huge_pages`, `ssl_*` and others cut `kingresd` off or stop the postmaster (P13R-02) | Managed or refused; a restart is checked with `postgres -C` first and a restart that cannot start puts the last good file back |
+| "The step waits and never gives up" for a server that is down | A stopped server in the middle blocked the later servers and every later change (P13R-03) | The step records `waiting` and goes on; the convergence loop brings the server up to date |
+| The superuser-only set is read at run time | An error gave an empty set and the classification failed open (P13R-04) | An error or an empty set fails the request (503); connection strings are always hidden |
+| A refused or managed name cannot be set | A stored value that later became managed blocked every apply and could not be removed (P13R-05) | Not written, not blocking, and its removal is always accepted |
+| The restart uses "the existing instance operations" | It bypassed the lifecycle and assumed instance 1 is the primary (P13R-06) | `Ops.BeginConfigRestart`, and the pair order uses the primary the leader last saw |
+| Audit `details` are `{revision, changes, servers}` | Only `{changes, taskId}`, with the text the caller sent (P13R-12) | See "The audit log" |
+| Task code `validation_failed` | The code was `step_failed` (P13R-15) | `validation_failed` and `config_incomplete` are coded task errors |
+| (silent) two administrators on one parameter | The second silently overwrote the first, and Retry resent a stale request (P13R-11) | `expectedRevision` of `ConfigChangeRequest`, sent by the dialog |
+
+Tests that the review found missing or too weak and that now exist: the time-zone tests use a zone that is not the host's (P13R-07), the order of the `config.restart` steps is
+compared with the preview (P13R-08), `0100` and `00` are in the unit table of the checker (P13R-09), and the reserved-connections warning names every server and makes
+no claim for a removed override (P13R-10).
+
+Not a gap, found already built: the differential validator test and `TestRefusedSetMatchesVersion` (`pgconfig/pg_test.go`, run with a real
+PostgreSQL), the order of restarts for a standby and its primary, the precedence of the levels, the roles, the hidden values and the audit
+entries (`clustertest/config_test.go`). The console unit and browser tests of the design are as built; the unit tests of the warnings are in
+`pgconfig/warnings_test.go` and the web tests of the mock and the dialog.
+
+One test of the design cannot work exactly as written: "an invalid value in the file, injected past the validator" has no hook in `kingresd`
+(there is no fault point in the agent), so the test stores the value in `kingres_cp.config_value` directly, which is the same state, and
+removes it in its clean-up.
+
+The text that the console shows for a value that PostgreSQL refuses **in the file** is what `pg_file_settings.error` holds, which is
+`setting could not be applied` for every such value (PostgreSQL's own reason goes to its log only), with the name of the parameter. A
+message with PostgreSQL's reason (`invalid value for parameter "TimeZone"`) is given only by layer 3, before anything is written. The
+design's "reports PostgreSQL's text" for a rejected file is therefore this text; the test asserts it.
+
+**The review of the fixes (2026-11-22, second)** ([reviews/2026-11-22-config-phase13-fixes.md](../reviews/2026-11-22-config-phase13-fixes.md), P13S-01 to P13S-09) found that the rollback of
+a restart had no good file in the common case and could fall back to a bad one, and more parameters that hurt a cluster. What changed in the design:
+
+| What the design said | Found | Done |
+|---|---|---|
+| A restart that cannot start puts the last good file back | The good file existed only after an apply that left nothing pending; with two changes before one restart the previous file was the bad one; a reboot or crash had no rollback (P13S-01) | Every successful start keeps the file as good; the manager retries a failed start with it (or the empty file) for every start; see "Restart" |
+| The managed and refused lists | Statement text through the sample-rate parameters, `archive_mode` without a command, `client_encoding`, `restart_after_crash`, `recovery_min_apply_delay`, `max_slot_wal_keep_size`, `log_file_mode` (P13S-02, 03, 06, 09) | Managed (the sample rates, `log_file_mode`) or refused (the others); "Refused parameters" |
+| Floors protect the needs of `kingresd` | `max_worker_processes = 1` silently left the workers of the extensions out (P13S-04) | Floor of 8 |
+| The loop compares the file of the server | Only instance 1: a standby never converged and a copied standby kept the source's server-level values (P13S-05) | The hash covers every instance; `InitStandby` writes the file of this server |
+| One configuration task at a time | A check followed by a start; `expectedRevision` checked before the record step only (P13S-07) | One step under a mutex of the leader; the record step checks the revision again under an advisory lock; the dialog waits for the revision |

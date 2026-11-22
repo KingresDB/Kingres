@@ -49,11 +49,11 @@ type Leader struct {
 	GatherTimeout time.Duration
 	// ClockEvery is how often the clocks of the other servers are measured for the alert (default 10 s).
 	ClockEvery time.Duration
-	// WaitPoll is how long a step waits between tries for a server that cannot be reached (default 2 s).
-	WaitPoll time.Duration
 
 	st store
-	tm timeCache
+	// startMu makes the check "no configuration task is unfinished" and the start of a task one step, for the apply and the restart (they have different subjects, so the engine would let both run) (P13S-07).
+	startMu sync.Mutex
+	tm      timeCache
 }
 
 // NewLeader prepares the leader's side.
@@ -64,9 +64,6 @@ func NewLeader(l *Leader) *Leader {
 	}
 	if l.GatherTimeout == 0 {
 		l.GatherTimeout = 3 * time.Second
-	}
-	if l.WaitPoll == 0 {
-		l.WaitPoll = 2 * time.Second
 	}
 	return l
 }
@@ -116,6 +113,8 @@ type snapshot struct {
 	values  []valueRow
 	stored  map[string]serverState
 	pairs   []standbyPair
+	// primaries is the server that runs the primary of each shard group now.
+	primaries map[int32]string
 }
 
 func (l *Leader) snapshot(ctx context.Context) (*snapshot, error) {
@@ -135,6 +134,9 @@ func (l *Leader) snapshot(ctx context.Context) (*snapshot, error) {
 	}
 	if sn.pairs, err = l.st.standbys(ctx); err != nil {
 		sn.pairs = nil // a cluster without the standby table yet has no standbys
+	}
+	if sn.primaries, err = l.st.groupPrimaries(ctx); err != nil {
+		sn.primaries = nil // without it the primary of a pair is the server the standby was created for
 	}
 	var mu sync.Mutex
 	var wg sync.WaitGroup

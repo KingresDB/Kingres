@@ -448,3 +448,27 @@ func (o *Ops) runRestart(lc LifecycleControl, rec TaskRecorder, t task.Task, rec
 		o.flush(ctx, rec)
 	}
 }
+
+// BeginConfigRestart brackets the restart that the configuration code (phase 13, config.restart) makes of
+// an instance: for the instance that holds the system database it checks the state like
+// restartThisServerInstance does, enters the state "restarting" (so that the server page does not say
+// "running" while it is down, and no start or stop runs meanwhile) and returns the function that waits for
+// the system database and leaves the state. Another instance (a standby, a primary that a failover
+// brought here) is restarted by the manager alone, which holds the lease gate (P13R-06).
+func (o *Ops) BeginConfigRestart(ctx context.Context, id int) (func(context.Context, error), error) {
+	if id != cluster.NodeID {
+		return func(context.Context, error) {}, nil
+	}
+	_, err := o.beginOp(ctx, "restart")
+	if err != nil {
+		return nil, err
+	}
+	return func(ctx context.Context, err error) {
+		if err == nil {
+			if werr := o.waitSystemDatabase(ctx); werr != nil {
+				o.Log.Error("the system database did not come back after the configuration restart", "error", werr)
+			}
+		}
+		o.life.clearIf(StateRestarting)
+	}, nil
+}

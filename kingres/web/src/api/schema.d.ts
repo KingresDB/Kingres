@@ -2357,13 +2357,13 @@ export interface paths {
          *     and starts the task `config.apply`: it checks the request again, records the change, then writes the
          *     override file of each server, checks it with PostgreSQL, reloads and reads the effective values back, one step
          *     per server. A parameter that needs a restart is reported `pendingRestart` per server; nothing is restarted
-         *     (see `restartPendingInstances`). A server that is down gets the change when it returns (the step waits and says
-         *     which). A server that fails does not stop the others: the task ends failed with `config_incomplete`, and the
+         *     (see `restartPendingInstances`). A server that is down is recorded as waiting and the task goes on and ends without it (changed in 0.17.0: before, the task waited for it and blocked every later change); the leader brings it up to date within a minute of its return
+         *     (`listConfigServers` shows it as `waiting`). A server that fails does not stop the others: the task ends failed with `config_incomplete`, and the
          *     steps and `listConfigServers` say which servers applied, wait for a restart, failed or wait. Refused with 400
          *     `validation_failed` (a value that is not valid for its parameter; `errors[]` names the change) and 422
          *     `config_parameter_managed`, `config_parameter_refused`, `config_level_not_allowed` and `config_value_below_floor`;
-         *     404 `not_found` for an unknown server group, server or database; 409 `operation_in_progress` while another
-         *     configuration task runs. Nothing is written before every change has passed.
+         *     404 `not_found` for an unknown server group, server or database; 409 `config_change_superseded` when `expectedRevision` is older than a change of a value the request changes (0.17.0); 409 `operation_in_progress` while another
+         *     configuration task runs. Nothing is written before every change has passed. A stored value can always be removed (`value: null`), also when its parameter has become managed or refused since it was set (0.17.0). The audit event has the checked changes with the old and the normalized new value, the servers and the task id; a refused request is audited with the names and levels only, never a value.
          */
         post: operations["applyConfigChange"];
         delete?: never;
@@ -6835,6 +6835,15 @@ export interface components {
         /** @description One or more changes applied together as one revision. */
         ConfigChangeRequest: {
             changes: components["schemas"]["ConfigChangeItem"][];
+            /**
+             * Format: int64
+             * @description Added in 0.17.0, optional. The configuration revision the client saw (`ConfigParameter.overrides[].revision`, or
+             *     `ConfigParameterList.revision`; 0 when it saw no stored value). `applyConfigChange` answers 409
+             *     `config_change_superseded` when a value the request changes was changed by a later revision, unless it already holds the
+             *     wanted value (so the repeat of a request whose change was recorded passes). Without it nothing is compared and the
+             *     last request wins, as before. `previewConfigChange` ignores it.
+             */
+            expectedRevision?: number;
         };
         /** @description Why one change of a request is not valid. */
         ConfigProblem: {
@@ -6848,6 +6857,21 @@ export interface components {
              */
             code: string;
             /** @description A sentence, with PostgreSQL's own text for an invalid value. */
+            message: string;
+        };
+        /** @description Why one change of a valid request deserves a second look. */
+        ConfigWarning: {
+            /** @description Position in `changes`. */
+            index: number;
+            /** @description JSON pointer into the request, for example `/changes/0/value`. */
+            pointer: string;
+            /**
+             * @description `config_value_unusual` (a memory value more than ten times the parameter's default or below a tenth of it; exactly ten times and exactly a tenth
+             *     are not flagged) and `config_reserved_connections` (on some server `max_connections` would not exceed
+             *     `superuser_reserved_connections + reserved_connections`, so PostgreSQL would not start; the warning names the server). Clients must tolerate other values.
+             */
+            code: string;
+            /** @description A sentence. */
             message: string;
         };
         /** @description What a change does to one parameter on one server. */
@@ -6884,6 +6908,11 @@ export interface components {
             /** @description True when `applyConfigChange` would accept the request. */
             valid: boolean;
             problems: components["schemas"]["ConfigProblem"][];
+            /**
+             * @description Things a valid change does that deserve a second look. A warning never makes the request invalid (`valid` depends on `problems` only) and
+             *     never stops `applyConfigChange`. Omitted by servers older than 0.17.0, so a client treats a missing property as an empty list.
+             */
+            warnings?: components["schemas"]["ConfigWarning"][];
             /** @description One entry per server and parameter that the change touches. */
             effects: components["schemas"]["ConfigEffect"][];
             /** @description The servers where at least one parameter would wait for a restart. */

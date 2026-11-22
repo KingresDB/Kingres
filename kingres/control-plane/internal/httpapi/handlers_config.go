@@ -117,12 +117,12 @@ func (s *Server) applyConfigChange(c *call, w http.ResponseWriter, r *http.Reque
 	if err := s.bodyClosed(w, r, &req); err != nil {
 		return err
 	}
-	details := l.ChangeDetails(r.Context(), req)
-	t, err := l.StartApply(r.Context(), c.session.Username, req, 0)
+	c.details = map[string]any{"attempted": pgconfig.Attempted(req)}
+	t, info, err := l.StartApply(r.Context(), c.session.Username, req, 0)
 	if err != nil {
 		return s.configTaskProblem(r, err)
 	}
-	c.details = map[string]any{"changes": details, "taskId": t.ID}
+	c.details = map[string]any{"changes": info.Changes, "servers": info.Servers, "basedOnRevision": info.BasedOn, "taskId": t.ID}
 	s.accepted(w, r, t)
 	return nil
 }
@@ -137,14 +137,14 @@ func (s *Server) revertConfigChange(c *call, w http.ResponseWriter, r *http.Requ
 	if p := pp.err(); p != nil {
 		return p
 	}
-	t, err := l.StartRevert(r.Context(), c.session.Username, id)
+	t, info, err := l.StartRevert(r.Context(), c.session.Username, id)
 	if err != nil {
 		if errors.Is(err, pgconfig.ErrNoSuchChange) {
 			return problem.New(problem.NotFound, "There is no such configuration change.")
 		}
 		return s.configTaskProblem(r, err)
 	}
-	c.details = map[string]any{"reverts": id, "taskId": t.ID}
+	c.details = map[string]any{"reverts": id, "changes": info.Changes, "servers": info.Servers, "basedOnRevision": info.BasedOn, "taskId": t.ID}
 	s.accepted(w, r, t)
 	return nil
 }

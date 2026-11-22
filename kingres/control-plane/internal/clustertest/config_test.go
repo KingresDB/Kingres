@@ -466,11 +466,12 @@ func TestConfigClusterAndDatabaseTimeZone(t *testing.T) {
 		leader.WaitTask(clustertest.TaskID(body), 3*time.Minute)
 	})
 	base := show(t, leader, "postgres", "TimeZone")
+	zone := otherZone(t, base) // a zone that is not the zone of the host: the test must fail when a value is not applied or not removed
 
 	// A database time zone is applied on every server.
-	cfgApplyDone(t, leader, cfgChange("TimeZone", "database", "cfgtz", "Asia/Tehran"))
+	cfgApplyDone(t, leader, cfgChange("TimeZone", "database", "cfgtz", zone))
 	for _, n := range c.Nodes {
-		if got := show(t, n, "cfgtz", "TimeZone"); got != "Asia/Tehran" {
+		if got := show(t, n, "cfgtz", "TimeZone"); got != zone {
 			t.Errorf("node %d: database cfgtz TimeZone %s", n.Index, got)
 		}
 		if got := show(t, n, "postgres", "TimeZone"); got != base {
@@ -480,7 +481,7 @@ func TestConfigClusterAndDatabaseTimeZone(t *testing.T) {
 	tm := leader.Expect(200, "GET", "/config/time", nil)
 	found := false
 	for _, d := range anyList(tm["databases"]) {
-		if m := d.(map[string]any); m["name"] == "cfgtz" && m["timeZone"] == "Asia/Tehran" {
+		if m := d.(map[string]any); m["name"] == "cfgtz" && m["timeZone"] == zone {
 			found = true
 		}
 	}
@@ -495,9 +496,9 @@ func TestConfigClusterAndDatabaseTimeZone(t *testing.T) {
 	}
 
 	// The cluster time zone and the time zone of the log, without a restart.
-	cfgApplyDone(t, leader, cfgChange("TimeZone", "cluster", "", "Asia/Tehran"), cfgChange("log_timezone", "cluster", "", "Asia/Tehran"))
+	cfgApplyDone(t, leader, cfgChange("TimeZone", "cluster", "", zone), cfgChange("log_timezone", "cluster", "", zone))
 	for _, n := range c.Nodes {
-		if got := show(t, n, "postgres", "TimeZone"); got != "Asia/Tehran" {
+		if got := show(t, n, "postgres", "TimeZone"); got != zone {
 			t.Errorf("node %d: TimeZone %s", n.Index, got)
 		}
 	}
@@ -507,7 +508,7 @@ func TestConfigClusterAndDatabaseTimeZone(t *testing.T) {
 		tm = leader.Expect(200, "GET", "/config/time", nil)
 		ok := true
 		for _, s := range anyList(tm["servers"]) {
-			if m := s.(map[string]any); m["timeZone"] != "Asia/Tehran" || m["logTimeZone"] != "Asia/Tehran" {
+			if m := s.(map[string]any); m["timeZone"] != zone || m["logTimeZone"] != zone {
 				ok = false
 			}
 		}
@@ -528,12 +529,12 @@ func TestConfigClusterAndDatabaseTimeZone(t *testing.T) {
 	}
 	foundZone := false
 	for _, z := range items(t, zones) {
-		if z["name"] == "Asia/Tehran" && z["utcOffset"] == "+03:30" {
+		if z["name"] == zone && z["utcOffset"] != nil {
 			foundZone = true
 		}
 	}
 	if !foundZone {
-		t.Errorf("Asia/Tehran is not in the zone list (%d zones)", len(items(t, zones)))
+		t.Errorf("%s is not in the zone list (%d zones)", zone, len(items(t, zones)))
 	}
 	cfgApplyDone(t, leader, cfgChange("TimeZone", "cluster", "", nil), cfgChange("log_timezone", "cluster", "", nil))
 	for _, n := range c.Nodes {
@@ -671,8 +672,31 @@ func TestConfigPendingRestartAndRestartTask(t *testing.T) {
 		t.Errorf("without the acknowledgement: %d %v", st, o)
 	}
 	body := leader.Expect(202, "POST", "/config/restarts", map[string]any{"acknowledgeDowntime": true, "serverIds": []string{n2.Host}})
-	if done := leader.WaitTask(clustertest.TaskID(body), 8*time.Minute); done["state"] != "done" {
+	done := leader.WaitTask(clustertest.TaskID(body), 8*time.Minute)
+	if done["state"] != "done" {
 		t.Fatalf("restart task: %v %v", done["state"], done["error"])
+	}
+	// The instances are restarted in the order the preview gave (P13R-08): the names of the steps, in order.
+	prog, _ := done["progress"].(map[string]any)
+	var ran []string
+	for _, s := range anyList(prog["steps"]) {
+		ran = append(ran, s.(map[string]any)["name"].(string))
+	}
+	var want []string
+	for _, o := range anyList(pv["restartOrder"]) {
+		m := o.(map[string]any)
+		want = append(want, fmt.Sprintf("Restart instance %d (%s) on server %s", int(m["instanceId"].(float64)), m["role"], m["serverId"]))
+	}
+	var wantRan []string // the instances that had something pending, in the order of the preview
+	for _, w := range want {
+		for _, r := range ran {
+			if r == w {
+				wantRan = append(wantRan, w)
+			}
+		}
+	}
+	if len(ran) < 2 || fmt.Sprint(ran) != fmt.Sprint(wantRan) {
+		t.Errorf("the restart ran %v, the preview said %v", ran, want)
 	}
 	deadline := time.Now().Add(2 * time.Minute)
 	for {
@@ -780,8 +804,11 @@ func TestConfigServerThatIsDownGetsTheChange(t *testing.T) {
 	})
 	body := leader.Expect(202, "POST", "/config/changes", map[string]any{"changes": []any{cfgChange("work_mem", "cluster", "", "12MB")}})
 	id := clustertest.TaskID(body)
-	// The task waits for the server and says which.
-	until(t, 90*time.Second, "the task to wait for the server", func() bool {
+	// The task does not wait for the server (P13R-03): it ends, and the server is shown as waiting.
+	if done := leader.WaitTask(id, 3*time.Minute); done["state"] != "done" {
+		t.Fatalf("the task with a server down: %v %v", done["state"], done["error"])
+	}
+	until(t, 30*time.Second, "the server to be shown as waiting", func() bool {
 		sv := leader.Expect(200, "GET", "/config/servers", nil)
 		for _, s := range items(t, sv) {
 			if s["serverId"] == n2.Host && s["state"] == "waiting" {
@@ -790,10 +817,6 @@ func TestConfigServerThatIsDownGetsTheChange(t *testing.T) {
 		}
 		return false
 	})
-	_, tk := leader.Do("GET", fmt.Sprintf("/tasks/%v", id), nil, nil)
-	if tk["state"] != "running" {
-		t.Errorf("the task is %v while a server is down: %v", tk["state"], tk)
-	}
 	for _, n := range []*clustertest.Node{leader, c.Nodes[1]} {
 		until(t, 30*time.Second, "the other servers to have the value", func() bool { return show(t, n, "postgres", "work_mem") == "12MB" })
 	}
@@ -802,12 +825,16 @@ func TestConfigServerThatIsDownGetsTheChange(t *testing.T) {
 	if !n2.Login(clustertest.AdminUser, clustertest.AdminPass) {
 		t.Fatal("login after the restart")
 	}
-	if done := leader.WaitTask(id, 5*time.Minute); done["state"] != "done" {
-		t.Fatalf("the task after the server returned: %v %v", done["state"], done["error"])
-	}
-	if got := show(t, n2, "postgres", "work_mem"); got != "12MB" {
-		t.Errorf("the server that was down has %s", got)
-	}
+	// The leader's loop brings the server that was down up to date once it answers.
+	until(t, 4*time.Minute, "the server that was down to get the value", func() bool {
+		conn, err := tryServicePG(n2, "postgres")
+		if err != nil {
+			return false
+		}
+		defer func() { _ = conn.Close(context.Background()) }()
+		var v string
+		return conn.QueryRow(context.Background(), "SELECT current_setting('work_mem')").Scan(&v) == nil && v == "12MB"
+	})
 	cfgApplyDone(t, leader, cfgChange("work_mem", "cluster", "", nil))
 }
 
@@ -829,7 +856,7 @@ func TestConfigFailedServerIsReported(t *testing.T) {
 		t.Skip("the user ignores directory modes")
 	}
 	done := cfgApply(t, leader, cfgChange("default_statistics_target", "cluster", "", "150"))
-	if done["state"] != "failed" || !strings.Contains(fmt.Sprint(done["error"]), "config_incomplete") {
+	if done["state"] != "failed" || !strings.Contains(fmt.Sprint(done["error"]), "config_incomplete") || fmt.Sprint(done["error"].(map[string]any)["code"]) != "config_incomplete" {
 		t.Fatalf("the task: %v %v", done["state"], done["error"])
 	}
 	sv := items(t, leader.Expect(200, "GET", "/config/servers", nil))

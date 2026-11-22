@@ -8,7 +8,7 @@
 import { describe, expect, it } from 'vitest'
 import { screen, waitFor, within } from '@testing-library/vue'
 import userEvent from '@testing-library/user-event'
-import { http, HttpResponse } from 'msw'
+import { delay, http, HttpResponse } from 'msw'
 import { mockServer } from '@/mocks/server'
 import { getState } from '@/mocks/http'
 import {
@@ -201,7 +201,7 @@ describe('the value is checked as it is typed', () => {
 
   it('checks a text value for its length and its line breaks', async () => {
     const user = userEvent.setup()
-    const { dialog: d } = await openEdit(user, 'search_path')
+    const { dialog: d } = await openEdit(user, 'log_line_prefix')
     await type(user, d, '"$user", public, extra')
     expect(d.getByTestId('value-message')).toHaveTextContent('')
     expect(d.getByText(/at most 4096 bytes/)).toBeInTheDocument()
@@ -405,7 +405,7 @@ describe('applying', () => {
     await user.click(d.getByRole('button', { name: /^Apply/ }))
     const r = await d.findByTestId('server-state-10.0.0.13')
     await waitFor(() => expect(within(r).getByText('Waiting for the server')).toBeInTheDocument())
-    expect(r).toHaveTextContent('The task waits for this server and does not give up.')
+    expect(r).toHaveTextContent('This server cannot be reached; it gets the change when it returns')
     expect(await d.findByRole('button', { name: 'Cancel the task' })).toBeInTheDocument()
     bringConfigServerBack(getState(), '10.0.0.13')
     await waitFor(() =>
@@ -456,6 +456,66 @@ describe('applying', () => {
     await user.click(d.getByRole('button', { name: /^Apply/ }))
     expect((await d.findByRole('alert')).getAttribute('data-code')).toBe('operation_in_progress')
     expect(d.getByRole('button', { name: /^Apply/ })).toBeInTheDocument()
+  })
+
+  it('sends the revision it saw when it opened, and a refusal as superseded says to look again (P13R-11)', async () => {
+    const user = userEvent.setup()
+    const { dialog: d } = await openEdit(user, 'work_mem')
+    await type(user, d, '16MB')
+    await ready(d)
+    const seen = getState().config.revision
+    const bodies: { expectedRevision?: number }[] = []
+    mockServer.use(
+      http.post('*/api/v1/config/changes', async ({ request }) => {
+        bodies.push((await request.json()) as { expectedRevision?: number })
+        return HttpResponse.json(
+          { type: 'about:blank', title: 'x', status: 409, code: 'config_change_superseded' },
+          { status: 409 },
+        )
+      }),
+    )
+    await user.click(d.getByRole('button', { name: /^Apply/ }))
+    expect((await d.findByRole('alert')).getAttribute('data-code')).toBe('config_change_superseded')
+    expect(bodies).toHaveLength(1)
+    expect(bodies[0]!.expectedRevision).toBe(seen)
+  })
+
+  it('does not enable Apply before the revision is known, and goes without it when it cannot be read (P13S-07)', async () => {
+    mockServer.use(http.get('*/api/v1/config/summary', async () => delay('infinite')))
+    const user = userEvent.setup()
+    const { dialog: d } = await openEdit(user, 'work_mem')
+    await type(user, d, '16MB')
+    await d.findByTestId('preview-sentence')
+    expect(d.getByRole('button', { name: /^Apply/ })).toHaveAttribute('aria-disabled', 'true')
+  })
+
+  it('goes without the revision when the summary cannot be read', async () => {
+    mockServer.use(
+      http.get('*/api/v1/config/summary', () =>
+        HttpResponse.json(
+          { type: 'about:blank', title: 'x', status: 503, code: 'service_unavailable' },
+          { status: 503 },
+        ),
+      ),
+    )
+    const user = userEvent.setup()
+    const { dialog: d } = await openEdit(user, 'work_mem')
+    await type(user, d, '16MB')
+    await ready(d)
+    const bodies: { expectedRevision?: number }[] = []
+    mockServer.use(
+      http.post('*/api/v1/config/changes', async ({ request }) => {
+        bodies.push((await request.json()) as { expectedRevision?: number })
+        return HttpResponse.json(
+          { type: 'about:blank', title: 'x', status: 409, code: 'operation_in_progress' },
+          { status: 409 },
+        )
+      }),
+    )
+    await user.click(d.getByRole('button', { name: /^Apply/ }))
+    await d.findByRole('alert')
+    expect(bodies[0]).toBeDefined()
+    expect(bodies[0]!.expectedRevision).toBeUndefined()
   })
 })
 
@@ -678,5 +738,28 @@ describe('restarting what waits', () => {
     expect(button).toHaveAttribute('aria-disabled', 'true')
     await user.click(button)
     expect(screen.queryByRole('dialog')).toBeNull()
+  })
+})
+
+describe('the warnings of the preview (contract 0.17.0)', () => {
+  it('shows an unusual memory value as a warning and leaves Apply on', async () => {
+    const user = userEvent.setup()
+    const { dialog: d } = await openEdit(user, 'work_mem')
+    await type(user, d, '16MB')
+    await d.findByTestId('preview-sentence')
+    expect(d.queryByTestId('preview-warnings')).toBeNull()
+    await type(user, d, '1GB')
+    const box = await d.findByTestId('preview-warnings')
+    expect(box).toHaveTextContent('more than ten times its default')
+    await ready(d)
+  })
+
+  it('warns that reserved connections leave no room, and still lets the change be applied', async () => {
+    const user = userEvent.setup()
+    const { dialog: d } = await openEdit(user, 'superuser_reserved_connections')
+    await type(user, d, '100')
+    const box = await d.findByTestId('preview-warnings')
+    expect(box).toHaveTextContent('max_connections (100) would be below')
+    await ready(d)
   })
 })

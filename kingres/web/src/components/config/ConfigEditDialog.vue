@@ -20,6 +20,7 @@ import { endpoints } from '@/api/endpoints'
 import {
   keys,
   useConfigServers,
+  useConfigSummary,
   useDatabases,
   useServerGroups,
   useServers,
@@ -226,12 +227,28 @@ async function apply(how: 'first' | 'retry'): Promise<void> {
 
 // --- the preview ---------------------------------------------------------------------------------------------
 
+// The configuration revision the person saw when the dialog opened (the first answer fetched after it opened, never an
+// older cached one): the apply carries it, and the server refuses (409 config_change_superseded) when someone changed
+// a value of the request after it. A Retry resends the same request, so it carries the same revision and is accepted
+// when the first attempt was recorded after all, never when somebody else changed the value meanwhile (P13R-11).
+const openedAt = Date.now()
+const summary = useConfigSummary()
+const seenRevision = ref<number | null>(null)
+watch(
+  () => [summary.data.value?.revision, summary.dataUpdatedAt.value] as const,
+  ([rev, at]) => {
+    if (seenRevision.value === null && rev !== undefined && at >= openedAt) seenRevision.value = rev
+  },
+  { immediate: true },
+)
+
 const request = computed<ConfigChangeRequest | null>(() => {
   const param = p.value
   if (!param || !verdict.value.ok) return null
   if (form.level !== 'cluster' && form.scopeId === '') return null
   const value = form.remove ? null : verdict.value.normalized
   const names = [param.name, ...(form.level === 'cluster' ? (props.alsoNames ?? []) : [])]
+  const expectedRevision = seenRevision.value
   return {
     changes: names.map((name) => ({
       name,
@@ -239,6 +256,7 @@ const request = computed<ConfigChangeRequest | null>(() => {
       scopeId: form.level === 'cluster' ? null : form.scopeId,
       value,
     })),
+    ...(expectedRevision === null ? {} : { expectedRevision }),
   }
 })
 
@@ -291,8 +309,16 @@ const total = computed(
 const sentence = computed(() =>
   changeSentence(changing.value, total.value, preview.value?.restartServerIds.length ?? 0),
 )
+// Apply waits for the revision the person saw (P13S-07): a request without it would overwrite a change nobody told them of.
+// When the summary cannot be read at all, the request goes without it and the last request wins, as before.
+const revisionKnown = computed(() => seenRevision.value !== null || summary.isError.value)
 const canApply = computed(
-  () => preview.value !== null && preview.value.valid && !previewing.value && changing.value > 0,
+  () =>
+    preview.value !== null &&
+    preview.value.valid &&
+    !previewing.value &&
+    changing.value > 0 &&
+    (props.revert !== undefined || revisionKnown.value),
 )
 
 const task = computed(() => action.task.value)
@@ -580,6 +606,23 @@ const valueId = 'cfg-value'
               </table>
             </TableWrap>
             <div
+              v-if="(preview.warnings ?? []).length > 0"
+              class="notice tone-warn"
+              role="status"
+              data-testid="preview-warnings"
+            >
+              <span aria-hidden="true">&#9650;</span>
+              <ul class="plain">
+                <li
+                  v-for="w in preview.warnings"
+                  :key="`${w.index}-${w.pointer}-${w.code}`"
+                  :data-code="w.code"
+                >
+                  <SafeName :value="w.message" kind="text" :max="400" />
+                </li>
+              </ul>
+            </div>
+            <div
               v-if="preview.restartServerIds.length > 0"
               class="notice tone-warn"
               data-testid="restart-note"
@@ -672,7 +715,8 @@ const valueId = 'cfg-value'
                   <span v-else-if="r.state === 'applied'">Running the new value.</span>
                 </template>
                 <span v-else-if="r.waiting"
-                  >The task waits for this server and does not give up.</span
+                  >This server cannot be reached; it gets the change when it returns (the change is
+                  not lost).</span
                 >
               </td>
               <td>

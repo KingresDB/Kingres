@@ -69,10 +69,22 @@ type ConfigChangeItem struct {
 // ConfigChangeRequest is the body of previewConfigChange and applyConfigChange.
 type ConfigChangeRequest struct {
 	Changes []ConfigChangeItem `json:"changes"`
+	// ExpectedRevision is the configuration revision the client saw (0.17.0). applyConfigChange refuses with 409
+	// config_change_superseded when a value it changes was changed by a later revision and does not already hold the
+	// wanted value; previewConfigChange ignores it.
+	ExpectedRevision *int64 `json:"expectedRevision,omitempty"`
 }
 
 // ConfigProblem says why one change is not valid.
 type ConfigProblem struct {
+	Index   int    `json:"index"`
+	Pointer string `json:"pointer"`
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+// ConfigWarning says that a valid change is unusual or risky. It never makes a request invalid.
+type ConfigWarning struct {
 	Index   int    `json:"index"`
 	Pointer string `json:"pointer"`
 	Code    string `json:"code"`
@@ -99,6 +111,7 @@ type ConfigRestartStep struct {
 type ConfigChangePreview struct {
 	Valid                bool                `json:"valid"`
 	Problems             []ConfigProblem     `json:"problems"`
+	Warnings             []ConfigWarning     `json:"warnings"`
 	Effects              []ConfigEffect      `json:"effects"`
 	RestartServerIDs     []string            `json:"restartServerIds"`
 	RestartOrder         []ConfigRestartStep `json:"restartOrder"`

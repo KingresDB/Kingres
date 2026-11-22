@@ -7,6 +7,72 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-22 (second entry): the fixes for the review of the fixes of phase 13
+
+### What was done
+
+- The review ([reviews/2026-11-22-config-phase13-fixes.md](reviews/2026-11-22-config-phase13-fixes.md)) found 5 medium and 4 low findings (P13S-01 to P13S-09, no critical or high). All are fixed or answered on `p13-fix`; the report has a "Fixes" section.
+- P13S-01: every successful start keeps the override file as the last good one; the manager retries a failed start with it (the empty file when none, never the previous one), for every start (the restart task, a reboot, a crash, an operator), with a mark the task reads.
+- P13S-02, 03, 06, 09: the sample-rate log parameters and `log_file_mode` are managed; `archive_mode`, `client_encoding`, `restart_after_crash`, `recovery_min_apply_delay`, `max_slot_wal_keep_size` are refused. P13S-04: floor of 8 for `max_worker_processes`.
+- P13S-05: the hash of a server covers every instance, and a copied standby gets the override file of its own server. P13S-07: `expectedRevision` is checked again in the record step, the start of a configuration task is one step under a mutex, the dialog waits for the revision.
+
+### How it was verified
+
+- Mutants: 5 for the rollback and the identity (killed by the new tests), 7 for the lists, the floor, `supersedes` and the standby file, 1 for the dialog; all killed.
+- PostgreSQL 18 and 19.0 (private installs, lane l5): `pgconfig`, `instance`, `httpapi`, `ops`, `standby` packages (318 passing tests each) and the 23 `TestConfig*` cluster tests.
+- Console: typecheck, lint, 1464 unit tests, `api:check`; `check-contract.mjs` holds. The browser tests were not run again (only a text and a disabled state of the dialog changed since the last run).
+
+### Decisions and deviations
+
+- The exclusion of `config.apply` and `config.restart` is a mutex of the leader, not a rule of the engine (see the report).
+
+### Still open
+
+See "What is left" of the report: no state on the server page for a start that went back to the good file at a reboot; no floors for `max_parallel_workers` and `max_locks_per_transaction`.
+
+### Core patches
+
+None.
+
+---
+
+## 2026-11-22: the fixes for the first independent review of phase 13 (configuration from the console)
+
+### What was done
+
+- The review ([reviews/2026-11-22-config-phase13.md](reviews/2026-11-22-config-phase13.md)) found 2 high, 5 medium and 8 low findings. All 15 are fixed or answered on
+  branch `p13-fix` (made from `p13-fin`, contract 0.17.0, which is unreleased and was changed in place); the report has a "Fixes" section that maps each finding to its commit and test.
+- High: the parameters that change how the sessions of `kingresd` itself behave (`default_transaction_read_only`, timeouts, `search_path`, ...) are refused at every
+  level; `unix_socket_permissions`, `unix_socket_group`, `huge_pages`, every `ssl*` and others are managed or refused; a restart is checked with `postgres -C` first, and a restart
+  that cannot start puts the last good override file back and starts the instance again.
+- Medium: a server that is down no longer keeps the apply task open (it is recorded as `waiting` and the convergence loop brings it up to date); the hidden set fails closed;
+  a stored value whose name became managed or refused is skipped and can always be removed; the restart goes through the instance lifecycle of the operations code and finds the
+  primary of each group from the leader's record; the time-zone tests use a zone that is not the host's.
+- Low: tests for the executed restart order, leading zeros and the audit; the audit details; the task codes; the reserved-connections warning; `expectedRevision` in the contract; the
+  console sends it. Contract 0.17.0 gained the optional `expectedRevision` of `ConfigChangeRequest` (additive).
+
+### How it was verified
+
+- Every fix has a test that fails without it; each was checked with a mutant (listed in the report): 10 cluster mutants and 13 unit mutants, all killed.
+- PostgreSQL 18 and 19 (private installs, lane l5): the `pgconfig`, `instance`, `httpapi` and `ops` packages, and the whole `TestConfig*` set of the cluster tests (23 tests) on three servers.
+- Console: typecheck, lint, the whole unit suite (90 files, 1462 tests), the browser tests (layout, CSP, axe), `api:check`; `node kingres/api/scripts/check-contract.mjs` holds.
+
+### Decisions and deviations
+
+- The apply task no longer waits for a server that is down (design "Failure cases" changed). Audit details carry `basedOnRevision` and the task id instead of the revision, which is allocated after the audit event.
+- `log_line_prefix` and `log_error_verbosity` stay settable (the console does not parse log lines). The console mock still models a waiting task for a server that is down.
+
+### Still open
+
+See the report: no cluster test with a promoted standby (unit test of the order only), no test that induces a failure of the hidden-set read inside `State`, the derived default of a removed
+override is not known to the preview warning, and the mock of the console still models the old waiting task.
+
+### Core patches
+
+None.
+
+---
+
 ## 2026-11-22: phase 11 (distributed schemas), the extension: the scale work (step 12), the review fixes and the documentation (step 15)
 
 Covers the work on branch shard-p1011 after the second review of phase 11 (the review fixes of 2026-11-21 are in the entry of that day).

@@ -121,7 +121,13 @@ const CONTEXT: Record<string, Context> = {
 
 const MANAGED: [string[], string][] = [
   [
-    ['listen_addresses', 'port', 'unix_socket_directories'],
+    [
+      'listen_addresses',
+      'port',
+      'unix_socket_directories',
+      'unix_socket_permissions',
+      'unix_socket_group',
+    ],
     'KingresDB needs the address and port that the other servers and kingresd connect to; a wrong value would cut the server off.',
   ],
   [
@@ -159,6 +165,20 @@ const MANAGED: [string[], string][] = [
     'Statement text must never be written to a log.',
   ],
   [['cluster_name'], 'KingresDB names the instances (process titles, logs).'],
+  [
+    [
+      'log_destination',
+      'syslog_facility',
+      'syslog_ident',
+      'syslog_sequence_numbers',
+      'syslog_split_messages',
+      'log_file_mode',
+      'log_transaction_sample_rate',
+      'log_statement_sample_rate',
+      'log_min_duration_sample',
+    ],
+    'The console reads the log files that the collector writes; another destination leaves them empty.',
+  ],
   [
     ['hot_standby', 'primary_conninfo', 'primary_slot_name'],
     'KingresDB maintains the connection of a standby to its primary.',
@@ -205,7 +225,7 @@ const REFUSED: [string[], string][] = [
     'Loads code into the database. Set it on the server, in postgresql.conf.',
   ],
   [
-    ['krb_server_keyfile', 'ssl_dh_params_file', 'ssl_crl_dir', 'unix_socket_group'],
+    ['krb_server_keyfile', 'ssl_dh_params_file', 'ssl_crl_dir'],
     'Names a file or an account of the operating system. Set it on the server, in postgresql.conf.',
   ],
   [
@@ -217,6 +237,47 @@ const REFUSED: [string[], string][] = [
       'ssl_ecdh_curve',
     ],
     'Part of the TLS policy of the cluster; a wrong value can lock every server out. Set it on the server, in postgresql.conf.',
+  ],
+  [
+    [
+      'default_transaction_read_only',
+      'transaction_read_only',
+      'default_transaction_isolation',
+      'transaction_isolation',
+      'session_replication_role',
+      'statement_timeout',
+      'lock_timeout',
+      'idle_in_transaction_session_timeout',
+      'idle_session_timeout',
+      'transaction_timeout',
+      'search_path',
+      'row_security',
+      'default_table_access_method',
+      'default_tablespace',
+      'temp_tablespaces',
+      'check_function_bodies',
+      'client_encoding',
+    ],
+    'Changes how the sessions of the control plane behave (a read-only default or a timeout stops its task engine). Set it for a role on the server.',
+  ],
+  [
+    [
+      'huge_pages',
+      'huge_page_size',
+      'shared_memory_type',
+      'dynamic_shared_memory_type',
+      'min_dynamic_shared_memory',
+      'bonjour',
+      'bonjour_name',
+      'event_source',
+      'ssl_prefer_server_ciphers',
+      'ssl_passphrase_command_supports_reload',
+    ],
+    'A value the host cannot honour stops the server from starting. Set it on the server, in postgresql.conf.',
+  ],
+  [
+    ['archive_mode', 'restart_after_crash', 'recovery_min_apply_delay', 'max_slot_wal_keep_size'],
+    'A setting that can fill the disk, delay a standby, leave a crashed server down or invalidate a replication slot. Set it on the server, in postgresql.conf.',
   ],
   [
     ['fsync', 'full_page_writes'],

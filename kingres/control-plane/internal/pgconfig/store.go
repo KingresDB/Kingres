@@ -129,6 +129,32 @@ func (s store) standbys(ctx context.Context) ([]standbyPair, error) {
 	return out, err
 }
 
+// groupPrimaries returns, for each shard group, the server that runs its primary now (what the standby check of the
+// leader last saw). After a failover that is the server of the promoted standby, not the one that ran the primary
+// when the standby was created (P13R-06).
+func (s store) groupPrimaries(ctx context.Context) (map[int32]string, error) {
+	out := map[int32]string{}
+	err := s.sys(ctx, func(c *pgx.Conn) error {
+		rows, err := c.Query(ctx, `SELECT group_id, coalesce(primary_server, '') FROM kingres_cp.group_replication_state`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var g int32
+			var srv string
+			if err := rows.Scan(&g, &srv); err != nil {
+				return err
+			}
+			if srv != "" {
+				out[g] = srv
+			}
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
 func (s store) setting(ctx context.Context, key string, def int) int {
 	var v []byte
 	err := s.sys(ctx, func(c *pgx.Conn) error {
@@ -321,4 +347,13 @@ func sortedKeys[V any](m map[string]V) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// lastRevision is the revision of the latest change of a value at a level and scope; 0 when it was never changed.
+func (s store) lastRevision(ctx context.Context, level, scope, name string) (int64, error) {
+	var rev int64
+	err := s.sys(ctx, func(c *pgx.Conn) error {
+		return c.QueryRow(ctx, `SELECT coalesce(max(revision), 0) FROM kingres_cp.config_change WHERE level = $1 AND scope_id = $2 AND name = $3`, level, scope, name).Scan(&rev)
+	})
+	return rev, err
 }
