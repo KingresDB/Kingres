@@ -113,6 +113,9 @@ type AlertSubject struct {
 	ShardGroupID   *int32  `json:"shardGroupId"`
 	DatabaseName   *string `json:"databaseName"`
 	Aspect         *string `json:"aspect"`
+	// TableSchema and TableName (contract 0.18.0, optional) name the table that a partition alert is about.
+	TableSchema *string `json:"tableSchema,omitempty"`
+	TableName   *string `json:"tableName,omitempty"`
 	// TaskID is the task the alert is about (contract 0.9.0), null when it is not about one.
 	TaskID *int64 `json:"taskId"`
 }

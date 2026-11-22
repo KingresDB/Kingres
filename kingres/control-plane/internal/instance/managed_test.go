@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -258,5 +259,127 @@ func TestEnsureConfigBringsThePreloadUpToDate(t *testing.T) {
 	}
 	if changed, err := m.EnsureConfig(1); err != nil || changed {
 		t.Errorf("a current file was rewritten: %v, %v", changed, err)
+	}
+}
+
+// fakeInstallation is a PostgreSQL binary directory with a pg_config that names a library directory; the library of kingres_columnar is in it or not.
+func fakeInstallation(t *testing.T, withColumnar bool) (bin string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("the fake pg_config is a shell script")
+	}
+	dir := t.TempDir()
+	lib := filepath.Join(dir, "lib")
+	bin = filepath.Join(dir, "bin")
+	for _, d := range []string{lib, bin} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, f := range []string{"kingres_shard.so", "kingres_ledger.so"} {
+		if err := os.WriteFile(filepath.Join(lib, f), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if withColumnar {
+		if err := os.WriteFile(filepath.Join(lib, "kingres_columnar.so"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	script := "#!/bin/sh\necho " + lib + "\n"
+	for _, prog := range []string{"pg_config", "initdb", "pg_ctl"} { // the manager wants initdb and pg_ctl to exist; only pg_config is run
+		body := "#!/bin/sh\nexit 1\n"
+		if prog == "pg_config" {
+			body = script
+		}
+		if err := os.WriteFile(filepath.Join(bin, prog), []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return bin
+}
+
+func managedInstance(t *testing.T, bin string, preload string) (*Manager, string) {
+	t.Helper()
+	root := t.TempDir()
+	m, err := New(Options{Root: root, BinDir: bin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, "1")
+	data := filepath.Join(dir, "pgdata")
+	if err := os.MkdirAll(data, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mk := `{"nodeId":1,"port":5432,"magic":"` + markerMagic + `"}`
+	if err := os.WriteFile(filepath.Join(dir, MarkerName), []byte(mk), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.WriteManaged(1, ManagedSettings{Port: 5432, Extra: map[string]string{"work_mem": "8MB"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(data, ConfigFileName), []byte("# x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(data, "kingres-managed.conf")
+	cur, _ := os.ReadFile(path)
+	// the file as an earlier package or a full list wrote it
+	set := regexp.MustCompile(`(?m)^shared_preload_libraries = '[^']*'`).ReplaceAllString(string(cur), "shared_preload_libraries = '"+preload+"'")
+	if err := os.WriteFile(path, []byte(set), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return m, path
+}
+
+// An installation without the library of kingres_columnar never gets it into the preload list: an instance whose list names a file that is not there
+// cannot start (pg_ctl fails), and the next restart, a crash restart too, would take the server down. A new file and an old one are both written without it.
+func TestPreloadLeavesOutALibraryThatTheInstallationLacks(t *testing.T) {
+	bin := fakeInstallation(t, false)
+	m, path := managedInstance(t, bin, "kingres_shard,kingres_ledger")
+	if got := m.preloadList(); got != "kingres_shard,kingres_ledger" {
+		t.Fatalf("preloadList = %q", got)
+	}
+	// the old list is already right for this installation: EnsureConfig does not add the missing library
+	if changed, err := m.EnsureConfig(1); err != nil || changed {
+		t.Fatalf("EnsureConfig on an old list without the library: %v %v", changed, err)
+	}
+	if got, _ := os.ReadFile(path); preloadOf(string(got)) != "kingres_shard,kingres_ledger" {
+		t.Errorf("the list became %q", preloadOf(string(got)))
+	}
+	// a file that already names the library (a package that was removed again) is made right
+	m2, path2 := managedInstance(t, bin, PreloadLibraries)
+	changed, err := m2.EnsureConfig(1)
+	if err != nil || !changed {
+		t.Fatalf("EnsureConfig on a list that names a missing library: %v %v", changed, err)
+	}
+	if got, _ := os.ReadFile(path2); preloadOf(string(got)) != "kingres_shard,kingres_ledger" || !strings.Contains(string(got), "work_mem = '8MB'") {
+		t.Errorf("after the repair:\n%s", got)
+	}
+	// and the settings that the manager writes later do not bring it back, and the saved settings do not keep the fallback
+	if err := m2.WriteManaged(1, ManagedSettings{Port: 5432}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(path2); preloadOf(string(got)) != "kingres_shard,kingres_ledger" {
+		t.Errorf("a later write: %q", preloadOf(string(got)))
+	}
+	s, err := m2.Settings(1)
+	if err != nil || s.Preload != "" {
+		t.Errorf("saved settings %+v %v", s, err)
+	}
+}
+
+// When the library is there, an old list is brought up to date, and the library appearing later (the package is upgraded while kingresd runs) is seen.
+func TestEnsureConfigAddsTheLibraryWhenTheInstallationHasIt(t *testing.T) {
+	bin := fakeInstallation(t, true)
+	m, path := managedInstance(t, bin, "kingres_shard,kingres_ledger")
+	changed, err := m.EnsureConfig(1)
+	if err != nil || !changed {
+		t.Fatalf("%v %v", changed, err)
+	}
+	if got, _ := os.ReadFile(path); preloadOf(string(got)) != PreloadLibraries {
+		t.Errorf("the list is %q", preloadOf(string(got)))
+	}
+	if changed, err := m.EnsureConfig(1); err != nil || changed {
+		t.Errorf("a current file was rewritten: %v %v", changed, err)
 	}
 }

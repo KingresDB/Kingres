@@ -52,8 +52,10 @@ func (o *Ops) ListPartitionPolicyRuns(ctx context.Context, db, schema, table, st
 		}
 		after = n
 	}
-	if err := o.ensureExtensions(ctx, db, []string{ExtTimepart}, false); err != nil {
+	if ok, err := o.timepartInstalled(ctx, db); err != nil {
 		return page, err
+	} else if !ok {
+		return page, nil // no extension, no runs
 	}
 	err := o.policyTx(ctx, db, func(tx pgx.Tx) error {
 		if err := requirePartitioned(ctx, tx, schema, table); err != nil {
@@ -92,8 +94,10 @@ func (o *Ops) GetPartitionPolicyRun(ctx context.Context, db, schema, table strin
 	if err := checkNames(db, schema, table); err != nil {
 		return run, err
 	}
-	if err := o.ensureExtensions(ctx, db, []string{ExtTimepart}, false); err != nil {
+	if ok, err := o.timepartInstalled(ctx, db); err != nil {
 		return run, err
+	} else if !ok {
+		return run, problem.New(problem.NotFound, fmt.Sprintf("Table %s.%s has no run %d (kingres_timepart is not installed in this database).", schema, table, id))
 	}
 	err := o.policyTx(ctx, db, func(tx pgx.Tx) error {
 		if err := requirePartitioned(ctx, tx, schema, table); err != nil {

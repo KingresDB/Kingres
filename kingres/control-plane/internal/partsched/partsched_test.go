@@ -14,14 +14,17 @@ import (
 
 // fakeBackend is the cluster as the scheduler sees it: policies with a time they are due, the tables that have an unfinished task, and the findings.
 type fakeBackend struct {
-	mu       sync.Mutex
-	policies map[string]time.Time // subject -> next_run_at
-	running  map[string]bool      // unfinished task of the subject
-	started  []string
-	failOn   map[string]error
-	dueErr   error
-	checks   []Check
-	asOfSeen []time.Time
+	mu        sync.Mutex
+	policies  map[string]time.Time // subject -> next_run_at
+	running   map[string]bool      // unfinished task of the subject
+	started   []string
+	failOn    map[string]error
+	dueErr    error
+	checks    []Check
+	asOfSeen  []time.Time
+	startAsOf []time.Time
+	// read is the list of databases that Checks says it read; nil means the databases of the findings.
+	read []string
 }
 
 func newFake() *fakeBackend {
@@ -51,9 +54,10 @@ func (f *fakeBackend) Due(_ context.Context, asOf time.Time) ([]Due, error) {
 	return out, nil
 }
 
-func (f *fakeBackend) Start(_ context.Context, d Due, _ time.Time) (bool, error) {
+func (f *fakeBackend) Start(_ context.Context, d Due, asOf time.Time) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.startAsOf = append(f.startAsOf, asOf)
 	s := d.Subject()
 	if err := f.failOn[s]; err != nil {
 		return false, err
@@ -66,7 +70,20 @@ func (f *fakeBackend) Start(_ context.Context, d Due, _ time.Time) (bool, error)
 	return true, nil
 }
 
-func (f *fakeBackend) Checks(context.Context) ([]Check, error) { return f.checks, nil }
+func (f *fakeBackend) Checks(context.Context) ([]Check, []string, error) {
+	if f.read != nil {
+		return f.checks, f.read, nil
+	}
+	seen := map[string]bool{}
+	var dbs []string
+	for _, c := range f.checks {
+		if !seen[c.Database] {
+			seen[c.Database] = true
+			dbs = append(dbs, c.Database)
+		}
+	}
+	return f.checks, dbs, nil
+}
 
 type fakeAlerts struct {
 	mu        sync.Mutex
@@ -138,6 +155,9 @@ func TestTickStartsWhatIsDueAndAsksWithTheInjectedClock(t *testing.T) {
 	}
 	if strings.Join(names, ",") != "crm/public.audit,shop/public.events,shop/public.logs" {
 		t.Errorf("started %v", names)
+	}
+	if len(b.startAsOf) != 3 || !b.startAsOf[0].Equal(clk.t) || !b.startAsOf[2].Equal(clk.t) {
+		t.Errorf("Start was given %v, the clock says %v", b.startAsOf, clk.t)
 	}
 	if len(b.asOfSeen) != 1 || !b.asOfSeen[0].Equal(clk.t) {
 		t.Errorf("asked at %v, the clock says %v", b.asOfSeen, clk.t)
@@ -262,10 +282,10 @@ func TestAlertsAreRaisedAndClearedFromTheChecks(t *testing.T) {
 	if len(a.open) != 2 {
 		t.Fatalf("open alerts %v", a.open)
 	}
-	if _, ok := a.open[OpenAlert{AlertAheadLow, "database:shop|table:public.events"}]; !ok {
+	if _, ok := a.open[OpenAlert{AlertAheadLow, "database:shop|tableschema:public|tablename:events"}]; !ok {
 		t.Errorf("no partitionsAheadLow: %v", a.open)
 	}
-	if v, ok := a.open[OpenAlert{AlertPolicyFailed, "database:shop|table:public.logs"}]; !ok || !strings.Contains(v, "lock_timeout") {
+	if v, ok := a.open[OpenAlert{AlertPolicyFailed, "database:shop|tableschema:public|tablename:logs"}]; !ok || !strings.Contains(v, "lock_timeout") {
 		t.Errorf("no partitionPolicyFailed: %v", a.open)
 	}
 	// a second pass with the same findings raises them again (an upsert) and clears nothing
@@ -273,11 +293,12 @@ func TestAlertsAreRaisedAndClearedFromTheChecks(t *testing.T) {
 		t.Errorf("second pass: %v, cleared %v, open %v", err, a.cleared, a.open)
 	}
 	// the policy of events was fixed
+	b.read = []string{"shop"}
 	b.checks = b.checks[1:2]
 	if err := s.CheckAlerts(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(a.cleared) != 1 || a.cleared[0] != (OpenAlert{AlertAheadLow, "database:shop|table:public.events"}) || len(a.open) != 1 {
+	if len(a.cleared) != 1 || a.cleared[0] != (OpenAlert{AlertAheadLow, "database:shop|tableschema:public|tablename:events"}) || len(a.open) != 1 {
 		t.Errorf("cleared %v, open %v", a.cleared, a.open)
 	}
 	// nothing is wrong any more
@@ -289,13 +310,51 @@ func TestAlertsAreRaisedAndClearedFromTheChecks(t *testing.T) {
 
 func TestAnAlertThatCannotBeRaisedDoesNotStopTheClearing(t *testing.T) {
 	b := newFake()
+	b.read = []string{"gone", "shop"}
 	a := newAlerts()
-	a.open[OpenAlert{AlertAheadLow, "database:gone|table:public.t"}] = "warning: old"
+	a.open[OpenAlert{AlertAheadLow, "database:gone|tableschema:public|tablename:t"}] = "warning: old"
 	a.failRaise = errors.New("the system database is busy")
 	s := newSched(t, b, a, &fakeClock{t: time.Now()})
 	b.checks = []Check{{Database: "shop", Schema: "public", Table: "events", Problem: "ahead_low"}}
 	err := s.CheckAlerts(context.Background())
 	if err == nil || len(a.cleared) != 1 {
 		t.Errorf("err %v, cleared %v", err, a.cleared)
+	}
+}
+
+// An alert of a database that could not be read this time is left as it is (a restart, a connection limit, a leader whose instance does not show the table): it is
+// neither cleared nor raised again. When the database is read and has no finding, the alert is cleared.
+func TestAnAlertOfADatabaseThatWasNotReadIsLeftAlone(t *testing.T) {
+	b := newFake()
+	a := newAlerts()
+	s := newSched(t, b, a, &fakeClock{t: time.Now()})
+	keep := OpenAlert{AlertPolicyFailed, "database:shop|tableschema:public|tablename:logs"}
+	other := OpenAlert{AlertPolicyFailed, "database:crm|tableschema:public|tablename:audit"}
+	a.open[keep], a.open[other] = "warning: x", "warning: y"
+	b.read = []string{"crm"} // shop could not be read
+	if err := s.CheckAlerts(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := a.open[keep]; !ok {
+		t.Error("the alert of the database that was not read was cleared")
+	}
+	if _, ok := a.open[other]; ok {
+		t.Error("the alert of a database that was read and has no finding stayed")
+	}
+	b.read = []string{"crm", "shop"}
+	if err := s.CheckAlerts(context.Background()); err != nil || len(a.open) != 0 {
+		t.Errorf("shop read and fine: %v %v", err, a.open)
+	}
+}
+
+// A name with a bar or a percent sign cannot break the subject: the segments are escaped and read back as they were.
+func TestAlertSubjectsEscapeNames(t *testing.T) {
+	c := Check{Database: "sh|op", Schema: "pub%lic", Table: "ev|ents.x", Problem: "ahead_low"}
+	k := alertKey(AlertAheadLow, c)
+	if strings.Count(k.Subject, "|") != 2 {
+		t.Fatalf("subject %q", k.Subject)
+	}
+	if got := subjectDatabase(k.Subject); got != "sh|op" {
+		t.Errorf("database %q", got)
 	}
 }

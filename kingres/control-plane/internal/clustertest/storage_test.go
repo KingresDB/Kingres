@@ -45,6 +45,9 @@ func TestTableStorageAndPartitionPolicies(t *testing.T) {
 	})
 	leader := c.Leader()
 	tbl := func(name string) string { return "/databases/st/schemas/public/tables/" + name }
+	day := func(offset int) string {
+		return time.Now().UTC().Truncate(24*time.Hour).AddDate(0, 0, offset).Format("2006-01-02")
+	}
 	taskDone := func(body map[string]any) map[string]any {
 		t.Helper()
 		got := leader.WaitTask(clustertest.TaskID(body), 5*time.Minute)
@@ -71,9 +74,9 @@ func TestTableStorageAndPartitionPolicies(t *testing.T) {
 		`CREATE TABLE refs (id int PRIMARY KEY)`,
 		`CREATE TABLE uses (id int, r int REFERENCES refs (id))`,
 		`CREATE TABLE ev (ts timestamptz NOT NULL, n int) PARTITION BY RANGE (ts)`,
-		`CREATE TABLE ev_a PARTITION OF ev FOR VALUES FROM ('2026-01-01 00:00:00+00') TO ('2026-02-01 00:00:00+00')`,
-		`CREATE TABLE ev_b PARTITION OF ev FOR VALUES FROM ('2026-02-01 00:00:00+00') TO ('2026-03-01 00:00:00+00')`,
-		`INSERT INTO ev SELECT '2026-01-05 00:00:00+00'::timestamptz + g * interval '1 minute', g FROM generate_series(1, 2000) g`)
+		fmt.Sprintf(`CREATE TABLE ev_a PARTITION OF ev FOR VALUES FROM ('%s 00:00:00+00') TO ('%s 00:00:00+00')`, day(-40), day(-35)),
+		fmt.Sprintf(`CREATE TABLE ev_b PARTITION OF ev FOR VALUES FROM ('%s 00:00:00+00') TO ('%s 00:00:00+00')`, day(-35), day(-30)),
+		fmt.Sprintf(`INSERT INTO ev SELECT '%s 00:00:00+00'::timestamptz + g * interval '1 minute', g FROM generate_series(1, 2000) g`, day(-39)))
 
 	t.Run("a table converts to columnar and back, and says how it is stored", func(t *testing.T) {
 		before := leader.Expect(200, "GET", tbl("facts"), nil)
@@ -113,8 +116,15 @@ func TestTableStorageAndPartitionPolicies(t *testing.T) {
 
 	t.Run("what cannot be converted is refused with its reasons, before a task exists", func(t *testing.T) {
 		st, p := leader.Do("PUT", tbl("uses")+"/storage", map[string]any{"accessMethod": "columnar"}, nil)
-		if st != 409 || p["code"] != "conversion_refused" || !strings.Contains(fmt.Sprint(p["detail"]), "foreign keys") {
+		if st != 409 || p["code"] != "conversion_refused" || !strings.Contains(fmt.Sprint(p["detail"]), "foreign keys") || !strings.Contains(fmt.Sprint(p["blockers"]), "foreign_keys") {
 			t.Errorf("a table with a foreign key: %d %v", st, p)
+		}
+		// the preview gives the same reasons as a typed list, and starts nothing
+		if st, pv := leader.Do("PUT", tbl("uses")+"/storage?dryRun=true", map[string]any{"accessMethod": "columnar"}, nil); st != 200 || pv["willConvert"] != false || !strings.Contains(fmt.Sprint(pv["blockers"]), "foreign_keys") || pv["current"] != "heap" {
+			t.Errorf("preview of a table with a foreign key: %d %v", st, pv)
+		}
+		if st, pv := leader.Do("PUT", tbl("facts")+"/storage?dryRun=true", map[string]any{"accessMethod": "columnar"}, nil); st != 200 || pv["willConvert"] != true {
+			t.Errorf("preview of a table that can be converted: %d %v", st, pv)
 		}
 		if st, p := leader.Do("PUT", tbl("ev")+"/storage", map[string]any{"accessMethod": "columnar"}, nil); st != 409 || p["code"] != "conversion_refused" {
 			t.Errorf("a partitioned table: %d %v", st, p)
@@ -176,7 +186,7 @@ func TestTableStorageAndPartitionPolicies(t *testing.T) {
 		if ev := leader.Expect(200, "GET", tbl("ev"), nil); ev["partitioning"].(map[string]any)["hasPolicy"] != true {
 			t.Errorf("hasPolicy: %v", ev["partitioning"])
 		}
-		plan := leader.Expect(200, "POST", tbl("ev")+"/partition-policy/plan", map[string]any{"asOf": "2026-03-10T00:00:00Z"})
+		plan := leader.Expect(200, "POST", tbl("ev")+"/partition-policy/plan", map[string]any{})
 		acts := plan["actions"].([]any)
 		if len(acts) == 0 || acts[0].(map[string]any)["state"] != "planned" {
 			t.Errorf("plan: %v", plan)
@@ -185,7 +195,15 @@ func TestTableStorageAndPartitionPolicies(t *testing.T) {
 			t.Errorf("a plan made %s partitions", n)
 		}
 		// by hand, for a time in the past (the scheduler may run it too: wait for every task of the table)
-		run := leader.Expect(202, "POST", tbl("ev")+"/partition-policy/runs", map[string]any{"asOf": "2026-03-10T00:00:00Z"})
+		// the time of a run is the time of the server: a run for 2100 is refused, and so is one for two days ago
+		for _, at := range []string{"2100-01-01T00:00:00Z", time.Now().UTC().Add(-48 * time.Hour).Format(time.RFC3339)} {
+			st, p := leader.Do("POST", tbl("ev")+"/partition-policy/runs", map[string]any{"asOf": at}, nil)
+			errs, _ := p["errors"].([]any)
+			if st != 400 || p["code"] != "validation_failed" || len(errs) != 1 || errs[0].(map[string]any)["field"] != "/asOf" {
+				t.Errorf("asOf %s: %d %v", at, st, p)
+			}
+		}
+		run := leader.Expect(202, "POST", tbl("ev")+"/partition-policy/runs", map[string]any{"asOf": time.Now().UTC().Format(time.RFC3339)})
 		got := leader.WaitTask(clustertest.TaskID(run), 5*time.Minute)
 		if got["kind"] != "partition.maintain" {
 			t.Errorf("kind %v", got["kind"])
@@ -201,7 +219,7 @@ func TestTableStorageAndPartitionPolicies(t *testing.T) {
 				mine = m
 			}
 		}
-		if mine == nil || mine["trigger"] != "manual" || mine["startedBy"] != clustertest.AdminUser || mine["asOf"] != "2026-03-10T00:00:00Z" {
+		if mine == nil || mine["trigger"] != "manual" || mine["startedBy"] != clustertest.AdminUser {
 			t.Fatalf("the run in the list: %v of %v", mine, runs["items"])
 		}
 		full := leader.Expect(200, "GET", fmt.Sprintf("%s/partition-policy/runs/%v", tbl("ev"), mine["id"]), nil)
@@ -225,9 +243,6 @@ func TestTableStorageAndPartitionPolicies(t *testing.T) {
 		}
 	})
 
-	day := func(offset int) string {
-		return time.Now().UTC().Truncate(24*time.Hour).AddDate(0, 0, offset).Format("2006-01-02")
-	}
 	t.Run("the scheduler of the leader runs a policy that is due", func(t *testing.T) {
 		// The first partition is yesterday's: the policy has to make today's and the next two, and the scheduler does it within its interval (3 s here).
 		stExec(t, leader, "st",
@@ -281,7 +296,7 @@ func TestTableStorageAndPartitionPolicies(t *testing.T) {
 			for _, it := range al["items"].([]any) {
 				a := it.(map[string]any)
 				sub, _ := a["subject"].(map[string]any)
-				if a["kind"] == kind && sub["databaseName"] == "st" && sub["aspect"] == "table:public.alert_t" && a["state"] != "resolved" {
+				if a["kind"] == kind && sub["databaseName"] == "st" && sub["tableSchema"] == "public" && sub["tableName"] == "alert_t" && sub["aspect"] == nil && a["state"] != "resolved" {
 					return true
 				}
 			}

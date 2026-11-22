@@ -91,12 +91,21 @@ func (s *Server) setStorage(c *call, w http.ResponseWriter, r *http.Request, par
 	if partition {
 		part = pp.pathName("partitionName")
 	}
+	dry := pp.boolQuery("dryRun")
 	if p := pp.err(); p != nil {
 		return p
 	}
 	var req api.TableStorageRequest
 	if err := s.body(w, r, &req); err != nil {
 		return err
+	}
+	if dry != nil && *dry {
+		out, err := o.PreviewSetStorage(r.Context(), c.session.Username, db, schema, table, part, req)
+		if err != nil {
+			return err
+		}
+		s.writeJSON(w, r, http.StatusOK, out)
+		return nil
 	}
 	in, err := o.PrepareSetStorage(r.Context(), c.session.Username, db, schema, table, part, req)
 	if err != nil {

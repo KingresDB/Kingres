@@ -15,9 +15,11 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/scheduler"
 )
 
@@ -51,8 +53,9 @@ type Backend interface {
 	Due(ctx context.Context, asOf time.Time) ([]Due, error)
 	// Start starts a run for a due policy. It reports false, without an error, when a task of the table is unfinished.
 	Start(ctx context.Context, d Due, asOf time.Time) (bool, error)
-	// Checks returns the findings of kingres.timepart_check in every database that has kingres_timepart.
-	Checks(ctx context.Context) ([]Check, error)
+	// Checks returns the findings of kingres.timepart_check in every database that has kingres_timepart, and the databases that it could read: a database that could not be read
+	// says nothing, so the alerts of its tables are neither raised nor cleared.
+	Checks(ctx context.Context) (checks []Check, read []string, err error)
 }
 
 // OpenAlert is an alert that is open.
@@ -152,7 +155,7 @@ func (s *Scheduler) Counts() (ticks, started, failures int64) {
 
 // alertKey names an alert of a table.
 func alertKey(kind string, c Check) OpenAlert {
-	return OpenAlert{Kind: kind, Subject: "database:" + c.Database + "|table:" + c.Schema + "." + c.Table}
+	return OpenAlert{Kind: kind, Subject: "database:" + api.SubjectEscape(c.Database) + "|tableschema:" + api.SubjectEscape(c.Schema) + "|tablename:" + api.SubjectEscape(c.Table)}
 }
 
 // CheckAlerts reads the findings and raises partitionsAheadLow for a policy whose last partition ends before the floor and partitionPolicyFailed for a
@@ -162,7 +165,7 @@ func (s *Scheduler) CheckAlerts(ctx context.Context) error {
 	if s.cfg.Alerts == nil {
 		return nil
 	}
-	checks, err := s.cfg.Backend.Checks(ctx)
+	checks, read, err := s.cfg.Backend.Checks(ctx)
 	if err != nil {
 		return fmt.Errorf("partsched: reading the checks: %w", err)
 	}
@@ -190,13 +193,26 @@ func (s *Scheduler) CheckAlerts(ctx context.Context) error {
 			first = err
 		}
 	}
+	readDB := map[string]bool{}
+	for _, d := range read {
+		readDB[d] = true
+	}
 	for _, o := range open {
 		if _, ok := want[o]; ok {
 			continue
+		}
+		if !readDB[subjectDatabase(o.Subject)] {
+			continue // its database was not read this time: the alert stays as it is
 		}
 		if err := s.cfg.Alerts.Clear(ctx, o.Kind, o.Subject); err != nil && first == nil {
 			first = err
 		}
 	}
 	return first
+}
+
+// subjectDatabase is the database named by the first segment of the stored subject of a partition alert.
+func subjectDatabase(subject string) string {
+	first, _, _ := strings.Cut(subject, "|")
+	return api.SubjectUnescape(strings.TrimPrefix(first, "database:"))
 }

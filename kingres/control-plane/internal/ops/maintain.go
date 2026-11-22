@@ -4,10 +4,8 @@ package ops
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -24,7 +22,11 @@ import (
 // database of the table; a run is a record of the extension (kingres.timepart_run), and kingres_cp.partition_run_task says which task made it.
 //
 // Every step is idempotent. begin looks for the run of this task before it makes one; a phase of a run records each action before and after it, so
-// a task that is taken over after a crash goes on with the action it was in; finish of a run that is finished does nothing.
+// a task that is taken over after a crash goes on with the action it was in; finish of a run that is finished does it again with the same result.
+//
+// A run is always closed with kingres.timepart_finish_run, whatever happened: that call moves the policy's next_run_at (so that a policy that fails is not
+// started again at every tick) and prunes the old runs. A run that failed before the finish step is closed by the failure itself (failRun) and, for a
+// failure that no step saw (the task is cancelled, the process lost its lease for good), by the hook OnFail of the kind.
 
 // KindMaintain is the task kind.
 const KindMaintain = "partition.maintain"
@@ -38,10 +40,16 @@ const (
 	stepMaintainFinish  = "Finish the run"
 )
 
-// maintainWait is how long begin waits before it asks again while another run of the table is going; maintainWaitLimit bounds the waiting. Variables for tests.
+// Timings that tests shorten.
 var (
+	// maintainWait is how long begin waits before it asks again while another run of the table is going; maintainWaitLimit bounds the waiting.
 	maintainWait      = 5 * time.Second
 	maintainWaitLimit = 30 * time.Minute
+	// maintainSkew is how far the time of a run may be from the time of the instance (the clock that decides what is old). A run for another time would
+	// retire or create the partitions of that time and park the schedule there.
+	maintainSkew = 5 * time.Minute
+	// maintainBackoff is how long a table whose last run failed is left alone by the scheduler, in addition to the next_run_at that the end of a run sets.
+	maintainBackoff = 5 * time.Minute
 )
 
 // maintainParams is the input of the task.
@@ -69,28 +77,27 @@ func (o *Ops) maintainDefinition() task.Definition {
 		phase(stepMaintainConvert, "convert"),
 		phase(stepMaintainRetire, "retire"),
 		{Name: stepMaintainFinish, Run: o.stepMaintainFinish},
-	}}
+	}, OnFail: o.maintainOnFail}
 }
 
-// PrepareMaintain validates a run of the policy of a table and returns the task input. asOf nil is now. trigger is schedule or manual.
+// PrepareMaintain validates a run of the policy of a table and returns the task input. asOf nil is the time of the instance. The time of a run must be within
+// maintainSkew of the time of the instance, so that a request, or a clock of the leader that jumped, cannot make a run act on another time (a dry
+// replay at another time is planPartitionPolicy). trigger is schedule or manual; only a manual run is refused when the policy converts and the library of
+// kingres_columnar is not preloaded: a scheduled run goes on creating and retiring, and the extension records the conversion it cannot do.
 func (o *Ops) PrepareMaintain(ctx context.Context, actor, db, schema, table string, asOf *time.Time, trigger string) (any, error) {
 	if err := checkNames(db, schema, table); err != nil {
 		return nil, err
 	}
-	at := time.Now().UTC()
-	if asOf != nil {
-		at = asOf.UTC()
-	}
-	p := maintainParams{Database: db, Schema: schema, Table: table, AsOf: at.Format(time.RFC3339Nano), Trigger: trigger, Actor: actor}
 	if err := o.ensureExtensions(ctx, db, []string{ExtTimepart}, false); err != nil {
 		return nil, err
 	}
 	var columnarAfter bool
+	var now time.Time
 	err := o.policyTx(ctx, db, func(tx pgx.Tx) error {
 		if err := requirePartitioned(ctx, tx, schema, table); err != nil {
 			return err
 		}
-		err := tx.QueryRow(ctx, `SELECT columnar_after IS NOT NULL FROM kingres.timepart_policy WHERE schema_name = $1 AND table_name = $2`, schema, table).Scan(&columnarAfter)
+		err := tx.QueryRow(ctx, `SELECT columnar_after IS NOT NULL, now() FROM kingres.timepart_policy WHERE schema_name = $1 AND table_name = $2`, schema, table).Scan(&columnarAfter, &now)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return problem.New(problem.NotFound, fmt.Sprintf("Table %s.%s has no partitioning policy.", schema, table))
 		}
@@ -99,18 +106,29 @@ func (o *Ops) PrepareMaintain(ctx context.Context, actor, db, schema, table stri
 	if err != nil {
 		return nil, wrap(err)
 	}
-	if columnarAfter {
+	now = now.UTC()
+	at := now
+	if asOf != nil {
+		at = asOf.UTC()
+		if d := at.Sub(now); d > maintainSkew || d < -maintainSkew {
+			return nil, problem.Validation("The time of the run is not the time of the server.", field("/asOf", fmt.Sprintf("must be within %s of the time of the server (%s)", maintainSkew, now.Format(time.RFC3339)), "out_of_range"))
+		}
+	}
+	if columnarAfter && trigger != "schedule" {
 		if err := o.ensureExtensions(ctx, db, []string{ExtColumnar}, true); err != nil {
 			return nil, err
 		}
 	}
-	return p, nil
+	return maintainParams{Database: db, Schema: schema, Table: table, AsOf: at.Format(time.RFC3339Nano), Trigger: trigger, Actor: actor}, nil
 }
 
 // StartMaintain starts the task for a table whose policy is due (the scheduler). It reports false, without an error, when a task of the table is
-// unfinished: the scheduler asks again at the next tick.
+// unfinished or when the last run of the table failed less than maintainBackoff ago: the scheduler asks again at the next tick.
 func (o *Ops) StartMaintain(ctx context.Context, db, schema, table string, asOf time.Time) (bool, error) {
 	if o.maintainRunning(ctx, db, schema, table) {
+		return false, nil
+	}
+	if o.recentlyFailed(ctx, db, schema, table) {
 		return false, nil
 	}
 	in, err := o.PrepareMaintain(ctx, "system", db, schema, table, &asOf, "schedule")
@@ -127,9 +145,26 @@ func (o *Ops) StartMaintain(ctx context.Context, db, schema, table string, asOf 
 	return true, nil
 }
 
-// maintainConn opens a service connection to the database of the table, trusting the owners of the tables as the service role trusts itself
-// (the extension refuses to run code of a table owner in a superuser session otherwise).
+// recentlyFailed tells whether the last run of the table ended failed within maintainBackoff (by the clock of the instance).
+func (o *Ops) recentlyFailed(ctx context.Context, db, schema, table string) bool {
+	var yes bool
+	err := o.policyTx(ctx, db, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM kingres.timepart_run r WHERE r.schema_name = $1 AND r.table_name = $2 AND r.state = 'failed'
+			AND r.finished_at > now() - make_interval(secs => $3::float8))`, schema, table, maintainBackoff.Seconds()).Scan(&yes)
+	})
+	return err == nil && yes
+}
+
+// maintainConn opens a service connection to the database of the table that trusts the owners of the tables; see trustedConn.
 func (o *Ops) maintainConn(ctx context.Context, db string) (*pgx.Conn, error) {
+	return o.trustedConn(ctx, db)
+}
+
+// trustedConn opens a service connection with kingres_timepart.trust_table_owners on and intervals in ISO 8601. The setting is the rule for every
+// operation that drives the DDL of kingres_timepart (a run of a policy and the conversion of a partition): the owner of the table is a role of this
+// cluster, and the code it can cause to run in the session (an index expression, a default, a trigger on a partition) runs as the service role for the time
+// of the call. The connection is closed when the call ends, which ends whatever the code left in the session. The README and the contract say so.
+func (o *Ops) trustedConn(ctx context.Context, db string) (*pgx.Conn, error) {
 	if o.Service == nil {
 		return nil, problem.New(problem.UnsupportedOp, "This server has no managed instance.")
 	}
@@ -158,21 +193,38 @@ func (o *Ops) runOfTask(ctx context.Context, db string, taskID int64) (int64, er
 	return run, err
 }
 
-func (o *Ops) runState(ctx context.Context, db string, run int64) (string, error) {
+// runInfo is the state of a run and its error text as the instance has them. A run that the instance does not have is an error: the run was made by
+// another server's instance and this server cannot go on with it.
+func (o *Ops) runInfo(ctx context.Context, db string, run int64) (state, errText string, err error) {
 	c, err := o.maintainConn(ctx, db)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
-	var st string
-	err = c.QueryRow(ctx, `SELECT state FROM kingres.timepart_run_data WHERE run_id = $1`, run).Scan(&st)
+	var e *string
+	err = c.QueryRow(ctx, `SELECT state, error FROM kingres.timepart_run_data WHERE run_id = $1`, run).Scan(&state, &e)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", nil
+		return "", "", fmt.Errorf("run %d, which this task made, is not in the instance of this server (the task was taken over by a server whose instance does not hold it): the run cannot go on", run)
 	}
-	return st, err
+	if e != nil {
+		errText = *e
+	}
+	return state, errText, err
 }
 
-// stepMaintainBegin makes the run, or finds the one this task made. While another run of the table is going it waits and says so.
+// finishRun closes a run: its final state, the next run time of the policy and the pruning of old runs. It is idempotent.
+func (o *Ops) finishRun(ctx context.Context, db string, run int64) error {
+	c, err := o.maintainConn(ctx, db)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	_, err = c.Exec(ctx, `SELECT kingres.timepart_finish_run($1)`, run)
+	return err
+}
+
+// stepMaintainBegin makes the run, or finds the one this task made. While another run of the table is going it waits and says so. A run that the extension
+// records as failed at once (the owner changed, the policy was never verified) is closed here and fails the task with the reason.
 func (o *Ops) stepMaintainBegin(ctx context.Context, env *task.Env) error {
 	p, err := inputOf[maintainParams](env.Task)
 	if err != nil {
@@ -192,11 +244,25 @@ func (o *Ops) stepMaintainBegin(ctx context.Context, env *task.Env) error {
 		run, err := o.beginRun(ctx, p, asOf)
 		if err == nil {
 			_ = env.SetDetail(ctx, "")
-			return o.asService(ctx, sysdb.Database, func(tx pgx.Tx) error {
+			if err := o.asService(ctx, sysdb.Database, func(tx pgx.Tx) error {
 				_, err := tx.Exec(ctx, `INSERT INTO kingres_cp.partition_run_task (database_name, run_id, task_id, started_by) VALUES ($1, $2, $3, $4)
 					ON CONFLICT (database_name, run_id) DO NOTHING`, p.Database, run, env.Task.ID, p.Actor)
 				return err
-			})
+			}); err != nil {
+				return err
+			}
+			state, errText, err := o.runInfo(ctx, p.Database, run)
+			if err != nil {
+				return err
+			}
+			if state == "failed" {
+				if err := o.finishRun(ctx, p.Database, run); err != nil {
+					return err
+				}
+				o.countRun("failed")
+				return &extError{code: problem.PartitionPolicyConflict, msg: "The run could not begin: " + errText}
+			}
+			return nil
 		}
 		var pe *pgconn.PgError
 		if !errors.As(err, &pe) || pe.Code != "55P03" {
@@ -234,9 +300,7 @@ func maintainError(err error) error {
 	var pe *pgconn.PgError
 	if errors.As(err, &pe) {
 		switch pe.Code {
-		case "42704":
-			return &extError{code: problem.PartitionPolicyConflict, msg: pe.Message}
-		case "42501":
+		case "42704", "42501":
 			return &extError{code: problem.PartitionPolicyConflict, msg: pe.Message}
 		}
 	}
@@ -244,7 +308,7 @@ func maintainError(err error) error {
 }
 
 // stepMaintainPhase runs one phase of the run: create, convert or retire. A phase that finds nothing to do succeeds. An action that failed (a lock
-// timeout) does not fail the step: the run ends partial and the next run tries again.
+// timeout) does not fail the step: the run ends partial and the next run tries again. An error of the phase closes the run as failed.
 func (o *Ops) stepMaintainPhase(ctx context.Context, env *task.Env, phase string) error {
 	p, run, state, err := o.currentRun(ctx, env)
 	if err != nil {
@@ -279,17 +343,18 @@ func (o *Ops) currentRun(ctx context.Context, env *task.Env) (maintainParams, in
 	if run == 0 {
 		return p, 0, "", errors.New("the run of this task was not made")
 	}
-	st, err := o.runState(ctx, p.Database, run)
+	st, _, err := o.runInfo(ctx, p.Database, run)
 	return p, run, st, err
 }
 
-// failRun marks a run failed after a step raised an error (the run would otherwise stay running until the next run found its session gone).
+// failRun marks a run failed after a step raised an error and closes it, so that the next run time moves (the policy is not started again at every tick) and
+// the old runs are pruned. Best effort: a run that cannot be marked now is marked by the next begin as interrupted.
 func (o *Ops) failRun(ctx context.Context, db string, run int64, cause error) {
-	c, err := o.maintainConn(context.WithoutCancel(ctx), db)
+	ctx = context.WithoutCancel(ctx)
+	c, err := o.maintainConn(ctx, db)
 	if err != nil {
 		return
 	}
-	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
 	msg := cause.Error()
 	var pe *pgconn.PgError
 	if errors.As(cause, &pe) {
@@ -298,34 +363,55 @@ func (o *Ops) failRun(ctx context.Context, db string, run int64, cause error) {
 	if len(msg) > 500 {
 		msg = msg[:500]
 	}
-	_, _ = c.Exec(context.WithoutCancel(ctx), `UPDATE kingres.timepart_run_data SET state = 'failed', finished_at = now(), error = $2 WHERE run_id = $1 AND state = 'running'`, run, msg)
+	_, _ = c.Exec(ctx, `UPDATE kingres.timepart_run_data SET state = 'failed', finished_at = now(), error = $2 WHERE run_id = $1 AND state = 'running'`, run, msg)
+	_ = c.Close(ctx)
+	if err := o.finishRun(ctx, db, run); err != nil && o.Log != nil {
+		o.Log.Warn("closing a failed run of a partition policy failed", "database", db, "run", run, "error", err)
+	}
+	o.countRun("failed")
 }
 
-// stepMaintainFinish closes the run: its state, the next run time, the pruning of old runs.
+// maintainOnFail runs after the task was recorded as failed or cancelled: a run that is still going (a step failed in a way that no step saw, the task was
+// cancelled) is marked failed and closed, so that the schedule moves on.
+func (o *Ops) maintainOnFail(ctx context.Context, t task.Task) {
+	p, err := inputOf[maintainParams](t)
+	if err != nil {
+		return
+	}
+	run, err := o.runOfTask(ctx, p.Database, t.ID)
+	if err != nil || run == 0 {
+		return
+	}
+	state, _, err := o.runInfo(ctx, p.Database, run)
+	if err != nil || state != "running" {
+		return
+	}
+	cause := errors.New("the task ended before the run did")
+	if t.Error != nil {
+		cause = fmt.Errorf("%s: %s", t.Error.Code, t.Error.Message)
+	}
+	o.failRun(ctx, p.Database, run, cause)
+}
+
+// stepMaintainFinish closes the run: its state, the next run time, the pruning of old runs. It also closes a run that failed or was closed before, which
+// moves the schedule once more with the same result.
 func (o *Ops) stepMaintainFinish(ctx context.Context, env *task.Env) error {
 	p, run, state, err := o.currentRun(ctx, env)
 	if err != nil {
 		return err
 	}
-	if state != "running" {
-		o.countRun(state)
-		return env.SetDetail(ctx, fmt.Sprintf("Run %d is %s.", run, state))
-	}
-	c, err := o.maintainConn(ctx, p.Database)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
-	if _, err := c.Exec(ctx, `SELECT kingres.timepart_finish_run($1)`, run); err != nil {
+	if err := o.finishRun(ctx, p.Database, run); err != nil {
 		return maintainError(err)
 	}
-	final, err := o.runState(ctx, p.Database, run)
+	final, _, err := o.runInfo(ctx, p.Database, run)
 	if err != nil {
 		return err
 	}
-	o.countRun(final)
-	if n := o.failedActions(ctx, p.Database, run); n > 0 {
-		o.metrics.actionsFailed.Add(n)
+	if state == "running" { // the first close of this run
+		o.countRun(final)
+		if n := o.failedActions(ctx, p.Database, run); n > 0 {
+			o.metrics.actionsFailed.Add(n)
+		}
 	}
 	return nil
 }
@@ -357,6 +443,3 @@ type partitionMetrics struct {
 func (o *Ops) PartitionMetrics() (runs, bad, actionsFailed int64) {
 	return o.metrics.runs.Load(), o.metrics.runsBad.Load(), o.metrics.actionsFailed.Load()
 }
-
-var _ = strings.TrimSpace
-var _ = json.Marshal

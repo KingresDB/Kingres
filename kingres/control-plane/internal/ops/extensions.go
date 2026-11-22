@@ -69,11 +69,13 @@ var databaseSettingNames = map[string]func(string) bool{
 type extError struct {
 	code problem.Code
 	msg  string
+	// retry says that the same request may succeed later (a lock that is held).
+	retry bool
 }
 
 func (e *extError) Error() string       { return e.msg }
 func (e *extError) TaskCode() string    { return string(e.code) }
-func (e *extError) TaskRetryable() bool { return false }
+func (e *extError) TaskRetryable() bool { return e.retry }
 
 func extErr(code problem.Code, format string, a ...any) *extError {
 	return &extError{code: code, msg: fmt.Sprintf(format, a...)}
@@ -285,7 +287,7 @@ func (o *Ops) extCheckLocal(ctx context.Context, p extensionOp) error {
 			return err
 		}
 		if !ok {
-			return extErr(problem.ExtensionMissing, "the library %s is not in shared_preload_libraries of this server; add it and restart the instance", p.Extension)
+			return extErr(problem.ExtensionMissing, "the library %s is not loaded by this server: its instance was started before the library was added to shared_preload_libraries, so restart the instance", p.Extension)
 		}
 	}
 	return nil

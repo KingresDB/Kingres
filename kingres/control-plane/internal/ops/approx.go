@@ -69,15 +69,15 @@ func (o *Ops) approxDefinition() task.Definition {
 		if err != nil {
 			return nil, err
 		}
-		steps := []task.Step{{Name: stepApproxCheck, Run: o.stepApproxCheck}}
+		steps := []task.Step{{Name: stepApproxCheck, Interruptible: true, Run: o.stepApproxCheck}}
 		for _, s := range p.Servers {
-			steps = append(steps, task.Step{Name: fmt.Sprintf(stepApproxInstall, s), Run: func(ctx context.Context, env *task.Env) error {
+			steps = append(steps, task.Step{Name: fmt.Sprintf(stepApproxInstall, s), Interruptible: true, Run: func(ctx context.Context, env *task.Env) error {
 				return o.stepApproxInstall(ctx, env, s)
 			}})
 		}
 		return append(steps,
-			task.Step{Name: stepApproxVerify, Run: o.stepApproxVerify},
-			task.Step{Name: stepApproxApply, Run: o.stepApproxApply},
+			task.Step{Name: stepApproxVerify, Interruptible: true, Run: o.stepApproxVerify},
+			task.Step{Name: stepApproxApply, Interruptible: true, Run: o.stepApproxApply},
 			task.Step{Name: stepApproxRecord, Run: o.stepApproxRecord}), nil
 	}}
 }
@@ -372,7 +372,7 @@ func (o *Ops) getServerStates(ctx context.Context, db string) (serverStates, err
 	// The reference is the highest version found; a server with a lower one is a mismatch.
 	ref := ""
 	for _, s := range all {
-		if s.version > ref {
+		if compareVersions(s.version, ref) > 0 {
 			ref = s.version
 		}
 	}
@@ -409,4 +409,43 @@ func (o *Ops) getServerStates(ctx context.Context, db string) (serverStates, err
 func isRemoteRefusal(err error) bool {
 	var ae *peerclient.APIError
 	return errors.As(err, &ae)
+}
+
+// compareVersions compares two extension versions such as 1.0, 0.9 and 0.10 as numbers part by part (0.10 is above 0.9); a part that is not a number is
+// compared as text. The empty version is below every other.
+func compareVersions(a, b string) int {
+	if a == b {
+		return 0
+	}
+	if a == "" {
+		return -1
+	}
+	if b == "" {
+		return 1
+	}
+	pa, pb := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < len(pa) || i < len(pb); i++ {
+		x, y := "0", "0" // a missing part is zero: 1.0 and 1.0.0 are the same
+		if i < len(pa) {
+			x = pa[i]
+		}
+		if i < len(pb) {
+			y = pb[i]
+		}
+		nx, ex := strconv.Atoi(x)
+		ny, ey := strconv.Atoi(y)
+		switch {
+		case ex == nil && ey == nil && nx != ny:
+			if nx < ny {
+				return -1
+			}
+			return 1
+		case (ex != nil || ey != nil) && x != y:
+			if x < y {
+				return -1
+			}
+			return 1
+		}
+	}
+	return 0
 }

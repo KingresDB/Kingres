@@ -2,6 +2,8 @@
 
 package api
 
+import "strings"
+
 // The types of phase 12 (contract 0.18.0): approximate aggregates, storage and time partitioning.
 
 // DatabaseApproximate is the approximateAggregates member of Database (optional).
@@ -176,4 +178,23 @@ type PlanPartitionPolicyRequest struct {
 type PartitionPlan struct {
 	AsOf    Time              `json:"asOf"`
 	Actions []PartitionAction `json:"actions"`
+}
+
+// TableStoragePreview is the answer of a storage request with dryRun=true.
+type TableStoragePreview struct {
+	Current     *string        `json:"current"`
+	Target      string         `json:"target"`
+	WillConvert bool           `json:"willConvert"`
+	Blockers    []TableBlocker `json:"blockers"`
+	Notes       []string       `json:"notes"`
+}
+
+// SubjectEscape and SubjectUnescape make a name safe for a segment of the stored subject of an alert (segments are separated by "|").
+func SubjectEscape(s string) string {
+	return strings.NewReplacer("%", "%25", "|", "%7C").Replace(s)
+}
+
+// SubjectUnescape reverses SubjectEscape.
+func SubjectUnescape(s string) string {
+	return strings.NewReplacer("%7C", "|", "%25", "%").Replace(s)
 }

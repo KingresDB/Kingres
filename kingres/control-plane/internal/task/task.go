@@ -982,6 +982,29 @@ func (e *Engine) def(kind string) (Definition, bool) {
 	return d, ok
 }
 
+// ActiveStore is the optional part of a Store that answers "does this subject have an unfinished task of this kind" without reading a window of the newest tasks.
+type ActiveStore interface {
+	ActiveFor(ctx context.Context, kind, subjType, subjID string) (bool, error)
+}
+
+// ActiveFor tells whether the subject has an unfinished task (pending, running or paused) of the kind. It asks the store directly when the store can
+// answer; otherwise it reads the newest thousand tasks.
+func (e *Engine) ActiveFor(ctx context.Context, kind, subjType, subjID string) (bool, error) {
+	if s, ok := e.store.(ActiveStore); ok {
+		return s.ActiveFor(ctx, kind, subjType, subjID)
+	}
+	ts, err := e.store.List(ctx, 1000)
+	if err != nil {
+		return false, err
+	}
+	for _, t := range ts {
+		if t.Kind == kind && t.SubjectType == subjType && t.SubjectID == subjID && t.State.Active() {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // List returns the newest tasks.
 func (e *Engine) List(ctx context.Context, limit int) ([]Task, error) {
 	return e.store.List(ctx, limit)

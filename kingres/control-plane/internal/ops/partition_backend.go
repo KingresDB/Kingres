@@ -93,13 +93,15 @@ func (b PartitionBackend) Start(ctx context.Context, d partsched.Due, asOf time.
 	return b.O.StartMaintain(ctx, d.Database, d.Schema, d.Table, asOf)
 }
 
-// Checks implements partsched.Backend. A run that was partial counts as a failure for the alert only when the run before it was partial too.
-func (b PartitionBackend) Checks(ctx context.Context) ([]partsched.Check, error) {
+// Checks implements partsched.Backend. A run that was partial counts as a failure for the alert only when the run before it was partial too. It also returns the
+// databases it read, so that an alert of a database that could not be read is left as it is.
+func (b PartitionBackend) Checks(ctx context.Context) ([]partsched.Check, []string, error) {
 	dbs, err := b.databasesWithTimepart(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var out []partsched.Check
+	var read []string
 	for _, db := range dbs {
 		err := b.O.asService(ctx, db, func(tx pgx.Tx) error {
 			rows, err := tx.Query(ctx, `SELECT schema_name::text, table_name::text, problem, coalesce(detail, '') FROM kingres.timepart_check()`)
@@ -124,7 +126,7 @@ func (b PartitionBackend) Checks(ctx context.Context) ([]partsched.Check, error)
 					var prev string
 					err := tx.QueryRow(ctx, `SELECT state FROM kingres.timepart_run r WHERE r.schema_name = $1 AND r.table_name = $2 AND r.state <> 'running'
 						ORDER BY r.run_id DESC OFFSET 1 LIMIT 1`, c.Schema, c.Table).Scan(&prev)
-					if err != nil || prev != "partial" {
+					if !secondPartial(prev, err) {
 						continue
 					}
 				}
@@ -134,7 +136,13 @@ func (b PartitionBackend) Checks(ctx context.Context) ([]partsched.Check, error)
 		})
 		if err != nil {
 			b.O.Log.Warn("reading the check of the policies of a database failed", "database", db, "error", err)
+			continue
 		}
+		read = append(read, db)
 	}
-	return out, nil
+	return out, read, nil
 }
+
+// secondPartial says whether the run before the last one was partial too: one partial run is a lock that was held, two in a row is a policy that does not get
+// its work done, and only that is an alert.
+func secondPartial(prev string, err error) bool { return err == nil && prev == "partial" }

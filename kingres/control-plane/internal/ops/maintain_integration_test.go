@@ -48,6 +48,10 @@ func policyOps(t *testing.T) (*Ops, *pgx.Conn, *task.MemStore, *testClock) {
 		`CREATE TABLE public.ev_yesterday PARTITION OF public.ev FOR VALUES FROM ('2026-01-09 00:00:00+00') TO ('2026-01-10 00:00:00+00')`,
 		`INSERT INTO public.ev VALUES ('2026-01-01 05:00:00+00', 1), ('2026-01-09 05:00:00+00', 2)`)
 	o := &Ops{Service: testService{in, t}, ServerHost: "s1", Log: slog.New(slog.DiscardHandler)}
+	// The tests run for fixed times: the bound of the time of a run is wide here, and tested on its own.
+	oldSkew := maintainSkew
+	maintainSkew = 100 * 365 * 24 * time.Hour
+	t.Cleanup(func() { maintainSkew = oldSkew })
 	clk := &testClock{t: time.Now()}
 	mem := task.NewMemStoreClock(clk.Now)
 	e, err := task.NewEngine(mem, o.Definitions(), task.Options{Holder: "A", Lease: time.Minute, StoreTries: 1, Now: clk.Now})
@@ -478,7 +482,7 @@ func TestIntegrationPartitionSchedulerStartsDueRuns(t *testing.T) {
 	}
 	_ = hold
 	// the findings for the alerts: the check reads the policies of every database
-	checks, err := (PartitionBackend{O: o}).Checks(ctx)
+	checks, _, err := (PartitionBackend{O: o}).Checks(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}

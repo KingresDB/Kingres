@@ -143,9 +143,19 @@ func (m *Manager) EnsureConfig(id int) (bool, error) {
 	if err != nil {
 		return changed, err
 	}
-	// An instance made by an earlier package preloads fewer libraries: bring the line up to date (it takes effect at the next restart).
-	if strings.Contains(string(cur), "include_if_exists '"+ConfigFileName+"'") && !preloadOutOfDate(string(cur)) {
+	// An instance made by an earlier package preloads fewer libraries: bring the line up to date (it takes effect at the next restart). The list names
+	// kingres_columnar only when the installation has the library: an instance whose preload names a file that is not there cannot start, and the next
+	// restart, even after a crash, would take the server down.
+	want := m.preloadList()
+	if strings.Contains(string(cur), "include_if_exists '"+ConfigFileName+"'") && !preloadDiffers(string(cur), want) {
 		return changed, nil
+	}
+	if preloadDiffers(string(cur), want) {
+		m.log.Warn("shared_preload_libraries of an instance is brought up to date; it takes effect when the instance is restarted (standbys first), and until then a columnar table cannot be written",
+			"instance", id, "now", preloadOf(string(cur)), "next", want)
+		if want != PreloadLibraries {
+			m.log.Warn("the installation has no kingres_columnar library: the instance does not preload it, and columnar storage is not available on this server", "instance", id)
+		}
 	}
 	s, err := m.Settings(id)
 	if err != nil {
@@ -154,16 +164,65 @@ func (m *Manager) EnsureConfig(id int) (bool, error) {
 	if err := m.WriteManaged(id, s); err != nil {
 		return changed, err
 	}
+	// A running instance reads the new line at a reload and then shows the setting as pending a restart (pg_settings.pending_restart), which is what
+	// getConfigSummary and the restart of the console list; without the reload it would not know.
+	if up, _ := m.Running(context.Background(), id); up {
+		if err := m.Reload(context.Background(), id); err != nil {
+			m.log.Warn("reloading an instance after its preload list changed failed", "instance", id, "error", err)
+		}
+	}
 	return true, nil
 }
 
 var preloadLineRE = regexp.MustCompile(`(?m)^shared_preload_libraries = '([^'
 ]*)'`)
 
-// preloadOutOfDate says whether kingres-managed.conf carries a preload list other than PreloadLibraries.
-func preloadOutOfDate(managed string) bool {
+// preloadOf returns the preload list of kingres-managed.conf, "" when it has none.
+func preloadOf(managed string) string {
 	m := preloadLineRE.FindStringSubmatch(managed)
-	return m != nil && m[1] != PreloadLibraries
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
+
+// preloadOutOfDate says whether kingres-managed.conf carries a preload list other than PreloadLibraries.
+func preloadOutOfDate(managed string) bool { return preloadDiffers(managed, PreloadLibraries) }
+
+// preloadDiffers says whether kingres-managed.conf carries a preload list, and another one than want.
+func preloadDiffers(managed, want string) bool {
+	have := preloadOf(managed)
+	return have != "" && have != want
+}
+
+// columnarLibrary is the library whose absence from the installation makes the manager leave it out of the preload list.
+const columnarLibrary = "kingres_columnar"
+
+// preloadList is the value of shared_preload_libraries for an instance of this installation: PreloadLibraries, without kingres_columnar when the
+// installation has no such library file in its package library directory (a package that was not upgraded with kingresd, an image that mixes versions).
+// The answer is looked up each time: the directory is read through pg_config, which is cheap, and a package that is upgraded while kingresd runs is seen.
+func (m *Manager) preloadList() string {
+	if m.libraryExists(columnarLibrary) {
+		return PreloadLibraries
+	}
+	return strings.TrimSuffix(PreloadLibraries, ","+columnarLibrary)
+}
+
+// libraryExists tells whether the installation has the library file lib (lib.so, or the extension of the platform), through pg_config --pkglibdir.
+// When pg_config cannot be run the library is assumed to be there, which is what the product did before.
+func (m *Manager) libraryExists(lib string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := m.run(ctx, "pg_config", "--pkglibdir")
+	if err != nil || out == "" {
+		return true
+	}
+	for _, ext := range []string{".so", ".dylib", ".dll"} {
+		if _, err := os.Stat(filepath.Join(out, lib+ext)); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // CheckValue asks PostgreSQL's own parser whether a value is valid for a parameter of PostgreSQL

@@ -161,13 +161,38 @@ func (o *Ops) policyTx(ctx context.Context, db string, f func(tx pgx.Tx) error) 
 	})
 }
 
+// notOnThisInstance is the 404 of a table that the instance of the manager leader does not have: it does not exist, or it lives on the instance of another
+// shard group, which the storage and policy operations of this version do not reach. The detail says both.
+func notOnThisInstance(schema, table string) error {
+	return problem.New(problem.NotFound, fmt.Sprintf("Table %s.%s does not exist on the instance of the manager leader. The operations on storage and partitioning act on the tables of that instance; "+
+		"a table that lives on another shard group's instance is not reached in this version.", schema, table))
+}
+
+// timepartInstalled tells whether kingres_timepart is installed in the database of this server. The read operations ask this and never install: a read that
+// ran CREATE EXTENSION, or an ALTER EXTENSION UPDATE while a run goes, would be a write by a read-only role (and on a follower a refused write).
+func (o *Ops) timepartInstalled(ctx context.Context, db string) (bool, error) {
+	v, err := o.ext().Installed(ctx, db, ExtTimepart)
+	if err != nil {
+		return false, connectProblem(err)
+	}
+	return v != "", nil
+}
+
+func noPolicy(schema, table string, installed bool) error {
+	why := "has no partitioning policy"
+	if !installed {
+		why = "has no partitioning policy (kingres_timepart is not installed in this database)"
+	}
+	return problem.New(problem.NotFound, fmt.Sprintf("Table %s.%s %s.", schema, table, why))
+}
+
 // requirePartitioned returns the key type of a table that a policy can work on; the problem is 404 for a table that is not there and
 // partition_policy_conflict for one that cannot have a policy.
 func requirePartitioned(ctx context.Context, tx pgx.Tx, schema, table string) error {
 	var kind string
 	err := tx.QueryRow(ctx, `SELECT c.relkind::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r', 'p')`, schema, table).Scan(&kind)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return problem.New(problem.NotFound, fmt.Sprintf("Table %s.%s does not exist.", schema, table))
+		return notOnThisInstance(schema, table)
 	}
 	if err != nil {
 		return err
@@ -188,8 +213,10 @@ func (o *Ops) GetPartitionPolicy(ctx context.Context, db, schema, table string) 
 	if err := checkNames(db, schema, table); err != nil {
 		return out, err
 	}
-	if err := o.ensureExtensions(ctx, db, []string{ExtTimepart}, false); err != nil {
+	if ok, err := o.timepartInstalled(ctx, db); err != nil {
 		return out, err
+	} else if !ok {
+		return out, noPolicy(schema, table, false)
 	}
 	err := o.policyTx(ctx, db, func(tx pgx.Tx) (err error) {
 		if err := requirePartitioned(ctx, tx, schema, table); err != nil {
@@ -209,7 +236,7 @@ func readPolicy(ctx context.Context, tx pgx.Tx, schema, table string) (api.Parti
 		&out.PartitionEvery, &out.CreateAhead, &out.Retention, &out.RetentionAction, &out.ColumnarAfter, &out.ColumnarSortBy, &out.Compression,
 		&out.CompressionLevel, &out.Timezone, &out.RunEvery, &out.Enabled, &nextp, &out.CreatedBy, &out.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return out, problem.New(problem.NotFound, fmt.Sprintf("Table %s.%s has no partitioning policy.", schema, table))
+		return out, noPolicy(schema, table, true)
 	}
 	if err != nil {
 		return out, err
@@ -295,6 +322,9 @@ func (o *Ops) PutPartitionPolicy(ctx context.Context, actor, db, schema, table s
 	if err := o.ensureExtensions(ctx, db, need, a.columnar != nil); err != nil {
 		return out, err
 	}
+	if o.maintainRunning(ctx, db, schema, table) {
+		return out, problem.New(problem.OperationInProgress, "A partition.maintain task is running for this table; its end moves the schedule. Set the policy when it has ended.")
+	}
 	err = o.policyTx(ctx, db, func(tx pgx.Tx) error {
 		if err := requirePartitioned(ctx, tx, schema, table); err != nil {
 			return err
@@ -318,8 +348,10 @@ func (o *Ops) DeletePartitionPolicy(ctx context.Context, db, schema, table strin
 	if err := checkNames(db, schema, table); err != nil {
 		return err
 	}
-	if err := o.ensureExtensions(ctx, db, []string{ExtTimepart}, false); err != nil {
+	if ok, err := o.timepartInstalled(ctx, db); err != nil {
 		return err
+	} else if !ok {
+		return noPolicy(schema, table, false)
 	}
 	if o.maintainRunning(ctx, db, schema, table) {
 		return problem.New(problem.OperationInProgress, "A partition.maintain task is running for this table.")
@@ -359,8 +391,13 @@ func (o *Ops) PlanPartitionPolicy(ctx context.Context, db, schema, table string,
 		}
 		hyp = &a
 	}
-	if err := o.ensureExtensions(ctx, db, []string{ExtTimepart}, false); err != nil {
+	if ok, err := o.timepartInstalled(ctx, db); err != nil {
 		return out, err
+	} else if !ok {
+		if hyp != nil {
+			return out, problem.New(problem.ExtensionMissing, "kingres_timepart is not installed in this database; set a policy first (the first write installs it).")
+		}
+		return out, noPolicy(schema, table, false)
 	}
 	err := o.policyTx(ctx, db, func(tx pgx.Tx) error {
 		if err := requirePartitioned(ctx, tx, schema, table); err != nil {
@@ -411,23 +448,14 @@ func utc(t *time.Time) *time.Time {
 // subjectOf is the subject of a task of a table.
 func subjectOf(db, schema, table string) string { return db + "/" + schema + "." + table }
 
-// maintainRunning tells whether a task partition.maintain is unfinished for the table.
+// maintainRunning tells whether a task partition.maintain is unfinished for the table (asked of the task store by kind and subject, not in a window of the newest tasks).
 func (o *Ops) maintainRunning(ctx context.Context, db, schema, table string) bool {
 	eng := o.Engine()
 	if eng == nil {
 		return false
 	}
-	ts, err := eng.List(ctx, 200)
-	if err != nil {
-		return false
-	}
-	subj := subjectOf(db, schema, table)
-	for _, t := range ts {
-		if t.Kind == KindMaintain && t.SubjectID == subj && (t.State == "pending" || t.State == "running" || t.State == "paused") {
-			return true
-		}
-	}
-	return false
+	yes, err := eng.ActiveFor(ctx, KindMaintain, "table", subjectOf(db, schema, table))
+	return err == nil && yes
 }
 
 var _ = sqlx.Fixed("")
