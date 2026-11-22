@@ -93,12 +93,25 @@ func (e *Error) Error() string {
 	}
 	if e.Line > 0 {
 		b.WriteString(", line " + strconv.Itoa(e.Line))
+	} else if strings.HasPrefix(e.SQLState, "23") {
+		// A constraint of a table of the router is checked by a shard group, which does not say which row it was (spike S2).
+		b.WriteString(", the row that failed is not known")
 	}
 	if !strings.HasSuffix(e.Sentence, ".") {
 		b.WriteString(".")
 	}
 	return b.String()
 }
+
+// ForTarget names the table of the task in the error: the router's errors from the shard groups name a bucket partition or nothing, so the
+// table is the one the task works on, which the caller knows and the error does not. It returns e.
+func (e *Error) ForTarget(schema, table string) *Error {
+	e.Schema, e.Table = safeText(schema), safeText(table)
+	return e
+}
+
+// bucketRE matches the name of a bucket partition of a distributed table (<table>_bNNNN) and of the indexes and constraints made from it.
+var bucketRE = regexp.MustCompile("_b[0-9]{4}(_|$)")
 
 func qualified(schema, table string) string {
 	if schema == "" {
@@ -255,6 +268,13 @@ func fromPg(pe *pgconn.PgError) *Error {
 		Column:     safeText(pe.ColumnName),
 		Constraint: safeText(pe.ConstraintName),
 		Line:       lineOf(pe.Where, pe.TableName),
+	}
+	// A name that is a bucket partition of a distributed table belongs to the implementation of the router, not to the user's table.
+	if bucketRE.MatchString(pe.TableName) {
+		e.Schema, e.Table = "", ""
+	}
+	if bucketRE.MatchString(pe.ConstraintName) {
+		e.Constraint = ""
 	}
 	switch {
 	case state == "KS001", strings.HasPrefix(state, "08"), state == "57P01", state == "57P02", state == "57P03", state == "40001", state == "40P01":
