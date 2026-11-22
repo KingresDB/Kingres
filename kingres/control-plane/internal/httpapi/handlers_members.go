@@ -37,6 +37,9 @@ func (s *Server) memberHandlers() map[string]handlerFunc {
 		"leaveCluster":             s.leaveCluster,
 		"renewServerCertificates":  s.renewServerCertificates,
 		"revokeServerCertificates": s.revokeServerCertificates,
+		"getCaEscrow":              s.getCaEscrow,
+		"setCaEscrow":              s.setCaEscrow,
+		"rotateCaEscrow":           s.rotateCaEscrow,
 	}
 }
 
@@ -238,5 +241,76 @@ func (s *Server) revokeServerCertificates(c *call, w http.ResponseWriter, r *htt
 		return err
 	}
 	s.accepted(w, r, t)
+	return nil
+}
+
+// CAEscrow is the escrow of the CA key (contract 0.22.0). The leader's Members implements it; a server whose Members does
+// not has no escrow to offer.
+type CAEscrow interface {
+	EscrowStatus(ctx context.Context) (api.CaEscrowStatus, error)
+	SetEscrow(ctx context.Context, enabled bool) (api.CaEscrowStatus, error)
+	RotateEscrow(ctx context.Context) (api.CaEscrowStatus, error)
+}
+
+func (s *Server) needEscrow() (CAEscrow, error) {
+	m, err := s.needMembers()
+	if err != nil {
+		return nil, err
+	}
+	e, ok := m.(CAEscrow)
+	if !ok {
+		return nil, problem.New(problem.UnsupportedOp, "This server cannot hold an escrow of the certificate authority key.")
+	}
+	return e, nil
+}
+
+// getCaEscrow is GET /certificate-authority/escrow.
+func (s *Server) getCaEscrow(c *call, w http.ResponseWriter, r *http.Request) error {
+	e, err := s.needEscrow()
+	if err != nil {
+		return err
+	}
+	out, err := e.EscrowStatus(r.Context())
+	if err != nil {
+		return err
+	}
+	s.writeJSON(w, r, http.StatusOK, out)
+	return nil
+}
+
+// setCaEscrow is PUT /certificate-authority/escrow.
+func (s *Server) setCaEscrow(c *call, w http.ResponseWriter, r *http.Request) error {
+	e, err := s.needEscrow()
+	if err != nil {
+		return err
+	}
+	var req api.CaEscrowUpdate
+	if err := s.body(w, r, &req); err != nil {
+		return err
+	}
+	if req.Enabled == nil {
+		return problem.Validation("The request is invalid.", problem.FieldError{Field: "/enabled", Message: "is required", Code: "required"})
+	}
+	c.details = map[string]any{"enabled": *req.Enabled}
+	out, err := e.SetEscrow(r.Context(), *req.Enabled)
+	if err != nil {
+		return err
+	}
+	s.writeJSON(w, r, http.StatusOK, out)
+	return nil
+}
+
+// rotateCaEscrow is POST /certificate-authority/escrow/rotations.
+func (s *Server) rotateCaEscrow(c *call, w http.ResponseWriter, r *http.Request) error {
+	e, err := s.needEscrow()
+	if err != nil {
+		return err
+	}
+	out, err := e.RotateEscrow(r.Context())
+	if err != nil {
+		return err
+	}
+	c.details = map[string]any{"generation": out.Generation}
+	s.writeJSON(w, r, http.StatusOK, out)
 	return nil
 }

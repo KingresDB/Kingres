@@ -114,6 +114,11 @@ var Calls = map[string]Policy{
 	"POST /pki/renew": ToLeader,
 	"GET /pki/csr":    LeaderOnly,
 
+	// Escrow of the CA key: the leader asks a server for its escrow public key, sends it its sealed copy and takes the copy away.
+	"POST /pki/escrow/offer": LeaderOnly,
+	"POST /pki/escrow/store": LeaderOnly,
+	"POST /pki/escrow/drop":  LeaderOnly,
+
 	// Leaving the cluster (D5, mirror of removing a server): the leaving server
 	// asks the leader, which answers only for the caller named by the certificate.
 	"POST /leave-cluster": ToLeader,

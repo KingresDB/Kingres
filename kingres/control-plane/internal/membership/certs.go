@@ -471,6 +471,7 @@ func (m *Manager) stepCertRevokeDistribute(ctx context.Context, env *task.Env) e
 			return fmt.Errorf("sending the revocation list to %s: %w", p.ServerID, err)
 		}
 	}
+	m.escrowAfterRevocation(ctx)
 	return nil
 }
 

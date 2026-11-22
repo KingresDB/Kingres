@@ -71,6 +71,13 @@ type Manager struct {
 		PurgeServer(ctx context.Context, server string) error
 	}
 
+	// escrow and escrowRecipients are the escrow of the CA key (escrow.go).
+	escrow           escrowGuard
+	escrowRecipients EscrowRecipients
+	// escrowActive and escrowTransport are the seams of the tests of the escrow (nil in production).
+	escrowActive    func(ctx context.Context) ([]string, error)
+	escrowTransport func(ctx context.Context, id, path string, in, out any) error
+
 	gatherMu   sync.Mutex
 	gatherAuth map[string]*gatherAuth
 }
@@ -842,6 +849,7 @@ func (m *Manager) distributeRevocations(ctx context.Context) error {
 			first = fmt.Errorf("sending the revocation list to %s: %w", p.ServerID, err)
 		}
 	}
+	m.escrowAfterRevocation(ctx)
 	return first
 }
 

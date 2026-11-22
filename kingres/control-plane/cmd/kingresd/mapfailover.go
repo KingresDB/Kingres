@@ -23,6 +23,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover/journal"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover/mapgroup"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/membership"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pki"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/rebalance"
@@ -52,6 +53,9 @@ type mapFailover struct {
 	rr      *failover.Runner
 	journal *journal.Store
 	runner  *mapgroup.Runner
+
+	// adoptCA makes this server the holder of the CA from its sealed copy of the key (escrow of the CA key); nil: no escrow.
+	adoptCA func() (bool, error)
 
 	mu      sync.Mutex
 	running bool
@@ -618,6 +622,14 @@ func engineGate(fd *failoverDeps) func() bool {
 }
 
 func (p *mapPorts) CheckAuthority(context.Context) (bool, error) {
+	// The new leader opens its sealed copy of the key first (escrow of the CA key): with it the alert is not raised.
+	if p.m.adoptCA != nil {
+		if ok, err := p.m.adoptCA(); ok {
+			return true, nil
+		} else if err != nil {
+			p.m.log.Warn("the sealed copy of the CA key was not adopted", "error", err)
+		}
+	}
 	_, err := os.Stat(filepath.Join(p.m.svc.PKIDir(), pki.CAKeyFile))
 	if err == nil {
 		return true, nil
@@ -645,4 +657,24 @@ func (p *mapPorts) isCandidate(ctx context.Context, server string) (bool, error)
 		}
 	}
 	return false, nil
+}
+
+// wireEscrow connects the escrow of the CA key to the failover of the map group: the recipients are the servers that host a
+// ready standby of group 0 (the only servers that can become the manager leader), and the new leader of the failover adopts its
+// sealed copy at B8.
+func wireEscrow(members *membership.Manager, mf *mapFailover) {
+	mf.adoptCA = members.AdoptEscrow
+	members.SetEscrowRecipients(func(ctx context.Context) ([]string, error) {
+		recs, err := mf.pl.Standbys(ctx, 0)
+		if err != nil {
+			return nil, err
+		}
+		var out []string
+		for _, s := range recs {
+			if s.State == "ready" {
+				out = append(out, s.Server)
+			}
+		}
+		return out, nil
+	})
 }

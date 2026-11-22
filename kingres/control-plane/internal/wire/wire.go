@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pki"
 )
 
 // PeerInfo is another server as the members know it. The server id is also
@@ -191,4 +192,20 @@ type Globals struct {
 	// are not in it (other than its own service role) are left alone anyway;
 	// reserved for later use, always false now.
 	Exact bool `json:"exact,omitempty"`
+}
+
+// EscrowOfferRequest asks a server for the public key of its escrow key (POST /pki/escrow/offer); Rotate makes a new one.
+type EscrowOfferRequest struct {
+	Rotate bool `json:"rotate"`
+}
+
+// EscrowOfferResponse is a server's escrow public key (X25519, base64) and its identifier.
+type EscrowOfferResponse struct {
+	KeyID     string `json:"keyId"`
+	PublicKey string `json:"publicKey"`
+}
+
+// EscrowStoreRequest hands a server its sealed copy of the CA key (POST /pki/escrow/store).
+type EscrowStoreRequest struct {
+	Blob pki.EscrowBlob `json:"blob"`
 }

@@ -339,7 +339,7 @@ paths; what is not done is in "Not done in this increment"). "Real" means the op
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **139 of 140 operations are real; 1 answer "not yet".**
+authenticated operation lists in 0.2.0. **142 of 143 operations are real; 1 answer "not yet".**
 
 | Tag | Real | Not yet |
 |---|---|---|
@@ -360,7 +360,7 @@ authenticated operation lists in 0.2.0. **139 of 140 operations are real; 1 answ
 | Rebalance | `getRebalanceStatus`, `startRebalance`, `previewRebalancePlan`, `listRebalanceReports`, `getRebalanceReport`, `stopRebalance` |  |
 | Replication | `getReplicationTopology`, `getFailoverStatus`, `listFailoverReports`, `getFailoverReport` | `restorePreferredPrimaries` |
 | Server groups | `listServerGroups`, `createServerGroup`, `deleteServerGroup` |  |
-| Servers | `listServers`, `getServer`, `addServer`, `removeServer`, `updateServer`, `renewServerCertificates`, `revokeServerCertificates`, `failoverServer` |  |
+| Servers | `listServers`, `getServer`, `addServer`, `removeServer`, `updateServer`, `renewServerCertificates`, `revokeServerCertificates`, `failoverServer`, `getCaEscrow`, `setCaEscrow`, `rotateCaEscrow` |  |
 | Configuration | `listConfigParameters`, `getConfigParameter`, `previewConfigChange`, `applyConfigChange`, `listConfigChanges`, `revertConfigChange`, `listConfigServers`, `getConfigSummary`, `getClusterTime`, `listTimeZones`, `restartPendingInstances` |  |
 | Settings | `getClusterSettings`, `updateClusterSettings`, `resetAutoFailoverCounter` |  |
 | Network access | `getNetworkAccess`, `replaceNetworkAccess` |  |
@@ -1090,8 +1090,8 @@ increment, and rebalance and failover are built since, see the table above and t
 restoring preferred primaries (9 operations answer "not yet" now: this one and the eight ledger operations of
 client keys, bundles and divergence), a way back for a server with buckets whose certificates were
 revoked (it needs rebalance; rebalance exists now), the rotation of the CA itself, and a change of the manager leader without the CA key (the three bullets
-below; a leader change by the failover of the map group is built since, increment 5, but the key of the CA is not
-escrowed). Certificate renewal and revocation, the dedicated problem for a leader without the CA key, cluster-wide
+below; a leader change by the failover of the map group is built since, increment 5, and the key of the CA can be escrowed
+since 2026-11-22). Certificate renewal and revocation, the dedicated problem for a leader without the CA key, cluster-wide
 logs, alerts and metrics and the four alert kinds that nothing raised are done (see "Fifth increment"). Server groups, `updateServer`, inclusion proofs, ledger verification records, instance start and
 stop, leave-cluster and local settings are done (see their sections).
 
@@ -1101,7 +1101,7 @@ leader's instance), the directory of internal addresses (`peers.json`, on every 
 (`audit.jsonl`, per server) and the session store (memory, per server) belong to the first server today. A leader
 change has to move the CA key and the revocation list (encrypted, to the standby leader) and the
 `kingres_cp` schema (it lives in the map group and follows it); followers already re-read the leader from the catalog
-every 2 s. The failover of the map group (increment 5, "The map group" below) changes the leader but does not move the CA key: the new leader raises the alert `certificateAuthorityUnavailable` until the operator restores `pki/ca.key` and `pki/revoked.json` from the old leader's backup. The limitation therefore stands: **if the manager leader is not the server that holds the CA, operations that
+every 2 s. The failover of the map group (increment 5, "The map group" below) changes the leader. With the escrow of the CA key switched on ("Escrow of the key of the certificate authority" below) the new leader opens its sealed copy and goes on; without it the new leader raises the alert `certificateAuthorityUnavailable` until the operator restores `pki/ca.key` and `pki/revoked.json` from the old leader's backup. The limitation therefore stands: **if the manager leader is not the server that holds the CA, operations that
 need the CA (adding a server, removing one, certificate operations) cannot work**; the cluster keeps running on its
 existing certificates until they expire (one year). See `docs/design/ha-phase5.md`.
 
@@ -3045,7 +3045,31 @@ failover task at `<step name>:before`.
 
 Built (contract 0.13.0): `internal/failover/journal` (the local journal), `internal/failover/mapgroup` (the bootstrap B1 to B8 over ports, tested with fakes at every step boundary), `cmd/kingresd/mapfailover.go` (the real ports, the candidate, the receiver, the answers about the bootstrap), `failover.RecordMapGroupRun` (the recorded task), `rebalance.PauseForMapGroupFailover`, the engine gate (`task.Options.Gate` from the journal) and the calls `POST /failover/map/start` and `/continue`. A request for the failover of the server that runs the primary of the map group is answered by any server that does not hear it (`httpapi.MapFailoverer`) with the task with id 0.
 
-**Not built:** the escrow of the key of the certificate authority (an alert, `certificateAuthorityUnavailable`, says what the operator does by hand: restore `pki/ca.key` and `pki/revoked.json` of the old leader from its backup into the pki directory of the new leader and restart kingresd), the second condition of the gate (the instance of group 0 in recovery), `graceful` for the map group. `Preflight` still refuses the map group with 422 `unsupported_operation` when the leader is alive (the request then goes to the leader).
+**Not built here (built since, see "Escrow of the key of the certificate authority"):** the escrow of the key of the certificate authority (without it an alert, `certificateAuthorityUnavailable`, says what the operator does by hand: restore `pki/ca.key` and `pki/revoked.json` of the old leader from its backup into the pki directory of the new leader and restart kingresd), the second condition of the gate (the instance of group 0 in recovery), `graceful` for the map group. `Preflight` still refuses the map group with 422 `unsupported_operation` when the leader is alive (the request then goes to the leader).
+
+## Escrow of the key of the certificate authority (contract 0.22.0, ha-phase5-part2.md 3.4.1)
+
+Built: `internal/pki/escrow.go`, `internal/membership/escrow.go`, the adoption in `cmd/kingresd/mapfailover.go` (`wireEscrow`, `CheckAuthority`), the operations `getCaEscrow`, `setCaEscrow`
+and `rotateCaEscrow` (`internal/httpapi/handlers_members.go`, type `CAEscrow`), the internal calls `POST /pki/escrow/offer`, `store` and `drop` (`LeaderOnly`, see `internal-api.md`).
+
+- **What it is.** The manager leader keeps a sealed copy of `ca.key` and of the revocation list on each server that hosts a ready standby of the map group. When the map group is failed over, the new leader
+  opens its own copy at B8, writes `pki/ca.key` and `pki/revoked.json` (the revocation list is the union of the copy and the list the old leader last distributed), and issues, renews and revokes
+  certificates at once. No alert is raised and nobody restores a file. A copy is sealed to an escrow key of its server (X25519 in `pki/escrow/recipient-<id>.key`, mode 0600, not the TLS key) with
+  HKDF-SHA256 and AES-256-GCM; the additional data bind recipient, key id, CA fingerprint, generation and time.
+- **Off until switched on.** `PUT /certificate-authority/escrow` with `{"enabled": true}` (`kingres_admin`). It is an operator decision: every recipient's disk can then hold the CA key. `GET` shows the recipients
+  and whether each holds the newest copy (`complete`); `POST /certificate-authority/escrow/rotations` makes every recipient a new escrow key and reseals a new generation. `enabled: false` deletes every copy
+  (a server that cannot be reached is asked again every minute).
+- **Kept current.** The leader reconciles every minute (`membership.Manager.RunEscrow`): it sends to a recipient whose copy is missing, older than the revocation list, of an older generation or older than 6 hours,
+  takes the copy away from a server that is no longer a recipient (removed, revoked, standby gone), and sends again at once after every revocation.
+- **What a recipient checks.** It stores a copy only if it opens with its escrow key, holds the key of the `ca.crt` the server already has, and is not older than the copy held; at adoption the same check is made again,
+  so a blob somebody made for the server, a damaged one or a replayed old one gives no key (the alert is raised, nothing is written as `ca.key`).
+- **Threat model.** A recipient's disk holds the copy and the key that opens it: its compromise is a compromise of the CA, as the leader's disk always was; the escrow widens the set of such disks from one to the
+  leader's plus the standbys of the map group. A server removed while it cannot be reached keeps its copy and must be treated as knowing the key; the rotation of the CA itself is not built. The key is never in
+  a REST answer, task, audit event, log or table. See the design for the alternatives that were rejected.
+- **Not built:** a console panel; an alert for a recipient that stays out of date (the status shows it); the removal of `ca.key` from an old leader that comes back.
+- **Tests:** `internal/pki` (`TestEscrowRoundTripGivesTheNewLeaderTheCA`, `TestHostileBlobs`, `TestAWrongKeyOpensNothing`, `TestABlobForAnotherCAIsNotAdopted`, `TestAnOlderBlobDoesNotReplaceANewerOne`,
+  `TestRotationReplacesTheEscrowKeyAndTheOldOneStopsWorking`), `internal/membership` (`escrow_test.go`: the leader's side with the receivers of other servers), `internal/httpapi`
+  (`handlers_caescrow_test.go`), and the cluster tests `TestCAEscrowMapGroupFailover` and `TestCAEscrowTamperedCopyIsNotAdopted` (`internal/clustertest/caescrow_test.go`).
 
 ## Automatic failover (increment 6 of ha-phase5-part2.md, no change of the contract)
 

@@ -195,6 +195,9 @@ func (r *Receiver) Handle(ctx context.Context, key, peer string, body []byte) (a
 	if res, ok, err := r.handleCertCall(ctx, key, peer, body); ok {
 		return res, err
 	}
+	if res, ok, err := r.handleEscrowCall(ctx, key, body); ok {
+		return res, err
+	}
 	return nil, &internalapi.CallError{Status: http.StatusNotFound, Code: "not_found", Message: "No such call."}
 }
 

@@ -55,8 +55,8 @@ type Ports interface {
 	// RecordTask inserts the task of the failover into the (now writable) system database, steps up to F7 done, and writes the
 	// report rows from the journal. It is idempotent for one journal id and returns the id of the task.
 	RecordTask(ctx context.Context, j journal.Journal) (int64, error)
-	// CheckAuthority says whether this server holds the key of the certificate authority (pki/ca.key). The leader holds it and no other
-	// server does: the new leader of a map group failover has none unless an operator put it there (design 3.4, 11.2).
+	// CheckAuthority says whether this server holds the key of the certificate authority (pki/ca.key). When the escrow of the key is on, the
+	// server first opens its sealed copy and makes the key from it; otherwise it has none unless an operator put it there (design 3.4, 11.2).
 	CheckAuthority(ctx context.Context) (bool, error)
 	// MoveSystem points what this server reads the system database with (the task engine, the store) at the promoted instance: from
 	// here on this server is the leader and its system database is the instance it promoted.
@@ -639,8 +639,8 @@ func (r *Runner) makeLeader(ctx context.Context, j journal.Journal) (bool, error
 
 // B8: the engine gate opens (the journal says the bootstrap is over); the engine claims the task and runs what is left.
 func (r *Runner) openGate(ctx context.Context, j journal.Journal) (bool, error) {
-	// The new leader issues and revokes certificates only with ca.key. The key is not escrowed (the construction is an open point of
-	// the design): when this server has none, the product says so and what the operator must do, and the renewal jobs of the other
+	// The new leader issues and revokes certificates only with ca.key. With the escrow of the key on, CheckAuthority has made the key from the
+	// sealed copy of this server. When there is none, the product says so and what the operator must do, and the renewal jobs of the other
 	// servers fail visibly until it is done (their certificates last a year).
 	if ok, err := r.P.CheckAuthority(ctx); err == nil && !ok {
 		r.P.Alert(ctx, AlertAuthority, "critical", "cluster", AuthorityMessage, true)
@@ -654,5 +654,5 @@ func (r *Runner) openGate(ctx context.Context, j journal.Journal) (bool, error) 
 // AlertAuthority is the alert of a new leader that has no key of the certificate authority.
 const AlertAuthority = "certificateAuthorityUnavailable"
 
-// AuthorityMessage is what the alert says: the key is not escrowed, so the operator restores it by hand.
-const AuthorityMessage = "The map group was failed over and this server, the new manager leader, does not hold the key of the certificate authority: no certificate can be issued, renewed or revoked. Restore pki/ca.key and pki/revoked.json of the old leader from its backup into the pki directory of this server and restart kingresd; the certificates of the servers last a year, and their renewal fails until then."
+// AuthorityMessage is what the alert says: there is no sealed copy of the key here (the escrow was off, or its copy was refused), so the operator restores it by hand.
+const AuthorityMessage = "The map group was failed over and this server, the new manager leader, does not hold the key of the certificate authority: no certificate can be issued, renewed or revoked. Switch the escrow of the CA key on (setCaEscrow) before the next failover. Now restore pki/ca.key and pki/revoked.json of the old leader from its backup into the pki directory of this server and restart kingresd; the certificates of the servers last a year, and their renewal fails until then."

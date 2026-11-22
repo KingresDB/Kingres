@@ -832,6 +832,75 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/certificate-authority/escrow": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get the escrow of the certificate authority key
+         * @description Added in 0.22.0. Whether the escrow of the key of the cluster certificate authority is on, which servers hold
+         *     a sealed copy of the key and whether each copy is the newest. The escrow lets a new manager leader (after the
+         *     failover of the map group) issue, renew and revoke certificates without the old leader: it opens its own copy
+         *     and goes on. Without it the new leader raises the alert `certificateAuthorityUnavailable` until an operator
+         *     restores `pki/ca.key` and `pki/revoked.json` by hand. The answer is the leader's (the request is forwarded).
+         *     Needs `kingres_admin`. The key itself is never in an answer, in a task, in an audit event or in the
+         *     PostgreSQL instances.
+         */
+        get: operations["getCaEscrow"];
+        /**
+         * Switch the escrow of the certificate authority key on or off
+         * @description Added in 0.22.0. `enabled: true` makes the leader seal the CA key and the revocation list to every server that
+         *     hosts a ready standby of the map group (the servers that can become leader) and send each its copy over the
+         *     internal API; the leader then keeps the copies current (after every revocation, when the standbys change, and at
+         *     least every 6 hours). `enabled: false` takes every copy and every escrow key away from the servers; a server that
+         *     cannot be reached is asked again every minute and stays listed until it has deleted its copy. The answer is the
+         *     status after the first round; a recipient that could not be reached is `pending` and the leader sends again.
+         *
+         *     Each copy is encrypted so that only the escrow key of its server opens it (X25519 and AES-256-GCM); that key
+         *     is a file of the server and is not its TLS key. **A server that holds a copy can become the CA: its disk is as
+         *     sensitive as the leader's.** Switch the escrow on only when the servers that host standbys of the map group are
+         *     as trusted as the leader. A server that is removed while it holds a copy, and that cannot be reached to delete
+         *     it, must be treated as knowing the CA key (the rotation of the CA itself is not part of this contract).
+         *
+         *     The operation needs the CA key on the leader: 503 `certificate_authority_unavailable` when it does not. It is
+         *     audited under `setCaEscrow`.
+         */
+        put: operations["setCaEscrow"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/certificate-authority/escrow/rotations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rotate the escrow keys and reseal the copies
+         * @description Added in 0.22.0. Every recipient makes a new escrow key, the leader seals a new generation of the copy to it,
+         *     and the recipient deletes its old key and old copy when the new copy is stored. Use it when the escrow keys
+         *     may have been exposed without the CA key being known to be (a copy of an old disk image, a retired server).
+         *     It does not change the CA key: a copy that an attacker already took together with the escrow key that opens it
+         *     still opens. 409 `conflict` while the escrow is off; 503 `certificate_authority_unavailable` when the leader
+         *     has no CA key. Audited under `rotateCaEscrow`.
+         */
+        post: operations["rotateCaEscrow"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/server-groups": {
         parameters: {
             query?: never;
@@ -5845,7 +5914,46 @@ export interface components {
          *     `failure`. Read-only operations are not audited except `executeQuery`.
          * @enum {string}
          */
-        AuditAction: "login" | "logout" | "loginFailed" | "setupTokenRejected" | "initCluster" | "joinCluster" | "updateThisServerSettings" | "restartThisServerInstance" | "stopThisServerInstance" | "startThisServerInstance" | "leaveCluster" | "addServer" | "updateServer" | "removeServer" | "failoverServer" | "autoFailover" | "createServerGroup" | "deleteServerGroup" | "createDatabase" | "updateDatabase" | "dropDatabase" | "distributeTable" | "enableTableLedger" | "restorePreferredPrimaries" | "startRebalance" | "stopRebalance" | "cancelTask" | "createRole" | "updateRole" | "deleteRole" | "setRoleMemberships" | "setRoleClusterRoles" | "createGrant" | "revokeGrants" | "applyGrantTemplate" | "replaceNetworkAccess" | "updateClusterSettings" | "generateLedgerDigest" | "startLedgerVerification" | "executeQuery" | "acknowledgeAlert" | "renewServerCertificates" | "revokeServerCertificates" | "certificateRenewed" | "certificateRenewalFailed" | "cancelStatement" | "leaseLost" | "leaseFenced" | "leaseAcquired" | "standbyCreated" | "standbyRemoved" | "standbyRebuilt" | "standbyInstanceStarted" | "standbyInstanceRemoved" | "standbyInstanceRebuilt" | "synchronousStandbyNamesChanged" | "replicationSlotDropped" | "applyConfigChange" | "revertConfigChange" | "restartPendingInstances" | "resetAutoFailoverCounter" | "failoverGroupStarted" | "failoverGroupPromoted" | "failoverGroupFailed" | "oldPrimaryRebuilt" | "updateLedgerSettings" | "createLedgerSigningKey" | "retireLedgerSigningKey" | "revokeLedgerSigningKey" | "createLedgerAnchorTarget" | "updateLedgerAnchorTarget" | "deleteLedgerAnchorTarget" | "testLedgerAnchorTarget" | "anchorLedgerNow" | "retryLedgerAnchor" | "createLedgerBundle" | "registerLedgerClientKey" | "revokeLedgerClientKey" | "setTableSignaturePolicy" | "upgradeLedgerExtension" | "acknowledgeLedgerDivergence" | "previewTableChange" | "undistributeTable" | "alterTableDistribution" | "createTablePartition" | "attachTablePartition" | "detachTablePartition" | "dropTablePartition";
+        AuditAction: "login" | "logout" | "loginFailed" | "setupTokenRejected" | "initCluster" | "joinCluster" | "updateThisServerSettings" | "restartThisServerInstance" | "stopThisServerInstance" | "startThisServerInstance" | "leaveCluster" | "addServer" | "updateServer" | "removeServer" | "failoverServer" | "autoFailover" | "createServerGroup" | "deleteServerGroup" | "createDatabase" | "updateDatabase" | "dropDatabase" | "distributeTable" | "enableTableLedger" | "restorePreferredPrimaries" | "startRebalance" | "stopRebalance" | "cancelTask" | "createRole" | "updateRole" | "deleteRole" | "setRoleMemberships" | "setRoleClusterRoles" | "createGrant" | "revokeGrants" | "applyGrantTemplate" | "replaceNetworkAccess" | "updateClusterSettings" | "generateLedgerDigest" | "startLedgerVerification" | "executeQuery" | "acknowledgeAlert" | "renewServerCertificates" | "revokeServerCertificates" | "certificateRenewed" | "certificateRenewalFailed" | "cancelStatement" | "leaseLost" | "leaseFenced" | "leaseAcquired" | "standbyCreated" | "standbyRemoved" | "standbyRebuilt" | "standbyInstanceStarted" | "standbyInstanceRemoved" | "standbyInstanceRebuilt" | "synchronousStandbyNamesChanged" | "replicationSlotDropped" | "applyConfigChange" | "revertConfigChange" | "restartPendingInstances" | "resetAutoFailoverCounter" | "failoverGroupStarted" | "failoverGroupPromoted" | "failoverGroupFailed" | "oldPrimaryRebuilt" | "updateLedgerSettings" | "createLedgerSigningKey" | "retireLedgerSigningKey" | "revokeLedgerSigningKey" | "createLedgerAnchorTarget" | "updateLedgerAnchorTarget" | "deleteLedgerAnchorTarget" | "testLedgerAnchorTarget" | "anchorLedgerNow" | "retryLedgerAnchor" | "createLedgerBundle" | "registerLedgerClientKey" | "revokeLedgerClientKey" | "setTableSignaturePolicy" | "upgradeLedgerExtension" | "acknowledgeLedgerDivergence" | "previewTableChange" | "undistributeTable" | "alterTableDistribution" | "createTablePartition" | "attachTablePartition" | "detachTablePartition" | "dropTablePartition" | "setCaEscrow" | "rotateCaEscrow";
+        /** @description The escrow of the key of the cluster certificate authority (0.22.0). */
+        CaEscrowStatus: {
+            /** @description Whether the leader keeps sealed copies of the CA key on the servers that can become leader. */
+            enabled: boolean;
+            /** @description Whether the server that answers holds the CA key (the manager leader does). */
+            holdsKey: boolean;
+            /**
+             * Format: int64
+             * @description Rises when the escrow is switched on again and at every rotation.
+             */
+            generation: number;
+            /** @description The servers that hold, or should hold, a copy. */
+            recipients: components["schemas"]["CaEscrowRecipient"][];
+            /** @description Whether at least one recipient exists and every recipient holds the newest copy. */
+            complete: boolean;
+            /** @description What the state means for the operator. */
+            message: string;
+        };
+        /** @description One server of the escrow. */
+        CaEscrowRecipient: {
+            serverId: string;
+            /**
+             * @description `current`: the copy is the newest. `pending`: not delivered yet or out of date (the leader sends again). `refused`: the server answered the last send with an error, see `error`.
+             * @enum {string}
+             */
+            state: "current" | "pending" | "refused";
+            /** @description Identifier of the escrow public key the copy is sealed to. */
+            keyId: string | null;
+            /** Format: int64 */
+            generation: number | null;
+            /** Format: date-time */
+            sealedAt: string | null;
+            /** @description The last error of a send. */
+            error: string | null;
+        };
+        /** @description Request of setCaEscrow. */
+        CaEscrowUpdate: {
+            enabled: boolean;
+        };
         /** @description One audit log entry. */
         AuditEvent: {
             /**
@@ -8576,6 +8684,87 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getCaEscrow: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The escrow of the CA key. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CaEscrowStatus"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    setCaEscrow: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CaEscrowUpdate"];
+            };
+        };
+        responses: {
+            /** @description The escrow after the operation. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CaEscrowStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    rotateCaEscrow: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The escrow after the rotation. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CaEscrowStatus"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
             405: components["responses"]["MethodNotAllowed"];
             409: components["responses"]["Conflict"];
             422: components["responses"]["UnprocessableEntity"];

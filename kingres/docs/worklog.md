@@ -7,6 +7,39 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-22: phase 5, the escrow of the key of the certificate authority (branch ca-escrow)
+
+The last open item of phase 5: after a failover of the leader's server, the new leader raised a critical alert until the operator restored `pki/ca.key` by hand.
+
+### What was done
+
+- **The design** is in `docs/design/ha-phase5-part2.md`, section 3.4.1: the alternatives (a copy wrapped to each server that may become leader; a key from an operator passphrase;
+  split shares; a blob in the system database), the choice of the first, the construction (X25519 key agreement, HKDF-SHA256, AES-256-GCM, additional data that bind the recipient,
+  key id, CA fingerprint, generation and time), the checks of a recipient and of the adoption, and the threat model. The first design (a key derived from the cluster secret) was
+  not buildable: the secret lives in the extension, not in `kingresd`.
+- **The control plane**: `internal/pki/escrow.go` (escrow keys, seal, open, store, drop, adopt, the leader's bookkeeping), `internal/membership/escrow.go` (recipients from the standbys of group 0,
+  the minute-by-minute reconcile and the resend after every revocation, the three internal calls `POST /pki/escrow/offer`, `store` and `drop`, all `LeaderOnly`), the adoption at B8 through the
+  port `CheckAuthority` (`cmd/kingresd/mapfailover.go`), the text of the alert.
+- **The operator path**: contract 0.22.0 (a placeholder number; the integrator renumbers): `getCaEscrow`, `setCaEscrow`, `rotateCaEscrow`, the schemas `CaEscrowStatus`, `CaEscrowRecipient`,
+  `CaEscrowUpdate`, two audit actions. The escrow is off until switched on. The shapes are in the scratch file `ca-escrow/contract.txt` for the integrator. No console part (the operations are REST only).
+
+### How it was verified
+
+- Unit tests: `internal/pki/escrow_test.go`, `internal/membership/escrow_test.go`, `internal/httpapi/handlers_caescrow_test.go`; the contract check (`node api/scripts/check-contract.mjs`), the generated operation table and the
+  README table test. Cluster tests (`internal/clustertest/caescrow_test.go`): the failover of the leader's server with the escrow on, and with a tampered copy. The results per major and the mutants
+  are in the report of the run (below).
+
+### Decisions and deviations
+
+- Off by default, because every recipient's disk then can hold the CA key (threat model, 3.4.1). Recipients: only the servers that host a ready standby of group 0.
+- The alert `certificateAuthorityUnavailable` stays for a failover without a copy; no new alert kind was added.
+
+### Still open
+
+- A console panel for the three operations; an alert for a recipient that stays out of date; the removal of `ca.key` from an old leader that returns; the rotation of the CA itself.
+
+---
+
 ## 2026-11-22: phase 11 (distributed schemas), the extension: the scale work (step 12), the review fixes and the documentation (step 15)
 
 Covers the work on branch shard-p1011 after the second review of phase 11 (the review fixes of 2026-11-21 are in the entry of that day).

@@ -47,7 +47,7 @@ type Forwarder interface {
 // runs (the system database's task, alert and settings tables), so that they
 // are answered by the leader too.
 var leaderBoundReads = map[string]bool{
-	"listTasks": true, "getTask": true, "getClusterSettings": true,
+	"listTasks": true, "getTask": true, "getClusterSettings": true, "getCaEscrow": true,
 	// Configuration from the console (phase 13): the leader can ask every server.
 	"listConfigParameters": true, "getConfigParameter": true, "listConfigChanges": true, "listConfigServers": true,
 	"getConfigSummary": true, "getClusterTime": true, "listTimeZones": true,

@@ -357,6 +357,8 @@ export const AUDIT_ACTION_LABEL: Record<AuditAction, string> = {
   attachTablePartition: 'Attach a partition',
   detachTablePartition: 'Detach a partition',
   dropTablePartition: 'Drop a partition',
+  setCaEscrow: 'Switch the escrow of the certificate authority key on or off',
+  rotateCaEscrow: 'Rotate the escrow of the certificate authority key',
   enableTableLedger: 'Enable the ledger of a table',
   restorePreferredPrimaries: 'Restore preferred primaries',
   startRebalance: 'Start a rebalance',
