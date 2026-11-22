@@ -143,7 +143,8 @@ func (m *Manager) EnsureConfig(id int) (bool, error) {
 	if err != nil {
 		return changed, err
 	}
-	if strings.Contains(string(cur), "include_if_exists '"+ConfigFileName+"'") {
+	// An instance made by an earlier package preloads fewer libraries: bring the line up to date (it takes effect at the next restart).
+	if strings.Contains(string(cur), "include_if_exists '"+ConfigFileName+"'") && !preloadOutOfDate(string(cur)) {
 		return changed, nil
 	}
 	s, err := m.Settings(id)
@@ -154,6 +155,15 @@ func (m *Manager) EnsureConfig(id int) (bool, error) {
 		return changed, err
 	}
 	return true, nil
+}
+
+var preloadLineRE = regexp.MustCompile(`(?m)^shared_preload_libraries = '([^'
+]*)'`)
+
+// preloadOutOfDate says whether kingres-managed.conf carries a preload list other than PreloadLibraries.
+func preloadOutOfDate(managed string) bool {
+	m := preloadLineRE.FindStringSubmatch(managed)
+	return m != nil && m[1] != PreloadLibraries
 }
 
 // CheckValue asks PostgreSQL's own parser whether a value is valid for a parameter of PostgreSQL

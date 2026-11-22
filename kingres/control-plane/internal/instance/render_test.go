@@ -90,7 +90,7 @@ func TestRenderManaged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"port = '56010'", "shared_preload_libraries = 'kingres_shard,kingres_ledger'",
+	for _, want := range []string{"port = '56010'", "shared_preload_libraries = 'kingres_shard,kingres_ledger,kingres_columnar'",
 		"password_encryption = 'scram-sha-256'", "cluster_name = 'it''s'", "ssl = 'on'", "work_mem = '8MB'"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %q in:\n%s", want, got)

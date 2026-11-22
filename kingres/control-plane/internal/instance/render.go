@@ -213,6 +213,11 @@ type ManagedSettings struct {
 	Extra map[string]string
 }
 
+// PreloadLibraries is the value of shared_preload_libraries of every instance. kingres_columnar is preloaded because it registers a WAL
+// resource manager: without it a columnar table is refused every write and kingres_timepart cannot convert a partition. kingres_shard stays
+// first. kingres_timepart and kingres_sketch need no preload.
+const PreloadLibraries = "kingres_shard,kingres_ledger,kingres_columnar"
+
 // RenderManaged renders kingres-managed.conf.
 func RenderManaged(s ManagedSettings) (string, error) {
 	if s.Port < 1024 || s.Port > 65535 {
@@ -240,7 +245,7 @@ func RenderManaged(s ManagedSettings) (string, error) {
 	settings := []kv{
 		{"listen_addresses", listen},
 		{"port", strconv.Itoa(s.Port)},
-		{"shared_preload_libraries", "kingres_shard,kingres_ledger"},
+		{"shared_preload_libraries", PreloadLibraries},
 		// A bucket move copies through logical replication on both nodes; the standbys use the
 		// physical part of the same WAL. (An instance created before this setting needs a restart.)
 		{"wal_level", "logical"},

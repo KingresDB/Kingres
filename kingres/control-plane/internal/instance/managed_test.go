@@ -183,3 +183,80 @@ func TestMajorOfVersionNum(t *testing.T) {
 		}
 	}
 }
+
+// The preload list names kingres_columnar, after the two it always had, and an old file is recognised
+// as out of date (EnsureConfig rewrites it): without the library columnar writes and every
+// kingres_timepart conversion are refused.
+func TestPreloadListNamesColumnar(t *testing.T) {
+	if PreloadLibraries != "kingres_shard,kingres_ledger,kingres_columnar" {
+		t.Fatalf("PreloadLibraries = %q", PreloadLibraries)
+	}
+	got, err := RenderManaged(ManagedSettings{Port: 5432})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "shared_preload_libraries = '"+PreloadLibraries+"'") {
+		t.Errorf("not rendered:\n%s", got)
+	}
+	if preloadOutOfDate(got) {
+		t.Error("a file rendered now is out of date")
+	}
+	old := strings.Replace(got, PreloadLibraries, "kingres_shard,kingres_ledger", 1)
+	if !preloadOutOfDate(old) {
+		t.Error("the old list is not recognised as out of date")
+	}
+	if preloadOutOfDate("port = '1'\n") {
+		t.Error("a file without the line is out of date")
+	}
+}
+
+// An instance made by an earlier package has the old preload list in kingres-managed.conf and already
+// has the include: EnsureConfig brings the list up to date and keeps the other settings, and a file
+// that is current is not rewritten.
+func TestEnsureConfigBringsThePreloadUpToDate(t *testing.T) {
+	bin := os.Getenv("KINGRES_PG_BIN") // the manager wants a PostgreSQL directory; nothing is run here
+	if bin == "" {
+		t.Skip("needs KINGRES_PG_BIN for the manager")
+	}
+	root := t.TempDir()
+	m, err := New(Options{Root: root, BinDir: bin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, "1")
+	data := filepath.Join(dir, "pgdata")
+	if err := os.MkdirAll(data, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mk := `{"nodeId":1,"port":5432,"magic":"` + markerMagic + `"}`
+	if err := os.WriteFile(filepath.Join(dir, MarkerName), []byte(mk), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := ManagedSettings{Port: 5432, Extra: map[string]string{"work_mem": "8MB"}}
+	if err := m.WriteManaged(1, s); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(data, ConfigFileName), []byte("# x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(data, "kingres-managed.conf")
+	cur, _ := os.ReadFile(path)
+	old := strings.Replace(string(cur), PreloadLibraries, "kingres_shard,kingres_ledger", 1)
+	if old == string(cur) {
+		t.Fatal("the rendered file does not carry the list")
+	}
+	if err := os.WriteFile(path, []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := m.EnsureConfig(1)
+	if err != nil || !changed {
+		t.Fatalf("EnsureConfig = %v, %v", changed, err)
+	}
+	got, _ := os.ReadFile(path)
+	if !strings.Contains(string(got), "shared_preload_libraries = '"+PreloadLibraries+"'") || !strings.Contains(string(got), "work_mem = '8MB'") {
+		t.Errorf("the file after EnsureConfig:\n%s", got)
+	}
+	if changed, err := m.EnsureConfig(1); err != nil || changed {
+		t.Errorf("a current file was rewritten: %v, %v", changed, err)
+	}
+}
