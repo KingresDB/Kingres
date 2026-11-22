@@ -1328,7 +1328,8 @@ The decision for each path (tested in `t/043_reference_paths.pl`):
 | a stored generated column whose expression calls a function that is declared `IMMUTABLE` and is not | **the extension trusts the declaration**, as PostgreSQL does for an index (S6-05): every node computes the column itself with that function. A function that is declared immutable and reads something of its node (a port, a setting, a table of the node) gives a different value in each copy; `check_cluster()` finds the copies that differ (`reference_table_differs`). Declare such a function `STABLE` or `VOLATILE`, and it is refused in a write |
 | a rule on an ordinary table whose action writes the table | **refused** ("cannot be run on every node": the rule's action reads the rule's table) |
 | a data-modifying `WITH` | **refused** ("a write to a reference table inside a WITH clause or a subquery is not supported yet") |
-| `MERGE`, `COPY ... FROM` | **refused** |
+| `MERGE` into the table | runs on every node since phase 12 (shapes M4 and M5 of "MERGE on distributed tables": the statement reads reference tables, `VALUES` and constants, or one relation that this node reads once and sends to every node); refused with the condition named when it cannot run on every node (a volatile value, a stable default of a column the `INSERT` does not list, a view, row-level security, a trigger or a rule) |
+| `COPY ... FROM` | **refused** |
 | `TRUNCATE` | propagated, from the map group primary only |
 | the actions of foreign keys between reference tables (`ON DELETE CASCADE`, `SET NULL`, `ON UPDATE CASCADE`) | every node does its own part of the cascade once; the writer locks cover every reference table reachable through foreign keys |
 | a plan made before the table became a reference table, or before the cluster had several nodes (a prepared statement, a PL/pgSQL function, a driver's statement) | `create_reference_table()` and every catalog change invalidate the plans of the tables, so the plan is made again; as a backstop the executor refuses a write to a reference table that a plan would make on this node only (`reference table "t" cannot be written by this plan ...`, repeat the statement) |
@@ -1552,17 +1553,24 @@ source is skipped unless the statement has a `NOT MATCHED BY SOURCE` action. A r
 group of the bucket that a `NULL` key hashes to, where an `INSERT` action puts the row as one node would. The command tag
 count is the sum of the groups' counts, `RETURNING` rows (with `merge_action()`) are the groups' rows put together, and the
 groups commit together by the two-phase path. The statement is atomic: an error on any group, `cannot affect row a second
-time` included, leaves no change anywhere (the fault points `merge_before_first_group`, `merge_between_groups` and
-`merge_before_commit` are used by `t/266`).
+time` included, leaves no change anywhere (the fault points `merge_before_first_group`, `merge_between_groups`, `merge_before_commit` and, for a shipped source,
+`merge_before_collect` fire for every shape, M4 and M5 included, and are used by `t/266`).
 
 Refused, with the condition named: a `WITH` clause; a sub-select in an expression (`ON`, a `WHEN` condition, `SET`, `VALUES`,
 `RETURNING`) of a distributed target; a `USING` clause that is a join or several relations when the source has to be routed
 or shipped (put the join in a sub-select); an `ON` clause that does not equate the distribution column with a column or
 expression of the source; an `UPDATE` action that assigns the distribution column; an `INSERT` action whose distribution
 column is not the key the statement is colocated or routed by; a volatile value (a sequence, an identity column, `random()`):
-each group would compute its own, so give the column a value in the `INSERT` list; an expression that is not built in and
-immutable; a target with a trigger or a rule, row-level security, or a view of another owner; a column of the source with a
-type that is not built in or a collation other than the default (the source is shipped as text).
+each group would compute its own, so give the column a value in the `INSERT` list; the same for a column that the `INSERT`
+does not list and whose `DEFAULT` is stable (`now()`, `current_user`, `current_setting()`): the refusal names the column;
+an expression that is not built in and immutable; a target with a trigger or a rule, or with row-level security; a `MERGE`
+through a view of any kind (a plain view, a `security_barrier` view, a view `WITH CHECK OPTION`, a view of another owner:
+the filter of a view is not part of the text of a `MERGE`, so the statement could change rows the view does not show; write
+the `MERGE` against the table); a column of the source with a type that is not built in or a collation other than the
+default (the source is shipped as text).
+
+A prepared `MERGE` may declare parameters that its text does not use, in any position and of any type: the origin sends the
+parameters that the text uses, and the arrays of a shipped source (M3, M5) are numbered after them.
 
 Snapshot. In M3 and M5 the source is read here, before the groups run: it is the snapshot of the start of the statement,
 and a source row that changes afterwards is not read again. Each group reads its target in its own statement snapshot, and
@@ -2248,16 +2256,20 @@ Read these first; each is a reviewed boundary, not an accident.
     combine function when the query is not closed (`json_agg`, `jsonb_agg`, `*_object_agg`, `range_agg`, `xmlagg`), `DISTINCT` or
     `ORDER BY` inside an aggregate call, statements with sub-selects, CTEs, views, local tables, tables of
     two colocation groups, a table with row-level security, and a statement that locks rows.
-- **Writes that span groups.** `MERGE` and an `UPDATE` or `DELETE` that cannot be
-  shipped are refused. A write that uses a function that is not built in cannot be
-  shipped. (A multi-row `INSERT`, `INSERT ... SELECT` and `COPY ... FROM` into a
+- **Writes that span groups.** An `UPDATE` or `DELETE` that cannot be shipped is
+  refused. A write that uses a function that is not built in cannot be shipped.
+  (A multi-row `INSERT`, `INSERT ... SELECT` and `COPY ... FROM` into a
   distributed table are no longer refused: see "Bulk writes through the row router",
-  which lists what is still refused for them.)
-- **UPDATE ... FROM, DELETE ... USING and MERGE that read a distributed table
+  which lists what is still refused for them.  A `MERGE` into a distributed table
+  or into a reference table runs since phase 12: see "MERGE on distributed tables",
+  which lists the shapes and what is still refused.)
+- **UPDATE ... FROM and DELETE ... USING that read a distributed table
   and write another table** are refused ("UPDATE, DELETE and MERGE that read
   distributed table ... are not supported"): PostgreSQL asks for the row
-  identifier of every table it does not modify. Only `INSERT ... SELECT` and
-  `CREATE TABLE AS` can write an ordinary table from a distributed one (S2-18).
+  identifier of every table it does not modify. `INSERT ... SELECT`,
+  `CREATE TABLE AS` and, since phase 12, a `MERGE` into a local table (shape M6,
+  which reads each distributed table of `USING` through a sub-select) can write an
+  ordinary table from a distributed one (S2-18).
 - **Nodes must agree.** `add_node()` refuses a node whose default collation,
   `LC_CTYPE`, collation provider or collation library version differs from the
   map group primary's, or that runs another version of the extension; a
