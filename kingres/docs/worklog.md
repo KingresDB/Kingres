@@ -7,6 +7,60 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-22: failover round 2 (restore, planned switchover, the map group with a live leader), its independent review and the fixes
+
+Covers the branch fo-r2wip, rebased onto kingres-18 at e279c14091 (contract 0.15.0).
+
+### What was done
+
+- **Round 2 of failover:** the restore of the preferred primaries, the plan and phases of a planned switchover, and the map group with a live old leader (a planned switchover
+  and a restore that include group 0): the bootstrap side in `mapgroup`, the leader's side in `failover`, the signed start of an operator's request (ADR 0026), the call that
+  gives up a stuck bootstrap (`abandonMapGroupBootstrap`, contract 0.15.0), `HoldBack` (the lease is renewed until a clean stop is over), and the 15 s bound on calls to the old
+  server.
+- **Independent review**
+  ([reviews/2026-11-21-failover-round-2.md](reviews/2026-11-21-failover-round-2.md)): no critical finding, one high (F5-01), five medium, six low. All twelve are fixed, one commit
+  per finding; the table in the review maps them to commits.
+- **Three defects found by the cluster tests of the fixes** and fixed: the step of the map group ended with the task lease about ten seconds after the clean stop (no rollback ran);
+  a rollback that could not be recorded made the engine run the step again and start a second switchover; and a nil dereference in the lease manager (`writeWatchdogFile`) crashed
+  kingresd in the rollback.
+- **Web:** the generated files and the panel follow contract 0.15.0: audit words, the endpoint, the mock handler, and a button on the failover progress view that gives up the move of
+  the manager (`kingres_admin`).
+- **Test hardening:** the request of the map group failover tests waits out, within two minutes, the 422 of a leader whose view does not yet show the killed server dead.
+
+### How it was verified
+
+- Unit tests of failover, journal, mapgroup, kingresd, lease, internalapi, httpapi and contract pass; a mutant of every fix (F5-01 to F5-12 except the two documents, and the three
+  later fixes) fails the new test of the fix and is killed. `check-contract.mjs` holds for 0.15.0 (141 operations); `go generate ./internal/contract` changes nothing.
+- Cluster tests in lane l3 on PostgreSQL 18 and 19 with kingres_shard 0.7 (extensions of e279c14091): the switchover, abandon and restore set and the failover, old-primary and
+  map-group set pass on both majors, with the five new tests of the review (a candidate that never promotes, an operator abandon, an abandon while the promoting call is in flight,
+  a standby that is behind, an unreadable `pg_controldata`). `TestMapGroupBootstrapSurvivesKingresdEnding` failed once on PostgreSQL 19 with the 422 described above and then passed
+  three of three reruns; it was hardened as described.
+- Web: typecheck, lint, `api:check`, `brand:check` and the full vitest suite (91 files, 1458 tests) pass. The browser and end-to-end suites were not run.
+- Not verified: the review's item 5 (the candidate killed between a refusal and the abandon, the old leader restarted between the proof and the verdict) has no cluster test; unit
+  tests cover it. The tests of `internal/pgconninfo` could not run on the Windows host (the test executable is blocked); they are not related to this work.
+
+### Needs-verification items
+
+None checked in this entry.
+
+### Decisions and deviations
+
+- ADR 0026 (the candidate of a map group failover receives the proof of the operator's session) is accepted as the way to carry an operator's authority to a member that is not the
+  leader; the documents say so.
+- After the clean stop of the map group the step runs on a context that is not cancelled (bounded by the verdict wait of six minutes), because the engine cancels its context when the
+  task lease cannot be renewed.
+
+### Still open
+
+- The map group's hard failover of a live leader's server is still refused (422); only the planned switchover and the restore include group 0.
+- A cluster test for the review's item 5.
+
+### Core patches
+
+None.
+
+---
+
 ## 2026-11-20: automatic failover, the last steps of phase 2b and their review, the second review of phase 9 and its fixes, and two npm alerts
 
 Covers 2026-11-20 from the morning, after the third entry of 2026-11-19.
