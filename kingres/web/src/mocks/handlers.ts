@@ -2738,7 +2738,13 @@ export function createHandlers(): HttpHandler[] {
       const errors: { field: string; message: string }[] = []
       if (Object.keys(b).length === 0)
         throw validationFailed([{ field: '/', message: 'at least one property is required' }])
-      for (const group of ['autoFailover', 'rebalance', 'features', 'clock'] as const) {
+      for (const group of [
+        'autoFailover',
+        'rebalance',
+        'features',
+        'clock',
+        'analytics',
+      ] as const) {
         const g = b[group]
         if (g !== undefined && Object.keys(g).length === 0)
           errors.push({ field: `/${group}`, message: 'at least one property is required' })
@@ -2776,6 +2782,11 @@ export function createHandlers(): HttpHandler[] {
           field: 'clock.maxDifferenceMs',
           message: 'Between 10 and 600000 milliseconds.',
         })
+      if (b.analytics !== undefined && typeof b.analytics.allowNonSuperuserOwners !== 'boolean')
+        errors.push({
+          field: 'analytics.allowNonSuperuserOwners',
+          message: 'Say true or false.',
+        })
       if (errors.length) throw validationFailed(errors)
       if (
         (b.features?.sharding === false && s.settings.features.sharding) ||
@@ -2797,6 +2808,8 @@ export function createHandlers(): HttpHandler[] {
           ...Object.fromEntries(Object.entries(b.autoFailover).filter(([, v]) => v !== undefined)),
         }
       if (b.rebalance) cur.rebalance = { ...cur.rebalance, ...b.rebalance }
+      if (b.analytics)
+        cur.analytics = { allowNonSuperuserOwners: b.analytics.allowNonSuperuserOwners === true }
       if (b.clock?.maxDifferenceMs !== undefined)
         cur.clock = { maxDifferenceMs: b.clock.maxDifferenceMs }
       if (b.features?.sharding && !cur.features.sharding) {

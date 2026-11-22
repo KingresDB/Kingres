@@ -16,6 +16,7 @@ import PartitionPolicyDialog from './PartitionPolicyDialog.vue'
 import PartitionRunDialog from './PartitionRunDialog.vue'
 import RemovePolicyDialog from './RemovePolicyDialog.vue'
 import RunPolicyDialog from './RunPolicyDialog.vue'
+import OwnerNotice from './OwnerNotice.vue'
 import { usePartitionPolicy, usePartitionRuns } from '@/api/queries'
 import { formatDateTime } from '@/lib/format'
 import {
@@ -105,6 +106,7 @@ const retentionText = (x: NonNullable<typeof p.value>) =>
         This table has no policy, so its partitions are made and removed by hand.
       </p>
       <template v-else>
+        <OwnerNotice v-if="p.ownerTrusted === false" :owner="p.tableOwner" />
         <div class="card stack" data-testid="policy-facts">
           <p data-testid="policy-health" :data-ok="p.health.ok ? 'true' : 'false'">
             <StatusBadge
@@ -128,6 +130,13 @@ const retentionText = (x: NonNullable<typeof p.value>) =>
             <dd>
               <code><SafeName :value="p.partitionColumn" :max="60" /></code>
               <span class="muted"> ({{ p.partitionColumnType }})</span>
+            </dd>
+            <dt>Owner of the table</dt>
+            <dd data-testid="policy-owner">
+              <NullableValue :value="p.tableOwner" safe />
+              <span v-if="p.ownerTrusted !== undefined" class="muted">
+                ({{ p.ownerTrusted ? 'trusted' : 'not trusted' }})</span
+              >
             </dd>
             <dt>Each partition covers</dt>
             <dd>{{ durationText(p.partitionEvery) }}</dd>

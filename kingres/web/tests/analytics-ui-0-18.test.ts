@@ -1124,3 +1124,87 @@ describe('the plan summary of the workbench', () => {
     expect(await axe(document.body)).toHaveNoViolations()
   })
 })
+
+describe('the owners of the tables in the console (contract 0.18.0)', () => {
+  it('the setting is off by default; turning it on says what it means and asks first, and sends only that group', async () => {
+    const user = userEvent.setup()
+    recordBodies('PATCH', '/settings/cluster')
+    await renderApp('/settings')
+    const box = await screen.findByTestId('allow-non-superuser-owners')
+    expect(box).not.toBeChecked()
+    expect(screen.getByTestId('allow-non-superuser-owners-text')).toHaveTextContent(
+      /run the code of the owner of the table.*as the\s+service role/i,
+    )
+    await user.click(box)
+    await user.click(screen.getByRole('button', { name: /^save settings/i }))
+    const dialog = await dialogOf(/run the code of table owners who are not superusers\?/i)
+    expect(dialog.getByTestId('owners-confirm-text')).toHaveTextContent(/trust every owner/i)
+    expect(bodies).toEqual([])
+    await user.click(dialog.getByRole('button', { name: /^turn on$/i }))
+    expect(await screen.findByText('Settings saved.')).toBeInTheDocument()
+    expect(bodies).toEqual([{ analytics: { allowNonSuperuserOwners: true } }])
+    expect(getState().settings.analytics?.allowNonSuperuserOwners).toBe(true)
+  })
+
+  it('turning it off needs no confirmation', async () => {
+    getState().settings.analytics = { allowNonSuperuserOwners: true }
+    const user = userEvent.setup()
+    recordBodies('PATCH', '/settings/cluster')
+    await renderApp('/settings')
+    const box = await screen.findByTestId('allow-non-superuser-owners')
+    expect(box).toBeChecked()
+    await user.click(box)
+    await user.click(screen.getByRole('button', { name: /^save settings/i }))
+    expect(await screen.findByText('Settings saved.')).toBeInTheDocument()
+    expect(bodies).toEqual([{ analytics: { allowNonSuperuserOwners: false } }])
+  })
+
+  it('the storage dialog names the owner, explains the blocker and links to the setting; Convert stays off', async () => {
+    sw('analytics=timeseries,owner:untrusted')
+    const user = userEvent.setup()
+    await renderApp(table('clicks'))
+    await user.click(await screen.findByTestId('convert-storage'))
+    const dialog = await dialogOf(/^convert storage of table clicks/i)
+    const notice = await dialog.findByTestId('owner-not-trusted')
+    expect(notice).toHaveTextContent(/owned by analyst, who is not a superuser/i)
+    expect(within(notice).getByRole('link', { name: /cluster settings/i })).toHaveAttribute(
+      'href',
+      '/settings',
+    )
+    expect(dialog.getByTestId('table-blockers')).toHaveTextContent(
+      /the owner of the table is not trusted/i,
+    )
+    expect(dialog.getByRole('button', { name: /^convert$/i })).toBeDisabled()
+  })
+
+  it('the policy panel shows the owner and why runs are refused; the setting clears it', async () => {
+    sw('analytics=timeseries,owner:untrusted')
+    const user = userEvent.setup()
+    await renderApp(table('metrics'))
+    expect(await screen.findByTestId('owner-not-trusted')).toHaveTextContent(
+      /scheduled run raises one alert/i,
+    )
+    expect(screen.getByTestId('policy-owner')).toHaveTextContent('analyst (not trusted)')
+    // Run now is refused by the server in words.
+    await user.click(await screen.findByTestId('policy-run'))
+    const dialog = await dialogOf(/^run the policy of public\.metrics now/i)
+    await user.click(await dialog.findByRole('button', { name: /^run now$/i }))
+    expect(
+      await dialog.findByText(/this table cannot have a partitioning policy/i),
+    ).toBeInTheDocument()
+    expect(dialog.getByText(/analytics\.allowNonSuperuserOwners/)).toBeInTheDocument()
+    await user.click(dialog.getByRole('button', { name: /^cancel$/i }))
+    await endpoints.updateClusterSettings({ analytics: { allowNonSuperuserOwners: true } })
+    await waitFor(() => expect(screen.queryByTestId('owner-not-trusted')).not.toBeInTheDocument(), {
+      timeout: 15_000,
+    })
+    expect(screen.getByTestId('policy-owner')).toHaveTextContent('analyst (trusted)')
+  })
+
+  it('a trusted owner shows no notice', async () => {
+    sw('analytics=timeseries')
+    await renderApp(table('metrics'))
+    expect(await screen.findByTestId('policy-owner')).toHaveTextContent('postgres (trusted)')
+    expect(screen.queryByTestId('owner-not-trusted')).not.toBeInTheDocument()
+  })
+})

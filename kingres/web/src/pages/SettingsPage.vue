@@ -35,12 +35,14 @@ const form = reactive({
   maxMoves: 4,
   sharding: false,
   ledger: false,
+  nonSuperuserOwners: false,
 })
 const saved = ref(false)
 const submitted = ref(false)
 /** True once the person has edited a field; a refresh from the server must not overwrite edits. */
 const dirty = ref(false)
 const confirmingFeatures = ref<string[] | null>(null)
+const confirmingOwners = ref(false)
 
 function load(): void {
   const d = s.value
@@ -54,6 +56,7 @@ function load(): void {
     maxMoves: d.rebalance.maxConcurrentMoves,
     sharding: d.features.sharding,
     ledger: d.features.ledger,
+    nonSuperuserOwners: d.analytics?.allowNonSuperuserOwners ?? false,
   })
   dirty.value = false
 }
@@ -108,6 +111,8 @@ function changes(): ClusterSettingsUpdateRequest {
   if (form.sharding && !d.features.sharding) features.sharding = true
   if (form.ledger && !d.features.ledger) features.ledger = true
   if (Object.keys(features).length) body.features = features
+  if (form.nonSuperuserOwners !== (d.analytics?.allowNonSuperuserOwners ?? false))
+    body.analytics = { allowNonSuperuserOwners: form.nonSuperuserOwners }
   return body
 }
 
@@ -118,6 +123,7 @@ const save = useMutation({
     saved.value = true
     dirty.value = false
     confirmingFeatures.value = null
+    confirmingOwners.value = false
     await Promise.all([
       client.invalidateQueries({ queryKey: keys.clusterSettings }),
       client.invalidateQueries({ queryKey: keys.cluster }),
@@ -143,6 +149,11 @@ function submit(): void {
   const turnedOn = Object.keys(body.features ?? {})
   if (turnedOn.length > 0) {
     confirmingFeatures.value = turnedOn
+    return
+  }
+  // Trusting owners who are not superusers is a decision about whose code runs as the service role: it is confirmed first.
+  if (body.analytics?.allowNonSuperuserOwners === true) {
+    confirmingOwners.value = true
     return
   }
   save.mutate()
@@ -276,6 +287,25 @@ function submit(): void {
         >
         <p class="hint muted">The first time a feature is enabled, every server needs a restart.</p>
       </fieldset>
+      <fieldset data-testid="analytics-settings">
+        <legend>Analytics</legend>
+        <label class="check"
+          ><input
+            v-model="form.nonSuperuserOwners"
+            type="checkbox"
+            data-testid="allow-non-superuser-owners"
+          />
+          Run the code of table owners who are not superusers</label
+        >
+        <p class="hint muted" data-testid="allow-non-superuser-owners-text">
+          Converting a table between rows and columns, and the runs of a time-partitioning policy,
+          run the code of the owner of the table (an index expression, a check, a default) as the
+          service role, which is a superuser. Off (the default), a table whose owner is not a
+          superuser is refused, and so is its policy. Turn it on only if you trust every owner of a
+          table that you convert or partition by policy. It can be turned off again; a policy that
+          is refused then raises one alert.
+        </p>
+      </fieldset>
       <ProblemNotice v-if="save.error.value" :error="save.error.value" />
       <p v-if="unchanged" class="notice tone-info" role="status">
         <span aria-hidden="true">&#9432;</span> Nothing was changed, so nothing was saved.
@@ -298,6 +328,26 @@ function submit(): void {
   <div style="max-width: 720px; margin-top: var(--s-5)">
     <AnchorSettings />
   </div>
+  <ConfirmDialog
+    v-if="confirmingOwners"
+    title="Run the code of table owners who are not superusers?"
+    confirm-label="Turn on"
+    danger
+    :busy="save.isPending.value"
+    @cancel="confirmingOwners = false"
+    @confirm="save.mutate()"
+  >
+    <p class="notice tone-danger" role="alert" data-testid="owners-confirm-text">
+      <span aria-hidden="true">&#10006;</span>
+      <span>
+        From now on a conversion and the runs of a policy run the code of the owner of a table as
+        the service role, a superuser, and the scheduler repeats a policy without a person watching.
+        What an owner's code leaves behind in that session would later run with the rights of the
+        service role. Turn this on only if you trust every owner of such a table.
+      </span>
+    </p>
+    <ProblemNotice v-if="save.error.value" :error="save.error.value" />
+  </ConfirmDialog>
   <ConfirmDialog
     v-if="confirmingFeatures"
     :title="`Turn on ${confirmingFeatures.join(' and ')} for the whole cluster?`"

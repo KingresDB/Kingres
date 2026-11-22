@@ -10,6 +10,7 @@
 import { computed, reactive, ref } from 'vue'
 import { useQuery } from '@tanstack/vue-query'
 import TableBlockerList from './TableBlockerList.vue'
+import OwnerNotice from './OwnerNotice.vue'
 import TaskActionDialog from '../TaskActionDialog.vue'
 import FormField from '../FormField.vue'
 import ProblemNotice from '../ProblemNotice.vue'
@@ -158,6 +159,7 @@ const preview = useQuery({
   staleTime: 0,
   gcTime: 0,
 })
+const ownerUntrusted = computed(() => askable.value && preview.data.value?.ownerTrusted === false)
 const previewUnavailable = computed(() => isUnsupported(preview.error.value))
 const serverBlockers = computed(() => (askable.value ? (preview.data.value?.blockers ?? []) : []))
 const serverNotes = computed(() => (askable.value ? (preview.data.value?.notes ?? []) : []))
@@ -273,6 +275,7 @@ const refusal = (error: unknown): string[] =>
           @retry="preview.refetch()"
         />
         <template v-else>
+          <OwnerNotice v-if="ownerUntrusted" :owner="preview.data.value?.tableOwner" />
           <TableBlockerList
             :lines="serverBlockers"
             tone="blocker"

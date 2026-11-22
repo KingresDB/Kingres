@@ -17,6 +17,7 @@ import QueryBoundary from '../QueryBoundary.vue'
 import SafeName from '../SafeName.vue'
 import TypeToConfirm from '../TypeToConfirm.vue'
 import PartitionActionsTable from './PartitionActionsTable.vue'
+import OwnerNotice from './OwnerNotice.vue'
 import { endpoints } from '@/api/endpoints'
 import { describeProblem } from '@/api/problem'
 import { keys, usePartitionPolicy } from '@/api/queries'
@@ -219,6 +220,10 @@ const EXAMPLE = computed(
       @retry="stored.refetch()"
     >
       <form class="stack" data-testid="policy-form" @submit.prevent>
+        <OwnerNotice
+          v-if="stored.data.value?.ownerTrusted === false"
+          :owner="stored.data.value?.tableOwner"
+        />
         <p>
           Partition column
           <code><SafeName :value="table.partitioning?.key ?? ''" :max="60" /></code>

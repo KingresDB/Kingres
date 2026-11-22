@@ -896,6 +896,7 @@ export function createMockState(options: { uninitialized?: boolean } = {}): Mock
       autoFailover: { enabled: true, timeoutSeconds: 120, maxCount: 1, eventsSinceReset: 0 },
       rebalance: { maxConcurrentMoves: 4 },
       features: { sharding: true, ledger: true },
+      analytics: { allowNonSuperuserOwners: false },
       clock: { maxDifferenceMs: 1000 },
       restart: { required: false, serverIds: [] },
     },

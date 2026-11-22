@@ -77,6 +77,7 @@ const BLOCKER_LABEL: Record<string, string> = {
   publication: 'A publication',
   foreign_keys: 'Foreign keys',
   other: 'Refused by the extension',
+  owner_not_trusted: 'The owner of the table is not trusted',
   free_space: 'Not enough free space',
 }
 

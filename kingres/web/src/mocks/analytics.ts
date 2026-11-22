@@ -52,6 +52,8 @@ export interface AnalyticsState {
     runFails: boolean
     /** A table is in a publication: a conversion of it is refused. */
     publication: boolean
+    /** The tables are owned by a role that is not a superuser (`tableOwner` analyst); trusted only when the cluster setting is on. */
+    untrustedOwner: boolean
   }
 }
 
@@ -69,6 +71,7 @@ export function analyticsOf(s: MockState): AnalyticsState {
       runAction: null,
       runFails: false,
       publication: false,
+      untrustedOwner: false,
     },
   }
   return s.analytics
@@ -435,7 +438,27 @@ function blockersFor(s: MockState, t: Table, target: string): Blocker[] {
       r.push(blocker('other', trg, `has a trigger (${trg})`))
   }
   if (analyticsOf(s).knobs.publication) r.push(blocker('publication', obj, 'is in a publication'))
+  r.push(...ownerBlockers(s, obj))
   return r
+}
+
+/** The owner of the tables and whether runs and conversions are allowed for it now (contract 0.18.0). */
+function ownerInfo(s: MockState): { tableOwner: string; ownerTrusted: boolean } {
+  const untrusted = analyticsOf(s).knobs.untrustedOwner
+  return {
+    tableOwner: untrusted ? 'analyst' : 'postgres',
+    ownerTrusted: !untrusted || s.settings.analytics?.allowNonSuperuserOwners === true,
+  }
+}
+const OWNER_TEXT =
+  'The owner of the table is not a superuser, and the code of an owner (an index expression, a check, a default) would run as the service role. Turn on the cluster setting analytics.allowNonSuperuserOwners if you trust this owner.'
+function ownerBlockers(s: MockState, object: string): Blocker[] {
+  const o = ownerInfo(s)
+  return o.ownerTrusted ? [] : [blocker('owner_not_trusted', object, OWNER_TEXT)]
+}
+/** 409 `partition_policy_conflict` for a policy that would run for an owner that is not trusted. */
+function refuseUntrustedOwner(s: MockState): void {
+  if (!ownerInfo(s).ownerTrusted) throw problem('partition_policy_conflict', OWNER_TEXT)
 }
 
 function storagePreview(
@@ -443,6 +466,7 @@ function storagePreview(
   target: 'heap' | 'columnar',
   blockers: Blocker[],
   partition: boolean,
+  owner: { tableOwner: string; ownerTrusted: boolean },
 ): S['TableStoragePreview'] {
   const notes: string[] = []
   if (current === target) notes.push(`stored as ${target === 'heap' ? 'rows' : 'columns'} already`)
@@ -457,6 +481,7 @@ function storagePreview(
     willConvert: blockers.length === 0 && current !== target,
     blockers,
     notes,
+    ...owner,
   }
 }
 
@@ -472,7 +497,7 @@ function setTableStorage(
   requireExtensions(s, b.accessMethod, false)
   const current = t.partitioning ? null : (t.storage?.accessMethod ?? 'heap')
   const blockers = blockersFor(s, t, b.accessMethod)
-  if (dryRun) return storagePreview(current, b.accessMethod, blockers, false)
+  if (dryRun) return storagePreview(current, b.accessMethod, blockers, false, ownerInfo(s))
   // Heap to heap changes nothing; columnar to columnar sets the options for new stripes.
   if (current === 'heap' && b.accessMethod === 'heap')
     blockers.push(blocker('other', `${t.schema}.${t.name}`, 'is stored as rows already'))
@@ -591,7 +616,8 @@ function startSetPartitionStorage(
   }
   if (analyticsOf(s).knobs.publication)
     blockers.push(blocker('publication', partition, 'is in a publication'))
-  if (dryRun) return storagePreview(current, b.accessMethod, blockers, true)
+  blockers.push(...ownerBlockers(s, `${t.schema}.${t.name}`))
+  if (dryRun) return storagePreview(current, b.accessMethod, blockers, true, ownerInfo(s))
   if (current === b.accessMethod)
     blockers.push(
       blocker(
@@ -777,6 +803,7 @@ function policyView(s: MockState, rec: DbRec, t: Table): Policy {
     health: { partitionsAhead: ahead, ok: problems.length === 0, problems },
     createdBy: p.createdBy,
     updatedAt: p.updatedAt,
+    ...ownerInfo(s),
   }
 }
 
@@ -789,6 +816,7 @@ function putPolicy(s: MockState, rec: DbRec, t: Table, b: Partial<PolicyRequest>
     )
   if (analyticsOf(s).knobs.timepartMissing)
     throw problem('extension_missing', 'kingres_timepart is not installed in this database.')
+  refuseUntrustedOwner(s)
   const key = keyOf(rec, t)
   const a = analyticsOf(s)
   if (holdsTable(s, key, ['partition.maintain']))
@@ -911,6 +939,11 @@ function startRun(s: MockState, rec: DbRec, t: Table, asOfText?: string): Task {
   const key = keyOf(rec, t)
   const policy = a.policies[key]
   if (!policy) throw problem('not_found', 'The table has no time-partitioning policy.')
+  if (!ownerInfo(s).ownerTrusted) {
+    // The scheduler does not retry: one alert says why.
+    raisePolicyAlert(s, rec, t, 'partitionPolicyFailed')
+    refuseUntrustedOwner(s)
+  }
   let asOf = new Date()
   if (asOfText !== undefined) {
     const d = new Date(asOfText)
@@ -1266,6 +1299,7 @@ export function applyAnalyticsSwitch(entry: string, s: MockState): void {
   if (entry === 'run:name') k.runAction = 'name_conflict'
   if (entry === 'run:fail') k.runFails = true
   if (entry === 'publication') k.publication = true
+  if (entry === 'owner:untrusted') k.untrustedOwner = true
   if (entry === 'old') for (const op of PHASE12_OPERATIONS) mockConfig.unsupported.add(op)
 }
 

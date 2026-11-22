@@ -1092,3 +1092,81 @@ describe('the settled contract of 0.18.0 (review of the control plane)', () => {
       ).toEqual(['/partitionEvery'])
   })
 })
+
+describe('the owners of the tables (contract 0.18.0, items 14 to 16)', () => {
+  const policy = { partitionEvery: 'P1D' } as const
+  it('the cluster setting is off by default, and an update needs a boolean', async () => {
+    expect((await endpoints.getClusterSettings()).analytics).toEqual({
+      allowNonSuperuserOwners: false,
+    })
+    const bad = await refused(endpoints.updateClusterSettings({ analytics: {} } as never))
+    expect(bad.status).toBe(400)
+    const on = await endpoints.updateClusterSettings({
+      analytics: { allowNonSuperuserOwners: true },
+    })
+    expect(on.analytics?.allowNonSuperuserOwners).toBe(true)
+  })
+
+  it('a table owned by a superuser is trusted: the owner is shown and nothing is refused', async () => {
+    sw('analytics=timeseries')
+    const p = await endpoints.getPartitionPolicy('shop', 'public', 'metrics')
+    expect(p).toMatchObject({ tableOwner: 'postgres', ownerTrusted: true })
+    const pre = await endpoints.previewTableStorage('shop', 'public', 'clicks', {
+      accessMethod: 'columnar',
+    })
+    expect(pre).toMatchObject({ tableOwner: 'postgres', ownerTrusted: true })
+  })
+
+  it('an owner that is not trusted: the preview and the 409 carry owner_not_trusted, a policy put and a run are 409 partition_policy_conflict', async () => {
+    sw('analytics=timeseries,owner:untrusted')
+    const pre = await endpoints.previewTableStorage('shop', 'public', 'clicks', {
+      accessMethod: 'columnar',
+    })
+    expect(pre).toMatchObject({ tableOwner: 'analyst', ownerTrusted: false, willConvert: false })
+    expect(pre.blockers.map((b) => b.code)).toEqual(['owner_not_trusted'])
+    const e = await endpoints
+      .setTableStorage('shop', 'public', 'clicks', { accessMethod: 'columnar' })
+      .then(
+        () => null,
+        (x: unknown) => x as ApiError,
+      )
+    expect(e?.code).toBe('conversion_refused')
+    expect(e?.problem.blockers?.map((b) => b.code)).toEqual(['owner_not_trusted'])
+    const heap = (await partitions()).find((x) => x.accessMethod === 'heap')!
+    const part = await endpoints.previewPartitionStorage('shop', 'public', 'metrics', heap.name, {
+      accessMethod: 'columnar',
+    })
+    expect(part.blockers.map((b) => b.code)).toContain('owner_not_trusted')
+    expect(
+      (await refused(endpoints.putPartitionPolicy('shop', 'public', 'metrics', policy))).code,
+    ).toBe('partition_policy_conflict')
+    expect((await refused(endpoints.runPartitionPolicy('shop', 'public', 'metrics'))).code).toBe(
+      'partition_policy_conflict',
+    )
+    expect(getState().tasks.some((t) => t.task.kind === 'partition.maintain')).toBe(false)
+    // The policy that exists says so, and its refusal raised one alert, not one per try.
+    expect(await endpoints.getPartitionPolicy('shop', 'public', 'metrics')).toMatchObject({
+      tableOwner: 'analyst',
+      ownerTrusted: false,
+    })
+    await refused(endpoints.runPartitionPolicy('shop', 'public', 'metrics'))
+    expect(
+      getState().alerts.filter((a) => a.kind === 'partitionPolicyFailed' && a.state === 'open'),
+    ).toHaveLength(1)
+  })
+
+  it('turning the setting on makes the owner trusted and lets the conversion and the policy through', async () => {
+    sw('analytics=timeseries,owner:untrusted')
+    await endpoints.updateClusterSettings({ analytics: { allowNonSuperuserOwners: true } })
+    const pre = await endpoints.previewTableStorage('shop', 'public', 'clicks', {
+      accessMethod: 'columnar',
+    })
+    expect(pre).toMatchObject({ ownerTrusted: true, willConvert: true, blockers: [] })
+    expect(
+      (await endpoints.putPartitionPolicy('shop', 'public', 'metrics', policy)).ownerTrusted,
+    ).toBe(true)
+    expect((await endpoints.runPartitionPolicy('shop', 'public', 'metrics')).kind).toBe(
+      'partition.maintain',
+    )
+  })
+})
