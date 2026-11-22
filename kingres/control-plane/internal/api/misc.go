@@ -305,6 +305,8 @@ type DataTransferSettings struct {
 	StagingQuotaBytes int64 `json:"stagingQuotaBytes"`
 	// MaxConcurrent is the number of transfers running at once in the cluster.
 	MaxConcurrent int `json:"maxConcurrent"`
+	// MaxAtomicBytes is the largest decompressed file that one import of this server accepts (a flag of the server); read only.
+	MaxAtomicBytes int64 `json:"maxAtomicBytes,omitempty"`
 }
 
 // ClockSettings are the clock settings of the cluster.

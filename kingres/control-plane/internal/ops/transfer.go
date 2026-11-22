@@ -135,11 +135,16 @@ func (o *Ops) openXfer(ctx context.Context) (*xferState, bool, error) {
 	}
 	o.xferSt = &xferState{cfg: *cfg, store: store, keys: keys, res: map[int64]*staging.Reservation{}}
 	// The quota is the sum over the live files: those that exist when this process starts hold their room before the first request is answered.
-	if live, lerr := rs.OnServer(ctx, o.ServerHost); lerr == nil {
-		for _, r := range live {
-			if _, aerr := o.xferSt.reservation(r); aerr != nil {
-				o.Log.Warn("adopting the reservation of a staged file failed", "transfer", r.ID)
-			}
+	// A failed read is not final for the process: the store is not kept, so the next use opens it again and adopts again (DX15-05).
+	live, lerr := rs.OnServer(ctx, o.ServerHost)
+	if lerr != nil {
+		o.xferSt = nil
+		o.Log.Error("the staged files cannot be listed, so their reservations are not adopted; the data transfer is unavailable until it can", "error", lerr)
+		return nil, false, problem.New(problem.ServiceUnavailable, "The staged files of the data transfer cannot be listed now; see the log of the server.").WithRetryAfter(30)
+	}
+	for _, r := range live {
+		if _, aerr := o.xferSt.reservation(r); aerr != nil {
+			o.Log.Error("adopting the reservation of a staged file failed", "transfer", r.ID)
 		}
 	}
 	return o.xferSt, true, nil
@@ -632,6 +637,8 @@ func exportView(rec transfer.Record) api.DataExport {
 			out.Rows = &r
 			out.Consistency = rep.Consistency
 			out.RLSApplied = rep.RLSApplied
+			safe := rep.Safe
+			out.SpreadsheetSafe = &safe
 		}
 	}
 	return out

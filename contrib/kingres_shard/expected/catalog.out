@@ -6,11 +6,14 @@ SELECT c.relname
   ORDER BY 1;
        relname        
 ----------------------
+ add_node_progress
  bucket_map
  bucket_move
+ bucket_split
  cluster_secret
  colocation
  dist_partition
+ dist_schema
  dist_table
  dtx_applied
  dtx_epoch
@@ -22,11 +25,12 @@ SELECT c.relname
  move_marker
  node
  pending_node
+ sharding_settings
  table_old_copy
  table_operation
  table_operation_item
  table_operation_lock
-(20 rows)
+(24 rows)
 
 SELECT conrelid::regclass AS tbl, conname, contype
   FROM pg_constraint
@@ -34,19 +38,31 @@ SELECT conrelid::regclass AS tbl, conname, contype
   ORDER BY 1::text, 2;
          tbl          |             conname             | contype 
 ----------------------+---------------------------------+---------
+ add_node_progress    | add_node_progress_pkey          | p
  bucket_map           | bucket_map_bucket_check         | c
  bucket_map           | bucket_map_colocation_id_fkey   | f
  bucket_map           | bucket_map_group_id_check       | c
+ bucket_map           | bucket_map_modulus_check        | c
  bucket_map           | bucket_map_pkey                 | p
  bucket_map           | bucket_map_state_check          | c
  bucket_move          | bucket_move_groups_check        | c
  bucket_move          | bucket_move_phase_check         | c
  bucket_move          | bucket_move_pkey                | p
+ bucket_split         | bucket_split_parts_check        | c
+ bucket_split         | bucket_split_phase_check        | c
+ bucket_split         | bucket_split_pkey               | p
+ bucket_split         | bucket_split_verify_check       | c
  cluster_secret       | cluster_secret_length_check     | c
  colocation           | colocation_bucket_count_check   | c
+ colocation           | colocation_kind_check           | c
+ colocation           | colocation_kind_shape_check     | c
+ colocation           | colocation_max_modulus_check    | c
  colocation           | colocation_pkey                 | p
  dist_partition       | dist_partition_parent_fkey      | f
  dist_partition       | dist_partition_pkey             | p
+ dist_schema          | dist_schema_colocation_id_fkey  | f
+ dist_schema          | dist_schema_colocation_id_key   | u
+ dist_schema          | dist_schema_pkey                | p
  dist_table           | dist_table_colocation_id_fkey   | f
  dist_table           | dist_table_method_check         | c
  dist_table           | dist_table_partition_check      | c
@@ -62,7 +78,10 @@ SELECT conrelid::regclass AS tbl, conname, contype
  node                 | node_pkey                       | p
  node                 | node_port_check                 | c
  node                 | node_role_check                 | c
+ node                 | node_weight_check               | c
  pending_node         | pending_node_pkey               | p
+ sharding_settings    | sharding_settings_default_check | c
+ sharding_settings    | sharding_settings_mode_check    | c
  table_old_copy       | table_old_copy_pkey             | p
  table_operation_item | table_operation_item_op_id_fkey | f
  table_operation_item | table_operation_item_pkey       | p
@@ -73,7 +92,7 @@ SELECT conrelid::regclass AS tbl, conname, contype
  table_operation      | table_operation_phase_check     | c
  table_operation      | table_operation_pkey            | p
  table_operation      | table_operation_verified_check  | c
-(39 rows)
+(54 rows)
 
 -- Nothing is created outside the kingres schema.
 SELECT count(*) AS tables_outside_kingres
@@ -146,30 +165,43 @@ DETAIL:  Key (host, port)=(a.example, 5432) already exists.
 INSERT INTO kingres.node (node_id, group_id, host, port, role)
   VALUES (3, 0, 'c.example', 5432, 'leader');
 ERROR:  new row for relation "node" violates check constraint "node_role_check"
-DETAIL:  Failing row contains (3, 0, c.example, 5432, leader, t, t, null).
+DETAIL:  Failing row contains (3, 0, c.example, 5432, leader, t, t, null, 1).
 INSERT INTO kingres.node (node_id, group_id, host, port, role)
   VALUES (3, -1, 'c.example', 5432, 'primary');
 ERROR:  new row for relation "node" violates check constraint "node_group_id_check"
-DETAIL:  Failing row contains (3, -1, c.example, 5432, primary, t, t, null).
+DETAIL:  Failing row contains (3, -1, c.example, 5432, primary, t, t, null, 1).
 INSERT INTO kingres.node (node_id, group_id, host, port, role)
   VALUES (3, 0, 'c.example', 70000, 'primary');
 ERROR:  new row for relation "node" violates check constraint "node_port_check"
-DETAIL:  Failing row contains (3, 0, c.example, 70000, primary, t, t, null).
+DETAIL:  Failing row contains (3, 0, c.example, 70000, primary, t, t, null, 1).
 INSERT INTO kingres.colocation VALUES (2, 0, 'int4', 0);
 ERROR:  new row for relation "colocation" violates check constraint "colocation_bucket_count_check"
-DETAIL:  Failing row contains (2, 0, integer, 0).
+DETAIL:  Failing row contains (2, 0, integer, 0, 0, 0, hash).
 INSERT INTO kingres.colocation VALUES (2, 4097, 'int4', 0);
 ERROR:  new row for relation "colocation" violates check constraint "colocation_bucket_count_check"
-DETAIL:  Failing row contains (2, 4097, integer, 0).
+DETAIL:  Failing row contains (2, 4097, integer, 0, 4097, 0, hash).
 INSERT INTO kingres.bucket_map VALUES (9, 0, 0);
 ERROR:  insert or update on table "bucket_map" violates foreign key constraint "bucket_map_colocation_id_fkey"
 DETAIL:  Key (colocation_id)=(9) is not present in table "colocation".
 INSERT INTO kingres.bucket_map VALUES (1, 0, 0);
 ERROR:  duplicate key value violates unique constraint "bucket_map_pkey"
 DETAIL:  Key (colocation_id, bucket)=(1, 0) already exists.
-INSERT INTO kingres.bucket_map VALUES (1, 20, 0, 'broken');
+INSERT INTO kingres.bucket_map VALUES (1, 2, 0, 'broken');
 ERROR:  new row for relation "bucket_map" violates check constraint "bucket_map_state_check"
-DETAIL:  Failing row contains (1, 20, 0, broken).
+DETAIL:  Failing row contains (1, 2, 0, broken, 8).
+-- the bucket layout of 0.8: a bucket is below its modulus, a modulus divides max_modulus of the group
+INSERT INTO kingres.bucket_map VALUES (1, 20, 0, 'active');
+ERROR:  new row for relation "bucket_map" violates check constraint "bucket_map_modulus_check"
+DETAIL:  Failing row contains (1, 20, 0, active, 8).
+INSERT INTO kingres.bucket_map VALUES (1, 0, 0, 'active', 0);
+ERROR:  new row for relation "bucket_map" violates check constraint "bucket_map_modulus_check"
+DETAIL:  Failing row contains (1, 0, 0, active, 0).
+INSERT INTO kingres.colocation VALUES (2, 4, 'int4', 0, 0);
+ERROR:  new row for relation "colocation" violates check constraint "colocation_max_modulus_check"
+DETAIL:  Failing row contains (2, 4, integer, 0, 0, 0, hash).
+INSERT INTO kingres.colocation VALUES (2, 4, 'int4', 0, 65537);
+ERROR:  new row for relation "colocation" violates check constraint "colocation_max_modulus_check"
+DETAIL:  Failing row contains (2, 4, integer, 0, 65537, 0, hash).
 INSERT INTO kingres.dist_table VALUES ('pg_class'::regclass, 'range', 'oid', 1);
 ERROR:  new row for relation "dist_table" violates check constraint "dist_table_method_check"
 DETAIL:  Failing row contains (pg_class, range, oid, 1, null, null, null).
@@ -201,12 +233,15 @@ SELECT name, setting, unit, context
   FROM pg_settings WHERE name LIKE 'kingres_shard.%' ORDER BY name;
                      name                     | setting | unit |  context  
 ----------------------------------------------+---------+------+-----------
+ kingres_shard.add_node_batch_statements      | 100     |      | superuser
+ kingres_shard.catalog_incremental            | on      |      | superuser
  kingres_shard.control_call_timeout           | 0       | s    | user
  kingres_shard.deadlock_check_interval        | 0       | s    | sighup
  kingres_shard.deadlock_confirm_delay         | 200     | ms   | sighup
  kingres_shard.decision_retention             | 300     | s    | sighup
  kingres_shard.default_bucket_count           | 128     |      | user
  kingres_shard.dependent_views                | refuse  |      | user
+ kingres_shard.distribute_new_schemas         | default |      | superuser
  kingres_shard.enable_bulk_routing            | on      |      | user
  kingres_shard.enable_colocated_insert_select | on      |      | user
  kingres_shard.enable_copy_routing            | on      |      | user
@@ -217,11 +252,14 @@ SELECT name, setting, unit, context
  kingres_shard.enable_pushdown_join           | on      |      | user
  kingres_shard.enable_pushdown_sort           | on      |      | user
  kingres_shard.enable_routing                 | on      |      | superuser
+ kingres_shard.enable_schema_routing          | on      |      | user
  kingres_shard.fault_injection                |         |      | superuser
  kingres_shard.forwarded                      | off     |      | backend
  kingres_shard.insert_batch_bytes             | 1048576 | B    | user
  kingres_shard.insert_batch_rows              | 1000    |      | user
+ kingres_shard.max_distributed_schemas        | 10000   |      | sighup
  kingres_shard.max_partition_leaves           | 8192    |      | user
+ kingres_shard.min_bucket_cost                | 1024    | kB   | user
  kingres_shard.move_catchup_threshold         | 1024    | kB   | user
  kingres_shard.move_cleanup_delay             | 600     | s    | user
  kingres_shard.move_switch_attempts           | 20      |      | user
@@ -237,9 +275,10 @@ SELECT name, setting, unit, context
  kingres_shard.rebuild_verify                 | on      |      | user
  kingres_shard.recovery_interval              | 0       | s    | sighup
  kingres_shard.scan_fetch_size                | 1000    |      | user
+ kingres_shard.schema_placement_group         | -1      |      | superuser
  kingres_shard.shippable_extensions           | all     |      | user
  kingres_shard.table_cleanup_delay            | 600     | s    | user
-(38 rows)
+(45 rows)
 
 SET kingres_shard.default_bucket_count = 0;
 ERROR:  0 is outside the valid range for parameter "kingres_shard.default_bucket_count" (1 .. 4096)

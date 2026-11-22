@@ -356,7 +356,10 @@ kingres_shard_copy_routed_ex(Oid source, const char *dest_schema, const char *de
 	return acked;
 }
 
-/* The placement of a colocation group from the catalog tables, as of this transaction. */
+/*
+ * The placement of a colocation group from the catalog tables, as of this transaction: its
+ * buckets with their moduli (a group that was split has buckets of several moduli) and owners.
+ */
 KsColocation *
 kingres_shard_load_placement(int colocation_id)
 {
@@ -365,16 +368,20 @@ kingres_shard_load_placement(int colocation_id)
 	KsColocation *c;
 	MemoryContext callercxt = CurrentMemoryContext;
 	bool		isnull;
-	int			nbuckets;
+	int			count;
+	int			maxmod;
+	int64		epoch;
 	Oid			dist_type;
 	Oid			collation;
-	int		   *groups;
+	int		   *rows;
 	uint64		i;
+	uint64		n;
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
 	argvalues[0] = Int32GetDatum(colocation_id);
-	if (SPI_execute_with_args("SELECT c.bucket_count, c.dist_column_type::pg_catalog.oid, c.dist_collation "
+	if (SPI_execute_with_args("SELECT c.bucket_count, c.dist_column_type::pg_catalog.oid, c.dist_collation, "
+							  "c.max_modulus, c.placement_epoch "
 							  "FROM " KINGRES_SHARD_SCHEMA ".colocation c "
 							  "WHERE c.colocation_id OPERATOR(pg_catalog.=) $1",
 							  1, argtypes, argvalues, NULL, true, 0) != SPI_OK_SELECT ||
@@ -382,32 +389,35 @@ kingres_shard_load_placement(int colocation_id)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("colocation group %d does not exist", colocation_id)));
-	nbuckets = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+	count = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
 	dist_type = DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull));
 	collation = DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3, &isnull));
-	/* in the caller's context: the SPI context goes with SPI_finish(), and the layout is made after it */
-	groups = MemoryContextAlloc(callercxt, sizeof(int) * Max(nbuckets, 1));
-	for (i = 0; i < (uint64) nbuckets; i++)
-		groups[i] = -1;
-	if (SPI_execute_with_args("SELECT b.bucket, b.group_id FROM " KINGRES_SHARD_SCHEMA ".bucket_map b "
+	maxmod = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 4, &isnull));
+	epoch = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 5, &isnull));
+	if (SPI_execute_with_args("SELECT b.bucket, b.group_id, b.modulus FROM " KINGRES_SHARD_SCHEMA ".bucket_map b "
 							  "WHERE b.colocation_id OPERATOR(pg_catalog.=) $1",
 							  1, argtypes, argvalues, NULL, true, 0) != SPI_OK_SELECT)
 		elog(ERROR, "could not read the bucket map of colocation group %d", colocation_id);
-	for (i = 0; i < SPI_processed; i++)
+	/* in the caller's context: the SPI context goes with SPI_finish(), and the layout is made after it */
+	n = SPI_processed;
+	rows = MemoryContextAlloc(callercxt, sizeof(int) * 3 * Max(n, 1));
+	for (i = 0; i < n; i++)
 	{
-		int			b = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
-		int			g = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2, &isnull));
-
-		if (b >= 0 && b < nbuckets)
-			groups[b] = g;
+		rows[3 * i] = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
+		rows[3 * i + 1] = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2, &isnull));
+		rows[3 * i + 2] = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 3, &isnull));
 	}
 	SPI_finish();
 	{
 		MemoryContext old = MemoryContextSwitchTo(callercxt);
 
-		c = kingres_shard_coloc_make(colocation_id, nbuckets, dist_type, collation, groups);
+		c = kingres_shard_coloc_begin(colocation_id, count, maxmod, epoch, dist_type, collation);
+		for (i = 0; i < n; i++)
+			kingres_shard_coloc_add(c, rows[3 * i], rows[3 * i + 2], rows[3 * i + 1]);
+		kingres_shard_coloc_finish(c);
 		MemoryContextSwitchTo(old);
 	}
+	pfree(rows);
 	return c;
 }
 

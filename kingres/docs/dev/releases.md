@@ -43,6 +43,12 @@ Before a release is tagged, on each branch:
 
 A cluster runs one major: all its servers are installed from the same branch. Moving a cluster from one major to the next is a separate procedure that is not designed yet.
 
+## State on 2026-11-22
+
+- Upstream tagged `REL_19_0` (PostgreSQL 19.0) on 2026-11-16, 47 commits after `REL_19_RC2`. `kingres-19` merged it on 2026-11-22. The only file that both upstream and the core patches change is `meson.build` (upstream the version line, KP-0001 the KingresDB version), and the merge had no conflict. Outside `contrib/kingres_*` and `kingres/`, `kingres-19` now differs from `REL_19_0` only by the core patches (`LICENSE`, `README.md`, `contrib/meson.build`, `meson.build`).
+- Checked on `kingres-19` after the merge: the tree builds with assertions enabled and without a compiler warning, the core regression suite passes, and the in-tree suites of the extensions pass (319 passed, 0 failed, 2 skipped: the test that needs an installation of the other major, and the columnar upgrade test that needs an older installation). The integration suite of the control plane runs against 19.0 installations from then on.
+- `kingres-19` is no longer a pre-release branch; nothing has been tagged on either branch yet.
+
 ## State on 2026-11-15
 
 - `kingres-18` is on `REL_18_7` and is the default branch.

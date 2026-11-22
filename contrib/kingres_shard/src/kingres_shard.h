@@ -22,7 +22,7 @@
 #include "fmgr.h"
 
 /* The version of the extension this library belongs to (the SQL objects of every node must match). */
-#define KINGRES_SHARD_EXT_VERSION "0.7"
+#define KINGRES_SHARD_EXT_VERSION "0.8"
 #include "nodes/params.h"
 #include "nodes/parsenodes.h"
 #include "nodes/plannodes.h"
@@ -149,6 +149,7 @@
 
 /* GUC variables (defined in kingres_shard.c). */
 extern PGDLLIMPORT int kingres_shard_default_bucket_count;
+extern PGDLLIMPORT int kingres_shard_min_bucket_cost;
 extern PGDLLIMPORT bool kingres_shard_enable_routing;
 extern PGDLLIMPORT bool kingres_shard_forwarded;
 extern PGDLLIMPORT int kingres_shard_node_connect_timeout;

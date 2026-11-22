@@ -91,6 +91,7 @@ func (s *Server) getClusterSettings(_ *call, w http.ResponseWriter, r *http.Requ
 	if v.Restart.ServerIDs == nil {
 		v.Restart.ServerIDs = []string{}
 	}
+	s.showMaxAtomic(&v)
 	s.writeJSON(w, r, http.StatusOK, v)
 	return nil
 }

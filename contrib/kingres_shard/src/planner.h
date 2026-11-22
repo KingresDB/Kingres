@@ -23,4 +23,8 @@ extern void kingres_shard_planner_init(void);
 /* Refuse work for another node on a table read through a view of another owner (S2-15). */
 extern void kingres_shard_refuse_view_owner(Query *q, RangeTblEntry *rte);
 
+/* The search_path of the session as the owner of a schema is to run functions with it, and whether the triggers or defaults of a table run code that its statements do not show. */
+extern char *kingres_shard_search_path_for_functions(void);
+extern bool kingres_shard_table_runs_hidden_code(Oid relid);
+
 #endif							/* KINGRES_SHARD_PLANNER_H */

@@ -1842,6 +1842,11 @@ section differ, this section is right.
   stored (the insert waits up to 60 seconds for a transaction that holds the key). A statement of the text above that is not true as built: the marker table is **local**
   to the database of the server that loaded, not a reference table; after a change of leader the marker cannot be read from the new leader, and the task fails
   `import_outcome_unknown` (the case the design left for "unknown until observed"). The reference-table form belongs to the batch import of 14c.
+- **The marker is hardened (DX15-01 to 03).** It is keyed by a random 128-bit nonce kept in the task parameters (not the task id, which a restored or cloned database could repeat),
+  old rows are deleted after 30 days, and the write goes through `kingres_transfer.mark(nonce, task, rows, tag)`: the function inserts only when `tag = sha256(secret || nonce:task:rows)`,
+  the secret being a service-only table of the database that the control plane reads and uses. A role therefore cannot forge, block or hold a marker. The schema, the tables and the
+  function are made by the service role only and checked on every use (owner, no trigger, rule, policy, other column, default or function, the exact body of the function), under an
+  advisory lock; anything else fails the import closed (`forbidden`), so a database owner cannot plant the schema and have the service role run it.
 - **One step loads and commits (DX14-07).** *Load rows* does `BEGIN`, the load, the checks, the marker, the intent and `COMMIT` and ends with the commit done or an error; the
   open transaction is never kept between steps, so a stand-down cannot leave one without an owner (the connection is closed by the step, and the server ends an idle
   transaction after the time that is left of the task). *Commit* is now *Confirm the commit*: it reads the marker, records the count and writes the audit event.

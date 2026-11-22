@@ -42,6 +42,7 @@
 #include "catalog/pg_inherits.h"
 #include "commands/trigger.h"
 #include "executor/spi.h"
+#include "funcapi.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/inval.h"
@@ -54,6 +55,11 @@
 #include "node_conn.h"
 
 PG_FUNCTION_INFO_V1(kingres_map_version_bump);
+PG_FUNCTION_INFO_V1(kingres_internal_catalog_stats);
+
+/* What this backend did for the cache (kingres.internal_catalog_stats(), for the tests of step 12). */
+static int64 stat_lazy_lookups = 0;
+static int64 stat_invalidations = 0;
 
 /* Catalog tables whose relcache invalidation drops the cache. */
 static const char *const catalog_tables[] = {
@@ -69,7 +75,14 @@ static struct
 	Oid			relids[NUM_CATALOG_TABLES];
 	MemoryContext cxt;
 	KsCatalog	cat;
+	HTAB	   *cohash;			/* colocation id -> KsColocation *, of the cached list */
 }			ks;
+
+typedef struct ColocEntry
+{
+	int			cid;
+	KsColocation *coloc;
+} ColocEntry;
 
 static void catalog_inval_callback(Datum arg, Oid relid);
 static void catalog_load(void);
@@ -405,6 +418,7 @@ catalog_load(void)
 	HASHCTL		ctl;
 	List	   *groups = NIL;
 	ListCell   *lc;
+	HTAB	   *cohash = NULL;
 
 	memset(&cat, 0, sizeof(cat));
 	cat.local_group_id = -1;
@@ -435,6 +449,17 @@ catalog_load(void)
 		ctl.hcxt = newcxt;
 		cat.dist_tables = hash_create("kingres_shard dist tables", 64, &ctl,
 									  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		cat.schema_tables = hash_create("kingres_shard schema tables", 64, &ctl,
+										HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		{
+			HASHCTL		cctl;
+
+			memset(&cctl, 0, sizeof(cctl));
+			cctl.keysize = sizeof(int);
+			cctl.entrysize = sizeof(ColocEntry);
+			cctl.hcxt = newcxt;
+			cohash = hash_create("kingres_shard colocations", 256, &cctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		}
 
 		if (complete)
 		{
@@ -524,27 +549,50 @@ catalog_load(void)
 				}
 			}
 
-			/* colocation(colocation_id, bucket_count, dist_column_type, dist_collation) */
+			/*
+			 * colocation(colocation_id, bucket_count, dist_column_type, dist_collation,
+			 * max_modulus, placement_epoch): the last two exist from 0.8; a catalog that is not
+			 * upgraded yet has the layout of a group that was never split.
+			 */
 			catscan_begin(&cs, relids[1]);
 			while ((tup = catscan_next(&cs)) != NULL)
 			{
 				TupleDesc	desc = RelationGetDescr(cs.rel);
 				bool		isnull;
-				KsColocation *c = palloc0(sizeof(KsColocation));
-				int			b;
+				int			cid = DatumGetInt32(heap_getattr(tup, 1, desc, &isnull));
+				int			count = DatumGetInt32(heap_getattr(tup, 2, desc, &isnull));
+				Oid			dtype = DatumGetObjectId(heap_getattr(tup, 3, desc, &isnull));
+				Oid			coll = DatumGetObjectId(heap_getattr(tup, 4, desc, &isnull));
+				int			maxmod = count;
+				int64		epoch = 0;
 
-				c->colocation_id = DatumGetInt32(heap_getattr(tup, 1, desc, &isnull));
-				c->bucket_count = DatumGetInt32(heap_getattr(tup, 2, desc, &isnull));
-				c->dist_type = DatumGetObjectId(heap_getattr(tup, 3, desc, &isnull));
-				c->collation = DatumGetObjectId(heap_getattr(tup, 4, desc, &isnull));
-				c->bucket_group = palloc(sizeof(int) * c->bucket_count);
-				for (b = 0; b < c->bucket_count; b++)
-					c->bucket_group[b] = -1;
-				cat.colocations = lappend(cat.colocations, c);
+				if (desc->natts >= 5)
+				{
+					Datum		d = heap_getattr(tup, 5, desc, &isnull);
+
+					if (!isnull)
+						maxmod = DatumGetInt32(d);
+				}
+				if (desc->natts >= 6)
+				{
+					Datum		d = heap_getattr(tup, 6, desc, &isnull);
+
+					if (!isnull)
+						epoch = DatumGetInt64(d);
+				}
+				{
+					KsColocation *nc = kingres_shard_coloc_begin(cid, count, maxmod, epoch, dtype, coll);
+					ColocEntry *ce;
+					bool		cfound;
+
+					cat.colocations = lappend(cat.colocations, nc);
+					ce = hash_search(cohash, &cid, HASH_ENTER, &cfound);
+					ce->coloc = nc;
+				}
 			}
 			catscan_end(&cs);
 
-			/* bucket_map(colocation_id, bucket, group_id, state) */
+			/* bucket_map(colocation_id, bucket, group_id, state, modulus): modulus exists from 0.8 */
 			catscan_begin(&cs, relids[3]);
 			while ((tup = catscan_next(&cs)) != NULL)
 			{
@@ -554,19 +602,28 @@ catalog_load(void)
 				int			bucket = DatumGetInt32(heap_getattr(tup, 2, desc, &isnull));
 				int			group = DatumGetInt32(heap_getattr(tup, 3, desc, &isnull));
 
-				foreach(lc, cat.colocations)
 				{
-					KsColocation *c = (KsColocation *) lfirst(lc);
+					ColocEntry *ce = hash_search(cohash, &cid, HASH_FIND, NULL);
 
-					if (c->colocation_id == cid)
+					if (ce != NULL)
 					{
-						if (bucket >= 0 && bucket < c->bucket_count)
-							c->bucket_group[bucket] = group;
-						break;
+						KsColocation *c = ce->coloc;
+						int			modulus = c->bucket_count;
+
+						if (desc->natts >= 5)
+						{
+							Datum		d = heap_getattr(tup, 5, desc, &isnull);
+
+							if (!isnull)
+								modulus = DatumGetInt32(d);
+						}
+						kingres_shard_coloc_add(c, bucket, modulus, group);
 					}
 				}
 			}
 			catscan_end(&cs);
+			foreach(lc, cat.colocations)
+				kingres_shard_coloc_finish((KsColocation *) lfirst(lc));
 
 			/* dist_table(relid, method, dist_column, colocation_id) */
 			catscan_begin(&cs, relids[2]);
@@ -575,7 +632,9 @@ catalog_load(void)
 				TupleDesc	desc = RelationGetDescr(cs.rel);
 				bool		isnull;
 				Oid			relid = DatumGetObjectId(heap_getattr(tup, 1, desc, &isnull));
-				char	   *method = TextDatumGetCString(heap_getattr(tup, 2, desc, &isnull));
+				Datum		mdat = heap_getattr(tup, 2, desc, &isnull);
+				bool		m_null = isnull;
+				char	   *method;
 				Datum		coldatum = heap_getattr(tup, 3, desc, &isnull);
 				bool		col_null = isnull;
 				Datum		ciddatum = heap_getattr(tup, 4, desc, &isnull);
@@ -583,11 +642,25 @@ catalog_load(void)
 				KsDistTable *dt;
 				bool		found;
 				AttrNumber	attno = InvalidAttrNumber;
-				bool		is_ref = (strcmp(method, "reference") == 0);
+				bool		is_ref;
+
+				/*
+				 * A table of a distributed schema (phase 11) is only counted here; its entry is made when a statement asks for the
+				 * table (kingres_shard_lookup_schema_table), so that a catalog of many schemas is not read whole by every backend
+				 * after every change of it (step 12).
+				 */
+				if (!m_null && VARSIZE_ANY_EXHDR(DatumGetPointer(mdat)) == 6 && memcmp(VARDATA_ANY(DatumGetPointer(mdat)), "schema", 6) == 0)
+				{
+					cat.nschema_tables++;
+					continue;
+				}
+				method = TextDatumGetCString(mdat);
+				is_ref = (strcmp(method, "reference") == 0);
 
 				/* A relation that vanished is cleaned up by the drop trigger. */
 				if (get_rel_name(relid) == NULL)
 					continue;
+
 				if (!is_ref)
 				{
 					if (col_null || cid_null)
@@ -603,17 +676,17 @@ catalog_load(void)
 				dt->colocation_id = is_ref ? 0 : DatumGetInt32(ciddatum);
 				dt->coloc = NULL;
 				dt->is_reference = is_ref;
+				dt->is_schema = false;
 				if (is_ref)
 					memset(&dt->dist_column, 0, sizeof(dt->dist_column));
 				else
 				{
 					namestrcpy(&dt->dist_column, NameStr(*DatumGetName(coldatum)));
-					foreach(lc, cat.colocations)
 					{
-						KsColocation *c = (KsColocation *) lfirst(lc);
+						ColocEntry *ce = hash_search(cohash, &dt->colocation_id, HASH_FIND, NULL);
 
-						if (c->colocation_id == dt->colocation_id)
-							dt->coloc = c;
+						if (ce != NULL)
+							dt->coloc = ce->coloc;
 					}
 				}
 				if (!is_ref && dt->coloc == NULL)
@@ -622,6 +695,50 @@ catalog_load(void)
 					cat.ndist_tables++;
 			}
 			catscan_end(&cs);
+
+			/*
+			 * The distributed schemas and the sharding mode (phase 11, version 0.8).  The two tables are not
+			 * in the list that decides whether the extension is installed: a database that still has the
+			 * 0.7 objects (the library was replaced before ALTER EXTENSION UPDATE) works as it did, with no
+			 * distributed schema and the mode "row".
+			 */
+			{
+				Oid			ds_rel = OidIsValid(nsp) ? get_relname_relid("dist_schema", nsp) : InvalidOid;
+				Oid			ss_rel = OidIsValid(nsp) ? get_relname_relid("sharding_settings", nsp) : InvalidOid;
+
+				cat.sharding_mode = KS_MODE_ROW;
+				if (OidIsValid(ss_rel))
+				{
+					catscan_begin(&cs, ss_rel);
+					while ((tup = catscan_next(&cs)) != NULL)
+					{
+						TupleDesc	desc = RelationGetDescr(cs.rel);
+						bool		isnull;
+						char	   *mode = TextDatumGetCString(heap_getattr(tup, 1, desc, &isnull));
+
+						cat.sharding_mode = strcmp(mode, "schema") == 0 ? KS_MODE_SCHEMA :
+							strcmp(mode, "both") == 0 ? KS_MODE_BOTH : KS_MODE_ROW;
+						cat.distribute_new_schemas = DatumGetBool(heap_getattr(tup, 2, desc, &isnull));
+					}
+					catscan_end(&cs);
+				}
+				if (OidIsValid(ds_rel))
+				{
+					HASHCTL		dctl;
+
+					memset(&dctl, 0, sizeof(dctl));
+					dctl.keysize = sizeof(Oid);
+					dctl.entrysize = sizeof(KsDistSchema);
+					dctl.hcxt = newcxt;
+					cat.dist_schemas = hash_create("kingres_shard dist schemas", 64, &dctl,
+												   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+					/* only counted: the entries are made when a statement asks for the schema (step 12) */
+					catscan_begin(&cs, ds_rel);
+					while ((tup = catscan_next(&cs)) != NULL)
+						cat.ndist_schemas++;
+					catscan_end(&cs);
+				}
+			}
 		}
 		MemoryContextSwitchTo(oldcxt);
 	}
@@ -636,6 +753,7 @@ catalog_load(void)
 	ks.loading = false;
 	ks.cxt = newcxt;
 	ks.cat = cat;
+	ks.cohash = cohash;
 	memcpy(ks.relids, relids, sizeof(relids));
 	if (prevcxt != NULL)
 		catalog_retire(prevcxt);
@@ -655,6 +773,11 @@ catalog_load(void)
  * colocation group), which count the map version up too.  The sum of a mixed
  * value per bucket, so that the order of the rows does not matter: the node that
  * asks reads the heap in any order.
+ *
+ * Since 0.8 the number also holds the placement epoch of the group, a counter that only the
+ * switch of a move or of a split raises, in the transaction that changes the partitions.  A
+ * bucket that moves away and comes back inside the window of a statement restores the sum of
+ * the bucket terms, but never the epoch (review finding S4-01).
  */
 static uint64
 placement_mix(int bucket, int group)
@@ -665,6 +788,13 @@ placement_mix(int bucket, int group)
 	x = (x ^ (x >> 30)) * UINT64CONST(0xBF58476D1CE4E5B9);
 	x = (x ^ (x >> 27)) * UINT64CONST(0x94D049BB133111EB);
 	return x ^ (x >> 31);
+}
+
+/* The term of the placement epoch of a group in the placement hash. */
+static uint64
+epoch_term(int64 epoch)
+{
+	return placement_mix((int) (epoch & 0x7fffffff), (int) ((uint64) epoch >> 31)) ^ UINT64CONST(0x5bd1e9955bd1e995);
 }
 
 /*
@@ -796,6 +926,7 @@ kingres_shard_placement_hash(const KsColocation *coloc)
 
 	if (coloc == NULL)
 		return 0;
+	h = epoch_term(coloc->placement_epoch);
 	gp = palloc(sizeof(GroupPrimary) * Max(list_length(cat->nodes), 1));
 	foreach(lc, cat->nodes)
 	{
@@ -818,6 +949,54 @@ kingres_shard_placement_hash(const KsColocation *coloc)
 	}
 	pfree(gp);
 	return (int64) h;
+}
+
+/*
+ * The placement epoch of a colocation group from the catalog table, with the latest committed
+ * snapshot; 0 for a group that is not there or a catalog of a version without the column.
+ */
+static int64
+placement_epoch_now(int colocation_id)
+{
+	Oid			relid = kingres_shard_catalog_relid("colocation");
+	Relation	rel;
+	Snapshot	snap;
+	Oid			pkey;
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	int64		epoch = 0;
+
+	if (!OidIsValid(relid))
+		return 0;
+	rel = table_open(relid, AccessShareLock);
+	if (RelationGetDescr(rel)->natts < 6)
+	{
+		table_close(rel, AccessShareLock);
+		return 0;
+	}
+	snap = RegisterSnapshot(IsInParallelMode() ? GetActiveSnapshot() : GetLatestSnapshot());
+	pkey = get_relname_relid("colocation_pkey", RelationGetNamespace(rel));
+	ScanKeyInit(&key, 1, BTEqualStrategyNumber, F_INT4EQ, Int32GetDatum(colocation_id));
+	scan = systable_beginscan(rel, pkey, OidIsValid(pkey), snap, 1, &key);
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		bool		isnull;
+		bool		a;
+		Datum		d;
+
+		a = DatumGetInt32(heap_getattr(tup, 1, RelationGetDescr(rel), &isnull)) == colocation_id;
+		if (!a)
+			continue;
+		d = heap_getattr(tup, 6, RelationGetDescr(rel), &isnull);
+		if (!isnull)
+			epoch = DatumGetInt64(d);
+		break;
+	}
+	systable_endscan(scan);
+	UnregisterSnapshot(snap);
+	table_close(rel, AccessShareLock);
+	return epoch;
 }
 
 /*
@@ -900,7 +1079,7 @@ kingres_shard_placement_hash_now(int colocation_id)
 	}
 	if (gp != NULL)
 		pfree(gp);
-	return (int64) h;
+	return (int64) (h + epoch_term(placement_epoch_now(colocation_id)));
 }
 
 /*
@@ -921,6 +1100,195 @@ kingres_shard_lookup_dist_table(Oid relid)
 }
 
 /*
+ * kingres_shard_lookup_schema_table
+ *
+ * The cached entry of a table of a distributed schema, or NULL.  The entry is not in
+ * dist_tables, so code that works on hash-distributed tables never sees it.
+ */
+/*
+ * The entries of schema_tables and dist_schemas are made when they are asked for: one index scan of the catalog table for the
+ * relation (or the schema), the answer cached until the next reload, "no" included.  A statement pays for the tables it names, not
+ * for the number of schemas of the database (step 12).  The scans use the snapshot of the loader, so they see what this
+ * transaction changed.
+ */
+static HeapTuple
+lazy_fetch(Oid heapoid, Oid key, SysScanDesc *sd, Relation *rel, Snapshot *snap)
+{
+	ScanKeyData skey;
+	Oid			pkoid;
+
+	stat_lazy_lookups++;
+	*rel = table_open(heapoid, AccessShareLock);
+	/*
+	 * The index is the one that the open relation has now, not an OID kept from the load: REINDEX CONCURRENTLY replaces it without a write to the
+	 * catalog table, and an index that is missing must be an error, not "this is a local table" (P12R-03).
+	 */
+	pkoid = RelationGetPrimaryKeyIndex(*rel, true);
+	if (!OidIsValid(pkoid))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("the table \"%s\" of the extension has no primary key", RelationGetRelationName(*rel)),
+				 errhint("Restore the primary key of the table (kingres_shard 0.8 creates it).")));
+	*snap = RegisterSnapshot(IsInParallelMode() ? GetActiveSnapshot() : GetLatestSnapshot());
+	ScanKeyInit(&skey, 1, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(key));
+	*sd = systable_beginscan(*rel, pkoid, true, *snap, 1, &skey);
+	return systable_getnext(*sd);
+}
+
+static void
+lazy_done(SysScanDesc sd, Relation rel, Snapshot snap)
+{
+	systable_endscan(sd);
+	UnregisterSnapshot(snap);
+	table_close(rel, AccessShareLock);
+}
+
+static const KsDistTable *
+lazy_schema_table(Oid relid)
+{
+	KsDistTable *st;
+	bool		found;
+	SysScanDesc sd;
+	Relation	rel;
+	Snapshot	snap;
+	HeapTuple	tup;
+	bool		is_schema = false;
+	int			cid = 0;
+
+	if (!OidIsValid(ks.relids[2]))
+		return NULL;
+	tup = lazy_fetch(ks.relids[2], relid, &sd, &rel, &snap);
+	if (tup != NULL)
+	{
+		TupleDesc	desc = RelationGetDescr(rel);
+		bool		isnull;
+		Datum		mdat = heap_getattr(tup, 2, desc, &isnull);
+		Datum		cdat = heap_getattr(tup, 4, desc, &isnull);
+
+		if (VARSIZE_ANY_EXHDR(DatumGetPointer(mdat)) == 6 && memcmp(VARDATA_ANY(DatumGetPointer(mdat)), "schema", 6) == 0 && !isnull)
+		{
+			is_schema = true;
+			cid = DatumGetInt32(cdat);
+		}
+	}
+	lazy_done(sd, rel, snap);
+	st = hash_search(ks.cat.schema_tables, &relid, HASH_ENTER, &found);
+	memset(st, 0, sizeof(*st));
+	st->relid = relid;
+	st->dist_attno = InvalidAttrNumber;
+	st->colocation_id = cid;
+	st->is_schema = true;
+	if (is_schema)
+	{
+		ColocEntry *ce = hash_search(ks.cohash, &cid, HASH_FIND, NULL);
+
+		st->coloc = ce != NULL ? ce->coloc : NULL;
+	}
+	st->negative = (st->coloc == NULL);
+	return st->negative ? NULL : st;
+}
+
+const KsDistTable *
+kingres_shard_lookup_schema_table(const KsCatalog *cat, Oid relid)
+{
+	KsDistTable *st;
+
+	if (!cat->present || cat->nschema_tables == 0 || cat->schema_tables == NULL)
+		return NULL;
+	st = hash_search(cat->schema_tables, &relid, HASH_FIND, NULL);
+	if (st != NULL)
+		return st->negative ? NULL : st;
+	if (cat != &ks.cat || ks.loading)
+		return NULL;
+	return lazy_schema_table(relid);
+}
+
+/*
+ * The distributed schema with this namespace OID (a node-local OID), or NULL.
+ */
+const KsDistSchema *
+kingres_shard_lookup_dist_schema(const KsCatalog *cat, Oid nsp)
+{
+	KsDistSchema *s;
+	bool		found;
+	SysScanDesc sd;
+	Relation	rel;
+	Snapshot	snap;
+	HeapTuple	tup;
+	int			cid = 0;
+	bool		ship = false;
+	bool		have = false;
+
+	if (!cat->present || cat->ndist_schemas == 0 || cat->dist_schemas == NULL)
+		return NULL;
+	s = hash_search(cat->dist_schemas, &nsp, HASH_FIND, NULL);
+	if (s != NULL)
+		return s->negative ? NULL : s;
+	if (cat != &ks.cat || ks.loading)
+		return NULL;
+	{
+		Oid			ds_rel = kingres_shard_catalog_relid("dist_schema");
+
+		if (!OidIsValid(ds_rel))
+			return NULL;
+		tup = lazy_fetch(ds_rel, nsp, &sd, &rel, &snap);
+		if (tup != NULL)
+		{
+			TupleDesc	desc = RelationGetDescr(rel);
+			bool		isnull;
+
+			cid = DatumGetInt32(heap_getattr(tup, 2, desc, &isnull));
+			ship = DatumGetBool(heap_getattr(tup, 4, desc, &isnull));
+			have = true;
+		}
+		lazy_done(sd, rel, snap);
+	}
+	s = hash_search(cat->dist_schemas, &nsp, HASH_ENTER, &found);
+	memset(s, 0, sizeof(*s));
+	s->nsp = nsp;
+	if (have)
+	{
+		ColocEntry *ce = hash_search(ks.cohash, &cid, HASH_FIND, NULL);
+
+		s->colocation_id = cid;
+		s->ship_functions = ship;
+		s->coloc = ce != NULL ? ce->coloc : NULL;
+	}
+	s->negative = (s->coloc == NULL);
+	return s->negative ? NULL : s;
+}
+
+/*
+ * The shard group that holds the rows of a schema table: the group of its one bucket
+ * (-1 when the bucket is not mapped).
+ */
+int
+kingres_shard_schema_table_owner(const KsDistTable *st)
+{
+	return kingres_shard_bucket_group(st->coloc, kingres_shard_coloc_bucket(st->coloc, 0));
+}
+
+/*
+ * The table the distributed scan reads: a distributed table (not a reference table) or a table of a
+ * distributed schema, or NULL.
+ */
+const KsDistTable *
+kingres_shard_lookup_scan_table(const KsCatalog *cat, Oid relid)
+{
+	const KsDistTable *dt;
+
+	if (!cat->present)
+		return NULL;
+	if (cat->dist_tables != NULL && cat->ndist_tables > 0)
+	{
+		dt = hash_search(cat->dist_tables, &relid, HASH_FIND, NULL);
+		if (dt != NULL)
+			return dt->is_reference ? NULL : dt;
+	}
+	return kingres_shard_lookup_schema_table(cat, relid);
+}
+
+/*
  * kingres_shard_lookup_colocation
  *
  * The cached colocation group with the given id, or NULL.
@@ -929,92 +1297,171 @@ const KsColocation *
 kingres_shard_lookup_colocation(int colocation_id)
 {
 	const KsCatalog *cat = kingres_shard_catalog();
-	ListCell   *lc;
+	ColocEntry *ce;
 
-	foreach(lc, cat->colocations)
-	{
-		KsColocation *c = (KsColocation *) lfirst(lc);
-
-		if (c->colocation_id == colocation_id)
-			return c;
-	}
-	return NULL;
+	if (!cat->present || ks.cohash == NULL)
+		return NULL;
+	ce = hash_search(ks.cohash, &colocation_id, HASH_FIND, NULL);
+	return ce != NULL ? ce->coloc : NULL;
 }
 
 /*
- * The buckets of a colocation group (catalog.h).  Today the buckets of a group
- * are numbered 0 .. bucket_count - 1; these three functions are the only
- * place besides the loading code that knows it.
+ * The buckets of a colocation group (catalog.h).  The layout is kept in the arrays of
+ * KsColocation; these functions and the three that make a layout are the only code that
+ * reads or writes them.
  */
 int
 kingres_shard_coloc_nbuckets(const KsColocation *coloc)
 {
-	return coloc->bucket_count;
+	return coloc->nbucket;
 }
 
 int
 kingres_shard_coloc_bucket(const KsColocation *coloc, int i)
 {
-	Assert(i >= 0 && i < coloc->bucket_count);
-	return i;
+	Assert(i >= 0 && i < coloc->nbucket);
+	return coloc->bucket_list[i];
 }
 
 /*
  * The modulus of the hash partition that is a bucket: FOR VALUES WITH (MODULUS m,
- * REMAINDER bucket).  Every bucket of a group has the modulus bucket_count today;
- * when a bucket can be split (design/shard-phase10.md) each bucket has its own,
- * and the code that creates or attaches a bucket partition asks here.
+ * REMAINDER bucket).  Every bucket of a group that was never split has the modulus
+ * bucket_count; a bucket that was split has children of a larger modulus
+ * (design/shard-phase10.md).  The code that creates or attaches a bucket partition asks here.
  */
 int
 kingres_shard_bucket_modulus(const KsColocation *coloc, int bucket)
 {
-	Assert(bucket >= 0 && bucket < coloc->bucket_count);
-	(void) bucket;
-	return coloc->bucket_count;
+	Assert(bucket >= 0 && bucket < coloc->max_modulus && coloc->bucket_mod[bucket] > 0);
+	return coloc->bucket_mod[bucket];
 }
 
 /*
- * A copy of a colocation group's bucket layout that stays valid when the catalog
- * cache is reloaded (the batch sender keeps one for the whole of a statement,
- * which plans other statements while it runs).  Made in the current memory context.
+ * A copy of a colocation group's bucket layout that stays valid when the catalog cache is
+ * reloaded (the batch sender keeps one for the whole of a statement, which plans other
+ * statements while it runs).  Made in the current memory context.
  */
 KsColocation *
 kingres_shard_coloc_copy(const KsColocation *coloc)
 {
 	KsColocation *c = palloc(sizeof(KsColocation));
+	Size		n = sizeof(int) * Max(coloc->max_modulus, 1);
 
 	*c = *coloc;
-	c->bucket_group = palloc(sizeof(int) * Max(coloc->bucket_count, 1));
-	memcpy(c->bucket_group, coloc->bucket_group, sizeof(int) * coloc->bucket_count);
+	c->bucket_list = palloc(sizeof(int) * Max(coloc->nbucket, 1));
+	memcpy(c->bucket_list, coloc->bucket_list, sizeof(int) * coloc->nbucket);
+	c->bucket_group = palloc(n);
+	memcpy(c->bucket_group, coloc->bucket_group, n);
+	c->bucket_mod = palloc(n);
+	memcpy(c->bucket_mod, coloc->bucket_mod, n);
+	c->slot_bucket = palloc(n);
+	memcpy(c->slot_bucket, coloc->slot_bucket, n);
 	return c;
 }
 
 int
 kingres_shard_bucket_group(const KsColocation *coloc, int bucket)
 {
-	if (bucket < 0 || bucket >= coloc->bucket_count)
+	if (bucket < 0 || bucket >= coloc->max_modulus)
 		return -1;
 	return coloc->bucket_group[bucket];
 }
 
 /*
- * A colocation group's layout made by the caller from the catalog tables as its own
- * transaction sees them (a group made in this transaction is not in the cache yet):
- * groups[b], for b = 0 .. nbuckets - 1, is the group that owns bucket b, or -1.  Made
- * in the current memory context.
+ * Making a layout: kingres_shard_coloc_begin() allocates it with no bucket, kingres_shard_coloc_add()
+ * records one row of bucket_map, kingres_shard_coloc_finish() lists the buckets.  A row that cannot
+ * belong (modulus that is not a divisor of max_modulus, remainder not below the modulus, a number
+ * twice, slots that another bucket covers) is dropped: the layout then has a gap, which the routing
+ * code treats as "no owner" and check_cluster() names.
+ */
+KsColocation *
+kingres_shard_coloc_begin(int colocation_id, int bucket_count, int max_modulus,
+						  int64 placement_epoch, Oid dist_type, Oid collation)
+{
+	KsColocation *c = palloc0(sizeof(KsColocation));
+	int			i;
+
+	if (max_modulus < 1)
+		max_modulus = Max(bucket_count, 1);
+	c->colocation_id = colocation_id;
+	c->bucket_count = bucket_count;
+	c->placement_epoch = placement_epoch;
+	c->dist_type = dist_type;
+	c->collation = collation;
+	c->max_modulus = max_modulus;
+	c->bucket_group = palloc(sizeof(int) * max_modulus);
+	c->bucket_mod = palloc0(sizeof(int) * max_modulus);
+	c->slot_bucket = palloc(sizeof(int) * max_modulus);
+	for (i = 0; i < max_modulus; i++)
+	{
+		c->bucket_group[i] = -1;
+		c->slot_bucket[i] = -1;
+	}
+	return c;
+}
+
+void
+kingres_shard_coloc_add(KsColocation *c, int bucket, int modulus, int group)
+{
+	int			s;
+
+	if (modulus < 1 || bucket < 0 || bucket >= modulus || c->max_modulus % modulus != 0 ||
+		c->bucket_mod[bucket] != 0)
+		return;
+	for (s = bucket; s < c->max_modulus; s += modulus)
+		if (c->slot_bucket[s] >= 0)
+			return;
+	for (s = bucket; s < c->max_modulus; s += modulus)
+		c->slot_bucket[s] = bucket;
+	c->bucket_mod[bucket] = modulus;
+	c->bucket_group[bucket] = group;
+}
+
+void
+kingres_shard_coloc_finish(KsColocation *c)
+{
+	int			b;
+	int			n = 0;
+
+	for (b = 0; b < c->max_modulus; b++)
+		if (c->bucket_mod[b] > 0)
+			n++;
+	/*
+	 * A group with no row in bucket_map at all (a catalog that is being made, or a broken one) has
+	 * the buckets of a group that was never split, none of them mapped: the routing then says "no
+	 * owner" instead of failing to find a bucket, as it always did.
+	 */
+	if (n == 0 && c->max_modulus == c->bucket_count)
+	{
+		for (b = 0; b < c->max_modulus; b++)
+		{
+			c->slot_bucket[b] = b;
+			c->bucket_mod[b] = c->bucket_count;
+		}
+		n = c->max_modulus;
+	}
+	c->nbucket = n;
+	c->bucket_list = palloc(sizeof(int) * Max(n, 1));
+	n = 0;
+	for (b = 0; b < c->max_modulus; b++)
+		if (c->bucket_mod[b] > 0)
+			c->bucket_list[n++] = b;
+}
+
+/*
+ * The layout of the buckets 0 .. nbuckets - 1, all of modulus nbuckets (a group that was never
+ * split), made by the caller: groups[b] is the group that owns bucket b, or -1.
  */
 KsColocation *
 kingres_shard_coloc_make(int colocation_id, int nbuckets, Oid dist_type, Oid collation,
 						 const int *groups)
 {
-	KsColocation *c = palloc0(sizeof(KsColocation));
+	KsColocation *c = kingres_shard_coloc_begin(colocation_id, nbuckets, nbuckets, 0, dist_type, collation);
+	int			b;
 
-	c->colocation_id = colocation_id;
-	c->bucket_count = nbuckets;
-	c->dist_type = dist_type;
-	c->collation = collation;
-	c->bucket_group = palloc(sizeof(int) * Max(nbuckets, 1));
-	memcpy(c->bucket_group, groups, sizeof(int) * nbuckets);
+	for (b = 0; b < nbuckets; b++)
+		kingres_shard_coloc_add(c, b, nbuckets, groups[b]);
+	kingres_shard_coloc_finish(c);
 	return c;
 }
 
@@ -1060,6 +1507,97 @@ kingres_shard_node_by_id(int node_id)
 	return NULL;
 }
 
+bool		kingres_shard_catalog_incremental = true;
+
+/*
+ * The rows of a catalog table that this transaction wrote: the first column that is wanted of each, as an int (the colocation id)
+ * or as an OID (the relation).  Returns the number of rows found.
+ */
+static Bitmapset *
+written_ids(Oid relid, int attno, bool as_oid, List **oids)
+{
+	CatScan		cs;
+	HeapTuple	tup;
+	Bitmapset  *ids = NULL;
+
+	catscan_begin(&cs, relid);
+	while ((tup = catscan_next(&cs)) != NULL)
+	{
+		bool		isnull;
+		Datum		d;
+
+		if (!TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetRawXmin(tup->t_data)))
+			continue;
+		d = heap_getattr(tup, attno, RelationGetDescr(cs.rel), &isnull);
+		if (isnull)
+			continue;
+		if (as_oid)
+			*oids = lappend_oid(*oids, DatumGetObjectId(d));
+		else if (DatumGetInt32(d) >= 0)
+			ids = bms_add_member(ids, DatumGetInt32(d));
+	}
+	catscan_end(&cs);
+	return ids;
+}
+
+/*
+ * Invalidate the relcache entries that the statement of this trigger can change; false when the statement is one that touches
+ * every distributed table (the caller then does that).
+ */
+static bool
+bump_invalidate_changed(FunctionCallInfo fcinfo)
+{
+	TriggerData *td = (TriggerData *) fcinfo->context;
+	const char *rel = RelationGetRelationName(td->tg_relation);
+	Oid			relid;
+	Bitmapset  *cids = NULL;
+	List	   *oids = NIL;
+	ListCell   *lc;
+	Oid			dtrel;
+
+	if (TRIGGER_FIRED_BY_TRUNCATE(td->tg_event) ||
+		RelationGetNamespace(td->tg_relation) != get_namespace_oid(KINGRES_SHARD_SCHEMA, true))
+		return false;
+	relid = RelationGetRelid(td->tg_relation);
+	dtrel = kingres_shard_catalog_relid("dist_table");
+	if (!OidIsValid(dtrel))
+		return false;
+	if (strcmp(rel, "dist_table") == 0)
+		(void) written_ids(relid, 1, true, &oids);
+	else if (strcmp(rel, "colocation") == 0 || strcmp(rel, "bucket_map") == 0)
+		cids = written_ids(relid, 1, false, NULL);
+	else if (strcmp(rel, "dist_schema") == 0)
+		cids = written_ids(relid, 2, false, NULL);
+	else
+		return false;
+
+	foreach(lc, oids)
+	{
+		stat_invalidations++;
+		CacheInvalidateRelcacheByRelid(lfirst_oid(lc));
+	}
+	if (!bms_is_empty(cids))
+	{
+		CatScan		cs;
+		HeapTuple	tup;
+
+		catscan_begin(&cs, dtrel);
+		while ((tup = catscan_next(&cs)) != NULL)
+		{
+			bool		isnull;
+			Datum		d = heap_getattr(tup, 4, RelationGetDescr(cs.rel), &isnull);
+
+			if (!isnull && DatumGetInt32(d) >= 0 && bms_is_member(DatumGetInt32(d), cids))
+			{
+				stat_invalidations++;
+				CacheInvalidateRelcacheByRelid(DatumGetObjectId(heap_getattr(tup, 1, RelationGetDescr(cs.rel), &isnull)));
+			}
+		}
+		catscan_end(&cs);
+	}
+	return true;
+}
+
 /*
  * kingres_map_version_bump
  *
@@ -1093,24 +1631,60 @@ kingres_map_version_bump(PG_FUNCTION_ARGS)
 	if (OidIsValid(mvrelid))
 		CacheInvalidateRelcacheByRelid(mvrelid);
 
-	ret = SPI_execute("SELECT d.relid::pg_catalog.oid FROM " KINGRES_SHARD_SCHEMA ".dist_table d "
-					  "JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) d.relid::pg_catalog.oid",
-					  true, 0);
-	if (ret != SPI_OK_SELECT)
-		elog(ERROR, "could not list distributed tables");
-	for (i = 0; i < SPI_processed; i++)
+	/*
+	 * The relcache entries of the distributed tables that the change can touch (step 12).  The statements that change one table
+	 * or one group (a DDL of a schema, a move) name the rows they wrote: a row that this transaction wrote has this transaction as
+	 * the inserting transaction, so one pass of the catalog table finds them without a query and without a message for every
+	 * table of the database.  Everything else (a node, the settings, a truncate, or the setting turned off) invalidates every
+	 * distributed table, as before.
+	 */
+	if (kingres_shard_catalog_incremental && bump_invalidate_changed(fcinfo))
 	{
-		bool		isnull;
-		Datum		d = SPI_getbinval(SPI_tuptable->vals[i],
-									  SPI_tuptable->tupdesc, 1, &isnull);
+		/* done */
+	}
+	else
+	{
+		ret = SPI_execute("SELECT d.relid::pg_catalog.oid FROM " KINGRES_SHARD_SCHEMA ".dist_table d "
+						  "JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) d.relid::pg_catalog.oid",
+						  true, 0);
+		if (ret != SPI_OK_SELECT)
+			elog(ERROR, "could not list distributed tables");
+		for (i = 0; i < SPI_processed; i++)
+		{
+			bool		isnull;
+			Datum		d = SPI_getbinval(SPI_tuptable->vals[i],
+										  SPI_tuptable->tupdesc, 1, &isnull);
 
-		if (!isnull)
-			CacheInvalidateRelcacheByRelid(DatumGetObjectId(d));
+			if (!isnull)
+			{
+				stat_invalidations++;
+				CacheInvalidateRelcacheByRelid(DatumGetObjectId(d));
+			}
+		}
 	}
 
 	SPI_finish();
 	ks.valid = false;
 	return PointerGetDatum(NULL);
+}
+
+/*
+ * kingres.internal_catalog_stats(): how often this backend loaded the cache, asked the catalog for one schema table or schema, and sent a
+ * relcache invalidation for a distributed table from the trigger of a catalog change.
+ */
+Datum
+kingres_internal_catalog_stats(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Datum		values[3];
+	bool		nulls[3] = {false, false, false};
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	values[0] = Int64GetDatum(catalog_generation);
+	values[1] = Int64GetDatum(stat_lazy_lookups);
+	values[2] = Int64GetDatum(stat_invalidations);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
 
 /*

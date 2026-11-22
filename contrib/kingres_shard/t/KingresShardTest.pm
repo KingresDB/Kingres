@@ -84,6 +84,10 @@ sub make_node
 	# that a path is NOT taken (a plan assertion that a statement is not shipped as a partial aggregation) is written for the
 	# defaults and says so (it skips under the profile); the answers are compared in both profiles.
 	$conf .= "kingres_shard.enable_partial_aggregation = on\nkingres_shard.enable_pushdown_join = on\n" if $ENV{KS_ALL_PATHS};
+	# The third profile (step 12): KS_CATALOG_FULL=1 turns the incremental cache of the catalog off, so that the fallback (every change of the
+	# catalog invalidates every distributed table) stays tested by the whole suite.
+	$conf .= "kingres_shard.catalog_incremental = off
+" if $ENV{KS_CATALOG_FULL};
 	# tcp: the node also listens on 127.0.0.1 and trusts connections from there, so that
 	# a cluster can be registered by an address that libpq connects to by TCP (SSL
 	# options only apply to TCP connections).

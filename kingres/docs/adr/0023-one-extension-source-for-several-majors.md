@@ -13,6 +13,8 @@ A port per major means two diverging copies of the extensions as soon as two maj
 
 At the time of this decision upstream has `REL_19_RC2`; the general release of PostgreSQL 19 is scheduled for 2026-11-19. Nothing of KingresDB has been built against 19 yet.
 
+Note of 2026-11-22: PostgreSQL 19.0 came out on 2026-11-16, and `kingres-19` is on `REL_19_0` since 2026-11-22 (see ../dev/releases.md). The decision is unchanged.
+
 ## Decision
 
 1. **One source.** Each extension (`kingres_shard`, `kingres_ledger`, and those of later phases) has one source tree that compiles, without warnings, against every supported PostgreSQL major. The supported majors are 18 and 19. The files under `contrib/kingres_*` and `kingres/` are identical on every product branch.

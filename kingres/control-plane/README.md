@@ -364,8 +364,11 @@ the value it changes). The consistency label is `single-snapshot` for a local or
 of another role needs `acknowledgeOtherRolesCode`.
 
 **Import.** All or nothing, in one step (*Load rows*): `BEGIN`, `COPY ... FROM STDIN`, the count of the server compared with the records the scanner counted, an
-insert into `kingres_transfer.import_marker` (a row keyed by the task id, written through a security definer function, so the role needs no grant and can still be
-dropped), the commit intent written in the detail of the task under the lease, `COMMIT`. No transaction lives between steps. The marker commits with the rows or not at
+insert into `kingres_transfer.import_marker` (a row keyed by a random 128-bit nonce that the task carries, written through the security definer function
+`kingres_transfer.mark(nonce, task, rows, tag)`, which inserts only when `tag` is SHA-256 of a per-database secret and of `nonce:task:rows`; only the control plane can compute it, so no
+role can forge, pre-empt or hold a marker, and the role needs no grant and can still be dropped; the secret and the table are readable by the service role only; markers older than
+30 days are deleted; the schema, tables and function are created and checked by the service role on every use and the import fails closed when the schema exists with another
+owner or holds a trigger, rule, policy, other column or other function, so a database owner cannot plant `kingres_transfer`; an operator removes a planted schema), the commit intent written in the detail of the task under the lease, `COMMIT`. No transaction lives between steps. The marker commits with the rows or not at
 all, so after any interruption the answer to "did it commit" is read from the database: a run that finds the intent asks the marker; a row `committed` finishes the task
 (*Confirm the commit* records the count and the audit event); otherwise the run inserts a tombstone `aborted` for the task (it waits up to 60 seconds for a transaction
 that holds the key) after which no transaction of that task can commit, and fails `copy_interrupted` (retryable) with the proof that nothing was stored. `nothing was
@@ -373,7 +376,9 @@ stored` is never said without that proof. When the question cannot be asked (the
 change of leader) the task fails `import_outcome_unknown` and is never retried. A cancel is accepted until the intent is written. The role is refused at the request
 and in the step when it has SUPERUSER, REPLICATION or BYPASSRLS or reaches server files, programs or logs (an import runs the triggers and defaults of the table as that
 role). The setting `dataTransfer.enabled` is read again by the first step of a task: turning it off ends a task that has not begun to move data; a task that is moving
-data is cancelled with `cancelTask`. The marker table is local to the database of the server that loaded (design: a reference table for the batch import of 14c). A reference table is loaded through a temporary table and
+data is cancelled with `cancelTask`. A transient error of the role check is retryable (`transfer_session_lost`), not a refusal. `done` means the local commit happened; a group whose `COMMIT PREPARED` is still pending
+may show its rows a moment later. A file exported with the spreadsheet guard and a header has an apostrophe in front of a header cell that starts like a formula; import it with `header: skip`
+(`match` compares the names). The marker table is local to the database of the server that loaded (design: a reference table for the batch import of 14c). A reference table is loaded through a temporary table and
 inserts from typed arrays (`unnest($1::int[], ...)`), cap 256 MiB, and refuses array columns. The scanner refuses an unquoted `\.` line (`import_end_marker`;
 on PostgreSQL 18 and 19 it is data in CSV, the refusal is the conservative choice) and a record above 16 MiB; a gzip stream is counted against the limit. **Identity
 columns of a distributed table draw from the sequence of the node the statement runs on** (design F18): rows loaded without the column from different servers can

@@ -59,6 +59,7 @@
 #include "shippable.h"
 #include "remote_scan.h"
 #include "row_router.h"
+#include "schema_ddl.h"
 #include "utility.h"
 
 PG_MODULE_MAGIC_EXT(
@@ -90,6 +91,7 @@ int			kingres_shard_insert_batch_rows = 1000;
 int			kingres_shard_insert_batch_bytes = 1048576;
 int			kingres_shard_move_catchup_threshold = 1024;	/* kB */
 int			kingres_shard_move_switch_timeout = 10000;	/* ms */
+int			kingres_shard_min_bucket_cost = 1024;	/* kB */
 int			kingres_shard_move_switch_attempts = 20;
 int			kingres_shard_move_cleanup_delay = 600;	/* s */
 int			kingres_shard_rebuild_batch_rows = 10000;
@@ -362,6 +364,15 @@ _PG_init(void)
 							PGC_USERSET, GUC_UNIT_KB,
 							NULL, NULL, NULL);
 
+	/* What a bucket costs at least in a plan by disk size (design/shard-phase10.md, section 4.2); read by kingres.plan_rebalance(). */
+	DefineCustomIntVariable("kingres_shard.min_bucket_cost",
+							"The smallest cost of a bucket in a rebalance plan by disk size.",
+							"An empty bucket is not free: it counts for at least this much, so that empty buckets do not pile up on one group.",
+							&kingres_shard_min_bucket_cost,
+							1024, 0, MAX_KILOBYTES,
+							PGC_USERSET, GUC_UNIT_KB,
+							NULL, NULL, NULL);
+
 	DefineCustomIntVariable("kingres_shard.move_switch_timeout",
 							"Longest time the tables of a moving bucket are locked by one switch attempt.",
 							"After it the switch is abandoned, the locks are released and the move returns to catching up.",
@@ -507,6 +518,7 @@ _PG_init(void)
 	kingres_shard_utility_init();
 	kingres_shard_remote_scan_init();
 	kingres_shard_row_router_init();
+	kingres_shard_schema_ddl_init();
 }
 
 /*

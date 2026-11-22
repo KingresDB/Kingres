@@ -55,6 +55,7 @@ func (s *Service) ServiceConnAt(ctx context.Context, id, port int, db string) (*
 	}
 	cfg.ConnectTimeout = 5 * time.Second
 	cfg.RuntimeParams["application_name"] = "kingresd"
+	safeServiceSession(cfg)
 	return pgx.ConnectConfig(ctx, cfg)
 }
 
@@ -84,6 +85,7 @@ func (s *Service) RemoteConn(ctx context.Context, host string, port int, db stri
 	cfg.TLSConfig, cfg.Password, cfg.Fallbacks = tc, "", nil
 	cfg.ConnectTimeout = 5 * time.Second
 	cfg.RuntimeParams["application_name"] = "kingresd"
+	safeServiceSession(cfg)
 	return pgx.ConnectConfig(ctx, cfg)
 }
 

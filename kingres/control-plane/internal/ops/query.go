@@ -370,10 +370,19 @@ SELECT (SELECT rolsuper OR rolreplication OR rolbypassrls FROM me)
 // and whose members the workbench refuses.
 var DangerousPredefinedRoles = []string{"pg_execute_server_program", "pg_read_server_files", "pg_write_server_files", "pg_read_server_logs"}
 
-func refuseDangerousRole(ctx context.Context, conn *pgx.Conn) error {
+// dangerousRole answers whether the role is one that the workbench and the imports refuse; an error means that the question could not be asked.
+func dangerousRole(ctx context.Context, conn *pgx.Conn) (bool, error) {
 	var bad bool
 	if err := conn.QueryRow(ctx, dangerousRolesSQL, DangerousPredefinedRoles, nil).Scan(&bad); err != nil {
-		return PGProblem(err)
+		return false, PGProblem(err)
+	}
+	return bad, nil
+}
+
+func refuseDangerousRole(ctx context.Context, conn *pgx.Conn) error {
+	bad, err := dangerousRole(ctx, conn)
+	if err != nil {
+		return err
 	}
 	if bad {
 		return problem.New(problem.Forbidden, "The query workbench does not run as a role with the SUPERUSER, REPLICATION or BYPASSRLS attribute or with access to server files, programs or logs.")
