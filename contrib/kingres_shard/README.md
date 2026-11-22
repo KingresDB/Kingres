@@ -2102,7 +2102,7 @@ hold rows and the marker table, a subscription that copies into the existing tab
 bounded attempts), a marker proves the copy complete, the state of the sequences is read on the source and set on the target in the switch's transaction, and the owner
 and the placement epoch change in the two-phase transaction.  Nothing is attached or detached.  A writer that meets the switch gets `KS001` and repeats.  The old copy is emptied by
 the cleaning phase after `move_cleanup_delay` (`cleanup_moved_buckets(true)` at once).  A move that fails before the switch is undone (the shells of the target are emptied
-again), resume and cancel work as for a bucket.  A schema without a table is not moved by a copy.  A plan of buckets (`plan_rebalance`, `rebalance_plan`) does not move a schema
+again), resume and cancel work as for a bucket.  A schema without a table is not moved by a copy.  `rebalance_plan` (phase 4) does not move a schema; `plan_rebalance` of 0.8 plans schemas as items (see "The schemas in the rebalance, the drain and check_cluster")
 yet; the bucket of a schema counts in the load of its group.
 
 **Increment 6: a schema with data becomes distributed, `kingres.undistribute_schema(nsp)`, several schemas on one group.**  `kingres.distribute_schema(nsp, group_id)` also takes a schema that already
@@ -2190,6 +2190,23 @@ again.  The tables of a distributed schema are empty shells on the new node: add
 Measured with `t/245_schema_scale_cluster.pl` (three nodes, one machine; the full table is in the design notes): at 2000 schemas of 5 tables a DDL statement takes 52 ms on average (174 ms before step 12), the first statement of a new backend 9 to 15 ms (55 to 112 ms), the cache of a backend 0.7 MB (3.3 MB), a routed single-row INSERT 1.2 ms (5.8 ms), and `add_node` passes in 39 s in 500 batches (it failed for lack of locks); at 200 schemas the cost of a DDL statement is that of the two-phase commit (26 ms, as before).
 
 
+**The schemas in the rebalance, the drain and `check_cluster`** (design 9.9 and 9.10).
+- `kingres.plan_rebalance()` plans a distributed schema as an item `(colocation_id of the schema, 0)` like any bucket: it takes part in the simulation, in
+  `drain_only`, in `exclude_groups`, `colocation_ids` and `extra_load`, and the scheduler moves it with `move_bucket(colocation_id, 0, target)`, which is
+  `move_schema`.  The cost is 1 under `by_bucket_count` and the bytes of the schema's tables on its owner under `by_disk_size` (at least `min_bucket_cost`).  A schema
+  that a ledger table pins is not an item: it counts in the load of its group as fixed load and stays (the owners are asked for the pins when the caller is a
+  superuser; for any other caller the plan does not know them and the move of a pinned schema is refused when it is tried).  `rebalance_plan()` of phase 4 plans
+  buckets of hash-distributed tables only.
+- `kingres.schemas_on_group(group_id)` (superuser) lists the schemas that a shard group holds with their sizes and what would keep each from moving (a ledger pin,
+  an unlogged table, a table with neither a key nor a full replica identity): the preview of a drain.  A drain is a rebalance with `drain_only`, so its plan holds the
+  schemas of the group with `reason = 'drain'`; `set_node_property(node, false)` stops new schemas from being placed on the group; `remove_node` refuses a group that
+  still owns a bucket, a schema's bucket included, and `drain_status()` counts it among the group's buckets.
+- `kingres.check_cluster()` asks every active primary about the distributed schemas and reports `schema_missing`, `schema_table_missing`, `schema_structure_differs`
+  (the fingerprint of the table differs from the map group primary's), `stray_schema_rows` (the empty copy of a table that another group holds has rows, outside a move
+  that has the group as source or target) and `schema_catalog_differs` (the schemas, their groups, states, placement epochs and numbers of tables differ from the map
+  group primary's); the checks of the moves (slots, publications, subscriptions, a bucket that is moving without a move) apply to a schema's bucket because it is in
+  `bucket_map`.  It stays a structural check: it does not compare the rows of a copy with its source.  Tests: `t/276` and `t/277`.
+
 **Using distributed schemas, and what they cannot do (step 15).**
 
 To use them: on the map group primary, `SELECT kingres.set_sharding_mode('schema', true)` (or `'both'`: hash-distributed tables and distributed schemas together), then create a schema per tenant or
@@ -2210,7 +2227,7 @@ Limits of this version:
   inheritance, `CREATE SCHEMA` with elements; unlogged tables cannot be in a schema that is moved.
 - A schema with a ledger table cannot be moved, made local or dropped (`schema_pinned`).
 - The writers of a schema wait during the switch of its move (an attempt of normally tens of milliseconds, at most `move_switch_timeout`); the old copy stays until `move_cleanup_delay` and takes disk space on the
-  source; a move back to a group whose old copy is not yet emptied is refused.  A plan of buckets (`plan_rebalance`, `rebalance_plan`) does not move a schema; the bucket of a schema counts in the load of its
+  source; a move back to a group whose old copy is not yet emptied is refused.  `rebalance_plan` (phase 4) does not move a schema; `plan_rebalance` of 0.8 plans schemas as items (see "The schemas in the rebalance, the drain and check_cluster"); the bucket of a schema counts in the load of its
   group.
 - `kingres_shard.max_distributed_schemas` (default 10000, a guess) bounds the number of schemas; every DDL statement is a two-phase transaction on every node; `add_node` makes the schemas in batches (see
   "Step 12") and its time grows with the number of objects; a schema that reads a reference table is made in its last transaction.

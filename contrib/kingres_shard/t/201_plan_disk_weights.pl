@@ -165,7 +165,7 @@ is(q1($n1, q{SELECT count(*) FILTER (WHERE reason = 'drain') FROM kingres.plan_r
 	cmp_ok($size, '>', 4 * 1048576, "G: the schema's tables are large ($size bytes)");
 	my $after = q1($n1, q{SELECT load FROM kingres.group_load('by_disk_size') WHERE group_id = 1});
 	cmp_ok($after - $before, '>=', $size - 65536, "G: the group of the schema carries the size of its tables, not the minimum cost of one bucket ($before before, $after after, $size of tables)");
-	is(q1($n1, q{SELECT count(*) FROM kingres.plan_rebalance('by_disk_size') WHERE colocation_id = (SELECT colocation_id FROM kingres.dist_schema WHERE nsp = 'big'::regnamespace)}), '0', 'G: and the plan does not move the schema as a bucket');
+	is(q1($n1, q{SELECT count(*) FROM kingres.plan_rebalance('by_disk_size') WHERE colocation_id = (SELECT colocation_id FROM kingres.dist_schema WHERE nsp = 'big'::regnamespace) AND (bucket <> 0 OR source_group <> 1)}), '0', 'G: and the plan, if it moves the schema (an item since phase 11 step 15: its one bucket), moves bucket 0 from the group that holds it');
 	q1($n1, q{SELECT kingres.undistribute_schema('big')});
 	q1($n1, q{DROP SCHEMA IF EXISTS big CASCADE});
 	q1($n1, q{SELECT kingres.set_sharding_mode('row')});
