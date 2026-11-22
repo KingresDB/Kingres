@@ -303,6 +303,10 @@ func (r *Runner) resume(ctx context.Context, j journal.Journal) (Result, error) 
 		if r.Journal.IsDone(s.name) {
 			continue
 		}
+		// A bootstrap that was given up while a step ran does not go on to the next one (F6-02): the abandon released the lease and let the old leader start again.
+		if !r.Journal.Active() {
+			return res, failover.Fail(failover.CodeSwitchoverUnproven, false, "the bootstrap of the map group was given up; nothing more is done")
+		}
 		if err := r.fault(s.name + ":before"); err != nil {
 			return res, err
 		}
@@ -550,6 +554,9 @@ func (r *Runner) promote(ctx context.Context, j journal.Journal) (bool, error) {
 	}
 	deadline := r.now().Add(dur(r.PromoteWait, 3*time.Minute))
 	for {
+		if !r.Journal.Active() {
+			return false, failover.Fail(failover.CodeSwitchoverUnproven, false, "the bootstrap of the map group was given up before the promotion; nothing more is done")
+		}
 		if ans, err := r.P.Lease(ctx, r.P.Self(), failover.LeaseRequest{Group: Group, Role: failover.LeaseHolder, ExpectedTerm: j.Term}); err == nil && ans.Held {
 			break
 		}
@@ -571,6 +578,9 @@ func (r *Runner) promote(ctx context.Context, j journal.Journal) (bool, error) {
 	}
 	// The intent is on disk before the call (F5-03): a promotion that ran and is not yet recorded cannot be given up as if it had not happened.
 	if err := r.Journal.PromotionIntent(); err != nil {
+		if errors.Is(err, journal.ErrAbandoned) {
+			return false, failover.Fail(failover.CodeSwitchoverUnproven, false, "the bootstrap of the map group was given up before the promotion; nothing more is done")
+		}
 		return false, err
 	}
 	behindUntil := r.now().Add(dur(r.VerifyWait, 30*time.Second))

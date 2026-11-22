@@ -294,6 +294,9 @@ func (s *Store) Undo(steps ...string) error {
 	return s.saveLocked()
 }
 
+// ErrAbandoned is returned by PromotionIntent for a bootstrap that was given up: nothing may be promoted for it any more (F6-02).
+var ErrAbandoned = errors.New("journal: the bootstrap was given up; nothing is promoted for it")
+
 // ErrPromoted is returned by Abandon for a bootstrap that promoted the standby: it can only go on.
 var ErrPromoted = errors.New("journal: the standby was promoted; the bootstrap cannot be given up")
 
@@ -393,6 +396,9 @@ func (s *Store) PromotionIntent() error {
 	defer s.mu.Unlock()
 	if s.j == nil {
 		return errors.New("journal: no bootstrap is in progress")
+	}
+	if !s.j.Abandoned.IsZero() {
+		return ErrAbandoned
 	}
 	if s.promotionStartedLocked() {
 		return nil

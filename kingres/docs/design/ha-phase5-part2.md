@@ -2686,3 +2686,25 @@ shown failing on the old code (`Relinquish` in place of `HoldBack`) and passing 
    steps make to the old primary's server wait 15 s (`OldServerWait`) instead of the minutes that a server that answers "not ready" makes a task step wait. There is no second
    primary at any time: the old one cannot start (the marker, and the lease is held by the candidate from B3 on), and the candidate promotes only on a proof. Fault: `demote:exit`
    (mode `exit`) on the old leader. Cluster test: `TestSwitchoverOfTheMapGroupWhoseOldLeaderEndsAtTheStop`.
+
+### A hold that nothing owns (F6-01 to F6-05, 2026-11-22)
+
+The review of the fixes of round 2 found that the old leader of a planned switchover of the map group can stay held back for ever. Its primary is the system database, so while the
+hand-over marker holds it back no task can be read or written, and the loop that repairs the holds of ordinary groups does not cover the map group. What ends a hold now:
+
+- **The old leader itself.** From the start of kingresd, a loop (every ten seconds) looks for the hand-over marker of group 0. When it is there, the server asks every other server
+  `GET /failover/map/bootstrap?old=<this server>` and ends the hold (`Resume` and `Unquiesce`, as the rollback of a switchover does) only when no server reports an active bootstrap that names it, no
+  server reports a promoted standby of the map group, and at least one standby is shown to be in recovery. A server that does not answer neither blocks nor proves. The lease stays the final authority:
+  the primary starts again only when this server wins it, so a mistaken resume cannot make two primaries.
+- **The candidate.** A bootstrap of a planned switchover that is given up (by the operator, by the monitor, or because the proof was refused) asks the old leader's server to do the same
+  (`POST /failover/map/resume`), after the journal is given up, because an active bootstrap is what makes the old leader wait.
+- **The operator.** `abandonMapGroupBootstrap` with no bootstrap in progress anywhere asks every server to do it, and answers with the server that was started again (`resumedServerId`).
+- **The question whether the standby is still one** (`inRecovery`) falls back to `pg_controldata` when the instance cannot be reached: a standby that was stopped says "in archive recovery" or
+  "shut down in recovery", a promoted one "in production" or "shut down". Before, an unreachable standby was read as "may have promoted", the abandon answered a conflict, and the old leader
+  stayed held back.
+
+The abandon takes the lifecycle lock of the standby agent, which the promoting call holds across `pg_promote`: the probe, the mark of the journal and the release of the lease are one step against
+a promotion, so a promotion that is running is waited for and found (409), and one that has not begun finds its lease let go of. The promoting loop of the bootstrap stops when the journal was
+given up. The writers of the watchdog file (a round, the idle refresh, the Off file of a demotion) exclude each other, so that a round that took its sequence number before a demotion cannot
+arm the watchdog of a standby after it. A rollback of the old leader that cannot ask the candidate (an error other than a conflict) goes on, and says so in the log: the lease decides which of the
+two primaries may run.

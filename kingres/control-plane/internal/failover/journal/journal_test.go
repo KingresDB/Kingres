@@ -227,3 +227,20 @@ func TestAPromotionThatWasBegunCannotBeGivenUpByTheOrdinaryCall(t *testing.T) {
 		t.Fatalf("a recorded promotion: %v", err)
 	}
 }
+
+// F6-02. The intent to promote is refused for a bootstrap that was given up: a runner that was past its last look at the journal cannot begin a promotion for it.
+func TestThePromotionIntentIsRefusedAfterTheAbandon(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Begin("b1", "s1", 3, "manual", "alice", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Abandon("an operator"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PromotionIntent(); !errors.Is(err, ErrAbandoned) || s.PromotionStarted() {
+		t.Fatalf("the intent after the abandon: %v (started %v)", err, s.PromotionStarted())
+	}
+}

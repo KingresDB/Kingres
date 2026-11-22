@@ -23,12 +23,13 @@ type world struct {
 	pulls                     int
 	pullCheckpoint, pullState string
 	pullErr                   error
-	refusedErr                error  // telling the old leader fails
-	behind                    int    // the callee answers standby_behind this many times before it promotes
-	onPromote                 func() // runs inside the call that promotes (a test gives the bootstrap up there)
-	resumeOldErr              error  // the answer of the call that asks the old leader to end its hold
-	onResumeOld               func() // runs inside the call that asks the old leader to end its hold
-	promoteErr                error  // the callee refuses a promotion that carries a proof
+	refusedErr                error                                // telling the old leader fails
+	behind                    int                                  // the callee answers standby_behind this many times before it promotes
+	onPromote                 func()                               // runs inside the call that promotes (a test gives the bootstrap up there)
+	resumeOldErr              error                                // the answer of the call that asks the old leader to end its hold
+	onResumeOld               func()                               // runs inside the call that asks the old leader to end its hold
+	onHolderLease             func() (failover.LeaseAnswer, error) // the answer of the holder lease call (a test gives the bootstrap up there)
+	promoteErr                error                                // the callee refuses a promotion that carries a proof
 	promoteReqs               []failover.PromoteRequest
 	freezeErr                 error // FreezeLocal fails from the second call on (the agent was lost with a restart)
 	freezes                   int
@@ -144,6 +145,9 @@ func (p ports) Lease(_ context.Context, s string, r failover.LeaseRequest) (fail
 		return failover.LeaseAnswer{Transferred: true, Holder: r.TransferTo}, nil
 	default:
 		p.w.rec("lease-%s %s", r.Role, s)
+		if r.Role == failover.LeaseHolder && p.w.onHolderLease != nil {
+			return p.w.onHolderLease()
+		}
 		return failover.LeaseAnswer{Held: true}, nil
 	}
 }
@@ -881,5 +885,54 @@ func TestARefusedProofAsksTheOldLeaderToEndItsHoldAfterTheJournalIsGivenUp(t *te
 	}
 	if activeAtTheCall {
 		t.Fatal("the old leader was asked while the bootstrap that names it was still active")
+	}
+}
+
+// F6-02. A bootstrap that is given up while a step runs does not go on to the next step (the abandon released the lease and let the old leader start again): the
+// runner reads the journal before every step, in the wait for the lease, and before the intent to promote, which the journal refuses for a given-up bootstrap.
+func TestABootstrapGivenUpBetweenTwoStepsGoesNoFurther(t *testing.T) {
+	w := newWorld()
+	r, js := w.runner(t)
+	r.Fault = func(point string) error {
+		if point == journal.StepLease+":after" {
+			_ = js.Abandon("an operator")
+		}
+		return nil
+	}
+	if _, err := r.Run(context.Background(), req()); err == nil {
+		t.Fatalf("the bootstrap that was given up went on:\n%s", strings.Join(w.log, "\n"))
+	}
+	if w.count("promote s2") != 0 || js.PromotionStarted() {
+		t.Fatalf("a promotion was begun after the abandon:\n%s", strings.Join(w.log, "\n"))
+	}
+	if js.IsDone(journal.StepPin) {
+		t.Fatalf("the step after the abandon ran:\n%s", strings.Join(w.log, "\n"))
+	}
+}
+
+func TestABootstrapGivenUpWhileItWaitsForTheLeaseDoesNotPromote(t *testing.T) {
+	for _, held := range []bool{false, true} {
+		w := newWorld()
+		r, js := w.runner(t)
+		calls := 0
+		w.onHolderLease = func() (failover.LeaseAnswer, error) {
+			calls++
+			if calls == 1 {
+				_ = js.Abandon("an operator")
+				return failover.LeaseAnswer{Held: held}, nil
+			}
+			return failover.LeaseAnswer{Held: true}, nil
+		}
+		_, err := r.Run(context.Background(), req())
+		var fe *failover.Error
+		if !errors.As(err, &fe) || fe.Code != failover.CodeSwitchoverUnproven {
+			t.Fatalf("held %v: the bootstrap that was given up ended with %v, want switchover_unproven:\n%s", held, err, strings.Join(w.log, "\n"))
+		}
+		if !held && calls != 1 {
+			t.Fatalf("the lease was asked for again (%d calls) after the bootstrap was given up", calls)
+		}
+		if w.count("promote s2") != 0 || js.PromotionStarted() {
+			t.Fatalf("held %v: a promotion was begun after the abandon:\n%s", held, strings.Join(w.log, "\n"))
+		}
 	}
 }
