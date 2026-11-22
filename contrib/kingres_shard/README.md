@@ -2293,7 +2293,8 @@ parent (a columnar leaf for cold data next to heap leaves); `internal_partition_
   refused by the access method on the group that holds a matching row, and the two-phase transaction rolls the rest back.
 - **`add_node`** onto a node that has `kingres_columnar` (or `kingres_ledger`) installed works: the schema `kingres` is shared, and the check
   of the prepared transaction no longer takes "the function does not exist" for a failure when the extension of this very transaction is
-  the one that makes the function.  A node without the access method is refused with the error of the node (`access method "columnar" does not
+  the one that makes the function.  That holds only for the node that `add_node` is adding (a flag on its connection): a participant of the cluster that lacks
+  `internal_sync_confirm` fails the transaction (review P12S-04, `t/275`).  A node without the access method is refused with the error of the node (`access method "columnar" does not
   exist`) and joins nothing.
 
 ### What a columnar distributed table refuses (increment S2)
@@ -2331,8 +2332,12 @@ A bucket of a columnar distributed table moves like any other (design 9.3 and 11
 
 Not done: the design has the move call `columnar_compact` on the copy before the switch, to merge the small stripes that the apply worker makes; version 0.9 does not
 (the stripes of the initial copy are full; the stripes of the changes of the move are as many as the source transactions: run `kingres.columnar_compact` on the bucket partition
-afterwards when many small transactions wrote during a long move).  The options of `columnar_set_options` of a bucket partition (compression, stripe size) are not carried to
-the copy either.  Test: `t/274_columnar_move`.
+afterwards when many small transactions wrote during a long move).  Test: `t/274_columnar_move`.
+
+**The options of a columnar table are carried** (review P12S-03): the compression, its level, the rows per stripe and per chunk that `columnar_set_options` gave a table are read
+by `kingres.internal_columnar_args()` and applied with `columnar_set_options` to every bucket partition that `create_distributed_table` and the rebuilds make, to the plain table
+that `undistribute_table` makes, to each leaf of a user-partitioned table, and to the copy of a bucket move (the bucket partition and each leaf).  For a distributed table that is rebuilt or
+undistributed the options are those of its first columnar bucket partition by name on the node that runs the call (a node that holds none gives the defaults).
 
 ## Approximate `count(DISTINCT x)` (version 0.9, phase 12)
 
@@ -2357,12 +2362,13 @@ that `approx_count_distinct(e, p)` gives on the same rows (the merge of sketches
 Left alone, the statement stays exact: an argument of a type that is not a built-in scalar type with an extended hash function (a user type, an array, a range, an enum, a record,
 `oid` and the `reg*` types, whose hash depends on an object identifier), `count(DISTINCT e ORDER BY ...)`, and an aggregate of another level than the one that reads the
 table.  The rewrite is made for the session that plans the statement: a view or a function defined while the setting was on is planned with the setting of the session that runs
-it, and a cached generic plan keeps what it was planned with.  It is made before the shortcut for a cluster of one shard group, so the answer does not depend on the number of
+it, and a change of either setting drops the cached plans (generic plans of prepared statements and of function bodies are planned again), so a statement never keeps the rewrite, or the lack of it, of a setting that is gone.  It is made before the shortcut for a cluster of one shard group, so the answer does not depend on the number of
 groups.
 
 It needs `kingres_sketch` at a version that the list of "Objects of extensions" accepts and `kingres_shard.shippable_extensions` that allows it.  Without it the setting does
 nothing and raises one warning per session (`count_distinct_mode is approximate but kingres_sketch is not installed in this database, or its version is not one that kingres_shard
-accepts`).  `EXPLAIN` shows `approx_count_distinct(...)` in the aggregate; the design's extra line `Rewritten: count(DISTINCT x) -> approximate (p = 14)` is not printed in 0.9.
+accepts`).  The sketch is looked up only when a statement has a count(DISTINCT) that can be rewritten, and only a role that has USAGE on the schema of `kingres_sketch` and EXECUTE on `approx_count_distinct` gets it; for any other role
+the statement stays exact, with one warning per session (`... this role may not use kingres_sketch ...`), and no other statement of the role is affected (review P12S-01).  `EXPLAIN` shows `approx_count_distinct(...)` in the aggregate; the design's extra line `Rewritten: count(DISTINCT x) -> approximate (p = 14)` is not printed in 0.9.
 Test: `t/273_count_distinct_mode`.
 
 ## Moving buckets and rebalancing (version 0.3, phase 4)

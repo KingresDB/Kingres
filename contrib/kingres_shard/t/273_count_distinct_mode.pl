@@ -154,6 +154,11 @@ qs($n1, "ALTER DATABASE postgres SET kingres_shard.count_distinct_mode = 'approx
 	my $w = () = $err =~ /this role may not use kingres_sketch/g;
 	is($w, 1, '... with one warning for the session');
 }
+{
+	my ($rc, $out, $err) = run_sql($n1, "SET ROLE appu; SELECT 1; SELECT count(*) FROM public.ev; SELECT count(DISTINCT u) FROM public.loc;");
+	is($rc, 0, 'statements without a count(DISTINCT) of a distributed table do not fail');
+	unlike($err, qr/kingres_sketch/, '... and look nothing up: no warning about the sketch');
+}
 qs($_, "GRANT USAGE ON SCHEMA kingres_sketch TO appu") for ($n1, $n2);
 is(one("SET ROLE appu; SELECT count(DISTINCT u) FROM public.ev"), one("SELECT $K.approx_count_distinct(u, 14) FROM public.ev"), 'with USAGE on the schema the role gets the sketch');
 qs($n1, "REVOKE ALL ON FUNCTION $K.approx_count_distinct(anyelement, int) FROM PUBLIC");
