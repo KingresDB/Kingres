@@ -409,3 +409,33 @@ func TestTheWritersOfTheWatchdogFileExcludeEachOther(t *testing.T) {
 		<-done
 	}
 }
+
+// F7-01. The server that a group is handed to is recorded on disk (a restart of kingresd keeps it) and goes with the hold: Unrelinquish and BecameStandby remove it.
+func TestTheCandidateOfAHandOverIsRecordedAndGoesWithTheHold(t *testing.T) {
+	r := newRig(t, []string{"a", "b", "c"}, true)
+	if got := r.m.Candidate(1); got != "" {
+		t.Fatalf("a candidate before any record: %q", got)
+	}
+	if err := r.m.RecordCandidate(1, "b"); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.m.Candidate(1); got != "b" {
+		t.Fatalf("the record: %q", got)
+	}
+	if got := r.m.Candidate(2); got != "" {
+		t.Fatalf("the record of another group: %q", got)
+	}
+	if err := r.m.Unrelinquish(1); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.m.Candidate(1); got != "" {
+		t.Fatalf("the record outlived the hold: %q", got)
+	}
+	_ = r.m.RecordCandidate(1, "b")
+	if err := r.m.BecameStandby(1, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.m.Candidate(1); got != "" {
+		t.Fatalf("the record outlived the instance being a primary: %q", got)
+	}
+}

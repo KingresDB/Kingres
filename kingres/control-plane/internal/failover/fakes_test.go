@@ -83,8 +83,9 @@ type world struct {
 	notReleased        bool    // the clean stop does not release the lease
 	markTerms          []int64
 	stopTerms          []int64
-	promoteRefuse      error  // the answer of a promote call that carries a proof (the callee refuses it)
-	verifyAnswers      []bool // the answers of the proof, in order (the last one repeats)
+	stopCandidates     []string // the Candidate of every clean stop request
+	promoteRefuse      error    // the answer of a promote call that carries a proof (the callee refuses it)
+	verifyAnswers      []bool   // the answers of the proof, in order (the last one repeats)
 	verifyErr          error
 	verifyN            int
 	quiesced           bool
@@ -264,6 +265,7 @@ func (p fpeers) Demote(_ context.Context, server string, r DemoteRequest) (Demot
 	if r.Mode == "fast" {
 		p.w.mu.Lock()
 		p.w.stopTerms = append(p.w.stopTerms, r.ExpectedTerm)
+		p.w.stopCandidates = append(p.w.stopCandidates, r.Candidate)
 		p.w.mu.Unlock()
 		if p.w.stopErr != nil {
 			return DemoteAnswer{}, p.w.stopErr

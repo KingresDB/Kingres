@@ -2708,3 +2708,17 @@ a promotion, so a promotion that is running is waited for and found (409), and o
 given up. The writers of the watchdog file (a round, the idle refresh, the Off file of a demotion) exclude each other, so that a round that took its sequence number before a demotion cannot
 arm the watchdog of a standby after it. A rollback of the old leader that cannot ask the candidate (an error other than a conflict) goes on, and says so in the log: the lease decides which of the
 two primaries may run.
+
+### The end of a hold needs the word of the candidate (F7-01 to F7-05, 2026-11-22)
+
+The review of the fixes above found that "some standby is in recovery" proves nothing about the standby that was promoted: after a completed switchover whose new primary died, the standby on a third
+server still reads "in recovery", and the old leader would have resumed its stale primary and lost what the new primary acknowledged. The lease decides who runs, not whose history is right; the hold is
+what guards that. So:
+
+- The clean stop of the map group names the server the group is handed to (`candidate` of the demote call); the old leader records it on disk before it stops (`candidate.0` in the lease
+  directory) and removes it with the hold.
+- The old leader resumes only when that server answers and shows its standby in recovery, no bootstrap that names it is active anywhere, and no standby was promoted. A candidate that does not
+  answer, or whose standby cannot be read, blocks: it may be the promoted primary. Without a record, and for the operator's call (`strict`), every server must answer and none may say `unknown`.
+- A bootstrap that was given up whose lease could not be let go of fails the abandon (503) and leaves the repeat to finish the release; the promoting call refuses a journal that was given up.
+- A hold that cannot be resolved is named in the log at warning level once a minute and in the failover status (`paused`, with the reason); the system database is the held-back primary, so an alert
+  cannot be recorded, and the status can only be read where a session can be made.

@@ -867,6 +867,12 @@ func handleFailoverDemote(ctx context.Context, d *haDeps, body []byte) (any, err
 		return nil, err
 	}
 	if r.Mode == "fast" {
+		if r.Group == 0 && r.Candidate != "" {
+			// Before anything is stopped (F7-01): the hold that follows may be ended later only on the word of this server.
+			if err := d.LeaseMgr.RecordCandidate(0, r.Candidate); err != nil {
+				return nil, err
+			}
+		}
 		return demoteClean(ctx, d, r)
 	}
 	li, ok := d.Svc.PrimaryOf(r.Group)
@@ -938,6 +944,10 @@ func handleFailoverPromote(ctx context.Context, d *haDeps, body []byte) (any, er
 		case <-time.After(20 * time.Second):
 		case <-ctx.Done():
 		}
+	}
+	// A bootstrap that was given up does not promote (F7-02): the abandon marks the journal under this lock, so a call that waited for it finds the mark here.
+	if err := promoteBlockedByJournal(d.MapFailover, r.Group); err != nil {
+		return nil, err
 	}
 	var li *cluster.LocalInstance
 	for _, x := range d.Svc.LocalInstances() {

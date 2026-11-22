@@ -7,14 +7,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover/journal"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 )
 
@@ -150,6 +154,7 @@ type resolveRig struct {
 	answers map[string]any // mapBootstrapStatus, or an error
 	ended   int
 	endErr  error
+	cand    string // the server that the hold was made for ("": no record)
 }
 
 func newResolveRig(t *testing.T, answers map[string]any) *resolveRig {
@@ -157,6 +162,7 @@ func newResolveRig(t *testing.T, answers map[string]any) *resolveRig {
 	m, _ := abandonRig(t)
 	m.self = "s1"
 	r := &resolveRig{m: m, answers: answers}
+	m.candidateRecord = func() string { return r.cand }
 	m.heldBack = func() bool { return true }
 	m.memberList = func(context.Context) ([]string, error) { return []string{"s1", "s2", "s3"}, nil }
 	m.callPeer = func(_ context.Context, server, method, path string, _, out any) error {
@@ -177,33 +183,49 @@ func newResolveRig(t *testing.T, answers map[string]any) *resolveRig {
 	return r
 }
 
-// F6-01 (b). The old leader ends its own hold only when nothing owns it: no bootstrap that names it is active, no standby was promoted, and a standby is shown to be
-// in recovery. A server that does not answer neither blocks nor proves.
+// F6-01 (b), F7-01. The old leader ends its own hold only when nothing owns it, on the word of the server that the group was handed to: that candidate answers and shows its
+// standby in recovery, no bootstrap that names the old leader is active, and no standby was promoted. A candidate that does not answer, or whose standby cannot be read,
+// blocks (it may be the promoted primary that took writes, and a standby that answers may follow it). Without a record, and for the operator's call, every server must answer.
 func TestTheOldLeaderEndsAHoldThatNothingOwns(t *testing.T) {
 	ctx := context.Background()
 	in := mapBootstrapStatus{Standby: "in_recovery"}
+	none := mapBootstrapStatus{Standby: "none"}
+	down := errors.New("down")
 	cases := []struct {
 		name    string
+		cand    string
+		strict  bool
 		answers map[string]any
 		heldBk  bool
 		endErr  error
 		want    bool
 		ended   int
 	}{
-		{"a standby in recovery, none active", map[string]any{"s2": in, "s3": mapBootstrapStatus{Standby: "none"}}, true, nil, true, 1},
-		{"the other server does not answer", map[string]any{"s2": in, "s3": errors.New("down")}, true, nil, true, 1},
-		{"a bootstrap that names it is active", map[string]any{"s2": mapBootstrapStatus{Active: true, Standby: "in_recovery"}, "s3": in}, true, nil, false, 0},
-		{"a standby was promoted", map[string]any{"s2": mapBootstrapStatus{Standby: "primary"}, "s3": in}, true, nil, false, 0},
-		{"no standby is shown in recovery", map[string]any{"s2": mapBootstrapStatus{Standby: "unknown"}, "s3": mapBootstrapStatus{Standby: "none"}}, true, nil, false, 0},
-		{"nobody answers", map[string]any{"s2": errors.New("down"), "s3": errors.New("down")}, true, nil, false, 0},
-		{"not held back", map[string]any{"s2": in, "s3": in}, false, nil, false, 0},
-		{"the hold cannot be ended", map[string]any{"s2": in, "s3": in}, true, errors.New("no"), false, 1},
+		{"the candidate shows its standby in recovery, none active", "s2", false, map[string]any{"s2": in, "s3": none}, true, nil, true, 1},
+		{"the candidate answers, another server does not", "s2", false, map[string]any{"s2": in, "s3": down}, true, nil, true, 1},
+		{"the candidate does not answer, another standby is in recovery", "s2", false, map[string]any{"s2": down, "s3": in}, true, nil, false, 0},
+		{"the standby of the candidate cannot be read, another is in recovery", "s2", false, map[string]any{"s2": mapBootstrapStatus{Standby: "unknown"}, "s3": in}, true, nil, false, 0},
+		{"the candidate hosts no standby", "s2", false, map[string]any{"s2": none, "s3": in}, true, nil, false, 0},
+		{"the candidate was promoted", "s2", false, map[string]any{"s2": mapBootstrapStatus{Standby: "primary"}, "s3": in}, true, nil, false, 0},
+		{"a bootstrap that names it is active on the candidate", "s2", false, map[string]any{"s2": mapBootstrapStatus{Active: true, Standby: "in_recovery"}, "s3": in}, true, nil, false, 0},
+		{"a bootstrap that names it is active elsewhere", "s2", false, map[string]any{"s2": in, "s3": mapBootstrapStatus{Active: true}}, true, nil, false, 0},
+		{"another standby was promoted", "s2", false, map[string]any{"s2": in, "s3": mapBootstrapStatus{Standby: "primary"}}, true, nil, false, 0},
+		{"every server answers, none is promoted (no record)", "", false, map[string]any{"s2": in, "s3": none}, true, nil, true, 1},
+		{"no record: a server does not answer", "", false, map[string]any{"s2": in, "s3": down}, true, nil, false, 0},
+		{"no record: a standby cannot be read", "", false, map[string]any{"s2": in, "s3": mapBootstrapStatus{Standby: "unknown"}}, true, nil, false, 0},
+		{"no record: no standby is shown in recovery", "", false, map[string]any{"s2": none, "s3": none}, true, nil, false, 0},
+		{"the operator's call: the candidate answered, another server does not", "s2", true, map[string]any{"s2": in, "s3": down}, true, nil, false, 0},
+		{"the operator's call: every server answers", "s2", true, map[string]any{"s2": in, "s3": none}, true, nil, true, 1},
+		{"nobody answers", "", false, map[string]any{"s2": down, "s3": down}, true, nil, false, 0},
+		{"not held back", "s2", false, map[string]any{"s2": in, "s3": in}, false, nil, false, 0},
+		{"the hold cannot be ended", "s2", false, map[string]any{"s2": in, "s3": in}, true, errors.New("no"), false, 1},
 	}
 	for _, c := range cases {
 		r := newResolveRig(t, c.answers)
+		r.cand = c.cand
 		r.endErr = c.endErr
 		r.m.heldBack = func() bool { return c.heldBk }
-		got, why := r.m.resolveHeldBack(ctx)
+		got, why := r.m.resolveHeldBack(ctx, c.strict)
 		if got != c.want || r.ended != c.ended || (!got && why == "") {
 			t.Errorf("%s: resumed %v (%q), ended %d; want %v, %d", c.name, got, why, r.ended, c.want, c.ended)
 		}
@@ -338,5 +360,195 @@ func TestTheResumeCallSaysWhyItDidNothing(t *testing.T) {
 	out, err := handleMapResume(context.Background(), &haDeps{MapFailover: m}, "s2", nil)
 	if a, _ := out.(mapResumeAnswer); err != nil || a.Resumed || a.Detail == "" {
 		t.Fatalf("%+v %v", out, err)
+	}
+}
+
+// F7-02. The lease of a bootstrap that was given up cannot be let go of: the abandon fails (503, nothing answered as given up, the old leader is not asked to resume), the
+// promoting call refuses a journal that was given up, and the repeat of the abandon finishes the release and then asks the old leader.
+func TestAFailedReleaseOfTheLeaseFailsTheAbandonAndTheRepeatFinishesIt(t *testing.T) {
+	ctx := context.Background()
+	m, js := abandonRig(t)
+	seen := abandonWatch(m)
+	releaseErr := errors.New("no majority of grantors")
+	m.releaseFence = func(context.Context) error { seen.released++; return releaseErr }
+	resumed := 0
+	m.resumeOldLeader = func(context.Context, string) (bool, error) { resumed++; return true, nil }
+	_, _ = js.Begin("b1", "s1", 3, "manual", "alice", false)
+	_, _ = js.SetPlanned(journal.Planned{TaskID: 42, StandbyID: 3})
+	ans, err := m.abandonLocalFull(ctx, "operator")
+	var p *problem.Problem
+	if ans.Abandoned || !errors.As(err, &p) || p.Code != problem.ServiceUnavailable || resumed != 0 || len(seen.told) != 0 {
+		t.Fatalf("a failed release: %+v %v (resumed %d, told %v)", ans, err, resumed, seen.told)
+	}
+	// the call that promotes finds the journal given up, whatever became of the lease
+	var ce *internalapi.CallError
+	if err := promoteBlockedByJournal(m, 0); !errors.As(err, &ce) || ce.Status != 409 {
+		t.Fatalf("the promoting call was not refused: %v", err)
+	}
+	if err := promoteBlockedByJournal(m, 1); err != nil {
+		t.Fatalf("an ordinary group was refused: %v", err)
+	}
+	if err := promoteBlockedByJournal(nil, 0); err != nil {
+		t.Fatalf("no map failover: %v", err)
+	}
+	// the repeat, with the lease let go of this time, finishes what the first call began
+	releaseErr = nil
+	ans, err = m.abandonLocalFull(ctx, "operator again")
+	if err != nil || !ans.Abandoned || ans.ResumedServer != "s1" || resumed != 1 || len(seen.told) != 1 {
+		t.Fatalf("the repeat: %+v %v (resumed %d, told %v)", ans, err, resumed, seen.told)
+	}
+	if ans, err := m.abandonLocalFull(ctx, "a third time"); err != nil || ans.Abandoned {
+		t.Fatalf("a third call has nothing to do: %+v %v", ans, err)
+	}
+}
+
+// A bootstrap that is in progress is not refused to promote.
+func TestAJournalInProgressDoesNotRefuseThePromotingCall(t *testing.T) {
+	m, js := abandonRig(t)
+	_, _ = js.Begin("b1", "s1", 3, "manual", "alice", false)
+	if err := promoteBlockedByJournal(m, 0); err != nil {
+		t.Fatalf("%v", err)
+	}
+}
+
+// F7-04 (M11b). The lifecycle lock is held until the lease is let go of: the promoting call that waited for it must find either the promotion done or the lease gone.
+func TestTheLifecycleLockIsHeldUntilTheLeaseIsLetGoOf(t *testing.T) {
+	m, js := abandonRig(t)
+	abandonWatch(m)
+	var mu sync.Mutex
+	locked, heldAtRelease := false, false
+	m.lifecycleLock = func(context.Context) (func(), error) {
+		mu.Lock()
+		locked = true
+		mu.Unlock()
+		return func() { mu.Lock(); locked = false; mu.Unlock() }, nil
+	}
+	m.releaseFence = func(context.Context) error {
+		mu.Lock()
+		heldAtRelease = locked
+		mu.Unlock()
+		return nil
+	}
+	_, _ = js.Begin("b1", "s1", 3, "manual", "alice", false)
+	if ok, err := m.abandonLocal(context.Background(), "operator"); err != nil || !ok {
+		t.Fatalf("%v %v", ok, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !heldAtRelease || locked {
+		t.Fatalf("the lock was held at the release: %v, and is released at the end: %v", heldAtRelease, !locked)
+	}
+}
+
+// F7-04 (M18b). The loop that resolves a hold is started by kingresd: a test of the wiring, since the loop tests call it directly.
+func TestTheLoopThatResolvesAHoldIsStartedByMain(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(src), "MapFailover.WatchHeldBack(") {
+		t.Fatal("main.go does not start WatchHeldBack")
+	}
+}
+
+// countingHandler counts the warnings of a logger.
+type countingHandler struct {
+	mu    sync.Mutex
+	warns int
+}
+
+func (h *countingHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *countingHandler) Handle(_ context.Context, r slog.Record) error {
+	if r.Level >= slog.LevelWarn {
+		h.mu.Lock()
+		h.warns++
+		h.mu.Unlock()
+	}
+	return nil
+}
+func (h *countingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *countingHandler) WithGroup(string) slog.Handler      { return h }
+func (h *countingHandler) count() int                         { h.mu.Lock(); defer h.mu.Unlock(); return h.warns }
+
+// F7-03. A hold that cannot be resolved is named at warning level once a minute and shown in the failover status with the reason; when it is resolved the status goes.
+func TestAHoldThatCannotBeResolvedIsNamedOnceAMinuteAndInTheStatus(t *testing.T) {
+	ctx := context.Background()
+	down := errors.New("down")
+	r := newResolveRig(t, map[string]any{"s2": down, "s3": down})
+	r.cand = "s2"
+	h := &countingHandler{}
+	r.m.log = slog.New(h)
+	t0 := time.Unix(1_000_000, 0)
+	r.m.watchOnce(ctx, t0)
+	if h.count() != 1 {
+		t.Fatalf("the first look: %d warnings", h.count())
+	}
+	r.m.watchOnce(ctx, t0.Add(30*time.Second))
+	if h.count() != 1 {
+		t.Fatalf("a second look within the minute: %d warnings", h.count())
+	}
+	r.m.watchOnce(ctx, t0.Add(61*time.Second))
+	if h.count() != 2 {
+		t.Fatalf("a look after the minute: %d warnings", h.count())
+	}
+	st, ok := r.m.Status()
+	if !ok || st.State != "paused" || st.PausedReason == nil || !strings.Contains(*st.PausedReason, "does not answer") {
+		t.Fatalf("the status of a hold that cannot be resolved: %+v %v", st, ok)
+	}
+	// the candidate answers: the hold is resolved and the status goes
+	r.answers["s2"] = mapBootstrapStatus{Standby: "in_recovery"}
+	r.m.watchOnce(ctx, t0.Add(70*time.Second))
+	if r.ended != 1 {
+		t.Fatalf("the hold was not ended: %d", r.ended)
+	}
+	if _, ok := r.m.Status(); ok {
+		t.Fatal("the status of a resolved hold remains")
+	}
+}
+
+// F7-01. Each rule that keeps a hold says its own reason (the log and the status name it), so that a rule that is lost is seen and not covered by another.
+func TestEachRuleThatKeepsAHoldSaysItsReason(t *testing.T) {
+	ctx := context.Background()
+	in := mapBootstrapStatus{Standby: "in_recovery"}
+	down := errors.New("down")
+	cases := []struct {
+		name    string
+		cand    string
+		answers map[string]any
+		reason  string
+	}{
+		{"the candidate does not answer", "s2", map[string]any{"s2": down, "s3": in}, "to which the map group was handed, does not answer"},
+		{"the standby of the candidate cannot be read", "s2", map[string]any{"s2": mapBootstrapStatus{Standby: "unknown"}, "s3": in}, "cannot be read"},
+		{"the candidate hosts no standby", "s2", map[string]any{"s2": mapBootstrapStatus{Standby: "none"}, "s3": in}, "hosts no standby"},
+		{"the candidate is not a server of the cluster", "s9", map[string]any{"s2": in, "s3": in}, "did not show its standby in recovery"},
+		{"a bootstrap is active", "s2", map[string]any{"s2": in, "s3": mapBootstrapStatus{Active: true}}, "is active on s3"},
+		{"a standby was promoted", "s2", map[string]any{"s2": in, "s3": mapBootstrapStatus{Standby: "primary"}}, "was promoted"},
+		{"no record, a server does not answer", "", map[string]any{"s2": in, "s3": down}, "the server s3 does not answer"},
+		{"no record, no standby in recovery", "", map[string]any{"s2": mapBootstrapStatus{Standby: "none"}, "s3": mapBootstrapStatus{Standby: "none"}}, "no standby of the map group could be shown"},
+	}
+	for _, c := range cases {
+		r := newResolveRig(t, c.answers)
+		r.cand = c.cand
+		got, why := r.m.resolveHeldBack(ctx, false)
+		if got || !strings.Contains(why, c.reason) || r.ended != 0 {
+			t.Errorf("%s: resumed %v, reason %q, want a reason with %q", c.name, got, why, c.reason)
+		}
+	}
+	// the operator's call asks every server, whatever the record says
+	r := newResolveRig(t, map[string]any{"s2": in, "s3": down})
+	r.cand = "s2"
+	if got, why := r.m.resolveHeldBack(ctx, true); got || !strings.Contains(why, "the server s3 does not answer") {
+		t.Errorf("the operator's call: %v %q", got, why)
+	}
+}
+
+// F7-02. The promoting call consults the journal of the bootstrap (a test of the wiring: the handler needs a whole server to run).
+func TestThePromotingCallConsultsTheJournalOfTheBootstrap(t *testing.T) {
+	src, err := os.ReadFile("failover.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(src), "promoteBlockedByJournal(d.MapFailover, r.Group)") {
+		t.Fatal("handleFailoverPromote does not ask the journal of the bootstrap")
 	}
 }

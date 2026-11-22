@@ -191,6 +191,7 @@ func (m *Manager) Unrelinquish(group int32) error {
 	m.mu.Lock()
 	delete(m.relinq, group)
 	m.mu.Unlock()
+	m.ForgetCandidate(group)
 	if err := os.Remove(MarkerPath(m.c.Dir, RelinquishedMarker, group)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -453,6 +454,7 @@ func (m *Manager) BecameStandby(group int32, leaseFile string) error {
 		m.writeWatchdogOff(leaseFile)
 	}
 	var first error
+	m.ForgetCandidate(group)
 	for _, base := range []string{RelinquishedMarker, FencedMarker, WaitMarker} {
 		if err := os.Remove(MarkerPath(m.c.Dir, base, group)); err != nil && !errors.Is(err, os.ErrNotExist) && first == nil {
 			first = err
@@ -487,4 +489,27 @@ func (m *Manager) Resume(ctx context.Context, group int32) error {
 // and nothing but Resume or a transfer to another server ends that. The wait marker and the fence marker are not this: the lease rounds end them by themselves.
 func (m *Manager) HandOverMarked(group int32) bool {
 	return markerExists(m.c.Dir, RelinquishedMarker, group)
+}
+
+// CandidateMarker is the base name of the per group file that names the server a planned switchover hands the group to (F7-01): written when the primary is
+// stopped for the hand-over, removed when the hold ends. The old leader of the map group resumes its primary only on the word of that server.
+const CandidateMarker = "candidate"
+
+// RecordCandidate names the server that the group is being handed to.
+func (m *Manager) RecordCandidate(group int32, server string) error {
+	return pki.WriteFile(MarkerPath(m.c.Dir, CandidateMarker, group), []byte(server+"\n"), 0o600)
+}
+
+// Candidate is the server that was recorded for the hand-over of the group, or "" when none was.
+func (m *Manager) Candidate(group int32) string {
+	b, err := os.ReadFile(MarkerPath(m.c.Dir, CandidateMarker, group))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// ForgetCandidate removes the record.
+func (m *Manager) ForgetCandidate(group int32) {
+	_ = os.Remove(MarkerPath(m.c.Dir, CandidateMarker, group))
 }

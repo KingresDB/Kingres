@@ -278,6 +278,9 @@ type DemoteRequest struct {
 	// Mode "fast" is the clean stop of a switchover: the lease is released (not transferred) and the answer carries the proof.
 	ExpectedTerm int64  `json:"expectedTerm"`
 	TransferTo   string `json:"transferTo"`
+	// Candidate is the server that a planned switchover of the map group hands the group to (mode fast, group 0): the old leader records it before it stops, and resumes
+	// its primary later only on that server's word (F7-01).
+	Candidate string `json:"candidate,omitempty"`
 }
 
 // DemoteAnswer is the answer of POST /failover/demote.

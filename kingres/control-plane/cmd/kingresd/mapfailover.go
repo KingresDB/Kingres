@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -74,16 +75,24 @@ type mapFailover struct {
 	resumeOldLeader func(ctx context.Context, oldServer string) (bool, error)
 	// The parts of the resolution of a held-back primary that a test stands in for (nil: the real ones): the calls to other servers, the list of servers, the marker, the end of
 	// the hold, and the two ways of asking an instance whether it is in recovery.
-	callPeer      func(ctx context.Context, server, method, path string, in, out any) error
-	memberList    func(ctx context.Context) ([]string, error)
-	heldBack      func() bool
-	endHold       func(ctx context.Context) error
-	queryInRec    func(ctx context.Context, id int) (bool, error)
-	controlDataOf func(ctx context.Context, id int) (map[string]string, error)
+	candidateRecord func() string // the server that the hold was made for (nil: the record of the lease manager)
+	callPeer        func(ctx context.Context, server, method, path string, in, out any) error
+	memberList      func(ctx context.Context) ([]string, error)
+	heldBack        func() bool
+	endHold         func(ctx context.Context) error
+	queryInRec      func(ctx context.Context, id int) (bool, error)
+	controlDataOf   func(ctx context.Context, id int) (map[string]string, error)
 
 	mu      sync.Mutex
 	running bool
 	lastErr string
+
+	// releasePending says that the lease of a bootstrap that was given up could not be let go of: the next abandon finishes the release (F7-02).
+	releasePending atomic.Bool
+
+	// heldWhy is why the hold of this server's primary of the map group cannot be resolved (empty: it can, or there is none); heldWarned is when it was last named in the log.
+	heldWhy    string
+	heldWarned time.Time
 }
 
 func newMapFailover(dataDir string, svc *cluster.Service, self string, log *slog.Logger, fd *failoverDeps, peers *foPeers, cat *foCatalog, pl *foPlanner, rr *failover.Runner,
@@ -362,7 +371,7 @@ func (m *mapFailover) TaskZero() (task.Task, bool) {
 // Status answers GET /failover while the bootstrap runs: the task id is null until the task is recorded.
 func (m *mapFailover) Status() (failover.Status, bool) {
 	if !m.journal.Active() {
-		return failover.Status{}, false
+		return m.heldStatus()
 	}
 	j, _ := m.journal.Current()
 	phase := "running"
@@ -743,6 +752,13 @@ func (m *mapFailover) abandonLocal(ctx context.Context, reason string) (bool, er
 // abandonLocalFull is abandonLocal with what else it did: for a planned switchover it asks the old leader's server to end the hold of its primary.
 func (m *mapFailover) abandonLocalFull(ctx context.Context, reason string) (mapAbandonAnswer, error) {
 	if !m.journal.Active() {
+		// A bootstrap that was given up and whose lease could not be let go of: the repeat of the abandon finishes the release (F7-02).
+		if cur, ok := m.journal.Current(); ok && !cur.Abandoned.IsZero() && m.releasePending.Load() {
+			if err := m.releaseTheLease(ctx); err != nil {
+				return mapAbandonAnswer{}, problem.New(problem.ServiceUnavailable, "The lease of the map group still cannot be let go of; repeat the call.").WithRetryAfter(5)
+			}
+			return m.afterRelease(ctx, cur, reason), nil
+		}
 		return mapAbandonAnswer{}, nil
 	}
 	cur, _ := m.journal.Current()
@@ -776,17 +792,34 @@ func (m *mapFailover) abandonLocalFull(ctx context.Context, reason string) (mapA
 	}
 	m.log.Warn("the bootstrap of the map group was given up", "reason", reason)
 	// What the bootstrap holds goes with it (F5-02): the fence and holder lease would otherwise be renewed for a bootstrap that no longer runs, and an old primary
-	// that is stopped could not win its lease again.
-	if m.releaseFence != nil {
-		if err := m.releaseFence(ctx); err != nil {
-			m.log.Warn("letting go of the lease of the map group after giving the bootstrap up", "error", err)
-		}
+	// that is stopped could not win its lease again. A lease that cannot be let go of fails the abandon (F7-02): the call answers that it must be repeated and the old
+	// leader is not asked to resume; the repeat finishes the release (the journal is marked, and the promoting call refuses a journal that was given up).
+	if err := m.releaseTheLease(ctx); err != nil {
+		return mapAbandonAnswer{}, problem.New(problem.ServiceUnavailable, "The bootstrap was given up, but its lease of the map group could not be let go of; repeat the call.").WithRetryAfter(5)
 	}
 	unlock()
 	unlock = func() {}
+	return m.afterRelease(ctx, cur, reason), nil
+}
+
+// releaseTheLease lets go of the lease of the bootstrap; a failure is remembered, so that a repeated abandon does it again.
+func (m *mapFailover) releaseTheLease(ctx context.Context) error {
+	if m.releaseFence == nil {
+		return nil
+	}
+	if err := m.releaseFence(ctx); err != nil {
+		m.releasePending.Store(true)
+		m.log.Error("letting go of the lease of the map group after giving the bootstrap up failed", "error", err)
+		return err
+	}
+	m.releasePending.Store(false)
+	return nil
+}
+
+// afterRelease is what follows the release of the lease of a given-up bootstrap: a planned switchover tells the old leader (F5-08) and asks it to end the hold of its
+// primary, because its task may be gone (its kingresd restarted, or the task ended) and the system database is the stopped primary, so nothing else would (F6-01).
+func (m *mapFailover) afterRelease(ctx context.Context, cur journal.Journal, reason string) mapAbandonAnswer {
 	ans := mapAbandonAnswer{Abandoned: true}
-	// A planned switchover also tells the old leader (F5-08), and asks it to end the hold of its primary: its task may be gone (its kingresd restarted, or the task ended),
-	// and the system database is the stopped primary, so nothing else would (F6-01).
 	if cur.Planned != nil && m.tellOldLeader != nil {
 		if err := m.tellOldLeader(ctx, cur.OldServer, cur.Planned.TaskID, reason); err != nil {
 			m.log.Warn("telling the old leader that its switchover of the map group was given up", "error", err)
@@ -799,7 +832,19 @@ func (m *mapFailover) abandonLocalFull(ctx context.Context, reason string) (mapA
 			ans.ResumedServer = cur.OldServer
 		}
 	}
-	return ans, nil
+	return ans
+}
+
+// promoteBlockedByJournal is the refusal of the promoting call on this server for a bootstrap that was given up (F7-02): the call that was queued behind the lifecycle
+// lock must not promote what the abandon let go of, whatever became of the release of the lease.
+func promoteBlockedByJournal(mf *mapFailover, group int32) error {
+	if mf == nil || group != 0 {
+		return nil
+	}
+	if cur, ok := mf.journal.Current(); ok && !cur.Abandoned.IsZero() {
+		return &internalapi.CallError{Status: http.StatusConflict, Code: "conflict", Message: "The bootstrap of the map group that asks for this promotion was given up."}
+	}
+	return nil
 }
 
 // Abandon gives up the bootstrap of the map group that is in progress on this server, or on the server of a standby of the map group: the
@@ -841,8 +886,8 @@ func (m *mapFailover) Abandon(ctx context.Context, actor, reason string) (failov
 	for _, s := range members {
 		var out mapResumeAnswer
 		if s == m.self {
-			out.Resumed, out.Detail = m.resolveHeldBack(ctx)
-		} else if err := m.call(ctx, s, http.MethodPost, "/failover/map/resume", struct{}{}, &out); err != nil {
+			out.Resumed, out.Detail = m.resolveHeldBack(ctx, true)
+		} else if err := m.call(ctx, s, http.MethodPost, "/failover/map/resume", mapResumeBody{Strict: true}, &out); err != nil {
 			continue
 		}
 		if out.Resumed {

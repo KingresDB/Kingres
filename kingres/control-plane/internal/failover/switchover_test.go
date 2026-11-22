@@ -1026,3 +1026,33 @@ func TestARollbackThatCannotAskTheCandidateGoesOnAndTheLeaseDecides(t *testing.T
 		t.Fatalf("the rollback that could not ask the candidate:\n%s", strings.Join(w.log, "\n"))
 	}
 }
+
+// F7-01. The clean stop names the server that the group is handed to, for the map group only: the old leader records it before it stops, and resumes its primary later only
+// on that server's word. The ordinary groups record none.
+func TestTheCleanStopOfTheMapGroupNamesTheCandidate(t *testing.T) {
+	w := mapWorld()
+	r := w.runner()
+	w.fakeClock(r)
+	if name, err := runAll(t, r, mapGracefulInput()); err != nil {
+		t.Fatalf("%s: %v\n%s", name, err, strings.Join(w.log, "\n"))
+	}
+	if len(w.stopCandidates) == 0 {
+		t.Fatalf("no clean stop was asked:\n%s", strings.Join(w.log, "\n"))
+	}
+	for _, c := range w.stopCandidates {
+		if c != "s2" {
+			t.Fatalf("the clean stop of the map group names %q, want s2: %v", c, w.stopCandidates)
+		}
+	}
+	g := gracefulWorld()
+	rg := g.runner()
+	g.fakeClock(rg)
+	if name, err := runAll(t, rg, Input{Mode: ModeGraceful, ServerID: "s1", Groups: []int32{1}, Trigger: "manual", RequestedBy: "tester", Comment: "g"}); err != nil {
+		t.Fatalf("%s: %v\n%s", name, err, strings.Join(g.log, "\n"))
+	}
+	for _, c := range g.stopCandidates {
+		if c != "" {
+			t.Fatalf("the clean stop of an ordinary group names %q: %v", c, g.stopCandidates)
+		}
+	}
+}

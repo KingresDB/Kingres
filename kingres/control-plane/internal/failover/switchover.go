@@ -326,7 +326,7 @@ func (r *Runner) stopClean(ctx context.Context, env *task.Env, sc *stepCtx) erro
 	} else if st, serr := r.Peers.State(ctx, sc.old(), sc.group); !IsCode(merr, "not_primary") && !(serr == nil && len(st.OutOfRecovery()) == 0) {
 		return sc.rollbackFailed(ctx, CodeStandbyBehind, true, "the position of the old primary of shard group %d could not be marked: %v", sc.group, merr)
 	}
-	ans, err := r.Peers.Demote(ctx, sc.old(), DemoteRequest{Group: sc.group, Mode: "fast", ExpectedTerm: run.ExpectedTerm})
+	ans, err := r.Peers.Demote(ctx, sc.old(), DemoteRequest{Group: sc.group, Mode: "fast", ExpectedTerm: run.ExpectedTerm, Candidate: sc.candidateOf(nw)})
 	if err != nil {
 		if IsCode(err, "stale_term") {
 			return sc.rollbackFailed(ctx, CodeSuperseded, false, "another failover changed the catalog term of the cluster")
@@ -400,7 +400,7 @@ func (r *Runner) verify(ctx context.Context, env *task.Env, sc *stepCtx) error {
 		return task.Skip("the map group was handed over already")
 	}
 	// Read the shutdown checkpoint again (the stop is idempotent): it is what the proof is made of.
-	ans, err := r.Peers.Demote(ctx, sc.old(), DemoteRequest{Group: sc.group, Mode: "fast", ExpectedTerm: run.ExpectedTerm})
+	ans, err := r.Peers.Demote(ctx, sc.old(), DemoteRequest{Group: sc.group, Mode: "fast", ExpectedTerm: run.ExpectedTerm, Candidate: sc.candidateOf(nw)})
 	if err != nil || !ans.Stopped || ans.ClusterState != "shut down" || ans.Checkpoint == "" {
 		return sc.rollbackFailed(ctx, CodeSwitchoverUnproven, true, "the shutdown checkpoint of the old primary of shard group %d cannot be read (%v)", sc.group, err)
 	}
@@ -616,4 +616,12 @@ func mapLast(in Input) []int32 {
 		out = append(out, 0)
 	}
 	return out
+}
+
+// candidateOf is the server that the old leader records as the one the map group is handed to; the other groups record none.
+func (sc *stepCtx) candidateOf(nw StandbyRec) string {
+	if sc.group != 0 {
+		return ""
+	}
+	return nw.Server
 }

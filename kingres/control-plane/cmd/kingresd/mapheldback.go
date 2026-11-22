@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -120,20 +121,50 @@ func (m *mapFailover) localStandbyState(ctx context.Context) string {
 	return state
 }
 
+// mapResumeBody is the request of POST /failover/map/resume: Strict asks for the evidence of an operator's call (every server of the cluster must answer).
+type mapResumeBody struct {
+	Strict bool `json:"strict,omitempty"`
+}
+
 // handleMapResume asks this server to resolve the hold of its primary of the map group. The caller is any member: the callee proves what it needs itself.
-func handleMapResume(ctx context.Context, d *haDeps, _ string, _ []byte) (any, error) {
+func handleMapResume(ctx context.Context, d *haDeps, _ string, body []byte) (any, error) {
 	mf := d.MapFailover
 	if mf == nil {
 		return nil, notStarted
 	}
-	resumed, detail := mf.resolveHeldBack(ctx)
+	var b mapResumeBody
+	if len(body) > 0 {
+		if err := json.Unmarshal(body, &b); err != nil {
+			return nil, badBody("a resume request")
+		}
+	}
+	resumed, detail := mf.resolveHeldBack(ctx, b.Strict)
 	return mapResumeAnswer{Resumed: resumed, Detail: detail}, nil
 }
 
-// resolveHeldBack ends the hold of this server's primary of the map group when nothing owns it any more: the primary is held back for a hand-over (the marker of
-// a planned switchover), no bootstrap that names this server as the old leader is active on any server, no standby of the map group was promoted, and a standby of
-// the map group is shown to be in recovery. The lease stays the final authority for who may run: the primary starts again only when this server wins it.
-func (m *mapFailover) resolveHeldBack(ctx context.Context) (bool, string) {
+// candidateOfTheHold is the server that the hand-over of the map group was made to, as the old leader recorded it before it stopped ("" for a hold without a record).
+func (m *mapFailover) candidateOfTheHold() string {
+	if m.candidateRecord != nil {
+		return m.candidateRecord()
+	}
+	if d := m.fd.d; d != nil && d.LeaseMgr != nil {
+		return d.LeaseMgr.Candidate(0)
+	}
+	return ""
+}
+
+// resolveHeldBack ends the hold of this server's primary of the map group when nothing owns it any more. The hold is the guard against reviving a stale primary after a
+// hand-over, so its end needs the word of the server that the group was handed to (F7-01):
+//
+//   - the primary is held back for a hand-over (the marker of a planned switchover);
+//   - no server reports an active bootstrap that names this server as the old leader, and none reports a standby of the map group that was promoted;
+//   - the candidate that was recorded when the primary was stopped answers, and shows its standby in recovery: an unreachable candidate, or one whose standby cannot be
+//     read, blocks (it may be the promoted primary that took writes, and the standby that answers may follow it);
+//   - without a record, and for the operator's call (strict), every server of the cluster answers, none of them says "unknown", and at least one shows a standby in
+//     recovery: a server that does not answer blocks.
+//
+// The lease stays the final authority for who may run: the primary starts again only when this server wins it.
+func (m *mapFailover) resolveHeldBack(ctx context.Context, strict bool) (bool, string) {
 	if !m.isHeldBack() {
 		return false, "the primary of the map group is not held back for a hand-over on this server"
 	}
@@ -141,7 +172,9 @@ func (m *mapFailover) resolveHeldBack(ctx context.Context) (bool, string) {
 	if err != nil {
 		return false, "the servers of the cluster cannot be read: " + err.Error()
 	}
-	proven := 0
+	cand := m.candidateOfTheHold()
+	all := strict || cand == ""
+	proven, candidateProven := 0, false
 	for _, s := range members {
 		if s == m.self {
 			continue
@@ -151,6 +184,12 @@ func (m *mapFailover) resolveHeldBack(ctx context.Context) (bool, string) {
 		err := m.call(cctx, s, http.MethodGet, "/failover/map/bootstrap?"+url.Values{"old": {m.self}}.Encode(), nil, &st)
 		cancel()
 		if err != nil {
+			if s == cand {
+				return false, "the server " + s + ", to which the map group was handed, does not answer"
+			}
+			if all {
+				return false, "the server " + s + " does not answer"
+			}
 			continue
 		}
 		switch {
@@ -158,9 +197,19 @@ func (m *mapFailover) resolveHeldBack(ctx context.Context) (bool, string) {
 			return false, "a bootstrap that names this server as the old leader is active on " + s
 		case st.Standby == "primary":
 			return false, "the standby of the map group on " + s + " was promoted"
+		case st.Standby == "unknown" && (s == cand || all):
+			return false, "the standby of the map group on " + s + " cannot be read"
 		case st.Standby == "in_recovery":
 			proven++
+			if s == cand {
+				candidateProven = true
+			}
+		case s == cand:
+			return false, "the server " + s + ", to which the map group was handed, hosts no standby of it"
 		}
+	}
+	if cand != "" && !candidateProven {
+		return false, "the server " + cand + ", to which the map group was handed, did not show its standby in recovery"
 	}
 	if proven == 0 {
 		return false, "no standby of the map group could be shown to be in recovery"
@@ -186,19 +235,57 @@ func (m *mapFailover) WatchHeldBack(ctx context.Context) {
 			return
 		case <-t.C:
 		}
-		if !m.isHeldBack() {
-			continue
-		}
-		if ok, why := m.resolveHeldBack(ctx); !ok {
-			m.log.Debug("the hold of the primary of the map group has an owner or cannot be resolved yet", "why", why)
-		}
+		m.watchOnce(ctx, time.Now())
 	}
+}
+
+// heldBackWarnEvery is how often a hold that cannot be resolved is named in the log (F7-03).
+const heldBackWarnEvery = time.Minute
+
+// watchOnce is one look at the hold: a hold that is resolved or gone is forgotten, one that cannot be resolved is remembered for the failover status and named in the
+// log at warning level once a minute, with the reason and the call that an operator can make.
+func (m *mapFailover) watchOnce(ctx context.Context, now time.Time) {
+	if !m.isHeldBack() {
+		m.setHeldWhy("", now)
+		return
+	}
+	if ok, why := m.resolveHeldBack(ctx, false); ok {
+		m.setHeldWhy("", now)
+	} else {
+		m.setHeldWhy(why, now)
+	}
+}
+
+func (m *mapFailover) setHeldWhy(why string, now time.Time) {
+	m.mu.Lock()
+	m.heldWhy = why
+	warn := why != "" && now.Sub(m.heldWarned) >= heldBackWarnEvery
+	if warn {
+		m.heldWarned = now
+	}
+	m.mu.Unlock()
+	if warn {
+		m.log.Warn("the primary of the map group is held back for a switchover that nothing owns, and it cannot be started again yet; abandonMapGroupBootstrap asks every server to try again", "why", why)
+	}
+}
+
+// heldStatus is the failover status of a hold that nothing owns and that cannot be resolved (F7-03): the system database is the held-back primary, so no alert can be
+// recorded, and the status is what an operator can read.
+func (m *mapFailover) heldStatus() (failover.Status, bool) {
+	m.mu.Lock()
+	why := m.heldWhy
+	m.mu.Unlock()
+	if why == "" || !m.isHeldBack() {
+		return failover.Status{}, false
+	}
+	reason := "The primary of the map group is held back for a switchover that nothing owns, and it cannot be started again yet: " + why + ". abandonMapGroupBootstrap asks every server to try again."
+	return failover.Status{State: "paused", PausedReason: &reason, NeedsDecision: []failover.Blocker{}, Groups: []failover.GroupProgress{}}, true
 }
 
 // resumeOldLeaderOf asks the old leader's server to resolve its hold (a planned bootstrap that was given up): best effort; the loop of that server does it as well.
 func (m *mapFailover) resumeOldLeaderOf(ctx context.Context, oldServer string) (bool, error) {
 	var out mapResumeAnswer
-	if err := m.call(ctx, oldServer, http.MethodPost, "/failover/map/resume", struct{}{}, &out); err != nil {
+	if err := m.call(ctx, oldServer, http.MethodPost, "/failover/map/resume", mapResumeBody{}, &out); err != nil {
 		return false, err
 	}
 	if !out.Resumed && out.Detail != "" {
