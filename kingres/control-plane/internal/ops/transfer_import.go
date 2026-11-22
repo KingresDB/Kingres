@@ -67,7 +67,7 @@ type importParams struct {
 }
 
 // ImportFault is the fault point hook of the tests (nil in production): it is called with the name of a point of the commit protocol and the process id of
-// the backend of the import, so that a test can end the connection at that point. The points are "beforeStart" (the first step of the task, no connection), "beforeCheck" (the table check of the task, no connection), "beforeIntent", "intentWrite", "afterIntent" and "afterCommit".
+// the backend of the import, so that a test can end the connection at that point. The points are "beforeStart" (the first step of the task, no connection), "beforeCheck" and "afterCheck" (before and after the table check of the task, no connection), "beforeIntent", "intentWrite", "afterIntent" and "afterCommit".
 var ImportFault func(point string, backendPID uint32) error
 
 // StartGap is called by a test between the check of the limits of the transfers and the start of the task, to widen the window that startMu closes.
@@ -499,6 +499,7 @@ func (o *Ops) stepImportCheckTable(ctx context.Context, env *task.Env) error {
 			return transfer.Errorf(transfer.CodeForbidden, false, "the type of a column of the table changed since the request")
 		}
 	}
+	_ = importFault("afterCheck", nil)
 	return nil
 }
 
@@ -620,6 +621,9 @@ func (o *Ops) stepImportLoad(ctx context.Context, env *task.Env) error {
 		return transfer.Errorf(transfer.CodeSessionLost, true, "the check of the role could not be made now; repeat the operation")
 	}
 	secret, serr := o.markerSecret(ctx, p.Database)
+	if errors.Is(serr, errMarkerNotVerified) {
+		return transfer.Errorf(transfer.CodeForbidden, false, "the schema kingres_transfer of the database is not what the control plane makes; an operator must remove it")
+	}
 	if serr != nil {
 		return transfer.Errorf(transfer.CodeSessionLost, true, "the marker of the database could not be read now; repeat the operation")
 	}
