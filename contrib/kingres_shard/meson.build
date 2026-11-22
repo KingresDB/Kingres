@@ -98,6 +98,7 @@ tests += {
       'bulk_plans',
       'pushdown_shippable',
       'pushdown_plans',
+      'repartition_plans',
       'schema_catalog',
       'upgrade',
       'pg_facts',
@@ -330,6 +331,7 @@ tests += {
       't/260_repartition_join.pl',
       't/261_repartition_security.pl',
       't/262_repartition_moves.pl',
+      't/267_repartition_equiv.pl',
     ],
   },
 }

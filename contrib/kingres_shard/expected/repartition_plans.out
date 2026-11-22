@@ -1,0 +1,379 @@
+-- sql/repartition_plans.sql
+--   Phase 12 (design/analytics-phase12-queries.md, 4.3, 4.7, 4.12 and 14.1): the plans of the repartitioned join.  Which statements
+--   get the Kingres Fragment Scan with "Pushed: repartitioned join" (the rows of the join come back, or a partial aggregation above
+--   it), which role each table has, which statements do not and why (the DEBUG1 message of the planner), and what the switches do.
+--
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+--
+-- The cluster has a second shard group that does not exist as a server: the odd buckets belong to it.  Nothing here is executed
+-- against it: the plans are shown.
+\set SHOW_CONTEXT never
+SET search_path = public;
+CREATE EXTENSION kingres_shard;
+SELECT kingres.init_cluster('localhost', current_setting('port')::int);
+ init_cluster 
+--------------
+ 
+(1 row)
+
+CREATE TABLE o (id int PRIMARY KEY, cust int, amount int, note text);
+CREATE TABLE cu (id int PRIMARY KEY, region int, name text);
+CREATE TABLE it (id int PRIMARY KEY, ord int, sku int);
+CREATE TABLE far (id int PRIMARY KEY, w int);
+CREATE TABLE r (k int PRIMARY KEY, label text);
+CREATE TABLE plain (x int, y text);
+SELECT kingres.create_distributed_table('o', 'id', bucket_count => 8);
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+SELECT kingres.create_distributed_table('cu', 'id', colocate_with => 'o');
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+SELECT kingres.create_distributed_table('it', 'id', colocate_with => 'o');
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+SELECT kingres.create_distributed_table('far', 'id', bucket_count => 4);
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+SELECT kingres.create_reference_table('r');
+ create_reference_table 
+------------------------
+ 
+(1 row)
+
+INSERT INTO kingres.node (node_id, group_id, host, port, role)
+  VALUES (2, 1, '127.0.0.1', 1, 'primary');
+UPDATE kingres.bucket_map SET group_id = 1 WHERE bucket % 2 = 1;
+-- The plan of a statement, one line per row, with the placement number (a hash of the map) hidden.
+CREATE FUNCTION plan_of(q text) RETURNS SETOF text LANGUAGE plpgsql AS $$
+DECLARE l text;
+BEGIN
+  FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+    RETURN NEXT regexp_replace(l, 'place=-?[0-9]+', 'place=N');
+  END LOOP;
+END $$;
+-- What is pushed: the "Pushed" line of the plan, or "none"
+CREATE FUNCTION pushed(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE l text; r text := 'none';
+BEGIN
+  FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+    IF l LIKE '%Pushed:%' THEN r := btrim(l); END IF;
+  END LOOP;
+  RETURN r;
+END $$;
+SET jit = off;
+SET kingres_shard.enable_repartition_join = force;
+SET kingres_shard.enable_partial_aggregation = on;
+-- ---------------------------------------------------------------------------
+-- The role of each table
+-- ---------------------------------------------------------------------------
+\echo -- o is moved to the groups of cu (the other way round, the same); a filter on each side
+-- o is moved to the groups of cu (the other way round, the same); a filter on each side
+SELECT * FROM plan_of('SELECT o.id, cu.name FROM o JOIN cu ON cu.id = o.cust');
+                                                                                                           plan_of                                                                                                            
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (Kingres Fragment Scan)
+   Pushed: repartitioned join (one table moved by its join key)
+   Groups: 2 of 2 (local + 1 remote)
+   Remote SQL: SELECT o.id, cu.name FROM (( SELECT (u.c1)::integer AS id, (u.c2)::integer AS cust, NULL::text AS amount, NULL::text AS note FROM UNNEST($1, $2) u(c1, c2)) o JOIN public.cu ON ((cu.id = o.cust))) WHERE true
+   ->  Custom Scan (Kingres Distributed Scan)
+         Remote groups: 1
+         Remote SQL: SELECT id, cust FROM public.o AS ks_t
+         ->  Append
+               ->  Seq Scan on o_b0000 o_1
+               ->  Seq Scan on o_b0001 o_2
+               ->  Seq Scan on o_b0002 o_3
+               ->  Seq Scan on o_b0003 o_4
+               ->  Seq Scan on o_b0004 o_5
+               ->  Seq Scan on o_b0005 o_6
+               ->  Seq Scan on o_b0006 o_7
+               ->  Seq Scan on o_b0007 o_8
+(16 rows)
+
+SELECT * FROM plan_of('SELECT cu.id, o.id FROM cu JOIN o ON o.cust = cu.id WHERE cu.region = 3 AND o.amount > 5');
+                                                                                                                plan_of                                                                                                                
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (Kingres Fragment Scan)
+   Pushed: repartitioned join (one table moved by its join key)
+   Groups: 2 of 2 (local + 1 remote)
+   Remote SQL: SELECT cu.id, o.id FROM (public.cu JOIN ( SELECT (u.c1)::integer AS id, (u.c2)::integer AS cust, NULL::text AS amount, NULL::text AS note FROM UNNEST($1, $2) u(c1, c2)) o ON ((o.cust = cu.id))) WHERE (cu.region = 3)
+   ->  Custom Scan (Kingres Distributed Scan)
+         Filter: (amount > 5)
+         Remote groups: 1
+         Remote SQL: SELECT id, cust, amount FROM public.o AS ks_t WHERE ((amount > 5))
+         ->  Append
+               ->  Seq Scan on o_b0000 o_1
+                     Filter: (amount > 5)
+               ->  Seq Scan on o_b0001 o_2
+                     Filter: (amount > 5)
+               ->  Seq Scan on o_b0002 o_3
+                     Filter: (amount > 5)
+               ->  Seq Scan on o_b0003 o_4
+                     Filter: (amount > 5)
+               ->  Seq Scan on o_b0004 o_5
+                     Filter: (amount > 5)
+               ->  Seq Scan on o_b0005 o_6
+                     Filter: (amount > 5)
+               ->  Seq Scan on o_b0006 o_7
+                     Filter: (amount > 5)
+               ->  Seq Scan on o_b0007 o_8
+                     Filter: (amount > 5)
+(25 rows)
+
+\echo -- the join condition in WHERE; a reference table beside; three tables, one of them moved
+-- the join condition in WHERE; a reference table beside; three tables, one of them moved
+SELECT pushed('SELECT o.id, cu.name FROM o, cu WHERE cu.id = o.cust');
+                            pushed                            
+--------------------------------------------------------------
+ Pushed: repartitioned join (one table moved by its join key)
+(1 row)
+
+SELECT pushed('SELECT o.id, r.label FROM o JOIN cu ON cu.id = o.cust JOIN r ON r.k = cu.region');
+                            pushed                            
+--------------------------------------------------------------
+ Pushed: repartitioned join (one table moved by its join key)
+(1 row)
+
+SELECT pushed('SELECT o.id, cu.name, it.sku FROM o JOIN cu ON cu.id = o.cust JOIN it ON it.id = cu.id');
+                            pushed                            
+--------------------------------------------------------------
+ Pushed: repartitioned join (one table moved by its join key)
+(1 row)
+
+\echo -- the table that is moved is of another colocation group: its rows go by the layout of the group that stays
+-- the table that is moved is of another colocation group: its rows go by the layout of the group that stays
+SELECT pushed('SELECT far.id, o.id FROM far JOIN o ON o.cust = far.id');
+                            pushed                            
+--------------------------------------------------------------
+ Pushed: repartitioned join (one table moved by its join key)
+(1 row)
+
+SELECT pushed('SELECT o.id, far.w FROM o JOIN far ON far.id = o.cust');
+                            pushed                            
+--------------------------------------------------------------
+ Pushed: repartitioned join (one table moved by its join key)
+(1 row)
+
+\echo -- a LEFT JOIN to the moved table
+-- a LEFT JOIN to the moved table
+SELECT * FROM plan_of('SELECT cu.id, o.id FROM cu LEFT JOIN o ON o.cust = cu.id');
+                                                                                                             plan_of                                                                                                             
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (Kingres Fragment Scan)
+   Pushed: repartitioned join (one table moved by its join key)
+   Groups: 2 of 2 (local + 1 remote)
+   Remote SQL: SELECT cu.id, o.id FROM (public.cu LEFT JOIN ( SELECT (u.c1)::integer AS id, (u.c2)::integer AS cust, NULL::text AS amount, NULL::text AS note FROM UNNEST($1, $2) u(c1, c2)) o ON ((o.cust = cu.id))) WHERE true
+   ->  Custom Scan (Kingres Distributed Scan)
+         Remote groups: 1
+         Remote SQL: SELECT id, cust FROM public.o AS ks_t
+         ->  Append
+               ->  Seq Scan on o_b0000 o_1
+               ->  Seq Scan on o_b0001 o_2
+               ->  Seq Scan on o_b0002 o_3
+               ->  Seq Scan on o_b0003 o_4
+               ->  Seq Scan on o_b0004 o_5
+               ->  Seq Scan on o_b0005 o_6
+               ->  Seq Scan on o_b0006 o_7
+               ->  Seq Scan on o_b0007 o_8
+(16 rows)
+
+-- ---------------------------------------------------------------------------
+-- Aggregates above the join: every group aggregates its rows of the join, this node combines
+-- ---------------------------------------------------------------------------
+\echo -- a grouped aggregate, an aggregate without grouping, HAVING, ORDER BY with LIMIT
+-- a grouped aggregate, an aggregate without grouping, HAVING, ORDER BY with LIMIT
+SELECT * FROM plan_of('SELECT cu.region, count(*), sum(o.amount) FROM o JOIN cu ON cu.id = o.cust GROUP BY cu.region');
+                                                                                                                                  plan_of                                                                                                                                   
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: region
+   ->  Custom Scan (Kingres Fragment Scan)
+         Pushed: repartitioned join, partial aggregate (one table moved by its join key)
+         Groups: 2 of 2 (local + 1 remote)
+         Remote SQL: SELECT cu.region, count(*), sum(o.amount) FROM (( SELECT NULL::text AS id, (u.c1)::integer AS cust, (u.c2)::integer AS amount, NULL::text AS note FROM UNNEST($1, $2) u(c1, c2)) o JOIN public.cu ON ((cu.id = o.cust))) WHERE true GROUP BY cu.region
+         ->  Custom Scan (Kingres Distributed Scan)
+               Remote groups: 1
+               Remote SQL: SELECT amount, cust FROM public.o AS ks_t
+               ->  Append
+                     ->  Seq Scan on o_b0000 o_1
+                     ->  Seq Scan on o_b0001 o_2
+                     ->  Seq Scan on o_b0002 o_3
+                     ->  Seq Scan on o_b0003 o_4
+                     ->  Seq Scan on o_b0004 o_5
+                     ->  Seq Scan on o_b0005 o_6
+                     ->  Seq Scan on o_b0006 o_7
+                     ->  Seq Scan on o_b0007 o_8
+(18 rows)
+
+SELECT pushed('SELECT count(*), max(cu.id) FROM o JOIN cu ON cu.id = o.cust');
+                                     pushed                                      
+---------------------------------------------------------------------------------
+ Pushed: repartitioned join, partial aggregate (one table moved by its join key)
+(1 row)
+
+SELECT pushed('SELECT cu.region, count(*) FROM o JOIN cu ON cu.id = o.cust GROUP BY cu.region HAVING count(*) > 10');
+                                     pushed                                      
+---------------------------------------------------------------------------------
+ Pushed: repartitioned join, partial aggregate (one table moved by its join key)
+(1 row)
+
+SELECT pushed('SELECT o.note, sum(o.amount) FROM o JOIN cu ON cu.id = o.cust GROUP BY o.note ORDER BY 2 DESC LIMIT 3');
+                                     pushed                                      
+---------------------------------------------------------------------------------
+ Pushed: repartitioned join, partial aggregate (one table moved by its join key)
+(1 row)
+
+\echo -- an aggregate that is not split stays above the rows of the join
+-- an aggregate that is not split stays above the rows of the join
+SELECT pushed('SELECT cu.region, count(DISTINCT o.note) FROM o JOIN cu ON cu.id = o.cust GROUP BY cu.region');
+                            pushed                            
+--------------------------------------------------------------
+ Pushed: repartitioned join (one table moved by its join key)
+(1 row)
+
+SET kingres_shard.enable_partial_aggregation = off;
+SELECT pushed('SELECT cu.region, count(*) FROM o JOIN cu ON cu.id = o.cust GROUP BY cu.region');
+                            pushed                            
+--------------------------------------------------------------
+ Pushed: repartitioned join (one table moved by its join key)
+(1 row)
+
+SET kingres_shard.enable_partial_aggregation = on;
+-- ---------------------------------------------------------------------------
+-- The switches
+-- ---------------------------------------------------------------------------
+SET kingres_shard.enable_repartition_join = off;
+SELECT pushed('SELECT o.id, cu.name FROM o JOIN cu ON cu.id = o.cust');
+ pushed 
+--------
+ none
+(1 row)
+
+SET kingres_shard.enable_repartition_join = on;
+SELECT pushed('SELECT o.id, cu.name FROM o JOIN cu ON cu.id = o.cust');
+ pushed 
+--------
+ none
+(1 row)
+
+SET kingres_shard.repartition_max_bytes = 1024;
+SELECT pushed('SELECT o.id, cu.name FROM o JOIN cu ON cu.id = o.cust');
+ pushed 
+--------
+ none
+(1 row)
+
+RESET kingres_shard.repartition_max_bytes;
+SET jit = off;
+SET kingres_shard.enable_repartition_join = force;
+SET kingres_shard.enable_pushdown = off;
+SELECT pushed('SELECT o.id, cu.name FROM o JOIN cu ON cu.id = o.cust');
+ pushed 
+--------
+ none
+(1 row)
+
+RESET kingres_shard.enable_pushdown;
+-- ---------------------------------------------------------------------------
+-- The statements that are not repartitioned, and why (DEBUG1 of the planner): the complete scan answers them
+-- ---------------------------------------------------------------------------
+SET client_min_messages = debug1;
+\echo -- an outer join other than one LEFT JOIN to a table
+-- an outer join other than one LEFT JOIN to a table
+SELECT pushed('SELECT o.id, cu.name FROM o FULL JOIN cu ON cu.id = o.cust');
+DEBUG:  kingres_shard: no pushdown: a FULL JOIN of distributed tables does not equate their distribution keys in its ON clause
+DEBUG:  kingres_shard: no repartitioned join: it has an outer join that a repartitioned join does not run (only a LEFT JOIN to one table)
+ pushed 
+--------
+ none
+(1 row)
+
+SELECT pushed('SELECT cu.id, o.id FROM cu LEFT JOIN o ON o.cust = cu.id LEFT JOIN it ON it.id = cu.id');
+DEBUG:  kingres_shard: no pushdown: an outer join of distributed tables does not equate their distribution keys in its ON clause
+DEBUG:  kingres_shard: no repartitioned join: it has an outer join other than one LEFT JOIN to a table
+ pushed 
+--------
+ none
+(1 row)
+
+\echo -- the moved table would be the preserved side
+-- the moved table would be the preserved side
+SELECT pushed('SELECT o.id, cu.name FROM o LEFT JOIN cu ON cu.id = o.cust');
+DEBUG:  kingres_shard: no pushdown: an outer join of distributed tables does not equate their distribution keys in its ON clause
+DEBUG:  kingres_shard: no repartitioned join: with a LEFT JOIN only the table on its nullable side can be moved, and the others do not leave it one key class to be aligned with
+ pushed 
+--------
+ none
+(1 row)
+
+\echo -- a join on an expression, a join that is not an equality
+-- a join on an expression, a join that is not an equality
+SELECT pushed('SELECT o.id, cu.name FROM o JOIN cu ON cu.id = o.cust + 1');
+DEBUG:  kingres_shard: no pushdown: the distributed tables are not all joined on their distribution keys (more than one key class)
+DEBUG:  kingres_shard: no repartitioned join: the distributed tables are not joined so that one repartition aligns them (the other tables must share one key class and the shipped table must equate a column with it)
+ pushed 
+--------
+ none
+(1 row)
+
+SELECT pushed('SELECT o.id, cu.id FROM o JOIN cu ON cu.region < o.amount');
+DEBUG:  kingres_shard: no pushdown: the distributed tables are not all joined on their distribution keys (more than one key class)
+DEBUG:  kingres_shard: no repartitioned join: the distributed tables are not joined so that one repartition aligns them (the other tables must share one key class and the shipped table must equate a column with it)
+ pushed 
+--------
+ none
+(1 row)
+
+\echo -- two tables that would both have to move
+-- two tables that would both have to move
+SELECT pushed('SELECT o.id, it.id FROM o JOIN it ON it.sku = o.amount');
+DEBUG:  kingres_shard: no pushdown: the distributed tables are not all joined on their distribution keys (more than one key class)
+DEBUG:  kingres_shard: no repartitioned join: the distributed tables are not joined so that one repartition aligns them (the other tables must share one key class and the shipped table must equate a column with it)
+ pushed 
+--------
+ none
+(1 row)
+
+\echo -- a table that is not distributed
+-- a table that is not distributed
+SELECT pushed('SELECT o.id, plain.y FROM o JOIN plain ON plain.x = o.cust');
+DEBUG:  kingres_shard: no pushdown: it reads a local table, which the other shard groups do not have
+DEBUG:  kingres_shard: no repartitioned join: it reads a local table, which the other shard groups do not have
+ pushed 
+--------
+ none
+(1 row)
+
+RESET client_min_messages;
+\echo -- a sub-select in the statement
+-- a sub-select in the statement
+SELECT pushed('SELECT o.id FROM o JOIN cu ON cu.id = o.cust WHERE o.amount > (SELECT avg(amount) FROM o)');
+ pushed 
+--------
+ none
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- Clean up
+-- ---------------------------------------------------------------------------
+RESET jit;
+RESET kingres_shard.enable_repartition_join;
+RESET kingres_shard.enable_partial_aggregation;
+UPDATE kingres.bucket_map SET group_id = 0;
+DELETE FROM kingres.node WHERE node_id = 2;
+DROP TABLE o, cu, it, far, r, plain;
+DROP FUNCTION plan_of(text);
+DROP FUNCTION pushed(text);
+DROP EXTENSION kingres_shard;
