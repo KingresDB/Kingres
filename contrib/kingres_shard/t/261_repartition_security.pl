@@ -225,4 +225,23 @@ unlike($err, qr/KS001/, '... not as a stale map');
 isnt($rc, 0, 'F: rp=2 on a partial text with one sent table is refused');
 unlike($err, qr/KS001/, '... not as a stale map');
 
+# G: the moved side of a LEFT JOIN (review P12J-02).  The planner offers only the nullable table of a LEFT JOIN as the one to move
+# (an optimisation: the group would refuse the other); the group's own rule is what makes it correct: a moved (routed) table on the
+# preserved side of an outer join would be emitted by every group for the rows it does not match, so the text is refused.  A fragment
+# of that shape is sent to the group directly, with its controls: the same sub-select in an inner join, and on the nullable side.
+{
+	my $osub = q{SELECT u.c1::int AS id, u.c2::int AS cust, NULL::int AS amount FROM ROWS FROM (unnest($1::text[]), unnest($2::text[])) AS u(c1, c2)};
+	($rc, $out, $err) = as_node($n2, 2, fragment(' rp=1', "SELECT o.id, cu.name FROM ($osub) o JOIN public.cu ON cu.id = o.cust", $ids, $custs));
+	is($rc, 0, 'G: control: the moved table in an inner join runs on a group') or diag($err);
+	($rc, $out, $err) = as_node($n2, 2, fragment(' rp=1', "SELECT cu.id, o.id FROM public.cu LEFT JOIN ($osub) o ON cu.id = o.cust", $ids, $custs));
+	is($rc, 0, 'G: control: the moved table on the nullable side of a LEFT JOIN runs on a group') or diag($err);
+	($rc, $out, $err) = as_node($n2, 2, fragment(' rp=1', "SELECT o.id, cu.name FROM ($osub) o LEFT JOIN public.cu ON cu.id = o.cust", $ids, $custs));
+	isnt($rc, 0, 'G: the moved table on the preserved side of a LEFT JOIN is refused by the group');
+	like($err, qr/does not accept the fragment/, '... as a fragment that the node does not accept') or diag($err);
+	unlike($err, qr/KS001/, '... not as a stale map');
+	($rc, $out, $err) = as_node($n2, 2, fragment(' rp=1', "SELECT o.id, cu.name FROM public.cu RIGHT JOIN ($osub) o ON cu.id = o.cust", $ids, $custs));
+	isnt($rc, 0, 'G: the same with a RIGHT JOIN written the other way round is refused');
+	unlike($err, qr/KS001/, '... not as a stale map');
+}
+
 done_testing();

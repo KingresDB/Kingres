@@ -546,7 +546,12 @@ kingres_shard_repart_prepare(Query *parse, const char **why)
 		List	   *dist = NIL;
 		int			nanch = 0;
 
-		/* with a LEFT JOIN, only the table on its nullable side can be moved */
+		/*
+		 * with a LEFT JOIN, only the table on its nullable side can be moved.  This is an optimisation: a path that
+		 * moves a preserved table is never offered, but it would be refused anyway, by the group, whose analysis of
+		 * the shipped text says "the preserved side of an outer join is replicated" (pushdown.c); the group-side
+		 * rule is what makes the result correct, and t/261 section G sends such a text to a group directly.
+		 */
 		if (c.outer_rti != 0 && rel->rti != c.outer_rti)
 			continue;
 		foreach(lo, drels)
