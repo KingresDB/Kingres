@@ -45,6 +45,7 @@
 #include "utils/guc.h"
 
 #include "catalog.h"
+#include "count_distinct.h"
 #include "dist_scan.h"
 #include "fragment_scan.h"
 #include "fanout.h"
@@ -514,6 +515,7 @@ _PG_init(void)
 	kingres_shard_fanout_init();
 	kingres_shard_dist_scan_init();
 	kingres_shard_fragment_scan_init();
+	kingres_shard_count_distinct_init();
 	kingres_shard_planner_init();
 	kingres_shard_utility_init();
 	kingres_shard_remote_scan_init();

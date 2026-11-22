@@ -2314,6 +2314,37 @@ parent (a columnar leaf for cold data next to heap leaves); `internal_partition_
 - **The ledger (rule L1).**  A ledger table cannot be columnar and the reverse: see the README of `kingres_ledger` (`ledger_enable` refuses a columnar table;
   a rewrite by `SET ACCESS METHOD` of a ledger table is rejected).
 
+## Approximate `count(DISTINCT x)` (version 0.9, phase 12)
+
+Design: [`analytics-phase12-queries.md`](../../kingres/docs/design/analytics-phase12-queries.md), section 9.8.  Two settings, both `USERSET`:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `kingres_shard.count_distinct_mode` | `exact` | `exact` or `approximate`. **The one setting that changes results**: it is never on by default, and the web console turns it on for a database with `ALTER DATABASE ... SET`. A session can set it for itself. |
+| `kingres_shard.count_distinct_error_rate` | `0.01` | 0.0005 to 0.1.  The precision `p` of the sketch is the smallest from 4 to 18 with `1.04 / sqrt(2^p)` not above the rate: 0.01 gives 14, 0.005 gives 16, 0.1 gives 7, 0.0005 is capped at 18. |
+
+With `approximate` the planner hook rewrites, before the statement is analyzed, in **every query level that reads a hash-distributed table in its own range table** (a sub-select, a CTE, a sub-link and the top level are levels; a level that has none, a reference table or a local table stays exact), each
+
+```
+count(DISTINCT e) [FILTER (WHERE ...)]      ->      kingres_sketch.approx_count_distinct(e, p) [FILTER (WHERE ...)]
+```
+
+in the target list and in `HAVING`.  The `Aggref` keeps its place, its filter and its level; the function is replaced, `DISTINCT` is cleared and `p` is added as a
+constant.  The new aggregate has a combine function and serial functions, so the statement takes the partial aggregation of phase 2b
+(`enable_partial_aggregation`) and every shard group answers with one sketch per group value, at most 12 KB at `p = 14`, not with its rows.  The answer is the number
+that `approx_count_distinct(e, p)` gives on the same rows (the merge of sketches is exact), within `1.04 / sqrt(2^p)` of the exact one.
+
+Left alone, the statement stays exact: an argument of a type that is not a built-in scalar type with an extended hash function (a user type, an array, a range, an enum, a record,
+`oid` and the `reg*` types, whose hash depends on an object identifier), `count(DISTINCT e ORDER BY ...)`, and an aggregate of another level than the one that reads the
+table.  The rewrite is made for the session that plans the statement: a view or a function defined while the setting was on is planned with the setting of the session that runs
+it, and a cached generic plan keeps what it was planned with.  It is made before the shortcut for a cluster of one shard group, so the answer does not depend on the number of
+groups.
+
+It needs `kingres_sketch` at a version that the list of "Objects of extensions" accepts and `kingres_shard.shippable_extensions` that allows it.  Without it the setting does
+nothing and raises one warning per session (`count_distinct_mode is approximate but kingres_sketch is not installed in this database, or its version is not one that kingres_shard
+accepts`).  `EXPLAIN` shows `approx_count_distinct(...)` in the aggregate; the design's extra line `Rewritten: count(DISTINCT x) -> approximate (p = 14)` is not printed in 0.9.
+Test: `t/273_count_distinct_mode`.
+
 ## Moving buckets and rebalancing (version 0.3, phase 4)
 
 Design: [`kingres/docs/design/shard-phase4.md`](../../kingres/docs/design/shard-phase4.md)

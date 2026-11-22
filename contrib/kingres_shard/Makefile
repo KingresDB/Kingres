@@ -12,6 +12,7 @@ OBJS = \
 	src/bucket_move.o \
 	src/catalog.o \
 	src/copy_routed.o \
+	src/count_distinct.o \
 	src/dist_scan.o \
 	src/dist_table.o \
 	src/fanout.o \

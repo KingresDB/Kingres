@@ -108,6 +108,7 @@
 #include "kingres_shard.h"
 #include "node_conn.h"
 #include "pg_compat.h"
+#include "count_distinct.h"
 #include "planner.h"
 #include "pushdown.h"
 #include "remote_scan.h"
@@ -3478,6 +3479,13 @@ planner_hook_body(Query *parse, const char *query_string,
 	cat = kingres_shard_catalog();
 	if (!cat->present || (cat->ndist_tables == 0 && cat->nschema_tables == 0 && cat->ndist_schemas == 0) || cat->local_group_id == -1)
 		return pass_through(parse, query_string, cursorOptions, boundParams);
+
+	/*
+	 * kingres_shard.count_distinct_mode = approximate: count(DISTINCT x) becomes a sketch aggregate before the analysis (design 9.8).  Before the
+	 * single-group shortcut below: the answer of a statement must not depend on the number of shard groups.
+	 */
+	if (kingres_shard_count_distinct_mode == KS_COUNT_DISTINCT_APPROXIMATE && !kingres_shard_session_forwarded())
+		(void) kingres_shard_apply_count_distinct(parse, cat);
 
 	/* With one shard group every bucket is local. */
 	if (cat->ngroups <= 1 && cat->local_group_id >= 0 && !kingres_shard_session_forwarded())
