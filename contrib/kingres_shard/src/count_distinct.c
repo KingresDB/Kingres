@@ -116,10 +116,10 @@ type_hashable(Oid typid)
 		return false;
 	if (OidIsValid(get_element_type(base)))
 		return false;
-	tce = lookup_type_cache(base, TYPECACHE_HASH_EXTENDED_PROC);
-	if (!OidIsValid(tce->hash_extended_proc))
+	tce = lookup_type_cache(base, TYPECACHE_HASH_EXTENDED_PROC_FINFO);
+	if (!OidIsValid(tce->hash_extended_proc_finfo.fn_oid))
 		return false;
-	if (tce->hash_extended_proc == F_HASHOIDEXTENDED || tce->hash_extended_proc == F_HASHOIDVECTOREXTENDED)
+	if (tce->hash_extended_proc_finfo.fn_oid == F_HASHOIDEXTENDED || tce->hash_extended_proc_finfo.fn_oid == F_HASHOIDVECTOREXTENDED)
 		return false;
 	return true;
 }
