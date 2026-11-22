@@ -644,6 +644,12 @@ describe('the time-partitioning policy', () => {
     // 3 days ahead exist, 7 are wanted: the partitions of the next five days are created, and the one that is old enough is converted.
     expect(plan.actions.filter((a) => a.kind === 'create')).toHaveLength(5)
     expect(plan.actions.filter((a) => a.kind === 'convert')).toHaveLength(1)
+    // The plan carries no sizes, not even for a conversion.
+    expect(
+      plan.actions
+        .filter((a) => a.kind === 'convert')
+        .every((a) => a.bytesBefore === null && a.bytesAfter === null),
+    ).toBe(true)
     expect(JSON.stringify(await partitions())).toBe(before)
     expect(getState().audit.some((e) => e.action === ('planPartitionPolicy' as never))).toBe(false)
   })

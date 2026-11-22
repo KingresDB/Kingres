@@ -1557,3 +1557,26 @@ describe('the detach path of the preview (P12W9, M17)', () => {
     expect(dialog.queryByTestId('policy-preview-deletes')).not.toBeInTheDocument()
   })
 })
+
+describe('a plan that cannot be read again (P12W3, N2)', () => {
+  it('holds Run now when a later read of the plan fails, although an older plan is still shown', async () => {
+    const { http, HttpResponse } = await import('msw')
+    sw('analytics=timeseries')
+    const user = userEvent.setup()
+    const { queryClient } = await renderApp(table('metrics'))
+    await user.click(await screen.findByTestId('policy-run'))
+    const dialog = await dialogOf(/^run the policy of public\.metrics now/i)
+    const start = await dialog.findByRole('button', { name: /^run now$/i })
+    await enabled(start)
+    mockServer.use(
+      http.post('*/partition-policy/plan', () =>
+        HttpResponse.json(
+          { type: 'about:blank', title: 'x', status: 500, code: 'internal_error' },
+          { status: 500 },
+        ),
+      ),
+    )
+    await queryClient.refetchQueries({ queryKey: ['partitionPlan'] })
+    await waitFor(() => expect(start).toBeDisabled())
+  })
+})
