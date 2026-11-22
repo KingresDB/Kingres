@@ -28,9 +28,11 @@ const (
 // Calls lists the keys of the internal calls the agent answers.
 var Calls = []string{CallCredentialsInstall, CallCredentialsRemove, CallCredentialsList, CallCredentialsFetch}
 
-// ListResponse is the answer of CallCredentialsList: the target ids that the server has a file for.
+// ListResponse is the answer of CallCredentialsList: the target ids that the server has a file for, and for each file that can be opened
+// the digest of what it holds and when it was written (P7F-01; an older server sends no copies, and the leader then cannot tell a stale file).
 type ListResponse struct {
-	IDs []int64 `json:"ids"`
+	IDs    []int64    `json:"ids"`
+	Copies []CopyInfo `json:"copies,omitempty"`
 }
 
 // FetchRequest is the body of CallCredentialsFetch; FetchResponse its answer, the file as the holder has it (standard base64).
@@ -81,6 +83,9 @@ func (a *Agent) Handle(_ context.Context, key string, body []byte) (any, error) 
 			return nil, bad("bad_request", "The kind is not known on this server.", http.StatusBadRequest)
 		}
 		if err := a.Creds.Install(in.TargetID, in.Kind, raw); err != nil {
+			if errors.Is(err, ErrInstallWrite) {
+				return nil, bad("credentials_not_written", "The credentials file could not be written on this server.", http.StatusInternalServerError)
+			}
 			if errors.Is(err, ErrCredentials) {
 				return nil, bad("passphrase_mismatch", "The credentials file cannot be opened with this server's passphrase file.", http.StatusConflict)
 			}
@@ -95,7 +100,13 @@ func (a *Agent) Handle(_ context.Context, key string, body []byte) (any, error) 
 		if ids == nil {
 			ids = []int64{}
 		}
-		return ListResponse{IDs: ids}, nil
+		out := ListResponse{IDs: ids}
+		for _, id := range ids {
+			if c, err := a.Creds.Digest(id); err == nil {
+				out.Copies = append(out.Copies, c)
+			}
+		}
+		return out, nil
 	case CallCredentialsFetch:
 		var in FetchRequest
 		if err := json.Unmarshal(body, &in); err != nil || in.TargetID < 1 {

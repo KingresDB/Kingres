@@ -78,6 +78,8 @@ type Config struct {
 	// that job only looks at this server.
 	Fetch   func(ctx context.Context, id int64) ([]byte, error)
 	Holders func(ctx context.Context, ids []int64) (HolderReport, error)
+	// FetchFrom asks one named holder for its file of a target (P7F-01: the holder that says its file is newer than the one of this server).
+	FetchFrom func(ctx context.Context, host string, id int64) ([]byte, error)
 	// PassWait replaces the constant of that name (tests).
 	PassWait time.Duration
 	// Limits bound the retries of a record (the settings anchor.maxRetryAttempts and anchor.maxRetryAgeHours of the
@@ -116,6 +118,8 @@ type Service struct {
 	fatalTerm scheduler.Term
 	// credProblems are the targets whose credentials this server or a holder lacks, by target id (see credsync.go).
 	credProblems map[int64]CredProblem
+	// credGate is when each target was last checked against the holders in each term (see ensureCurrent).
+	credGate map[credGateKey]time.Time
 }
 
 // New builds a Service.
@@ -137,7 +141,7 @@ func New(cfg Config) (*Service, error) {
 		log = slog.New(slog.DiscardHandler)
 	}
 	s := &Service{cfg: cfg, log: log, inflight: map[int64]bool{}, exporters: map[string]exporter{},
-		working: map[[2]int64]bool{}, sem: make(chan struct{}, MaxParallelTargets), credProblems: map[int64]CredProblem{}}
+		working: map[[2]int64]bool{}, sem: make(chan struct{}, MaxParallelTargets), credProblems: map[int64]CredProblem{}, credGate: map[credGateKey]time.Time{}}
 	warnHeaderTable(log, cfg.Clock())
 	for _, k := range kinds {
 		for f, fn := range k.Exports {
@@ -306,13 +310,29 @@ func (s *Service) timeout(set, def time.Duration) time.Duration {
 
 // credsUnreachedError is the build error of a target whose credentials file this server lacks, when the holders that might have it could
 // not all be asked (P7R-08). Unlike noCredsError it is not final.
-type credsUnreachedError struct{}
+type credsUnreachedError struct{ notInstalled bool }
 
-func (credsUnreachedError) Error() string {
+func (e credsUnreachedError) Error() string {
+	if e.notInstalled {
+		return "a holder gave the credentials file of the target and this server could not write it (the disk or the key directory): it is tried again"
+	}
 	return "this server has no credentials file for the target, and not every other holder could be asked for it: it is asked again"
 }
 
 func isCredsUnreached(err error) bool {
 	var n credsUnreachedError
+	return errors.As(err, &n)
+}
+
+// credsStaleError is the build error of a target whose credentials file on this server is known to be older than a holder's, when the newer
+// one could not be taken (P7F-01). It is not final: the records wait and the check is made again.
+type credsStaleError struct{ cause error }
+
+func (e credsStaleError) Error() string {
+	return "a holder has newer credentials for the target than this server and they could not be taken from it: the records wait (" + e.cause.Error() + ")"
+}
+
+func isCredsStale(err error) bool {
+	var n credsStaleError
 	return errors.As(err, &n)
 }

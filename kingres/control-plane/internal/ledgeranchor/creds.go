@@ -8,8 +8,10 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +21,7 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
+	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/anchor"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgerkeys"
@@ -90,6 +93,9 @@ func FetchFirst(ctx context.Context, hosts []string, ask func(ctx context.Contex
 	}
 	return nil, ErrNoCredentials
 }
+
+// ErrInstallWrite is part of the error of Install when the file was good and writing it failed (P7F-02).
+var ErrInstallWrite = errors.New("ledgeranchor: the credentials file could not be written on this server")
 
 // ErrCredentials means a credentials file cannot be read or opened. Its text names no content.
 var ErrCredentials = errors.New("ledgeranchor: the credentials file cannot be read or opened")
@@ -366,6 +372,20 @@ func credAEAD(p ledgerkeys.Passphrase, iterations uint32, salt []byte) (cipher.A
 // Decode reads a file made by Encode (a sealed one needs the passphrase file of this server; a plain one is
 // accepted whether or not this server seals).
 func (s *CredStore) Decode(data []byte, kind string) (Creds, error) {
+	body, err := s.openBody(data)
+	if err != nil {
+		return nil, err
+	}
+	defer clear(body)
+	c, err := ParseCreds(kind, body)
+	if err != nil || c == nil {
+		return nil, ErrCredentials
+	}
+	return c, nil
+}
+
+// openBody returns the JSON object of the credentials that a file holds, opened when it is sealed. The caller clears it.
+func (s *CredStore) openBody(data []byte) ([]byte, error) {
 	rest, ok := bytes.CutPrefix(data, []byte(CredMagic+"\n"))
 	if !ok || len(data) > MaxCredFile {
 		return nil, ErrCredentials
@@ -375,11 +395,7 @@ func (s *CredStore) Decode(data []byte, kind string) (Creds, error) {
 		if !ok {
 			return nil, ErrCredentials
 		}
-		c, err := ParseCreds(kind, body)
-		if err != nil || c == nil {
-			return nil, ErrCredentials
-		}
-		return c, nil
+		return bytes.Clone(body), nil
 	}
 	var env struct {
 		KDF        string `json:"kdf"`
@@ -415,12 +431,51 @@ func (s *CredStore) Decode(data []byte, kind string) (Creds, error) {
 	if err != nil {
 		return nil, ErrCredentials
 	}
-	defer clear(plain)
-	c, err := ParseCreds(kind, plain)
-	if err != nil || c == nil {
-		return nil, ErrCredentials
+	return plain, nil
+}
+
+// CopyInfo says which credentials a server holds for a target without saying what they are: Digest is a SHA-256 over the id and the
+// members with their values in a fixed order (the same for a plain and a sealed file, and whatever the salt of the sealing), Installed is
+// when the file was last written on that server. Two servers that hold the same credentials give the same digest (P7F-01). The call that
+// carries it is LeaderOnly and goes between servers that hold the secrets themselves.
+type CopyInfo struct {
+	ID        int64     `json:"id"`
+	Digest    string    `json:"digest"`
+	Installed time.Time `json:"installed"`
+}
+
+// Digest describes the file of a target on this server.
+func (s *CredStore) Digest(id int64) (CopyInfo, error) {
+	data, err := readPrivate(s.path(id), MaxCredFile)
+	if errors.Is(err, os.ErrNotExist) {
+		return CopyInfo{}, ErrNoCredentials
 	}
-	return c, nil
+	if err != nil {
+		return CopyInfo{}, err
+	}
+	defer clear(data)
+	body, err := s.openBody(data)
+	if err != nil {
+		return CopyInfo{}, err
+	}
+	defer clear(body)
+	var m map[string]string
+	if err := json.Unmarshal(body, &m); err != nil || len(m) == 0 {
+		return CopyInfo{}, ErrCredentials
+	}
+	canon, err := json.Marshal(m)
+	if err != nil {
+		return CopyInfo{}, ErrCredentials
+	}
+	defer clear(canon)
+	h := sha256.New()
+	h.Write([]byte("kingres-anchor-credentials-digest\x00" + strconv.FormatInt(id, 10) + "\x00"))
+	h.Write(canon)
+	info := CopyInfo{ID: id, Digest: hex.EncodeToString(h.Sum(nil))}
+	if st, err := os.Lstat(s.path(id)); err == nil {
+		info.Installed = st.ModTime().UTC()
+	}
+	return info, nil
 }
 
 // Put writes the file of a target atomically, mode 0600, replacing one that exists. It returns the bytes written so
@@ -439,13 +494,18 @@ func (s *CredStore) Put(id int64, c Creds) ([]byte, error) {
 
 // Install writes a file received from the leader: it must decode here (so a holder with another passphrase says
 // so), and it is written again under this server's own sealing.
+//
+// A file that does not decode here is ErrCredentials. A file that decodes and cannot be written (a full or unwritable disk) is ErrInstallWrite
+// as well as ErrCredentials, so that a caller can tell a bad file from a bad disk (P7F-02).
 func (s *CredStore) Install(id int64, kind string, data []byte) error {
 	c, err := s.Decode(data, kind)
 	if err != nil {
 		return err
 	}
-	_, err = s.Put(id, c)
-	return err
+	if _, err = s.Put(id, c); err != nil {
+		return fmt.Errorf("%w: %w", ErrInstallWrite, err)
+	}
+	return nil
 }
 
 // Raw returns the bytes of the file of a target, for the leader that distributes it (ErrNoCredentials when there
