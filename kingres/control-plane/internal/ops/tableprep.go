@@ -515,8 +515,11 @@ func (o *Ops) ListTablePartitions(ctx context.Context, db, schema, table string,
 			return problem.New(problem.NotFound, fmt.Sprintf("Table %s.%s does not exist.", schema, table))
 		}
 		var have bool
-		if err := tx.QueryRow(ctx, `SELECT to_regclass('kingres.partitions') IS NOT NULL`).Scan(&have); err != nil || !have {
+		if err := tx.QueryRow(ctx, `SELECT to_regclass('kingres.partitions') IS NOT NULL`).Scan(&have); err != nil {
 			return err
+		}
+		if !have {
+			return o.nativePartitions(ctx, tx, schema, table, cursor, limit, &page)
 		}
 		rows, err := tx.Query(ctx, `SELECT partition_name::text, method, bound, is_default, leaf_count, size_here FROM kingres.partitions
 			WHERE table_name = $1::regclass AND partition_name::text > $2 ORDER BY partition_name LIMIT $3`, qualified(schema, table), cursor, limit+1)
@@ -531,7 +534,13 @@ func (o *Ops) ListTablePartitions(ctx context.Context, db, schema, table string,
 			}
 			page.Items = append(page.Items, x)
 		}
-		return rows.Err()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if len(page.Items) == 0 && cursor == "" {
+			return o.nativePartitions(ctx, tx, schema, table, cursor, limit, &page) // not a user-partitioned distributed table
+		}
+		return nil
 	})
 	if err != nil {
 		return page, wrap(err)

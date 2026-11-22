@@ -149,6 +149,7 @@ func (s *Store) buildDatabases(ctx context.Context, name string) ([]api.Database
 			by, at, mode := st.createdBy, st.createdAt, st.ledgerMode
 			db.CreatedBy, db.CreatedAt = &by, &at
 			db.Ledger.Mode, db.Ledger.DigestIntervalSeconds = &mode, st.digest
+			db.ApproximateAggregates = &api.DatabaseApproximate{Enabled: st.approxEnabled, CountDistinct: st.approxDistinct}
 			if st.sharding && st.bucketCnt != nil && db.Sharding.BucketCount == nil {
 				db.Sharding.BucketCount = st.bucketCnt
 			}

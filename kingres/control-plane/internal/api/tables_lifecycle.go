@@ -133,6 +133,12 @@ type TablePartition struct {
 	IsDefault bool   `json:"isDefault"`
 	LeafCount int    `json:"leafCount"`
 	SizeBytes *int64 `json:"sizeBytes"`
+	// The members below are optional (contract 0.18.0).
+	AccessMethod     *string  `json:"accessMethod,omitempty"`
+	RangeFrom        *string  `json:"rangeFrom,omitempty"`
+	RangeTo          *string  `json:"rangeTo,omitempty"`
+	EstimatedRows    *int64   `json:"estimatedRows,omitempty"`
+	CompressionRatio *float64 `json:"compressionRatio,omitempty"`
 }
 
 // TablePartitionPage is a page of partitions.

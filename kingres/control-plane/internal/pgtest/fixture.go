@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pgconninfo"
 )
 
@@ -26,7 +28,16 @@ var (
 	fixtureDSN  string
 	fixtureErr  error
 	fixtureStop func()
+	fixtureInst *Instance
 )
+
+// FixtureConnect opens a superuser connection of the service role to database db of the shared fixture instance (made on first use); the
+// connection is closed when the test ends.
+func FixtureConnect(t testing.TB, db string) *pgx.Conn {
+	t.Helper()
+	Fixture(t)
+	return fixtureInst.Connect(t, db)
+}
 
 func StopFixture() {
 	if fixtureStop != nil {
@@ -56,6 +67,7 @@ func Fixture(t testing.TB) string {
 func setupFixture(t testing.TB) (string, error) {
 	fixtureOnce.Do(func() {
 		in := StartNoCleanup(t, nil)
+		fixtureInst = in
 		fixtureStop = in.Stop
 		bin := BinDir()
 		psql := func(db string, extra ...string) error {

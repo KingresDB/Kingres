@@ -48,6 +48,10 @@ type Forwarder interface {
 // are answered by the leader too.
 var leaderBoundReads = map[string]bool{
 	"listTasks": true, "getTask": true, "getClusterSettings": true,
+	// The extension versions of the other servers are read by the leader (the internal call exec is leader-only).
+	"getApproximateAggregates": true,
+	// The policies, their runs and the partitions of a plain table are read from the instance that the leader runs.
+	"getPartitionPolicy": true, "listPartitionPolicyRuns": true, "getPartitionPolicyRun": true, "listTablePartitions": true,
 	// Configuration from the console (phase 13): the leader can ask every server.
 	"listConfigParameters": true, "getConfigParameter": true, "listConfigChanges": true, "listConfigServers": true,
 	"getConfigSummary": true, "getClusterTime": true, "listTimeZones": true,

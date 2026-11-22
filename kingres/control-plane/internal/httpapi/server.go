@@ -13,6 +13,7 @@ package httpapi
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"sort"
@@ -65,6 +66,8 @@ type Deps struct {
 	// optional scrape token of /metrics (empty: only stats-role bearer tokens).
 	Metrics      *monitor.Ring
 	MetricsToken string
+	// ExtraMetrics, when set, writes more lines in the Prometheus text format after those of the ring (counters of the leader jobs).
+	ExtraMetrics func(w io.Writer)
 	// Forwarder sends cluster operations to the manager leader when this server
 	// is not it; nil means this server is alone and runs everything itself.
 	Forwarder Forwarder

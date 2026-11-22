@@ -145,6 +145,9 @@ func (o *Ops) ApplyLocal(ctx context.Context, kind string, raw json.RawMessage) 
 		return o.Local.DropRole(ctx, p.Name)
 	case ApplyLedgerClient:
 		return o.ledgerClientApply(ctx, raw)
+	case ApplyExtensionCheck, ApplyExtensionInstall, ApplyExtensionVerify, ApplyDatabaseSettings:
+		_, err := o.applyExtensionKind(ctx, kind, raw)
+		return err
 	case ApplyGrant:
 		var p grantOp
 		if err := strictJSON(raw, &p); err != nil {

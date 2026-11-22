@@ -45,7 +45,7 @@ var ManagedParameters = map[string]Reason{
 	"listen_addresses":                  managed("kingresd sets the addresses the other servers and kingresd itself connect to; a wrong value cuts the server off."),
 	"port":                              managed("kingresd sets the port the other servers and kingresd itself connect to."),
 	"unix_socket_directories":           managed("kingresd connects to the instance through this socket."),
-	"shared_preload_libraries":          managed("the extensions of the cluster (kingres_shard, kingres_ledger) are loaded through it."),
+	"shared_preload_libraries":          managed("the extensions of the cluster (kingres_shard, kingres_ledger, kingres_columnar) are loaded through it."),
 	"ssl":                               managed("kingresd sets the TLS files of the cluster certificates."),
 	"ssl_cert_file":                     managed("the cluster certificate of this server."),
 	"ssl_key_file":                      managed("the key of the cluster certificate of this server."),

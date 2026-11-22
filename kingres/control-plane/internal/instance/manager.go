@@ -204,6 +204,7 @@ func (m *Manager) Init(ctx context.Context, s Spec) (err error) {
 	}
 	s.Settings.SocketDir = filepath.ToSlash(sock)
 	// Render before touching the disk so that bad input leaves nothing behind.
+	s.Settings.Preload = m.preloadList()
 	managed, err := RenderManaged(s.Settings)
 	if err != nil {
 		return err
@@ -505,6 +506,7 @@ func (m *Manager) WriteManaged(id int, s ManagedSettings) error {
 	}
 	sock, _ := m.SocketDir(id)
 	s.SocketDir = filepath.ToSlash(sock)
+	s.Preload = m.preloadList()
 	text, err := RenderManaged(s)
 	if err != nil {
 		return err
@@ -513,6 +515,7 @@ func (m *Manager) WriteManaged(id int, s ManagedSettings) error {
 	if err := writeAtomic(filepath.Join(data, "kingres-managed.conf"), []byte(text)); err != nil {
 		return err
 	}
+	s.Preload = ""
 	return m.saveSettings(id, s)
 }
 

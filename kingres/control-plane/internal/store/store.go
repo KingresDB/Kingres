@@ -57,6 +57,9 @@ type TableFilter struct {
 	Schema string
 	// Class restricts the result to tables having this class when non-empty.
 	Class string
+	// Storage restricts the result to tables stored in this format (heap or columnar) when non-empty; a partitioned table matches when any of
+	// its partitions is.
+	Storage string
 }
 
 // BucketFilter selects buckets.
@@ -297,4 +300,24 @@ func KeysetPage[T any](items []T, p Page, key func(T) string) ([]T, *string) {
 	}
 	next := key(items[p.Limit-1])
 	return items[:p.Limit], &next
+}
+
+// StorageMatches tells whether a table is stored in the format (heap or columnar): its own access method is it, or, for a partitioned table, any of
+// its partitions is stored in it. A table without storage information matches nothing.
+func StorageMatches(t api.Table, format string) bool {
+	if t.Storage == nil {
+		return false
+	}
+	if t.Storage.AccessMethod != nil && *t.Storage.AccessMethod == format {
+		return true
+	}
+	if f := t.Storage.PartitionFormats; f != nil {
+		switch format {
+		case "heap":
+			return f.Heap > 0
+		case "columnar":
+			return f.Columnar > 0
+		}
+	}
+	return false
 }

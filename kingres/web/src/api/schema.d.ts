@@ -1177,7 +1177,7 @@ export interface paths {
         /**
          * List the user partitions of a distributed table
          * @description Added in 0.14.0. The user partitions (`kingres.dist_partition`) of a distributed table that was partitioned by the user (RANGE or LIST),
-         *     with their bound, the number of their leaves (one per bucket) and, when it can be read, their size. From 0.18.0 an ordinary range-partitioned table lists its partitions too (`leafCount` 1, with `accessMethod` and the range bounds); an empty list for a table that is not partitioned.
+         *     with their bound, the number of their leaves (one per bucket) and, when it can be read, their size. From 0.18.0 an ordinary range- or list-partitioned table lists its partitions too (`leafCount` 1, with `accessMethod`, the bounds, `estimatedRows` and `compressionRatio`); the answer is an empty list for a table that is not partitioned (and for a hash-partitioned table), and 404 `not_found` only for a table that does not exist on the instance of the manager leader.
          */
         get: operations["listTablePartitions"];
         put?: never;
@@ -1305,6 +1305,14 @@ export interface paths {
          *     Returns a task of kind `table.setStorage` with the steps `check`, `convert` and `analyze`. 409 `extension_missing` when `kingres_columnar` is not installed
          *     in the database or not preloaded on a server; 409 `conversion_refused` (the `detail` lists the reasons: ledger table, indexes, triggers, publication,
          *     a partition that is a parent, a default partition); 409 `operation_in_progress` while a task runs for the table.
+         *     The request-time check covers the partitioned table, a partition addressed as a table, a ledger table, a distributed or reference table, a publication and foreign keys, and for a
+         *     partition what `kingres.convert_partition` refuses; the reasons are in `Problem.blockers` (one entry each; `detail` repeats them as text). Other refusals of PostgreSQL (a trigger, an
+         *     index the format cannot take) fail the task at the step `Convert the storage` with the code `conversion_refused`. 409 `extension_missing` names the extension and the server; for a
+         *     library that is not preloaded the remedy is to restart the instance of that server (the setting `shared_preload_libraries` is managed). The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so.
+         *     With `dryRun=true` nothing is started: the answer is 200 `TableStoragePreview` with the same reasons as `blockers`, and no task exists. Changing the options of a table that is
+         *     columnar already sets them for the stripes written from then on (the step says so).
+         *     The conversion runs with the `kingres_timepart.trust_table_owners` setting on, as `partition.maintain` does: the code of a non-superuser owner of the table (an index expression, a
+         *     default) runs in the session of the service role for the time of the step. See `putPartitionPolicy`.
          */
         put: operations["setTableStorage"];
         post?: never;
@@ -1335,7 +1343,8 @@ export interface paths {
          * Change the storage format of one partition
          * @description Added in 0.18.0. Converts one partition of a range-partitioned table between the heap and the columnar format (`kingres.convert_partition`, which builds
          *     the new partition aside and swaps it in, so writers wait only for the swap). `sortBy` orders the rows of a columnar partition, which helps the skipping of
-         *     stripes. Returns a task of kind `table.setStorage`, subject `database/schema.partition`. The problem codes are those of `setTableStorage`.
+         *     stripes. Returns a task of kind `table.setStorage`, subject `database/schema.partition`. The problem codes, `blockers`, `dryRun` and the limit to the leader's instance are those of
+         *     `setTableStorage`. The partition is addressed in the schema of its table. A task `partition.maintain` that is running for the table makes it 409 `operation_in_progress`.
          */
         put: operations["setPartitionStorage"];
         post?: never;
@@ -1361,7 +1370,8 @@ export interface paths {
         };
         /**
          * Get the time-partitioning policy of a table
-         * @description Added in 0.18.0. The policy, when it runs next, the last run and the health of the partitions ahead. 404 `not_found` when the table has no policy.
+         * @description Added in 0.18.0. The policy, when it runs next, the last run and the health of the partitions ahead. 404 `not_found` when the table has no policy, and the same code when the table does not exist
+         *     or `kingres_timepart` is not installed in the database; the `detail` says which. The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so. A read never installs an extension.
          */
         get: operations["getPartitionPolicy"];
         /**
@@ -1369,14 +1379,17 @@ export interface paths {
          * @description Added in 0.18.0. Creates or replaces the policy. Synchronous: it writes the policy and creates no partition; `nextRunAt` of the answer is now, so the
          *     scheduler takes the table at its next tick. Durations are ISO 8601 (`P1D`, `P1M`, `PT6H`). 400 `validation_failed` with the JSON pointer of the field;
          *     409 `partition_policy_conflict` when the table is not range-partitioned on a `date`, `timestamp` or `timestamptz` column; 409 `extension_missing`
-         *     when `kingres_timepart` is not installed in the database.
+         *     when `kingres_timepart` is not installed in the database and cannot be installed (the package of the server lacks it). 409 `operation_in_progress` while a run of the policy is going (its end would
+         *     move the schedule). The runs of a policy execute with `kingres_timepart.trust_table_owners` on: for a table that a non-superuser owns, the code of that owner (an index expression, a default) runs in the
+         *     session of the service role while a partition is made, attached or converted. Set a policy only for tables whose owner is trusted as the administrator is. `createdBy` of the answer is the service role.
+         *     The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so.
          */
         put: operations["putPartitionPolicy"];
         post?: never;
         /**
          * Remove the time-partitioning policy of a table
          * @description Added in 0.18.0. Removes the policy; the partitions stay as they are. 404 `not_found` when the table has no policy; 409 `operation_in_progress`
-         *     while a `partition.maintain` task runs for the table.
+         *     while a `partition.maintain` task runs for the table. The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so.
          */
         delete: operations["deletePartitionPolicy"];
         options?: never;
@@ -1400,14 +1413,16 @@ export interface paths {
         };
         /**
          * List the runs of a time-partitioning policy
-         * @description Added in 0.18.0. The runs of the policy, newest first, with the trigger, the state and the error of each.
+         * @description Added in 0.18.0. The runs of the policy, newest first, with the trigger, the state and the error of each (the `actions` of a listed run are empty). Empty when `kingres_timepart` is not installed. The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so.
          */
         get: operations["listPartitionPolicyRuns"];
         put?: never;
         /**
          * Run a time-partitioning policy now
          * @description Added in 0.18.0. Starts a task of kind `partition.maintain` for the table (the console's "Run now"); the run's `trigger` is `manual`.
-         *     `asOf` is for tests and dry replays. 404 `not_found` when the table has no policy; 409 `operation_in_progress` while a run is going.
+         *     `asOf`, when given, must be within five minutes of the time of the instance that runs the policy, otherwise 400 `validation_failed` on `/asOf` (a run with a time far from now would retire
+         *     or create the partitions of that time and park the schedule there; use `planPartitionPolicy` with `asOf` for a dry replay). 404 `not_found` when the table has no policy; 409 `operation_in_progress`
+         *     while a run is going. 409 `extension_missing` when the policy converts to columnar and the library is not preloaded. The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so.
          */
         post: operations["runPartitionPolicy"];
         delete?: never;
@@ -1434,7 +1449,7 @@ export interface paths {
         };
         /**
          * Get one run of a time-partitioning policy
-         * @description Added in 0.18.0. A run with its actions, in the order they were taken.
+         * @description Added in 0.18.0. A run with its actions, in the order they were taken. 404 `not_found` for a run that does not exist. The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so.
          */
         get: operations["getPartitionPolicyRun"];
         put?: never;
@@ -1464,7 +1479,7 @@ export interface paths {
         /**
          * Preview the actions of a time-partitioning policy
          * @description Added in 0.18.0. A dry run: the actions a run would take now (or at `asOf`), with the stored policy or with the policy in the request.
-         *     Nothing changes. It is a read, so a `kingres_readonly` role may call it, and it is not audited.
+         *     Nothing changes. It is a read, so a `kingres_readonly` role may call it, and it is not audited. `asOf` is free here (a dry replay). The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so.
          */
         post: operations["planPartitionPolicy"];
         delete?: never;
@@ -3524,7 +3539,7 @@ export interface components {
             sqlState?: string;
             /** @description 1-based character position of the error in the statement; present for some `sql_error` problems. */
             sqlPosition?: number;
-            /** @description Added in 0.14.0. The lines of the report of the sharding extension that make a table not eligible; present for `table_not_eligible`. */
+            /** @description Added in 0.14.0. The lines of the report of the sharding extension that make a table not eligible; present for `table_not_eligible` and, from 0.18.0, for `conversion_refused` (the reasons of the refusal, one entry each). */
             blockers?: components["schemas"]["TableBlocker"][];
             /** @description Added in 0.12.0, optional. The whole plan of the request (the same body as `dryRun` answers), present only when `code` is `failover_needs_decision`: the console shows the groups, the candidates and the verdict without asking again. */
             plan?: components["schemas"]["FailoverPlan"];
@@ -5792,6 +5807,18 @@ export interface components {
             /** @description Columns that order the rows of a columnar partition. */
             sortBy?: string[];
         };
+        /** @description Added in 0.18.0. The answer of a storage request with `dryRun=true`. */
+        TableStoragePreview: {
+            /** @description The access method of the table or partition now; null for a partitioned table. */
+            current: string | null;
+            target: components["schemas"]["TableStorageAccessMethod"];
+            /** @description False when the request would be refused (`blockers` is not empty) or when there is nothing to do. */
+            willConvert: boolean;
+            /** @description The reasons the request would be refused with 409 `conversion_refused`; the codes are `partitioned_table`, `partition`, `ledger_table`, `distributed_table`, `publication`, `foreign_keys` and `other` (the text of the extension). */
+            blockers: components["schemas"]["TableBlocker"][];
+            /** @description What else the operator should know, as text, for example that the table is converted under an `ACCESS EXCLUSIVE` lock or that it has the format already. */
+            notes: string[];
+        };
         /** @description Added in 0.18.0. Totals of the columnar format over a table or over its partitions. */
         ColumnarStats: {
             compression?: components["schemas"]["ColumnarCompression"] | null;
@@ -5822,6 +5849,7 @@ export interface components {
         };
         /** @description Added in 0.18.0. Every duration is ISO 8601 (`P1D`, `P1M`, `PT6H`). */
         PartitionPolicyRequest: {
+            /** @description The size of a partition, in one unit: `PT1H`, `PT2H`, `PT3H`, `PT4H`, `PT6H`, `PT8H` or `PT12H` (hours that divide a day; only for a timestamp column), `P<n>D` for n from 1 to 3660 (`P7D` is the week, aligned on Monday), `P1M`, `P2M`, `P3M`, `P4M`, `P6M` (months that divide a year), or `P<n>Y` for n from 1 to 1000. Any other shape is 400 `validation_failed` on `/partitionEvery`. `columnarAfter` longer than `retention` is 400 on `/columnarAfter`. */
             partitionEvery: string;
             /** @default P7D */
             createAhead?: string;
@@ -5929,7 +5957,7 @@ export interface components {
         RunPartitionPolicyRequest: {
             /**
              * Format: date-time
-             * @description For tests and dry replays.
+             * @description Within five minutes of the time of the instance, otherwise 400. For a dry replay at another time use planPartitionPolicy.
              */
             asOf?: string;
         };
@@ -7968,10 +7996,14 @@ export interface components {
          *     `groupWithoutSynchronousStandby`, `groupUnderReplicated`: `shardGroupId`, and `serverId` the server that
          *     runs the group's primary. `clockDifference` (0.8.0): `serverId` is the server whose clock differs. `versionMismatch`: all null.
          *     Added in 0.11.0: `ledgerNotAnchored`, `ledgerDigestOverdue`: `databaseName`. `ledgerAnchorBehind`, `ledgerAnchorFailed`: `aspect` is `target:<id>`. `ledgerAnchorConflict`: `databaseName` and `aspect` `target:<id>`. `ledgerChainDiverged`, `ledgerGroupUnread`, `ledgerPublicationBehind`: `databaseName` and `shardGroupId`. `ledgerSignerUnavailable`: all null.
-         *     `taskId` (0.9.0, optional) names a task the alert is about, so that a client can link to it; `kingresd` sets it for
+         *     Added in 0.18.0: `partitionsAheadLow` and `partitionPolicyFailed` set `databaseName`, `tableSchema` and `tableName` (the table), and leave `aspect` null. `taskId` (0.9.0, optional) names a task the alert is about, so that a client can link to it; `kingresd` sets it for
          *     `taskFailed` alerts (the only kind about a task; `kingresd` raises it for a rebalance that ended failed, subject `task:<id>`), and no other kind sets it.
          */
         AlertSubject: {
+            /** @description Added in 0.18.0, optional. The schema of the table the alert is about (`partitionsAheadLow`, `partitionPolicyFailed`); null or absent otherwise. With `tableName` it needs no parsing: use these, not `aspect`. */
+            tableSchema?: string | null;
+            /** @description Added in 0.18.0, optional. The name of the table the alert is about; null or absent otherwise. */
+            tableName?: string | null;
             /** @description The server the alert is about; null when it is about the cluster. */
             serverId: components["schemas"]["ServerId"] | null;
             /** @description The server that is behind (`replicationPending`); null for other kinds. */
@@ -8241,6 +8273,8 @@ export interface components {
         TableName: string;
         /** @description Name of a user partition (added in 0.14.0). */
         PartitionName: string;
+        /** @description Added in 0.18.0. When true, only check the request and answer what it would do (200 `TableStoragePreview`); no task is started. Default false. */
+        DryRunStorage: boolean;
         /** @description Identifier of a run of a time-partitioning policy (added in 0.18.0). */
         PartitionRunId: number;
         /** @description Colocation group identifier. */
@@ -9721,7 +9755,10 @@ export interface operations {
     };
     setTableStorage: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Added in 0.18.0. When true, only check the request and answer what it would do (200 `TableStoragePreview`); no task is started. Default false. */
+                dryRun?: components["parameters"]["DryRunStorage"];
+            };
             header?: never;
             path: {
                 /** @description Database name. */
@@ -9739,6 +9776,15 @@ export interface operations {
             };
         };
         responses: {
+            /** @description Only with `dryRun=true`. What the request would do, and why it would be refused. Nothing was started. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableStoragePreview"];
+                };
+            };
             202: components["responses"]["AcceptedTask"];
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
@@ -9752,7 +9798,10 @@ export interface operations {
     };
     setPartitionStorage: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Added in 0.18.0. When true, only check the request and answer what it would do (200 `TableStoragePreview`); no task is started. Default false. */
+                dryRun?: components["parameters"]["DryRunStorage"];
+            };
             header?: never;
             path: {
                 /** @description Database name. */
@@ -9772,6 +9821,15 @@ export interface operations {
             };
         };
         responses: {
+            /** @description Only with `dryRun=true`. What the request would do, and why it would be refused. Nothing was started. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableStoragePreview"];
+                };
+            };
             202: components["responses"]["AcceptedTask"];
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];

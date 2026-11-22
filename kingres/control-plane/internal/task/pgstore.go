@@ -82,6 +82,14 @@ func (s *PGStore) Create(ctx context.Context, t Task) (Task, error) {
 	return out, err
 }
 
+// ActiveFor implements ActiveStore.
+func (s *PGStore) ActiveFor(ctx context.Context, kind, subjType, subjID string) (bool, error) {
+	var yes bool
+	err := s.db.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM kingres_cp.task WHERE kind = $1 AND subject_type = $2 AND subject_id = $3
+		AND state IN ('pending', 'running', 'paused'))`, kind, subjType, subjID).Scan(&yes)
+	return yes, err
+}
+
 // Get implements Store.
 func (s *PGStore) Get(ctx context.Context, id int64) (Task, error) {
 	return scan(s.db.QueryRow(ctx, `SELECT `+cols+` FROM kingres_cp.task WHERE id = $1`, id))

@@ -150,8 +150,8 @@ Each task kind has exactly one `subject.type`; `subject.id` is always a string.
 | `instance.start`, `instance.stop`, `instance.restart` | `instance` | the instance id (`node_id`) as a decimal string |
 | `database.create`, `database.update`, `database.drop` | `database` | the database name |
 | `database.approximateAggregates` (0.18.0) | `database` | the database name (the subject of `database.update`; a second `database.*` task on the database is 409 `operation_in_progress`). Steps: `Check the servers`, `Install the extension on server <id>` (one per server), `Verify versions and hashes`, `Apply the database settings`, `Record the settings` |
-| `table.setStorage` (0.18.0) | `table` | `database/schema.table`; for one partition (`setPartitionStorage`) `database/schema.partition`. Steps: `check`, `convert` (the detail says that `ALTER TABLE ... SET ACCESS METHOD` takes an `ACCESS EXCLUSIVE` lock), `analyze` |
-| `partition.maintain` (0.18.0) | `table` | `database/schema.table`: one run of the time-partitioning policy of the table. Steps: `begin`, `create`, `convert`, `retire`, `finish`. The task's `createdBy` is `system` for a scheduled run and the role for `runPartitionPolicy` |
+| `table.setStorage` (0.18.0) | `table` | `database/schema.table`; for one partition (`setPartitionStorage`) `database/schema.partition`. Steps of a table: `Check the table`, `Convert the storage` (the detail says that `ALTER TABLE ... SET ACCESS METHOD` takes an `ACCESS EXCLUSIVE` lock), `Analyze the table`; of a partition: `Check the partition`, `Convert the partition`, `Analyze the partition` |
+| `partition.maintain` (0.18.0) | `table` | `database/schema.table`: one run of the time-partitioning policy of the table. Steps: `Begin the run`, `Create partitions`, `Convert partitions`, `Retire partitions`, `Finish the run`. The task's `createdBy` is `system` for a scheduled run and the role for `runPartitionPolicy` |
 | `table.distribute`, `table.undistribute`, `table.alter`, `table.partition` | `table` | `database/schema.table` (0.14.0: the table the request named; one table task per colocation group) |
 | `rebalance` | `cluster` | `cluster` (0.9.0; one rebalance at a time, cluster-wide; the task id is the report id): steps `Check that the cluster can rebalance`, `Compute the plan`, `Move buckets`, `Write the report`; a stopped run is `paused` |
 | `replication.restorePreferredPrimaries` | `replication` | `preferred-primaries` (0.10.0: answers `unsupported_operation` until the switchover is built) |
@@ -341,7 +341,9 @@ None.
 
 #### Documentation
 
-- `listTablePartitions` (0.14.0) lists the user partitions of a distributed table; from 0.18.0 it also lists the partitions of an ordinary range-partitioned table. A client that does not know the new properties and codes works as before.
+- `listTablePartitions` (0.14.0) lists the user partitions of a distributed table; from 0.18.0 it also lists the partitions of an ordinary range- or list-partitioned table (an empty list for a table that is not partitioned, 404 only for a table that is not on the instance of the manager leader). A client that does not know the new properties and codes works as before.
+- Revised after the independent review of the control plane (still 0.18.0): `setTableStorage` and `setPartitionStorage` have the query parameter `dryRun` (200 `TableStoragePreview`), and 409 `conversion_refused` carries `Problem.blockers`; `AlertSubject` has the optional `tableSchema` and `tableName`, which the two partition alerts set (`aspect` stays null); `runPartitionPolicy` takes an `asOf` only within five minutes of the time of the server; `PartitionPolicyRequest.partitionEvery` lists the allowed shapes. Every storage and policy operation says that it acts on the tables of the instance that the manager leader runs. `getPartitionPolicy` and the other reads never install an extension.
+- A disable of approximate aggregates runs the same five steps as an enable. The steps of `table.setStorage` and `partition.maintain` are sentences (the table above).
 
 ### 0.14.0
 
