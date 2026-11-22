@@ -7,6 +7,41 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-22 (second entry): fixes for the independent review of the phase 12 control plane (P12C-01 to P12C-16), and the console's contract notes
+
+Branch `p12-cp`. The review is [reviews/2026-11-22-control-plane-phase12.md](reviews/2026-11-22-control-plane-phase12.md); its "Fixes" section lists every finding with the change and the test.
+
+### What was done
+
+- The four high findings: the time of a run is the time of the server (within five minutes, for a request and for the scheduler), a run is always closed with `timepart_finish_run` (begin failure, step failure, the hook of the kind) so that a failing
+  policy does not start a task at every tick, `kingres_columnar` goes into `shared_preload_libraries` only when the installation has the library (a rewrite is logged and reloaded, the conversion needs the library on every server), and the conversion and the runs share
+  one rule for the owners of tables (`trust_table_owners` on, documented).
+- The mediums and lows: columnar options on a columnar table, lock waits with `lock_timeout` and retry, a missing run is an error, alerts of databases that were not read are left alone, a scheduled run does not need the library, reads never install an extension,
+  the limit to the leader's instance is in the contract text and the 404, `put` during a run, `Engine.ActiveFor`, versions as numbers.
+- Contract text and shapes for the console (still 0.18.0): `dryRun` and `TableStoragePreview`, typed `blockers` on `conversion_refused`, `tableSchema` and `tableName` of `AlertSubject`, the shapes of `partitionEvery`, the bound of `asOf`; listed in `p12cp/contract-changes.txt`.
+
+### How it was verified
+
+PostgreSQL 18 and 19.0 (the private installations were refreshed from `~/kw-int/pg`, extensions built from e279c14091), lane l1: the PG-backed tests of `internal/ops`, `internal/store/pgstore`, `internal/instance` and the two cluster tests of three servers
+(`TestApproximateAggregates`, `TestTableStorageAndPartitionPolicies`). Unit tests of `ops`, `partsched`, `task`, `monitor`, `api`, `problem`, `contract`; `check-contract.mjs`; `vue-tsc`. `httpapi` has one test that fails now and then on Windows on the cleanup of its temporary
+directory (`TestSettingsOperations`), not on an assertion. The mutants of the round are in the report.
+
+### Decisions and deviations
+
+- The sound rule for the owners of tables is trust, as the extension offers it: a refusal of non-superuser owners (or a cluster setting) was not built; the contract text says what the setting gives away. It is a question for the project owner.
+- The restart order of the preload change is the operator's: the restart of the console orders standbys and primaries by the rule of the configuration design, which was written for settings that go up; for a list of libraries the safe order (standbys first) is documented, not enforced.
+
+### Still open
+
+- A cluster test that restarts one server with the library missing (the logic is tested with a fake installation).
+- The cluster setting for non-superuser owners, if wanted.
+
+### Core patches
+
+None.
+
+---
+
 ## 2026-11-22: phase 12 control plane (contract 0.18.0): approximate aggregates, storage conversion, time-partitioning policies and their scheduler, and the preload of kingres_columnar
 
 Branch `p12-cp` (worktree of its own), from `kingres-18` at e279c14091. Items St-P1 to St-P5 and Q-C1 of the inventory of 2026-11-22; the console parts (W1, W2, Q-W1)

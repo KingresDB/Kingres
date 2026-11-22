@@ -3573,7 +3573,7 @@ that fails (a lock timeout) does not fail the step: the run ends `partial` and t
 `internal/partsched` is the scheduler: two jobs of `internal/scheduler` (they run on the manager leader only, with its term): `partition.schedule` every `partition-scheduler-interval` (default 1m; environment
 `KINGRES_PARTITION_SCHEDULER_INTERVAL`) asks `kingres.timepart_due(now)` in every database that has `kingres_timepart` and starts one task for each table that has no unfinished task (it holds no state: after a change of
 the leader the new leader asks again), and `partition.alerts` every five minutes reads `kingres.timepart_check()` and raises or clears `partitionsAheadLow` and `partitionPolicyFailed` (the last run failed, or was
-`partial` twice in a row), subject `database:<db>|table:<schema>.<table>`. The counters `kingres_partition_runs_total`, `kingres_partition_runs_failed_total` and `kingres_partition_actions_failed_total` are on `/metrics`.
+`partial` twice in a row), subject `database:<db>|tableschema:<s>|tablename:<t>` (see below). The counters `kingres_partition_runs_total`, `kingres_partition_runs_failed_total` and `kingres_partition_actions_failed_total` are on `/metrics`.
 
 ### Tests
 
@@ -3583,3 +3583,32 @@ call), `internal/partsched` (a fake clock and backend). PostgreSQL-backed (`scri
 `TestIntegrationTableStorage` (pgstore), `TestEnsureConfigBringsThePreloadUpToDate`. Cluster tests of three servers: `TestApproximateAggregates` and `TestTableStorageAndPartitionPolicies` in `internal/clustertest`.
 Not covered: a server whose package has another version of `kingres_sketch` (all servers of the tests share one installation; the case is in the unit tests), and the library not preloaded on a running instance
 (unit test with a fake backend).
+
+### After the independent review of the analytics control plane (P12C-01 to P12C-16)
+
+The review is in `kingres/docs/reviews/2026-11-22-control-plane-phase12.md`; its "Fixes" section lists every finding. What changed in behaviour:
+
+- **The time of a run is the time of the server (P12C-01).** `runPartitionPolicy` takes `asOf` only within five minutes of the time of the instance (`maintainSkew`), otherwise 400 on `/asOf`; the scheduler goes
+  through the same check, so a leader whose clock jumped starts nothing. `planPartitionPolicy` keeps a free `asOf` (it changes nothing). `next_run_at` can therefore never be moved far from now.
+- **A run is always closed (P12C-02).** `kingres.timepart_finish_run` runs for every end of a run: the finish step, a run that the extension recorded as failed at `begin` (the owner changed, the policy was never verified:
+  the task fails with `partition_policy_conflict` and the reason), an error of a phase (`failRun` marks the run failed and closes it) and, for a failure that no step saw (a cancel, a lost lease), the hook `OnFail` of the kind.
+  Closing moves `next_run_at` and prunes the old runs, so a policy that fails is not started at every tick. As a second line the scheduler leaves a table alone for five minutes (`maintainBackoff`) after a failed run.
+- **Preload (P12C-03).** `kingres_columnar` is in the list only when the installation has the library file (`pg_config --pkglibdir`): a package that was not upgraded with `kingresd`, or an image that mixes versions, gets the old
+  list and its instances still start. `EnsureConfig` logs a warning when it rewrites the list, reloads a running instance (so that `shared_preload_libraries` shows as pending a restart in the configuration view and the
+  restart of the console lists it) and repairs a file that names a library that is not there. The list takes effect at a restart: restart the instances with the console's restart of pending instances (it orders the pairs of standbys and primaries by the rule of the configuration design; for this setting the safe order is the standbys of a group before
+  its primary, and the restart by hand follows it); a primary that was restarted first and then wrote columnar WAL would be ahead of a standby that cannot replay it. A conversion to columnar is therefore refused (`extension_missing`) until **every server of the cluster** has loaded the library (the leader asks each server with `extension.check`, with the library check), and says to restart the instance of the server it names.
+- **One rule for the owners of tables (P12C-04, P12C-05).** The conversion of a table or a partition and the runs of a policy both open the service connection with `kingres_timepart.trust_table_owners = on` (`trustedConn`). The owner of the table is a role of
+  this cluster; the code it can cause to run while a partition is made, attached or converted (an index expression, a default, a trigger) runs as the service role for the time of the call, and the connection is closed
+  at its end. The owner needs `CREATE` on the schema of the partition. Set a policy and convert only tables whose owners the administrator trusts as himself; the contract text says so. A refusal by PostgreSQL privileges (42501) is `conversion_refused`, not a retryable step failure.
+- **Conversion (P12C-06, P12C-07, P12C-15).** A table that is columnar already gets new options through `columnar_set_options` (for the stripes to come; the step says so) instead of a silent no-op. The `ALTER TABLE ... SET ACCESS METHOD` and the `ANALYZE` ask for their lock
+  with `lock_timeout` (3 s) and try again, saying "Waiting for a lock held by another session" in the detail, for ten minutes at most, then fail with the retryable `operation_in_progress`; a reader of the table is never queued behind a conversion
+  that waits for a long transaction. The claim of another run of the table (55P03 of the extension) is `operation_in_progress` too, and a conversion of a partition is refused while a `partition.maintain` task of its table is unfinished.
+- **A run that this instance does not have is an error (P12C-08).** After a takeover by a server whose instance does not hold the run that `partition_run_task` names, the step fails with a clear message instead of ending the task as done.
+- **Alerts do not flap (P12C-09).** `Checks` returns the databases it could read; an alert of a database that was not read is left as it is. The alerts carry the table in `AlertSubject.tableSchema` and `tableName` (stored as `database:<db>|tableschema:<s>|tablename:<t>`, with `|` and `%` escaped).
+- **The scheduled run no longer needs the library (P12C-10).** Only a run by hand is refused when the policy converts and the library is not loaded; a scheduled run goes on creating and retiring partitions and the extension records what it cannot convert.
+- **Reads do not write (P12C-11).** `getPartitionPolicy`, `listPartitionPolicyRuns`, `getPartitionPolicyRun`, `planPartitionPolicy` and `deletePartitionPolicy` only ask whether `kingres_timepart` is installed (404 / an empty list / `extension_missing` for a plan with a policy in the request);
+  the writes install it. The reads of policies, runs and `listTablePartitions` are leader-bound.
+- **Messages that say the truth (P12C-12, P12C-16).** A table that the leader's instance does not have is 404 with a detail that names the limit; the contract text says it for every operation. `conversion_refused` carries typed `blockers`; `dryRun=true` on both storage operations answers the same reasons as `TableStoragePreview` and installs nothing. The
+  remedy for a library that is not loaded is "restart the instance", not "edit shared_preload_libraries" (the setting is managed).
+- **Others.** `putPartitionPolicy` is refused while a run goes (P12C-13). `maintainRunning` asks the task store by kind and subject (`Engine.ActiveFor`), not in the newest 200 tasks (P12C-14). Versions of `kingres_sketch` compare as numbers (`0.10` is above `0.9`).
+  The steps of `database.approximateAggregates` can be interrupted by a cancel; the list of servers is fixed when the task is made (a server added meanwhile is covered by the next request), and a failure at `Apply the database settings` leaves the settings on the servers that took them: the same request, repeated, finishes it.
