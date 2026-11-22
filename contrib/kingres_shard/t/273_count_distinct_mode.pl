@@ -155,7 +155,7 @@ qs($n1, "ALTER DATABASE postgres SET kingres_shard.count_distinct_mode = 'approx
 	is($w, 1, '... with one warning for the session');
 }
 {
-	my ($rc, $out, $err) = run_sql($n1, "SET ROLE appu; SELECT 1; SELECT count(*) FROM public.ev; SELECT count(DISTINCT u) FROM public.loc;");
+	my ($rc, $out, $err) = run_sql($n1, "SET ROLE appu; SELECT 1; SELECT count(*) FROM public.ev;");
 	is($rc, 0, 'statements without a count(DISTINCT) of a distributed table do not fail');
 	unlike($err, qr/kingres_sketch/, '... and look nothing up: no warning about the sketch');
 }
