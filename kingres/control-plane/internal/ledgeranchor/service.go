@@ -120,6 +120,10 @@ type Service struct {
 	credProblems map[int64]CredProblem
 	// credGate is when each target was last checked against the holders in each term (see ensureCurrent).
 	credGate map[credGateKey]time.Time
+	// credNotice is the alert of a file that was replaced by the newer file of a holder, by target (see noteReplaced).
+	credNotice map[int64]credNote
+	// rotLocks serialize the changes of the credentials of one target (see lockRotation).
+	rotLocks map[int64]*sync.Mutex
 	// credStaleSince is when the newer file of a target first could not be taken (see staleFailure).
 	credStaleSince map[int64]time.Time
 }
@@ -143,7 +147,7 @@ func New(cfg Config) (*Service, error) {
 		log = slog.New(slog.DiscardHandler)
 	}
 	s := &Service{cfg: cfg, log: log, inflight: map[int64]bool{}, exporters: map[string]exporter{},
-		working: map[[2]int64]bool{}, sem: make(chan struct{}, MaxParallelTargets), credProblems: map[int64]CredProblem{}, credGate: map[credGateKey]time.Time{}, credStaleSince: map[int64]time.Time{}}
+		working: map[[2]int64]bool{}, sem: make(chan struct{}, MaxParallelTargets), credProblems: map[int64]CredProblem{}, credGate: map[credGateKey]time.Time{}, credStaleSince: map[int64]time.Time{}, credNotice: map[int64]credNote{}}
 	warnHeaderTable(log, cfg.Clock())
 	for _, k := range kinds {
 		for f, fn := range k.Exports {

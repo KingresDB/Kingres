@@ -78,12 +78,16 @@ func (s *Service) credProblemList() map[int64]CredProblem {
 
 // judgeCopies compares the copy of this server with those of the holders. newer is the holder with the highest generation above this server's
 // (the first of them by name when two share it); stale lists the holders with a lower generation; conflict lists the holders with the same
-// generation and another digest. A holder with the same generation and the same digest is current, and so is one of generation 0 when either
+// generation and another digest; jump lists the holders whose generation is more than MaxGenerationJump above this server's (not believed, neither
+// taken nor replaced). A holder with the same generation and the same digest is current, and so is one of generation 0 when either
 // side has no stamp (files of earlier versions cannot be told apart).
-func judgeCopies(own CopyInfo, others []HolderCopy) (newer *HolderCopy, stale, conflict []string) {
+func judgeCopies(own CopyInfo, others []HolderCopy) (newer *HolderCopy, stale, conflict, jump []string) {
 	for i := range others {
 		o := others[i]
 		switch {
+		case o.Generation > own.Generation+MaxGenerationJump:
+			// a number that no run of rotations reaches: a damaged or foreign file, not believed (P7H-01)
+			jump = append(jump, o.Host)
 		case o.Generation > own.Generation:
 			if newer == nil || o.Generation > newer.Generation || o.Generation == newer.Generation && o.Host < newer.Host {
 				newer = &o
@@ -97,26 +101,31 @@ func judgeCopies(own CopyInfo, others []HolderCopy) (newer *HolderCopy, stale, c
 	}
 	sort.Strings(stale)
 	sort.Strings(conflict)
-	return newer, stale, conflict
+	sort.Strings(jump)
+	return newer, stale, conflict, jump
 }
 
 // generationFloor is the highest generation that a holder reports for a target: a leader that rotates credentials writes a generation above it.
 // Holders that cannot be asked are not in it (a holder that has a higher one refuses the file, which is an alert).
-func (s *Service) generationFloor(ctx context.Context, id int64) uint64 {
+func (s *Service) generationFloor(ctx context.Context, id int64) (floor uint64, unreached []string, err error) {
 	if s.cfg.Holders == nil {
-		return 0
+		return 0, nil, nil
 	}
 	rep, err := s.cfg.Holders(ctx, []int64{id})
 	if err != nil {
-		return 0
+		return 0, nil, err
 	}
-	var floor uint64
+	var own uint64
+	if d, derr := s.cfg.Creds.Digest(id); derr == nil {
+		own = d.Generation
+	}
 	for _, c := range rep.Copies[id] {
-		if c.Generation > floor {
+		// a generation far above this server's is a damaged or foreign file and is not counted: the way out of it is a rotation here
+		if c.Generation > floor && c.Generation <= own+MaxGenerationJump {
 			floor = c.Generation
 		}
 	}
-	return floor
+	return floor, rep.Unreached, nil
 }
 
 // fetchOutcome is the result of fetchMissing.
@@ -202,6 +211,10 @@ func (s *Service) takeNewer(ctx context.Context, t TargetRow, from HolderCopy) e
 	defer clear(data)
 	if err := s.cfg.Creds.Install(t.ID, t.Kind, data); err != nil {
 		switch {
+		case errors.Is(err, ErrGenerationJump):
+			return takeError{takeOlder, fmt.Errorf("the holder %s said it has generation %d and its file is more than %d above the generation of this server: it is not believed", from.Host, from.Generation, MaxGenerationJump)}
+		case errors.Is(err, ErrPlainFile):
+			return takeError{takeUnopenable, fmt.Errorf("the file of %s is in clear and this server seals its files: only a sealed file is taken", from.Host)}
 		case errors.Is(err, ErrOlderGeneration):
 			return takeError{takeOlder, fmt.Errorf("the holder %s said it has generation %d and gave a file that is older than the one of this server or another of the same generation", from.Host, from.Generation)}
 		case errors.Is(err, ErrInstallWrite):
@@ -271,12 +284,16 @@ func (s *Service) ensureCurrent(ctx context.Context, term scheduler.Term, t Targ
 	}
 	rep, herr := s.cfg.Holders(ctx, []int64{t.ID})
 	if herr == nil {
-		if newer, _, _ := judgeCopies(own, rep.Copies[t.ID]); newer != nil {
+		if newer, _, _, _ := judgeCopies(own, rep.Copies[t.ID]); newer != nil {
 			if err := s.takeNewer(ctx, t, *newer); err != nil {
 				var te takeError
 				errors.As(err, &te)
 				return credsStaleError{cause: err, final: s.staleFailure(t.ID, te.kind)}
 			}
+			s.staleCleared(t.ID)
+			s.noteReplaced(t, *newer, own.Generation)
+		} else {
+			// no holder has a newer file: whatever kept the target waiting is over, and a later episode starts its own wait (P7H-02)
 			s.staleCleared(t.ID)
 		}
 	}
@@ -346,7 +363,10 @@ func (s *Service) jobCredentials(ctx context.Context, term scheduler.Term) error
 			if derr != nil {
 				continue
 			}
-			newer, stale, conflict := judgeCopies(own, rep.Copies[id])
+			newer, stale, conflict, jump := judgeCopies(own, rep.Copies[id])
+			if newer == nil && herr == nil {
+				s.staleCleared(id) // no holder has a newer file: the wait of an earlier episode is over (P7H-02)
+			}
 			if newer != nil {
 				// this server holds the older file (it became the leader after a rotation it missed): it takes the newer one and gives
 				// nothing away before that
@@ -363,11 +383,13 @@ func (s *Service) jobCredentials(ctx context.Context, term scheduler.Term) error
 					continue
 				}
 				s.staleCleared(id)
+				old := own.Generation
+				s.noteReplaced(t, *newer, old)
 				own, derr = s.cfg.Creds.Digest(id)
 				if derr != nil {
 					continue
 				}
-				_, stale, conflict = judgeCopies(own, rep.Copies[id])
+				_, stale, conflict, jump = judgeCopies(own, rep.Copies[id])
 			}
 			if len(stale) > 0 {
 				behind[id] = append(behind[id], stale...)
@@ -375,6 +397,12 @@ func (s *Service) jobCredentials(ctx context.Context, term scheduler.Term) error
 			if len(conflict) > 0 {
 				// two rotations of one generation: neither is given over the other
 				problems[id] = CredProblem{Text: fmt.Sprintf("The holders %s hold another credentials file for target %s than this server, of the same generation %d (two changes of the credentials were made at once): neither is given to the other. Enter the credentials of the target again: that makes a newer generation that every holder takes.", strings.Join(conflict, ", "), t.Name, own.Generation)}
+			}
+			if len(jump) > 0 {
+				// a number that no run of rotations reaches (P7H-01): not believed, not taken, not replaced. The way out is on that holder
+				if _, bad := problems[id]; !bad {
+					problems[id] = CredProblem{Text: fmt.Sprintf("The holders %s report a credentials generation for target %s that is more than %d above this server's (%d): a damaged or foreign file. It is neither taken nor replaced. Remove the file of the target on that holder (<key directory>/anchor/<id>.json) and the next pass gives it this server's file (entering the credentials again does not change that holder: it refuses a file below its own number).", strings.Join(jump, ", "), t.Name, MaxGenerationJump, own.Generation)}
+				}
 			}
 		}
 		for _, id := range sortedIDs(behind) {
@@ -426,6 +454,20 @@ func (s *Service) jobCredentials(ctx context.Context, term scheduler.Term) error
 		}
 	}
 	s.mu.Lock()
+	for _, id := range ids {
+		if n, ok := s.credNotice[id]; ok {
+			if s.now().Sub(n.at) >= CredNoticeFor {
+				delete(s.credNotice, id)
+			} else if _, bad := problems[id]; !bad {
+				problems[id] = CredProblem{Text: n.text}
+			}
+		}
+	}
+	for id := range s.credNotice {
+		if !known[id] {
+			delete(s.credNotice, id)
+		}
+	}
 	// A problem of an earlier distribution (a holder that was down when the credentials changed) stays while a holder cannot be asked: the
 	// pass has not seen that holder, so it does not know the holder is current, and "they are given again every minute" must stay true. It goes
 	// when the report is complete and nothing is behind, or when this pass gave the file to every holder that was behind.
@@ -503,4 +545,22 @@ func (r *HolderReport) Add(host string, out ListResponse, ids []int64) {
 			r.Orphans[id] = append(r.Orphans[id], host)
 		}
 	}
+}
+
+// CredNoticeFor is how long the alert of a rotation that was replaced by a file of a holder stays.
+const CredNoticeFor = 24 * time.Hour
+
+type credNote struct {
+	text string
+	at   time.Time
+}
+
+// noteReplaced keeps, as an alert, that this server replaced its credentials file by the newer file of a holder (P7H-03). A rotation made here
+// while that holder was away, or a file of a holder that came back, is undone this way, and the operator must be able to see that it happened:
+// the alert stays CredNoticeFor and is a warning, because the file that was taken is the cluster's newer one.
+func (s *Service) noteReplaced(t TargetRow, from HolderCopy, ownGeneration uint64) {
+	text := fmt.Sprintf("This server replaced its credentials file of target %s (generation %d) by the newer file of the holder %s (generation %d). A change of the credentials made here while that holder was away is undone by it: check that the credentials are the ones you want, and enter them again if not.", t.Name, ownGeneration, from.Host, from.Generation)
+	s.mu.Lock()
+	s.credNotice[t.ID] = credNote{text: text, at: s.now()}
+	s.mu.Unlock()
 }

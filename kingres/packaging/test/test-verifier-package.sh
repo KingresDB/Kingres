@@ -177,6 +177,11 @@ if command -v git >/dev/null; then
     "${packaged}" release verify --accept-dry-run --sums "${run}/r-dry/SHA256SUMS" --note "${run}/r-dry/SHA256SUMS.note" --key "${pubkey}" \
         --binary "${run}/r-dry/RELEASE" >/dev/null 2>&1 || dstatus=$?
     check_eq "and with --accept-dry-run ends with status 0" 0 "${dstatus}"
+    # an empty array under set -u is an unbound variable on bash before 4.4: release.sh expands it in the form that those accept (P7H-05)
+    portable='${accept[@]+"${accept[@]}"}'
+    bare='"${accept[@]}"'
+    check "release.sh expands its empty array in the portable form" grep -qF -- "${portable}" "${ver}/scripts/release.sh"
+    check "and nowhere bare" sh -c "! grep -F -- '${bare}' '${ver}/scripts/release.sh' | grep -vF -- '${portable}' | grep -q ."
     gitq tag v9.9.9
     rtry "${run}/r-ok" "${run}/r-ok.log"
     check_eq "a signed release from the tagged clean commit is made" 0 "${rstatus}"

@@ -55,16 +55,30 @@ func TestARotationRaisesTheGenerationAndEveryCopyKeepsGenerationAndStamp(t *test
 		t.Fatal(err)
 	}
 	sealed.Iterations, sealed.MinIterations = 2000, 1000
-	if err := sealed.Install(tg.ID, "worm", raw); err != nil {
+	// a server that seals does not take a file in clear above generation 0 (P7H-01): the generation of a plain file is not authenticated
+	if err := sealed.Install(tg.ID, "worm", append([]byte(nil), raw...)); !errors.Is(err, ErrPlainFile) {
+		t.Fatalf("a plain file on a sealed server: %v", err)
+	}
+	// a copy between two servers that seal with the same passphrase is the same rotation: the same generation and digest
+	creds2, _ := e.creds.Get(tg.ID, "worm")
+	if _, err := sealed.Rotate(tg.ID, creds2, 1); err != nil {
 		t.Fatal(err)
 	}
-	if sraw, _ := sealed.Raw(tg.ID); strings.Contains(string(sraw), testSecret) {
+	first, _ := sealed.Raw(tg.ID)
+	if strings.Contains(string(first), testSecret) {
 		t.Fatal("the sealed file is not sealed")
 	}
-	sd, err := sealed.Digest(tg.ID)
-	if err != nil || sd != d2 {
-		t.Fatalf("sealed copy %+v, want %+v (%v)", sd, d2, err)
+	second, _ := NewCredStore(t.TempDir(), pf)
+	second.Iterations, second.MinIterations = 2000, 1000
+	if err := second.Install(tg.ID, "worm", append([]byte(nil), first...)); err != nil {
+		t.Fatal(err)
 	}
+	sd, err := sealed.Digest(tg.ID)
+	sd2, err2 := second.Digest(tg.ID)
+	if err != nil || err2 != nil || sd != sd2 || sd.Generation != 2 {
+		t.Fatalf("copies %+v %+v (%v %v)", sd, sd2, err, err2)
+	}
+	d2 = sd
 	// and it goes back to a plain server unchanged
 	sraw, _ := sealed.Raw(tg.ID)
 	back, _ := NewCredStore(t.TempDir(), "")
@@ -250,7 +264,7 @@ func TestAFileOfAnEarlierVersionIsReadAsGenerationZeroAndIsOlderThanEveryRotatio
 		t.Fatalf("%+v %v", d, err)
 	}
 	// two files of earlier versions cannot be told apart: they are current to each other, and no holder of an earlier version is judged
-	if n, s, k := judgeCopies(CopyInfo{}, []HolderCopy{{Host: "h2"}}); n != nil || len(s) != 0 || len(k) != 0 {
+	if n, s, k, _ := judgeCopies(CopyInfo{}, []HolderCopy{{Host: "h2"}}); n != nil || len(s) != 0 || len(k) != 0 {
 		t.Fatalf("%v %v %v", n, s, k)
 	}
 	// a file of an earlier version is installed as it is (generation 0), and the first rotation is above it
@@ -268,10 +282,10 @@ func TestAFileOfAnEarlierVersionIsReadAsGenerationZeroAndIsOlderThanEveryRotatio
 	}
 	// a rotation makes a holder of generation 0 stale, and a holder of a higher generation makes a leader of generation 0 take its file
 	own, _ := e.creds.Digest(9)
-	if _, s, _ := judgeCopies(own, []HolderCopy{{Host: "h2"}}); len(s) != 1 {
+	if _, s, _, _ := judgeCopies(own, []HolderCopy{{Host: "h2"}}); len(s) != 1 {
 		t.Fatalf("a holder of an earlier version is not behind a rotation: %v", s)
 	}
-	if n, _, _ := judgeCopies(CopyInfo{}, []HolderCopy{{Host: "h2", Generation: 1, Digest: own.Digest}}); n == nil {
+	if n, _, _, _ := judgeCopies(CopyInfo{}, []HolderCopy{{Host: "h2", Generation: 1, Digest: own.Digest}}); n == nil {
 		t.Fatal("a leader of generation 0 does not take a rotation")
 	}
 	// damaged generations are refused
@@ -796,14 +810,15 @@ func TestAWorkerWithoutTheFileOfATargetFetchesItThroughTheGate(t *testing.T) {
 func TestAPassphraseFileThatCannotBeReadIsAMatterOfThisServerAndNotNoHolderHavingTheFile(t *testing.T) {
 	e := newEnv(t)
 	tg := e.addWorm("vault")
-	raw, _ := e.creds.Raw(tg.ID)
 	broken, err := NewCredStore(t.TempDir(), e.dir+"/there-is-no-passphrase-file")
 	if err != nil {
 		t.Fatal(err)
 	}
 	broken.Iterations, broken.MinIterations = 2000, 1000
-	// a plain file cannot be written under a passphrase that cannot be read
-	err = broken.Install(tg.ID, "worm", append([]byte(nil), raw...))
+	// a file in clear (generation 0, an earlier version) cannot be written under a passphrase that cannot be read
+	c0, _ := e.creds.Get(tg.ID, "worm")
+	legacy := legacyPlain(c0)
+	err = broken.Install(tg.ID, "worm", append([]byte(nil), legacy...))
 	if !errors.Is(err, ErrInstallWrite) || !errors.Is(err, ErrPassphraseFile) {
 		t.Fatalf("%v", err)
 	}
@@ -814,7 +829,7 @@ func TestAPassphraseFileThatCannotBeReadIsAMatterOfThisServerAndNotNoHolderHavin
 		t.Fatalf("%v", err)
 	}
 	e.svc.cfg.Creds = broken
-	e.svc.cfg.Fetch = func(context.Context, int64) ([]byte, error) { return append([]byte(nil), raw...), nil }
+	e.svc.cfg.Fetch = func(context.Context, int64) ([]byte, error) { return append([]byte(nil), legacy...), nil }
 	trow, _ := e.st.Target(e.ctx(), tg.ID)
 	if got := e.svc.fetchMissing(e.ctx(), trow); got != fetchNotInstalled {
 		t.Fatalf("fetchMissing says %v, want the failure of this server", got)
@@ -875,7 +890,7 @@ func TestJudgingTheCopiesByGeneration(t *testing.T) {
 	h := func(host string, g uint64, d string) HolderCopy {
 		return HolderCopy{Host: host, Generation: g, Digest: d}
 	}
-	newer, stale, conflict := judgeCopies(own, []HolderCopy{h("h2", 3, "aa"), h("h3", 2, "bb"), h("h4", 0, ""), h("h5", 4, "cc"), h("h6", 5, "dd"), h("h7", 3, "ee"), h("h8", 5, "ff")})
+	newer, stale, conflict, _ := judgeCopies(own, []HolderCopy{h("h2", 3, "aa"), h("h3", 2, "bb"), h("h4", 0, ""), h("h5", 4, "cc"), h("h6", 5, "dd"), h("h7", 3, "ee"), h("h8", 5, "ff")})
 	if newer == nil || newer.Host != "h6" {
 		t.Fatalf("newer %+v, want the highest generation, the first of two by name (h6)", newer)
 	}
@@ -885,11 +900,11 @@ func TestJudgingTheCopiesByGeneration(t *testing.T) {
 	if strings.Join(conflict, ",") != "h7" {
 		t.Fatalf("conflict %v: the same generation with another digest", conflict)
 	}
-	if n, s, k := judgeCopies(own, []HolderCopy{h("h2", 3, "aa")}); n != nil || len(s) != 0 || len(k) != 0 {
+	if n, s, k, _ := judgeCopies(own, []HolderCopy{h("h2", 3, "aa")}); n != nil || len(s) != 0 || len(k) != 0 {
 		t.Fatalf("the same copy is current: %v %v %v", n, s, k)
 	}
 	// the number decides, nothing else: a lower generation is stale whatever its digest says
-	if n, s, _ := judgeCopies(own, []HolderCopy{h("h2", 2, "aa")}); n != nil || len(s) != 1 {
+	if n, s, _, _ := judgeCopies(own, []HolderCopy{h("h2", 2, "aa")}); n != nil || len(s) != 1 {
 		t.Fatalf("%v %v", n, s)
 	}
 }
@@ -911,7 +926,7 @@ func TestAHolderReportKeepsTheGenerationAndTheDigestOfEachCopy(t *testing.T) {
 func TestANewerFileThatThisServerCannotStoreIsWaitedFor(t *testing.T) {
 	e, _, raw := staleLeader(t)
 	e.svc.cfg.FetchFrom = func(context.Context, string, int64) ([]byte, error) { return append([]byte(nil), raw...), nil }
-	e.creds.passFile = e.dir + "/there-is-no-passphrase-file" // a plain file is still read, and nothing can be written under it
+	e.creds.writeErr = errors.New("the disk is full") // the file is still read, and nothing can be written
 	if err := e.runSubmit(); err != nil {
 		t.Fatal(err)
 	}

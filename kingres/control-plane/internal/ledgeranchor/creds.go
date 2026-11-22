@@ -22,6 +22,7 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
+	"sync"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/anchor"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ledgerkeys"
@@ -268,6 +269,28 @@ type CredStore struct {
 	MinIterations int
 	// Rand supplies the salt and the nonce (crypto/rand when nil).
 	Rand io.Reader
+	// writeErr is an error that every write of a file returns (tests).
+	writeErr error
+
+	// locks serialize the changes of the file of one target (P7H-04).
+	lmu   sync.Mutex
+	locks map[int64]*sync.Mutex
+}
+
+// lock takes the lock of one target and returns its release.
+func (s *CredStore) lock(id int64) func() {
+	s.lmu.Lock()
+	if s.locks == nil {
+		s.locks = map[int64]*sync.Mutex{}
+	}
+	m := s.locks[id]
+	if m == nil {
+		m = &sync.Mutex{}
+		s.locks[id] = m
+	}
+	s.lmu.Unlock()
+	m.Lock()
+	return m.Unlock
 }
 
 // NewCredStore prepares <dir>/anchor with mode 0700; passFile is the passphrase file ("" for files in clear).
@@ -426,6 +449,8 @@ type Stored struct {
 	Generation uint64
 	// Stamp is the stamp of the rotation, empty for a file of an earlier version (generation 0).
 	Stamp string
+	// Plain is true when the file was in clear (not sealed).
+	Plain bool
 }
 
 // Decode reads a file made by Encode (a sealed one needs the passphrase file of this server; a plain one is
@@ -449,7 +474,7 @@ func (s *CredStore) DecodeFile(data []byte, kind string) (Stored, error) {
 	if err != nil || c == nil {
 		return Stored{}, ErrCredentials
 	}
-	return Stored{Creds: c, Generation: b.Generation, Stamp: b.Stamp}, nil
+	return Stored{Creds: c, Generation: b.Generation, Stamp: b.Stamp, Plain: b.Plain}, nil
 }
 
 // openedBody is the members of a file as JSON, with the generation and the stamp.
@@ -457,6 +482,8 @@ type openedBody struct {
 	Members    []byte
 	Generation uint64
 	Stamp      string
+	// Plain: the body was read from a file in clear.
+	Plain bool
 }
 
 // parseBody splits the text of a file body: the new form is an object with the members of credentials, a generation and a stamp, the old form
@@ -491,7 +518,9 @@ func (s *CredStore) openBody(data []byte) (openedBody, error) {
 		if !bytes.HasSuffix(rest, []byte("}\n")) {
 			return openedBody{}, ErrCredentials
 		}
-		return parseBody(rest, true)
+		b, err := parseBody(rest, true)
+		b.Plain = true
+		return b, err
 	}
 	var env struct {
 		KDF        string `json:"kdf"`
@@ -594,11 +623,17 @@ func (s *CredStore) Digest(id int64) (CopyInfo, error) {
 	for k, v := range m {
 		cr[k] = anchor.Secret(v)
 	}
-	d, err := digestOf(id, Stored{Creds: cr, Generation: b.Generation, Stamp: b.Stamp})
+	gen, stamp := b.Generation, b.Stamp
+	if s.Sealed() && b.Plain && gen > 0 {
+		// a file in clear above generation 0 on a server that seals is not one that a rotation of this cluster made (P7H-01): it takes no part
+		// in the ordering
+		gen, stamp = 0, ""
+	}
+	d, err := digestOf(id, Stored{Creds: cr, Generation: gen, Stamp: stamp})
 	if err != nil {
 		return CopyInfo{}, err
 	}
-	return CopyInfo{ID: id, Generation: b.Generation, Digest: d}, nil
+	return CopyInfo{ID: id, Generation: gen, Digest: d}, nil
 }
 
 // Put writes the file of a target atomically, mode 0600, replacing one that exists: a rotation. The generation is one above the generation of the
@@ -609,9 +644,13 @@ func (s *CredStore) Put(id int64, c Creds) ([]byte, error) { return s.Rotate(id,
 
 // Rotate is Put with a floor for the generation.
 func (s *CredStore) Rotate(id int64, c Creds, floor uint64) ([]byte, error) {
+	defer s.lock(id)()
 	gen := floor
 	if cur, err := s.Digest(id); err == nil && cur.Generation > gen {
 		gen = cur.Generation
+	}
+	if gen >= MaxCredGeneration {
+		return nil, ErrGenerationExhausted
 	}
 	gen++
 	stamp, err := NewStamp()
@@ -622,6 +661,9 @@ func (s *CredStore) Rotate(id int64, c Creds, floor uint64) ([]byte, error) {
 }
 
 func (s *CredStore) write(id int64, c Creds, gen uint64, stamp string) ([]byte, error) {
+	if s.writeErr != nil {
+		return nil, s.writeErr
+	}
 	data, err := s.Encode(c, gen, stamp)
 	if err != nil {
 		return nil, err
@@ -637,6 +679,21 @@ func (s *CredStore) write(id int64, c Creds, gen uint64, stamp string) ([]byte, 
 // another rotation: an older or a rival file is never written over a newer one (P7G-02).
 var ErrOlderGeneration = errors.New("ledgeranchor: this server holds a newer credentials file for the target, or a different one of the same generation")
 
+// ErrPlainFile means that a file in clear above generation 0 was refused by a server that seals its files: the generation of a plain file is not
+// authenticated, and a plain file would win over every sealed one (P7H-01). It is an ErrCredentials.
+var ErrPlainFile = fmt.Errorf("%w (a file in clear above generation 0 is not accepted by a server that seals its files)", ErrCredentials)
+
+// MaxGenerationJump is how far above the generation of the file that is here an incoming generation may be: a rotation counts one at a time, so
+// a jump is a damaged or foreign file (P7H-01). A holder that reports more is not believed, and its file is neither taken nor replaced.
+const MaxGenerationJump = 64
+
+// ErrGenerationJump means that a file was refused because its generation is more than MaxGenerationJump above the one that is here.
+var ErrGenerationJump = fmt.Errorf("%w (its generation is far above the one of this server)", ErrCredentials)
+
+// ErrGenerationExhausted means that the credentials cannot be changed because the generation of the file is at its bound (a damaged file):
+// remove the file of the target on this server (<key directory>/anchor/<id>.json) and enter the credentials again, which writes a new one.
+var ErrGenerationExhausted = errors.New("ledgeranchor: the generation of the credentials file is at its bound: remove the file of the target on this server and enter the credentials again")
+
 // Install writes a file received from another server, with the generation and the stamp it carries: it must decode here (so a holder with
 // another passphrase says so), and it is written again under this server's own sealing. A file of a lower generation than the one that is here,
 // or of the same generation and another rotation, is refused with ErrOlderGeneration.
@@ -651,9 +708,16 @@ func (s *CredStore) Install(id int64, kind string, data []byte) error {
 		}
 		return err
 	}
+	if s.Sealed() && st.Plain && st.Generation > 0 {
+		return ErrPlainFile
+	}
+	defer s.lock(id)()
 	if cur, cerr := s.Digest(id); cerr == nil {
 		if st.Generation < cur.Generation {
 			return ErrOlderGeneration
+		}
+		if st.Generation > cur.Generation+MaxGenerationJump {
+			return ErrGenerationJump
 		}
 		if st.Generation == cur.Generation {
 			d, derr := digestOf(id, st)
