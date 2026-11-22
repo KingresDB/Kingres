@@ -203,6 +203,26 @@ mg_unique_indexes_carry_key(Oid relid, AttrNumber dist_attno, Oid collation)
  * The checks that M1 and M3 share (7.2, the refusals of every case)
  * ====================================================================== */
 
+/*
+ * The entry of a table of the catalog, copied: every call that reads the catalog (the analyses, the deparse,
+ * the parse of a text, a cursor of SPI) can make this backend load the cache again, and a pointer into the
+ * old one is then dangling.  The copy and its colocation group stay valid for the statement.
+ */
+static const KsDistTable *
+mg_lookup_stable(Oid relid)
+{
+	const KsDistTable *dt = kingres_shard_lookup_dist_table(relid);
+	KsDistTable *copy;
+
+	if (dt == NULL)
+		return NULL;
+	copy = palloc(sizeof(KsDistTable));
+	memcpy(copy, dt, sizeof(KsDistTable));
+	if (dt->coloc != NULL)
+		copy->coloc = kingres_shard_coloc_copy(dt->coloc);
+	return copy;
+}
+
 #define MG_NO(msg) do { *why = (msg); return false; } while (0)
 
 static bool
@@ -932,7 +952,7 @@ kingres_shard_merge_fragment_analyze(Query *q, int rp, KsMerge *m, const char **
 	trte = rt_fetch(q->resultRelation, q->rtable);
 	if (trte->rtekind != RTE_RELATION)
 		MG_NO("its target is not a table");
-	tdt = kingres_shard_lookup_dist_table(trte->relid);
+	tdt = mg_lookup_stable(trte->relid);
 	if (tdt == NULL || tdt->is_reference)
 		MG_NO("its target is not a distributed table");
 	merge_fill(q, tdt, m);
@@ -1018,7 +1038,7 @@ kingres_shard_merge_classify(Query *parse, KsMerge *m)
 	trte = rt_fetch(parse->resultRelation, parse->rtable);
 	if (trte->rtekind != RTE_RELATION)
 		return false;
-	tdt = kingres_shard_lookup_dist_table(trte->relid);
+	tdt = mg_lookup_stable(trte->relid);
 	if (tdt == NULL || tdt->is_reference)
 		return false;
 	merge_fill(parse, tdt, m);
@@ -1189,7 +1209,7 @@ kingres_shard_merge_collect(const char *source_sql, ParamListInfo params, int nc
 	KsMergeShares *sh;
 	MemoryContext old = MemoryContextSwitchTo(cxt);
 	bool		bcast = (colocation_id == 0);
-	const KsColocation *coloc = bcast ? NULL : kingres_shard_lookup_colocation(colocation_id);
+	const KsColocation *coloc = NULL;
 	int			n = params ? params->numParams : 0;
 	Oid		   *argtypes = palloc(sizeof(Oid) * Max(n, 1));
 	Datum	   *values = palloc(sizeof(Datum) * Max(n, 1));
@@ -1203,6 +1223,9 @@ kingres_shard_merge_collect(const char *source_sql, ParamListInfo params, int nc
 	int			nest;
 	MemoryContext rowcxt;
 
+	/* a copy: the cursor below can make this backend load the catalog again */
+	if (!bcast && kingres_shard_lookup_colocation(colocation_id) != NULL)
+		coloc = kingres_shard_coloc_copy(kingres_shard_lookup_colocation(colocation_id));
 	if (coloc == NULL && !bcast)
 		elog(ERROR, "colocation group %d of a MERGE is not in the catalog", colocation_id);
 	sh = palloc0(sizeof(KsMergeShares));
@@ -1404,7 +1427,7 @@ kingres_shard_merge_ref_fragment_analyze(Query *q, int *nshipped, const char **w
 	trte = rt_fetch(q->resultRelation, q->rtable);
 	if (trte->rtekind != RTE_RELATION)
 		MG_NO("its target is not a table");
-	tdt = kingres_shard_lookup_dist_table(trte->relid);
+	tdt = mg_lookup_stable(trte->relid);
 	if (tdt == NULL || !tdt->is_reference)
 		MG_NO("its target is not a reference table");
 	if (q->cteList != NIL || q->hasRecursive || q->hasModifyingCTE)
@@ -1489,7 +1512,7 @@ kingres_shard_merge_classify_ref(Query *parse, KsMerge *m)
 	trte = rt_fetch(parse->resultRelation, parse->rtable);
 	if (trte->rtekind != RTE_RELATION)
 		return false;
-	tdt = kingres_shard_lookup_dist_table(trte->relid);
+	tdt = mg_lookup_stable(trte->relid);
 	if (tdt == NULL || !tdt->is_reference)
 		return false;
 	m->target_relid = trte->relid;
