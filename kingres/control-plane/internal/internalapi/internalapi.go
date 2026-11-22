@@ -173,6 +173,8 @@ var Calls = map[string]Policy{
 	// The credentials of anchor targets (internal-api.md, "The credentials of anchor targets"): the leader gives a holder the file, takes it away.
 	"POST /ledger/anchor/credentials/install": LeaderOnly,
 	"POST /ledger/anchor/credentials/remove":  LeaderOnly,
+	"POST /ledger/anchor/credentials/list":    LeaderOnly,
+	"POST /ledger/anchor/credentials/fetch":   LeaderOnly,
 
 	// The record of what was published (internal-api.md, "The record of what was published"): the leader merges its state into a holder's, and a server that
 	// is about to lead and has none asks the others for theirs.
@@ -207,7 +209,7 @@ var handled = map[string]bool{
 	"POST /failover/lease": true, "POST /failover/demote": true, "POST /failover/promote": true, "POST /failover/prepared": true, "POST /standby/repoint": true,
 	"POST /failover/quiesce": true, "POST /failover/unquiesce": true, "POST /failover/mark": true, "POST /failover/verify": true, "POST /failover/resume": true,
 	"POST /ledger/key/install": true, "POST /ledger/key/remove": true, "POST /ledger/key/list": true,
-	"POST /ledger/anchor/credentials/install": true, "POST /ledger/anchor/credentials/remove": true,
+	"POST /ledger/anchor/credentials/install": true, "POST /ledger/anchor/credentials/remove": true, "POST /ledger/anchor/credentials/list": true, "POST /ledger/anchor/credentials/fetch": true,
 	"POST /ledger/state/get": true, "POST /ledger/state/merge": true,
 	"POST /ledger/read": true, "POST /ledger/publication/get": true,
 	"POST /config/state": true, "POST /config/apply": true, "POST /config/check": true, "POST /config/restart": true, "GET /time": true,
@@ -215,7 +217,11 @@ var handled = map[string]bool{
 
 // fenceRequired are the destructive calls of the failover: they are accepted from the leader only with the fence
 // header of a task run (F3-13).
-var fenceRequired = map[string]bool{"POST /failover/demote": true, "POST /failover/promote": true}
+var fenceRequired = map[string]bool{"POST /failover/demote": true, "POST /failover/promote": true,
+	// The forward calls of a planned switchover (F4-09): they end sessions, replace access rules, stop writes and prove a replay, so a leader that
+	// is not a live run of the task cannot make them. The undo calls (unquiesce, resume) are not fenced: the repair of a switchover that a task left
+	// behind has no run to show.
+	"POST /failover/quiesce": true, "POST /failover/mark": true, "POST /failover/verify": true}
 
 // CallError is an error with the status and code the internal API answers.
 type CallError struct {

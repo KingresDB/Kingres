@@ -55,8 +55,8 @@ func (r *retryRows) SetPlanned(ctx context.Context, n int) error {
 	return r.do(ctx, func() error { return r.Rows.SetPlanned(ctx, n) })
 }
 
-func (r *retryRows) StartMove(ctx context.Context, m Move, fromServer, toServer string, attempts int) (seq int, err error) {
-	err = r.do(ctx, func() (e error) { seq, e = r.Rows.StartMove(ctx, m, fromServer, toServer, attempts); return })
+func (r *retryRows) StartMove(ctx context.Context, m Move, fromServer, toServer string, attempts int, mark int64) (seq int, err error) {
+	err = r.do(ctx, func() (e error) { seq, e = r.Rows.StartMove(ctx, m, fromServer, toServer, attempts, mark); return })
 	return
 }
 
@@ -83,8 +83,4 @@ func (r *retryRows) Moves(ctx context.Context) (rows []MoveRow, err error) {
 
 func (r *retryRows) Settle(ctx context.Context, outcome, stoppedBy, errText string, after []Placement) error {
 	return r.do(ctx, func() error { return r.Rows.Settle(ctx, outcome, stoppedBy, errText, after) })
-}
-
-func (r *retryRows) SetMark(ctx context.Context, seq int, mark int64) error {
-	return r.do(ctx, func() error { return r.Rows.SetMark(ctx, seq, mark) })
 }

@@ -899,3 +899,23 @@ func EvidenceFromToken(url string, info *TokenInfo, tokenDER []byte) anchor.TSAE
 
 // SkewOf returns genTime minus now (positive: the TSA is ahead).
 func SkewOf(genTime, now time.Time) time.Duration { return genTime.Sub(now) }
+
+// ImprintOf returns the SHA-256 message imprint that a token states, and nothing else: it checks no signature and no chain (the token was
+// verified when it was received). A caller that holds the digest a record stands for compares the two before it believes that the token
+// belongs to the record (P7A-05).
+func ImprintOf(tokenDER []byte) ([32]byte, error) {
+	var out [32]byte
+	pt, aerr := parseToken(tokenDER)
+	if aerr != nil {
+		return out, aerr
+	}
+	info, aerr := parseTSTInfo(pt.eContent)
+	if aerr != nil {
+		return out, aerr
+	}
+	if info.hashOID != oidSHA256 || len(info.imprint) != 32 {
+		return out, fail(CodeImprint, "the token does not stamp a SHA-256 imprint")
+	}
+	copy(out[:], info.imprint)
+	return out, nil
+}

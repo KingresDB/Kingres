@@ -38,7 +38,7 @@ func TestVersionFlag(t *testing.T) {
 }
 
 func TestMissingPostgresProgramsStopTheServerWithAClearMessage(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempDir(t)
 	err := run(context.Background(), []string{"-data-dir", filepath.Join(dir, "d"), "-listen", "127.0.0.1:0", "-pg-bin-dir", filepath.Join(dir, "none")},
 		noEnv, &bytes.Buffer{}, nil)
 	if err == nil || !strings.Contains(err.Error(), "pg-bin-dir") {

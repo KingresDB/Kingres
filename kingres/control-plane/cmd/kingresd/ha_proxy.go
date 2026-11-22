@@ -131,7 +131,7 @@ func primaryResolver(d *haDeps) clientproxy.Resolver {
 		},
 		Nodes:         func(ctx context.Context) ([]clientproxy.Node, error) { return catalogNodesWithFallback(ctx, d) },
 		LeaseKnown:    func() bool { return len(d.Registry.Leases().Info()) > 0 },
-		HoldsLease:    func(g int32) bool { return d.Registry.Leases().Holds(g) && !quiesced.has(g) },
+		HoldsLease:    func(g int32) bool { return d.Registry.Leases().Holds(g) && !quiescedNow(d, g) },
 		Dead:          func(host string) bool { return d.Registry.Liveness().State(host) == ha.PeerDead },
 		PeerEntryPort: entryPort(d.Cfg.HA.ClientListen),
 		IsPeer:        newPeerMatcher(d).isPeer,

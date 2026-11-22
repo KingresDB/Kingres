@@ -338,14 +338,40 @@ func TestAnUnreadableStandbyNeedsTheAcceptanceOfALoss(t *testing.T) {
 	if !errors.As(err, &pe) || w.index("promote ") >= 0 {
 		t.Fatalf("got %v\n%s", err, strings.Join(w.log, "\n"))
 	}
-	// The same request with the acceptance goes on: the pause did not close the journal.
+	// F4-01. The same request with the acceptance, repeated on the same runner and the same journal (the pause did not close it), goes
+	// on: the decision of the operator is taken by the bootstrap in progress.
 	rq := req()
 	rq.AllowDataLoss = true
-	w2 := newWorld()
-	w2.posErr["s3"] = failover.ErrUnreachable
-	r2, _ := w2.runner(t)
-	if _, err := r2.Run(context.Background(), rq); err != nil || w2.index("promote s2") < 0 {
-		t.Fatalf("with allowDataLoss: %v\n%s", err, strings.Join(w2.log, "\n"))
+	if _, err := r.Run(context.Background(), rq); err != nil || w.index("promote s2") < 0 {
+		t.Fatalf("with allowDataLoss: %v\n%s", err, strings.Join(w.log, "\n"))
+	}
+}
+
+// F4-01 (the other direction). An automatic request that finds a journal begun by an operator does not change it, and an operator can take
+// the acceptance back before anything is pinned.
+func TestARepeatedRequestChangesTheAcceptanceOnlyWhenItIsManual(t *testing.T) {
+	st, err := journal.Open(tempDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	j, err := st.Begin("a", "s1", 4, "manual", "op", true)
+	if err != nil || !j.AllowDataLoss {
+		t.Fatalf("%+v %v", j, err)
+	}
+	if j, _ = st.Begin("b", "s1", 4, "automatic", "system", false); !j.AllowDataLoss || j.Trigger != "manual" || j.RequestedBy != "op" {
+		t.Fatalf("an automatic request changed the journal of an operator: %+v", j)
+	}
+	if j, _ = st.Begin("c", "s1", 4, "manual", "op2", false); j.AllowDataLoss || j.RequestedBy != "op2" {
+		t.Fatalf("the operator could not take the acceptance back: %+v", j)
+	}
+	if j, _ = st.Begin("d", "s1", 4, "manual", "op2", true); !j.AllowDataLoss || len(j.Events) != 2 {
+		t.Fatalf("%+v", j)
+	}
+	if _, err := st.SetPin(journal.Pin{StandbyID: 1, Node: 1, Server: "s2"}); err != nil {
+		t.Fatal(err)
+	}
+	if j, _ = st.Begin("e", "s1", 4, "manual", "op2", false); !j.AllowDataLoss {
+		t.Fatalf("a pinned journal took a new acceptance: %+v", j)
 	}
 }
 
@@ -480,4 +506,21 @@ func tempDir(t *testing.T) string {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(d) })
 	return d
+}
+
+// F4-05. An automatic start for an old server that this server hears is refused; an operator's request is not.
+func TestAnAutomaticStartForALiveOldServerIsRefused(t *testing.T) {
+	w := newWorld()
+	w.live["s1"] = "live"
+	r, _ := w.runner(t)
+	rq := req()
+	rq.Trigger = "automatic"
+	_, err := r.Decide(context.Background(), rq)
+	var ref *Refusal
+	if !errors.As(err, &ref) || ref.Code != "conflict" {
+		t.Fatalf("an automatic start for a live server: %v", err)
+	}
+	if _, err := r.Decide(context.Background(), req()); err != nil {
+		t.Fatalf("a manual request for a live server: %v", err)
+	}
 }

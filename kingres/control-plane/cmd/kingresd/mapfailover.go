@@ -331,7 +331,7 @@ func (m *mapFailover) Status() (failover.Status, bool) {
 // ---------------------------------------------------------------------------------
 // The callee side
 
-func handleMapStart(ctx context.Context, d *haDeps, body []byte) (any, error) {
+func handleMapStart(ctx context.Context, d *haDeps, caller string, body []byte) (any, error) {
 	mf := d.MapFailover
 	if mf == nil {
 		return nil, notStarted
@@ -339,6 +339,12 @@ func handleMapStart(ctx context.Context, d *haDeps, body []byte) (any, error) {
 	var b mapStartBody
 	if err := json.Unmarshal(body, &b); err != nil || b.Server == "" {
 		return nil, badBody("a map group failover request")
+	}
+	// The call is the request of an operator that a member received (F4-05): it is never automatic (the monitor of this server starts an
+	// automatic bootstrap itself), and it does not name the system as its author.
+	b.Trigger = "manual"
+	if b.RequestedBy == "" || b.RequestedBy == "system" {
+		b.RequestedBy = "operator (via " + caller + ")"
 	}
 	if err := mf.begin(ctx, b); err != nil {
 		var p *problem.Problem
@@ -352,7 +358,7 @@ func handleMapStart(ctx context.Context, d *haDeps, body []byte) (any, error) {
 
 // handleMapContinue is the call of a candidate that handed over the lease at B4: this server holds the journal's pin, adopts the
 // journal (its steps up to B4 are done there) and resumes at B4's successor.
-func handleMapContinue(ctx context.Context, d *haDeps, body []byte) (any, error) {
+func handleMapContinue(ctx context.Context, d *haDeps, caller string, body []byte) (any, error) {
 	mf := d.MapFailover
 	if mf == nil {
 		return nil, notStarted
@@ -363,6 +369,14 @@ func handleMapContinue(ctx context.Context, d *haDeps, body []byte) (any, error)
 	}
 	if j.Pin.Server != mf.self {
 		return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "not_candidate", Message: "The journal pins another server's standby."}
+	}
+	// The caller is a server that hosts a ready standby of the map group (it was a candidate that found this one better), and the journal it
+	// sends has done the steps up to B4 and no more (F4-05): what comes after is done here, under this server's own lease.
+	if ok, _ := (&mapPorts{m: mf}).isCandidate(ctx, caller); !ok {
+		return nil, &internalapi.CallError{Status: http.StatusForbidden, Code: "forbidden", Message: "Only a server that hosts a standby of the map group hands a bootstrap over."}
+	}
+	for _, step := range []string{journal.StepPromote, journal.StepCatalog, journal.StepLeader, journal.StepGateOpen} {
+		delete(j.Done, step)
 	}
 	term, primary, err := (&mapPorts{m: mf}).CatalogTerm(ctx)
 	if err != nil || primary != j.OldServer || term != j.Term {
@@ -617,4 +631,18 @@ func (p *mapPorts) CheckAuthority(context.Context) (bool, error) {
 func (p *mapPorts) MoveSystem(context.Context) error {
 	p.m.svc.PublishSystemDSN()
 	return nil
+}
+
+// isCandidate says that server hosts a ready, registered standby of the map group.
+func (p *mapPorts) isCandidate(ctx context.Context, server string) (bool, error) {
+	recs, err := p.Standbys(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, s := range recs {
+		if s.Server == server && s.State == "ready" && s.CatalogNode != 0 {
+			return true, nil
+		}
+	}
+	return false, nil
 }

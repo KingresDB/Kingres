@@ -113,11 +113,11 @@ func (f *flakyRows) Moves(ctx context.Context) ([]MoveRow, error) {
 	}
 	return f.memRows.Moves(ctx)
 }
-func (f *flakyRows) StartMove(ctx context.Context, m Move, from, to string, attempts int) (int, error) {
+func (f *flakyRows) StartMove(ctx context.Context, m Move, from, to string, attempts int, mark int64) (int, error) {
 	if err := f.fail(); err != nil {
 		return 0, err
 	}
-	return f.memRows.StartMove(ctx, m, from, to, attempts)
+	return f.memRows.StartMove(ctx, m, from, to, attempts, mark)
 }
 func (f *flakyRows) SetPlanned(ctx context.Context, n int) error {
 	if err := f.fail(); err != nil {

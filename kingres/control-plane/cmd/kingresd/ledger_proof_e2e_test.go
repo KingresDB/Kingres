@@ -159,7 +159,7 @@ func digestDocument(t testing.TB, raw []byte) []byte {
 func TestInclusionProofsAndTheVerifier(t *testing.T) {
 	e := shared(t)
 	verifyBin(t)
-	dir := t.TempDir()
+	dir := tempDir(t)
 	e.mustTask(t, "POST", "/databases", map[string]any{"name": "pfdb", "ledger": map[string]any{"mode": "optIn"}})
 	e.sql(t, "pfdb", "create table public.acct (id int primary key, owner text)")
 	e.sql(t, "pfdb", "create table public.inv (id int primary key, qty int)")

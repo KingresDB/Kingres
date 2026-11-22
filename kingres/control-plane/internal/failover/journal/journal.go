@@ -74,6 +74,8 @@ type Journal struct {
 	// does not insert a second one.
 	Recorded bool  `json:"recorded,omitempty"`
 	TaskID   int64 `json:"taskId,omitempty"`
+	// Abandoned is when the bootstrap was given up before the promotion (F4-06): its gate is open and a new one may begin.
+	Abandoned time.Time `json:"abandoned,omitempty"`
 }
 
 // ErrNewerTerm is returned by Begin when the journal on disk belongs to a bootstrap of a higher term than the one asked for.
@@ -129,7 +131,15 @@ func (s *Store) Begin(id, oldServer string, term int64, trigger, requestedBy str
 		switch {
 		case s.j.Term > term:
 			return Journal{}, ErrNewerTerm
-		case s.j.Term == term && s.j.OldServer == oldServer && !s.finishedLocked():
+		case s.j.Term == term && s.j.OldServer == oldServer && !s.finishedLocked() && s.j.Abandoned.IsZero():
+			// The bootstrap in progress is the answer, but a repeated request of an operator carries a decision that the first one did not
+			// (F4-01: "repeat the request with allowDataLoss set to true"): it is taken as long as nothing was pinned, in either direction,
+			// and it never comes from an automatic request.
+			if trigger == "manual" && s.j.Pin == nil && (s.j.AllowDataLoss != allowDataLoss || s.j.Trigger != trigger || s.j.RequestedBy != requestedBy) {
+				s.j.AllowDataLoss, s.j.Trigger, s.j.RequestedBy = allowDataLoss, trigger, requestedBy
+				s.j.Events = append(s.j.Events, Event{At: s.now().UTC(), Step: "request", Kind: "requestRepeated", Detail: map[string]any{"allowDataLoss": allowDataLoss, "requestedBy": requestedBy}})
+				return s.copyLocked(), s.saveLocked()
+			}
 			return s.copyLocked(), nil
 		}
 	}
@@ -168,7 +178,7 @@ func (s *Store) Current() (Journal, bool) {
 func (s *Store) Active() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.j != nil && !s.finishedLocked()
+	return s.j != nil && !s.finishedLocked() && s.j.Abandoned.IsZero()
 }
 
 // Done records that a step finished (idempotent: the first time stays).
@@ -267,4 +277,38 @@ func (s *Store) Undo(steps ...string) error {
 		delete(s.j.Done, st)
 	}
 	return s.saveLocked()
+}
+
+// ErrPromoted is returned by Abandon for a bootstrap that promoted the standby: it can only go on.
+var ErrPromoted = errors.New("journal: the standby was promoted; the bootstrap cannot be given up")
+
+// Abandon gives up a bootstrap that did not reach the promotion (F4-06): the gate of the engine opens, the monitor looks again, and a new
+// bootstrap may begin. After the promotion (B5) it is refused: the promoted instance holds the lease and the bootstrap must end.
+func (s *Store) Abandon(reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.j == nil || s.finishedLocked() || !s.j.Abandoned.IsZero() {
+		return nil
+	}
+	if !s.j.Done[StepPromote].IsZero() {
+		return ErrPromoted
+	}
+	s.j.Abandoned = s.now().UTC()
+	s.j.Events = append(s.j.Events, Event{At: s.j.Abandoned, Step: "abandon", Kind: "abandoned", Detail: map[string]any{"reason": reason}})
+	return s.saveLocked()
+}
+
+// Stuck says whether the bootstrap in progress should be given up: it did not reach the promotion and either the catalog has a newer term
+// than it began with (another candidate, or a change, got there first) or it is older than maxAge.
+func Stuck(j Journal, catalogTerm int64, now time.Time, maxAge time.Duration) (bool, string) {
+	if !j.Done[StepPromote].IsZero() || !j.Done[StepGateOpen].IsZero() || !j.Abandoned.IsZero() {
+		return false, ""
+	}
+	if catalogTerm > j.Term {
+		return true, fmt.Sprintf("the catalog has term %d, the bootstrap began with %d", catalogTerm, j.Term)
+	}
+	if maxAge > 0 && now.Sub(j.StartedAt) > maxAge {
+		return true, fmt.Sprintf("the bootstrap began %s ago and did not reach the promotion", now.Sub(j.StartedAt).Round(time.Second))
+	}
+	return false, ""
 }

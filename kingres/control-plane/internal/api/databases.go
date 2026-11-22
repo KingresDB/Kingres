@@ -145,6 +145,15 @@ type Table struct {
 	EstimatedRows *int64 `json:"estimatedRows"`
 	// SizeBytes is the table size; null when not available.
 	SizeBytes *int64 `json:"sizeBytes"`
+	// Partitioning says how the user partitioned a distributed table (contract 0.14.0, optional); null when it is not partitioned.
+	Partitioning *TablePartitioning `json:"partitioning,omitempty"`
+}
+
+// TablePartitioning is the partitioning member of Table.
+type TablePartitioning struct {
+	Method         string `json:"method"`
+	Key            string `json:"key"`
+	PartitionCount int    `json:"partitionCount"`
 }
 
 // TableColumn is a column of a table with its eligibility as distribution

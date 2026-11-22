@@ -119,6 +119,10 @@ type groupState struct {
 	rounds  int
 	refused map[string]string
 	waitMs  int64
+	// What the log says when the lease is lost, so that a loss is explained by what the rounds saw: when the last round started
+	// and how long it took (monotonic), how many grantors answered yes, and when a round last reached a majority.
+	lastStart, lastTook, lastOKStart time.Duration
+	lastGranted                      int
 }
 
 // Manager is the holder side of the lease protocol. It implements ha.Leases.
@@ -234,7 +238,11 @@ func (m *Manager) state(g int32) *groupState {
 // of. The lease obtained is valid from the START of the round, never from the
 // moment the answers arrived.
 func (m *Manager) Renew(ctx context.Context) {
-	topo, err := m.c.Source.Topology(ctx)
+	// The catalog is read within one renewal period: a catalog that does not answer (its instance is busy, or starting again) must not
+	// keep the rounds from being asked, the cached topology serves (as for any error), or the lease runs out because nothing asked for it.
+	tctx, tcancel := context.WithTimeout(ctx, max(m.c.Renew, 500*time.Millisecond))
+	topo, err := m.c.Source.Topology(tctx)
+	tcancel()
 	m.mu.Lock()
 	if err == nil {
 		changed := !sameTopology(m.topo, topo)
@@ -377,7 +385,9 @@ func (m *Manager) round(ctx context.Context, group int32, members []string) {
 	st := m.state(group)
 	st.roundDone = true
 	st.rounds++
+	st.lastStart, st.lastTook, st.lastGranted = start, m.c.Clock.Mono()-start, granted
 	if ok {
+		st.lastOKStart = start
 		st.refused, st.waitMs = nil, 0
 	} else {
 		st.refused, st.waitMs = refused, waitMs
@@ -584,7 +594,15 @@ func (m *Manager) lose(ctx context.Context, group int32) {
 		return
 	}
 	enforced := m.c.Enforced(group)
-	m.c.Log.Warn("the group lease was lost", "group", group, "enforced", enforced)
+	m.mu.Lock()
+	var why []any
+	if st := m.groups[group]; st != nil {
+		now := m.c.Clock.Mono()
+		why = []any{"rounds", st.rounds, "lastRoundStartedAgo", (now - st.lastStart).Round(time.Millisecond), "lastRoundTook", st.lastTook.Round(time.Millisecond),
+			"lastRoundGranted", st.lastGranted, "lastMajorityStartedAgo", (now - st.lastOKStart).Round(time.Millisecond), "refusedBy", st.refused}
+	}
+	m.mu.Unlock()
+	m.c.Log.Warn("the group lease was lost", append([]any{"group", group, "enforced", enforced}, why...)...)
 	m.audit(ctx, AuditLeaseLost, group, fmt.Sprintf("no majority renewed the lease in time; enforced=%t", enforced))
 	if !enforced {
 		return

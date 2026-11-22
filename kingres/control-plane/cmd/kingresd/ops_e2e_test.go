@@ -448,8 +448,8 @@ func TestDatabasesTablesAndLedger(t *testing.T) {
 	if st, _, _ := e.call("PUT", "/databases/db_plain/schemas/public/tables/x/ledger", map[string]any{"mode": "appendOnly"}, nil); st != 404 && st != 409 {
 		t.Errorf("database without ledger: %d", st)
 	}
-	// distributeTable offers what the extension can do (0.9.0): a reference table with rows, no hash table
-	// with rows, no ledger table of either kind, each refusal before a task exists.
+	// distributeTable offers what the extension can do (contract 0.14.0, extension 0.7): a reference table with rows and a hash
+	// table with rows (a task that copies them), but no ledger table of either kind, each refusal before a task exists.
 	q("create table public.refdata (id int primary key, v text)")
 	q("insert into public.refdata values (1, 'a'), (2, 'b')")
 	e.mustTask(t, "PUT", "/databases/db_both/schemas/public/tables/refdata/distribution", map[string]any{"method": "reference"})
@@ -458,8 +458,12 @@ func TestDatabasesTablesAndLedger(t *testing.T) {
 	}
 	q("create table public.has_rows (id bigint primary key)")
 	q("insert into public.has_rows values (1)")
-	if st, o, _ := e.call("PUT", "/databases/db_both/schemas/public/tables/has_rows/distribution", map[string]any{"method": "hash", "distributionColumn": "id"}, nil); st != 422 || problemCode(o) != "unprocessable" {
-		t.Errorf("hash table with rows: %d %v", st, o)
+	e.mustTask(t, "PUT", "/databases/db_both/schemas/public/tables/has_rows/distribution", map[string]any{"method": "hash", "distributionColumn": "id"})
+	if cl, _ := e.expect(t, 200, "GET", "/databases/db_both/schemas/public/tables/has_rows", nil)["classes"].([]any); len(cl) != 1 || cl[0] != "distributed" {
+		t.Errorf("classes of the hash table that had rows: %v", cl)
+	}
+	if out := q("select count(*), min(id), max(id) from public.has_rows"); fmt.Sprint(out["rows"]) != "[[1 1 1]]" {
+		t.Errorf("the row of the table distributed with rows: %v", out["rows"])
 	}
 	for _, m := range []map[string]any{{"method": "hash", "distributionColumn": "id"}, {"method": "reference"}} {
 		if st, o, _ := e.call("PUT", "/databases/db_both/schemas/public/tables/audit_rows/distribution", m, nil); st != 422 || problemCode(o) != "unprocessable" {

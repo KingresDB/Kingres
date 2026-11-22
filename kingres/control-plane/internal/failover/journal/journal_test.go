@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestTheJournalSurvivesARestartAndKeepsItsFirstPin(t *testing.T) {
@@ -100,4 +101,53 @@ func tempDir(t *testing.T) string {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(d) })
 	return d
+}
+
+// F4-06. A bootstrap that did not reach the promotion can be given up (the gate opens, a new one may begin); one that promoted cannot.
+func TestABootstrapThatDidNotPromoteCanBeGivenUp(t *testing.T) {
+	s, err := Open(tempDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Begin("a", "s1", 3, "automatic", "", false); err != nil {
+		t.Fatal(err)
+	}
+	if !s.Active() || s.Gate() {
+		t.Fatal("a bootstrap in progress keeps the gate closed")
+	}
+	if err := s.Abandon("test"); err != nil {
+		t.Fatal(err)
+	}
+	if s.Active() || !s.Gate() {
+		t.Fatal("an abandoned bootstrap is still active")
+	}
+	j, err := s.Begin("b", "s1", 3, "automatic", "", false)
+	if err != nil || j.ID != "b" || !s.Active() {
+		t.Fatalf("a new bootstrap of the same term did not begin: %+v %v", j, err)
+	}
+	if err := s.Done(StepPromote); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Abandon("late"); !errors.Is(err, ErrPromoted) || !s.Active() {
+		t.Fatalf("a promoted bootstrap was given up: %v", err)
+	}
+}
+
+func TestWhenABootstrapIsStuck(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	j := Journal{Term: 5, StartedAt: now.Add(-time.Minute), Done: map[string]time.Time{}}
+	if stuck, _ := Stuck(j, 5, now, 15*time.Minute); stuck {
+		t.Error("a young bootstrap of the current term is not stuck")
+	}
+	if stuck, _ := Stuck(j, 6, now, 15*time.Minute); !stuck {
+		t.Error("a bootstrap of an older term is stuck")
+	}
+	j.StartedAt = now.Add(-20 * time.Minute)
+	if stuck, _ := Stuck(j, 5, now, 15*time.Minute); !stuck {
+		t.Error("an old bootstrap that did not promote is stuck")
+	}
+	j.Done[StepPromote] = now
+	if stuck, _ := Stuck(j, 6, now, 15*time.Minute); stuck {
+		t.Error("a promoted bootstrap is never given up")
+	}
 }

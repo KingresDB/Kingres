@@ -355,7 +355,7 @@ func (m *MemStore) Begin(_ context.Context, term scheduler.Term, id int64, now t
 }
 
 // Apply implements Store.
-func (m *MemStore) Apply(_ context.Context, term scheduler.Term, w Row, expect int64) error {
+func (m *MemStore) Apply(_ context.Context, term scheduler.Term, w Row, expect int64, targetRev int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if err := m.guard(term, "apply"); err != nil {
@@ -368,6 +368,11 @@ func (m *MemStore) Apply(_ context.Context, term scheduler.Term, w Row, expect i
 	if r.Version != expect {
 		return ErrConflict
 	}
+	if targetRev != 0 {
+		if t, ok := m.targets[r.TargetID]; !ok || !t.Enabled || t.Revision != targetRev {
+			return ErrConflict
+		}
+	}
 	keep := r.Note
 	gone := r.TargetGone
 	*r = cloneRow(w)
@@ -377,27 +382,46 @@ func (m *MemStore) Apply(_ context.Context, term scheduler.Term, w Row, expect i
 }
 
 // Due implements Store.
-func (m *MemStore) Due(_ context.Context, now time.Time, limit int) ([]Row, error) {
+func (m *MemStore) Due(_ context.Context, now time.Time, set DueSet, perTarget int) ([]Row, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	var out []Row
+	var all []*Row
 	for _, r := range m.rows {
 		t, ok := m.targets[r.TargetID]
 		if r.TargetGone || !ok || !t.Enabled {
 			continue
 		}
-		switch r.State {
-		case anchor.StatePending, anchor.StateSubmitted, anchor.StateClaimed:
-			if r.NextAttemptAt == nil || !r.NextAttemptAt.After(now) || r.State == anchor.StateClaimed {
-				out = append(out, cloneRow(*r))
-			}
+		in := r.State == anchor.StatePending
+		if set == DueUpgrade {
+			in = r.State == anchor.StateSubmitted || r.State == anchor.StateClaimed
+		}
+		if in && (r.NextAttemptAt == nil || !r.NextAttemptAt.After(now)) {
+			all = append(all, r)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	if limit > 0 && len(out) > limit {
-		out = out[:limit]
+	sort.Slice(all, func(i, j int) bool { return all[i].ID < all[j].ID })
+	var out []Row
+	taken := map[int64]int{}
+	for _, r := range all {
+		if perTarget > 0 && taken[r.TargetID] >= perTarget {
+			continue
+		}
+		taken[r.TargetID]++
+		out = append(out, cloneRow(*r))
 	}
 	return out, nil
+}
+
+// Newer implements Store.
+func (m *MemStore) Newer(_ context.Context, targetID, logKeyID, size int64) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, r := range m.rows {
+		if !r.TargetGone && r.TargetID == targetID && logID(r.Record.LogID) == logKeyID && int64(r.Size) > size { //nolint:gosec // below 2^62
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // NewestAnchored implements Store.
@@ -422,13 +446,23 @@ func (m *MemStore) NewestAnchored(context.Context) ([]Anchored, error) {
 	return out, nil
 }
 
+// hasNewer tells whether a newer record of the same (target, log) is anchored: a failure that the target has since made good (P7A-08).
+func (m *MemStore) hasNewer(f *Row) bool {
+	for _, r := range m.rows {
+		if !r.TargetGone && r.TargetID == f.TargetID && logID(r.Record.LogID) == logID(f.Record.LogID) && r.Size > f.Size && r.State == anchor.StateAnchored {
+			return true
+		}
+	}
+	return false
+}
+
 // Failures implements Store.
 func (m *MemStore) Failures(context.Context) ([]Row, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var out []Row
 	for _, r := range m.rows {
-		if !r.TargetGone && (r.State == anchor.StateFailed || r.State == anchor.StateExpired) && r.Alert != "" {
+		if !r.TargetGone && (r.State == anchor.StateFailed || r.State == anchor.StateExpired) && r.Alert != "" && !m.hasNewer(r) {
 			c := cloneRow(*r)
 			c.Note = nil
 			out = append(out, c)

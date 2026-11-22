@@ -98,6 +98,8 @@ const (
 	SigningKeyMissing  Code = "signing_key_missing"
 	LastSigningKey     Code = "last_signing_key"
 	ChainNotDiverged   Code = "chain_not_diverged"
+	// Added in contract 0.14.0 (the table lifecycle): the table cannot take the requested change; Blockers says why.
+	TableNotEligible Code = "table_not_eligible"
 )
 
 // FieldError is one entry of the "errors" extension (schema ValidationIssue).
@@ -138,6 +140,8 @@ type Problem struct {
 	ServerIDs []string `json:"serverIds,omitempty"`
 	// Plan is the plan of a failover request that needs a decision (failover_needs_decision; contract 0.12.0).
 	Plan any `json:"plan,omitempty"`
+	// Blockers are the lines of the report of the sharding extension that make a table not eligible (table_not_eligible; contract 0.14.0).
+	Blockers any `json:"blockers,omitempty"`
 
 	// retryAfter, when positive, is sent as a Retry-After header (seconds).
 	retryAfter int
@@ -226,6 +230,7 @@ var specs = map[Code]struct {
 	SigningKeyMissing:               {409, "No signing key", "signing-key-missing"},
 	LastSigningKey:                  {409, "Last signing key", "last-signing-key"},
 	ChainNotDiverged:                {409, "The chain is not diverged", "chain-not-diverged"},
+	TableNotEligible:                {422, "The table cannot take this change", "table-not-eligible"},
 }
 
 // New returns a Problem for the code with the standard status, title and
@@ -302,6 +307,12 @@ func Write(w http.ResponseWriter, instance, requestID string, p *Problem) {
 	}
 	w.WriteHeader(out.Status)
 	_, _ = w.Write(append(body, '\n'))
+}
+
+// WithBlockers attaches the blockers of a table_not_eligible problem (contract 0.14.0).
+func (p *Problem) WithBlockers(b any) *Problem {
+	p.Blockers = b
+	return p
 }
 
 // WithPlan attaches the plan of a failover request to a failover_needs_decision problem (contract 0.12.0).

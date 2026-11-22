@@ -311,3 +311,286 @@ func TestOnFailRollsBackASwitchoverThatWasNotPromoted(t *testing.T) {
 		t.Errorf("a promoted group was rolled back:\n%s", strings.Join(w2.log, "\n"))
 	}
 }
+
+// F4-03. A promote step that began and failed (the call did not answer) is past the point of no return: the standby may be promoted, so
+// the hook neither resumes the old primary nor releases a lease. A step before the promotion is rolled back as before.
+func TestOnFailDoesNotRollBackAGroupWhoseFailedStepIsFromThePromotionOn(t *testing.T) {
+	raw, _ := json.Marshal(gracefulInput())
+	for _, c := range []struct {
+		step     string
+		rollback bool
+	}{
+		{StepName(1, StepVerify), true},
+		{StepName(1, StepHandOver), true},
+		{StepName(1, StepPromote), false},
+		{StepName(1, StepCatalog), false},
+		{StepName(2, StepPromote), true}, // another group's step says nothing about group 1
+	} {
+		w := gracefulWorld()
+		r := w.runner()
+		w.rows.groups[1] = &GroupRow{Group: 1, State: "pinned", NewServer: "s2"}
+		r.OnFail(nil)(context.Background(), task.Task{ID: 1, Input: raw, Error: &task.Error{Code: CodePromoteTimeout, Step: c.step, Message: "x"}})
+		got := w.index("resume s1") >= 0 || w.index("unquiesce s1") >= 0
+		if got != c.rollback {
+			t.Errorf("failed in %q: rolled back %v, want %v\n%s", c.step, got, c.rollback, strings.Join(w.log, "; "))
+		}
+	}
+}
+
+// F4-03, end to end: the promote call does not answer three times, the task fails, and the hook leaves the old primary stopped.
+func TestAPromoteThatDoesNotAnswerIsNotRolledBack(t *testing.T) {
+	w := gracefulWorld()
+	for i := 0; i < 3; i++ {
+		w.promoteErr["s2#"+string(rune('0'+i))] = ErrUnreachable
+	}
+	r := w.runner()
+	w.fakeClock(r)
+	in := gracefulInput()
+	name, err := runAll(t, r, in)
+	failedWith(t, w, err, CodePromoteTimeout)
+	if name != StepName(1, StepPromote) {
+		t.Fatalf("failed in %q", name)
+	}
+	raw, _ := json.Marshal(in)
+	r.OnFail(nil)(context.Background(), task.Task{ID: 1, Input: raw, Error: &task.Error{Code: CodePromoteTimeout, Step: name}})
+	if w.index("resume") >= 0 || w.index("unquiesce s1") >= 0 {
+		t.Errorf("the old primary was resumed after a promote that may have taken effect:\n%s", strings.Join(w.log, "\n"))
+	}
+}
+
+// F4-07. The call that promotes carries the shutdown checkpoint and the state, so that the callee makes the proof again; a failover that
+// is not a switchover carries none.
+func TestThePromoteCallOfASwitchoverCarriesTheProof(t *testing.T) {
+	w := gracefulWorld()
+	r := w.runner()
+	w.fakeClock(r)
+	if name, err := runAll(t, r, gracefulInput()); err != nil {
+		t.Fatalf("%s: %v", name, err)
+	}
+	if len(w.promoteReqs) == 0 || w.promoteReqs[0].Checkpoint != "0/6000028" || w.promoteReqs[0].ClusterState != "shut down" {
+		t.Fatalf("%+v", w.promoteReqs)
+	}
+	w2 := newWorld()
+	r2 := w2.runner()
+	w2.fakeClock(r2)
+	if name, err := runAll(t, r2, hardInput()); err != nil {
+		t.Fatalf("%s: %v", name, err)
+	}
+	if len(w2.promoteReqs) == 0 || w2.promoteReqs[0].Checkpoint != "" {
+		t.Fatalf("a failover carried a checkpoint: %+v", w2.promoteReqs)
+	}
+}
+
+// F4-07. A callee that refuses the proof at the promotion (the old primary wrote more after the first proof, or the standby is behind)
+// has promoted nothing: the switchover rolls back, with the code of the refusal.
+func TestAProofRefusedAtThePromotionRollsBack(t *testing.T) {
+	for _, c := range []struct {
+		refuse *CallError
+		code   string
+	}{
+		{&CallError{Status: 409, Code: "unprovable", Message: "KS006"}, CodeSwitchoverUnproven},
+		{&CallError{Status: 409, Code: "standby_behind", Message: "behind"}, CodeStandbyBehind},
+	} {
+		w := gracefulWorld()
+		w.promoteRefuse = c.refuse
+		r := w.runner()
+		w.fakeClock(r)
+		name, err := runAll(t, r, gracefulInput())
+		failedWith(t, w, err, c.code)
+		if name != StepName(1, StepPromote) {
+			t.Errorf("failed in %q", name)
+		}
+		if w.index("promote s2") >= 0 && w.index("promote-refused-proof") < 0 {
+			t.Error("promoted")
+		}
+		if w.index("resume s1") < 0 || w.index("unquiesce s1") < 0 {
+			t.Errorf("the refusal was not rolled back:\n%s", strings.Join(w.log, "\n"))
+		}
+	}
+}
+
+// F4-08. The steps before the promotion end when a cancel arrives; the promotion and the steps after it never do.
+func TestOnlyTheStepsBeforeThePromotionAreInterruptible(t *testing.T) {
+	w := gracefulWorld()
+	r := w.runner()
+	raw, _ := json.Marshal(gracefulInput())
+	steps, err := r.steps(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	past := false
+	for _, s := range steps {
+		if s.Name == StepName(1, StepPromote) {
+			past = true
+		}
+		if s.Name == StepCheck || s.Name == StepWriteReport {
+			if s.Interruptible {
+				t.Errorf("%q is interruptible", s.Name)
+			}
+			continue
+		}
+		if s.Interruptible == past {
+			t.Errorf("%q: interruptible %v, past the promotion %v", s.Name, s.Interruptible, past)
+		}
+	}
+}
+
+// F4-17. The rules that no test pinned: the stop must release the lease; a failure of the mark that is not "no primary here" and a stale
+// term at the stop roll back; the mark and the stop carry the term of the run; a standby that is not ready is not a candidate; the rollback
+// releases the lease of the new server when it is not the leader's; an unknown count of prepared transactions is not a reason to wait.
+func TestAStopThatDoesNotReleaseTheLeaseIsNotClean(t *testing.T) {
+	w := gracefulWorld()
+	w.notReleased = true
+	r := w.runner()
+	w.fakeClock(r)
+	name, err := runAll(t, r, gracefulInput())
+	failedWith(t, w, err, CodeSwitchoverUnproven)
+	if name != StepName(1, StepStopClean) || w.index("promote s") >= 0 {
+		t.Errorf("%s\n%s", name, strings.Join(w.log, "\n"))
+	}
+}
+
+func TestAFailureOfTheMarkRollsBack(t *testing.T) {
+	w := gracefulWorld()
+	w.markErr = errors.New("the instance cannot be asked")
+	r := w.runner()
+	w.fakeClock(r)
+	name, err := runAll(t, r, gracefulInput())
+	failedWith(t, w, err, CodeStandbyBehind)
+	if name != StepName(1, StepStopClean) || w.index("demote-fast") >= 0 || w.index("resume s1") < 0 {
+		t.Errorf("%s\n%s", name, strings.Join(w.log, "\n"))
+	}
+}
+
+func TestAStaleTermAtTheStopIsSupersededAndRollsBack(t *testing.T) {
+	w := gracefulWorld()
+	w.stopErr = &CallError{Status: 409, Code: "stale_term", Message: "newer"}
+	r := w.runner()
+	w.fakeClock(r)
+	_, err := runAll(t, r, gracefulInput())
+	failedWith(t, w, err, CodeSuperseded)
+	if w.index("resume s1") < 0 || w.index("promote s") >= 0 {
+		t.Errorf("\n%s", strings.Join(w.log, "\n"))
+	}
+}
+
+func TestTheMarkAndTheStopCarryTheTermOfTheRun(t *testing.T) {
+	w := gracefulWorld()
+	want := w.term // the run is term is the one it began with: the promotion raises it
+	r := w.runner()
+	w.fakeClock(r)
+	if name, err := runAll(t, r, gracefulInput()); err != nil {
+		t.Fatalf("%s: %v", name, err)
+	}
+	if len(w.markTerms) == 0 || len(w.stopTerms) == 0 {
+		t.Fatalf("mark %v stop %v", w.markTerms, w.stopTerms)
+	}
+	for _, x := range append(append([]int64(nil), w.markTerms...), w.stopTerms...) {
+		if x != want {
+			t.Errorf("a call carried the term %d, the run's is %d", x, want)
+		}
+	}
+}
+
+func TestAStandbyThatIsNotReadyIsNotACandidate(t *testing.T) {
+	w := gracefulWorld()
+	w.standbys[0].State = "rebuilding" // s2 has the most WAL
+	r := w.runner()
+	w.fakeClock(r)
+	if name, err := runAll(t, r, gracefulInput()); err != nil {
+		t.Fatalf("%s: %v", name, err)
+	}
+	if w.index("promote s3") < 0 || w.index("promote s2") >= 0 {
+		t.Errorf("\n%s", strings.Join(w.log, "\n"))
+	}
+}
+
+func TestTheRollbackReleasesTheLeaseOfTheNewServer(t *testing.T) {
+	w := gracefulWorld()
+	w.verifyAnswers = []bool{false}
+	in := gracefulInput()
+	in.Targets = map[int32]string{1: "s3"} // not the leader's server
+	r := w.runner()
+	w.fakeClock(r)
+	_, err := runAll(t, r, in)
+	failedWith(t, w, err, CodeStandbyBehind)
+	if w.index("lease-release s3") < 0 {
+		t.Errorf("the lease of the new server was not released:\n%s", strings.Join(w.log, "\n"))
+	}
+}
+
+func TestAnUnknownCountOfPreparedTransactionsIsNotWaitedFor(t *testing.T) {
+	w := gracefulWorld()
+	w.oldPreparedUnknown = true
+	r := w.runner()
+	w.fakeClock(r)
+	if name, err := runAll(t, r, gracefulInput()); err != nil {
+		t.Fatalf("%s: %v", name, err)
+	}
+	if i := w.index("recover-prepared kingres_system"); i >= 0 && i < w.index("mark s1") {
+		t.Error("the drain asked for a recovery although nothing says that a transaction is prepared")
+	}
+}
+
+// F4-15. A target names a group of the request, also when the request names no groups (all the groups of the server).
+func TestATargetForAGroupTheServerDoesNotRunIsRefused(t *testing.T) {
+	w := gracefulWorld()
+	s := &Service{Runner: w.runner()}
+	_, err := s.Resolve(context.Background(), "t", "s1", Request{Mode: ModeHard, Targets: []TargetRequest{{ShardGroupID: 2, ServerID: "s2"}}})
+	if err == nil {
+		t.Fatal("a target for a group that the server does not run was accepted")
+	}
+	if _, err := s.Resolve(context.Background(), "t", "s1", Request{Mode: ModeHard, Targets: []TargetRequest{{ShardGroupID: 1, ServerID: "s2"}}}); err != nil {
+		t.Fatalf("a target for a group the server runs: %v", err)
+	}
+}
+
+// F4-09. The calls that stop the writes and the calls that undo it carry the term of the run, so that a callee that has seen a newer term
+// refuses them (they cannot carry the fence of a task run: the repair of a switchover has none).
+func TestTheUndoCallsCarryTheTermOfTheRun(t *testing.T) {
+	w := gracefulWorld()
+	want := w.term
+	w.verifyAnswers = []bool{false}
+	r := w.runner()
+	w.fakeClock(r)
+	_, err := runAll(t, r, gracefulInput())
+	failedWith(t, w, err, CodeStandbyBehind)
+	if len(w.undoTerms) < 3 {
+		t.Fatalf("quiesce, resume and unquiesce were not all called: %v", w.undoTerms)
+	}
+	for _, x := range w.undoTerms {
+		if x != want {
+			t.Errorf("a call carried the term %d, the run's is %d (%v)", x, want, w.undoTerms)
+		}
+	}
+}
+
+// F4-02(c). A switchover that loses the majority after the old primary was stopped does not pause with the group down: it goes back through
+// the path of a failure (the writes are let in again, the old primary resumed), a plain failover still pauses.
+func TestASwitchoverWithoutAMajorityIsRolledBackNotPaused(t *testing.T) {
+	w := gracefulWorld()
+	r := w.runner()
+	w.fakeClock(r)
+	raw, _ := json.Marshal(gracefulInput())
+	steps, err := r.steps(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range steps {
+		if s.Name == StepName(1, StepLease) {
+			w.live["s1"], w.live["s3"] = "dead", "dead" // the leader (s2) hears none of the others now
+			runErr := s.Run(context.Background(), &task.Env{Task: task.Task{ID: 1, Input: raw}})
+			failedWith(t, w, runErr, CodeQuorumUnavailable)
+			break
+		}
+		if err := s.Run(context.Background(), &task.Env{Task: task.Task{ID: 1, Input: raw}}); err != nil {
+			var sk *task.SkipError
+			if !errors.As(err, &sk) {
+				t.Fatalf("%s: %v", s.Name, err)
+			}
+		}
+	}
+	if w.index("resume s1") < 0 || w.index("unquiesce s1") < 0 || w.index("promote s") >= 0 {
+		t.Errorf("\n%s", strings.Join(w.log, "\n"))
+	}
+}

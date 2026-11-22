@@ -142,12 +142,10 @@ type Rows interface {
 	CreateRun(ctx context.Context, opts Options, before []Placement) (Run, error)
 	Run(ctx context.Context) (Run, error)
 	SetPlanned(ctx context.Context, n int) error
-	// StartMove records a move as running; attempts is the number of this try.
-	// A move of the same bucket that failed or was skipped before keeps its row.
-	StartMove(ctx context.Context, m Move, fromServer, toServer string, attempts int) (seq int, err error)
+	// StartMove records a move as running; attempts is the number of this try. mark is the mark taken before the call
+	// (Backend.Mark), written in the same statement as the row, so that a row never exists without it (P4D-03).
+	StartMove(ctx context.Context, m Move, fromServer, toServer string, attempts int, mark int64) (seq int, err error)
 	UpdateMove(ctx context.Context, seq int, extID int64, phase string, percent float64) error
-	// SetMark keeps the mark taken before the call with the row (a holder that takes over needs it).
-	SetMark(ctx context.Context, seq int, mark int64) error
 	FinishMove(ctx context.Context, seq int, state, errText, skipReason string, size *int64) error
 	// UndoStart takes back the record of a start that did not happen (the call was not made, or was
 	// withdrawn before the extension recorded the move): attempts is the number the start used, and the
@@ -657,19 +655,15 @@ func (l *Loop) stoppedWhileWaiting(ctx context.Context) error {
 // either: the call goes on and finishes, the polls are skipped, and what became of the move is recorded when
 // it is over, with the same retries as every other write (RBR-02).
 func (l *Loop) execute(ctx context.Context, m Move, attempt int) error {
-	seq, err := l.Rows.StartMove(ctx, m, l.Backend.ServerOf(ctx, m.Database, m.From), l.Backend.ServerOf(ctx, m.Database, m.To), attempt)
-	if err != nil {
-		return err
-	}
+	// The mark comes first and is written with the row (P4D-03): there is no row without a mark, so the match by time is
+	// only for rows made before the mark was kept. A mark that cannot be had starts nothing and leaves no row.
 	after, err := l.Backend.Mark(ctx, m)
 	if err != nil {
-		return l.notStarted(ctx, seq, attempt, &NotStartedError{err})
+		return l.notStarted(ctx, 0, attempt, &NotStartedError{err})
 	}
-	if err := l.Rows.SetMark(ctx, seq, after); err != nil {
-		if errors.Is(err, ErrLeaseLost) {
-			return err
-		}
-		return l.notStarted(ctx, seq, attempt, &NotStartedError{err})
+	seq, err := l.Rows.StartMove(ctx, m, l.Backend.ServerOf(ctx, m.Database, m.From), l.Backend.ServerOf(ctx, m.Database, m.To), attempt, after)
+	if err != nil {
+		return err
 	}
 	ref := Ref{After: after}
 	done := make(chan error, 1)
@@ -780,8 +774,10 @@ func (l *Loop) finishCall(ctx context.Context, m Move, seq, attempt int, ref Ref
 // attempt at the move (RBR-01).
 func (l *Loop) notStarted(ctx context.Context, seq, attempt int, ns *NotStartedError) error {
 	l.log().Warn("rebalance: a move was not started; it will be tried again", "error", ns.Err)
-	if err := l.Rows.UndoStart(ctx, seq, attempt, ns.Error()); err != nil {
-		return err
+	if seq > 0 { // 0: the mark could not be had and no row was made
+		if err := l.Rows.UndoStart(ctx, seq, attempt, ns.Error()); err != nil {
+			return err
+		}
 	}
 	if l.notStartedRun++; l.notStartedRun >= notStartedTries {
 		l.notStartedRun = 0

@@ -714,7 +714,25 @@ export interface paths {
          *     422 `node_state_invalid` for `graceful` on a server that is not `live`, 422 `unprocessable` for a group
          *     the server is not primary of or a target that is not a standby of the group. While `kingresd` lacks a
          *     part of the design, the request answers 422 `unsupported_operation`: this revision's server implements
-         *     `hard` for ordinary groups only.
+         *     `hard` and `graceful` for ordinary groups.
+         *
+         *     **0.13.0, the planned switchover (`graceful`).** For each group, in this order: the writes of the group stop on the old primary
+         *     (new connections go elsewhere, the other sessions are ended), the distributed transactions end, the old primary stops with a fast
+         *     shutdown and releases its lease, the standby that streams from it is proven to hold everything the old primary wrote, and only then
+         *     is it promoted. A standby that is behind, or a proof that cannot be made, rolls the group back (the old primary starts again, the
+         *     writes are let in again) and the task ends `failed` with the code `standby_behind` or `switchover_unproven`; a stop of the writes
+         *     that does not succeed in two minutes ends it with `cannot_quiesce`, and prepared transactions that do not end with
+         *     `prepared_transactions_pending`. The task can be cancelled until the promotion has begun (`Task.cancellable`). Refused with 409
+         *     `group_degraded` when no standby of a group streams from its primary (or the named target does not), and with 422
+         *     `unsupported_operation` for a request that includes the map group (name the other groups in `shardGroupIds`).
+         *
+         *     **0.13.0, the map group.** The failover of the server that runs the primary of the map group (and the manager
+         *     leader) is accepted by any server that does not hear it, in mode `hard` only (`dryRun` and `graceful` answer 422
+         *     `unsupported_operation`): the server asks a server that hosts a ready standby of the map group to run the bootstrap, and
+         *     answers 202 with a Task whose `id` is 0, `state` `running` and the steps of the bootstrap, with `Location: /api/v1/failover`;
+         *     the client polls `GET /failover` (answered by that server) until `taskId` is not null, then `GET /tasks/{id}` on the new
+         *     manager leader. The old leader's rebalance is paused (`stoppedBy` `safetyRule`). The key of the certificate authority is not
+         *     copied to the new leader: the alert `certificateAuthorityUnavailable` says what the operator must do.
          *
          *     The task is `server.failover`, one block of steps per group (`TaskStep.shardGroupId`). A task that
          *     waits for an operator is `paused`; a repeat of this request for the same server resumes it. From the moment
@@ -1030,6 +1048,14 @@ export interface paths {
          * @description Turns a plain table into a hash-distributed table (by a distribution column) or a reference table
          *     (a full copy on every shard group). Requires sharding to be enabled on the database. Long-running: returns a task.
          *
+         *     **0.14.0 (increment 9.6): a table with rows can be distributed.** `mode` `online` copies the rows while writers go on
+         *     (`create_distributed_table_concurrently`; needs a primary key or a unique index on NOT NULL columns); `blocking` makes writers wait for the whole copy;
+         *     `auto` (the default) is online for a table with a usable key and more than 100000 estimated rows. `bucketCount` sets the bucket count of a new
+         *     colocation group. `dependentViews` `recreate` makes the plain views that use the table be made again on the new table. A table that cannot be
+         *     distributed is refused before the task exists with 422 `table_not_eligible` and the `blockers` (the table's own report: for example a trigger, a foreign key to an ordinary table,
+         *     a materialized view that uses it). The free space of every destination server is checked first (step *Check free space*). A RANGE or LIST partitioned table
+         *     becomes a user-partitioned distributed table (blocking only). The text below, that the table must be empty, holds for contract versions before 0.14.0.
+         *
          *     **What the sharding extension can do, and what this operation refuses (0.9.0 states exactly that).**
          *     *Hash* (`kingres.create_distributed_table`): the table must be **empty** (422 `unprocessable`: distributing a
          *     table that has rows is a later phase; create an empty copy, distribute it and insert the rows), have a primary
@@ -1042,6 +1068,180 @@ export interface paths {
          */
         put: operations["distributeTable"];
         post?: never;
+        /**
+         * Turn a distributed table back into a plain table
+         * @description Added in 0.14.0 (increment 9.6). Turns a distributed or reference table back into an ordinary table on one server
+         *     (`kingres.undistribute_table`, or `undistribute_table_concurrently` in mode `online`). With `cascadeViaForeignKeys` the tables
+         *     that foreign keys link to it are undistributed in the same operation; without it a table that is linked to others is refused
+         *     (422 `table_not_eligible`, the linked tables named in `blockers`). The table goes to the primary of the shard group
+         *     `targetGroupId` (default 0, the map group). Long-running: returns a task of kind `table.undistribute`. `mode`: `auto` (online when
+         *     the table has a usable key and more than 100000 estimated rows, otherwise blocking), `online` (writers go on; needs a primary key or a unique index
+         *     on NOT NULL columns) or `blocking` (writers wait for the whole copy). A user-partitioned table cannot be undistributed in this version
+         *     (`table_not_eligible`). The free space of the target server is checked first. `dependentViews` `recreate` makes the plain views that use the table be made
+         *     again on the new table (setting `kingres_shard.dependent_views`); a view on a server that will not hold the table makes the table not eligible.
+         */
+        delete: operations["undistributeTable"];
+        options?: never;
+        head?: never;
+        /**
+         * Change the distribution of a distributed table
+         * @description Added in 0.14.0. Changes the distribution column, the bucket count or the colocation group of a distributed table
+         *     (`kingres.alter_distributed_table`, or `alter_distributed_table_concurrently` in mode `online`); with `cascadeToColocated`
+         *     the tables of its colocation group change together (blocking mode only). At least one of `distributionColumn`, `bucketCount` and
+         *     `colocateWith` is needed (400 `validation_failed` otherwise). Long-running: returns a task of kind `table.alter`. A request that
+         *     changes the catalog only (no row moves) is done in one step. The free space of every destination server is checked first.
+         *     A user-partitioned table cannot be altered in this version (`table_not_eligible`).
+         */
+        patch: operations["alterTableDistribution"];
+        trace?: never;
+    };
+    "/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/distribution/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Preview a change of a table
+         * @description Added in 0.14.0. What the report of the sharding extension (`kingres.table_change_report`) says about the change, without changing anything:
+         *     the `blockers` that would make the operation fail with 422 `table_not_eligible`, the `warnings` and `notes`, the tables the change would affect
+         *     (the table, the tables of its colocation group that would change with it, the tables linked by foreign keys), and an estimate of the work.
+         *     Synchronous; reads only.
+         */
+        post: operations["previewTableChange"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partitions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List the user partitions of a distributed table
+         * @description Added in 0.14.0. The user partitions (`kingres.dist_partition`) of a distributed table that was partitioned by the user (RANGE or LIST),
+         *     with their bound, the number of their leaves (one per bucket) and, when it can be read, their size. An empty list for a table that is not user-partitioned.
+         */
+        get: operations["listTablePartitions"];
+        put?: never;
+        /**
+         * Create a user partition
+         * @description Added in 0.14.0. Creates a partition of a user-partitioned distributed table (`kingres.create_partition`): one leaf in every bucket partition on
+         *     every server, in one transaction. `bound` is the text that follows `FOR VALUES` (`FROM ('2026-01-01') TO ('2026-02-01')`, `IN ('a', 'b')`) or `DEFAULT`.
+         *     Returns a task of kind `table.partition`; 409 `already_exists` when the partition exists and 409 `operation_in_progress` while a bucket move or
+         *     a table operation uses the colocation group (retry later).
+         */
+        post: operations["createTablePartition"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partitions/attach": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Attach a distributed table as a user partition
+         * @description Added in 0.14.0. A distributed table of the colocation group of the table, on the same distribution column, becomes a user partition of it
+         *     (`kingres.attach_partition`); no row moves. Returns a task of kind `table.partition`.
+         */
+        post: operations["attachTablePartition"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partitions/{partitionName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+                /** @description Name of a user partition (added in 0.14.0). */
+                partitionName: components["parameters"]["PartitionName"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Drop a user partition
+         * @description Added in 0.14.0. Drops a user partition with its leaves on every server (`kingres.drop_partition`); the rows of the partition are gone.
+         *     Returns a task of kind `table.partition`; 404 for a partition that does not exist.
+         */
+        delete: operations["dropTablePartition"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partitions/{partitionName}/detach": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+                /** @description Name of a user partition (added in 0.14.0). */
+                partitionName: components["parameters"]["PartitionName"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Detach a user partition as a table of its own
+         * @description Added in 0.14.0. The partition becomes a distributed table of the same colocation group and distribution column (`kingres.detach_partition`); no
+         *     row moves. Returns a task of kind `table.partition`; 404 for a partition that does not exist. A table with foreign keys cannot detach a partition (`table_not_eligible`).
+         */
+        post: operations["detachTablePartition"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1295,8 +1495,9 @@ export interface paths {
         /**
          * Get the current rebalance status
          * @description Whether a rebalance is needed, running, stopped or idle, with progress and the moves in flight.
-         *     `progress` and `inFlightMoves` describe the current run (a stopped run too) and are null or empty while
-         *     idle. `lastReport` is the summary of the most recent finished or failed run other than the current one (the
+         *     `progress` and `inFlightMoves` describe the current run and are null or empty while idle. A stopped run lists no move
+         *     in flight and reports `movesInFlight` 0: a move that the loss of its source left unfinished is settled by the
+         *     extension's recovery when the rebalance is started again. `lastReport` is the summary of the most recent finished or failed run other than the current one (the
          *     same object as the matching item of `GET /rebalance/reports`) and is null when no run has finished yet.
          *
          *     **States (0.9.0).** `idle`: no run is unfinished and the last one did not fail. `running`: the task runs.
@@ -3018,6 +3219,8 @@ export interface components {
         /**
          * @description Stable machine-readable error code. Clients branch on this, not on `title` or `detail`.
          *
+         *     422: `table_not_eligible` (added in 0.14.0: the table cannot take the requested change; `blockers` says why).
+         *
          *     409 (state conflict): `conflict` (generic), `already_exists`, `immutable_field`,
          *     `rebalance_in_progress`, `operation_in_progress`, `task_not_cancellable`, `last_admin`, `role_in_use`,
          *     `optimistic_lock_failed`, `no_replica_available` (the instance or server is the only up-to-date copy),
@@ -3032,7 +3235,7 @@ export interface components {
          *     `rebalance_not_running` (`stopRebalance`), `cluster_inconsistent` (`kingres.check_cluster()` reports something that
          *     makes moving buckets unsafe), `version_mismatch` (the servers do not run the same version of the sharding
          *     extension and the same PostgreSQL major), `failover_in_progress`, `no_receiving_server` (no server should hold
-         *     shards). `group_degraded` and `insufficient_disk` are reserved for later increments (a move that meets them is
+         *     shards). `insufficient_disk` is reserved for a later increment and `group_degraded` is used by `failoverServer` in mode `graceful` since 0.13.0 (a move that meets them is
          *     skipped and reported, not refused). `leader_unavailable` (503) names, in `serverIds`, servers that can be opened
          *     instead. Clients must tolerate codes they do not know.
          *
@@ -3059,7 +3262,7 @@ export interface components {
          *     system database was stopped on purpose; start it with `startThisServerInstance`).
          * @enum {string}
          */
-        ProblemCode: "bad_request" | "validation_failed" | "unauthenticated" | "invalid_credentials" | "session_expired" | "csrf_token_invalid" | "forbidden" | "setup_token_invalid" | "not_found" | "method_not_allowed" | "conflict" | "already_exists" | "immutable_field" | "rebalance_in_progress" | "operation_in_progress" | "task_not_cancellable" | "last_admin" | "role_in_use" | "optimistic_lock_failed" | "no_replica_available" | "instance_already_running" | "instance_already_stopped" | "server_owns_buckets" | "server_hosts_map_group" | "last_server" | "server_group_not_empty" | "ledger_entry_pending" | "quorum_unavailable" | "system_database_stopped" | "unprocessable" | "sql_error" | "unsupported_operation" | "node_state_invalid" | "node_uninitialized" | "map_group_unavailable" | "leader_unavailable" | "rate_limited" | "service_unavailable" | "internal_error" | "certificate_revoked" | "certificate_authority_unavailable" | "internal_api_disabled" | "workbench_busy" | "config_parameter_unknown" | "config_parameter_managed" | "config_parameter_refused" | "config_level_not_allowed" | "config_value_below_floor" | "config_change_superseded" | "config_restart_order_conflict" | "nothing_pending" | "nothing_to_rebalance" | "rebalance_not_running" | "cluster_inconsistent" | "version_mismatch" | "failover_in_progress" | "group_degraded" | "insufficient_disk" | "no_receiving_server" | "failover_needs_decision" | "lease_settings_differ" | "ledger_not_published" | "origin_prefix_locked" | "signing_key_missing" | "last_signing_key" | "chain_not_diverged";
+        ProblemCode: "bad_request" | "validation_failed" | "unauthenticated" | "invalid_credentials" | "session_expired" | "csrf_token_invalid" | "forbidden" | "setup_token_invalid" | "not_found" | "method_not_allowed" | "conflict" | "already_exists" | "immutable_field" | "rebalance_in_progress" | "operation_in_progress" | "task_not_cancellable" | "last_admin" | "role_in_use" | "optimistic_lock_failed" | "no_replica_available" | "instance_already_running" | "instance_already_stopped" | "server_owns_buckets" | "server_hosts_map_group" | "last_server" | "server_group_not_empty" | "ledger_entry_pending" | "quorum_unavailable" | "system_database_stopped" | "unprocessable" | "sql_error" | "unsupported_operation" | "node_state_invalid" | "node_uninitialized" | "map_group_unavailable" | "leader_unavailable" | "rate_limited" | "service_unavailable" | "internal_error" | "certificate_revoked" | "certificate_authority_unavailable" | "internal_api_disabled" | "workbench_busy" | "config_parameter_unknown" | "config_parameter_managed" | "config_parameter_refused" | "config_level_not_allowed" | "config_value_below_floor" | "config_change_superseded" | "config_restart_order_conflict" | "nothing_pending" | "nothing_to_rebalance" | "rebalance_not_running" | "cluster_inconsistent" | "version_mismatch" | "failover_in_progress" | "group_degraded" | "insufficient_disk" | "no_receiving_server" | "failover_needs_decision" | "lease_settings_differ" | "ledger_not_published" | "origin_prefix_locked" | "signing_key_missing" | "last_signing_key" | "chain_not_diverged" | "table_not_eligible";
         /** @description One invalid field of a request. */
         ValidationIssue: {
             /** @description JSON Pointer (RFC 6901) to the invalid property of the request body, or the name of the invalid query or path parameter. */
@@ -3096,6 +3299,8 @@ export interface components {
             sqlState?: string;
             /** @description 1-based character position of the error in the statement; present for some `sql_error` problems. */
             sqlPosition?: number;
+            /** @description Added in 0.14.0. The lines of the report of the sharding extension that make a table not eligible; present for `table_not_eligible`. */
+            blockers?: components["schemas"]["TableBlocker"][];
             /** @description Added in 0.12.0, optional. The whole plan of the request (the same body as `dryRun` answers), present only when `code` is `failover_needs_decision`: the console shows the groups, the candidates and the verdict without asking again. */
             plan?: components["schemas"]["FailoverPlan"];
             /** @description Added in 0.9.0, optional. Servers that can be opened instead; set for `leader_unavailable`: the manager leader first when this server knows it, then the other servers of the cluster as this server knows them. Empty or absent when it knows none. */
@@ -4571,6 +4776,13 @@ export interface components {
              * @description Table size over all shards (primary copies); null when not available.
              */
             sizeBytes: number | null;
+            /** @description Added in 0.14.0, optional. How the user partitioned the table (a user-partitioned distributed table is also `distributed`); null when it is not partitioned. */
+            partitioning?: {
+                /** @enum {string} */
+                method: "range" | "list";
+                key: string;
+                partitionCount: number;
+            } | null;
         };
         /**
          * @description Why a column cannot be the distribution column. When several reasons apply the first of this list wins:
@@ -4634,7 +4846,147 @@ export interface components {
             distributionColumn?: string;
             /** @description Existing distributed table whose colocation group to join; null creates or reuses a group by column type. */
             colocateWith?: components["schemas"]["TableRef"] | null;
+            /** @description Added in 0.14.0. Bucket count of a new colocation group; ignored with `colocateWith`. Default: the database setting. */
+            bucketCount?: number;
+            mode?: components["schemas"]["TableChangeMode"];
+            dependentViews?: components["schemas"]["DependentViews"];
         };
+        /**
+         * @description Added in 0.14.0. How a table operation copies the rows. `auto` (the default): online when the table has a usable key and more than 100000 estimated rows, otherwise blocking.
+         *     `online`: writers go on (a capture trigger and a log on every node; needs a primary key or a unique index on NOT NULL columns). `blocking`: writers wait for the whole copy.
+         * @default auto
+         * @enum {string}
+         */
+        TableChangeMode: "auto" | "online" | "blocking";
+        /**
+         * @description Added in 0.14.0. What an operation does with the plain views that use the table it replaces: `refuse` (the default; the view stops the operation, 422 `table_not_eligible`) or `recreate`
+         *     (the views and the views on them are dropped in the switch and made again on the new table with their owner, options, privileges and comments; sets
+         *     `kingres_shard.dependent_views` for the operation).
+         * @default refuse
+         * @enum {string}
+         */
+        DependentViews: "refuse" | "recreate";
+        /** @description Added in 0.14.0. What to change; at least one of `distributionColumn`, `bucketCount` and `colocateWith`. */
+        AlterTableDistributionRequest: {
+            /** @description The new distribution column (part of every unique key of the table). */
+            distributionColumn?: string;
+            /** @description The new bucket count; a multiple of the old one moves no row between servers. */
+            bucketCount?: number;
+            /** @description A table whose colocation group to join, `default` (a group of the same type and bucket count) or `none` (a group of its own). */
+            colocateWith?: components["schemas"]["TableRef"] | ("default" | "none");
+            /**
+             * @description Change the tables of the colocation group together (blocking mode only).
+             * @default false
+             */
+            cascadeToColocated?: boolean;
+            mode?: components["schemas"]["TableChangeMode"];
+            dependentViews?: components["schemas"]["DependentViews"];
+        };
+        /** @description Added in 0.14.0. One line of the report of the sharding extension about a table: a blocker (the operation is refused), a warning or a note. */
+        TableBlocker: {
+            /** @description The code of the extension, for example `partitioned_table`, `dependent_object`, `trigger`, `foreign_key_linked`, `no_unique_key`, `group_busy`. Clients tolerate codes they do not know. */
+            code: string;
+            /** @description What the line is about (a table, a view, a constraint, a node). */
+            object: string;
+            /** @description Human-readable text. */
+            message: string;
+        };
+        /** @description Added in 0.14.0. A change to preview. */
+        TableChangeRequest: {
+            /** @enum {string} */
+            kind: "distribute" | "undistribute" | "alter" | "createPartition" | "attachPartition" | "detachPartition" | "dropPartition";
+            distribute?: components["schemas"]["DistributeTableRequest"];
+            undistribute?: {
+                cascadeViaForeignKeys?: boolean;
+                /** Format: int32 */
+                targetGroupId?: number;
+                mode?: components["schemas"]["TableChangeMode"];
+                dependentViews?: components["schemas"]["DependentViews"];
+            };
+            alter?: components["schemas"]["AlterTableDistributionRequest"];
+            partition?: {
+                name?: string;
+                bound?: string;
+                table?: components["schemas"]["TableRef"];
+            };
+        };
+        /** @description Added in 0.14.0. A table that a change would touch. */
+        TableChangeTable: {
+            schema: string;
+            name: string;
+            /** @enum {string} */
+            role: "source" | "colocated" | "linked";
+            /** Format: int64 */
+            sizeBytes: number | null;
+            /** Format: int64 */
+            estimatedRows: number | null;
+        };
+        /** @description Added in 0.14.0. The answer of `previewTableChange`. */
+        TableChangePreview: {
+            blockers: components["schemas"]["TableBlocker"][];
+            warnings: components["schemas"]["TableBlocker"][];
+            notes: components["schemas"]["TableBlocker"][];
+            affectedTables: components["schemas"]["TableChangeTable"][];
+            estimate: {
+                /**
+                 * Format: int64
+                 * @description Estimated rows to copy; null when not available.
+                 */
+                rows: number | null;
+                /**
+                 * Format: int64
+                 * @description Estimated bytes to copy; null when not available.
+                 */
+                bytes: number | null;
+                /** @enum {string} */
+                modeRecommended: "online" | "blocking";
+                onlineAvailable: boolean;
+                onlineUnavailableReason: string | null;
+                /**
+                 * @description Who waits: nobody (a change of the catalog), writers during the switch only (online) or for the whole copy (blocking).
+                 * @enum {string}
+                 */
+                writersBlocked: "none" | "switchOnly" | "wholeCopy";
+            };
+        };
+        /** @description Added in 0.14.0. A user partition of a distributed table. */
+        TablePartition: {
+            name: string;
+            /** @enum {string} */
+            method: "range" | "list";
+            /** @description The text that follows `FOR VALUES`, or `DEFAULT`. */
+            bound: string;
+            isDefault: boolean;
+            /** @description One leaf per bucket. */
+            leafCount: number;
+            /**
+             * Format: int64
+             * @description Size of the leaves that this server holds; null when not available.
+             */
+            sizeBytes: number | null;
+        };
+        /** @description Added in 0.14.0. A page of partitions. */
+        TablePartitionPage: {
+            items: components["schemas"]["TablePartition"][];
+            nextCursor: components["schemas"]["NextCursor"];
+        };
+        /** @description Added in 0.14.0. */
+        CreateTablePartitionRequest: {
+            /** @description Name of the partition; at most 57 bytes (leaf names append `_bNNNN`). */
+            name: string;
+            /** @description The text that follows `FOR VALUES` (`FROM ('2026-01-01') TO ('2026-02-01')`, `IN ('a')`) or `DEFAULT`. */
+            bound: string;
+            /** @default false */
+            ifNotExists?: boolean;
+        };
+        /** @description Added in 0.14.0. */
+        AttachTablePartitionRequest: {
+            table: components["schemas"]["TableRef"];
+            /** @description The text that follows `FOR VALUES`, or `DEFAULT`. */
+            bound: string;
+        };
+        /** @description Added in 0.14.0. Reserved for options; the body may be absent. */
+        DetachTablePartitionRequest: Record<string, never>;
         /**
          * @description `active` normal; `moving` being copied to another group; `orphan` left-over shard awaiting deferred cleanup.
          * @enum {string}
@@ -5137,7 +5489,7 @@ export interface components {
          *     (section "Task kinds and subjects"). `standby.reconcile` is added in 0.7.0; the `ledger.key.*`, `ledger.bundle.create`, `ledger.epoch.start` and `ledger.upgrade` kinds in 0.11.0.
          * @enum {string}
          */
-        TaskKind: "cluster.init" | "cluster.join" | "server.add" | "server.remove" | "server.failover" | "server.leave" | "instance.start" | "instance.stop" | "instance.restart" | "database.create" | "database.update" | "database.drop" | "table.distribute" | "rebalance" | "replication.restorePreferredPrimaries" | "ledger.verify" | "networkAccess.apply" | "replicate.apply" | "certificate.renew" | "certificate.revoke" | "standby.reconcile" | "config.apply" | "config.restart" | "ledger.key.create" | "ledger.key.rotate" | "ledger.key.retire" | "ledger.key.revoke" | "ledger.key.distribute" | "ledger.bundle.create" | "ledger.epoch.start" | "ledger.upgrade";
+        TaskKind: "cluster.init" | "cluster.join" | "server.add" | "server.remove" | "server.failover" | "server.leave" | "instance.start" | "instance.stop" | "instance.restart" | "database.create" | "database.update" | "database.drop" | "table.distribute" | "rebalance" | "replication.restorePreferredPrimaries" | "ledger.verify" | "networkAccess.apply" | "replicate.apply" | "certificate.renew" | "certificate.revoke" | "standby.reconcile" | "config.apply" | "config.restart" | "ledger.key.create" | "ledger.key.rotate" | "ledger.key.retire" | "ledger.key.revoke" | "ledger.key.distribute" | "ledger.bundle.create" | "ledger.epoch.start" | "ledger.upgrade" | "table.undistribute" | "table.alter" | "table.partition";
         /** @description One step of a task. */
         TaskStep: {
             /** @description Step name. */
@@ -5208,7 +5560,7 @@ export interface components {
         Task: {
             /**
              * Format: int64
-             * @description Task identifier (`task_id` in `kingres.task`).
+             * @description Task identifier (`task_id` in `kingres.task`). From 0.13.0 the id is 0 for the task that stands for the bootstrap of a map group failover while no task can be recorded (the system database is not writable yet); `GET /tasks/0` on the server that runs the bootstrap answers it, and `GET /failover` names the recorded task (`taskId`) once it exists. Id 0 never names a stored task.
              */
             id: number;
             /**
@@ -5493,7 +5845,7 @@ export interface components {
          *     `failure`. Read-only operations are not audited except `executeQuery`.
          * @enum {string}
          */
-        AuditAction: "login" | "logout" | "loginFailed" | "setupTokenRejected" | "initCluster" | "joinCluster" | "updateThisServerSettings" | "restartThisServerInstance" | "stopThisServerInstance" | "startThisServerInstance" | "leaveCluster" | "addServer" | "updateServer" | "removeServer" | "failoverServer" | "autoFailover" | "createServerGroup" | "deleteServerGroup" | "createDatabase" | "updateDatabase" | "dropDatabase" | "distributeTable" | "enableTableLedger" | "restorePreferredPrimaries" | "startRebalance" | "stopRebalance" | "cancelTask" | "createRole" | "updateRole" | "deleteRole" | "setRoleMemberships" | "setRoleClusterRoles" | "createGrant" | "revokeGrants" | "applyGrantTemplate" | "replaceNetworkAccess" | "updateClusterSettings" | "generateLedgerDigest" | "startLedgerVerification" | "executeQuery" | "acknowledgeAlert" | "renewServerCertificates" | "revokeServerCertificates" | "certificateRenewed" | "certificateRenewalFailed" | "cancelStatement" | "leaseLost" | "leaseFenced" | "leaseAcquired" | "standbyCreated" | "standbyRemoved" | "standbyRebuilt" | "standbyInstanceStarted" | "standbyInstanceRemoved" | "standbyInstanceRebuilt" | "synchronousStandbyNamesChanged" | "replicationSlotDropped" | "applyConfigChange" | "revertConfigChange" | "restartPendingInstances" | "resetAutoFailoverCounter" | "failoverGroupStarted" | "failoverGroupPromoted" | "failoverGroupFailed" | "oldPrimaryRebuilt" | "updateLedgerSettings" | "createLedgerSigningKey" | "retireLedgerSigningKey" | "revokeLedgerSigningKey" | "createLedgerAnchorTarget" | "updateLedgerAnchorTarget" | "deleteLedgerAnchorTarget" | "testLedgerAnchorTarget" | "anchorLedgerNow" | "retryLedgerAnchor" | "createLedgerBundle" | "registerLedgerClientKey" | "revokeLedgerClientKey" | "setTableSignaturePolicy" | "upgradeLedgerExtension" | "acknowledgeLedgerDivergence";
+        AuditAction: "login" | "logout" | "loginFailed" | "setupTokenRejected" | "initCluster" | "joinCluster" | "updateThisServerSettings" | "restartThisServerInstance" | "stopThisServerInstance" | "startThisServerInstance" | "leaveCluster" | "addServer" | "updateServer" | "removeServer" | "failoverServer" | "autoFailover" | "createServerGroup" | "deleteServerGroup" | "createDatabase" | "updateDatabase" | "dropDatabase" | "distributeTable" | "enableTableLedger" | "restorePreferredPrimaries" | "startRebalance" | "stopRebalance" | "cancelTask" | "createRole" | "updateRole" | "deleteRole" | "setRoleMemberships" | "setRoleClusterRoles" | "createGrant" | "revokeGrants" | "applyGrantTemplate" | "replaceNetworkAccess" | "updateClusterSettings" | "generateLedgerDigest" | "startLedgerVerification" | "executeQuery" | "acknowledgeAlert" | "renewServerCertificates" | "revokeServerCertificates" | "certificateRenewed" | "certificateRenewalFailed" | "cancelStatement" | "leaseLost" | "leaseFenced" | "leaseAcquired" | "standbyCreated" | "standbyRemoved" | "standbyRebuilt" | "standbyInstanceStarted" | "standbyInstanceRemoved" | "standbyInstanceRebuilt" | "synchronousStandbyNamesChanged" | "replicationSlotDropped" | "applyConfigChange" | "revertConfigChange" | "restartPendingInstances" | "resetAutoFailoverCounter" | "failoverGroupStarted" | "failoverGroupPromoted" | "failoverGroupFailed" | "oldPrimaryRebuilt" | "updateLedgerSettings" | "createLedgerSigningKey" | "retireLedgerSigningKey" | "revokeLedgerSigningKey" | "createLedgerAnchorTarget" | "updateLedgerAnchorTarget" | "deleteLedgerAnchorTarget" | "testLedgerAnchorTarget" | "anchorLedgerNow" | "retryLedgerAnchor" | "createLedgerBundle" | "registerLedgerClientKey" | "revokeLedgerClientKey" | "setTableSignaturePolicy" | "upgradeLedgerExtension" | "acknowledgeLedgerDivergence" | "previewTableChange" | "undistributeTable" | "alterTableDistribution" | "createTablePartition" | "attachTablePartition" | "detachTablePartition" | "dropTablePartition";
         /** @description One audit log entry. */
         AuditEvent: {
             /**
@@ -7092,7 +7444,7 @@ export interface components {
             confirm: string;
         };
         /**
-         * @description Alert type. Clients must tolerate kinds they do not know. Added in 0.11.0 (ledger phase 7; subjects at `AlertSubject`): `ledgerNotAnchored` (a database has ledger tables and no anchor target is enabled; `info`, `warning` when the setting `anchor.required` is on), `ledgerAnchorBehind` (`warning`, `critical`), `ledgerAnchorFailed` (an anchor record is `failed` or `expired`; `critical`), `ledgerAnchorConflict` (the store holds a different object under the name of an anchor; `critical`), `ledgerChainDiverged` (a chain no longer extends its published log; `critical`), `ledgerGroupUnread` (a shard group's chain could not be read; `warning`, `critical`), `ledgerPublicationBehind` (the newest signed checkpoint of a chain is older than five publication intervals while its head advanced; `warning`), `ledgerSignerUnavailable` (no checkpoint could be signed for two rounds, or the key set is damaged, or the key file is missing on the leader; `critical`) and `ledgerDigestOverdue` (no digest within twice `digestIntervalSeconds`; `warning`). Added in 0.8.0: `clockDifference` (a server's clock differs from the manager leader's by more than `ClusterSettings.clock.maxDifferenceMs`, less the uncertainty of the measurement; `warning`, `critical` at ten times the threshold; `kingresd` does not set the system clock, run NTP or chrony). Added in 0.7.0: `leaseLost` (the `kingresd` that
+         * @description Alert type. Clients must tolerate kinds they do not know. Added in 0.13.0: `certificateAuthorityUnavailable` (the map group was failed over and the new manager leader holds no key of the certificate authority, so no certificate can be issued, renewed or revoked until the operator restores `pki/ca.key` and `pki/revoked.json` from the backup of the old leader; subject `cluster`; `critical`). Added in 0.11.0 (ledger phase 7; subjects at `AlertSubject`): `ledgerNotAnchored` (a database has ledger tables and no anchor target is enabled; `info`, `warning` when the setting `anchor.required` is on), `ledgerAnchorBehind` (`warning`, `critical`), `ledgerAnchorFailed` (an anchor record is `failed` or `expired`; `critical`), `ledgerAnchorConflict` (the store holds a different object under the name of an anchor; `critical`), `ledgerChainDiverged` (a chain no longer extends its published log; `critical`), `ledgerGroupUnread` (a shard group's chain could not be read; `warning`, `critical`), `ledgerPublicationBehind` (the newest signed checkpoint of a chain is older than five publication intervals while its head advanced; `warning`), `ledgerSignerUnavailable` (no checkpoint could be signed for two rounds, or the key set is damaged, or the key file is missing on the leader; `critical`) and `ledgerDigestOverdue` (no digest within twice `digestIntervalSeconds`; `warning`). Added in 0.8.0: `clockDifference` (a server's clock differs from the manager leader's by more than `ClusterSettings.clock.maxDifferenceMs`, less the uncertainty of the measurement; `warning`, `critical` at ten times the threshold; `kingresd` does not set the system clock, run NTP or chrony). Added in 0.7.0: `leaseLost` (the `kingresd` that
          *     runs the primary of a shard group could not renew the group's lease in time; for a group with a standby the
          *     instance was stopped (fenced), for a group without one it keeps running and this alert is the only effect;
          *     `critical`), `groupWithoutSynchronousStandby` (the group's standby has been unreachable for longer than the
@@ -7106,7 +7458,7 @@ export interface components {
          *     `server:<leader>|behind:<server>`, `warning` after a minute, `critical` after ten).
          * @enum {string}
          */
-        AlertKind: "serverDown" | "serverSuspect" | "underReplicatedBuckets" | "unavailableBuckets" | "replicationLagHigh" | "diskSpaceLow" | "memoryPressure" | "rebalanceNeeded" | "autoFailoverTriggered" | "autoFailoverLimitReached" | "mapGroupUnavailable" | "ledgerVerificationFailed" | "ledgerPendingTooOld" | "versionMismatch" | "certificateExpiring" | "certificateRenewalFailed" | "replicationPending" | "taskFailed" | "leaseLost" | "groupWithoutSynchronousStandby" | "groupUnderReplicated" | "clockDifference" | "failoverNeedsDecision" | "failoverBlocked" | "failoverDataLoss" | "splitPromotion" | "oldPrimaryRunning" | "oldPrimaryNotStopped" | "oldPrimaryNotRebuilt" | "ledgerNotAnchored" | "ledgerAnchorBehind" | "ledgerAnchorFailed" | "ledgerAnchorConflict" | "ledgerChainDiverged" | "ledgerGroupUnread" | "ledgerPublicationBehind" | "ledgerSignerUnavailable" | "ledgerDigestOverdue";
+        AlertKind: "serverDown" | "serverSuspect" | "underReplicatedBuckets" | "unavailableBuckets" | "replicationLagHigh" | "diskSpaceLow" | "memoryPressure" | "rebalanceNeeded" | "autoFailoverTriggered" | "autoFailoverLimitReached" | "mapGroupUnavailable" | "ledgerVerificationFailed" | "ledgerPendingTooOld" | "versionMismatch" | "certificateExpiring" | "certificateRenewalFailed" | "replicationPending" | "taskFailed" | "leaseLost" | "groupWithoutSynchronousStandby" | "groupUnderReplicated" | "clockDifference" | "failoverNeedsDecision" | "failoverBlocked" | "failoverDataLoss" | "splitPromotion" | "oldPrimaryRunning" | "oldPrimaryNotStopped" | "oldPrimaryNotRebuilt" | "ledgerNotAnchored" | "ledgerAnchorBehind" | "ledgerAnchorFailed" | "ledgerAnchorConflict" | "ledgerChainDiverged" | "ledgerGroupUnread" | "ledgerPublicationBehind" | "ledgerSignerUnavailable" | "ledgerDigestOverdue" | "certificateAuthorityUnavailable";
         /** @description An alert. */
         Alert: {
             /**
@@ -7426,6 +7778,8 @@ export interface components {
         SchemaName: string;
         /** @description Table name. */
         TableName: string;
+        /** @description Name of a user partition (added in 0.14.0). */
+        PartitionName: string;
         /** @description Colocation group identifier. */
         ColocationId: number;
         /** @description Role name. */
@@ -8565,6 +8919,271 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["DistributeTableRequest"];
+            };
+        };
+        responses: {
+            202: components["responses"]["AcceptedTask"];
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    undistributeTable: {
+        parameters: {
+            query?: {
+                /** @description Undistribute the tables that foreign keys link to this one too. */
+                cascadeViaForeignKeys?: boolean;
+                /** @description Shard group (`group_id`) whose primary receives the table; 0 is the map group. */
+                targetGroupId?: number;
+                mode?: components["schemas"]["TableChangeMode"];
+                dependentViews?: components["schemas"]["DependentViews"];
+            };
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: components["responses"]["AcceptedTask"];
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    alterTableDistribution: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AlterTableDistributionRequest"];
+            };
+        };
+        responses: {
+            202: components["responses"]["AcceptedTask"];
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    previewTableChange: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TableChangeRequest"];
+            };
+        };
+        responses: {
+            /** @description The preview. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableChangePreview"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    listTablePartitions: {
+        parameters: {
+            query?: {
+                /** @description Maximum number of items to return. */
+                limit?: components["parameters"]["Limit"];
+                /** @description Opaque cursor taken from `nextCursor` of the previous page. Omit for the first page. */
+                cursor?: components["parameters"]["Cursor"];
+            };
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A page of partitions. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TablePartitionPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    createTablePartition: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateTablePartitionRequest"];
+            };
+        };
+        responses: {
+            202: components["responses"]["AcceptedTask"];
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    attachTablePartition: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AttachTablePartitionRequest"];
+            };
+        };
+        responses: {
+            202: components["responses"]["AcceptedTask"];
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    dropTablePartition: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+                /** @description Name of a user partition (added in 0.14.0). */
+                partitionName: components["parameters"]["PartitionName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: components["responses"]["AcceptedTask"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    detachTablePartition: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+                /** @description Name of a user partition (added in 0.14.0). */
+                partitionName: components["parameters"]["PartitionName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["DetachTablePartitionRequest"];
             };
         };
         responses: {

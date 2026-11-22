@@ -31,6 +31,7 @@ An ADR records one decision: the context, the decision, its consequences and the
 | [0022](0022-the-complete-scan-stays.md) | The row-moving distributed scan stays as the path that answers every query | Accepted | 2026-11-15 | - |
 | [0023](0023-one-extension-source-for-several-majors.md) | One source of every extension builds against each supported PostgreSQL major (18 and 19) | Accepted | 2026-11-15 | 1 (extends 0002) |
 | [0024](0024-agpl-for-kingresdb-code.md) | KingresDB's own code is licensed under the GNU Affero General Public License, version 3 | Accepted | 2026-11-15 | 3 (supersedes 0004) |
+| [0025](0025-restore-of-the-system-database-is-accepted-by-an-operator.md) | A restored system database is accepted by an operator, and the acceptance is a signed event | Proposed | 2026-11-20 | - |
 
 "Open decision #" refers to the table "Open decisions" in architecture.md.
 

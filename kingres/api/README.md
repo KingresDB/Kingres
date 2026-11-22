@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.13.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.14.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and, when it is built, the planned `kingres-cli` (it does not exist yet). Lint it and run the mechanical rule check with:
 
 ```
@@ -149,7 +149,7 @@ Each task kind has exactly one `subject.type`; `subject.id` is always a string.
 | `certificate.renew`, `certificate.revoke` (0.5.0) | `server` | the `ServerId` whose certificates are renewed or revoked |
 | `instance.start`, `instance.stop`, `instance.restart` | `instance` | the instance id (`node_id`) as a decimal string |
 | `database.create`, `database.update`, `database.drop` | `database` | the database name |
-| `table.distribute` | `table` | `database/schema.table` |
+| `table.distribute`, `table.undistribute`, `table.alter`, `table.partition` | `table` | `database/schema.table` (0.14.0: the table the request named; one table task per colocation group) |
 | `rebalance` | `cluster` | `cluster` (0.9.0; one rebalance at a time, cluster-wide; the task id is the report id): steps `Check that the cluster can rebalance`, `Compute the plan`, `Move buckets`, `Write the report`; a stopped run is `paused` |
 | `replication.restorePreferredPrimaries` | `replication` | `preferred-primaries` (0.10.0: answers `unsupported_operation` until the switchover is built) |
 | `ledger.verify` | `ledgerVerification` | the **database name**: the verification id exists only after the run (see `LedgerVerification.taskId`) |
@@ -317,6 +317,32 @@ Where the architecture document leaves something open, the simplest option was c
     range and the cluster's replica count.
 
 ## Changelog
+
+### 0.14.0
+
+Revision written with the control plane of the table lifecycle (increment 9.6 of `kingres/docs/design/shard-phase9.md`). Summary for the panel:
+8 operations added (140 operations, 113 paths); one operation changed (`distributeTable`: a table with rows can be distributed, three optional request properties);
+three task kinds, one problem code and one optional `Table` property added; **no change that is not additive**.
+
+#### Breaking
+
+None.
+
+#### Additive
+
+- `previewTableChange` (`POST .../tables/{tableName}/distribution/preview`): the blockers, warnings and notes of the report of the sharding extension and an estimate, without changing anything.
+- `undistributeTable` (`DELETE .../distribution`, task kind `table.undistribute`) and `alterTableDistribution` (`PATCH .../distribution`, task kind `table.alter`),
+  with the request properties `mode` (`auto`, `online`, `blocking`), `dependentViews` (`refuse`, `recreate`), `cascadeViaForeignKeys`, `targetGroupId`, `cascadeToColocated`.
+- `listTablePartitions`, `createTablePartition`, `attachTablePartition`, `detachTablePartition`, `dropTablePartition` (task kind `table.partition`): the user partitions of a distributed table.
+- `DistributeTableRequest` has optional `bucketCount`, `mode` and `dependentViews`; a table with rows can be distributed (online or blocking); a table that cannot is refused with
+  422 `table_not_eligible` and `Problem.blockers` before the task exists.
+- `ProblemCode` has `table_not_eligible`; `Problem` has optional `blockers`; `TaskKind` has `table.undistribute`, `table.alter`, `table.partition`; `Table` has the optional `partitioning`;
+  `AuditAction` has the six new mutating operations.
+
+#### Documentation
+
+- The text of `distributeTable` says what changed: before 0.14.0 the table had to be empty. A client that does not know the new properties and codes works as before.
+- `undistributeTable` and `alterTableDistribution` do not accept a user-partitioned table in this version (`table_not_eligible`).
 
 ### 0.13.0
 

@@ -37,8 +37,8 @@ func TestRoutingMatchesContract(t *testing.T) {
 	for _, op := range doc.Operations {
 		want[op.Method+" /api/v1"+op.Path] = op.ID
 	}
-	if len(want) != 132 {
-		t.Errorf("contract has %d operations, this test was written for 132", len(want))
+	if len(want) != 140 {
+		t.Errorf("contract has %d operations, this test was written for 140", len(want))
 	}
 	got := map[string]string{}
 	for _, r := range e.srv.Routes() {
@@ -298,6 +298,12 @@ func TestResponsesValidateAgainstContract(t *testing.T) {
 	}
 	for id := range e.srv.ledgerPublicationHandlers() {
 		mutating[id] = true // validated in ledger_publication_http_test.go with a fake service
+	}
+	for id := range e.srv.ledgerBundleHandlers() {
+		mutating[id] = true // validated by the cluster tests of package clustertest (ledgerbundle_test.go)
+	}
+	for id := range e.srv.ledgerClientHandlers() {
+		mutating[id] = true // validated by the cluster tests of package clustertest (ledgerclient_test.go)
 	}
 	for id := range e.srv.ledgerAnchorHandlers() {
 		mutating[id] = true // validated in ledger_anchor_http_test.go with a fake service

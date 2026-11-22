@@ -51,6 +51,9 @@ type Agent struct {
 	// Now is the wall clock (default time.Now); the fault hook of the tests steps it.
 	Now func() time.Time
 
+	// needed replaces the question "does this instance have to be restarted now" (tests).
+	needed func(ctx context.Context, id int) bool
+
 	mu    sync.Mutex // one apply or restart at a time
 	zmu   sync.Mutex
 	zones zoneCache
@@ -900,6 +903,9 @@ func (a *Agent) now() time.Time {
 // waits for a restart. A question that cannot be answered is "yes": the restart is the safe side of a repeat only
 // when the instance is known to be fine, so an unknown state restarts.
 func (a *Agent) restartNeeded(ctx context.Context, id int) bool {
+	if a.needed != nil {
+		return a.needed(ctx, id)
+	}
 	if up, err := a.mgr().Running(ctx, id); err != nil || !up {
 		return true
 	}

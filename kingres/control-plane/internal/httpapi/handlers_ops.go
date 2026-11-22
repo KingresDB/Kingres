@@ -25,7 +25,7 @@ type RoleConnector interface {
 
 // opsHandlers are the operations of package ops.
 func (s *Server) opsHandlers() map[string]handlerFunc {
-	return map[string]handlerFunc{
+	m := map[string]handlerFunc{
 		"createRole":                s.createRole,
 		"updateRole":                s.updateRole,
 		"deleteRole":                s.deleteRole,
@@ -55,6 +55,10 @@ func (s *Server) opsHandlers() map[string]handlerFunc {
 		"listLedgerVerifications":   s.listLedgerVerifications,
 		"getLedgerVerification":     s.getLedgerVerification,
 	}
+	for id, h := range s.tableLifecycleHandlers() {
+		m[id] = h
+	}
+	return m
 }
 
 func (s *Server) needOps() (*ops.Ops, error) {

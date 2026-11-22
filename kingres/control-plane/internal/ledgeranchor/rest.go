@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"regexp"
 	"strconv"
 	"time"
@@ -262,7 +263,12 @@ func (s *Service) putCreds(ctx context.Context, id int64, kind string, c Creds) 
 	defer clear(data)
 	if s.cfg.Distribute != nil {
 		if err := s.cfg.Distribute(ctx, id, kind, data); err != nil {
+			// the answer stays 201 or 200 (the contract has no warnings member): the failure is an alert at the next pass of the monitor, and
+			// the job "ledger.anchor.credentials" gives the file again until every holder has it (P7A-03)
 			s.log.Warn("the credentials of an anchor target could not be given to every holder", "target", id, "error", errText(err))
+			s.setCredProblem(id, &CredProblem{Text: fmt.Sprintf("The credentials of target %d could not be given to every holder (%s): after a change of the leader a holder cannot anchor at this target. They are given again every minute.", id, errText(err))})
+		} else {
+			s.setCredProblem(id, nil)
 		}
 	}
 	return nil
@@ -516,10 +522,17 @@ func (s *Service) Retry(ctx context.Context, db string, id int64) (api.LedgerAnc
 	if err != nil {
 		return api.LedgerAnchor{}, problem.New(problem.Conflict, "Only a failed or expired record can be retried (this one is "+apiState(row.State)+").")
 	}
+	// A record that a newer checkpoint has replaced is not retried: the store would be given an old checkpoint again (another object under
+	// another key of the bucket) for nothing, since the newer record covers it (P7A-08).
+	if newer, err := s.cfg.Store.Newer(ctx, row.TargetID, logID(row.Record.LogID), int64(row.Size)); err != nil { //nolint:gosec // below 2^62
+		return api.LedgerAnchor{}, storeErr(err)
+	} else if newer {
+		return api.LedgerAnchor{}, problem.New(problem.Conflict, "A newer checkpoint of this log has a record for this target: this record is obsolete and is not retried.")
+	}
 	w := row
 	w.Record = rec
 	w.Alert, w.ErrorCode = "", ""
-	if err := s.cfg.Store.Apply(ctx, term, w, row.Version); err != nil {
+	if err := s.cfg.Store.Apply(ctx, term, w, row.Version, 0); err != nil {
 		if errors.Is(err, ErrConflict) {
 			return api.LedgerAnchor{}, problem.New(problem.Conflict, "The record changed meanwhile; read it and try again.")
 		}
@@ -546,10 +559,13 @@ func (s *Service) Evidence(ctx context.Context, db string, id int64, format stri
 	}
 	switch format {
 	case "", "json":
-		at := row.UpdatedAt
-		if row.AnchoredAt != nil {
-			at = *row.AnchoredAt
+		// The evidence file is the public file of an anchor: it states no state, so it is given for an anchored record only; the evidence of a
+		// record that is not (yet) anchored is shown by the formats of the kind (ots), whose content says what it proves (P7A-09). The time of
+		// the file is the time of the anchoring, never the time of the last write.
+		if row.State != anchor.StateAnchored || row.AnchoredAt == nil {
+			return Evidence{}, problem.New(problem.NotFound, "This record has no evidence file: it is not anchored (it is "+apiState(row.State)+").")
 		}
+		at := *row.AnchoredAt
 		data, err := anchor.EncodeEvidenceFile(anchor.EvidenceFile{Kind: row.Kind, Origin: row.Origin, Size: row.Size,
 			PayloadSHA256: hex.EncodeToString(row.PayloadSHA256[:]), CreatedAt: at, Evidence: row.Evidence})
 		if err != nil {

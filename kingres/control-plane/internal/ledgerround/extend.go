@@ -187,7 +187,12 @@ func (c *Collector) ensureCheckpoint(ctx context.Context, pc ledgersign.PubConte
 	}
 	if err == nil && c.cfg.Published != nil {
 		if rerr := c.cfg.Published.RecordCheckpoint(l.Origin, l.Size, l.Root); rerr != nil {
+			// The checkpoint is stored and the record in memory is current, but the file is behind: that is not a crash, it is a disk that cannot be
+			// written, and the record is the guard of every later signature. The round says so and stops (the next one writes it again before it
+			// signs anything, ledgerstate.ErrNotWritten) and a critical alert names the cause (P7A-11).
 			c.log.Error("a checkpoint was stored and could not be noted in the record of what was published", "origin", l.Origin, "error", rerr.Error())
+			c.publishedAlert(ctx, "A checkpoint was stored and the record of what was published could not be written to the key directory ("+rerr.Error()+"). Nothing is signed until it can: free the disk or fix the directory.", true)
+			return fmt.Errorf("%w: %v", ErrPublishedState, rerr)
 		}
 	}
 	return err

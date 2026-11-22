@@ -19,10 +19,29 @@ import (
 const (
 	CallCredentialsInstall = "POST /ledger/anchor/credentials/install"
 	CallCredentialsRemove  = "POST /ledger/anchor/credentials/remove"
+	// CallCredentialsList asks a holder which files it has; CallCredentialsFetch asks it for one (P7A-03). Both are LeaderOnly too: the
+	// leader that lacks a file, or wants to know which holders lack one, is the caller.
+	CallCredentialsList  = "POST /ledger/anchor/credentials/list"
+	CallCredentialsFetch = "POST /ledger/anchor/credentials/fetch"
 )
 
 // Calls lists the keys of the internal calls the agent answers.
-var Calls = []string{CallCredentialsInstall, CallCredentialsRemove}
+var Calls = []string{CallCredentialsInstall, CallCredentialsRemove, CallCredentialsList, CallCredentialsFetch}
+
+// ListResponse is the answer of CallCredentialsList: the target ids that the server has a file for.
+type ListResponse struct {
+	IDs []int64 `json:"ids"`
+}
+
+// FetchRequest is the body of CallCredentialsFetch; FetchResponse its answer, the file as the holder has it (standard base64).
+type FetchRequest struct {
+	TargetID int64 `json:"targetId"`
+}
+
+// FetchResponse is the answer of CallCredentialsFetch.
+type FetchResponse struct {
+	File string `json:"file"`
+}
 
 // InstallRequest is the body of CallCredentialsInstall. File is the standard base64 of the credentials file.
 type InstallRequest struct {
@@ -68,6 +87,29 @@ func (a *Agent) Handle(_ context.Context, key string, body []byte) (any, error) 
 			return nil, bad("credentials_invalid", "The credentials file was refused.", http.StatusUnprocessableEntity)
 		}
 		return struct{}{}, nil
+	case CallCredentialsList:
+		ids, err := a.Creds.IDs()
+		if err != nil {
+			return nil, bad("credentials_invalid", "The credentials directory could not be read.", http.StatusUnprocessableEntity)
+		}
+		if ids == nil {
+			ids = []int64{}
+		}
+		return ListResponse{IDs: ids}, nil
+	case CallCredentialsFetch:
+		var in FetchRequest
+		if err := json.Unmarshal(body, &in); err != nil || in.TargetID < 1 {
+			return nil, bad("bad_request", "The body is not valid.", http.StatusBadRequest)
+		}
+		raw, err := a.Creds.Raw(in.TargetID)
+		switch {
+		case errors.Is(err, ErrNoCredentials):
+			return nil, bad("not_found", "This server has no credentials file for the target.", http.StatusNotFound)
+		case err != nil:
+			return nil, bad("credentials_invalid", "The credentials file could not be read.", http.StatusUnprocessableEntity)
+		}
+		defer clear(raw)
+		return FetchResponse{File: base64.StdEncoding.EncodeToString(raw)}, nil
 	case CallCredentialsRemove:
 		var in RemoveRequest
 		if err := json.Unmarshal(body, &in); err != nil || in.TargetID < 1 {

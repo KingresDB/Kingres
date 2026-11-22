@@ -3,8 +3,12 @@
 package anchor
 
 import (
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/url"
+	"sort"
 	"strings"
 )
 
@@ -39,15 +43,43 @@ func (s Secret) MarshalText() ([]byte, error) { return []byte(RedactedText), nil
 // (a server's error message may echo a key). The zero value redacts nothing.
 type Redactor struct{ values []string }
 
+// MinSecretLength is the length below which a value is not redacted (it would match unrelated text); the
+// validation of credentials refuses values shorter than this, so that no secret escapes the redactor (P7A-10).
+const MinSecretLength = 4
+
 // NewRedactor returns a Redactor for the given values; empty values and values
-// shorter than 4 bytes are ignored (they would match unrelated text).
+// shorter than MinSecretLength bytes are ignored (they would match unrelated
+// text). Each value is also removed in the spellings that a server may echo: the
+// URL-escaped form, the hexadecimal forms and the four base64 forms (a Basic
+// header that is repeated in a status text holds the base64 of "user:password",
+// which the caller gives as a value of its own).
 func NewRedactor(secrets ...Secret) Redactor {
 	var r Redactor
-	for _, s := range secrets {
-		if len(s) >= 4 {
-			r.values = append(r.values, string(s))
+	seen := map[string]bool{}
+	add := func(v string) {
+		if len(v) >= MinSecretLength && !seen[v] {
+			seen[v] = true
+			r.values = append(r.values, v)
 		}
 	}
+	for _, s := range secrets {
+		v := string(s)
+		if len(v) < MinSecretLength {
+			continue
+		}
+		add(v)
+		add(url.QueryEscape(v))
+		add(url.PathEscape(v))
+		add(hex.EncodeToString([]byte(v)))
+		add(strings.ToUpper(hex.EncodeToString([]byte(v))))
+		b := []byte(v)
+		add(base64.StdEncoding.EncodeToString(b))
+		add(base64.RawStdEncoding.EncodeToString(b))
+		add(base64.URLEncoding.EncodeToString(b))
+		add(base64.RawURLEncoding.EncodeToString(b))
+	}
+	// longest first, so that a form that holds another is removed whole
+	sort.SliceStable(r.values, func(i, j int) bool { return len(r.values[i]) > len(r.values[j]) })
 	return r
 }
 

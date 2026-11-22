@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/anchor"
@@ -81,24 +80,31 @@ func errText(err error) string { return (anchor.Redactor{}).Clean(err.Error(), 3
 // are worked on side by side (a target that hangs for its timeout holds one place) and the records of one target
 // one after the other.
 func (s *Service) jobSubmit(ctx context.Context, term scheduler.Term) error {
-	return s.pass(ctx, term, func(r Row) bool { return r.State == anchor.StatePending })
+	return s.pass(ctx, term, DueSubmit)
 }
 
 // jobUpgrade is one pass of ledger.anchor.upgrade: the submitted and claimed records that are due.
 func (s *Service) jobUpgrade(ctx context.Context, term scheduler.Term) error {
-	return s.pass(ctx, term, func(r Row) bool { return r.State == anchor.StateSubmitted || r.State == anchor.StateClaimed })
+	return s.pass(ctx, term, DueUpgrade)
 }
 
-func (s *Service) pass(ctx context.Context, term scheduler.Term, want func(Row) bool) error {
+// pass lists the records of the set that are due (the store selects by state and time before it limits, for each target, P7A-01) and starts one
+// worker for each target that has none running. The targets are independent of the end of the pass (P7A-04): the pass waits for the workers
+// at most PassWait, and a target that is still being worked on (it hangs for its timeouts on each of its records) keeps its worker and is
+// left alone by the next passes until it ends, while the other targets are worked on in every pass.
+func (s *Service) pass(ctx context.Context, term scheduler.Term, set DueSet) error {
+	if err := s.takeFatal(); err != nil {
+		return err
+	}
 	now := s.now()
-	rows, err := s.cfg.Store.Due(ctx, now, BatchSize)
+	rows, err := s.cfg.Store.Due(ctx, now, set, BatchSize)
 	if err != nil {
 		return err
 	}
 	byTarget := map[int64][]Row{}
 	var order []int64
 	for _, r := range rows {
-		if !want(r) || !(r.Record.Due(now) || r.State == anchor.StateClaimed && r.NextAttemptAt == nil) {
+		if !(r.Record.Due(now) || r.State == anchor.StateClaimed && r.NextAttemptAt == nil) {
 			continue
 		}
 		if _, ok := byTarget[r.TargetID]; !ok {
@@ -106,33 +112,84 @@ func (s *Service) pass(ctx context.Context, term scheduler.Term, want func(Row) 
 		}
 		byTarget[r.TargetID] = append(byTarget[r.TargetID], r)
 	}
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, MaxParallelTargets)
-	var mu sync.Mutex
-	var fatal error
+	done := make(chan struct{}, len(order))
+	started := 0
 	for _, id := range order {
-		wg.Add(1)
-		sem <- struct{}{}
+		if !s.beginTarget(set, id) {
+			continue // an earlier pass still works on this target
+		}
+		started++
 		go func(id int64, list []Row) {
-			defer wg.Done()
-			defer func() { <-sem }()
+			defer func() { done <- struct{}{} }()
+			defer s.endTarget(set, id)
 			// a panic of a step is the error of the pass and never the end of the daemon (the scheduler protects its own goroutine, not this one)
 			defer func() {
 				if r := recover(); r != nil {
 					s.log.Error("a job of anchoring panicked", "target", id, "panic", fmt.Sprint(r))
 				}
 			}()
+			select {
+			case s.sem <- struct{}{}:
+				defer func() { <-s.sem }()
+			case <-ctx.Done():
+				return
+			}
 			if err := s.workTarget(ctx, term, id, list); err != nil {
-				mu.Lock()
-				if fatal == nil {
-					fatal = err
-				}
-				mu.Unlock()
+				s.setFatal(err)
 			}
 		}(id, byTarget[id])
 	}
-	wg.Wait()
-	return fatal
+	wait := s.cfg.PassWait
+	if wait <= 0 {
+		wait = PassWait
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	for i := 0; i < started; i++ {
+		select {
+		case <-done:
+		case <-timer.C:
+			i = started
+		case <-ctx.Done():
+			i = started
+		}
+	}
+	return s.takeFatal()
+}
+
+// beginTarget takes the worker of a target for a set of records (false when one is running); endTarget gives it back.
+func (s *Service) beginTarget(set DueSet, id int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := [2]int64{int64(set), id}
+	if s.working[k] {
+		return false
+	}
+	s.working[k] = true
+	return true
+}
+
+func (s *Service) endTarget(set DueSet, id int64) {
+	s.mu.Lock()
+	delete(s.working, [2]int64{int64(set), id})
+	s.mu.Unlock()
+}
+
+// setFatal keeps the error that ends the term (a deposed leader) for the pass that returns it: a worker may end after its pass did.
+func (s *Service) setFatal(err error) {
+	s.mu.Lock()
+	if s.fatal == nil {
+		s.fatal = err
+	}
+	s.mu.Unlock()
+}
+
+func (s *Service) takeFatal() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	err := s.fatal
+	s.fatal = nil
+	return err
 }
 
 // workTarget works on the records of one target; it returns only an error that ends the pass (the term is over).
@@ -142,6 +199,10 @@ func (s *Service) workTarget(ctx context.Context, term scheduler.Term, id int64,
 		return nil
 	}
 	b, berr := s.build(trow)
+	if berr != nil && isNoCredentials(berr) && s.fetchMissing(ctx, trow) {
+		// a server that became the leader without the file asks the other holders for it before it gives up (P7A-03)
+		b, berr = s.build(trow)
+	}
 	for _, r := range list {
 		if ctx.Err() != nil {
 			return nil
@@ -191,14 +252,16 @@ func (s *Service) work(ctx context.Context, term scheduler.Term, trow TargetRow,
 					w.Record = exp
 					w.Alert, w.ErrorCode = AlertFailed, "expired"
 					w.LastError = "the target did not confirm the record in time; use Retry to wait again"
-					return s.apply(ctx, term, w, row.Version)
+					return s.apply(ctx, term, w, row.Version, trow.Revision)
 				}
 			}
 		}
 	}
 	if berr != nil {
-		// the target cannot be built: the credentials or the configuration are wrong or missing here
-		return s.fail(ctx, term, row, anchor.Errorf(anchor.ClassRetryable, row.Kind, "target", "target_unavailable", "%s", errText(berr)), nil)
+		// The target cannot be built: the credentials or the configuration are wrong or missing on this server. Nothing a later call does
+		// changes that, so the record fails at once, with the cause in its text and in the alert of 6.9, and an operator uses Retry after
+		// the fix (P7A-03); a retry with backoff would say nothing for hours.
+		return s.fail(ctx, term, row, anchor.Errorf(anchor.ClassPermanent, row.Kind, "target", "target_unbuildable", "%s", errText(berr)), nil, trow.Revision)
 	}
 	var (
 		rc  anchor.Receipt
@@ -209,7 +272,7 @@ func (s *Service) work(ctx context.Context, term scheduler.Term, trow TargetRow,
 		var p anchor.Payload
 		p, err = anchor.PayloadFor(row.Record, row.AggregateID, row.Note)
 		if err != nil {
-			return s.fail(ctx, term, row, anchor.Errorf(anchor.ClassPermanent, row.Kind, "payload", "bad_payload", "%s", errText(err)), b)
+			return s.fail(ctx, term, row, anchor.Errorf(anchor.ClassPermanent, row.Kind, "payload", "bad_payload", "%s", errText(err)), b, trow.Revision)
 		}
 		cctx, cancel := context.WithTimeout(ctx, s.timeout(s.cfg.SubmitTimeout, SubmitTimeout))
 		if res, ok := b.Target.(anchor.Resumer); ok && len(row.Evidence) > 0 {
@@ -231,21 +294,28 @@ func (s *Service) work(ctx context.Context, term scheduler.Term, trow TargetRow,
 		return err
 	}
 	if err != nil {
-		return s.fail(ctx, term, row, err, b)
+		return s.fail(ctx, term, row, err, b, trow.Revision)
 	}
-	return s.succeed(ctx, term, row, rc, b)
+	return s.succeed(ctx, term, row, rc, b, trow.Revision)
 }
 
 // succeed applies the receipt of a call that returned no error. A receipt whose evidence the library's own
 // parser refuses is a fault of the target's code and fails the record: nothing is anchored on evidence that does
 // not read back.
-func (s *Service) succeed(ctx context.Context, term scheduler.Term, row Row, rc anchor.Receipt, b *Built) error {
+func (s *Service) succeed(ctx context.Context, term scheduler.Term, row Row, rc anchor.Receipt, b *Built, rev int64) error {
 	now := s.now()
 	canon, err := anchor.CanonicalEvidence(row.Kind, rc.Evidence)
 	if err != nil {
-		return s.fail(ctx, term, row, anchor.Errorf(anchor.ClassPermanent, row.Kind, "receipt", "bad_evidence", "the evidence of the receipt does not read back: %s", errText(err)), b)
+		return s.fail(ctx, term, row, anchor.Errorf(anchor.ClassPermanent, row.Kind, "receipt", "bad_evidence", "the evidence of the receipt does not read back: %s", errText(err)), b, rev)
 	}
 	rc.Evidence = canon
+	// the evidence must be the evidence of this record: the second check behind the library's own, at the one place where a record becomes
+	// anchored (P7A-05); a mismatch is a fault of the target's code and fails the record for good
+	if b != nil && b.Kind.Binds != nil {
+		if berr := b.Kind.Binds(row, canon); berr != nil {
+			return s.fail(ctx, term, row, anchor.Errorf(anchor.ClassPermanent, row.Kind, "receipt", "evidence_mismatch", "the evidence of the receipt is not the evidence of this checkpoint: %s", errText(berr)), b, rev)
+		}
+	}
 	rec, err := row.Record.ApplyReceipt(rc, now)
 	if err != nil {
 		s.log.Warn("a receipt was refused by the state machine, the job is stale", "record", row.ID, "state", string(row.State), "receipt", rc.State)
@@ -264,11 +334,11 @@ func (s *Service) succeed(ctx context.Context, term scheduler.Term, row Row, rc 
 		w.LastError = fmt.Sprintf("claims of a calendar were contradicted by the header source: %d contradicted, %d kept aside, %d dropped, %d repeated", rc.ContradictedClaims, rc.ClaimsAside, rc.ClaimsDropped, rc.ClaimsRepeated)
 		s.log.Warn("claims of an OpenTimestamps calendar were contradicted", "record", row.ID, "contradicted", rc.ContradictedClaims, "aside", rc.ClaimsAside, "dropped", rc.ClaimsDropped, "repeated", rc.ClaimsRepeated)
 	}
-	return s.apply(ctx, term, w, row.Version)
+	return s.apply(ctx, term, w, row.Version, rev)
 }
 
 // fail applies the failure of a call to the record, as table 6.6 says, and keeps the alert it names with the row.
-func (s *Service) fail(ctx context.Context, term scheduler.Term, row Row, err error, b *Built) error {
+func (s *Service) fail(ctx context.Context, term scheduler.Term, row Row, err error, b *Built, rev int64) error {
 	now := s.now()
 	rec, alertKind, aerr := row.Record.AfterError(err, now, s.cfg.Rand(), s.cfg.Limits)
 	if aerr != nil {
@@ -291,14 +361,14 @@ func (s *Service) fail(ctx context.Context, term scheduler.Term, row Row, err er
 	if alertKind == anchor.AlertNone && (rec.State == anchor.StateFailed || rec.State == anchor.StateExpired) {
 		w.Alert = AlertFailed
 	}
-	return s.apply(ctx, term, w, row.Version)
+	return s.apply(ctx, term, w, row.Version, rev)
 }
 
-func (s *Service) apply(ctx context.Context, term scheduler.Term, w Row, expect int64) error {
+func (s *Service) apply(ctx context.Context, term scheduler.Term, w Row, expect, rev int64) error {
 	if err := s.hook("before-apply"); err != nil {
 		return err
 	}
-	if err := s.cfg.Store.Apply(ctx, term, w, expect); err != nil {
+	if err := s.cfg.Store.Apply(ctx, term, w, expect, rev); err != nil {
 		if errors.Is(err, ErrConflict) || errors.Is(err, ErrNotFound) {
 			return nil // changed meanwhile (a Retry, a delete, a second pass): this result is dropped
 		}

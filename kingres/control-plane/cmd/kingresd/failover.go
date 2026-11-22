@@ -858,7 +858,12 @@ func handleFailoverDemote(ctx context.Context, d *haDeps, body []byte) (any, err
 	}
 	// The clean stop of a switchover is asked again to read the proof, when the instance is stopped and its catalog cannot be read:
 	// the term is then judged only when it can be read.
-	if err := staleTerm(ctx, d, r.ExpectedTerm, r.Mode != "fast"); err != nil {
+	// The term of the run is required (F4-09). The clean stop of a switchover is asked again to read the proof when the instance is stopped and
+	// its catalog cannot be read: the term is then judged only when it can be read; while the instance runs, an unreadable term refuses.
+	if r.Mode == "fast" && r.ExpectedTerm < 0 {
+		return nil, badBody("a demote request with the term of the run")
+	}
+	if err := staleTerm(ctx, d, r.ExpectedTerm, r.Mode != "fast" || primaryRuns(ctx, d, r.Group)); err != nil {
 		return nil, err
 	}
 	if r.Mode == "fast" {
@@ -956,6 +961,28 @@ func handleFailoverPromote(ctx context.Context, d *haDeps, body []byte) (any, er
 		}
 		return promoteAnswer(ctx, c, "already", started), nil
 	}
+	// 0. A planned switchover makes its proof again here, in the call that promotes (F4-07): the standby must hold everything the old
+	//    primary wrote up to its shutdown checkpoint, and nothing beyond it. A standby that is behind, or an old primary that was
+	//    started again and wrote more, is refused before anything is changed: the call is still before the point of no return.
+	if r.Checkpoint != "" && !r.ReapplyList {
+		vc, verr := d.Svc.InstanceConn(ctx, li.ID, dbOrSystem(""))
+		if verr != nil {
+			return nil, &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The proof cannot be asked: the instance cannot be reached."}
+		}
+		var ok bool
+		verr = vc.QueryRow(ctx, `SELECT kingres.switchover_verify($1::pg_lsn, $2)`, r.Checkpoint, r.ClusterState).Scan(&ok)
+		_ = vc.Close(context.WithoutCancel(ctx))
+		if verr != nil {
+			var pe *pgconn.PgError
+			if errors.As(verr, &pe) && pe.Code == "KS006" {
+				return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "unprovable", Message: pe.Message}
+			}
+			return nil, &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The proof cannot be asked: " + verr.Error()}
+		}
+		if !ok {
+			return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "standby_behind", Message: "The standby does not hold everything the old primary wrote."}
+		}
+	}
 	// 1. The list of synchronous standbys is emptied first: a promoted standby inherits its primary's list and every
 	//    commit on it would wait for ever (extension precondition 3). Harmless while the instance is in recovery.
 	if err := d.Standby.agent.EmptySyncNames(ctx, li.ID); err != nil {
@@ -1043,8 +1070,13 @@ func registerFailoverCallee(d *haDeps) {
 	reg(callFailoverPromote, handleFailoverPromote)
 	reg("POST /failover/prepared", handleFailoverPrepared)
 	registerSwitchoverCallee(reg)
-	reg(callMapStart, handleMapStart)
-	reg(callMapContinue, handleMapContinue)
+	// The two calls of the map group are open to every member: they are told who calls (F4-05).
+	d.Calls.Register(callMapStart, func(ctx context.Context, caller string, body []byte) (any, error) {
+		return handleMapStart(ctx, d, caller, body)
+	})
+	d.Calls.Register(callMapContinue, func(ctx context.Context, caller string, body []byte) (any, error) {
+		return handleMapContinue(ctx, d, caller, body)
+	})
 }
 
 var _ = url.Values{}

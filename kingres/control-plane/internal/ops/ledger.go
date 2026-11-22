@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -265,8 +266,9 @@ func (o *Ops) ListDigests(ctx context.Context, db string, p store.Page) (api.Led
 }
 
 type verifyParams struct {
-	Database string `json:"database"`
-	Scope    string `json:"scope"`
+	Database string   `json:"database"`
+	Scope    string   `json:"scope"`
+	Checks   []string `json:"checks,omitempty"`
 }
 
 // PrepareVerification validates a verification request.
@@ -285,6 +287,22 @@ func (o *Ops) PrepareVerification(ctx context.Context, db string, req api.Ledger
 	if req.DigestID != nil {
 		return nil, problem.New(problem.UnsupportedOp, "Verifying against a recorded digest is not supported yet.")
 	}
+	seen := map[string]bool{}
+	for _, ck := range req.Checks {
+		switch {
+		case ck != "chain" && ck != "publication" && ck != "anchors":
+			return nil, problem.Validation("The request is invalid.", field("/checks", "each check is chain, publication or anchors", "enum"))
+		case seen[ck]:
+			return nil, problem.Validation("The request is invalid.", field("/checks", "a check is named once", "unique"))
+		}
+		seen[ck] = true
+	}
+	if seen["anchors"] {
+		return nil, problem.New(problem.UnsupportedOp, "The check of the anchors is not supported by this server version yet.")
+	}
+	if seen["publication"] && o.LedgerAudit == nil {
+		return nil, problem.New(problem.UnsupportedOp, "This server does not publish the ledger, so there is no publication to audit.")
+	}
 	err := o.asService(ctx, db, func(tx pgx.Tx) error {
 		if err := needRecords(ctx, tx); err != nil {
 			return err
@@ -294,10 +312,10 @@ func (o *Ops) PrepareVerification(ctx context.Context, db string, req api.Ledger
 	if err != nil {
 		return nil, wrap(err)
 	}
-	return verifyParams{Database: db, Scope: scope}, nil
+	return verifyParams{Database: db, Scope: scope, Checks: req.Checks}, nil
 }
 
-func (o *Ops) stepVerifyLedger(ctx context.Context, env *task.Env) error {
+func (o *Ops) stepVerifyChain(ctx context.Context, env *task.Env) error {
 	p, err := inputOf[verifyParams](env.Task)
 	if err != nil {
 		return err
@@ -368,4 +386,33 @@ func (o *Ops) stepLedgerRetire(ctx context.Context, env *task.Env) error {
 		return err
 	}
 	return o.LedgerRetireDatabase(ctx, p.Name)
+}
+
+// stepVerifyLedger runs the checks of a verification: the chain (always: the task that is done leaves the extension's record), then the
+// audit of the stored publication when it was asked for. Both are run, so the operator reads every finding at once; the task fails when
+// either found something.
+func (o *Ops) stepVerifyLedger(ctx context.Context, env *task.Env) error {
+	p, err := inputOf[verifyParams](env.Task)
+	if err != nil {
+		return err
+	}
+	chainErr := o.stepVerifyChain(ctx, env)
+	var findings []string
+	for _, ck := range p.Checks {
+		if ck != "publication" {
+			continue
+		}
+		f, err := o.LedgerAudit(ctx, p.Database)
+		if err != nil {
+			return fmt.Errorf("the audit of the publication could not run: %w", err)
+		}
+		findings = append(findings, f...)
+	}
+	switch {
+	case chainErr != nil && len(findings) > 0:
+		return fmt.Errorf("%w; the audit of the publication found %d problem(s): %s", chainErr, len(findings), strings.Join(findings, "; "))
+	case len(findings) > 0:
+		return fmt.Errorf("the audit of the publication found %d problem(s): %s", len(findings), strings.Join(findings, "; "))
+	}
+	return chainErr
 }

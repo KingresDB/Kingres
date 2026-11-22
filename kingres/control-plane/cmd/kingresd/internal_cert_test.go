@@ -15,7 +15,7 @@ import (
 // leader's call took for a server that cannot be reached. During the reset it presents the bootstrap
 // certificate instead; a member that merely lost its certificates still presents nothing.
 func TestInternalCertificateDuringAReset(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "pki")
+	dir := filepath.Join(tempDir(t), "pki")
 	state, resetting := setup.Clustered, false
 	var seen string
 	get := internalCertificate(dir, func() pki.Names { return pki.Names{CommonName: "127.0.0.9"} },

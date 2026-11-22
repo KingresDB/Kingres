@@ -65,25 +65,27 @@ func (l *logSink) String() string { l.mu.Lock(); defer l.mu.Unlock(); return l.b
 
 // env is a leader (server "s1") with the store, the task engine and some peers.
 type env struct {
-	t      *testing.T
-	store  ledgersign.Store
-	bump   func(context.Context) (scheduler.Term, error)
-	mem    *ledgersign.MemStore // nil for the database store
-	clk    *fakeClock
-	dbClk  *fakeClock
-	dir    string
-	pass   string
-	skew   time.Duration
-	svc    *ledgersign.Service
-	kr     *ledgersign.Keyring
-	tasks  *task.MemStore
-	store2 task.Store // the store the engine uses (a test wraps it to simulate a crash); nil: tasks
-	eng    *task.Engine
-	peers  map[string]*server
-	hold   []string // servers that run an instance of group 0 (besides s1)
-	logs   *logSink
-	audits []audit.Event
-	alerts []string
+	t *testing.T
+	// published is the record of what was published that the service is given (nil: none)
+	published ledgersign.Published
+	store     ledgersign.Store
+	bump      func(context.Context) (scheduler.Term, error)
+	mem       *ledgersign.MemStore // nil for the database store
+	clk       *fakeClock
+	dbClk     *fakeClock
+	dir       string
+	pass      string
+	skew      time.Duration
+	svc       *ledgersign.Service
+	kr        *ledgersign.Keyring
+	tasks     *task.MemStore
+	store2    task.Store // the store the engine uses (a test wraps it to simulate a crash); nil: tasks
+	eng       *task.Engine
+	peers     map[string]*server
+	hold      []string // servers that run an instance of group 0 (besides s1)
+	logs      *logSink
+	audits    []audit.Event
+	alerts    []string
 
 	mu       sync.Mutex
 	term     scheduler.Term
@@ -147,7 +149,7 @@ func (e *env) newKeyring(dir string) *ledgersign.Keyring {
 func (e *env) rebuild() {
 	e.t.Helper()
 	svc, err := ledgersign.New(ledgersign.Config{
-		Self: "s1", Store: e.store, Keyring: e.kr,
+		Self: "s1", Store: e.store, Keyring: e.kr, Published: e.published,
 		Term:  func() (scheduler.Term, bool) { e.mu.Lock(); defer e.mu.Unlock(); return e.term, e.hasTerm },
 		Clock: e.clk.Now, MaxClockSkew: e.skew, DefaultPrefix: "s1/kingres-ledger", TermWait: 200 * time.Millisecond,
 		Holders: func(context.Context) ([]string, error) { return append([]string(nil), e.hold...), nil },

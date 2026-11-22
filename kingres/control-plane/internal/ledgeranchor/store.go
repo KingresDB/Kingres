@@ -83,6 +83,17 @@ type Row struct {
 	UpdatedAt time.Time
 }
 
+// DueSet is the set of records Due lists.
+type DueSet int
+
+// The sets of Due.
+const (
+	// DueSubmit: pending records, for the job that submits.
+	DueSubmit DueSet = iota
+	// DueUpgrade: submitted and claimed records, for the job that upgrades.
+	DueUpgrade
+)
+
 // Aggregate is the newest checkpoint of the aggregate log of a database.
 type Aggregate struct {
 	LogID    int64
@@ -173,11 +184,18 @@ type Store interface {
 	Begin(ctx context.Context, term scheduler.Term, id int64, now time.Time) (Row, error)
 	// Apply writes the result of a job: the mutable fields of the record, the error code and the alert, when the row
 	// still has the version expect (ErrConflict otherwise). A record that becomes anchored marks its checkpoint.
-	Apply(ctx context.Context, term scheduler.Term, r Row, expect int64) error
-	// Due lists the records of enabled targets that wait for work at now: pending ones to submit, submitted and
-	// claimed ones to upgrade (the library decides what is due; this is a first cut by next_attempt_at), oldest
-	// first, at most limit, with their notes.
-	Due(ctx context.Context, now time.Time, limit int) ([]Row, error)
+	// targetRev is the revision the target had when the job built its client, and 0 for a write that is not the result
+	// of a call (a Retry): with a revision the result is dropped (ErrConflict) when the target was changed since,
+	// switched off or deleted, so that a call made for an old configuration is never credited to the new one (P7A-07).
+	Apply(ctx context.Context, term scheduler.Term, r Row, expect int64, targetRev int64) error
+	// Due lists the records of enabled targets that wait for work at now, of the set (DueSubmit: pending records;
+	// DueUpgrade: submitted and claimed ones): only those whose next check has come (a claimed record without one is
+	// due), oldest first, at most perTarget for each target, with their notes. The selection by state and time is made
+	// before the limit, so records that wait for a later time never take the place of a due one, and one target with
+	// many records never takes the places of the others (P7A-01).
+	Due(ctx context.Context, now time.Time, set DueSet, perTarget int) ([]Row, error)
+	// Newer tells whether the (target, log) has a record of a larger size than size, in any state (P7A-08).
+	Newer(ctx context.Context, targetID, logID, size int64) (bool, error)
 	// NewestAnchored lists the newest anchored record of every (target, log).
 	NewestAnchored(ctx context.Context) ([]Anchored, error)
 	// Failures lists the failed and expired records of live targets that carry an alert, without notes.

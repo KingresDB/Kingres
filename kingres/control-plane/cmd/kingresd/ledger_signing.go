@@ -3,8 +3,13 @@
 package main
 
 import (
+	"errors"
+	"io"
+
 	"context"
 	"fmt"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"log/slog"
 	"path/filepath"
 	"strings"
@@ -237,6 +242,7 @@ func newLedgerParts(cfg config.Config, svc *cluster.Service, self string, log *s
 		Store: pub, Source: src, Keys: s, Log: log.With("component", "ledger-round"), Alert: alertFn,
 		Published: pubState, PullState: pullState(members, holderHosts, log.With("component", "ledger-state")),
 		MissingFor: missingFor(log),
+		OnNewChain: opsSvc.SyncClientKeys,
 		Listener:   listener.Status,
 		DatabaseExists: func(ctx context.Context, db string) (bool, error) {
 			var ok bool
@@ -281,6 +287,37 @@ func newLedgerParts(cfg config.Config, svc *cluster.Service, self string, log *s
 	opsSvc.LedgerDigest, opsSvc.LedgerDigests = coll.Digest, coll.Digests
 	opsSvc.LedgerRetireDatabase = func(ctx context.Context, db string) error {
 		return coll.RetireDatabase(ctx, db, ledgerround.ReasonDropped, true)
+	}
+	opsSvc.LedgerAudit = pub.AuditPublication
+	opsSvc.LedgerChainDiverged = coll.IsDiverged
+	opsSvc.LedgerEpochStart = coll.StartEpoch
+	opsSvc.BundleDir = filepath.Join(cfg.DataDir, "ledger", "bundles")
+	opsSvc.LedgerPublished = func(ctx context.Context, db string) (bool, error) {
+		logs, err := pub.Logs(ctx)
+		for _, l := range logs {
+			if l.Database == db && l.Kind == ledgerpub.KindAggregate && l.Size > 0 {
+				return true, nil
+			}
+		}
+		return false, err
+	}
+	opsSvc.LedgerBundleBuild = func(ctx context.Context, db string, req api.LedgerBundleRequest, files map[string][]byte, w io.Writer) error {
+		br := ledgerpub.BundleRequest{Logs: req.Logs, IncludeAnchors: req.IncludeAnchors != nil && *req.IncludeAnchors, Files: files}
+		if req.SinceSize != nil {
+			br.SinceSize = *req.SinceSize
+		}
+		prefix, err := s.Prefix(ctx)
+		if err != nil {
+			return err
+		}
+		_, err = pub.WriteBundle(ctx, db, br, prefix, time.Now(), w)
+		if errors.Is(err, ledgerpub.ErrNoLogs) {
+			return problem.New(problem.LedgerNotPublished, "The database has no published ledger yet.")
+		}
+		if errors.Is(err, ledgerpub.ErrUnknownOrigin) {
+			return problem.Validation("The request is invalid.", problem.FieldError{Field: "/logs", Message: "an origin is not a log of this database", Code: "not_found"})
+		}
+		return err
 	}
 	if members != nil {
 		members.LedgerRetire = coll.RetireServer

@@ -54,7 +54,7 @@ func TestAStandbyThatLagsIsNotChosenAndFollowsTheNewPrimary(t *testing.T) {
 	old.Kill()
 	old.StopInstance()
 	old.StopStandbys()
-	st, resp := leader.Do("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard", "comment": "a standby lags"}, nil)
+	st, resp := leader.DoThroughRestart("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard", "comment": "a standby lags"}, nil)
 	if st != 202 {
 		t.Fatalf("failover request (no allowDataLoss: the verdict must be none): %d %v", st, resp)
 	}
@@ -155,7 +155,7 @@ func TestASecondFailoverWhileOneIsPaused(t *testing.T) {
 	// The leader's kingresd ends after the lease wait and is started again: its check of the group is then older than the
 	// verdict accepts and the task pauses for a decision.
 	leader.SetFaults(fault.Spec{TaskExitPoint: "step_recorded", TaskExitStep: 3})
-	st, resp := leader.Do("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard"}, nil)
+	st, resp := leader.DoThroughRestart("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard"}, nil)
 	if st != 202 {
 		t.Fatalf("failover request: %d %v", st, resp)
 	}
@@ -192,7 +192,7 @@ func TestASecondFailoverWhileOneIsPaused(t *testing.T) {
 		t.Errorf("the status resource does not name the paused task %v: %v", id, status)
 	}
 	// The same request again, accepting the loss, resumes the same task.
-	st, resp2 := leader.Do("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard", "allowDataLoss": true}, nil)
+	st, resp2 := leader.DoThroughRestart("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard", "allowDataLoss": true}, nil)
 	if st != 202 || fmt.Sprint(clustertest.TaskID(resp2)) != fmt.Sprint(id) {
 		t.Fatalf("resuming the paused failover: %d %v (the task was %v)", st, resp2, id)
 	}

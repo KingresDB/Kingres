@@ -23,7 +23,7 @@ func (oneServer) Topology(context.Context) (lease.Topology, error) {
 // server holds, or adopts, refuses it again.
 func TestTheProofOfAFormerPrimaryNeedsAMarkerOnDiskAndNoLease(t *testing.T) {
 	clk := clock.NewReal()
-	dir := filepath.Join(t.TempDir(), "lease")
+	dir := filepath.Join(tempDir(t), "lease")
 	grantor, err := lease.NewGrantor(clk, 3*time.Second, dir)
 	if err != nil {
 		t.Fatal(err)

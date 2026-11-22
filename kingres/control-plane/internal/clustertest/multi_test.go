@@ -67,6 +67,7 @@ func sharedCluster(t *testing.T) *clustertest.Cluster {
 		shared.Retain()
 	}
 	shared.Use(t)
+	sharedHealth(t, shared)
 	return shared
 }
 

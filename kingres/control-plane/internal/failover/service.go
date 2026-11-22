@@ -78,6 +78,12 @@ func (s *Service) Resolve(ctx context.Context, actor, server string, req Request
 	if len(req.Comment) > 500 {
 		errs = append(errs, problem.FieldError{Field: "/comment", Message: "at most 500 characters", Code: "out_of_range"})
 	}
+	for _, c := range req.Comment {
+		if c < 0x20 && c != 0x0a && c != 0x09 {
+			errs = append(errs, problem.FieldError{Field: "/comment", Message: "must not contain control characters", Code: "invalid_value"})
+			break
+		}
+	}
 	seen := map[int32]bool{}
 	for i, g := range req.ShardGroupIDs {
 		if g < 0 || seen[g] {
@@ -113,8 +119,13 @@ func (s *Service) Resolve(ctx context.Context, actor, server string, req Request
 		groups = append([]int32(nil), req.ShardGroupIDs...)
 		sort.Slice(groups, func(i, j int) bool { return groups[i] < groups[j] })
 	}
+	in := map[int32]bool{}
+	for _, g := range groups {
+		in[g] = true
+	}
 	for g := range targets {
-		if !seen[g] && len(req.ShardGroupIDs) > 0 {
+		// A target names a group that the request fails over, also when the request does not name groups (all of the server's) (F4-15).
+		if !in[g] {
 			return Input{}, problem.New(problem.Unprocessable, fmt.Sprintf("A target names shard group %d, which the request does not fail over.", g))
 		}
 	}
@@ -791,18 +802,22 @@ func (s *Service) Unfinished(ctx context.Context) (bool, error) {
 func (s *Service) LastEnded(ctx context.Context) (map[int32]time.Time, error) {
 	out := map[int32]time.Time{}
 	err := s.sys(ctx, func(c *pgx.Conn) error {
-		rows, err := c.Query(ctx, `SELECT g.group_id, max(g.finished_at) FROM kingres_cp.failover_group g WHERE g.finished_at IS NOT NULL GROUP BY g.group_id`)
+		// A run that ended without finishing a group (failed, cancelled, partial) counts too: the cool-down is what keeps a failing automatic task from
+		// being submitted again at once (F4-04). The age is measured by the database, so a step of the leader's clock does not move it (F4-15).
+		rows, err := c.Query(ctx, `SELECT g.group_id, extract(epoch FROM clock_timestamp() - max(coalesce(g.finished_at, r.finished_at)))::float8
+			FROM kingres_cp.failover_group g JOIN kingres_cp.failover_run r USING (task_id)
+			WHERE coalesce(g.finished_at, r.finished_at) IS NOT NULL GROUP BY g.group_id`)
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
 		for rows.Next() {
 			var g int32
-			var at time.Time
-			if err := rows.Scan(&g, &at); err != nil {
+			var age float64
+			if err := rows.Scan(&g, &age); err != nil {
 				return err
 			}
-			out[g] = at
+			out[g] = time.Now().Add(-time.Duration(age * float64(time.Second)))
 		}
 		return rows.Err()
 	})

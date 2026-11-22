@@ -175,6 +175,9 @@ type Auto struct {
 	back    map[string]time.Duration
 	blocked map[int32]bool
 	limited bool
+	// limitKnown says that this loop has told the alert about the limit at least once: a leader that took over does not know what its predecessor
+	// raised, so its first look raises or clears the alert, which is idempotent (F4-13).
+	limitKnown bool
 }
 
 func (a *Auto) now() time.Time {
@@ -199,8 +202,8 @@ func (a *Auto) Step(ctx context.Context) (AutoDecision, error) {
 	if a.until == nil {
 		a.until, a.back, a.blocked = map[string]time.Time{}, map[string]time.Duration{}, map[int32]bool{}
 	}
-	if d.LimitReached != a.limited {
-		a.limited = d.LimitReached
+	if !a.limitKnown || d.LimitReached != a.limited {
+		a.limited, a.limitKnown = d.LimitReached, true
 		a.mu.Unlock()
 		a.P.Alert(ctx, "autoFailoverLimitReached", "critical", "cluster", "The automatic failover limit is reached; fail over by hand or reset the counter.", d.LimitReached)
 		a.mu.Lock()

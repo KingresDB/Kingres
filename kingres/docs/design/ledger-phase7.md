@@ -1124,6 +1124,7 @@ Jobs of this phase (names are the `Job.Name`):
 | `ledger.anchor.submit` | 30 s | records in state `pending` whose `next_attempt_at` has passed |
 | `ledger.anchor.upgrade` | 60 s (each record has its own `next_check`) | OpenTimestamps upgrade |
 | `ledger.anchor.enqueue` | `anchor.intervalSeconds` | creates the records of 6.2 for the newest aggregate checkpoints |
+| `ledger.anchor.credentials` | 60 s | brings the credentials files of the holders to the state of the targets (correction 232) |
 | `ledger.publication.audit` | 24 h and on request | re-reads every chain from block 0 and compares with the published leaves (4.7, 1) |
 | `ledger.monitor` | 10 s | the alert reconciliation of 6.9 (no write unless an alert changes) |
 
@@ -1610,11 +1611,50 @@ the old history learns that the history was cut, when, and by whom (the acknowle
 event). The flag `--accept-epoch-closed <seq>` turns that failure into a printed finding with exit
 status 0 for a verification of the new epoch alone; it never hides the finding.
 
-**Restoring only the system database** (`kingres_system`, whose schema is `kingres_cp`): the tiles, checkpoints and anchor records
-are public data derived from the chains and from keys the host still has. The publisher re-derives
-tiles (same leaves give the same bytes), Ed25519 is deterministic so re-signed checkpoints are
-byte-identical, WORM re-submission finds the same bytes (the idempotent path of 6.3, 4), and anchor
-records that were lost are re-created for the latest checkpoint. A restored `ledger_cluster.term`
+**Restoring only the system database** (`kingres_cp`; correction 230). What can be derived again
+and what cannot:
+
+- The **chain logs** are derived from the chains, which a restore of `kingres_cp` does not touch: the
+  leaves are the blocks, so the same leaves give the same tiles, and Ed25519 is deterministic, so a
+  checkpoint of a chain log that is signed again is byte-identical to the one that was published. A
+  chain log that the restored database holds at a smaller size is caught up by the next rounds
+  as for any log.
+- The **aggregate log and the events cannot be derived again.** An aggregate leaf holds the clock time
+  of its round and what the chains looked like at that moment; an event holds its time and the state of
+  the key set. A restored database that holds fewer of them cannot get back to what was published by
+  any computation, and signing the next size of such a log would sign another root for a size that was
+  published, and the next event another note for a number that was published. (An earlier text of this
+  section said that everything is re-derived and re-signed byte for byte: that holds for the chain
+  logs only.)
+- Anchor records that were lost are created again for the newest checkpoint (6.1), and WORM
+  re-submission finds the same bytes (the idempotent path of 6.3, 4).
+
+A restored database is therefore **refused**: every holder keeps `published.json` (correction 171) and the
+publisher signs nothing, writes nothing and raises the critical alert `ledgerSignerUnavailable` while the
+database is behind it or contradicts it. That refusal has one end besides restoring the database that was
+lost, a deliberate act of an operator, **accepting the loss**:
+
+1. The alert says what was published (events, logs) and what the restored database holds, and names a
+   confirmation of sixteen hexadecimal digits that depends on exactly these two states.
+2. The operator reads the text, decides the loss is real and unavoidable, and writes the confirmation (and,
+   on a second line, a reason of up to 200 printable ASCII characters) into the file `accept-restore` in the
+   key directory of the manager leader. There is no setting, no call and no way of removing the record that
+   does the same: a confirmation for another situation is ignored.
+3. The leader replaces its record by what the restored database holds, one **generation** higher,
+   keeps the old record beside it as `published.json.before-restore-<generation>`, removes the file and goes on. A record of a
+   higher generation replaces the records of the other holders when it reaches them, and one of a lower
+   generation never takes the floor back; a server that is about to lead with the old record asks the other
+   holders first.
+4. In the first round after, and in every round until it succeeds, the signed event `restore-acknowledged`
+   is published (lines `generation`, `published-events`, `published-logs`, `published-state-sha256`,
+   `database-events`, `database-logs`, `database-state-sha256`, `reason`, `acknowledged-by`), before anything else
+   is signed. A crash between the acceptance and the event leaves the note in the record, and the next
+   round publishes the event.
+
+What a verifier concludes: the logs continue from the restored database, so the aggregate log and the events
+show a **fork** against a mirror that holds the old checkpoints, with the event that says why next to it. That is
+the finding the event is for, as the failure of `--previous` across an epoch (above) is for a rolled-back chain.
+Nothing that was published is signed again with other content without this act. A restored `ledger_cluster.term`
 smaller than a deposed leader's last term is the one case this design does not close (a deposed leader
 that wakes up with a higher term could keep writing to a restored table): the restore procedure
 documented in the README says to restart every `kingresd` after restoring the system database.
@@ -3090,6 +3130,67 @@ The number 159 is not used.
     at that path only and never listed. A log closed because its database was dropped raises no
     alert of a returning chain for 30 minutes, the time the drop task needs between ending the
     publication and dropping the database.
+
+The review of the wiring of anchoring and of the fixes of the publication
+(`docs/reviews/2026-11-20-kingresd-anchoring-wiring-and-publication-fixes.md`, P7A-01 to P7A-17) gave:
+
+230. **The restore of the system database** is refused until an operator accepts the loss with a confirmation
+    that fits the situation; the acceptance is a signed event (9.4). The aggregate log and the events cannot be
+    derived again, the chain logs can. The confirmation is a file in the key directory and not a call of the REST
+    contract, because accepting is a decision made at the host with the old record and the restored database
+    in view, and a call would have to be authorised against a database that the publisher distrusts.
+231. **The list of records that are due** (`Store.Due`) is selected by state and by time in the query and limited for
+    each target after that (100 per target and set): the submit job asks for the pending records, the upgrade job for the
+    submitted and the claimed ones. A claimed record that waits for a block header no longer takes the place of a
+    pending record, and one target with many records no longer takes the places of the others (P7A-01).
+232. **The credentials follow the targets.** The job `ledger.anchor.credentials` (60 s, on the leader) fetches the
+    files this server lacks from the other holders, gives the holders the files they lack, takes away the files of
+    targets that are gone, and keeps what it could not do as an alert (`ledgerAnchorFailed`, subject
+    `target:<id>|credentials`: warning when a holder lacks a file, critical when this server lacks it for an enabled
+    target). A worker that finds the file missing asks the holders at once. The REST answer of a create or an update
+    stays 201 or 200 when the distribution failed (the contract has no member for warnings); the alert comes with the
+    next pass of the monitor, 10 s later. The internal calls `credentials/list` and `credentials/fetch` are new (P7A-03).
+233. **A target that cannot be built** (no credentials file, a credentials path that cannot be used, a bundle that cannot
+    be read) fails its records at once with the code `target_unbuildable` and the cause, which is in the alert; it is
+    not retried with a backoff. After the fix the operator uses Retry (P7A-03).
+234. **A pass of the submit or upgrade job** starts one worker for each target and waits for them at most 20 s; a target
+    that is still being worked on keeps its worker, and the next passes leave it alone and work on the others (P7A-04).
+235. **The evidence of a receipt is compared with the record** before the record becomes anchored: for a WORM object
+    the key (`<aggregate id>/<size>[.g<generation>].note`), the SHA-256 and the length of the stored note; for OpenTimestamps the
+    digest; for a time-stamp token its message imprint. A difference fails the record for good with the code
+    `evidence_mismatch` (P7A-05).
+236. **One answer of another chain id** does not retire a chain log. The same new id must answer in every round for as
+    long as a database must be missing to count as vanished (30 minutes by default); an alert is raised from the first
+    answer, the group counts as unread meanwhile, and an answer of the real chain ends the wait. The clock is in memory:
+    a restart or a change of leader starts it again, the safe direction (P7A-06, P7A-16).
+237. **The result of a call is applied only to the target it was made for:** the write carries the revision of the target
+    that the client was built from and is dropped when the target was changed, switched off or deleted since (P7A-07).
+238. **A failed record is not an alert once a newer checkpoint of the same log is anchored for the target**, and a Retry of a
+    record that a newer record replaced is refused with 409 (P7A-08).
+239. **The evidence file `json` is served for an anchored record only** (404 for another state), with the time of the
+    anchoring as `created_at`; the format `ots` is served for any record that has evidence, its content says what it proves (P7A-09).
+240. **The redactor removes a secret in its URL-escaped, hexadecimal and base64 forms**, and the base64 of `user:password` of
+    a time-stamp authority (the pair is a secret of its own). A credential member is at least four characters, the length
+    below which the redactor ignores a value; a stored file with a shorter member is no longer read (P7A-10).
+241. **A record of what was published that cannot be written** (a full disk, a directory that is gone, a file larger than
+    32 MiB, which was never read back) stops all signing and raises the critical alert until it is written again, which is
+    tried before the next signature is allowed. The rename is made durable with a sync of the directory (P7A-11, P7A-14).
+242. **A `credentialsPath` that cannot be used** says which of three reasons it is: the file does not exist, it can be read by group or others, or its content
+    is not the members of the kind (P7A-12).
+243. **Two enqueues of one checkpoint** are not an error: the loser of the unique key returns the record of the winner (P7A-13).
+244. **Decisions that stand (P7A-15).** `credentialsPath` and `caBundlePath` take any path the daemon can read and a failed read says
+    whether the file exists and whether it parses: the configuration of a target is for an administrator, who may already read what the
+    daemon reads through the test of a target; the contents of the file are never shown. An address written as an IP is dialled as written,
+    link-local and loopback included, as 6.8 documents; the Test of a target lets an administrator reach any host and port the
+    configuration names, which is what a target is. `kingres_readonly` reads the configuration of the targets, the last test and the
+    last error of every record: those texts hold no credential (the redactor) and the path of a credentials file is not a secret. A probe
+    object of the Test of a WORM target stays in a bucket whose default retention is a compliance one and cannot be removed; an operator
+    who tests such a bucket often leaves objects behind, and this is stated here and in the README, not prevented.
+    `anchor_minimum` is compared with the targets when a target is anchored and again when a checkpoint is anchored; the flag `anchored` of a checkpoint is
+    not computed again when the setting changes, because a flag that went from true to false would withdraw a statement that was made.
+245. **The tests that the mutants of the review asked for** (P7A-17) exist: the evidence of another database, the evidence of a record
+    that has none, the number of iterations of a sealed file, the claim of a record in a process, the thresholds of the behind warning, the start of its clock, a
+    receipt whose evidence does not read back, a call cut short by the end of the leadership, the root of a published size, an unreachable group and a damaged record.
 
 Correction 168 (an old checkpoint of a revoked key dated by an anchor) is not applied: the design must
 state which kinds of anchor may date a checkpoint, whether the comparison with the time of compromise is
