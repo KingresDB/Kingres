@@ -54,6 +54,12 @@ Covers branch p12-storage (from p12f-fix, kingres_shard 0.8 with the review fixe
   the check `get_typtype(base) != TYPTYPE_BASE` in `count_distinct.c` is redundant with the check of the extended hash function (a record has none in the type cache), so no test can tell the two apart.
 - The full suites are recorded in the section below ("Gate").
 
+### Gate of the fixes
+
+- `kingres_shard` with the fixes, in a fresh area with PostgreSQL 19.0 and 18 (clean -Werror builds with no warning, regress 23 of 23, every TAP file): 224 files, 48556 tests on 18 and 49050 on 19.  One file failed in that run, `t/273`: a statement of the new assertion read a table the role may not read (a mistake of the test); fixed, and `t/273` passes alone on both majors from a clean build.  Every other file passed.
+- The mutants of the fixes: fifteen, all killed (the first one that survived, the eager lookup, got an assertion).
+
+
 ### Decisions and deviations
 
 - **Reference tables are not columnar** (design 9.5 recommends it; the S1 row of the plan says "carry"): `create_reference_table` refuses a columnar table with `columnar_reference_table`.
