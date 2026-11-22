@@ -197,6 +197,108 @@ export const endpoints = {
         body,
       }),
     ),
+  // --- the table lifecycle of contract 0.14.0 (increment 9.7)
+  /** Turns a distributed or reference table back into a plain table; the options are query parameters. */
+  undistributeTable: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    query: {
+      cascadeViaForeignKeys?: boolean
+      targetGroupId?: number
+      mode?: S['TableChangeMode']
+      dependentViews?: S['DependentViews']
+    } = {},
+  ) =>
+    j(
+      api.DELETE('/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/distribution', {
+        params: { path: { databaseName, schemaName, tableName }, query },
+      }),
+    ),
+  alterTableDistribution: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    body: S['AlterTableDistributionRequest'],
+  ) =>
+    j(
+      api.PATCH('/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/distribution', {
+        params: { path: { databaseName, schemaName, tableName } },
+        body,
+      }),
+    ),
+  /** What a change would do, without doing it (blockers, warnings, notes, the tables it touches, an estimate). */
+  previewTableChange: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    body: S['TableChangeRequest'],
+  ) =>
+    j(
+      api.POST(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/distribution/preview',
+        { params: { path: { databaseName, schemaName, tableName } }, body },
+      ),
+    ),
+  listTablePartitions: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    q: Page = {},
+  ) =>
+    j(
+      api.GET('/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partitions', {
+        params: { path: { databaseName, schemaName, tableName }, query: { limit: 200, ...q } },
+      }),
+    ),
+  createTablePartition: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    body: S['CreateTablePartitionRequest'],
+  ) =>
+    j(
+      api.POST('/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partitions', {
+        params: { path: { databaseName, schemaName, tableName } },
+        body,
+      }),
+    ),
+  attachTablePartition: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    body: S['AttachTablePartitionRequest'],
+  ) =>
+    j(
+      api.POST(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partitions/attach',
+        { params: { path: { databaseName, schemaName, tableName } }, body },
+      ),
+    ),
+  detachTablePartition: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    partitionName: string,
+  ) =>
+    j(
+      api.POST(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partitions/{partitionName}/detach',
+        { params: { path: { databaseName, schemaName, tableName, partitionName } } },
+      ),
+    ),
+  dropTablePartition: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    partitionName: string,
+  ) =>
+    j(
+      api.DELETE(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partitions/{partitionName}',
+        { params: { path: { databaseName, schemaName, tableName, partitionName } } },
+      ),
+    ),
   listColocationGroups: (databaseName: string) =>
     j(
       api.GET('/databases/{databaseName}/colocation-groups', {

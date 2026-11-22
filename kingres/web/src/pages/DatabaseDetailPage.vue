@@ -208,7 +208,11 @@ const shardingOn = computed(() => db.value?.sharding.enabled === true)
               <tbody>
                 <tr v-for="t in tableRows" :key="JSON.stringify([t.schema, t.name])">
                   <th scope="row" class="mono">
-                    <SafeName :value="`${t.schema}.${t.name}`" :max="120" />
+                    <RouterLink
+                      :to="{ name: 'table', params: { name, schema: t.schema, table: t.name } }"
+                    >
+                      <SafeName :value="`${t.schema}.${t.name}`" :max="120" />
+                    </RouterLink>
                   </th>
                   <td>
                     <span class="row" style="gap: var(--s-1)">

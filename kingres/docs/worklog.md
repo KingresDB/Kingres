@@ -73,6 +73,35 @@ None.
 
 ---
 
+## 2026-11-22: the table page and the table dialogs of the console (phase 9, increment 9.7) moved onto the control plane of 9.6
+
+Branch web-15b (from m18) carries the one console commit of web-15 for increment 9.7, cherry-picked so that the history stays one commit. web-15 also holds the failover console of contract 0.15.0, which m18 does not have; it is not taken here.
+
+### What was done
+
+- The table page `/databases/<name>/tables/<schema>/<table>`, the dialogs distribute, undistribute, change the distribution, create, attach, detach and drop a partition, the preview panel and the task panel, from web-15.
+- The conflicts (README, browser harness, `mocks/http.ts`, `mocks/state.ts`) all came from the 0.15.0 failover console; only the 0.14.0 table parts were kept. The fixed-shape mock handlers that 9.6 put on m18 for the eight operations were replaced by the mock of 9.7 (`src/mocks/tables.ts`); the generated types, operations and problem codes are those of m18, and no stand-in type is left. A doc comment that had slipped above a new constant in `handlers.ts` was put back.
+- Checked against shard-phase9.md: each of the eight operations of 9.6 has its UI (the preview in every dialog, undistribute, alter, create, attach, detach, drop, the list of partitions). Not done as the design describes: the progress indicator on a row of the tables list and the badge on the Shards page need an `operation` field on `Table`, which contract 0.14.0 does not have; "distribute with related tables" (control plane and dialog) stays open, as the README says. The reviews in kingres/docs/reviews say nothing about the console of 9.7 (the review of increments 4 to 9 lists the console as not in the commits).
+
+### How it was checked
+
+- `npm run typecheck`, `npm run lint` (eslint and prettier) and `npm run api:check`: clean.
+- `npx vitest run`: 92 files, 1513 tests passed.
+- `npm run test:browser` (Chrome): 3 files, 46 tests passed (axe in light and dark at 1366 and 320 px, layout, content security policy), including the table route and the four table states.
+- Mutants, each caught by the tests and reverted: a blocked change no longer holds the start; the partition name limit raised by 100 bytes; "Cancel the task" shown for a task that cannot be cancelled.
+- `go test ./internal/...` on Windows: every package passes except `internal/pgconninfo`, whose test binary Windows refuses to run ("Access is denied", a build failure, repeated). No Go file is changed here. `internalapi` and `ledgersign` failed once under the load of the browser run and passed alone.
+
+### The review of the console (2026-11-22) and its fixes
+
+The independent review (docs/reviews/2026-11-22-console-phase9-7.md, no critical or high finding) had seven findings, all fixed in a second commit on web-15b: type-to-confirm and the danger tone for undistribute and alter (C97R-001); no claim that a cancelled task left the table as it was, the detail of the task shown and read again after a cancel (C97R-002); the mock switches blockme, diffme, pending, undo:<ms> and undo:fail with tests of the paused, verification-failed and pending states (C97R-003); a test that the start waits for the preview (C97R-004); a name on every group of radios (C97R-005); a test of the 57 bytes with two-byte letters (C97R-006); pending tasks hold the buttons and the page reads 200 tasks (C97R-007). The runs and the mutants are in the Fixes section of the review and in the final report of the work.
+
+### Still open
+
+- The progress indicators that need `Table.operation`; distribute with related tables.
+- Not pushed.
+
+---
+
 ## 2026-11-22: phase 11 (distributed schemas), the extension: the scale work (step 12), the review fixes and the documentation (step 15)
 
 Covers the work on branch shard-p1011 after the second review of phase 11 (the review fixes of 2026-11-21 are in the entry of that day).

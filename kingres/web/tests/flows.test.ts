@@ -320,7 +320,10 @@ describe('database detail', () => {
     await user.click(within(notes).getByRole('button', { name: /distribute table/i }))
     const dialog = await screen.findByRole('dialog', { name: /distribute public\.notes/i })
     await user.type(within(dialog).getByLabelText(/distribution column/i), 'note_id')
-    await user.click(within(dialog).getByRole('button', { name: /^distribute table$/i }))
+    // The start button waits for the preview of the change (what the sharding extension says about the table).
+    const start = within(dialog).getByRole('button', { name: /^distribute table$/i })
+    await waitFor(() => expect(start).toBeEnabled())
+    await user.click(start)
     expect(await within(dialog).findByText('Finished.')).toBeInTheDocument()
     await user.click(within(dialog).getByRole('button', { name: /^close$/i }))
     await waitFor(() =>

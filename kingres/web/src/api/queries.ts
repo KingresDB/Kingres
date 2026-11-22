@@ -16,7 +16,7 @@ import {
 } from '@tanstack/vue-query'
 import { endpoints } from './endpoints'
 import { ApiError, isRejectedCursor, isSessionLost, isUnsupported, shouldRetry } from './problem'
-import type { MetricName, MissingServer } from './types'
+import type { MetricName, MissingServer, TableChangeRequest } from './types'
 import { useAnnounce } from '@/composables/useAnnounce'
 import { mergeCompleteness } from '@/lib/partial'
 
@@ -96,6 +96,10 @@ export const keys = {
   table: (db: string, schema: string, table: string) => ['table', db, schema, table] as const,
   database: (name: string) => ['database', name] as const,
   tables: (name: string) => ['tables', name] as const,
+  tablePartitions: (db: string, schema: string, table: string) =>
+    ['tablePartitions', db, schema, table] as const,
+  tableChange: (db: string, schema: string, table: string, request: string) =>
+    ['tableChange', db, schema, table, request] as const,
   colocation: (name: string) => ['colocation', name] as const,
   buckets: (name: string, colocationId: number) => ['buckets', name, colocationId] as const,
   bucketDistribution: (name: string, colocationId?: number) =>
@@ -226,6 +230,72 @@ export const useTableDetail = (db: string, schema: string, table: string) =>
   useQuery({
     queryKey: keys.table(db, schema, table),
     queryFn: () => endpoints.getTable(db, schema, table),
+  })
+
+/** The table with its columns, read again while a change of it may be running. */
+export const useTable = (
+  db: MaybeRefOrGetter<string>,
+  schema: MaybeRefOrGetter<string>,
+  table: MaybeRefOrGetter<string>,
+) =>
+  useQuery({
+    queryKey: computed(() => keys.table(toValue(db), toValue(schema), toValue(table))),
+    queryFn: () => endpoints.getTable(toValue(db), toValue(schema), toValue(table)),
+    refetchInterval: every(POLL.normal),
+  })
+
+/** The user partitions of a table (every page; an empty list for a table that is not user-partitioned). */
+export const useTablePartitions = (
+  db: MaybeRefOrGetter<string>,
+  schema: MaybeRefOrGetter<string>,
+  table: MaybeRefOrGetter<string>,
+  enabled: MaybeRefOrGetter<boolean> = true,
+) =>
+  useQuery({
+    queryKey: computed(() => keys.tablePartitions(toValue(db), toValue(schema), toValue(table))),
+    queryFn: () =>
+      fetchAllPages((cursor) =>
+        endpoints.listTablePartitions(
+          toValue(db),
+          toValue(schema),
+          toValue(table),
+          cursor ? { cursor } : {},
+        ),
+      ),
+    enabled: computed(() => toValue(enabled)),
+    refetchInterval: every(POLL.normal),
+  })
+
+/**
+ * What a change of a table would do (`previewTableChange`), read again whenever the request changes. It reads only; a request that is
+ * not complete yet (`null`) is not sent.
+ */
+export const useTableChangePreview = (
+  db: MaybeRefOrGetter<string>,
+  schema: MaybeRefOrGetter<string>,
+  table: MaybeRefOrGetter<string>,
+  request: MaybeRefOrGetter<TableChangeRequest | null>,
+) =>
+  useQuery({
+    queryKey: computed(() =>
+      keys.tableChange(
+        toValue(db),
+        toValue(schema),
+        toValue(table),
+        JSON.stringify(toValue(request)),
+      ),
+    ),
+    queryFn: () =>
+      endpoints.previewTableChange(
+        toValue(db),
+        toValue(schema),
+        toValue(table),
+        toValue(request) as TableChangeRequest,
+      ),
+    enabled: computed(() => toValue(request) !== null),
+    retry: false,
+    staleTime: 0,
+    gcTime: 0,
   })
 
 export const useDatabase = (name: MaybeRefOrGetter<string>) =>
