@@ -147,4 +147,109 @@ for my $shape (qw(M1 M3 M4 M5 M6))
 	$c->compare_tables($sh->{table}, order_by => $sh->{order}, name => "$shape: $sh->{table} after every layout", nodes => ($shape eq 'M6' ? [0] : [0, 1, 2]));
 }
 
+# ---------------------------------------------------------------------------
+# B. a view, a view of another owner, a CHECK OPTION view, row-level security
+# ---------------------------------------------------------------------------
+# The filter of a view is not in the text of a MERGE (a MERGE has no WHERE clause) and the policies of a table are not either, so
+# these statements must never be shipped.  Each of the guards of merge.c has its own message; a test names it.
+$c->on_every_node(q{
+	CREATE ROLE vown;
+	CREATE ROLE rlsu;
+	GRANT USAGE ON SCHEMA public TO rlsu;
+});
+table(q{CREATE TABLE public.rl (id int PRIMARY KEY, v text, n int)},
+	q{; SELECT kingres.create_distributed_table('public.rl', 'id', colocate_with => 'public.t')});
+table(q{CREATE TABLE public.rlr (k int PRIMARY KEY, label text, n int)},
+	q{; SELECT kingres.create_reference_table('public.rlr')});
+$c->on_both(q{INSERT INTO public.rl SELECT g, 'rl' || g, g % 5 FROM generate_series(1, 60) g});
+$c->on_both(q{INSERT INTO public.rlr SELECT g, repeat('x', 1 + g % 3), g % 5 FROM generate_series(0, 30) g});
+# the views are made on node 1, where the statements run (a view is not propagated); the policies and grants are DDL of the cluster
+$c->on_cluster(q{
+	CREATE VIEW public.vt_plain AS SELECT * FROM public.t WHERE n < 3;
+	CREATE VIEW public.vt_barrier WITH (security_barrier) AS SELECT * FROM public.t WHERE n < 3;
+	CREATE VIEW public.vt_check AS SELECT * FROM public.t WHERE n < 3 WITH CHECK OPTION;
+	CREATE VIEW public.vr_plain AS SELECT * FROM public.rt WHERE n < 3;
+	CREATE VIEW public.vr_barrier WITH (security_barrier) AS SELECT * FROM public.rt WHERE n < 3;
+	CREATE VIEW public.vr_check AS SELECT * FROM public.rt WHERE n < 3 WITH CHECK OPTION;
+	CREATE VIEW public.vt_owner AS SELECT * FROM public.t WHERE n < 3;
+	CREATE VIEW public.vr_owner AS SELECT * FROM public.rt WHERE n < 3;
+	ALTER VIEW public.vt_owner OWNER TO vown;
+	ALTER VIEW public.vr_owner OWNER TO vown;
+	GRANT ALL ON public.vt_owner, public.vr_owner TO PUBLIC;
+});
+# row-level security and grants are not propagated for these tables (ALTER TABLE, GRANT on reference tables): by hand on every node
+$c->on_every_node(q{
+	SET kingres_shard.enable_routing = off;
+	ALTER TABLE public.rl ENABLE ROW LEVEL SECURITY;
+	CREATE POLICY rl_p ON public.rl USING (n < 3) WITH CHECK (n < 3);
+	ALTER TABLE public.rlr ENABLE ROW LEVEL SECURITY;
+	CREATE POLICY rlr_p ON public.rlr USING (n < 3) WITH CHECK (n < 3);
+	GRANT ALL ON public.rl, public.s, public.t, public.rlr, public.rf, public.loc TO rlsu;
+});
+
+my $VIEW = qr/MERGE through a view is not supported/;
+my $OWNER = qr/rights of another role/;
+my $CHECK = qr/checked against a view or a row-level security policy/;
+my $RLS = qr/the target has row-level security/;
+
+sub refused
+{
+	my ($name, $sql, $re, $table, $order, %opt) = @_;
+	my $node = $nodes[0];
+	my $pre = $opt{as} ? "SET ROLE $opt{as}; " : '';
+	my ($rd, $od, $ed) = run_sql($node, $pre . $sql);
+	isnt($rd, 0, "$name: the cluster refuses it");
+	like($ed, $re, "$name: refused by the expected guard") or diag($ed);
+	unlike($ed, qr/KS001/, "$name: and not as a stale map");
+	$c->compare_tables($table, order_by => $order, name => "$name: $table unchanged");
+}
+
+my @m1 = (
+	[ 'update', q{MERGE INTO public.__V__ USING public.s ON __V__.id = s.id WHEN MATCHED THEN UPDATE SET n = 99} ],
+	[ 'delete', q{MERGE INTO public.__V__ USING public.s ON __V__.id = s.id WHEN MATCHED THEN DELETE} ],
+	[ 'insert', q{MERGE INTO public.__V__ USING public.s ON __V__.id = s.id WHEN NOT MATCHED THEN INSERT (id, v, n) VALUES (s.id, 'x', 1)} ],
+);
+my @m3 = (
+	[ 'update', q{MERGE INTO public.__V__ USING public.loc ON __V__.id = loc.x WHEN MATCHED THEN UPDATE SET n = 99} ],
+	[ 'delete', q{MERGE INTO public.__V__ USING public.loc ON __V__.id = loc.x WHEN MATCHED THEN DELETE} ],
+	[ 'insert', q{MERGE INTO public.__V__ USING (VALUES (500, 'x')) AS l(x, y) ON __V__.id = l.x WHEN NOT MATCHED THEN INSERT (id, v, n) VALUES (l.x, l.y, 1)} ],
+);
+my @m4 = (
+	[ 'update', q{MERGE INTO public.__V__ USING public.rf ON __V__.k = rf.k WHEN MATCHED THEN UPDATE SET n = 99} ],
+	[ 'delete', q{MERGE INTO public.__V__ USING public.rf ON __V__.k = rf.k WHEN MATCHED THEN DELETE} ],
+	[ 'insert', q{MERGE INTO public.__V__ USING public.rf ON __V__.k = rf.k WHEN NOT MATCHED THEN INSERT (k, label, n) VALUES (rf.k, rf.label, 1)} ],
+);
+sub with_view { my ($sql, $v) = @_; $sql =~ s/__V__/$v/g; return $sql; }
+
+for my $case (
+	[ 'a plain view', 'vt_plain', 'vr_plain', $VIEW, $VIEW ],
+	[ 'a security_barrier view', 'vt_barrier', 'vr_barrier', $RLS, $RLS ],
+	[ 'a view WITH CHECK OPTION', 'vt_check', 'vr_check', $CHECK, $CHECK ],
+	[ 'a view of another owner', 'vt_owner', 'vr_owner', $OWNER, $OWNER ],
+)
+{
+	my ($what, $vt, $vr, $re_dist, $re_ref) = @$case;
+	# a CHECK OPTION view checks INSERT and UPDATE only: a DELETE through it is refused as any view is
+	my $re = sub { my ($act, $r) = @_; return ($what =~ /CHECK OPTION/ && $act eq 'delete') ? $VIEW : $r; };
+	for my $m (@m1) { refused("M1 through $what ($m->[0])", with_view($m->[1], $vt), $re->($m->[0], $re_dist), 'public.t', 'id'); }
+	for my $m (@m3) { refused("M3 through $what ($m->[0])", with_view($m->[1], $vt), $re->($m->[0], $re_dist), 'public.t', 'id'); }
+	for my $m (@m4) { refused("M4 through $what ($m->[0])", with_view($m->[1], $vr), $re->($m->[0], $re_ref), 'public.rt', 'k'); }
+}
+
+# a target with row-level security, written by a role that is subject to the policy, and by its owner (relrowsecurity alone refuses)
+for my $who ('rlsu', undef)
+{
+	my $w = $who // 'the owner';
+	my %opt = defined $who ? (as => $who) : ();
+	refused("M1 into a target with row-level security, $w (update)", q{MERGE INTO public.rl USING public.s ON rl.id = s.id WHEN MATCHED THEN UPDATE SET n = 1}, qr/$CHECK|$RLS/, 'public.rl', 'id', %opt);
+	refused("M1 into a target with row-level security, $w (delete)", q{MERGE INTO public.rl USING public.s ON rl.id = s.id WHEN MATCHED THEN DELETE}, qr/$CHECK|$RLS/, 'public.rl', 'id', %opt);
+	refused("M3 into a target with row-level security, $w (delete)", q{MERGE INTO public.rl USING public.loc ON rl.id = loc.x WHEN MATCHED THEN DELETE}, qr/$CHECK|$RLS/, 'public.rl', 'id', %opt);
+	refused("M3 into a target with row-level security, $w (update)", q{MERGE INTO public.rl USING public.loc ON rl.id = loc.x WHEN MATCHED THEN UPDATE SET n = 1}, qr/$CHECK|$RLS/, 'public.rl', 'id', %opt);
+	refused("M4 into a reference target with row-level security, $w (delete)", q{MERGE INTO public.rlr USING public.rf ON rlr.k = rf.k WHEN MATCHED THEN DELETE}, qr/$CHECK|$RLS/, 'public.rlr', 'k', %opt);
+	refused("M4 into a reference target with row-level security, $w (update)", q{MERGE INTO public.rlr USING public.rf ON rlr.k = rf.k WHEN MATCHED THEN UPDATE SET n = 1}, qr/$CHECK|$RLS/, 'public.rlr', 'k', %opt);
+}
+
+# the tables that these statements did not change are the single node's, and a plain table of the same rows still takes the pushed path
+like(plan_of($nodes[0], q{MERGE INTO public.t USING public.s ON t.id = s.id WHEN MATCHED THEN UPDATE SET n = 99}), qr/Pushed: colocated MERGE/, 'a MERGE into the table itself is still pushed');
+
 done_testing();

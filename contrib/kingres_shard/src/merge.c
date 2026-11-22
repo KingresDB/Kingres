@@ -225,26 +225,75 @@ mg_lookup_stable(Oid relid)
 
 #define MG_NO(msg) do { *why = (msg); return false; } while (0)
 
+/*
+ * The rewriter keeps the entry of a view in the range table of a statement written through it, next to
+ * the table it resolved to.  The filter of such a view (a plain view: the jointree; a security_barrier view:
+ * securityQuals) is not part of the text a MERGE is deparsed to (a MERGE has no WHERE clause), so a MERGE
+ * through a view would change rows the view does not show.  It is refused outright (review P12M-02); the
+ * guards below it (the owner of the view, row-level security, CHECK OPTION) stay as the first layer, so that
+ * each of them has its own message and its own test.  The name of the view, or NULL.
+ */
+static const char *
+mg_view_in_rtable(Query *q)
+{
+	ListCell   *lc;
+
+	foreach(lc, q->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+		if (rte->rtekind == RTE_RELATION && rte->relkind == RELKIND_VIEW)
+			return get_rel_name(rte->relid);
+	}
+	return NULL;
+}
+
+#define MG_NO_VIEW(q) \
+	do { \
+		const char *vname_ = mg_view_in_rtable(q); \
+		if (vname_ != NULL) \
+			MG_NO(psprintf("MERGE through a view is not supported (the statement was written through view \"%s\")", vname_)); \
+	} while (0)
+
+/*
+ * What the deparsed text of a MERGE cannot carry about its target: the policies of row-level security and the
+ * CHECK OPTION of a view (withCheckOptions), the filter of a row-level security policy or of a security_barrier
+ * view (securityQuals), the rights of the owner of a view (checkAsUser), and the view itself (its filter, in
+ * the jointree, is not a clause of a MERGE).  Every shape that ships the statement or a text made of it (M1, M3,
+ * M4, M5) asks this first, on the statement as the user wrote it: the shapes M4 and M5 are tried one after the
+ * other, and a refusal of M4 must not let M5 build a text that has lost the filter (review P12M-02).  Each
+ * guard has its own message, so that a test can tell which one refused.
+ */
+static bool
+mg_target_guards(Query *q, RangeTblEntry *trte, const char **why)
+{
+	RTEPermissionInfo *tperm;
+
+	if (q->withCheckOptions != NIL)
+		MG_NO("the rows are checked against a view or a row-level security policy");
+	if (trte->securityQuals != NIL || mg_relation_has_rls(trte->relid))
+		MG_NO("the target has row-level security");
+	tperm = getRTEPermissionInfo(q->rteperminfos, trte);
+	if (OidIsValid(tperm->checkAsUser) && tperm->checkAsUser != GetUserId())
+		MG_NO("the target is written with the rights of another role (a view of another owner)");
+	MG_NO_VIEW(q);
+	return true;
+}
+
 static bool
 merge_common(Query *q, const KsDistTable *tdt, const char **why)
 {
 	RangeTblEntry *trte = rt_fetch(q->resultRelation, q->rtable);
-	RTEPermissionInfo *tperm;
 	ListCell   *lc;
 
 	if (q->cteList != NIL || q->hasRecursive || q->hasModifyingCTE)
 		MG_NO("it has a WITH clause");
 	if (q->hasSubLinks)
 		MG_NO("it has a sub-select in an expression (ON, a WHEN condition, SET, VALUES or RETURNING)");
-	if (q->withCheckOptions != NIL)
-		MG_NO("the rows are checked against a view or a row-level security policy");
 	if (trte->rtekind != RTE_RELATION || trte->relkind != RELKIND_PARTITIONED_TABLE)
 		MG_NO("its target is not a partitioned (distributed) table");
-	if (trte->securityQuals != NIL || mg_relation_has_rls(trte->relid))
-		MG_NO("the target has row-level security");
-	tperm = getRTEPermissionInfo(q->rteperminfos, trte);
-	if (OidIsValid(tperm->checkAsUser) && tperm->checkAsUser != GetUserId())
-		MG_NO("the target is written with the rights of another role (a view of another owner)");
+	if (!mg_target_guards(q, trte, why))
+		return false;
 	if (mg_target_has_user_code(trte->relid))
 		MG_NO("the target has a trigger or a rule, which would run on the shard groups");
 	if (!mg_unique_indexes_carry_key(trte->relid, tdt->dist_attno, tdt->coloc->collation))
@@ -313,12 +362,22 @@ merge_join_type(Query *q, bool *nmbt, bool *nmbs)
 static Query *
 merge_as_select(Query *m)
 {
-	Query	   *s = copyObject(m);
-	JoinExpr   *j = makeNode(JoinExpr);
-	RangeTblRef *tr = makeNode(RangeTblRef);
+	Query	   *s;
+	JoinExpr   *j;
+	RangeTblRef *tr;
 	bool		nmbt;
 	bool		nmbs;
 
+	/*
+	 * The filter of a view that the statement was written through is in jointree->quals or in securityQuals,
+	 * and this SELECT has neither: it must never be built for such a statement (merge_common refuses it first;
+	 * this is the second layer, review P12M-02).
+	 */
+	if (mg_view_in_rtable(m) != NULL)
+		return NULL;
+	s = copyObject(m);
+	j = makeNode(JoinExpr);
+	tr = makeNode(RangeTblRef);
 	j->jointype = merge_join_type(m, &nmbt, &nmbs);
 	tr->rtindex = m->resultRelation;
 	j->larg = (Node *) tr;
@@ -705,6 +764,9 @@ kingres_shard_merge_build_ship(Query *q, const KsMerge *m, KsMergeShip *sh, cons
 	int			i;
 
 	memset(sh, 0, sizeof(*sh));
+	/* the text below is deparsed from the statement, which cannot carry these (the callers ask too; this is the layer under them) */
+	if (!mg_target_guards(q, rt_fetch(q->resultRelation, q->rtable), why))
+		return false;
 	vtype = palloc0(sizeof(Oid) * (natts + 1));
 	vtypmod = palloc0(sizeof(int32) * (natts + 1));
 	vcoll = palloc0(sizeof(Oid) * (natts + 1));
@@ -1432,10 +1494,8 @@ kingres_shard_merge_ref_fragment_analyze(Query *q, int *nshipped, const char **w
 		MG_NO("its target is not a reference table");
 	if (q->cteList != NIL || q->hasRecursive || q->hasModifyingCTE)
 		MG_NO("it has a WITH clause");
-	if (q->withCheckOptions != NIL)
-		MG_NO("the rows are checked against a view or a row-level security policy");
-	if (trte->securityQuals != NIL || mg_relation_has_rls(trte->relid))
-		MG_NO("the target has row-level security");
+	if (!mg_target_guards(q, trte, why))
+		return false;
 	if (mg_target_has_user_code(trte->relid))
 		MG_NO("the target has a trigger or a rule, which would run on every node");
 	foreach(lc, q->rtable)
@@ -1518,6 +1578,17 @@ kingres_shard_merge_classify_ref(Query *parse, KsMerge *m)
 	m->target_relid = trte->relid;
 	m->target_rti = parse->resultRelation;
 	m->relids = merge_relids(parse);
+
+	/*
+	 * What the text cannot carry about the target (a view and its filter, row-level security, CHECK OPTION) is
+	 * asked on the statement as written, before M4 and M5 are tried one after the other: a refusal of M4 must
+	 * not let M5 build a text that has lost the filter of the view or the policy (review P12M-02).
+	 */
+	if (!mg_target_guards(parse, trte, &why4))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("this MERGE into reference table \"%s\" cannot be run on every node", get_rel_name(trte->relid)),
+				 errdetail("%s.", why4)));
 
 	/* M4: the statement as written runs on every node */
 	if (kingres_shard_merge_ref_fragment_analyze(parse, &nsh, &why4) && nsh == 0)
