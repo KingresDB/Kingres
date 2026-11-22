@@ -1410,7 +1410,7 @@ kingres_shard_merge_collect(const char *source_sql, ParamListInfo params, int nc
 				bool		isnull = true;
 				Datum		kd = (Datum) 0;
 				int			bucket;
-				int			g;
+				int			g = -1;
 				MgShare    *share = NULL;
 				int			j;
 
@@ -1437,8 +1437,16 @@ kingres_shard_merge_collect(const char *source_sql, ParamListInfo params, int nc
 						break;
 					}
 				}
+				/*
+				 * The group of the row is not one of the groups the statement was planned for: the bucket map
+				 * changed since the plan (review P12M-03).  The row cannot be dropped, which would be a wrong
+				 * answer; the statement stops before any group has run (KS001, as the placement checks do).
+				 */
 				if (share == NULL)
-					continue;
+					ereport(ERROR,
+							(errcode(ERRCODE_KINGRES_STALE_MAP),
+							 errmsg("the bucket map changed while the source of a MERGE was read (group %d now owns a bucket of the key, and it was not a target of the statement)", g),
+							 errhint("A bucket moved between shard groups; nothing was changed.  Repeat the statement.")));
 				for (j = 0; j < ncols; j++)
 				{
 					bool		cnull;

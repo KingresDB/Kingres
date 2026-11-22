@@ -16,6 +16,8 @@
 #      planned before a move
 #   E. (review P12M-04) the same faults for the MERGE into a reference table (M4, M5): an error at every point, a cancel, a node that
 #      dies, an origin that dies; nothing is prepared and every node's copy is the state before or the state after
+#   F. (review P12M-03) a bucket that moves to a group that was not a target: after the source was read (only the origin's own group
+#      runs) and before it is read (the source row of a group that was not planned)
 
 use strict;
 use warnings FATAL => 'all';
@@ -96,10 +98,11 @@ sub bucket_of
 # Run $stmt on node 1 up to the fault point; run $during; let it go; returns (out, err).
 sub with_gate
 {
-	my ($n1, $point, $stmt, $during, $tag, $pre) = @_;
+	my ($n1, $point, $stmt, $during, $tag, $pre, $mode) = @_;
+	$mode //= 'wait';
 	my $gate = "$tmp/gate_mf_$tag";
 	append_to_file($gate, 'x');
-	my $sess = start_psql($n1, ($pre // '') . " SET kingres_shard.fault_injection = '$point:wait:$gate'; $stmt");
+	my $sess = start_psql($n1, ($pre // '') . " SET kingres_shard.fault_injection = '$point:$mode:$gate'; $stmt");
 	ok(wait_for_fault_file("$gate.reached", 60), "the statement waits at $point ($tag)");
 	$during->();
 	unlink $gate;
@@ -411,6 +414,48 @@ for my $shape (['colocated', $M1], ['routed', $M3])
 		$r1->safe_psql('postgres', 'DELETE FROM public.rdst');
 	}
 	release_node($_) for @rn;
+}
+
+# ---------------------------------------------------------------------------
+# F. a bucket moves to a group that was not a target (review P12M-03)
+# ---------------------------------------------------------------------------
+# Group 2 is emptied first (its buckets go to group 1), so no bucket of the colocation group is on it; then a bucket of group 1 moves
+# to group 2 while the statement waits.  A statement planned before the move cannot be right about that bucket: it fails with the
+# retryable error and changes nothing.
+#   first_group: the point after the source was read; the source holds keys of group 0 only (this node), so group 1 is skipped, and
+#                the statement runs on the origin's own group only
+#   collect:     the point before the source is read; the source holds two keys of the bucket that moves, whose group is now one
+#                that the statement was not planned for
+for my $kind (['first_group', 'merge_before_first_group'], ['collect', 'merge_before_collect'])
+{
+	my ($tag, $point) = @$kind;
+	my @m = setup3("mz$tag", logical => 1);
+	my $m1 = $m[0];
+	my $b2 = $m1->safe_psql('postgres', "SELECT string_agg(bucket::text, ' ') FROM kingres.bucket_map WHERE colocation_id = $SRC_COLOC AND group_id = 2");
+	$m1->safe_psql('postgres', "SELECT kingres.move_bucket($SRC_COLOC, $_, 1)") for split / /, $b2;
+	is($m1->safe_psql('postgres', "SELECT count(*) FROM kingres.bucket_map WHERE colocation_id = $SRC_COLOC AND group_id = 2"), 0,
+		"$tag: group 2 owns no bucket of the colocation group");
+	my $victim = bucket_of($m1, 1);
+	my @k0 = KingresShardTest::keys_of_group($m1, $SRC_COLOC, 0, 3, 1);
+	my @kv;
+	if ($tag eq 'collect')
+	{
+		my $keys = $m1->safe_psql('postgres', "SELECT string_agg(g::text, ' ') FROM (SELECT g FROM generate_series(1, 1000) g WHERE kingres.bucket_for($SRC_COLOC, g) = $victim ORDER BY g LIMIT 2) q");
+		@kv = split / /, $keys;
+	}
+	my $list = join(', ', map { "($_, 'k$_')" } (@k0, @kv));
+	my $stmt = qq{MERGE INTO public.dst USING (VALUES $list) AS v(k, name) ON dst.id = v.k WHEN NOT MATCHED THEN INSERT (id, v) VALUES (v.k, v.name)};
+	like(plan_of($m1, $stmt), qr/Pushed: MERGE with a routed source/, "$tag: the statement is a MERGE with a routed source");
+	my ($out, $err) = with_gate($m1, $point, $stmt, sub { $m1->safe_psql('postgres', "SELECT kingres.move_bucket($SRC_COLOC, $victim, 2)") },
+		"z$tag", '', $tag eq 'collect' ? 'waitinv' : 'wait');
+	like($err, $KS, "$tag: the statement fails with the retryable error");
+	like($err, qr/the bucket map changed while the source of a MERGE was read/,
+		"$tag: it is the check of the source rows (a row of a group that was not planned is never dropped)") if $tag eq 'collect';
+	clean_state(\@m, 'public.dst', 0, "$tag: after the failed statement");
+	my ($rc, $o2, $e2) = run_sql($m1, $stmt);
+	is($rc, 0, "$tag: the statement repeated is planned with the new map and works") or diag($e2);
+	clean_state(\@m, 'public.dst', scalar(@k0) + scalar(@kv), "$tag: after the repeat");
+	release_node($_) for @m;
 }
 
 done_testing();

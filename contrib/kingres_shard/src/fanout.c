@@ -1201,6 +1201,8 @@ run_all(KsFanoutState *s)
 	{
 		List	   *gids = NIL;
 
+		/* the window between the check of the placement at the start and the read of the source (review P12M-03) */
+		kingres_shard_fault_point("merge_before_collect");
 		foreach(lc, s->targets)
 			gids = lappend_int(gids, ((KsFanTarget *) lfirst(lc))->group_id);
 		shares = kingres_shard_merge_collect(strVal(list_nth(s->mergeinfo, FO_MI_SOURCE_SQL)), params,
