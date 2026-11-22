@@ -42,10 +42,27 @@ Covers branch shard-p12, rebased onto the staging branch m18 (kingres-18 with th
 - M3 and M5 need the source to be one relation (a join in `USING` goes in a sub-select); M1 accepts a join of colocated tables.  A key restriction in `ON` does not prune the groups of M1 (always correct).
 - A NULL route key is hashed like a NULL in the row router and in tuple routing, which is the design's slot-0 rule without a special case.
 
+### The fixes for the review
+
+The independent review of this branch ([2026-11-22-kingres-shard-phase12-joins-merge.md](reviews/2026-11-22-kingres-shard-phase12-joins-merge.md);
+the repartitioned join held, MERGE had one silent wrong answer) is fixed on branch p12-fix, one commit for each finding, each with a test that fails
+without it (the section "Fixes" of the review lists the commits, the tests and the mutants).  P12M-01: a prepared MERGE that declares a parameter it does not
+use no longer shifts the arrays of a shipped source (the origin sends the parameters that the text uses, then the arrays; `t/268` section A, nine types in
+three positions for M1, M3, M4, M5 and M6).  P12M-02: a MERGE through a view is refused explicitly, and the guards for the target (CHECK OPTION, row-level
+security, view owner, view) run on the statement as written for every shape.  The fixing found a case that the review had not: a security_barrier view over a
+reference table was accepted by M5 after M4 had refused it, and the text of M5 has no filter, so every node changed rows that the view hides; the guards
+now run before M4 and M5 are tried.  P12M-03: a source row of a group that is not a planned target is KS001, not dropped (new fault point
+`merge_before_collect`).  P12M-04: the merge fault points fire for M4 and M5 (`t/266` section E).  P12M-05: two stale README passages.  P12M-06: the refusal for
+a stable default names the column.  P12J-01: `repartition_max_bytes` is capped at 512MB.  P12J-02: the group-side rule for a preserved moved side is pinned
+by forged fragments (`t/261` section G).  Not changed, and open: M5 takes the writer lock of every relation of the statement on every node, so a local source
+that exists on one node only is refused with "reference table ... does not exist on this node" (a refusal, not a wrong answer; the lock names should come from
+the reference tables only).
+
 ### Still open
 
 - The four items above that are not built.
-- An independent review of this branch.
+- An independent review of the fixes of the review of this branch.
+- M5 and a local source that does not exist on every node (see the fixes above).
 - Integration with phase 10's scheduler and the control plane of cp-1011 (`MERGE` and the repartitioned join add no REST surface).
 
 ### Core patches
