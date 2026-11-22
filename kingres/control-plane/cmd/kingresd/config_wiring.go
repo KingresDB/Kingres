@@ -28,7 +28,7 @@ type configParts struct {
 // without an internal API: the cluster is then this server alone and no call leaves the process.
 func newConfigParts(svc *cluster.Service, self string, log *slog.Logger, members *membership.Manager, opsSvc *ops.Ops, hook *fault.Hook) *configParts {
 	// The wall clock is the one the fault hook of the tests steps (nil hook: the real clock).
-	agent := &pgconfig.Agent{Svc: svc, Self: self, Log: log, Now: clock.Stepped{Base: clock.NewReal(), Offset: hook.ClockOffset}.Wall}
+	agent := &pgconfig.Agent{Svc: svc, Self: self, Log: log, Now: clock.Stepped{Base: clock.NewReal(), Offset: hook.ClockOffset}.Wall, Lifecycle: configLifecycle{opsSvc}}
 	sys := func(ctx context.Context, f func(c *pgx.Conn) error) error {
 		c, err := svc.ServiceConn(ctx, sysdb.Database)
 		if err != nil {
@@ -69,4 +69,12 @@ func (p *configParts) start(d *haDeps, calls *callTable) {
 	}
 	d.WG.Add(1)
 	go func() { defer d.WG.Done(); p.leader.Run(d.BG) }()
+}
+
+// configLifecycle lets the configuration agent restart an instance through the instance lifecycle of the
+// operations code (P13R-06).
+type configLifecycle struct{ o *ops.Ops }
+
+func (c configLifecycle) BeginRestart(ctx context.Context, id int) (func(context.Context, error), error) {
+	return c.o.BeginConfigRestart(ctx, id)
 }

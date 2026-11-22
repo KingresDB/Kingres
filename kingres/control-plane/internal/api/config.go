@@ -69,6 +69,10 @@ type ConfigChangeItem struct {
 // ConfigChangeRequest is the body of previewConfigChange and applyConfigChange.
 type ConfigChangeRequest struct {
 	Changes []ConfigChangeItem `json:"changes"`
+	// ExpectedRevision is the configuration revision the client saw (0.17.0). applyConfigChange refuses with 409
+	// config_change_superseded when a value it changes was changed by a later revision and does not already hold the
+	// wanted value; previewConfigChange ignores it.
+	ExpectedRevision *int64 `json:"expectedRevision,omitempty"`
 }
 
 // ConfigProblem says why one change is not valid.

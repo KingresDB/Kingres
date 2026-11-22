@@ -66,6 +66,24 @@ func (l *Leader) check(ctx context.Context, sn *snapshot, req api.ConfigChangeRe
 	for i, c := range req.Changes {
 		bad := func(field, code, msg string) { out.problems = append(out.problems, prob(i, field, code, msg)) }
 		name := strings.ToLower(strings.TrimSpace(c.Name))
+		// A stored value can always be removed, whatever the parameter has become since it was set: a name that
+		// an upgrade made managed or refused, a server group or database that is gone (P13R-05).
+		if c.Value == nil && (c.Level == LevelCluster || c.ScopeID != nil) {
+			sc := ""
+			if c.Level != LevelCluster {
+				sc = *c.ScopeID
+			}
+			if hasStored(sn.values, name, c.Level, sc) {
+				key := name + "|" + c.Level + "|" + sc
+				if seen[key] {
+					bad("", "config_value_invalid", "The request changes "+trunc(name)+" twice at the same level.")
+					continue
+				}
+				seen[key] = true
+				out.changes = append(out.changes, change{Name: name, Level: c.Level, Scope: sc})
+				continue
+			}
+		}
 		meta, ok := sn.metaBy[name]
 		if !ok {
 			bad("/name", "config_parameter_unknown", "PostgreSQL on this server has no parameter "+trunc(c.Name)+".")
@@ -144,6 +162,15 @@ func (l *Leader) check(ctx context.Context, sn *snapshot, req api.ConfigChangeRe
 	return out, nil
 }
 
+func hasStored(rows []valueRow, name, level, scope string) bool {
+	for _, v := range rows {
+		if v.Name == name && v.Level == level && v.Scope == scope {
+			return true
+		}
+	}
+	return false
+}
+
 // asProblem turns the first problem of a refused request into the API's answer.
 func asProblem(ps []api.ConfigProblem) error {
 	if len(ps) == 0 {
@@ -204,7 +231,10 @@ func (l *Leader) Preview(ctx context.Context, req api.ConfigChangeRequest) (api.
 	out.Warnings = append(out.Warnings, reservedWarnings(sn, after, ck.changes, identity)...)
 	restart := map[string]bool{}
 	for _, name := range changedNames(ck.changes) {
-		meta := sn.metaBy[name]
+		meta, known := sn.metaBy[name]
+		if !known {
+			continue // the removal of a stored value of a parameter PostgreSQL no longer has
+		}
 		for _, s := range sn.servers {
 			e := effect(sn, meta, s, sn.values, after, ck.changes)
 			if e.TakesEffect == "unchanged" && !touchedAt(ck.changes, name, s) {
@@ -398,10 +428,10 @@ func restartOrder(sn *snapshot, servers map[string]bool, want map[string]map[str
 		}
 	}
 	for _, id := range sortedKeys(servers) {
-		add(id, 1, "primary", 0)
+		add(id, 1, roleAt(sn, id, 1, "primary"), 0)
 		for _, p := range sn.pairs {
 			if p.Server == id {
-				add(id, p.InstanceID, "standby", p.Group)
+				add(id, p.InstanceID, roleAt(sn, id, p.InstanceID, "standby"), p.Group)
 			}
 		}
 	}
@@ -410,15 +440,19 @@ func restartOrder(sn *snapshot, servers map[string]bool, want map[string]map[str
 	conflict := ""
 	for _, p := range sn.pairs {
 		si, sok := idx[node{p.Server, p.InstanceID}]
-		pi, pok := idx[node{p.PrimaryServer, 1}]
+		psrv, pinst := primaryNode(sn, p)
+		if psrv == p.Server && pinst == p.InstanceID {
+			continue // the standby was promoted: it has no primary above it
+		}
+		pi, pok := idx[node{psrv, pinst}]
 		if !sok && !pok {
 			continue
 		}
 		up, down := false, false
 		var names []string
 		for _, name := range fiveSettings {
-			ws, wp := want[name][p.Server], want[name][p.PrimaryServer]
-			cs, cp := current(sn, p.Server, p.InstanceID, name), current(sn, p.PrimaryServer, 1, name)
+			ws, wp := want[name][p.Server], want[name][psrv]
+			cs, cp := current(sn, p.Server, p.InstanceID, name), current(sn, psrv, pinst, name)
 			if wp == nil {
 				wp = cp
 			}
@@ -440,7 +474,7 @@ func restartOrder(sn *snapshot, servers map[string]bool, want map[string]map[str
 		switch {
 		case up && down:
 			conflict = fmt.Sprintf("For the standby of shard group %d on %s and its primary on %s, %s change in different directions; change them one direction at a time.",
-				p.Group, p.Server, p.PrimaryServer, strings.Join(names, ", "))
+				p.Group, p.Server, psrv, strings.Join(names, ", "))
 		case up && sok && pok:
 			edges[si] = append(edges[si], pi)
 		case down && sok && pok:
@@ -570,4 +604,33 @@ func sortChanges(cs []change) {
 		}
 		return cs[i].Scope < cs[j].Scope
 	})
+}
+
+// primaryNode is the server and the instance that run the primary above a standby now. The pair records the
+// server that ran the group's primary when the standby was created; after a failover the primary is the promoted
+// standby on another server, and its instance is the one the standby record of that server names (instance 1
+// when the server never held a standby of the group) (P13R-06).
+func primaryNode(sn *snapshot, p standbyPair) (string, int) {
+	srv := p.PrimaryServer
+	if cur := sn.primaries[p.Group]; cur != "" {
+		srv = cur
+	}
+	for _, q := range sn.pairs {
+		if q.Group == p.Group && q.Server == srv {
+			return srv, q.InstanceID
+		}
+	}
+	return srv, 1
+}
+
+// roleAt is the role an instance has now, as its server reports it; def when the server did not answer.
+func roleAt(sn *snapshot, server string, inst int, def string) string {
+	if st := sn.states[server]; st != nil {
+		for _, in := range st.Instances {
+			if in.ID == inst && in.Role != "" {
+				return in.Role
+			}
+		}
+	}
+	return def
 }

@@ -132,6 +132,7 @@ func TestConfigValueRejectedByPostgreSQLInTheFileRestoresTheFile(t *testing.T) {
 func TestConfigDatabaseTimeZoneReachesTheStandbys(t *testing.T) {
 	c := sharedCluster(t)
 	leader := c.Nodes[0]
+	zone := otherZone(t, show(t, leader, "postgres", "TimeZone")) // not the zone of the host, or the test proves nothing
 	mkDB(t, leader, "cfgtzs")
 	t.Cleanup(func() {
 		body := leader.Expect(202, "DELETE", "/databases/cfgtzs", nil)
@@ -149,7 +150,7 @@ func TestConfigDatabaseTimeZoneReachesTheStandbys(t *testing.T) {
 		}
 		return len(standbys) > 0
 	})
-	cfgApplyDone(t, leader, cfgChange("TimeZone", "database", "cfgtzs", "Asia/Tehran"))
+	cfgApplyDone(t, leader, cfgChange("TimeZone", "database", "cfgtzs", zone))
 	t.Cleanup(func() { cfgApplyDone(t, leader, cfgChange("TimeZone", "database", "cfgtzs", nil)) })
 	for _, s := range standbys {
 		n := nodeOf(c, s.server)
@@ -167,7 +168,7 @@ func TestConfigDatabaseTimeZoneReachesTheStandbys(t *testing.T) {
 			if err := conn.QueryRow(context.Background(), `SELECT pg_is_in_recovery(), current_setting('TimeZone')`).Scan(&recovery, &tz); err != nil {
 				return false
 			}
-			return recovery && tz == "Asia/Tehran"
+			return recovery && tz == zone
 		})
 	}
 }
@@ -205,7 +206,7 @@ func TestConfigPreviewWarnings(t *testing.T) {
 		}
 	}
 	// A parameter that is not a memory size is never unusual.
-	if pv := preview(cfgChange("statement_timeout", "cluster", "", "24h"), cfgChange("random_page_cost", "cluster", "", "900")); pv["valid"] != true || len(codes(pv)) != 0 {
+	if pv := preview(cfgChange("autovacuum_naptime", "cluster", "", "24h"), cfgChange("random_page_cost", "cluster", "", "900")); pv["valid"] != true || len(codes(pv)) != 0 {
 		t.Errorf("a time and a real: %v", pv)
 	}
 	// Removing a value warns about nothing.

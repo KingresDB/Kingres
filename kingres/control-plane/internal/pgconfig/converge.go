@@ -19,9 +19,9 @@ const (
 	maxRetryAfter = 10 * time.Minute
 )
 
-// Run is the leader's loop that brings servers up to date. A server that was down during a change
-// is already waited for by the task of that change (it never gives up); this loop covers the rest:
-// a new server, a server that moved to another server group, a hand-edited file.
+// Run is the leader's loop that brings servers up to date. A task of a change does not wait for a server that
+// is down (P13R-03): it records the server as waiting and ends, and this loop brings the server up to date when it
+// answers again. It also covers a new server, a server that moved to another server group and a hand-edited file.
 func (l *Leader) Run(ctx context.Context) {
 	last := map[string]attempt{}
 	t := time.NewTicker(convergeEvery)
@@ -52,7 +52,7 @@ func (l *Leader) Run(ctx context.Context) {
 		for _, s := range sn.servers {
 			st := sn.states[s.ID]
 			if st == nil {
-				continue // unreachable servers are the business of the task that waits for them
+				continue // an unreachable server is brought up to date by a later round, when it answers
 			}
 			req, err := l.buildRequest(ctx, s.ID)
 			if err != nil {

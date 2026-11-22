@@ -36,44 +36,77 @@ func (l *Leader) busy(ctx context.Context) bool {
 
 // StartApply checks a request and starts the task config.apply. Nothing is written before every
 // change has passed.
-func (l *Leader) StartApply(ctx context.Context, actor string, req api.ConfigChangeRequest, reverts int64) (task.Task, error) {
+func (l *Leader) StartApply(ctx context.Context, actor string, req api.ConfigChangeRequest, reverts int64) (task.Task, ApplyInfo, error) {
 	sn, err := l.snapshot(ctx)
 	if err != nil {
-		return task.Task{}, serviceDown(err)
+		return task.Task{}, ApplyInfo{}, serviceDown(err)
 	}
 	ck, err := l.check(ctx, sn, req)
 	if err != nil {
-		return task.Task{}, wrapProblem(err)
+		return task.Task{}, ApplyInfo{}, wrapProblem(err)
 	}
 	if err := asProblem(ck.problems); err != nil {
-		return task.Task{}, err
+		return task.Task{}, ApplyInfo{}, err
+	}
+	if req.ExpectedRevision != nil {
+		if err := l.checkExpected(ctx, sn, ck.changes, *req.ExpectedRevision); err != nil {
+			return task.Task{}, ApplyInfo{}, err
+		}
 	}
 	if l.busy(ctx) {
-		return task.Task{}, problem.New(problem.OperationInProgress, "Another configuration task is still running.")
+		return task.Task{}, ApplyInfo{}, problem.New(problem.OperationInProgress, "Another configuration task is still running.")
 	}
 	sortChanges(ck.changes)
 	var servers []string
 	for _, s := range sn.servers {
 		servers = append(servers, s.ID)
 	}
-	return l.StartTask(ctx, KindApply, SubjectType, SubjectApply, applyInput{Changes: ck.changes, Actor: actor, Servers: servers, Reverts: reverts}, actor)
+	info := ApplyInfo{Changes: describe(sn.values, ck.changes), Servers: servers, BasedOn: sn.rev}
+	t, err := l.StartTask(ctx, KindApply, SubjectType, SubjectApply, applyInput{Changes: ck.changes, Actor: actor, Servers: servers, Reverts: reverts}, actor)
+	return t, info, err
+}
+
+// checkExpected refuses a request that would overwrite a change the client has not seen: a value it changes was
+// changed by a revision later than the one the client saw, and does not hold the wanted value already (P13R-11).
+func (l *Leader) checkExpected(ctx context.Context, sn *snapshot, cs []change, expected int64) error {
+	for _, c := range cs {
+		last, err := l.st.lastRevision(ctx, c.Level, c.Scope, c.Name)
+		if err != nil {
+			return serviceDown(err)
+		}
+		if last <= expected {
+			continue
+		}
+		var cur *string
+		for _, v := range sn.values {
+			if v.Name == c.Name && v.Level == c.Level && v.Scope == c.Scope {
+				x := v.Value
+				cur = &x
+			}
+		}
+		if (cur == nil) == (c.Value == nil) && (cur == nil || *cur == *c.Value) {
+			continue
+		}
+		return problem.New(problem.ConfigChangeSuperseded, fmt.Sprintf("%s was changed by revision %d after the one you saw (%d); look at it again.", c.Name, last, expected))
+	}
+	return nil
 }
 
 // StartRevert starts the change that puts a value back to what it was before a change.
-func (l *Leader) StartRevert(ctx context.Context, actor string, id int64) (task.Task, error) {
+func (l *Leader) StartRevert(ctx context.Context, actor string, id int64) (task.Task, ApplyInfo, error) {
 	row, err := l.st.change(ctx, id)
 	if err != nil {
 		if errors.Is(err, errNoChange) {
-			return task.Task{}, ErrNoSuchChange
+			return task.Task{}, ApplyInfo{}, ErrNoSuchChange
 		}
-		return task.Task{}, err
+		return task.Task{}, ApplyInfo{}, err
 	}
 	latest, err := l.st.latestChange(ctx, row.Level, row.Scope, row.Name)
 	if err != nil {
-		return task.Task{}, err
+		return task.Task{}, ApplyInfo{}, err
 	}
 	if latest != row.ID {
-		return task.Task{}, problem.New(problem.ConfigChangeSuperseded, "A later change touched the same value; revert that one first.")
+		return task.Task{}, ApplyInfo{}, problem.New(problem.ConfigChangeSuperseded, "A later change touched the same value; revert that one first.")
 	}
 	item := api.ConfigChangeItem{Name: row.Name, Level: row.Level, Value: row.Old}
 	if row.Level != LevelCluster {
@@ -128,6 +161,9 @@ func (l *Leader) stepValidate(ctx context.Context, in applyInput) error {
 	}
 	var req api.ConfigChangeRequest
 	for _, c := range in.Changes {
+		if c.Value == nil && !hasStored(sn.values, c.Name, c.Level, c.Scope) {
+			continue // the removal is done already (a retry of a task that recorded its change)
+		}
 		it := api.ConfigChangeItem{Name: c.Name, Level: c.Level, Value: c.Value}
 		if c.Level != LevelCluster {
 			it.ScopeID = strp(c.Scope)
@@ -139,7 +175,7 @@ func (l *Leader) stepValidate(ctx context.Context, in applyInput) error {
 		return err
 	}
 	if len(ck.problems) > 0 {
-		return fmt.Errorf("validation_failed: %s", ck.problems[0].Message)
+		return &taskError{code: "validation_failed", msg: ck.problems[0].Message}
 	}
 	return nil
 }
@@ -240,6 +276,12 @@ func (l *Leader) buildRequest(ctx context.Context, server string) (ApplyRequest,
 		Replicas: l.st.setting(ctx, "replica.default", 1)}
 	byName := map[string][]Override{}
 	for _, v := range vals {
+		if Dropped(v.Name) {
+			// A stored value of a name that has become managed or refused is not sent: the operator removes it
+			// (the preview of its removal is accepted). It must not keep any server from being configured.
+			l.Log.Warn("a stored configuration value is no longer settable and is not applied", "parameter", v.Name, "level", v.Level, "scope", v.Scope)
+			continue
+		}
 		if v.Level == LevelDatabase {
 			if req.Databases[v.Scope] == nil {
 				req.Databases[v.Scope] = map[string]string{}
@@ -257,52 +299,42 @@ func (l *Leader) buildRequest(ctx context.Context, server string) (ApplyRequest,
 	return req, nil
 }
 
+// stepApply brings one server to the stored configuration. It tries once: a server that cannot be reached is
+// recorded as waiting and the task goes on to the next server, so that a stopped server in the middle neither
+// keeps the later servers from the change nor keeps every later change out (P13R-03). The leader's convergence
+// loop brings the waiting server up to date when it answers again.
 func (l *Leader) stepApply(ctx context.Context, env *task.Env, server string) error {
-	announced := false
-	for {
-		req, err := l.buildRequest(ctx, server)
-		if err != nil {
-			return err
-		}
-		var res ApplyResponse
-		cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-		err = l.callServer(cctx, server, CallApply, req, &res)
-		cancel()
-		if err == nil {
-			st := serverState{Server: server, Revision: res.Revision, State: res.State, Detail: res.Detail, Errors: map[string]string{}}
-			for _, p := range res.Parameters {
-				if p.State == StateFailed {
-					st.Errors[p.Name] = p.Error
-				}
-			}
-			if res.State == StateFailed {
-				// The server kept its previous file: the revision it holds is not the new one.
-				if old, ok := l.currentRevision(ctx, server); ok {
-					st.Revision = old
-				}
-			}
-			if announced {
-				_ = env.SetDetail(ctx, "")
-			}
-			return l.st.saveState(ctx, st)
-		}
-		if !errors.Is(err, peerclient.ErrUnreachable) {
-			// The server answered with an error: it is failed, the others go on.
-			l.Log.Warn("a server could not apply the configuration", "server", server, "error", err)
-			return l.st.saveState(ctx, serverState{Server: server, State: StateFailed, Errors: map[string]string{"(server)": firstLine(err.Error())}})
-		}
-		if !announced {
-			announced = true
-			l.Log.Warn("the configuration task waits for a server", "server", server, "error", err)
-		}
-		_ = l.st.saveState(ctx, serverState{Server: server, Revision: 0, State: StateWaiting, Detail: "the server cannot be reached"})
-		_ = env.SetDetail(ctx, fmt.Sprintf("Waiting for server %s, which cannot be reached (it gets the change when it returns).", server))
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(l.WaitPoll):
-		}
+	req, err := l.buildRequest(ctx, server)
+	if err != nil {
+		return err
 	}
+	var res ApplyResponse
+	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	err = l.callServer(cctx, server, CallApply, req, &res)
+	cancel()
+	if err == nil {
+		st := serverState{Server: server, Revision: res.Revision, State: res.State, Detail: res.Detail, Errors: map[string]string{}}
+		for _, p := range res.Parameters {
+			if p.State == StateFailed {
+				st.Errors[p.Name] = p.Error
+			}
+		}
+		if res.State == StateFailed {
+			// The server kept its previous file: the revision it holds is not the new one.
+			if old, ok := l.currentRevision(ctx, server); ok {
+				st.Revision = old
+			}
+		}
+		return l.st.saveState(ctx, st)
+	}
+	if !errors.Is(err, peerclient.ErrUnreachable) {
+		// The server answered with an error: it is failed, the others go on.
+		l.Log.Warn("a server could not apply the configuration", "server", server, "error", err)
+		return l.st.saveState(ctx, serverState{Server: server, State: StateFailed, Errors: map[string]string{"(server)": firstLine(err.Error())}})
+	}
+	l.Log.Warn("a server cannot be reached; it gets the configuration when it answers again", "server", server, "error", err)
+	_ = env.SetDetail(ctx, fmt.Sprintf("Server %s cannot be reached; it gets the change when it returns.", server))
+	return l.st.saveState(ctx, serverState{Server: server, Revision: 0, State: StateWaiting, Detail: "the server cannot be reached"})
 }
 
 func (l *Leader) currentRevision(ctx context.Context, server string) (int64, bool) {
@@ -337,7 +369,7 @@ func (l *Leader) stepConfirm(ctx context.Context, in applyInput) error {
 		}
 	}
 	if len(failed) > 0 {
-		return fmt.Errorf("config_incomplete: applied on %s; waiting for a restart on %s; failed on %s", list(ok), list(pend), strings.Join(failed, ", "))
+		return &taskError{code: "config_incomplete", retry: true, msg: fmt.Sprintf("applied on %s; waiting for a restart on %s; failed on %s", list(ok), list(pend), strings.Join(failed, ", "))}
 	}
 	return nil
 }
@@ -349,20 +381,26 @@ func list(s []string) string {
 	return strings.Join(s, ", ")
 }
 
-// ChangeDetails describes the changes of a request for the audit log: the old and the new value and
-// the level. The values are those PostgreSQL shows to every database user: a parameter that is
-// hidden, managed or refused can never be in a request that was accepted.
-func (l *Leader) ChangeDetails(ctx context.Context, req api.ConfigChangeRequest) []map[string]any {
-	vals, _ := l.st.values(ctx)
-	out := make([]map[string]any, 0, len(req.Changes))
-	for _, c := range req.Changes {
-		scope := ""
-		if c.ScopeID != nil && c.Level != LevelCluster {
-			scope = *c.ScopeID
-		}
-		d := map[string]any{"name": strings.ToLower(c.Name), "level": c.Level, "scopeId": scope, "oldValue": nil, "newValue": nil}
-		for _, v := range vals {
-			if v.Name == strings.ToLower(c.Name) && v.Level == c.Level && v.Scope == scope {
+// ApplyInfo describes an accepted change for the audit log.
+type ApplyInfo struct {
+	// Changes are the checked changes: name, level, scope, the stored value before and the normalized value after.
+	Changes []map[string]any
+	// Servers are the servers the task brings to the change.
+	Servers []string
+	// BasedOn is the configuration revision the request was checked against; the revision the change gets is recorded
+	// with the task (the history row of its task id).
+	BasedOn int64
+}
+
+// describe lists the checked changes with the value each replaces. The values are those PostgreSQL shows to every
+// database user: a parameter that is hidden, managed or refused can never be in an accepted request (a removal of
+// a stored value of such a name has no value to show).
+func describe(stored []valueRow, cs []change) []map[string]any {
+	out := make([]map[string]any, 0, len(cs))
+	for _, c := range cs {
+		d := map[string]any{"name": c.Name, "level": c.Level, "scopeId": c.Scope, "oldValue": nil, "newValue": nil}
+		for _, v := range stored {
+			if v.Name == c.Name && v.Level == c.Level && v.Scope == c.Scope && !Dropped(c.Name) {
 				d["oldValue"] = v.Value
 			}
 		}
@@ -373,3 +411,36 @@ func (l *Leader) ChangeDetails(ctx context.Context, req api.ConfigChangeRequest)
 	}
 	return out
 }
+
+// Attempted describes the changes of a request that was not accepted for the audit log: the names and levels only,
+// never a value (the value of a refused parameter may be a command or a secret).
+func Attempted(req api.ConfigChangeRequest) []map[string]any {
+	out := make([]map[string]any, 0, len(req.Changes))
+	for i, c := range req.Changes {
+		if i >= MaxChanges {
+			break
+		}
+		scope := ""
+		if c.ScopeID != nil && c.Level != LevelCluster {
+			scope = *c.ScopeID
+		}
+		name := strings.ToLower(c.Name)
+		if len(name) > 63 {
+			name = name[:63]
+		}
+		out = append(out, map[string]any{"name": name, "level": c.Level, "scopeId": scope, "remove": c.Value == nil})
+	}
+	return out
+}
+
+// taskError is a failure of a step that carries the code the task is recorded with (task.Coded): the design
+// documents validation_failed and config_incomplete, which a client branches on (P13R-15).
+type taskError struct {
+	code  string
+	retry bool
+	msg   string
+}
+
+func (e *taskError) Error() string       { return e.code + ": " + e.msg }
+func (e *taskError) TaskCode() string    { return e.code }
+func (e *taskError) TaskRetryable() bool { return e.retry }

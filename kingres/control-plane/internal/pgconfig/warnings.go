@@ -5,10 +5,12 @@ package pgconfig
 
 import (
 	"math/big"
+	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/instance"
 )
 
 // The warning codes of a preview (design config-phase13.md, "Validation" and "Security"). A warning
@@ -84,6 +86,10 @@ func effectiveInt(sn *snapshot, after []valueRow, s srv, name string) (int64, bo
 	}
 	if o, has := Pick(toOverrides(ovs), s.ID, s.Group); has {
 		text = o.Value
+	} else if meta.Source == "configuration file" && filepath.Base(meta.SourceFile) == instance.ConfigFileName {
+		// The running value comes from an override that the change removes: what the server falls back to (a
+		// derived default of kingresd or PostgreSQL's own) is not known here, so no claim is made (P13R-10).
+		return 0, false
 	}
 	n, err := strconv.ParseInt(strings.TrimSpace(text), 10, 64)
 	return n, err == nil
@@ -102,6 +108,8 @@ func reservedWarnings(sn *snapshot, after []valueRow, cs []change, indexes []int
 	if at < 0 {
 		return nil
 	}
+	var others []string
+	var first string
 	for _, s := range sn.servers {
 		max, ok1 := effectiveInt(sn, after, s, "max_connections")
 		su, ok2 := effectiveInt(sn, after, s, "superuser_reserved_connections")
@@ -110,8 +118,18 @@ func reservedWarnings(sn *snapshot, after []valueRow, cs []change, indexes []int
 			continue
 		}
 		if max < su+rs+reservedConnectionsFloor {
-			return []api.ConfigWarning{warn(at, WarnReservedConnections, "On server "+s.ID+" max_connections ("+strconv.FormatInt(max, 10)+") would be below superuser_reserved_connections ("+strconv.FormatInt(su, 10)+") plus reserved_connections ("+strconv.FormatInt(rs, 10)+") plus 1; PostgreSQL would not start.")}
+			if first == "" {
+				first = "On server " + s.ID + " max_connections (" + strconv.FormatInt(max, 10) + ") would be below superuser_reserved_connections (" + strconv.FormatInt(su, 10) + ") plus reserved_connections (" + strconv.FormatInt(rs, 10) + ") plus 1; PostgreSQL would not start."
+			} else {
+				others = append(others, s.ID)
+			}
 		}
 	}
-	return nil
+	if first == "" {
+		return nil
+	}
+	if len(others) > 0 {
+		first += " The same holds on " + strings.Join(others, ", ") + "."
+	}
+	return []api.ConfigWarning{warn(at, WarnReservedConnections, first)}
 }
