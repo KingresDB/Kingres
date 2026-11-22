@@ -171,6 +171,10 @@ func (m *Manager) CheckValue(ctx context.Context, id int, name, value string) er
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	out, err := m.run(ctx, "postgres", "-D", data, "-c", name+"="+value, "-C", name)
+	return postgresCheckError(out, err)
+}
+
+func postgresCheckError(out string, err error) error {
 	if err == nil {
 		return nil
 	}
@@ -180,4 +184,48 @@ func (m *Manager) CheckValue(ctx context.Context, id int, name, value string) er
 		}
 	}
 	return fmt.Errorf("instance: postgres -C: %w", err)
+}
+
+// CheckConfig asks PostgreSQL's own parser whether the files of the instance, the override file
+// included, can be loaded as they are now (postgres -C over the whole configuration). A restart that
+// would fail on a value the parser refuses is found here, before the instance is stopped (P13R-02).
+func (m *Manager) CheckConfig(ctx context.Context, id int) error {
+	data, err := m.DataDir(id)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	out, err := m.run(ctx, "postgres", "-D", data, "-C", "data_directory")
+	return postgresCheckError(out, err)
+}
+
+// MarkConfigGood keeps a copy of the override file as the last one an instance ran with
+// (kingres-config.conf.good): a restart that cannot start the instance puts it back.
+func (m *Manager) MarkConfigGood(id int) error {
+	p, err := m.ConfigPath(id)
+	if err != nil {
+		return err
+	}
+	b, err := os.ReadFile(p) //nolint:gosec // path below the manager root
+	if err != nil {
+		return err
+	}
+	return writeAtomic(p+".good", b)
+}
+
+// RestoreGoodConfig puts back the file that MarkConfigGood kept. It reports false when there is none.
+func (m *Manager) RestoreGoodConfig(id int) (bool, error) {
+	p, err := m.ConfigPath(id)
+	if err != nil {
+		return false, err
+	}
+	b, err := os.ReadFile(p + ".good") //nolint:gosec // path below the manager root
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, writeAtomic(p, b)
 }
