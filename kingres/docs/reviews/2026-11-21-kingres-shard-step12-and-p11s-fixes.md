@@ -1,3 +1,6 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026 RooyeKhat Media Co -->
+
 # kingres_shard 0.8, branch shard-p1011: review of the fixes P11S-01..08, P10F-01..03 and step 12 (a) and (b)
 
 Scope: commits c4e15556db, 1b47f56d0b, a4be355a0a, 01aea52761, 68e2027126, 9a4e4cb329, 00ebfe6a34, 786c9d1190.
