@@ -75,6 +75,15 @@ extern bool kingres_shard_repart_shipped_shape(Query *q, int *narrays);
  */
 extern KsPushdownInfo *kingres_shard_repart_prepare(Query *parse, const char **why);
 
+/*
+ * What EXPLAIN (VERBOSE) says of a statement that was a candidate and got no repartitioned plan (design 4.12).  The reasons are
+ * collected between kingres_shard_repart_attach and the end of plan_with_scan; the text is NULL when there is nothing to say.
+ */
+extern void kingres_shard_repart_note_reset(void);
+extern void kingres_shard_repart_note(const char *msg);
+extern void kingres_shard_repart_offered(void);
+extern const char *kingres_shard_repart_explain_reason(void);
+
 /* The hook of planner.c: add the candidates to what pushdown_prepare found (pi may be NULL); pi when none. */
 extern KsPushdownInfo *kingres_shard_repart_attach(Query *parse, KsPushdownInfo *pi);
 

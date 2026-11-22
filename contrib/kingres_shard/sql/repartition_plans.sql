@@ -48,6 +48,17 @@ BEGIN
   RETURN r;
 END $$;
 
+
+-- The reason line of EXPLAIN (VERBOSE): "Repartition: not used: ...", or "-"
+CREATE FUNCTION why(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE l text; r text := '-';
+BEGIN
+  FOR l IN EXECUTE 'EXPLAIN (COSTS OFF, VERBOSE) ' || q LOOP
+    IF l LIKE '%Repartition: not used:%' THEN r := btrim(l); END IF;
+  END LOOP;
+  RETURN r;
+END $$;
+
 SET jit = off;
 SET kingres_shard.enable_repartition_join = force;
 SET kingres_shard.enable_partial_aggregation = on;
@@ -112,11 +123,40 @@ SELECT pushed('SELECT o.id, cu.name FROM o JOIN cu ON cu.id = o.cust + 1');
 SELECT pushed('SELECT o.id, cu.id FROM o JOIN cu ON cu.region < o.amount');
 \echo -- two tables that would both have to move
 SELECT pushed('SELECT o.id, it.id FROM o JOIN it ON it.sku = o.amount');
+\echo -- the ON clause of a LEFT JOIN does not align the tables that stay with each other
+SELECT pushed('SELECT o.id, it.id, cu.id FROM o CROSS JOIN it LEFT JOIN cu ON cu.region = o.id AND cu.region = it.id');
+SELECT pushed('SELECT o.id, it.id, cu.id FROM o CROSS JOIN it LEFT JOIN cu ON o.id = it.id AND cu.region = o.id');
 \echo -- a table that is not distributed
 SELECT pushed('SELECT o.id, plain.y FROM o JOIN plain ON plain.x = o.cust');
 RESET client_min_messages;
 \echo -- a sub-select in the statement
 SELECT pushed('SELECT o.id FROM o JOIN cu ON cu.id = o.cust WHERE o.amount > (SELECT avg(amount) FROM o)');
+
+-- ---------------------------------------------------------------------------
+-- EXPLAIN (VERBOSE) names the reason when a statement that was a candidate is not repartitioned (design 4.12)
+-- ---------------------------------------------------------------------------
+\echo -- the statements of the section above, one reason each ("-" when the plan has no such line)
+SELECT why('SELECT o.id, cu.name FROM o FULL JOIN cu ON cu.id = o.cust');
+SELECT why('SELECT cu.id, o.id FROM cu LEFT JOIN o ON o.cust = cu.id LEFT JOIN it ON it.id = cu.id');
+\echo -- a statement planned after one that had a reason does not inherit it (a local table beside a distributed one, on the other group)
+SELECT id, why('SELECT o.id, plain.y FROM o JOIN plain ON plain.x = o.id WHERE o.id = ' || id) FROM generate_series(1, 6) id;
+SELECT why('SELECT o.id, cu.name FROM o LEFT JOIN cu ON cu.id = o.cust');
+SELECT why('SELECT o.id, cu.name FROM o JOIN cu ON cu.id = o.cust + 1');
+SELECT why('SELECT o.id, it.id FROM o JOIN it ON it.sku = o.amount');
+SELECT why('SELECT o.id, plain.y FROM o JOIN plain ON plain.x = o.cust');
+\echo -- the setting is off; a small bound, where the scan is cheaper by cost
+SET kingres_shard.enable_repartition_join = off;
+SELECT why('SELECT o.id, cu.name FROM o JOIN cu ON cu.id = o.cust');
+SET kingres_shard.enable_repartition_join = on;
+SET kingres_shard.repartition_max_bytes = 1024;
+SELECT why('SELECT o.id, cu.name FROM o JOIN cu ON cu.id = o.cust');
+RESET kingres_shard.repartition_max_bytes;
+SET kingres_shard.enable_repartition_join = force;
+\echo -- not a candidate (one distributed table), or repartitioned: no line
+SELECT why('SELECT o.id FROM o WHERE o.amount > 3');
+SELECT why('SELECT o.id, cu.name FROM o JOIN cu ON cu.id = o.cust');
+\echo -- the used form (no VERBOSE) names the moved table, its key and the placement
+SELECT * FROM plan_of('SELECT o.id, cu.name FROM o JOIN cu ON cu.id = o.cust') LIMIT 3;
 
 -- ---------------------------------------------------------------------------
 -- Clean up
@@ -129,4 +169,5 @@ DELETE FROM kingres.node WHERE node_id = 2;
 DROP TABLE o, cu, it, far, r, plain;
 DROP FUNCTION plan_of(text);
 DROP FUNCTION pushed(text);
+DROP FUNCTION why(text);
 DROP EXTENSION kingres_shard;

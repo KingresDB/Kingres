@@ -351,6 +351,49 @@ rp_strip_relabel(Node *n)
 	return n;
 }
 
+/* ======================================================================
+ * What EXPLAIN says about a statement that was a candidate (design 4.12)
+ * ====================================================================== */
+
+static bool rp_was_candidate = false;
+static StringInfo rp_notes = NULL;	/* the reasons why no repartitioned plan was made, joined by "; " */
+static bool rp_offered = false;		/* a repartitioned path was offered to the planner */
+
+void
+kingres_shard_repart_note_reset(void)
+{
+	rp_notes = NULL;
+	rp_offered = false;
+}
+
+void
+kingres_shard_repart_note(const char *msg)
+{
+	if (rp_notes == NULL)
+		rp_notes = makeStringInfo();
+	if (strstr(rp_notes->data, msg) != NULL)
+		return;
+	if (rp_notes->len > 0)
+		appendStringInfoString(rp_notes, "; ");
+	appendStringInfoString(rp_notes, msg);
+}
+
+void
+kingres_shard_repart_offered(void)
+{
+	rp_offered = true;
+}
+
+const char *
+kingres_shard_repart_explain_reason(void)
+{
+	if (rp_notes != NULL && rp_notes->len > 0)
+		return rp_offered ? psprintf("cost: the scan is cheaper than a repartitioned plan; %s", rp_notes->data) : pstrdup(rp_notes->data);
+	if (rp_offered)
+		return pstrdup("cost: the scan is cheaper than a repartitioned plan");
+	return NULL;
+}
+
 KsPushdownInfo *
 kingres_shard_repart_prepare(Query *parse, const char **why)
 {
@@ -368,8 +411,7 @@ kingres_shard_repart_prepare(Query *parse, const char **why)
 
 #define RP_NO(msg) do { *why = (msg); return NULL; } while (0)
 
-	if (kingres_shard_enable_repartition_join == KS_REPART_OFF)
-		RP_NO("repartitioned joins are switched off");
+	rp_was_candidate = false;
 	if (IsInParallelMode())
 		RP_NO("it is planned in a parallel worker");
 	if (parse->commandType != CMD_SELECT)
@@ -417,6 +459,10 @@ kingres_shard_repart_prepare(Query *parse, const char **why)
 	}
 	if (ndist < 2)
 		RP_NO("it reads fewer than two distributed tables");
+	/* from here the statement is a candidate: the plan of an EXPLAIN names why it is not repartitioned (4.12) */
+	rp_was_candidate = true;
+	if (kingres_shard_enable_repartition_join == KS_REPART_OFF)
+		RP_NO("switched off by kingres_shard.enable_repartition_join");
 
 	memset(&c, 0, sizeof(c));
 	c.q = parse;
@@ -973,7 +1019,8 @@ kingres_shard_repart_attach(Query *parse, KsPushdownInfo *pi)
 	KsPushdownInfo *rp;
 	const char *why = NULL;
 
-	if (kingres_shard_enable_repartition_join == KS_REPART_OFF || !kingres_shard_enable_pushdown)
+	kingres_shard_repart_note_reset();
+	if (!kingres_shard_enable_pushdown)
 		return pi;
 	if (pi != NULL && (!pi->join || pi->ship == NULL))
 		return pi;
@@ -981,7 +1028,11 @@ kingres_shard_repart_attach(Query *parse, KsPushdownInfo *pi)
 	if (rp == NULL)
 	{
 		if (why != NULL)
+		{
 			ereport(DEBUG1, (errmsg_internal("kingres_shard: no repartitioned join: %s", why)));
+			if (rp_was_candidate)
+				kingres_shard_repart_note(why);
+		}
 		return pi;
 	}
 	if (pi == NULL)

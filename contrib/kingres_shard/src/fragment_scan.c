@@ -939,6 +939,9 @@ typedef struct KsFragScanState
 	bool		rp_ran;			/* the child was run once (a rescan has to rescan it) */
 	const char **rp_base;		/* the values of the statement's parameters, while the groups are being started */
 	int			rp_nbase;
+	Oid			rp_relid;		/* EXPLAIN: the shipped relation, its key column and the rows estimated */
+	int			rp_keyatt;
+	int			rp_estrows;
 } KsFragScanState;
 
 static create_upper_paths_hook_type prev_create_upper_paths_hook = NULL;
@@ -970,6 +973,12 @@ static const CustomScanMethods fs_scan_methods = {
 	.CustomName = "Kingres Fragment Scan",
 	.CreateCustomScanState = fs_create_scan_state
 };
+
+bool
+kingres_shard_is_fragment_scan_plan(Plan *plan)
+{
+	return plan != NULL && IsA(plan, CustomScan) && ((CustomScan *) plan)->methods == &fs_scan_methods;
+}
 
 static const CustomExecMethods fs_exec_methods = {
 	.CustomName = "Kingres Fragment Scan",
@@ -1324,6 +1333,21 @@ fs_upper_paths(PlannerInfo *root, UpperRelationKind stage, RelOptInfo *input_rel
 }
 
 /*
+ * What a path of a repartitioned join carries to its plan: 0 the child columns shipped, 1 the position of the key among them, 2 the
+ * colocation group, 3 its placement, 4 the anchored tables, 5 the shipped relation, 6 its key column, 7 the estimated rows (for EXPLAIN).
+ */
+static List *
+fs_rpinfo(List *child_cols, int keypos, const KsRepartCand *cand, List *dist, RelOptInfo *rrel)
+{
+	List	   *l = list_make5(child_cols, makeInteger(keypos), makeInteger(cand->colocation_id),
+								makeString(psprintf(INT64_FORMAT, cand->place)), dist);
+
+	l = lappend(l, makeInteger((int) cand->routed_relid));
+	l = lappend(l, makeInteger((int) cand->key_attno));
+	return lappend(l, makeInteger((int) Min(clamp_row_est(rrel->rows), (double) PG_INT32_MAX)));
+}
+
+/*
  * The pruning that holds for a repartitioned join: only the anchored tables say which buckets the groups read; a restriction on the shipped table
  * says nothing about the buckets of the others.
  */
@@ -1432,7 +1456,7 @@ fs_partial_paths_one(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *outpu
 	List	   *child_cols = NIL;
 	int			keypos = 0;
 
-#define PA_NO(msg) do { ereport(DEBUG1, (errmsg_internal("kingres_shard: no partial aggregation: %s", (msg)))); return; } while (0)
+#define PA_NO(msg) do { ereport(DEBUG1, (errmsg_internal("kingres_shard: no partial aggregation: %s", (msg)))); if (cand != NULL) kingres_shard_repart_note(msg); return; } while (0)
 
 	if (!kingres_shard_enable_partial_aggregation)
 		return;
@@ -1621,13 +1645,14 @@ fs_partial_paths_one(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *outpu
 		foreach(ld, cand->dist_relids)
 			dist = lappend(dist, makeInteger((int) lfirst_oid(ld)));
 		cpath->custom_private = list_make4(prune, info, makeInteger(FS_PATH_REPART_PARTIAL),
-										   list_make5(child_cols, makeInteger(keypos), makeInteger(cand->colocation_id),
-													  makeString(psprintf(INT64_FORMAT, cand->place)), dist));
+										   fs_rpinfo(child_cols, keypos, cand, dist, rrel));
 	}
 	else
 		cpath->custom_private = list_make3(prune, info, makeInteger(FS_PATH_PARTIAL));
 	cpath->methods = &fs_path_methods;
 	cpath_p = (Path *) cpath;
+	if (cand != NULL)
+		kingres_shard_repart_offered();
 
 	if (extra->partial_costs_set)
 		final_costs = extra->agg_final_costs;
@@ -1733,7 +1758,7 @@ fs_repart_join_paths(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerre
 		List	   *dist = NIL;
 		List	   *rpinfo;
 
-#define RJ_NO(msg) { ereport(DEBUG1, (errmsg_internal("kingres_shard: no repartitioned join: %s", (msg)))); continue; }
+#define RJ_NO(msg) { ereport(DEBUG1, (errmsg_internal("kingres_shard: no repartitioned join: %s", (msg)))); kingres_shard_repart_note(msg); continue; }
 
 		if (cand->routed_rti >= (Index) root->simple_rel_array_size || (rrel = root->simple_rel_array[cand->routed_rti]) == NULL)
 			RJ_NO("the shipped relation has no base relation");
@@ -1802,8 +1827,7 @@ fs_repart_join_paths(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerre
 
 		foreach(lc, cand->dist_relids)
 			dist = lappend(dist, makeInteger((int) lfirst_oid(lc)));
-		rpinfo = list_make5(child_cols, makeInteger(keypos), makeInteger(cand->colocation_id),
-							makeString(psprintf(INT64_FORMAT, cand->place)), dist);
+		rpinfo = fs_rpinfo(child_cols, keypos, cand, dist, rrel);
 
 		/*
 		 * The groups do what the planner would pay to join the other tables with the shipped rows, divided among them; this node
@@ -1842,6 +1866,7 @@ fs_repart_join_paths(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerre
 		cpath->custom_private = list_make4(prune, list_make3(makeString(body), pids, makeString(pstrdup(""))),
 										   makeInteger(FS_PATH_REPART), rpinfo);
 		cpath->methods = &fs_path_methods;
+		kingres_shard_repart_offered();
 		add_path(joinrel, (Path *) cpath);
 #undef RJ_NO
 	}
@@ -2086,7 +2111,7 @@ fs_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path, L
 	cscan->custom_private = lappend(cscan->custom_private, makeString(ext != NULL ? pstrdup(ext) : pstrdup("")));
 	cscan->custom_private = lappend(cscan->custom_private, path_kind != FS_PATH_WHOLE ? NIL : pi->sort);
 	cscan->custom_private = lappend(cscan->custom_private, makeInteger(path_kind == FS_PATH_WHOLE ? pi->limit_param : 0));
-	cscan->custom_private = lappend(cscan->custom_private, is_rp ? list_make2(linitial(rpinfo), lsecond(rpinfo)) : NIL);
+	cscan->custom_private = lappend(cscan->custom_private, is_rp ? list_make5(linitial(rpinfo), lsecond(rpinfo), list_nth(rpinfo, 5), list_nth(rpinfo, 6), list_nth(rpinfo, 7)) : NIL);
 	if (path_kind == FS_PATH_WHOLE && pi->limit_param > 0)
 		cscan->custom_exprs = list_make2(pi->limit_cnt, pi->limit_off != NULL ? pi->limit_off : (Node *) makeNullConst(INT8OID, -1, InvalidOid));
 	cscan->methods = &fs_scan_methods;
@@ -2135,6 +2160,9 @@ fs_create_scan_state(CustomScan *cscan)
 		foreach(rl, (List *) linitial(rp))
 			s->rp_cols = lappend_int(s->rp_cols, lfirst_int(rl));
 		s->rp_keypos = intVal(lsecond(rp));
+		s->rp_relid = (Oid) intVal(lthird(rp));
+		s->rp_keyatt = intVal(lfourth(rp));
+		s->rp_estrows = intVal(lfirst(list_nth_cell(rp, 4)));
 	}
 	{
 		ListCell   *kl;
@@ -2986,6 +3014,19 @@ fs_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 				local_possible = true;
 	}
 	ExplainPropertyText("Pushed", s->kind, es);
+	if (s->rp_cols != NIL)
+	{
+		StringInfoData rep;
+
+		initStringInfo(&rep);
+		appendStringInfo(&rep, "%s by %s -> placement of colocation %d (%d buckets)",
+						 get_rel_name(s->rp_relid) != NULL ? get_rel_name(s->rp_relid) : "?",
+						 get_attname(s->rp_relid, (AttrNumber) s->rp_keyatt, true) != NULL ? get_attname(s->rp_relid, (AttrNumber) s->rp_keyatt, true) : "?",
+						 s->colocation_id, coloc != NULL ? kingres_shard_coloc_nbuckets(coloc) : 0);
+		if (es->costs)
+			appendStringInfo(&rep, ", est %d rows", s->rp_estrows);
+		ExplainPropertyText("Repartition", rep.data, es);
+	}
 	initStringInfo(&groups);
 	appendStringInfo(&groups, "%d of %d (", nremote + (local ? 1 : 0), nremote_all + (local_possible ? 1 : 0));
 	if (local && nremote > 0)

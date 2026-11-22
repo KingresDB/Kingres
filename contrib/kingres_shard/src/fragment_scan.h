@@ -24,6 +24,7 @@
 #include "nodes/params.h"
 #include "nodes/parsenodes.h"
 #include "nodes/pg_list.h"
+#include "nodes/plannodes.h"
 
 #include "catalog.h"
 #include "node_conn.h"
@@ -202,5 +203,8 @@ extern KsPushdownInfo *kingres_shard_pushdown_info_set(KsPushdownInfo *info);
  */
 extern const char *kingres_shard_pushdown_reason_swap(const char *reason);
 extern const char *kingres_shard_pushdown_reason(void);
+
+/* Is the plan node a Fragment Scan?  EXPLAIN: the scan that feeds a repartitioned join does not say why the join was not made. */
+extern bool kingres_shard_is_fragment_scan_plan(Plan *plan);
 
 #endif							/* KINGRES_SHARD_FRAGMENT_SCAN_H */

@@ -2543,6 +2543,7 @@ plan_with_scan(Query *parse, const char *query_string, int cursorOptions,
 		(void) kingres_shard_distscan_set_active(false);
 		(void) kingres_shard_pushdown_info_set(old_pi);
 		(void) kingres_shard_pushdown_reason_swap(old_reason);
+		kingres_shard_repart_note_reset();
 	}
 	PG_END_TRY();
 	AtEOXact_GUC(true, nest);

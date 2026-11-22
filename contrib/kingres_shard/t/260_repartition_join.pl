@@ -41,6 +41,13 @@ sub plan_of
 	return $rc == 0 ? $out : "ERROR: $err";
 }
 
+sub vplan
+{
+	my ($node, $sql, $pre) = @_;
+	my ($rc, $out, $err) = run_sql($node, ($pre // '') . "EXPLAIN (COSTS OFF, VERBOSE) $sql");
+	return $rc == 0 ? $out : "ERROR: $err";
+}
+
 table(q{CREATE TABLE public.o (id int PRIMARY KEY, cust int, amount int, note text)},
 	q{; SELECT kingres.create_distributed_table('public.o', 'id', bucket_count => 12)});
 table(q{CREATE TABLE public.cu (id int PRIMARY KEY, region int, name text)},
@@ -188,6 +195,10 @@ my @not = (
 	[ 'a join on a column of both that is not equal', q{SELECT o.id, cu.id FROM public.o JOIN public.cu ON cu.region < o.amount % 5 WHERE o.id < 20 AND cu.id < 20} ],
 	[ 'two tables that would both have to move (one is for J2)', q{SELECT o.id, cu.id, e.id FROM public.o JOIN public.cu ON cu.id = o.cust JOIN public.e ON e.cust = cu.id WHERE o.id < 200} ],
 	[ 'two tables that both join by other columns', q{SELECT o.id, it.id FROM public.o JOIN public.it ON it.sku = o.amount % 13 WHERE o.id < 50 AND it.id < 50} ],
+	# the ON clause of a LEFT JOIN decides which rows of the nullable table match, not which rows of the preserved side are paired:
+	# o.id = cu.region AND it.id = cu.region does not put o and it on the same group (their cross product is in the result)
+	[ 'a LEFT JOIN whose ON clause equates the nullable table with two preserved tables', q{SELECT o.id, it.id AS iid, cu.id AS cid FROM public.o CROSS JOIN public.it LEFT JOIN public.cu ON cu.region = o.id AND cu.region = it.id WHERE o.id < 12 AND it.id < 12} ],
+	[ 'a LEFT JOIN whose ON clause equates the two preserved tables', q{SELECT o.id, it.id AS iid, cu.id AS cid FROM public.o CROSS JOIN public.it LEFT JOIN public.cu ON o.id = it.id AND cu.region = o.id WHERE o.id < 12 AND it.id < 12} ],
 );
 for my $q (@not)
 {
@@ -223,6 +234,13 @@ for my $q (@not)
 	is($rc, 0, 'with the default bound the same statement is repartitioned') or diag($err);
 	is(join("\n", sort split /\n/, $out), join("\n", sort split /\n/, $os0), '... with the single node\'s answer');
 
+	# design 4.12: the plan names the moved table, and a candidate that is not repartitioned names the reason
+	like(plan_of($n1, $sql), qr/Repartition: o by cust -> placement of colocation \d+ \(12 buckets\)/, 'EXPLAIN: the moved table, its key and the placement');
+	unlike(vplan($n1, $sql), qr/Repartition: not used/, 'EXPLAIN VERBOSE: a repartitioned join has no "not used" line (not on the scan that feeds it either)');
+	like(vplan($n1, $sql, 'SET kingres_shard.enable_repartition_join = off; '), qr/Repartition: not used: switched off by kingres_shard\.enable_repartition_join/, 'EXPLAIN VERBOSE: switched off');
+	like(vplan($n1, q{SELECT o.id, cu.id FROM public.o FULL JOIN public.cu ON cu.id = o.cust}), qr/Repartition: not used: it has an outer join/, 'EXPLAIN VERBOSE: a full join');
+	unlike(plan_of($n1, q{SELECT o.id, cu.id FROM public.o FULL JOIN public.cu ON cu.id = o.cust}), qr/Repartition:/, 'EXPLAIN without VERBOSE: no line for a refusal');
+	unlike(vplan($n1, q{SELECT o.id FROM public.o WHERE o.amount > 3}), qr/Repartition:/, 'EXPLAIN VERBOSE: a statement that is not a candidate has no line');
 	($rc, $out, $err) = run_sql($n1, "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) $sql");
 	is($rc, 0, 'EXPLAIN ANALYZE runs') or diag($err);
 

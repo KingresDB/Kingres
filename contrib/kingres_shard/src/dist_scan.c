@@ -82,6 +82,7 @@
 #include "planner.h"
 #include "node_conn.h"
 #include "placement_check.h"
+#include "repartition.h"
 #include "prune.h"
 #include "shippable.h"
 
@@ -94,6 +95,7 @@
 #define DS_PRIV_PARTITIONS	5	/* String: identity of the partitions of the table on this node, in the plan; "" when it is not partitioned */
 #define DS_PRIV_PRUNE		6	/* List: the pruning terms of the restrictions (prune.c); NIL: every group is asked */
 #define DS_PRIV_REASON		7	/* String: why the statement is not pushed down ("" when the question was not asked) */
+#define DS_PRIV_REPART		8	/* String: why a repartitioned join was not made (EXPLAIN VERBOSE), "" for nothing to say */
 
 /* Rows requested from a remote group at a time. */
 int			kingres_shard_scan_fetch_size = 1000;
@@ -110,6 +112,7 @@ typedef struct KsDistScanState
 	int			nchild;			/* scan columns the child returns */
 	int			colocation_id;	/* of the table, from the catalog when the scan starts */
 	char	   *reason;			/* why the statement is not pushed (EXPLAIN VERBOSE), "" when it was not asked */
+	char	   *repart_reason;	/* why no repartitioned join was made (EXPLAIN VERBOSE) */
 	int64		plan_placement;	/* placement of the colocation group in the plan (the local partitions are those of it) */
 	bool		plan_has_parts;	/* the table is partitioned on this node */
 	int64		plan_partitions;	/* identity of its partitions in the plan (catalog.c) */
@@ -631,6 +634,11 @@ ds_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	cscan->custom_private = lappend(cscan->custom_private, lthird(best_path->custom_private));
 	cscan->custom_private = lappend(cscan->custom_private,
 									makeString(kingres_shard_pushdown_reason() != NULL ? pstrdup(kingres_shard_pushdown_reason()) : pstrdup("")));
+	{
+		const char *rr = kingres_shard_repart_explain_reason();
+
+		cscan->custom_private = lappend(cscan->custom_private, makeString(rr != NULL ? pstrdup(rr) : pstrdup("")));
+	}
 	cscan->methods = &ds_scan_methods;
 	return &cscan->scan.plan;
 }
@@ -657,6 +665,7 @@ ds_create_scan_state(CustomScan *cscan)
 	}
 	s->prune_terms = (List *) list_nth(p, DS_PRIV_PRUNE);
 	s->reason = pstrdup(strVal(list_nth(p, DS_PRIV_REASON)));
+	s->repart_reason = list_length(p) > DS_PRIV_REPART ? pstrdup(strVal(list_nth(p, DS_PRIV_REPART))) : pstrdup("");
 	foreach(lc, (List *) list_nth(p, DS_PRIV_PARAMS))
 		s->param_ids = lappend_int(s->param_ids, intVal(lfirst(lc)));
 	return (Node *) s;
@@ -1041,4 +1050,16 @@ ds_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 	ExplainPropertyText("Remote SQL", flat.data, es);
 	if (es->verbose && s->reason[0] != '\0')
 		ExplainPropertyText("Pushdown", psprintf("not used: %s", s->reason), es);
+	if (es->verbose && s->repart_reason[0] != '\0')
+	{
+		bool		under_fragment = false;
+		ListCell   *la;
+
+		/* the scan that feeds a repartitioned join (the child of a Fragment Scan) is part of the plan that was made */
+		foreach(la, ancestors)
+			if (kingres_shard_is_fragment_scan_plan((Plan *) lfirst(la)))
+				under_fragment = true;
+		if (!under_fragment)
+			ExplainPropertyText("Repartition", psprintf("not used: %s", s->repart_reason), es);
+	}
 }
