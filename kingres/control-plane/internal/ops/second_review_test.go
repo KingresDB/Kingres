@@ -304,13 +304,21 @@ func TestIntegrationChecksNameTheDatabasesThatCouldNotBeRead(t *testing.T) {
 	if err != nil || len(unread) != 0 {
 		t.Fatalf("a database that is read: %v %v", unread, err)
 	}
-	execAll(t, c, `ALTER FUNCTION kingres.timepart_check() RENAME TO timepart_check_x`)
+	renameFunction(t, c, "timepart_check", "timepart_check_x")
 	checks, unread, err := (PartitionBackend{O: o}).Checks(ctx)
 	if err != nil || len(checks) != 0 || len(unread) != 1 || unread[0] != "postgres" {
 		t.Fatalf("a database that cannot be read: %v %v %v", checks, unread, err)
 	}
-	execAll(t, c, `ALTER FUNCTION kingres.timepart_check_x() RENAME TO timepart_check`, `DROP EXTENSION kingres_timepart CASCADE`)
+	renameFunction(t, c, "timepart_check_x", "timepart_check")
+	execAll(t, c, `DROP EXTENSION kingres_timepart CASCADE`)
 	if _, unread, err := (PartitionBackend{O: o}).Checks(ctx); err != nil || len(unread) != 0 {
 		t.Errorf("a database whose extension is gone is not unread: %v %v", unread, err)
 	}
+}
+
+// renameFunction renames every function of the schema kingres with the name from (whatever its arguments), to break or mend a call of the extension.
+func renameFunction(t *testing.T, c *pgx.Conn, from, to string) {
+	t.Helper()
+	execAll(t, c, `DO $$ DECLARE r regprocedure; BEGIN FOR r IN SELECT oid::regprocedure FROM pg_proc WHERE proname = '`+from+`' AND pronamespace = 'kingres'::regnamespace
+		LOOP EXECUTE format('ALTER FUNCTION %s RENAME TO ' || quote_ident('`+to+`'), r); END LOOP; END $$`)
 }
