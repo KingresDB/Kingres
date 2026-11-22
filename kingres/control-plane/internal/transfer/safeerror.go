@@ -247,6 +247,9 @@ func SafeError(err error) *Error {
 		}
 		return &Error{Code: CodeInternal, Sentence: "the transfer failed (" + pp.Title + ")"}
 	}
+	if brokenConnection(err) {
+		return &Error{Code: CodeCopyInterrupted, Retryable: true, Sentence: "the connection to the database broke before the statement ended"}
+	}
 	var ne net.Error
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &ne) || pgconn.SafeToRetry(err) || pgconn.Timeout(err) {
 		return &Error{Code: CodeCopyInterrupted, Retryable: true, Sentence: "the connection to the database broke before the statement ended"}
@@ -291,4 +294,15 @@ func fromPg(pe *pgconn.PgError) *Error {
 		}
 	}
 	return e
+}
+
+// brokenConnection recognises the failures of an established connection that the driver reports as plain errors. The text is only compared, never kept.
+func brokenConnection(err error) bool {
+	msg := strings.ToLower(err.Error())
+	for _, s := range []string{"conn closed", "conn busy", "unexpected eof", "connection reset", "broken pipe", "use of closed network connection", "connection refused", "forcibly closed"} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
 }

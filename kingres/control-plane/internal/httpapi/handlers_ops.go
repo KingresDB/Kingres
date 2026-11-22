@@ -58,6 +58,9 @@ func (s *Server) opsHandlers() map[string]handlerFunc {
 	for id, h := range s.tableLifecycleHandlers() {
 		m[id] = h
 	}
+	for id, h := range s.transferHandlers() {
+		m[id] = h
+	}
 	return m
 }
 

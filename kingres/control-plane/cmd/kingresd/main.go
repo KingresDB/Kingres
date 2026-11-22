@@ -278,6 +278,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		}
 		ring = monitor.NewRing(1440, 2000)
 		opsSvc = &ops.Ops{Service: svc, Roles: proxy, Instances: svc.Manager(), WritableIDs: svc.WritableIDs, ServerHost: serverHost, PGPort: cfg.PGPort, Log: log, DiskFree: diskFreeOf(serverHost, cfg.DataDir)}
+		opsSvc.Transfer = transferConfig(cfg, checkedAuthn, auditFn(sink, log))
 	}
 	deps := httpapi.Deps{
 		Logger: log, Store: pg, Setup: node, Sessions: sessions, Authenticator: checkedAuthn, Audit: sink,

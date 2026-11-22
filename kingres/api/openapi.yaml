@@ -1853,7 +1853,7 @@ paths:
         A table that does not exist is 404; a view, a foreign table, a bucket partition named directly and a table of the schemas `kingres`,
         `pg_catalog` and `information_schema` are 422 `table_not_eligible` with `blockers`. 422 `export_untrusted_code`: the table is owned by another
         role and a column that is read calls a function owned by a role that is neither the caller nor a superuser (`acknowledgeOtherRolesCode`
-        accepts the risk); 422 `insufficient_disk`: the staging area has too little free space; 422 `validation_failed` for an option that is not valid.
+        accepts the risk); 409 `insufficient_disk`: the staging area has too little free space; 400 `validation_failed` for an option that is not valid.
         409 `operation_in_progress`: the table has an unfinished task, or the cluster or the role is at the limit `maxConcurrent`;
         409 `transfer_quota_exceeded`: the reservation does not fit into `stagingQuotaBytes`.
 
@@ -4822,7 +4822,7 @@ paths:
         The answer says the chunk rules: `chunkBytesMax` (at most 256 MiB, 64 MiB offered) and `chunkAlign` (65536: every chunk but the last is a multiple of it).
 
         Needs `kingres_admin`, `dataTransfer.enabled` (403 `data_transfer_disabled`) and a request over TLS (403 `insecure_transport`). 409 `transfer_quota_exceeded`: the declared
-        size does not fit into the quota. 422 `validation_failed` on `/sizeBytes` when the size is above `maxFileBytes`, and 422 `insufficient_disk`. Only the creator can read, continue or delete the upload.
+        size does not fit into the quota. 400 `validation_failed` on `/sizeBytes` when the size is above `maxFileBytes`, and 409 `insufficient_disk`. Only the creator can read, continue or delete the upload.
         An upload that received nothing for 48 hours, or that was complete and was not used for 24 hours, is deleted; `getDataUpload` then answers 404.
       tags: [Data transfer]
       x-required-role: kingres_admin
@@ -4916,7 +4916,7 @@ paths:
         request is not subject to the 30 s request timeout and the 1 MiB body limit of the other operations (an idle limit of 60 s and a limit of 15 minutes per chunk apply), and a
         follower relays it to the leader. The header `Upload-Offset` must equal the server's offset (409 `upload_offset_mismatch`; the response header `Upload-Offset` has the right one).
         `Content-Length` is needed, is at most `chunkBytesMax` (413 `chunk_too_large`; also for a chunk that reaches past `sizeBytes`) and is a **multiple of 65536 unless the chunk is the last one**
-        (422 `validation_failed` on `Content-Length`). A request that breaks off keeps the whole sealed segments it delivered and drops the rest; the client reads the offset with `getDataUpload` and
+        (400 `validation_failed` on `Content-Length`). A request that breaks off keeps the whole sealed segments it delivered and drops the rest; the client reads the offset with `getDataUpload` and
         continues. The answer is 204 with the new `Upload-Offset`; after the last chunk the server computes the SHA-256 of the file (422 `upload_checksum_mismatch` when it differs from the declared one;
         the upload is deleted) and the upload is `complete`. Two chunks at one offset: one wins, the other gets 409. Needs `kingres_admin`, `dataTransfer.enabled` and a request over TLS. A chunk is not an audit event.
       tags: [Data transfer]

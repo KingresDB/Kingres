@@ -516,3 +516,11 @@ func (r *Reservation) Release() {
 		delete(r.s.res, r.id)
 	}
 }
+
+// SetQuota changes the quota of the sum of the reservations (zero: the default of the file system). The cluster setting
+// stagingQuotaBytes can change while kingresd runs; reservations that exist stay, the next Reserve and the next growth see the new value.
+func (s *Store) SetQuota(n int64) {
+	s.mu.Lock()
+	s.cfg.Quota = n
+	s.mu.Unlock()
+}

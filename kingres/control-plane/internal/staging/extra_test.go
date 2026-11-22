@@ -103,3 +103,19 @@ func TestPathsStayInsideTheDirectory(t *testing.T) {
 		}
 	}
 }
+
+func TestSetQuotaAppliesToTheNextReservation(t *testing.T) {
+	s, _ := testStore(t, nil)
+	r1, err := s.Reserve(1, "a", 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetQuota(1500)
+	if _, err := s.Reserve(2, "a", 600); !errors.Is(err, ErrQuotaExceeded) {
+		t.Errorf("a reservation above the new quota: %v", err)
+	}
+	if _, err := s.Reserve(3, "a", 500); err != nil {
+		t.Errorf("a reservation within the new quota: %v", err)
+	}
+	r1.Release()
+}

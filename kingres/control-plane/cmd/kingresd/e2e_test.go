@@ -53,6 +53,7 @@ type cp struct {
 var (
 	sharedMu  sync.Mutex
 	sharedCP  *cp
+	sharedTLS *cp
 	allEnvs   []*cp
 	allEnvsMu sync.Mutex
 )
@@ -68,7 +69,11 @@ func TestMain(m *testing.M) {
 }
 
 // newServer starts kingresd (uninitialized) with a fresh data directory.
-func newServer(t testing.TB) *cp {
+func newServer(t testing.TB) *cp { return newServerWith(t, false) }
+
+// newServerWith starts kingresd; with tls it serves HTTPS with a certificate made for the test (the data transfer refuses plain HTTP) and the
+// client of the returned cp trusts it.
+func newServerWith(t testing.TB, useTLS bool) *cp {
 	t.Helper()
 	if !pgtest.Available() {
 		t.Skip("KINGRES_PG_BIN is not set; skipping the end-to-end test")
@@ -85,11 +90,19 @@ func newServer(t testing.TB) *cp {
 	e.internal = fmt.Sprintf("127.0.0.1:%d", pgtest.FreePort(t))
 	args := []string{"-listen", "127.0.0.1:0", "-data-dir", e.dataDir, "-log-format", "json",
 		"-login-rate-limit", "1000", "-internal-listen", e.internal, "-pg-bin-dir", pgtest.BinDir(), "-pg-port", fmt.Sprint(e.pgPort), "-server-host", "127.0.0.1"}
+	if useTLS {
+		crt, key := writeSelfSigned(t, root)
+		args = append(args, "-tls-cert-file", crt, "-tls-key-file", key)
+		e.client = tlsClient()
+	}
 	e.args = args
 	go func() { e.done <- run(ctx, args, noEnv, e.logs, ready) }()
 	select {
 	case addr := <-ready:
 		e.base = "http://" + addr + "/api/v1"
+		if useTLS {
+			e.base = "https://" + addr + "/api/v1"
+		}
 	case err := <-e.done:
 		t.Fatalf("kingresd exited early: %v\n%s", err, e.logs.String())
 	case <-time.After(30 * time.Second):
@@ -117,9 +130,11 @@ func (e *cp) shutdown() {
 }
 
 // startCluster creates a new one-server cluster through the API only.
-func startCluster(t testing.TB) *cp {
+func startCluster(t testing.TB) *cp { return startClusterWith(t, false) }
+
+func startClusterWith(t testing.TB, useTLS bool) *cp {
 	t.Helper()
-	e := newServer(t)
+	e := newServerWith(t, useTLS)
 	tok, err := os.ReadFile(filepath.Join(e.dataDir, "setup-token"))
 	if err != nil {
 		t.Fatalf("setup token: %v", err)
@@ -393,4 +408,15 @@ func (e *cp) startManager(t testing.TB) {
 	case <-time.After(60 * time.Second):
 		t.Fatal("kingresd did not start")
 	}
+}
+
+// sharedWithTLS returns a second cluster of the test binary that serves HTTPS, for the data transfer tests.
+func sharedWithTLS(t testing.TB) *cp {
+	t.Helper()
+	sharedMu.Lock()
+	defer sharedMu.Unlock()
+	if sharedTLS == nil {
+		sharedTLS = startClusterWith(t, true)
+	}
+	return sharedTLS
 }
