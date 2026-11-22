@@ -118,7 +118,7 @@ my $ua_h = q{SELECT count(*) || ':' || sum(x) FROM (SELECT id + 1 AS x, v FROM p
 my $ua_r = q{SELECT count(*) || ':' || sum(x) FROM (SELECT id * 2 AS x, v FROM public.ref UNION ALL SELECT id + 2000, tag FROM public.loc) u};
 for my $n (@nodes)
 {
-	is(q1($n, $ua_s), '10:12035', $n->name . ': UNION ALL with an expression over a schema table'); 
+	is(q1($n, $ua_s), '10:12035', $n->name . ': UNION ALL with an expression over a schema table');
 	is(q1($n, $ua_h), '18:12111', $n->name . ': ... over a hash-distributed table');
 	is(q1($n, $ua_r), '8:12027', $n->name . ': ... over a reference table');
 	is(q1($n, q{SET kingres_shard.enable_schema_routing = off; } . $ua_s), '10:12035', $n->name . ': ... with schema routing off');
