@@ -585,3 +585,77 @@ func TestNoFileIsTakenFromAHolderWhenTheTargetsCannotBeReadAgain(t *testing.T) {
 		t.Fatalf("removed %v, want 77", removed)
 	}
 }
+
+// The holders are asked before a target is built at most once in CredGateTTL for each target and term, and again after it (a worker must not
+// ask every holder on every pass).
+func TestTheHoldersAreAskedBeforeATargetIsBuiltOnlyOnceInTheGateTime(t *testing.T) {
+	e, _, raw := staleLeader(t)
+	calls := 0
+	inner := e.svc.cfg.Holders
+	e.svc.cfg.Holders = func(ctx context.Context, ids []int64) (HolderReport, error) { calls++; return inner(ctx, ids) }
+	e.svc.cfg.FetchFrom = func(context.Context, string, int64) ([]byte, error) { return append([]byte(nil), raw...), nil }
+	if err := e.runSubmit(); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("%d questions to the holders in the first pass, want 1", calls)
+	}
+	for i := 0; i < 3; i++ {
+		e.putAgg("shop", int64(5+i))
+		_ = e.runEnqueue()
+		_ = e.runSubmit()
+	}
+	if calls != 1 {
+		t.Fatalf("%d questions within the time the answer is believed, want 1", calls)
+	}
+	e.clock.Advance(CredGateTTL + time.Second)
+	e.putAgg("shop", 20)
+	_ = e.runEnqueue()
+	_ = e.runSubmit()
+	if calls != 2 {
+		t.Fatalf("%d questions after the time passed, want 2", calls)
+	}
+	// another term asks again at once
+	e.term = 2
+	e.st.SetTerm(2)
+	e.putAgg("shop", 30)
+	_ = e.runEnqueue()
+	_ = e.runSubmit()
+	if calls != 3 {
+		t.Fatalf("%d questions in a new term, want 3", calls)
+	}
+}
+
+// The wire form of the list answer: what a holder sends is what the leader reads, with the time to the nanosecond, and the answer of a server
+// that sends no copies is read as a list of files without a digest.
+func TestTheListAnswerSurvivesTheWire(t *testing.T) {
+	e := newEnv(t)
+	tg := e.addWorm("vault")
+	at := time.Date(2026, 11, 20, 8, 30, 15, 123456789, time.UTC)
+	ageFile(t, e, tg.ID, at)
+	out, err := (&Agent{Creds: e.creds}).Handle(e.ctx(), CallCredentialsList, []byte("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back ListResponse
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatal(err)
+	}
+	d, _ := e.creds.Digest(tg.ID)
+	if len(back.Copies) != 1 || back.Copies[0].Digest != d.Digest || !back.Copies[0].Installed.Equal(at.Truncate(time.Nanosecond)) && back.Copies[0].Installed.Sub(at).Abs() > time.Second {
+		t.Fatalf("%s -> %+v", b, back)
+	}
+	var old ListResponse
+	if err := json.Unmarshal([]byte(`{"ids":[1,2]}`), &old); err != nil || len(old.IDs) != 2 || len(old.Copies) != 0 {
+		t.Fatalf("%+v %v", old, err)
+	}
+	rep := NewHolderReport()
+	rep.Add("h9", old, []int64{1, 2})
+	if len(rep.Copies) != 0 || len(rep.Lacking) != 0 {
+		t.Fatalf("a server that sends no copies has the files and says nothing of them: %+v", rep)
+	}
+}
