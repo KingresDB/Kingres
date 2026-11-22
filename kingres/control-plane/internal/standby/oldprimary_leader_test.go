@@ -95,3 +95,11 @@ func TestTheDivergenceIsMeasuredFromAShutDownDirectory(t *testing.T) {
 		t.Fatalf("%+v", lower)
 	}
 }
+
+func TestOnlyAShutDownDirectoryHasItsCheckpointAsTheEndOfTheWal(t *testing.T) {
+	for state, want := range map[string]bool{"shut down": true, "in production": false, "in crash recovery": false, "shut down in recovery": false, "": false} {
+		if cp, shut := endOfOldWal(map[string]string{"Latest checkpoint location": "0/3100000", "Database cluster state": state}); cp != "0/3100000" || shut != want {
+			t.Errorf("state %q: %q %v, want shut down %v", state, cp, shut, want)
+		}
+	}
+}

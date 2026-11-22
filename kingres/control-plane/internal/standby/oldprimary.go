@@ -225,7 +225,7 @@ func (a *Agent) rebuildFormerLocked(ctx context.Context, id int, e Entry, term i
 			if cd, cerr := mgr.ControlData(ctx, id); cerr == nil {
 				// A directory whose state is "shut down" has finished its crash recovery (the dry run does it before it refuses): its shutdown checkpoint is the end of
 				// the old primary's WAL and not only a checkpoint that it had before.
-				lastCheckpoint, shutDown = cd["Latest checkpoint location"], cd["Database cluster state"] == "shut down"
+				lastCheckpoint, shutDown = endOfOldWal(cd)
 			}
 		}
 		rerr := error(nil)
@@ -398,4 +398,10 @@ func completeFromRewind(info *OldPrimaryInfo, out, lastCheckpoint string, shutDo
 		info.DivergenceBytes = &zero
 		info.Message += " The old primary's WAL ends before that point: it wrote nothing after the divergence that the new primary does not hold."
 	}
+}
+
+// endOfOldWal reads the last checkpoint of a directory and whether it is the end of the old primary's WAL: only a directory whose state is "shut down" has finished
+// its crash recovery, so only then is the checkpoint the end and not just one that the directory had before.
+func endOfOldWal(controlData map[string]string) (checkpoint string, shutDown bool) {
+	return controlData["Latest checkpoint location"], controlData["Database cluster state"] == "shut down"
 }
