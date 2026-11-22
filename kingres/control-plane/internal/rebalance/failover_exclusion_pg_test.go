@@ -344,3 +344,52 @@ func TestSchemaTasksExcludeAFailoverAndARebalanceInTheDatabase(t *testing.T) {
 		t.Fatalf("after every schema task ended: %v", err)
 	}
 }
+
+// Migration 0041: schema.move and schema.undistribute and a change of the servers (add, remove, leave) exclude each other (KX007 for
+// the schema task, KX006 for the server task); schema.distribute lives beside them.
+func TestSchemaMovesAndServerChangesExcludeEachOtherInTheDatabase(t *testing.T) {
+	e := newEnvNoTask(t)
+	ctx := context.Background()
+	insert := func(kind string) (int64, error) {
+		var id int64
+		err := e.sys.QueryRow(ctx, `INSERT INTO kingres_cp.task (kind, state, subject_type, subject_id, created_by) VALUES ($1, 'running', 'x', $1, 'test') RETURNING id`, kind).Scan(&id)
+		return id, err
+	}
+	code := func(err error) string {
+		var pe *pgconn.PgError
+		if errors.As(err, &pe) {
+			return pe.Code
+		}
+		return "none"
+	}
+	for _, srv := range []string{"server.add", "server.remove", "server.leave"} {
+		for _, k := range []string{"schema.move", "schema.undistribute"} {
+			id, err := insert(srv)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := insert(k); code(err) != "KX007" {
+				t.Fatalf("%s while %s runs: %v", k, srv, err)
+			}
+			e.setState(t, id, "done")
+			id, err = insert(k)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := insert(srv); code(err) != "KX006" {
+				t.Fatalf("%s while %s runs: %v", srv, k, err)
+			}
+			e.setState(t, id, "done")
+		}
+		id, err := insert("schema.distribute")
+		if err != nil {
+			t.Fatal(err)
+		}
+		sid, err := insert(srv)
+		if err != nil {
+			t.Fatalf("%s beside schema.distribute: %v", srv, err)
+		}
+		e.setState(t, id, "done")
+		e.setState(t, sid, "done")
+	}
+}

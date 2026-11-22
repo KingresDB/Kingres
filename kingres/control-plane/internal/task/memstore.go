@@ -306,6 +306,9 @@ var databaseOps = map[string]bool{"database.create": true, "database.drop": true
 // move it first): a rebalance and they exclude each other (migration 0041, KX001 and KX002).
 var schemaMoves = map[string]bool{"schema.move": true, "schema.undistribute": true}
 
+// membershipOps change which servers hold shards: a schema task that moves a bucket and they exclude each other (migration 0041, KX006 and KX007).
+var membershipOps = map[string]bool{"server.add": true, "server.remove": true, "server.leave": true}
+
 // excludedLocked is the rule of the database trigger for a task of kind about to be created.
 func (m *MemStore) excludedLocked(kind string) error {
 	for _, o := range m.tasks {
@@ -326,6 +329,10 @@ func (m *MemStore) excludedLocked(kind string) error {
 			return &ExcludedError{Kind: kind, Other: o.Kind}
 		case schemaMoves[kind] && o.Kind == "rebalance" && (o.State == Pending || o.State == Running):
 			return &ExcludedError{Kind: kind, Other: "rebalance"}
+		case schemaMoves[kind] && membershipOps[o.Kind] && o.State.Active():
+			return &ExcludedError{Kind: kind, Other: o.Kind}
+		case membershipOps[kind] && schemaMoves[o.Kind] && o.State.Active():
+			return &ExcludedError{Kind: kind, Other: o.Kind}
 		}
 	}
 	return nil

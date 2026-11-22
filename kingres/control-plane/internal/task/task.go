@@ -635,6 +635,14 @@ func (e *Engine) run(ctx context.Context, t Task, started time.Time, secrets map
 				if rerr != nil && leaseLost(rerr) {
 					return e.standDown(ctx, t, i, st, rerr)
 				}
+				if rerr != nil && runCtx.Err() != nil {
+					// A run that is shut down or has lost its lease did not learn whether the effect is there: it is not a failure of the
+					// step (as on the path of a step that runs); the next holder asks again.
+					if ctx.Err() != nil {
+						return ctx.Err()
+					}
+					return ErrLeaseLost
+				}
 			}
 			if st.Recover == nil || rerr != nil {
 				return e.fail(ctx, t, i, st, &Error{Code: CodeStepInterrupted, Step: st.Name, Retryable: false,

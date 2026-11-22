@@ -13,6 +13,8 @@
 --   or paused; a failover (or the restore of preferred primaries) is refused (KX006) while one of those tasks is unfinished;
 --   schema.move and schema.undistribute (which may move the schema first) are refused (KX002) while a rebalance is pending or
 --   running, and a rebalance is refused (KX001) while one of those two is unfinished.
+--   schema.move and schema.undistribute are refused (KX007) while server.add, server.remove or server.leave is unfinished, and those
+--   are refused (KX006) while one of the two is unfinished: a move to a group whose server is being removed or joined must not run.
 
 CREATE FUNCTION kingres_cp.task_exclusion_schema() RETURNS trigger
 LANGUAGE plpgsql AS $$
@@ -35,6 +37,15 @@ BEGIN
             RAISE EXCEPTION 'a task of kind % cannot start while a task of kind % is unfinished', NEW.kind, other
                 USING ERRCODE = 'KX007', DETAIL = other;
         END IF;
+        IF NEW.kind IN ('schema.move', 'schema.undistribute') THEN
+            SELECT kind INTO other FROM kingres_cp.task
+                WHERE kind IN ('server.add', 'server.remove', 'server.leave')
+                  AND state IN ('pending', 'running', 'paused') AND id <> NEW.id LIMIT 1;
+            IF FOUND THEN
+                RAISE EXCEPTION 'a task of kind % cannot start while a task of kind % is unfinished', NEW.kind, other
+                    USING ERRCODE = 'KX007', DETAIL = other;
+            END IF;
+        END IF;
         IF NEW.kind IN ('schema.move', 'schema.undistribute')
            AND EXISTS (SELECT 1 FROM kingres_cp.task WHERE kind = 'rebalance' AND state IN ('pending', 'running') AND id <> NEW.id) THEN
             RAISE EXCEPTION 'a task of kind % cannot start while a rebalance is running', NEW.kind
@@ -44,6 +55,15 @@ BEGIN
         PERFORM kingres_cp.lock_operations();
         SELECT kind INTO other FROM kingres_cp.task
             WHERE kind IN ('schema.distribute', 'schema.move', 'schema.undistribute')
+              AND state IN ('pending', 'running', 'paused') AND id <> NEW.id LIMIT 1;
+        IF FOUND THEN
+            RAISE EXCEPTION 'a task of kind % cannot start while a task of kind % is unfinished', NEW.kind, other
+                USING ERRCODE = 'KX006', DETAIL = other;
+        END IF;
+    ELSIF NEW.kind IN ('server.add', 'server.remove', 'server.leave') THEN
+        PERFORM kingres_cp.lock_operations();
+        SELECT kind INTO other FROM kingres_cp.task
+            WHERE kind IN ('schema.move', 'schema.undistribute')
               AND state IN ('pending', 'running', 'paused') AND id <> NEW.id LIMIT 1;
         IF FOUND THEN
             RAISE EXCEPTION 'a task of kind % cannot start while a task of kind % is unfinished', NEW.kind, other

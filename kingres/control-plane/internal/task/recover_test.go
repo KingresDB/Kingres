@@ -176,6 +176,15 @@ func TestSchemaTasksExcludeAFailoverAndARebalance(t *testing.T) {
 		both("rebalance", k, true)
 		both(k, "rebalance", true)
 	}
+	// a change of the servers excludes the two that move a bucket, both ways, and not a distribution
+	for _, s := range []string{"server.add", "server.remove", "server.leave"} {
+		for _, k := range []string{"schema.move", "schema.undistribute"} {
+			both(s, k, true)
+			both(k, s, true)
+		}
+		both(s, "schema.distribute", false)
+		both("schema.distribute", s, false)
+	}
 	both("rebalance", "schema.distribute", false)
 	both("schema.distribute", "rebalance", false)
 	// the text of the refusal names the schema task
@@ -186,5 +195,57 @@ func TestSchemaTasksExcludeAFailoverAndARebalance(t *testing.T) {
 	var x *task.ExcludedError
 	if err := submit(e, "server.failover"); !errors.As(err, &x) || x.Problem().Code != "operation_in_progress" {
 		t.Errorf("a failover while a schema move runs: %v", err)
+	}
+}
+
+// A run that is shut down while its Recover reads the effect did not learn anything: the task is not failed with step_interrupted
+// (a permanent verdict by a run that was going away); the step stays recorded as running and the next run asks again.
+func TestRecoverCutOffByAShutdownDoesNotFailTheTask(t *testing.T) {
+	c := &counter{n: map[string]int{}}
+	clk := newClock()
+	mem := task.NewMemStoreClock(clk.Now)
+	ds := &deadStore{Store: mem}
+	hook := func(p string, _ int64, step int) {
+		if p == task.FaultStepRan && step == 1 {
+			ds.dead.Store(true)
+			panic(crashed{})
+		}
+	}
+	first := func(context.Context, *task.Env) (bool, error) { return false, errors.New("unused") }
+	a, err := task.NewEngine(ds, []task.Definition{recoverDef(c, first)}, task.Options{Holder: "A", Lease: 30 * time.Second, Now: clk.Now, StoreTries: 1, Fault: hook})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	tk, _ := a.Submit(ctx, "test.kind", task.Subject{Type: "x", ID: "1"}, nil, "u")
+	func() {
+		defer func() { _ = recover() }()
+		_, _ = a.RunOnce(ctx)
+	}()
+	// B is shut down in the middle of Recover
+	shutdown, stop := context.WithCancel(ctx)
+	cut := func(rctx context.Context, _ *task.Env) (bool, error) {
+		stop()
+		<-rctx.Done()
+		return false, rctx.Err()
+	}
+	b := engine(t, mem, "B", clk, recoverDef(c, cut))
+	clk.Add(31 * time.Second)
+	_, _ = b.RunOnce(shutdown)
+	got, _ := b.Get(ctx, tk.ID)
+	if got.State == task.Failed {
+		t.Fatalf("the task was failed by a run that was shut down: %+v", got.Error)
+	}
+	// the next run asks again, and this time the effect is there
+	d := engine(t, mem, "D", clk, recoverDef(c, func(context.Context, *task.Env) (bool, error) { return true, nil }))
+	clk.Add(31 * time.Second)
+	if ran, err := d.RunOnce(ctx); !ran || err != nil {
+		t.Fatalf("D: %v %v", ran, err)
+	}
+	if got, _ = d.Get(ctx, tk.ID); got.State != task.Done {
+		t.Fatalf("task after the next run: %s %+v", got.State, got.Error)
+	}
+	if n := c.get("n"); n != 1 {
+		t.Errorf("the step ran %d times", n)
 	}
 }
