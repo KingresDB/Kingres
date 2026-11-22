@@ -772,10 +772,14 @@ store_remote_rows(KsFanoutState *s, PGresult *res)
  * statement is already the local part of a fanned-out one.  The rows are kept
  * when keep_rows; the number of rows affected is returned.
  */
+/*
+ * nkeep >= 0: a shipped MERGE source numbers its arrays after the last parameter the text uses, so only that
+ * many parameters go along (review P12M-01: a declared but unused parameter must not shift the arrays).
+ */
 static uint64
-run_local(KsFanoutState *s, ParamListInfo params, bool keep_rows, int nextra, const char **extra)
+run_local(KsFanoutState *s, ParamListInfo params, bool keep_rows, int nextra, const char **extra, int nkeep)
 {
-	int			n = params ? params->numParams : 0;
+	int			n = (params && params->numParams > nkeep && nkeep >= 0) ? nkeep : (params ? params->numParams : 0);
 	Oid		   *argtypes = palloc(sizeof(Oid) * Max(n + nextra, 1));
 	Datum	   *values = palloc(sizeof(Datum) * Max(n + nextra, 1));
 	char	   *nulls = palloc(Max(n + nextra, 1));
@@ -1137,6 +1141,10 @@ run_all(KsFanoutState *s)
 	bool	   *ran = NULL;		/* the targets the statement ran on */
 	KsMergeShares *shares = NULL;
 	int			nran = 0;
+	int			nkeep = -1;		/* a shipped source: how many parameters of the statement the text uses */
+
+	if (s->mergeinfo != NIL)
+		nkeep = intVal(list_nth(s->mergeinfo, FO_MI_FIRST_PARAM)) - 1;
 
 	if (IsInParallelMode())
 		ereport(ERROR,
@@ -1229,7 +1237,7 @@ run_all(KsFanoutState *s)
 
 		if (t->is_local)
 		{
-			count = run_local(s, params, true, nextra, extra);
+			count = run_local(s, params, true, nextra, extra, nkeep);
 			local_count = count;
 			have_local = true;
 		}
@@ -1243,6 +1251,8 @@ run_all(KsFanoutState *s)
 
 			kingres_shard_begin_write_xact(kc);
 			values = kingres_shard_params_to_text(params, &types, &nparams);
+			if (nkeep >= 0 && nparams > nkeep)
+				nparams = nkeep;	/* P12M-01: the arrays follow the last parameter the text uses */
 			if (nextra > 0)
 			{
 				const char **values2 = palloc(sizeof(char *) * (nparams + nextra));
