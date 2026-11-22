@@ -95,9 +95,19 @@ describe('runDownload', () => {
   it('resumes with Range from the byte it holds after the network breaks, and the file is whole', async () => {
     const e = await makeExport()
     const sink = new MemorySink()
-    const out = await runDownload(options(e, sink, { open: cutAfter(e, 100) }))
+    const asked: number[] = []
+    const open = cutAfter(e, 100)
+    const out = await runDownload(
+      options(e, sink, {
+        open: (from, signal) => {
+          asked.push(from)
+          return open(from, signal)
+        },
+      }),
+    )
     expect(out).toMatchObject({ kind: 'complete', bytes: e.sizeBytes, verified: true, resumes: 1 })
-    // The first answer was cut after 100 bytes; the second asked for the rest with Range.
+    // The first answer was cut after 100 bytes; the second asked for the rest, from byte 100, with Range.
+    expect(asked).toEqual([0, 100])
     expect(transferSwitches.downloadRequests).toBe(2)
   })
 

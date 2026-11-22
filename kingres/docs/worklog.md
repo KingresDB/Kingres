@@ -7,6 +7,62 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-22: the console of phase 14a, table CSV export and import (increments CN1 to CN5, contract 0.19.0)
+
+Branch `dx-web`, from the contract commit cb4afe3757 of branch `dx-cp`. The control plane is written on `dx-cp` by another writer; this
+entry covers the console only. No Go code and no contract text was changed.
+
+### What was done
+
+- **CN1, API layer and mock.** The ten operations in `endpoints.ts` and `queries.ts`; calls that keep the session in place on a
+  401 (`unwrap(..., { keepSession: true })`) for the uploader; the texts of the twelve new problem codes; the labels of the task
+  kinds `table.export` and `table.import` and of the eight new audit actions (the red tests A0 left); a mock that behaves like
+  the server (offsets, 409 with the right offset, 64 KiB alignment, `Range` and 206, 416, 410, a 401 in the middle of an upload,
+  quota, the setting off, the role, creator-only files) with the fixtures of the design and a real SHA-256, and the `?transfer=` switches.
+- **CN2.** The *Data transfer* group of the settings page; the Transfers panel (export files and the uploads of the tab, Download,
+  Delete) on the databases page and on a database page; the resumable download (`lib/downloader.ts`).
+- **CN3.** *Export CSV* in the tables list: gates, consistency sentence before the confirmation, the spreadsheet text, options,
+  acceptance of code of another role, task progress, result with the SHA-256, the sentence about exporting twice, the download.
+- **CN4.** *Import CSV*: local preview and guess, the limit shown before the upload, options, the uploader (`Blob.slice`, 64 MiB,
+  re-read offset, password on a 401, pause, resume, cancel, `sessionStorage` in `try/catch`), the import task, the whitelisted
+  errors and the wording of `import_outcome_unknown`.
+- **CN5.** Tests, fifteen browser states, mutants (below), README and this entry.
+
+### How it was verified
+
+- Typecheck, lint (eslint with no warning, prettier), `npm run api:check`.
+- The full vitest suite: 97 files, 1580 tests, all passed.
+- The browser tests (`npm run test:browser`, 12 minutes): 3 files, 49 tests, all passed. They include the axe run of fourteen states of the data transfer (the settings group, the panel with files and with the setting off, the export dialog and its refusal, its result and its failure, the import dialog with the preview, the options, the stop for the password, the refused size, a failed import and an unknown outcome) in light at 1366 px and dark at 320 px, and the layout run of the same states at 1366 and 320 px.
+- **Mutants of the console** (a defect put in by hand, the tests that must notice it run, the file restored): 31 of 31 killed.
+  They cover the downloader (a short file called complete, the ETag, the SHA-256, a resume from byte 0, `Content-Range`, more bytes
+  than the record), the uploader (a conflict taken from the client, no re-read after a break, the 2 GiB cap missing or applied to a
+  compressed file, a 401 as a failure, no session check between chunks, another size continued, cancel without delete, an unaligned
+  chunk), the dialogs (the limit as `>=`, a repeat offered after an unknown outcome, the upload dropped after a failure), the
+  options (the null limit, `skipBom`, the spreadsheet guard, the consistency sentence), the gates and the panel, the settings
+  (sizes always sent), and the mock (another role sees a file, the alignment, a range past the end, a value in the failure text).
+
+### Decisions and deviations
+
+- The download is not only the plain link of the design: a fetch with `Range` resumes after a break and reports a short file; the
+  link is the fallback for a large file in a browser that cannot write to a file as it goes.
+- A file kept in memory is checked against the SHA-256 of the export before it is handed over; a mismatch saves nothing.
+- The 2 GiB cap is enforced in the browser before the first byte for an uncompressed file; for a gzip file the server counts after
+  expansion, so only the largest staged file applies.
+- The actions are mounted in the tables list of a database; the table page of phase 9 (branch `web-15b`) is not in this base and
+  takes `TableTransferActions` in its header.
+
+### Still open
+
+- E1 (the console against a real `kingresd`), after CP3, CP5 and CN4.
+- The table page mount, when `web-15b` and this branch meet.
+- A browser test that downloads a file (headless Chrome would open the file picker).
+
+### Core patches
+
+None.
+
+---
+
 ## 2026-11-20: automatic failover, the last steps of phase 2b and their review, the second review of phase 9 and its fixes, and two npm alerts
 
 Covers 2026-11-20 from the morning, after the third entry of 2026-11-19.

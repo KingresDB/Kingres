@@ -462,6 +462,63 @@ const freshFailover = async (page: Page): Promise<void> => {
   })
 }
 
+/** Clicks a button of the table row whose first cell says `name` (the tables list of a database). */
+async function clickRowButton(page: Page, name: string, label: string): Promise<void> {
+  await page.waitForSelector('[data-testid="export-csv"]', { timeout: 30_000 })
+  const ok = await page.evaluate(
+    (n, l) => {
+      const row = [...document.querySelectorAll('tbody tr')].find(
+        (r) => r.querySelector('th')?.textContent?.trim() === n,
+      )
+      const button = [...(row?.querySelectorAll('button') ?? [])].find(
+        (b) => b.textContent?.trim() === l,
+      )
+      button?.click()
+      return !!button
+    },
+    name,
+    label,
+  )
+  if (!ok) throw new Error(`No button ${label} in the row ${name}`)
+  await dialogOpen(page)
+}
+
+/** Chooses a CSV file in the import dialog the way a person does: a file in the input, and its change event. */
+async function chooseCsv(page: Page, name: string, text: string): Promise<void> {
+  await page.evaluate(
+    (n, t) => {
+      const input = document.querySelector<HTMLInputElement>('#import-file')
+      if (!input) throw new Error('No file input')
+      const transfer = new DataTransfer()
+      transfer.items.add(new File([t], n, { type: 'text/csv', lastModified: 1 }))
+      input.files = transfer.files
+      input.dispatchEvent(new Event('change', { bubbles: true }))
+    },
+    name,
+    text,
+  )
+  await page.waitForSelector('[data-testid="csv-preview"]', { timeout: 20_000 })
+  await sleep(250)
+}
+
+const NOTES_CSV = 'note_id,body,created_at\n1,hello,2026-01-01\n2,world,2026-01-02\n'
+const fastTasks = (page: Page) => setMock(page, { taskDurationMs: 400 })
+const slowTasks = (page: Page) => setMock(page, { taskDurationMs: 4000 })
+
+/** Closes the open dialog with its close button (a step of the import dialog has no Cancel). */
+const closeX = async (page: Page): Promise<void> => {
+  await page.click('[role="dialog"] [data-dialog-close]')
+  await sleep(200)
+}
+
+/** Goes through the options step of the import dialog and starts it. */
+async function startImport(page: Page): Promise<void> {
+  await page.click('[data-testid="to-options"]')
+  await page.waitForSelector('[data-testid="all-or-nothing"]', { timeout: 20_000 })
+  await sleep(200)
+  await page.click('[data-testid="start-import"]')
+}
+
 /**
  * The 0.4.0 and 0.5.0 states that the page loop does not reach: the certificate dialogs of a server, the
  * inclusion proof with the digests compared against it, the add-server dialog with the fingerprint, the
@@ -1206,6 +1263,201 @@ export const STATES: PageState[] = [
     },
   },
   {
+    name: 'settings: data transfer group (0.19.0)',
+    route: '/settings',
+    open: async (page) => {
+      await page.waitForSelector('[data-testid="data-transfer-settings"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+  },
+  {
+    name: 'transfers panel with export files (0.19.0)',
+    needsMock: true,
+    route: '/databases',
+    open: async (page) => {
+      await urlSwitch(page, 'transfer', 'exports')
+      await page.waitForSelector('[data-testid="transfers-panel"] tbody tr', { timeout: 30_000 })
+      await sleep(250)
+    },
+  },
+  {
+    name: 'transfers panel while data transfer is off (0.19.0)',
+    needsMock: true,
+    route: '/databases',
+    open: async (page) => {
+      await urlSwitch(page, 'transfer', 'off')
+      await page.waitForSelector('[data-testid="transfers-off"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await page.evaluate(() => {
+        const mock = (
+          window as unknown as {
+            __kingresMock: { state: () => { settings: { dataTransfer?: { enabled: boolean } } } }
+          }
+        ).__kingresMock
+        const dt = mock.state().settings.dataTransfer
+        if (dt) dt.enabled = true
+        void (
+          window as unknown as { __queryClient: { invalidateQueries: () => unknown } }
+        ).__queryClient.invalidateQueries()
+      })
+      await sleep(300)
+    },
+  },
+  {
+    name: 'export CSV dialog (0.19.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await clickRowButton(page, 'public.orders', 'Export CSV')
+      await page.waitForSelector('[data-testid="export-consistency-before"]', { timeout: 20_000 })
+    },
+    close: cancel,
+  },
+  {
+    name: 'export CSV dialog, spreadsheet guard off and an acknowledgement (0.19.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await clickRowButton(page, 'public.othercode', 'Export CSV')
+      await page.click('[data-testid="spreadsheet-safe"]')
+      await page.waitForSelector('[data-testid="spreadsheet-warning"]', { timeout: 20_000 })
+      await clickText(page, 'Export table', '[role="dialog"] button')
+      await page.waitForSelector('[data-testid="acknowledge-code"]', { timeout: 20_000 })
+      await sleep(250)
+    },
+    close: cancel,
+  },
+  {
+    name: 'export CSV result with the download (0.19.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await fastTasks(page)
+      await clickRowButton(page, 'public.skewme', 'Export CSV')
+      await clickText(page, 'Export table', '[role="dialog"] button')
+      await page.waitForSelector('[data-testid="download-start"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await closeDialogs(page)
+      await slowTasks(page)
+    },
+  },
+  {
+    name: 'export CSV failed (0.19.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await fastTasks(page)
+      await clickRowButton(page, 'public.failme', 'Export CSV')
+      await clickText(page, 'Export table', '[role="dialog"] button')
+      await page.waitForSelector('[role="dialog"] [role="alert"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await closeDialogs(page)
+      await slowTasks(page)
+    },
+  },
+  {
+    name: 'import CSV dialog, file chosen with the preview (0.19.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await clickRowButton(page, 'public.notes', 'Import CSV')
+      await chooseCsv(page, 'notes.csv', NOTES_CSV)
+    },
+    close: cancel,
+  },
+  {
+    name: 'import CSV dialog, the options and what all or nothing means (0.19.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await clickRowButton(page, 'public.notes', 'Import CSV')
+      await chooseCsv(page, 'notes.csv', NOTES_CSV)
+      await page.click('[data-testid="to-options"]')
+      await page.waitForSelector('[data-testid="all-or-nothing"]', { timeout: 20_000 })
+      await sleep(250)
+    },
+    close: closeX,
+  },
+  {
+    name: 'import CSV dialog, the session ended in the middle of the upload (0.19.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await urlSwitch(page, 'transfer', 'session')
+      await clickRowButton(page, 'public.notes', 'Import CSV')
+      await chooseCsv(page, 'notes.csv', NOTES_CSV)
+      await startImport(page)
+      await page.waitForSelector('[data-testid="upload-password"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await clickText(page, 'Cancel the upload', '[role="dialog"] button')
+      await closeX(page)
+    },
+  },
+  {
+    name: 'import CSV dialog, the file is too large (0.19.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await clickRowButton(page, 'public.notes', 'Import CSV')
+      // A file of 3 GiB: the size is what the browser reports; only its first bytes are read.
+      await page.evaluate((t) => {
+        const input = document.querySelector<HTMLInputElement>('#import-file')
+        if (!input) throw new Error('No file input')
+        const file = new File([t], 'big.csv', { type: 'text/csv' })
+        Object.defineProperty(file, 'size', { value: 3 * 1024 ** 3 })
+        const transfer = new DataTransfer()
+        transfer.items.add(file)
+        input.files = transfer.files
+        input.dispatchEvent(new Event('change', { bubbles: true }))
+      }, NOTES_CSV)
+      await page.waitForSelector('[data-testid="file-refused"]', { timeout: 20_000 })
+      await sleep(250)
+    },
+    close: cancel,
+  },
+  {
+    name: 'import CSV failed with a whitelisted sentence (0.19.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await fastTasks(page)
+      await clickRowButton(page, 'public.notes', 'Import CSV')
+      await chooseCsv(page, 'badrow.csv', NOTES_CSV)
+      await startImport(page)
+      await page.waitForSelector('[data-testid="import-failed-note"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await closeDialogs(page)
+      await slowTasks(page)
+    },
+  },
+  {
+    name: 'import CSV, the outcome is not known (0.19.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await fastTasks(page)
+      await clickRowButton(page, 'public.notes', 'Import CSV')
+      await chooseCsv(page, 'outcome.csv', NOTES_CSV)
+      await startImport(page)
+      await page.waitForSelector('[data-testid="outcome-unknown"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await closeDialogs(page)
+      await slowTasks(page)
+    },
+  },
+  {
     name: 'system database stopped',
     route: '/this-server',
     open: async (page) => {
@@ -1238,3 +1490,8 @@ export const STATES: PageState[] = [
     },
   },
 ]
+
+/** The states of the data transfer (contract 0.19.0): they are run apart from the older ones, so that each run stays inside the time of one test. */
+export const TRANSFER_STATES = STATES.filter((s) => s.name.includes('(0.19.0)'))
+/** Every state that is not one of the data transfer. */
+export const OLDER_STATES = STATES.filter((s) => !s.name.includes('(0.19.0)'))

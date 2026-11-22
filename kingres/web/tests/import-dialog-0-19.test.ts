@@ -101,6 +101,22 @@ describe('step 1: the file', () => {
     expect(getState().transfer.uploads).toEqual([])
   })
 
+  it('takes a file of exactly 2 GiB and refuses one byte more', async () => {
+    const user = userEvent.setup()
+    await renderApp('/databases/shop')
+    const dialog = await openImport('notes', user)
+    const exact = csv()
+    Object.defineProperty(exact, 'size', { value: 2 * GIB })
+    await choose(dialog, exact, user)
+    expect(within(dialog).queryByTestId('file-refused')).toBeNull()
+    expect(within(dialog).getByTestId('to-options')).toBeEnabled()
+    const over = csv()
+    Object.defineProperty(over, 'size', { value: 2 * GIB + 1 })
+    await choose(dialog, over, user)
+    expect(await within(dialog).findByTestId('file-refused')).toBeInTheDocument()
+    expect(within(dialog).getByTestId('to-options')).toBeDisabled()
+  })
+
   it('does not apply the 2 GiB limit to a compressed file and says it cannot be previewed', async () => {
     const user = userEvent.setup()
     await renderApp('/databases/shop')

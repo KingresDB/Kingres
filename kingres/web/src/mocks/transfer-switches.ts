@@ -58,7 +58,7 @@ export function applyTransferSwitch(entry: string, s: MockState): void {
   if (entry === 'insecure') transferSwitches.insecure = true
   if (entry === 'full' && dt) dt.stagingQuotaBytes = MiB
   if (entry === 'small') transferSwitches.chunkBytesMax = 128 * KiB
-  if (entry === 'session') transferSwitches.loseSessionAtChunk = 2
+  if (entry === 'session') transferSwitches.loseSessionAtChunk = transferSwitches.chunkRequests + 1
   if (entry === 'cut') {
     transferSwitches.breakChunkAfterBytes = 100 * KiB
     transferSwitches.breakDownloadAfterBytes = KiB
