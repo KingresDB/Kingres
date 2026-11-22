@@ -151,9 +151,13 @@ refused('data-modifying CTE in a write', $n1,
 	qr/cannot be run on every node|WITH clause|reads a table/);
 same_everywhere('CTE', 'logr', 'logr2');
 
-# MERGE and COPY FROM are refused, TRUNCATE is propagated.
-refused('MERGE', $n1,
-	q{MERGE INTO public.logr t USING (VALUES (1, 'm')) s(k, v) ON t.k = s.k WHEN NOT MATCHED THEN INSERT VALUES (s.k, s.v)},
+# MERGE into a reference table runs on every node since phase 12 (a source of constants, M4); with the switch off it is refused as before.  COPY FROM is refused, TRUNCATE is propagated.
+{
+	my ($rc, $out, $err) = run_sql($n1, q{MERGE INTO public.logr t USING (VALUES (1, 'm')) s(k, v) ON t.k = s.k WHEN NOT MATCHED THEN INSERT VALUES (s.k, s.v)});
+	is($rc, 0, 'MERGE into a reference table runs (phase 12, M4)') or diag($err);
+}
+refused('MERGE with kingres_shard.enable_distributed_merge off', $n1,
+	q{SET kingres_shard.enable_distributed_merge = off; MERGE INTO public.logr t USING (VALUES (2, 'm')) s(k, v) ON t.k = s.k WHEN NOT MATCHED THEN INSERT VALUES (s.k, s.v)},
 	qr/MERGE into a reference table is not supported/);
 refused('COPY FROM', $n1, q{COPY public.logr FROM STDIN}, qr/not supported/);
 same_everywhere('MERGE and COPY', 'logr');
