@@ -351,3 +351,14 @@ Counts of this second look: critical 0, high 0, medium 0, low 1 (C14-08), note 2
 
 The no-clearing mutant against t/069 (not rebuilt), a MAINTAIN-only role, a full disk in the merge, cancels at each point of the merge, wraparound autovacuum, and the PostgreSQL 18 runs of
 rv04, rv06, rv07, rv08, rv10 and rv13 (the same scripts passed on 18 on the earlier code, and on 19 on this code).
+
+### Fixes of the low finding and the two notes (2026-11-22)
+
+* **C14-08 fixed.** A developer gate at point 8 (`KC_RES_VAC_LOCKED`) stands in `kc_index_vacuum` between the vacuum lock and the read of the ranges. `t/070` stops the vacuum
+  there, lets a writer that aborted insert again, and checks that the tail was not given back (the insert takes 64 row numbers, not the few of a give-back). Mutant M9 (the lock taken
+  after the ranges are read, the gate left in front) fails that check; the clean code passes it. The vacuum's lock is taken before the ranges, and a test now says so.
+* **C14-09 documented.** The README says that the give-back is refused for the whole run of an index vacuum, up to 63 row numbers per commit or abort, with the rate worked out
+  (about 0.2 percent of the numbers per hour at 100 000 commits per second) and the 90 percent warning as the way to see it. No code change.
+* **C14-10 fixed.** A merge that is skipped because the `VACUUM` already has a transaction id now says so at `DEBUG1`. `t/070` drops a columnar table in a server without the library, so
+  that the reconcile at the start of the next `VACUUM` deletes its catalog rows, and checks the message and that no stripe was merged; the next `VACUUM` merges. Mutant M10 (the message
+  at `DEBUG5`) fails the check.

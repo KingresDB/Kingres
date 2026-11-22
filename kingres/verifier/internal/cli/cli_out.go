@@ -37,6 +37,8 @@ type result struct {
 	// that carry no info of their own then carry it (inputInfo), so that
 	// old_anchor_weak is on every one of them (L16-02).
 	keepInfo bool
+	// exit is the status of a success when it is not ExitOK (a verdict with a word of its own).
+	exit int
 }
 
 // inputInfo is the info an input error carries: the info of the run once the held
@@ -181,10 +183,14 @@ func (e *env) printLines(prefix string, lines []string) {
 
 // finishOK prints a verified result and returns the exit status 0.
 func (e *env) finishOK(r *result, asJSON bool) int {
-	traceExit(ExitOK)
+	code := ExitOK
+	if r.exit != 0 {
+		code = r.exit
+	}
+	traceExit(code)
 	if asJSON {
 		e.printJSON(jsonOutput{Command: r.cmd, Verified: true, Steps: r.steps, Info: r.info, Notes: r.notes, NotProved: r.notProved})
-		return ExitOK
+		return code
 	}
 	word := r.word
 	if word == "" {
@@ -194,7 +200,7 @@ func (e *env) finishOK(r *result, asJSON bool) int {
 	e.printSteps(r.steps)
 	e.printLines("note: ", r.notes)
 	e.printLines("not proved: ", r.notProved)
-	return ExitOK
+	return code
 }
 
 // finishFailed prints a failed verification and returns the exit status 1.

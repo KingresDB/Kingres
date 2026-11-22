@@ -150,10 +150,45 @@ sub invalidations_of
 	is($h->query('SELECT count(*) FROM tenant_11.t1'), 0, 'D: an index that has another name is the same index');
 	q1($n1, q{ALTER INDEX kingres.ks_renamed_pk RENAME TO dist_table_pkey});
 	$h->quit;
-	# a table of the extension without its primary key is an error, never "a local table" (in a transaction that is rolled back)
+	# a table of the extension without its primary key is read without an index, never answered as "a local table" (in a transaction that is rolled back)
 	my ($rc, $out, $err) = run_sql($n1, q{BEGIN; ALTER TABLE kingres.dist_schema DROP CONSTRAINT dist_schema_pkey; SELECT count(*) FROM tenant_12.t1; ROLLBACK});
-	like($err, qr/has no primary key/, 'D: without the primary key of dist_schema a statement on a schema table is refused with the reason, not answered from a local copy') or diag($err);
+	like($err, qr/WARNING:.*has no primary key/, 'D: without the primary key of dist_schema a statement on a schema table warns') or diag($err);
+	is($rc, 0, 'D: ... and is not refused') or diag($err);
 	is(q1($n1, q{SELECT count(*) FROM tenant_12.t1}), 0, 'D: after the rollback it answers again');
+}
+
+# E. a primary key that is gone and not restored (committed) does not block the repair or any other statement (review P12F-01)
+{
+	for my $t (['dist_schema', 'nsp', 'tenant_20'], ['dist_table', 'relid', 'tenant_21'])
+	{
+		my ($tab, $col, $sch) = @$t;
+		q1($n1, "ALTER TABLE kingres.$tab DROP CONSTRAINT ${tab}_pkey CASCADE");
+		my ($rc, $out, $err) = run_sql($n1, "SELECT count(*) FROM $sch.t1");
+		is($rc, 0, "E: $tab without its key: a statement on a schema table is answered") or diag($err);
+		is($out, 0, "E: ... with the right answer");
+		like($err, qr/WARNING:.*"$tab" of the extension has no primary key.*\n?.*HINT:.*ADD PRIMARY KEY/s, "E: ... and a warning that names the table and the repair");
+		($rc, $out, $err) = run_sql($n1, "INSERT INTO $sch.t1 VALUES (5, 'y') RETURNING id");
+		is($rc, 0, "E: $tab without its key: a write is routed") or diag($err);
+		is(q1($n1, "SELECT count(*) FROM $sch.t1 WHERE id = 5"), 1, 'E: ... and it is there');
+		($rc, $out, $err) = run_sql($n1, "CREATE TABLE public.loc_$tab (id int)");
+		is($rc, 0, "E: $tab without its key: an unrelated CREATE TABLE runs") or diag($err);
+		($rc, $out, $err) = run_sql($n1, "ALTER TABLE kingres.$tab ADD CONSTRAINT ${tab}_pkey PRIMARY KEY ($col)");
+		is($rc, 0, "E: $tab: ALTER TABLE ... ADD PRIMARY KEY, the repair the warning names, runs") or diag($err);
+		is(q1($n1, "SELECT count(*) FROM pg_index WHERE indrelid = 'kingres.$tab'::regclass AND indisprimary"), 1, 'E: ... and the key is back');
+		# the foreign key of dist_partition went with the key (CASCADE): put it back
+		q1($n1, q{ALTER TABLE kingres.dist_partition ADD CONSTRAINT dist_partition_parent_fkey FOREIGN KEY (parent) REFERENCES kingres.dist_table (relid) ON DELETE CASCADE}) if $tab eq 'dist_table';
+		($rc, $out, $err) = run_sql($n1, "SELECT count(*) FROM tenant_22.t1");
+		unlike($err, qr/WARNING/, 'E: after the repair there is no warning') or diag($err);
+		is($out, 0, 'E: ... and routing works');
+		is(q1($n1, "INSERT INTO $sch.t1 VALUES (6, 'z') RETURNING id"), 6, 'E: ... also a write on the table that was written without the key');
+	}
+	# the same through a unique index, as the review names it (CREATE UNIQUE INDEX is not a primary key: the lookups keep scanning, and say so)
+	q1($n1, q{ALTER TABLE kingres.dist_schema DROP CONSTRAINT dist_schema_pkey});
+	my ($rc, $out, $err) = run_sql($n1, q{CREATE UNIQUE INDEX ks_p12f_idx ON kingres.dist_schema (nsp)});
+	is($rc, 0, 'E: CREATE UNIQUE INDEX on a table without its key runs') or diag($err);
+	q1($n1, q{DROP INDEX kingres.ks_p12f_idx; ALTER TABLE kingres.dist_schema ADD CONSTRAINT dist_schema_pkey PRIMARY KEY (nsp)});
+	is(q1($n1, q{SELECT count(*) FROM tenant_23.t1}), 0, 'E: the cluster answers after the last repair');
+	is(q1($n1, q{SELECT coalesce(string_agg(check_name, ','), '') FROM kingres.check_cluster()}), '', 'E: check_cluster() finds nothing');
 }
 
 done_testing();
