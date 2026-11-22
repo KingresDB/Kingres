@@ -694,13 +694,35 @@ var ErrGenerationJump = fmt.Errorf("%w (its generation is far above the one of t
 // remove the file of the target on this server (<key directory>/anchor/<id>.json) and enter the credentials again, which writes a new one.
 var ErrGenerationExhausted = errors.New("ledgeranchor: the generation of the credentials file is at its bound: remove the file of the target on this server and enter the credentials again")
 
-// Install writes a file received from another server, with the generation and the stamp it carries: it must decode here (so a holder with
+// MaxLeaderJump is how far above the file that is here, or above what the leader saw at the holders when there is no file, a file may be that the
+// leader hands over (P7I-03): the leader is the authenticated source of the cluster's credentials over the internal API, so a holder that missed
+// more than MaxGenerationJump changes is brought up to date without the operator removing anything. A file above that is a damaged one.
+const MaxLeaderJump = 1 << 20
+
+// InstallSource says where a file comes from, which decides what Install believes of it.
+type InstallSource struct {
+	// Leader: the file was sent by the leader over the authenticated internal API (credentials/install). It is accepted in clear by a server that
+	// seals (it is sealed here, keeping its generation and stamp: P7I-02), and it may be MaxLeaderJump above the reference.
+	Leader bool
+	// Known is the reference of the bound when this server has no file for the target: the highest generation that the sender saw at the holders
+	// (0 when it saw none). A file that was fetched from a holder and the first file of a holder that was given one are bounded against it
+	// (P7I-01).
+	Known uint64
+}
+
+// Install is InstallFrom for a file that is not from the leader (a file fetched from a holder), with no reference for a first file.
+func (s *CredStore) Install(id int64, kind string, data []byte) error {
+	return s.InstallFrom(id, kind, data, InstallSource{})
+}
+
+// InstallFrom writes a file received from another server, with the generation and the stamp it carries: it must decode here (so a holder with
 // another passphrase says so), and it is written again under this server's own sealing. A file of a lower generation than the one that is here,
-// or of the same generation and another rotation, is refused with ErrOlderGeneration.
+// or of the same generation and another rotation, is refused with ErrOlderGeneration; a generation far above the reference is refused with
+// ErrGenerationJump; a file in clear above generation 0 on a server that seals is refused with ErrPlainFile unless the leader sent it.
 //
 // A file that does not decode here is ErrCredentials. A failure of this server (a full or unwritable disk, a passphrase file that cannot be read)
 // is ErrInstallWrite as well, so that a caller can tell a bad file from a bad server (P7F-02, P7G-04).
-func (s *CredStore) Install(id int64, kind string, data []byte) error {
+func (s *CredStore) InstallFrom(id int64, kind string, data []byte, src InstallSource) error {
 	st, err := s.DecodeFile(data, kind)
 	if err != nil {
 		if errors.Is(err, ErrPassphraseFile) {
@@ -708,15 +730,20 @@ func (s *CredStore) Install(id int64, kind string, data []byte) error {
 		}
 		return err
 	}
-	if s.Sealed() && st.Plain && st.Generation > 0 {
+	if s.Sealed() && st.Plain && st.Generation > 0 && !src.Leader {
 		return ErrPlainFile
 	}
+	limit := uint64(MaxGenerationJump)
+	if src.Leader {
+		limit = MaxLeaderJump
+	}
 	defer s.lock(id)()
-	if cur, cerr := s.Digest(id); cerr == nil {
+	cur, cerr := s.Digest(id)
+	if cerr == nil {
 		if st.Generation < cur.Generation {
 			return ErrOlderGeneration
 		}
-		if st.Generation > cur.Generation+MaxGenerationJump {
+		if st.Generation > cur.Generation+limit {
 			return ErrGenerationJump
 		}
 		if st.Generation == cur.Generation {
@@ -729,11 +756,62 @@ func (s *CredStore) Install(id int64, kind string, data []byte) error {
 				return ErrOlderGeneration
 			}
 		}
+	} else if st.Generation > src.Known+limit {
+		// no file here: the first file is bounded against what the sender saw at the holders, not believed at any number (P7I-01)
+		return ErrGenerationJump
 	}
 	if _, err = s.write(id, st.Creds, st.Generation, st.Stamp); err != nil {
 		return fmt.Errorf("%w: %w", ErrInstallWrite, err)
 	}
 	return nil
+}
+
+// SealPlainFiles writes again, under this server's sealing, the files in clear above generation 0 that it holds (P7I-02): a server that has just got
+// a passphrase file holds its own files in clear, and Digest does not count a file in clear on a server that seals (a planted file must not win the
+// ordering), so without this it would take itself for behind. The generation and the stamp are kept, the file is this server's own. A file above
+// MaxLeaderJump is left alone (damaged, and still not counted). It returns the number of files sealed.
+func (s *CredStore) SealPlainFiles() (int, error) {
+	if !s.Sealed() {
+		return 0, nil
+	}
+	ids, err := s.IDs()
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, id := range ids {
+		unlock := s.lock(id)
+		data, rerr := readPrivate(s.path(id), MaxCredFile)
+		if rerr != nil {
+			unlock()
+			continue
+		}
+		b, oerr := s.openBody(data)
+		clear(data)
+		if oerr != nil || !b.Plain || b.Generation == 0 || b.Generation > MaxLeaderJump {
+			clear(b.Members)
+			unlock()
+			continue
+		}
+		var m map[string]string
+		if json.Unmarshal(b.Members, &m) != nil {
+			clear(b.Members)
+			unlock()
+			continue
+		}
+		cr := Creds{}
+		for k, v := range m {
+			cr[k] = anchor.Secret(v)
+		}
+		clear(b.Members)
+		if _, werr := s.write(id, cr, b.Generation, b.Stamp); werr != nil {
+			unlock()
+			return n, werr
+		}
+		n++
+		unlock()
+	}
+	return n, nil
 }
 
 // Raw returns the bytes of the file of a target, for the leader that distributes it (ErrNoCredentials when there

@@ -50,6 +50,21 @@ type InstallRequest struct {
 	TargetID int64  `json:"targetId"`
 	Kind     string `json:"kind"`
 	File     string `json:"file"`
+	// Known is the highest generation that the leader saw at the holders: the reference of the bound for a holder that has no file (P7I-01).
+	Known uint64 `json:"known,omitempty"`
+}
+
+type knownKey struct{}
+
+// WithKnownGeneration carries the highest generation seen at the holders to the function that hands a file over.
+func WithKnownGeneration(ctx context.Context, g uint64) context.Context {
+	return context.WithValue(ctx, knownKey{}, g)
+}
+
+// KnownGeneration is what WithKnownGeneration carried (0 when nothing).
+func KnownGeneration(ctx context.Context) uint64 {
+	g, _ := ctx.Value(knownKey{}).(uint64)
+	return g
 }
 
 // RemoveRequest is the body of CallCredentialsRemove.
@@ -82,7 +97,10 @@ func (a *Agent) Handle(_ context.Context, key string, body []byte) (any, error) 
 		if _, err := kindOf(in.Kind); err != nil {
 			return nil, bad("bad_request", "The kind is not known on this server.", http.StatusBadRequest)
 		}
-		if err := a.Creds.Install(in.TargetID, in.Kind, raw); err != nil {
+		if err := a.Creds.InstallFrom(in.TargetID, in.Kind, raw, InstallSource{Leader: true, Known: in.Known}); err != nil {
+			if errors.Is(err, ErrGenerationJump) {
+				return nil, bad("generation_too_far", "The generation of the file is far above the one of this server: if this server's file is damaged, remove it (<key directory>/anchor/<id>.json) and the next pass gives it the leader's file.", http.StatusConflict)
+			}
 			if errors.Is(err, ErrOlderGeneration) {
 				return nil, bad("older_generation", "This server holds a newer credentials file for the target, or a different one of the same generation.", http.StatusConflict)
 			}

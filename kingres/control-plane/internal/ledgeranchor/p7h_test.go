@@ -64,8 +64,12 @@ func TestAPlainFileWithAChosenGenerationIsRefusedByAServerThatSealsAndRotationSt
 	if d, _ := sealed.Digest(10); d.Generation != 1 || d.Digest == "" {
 		t.Fatalf("%+v", d)
 	}
-	// a server that does not seal still takes a plain file: the property belongs to the sealing
-	if err := e.creds.Install(11, "worm", plain); err != nil {
+	// a server that does not seal still takes a plain file, but a first file is bounded against what the sender saw (P7I-01)
+	if err := e.creds.Install(11, "worm", plain); !errors.Is(err, ErrGenerationJump) {
+		t.Fatalf("a first file at the top of the range: %v", err)
+	}
+	near, _ := e.creds.Encode(creds2(), 5, newStamp(t))
+	if err := e.creds.Install(11, "worm", near); err != nil {
 		t.Fatalf("a plain server: %v", err)
 	}
 }

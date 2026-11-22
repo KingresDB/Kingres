@@ -35,6 +35,12 @@ func newLedgerAnchor(cfg config.Config, dir string, sys func(ctx context.Context
 	if err != nil {
 		return nil, err
 	}
+	// a server that has just got a passphrase file holds its own files in clear: they are sealed, keeping generation and stamp (P7I-02)
+	if n, serr := creds.SealPlainFiles(); serr != nil {
+		log.Warn("the credentials files in clear could not all be sealed", "sealed", n, "error", serr.Error())
+	} else if n > 0 {
+		log.Info("the credentials files in clear were sealed", "files", n)
+	}
 	holders := func(ctx context.Context) ([]string, error) {
 		var hosts []string
 		err := sys(ctx, func(c *pgx.Conn) error {
@@ -67,11 +73,17 @@ func newLedgerAnchor(cfg config.Config, dir string, sys func(ctx context.Context
 		var bad []string
 		for _, h := range hs {
 			if err := members.Client.Do(ctx, h, "POST", path, body, nil); err != nil {
-				bad = append(bad, h)
+				// the reason goes with the name: a holder that refuses a file (it seals its files and this server does not, a number that is far
+				// above its own) is told apart from a holder that did not answer (P7I-02)
+				reason := err.Error()
+				if len(reason) > 160 {
+					reason = reason[:160]
+				}
+				bad = append(bad, h+" ("+reason+")")
 			}
 		}
 		if len(bad) > 0 {
-			return fmt.Errorf("not reached: %s", strings.Join(bad, ", "))
+			return fmt.Errorf("not reached or refused: %s", strings.Join(bad, ", "))
 		}
 		return nil
 	}
@@ -186,7 +198,7 @@ func newLedgerAnchor(cfg config.Config, dir string, sys func(ctx context.Context
 			return ok, err
 		},
 		Distribute: func(ctx context.Context, id int64, kind string, file []byte) error {
-			return each(ctx, "/ledger/anchor/credentials/install", ledgeranchor.InstallRequest{TargetID: id, Kind: kind, File: base64.StdEncoding.EncodeToString(file)})
+			return each(ctx, "/ledger/anchor/credentials/install", ledgeranchor.InstallRequest{TargetID: id, Kind: kind, File: base64.StdEncoding.EncodeToString(file), Known: ledgeranchor.KnownGeneration(ctx)})
 		},
 		Undistribute: func(ctx context.Context, id int64) error {
 			return each(ctx, "/ledger/anchor/credentials/remove", ledgeranchor.RemoveRequest{TargetID: id})

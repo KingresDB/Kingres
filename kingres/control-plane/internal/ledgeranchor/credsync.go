@@ -105,27 +105,44 @@ func judgeCopies(own CopyInfo, others []HolderCopy) (newer *HolderCopy, stale, c
 	return newer, stale, conflict, jump
 }
 
-// generationFloor is the highest generation that a holder reports for a target: a leader that rotates credentials writes a generation above it.
-// Holders that cannot be asked are not in it (a holder that has a higher one refuses the file, which is an alert).
-func (s *Service) generationFloor(ctx context.Context, id int64) (floor uint64, unreached []string, err error) {
+// genView is what the holders say about the generation of the credentials of a target, as far as they could be asked.
+type genView struct {
+	// floor is the highest generation that a holder reports and that is not far above this server's file: a leader that rotates credentials writes
+	// a generation above it. known is the highest of all, the reference of the bound for a holder that has no file (P7I-01).
+	floor, known uint64
+	// unreached are the holders that could not be asked.
+	unreached []string
+	// holdersHaveFile: some holder has a file for the target. ownFile: this server has one.
+	holdersHaveFile, ownFile bool
+}
+
+// generationView asks the holders (nothing is asked, and the view is empty, when this server has no holders to ask).
+func (s *Service) generationView(ctx context.Context, id int64) (genView, error) {
+	var v genView
+	var own uint64
+	if d, derr := s.cfg.Creds.Digest(id); derr == nil {
+		own, v.ownFile = d.Generation, true
+	}
 	if s.cfg.Holders == nil {
-		return 0, nil, nil
+		return v, nil
 	}
 	rep, err := s.cfg.Holders(ctx, []int64{id})
 	if err != nil {
-		return 0, nil, err
+		return v, err
 	}
-	var own uint64
-	if d, derr := s.cfg.Creds.Digest(id); derr == nil {
-		own = d.Generation
-	}
+	v.unreached = rep.Unreached
 	for _, c := range rep.Copies[id] {
-		// a generation far above this server's is a damaged or foreign file and is not counted: the way out of it is a rotation here
-		if c.Generation > floor && c.Generation <= own+MaxGenerationJump {
-			floor = c.Generation
+		v.holdersHaveFile = true
+		if c.Generation > v.known {
+			v.known = c.Generation
+		}
+		// a generation far above this server's file is a damaged or foreign file and is not counted (P7H-01); without a file of its own this
+		// server has no reference, and a change of the credentials is refused instead (P7I-03)
+		if c.Generation > v.floor && (!v.ownFile || c.Generation <= own+MaxGenerationJump) {
+			v.floor = c.Generation
 		}
 	}
-	return floor, rep.Unreached, nil
+	return v, nil
 }
 
 // fetchOutcome is the result of fetchMissing.
@@ -141,6 +158,8 @@ const (
 	// fetchNotInstalled: a holder gave a file and this server could not store it (P7F-02, P7G-04: the disk, or the passphrase file that could
 	// not be read): a matter of this server, a retry later may work.
 	fetchNotInstalled
+	// fetchRefused: a holder gave a file whose generation is far above what the holders report: a damaged or foreign file, not taken (P7I-01).
+	fetchRefused
 	// fetchUnopenable: a holder gave a file that this server cannot open (it is sealed under another passphrase, or it is not a credentials
 	// file): the operator must help.
 	fetchUnopenable
@@ -164,12 +183,19 @@ func (s *Service) fetchMissing(ctx context.Context, t TargetRow) fetchOutcome {
 		return fetchUnreached
 	}
 	defer clear(data)
-	if err := s.cfg.Creds.Install(t.ID, t.Kind, data); err != nil {
+	var known uint64
+	if v, verr := s.generationView(ctx, t.ID); verr == nil {
+		known = v.known
+	}
+	if err := s.cfg.Creds.InstallFrom(t.ID, t.Kind, data, InstallSource{Known: known}); err != nil {
 		s.log.Warn("the credentials file that another holder gave could not be installed", "target", t.ID, "error", errText(err))
 		// a disk that could not be written or a passphrase file that could not be read is a matter of this server and the holders still have
 		// the file; a file that does not open here is not
 		if errors.Is(err, ErrInstallWrite) {
 			return fetchNotInstalled
+		}
+		if errors.Is(err, ErrGenerationJump) {
+			return fetchRefused
 		}
 		return fetchUnopenable
 	}
@@ -331,6 +357,8 @@ func (s *Service) jobCredentials(ctx context.Context, term scheduler.Term) error
 				text = fmt.Sprintf("This server has no credentials file for target %s, and not every other holder could be asked for it (a holder did not answer): it cannot anchor at this target until one gives it. It is asked again every minute.", t.Name)
 			case fetchNotInstalled:
 				text = fmt.Sprintf("This server has no credentials file for target %s: a holder gave it and it could not be stored here (check the disk, the permissions of the key directory and the passphrase file). It is asked again every minute.", t.Name)
+			case fetchRefused:
+				text = fmt.Sprintf("This server has no credentials file for target %s: a holder gave one whose generation is far above what the holders report (a damaged or foreign file), and it was not taken. Remove the file of the target on that holder (<key directory>/anchor/<id>.json) or enter the credentials of the target again.", t.Name)
 			case fetchUnopenable:
 				text = fmt.Sprintf("This server has no credentials file for target %s: a holder gave one that cannot be opened with the passphrase file of this server (another passphrase, or a plain server and a sealed file). Give the servers the same passphrase file or enter the credentials of the target again.", t.Name)
 			default:
@@ -401,7 +429,7 @@ func (s *Service) jobCredentials(ctx context.Context, term scheduler.Term) error
 			if len(jump) > 0 {
 				// a number that no run of rotations reaches (P7H-01): not believed, not taken, not replaced. The way out is on that holder
 				if _, bad := problems[id]; !bad {
-					problems[id] = CredProblem{Text: fmt.Sprintf("The holders %s report a credentials generation for target %s that is more than %d above this server's (%d): a damaged or foreign file. It is neither taken nor replaced. Remove the file of the target on that holder (<key directory>/anchor/<id>.json) and the next pass gives it this server's file (entering the credentials again does not change that holder: it refuses a file below its own number).", strings.Join(jump, ", "), t.Name, MaxGenerationJump, own.Generation)}
+					problems[id] = CredProblem{Text: fmt.Sprintf("The holders %s report a credentials generation for target %s that is more than %d above this server's (%d): a damaged or foreign file. It is neither taken nor replaced. Remove the file of the target on that holder (<key directory>/anchor/<id>.json) and the next pass gives it this server's file (entering the credentials again does not change that holder: it refuses a file below its own number). If instead this server was away for more than %d changes and the holders are right, remove this server's own file of the target and the next pass takes the holders' file.", strings.Join(jump, ", "), t.Name, MaxGenerationJump, own.Generation, MaxGenerationJump)}
 				}
 			}
 		}
@@ -415,12 +443,18 @@ func (s *Service) jobCredentials(ctx context.Context, term scheduler.Term) error
 			}
 			derr := error(nil)
 			if s.cfg.Distribute != nil {
-				derr = s.cfg.Distribute(ctx, id, kinds[id], raw)
+				var known uint64
+				for _, c := range rep.Copies[id] {
+					if c.Generation > known {
+						known = c.Generation
+					}
+				}
+				derr = s.cfg.Distribute(WithKnownGeneration(ctx, known), id, kinds[id], raw)
 			}
 			clear(raw)
 			if derr != nil {
-				problems[id] = CredProblem{Text: fmt.Sprintf("The credentials file of target %s could not be given to the holders %s (they have none or an older one): after a change of the leader one of them cannot anchor at this target correctly. It is given again every minute.",
-					t.Name, strings.Join(hosts, ", "))}
+				problems[id] = CredProblem{Text: fmt.Sprintf("The credentials file of target %s could not be given to the holders %s (they have none or an older one): after a change of the leader one of them cannot anchor at this target correctly. It is given again every minute. Cause: %s",
+					t.Name, strings.Join(hosts, ", "), errText(derr))}
 			} else if _, bad := problems[id]; !bad {
 				delivered[id] = true
 			}

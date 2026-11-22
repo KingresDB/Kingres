@@ -259,7 +259,13 @@ func joinKinds() string {
 // putCreds writes the file of a target on this server and hands it to the other holders (best effort).
 func (s *Service) putCreds(ctx context.Context, id int64, kind string, c Creds, changing bool) error {
 	defer s.lockRotation(id)()
-	floor, unreached, ferr := s.generationFloor(ctx, id)
+	v, ferr := s.generationView(ctx, id)
+	floor, unreached := v.floor, v.unreached
+	if changing && s.cfg.Holders != nil && !v.ownFile && v.holdersHaveFile && ferr == nil {
+		// this server has no file of the target and the holders have one (a replaced disk): a change would write a number below theirs and be
+		// refused by every holder. The job takes their file in a minute; then the change can be made (P7I-03)
+		return rotationNoFileError{}
+	}
 	if changing && s.cfg.Holders != nil && (ferr != nil || len(unreached) > 0) {
 		// A change of credentials that has not seen every holder can be undone by a holder that comes back with a higher generation, and the
 		// operator would see nothing (P7H-03): it is refused until every holder answers or is no longer a holder of the cluster.
@@ -271,7 +277,7 @@ func (s *Service) putCreds(ctx context.Context, id int64, kind string, c Creds, 
 	}
 	defer clear(data)
 	if s.cfg.Distribute != nil {
-		if err := s.cfg.Distribute(ctx, id, kind, data); err != nil {
+		if err := s.cfg.Distribute(WithKnownGeneration(ctx, v.known), id, kind, data); err != nil {
 			// the answer stays 201 or 200 (the contract has no warnings member): the failure is an alert at the next pass of the monitor, and
 			// the job "ledger.anchor.credentials" gives the file again until every holder has it (P7A-03)
 			s.log.Warn("the credentials of an anchor target could not be given to every holder", "target", id, "error", errText(err))
@@ -342,8 +348,9 @@ func (s *Service) UpdateTarget(ctx context.Context, id int64, in api.LedgerAncho
 	if sh.creds != nil {
 		if err := s.putCreds(ctx, id, k.Name, sh.creds, row.CredentialsSet); err != nil {
 			var rp rotationPartialError
-			if errors.As(err, &rp) {
-				return api.LedgerAnchorTarget{}, problem.New(problem.ServiceUnavailable, rp.Error()).WithRetryAfter(30)
+			var rn rotationNoFileError
+			if errors.As(err, &rp) || errors.As(err, &rn) {
+				return api.LedgerAnchorTarget{}, problem.New(problem.ServiceUnavailable, err.Error()).WithRetryAfter(30)
 			}
 			return api.LedgerAnchorTarget{}, problem.New(problem.ServiceUnavailable, "The credentials could not be stored on this server.").WithRetryAfter(5)
 		}
@@ -629,4 +636,11 @@ func (s *Service) lockRotation(id int64) func() {
 	s.mu.Unlock()
 	m.Lock()
 	return m.Unlock
+}
+
+// rotationNoFileError is the refusal of a change of credentials by a server that has no file of the target while the holders have one (P7I-03).
+type rotationNoFileError struct{}
+
+func (rotationNoFileError) Error() string {
+	return "The credentials were not changed: this server has no credentials file of the target and the holders have one, so a change made here would be refused by every holder. This server takes the holders' file within a minute (the job of the credentials); change the credentials again then."
 }
