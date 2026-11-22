@@ -1,5 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
-# ADR 0027: Ledger tables are carried as data, and the imported ledger starts a new chain
+# ADR 0028: Ledger tables are carried as data, and the imported ledger starts a new chain
 
 - Status: Proposed
 - Date: 2026-11-22

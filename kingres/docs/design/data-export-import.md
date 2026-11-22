@@ -7,8 +7,8 @@ Builds on the control plane of phase 3 ([control-plane-3.md](control-plane-3.md)
 ([shard-phase9.md](shard-phase9.md)), the configuration of phase 13 ([config-phase13.md](config-phase13.md)) and the
 row router of phase 2b ([shard-phase2b.md](shard-phase2b.md)). It revises the REST contract to **0.19.0**
 (additive: no operation, field or enum value of 0.14.0 changes meaning; the integrator renumbers). Decisions that
-deserve a record are in [ADR 0026](../adr/0026-transfers-are-staged-encrypted-files-run-as-the-requesting-role.md) and
-[ADR 0027](../adr/0027-ledger-tables-are-carried-as-data-and-restart-their-chain.md).
+deserve a record are in [ADR 0027](../adr/0027-transfers-are-staged-encrypted-files-run-as-the-requesting-role.md) and
+[ADR 0028](../adr/0028-ledger-tables-are-carried-as-data-and-restart-their-chain.md).
 
 The project owner asked for data export and import in the admin console. This note fixes what that means for a
 sharded database: four features (a table to CSV, a CSV into a table, a database to one archive, an archive into a
@@ -107,7 +107,7 @@ running cluster are **[Needs verification]** and are checked by the first increm
 | 2 | Export and import need `kingres_admin`, **and** the setting `dataTransfer.enabled` (off by default), **and** the PostgreSQL privileges of the signed-in role; a staged file can be read and downloaded only by the role that made it | The ladder has no separate permission and adding a fifth cluster role changes every client of the ladder. Data runs as the requesting role over `Proxy.Connect`, so a role gets only what its privileges give; the creator-only rule stops a second administrator from taking data the first one could read and the second could not |
 | 3 | The archive is a **zip** file with fixed entry names, one CSV per table, a JSON catalog, the schema as two SQL files and a manifest with SHA-256 sums | The central directory gives a table of contents before anything is read, which is what "validated before anything runs" needs; streaming writers can add the manifest last; the standard library reads and writes it |
 | 4 | The SQL of the archive is **never run as it is**. It is lexed into statements, each statement is classified against an allowlist, the plan is checked in full, and only then is it executed, one statement at a time, **as the requesting role** (never as the service role), on a connection that passed `refuseDangerousRole`. Distribution, ledger and time-partition policies are recreated from the structured catalog document with the service role, never from SQL in the archive | The dump is attacker-controlled text in the worst case. The allowlist narrows what a non-superuser can attempt; PostgreSQL's privileges bound what is left; the structured parts need superuser functions and so must come from validated data |
-| 5 | **Ledger tables are exported and imported as data**; the imported table is a **new chain**: rows are loaded first, then `ledger_enable` enters them. The import needs an explicit acknowledgement, and the verifier says what it says about a new chain. The history of an updatable table is exported for the record and not loaded (ADR 0027) | There is no supported way to load an existing ledger (README of `kingres_ledger`). Refusing would make a database with one ledger table impossible to carry; skipping silently would hide that the proof of the past is not carried |
+| 5 | **Ledger tables are exported and imported as data**; the imported table is a **new chain**: rows are loaded first, then `ledger_enable` enters them. The import needs an explicit acknowledgement, and the verifier says what it says about a new chain. The history of an updatable table is exported for the record and not loaded (ADR 0028) | There is no supported way to load an existing ledger (README of `kingres_ledger`). Refusing would make a database with one ledger table impossible to carry; skipping silently would hide that the proof of the past is not carried |
 | 6 | **Distribute first, load second.** The importer creates the tables, calls the same functions an administrator calls to distribute them (while they are empty), then loads each table by routed `COPY` | The user asked for the distribution to be recreated before the data, and a load into an empty distributed table is the path the router is built for; a copy of rows into a table that is distributed later is the slower, blocking path of phase 9 |
 | 7 | Data is exported as **CSV in UTF-8 with fixed session formats** (`DateStyle`, `IntervalStyle`, `bytea_output`, `extra_float_digits`, `TimeZone`, `lc_monetary`) and a distinct null marker | Text CSV is portable across PostgreSQL majors; the sessions fix what the router already fixes for transport (README, "The text of a statement sent to another node means the same there") |
 | 8 | Table CSV export protects spreadsheets by default (`spreadsheetSafe`), the archive never changes a value | A file for a person opened in a spreadsheet must not run formulas; a file for a restore must be exact |
@@ -214,7 +214,7 @@ file is.
 contract names one of them; a role that may export but not administer would need a new level in the ladder, in the
 contract's `x-required-role`, in the generated types of the console, and in `setRoleClusterRoles`. The three guards
 above do the same work with what exists: the setting is an explicit decision of an administrator, the privileges
-bound the data, and the creator-only rule stops laundering (ADR 0026, alternatives).
+bound the data, and the creator-only rule stops laundering (ADR 0027, alternatives).
 
 **The setting.** `ClusterSettings.dataTransfer` (additive): `enabled` (default `false`), `retentionHours`,
 `maxFileBytes`, `stagingQuotaBytes`, `maxConcurrent` (default 2 transfers running in the cluster, 1 per role). While
@@ -640,7 +640,7 @@ closed set of constructs and fails on anything it does not recognise:
    are in `kingres.partitions`).
 3. For a ledger table the capture triggers (their names and the function they execute are in `kingres.ledger_table`
    and in the extension) and its history table (rule 1's list), because the importer will call `ledger_enable`
-   itself (ADR 0027).
+   itself (ADR 0028).
 4. `CREATE EXTENSION` statements (the importer creates the extensions from the manifest's list), and the
    `SET`/`\restrict` preamble (replaced by fixed settings).
 
@@ -676,7 +676,7 @@ the console can show it before the user decides.
 | `expectedSha256` | none | Binds the import to a value the operator got elsewhere |
 | `privileges` | `none` | `none` or `restore` (above) |
 | `allowCode` | `false` | See "What may run". Needs the text `execute code from the archive` in `confirm` |
-| `acknowledgeLedgerRestart` | `false` | **Required `true` when the archive has a ledger table** (ADR 0027) |
+| `acknowledgeLedgerRestart` | `false` | **Required `true` when the archive has a ledger table** (ADR 0028) |
 | `keepOnFailure` | `false` | Keep the new database if the import fails (to look at it); it is marked and listed as failed |
 | `bucketCount` | the source's, per group | Not offered: the bucket counts of the archive are kept |
 
@@ -856,7 +856,7 @@ in a database that the failure of any step removes.
 
 ## Ledger tables
 
-[ADR 0027](../adr/0027-ledger-tables-are-carried-as-data-and-restart-their-chain.md) records the decision and the
+[ADR 0028](../adr/0028-ledger-tables-are-carried-as-data-and-restart-their-chain.md) records the decision and the
 alternatives. In summary:
 
 - **Table CSV export** of a ledger table is an ordinary export of its current rows. The history table of an
@@ -1087,7 +1087,7 @@ the other tasks; the confirm button is disabled while a blocker shows):
   them (a refusal shows `reasons` and stops), tables by kind with rows and size, the extensions, the warnings
   (including each `per-group` label), the **statements the plan refuses** (kind, count, position; the text is never
   shown) and, if there is code, an explanation and a typed confirmation for `allowCode`; the ledger tables with the
-  required checkbox and the text of ADR 0027; the option `privileges`; the name of the new database; then the import
+  required checkbox and the text of ADR 0028; the option `privileges`; the name of the new database; then the import
   task with its steps; on failure the message names the step and says the database was removed (or kept).
   A role that is dangerous sees the dialog explaining that it must sign in as another administrator.
 
@@ -1260,7 +1260,7 @@ contract types) and can start at once after 1. The first increment that gives th
   columns). Each has a fallback above, is checked by the increment that needs it, and is recorded in this note when it
   is.
 
-## Open questions for the project owner
+## Open questions for the project owner (answered 2026-11-22: all three recommended defaults accepted)
 
 1. **Is `dataTransfer.enabled` off by default?** Recommended: **off** (an administrator turns it on once in the
    settings; every export is data leaving). The alternative, on, makes the first run easier and the default less safe.

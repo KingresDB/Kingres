@@ -1,5 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
-# ADR 0026: Exports are staged encrypted files, and transfers run as the role that asked
+# ADR 0027: Exports are staged encrypted files, and transfers run as the role that asked
 
 - Status: Proposed
 - Date: 2026-11-22
