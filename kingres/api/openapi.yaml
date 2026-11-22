@@ -2108,7 +2108,11 @@ paths:
         newer term; this operation gives it up at once, so that the gate of the task engine opens and a new request can begin. It is answered by any
         server (the leader may be the server that is gone): the server asks the servers that host a ready standby of the map group and gives up the
         bootstrap that one of them runs. `abandoned` is false when no bootstrap is in progress. A bootstrap that already promoted the standby cannot
-        be given up (409 `conflict`): the promoted instance holds the lease and the bootstrap goes on to its end. The audit event is `abandonMapGroupBootstrap`. It needs `kingres_admin`, one role above the failover it undoes (`kingres_ops`): it discards what a bootstrap did and, for a planned switchover, makes the old leader roll back.
+        be given up (409 `conflict`): the promoted instance holds the lease and the bootstrap goes on to its end. A bootstrap of a planned switchover that is given up also
+        asks the old leader's server to end the hold of its primary of the map group (the system database), whose task may be gone; `resumedServerId` names the
+        server that was started again. When no bootstrap is in progress anywhere, the call asks every server to end a hold of its primary of the map group that
+        nothing owns (no bootstrap names it, no standby of the map group was promoted, a standby is shown to be in recovery): this is how an operator starts a
+        stranded old leader again, and `resumedServerId` names it (`abandoned` is false then). The audit event is `abandonMapGroupBootstrap`. It needs `kingres_admin`, one role above the failover it undoes (`kingres_ops`): it discards what a bootstrap did and, for a planned switchover, makes the old leader roll back.
       tags: [Replication]
       x-required-role: kingres_admin
       requestBody:
@@ -6731,6 +6735,9 @@ components:
         abandoned:
           type: boolean
           description: True when a bootstrap was in progress and is given up; false when none was.
+        resumedServerId:
+          $ref: '#/components/schemas/ServerId'
+          description: The server whose primary of the map group, held back for a planned switchover, was started again by this call; absent when none was.
     FailoverGroupPlan:
       type: object
       description: The plan for one group.

@@ -329,8 +329,8 @@ None.
 
 #### Additive
 
-- `abandonMapGroupBootstrap` (`POST /failover/map/abandon`, `kingres_admin`, body `{reason}`, answer `{abandoned}`): gives up a bootstrap of the map group that did not reach the promotion
-  (409 `conflict` after it). Any server answers it, because the manager leader may be the server that is gone. `AuditAction` has `abandonMapGroupBootstrap`.
+- `abandonMapGroupBootstrap` (`POST /failover/map/abandon`, `kingres_admin`, body `{reason}`, answer `{abandoned, resumedServerId?}`): gives up a bootstrap of the map group that did not reach the promotion
+  (409 `conflict` after it), and ends the hold of the old leader of a planned switchover that it gave up (`resumedServerId` names the server started again; with no bootstrap in progress it asks every server to resume a hold that nothing owns). Any server answers it, because the manager leader may be the server that is gone. `AuditAction` has `abandonMapGroupBootstrap`.
 - `FailoverGroupPlan.skipped` (`{reason, message}`, `reason` is `preferredNotReady` or `mapGroup`): present for a group that a `restorePreferredPrimaries` leaves alone; such a group has
   no target, no candidates and no steps in the plan (before 0.15.0 the plan listed only the groups that are restored, and the report listed the skipped ones).
 

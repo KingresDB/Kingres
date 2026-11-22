@@ -68,6 +68,18 @@ type mapFailover struct {
 	// inRecovery asks the instance of the standby that this server would promote whether it is still in recovery (nil: it cannot be asked, and a promotion that was begun is
 	// then never given up).
 	inRecovery func(ctx context.Context) (bool, error)
+	// lifecycleLock takes the standby agent's lifecycle lock, which the promoting call holds across pg_promote (nil: none is taken, a test without an agent); resumeOldLeader
+	// asks the old leader's server to end the hold of its primary (F6-01, F6-02).
+	lifecycleLock   func(ctx context.Context) (func(), error)
+	resumeOldLeader func(ctx context.Context, oldServer string) (bool, error)
+	// The parts of the resolution of a held-back primary that a test stands in for (nil: the real ones): the calls to other servers, the list of servers, the marker, the end of
+	// the hold, and the two ways of asking an instance whether it is in recovery.
+	callPeer      func(ctx context.Context, server, method, path string, in, out any) error
+	memberList    func(ctx context.Context) ([]string, error)
+	heldBack      func() bool
+	endHold       func(ctx context.Context) error
+	queryInRec    func(ctx context.Context, id int) (bool, error)
+	controlDataOf func(ctx context.Context, id int) (map[string]string, error)
 
 	mu      sync.Mutex
 	running bool
@@ -93,17 +105,15 @@ func newMapFailover(dataDir string, svc *cluster.Service, self string, log *slog
 		if !ok || cur.Pin == nil {
 			return true, nil // nothing is pinned: nothing was promoted
 		}
-		c, err := m.svc.InstanceConn(ctx, cur.Pin.Instance, sysdb.Database)
-		if err != nil {
-			return false, err
-		}
-		defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
-		var rec bool
-		if err := c.QueryRow(ctx, `SELECT pg_is_in_recovery()`).Scan(&rec); err != nil {
-			return false, err
-		}
-		return rec, nil
+		return m.instanceInRecovery(ctx, cur.Pin.Instance)
 	}
+	m.lifecycleLock = func(ctx context.Context) (func(), error) {
+		if d := m.fd.d; d != nil && d.Standby != nil {
+			return d.Standby.agent.LockLifecycle(ctx)
+		}
+		return func() {}, nil
+	}
+	m.resumeOldLeader = m.resumeOldLeaderOf
 	m.runner = &mapgroup.Runner{P: &mapPorts{m: m}, Journal: js, Fault: faultErr,
 		Log: func(f string, a ...any) { log.Info(fmt.Sprintf(f, a...)) }}
 	return m, nil
@@ -719,15 +729,38 @@ type mapAbandonBody struct {
 
 type mapAbandonAnswer struct {
 	Abandoned bool `json:"abandoned"`
+	// ResumedServer names the old leader whose held-back primary was started again by giving a planned switchover up (F6-01).
+	ResumedServer string `json:"resumedServer,omitempty"`
 }
 
 // abandonLocal gives up the bootstrap in progress on this server; false when none is. A bootstrap that promoted the standby cannot be given
 // up (409): the promoted instance holds the lease and the bootstrap goes on to its end.
 func (m *mapFailover) abandonLocal(ctx context.Context, reason string) (bool, error) {
+	ans, err := m.abandonLocalFull(ctx, reason)
+	return ans.Abandoned, err
+}
+
+// abandonLocalFull is abandonLocal with what else it did: for a planned switchover it asks the old leader's server to end the hold of its primary.
+func (m *mapFailover) abandonLocalFull(ctx context.Context, reason string) (mapAbandonAnswer, error) {
 	if !m.journal.Active() {
-		return false, nil
+		return mapAbandonAnswer{}, nil
 	}
 	cur, _ := m.journal.Current()
+	// The lifecycle lock of the standby agent is what the promoting call holds across pg_promote (F6-02): the probe, the mark of the journal and the release of the lease
+	// happen together, so that a promotion that is running is waited for (and then found, and refused: 409), and one that has not begun is refused by the lease it
+	// finds let go of.
+	unlock := func() {}
+	if m.lifecycleLock != nil {
+		u, lerr := m.lifecycleLock(ctx)
+		if lerr != nil {
+			return mapAbandonAnswer{}, problem.New(problem.ServiceUnavailable, "A promotion, a create, a remove or a rebuild of a standby is running on this server; repeat the call.").WithRetryAfter(5)
+		}
+		unlock = u
+	}
+	defer func() { unlock() }()
+	if !m.journal.Active() {
+		return mapAbandonAnswer{}, nil // given up or finished while the lock was waited for
+	}
 	err := m.journal.Abandon(reason)
 	if errors.Is(err, journal.ErrPromoted) && cur.Done[journal.StepPromote].IsZero() && m.inRecovery != nil {
 		// The call that promotes was begun and its answer is not recorded (F5-03): the bootstrap is given up only when the standby is asked and is still in recovery.
@@ -737,37 +770,49 @@ func (m *mapFailover) abandonLocal(ctx context.Context, reason string) (bool, er
 	}
 	if err != nil {
 		if errors.Is(err, journal.ErrPromoted) {
-			return false, problem.New(problem.Conflict, "The bootstrap of the map group promoted its standby, or was about to and the standby cannot be shown to be a standby still; it cannot be given up, and goes on to its end.")
+			return mapAbandonAnswer{}, problem.New(problem.Conflict, "The bootstrap of the map group promoted its standby, or was about to and the standby cannot be shown to be a standby still; it cannot be given up, and goes on to its end.")
 		}
-		return false, err
+		return mapAbandonAnswer{}, err
 	}
 	m.log.Warn("the bootstrap of the map group was given up", "reason", reason)
 	// What the bootstrap holds goes with it (F5-02): the fence and holder lease would otherwise be renewed for a bootstrap that no longer runs, and an old primary
-	// that is stopped could not win its lease again. A planned switchover also tells the old leader, whose task rolls back (F5-08).
+	// that is stopped could not win its lease again.
 	if m.releaseFence != nil {
 		if err := m.releaseFence(ctx); err != nil {
 			m.log.Warn("letting go of the lease of the map group after giving the bootstrap up", "error", err)
 		}
 	}
+	unlock()
+	unlock = func() {}
+	ans := mapAbandonAnswer{Abandoned: true}
+	// A planned switchover also tells the old leader (F5-08), and asks it to end the hold of its primary: its task may be gone (its kingresd restarted, or the task ended),
+	// and the system database is the stopped primary, so nothing else would (F6-01).
 	if cur.Planned != nil && m.tellOldLeader != nil {
 		if err := m.tellOldLeader(ctx, cur.OldServer, cur.Planned.TaskID, reason); err != nil {
 			m.log.Warn("telling the old leader that its switchover of the map group was given up", "error", err)
 		}
 	}
-	return true, nil
+	if cur.Planned != nil && m.resumeOldLeader != nil {
+		if resumed, err := m.resumeOldLeader(ctx, cur.OldServer); err != nil {
+			m.log.Warn("asking the old leader to end the hold of its primary of the map group; it does so by itself when it can", "server", cur.OldServer, "error", err)
+		} else if resumed {
+			ans.ResumedServer = cur.OldServer
+		}
+	}
+	return ans, nil
 }
 
 // Abandon gives up the bootstrap of the map group that is in progress on this server, or on the server of a standby of the map group: the
-// request may arrive anywhere, and the leader may be the server that is gone. It is false when no bootstrap is in progress anywhere that
-// this server can ask.
-func (m *mapFailover) Abandon(ctx context.Context, actor, reason string) (bool, error) {
+// request may arrive anywhere, and the leader may be the server that is gone. When none is in progress anywhere, it asks every server to end the hold of its
+// primary of the map group that nothing owns (F6-03): the operator's way to start a stranded old leader again. The answer says which server was resumed.
+func (m *mapFailover) Abandon(ctx context.Context, actor, reason string) (failover.MapAbandonResult, error) {
 	reason = "given up by " + actor + ": " + reason
-	if ok, err := m.abandonLocal(ctx, reason); ok || err != nil {
-		return ok, err
+	if ans, err := m.abandonLocalFull(ctx, reason); ans.Abandoned || err != nil {
+		return failover.MapAbandonResult{Abandoned: ans.Abandoned, ResumedServer: ans.ResumedServer}, err
 	}
-	members, err := (&mapPorts{m: m}).Members(ctx)
+	members, err := m.members(ctx)
 	if err != nil {
-		return false, problem.New(problem.ServiceUnavailable, "The servers of the cluster cannot be read now.").WithRetryAfter(5)
+		return failover.MapAbandonResult{}, problem.New(problem.ServiceUnavailable, "The servers of the cluster cannot be read now.").WithRetryAfter(5)
 	}
 	var asked, failed int
 	for _, s := range members {
@@ -776,22 +821,36 @@ func (m *mapFailover) Abandon(ctx context.Context, actor, reason string) (bool, 
 		}
 		asked++
 		var out mapAbandonAnswer
-		if err := m.peers.do(ctx, s, http.MethodPost, "/failover/map/abandon", mapAbandonBody{Reason: reason}, &out); err != nil {
+		if err := m.call(ctx, s, http.MethodPost, "/failover/map/abandon", mapAbandonBody{Reason: reason}, &out); err != nil {
 			var ce *failover.CallError
 			if errors.As(err, &ce) && ce.Status == http.StatusConflict {
-				return false, problem.New(problem.Conflict, ce.Message)
+				return failover.MapAbandonResult{}, problem.New(problem.Conflict, ce.Message)
 			}
 			failed++
 			continue
 		}
 		if out.Abandoned {
-			return true, nil
+			return failover.MapAbandonResult{Abandoned: true, ResumedServer: out.ResumedServer}, nil
 		}
 	}
 	if asked > 0 && failed == asked {
-		return false, problem.New(problem.ServiceUnavailable, "No other server of the cluster answered, so it is not known whether a bootstrap of the map group is in progress there.").WithRetryAfter(5)
+		return failover.MapAbandonResult{}, problem.New(problem.ServiceUnavailable, "No other server of the cluster answered, so it is not known whether a bootstrap of the map group is in progress there.").WithRetryAfter(5)
 	}
-	return false, nil
+	// No bootstrap is in progress: a held-back old leader that nothing owns is started again (this server too).
+	var res failover.MapAbandonResult
+	for _, s := range members {
+		var out mapResumeAnswer
+		if s == m.self {
+			out.Resumed, out.Detail = m.resolveHeldBack(ctx)
+		} else if err := m.call(ctx, s, http.MethodPost, "/failover/map/resume", struct{}{}, &out); err != nil {
+			continue
+		}
+		if out.Resumed {
+			res.ResumedServer = s
+			break
+		}
+	}
+	return res, nil
 }
 
 // handleMapAbandon is the call of a server that was asked to give up the bootstrap: it acts on its own journal only.
@@ -811,7 +870,7 @@ func handleMapAbandon(ctx context.Context, d *haDeps, caller string, body []byte
 			return nil, &internalapi.CallError{Status: http.StatusForbidden, Code: "forbidden", Message: "Only the old leader or a server that hosts a standby of the map group gives up a planned switchover."}
 		}
 	}
-	ok, err := mf.abandonLocal(ctx, b.Reason)
+	ans, err := mf.abandonLocalFull(ctx, b.Reason)
 	if err != nil {
 		var p *problem.Problem
 		if errors.As(err, &p) {
@@ -819,7 +878,7 @@ func handleMapAbandon(ctx context.Context, d *haDeps, caller string, body []byte
 		}
 		return nil, err
 	}
-	return mapAbandonAnswer{Abandoned: ok}, nil
+	return ans, nil
 }
 
 // mapProofBody is what the old leader sends after its clean stop (planned switchover): the shutdown checkpoint and the state of the cluster.
@@ -1067,4 +1126,13 @@ func (m *mapFailover) isCandidateServer(ctx context.Context, server string) bool
 	}
 	ok, _ := (&mapPorts{m: m}).isCandidate(ctx, server)
 	return ok
+}
+
+// ResumeOldLeader asks the old leader's server to end the hold of its primary of the map group (F6-01).
+func (p *mapPorts) ResumeOldLeader(ctx context.Context, oldServer string) error {
+	if p.m.resumeOldLeader == nil {
+		return nil
+	}
+	_, err := p.m.resumeOldLeader(ctx, oldServer)
+	return err
 }

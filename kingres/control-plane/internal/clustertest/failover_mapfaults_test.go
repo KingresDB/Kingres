@@ -217,3 +217,80 @@ func TestSwitchoverWhoseControlDataCannotBeReadRollsBack(t *testing.T) {
 	}
 	swAfterRollback(t, c, port, pool, leader, g, old, w)
 }
+
+// F6-01 (the first case of the review). The candidate's standby cannot be reached after the promotion was begun, neither by the promoting call nor by the question
+// whether it is still in recovery: the rollback of the old leader asks the candidate to give the bootstrap up, the candidate answers from the control data of the
+// instance that it is still a standby, and the old leader is started again. Before, the answer was a conflict, the old leader read it as "promoted" and stayed held back.
+func TestSwitchoverOfTheMapGroupWhoseCandidateCannotBeAskedIfItIsStillAStandby(t *testing.T) {
+	c, port, pool, leader, nw, w := mapSwitchoverEnv(t)
+	nw.SetFaults(fault.Spec{FailoverPoint: "promote:unreachable", FailoverMode: "unreachable"})
+	id := mapSwitchoverRequest(t, leader, nw)
+	mapRolledBack(t, c, port, pool, leader, nw, w, id, 16*time.Minute)
+}
+
+// F6-01 (the second case). The old leader's kingresd ends right after the clean stop and is started again; the standby refuses the proof it reads from it. The old
+// leader's task is gone, so nothing in a task rolls the hold back: the candidate that gave its bootstrap up asks the old leader to end the hold, and the old leader's
+// own loop does it as well. The old primary runs again, the standby never became a primary, nothing acknowledged is lost, and the operator's call finds nothing in
+// progress and nothing to resume.
+func TestSwitchoverOfTheMapGroupWhoseOldLeaderRestartedAndTheProofIsRefused(t *testing.T) {
+	c, port, pool, leader, nw, w := mapSwitchoverEnv(t)
+	nw.SetFaults(fault.Spec{FailoverPoint: "promote:unproven", FailoverMode: "fail"})
+	leader.SetFaults(fault.Spec{FailoverPoint: "demote:exit", FailoverMode: "exit"})
+	id := mapSwitchoverRequest(t, leader, nw)
+	until(t, 5*time.Minute, "the old leader's kingresd to end after the clean stop", func() bool {
+		st, _ := leader.Do("GET", "/healthz", nil, nil)
+		return st != 200
+	})
+	leader.Kill() // reaps the process
+	leader.Heal()
+	time.Sleep(5 * time.Second)
+	leader.Start()
+	mapRolledBack(t, c, port, pool, leader, nw, w, id, 10*time.Minute)
+	st, body := nw.Do("POST", "/failover/map/abandon", map[string]any{"reason": "nothing is stranded"}, nil)
+	if st != 200 || body["abandoned"] != false {
+		t.Fatalf("the operator's call with nothing in progress: %d %v", st, body)
+	}
+}
+
+// F6-02. The abandon arrives while the promoting call is inside the lifecycle lock of the standby agent (the call holds there for 20 s, as pg_promote does): the
+// abandon waits for the lock, finds the promotion done, and answers a conflict; the switchover goes on to its end on the candidate, with one primary and nothing
+// acknowledged lost. Without the lock the probe would have found the standby in recovery and given the bootstrap up under the promotion's feet.
+func TestAnAbandonWaitsForAPromotionThatIsRunningInsideTheLock(t *testing.T) {
+	c, port, pool, leader, nw, w := mapSwitchoverEnv(t)
+	nw.SetFaults(fault.Spec{FailoverPoint: "promote:slowlock", FailoverMode: "slow"})
+	id := mapSwitchoverRequest(t, leader, nw)
+	mapStopped(t, leader)
+	time.Sleep(10 * time.Second) // the proof is sent and the promoting call is inside the lock
+	st, body := nw.Do("POST", "/failover/map/abandon", map[string]any{"reason": "while the promotion runs"}, nil)
+	t.Logf("the abandon during the promotion: %d %v", st, body)
+	if st != 409 {
+		t.Fatalf("the abandon of a bootstrap whose promotion was running answered %d %v, want 409", st, body)
+	}
+	var task map[string]any
+	defer func() {
+		if t.Failed() {
+			t.Logf("task %v: %v", id, task)
+			t.Logf("old leader log: %s", quietLog(leader.LogTail(60000)))
+			t.Logf("candidate log: %s", quietLog(nw.LogTail(60000)))
+		}
+	}()
+	until(t, 10*time.Minute, "the task to end on the new leader", func() bool {
+		stt, b := nw.Do("GET", fmt.Sprintf("/tasks/%v", id), nil, nil)
+		if stt == 200 {
+			if s, _ := b["state"].(string); s == "failed" || s == "done" {
+				task = b
+				return true
+			}
+		}
+		return false
+	})
+	if task["state"] != "done" {
+		t.Fatalf("the task ended %v: %v", task["state"], task["error"])
+	}
+	nw.Heal()
+	hosts, _ := primaryOf(t, nw)
+	if hosts[0] != nw.Host {
+		t.Fatalf("the primary of the map group is on %s, want %s", hosts[0], nw.Host)
+	}
+	mapAcked(t, c, port, pool, w)
+}

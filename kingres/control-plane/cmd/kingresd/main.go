@@ -545,6 +545,8 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	}
 	if hd.MapFailover != nil {
 		hd.MapFailover.ResumeOnStart()
+		wg.Add(1)
+		go func() { defer wg.Done(); hd.MapFailover.WatchHeldBack(bgCtx) }()
 	}
 
 	if cfg.InternalListen != "" && svc.Enabled() {

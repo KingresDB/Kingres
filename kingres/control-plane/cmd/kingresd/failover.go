@@ -908,6 +908,12 @@ func handleFailoverPromote(ctx context.Context, d *haDeps, body []byte) (any, er
 	}
 	// Tests of the planned switchover of the map group: the call answers "unavailable" for as long as the fault is in force (a candidate that never promotes),
 	// or holds for 20 s before it does anything (an abandon that arrives while the call is in flight).
+	// A test (F6-01): the standby's instance cannot be reached at all, neither by the promoting call nor by the question whether it is still in recovery (the answer of its control
+	// data is what then counts).
+	if d.Fault.FailoverInjection("promote:unreachable") == "unreachable" {
+		testInstanceUnreachable.Store(true)
+		return nil, &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The instance cannot be reached."}
+	}
 	if d.Fault.FailoverInjection("promote:unavailable") == "unavailable" {
 		return nil, &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The instance cannot be reached."}
 	}
@@ -926,6 +932,13 @@ func handleFailoverPromote(ctx context.Context, d *haDeps, body []byte) (any, er
 		return nil, &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "A create, remove or rebuild of a standby is running on this server; repeat the call."}
 	}
 	defer unlock()
+	// A test (F6-02): the call holds inside the lock, as a promotion does, before the lease is checked and the instance is promoted.
+	if d.Fault.FailoverInjection("promote:slowlock") == "slow" {
+		select {
+		case <-time.After(20 * time.Second):
+		case <-ctx.Done():
+		}
+	}
 	var li *cluster.LocalInstance
 	for _, x := range d.Svc.LocalInstances() {
 		x := x
@@ -1107,6 +1120,12 @@ func registerFailoverCallee(d *haDeps) {
 	})
 	d.Calls.Register(callMapProof, func(ctx context.Context, caller string, body []byte) (any, error) {
 		return handleMapProof(ctx, d, caller, body)
+	})
+	d.Calls.Register(callMapBootstrap, func(ctx context.Context, caller string, body []byte) (any, error) {
+		return handleMapBootstrap(ctx, d, caller, body)
+	})
+	d.Calls.Register(callMapResume, func(ctx context.Context, caller string, body []byte) (any, error) {
+		return handleMapResume(ctx, d, caller, body)
 	})
 }
 
