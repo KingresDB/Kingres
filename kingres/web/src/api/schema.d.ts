@@ -724,7 +724,7 @@ export interface paths {
          *     that does not succeed in two minutes ends it with `cannot_quiesce`, and prepared transactions that do not end with
          *     `prepared_transactions_pending`. The task can be cancelled until the promotion has begun (`Task.cancellable`). Refused with 409
          *     `group_degraded` when no standby of a group streams from its primary (or the named target does not), and with 422
-         *     `unsupported_operation` for a request that includes the map group (name the other groups in `shardGroupIds`).
+         *     `unsupported_operation` for a hard failover of a server whose map group primary answers (see 0.15.0 below).
          *
          *     **0.13.0, the map group.** The failover of the server that runs the primary of the map group (and the manager
          *     leader) is accepted by any server that does not hear it, in mode `hard` only (`dryRun` and `graceful` answer 422
@@ -733,6 +733,15 @@ export interface paths {
          *     the client polls `GET /failover` (answered by that server) until `taskId` is not null, then `GET /tasks/{id}` on the new
          *     manager leader. The old leader's rebalance is paused (`stoppedBy` `safetyRule`). The key of the certificate authority is not
          *     copied to the new leader: the alert `certificateAuthorityUnavailable` says what the operator must do.
+         *
+         *     **0.15.0, a planned switchover of the map group.** `mode: graceful` for the server that runs the primary of the map group, sent to the
+         *     leader (that server) while it answers, is a switchover like any other, with the map group last: the task starts the bootstrap of the chosen
+         *     standby's server, stops the old leader cleanly and sends it the proof, the standby's server promotes on the proof and becomes the manager
+         *     leader, and its task engine finishes the task (the task is read from the new leader once the old leader's system database is stopped). The
+         *     steps of the map group that the old leader could not record are the ones before `Verify the new primary`. A hard failover of a server whose
+         *     map group primary answers is still 422 `unsupported_operation`.
+         *     When the manager leader is gone and the request is answered by a server that is not the candidate, the request travels to the candidate with the proof of the
+         *     operator's session (ADR 0026); a session of the token kind has no proof key and gets 503 `service_unavailable` for this case.
          *
          *     The task is `server.failover`, one block of steps per group (`TaskStep.shardGroupId`). A task that
          *     waits for an operator is `paused`; a repeat of this request for the same server resumes it. From the moment
@@ -1387,8 +1396,15 @@ export interface paths {
          *     preferred server are skipped. Long-running: returns a task.
          *
          *     **0.10.0.** The body is optional: `shardGroupIds` limits the groups, `dryRun` answers 200
-         *     `FailoverPlan` and changes nothing. Refused with the same 409 codes as `failoverServer`. This revision's
-         *     `kingresd` answers 422 `unsupported_operation` (the switchover is a later increment).
+         *     `FailoverPlan` and changes nothing. Refused with the same 409 codes as `failoverServer`.
+         *
+         *     **How the restore works (the text of 0.15.0).** The task is `replication.restorePreferredPrimaries` (subject `replication` / `preferred-primaries`). The
+         *     preferred server of a group is the server of its first node by id. A group whose primary is not there is handed back by the steps of a
+         *     planned switchover (see `failoverServer`, mode `graceful`), one group at a time, from the server that took it over to the preferred server.
+         *     A group whose preferred server has no ready standby, is left alone and listed in the report as
+         *     `skipped` with the reason `preferredNotReady` (`mapGroup` is reserved and is not produced since the map group is restored like any group). A group that fails before its promotion (a standby that is behind, a proof
+         *     that cannot be made) is rolled back and reported `failed`; the task goes on with the next group and ends `partial`. 422 `unprocessable`
+         *     when no group needs to be restored. The report has `kind` `restorePreferredPrimaries`, `mode` `restore` and `serverId` null.
          */
         post: operations["restorePreferredPrimaries"];
         delete?: never;
@@ -1416,6 +1432,32 @@ export interface paths {
         get: operations["getFailoverStatus"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/failover/map/abandon": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Give up a stuck bootstrap of the map group
+         * @description Added in 0.15.0. A failover of the map group that the manager leader's loss forces is run by a bootstrap on the server of a standby (not by a
+         *     task: no task can be recorded while the system database is not writable). A bootstrap that did not reach the promotion and cannot go on (for
+         *     example it waits for a majority that does not come back) is given up by the candidate monitor after fifteen minutes or when the catalog has a
+         *     newer term; this operation gives it up at once, so that the gate of the task engine opens and a new request can begin. It is answered by any
+         *     server (the leader may be the server that is gone): the server asks the servers that host a ready standby of the map group and gives up the
+         *     bootstrap that one of them runs. `abandoned` is false when no bootstrap is in progress. A bootstrap that already promoted the standby cannot
+         *     be given up (409 `conflict`): the promoted instance holds the lease and the bootstrap goes on to its end. The audit event is `abandonMapGroupBootstrap`. It needs `kingres_admin`, one role above the failover it undoes (`kingres_ops`): it discards what a bootstrap did and, for a planned switchover, makes the old leader roll back.
+         */
+        post: operations["abandonMapGroupBootstrap"];
         delete?: never;
         options?: never;
         head?: never;
@@ -4266,6 +4308,14 @@ export interface components {
             shardGroupId: number | null;
             message: string;
         };
+        AbandonMapGroupBootstrapRequest: {
+            /** @description Why the bootstrap is given up; it is kept in the journal of the bootstrap and in the audit event. */
+            reason: string;
+        };
+        AbandonMapGroupBootstrapResult: {
+            /** @description True when a bootstrap was in progress and is given up; false when none was. */
+            abandoned: boolean;
+        };
         /** @description The plan for one group. */
         FailoverGroupPlan: {
             /** Format: int32 */
@@ -4283,6 +4333,18 @@ export interface components {
             steps: string[];
             /** @description True for the map group. */
             movesTheManager: boolean;
+            /**
+             * @description Added in 0.15.0. Present only for a group that a `restorePreferredPrimaries` leaves alone (the plan then has `toServerId` null, no
+             *     candidates and no steps). The report lists the same group as `skipped` with the same reason.
+             */
+            skipped?: {
+                /**
+                 * @description `preferredNotReady`: the preferred server has no ready, registered standby of the group. `mapGroup`: reserved; the map group is restored like any group since 0.15.0 and is skipped with `preferredNotReady` when its preferred server has no ready standby of it.
+                 * @enum {string}
+                 */
+                reason: "preferredNotReady" | "mapGroup";
+                message: string;
+            };
         };
         /** @description A standby that could be promoted. */
         FailoverCandidate: {
@@ -5845,7 +5907,7 @@ export interface components {
          *     `failure`. Read-only operations are not audited except `executeQuery`.
          * @enum {string}
          */
-        AuditAction: "login" | "logout" | "loginFailed" | "setupTokenRejected" | "initCluster" | "joinCluster" | "updateThisServerSettings" | "restartThisServerInstance" | "stopThisServerInstance" | "startThisServerInstance" | "leaveCluster" | "addServer" | "updateServer" | "removeServer" | "failoverServer" | "autoFailover" | "createServerGroup" | "deleteServerGroup" | "createDatabase" | "updateDatabase" | "dropDatabase" | "distributeTable" | "enableTableLedger" | "restorePreferredPrimaries" | "startRebalance" | "stopRebalance" | "cancelTask" | "createRole" | "updateRole" | "deleteRole" | "setRoleMemberships" | "setRoleClusterRoles" | "createGrant" | "revokeGrants" | "applyGrantTemplate" | "replaceNetworkAccess" | "updateClusterSettings" | "generateLedgerDigest" | "startLedgerVerification" | "executeQuery" | "acknowledgeAlert" | "renewServerCertificates" | "revokeServerCertificates" | "certificateRenewed" | "certificateRenewalFailed" | "cancelStatement" | "leaseLost" | "leaseFenced" | "leaseAcquired" | "standbyCreated" | "standbyRemoved" | "standbyRebuilt" | "standbyInstanceStarted" | "standbyInstanceRemoved" | "standbyInstanceRebuilt" | "synchronousStandbyNamesChanged" | "replicationSlotDropped" | "applyConfigChange" | "revertConfigChange" | "restartPendingInstances" | "resetAutoFailoverCounter" | "failoverGroupStarted" | "failoverGroupPromoted" | "failoverGroupFailed" | "oldPrimaryRebuilt" | "updateLedgerSettings" | "createLedgerSigningKey" | "retireLedgerSigningKey" | "revokeLedgerSigningKey" | "createLedgerAnchorTarget" | "updateLedgerAnchorTarget" | "deleteLedgerAnchorTarget" | "testLedgerAnchorTarget" | "anchorLedgerNow" | "retryLedgerAnchor" | "createLedgerBundle" | "registerLedgerClientKey" | "revokeLedgerClientKey" | "setTableSignaturePolicy" | "upgradeLedgerExtension" | "acknowledgeLedgerDivergence" | "previewTableChange" | "undistributeTable" | "alterTableDistribution" | "createTablePartition" | "attachTablePartition" | "detachTablePartition" | "dropTablePartition";
+        AuditAction: "login" | "logout" | "loginFailed" | "setupTokenRejected" | "initCluster" | "joinCluster" | "updateThisServerSettings" | "restartThisServerInstance" | "stopThisServerInstance" | "startThisServerInstance" | "leaveCluster" | "addServer" | "updateServer" | "removeServer" | "failoverServer" | "abandonMapGroupBootstrap" | "autoFailover" | "createServerGroup" | "deleteServerGroup" | "createDatabase" | "updateDatabase" | "dropDatabase" | "distributeTable" | "enableTableLedger" | "restorePreferredPrimaries" | "startRebalance" | "stopRebalance" | "cancelTask" | "createRole" | "updateRole" | "deleteRole" | "setRoleMemberships" | "setRoleClusterRoles" | "createGrant" | "revokeGrants" | "applyGrantTemplate" | "replaceNetworkAccess" | "updateClusterSettings" | "generateLedgerDigest" | "startLedgerVerification" | "executeQuery" | "acknowledgeAlert" | "renewServerCertificates" | "revokeServerCertificates" | "certificateRenewed" | "certificateRenewalFailed" | "cancelStatement" | "leaseLost" | "leaseFenced" | "leaseAcquired" | "standbyCreated" | "standbyRemoved" | "standbyRebuilt" | "standbyInstanceStarted" | "standbyInstanceRemoved" | "standbyInstanceRebuilt" | "synchronousStandbyNamesChanged" | "replicationSlotDropped" | "applyConfigChange" | "revertConfigChange" | "restartPendingInstances" | "resetAutoFailoverCounter" | "failoverGroupStarted" | "failoverGroupPromoted" | "failoverGroupFailed" | "oldPrimaryRebuilt" | "updateLedgerSettings" | "createLedgerSigningKey" | "retireLedgerSigningKey" | "revokeLedgerSigningKey" | "createLedgerAnchorTarget" | "updateLedgerAnchorTarget" | "deleteLedgerAnchorTarget" | "testLedgerAnchorTarget" | "anchorLedgerNow" | "retryLedgerAnchor" | "createLedgerBundle" | "registerLedgerClientKey" | "revokeLedgerClientKey" | "setTableSignaturePolicy" | "upgradeLedgerExtension" | "acknowledgeLedgerDivergence" | "previewTableChange" | "undistributeTable" | "alterTableDistribution" | "createTablePartition" | "attachTablePartition" | "detachTablePartition" | "dropTablePartition";
         /** @description One audit log entry. */
         AuditEvent: {
             /**
@@ -9420,6 +9482,37 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    abandonMapGroupBootstrap: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AbandonMapGroupBootstrapRequest"];
+            };
+        };
+        responses: {
+            /** @description The bootstrap was given up, or none was in progress. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AbandonMapGroupBootstrapResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
             422: components["responses"]["UnprocessableEntity"];
             503: components["responses"]["ServiceUnavailable"];
         };
