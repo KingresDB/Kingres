@@ -245,6 +245,7 @@ func TestSwitchoverOfTheMapGroupWhoseOldLeaderRestartedAndTheProofIsRefused(t *t
 	leader.Heal()
 	time.Sleep(5 * time.Second)
 	leader.Start()
+	until(t, 3*time.Minute, "the restarted old leader accepts a sign-in", func() bool { return leader.Login(clustertest.AdminUser, clustertest.AdminPass) })
 	mapRolledBack(t, c, port, pool, leader, nw, w, id, 10*time.Minute)
 	st, body := nw.Do("POST", "/failover/map/abandon", map[string]any{"reason": "nothing is stranded"}, nil)
 	if st != 200 || body["abandoned"] != false {
@@ -263,8 +264,10 @@ func TestAnAbandonWaitsForAPromotionThatIsRunningInsideTheLock(t *testing.T) {
 	time.Sleep(10 * time.Second) // the proof is sent and the promoting call is inside the lock
 	st, body := nw.Do("POST", "/failover/map/abandon", map[string]any{"reason": "while the promotion runs"}, nil)
 	t.Logf("the abandon during the promotion: %d %v", st, body)
-	if st != 409 {
-		t.Fatalf("the abandon of a bootstrap whose promotion was running answered %d %v, want 409", st, body)
+	// 409: the promotion was found done and the bootstrap goes on; 200 with abandoned false: the bootstrap had finished by the time the abandon got the lock. What must not happen is a
+	// bootstrap given up under the promotion (abandoned true).
+	if st != 409 && !(st == 200 && body["abandoned"] == false) {
+		t.Fatalf("the abandon of a bootstrap whose promotion was running answered %d %v, want 409 or nothing to give up", st, body)
 	}
 	var task map[string]any
 	defer func() {
