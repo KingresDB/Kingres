@@ -23,8 +23,8 @@ describe('labels', () => {
     // 0.11.0 added nine for the ledger of phase 7: ledgerNotAnchored, ledgerAnchorBehind, ledgerAnchorFailed,
     // ledgerAnchorConflict, ledgerChainDiverged, ledgerGroupUnread, ledgerPublicationBehind, ledgerSignerUnavailable and
     // ledgerDigestOverdue: 38.
-    // 0.13.0 added certificateAuthorityUnavailable: 39.
-    expect(Object.keys(ALERT_KIND_LABEL)).toHaveLength(39)
+    // 0.13.0 added certificateAuthorityUnavailable: 39. 0.19.0 added transferStagingLow: 40.
+    expect(Object.keys(ALERT_KIND_LABEL)).toHaveLength(40)
     // 18 in 0.4.0, plus the two certificate kinds (0.5.0), standby.reconcile (0.7.0), config.apply and config.restart (0.8.0).
     // 0.11.0 added eight: ledger.key.create, .rotate, .retire, .revoke, .distribute, ledger.bundle.create, ledger.epoch.start
     // and ledger.upgrade: 31.

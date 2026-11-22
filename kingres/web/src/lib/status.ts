@@ -255,6 +255,7 @@ export const ALERT_KIND_LABEL: Record<AlertKind, string> = {
   ledgerSignerUnavailable: 'Ledger checkpoints cannot be signed',
   ledgerDigestOverdue: 'No ledger digest for too long',
   certificateAuthorityUnavailable: 'The certificate authority is unavailable',
+  transferStagingLow: 'The staging area of the data transfer is nearly full',
 }
 
 /** The label of an alert kind; a kind from a newer server is shown as sent (through SafeName). */

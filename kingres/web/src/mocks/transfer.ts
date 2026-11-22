@@ -395,11 +395,6 @@ export function transferHandlers(columnsOf: ColumnsOf): Partial<Record<Operation
         )
       if (u.fileName === FIXTURE_FILES.endmarker)
         throw problem('import_end_marker', 'The file has an unquoted end marker on line 7.')
-      if (u.fileName === FIXTURE_FILES.header && b.header === 'match')
-        throw problem(
-          'import_header_mismatch',
-          'The first difference is at column 2: the file has "name", the table has "total".',
-        )
       if (u.usedBy !== null) throw problem('operation_in_progress', 'A task uses this upload.')
       checkConcurrency(s, subjectOf(c))
       const loaded = u.data
@@ -409,7 +404,16 @@ export function transferHandlers(columnsOf: ColumnsOf): Partial<Record<Operation
               (b.header === 'none' ? 0 : 1),
           )
         : 1000
-      const failure = importFailure(u.fileName)
+      // The header is checked by PostgreSQL when the rows are loaded, so a mismatch is the code of a failed task (spike S2, V6).
+      const failure =
+        u.fileName === FIXTURE_FILES.header && b.header === 'match'
+          ? {
+              code: 'import_header_mismatch',
+              message:
+                'The header of the file does not match the columns: the first difference is at column 2. Nothing was stored.',
+              fraction: 0.4,
+            }
+          : importFailure(u.fileName)
       u.usedBy = s.nextTaskId
       const task = createTask(s, {
         kind: 'table.import',

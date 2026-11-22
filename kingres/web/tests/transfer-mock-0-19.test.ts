@@ -371,7 +371,7 @@ describe('import', () => {
     expect(done.error?.message).toContain('3 rows may have been loaded')
   })
 
-  it('toobig.csv is refused as too large, endmarker.csv for its line, header.csv when the header must match', async () => {
+  it('toobig.csv is refused as too large, endmarker.csv for its line; header.csv fails the task when the header must match', async () => {
     const big = await upload('toobig.csv')
     expect(
       (await refused(endpoints.importTable('shop', 'public', 'notes', { uploadId: big }))).code,
@@ -380,14 +380,13 @@ describe('import', () => {
     expect(
       (await refused(endpoints.importTable('shop', 'public', 'notes', { uploadId: marker }))).code,
     ).toBe('import_end_marker')
+    // A header mismatch is not a refusal of the request: PostgreSQL checks it while loading, so the task fails with the code.
     const header = await upload('header.csv')
-    expect(
-      (
-        await refused(
-          endpoints.importTable('shop', 'public', 'notes', { uploadId: header, header: 'match' }),
-        )
-      ).code,
-    ).toBe('import_header_mismatch')
+    const done = await runTask(
+      await endpoints.importTable('shop', 'public', 'notes', { uploadId: header, header: 'match' }),
+    )
+    expect(done.state).toBe('failed')
+    expect(done.error?.code).toBe('import_header_mismatch')
   })
 
   it('a table with another operation under way (blockme) is refused; unknown columns are named', async () => {

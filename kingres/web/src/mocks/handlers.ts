@@ -1035,6 +1035,15 @@ function metricValue(metric: S['MetricName'], serverId: number, t: number): numb
       return 1800 + serverId * 120 + wave(500, 5) * 900
     case 'bucketsUnderReplicated':
       return 0
+    // The data transfer (0.19.0): only the manager leader holds staged files.
+    case 'transferStagingUsedBytes':
+      return (2 + wave(1800, 6) * 3) * 1024 * MiB
+    case 'transferStagingFreeBytes':
+      return (80 - wave(1800, 6) * 3) * 1024 * MiB
+    case 'transfersRunning':
+      return Math.round(wave(300, 7) * 2)
+    case 'transfersStaged':
+      return 3
     default:
       return clientMetricValue(metric, serverId, t)
   }
@@ -1117,6 +1126,10 @@ const METRIC_UNIT: Record<S['MetricName'], S['MetricQueryResult']['unit']> = {
   transactionsPerSecond: 'countPerSecond',
   queriesPerSecond: 'countPerSecond',
   bucketsUnderReplicated: 'count',
+  transferStagingUsedBytes: 'bytes',
+  transferStagingFreeBytes: 'bytes',
+  transfersRunning: 'count',
+  transfersStaged: 'count',
   clientConnectionsAccepted: 'count',
   clientConnectionsActive: 'count',
   clientConnectionsRefused: 'count',
