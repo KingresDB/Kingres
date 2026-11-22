@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.15.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.13.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and, when it is built, the planned `kingres-cli` (it does not exist yet). Lint it and run the mechanical rule check with:
 
 ```
@@ -150,8 +150,6 @@ Each task kind has exactly one `subject.type`; `subject.id` is always a string.
 | `instance.start`, `instance.stop`, `instance.restart` | `instance` | the instance id (`node_id`) as a decimal string |
 | `database.create`, `database.update`, `database.drop` | `database` | the database name |
 | `table.distribute` | `table` | `database/schema.table` |
-| `schema.distribute`, `schema.undistribute` (0.15.0) | `schema` | `database/schema`. `schema.distribute`: `Check the schema`, `Set REPLICA IDENTITY FULL` (skipped unless asked), `Make the schema distributed` (never run twice; a retry reads `kingres.dist_schema`), `Verify on every server`. `schema.undistribute`: `Check the schema`, `Move first` (skipped unless a target group was named and differs), `Make the schema local`, `Verify on every server` |
-| `schema.move` (0.15.0) | `schema` | `database/schema`: steps `Check the move`, `Set REPLICA IDENTITY FULL` (skipped unless asked), `Copy the data` (`itemsDone`/`itemsTotal` in bytes; `detail` names the phase), `Switch`, `Clean up the old copy`; not cancellable from the phase `switching` on |
 | `rebalance` | `cluster` | `cluster` (0.9.0; one rebalance at a time, cluster-wide; the task id is the report id): steps `Check that the cluster can rebalance`, `Compute the plan`, `Move buckets`, `Write the report`; a stopped run is `paused` |
 | `replication.restorePreferredPrimaries` | `replication` | `preferred-primaries` (0.10.0: answers `unsupported_operation` until the switchover is built) |
 | `ledger.verify` | `ledgerVerification` | the **database name**: the verification id exists only after the run (see `LedgerVerification.taskId`) |
@@ -319,47 +317,6 @@ Where the architecture document leaves something open, the simplest option was c
     range and the cluster's replica count.
 
 ## Changelog
-
-### 0.15.0
-
-Revision written with the control plane of distributed schemas (phase 11, step 13 of `kingres/docs/design/shard-phase11.md`). The number is
-0.15.0 because phase 10 holds 0.14.0 on another branch; when the two are merged this entry sits above 0.14.0 and the counts below must be
-added to those of 0.14.0 (this revision counts from 0.13.0). Summary for the panel: 5 operations added (137 operations, 112 paths), 4 problem
-codes, 3 task kinds and one task subject type, optional properties on eight existing schemas; **no change that is not additive**.
-
-#### Breaking
-
-None.
-
-#### Additive
-
-- Operations (tag `Schemas`): `listSchemas` (`kingres_readonly`, cursor pagination, filters `distributed`, `shardGroupId`, `state`), `getSchema`
-  (`kingres_readonly`; the blockers of `kingres.schema_inventory`, `pinned`, `moveInProgress`), `distributeSchema` (`kingres_admin`, `PUT .../distribution`,
-  202, task `schema.distribute`), `undistributeSchema` (`kingres_admin`, `DELETE .../distribution`, optional query `shardGroupId` to move first, 202,
-  task `schema.undistribute`) and `moveSchema` (`kingres_ops`, `POST .../moves`, 202, task `schema.move`). New schemas: `SchemaSummary`,
-  `SchemaDistribution`, `SchemaBlocker`, `SchemaPinned`, `SchemaDetail`, `SchemaPage`, `DistributeSchemaRequest`, `MoveSchemaRequest`.
-- `TaskKind`: `schema.distribute`, `schema.move`, `schema.undistribute`; `TaskSubject.type`: `schema` (id `database/schema`).
-- `ProblemCode`: `sharding_mode_in_use` (409), `schema_not_distributable` (422, `errors` are the blockers), `schema_pinned` (409),
-  `schema_move_in_progress` (409).
-- `ShardingCreateSettings` and `ShardingSettings`: `mode` (`row`, `schema`, `both`) and `distributeNewSchemas`; `bucketCount` is optional in a
-  request (it was required by the schema although the server defaulted it) and null in the mode `schema`. `DatabaseUpdateRequest.sharding` has
-  `minProperties: 1` instead of `required: [enabled]` and the same two properties; a change of the mode is synchronous. `DatabaseCreateOptions.shardingModes`.
-  `Database.stats.distributedSchemaCount`.
-- `TableDistribution.method` has `schema` (`column` null, `bucketCount` 1); `Table.homeShardGroupId` is the owner group for such a table.
-  `ColocationGroup.kind` and `schemaName` (`distributionColumnType` is nullable now, for a group of kind `schema`); `listColocationGroups` has the
-  query `kind`. `BucketMove.kind` and `schemaName` (the moves in `RebalanceStatus.inFlightMoves`). `ServerBucketCount.primarySchemas`.
-
-#### Documentation
-
-- A client that does not know `schema` as a method, kind, subject type or task kind must show it as an unknown value and not fail: the enums
-  were never closed for clients. The console should ask `listColocationGroups` for `kind=hash` on its Shards page, because a database with
-  thousands of distributed schemas has thousands of groups of kind `schema`.
-- `moveSchema` and `schema.move`: the task has the steps `Check the move`, `Set REPLICA IDENTITY FULL` (skipped unless asked), `Copy the data`,
-  `Switch`, `Clean up the old copy`; `itemsDone` and `itemsTotal` of `Copy the data` are bytes; the task is `done` when the move reaches the phase
-  `cleaning`. `Task.cancellable` is false from the phase `switching` on.
-- `distributeSchema` has the optional body property `setReplicaIdentityFull` and `moveSchema` the same (a change of the user's tables is only made on
-  request). Where the design text of the phase leaves the body of `distributeSchema` with `shardGroupId` alone, this is an addition.
-- `updateDatabase` answers 422 `unsupported_operation` for a mode change in a database whose extension is older than kingres_shard 0.8.
 
 ### 0.13.0
 

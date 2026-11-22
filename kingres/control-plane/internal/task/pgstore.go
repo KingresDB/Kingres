@@ -270,14 +270,3 @@ func (s *PGStore) SetDetail(ctx context.Context, id int64, l Lease, detail strin
 	}
 	return s.heldOrErr(ctx, tag, id)
 }
-
-// SetItems implements ItemsStore.
-func (s *PGStore) SetItems(ctx context.Context, id int64, l Lease, step int, done, total int64) error {
-	tag, err := s.db.Exec(ctx, `UPDATE kingres_cp.task SET progress = jsonb_set(jsonb_set(progress, ARRAY['steps', $4::text, 'itemsDone'], to_jsonb($5::bigint)),
-		ARRAY['steps', $4::text, 'itemsTotal'], to_jsonb($6::bigint))
-		WHERE id = $1 AND lease_holder = $2 AND lease_epoch = $3 AND state = 'running'`, id, l.Holder, l.Epoch, strconv.Itoa(step), done, total)
-	if err != nil {
-		return err
-	}
-	return s.heldOrErr(ctx, tag, id)
-}

@@ -575,16 +575,9 @@ func (s *Service) Status(ctx context.Context) (api.RebalanceStatus, error) {
 			if ph == "" {
 				ph = "preparing"
 			}
-			mv := api.BucketMove{Kind: "hash"}
-			if s.Backend != nil {
-				if name, err := s.Backend.SchemaOf(ctx, m.Move.Database, m.Move.Colocation); err == nil && name != nil {
-					mv.Kind, mv.SchemaName = "schema", name
-				}
-			}
-			mv.DatabaseName, mv.ColocationID, mv.Bucket = m.Move.Database, m.Move.Colocation, m.Move.Bucket
-			mv.FromShardGroupID, mv.ToShardGroupID, mv.FromServerID, mv.ToServerID = m.Move.From, m.Move.To, m.FromServer, m.ToServer
-			mv.Phase, mv.Percent, mv.SizeBytes = phaseOf(ph), m.Percent, m.Size
-			st.InFlightMoves = append(st.InFlightMoves, mv)
+			st.InFlightMoves = append(st.InFlightMoves, api.BucketMove{DatabaseName: m.Move.Database, ColocationID: m.Move.Colocation,
+				Bucket: m.Move.Bucket, FromShardGroupID: m.Move.From, ToShardGroupID: m.Move.To, FromServerID: m.FromServer, ToServerID: m.ToServer,
+				Phase: phaseOf(ph), Percent: m.Percent, SizeBytes: m.Size})
 		}
 	}
 	last, err := s.latest(ctx, exclude)

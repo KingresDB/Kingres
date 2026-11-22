@@ -98,11 +98,6 @@ const (
 	SigningKeyMissing  Code = "signing_key_missing"
 	LastSigningKey     Code = "last_signing_key"
 	ChainNotDiverged   Code = "chain_not_diverged"
-	// Added in contract 0.15.0 (distributed schemas, phase 11).
-	ShardingModeInUse      Code = "sharding_mode_in_use"
-	SchemaNotDistributable Code = "schema_not_distributable"
-	SchemaPinned           Code = "schema_pinned"
-	SchemaMoveInProgress   Code = "schema_move_in_progress"
 )
 
 // FieldError is one entry of the "errors" extension (schema ValidationIssue).
@@ -231,10 +226,6 @@ var specs = map[Code]struct {
 	SigningKeyMissing:               {409, "No signing key", "signing-key-missing"},
 	LastSigningKey:                  {409, "Last signing key", "last-signing-key"},
 	ChainNotDiverged:                {409, "The chain is not diverged", "chain-not-diverged"},
-	ShardingModeInUse:               {409, "The sharding mode is in use", "sharding-mode-in-use"},
-	SchemaNotDistributable:          {422, "The schema cannot be distributed", "schema-not-distributable"},
-	SchemaPinned:                    {409, "The schema is pinned", "schema-pinned"},
-	SchemaMoveInProgress:            {409, "The schema is moving", "schema-move-in-progress"},
 }
 
 // New returns a Problem for the code with the standard status, title and

@@ -59,16 +59,6 @@ type TableFilter struct {
 	Class string
 }
 
-// SchemaFilter selects schemas (contract 0.15.0); every condition is on the distribution.
-type SchemaFilter struct {
-	// Distributed restricts to distributed (true) or local (false) schemas when non-nil.
-	Distributed *bool
-	// ShardGroupID restricts to the schemas this group owns when non-nil.
-	ShardGroupID *int32
-	// State restricts to one state (active or moving) when non-empty.
-	State string
-}
-
 // BucketFilter selects buckets.
 type BucketFilter struct {
 	// ShardGroupID restricts to one owning group when non-nil.
@@ -164,13 +154,9 @@ type Store interface {
 	DatabaseCreateOptions(ctx context.Context) (api.DatabaseCreateOptions, error)
 	// ColocationGroups, Buckets and BucketDistribution read the shard
 	// catalog of a database.
-	ColocationGroups(ctx context.Context, db, kind string) ([]api.ColocationGroup, error)
+	ColocationGroups(ctx context.Context, db string) ([]api.ColocationGroup, error)
 	Buckets(ctx context.Context, db string, colocationID int32, f BucketFilter, p Page) (api.BucketPage, error)
 	BucketDistribution(ctx context.Context, db string, colocationID *int32) (api.BucketDistribution, error)
-	// Schemas and Schema read the schemas of a database (contract 0.15.0): the distribution of a distributed schema is
-	// read from the catalog of the extension, a database without sharding lists its schemas as local ones.
-	Schemas(ctx context.Context, db string, f SchemaFilter, p Page) (api.SchemaPage, error)
-	Schema(ctx context.Context, db, name string) (api.SchemaDetail, error)
 
 	// Tasks and Task read kingres_cp.task of the system database.
 	Tasks(ctx context.Context, f TaskFilter, p Page) (api.TaskPage, error)

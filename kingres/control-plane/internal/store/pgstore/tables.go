@@ -46,11 +46,10 @@ func classPredicate(class string, hasShard, hasLedger bool) string {
 // exist in the database; $1 and $2 filter the schema and the name, $3 and $4 are
 // the position to continue after (NULL: from the start), $5 the number of rows.
 func tableQuery(hasShard, hasLedger, hasUpdatable bool, class string) string {
-	dist := "NULL::text, NULL::text, NULL::int, NULL::int, NULL::int"
+	dist := "NULL::text, NULL::text, NULL::int, NULL::int"
 	distJoin := ""
 	if hasShard {
-		dist = `dt.method, dt.dist_column::text, dt.colocation_id, co.bucket_count,
-		(SELECT bm.group_id FROM kingres.bucket_map bm WHERE dt.method = 'schema' AND bm.colocation_id = dt.colocation_id AND bm.bucket = 0)`
+		dist = "dt.method, dt.dist_column::text, dt.colocation_id, co.bucket_count"
 		distJoin = `LEFT JOIN kingres.dist_table dt ON dt.relid::oid = c.oid
 		LEFT JOIN kingres.colocation co ON co.colocation_id = dt.colocation_id`
 	}
@@ -133,13 +132,13 @@ func (s *Store) readTables(ctx context.Context, h *dbHandle, schema, name, class
 	}
 	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (api.Table, error) {
 		var (
-			t                         api.Table
-			method, column            *string
-			colocation, bucket, owner *int32
-			isLedger                  bool
-			lmode, lhistory           *string
+			t                  api.Table
+			method, column     *string
+			colocation, bucket *int32
+			isLedger           bool
+			lmode, lhistory    *string
 		)
-		if err := r.Scan(&t.Schema, &t.Name, &t.EstimatedRows, &t.SizeBytes, &method, &column, &colocation, &bucket, &owner, &isLedger, &lmode, &lhistory); err != nil {
+		if err := r.Scan(&t.Schema, &t.Name, &t.EstimatedRows, &t.SizeBytes, &method, &column, &colocation, &bucket, &isLedger, &lmode, &lhistory); err != nil {
 			return t, s.wrap("scanning tables", err)
 		}
 		t.Classes = []string{"plain"}
@@ -155,14 +154,7 @@ func (s *Store) readTables(ctx context.Context, h *dbHandle, schema, name, class
 				bc = &n
 			}
 			t.Distribution = &api.TableDistribution{Method: *method, Column: column, ColocationID: colocation, BucketCount: bc}
-			if *method == "schema" && owner != nil {
-				// a table of a distributed schema is on its owner group; the other servers hold empty shells
-				g := *owner
-				t.HomeShardGroupID = &g
-				if g != home {
-					t.EstimatedRows, t.SizeBytes = nil, nil
-				}
-			} else if multiGroup {
+			if multiGroup {
 				t.EstimatedRows, t.SizeBytes = nil, nil
 			}
 			if *method == "reference" {
@@ -249,7 +241,7 @@ func (s *Store) Table(ctx context.Context, db, schema, name string) (api.TableDe
 }
 
 // ColocationGroups implements store.Store.
-func (s *Store) ColocationGroups(ctx context.Context, db, kind string) ([]api.ColocationGroup, error) {
+func (s *Store) ColocationGroups(ctx context.Context, db string) ([]api.ColocationGroup, error) {
 	h, err := s.requireDatabase(ctx, db)
 	if err != nil {
 		return nil, err
@@ -277,35 +269,15 @@ func (s *Store) ColocationGroups(ctx context.Context, db, kind string) ([]api.Co
 		return nil, err
 	}
 	multiGroup := len(cat.groups) > 1
-	// kingres_shard 0.8 has the kind of a group and the distributed schemas; before, every group is a hash group
-	var hasKind bool
-	if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'kingres.colocation'::regclass AND attname = 'kind' AND NOT attisdropped)`).Scan(&hasKind); err != nil {
-		return nil, s.wrap("reading kingres.colocation", err)
-	}
-	kindSQL, nameSQL, ownerSQL, join := "'hash'::text", "NULL::text", "NULL::int", ""
-	if hasKind {
-		kindSQL = "co.kind"
-		nameSQL = "ns.nspname::text"
-		ownerSQL = "(SELECT bm.group_id FROM kingres.bucket_map bm WHERE bm.colocation_id = co.colocation_id AND bm.bucket = 0 AND co.kind = 'schema')"
-		join = "LEFT JOIN kingres.dist_schema ds ON ds.colocation_id = co.colocation_id LEFT JOIN pg_namespace ns ON ns.oid = ds.nsp::oid"
-	}
-	home := s.localGroup(ctx, h)
-	rows, err := h.pool.Query(ctx, `SELECT co.colocation_id, `+kindSQL+`, `+nameSQL+`, co.bucket_count, co.dist_column_type::text,
-		`+count+`::int, `+size+`::bigint, `+ownerSQL+` FROM kingres.colocation co `+join+`
-		WHERE ($1 = '' OR `+kindSQL+` = $1) ORDER BY co.colocation_id`, kind)
+	rows, err := h.pool.Query(ctx, `SELECT co.colocation_id, co.bucket_count, co.dist_column_type::text,
+		`+count+`::int, `+size+`::bigint FROM kingres.colocation co ORDER BY co.colocation_id`)
 	if err != nil {
 		return nil, s.wrap("reading kingres.colocation", err)
 	}
 	out, err = pgx.CollectRows(rows, func(r pgx.CollectableRow) (api.ColocationGroup, error) {
 		var g api.ColocationGroup
-		var owner *int32
-		err := r.Scan(&g.ColocationID, &g.Kind, &g.SchemaName, &g.BucketCount, &g.DistributionColumnType, &g.TableCount, &g.SizeBytes, &owner)
-		if g.Kind == "schema" {
-			// the tables of a distributed schema are on the owner group; the other servers hold empty shells
-			if owner == nil || *owner != home {
-				g.SizeBytes = nil
-			}
-		} else if multiGroup {
+		err := r.Scan(&g.ColocationID, &g.BucketCount, &g.DistributionColumnType, &g.TableCount, &g.SizeBytes)
+		if multiGroup {
 			g.SizeBytes = nil // this node sees only its own partitions
 		}
 		return g, err
@@ -428,10 +400,6 @@ func (s *Store) BucketDistribution(ctx context.Context, db string, colocationID 
 	if err != nil {
 		return api.BucketDistribution{}, err
 	}
-	schemas, err := s.schemaBucketsPerGroup(ctx, h, colocationID)
-	if err != nil {
-		return api.BucketDistribution{}, err
-	}
 	per := map[string]*api.ServerBucketCount{}
 	for _, sv := range cat.servers {
 		per[sv.ID] = &api.ServerBucketCount{ServerID: sv.ID}
@@ -444,7 +412,6 @@ func (s *Store) BucketDistribution(ctx context.Context, db string, colocationID 
 			c := per[cat.byNode[n.ID].ID]
 			if n.Role == "primary" {
 				c.PrimaryBuckets += gb.held()
-				c.PrimarySchemas += schemas[g]
 			} else {
 				c.ReplicaBuckets += gb.held()
 			}
@@ -542,38 +509,4 @@ func (s *Store) readColumns(ctx context.Context, h *dbHandle, t api.Table) ([]ap
 		}
 		return c, nil
 	})
-}
-
-// schemaBucketsPerGroup counts, per owner group, the buckets that are distributed schemas (colocation groups of kind
-// schema: one bucket each, active or moving). A database whose extension has no kinds has none.
-func (s *Store) schemaBucketsPerGroup(ctx context.Context, h *dbHandle, colocationID *int32) (map[int32]int, error) {
-	out := map[int32]int{}
-	var hasKind bool
-	if err := h.pool.QueryRow(ctx, `SELECT to_regclass('kingres.colocation') IS NOT NULL AND EXISTS (SELECT 1 FROM pg_attribute
-		WHERE attrelid = 'kingres.colocation'::regclass AND attname = 'kind' AND NOT attisdropped)`).Scan(&hasKind); err != nil {
-		return nil, s.wrap("reading kingres.colocation", err)
-	}
-	if !hasKind {
-		return out, nil
-	}
-	var cg any
-	if colocationID != nil {
-		cg = *colocationID
-	}
-	rows, err := h.pool.Query(ctx, `SELECT b.group_id, count(*)::int FROM kingres.bucket_map b
-		JOIN kingres.colocation c ON c.colocation_id = b.colocation_id AND c.kind = 'schema'
-		WHERE b.state IN ('active', 'moving') AND ($1::int IS NULL OR b.colocation_id = $1) GROUP BY b.group_id`, cg)
-	if err != nil {
-		return nil, s.wrap("reading kingres.bucket_map", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var g int32
-		var n int
-		if err := rows.Scan(&g, &n); err != nil {
-			return nil, s.wrap("scanning kingres.bucket_map", err)
-		}
-		out[g] = n
-	}
-	return out, s.wrap("reading kingres.bucket_map", rows.Err())
 }

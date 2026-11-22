@@ -16,8 +16,6 @@ type MemStore struct {
 	next   int64
 	tasks  map[int64]*Task
 	failOn func(op string) error // test hook
-	// items are the counters of the steps that recorded any (ItemsStore), by task id and step.
-	items map[int64]map[int][2]int64
 	// clock stands for the database's clock: every engine that shares the
 	// store agrees on it, whatever its own clock says.
 	clock func() time.Time
@@ -300,9 +298,7 @@ var failoverClass = map[string]bool{"server.failover": true, "replication.restor
 
 // databaseOps are the kinds that change which databases and tables have a catalog (migration 0016): a failover is
 // excluded by them and excludes them.
-var databaseOps = map[string]bool{"database.create": true, "database.drop": true, "table.distribute": true,
-	// migration 0050: the tasks of the distributed schemas exclude a failover too
-	"schema.distribute": true, "schema.move": true, "schema.undistribute": true}
+var databaseOps = map[string]bool{"database.create": true, "database.drop": true, "table.distribute": true}
 
 // excludedLocked is the rule of the database trigger for a task of kind about to be created.
 func (m *MemStore) excludedLocked(kind string) error {
@@ -322,29 +318,4 @@ func (m *MemStore) excludedLocked(kind string) error {
 		}
 	}
 	return nil
-}
-
-// SetItems implements ItemsStore.
-func (m *MemStore) SetItems(_ context.Context, id int64, l Lease, step int, done, total int64) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if _, err := m.held(id, l); err != nil {
-		return err
-	}
-	if m.items == nil {
-		m.items = map[int64]map[int][2]int64{}
-	}
-	if m.items[id] == nil {
-		m.items[id] = map[int][2]int64{}
-	}
-	m.items[id][step] = [2]int64{done, total}
-	return nil
-}
-
-// StepItems returns the counters a step recorded, for tests.
-func (m *MemStore) StepItems(id int64, step int) (done, total int64, ok bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	v, ok := m.items[id][step]
-	return v[0], v[1], ok
 }

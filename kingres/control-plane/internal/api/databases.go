@@ -23,10 +23,6 @@ type ShardingSettings struct {
 	// BucketCount is the number of hash buckets per colocation group; null
 	// when not available.
 	BucketCount *int `json:"bucketCount"`
-	// Mode is row, schema or both (contract 0.15.0).
-	Mode string `json:"mode,omitempty"`
-	// DistributeNewSchemas tells whether a new schema is distributed by default (0.15.0).
-	DistributeNewSchemas bool `json:"distributeNewSchemas"`
 }
 
 // ReplicationSettings are the replication settings of a database.
@@ -55,8 +51,6 @@ type DatabaseStats struct {
 	ActiveConnections *int `json:"activeConnections"`
 	// TransactionsPerSecond is the recent commit rate; null when not available.
 	TransactionsPerSecond *float64 `json:"transactionsPerSecond"`
-	// DistributedSchemaCount is the number of distributed schemas (0.15.0); 0 without sharding.
-	DistributedSchemaCount *int `json:"distributedSchemaCount"`
 }
 
 // DatabaseHealth is the replication health of a database.
@@ -115,7 +109,7 @@ type DatabaseList struct {
 
 // TableDistribution describes how a table is spread over shard groups.
 type TableDistribution struct {
-	// Method is hash, reference or schema (0.15.0).
+	// Method is hash or reference.
 	Method string `json:"method"`
 	// Column is the distribution column; null for reference tables.
 	Column *string `json:"column"`
@@ -128,7 +122,7 @@ type TableDistribution struct {
 // TableLedger are the ledger properties of a table.
 type TableLedger struct {
 	// Mode is appendOnly or updatable.
-	Mode string `json:"mode,omitempty"`
+	Mode string `json:"mode"`
 	// HistoryTable is the history table; null for appendOnly.
 	HistoryTable *string `json:"historyTable"`
 }
@@ -190,14 +184,10 @@ type TablePage struct {
 type ColocationGroup struct {
 	// ColocationID is the group identifier.
 	ColocationID int32 `json:"colocationId"`
-	// Kind is hash or schema (0.15.0).
-	Kind string `json:"kind,omitempty"`
-	// SchemaName is the distributed schema of a group of kind schema; null for hash.
-	SchemaName *string `json:"schemaName"`
 	// BucketCount is the number of buckets.
 	BucketCount int `json:"bucketCount"`
 	// DistributionColumnType is the PostgreSQL type of the column.
-	DistributionColumnType *string `json:"distributionColumnType"`
+	DistributionColumnType string `json:"distributionColumnType"`
 	// TableCount is the number of tables in the group.
 	TableCount int `json:"tableCount"`
 	// SizeBytes is the size of the group's data; null when not available.
@@ -246,8 +236,6 @@ type ServerBucketCount struct {
 	PrimaryBuckets int `json:"primaryBuckets"`
 	// ReplicaBuckets have a replica copy here.
 	ReplicaBuckets int `json:"replicaBuckets"`
-	// PrimarySchemas are the distributed schemas whose primary copy is here (0.15.0); also counted in PrimaryBuckets.
-	PrimarySchemas int `json:"primarySchemas"`
 	// PrimarySizeBytes is the size of primary copies.
 	PrimarySizeBytes *int64 `json:"primarySizeBytes"`
 	// ReplicaSizeBytes is the size of replica copies.
@@ -304,12 +292,4 @@ type DatabaseCreateOptions struct {
 	DefaultDurability string `json:"defaultDurability"`
 	// LedgerDigestIntervalSeconds is the ledger digest interval range.
 	LedgerDigestIntervalSeconds IntegerRange `json:"ledgerDigestIntervalSeconds"`
-	// ShardingModes are the modes the create dialog offers (0.15.0).
-	ShardingModes *ShardingModes `json:"shardingModes,omitempty"`
-}
-
-// ShardingModes lists the sharding modes of a database and the default (contract 0.15.0).
-type ShardingModes struct {
-	Modes   []string `json:"modes"`
-	Default string   `json:"default"`
 }

@@ -55,8 +55,6 @@ var leaderBoundReads = map[string]bool{
 	"listServerGroups": true,
 	// The records of a rebalance run are in the leader's system database.
 	"getRebalanceStatus": true, "listRebalanceReports": true, "getRebalanceReport": true,
-	// The move of a schema is a row of the map group's catalog and a task of the leader's system database (0.15.0).
-	"listSchemas": true, "getSchema": true,
 	// The records of a failover run are in the leader's system database too.
 	"getFailoverStatus": true, "listFailoverReports": true, "getFailoverReport": true,
 	// The verification records get their identifiers in the system database

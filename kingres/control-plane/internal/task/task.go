@@ -210,13 +210,6 @@ type Env struct {
 	secrets map[string]string
 	eng     *Engine
 	lease   Lease
-	// step is the index of the step that runs (set by the engine before each Run).
-	step int
-}
-
-// ItemsStore is implemented by stores that can keep the items counters of a step (TaskStep.itemsDone and itemsTotal).
-type ItemsStore interface {
-	SetItems(ctx context.Context, id int64, l Lease, step int, done, total int64) error
 }
 
 // DetailStore is implemented by stores that can keep a task's Detail.
@@ -239,29 +232,6 @@ func (e *Env) SetDetail(ctx context.Context, detail string) error {
 	}
 	e.Task.Detail = detail
 	return ds.SetDetail(ctx, e.Task.ID, e.lease, detail)
-}
-
-// SetItems records how far the running step is (itemsDone of itemsTotal, in the unit the step names in its detail; the
-// contract has them as plain numbers). A store without support ignores it.
-func (e *Env) SetItems(ctx context.Context, done, total int64) error {
-	if e.eng == nil {
-		return nil
-	}
-	is, ok := e.eng.store.(ItemsStore)
-	if !ok {
-		return nil
-	}
-	return is.SetItems(ctx, e.Task.ID, e.lease, e.step, done, total)
-}
-
-// CancelRequested reports whether a cancel request is recorded for the task now (a step that runs for long asks it between
-// its own waits, because the engine looks at the mark only between steps). A task that cannot be read is not cancelled.
-func (e *Env) CancelRequested(ctx context.Context) bool {
-	if e.eng == nil {
-		return false
-	}
-	t, err := e.eng.store.Get(ctx, e.Task.ID)
-	return err == nil && t.CancelRequested
 }
 
 // Fence returns the fencing token of this run (the lease epoch). A step that
@@ -300,11 +270,6 @@ type Step struct {
 	// task with CodeStepInterrupted. Steps without the mark are at-least-once:
 	// they run again.
 	NonIdempotent bool
-	// Recover, for a NonIdempotent step, says whether the effect of the step is there when a run finds the step recorded
-	// as running (the run that started it ended before it recorded the end). true: the step is recorded as done and the task
-	// goes on; false: the effect is provably not there, so the step runs again. An error, or no Recover, fails the task with
-	// CodeStepInterrupted as before. A step that cannot tell must not have a Recover.
-	Recover func(ctx context.Context, env *Env) (bool, error)
 	// NeedsSecret names a secret the step needs; when it is missing the task
 	// fails with CodeSecretUnavailable instead of running the step.
 	NeedsSecret string
@@ -634,32 +599,9 @@ func (e *Engine) run(ctx context.Context, t Task, started time.Time, secrets map
 			return nil
 		}
 		st := def.Steps[i]
-		env.step = i
 		if st.NonIdempotent && i < len(t.Steps) && t.Steps[i].State == StepRunning {
-			// The run that started the step ended before it recorded the end. A step that can read its own effect says
-			// whether it is there; any other is not run again.
-			var done bool
-			var rerr error
-			if st.Recover != nil {
-				done, rerr = st.Recover(fence.With(runCtx, fence.Token{Task: t.ID, Epoch: env.lease.Epoch}), env)
-				if rerr != nil && leaseLost(rerr) {
-					return e.standDown(ctx, t, i, st, rerr)
-				}
-			}
-			if st.Recover == nil || rerr != nil {
-				return e.fail(ctx, t, i, st, &Error{Code: CodeStepInterrupted, Step: st.Name, Retryable: false,
-					Message: "The step was interrupted after it started and must not run twice, so it is unknown whether it took effect. Check the result and submit the task again if needed."})
-			}
-			if done {
-				cancelReq, err := e.setStep(ctx, t, i, StepDone, percent(i+1, len(def.Steps)))
-				if err != nil {
-					return err
-				}
-				if cancelReq && i+1 < len(def.Steps) && e.honourCancel(ctx, t, def) {
-					return e.cancelTask(ctx, t, def, i+1)
-				}
-				continue
-			}
+			return e.fail(ctx, t, i, st, &Error{Code: CodeStepInterrupted, Step: st.Name, Retryable: false,
+				Message: "The step was interrupted after it started and must not run twice, so it is unknown whether it took effect. Check the result and submit the task again if needed."})
 		}
 		e.fault(FaultBeforeStep, t.ID, i)
 		if st.NeedsSecret != "" {

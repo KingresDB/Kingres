@@ -55,11 +55,7 @@ type RebalancePlan struct {
 
 // BucketMove is a move in flight.
 type BucketMove struct {
-	DatabaseName string `json:"databaseName"`
-	// Kind is hash or schema (contract 0.15.0); empty reads as hash.
-	Kind string `json:"kind,omitempty"`
-	// SchemaName is the schema that moves, for kind schema.
-	SchemaName       *string `json:"schemaName,omitempty"`
+	DatabaseName     string  `json:"databaseName"`
 	ColocationID     int32   `json:"colocationId"`
 	Bucket           int32   `json:"bucket"`
 	FromShardGroupID int32   `json:"fromShardGroupId"`

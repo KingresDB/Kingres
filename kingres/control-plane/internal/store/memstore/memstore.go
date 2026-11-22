@@ -33,10 +33,6 @@ type Store struct {
 	DBs           []api.Database
 	TablesByDB    map[string][]api.TableDetail
 	Colocation    map[string][]api.ColocationGroup
-	// SchemasByDB are the schemas of a database in name order (contract 0.15.0); SchemaDetails are the details of one,
-	// by "database/schema", and a schema without one is read as a detail with no blocker.
-	SchemasByDB   map[string][]api.SchemaSummary
-	SchemaDetails map[string]api.SchemaDetail
 	BucketsByCG   map[string]map[int32][]api.Bucket
 	Distribution  map[string]api.BucketDistribution
 	MapVersion    int64
@@ -73,8 +69,6 @@ func New() *Store {
 		ServerDetails: map[string][]api.DatabaseBucketCount{},
 		TablesByDB:    map[string][]api.TableDetail{},
 		Colocation:    map[string][]api.ColocationGroup{},
-		SchemasByDB:   map[string][]api.SchemaSummary{},
-		SchemaDetails: map[string]api.SchemaDetail{},
 		BucketsByCG:   map[string]map[int32][]api.Bucket{},
 		Distribution:  map[string]api.BucketDistribution{},
 		LedgerByDB:    map[string]api.LedgerStatus{},
@@ -227,78 +221,14 @@ func (s *Store) DatabaseCreateOptions(context.Context) (api.DatabaseCreateOption
 }
 
 // ColocationGroups implements store.Store.
-func (s *Store) ColocationGroups(_ context.Context, db, kind string) ([]api.ColocationGroup, error) {
+func (s *Store) ColocationGroups(_ context.Context, db string) ([]api.ColocationGroup, error) {
 	if s.Err != nil {
 		return nil, s.Err
 	}
 	if !s.hasDB(db) {
 		return nil, store.ErrNotFound
 	}
-	out := []api.ColocationGroup{}
-	for _, g := range s.Colocation[db] {
-		k := g.Kind
-		if k == "" {
-			k = "hash"
-		}
-		if kind == "" || k == kind {
-			out = append(out, g)
-		}
-	}
-	return out, nil
-}
-
-// Schemas implements store.Store.
-func (s *Store) Schemas(_ context.Context, db string, f store.SchemaFilter, p store.Page) (api.SchemaPage, error) {
-	if s.Err != nil {
-		return api.SchemaPage{}, s.Err
-	}
-	if !s.hasDB(db) {
-		return api.SchemaPage{}, store.ErrNotFound
-	}
-	after, err := store.DecodeTextKey(p.Cursor, 1)
-	if err != nil {
-		return api.SchemaPage{}, err
-	}
-	var sel []api.SchemaSummary
-	for _, x := range s.SchemasByDB[db] {
-		if after != nil && x.Name <= after[0] {
-			continue
-		}
-		if f.Distributed != nil && (x.Distribution != nil) != *f.Distributed {
-			continue
-		}
-		if f.ShardGroupID != nil && (x.Distribution == nil || x.Distribution.ShardGroupID != *f.ShardGroupID) {
-			continue
-		}
-		if f.State != "" && (x.Distribution == nil || x.Distribution.State != f.State) {
-			continue
-		}
-		sel = append(sel, x)
-	}
-	items, next := store.KeysetPage(sel, p, func(x api.SchemaSummary) string { return store.EncodeTextKey(x.Name) })
-	if items == nil {
-		items = []api.SchemaSummary{}
-	}
-	return api.SchemaPage{Items: items, NextCursor: next}, nil
-}
-
-// Schema implements store.Store.
-func (s *Store) Schema(_ context.Context, db, name string) (api.SchemaDetail, error) {
-	if s.Err != nil {
-		return api.SchemaDetail{}, s.Err
-	}
-	if !s.hasDB(db) {
-		return api.SchemaDetail{}, store.ErrNotFound
-	}
-	if d, ok := s.SchemaDetails[db+"/"+name]; ok {
-		return d, nil
-	}
-	for _, x := range s.SchemasByDB[db] {
-		if x.Name == name {
-			return api.SchemaDetail{SchemaSummary: x, DistributionBlockers: []api.SchemaBlocker{}}, nil
-		}
-	}
-	return api.SchemaDetail{}, store.ErrNotFound
+	return append([]api.ColocationGroup{}, s.Colocation[db]...), nil
 }
 
 // Buckets implements store.Store.

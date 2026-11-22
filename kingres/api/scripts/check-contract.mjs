@@ -381,13 +381,12 @@ const MUST_MENTION = {
   '0.8.0': ['listConfigParameters', 'applyConfigChange', 'restartPendingInstances', 'clockDifference', 'config_parameter_refused', 'config.apply', 'additive'],
   '0.10.0': ['getFailoverStatus', 'listFailoverReports', 'getFailoverReport', 'resetAutoFailoverCounter', 'failover_needs_decision', 'quorum_unavailable', 'lease_settings_differ', 'allowDataLoss', 'shardGroupId', 'additive'],
   '0.11.0': ['getLedgerSigning', 'createLedgerSigningKey', 'getLedgerTrustFile', 'getLedgerAggregate', 'createLedgerAnchorTarget', 'ledger_not_published', 'origin_prefix_locked', 'signing_key_missing', 'last_signing_key', 'chain_not_diverged', 'ledgerSignerUnavailable', 'ledger.key.create', 'aggregateSize', 'additive'],
-  '0.15.0': ['listSchemas', 'getSchema', 'distributeSchema', 'undistributeSchema', 'moveSchema', 'sharding_mode_in_use', 'schema_not_distributable', 'schema_pinned', 'schema_move_in_progress', 'schema.distribute', 'additive'],
   '0.13.0': ['certificateAuthorityUnavailable', 'failoverServer', 'taskId', 'additive'],
   '0.12.0': ['completedWithWarnings', 'failover_needs_decision', 'plan', 'notScheduled', 'additive'],
   '0.9.0': ['startRebalance', 'previewRebalancePlan', 'nothing_to_rebalance', 'cluster_inconsistent', 'skipped', 'ledgerSummary', 'Prefer', 'additive'],
   '0.5.0': ['renewServerCertificates', 'revokeServerCertificates', 'certificate_authority_unavailable', 'certificate_revoked', 'certificateRenewalFailed', 'partial', 'additive'],
 };
-for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0', '0.10.0', '0.11.0', '0.12.0', '0.13.0', '0.15.0']) {
+for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0', '0.10.0', '0.11.0', '0.12.0', '0.13.0']) {
   const changelog = changelogOf(version);
   if (!changelog) { fail('README.md', `changelog heading for ${version} is missing`); continue; }
   for (const h of ['#### Breaking', '#### Additive', '#### Documentation']) if (!changelog.includes(h)) fail('README.md', `changelog of ${version} lacks "${h}"`);
@@ -399,7 +398,7 @@ for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0', '0.
   if (!m) fail('README.md', `the changelog summary of ${version} must state "N operations added (M operations, P paths)"`);
   else if (version === doc.info?.version && (Number(m[2]) !== operations.length || Number(m[3]) !== Object.keys(doc.paths ?? {}).length)) fail('README.md', `changelog says ${m[2]} operations and ${m[3]} paths, the contract has ${operations.length} and ${Object.keys(doc.paths ?? {}).length}`);
 }
-if (doc.info?.version !== '0.15.0') fail('info.version', 'the contract is revision 0.15.0');
+if (doc.info?.version !== '0.13.0') fail('info.version', 'the contract is revision 0.13.0');
 
 
 // 0.5.0 rules: certificate operations, partial answers, additive changes only.
@@ -575,52 +574,6 @@ for (const [n, prop] of [['SetupTaskSummary', 'detail'], ['NodeStateInfo', 'inte
   if (!schemas.LedgerDigest?.properties?.aggregateSize || (schemas.LedgerDigest?.required ?? []).includes('aggregateSize')) fail('LedgerDigest', 'aggregateSize must exist and stay optional');
   if (!opDesc('getLedgerSigning').includes('No private key')) fail('getLedgerSigning', 'must say that no private key is ever part of the answer');
   if (!opDesc('getLedgerTrustFile').includes('first trust')) fail('getLedgerTrustFile', 'must say that the file is not a source of first trust');
-}
-// 0.15.0 rules: distributed schemas. Only additions: no property removed or made required.
-{
-  const need = {
-    listSchemas: ['get', '/databases/{databaseName}/schemas', 'kingres_readonly'],
-    getSchema: ['get', '/databases/{databaseName}/schemas/{schemaName}', 'kingres_readonly'],
-    distributeSchema: ['put', '/databases/{databaseName}/schemas/{schemaName}/distribution', 'kingres_admin'],
-    undistributeSchema: ['delete', '/databases/{databaseName}/schemas/{schemaName}/distribution', 'kingres_admin'],
-    moveSchema: ['post', '/databases/{databaseName}/schemas/{schemaName}/moves', 'kingres_ops'],
-  };
-  for (const [id, [method, p, role]] of Object.entries(need)) {
-    const o = opById.get(id);
-    if (!o) { fail(id, 'operation of 0.15.0 does not exist'); continue; }
-    if (o.method !== method || o.path !== p || o.op['x-required-role'] !== role) fail(id, `must be ${method.toUpperCase()} ${p} and need ${role}`);
-    if (!o.op.tags?.includes('Schemas')) fail(id, 'must have the tag Schemas');
-  }
-  for (const id of ['distributeSchema', 'undistributeSchema', 'moveSchema']) {
-    if (!respCodes(id).includes('202')) fail(id, 'must answer 202 with a task');
-    if (!respCodes(id).includes('409')) fail(id, 'must list 409');
-  }
-  for (const c of ['sharding_mode_in_use', 'schema_not_distributable', 'schema_pinned', 'schema_move_in_progress']) if (!problemCodes.has(c)) fail('ProblemCode', 'missing ' + c);
-  for (const k of ['schema.distribute', 'schema.move', 'schema.undistribute']) if (!(schemas.TaskKind?.enum ?? []).includes(k)) fail('TaskKind', 'missing ' + k);
-  if (!(schemas.TaskSubject?.properties?.type?.enum ?? []).includes('schema')) fail('TaskSubject', 'type must include schema');
-  if (!(schemas.TableDistribution?.properties?.method?.enum ?? []).includes('schema')) fail('TableDistribution', 'method must include schema');
-  // additive: the new properties exist and none of them is required
-  const optional = {
-    ShardingSettings: ['mode', 'distributeNewSchemas'], ShardingCreateSettings: ['mode', 'distributeNewSchemas'],
-    DatabaseCreateOptions: ['shardingModes'], DatabaseStats: ['distributedSchemaCount'], ColocationGroup: ['kind', 'schemaName'],
-    BucketMove: ['kind', 'schemaName'], ServerBucketCount: ['primarySchemas'],
-  };
-  for (const [name, props] of Object.entries(optional)) {
-    for (const p of props) {
-      if (!schemas[name]?.properties?.[p]) fail(name, `${p} is missing`);
-      if ((schemas[name]?.required ?? []).includes(p)) fail(name, `${p} must stay optional`);
-    }
-  }
-  if ((schemas.ShardingCreateSettings?.required ?? []).includes('bucketCount')) fail('ShardingCreateSettings', 'bucketCount must be optional (mode schema)');
-  const upd = schemas.DatabaseUpdateRequest?.properties?.sharding;
-  if (upd?.minProperties !== 1 || (upd?.required ?? []).length > 0) fail('DatabaseUpdateRequest.sharding', 'must have minProperties 1 and no required property');
-  for (const p of ['mode', 'distributeNewSchemas']) if (!upd?.properties?.[p]) fail('DatabaseUpdateRequest.sharding', `${p} is missing`);
-  if (!(opById.get('listColocationGroups')?.op.parameters ?? []).some((p) => deref(p)?.name === 'kind')) fail('listColocationGroups', 'parameter kind is missing');
-  for (const n of ['listSchemas']) {
-    const names = (opById.get(n)?.op.parameters ?? []).map((p) => deref(p)?.name);
-    for (const q of ['limit', 'cursor', 'distributed', 'shardGroupId', 'state']) if (!names.includes(q)) fail(n, `parameter ${q} is missing`);
-  }
-  if (schemas.SchemaPage?.required?.includes('nextCursor') !== true) fail('SchemaPage', 'nextCursor must be required');
 }
 // ------------------------------------------------------------------ report
 const pathCount = Object.keys(doc.paths ?? {}).length;
