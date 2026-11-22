@@ -240,6 +240,8 @@ export const TASK_KIND_LABEL: Record<TaskKind, string> = {
   'table.undistribute': 'Undistribute a table',
   'table.alter': 'Change the distribution of a table',
   'table.partition': 'Change the partitions of a table',
+  'table.export': 'Export a table as CSV',
+  'table.import': 'Import a CSV file into a table',
   rebalance: 'Rebalance',
   'replication.restorePreferredPrimaries': 'Restore preferred primaries',
   'ledger.verify': 'Verify the ledger',
@@ -416,6 +418,14 @@ export const AUDIT_ACTION_LABEL: Record<AuditAction, string> = {
   setTableSignaturePolicy: 'Set the signature policy of a ledger table',
   upgradeLedgerExtension: 'Upgrade the ledger extension',
   acknowledgeLedgerDivergence: 'Acknowledge a diverged ledger chain',
+  exportTable: 'Export a table as CSV',
+  importTable: 'Import a CSV file into a table',
+  createDataUpload: 'Start an upload',
+  deleteDataUpload: 'Delete an upload',
+  downloadDataExport: 'Download an export file',
+  deleteDataExport: 'Delete an export file',
+  'dataTransfer.completed': 'A data transfer ended',
+  'dataTransfer.purged': 'Staged transfer files were removed',
 }
 
 /** The words for an audit action; an action from a newer server is shown as sent. */

@@ -54,9 +54,19 @@
 //   ?anchors=all|disabled|testfail|testwarn|refuse:<code>   0.11.0 (console part B): see the README
 //   ?anchors=<a>,<b>,...          0.11.0: none (alert ledgerNotAnchored) | required (the same, a warning) | ok | behind | failed
 //                                 (a WORM target "archive-worm" exists, with the newest aggregate anchored in time, late or not)
+//   ?transfer=<a>,<b>,...         0.19.0 (the data transfer; combinable with a comma):
+//                                 off          the cluster setting is off: every transfer operation answers 403 data_transfer_disabled
+//                                 insecure     every transfer operation answers 403 insecure_transport
+//                                 full         the staging area has no room: 409 transfer_quota_exceeded
+//                                 small        the chunk size the server accepts is 128 KiB (a long upload in a short time)
+//                                 session      the second chunk of an upload is answered 401 (the session ended in the middle)
+//                                 cut          the next chunk is cut after 100 KiB; the next download breaks after 1 KiB
+//                                 short        the next download ends early, without an error
+//                                 exports      three exports exist: ready, building and expired
 //   ?clock=off:<server>:<ms>      the clock of that server is that many milliseconds ahead (negative: behind).
 //   ?clock=unreachable:<server>   the clock of that server cannot be read.
 import type { MockState } from './state'
+import { applyTransferSwitch } from './transfer-switches'
 import { loseLease, mockConfig, silenceServer, stallStandby } from './state'
 import { FAIL_STEPS, raiseAutoFailoverLimit, seedAutomaticFailover } from './failover'
 import {
@@ -276,6 +286,7 @@ export function applySwitches(params: URLSearchParams, s: MockState): void {
     const refuse = /^refuse:([a-z_]+)$/.exec(entry)
     if (refuse) mockConfig.opsRefuse = refuse[1] as string
   }
+  for (const entry of (params.get('transfer') ?? '').split(',')) applyTransferSwitch(entry, s)
   for (const entry of (params.get('clock') ?? '').split(',')) {
     const off = /^off:([^:]+):(-?\d+(?:\.\d+)?)$/.exec(entry)
     if (off) setClockOffset(s, off[1] as string, Number(off[2]))

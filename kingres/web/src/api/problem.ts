@@ -407,6 +407,81 @@ const entries: Record<ProblemCode, Entry> = {
       'The report of the sharding extension lists what stops it (a trigger, a key to an ordinary table, a view that depends on the table, ...). Remove the cause, or ask for the views to be recreated, and try again.',
     withDetail: true,
   },
+  data_transfer_disabled: {
+    tone: 'warning',
+    heading: 'Data transfer is turned off',
+    message:
+      'An administrator has not turned on table export and import for this cluster. It is a cluster setting (Settings, Data transfer). Nothing was changed.',
+  },
+  insecure_transport: {
+    tone: 'warning',
+    heading: 'The connection is not encrypted',
+    message:
+      'Data is transferred only over HTTPS, and this request did not arrive over it. Open the console through an address that ends TLS at the server.',
+  },
+  transfer_quota_exceeded: {
+    tone: 'warning',
+    heading: 'The staging area is full',
+    message:
+      'Files that are staged for transfer use all the space the cluster allows, or the limit of transfers that run at once is reached. Delete exports or uploads you no longer need, or try again later.',
+    retryable: true,
+  },
+  upload_incomplete: {
+    tone: 'warning',
+    heading: 'The upload is not complete',
+    message: 'The file has not been sent to the end yet. Finish the upload, then start the import.',
+  },
+  upload_offset_mismatch: {
+    tone: 'warning',
+    heading: 'The upload is at another place',
+    message:
+      'The server holds a different number of bytes than the console expected. The console asks the server where it is and continues from there.',
+  },
+  chunk_too_large: {
+    tone: 'danger',
+    heading: 'A part of the file was too large',
+    message:
+      'The server refused a part that is larger than it accepts, or one that reaches past the declared size of the file. Start the upload again.',
+  },
+  upload_checksum_mismatch: {
+    tone: 'danger',
+    heading: 'The file arrived changed',
+    message:
+      'The SHA-256 of the file the server received is not the one that was declared. The upload was deleted. Send the file again.',
+  },
+  import_header_mismatch: {
+    tone: 'warning',
+    heading: 'The header of the file does not match',
+    message:
+      'The column names in the first row of the file are not the columns you chose, in that order. Change the columns or the header option.',
+    withDetail: true,
+  },
+  import_ledger_policy: {
+    tone: 'warning',
+    heading: 'This ledger table requires signed rows',
+    message:
+      'The signature policy of this ledger table is required, so rows cannot be loaded from a file.',
+  },
+  import_too_large: {
+    tone: 'warning',
+    heading: 'The file is too large for one import',
+    message:
+      'An import is all or nothing and is limited to 2 GiB of data. Split the file into parts of at most 2 GiB and import them one after the other.',
+  },
+  import_end_marker: {
+    tone: 'warning',
+    heading: 'The file has a line that only ends a copy',
+    message:
+      'A line that holds only a backslash and a dot ends a copy in some situations, so the file is refused. Remove or quote that line.',
+    withDetail: true,
+  },
+  export_untrusted_code: {
+    tone: 'warning',
+    heading: 'The export would run code of another role',
+    message:
+      'The table is owned by another role, and reading it runs an expression (a generated column or a row-level security policy) that calls a function owned by a role that is neither you nor a superuser. Export only if you trust that code.',
+    withDetail: true,
+  },
   chain_not_diverged: {
     tone: 'info',
     heading: 'This chain has not diverged',

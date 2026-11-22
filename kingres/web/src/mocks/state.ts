@@ -39,6 +39,11 @@ import type {
 } from '@/api/types'
 import { createConfigState, type ConfigState } from './config-data'
 import { createLedger7State, type Ledger7State } from './ledger-data'
+import {
+  createTransferState,
+  defaultDataTransferSettings,
+  type TransferState,
+} from './transfer-data'
 
 type S = components['schemas']
 
@@ -372,6 +377,8 @@ export interface MockState {
   config: ConfigState
   /** 0.11.0: the ledger of phase 7 (the settings, the signing keys, the anchor targets, the divergence of chains). */
   ledger7: Ledger7State
+  /** 0.19.0: the staged uploads and exports of the data transfer. */
+  transfer: TransferState
   /** Result sets the workbench can select from, by table name (hostile-data tests). */
   extraQueryTables?: Record<string, { columns: S['QueryColumn'][]; rows: unknown[][] }>
 }
@@ -512,6 +519,19 @@ function seedDatabases(): DbRec[] {
         sizeBytes: 64 * 1024,
       }),
       table({ name: 'notes', classes: ['plain'], estimatedRows: 1_203, sizeBytes: 2 * MiB }),
+      // Fixtures of the data transfer (contract 0.19.0): what each name makes the export or the import do is in
+      // mocks/transfer-data.ts.
+      table({ name: 'failme', classes: ['plain'], estimatedRows: 40, sizeBytes: MiB }),
+      table({ name: 'blockme', classes: ['plain'], estimatedRows: 40, sizeBytes: MiB }),
+      table({
+        name: 'skewme',
+        classes: ['distributed'],
+        distribution: { method: 'hash', column: 'customer_id', colocationId: 1, bucketCount: 128 },
+        homeShardGroupId: null,
+        estimatedRows: 120,
+        sizeBytes: 4 * MiB,
+      }),
+      table({ name: 'othercode', classes: ['plain'], estimatedRows: 40, sizeBytes: MiB }),
     ],
     colocations: [
       {
@@ -885,6 +905,7 @@ export function createMockState(options: { uninitialized?: boolean } = {}): Mock
       features: { sharding: true, ledger: true },
       clock: { maxDifferenceMs: 1000 },
       restart: { required: false, serverIds: [] },
+      dataTransfer: defaultDataTransferSettings(),
     },
     failover: { reports: [], runs: [] },
     rebalance: {
@@ -1080,6 +1101,7 @@ export function createMockState(options: { uninitialized?: boolean } = {}): Mock
     session: null,
     config: createConfigState(servers.map((x) => ({ id: x.id, serverGroup: x.serverGroup }))),
     ledger7: createLedger7State(),
+    transfer: createTransferState(),
   }
 }
 

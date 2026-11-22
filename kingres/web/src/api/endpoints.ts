@@ -56,6 +56,21 @@ async function startedTask(answer: Promise<Task | S['FailoverPlan']>): Promise<T
   return result
 }
 
+/** What a download answered: the stream, and the headers a resumed download is checked against. */
+export interface ExportStream {
+  status: number
+  body: ReadableStream<Uint8Array> | null
+  contentLength: number | null
+  contentRange: string | null
+  etag: string | null
+}
+
+/** A whole number of bytes from a header, or null when it is absent or is not one. */
+function parseOffset(value: string | null): number | null {
+  if (value === null || !/^\d{1,15}$/.test(value.trim())) return null
+  return Number(value.trim())
+}
+
 export interface Page {
   limit?: number
   cursor?: string
@@ -592,6 +607,101 @@ export const endpoints = {
   /** 202 + task `config.restart`. */
   restartPendingInstances: async (body: RestartPendingRequest): Promise<Task> =>
     (await j(api.POST('/config/restarts', { body }))) as Task,
+
+  // --- data transfer (0.19.0): table export and import, resumable uploads, downloads
+  /** 202 + task `table.export`; when it is done its `detail` is `transfer <id>`, the id of the export file. */
+  exportTable: async (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    body: S['ExportTableRequest'] = {},
+  ): Promise<Task> =>
+    (await j(
+      api.POST('/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/export', {
+        params: { path: { databaseName, schemaName, tableName } },
+        body,
+      }),
+    )) as Task,
+  /** 202 + task `table.import`. */
+  importTable: async (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    body: S['ImportTableRequest'],
+  ): Promise<Task> =>
+    (await j(
+      api.POST('/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/import', {
+        params: { path: { databaseName, schemaName, tableName } },
+        body,
+      }),
+    )) as Task,
+  // The calls of an upload keep the session in place when the answer is 401: the uploader asks for the password and goes on.
+  createDataUpload: (body: S['CreateDataUploadRequest']) =>
+    j(api.POST('/data-uploads', { body }), { keepSession: true }),
+  getDataUpload: (uploadId: string) =>
+    j(api.GET('/data-uploads/{uploadId}', { params: { path: { uploadId } } }), {
+      keepSession: true,
+    }),
+  /**
+   * Sends one chunk at `offset`. The answer is the offset the server holds afterwards. A 409
+   * `upload_offset_mismatch` is not an error here: it says where the server is (`conflict: true`), and the caller
+   * continues from that offset. Any other refusal is thrown.
+   */
+  uploadDataChunk: async (
+    uploadId: string,
+    offset: number,
+    chunk: Blob,
+    signal?: AbortSignal,
+  ): Promise<{ offset: number; conflict: boolean }> => {
+    const result = await api.PATCH('/data-uploads/{uploadId}', {
+      params: { path: { uploadId }, header: { 'Upload-Offset': offset } },
+      body: chunk as unknown as string,
+      bodySerializer: (body: unknown) => body as BodyInit,
+      headers: { 'Content-Type': 'application/octet-stream' },
+      signal,
+    })
+    const held = parseOffset(result.response.headers.get('Upload-Offset'))
+    if (result.response.status === 409 && held !== null) return { offset: held, conflict: true }
+    await j(Promise.resolve(result), { keepSession: true })
+    if (held === null) throw new Error('The server did not say where the upload is.')
+    return { offset: held, conflict: false }
+  },
+  deleteDataUpload: (uploadId: string) =>
+    j(api.DELETE('/data-uploads/{uploadId}', { params: { path: { uploadId } } }), {
+      keepSession: true,
+    }),
+  listDataExports: (q: Page = {}) => j(api.GET('/data-exports', { params: { query: q } })),
+  getDataExport: (exportId: string) =>
+    j(api.GET('/data-exports/{exportId}', { params: { path: { exportId } } })),
+  deleteDataExport: (exportId: string) =>
+    j(api.DELETE('/data-exports/{exportId}', { params: { path: { exportId } } })),
+  /**
+   * Opens the file from byte `from` (a `Range` request when `from` is above 0). The answer is the stream and what the
+   * server said about it; the caller checks the status (200 or 206), `Content-Range` and `Content-Length`.
+   */
+  downloadDataExport: async (
+    exportId: string,
+    from = 0,
+    signal?: AbortSignal,
+  ): Promise<ExportStream> => {
+    const result = await api.GET('/data-exports/{exportId}/content', {
+      params: {
+        path: { exportId },
+        header: from > 0 ? { Range: `bytes=${from}-` } : {},
+      },
+      parseAs: 'stream',
+      signal,
+    })
+    await j(Promise.resolve(result), { keepSession: true })
+    const { response } = result
+    return {
+      status: response.status,
+      body: response.body,
+      contentLength: parseOffset(response.headers.get('Content-Length')),
+      contentRange: response.headers.get('Content-Range'),
+      etag: response.headers.get('ETag'),
+    }
+  },
 
   // --- workbench, alerts, logs, metrics
   executeQuery: (body: S['QueryRequest'], signal?: AbortSignal) =>

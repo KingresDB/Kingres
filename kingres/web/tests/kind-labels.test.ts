@@ -28,8 +28,8 @@ describe('labels', () => {
     // 18 in 0.4.0, plus the two certificate kinds (0.5.0), standby.reconcile (0.7.0), config.apply and config.restart (0.8.0).
     // 0.11.0 added eight: ledger.key.create, .rotate, .retire, .revoke, .distribute, ledger.bundle.create, ledger.epoch.start
     // and ledger.upgrade: 31.
-    // 0.14.0 added table.undistribute, table.alter and table.partition: 34.
-    expect(Object.keys(TASK_KIND_LABEL)).toHaveLength(34)
+    // 0.14.0 added table.undistribute, table.alter and table.partition: 34. 0.19.0 added table.export and table.import: 36.
+    expect(Object.keys(TASK_KIND_LABEL)).toHaveLength(36)
   })
   it('shows an unknown kind as sent', () => {
     expect(alertKindLabel('somethingNew')).toBe('somethingNew')

@@ -113,6 +113,8 @@ export const keys = {
   networkAccess: ['networkAccess'] as const,
   audit: ['audit'] as const,
   clusterSettings: ['clusterSettings'] as const,
+  dataExports: ['dataExports'] as const,
+  dataExport: (id: string) => ['dataExport', id] as const,
   ledgerStatus: ['ledgerStatus'] as const,
   ledger: (name: string) => ['ledger', name] as const,
   ledgerSettings: ['ledgerSettings'] as const,
@@ -202,6 +204,28 @@ export const useServerGroups = () =>
 
 export const useClusterSettings = () =>
   useQuery({ queryKey: keys.clusterSettings, queryFn: endpoints.getClusterSettings })
+
+/** The staged exports of the signed-in role (contract 0.19.0), newest first; polled while one is being built. */
+export const useDataExports = (enabled: MaybeRefOrGetter<boolean> = true) =>
+  useQuery({
+    queryKey: keys.dataExports,
+    queryFn: () => fetchAllPages((cursor) => endpoints.listDataExports(cursor ? { cursor } : {})),
+    enabled,
+    refetchInterval: (query) =>
+      isUnsupported(query.state.error)
+        ? false
+        : query.state.data?.items.some((e) => e.state === 'building')
+          ? POLL.fast
+          : POLL.slow,
+  })
+
+/** One export file, for the dialog that has just made it. */
+export const useDataExport = (id: MaybeRefOrGetter<string | null>) =>
+  useQuery({
+    queryKey: computed(() => keys.dataExport(toValue(id) ?? '')),
+    queryFn: () => endpoints.getDataExport(toValue(id) ?? ''),
+    enabled: computed(() => !!toValue(id)),
+  })
 
 // --- databases and shards ---------------------------------------------------------------------
 
