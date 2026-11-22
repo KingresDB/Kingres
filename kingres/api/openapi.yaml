@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: KingresDB Management API
-  version: 0.14.0
+  version: 0.19.0
   summary: REST API of the KingresDB management panel, CLI and manager.
   description: |
     The single REST API served by `kingresd` on every KingresDB server. The web panel
@@ -93,6 +93,8 @@ tags:
   - name: Configuration
     description: PostgreSQL parameters of the servers at the cluster, server group, server and database level, the clocks and time zones, and the restarts a change needs (0.8.0).
 
+  - name: Data transfer
+    description: Export a table to a CSV file and import a CSV file into a table (0.19.0). Files are staged on the manager leader, encrypted at rest and kept for a limited time; every operation needs `kingres_admin` and the cluster setting `dataTransfer.enabled`.
 paths:
   /healthz:
     get:
@@ -1829,6 +1831,112 @@ paths:
         '422': { $ref: '#/components/responses/UnprocessableEntity' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
 
+
+  /databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/export:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+      - $ref: '#/components/parameters/SchemaName'
+      - $ref: '#/components/parameters/TableName'
+    post:
+      operationId: exportTable
+      summary: Export a table to a CSV file
+      description: |
+        Added in 0.19.0 (data transfer, phase 14a). Starts the task `table.export` (subject `database/schema.table`): one
+        `COPY (SELECT ...) TO STDOUT` of the table, as the signed-in role, written to a file that is staged on the manager leader, sealed
+        (encrypted at rest) and kept for `retentionHours`. The answer is the task; when it is `done` its `detail` is `transfer <id>` and
+        `getDataExport` with that id says size, rows, SHA-256 and the consistency label of the file, and `downloadDataExport` serves it.
+        The request has no `WHERE`, no order and no SQL of any kind. The same statement is used for local, reference, distributed and partitioned
+        tables.
+
+        Needs `kingres_admin`, the cluster setting `dataTransfer.enabled` (403 `data_transfer_disabled` while it is off), a request that arrived
+        over TLS (403 `insecure_transport`), and the PostgreSQL privilege `SELECT` on every exported column (the connection is the role's).
+        A table that does not exist is 404; a view, a foreign table, a bucket partition named directly and a table of the schemas `kingres`,
+        `pg_catalog` and `information_schema` are 422 `table_not_eligible` with `blockers`. 422 `export_untrusted_code`: the table is owned by another
+        role and a column that is read calls a function owned by a role that is neither the caller nor a superuser (`acknowledgeOtherRolesCode`
+        accepts the risk); 422 `insufficient_disk`: the staging area has too little free space; 422 `validation_failed` for an option that is not valid.
+        409 `operation_in_progress`: the table has an unfinished task, or the cluster or the role is at the limit `maxConcurrent`;
+        409 `transfer_quota_exceeded`: the reservation does not fit into `stagingQuotaBytes`.
+
+        What the file guarantees is stated in `DataExport.consistency`: every row was committed; a local table, a reference table and a distributed table
+        whose buckets are all on one group are one snapshot (`single-snapshot`); a table over several groups is read per group (`per-group`) and the groups'
+        snapshots are not one instant. Writers are not stopped. **There is no global snapshot.** Two exports of a table that give the same SHA-256 saw the same data.
+
+        `spreadsheetSafe` (default `true`) prefixes with an apostrophe a text cell that a spreadsheet would read as a formula. It is lossy and **not a security feature**.
+        The task codes of a failed export are: `export_too_large`, `insufficient_disk`, `transfer_quota_exceeded`, `transfer_timeout`, `transfer_leader_changed` (retryable),
+        `transfer_session_lost` (retryable), `transfer_key_lost`, `copy_interrupted` (retryable), `forbidden` (the role lost its right between two steps), `cancelled`.
+        The error of a task never carries a value, a row or text of the server.
+      tags: [Data transfer]
+      x-required-role: kingres_admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExportTableRequest' }
+            examples:
+              defaults: { summary: "Everything, as UTF-8 with a header", value: {} }
+              semicolon:
+                summary: Two columns, a semicolon, Windows-1252, compressed
+                value: { columns: [id, customer], delimiter: ';', encoding: WIN1252, compression: gzip, spreadsheetSafe: true, retentionHours: 48 }
+      responses:
+        '202': { $ref: '#/components/responses/AcceptedTableExport' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/DataTransferForbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/DataTransferConflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/import:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+      - $ref: '#/components/parameters/SchemaName'
+      - $ref: '#/components/parameters/TableName'
+    post:
+      operationId: importTable
+      summary: Import an uploaded CSV file into a table
+      description: |
+        Added in 0.19.0 (data transfer, phase 14a). Starts the task `table.import` (subject `database/schema.table`) that loads a complete upload
+        (`createDataUpload`, `uploadDataChunk`) into an existing table with `COPY ... FROM STDIN`, as the signed-in role, through the row router
+        for a distributed table. **All or nothing:** the load is one explicit transaction; the number of rows the server reports is compared with the
+        number of records the control plane counted, and the transaction commits only when they are equal. The import adds rows; it never replaces
+        or merges, and it cannot skip bad rows. A file above 2 GiB (decompressed) is refused with 422 `import_too_large`: split the file.
+
+        Needs `kingres_admin`, `dataTransfer.enabled` (403 `data_transfer_disabled`), a request over TLS (403 `insecure_transport`) and the PostgreSQL privilege
+        `INSERT` on the loaded columns. 404: the table or the upload (also one of another role) does not exist; 409 `upload_incomplete`: the upload has not
+        received all its bytes; 409 `operation_in_progress`: an unfinished task on the table or the transfer limit; 422 `table_not_eligible` with `blockers`
+        (a view, a foreign table, a bucket partition, a system schema, a table with row-level security, a generated column in `columns`, a reference table of a cluster with
+        several groups); 422 `import_header_mismatch` (`header: match` failed; the first difference is named), `import_ledger_policy` (a ledger table whose signature policy is
+        `required`), `import_too_large`, `import_end_marker` (the file has an unquoted `\.` line; the line number is given) and `validation_failed`.
+
+        The task `table.import` has the steps *Check the upload*, *Check the table*, *Load rows*, *Commit* and *Clean up*. `Task.cancellable` is true until the commit has been
+        sent. A task that fails after the commit was sent with an unknown outcome has the code `import_outcome_unknown` (`retryable: false`): **N rows may have been loaded; check
+        the table before repeating the import.** Other task codes: `row_count_mismatch`, `transfer_timeout`, `transfer_leader_changed` (retryable), `transfer_session_lost`
+        (retryable), `copy_interrupted` (retryable), `forbidden`, `cancelled`, and `sql_error` with a `sqlState`. **No error of a task, no problem and no audit event carries a value,
+        a row, a key or the text of PostgreSQL**: the message is a fixed sentence per SQLSTATE plus the names of the column and the constraint and the absolute line number.
+      tags: [Data transfer]
+      x-required-role: kingres_admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ImportTableRequest' }
+            examples:
+              defaults: { summary: A file with a header, value: { uploadId: '42' } }
+              options:
+                summary: No header, a tab, an explicit column list
+                value: { uploadId: '43', header: none, delimiter: "\t", columns: [id, customer, total], nullString: '\N', encoding: LATIN1, keepUpload: true }
+      responses:
+        '202': { $ref: '#/components/responses/AcceptedTableImport' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/DataTransferForbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/DataTransferConflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
 
   /databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/ledger:
     parameters:
@@ -4702,6 +4810,350 @@ paths:
         '422': { $ref: '#/components/responses/UnprocessableEntity' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
 
+  /data-uploads:
+    post:
+      operationId: createDataUpload
+      summary: Start a resumable upload
+      description: |
+        Added in 0.19.0 (data transfer, phase 14a). Creates an upload: a file that the console or a client sends in chunks (`uploadDataChunk`) and that an import then uses
+        (`importTable`). The size is declared and the staging quota is reserved when the upload is created. `purpose` is `tableImport` (0.20.0 adds `databaseArchive`).
+        `fileName` is for display only and is never used in a path. `sha256` is for command-line clients that hash the file first; a browser cannot hash a large file
+        incrementally, so the server computes the SHA-256 itself when the last byte is in and compares it with the declared one (422 `upload_checksum_mismatch`, the upload is deleted).
+        The answer says the chunk rules: `chunkBytesMax` (at most 256 MiB, 64 MiB offered) and `chunkAlign` (65536: every chunk but the last is a multiple of it).
+
+        Needs `kingres_admin`, `dataTransfer.enabled` (403 `data_transfer_disabled`) and a request over TLS (403 `insecure_transport`). 409 `transfer_quota_exceeded`: the declared
+        size does not fit into the quota. 422 `validation_failed` on `/sizeBytes` when the size is above `maxFileBytes`, and 422 `insufficient_disk`. Only the creator can read, continue or delete the upload.
+        An upload that received nothing for 48 hours, or that was complete and was not used for 24 hours, is deleted; `getDataUpload` then answers 404.
+      tags: [Data transfer]
+      x-required-role: kingres_admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateDataUploadRequest' }
+            examples:
+              csv: { summary: A 3 GiB file, value: { purpose: tableImport, sizeBytes: 3221225472, fileName: orders-2026-11.csv } }
+              hashed: { summary: A file whose SHA-256 is known, value: { purpose: tableImport, sizeBytes: 1048576, sha256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08 } }
+      responses:
+        '201':
+          description: The upload, at offset 0.
+          headers:
+            Location:
+              description: URL of the upload, `/api/v1/data-uploads/{uploadId}`.
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DataUpload' }
+              examples:
+                created:
+                  value:
+                    uploadId: '42'
+                    state: receiving
+                    sizeBytes: 3221225472
+                    offset: 0
+                    chunkBytesMax: 67108864
+                    chunkAlign: 65536
+                    sha256: null
+                    expiresAt: '2026-11-24T09:58:00Z'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/DataTransferForbidden' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/DataTransferConflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /data-uploads/{uploadId}:
+    parameters:
+      - $ref: '#/components/parameters/UploadId'
+    get:
+      operationId: getDataUpload
+      summary: Read an upload
+      description: |
+        Added in 0.19.0 (data transfer, phase 14a). The state of an upload and the **offset** at which the next chunk must start. The server reads the offset from the staged
+        file (the whole sealed segments), never from the record, so it is right after a crash; a client that lost its place asks here and continues. `sha256` is set once the
+        upload is complete. 404 for an upload that does not exist, that belongs to another role, or that was lost (the console starts a new one).
+      tags: [Data transfer]
+      x-required-role: kingres_admin
+      responses:
+        '200':
+          description: The upload.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DataUpload' }
+              examples:
+                receiving:
+                  value:
+                    uploadId: '42'
+                    state: receiving
+                    sizeBytes: 3221225472
+                    offset: 134217728
+                    chunkBytesMax: 67108864
+                    chunkAlign: 65536
+                    sha256: null
+                    expiresAt: '2026-11-24T09:58:00Z'
+                complete:
+                  value:
+                    uploadId: '43'
+                    state: complete
+                    sizeBytes: 1048576
+                    offset: 1048576
+                    chunkBytesMax: 67108864
+                    chunkAlign: 65536
+                    sha256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+                    expiresAt: '2026-11-23T10:15:00Z'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/DataTransferForbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+    patch:
+      operationId: uploadDataChunk
+      summary: Send one chunk of an upload
+      description: |
+        Added in 0.19.0 (data transfer, phase 14a). Appends one chunk. `x-streams: upload`: the body is streamed to the manager leader without being held in memory by any server, the
+        request is not subject to the 30 s request timeout and the 1 MiB body limit of the other operations (an idle limit of 60 s and a limit of 15 minutes per chunk apply), and a
+        follower relays it to the leader. The header `Upload-Offset` must equal the server's offset (409 `upload_offset_mismatch`; the response header `Upload-Offset` has the right one).
+        `Content-Length` is needed, is at most `chunkBytesMax` (413 `chunk_too_large`; also for a chunk that reaches past `sizeBytes`) and is a **multiple of 65536 unless the chunk is the last one**
+        (422 `validation_failed` on `Content-Length`). A request that breaks off keeps the whole sealed segments it delivered and drops the rest; the client reads the offset with `getDataUpload` and
+        continues. The answer is 204 with the new `Upload-Offset`; after the last chunk the server computes the SHA-256 of the file (422 `upload_checksum_mismatch` when it differs from the declared one;
+        the upload is deleted) and the upload is `complete`. Two chunks at one offset: one wins, the other gets 409. Needs `kingres_admin`, `dataTransfer.enabled` and a request over TLS. A chunk is not an audit event.
+      tags: [Data transfer]
+      x-required-role: kingres_admin
+      x-streams: upload
+      parameters:
+        - $ref: '#/components/parameters/UploadOffset'
+      requestBody:
+        required: true
+        description: The bytes of the chunk. The example is the first chunk of an upload (a multiple of 65536 bytes).
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary, description: The bytes of the chunk. }
+            examples:
+              firstChunk: { summary: "The first chunk of a file; the header is Upload-Offset 0", value: 'id,customer,total\n1,Ada,12.50\n' }
+      responses:
+        '204':
+          description: The chunk was stored. `Upload-Offset` is the next offset (the size of the file when it is complete).
+          headers:
+            Upload-Offset:
+              description: The offset at which the next chunk must start.
+              schema: { type: integer, format: int64, minimum: 0 }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/DataTransferForbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/UploadOffsetMismatch' }
+        '413': { $ref: '#/components/responses/ChunkTooLarge' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+    delete:
+      operationId: deleteDataUpload
+      summary: Delete an upload
+      description: |
+        Added in 0.19.0 (data transfer, phase 14a). Deletes the staged file and frees the reservation. 404 for an upload that does not exist or belongs to another role; 409
+        `operation_in_progress` while a task uses the upload.
+      tags: [Data transfer]
+      x-required-role: kingres_admin
+      responses:
+        '204': { description: The upload was deleted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/DataTransferForbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/DataTransferConflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /data-exports:
+    get:
+      operationId: listDataExports
+      summary: List the exports of the signed-in role
+      description: |
+        Added in 0.19.0 (data transfer, phase 14a). The staged export files of the caller, newest first. A file of another role is not listed and its existence is never revealed.
+        Cursor pagination: `limit`, `cursor`, `nextCursor`.
+      tags: [Data transfer]
+      x-required-role: kingres_admin
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of exports.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DataExportPage' }
+              examples:
+                page:
+                  value:
+                    items:
+                      - exportId: '57'
+                        kind: tableExport
+                        state: ready
+                        database: shop
+                        schema: public
+                        table: orders
+                        sizeBytes: 90211333
+                        sha256: 3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1b
+                        rows: 1200000
+                        consistency: [{ table: public.orders, level: per-group, groups: 3 }]
+                        rlsApplied: false
+                        format: csv
+                        taskId: 118
+                        createdAt: '2026-11-22T09:30:00Z'
+                        expiresAt: '2026-11-23T09:30:00Z'
+                        downloadedAt: null
+                    nextCursor: null
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/DataTransferForbidden' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /data-exports/{exportId}:
+    parameters:
+      - $ref: '#/components/parameters/ExportId'
+    get:
+      operationId: getDataExport
+      summary: Read an export
+      description: |
+        Added in 0.19.0 (data transfer, phase 14a). One staged export: state, size, SHA-256, rows, the consistency label of every table, expiry and the task that made it.
+        404 for a file that does not exist or belongs to another role (the existence of a file is not leaked).
+      tags: [Data transfer]
+      x-required-role: kingres_admin
+      responses:
+        '200':
+          description: The export.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DataExport' }
+              examples:
+                ready:
+                  value:
+                    exportId: '57'
+                    kind: tableExport
+                    state: ready
+                    database: shop
+                    schema: public
+                    table: orders
+                    sizeBytes: 90211333
+                    sha256: 3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1b
+                    rows: 1200000
+                    consistency: [{ table: public.orders, level: per-group, groups: 3 }]
+                    rlsApplied: false
+                    format: csv
+                    taskId: 118
+                    createdAt: '2026-11-22T09:30:00Z'
+                    expiresAt: '2026-11-23T09:30:00Z'
+                    downloadedAt: null
+                building:
+                  value:
+                    exportId: '58'
+                    kind: tableExport
+                    state: building
+                    database: shop
+                    schema: public
+                    table: customers
+                    sizeBytes: null
+                    sha256: null
+                    rows: null
+                    consistency: null
+                    rlsApplied: false
+                    format: csv.gz
+                    taskId: 119
+                    createdAt: '2026-11-22T09:40:00Z'
+                    expiresAt: '2026-11-23T09:40:00Z'
+                    downloadedAt: null
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/DataTransferForbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+    delete:
+      operationId: deleteDataExport
+      summary: Delete an export
+      description: |
+        Added in 0.19.0 (data transfer, phase 14a). Deletes the staged file and frees its reservation. The creator **or any `kingres_admin`** may delete (to free the disk of a colleague who left;
+        deleting reveals nothing); the audit event names the creator when the actor is another role. 404 for a file that does not exist.
+      tags: [Data transfer]
+      x-required-role: kingres_admin
+      responses:
+        '204': { description: The export was deleted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/DataTransferForbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /data-exports/{exportId}/content:
+    parameters:
+      - $ref: '#/components/parameters/ExportId'
+    get:
+      operationId: downloadDataExport
+      summary: Download an export file
+      description: |
+        Added in 0.19.0 (data transfer, phase 14a). The plaintext file. `x-streams: download`: streamed from the manager leader through whichever server received the request, with no
+        buffering and without the 60 s write timeout of the other operations. `Range: bytes=a-b` (one range) answers 206 with `Content-Range`. Every answer has `Content-Length` of the bytes it
+        carries (the whole file for 200), `Accept-Ranges: bytes`, `ETag` (the SHA-256), `Cache-Control: no-store`, `X-Content-Type-Options: nosniff` and `Content-Disposition: attachment; filename="..."`
+        with a name the server builds from the database, the table and the UTC time (never from a client string). A stream that fails half way cannot change its status: the `Content-Length` makes a short file
+        visible, and the SHA-256 of `getDataExport` lets the user check the file. The audit event `downloadDataExport` is written when the stream ends and says whether the last byte was served.
+        Only the creator downloads (404 otherwise). 410: the file has expired. 416: the range cannot be served. Needs `kingres_admin`, `dataTransfer.enabled` and a request over TLS.
+      tags: [Data transfer]
+      x-required-role: kingres_admin
+      x-streams: download
+      parameters:
+        - $ref: '#/components/parameters/RangeHeader'
+      responses:
+        '200':
+          description: The whole file.
+          headers:
+            Content-Length: { description: Size of the file in bytes., schema: { type: integer, format: int64, minimum: 0 } }
+            Accept-Ranges: { description: Always `bytes`., schema: { type: string, enum: [bytes] } }
+            ETag: { description: The SHA-256 of the plaintext file in quotes., schema: { type: string } }
+            Content-Disposition: { description: '`attachment` with a file name built by the server.', schema: { type: string } }
+            Cache-Control: { description: Always `no-store`., schema: { type: string } }
+            X-Content-Type-Options: { description: Always `nosniff`., schema: { type: string } }
+          content:
+            text/csv:
+              schema: { type: string, format: binary, description: 'The CSV file (`format` `csv`); the `charset` parameter is the encoding of the export.' }
+              examples:
+                csv: { summary: The first bytes of an export, value: "id,customer,total\n1,Ada,12.50\n" }
+            application/gzip:
+              schema: { type: string, format: binary, description: The gzip-compressed CSV file (`format` `csv.gz`). }
+              examples:
+                gzip: { summary: The first bytes of a compressed export (binary), value: '' }
+        '206':
+          description: One range of the file.
+          headers:
+            Content-Length: { description: Size of the range in bytes., schema: { type: integer, format: int64, minimum: 0 } }
+            Content-Range: { description: '`bytes first-last/size`.', schema: { type: string } }
+            Accept-Ranges: { description: Always `bytes`., schema: { type: string, enum: [bytes] } }
+            ETag: { description: The SHA-256 of the plaintext file in quotes., schema: { type: string } }
+            Content-Disposition: { description: '`attachment` with a file name built by the server.', schema: { type: string } }
+            Cache-Control: { description: Always `no-store`., schema: { type: string } }
+            X-Content-Type-Options: { description: Always `nosniff`., schema: { type: string } }
+          content:
+            text/csv:
+              schema: { type: string, format: binary, description: The bytes of the range. }
+              examples:
+                range: { summary: Bytes 0 to 16 of an export, value: 'id,customer,total' }
+            application/gzip:
+              schema: { type: string, format: binary, description: The bytes of the range of a compressed file. }
+              examples:
+                gzipRange: { summary: Bytes of a compressed export (binary), value: '' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/DataTransferForbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '410': { $ref: '#/components/responses/Gone' }
+        '416': { $ref: '#/components/responses/RangeNotSatisfiable' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
 components:
   securitySchemes:
     sessionCookie:
@@ -4825,6 +5277,30 @@ components:
       required: true
       description: Name of a user partition (added in 0.14.0).
       schema: { type: string, minLength: 1, maxLength: 57 }
+    UploadId:
+      name: uploadId
+      in: path
+      required: true
+      description: Identifier of an upload (added in 0.19.0), a decimal string. An upload of another role is 404.
+      schema: { type: string, minLength: 1, maxLength: 20, pattern: '^[0-9]+$' }
+    ExportId:
+      name: exportId
+      in: path
+      required: true
+      description: Identifier of a staged export file (added in 0.19.0), a decimal string. A file of another role is 404.
+      schema: { type: string, minLength: 1, maxLength: 20, pattern: '^[0-9]+$' }
+    UploadOffset:
+      name: Upload-Offset
+      in: header
+      required: true
+      description: The offset of the first byte of the chunk; it must equal the offset the server holds (409 `upload_offset_mismatch` otherwise).
+      schema: { type: integer, format: int64, minimum: 0 }
+    RangeHeader:
+      name: Range
+      in: header
+      required: false
+      description: 'One byte range of the plaintext file, `bytes=first-last`, `bytes=first-` or `bytes=-suffix`. More than one range is answered with the whole file.'
+      schema: { type: string, maxLength: 64 }
     ColocationId:
       name: colocationId
       in: path
@@ -5039,6 +5515,188 @@ components:
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }
+    AcceptedTableExport:
+      description: |
+        The export was accepted and runs as the task `table.export` (added in 0.19.0). Poll `GET /tasks/{taskId}` (the `Location` header) until `state` is `done` or `failed`; when it is `done`,
+        `detail` is `transfer <id>`, the id to give to `getDataExport` and `downloadDataExport`.
+      headers:
+        Location:
+          description: URL of the task, `/api/v1/tasks/{taskId}`.
+          schema: { type: string }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Task' }
+          examples:
+            exportTable:
+              value:
+                id: 118
+                kind: table.export
+                state: running
+                progress:
+                  percent: 0
+                  currentStep: Check the request
+                  steps:
+                    - { name: Check the request, state: running, detail: null, itemsDone: null, itemsTotal: null, startedAt: '2026-11-22T09:30:00Z', finishedAt: null }
+                    - { name: Read the table class, state: pending, detail: null, itemsDone: null, itemsTotal: null, startedAt: null, finishedAt: null }
+                    - { name: Write the file, state: pending, detail: null, itemsDone: null, itemsTotal: null, startedAt: null, finishedAt: null }
+                    - { name: Seal, state: pending, detail: null, itemsDone: null, itemsTotal: null, startedAt: null, finishedAt: null }
+                error: null
+                subject: { type: table, id: shop/public.orders }
+                cancellable: true
+                detail: null
+                createdAt: '2026-11-22T09:30:00Z'
+                updatedAt: '2026-11-22T09:30:00Z'
+                createdBy: alice
+    AcceptedTableImport:
+      description: |
+        The import was accepted and runs as the task `table.import` (added in 0.19.0). Poll `GET /tasks/{taskId}` (the `Location` header). A failed task never carries a value or text of the
+        server; `import_outcome_unknown` means that the commit was sent and its outcome is not known.
+      headers:
+        Location:
+          description: URL of the task, `/api/v1/tasks/{taskId}`.
+          schema: { type: string }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Task' }
+          examples:
+            importTable:
+              value:
+                id: 120
+                kind: table.import
+                state: running
+                progress:
+                  percent: 20
+                  currentStep: Load rows
+                  steps:
+                    - { name: Check the upload, state: done, detail: null, itemsDone: 1, itemsTotal: 1, startedAt: '2026-11-22T10:00:00Z', finishedAt: '2026-11-22T10:00:01Z' }
+                    - { name: Check the table, state: done, detail: null, itemsDone: 1, itemsTotal: 1, startedAt: '2026-11-22T10:00:01Z', finishedAt: '2026-11-22T10:00:02Z' }
+                    - { name: Load rows, state: running, detail: null, itemsDone: 41943040, itemsTotal: 209715200, startedAt: '2026-11-22T10:00:02Z', finishedAt: null }
+                    - { name: Commit, state: pending, detail: null, itemsDone: null, itemsTotal: null, startedAt: null, finishedAt: null }
+                    - { name: Clean up, state: pending, detail: null, itemsDone: null, itemsTotal: null, startedAt: null, finishedAt: null }
+                error: null
+                subject: { type: table, id: shop/public.orders }
+                cancellable: true
+                detail: null
+                createdAt: '2026-11-22T10:00:00Z'
+                updatedAt: '2026-11-22T10:00:30Z'
+                createdBy: alice
+    DataTransferForbidden:
+      description: |
+        Not allowed (added in 0.19.0 for the data transfer operations): `forbidden` (the role is below `kingres_admin`), `data_transfer_disabled` (the cluster setting
+        `dataTransfer.enabled` is off) or `insecure_transport` (the request did not arrive over TLS).
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          examples:
+            disabled:
+              value:
+                type: https://kingresdb.dev/problems/data-transfer-disabled
+                title: Data transfer is disabled
+                status: 403
+                detail: An administrator must turn on dataTransfer.enabled in the cluster settings.
+                instance: /api/v1/data-uploads
+                code: data_transfer_disabled
+            insecureTransport:
+              value:
+                type: https://kingresdb.dev/problems/insecure-transport
+                title: Insecure transport
+                status: 403
+                detail: Data transfer needs a connection over TLS.
+                instance: /api/v1/data-uploads
+                code: insecure_transport
+    DataTransferConflict:
+      description: |
+        A conflict of the data transfer operations (added in 0.19.0): `operation_in_progress` (an unfinished task on the table, a task that uses the upload, or the limit `maxConcurrent`;
+        `Retry-After` for the limit), `transfer_quota_exceeded` (the reservation does not fit into the staging quota; the detail says how much is free) or `upload_incomplete`
+        (an import names an upload that has not received all its bytes).
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying; present for the concurrency limit.
+          schema: { type: integer, minimum: 0 }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          examples:
+            quota:
+              value:
+                type: https://kingresdb.dev/problems/transfer-quota-exceeded
+                title: Staging quota exceeded
+                status: 409
+                detail: The staging area has 1.2 GiB free; the transfer needs 3 GiB. You hold 2 transfers (ids 40, 41).
+                instance: /api/v1/data-uploads
+                code: transfer_quota_exceeded
+            incomplete:
+              value:
+                type: https://kingresdb.dev/problems/upload-incomplete
+                title: Upload incomplete
+                status: 409
+                detail: The upload has 134217728 of 3221225472 bytes.
+                instance: /api/v1/databases/shop/schemas/public/tables/orders/import
+                code: upload_incomplete
+    UploadOffsetMismatch:
+      description: The `Upload-Offset` of the request is not the offset of the server (`upload_offset_mismatch`); the response header has the right one. Added in 0.19.0.
+      headers:
+        Upload-Offset:
+          description: The offset at which the next chunk must start.
+          schema: { type: integer, format: int64, minimum: 0 }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          examples:
+            mismatch:
+              value:
+                type: https://kingresdb.dev/problems/upload-offset-mismatch
+                title: Upload offset mismatch
+                status: 409
+                detail: The upload is at offset 134217728.
+                instance: /api/v1/data-uploads/42
+                code: upload_offset_mismatch
+    ChunkTooLarge:
+      description: A chunk beyond `chunkBytesMax`, or that reaches past the declared size (`chunk_too_large`). Added in 0.19.0.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          examples:
+            tooLarge:
+              value:
+                type: https://kingresdb.dev/problems/chunk-too-large
+                title: Chunk too large
+                status: 413
+                detail: A chunk is at most 268435456 bytes.
+                instance: /api/v1/data-uploads/42
+                code: chunk_too_large
+    Gone:
+      description: The resource has expired (code `not_found`, status 410, as for a ledger bundle). Added in 0.19.0 for `downloadDataExport`.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          examples:
+            expired:
+              value:
+                type: https://kingresdb.dev/problems/not-found
+                title: Expired
+                status: 410
+                detail: The export expired at 2026-11-23T09:30:00Z.
+                instance: /api/v1/data-exports/57/content
+                code: not_found
+    RangeNotSatisfiable:
+      description: The range cannot be served. Added in 0.19.0 for `downloadDataExport`.
+      headers:
+        Content-Range:
+          description: '`bytes */size`.'
+          schema: { type: string }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          examples:
+            range:
+              value:
+                type: https://kingresdb.dev/problems/range-not-satisfiable
+                title: Range not satisfiable
+                status: 416
+                detail: The file has 90211333 bytes.
+                instance: /api/v1/data-exports/57/content
+                code: bad_request
     AcceptedTask:
       description: |
         The operation was accepted and runs as a durable task. Poll `GET /tasks/{taskId}` (the `Location`
@@ -5080,6 +5738,8 @@ components:
         Stable machine-readable error code. Clients branch on this, not on `title` or `detail`.
 
         422: `table_not_eligible` (added in 0.14.0: the table cannot take the requested change; `blockers` says why).
+
+        Added in 0.19.0 (data transfer): 403 `data_transfer_disabled` (the cluster setting is off) and `insecure_transport` (the request did not arrive over TLS); 409 `transfer_quota_exceeded` (the staging quota or the number of running transfers; `Retry-After` for the second), `upload_incomplete` and `upload_offset_mismatch` (the response header `Upload-Offset` has the right offset); 413 `chunk_too_large`; 422 `upload_checksum_mismatch`, `import_header_mismatch`, `import_ledger_policy`, `import_too_large` (a file above 2 GiB decompressed: split it), `import_end_marker` (an unquoted `.` line) and `export_untrusted_code`. An expired file is 410 with the code `not_found`. The error text of a data transfer never carries a value, a row or text of the server. Clients must tolerate codes they do not know.
 
         409 (state conflict): `conflict` (generic), `already_exists`, `immutable_field`,
         `rebalance_in_progress`, `operation_in_progress`, `task_not_cancellable`, `last_admin`, `role_in_use`,
@@ -5188,6 +5848,18 @@ components:
         - last_signing_key
         - chain_not_diverged
         - table_not_eligible
+        - data_transfer_disabled
+        - insecure_transport
+        - transfer_quota_exceeded
+        - upload_incomplete
+        - upload_offset_mismatch
+        - chunk_too_large
+        - upload_checksum_mismatch
+        - import_header_mismatch
+        - import_ledger_policy
+        - import_too_large
+        - import_end_marker
+        - export_untrusted_code
     ValidationIssue:
       type: object
       description: One invalid field of a request.
@@ -5246,6 +5918,10 @@ components:
         blockers:
           type: array
           description: Added in 0.14.0. The lines of the report of the sharding extension that make a table not eligible; present for `table_not_eligible`.
+          items: { $ref: '#/components/schemas/TableBlocker' }
+        reasons:
+          type: array
+          description: Added in 0.19.0, optional. Further reasons in the shape of `blockers`; reserved for the archive codes of later revisions, empty or absent for the codes of 0.19.0.
           items: { $ref: '#/components/schemas/TableBlocker' }
         plan:
           $ref: '#/components/schemas/FailoverPlan'
@@ -8452,7 +9128,7 @@ components:
       type: string
       description: |
         Kind of task. Each kind has one fixed `subject.type`; the table is in the README
-        (section "Task kinds and subjects"). `standby.reconcile` is added in 0.7.0; the `ledger.key.*`, `ledger.bundle.create`, `ledger.epoch.start` and `ledger.upgrade` kinds in 0.11.0.
+        (section "Task kinds and subjects"). `standby.reconcile` is added in 0.7.0; the `ledger.key.*`, `ledger.bundle.create`, `ledger.epoch.start` and `ledger.upgrade` kinds in 0.11.0; `table.export` and `table.import` (subject `database/schema.table`) in 0.19.0.
       enum:
         - cluster.init
         - cluster.join
@@ -8488,6 +9164,8 @@ components:
         - table.undistribute
         - table.alter
         - table.partition
+        - table.export
+        - table.import
     TaskStep:
       type: object
       description: One step of a task.
@@ -9013,7 +9691,7 @@ components:
         operation: `loginFailed` (a sign-in attempt that was rejected, also for an unknown user), `setupTokenRejected`
         (a wrong setup token), `autoFailover` (a failover started by the manager, actor `system`). From 0.5.0 also `certificateRenewed` and `certificateRenewalFailed` (a server renewed its certificates by itself, or failed to; actor `system`). From 0.7.0 also `leaseLost`, `leaseFenced` and `leaseAcquired` (the lease of a shard group, actor `system`, resource type `shardGroup`, resource id the group id) and the operation `cancelStatement`; and the standby events `standbyCreated`, `standbyRemoved`, `standbyRebuilt` (resource type `standby`, by the leader), `standbyInstanceStarted`, `standbyInstanceRemoved`, `standbyInstanceRebuilt` (by the server that runs the instance), `synchronousStandbyNamesChanged` and `replicationSlotDropped` (by the server that runs the primary), all with actor `system` unless an administrator started the task. A denied
         or failed call of an operation is recorded under that operation's id with `outcome` `denied` or
-        `failure`. Read-only operations are not audited except `executeQuery`.
+        `failure`. Read-only operations are not audited except `executeQuery` and (0.19.0) `downloadDataExport`, because it is where data leaves. From 0.19.0 also `dataTransfer.completed` (a data transfer task ended, written by the task) and `dataTransfer.purged` (the janitor deleted staged files), actor `system`. An upload chunk is not an event.
       enum:
         - login
         - logout
@@ -9103,6 +9781,14 @@ components:
         - attachTablePartition
         - detachTablePartition
         - dropTablePartition
+        - exportTable
+        - importTable
+        - createDataUpload
+        - deleteDataUpload
+        - downloadDataExport
+        - deleteDataExport
+        - dataTransfer.completed
+        - dataTransfer.purged
     AuditEvent:
       type: object
       description: One audit log entry.
@@ -9233,6 +9919,8 @@ components:
               maximum: 600000
               default: 1000
               description: A server whose clock differs from the manager leader's by more than this (less the uncertainty of the measurement) raises the alert `clockDifference` (`warning`; `critical` at ten times it).
+        dataTransfer:
+          $ref: '#/components/schemas/DataTransferSettings'
         restart:
           type: object
           description: Pending restart caused by enabling a feature.
@@ -9298,6 +9986,8 @@ components:
               minimum: 10
               maximum: 600000
               description: New threshold of the alert `clockDifference`.
+        dataTransfer:
+          $ref: '#/components/schemas/DataTransferSettingsUpdate'
         features:
           type: object
           description: Features to turn on. `false` is rejected for a feature that is already on.
@@ -11382,3 +12072,334 @@ components:
           type: array
           description: Added in 0.5.0, optional. The servers that did not answer, sorted by id; absent when `partial` is false.
           items: { $ref: '#/components/schemas/MissingServer' }
+
+    # ------------------------------------------------------------------ data transfer (0.19.0)
+    CsvDelimiter:
+      type: string
+      description: Added in 0.19.0. The field delimiter of a CSV file.
+      enum: [',', ';', "\t", '|', ':']
+      default: ','
+    CsvEncoding:
+      type: string
+      description: Added in 0.19.0. The character encoding of a CSV file, by the name PostgreSQL gives it. `SJIS`, `BIG5` and `GBK` are client-only encodings.
+      enum: [UTF8, LATIN1, LATIN2, LATIN9, WIN1250, WIN1251, WIN1252, WIN1256, ISO_8859_6, SJIS, EUC_JP, GBK, BIG5, KOI8R]
+      default: UTF8
+    ExportTableRequest:
+      type: object
+      description: |
+        Added in 0.19.0. Options of a table export. Every member is optional; the server never accepts a `WHERE`, an order or SQL of any kind.
+      properties:
+        columns:
+          type: array
+          description: Column names to export, in this order; validated against the catalog. Default all columns in table order. Generated columns are exported (they are values).
+          maxItems: 1600
+          items: { type: string, minLength: 1, maxLength: 63 }
+        delimiter:
+          $ref: '#/components/schemas/CsvDelimiter'
+        nullString:
+          type: string
+          maxLength: 32
+          default: ''
+          description: The text of a null. The default, an empty string, writes a null as an unquoted empty field. It must not contain a quote, the delimiter, a carriage return or a line feed.
+        quote:
+          type: string
+          minLength: 1
+          maxLength: 1
+          default: '"'
+          description: The quote character, one byte. The escape character is the quote.
+        header:
+          type: boolean
+          default: true
+          description: Whether the first record holds the column names.
+        encoding:
+          $ref: '#/components/schemas/CsvEncoding'
+        utf8Bom:
+          type: boolean
+          default: false
+          description: Write a UTF-8 byte order mark (some spreadsheets need one). Only with `encoding` `UTF8`.
+        compression:
+          type: string
+          enum: [none, gzip]
+          default: none
+          description: '`gzip` compresses the file; its `format` is then `csv.gz`.'
+        spreadsheetSafe:
+          type: boolean
+          default: true
+          description: |
+            Write a text cell that begins with `=`, `+`, `-`, `@`, `|`, `%`, a tab, a carriage return, the full-width forms of `=`, `+`, `-` and `@`, or a no-break space or spaces before such a character, with an apostrophe in front.
+            Numeric, date and boolean columns are not changed. **It is lossy** (importing the file puts the apostrophe in) and **not a security feature**.
+        acknowledgeOtherRolesCode:
+          type: boolean
+          default: false
+          description: Accept that the read runs code of another role (a virtual generated column or a row-level-security expression of a table that another role owns). Recorded in the audit event.
+        retentionHours:
+          type: integer
+          minimum: 1
+          maximum: 168
+          description: How long the file is kept. Default the cluster setting `dataTransfer.retentionHours`.
+    ImportTableRequest:
+      type: object
+      description: |
+        Added in 0.19.0. Options of a table import. The schema is closed: members for batches can be added later without changing the meaning of these. There is no `onError`, no `batchRows`
+        and no `skipRows`: the import is all or nothing.
+      required: [uploadId]
+      additionalProperties: false
+      properties:
+        uploadId:
+          type: string
+          minLength: 1
+          maxLength: 20
+          pattern: '^[0-9]+$'
+          description: A complete upload of the caller.
+        header:
+          type: string
+          enum: [none, skip, match]
+          default: skip
+          description: '`none`: the file has no header. `skip`: it has one, which is ignored. `match`: it has one and its names must equal `columns` (422 `import_header_mismatch` names the first difference).'
+        columns:
+          type: array
+          description: The columns, in the file's order. Default the non-generated columns of the table in table order. A generated column is refused (400 `validation_failed`).
+          maxItems: 1600
+          items: { type: string, minLength: 1, maxLength: 63 }
+        delimiter:
+          $ref: '#/components/schemas/CsvDelimiter'
+        nullString:
+          type: string
+          maxLength: 32
+          default: ''
+          description: The text of a null, as in `ExportTableRequest`.
+        quote:
+          type: string
+          minLength: 1
+          maxLength: 1
+          default: '"'
+          description: The quote character, one byte. With the client-only encodings `SJIS`, `BIG5` and `GBK` it must be an ASCII byte below 0x40.
+        encoding:
+          $ref: '#/components/schemas/CsvEncoding'
+        compression:
+          type: string
+          enum: [none, gzip]
+          description: Default detected from the upload. The expansion is counted against the 2 GiB limit.
+        forceNotNull:
+          type: array
+          description: Columns in which an empty unquoted field is an empty string, not a null.
+          maxItems: 1600
+          items: { type: string, minLength: 1, maxLength: 63 }
+        forceNull:
+          type: array
+          description: Columns in which a quoted `nullString` is a null.
+          maxItems: 1600
+          items: { type: string, minLength: 1, maxLength: 63 }
+        skipBom:
+          type: boolean
+          default: true
+          description: Remove a UTF-8 byte order mark at the start of the decompressed stream.
+        keepUpload:
+          type: boolean
+          default: false
+          description: Keep the upload after a successful import (until its retention time).
+    CreateDataUploadRequest:
+      type: object
+      description: Added in 0.19.0. A new resumable upload.
+      required: [purpose, sizeBytes]
+      properties:
+        purpose:
+          type: string
+          enum: [tableImport]
+          description: What the file is for. 0.20.0 adds `databaseArchive`.
+        sizeBytes:
+          type: integer
+          format: int64
+          minimum: 1
+          description: The size of the file in bytes; at most `dataTransfer.maxFileBytes`. The staging quota for this size is reserved.
+        sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: The SHA-256 of the file in lower-case hexadecimal; for clients that can hash the file first. The server checks it when the last byte is in.
+        fileName:
+          type: string
+          maxLength: 255
+          description: For display only. It is never used in a path and never appears in an audit event.
+    DataUpload:
+      type: object
+      description: Added in 0.19.0. A resumable upload.
+      required: [uploadId, state, sizeBytes, offset, chunkBytesMax, chunkAlign, expiresAt]
+      properties:
+        uploadId:
+          type: string
+          description: Identifier, a decimal string.
+        state:
+          type: string
+          enum: [receiving, complete, lost, deleted]
+          description: '`receiving`: bytes are missing. `complete`: all bytes are in and the SHA-256 is known. `lost`: the staged file is gone (404 is the usual answer). 0.20.0 adds `validating`, `valid` and `invalid`.'
+        sizeBytes:
+          type: integer
+          format: int64
+          description: The declared size.
+        offset:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Where the next chunk must start; read from the staged file.
+        chunkBytesMax:
+          type: integer
+          format: int64
+          description: The largest chunk the server accepts (256 MiB). The console sends 64 MiB.
+        chunkAlign:
+          type: integer
+          enum: [65536]
+          description: Every chunk except the last is a multiple of this many bytes.
+        sha256:
+          type:
+            - string
+            - 'null'
+          description: The SHA-256 of the file in lower-case hexadecimal, once the upload is complete; null before.
+        expiresAt:
+          type: string
+          format: date-time
+          description: When the server deletes the upload if nothing happens (48 hours without data, 24 hours when complete and unused).
+    TableConsistency:
+      type: object
+      description: |
+        Added in 0.19.0. What the file guarantees for one table. Every row in a file was committed. `single-snapshot`: one snapshot (a local table, a reference table, or a distributed table whose buckets are all on one
+        group). `per-group`: each group's rows come from one snapshot of that group and the groups' snapshots are **not** one instant. `per-group-and-partition`: as `per-group`, and the partitions of one group may be
+        different snapshots. **There is no global snapshot** (phase 8, future).
+      required: [table, level, groups]
+      properties:
+        table:
+          type: string
+          description: '`schema.table`.'
+        level:
+          type: string
+          enum: [single-snapshot, per-group, per-group-and-partition]
+        groups:
+          type: integer
+          minimum: 1
+          description: Number of groups that hold buckets of the table.
+    DataExport:
+      type: object
+      description: Added in 0.19.0. A staged export file and what is known about it.
+      required: [exportId, kind, state, createdAt, expiresAt]
+      properties:
+        exportId:
+          type: string
+          description: Identifier, a decimal string.
+        kind:
+          type: string
+          enum: [tableExport]
+          description: 0.20.0 adds `databaseExport`.
+        state:
+          type: string
+          enum: [building, ready, failed, expired, lost, deleted]
+          description: '`building`: the task writes it. `ready`: it can be downloaded. `failed`: the task failed and the partial file was removed. `expired`: its time has passed. `lost`: the file or the key is gone.'
+        database:
+          type:
+            - string
+            - 'null'
+        schema:
+          type:
+            - string
+            - 'null'
+        table:
+          type:
+            - string
+            - 'null'
+        sizeBytes:
+          type:
+            - integer
+            - 'null'
+          format: int64
+          description: Size of the plaintext file; null while it is built.
+        sha256:
+          type:
+            - string
+            - 'null'
+          description: SHA-256 of the plaintext file; null while it is built. Two exports with the same value saw the same data.
+        rows:
+          type:
+            - integer
+            - 'null'
+          format: int64
+          description: Rows in the file; null while it is built.
+        consistency:
+          type:
+            - array
+            - 'null'
+          items: { $ref: '#/components/schemas/TableConsistency' }
+          description: One entry for the table; null while it is built.
+        rlsApplied:
+          type: boolean
+          description: "Whether row-level security shortened the file. Always false: a table with row-level security is exported only with `row_security = off`, so a policy that hides rows fails the export."
+        format:
+          type: string
+          enum: [csv, csv.gz]
+          description: 0.20.0 adds `archive/1`.
+        taskId:
+          type: integer
+          format: int64
+          description: The task that builds the file.
+        createdAt:
+          type: string
+          format: date-time
+        expiresAt:
+          type: string
+          format: date-time
+          description: The retention time; the file is deleted after it.
+        downloadedAt:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: When the last byte was served; null when no download has finished.
+    DataExportPage:
+      type: object
+      description: Added in 0.19.0. A page of the caller's exports, newest first.
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/DataExport' }
+        nextCursor:
+          $ref: '#/components/schemas/NextCursor'
+    DataTransferSettings:
+      type: object
+      description: Added in 0.19.0. The cluster settings of table export and import.
+      required: [enabled, retentionHours, maxFileBytes, stagingQuotaBytes, maxConcurrent]
+      properties:
+        enabled:
+          type: boolean
+          default: false
+          description: While false every data transfer operation answers 403 `data_transfer_disabled`.
+        retentionHours:
+          type: integer
+          minimum: 1
+          maximum: 168
+          default: 24
+          description: How long an export file is kept by default.
+        maxFileBytes:
+          type: integer
+          format: int64
+          minimum: 1048576
+          default: 21474836480
+          description: The largest staged file (20 GiB).
+        stagingQuotaBytes:
+          type: integer
+          format: int64
+          minimum: 1048576
+          description: The sum of the reservations of the staging area; the default is the smaller of 100 GiB and 25 percent of the file system.
+        maxConcurrent:
+          type: integer
+          minimum: 1
+          maximum: 16
+          default: 2
+          description: Transfers running at once in the cluster (one per role).
+    DataTransferSettingsUpdate:
+      type: object
+      description: Added in 0.19.0. A partial update of `DataTransferSettings`.
+      minProperties: 1
+      properties:
+        enabled: { type: boolean, description: Turn the data transfer operations on or off. }
+        retentionHours: { type: integer, minimum: 1, maximum: 168, description: New default retention. }
+        maxFileBytes: { type: integer, format: int64, minimum: 1048576, description: New largest staged file. }
+        stagingQuotaBytes: { type: integer, format: int64, minimum: 1048576, description: New staging quota. }
+        maxConcurrent: { type: integer, minimum: 1, maximum: 16, description: New limit of running transfers. }
