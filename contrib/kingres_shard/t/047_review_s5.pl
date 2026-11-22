@@ -213,7 +213,7 @@ sub as_role
 	$n2->safe_psql('postgres', q{SET kingres_shard.enable_routing = off; UPDATE kingres.cluster_secret SET secret = decode(repeat('ab', 40), 'hex')});
 	my ($rc, $out, $err) = run_sql($n1, q{SELECT count(*) FROM public.d}, extra_params => [ '-U', 'alice' ]);
 	isnt($rc, 0, 'a scan that needs the node fails');
-	like($err, qr/node \S+:\d+ runs kingres_shard 0\.3, this node runs 0\.8/, 'S5-02: and the message names the version of the node');
+	like($err, qr/node \S+:\d+ runs kingres_shard 0\.3, this node runs 0.9/, 'S5-02: and the message names the version of the node');
 }
 
 # ---------------------------------------------------------------------------
