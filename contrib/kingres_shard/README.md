@@ -1577,6 +1577,68 @@ restriction in `ON` does not prune the groups of an M1 statement (every group ow
 always correct); `merge_max_source_bytes` bounds the rows that the origin holds, and for M5 every node receives all of them;
 a `MERGE` on a hot standby is refused as every write is.
 
+## The repartitioned join (phase 12, version 0.8)
+
+A join of distributed tables on columns other than their distribution column cannot run on the groups as it stands: the rows that
+meet are on different groups.  The distributed scan (phase 2a) answers such a statement by bringing every row to this node.  The
+repartitioned join (design `analytics-phase12-queries.md`, section 4) moves less: one table is read by this node, and its rows are
+sent to the groups that can join them with their own rows of the other tables.  The complete scan stays the fallback of every
+statement (ADR 0022): a join that no path here can prove correct is planned exactly as before, and the reason is in the `DEBUG1`
+message of the planner and in `EXPLAIN (VERBOSE)`.
+
+**Which table moves.**  A distributed table R can be the moved one when all the other distributed tables of the statement are
+aligned with each other (their distribution columns are in one class of the equalities of the statement, or there is only one of
+them) and share one colocation group.  Reference tables are on every group and take no part.  Two ways to move R:
+
+* *Routed.*  R has a column that the statement equates (hash-joinable equality, equal types or the integer family, deterministic
+  collation) with the distribution column of the other tables.  Each row of R goes to the one group that owns the bucket of that
+  column's value in the colocation layout of the other tables (the same lookup as the row router), so the join is local there.  A
+  NULL key joins nothing and the row is dropped.
+* *Broadcast.*  R has no such column (the join is on an expression, an inequality, columns that are not keys, or the types or the
+  collation do not match).  Every row of R goes to every group that is asked.  Every group joins its own rows of the other tables
+  with all of R, and a row of the result is formed from rows of the others that are on one group only, so no row of the result is
+  repeated or missing.  A table that can be routed is routed (it sends one copy of each row, not one for every group).
+
+With a LEFT JOIN, only the table on its nullable side (one table) can move, routed or broadcast: the preserved side stays where it
+is, so that each of its rows is emitted once, by its own group.  A condition of the ON clause on the moved table is applied by its
+scan; a condition of the WHERE that names only the moved table is refused (it applies after the join, to the rows that were filled
+with NULLs).  What moves is only the columns that the statement needs.  Aggregates above the join are split in two as for a closed
+query (the groups aggregate the rows of the join they hold, this node combines).
+
+**What the groups check.**  The text that a group runs is the statement with the moved table replaced by a sub-select of casts of
+the columns of `unnest()` over `text[]` parameters.  The group accepts a sub-select of exactly that shape and no other, counts them,
+and refuses the text unless their number is the `rp=<n>` of the marker; it then applies the rules of every closed fragment (the
+proof of the sending node, the placement of the map, the shippability of every expression).  A forged text is a plain refusal, never
+a stale map.  A bucket that moves while the statement runs ends in the retryable KS001 or in the baseline answer, never in a wrong
+one (t/262).
+
+**EXPLAIN.**  The plan of a repartitioned join has a line `Repartition: o by cust -> placement of colocation 1 (12 buckets)` or
+`Repartition: o broadcast (to 3 groups)` (with the estimated rows when costs are on).  `EXPLAIN (VERBOSE)` of a statement that was
+a candidate (two distributed tables or more, tables only) and was not repartitioned has `Repartition: not used: <reason>` on its
+Distributed Scan: the reason of the planner (an outer join that is not one LEFT JOIN to a table, tables that are not aligned, a table
+that is not distributed ...), `switched off by kingres_shard.enable_repartition_join`, or `cost: the scan is cheaper than a
+repartitioned plan`.
+
+**Settings.**  `kingres_shard.enable_repartition_join` (`off`, `on` by cost, `force` for the tests) and
+`kingres_shard.repartition_max_bytes` (default 64 MB): the most text that one moved table may need at this node, and for a
+broadcast table the share of one group.  The planner does not choose a moved side that it estimates above half of it, and the
+executor stops a statement that would hold more with an error that names the setting (the one place where a read fails instead of
+falling back, because the plan cannot change once it runs).  Fault points: `rp_after_ship`, `rp_before_fragment`.
+
+**Not done (the complete scan answers them).**
+
+* A preserved side that moves (`o LEFT JOIN c` with `o` moved, `c` staying).  It can be made correct: every `o` row goes to the group
+  of its key, a NULL key goes once to one group, a condition of the ON clause that names only `o` stays in the text (it decides the
+  NULLs, not the presence of the row), no pruning is taken from the restrictions of `c`.  What is missing is on the group: its
+  analysis (`pushdown.c`) reads a shipped relation like a reference table, so it refuses it on the preserved side of an outer join
+  (every group would emit its unmatched rows), and a partitioned role for a shipped relation needs a way for the group to check
+  that the key column is the one the rows were routed by.  That is a change of the analysis that the closed queries of phase 2b
+  share, and it was not made.
+* Two moved tables at once (dual repartition, or a routed table with a broadcast one, or two broadcast tables), and a statement with
+  no table that stays: the executor ships one relation, and a group that holds none of the tables of the statement has nothing to
+  prove the placement with.
+* A broadcast table of which no column is needed above the join (`count(*)` over a cross join): there is no column to send.
+
 ## Bulk writes through the row router (phase 2b, steps 3 and 4)
 
 An `INSERT` into a hash-distributed table whose rows can belong to several groups, and `COPY ...

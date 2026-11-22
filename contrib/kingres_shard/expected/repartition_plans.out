@@ -201,6 +201,112 @@ SELECT * FROM plan_of('SELECT cu.id, o.id FROM cu LEFT JOIN o ON o.cust = cu.id'
                ->  Seq Scan on o_b0007 o_8
 (17 rows)
 
+\echo -- a table with no column to be routed by is sent whole to every group (broadcast): an expression, an inequality, columns that are not keys
+-- a table with no column to be routed by is sent whole to every group (broadcast): an expression, an inequality, columns that are not keys
+SELECT * FROM plan_of('SELECT o.id, cu.name FROM o JOIN cu ON cu.id = o.cust + 1');
+                                                                                                              plan_of                                                                                                               
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (Kingres Fragment Scan)
+   Pushed: repartitioned join (one table sent whole to every group)
+   Repartition: o broadcast (to 2 groups)
+   Groups: 2 of 2 (local + 1 remote)
+   Remote SQL: SELECT o.id, cu.name FROM (( SELECT (u.c1)::integer AS id, (u.c2)::integer AS cust, NULL::text AS amount, NULL::text AS note FROM UNNEST($1, $2) u(c1, c2)) o JOIN public.cu ON ((cu.id = (o.cust + 1)))) WHERE true
+   ->  Custom Scan (Kingres Distributed Scan)
+         Remote groups: 1
+         Remote SQL: SELECT id, cust FROM public.o AS ks_t
+         ->  Append
+               ->  Seq Scan on o_b0000 o_1
+               ->  Seq Scan on o_b0001 o_2
+               ->  Seq Scan on o_b0002 o_3
+               ->  Seq Scan on o_b0003 o_4
+               ->  Seq Scan on o_b0004 o_5
+               ->  Seq Scan on o_b0005 o_6
+               ->  Seq Scan on o_b0006 o_7
+               ->  Seq Scan on o_b0007 o_8
+(17 rows)
+
+SELECT pushed('SELECT o.id, cu.id FROM o JOIN cu ON cu.region < o.amount');
+                              pushed                              
+------------------------------------------------------------------
+ Pushed: repartitioned join (one table sent whole to every group)
+(1 row)
+
+SELECT pushed('SELECT o.id, it.id FROM o JOIN it ON it.sku = o.amount');
+                              pushed                              
+------------------------------------------------------------------
+ Pushed: repartitioned join (one table sent whole to every group)
+(1 row)
+
+\echo -- a LEFT JOIN: only the nullable table can be sent whole; a table that can be routed is routed
+-- a LEFT JOIN: only the nullable table can be sent whole; a table that can be routed is routed
+SELECT * FROM plan_of('SELECT o.id, cu.name FROM o LEFT JOIN cu ON cu.id = o.cust');
+                                                                                              plan_of                                                                                               
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (Kingres Fragment Scan)
+   Pushed: repartitioned join (one table sent whole to every group)
+   Repartition: cu broadcast (to 2 groups)
+   Groups: 2 of 2 (local + 1 remote)
+   Remote SQL: SELECT o.id, cu.name FROM (public.o LEFT JOIN ( SELECT (u.c1)::integer AS id, NULL::text AS region, u.c2 AS name FROM UNNEST($1, $2) u(c1, c2)) cu ON ((cu.id = o.cust))) WHERE true
+   ->  Custom Scan (Kingres Distributed Scan)
+         Remote groups: 1
+         Remote SQL: SELECT name, id FROM public.cu AS ks_t
+         ->  Append
+               ->  Seq Scan on cu_b0000 cu_1
+               ->  Seq Scan on cu_b0001 cu_2
+               ->  Seq Scan on cu_b0002 cu_3
+               ->  Seq Scan on cu_b0003 cu_4
+               ->  Seq Scan on cu_b0004 cu_5
+               ->  Seq Scan on cu_b0005 cu_6
+               ->  Seq Scan on cu_b0006 cu_7
+               ->  Seq Scan on cu_b0007 cu_8
+(17 rows)
+
+SELECT pushed('SELECT o.id, cu.name FROM o LEFT JOIN cu ON cu.id = o.cust + 1 AND o.amount > 3');
+                              pushed                              
+------------------------------------------------------------------
+ Pushed: repartitioned join (one table sent whole to every group)
+(1 row)
+
+\echo -- three tables, two aligned, one sent whole; a reference table beside
+-- three tables, two aligned, one sent whole; a reference table beside
+SELECT pushed('SELECT o.id, it.sku, cu.name FROM o JOIN it ON it.id = o.id JOIN cu ON cu.id = o.cust + 1');
+                              pushed                              
+------------------------------------------------------------------
+ Pushed: repartitioned join (one table sent whole to every group)
+(1 row)
+
+SELECT pushed('SELECT o.id, r.label, cu.name FROM o JOIN cu ON cu.id = o.cust + 1 JOIN r ON r.k = cu.region');
+                              pushed                              
+------------------------------------------------------------------
+ Pushed: repartitioned join (one table sent whole to every group)
+(1 row)
+
+\echo -- an aggregate above a broadcast join
+-- an aggregate above a broadcast join
+SELECT * FROM plan_of('SELECT cu.region, count(*), sum(o.amount) FROM o JOIN cu ON cu.id = o.cust + 1 GROUP BY cu.region');
+                                                                                                                                     plan_of                                                                                                                                      
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: region
+   ->  Custom Scan (Kingres Fragment Scan)
+         Pushed: repartitioned join, partial aggregate (one table sent whole to every group)
+         Repartition: o broadcast (to 2 groups)
+         Groups: 2 of 2 (local + 1 remote)
+         Remote SQL: SELECT cu.region, count(*), sum(o.amount) FROM (( SELECT NULL::text AS id, (u.c1)::integer AS cust, (u.c2)::integer AS amount, NULL::text AS note FROM UNNEST($1, $2) u(c1, c2)) o JOIN public.cu ON ((cu.id = (o.cust + 1)))) WHERE true GROUP BY cu.region
+         ->  Custom Scan (Kingres Distributed Scan)
+               Remote groups: 1
+               Remote SQL: SELECT amount, cust FROM public.o AS ks_t
+               ->  Append
+                     ->  Seq Scan on o_b0000 o_1
+                     ->  Seq Scan on o_b0001 o_2
+                     ->  Seq Scan on o_b0002 o_3
+                     ->  Seq Scan on o_b0003 o_4
+                     ->  Seq Scan on o_b0004 o_5
+                     ->  Seq Scan on o_b0005 o_6
+                     ->  Seq Scan on o_b0006 o_7
+                     ->  Seq Scan on o_b0007 o_8
+(19 rows)
+
 -- ---------------------------------------------------------------------------
 -- Aggregates above the join: every group aggregates its rows of the join, this node combines
 -- ---------------------------------------------------------------------------
@@ -321,39 +427,19 @@ DEBUG:  kingres_shard: no repartitioned join: it has an outer join other than on
  none
 (1 row)
 
-\echo -- the moved table would be the preserved side
--- the moved table would be the preserved side
-SELECT pushed('SELECT o.id, cu.name FROM o LEFT JOIN cu ON cu.id = o.cust');
+\echo -- the tables that stay are not aligned with each other: a broadcast needs them aligned
+-- the tables that stay are not aligned with each other: a broadcast needs them aligned
+SELECT pushed('SELECT o.id, it.id, cu.id FROM o CROSS JOIN it LEFT JOIN cu ON cu.id = o.cust');
 DEBUG:  kingres_shard: no pushdown: an outer join of distributed tables does not equate their distribution keys in its ON clause
-DEBUG:  kingres_shard: no repartitioned join: with a LEFT JOIN only the table on its nullable side can be moved, and the others do not leave it one key class to be aligned with
+DEBUG:  kingres_shard: no repartitioned join: with a LEFT JOIN only the table on its nullable side can be moved or broadcast, and the other distributed tables do not share one key class
  pushed 
 --------
  none
 (1 row)
 
-\echo -- a join on an expression, a join that is not an equality
--- a join on an expression, a join that is not an equality
-SELECT pushed('SELECT o.id, cu.name FROM o JOIN cu ON cu.id = o.cust + 1');
+SELECT pushed('SELECT o.id, it.id, cu.id FROM o, it, cu');
 DEBUG:  kingres_shard: no pushdown: the distributed tables are not all joined on their distribution keys (more than one key class)
-DEBUG:  kingres_shard: no repartitioned join: the distributed tables are not joined so that one repartition aligns them (the other tables must share one key class and the shipped table must equate a column with it)
- pushed 
---------
- none
-(1 row)
-
-SELECT pushed('SELECT o.id, cu.id FROM o JOIN cu ON cu.region < o.amount');
-DEBUG:  kingres_shard: no pushdown: the distributed tables are not all joined on their distribution keys (more than one key class)
-DEBUG:  kingres_shard: no repartitioned join: the distributed tables are not joined so that one repartition aligns them (the other tables must share one key class and the shipped table must equate a column with it)
- pushed 
---------
- none
-(1 row)
-
-\echo -- two tables that would both have to move
--- two tables that would both have to move
-SELECT pushed('SELECT o.id, it.id FROM o JOIN it ON it.sku = o.amount');
-DEBUG:  kingres_shard: no pushdown: the distributed tables are not all joined on their distribution keys (more than one key class)
-DEBUG:  kingres_shard: no repartitioned join: the distributed tables are not joined so that one repartition aligns them (the other tables must share one key class and the shipped table must equate a column with it)
+DEBUG:  kingres_shard: no repartitioned join: the distributed tables are not joined so that moving one of them aligns the others (the tables that stay must share one key class, and the moved one must not be anchored itself)
  pushed 
 --------
  none
@@ -426,22 +512,22 @@ SELECT id, why('SELECT o.id, plain.y FROM o JOIN plain ON plain.x = o.id WHERE o
   6 | -
 (6 rows)
 
-SELECT why('SELECT o.id, cu.name FROM o LEFT JOIN cu ON cu.id = o.cust');
-                                                                            why                                                                            
------------------------------------------------------------------------------------------------------------------------------------------------------------
- Repartition: not used: with a LEFT JOIN only the table on its nullable side can be moved, and the others do not leave it one key class to be aligned with
+SELECT why('SELECT o.id, it.id, cu.id FROM o CROSS JOIN it LEFT JOIN cu ON cu.id = o.cust');
+                                                                                why                                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Repartition: not used: with a LEFT JOIN only the table on its nullable side can be moved or broadcast, and the other distributed tables do not share one key class
+(1 row)
+
+SELECT why('SELECT o.id, it.id, cu.id FROM o, it, cu');
+                                                                                                   why                                                                                                    
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Repartition: not used: the distributed tables are not joined so that moving one of them aligns the others (the tables that stay must share one key class, and the moved one must not be anchored itself)
 (1 row)
 
 SELECT why('SELECT o.id, cu.name FROM o JOIN cu ON cu.id = o.cust + 1');
-                                                                                               why                                                                                               
--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- Repartition: not used: the distributed tables are not joined so that one repartition aligns them (the other tables must share one key class and the shipped table must equate a column with it)
-(1 row)
-
-SELECT why('SELECT o.id, it.id FROM o JOIN it ON it.sku = o.amount');
-                                                                                               why                                                                                               
--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- Repartition: not used: the distributed tables are not joined so that one repartition aligns them (the other tables must share one key class and the shipped table must equate a column with it)
+ why 
+-----
+ -
 (1 row)
 
 SELECT why('SELECT o.id, plain.y FROM o JOIN plain ON plain.x = o.cust');
@@ -462,9 +548,9 @@ SELECT why('SELECT o.id, cu.name FROM o JOIN cu ON cu.id = o.cust');
 SET kingres_shard.enable_repartition_join = on;
 SET kingres_shard.repartition_max_bytes = 1024;
 SELECT why('SELECT o.id, cu.name FROM o JOIN cu ON cu.id = o.cust');
-                                    why                                     
-----------------------------------------------------------------------------
- Repartition: not used: cost: the scan is cheaper than a repartitioned plan
+                                                                      why                                                                      
+-----------------------------------------------------------------------------------------------------------------------------------------------
+ Repartition: not used: cost: the scan is cheaper than a repartitioned plan; the shipped side is estimated above half of repartition_max_bytes
 (1 row)
 
 RESET kingres_shard.repartition_max_bytes;

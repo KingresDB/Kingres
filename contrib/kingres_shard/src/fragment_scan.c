@@ -1611,12 +1611,13 @@ fs_partial_paths_one(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *outpu
 			moved > (double) kingres_shard_repartition_max_kb * 1024.0 / 2.0)
 			PA_NO("the shipped side is estimated above half of repartition_max_bytes");
 		startup = child->total_cost + 100.0 * nremote;
-		total = startup + Max(base->total_cost - child->total_cost, 0.0) / ntotal + clamp_row_est(rrel->rows) * (cpu_tuple_cost * 4.0 + 0.04) +
+		/* a broadcast relation is sent to every group */
+		total = startup + Max(base->total_cost - child->total_cost, 0.0) / ntotal + clamp_row_est(rrel->rows) * (cpu_tuple_cost * 4.0 + 0.04) * (cand->broadcast ? ntotal : 1) +
 			prows * (cpu_tuple_cost * 2.0 + 0.02) * nremote / ntotal;
 		if (kingres_shard_enable_repartition_join == KS_REPART_FORCE)
 		{
 			startup = 0.0;
-			total = 0.005;
+			total = cand->broadcast ? 0.0055 : 0.005;
 		}
 	}
 
@@ -1839,12 +1840,12 @@ fs_repart_join_paths(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerre
 			base_total += innerrel->cheapest_total_path->total_cost;
 		rows = clamp_row_est(joinrel->rows);
 		startup = child->total_cost + 100.0 * nremote;
-		total = startup + base_total / ntotal + clamp_row_est(rrel->rows) * (cpu_tuple_cost * 4.0 + 0.04) +
+		total = startup + base_total / ntotal + clamp_row_est(rrel->rows) * (cpu_tuple_cost * 4.0 + 0.04) * (cand->broadcast ? ntotal : 1) +
 			rows * (cpu_tuple_cost * 2.0 + 0.02) * nremote / ntotal;
 		if (kingres_shard_enable_repartition_join == KS_REPART_FORCE)
 		{
 			startup = 0.0;
-			total = 0.01;
+			total = cand->broadcast ? 0.011 : 0.01;
 		}
 
 		cpath = makeNode(CustomPath);
@@ -2048,6 +2049,7 @@ fs_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path, L
 	List	   *rpinfo = NIL;
 	int			rp_coloc = 0;
 	const char *rp_place = NULL;
+	bool		rp_bcast = false;
 
 	if (pi == NULL || root->parse != pi->parse)
 		elog(ERROR, "a fragment scan was planned for a statement that was not decided");
@@ -2057,6 +2059,7 @@ fs_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path, L
 		rpinfo = (List *) lfourth(best_path->custom_private);
 		rp_coloc = intVal(lthird(rpinfo));
 		rp_place = strVal(lfourth(rpinfo));
+		rp_bcast = intVal(lsecond(rpinfo)) < 0;
 	}
 	if (path_kind != FS_PATH_WHOLE)
 	{
@@ -2105,7 +2108,7 @@ fs_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path, L
 									   makeString(relations_signature(pi->relids)));
 	cscan->custom_private = lappend(cscan->custom_private, dist);
 	cscan->custom_private = lappend(cscan->custom_private, prune);
-	cscan->custom_private = lappend(cscan->custom_private, makeString(pstrdup(path_kind == FS_PATH_REPART_PARTIAL ? "repartitioned join, partial aggregate (one table moved by its join key)" : path_kind == FS_PATH_REPART ? "repartitioned join (one table moved by its join key)" : path_kind == FS_PATH_JOIN ? "join rows (on key)" : path_kind == FS_PATH_PARTIAL ? "partial aggregate" : pi->kind)));
+	cscan->custom_private = lappend(cscan->custom_private, makeString(pstrdup(path_kind == FS_PATH_REPART_PARTIAL ? (rp_bcast ? "repartitioned join, partial aggregate (one table sent whole to every group)" : "repartitioned join, partial aggregate (one table moved by its join key)") : path_kind == FS_PATH_REPART ? (rp_bcast ? "repartitioned join (one table sent whole to every group)" : "repartitioned join (one table moved by its join key)") : path_kind == FS_PATH_JOIN ? "join rows (on key)" : path_kind == FS_PATH_PARTIAL ? "partial aggregate" : pi->kind)));
 	cscan->custom_private = lappend(cscan->custom_private, makeInteger(path_kind != FS_PATH_WHOLE ? list_length(tlist) : pi->ncols));
 	cscan->custom_private = lappend(cscan->custom_private, makeInteger((path_kind == FS_PATH_PARTIAL || path_kind == FS_PATH_REPART_PARTIAL) ? 1 : 0));
 	cscan->custom_private = lappend(cscan->custom_private, makeString(ext != NULL ? pstrdup(ext) : pstrdup("")));
@@ -3019,10 +3022,14 @@ fs_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 		StringInfoData rep;
 
 		initStringInfo(&rep);
-		appendStringInfo(&rep, "%s by %s -> placement of colocation %d (%d buckets)",
-						 get_rel_name(s->rp_relid) != NULL ? get_rel_name(s->rp_relid) : "?",
-						 get_attname(s->rp_relid, (AttrNumber) s->rp_keyatt, true) != NULL ? get_attname(s->rp_relid, (AttrNumber) s->rp_keyatt, true) : "?",
-						 s->colocation_id, coloc != NULL ? kingres_shard_coloc_nbuckets(coloc) : 0);
+		if (s->rp_keypos < 0)
+			appendStringInfo(&rep, "%s broadcast (to %d groups)",
+							 get_rel_name(s->rp_relid) != NULL ? get_rel_name(s->rp_relid) : "?", nremote + (local ? 1 : 0));
+		else
+			appendStringInfo(&rep, "%s by %s -> placement of colocation %d (%d buckets)",
+							 get_rel_name(s->rp_relid) != NULL ? get_rel_name(s->rp_relid) : "?",
+							 get_attname(s->rp_relid, (AttrNumber) s->rp_keyatt, true) != NULL ? get_attname(s->rp_relid, (AttrNumber) s->rp_keyatt, true) : "?",
+							 s->colocation_id, coloc != NULL ? kingres_shard_coloc_nbuckets(coloc) : 0);
 		if (es->costs)
 			appendStringInfo(&rep, ", est %d rows", s->rp_estrows);
 		ExplainPropertyText("Repartition", rep.data, es);

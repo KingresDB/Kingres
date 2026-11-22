@@ -573,34 +573,40 @@ kingres_shard_repart_prepare(Query *parse, const char **why)
 			dist = list_append_unique_oid(dist, o->relid);
 			nanch++;
 		}
-		if (!ok || first || anchor_class < 0)
+		if (!ok || first)
 			continue;
 		own = rp_node(&nd, rel->rti, rel->dist_attno, false);
-		if (own >= 0 && rp_find(&nd, own) == anchor_class)
+		if (anchor_class >= 0 && own >= 0 && rp_find(&nd, own) == anchor_class)
 			continue;			/* it is anchored itself */
-		/* the column of the shipped relation that is equated with the key of the anchored tables */
-		for (i = 0; i < nd.n; i++)
-			if (nd.rti[i] == rel->rti && rp_find(&nd, i) == anchor_class &&
-				(key == InvalidAttrNumber || nd.att[i] < key))
-				key = nd.att[i];
-		if (key == InvalidAttrNumber)
-			continue;
 		coloc = kingres_shard_lookup_colocation(anchor_coloc);
 		if (coloc == NULL)
 			continue;
+		/* the column of the shipped relation that is equated with the key of the anchored tables */
+		if (anchor_class >= 0)
+			for (i = 0; i < nd.n; i++)
+				if (nd.rti[i] == rel->rti && rp_find(&nd, i) == anchor_class &&
+					(key == InvalidAttrNumber || nd.att[i] < key))
+					key = nd.att[i];
+		if (key != InvalidAttrNumber)
 		{
 			Oid			kt = get_atttype(rel->relid, key);
 
-			if (!(kt == coloc->dist_type || (rp_int_family(kt) && rp_int_family(coloc->dist_type))))
-				continue;
-			if (rp_attcoll(rel->relid, key) != coloc->collation)
-				continue;
+			if (!(kt == coloc->dist_type || (rp_int_family(kt) && rp_int_family(coloc->dist_type))) ||
+				rp_attcoll(rel->relid, key) != coloc->collation)
+				key = InvalidAttrNumber;	/* the key cannot be hashed as the anchored tables are: the relation can still be broadcast */
 		}
+		/*
+		 * A relation with no usable key is sent whole to every group (design 4.3 rule 3).  It is correct whatever the join condition
+		 * is, as long as the tables that stay are aligned with each other (the loop above): every group joins its own rows of them
+		 * with all the rows of this one, and a row of the result is formed from anchored rows of one group only.  With a LEFT JOIN
+		 * the broadcast table is the nullable side (only that one is a candidate), so a preserved row is on one group only.
+		 */
 		cand = palloc0(sizeof(KsRepartCand));
 		cand->routed_rti = rel->rti;
 		cand->routed_relid = rel->relid;
+		cand->broadcast = (key == InvalidAttrNumber);
 		cand->key_attno = key;
-		cand->key_type = get_atttype(rel->relid, key);
+		cand->key_type = cand->broadcast ? InvalidOid : get_atttype(rel->relid, key);
 		cand->colocation_id = anchor_coloc;
 		cand->place = kingres_shard_placement_hash(coloc);
 		cand->dist_relids = dist;
@@ -612,9 +618,9 @@ kingres_shard_repart_prepare(Query *parse, const char **why)
 	}
 	ncands = list_length(cands);
 	if (ncands == 0 && c.outer_rti != 0)
-		RP_NO("with a LEFT JOIN only the table on its nullable side can be moved, and the others do not leave it one key class to be aligned with");
+		RP_NO("with a LEFT JOIN only the table on its nullable side can be moved or broadcast, and the other distributed tables do not share one key class");
 	if (ncands == 0)
-		RP_NO("the distributed tables are not joined so that one repartition aligns them (the other tables must share one key class and the shipped table must equate a column with it)");
+		RP_NO("the distributed tables are not joined so that moving one of them aligns the others (the tables that stay must share one key class, and the moved one must not be anchored itself)");
 
 	ship = copyObject(parse);
 	ship->sortClause = NIL;
@@ -718,7 +724,8 @@ kingres_shard_repart_ship_text(Query *jq, const KsRepartCand *cand, int first_pa
 	rp_strip_tree((Node *) jq->jointree, cand->routed_rti);
 	pull_varattnos((Node *) jq->targetList, cand->routed_rti, &attrs);
 	pull_varattnos((Node *) jq->jointree, cand->routed_rti, &attrs);
-	attrs = bms_add_member(attrs, cand->key_attno - FirstLowInvalidHeapAttributeNumber);
+	if (!cand->broadcast)
+		attrs = bms_add_member(attrs, cand->key_attno - FirstLowInvalidHeapAttributeNumber);
 
 	initStringInfo(&sel);
 	initStringInfo(&from);
@@ -773,7 +780,7 @@ kingres_shard_repart_ship_text(Query *jq, const KsRepartCand *cand, int first_pa
 	for (i = 1; i <= k; i++)
 		appendStringInfo(&from, "%sc%d", i > 1 ? ", " : "", i);
 	appendStringInfoChar(&from, ')');
-	if (k == 0 || kp < 0)
+	if (k == 0 || (!cand->broadcast && kp < 0))
 		SH_NO("the shipped table has no column to ship");
 
 	{
@@ -807,7 +814,7 @@ kingres_shard_repart_ship_text(Query *jq, const KsRepartCand *cand, int first_pa
 	rte->lateral = false;
 
 	*child_cols = cols;
-	*keypos = kp;
+	*keypos = cand->broadcast ? -1 : kp;
 	return true;
 #undef SH_NO
 }
@@ -828,6 +835,7 @@ struct KsRepartRows
 	int			ncols;
 	int			ngroups;
 	RpGroup    *groups;
+	bool		broadcast;		/* one buffer for every group */
 	int64		bytes;
 	int64		rows;
 };
@@ -866,17 +874,20 @@ kingres_shard_repart_collect(PlanState *child, const KsColocation *coloc, List *
 	int			i;
 	ListCell   *lc;
 	FmgrInfo   *outf;
-	int			keycol = list_nth_int(cols, keypos);
-	Oid			keytype = TupleDescAttr(desc, keycol)->atttypid;
+	bool		bcast = (keypos < 0);
+	int			keycol = bcast ? -1 : list_nth_int(cols, keypos);
+	Oid			keytype = bcast ? InvalidOid : TupleDescAttr(desc, keycol)->atttypid;
 	int64		limit = (int64) kingres_shard_repartition_max_kb * 1024;
 	int			nest;
 
 	rows = palloc0(sizeof(KsRepartRows));
 	rows->ncols = ncols;
-	rows->ngroups = list_length(groups);
+	rows->broadcast = bcast;
+	/* a broadcast relation is one buffer that every group is given: the bound is on the share of one group (design 4.6) */
+	rows->ngroups = bcast ? 1 : list_length(groups);
 	rows->groups = palloc0(sizeof(RpGroup) * Max(rows->ngroups, 1));
 	i = 0;
-	foreach(lc, groups)
+	foreach(lc, bcast ? list_make1_int(-1) : groups)
 	{
 		int			j;
 
@@ -913,6 +924,11 @@ kingres_shard_repart_collect(PlanState *child, const KsColocation *coloc, List *
 			CHECK_FOR_INTERRUPTS();
 			if (TupIsNull(slot))
 				break;
+			if (bcast)
+			{
+				rg = &rows->groups[0];
+				goto have_group;
+			}
 			kd = slot_getattr(slot, keycol + 1, &kn);
 			if (kn)
 				continue;		/* a NULL key joins nothing */
@@ -933,6 +949,7 @@ kingres_shard_repart_collect(PlanState *child, const KsColocation *coloc, List *
 				}
 			if (rg == NULL)
 				continue;		/* a group the statement does not ask (pruned): its rows are not needed */
+have_group:
 			MemoryContextSwitchTo(rowcxt);
 			for (j = 0; j < ncols; j++)
 			{
@@ -973,6 +990,8 @@ rp_find_group(KsRepartRows *rows, int group_id)
 {
 	int			i;
 
+	if (rows->broadcast)
+		return &rows->groups[0];
 	for (i = 0; i < rows->ngroups; i++)
 		if (rows->groups[i].group_id == group_id)
 			return &rows->groups[i];

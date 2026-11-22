@@ -11,8 +11,10 @@
 #
 #   A. joins that are repartitioned: one routed table, filters on both sides, aggregates above, three tables, a self join, a reference table
 #   B. NULL join keys, duplicates, an empty side, a key that matches nothing
-#   C. joins that are not repartitioned and fall back to the complete scan: an outer join, two routed tables, a join on an expression
+#   C. joins that are not repartitioned and fall back to the complete scan: an outer join, tables that stay but are not aligned with each other
 #   D. the switches and the size bound
+#   E. aggregates above the repartitioned join (J2)
+#   F. J2: a table with no key to be routed by is sent whole to every group (broadcast): any join condition, a LEFT JOIN to it, the bound
 
 use strict;
 use warnings FATAL => 'all';
@@ -186,25 +188,111 @@ for my $q (@data)
 # C. fall back to the complete scan
 # ---------------------------------------------------------------------------
 my @not = (
-	[ 'a left join with the moved table preserved', q{SELECT o.id, cu.name FROM public.o LEFT JOIN public.cu ON cu.id = o.cust WHERE o.id < 200} ],
 	[ 'a left join whose WHERE names only the nullable side', q{SELECT cu.id, o.id FROM public.cu LEFT JOIN public.o ON o.cust = cu.id WHERE cu.id < 60 AND o.id IS NULL} ],
 	[ 'two left joins', q{SELECT cu.id, o.id, it.id FROM public.cu LEFT JOIN public.o ON o.cust = cu.id LEFT JOIN public.it ON it.id = cu.id WHERE cu.id < 60} ],
 	[ 'a left join whose nullable side is a join', q{SELECT cu.id, o.id FROM public.cu LEFT JOIN (public.o JOIN public.it ON it.id = o.id) ON o.cust = cu.id WHERE cu.id < 60} ],
 	[ 'a full join', q{SELECT o.id, cu.id FROM public.o FULL JOIN public.cu ON cu.id = o.cust WHERE o.id < 100 OR cu.id < 100} ],
-	[ 'a join on an expression', q{SELECT o.id, cu.name FROM public.o JOIN public.cu ON cu.id = o.cust + 1 WHERE o.id < 300} ],
-	[ 'a join on a column of both that is not equal', q{SELECT o.id, cu.id FROM public.o JOIN public.cu ON cu.region < o.amount % 5 WHERE o.id < 20 AND cu.id < 20} ],
 	[ 'two tables that would both have to move (one is for J2)', q{SELECT o.id, cu.id, e.id FROM public.o JOIN public.cu ON cu.id = o.cust JOIN public.e ON e.cust = cu.id WHERE o.id < 200} ],
-	[ 'two tables that both join by other columns', q{SELECT o.id, it.id FROM public.o JOIN public.it ON it.sku = o.amount % 13 WHERE o.id < 50 AND it.id < 50} ],
 	# the ON clause of a LEFT JOIN decides which rows of the nullable table match, not which rows of the preserved side are paired:
 	# o.id = cu.region AND it.id = cu.region does not put o and it on the same group (their cross product is in the result)
 	[ 'a LEFT JOIN whose ON clause equates the nullable table with two preserved tables', q{SELECT o.id, it.id AS iid, cu.id AS cid FROM public.o CROSS JOIN public.it LEFT JOIN public.cu ON cu.region = o.id AND cu.region = it.id WHERE o.id < 12 AND it.id < 12} ],
 	[ 'a LEFT JOIN whose ON clause equates the two preserved tables', q{SELECT o.id, it.id AS iid, cu.id AS cid FROM public.o CROSS JOIN public.it LEFT JOIN public.cu ON o.id = it.id AND cu.region = o.id WHERE o.id < 12 AND it.id < 12} ],
+	# broadcast needs the tables that stay to be aligned with each other: the groups join their own rows of them
+	[ 'a LEFT JOIN whose preserved side is two tables that are not aligned', q{SELECT o.id, it.id AS iid, cu.id AS cid FROM public.o CROSS JOIN public.it LEFT JOIN public.cu ON cu.id = o.cust WHERE o.id < 12 AND it.id < 12} ],
+	[ 'a cross join of two tables with a third: none of the three is aligned', q{SELECT o.id, it.id AS iid, cu.id AS cid FROM public.o, public.it, public.cu WHERE o.id < 6 AND it.id < 6 AND cu.id < 6} ],
+	[ 'a table that is anchored itself is not broadcast (the join of the other two is not aligned)', q{SELECT o.id, cu.id, e.id FROM public.o JOIN public.cu ON cu.id = o.cust JOIN public.e ON e.cust = o.amount WHERE o.id < 200} ],
 );
 for my $q (@not)
 {
 	my ($name, $sql) = @$q;
 	$c->compare("fallback: $name", $sql, ordered => 0, plans => \@PLANS, profiles => 0, normalize => 1);
 	unlike(plan_of($n1, $sql), qr/\Q$RJ\E/, "fallback: $name: no repartitioned join");
+}
+
+# ---------------------------------------------------------------------------
+# F. J2: a table that has no key to be routed by is sent whole to every group (broadcast), design 4.3 rule 3.  Every group joins its
+#    own rows of the tables that stay with all the rows of that table.  The join condition can be anything; with a LEFT JOIN only the
+#    nullable table is sent whole.  The answer must be the single node's from every node, and the row-moving scan's.
+# ---------------------------------------------------------------------------
+my $BC = 'broadcast \(to \d groups\)';
+my @bc = (
+	[ 'a join on an expression', q{SELECT o.id, cu.name FROM public.o JOIN public.cu ON cu.id = o.cust + 1 WHERE o.id < 300}, 0 ],
+	[ 'a join that is not an equality', q{SELECT o.id, cu.id FROM public.o JOIN public.cu ON cu.region < o.amount % 5 WHERE o.id < 20 AND cu.id < 20}, 0 ],
+	[ 'a join on columns that are not the keys, for two tables of one colocation group', q{SELECT o.id, it.id FROM public.o JOIN public.it ON it.sku = o.amount % 13 WHERE o.id < 50 AND it.id < 50}, 0 ],
+	[ 'an equality of two columns that are not keys', q{SELECT o.id, it.id FROM public.o JOIN public.it ON it.sku = o.amount WHERE o.id < 300 AND it.id < 300}, 0 ],
+	[ 'a LEFT JOIN: the nullable table is sent whole', q{SELECT o.id, cu.name FROM public.o LEFT JOIN public.cu ON cu.id = o.cust WHERE o.id < 200}, 0 ],
+	[ 'a LEFT JOIN: a condition of the ON clause on the nullable table', q{SELECT o.id, cu.name FROM public.o LEFT JOIN public.cu ON cu.id = o.cust AND cu.region = 2 WHERE o.id < 200}, 0 ],
+	[ 'a LEFT JOIN: a condition of the ON clause on the preserved table (it decides the NULLs, not the rows)', q{SELECT o.id, o.amount, cu.name FROM public.o LEFT JOIN public.cu ON cu.id = o.cust AND o.amount > 50 WHERE o.id < 200}, 0 ],
+	[ 'a LEFT JOIN: nothing matches', q{SELECT o.id, cu.name FROM public.o LEFT JOIN public.cu ON cu.id = o.cust AND cu.region = 9 WHERE o.id < 100}, 0 ],
+	[ 'a LEFT JOIN: on an expression, a count of the matches', q{SELECT o.note, count(cu.id) FROM public.o LEFT JOIN public.cu ON cu.id = o.cust + 1 GROUP BY o.note ORDER BY 1}, 1 ],
+	[ 'a LEFT JOIN: on an inequality, the other table is empty', q{SELECT o.id, cu.id FROM public.o LEFT JOIN public.cu ON cu.id < o.amount AND cu.id < 0 WHERE o.id < 50}, 0 ],
+	[ 'a LEFT JOIN: the preserved table has NULL in the column of the condition', q{SELECT o.id, o.cust, cu.id FROM public.o LEFT JOIN public.cu ON cu.region = o.cust % 5 WHERE o.id < 40}, 0 ],
+	[ 'a count of the pairs', q{SELECT count(*) FROM public.o JOIN public.cu ON cu.region = o.amount % 5}, 0 ],
+	[ 'a sum and a count by a column of the broadcast table', q{SELECT cu.region, sum(o.amount), count(*) FROM public.o JOIN public.cu ON cu.id = o.cust + 1 GROUP BY cu.region ORDER BY 1}, 1 ],
+	[ 'an aggregate that is not split', q{SELECT cu.region, count(DISTINCT o.note) FROM public.o JOIN public.cu ON cu.id = o.cust + 1 GROUP BY cu.region ORDER BY 1}, 1 ],
+	[ 'three tables: two aligned, one sent whole', q{SELECT o.id, it.sku, cu.name FROM public.o JOIN public.it ON it.id = o.id JOIN public.cu ON cu.id = o.cust + 1 WHERE o.id < 300}, 0 ],
+	[ 'a reference table beside', q{SELECT o.id, rg.label, cu.name FROM public.o JOIN public.cu ON cu.id = o.cust + 1 JOIN public.rg ON rg.k = cu.region WHERE o.id < 300}, 0 ],
+	[ 'a sort and a limit', q{SELECT o.id, cu.name FROM public.o JOIN public.cu ON cu.id = o.cust + 1 ORDER BY o.amount DESC, o.id, cu.id LIMIT 15}, 1 ],
+	[ 'a restriction on the key of the table that stays prunes the groups', q{SELECT o.id, cu.name FROM public.o JOIN public.cu ON cu.id = o.cust + 1 WHERE o.id = 12}, 0 ],
+	[ 'a restriction on the other table', q{SELECT o.id, cu.name FROM public.o JOIN public.cu ON cu.id = o.cust + 1 WHERE cu.id = 17}, 0 ],
+	[ 'an empty table that stays', q{SELECT o.id, cu.name FROM public.o JOIN public.cu ON cu.id = o.cust + 1 WHERE o.id < 0}, 0 ],
+	[ 'an empty table that is sent whole', q{SELECT o.id, cu.name FROM public.o JOIN public.cu ON cu.id = o.cust + 1 WHERE cu.id < 0}, 0 ],
+	[ 'a window above', q{SELECT o.id, rank() OVER (PARTITION BY cu.region ORDER BY o.id) FROM public.o JOIN public.cu ON cu.id = o.cust + 1 WHERE o.id < 200}, 0 ],
+	[ 'a self join on a column that is not the key', q{SELECT x.id, y.id AS yid FROM public.o x JOIN public.o y ON y.amount = x.amount + 1 WHERE x.id < 40 AND y.id < 200}, 0 ],
+	# ty is the nullable table, so it is the one sent whole: every kind of value (quotes, a newline, NaN, infinity, binary data, NULL) travels as text
+	[ 'every kind of value travels whole', q{SELECT ty.*, cu.id AS cid FROM public.cu LEFT JOIN public.ty ON cu.id = ty.cust + 295 WHERE cu.id BETWEEN 298 AND 306}, 0 ],
+);
+for my $q (@bc)
+{
+	my ($name, $sql, $ordered) = @$q;
+	$c->compare("broadcast: $name", $sql, ordered => $ordered, plans => \@PLANS, profiles => 0, normalize => 1, path => [ $FS, $RJ ]);
+	like(plan_of($n1, $sql), qr/Repartition: \w+ $BC/, "broadcast: $name: EXPLAIN says which table is sent whole");
+}
+{
+	my $sql = q{SELECT o.id, cu.name FROM public.o JOIN public.cu ON cu.id = o.cust + 1 WHERE o.id < 300};
+	like(plan_of($n1, $sql), qr/Repartition: \w+ broadcast \(to 3 groups\)/, 'broadcast: three groups are named');
+	unlike(plan_of($n1, $sql, 'SET kingres_shard.enable_repartition_join = off; '), qr/\Q$RJ\E/, 'broadcast: off, no repartitioned join');
+	like(vplan($n1, $sql, 'SET kingres_shard.enable_repartition_join = off; '), qr/Repartition: not used: switched off/, '... and EXPLAIN VERBOSE says why');
+
+	# a table that can be routed is routed, not broadcast
+	my $r = q{SELECT o.id, cu.name FROM public.o JOIN public.cu ON cu.id = o.cust};
+	unlike(plan_of($n1, $r), qr/broadcast/, 'a table that can be routed by a key is routed, not broadcast');
+
+	# the bound: the whole of the broadcast table is the share of one group.  bg is about 1.6 MB, the setting at its smallest is 1 MB
+	table(q{CREATE TABLE public.bgb (id int PRIMARY KEY, cust int, pad text)},
+		q{; SELECT kingres.create_distributed_table('public.bgb', 'id', colocate_with => 'public.o')});
+	$c->on_both(q{INSERT INTO public.bgb SELECT g, 1 + g % 300, repeat('x', 400) FROM generate_series(1, 4000) g});
+	$c->on_every_node(q{ANALYZE});
+	$c->on_single(q{ANALYZE});
+	# only the nullable table of a LEFT JOIN can be sent whole, so bgb is the table that is sent here
+	my $big = q{SELECT cu.id, bgb.id, length(bgb.pad) FROM public.cu LEFT JOIN public.bgb ON bgb.cust = cu.id + 1 WHERE cu.id < 3};
+	like(plan_of($n1, $big), qr/Repartition: bgb broadcast/, 'broadcast: the big table is the one sent whole');
+	my ($rc, $out, $err) = run_sql($n1, 'SET kingres_shard.repartition_max_bytes = 1024; ' . $big);
+	isnt($rc, 0, 'broadcast: the share of a group above repartition_max_bytes: an error, never a wrong answer');
+	like($err, qr/repartition_max_bytes/, '... which names the setting');
+	my ($rs0, $os0) = run_sql($c->single, $big);
+	($rc, $out, $err) = run_sql($n1, $big);
+	is($rc, 0, 'broadcast: with the default bound the same statement runs') or diag($err);
+	is(join("\n", sort split /\n/, $out), join("\n", sort split /\n/, $os0), '... with the single node\'s answer');
+	# by cost, a broadcast of more than half the bound is not chosen
+	($rc, $out, $err) = run_sql($n1, "SET kingres_shard.enable_repartition_join = on; SET kingres_shard.repartition_max_bytes = 1024; EXPLAIN (COSTS OFF) $big");
+	is($rc, 0, 'broadcast: by cost a side above half the bound is not chosen: the statement is planned') or diag($err);
+	unlike($out, qr/Repartition: bgb broadcast/, '... and bgb is not sent whole');
+
+	my $G = 'SET plan_cache_mode = force_generic_plan; ';
+	my $pre = q{PREPARE bp(int, int) AS SELECT o.id, cu.name FROM public.o JOIN public.cu ON cu.id = o.cust + 1 WHERE o.amount > $1 AND cu.region = $2; };
+	my ($rs, $os) = run_sql($c->single, $pre . 'EXECUTE bp(50, 3)');
+	for my $nd (@nodes)
+	{
+		for my $mode ('', $G)
+		{
+			my ($rc2, $out2, $err2) = run_sql($nd, $mode . $pre . 'EXECUTE bp(50, 3)');
+			is($rc2, 0, 'a prepared broadcast join runs on ' . $nd->name . ($mode ? ' (generic plan)' : '')) or diag($err2);
+			is(join("\n", sort split /\n/, $out2), join("\n", sort split /\n/, $os), '... and its answer is the single node\'s');
+		}
+	}
+	($rc, $out, $err) = run_sql($n1, "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) $sql");
+	is($rc, 0, 'EXPLAIN ANALYZE of a broadcast join runs') or diag($err);
 }
 
 # ---------------------------------------------------------------------------

@@ -59,6 +59,7 @@ typedef struct KsRepartCand
 	int64		place;			/* its placement number */
 	List	   *dist_relids;	/* the anchored tables (relation OIDs): what the groups read */
 	int			nanchored;		/* the references to them in the statement */
+	bool		broadcast;		/* the relation is sent whole to every group: no key (key_attno is 0, key_type InvalidOid) */
 } KsRepartCand;
 
 /*
@@ -108,7 +109,7 @@ typedef struct KsRepartRows KsRepartRows;
 /*
  * Read the rows of the child plan to its end and sort them by the group that owns the bucket of
  * the key.  `cols` are the positions in the child's output (0-based) of the columns to ship, in
- * the order of the arrays; `keypos` the position of the key among them.  `groups` the groups whose
+ * the order of the arrays; `keypos` the position of the key among them, or -1 for a broadcast relation (every row goes to every group, whatever its columns hold).  `groups` the groups whose
  * rows are kept.  An error when the rows need more than the setting allows.
  */
 extern KsRepartRows *kingres_shard_repart_collect(PlanState *child, const KsColocation *coloc,

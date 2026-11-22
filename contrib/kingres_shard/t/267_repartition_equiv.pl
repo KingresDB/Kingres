@@ -5,7 +5,8 @@
 #
 # Phase 12 (design/analytics-phase12-queries.md, 14.2 "060_repartition_equiv"): a seeded, generated list of two-, three- and four-table
 # joins on columns that are not the distribution column, with the join types the repartitioned join accepts (inner joins, one LEFT JOIN to
-# the moved table), reference tables, aggregates, HAVING, order and limit.  The answer under each plan profile must be the single node's
+# the moved table, routed or sent whole to every group (broadcast: expressions, inequalities, columns that are not keys)), reference tables,
+# aggregates, HAVING, order and limit.  The answer under each plan profile must be the single node's
 # and the row-moving scan's: repartitioned (the switch is on "force"), repartitioned without the partial aggregation, with
 # enable_repartition_join = off, and the scan.  A fixed list of statements is checked to be planned as a repartitioned join, so that the
 # test cannot pass by never choosing the path; the generated list reports how many of its statements were repartitioned.
@@ -29,6 +30,13 @@ my $FS = 'Kingres Fragment Scan';
 my $RJ = 'Pushed: repartitioned join';
 
 sub table { my ($create, $dist) = @_; $c->on_cluster($create . ($dist // '')); $c->on_single($create); }
+
+sub plan_of
+{
+	my ($node, $sql) = @_;
+	my ($rc, $out, $err) = run_sql($node, "EXPLAIN (COSTS OFF) $sql");
+	return $rc == 0 ? $out : "ERROR: $err";
+}
 
 table(q{CREATE TABLE public.o (id int PRIMARY KEY, cust int, far int, amount int, note text, f float8)},
 	q{; SELECT kingres.create_distributed_table('public.o', 'id', bucket_count => 12)});
@@ -75,6 +83,25 @@ for my $f (@fixed)
 	$c->compare("fixed: $name", $sql, ordered => 0, plans => \@PLANS, profiles => 0, normalize => 1, path => [ $FS, $RJ ]);
 }
 
+# a table that has no key to be routed by is sent whole to every group (broadcast): a join on an expression, an inequality, a LEFT JOIN
+my @fixed_bc = (
+	[ 'an expression', q{SELECT o.id, cu.name FROM public.o JOIN public.cu ON cu.id = o.cust + 1} ],
+	[ 'an inequality', q{SELECT o.id, cu.id FROM public.o JOIN public.cu ON cu.region < o.amount % 5 WHERE o.id < 200} ],
+	[ 'a LEFT JOIN, the nullable table sent whole', q{SELECT o.id, cu.name FROM public.o LEFT JOIN public.cu ON cu.id = o.cust} ],
+	[ 'a LEFT JOIN with a condition on the preserved table', q{SELECT o.id, o.amount, cu.name FROM public.o LEFT JOIN public.cu ON cu.id = o.cust AND o.amount > 40} ],
+	[ 'two tables of one colocation group on other columns', q{SELECT o.id, it.id FROM public.o JOIN public.it ON it.sku = o.amount % 13 WHERE o.id < 200} ],
+	[ 'three tables, one sent whole', q{SELECT o.id, it.sku, cu.name FROM public.o JOIN public.it ON it.id = o.id JOIN public.cu ON cu.id = o.cust + 1} ],
+	[ 'an aggregate', q{SELECT cu.region, count(*), sum(o.amount) FROM public.o JOIN public.cu ON cu.id = o.cust + 1 GROUP BY cu.region} ],
+	[ 'an aggregate without grouping', q{SELECT count(*), max(o.amount) FROM public.o JOIN public.cu ON cu.region = o.amount % 6} ],
+	[ 'a LEFT JOIN and an aggregate', q{SELECT o.note, count(cu.id) FROM public.o LEFT JOIN public.cu ON cu.id = o.cust + 1 GROUP BY o.note} ],
+);
+for my $f (@fixed_bc)
+{
+	my ($name, $sql) = @$f;
+	$c->compare("fixed broadcast: $name", $sql, ordered => 0, plans => \@PLANS, profiles => 0, normalize => 1, path => [ $FS, $RJ ]);
+	like(plan_of($nodes[0], $sql), qr/Repartition: \w+ broadcast \(to \d groups\)/, "fixed broadcast: $name: a table is sent whole");
+}
+
 # ---------------------------------------------------------------------------
 # the generated list
 # ---------------------------------------------------------------------------
@@ -114,22 +141,29 @@ my @shapes = (
 	[ 'rep:by_other',   "SELECT it.id, o.id, o.amount FROM public.it JOIN public.o ON o.id = it.ord WHERE ({po}) AND ({pi}){tail3}", 1, 1 ],
 	[ 'rep:by_other_agg', "SELECT it.sku, {agg_oc} FROM public.it JOIN public.o ON o.id = it.ord, public.cu WHERE cu.id = o.cust AND ({po}) AND ({pi}) GROUP BY it.sku {having}{tailg}", 1, 0 ],
 	# ---- the complete scan answers these: a repartitioned join must not change their answers
-	[ 'fall:two_left',  "SELECT o.id, cu.name FROM public.o LEFT JOIN public.cu ON cu.id = o.cust WHERE ({po}){tail2}", 1, 0 ],
 	[ 'fall:full',      "SELECT o.id, cu.id FROM public.o FULL JOIN public.cu ON cu.id = o.cust WHERE ({po}) OR ({pc}){tail2}", 1, 0 ],
-	[ 'fall:expr',      "SELECT o.id, cu.name FROM public.o JOIN public.cu ON cu.id = o.cust + 1 WHERE ({po}) AND ({pc}){tail2}", 1, 0 ],
-	[ 'fall:both_move', "SELECT o.id, it.id FROM public.o JOIN public.it ON it.sku = o.amount % 13 WHERE o.id < 60 AND it.id < 60{tail2}", 1, 0 ],
+	# ---- a table with no key to be routed by is sent whole to every group (broadcast)
+	[ 'bc:expr',        "SELECT o.id, cu.name, o.amount FROM public.o JOIN public.cu ON cu.id = o.cust + 1 WHERE ({po}) AND ({pc}){tail2}", 1, 1 ],
+	[ 'bc:theta',       "SELECT o.id, cu.id FROM public.o JOIN public.cu ON cu.region < o.amount % 5 WHERE ({po}) AND ({pc}) AND o.id < 120{tail2}", 1, 1 ],
+	[ 'bc:left',        "SELECT o.id, cu.name FROM public.o LEFT JOIN public.cu ON cu.id = o.cust AND ({pc}) WHERE ({po}){tail2}", 1, 1 ],
+	[ 'bc:left_expr',   "SELECT o.id, cu.name FROM public.o LEFT JOIN public.cu ON cu.id = o.cust + 1 WHERE ({po}){tail2}", 1, 1 ],
+	[ 'bc:left_pres',   "SELECT o.id, o.amount, cu.name FROM public.o LEFT JOIN public.cu ON cu.id = o.cust AND o.amount > 40 WHERE ({po}){tail2}", 1, 1 ],
+	[ 'bc:left_agg',    "SELECT o.note, count(cu.id), count(*) FROM public.o LEFT JOIN public.cu ON cu.id = o.cust + 1 WHERE ({po}) GROUP BY o.note {having}{tailg}", 1, 1 ],
+	[ 'bc:both',        "SELECT o.id, it.id FROM public.o JOIN public.it ON it.sku = o.amount % 13 WHERE o.id < 60 AND ({pi}) AND it.id < 60{tail2}", 1, 1 ],
+	[ 'bc:agg',         "SELECT cu.region, {agg_oc} FROM public.o JOIN public.cu ON cu.id = o.cust + 1 WHERE ({po}) AND ({pc}) GROUP BY cu.region {having}{tailg}", 1, 1 ],
+	[ 'bc:agg_all',     "SELECT {agg_oc} FROM public.o JOIN public.cu ON cu.region = o.amount % 6 WHERE ({po}) AND ({pc})", 0, 1 ],
+	[ 'bc:three',       "SELECT o.id, it.sku, cu.name FROM public.o JOIN public.it ON it.id = o.id JOIN public.cu ON cu.id = o.cust + 1 WHERE ({po}) AND ({pi}) AND ({pc}){tail3}", 1, 1 ],
+	[ 'bc:ref',         "SELECT o.id, rg.label, cu.name FROM public.o JOIN public.cu ON cu.id = o.cust + 1 JOIN public.rg ON rg.k = cu.region WHERE ({po}) AND ({pc})", 0, 1 ],
+	[ 'bc:self',        "SELECT x.id, y.id FROM public.o x JOIN public.o y ON y.amount = x.amount + 1 WHERE x.id < 60 AND y.id < 300{tail2}", 1, 1 ],
+	[ 'bc:other_group', "SELECT o.id, fr.w FROM public.o JOIN public.fr ON fr.w = o.amount % 9 WHERE ({po}) AND ({pf}){tail2}", 1, 1 ],
+	# ---- the tables that stay are not aligned with each other: the complete scan answers
+	[ 'fall:unaligned', "SELECT o.id, it.id, cu.id FROM public.o CROSS JOIN public.it LEFT JOIN public.cu ON cu.id = o.cust WHERE o.id < 20 AND it.id < 20{tail3}", 1, 0 ],
 	[ 'rep:window',      "SELECT o.id, rank() OVER (PARTITION BY cu.region ORDER BY o.id) FROM public.o JOIN public.cu ON cu.id = o.cust WHERE o.id < 200 AND ({pc}) ORDER BY 1", 1, 1 ],
 );
 my @templates = map { { name => $_->[0], sql => $_->[1], ordered => 0, slots => \%SLOTS, rep => $_->[3] } } @shapes;
 my $g = $c->generator(templates => \@templates);
 my $COUNT = $ENV{KS_COUNT} // 150;
 
-sub plan_of
-{
-	my ($node, $sql) = @_;
-	my ($rc, $out, $err) = run_sql($node, "EXPLAIN (COSTS OFF) $sql");
-	return $rc == 0 ? $out : "ERROR: $err";
-}
 my %rep_of = map { $_->[0] => $_->[3] } @shapes;
 my (%n, %repartitioned);
 my $i = 0;

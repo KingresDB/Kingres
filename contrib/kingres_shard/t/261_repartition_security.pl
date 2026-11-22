@@ -143,4 +143,86 @@ for my $f (@forged)
 isnt($rc, 0, 'E: a placement that is not the group\'s is refused');
 like($err, qr/KS001|bucket map of this node is not the one/, '... as a stale map, which a repeat can cure') or diag($err);
 
+# F: a relation that is sent whole to every group (broadcast, J2).  The group cannot tell it from a routed one and does not need to: it
+# is the same sub-select over unnest of text[] parameters, counted by rp=<n>.  What the group does check, and what a broadcast needs
+# more than a routed relation: the tables that stay are aligned with each other, and the sent relation is not a table of the group's.
+$n1->safe_psql('postgres', q{
+	CREATE TABLE public.it (id int PRIMARY KEY, ord int);
+	SELECT kingres.create_distributed_table('public.it', 'id', colocate_with => 'public.o');
+	INSERT INTO public.it SELECT g, g % 50 FROM generate_series(1, 300) g;
+});
+$_->safe_psql('postgres', 'ANALYZE') for ($n1, $n2);
+($rc, my $bplan, $err) = run_sql($n1, q{EXPLAIN (VERBOSE, COSTS OFF) SELECT o.id, cu.name FROM public.o LEFT JOIN public.cu ON cu.id = o.cust + 1});
+my ($btext) = $bplan =~ /Remote SQL: (.*)$/m;
+ok(defined $btext && $bplan =~ /Repartition: cu broadcast/, 'F: the statement is planned with cu sent whole') or diag($bplan . $err);
+like($btext, qr/UNNEST\(\$1, \$2\) u\(c1, c2\)/, 'F: the text has the sent table as a sub-select over unnest of two array parameters') or diag($btext);
+$btext =~ s/UNNEST\(\$1, \$2\)/UNNEST(\$1::text[], \$2::text[])/ or die 'the shape of the text changed';
+my $bids = '{1,2,3,4,5,6,7,8,9,10,11,12}';
+my $bnames = '{a,b,c,d,e,f,g,h,i,j,k,l}';
+
+($rc, $out, $err) = as_node($n2, 2, fragment(' rp=1', $btext, $bids, $bnames));
+is($rc, 0, 'F: the broadcast text with its marker and its arrays runs on a group') or diag($err);
+($rc, $out, $err) = as_node($n2, 2, fragment('', $btext, $bids, $bnames));
+isnt($rc, 0, 'F: a broadcast text with a marker without rp is refused');
+unlike($err, qr/KS001/, '... not as a stale map');
+($rc, $out, $err) = as_node($n2, 2, fragment(' rp=2', $btext, $bids, $bnames));
+isnt($rc, 0, 'F: rp=2 on a text with one sent table is refused');
+unlike($err, qr/KS001/, '... not as a stale map');
+($rc, $out, $err) = as_node($n2, 2, fragment(' rp=0', $btext, $bids, $bnames));
+isnt($rc, 0, 'F: rp=0 is not a valid marker');
+($rc, $out, $err) = as_node($n2, 2, fragment(' rp=1', q{SELECT o.id, o.amount FROM public.o WHERE o.amount > 3}));
+isnt($rc, 0, 'F: rp=1 on a text without a sent table is refused');
+unlike($err, qr/KS001/, '... not as a stale map');
+
+# the sent table replaced by sub-selects that read something else
+for my $f (@forged)
+{
+	my ($name, $sub, $nargs) = @$f;
+	my $body = "SELECT o.id, cu.name FROM public.o LEFT JOIN ($sub) cu ON cu.id = o.cust + 1";
+	my @args = ($bids, $bnames)[0 .. $nargs - 1];
+	($rc, $out, $err) = as_node($n2, 2, fragment(' rp=1', $body, @args));
+	isnt($rc, 0, "F: $name, as a table sent whole: refused");
+	unlike($err, qr/KS001/, '... not as a stale map');
+}
+
+# the tables that stay must be aligned with each other: a text that joins two distributed tables without their keys, beside a sent
+# table, would be a join of rows that are on different groups (the origin never makes such a text; a forged one is refused)
+my $unaligned = "SELECT o.id, it.id FROM public.o, public.it, (SELECT u.c1::int AS id, u.c2 AS name FROM UNNEST(\$1::text[], \$2::text[]) u(c1, c2)) cu WHERE cu.id < o.amount";
+($rc, $out, $err) = as_node($n2, 2, fragment(' rp=1', $unaligned, $bids, $bnames));
+isnt($rc, 0, 'F: two distributed tables that are not joined on their keys, beside a sent table: refused');
+unlike($err, qr/KS001/, '... not as a stale map');
+my $aligned = "SELECT o.id, it.id FROM public.o, public.it, (SELECT u.c1::int AS id, u.c2 AS name FROM UNNEST(\$1::text[], \$2::text[]) u(c1, c2)) cu WHERE it.id = o.id AND cu.id < o.amount";
+($rc, $out, $err) = as_node($n2, 2, fragment(' rp=1', $aligned, $bids, $bnames));
+is($rc, 0, 'F: the same text with the two tables joined on their keys runs') or diag($err);
+
+# the sent table is the only relation: nothing of the group is read, the text returns the rows that its sender gave it (harmless: it is
+# not a way to read anything)
+($rc, $out, $err) = as_node($n2, 2, fragment(' rp=1', "SELECT cu.id FROM (SELECT u.c1::int AS id, u.c2 AS name FROM UNNEST(\$1::text[], \$2::text[]) u(c1, c2)) cu", $bids, $bnames));
+is($rc, 0, 'F: a text with a sent table and no table of the group reads nothing of the group and returns what it was given') or diag($err);
+
+# the sent table on the preserved side of an outer join would be emitted once by every group
+($rc, $out, $err) = as_node($n2, 2, fragment(' rp=1', "SELECT o.id, cu.name FROM (SELECT u.c1::int AS id, u.c2 AS name FROM UNNEST(\$1::text[], \$2::text[]) u(c1, c2)) cu LEFT JOIN public.o ON cu.id = o.cust + 1", $bids, $bnames));
+isnt($rc, 0, 'F: a sent table on the preserved side of a LEFT JOIN is refused');
+unlike($err, qr/KS001/, '... not as a stale map');
+
+($rc, $out, $err) = as_node($n2, 2, "/* kingres:query-fragment place=1 rp=1 */ DECLARE ks_f NO SCROLL CURSOR FOR $btext\n\\bind '$bids' '$bnames' \\g");
+isnt($rc, 0, 'F: a placement that is not the group\'s is refused');
+like($err, qr/KS001|bucket map of this node is not the one/, '... as a stale map, which a repeat can cure') or diag($err);
+
+# the first step of a partial aggregation over a statement with a sent table: the same rules, and the marker has rp too
+($rc, my $bpplan, $err) = run_sql($n1, q{EXPLAIN (VERBOSE, COSTS OFF) SELECT o.amount, count(cu.id) FROM public.o LEFT JOIN public.cu ON cu.id = o.cust + 1 GROUP BY o.amount});
+my ($bptext) = $bpplan =~ /Remote SQL: (.*)$/m;
+ok(defined $bptext && $bpplan =~ /partial aggregate/ && $bpplan =~ /Repartition: cu broadcast/, 'F: the grouped aggregate is a partial aggregation with cu sent whole') or diag($bpplan . $err);
+# only cu.id is needed above the join here, so one array is shipped: unnest($1) u(c1)
+my @bpargs = ($bids);
+$bptext =~ s/\bunnest\(\$1\) u\(c1\)/unnest(\$1::text[]) u(c1)/ or die "the shape of the text changed: $bptext";
+($rc, $out, $err) = as_node($n2, 2, pfragment(' rp=1', $bptext, @bpargs));
+is($rc, 0, 'F: the partial text with its marker and its arrays runs on a group') or diag($err . $bptext);
+($rc, $out, $err) = as_node($n2, 2, pfragment('', $bptext, @bpargs));
+isnt($rc, 0, 'F: a partial text with a sent table and a marker without rp is refused');
+unlike($err, qr/KS001/, '... not as a stale map');
+($rc, $out, $err) = as_node($n2, 2, pfragment(' rp=2', $bptext, @bpargs));
+isnt($rc, 0, 'F: rp=2 on a partial text with one sent table is refused');
+unlike($err, qr/KS001/, '... not as a stale map');
+
 done_testing();

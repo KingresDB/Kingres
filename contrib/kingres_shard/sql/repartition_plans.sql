@@ -79,6 +79,20 @@ SELECT pushed('SELECT o.id, far.w FROM o JOIN far ON far.id = o.cust');
 \echo -- a LEFT JOIN to the moved table
 SELECT * FROM plan_of('SELECT cu.id, o.id FROM cu LEFT JOIN o ON o.cust = cu.id');
 
+\echo -- a table with no column to be routed by is sent whole to every group (broadcast): an expression, an inequality, columns that are not keys
+SELECT * FROM plan_of('SELECT o.id, cu.name FROM o JOIN cu ON cu.id = o.cust + 1');
+SELECT pushed('SELECT o.id, cu.id FROM o JOIN cu ON cu.region < o.amount');
+SELECT pushed('SELECT o.id, it.id FROM o JOIN it ON it.sku = o.amount');
+\echo -- a LEFT JOIN: only the nullable table can be sent whole; a table that can be routed is routed
+SELECT * FROM plan_of('SELECT o.id, cu.name FROM o LEFT JOIN cu ON cu.id = o.cust');
+SELECT pushed('SELECT o.id, cu.name FROM o LEFT JOIN cu ON cu.id = o.cust + 1 AND o.amount > 3');
+\echo -- three tables, two aligned, one sent whole; a reference table beside
+SELECT pushed('SELECT o.id, it.sku, cu.name FROM o JOIN it ON it.id = o.id JOIN cu ON cu.id = o.cust + 1');
+SELECT pushed('SELECT o.id, r.label, cu.name FROM o JOIN cu ON cu.id = o.cust + 1 JOIN r ON r.k = cu.region');
+\echo -- an aggregate above a broadcast join
+SELECT * FROM plan_of('SELECT cu.region, count(*), sum(o.amount) FROM o JOIN cu ON cu.id = o.cust + 1 GROUP BY cu.region');
+
+
 -- ---------------------------------------------------------------------------
 -- Aggregates above the join: every group aggregates its rows of the join, this node combines
 -- ---------------------------------------------------------------------------
@@ -116,13 +130,9 @@ SET client_min_messages = debug1;
 \echo -- an outer join other than one LEFT JOIN to a table
 SELECT pushed('SELECT o.id, cu.name FROM o FULL JOIN cu ON cu.id = o.cust');
 SELECT pushed('SELECT cu.id, o.id FROM cu LEFT JOIN o ON o.cust = cu.id LEFT JOIN it ON it.id = cu.id');
-\echo -- the moved table would be the preserved side
-SELECT pushed('SELECT o.id, cu.name FROM o LEFT JOIN cu ON cu.id = o.cust');
-\echo -- a join on an expression, a join that is not an equality
-SELECT pushed('SELECT o.id, cu.name FROM o JOIN cu ON cu.id = o.cust + 1');
-SELECT pushed('SELECT o.id, cu.id FROM o JOIN cu ON cu.region < o.amount');
-\echo -- two tables that would both have to move
-SELECT pushed('SELECT o.id, it.id FROM o JOIN it ON it.sku = o.amount');
+\echo -- the tables that stay are not aligned with each other: a broadcast needs them aligned
+SELECT pushed('SELECT o.id, it.id, cu.id FROM o CROSS JOIN it LEFT JOIN cu ON cu.id = o.cust');
+SELECT pushed('SELECT o.id, it.id, cu.id FROM o, it, cu');
 \echo -- the ON clause of a LEFT JOIN does not align the tables that stay with each other
 SELECT pushed('SELECT o.id, it.id, cu.id FROM o CROSS JOIN it LEFT JOIN cu ON cu.region = o.id AND cu.region = it.id');
 SELECT pushed('SELECT o.id, it.id, cu.id FROM o CROSS JOIN it LEFT JOIN cu ON o.id = it.id AND cu.region = o.id');
@@ -140,9 +150,9 @@ SELECT why('SELECT o.id, cu.name FROM o FULL JOIN cu ON cu.id = o.cust');
 SELECT why('SELECT cu.id, o.id FROM cu LEFT JOIN o ON o.cust = cu.id LEFT JOIN it ON it.id = cu.id');
 \echo -- a statement planned after one that had a reason does not inherit it (a local table beside a distributed one, on the other group)
 SELECT id, why('SELECT o.id, plain.y FROM o JOIN plain ON plain.x = o.id WHERE o.id = ' || id) FROM generate_series(1, 6) id;
-SELECT why('SELECT o.id, cu.name FROM o LEFT JOIN cu ON cu.id = o.cust');
+SELECT why('SELECT o.id, it.id, cu.id FROM o CROSS JOIN it LEFT JOIN cu ON cu.id = o.cust');
+SELECT why('SELECT o.id, it.id, cu.id FROM o, it, cu');
 SELECT why('SELECT o.id, cu.name FROM o JOIN cu ON cu.id = o.cust + 1');
-SELECT why('SELECT o.id, it.id FROM o JOIN it ON it.sku = o.amount');
 SELECT why('SELECT o.id, plain.y FROM o JOIN plain ON plain.x = o.cust');
 \echo -- the setting is off; a small bound, where the scan is cheaper by cost
 SET kingres_shard.enable_repartition_join = off;

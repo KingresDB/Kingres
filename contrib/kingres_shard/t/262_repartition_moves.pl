@@ -58,6 +58,10 @@ isnt($CC, $CO, 'cu is in a colocation group of its own, so is fr');
 my $SJ = q{SELECT o.id, cu.name FROM public.o JOIN public.cu ON cu.id = o.cust};
 my $SA = q{SELECT cu.region, count(*), sum(o.amount) FROM public.o JOIN public.cu ON cu.id = o.cust GROUP BY cu.region};
 my $SF = q{SELECT o.id, fr.w FROM public.o JOIN public.fr ON fr.id = o.far};
+# J2: cu has no column that o is joined by on its key, so it is sent whole to every group (broadcast); o stays
+my $SB = q{SELECT o.id, cu.name FROM public.o LEFT JOIN public.cu ON cu.id = o.cust + 1};
+my $SBA = q{SELECT (o.amount % 7) AS k, count(cu.id), count(*) FROM public.o LEFT JOIN public.cu ON cu.id = o.cust + 1 GROUP BY 1};
+my %SQL = (join => $SJ, agg => $SA, far => $SF, bcast => $SB, bcagg => $SBA);
 
 sub plan_of
 {
@@ -95,7 +99,7 @@ sub clean_nodes
 # A. nothing happens
 # ---------------------------------------------------------------------------
 my %WANT;
-for my $q ([ join => $SJ ], [ agg => $SA ], [ far => $SF ])
+for my $q ([ join => $SJ ], [ agg => $SA ], [ far => $SF ], [ bcast => $SB ], [ bcagg => $SBA ])
 {
 	my ($name, $sql) = @$q;
 	like(plan_of($n1, $sql), qr/\Q$RJ\E/, "A: $name is repartitioned");
@@ -121,7 +125,7 @@ sub rule
 sub all_three
 {
 	my ($label) = @_;
-	for my $q ([ join => $SJ ], [ agg => $SA ], [ far => $SF ])
+	for my $q ([ join => $SJ ], [ agg => $SA ], [ far => $SF ], [ bcast => $SB ], [ bcagg => $SBA ])
 	{
 		my ($name, $sql) = @$q;
 		for my $n (@nodes)
@@ -201,9 +205,9 @@ sub move_target
 
 for my $point (qw(rp_after_ship rp_before_fragment))
 {
-	for my $name (qw(join agg))
+	for my $name (qw(join agg bcast bcagg))
 	{
-		my $sql = $name eq 'join' ? $SJ : $SA;
+		my $sql = $SQL{$name};
 		my ($rc, $out, $err) = run_sql($n1, "SET kingres_shard.fault_injection = '$point:error'; $sql");
 		isnt($rc, 0, "C: an error at $point fails the $name");
 		like($err, qr/injected failure at \Q$point\E/, '... with that error (the point was reached)');
@@ -240,6 +244,18 @@ for my $point (qw(rp_after_ship rp_before_fragment))
 		else { is($got, $WANT{$name}, "C: a move of $label that commits at $point: the statement was right"); }
 		my ($rc2, $g2, $e2) = answer($n1, $sql);
 		is($g2, $WANT{$name}, "C: the statement repeated gives the baseline after the move of $label") or diag($e2);
+	}
+	# the broadcast statement: a move of the group of the table that stays (o) or of the table that is sent (cu)
+	for my $mv ([ 'the group of the table that stays (o), broadcast', $CO ], [ 'the group of the table that is sent (cu), broadcast', $CC ])
+	{
+		my ($label, $coloc) = @$mv;
+		my ($bk, $dst) = move_target($coloc, $i++);
+		my ($got, $err, $me) = gate_run($point, $SB, sub { start_psql($n1, "SELECT kingres.move_bucket($coloc, $bk, $dst)") }, "mvb${coloc}_$point");
+		unlike($me, qr/ERROR/, "C: the move of bucket $bk of $label completes") or diag($me);
+		if ($err =~ /ERROR/) { like($err, $KS, "C: a move of $label that commits at $point: the retryable error, no rows"); }
+		else { is($got, $WANT{bcast}, "C: a move of $label that commits at $point: the statement was right"); }
+		my ($rc2, $g2, $e2) = answer($n1, $SB);
+		is($g2, $WANT{bcast}, "C: the broadcast statement repeated gives the baseline after the move of $label") or diag($e2);
 	}
 	# a split that commits there
 	my ($bk) = (active_buckets($CC))[0] =~ /^(\d+):/;
@@ -278,7 +294,7 @@ clean_nodes('C: at the end');
 	my $round = 0;
 	while (time - $t0 < 120 && waitpid($pid, POSIX::WNOHANG()) == 0)
 	{
-		for my $q ([ join => $SJ ], [ agg => $SA ], [ far => $SF ])
+		for my $q ([ join => $SJ ], [ agg => $SA ], [ far => $SF ], [ bcast => $SB ], [ bcagg => $SBA ])
 		{
 			my ($name, $sql) = @$q;
 			for my $n (@nodes)
@@ -315,7 +331,7 @@ clean_nodes('C: at the end');
 	my ($bk, $dst) = move_target($CC, 1);
 	my $mover = start_psql($n1, "SELECT kingres.move_bucket($CC, $bk, $dst)");
 	sleep(3);
-	for my $q ([ join => $SJ ], [ agg => $SA ])
+	for my $q ([ join => $SJ ], [ agg => $SA ], [ bcast => $SB ])
 	{
 		my ($name, $sql) = @$q;
 		my ($rc, $got, $err) = answer($n1, $sql);
