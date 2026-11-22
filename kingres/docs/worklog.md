@@ -7,6 +7,24 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-22: phase 12, the sharding extension: the fixes of the independent review of 0.9 (P12S-01 to P12S-06)
+
+The review is in [reviews/2026-11-22-kingres-shard-0.9-storage.md](reviews/2026-11-22-kingres-shard-0.9-storage.md), with a Fixes section.
+
+### What was done
+
+- **P12S-01** the sketch is looked up only for a rewritable count(DISTINCT) and only when the role has USAGE on its schema and EXECUTE on the aggregate; otherwise the statement is exact with one warning.
+- **P12S-02** both settings drop the cached plans when they change.
+- **P12S-03** the options of columnar_set_options are carried by distribution, rebuilds, undistribute and moves (the bucket partition and the leaves).
+- **P12S-04** the confirmation after PREPARE is skipped only for the node that add_node is adding.
+- **P12S-05** every relation of a bucket is checked, not the first (a second table access method over the heap handler makes it testable).
+- **P12S-06** tests for the oid types and for one shard group.
+
+### How it was verified
+
+- A new or extended test for each, each with a one-line mutant that it kills (t/270, 271, 273, 274, 275).
+- The full suite on both majors is in the Gate section below.
+
 ## 2026-11-22: phase 12, the sharding extension: columnar tables in kingres_shard 0.9, the explicit refusal of ledger tables, and approximate count(DISTINCT)
 
 Covers branch p12-storage (from p12f-fix, kingres_shard 0.8 with the review fixes of step 12).  Version 0.9 is new: the other writer of kingres_shard (shard-p12) adds no SQL object and stays at 0.8, so the integrator merges the two and resolves the version.
