@@ -122,7 +122,7 @@ func readFacts(ctx context.Context, tx pgx.Tx, schema, table string) (tableFacts
 	var f tableFacts
 	rel := qualified(schema, table)
 	err := tx.QueryRow(ctx, `SELECT c.relkind::text, c.relispartition, c.relrowsecurity,
-			pg_catalog.pg_has_role(current_user, c.relowner, 'USAGE'),
+			c.relowner = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = current_user),
 			(SELECT rolbypassrls OR rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user),
 			coalesce((SELECT am.amname = 'columnar' FROM pg_catalog.pg_am am WHERE am.oid = c.relam), false),
 			CASE WHEN c.relkind IN ('r', 'p', 'm') THEN pg_catalog.pg_total_relation_size(c.oid) ELSE 0 END,
@@ -136,7 +136,7 @@ func readFacts(ctx context.Context, tx pgx.Tx, schema, table string) (tableFacts
 	}
 	f.Exists = true
 	rows, err := tx.Query(ctx, `SELECT a.attname::text, a.attgenerated::text <> '', a.attgenerated::text = 'v',
-			(t.typtype = 'e' OR t.typcategory = 'S' OR (t.typtype = 'd' AND bt.typcategory = 'S')),
+			(t.typtype = 'e' OR t.typcategory = 'S' OR t.typname = 'xml' OR (t.typtype = 'd' AND (bt.typcategory = 'S' OR bt.typname = 'xml'))),
 			pg_catalog.has_column_privilege(a.attrelid, a.attnum, 'SELECT')
 		FROM pg_catalog.pg_attribute a
 		JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
@@ -337,6 +337,8 @@ func (o *Ops) StartExport(ctx context.Context, actor, db, schema, table string, 
 	if err := o.roleChecker().Check(ctx, who); err != nil {
 		return task.Task{}, transfer.SafeError(err).Problem()
 	}
+	o.startMu.Lock()
+	defer o.startMu.Unlock()
 	if err := o.concurrency(ctx, st, actor); err != nil {
 		return task.Task{}, err
 	}
@@ -416,8 +418,7 @@ func (o *Ops) StartExport(ctx context.Context, actor, db, schema, table string, 
 	}
 	failRecord := func(e error) (task.Task, error) {
 		x.forget(id)
-		failed, zero := transfer.StateFailed, int64(0)
-		_ = rs.Apply(context.WithoutCancel(ctx), id, transfer.Update{State: &failed, ReservedBytes: &zero})
+		_ = rs.Remove(context.WithoutCancel(ctx), id)
 		return task.Task{}, e
 	}
 	res, err := x.store.Reserve(id, who.Name, est)
@@ -556,7 +557,6 @@ func (o *Ops) loadExport(ctx context.Context, env *task.Env) (exportParams, tran
 		return p, rec, x, transfer.Errorf(transfer.CodeLeaderChanged, true, "the file of the export is not known to this server; repeat the operation")
 	}
 	if rec.ServerID != o.ServerHost || rec.State != transfer.StateBuilding {
-		o.setLost(ctx, rec.ID)
 		return p, rec, x, transfer.Errorf(transfer.CodeLeaderChanged, true, "the leader changed while the export was running; repeat the operation")
 	}
 	if err := o.roleChecker().Check(ctx, rec.Owner); err != nil {
@@ -566,9 +566,36 @@ func (o *Ops) loadExport(ctx context.Context, env *task.Env) (exportParams, tran
 }
 
 func (o *Ops) stepExportCheck(ctx context.Context, env *task.Env) error {
-	p, _, _, err := o.loadExport(ctx, env)
+	p, rec, _, err := o.loadExport(ctx, env)
 	if err != nil {
 		return err
+	}
+	if err := o.stillEnabled(ctx); err != nil {
+		return err
+	}
+	// The checks of the request are made again: a function or a type may have been changed in the time the task waited (DX14-05).
+	conn, err := o.roleConn(ctx, p.Database, rec.Owner.Name)
+	if err != nil {
+		return transfer.Errorf(transfer.CodeSessionLost, true, "the role cannot connect to the database from this server now; repeat the operation")
+	}
+	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+	var foreign []string
+	var facts tableFacts
+	if err := inTx(ctx, conn, func(tx pgx.Tx) error {
+		var e error
+		if facts, e = readFacts(ctx, tx, p.Schema, p.Table); e != nil {
+			return e
+		}
+		if e = eligibleKind(p.Schema, p.Table, facts); e != nil {
+			return e
+		}
+		foreign, e = o.exportColumnsCheck(ctx, tx, p.Schema, p.Table, facts, p.Columns)
+		return e
+	}); err != nil {
+		return transfer.Errorf(transfer.CodeForbidden, false, "the table can no longer be exported as it was requested: %s", transfer.SafeError(err).Error())
+	}
+	if len(foreign) > 0 && !p.AckForeign && !facts.OwnerIsRole {
+		return transfer.Errorf(transfer.CodeForbidden, false, "a column of the table now runs a function owned by another role; request the export again")
 	}
 	return env.SetDetail(ctx, "transfer "+idText(p.TransferID))
 }

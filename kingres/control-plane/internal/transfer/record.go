@@ -256,3 +256,11 @@ func (rs Records) Reserved(ctx context.Context) (total int64, err error) {
 	})
 	return total, err
 }
+
+// Remove deletes the record of a transfer that was refused before it began (no file, no task); a refused request leaves nothing behind.
+func (rs Records) Remove(ctx context.Context, id int64) error {
+	return rs.Run(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, "DELETE FROM kingres_cp.data_transfer WHERE transfer_id = $1 AND state IN ('receiving', 'building')", id)
+		return err
+	})
+}

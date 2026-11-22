@@ -403,7 +403,11 @@ func (e *cp) startManager(t testing.TB) {
 	go func() { e.done <- run(ctx, e.args, noEnv, e.logs, ready) }()
 	select {
 	case addr := <-ready:
-		e.base = "http://" + addr + "/api/v1"
+		scheme := "http"
+		if strings.HasPrefix(e.base, "https") {
+			scheme = "https"
+		}
+		e.base = scheme + "://" + addr + "/api/v1"
 	case err := <-e.done:
 		t.Fatalf("kingresd exited early: %v\n%s", err, tail(e.logs.String(), 3000))
 	case <-time.After(60 * time.Second):

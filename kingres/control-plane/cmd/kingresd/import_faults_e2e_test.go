@@ -129,12 +129,58 @@ func TestImportLeaseLostBeforeTheIntent(t *testing.T) {
 	if done["state"] == "failed" && taskCode(done) == "import_outcome_unknown" {
 		t.Errorf("an unknown outcome was claimed although the commit was never sent: %v", done["error"])
 	}
-	if task := e.startImport(t, "db_xfer", "ll_t", map[string]any{"uploadId": uid, "header": "none"}); (task["state"] == "done") != (count(t, q, "ll_t") != "[[0]]") {
-		t.Errorf("the repeat: %v", task["error"])
+	// The task that took it over found no intent, loaded the rows once and is done; only a task that failed needs a repeat.
+	if done["state"] != "done" {
+		if task := e.startImport(t, "db_xfer", "ll_t", map[string]any{"uploadId": uid, "header": "none"}); task["state"] != "done" {
+			t.Errorf("the repeat: %v", task["error"])
+		}
 	}
-	if got := count(t, q, "ll_t"); got != "[[3]]" && got != "[[6]]" {
-		t.Errorf("rows after the repeat: %s", got)
-	} else if got == "[[6]]" {
-		t.Errorf("the rows were doubled: %s", got)
+	if got := count(t, q, "ll_t"); got != "[[3]]" {
+		t.Errorf("rows after the take-over or the repeat: %s", got)
+	}
+}
+
+// DX14-01: the process ends after COMMIT and before the step is recorded. The run that takes the task over finds the intent, asks the marker, and finishes the
+// task as done with exactly the rows that were committed; it never loads again and never claims that nothing was stored.
+func TestImportCrashAfterCommit(t *testing.T) {
+	e, off := transferOn(t)
+	defer off()
+	q := xferDB(t, e, "db_xfer")
+	q("create table if not exists public.ac_t (id int, v text)")
+	q("truncate public.ac_t")
+	uid := e.uploadFile(t, []byte("1,a\n2,b\n3,c\n"))
+	ops.ImportFault = func(p string, _ uint32) error {
+		if p == "afterCommit" {
+			ops.ImportFault = nil
+			return task.ErrLeaseLost
+		}
+		return nil
+	}
+	defer func() { ops.ImportFault = nil }()
+	st, out, _ := e.call("POST", "/databases/db_xfer/schemas/public/tables/ac_t/import", map[string]any{"uploadId": uid, "header": "none", "keepUpload": true}, nil)
+	if st != 202 {
+		t.Fatalf("%d %v", st, out)
+	}
+	deadline := time.Now().Add(3 * time.Minute)
+	var done map[string]any
+	for time.Now().Before(deadline) {
+		_, cur, _ := e.call("GET", "/tasks/"+fmt.Sprint(int64(out["id"].(float64))), nil, nil)
+		if cur["state"] == "failed" || cur["state"] == "done" {
+			done = cur
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if done == nil {
+		t.Fatal("the task did not end")
+	}
+	if done["state"] != "done" {
+		t.Fatalf("a commit that happened must end the task done, got %v", done["error"])
+	}
+	if got := count(t, q, "ac_t"); got != "[[3]]" {
+		t.Errorf("rows after the crash after COMMIT: %s", got)
+	}
+	if got := fmt.Sprint(q("select state, rows::text from kingres_transfer.import_marker")["rows"]); !strings.Contains(got, "committed 3") {
+		t.Errorf("marker: %s", got)
 	}
 }

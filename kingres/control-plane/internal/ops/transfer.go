@@ -134,6 +134,14 @@ func (o *Ops) openXfer(ctx context.Context) (*xferState, bool, error) {
 		return nil, false, problem.New(problem.ServiceUnavailable, "The master key of the data transfer cannot be used ("+transfer.CodeKeyLost+"); see the log of the server.").WithRetryAfter(60)
 	}
 	o.xferSt = &xferState{cfg: *cfg, store: store, keys: keys, res: map[int64]*staging.Reservation{}}
+	// The quota is the sum over the live files: those that exist when this process starts hold their room before the first request is answered.
+	if live, lerr := rs.OnServer(ctx, o.ServerHost); lerr == nil {
+		for _, r := range live {
+			if _, aerr := o.xferSt.reservation(r); aerr != nil {
+				o.Log.Warn("adopting the reservation of a staged file failed", "transfer", r.ID)
+			}
+		}
+	}
 	return o.xferSt, true, nil
 }
 
@@ -289,9 +297,7 @@ func (o *Ops) CreateUpload(ctx context.Context, actor string, req api.CreateData
 	fail := func(e error) (api.DataUpload, int64, error) {
 		x.forget(id)
 		_ = x.store.Remove(id)
-		failed := transfer.StateFailed
-		zero := int64(0)
-		_ = rs.Apply(context.WithoutCancel(ctx), id, transfer.Update{State: &failed, ReservedBytes: &zero})
+		_ = rs.Remove(context.WithoutCancel(ctx), id)
 		return api.DataUpload{}, 0, e
 	}
 	res, err := x.store.Reserve(id, who.Name, reserve)
@@ -422,7 +428,7 @@ func (o *Ops) GetUpload(ctx context.Context, actor, idText string) (api.DataUplo
 		return api.DataUpload{}, problem.New(problem.NotFound, "There is no such transfer.")
 	}
 	if rec.ServerID != o.ServerHost {
-		o.setLost(ctx, rec.ID)
+		// The file is on the server that was the leader. A poll does not decide for good: that server may be the leader again.
 		return api.DataUpload{}, problem.New(problem.NotFound, "There is no such transfer.")
 	}
 	v, err := o.uploadView(x, rec)
@@ -755,3 +761,23 @@ func (o *Ops) FinishDownload(ctx context.Context, id int64) {
 
 // String of an id for audit details.
 func idText(id int64) string { return fmt.Sprint(id) }
+
+// stillEnabled is the check of the setting that the first step of a task makes: turning dataTransfer.enabled off ends a task that has not begun to move data.
+// A task that is moving data is not stopped by it (cancel it).
+func (o *Ops) stillEnabled(ctx context.Context) error {
+	st, err := o.settings(ctx)
+	if err != nil {
+		return err
+	}
+	if !st.Enabled {
+		return transfer.Errorf(transfer.CodeForbidden, false, "the data transfer was turned off in the cluster settings")
+	}
+	return nil
+}
+
+// ReopenTransfer forgets the staging store and the reservations of this process, as a restart does; the next use opens it again and adopts the files. For tests.
+func (o *Ops) ReopenTransfer() {
+	o.xferMu.Lock()
+	o.xferSt = nil
+	o.xferMu.Unlock()
+}

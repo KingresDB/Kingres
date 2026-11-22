@@ -31,7 +31,7 @@ const (
 	stepICheckUpload = "Check the upload"
 	stepICheckTable  = "Check the table"
 	stepILoad        = "Load rows"
-	stepICommit      = "Commit"
+	stepICommit      = "Confirm the commit"
 	stepIClean       = "Clean up"
 )
 
@@ -65,45 +65,18 @@ type importParams struct {
 }
 
 // ImportFault is the fault point hook of the tests (nil in production): it is called with the name of a point of the commit protocol and the process id of
-// the backend of the import, so that a test can end the connection at that point. The points are "beforeIntent" and "afterIntent".
+// the backend of the import, so that a test can end the connection at that point. The points are "beforeStart" (the first step of the task, no connection), "beforeCheck" (the table check of the task, no connection), "beforeIntent", "intentWrite", "afterIntent" and "afterCommit".
 var ImportFault func(point string, backendPID uint32) error
 
-func importFault(point string, pl *pendingLoad) error {
+func importFault(point string, conn *pgx.Conn) error {
 	if ImportFault != nil {
-		return ImportFault(point, pl.conn.PgConn().PID())
+		var pid uint32
+		if conn != nil {
+			pid = conn.PgConn().PID()
+		}
+		return ImportFault(point, pid)
 	}
 	return nil
-}
-
-// pendingLoad is the open transaction between the step that loads and the step that commits. It lives in memory: a restart ends it with the
-// connection, which rolls the transaction back, and the step that commits then knows nothing was stored.
-type pendingLoad struct {
-	conn *pgx.Conn
-	tx   pgx.Tx
-	rows int64
-}
-
-func (o *Ops) setPending(id int64, p *pendingLoad) {
-	o.loadMu.Lock()
-	if o.loads == nil {
-		o.loads = map[int64]*pendingLoad{}
-	}
-	o.loads[id] = p
-	o.loadMu.Unlock()
-}
-
-func (o *Ops) takePending(id int64) *pendingLoad {
-	o.loadMu.Lock()
-	defer o.loadMu.Unlock()
-	p := o.loads[id]
-	delete(o.loads, id)
-	return p
-}
-
-func (p *pendingLoad) rollback(ctx context.Context) {
-	bg := context.WithoutCancel(ctx)
-	_ = p.tx.Rollback(bg)
-	_ = p.conn.Close(bg)
 }
 
 // ledgerPolicy reads, with the service role, the signature policy of a ledger table ("" when the table is not one).
@@ -242,6 +215,9 @@ func (o *Ops) StartImport(ctx context.Context, actor, db, schema, table string, 
 	default:
 		errs = append(errs, field("/header", "must be none, skip or match", "unknown_value"))
 	}
+	if req.SkipBOM != nil && *req.SkipBOM && csv.Encoding != "UTF8" {
+		errs = append(errs, field("/skipBom", "removes a UTF-8 byte order mark and needs the encoding UTF8", "conflict"))
+	}
 	var gz *bool
 	switch req.Compression {
 	case "":
@@ -304,7 +280,13 @@ func (o *Ops) StartImport(ctx context.Context, actor, db, schema, table string, 
 	if up.SizeBytes != nil {
 		size = *up.SizeBytes
 	}
-	if size > cap && (gz == nil || !*gz) {
+	plain := gz == nil || !*gz
+	if gz == nil {
+		if x, xerr := o.xfer(ctx); xerr == nil {
+			plain = !o.isGzip(x, up)
+		}
+	}
+	if size > cap && plain {
 		return task.Task{}, problem.New(problem.ImportTooLarge, "The file is larger than "+strconv.FormatInt(cap, 10)+" bytes; split the file into parts of at most that size and import them one after the other.")
 	}
 	policy, err := o.ledgerPolicy(ctx, db, schema, table)
@@ -314,6 +296,8 @@ func (o *Ops) StartImport(ctx context.Context, actor, db, schema, table string, 
 	if policy == "required" {
 		return task.Task{}, problem.New(problem.ImportLedgerPolicy, "The table is a ledger table whose signature policy is required: an unsigned write is refused (KL010), so the first row would fail.")
 	}
+	o.startMu.Lock()
+	defer o.startMu.Unlock()
 	if err := o.concurrency(ctx, st, actor); err != nil {
 		return task.Task{}, err
 	}
@@ -322,6 +306,9 @@ func (o *Ops) StartImport(ctx context.Context, actor, db, schema, table string, 
 		return task.Task{}, err
 	}
 	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+	if err := refuseDangerousRole(ctx, conn); err != nil {
+		return task.Task{}, problem.New(problem.Forbidden, "An import runs the triggers, defaults and checks of the table as the signed-in role, so it is refused for a role with the SUPERUSER, REPLICATION or BYPASSRLS attribute or with access to server files, programs or logs; sign in as another role.")
+	}
 	cols, types, err := o.importTarget(ctx, conn, schema, table, req.Columns, class)
 	if err != nil {
 		return task.Task{}, err
@@ -335,7 +322,7 @@ func (o *Ops) StartImport(ctx context.Context, actor, db, schema, table string, 
 			return task.Task{}, problem.Validation("The import request is invalid.", field("/forceNotNull", "names a column that is not loaded", "not_found"))
 		}
 	}
-	skipBOM := req.SkipBOM == nil || *req.SkipBOM
+	skipBOM := (req.SkipBOM == nil || *req.SkipBOM) && csv.Encoding == "UTF8"
 	if _, err := transfer.CopyFromSQL(schema, table, cols, csv, header, req.ForceNotNull, req.ForceNull); err != nil {
 		return task.Task{}, problem.Validation("The import request is invalid.", field("/columns", "a name is not valid", "pattern"))
 	}
@@ -348,6 +335,22 @@ func (o *Ops) StartImport(ctx context.Context, actor, db, schema, table string, 
 	tid := t.ID
 	_ = o.records().Apply(ctx, up.ID, transfer.Update{TaskID: &tid})
 	return t, nil
+}
+
+// isGzip looks at the first two bytes of a staged file.
+func (o *Ops) isGzip(x *xferState, rec transfer.Record) bool {
+	dk, err := x.keys.Unwrap(rec.ID, rec.KeyID, rec.WrappedKey)
+	if err != nil {
+		return false
+	}
+	r, err := x.store.OpenReader(rec.ID, dk)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = r.Close() }()
+	var magic [2]byte
+	n, _ := r.ReadAt(magic[:], 0)
+	return n == 2 && magic[0] == 0x1f && magic[1] == 0x8b
 }
 
 func (o *Ops) maxAtomic() int64 {
@@ -408,6 +411,10 @@ func (o *Ops) stepImportCheckUpload(ctx context.Context, env *task.Env) error {
 	if err != nil {
 		return err
 	}
+	_ = importFault("beforeStart", nil)
+	if err := o.stillEnabled(ctx); err != nil {
+		return err
+	}
 	rec, x, err := o.loadUpload(ctx, p)
 	if err != nil {
 		return err
@@ -432,6 +439,9 @@ func (o *Ops) stepImportCheckTable(ctx context.Context, env *task.Env) error {
 	if err != nil {
 		return err
 	}
+	if err := importFault("beforeCheck", nil); err != nil {
+		return err
+	}
 	if _, _, err := o.loadUpload(ctx, p); err != nil {
 		return err
 	}
@@ -449,12 +459,15 @@ func (o *Ops) stepImportCheckTable(ctx context.Context, env *task.Env) error {
 	if policy == "required" {
 		return transfer.Errorf(transfer.CodeForbidden, false, "the ledger policy of the table became required")
 	}
+	if err := o.ensureMarker(ctx, p.Database, p.Owner.Name); err != nil {
+		return err
+	}
 	conn, err := o.roleConn(ctx, p.Database, p.Owner.Name)
 	if err != nil {
 		return transfer.Errorf(transfer.CodeSessionLost, true, "the role cannot connect to the database from this server now; repeat the operation")
 	}
 	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
-	cols, _, err := o.importTarget(ctx, conn, p.Schema, p.Table, p.Columns, class)
+	cols, types, err := o.importTarget(ctx, conn, p.Schema, p.Table, p.Columns, class)
 	if err != nil {
 		var pr *problem.Problem
 		if errors.As(err, &pr) {
@@ -464,6 +477,11 @@ func (o *Ops) stepImportCheckTable(ctx context.Context, env *task.Env) error {
 	}
 	if len(cols) != len(p.Columns) {
 		return transfer.Errorf(transfer.CodeForbidden, false, "the columns of the table changed since the request")
+	}
+	for i := range types {
+		if i >= len(p.ColumnTypes) || types[i] != p.ColumnTypes[i] {
+			return transfer.Errorf(transfer.CodeForbidden, false, "the type of a column of the table changed since the request")
+		}
 	}
 	return nil
 }
@@ -536,21 +554,83 @@ func (p *progressReader) Read(b []byte) (int, error) {
 	return n, err
 }
 
+// markerTable is the table, in the database of the target, that decides the outcome of an import (DX14-01). The load inserts a row for its task into it inside
+// the transaction of the load, so the row commits with the data or not at all (for a routed table inside the same two-phase commit). A run that finds the intent
+// asks the marker: a row "committed" says the rows are in; otherwise the run inserts a row "aborted" for the task, which waits for a transaction that holds the
+// key and, once inserted, makes the commit of any transaction of that task impossible (it would fail on the key): the rows are then provably not stored.
+const markerTable = "kingres_transfer.import_marker"
+
+// ensureMarker makes the schema, the table and the function that writes into it, with the service role. The table belongs to the service role and no other
+// role can touch it; the role of an import writes its row through the function, which runs as the service role. No privilege is granted to the role itself, so
+// that dropping the role is never blocked by it. A role that calls the function with the id of a task it does not own can only make that task fail on the key.
+func (o *Ops) ensureMarker(ctx context.Context, db, _ string) error {
+	return wrap(o.asService(ctx, db, func(tx pgx.Tx) error {
+		for _, s := range []string{
+			"CREATE SCHEMA IF NOT EXISTS kingres_transfer",
+			"CREATE TABLE IF NOT EXISTS " + markerTable + " (task_id bigint PRIMARY KEY, state text NOT NULL CHECK (state IN ('committed', 'aborted')), rows bigint NOT NULL, at timestamptz NOT NULL DEFAULT now())",
+			"CREATE OR REPLACE FUNCTION kingres_transfer.mark(t bigint, n bigint) RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog AS $f$ INSERT INTO kingres_transfer.import_marker (task_id, state, rows) VALUES (t, 'committed', n) $f$",
+			"REVOKE ALL ON TABLE " + markerTable + " FROM PUBLIC",
+			"GRANT USAGE ON SCHEMA kingres_transfer TO PUBLIC",
+			"GRANT EXECUTE ON FUNCTION kingres_transfer.mark(bigint, bigint) TO PUBLIC",
+		} {
+			if _, err := tx.Exec(ctx, s); err != nil {
+				return err
+			}
+		}
+		return nil
+	}))
+}
+
+// decideOutcome settles whether the transaction of a task committed. It is only called for a task that wrote its intent. committed is true when the marker says
+// the rows are in; false means a marker "aborted" now exists and the transaction can never commit. err is set when the question could not be answered (the
+// lock on the key was not given in a minute: a transaction in doubt holds it), and the outcome is then unknown.
+func (o *Ops) decideOutcome(ctx context.Context, db string, taskID int64) (committed bool, rows int64, err error) {
+	err = o.asService(ctx, db, func(tx pgx.Tx) error {
+		if _, e := tx.Exec(ctx, "SET LOCAL lock_timeout = '60s'"); e != nil {
+			return e
+		}
+		if _, e := tx.Exec(ctx, "INSERT INTO "+markerTable+" (task_id, state, rows) VALUES ($1, 'aborted', -1) ON CONFLICT (task_id) DO NOTHING", taskID); e != nil {
+			return e
+		}
+		var state string
+		if e := tx.QueryRow(ctx, "SELECT state, rows FROM "+markerTable+" WHERE task_id = $1", taskID).Scan(&state, &rows); e != nil {
+			return e
+		}
+		committed = state == "committed"
+		return nil
+	})
+	return committed, rows, err
+}
+
+// resolveAfterIntent turns the question "did it commit" into the answer of the task: done when the marker is there, a retryable failure with the proof when it
+// is not, an unknown outcome when it cannot be asked.
+func (o *Ops) resolveAfterIntent(ctx context.Context, env *task.Env, p importParams) error {
+	// The marker is in the database that this server loaded into. After a change of leader the answer is not in reach: say so, and never claim that nothing was stored.
+	if up, gerr := o.records().Get(ctx, p.UploadID); gerr != nil || up.ServerID != o.ServerHost {
+		return o.unknownOutcome(env.Task)
+	}
+	committed, rows, err := o.decideOutcome(ctx, p.Database, env.Task.ID)
+	switch {
+	case err != nil:
+		return o.unknownOutcome(env.Task)
+	case committed:
+		return env.SetDetail(ctx, intentMarker+strconv.FormatInt(rows, 10)+" rows; committed")
+	}
+	return transfer.Errorf(transfer.CodeCopyInterrupted, true, "the commit did not happen: the marker of the task in the database proves that nothing was stored; repeat the operation")
+}
+
 func (o *Ops) stepImportLoad(ctx context.Context, env *task.Env) error {
 	p, err := importOf(env.Task)
 	if err != nil {
 		return err
 	}
-	// A run that finds the intent must not load again: whether the rows are in is not known.
+	// A run that finds the intent never loads again: the marker in the database says whether the rows are in.
 	if strings.Contains(env.Task.Detail, intentMarker) {
-		return o.unknownOutcome(env.Task)
+		return o.resolveAfterIntent(ctx, env, p)
 	}
 	rec, x, err := o.loadUpload(ctx, p)
 	if err != nil {
 		return err
-	}
-	if old := o.takePending(env.Task.ID); old != nil {
-		old.rollback(ctx)
 	}
 	left, err := o.timeLeft(env.Task)
 	if err != nil {
@@ -565,25 +645,22 @@ func (o *Ops) stepImportLoad(ctx context.Context, env *task.Env) error {
 	if err != nil {
 		return transfer.Errorf(transfer.CodeSessionLost, true, "the role cannot connect to the database from this server now; repeat the operation")
 	}
-	pl := &pendingLoad{conn: conn}
-	ok := false
-	defer func() {
-		if !ok && pl.tx != nil {
-			pl.rollback(ctx)
-		} else if !ok {
-			_ = conn.Close(context.WithoutCancel(ctx))
-		}
-	}()
+	// The connection and its transaction belong to this run and end with it, whatever happens (a lease that is lost stands the run down without a hook).
+	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+	if err := refuseDangerousRole(ctx, conn); err != nil {
+		return transfer.Errorf(transfer.CodeForbidden, false, "the role has the SUPERUSER, REPLICATION or BYPASSRLS attribute or access to server files, programs or logs; an import runs the triggers and defaults of the table as that role")
+	}
 	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return err
 	}
-	pl.tx = tx
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 	formats, err := transfer.SessionFormats(p.CSV.Encoding)
 	if err != nil {
 		return err
 	}
-	for _, s := range append(formats, fmt.Sprintf("SET LOCAL statement_timeout = %d", left.Milliseconds())) {
+	// A transaction that is left open (a process that stalls) is ended by the server after the time that is left of the task.
+	for _, s := range append(formats, fmt.Sprintf("SET LOCAL statement_timeout = %d", left.Milliseconds()), fmt.Sprintf("SET LOCAL idle_in_transaction_session_timeout = %d", left.Milliseconds())) {
 		if _, err := tx.Exec(ctx, s); err != nil {
 			return err
 		}
@@ -620,10 +697,41 @@ func (o *Ops) stepImportLoad(ctx context.Context, env *task.Env) error {
 	if tag != want {
 		return transfer.Errorf(transfer.CodeRowCountMismatch, false, "the database loaded %d rows and the file has %d records; nothing was stored", tag, want)
 	}
-	pl.rows = tag
-	o.setPending(env.Task.ID, pl)
-	ok = true
-	return env.SetDetail(ctx, "loaded "+strconv.FormatInt(tag, 10)+" rows, not committed")
+	// The role is checked again before the commit: a role that lost its right ends the task with nothing stored.
+	if err := o.roleChecker().Check(ctx, p.Owner); err != nil {
+		return err
+	}
+	_ = importFault("beforeIntent", conn)
+	// The marker commits with the rows or not at all. A second marker of the same task (a run that raced this one) fails here, and nothing commits.
+	if _, err := tx.Exec(ctx, "SELECT kingres_transfer.mark($1, $2)", env.Task.ID, tag); err != nil {
+		return transfer.Errorf(transfer.CodeCopyInterrupted, true, "the marker of the import could not be written; nothing was stored, repeat the operation")
+	}
+	// A connection that broke since the load: nothing was committed, the transaction died with it, and the import may be repeated.
+	if _, err := tx.Exec(ctx, "SELECT 1"); err != nil {
+		return transfer.Errorf(transfer.CodeCopyInterrupted, true, "the connection to the database broke before the commit; nothing was stored, repeat the operation")
+	}
+	// The intent is written under the lease before COMMIT is sent: a leader that lost its lease cannot record it, so it cannot commit.
+	werr := importFault("intentWrite", conn)
+	if werr == nil {
+		werr = env.SetDetail(ctx, intentMarker+strconv.FormatInt(tag, 10)+" rows")
+	}
+	if werr != nil {
+		return werr
+	}
+	_ = importFault("afterIntent", conn)
+	// After the intent there is no cancel: the commit is not tied to the context of the request.
+	bg, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
+	defer cancel()
+	if err := tx.Commit(bg); err != nil {
+		// The answer of the server is lost or the commit failed: the marker is the proof, asked on another connection.
+		_ = conn.Close(context.WithoutCancel(ctx))
+		return o.resolveAfterIntent(bg, env, p)
+	}
+	// A fault point for the crash between the commit and the record of the step (the lease lost, the process ended): the run that comes next asks the marker.
+	if err := importFault("afterCommit", conn); err != nil {
+		return err
+	}
+	return env.SetDetail(ctx, intentMarker+strconv.FormatInt(tag, 10)+" rows; committed")
 }
 
 // importError maps what the load ended with: the scanner's own refusals, the header, the limit, and anything else through SafeError.
@@ -732,52 +840,24 @@ func (o *Ops) loadReference(ctx context.Context, tx pgx.Tx, p importParams, src 
 	return n, nil
 }
 
+// stepImportCommit confirms the commit from the marker in the database, which is the proof (it committed with the rows). A task that gets here has done the
+// load step, which ends only with the commit done or with an error; the marker says how many rows. Nothing is claimed that the marker does not say.
 func (o *Ops) stepImportCommit(ctx context.Context, env *task.Env) error {
 	p, err := importOf(env.Task)
 	if err != nil {
 		return err
 	}
-	if strings.Contains(env.Task.Detail, intentMarker) {
-		// Found after the intent without the commit recorded as done: a restart, a lease that was lost, a connection that broke.
+	var state string
+	var rows int64
+	if err := o.asService(ctx, p.Database, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, "SELECT state, rows FROM "+markerTable+" WHERE task_id = $1", env.Task.ID).Scan(&state, &rows)
+	}); err != nil || state != "committed" {
 		return o.unknownOutcome(env.Task)
 	}
-	pl := o.takePending(env.Task.ID)
-	if pl == nil {
-		return transfer.Errorf(transfer.CodeCopyInterrupted, true, "the open transaction of the load is gone (the server restarted); nothing was stored, repeat the operation")
-	}
-	// The role is checked again before the commit: a role that lost its right ends the task with nothing stored.
-	if err := o.roleChecker().Check(ctx, p.Owner); err != nil {
-		pl.rollback(ctx)
-		return err
-	}
-	_ = importFault("beforeIntent", pl)
-	// A connection that broke since the load: nothing was committed, the transaction died with it, and the import may be repeated.
-	if _, err := pl.tx.Exec(ctx, "SELECT 1"); err != nil {
-		pl.rollback(ctx)
-		return transfer.Errorf(transfer.CodeCopyInterrupted, true, "the connection to the database broke before the commit; nothing was stored, repeat the operation")
-	}
-	// The intent is written under the lease before COMMIT is sent: a leader that lost its lease cannot record it, so it cannot commit.
-	werr := importFault("intentWrite", pl)
-	if werr == nil {
-		werr = env.SetDetail(ctx, intentMarker+strconv.FormatInt(pl.rows, 10)+" rows")
-	}
-	if err := werr; err != nil {
-		pl.rollback(ctx)
-		return err
-	}
-	_ = importFault("afterIntent", pl)
-	// After the intent there is no cancel: the commit is not tied to the context of the request.
-	bg, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
-	defer cancel()
-	if err := pl.tx.Commit(bg); err != nil {
-		_ = pl.conn.Close(context.WithoutCancel(ctx))
-		return o.unknownOutcome(task.Task{Detail: intentMarker + strconv.FormatInt(pl.rows, 10) + " rows"})
-	}
-	_ = pl.conn.Close(context.WithoutCancel(ctx))
 	if o.Transfer != nil && o.Transfer.Audit != nil {
-		o.Transfer.Audit(ctx, "dataTransfer.completed", map[string]any{"kind": "import", "uploadId": idText(p.UploadID), "rows": pl.rows, "commitIntentWritten": true, "outcome": "success"})
+		o.Transfer.Audit(ctx, "dataTransfer.completed", map[string]any{"kind": "import", "uploadId": idText(p.UploadID), "rows": rows, "commitIntentWritten": true, "outcome": "success"})
 	}
-	return env.SetDetail(ctx, "committed "+strconv.FormatInt(pl.rows, 10)+" rows")
+	return env.SetDetail(ctx, "committed "+strconv.FormatInt(rows, 10)+" rows")
 }
 
 func (o *Ops) stepImportClean(ctx context.Context, env *task.Env) error {
@@ -801,9 +881,6 @@ func (o *Ops) stepImportClean(ctx context.Context, env *task.Env) error {
 // importOnFail rolls back an open transaction of a task that failed or was cancelled and keeps the upload (until its retention time) so that the import
 // can be tried again; it writes how the task ended to the audit log.
 func (o *Ops) importOnFail(ctx context.Context, t task.Task) {
-	if pl := o.takePending(t.ID); pl != nil {
-		pl.rollback(ctx)
-	}
 	p, err := importOf(t)
 	if err != nil {
 		return

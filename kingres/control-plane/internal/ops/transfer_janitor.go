@@ -84,6 +84,13 @@ func (o *Ops) TransferSweep(ctx context.Context) (SweepReport, error) {
 	}
 	sr, err := x.store.Sweep(staging.SweepInput{HighestID: highest, Rows: rows, ReadyIDs: ready})
 	if errors.Is(err, staging.ErrRestoredDatabase) {
+		// A transfer made between the read of the rows and the listing of the directory has a higher id than the one read: read again before the alarm.
+		if again, merr := o.records().MaxID(ctx); merr == nil && again > highest {
+			highest = again
+			sr, err = x.store.Sweep(staging.SweepInput{HighestID: highest, Rows: rows, ReadyIDs: ready})
+		}
+	}
+	if errors.Is(err, staging.ErrRestoredDatabase) {
 		rep.Restored = true
 		o.Log.Error("the staging directory holds files with ids the system database never issued; it looks restored from an older copy, so no file is deleted until an operator looks at it")
 		return rep, nil

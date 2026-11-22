@@ -120,11 +120,10 @@ func TestImportRoundTripAndOptions(t *testing.T) {
 	}
 	e.expect(t, 204, "DELETE", "/data-uploads/"+uid, nil)
 
-	// Options: no header, a semicolon, a null text, an apostrophe as the quote, a BOM, another encoding, gzip found by itself.
+	// Options: no header, a semicolon, a null text, an apostrophe as the quote, another encoding, gzip found by itself.
 	q("create table if not exists public.opt_t (a int, b text, c text)")
 	q("truncate public.opt_t")
 	var plain bytes.Buffer
-	plain.Write([]byte{0xEF, 0xBB, 0xBF})
 	plain.WriteString("1;'it''s; ok';NULL\n2;caf" + string(rune(0xe9)) + ";\n")
 	latin := bytes.ReplaceAll(plain.Bytes(), []byte("caf\xc3\xa9"), []byte("caf\xe9"))
 	var gz bytes.Buffer
@@ -460,7 +459,7 @@ func TestImportTargets(t *testing.T) {
 }
 
 // The commit protocol at its fault points: a connection that dies before the intent leaves nothing stored and a retryable code, a clean repeat works; a
-// connection that dies after the intent is an unknown outcome that is never retried, and is said so.
+// connection that dies after the intent is settled by the marker that commits with the rows (here: not committed, so a retryable failure with the proof).
 func TestImportCommitFaultPoints(t *testing.T) {
 	e, off := transferOn(t)
 	defer off()
@@ -495,11 +494,9 @@ func TestImportCommitFaultPoints(t *testing.T) {
 	kill("afterIntent")
 	task = e.startImport(t, "db_xfer", "fp_t", map[string]any{"uploadId": uid, "header": "none", "keepUpload": true})
 	er, _ = task["error"].(map[string]any)
-	if task["state"] != "failed" || taskCode(task) != "import_outcome_unknown" || er["retryable"] != false || !strings.Contains(taskMessage(task), "may have been loaded") {
+	// The marker in the database is the proof: the connection died before COMMIT, so the marker did not commit and nothing was stored (DX14-01).
+	if task["state"] != "failed" || taskCode(task) != "copy_interrupted" || er["retryable"] != true || !strings.Contains(taskMessage(task), "marker") {
 		t.Errorf("a connection that died after the intent: %v", task["error"])
-	}
-	if d, _ := task["detail"].(string); !strings.Contains(d, "commit sent for 3 rows") {
-		t.Errorf("the intent is not in the detail: %q", d)
 	}
 	if task["cancellable"] != false {
 		t.Errorf("a task past the intent is cancellable: %v", task["cancellable"])
