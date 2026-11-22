@@ -167,6 +167,16 @@ if command -v git >/dev/null; then
     check_eq "a dry run without a tag makes the files" 0 "${rstatus}"
     check "and says in capitals that it is not a release" grep -q 'DRY RUN: .* NOT a release' "${run}/r-dry.log"
     check "its RELEASE file records no commit" grep -qx 'commit: unknown' "${run}/r-dry/RELEASE"
+    # release verify of that set is not a plain pass: status 5 and the words NOT A RELEASE, unless --accept-dry-run asks for status 0
+    dstatus=0
+    "${packaged}" release verify --sums "${run}/r-dry/SHA256SUMS" --note "${run}/r-dry/SHA256SUMS.note" --key "${pubkey}" \
+        --binary "${run}/r-dry/RELEASE" >"${run}/r-dry-verify.log" 2>&1 || dstatus=$?
+    check_eq "release verify of a dry-run set ends with status 5" 5 "${dstatus}"
+    check "and says NOT A RELEASE" grep -q '^VERIFIED (NOT A RELEASE):' "${run}/r-dry-verify.log"
+    dstatus=0
+    "${packaged}" release verify --accept-dry-run --sums "${run}/r-dry/SHA256SUMS" --note "${run}/r-dry/SHA256SUMS.note" --key "${pubkey}" \
+        --binary "${run}/r-dry/RELEASE" >/dev/null 2>&1 || dstatus=$?
+    check_eq "and with --accept-dry-run ends with status 0" 0 "${dstatus}"
     gitq tag v9.9.9
     rtry "${run}/r-ok" "${run}/r-ok.log"
     check_eq "a signed release from the tagged clean commit is made" 0 "${rstatus}"

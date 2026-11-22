@@ -175,7 +175,11 @@ else
     # The note is checked with the verifier itself, with the public key of the key
     # file, before anything is announced.
     pubkey="$(tool pub --key-file "${key_file}" | sed -n 's/^public key:  //p')"
-    go run -trimpath ./cmd/kingres-verify release verify \
+    # A set that records the commit as unknown ends release verify with status 5. A dry run makes such a set on purpose and says so below; a real
+    # release must never end that way, so only a dry run passes --accept-dry-run.
+    accept=()
+    [ "${dry}" -eq 0 ] || accept=(--accept-dry-run)
+    go run -trimpath ./cmd/kingres-verify release verify "${accept[@]}" \
         --sums "${out}/SHA256SUMS" --note "${out}/SHA256SUMS.note" --key "${pubkey}" \
         --binary "${out}/${files[0]}" --binary "${out}/RELEASE" >/dev/null || die "the note that was just made does not verify"
     if [ "${dry}" -eq 1 ]; then
