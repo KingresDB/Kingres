@@ -407,6 +407,42 @@ const entries: Record<ProblemCode, Entry> = {
       'The report of the sharding extension lists what stops it (a trigger, a key to an ordinary table, a view that depends on the table, ...). Remove the cause, or ask for the views to be recreated, and try again.',
     withDetail: true,
   },
+  extension_unavailable: {
+    tone: 'warning',
+    heading: 'The extension is not available on a server',
+    message: 'A server has no package for the extension, or the database lacks it. Install the package on that server and try again.',
+    withDetail: true,
+  },
+  extension_version_mismatch: {
+    tone: 'warning',
+    heading: 'The servers run different versions of the extension',
+    message: 'Every server of the database must run the same version. Update the extension on the servers named below, then try again.',
+    withDetail: true,
+  },
+  sketch_hash_mismatch: {
+    tone: 'danger',
+    heading: 'The servers disagree on the sketch hash',
+    message: 'The known-answer values hash differently on the servers named below, so sketches built on them would not merge. Check that they run the same build.',
+    withDetail: true,
+  },
+  extension_missing: {
+    tone: 'warning',
+    heading: 'An extension is missing',
+    message: 'The extension is not installed in the database, or its library is not preloaded on a server. The detail names the extension and the servers.',
+    withDetail: true,
+  },
+  conversion_refused: {
+    tone: 'warning',
+    heading: 'The storage format cannot be changed',
+    message: 'The detail lists the reasons (a ledger table, indexes, triggers, a publication, a default partition). Remove them and try again.',
+    withDetail: true,
+  },
+  partition_policy_conflict: {
+    tone: 'warning',
+    heading: 'This table cannot have a partitioning policy',
+    message: 'A policy needs a table that is range-partitioned on a date or timestamp column.',
+    withDetail: true,
+  },
   chain_not_diverged: {
     tone: 'info',
     heading: 'This chain has not diverged',

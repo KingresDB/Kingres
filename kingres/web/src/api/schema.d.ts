@@ -977,6 +977,41 @@ export interface paths {
         patch: operations["updateDatabase"];
         trace?: never;
     };
+    "/databases/{databaseName}/approximate-aggregates": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Get the approximate-aggregates setting of a database
+         * @description Added in 0.18.0. The recorded setting (`kingres_cp.database_setting`) and, read live from every server, the version of the extension
+         *     `kingres_sketch` that each one has installed in the database. `extensionVersion` is the version every server runs, null when no
+         *     server has it or the versions differ.
+         */
+        get: operations["getApproximateAggregates"];
+        /**
+         * Turn approximate aggregates on or off for a database
+         * @description Added in 0.18.0. Installs `kingres_sketch` in the database on every server, checks that every server runs the same version and the same
+         *     known-answer hash, applies the database settings (`kingres_shard.count_distinct_mode`, `kingres_shard.count_distinct_error_rate`,
+         *     `kingres_shard.enable_sketch_pushdown`) and records the setting. Returns a task of kind `database.approximateAggregates`.
+         *     `enabled: false` sets `count_distinct_mode` to `exact` and switches the sketch pushdown off, and never drops the extension.
+         *     The request is idempotent. 400 `validation_failed` for `enabled: false` with `countDistinct: approximate`;
+         *     422 `extension_unavailable` when a server's package lacks the extension; 409 `extension_version_mismatch` when the servers run different versions;
+         *     409 `operation_in_progress` while another `database.*` task runs on the database.
+         */
+        put: operations["configureApproximateAggregates"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/databases/{databaseName}/tables": {
         parameters: {
             query?: never;
@@ -1142,7 +1177,7 @@ export interface paths {
         /**
          * List the user partitions of a distributed table
          * @description Added in 0.14.0. The user partitions (`kingres.dist_partition`) of a distributed table that was partitioned by the user (RANGE or LIST),
-         *     with their bound, the number of their leaves (one per bucket) and, when it can be read, their size. An empty list for a table that is not user-partitioned.
+         *     with their bound, the number of their leaves (one per bucket) and, when it can be read, their size. From 0.18.0 an ordinary range-partitioned table lists its partitions too (`leafCount` 1, with `accessMethod` and the range bounds); an empty list for a table that is not partitioned.
          */
         get: operations["listTablePartitions"];
         put?: never;
@@ -1242,6 +1277,196 @@ export interface paths {
          *     row moves. Returns a task of kind `table.partition`; 404 for a partition that does not exist. A table with foreign keys cannot detach a partition (`table_not_eligible`).
          */
         post: operations["detachTablePartition"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/storage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Change the storage format of a table
+         * @description Added in 0.18.0. Converts a table between the heap and the columnar format (`ALTER TABLE ... SET ACCESS METHOD`, under an `ACCESS EXCLUSIVE` lock,
+         *     which the step `detail` says) and sets the columnar options. For a table that is partitioned by time, use `setPartitionStorage` for one partition.
+         *     Returns a task of kind `table.setStorage` with the steps `check`, `convert` and `analyze`. 409 `extension_missing` when `kingres_columnar` is not installed
+         *     in the database or not preloaded on a server; 409 `conversion_refused` (the `detail` lists the reasons: ledger table, indexes, triggers, publication,
+         *     a partition that is a parent, a default partition); 409 `operation_in_progress` while a task runs for the table.
+         */
+        put: operations["setTableStorage"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partitions/{partitionName}/storage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+                /** @description Name of a user partition (added in 0.14.0). */
+                partitionName: components["parameters"]["PartitionName"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Change the storage format of one partition
+         * @description Added in 0.18.0. Converts one partition of a range-partitioned table between the heap and the columnar format (`kingres.convert_partition`, which builds
+         *     the new partition aside and swaps it in, so writers wait only for the swap). `sortBy` orders the rows of a columnar partition, which helps the skipping of
+         *     stripes. Returns a task of kind `table.setStorage`, subject `database/schema.partition`. The problem codes are those of `setTableStorage`.
+         */
+        put: operations["setPartitionStorage"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partition-policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Get the time-partitioning policy of a table
+         * @description Added in 0.18.0. The policy, when it runs next, the last run and the health of the partitions ahead. 404 `not_found` when the table has no policy.
+         */
+        get: operations["getPartitionPolicy"];
+        /**
+         * Set the time-partitioning policy of a table
+         * @description Added in 0.18.0. Creates or replaces the policy. Synchronous: it writes the policy and creates no partition; `nextRunAt` of the answer is now, so the
+         *     scheduler takes the table at its next tick. Durations are ISO 8601 (`P1D`, `P1M`, `PT6H`). 400 `validation_failed` with the JSON pointer of the field;
+         *     409 `partition_policy_conflict` when the table is not range-partitioned on a `date`, `timestamp` or `timestamptz` column; 409 `extension_missing`
+         *     when `kingres_timepart` is not installed in the database.
+         */
+        put: operations["putPartitionPolicy"];
+        post?: never;
+        /**
+         * Remove the time-partitioning policy of a table
+         * @description Added in 0.18.0. Removes the policy; the partitions stay as they are. 404 `not_found` when the table has no policy; 409 `operation_in_progress`
+         *     while a `partition.maintain` task runs for the table.
+         */
+        delete: operations["deletePartitionPolicy"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partition-policy/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List the runs of a time-partitioning policy
+         * @description Added in 0.18.0. The runs of the policy, newest first, with the trigger, the state and the error of each.
+         */
+        get: operations["listPartitionPolicyRuns"];
+        put?: never;
+        /**
+         * Run a time-partitioning policy now
+         * @description Added in 0.18.0. Starts a task of kind `partition.maintain` for the table (the console's "Run now"); the run's `trigger` is `manual`.
+         *     `asOf` is for tests and dry replays. 404 `not_found` when the table has no policy; 409 `operation_in_progress` while a run is going.
+         */
+        post: operations["runPartitionPolicy"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partition-policy/runs/{runId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+                /** @description Identifier of a run of a time-partitioning policy (added in 0.18.0). */
+                runId: components["parameters"]["PartitionRunId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Get one run of a time-partitioning policy
+         * @description Added in 0.18.0. A run with its actions, in the order they were taken.
+         */
+        get: operations["getPartitionPolicyRun"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partition-policy/plan": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Preview the actions of a time-partitioning policy
+         * @description Added in 0.18.0. A dry run: the actions a run would take now (or at `asOf`), with the stored policy or with the policy in the request.
+         *     Nothing changes. It is a read, so a `kingres_readonly` role may call it, and it is not audited.
+         */
+        post: operations["planPartitionPolicy"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3262,7 +3487,7 @@ export interface components {
          *     system database was stopped on purpose; start it with `startThisServerInstance`).
          * @enum {string}
          */
-        ProblemCode: "bad_request" | "validation_failed" | "unauthenticated" | "invalid_credentials" | "session_expired" | "csrf_token_invalid" | "forbidden" | "setup_token_invalid" | "not_found" | "method_not_allowed" | "conflict" | "already_exists" | "immutable_field" | "rebalance_in_progress" | "operation_in_progress" | "task_not_cancellable" | "last_admin" | "role_in_use" | "optimistic_lock_failed" | "no_replica_available" | "instance_already_running" | "instance_already_stopped" | "server_owns_buckets" | "server_hosts_map_group" | "last_server" | "server_group_not_empty" | "ledger_entry_pending" | "quorum_unavailable" | "system_database_stopped" | "unprocessable" | "sql_error" | "unsupported_operation" | "node_state_invalid" | "node_uninitialized" | "map_group_unavailable" | "leader_unavailable" | "rate_limited" | "service_unavailable" | "internal_error" | "certificate_revoked" | "certificate_authority_unavailable" | "internal_api_disabled" | "workbench_busy" | "config_parameter_unknown" | "config_parameter_managed" | "config_parameter_refused" | "config_level_not_allowed" | "config_value_below_floor" | "config_change_superseded" | "config_restart_order_conflict" | "nothing_pending" | "nothing_to_rebalance" | "rebalance_not_running" | "cluster_inconsistent" | "version_mismatch" | "failover_in_progress" | "group_degraded" | "insufficient_disk" | "no_receiving_server" | "failover_needs_decision" | "lease_settings_differ" | "ledger_not_published" | "origin_prefix_locked" | "signing_key_missing" | "last_signing_key" | "chain_not_diverged" | "table_not_eligible";
+        ProblemCode: "bad_request" | "validation_failed" | "unauthenticated" | "invalid_credentials" | "session_expired" | "csrf_token_invalid" | "forbidden" | "setup_token_invalid" | "not_found" | "method_not_allowed" | "conflict" | "already_exists" | "immutable_field" | "rebalance_in_progress" | "operation_in_progress" | "task_not_cancellable" | "last_admin" | "role_in_use" | "optimistic_lock_failed" | "no_replica_available" | "instance_already_running" | "instance_already_stopped" | "server_owns_buckets" | "server_hosts_map_group" | "last_server" | "server_group_not_empty" | "ledger_entry_pending" | "quorum_unavailable" | "system_database_stopped" | "unprocessable" | "sql_error" | "unsupported_operation" | "node_state_invalid" | "node_uninitialized" | "map_group_unavailable" | "leader_unavailable" | "rate_limited" | "service_unavailable" | "internal_error" | "certificate_revoked" | "certificate_authority_unavailable" | "internal_api_disabled" | "workbench_busy" | "config_parameter_unknown" | "config_parameter_managed" | "config_parameter_refused" | "config_level_not_allowed" | "config_value_below_floor" | "config_change_superseded" | "config_restart_order_conflict" | "nothing_pending" | "nothing_to_rebalance" | "rebalance_not_running" | "cluster_inconsistent" | "version_mismatch" | "failover_in_progress" | "group_degraded" | "insufficient_disk" | "no_receiving_server" | "failover_needs_decision" | "lease_settings_differ" | "ledger_not_published" | "origin_prefix_locked" | "signing_key_missing" | "last_signing_key" | "chain_not_diverged" | "table_not_eligible" | "extension_unavailable" | "extension_version_mismatch" | "sketch_hash_mismatch" | "extension_missing" | "conversion_refused" | "partition_policy_conflict";
         /** @description One invalid field of a request. */
         ValidationIssue: {
             /** @description JSON Pointer (RFC 6901) to the invalid property of the request body, or the name of the invalid query or path parameter. */
@@ -4626,6 +4851,12 @@ export interface components {
                 /** @description Added in 0.9.0, optional. The shard groups whose chains the summary does not cover (empty when `complete`). */
                 uncoveredShardGroupIds?: number[];
             };
+            /** @description Added in 0.18.0, optional. The approximate-aggregates setting (`GET /databases/{databaseName}/approximate-aggregates` has the state of every server). */
+            approximateAggregates?: {
+                enabled: boolean;
+                /** @enum {string} */
+                countDistinct: "exact" | "approximate";
+            };
             /** @description Whether this database's buckets need rebalancing. */
             rebalanceRequired: boolean;
             /** @description Role that created the database; null when not recorded (databases created outside the control plane). */
@@ -4780,9 +5011,21 @@ export interface components {
             partitioning?: {
                 /** @enum {string} */
                 method: "range" | "list";
+                /** @description The partition column. */
                 key: string;
                 partitionCount: number;
+                /**
+                 * @description Added in 0.18.0, optional. Present when the key is a time column of a range-partitioned table.
+                 * @enum {string}
+                 */
+                columnType?: "date" | "timestamp" | "timestamptz";
+                /** @description Added in 0.18.0, optional. Whether the table has a time-partitioning policy. */
+                hasPolicy?: boolean;
+                /** @description Added in 0.18.0, optional. Whether the table has a default partition. */
+                defaultPartition?: boolean;
             } | null;
+            /** @description Added in 0.18.0, optional. The storage format; null when not available. */
+            storage?: components["schemas"]["TableStorage"] | null;
         };
         /**
          * @description Why a column cannot be the distribution column. When several reasons apply the first of this list wins:
@@ -4964,6 +5207,19 @@ export interface components {
              * @description Size of the leaves that this server holds; null when not available.
              */
             sizeBytes: number | null;
+            /** @description Added in 0.18.0, optional. The storage format of the partition (`heap`, `columnar`). */
+            accessMethod?: string | null;
+            /** @description Added in 0.18.0, optional. The lower bound of a range partition, as text. */
+            rangeFrom?: string | null;
+            /** @description Added in 0.18.0, optional. The upper bound of a range partition, as text. */
+            rangeTo?: string | null;
+            /**
+             * Format: int64
+             * @description Added in 0.18.0, optional.
+             */
+            estimatedRows?: number | null;
+            /** @description Added in 0.18.0, optional. Uncompressed over stored bytes of a columnar partition; null otherwise. */
+            compressionRatio?: number | null;
         };
         /** @description Added in 0.14.0. A page of partitions. */
         TablePartitionPage: {
@@ -5484,12 +5740,217 @@ export interface components {
          * @enum {string}
          */
         TaskState: "pending" | "running" | "paused" | "failed" | "done";
+        /** @description Added in 0.18.0. The approximate-aggregates setting of a database and the state of the extension `kingres_sketch` on every server. */
+        ApproximateAggregates: {
+            /** @description The recorded setting. */
+            enabled: boolean;
+            /** @description The version every server runs; null when no server has the extension or the versions differ. */
+            extensionVersion: string | null;
+            /**
+             * @description Whether `count(DISTINCT x)` is rewritten to a sketch (`kingres_shard.count_distinct_mode`).
+             * @enum {string}
+             */
+            countDistinct: "exact" | "approximate";
+            /** @description The relative error of the approximate count; null when `countDistinct` is `exact`. */
+            errorRate: number | null;
+            servers: {
+                serverId: string;
+                installedVersion: string | null;
+                /** @enum {string} */
+                state: "ok" | "notInstalled" | "versionMismatch" | "unreachable";
+            }[];
+        };
+        /** @description Added in 0.18.0. */
+        ApproximateAggregatesRequest: {
+            enabled: boolean;
+            /**
+             * @description `approximate` needs `enabled: true`, otherwise 400 `validation_failed`.
+             * @default exact
+             * @enum {string}
+             */
+            countDistinct?: "exact" | "approximate";
+            /**
+             * @description Only with `countDistinct: approximate`.
+             * @default 0.01
+             */
+            errorRate?: number;
+        };
+        /** @enum {string} */
+        TableStorageAccessMethod: "heap" | "columnar";
+        /** @enum {string} */
+        ColumnarCompression: "none" | "pglz" | "lz4" | "zstd";
+        /** @description Added in 0.18.0. */
+        TableStorageRequest: {
+            accessMethod: components["schemas"]["TableStorageAccessMethod"];
+            compression?: components["schemas"]["ColumnarCompression"];
+            compressionLevel?: number;
+            stripeRowCount?: number;
+            chunkRowCount?: number;
+        };
+        /** @description Added in 0.18.0. The request of `setTableStorage`, plus a sort order. */
+        PartitionStorageRequest: components["schemas"]["TableStorageRequest"] & {
+            /** @description Columns that order the rows of a columnar partition. */
+            sortBy?: string[];
+        };
+        /** @description Added in 0.18.0. Totals of the columnar format over a table or over its partitions. */
+        ColumnarStats: {
+            compression?: components["schemas"]["ColumnarCompression"] | null;
+            compressionLevel?: number | null;
+            stripeRowCount?: number | null;
+            chunkRowCount?: number | null;
+            /** Format: int64 */
+            stripes: number;
+            /** Format: int64 */
+            rows: number;
+            /** Format: int64 */
+            bytesOnDisk: number;
+            /** Format: int64 */
+            bytesUncompressed: number;
+            compressionRatio?: number | null;
+        };
+        /** @description Added in 0.18.0. The storage format of a table. */
+        TableStorage: {
+            /** @description `heap`, `columnar` or another access method; null for a partitioned table. */
+            accessMethod: string | null;
+            /** @description The number of partitions in each format; null for a table that is not partitioned. */
+            partitionFormats?: {
+                heap: number;
+                columnar: number;
+                other: number;
+            } | null;
+            columnar?: components["schemas"]["ColumnarStats"] | null;
+        };
+        /** @description Added in 0.18.0. Every duration is ISO 8601 (`P1D`, `P1M`, `PT6H`). */
+        PartitionPolicyRequest: {
+            partitionEvery: string;
+            /** @default P7D */
+            createAhead?: string;
+            retention?: string | null;
+            /**
+             * @default drop
+             * @enum {string}
+             */
+            retentionAction?: "drop" | "detach";
+            columnarAfter?: string | null;
+            columnarSortBy?: string[] | null;
+            compression?: components["schemas"]["ColumnarCompression"] | null;
+            compressionLevel?: number | null;
+            /** @default UTC */
+            timezone?: string;
+            /** @default PT1H */
+            runEvery?: string;
+            /** @default true */
+            enabled?: boolean;
+        };
+        /** @enum {string} */
+        PartitionRunState: "running" | "done" | "partial" | "failed";
+        /** @description Added in 0.18.0. */
+        PartitionRunSummary: {
+            /** Format: int64 */
+            id: number;
+            state: components["schemas"]["PartitionRunState"];
+            /** Format: date-time */
+            startedAt: string;
+            /** Format: date-time */
+            finishedAt: string | null;
+        };
+        /** @description Added in 0.18.0. */
+        PartitionPolicyHealth: {
+            /** @description ISO 8601 duration from now to the end of the last partition. */
+            partitionsAhead: string | null;
+            ok: boolean;
+            problems: ("aheadLow" | "lastRunFailed" | "defaultPartitionPresent" | "misaligned")[];
+        };
+        /** @description Added in 0.18.0. The request, as stored, plus the state of the policy. */
+        PartitionPolicy: components["schemas"]["PartitionPolicyRequest"] & {
+            partitionColumn: string;
+            /** @enum {string} */
+            partitionColumnType: "date" | "timestamp" | "timestamptz";
+            /** Format: date-time */
+            nextRunAt: string | null;
+            lastRun: components["schemas"]["PartitionRunSummary"] | null;
+            health: components["schemas"]["PartitionPolicyHealth"];
+            createdBy: string;
+            /** Format: date-time */
+            updatedAt: string;
+        };
+        /** @description Added in 0.18.0. One action of a run or of a plan. */
+        PartitionAction: {
+            seq: number;
+            /** @enum {string} */
+            kind: "create" | "convert" | "drop" | "detach";
+            partition: string;
+            /** Format: date-time */
+            rangeFrom?: string | null;
+            /** Format: date-time */
+            rangeTo?: string | null;
+            /**
+             * @description `planned` appears only in a plan.
+             * @enum {string}
+             */
+            state: "planned" | "running" | "done" | "failed" | "skipped";
+            /** @description For example `lock_timeout`, `retry_later`, `name_conflict`. */
+            detail?: string | null;
+            /** Format: int64 */
+            bytesBefore?: number | null;
+            /** Format: int64 */
+            bytesAfter?: number | null;
+            /** Format: date-time */
+            startedAt?: string | null;
+            /** Format: date-time */
+            finishedAt?: string | null;
+        };
+        /** @description Added in 0.18.0. A run of a policy, with its actions. */
+        PartitionRun: {
+            /** Format: int64 */
+            id: number;
+            /** Format: date-time */
+            asOf: string;
+            /** @enum {string} */
+            trigger: "schedule" | "manual";
+            state: components["schemas"]["PartitionRunState"];
+            /** Format: date-time */
+            startedAt: string;
+            /** Format: date-time */
+            finishedAt: string | null;
+            /** @description A role name */
+            startedBy: string;
+            /** Format: int64 */
+            taskId: number | null;
+            error: string | null;
+            actions: components["schemas"]["PartitionAction"][];
+        };
+        /** @description Added in 0.18.0. A page of runs; the `actions` of a listed run are empty, read the run for them. */
+        PartitionRunPage: {
+            items: components["schemas"]["PartitionRun"][];
+            nextCursor: components["schemas"]["NextCursor"];
+        };
+        /** @description Added in 0.18.0. */
+        RunPartitionPolicyRequest: {
+            /**
+             * Format: date-time
+             * @description For tests and dry replays.
+             */
+            asOf?: string;
+        };
+        /** @description Added in 0.18.0. With `policy` the plan is made for that policy instead of the stored one. */
+        PlanPartitionPolicyRequest: {
+            /** Format: date-time */
+            asOf?: string;
+            policy?: components["schemas"]["PartitionPolicyRequest"];
+        };
+        /** @description Added in 0.18.0. The actions a run would take; nothing was changed. */
+        PartitionPlan: {
+            /** Format: date-time */
+            asOf: string;
+            actions: components["schemas"]["PartitionAction"][];
+        };
         /**
          * @description Kind of task. Each kind has one fixed `subject.type`; the table is in the README
          *     (section "Task kinds and subjects"). `standby.reconcile` is added in 0.7.0; the `ledger.key.*`, `ledger.bundle.create`, `ledger.epoch.start` and `ledger.upgrade` kinds in 0.11.0.
          * @enum {string}
          */
-        TaskKind: "cluster.init" | "cluster.join" | "server.add" | "server.remove" | "server.failover" | "server.leave" | "instance.start" | "instance.stop" | "instance.restart" | "database.create" | "database.update" | "database.drop" | "table.distribute" | "rebalance" | "replication.restorePreferredPrimaries" | "ledger.verify" | "networkAccess.apply" | "replicate.apply" | "certificate.renew" | "certificate.revoke" | "standby.reconcile" | "config.apply" | "config.restart" | "ledger.key.create" | "ledger.key.rotate" | "ledger.key.retire" | "ledger.key.revoke" | "ledger.key.distribute" | "ledger.bundle.create" | "ledger.epoch.start" | "ledger.upgrade" | "table.undistribute" | "table.alter" | "table.partition";
+        TaskKind: "cluster.init" | "cluster.join" | "server.add" | "server.remove" | "server.failover" | "server.leave" | "instance.start" | "instance.stop" | "instance.restart" | "database.create" | "database.update" | "database.drop" | "table.distribute" | "rebalance" | "replication.restorePreferredPrimaries" | "ledger.verify" | "networkAccess.apply" | "replicate.apply" | "certificate.renew" | "certificate.revoke" | "standby.reconcile" | "config.apply" | "config.restart" | "ledger.key.create" | "ledger.key.rotate" | "ledger.key.retire" | "ledger.key.revoke" | "ledger.key.distribute" | "ledger.bundle.create" | "ledger.epoch.start" | "ledger.upgrade" | "table.undistribute" | "table.alter" | "table.partition" | "database.approximateAggregates" | "table.setStorage" | "partition.maintain";
         /** @description One step of a task. */
         TaskStep: {
             /** @description Step name. */
@@ -5845,7 +6306,7 @@ export interface components {
          *     `failure`. Read-only operations are not audited except `executeQuery`.
          * @enum {string}
          */
-        AuditAction: "login" | "logout" | "loginFailed" | "setupTokenRejected" | "initCluster" | "joinCluster" | "updateThisServerSettings" | "restartThisServerInstance" | "stopThisServerInstance" | "startThisServerInstance" | "leaveCluster" | "addServer" | "updateServer" | "removeServer" | "failoverServer" | "autoFailover" | "createServerGroup" | "deleteServerGroup" | "createDatabase" | "updateDatabase" | "dropDatabase" | "distributeTable" | "enableTableLedger" | "restorePreferredPrimaries" | "startRebalance" | "stopRebalance" | "cancelTask" | "createRole" | "updateRole" | "deleteRole" | "setRoleMemberships" | "setRoleClusterRoles" | "createGrant" | "revokeGrants" | "applyGrantTemplate" | "replaceNetworkAccess" | "updateClusterSettings" | "generateLedgerDigest" | "startLedgerVerification" | "executeQuery" | "acknowledgeAlert" | "renewServerCertificates" | "revokeServerCertificates" | "certificateRenewed" | "certificateRenewalFailed" | "cancelStatement" | "leaseLost" | "leaseFenced" | "leaseAcquired" | "standbyCreated" | "standbyRemoved" | "standbyRebuilt" | "standbyInstanceStarted" | "standbyInstanceRemoved" | "standbyInstanceRebuilt" | "synchronousStandbyNamesChanged" | "replicationSlotDropped" | "applyConfigChange" | "revertConfigChange" | "restartPendingInstances" | "resetAutoFailoverCounter" | "failoverGroupStarted" | "failoverGroupPromoted" | "failoverGroupFailed" | "oldPrimaryRebuilt" | "updateLedgerSettings" | "createLedgerSigningKey" | "retireLedgerSigningKey" | "revokeLedgerSigningKey" | "createLedgerAnchorTarget" | "updateLedgerAnchorTarget" | "deleteLedgerAnchorTarget" | "testLedgerAnchorTarget" | "anchorLedgerNow" | "retryLedgerAnchor" | "createLedgerBundle" | "registerLedgerClientKey" | "revokeLedgerClientKey" | "setTableSignaturePolicy" | "upgradeLedgerExtension" | "acknowledgeLedgerDivergence" | "previewTableChange" | "undistributeTable" | "alterTableDistribution" | "createTablePartition" | "attachTablePartition" | "detachTablePartition" | "dropTablePartition";
+        AuditAction: "login" | "logout" | "loginFailed" | "setupTokenRejected" | "initCluster" | "joinCluster" | "updateThisServerSettings" | "restartThisServerInstance" | "stopThisServerInstance" | "startThisServerInstance" | "leaveCluster" | "addServer" | "updateServer" | "removeServer" | "failoverServer" | "autoFailover" | "createServerGroup" | "deleteServerGroup" | "createDatabase" | "updateDatabase" | "dropDatabase" | "distributeTable" | "enableTableLedger" | "restorePreferredPrimaries" | "startRebalance" | "stopRebalance" | "cancelTask" | "createRole" | "updateRole" | "deleteRole" | "setRoleMemberships" | "setRoleClusterRoles" | "createGrant" | "revokeGrants" | "applyGrantTemplate" | "replaceNetworkAccess" | "updateClusterSettings" | "generateLedgerDigest" | "startLedgerVerification" | "executeQuery" | "acknowledgeAlert" | "renewServerCertificates" | "revokeServerCertificates" | "certificateRenewed" | "certificateRenewalFailed" | "cancelStatement" | "leaseLost" | "leaseFenced" | "leaseAcquired" | "standbyCreated" | "standbyRemoved" | "standbyRebuilt" | "standbyInstanceStarted" | "standbyInstanceRemoved" | "standbyInstanceRebuilt" | "synchronousStandbyNamesChanged" | "replicationSlotDropped" | "applyConfigChange" | "revertConfigChange" | "restartPendingInstances" | "resetAutoFailoverCounter" | "failoverGroupStarted" | "failoverGroupPromoted" | "failoverGroupFailed" | "oldPrimaryRebuilt" | "updateLedgerSettings" | "createLedgerSigningKey" | "retireLedgerSigningKey" | "revokeLedgerSigningKey" | "createLedgerAnchorTarget" | "updateLedgerAnchorTarget" | "deleteLedgerAnchorTarget" | "testLedgerAnchorTarget" | "anchorLedgerNow" | "retryLedgerAnchor" | "createLedgerBundle" | "registerLedgerClientKey" | "revokeLedgerClientKey" | "setTableSignaturePolicy" | "upgradeLedgerExtension" | "acknowledgeLedgerDivergence" | "previewTableChange" | "undistributeTable" | "alterTableDistribution" | "createTablePartition" | "attachTablePartition" | "detachTablePartition" | "dropTablePartition" | "configureApproximateAggregates" | "setTableStorage" | "setPartitionStorage" | "putPartitionPolicy" | "deletePartitionPolicy" | "runPartitionPolicy";
         /** @description One audit log entry. */
         AuditEvent: {
             /**
@@ -7458,7 +7919,7 @@ export interface components {
          *     `server:<leader>|behind:<server>`, `warning` after a minute, `critical` after ten).
          * @enum {string}
          */
-        AlertKind: "serverDown" | "serverSuspect" | "underReplicatedBuckets" | "unavailableBuckets" | "replicationLagHigh" | "diskSpaceLow" | "memoryPressure" | "rebalanceNeeded" | "autoFailoverTriggered" | "autoFailoverLimitReached" | "mapGroupUnavailable" | "ledgerVerificationFailed" | "ledgerPendingTooOld" | "versionMismatch" | "certificateExpiring" | "certificateRenewalFailed" | "replicationPending" | "taskFailed" | "leaseLost" | "groupWithoutSynchronousStandby" | "groupUnderReplicated" | "clockDifference" | "failoverNeedsDecision" | "failoverBlocked" | "failoverDataLoss" | "splitPromotion" | "oldPrimaryRunning" | "oldPrimaryNotStopped" | "oldPrimaryNotRebuilt" | "ledgerNotAnchored" | "ledgerAnchorBehind" | "ledgerAnchorFailed" | "ledgerAnchorConflict" | "ledgerChainDiverged" | "ledgerGroupUnread" | "ledgerPublicationBehind" | "ledgerSignerUnavailable" | "ledgerDigestOverdue" | "certificateAuthorityUnavailable";
+        AlertKind: "serverDown" | "serverSuspect" | "underReplicatedBuckets" | "unavailableBuckets" | "replicationLagHigh" | "diskSpaceLow" | "memoryPressure" | "rebalanceNeeded" | "autoFailoverTriggered" | "autoFailoverLimitReached" | "mapGroupUnavailable" | "ledgerVerificationFailed" | "ledgerPendingTooOld" | "versionMismatch" | "certificateExpiring" | "certificateRenewalFailed" | "replicationPending" | "taskFailed" | "leaseLost" | "groupWithoutSynchronousStandby" | "groupUnderReplicated" | "clockDifference" | "failoverNeedsDecision" | "failoverBlocked" | "failoverDataLoss" | "splitPromotion" | "oldPrimaryRunning" | "oldPrimaryNotStopped" | "oldPrimaryNotRebuilt" | "ledgerNotAnchored" | "ledgerAnchorBehind" | "ledgerAnchorFailed" | "ledgerAnchorConflict" | "ledgerChainDiverged" | "ledgerGroupUnread" | "ledgerPublicationBehind" | "ledgerSignerUnavailable" | "ledgerDigestOverdue" | "certificateAuthorityUnavailable" | "partitionsAheadLow" | "partitionPolicyFailed";
         /** @description An alert. */
         Alert: {
             /**
@@ -7780,6 +8241,8 @@ export interface components {
         TableName: string;
         /** @description Name of a user partition (added in 0.14.0). */
         PartitionName: string;
+        /** @description Identifier of a run of a time-partitioning policy (added in 0.18.0). */
+        PartitionRunId: number;
         /** @description Colocation group identifier. */
         ColocationId: number;
         /** @description Role name. */
@@ -8830,6 +9293,62 @@ export interface operations {
             503: components["responses"]["ServiceUnavailable"];
         };
     };
+    getApproximateAggregates: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The setting and the state of every server. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApproximateAggregates"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    configureApproximateAggregates: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ApproximateAggregatesRequest"];
+            };
+        };
+        responses: {
+            202: components["responses"]["AcceptedTask"];
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
     listTables: {
         parameters: {
             query?: {
@@ -8841,6 +9360,8 @@ export interface operations {
                 schema?: string;
                 /** @description Return only tables that have this class (a distributed ledger table matches both `distributed` and `ledger`). */
                 class?: components["schemas"]["TableClass"];
+                /** @description Added in 0.18.0. Return only tables stored in this format (a partitioned table matches `columnar` when any of its partitions is columnar). */
+                storage?: components["schemas"]["TableStorageAccessMethod"];
             };
             header?: never;
             path: {
@@ -9188,6 +9709,320 @@ export interface operations {
         };
         responses: {
             202: components["responses"]["AcceptedTask"];
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    setTableStorage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TableStorageRequest"];
+            };
+        };
+        responses: {
+            202: components["responses"]["AcceptedTask"];
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    setPartitionStorage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+                /** @description Name of a user partition (added in 0.14.0). */
+                partitionName: components["parameters"]["PartitionName"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PartitionStorageRequest"];
+            };
+        };
+        responses: {
+            202: components["responses"]["AcceptedTask"];
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getPartitionPolicy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The policy. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PartitionPolicy"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    putPartitionPolicy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PartitionPolicyRequest"];
+            };
+        };
+        responses: {
+            /** @description The policy as stored. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PartitionPolicy"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    deletePartitionPolicy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    listPartitionPolicyRuns: {
+        parameters: {
+            query?: {
+                /** @description Maximum number of items to return. */
+                limit?: components["parameters"]["Limit"];
+                /** @description Opaque cursor taken from `nextCursor` of the previous page. Omit for the first page. */
+                cursor?: components["parameters"]["Cursor"];
+                /** @description Return only runs in this state. */
+                state?: components["schemas"]["PartitionRunState"];
+            };
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A page of runs. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PartitionRunPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    runPartitionPolicy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["RunPartitionPolicyRequest"];
+            };
+        };
+        responses: {
+            202: components["responses"]["AcceptedTask"];
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getPartitionPolicyRun: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+                /** @description Identifier of a run of a time-partitioning policy (added in 0.18.0). */
+                runId: components["parameters"]["PartitionRunId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The run. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PartitionRun"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    planPartitionPolicy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["PlanPartitionPolicyRequest"];
+            };
+        };
+        responses: {
+            /** @description The plan. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PartitionPlan"];
+                };
+            };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];

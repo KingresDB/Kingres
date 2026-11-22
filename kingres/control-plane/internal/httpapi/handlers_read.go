@@ -310,7 +310,7 @@ func (s *Server) listTasks(_ *call, w http.ResponseWriter, r *http.Request) erro
 		State: pp.enum("state", "pending", "running", "paused", "failed", "done"),
 		Kind: pp.enum("kind", "cluster.init", "cluster.join", "server.add", "server.remove", "server.failover",
 			"server.leave", "instance.start", "instance.stop", "instance.restart", "database.create",
-			"database.update", "database.drop", "table.distribute", "table.undistribute", "table.alter", "table.partition", "rebalance",
+			"database.update", "database.drop", "table.distribute", "table.undistribute", "table.alter", "table.partition", "database.approximateAggregates", "table.setStorage", "partition.maintain", "rebalance",
 			"replication.restorePreferredPrimaries", "ledger.verify", "networkAccess.apply", "replicate.apply",
 			"certificate.renew", "certificate.revoke", "standby.reconcile", "config.apply", "config.restart",
 			"ledger.key.create", "ledger.key.rotate", "ledger.key.retire", "ledger.key.revoke", "ledger.key.distribute",

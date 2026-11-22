@@ -215,6 +215,8 @@ export const ALERT_KIND_LABEL: Record<AlertKind, string> = {
   ledgerSignerUnavailable: 'Ledger checkpoints cannot be signed',
   ledgerDigestOverdue: 'No ledger digest for too long',
   certificateAuthorityUnavailable: 'The certificate authority is unavailable',
+  partitionsAheadLow: 'Partitions ahead are running low',
+  partitionPolicyFailed: 'A partitioning policy failed',
 }
 
 /** The label of an alert kind; a kind from a newer server is shown as sent (through SafeName). */
@@ -240,6 +242,9 @@ export const TASK_KIND_LABEL: Record<TaskKind, string> = {
   'table.undistribute': 'Undistribute a table',
   'table.alter': 'Change the distribution of a table',
   'table.partition': 'Change the partitions of a table',
+  'database.approximateAggregates': 'Change approximate aggregates',
+  'table.setStorage': 'Change the storage of a table',
+  'partition.maintain': 'Maintain the partitions of a table',
   rebalance: 'Rebalance',
   'replication.restorePreferredPrimaries': 'Restore preferred primaries',
   'ledger.verify': 'Verify the ledger',
@@ -357,6 +362,12 @@ export const AUDIT_ACTION_LABEL: Record<AuditAction, string> = {
   attachTablePartition: 'Attach a partition',
   detachTablePartition: 'Detach a partition',
   dropTablePartition: 'Drop a partition',
+  configureApproximateAggregates: 'Change approximate aggregates',
+  setTableStorage: 'Change the storage of a table',
+  setPartitionStorage: 'Change the storage of a partition',
+  putPartitionPolicy: 'Set a partitioning policy',
+  deletePartitionPolicy: 'Remove a partitioning policy',
+  runPartitionPolicy: 'Run a partitioning policy',
   enableTableLedger: 'Enable the ledger of a table',
   restorePreferredPrimaries: 'Restore preferred primaries',
   startRebalance: 'Start a rebalance',

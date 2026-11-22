@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.14.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.18.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and, when it is built, the planned `kingres-cli` (it does not exist yet). Lint it and run the mechanical rule check with:
 
 ```
@@ -149,6 +149,9 @@ Each task kind has exactly one `subject.type`; `subject.id` is always a string.
 | `certificate.renew`, `certificate.revoke` (0.5.0) | `server` | the `ServerId` whose certificates are renewed or revoked |
 | `instance.start`, `instance.stop`, `instance.restart` | `instance` | the instance id (`node_id`) as a decimal string |
 | `database.create`, `database.update`, `database.drop` | `database` | the database name |
+| `database.approximateAggregates` (0.18.0) | `database` | the database name (the subject of `database.update`; a second `database.*` task on the database is 409 `operation_in_progress`). Steps: `Check the servers`, `Install the extension on server <id>` (one per server), `Verify versions and hashes`, `Apply the database settings`, `Record the settings` |
+| `table.setStorage` (0.18.0) | `table` | `database/schema.table`; for one partition (`setPartitionStorage`) `database/schema.partition`. Steps: `check`, `convert` (the detail says that `ALTER TABLE ... SET ACCESS METHOD` takes an `ACCESS EXCLUSIVE` lock), `analyze` |
+| `partition.maintain` (0.18.0) | `table` | `database/schema.table`: one run of the time-partitioning policy of the table. Steps: `begin`, `create`, `convert`, `retire`, `finish`. The task's `createdBy` is `system` for a scheduled run and the role for `runPartitionPolicy` |
 | `table.distribute`, `table.undistribute`, `table.alter`, `table.partition` | `table` | `database/schema.table` (0.14.0: the table the request named; one table task per colocation group) |
 | `rebalance` | `cluster` | `cluster` (0.9.0; one rebalance at a time, cluster-wide; the task id is the report id): steps `Check that the cluster can rebalance`, `Compute the plan`, `Move buckets`, `Write the report`; a stopped run is `paused` |
 | `replication.restorePreferredPrimaries` | `replication` | `preferred-primaries` (0.10.0: answers `unsupported_operation` until the switchover is built) |
@@ -317,6 +320,28 @@ Where the architecture document leaves something open, the simplest option was c
     range and the cluster's replica count.
 
 ## Changelog
+
+### 0.18.0
+
+Revision written with the control plane of phase 12 (analytics; `kingres/docs/design/analytics-phase12-queries.md` section 12 and `analytics-phase12-storage.md` section 13).
+It is numbered 0.18.0 because 0.15.0 to 0.17.0 are taken by other branches; the integrator renumbers at merge. Summary for the panel:
+11 operations added (151 operations, 120 paths); one query parameter, optional properties of three schemas and enum values added; **no change that is not additive**.
+
+#### Breaking
+
+None.
+
+#### Additive
+
+- `getApproximateAggregates` and `configureApproximateAggregates` (`GET` and `PUT /databases/{databaseName}/approximate-aggregates`, task kind `database.approximateAggregates`): install `kingres_sketch` on every server, check version and hash, apply `kingres_shard.count_distinct_mode`, `count_distinct_error_rate` and `enable_sketch_pushdown`, and record the setting. Turning it off never drops the extension. `Database` has the optional `approximateAggregates`.
+- `setTableStorage` (`PUT .../tables/{tableName}/storage`) and `setPartitionStorage` (`PUT .../partitions/{partitionName}/storage`), task kind `table.setStorage`: convert a table or one partition between heap and columnar.
+- `getPartitionPolicy`, `putPartitionPolicy`, `deletePartitionPolicy`, `runPartitionPolicy` (task kind `partition.maintain`), `listPartitionPolicyRuns`, `getPartitionPolicyRun` and `planPartitionPolicy` (`POST .../partition-policy/plan`, a dry run, `kingres_readonly`, not audited): the time-partitioning policy of a table, its runs and a preview.
+- `Table` has the optional `storage` and, inside `partitioning`, the optional `columnType`, `hasPolicy` and `defaultPartition`; `listTables` has the query parameter `storage`; `TablePartition` has the optional `accessMethod`, `rangeFrom`, `rangeTo`, `estimatedRows` and `compressionRatio`.
+- `ProblemCode` has `extension_unavailable`, `extension_version_mismatch`, `sketch_hash_mismatch`, `extension_missing`, `conversion_refused` and `partition_policy_conflict`; `TaskKind` has `database.approximateAggregates`, `table.setStorage` and `partition.maintain`; `AlertKind` has `partitionsAheadLow` and `partitionPolicyFailed`; `AuditAction` has the six new mutating operations.
+
+#### Documentation
+
+- `listTablePartitions` (0.14.0) lists the user partitions of a distributed table; from 0.18.0 it also lists the partitions of an ordinary range-partitioned table. A client that does not know the new properties and codes works as before.
 
 ### 0.14.0
 

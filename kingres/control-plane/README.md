@@ -334,12 +334,12 @@ handlers in `internal/httpapi/handlers_config.go`, wiring in `cmd/kingresd/confi
 
 ## What is implemented
 
-The server implements revision **0.14.0** of the contract (140 operations, 113
+The server implements revision **0.18.0** of the contract (151 operations, 120
 paths; what is not done is in "Not done in this increment"). "Real" means the operation works against PostgreSQL or the local node
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **139 of 140 operations are real; 1 answer "not yet".**
+authenticated operation lists in 0.2.0. **139 of 151 operations are real; 12 answer "not yet".**
 
 | Tag | Real | Not yet |
 |---|---|---|
@@ -348,10 +348,10 @@ authenticated operation lists in 0.2.0. **139 of 140 operations are real; 1 answ
 | Auth | `login`, `logout`, `getSession` |  |
 | Cluster | `getCluster`, `getClusterSummary` |  |
 | Roles | `listClusterRoles`, `listRoles`, `createRole`, `getRole`, `deleteRole`, `updateRole`, `setRoleClusterRoles`, `setRoleMemberships` |  |
-| Databases | `getDatabaseCreateOptions`, `listDatabases`, `createDatabase`, `getDatabase`, `dropDatabase`, `updateDatabase` |  |
+| Databases | `getDatabaseCreateOptions`, `listDatabases`, `createDatabase`, `getDatabase`, `dropDatabase`, `updateDatabase` | `getApproximateAggregates`, `configureApproximateAggregates` |
 | Shards | `getBucketDistribution`, `listColocationGroups`, `listBuckets` |  |
 | Ledger | `getLedgerStatus`, `listLedgerBlocks`, `listLedgerDigests`, `generateLedgerDigest`, `startLedgerVerification`, `listLedgerStatus`, `createInclusionProof`, `listLedgerVerifications`, `getLedgerVerification`, `getLedgerSettings`, `updateLedgerSettings`, `getLedgerSigning`, `createLedgerSigningKey`, `retireLedgerSigningKey`, `revokeLedgerSigningKey`, `getLedgerTrustFile`, `getLedgerPublication`, `getLedgerAggregate`, `listLedgerAggregates`, `listLedgerAnchorTargets`, `createLedgerAnchorTarget`, `getLedgerAnchorTarget`, `updateLedgerAnchorTarget`, `deleteLedgerAnchorTarget`, `testLedgerAnchorTarget`, `listLedgerAnchors`, `anchorLedgerNow`, `retryLedgerAnchor`, `downloadLedgerAnchor`, `listLedgerClientKeys`, `registerLedgerClientKey`, `revokeLedgerClientKey`, `setTableSignaturePolicy`, `upgradeLedgerExtension`, `createLedgerBundle`, `getLedgerBundle`, `acknowledgeLedgerDivergence` | |
-| Tables | `getTable`, `distributeTable`, `enableTableLedger`, `listTables`, `previewTableChange`, `undistributeTable`, `alterTableDistribution`, `listTablePartitions`, `createTablePartition`, `attachTablePartition`, `detachTablePartition`, `dropTablePartition` |  |
+| Tables | `getTable`, `distributeTable`, `enableTableLedger`, `listTables`, `previewTableChange`, `undistributeTable`, `alterTableDistribution`, `listTablePartitions`, `createTablePartition`, `attachTablePartition`, `detachTablePartition`, `dropTablePartition` | `setTableStorage`, `setPartitionStorage`, `getPartitionPolicy`, `putPartitionPolicy`, `deletePartitionPolicy`, `runPartitionPolicy`, `listPartitionPolicyRuns`, `getPartitionPolicyRun`, `planPartitionPolicy` |
 | Grants | `listGrants`, `createGrant`, `revokeGrants`, `applyGrantTemplate` |  |
 | Health | `getHealth`, `getReadiness` |  |
 | Logs | `listLogs` |  |
