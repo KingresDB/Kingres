@@ -525,7 +525,7 @@ async function openTablePage(page: Page, table: string): Promise<void> {
  * leave-cluster and instance dialogs, and the state of a stopped system database. Used by the axe, layout
  * and content-security-policy runs (W2-16).
  */
-const BASE_STATES: PageState[] = [
+export const STATES: PageState[] = [
   {
     // 0.9.0: the plan of a rebalance listed with its servers, and a start that the server refuses
     // (the mock refuses an empty plan with its own notice).
@@ -1549,5 +1549,3 @@ export const ANALYTICS_STATES: PageState[] = [
     },
   },
 ]
-
-export const STATES: PageState[] = [...BASE_STATES, ...ANALYTICS_STATES]

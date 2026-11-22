@@ -7,6 +7,49 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-22: the analytics console (phase 12, steps W1 and W2) on contract 0.18.0
+
+Branch p12-web, from the contract commit `7d43a79a3f` of p12-cp. The table page of increment 9.7 (branch web-15b, one commit) is not on kingres-18, and the Storage column, the partitions panel and the policy need it, so that commit is taken first (cherry-picked, the same change). The control plane of phase 12 is built on p12-cp by another writer; nothing in `kingres/api` or in Go is changed here.
+
+### What was done
+
+- **Approximate aggregates** (inventory row Q-W1): `ApproximateAggregatesCard` on the database page and `ApproximateAggregatesDialog` (a switch, the mode of count(DISTINCT), the error rate in percent, the consequence in words, the task with its five steps). The three new problem codes of the extension have their own words.
+- **Plan summary** (Q-W1, and the phase 2b item "EXPLAIN path summary in the workbench"): `lib/plan-summary.ts` reads the lines `Pushed:`, `Repartition:`, `Pushdown: not used:`, `Rewritten:` and `Remote groups:` of an EXPLAIN result and shows one line above the monospaced plan (path, why not, rewrite); no line it knows, no summary. The help text with the sketch functions appears when the database has the extension; the note says EXPLAIN ANALYZE and MERGE run the statement.
+- **Storage** (St-W1): `StorageBadge` and the Storage column and filter of the tables list; the Storage row, the format, range, rows and ratio of each partition, a filter by format and a marker with progress on the row of a partition that is being converted, on the table page.
+- **Policy and runs** (St-W1, St-W2): `PartitionPolicyPanel` (policy, health line, next and last run, runs list), `PartitionRunDialog` (a run with its actions, failures in words), `PartitionPolicyDialog` (the form, **Preview** through `planPartitionPolicy`, the field errors from the JSON pointers, the table name typed when a retention is new or shorter, and a preview of the form as it is then), `RunPolicyDialog` (the plan first, then the task), `RemovePolicyDialog`, and the link of the two new alert kinds to the table.
+- **Convert storage** (St-W2): `SetStorageDialog` for a table or one partition (codec, level, stripe and chunk rows, sort order of a partition, what the console already knows that stops it, the reasons of `conversion_refused` listed, cancel until the switch).
+- **Mock** (`src/mocks/analytics.ts`, switch `?analytics=`): all eleven operations as the contract says, including the tasks, the problem codes, the idempotency of configure and put, the dry run that changes nothing, the 404 of a table without a policy, the roles and `unsupported_operation` on an older server. `describeTable` adds `storage` and the new members of `partitioning`; `listTablePartitions` answers the format, range, rows and ratio.
+- README of the web panel: a section for the analytics console and the switch `?analytics=`. The notes on what the contract does not say are in the report of the writer (11 items: the subject of the partition alerts, no preview of a storage change, no way to install kingres_columnar, the step names, the shapes of the intervals, and others).
+- A separate commit formats three files that were unformatted before this work (`api/problem.ts`, `contract-0-4.test.ts`, `kind-labels.test.ts`); `npm run lint` fails without it.
+
+### How it was checked
+
+- `npm run typecheck`, `npm run lint` (eslint and prettier) and `npm run api:check` (the generated files are up to date with the contract at `7d43a79a3f`): clean.
+- `npx vitest run` (two workers): 95 files, 1674 tests passed. New: `analytics-lib-0-18` (46), `analytics-mock-0-18` (49), `analytics-ui-0-18` (65). One existing test, in `hostile.test.ts`, asked for "the table" of the database page and now names it, because the page has a second table (the servers of the card). `tables-0-14-mock.test.ts` compares `partitioning` with `toMatchObject` now, because 0.18.0 adds members to it. The full run once showed `task-notices.test.ts` timing out under load; it passes alone and in the later full run.
+- `npm run test:browser` (Chrome): 4 files, 48 tests passed. The new file runs the eight states of phase 12 through axe in light and dark at 1366 and 320 px (no violation) and checks that no page scrolls sideways and that each dialog and its buttons stay inside the window at 1366 and 320 px.
+- Mutants, each caught and reverted (the tree was clean after each): a new or shorter retention no longer needs the name typed; a missing ratio shown as `0.0 x`; a repartitioned join read as a colocated one (survived at first because the Repartition line gave the same answer; a test of the Pushed line alone was added, then caught); the mock accepts a columnar_after longer than the retention; the mock does not refuse a conversion for its reasons; the mock plan changes the partitions; a blocked storage change can still start; saving a retention does not ask for the name; saving a retention needs no preview; a preview of an older form is taken for the current one; the error rate of the dialog is not checked; a conversion of a partition does not hold the table page; the Storage filter shows every table; the plan is audited or needs admin (role change); a server without the sketch package is not refused; a hidden character of a server id shown as it is; in the browser: a select without a label (axe), a 900 px wide grid at 320 px (layout), an unnamed button (axe).
+- `git diff --check`, the scan for the project name misspelt with a double s, and the scan for local paths in the changed files: clean.
+
+### Decisions and deviations
+
+- The Storage filter is made in the panel from `Table.storage`; the server's `storage` parameter is implemented in the mock but not sent (the whole list is read anyway).
+- `Convert storage` is not offered for a distributed table or for the partitions of one (the release has heap distributed partitions only; D1b is later).
+- The alert link reads the table from `aspect` `table:<schema>.<table>`, which the contract does not define (note 1 of the report).
+- The mock uses the step names of the README for `table.setStorage` and `partition.maintain` (lower case), as the README gives them.
+
+### Still open
+
+- The contract notes (11 items) for the writer of the control plane.
+- No install action for `kingres_columnar` (no operation for it); no preview for a storage change; the alert subject of the partition alerts; the distributed tables.
+- The end-to-end run against a real `kingresd` once the control plane of phase 12 is built.
+- Not pushed.
+
+### Core patches
+
+none
+
+---
+
 ## 2026-11-22: the table page and the table dialogs of the console (phase 9, increment 9.7) moved onto the control plane of 9.6
 
 Branch web-15b (from m18) carries the one console commit of web-15 for increment 9.7, cherry-picked so that the history stays one commit. web-15 also holds the failover console of contract 0.15.0, which m18 does not have; it is not taken here.

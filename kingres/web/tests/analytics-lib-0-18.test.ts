@@ -293,6 +293,17 @@ describe('the summary of an EXPLAIN', () => {
   ])('reads %s', (_n, lines, path) => {
     expect(summarizePlan(lines)?.path).toBe(path)
   })
+  it('reads the path from the Pushed line alone, without a Repartition line', () => {
+    expect(summarizePlan(['  Pushed: join (orders, events: repartitioned)'])?.path).toBe(
+      'repartitioned join',
+    )
+    expect(summarizePlan(['  Pushed: join (orders, customers: key class customer_id)'])?.path).toBe(
+      'colocated join',
+    )
+    expect(summarizePlan(['  Pushed: aggregate (by key), sort, limit 20'])?.path).toBe(
+      'pushed aggregate',
+    )
+  })
   it('keeps the first reason of each line that says a path was not used', () => {
     const s = summarizePlan(NOT_PUSHED)
     expect(s?.path).toBe('scan')
