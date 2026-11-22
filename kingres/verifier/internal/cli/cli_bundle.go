@@ -13,6 +13,7 @@ import (
 
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/bundleidx"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/events"
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/merkle"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/proof"
 )
 
@@ -307,7 +308,7 @@ func (e *env) bundleVerifyRun(r *result, a bundleVerifyArgs) outcome {
 		if chosen > 0 {
 			if w, werr := p.events(); werr == nil && w != nil {
 				if _, closed := w.EpochClosed[events.ChainKey(pr.ChainID, chosen)]; closed {
-					inClosed = append(inClosed, proofInClosed{label: label, chain: pr.ChainID, epoch: chosen, height: pr.Block.Height})
+					inClosed = append(inClosed, proofInClosed{label: label, chain: pr.ChainID, epoch: chosen, height: pr.Block.Height, leaf: merkle.LeafHash(pr.Block.BlockHashInput())})
 				}
 			}
 		}
@@ -315,7 +316,7 @@ func (e *env) bundleVerifyRun(r *result, a bundleVerifyArgs) outcome {
 			r.notes = append(r.notes, fmt.Sprintf("%s: the aggregate log %s covers epoch %d of the chain and the block is in epoch %d, so the aggregate leg was not made", label, aggID[:8], epoch, chosen))
 		} else if aggID != "" {
 			sub2 := &result{cmd: r.cmd}
-			out := e.proofLegCore(sub2, p, bytesOpener(data), proof.Expect{}, proofLegArgs{leg: "aggregate", aggID: aggID, epoch: uint64(epoch)}, nil)
+			out := e.proofLegCore(sub2, p, bytesOpener(data), proof.Expect{}, proofLegArgs{leg: "aggregate", aggID: aggID, epoch: uint64(epoch), accept: acc}, nil)
 			if !out.ok() {
 				if out.kind == outFailed {
 					out.err = fmt.Errorf("%s (%s) against the aggregate: %w", label, pe.File, out.err)
@@ -416,6 +417,7 @@ func (e *env) bundleVerifyRun(r *result, a bundleVerifyArgs) outcome {
 		return epochOut
 	}
 	r.notes = append(r.notes, acc.unusedNotes()...)
+	r.notes = append(r.notes, p.restoreNotes()...)
 	timeClaim := "when anything in the bundle was made: no anchor was verified, every time is the signer's claim"
 	if anchorsVerified > 0 {
 		timeClaim = "when anything in the bundle was made that no verified anchor covers: block and event times are the signer's claim, and an anchor shows only that one digest existed by its time"

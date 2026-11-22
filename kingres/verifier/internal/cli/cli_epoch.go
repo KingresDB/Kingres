@@ -219,7 +219,7 @@ func (p *pubInputs) closedEpochNotes(rep *aggReport) []string {
 // commonRemark says whether a block at height h is below the common height that an epoch-closed event states.
 func commonRemark(ec events.EpochClosed, h uint64) string {
 	if ec.CommonKnown && int64(h) <= ec.CommonHeight { // #nosec G115 -- a height is below 2^62
-		return fmt.Sprintf(" (the event states common height %d and this block has height %d: by that statement it is in the history that goes on as well)", ec.CommonHeight, h)
+		return fmt.Sprintf(" (the event states common height %d and this block has height %d: the log of the next epoch was not opened by this command, so this run did not test that the block is in the history that goes on)", ec.CommonHeight, h)
 	}
 	return ""
 }

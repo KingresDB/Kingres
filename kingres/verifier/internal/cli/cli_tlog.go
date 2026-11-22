@@ -599,7 +599,11 @@ func (e *env) runConsistency(args []string) int {
 	// says so and names the rebase. The status stays 1.
 	weakWrap := func(err error) error {
 		if oldHeld != nil && oldHeld.weak {
-			return fmt.Errorf("%w (%s. %s)", err, weakCause(oldHeld), weakAdvice(oldCP.Size))
+			err = fmt.Errorf("%w (%s. %s)", err, weakCause(oldHeld), weakAdvice(oldCP.Size))
+		}
+		// a log that a restore cut: the event that says so is named next to the failure (P7R-09)
+		if rr := in.restoreRemarkFor(); rr != "" {
+			err = fmt.Errorf("%w%s", err, rr)
 		}
 		return err
 	}

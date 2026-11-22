@@ -28,9 +28,11 @@ const (
 // Calls lists the keys of the internal calls the agent answers.
 var Calls = []string{CallCredentialsInstall, CallCredentialsRemove, CallCredentialsList, CallCredentialsFetch}
 
-// ListResponse is the answer of CallCredentialsList: the target ids that the server has a file for.
+// ListResponse is the answer of CallCredentialsList: the target ids that the server has a file for, and for each file that can be opened
+// its rotation generation and the keyed digest of what it holds (P7F-01; an older server sends no copies, and the leader then cannot tell a stale file).
 type ListResponse struct {
-	IDs []int64 `json:"ids"`
+	IDs    []int64    `json:"ids"`
+	Copies []CopyInfo `json:"copies,omitempty"`
 }
 
 // FetchRequest is the body of CallCredentialsFetch; FetchResponse its answer, the file as the holder has it (standard base64).
@@ -48,6 +50,21 @@ type InstallRequest struct {
 	TargetID int64  `json:"targetId"`
 	Kind     string `json:"kind"`
 	File     string `json:"file"`
+	// Known is the highest generation that the leader saw at the holders: the reference of the bound for a holder that has no file (P7I-01).
+	Known uint64 `json:"known,omitempty"`
+}
+
+type knownKey struct{}
+
+// WithKnownGeneration carries the highest generation seen at the holders to the function that hands a file over.
+func WithKnownGeneration(ctx context.Context, g uint64) context.Context {
+	return context.WithValue(ctx, knownKey{}, g)
+}
+
+// KnownGeneration is what WithKnownGeneration carried (0 when nothing).
+func KnownGeneration(ctx context.Context) uint64 {
+	g, _ := ctx.Value(knownKey{}).(uint64)
+	return g
 }
 
 // RemoveRequest is the body of CallCredentialsRemove.
@@ -80,7 +97,16 @@ func (a *Agent) Handle(_ context.Context, key string, body []byte) (any, error) 
 		if _, err := kindOf(in.Kind); err != nil {
 			return nil, bad("bad_request", "The kind is not known on this server.", http.StatusBadRequest)
 		}
-		if err := a.Creds.Install(in.TargetID, in.Kind, raw); err != nil {
+		if err := a.Creds.InstallFrom(in.TargetID, in.Kind, raw, InstallSource{Leader: true, Known: in.Known}); err != nil {
+			if errors.Is(err, ErrGenerationJump) {
+				return nil, bad("generation_too_far", "The generation of the file is far above the one of this server: if this server's file is damaged, remove it (<key directory>/anchor/<id>.json) and the next pass gives it the leader's file.", http.StatusConflict)
+			}
+			if errors.Is(err, ErrOlderGeneration) {
+				return nil, bad("older_generation", "This server holds a newer credentials file for the target, or a different one of the same generation.", http.StatusConflict)
+			}
+			if errors.Is(err, ErrInstallWrite) {
+				return nil, bad("credentials_not_written", "The credentials file could not be written on this server.", http.StatusInternalServerError)
+			}
 			if errors.Is(err, ErrCredentials) {
 				return nil, bad("passphrase_mismatch", "The credentials file cannot be opened with this server's passphrase file.", http.StatusConflict)
 			}
@@ -95,7 +121,13 @@ func (a *Agent) Handle(_ context.Context, key string, body []byte) (any, error) 
 		if ids == nil {
 			ids = []int64{}
 		}
-		return ListResponse{IDs: ids}, nil
+		out := ListResponse{IDs: ids}
+		for _, id := range ids {
+			if c, err := a.Creds.Digest(id); err == nil {
+				out.Copies = append(out.Copies, c)
+			}
+		}
+		return out, nil
 	case CallCredentialsFetch:
 		var in FetchRequest
 		if err := json.Unmarshal(body, &in); err != nil || in.TargetID < 1 {
@@ -104,7 +136,7 @@ func (a *Agent) Handle(_ context.Context, key string, body []byte) (any, error) 
 		raw, err := a.Creds.Raw(in.TargetID)
 		switch {
 		case errors.Is(err, ErrNoCredentials):
-			return nil, bad("not_found", "This server has no credentials file for the target.", http.StatusNotFound)
+			return nil, bad("not_found", FetchNoneMessage, http.StatusNotFound)
 		case err != nil:
 			return nil, bad("credentials_invalid", "The credentials file could not be read.", http.StatusUnprocessableEntity)
 		}
@@ -122,3 +154,7 @@ func (a *Agent) Handle(_ context.Context, key string, body []byte) (any, error) 
 	}
 	return nil, bad("not_found", "No such call.", http.StatusNotFound)
 }
+
+// FetchNoneMessage is the text of the 404 answer of a holder that has no credentials file for the target. A 404 with another text (a server that
+// does not know the call) does not say that the holder has none (P7R-08).
+const FetchNoneMessage = "This server has no credentials file for the target."

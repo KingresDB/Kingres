@@ -117,5 +117,8 @@ func (in *logInputs) applyEvents() error {
 	in.notes = append(in.notes, kn...)
 	in.notes = append(in.notes, skippedNotes(w)...)
 	in.notes = append(in.notes, in.closedEpochNote(w)...)
+	if in.spec.kind == "aggregate" {
+		in.notes = append(in.notes, restoreNotes(w)...)
+	}
 	return nil
 }

@@ -36,6 +36,9 @@ const (
 	// and the conflicting checkpoint could not be saved: the finding stands and
 	// the auditor must keep the note they were shown themselves.
 	ExitEvidenceLost = 4
+	// ExitNotRelease means that `release verify` found the signature and the hashes genuine and the set made by a dry run (the signed RELEASE file says
+	// the commit or its date is unknown): a signed build that is not a release. --accept-dry-run turns it into status 0 (P7G-06).
+	ExitNotRelease = 5
 )
 
 const (

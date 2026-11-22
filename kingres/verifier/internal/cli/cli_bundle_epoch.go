@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/events"
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/merkle"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/proof"
 )
 
@@ -39,6 +40,7 @@ type proofInClosed struct {
 	chain  [32]byte
 	epoch  uint32
 	height uint64
+	leaf   merkle.Hash // the leaf hash of the block, as the proof shows it
 }
 
 // proofEpochs shows a proof in the epochs of its chain that the bundle holds, newest first, and returns the epoch that shows the
@@ -149,7 +151,19 @@ func (p *pubInputs) auditEpochs(r *result, bc *bundleChains, found []proofInClos
 			continue
 		}
 		if ec.CommonKnown && int64(f.height) <= ec.CommonHeight { // #nosec G115 -- a height is below 2^62
-			r.notes = append(r.notes, fmt.Sprintf("%s: the block has height %d, at or below the common height %d that the event %06d states for the closed epoch %d: by that statement it is in the history that goes on as well", f.label, f.height, ec.CommonHeight, ec.Seq, ec.Epoch))
+			// The event states that the two histories share this height. The statement is tested, not believed (P7R-02): when
+			// the log of the next epoch is in the bundle, the block must be in it at that height.
+			next := bc.logs[events.ChainKey(f.chain, f.epoch+1)]
+			if next == nil {
+				r.notes = append(r.notes, fmt.Sprintf("%s: the block has height %d, at or below the common height %d that the event %06d states for the closed epoch %d; the log of epoch %d is not in the bundle, so this run did not test that statement and does not show that the block is in the history that goes on", f.label, f.height, ec.CommonHeight, ec.Seq, ec.Epoch, f.epoch+1))
+				continue
+			}
+			if why := blockNotInLog(next, f.height, f.leaf); why != "" {
+				return info, failedOut("epoch-closed", fmt.Errorf("%s shows its block (height %d) in epoch %d, and the event %06d states common height %d for that epoch, which says the block is in epoch %d as well; it is not: %s. The event and the logs disagree", f.label, f.height, ec.Epoch, ec.Seq, ec.CommonHeight, f.epoch+1, why))
+			}
+			// There is no success note here (P7F-03): proofEpochs tries the newest epoch first, so a block that is also leaf h of the log of the
+			// next epoch is found there and is never listed as found in the closed one. A block that is listed here has failed the inclusion in the
+			// next log already, so the check above fails for it; the check stays as a second line behind proofEpochs.
 			continue
 		}
 		if !acc.want[ec.Seq] {
@@ -172,4 +186,19 @@ func hasStep(r *result, name string) bool {
 		}
 	}
 	return false
+}
+
+// blockNotInLog says why the block with leaf hash leaf is not leaf h of the signed log ol, or "" when it is.
+func blockNotInLog(ol *openedLog, h uint64, leaf merkle.Hash) string {
+	if h >= ol.cp.Size {
+		return fmt.Sprintf("that log has %d block(s), heights 0 to %d", ol.cp.Size, ol.cp.Size-1)
+	}
+	path, err := ol.reader.InclusionProof(h)
+	if err != nil {
+		return "the tiles of that log could not give the path of the height: " + err.Error()
+	}
+	if err := merkle.VerifyPath(leaf, h, ol.cp.Size, path, ol.cp.Root); err != nil {
+		return fmt.Sprintf("leaf %d of the signed log of size %d is another block", h, ol.cp.Size)
+	}
+	return ""
 }

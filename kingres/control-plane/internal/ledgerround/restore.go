@@ -118,7 +118,7 @@ func (c *Collector) announceRestore(ctx context.Context) error {
 		{Name: "reason", Value: n.Reason},
 		{Name: "acknowledged-by", Value: n.Actor},
 	}
-	if _, err := c.cfg.Keys.AppendEvent(ctx, EventRestoreAcknowledged, "generation:"+strconv.FormatInt(snap.Generation, 10), fields); err != nil {
+	if _, err := c.cfg.Keys.AppendEvent(ctx, EventRestoreAcknowledged, restoreSubject(snap.Generation, n.PublishedSHA), fields); err != nil {
 		return fmt.Errorf("publishing the event of the accepted restore: %w", err)
 	}
 	return p.ClearRestore()
@@ -167,4 +167,16 @@ func (c *Collector) replacementDone(db string, g int32) {
 	c.mu.Lock()
 	delete(c.replacing, replaceKey(db, g))
 	c.mu.Unlock()
+}
+
+// restoreSubject is the subject of the event of an accepted restore: the generation and the first sixteen hexadecimal digits of the sum of the
+// record that the acceptance replaced. The generation alone is not enough: a record that was lost and made again from the database starts at
+// generation 0 and reaches a number that an earlier restore had, and an event with the same subject is taken for the one that is already
+// published, so the second cut would never be announced (P7F-07). Announcing the same restore again gives the same subject and finds the
+// event that is there.
+func restoreSubject(generation int64, publishedSHA string) string {
+	if len(publishedSHA) > 16 {
+		publishedSHA = publishedSHA[:16]
+	}
+	return "generation:" + strconv.FormatInt(generation, 10) + ":" + publishedSHA
 }
