@@ -3147,13 +3147,13 @@ paths:
         and starts the task `config.apply`: it checks the request again, records the change, then writes the
         override file of each server, checks it with PostgreSQL, reloads and reads the effective values back, one step
         per server. A parameter that needs a restart is reported `pendingRestart` per server; nothing is restarted
-        (see `restartPendingInstances`). A server that is down gets the change when it returns (the step waits and says
-        which). A server that fails does not stop the others: the task ends failed with `config_incomplete`, and the
+        (see `restartPendingInstances`). A server that is down is recorded as waiting and the task goes on and ends without it (changed in 0.17.0: before, the task waited for it and blocked every later change); the leader brings it up to date within a minute of its return
+        (`listConfigServers` shows it as `waiting`). A server that fails does not stop the others: the task ends failed with `config_incomplete`, and the
         steps and `listConfigServers` say which servers applied, wait for a restart, failed or wait. Refused with 400
         `validation_failed` (a value that is not valid for its parameter; `errors[]` names the change) and 422
         `config_parameter_managed`, `config_parameter_refused`, `config_level_not_allowed` and `config_value_below_floor`;
-        404 `not_found` for an unknown server group, server or database; 409 `operation_in_progress` while another
-        configuration task runs. Nothing is written before every change has passed.
+        404 `not_found` for an unknown server group, server or database; 409 `config_change_superseded` when `expectedRevision` is older than a change of a value the request changes (0.17.0); 409 `operation_in_progress` while another
+        configuration task runs. Nothing is written before every change has passed. A stored value can always be removed (`value: null`), also when its parameter has become managed or refused since it was set (0.17.0). The audit event has the checked changes with the old and the normalized new value, the servers and the task id; a refused request is audited with the names and levels only, never a value.
       tags: [Configuration]
       x-required-role: kingres_admin
       requestBody:
@@ -9514,6 +9514,16 @@ components:
           minItems: 1
           maxItems: 100
           items: { $ref: '#/components/schemas/ConfigChangeItem' }
+        expectedRevision:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Added in 0.17.0, optional. The configuration revision the client saw (`ConfigParameter.overrides[].revision`, or
+            `ConfigParameterList.revision`; 0 when it saw no stored value). `applyConfigChange` answers 409
+            `config_change_superseded` when a value the request changes was changed by a later revision, unless it already holds the
+            wanted value (so the repeat of a request whose change was recorded passes). Without it nothing is compared and the
+            last request wins, as before. `previewConfigChange` ignores it.
     ConfigProblem:
       type: object
       description: Why one change of a request is not valid.

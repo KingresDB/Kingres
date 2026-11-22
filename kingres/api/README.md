@@ -321,7 +321,7 @@ Where the architecture document leaves something open, the simplest option was c
 ### 0.17.0
 
 Revision written with the closing of phase 13 (`kingres/docs/design/config-phase13.md`). Summary for the panel:
-0 operations added (140 operations, 113 paths); one schema and one optional response property added; **no change that is not additive**.
+0 operations added (140 operations, 113 paths); one schema, one optional response property and one optional request property added; **no change that is not additive**.
 
 #### Breaking
 
@@ -331,6 +331,11 @@ None.
 
 - `ConfigChangePreview` has the optional `warnings` (`ConfigWarning`: `index`, `pointer`, `code`, `message`), the codes `config_value_unusual` and `config_reserved_connections`.
   A warning never makes a request invalid; `valid` is still a function of `problems` only.
+- `ConfigChangeRequest` has the optional `expectedRevision`: `applyConfigChange` answers 409 `config_change_superseded` when a value the request changes was changed by a later revision (the repeat of a recorded change passes).
+
+#### Behaviour (not a change of the schema)
+
+- A server that is down no longer keeps the task `config.apply` open: it is recorded as waiting and the leader brings it up to date when it answers. A stored value can always be removed, also when its parameter has become managed or refused. More parameters are refused or managed (`default_transaction_read_only` and the other settings of the sessions of the control plane, `unix_socket_permissions`, `unix_socket_group`, every `ssl*`, `huge_pages`, `log_destination`, `syslog_*`): they answer 422 `config_parameter_refused` or `config_parameter_managed` as before for their class. The task codes `validation_failed` and `config_incomplete` are set on the task error.
 
 #### Documentation
 

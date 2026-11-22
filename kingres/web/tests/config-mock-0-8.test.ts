@@ -1040,7 +1040,7 @@ describe('the warnings of a preview (contract 0.17.0)', () => {
   it('never flags a parameter that is not a memory size, and a removal', async () => {
     await login()
     const none = await endpoints.previewConfigChange({
-      changes: [change('statement_timeout', '24h'), change('work_mem', null)],
+      changes: [change('autovacuum_naptime', '24h'), change('work_mem', null)],
     })
     expect(none.valid).toBe(true)
     expect(none.warnings ?? []).toEqual([])

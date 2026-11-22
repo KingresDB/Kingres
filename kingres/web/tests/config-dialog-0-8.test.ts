@@ -201,7 +201,7 @@ describe('the value is checked as it is typed', () => {
 
   it('checks a text value for its length and its line breaks', async () => {
     const user = userEvent.setup()
-    const { dialog: d } = await openEdit(user, 'search_path')
+    const { dialog: d } = await openEdit(user, 'log_line_prefix')
     await type(user, d, '"$user", public, extra')
     expect(d.getByTestId('value-message')).toHaveTextContent('')
     expect(d.getByText(/at most 4096 bytes/)).toBeInTheDocument()
@@ -405,7 +405,7 @@ describe('applying', () => {
     await user.click(d.getByRole('button', { name: /^Apply/ }))
     const r = await d.findByTestId('server-state-10.0.0.13')
     await waitFor(() => expect(within(r).getByText('Waiting for the server')).toBeInTheDocument())
-    expect(r).toHaveTextContent('The task waits for this server and does not give up.')
+    expect(r).toHaveTextContent('This server cannot be reached; it gets the change when it returns')
     expect(await d.findByRole('button', { name: 'Cancel the task' })).toBeInTheDocument()
     bringConfigServerBack(getState(), '10.0.0.13')
     await waitFor(() =>
@@ -456,6 +456,28 @@ describe('applying', () => {
     await user.click(d.getByRole('button', { name: /^Apply/ }))
     expect((await d.findByRole('alert')).getAttribute('data-code')).toBe('operation_in_progress')
     expect(d.getByRole('button', { name: /^Apply/ })).toBeInTheDocument()
+  })
+
+  it('sends the revision it saw when it opened, and a refusal as superseded says to look again (P13R-11)', async () => {
+    const user = userEvent.setup()
+    const { dialog: d } = await openEdit(user, 'work_mem')
+    await type(user, d, '16MB')
+    await ready(d)
+    const seen = getState().config.revision
+    const bodies: { expectedRevision?: number }[] = []
+    mockServer.use(
+      http.post('*/api/v1/config/changes', async ({ request }) => {
+        bodies.push((await request.json()) as { expectedRevision?: number })
+        return HttpResponse.json(
+          { type: 'about:blank', title: 'x', status: 409, code: 'config_change_superseded' },
+          { status: 409 },
+        )
+      }),
+    )
+    await user.click(d.getByRole('button', { name: /^Apply/ }))
+    expect((await d.findByRole('alert')).getAttribute('data-code')).toBe('config_change_superseded')
+    expect(bodies).toHaveLength(1)
+    expect(bodies[0]!.expectedRevision).toBe(seen)
   })
 })
 
