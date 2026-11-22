@@ -540,6 +540,7 @@ test/test-image.sh   --rev kingres-19 [--port 58790]       # build the image, ru
 test/test-compose.sh --rev kingres-19 [--port-base 58700]  # three nodes joined into one cluster
 test/test-deb.sh --deb FILE --other-deb FILE --work WORK   # install ... purge under systemd
 test/test-verifier-package.sh [--work DIR]                 # the verifier in the package, no Docker
+test/test-modes.sh [--rev REV]                              # the scripts are committed (and archived) as executable, no Docker
 ```
 
 Each test is run once per major, on the source of that major. The image and
