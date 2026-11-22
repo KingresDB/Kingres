@@ -28,6 +28,12 @@ import (
 // TypeRestoreAcknowledged is the type of the event that announces an accepted restore.
 const TypeRestoreAcknowledged = "restore-acknowledged"
 
+// UnreadRestore is a restore-acknowledged event, signed by an authorised key, that is not in the strict form and was not read.
+type UnreadRestore struct {
+	Seq    uint64
+	Reason string
+}
+
 // RestoreAcknowledged is a verified restore-acknowledged event.
 type RestoreAcknowledged struct {
 	Seq             uint64
@@ -49,7 +55,18 @@ func (r RestoreAcknowledged) Text() string {
 		r.Seq, r.Generation, r.AcknowledgedBy, r.Reason, r.PublishedEvents, r.PublishedLogs, r.DatabaseEvents, r.DatabaseLogs)
 }
 
+// restoreAcknowledged reads the event strictly: every line, canonical numbers, a generation from 1 that was not acknowledged before. An event
+// that deviates is not read at all (nothing of it is used) and is kept in Unread, and the walk goes on: a signed event of a type that only some
+// commands interpret must not end the run of every command, and must not hide the events after it (P7F-06). The commands that report restore
+// events say that this one was not read.
 func (w *Walk) restoreAcknowledged(ev *Event, authorised []*Key) error {
+	if err := w.readRestoreAcknowledged(ev, authorised); err != nil {
+		w.UnreadRestores = append(w.UnreadRestores, UnreadRestore{Seq: ev.Seq, Reason: err.Error()})
+	}
+	return nil
+}
+
+func (w *Walk) readRestoreAcknowledged(ev *Event, authorised []*Key) error {
 	want := map[string]bool{"generation": true, "published-events": true, "published-logs": true, "published-state-sha256": true,
 		"database-events": true, "database-logs": true, "database-state-sha256": true, "reason": true, "acknowledged-by": true}
 	for name := range ev.Fields {

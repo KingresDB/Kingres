@@ -22,6 +22,9 @@ func restoreNotes(w *events.Walk) []string {
 		return nil
 	}
 	var out []string
+	for _, u := range w.UnreadRestores {
+		out = append(out, fmt.Sprintf("finding: event %06d is signed by an authorised key and has the type restore-acknowledged, but it is not in the form the publisher writes (%s) and was not read: nothing of it is used. If it announces a restore, this run does not know what it states, and a checkpoint that you hold from before it may differ from what is published for that reason", u.Seq, u.Reason))
+	}
 	for _, r := range w.Restores {
 		out = append(out, "finding: the publication holds a verified "+r.Text()+". The history of the aggregate log and of the events published before it was cut there: an aggregate checkpoint that you hold from before that event is not a prefix of what is published now, and the fork or the smaller size it shows is what the event says. This run did not compare anything with the history that was cut")
 	}
@@ -31,15 +34,25 @@ func restoreNotes(w *events.Walk) []string {
 // restoreRemark is what the failure of a comparison of the aggregate log with a checkpoint you hold adds when the publication holds a
 // verified restore-acknowledged event: it names the event, which is the statement that explains such a failure.
 func restoreRemark(w *events.Walk) string {
-	if w == nil || len(w.Restores) == 0 {
+	if w == nil || len(w.Restores) == 0 && len(w.UnreadRestores) == 0 {
 		return ""
 	}
-	var parts []string
+	var parts, unread []string
 	for _, r := range w.Restores {
 		parts = append(parts, r.Text())
 	}
-	return ". The publication holds the verified signed statement of the operator: " + strings.Join(parts, "; and ") +
-		". If the checkpoint you hold is from before that event, this explains the failure: the aggregate log and the events were cut there and continue from the restored database. The statement says why the fork exists; it does not show that the cut was honest, and a checkpoint you hold from after the event is not explained by it"
+	for _, u := range w.UnreadRestores {
+		unread = append(unread, fmt.Sprintf("event %06d is typed restore-acknowledged and is not in the form the publisher writes (%s), so it was not read", u.Seq, u.Reason))
+	}
+	out := ""
+	if len(parts) > 0 {
+		out = ". The publication holds the verified signed statement of the operator: " + strings.Join(parts, "; and ") +
+			". If the checkpoint you hold is from before that event, this explains the failure: the aggregate log and the events were cut there and continue from the restored database. The statement says why the fork exists; it does not show that the cut was honest, and a checkpoint you hold from after the event is not explained by it"
+	}
+	if len(unread) > 0 {
+		out += ". Also: " + strings.Join(unread, "; and ") + ". If it announces a restore, this run cannot say whether it explains the failure"
+	}
+	return out
 }
 
 // restoreRemark for the commands that opened the publication.

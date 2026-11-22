@@ -161,7 +161,9 @@ func (p *pubInputs) auditEpochs(r *result, bc *bundleChains, found []proofInClos
 			if why := blockNotInLog(next, f.height, f.leaf); why != "" {
 				return info, failedOut("epoch-closed", fmt.Errorf("%s shows its block (height %d) in epoch %d, and the event %06d states common height %d for that epoch, which says the block is in epoch %d as well; it is not: %s. The event and the logs disagree", f.label, f.height, ec.Epoch, ec.Seq, ec.CommonHeight, f.epoch+1, why))
 			}
-			r.notes = append(r.notes, fmt.Sprintf("%s: the block has height %d, at or below the common height %d that the event %06d states for the closed epoch %d, and it is leaf %d of the signed log of epoch %d in the bundle as well", f.label, f.height, ec.CommonHeight, ec.Seq, ec.Epoch, f.height, f.epoch+1))
+			// There is no success note here (P7F-03): proofEpochs tries the newest epoch first, so a block that is also leaf h of the log of the
+			// next epoch is found there and is never listed as found in the closed one. A block that is listed here has failed the inclusion in the
+			// next log already, so the check above fails for it; the check stays as a second line behind proofEpochs.
 			continue
 		}
 		if !acc.want[ec.Seq] {

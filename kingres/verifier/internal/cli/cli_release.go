@@ -132,7 +132,8 @@ func releaseVerifyRun(r *result, a releaseVerifyArgs) outcome {
 	}
 	r.ok("sums-format", fmt.Sprintf("the sums list %d file(s): %s", len(entries), listNames(entries)))
 	r.info = map[string]any{"key_id": fmt.Sprintf("%08x", key.ID()), "files": len(entries)}
-	shown := false // the RELEASE file was given and its content is shown
+	shown := false       // the RELEASE file was given and its content is shown
+	notARelease := false // the signed RELEASE file says the commit or its date is unknown
 	for _, b := range bins {
 		want := a.name
 		if want == "" {
@@ -156,6 +157,11 @@ func releaseVerifyRun(r *result, a releaseVerifyArgs) outcome {
 			shown = true
 			r.ok("release-info", fmt.Sprintf("the signed release file says: version %s, commit %s, commit date %s, built with %s", info.Version, info.Commit, info.Date, info.Go))
 			r.info["release_version"], r.info["release_commit"], r.info["release_date"], r.info["release_go"] = info.Version, info.Commit, info.Date, info.Go
+			if info.Commit == "unknown" || info.Date == "unknown" {
+				// release.sh --dry-run signs a set from a tree that is dirty or not at a tag and says so here (P7F-04): the signature is genuine and the set is no release
+				notARelease = true
+				r.info["not_a_release"] = true
+			}
 		}
 	}
 	r.word = "VERIFIED"
@@ -164,6 +170,11 @@ func releaseVerifyRun(r *result, a releaseVerifyArgs) outcome {
 		r.notProved = append(r.notProved, "that any binary you hold is a file of this release: give it with --binary")
 	} else {
 		r.headline = fmt.Sprintf("%d binary(ies) match the sums signed by the release key", len(bins))
+	}
+	if notARelease {
+		r.word = "VERIFIED (NOT A RELEASE)"
+		r.headline += "; BUT the signed RELEASE file says the commit is unknown: this set was made by a dry run, from a checkout that was not clean or not at a release tag, so it is a signed build and not a release"
+		r.notes = append(r.notes, "finding: the signed RELEASE file records commit or date \"unknown\" (scripts/release.sh --dry-run). The signature is the release key's and the hashes match, and that is all the run shows: the set was not made from a clean tagged checkout, it must not be taken for a release and it cannot be reproduced from a tag")
 	}
 	if _, listed := release.Find(entries, release.InfoName); listed && !shown {
 		r.notProved = append(r.notProved, "which release this is: the signed sums list a "+release.InfoName+" file with the version, commit and date; give it with --binary "+release.InfoName+" to see them")

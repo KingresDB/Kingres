@@ -245,3 +245,46 @@ func TestReleaseVerifyShowsTheSignedVersionAndSaysAnOlderReleaseVerifiesToo(t *t
 	dir2 := testdir.New(t)
 	wantRun(t, 1, []string{"release", "verify", "--sums", writeTemp(t, dir2, "SHA256SUMS", string(sums2)), "--note", writeTemp(t, dir2, "SHA256SUMS.note", string(note2)), "--key", key, "--binary", writeTemp(t, dir2, release.InfoName, string(junk))}, "FAILED at step release-info:")
 }
+
+// P7F-04: a set that scripts/release.sh --dry-run signed records the commit as "unknown"; release verify says so in the verdict word, the
+// headline, a note and the JSON, and does not end with a plain VERIFIED.
+func TestReleaseVerifyMarksASignedSetWhoseCommitIsUnknown(t *testing.T) {
+	seed := sha256.Sum256([]byte("release dry run test key"))
+	priv := ed25519.NewKeyFromSeed(seed[:])
+	key := base64.StdEncoding.EncodeToString(priv.Public().(ed25519.PublicKey))
+	dir := testdir.New(t)
+	args := func(commit, date string) []string {
+		info, err := release.FormatInfo(release.Info{Version: "0.1.0", Commit: commit, Date: date, Go: "go1.27.3"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		sums, err := release.FormatSums([]release.Entry{{Hash: sha256.Sum256(info), Name: release.InfoName}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		note, err := release.Sign(priv, sums)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d := testdir.New(t)
+		_ = dir
+		return []string{"release", "verify", "--sums", writeTemp(t, d, "SHA256SUMS", string(sums)), "--note", writeTemp(t, d, "SHA256SUMS.note", string(note)), "--key", key, "--binary", writeTemp(t, d, release.InfoName, string(info))}
+	}
+	for name, a := range map[string][]string{
+		"commit unknown": args("unknown", "unknown"),
+		"date unknown":   args(strings.Repeat("c0", 20), "unknown"),
+	} {
+		code, out, errs := run(t, a...)
+		if code != 0 || !strings.HasPrefix(out, "VERIFIED (NOT A RELEASE):") || strings.HasPrefix(out, "VERIFIED:") || !strings.Contains(out, "not a release") || !strings.Contains(out, "note: finding:") {
+			t.Errorf("%s: %d\n%s%s", name, code, out, errs)
+		}
+		if _, out, _ := run(t, append(a, "--json")...); !strings.Contains(out, `"not_a_release": true`) {
+			t.Errorf("%s: the JSON does not say it:\n%s", name, out)
+		}
+	}
+	// a real release is a plain VERIFIED and says nothing of the kind
+	code, out, _ := run(t, args(strings.Repeat("c0", 20), "2026-11-21T10:00:00Z")...)
+	if code != 0 || !strings.HasPrefix(out, "VERIFIED:") || strings.Contains(out, "NOT A RELEASE") {
+		t.Errorf("a real release: %d\n%s", code, out)
+	}
+}

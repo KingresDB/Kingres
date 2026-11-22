@@ -6,6 +6,8 @@ package cli
 import (
 	"strings"
 	"testing"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/events"
 )
 
 // P7R-09: the verifier reads the event restore-acknowledged (design 9.4), reports it in the commands that read the events, and names it in the
@@ -56,8 +58,9 @@ func TestAnUnauthorisedRestoreAcknowledgedEventExplainsNothing(t *testing.T) {
 	}
 }
 
-// A signed event that is not the format ends the run, as every known event type does.
-func TestAMalformedRestoreAcknowledgedEventIsRefused(t *testing.T) {
+// A signed event that is not the strict format is not read, and says so; it does not end the run (P7F-06). The run goes on and reads the events
+// after it, and nothing of the malformed one is used.
+func TestAMalformedRestoreAcknowledgedEventIsNotReadAndTheRunGoesOn(t *testing.T) {
 	for name, lines := range map[string][]string{
 		"generation 0":    append([]string{"generation: 0"}, restoreLines(1, 9, 2, 4, 1)[1:]...),
 		"a missing line":  restoreLines(1, 9, 2, 4, 1)[:8],
@@ -67,17 +70,41 @@ func TestAMalformedRestoreAcknowledgedEventIsRefused(t *testing.T) {
 	} {
 		w, _, _ := stdWorld(t)
 		w.event(0, "restore-acknowledged", []signer{w.s1}, lines...)
-		code, out, errs := run(t, w.aggArgs()...)
-		if code == 0 || strings.Contains(out, "VERIFIED:") {
-			t.Errorf("%s: accepted (%d)\n%s%s", name, code, out, errs)
+		// a well formed one after it is still read
+		w.event(1, "restore-acknowledged", []signer{w.s1}, restoreLines(2, 9, 2, 4, 1)...)
+		out := wantRun(t, 0, w.aggArgs(), "VERIFIED:", "finding: event 000000 is signed by an authorised key and has the type restore-acknowledged, but it is not in the form the publisher writes",
+			"was not read", "finding: the publication holds a verified event 000001 (restore-acknowledged, generation 2")
+		if strings.Contains(out, "verified event 000000") {
+			t.Errorf("%s: the malformed event was read:\n%s", name, out)
 		}
 	}
-	// the same generation twice
+	// the same generation twice: the first is read, the second is not
 	w, _, _ := stdWorld(t)
 	w.event(0, "restore-acknowledged", []signer{w.s1}, restoreLines(1, 9, 2, 4, 1)...)
 	w.event(1, "restore-acknowledged", []signer{w.s1}, restoreLines(1, 9, 2, 4, 1)...)
-	if code, out, _ := run(t, w.aggArgs()...); code == 0 {
-		t.Errorf("the same generation twice was accepted:\n%s", out)
+	out := wantRun(t, 0, w.aggArgs(), "VERIFIED:", "verified event 000000 (restore-acknowledged, generation 1", "finding: event 000001 is signed by an authorised key", "acknowledged twice")
+	if strings.Contains(out, "verified event 000001") {
+		t.Errorf("the second event of one generation was read:\n%s", out)
+	}
+	// the commands that do not report restores are not touched by it: a key follow reads the events and goes on
+	wf, _, _ := stdWorld(t)
+	wf.event(0, "restore-acknowledged", []signer{wf.s1}, append(restoreLines(1, 9, 2, 4, 1), "extra: x")...)
+	out = wantRun(t, 0, wf.followArgs(newOut(t)), "VERIFIED:")
+	if strings.Contains(out, "restore-acknowledged") {
+		t.Errorf("a key follow reports a restore event:\n%s", out)
+	}
+}
+
+// A malformed restore event next to a fork: the failure says that an event was not read and cannot say whether it explains the fork.
+func TestAForkNextToAnUnreadRestoreEventSaysSo(t *testing.T) {
+	w, _, _ := stdWorld(t)
+	held := t.TempDir() + "/held.note"
+	copyFile(t, w.logDir("a/"+w.aggID+"/checkpoint"), held)
+	w.publishAggregate(1)
+	w.event(0, "restore-acknowledged", []signer{w.s1}, append(restoreLines(1, 9, 2, 4, 1), "extra: x")...)
+	out := wantRun(t, 1, w.aggArgs("--previous", held), "FAILED at step rollback", "Also: event 000000 is typed restore-acknowledged and is not in the form the publisher writes", "was not read", "cannot say whether it explains the failure")
+	if strings.Contains(out, "this explains the failure") {
+		t.Errorf("an unread event is said to explain the failure:\n%s", out)
 	}
 }
 
@@ -122,4 +149,37 @@ func TestMonitorOfChainLogsOnlyReportsARestoreAcknowledgedEvent(t *testing.T) {
 	args := []string{"monitor", "--trust", w.trust, "--source", srv.URL, "--state", st, "--polls", "1", "--interval", "1ms", "--now", "2026-11-19T12:00:00Z",
 		"--log", "chain:" + w.chains[0].idHex + ":e1", "--init"}
 	wantRun(t, 0, args, "finding: the publication holds a verified event 000000 (restore-acknowledged, generation 1")
+}
+
+// P7F-03 (mutant P1): a held checkpoint of the same size as the served one with another root is a fork; with a restore event the failure names it,
+// without one it does not.
+func TestAForkOfTheSameSizeAgainstAHeldCheckpointNamesTheRestoreEvent(t *testing.T) {
+	w, _, _ := stdWorld(t)
+	held := t.TempDir() + "/held.note"
+	copyFile(t, w.logDir("a/"+w.aggID+"/checkpoint"), held) // size 2
+	w.leaves[1].GeneratedAtUS++                             // another second leaf: the same size, another root
+	w.aggEnc[1] = w.leaves[1].Encode()
+	w.publishAggregate(2)
+	out := wantRun(t, 1, w.aggArgs("--previous", held), "FAILED at step fork", "two histories")
+	if strings.Contains(out, "restore-acknowledged") {
+		t.Fatalf("a restore is named without an event:\n%s", out)
+	}
+	w.event(0, "restore-acknowledged", []signer{w.s1}, restoreLines(1, 9, 2, 4, 1)...)
+	wantRun(t, 1, w.aggArgs("--previous", held), "FAILED at step fork", "two histories", "restore-acknowledged, generation 1", "this explains the failure")
+}
+
+// P7F-03 (mutant P5): only a fork is what the event explains, a damaged tile is not.
+func TestOnlyAForkIsExplainedByARestoreEventAndADamagedTileIsNot(t *testing.T) {
+	pw := &pubInputs{walked: true, walk: &events.Walk{Restores: []events.RestoreAcknowledged{{Seq: 0, Generation: 1, AcknowledgedBy: "operator", Reason: "r"}}}}
+	if got := pw.forkRemark("fork"); !strings.Contains(got, "restore-acknowledged, generation 1") {
+		t.Errorf("a fork is not explained by the event: %q", got)
+	}
+	for _, step := range []string{"tiles", "tile", "sizes", ""} {
+		if got := pw.forkRemark(step); got != "" {
+			t.Errorf("a failure at step %q is explained by the event: %q", step, got)
+		}
+	}
+	if got := (&pubInputs{walked: true, walk: &events.Walk{}}).forkRemark("fork"); got != "" {
+		t.Errorf("a fork is explained without an event: %q", got)
+	}
 }

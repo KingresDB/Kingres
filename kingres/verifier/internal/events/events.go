@@ -238,9 +238,11 @@ type Walk struct {
 	UnauthorisedEpochClosed map[string]uint64
 	// Restores are the verified restore-acknowledged events, in the order of their numbers.
 	Restores []RestoreAcknowledged
-	Count    int            // events read
-	Other    map[string]int // verified events of a type this version does not interpret
-	Notes    []string
+	// UnreadRestores are the restore-acknowledged events that an authorised key signed and that are not in the strict form: nothing of them is used.
+	UnreadRestores []UnreadRestore
+	Count          int            // events read
+	Other          map[string]int // verified events of a type this version does not interpret
+	Notes          []string
 }
 
 // ChainKey is the key of a chain and epoch in Walk.Retired.
