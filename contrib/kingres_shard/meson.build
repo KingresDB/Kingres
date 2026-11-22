@@ -331,6 +331,7 @@ tests += {
       't/251_add_node_staging_leftovers.pl',
       't/263_merge_colocated.pl',
       't/264_merge_routed.pl',
+      't/265_merge_reference_local.pl',
     ],
   },
 }

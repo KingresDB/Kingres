@@ -1201,6 +1201,30 @@ kingres_shard_stmt_shippable_merge(Query *query, int colocation_id, const char *
 }
 
 /*
+ * A MERGE into a reference table (design 7.5, M4 and M5): the rule of a write that runs on every node (the target
+ * is the one table written, the other relations are reference tables or the sub-select of a shipped source)
+ * applied to the MERGE node kinds.
+ */
+bool
+kingres_shard_stmt_shippable_merge_ref(Query *query, Oid target_relid, const char **reason)
+{
+	ShipCtx		ctx;
+	bool		bad;
+
+	ship_allow_ext = false;
+	ship_used_ext = NIL;
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.statement = true;
+	ctx.merge_ok = true;
+	ctx.shipped_relid = target_relid;
+	ctx.top = query;
+	bad = query_ok(query, &ctx);
+	if (bad && reason != NULL)
+		*reason = ctx.reason ? ctx.reason : "it cannot be shipped";
+	return !bad;
+}
+
+/*
  * The fragment of a partial aggregation (design 7): the same tests as the colocated mode, except that
  * an aggregate whose result depends on the order or the grouping of the rows (a floating point sum,
  * array_agg, string_agg) is accepted: the partial states are combined in the order the groups

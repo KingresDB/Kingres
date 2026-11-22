@@ -59,6 +59,7 @@ extern bool kingres_shard_stmt_shippable_colocated(Query *query, Oid target_reli
 													const char **reason);
 
 extern bool kingres_shard_stmt_shippable_merge(Query *query, int colocation_id, const char **reason);
+extern bool kingres_shard_stmt_shippable_merge_ref(Query *query, Oid target_relid, const char **reason);
 
 extern bool kingres_shard_stmt_shippable_query(Query *query, int colocation_id, const char **reason);
 

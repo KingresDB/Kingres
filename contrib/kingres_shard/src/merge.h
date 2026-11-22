@@ -39,7 +39,9 @@ typedef enum KsMergeKind
 {
 	KS_MERGE_NONE = 0,
 	KS_MERGE_COLOCATED = 1,		/* M1: the whole statement runs on every group of the target */
-	KS_MERGE_ROUTED = 2			/* M3: the origin reads the source and routes each row to its group */
+	KS_MERGE_ROUTED = 2,		/* M3: the origin reads the source and routes each row to its group */
+	KS_MERGE_REFERENCE = 3,		/* M4: a reference table is the target, the statement runs on every node */
+	KS_MERGE_REFERENCE_SHIPPED = 4	/* M5: the same, the source is read here and every node gets all of it */
 } KsMergeKind;
 
 typedef struct KsMerge
@@ -69,6 +71,7 @@ typedef struct KsMergeShip
 	int			ncols;			/* arrays: columns shipped */
 	List	   *attnos;			/* the attribute numbers of the source that are shipped, in array order */
 	Oid			route_type;
+	bool		broadcast;		/* no route: every node gets every row (M5) */
 } KsMergeShip;
 
 extern bool kingres_shard_merge_build_ship(Query *q, const KsMerge *m, KsMergeShip *sh, const char **why);
@@ -106,5 +109,13 @@ extern bool kingres_shard_merge_classify(Query *parse, KsMerge *m);
  * shape.
  */
 extern bool kingres_shard_merge_fragment_analyze(Query *q, int rp, KsMerge *m, const char **why);
+
+/* M4 and M5: a MERGE into a reference table.  The analysis a node makes of the text of a reference-table write; *nshipped the shipped sub-selects. */
+extern bool kingres_shard_merge_ref_fragment_analyze(Query *q, int *nshipped, const char **why);
+extern bool kingres_shard_merge_classify_ref(Query *parse, KsMerge *m);
+extern char *kingres_shard_merge_text_reference(Query *parse, const char **why);
+
+/* M6: fence the distributed tables of USING of a MERGE into a local table; the number fenced. */
+extern int	kingres_shard_merge_fence_sources(Query *parse);
 
 #endif							/* KINGRES_SHARD_MERGE_H */

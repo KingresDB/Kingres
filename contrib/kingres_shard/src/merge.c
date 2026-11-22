@@ -749,15 +749,19 @@ kingres_shard_merge_build_ship(Query *q, const KsMerge *m, KsMergeShip *sh, cons
 																   Int32GetDatum(1), false, true),
 												resno, psprintf("ks_c%d", resno), false));
 		}
-		resno++;
-		tlist = lappend(tlist, makeTargetEntry((Expr *) copyObject(m->route), resno, "ks_route", false));
+		if (m->route != NULL)
+		{
+			resno++;
+			tlist = lappend(tlist, makeTargetEntry((Expr *) copyObject(m->route), resno, "ks_route", false));
+		}
 		sq->targetList = tlist;
 		sq->hasSubLinks = false;
 	}
 	nest = kingres_shard_set_transmission_modes();
 	sh->source_sql = pg_get_querydef(sq, false);
 	kingres_shard_reset_transmission_modes(nest);
-	sh->route_type = exprType((Node *) m->route);
+	sh->broadcast = (m->route == NULL);
+	sh->route_type = m->route != NULL ? exprType((Node *) m->route) : InvalidOid;
 
 	/* the sub-select that stands for the source in the statement the groups run */
 	initStringInfo(&sel);
@@ -771,6 +775,8 @@ kingres_shard_merge_build_ship(Query *q, const KsMerge *m, KsMergeShip *sh, cons
 		int			idx = 0;
 		ListCell   *plc;
 
+		if (name[0] == '\0')
+			name = psprintf("ks_dropped%d", a);
 		foreach(plc, attnos)
 		{
 			if (lfirst_int(plc) == a)
@@ -847,9 +853,19 @@ kingres_shard_merge_build_ship(Query *q, const KsMerge *m, KsMergeShip *sh, cons
 		return false;
 	{
 		KsMerge		m2;
+		int			nsh = 0;
 
-		if (!kingres_shard_merge_fragment_analyze(reparsed, 1, &m2, why))
+		if (m->route != NULL)
+		{
+			if (!kingres_shard_merge_fragment_analyze(reparsed, 1, &m2, why))
+				return false;
+		}
+		else if (!kingres_shard_merge_ref_fragment_analyze(reparsed, &nsh, why) || nsh != 1)
+		{
+			if (*why == NULL)
+				*why = "the text has no shipped source";
 			return false;
+		}
 	}
 	sh->shipped = sm;
 	sh->ncols = k;
@@ -1141,6 +1157,7 @@ struct KsMergeShares
 	MgShare    *g;
 	int64		bytes;
 	int64		rows;
+	bool		broadcast;		/* one share, for every node (a reference table is the target) */
 };
 
 static void
@@ -1171,7 +1188,8 @@ kingres_shard_merge_collect(const char *source_sql, ParamListInfo params, int nc
 {
 	KsMergeShares *sh;
 	MemoryContext old = MemoryContextSwitchTo(cxt);
-	const KsColocation *coloc = kingres_shard_lookup_colocation(colocation_id);
+	bool		bcast = (colocation_id == 0);
+	const KsColocation *coloc = bcast ? NULL : kingres_shard_lookup_colocation(colocation_id);
 	int			n = params ? params->numParams : 0;
 	Oid		   *argtypes = palloc(sizeof(Oid) * Max(n, 1));
 	Datum	   *values = palloc(sizeof(Datum) * Max(n, 1));
@@ -1185,10 +1203,13 @@ kingres_shard_merge_collect(const char *source_sql, ParamListInfo params, int nc
 	int			nest;
 	MemoryContext rowcxt;
 
-	if (coloc == NULL)
+	if (coloc == NULL && !bcast)
 		elog(ERROR, "colocation group %d of a MERGE is not in the catalog", colocation_id);
 	sh = palloc0(sizeof(KsMergeShares));
 	sh->ncols = ncols;
+	sh->broadcast = bcast;
+	if (bcast)
+		group_ids = list_make1_int(-1);
 	sh->ngroups = list_length(group_ids);
 	sh->g = palloc0(sizeof(MgShare) * Max(sh->ngroups, 1));
 	i = 0;
@@ -1237,10 +1258,10 @@ kingres_shard_merge_collect(const char *source_sql, ParamListInfo params, int nc
 				TupleDesc	td = SPI_tuptable->tupdesc;
 				int			c;
 
-				if (td->natts != ncols + 1)
-					elog(ERROR, "the source of a MERGE returned %d columns, expected %d", td->natts, ncols + 1);
+				if (td->natts != ncols + (bcast ? 0 : 1))
+					elog(ERROR, "the source of a MERGE returned %d columns, expected %d", td->natts, ncols + (bcast ? 0 : 1));
 				outf = MemoryContextAlloc(cxt, sizeof(FmgrInfo) * (ncols + 1));
-				for (c = 0; c <= ncols; c++)
+				for (c = 0; c < td->natts; c++)
 				{
 					Oid			ofunc;
 					bool		isvarlena;
@@ -1248,20 +1269,26 @@ kingres_shard_merge_collect(const char *source_sql, ParamListInfo params, int nc
 					getTypeOutputInfo(TupleDescAttr(td, c)->atttypid, &ofunc, &isvarlena);
 					fmgr_info_cxt(ofunc, &outf[c], cxt);
 				}
-				route_type = TupleDescAttr(td, ncols)->atttypid;
+				if (!bcast)
+					route_type = TupleDescAttr(td, ncols)->atttypid;
 			}
 			for (k = 0; k < SPI_processed; k++)
 			{
 				HeapTuple	tup = SPI_tuptable->vals[k];
 				TupleDesc	td = SPI_tuptable->tupdesc;
-				bool		isnull;
-				Datum		kd = SPI_getbinval(tup, td, ncols + 1, &isnull);
+				bool		isnull = true;
+				Datum		kd = (Datum) 0;
 				int			bucket;
 				int			g;
 				MgShare    *share = NULL;
 				int			j;
 
 				CHECK_FOR_INTERRUPTS();
+				if (bcast)
+					share = &sh->g[0];
+				else
+				{
+					kd = SPI_getbinval(tup, td, ncols + 1, &isnull);
 				/* a NULL key hashes like the router's: tuple routing puts the inserted row into the bucket of slot 0 */
 				if (!kingres_shard_try_bucket(coloc->dist_type, coloc->collation, coloc, route_type, kd, isnull, &bucket))
 					ereport(ERROR,
@@ -1278,6 +1305,7 @@ kingres_shard_merge_collect(const char *source_sql, ParamListInfo params, int nc
 						share = &sh->g[j];
 						break;
 					}
+				}
 				if (share == NULL)
 					continue;
 				for (j = 0; j < ncols; j++)
@@ -1322,6 +1350,9 @@ mg_find_share(KsMergeShares *sh, int group_id)
 {
 	int			i;
 
+	if (sh->broadcast)
+		return &sh->g[0];
+
 	for (i = 0; i < sh->ngroups; i++)
 		if (sh->g[i].group_id == group_id)
 			return &sh->g[i];
@@ -1344,4 +1375,366 @@ kingres_shard_merge_share_rows(KsMergeShares *sh, int group_id)
 	MgShare    *g = mg_find_share(sh, group_id);
 
 	return g == NULL ? 0 : g->nrows;
+}
+
+/* ======================================================================
+ * M4 and M5: a reference table is the target (7.5)
+ * ====================================================================== */
+
+/*
+ * The decision about a MERGE into a reference table, as every node makes it on the text it runs: the
+ * target is a reference table without code of the users, every relation of the statement is a
+ * reference table or the sub-select of a shipped source (at most one), every expression is built in
+ * and immutable (the rule of a write that runs on every node: shippable.c), nothing is read that
+ * another node does not hold in the same state.  *nshipped is the number of shipped sub-selects.
+ */
+bool
+kingres_shard_merge_ref_fragment_analyze(Query *q, int *nshipped, const char **why)
+{
+	RangeTblEntry *trte;
+	const KsDistTable *tdt;
+	ListCell   *lc;
+	Index		rti = 0;
+	const char *reason = NULL;
+
+	*nshipped = 0;
+	*why = NULL;
+	if (q->commandType != CMD_MERGE || q->resultRelation <= 0)
+		MG_NO("it is not a MERGE");
+	trte = rt_fetch(q->resultRelation, q->rtable);
+	if (trte->rtekind != RTE_RELATION)
+		MG_NO("its target is not a table");
+	tdt = kingres_shard_lookup_dist_table(trte->relid);
+	if (tdt == NULL || !tdt->is_reference)
+		MG_NO("its target is not a reference table");
+	if (q->cteList != NIL || q->hasRecursive || q->hasModifyingCTE)
+		MG_NO("it has a WITH clause");
+	if (q->withCheckOptions != NIL)
+		MG_NO("the rows are checked against a view or a row-level security policy");
+	if (trte->securityQuals != NIL || mg_relation_has_rls(trte->relid))
+		MG_NO("the target has row-level security");
+	if (mg_target_has_user_code(trte->relid))
+		MG_NO("the target has a trigger or a rule, which would run on every node");
+	foreach(lc, q->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+		rti++;
+		if (rti == (Index) q->resultRelation)
+			continue;
+		if (rte->rtekind == RTE_SUBQUERY && !rte->lateral && !rte->inh &&
+			kingres_shard_repart_shipped_shape(rte->subquery, NULL))
+			(*nshipped)++;
+	}
+	if (*nshipped > 1)
+		MG_NO("a MERGE has one shipped source");
+	if (!kingres_shard_stmt_shippable_merge_ref(q, trte->relid, &reason))
+		MG_NO(reason ? reason : "it cannot be run on every node");
+	return true;
+}
+
+/* The text of an M4 statement as every node gets it, decided once more on its parse; NULL with *why when a node would not accept it. */
+char *
+kingres_shard_merge_text_reference(Query *parse, const char **why)
+{
+	ParamTypes	pt = {NULL, 0};
+	char	   *body;
+	Query	   *rq;
+	int			nsh;
+	int			nest;
+	int			i;
+
+	nest = kingres_shard_set_transmission_modes();
+	body = pg_get_querydef(parse, false);
+	kingres_shard_reset_transmission_modes(nest);
+
+	(void) merge_param_types_walker((Node *) parse, &pt);
+	for (i = 0; i < pt.n; i++)
+		if (!OidIsValid(pt.types[i]))
+			pt.types[i] = TEXTOID;
+	rq = merge_parse_text(body, pt.types, pt.n, why);
+	if (rq == NULL)
+		return NULL;
+	if (!kingres_shard_merge_ref_fragment_analyze(rq, &nsh, why) || nsh != 0)
+	{
+		if (*why == NULL)
+			*why = "the text has a shipped source";
+		return NULL;
+	}
+	return body;
+}
+
+/*
+ * A MERGE into a reference table: M4 when the statement itself can run on every node (it reads
+ * reference tables, VALUES and constants only); M5 when its source is one other relation (a
+ * distributed table, a local table, a sub-select over them): this node reads the source once and
+ * every node gets all of it.  The result has kind KS_MERGE_REFERENCE (M4) or
+ * KS_MERGE_REFERENCE_SHIPPED (M5, with source_rti set and route NULL).  False when the target is
+ * not a reference table; an error that names the condition when no shape runs.
+ */
+bool
+kingres_shard_merge_classify_ref(Query *parse, KsMerge *m)
+{
+	RangeTblEntry *trte;
+	const KsDistTable *tdt;
+	const char *why4 = NULL;
+	const char *why5 = NULL;
+	int			nsh;
+	Index		src;
+	RangeTblEntry *srte;
+
+	memset(m, 0, sizeof(*m));
+	if (parse->commandType != CMD_MERGE || parse->resultRelation <= 0)
+		return false;
+	trte = rt_fetch(parse->resultRelation, parse->rtable);
+	if (trte->rtekind != RTE_RELATION)
+		return false;
+	tdt = kingres_shard_lookup_dist_table(trte->relid);
+	if (tdt == NULL || !tdt->is_reference)
+		return false;
+	m->target_relid = trte->relid;
+	m->target_rti = parse->resultRelation;
+	m->relids = merge_relids(parse);
+
+	/* M4: the statement as written runs on every node */
+	if (kingres_shard_merge_ref_fragment_analyze(parse, &nsh, &why4) && nsh == 0)
+	{
+		m->kind = KS_MERGE_REFERENCE;
+		return true;
+	}
+
+	/* M5: a source that is one relation */
+	if (parse->cteList != NIL || parse->hasRecursive || parse->hasModifyingCTE)
+		why5 = "it has a WITH clause";
+	else if (parse->hasSubLinks)
+		why5 = "it has a sub-select in an expression (ON, a WHEN condition, SET, VALUES or RETURNING)";
+	else if (parse->jointree == NULL || list_length(parse->jointree->fromlist) != 1 ||
+			 !IsA(linitial(parse->jointree->fromlist), RangeTblRef) || parse->jointree->quals != NULL)
+		why5 = "USING is a join or several relations; put it in a sub-select so that the source is one relation";
+	else
+	{
+		src = (Index) ((RangeTblRef *) linitial(parse->jointree->fromlist))->rtindex;
+		srte = rt_fetch(src, parse->rtable);
+		if (src == (Index) parse->resultRelation)
+			why5 = "USING is the target";
+		else if (srte->rtekind != RTE_RELATION && srte->rtekind != RTE_SUBQUERY &&
+				 srte->rtekind != RTE_VALUES && srte->rtekind != RTE_FUNCTION)
+			why5 = "USING is not a table, a sub-select, a VALUES list or a function";
+		else if (srte->lateral)
+			why5 = "USING is a LATERAL item";
+		else
+		{
+			KsMergeShip sh;
+
+			m->source_rti = src;
+			m->route = NULL;
+			if (kingres_shard_merge_build_ship(parse, m, &sh, &why5))
+			{
+				m->kind = KS_MERGE_REFERENCE_SHIPPED;
+				return true;
+			}
+		}
+	}
+	/* the reason of the shape the statement is nearer to: M4 when its source is made of reference tables, else M5 */
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("this MERGE into reference table \"%s\" cannot be run on every node", get_rel_name(trte->relid)),
+			 errdetail("%s.", (why4 != NULL && why5 != NULL && strstr(why4, "not a reference table") == NULL &&
+							   strstr(why4, "reads a table") == NULL) ? why4 : (why5 != NULL ? why5 : why4)),
+			 errhint("A MERGE into a reference table runs on every node, so it may use only constants, parameters and built-in immutable functions (not a sequence, random() or now()); its source is reference tables, VALUES, or one relation that this node reads and sends to every node.")));
+	return false;				/* not reached */
+}
+
+/* ======================================================================
+ * M6: a local target with a distributed source (7.6)
+ * ====================================================================== */
+
+typedef struct FenceVars
+{
+	Index		rti;
+	int			sublevels;
+	Bitmapset  *attrs;
+	bool		whole;
+} FenceVars;
+
+static bool
+fence_vars_walker(Node *node, FenceVars *fv)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+	{
+		Var		   *v = (Var *) node;
+
+		if (v->varno == fv->rti && v->varlevelsup == (Index) fv->sublevels)
+		{
+			if (v->varattno == 0)
+				fv->whole = true;
+			else if (v->varattno > 0)
+				fv->attrs = bms_add_member(fv->attrs, v->varattno);
+		}
+		return false;
+	}
+	if (IsA(node, Query))
+	{
+		bool		r;
+
+		fv->sublevels++;
+		r = query_tree_walker((Query *) node, fence_vars_walker, fv, 0);
+		fv->sublevels--;
+		return r;
+	}
+	return expression_tree_walker(node, fence_vars_walker, fv);
+}
+
+/*
+ * Replace the relation of range table entry `rti` of `q`, a distributed table, by the sub-select
+ * (SELECT <the columns the query uses; NULL for the others> FROM <table> OFFSET 0): the same
+ * alias and column names, at the same range table index.  The OFFSET keeps PostgreSQL from
+ * pulling the sub-select up, so the entry stays a sub-select and gets a copy row mark (7.6).
+ */
+static void
+fence_one(Query *q, Index rti)
+{
+	RangeTblEntry *rte = rt_fetch(rti, q->rtable);
+	FenceVars	fv;
+	Relation	rel;
+	int			natts;
+	int			a;
+	StringInfoData sql;
+	List	   *raw;
+	Query	   *sub;
+	bool		first = true;
+	char	   *relname;
+
+	memset(&fv, 0, sizeof(fv));
+	fv.rti = rti;
+	(void) query_tree_walker(q, fence_vars_walker, &fv, 0);
+
+	rel = table_open(rte->relid, AccessShareLock);
+	natts = RelationGetNumberOfAttributes(rel);
+	relname = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)), RelationGetRelationName(rel));
+	initStringInfo(&sql);
+	appendStringInfoString(&sql, "SELECT ");
+	for (a = 1; a <= natts; a++)
+	{
+		Form_pg_attribute att = TupleDescAttr(rel->rd_att, a - 1);
+		const char *name = NameStr(att->attname);
+
+		if (!first)
+			appendStringInfoString(&sql, ", ");
+		first = false;
+		if (att->attisdropped)
+			appendStringInfo(&sql, "NULL::pg_catalog.text AS %s", quote_identifier(psprintf("ks_dropped%d", a)));
+		else if (fv.whole || bms_is_member(a, fv.attrs))
+			appendStringInfo(&sql, "%s", quote_identifier(name));
+		else
+			appendStringInfo(&sql, "NULL::%s AS %s", format_type_extended(att->atttypid, att->atttypmod,
+																		  FORMAT_TYPE_FORCE_QUALIFY | FORMAT_TYPE_TYPEMOD_GIVEN),
+							 quote_identifier(name));
+	}
+	if (natts == 0)
+		appendStringInfoString(&sql, "1");
+	appendStringInfo(&sql, " FROM %s OFFSET 0", relname);
+	table_close(rel, NoLock);
+
+	raw = pg_parse_query(sql.data);
+	sub = parse_analyze_fixedparams(linitial_node(RawStmt, raw), sql.data, NULL, 0, NULL);
+	if (rte->alias == NULL)
+		rte->alias = makeAlias(rte->eref->aliasname, NIL);
+	rte->rtekind = RTE_SUBQUERY;
+	rte->subquery = sub;
+	rte->relid = InvalidOid;
+	rte->relkind = 0;
+	rte->inh = false;
+	rte->rellockmode = 0;
+	rte->perminfoindex = 0;
+	rte->tablesample = NULL;
+	rte->securityQuals = NIL;
+	rte->lateral = false;
+	rte->security_barrier = false;
+}
+
+/* Does the query, at any depth, read a distributed table? */
+static bool
+reads_dist_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Query))
+	{
+		Query	   *q = (Query *) node;
+		ListCell   *lc;
+
+		foreach(lc, q->rtable)
+		{
+			RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+			if (rte->rtekind == RTE_RELATION)
+			{
+				const KsDistTable *dt = kingres_shard_lookup_scan_table(kingres_shard_catalog(), rte->relid);
+
+				if (dt != NULL && !dt->is_reference)
+					return true;
+			}
+		}
+		return query_tree_walker(q, reads_dist_walker, context, 0);
+	}
+	return expression_tree_walker(node, reads_dist_walker, context);
+}
+
+/*
+ * Only the relations of the top level of the statement are asked for a row identifier (a sub-select is
+ * planned as a query of its own): a distributed table there is fenced; a sub-select there that PostgreSQL
+ * could pull up (and so turn its tables into relations of the top level) gets OFFSET 0 on itself, so that
+ * what the user wrote inside it, its own restrictions, stays inside and reaches the scan.
+ */
+static int
+fence_level(Query *q, Index skip)
+{
+	ListCell   *lc;
+	Index		rti = 0;
+	int			n = 0;
+
+	foreach(lc, q->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+		rti++;
+		if (rti == skip)
+			continue;
+		if (rte->rtekind == RTE_RELATION && rte->relkind != RELKIND_VIEW)
+		{
+			const KsDistTable *dt = kingres_shard_lookup_scan_table(kingres_shard_catalog(), rte->relid);
+
+			if (dt != NULL && !dt->is_reference)
+			{
+				fence_one(q, rti);
+				n++;
+			}
+		}
+		else if (rte->rtekind == RTE_SUBQUERY && reads_dist_walker((Node *) rte->subquery, NULL))
+		{
+			if (rte->subquery->limitOffset == NULL && rte->subquery->limitCount == NULL)
+				rte->subquery->limitOffset = (Node *) makeConst(INT8OID, -1, InvalidOid, sizeof(int64),
+																Int64GetDatum(0), false, FLOAT8PASSBYVAL);
+			n++;
+		}
+	}
+	return n;
+}
+
+/*
+ * M6: the target of the MERGE is a local table (it keeps its triggers, the capture trigger of a
+ * ledger table among them) and USING reads distributed tables.  PostgreSQL asks every relation of
+ * the statement other than the target for its row identifier unless the relation is not a table;
+ * the distributed scan has none to give, so each distributed table of USING is read through a
+ * sub-select with OFFSET 0 (above).  Returns the number of tables fenced; the query is changed.
+ */
+int
+kingres_shard_merge_fence_sources(Query *parse)
+{
+	if (parse->commandType != CMD_MERGE || parse->resultRelation <= 0)
+		return 0;
+	return fence_level(parse, (Index) parse->resultRelation);
 }

@@ -516,6 +516,13 @@ kingres_shard_make_fanout_plan(Query *parse, char *sql, List *targets,
 	return make_fanout_plan(parse, sql, targets, all_rows, relids, locknames, FO_KIND_WRITE, 0, NIL);
 }
 
+PlannedStmt *
+kingres_shard_make_fanout_plan_shipped(Query *parse, char *sql, List *targets, List *relids, List *locknames,
+									   List *mergeinfo)
+{
+	return make_fanout_plan(parse, sql, targets, false, relids, locknames, FO_KIND_WRITE, 0, mergeinfo);
+}
+
 /*
  * The plan of a MERGE that every group runs (design 7): colocated when mergeinfo is NIL, else the
  * source is read here and routed (mergeinfo: the SELECT that reads it, the number of shipped
@@ -1179,7 +1186,7 @@ run_all(KsFanoutState *s)
 	 * bound of merge_max_source_bytes is met, or not, before any group has changed a row).
 	 */
 	ran = palloc0(sizeof(bool) * Max(list_length(s->targets), 1));
-	if (s->kind == FO_KIND_MERGE_ROUTED)
+	if (s->mergeinfo != NIL)
 	{
 		List	   *gids = NIL;
 

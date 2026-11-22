@@ -37,7 +37,7 @@ CREATE FUNCTION merge_verdict(q text) RETURNS text LANGUAGE plpgsql AS $$
 DECLARE l text; r text := 'other'; dt text;
 BEGIN
   FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
-    IF l ~ 'Kingres|Pushed|Remote SQL|Source SQL|Nodes' THEN
+    IF l ~ 'Kingres|Pushed|Remote SQL|Source SQL|Nodes|Subquery Scan' THEN
       r := CASE WHEN r = 'other' THEN '' ELSE r || ' ## ' END
            || regexp_replace(regexp_replace(l, '^ *', ''), 'place=-?[0-9]+', 'place=N');
     END IF;
@@ -116,6 +116,35 @@ DEALLOCATE mp;
 SET kingres_shard.enable_distributed_merge = off;
 SELECT merge_verdict('MERGE INTO d USING plain p ON d.id = p.x WHEN MATCHED THEN DELETE');
 RESET kingres_shard.enable_distributed_merge;
+
+-- ---------------------------------------------------------------------------
+-- M4 and M5: a reference table is the target (7.5).
+-- ---------------------------------------------------------------------------
+-- M4: the statement reads reference tables, VALUES and constants only
+SELECT merge_verdict('MERGE INTO r USING (VALUES (1, ''a''), (9, ''z'')) v(k, l) ON r.k = v.k WHEN MATCHED THEN UPDATE SET label = v.l WHEN NOT MATCHED THEN INSERT VALUES (v.k, v.l)');
+SELECT merge_verdict('MERGE INTO r USING r r2 ON r.k = r2.k + 100 WHEN NOT MATCHED BY SOURCE THEN DELETE');
+-- M5: the source is a distributed table, a local table, a sub-select
+SELECT merge_verdict('MERGE INTO r USING s ON r.k = s.id WHEN MATCHED THEN UPDATE SET label = s.v WHEN NOT MATCHED THEN INSERT (k, label) VALUES (s.id, s.v)');
+SELECT merge_verdict('MERGE INTO r USING plain p ON r.k = p.x WHEN MATCHED THEN DELETE');
+SELECT merge_verdict('MERGE INTO r USING (SELECT g, count(*) AS c FROM s GROUP BY g) q ON r.k = q.g WHEN MATCHED THEN UPDATE SET label = q.c::text');
+-- refused: a value that differs between the nodes, a sub-select in an expression, a source that is a join
+SELECT merge_verdict('MERGE INTO r USING plain p ON r.k = p.x WHEN MATCHED THEN UPDATE SET label = repeat(''x'', (random() * 3)::int)');
+SELECT merge_verdict('MERGE INTO r USING s ON r.k = s.id WHEN MATCHED AND r.k > (SELECT 1) THEN DELETE');
+SELECT merge_verdict('MERGE INTO r USING plain p JOIN plain q ON p.x = q.x ON r.k = p.x WHEN MATCHED THEN DELETE');
+SET kingres_shard.enable_distributed_merge = off;
+SELECT merge_verdict('MERGE INTO r USING (VALUES (1, ''a'')) v(k, l) ON r.k = v.k WHEN MATCHED THEN DELETE');
+RESET kingres_shard.enable_distributed_merge;
+
+-- ---------------------------------------------------------------------------
+-- M6: a local target, a distributed source (7.6).
+-- ---------------------------------------------------------------------------
+SELECT merge_verdict('MERGE INTO plain USING s ON plain.x = s.id WHEN MATCHED THEN UPDATE SET y = s.v WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)');
+SELECT merge_verdict('MERGE INTO plain USING (SELECT id, v FROM s WHERE n > 3) q ON plain.x = q.id WHEN MATCHED THEN DELETE');
+SELECT merge_verdict('MERGE INTO plain USING r ON plain.x = r.k WHEN MATCHED THEN DELETE');
+SET kingres_shard.enable_distributed_merge = off;
+SELECT merge_verdict('MERGE INTO plain USING s ON plain.x = s.id WHEN MATCHED THEN DELETE');
+RESET kingres_shard.enable_distributed_merge;
+
 
 -- ---------------------------------------------------------------------------
 -- Clean up

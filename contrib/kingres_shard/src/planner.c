@@ -2017,6 +2017,91 @@ plan_reference_write(Query *parse, Oid target, const KsCatalog *cat)
 }
 
 /*
+ * plan_merge_reference
+ *
+ * Phase 12, design 7.5: a MERGE into a reference table.  M4: the statement itself runs on every node
+ * (it reads reference tables, VALUES and constants).  M5: its source is one other relation (a
+ * distributed table, a local table, a sub-select over them): this node reads the source once, takes
+ * the writer locks first (as every write to a reference table does), and every node runs the MERGE
+ * over the same rows, which a sub-select over unnest() of array parameters stands for.  The nodes,
+ * the locks, the order and the check that the copies agree are those of plan_reference_write.
+ */
+static PlannedStmt *
+plan_merge_reference(Query *parse, Oid target)
+{
+	KsMerge		m;
+	const char *why = NULL;
+	char	   *body = NULL;
+	List	   *mi = NIL;
+	List	   *nodes = NIL;
+	List	   *targets = NIL;
+	List	   *relids = NIL;
+	List	   *locks;
+	const KsCatalog *cat;
+	ListCell   *lc;
+
+	if (IsInParallelMode())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a write to a reference table cannot be run from a parallel worker")));
+	if (!kingres_shard_merge_classify_ref(parse, &m))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("MERGE into a reference table is not supported yet")));
+	if (m.kind == KS_MERGE_REFERENCE)
+		body = kingres_shard_merge_text_reference(parse, &why);
+	else
+	{
+		KsMergeShip sh;
+
+		if (kingres_shard_merge_build_ship(parse, &m, &sh, &why))
+		{
+			body = sh.text;
+			mi = list_make4(makeString(sh.source_sql), makeInteger(sh.ncols), makeInteger(sh.first_param),
+							makeInteger(1));
+		}
+	}
+	if (body == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("this MERGE into reference table \"%s\" cannot be run on every node", get_rel_name(target)),
+				 errdetail("The nodes would not accept its text: %s.", why)));
+
+	/* the analyses read the catalog cache, which a call of theirs may have reloaded */
+	cat = kingres_shard_catalog();
+	foreach(lc, cat->nodes)
+	{
+		KsNode	   *n = (KsNode *) lfirst(lc);
+
+		if (n->is_active && n->is_primary)
+			nodes = lappend(nodes, n);
+	}
+	list_sort(nodes, compare_nodes_by_id);
+	foreach(lc, nodes)
+	{
+		KsNode	   *n = (KsNode *) lfirst(lc);
+		KsFanTarget *t = palloc0(sizeof(KsFanTarget));
+
+		t->host = n->host;
+		t->port = n->port;
+		t->is_local = (n->node_id == cat->local_node_id);
+		targets = lappend(targets, t);
+	}
+	/* the reference tables of the statement (a distributed or local source is read here, not on the nodes) */
+	relids = list_make1_oid(target);
+	foreach(lc, m.relids)
+	{
+		const KsDistTable *dt = kingres_shard_lookup_dist_table(lfirst_oid(lc));
+
+		if (dt != NULL && dt->is_reference)
+			relids = list_append_unique_oid(relids, lfirst_oid(lc));
+	}
+	locks = reference_lock_names(parse, cat);
+	return kingres_shard_make_fanout_plan_shipped(parse, psprintf("%s%s", KS_REFWRITE_MARKER, body), targets, relids,
+												  locks, mi);
+}
+
+/*
  * can_distributed_scan
  *
  * May a statement that spans shard groups be planned with the distributed scan?
@@ -3707,6 +3792,8 @@ planner_hook_body(Query *parse, const char *query_string,
 
 		if (OidIsValid(reftarget))
 		{
+			if (parse->commandType == CMD_MERGE && kingres_shard_enable_distributed_merge)
+				return plan_merge_reference(parse, reftarget);
 			if (a.refs != NIL)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -3718,6 +3805,23 @@ planner_hook_body(Query *parse, const char *query_string,
 
 	if (a.refs == NIL)
 	{
+		/*
+		 * The text of a MERGE into a reference table (M4, M5) that another node sends: this node decides on its parse, with
+		 * the function the sender used, and refuses what it does not recognise (a forged text is never run).
+		 */
+		if (kingres_shard_session_forwarded() && parse->commandType == CMD_MERGE && query_string != NULL &&
+			strncmp(query_string, KS_REFWRITE_MARKER, strlen(KS_REFWRITE_MARKER)) == 0)
+		{
+			const char *why = NULL;
+			int			nsh = 0;
+
+			if (!kingres_shard_merge_ref_fragment_analyze(parse, &nsh, &why))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("this node does not accept the fragment that another node sent it"),
+						 errdetail("The statement is not a MERGE into a reference table that this node runs: %s.", why),
+						 errhint("This is not a change of the bucket map: repeating the statement does not help.")));
+		}
 		/*
 		 * No distributed table in the statement as written: the planner may
 		 * still find one (it expands a SQL-language function into the
@@ -3732,6 +3836,26 @@ planner_hook_body(Query *parse, const char *query_string,
 	if (kingres_shard_session_forwarded())
 		return plan_forwarded(parse, query_string, cursorOptions, boundParams,
 							  &a, cat);
+
+	/*
+	 * Phase 12, design 7.6: a MERGE into a local table that reads distributed tables.  PostgreSQL asks for the
+	 * row identifier of every relation of such a statement that is a table and is not the target, and the
+	 * distributed scan has none to give; each distributed table of USING is read through a sub-select with
+	 * OFFSET 0 instead (merge.c), which the planner does not pull up and marks with a copy of the row.  The
+	 * statement is then planned with the distributed scan; the target keeps its triggers, a ledger table's
+	 * capture trigger among them.
+	 */
+	if (parse->commandType == CMD_MERGE && kingres_shard_enable_distributed_merge &&
+		kingres_shard_enable_distributed_scan && parse->resultRelation > 0)
+	{
+		RangeTblEntry *mtrte = rt_fetch(parse->resultRelation, parse->rtable);
+
+		if (mtrte->rtekind == RTE_RELATION &&
+			hash_search(cat->dist_tables, &mtrte->relid, HASH_FIND, NULL) == NULL &&
+			kingres_shard_lookup_scan_table(cat, mtrte->relid) == NULL &&
+			kingres_shard_merge_fence_sources(parse) > 0)
+			return plan_with_scan(parse, query_string, cursorOptions, boundParams, NULL, NULL);
+	}
 
 	/* A row cannot change its key: it might have to move to another shard group. */
 	if (parse->commandType == CMD_UPDATE && parse->resultRelation > 0)

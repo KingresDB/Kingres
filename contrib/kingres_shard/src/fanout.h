@@ -53,6 +53,10 @@ extern PlannedStmt *kingres_shard_make_fanout_plan(Query *parse, char *sql,
 extern PlannedStmt *kingres_shard_make_merge_plan(Query *parse, char *sql, List *targets, int64 place, List *relids,
 												   List *mergeinfo);
 
+/* A write to a reference table whose source this node reads once and sends to every node (M5): mergeinfo as for kingres_shard_make_merge_plan. */
+extern PlannedStmt *kingres_shard_make_fanout_plan_shipped(Query *parse, char *sql, List *targets, List *relids,
+															List *locknames, List *mergeinfo);
+
 extern PlannedStmt *kingres_shard_make_insert_select_plan(Query *parse, char *sql, List *targets,
 														   int64 place, List *relids);
 
