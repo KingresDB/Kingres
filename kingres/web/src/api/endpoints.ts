@@ -645,7 +645,7 @@ export const endpoints = {
   /**
    * Sends one chunk at `offset`. The answer is the offset the server holds afterwards. A 409
    * `upload_offset_mismatch` is not an error here: it says where the server is (`conflict: true`), and the caller
-   * continues from that offset. Any other refusal is thrown.
+   * continues from that offset (also for a 400 that carries `Upload-Offset`). Any other refusal is thrown.
    */
   uploadDataChunk: async (
     uploadId: string,
@@ -661,7 +661,10 @@ export const endpoints = {
       signal,
     })
     const held = parseOffset(result.response.headers.get('Upload-Offset'))
-    if (result.response.status === 409 && held !== null) return { offset: held, conflict: true }
+    // A 409 says where the server is. So does a 400 that carries the header: the body was cut and the server kept what it
+    // had read (whole segments). Both are answers about the offset, not refusals of the upload.
+    const status = result.response.status
+    if ((status === 409 || status === 400) && held !== null) return { offset: held, conflict: true }
     await j(Promise.resolve(result), { keepSession: true })
     if (held === null) throw new Error('The server did not say where the upload is.')
     return { offset: held, conflict: false }

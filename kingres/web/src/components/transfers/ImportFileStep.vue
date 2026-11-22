@@ -8,9 +8,12 @@ import { computed, ref } from 'vue'
 import SafeName from '@/components/SafeName.vue'
 import { guessCsv, PREVIEW_BYTES, type CsvGuess } from '@/lib/csv-guess'
 import { formatBytes } from '@/lib/format'
-import { MAX_ATOMIC_BYTES } from '@/lib/transfer'
 
-const props = defineProps<{ maxFileBytes: number | null }>()
+const props = defineProps<{
+  maxFileBytes: number | null
+  /** The most data one import of the table takes (2 GiB; 256 MiB for a reference table). */
+  maxAtomicBytes: number
+}>()
 const emit = defineEmits<{
   chosen: [payload: { file: File; bytes: Uint8Array; guess: CsvGuess; refused: string | null }]
   cleared: []
@@ -27,10 +30,10 @@ const guess = ref<CsvGuess | null>(null)
 function refusal(f: File, g: CsvGuess): string | null {
   if (f.size === 0) return 'The file is empty.'
   if (props.maxFileBytes !== null && f.size > props.maxFileBytes)
-    return `The file is larger than the ${formatBytes(props.maxFileBytes)} this cluster stages. Split the file into parts of at most ${formatBytes(MAX_ATOMIC_BYTES)} and import them one after the other.`
+    return `The file is larger than the ${formatBytes(props.maxFileBytes)} this cluster stages. Split the file into parts of at most ${formatBytes(props.maxAtomicBytes)} and import them one after the other.`
   // A compressed file is counted by the server after it is expanded; its size here proves nothing about that.
-  if (!g.compressed && f.size > MAX_ATOMIC_BYTES)
-    return `An import is all or nothing and takes at most ${formatBytes(MAX_ATOMIC_BYTES)} of data. Split the file into parts of at most ${formatBytes(MAX_ATOMIC_BYTES)} and import them one after the other.`
+  if (!g.compressed && f.size > props.maxAtomicBytes)
+    return `An import is all or nothing and takes at most ${formatBytes(props.maxAtomicBytes)} of data. Split the file into parts of at most ${formatBytes(props.maxAtomicBytes)} and import them one after the other.`
   return null
 }
 
@@ -97,9 +100,9 @@ function clear(): void {
       />
     </div>
     <p id="import-limits" class="muted" data-testid="import-limits">
-      An import is all or nothing and takes at most {{ formatBytes(MAX_ATOMIC_BYTES) }} of data (a
-      compressed file is counted after it is expanded). Split a larger file. Nothing is sent until
-      you confirm the options.<template v-if="maxFileBytes !== null">
+      An import is all or nothing and takes at most {{ formatBytes(props.maxAtomicBytes) }} of data
+      (a compressed file is counted after it is expanded). Split a larger file. Nothing is sent
+      until you confirm the options.<template v-if="maxFileBytes !== null">
         The cluster stages files of at most {{ formatBytes(maxFileBytes) }}.</template
       >
     </p>
@@ -118,11 +121,11 @@ function clear(): void {
       <div
         class="progress"
         role="img"
-        :aria-label="`${formatBytes(file.size)} of the ${formatBytes(MAX_ATOMIC_BYTES)} an import takes`"
+        :aria-label="`${formatBytes(file.size)} of the ${formatBytes(props.maxAtomicBytes)} an import takes`"
       >
         <span
           :class="{ over: refused !== null }"
-          :style="{ width: `${Math.min(100, (file.size / MAX_ATOMIC_BYTES) * 100)}%` }"
+          :style="{ width: `${Math.min(100, (file.size / maxAtomicBytes) * 100)}%` }"
         />
       </div>
       <p v-if="refused" class="notice tone-danger" role="alert" data-testid="file-refused">

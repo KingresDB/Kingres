@@ -205,6 +205,7 @@ describe('Transfers panel, uploads of this tab', () => {
       fileName: 'a.csv',
     })
     rememberUpload({
+      user: 'admin',
       uploadId: created.uploadId,
       fileName: 'a.csv',
       sizeBytes: 1000,
@@ -218,15 +219,16 @@ describe('Transfers panel, uploads of this tab', () => {
     const list = await screen.findByTestId('stored-uploads')
     expect(list).toHaveTextContent('a.csv')
     expect(list).toHaveTextContent('shop.public.notes')
-    await user.click(within(list).getByRole('button', { name: /delete upload/i }))
+    await user.click(within(list).getByRole('button', { name: /delete upload of/i }))
     await waitFor(() => expect(screen.queryByTestId('stored-uploads')).toBeNull())
     expect(getState().transfer.uploads).toEqual([])
-    expect(listStoredUploads()).toEqual([])
+    expect(listStoredUploads('admin')).toEqual([])
   })
 
   it('forgets an upload the server no longer has (404) without a message', async () => {
     const user = userEvent.setup()
     rememberUpload({
+      user: 'admin',
       uploadId: '999',
       fileName: 'gone.csv',
       sizeBytes: 1,
@@ -237,7 +239,7 @@ describe('Transfers panel, uploads of this tab', () => {
     })
     await renderApp('/databases')
     const list = await screen.findByTestId('stored-uploads')
-    await user.click(within(list).getByRole('button', { name: /delete upload/i }))
+    await user.click(within(list).getByRole('button', { name: /delete upload of/i }))
     await waitFor(() => expect(screen.queryByTestId('stored-uploads')).toBeNull())
   })
 })

@@ -15,6 +15,14 @@ export const CHUNK_BYTES = 64 * MIB
 export const CHUNK_ALIGN = 64 * KIB
 /** An import is all or nothing and takes at most 2 GiB of decompressed data in this version. */
 export const MAX_ATOMIC_BYTES = 2 * GIB
+/** The most data of one import into a reference table (written on every group, so the server's cap is smaller). */
+export const MAX_ATOMIC_REFERENCE_BYTES = 256 * MIB
+
+/** The most data one import takes for a table with these classes (contract text of `importTable`). */
+export function atomicCapFor(classes: readonly string[]): number {
+  return classes.includes('reference') ? MAX_ATOMIC_REFERENCE_BYTES : MAX_ATOMIC_BYTES
+}
+
 /** The most a download keeps in memory when the browser cannot write to a file as it goes. */
 export const MEMORY_DOWNLOAD_BYTES = 256 * MIB
 
@@ -115,7 +123,9 @@ export function describeDownloadFailure(
     case 'network':
       return `The connection broke and could not be resumed (${of}). The file was not saved. Try again.`
     case 'session':
-      return `Your session ended (${of}). Sign in again, then download again. The file was not saved.`
+      return `Your session ended (${of}). Enter your password to go on from the bytes that are kept.`
+    case 'save':
+      return `The file could not be written to the place you chose, for example because the disk is full (${of}). Nothing was saved. Free some room or choose another place, and try again.`
     case 'refused':
       return 'The server refused the download: data transfer is turned off, your role is too low, or the connection is not encrypted.'
     case 'cancelled':

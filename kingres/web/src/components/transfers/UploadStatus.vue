@@ -1,14 +1,16 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <script setup lang="ts">
-// The state of an upload: the progress bar, the bytes the server holds, pause, resume and cancel, the sentence for every way
-// it can stop, and the prompt for the password when the server says the session ended (the upload then goes on from the
-// server's offset). The sentences are fixed; what the server said is shown through the notice of the problem.
-import { computed, ref } from 'vue'
+// The state of an upload: the progress bar (read out every ten percent), the bytes the server holds, pause, resume and
+// cancel (which asks first when much was sent), the sentence for every way it can stop, and the prompt for the password
+// when the server says the session ended (the upload then goes on from the server's offset). The sentences are fixed; what
+// the server said is shown through the notice of the problem.
+import { computed, ref, watch } from 'vue'
 import ProblemNotice from '@/components/ProblemNotice.vue'
+import { useAnnounce } from '@/composables/useAnnounce'
 import type { UploadFailure, UploadSnapshot } from '@/lib/uploader'
 import { formatBytes } from '@/lib/format'
-import { MAX_ATOMIC_BYTES } from '@/lib/transfer'
+import { MIB } from '@/lib/transfer'
 
 const props = defineProps<{
   snapshot: UploadSnapshot
@@ -26,10 +28,16 @@ const emit = defineEmits<{
   signIn: [password: string]
 }>()
 
+const announce = useAnnounce()
 const password = ref('')
+/** Cancelling deletes what was sent: it asks first when more than a few megabytes are on the server. */
+const confirming = ref(false)
+const CONFIRM_ABOVE = 4 * MIB
+
 const FAILURE: Record<UploadFailure, string> = {
   empty: 'The file is empty.',
-  too_large: `The file is above the limit of one import (${formatBytes(MAX_ATOMIC_BYTES)}) or above the largest file the cluster stages. Split it into parts and import them one after the other. Nothing was sent.`,
+  too_large:
+    'The file is above the limit of one import for this table or above the largest file the cluster stages. Split it into parts and import them one after the other. Nothing was sent.',
   size_differs:
     'The upload the browser remembered is for a file of another size, so it is not continued. Start the upload again.',
   lost: 'The server no longer has this upload (it expired, was deleted, or its file is gone). Start the upload again.',
@@ -42,6 +50,7 @@ const FAILURE: Record<UploadFailure, string> = {
   rejected: 'The server refused a part of the file. Start the upload again.',
   network:
     'The connection broke and did not come back. What the server holds is kept; resume the upload when the connection is back.',
+  busy: 'The server says that another request is still writing this upload and did not let go in time. What the server holds is kept; resume the upload in a moment.',
   other: 'The upload stopped. What the server holds is kept; try to resume it.',
 }
 const failure = computed(() => (props.snapshot.failure ? FAILURE[props.snapshot.failure] : null))
@@ -49,7 +58,9 @@ const canResume = computed(
   () =>
     props.snapshot.phase === 'paused' ||
     (props.snapshot.phase === 'failed' &&
-      (props.snapshot.failure === 'network' || props.snapshot.failure === 'other') &&
+      (props.snapshot.failure === 'network' ||
+        props.snapshot.failure === 'busy' ||
+        props.snapshot.failure === 'other') &&
       props.snapshot.uploadId !== null),
 )
 const showProblem = computed(
@@ -57,13 +68,30 @@ const showProblem = computed(
     props.snapshot.problem !== null &&
     props.snapshot.failure !== null &&
     props.snapshot.failure !== 'network' &&
+    props.snapshot.failure !== 'busy' &&
     props.snapshot.failure !== 'size_differs',
+)
+
+watch(
+  () => Math.floor(props.percent / 10),
+  (tenth) => {
+    if (props.snapshot.phase === 'sending' && tenth > 0) announce(`Upload ${tenth * 10} percent.`)
+  },
 )
 
 function submit(): void {
   if (password.value === '') return
   emit('signIn', password.value)
   password.value = ''
+}
+
+function askCancel(): void {
+  if (props.snapshot.offset > CONFIRM_ABOVE) confirming.value = true
+  else emit('cancel')
+}
+function confirmCancel(): void {
+  confirming.value = false
+  emit('cancel')
 }
 </script>
 
@@ -121,8 +149,9 @@ function submit(): void {
         <span aria-hidden="true">&#9650;</span>
         <span
           >Your session ended in the middle of the upload. Enter your password to go on from where
-          the server is ({{ formatBytes(snapshot.offset) }} of
-          {{ formatBytes(snapshot.size) }}).</span
+          the server is ({{ formatBytes(snapshot.offset) }} of {{ formatBytes(snapshot.size) }}).
+          Cancelling now cannot delete the upload on the server, because that needs a session: it
+          stays listed in the Transfers panel until you delete it there.</span
         >
       </p>
       <label for="upload-password">Password</label>
@@ -148,7 +177,28 @@ function submit(): void {
       </p>
       <ProblemNotice v-if="showProblem" :error="snapshot.problem" />
     </div>
-    <div v-if="snapshot.phase !== 'password'" class="row">
+    <div v-if="confirming" class="stack" data-testid="cancel-confirm" role="alert">
+      <p class="notice tone-warn">
+        <span aria-hidden="true">&#9650;</span>
+        <span
+          >{{ formatBytes(snapshot.offset) }} are on the server. Cancelling deletes them, and the
+          file has to be sent again from the start.</span
+        >
+      </p>
+      <div class="row">
+        <button
+          type="button"
+          class="btn btn-danger"
+          data-testid="cancel-yes"
+          data-autofocus
+          @click="confirmCancel"
+        >
+          Delete the upload
+        </button>
+        <button type="button" class="btn" @click="confirming = false">Keep the upload</button>
+      </div>
+    </div>
+    <div v-if="snapshot.phase !== 'password' && !confirming" class="row">
       <button
         v-if="snapshot.phase === 'sending' || snapshot.phase === 'starting'"
         type="button"
@@ -181,7 +231,7 @@ function submit(): void {
         type="button"
         class="btn"
         data-testid="upload-cancel"
-        @click="emit('cancel')"
+        @click="askCancel"
       >
         Cancel the upload
       </button>

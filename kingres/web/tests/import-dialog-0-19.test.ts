@@ -167,7 +167,7 @@ describe('steps 2 to 4: upload and import', () => {
     expect(rows('notes')).toBe(before + 3)
     // The upload was used and deleted; the tab forgot it.
     expect(getState().transfer.uploads).toEqual([])
-    expect(listStoredUploads()).toEqual([])
+    expect(listStoredUploads('admin')).toEqual([])
   })
 
   it('sends the options that were chosen: delimiter, null text, columns in the order of the file', async () => {
@@ -269,6 +269,7 @@ describe('steps 2 to 4: upload and import', () => {
       fileName: file.name,
     })
     rememberUpload({
+      user: 'admin',
       uploadId: created.uploadId,
       fileName: file.name,
       sizeBytes: file.size,
@@ -340,9 +341,7 @@ describe('the errors of an import', () => {
     expect(
       await within(dialog).findByText('The file is too large for one import'),
     ).toBeInTheDocument()
-    expect(
-      within(dialog).getByText(/split the file into parts of at most 2 GiB/i),
-    ).toBeInTheDocument()
+    expect(within(dialog).getByText(/split the file into smaller parts/i)).toBeInTheDocument()
   })
 
   it('endmarker.csv: the refusal names the line', async () => {

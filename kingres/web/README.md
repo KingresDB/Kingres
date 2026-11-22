@@ -579,6 +579,13 @@ built in five increments (CN1 to CN5 of `docs/design/data-export-import.md`); th
 - **Tests.** `tests/transfer-mock-0-19.test.ts`, `downloader-0-19`, `uploader-0-19`, `csv-guess-0-19`, `transfers-panel-0-19`,
   `export-dialog-0-19`, `import-dialog-0-19`; the browser tests have fifteen more states (`harness.ts`, `STATES`) in the axe and
   layout runs, light and dark, at 1366 and 320 px.
+- **After the independent review** (`docs/reviews/2026-11-22-console-data-transfer-14a.md`). The uploader pauses and caps a conflict that does not move
+  the offset (a busy writer), takes a 400 that carries `Upload-Offset` as an answer about the offset, never forgets an upload whose delete was
+  refused (`deletePending`; the panel deletes it), and asks before it cancels much. The tab's uploads are kept per person with a fingerprint of the
+  first and last 64 KiB of the file and are marked after an import with an unknown outcome (the same file then needs a tick). The dialog knows the
+  cap of the table class (2 GiB, 256 MiB for a reference table). The download reports a failing file as `save`, goes on from its bytes after a
+  sign-in, stops when the console's session ends, and its browser-link fallback shows the size and SHA-256 with the commands to check them. The
+  mock switches `busy`, `cut400` and the download that loses its session (`sessionEndsOnDownload`) make these states reachable.
 - **Known limits.** The tables list is where the actions are mounted; the table page of phase 9 (branch `web-15b`) takes the same
   `TableTransferActions` in its header. No browser test downloads a file (headless Chrome would open the file picker); the
   download is tested through the same code with a stream that breaks. A pause cuts the request in flight; the server keeps the

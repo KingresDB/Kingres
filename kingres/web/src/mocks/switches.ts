@@ -61,6 +61,8 @@
 //                                 small        the chunk size the server accepts is 128 KiB (a long upload in a short time)
 //                                 session      the next chunk of an upload is answered 401 (the session ended in the middle)
 //                                 cut          the next chunk is cut after 100 KiB; the next download breaks after 1 KiB
+//                                 busy         the next two chunks are answered 409 with the offset unchanged (another request still writes)
+//                                 cut400       the next chunk is cut and answered 400 with Upload-Offset
 //                                 short        the next download ends early, without an error
 //                                 exports      three exports exist: ready, building and expired
 //   ?clock=off:<server>:<ms>      the clock of that server is that many milliseconds ahead (negative: behind).

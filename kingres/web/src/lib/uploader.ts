@@ -34,6 +34,8 @@ export type UploadFailure =
   | 'checksum'
   | 'rejected'
   | 'network'
+  /** Another request still writes this upload and did not let go within the tries. */
+  | 'busy'
   | 'other'
 
 export interface UploadSnapshot {
@@ -51,6 +53,8 @@ export interface UploadSnapshot {
   resumes: number
   /** True when this upload went on from an upload that already existed. */
   continued: boolean
+  /** A cancel could not delete the upload on the server (the session ended, the server was not reached): it stays listed. */
+  deletePending: boolean
 }
 
 export interface UploaderApi {
@@ -125,6 +129,7 @@ export class Uploader {
       sha256: null,
       resumes: 0,
       continued: false,
+      deletePending: false,
     }
   }
 
@@ -253,12 +258,21 @@ export class Uploader {
           this.controller.signal,
         )
         this.controller = null
-        if (answer.conflict) {
-          // The server is somewhere else than the console thought: take its word, and ask it again to be sure.
+        // An answer that moves the offset forward and not past the end is progress. Anything else (a 409 with the offset
+        // where it was, a 400 that carries it, a 204 that did not advance) means the server is somewhere else, or another
+        // request still writes the upload: ask it, and wait before the next try, with a cap.
+        if (answer.conflict || answer.offset <= from || answer.offset > file.size) {
           this.set({ resumes: this.state.resumes + 1 })
           const r = await this.read(up.uploadId)
           if (r === 'gone') return this.fail('lost')
           if (r === 'stopped') return
+          if (this.state.offset > from) {
+            failures = 0
+            continue
+          }
+          failures += 1
+          if (failures > maxFailures) return this.fail('busy')
+          await sleep(Math.min(8000, 500 * 2 ** failures))
           continue
         }
         failures = 0
@@ -327,21 +341,27 @@ export class Uploader {
     return this.resume()
   }
 
-  /** Stops, deletes the staged upload on the server (a missing one is fine) and forgets it. */
+  /**
+   * Stops and deletes the staged upload on the server. A missing upload (404) is gone, which is what was wanted. Any other
+   * refusal (the session ended, the server cannot be reached) leaves the upload on the server with its room reserved: it is
+   * not forgotten, `deletePending` says so, and the Transfers panel can delete it later.
+   */
   async cancel(): Promise<void> {
     this.run += 1
     this.wantPause = true
     this.controller?.abort()
     const id = this.state.uploadId
     this.set({ phase: 'cancelled' })
-    if (id !== null) {
-      try {
-        await this.o.api.deleteDataUpload(id)
-      } catch {
-        // Gone already, or the server cannot be reached: the server deletes an upload that gets no data for 48 hours.
+    if (id === null) return
+    try {
+      await this.o.api.deleteDataUpload(id)
+    } catch (error) {
+      if (!(error instanceof ApiError && error.status === 404)) {
+        this.set({ deletePending: true })
+        return
       }
-      this.o.onUpload?.(null)
     }
+    this.o.onUpload?.(null)
   }
 
   /** Releases the in-flight request without deleting the upload (the dialog was closed; the tab remembers the upload). */

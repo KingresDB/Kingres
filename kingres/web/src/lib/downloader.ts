@@ -32,8 +32,10 @@ export type DownloadFailure =
   | 'short'
   /** The server could not be reached again after the allowed number of tries. */
   | 'network'
-  /** The session ended (401). The bytes held are kept; the person signs in and tries again. */
+  /** The session ended (401). The sink is left open and the bytes held are kept: after the sign-in the download goes on from them. */
   | 'session'
+  /** The place the file is written to failed (the disk is full, the permission was withdrawn). Nothing is resumed. */
+  | 'save'
   /** The server refused (the setting is off, the role is too low, no TLS). */
   | 'refused'
   /** The person cancelled. */
@@ -61,6 +63,8 @@ export interface DownloadOptions {
   sink: DownloadSink
   signal: AbortSignal
   onProgress?: (received: number) => void
+  /** Bytes that are already in the sink (a download that goes on after a sign-in). */
+  startAt?: number
   /** How many times the download is resumed after a break before it gives up. */
   maxResumes?: number
   /** Waits before a resume; replaceable so that tests do not wait. */
@@ -99,7 +103,7 @@ export async function runDownload(o: DownloadOptions): Promise<DownloadOutcome> 
   const maxResumes = o.maxResumes ?? 5
   const pause = o.pause ?? defaultPause
   const etag = o.sha256 === null ? null : `"${o.sha256}"`
-  let received = 0
+  let received = o.startAt ?? 0
   let resumes = 0
   const fail = async (reason: DownloadFailure, status?: number): Promise<DownloadOutcome> => {
     await o.sink.abort().catch(() => undefined)
@@ -111,6 +115,14 @@ export async function runDownload(o: DownloadOptions): Promise<DownloadOutcome> 
       ...(status === undefined ? {} : { status }),
     }
   }
+  /** The session ended: the sink stays open with the bytes it has, so that the download can go on after the sign-in. */
+  const sessionEnded = (status?: number): DownloadOutcome => ({
+    kind: 'failed',
+    reason: 'session',
+    received,
+    resumes,
+    ...(status === undefined ? {} : { status }),
+  })
   /** A break: wait and ask again, or give up when the tries are used. */
   const breakOrGiveUp = async (reason: DownloadFailure): Promise<'again' | DownloadOutcome> => {
     if (o.signal.aborted) return fail('cancelled')
@@ -133,6 +145,8 @@ export async function runDownload(o: DownloadOptions): Promise<DownloadOutcome> 
         if (next === 'again') continue
         return next
       }
+      if (why === 'session')
+        return sessionEnded(error instanceof ApiError ? error.status : undefined)
       return fail(why, error instanceof ApiError ? error.status : undefined)
     }
 
@@ -183,19 +197,28 @@ export async function runDownload(o: DownloadOptions): Promise<DownloadOutcome> 
           await reader.cancel().catch(() => undefined)
           return fail('changed')
         }
-        await o.sink.write(chunk)
+        try {
+          await o.sink.write(chunk)
+        } catch {
+          // A failure of the file is not a break of the network: it is not resumed, and the person is told what it is.
+          await reader.cancel().catch(() => undefined)
+          return fail('save')
+        }
         received += chunk.length
         o.onProgress?.(received)
       }
     } catch (error) {
       if (o.signal.aborted) return fail('cancelled')
       // A stream that fails half way: the bytes that arrived are kept, the rest is asked for.
-      if (error instanceof ApiError && failureOf(error) !== 'break')
+      if (error instanceof ApiError && failureOf(error) !== 'break') {
+        if (failureOf(error) === 'session') return sessionEnded(error.status)
         return fail(failureOf(error) as DownloadFailure)
+      }
       broke = true
     }
 
-    if (!broke && received === o.expectedSize) break
+    // Every byte arrived: a stream that failed after the last byte is not a reason to ask again (the server would answer 416).
+    if (received === o.expectedSize) break
     // Short: the stream failed or ended before the declared size. Ask for the rest.
     const next = await breakOrGiveUp(broke ? 'network' : 'short')
     if (next !== 'again') return next
@@ -210,7 +233,12 @@ export async function runDownload(o: DownloadOptions): Promise<DownloadOutcome> 
       if (!verified) return fail('changed')
     }
   }
-  await o.sink.close()
+  try {
+    await o.sink.close()
+  } catch {
+    // A full disk is often reported only here, when the file is sealed.
+    return fail('save')
+  }
   return { kind: 'complete', bytes: received, verified, resumes }
 }
 
@@ -222,10 +250,10 @@ export class MemorySink implements DownloadSink {
 
   async write(chunk: Uint8Array): Promise<void> {
     // A reader may reuse its buffer: keep a copy.
+    if (this.size + chunk.length > MEMORY_DOWNLOAD_BYTES)
+      throw new Error('The file is too large to keep in memory.')
     this.parts.push(chunk.slice())
     this.size += chunk.length
-    if (this.size > MEMORY_DOWNLOAD_BYTES)
-      throw new Error('The file is too large to keep in memory.')
   }
 
   async close(): Promise<void> {

@@ -71,8 +71,11 @@ const file = useDataExport(exportId)
           <span>{{ consistencySentence(c) }}</span>
         </div>
         <p v-if="props.spreadsheetSafe" class="muted" data-testid="export-lossy">
-          The values that begin with a formula character were changed with an apostrophe in front.
-          Importing this file puts the apostrophe into the table.
+          Text values that begin with a formula character were changed with an apostrophe in front
+          (a header cell too). Importing this file puts the apostrophe into the table; import it
+          with the first line ignored. The guard looks at the type of a column: a json or an array
+          value that begins with such a character is not changed, so it is a convenience and not a
+          security feature.
         </p>
         <p v-else class="notice tone-warn" data-testid="export-not-for-spreadsheet">
           <span aria-hidden="true">&#9650;</span>

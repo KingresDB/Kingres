@@ -7,6 +7,7 @@ import { computed, getCurrentScope, onScopeDispose, shallowRef } from 'vue'
 import { endpoints } from '@/api/endpoints'
 import { Uploader, type UploadSnapshot, type UploadSource } from '@/lib/uploader'
 import { forgetUpload, rememberUpload } from '@/lib/upload-store'
+import { useSessionStore } from '@/stores/session'
 
 export interface UploadTarget {
   database: string
@@ -24,9 +25,11 @@ const idle = (size: number): UploadSnapshot => ({
   sha256: null,
   resumes: 0,
   continued: false,
+  deletePending: false,
 })
 
 export function useUpload(target: UploadTarget) {
+  const session = useSessionStore()
   const snapshot = shallowRef<UploadSnapshot>(idle(0))
   let uploader: Uploader | null = null
   let source: UploadSource | null = null
@@ -41,7 +44,13 @@ export function useUpload(target: UploadTarget) {
   /** Starts sending `file`, or continues the upload with the id the tab remembered. */
   async function start(
     file: UploadSource,
-    options: { existing?: string; compressed?: boolean; maxFileBytes?: number | null } = {},
+    options: {
+      existing?: string
+      compressed?: boolean
+      maxFileBytes?: number | null
+      maxAtomicBytes?: number
+      fingerprint?: string | null
+    } = {},
   ): Promise<void> {
     uploader?.detach()
     source = file
@@ -57,6 +66,7 @@ export function useUpload(target: UploadTarget) {
       },
       compressed: options.compressed,
       maxFileBytes: options.maxFileBytes,
+      maxAtomicBytes: options.maxAtomicBytes,
       onChange: (s) => {
         snapshot.value = s
       },
@@ -71,6 +81,8 @@ export function useUpload(target: UploadTarget) {
             fileName: source.name,
             sizeBytes: source.size,
             lastModified: source.lastModified,
+            user: session.username ?? '',
+            ...(options.fingerprint ? { fingerprint: options.fingerprint } : {}),
             ...target,
           })
       },

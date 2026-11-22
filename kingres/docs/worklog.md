@@ -41,6 +41,19 @@ entry covers the console only. No Go code and no contract text was changed.
   options (the null limit, `skipBom`, the spreadsheet guard, the consistency sentence), the gates and the panel, the settings
   (sizes always sent), and the mock (another role sees a file, the alignment, a range past the end, a value in the failure text).
 
+### The review of the console and its fixes
+
+The independent review ([reviews/2026-11-22-console-data-transfer-14a.md](reviews/2026-11-22-console-data-transfer-14a.md)) found no critical or
+high finding, eight medium (DXW-01 to DXW-08) and nine low ones. All are fixed with tests, with the tip of `dx-cp` (97976b3c44) merged: a conflict
+that does not move the offset waits and stops as busy; a cancel whose delete was refused keeps the upload listed and says so; an import
+repeat after an unknown outcome needs a tick; the cap of a reference table (256 MiB) is known before the upload; a failing file is a
+save error and never hangs the dialog; a download that loses its session asks for the password and goes on from its bytes; the link
+fallback shows the size and the SHA-256 and the commands to check it and is for administrators only; a 400 that carries the offset
+resumes; a stream that fails after the last byte is complete; a download stops when the session of the console ends; uploads are
+kept per person with a fingerprint of the file; a file that cannot be previewed gets no default for its first line. 37 mutants of the
+fixed code were killed. The contract notes for later revisions (the spreadsheet option and the effective import cap in the
+`DataExport` and `DataTransferSettings`) are in the notes of the writer.
+
 ### Decisions and deviations
 
 - The download is not only the plain link of the design: a fetch with `Range` resumes after a break and reports a short file; the

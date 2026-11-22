@@ -63,6 +63,11 @@ export function applyTransferSwitch(entry: string, s: MockState): void {
     transferSwitches.breakChunkAfterBytes = 100 * KiB
     transferSwitches.breakDownloadAfterBytes = KiB
   }
+  if (entry === 'busy') transferSwitches.busyWriterChunks = 2
+  if (entry === 'cut400') {
+    transferSwitches.breakChunkAfterBytes = 100 * KiB
+    transferSwitches.cutAnswers400 = true
+  }
   if (entry === 'short') transferSwitches.truncateDownloadAt = 8
   if (entry === 'exports') {
     seedExport(s, 'ready', 'orders', 20)

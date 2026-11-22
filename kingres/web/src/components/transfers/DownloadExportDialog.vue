@@ -36,6 +36,12 @@ const emit = defineEmits<{ close: [] }>()
       <dt>Kept until</dt>
       <dd>{{ formatDateTime(file.expiresAt) }}</dd>
     </dl>
+    <p class="muted" data-testid="download-spreadsheet-note">
+      If this file was exported with the spreadsheet guard off, or holds json or array values, do
+      not open it in a spreadsheet: a value that begins with = + - @ can run as a formula there. The
+      guard changes text columns only and is not a security feature. This list does not say which
+      option the export had.
+    </p>
     <ExportDownload :export="file" />
     <template #footer>
       <button type="button" class="btn btn-primary" @click="emit('close')">Close</button>

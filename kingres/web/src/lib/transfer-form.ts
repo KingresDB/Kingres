@@ -123,7 +123,8 @@ export function importRequest(uploadId: string, f: ImportForm): ImportTableReque
     ...(f.compression === null ? {} : { compression: f.compression }),
     ...(f.forceNotNull.length ? { forceNotNull: f.forceNotNull } : {}),
     ...(f.forceNull.length ? { forceNull: f.forceNull } : {}),
-    skipBom: f.skipBom,
+    // The server refuses a byte order mark option with an encoding other than UTF-8 (400).
+    skipBom: f.encoding === 'UTF8' ? f.skipBom : false,
     keepUpload: f.keepUpload,
   }
 }

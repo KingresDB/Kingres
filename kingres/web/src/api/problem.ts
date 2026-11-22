@@ -466,7 +466,8 @@ const entries: Record<ProblemCode, Entry> = {
     tone: 'warning',
     heading: 'The file is too large for one import',
     message:
-      'An import is all or nothing and is limited to 2 GiB of data. Split the file into parts of at most 2 GiB and import them one after the other.',
+      'An import is all or nothing and is limited in the size of its data: 2 GiB, and 256 MiB for a reference table. Split the file into smaller parts and import them one after the other.',
+    withDetail: true,
   },
   import_end_marker: {
     tone: 'warning',

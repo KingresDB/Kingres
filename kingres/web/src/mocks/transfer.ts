@@ -35,6 +35,8 @@ const SEGMENT = 65536
 /** Files of at most this size are kept in memory; a larger one is only counted. */
 const KEEP_BYTES = 8 * MiB
 const MAX_ATOMIC = 2 * GiB
+/** A reference table is written on every group, so the server lowers the cap of one import to 256 MiB. */
+const MAX_ATOMIC_REFERENCE = 256 * MiB
 
 function db(s: MockState, name: string): DbRec {
   const rec = s.databases.find((d) => d.info.name === name)
@@ -238,6 +240,7 @@ function seal(
   content.set(prefix, gzip.length)
   content.set(bytes, gzip.length + prefix.length)
   e.content = content
+  e.encoding = b.encoding ?? 'UTF8'
   e.meta.state = 'ready'
   e.meta.sizeBytes = content.length
   e.meta.sha256 = sha256Hex(content)
@@ -264,6 +267,12 @@ function importFailure(
       fraction: 0.85,
     }
   return null
+}
+
+/** The charset of the download is the encoding of the export (UTF8 is `utf-8`, WIN1256 is `windows-1256`). */
+function charsetOf(encoding: string | undefined): string {
+  const name = (encoding ?? 'UTF8').toLowerCase()
+  return name === 'utf8' ? 'utf-8' : name.replace(/^win(\d+)$/, 'windows-$1').replace(/_/g, '-')
 }
 
 function concat(parts: Uint8Array[]): Uint8Array {
@@ -388,11 +397,19 @@ export function transferHandlers(columnsOf: ColumnsOf): Partial<Record<Operation
         throw problem('upload_incomplete', 'The upload has not received all its bytes.')
       if (t.name === FIXTURE_TABLES.blockme)
         throw problem('operation_in_progress', 'An operation on this table is running.')
-      if (u.upload.sizeBytes > MAX_ATOMIC || u.fileName === FIXTURE_FILES.toobig)
+      const cap = t.classes.includes('reference') ? MAX_ATOMIC_REFERENCE : MAX_ATOMIC
+      if (u.upload.sizeBytes > cap || u.fileName === FIXTURE_FILES.toobig)
         throw problem(
           'import_too_large',
-          'The file is larger than 2 GiB. Split the file into parts of at most 2 GiB and import them one after the other.',
+          `The data is ${u.upload.sizeBytes} bytes and an import into this table takes at most ${cap} bytes. Split the file into smaller parts.`,
         )
+      if (b.skipBom === true && b.encoding !== undefined && b.encoding !== 'UTF8')
+        throw validationFailed([
+          {
+            field: 'skipBom',
+            message: 'A byte order mark is removed only with the encoding UTF8.',
+          },
+        ])
       if (u.fileName === FIXTURE_FILES.endmarker)
         throw problem('import_end_marker', 'The file has an unquoted end marker on line 7.')
       if (u.usedBy !== null) throw problem('operation_in_progress', 'A task uses this upload.')
@@ -418,7 +435,13 @@ export function transferHandlers(columnsOf: ColumnsOf): Partial<Record<Operation
       const task = createTask(s, {
         kind: 'table.import',
         subject: { type: 'table', id: subjectOf(c) },
-        steps: ['Check the upload', 'Check the table', 'Load rows', 'Commit', 'Clean up'],
+        steps: [
+          'Check the upload',
+          'Check the table',
+          'Load rows',
+          'Confirm the commit',
+          'Clean up',
+        ],
         detail: `${u.upload.sizeBytes} bytes`,
         cancellable: true,
         ...(failure
@@ -505,6 +528,26 @@ export function transferHandlers(columnsOf: ColumnsOf): Partial<Record<Operation
           { field: 'Upload-Offset', message: 'Send the offset as a number.' },
         ])
       const bytes = new Uint8Array(await c.request.arrayBuffer())
+      // A chunk for an upload that is not receiving any more: the server answers 404 (the upload is as good as gone).
+      if (up.state !== 'receiving') throw problem('not_found', 'The upload does not exist.')
+      // Another request still writes this upload: 409 with the offset where it was (the normal state right after a pause and a resume).
+      if (sw.busyWriterChunks > 0) {
+        sw.busyWriterChunks -= 1
+        return {
+          status: 409,
+          headers: {
+            'Upload-Offset': String(up.offset),
+            'Content-Type': 'application/problem+json',
+          },
+          body: {
+            type: 'https://kingresdb.example/problems/upload-offset-mismatch',
+            title: 'upload offset mismatch',
+            status: 409,
+            code: 'upload_offset_mismatch',
+            detail: 'Another request is writing this upload.',
+          },
+        }
+      }
       if (Number(asked) !== up.offset)
         return {
           status: 409,
@@ -520,7 +563,6 @@ export function transferHandlers(columnsOf: ColumnsOf): Partial<Record<Operation
             detail: `The upload is at offset ${up.offset}.`,
           },
         }
-      if (up.state !== 'receiving') throw problem('conflict', 'The upload is complete.')
       if (bytes.length > up.chunkBytesMax || up.offset + bytes.length > up.sizeBytes)
         throw problem('chunk_too_large', 'The chunk is larger than the server accepts.')
       const last = up.offset + bytes.length === up.sizeBytes
@@ -542,7 +584,24 @@ export function transferHandlers(columnsOf: ColumnsOf): Partial<Record<Operation
         u.data?.push(take)
         up.offset += take.length
       }
-      if (take !== bytes) return { status: 0, networkError: true }
+      if (take !== bytes) {
+        if (!sw.cutAnswers400) return { status: 0, networkError: true }
+        // The body was shorter than its Content-Length: the server kept the whole segments and says where it is.
+        return {
+          status: 400,
+          headers: {
+            'Upload-Offset': String(up.offset),
+            'Content-Type': 'application/problem+json',
+          },
+          body: {
+            type: 'https://kingresdb.example/problems/bad-request',
+            title: 'bad request',
+            status: 400,
+            code: 'bad_request',
+            detail: 'The body of the chunk ended before its length.',
+          },
+        }
+      }
       if (up.offset === up.sizeBytes) {
         up.state = 'complete'
         up.sha256 = u.data
@@ -592,6 +651,10 @@ export function transferHandlers(columnsOf: ColumnsOf): Partial<Record<Operation
       guard(s)
       const sw = transferSwitches
       sw.downloadRequests += 1
+      if (sw.sessionEndsOnDownload) {
+        sw.sessionEndsOnDownload = false
+        throw problem('session_expired')
+      }
       const e = ownExport(c)
       if (e.meta.state === 'expired' || e.meta.state === 'deleted')
         return gone('The file has expired.')
@@ -603,7 +666,12 @@ export function transferHandlers(columnsOf: ColumnsOf): Partial<Record<Operation
       let last = size - 1
       let partial = false
       const range = sw.ignoreRange ? null : c.request.headers.get('Range')
-      if (range !== null) {
+      // A header that is not one range (several ranges, another unit, junk) is ignored: the whole file, status 200.
+      if (
+        range !== null &&
+        /^bytes=(\d*)-(\d*)$/.test(range.trim()) &&
+        range.trim() !== 'bytes=-'
+      ) {
         const m = /^bytes=(\d*)-(\d*)$/.exec(range.trim())
         if (!m || (m[1] === '' && m[2] === '')) return unsatisfiable(size)
         if (m[1] === '') {
@@ -622,7 +690,10 @@ export function transferHandlers(columnsOf: ColumnsOf): Partial<Record<Operation
         sw.changeEtagOnResume && sw.downloadRequests > 1 ? hex64('other') : (e.meta.sha256 ?? '')
       const ext = e.meta.format === 'csv.gz' ? 'csv.gz' : 'csv'
       const headers: Record<string, string> = {
-        'Content-Type': e.meta.format === 'csv.gz' ? 'application/gzip' : 'text/csv; charset=utf-8',
+        'Content-Type':
+          e.meta.format === 'csv.gz'
+            ? 'application/gzip'
+            : `text/csv; charset=${charsetOf(e.encoding)}`,
         'Content-Length': String(slice.length),
         'Accept-Ranges': 'bytes',
         ETag: `"${tag}"`,

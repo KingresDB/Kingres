@@ -516,6 +516,9 @@ async function startImport(page: Page): Promise<void> {
   await page.click('[data-testid="to-options"]')
   await page.waitForSelector('[data-testid="all-or-nothing"]', { timeout: 20_000 })
   await sleep(200)
+  // A file whose earlier import had no known outcome asks for the tick before it is imported again.
+  const ack = await page.$('[data-testid="ack-repeat"]')
+  if (ack) await ack.click()
   await page.click('[data-testid="start-import"]')
 }
 

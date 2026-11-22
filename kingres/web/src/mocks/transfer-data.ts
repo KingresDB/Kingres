@@ -54,6 +54,8 @@ export interface ExportRec {
   creator: string
   /** The plaintext file; null while it is built and after it is deleted or expired. */
   content: Uint8Array | null
+  /** The encoding of the file, for the charset of the download. */
+  encoding?: string
 }
 
 export interface TransferState {
@@ -82,6 +84,12 @@ export const transferSwitches = {
   loseSessionAtChunk: null as number | null,
   /** The next chunk request is cut after this many bytes: whole 64 KiB segments are kept, the answer is a network error. */
   breakChunkAfterBytes: null as number | null,
+  /** The next this many chunk requests are answered 409 with the offset where it was: another request still writes the upload. */
+  busyWriterChunks: 0,
+  /** The next download request is answered 401 `session_expired`, once; the session of the mock stays. */
+  sessionEndsOnDownload: false,
+  /** A cut chunk (`breakChunkAfterBytes`) is answered 400 with `Upload-Offset` (a proxy cut the body but the answer came) instead of a dropped connection. */
+  cutAnswers400: false,
   /** The next download stream ends with a network error after this many bytes (the headers promised the whole file). */
   breakDownloadAfterBytes: null as number | null,
   /** The next download stream ends cleanly, early, at this many bytes (a short file; the headers promised more). */
@@ -100,6 +108,9 @@ export function resetTransferSwitches(): void {
   transferSwitches.chunkRequests = 0
   transferSwitches.loseSessionAtChunk = null
   transferSwitches.breakChunkAfterBytes = null
+  transferSwitches.busyWriterChunks = 0
+  transferSwitches.sessionEndsOnDownload = false
+  transferSwitches.cutAnswers400 = false
   transferSwitches.breakDownloadAfterBytes = null
   transferSwitches.truncateDownloadAt = null
   transferSwitches.ignoreRange = false

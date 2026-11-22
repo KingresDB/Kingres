@@ -146,6 +146,7 @@ describe('the memory of an upload', () => {
   const target = { database: 'shop', schema: 'public', table: 'notes' }
   const entry = {
     uploadId: '42',
+    user: 'admin',
     fileName: 'a.csv',
     sizeBytes: 10,
     lastModified: 5,
@@ -158,17 +159,27 @@ describe('the memory of an upload', () => {
 
   it('remembers, finds by name, size, time and table, and forgets', () => {
     rememberUpload(entry)
-    expect(findStoredUpload({ name: 'a.csv', size: 10, lastModified: 5 }, target)?.uploadId).toBe(
-      '42',
-    )
-    expect(findStoredUpload({ name: 'a.csv', size: 11, lastModified: 5 }, target)).toBeNull()
-    expect(findStoredUpload({ name: 'a.csv', size: 10, lastModified: 6 }, target)).toBeNull()
-    expect(findStoredUpload({ name: 'b.csv', size: 10, lastModified: 5 }, target)).toBeNull()
     expect(
-      findStoredUpload({ name: 'a.csv', size: 10, lastModified: 5 }, { ...target, table: 'x' }),
+      findStoredUpload({ name: 'a.csv', size: 10, lastModified: 5 }, target, 'admin')?.uploadId,
+    ).toBe('42')
+    expect(
+      findStoredUpload({ name: 'a.csv', size: 11, lastModified: 5 }, target, 'admin'),
+    ).toBeNull()
+    expect(
+      findStoredUpload({ name: 'a.csv', size: 10, lastModified: 6 }, target, 'admin'),
+    ).toBeNull()
+    expect(
+      findStoredUpload({ name: 'b.csv', size: 10, lastModified: 5 }, target, 'admin'),
+    ).toBeNull()
+    expect(
+      findStoredUpload(
+        { name: 'a.csv', size: 10, lastModified: 5 },
+        { ...target, table: 'x' },
+        'admin',
+      ),
     ).toBeNull()
     forgetUpload('42')
-    expect(listStoredUploads()).toEqual([])
+    expect(listStoredUploads('admin')).toEqual([])
   })
 
   it('works without storage: nothing is remembered and nothing throws', () => {
@@ -179,20 +190,22 @@ describe('the memory of an upload', () => {
       throw new Error('full')
     })
     expect(() => rememberUpload(entry)).not.toThrow()
-    expect(listStoredUploads()).toEqual([])
-    expect(findStoredUpload({ name: 'a.csv', size: 10, lastModified: 5 }, target)).toBeNull()
+    expect(listStoredUploads('admin')).toEqual([])
+    expect(
+      findStoredUpload({ name: 'a.csv', size: 10, lastModified: 5 }, target, 'admin'),
+    ).toBeNull()
   })
 
   it('ignores a stored value that is not a list of uploads, or an id that is not a number', () => {
     sessionStorage.setItem('kingres.uploads', '{"x":1}')
-    expect(listStoredUploads()).toEqual([])
+    expect(listStoredUploads('admin')).toEqual([])
     sessionStorage.setItem(
       'kingres.uploads',
       JSON.stringify([{ ...entry, uploadId: '../x' }, entry]),
     )
-    expect(listStoredUploads().map((e) => e.uploadId)).toEqual(['42'])
+    expect(listStoredUploads('admin').map((e) => e.uploadId)).toEqual(['42'])
     sessionStorage.setItem('kingres.uploads', 'not json')
-    expect(listStoredUploads()).toEqual([])
+    expect(listStoredUploads('admin')).toEqual([])
   })
 })
 
@@ -255,5 +268,14 @@ describe('the options of a CSV', () => {
         columns: ['b', 'a'],
       }),
     ).toMatchObject({ compression: 'gzip', forceNull: ['a'], columns: ['b', 'a'] })
+  })
+})
+
+describe('the byte order mark option', () => {
+  it('is sent only with UTF8: the server answers 400 for it with another encoding', () => {
+    const latin = { ...defaultImportForm(), encoding: 'LATIN1' as const, skipBom: true }
+    expect(importRequest('7', latin).skipBom).toBe(false)
+    expect(importRequest('7', { ...defaultImportForm(), skipBom: true }).skipBom).toBe(true)
+    expect(importRequest('7', { ...defaultImportForm(), skipBom: false }).skipBom).toBe(false)
   })
 })

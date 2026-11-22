@@ -25,7 +25,8 @@ import { EXPORT_STATE } from '@/lib/status'
 import { formatBytes, formatDateTime, formatNumber } from '@/lib/format'
 import { formatLabel } from '@/lib/transfer'
 import { forgetUpload, listStoredUploads, type StoredUpload } from '@/lib/upload-store'
-import { ApiError } from '@/api/problem'
+import { ApiError, isSessionLost } from '@/api/problem'
+import { reportSessionLost } from '@/api/server-state'
 
 const props = defineProps<{
   /** Only the files of this database (the page of a database); the panel says how many others exist. */
@@ -46,7 +47,7 @@ const shown = computed(() =>
 const others = computed(() => all.value.length - shown.value.length)
 
 /** The uploads this tab started and has not finished with (the tab's own memory; the server lists none). */
-const uploads = ref<StoredUpload[]>(listStoredUploads())
+const uploads = computed<StoredUpload[]>(() => listStoredUploads(session.username ?? ''))
 const uploadError = ref<unknown>(null)
 async function deleteUpload(u: StoredUpload): Promise<void> {
   uploadError.value = null
@@ -56,11 +57,12 @@ async function deleteUpload(u: StoredUpload): Promise<void> {
     // A missing upload is already gone; any other refusal is shown and the upload is kept in the list.
     if (!(error instanceof ApiError && error.status === 404)) {
       uploadError.value = error
+      // The session ended: the person is sent to sign in, and the upload stays listed for after it.
+      if (isSessionLost(error)) reportSessionLost()
       return
     }
   }
   forgetUpload(u.uploadId)
-  uploads.value = listStoredUploads()
 }
 
 const downloading = ref<DataExport | null>(null)
@@ -154,11 +156,18 @@ function levels(e: DataExport): string {
                     :blocked-reason="
                       e.state === 'ready' ? '' : 'Only a file that is ready can be downloaded.'
                     "
+                    :aria-label="`Download the file of ${nameOf(e)}`"
                     @click="downloading = e"
                   >
                     Download
                   </GateButton>
-                  <GateButton op="deleteDataExport" small variant="danger" @click="deleting = e">
+                  <GateButton
+                    op="deleteDataExport"
+                    small
+                    variant="danger"
+                    :aria-label="`Delete the file of ${nameOf(e)}`"
+                    @click="deleting = e"
+                  >
                     Delete
                   </GateButton>
                 </div>
@@ -195,7 +204,13 @@ function levels(e: DataExport): string {
               <SafeName :value="`${u.database}.${u.schema}.${u.table}`" :max="80" />)</span
             ></span
           >
-          <GateButton op="deleteDataUpload" small variant="danger" @click="deleteUpload(u)">
+          <GateButton
+            op="deleteDataUpload"
+            small
+            variant="danger"
+            :aria-label="`Delete upload of ${u.fileName}`"
+            @click="deleteUpload(u)"
+          >
             Delete upload
           </GateButton>
         </li>

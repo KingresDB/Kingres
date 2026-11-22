@@ -25,7 +25,7 @@ import { useTaskAction } from '@/composables/useTask'
 import { useUpload } from '@/composables/useUpload'
 import type { CsvGuess } from '@/lib/csv-guess'
 import { formatBytes, formatNumber } from '@/lib/format'
-import { DELIMITER_LABEL, ENCODING_LABEL, MAX_ATOMIC_BYTES } from '@/lib/transfer'
+import { atomicCapFor, DELIMITER_LABEL, ENCODING_LABEL } from '@/lib/transfer'
 import {
   defaultImportForm,
   importRequest,
@@ -33,7 +33,7 @@ import {
   quoteError,
   utf8Length,
 } from '@/lib/transfer-form'
-import { findStoredUpload, forgetUpload } from '@/lib/upload-store'
+import { findStoredUpload, fingerprintFile, forgetUpload, markUpload } from '@/lib/upload-store'
 
 const props = defineProps<{ databaseName: string; table: Table }>()
 const emit = defineEmits<{ close: [] }>()
@@ -45,6 +45,8 @@ const settings = useClusterSettings()
 const detail = useTableDetail(props.databaseName, props.table.schema, props.table.name)
 const off = computed(() => settings.data.value?.dataTransfer?.enabled === false)
 const maxFileBytes = computed(() => settings.data.value?.dataTransfer?.maxFileBytes ?? null)
+/** The most data one import of this table takes: 2 GiB, and 256 MiB for a reference table (written on every group). */
+const cap = computed(() => atomicCapFor(props.table.classes))
 const allColumns = computed(() => detail.data.value?.columns.map((c) => c.name) ?? [])
 
 const form = reactive(defaultImportForm())
@@ -55,6 +57,12 @@ const refused = ref<string | null>(null)
 const chooseColumns = ref(false)
 const picked = ref<string[]>([])
 const submitted = ref(false)
+/** A hash of the beginning and the end of the chosen file, so that an upload is continued only for the same content. */
+const fingerprint = ref<string | null>(null)
+/** The file cannot be previewed (compressed), so whether its first line is names is for the person to say. */
+const headerPending = ref(false)
+/** The person confirmed that an earlier import of this very file was checked (see `remembered.imported`). */
+const acknowledgedRepeat = ref(false)
 
 const target = {
   database: props.databaseName,
@@ -78,10 +86,17 @@ function onChosen(p: {
   guess.value = p.guess
   refused.value = p.refused
   completeUpload.value = null
+  acknowledgedRepeat.value = false
+  fingerprint.value = null
+  void fingerprintFile(p.file).then((f) => {
+    if (file.value === p.file) fingerprint.value = f
+  })
+  headerPending.value = p.guess.compressed
   // The guess is the starting point; the person corrects it in the next step.
   form.encoding = p.guess.encoding
   form.delimiter = p.guess.delimiter
-  form.header = p.guess.header ? 'skip' : 'none'
+  // A file that cannot be previewed gets no default: whether its first line is names is for the person to say.
+  form.header = p.guess.compressed ? ('' as typeof form.header) : p.guess.header ? 'skip' : 'none'
   form.skipBom = true
   form.compression = p.guess.compressed ? 'gzip' : null
 }
@@ -98,6 +113,10 @@ const errors = computed(() => {
   const q = quoteError(form.quote, form.encoding)
   if (q) e.quote = q
   if (chooseColumns.value && picked.value.length === 0) e.columns = 'Choose at least one column.'
+  if (headerPending.value)
+    e.header = 'This file cannot be previewed here. Say whether its first line holds column names.'
+  if (remembered.value?.imported && !acknowledgedRepeat.value)
+    e.repeat = 'Say that you checked the table, or choose another file.'
   return e
 })
 
@@ -127,7 +146,11 @@ const importError = computed(() => task.error.value)
 const rowEstimate = computed(() => props.table.estimatedRows)
 
 /** The upload of this file that this tab remembers, if any. */
-const remembered = computed(() => (file.value ? findStoredUpload(file.value, target) : null))
+const remembered = computed(() =>
+  file.value
+    ? findStoredUpload(file.value, target, session.username ?? '', fingerprint.value)
+    : null,
+)
 
 function toOptions(): void {
   if (file.value && refused.value === null) step.value = 'options'
@@ -142,6 +165,8 @@ async function startSending(): Promise<void> {
     existing: remembered.value?.uploadId,
     compressed: guess.value?.compressed ?? false,
     maxFileBytes: maxFileBytes.value,
+    maxAtomicBytes: cap.value,
+    fingerprint: fingerprint.value,
   })
 }
 
@@ -155,6 +180,19 @@ async function startImport(): Promise<void> {
     completeUpload.value = null
   }
 }
+
+// What became of an import is remembered with the upload: after an unknown outcome, and after a success that kept the
+// file, choosing the same file again does not import it again without a word.
+watch(
+  () => task.state.value,
+  (state) => {
+    const id = completeUpload.value
+    if (!id) return
+    if (state === 'failed' && task.task.value?.error?.code === 'import_outcome_unknown')
+      markUpload(id, 'unknown')
+    if (state === 'done' && form.keepUpload) markUpload(id, 'done')
+  },
+)
 
 // When the whole file is on the server, the import starts by itself: the options were confirmed before the upload.
 watch(
@@ -216,7 +254,12 @@ const headerIsNames = computed(() => form.header !== 'none')
           >The table has about {{ formatNumber(rowEstimate) }} rows now (an estimate).</template
         >
       </p>
-      <ImportFileStep :max-file-bytes="maxFileBytes" @chosen="onChosen" @cleared="onCleared" />
+      <ImportFileStep
+        :max-file-bytes="maxFileBytes"
+        :max-atomic-bytes="cap"
+        @chosen="onChosen"
+        @cleared="onCleared"
+      />
       <template v-if="file && guess">
         <p
           v-if="remembered && refused === null"
@@ -250,13 +293,49 @@ const headerIsNames = computed(() => form.header !== 'none')
 
     <!-- Step 2 -->
     <form v-if="step === 'options'" class="stack" novalidate @submit.prevent="startSending">
+      <div v-if="remembered?.imported" class="stack" data-testid="repeat-warning">
+        <p class="notice tone-danger" role="alert">
+          <span aria-hidden="true">&#10006;</span>
+          <span
+            ><template v-if="remembered.imported === 'unknown'"
+              >An import of this very file ended without a known outcome: some of its rows may be in
+              the table already.</template
+            ><template v-else
+              >This file was imported before and the upload was kept on the server: its rows are in
+              the table already.</template
+            >
+            Importing it again adds the rows again (a table with a unique key answers with the key's
+            own error).</span
+          >
+        </p>
+        <label class="check"
+          ><input v-model="acknowledgedRepeat" type="checkbox" data-testid="ack-repeat" /> I checked
+          the table and I want to import this file again</label
+        >
+        <span v-if="submitted && errors.repeat" class="error" role="alert">{{
+          errors.repeat
+        }}</span>
+      </div>
+      <p
+        v-if="upload.snapshot.value.deletePending"
+        class="notice tone-warn"
+        role="alert"
+        data-testid="delete-pending"
+      >
+        <span aria-hidden="true">&#9650;</span>
+        <span
+          >The upload you cancelled could not be deleted on the server (the session ended or the
+          server could not be reached). It still holds its room. Delete it from the Transfers
+          panel.</span
+        >
+      </p>
       <p class="notice tone-warn" data-testid="all-or-nothing">
         <span aria-hidden="true">&#9650;</span>
         <span
           ><strong>All or nothing.</strong> The file is loaded in one transaction. If a row is
           wrong, nothing is stored, and the error says which line and column. A file larger than
-          {{ formatBytes(MAX_ATOMIC_BYTES) }} cannot be imported in one piece: split it. The rows
-          are locked until the end, so a large import slows writers to the table.</span
+          {{ formatBytes(cap) }} cannot be imported in one piece: split it. The rows are locked
+          until the end, so a large import slows writers to the table.</span
         >
       </p>
       <p v-if="file" class="muted">
@@ -273,8 +352,19 @@ const headerIsNames = computed(() => form.header !== 'none')
         />
       </div>
       <div class="grid-2">
-        <FormField v-slot="slot" label="First line">
-          <select v-bind="slot" v-model="form.header" data-testid="import-header">
+        <FormField
+          v-slot="slot"
+          label="First line"
+          hint="A file made by Export CSV with spreadsheet-safe values: choose to ignore the names (an apostrophe may stand before one)."
+          :error="submitted ? errors.header : undefined"
+        >
+          <select
+            v-bind="slot"
+            v-model="form.header"
+            data-testid="import-header"
+            @change="headerPending = false"
+          >
+            <option v-if="headerPending" value="" disabled>Choose ...</option>
             <option value="skip">Has column names; ignore them</option>
             <option value="match">Has column names; they must match the columns</option>
             <option value="none">Has no column names</option>
