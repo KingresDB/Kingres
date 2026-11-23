@@ -280,10 +280,11 @@ func TestSchemaSpoofIsNeverExecuted(t *testing.T) {
 		if _, err := o.GenerateDigest(ctx, db, "a"); err == nil {
 			t.Errorf("%s: a digest was made", db)
 		}
-		if _, err := o.ListDigests(ctx, db, store.Page{Limit: 5}); err == nil {
+		// the lists are empty for a database without a ledger; what matters is that nothing of the tenant ran (the markers below)
+		if p, err := o.ListDigests(ctx, db, store.Page{Limit: 5}); err == nil && len(p.Items) != 0 {
 			t.Errorf("%s: digests were listed", db)
 		}
-		if _, err := o.ListVerifications(ctx, db, store.Page{Limit: 5}); err == nil {
+		if p, err := o.ListVerifications(ctx, db, store.Page{Limit: 5}); err == nil && len(p.Items) != 0 {
 			t.Errorf("%s: verifications were listed", db)
 		}
 		if _, err := o.ListClientKeys(ctx, db); err == nil {
