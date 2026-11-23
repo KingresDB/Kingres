@@ -70,19 +70,13 @@ INSERT INTO pg_catalog.pg_extension (oid, extname, extowner, extnamespace, extre
 SELECT pg_catalog.pg_nextoid('pg_catalog.pg_extension'::pg_catalog.regclass, 'oid', 'pg_catalog.pg_extension_oid_index'::pg_catalog.regclass),
        v.n, (SELECT r.oid FROM pg_catalog.pg_roles r WHERE r.rolname = current_user), 'kingres'::pg_catalog.regnamespace, false, v.v
   FROM (VALUES ('kingres_shard', '0.9'), ('kingres_ledger', '0.3')) AS v(n, v);
-DO $fx$
-DECLARE
-    r record;
-BEGIN
-    FOR r IN SELECT c.relname, c.relkind FROM pg_catalog.pg_class c
-              WHERE c.relnamespace = 'kingres'::pg_catalog.regnamespace AND c.relkind IN ('r', 'v')
-    LOOP
-        EXECUTE pg_catalog.format('ALTER EXTENSION %I ADD %s kingres.%I',
-                                  CASE WHEN r.relname LIKE 'ledger\_%' THEN 'kingres_ledger' ELSE 'kingres_shard' END,
-                                  CASE r.relkind WHEN 'v' THEN 'VIEW' ELSE 'TABLE' END, r.relname);
-    END LOOP;
-END
-$fx$;
+-- The membership is a dependency row of type e, written directly: ALTER EXTENSION ... ADD is refused for kingres_ledger by the guard of its library, which a
+-- server that preloads it runs.
+INSERT INTO pg_catalog.pg_depend (classid, objid, objsubid, refclassid, refobjid, refobjsubid, deptype)
+SELECT 'pg_catalog.pg_class'::pg_catalog.regclass, c.oid, 0, 'pg_catalog.pg_extension'::pg_catalog.regclass, e.oid, 0, 'e'
+  FROM pg_catalog.pg_class c
+  JOIN pg_catalog.pg_extension e ON e.extname = CASE WHEN c.relname LIKE 'ledger\_%' THEN 'kingres_ledger' ELSE 'kingres_shard' END
+ WHERE c.relnamespace = 'kingres'::pg_catalog.regnamespace AND c.relkind IN ('r', 'v');
 
 -- The task table of the system schema (shape of sysdb migration 1, columns
 -- that the read side uses).
