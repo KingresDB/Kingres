@@ -9,6 +9,7 @@ package ops
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -540,6 +541,7 @@ func (o *Ops) ListTablePartitions(ctx context.Context, db, schema, table string,
 		if len(page.Items) == 0 && cursor == "" {
 			return o.nativePartitions(ctx, tx, schema, table, cursor, limit, &page) // not a user-partitioned distributed table
 		}
+		o.fillDistPartitions(ctx, tx, schema, table, page.Items)
 		return nil
 	})
 	if err != nil {
@@ -551,6 +553,61 @@ func (o *Ops) ListTablePartitions(ctx context.Context, db, schema, table string,
 		page.NextCursor = &c
 	}
 	return page, nil
+}
+
+// distBoundRE reads the bound of a range partition of a distributed table as it was given to create_partition: FROM ('2026-01-01') TO ('2026-02-01').
+var distBoundRE = regexp.MustCompile(`^(?i)\s*FROM\s*\(\s*'([^']*)'\s*\)\s*TO\s*\(\s*'([^']*)'\s*\)\s*$`)
+
+// fillDistPartitions adds to the partitions of a distributed table what the policy of phase 12 needs to show: the bounds of a range partition and how the leaves
+// are stored. A partition is columnar when every leaf is, heap when every leaf is, and mixed while a conversion is half done (the next run of the policy goes on). The
+// storage is read on the nodes that hold the leaves (kingres.partition_leaf_storage), so a node that does not answer, or a sharding extension that is older, leaves the
+// member out and does not fail the list.
+func (o *Ops) fillDistPartitions(ctx context.Context, tx pgx.Tx, schema, table string, items []api.TablePartition) {
+	for i := range items {
+		if items[i].Method != "range" || items[i].IsDefault {
+			continue
+		}
+		if m := distBoundRE.FindStringSubmatch(items[i].Bound); m != nil {
+			from, to := m[1], m[2]
+			items[i].RangeFrom, items[i].RangeTo = &from, &to
+		}
+	}
+	var have bool
+	if err := tx.QueryRow(ctx, `SELECT to_regprocedure('kingres.partition_leaf_storage(regclass)') IS NOT NULL`).Scan(&have); err != nil || !have {
+		return
+	}
+	sp, err := tx.Begin(ctx) // a savepoint: a node that fails must not end the transaction of the list
+	if err != nil {
+		return
+	}
+	defer func() { _ = sp.Rollback(context.WithoutCancel(ctx)) }()
+	rows, err := sp.Query(ctx, `SELECT partition_name, CASE WHEN count(*) = count(*) FILTER (WHERE access_method = 'columnar') THEN 'columnar'
+		WHEN count(*) = count(*) FILTER (WHERE access_method = 'heap') THEN 'heap' ELSE 'mixed' END
+		FROM kingres.partition_leaf_storage($1::regclass) GROUP BY partition_name`, qualified(schema, table))
+	if err != nil {
+		if o.Log != nil {
+			o.Log.Warn("reading the storage of the leaves of a distributed table failed", "table", qualified(schema, table), "error", err)
+		}
+		return
+	}
+	defer rows.Close()
+	am := map[string]string{}
+	for rows.Next() {
+		var name, kind string
+		if err := rows.Scan(&name, &kind); err != nil {
+			return
+		}
+		am[name] = kind
+	}
+	if rows.Err() != nil {
+		return
+	}
+	for i := range items {
+		if k, ok := am[items[i].Name]; ok {
+			k := k
+			items[i].AccessMethod = &k
+		}
+	}
 }
 
 var _ = task.CodeStepFailed
