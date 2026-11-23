@@ -28,7 +28,7 @@ Covers branch p11-left (from shard-p12), design [shard-phase11.md](design/shard-
 
 ### How it was verified
 
-See the integration note of this branch (full suite, both majors).
+Full run on both majors (kingres_shard TAP: 235 files, 59620 tests on 19 and 59060 on 18, all pass; regress, kingres_ledger and kingres_columnar pass), and in-tree meson (kingres_shard 234 ok, 1 skipped; ledger 39 and columnar 69 ok).  One in-tree failure, `t/188_online_alter` (a warning that the verification of a table operation was not done: 402 rows against 400 after the switch, under 4-process load), passed 3 of 3 reruns alone and in both TAP runs; it is watched as a load-dependent flake.
 
 ### Decisions and deviations
 
