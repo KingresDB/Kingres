@@ -559,6 +559,10 @@ func (p *mapPorts) Facts(ctx context.Context) (failover.GroupFacts, error) {
 }
 
 func (p *mapPorts) Position(ctx context.Context, s string) (failover.Position, error) {
+	// A test: the position of this server's own standby cannot be read when the bootstrap ranks the standbys (the verdict is then unknown and the bootstrap pauses).
+	if d := p.m.fd.d; d != nil && s == p.m.self && d.Fault.FailoverInjection("pin:unreadable") == "fail" {
+		return failover.Position{}, errors.New("the position cannot be read (injected)")
+	}
 	return p.m.peers.Position(ctx, s, 0)
 }
 func (p *mapPorts) State(ctx context.Context, s string) (failover.State, error) {

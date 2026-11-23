@@ -879,7 +879,7 @@ func handleFailoverDemote(ctx context.Context, d *haDeps, body []byte) (any, err
 	if !ok {
 		return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "not_primary", Message: "This server runs no primary of the shard group."}
 	}
-	return fencedStop(ctx, d.Svc.Manager(), d.LeaseMgr, d.Log, li.ID, r)
+	return fencedStop(ctx, d.Svc.Manager(), d.LeaseMgr, d.Fault, d.Log, li.ID, r)
 }
 
 // The parts of the instance manager and of the lease manager that the fenced stop uses, so that a test can stand in for them.
@@ -899,7 +899,7 @@ type fenceLeases interface {
 // that server's word. (2) The renewal of the lease ends and the marker that keeps the primary from starting here again is written, before anything is stopped. (3) The
 // instance is stopped with an immediate shutdown. (4) Only when it is seen stopped is the lease handed to the server the call names: a primary that is still running
 // keeps a lease that is no longer renewed, which runs out and takes the primary with it (the watchdog), and nobody else holds it before that.
-func fencedStop(ctx context.Context, mgr immediateManager, lm fenceLeases, log *slog.Logger, id int, r failover.DemoteRequest) (any, error) {
+func fencedStop(ctx context.Context, mgr immediateManager, lm fenceLeases, fh *fault.Hook, log *slog.Logger, id int, r failover.DemoteRequest) (any, error) {
 	if r.Group == 0 && r.Candidate != "" {
 		if err := lm.RecordCandidate(0, r.Candidate); err != nil {
 			return nil, err
@@ -911,7 +911,10 @@ func fencedStop(ctx context.Context, mgr immediateManager, lm fenceLeases, log *
 	out := failover.DemoteAnswer{}
 	stopCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
-	if err := mgr.StopImmediate(stopCtx, id); err != nil {
+	if fh.FailoverInjection("demote:nostop") == "skip" {
+		// A test: the instance does not stop (a postmaster that hangs); nothing is handed over, the lease runs out and the watchdog stops it.
+		log.Warn("failover: the old primary is not stopped (test fault demote:nostop)", "group", r.Group, "instance", id)
+	} else if err := mgr.StopImmediate(stopCtx, id); err != nil {
 		log.Warn("failover: stopping the old primary", "group", r.Group, "instance", id, "error", err)
 	}
 	running, err := mgr.Running(ctx, id)
@@ -921,6 +924,10 @@ func fencedStop(ctx context.Context, mgr immediateManager, lm fenceLeases, log *
 		out.Transferred = terr == nil && res.Granted >= res.Need
 		if terr != nil {
 			log.Warn("failover: the lease was not handed over; it runs out by itself", "group", r.Group, "error", terr)
+		}
+		// A test: kingresd ends right after it fenced its primary and handed the lease over (the leader changes at the stop).
+		if fh.FailoverInjection("demote:exit") == "exit" {
+			os.Exit(137)
 		}
 	}
 	return out, nil

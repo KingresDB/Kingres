@@ -55,7 +55,7 @@ func (f *fenceWorld) Transfer(_ context.Context, _ int32, to string) (lease.Tran
 
 func runFence(t *testing.T, w *fenceWorld, r failover.DemoteRequest) (failover.DemoteAnswer, error) {
 	t.Helper()
-	out, err := fencedStop(context.Background(), w, w, slog.New(slog.NewTextHandler(io.Discard, nil)), 1, r)
+	out, err := fencedStop(context.Background(), w, w, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), 1, r)
 	if err != nil {
 		return failover.DemoteAnswer{}, err
 	}

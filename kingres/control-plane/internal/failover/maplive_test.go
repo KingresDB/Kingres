@@ -326,3 +326,24 @@ func TestTheCallsToTheOldServerAreBoundedForAHardFailoverOfTheMapGroup(t *testin
 		t.Fatal("the failover of an ordinary group is bounded")
 	}
 }
+
+// A hard request that includes the map group is the failover of a live leader's server for the task that resolves it; no other request is.
+func TestAHardRequestThatIncludesTheMapGroupIsMarkedAsOneOfALiveLeadersServer(t *testing.T) {
+	w := mapWorld()
+	s := &Service{Runner: w.runner()}
+	in, err := s.Resolve(context.Background(), "t", "s1", Request{Mode: ModeHard, ShardGroupIDs: []int32{0}})
+	if err != nil || !in.MapLive || len(in.Groups) != 1 || in.Groups[0] != 0 {
+		t.Fatalf("hard, the map group: %+v %v", in, err)
+	}
+	if in, err = s.Resolve(context.Background(), "t", "s1", Request{Mode: ModeHard}); err != nil || !in.MapLive {
+		t.Fatalf("hard, all the groups of the server (the map group is one): %+v %v", in, err)
+	}
+	if in, err = s.Resolve(context.Background(), "t", "s1", Request{Mode: ModeGraceful, ShardGroupIDs: []int32{0}}); err != nil || in.MapLive {
+		t.Fatalf("a planned switchover is not marked: %+v %v", in, err)
+	}
+	w2 := gracefulWorld() // group 1 only
+	s2 := &Service{Runner: w2.runner()}
+	if in, err = s2.Resolve(context.Background(), "t", "s1", Request{Mode: ModeHard}); err != nil || in.MapLive {
+		t.Fatalf("a hard failover of an ordinary group is not marked: %+v %v", in, err)
+	}
+}

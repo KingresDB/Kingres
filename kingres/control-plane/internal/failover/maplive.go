@@ -84,6 +84,10 @@ func (r *Runner) stopOldMap(ctx context.Context, env *task.Env, sc *stepCtx, run
 	}
 	sc.event(ctx, "mapHardStop", map[string]any{"candidate": chosen.Server, "standby": chosen.ID, "verdict": ch.Verdict})
 	mf := &MapFacts{SyncStreaming: facts.SyncStreaming && facts.LastKnownAge <= MaxCheckAge, LastKnownLsn: facts.LastKnownLsn, PrimaryPlanned: facts.PrimaryPlanned, AsyncDatabases: facts.AsyncDatabases}
+	if r.Inject != nil && r.Inject("maphard:facts") == "async" {
+		// A test: the facts the candidate judges with differ from those this task accepted (a synchronous standby that stopped confirming): the candidate pauses.
+		mf.SyncStreaming = false
+	}
 	// The candidate's bootstrap first: it waits for the lease, which only the stop below hands to it. A request that was made before (a repeated run) finds
 	// the journal in progress.
 	if err := r.Peers.MapStart(ctx, chosen.Server, MapStartRequest{Server: sc.old(), RequestedBy: sc.in.RequestedBy, Comment: sc.in.Comment, AllowDataLoss: sc.in.AllowDataLoss,
