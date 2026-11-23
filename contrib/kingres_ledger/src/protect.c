@@ -338,8 +338,8 @@ kl_is_registered(Oid relid)
 
 	if (!OidIsValid(nspoid))
 		return false;
-	tableoid = get_relname_relid("ledger_table", nspoid);
-	idxoid = get_relname_relid("ledger_table_relid_key", nspoid);
+	tableoid = kl_catalog_relid("ledger_table");
+	idxoid = kl_catalog_index_relid("ledger_table_relid_key", tableoid);
 	if (!OidIsValid(tableoid) || !OidIsValid(idxoid))
 		return false;
 
@@ -378,8 +378,8 @@ kl_is_history(Oid relid)
 
 	if (!OidIsValid(nspoid))
 		return false;
-	tableoid = get_relname_relid("ledger_table", nspoid);
-	idxoid = get_relname_relid("ledger_table_history_relid_key", nspoid);
+	tableoid = kl_catalog_relid("ledger_table");
+	idxoid = kl_catalog_index_relid("ledger_table_history_relid_key", tableoid);
 	if (!OidIsValid(tableoid) || !OidIsValid(idxoid))
 		return false;
 
@@ -531,6 +531,9 @@ kl_internal_table_unused(Oid relid)
 	/* Gone already: it was dropped by a statement that was allowed to. */
 	if (get_rel_name(relid) == NULL)
 		return true;
+	/* only an ordinary table is read (a look-alike of the schema may be a view) */
+	if (get_rel_relkind(relid) != RELKIND_RELATION)
+		return false;
 	rel = table_open(relid, AccessShareLock);
 	snap = RegisterSnapshot(GetLatestSnapshot());
 	scan = systable_beginscan(rel, InvalidOid, false, snap, 0, NULL);
@@ -562,7 +565,7 @@ kl_ledger_relids(void)
 
 	if (!OidIsValid(nspoid))
 		return NIL;
-	tableoid = get_relname_relid("ledger_table", nspoid);
+	tableoid = kl_catalog_relid("ledger_table");
 	if (!OidIsValid(tableoid))
 		return NIL;
 

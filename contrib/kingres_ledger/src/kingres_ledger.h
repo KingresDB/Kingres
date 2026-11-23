@@ -264,6 +264,8 @@ extern bool kl_write_active(void);
 extern bool kl_manual_setting_on(void);
 extern bool kl_manual_write_ok(void);
 extern Oid	kl_extension_oid(void);
+extern Oid	kl_catalog_relid(const char *relname);
+extern Oid	kl_catalog_index_relid(const char *idxname, Oid tableoid);
 
 /* write.c: the functions that write the ledger, and the record of a manual write */
 extern void kl_record_manual_insert(Relation rel, HeapTuple tuple);

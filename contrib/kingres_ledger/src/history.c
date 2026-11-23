@@ -410,7 +410,7 @@ kl_sync_all_history_acls(Oid extowner)
 
 	if (!OidIsValid(nspoid) || !OidIsValid(extowner))
 		return;
-	tableoid = get_relname_relid("ledger_table", nspoid);
+	tableoid = kl_catalog_relid("ledger_table");
 	if (!OidIsValid(tableoid))
 		return;
 

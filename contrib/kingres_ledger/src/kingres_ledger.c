@@ -22,11 +22,14 @@
 #include "postgres.h"
 
 #include "access/table.h"
+#include "catalog/dependency.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/objectaddress.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_class.h"
 #include "commands/defrem.h"
+#include "commands/extension.h"
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "lib/stringinfo.h"
@@ -253,12 +256,50 @@ kl_check_owner(Oid relid)
  * have empty shells of it.  A ledger on a shell would cover none of its rows, so ledger_enable refuses a table whose schema another group
  * holds and names the node to run it on.  Nothing is checked when kingres_shard is not installed in this database.
  */
+/*
+ * Whether the tables of kingres_shard that kl_check_distributed_owner reads are the ones of the
+ * extension: kingres_shard is installed in this database, the schema "kingres" belongs to a
+ * superuser and each table is a member of the extension.  The names are the same in every database,
+ * and a database owner can make a schema of that name (kingres_shard does the same check).
+ */
+static bool
+kl_shard_catalog_trusted(void)
+{
+	static const char *const names[] = {"dist_schema", "bucket_map", "local_node", "node", "bucket_move"};
+	Oid			extoid = get_extension_oid("kingres_shard", true);
+	Oid			nspoid = get_namespace_oid(KL_SCHEMA_NAME, true);
+	HeapTuple	tup;
+	bool		owner_ok = false;
+	int			i;
+
+	if (!OidIsValid(extoid) || !OidIsValid(nspoid))
+		return false;
+	tup = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(nspoid));
+	if (HeapTupleIsValid(tup))
+	{
+		owner_ok = superuser_arg(((Form_pg_namespace) GETSTRUCT(tup))->nspowner);
+		ReleaseSysCache(tup);
+	}
+	if (!owner_ok)
+		return false;
+	for (i = 0; i < (int) lengthof(names); i++)
+	{
+		Oid			relid = get_relname_relid(names[i], nspoid);
+
+		if (!OidIsValid(relid) || getExtensionOfObject(RelationRelationId, relid) != extoid)
+			return false;
+	}
+	return true;
+}
+
 static void
 kl_check_distributed_owner(Oid relid)
 {
 	int			ret;
 	bool		ok = false;
 
+	if (!kl_shard_catalog_trusted())
+		return;
 	if (SPI_connect() != SPI_OK_CONNECT)
 		return;
 	ret = SPI_execute("SELECT pg_catalog.to_regclass('kingres.dist_schema') IS NOT NULL "
