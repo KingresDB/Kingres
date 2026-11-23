@@ -97,7 +97,8 @@ func (e *env) plant(t *testing.T, db string, schemas ...string) {
 	e.tenant[db] = c
 	exec(t, c, "CREATE SCHEMA ts")
 	exec(t, c, "CREATE TABLE ts.marker (what text)")
-	exec(t, c, "CREATE FUNCTION ts.spoof(w text) RETURNS boolean LANGUAGE sql AS 'INSERT INTO ts.marker VALUES (w) RETURNING true'")
+	exec(t, c, "CREATE SEQUENCE ts.ms")
+	exec(t, c, "CREATE FUNCTION ts.spoof(w text) RETURNS boolean LANGUAGE sql AS 'WITH i AS (INSERT INTO ts.marker VALUES (w) RETURNING 1) SELECT nextval(''ts.ms'') > 0'")
 	exec(t, c, "CREATE SCHEMA evil")
 	exec(t, c, "CREATE FUNCTION evil.to_regclass(text) RETURNS regclass LANGUAGE sql AS 'SELECT CASE WHEN ts.spoof(''evil.to_regclass'') THEN NULL::regclass END'")
 	exec(t, c, "CREATE FUNCTION evil.to_regprocedure(text) RETURNS regprocedure LANGUAGE sql AS 'SELECT CASE WHEN ts.spoof(''evil.to_regprocedure'') THEN NULL::regprocedure END'")
@@ -138,10 +139,21 @@ func (e *env) markers(t *testing.T, db string) []string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// the sequence is not rolled back with the transaction of the caller: a planted call in a transaction that failed afterwards is still seen
+	var called bool
+	if err := e.tenant[db].QueryRow(context.Background(), "SELECT is_called FROM ts.ms").Scan(&called); err != nil {
+		t.Fatal(err)
+	}
+	if called {
+		out = append(out, "(a call whose row was rolled back)")
+	}
 	return out
 }
 
-func (e *env) clear(t *testing.T, db string) { exec(t, e.tenant[db], "TRUNCATE ts.marker") }
+func (e *env) clear(t *testing.T, db string) {
+	exec(t, e.tenant[db], "TRUNCATE ts.marker")
+	exec(t, e.tenant[db], "SELECT setval('ts.ms', 1, false)")
+}
 
 func TestSchemaSpoofIsNeverExecuted(t *testing.T) {
 	in := pgtest.Start(t, nil)
