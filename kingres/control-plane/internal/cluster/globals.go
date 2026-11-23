@@ -356,12 +356,14 @@ func (s *Service) applyDatabasesAt(ctx context.Context, id int, dbs []wire.Datab
 		return fmt.Errorf("connecting to the instance: %w", err)
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	// A database that cannot be copied does not stop the others: every database is tried, and the errors come back together.
+	var errs []error
 	for _, d := range dbs {
 		if err := s.applyDatabase(ctx, id, c, d); err != nil {
-			return fmt.Errorf("copying database %s: %w", truncName(d.Name), err)
+			errs = append(errs, fmt.Errorf("copying database %s: %w", truncName(d.Name), err))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (s *Service) applyDatabase(ctx context.Context, id int, c *pgx.Conn, d wire.DatabaseSpec) error {
@@ -416,26 +418,7 @@ func (s *Service) applyDatabase(ctx context.Context, id int, c *pgx.Conn, d wire
 			return err
 		}
 	}
-	for _, e := range d.Extensions {
-		if e == "kingres_shard" {
-			continue
-		}
-		place, known := d.ExtensionPlaces[e]
-		var fixed bool
-		if err := dc.QueryRow(ctx, "SELECT coalesce(bool_or(schema IS NOT NULL), false) FROM pg_catalog.pg_available_extension_versions WHERE name = $1", e).Scan(&fixed); err != nil {
-			return fmt.Errorf("installing extension %s failed", truncName(e))
-		}
-		stmts, err := extensionStatements(e, place, known, fixed)
-		if err != nil {
-			return err
-		}
-		for _, b := range stmts {
-			if err := execB(ctx, dc, b); err != nil {
-				return fmt.Errorf("installing extension %s failed", truncName(e))
-			}
-		}
-	}
-	return nil
+	return applyExtensions(ctx, s.log, pgTarget{dc}, d)
 }
 
 // ApplyGlobals applies roles, then databases.
@@ -482,32 +465,4 @@ func (s *Service) databaseExtensionPlaces(ctx context.Context, db string) (map[s
 		out[name] = p
 	}
 	return out, rows.Err()
-}
-
-// extensionStatements builds the statements that install extension e in the schema it has on the sender: CREATE SCHEMA IF NOT EXISTS ... AUTHORIZATION owner
-// (the schema is made as the sender has it), then CREATE EXTENSION IF NOT EXISTS ... SCHEMA schema. Both names are quoted identifiers. An extension whose
-// control file fixes its schema (the kingres_* extensions make theirs themselves) and an extension in pg_catalog get no schema clause and no schema made;
-// with fixed false and no place known (a sender that does not say) the extension is made without a clause, as before.
-func extensionStatements(e string, place wire.ExtensionPlace, known, fixed bool) ([]*sqlx.Builder, error) {
-	id, err := sqlx.NewIdent(e)
-	if err != nil {
-		return nil, errors.New("invalid extension name")
-	}
-	create := new(sqlx.Builder).Text("CREATE EXTENSION IF NOT EXISTS").ID(id)
-	if !known || fixed || place.Schema == "" || place.Schema == "pg_catalog" {
-		return []*sqlx.Builder{create}, nil
-	}
-	sch, err := sqlx.NewIdent(place.Schema)
-	if err != nil {
-		return nil, errors.New("invalid schema name")
-	}
-	mk := new(sqlx.Builder).Text("CREATE SCHEMA IF NOT EXISTS").ID(sch)
-	if place.Owner != "" {
-		owner, err := sqlx.NewIdent(place.Owner)
-		if err != nil {
-			return nil, errors.New("invalid owner name")
-		}
-		mk.Text("AUTHORIZATION").ID(owner)
-	}
-	return []*sqlx.Builder{mk, create.Text("SCHEMA").ID(sch)}, nil
 }

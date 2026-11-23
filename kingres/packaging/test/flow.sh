@@ -186,7 +186,8 @@ flow_check_extensions() {
     check_eq "${p}: all five are in pg_extension" "${KINGRES_EXTENSIONS}" \
         "$(svc -d ext_check -Atc "select string_agg(extname, ' ' order by extname) from pg_extension where extname like 'kingres%'" 2>/dev/null)"
     # The library is preloaded, so a columnar table can be created and written.
-    check "${p}: a columnar table can be created and written (the library is preloaded)" svc -d ext_check -v ON_ERROR_STOP=1 \n        -c 'create table public.col_t (a int) using columnar' -c 'insert into public.col_t values (1)'
+    check "${p}: a columnar table can be created and written (the library is preloaded)" svc -d ext_check -v ON_ERROR_STOP=1 \
+        -c 'create table public.col_t (a int) using columnar' -c 'insert into public.col_t values (1)'
     check "${p}: drop the scratch database" svc -d postgres -v ON_ERROR_STOP=1 -c 'drop database ext_check'
     # The order must not matter: every extension that uses the schema kingres
     # installs whether or not another one made the schema first.  An earlier

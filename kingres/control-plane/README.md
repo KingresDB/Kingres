@@ -3722,6 +3722,16 @@ a package without the extension leaves them as they are), and every database mad
 apply kind on the others). A server that is added gets the extension with each database of the leader (`globals/apply` copies the extension list).
 `ExtStatStatements` is in the closed list of `extension.check`, `extension.install` and `extension.verify`.
 
+**Copying extensions to an added server (`globals/apply`).** The leader sends, for each extension of a database, the schema it is installed in and the
+owner of that schema (`ExtensionPlaces`). The receiver checks the package first (`pg_available_extensions`): `pg_stat_statements` that the package lacks is a
+warning, any other extension that it lacks is one error that names all of them; every database and every extension is tried, and the errors come back
+together. For each extension it runs `CREATE SCHEMA IF NOT EXISTS ... AUTHORIZATION owner` and `CREATE EXTENSION IF NOT EXISTS ... SCHEMA schema` in one
+transaction, quoting both names; a schema that exists on the receiver with another owner than on the leader is refused. An extension whose control file
+fixes its place (it names a schema, or `relocatable = false`: the `kingres_*` extensions) and an extension in `pg_catalog` get no clause. **Mixed
+versions: upgrade the leader last.** A leader of an earlier version sends no places; the receiver then makes `pg_stat_statements` in `public` and any
+other extension without a clause, as that version did, so an extension outside `public` or `pg_catalog` that is not fixed is only copied correctly
+from a leader that has this change.
+
 **Databases that exist already** get no extension from `kingresd`, neither lazily nor at start. That is a decision: the storage extensions are installed at
 first use because an operation of `kingresd` needs them, and nothing in `kingresd` reads `pg_stat_statements`, so there is no first use to hang the
 installation on, and `CREATE EXTENSION` run by the control plane in a database of a user at an unforeseen time (a superuser statement on the objects of the
