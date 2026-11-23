@@ -110,7 +110,12 @@ func (e *env) plant(t *testing.T, db string, schemas ...string) {
 	for _, s := range schemas {
 		exec(t, c, "CREATE SCHEMA IF NOT EXISTS "+s)
 		for _, n := range kingresNames {
-			exec(t, c, "CREATE VIEW "+s+"."+n+" AS SELECT 1::bigint AS ledger_txid, 1::int AS group_id, 'x'::text AS host, 1::bigint AS version, 1::int AS node_id, 1::int AS bucket_count, 1::int AS colocation_id WHERE ts.spoof('"+s+"."+n+"')")
+			cols := "1::bigint AS ledger_txid, 1::int AS group_id, 'x'::text AS host, 1::bigint AS version, 1::int AS node_id, 1::int AS bucket_count, 1::int AS colocation_id"
+			if n == "ledger_digest" {
+				// the columns that the digest operation reads, so that the statements are valid and the function in them is what stops the planted code
+				cols = "1::bigint AS digest_id, now() AS generated_at, 'x'::name AS generated_by, 1::bigint AS height, NULL::bytea AS block_hash, '{}'::jsonb AS digest"
+			}
+			exec(t, c, "CREATE VIEW "+s+"."+n+" AS SELECT "+cols+" WHERE ts.spoof('"+s+"."+n+"')")
 		}
 		exec(t, c, "CREATE FUNCTION "+s+".ledger_head() RETURNS TABLE (chain_id bytea, height bigint, block_hash bytea, closed_at_us bigint) LANGUAGE sql AS 'SELECT NULL::bytea, 1::bigint, NULL::bytea, 1::bigint WHERE ts.spoof(''"+s+".ledger_head'')'")
 		exec(t, c, "CREATE FUNCTION "+s+".ledger_blocks_entries(bigint, integer) RETURNS TABLE (height bigint, entry bytea) LANGUAGE sql AS 'SELECT 1::bigint, NULL::bytea WHERE ts.spoof(''"+s+".ledger_blocks_entries'')'")
