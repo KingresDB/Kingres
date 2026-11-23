@@ -7,6 +7,70 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-24 (branch p14c): phase 14c, database import
+
+### What was done
+
+- **Contract 0.41.0** (a placeholder number; the integrator renumbers it): `importDatabase` (`POST /database-imports`), the closed `ImportDatabaseRequest`, the task kind `database.import`, the codes
+  `archive_statement_refused` and `ledger_restart_not_acknowledged`, the checker rules, the README (174 operations, 139 paths), the generated types. It is its own commit (C0), and the console was built against it by a second writer.
+- **The shape grammar in execution mode** (`sqlshape.Each`): the exact text that the grammar consumed completely, lexed again alone (a text that reads differently is refused); a refusal ends the walk.
+  **`archive.OpenEntry`** reads an entry again and checks its size, CRC-32 and SHA-256 at the end of the stream; `archive.ReadManifest`; `archive.Assemble` and `archive/archivetest` for archives that lie.
+- **The task `database.import`** (`ops/dbimport*.go`): the archive is read again from its bytes (file SHA-256 against `expectedSha256`, the validator, the grammar, the plan against the catalog, versions, the
+  closed list of extensions, the ledger acknowledgement, `maxImportBytes`); a private database `kingres_import_<task id>` made strictly by the service role on every server, with a marker; the extensions; the
+  function check against `pg_proc`; the statements of the archive **as the signed-in role**, one per round trip through the extended protocol with `search_path = pg_catalog`; the distribution from the catalog
+  while the tables are empty (colocation groups, reference tables, columnar options, distributed schemas); the views; the data (one transaction per table, the rows against the manifest, reference tables through
+  the temporary table of 14a); the constraints (a violated foreign key is counted and named); the sequences on every node; the ledger (new chain, `ledger_verify`, the policy set again) and the time-partition
+  policies **disabled**; the verification; the rename on every server, the owner, the registry. The hook of a failed or cancelled task drops the private database (only one that it made).
+- **The role is kept out while the service role works** (`CONNECT` is withdrawn and its sessions are ended, on every server, before every service phase), the service role touches a table of the role only after
+  the catalog shows that it holds no code (`tableTrusted`, from the deparsed expressions: PostgreSQL records no dependency on a builtin function), and `extguard` (or the shard check of 14b) precedes every read of `kingres.*`.
+- **V8 passed**: the rename of a database works on one and on three servers with the background workers connected. The fallback of the design was not needed.
+- **Fixes of 14b that the import found**: the locale provider of a libc database was written as `builtin`; the colocation group of a distributed schema has no column type (the export failed with a 500).
+- **Console** (a second writer, merged): the *Import database* dialog, the report page with the statements the plan refuses, the acknowledgement of the ledger restart, progress, the result and the failure text, the
+  mock with the fixtures of the design, 2050 unit tests and browser and axe tests at three widths.
+
+### How it was verified
+
+PostgreSQL 18.7 and 19.0 in private installations (`~/kw-p14c/pg18` and `pg19`, the extensions built from this commit, each major built clean, deleted at the end), lane `l13`, `control-plane/scripts/run-integration.ps1`.
+
+| Test | Layer | PostgreSQL 18 | PostgreSQL 19 |
+|---|---|---|---|
+| `sqlshape` (`Each`, hidden statements, the maximum, a fuzz target of 3.5 million runs), `archive` (`OpenEntry`, `ReadManifest`, `Assemble`), `ops` unit tests of the import (revalidation from bytes, plan, verdict about functions, names, steps, cancel guard, cached report, expressions), `transfer`, `problem`, `httpapi`, `config` | Go unit | pass | pass (same files) |
+| `TestLexersAgreeWithTheServer` with 19 more scripts of the import statement kinds | PG test | pass | pass |
+| `TestImportFunctionCheckOnARealCatalog`, `TestTableTrustedOnARealCatalog`, `TestExecOneIsOneStatement`, `TestUnqualifiedNamesDoNotLandAnywhere`, `TestForeignKeyViolationsAreCounted` | PG test, private install | pass | pass |
+| `TestDatabaseImportRoundTrip`: every table kind, compared row for row, distribution, colocation sets, ledger (new chain, entries, `ledger_verify`, policy `required` back), policies disabled, sequences, owners, comments, views | cluster (one server) | pass | pass |
+| `TestDatabaseImportRefusesHostileArchives`: 45 archives (comments, `\r`, dollar quotes, `SET ROLE`, `SET SESSION AUTHORIZATION`, `ALTER DATABASE`, a grant to PUBLIC on `pg_catalog`, extensions outside the list, an oversized statement, a zip bomb, manifests that lie, dangerous functions): refused, no database, role or setting left | cluster (one server) | pass | pass |
+| `TestDatabaseImportHiddenTextIsNotRun`, `...RefusesADangerousRole`, `...WithdrawsTheAccessOfTheRole`, `...CleansUp` (failure, `keepOnFailure`, cancel), `...NeverUsesADatabaseItDidNotMake` | cluster (one server) | pass | pass |
+| `TestDatabaseImportOfAnArchiveFromAnotherMajor` (18 into 19: imported and equal to its source; 19 into 18: `archive_incompatible`, nothing made) | cluster (one server) | pass | pass |
+| `TestDatabaseImportOverThreeServers` (through followers, buckets in several groups, colocation, a distributed schema, ledger verification, the private database removed from every server after a failure) | cluster (three servers) | pass | pass |
+| 14b regression: `TestDatabaseExport*`, `TestSpikeS3`, `TestDatabaseExportOverThreeServers` | cluster | pass | pass |
+| Console: typecheck, lint, `api:check`, 114 files and 2050 vitest tests, `import-0-41` browser and axe tests at 1366, 683 and 320 px in both themes | web | pass | not applicable |
+| Contract: `check-contract.mjs`, `httpapi` and `contract` tests | contract | pass | not applicable |
+
+**Mutants** (one-line edits, each killed by the named test): the text of a statement is not lexed again alone (`TestSameTokensGuard`); the walk goes on after a refusal; a carriage return does not end a comment; the
+grammar allows `SET`; the dangerous functions are not known; an extension outside the list is installed (`TestSetupRefusesAnExtensionOutsideTheList`); the checksum of an entry is not compared; `expectedSha256` is not compared;
+the refusals of the grammar are not applied at import (both layers); a statement runs through the simple protocol (`TestExecOneIsOneStatement`); the session has the default search path; a table with a trigger of the
+role is touched; the functions of the expressions of a table are not checked; the statements run as the service role (`TestDatabaseImportRoundTrip`); a private database that exists is a success; the final rename does
+not check the name; `dblink` is in the closed list; the history rows of a ledger table are loaded; the ledger policy is not set again; time-partition policies are enabled; the failure hook drops nothing, or another
+name; the access of the role is not withdrawn; the function check is skipped; a dangerous role may import; the rows are not compared with the manifest; the ledger restart is not acknowledged (`TestDatabaseImportRoundTrip`: the first import without the acknowledgement must fail). **All 27 are killed** (the runner and the list of the mutants are in the scratch area of the writer, not in the tree).
+
+### Decisions and deviations
+
+- A request does not read the archive (it cannot, for 100 GiB inside a request); a cached report only refuses early. Every hostile archive is refused by the first step of the task, with nothing made.
+- No commit intent: a failure drops the whole database, so a table is one transaction with its count and nothing more. Statements are not grouped in a transaction per table.
+- The service role works only while the role cannot connect (a design addition, "What the service role does after the role, and how the role is kept out of it" in the design note).
+- The task drops a database only if the service role owns it and it carries its marker (a role with `CREATEDB` can make a database with a guessed private name).
+- The free space of the data nodes against `maxImportBytes` is not checked; the leader change at every step is not tested with a real failover; no archive of 2 GiB or more was imported.
+
+### Still open
+
+- The integrator renumbers the contract (0.41.0 here) and the migration is none; the console and the server agree on the detail lines of the finished task (`ledger: ...`, `policy disabled: ...`, `NOT VALID: ...`).
+
+### Core patches
+
+None.
+
+---
+
 ## 2026-11-23 (branch p14b, second entry): the fixes for the security review of phase 14b
 
 ### What was done
