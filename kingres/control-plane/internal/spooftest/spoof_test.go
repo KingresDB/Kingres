@@ -95,7 +95,8 @@ func (e *env) plant(t *testing.T, db string, schemas ...string) {
 	exec(t, c, "CREATE FUNCTION evil.to_regprocedure(text) RETURNS regprocedure LANGUAGE sql AS 'SELECT CASE WHEN ts.spoof(''evil.to_regprocedure'') THEN NULL::regprocedure END'")
 	exec(t, c, "CREATE FUNCTION evil.cnt(bigint) RETURNS bigint LANGUAGE sql AS 'SELECT CASE WHEN ts.spoof(''evil.count'') THEN $1 + 1 END'")
 	exec(t, c, "CREATE AGGREGATE evil.count(*) (SFUNC = evil.cnt, STYPE = bigint, INITCOND = '0')")
-	for _, v := range []string{"pg_class", "pg_namespace", "pg_attribute", "pg_extension", "pg_database", "pg_index"} {
+	exec(t, c, "CREATE VIEW evil.pg_attribute AS SELECT attrelid, attnum, attname, atttypid, attisdropped, attnotnull FROM pg_catalog.pg_attribute WHERE ts.spoof('evil.pg_attribute')")
+	for _, v := range []string{"pg_class", "pg_namespace", "pg_extension", "pg_database", "pg_index"} {
 		exec(t, c, "CREATE VIEW evil."+v+" AS SELECT * FROM pg_catalog."+v+" WHERE ts.spoof('evil."+v+"')")
 	}
 	for _, s := range schemas {
