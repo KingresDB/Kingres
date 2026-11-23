@@ -69,6 +69,7 @@
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/json.h"
 #include "utils/lsyscache.h"
@@ -854,6 +855,7 @@ kingres_shard_assert_no_move(int colocation_id)
 	Oid			save_uid;
 	int			save_sec;
 	int			ret;
+	int			nest;
 
 	if (!OidIsValid(kingres_shard_catalog_relid("bucket_move")))
 		return;
@@ -867,9 +869,13 @@ kingres_shard_assert_no_move(int colocation_id)
 	 */
 	GetUserIdAndSecContext(&save_uid, &save_sec);
 	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, save_sec | SECURITY_LOCAL_USERID_CHANGE);
+	/* the session's search_path is not trusted here (XSP-02): the system catalogs alone, for the block */
+	nest = NewGUCNestLevel();
+	(void) set_config_option("search_path", "pg_catalog, pg_temp", PGC_USERSET,
+							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	ret = SPI_execute_with_args("SELECT m.move_id FROM " KINGRES_SHARD_SCHEMA ".bucket_move m "
 							  "WHERE m.colocation_id OPERATOR(pg_catalog.=) $1 "
-							  "AND m.phase IN ('preparing', 'copying', 'catching_up', 'switching') "
+							  "AND m.phase OPERATOR(pg_catalog.=) ANY (ARRAY['preparing', 'copying', 'catching_up', 'switching']::pg_catalog.text[]) "
 							  "LIMIT 1",
 							  1, argtypes, values, NULL, true, 0);
 	if (ret != SPI_OK_SELECT)
@@ -902,7 +908,7 @@ kingres_shard_assert_no_move(int colocation_id)
 	{
 		ret = SPI_execute_with_args("SELECT s.split_id FROM " KINGRES_SHARD_SCHEMA ".bucket_split s "
 									"WHERE s.colocation_id OPERATOR(pg_catalog.=) $1 "
-									"AND s.phase IN ('preparing', 'copying', 'catching_up', 'switching') LIMIT 1",
+									"AND s.phase OPERATOR(pg_catalog.=) ANY (ARRAY['preparing', 'copying', 'catching_up', 'switching']::pg_catalog.text[]) LIMIT 1",
 									1, argtypes, values, NULL, true, 0);
 		if (ret != SPI_OK_SELECT)
 			elog(ERROR, "could not look for bucket splits");
@@ -913,6 +919,7 @@ kingres_shard_assert_no_move(int colocation_id)
 			splitting = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
 		}
 	}
+	AtEOXact_GUC(true, nest);
 	SetUserIdAndSecContext(save_uid, save_sec);
 	SPI_finish();
 	if (splitting > 0)

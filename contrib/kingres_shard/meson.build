@@ -350,6 +350,7 @@ tests += {
       't/265_merge_reference_local.pl',
       't/266_merge_faults.pl',
       't/268_merge_review_fixes.pl',
+      't/252_extension_search_path.pl',
     ],
   },
 }
