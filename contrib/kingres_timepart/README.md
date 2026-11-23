@@ -1153,10 +1153,42 @@ no distributed table and the functions below see none.
   the database of every node that holds a leaf, and `kingres_columnar` for a
   conversion to columnar (the control plane installs both with the database); a
   node that lacks one makes the action `skipped` with `conversion_refused` and
-  the number of the node, before any leaf is touched. A claim that a stopped
-  conversion left stays until `kingres.end_leaf_conversion(op_id)` (or six
-  hours without renewal: the next claim takes it over); `kingres.table_operations`
-  lists it as kind `convert_leaf`.
+  the number of the node, before any leaf is touched (the claim is taken first
+  and every error after it, this one included, releases it).
+* **A claim that is left behind.** The claim names the session that drives the
+  conversion (`holder_pid` and its start time in the `spec` of the record, shown
+  by `kingres.table_operations`), and the driver renews it after each leaf.
+  `kingres.check_cluster()` reports `leaf_conversion_stale` for a claim whose
+  session is gone or that was not renewed for six hours, with the way out. The
+  way out is `kingres.cancel_table_operation(op_id)`, which releases a claim
+  that nobody holds (it refuses one whose session lives: cancel that session
+  with `pg_cancel_backend`, and the driver releases the claim itself) or
+  `kingres.end_leaf_conversion(op_id)`; the next claim also takes over a claim
+  that is stale, and the refusals that a claim causes (a bucket move, a
+  partition function, `begin_leaf_conversion`) say so in their hint. When the
+  driver stops on an error or a cancel, the `CALL` that it left on the node is
+  ended there before the claim is released, so that no leaf is converted after
+  the group is free. A driver that is killed outright cannot do that: the leaf
+  that was running ends by itself (it is one transaction) and the claim is
+  reported until it is released.
+* **Time limits.** A leaf is bounded by `kingres_timepart.dist_leaf_timeout_ms`
+  (4 hours; at most 5, below the six hours of the lease of the claim, which the
+  driver renews after each leaf). A driver that sets `statement_timeout` for an
+  action bounds the whole conversion of a partition, all its leaves: the control
+  plane sets none, and a driver that does should set it for the largest
+  partition (`timepart_action_timeout()` is the 5 minutes meant for the
+  actions of ordinary tables). A leaf that waits for a lock gives way after
+  `kingres_timepart.create_lock_timeout_ms` and the swap after 500 ms
+  (`swap_lock_timeout`): the partition is then mixed and the next run goes on.
+* **What the history shows.** The action of a distributed partition has no size
+  before or after (the leaves are on other nodes: `bytes_before` and
+  `bytes_after` stay null), and `object_in_use` is a `retry_later` only for a
+  distributed table (for an ordinary table it is an error of the action).
+  `timepart__dist_budget` reads the limit that is configured
+  (`pg_settings.reset_val`), not the value that the session of the owner set: a
+  role that owns a table cannot raise it for the policy. `partition_leaf_storage`
+  raises an error when a bucket belongs to a group that has no active primary,
+  and does not leave its leaves out.
 
 ## Upgrade path
 

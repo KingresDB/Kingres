@@ -559,9 +559,11 @@ func (o *Ops) ListTablePartitions(ctx context.Context, db, schema, table string,
 var distBoundRE = regexp.MustCompile(`^(?i)\s*FROM\s*\(\s*'([^']*)'\s*\)\s*TO\s*\(\s*'([^']*)'\s*\)\s*$`)
 
 // fillDistPartitions adds to the partitions of a distributed table what the policy of phase 12 needs to show: the bounds of a range partition and how the leaves
-// are stored. A partition is columnar when every leaf is, heap when every leaf is, and mixed while a conversion is half done (the next run of the policy goes on). The
-// storage is read on the nodes that hold the leaves (kingres.partition_leaf_storage), so a node that does not answer, or a sharding extension that is older, leaves the
-// member out and does not fail the list.
+// are stored, with the words of kingres_timepart (timepart__dist_kinds): columnar when every leaf is, heap when every leaf is, mixed while a conversion is half done (some
+// leaves are columnar and the others are not; the next run of the policy goes on), other when a leaf is missing or has another access method. The storage is read on
+// the nodes that hold the leaves (kingres.partition_leaf_storage), so a node that does not answer, a bucket whose group has no active primary, or a sharding extension
+// that is older, leaves the member out and does not fail the list. It reads every node for each page of the list (a page is 50 partitions by default): the listing is
+// not a hot path, and a cache would show a conversion that is over as half done.
 func (o *Ops) fillDistPartitions(ctx context.Context, tx pgx.Tx, schema, table string, items []api.TablePartition) {
 	for i := range items {
 		if items[i].Method != "range" || items[i].IsDefault {
@@ -582,7 +584,8 @@ func (o *Ops) fillDistPartitions(ctx context.Context, tx pgx.Tx, schema, table s
 	}
 	defer func() { _ = sp.Rollback(context.WithoutCancel(ctx)) }()
 	rows, err := sp.Query(ctx, `SELECT partition_name, CASE WHEN count(*) = count(*) FILTER (WHERE access_method = 'columnar') THEN 'columnar'
-		WHEN count(*) = count(*) FILTER (WHERE access_method = 'heap') THEN 'heap' ELSE 'mixed' END
+		WHEN count(*) = count(*) FILTER (WHERE access_method = 'heap') THEN 'heap'
+		WHEN count(*) FILTER (WHERE access_method = 'columnar') > 0 THEN 'mixed' ELSE 'other' END
 		FROM kingres.partition_leaf_storage($1::regclass) GROUP BY partition_name`, qualified(schema, table))
 	if err != nil {
 		if o.Log != nil {

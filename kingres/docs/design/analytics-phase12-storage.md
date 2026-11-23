@@ -2003,8 +2003,14 @@ policy, the leaf budget as a conflict, the storage of the partitions in the list
   `attach_partition` enforce `kingres_shard.max_partition_leaves` (8192, not the 20 000 of the first sketch): before 9.5 only the distribution of the table checked it.
 - **The listing** of the partitions of a distributed table has the bounds and `accessMethod` `heap`, `columnar` or `mixed` (the value `mixed` is new; the counts are in
   `kingres.timepart_dist_partitions`).
-- **Not built:** `check_cluster()` does not report a claim that a stopped conversion left (it is listed by `kingres.table_operations` and expires); the conversion of a leaf of a
-  table with a foreign key or a trigger of its own is refused as for any table (the action is `skipped`).
+- **A claim that is left behind** is reported by `check_cluster()` (`leaf_conversion_stale`: its session is gone, or it was not renewed for six hours) and released by
+  `cancel_table_operation` or `end_leaf_conversion`; the driver gives its backend pid when it takes the claim, and ends the `CALL` that it left on a node before it releases the
+  claim after an error. The claim is taken before the leaves are read and the nodes are checked, so that those are true until it is released. The limit of a leaf
+  (`dist_leaf_timeout_ms`) is below the lease. The history of a distributed action has no sizes. The control plane brings `kingres_timepart` to the packaged version on every
+  server (a job of the leader, `extension.update`, ten intervals of the partition scheduler), so that no operator step is needed.
+- **Not built:** the conversion of a leaf of a table with a foreign key or a trigger of its own is refused as for any table (the action is `skipped`); the leaf budget is
+  not part of `table_change_report` for a policy (the policy and the partition functions check it); a copy of the claim on the other nodes is not needed (DDL and the partition functions
+  reach them only through the map group primary).
 
 ## 12. Security
 

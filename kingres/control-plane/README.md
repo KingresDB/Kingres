@@ -3761,8 +3761,13 @@ are the same operations on the same records; nothing in `partsched` or in the ta
 an old partition on the nodes that hold them (one action per partition; a leaf that refuses leaves the partition `mixed`, and the next run goes on) and refuses a policy that would give the table more leaves than
 `kingres_shard.max_partition_leaves` (409 `partition_policy_conflict`, with the numbers). `partitionColumn` and the health come from the extension, so they name the key of the partitions and not the distribution column.
 `listTablePartitions` of a distributed table gives `rangeFrom`, `rangeTo` and an `accessMethod` of `heap`, `columnar` or `mixed`, read on the nodes. A run needs `kingres_timepart` 0.3 in the database of every server that holds a
-leaf and `kingres_columnar` for the conversion (`database.create` installs them on every server; an update of `kingres_timepart` to 0.3 on the servers other than the leader's is not made by the control plane in this version: run `ALTER EXTENSION kingres_timepart UPDATE` in the database on each); a server that lacks one makes the conversion `skipped` with the server named. The service role is a superuser, as
+leaf and `kingres_columnar` for the conversion (`database.create` installs them on every server and the job `extension.update` brings `kingres_timepart` up to date); a server that lacks one makes the conversion `skipped` with the server named. The service role is a superuser, as
 the partition functions need. Test: `internal/clustertest/distpart_test.go` (`TestPartitionPolicyOfADistributedTable`).
+
+**The update of `kingres_timepart`.** The job `extension.update` of the leader's scheduler (every ten intervals of `partition-scheduler-interval`, 10 minutes by default, and soon after the leader starts) brings
+`kingres_timepart` to the version of the package in every database of this server that has it, and in the same databases on the other servers, with the update path of the extension steps
+(`extension.install` of the internal `apply`: `ALTER EXTENSION UPDATE` to the default version of the package of that server, nothing when it is there already), so that a database that was made with
+0.2 has the procedure that converts a leaf on every server without a step of an operator. A server that cannot be reached is named in the log and asked again at the next pass. Test: `TestTimepartUpdatedOnEveryServer`.
 
 ### Tests
 

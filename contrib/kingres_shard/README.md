@@ -2504,7 +2504,12 @@ partitioning policy on a user-partitioned distributed table (its README, "Distri
   move, the online table operations, the partition functions and a DDL statement on a table of the group already read: they refuse with
   `object_in_use` and "used by table operation N" or "colocation group N is busy" while it is held.  The claim is refused when a bucket of the group moves or another
   operation holds it.  `renew_leaf_conversion(op)` shows that the conversion lives, `end_leaf_conversion(op, reason)` releases it (idempotent); a claim that nobody renewed for six
-  hours is taken over by the next `begin_leaf_conversion`.  A stopped conversion that left its claim is removed with `end_leaf_conversion`; `check_cluster()` does not report it.
+  hours, or whose session is gone, is taken over by the next `begin_leaf_conversion`.  The optional fourth argument `holder_pid` names the session that drives the conversion
+  (its start time is kept with it): `check_cluster()` reports `leaf_conversion_stale` for a claim whose session is gone or that was not renewed for six hours, and
+  `cancel_table_operation(op)` releases such a claim (it refuses one whose session lives).  The refusals that a claim causes name these actions in their hint.  The claim is a
+  record of the map group primary, like every table operation: DDL reaches the other nodes through it (a statement on another node is refused there), so the claim needs
+  no copy on the nodes.  `partition_leaf_storage` raises an error for a bucket whose group has no active primary.  `partition_leaf_budget` reads the limit with a fallback of
+  8192 when the setting is not known, and `table_change_report('create_partition' | 'attach_partition', table)` has the blocker `leaf_budget` when one more partition would pass it.
 - The conversion itself is `kingres.convert_leaf` of `kingres_timepart` 0.3, run on the node that holds the leaf with `kingres_shard.enable_routing` off for the transaction of the
   swap (the hook refuses `ATTACH`, `DETACH`, `RENAME` and `DROP` of a bucket partition or a leaf otherwise: requirement R4 of the design).  The claim is requirement R5: a move cannot start
   while leaves are converted, and a conversion cannot start while a bucket moves.

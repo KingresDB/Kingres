@@ -54,9 +54,7 @@ Covers branch p12-dist-tp (from g16), design [analytics-phase12-storage.md](desi
 
 ### Still open
 
-- `check_cluster()` does not report a claim that a stopped conversion left (it expires; `kingres.table_operations` lists it; `end_leaf_conversion` removes it).
-- The control plane does not update `kingres_timepart` to 0.3 on the servers other than the leader's for a database made before 0.3 (the conversion says which server lacks `convert_leaf`; an operator runs `ALTER EXTENSION kingres_timepart UPDATE`).
-- The console's Format filter of the partitions has no `mixed` option (the value is listed under "All formats"); `table_change_report('create_partition')` does not carry the leaf budget (the partition function and the policy do).
+- Closed by the leftovers entry of the same date below: the stale claim in `check_cluster()`, the update of `kingres_timepart` on every server, the Mixed filter and the leaf budget in `table_change_report`.
 - The contract text is not in `api/openapi.yaml` (the revision number is assigned at the merge).
 
 ### Core patches

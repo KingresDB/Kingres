@@ -5171,6 +5171,11 @@ BEGIN
             EXIT;
         EXCEPTION
             WHEN object_in_use THEN
+                IF NOT v_dist THEN
+                    v_state := 'failed';
+                    v_detail := SQLSTATE || ': ' || SQLERRM;
+                    EXIT;
+                END IF;
                 -- a colocation group that a bucket move, a table operation or a
                 -- conversion uses: retry_later.  The action is tried again with
                 -- a growing wait, and a run that still finds it busy is partial
@@ -5554,9 +5559,6 @@ BEGIN
         -- the leaves of a distributed partition are analyzed on their nodes
         IF v_oid IS NULL AND v_run.table_oid IS NOT NULL
            AND (SELECT d.r_dist FROM kingres.timepart__dist(v_run.table_oid) d) THEN
-            UPDATE kingres.timepart_run_action_data a
-               SET bytes_after = 0
-             WHERE a.run_id = v_a.run_id AND a.seq = v_a.seq;
             CONTINUE;
         END IF;
         v_size := coalesce(pg_total_relation_size(v_oid), 0);
@@ -6136,7 +6138,9 @@ BEGIN
     IF NOT (SELECT d.r_dist FROM kingres.timepart__dist(p_rel) d) THEN
         RETURN;
     END IF;
-    EXECUTE 'SELECT b.buckets, b.max_leaves '
+    -- the limit that is configured (what RESET gives), not the value that this session set: a role that owns a table may SET the setting
+    EXECUTE 'SELECT b.buckets, coalesce((SELECT nullif(s.reset_val, '''')::integer FROM pg_catalog.pg_settings s '
+            'WHERE s.name = ''kingres_shard.max_partition_leaves''), 8192) AS max_leaves '
             'FROM kingres.partition_leaf_budget($1::pg_catalog.oid::pg_catalog.regclass) b'
         INTO v_b USING p_rel;
     v_parts := ceil(extract(epoch FROM coalesce(p_retention, interval '1 year') + p_ahead)
@@ -6170,16 +6174,19 @@ DECLARE
     v_leaves  jsonb;
     v_leaf    record;
     v_node    integer;
+    v_cur     integer;
     v_bp      text;
     v_have    text;
     v_trust   boolean := kingres.timepart__trust_owners();
+    -- a leaf is bounded below the lease of the claim (six hours, renewed after each leaf), so that a claim cannot be taken over while a leaf is still running
     v_ms      integer := kingres.timepart__setting_int(
-                             'kingres_timepart.dist_leaf_timeout_ms', 14400000, 1000, 86400000);
+                             'kingres_timepart.dist_leaf_timeout_ms', 14400000, 1000, 18000000);
     v_done    integer := 0;
     v_had     integer := 0;
     v_kind    text := kingres.timepart__am_kind(p_target);
     v_msg     text;
     v_state   text;
+    v_wait    integer;
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles r WHERE r.rolname = current_user AND r.rolsuper) THEN
         RAISE EXCEPTION 'permission denied: the leaves of a distributed table are converted by a superuser'
@@ -6192,38 +6199,39 @@ BEGIN
     IF v_kind <> 'heap' THEN
         PERFORM kingres.timepart__need_columnar();
     END IF;
-    SELECT jsonb_agg(to_jsonb(s) ORDER BY s.node_id, s.bucket) INTO v_leaves
-      FROM kingres.partition_leaf_storage(p_parent::regclass) s
-     WHERE s.partition_name = p_partition::text;
-    IF v_leaves IS NULL THEN
-        RAISE EXCEPTION 'partition "%" of table "%" does not exist', p_partition, p_parent::regclass
-            USING ERRCODE = '42704';
-    END IF;
-    -- every node that holds a leaf can convert it (kingres_timepart 0.3 and, for columnar, kingres_columnar)
-    FOR v_node IN SELECT DISTINCT (x ->> 'node_id')::integer
-                    FROM jsonb_array_elements(v_leaves) x ORDER BY 1
-    LOOP
-        v_have := kingres.internal_exec_scalar(v_node,
-            'SELECT (pg_catalog.to_regprocedure(''kingres.convert_leaf(regclass,regclass,name,text[],jsonb,boolean)'') IS NOT NULL)::pg_catalog.text '
-            '|| '','' || (EXISTS (SELECT 1 FROM pg_catalog.pg_extension e WHERE e.extname = ''kingres_columnar''))::pg_catalog.text',
-            60000);
-        IF v_have LIKE 'false,%' THEN
-            RAISE EXCEPTION 'conversion_refused: node % does not have kingres_timepart 0.3 (kingres.convert_leaf) in this database', v_node
-                USING ERRCODE = '0A000',
-                      HINT = 'Install or update kingres_timepart on every node of the cluster.';
-        END IF;
-        IF v_kind = 'columnar' AND v_have LIKE '%,false' THEN
-            RAISE EXCEPTION 'conversion_refused: node % does not have kingres_columnar in this database', v_node
-                USING ERRCODE = '0A000',
-                      HINT = 'Install kingres_columnar on every node of the cluster.';
-        END IF;
-    END LOOP;
 
+    -- the claim first: what is read and checked below is then true until the claim is released, and every error releases it
     v_self := (SELECT l.node_id FROM kingres.local_node l);
     v_op := kingres.internal_exec_scalar(v_self,
         format('SELECT kingres.begin_leaf_conversion(%s::pg_catalog.oid::pg_catalog.regclass, %L, %L, %s)',
                p_parent::oid, p_partition, p_target, pg_catalog.pg_backend_pid()), 60000)::bigint;
     BEGIN
+        SELECT jsonb_agg(to_jsonb(s) ORDER BY s.node_id, s.bucket) INTO v_leaves
+          FROM kingres.partition_leaf_storage(p_parent::regclass) s
+         WHERE s.partition_name = p_partition::text;
+        IF v_leaves IS NULL THEN
+            RAISE EXCEPTION 'partition "%" of table "%" does not exist', p_partition, p_parent::regclass
+                USING ERRCODE = '42704';
+        END IF;
+        -- every node that holds a leaf can convert it (kingres_timepart 0.3 and, for columnar, kingres_columnar)
+        FOR v_node IN SELECT DISTINCT (x ->> 'node_id')::integer
+                        FROM jsonb_array_elements(v_leaves) x ORDER BY 1
+        LOOP
+            v_have := kingres.internal_exec_scalar(v_node,
+                'SELECT (pg_catalog.to_regprocedure(''kingres.convert_leaf(regclass,regclass,name,text[],jsonb,boolean)'') IS NOT NULL)::pg_catalog.text '
+                '|| '','' || (EXISTS (SELECT 1 FROM pg_catalog.pg_extension e WHERE e.extname = ''kingres_columnar''))::pg_catalog.text',
+                60000);
+            IF v_have LIKE 'false,%' THEN
+                RAISE EXCEPTION 'conversion_refused: node % does not have kingres_timepart 0.3 (kingres.convert_leaf) in this database', v_node
+                    USING ERRCODE = '0A000',
+                          HINT = 'Install or update kingres_timepart on every node of the cluster.';
+            END IF;
+            IF v_kind = 'columnar' AND v_have LIKE '%,false' THEN
+                RAISE EXCEPTION 'conversion_refused: node % does not have kingres_columnar in this database', v_node
+                    USING ERRCODE = '0A000',
+                          HINT = 'Install kingres_columnar on every node of the cluster.';
+            END IF;
+        END LOOP;
         FOR v_leaf IN
             SELECT x.partition_name, x.node_id, x.bucket, x.leaf, x.access_method
               FROM jsonb_to_recordset(v_leaves)
@@ -6244,10 +6252,12 @@ BEGIN
                              WHERE c.oid = p_parent),
                            (SELECT c.relname FROM pg_class c WHERE c.oid = p_parent)
                                || '_b' || lpad(v_leaf.bucket::text, 4, '0'));
+            v_cur := v_leaf.node_id;
             PERFORM kingres.internal_node_exec(v_leaf.node_id,
                 format('CALL kingres.convert_leaf(%L::pg_catalog.regclass, %L::pg_catalog.regclass, %L, %L::pg_catalog.text[], %L::pg_catalog.jsonb, %L::pg_catalog.bool)',
                        v_bp, v_leaf.leaf, p_target, p_sort, p_options, v_trust),
                 v_ms);
+            v_cur := NULL;
             v_done := v_done + 1;
             PERFORM kingres.internal_exec_scalar(v_self,
                 format('SELECT kingres.renew_leaf_conversion(%s)::pg_catalog.text', v_op), 60000);
@@ -6255,6 +6265,24 @@ BEGIN
     EXCEPTION WHEN OTHERS OR query_canceled THEN
         v_msg := SQLERRM;
         v_state := SQLSTATE;
+        BEGIN
+            -- a leaf that timed out or was cancelled may still run on its node: the session of the call is stopped there before the claim is released, so that nothing
+            -- converts a leaf after the group is free (the swap is one transaction: what has not committed is rolled back)
+            IF v_cur IS NOT NULL THEN
+                PERFORM kingres.internal_node_exec(v_cur,
+                    'SELECT pg_catalog.pg_terminate_backend(a.pid) FROM pg_catalog.pg_stat_activity a '
+                    'WHERE a.pid <> pg_catalog.pg_backend_pid() AND a.datname = pg_catalog.current_database() '
+                    'AND a.query LIKE ''CALL kingres.convert_leaf(%''', 60000);
+                FOR v_wait IN 1..50 LOOP
+                    EXIT WHEN kingres.internal_exec_scalar(v_cur,
+                        'SELECT count(*) FROM pg_catalog.pg_stat_activity a WHERE a.pid <> pg_catalog.pg_backend_pid() '
+                        'AND a.datname = pg_catalog.current_database() AND a.query LIKE ''CALL kingres.convert_leaf(%''', 60000) = '0';
+                    PERFORM pg_sleep(0.2);
+                END LOOP;
+            END IF;
+        EXCEPTION WHEN OTHERS OR query_canceled THEN
+            NULL;
+        END;
         BEGIN
             PERFORM kingres.internal_exec_scalar(v_self,
                 format('SELECT kingres.end_leaf_conversion(%s, %L)::pg_catalog.text', v_op,

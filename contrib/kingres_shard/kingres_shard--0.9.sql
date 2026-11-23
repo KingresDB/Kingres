@@ -17675,7 +17675,7 @@ CREATE FUNCTION kingres.partition_leaf_budget(parent regclass)
     SET search_path = pg_catalog, kingres, pg_temp
     AS $$
 SELECT b.n, p.n, (b.n::pg_catalog.int8 OPERATOR(pg_catalog.*) p.n::pg_catalog.int8),
-       pg_catalog.current_setting('kingres_shard.max_partition_leaves')::pg_catalog.int4
+       COALESCE(NULLIF(pg_catalog.current_setting('kingres_shard.max_partition_leaves', true), '')::pg_catalog.int4, 8192)
   FROM (SELECT pg_catalog.count(*)::pg_catalog.int4 AS n
           FROM kingres.bucket_map m JOIN kingres.dist_table d ON d.colocation_id OPERATOR(pg_catalog.=) m.colocation_id
          WHERE d.relid OPERATOR(pg_catalog.=) partition_leaf_budget.parent) b,
@@ -17806,6 +17806,8 @@ DECLARE
     x       pg_catalog.record;
     r       pg_catalog.jsonb;
     v_names pg_catalog.text[];
+    v_nobucket pg_catalog.int4;
+    v_nogroup  pg_catalog.int4;
 BEGIN
     PERFORM kingres.internal_require_superuser();
     IF NOT EXISTS (SELECT 1 FROM kingres.dist_table d WHERE d.relid OPERATOR(pg_catalog.=) partition_leaf_storage.parent AND d.partition_method IS NOT NULL) THEN
@@ -17813,6 +17815,16 @@ BEGIN
     END IF;
     SELECT s.nspname INTO v_nsp FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace s ON s.oid OPERATOR(pg_catalog.=) c.relnamespace
      WHERE c.oid OPERATOR(pg_catalog.=) parent::pg_catalog.oid;
+    -- the leaves of a bucket whose group has no active primary cannot be read: say so, and do not leave them out of the answer
+    SELECT m.bucket, m.group_id INTO v_nobucket, v_nogroup
+      FROM kingres.dist_table d JOIN kingres.bucket_map m ON m.colocation_id OPERATOR(pg_catalog.=) d.colocation_id
+     WHERE d.relid OPERATOR(pg_catalog.=) partition_leaf_storage.parent
+       AND NOT EXISTS (SELECT 1 FROM kingres.node nd WHERE nd.group_id OPERATOR(pg_catalog.=) m.group_id AND nd.role OPERATOR(pg_catalog.=) 'primary' AND nd.is_active)
+     ORDER BY m.bucket LIMIT 1;
+    IF FOUND THEN
+        RAISE EXCEPTION 'bucket % of table "%" belongs to shard group %, which has no active primary: its leaves cannot be read', v_nobucket, parent, v_nogroup
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
     FOR n IN SELECT DISTINCT nd.node_id AS id
                FROM kingres.dist_table d
                JOIN kingres.bucket_map m ON m.colocation_id OPERATOR(pg_catalog.=) d.colocation_id
@@ -17902,14 +17914,16 @@ BEGIN
     -- a claim of a conversion that stopped without releasing it
     FOR v_op IN SELECT l.op_id FROM kingres.table_operation_lock l JOIN kingres.table_operation o ON o.op_id OPERATOR(pg_catalog.=) l.op_id
                  WHERE l.colocation_id OPERATOR(pg_catalog.=) v_dt.colocation_id AND o.kind OPERATOR(pg_catalog.=) 'convert_leaf'
-                   AND o.updated_at OPERATOR(pg_catalog.<) (pg_catalog.clock_timestamp() OPERATOR(pg_catalog.-) interval '6 hours')
+                   AND (o.updated_at OPERATOR(pg_catalog.<) (pg_catalog.clock_timestamp() OPERATOR(pg_catalog.-) interval '6 hours')
+                        OR COALESCE(kingres.internal_leaf_holder_gone(o.op_id), false))
     LOOP
-        PERFORM kingres.end_leaf_conversion(v_op, 'the claim was not renewed for six hours');
+        PERFORM kingres.end_leaf_conversion(v_op, 'the claim was not renewed for six hours, or its session is gone');
     END LOOP;
     IF EXISTS (SELECT 1 FROM kingres.table_operation_lock l WHERE l.colocation_id OPERATOR(pg_catalog.=) v_dt.colocation_id)
        OR EXISTS (SELECT 1 FROM kingres.bucket_move m WHERE m.colocation_id OPERATOR(pg_catalog.=) v_dt.colocation_id AND m.phase IN ('preparing', 'copying', 'catching_up', 'switching'))
        OR EXISTS (SELECT 1 FROM kingres.bucket_map b WHERE b.colocation_id OPERATOR(pg_catalog.=) v_dt.colocation_id AND b.state OPERATOR(pg_catalog.<>) 'active') THEN
-        RAISE EXCEPTION 'colocation group % is busy: a table operation or a bucket move uses it', v_dt.colocation_id USING ERRCODE = 'object_in_use';
+        RAISE EXCEPTION 'colocation group % is busy: a table operation or a bucket move uses it', v_dt.colocation_id USING ERRCODE = 'object_in_use',
+              HINT = 'See kingres.table_operations and kingres.bucket_move: a bucket move is cancelled with kingres.cancel_bucket_move(), a table operation with kingres.cancel_table_operation(), and a claim of a conversion that nobody runs any more with kingres.end_leaf_conversion().';
     END IF;
     INSERT INTO kingres.table_operation (kind, mode, phase, spec, detail, colocation_id, started_at, updated_at)
     VALUES ('convert_leaf', 'online', 'done',
@@ -17922,6 +17936,19 @@ BEGIN
     INSERT INTO kingres.table_operation_lock (colocation_id, op_id) VALUES (v_dt.colocation_id, v_id);
     RETURN v_id;
 END;
+$$;
+
+-- Is the session that holds a claim gone?  holder_pid and holder_start name the backend that runs the conversion; a claim made without them has no holder to miss.
+CREATE FUNCTION kingres.internal_leaf_holder_gone(p_op bigint)
+    RETURNS bool
+    LANGUAGE sql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+SELECT (t.spec OPERATOR(pg_catalog.->>) 'holder_pid') IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity a
+                        WHERE a.pid OPERATOR(pg_catalog.=) (t.spec OPERATOR(pg_catalog.->>) 'holder_pid')::pg_catalog.int4
+                          AND a.backend_start OPERATOR(pg_catalog.=) (t.spec OPERATOR(pg_catalog.->>) 'holder_start')::pg_catalog.timestamptz)
+  FROM kingres.table_operation t WHERE t.op_id OPERATOR(pg_catalog.=) p_op AND t.kind OPERATOR(pg_catalog.=) 'convert_leaf';
 $$;
 
 -- check_cluster: a claim of a conversion that is stale, not renewed for the six hours after which the next claim takes it over, or held by a
@@ -17942,10 +17969,7 @@ BEGIN
                FROM kingres.table_operation t JOIN kingres.table_operation_lock l ON l.op_id OPERATOR(pg_catalog.=) t.op_id
               WHERE t.kind OPERATOR(pg_catalog.=) 'convert_leaf' AND t.finished_at IS NULL ORDER BY t.op_id
     LOOP
-        v_gone := (o.spec OPERATOR(pg_catalog.->>) 'holder_pid') IS NOT NULL
-                  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity a
-                                   WHERE a.pid OPERATOR(pg_catalog.=) (o.spec OPERATOR(pg_catalog.->>) 'holder_pid')::pg_catalog.int4
-                                     AND a.backend_start OPERATOR(pg_catalog.=) (o.spec OPERATOR(pg_catalog.->>) 'holder_start')::pg_catalog.timestamptz);
+        v_gone := COALESCE(kingres.internal_leaf_holder_gone(o.op_id), false);
         IF o.updated_at OPERATOR(pg_catalog.<) (pg_catalog.clock_timestamp() OPERATOR(pg_catalog.-) interval '6 hours') OR v_gone THEN
             check_name := 'leaf_conversion_stale'; node_id := NULL;
             object := pg_catalog.format('leaf conversion %s of %s', o.op_id, o.spec OPERATOR(pg_catalog.->>) 'table');
@@ -17999,6 +18023,151 @@ REVOKE ALL ON FUNCTION
     kingres.partition_leaf_storage(regclass),
     kingres.begin_leaf_conversion(regclass, text, text, int),
     kingres.internal_check_leaf_conversions(),
+    kingres.internal_leaf_holder_gone(bigint),
     kingres.renew_leaf_conversion(bigint),
     kingres.end_leaf_conversion(bigint, text)
     FROM PUBLIC;
+
+-- internal_begin_move(): the refusal that a claim of a conversion causes names the action that fits it.
+CREATE OR REPLACE FUNCTION kingres.internal_begin_move(p_colocation int, p_bucket int, p_target int)
+    RETURNS bigint
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_source pg_catalog.int4;
+    v_state  pg_catalog.text;
+    v_count  pg_catalog.int4;
+    v_id     pg_catalog.int8;
+    v_op     pg_catalog.int8;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    LOCK TABLE kingres.map_version IN EXCLUSIVE MODE;
+    PERFORM kingres.internal_require_map_group();
+    PERFORM kingres.internal_check_node_versions();
+
+    SELECT c.bucket_count INTO v_count FROM kingres.colocation c WHERE c.colocation_id OPERATOR(pg_catalog.=) p_colocation;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'colocation group % does not exist', p_colocation USING ERRCODE = 'undefined_object';
+    END IF;
+    SELECT l.op_id INTO v_op FROM kingres.table_operation_lock l WHERE l.colocation_id OPERATOR(pg_catalog.=) p_colocation;
+    IF FOUND THEN
+        RAISE EXCEPTION 'colocation group % is used by table operation %', p_colocation, v_op
+            USING ERRCODE = 'object_in_use',
+                  DETAIL = 'A bucket cannot move while a table operation copies the tables of its group.',
+                  HINT = CASE WHEN EXISTS (SELECT 1 FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) v_op AND o.kind OPERATOR(pg_catalog.=) 'convert_leaf')
+                              THEN pg_catalog.format('The leaves of a partition are being converted; wait for the conversion to end. A claim that nobody holds any more is reported by kingres.check_cluster() and released by kingres.cancel_table_operation(%s) or kingres.end_leaf_conversion(%s).', v_op, v_op)
+                              ELSE 'Wait for the operation to finish, or cancel it; see kingres.table_operations.' END;
+    END IF;
+    SELECT m.group_id, m.state INTO v_source, v_state FROM kingres.bucket_map m
+     WHERE m.colocation_id OPERATOR(pg_catalog.=) p_colocation AND m.bucket OPERATOR(pg_catalog.=) p_bucket;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'bucket % of colocation group % does not exist (it has % buckets)', p_bucket, p_colocation, v_count
+            USING ERRCODE = 'undefined_object';
+    END IF;
+    IF EXISTS (SELECT 1 FROM kingres.bucket_move m
+                WHERE m.colocation_id OPERATOR(pg_catalog.=) p_colocation AND m.bucket OPERATOR(pg_catalog.=) p_bucket
+                  AND m.phase IN ('preparing', 'copying', 'catching_up', 'switching')) THEN
+        RAISE EXCEPTION 'bucket % of colocation group % is already being moved', p_bucket, p_colocation
+            USING ERRCODE = 'object_in_use',
+                  HINT = 'See kingres.bucket_move; a move can be cancelled with kingres.cancel_bucket_move().';
+    END IF;
+    IF v_state OPERATOR(pg_catalog.<>) 'active' THEN
+        RAISE EXCEPTION 'bucket % of colocation group % is in state "%"', p_bucket, p_colocation, v_state
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    IF p_target OPERATOR(pg_catalog.=) v_source THEN
+        RAISE EXCEPTION 'bucket % of colocation group % is already on shard group %', p_bucket, p_colocation, p_target
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF kingres.internal_group_node(p_target) IS NULL OR kingres.internal_group_node(v_source) IS NULL THEN
+        RAISE EXCEPTION 'shard group % or % has no active primary', v_source, p_target
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM kingres.node n
+                    WHERE n.group_id OPERATOR(pg_catalog.=) p_target AND n.role OPERATOR(pg_catalog.=) 'primary'
+                      AND n.is_active AND n.should_have_shards) THEN
+        RAISE EXCEPTION 'shard group % does not accept buckets (should_have_shards is false)', p_target
+            USING ERRCODE = 'object_not_in_prerequisite_state',
+                  HINT = 'Use kingres.set_node_property() to change it.';
+    END IF;
+
+    INSERT INTO kingres.bucket_move (colocation_id, bucket, source_group, target_group, phase,
+                                     detail, started_at, updated_at)
+    VALUES (p_colocation, p_bucket, v_source, p_target, 'preparing', 'starting',
+            pg_catalog.clock_timestamp(), pg_catalog.clock_timestamp())
+    RETURNING move_id INTO v_id;
+    UPDATE kingres.bucket_move m SET slot_name = pg_catalog.format('ks_move_%s', v_id) WHERE m.move_id OPERATOR(pg_catalog.=) v_id;
+    UPDATE kingres.bucket_map m SET state = 'moving'
+     WHERE m.colocation_id OPERATOR(pg_catalog.=) p_colocation AND m.bucket OPERATOR(pg_catalog.=) p_bucket;
+    PERFORM kingres.sync_catalog();
+    RETURN v_id;
+END;
+$$;
+
+
+-- cancel_table_operation() also releases the claim of a conversion of leaves that nobody holds any more.
+CREATE OR REPLACE FUNCTION kingres.cancel_table_operation(op_id bigint)
+    RETURNS void
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_op    pg_catalog.int8 := op_id;
+    v_phase pg_catalog.text;
+    v_self  pg_catalog.int4;
+    v_ms    pg_catalog.int4;
+    v_res   pg_catalog.text;
+    i       pg_catalog.int4;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    PERFORM kingres.internal_require_map_group();
+    SELECT o.phase INTO v_phase FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) v_op;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'table operation % does not exist', v_op USING ERRCODE = 'undefined_object';
+    END IF;
+    -- the claim of a conversion of leaves (kingres_timepart): released when the session that holds it is gone or it was not renewed for the lease; a live
+    -- conversion is stopped by cancelling its session (pg_cancel_backend of holder_pid), which releases the claim itself
+    IF EXISTS (SELECT 1 FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) v_op AND o.kind OPERATOR(pg_catalog.=) 'convert_leaf') THEN
+        IF NOT EXISTS (SELECT 1 FROM kingres.table_operation_lock l WHERE l.op_id OPERATOR(pg_catalog.=) v_op) THEN
+            RETURN;
+        END IF;
+        IF kingres.internal_leaf_holder_gone(v_op)
+           OR EXISTS (SELECT 1 FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) v_op AND o.updated_at OPERATOR(pg_catalog.<) (pg_catalog.clock_timestamp() OPERATOR(pg_catalog.-) interval '6 hours')) THEN
+            PERFORM kingres.end_leaf_conversion(v_op, 'cancelled: nobody holds the claim any more');
+            RETURN;
+        END IF;
+        RAISE EXCEPTION 'table operation % is a conversion of leaves that its session still holds', v_op
+            USING ERRCODE = 'object_in_use',
+                  HINT = 'Cancel the session that runs it (see holder_pid in the spec of the record), or release the claim with kingres.end_leaf_conversion() if you know that nothing runs.';
+    END IF;
+    IF v_phase IN ('cleaning', 'done') THEN
+        RAISE NOTICE 'table operation % has switched: nothing is undone', v_op;
+        RETURN;
+    END IF;
+    IF v_phase IN ('failed', 'cancelled') THEN
+        RETURN;
+    END IF;
+    SELECT l.node_id INTO v_self FROM kingres.local_node l;
+    v_ms := (SELECT s.setting::pg_catalog.int4 FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) 'kingres_shard.node_timeout') * 1000;
+    PERFORM kingres.internal_exec_scalar(v_self, pg_catalog.format('SELECT kingres.internal_op_request_cancel(%s)', v_op), v_ms);
+    IF kingres.internal_op_alive(v_op) THEN
+        -- the session that runs it undoes it at the end of its chunk
+        FOR i IN 1 .. (v_ms OPERATOR(pg_catalog./) 100) * 4 LOOP
+            PERFORM pg_catalog.pg_sleep(0.1);
+            SELECT o.phase INTO v_phase FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) v_op;
+            EXIT WHEN v_phase IN ('failed', 'cancelled', 'cleaning', 'done');
+        END LOOP;
+        IF v_phase NOT IN ('failed', 'cancelled', 'cleaning', 'done') THEN
+            RAISE NOTICE 'table operation % was asked to stop; the session that runs it has not yet noticed', v_op;
+        END IF;
+        RETURN;
+    END IF;
+    v_res := kingres.internal_exec_scalar(v_self,
+        pg_catalog.format('SELECT kingres.internal_op_undo(%s, ''cancelled'', %L)', v_op, 'cancelled on request'), v_ms * 6);
+    IF v_res OPERATOR(pg_catalog.=) 'incomplete' THEN
+        RAISE NOTICE 'table operation % was cancelled but a node could not be cleaned; kingres.resume_table_operations() removes what is left', v_op;
+    END IF;
+END;
+$$;
+

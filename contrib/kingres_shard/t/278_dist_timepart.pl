@@ -14,6 +14,8 @@
 #   D. a conversion that a leaf refuses leaves the partition mixed, which reads right and is converted by the next run
 #   E. a converted table moves its buckets (columnar leaves included) and the policy goes on afterwards
 #   F. retention by detach makes a distributed table of the old partition; the owner who is not a superuser cannot run it
+#   H. the budget of an attach, the lease and the renewal of a claim, a name of multibyte letters, the way back to heap, readers during a conversion, who may convert a leaf,
+#      DDL on a node that is not the map group primary, a driver that is killed
 #   G. check_cluster reports a claim that is stale (not renewed for the lease, or held by a session that is gone); the report of a new partition carries the leaf budget
 #
 # Needs kingres_columnar and kingres_timepart built and installed into the same installation as kingres_shard.
@@ -416,6 +418,159 @@ is(prepared_count($_), '0', 'F: nothing is prepared on ' . $_->name) for @nodes;
 	$n1->append_conf('postgresql.conf', "kingres_shard.max_partition_leaves = 8192\n");
 	$n1->reload;
 	is($codes->('create_partition', 'public.bd'), '', 'G: nothing once the limit is back');
+}
+
+# ---------------------------------------------------------------------------
+# H. the budget of an attach, the lease and the renewal of a claim, a name of multibyte letters, the way back to heap, who may convert a leaf, readers during a
+#    conversion, DDL on a node that is not the map group primary, and a driver that is killed
+# ---------------------------------------------------------------------------
+{
+	my $node1_id = q1($n1, q{SELECT node_id FROM kingres.local_node});
+	my $stale = sub { return q1($n1, q{SELECT count(*) FROM kingres.check_cluster() WHERE check_name = 'leaf_conversion_stale'}); };
+	my $first = sub { my ($cond) = @_; return q1($n1, qq{SELECT partition_name FROM kingres.partition_leaf_storage('public.ev') GROUP BY partition_name HAVING $cond ORDER BY partition_name LIMIT 1}); };
+
+	# the budget of an attach_partition
+	$n1->safe_psql('postgres', q{
+		CREATE TABLE public.bdx (cust int NOT NULL, ts date NOT NULL, id int NOT NULL, v int, PRIMARY KEY (cust, ts, id));
+		SELECT kingres.create_distributed_table('public.bdx', 'cust', colocate_with => 'public.bd');
+	});
+	$n1->append_conf('postgresql.conf', "kingres_shard.max_partition_leaves = 6\n");
+	$n1->reload;
+	($rc, $out, $err) = run_sql($n1, q{SELECT kingres.attach_partition('public.bd', 'public.bdx', 'FROM (''2027-01-01'') TO (''2027-01-02'')')});
+	isnt($rc, 0, 'H: attach_partition is refused when the table would pass the leaf budget');
+	like($err, qr/table "public.bd" would have 12 leaves \(6 buckets, 2 partitions\); kingres_shard.max_partition_leaves is 6/, 'H: with the numbers');
+	is(q1($n1, q{SELECT count(*) FROM kingres.dist_table WHERE relid = 'public.bdx'::regclass}), '1', 'H: the table is still a distributed table of its own');
+	$n1->append_conf('postgresql.conf', "kingres_shard.max_partition_leaves = 8192\n");
+	$n1->reload;
+	($rc, $out, $err) = run_sql($n1, q{SELECT kingres.attach_partition('public.bd', 'public.bdx', 'FROM (''2027-01-01'') TO (''2027-01-02'')')});
+	is($rc, 0, 'H: and it is attached within the budget') or diag($err);
+
+	# the lease of a claim and its renewal
+	my $pn = q1($n1, q{SELECT partition_name FROM kingres.dist_partition WHERE parent = 'public.ev'::regclass ORDER BY partition_name LIMIT 1});
+	my $a1 = q1($n1, "SELECT kingres.begin_leaf_conversion('public.ev', '$pn')");
+	q1($n1, "UPDATE kingres.table_operation SET updated_at = clock_timestamp() - interval '7 hours' WHERE op_id = $a1");
+	my $a2 = q1($n1, "SELECT kingres.begin_leaf_conversion('public.ev', '$pn')");
+	isnt($a2, $a1, 'H: a claim that was not renewed for six hours is taken over by the next claim');
+	like(q1($n1, "SELECT (finished_at IS NOT NULL)::text || '|' || detail FROM kingres.table_operation WHERE op_id = $a1"), qr/^true\|the claim was not renewed/, 'H: and its record says so');
+	is(q1($n1, q{SELECT count(*) FROM kingres.table_operation_lock}), '1', 'H: one claim holds the group');
+	q1($n1, "UPDATE kingres.table_operation SET updated_at = clock_timestamp() - interval '5 hours' WHERE op_id = $a2");
+	q1($n1, "SELECT kingres.renew_leaf_conversion($a2)");
+	is(q1($n1, "SELECT (updated_at > clock_timestamp() - interval '1 minute')::text FROM kingres.table_operation WHERE op_id = $a2"), 'true', 'H: renew_leaf_conversion renews it');
+	($rc, $out, $err) = run_sql($n1, "SELECT kingres.begin_leaf_conversion('public.ev', '$pn')");
+	isnt($rc, 0, 'H: a renewed claim is not taken over');
+	like($err, qr/HINT:.*end_leaf_conversion/s, 'H: the refusal names the action that releases a claim');
+	# a bucket move is refused with a hint that fits a claim of a conversion
+	my $mb = q1($n1, "SELECT kingres.bucket_for($coloc, 2)");
+	my $mg = q1($n1, "SELECT group_id FROM kingres.bucket_map WHERE colocation_id = $coloc AND bucket = $mb");
+	($rc, $out, $err) = run_sql($n1, "SELECT kingres.move_bucket($coloc, $mb, " . (($mg + 1) % 3) . ")");
+	isnt($rc, 0, 'H: a move is refused while the claim is held');
+	like($err, qr/HINT:.*being converted.*end_leaf_conversion/s, 'H: with a hint about the conversion and not "cancel the operation"');
+	# DDL on a node that is not the map group primary is refused (the claim is a record of the map group primary: DDL reaches the other nodes through it)
+	($rc, $out, $err) = run_sql($n2, q{ALTER TABLE public.ev ADD COLUMN zz int});
+	isnt($rc, 0, 'H: DDL on a server that is not the map group primary is refused while the claim is held');
+	is(q1($n2, q{SELECT count(*) FROM kingres.table_operation_lock}), '0', 'H: (the claim is not on that server: it is not needed there)');
+	($rc, $out, $err) = run_sql($n2, q{SELECT kingres.create_partition('public.ev', 'ev_p_zz', 'FROM (''2031-01-01'') TO (''2031-01-02'')')});
+	isnt($rc, 0, 'H: nor can a partition be made there');
+	is(q1($n1, q{SELECT count(*) FROM pg_attribute WHERE attrelid = 'public.ev'::regclass AND attname = 'zz'}), '0', 'H: the table is as it was');
+	q1($n1, "SELECT kingres.end_leaf_conversion($a2)");
+	is(q1($n1, q{SELECT count(*) FROM kingres.table_operation_lock}), '0', 'H: released');
+
+	# a name of letters of two bytes is cut between letters, at 57 bytes
+	$n1->safe_psql('postgres', q{
+		SELECT format('CREATE TABLE public.%I (cust int NOT NULL, ts date NOT NULL, id int NOT NULL, PRIMARY KEY (cust, ts, id)) PARTITION BY RANGE (ts)', 'tm' || repeat(chr(233), 24)) \gexec
+		SELECT format('CREATE TABLE public.%I PARTITION OF public.%I FOR VALUES FROM (''2026-03-01'') TO (''2026-03-02'')', 'first', 'tm' || repeat(chr(233), 24)) \gexec
+		SELECT format('SELECT kingres.create_distributed_table(%L, ''cust'', bucket_count => 6)', format('public.%I', 'tm' || repeat(chr(233), 24))) \gexec
+		SELECT format('SELECT kingres.timepart_set_policy(%L, ''1 day'', create_ahead => ''1 day'')', format('public.%I', 'tm' || repeat(chr(233), 24))) \gexec
+	});
+	($rc, $out, $err) = run_sql($n1, q{SELECT format('CALL kingres.timepart_run(%L, %L)', format('public.%I', 'tm' || repeat(chr(233), 24)), '2026-03-02 12:00 UTC') \gexec});
+	is($rc, 0, 'H: a run on a table with a name of multibyte letters') or diag($err);
+	is(q1($n1, q{SELECT string_agg(octet_length(partition_name)::text || ':' || (partition_name ~ '^tm(.){22}_p2026030[23]$')::text, ',' ORDER BY partition_name)
+		FROM kingres.dist_partition WHERE parent = format('public.%I', 'tm' || repeat(chr(233), 24))::regclass AND partition_name <> 'first'}),
+		'56:true,56:true', 'H: the names are 56 bytes, cut between letters');
+
+	# an error between the claim and the first leaf (a node without the procedure) releases the claim
+	{
+		my $hp = $first->(q{bool_and(access_method = 'heap')});
+		$n3->safe_psql('postgres', q{ALTER PROCEDURE kingres.convert_leaf(regclass, regclass, name, text[], jsonb, boolean) RENAME TO convert_leaf_away});
+		($rc, $out, $err) = run_sql($n1, "SELECT kingres.convert_distributed_partition('public.ev', '$hp', 'columnar')");
+		isnt($rc, 0, 'H: a conversion is refused when a node lacks the procedure');
+		like($err, qr/conversion_refused: node \d+ does not have kingres_timepart 0.3/, 'H: and says which node');
+		is(q1($n1, q{SELECT count(*) FROM kingres.table_operation_lock}), '0', 'H: the claim that was taken before the check is released');
+		is(q1($n1, q{SELECT count(*) FROM kingres.table_operation WHERE kind = 'convert_leaf' AND finished_at IS NULL}), '0', 'H: and its record is closed');
+		$n3->safe_psql('postgres', q{ALTER PROCEDURE kingres.convert_leaf_away(regclass, regclass, name, text[], jsonb, boolean) RENAME TO convert_leaf});
+	}
+
+	# the way back to heap, with readers that must always see every row
+	my $col = $first->(q{bool_and(access_method = 'columnar')});
+	ok($col ne '', "H: a columnar partition ($col)");
+	my $want_rows = (split /,/, totals('ev'))[0];
+	# a reader that runs one statement at a time (a statement of its own each, so that no lock of the scan outlives it: a long transaction that reads the table makes the
+	# swap give way, which timepart_convert tests) on a server that is not the one that drives
+	my $rfile = "$PostgreSQL::Test::Utils::tmp_check/reader_h_$$.sql";
+	PostgreSQL::Test::Utils::append_to_file($rfile, "SELECT 'n=' || count(*) FROM public.ev;\nSELECT pg_sleep(0.01);\n" x 200);
+	my ($rout, $rerr) = ('', '');
+	my $reader = IPC::Run::start([ 'psql', '-X', '-At', '-h', $n2->host, '-p', $n2->port, '-d', 'postgres', '-f', $rfile ], '>', \$rout, '2>', \$rerr);
+	for my $try (1 .. 3)
+	{
+		($rc, $out, $err) = run_sql($n1, "SELECT kingres.convert_distributed_partition('public.ev', '$col', 'heap')");
+		last if $rc == 0;
+	}
+	is($rc, 0, 'H: the leaves of a columnar partition are converted to heap') or diag($err);
+	like($out, qr/^\d leaves converted to heap on 3 nodes, \d already were/, 'H: all of them');
+	IPC::Run::finish($reader);
+	is($rerr, '', 'H: the reader ran without an error') or diag($rerr);
+	my @seen = grep { /^n=/ } split /\n/, $rout;
+	cmp_ok(scalar(@seen), '>', 50, 'H: and it read the table many times meanwhile');
+	is(scalar(grep { $_ ne "n=$want_rows" } @seen), 0, 'H: and always saw every row');
+	unlink $rfile;
+	is(leaves($col), '6|0|6', 'H: the leaves are heap (and keep REPLICA IDENTITY FULL)');
+	is((split /,/, totals('ev'))[0], $want_rows, 'H: no row is lost');
+	($rc, $out, $err) = run_sql($n1, "SELECT kingres.convert_distributed_partition('public.ev', '$col', 'columnar')");
+	is($rc, 0, 'H: and back to columnar') or diag($err);
+	is(leaves($col), '6|6|6', 'H: columnar again');
+
+	# a role that is not a superuser cannot convert a leaf, also with EXECUTE granted
+	my $leaf1 = q1($n1, "SELECT leaf FROM kingres.partition_leaves('public.ev', '$pn') WHERE node_id = $node1_id ORDER BY bucket LIMIT 1");
+	my ($bkt) = $leaf1 =~ /_b(\d{4})"?$/;
+	$n1->safe_psql('postgres', q{GRANT EXECUTE ON PROCEDURE kingres.convert_leaf(regclass, regclass, name, text[], jsonb, boolean) TO dtp_owner});
+	my ($so2, $se2) = ('', '');
+	my $rc2 = $n1->psql('postgres', "CALL kingres.convert_leaf('public.ev_b$bkt'::regclass, '$leaf1'::regclass)", stdout => \$so2, stderr => \$se2, extra_params => ['-U', 'dtp_owner']);
+	isnt($rc2, 0, 'H: convert_leaf by a role that is not a superuser is refused');
+	like($se2, qr/permission denied: only a superuser may convert the leaves of a distributed table/, 'H: with the reason');
+
+	# a driver that is killed in the middle of a conversion: its claim is reported, cancel_table_operation releases it, and the leaf that was running ends
+	my $heap = $first->(q{bool_and(access_method = 'heap')});
+	ok($heap ne '', "H: a partition in heap to convert ($heap)");
+	my $hleaf = q1($n1, "SELECT leaf FROM kingres.partition_leaves('public.ev', '$heap') WHERE node_id = $node1_id ORDER BY bucket LIMIT 1");
+	$n1->append_conf('postgresql.conf', "kingres_timepart.create_lock_timeout_ms = 60000\n");
+	$n1->reload;
+	# a session of node 1 holds a lock that the conversion of that leaf waits for
+	my $blocker = start_psql($n1, qq{LOCK TABLE $hleaf IN ROW EXCLUSIVE MODE; SELECT pg_sleep(120)});
+	ok($n1->poll_query_until('postgres', q{SELECT count(*) = 1 FROM pg_stat_activity WHERE query LIKE 'LOCK TABLE %' AND pid <> pg_backend_pid()}), 'H: a lock is held on a leaf');
+	my $driver = start_psql($n1, "SELECT kingres.convert_distributed_partition('public.ev', '$heap')");
+	ok($n1->poll_query_until('postgres', q{SELECT count(*) = 1 FROM kingres.table_operation_lock}), 'H: the conversion holds the group');
+	my $kop = q1($n1, q{SELECT l.op_id FROM kingres.table_operation_lock l});
+	my $kpid = q1($n1, "SELECT spec->>'holder_pid' FROM kingres.table_operation WHERE op_id = $kop");
+	cmp_ok($kpid, '>', 0, 'H: the claim names the session that drives it');
+	is($stale->(), '0', 'H: a claim of a driver that lives is not stale');
+	($rc, $out, $err) = run_sql($n1, "SELECT kingres.cancel_table_operation($kop)");
+	isnt($rc, 0, 'H: cancel_table_operation refuses a claim whose session lives');
+	q1($n1, "SELECT pg_terminate_backend($kpid)");
+	ok($n1->poll_query_until('postgres', "SELECT count(*) = 0 FROM pg_stat_activity WHERE pid = $kpid"), 'H: the driver is killed');
+	eval { finish_psql($driver) };
+	is($stale->(), '1', 'H: the claim of the killed driver is reported');
+	($rc, $out, $err) = run_sql($n1, "SELECT kingres.cancel_table_operation($kop)");
+	is($rc, 0, 'H: cancel_table_operation releases it') or diag($err);
+	is(q1($n1, q{SELECT count(*) FROM kingres.table_operation_lock}), '0', 'H: the group is free');
+	is($stale->(), '0', 'H: nothing is reported any more');
+	# the leaf that was running on node 1 ends when its lock comes: nothing is left half done
+	q1($n1, q{SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE query LIKE 'LOCK TABLE %' OR query LIKE 'SELECT pg_sleep(120)%'});
+	eval { finish_psql($blocker) };
+	ok($n1->poll_query_until('postgres', q{SELECT count(*) = 0 FROM pg_stat_activity WHERE query LIKE 'CALL kingres.convert_leaf(%' AND pid <> pg_backend_pid()}), 'H: the leaf that was running ends');
+	is(q1($n1, q{SELECT count(*) FROM kingres.check_cluster()}), '0', 'H: check_cluster finds nothing');
+	is((split /,/, totals('ev'))[0], $want_rows, 'H: no row is lost');
+	$n1->append_conf('postgresql.conf', "kingres_timepart.create_lock_timeout_ms = 5000\n");
+	$n1->reload;
 }
 
 done_testing();
