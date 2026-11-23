@@ -118,10 +118,15 @@ func IsUntrusted(err error) (*UntrustedError, bool) {
 const verifySQL = verifyHead + verifyTail
 
 // verifyHead selects the extensions named in $1 (the CTE e). preInstallHead selects a schema named in $1 that an extension is about to be created in, as a
+// kingres_shard is created with SCHEMA pg_catalog and its script makes the schema kingres: that schema is the one it populates, and pg_catalog is never searched
+// for foreign objects (it holds the objects of PostgreSQL itself).
 // row with no extension (owned by a superuser, so that only the checks of the schema remain). Both go with verifyTail.
 const verifyHead = `
 WITH e AS (
-SELECT x.oid, x.extname, x.extversion, x.extowner,         -- kingres_shard is created with SCHEMA pg_catalog and its script makes the schema kingres: that schema is the one it populates, and pg_catalog is never         -- searched for foreign objects (it holds the objects of PostgreSQL itself)         CASE WHEN x.extnamespace = 'pg_catalog'::pg_catalog.regnamespace AND x.extname = 'kingres_shard'              THEN COALESCE((SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = 'kingres'), x.extnamespace)              ELSE x.extnamespace END AS extnamespace
+  SELECT x.oid, x.extname, x.extversion, x.extowner,
+         CASE WHEN x.extnamespace = 'pg_catalog'::pg_catalog.regnamespace AND x.extname = 'kingres_shard'
+              THEN COALESCE((SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = 'kingres'), x.extnamespace)
+              ELSE x.extnamespace END AS extnamespace
     FROM pg_catalog.pg_extension x
    WHERE x.extname = ANY ($1::pg_catalog.text[])`
 
