@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 )
 
 // This file is the execution mode of the grammar (phase 14c). Each hands every accepted statement to the importer together with the exact text that the
@@ -90,3 +91,7 @@ func sameTokens(text string, first *rawStmt) error {
 	}
 	return nil
 }
+
+// IsSyntaxWord reports whether a word that is followed by an opening parenthesis is a word of the SQL syntax (an operator, a clause, a type that is written like a
+// call) and not a call of a function: the words that the grammar does not report as functions.
+func IsSyntaxWord(w string) bool { return notFunctions[strings.ToLower(w)] }

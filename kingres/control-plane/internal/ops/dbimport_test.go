@@ -398,3 +398,33 @@ func TestDataEntriesWithoutHistories(t *testing.T) {
 		}
 	}
 }
+
+func TestExprFunctionNames(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"lower(name)", "lower"},
+		{"(a + abs(b))", "abs"},
+		{"CHECK ((length(note) < 50))", "length"},
+		{"CREATE INDEX i ON public.t USING btree (lower(name))", "lower"},
+		{"public.mine(1)", "public.mine"},
+		{"\"public\".\"Mine\"(1)", "public.Mine"},
+		{"pg_read_file('/etc/passwd'::text)", "pg_read_file"},
+		{"'call(me)'::text", ""},
+		{"'it''s lower(x)'::text", ""},
+		{"COALESCE(a, 0)", ""},
+		{"(x)::numeric(10,2)", ""},
+		{"(x)::character varying(5)", ""},
+		{"nextval('s'::regclass)", "nextval"},
+		{"a IN (1, 2)", ""},
+		{"ARRAY[1, 2]", ""},
+		{"a.b.c.d(1)", "b.c.d"},
+		{"pg_sleep(1), pg_sleep(2), lower(x)", "pg_sleep,lower"},
+	}
+	for _, tc := range cases {
+		if got := strings.Join(exprFunctionNames(tc.in), ","); got != tc.want {
+			t.Errorf("%q: %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}

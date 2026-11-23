@@ -102,6 +102,10 @@ func (o *Ops) applyImportKind(ctx context.Context, kind string, raw json.RawMess
 // when the service role reads or changes it: it is an ordinary or partitioned table owned by the role, it has no trigger of its own, no rule, no policy and no row-level
 // security, and every function that a default, a generated column, a constraint or an index of it calls is allowed in an expression.
 func tableTrusted(ctx context.Context, tx pgx.Tx, schema, table, owner string, extSchema map[string]string) error {
+	// The deparsed form of an expression depends on the search path: a builtin function is written bare and every other one with its schema.
+	if _, err := tx.Exec(ctx, "SET LOCAL search_path = pg_catalog"); err != nil {
+		return err
+	}
 	var kind *string
 	var ownerOK, trig, rule, pol, rls bool
 	err := tx.QueryRow(ctx, `SELECT c.relkind::pg_catalog.text, pg_catalog.pg_get_userbyid(c.relowner) = $3::pg_catalog.text,
@@ -127,30 +131,47 @@ func tableTrusted(ctx context.Context, tx pgx.Tx, schema, table, owner string, e
 	case trig || rule || pol || rls:
 		return fmt.Errorf("%s.%s has a trigger, a rule, a policy or row-level security", schema, table)
 	}
-	rows, err := tx.Query(ctx, `SELECT DISTINCT pn.nspname::pg_catalog.text, p.proname::pg_catalog.text,
-			coalesce((SELECT e.extname::pg_catalog.text FROM pg_catalog.pg_depend d2 JOIN pg_catalog.pg_extension e ON e.oid = d2.refobjid
-			          WHERE d2.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass AND d2.objid = p.oid AND d2.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass AND d2.deptype = 'e' LIMIT 1), ''), p.prosecdef
-		FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_proc p ON d.refclassid = 'pg_catalog.pg_proc'::pg_catalog.regclass AND p.oid = d.refobjid
-		JOIN pg_catalog.pg_namespace pn ON pn.oid = p.pronamespace
-		WHERE (d.classid = 'pg_catalog.pg_attrdef'::pg_catalog.regclass AND d.objid IN (SELECT oid FROM pg_catalog.pg_attrdef WHERE adrelid = $1::pg_catalog.text::pg_catalog.regclass))
-		   OR (d.classid = 'pg_catalog.pg_constraint'::pg_catalog.regclass AND d.objid IN (SELECT oid FROM pg_catalog.pg_constraint WHERE conrelid = $1::pg_catalog.text::pg_catalog.regclass))
-		   OR (d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.objid IN (SELECT indexrelid FROM pg_catalog.pg_index WHERE indrelid = $1::pg_catalog.text::pg_catalog.regclass))`,
-		qualifiedText(schema, table))
+	// The expressions of the table, as the catalog deparses them with the search path of this session.
+	rel := qualifiedText(schema, table)
+	rows, err := tx.Query(ctx, `SELECT pg_catalog.pg_get_expr(ad.adbin, ad.adrelid) FROM pg_catalog.pg_attrdef ad WHERE ad.adrelid = $1::pg_catalog.text::pg_catalog.regclass
+		UNION ALL SELECT pg_catalog.pg_get_constraintdef(c.oid) FROM pg_catalog.pg_constraint c WHERE c.conrelid = $1::pg_catalog.text::pg_catalog.regclass
+		UNION ALL SELECT pg_catalog.pg_get_indexdef(i.indexrelid) FROM pg_catalog.pg_index i WHERE i.indrelid = $1::pg_catalog.text::pg_catalog.regclass`, rel)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	var texts []string
 	for rows.Next() {
-		var ns, fn, ext string
-		var secdef bool
-		if err := rows.Scan(&ns, &fn, &ext, &secdef); err != nil {
+		var x *string
+		if err := rows.Scan(&x); err != nil {
+			rows.Close()
 			return err
 		}
-		if why := functionVerdict(ns, fn, []procCand{{Schema: ns, Ext: ext, SecDef: secdef}}, extSchema); why != "" {
-			return fmt.Errorf("%s.%s calls %s: %s", schema, table, safeName(ns+"."+fn), why)
+		if x != nil {
+			texts = append(texts, *x)
 		}
 	}
-	return rows.Err()
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	seen := map[string]bool{}
+	var names []string
+	for _, x := range texts {
+		for _, n := range exprFunctionNames(x) {
+			if !seen[n] {
+				seen[n] = true
+				names = append(names, n)
+			}
+		}
+	}
+	refused, err := checkFunctions(ctx, tx, names, extSchema)
+	if err != nil {
+		return err
+	}
+	if len(refused) > 0 {
+		return fmt.Errorf("%s.%s calls a function that is not allowed (%s)", schema, table, refused[0])
+	}
+	return nil
 }
 
 // untrustedError is the task error for a table that the service role may not touch.
