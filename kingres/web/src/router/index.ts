@@ -78,6 +78,13 @@ export const routes: RouteRecordRaw[] = [
         meta: { title: 'Database', operation: 'getDatabase' },
       },
       {
+        path: 'databases/:name/tables/:schema/:table',
+        name: 'table',
+        component: () => import('@/pages/TableDetailPage.vue'),
+        props: true,
+        meta: { title: 'Table', operation: 'getTable' },
+      },
+      {
         path: 'shards',
         name: 'shards',
         component: () => import('@/pages/ShardsPage.vue'),
@@ -200,7 +207,10 @@ export function createAppRouter(
   router.beforeEach(async (to) => {
     // A name that no URL can carry (`.`, `..`, empty) cannot be opened: the browser would resolve the
     // address to another page. Whatever made the link, it lands on the list, which says so.
-    if (to.name === 'database' && !isAddressableSegment(String(to.params.name ?? '')))
+    if (
+      (to.name === 'database' || to.name === 'table') &&
+      !isAddressableSegment(String(to.params.name ?? ''))
+    )
       return { name: 'databases' }
     let uninitialized = false
     try {

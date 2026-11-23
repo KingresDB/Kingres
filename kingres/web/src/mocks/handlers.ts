@@ -39,7 +39,6 @@ import {
   instancesOfServer,
   ledgerBlock,
   ledgerStatusOf,
-  makeBuckets,
   MOCK_PASSWORD,
   MOCK_SETUP_TOKEN,
   mockConfig,
@@ -65,6 +64,15 @@ import {
   restorePlan,
   startFailoverRun,
 } from './failover'
+import {
+  columnDefsOf,
+  partitionsOf,
+  previewChange,
+  startAlter,
+  startDistribute,
+  startPartition,
+  startUndistribute,
+} from './tables'
 
 type S = components['schemas']
 
@@ -399,6 +407,26 @@ function markRebalance(s: MockState, reason: S['RebalanceReason']): void {
 /** 0.12.0: the refusal of a request that needs a decision carries the plan (`?failover=noplan`: a server that does not yet). */
 function decisionExtra(plan: S['FailoverPlan']): Partial<Problem> {
   return mockConfig.failoverNoPlan ? {} : { plan }
+}
+
+const CHANGE_KINDS: S['TableChangeRequest']['kind'][] = [
+  'distribute',
+  'undistribute',
+  'alter',
+  'createPartition',
+  'attachPartition',
+  'detachPartition',
+  'dropPartition',
+]
+
+/** The database, the table and the state of the request of a table operation; 404 when either does not exist. */
+function tableOf(c: { s: MockState; params: Record<string, string | undefined> }) {
+  const rec = db(c.s, c.params.databaseName ?? '')
+  const t = rec.tables.find(
+    (x) => x.schema === c.params.schemaName && x.name === c.params.tableName,
+  )
+  if (!t) throw problem('not_found', 'Table does not exist.')
+  return { s: c.s, rec, t }
 }
 
 /** 0.12.0: a database is not created, dropped or distributed while a failover or a restore runs (409 `failover_in_progress`). */
@@ -891,31 +919,9 @@ function databaseView(s: MockState, name: string): Database {
 
 // --- roles and grants ----------------------------------------------------------------------------------
 
-const COLUMN_DEFS: Record<string, { name: string; type: string; key?: boolean }[]> = {
-  notes: [
-    { name: 'note_id', type: 'bigint', key: true },
-    { name: 'body', type: 'text' },
-    { name: 'tags', type: 'jsonb' },
-    { name: 'created_at', type: 'timestamptz' },
-  ],
-  monthly_totals: [
-    { name: 'month', type: 'date', key: true },
-    { name: 'total', type: 'numeric' },
-    { name: 'region', type: 'text' },
-  ],
-  exports: [
-    { name: 'export_id', type: 'bigint', key: true },
-    { name: 'payload', type: 'bytea' },
-    { name: 'created_at', type: 'timestamptz' },
-  ],
-}
-
 /** Columns of a table with the reason a column cannot be the distribution column (or null). */
 function columnsFor(rec: ReturnType<typeof db>, t: Table): S['TableColumn'][] {
-  const defs = COLUMN_DEFS[t.name] ?? [
-    { name: 'id', type: 'bigint', key: true },
-    { name: 'created_at', type: 'timestamptz' },
-  ]
+  const defs = columnDefsOf(t)
   return defs.map((d) => {
     let reason: S['DistributionBlockedReason'] | null = null
     if (!rec.info.sharding.enabled) reason = 'shardingDisabled'
@@ -2024,133 +2030,83 @@ export function createHandlers(): HttpHandler[] {
         ),
       )
     },
-    // The table lifecycle of contract 0.14.0: the mock answers with the shape of the contract and changes little (increment 9.7 gives the panel its dialogs).
+    // The table lifecycle of contract 0.14.0 (increment 9.7): src/mocks/tables.ts.
     previewTableChange: (c) => {
-      db(c.s, c.params.databaseName ?? '')
-      return ok({
-        blockers: [],
-        warnings: [],
-        notes: [],
-        affectedTables: [],
-        estimate: {
-          rows: null,
-          bytes: null,
-          modeRecommended: 'blocking',
-          onlineAvailable: false,
-          onlineUnavailableReason: 'The mock has no online copy.',
-          writersBlocked: 'wholeCopy',
-        },
-      } satisfies S['TableChangePreview'])
+      const { s, rec, t } = tableOf(c)
+      const b = body<S['TableChangeRequest']>(c)
+      if (!CHANGE_KINDS.includes(b.kind))
+        throw validationFailed([
+          { field: 'kind', message: 'Use one of: ' + CHANGE_KINDS.join(', ') + '.' },
+        ])
+      return ok(previewChange(s, rec, t, b))
     },
-    listTablePartitions: () =>
-      ok({ items: [], nextCursor: null } satisfies S['TablePartitionPage']),
+    listTablePartitions: (c) => {
+      const { s, rec, t } = tableOf(c)
+      return ok(paginate(partitionsOf(s, rec, t), c.url))
+    },
     undistributeTable: (c) => {
       refuseDuringFailover(c.s)
-      const rec = db(c.s, c.params.databaseName ?? '')
-      const t = rec.tables.find(
-        (x) => x.schema === c.params.schemaName && x.name === c.params.tableName,
-      )
-      if (!t) throw problem('not_found', 'Table does not exist.')
+      const { s, rec, t } = tableOf(c)
+      const q = c.url.searchParams
+      const mode = q.get('mode')
+      const views = q.get('dependentViews')
+      const target = q.get('targetGroupId')
+      const errors: { field: string; message: string }[] = []
+      if (mode !== null && !['auto', 'online', 'blocking'].includes(mode))
+        errors.push({ field: 'mode', message: 'Use auto, online or blocking.' })
+      if (views !== null && !['refuse', 'recreate'].includes(views))
+        errors.push({ field: 'dependentViews', message: 'Use refuse or recreate.' })
+      if (target !== null && !/^\d+$/.test(target))
+        errors.push({ field: 'targetGroupId', message: 'Use a shard group number, 0 or more.' })
+      if (errors.length > 0) throw validationFailed(errors)
       return accepted(
-        createTask(c.s, {
-          kind: 'table.undistribute',
-          subject: { type: 'table', id: `${rec.info.name}.${t.schema}.${t.name}` },
-          steps: ['Check the table', 'Copy rows', 'Switch'],
-          apply: () => {
-            t.classes = ['plain']
-            t.distribution = null
-          },
+        startUndistribute(s, rec, t, {
+          ...(q.get('cascadeViaForeignKeys') === 'true' ? { cascadeViaForeignKeys: true } : {}),
+          ...(target !== null ? { targetGroupId: Number(target) } : {}),
+          ...(mode ? { mode: mode as S['TableChangeMode'] } : {}),
+          ...(views ? { dependentViews: views as S['DependentViews'] } : {}),
         }),
       )
     },
     alterTableDistribution: (c) => {
       refuseDuringFailover(c.s)
-      const rec = db(c.s, c.params.databaseName ?? '')
-      const t = rec.tables.find(
-        (x) => x.schema === c.params.schemaName && x.name === c.params.tableName,
-      )
-      if (!t) throw problem('not_found', 'Table does not exist.')
-      return accepted(
-        createTask(c.s, {
-          kind: 'table.alter',
-          subject: { type: 'table', id: `${rec.info.name}.${t.schema}.${t.name}` },
-          steps: ['Check the table', 'Copy rows', 'Switch'],
-          apply: () => {
-            void t
-          },
-        }),
-      )
+      const { s, rec, t } = tableOf(c)
+      return accepted(startAlter(s, rec, t, body<S['AlterTableDistributionRequest']>(c)))
     },
     createTablePartition: (c) => {
       refuseDuringFailover(c.s)
-      const rec = db(c.s, c.params.databaseName ?? '')
-      const t = rec.tables.find(
-        (x) => x.schema === c.params.schemaName && x.name === c.params.tableName,
-      )
-      if (!t) throw problem('not_found', 'Table does not exist.')
+      const { s, rec, t } = tableOf(c)
       return accepted(
-        createTask(c.s, {
-          kind: 'table.partition',
-          subject: { type: 'table', id: `${rec.info.name}.${t.schema}.${t.name}` },
-          steps: ['Check the request', 'Change the partitions on every server'],
-          apply: () => {
-            void t
-          },
+        startPartition(s, rec, t, {
+          kind: 'create',
+          body: body<S['CreateTablePartitionRequest']>(c),
         }),
       )
     },
     attachTablePartition: (c) => {
       refuseDuringFailover(c.s)
-      const rec = db(c.s, c.params.databaseName ?? '')
-      const t = rec.tables.find(
-        (x) => x.schema === c.params.schemaName && x.name === c.params.tableName,
-      )
-      if (!t) throw problem('not_found', 'Table does not exist.')
-      return accepted(
-        createTask(c.s, {
-          kind: 'table.partition',
-          subject: { type: 'table', id: `${rec.info.name}.${t.schema}.${t.name}` },
-          steps: ['Check the request', 'Change the partitions on every server'],
-          apply: () => {
-            void t
-          },
-        }),
-      )
+      const { s, rec, t } = tableOf(c)
+      const b = body<S['AttachTablePartitionRequest']>(c)
+      if (!b.table || typeof b.bound !== 'string' || b.bound.trim() === '')
+        throw validationFailed([
+          { field: b.table ? 'bound' : 'table', message: 'Give the table and the bound.' },
+        ])
+      if (!rec.tables.some((x) => x.schema === b.table.schema && x.name === b.table.table))
+        throw problem('not_found', 'The table to attach does not exist.')
+      return accepted(startPartition(s, rec, t, { kind: 'attach', body: b }))
     },
     detachTablePartition: (c) => {
       refuseDuringFailover(c.s)
-      const rec = db(c.s, c.params.databaseName ?? '')
-      const t = rec.tables.find(
-        (x) => x.schema === c.params.schemaName && x.name === c.params.tableName,
-      )
-      if (!t) throw problem('not_found', 'Table does not exist.')
+      const { s, rec, t } = tableOf(c)
       return accepted(
-        createTask(c.s, {
-          kind: 'table.partition',
-          subject: { type: 'table', id: `${rec.info.name}.${t.schema}.${t.name}` },
-          steps: ['Check the request', 'Change the partitions on every server'],
-          apply: () => {
-            void t
-          },
-        }),
+        startPartition(s, rec, t, { kind: 'detach', partition: c.params.partitionName ?? '' }),
       )
     },
     dropTablePartition: (c) => {
       refuseDuringFailover(c.s)
-      const rec = db(c.s, c.params.databaseName ?? '')
-      const t = rec.tables.find(
-        (x) => x.schema === c.params.schemaName && x.name === c.params.tableName,
-      )
-      if (!t) throw problem('not_found', 'Table does not exist.')
+      const { s, rec, t } = tableOf(c)
       return accepted(
-        createTask(c.s, {
-          kind: 'table.partition',
-          subject: { type: 'table', id: `${rec.info.name}.${t.schema}.${t.name}` },
-          steps: ['Check the request', 'Change the partitions on every server'],
-          apply: () => {
-            void t
-          },
-        }),
+        startPartition(s, rec, t, { kind: 'drop', partition: c.params.partitionName ?? '' }),
       )
     },
     getTable: (c) => {
@@ -2203,62 +2159,7 @@ export function createHandlers(): HttpHandler[] {
         : undefined
       if (b.colocateWith && !target?.distribution)
         throw problem('unprocessable', 'The table to colocate with is not distributed.')
-      return accepted(
-        createTask(s, {
-          kind: 'table.distribute',
-          subject: { type: 'table', id: `${rec.info.name}.${t.schema}.${t.name}` },
-          steps: ['Create shards', 'Copy rows', 'Switch over', 'Clean up'],
-          apply: () => {
-            const bucketCount = rec.info.sharding.bucketCount ?? 128
-            if (b.method === 'reference') {
-              t.classes = ['reference']
-              t.distribution = {
-                method: 'reference',
-                column: null,
-                colocationId: 3,
-                bucketCount: 1,
-              }
-            } else {
-              const colocationId =
-                target?.distribution?.colocationId ??
-                Math.max(
-                  0,
-                  ...rec.tables.map((x) => x.distribution?.colocationId ?? 0),
-                  ...rec.colocations.map((x) => x.colocationId),
-                ) + 1
-              t.classes = t.ledger ? ['distributed', 'ledger'] : ['distributed']
-              t.distribution = {
-                method: 'hash',
-                column: b.distributionColumn ?? null,
-                colocationId,
-                bucketCount,
-              }
-              const existing = rec.colocations.find((x) => x.colocationId === colocationId)
-              const group = existing ?? {
-                colocationId,
-                bucketCount,
-                distributionColumnType: 'bigint',
-                tableCount: 0,
-                sizeBytes: 0,
-              }
-              if (!existing) {
-                rec.colocations.push(group)
-                rec.buckets.set(
-                  colocationId,
-                  makeBuckets(
-                    colocationId,
-                    bucketCount,
-                    dataGroups(s).map((g) => g.id),
-                    colocationId * 7,
-                  ),
-                )
-              }
-              group.tableCount += 1
-            }
-            t.homeShardGroupId = null
-          },
-        }),
-      )
+      return accepted(startDistribute(s, rec, t, b))
     },
     enableTableLedger: (c) => {
       const s = c.s
@@ -2562,7 +2463,33 @@ export function createHandlers(): HttpHandler[] {
       }
       // A failover stops before the promotion: its freezes are lifted and its report says cancelled (running or paused).
       if (rec.task.kind === 'server.failover') return ok(cancelFailover(c.s, rec))
-      if (rec.task.state !== 'running') throw problem('task_not_cancellable')
+      const tableTask = rec.task.kind.startsWith('table.')
+      if (rec.task.state !== 'running' && !(tableTask && rec.task.state === 'paused'))
+        throw problem('task_not_cancellable')
+      if (tableTask) {
+        // A change of a table stops at the next step and leaves the table as it was (the result is never applied).
+        rec.task.state = 'failed'
+        rec.task.cancellable = false
+        rec.task.error = {
+          code: 'cancelled',
+          message: 'The task was canceled.',
+          step: rec.task.progress.currentStep,
+          retryable: false,
+        }
+        rec.task.progress.steps = rec.task.progress.steps.map((st) =>
+          st.state === 'done'
+            ? st
+            : { ...st, state: st.state === 'running' ? 'failed' : 'skipped' },
+        )
+        // The control plane records the task as cancelled first and undoes the change after that: the detail says so until it has.
+        rec.task.detail = 'Undoing the change on every server.'
+        rec.settleAt = Date.now() + mockConfig.tableUndoMs
+        rec.settleDetail = mockConfig.tableUndoFails
+          ? 'The change could not be undone on server 10.0.0.13, which did not answer. It is cleaned up when that server returns.'
+          : 'The change was undone on every server.'
+        rec.task.updatedAt = nowIso()
+        return ok(rec.task)
+      }
       rec.task.state = 'paused'
       rec.task.cancellable = false
       if (rec.task.kind === 'rebalance') r.state = 'stopped'

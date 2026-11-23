@@ -207,6 +207,7 @@ export const ROUTES = [
   '/servers/10.0.0.13',
   '/databases',
   '/databases/shop',
+  '/databases/shop/tables/public/orders',
   '/shards',
   '/replication',
   '/rebalance',
@@ -520,6 +521,62 @@ async function startImport(page: Page): Promise<void> {
   const ack = await page.$('[data-testid="ack-repeat"]')
   if (ack) await ack.click()
   await page.click('[data-testid="start-import"]')
+}
+
+/** Puts the tables of increment 9.7 back as they were: the switches off, and the partitioned tables the states added gone. */
+const freshTables = async (page: Page): Promise<void> => {
+  await setMock(page, {
+    tableFail: null,
+    tableSlow: false,
+    tableBusy: false,
+    tableForeignKeys: [],
+    taskDurationMs: 800,
+  })
+  await page.evaluate(() => {
+    const mock = (
+      window as unknown as {
+        __kingresMock: {
+          state: () => {
+            databases: {
+              info: { name: string }
+              tables: { name: string; distribution: { colocationId: number | null } | null }[]
+              colocations: { colocationId: number }[]
+              buckets: Map<number, unknown>
+            }[]
+            partitions?: Record<string, unknown>
+          }
+        }
+      }
+    ).__kingresMock
+    const s = mock.state()
+    const shop = s.databases.find((d) => d.info.name === 'shop')
+    if (!shop) return
+    const gone = shop.tables.filter((t) => t.name.startsWith('measurements'))
+    const groups = new Set(gone.map((t) => t.distribution?.colocationId))
+    shop.tables = shop.tables.filter((t) => !t.name.startsWith('measurements'))
+    shop.colocations = shop.colocations.filter((g) => !groups.has(g.colocationId))
+    for (const id of groups) if (id != null) shop.buckets.delete(id)
+    delete s.partitions
+  })
+}
+
+/** Opens the page of a table of the database `shop` through the list of its tables. */
+async function openTablePage(page: Page, table: string): Promise<void> {
+  await page.evaluate((name) => {
+    ;(
+      window as unknown as { __queryClient: { invalidateQueries: () => unknown } }
+    ).__queryClient.invalidateQueries()
+    void name
+  }, table)
+  await sleep(500)
+  await page.waitForFunction(
+    (name) =>
+      [...document.querySelectorAll('a')].some((a) => a.textContent?.trim() === `public.${name}`),
+    { timeout: 20_000 },
+    table,
+  )
+  await clickText(page, `public.${table}`, 'a')
+  await page.waitForSelector('[data-testid="table-facts"]', { timeout: 20_000 })
 }
 
 /**
@@ -1175,6 +1232,81 @@ export const STATES: PageState[] = [
     close: async (page) => {
       await cancel(page)
       await freshFailover(page)
+    },
+  },
+  {
+    // 0.14.0, increment 9.7: a table the user partitioned by range, with its partitions and the buttons that change them.
+    name: 'table page: the partitions of a table (0.14.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await freshTables(page)
+      await page.evaluate(() =>
+        (
+          window as unknown as {
+            __kingresMock: { urlSwitch: (name: string, text: string) => void }
+          }
+        ).__kingresMock.urlSwitch('tables', 'partitions'),
+      )
+      await openTablePage(page, 'measurements')
+      await page.waitForSelector('[data-testid="partition-list"]', { timeout: 20_000 })
+      await sleep(250)
+    },
+    close: freshTables,
+  },
+  {
+    name: 'table dialog: a change that the table cannot take, with the lines that stop it (0.14.0)',
+    needsMock: true,
+    route: '/databases/shop/tables/public/customers',
+    open: async (page) => {
+      await freshTables(page)
+      await clickWhenThere(page, '[data-testid="undistribute-table"]')
+      await dialogOpen(page)
+      await page.waitForSelector('[role="dialog"] [data-testid="table-blockers"]', {
+        timeout: 20_000,
+      })
+      await sleep(250)
+    },
+    close: cancel,
+  },
+  {
+    name: 'table dialog: distribute a table, with the preview of the change (0.14.0)',
+    needsMock: true,
+    route: '/databases/shop/tables/public/notes',
+    open: async (page) => {
+      await freshTables(page)
+      await clickWhenThere(page, '[data-testid="distribute-table"]')
+      await dialogOpen(page)
+      await page.waitForSelector('[role="dialog"] [data-testid="table-change-eligible"]', {
+        timeout: 20_000,
+      })
+      await sleep(250)
+    },
+    close: cancel,
+  },
+  {
+    name: 'table dialog: a task that failed, in words (0.14.0)',
+    needsMock: true,
+    route: '/databases/shop/tables/public/notes',
+    open: async (page) => {
+      await freshTables(page)
+      await setMock(page, { tableFail: 'space' })
+      await clickWhenThere(page, '[data-testid="distribute-table"]')
+      await dialogOpen(page)
+      await page.waitForSelector('[role="dialog"] [data-testid="table-change-eligible"]', {
+        timeout: 20_000,
+      })
+      await clickText(page, 'Distribute table', '[role="dialog"] button')
+      await page.waitForFunction(
+        () =>
+          document.querySelector('[role="dialog"]')?.textContent?.includes('Not enough free space'),
+        { timeout: 30_000 },
+      )
+      await sleep(300)
+    },
+    close: async (page) => {
+      await clickText(page, 'Close', '[role="dialog"] button')
+      await freshTables(page)
     },
   },
   {

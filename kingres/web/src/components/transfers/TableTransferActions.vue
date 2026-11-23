@@ -11,7 +11,15 @@ import ImportTableDialog from './ImportTableDialog.vue'
 import { useTransferGate } from '@/composables/useTransferGate'
 import type { Table } from '@/api/types'
 
-const props = defineProps<{ databaseName: string; table: Table }>()
+const props = withDefaults(
+  defineProps<{
+    databaseName: string
+    table: Table
+    /** Small buttons for a row of a list; the header of the table page uses full-size ones. */
+    small?: boolean
+  }>(),
+  { small: true },
+)
 const gate = useTransferGate(
   () => props.databaseName,
   () => props.table.schema,
@@ -23,7 +31,7 @@ const open = ref<'export' | 'import' | null>(null)
 <template>
   <GateButton
     op="exportTable"
-    small
+    :small="small"
     :blocked-reason="gate.reason.value"
     data-testid="export-csv"
     @click="open = 'export'"
@@ -32,7 +40,7 @@ const open = ref<'export' | 'import' | null>(null)
   </GateButton>
   <GateButton
     op="importTable"
-    small
+    :small="small"
     :blocked-reason="gate.reason.value"
     data-testid="import-csv"
     @click="open = 'import'"
