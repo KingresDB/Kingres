@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.19.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.24.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and, when it is built, the planned `kingres-cli` (it does not exist yet). Lint it and run the mechanical rule check with:
 
 ```
@@ -362,6 +362,15 @@ Where the architecture document leaves something open, the simplest option was c
     range and the cluster's replica count.
 
 ## Changelog
+
+### 0.24.0
+
+Placeholder revision for the security fix of the extension schemas (`kingres/docs/reviews/2026-11-23-extension-schema-trust.md`); the number is set when the revision is merged. **No change that is not additive.**
+
+#### Additive
+
+- `AlertKind` has `extensionSchemaUntrusted` (`critical`; subject `server:<id>|database:<name>`): the schema of a KingresDB extension in a database is owned by a role that is not a superuser, holds an object that is not a member of an extension, or lets a role that is not a superuser create objects in it. The control plane then reads and calls nothing in that schema, and the operations that need the extension are refused.
+
 
 ### 0.19.0
 

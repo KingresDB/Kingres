@@ -197,3 +197,39 @@ func EvaluateVersions(servers []ServerVersions) []Condition {
 	return []Condition{{Kind: "versionMismatch", Severity: "warning", Subject: "cluster",
 		Message: "The servers run different versions: " + strings.Join(parts, ". ") + "."}}
 }
+
+// ExtensionReading is a KingresDB extension of a database whose schema cannot be trusted (package extguard): the control plane reads and calls nothing in it.
+type ExtensionReading struct {
+	Database  string
+	Extension string
+	Schema    string
+	// Reason is the check that failed (extguard.Reason) and Detail the first object that does not belong, if any.
+	Reason string
+	Detail string
+}
+
+// extensionConditions is one critical alert per database: the message names every untrusted extension of it.
+func (r Readings) extensionConditions() (conds []Condition) {
+	byDB := map[string][]ExtensionReading{}
+	var order []string
+	for _, e := range r.ExtensionsUntrusted {
+		if _, ok := byDB[e.Database]; !ok {
+			order = append(order, e.Database)
+		}
+		byDB[e.Database] = append(byDB[e.Database], e)
+	}
+	sort.Strings(order)
+	for _, db := range order {
+		var parts []string
+		for _, e := range byDB[db] {
+			s := fmt.Sprintf("%s (schema %s, %s", e.Extension, e.Schema, e.Reason)
+			if e.Detail != "" {
+				s += ": " + e.Detail
+			}
+			parts = append(parts, s+")")
+		}
+		conds = append(conds, Condition{"extensionSchemaUntrusted", "critical", serverSubject(r.Host, "database:"+db),
+			fmt.Sprintf("The schema of a KingresDB extension in database %s on server %s cannot be trusted, so nothing in it is read or called: %s. The owner of the schema or of an object in it is not a superuser, a role that is not a superuser can create objects in it, or it holds an object that does not belong to an extension.", db, r.Host, strings.Join(parts, "; "))})
+	}
+	return conds
+}

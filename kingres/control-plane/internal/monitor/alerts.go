@@ -30,7 +30,7 @@ const (
 )
 
 // Managed lists the alert kinds the checks own; others are never cleared by them.
-var Managed = []string{"serverDown", "serverSuspect", "diskSpaceLow", "memoryPressure", "replicationLagHigh", "certificateExpiring", "ledgerPendingTooOld", "versionMismatch", "certificateRenewalFailed", "replicationPending", "leaseLost", "groupWithoutSynchronousStandby", "groupUnderReplicated", "clockDifference", "transferStagingLow"}
+var Managed = []string{"serverDown", "serverSuspect", "diskSpaceLow", "memoryPressure", "replicationLagHigh", "certificateExpiring", "ledgerPendingTooOld", "versionMismatch", "certificateRenewalFailed", "replicationPending", "leaseLost", "groupWithoutSynchronousStandby", "groupUnderReplicated", "clockDifference", "transferStagingLow", "extensionSchemaUntrusted"}
 
 // Readings are the inputs of the checks; nil means "not measured", which
 // neither raises nor clears an alert.
@@ -59,6 +59,9 @@ type Readings struct {
 	Now                time.Time
 	// LedgerMaxAge is the age that raises ledgerPendingTooOld (0: LedgerPendingMaxAge).
 	LedgerMaxAge time.Duration
+	// ExtensionsChecked says that ExtensionsUntrusted was measured (an empty list then means that every extension of every database is trusted).
+	ExtensionsChecked   bool
+	ExtensionsUntrusted []ExtensionReading
 }
 
 // Condition is a problem that exists now.
@@ -102,6 +105,10 @@ func Evaluate(r Readings) (conds []Condition, evaluated map[string]bool) {
 	if r.LedgerChecked {
 		evaluated["ledgerPendingTooOld"] = true
 		conds = append(conds, r.ledgerConditions()...)
+	}
+	if r.ExtensionsChecked {
+		evaluated["extensionSchemaUntrusted"] = true
+		conds = append(conds, r.extensionConditions()...)
 	}
 	if r.LeasesChecked {
 		evaluated["leaseLost"] = true
@@ -179,7 +186,8 @@ var titles = map[string]string{
 	"ledgerPendingTooOld": "Ledger entries pending for too long", "versionMismatch": "KingresDB versions differ",
 	"certificateRenewalFailed": "Certificate renewal failed", "replicationPending": "A server is behind on role and grant changes", "leaseLost": "A group lease was lost",
 	"groupWithoutSynchronousStandby": "A shard group runs without a synchronous standby", "groupUnderReplicated": "A shard group has too few standbys", "clockDifference": "A server's clock is off", "transferStagingLow": "The staging area of the data transfer is nearly full",
-	"oldPrimaryNotStopped": "An old primary could not be stopped", "oldPrimaryRunning": "An old primary is running", "oldPrimaryNotRebuilt": "An old primary has not been turned into a standby",
+	"extensionSchemaUntrusted": "The schema of a KingresDB extension cannot be trusted",
+	"oldPrimaryNotStopped":     "An old primary could not be stopped", "oldPrimaryRunning": "An old primary is running", "oldPrimaryNotRebuilt": "An old primary has not been turned into a standby",
 }
 
 func scanAlert(r pgx.Row) (api.Alert, error) {

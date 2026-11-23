@@ -436,5 +436,13 @@ func (s *Service) PublishSystemDSN() { s.publishDSN() }
 // an object that the owner planted and run it as the service role (a superuser). The service role's own statements name what they use; pg_catalog is the
 // only schema that they search.
 func safeServiceSession(cfg *pgx.ConnConfig) {
+	if cfg.RuntimeParams == nil {
+		cfg.RuntimeParams = map[string]string{}
+	}
 	cfg.RuntimeParams["search_path"] = "pg_catalog"
 }
+
+// SafeSession fixes the search path of a connection that the service role opens, in its startup parameters (see safeServiceSession). Every
+// pgx.ParseConfig and pgxpool.ParseConfig of the service role calls it before the connection is made, for a pool as SafeSession(cfg.ConnConfig): a database
+// owner can run ALTER DATABASE ... SET search_path, and a session that took it would run the function or the operator of the owner as a superuser.
+func SafeSession(cfg *pgx.ConnConfig) { safeServiceSession(cfg) }
