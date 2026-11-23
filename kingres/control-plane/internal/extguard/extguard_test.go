@@ -521,3 +521,40 @@ func TestPreInstallMutantsAreKilled(t *testing.T) {
 		d.mustSU(t, c.undo)
 	}
 }
+
+// kingres_shard is created with SCHEMA pg_catalog and populates the schema kingres: that schema is the one that is checked, never pg_catalog.
+func TestShardIsCheckedInTheSchemaKingres(t *testing.T) {
+	d := startTenant(t)
+	ctx := context.Background()
+	d.install(t, Shard)
+	info, err := Verify(ctx, d.su, Shard)
+	if err != nil || !info.Present || info.Schema != "kingres" {
+		t.Fatalf("a real install of kingres_shard is trusted, in the schema kingres: %+v %v", info, err)
+	}
+	// the other extensions of the schema kingres are members, not foreign
+	d.install(t, Timepart)
+	if _, err := Verify(ctx, d.su, Shard); err != nil {
+		t.Fatalf("with kingres_timepart in the same schema: %v", err)
+	}
+	if rs, err := VerifyAll(ctx, d.su, Shard, Timepart); err != nil || rs[0].Err != nil || rs[1].Err != nil {
+		t.Fatalf("%+v %v", rs, err)
+	}
+	for _, c := range []struct {
+		bad, undo string
+		want      Reason
+	}{
+		{"CREATE VIEW kingres.ledger_pending AS SELECT 1 AS ledger_txid", "DROP VIEW kingres.ledger_pending", ReasonForeignObject},
+		{"CREATE FUNCTION kingres.planted() RETURNS int LANGUAGE sql AS 'SELECT 1'", "DROP FUNCTION kingres.planted()", ReasonForeignObject},
+		{"ALTER SCHEMA kingres OWNER TO tenant", "ALTER SCHEMA kingres OWNER TO kingresd", ReasonSchemaOwner},
+		{"GRANT CREATE ON SCHEMA kingres TO PUBLIC", "REVOKE CREATE ON SCHEMA kingres FROM PUBLIC", ReasonSchemaCreate},
+	} {
+		d.mustSU(t, c.bad)
+		if _, r := verifyReason(t, d.su, Shard); r != c.want {
+			t.Errorf("%s: %q, want %q", c.bad, r, c.want)
+		}
+		d.mustSU(t, c.undo)
+		if _, r := verifyReason(t, d.su, Shard); r != "" {
+			t.Fatalf("after %s: %q", c.undo, r)
+		}
+	}
+}

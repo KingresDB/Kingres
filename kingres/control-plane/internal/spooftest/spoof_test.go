@@ -32,8 +32,9 @@ import (
 
 // kingresNames are the relations of the schema kingres that the control plane reads; the tenant makes a view of each of them that writes a marker, and a function
 // of each function that it calls.
+// map_version and local_node are left out on purpose: the library of kingres_shard takes the catalog to be present when the six tables node, colocation,// dist_table, bucket_map, map_version and local_node exist in the schema kingres of any database, and then scans them; a view of a tenant that completes the list// makes the backend fail with a segmentation fault (see the security note).
 var kingresNames = []string{
-	"node", "bucket_map", "map_version", "local_node", "colocation", "dist_table", "dist_schema", "dist_partition", "sharding_settings",
+	"node", "bucket_map", "colocation", "dist_table", "dist_schema", "dist_partition", "sharding_settings",
 	"ledger_blocks", "ledger_digest", "ledger_verification", "ledger_status", "ledger_table", "ledger_pending", "ledger_chain", "timepart_policy_x",
 	"ledger_client_key", "ledger_client_key_revocation",
 }
