@@ -82,6 +82,7 @@ SELECT proname FROM members
  timepart__dist
  timepart__dist_bounds
  timepart__dist_budget
+ timepart__dist_kinds
  timepart__eff
  timepart__exec_direct
  timepart__is_sealed
@@ -117,7 +118,7 @@ SELECT proname FROM members
  timepart_interval_parts
  timepart_part_name
  timepart_retire_one
-(51 rows)
+(52 rows)
 
 -- The policy and the history are shown to a role through security_barrier
 -- views (the rows of the tables it owns); the base tables and the lock table

@@ -188,6 +188,23 @@ $n1->append_conf('postgresql.conf', "kingres_shard.max_partition_leaves = 8192
 ");
 $n1->reload;
 
+
+# the name of a generated partition of a distributed table fits its leaves (57 bytes, not the 63 of an ordinary table)
+{
+	my $long = 'bdl_' . ('x' x 46);
+	$n1->safe_psql('postgres', qq{
+		CREATE TABLE public.$long (cust int NOT NULL, ts date NOT NULL, id int NOT NULL, PRIMARY KEY (cust, ts, id)) PARTITION BY RANGE (ts);
+		CREATE TABLE public.bdl_first PARTITION OF public.$long FOR VALUES FROM ('2026-03-01') TO ('2026-03-02');
+		SELECT kingres.create_distributed_table('public.$long', 'cust', bucket_count => 6);
+		SELECT kingres.timepart_set_policy('public.$long', '1 day', create_ahead => '1 day');
+	});
+	($rc, $out, $err) = run_policy($long, '2026-03-02 12:00');
+	is($rc, 0, 'B: a run on a table with a long name') or diag($err);
+	is(last_run($long), 'done', 'B: is done');
+	is(q1($n1, qq{SELECT string_agg(length(partition_name)::text, ',' ORDER BY partition_name) FROM kingres.dist_partition WHERE parent = 'public.$long'::regclass AND partition_name <> 'bdl_first'}),
+		'57,57', 'B: the generated names are cut to 57 bytes, so that the leaves fit');
+}
+
 # ---------------------------------------------------------------------------
 # C. a group that is claimed: retry later; the claim keeps moves and partition changes away, and a move keeps the claim away
 # ---------------------------------------------------------------------------
@@ -333,8 +350,11 @@ is(q1($n1, q{SELECT method || '|' || (colocation_id = (SELECT colocation_id FROM
 is(q1($n1, q{SELECT count(*) FROM public.dt_p20260301}) + q1($n1, q{SELECT count(*) FROM public.dt WHERE ts < '2026-03-04 00:00+00'}), '120', 'F: the rows are in the table of its own and nowhere else');
 
 $_->safe_psql('postgres', q{CREATE ROLE dtp_owner LOGIN}) for @nodes;
-$n1->safe_psql('postgres', q{ALTER TABLE public.dt OWNER TO dtp_owner; SELECT kingres.timepart_set_policy('public.dt', '1 day', create_ahead => '2 days', retention => '2 days', retention_action => 'detach'); SELECT kingres.timepart_grant_driver('dtp_owner')});
+$n1->safe_psql('postgres', q{ALTER TABLE public.dt OWNER TO dtp_owner; SELECT kingres.timepart_set_policy('public.dt', '1 day', create_ahead => '2 days', retention => '2 days', retention_action => 'detach', columnar_after => '1 day'); GRANT EXECUTE ON FUNCTION kingres.timepart_plan(regclass, timestamptz) TO dtp_owner; SELECT kingres.timepart_grant_driver('dtp_owner')});
 my ($so, $se) = ('', '');
+$rc = $n1->psql('postgres', q{SELECT count(*) FROM kingres.timepart_plan('public.dt', '2026-03-10 12:00 UTC')}, stdout => \$so, stderr => \$se, extra_params => ['-U', 'dtp_owner']);
+is($rc, 0, 'F: the owner plans the policy of its distributed table (the storage of the leaves is read for it)') or diag($se);
+cmp_ok($so, '>', 0, 'F: and the plan has actions');
 $rc = $n1->psql('postgres', q{CALL kingres.timepart_run('public.dt', '2026-03-10 12:00 UTC')}, stdout => \$so, stderr => \$se, extra_params => ['-U', 'dtp_owner']);
 is($rc, 0, 'F: the owner runs its policy') or diag($se);
 is(last_run('dt'), 'partial', 'F: the run is partial');

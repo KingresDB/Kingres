@@ -6376,7 +6376,6 @@ $$;
 ------------------------------------------------------------------------
 
 REVOKE ALL ON FUNCTION
-    kingres.timepart__dist_kinds(oid),
     kingres.timepart__dist_convert(oid, name, name, text[], jsonb),
     kingres.timepart_dist_partitions(regclass),
     kingres.convert_distributed_partition(regclass, name, name, text[], jsonb)
