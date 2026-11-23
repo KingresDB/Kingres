@@ -413,6 +413,28 @@ the import completes once), `TestImportLeaseLostBeforeTheIntent` (the write of t
 of another role: `export_untrusted_code`), `TestStagingMetricsAndAlert`, and on three servers `TestDataTransferLeaderRestartMidTransfer` and
 `TestDataTransferShardGroupLostMidCopy` (rows are all or none; no prepared transaction is left).
 
+## Database export and archive validation (phase 14b, contract 0.40.0)
+
+Two more operations of the tag `Data transfer` and two tasks, built on the staging store, the encryption at rest, the uploads and the roles of phase 14a (design:
+`docs/design/data-export-import.md`, "Database export [14b]" and "Results of the spikes and changes made by the code (phase 14b)"). The revision number is a
+placeholder.
+
+- **`exportDatabase`** starts `database.export` (subject: the database). Steps: *Check the request* (what the archive does not carry, the privileges of the role on
+  every table, large objects), *Take the structure* (one `REPEATABLE READ READ ONLY` transaction of the service role: the catalog, the fingerprint, and `pg_dump` of the
+  build of the instance, schema only, in the snapshot of that transaction), *Normalise the schema* (package `dumpnorm`, then the shape grammar of package `sqlshape`),
+  *Write the data* (the streaming zip writer of package `archive`, the data read as the signed-in role by `COPY (SELECT)`), *Check the archive* (the file is read back
+  through the validator and the fingerprint is compared: `schema_changed`) and *Seal*. A table task of the database is refused while it runs and the export waits for a
+  table task. The archive is a file of the staging store like an export of 14a; `downloadDataExport` serves it as `application/zip`.
+- **`validateDatabaseArchive`** starts `archive.validate` (subject: the upload) for an upload of the purpose `databaseArchive`: the archive is read once, checked as the
+  importer will check it, and the `ArchiveReport` is stored with the upload and cached by the SHA-256 of the file. It touches no database.
+- **Packages.** `internal/archive` (writer, validator, manifest and catalog decoders, version rules, report), `internal/sqlshape` (lexer and shape grammar, validate-only),
+  `internal/dumpnorm` (the normaliser of the dump, with the golden files of PostgreSQL 18 and 19), `internal/ops/dbexport*.go` and `archivevalidate.go`.
+- **The binary directory.** `pg_dump` is run from the directory of the PostgreSQL programs of the instance (`-pg-bin-dir`, or the one found), never from `PATH`, with fixed
+  arguments, an environment of its own and its error output discarded.
+- **Tests.** Unit tests of every package, a PostgreSQL test of the facts and the dump (`TestReadFactsAndDumpOfARealDatabase`), cluster tests in `cmd/kingresd`
+  (`TestDatabaseExport*`, `TestSpikeS3DumpOfEveryTableKind`) and `internal/clustertest` (`TestDatabaseExportOverThreeServers`); run on PostgreSQL 18 and 19 with
+  `scripts/run-integration.ps1`.
+
 ## What is implemented
 
 The server implements revision **0.19.0** of the contract (171 operations, 136

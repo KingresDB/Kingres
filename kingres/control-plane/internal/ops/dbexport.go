@@ -615,12 +615,6 @@ func (o *Ops) stepDBNormalise(ctx context.Context, env *task.Env) error {
 	return nil
 }
 
-// dataWriter is what the data step writes into: the archive writer over the sealing writer.
-type archiveSink struct {
-	sw *sealWriter
-	aw *archive.Writer
-}
-
 // stepDBData writes the whole archive (the fixed entries, the data and the manifest) to the staged file. It is one step and one process: a restart writes the
 // file again from the beginning.
 func (o *Ops) stepDBData(ctx context.Context, env *task.Env) error {

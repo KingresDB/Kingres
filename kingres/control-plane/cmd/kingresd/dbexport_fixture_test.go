@@ -62,6 +62,8 @@ func buildExportFixture(t testing.TB, e *cp, db string) func(sql string) map[str
 	e.expect(t, 200, "PUT", tbl("acc")+"/ledger", map[string]any{"mode": "updatable"})
 	e.expect(t, 200, "PUT", tbl("audit_rows")+"/ledger", map[string]any{"mode": "appendOnly"})
 	e.expect(t, 200, "PUT", tbl("ev")+"/partition-policy", map[string]any{"partitionEvery": "P1D", "createAhead": "P3D", "retention": "P30D", "retentionAction": "drop", "enabled": true})
+	// The policy makes the partitions of the time-partitioned table: today and the days ahead.
+	e.mustTask(t, "POST", tbl("ev")+"/partition-policy/runs", map[string]any{})
 	for _, s := range []string{
 		"insert into public.t_plain (name, mood, qty, tags, n) values ('Ada', 'ok', 3, '{a,b}', 12.50), ('', null, null, null, null), ('\\N', 'happy', 1, '{}', -0.01), ('line' || chr(10) || 'break, \"q\"', 'sad', 2, null, 7)",
 		"insert into public.t_child (id, plain_id, note) values (1, 1, 'one'), (2, 1, ''), (3, null, null)",
@@ -76,6 +78,7 @@ func buildExportFixture(t testing.TB, e *cp, db string) func(sql string) map[str
 		"insert into public.c_events select g, 'e' || g from generate_series(1, 300) g",
 		"insert into public.acc values (1, 10), (2, 20)",
 		"insert into public.audit_rows values (1, 'first')",
+		"insert into public.ev values (1, now(), 'now')",
 	} {
 		q(s)
 	}

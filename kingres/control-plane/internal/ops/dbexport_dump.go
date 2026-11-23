@@ -60,7 +60,7 @@ func (o *Ops) runDump(ctx context.Context, cfg *pgx.ConnConfig, section, snapsho
 	defer cancel()
 	cmd := exec.CommandContext(ctx, prog, dumpArgs(section, snapshot)...) //nolint:gosec // a fixed program and fixed arguments
 	cmd.Env = dumpEnv(cfg)
-	cmd.Dir = os.TempDir()
+	cmd.Dir = dir
 	out := &capBuffer{max: MaxDumpBytes}
 	cmd.Stdout = out
 	// What pg_dump says on its error output can name objects and values; it is read only to be thrown away.

@@ -1861,3 +1861,68 @@ section differ, this section is right.
   after reading the first two bytes of the staged file (a gzip file is not capped by its compressed size). `skipBom` is for UTF-8 only; for another encoding it is refused
   (400) when named and ignored by default. One transfer per role is race free (a lock from the check to the start of the task); a refused request leaves no record; the
   first step of a task reads `dataTransfer.enabled` again (a task that is moving data is cancelled with `cancelTask`).
+
+## Results of the spikes and changes made by the code (phase 14b)
+
+This section is written by the writer of 14b. The text above is left as the design was reviewed; where the two disagree, this section is right. The contract revision
+of 14b is **0.40.0**, a placeholder (the sections above name it 0.20.0); the migration is `0050_archive_validation.sql`, also a placeholder number.
+
+### Spike S3: `pg_dump` for every table kind (2026-11-23)
+
+**Result: passed, with the rewrites that the design expected and one it did not (the user's partitioning of a distributed table is synthesised).** The test is
+`TestSpikeS3DumpOfEveryTableKind` (`cmd/kingresd/spike_s3_e2e_test.go`): the database of the export fixture (`buildExportFixture`) is built through the API on a real cluster,
+and `pg_dump` of the build of this tree is run as the service role with the arguments of the exporter (`--schema-only --no-owner --no-tablespaces --no-publications
+--no-subscriptions --no-security-labels --no-privileges`, the two sections, `--exclude-schema=kingres`, `--exclude-schema=kingres_transfer`). It was run on PostgreSQL **18.7 and
+19.0**; **the two outputs are identical except for the two version comments and the `\restrict` token** (the golden files are in `internal/dumpnorm/testdata/pg18` and `pg19`,
+and a test says that the normalised schema is the same on both). The cluster test of 14b (`TestDatabaseExportOverThreeServers`) repeats the check on three servers, where the
+coordinator holds only some of the buckets and the dump holds only those. What the dump looks like for each kind (the answers to V1 and V2):
+
+| Kind | What `pg_dump` writes | What the normaliser does |
+|---|---|---|
+| Preamble | `\restrict <token>` and `\unrestrict <token>` on both majors (V2: yes); eleven `SET` lines and `SELECT pg_catalog.set_config('search_path', '', false)` | removed (a closed list of `SET` names; any other `SET` is a refusal) |
+| Extensions | `CREATE EXTENSION IF NOT EXISTS <name> WITH SCHEMA <schema>` and `COMMENT ON EXTENSION` for each, `kingres_shard` in `pg_catalog` | removed; the extensions and their schemas are in the manifest, from the catalog |
+| Hash-distributed table | the parent `CREATE TABLE ... PARTITION BY HASH (<column>)`, then every bucket partition `<table>_bNNNN` as a table of its own with `NOT NULL` constraints named `<table>_<column>_not_null`, and `ALTER TABLE ONLY parent ATTACH PARTITION bucket FOR VALUES WITH (modulus N, remainder R)` | the bucket partitions and their attaches are removed (the set is **read from the catalog as the descendants of every hash table**, so it is exact on a coordinator that holds some of the buckets); `PARTITION BY HASH (<column>)` is removed only when the column is the catalog's |
+| User-partitioned distributed table | the parent is `PARTITION BY HASH`; each bucket partition is itself `PARTITION BY RANGE (<key>)`; the user's leaves exist only as `<partition>_bNNNN` under the bucket partitions, with the bound written with explicit time-zone offsets, and `DEFAULT` | the user's partitioning is **synthesised from the catalog**: the parent gets `PARTITION BY <method> (<key>)` (from `pg_get_partkeydef` of a bucket partition) and one `CREATE TABLE <leaf> PARTITION OF <parent> FOR VALUES <bound>` or `DEFAULT` per user partition, the bound taken from the leaf `<partition>_bNNNN` of the first bucket the coordinator holds (`pg_get_expr`), so that a time zone is exact (the text in `kingres.dist_partition.bound` is what the user typed) |
+| Constraints and indexes of a distributed table | `ALTER TABLE ONLY parent ADD CONSTRAINT`, `CREATE INDEX ... ON ONLY parent`, the same for every bucket partition with names `<bucket>_pkey` and `<bucket>_<column>_idx`, `ALTER INDEX parent ATTACH PARTITION child` | `ONLY` is removed for a distributed parent; everything about a bucket partition, and every attach of one of their indexes (names **read from the catalog**), is removed |
+| Reference table | an ordinary table | kept |
+| Columnar table | `SET default_table_access_method = columnar;` before its `CREATE TABLE` (and `= heap` after it; the setting stays on over the partitioned parent that follows) | `USING columnar` is added to the `CREATE TABLE` of a table that is not partitioned while the setting is on; the options are in the catalog document (`kingres.columnar_options`) |
+| Updatable and append-only ledger table | the table, the history table `<table>_ledger_history` as an ordinary table, and four trigger names `kingres_ledger_block_insert`, `_block_modify`, `_block_truncate`, `_capture` with `ALTER TABLE ... ENABLE ALWAYS TRIGGER` | the history table (with everything about it) and the triggers of those names on the ledger tables are removed; **a trigger of that name on another table, and every other trigger, is kept and refused by the grammar** |
+| Time-partitioned table | an ordinary partitioned table (the policy is in `kingres.timepart_policy_data`, not in the dump) | kept; the policy is in the catalog document and is imported disabled |
+| Identity column | `ALTER TABLE ... ALTER COLUMN ... ADD GENERATED ALWAYS AS IDENTITY (SEQUENCE NAME ...)` after the table | kept |
+| Local partitioned table | the leaves as tables of their own and `ALTER TABLE ONLY parent ATTACH PARTITION leaf FOR VALUES ...` | kept; the leaves are `leaf` in the catalog and have no data entry |
+| Inheritance | `INHERITS (parent)` | kept; the shape grammar accepts it for the tables that the catalog names |
+| Views and materialized views | in pre-data, in dependency order among the tables; `CREATE MATERIALIZED VIEW ... WITH NO DATA`; comments on their columns and indexes of a materialized view are in post-data | moved, with their comments and indexes, to `schema/views.sql`, in the order of the dump |
+| Sequences | `CREATE SEQUENCE` and `ALTER SEQUENCE ... OWNED BY`, or the identity form above | kept; the state of each is in the catalog document |
+
+What the dump does not show for the tables of the extensions, and is therefore in the catalog document: the access method of a distributed table, the colocation group, the
+bucket count, the ledger mode, head and policy, the time-partition policy. **What the importer would refuse** (functions, triggers other than the ledger's, policies, rules,
+event triggers, collations, extended statistics, foreign objects, unlogged tables, row-level security) is found twice: by queries on the catalog **at the request** (422
+`schema_unrecognised`, naming the kinds), and by the shape grammar on the normalised files in the step *Normalise the schema* (the task code `schema_unrecognised`). V8 (the
+rename of a database) belongs to 14c and was not checked. V9, for what 14b does: a read reaches only the expressions of virtual generated columns (checked as in 14a), because
+every table with a policy is refused.
+
+### Changes made by the code
+
+- **Contract.** `TaskSubject` has the type `upload` (for `archive.validate`); `export_not_readable` names its objects in the problem's `reasons` (code `no_usage` or
+  `no_privilege`, `object` the name, at most 20) and in the detail after a colon; `DataExport.warnings` is new and optional; `DataUpload.state` is `valid` or `invalid` after a
+  validation and `report` holds the `ArchiveReport`. An archive that is not valid is a **finished** task whose report says `valid: false` with reasons, not a failed task.
+- **Archive writer and validator (package `archive`)** are stricter than the text above in four ways: the end record has no comment and is the last 22 bytes (a comment can
+  hide bytes); the flags of every entry are exactly 0x0008 and a descriptor is always present (the writer's shape is the only accepted one); the entries are in a fixed physical
+  order (catalog, the three SQL files, the data, the manifest) and the central directory has the same order; an extension outside the closed list of the import (plus
+  `plpgsql`) is `archive_invalid`. The catalog document gained `columns` of each table (the header of its data entry) and `historyColumns` of a ledger table; the manifest
+  gained `options.excludedTables`, so that "the data entries are the tables that have data" can be decided from the file alone.
+- **The progress of the data step is the task's `detail`** (`schema.table (n of m), N bytes so far`); the task engine has no item counters today, so `itemsDone` is not set. A
+  task that is done has the detail `transfer <id>`.
+- **A failed read restarts the whole data step, not one table** (up to 3 times, as in 14a): the archive writer is sequential and cannot rewind an entry.
+- **Single snapshot** is decided by the catalog: when no hash table has buckets in more than one group, every table is read in one `REPEATABLE READ READ ONLY` transaction of the
+  role and labelled `archive-single-snapshot`, and the independent count of every table is made in the same transaction (a difference fails the task `row_count_mismatch`).
+  Otherwise each table is one `READ COMMITTED` statement with the label of 14a, and the counts are taken at the end and are a **warning** only.
+- **A table with row-level security is refused** at the request (`schema_unrecognised`, "row-level security"): policies are not carried, and an archive of such a table would be
+  shorter than the table or refused at import.
+- **The history of an updatable ledger table** is a data entry with `ledgerHistory: true` whose `table` is the ledger table; it needs `SELECT` on the history table like any table.
+- **Table tasks wait for an export:** `StartTask` refuses a table task (`table.distribute`, `.undistribute`, `.alter`, `.partition`, `.setStorage`, `.import`, `partition.maintain`)
+  of a database in which a `database.export` is unfinished, and the export refuses to start while one of those is (one query each, 409 `operation_in_progress`).
+- **Not covered by tests:** a leader change at every step of the export (the codes come from the helpers of 14a); a database with distributed schemas (`kingres.dist_schema`) is
+  read into `distributedSchemas` but no test builds one; a columnar **distributed** table; an upload of an archive above 2 GiB.
+- **Not in 14b, by the design's own scope:** the import, `expectedSha256`, the private database; `ArchiveReport.statements` is filled by the shape grammar already, so the
+  validation says which statements a 14c importer would refuse.

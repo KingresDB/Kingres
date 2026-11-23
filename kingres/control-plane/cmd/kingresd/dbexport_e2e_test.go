@@ -166,7 +166,7 @@ func TestDatabaseExportOfEveryTableKindAndItsValidation(t *testing.T) {
 	}
 	// The rows of every table, the partition roots only, the history of the updatable ledger table for the record.
 	want := map[string]int64{"public.t_plain": 4, "public.t_child": 3, "public.inh_parent": 1, "public.inh_child": 1, "public.lp": 2, "app.items": 2, "public.refdata": 2, "public.d_hash": 200,
-		"public.d_part": 61, "public.c_events": 300, "public.acc": 2, "public.audit_rows": 1, "public.ev": 0}
+		"public.d_part": 61, "public.c_events": 300, "public.acc": 2, "public.audit_rows": 1, "public.ev": 1}
 	got := map[string]int64{}
 	history := 0
 	for _, en := range m.Entries {

@@ -259,6 +259,7 @@ Tag `Data transfer`: export a table to a CSV file, upload a CSV file, import it 
   `import_record_too_large` (with the line) and `import_too_large` (the decompressed file passes the limit).
 - **Identity columns.** The sequences behind the identity or serial columns of a distributed table are node-local: rows loaded without the column from different servers
   can repeat values. List the column in the file. The console should warn for such a table.
+- **Task codes of a database export** (0.40.0): `schema_changed` (a table or a column changed while the archive was written), `schema_unrecognised` (the dump holds a construct that an archive does not carry), `schema_dump_failed` (`pg_dump` could not run; the text of its error output is never passed on), `archive_invalid` (the archive that was written was refused by its own validator), `row_count_mismatch` (the rows written are not the rows the table has, in the one-snapshot case), and the codes of the table export (`export_too_large`, `insufficient_disk`, `transfer_*`, `copy_interrupted`, `forbidden`, `cancelled`).
 - **Audit.** The mutating operations, `downloadDataExport` (a read, audited because data leaves; written when the stream ends), and the system events `dataTransfer.completed` and
   `dataTransfer.purged`. An upload chunk is not an event.
 

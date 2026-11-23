@@ -8,7 +8,9 @@ The release script ([packaging/release/release.sh](packaging/release/release.sh)
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **Database export and archive validation** (phase 14b, REST contract revision 0.40.0, a placeholder number). `exportDatabase` writes one zip archive of a database (the structure from `pg_dump` of the same build, taken by the service role and normalised; a catalog document for the distribution, the access methods, the ledger and time-partition policies and the sequences; one CSV entry per table; a manifest with SHA-256 sums) and `validateDatabaseArchive` checks an uploaded archive without touching any database. The console has the dialogs and the report page. The archive is for inspection and for loading by hand; importing it is the next phase. Design: [docs/design/data-export-import.md](docs/design/data-export-import.md).
 
 ## [0.1.0] - not released
 
