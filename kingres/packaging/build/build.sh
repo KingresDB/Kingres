@@ -367,6 +367,19 @@ for e in "${kingres_exts[@]}"; do
     [ "${src_scripts}" = "${make_scripts}" ] ||
         die "the DATA list of the Makefile of ${e} differs from its scripts: Makefile [$(echo "${make_scripts}" | tr '\n' ' ')] files [$(echo "${src_scripts}" | tr '\n' ' ')]"
 done
+# Two modules of PostgreSQL that the product relies on are in the staged tree
+# (meson builds every contrib module and the PL/pgSQL of the server, and this
+# stops the build if an option or a change of the tree ever leaves one out):
+#   pg_stat_statements  its library is in the shared_preload_libraries of every
+#                       instance (kingresd, instance.PreloadLibraries) and every
+#                       database that kingresd makes carries the extension;
+#   plpgsql             in template1 of every cluster, and kingres_timepart and
+#                       the functions of the users are written in it.
+for m in pg_stat_statements plpgsql; do
+    [ -f "${ext_share}/${m}.control" ] || die "control file of ${m} was not installed"
+    [ -f "${ext_dir}/${m}.so" ] || die "library ${m}.so was not installed"
+    ls "${ext_share}/${m}"--*.sql >/dev/null 2>&1 || die "no install script of ${m} was installed"
+done
 # And nothing else named kingres_* may be there that the source does not have.
 for f in "${ext_share}"/kingres_*.control; do
     case " ${kingres_exts[*]} " in *" $(basename "${f}" .control) "*) ;; *) die "unexpected extension $(basename "${f}")" ;; esac

@@ -67,13 +67,27 @@ Target: Ubuntu 24.04, amd64. Everything below was run on Windows 11 with WSL2
   write (it registers a WAL resource manager). **What the product preloads
   is described in
   [The preload of `kingres_columnar`](#the-preload-of-kingres_columnar).** In
-  short: since phase 12 `kingresd` preloads `kingres_shard,kingres_ledger,kingres_columnar`
+  short: since phase 12 `kingresd` preloads `kingres_shard,kingres_ledger,kingres_columnar,pg_stat_statements`
   (`instance.PreloadLibraries`; an instance made by an earlier package gets the new list when
   `kingresd` starts and the instance is restarted); without the preload `CREATE EXTENSION` works,
   a columnar table can be read, and creating one, a write, and the conversion of a
   partition to columnar storage by `kingres_timepart` are refused with a message
   that names `shared_preload_libraries`. The other four extensions need no
   preload except `kingres_shard` and `kingres_ledger`.
+- Two modules of PostgreSQL that the product relies on, `pg_stat_statements` and
+  `plpgsql`, are part of "all contrib modules" and of the server and are shipped
+  for both majors without any extra step: `build.sh` builds with meson, which builds
+  every contrib module and PL/pgSQL (nothing in `meson_opts` leaves one out), and the
+  deb and the image take the whole staged tree. `build.sh` now also **stops** when the
+  control file, an install script or the library (`pg_stat_statements.so`,
+  `plpgsql.so`) of either is missing from the staged tree. `test/lib.sh`
+  (`check_postgres_modules`, run by `check_extension_files` for the package, the image
+  and the compose test) checks the same files in the installed tree, and
+  `test/test-modules.sh --deb FILE | --tree DIR` checks a package file or a tree
+  without docker (it reads file lists only). The library of `pg_stat_statements` is
+  preloaded by every instance (see the preload above); every database that `kingresd`
+  makes carries the extension; `flow_check_extensions` checks the preload, that the
+  view answers in `postgres`, and a plpgsql function.
 - `kingresd`: one static Go binary with the web panel embedded, and
   `kingres-watchdog`, the lease watchdog next to it.
 - `kingres-verify`: the standalone ledger verifier, when `kingres/verifier/go.mod`
@@ -542,6 +556,7 @@ test/test-compose.sh --rev kingres-19 [--port-base 58700]  # three nodes joined 
 test/test-deb.sh --deb FILE --other-deb FILE --work WORK   # install ... purge under systemd
 test/test-verifier-package.sh [--work DIR]                 # the verifier in the package, no Docker
 test/test-modes.sh [--rev REV]                              # the scripts are committed (and archived) as executable, no Docker
+test/test-modules.sh --deb FILE.deb | --tree DIR             # pg_stat_statements and plpgsql are in the package, no Docker
 ```
 
 Each test is run once per major, on the source of that major. The image and

@@ -164,8 +164,15 @@ flow_wait_task() {
 # service-credentials file.
 flow_check_extensions() {
     local p="$1" e out
-    check_eq "${p}: the instance preloads kingres_shard, kingres_ledger and kingres_columnar" "kingres_shard,kingres_ledger,kingres_columnar" \
+    check_eq "${p}: the instance preloads kingres_shard, kingres_ledger, kingres_columnar and pg_stat_statements" "kingres_shard,kingres_ledger,kingres_columnar,pg_stat_statements" \
         "$(svc -d postgres -Atc 'show shared_preload_libraries' 2>/dev/null)"
+    # kingresd makes pg_stat_statements in the databases it creates, and the library is loaded, so the view answers (this statement is in it).
+    check_eq "${p}: pg_stat_statements is in the database postgres and collects statements" "t" \
+        "$(svc -d postgres -Atc 'select count(*) > 0 from pg_stat_statements' 2>/dev/null)"
+    # plpgsql is in template1 of the cluster: a function written in it works in a database made from the template.
+    check "${p}: a plpgsql function can be created and called" svc -d postgres -v ON_ERROR_STOP=1 \
+        -c 'create function pg_temp.kingres_plpgsql_check() returns int language plpgsql as $$ begin return 42; end $$' \
+        -c 'select pg_temp.kingres_plpgsql_check()'
     check "${p}: create the scratch database ext_check" svc -d postgres -v ON_ERROR_STOP=1 -c 'create database ext_check'
     # kingres_shard first, as the product creates them; the other order is
     # checked below.
