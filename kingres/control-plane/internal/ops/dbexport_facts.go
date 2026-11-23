@@ -241,6 +241,10 @@ func readDBFacts(ctx context.Context, tx pgx.Tx) (*dbFacts, error) {
 		return nil, err
 	}
 	use := func(ext, rel string) (bool, error) {
+		if ext == extguard.Shard {
+			ok, err := f.shardUsable(ctx, tx)
+			return ok && hasTable(ctx, tx, rel), err
+		}
 		info, err := guard.Verify(ctx, ext)
 		if err != nil {
 			return false, err
@@ -307,12 +311,52 @@ func boolText(b bool, s string) string {
 	return ""
 }
 
+// shardUsable says whether the sharding extension is installed and its catalog can be read. The extension is created with the schema pg_catalog, so extguard
+// (which checks the schema of an extension) cannot decide about it; what is read is the relations of the schema kingres that the export reads, and each of them must
+// be a member of the extension that a superuser owns, in a schema that a superuser owns and that no other role can create objects in.
+func (f *dbFacts) shardUsable(ctx context.Context, tx pgx.Tx) (bool, error) {
+	var present, ownerSuper bool
+	if err := tx.QueryRow(ctx, `SELECT true, (SELECT rolsuper FROM pg_roles WHERE oid = e.extowner) FROM pg_extension e WHERE e.extname = 'kingres_shard'`).Scan(&present, &ownerSuper); err != nil {
+		if err == pgx.ErrNoRows {
+			return false, nil
+		}
+		return false, err
+	}
+	if !ownerSuper {
+		return false, &extguard.UntrustedError{Extension: extguard.Shard, Schema: "kingres", Reason: extguard.ReasonExtensionOwner, Detail: "the extension is not owned by a superuser"}
+	}
+	var create bool
+	var foreign *string
+	err := tx.QueryRow(ctx, `SELECT
+			EXISTS (SELECT 1 FROM pg_namespace n, aclexplode(coalesce(n.nspacl, acldefault('n', n.nspowner))) a
+			        WHERE n.nspname = 'kingres' AND a.privilege_type = 'CREATE' AND (a.grantee = 0 OR NOT EXISTS (SELECT 1 FROM pg_roles g WHERE g.oid = a.grantee AND g.rolsuper))),
+			(SELECT c.relname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+			 WHERE n.nspname = 'kingres' AND c.relname IN ('dist_table', 'colocation', 'bucket_map', 'dist_partition', 'dist_schema')
+			   AND NOT EXISTS (SELECT 1 FROM pg_depend d JOIN pg_extension m ON m.oid = d.refobjid JOIN pg_roles r ON r.oid = m.extowner
+			                   WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.objsubid = 0 AND d.refclassid = 'pg_extension'::regclass
+			                     AND d.deptype = 'e' AND m.extname = 'kingres_shard' AND r.rolsuper)
+			 LIMIT 1)`).Scan(&create, &foreign)
+	if err != nil {
+		return false, err
+	}
+	switch {
+	case create:
+		return false, &extguard.UntrustedError{Extension: extguard.Shard, Schema: "kingres", Reason: extguard.ReasonSchemaCreate, Detail: "a role that is not a superuser can create objects in the schema"}
+	case foreign != nil:
+		return false, &extguard.UntrustedError{Extension: extguard.Shard, Schema: "kingres", Reason: extguard.ReasonForeignObject, Detail: "a relation that is read is not a member of the extension"}
+	}
+	return true, nil
+}
+
 // checkFixedSchemas refuses a database that has a schema of the name of the control plane's own (kingres, kingres_transfer) that does not belong to it: the
 // schema kingres must be owned by a superuser (extguard decides about its objects when an extension is installed, and no object may be in it when none is), and
 // the schema kingres_transfer must be owned by the service role that makes it.
 func (f *dbFacts) checkFixedSchemas(ctx context.Context, tx pgx.Tx, g *extguard.Guard) error {
-	anyExt := false
-	for _, e := range extguard.All {
+	anyExt, err := f.shardUsable(ctx, tx)
+	if err != nil {
+		return err
+	}
+	for _, e := range []string{extguard.Ledger, extguard.Timepart, extguard.Columnar} {
 		info, err := g.Verify(ctx, e)
 		if err != nil {
 			return err
@@ -322,7 +366,7 @@ func (f *dbFacts) checkFixedSchemas(ctx context.Context, tx pgx.Tx, g *extguard.
 	var owner string
 	var super bool
 	var objects int
-	err := tx.QueryRow(ctx, `SELECT pg_get_userbyid(n.nspowner)::text, (SELECT rolsuper FROM pg_roles WHERE oid = n.nspowner),
+	err = tx.QueryRow(ctx, `SELECT pg_get_userbyid(n.nspowner)::text, (SELECT rolsuper FROM pg_roles WHERE oid = n.nspowner),
 			(SELECT count(*) FROM pg_class WHERE relnamespace = n.oid) + (SELECT count(*) FROM pg_proc WHERE pronamespace = n.oid) + (SELECT count(*) FROM pg_type WHERE typnamespace = n.oid)
 		FROM pg_namespace n WHERE n.nspname = 'kingres'`).Scan(&owner, &super, &objects)
 	switch {
