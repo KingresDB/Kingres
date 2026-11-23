@@ -243,6 +243,9 @@ type ClusterFacts struct {
 	ReplicaCount      int
 	GroupsNoPrimary   []int32
 	GroupsFewStandbys []int32
+	// GroupsLagging are the groups with a standby that is behind its primary by more than maxStandbyLagBytes (design 8.3: a group without
+	// a healthy standby), or whose lag cannot be read.
+	GroupsLagging []int32
 	// ServersNotLive are servers that are dead or suspect.
 	ServersNotLive []string
 	// ServerTaskUnfinished is true while a server.add, server.remove, replica-count or restore task is unfinished.
@@ -262,7 +265,7 @@ func SafetyBlockers(s AutoSettings, f ClusterFacts) []string {
 	if len(f.GroupsNoPrimary) > 0 {
 		out = append(out, RuleNoPrimary)
 	}
-	if f.ReplicaCount > 0 && len(f.GroupsFewStandbys) > 0 {
+	if f.ReplicaCount > 0 && (len(f.GroupsFewStandbys) > 0 || len(f.GroupsLagging) > 0) {
 		out = append(out, RuleDegraded)
 	}
 	if len(f.ServersNotLive) > 0 || f.ServerTaskUnfinished {
@@ -498,6 +501,9 @@ func (s *Service) clusterFacts(ctx context.Context, dbs []string, set AutoSettin
 	for _, c := range standbys {
 		f.ReplicaCount = max(f.ReplicaCount, c)
 	}
+	if f.ReplicaCount > 0 {
+		f.GroupsLagging = s.laggingGroups(ctx, primaries)
+	}
 	for _, n := range nodes {
 		if n.Role == "primary" && !primaries[n.Group] {
 			f.GroupsNoPrimary = append(f.GroupsNoPrimary, n.Group)
@@ -588,7 +594,7 @@ func ruleText(rule string) string {
 	case RuleFailover:
 		return "a failover is running or has just ended"
 	case RuleDegraded:
-		return "a shard group has fewer healthy standbys than the replica count"
+		return "a shard group has fewer healthy standbys than the replica count, or a standby lags too far behind"
 	case RuleNoPrimary:
 		return "a shard group has no primary"
 	case RuleServers:
@@ -641,4 +647,53 @@ func (s *Service) AutoStatus(ctx context.Context) *api.RebalanceAutomatic {
 		return nil
 	})
 	return out
+}
+
+// LaggingGroups are the groups whose lag is above max bytes (design 8.3, maxStandbyLagBytes), ascending. A group whose lag could not be
+// read has a negative value in lags and counts as lagging: what cannot be shown to be in step is not trusted. A lag of exactly max is
+// allowed.
+func LaggingGroups(lags map[int32]int64, max int64) []int32 {
+	var out []int32
+	for g, l := range lags {
+		if l < 0 || l > max {
+			out = append(out, g)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+// standbyLag is the lag of the standbys of the group behind its primary, in bytes, by the hook or the primary of the group.
+func (s *Service) standbyLag(ctx context.Context, group int32) (int64, error) {
+	if s.StandbyLag != nil {
+		return s.StandbyLag(ctx, group)
+	}
+	if s.Backend == nil {
+		return 0, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	return s.Backend.StandbyLag(ctx, group)
+}
+
+// laggingGroups reads the lag of every group with an active primary and returns the groups that exceed the limit of the cluster
+// settings. Nothing is asked when no standby is wanted.
+func (s *Service) laggingGroups(ctx context.Context, primaries map[int32]bool) []int32 {
+	limit := DefaultMaxStandbyLagBytes
+	_ = s.sys(ctx, func(c *pgx.Conn) error {
+		if set, err := ReadSettings(ctx, c); err == nil {
+			limit = set.MaxStandbyLagBytes
+		}
+		return nil
+	})
+	lags := map[int32]int64{}
+	for g := range primaries {
+		l, err := s.standbyLag(ctx, g)
+		if err != nil {
+			s.log().Warn("automatic rebalance: the lag of the standbys of a shard group cannot be read", "group", g, "error", err)
+			l = -1
+		}
+		lags[g] = l
+	}
+	return LaggingGroups(lags, limit)
 }

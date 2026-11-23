@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1078,4 +1079,31 @@ func (b *PG) maxCallWait() time.Duration {
 		return b.MaxCallWait
 	}
 	return guardMaxWait
+}
+
+// StandbyLag is the largest distance, in bytes of WAL, between the write position of the primary of the group and the position that
+// any of its connected standbys has replayed; 0 when none is connected (the missing standby is the business of the other rules). The
+// primary of the group answers, through the node call of the map group's connection.
+func (b *PG) StandbyLag(ctx context.Context, group int32) (int64, error) {
+	var res *string
+	err := b.with(ctx, sysdb.Database, func(c *pgx.Conn) error {
+		var node int32
+		if err := c.QueryRow(ctx, `SELECT kingres.internal_group_node($1)`, group).Scan(&node); err != nil {
+			return err
+		}
+		var err error
+		res, err = onNode(ctx, c, node, `SELECT coalesce(max(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)), 0)::bigint::text FROM pg_stat_replication`)
+		return err
+	})
+	if err != nil {
+		return 0, fmt.Errorf("asking the primary of shard group %d for the lag of its standbys: %w", group, err)
+	}
+	if res == nil {
+		return 0, nil
+	}
+	n, err := strconv.ParseInt(*res, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("the lag of shard group %d is not a number: %w", group, err)
+	}
+	return max(n, 0), nil
 }

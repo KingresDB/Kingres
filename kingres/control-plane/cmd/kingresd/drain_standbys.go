@@ -51,7 +51,13 @@ func wireStandbyRelocation(rbs *rebalance.Service, l *standby.Leader, o *ops.Ops
 		}
 		defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
 		set := read(ctx, c)
-		if !set[server] {
+		// The standby that a planned switchover of the map group made of the old leader (its former primary is rebuilt as a standby by the
+		// reconcile) is not taken out of the ring before it is ready: an instance that is still being rebuilt cannot be removed, only finished.
+		var rebuilding int
+		if err := c.QueryRow(ctx, `SELECT count(*)::int FROM kingres_cp.standby WHERE server_id = $1 AND group_id = 0 AND state <> 'ready'`, server).Scan(&rebuilding); err != nil {
+			return 0, err
+		}
+		if !set[server] && rebuilding == 0 {
 			set[server] = true
 			list := make([]string, 0, len(set))
 			for s := range set {
@@ -78,6 +84,6 @@ func wireStandbyRelocation(rbs *rebalance.Service, l *standby.Leader, o *ops.Ops
 				SELECT group_id, count(*) FILTER (WHERE role = 'standby' AND host <> $1) AS c FROM kingres.node GROUP BY group_id)
 			SELECT (SELECT count(*) FROM kingres.node WHERE host = $1 AND role = 'standby')::int
 			     + (SELECT count(*) FROM per WHERE c < (SELECT max(c) FROM per))::int`, server).Scan(&n)
-		return n, err
+		return n + rebuilding, err
 	}
 }

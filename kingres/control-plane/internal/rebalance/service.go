@@ -60,6 +60,15 @@ type Service struct {
 	// RelocateStandbys takes the server out of the ring of the standbys, asks for a reconcile and returns how many standbys the server
 	// still hosts. nil: the step is skipped.
 	RelocateStandbys func(ctx context.Context, server string) (int, error)
+	// HandOverMapGroup asks for the planned switchover of the map group (shard group 0) of the server to a standby on another server and
+	// returns once the failover task exists (or the problem that refuses it). nil: a server that hosts the map group primary is refused.
+	HandOverMapGroup func(ctx context.Context, actor, server string) error
+	// HostsMapGroup says whether the server runs the primary of group 0; nil reads the catalog.
+	HostsMapGroup func(ctx context.Context, server string) (bool, error)
+	// Handover keeps the marker of a hand-over in progress; nil keeps it in the system database.
+	Handover HandoverStore
+	// StandbyLag is the largest lag in bytes of the standbys of a group behind its primary; nil asks the primary of the group.
+	StandbyLag func(ctx context.Context, group int32) (int64, error)
 	// DrainWait bounds the wait for the server to own no bucket (default 30 minutes).
 	DrainWait time.Duration
 	// DrainPoll is the pause between two looks at a drain (default 3 s).
@@ -103,6 +112,7 @@ func (s *Service) Definitions() []task.Definition {
 			step(StepPlan, s.stepPlan),
 			step(StepMove, s.stepMove),
 			step(StepDrainEmpty, s.stepDrainEmpty),
+			step(StepDrainMapGroup, s.stepDrainMapGroup),
 			step(StepDrainStandbys, s.stepDrainStandbys),
 			step(StepWrite, s.stepWrite),
 			step(StepDrainEnd, s.stepDrainEnd),
