@@ -11,6 +11,8 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -132,6 +134,21 @@ func (e *env) clear(t *testing.T, db string) { exec(t, e.tenant[db], "TRUNCATE t
 
 func TestSchemaSpoofIsNeverExecuted(t *testing.T) {
 	in := pgtest.Start(t, nil)
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		files, _ := filepath.Glob(filepath.Join(in.Root, "1", "pgdata", "log", "*"))
+		for _, f := range files {
+			if b, err := os.ReadFile(f); err == nil {
+				lines := strings.Split(string(b), "\n")
+				if len(lines) > 40 {
+					lines = lines[len(lines)-40:]
+				}
+				t.Logf("the log of the server (%s):\n%s", filepath.Base(f), strings.Join(lines, "\n"))
+			}
+		}
+	})
 	ctx := context.Background()
 	admin := in.Connect(t, "postgres")
 	e := &env{in: in, admin: admin, tenant: map[string]*pgx.Conn{}}
