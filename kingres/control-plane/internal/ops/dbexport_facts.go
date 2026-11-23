@@ -142,7 +142,7 @@ func readDBFacts(ctx context.Context, tx pgx.Tx) (*dbFacts, error) {
 		return nil, err
 	}
 	f := &dbFacts{byOID: map[int64]*dbTable{}, Colocs: map[int]*dbColoc{}, UserPart: map[int64][]dbPartition{}, PartKey: map[int64]string{}, Buckets: map[int64]bool{}, Hash: map[string]dumpnorm.HashTable{}}
-	if err := tx.QueryRow(ctx, `SELECT pg_encoding_to_char(encoding), datcollate, datctype, CASE datlocprovider WHEN 'c' THEN 'builtin' WHEN 'i' THEN 'icu' ELSE 'libc' END,
+	if err := tx.QueryRow(ctx, `SELECT pg_encoding_to_char(encoding), datcollate, datctype, CASE datlocprovider WHEN 'c' THEN 'libc' WHEN 'b' THEN 'builtin' WHEN 'i' THEN 'icu' ELSE 'libc' END,
 			(current_setting('server_version_num')::int / 10000)
 		FROM pg_database WHERE datname = current_database()`).Scan(&f.Encoding, &f.Collate, &f.Ctype, &f.Provider, &f.PGMajor); err != nil {
 		return nil, err

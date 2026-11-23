@@ -105,7 +105,10 @@ func tableTrusted(ctx context.Context, tx pgx.Tx, schema, table, owner string, e
 	var kind *string
 	var ownerOK, trig, rule, pol, rls bool
 	err := tx.QueryRow(ctx, `SELECT c.relkind::pg_catalog.text, pg_catalog.pg_get_userbyid(c.relowner) = $3::pg_catalog.text,
-			EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t WHERE t.tgrelid = c.oid AND NOT t.tgisinternal),
+			EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t WHERE t.tgrelid = c.oid AND NOT t.tgisinternal
+			        AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d3 JOIN pg_catalog.pg_extension e3 ON e3.oid = d3.refobjid
+			                        WHERE d3.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass AND d3.objid = t.tgfoid AND d3.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass
+			                          AND d3.deptype = 'e' AND e3.extname = 'kingres_ledger' AND pg_catalog.pg_get_userbyid(e3.extowner) IN (SELECT rolname FROM pg_catalog.pg_roles WHERE rolsuper))),
 			EXISTS (SELECT 1 FROM pg_catalog.pg_rewrite r WHERE r.ev_class = c.oid),
 			EXISTS (SELECT 1 FROM pg_catalog.pg_policy p WHERE p.polrelid = c.oid), c.relrowsecurity
 		FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::pg_catalog.text AND c.relname = $2::pg_catalog.text`,
@@ -152,7 +155,7 @@ func tableTrusted(ctx context.Context, tx pgx.Tx, schema, table, owner string, e
 
 // untrustedError is the task error for a table that the service role may not touch.
 func untrustedError(err error) error {
-	return transfer.Errorf(transfer.CodeTableNotEligible, false, "the service role does not touch a table that the importing role made unless the catalog shows that it holds no code (%s)", firstSentence(err))
+	return transfer.Errorf(transfer.CodeTableNotEligible, false, "the service role does not touch a table that the importing role made unless the catalog shows that it holds no code (%s)", safeSentence(err.Error()))
 }
 
 // serviceConnFor opens a service connection to the private database with the search path pinned.
@@ -474,7 +477,7 @@ func (o *Ops) importSequencesLocal(ctx context.Context, op importSeqOp) error {
 			return errors.New("a sequence name is not valid")
 		}
 		// Only a sequence (relkind S) is touched; nothing that the role could have put under that name in another kind is read.
-		if _, err := c.Exec(ctx, `SELECT pg_catalog.setval(c.oid, pg_catalog.greatest($3::pg_catalog.int8, coalesce(pg_catalog.pg_sequence_last_value(c.oid), 0)), true)
+		if _, err := c.Exec(ctx, `SELECT pg_catalog.setval(c.oid, GREATEST($3::pg_catalog.int8, coalesce(pg_catalog.pg_sequence_last_value(c.oid), 0)), true)
 			FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::pg_catalog.text AND c.relname = $2::pg_catalog.text AND c.relkind = 'S'`,
 			it.Schema, it.Name, it.Value); err != nil {
 			return err
@@ -921,4 +924,22 @@ func sortedSet(m map[string]bool) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// safeSentence bounds and cleans a sentence that holds names from the catalog before it is put in a message.
+func safeSentence(s string) string {
+	var b strings.Builder
+	n := 0
+	for _, r := range s {
+		if n >= 240 {
+			b.WriteString("...")
+			break
+		}
+		if r < 0x20 || r > 0x7e {
+			r = '?'
+		}
+		b.WriteRune(r)
+		n++
+	}
+	return b.String()
 }

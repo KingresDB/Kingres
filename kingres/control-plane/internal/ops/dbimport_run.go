@@ -193,7 +193,7 @@ func (o *Ops) importAccessLocal(ctx context.Context, op importAccessOp) error {
 	if op.Allow {
 		priv := "CONNECT"
 		if op.Full {
-			priv = "CONNECT, CREATE"
+			priv = "CONNECT, CREATE, TEMPORARY"
 		}
 		if err := run(ctx, c, stmt().Text("GRANT").Text(sqlx.Fixed(priv)).Text("ON DATABASE").ID(db).Text("TO").ID(role)); err != nil {
 			return err
@@ -388,6 +388,18 @@ func (o *Ops) loadTable(ctx context.Context, conn *pgx.Conn, env *task.Env, a *a
 	defer func() { _ = er.Close() }()
 	csv := transfer.CSV{Delimiter: ",", Quote: `"`, NullString: `\N`, Encoding: "UTF8"}.Fill()
 	sc := transfer.NewScanner(&countReader{r: er, n: read, note: note, next: 16 << 20}, csv.QuoteByte())
+	schema, table, ok := splitQualified(me.Table)
+	if !ok {
+		return 0, transfer.Errorf(transfer.CodeArchiveInvalid, false, "a table name is not valid")
+	}
+	// A reference table is written from typed arrays: the check of its columns is made before the transaction (it has a transaction of its own).
+	var refCols, refTypes []string
+	if ct.Kind == "reference" {
+		var terr error
+		if refCols, refTypes, terr = o.importTarget(ctx, conn, schema, table, me.Columns, "reference"); terr != nil {
+			return 0, transfer.Errorf(transfer.CodeTableNotEligible, false, "the reference table %s cannot take the load", me.Table)
+		}
+	}
 	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return 0, transfer.SafeError(err)
@@ -403,17 +415,9 @@ func (o *Ops) loadTable(ctx context.Context, conn *pgx.Conn, env *task.Env, a *a
 			return 0, transfer.SafeError(err)
 		}
 	}
-	schema, table, ok := splitQualified(me.Table)
-	if !ok {
-		return 0, transfer.Errorf(transfer.CodeArchiveInvalid, false, "a table name is not valid")
-	}
 	var rows int64
 	if ct.Kind == "reference" {
-		cols, types, terr := o.importTarget(ctx, conn, schema, table, me.Columns, "reference")
-		if terr != nil {
-			return 0, transfer.Errorf(transfer.CodeTableNotEligible, false, "the reference table %s cannot take the load", me.Table)
-		}
-		ip := importParams{Schema: schema, Table: table, Columns: cols, ColumnTypes: types, CSV: csv, Header: transfer.HeaderSkip, SkipBOM: false, Reference: true}
+		ip := importParams{Schema: schema, Table: table, Columns: refCols, ColumnTypes: refTypes, CSV: csv, Header: transfer.HeaderSkip, SkipBOM: false, Reference: true}
 		rows, err = o.loadReference(ctx, tx, ip, sc, sc)
 	} else {
 		sql, serr := transfer.ArchiveCopyFromSQL(schema, table, me.Columns)

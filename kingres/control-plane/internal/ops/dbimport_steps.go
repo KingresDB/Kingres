@@ -90,14 +90,23 @@ func (o *Ops) stepIMCheck(ctx context.Context, env *task.Env) error {
 	for _, ct := range res.Catalog.Tables {
 		cat[ct.Qualified()] = true
 	}
+	// The user's partitions of a distributed table are written by the exporter as tables of the parent's schema; the catalog names them in the parent.
+	userPart := map[string]bool{}
+	for _, ct := range res.Catalog.Tables {
+		if ct.UserPartitioning != nil {
+			for _, up := range ct.UserPartitioning.Partitions {
+				userPart[ct.Schema+"."+up.Name] = true
+			}
+		}
+	}
 	for n := range plan.Tables {
-		if !cat[n] {
-			return transfer.Errorf(transfer.CodeArchiveInvalid, false, "the SQL files create a table that the catalog does not list")
+		if !cat[n] && !userPart[n] {
+			return transfer.Errorf(transfer.CodeArchiveInvalid, false, "the SQL files create a table that the catalog does not list (%s)", safeName(n))
 		}
 	}
 	for n := range cat {
 		if !plan.Tables[n] {
-			return transfer.Errorf(transfer.CodeArchiveInvalid, false, "the catalog lists a table that the SQL files do not create")
+			return transfer.Errorf(transfer.CodeArchiveInvalid, false, "the catalog lists a table that the SQL files do not create (%s)", safeName(n))
 		}
 	}
 	if plan.Statements > sqlshapeMaxTotal {
