@@ -398,6 +398,7 @@ None.
 - `ProblemCode` has `export_not_readable`, `large_objects_present`, `schema_unrecognised`, `archive_invalid` and `archive_incompatible`; `schema_changed` is a code of a failed task.
 - `TaskKind` has `database.export` and `archive.validate`; `AuditAction` has `exportDatabase` and `validateDatabaseArchive`.
 - Schemas: `ExportDatabaseRequest` (closed), `ArchiveReport`.
+- `AlertKind` has `extensionSchemaUntrusted` (`critical`; subject `server:<id>|database:<name>`): the schema of a KingresDB extension in a database is owned by a role that is not a superuser, holds an object that is not a member of an extension, or lets a role that is not a superuser create objects in it. The control plane then reads and calls nothing in that schema, and the operations that need the extension, the database export among them, are refused.
 
 #### Documentation
 

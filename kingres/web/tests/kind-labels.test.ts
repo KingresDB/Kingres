@@ -25,7 +25,7 @@ describe('labels', () => {
     // ledgerDigestOverdue: 38.
     // 0.13.0 added certificateAuthorityUnavailable: 39.
     // 0.15.0 added rebalanceFailed: 40; 0.17.0 added partitionsAheadLow and partitionPolicyFailed: 42.
-    expect(Object.keys(ALERT_KIND_LABEL)).toHaveLength(43)
+    expect(Object.keys(ALERT_KIND_LABEL)).toHaveLength(44)
     // 18 in 0.4.0, plus the two certificate kinds (0.5.0), standby.reconcile (0.7.0), config.apply and config.restart (0.8.0).
     // 0.11.0 added eight: ledger.key.create, .rotate, .retire, .revoke, .distribute, ledger.bundle.create, ledger.epoch.start
     // and ledger.upgrade: 31.

@@ -262,6 +262,7 @@ export const ALERT_KIND_LABEL: Record<AlertKind, string> = {
   partitionsAheadLow: 'Partitions ahead are running low',
   partitionPolicyFailed: 'A partitioning policy failed',
   transferStagingLow: 'The staging area of the data transfer is nearly full',
+  extensionSchemaUntrusted: 'The schema of a KingresDB extension cannot be trusted',
 }
 
 /** The label of an alert kind; a kind from a newer server is shown as sent (through SafeName). */
