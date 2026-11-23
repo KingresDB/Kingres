@@ -53,10 +53,16 @@ Verification of the fixes: unit and PostgreSQL tests of `internal/rebalance` (wh
 
 Verification of the fixes: unit and PostgreSQL tests of `internal/rebalance` (whole package, PostgreSQL 18 and 19.0), `cmd/kingresd` (hook), console (vitest of the touched file and of the servers pages, `npm run api:check`, eslint, prettier, `vue-tsc`), the five cluster tests on both majors. 16 more mutants, all killed (a lagging row of one evaluation, no `requesting` record, no audit event, a young marker that asks again, the attempt ignored, readiness without the ended failover, the marker of any task cleared, no `force`, streak of one, factor of one, a hook that ignores an unfinished failover, sequential reads, a query without the physical filter, with backups, without the unreadable case, `onFail` that keeps the marker). One cluster run of `TestDrainHandsOverTheMapGroup` on PostgreSQL 19.0 ran into its 25 minute bound (the drain did not end under the new leader) and its log was not kept; six later runs on 19.0 and two on 18 passed. The test now prints the task, the rebalance status and the log of the new leader when it fails, so that the next occurrence can be read; the cause is not known.
 
+### Closing items before gate2 (2026-11-24)
+
+- The timeout of `TestDrainHandsOverTheMapGroup` on PostgreSQL 19.0: ten more runs on 19.0 (nine passed; the tenth stopped in the formation of the cluster, where the standbys were not streaming after three minutes, before any drain began, under the load of the gate) and five on 18 (all passed); a second formation stop on 19.0 hit the death test the same way and its rerun passed. The L5 suspicion was reasoned through: the five states of the CHECK, which are written, and how the former primary of group 0 passes through them (design section 23). It does not leave a state other than the ones that are waited for; the cause of the one timeout stays unknown.
+- A manual start is refused with `group_degraded` while a standby lags by more than the limit, unless `RebalanceOptions.force` (contract 0.21.0, additive): `Service.manualLagGate`, unit and PostgreSQL tests, the cluster test `TestManualRebalanceRefusesAStandbyThatLagsUnlessForced`.
+- A drain whose server dies while the map group is handed over: cluster test `TestDrainWhoseServerDiesWhileTheMapGroupIsHandedOver` (fault point `drain:handover` holds the request after the marker says `requesting`; kingresd and the instances are killed by pid; the map group is failed over by an operator). It found that step 5 waited its whole bound (30 minutes) for a dead server: step 5 now fails at once with `node_state_invalid` when the server is dead. The drain ends failed on the new leader, the marker is gone and the rebalance lock is free.
+- The tests wait for the first rebalance to be idle before they start a drain (a report can exist before its task ends).
+
 ### Still open
 
-- The manual start of a rebalance does not refuse a lagging group (section 8.3 marks it (M)).
-- The console: the mock of the drain task and the drain dialog do not know the new step or the paused state yet.
+- The cause of the one timeout of the cluster test on PostgreSQL 19.0 is unknown (it did not happen again in 14 runs); the test now prints what is needed to read it.
 - The number 0.21.0 is a placeholder and must be renumbered when the branch is merged.
 
 ---
