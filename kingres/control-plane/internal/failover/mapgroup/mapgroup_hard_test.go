@@ -287,3 +287,28 @@ func TestAHardFailoverRanksTheStandbyTheRequestNamed(t *testing.T) {
 		t.Fatalf("%+v %v\n%s", res, err, strings.Join(w.log, "\n"))
 	}
 }
+
+// M3. A group 0 row that is not there to be marked is a pause with an alert and an event, not a bootstrap that goes on as if the task were finished.
+func TestAMissingRowOfTheOldLeadersTaskPausesTheBootstrap(t *testing.T) {
+	w := hardWorld()
+	w.plannedErr = ErrNoPlannedRow
+	r, js := w.runner(t)
+	_, err := r.Run(context.Background(), hardRequest())
+	var pe *failover.PauseError
+	if !errors.As(err, &pe) {
+		t.Fatalf("want a pause: %v", err)
+	}
+	if len(w.alerts) == 0 || w.alerts[len(w.alerts)-1] != "failoverNeedsDecision" {
+		t.Fatalf("alerts %v", w.alerts)
+	}
+	cur, _ := js.Current()
+	found := false
+	for _, e := range cur.Events {
+		if e.Kind == "plannedRowMissing" {
+			found = true
+		}
+	}
+	if !found || cur.Recorded {
+		t.Fatalf("event %v recorded %v", found, cur.Recorded)
+	}
+}

@@ -975,11 +975,14 @@ func (p *mapPorts) RecordPlanned(ctx context.Context, taskID, termAfter, timelin
 	if pin != nil {
 		chosen, node, server = &pin.StandbyID, ptrInt32(pin.Node), &pin.Server
 	}
-	_, err = c.Exec(ctx, `UPDATE kingres_cp.failover_group
+	tag, err := c.Exec(ctx, `UPDATE kingres_cp.failover_group
 		SET state = 'promoted', term_after = $2, timeline = CASE WHEN $3 > 0 THEN $3 ELSE timeline END, promoted_at = COALESCE(promoted_at, now()),
 		    chosen_standby_id = COALESCE(chosen_standby_id, $4), new_server = COALESCE(new_server, $5), new_node_id = COALESCE(new_node_id, $6::int),
 		    data_loss = CASE WHEN chosen_standby_id IS NULL AND $7::jsonb IS NOT NULL THEN $7::jsonb ELSE data_loss END
 		WHERE task_id = $1 AND group_id = 0 AND state IN ('pending', 'frozen', 'fenced', 'pinned', 'promoted')`, taskID, termAfter, timeline, chosen, server, node, nullJSON(dataLoss))
+	if err == nil && tag.RowsAffected() == 0 {
+		return mapgroup.ErrNoPlannedRow
+	}
 	return err
 }
 

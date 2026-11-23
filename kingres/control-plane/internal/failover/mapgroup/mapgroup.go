@@ -93,6 +93,9 @@ type Request struct {
 	Planned *journal.Planned
 }
 
+// ErrNoPlannedRow is what RecordPlanned answers when the group 0 row of the old leader's task is not there to be marked.
+var ErrNoPlannedRow = errors.New("mapgroup: the group 0 row of the task is not in the system database")
+
 // Result says how the run ended when it did not fail.
 type Result struct {
 	// HandedTo is the server the bootstrap was handed over to at B4 (another candidate is better); empty when this server
@@ -794,7 +797,13 @@ func (r *Runner) makeLeader(ctx context.Context, j journal.Journal) (bool, error
 				}
 				dl, _ = json.Marshal(v)
 			}
-			if err := r.P.RecordPlanned(ctx, id, term, timeline, pin, dl); err != nil {
+			if err := r.P.RecordPlanned(ctx, id, term, timeline, pin, dl); errors.Is(err, ErrNoPlannedRow) {
+				// M3: the row of the old leader's task is not in the system database this server promoted (the task was never replicated, or was removed): nothing may be
+				// claimed on it, and the operator has to know.
+				r.P.Alert(ctx, "failoverNeedsDecision", "critical", "group:0", "The map group was promoted, but the task "+strconv.FormatInt(id, 10)+" of the old leader has no row for it in the new leader's system database.", true)
+				_ = r.Journal.Event(journal.StepLeader, "plannedRowMissing", map[string]any{"task": id, "pin": pin != nil, "verdict": string(dl)})
+				return false, &failover.PauseError{Reason: "the map group was promoted, but the row of the old leader's task is missing in the new system database; read the journal events, then repeat the request"}
+			} else if err != nil {
 				return false, fmt.Errorf("marking the map group of the task promoted: %w", err)
 			}
 		} else {

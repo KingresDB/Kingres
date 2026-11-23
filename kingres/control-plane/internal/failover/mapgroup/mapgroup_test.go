@@ -53,7 +53,8 @@ type world struct {
 	noCA                      bool
 	plannedPins               []*journal.Pin
 	plannedDL                 [][]byte
-	fenceRefusals             int // the fence lease is refused this many times (the old leader still holds it)
+	fenceRefusals             int   // the fence lease is refused this many times (the old leader still holds it)
+	plannedErr                error // RecordPlanned answers this
 }
 
 func newWorld() *world {
@@ -685,6 +686,9 @@ func (p ports) RecordPlanned(_ context.Context, taskID, termAfter, timeline int6
 	p.w.plannedPins = append(p.w.plannedPins, pin)
 	p.w.plannedDL = append(p.w.plannedDL, dl)
 	p.w.mu.Unlock()
+	if p.w.plannedErr != nil {
+		return p.w.plannedErr
+	}
 	return nil
 }
 
