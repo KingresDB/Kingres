@@ -31,6 +31,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/jackc/pgx/v5"
@@ -114,11 +115,29 @@ func IsUntrusted(err error) (*UntrustedError, bool) {
 // verifySQL runs the four checks for the extensions named in $1. One row per extension that has a pg_extension row. A member is an object with an 'e'
 // dependency on an extension that a superuser owns; indexes, TOAST tables and the types that belong to a relation or an array are parts of their relation and
 // are not looked at on their own.
-const verifySQL = `
+const verifySQL = verifyHead + verifyTail
+
+// verifyHead selects the extensions named in $1 (the CTE e). preInstallHead selects a schema named in $1 that an extension is about to be created in, as a
+// kingres_shard is created with SCHEMA pg_catalog and its script makes the schema kingres: that schema is the one it populates, and pg_catalog is never searched
+// for foreign objects (it holds the objects of PostgreSQL itself).
+// row with no extension (owned by a superuser, so that only the checks of the schema remain). Both go with verifyTail.
+const verifyHead = `
 WITH e AS (
-  SELECT x.oid, x.extname, x.extversion, x.extowner, x.extnamespace
+  SELECT x.oid, x.extname, x.extversion, x.extowner,
+         CASE WHEN x.extnamespace = 'pg_catalog'::pg_catalog.regnamespace AND x.extname = 'kingres_shard'
+              THEN COALESCE((SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = 'kingres'), x.extnamespace)
+              ELSE x.extnamespace END AS extnamespace
     FROM pg_catalog.pg_extension x
-   WHERE x.extname = ANY ($1::pg_catalog.text[])
+   WHERE x.extname = ANY ($1::pg_catalog.text[])`
+
+const preInstallHead = `
+WITH e AS (
+  SELECT 0::pg_catalog.oid AS oid, 'install'::pg_catalog.text AS extname, ''::pg_catalog.text AS extversion,
+         (SELECT r.oid FROM pg_catalog.pg_roles r WHERE r.rolsuper ORDER BY r.oid LIMIT 1) AS extowner, n.oid AS extnamespace
+    FROM pg_catalog.pg_namespace n
+   WHERE n.nspname = $1::pg_catalog.text`
+
+const verifyTail = `
 ), ns AS (
   SELECT e.extname, n.oid AS nsoid, n.nspname, n.nspowner, n.nspacl
     FROM e JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace
@@ -323,3 +342,104 @@ func (g *Guard) Usable(ctx context.Context, ext string) (bool, error) {
 
 // querySQL is the statement that VerifyAll runs; the tests replace it to show that each check is needed (mutants).
 var querySQL = verifySQL
+
+// ObjectExtension names the extension that defines an object of the schema kingres, from its name with or without the schema ("kingres.ledger_blocks",
+// "timepart_policy"): the ledger objects are ledger_*, the time partitioning ones timepart_* and the two functions create_time_partitions and
+// drop_old_time_partitions, the columnar ones columnar_*; everything else is the sharding extension's.
+func ObjectExtension(name string) string {
+	name = strings.TrimPrefix(name, "kingres.")
+	switch {
+	case strings.HasPrefix(name, "ledger_"):
+		return Ledger
+	case strings.HasPrefix(name, "timepart_"), name == "create_time_partitions", name == "drop_old_time_partitions":
+		return Timepart
+	case strings.HasPrefix(name, "columnar_"):
+		return Columnar
+	}
+	return Shard
+}
+
+// preInstallSQL is the statement of PreInstall; the tests replace it (mutants).
+var preInstallSQL = preInstallHead + verifyTail
+
+// PreInstall is the check before CREATE EXTENSION or ALTER EXTENSION UPDATE: the schema that the extension is created in must not exist, or must be owned by a
+// superuser, grant CREATE to no role that is not a superuser and hold nothing but members of extensions owned by a superuser. A schema that a tenant made in
+// advance would otherwise become the schema of the extension (a control file with "schema = ..." uses an existing schema), and the tenant would own what the
+// service role runs. The result is an *UntrustedError (with Extension set to ext) or nil; a schema that does not exist is nil.
+func PreInstall(ctx context.Context, q Querier, ext, schema string) error {
+	rows, err := q.Query(ctx, preInstallSQL, schema)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.Name, &r.Version, &r.Schema, &r.ExtOwnerSuper, &r.SchemaOwnerSuper, &r.CreateGrant, &r.Foreign, &r.FirstForeign); err != nil {
+			return err
+		}
+		r.Name = ext
+		if _, err := classify(r); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+// ExtensionSchema returns the schema that the control file of the extension names ("schema = ..."), as pg_available_extension_versions shows it, for the
+// default version: "" when the extension is not available or the control file names none (the install script then makes its own schema, which PreInstall of
+// the name "kingres" covers for kingres_shard).
+func ExtensionSchema(ctx context.Context, q Querier, ext string) (string, error) {
+	rows, err := q.Query(ctx, `SELECT coalesce(v.schema, '') FROM pg_catalog.pg_available_extension_versions v
+		JOIN pg_catalog.pg_available_extensions a ON a.name = v.name AND a.default_version = v.version WHERE v.name = $1`, ext)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	var s string
+	for rows.Next() {
+		if err := rows.Scan(&s); err != nil {
+			return "", err
+		}
+	}
+	return s, rows.Err()
+}
+
+// PreInstallExtension runs PreInstall for the schema that ext is created in (its control file's schema; the install script of kingres_shard makes "kingres"
+// itself, so that is its schema).
+func PreInstallExtension(ctx context.Context, q Querier, ext string) error {
+	s, err := ExtensionSchema(ctx, q, ext)
+	if err != nil {
+		return err
+	}
+	if s == "" && ext == Shard {
+		s = "kingres"
+	}
+	if s == "" {
+		return nil
+	}
+	return PreInstall(ctx, q, ext, s)
+}
+
+// IsKingres reports whether name is one of the extensions of KingresDB (All). The other extensions of a database (pgcrypto, hstore, ...) live in schemas that
+// the tenant may own and that the control plane never reads, so they are not subject to the checks.
+func IsKingres(name string) bool {
+	for _, n := range All {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
+// StatusSQL is a statement without parameters for the places that can only send text (a read-only statement run on another server): it returns no row when
+// the extension is absent and one row (extversion, reason) otherwise, with reason "" for a trusted extension and the Reason of the first failed check
+// for an untrusted one. ext must be one of All.
+func StatusSQL(ext string) (string, error) {
+	if !IsKingres(ext) {
+		return "", fmt.Errorf("extguard: %q is not an extension of KingresDB", ext)
+	}
+	inner := strings.Replace(verifySQL, "$1::pg_catalog.text[]", "ARRAY['"+ext+"']::pg_catalog.text[]", 1)
+	return `SELECT v.extversion, CASE WHEN NOT v.eo THEN '` + string(ReasonExtensionOwner) + `' WHEN NOT v.so THEN '` + string(ReasonSchemaOwner) +
+		`' WHEN v.cg THEN '` + string(ReasonSchemaCreate) + `' WHEN v.fc > 0 THEN '` + string(ReasonForeignObject) + `' ELSE '' END
+  FROM (` + inner + `) AS v(extname, extversion, nspname, eo, so, cg, fc, ff)`, nil
+}

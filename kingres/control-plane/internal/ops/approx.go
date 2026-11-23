@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/peerclient"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
@@ -356,7 +357,18 @@ func (o *Ops) getServerStates(ctx context.Context, db string) (serverStates, err
 			all = append(all, seen{id: s.ID, down: true})
 			continue
 		}
-		rows, err := o.Remote.Query(ctx, s.ID, db, "SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'kingres_sketch'")
+		// extguard's check (version and the reason it cannot be trusted, if any), not the name alone.
+		statusSQL, err := extguard.StatusSQL(ExtSketch)
+		if err != nil {
+			return out, err
+		}
+		rows, err := o.Remote.Query(ctx, s.ID, db, statusSQL)
+		if err == nil && len(rows) > 0 && len(rows[0]) > 1 {
+			if reason, _ := rows[0][1].(string); reason != "" {
+				return out, problem.New(problem.Conflict, "The schema of "+ExtSketch+" in this database on server "+s.ID+" cannot be trusted ("+reason+
+					"); nothing in it is read or called. An operator must restore it (see the alert extensionSchemaUntrusted).")
+			}
+		}
 		switch {
 		case err != nil && !errors.Is(err, peerclient.ErrUnreachable) && !isRemoteRefusal(err):
 			return out, err

@@ -196,6 +196,9 @@ func (s *Store) addPartitioning(ctx context.Context, h *dbHandle, ts []api.Table
 	if len(ts) == 0 {
 		return
 	}
+	if ok, err := s.regclassExists(ctx, h.pool, "kingres.dist_table"); err != nil || !ok {
+		return
+	}
 	var has bool
 	if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'kingres.dist_table'::regclass AND attname = 'partition_method' AND NOT attisdropped)`).Scan(&has); err != nil || !has {
 		return

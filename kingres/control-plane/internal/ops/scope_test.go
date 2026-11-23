@@ -113,6 +113,9 @@ func TestOtherGroupsReadsTheShardCatalog(t *testing.T) {
 		"CREATE SCHEMA kingres",
 		"CREATE TABLE kingres.node (node_id int PRIMARY KEY, group_id int NOT NULL)",
 		"INSERT INTO kingres.node VALUES (1, 0), (2, 0), (3, 1), (4, 2)",
+		// The control plane reads the schema kingres only when it belongs to an extension of a superuser (extguard): record the extension and make the table a member.
+		"INSERT INTO pg_catalog.pg_extension (oid, extname, extowner, extnamespace, extrelocatable, extversion) SELECT pg_catalog.pg_nextoid('pg_catalog.pg_extension'::pg_catalog.regclass, 'oid', 'pg_catalog.pg_extension_oid_index'::pg_catalog.regclass), 'kingres_shard', (SELECT r.oid FROM pg_catalog.pg_roles r WHERE r.rolname = current_user), 'kingres'::pg_catalog.regnamespace, false, '0.9'",
+		"INSERT INTO pg_catalog.pg_depend SELECT 'pg_catalog.pg_class'::pg_catalog.regclass, c.oid, 0, 'pg_catalog.pg_extension'::pg_catalog.regclass, e.oid, 0, 'e' FROM pg_catalog.pg_class c, pg_catalog.pg_extension e WHERE c.oid = 'kingres.node'::pg_catalog.regclass AND e.extname = 'kingres_shard'",
 	} {
 		if _, err := c.Exec(ctx, sql); err != nil {
 			t.Fatal(err)

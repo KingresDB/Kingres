@@ -424,7 +424,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		var err error
 		engineOnce.Do(func() {
 			var pool *pgxpool.Pool
-			if pool, err = pgxpool.New(bgCtx, dsn); err != nil {
+			if pool, err = cluster.NewSafePool(bgCtx, dsn); err != nil {
 				return
 			}
 			engSwap = newSwapDB(pool, dsn)

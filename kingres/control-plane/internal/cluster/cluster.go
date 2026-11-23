@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fault"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/instance"
@@ -446,3 +447,13 @@ func safeServiceSession(cfg *pgx.ConnConfig) {
 // pgx.ParseConfig and pgxpool.ParseConfig of the service role calls it before the connection is made, for a pool as SafeSession(cfg.ConnConfig): a database
 // owner can run ALTER DATABASE ... SET search_path, and a session that took it would run the function or the operator of the owner as a superuser.
 func SafeSession(cfg *pgx.ConnConfig) { safeServiceSession(cfg) }
+
+// NewSafePool opens a pool of the service role to dsn with SafeSession applied (pgxpool.New does not let a caller change the startup parameters).
+func NewSafePool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	SafeSession(cfg.ConnConfig)
+	return pgxpool.NewWithConfig(ctx, cfg)
+}

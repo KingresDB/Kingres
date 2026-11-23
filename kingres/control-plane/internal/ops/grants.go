@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sqlx"
 )
@@ -136,8 +137,13 @@ func checkLedgerRule(ctx context.Context, x execer, req api.GrantRequest) error 
 	if !risky {
 		return nil
 	}
+	// The extension first (extguard): a schema that cannot be trusted is a refusal, since the ledger mode of the table cannot be known.
+	info, err := extPresent(ctx, x, extguard.Ledger)
+	if err != nil || !info.Present {
+		return err
+	}
 	var has bool
-	if err := x.QueryRow(ctx, "SELECT to_regclass('kingres.ledger_table') IS NOT NULL").Scan(&has); err != nil || !has {
+	if err := x.QueryRow(ctx, "SELECT pg_catalog.to_regclass('kingres.ledger_table') IS NOT NULL").Scan(&has); err != nil || !has {
 		return err
 	}
 	qn, err := sqlx.QualifiedIdent(req.Schema, req.Table)
@@ -223,8 +229,14 @@ func (o *Ops) applyTemplateLocal(ctx context.Context, actor string, req api.Gran
 		}
 		write := req.Template == "readWrite"
 		var hasLedger bool
-		if err := tx.QueryRow(ctx, "SELECT to_regclass('kingres.ledger_table') IS NOT NULL").Scan(&hasLedger); err != nil {
+		linfo, err := extPresent(ctx, tx, extguard.Ledger)
+		if err != nil {
 			return err
+		}
+		if linfo.Present {
+			if err := tx.QueryRow(ctx, "SELECT pg_catalog.to_regclass('kingres.ledger_table') IS NOT NULL").Scan(&hasLedger); err != nil {
+				return err
+			}
 		}
 		for _, sn := range schemas {
 			s, err := sqlx.NewIdent(sn)
@@ -294,7 +306,10 @@ func (o *Ops) applyTemplateLocal(ctx context.Context, actor string, req api.Gran
 func (o *Ops) sharded(ctx context.Context, db string) bool {
 	var yes bool
 	err := o.asService(ctx, db, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'kingres_shard')").Scan(&yes)
+		// extguard, not the name alone: an extension whose schema cannot be trusted does not propagate anything the service role may rely on.
+		info, err := extguard.Verify(ctx, tx, extguard.Shard)
+		yes = err == nil && info.Present
+		return nil
 	})
 	return err == nil && yes
 }

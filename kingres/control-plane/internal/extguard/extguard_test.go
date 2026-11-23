@@ -323,7 +323,7 @@ func TestMutantsAreKilled(t *testing.T) {
 			"ALTER SCHEMA kingres_sketch OWNER TO tenant", "ALTER SCHEMA kingres_sketch OWNER TO kingresd", ReasonSchemaOwner},
 		{"CREATE of a role not checked", "a.privilege_type = 'CREATE'", "a.privilege_type = 'NOPE'",
 			"GRANT CREATE ON SCHEMA kingres_sketch TO tenant", "REVOKE CREATE ON SCHEMA kingres_sketch FROM tenant", ReasonSchemaCreate},
-		{"CREATE of PUBLIC not checked", "a.grantee = 0 OR ", "",
+		{"CREATE of PUBLIC not checked", "a.grantee = 0 OR NOT EXISTS", "a.grantee <> 0 AND NOT EXISTS",
 			"GRANT CREATE ON SCHEMA kingres_sketch TO PUBLIC", "REVOKE CREATE ON SCHEMA kingres_sketch FROM PUBLIC", ReasonSchemaCreate},
 		{"the grantee that is a superuser is not excused", "g.rolsuper)", "true)",
 			"GRANT CREATE ON SCHEMA kingres_sketch TO tenant", "REVOKE CREATE ON SCHEMA kingres_sketch FROM tenant", ReasonSchemaCreate},
@@ -359,6 +359,202 @@ func TestMutantsAreKilled(t *testing.T) {
 		querySQL = orig
 		if c.undo != "" {
 			d.mustSU(t, c.undo)
+		}
+	}
+}
+
+func TestObjectExtensionAndNames(t *testing.T) {
+	for name, want := range map[string]string{
+		"kingres.node": Shard, "bucket_map": Shard, "kingres.ledger_blocks": Ledger, "ledger_head": Ledger, "kingres.timepart_policy": Timepart,
+		"create_time_partitions": Timepart, "kingres.columnar_info": Columnar, "dist_table": Shard,
+	} {
+		if got := ObjectExtension(name); got != want {
+			t.Errorf("%s: %s, want %s", name, got, want)
+		}
+	}
+	for _, n := range All {
+		if !IsKingres(n) {
+			t.Errorf("%s", n)
+		}
+	}
+	if IsKingres("pgcrypto") || IsKingres("") || IsKingres("kingres_other") {
+		t.Error("only the extensions of KingresDB")
+	}
+	if _, err := StatusSQL("pgcrypto"); err == nil {
+		t.Error("StatusSQL takes only the extensions of KingresDB (its text carries the name)")
+	}
+}
+
+// PreInstall: the schema that an extension is created in.
+func TestPreInstallAndStatusSQL(t *testing.T) {
+	d := startTenant(t)
+	ctx := context.Background()
+	pre := func() Reason {
+		t.Helper()
+		err := PreInstall(ctx, d.su, Sketch, "kingres_sketch")
+		if err == nil {
+			return ""
+		}
+		u, ok := IsUntrusted(err)
+		if !ok {
+			t.Fatal(err)
+		}
+		if u.Extension != Sketch {
+			t.Fatalf("the error names the extension: %+v", u)
+		}
+		return u.Reason
+	}
+	if r := pre(); r != "" {
+		t.Fatalf("a schema that does not exist: %q", r)
+	}
+	if err := PreInstallExtension(ctx, d.su, Sketch); err != nil {
+		t.Fatal(err)
+	}
+	if s, err := ExtensionSchema(ctx, d.su, Sketch); err != nil || s != "kingres_sketch" {
+		t.Fatalf("the control file schema: %q %v", s, err)
+	}
+	d.mustSU(t, "CREATE SCHEMA kingres_sketch")
+	if r := pre(); r != "" {
+		t.Fatalf("an empty schema of the superuser: %q", r)
+	}
+	for _, c := range []struct {
+		name, bad, undo string
+		want            Reason
+	}{
+		{"a schema of the tenant", "ALTER SCHEMA kingres_sketch OWNER TO tenant", "ALTER SCHEMA kingres_sketch OWNER TO kingresd", ReasonSchemaOwner},
+		{"CREATE for PUBLIC", "GRANT CREATE ON SCHEMA kingres_sketch TO PUBLIC", "REVOKE CREATE ON SCHEMA kingres_sketch FROM PUBLIC", ReasonSchemaCreate},
+		{"CREATE for the tenant", "GRANT CREATE ON SCHEMA kingres_sketch TO tenant", "REVOKE CREATE ON SCHEMA kingres_sketch FROM tenant", ReasonSchemaCreate},
+		{"an object that is not a member", "CREATE VIEW kingres_sketch.v AS SELECT 1", "DROP VIEW kingres_sketch.v", ReasonForeignObject},
+	} {
+		d.mustSU(t, c.bad)
+		if r := pre(); r != c.want {
+			t.Errorf("%s: %q, want %q", c.name, r, c.want)
+		}
+		d.mustSU(t, c.undo)
+	}
+	// The same checks through the statement for another server (no parameters): reason "" for a trusted extension, no row for an absent one.
+	statusOf := func(ext string) (string, string, bool) {
+		sql, err := StatusSQL(ext)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var v, reason string
+		err = d.su.QueryRow(ctx, sql).Scan(&v, &reason)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", "", false
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v, reason, true
+	}
+	d.mustSU(t, "DROP SCHEMA kingres_sketch")
+	if _, _, ok := statusOf(Sketch); ok {
+		t.Fatal("absent: no row")
+	}
+	d.install(t, Sketch)
+	for _, c := range []struct {
+		bad, undo string
+		want      Reason
+	}{
+		{"", "", ""},
+		{"ALTER SCHEMA kingres_sketch OWNER TO tenant", "ALTER SCHEMA kingres_sketch OWNER TO kingresd", ReasonSchemaOwner},
+		{"GRANT CREATE ON SCHEMA kingres_sketch TO PUBLIC", "REVOKE CREATE ON SCHEMA kingres_sketch FROM PUBLIC", ReasonSchemaCreate},
+		{"CREATE FUNCTION kingres_sketch.planted() RETURNS int LANGUAGE sql AS 'SELECT 1'", "DROP FUNCTION kingres_sketch.planted()", ReasonForeignObject},
+	} {
+		if c.bad != "" {
+			d.mustSU(t, c.bad)
+		}
+		v, reason, ok := statusOf(Sketch)
+		_, vr := verifyReason(t, d.su, Sketch)
+		if !ok || v == "" || Reason(reason) != c.want || vr != c.want {
+			t.Errorf("%q: StatusSQL %q %q, Verify %q, want %q", c.bad, v, reason, vr, c.want)
+		}
+		if c.undo != "" {
+			d.mustSU(t, c.undo)
+		}
+	}
+}
+
+// Mutants of PreInstall.
+func TestPreInstallMutantsAreKilled(t *testing.T) {
+	d := startTenant(t)
+	d.mustSU(t, "CREATE SCHEMA kingres_sketch")
+	orig := preInstallSQL
+	defer func() { preInstallSQL = orig }()
+	check := func() Reason {
+		err := PreInstall(context.Background(), d.su, Sketch, "kingres_sketch")
+		if u, ok := IsUntrusted(err); ok {
+			return u.Reason
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ""
+	}
+	for _, c := range []struct {
+		name, from, to, bad, undo string
+		want                      Reason
+	}{
+		{"owner not checked", "COALESCE((SELECT r.rolsuper FROM pg_catalog.pg_roles r WHERE r.oid = ns.nspowner), false)", "true",
+			"ALTER SCHEMA kingres_sketch OWNER TO tenant", "ALTER SCHEMA kingres_sketch OWNER TO kingresd", ReasonSchemaOwner},
+		{"CREATE not checked", "a.privilege_type = 'CREATE'", "a.privilege_type = 'NOPE'",
+			"GRANT CREATE ON SCHEMA kingres_sketch TO PUBLIC", "REVOKE CREATE ON SCHEMA kingres_sketch FROM PUBLIC", ReasonSchemaCreate},
+		{"members not checked", "(SELECT count(*) FROM foreign_objs f WHERE f.extname = e.extname)", "0::bigint",
+			"CREATE VIEW kingres_sketch.v AS SELECT 1", "DROP VIEW kingres_sketch.v", ReasonForeignObject},
+		{"the schema is not looked up by name", "WHERE n.nspname = $1::pg_catalog.text", "WHERE n.nspname = $1::pg_catalog.text AND false",
+			"ALTER SCHEMA kingres_sketch OWNER TO tenant", "ALTER SCHEMA kingres_sketch OWNER TO kingresd", ReasonSchemaOwner},
+	} {
+		preInstallSQL = orig
+		d.mustSU(t, c.bad)
+		if r := check(); r != c.want {
+			t.Fatalf("%s: the real statement says %q", c.name, r)
+		}
+		if !strings.Contains(orig, c.from) {
+			t.Fatalf("%s: %q is not in the statement", c.name, c.from)
+		}
+		preInstallSQL = strings.Replace(orig, c.from, c.to, 1)
+		if r := check(); r == c.want {
+			t.Errorf("mutant survived: %s", c.name)
+		}
+		preInstallSQL = orig
+		d.mustSU(t, c.undo)
+	}
+}
+
+// kingres_shard is created with SCHEMA pg_catalog and populates the schema kingres: that schema is the one that is checked, never pg_catalog.
+func TestShardIsCheckedInTheSchemaKingres(t *testing.T) {
+	d := startTenant(t)
+	ctx := context.Background()
+	d.install(t, Shard)
+	info, err := Verify(ctx, d.su, Shard)
+	if err != nil || !info.Present || info.Schema != "kingres" {
+		t.Fatalf("a real install of kingres_shard is trusted, in the schema kingres: %+v %v", info, err)
+	}
+	// the other extensions of the schema kingres are members, not foreign
+	d.install(t, Timepart)
+	if _, err := Verify(ctx, d.su, Shard); err != nil {
+		t.Fatalf("with kingres_timepart in the same schema: %v", err)
+	}
+	if rs, err := VerifyAll(ctx, d.su, Shard, Timepart); err != nil || rs[0].Err != nil || rs[1].Err != nil {
+		t.Fatalf("%+v %v", rs, err)
+	}
+	for _, c := range []struct {
+		bad, undo string
+		want      Reason
+	}{
+		{"CREATE VIEW kingres.ledger_pending AS SELECT 1 AS ledger_txid", "DROP VIEW kingres.ledger_pending", ReasonForeignObject},
+		{"CREATE FUNCTION kingres.planted() RETURNS int LANGUAGE sql AS 'SELECT 1'", "DROP FUNCTION kingres.planted()", ReasonForeignObject},
+		{"ALTER SCHEMA kingres OWNER TO tenant", "ALTER SCHEMA kingres OWNER TO kingresd", ReasonSchemaOwner},
+		{"GRANT CREATE ON SCHEMA kingres TO PUBLIC", "REVOKE CREATE ON SCHEMA kingres FROM PUBLIC", ReasonSchemaCreate},
+	} {
+		d.mustSU(t, c.bad)
+		if _, r := verifyReason(t, d.su, Shard); r != c.want {
+			t.Errorf("%s: %q, want %q", c.bad, r, c.want)
+		}
+		d.mustSU(t, c.undo)
+		if _, r := verifyReason(t, d.su, Shard); r != "" {
+			t.Fatalf("after %s: %q", c.undo, r)
 		}
 	}
 }

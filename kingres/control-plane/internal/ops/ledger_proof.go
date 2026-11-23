@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sqlx"
 )
@@ -142,10 +143,12 @@ type proofTable struct {
 
 func (o *Ops) lookupProofTable(ctx context.Context, tx pgx.Tx, pr proofRequest) (proofTable, error) {
 	var t proofTable
-	err := tx.QueryRow(ctx, `SELECT coalesce((SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'kingres_ledger'), '')`).Scan(&t.extVerion)
+	// The extension is found by extguard, not by name alone: an untrusted schema is refused before anything in it is read or called.
+	info, err := extPresent(ctx, tx, extguard.Ledger)
 	if err != nil {
 		return t, err
 	}
+	t.extVerion = info.Version
 	if t.extVerion == "" {
 		return t, problem.New(problem.Conflict, "The ledger is not enabled on this database.")
 	}
@@ -189,7 +192,7 @@ func (o *Ops) lookupProofTable(ctx context.Context, tx pgx.Tx, pr proofRequest) 
 		return t, err
 	}
 	var dist bool
-	if err := tx.QueryRow(ctx, `SELECT to_regclass('kingres.dist_table') IS NOT NULL`).Scan(&dist); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT pg_catalog.to_regclass('kingres.dist_table') IS NOT NULL`).Scan(&dist); err != nil {
 		return t, err
 	}
 	if dist {

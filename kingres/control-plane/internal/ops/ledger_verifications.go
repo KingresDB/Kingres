@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/instance"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/store"
@@ -67,7 +68,10 @@ type ledgerChain struct {
 // the database is not sharded).
 func localGroup(ctx context.Context, x execer) int32 {
 	var ok bool
-	if x.QueryRow(ctx, `SELECT to_regclass('kingres.local_node') IS NOT NULL AND to_regclass('kingres.node') IS NOT NULL`).Scan(&ok) != nil || !ok {
+	if info, err := extguard.Verify(ctx, x, extguard.Shard); err != nil || !info.Present {
+		return 0 // absent, or a schema that cannot be trusted: nothing of it is read
+	}
+	if x.QueryRow(ctx, `SELECT pg_catalog.to_regclass('kingres.local_node') IS NOT NULL AND pg_catalog.to_regclass('kingres.node') IS NOT NULL`).Scan(&ok) != nil || !ok {
 		return 0
 	}
 	var g int32
@@ -83,7 +87,10 @@ func localGroup(ctx context.Context, x execer) int32 {
 func otherGroups(ctx context.Context, x execer, local int32) []int32 {
 	out := []int32{}
 	var ok bool
-	if x.QueryRow(ctx, `SELECT to_regclass('kingres.node') IS NOT NULL`).Scan(&ok) != nil || !ok {
+	if info, err := extguard.Verify(ctx, x, extguard.Shard); err != nil || !info.Present {
+		return out
+	}
+	if x.QueryRow(ctx, `SELECT pg_catalog.to_regclass('kingres.node') IS NOT NULL`).Scan(&ok) != nil || !ok {
 		return out
 	}
 	rows, err := x.Query(ctx, `SELECT DISTINCT group_id FROM kingres.node WHERE group_id <> $1 ORDER BY group_id`, local)
@@ -98,6 +105,10 @@ func otherGroups(ctx context.Context, x execer, local int32) []int32 {
 }
 
 func chainOf(ctx context.Context, x execer) (ledgerChain, error) {
+	// Nothing of the schema kingres is read before the extension is known to be the extension's own (extguard).
+	if _, err := needExt(ctx, x, extguard.Ledger, "The ledger is not enabled on this database."); err != nil {
+		return ledgerChain{}, err
+	}
 	c := ledgerChain{group: localGroup(ctx, x)}
 	err := x.QueryRow(ctx, `SELECT encode(chain_id, 'hex') FROM kingres.ledger_chain LIMIT 1`).Scan(&c.id)
 	return c, err
@@ -339,6 +350,9 @@ func (o *Ops) ListVerifications(ctx context.Context, db string, p store.Page) (a
 	}
 	byExt := map[int64]extVerification{}
 	err = o.asService(ctx, db, func(tx pgx.Tx) error {
+		if _, err := needExt(ctx, tx, extguard.Ledger, "The ledger is not enabled on this database."); err != nil {
+			return err
+		}
 		rows, err := tx.Query(ctx, `SELECT `+extVerificationCols+` FROM kingres.ledger_verification WHERE verification_id = ANY ($1)`, ids)
 		if err != nil {
 			return err

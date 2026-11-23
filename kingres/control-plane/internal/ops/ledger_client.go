@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/instance"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/peerclient"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
@@ -76,16 +77,27 @@ func pgText(err error) error {
 
 // ledgerVersions reads the version of the extension in the database and the newest one that is installed.
 func ledgerVersions(ctx context.Context, x execer) (have, want string, err error) {
-	err = x.QueryRow(ctx, `SELECT
-		coalesce((SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'kingres_ledger'), ''),
-		coalesce((SELECT default_version FROM pg_catalog.pg_available_extensions WHERE name = 'kingres_ledger'), '')`).Scan(&have, &want)
+	// The extension is found by extguard (owner, schema owner, ACL and members), not by its name alone: an untrusted one is a refusal.
+	info, err := extPresent(ctx, x, extguard.Ledger)
+	if err != nil {
+		return "", "", err
+	}
+	have = info.Version
+	err = x.QueryRow(ctx, `SELECT coalesce((SELECT default_version FROM pg_catalog.pg_available_extensions WHERE name = 'kingres_ledger'), '')`).Scan(&want)
 	return
 }
 
 // needClientKeys detects version 0.3 by its objects, as the records of 0.2 are detected: the ledger must be there and the registry too.
 func needClientKeys(ctx context.Context, x execer) error {
+	info, err := extPresent(ctx, x, extguard.Ledger)
+	if err != nil {
+		return err
+	}
+	if !info.Present {
+		return errors.New(textLedgerOff)
+	}
 	var inst, keys bool
-	if err := x.QueryRow(ctx, `SELECT to_regclass('kingres.ledger_blocks') IS NOT NULL, to_regclass('kingres.ledger_client_key') IS NOT NULL`).Scan(&inst, &keys); err != nil {
+	if err := x.QueryRow(ctx, `SELECT pg_catalog.to_regclass('kingres.ledger_blocks') IS NOT NULL, pg_catalog.to_regclass('kingres.ledger_client_key') IS NOT NULL`).Scan(&inst, &keys); err != nil {
 		return err
 	}
 	if !inst {
@@ -112,6 +124,9 @@ func clientProblem(err error, server string) error {
 	}
 	msg := err.Error()
 	switch {
+	case strings.Contains(msg, "cannot be trusted"):
+		// The text of untrustedProblem, from another server.
+		return problem.New(problem.Conflict, "The schema of the extension kingres_ledger in this database"+where+" cannot be trusted; nothing in it is read or called.")
 	case strings.Contains(msg, textLedgerOff):
 		return problem.New(problem.Conflict, "The ledger is not enabled on this database"+where+".")
 	case strings.Contains(msg, textClientOld):
