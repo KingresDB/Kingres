@@ -13,7 +13,38 @@
 -- extension made it); see below for whose it is.  Not CREATE SCHEMA IF NOT EXISTS:
 -- PostgreSQL refuses that in a script when the schema exists and is not a member of
 -- the extension.
-DO $ks$ BEGIN IF pg_catalog.to_regnamespace('kingres') IS NULL THEN CREATE SCHEMA kingres; END IF; END $ks$;
+-- The schema kingres is made here, or it exists already (another KingresDB extension made it).  Not CREATE SCHEMA IF NOT EXISTS: PostgreSQL refuses that in
+-- a script when the schema exists and is not a member of the extension.  An existing schema must be owned by a superuser and give CREATE to no role that is
+-- not a superuser: a role that made it in advance would otherwise own what the service role, a superuser, reads and runs.
+DO $ks$
+DECLARE
+    v_owner pg_catalog.name;
+BEGIN
+    IF pg_catalog.to_regnamespace('kingres') IS NULL THEN
+        CREATE SCHEMA kingres;
+        RETURN;
+    END IF;
+    SELECT r.rolname INTO v_owner
+      FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) n.nspowner
+     WHERE n.nspname OPERATOR(pg_catalog.=) 'kingres' AND NOT r.rolsuper;
+    IF v_owner IS NOT NULL THEN
+        RAISE EXCEPTION 'the schema kingres already exists and is owned by %, which is not a superuser', v_owner
+            USING ERRCODE = 'insufficient_privilege',
+                  HINT = 'Drop the schema, or make a superuser its owner, before CREATE EXTENSION kingres_shard.';
+    END IF;
+    IF EXISTS (SELECT 1
+                 FROM pg_catalog.pg_namespace n,
+                      LATERAL pg_catalog.aclexplode(COALESCE(n.nspacl, pg_catalog.acldefault('n', n.nspowner))) a
+                WHERE n.nspname OPERATOR(pg_catalog.=) 'kingres'
+                  AND a.privilege_type OPERATOR(pg_catalog.=) 'CREATE'
+                  AND (a.grantee OPERATOR(pg_catalog.=) 0
+                       OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles g WHERE g.oid OPERATOR(pg_catalog.=) a.grantee AND g.rolsuper))) THEN
+        RAISE EXCEPTION 'the schema kingres grants CREATE to a role that is not a superuser (or to PUBLIC)'
+            USING ERRCODE = 'insufficient_privilege',
+                  HINT = 'Revoke CREATE on the schema before CREATE EXTENSION kingres_shard.';
+    END IF;
+END
+$ks$;
 -- The schema "kingres" is shared with the other KingresDB extensions, which ask for it
 -- with "schema = kingres" in their control files, and any of them may be created
 -- first.  So it belongs to none of them: whoever made it, it is not a member of this
