@@ -18,6 +18,7 @@ The independent review (`docs/reviews/2026-11-22-ca-key-escrow.md`) found the cr
 - **CAE-1**: copies are ordered by (epoch, generation, seq); a new leader takes a higher epoch; recipients refuse a blob and a drop of an older epoch.
 - **CAE-2, CAE-3, CAE-6**: records stay (`dropPending`) until a drop succeeded; the operator's choice, the epoch and the holders are mirrored to `kingres_cp.cluster_setting` (`caEscrow`); a standby missing for less than three rounds keeps its copy; switching off tells every active member.
 - **CAE-5, CAE-7, CAE-8**: durable write of `ca.key`, a truncated key is put aside, the list in a blob is parsed on store, length-prefixed additional data, key file mode check, clearing of secrets where Go allows.
+- The cluster test of CAE-4 found that every revocation task on the new leader failed after a failover of the map group (the row of the server that created the cluster has no address); the task now takes the ids of the active members and leaves the address to the peer client.
 - Contract 0.22.0 (still the placeholder) gets the value `dropPending` of `CaEscrowRecipient.state`; the internal calls get `epoch`, `heldEpoch` and `heldGeneration`.
 
 ### How it was verified

@@ -204,3 +204,8 @@ Each fix has a test that fails without it (the mutant that was run is named). Un
 disk); the removal of that key stays an operator step. A recipient that is removed while unreachable keeps its copy; it stays listed as
 `dropPending` and the leader asks again every round. A new leader needs the system database to be readable to know the operator's choice (it
 logs a warning and falls back to the copy otherwise). The CA itself is not rotated.
+
+**Found by the cluster test of CAE-4.** After a failover of the map group, every revocation task on the new leader failed at "Send the revocation list to
+every server": the list of servers was read with `peerInfos`, which refuses a server whose row has no address, and the row of the server that created the
+cluster has none (its address is in the peer directory). The revocation task and the reads of the lists now take the ids of the active members from the
+table (`revocationPeers`) and leave the address to the peer client. The cluster test fails without it.
