@@ -230,7 +230,7 @@ func dumpLogs(t *testing.T, root string) {
 	})
 }
 
-// NewUntrusted is New for the other attack: the tenant makes the schema kingres first (it owns it), and the service role then installs kingres_shard into it, so the
+// NewUntrusted is New for the other attack: kingres_shard is installed by the service role, and the tenant is then given CREATE on its schema kingres, so the
 // extension is there and the schema is not the extension's alone. The tenant also makes an object of its own in the schema. The database has the table public.t and
 // the marker table; Markers works as before.
 func NewUntrusted(t *testing.T) *Env {
@@ -267,7 +267,6 @@ func NewUntrusted(t *testing.T) *Env {
 	for _, s := range []string{
 		"CREATE TABLE public.t (id int PRIMARY KEY, v text)",
 		"CREATE TABLE public.spoof_marker (what text, at timestamptz DEFAULT now())",
-		"CREATE SCHEMA kingres",
 	} {
 		if _, err := tc.Exec(ctx, s); err != nil {
 			t.Fatalf("%s: %v", s, err)
@@ -279,8 +278,13 @@ func NewUntrusted(t *testing.T) *Env {
 		t.Fatal(err)
 	}
 	defer func() { _ = sc.Close(ctx) }()
+	// The extension refuses to be installed into a schema of a tenant, so it is installed first; the schema then comes to the tenant afterwards (a grant that
+	// somebody made by mistake, or a change the tenant made as a role that had the right), which is what extguard has to see.
 	if _, err := sc.Exec(ctx, "CREATE EXTENSION kingres_shard"); err != nil {
-		t.Skipf("kingres_shard cannot be installed in this installation: %v", err)
+		t.Fatalf("installing kingres_shard: %v", err)
+	}
+	if _, err := sc.Exec(ctx, "GRANT CREATE ON SCHEMA kingres TO tenant"); err != nil {
+		t.Fatal(err)
 	}
 	// an object of the tenant in the schema it owns: a function that is not the extension's and writes the marker when it runs
 	if _, err := tc.Exec(ctx, "CREATE FUNCTION kingres.tenant_probe() RETURNS int LANGUAGE sql AS 'INSERT INTO public.spoof_marker(what) VALUES (''probe'') RETURNING 1'"); err != nil {
