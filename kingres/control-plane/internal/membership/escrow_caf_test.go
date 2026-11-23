@@ -34,6 +34,7 @@ func TestAHostileAnswerCannotMakeTheLeaderRevokeWhatItNeverIssued(t *testing.T) 
 	for i := 0; i < 70; i++ {
 		long += "a"
 	}
+	c.issued[long] = true // issued, but longer than any serial can be
 	c.holds("db2", "ee05", "aa01", long, "not hex", "")
 	c.holds("db3", "ee06")
 	c.servers["db1"].reconcileRevocations(context.Background(), ca)
@@ -419,37 +420,6 @@ func TestADropThatKeepsFailingIsTriedLessOften(t *testing.T) {
 	}
 	if due < 29+7 || due > 29+8 {
 		t.Fatalf("%d attempts in 100 rounds", due)
-	}
-}
-
-// CAF-8: the leftovers of an interrupted write are removed, and the key put aside is kept in a small number.
-func TestInterruptedWritesAreCleanedUp(t *testing.T) {
-	c := newEscrowCluster(t, "db1", "db2")
-	dir := c.servers["db1"].Svc.PKIDir()
-	old := filepath.Join(dir, ".pki-123")
-	young := filepath.Join(dir, ".pki-456")
-	for _, p := range []string{old, young} {
-		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := os.Chtimes(old, time.Now().Add(-time.Hour), time.Now().Add(-time.Hour)); err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < 6; i++ {
-		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("%s.unusable-%d", pki.CAKeyFile, 100+i)), []byte("x"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	pki.CleanTempFiles(dir, 5*time.Minute, 3)
-	if _, err := os.Stat(old); err == nil {
-		t.Error("an old temporary file was kept")
-	}
-	if _, err := os.Stat(young); err != nil {
-		t.Error("a young temporary file (a write in progress) was removed")
-	}
-	if m, _ := filepath.Glob(filepath.Join(dir, pki.CAKeyFile+".unusable-*")); len(m) != 3 {
-		t.Errorf("%d keys put aside kept", len(m))
 	}
 }
 

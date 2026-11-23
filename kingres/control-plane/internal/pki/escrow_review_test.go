@@ -458,3 +458,33 @@ func TestTheModeIsSetBeforeTheFlush(t *testing.T) {
 		t.Fatalf("the mode at the flush was %v", modeAtSync)
 	}
 }
+
+// CAF-8: the leftovers of an interrupted write are removed, a young one (a write in progress) is not, and the keys put aside are few.
+func TestInterruptedWritesAreCleanedUp(t *testing.T) {
+	dir := t.TempDir()
+	old := filepath.Join(dir, ".pki-123")
+	young := filepath.Join(dir, ".pki-456")
+	for _, p := range []string{old, young} {
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chtimes(old, time.Now().Add(-time.Hour), time.Now().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 6; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("%s.unusable-%d", CAKeyFile, 100+i)), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	CleanTempFiles(dir, 5*time.Minute, 3)
+	if _, err := os.Stat(old); err == nil {
+		t.Error("an old temporary file was kept")
+	}
+	if _, err := os.Stat(young); err != nil {
+		t.Error("a young temporary file (a write in progress) was removed")
+	}
+	if m, _ := filepath.Glob(filepath.Join(dir, CAKeyFile+".unusable-*")); len(m) != 3 {
+		t.Errorf("%d keys put aside kept", len(m))
+	}
+}
