@@ -270,6 +270,7 @@ describe('each refusal has words of its own', () => {
     expect(only('graceful', false)).toMatch(/planned switchover/i)
     expect(only('graceful', false)).not.toMatch(/map group/i)
     expect(only('hard', true)).toMatch(/map group/i)
+    expect(only('hard', true)).toMatch(/manager leader/i)
     expect(only('hard', true)).not.toMatch(/planned switchover/i)
   })
 })

@@ -724,7 +724,7 @@ export interface paths {
          *     that does not succeed in two minutes ends it with `cannot_quiesce`, and prepared transactions that do not end with
          *     `prepared_transactions_pending`. The task can be cancelled until the promotion has begun (`Task.cancellable`). Refused with 409
          *     `group_degraded` when no standby of a group streams from its primary (or the named target does not), and with 422
-         *     `unsupported_operation` for a hard failover of a server whose map group primary answers (see 0.18.0 below).
+         *     `unsupported_operation` for a request that cannot run on this server (see 0.22.0 below for the map group).
          *
          *     **0.13.0, the map group.** The failover of the server that runs the primary of the map group (and the manager
          *     leader) is accepted by any server that does not hear it, in mode `hard` only (`dryRun` and `graceful` answer 422
@@ -739,9 +739,20 @@ export interface paths {
          *     standby's server, stops the old leader cleanly and sends it the proof, the standby's server promotes on the proof and becomes the manager
          *     leader, and its task engine finishes the task (the task is read from the new leader once the old leader's system database is stopped). The
          *     steps of the map group that the old leader could not record are the ones before `Verify the new primary`. A hard failover of a server whose
-         *     map group primary answers is still 422 `unsupported_operation`.
+         *     map group primary answers (mode `hard`) is the subject of 0.22.0 below.
          *     When the manager leader is gone and the request is answered by a server that is not the candidate, the request travels to the candidate with the proof of the
          *     operator's session (ADR 0026); a session of the token kind has no proof key and gets 503 `service_unavailable` for this case.
+         *
+         *     **0.22.0, a hard failover of the map group while its server is alive.** `mode: hard` for the server that runs the primary of the map group, sent
+         *     to the leader (that server) while it answers, is accepted (it was 422 `unsupported_operation`); the map group is the last group of the task. The
+         *     leader judges the loss before it changes anything (a loss that the request did not accept with `allowDataLoss` is 409 `failover_needs_decision`, as for any group),
+         *     starts the bootstrap of a standby's server, which waits for the lease, and then fences its own primary of the map group in one step: its lease is no
+         *     longer renewed, a marker keeps the primary from starting, it is stopped with an immediate shutdown, and only when it is seen stopped is the lease
+         *     handed to the standby's server, which then promotes (ranking all the standbys after the stop) and becomes the manager leader. A primary that
+         *     cannot be stopped is stopped by the watchdog when its lease runs out, and the standby's server takes the lease after that. Nothing is promoted without
+         *     the lease, so two writable primaries are impossible. The task is read from the new leader (id and report as for a planned switchover). A loss that
+         *     shows only after the stop (a standby that cannot be read any more) pauses the bootstrap with `failoverNeedsDecision`; the repeated request, sent to
+         *     the server of the standby, carries the decision. `dryRun` for this case is answered by the leader as for any group.
          *
          *     The task is `server.failover`, one block of steps per group (`TaskStep.shardGroupId`). A task that
          *     waits for an operator is `paused`; a repeat of this request for the same server resumes it. From the moment
