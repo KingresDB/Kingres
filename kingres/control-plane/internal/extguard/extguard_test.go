@@ -565,7 +565,11 @@ func TestSystemDatabaseProblems(t *testing.T) {
 	ctx := context.Background()
 	// the database that the tenant owns is not a system database
 	probs, err := SystemDatabaseProblems(ctx, d.su)
-	if err != nil || len(probs) == 0 || probs[0].Reason != ReasonDatabaseOwner {
+	hasOwner := false
+	for _, p := range probs {
+		hasOwner = hasOwner || p == SystemProblem{"database", ReasonDatabaseOwner}
+	}
+	if err != nil || !hasOwner {
 		t.Fatalf("a database of the tenant: %v %v", probs, err)
 	}
 	// the system database as the control plane makes it
