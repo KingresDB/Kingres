@@ -502,7 +502,7 @@ func TestPreInstallMutantsAreKilled(t *testing.T) {
 			"GRANT CREATE ON SCHEMA kingres_sketch TO PUBLIC", "REVOKE CREATE ON SCHEMA kingres_sketch FROM PUBLIC", ReasonSchemaCreate},
 		{"members not checked", "(SELECT count(*) FROM foreign_objs f WHERE f.extname = e.extname)", "0::bigint",
 			"CREATE VIEW kingres_sketch.v AS SELECT 1", "DROP VIEW kingres_sketch.v", ReasonForeignObject},
-		{"the schema is not looked up by name", "WHERE n.nspname = $1::pg_catalog.text", "WHERE false",
+		{"the schema is not looked up by name", "WHERE n.nspname = $1::pg_catalog.text", "WHERE n.nspname = $1::pg_catalog.text AND false",
 			"ALTER SCHEMA kingres_sketch OWNER TO tenant", "ALTER SCHEMA kingres_sketch OWNER TO kingresd", ReasonSchemaOwner},
 	} {
 		preInstallSQL = orig
