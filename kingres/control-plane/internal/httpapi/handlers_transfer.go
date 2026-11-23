@@ -20,16 +20,18 @@ import (
 
 func (s *Server) transferHandlers() map[string]handlerFunc {
 	return map[string]handlerFunc{
-		"createDataUpload":   s.createDataUpload,
-		"getDataUpload":      s.getDataUpload,
-		"uploadDataChunk":    s.uploadDataChunk,
-		"deleteDataUpload":   s.deleteDataUpload,
-		"listDataExports":    s.listDataExports,
-		"getDataExport":      s.getDataExport,
-		"downloadDataExport": s.downloadDataExport,
-		"deleteDataExport":   s.deleteDataExport,
-		"exportTable":        s.exportTable,
-		"importTable":        s.importTable,
+		"createDataUpload":        s.createDataUpload,
+		"getDataUpload":           s.getDataUpload,
+		"uploadDataChunk":         s.uploadDataChunk,
+		"deleteDataUpload":        s.deleteDataUpload,
+		"listDataExports":         s.listDataExports,
+		"getDataExport":           s.getDataExport,
+		"downloadDataExport":      s.downloadDataExport,
+		"deleteDataExport":        s.deleteDataExport,
+		"exportTable":             s.exportTable,
+		"importTable":             s.importTable,
+		"exportDatabase":          s.exportDatabase,
+		"validateDatabaseArchive": s.validateDatabaseArchive,
 	}
 }
 

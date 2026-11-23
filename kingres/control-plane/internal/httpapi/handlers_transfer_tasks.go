@@ -67,3 +67,12 @@ func (s *Server) importTable(c *call, w http.ResponseWriter, r *http.Request) er
 	s.accepted(w, r, t)
 	return nil
 }
+
+// exportDatabase and validateDatabaseArchive (contract 0.40.0) answer 501 until the operations behind them are built.
+func (s *Server) exportDatabase(c *call, w http.ResponseWriter, r *http.Request) error {
+	return problem.New(problem.UnsupportedOp, "Database export is not available yet.")
+}
+
+func (s *Server) validateDatabaseArchive(c *call, w http.ResponseWriter, r *http.Request) error {
+	return problem.New(problem.UnsupportedOp, "Archive validation is not available yet.")
+}

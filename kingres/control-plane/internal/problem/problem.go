@@ -131,6 +131,13 @@ const (
 	ImportTooLarge         Code = "import_too_large"
 	ImportEndMarker        Code = "import_end_marker"
 	ExportUntrustedCode    Code = "export_untrusted_code"
+
+	// Contract 0.40.0 (database export and archive validation).
+	ExportNotReadable   Code = "export_not_readable"
+	LargeObjectsPresent Code = "large_objects_present"
+	SchemaUnrecognised  Code = "schema_unrecognised"
+	ArchiveInvalid      Code = "archive_invalid"
+	ArchiveIncompatible Code = "archive_incompatible"
 )
 
 // FieldError is one entry of the "errors" extension (schema ValidationIssue).
@@ -289,6 +296,11 @@ var specs = map[Code]struct {
 	ImportTooLarge:                  {422, "The file is too large to import", "import-too-large"},
 	ImportEndMarker:                 {422, "The file has an end-of-data line", "import-end-marker"},
 	ExportUntrustedCode:             {422, "The read would run code of another role", "export-untrusted-code"},
+	ExportNotReadable:               {422, "The role cannot read every table", "export-not-readable"},
+	LargeObjectsPresent:             {422, "The database has large objects", "large-objects-present"},
+	SchemaUnrecognised:              {422, "The schema has an object the archive does not carry", "schema-unrecognised"},
+	ArchiveInvalid:                  {422, "The archive is not valid", "archive-invalid"},
+	ArchiveIncompatible:             {422, "The archive does not fit this cluster", "archive-incompatible"},
 }
 
 // New returns a Problem for the code with the standard status, title and
