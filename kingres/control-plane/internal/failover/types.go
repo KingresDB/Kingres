@@ -694,6 +694,8 @@ type MapPlanned struct {
 	// candidate ranks the standbys after the stop and judges the loss with Facts, which the old leader read just before the stop (no check can follow it).
 	Hard  bool      `json:"hard,omitempty"`
 	Facts *MapFacts `json:"facts,omitempty"`
+	// Target is the server the request named for the map group (empty: the best standby); the candidate ranks with it as the ordinary groups do.
+	Target string `json:"target,omitempty"`
 }
 
 // MapFacts are the facts of the old leader's last check that a hard failover of the map group carries to the candidate (the field names of

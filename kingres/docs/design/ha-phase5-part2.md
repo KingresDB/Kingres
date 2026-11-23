@@ -2747,7 +2747,7 @@ group is last, `Input.MapLive`), and for group 0 the step `Stop the old primary`
    the promotion skip because the standby is promoted (`mapHandedOver`), and the rest (catalog check, repoint, records, synchronous names, prepared transactions, clients, unfreeze, report) run from the new leader.
 5. *The candidate.* B3 takes the fence lease (waiting `PlannedWait`, 4 min: what it waits for is the call of step 3, not the lapse of a lease), B4 **ranks all the standbys after the stop**, when their
    positions have stopped moving, with the same choice as for a dead leader but with the facts of step 1 (the record in the system database stops growing at the stop and would turn "a synchronous standby
-   streamed" into "possible loss" after thirty seconds), and may hand the lease to a better candidate as always. B5 promotes **without a proof** (there is none: the stop was not clean). B6, B7, B8 are
+   streamed" into "possible loss" after thirty seconds), and may hand the lease to a better candidate as always; a standby that the request named for the map group (`targets`) is ranked and judged as for any group (`Planned.Target`: chosen although another is better, and a loss the operator must accept when it is behind). B5 promotes **without a proof** (there is none: the stop was not clean). B6, B7, B8 are
    as for any bootstrap, except that B7 marks the old leader's task (`RecordPlanned`) and writes into its row of group 0 the pin and the verdict that the old leader could not write.
 
 **The fencing argument, stated plainly.** The old primary must not accept a write after any other instance of the group does, and the new primary must not be promoted while the old one can.

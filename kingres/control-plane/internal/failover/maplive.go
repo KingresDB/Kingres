@@ -91,7 +91,7 @@ func (r *Runner) stopOldMap(ctx context.Context, env *task.Env, sc *stepCtx, run
 	// The candidate's bootstrap first: it waits for the lease, which only the stop below hands to it. A request that was made before (a repeated run) finds
 	// the journal in progress.
 	if err := r.Peers.MapStart(ctx, chosen.Server, MapStartRequest{Server: sc.old(), RequestedBy: sc.in.RequestedBy, Comment: sc.in.Comment, AllowDataLoss: sc.in.AllowDataLoss,
-		Planned: &MapPlanned{TaskID: env.Task.ID, StandbyID: chosen.ID, Hard: true, Facts: mf}}); err != nil {
+		Planned: &MapPlanned{TaskID: env.Task.ID, StandbyID: chosen.ID, Hard: true, Facts: mf, Target: sc.in.Targets[0]}}); err != nil {
 		return fail(CodeTargetUnavailable, true, "the bootstrap of the map group could not be started on %s: %v; nothing was changed", chosen.Server, err)
 	}
 	ans, err := r.Peers.Demote(ctx, sc.old(), DemoteRequest{Group: 0, Mode: "immediate", ExpectedTerm: run.ExpectedTerm, TransferTo: chosen.Server, Candidate: chosen.Server})

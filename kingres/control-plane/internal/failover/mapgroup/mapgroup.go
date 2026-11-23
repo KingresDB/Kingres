@@ -490,7 +490,11 @@ func (r *Runner) pin(ctx context.Context, j journal.Journal) (bool, error) {
 	for i := range cands {
 		cands[i].Preferred = false
 	}
-	ch := failover.Choose(failover.ChooseInput{Candidates: cands, Facts: facts})
+	target := ""
+	if j.Planned != nil && j.Planned.Hard {
+		target = j.Planned.Target // the server the request named: ranked and judged as for the ordinary groups
+	}
+	ch := failover.Choose(failover.ChooseInput{Candidates: cands, Target: target, Facts: facts})
 	if ch.Chosen == nil {
 		return false, failover.Fail(failover.CodeNoCandidate, true, "no standby of the map group can be promoted: %s", ch.Message)
 	}

@@ -265,3 +265,30 @@ func TestAHardFailoverSurvivesACrashAtEveryStepBoundary(t *testing.T) {
 		}
 	}
 }
+
+// The standby that the request named is ranked as the ordinary groups rank it: it is chosen although another is better, and being behind the best is a loss that the
+// operator has to accept (the verdict), after the stop as before it.
+func TestAHardFailoverRanksTheStandbyTheRequestNamed(t *testing.T) {
+	w := hardWorld() // the standby on s2 (this server) is ahead of the one on s3
+	r, _ := w.runner(t)
+	rq := hardRequest()
+	rq.Planned.Target = "s3"
+	_, err := r.Run(context.Background(), rq)
+	var pe *failover.PauseError
+	if !errors.As(err, &pe) || !strings.Contains(pe.Reason, "could lose data") {
+		t.Fatalf("the named standby is behind the best: want a pause for the loss, got %v", err)
+	}
+	if w.count("promote ") != 0 {
+		t.Fatal("promoted")
+	}
+	// accepted: the lease goes to the named standby's server, which continues with the journal
+	w = hardWorld()
+	r, _ = w.runner(t)
+	rq = hardRequest()
+	rq.Planned.Target = "s3"
+	rq.AllowDataLoss = true
+	res, err := r.Run(context.Background(), rq)
+	if err != nil || res.HandedTo != "s3" {
+		t.Fatalf("%+v %v\n%s", res, err, strings.Join(w.log, "\n"))
+	}
+}

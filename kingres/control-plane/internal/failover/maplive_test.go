@@ -347,3 +347,29 @@ func TestAHardRequestThatIncludesTheMapGroupIsMarkedAsOneOfALiveLeadersServer(t 
 		t.Fatalf("a hard failover of an ordinary group is not marked: %+v %v", in, err)
 	}
 }
+
+// The standby that the request named for the map group is the candidate, and the bootstrap is told which server was named.
+func TestAHardFailoverOfTheMapGroupNamesTheTargetToTheCandidate(t *testing.T) {
+	w := mapWorld()
+	r := w.runner()
+	w.fakeClock(r)
+	in := mapHardInput()
+	in.Targets = map[int32]string{0: "s3"}
+	in.AllowDataLoss = true // s3 is behind s2: the loss is accepted
+	if name, err := runThrough(t, r, in, StepName(0, StepStop)); err != nil {
+		t.Fatalf("%s: %v\n%s", name, err, strings.Join(w.log, "\n"))
+	}
+	if w.index("map-start s3") < 0 || len(w.mapStarts) != 1 || w.mapStarts[0].Planned.Target != "s3" || w.mapStarts[0].Planned.StandbyID != 11 {
+		t.Fatalf("the candidate and the target: %+v\n%s", w.mapStarts, strings.Join(w.log, "\n"))
+	}
+	// without the acceptance the loss pauses the task before anything is started
+	w2 := mapWorld()
+	r2 := w2.runner()
+	w2.fakeClock(r2)
+	in.AllowDataLoss = false
+	_, err := runThrough(t, r2, in, StepName(0, StepStop))
+	var pe *PauseError
+	if !errors.As(err, &pe) || w2.index("map-start") >= 0 {
+		t.Fatalf("want a pause with nothing started: %v", err)
+	}
+}
