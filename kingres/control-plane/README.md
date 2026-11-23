@@ -415,7 +415,7 @@ of another role: `export_untrusted_code`), `TestStagingMetricsAndAlert`, and on 
 
 ## What is implemented
 
-The server implements revision **0.19.0** of the contract (171 operations, 136
+The server implements revision **0.22.0** of the contract (171 operations, 136
 paths; what is not done is in "Not done in this increment"). "Real" means the operation works against PostgreSQL or the local node
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
