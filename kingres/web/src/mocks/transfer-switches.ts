@@ -75,6 +75,7 @@ export function applyTransferSwitch(entry: string, s: MockState): void {
   if (entry === 'dbfail') transferSwitches.dbExportFails = true
   if (entry === 'changed') transferSwitches.schemaChanges = true
   if (entry === 'superuser') transferSwitches.dangerousRole = true
+  if (entry === 'ordinaryrole') transferSwitches.dangerousRole = false
   if (entry === 'exports') {
     seedExport(s, 'ready', 'orders', 20)
     seedExport(s, 'building', 'customers', 24)
