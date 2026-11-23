@@ -39,7 +39,7 @@ $groups = [ordered]@{
     'map-group'        = 'TestMapGroupPrimaryLost|TestMapGroupBootstrapSurvivesKingresdEnding|TestMapGroupEngineGateStaysClosedUntilTheBootstrapEnds'
     # The map group with a live old leader: the planned switchover and the hard failover.
     'map-switchover'   = 'TestSwitchoverOfTheMapGroup$|TestSwitchoverOfTheMapGroupWhoseProofIsRefused|TestSwitchoverOfTheMapGroupWhoseOldLeaderEndsAtTheStop'
-    'map-hard'         = 'TestHardFailoverOfTheMapGroupWhileItsServerIsAlive|TestHardFailoverOfTheMapGroupWhoseOldPrimaryDoesNotStop|TestHardFailoverOfTheMapGroupWhoseOldLeaderEndsAfterTheFence'
+    'map-hard'         = 'TestHardFailoverOfTheMapGroup'
     # T13: the automatic failover.
     'automatic'        = 'TestAutomaticFailoverRulesAndTheCounter|TestAutomaticFailoverOfTheMapGroup'
 }
