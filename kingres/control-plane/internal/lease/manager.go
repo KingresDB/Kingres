@@ -274,7 +274,7 @@ func (m *Manager) Renew(ctx context.Context) {
 		}
 		m.rmu.Unlock()
 		// A group that is not enforced keeps its watchdog file fresh whether or not the round succeeded (FO-01).
-		if wf := m.watchdogFile(g); wf != "" && !m.c.Enforced(g) {
+		if wf := m.watchdogFile(g); wf != "" && !m.enforced(g) {
 			m.writeWatchdogIdle(wf)
 		}
 	}
@@ -290,7 +290,7 @@ func (m *Manager) touchIdle() {
 	}
 	m.mu.Unlock()
 	for _, g := range groups {
-		if wf := m.watchdogFile(g); wf != "" && !m.c.Enforced(g) {
+		if wf := m.watchdogFile(g); wf != "" && !m.enforced(g) {
 			m.writeWatchdogIdle(wf)
 		}
 	}
@@ -414,7 +414,7 @@ func (m *Manager) round(ctx context.Context, group int32, members []string) {
 // acquired runs after a round that left a valid lease.
 func (m *Manager) acquired(ctx context.Context, group int32, wasLost bool) {
 	m.writeWatchdogFile(group)
-	enforced := m.c.Enforced(group)
+	enforced := m.enforced(group)
 	m.recordEnforced(group, enforced)
 	m.mu.Lock()
 	if m.starting[group] {
@@ -493,7 +493,7 @@ func (m *Manager) afterAcquired(ctx context.Context, group int32, wasLost bool) 
 		m.c.Log.Warn("the group lease is held again", "group", group)
 		m.audit(ctx, AuditLeaseAcquired, group, "the lease was obtained again after it was lost")
 	}
-	if m.c.Enforced(group) {
+	if m.enforced(group) {
 		m.writeWatchdogFile(group)
 		m.ensureWatchdog(group)
 	}
@@ -557,7 +557,7 @@ func (m *Manager) refence(ctx context.Context, group int32) {
 	m.mu.Lock()
 	busy := m.fencing[group]
 	m.mu.Unlock()
-	if busy || !m.c.Enforced(group) {
+	if busy || !m.enforced(group) {
 		return
 	}
 	var insts []Instance
@@ -596,7 +596,7 @@ func (m *Manager) lose(ctx context.Context, group int32) {
 		m.c.Log.Warn("a group lease was lost and no instance of this server serves the group: nothing to fence", "group", group)
 		return
 	}
-	enforced := m.c.Enforced(group)
+	enforced := m.enforced(group)
 	m.mu.Lock()
 	var why []any
 	if st := m.groups[group]; st != nil {
@@ -764,7 +764,7 @@ func (m *Manager) Info() []ha.LeaseInfo {
 	now := m.c.Clock.Mono()
 	byGroup := map[int32]ha.LeaseInfo{}
 	for g, st := range m.groups {
-		li := ha.LeaseInfo{Group: g, Holder: m.c.Self, State: StateNone, Enforced: m.c.Enforced(g)}
+		li := ha.LeaseInfo{Group: g, Holder: m.c.Self, State: StateNone, Enforced: m.enforced(g)}
 		switch {
 		case st.have && !st.lost && now < st.validUntil-m.c.Margin:
 			li.State = StateHeld
@@ -822,7 +822,7 @@ func (m *Manager) Confirming() bool {
 		if st != nil && (st.lost || (st.have && m.c.Clock.Mono() < st.validUntil-m.c.Margin)) {
 			continue
 		}
-		if m.c.Enforced(g) || (st == nil && slices.Contains(readEnforced(m.c.Dir).Groups, g)) {
+		if m.enforced(g) || (st == nil && slices.Contains(readEnforced(m.c.Dir).Groups, g)) {
 			return true
 		}
 	}
