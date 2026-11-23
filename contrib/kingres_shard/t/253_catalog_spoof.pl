@@ -123,6 +123,25 @@ unlike($err, qr/server closed the connection|terminated|crash/i, 'A: ... and the
 is($rc, 0, 'A: after the superuser removed the schema of the tenant, the extension installs') or diag($err);
 is(su(q{SELECT count(*) FROM public.marker}, 'viewdb'), '0', 'A: no function of the tenant ran');
 
+# A2. tables of the six names with the wrong columns: the same, and no crash
+su(q{CREATE DATABASE wrongdb OWNER tenant});
+($rc, $out, $err) = as_tenant('wrongdb', q{
+	CREATE SCHEMA kingres;
+	CREATE TABLE kingres.node (a text);
+	CREATE TABLE kingres.colocation (a text);
+	CREATE TABLE kingres.dist_table (a text);
+	CREATE TABLE kingres.bucket_map (a text);
+	CREATE TABLE kingres.map_version (a text);
+	CREATE TABLE kingres.local_node (a text);
+	INSERT INTO kingres.node VALUES ('x'); INSERT INTO kingres.map_version VALUES ('x'); INSERT INTO kingres.local_node VALUES ('x');
+	CREATE TABLE public.victim (id int PRIMARY KEY, v text);
+	INSERT INTO public.victim SELECT g, 'v' FROM generate_series(1, 10) g;
+	ALTER TABLE public.victim ADD COLUMN w int;
+	DROP TABLE public.victim;
+	CREATE SCHEMA other; CREATE TABLE other.t (id int);
+});
+is($rc, 0, 'A2: tables of the six names with the wrong columns: DDL and DML run as in PostgreSQL, no crash') or diag($err);
+
 # ---------------------------------------------------------------------------------------------------------------------------------
 # B. real tables that describe a cluster
 # ---------------------------------------------------------------------------------------------------------------------------------
