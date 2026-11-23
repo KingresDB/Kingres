@@ -67,8 +67,12 @@ func (s svc) unpinned(ctx context.Context, db string) (*pgx.Conn, error) {
 
 func exec(t *testing.T, c *pgx.Conn, sql string) {
 	t.Helper()
+	start := time.Now()
 	if _, err := c.Exec(context.Background(), sql); err != nil {
-		t.Fatalf("%.120s: %v", sql, err)
+		t.Fatalf("%.120s: %v (after %v, closed: %v)", sql, err, time.Since(start), c.IsClosed())
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Logf("slow statement (%v): %.80s", d, sql)
 	}
 }
 
