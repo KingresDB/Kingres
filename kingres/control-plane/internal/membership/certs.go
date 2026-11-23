@@ -222,7 +222,7 @@ func (m *Manager) RenewFromPeer(ctx context.Context, peer string, req wire.Renew
 	if err != nil {
 		return wire.RenewResponse{}, err
 	}
-	res, err := m.renewalAnswer(is)
+	res, err := m.renewalAnswer(ctx, is)
 	if err != nil {
 		return wire.RenewResponse{}, err
 	}
@@ -232,11 +232,13 @@ func (m *Manager) RenewFromPeer(ctx context.Context, peer string, req wire.Renew
 
 // renewalAnswer builds the answer of a renewal: the certificate with the CA
 // certificate and the current revocation list.
-func (m *Manager) renewalAnswer(is issued) (wire.RenewResponse, error) {
+func (m *Manager) renewalAnswer(ctx context.Context, is issued) (wire.RenewResponse, error) {
 	ca, err := m.ca()
 	if err != nil {
 		return wire.RenewResponse{}, err
 	}
+	// The list that goes out with a certificate is at least what the servers hold.
+	m.reconcileRevocations(ctx, ca)
 	crl, err := m.Svc.CRLPEM()
 	if err != nil {
 		return wire.RenewResponse{}, err
@@ -256,7 +258,7 @@ func (m *Manager) RenewSelf(ctx context.Context) (notAfter time.Time, err error)
 	if err != nil {
 		return time.Time{}, err
 	}
-	res, err := m.renewalAnswer(is)
+	res, err := m.renewalAnswer(ctx, is)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -411,7 +413,7 @@ func (m *Manager) stepCertRenewIssue(ctx context.Context, env *task.Env) error {
 	if err != nil {
 		return err
 	}
-	res, err := m.renewalAnswer(is)
+	res, err := m.renewalAnswer(ctx, is)
 	if err != nil {
 		return err
 	}
@@ -462,20 +464,21 @@ func (m *Manager) stepCertRevokeDistribute(ctx context.Context, env *task.Env) e
 	}
 	// The servers are the active members of the table: the address of a server is the peer directory's business (the row of the server that
 	// created the cluster has none, and after a failover of the map group that server is one of the others).
-	ids, err := m.revocationPeers(ctx)
+	ids, revoked, err := m.revocationTargets(ctx)
 	if err != nil {
 		return err
 	}
 	req := wire.PKIRequest{CACert: string(ca.CertPEM()), Revoked: ca.Revoked(), CRL: string(crl)}
-	for _, id := range ids {
-		if err := m.waitUnreachable(ctx, env, id, "sending the revocation list", func() error {
+	// A server that refuses does not stop the others (the revoked ones are last and have no say); a server that cannot be reached is waited for, as
+	// in every cluster-wide task, but a revoked one is not waited for.
+	err = m.distributeAll(ids, revoked, func(id string) error {
+		if revoked[id] {
 			return m.installRevocations(ctx, id, ca, req)
-		}); err != nil {
-			return fmt.Errorf("sending the revocation list to %s: %w", id, err)
 		}
-	}
+		return m.waitUnreachable(ctx, env, id, "sending the revocation list", func() error { return m.installRevocations(ctx, id, ca, req) })
+	})
 	m.escrowAfterRevocation(ctx)
-	return nil
+	return err
 }
 
 func (m *Manager) stepCertRevokeClose(ctx context.Context, env *task.Env) error {

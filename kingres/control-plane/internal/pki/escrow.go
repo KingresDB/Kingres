@@ -110,6 +110,11 @@ func (b EscrowBlob) Position() Position { return Position{b.Epoch, b.Generation,
 
 // aad is the authenticated header of a blob: every field is length-prefixed, so no value can shift into another.
 func (b EscrowBlob) aad() []byte {
+	if b.Version == 1 {
+		// The copies of the first version (before the review fixes): fields joined with a bar, no epoch and no seq. They are still opened, so a
+		// failover between an upgrade and the first resend of the new leader finds a copy that works.
+		return []byte(fmt.Sprintf("%s|%d|%s|%s|%s|%d|%d", escrowInfo, b.Version, b.ServerID, b.KeyID, b.CAFingerprint, b.Generation, b.SealedAt.UnixNano()))
+	}
 	var out []byte
 	put := func(s string) {
 		var n [4]byte
@@ -321,7 +326,7 @@ func newGCM(key []byte) (cipher.AEAD, error) {
 // open decrypts a blob with the recipient's private key.
 func (b EscrowBlob) open(serverID string, k recipientKeyFile) (escrowPlain, error) {
 	var out escrowPlain
-	if b.Version != escrowVersion || b.ServerID != serverID || b.KeyID != k.KeyID {
+	if (b.Version != escrowVersion && b.Version != 1) || b.ServerID != serverID || b.KeyID != k.KeyID {
 		return out, ErrEscrowRefused
 	}
 	priv, err := ecdh.X25519().NewPrivateKey(k.Private)

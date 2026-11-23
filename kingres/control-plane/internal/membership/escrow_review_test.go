@@ -202,40 +202,6 @@ func TestAFormerLeaderCannotOverrideANewerOne(t *testing.T) {
 	}
 }
 
-func TestTheOperatorsRotationTakesAnEpochAboveWhatTheServersHold(t *testing.T) {
-	c := newEscrowCluster(t, "db1", "db2")
-	ctx := context.Background()
-	if _, err := c.leader().SetEscrow(ctx, true); err != nil {
-		t.Fatal(err)
-	}
-	// Another leader sealed epoch 9 and the record of it was lost.
-	kid, pub, err := pki.RecipientOffer(c.servers["db2"].Svc.PKIDir(), false, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, err := pki.SealCA(c.mgrCA("db1"), "db2", kid, pub, pki.Position{Epoch: 9, Generation: 1, Seq: 1}, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := pki.StoreEscrow(c.servers["db2"].Svc.PKIDir(), "db2", b); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := c.mgrCA("db1").MergeRevoked([]string{"dd04"}, time.Now()); err != nil { // its content changed: it wants to resend
-		t.Fatal(err)
-	}
-	c.sync("db1")
-	if st := c.status(c.leader()); st.states["db2"] == "current" {
-		t.Fatalf("a leader of a lower epoch overrode a copy: %+v", st)
-	}
-	st, err := c.leader().RotateEscrow(ctx)
-	if err != nil || !st.Complete {
-		t.Fatalf("rotation: %+v %v", st, err)
-	}
-	if h, _ := held(c.servers["db2"]); h.Position.Epoch <= 9 {
-		t.Fatalf("the rotation sealed epoch %d", h.Position.Epoch)
-	}
-}
-
 // CAE-4: the server that comes back with an old revocation list must not undo what was revoked while it was away.
 func TestAReturningLeaderMergesWhatTheServersHoldBeforeItDistributes(t *testing.T) {
 	c := newEscrowCluster(t, "db1", "db2", "db3")

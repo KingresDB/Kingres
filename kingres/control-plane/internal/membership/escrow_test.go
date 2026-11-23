@@ -25,16 +25,20 @@ import (
 // escrowCluster is servers made of a Manager and a Receiver each, joined by a transport that calls the receiver of the
 // named server as the leader would over the internal API.
 type escrowCluster struct {
-	t       *testing.T
-	ca      *pki.CA
-	servers map[string]*Manager
-	down    map[string]bool
-	active  []string
-	mu      sync.Mutex
-	calls   []string
-	paths   []string
-	stale   int // lists that a holder refused because they take a revocation back
-	db      *memEscrowDB
+	t        *testing.T
+	ca       *pki.CA
+	servers  map[string]*Manager
+	down     map[string]bool
+	active   []string
+	mu       sync.Mutex
+	calls    []string
+	paths    []string
+	stale    int // lists that a holder refused because they take a revocation back
+	db       *memEscrowDB
+	issued   map[string]bool // the serials the CA issued (the certificate table)
+	readable []string        // nil: every active server
+	revoked  map[string]bool
+	numbers  map[string]int64 // not used
 }
 
 // memEscrowDB is the system database of the tests: one for the cluster, as the map group replicates it.
@@ -101,8 +105,20 @@ func newEscrowCluster(t *testing.T, ids ...string) *escrowCluster {
 		c.servers[id] = m
 	}
 	c.active = append([]string(nil), ids...)
+	c.issued = map[string]bool{}
+	for _, s := range []string{"aa01", "bb02", "cc03", "dd04", "beef01", "ff02", "dead01", "ab12"} {
+		c.issued[s] = true
+	}
 	for _, m := range c.servers {
 		m.escrowDB = c.db
+		m.escrowIssued = func(context.Context) (map[string]bool, error) { return c.issued, nil }
+		m.escrowRevoked = func(context.Context) (map[string]bool, error) { return c.revoked, nil }
+		m.escrowReadable = func(ctx context.Context) ([]string, error) {
+			if c.readable != nil {
+				return c.readable, nil
+			}
+			return m.escrowActive(ctx)
+		}
 		m.escrowActive = func(context.Context) ([]string, error) {
 			var out []string
 			for _, id := range c.active {
@@ -129,7 +145,7 @@ func (c *escrowCluster) transport(from *Manager) func(context.Context, string, s
 			return peerclient.ErrUnreachable
 		}
 		if method == "GET" && path == "/revoked" {
-			b, _ := json.Marshal(map[string]any{"serials": to.Svc.RevokedSerials()})
+			b, _ := json.Marshal(map[string]any{"serials": to.Svc.RevokedSerials(), "crlNumber": pki.HeldCRLNumber(to.Svc.PKIDir())})
 			return json.Unmarshal(b, out)
 		}
 		body, _ := json.Marshal(in)

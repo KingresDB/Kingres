@@ -353,6 +353,9 @@ type Backend struct {
 	Leader func() string
 	// Revoked returns the revoked serial numbers (hex).
 	Revoked func() []string
+	// CRLNumber is the number of the revocation list this server holds (0 when none): a leader that distributes learns from it the number its
+	// next list must exceed. Nil answers 0.
+	CRLNumber func() int64
 	// Resources, Logs, Metrics return JSON-encodable values.
 	Resources func(ctx context.Context) (any, error)
 	Logs      func(ctx context.Context, query map[string]string) (any, error)
@@ -561,7 +564,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	limit := int64(1 << 20)
-	if policy == ToLeader || key == "POST /globals/apply" || key == "POST /apply" {
+	if policy == ToLeader || key == "POST /globals/apply" || key == "POST /apply" || key == "POST /pki/install" {
 		limit = 16 << 20
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, limit)
@@ -572,7 +575,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "GET /leader":
 		writeJSON(w, http.StatusOK, map[string]string{"leader": s.be.Leader()})
 	case "GET /revoked":
-		writeJSON(w, http.StatusOK, map[string]any{"serials": s.be.Revoked()})
+		out := map[string]any{"serials": s.be.Revoked()}
+		if s.be.CRLNumber != nil {
+			out["crlNumber"] = s.be.CRLNumber()
+		}
+		writeJSON(w, http.StatusOK, out)
 	case "GET /resources":
 		s.answer(w, func() (any, error) { return s.be.Resources(ctx) })
 	case "GET /metrics":

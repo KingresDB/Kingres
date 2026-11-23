@@ -135,6 +135,7 @@ func serveInternal(ctx context.Context, d internalDeps) {
 		Self:       me,
 		Gather:     d.gather,
 		Revoked:    d.svc.RevokedSerials,
+		CRLNumber:  func() int64 { return pki.HeldCRLNumber(d.svc.PKIDir()) },
 		Handle:     handleCall(d),
 		Bootstrap:  d.receiver.Bootstrap,
 		Joining:    d.svc.Joining,

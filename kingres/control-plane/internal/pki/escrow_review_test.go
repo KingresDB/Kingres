@@ -7,9 +7,11 @@ import (
 	"crypto/cipher"
 	"crypto/ecdh"
 	"crypto/hkdf"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -382,5 +384,77 @@ func TestAdoptionKeepsThePublishedCRLNumber(t *testing.T) {
 	next, _ := nca.CRL(t0)
 	if n, s, _ := CRLContent(next); n <= 21 || !s["cc03"] {
 		t.Fatalf("the adopted CA issues number %d, revoked %v", n, s)
+	}
+}
+
+// CAF-2: the number a holder holds crosses the network in the message of the refusal.
+func TestTheHeldNumberIsReadFromTheRefusal(t *testing.T) {
+	ca := newCA(t)
+	held, _ := forgeCRL(t, ca, []string{"aa01"}, t0.Unix()+5000)
+	low, _ := forgeCRL(t, ca, []string{"aa01"}, 5)
+	err := CheckNotStale(held, low)
+	if !errors.Is(err, ErrStaleRevocations) {
+		t.Fatalf("%v", err)
+	}
+	if n, ok := ParseHeldNumber(err.Error()); !ok || n < t0.Unix()+5000 {
+		t.Fatalf("held number %d %v from %q", n, ok, err)
+	}
+	if _, ok := ParseHeldNumber("no number here"); ok {
+		t.Fatal("a number was found in a message without one")
+	}
+}
+
+// CAF-10: a copy of the first version still opens.
+func TestACopyOfTheFirstVersionStillOpens(t *testing.T) {
+	ca := newCA(t)
+	dir := member(t, ca)
+	kid, pub, err := RecipientOffer(dir, false, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, _ := ca.escrowPlain()
+	// A blob as the first version made it: the additional data are the fields joined with a bar.
+	b := EscrowBlob{Version: 1, ServerID: "b", KeyID: kid, CAFingerprint: ca.CAFingerprint(), Generation: 4, SealedAt: t0}
+	rpub, _ := ecdh.X25519().NewPublicKey(pub)
+	eph, _ := ecdh.X25519().GenerateKey(rand.Reader)
+	shared, _ := eph.ECDH(rpub)
+	key, err := deriveKey(shared, eph.PublicKey().Bytes(), pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.Ephemeral = eph.PublicKey().Bytes()
+	gcm, _ := newGCM(key)
+	nonce := make([]byte, gcm.NonceSize())
+	_, _ = rand.Read(nonce)
+	b.Ciphertext = append(nonce, gcm.Seal(nil, nonce, plain, []byte(fmt.Sprintf("%s|%d|%s|%s|%s|%d|%d", escrowInfo, 1, "b", kid, b.CAFingerprint, 4, t0.UnixNano())))...)
+	if err := StoreEscrow(dir, "b", b); err != nil {
+		t.Fatalf("a copy of the first version: %v", err)
+	}
+	if res, err := AdoptEscrow(dir, "b", t0); err != nil || res != Adopted {
+		t.Fatalf("adopt from a copy of the first version: %v %v", res, err)
+	}
+}
+
+// CAF-8: the mode is set before the flush (a crash cannot bring the file back wider than asked).
+func TestTheModeIsSetBeforeTheFlush(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no file modes")
+	}
+	dir := t.TempDir()
+	var modeAtSync os.FileMode
+	old := syncFile
+	syncFile = func(f *os.File) error {
+		fi, err := f.Stat()
+		if err == nil {
+			modeAtSync = fi.Mode().Perm()
+		}
+		return old(f)
+	}
+	defer func() { syncFile = old }()
+	if err := WriteFile(filepath.Join(dir, "k"), []byte("x"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if modeAtSync != 0o640 {
+		t.Fatalf("the mode at the flush was %v", modeAtSync)
 	}
 }

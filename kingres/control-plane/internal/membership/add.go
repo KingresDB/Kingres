@@ -78,6 +78,10 @@ type Manager struct {
 	escrowActive    func(ctx context.Context) ([]string, error)
 	escrowTransport func(ctx context.Context, id, method, path string, in, out any) error
 	escrowDB        escrowDB
+	// More seams: the serials this CA issued, the servers whose answers are read, which of the servers are revoked.
+	escrowIssued   func(ctx context.Context) (map[string]bool, error)
+	escrowReadable func(ctx context.Context) ([]string, error)
+	escrowRevoked  func(ctx context.Context) (map[string]bool, error)
 
 	gatherMu   sync.Mutex
 	gatherAuth map[string]*gatherAuth
@@ -606,6 +610,7 @@ func (m *Manager) stepAddPrepare(ctx context.Context, env *task.Env) error {
 	if err != nil {
 		return err
 	}
+	m.reconcileRevocations(ctx, ca)
 	if err := m.Svc.PublishLocalCRL(ctx); err != nil {
 		return fmt.Errorf("publishing the revocation list: %w", err)
 	}
@@ -839,17 +844,12 @@ func (m *Manager) distributeRevocations(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	ids, err := m.revocationPeers(ctx)
+	ids, revoked, err := m.revocationTargets(ctx)
 	if err != nil {
 		return err
 	}
-	var first error
-	for _, id := range ids {
-		req := wire.PKIRequest{CACert: string(ca.CertPEM()), Revoked: ca.Revoked(), CRL: string(crl)}
-		if err := m.installRevocations(ctx, id, ca, req); err != nil && first == nil {
-			first = fmt.Errorf("sending the revocation list to %s: %w", id, err)
-		}
-	}
+	req := wire.PKIRequest{CACert: string(ca.CertPEM()), Revoked: ca.Revoked(), CRL: string(crl)}
+	first := m.distributeAll(ids, revoked, func(id string) error { return m.installRevocations(ctx, id, ca, req) })
 	m.escrowAfterRevocation(ctx)
 	return first
 }

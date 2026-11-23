@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,6 +39,15 @@ const EscrowRefresh = 6 * time.Hour
 const escrowDropAfterMisses = 3
 
 const escrowCallTimeout = 20 * time.Second
+
+// escrowDropTimeout bounds one attempt to delete a copy: a server that is gone must not hold the round (and the lock of the escrow) for long.
+const escrowDropTimeout = 5 * time.Second
+
+// maxCounter bounds the epoch and the generation read from the system database or from a server (no overflow at the next increment).
+const maxCounter = int64(1) << 62
+
+// maxHolders bounds the holders read from the system database.
+const maxHolders = 64
 
 // escrowGuard serializes the escrow files of this server (the bookkeeping, the keys and the copy).
 type escrowGuard struct {
@@ -142,6 +152,19 @@ func (m *Manager) SetEscrowRecipients(f EscrowRecipients) {
 	m.escrowRecipients = f
 }
 
+// validServerID says whether a string can be the id of a server (a host name or an address).
+func validServerID(id string) bool {
+	if id == "" || len(id) > 253 {
+		return false
+	}
+	for _, c := range id {
+		if c <= 32 || c == 127 || c == '/' || c == '\\' {
+			return false
+		}
+	}
+	return true
+}
+
 // escrowActiveServers lists the active members other than this server whose certificates are not revoked.
 func (m *Manager) escrowActiveServers(ctx context.Context) ([]string, error) {
 	if m.escrowActive != nil {
@@ -200,10 +223,76 @@ func (m *Manager) escrowCandidates(ctx context.Context) (cands, active []string,
 	return cands, active, nil
 }
 
+// Limits on what a peer can make the leader merge.
+const (
+	maxSerialsFromPeer = 10000
+	maxSerialLength    = 64
+	// maxCRLJump is how far above its own clock a revocation list number may be before the leader refuses to follow it.
+	maxCRLJump = 24 * time.Hour
+)
+
+// issuedSerials is the set of serial numbers this CA issued (the certificate table and the certificates of the servers).
+func (m *Manager) issuedSerials(ctx context.Context) (map[string]bool, error) {
+	if m.escrowIssued != nil {
+		return m.escrowIssued(ctx)
+	}
+	out := map[string]bool{}
+	err := m.sys(ctx, func(c *pgx.Conn) error {
+		rows, err := c.Query(ctx, `SELECT serial FROM kingres_cp.certificate UNION SELECT certificate_serial FROM kingres_cp.server WHERE certificate_serial IS NOT NULL`)
+		if err != nil {
+			return err
+		}
+		list, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		for _, s := range list {
+			out[strings.ToLower(s)] = true
+		}
+		return err
+	})
+	return out, err
+}
+
+// readablePeers are the servers whose answers a leader trusts to read: active members whose certificates are not revoked (a revoked or
+// leaving server is the one that has a reason to lie).
+func (m *Manager) readablePeers(ctx context.Context) ([]string, error) {
+	if m.escrowReadable != nil {
+		return m.escrowReadable(ctx)
+	}
+	if m.escrowActive != nil {
+		return m.escrowActive(ctx)
+	}
+	rows, err := m.listServers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, r := range rows {
+		if r.Status == StatusActive && r.RevokedAt == nil && r.ID != m.Self {
+			out = append(out, r.ID)
+		}
+	}
+	return out, nil
+}
+
+// learnCRLNumber raises the number of the next revocation list above one that a server holds. A number far above the clock is not followed
+// (a server with a wrong date would pin every later list above it).
+func (m *Manager) learnCRLNumber(ca *pki.CA, from string, n int64) {
+	if n <= 0 {
+		return
+	}
+	if n > time.Now().Add(maxCRLJump).Unix() {
+		m.log().Warn("a server holds a revocation list whose number is more than a day above this server's clock; not following it", "server", from, "number", n)
+		return
+	}
+	if err := ca.EnsureCRLNumberAbove(n); err != nil {
+		m.log().Error("raising the number of the revocation list failed", "error", err)
+	}
+}
+
 // reconcileRevocations merges every revocation this server can learn of into the CA it holds: the file the previous leader
-// distributed, the copy of the revocation list in its sealed copy, the revocation list file that is published and the list
-// of every other server. A revocation list never shrinks, so a leader that was away (or a new one) does this before it
-// distributes anything: its list must be at least what the servers already trust.
+// distributed, the copy of the revocation list in its sealed copy and the revocation list file that is published (all three are this
+// server's own, and sealed or signed), and, from the other servers, the serials of certificates this CA issued. A revocation list never
+// shrinks, so a leader that was away (or a new one) does this before it distributes anything: its list must be at least what the servers
+// already trust. What a server reports that this CA never issued is ignored, whoever the server is: the merge cannot be undone.
 func (m *Manager) reconcileRevocations(ctx context.Context, ca *pki.CA) {
 	dir := m.Svc.PKIDir()
 	now := time.Now()
@@ -232,15 +321,20 @@ func (m *Manager) reconcileRevocations(ctx context.Context, ca *pki.CA) {
 			}
 		}
 	}
-	ids, err := m.revocationPeers(ctx)
+	ids, err := m.readablePeers(ctx)
 	if err != nil {
 		m.log().Warn("the servers could not be listed to learn their revocation lists", "error", err)
 		return
 	}
+	issued, ierr := m.issuedSerials(ctx)
+	if ierr != nil {
+		m.log().Warn("the serials this CA issued could not be read; the revocation lists of the servers are not merged", "error", ierr)
+	}
 	for _, id := range ids {
 		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		var out struct {
-			Serials []string `json:"serials"`
+			Serials   []string `json:"serials"`
+			CRLNumber int64    `json:"crlNumber"`
 		}
 		err := m.peerCall(cctx, id, "GET", "/revoked", nil, &out, true)
 		cancel()
@@ -248,12 +342,31 @@ func (m *Manager) reconcileRevocations(ctx context.Context, ca *pki.CA) {
 			m.log().Warn("the revocation list of a server could not be read", "server", id, "error", err)
 			continue
 		}
-		add(id, out.Serials)
+		m.learnCRLNumber(ca, id, out.CRLNumber)
+		if ierr != nil {
+			continue
+		}
+		var take []string
+		ignored := 0
+		for i, s := range out.Serials {
+			s = strings.ToLower(s)
+			switch {
+			case i >= maxSerialsFromPeer, len(s) > maxSerialLength, !issued[s]:
+				ignored++
+			default:
+				take = append(take, s)
+			}
+		}
+		if ignored > 0 {
+			m.log().Warn("a server reported revoked serials that this CA did not issue (or too many); they are ignored", "server", id, "count", ignored)
+		}
+		add(id, take)
 	}
 }
 
-// installRevocations sends the revocation list to one server. A server that holds a revocation the list lacks refuses it
-// (stale_revocations); the leader then learns what the servers hold, issues the list again and sends it once more.
+// installRevocations sends the revocation list to one server. A server that holds a revocation the list lacks, or a higher number,
+// refuses it (stale_revocations, with the number it holds); the leader then learns what the servers hold, issues the list again above
+// that number and sends it once more.
 func (m *Manager) installRevocations(ctx context.Context, id string, ca *pki.CA, req wire.PKIRequest) error {
 	err := m.peerCall(ctx, id, "POST", "/pki/install", req, nil, true)
 	var ae *peerclient.APIError
@@ -261,6 +374,9 @@ func (m *Manager) installRevocations(ctx context.Context, id string, ca *pki.CA,
 		return err
 	}
 	m.log().Warn("a server refused the revocation list because it takes a revocation back; merging and sending again", "server", id)
+	if n, ok := pki.ParseHeldNumber(ae.Message); ok {
+		m.learnCRLNumber(ca, id, n)
+	}
 	m.reconcileRevocations(ctx, ca)
 	if err := m.Svc.PublishLocalCRL(ctx); err != nil {
 		return err
@@ -273,6 +389,71 @@ func (m *Manager) installRevocations(ctx context.Context, id string, ca *pki.CA,
 	return m.peerCall(ctx, id, "POST", "/pki/install", req, nil, true)
 }
 
+// distributeAll sends to every server in the order given and does not stop at the first refusal: the errors are collected, the servers
+// that failed are tried once more, and the result is the errors that remain. A server in ignore (one whose certificates are revoked)
+// has no say: its failure is logged and does not fail the whole.
+func (m *Manager) distributeAll(ids []string, ignore map[string]bool, send func(id string) error) error {
+	var failed []string
+	for _, id := range ids {
+		if err := send(id); err != nil {
+			if ignore[id] {
+				m.log().Warn("the revocation list could not be sent to a server whose certificates are revoked", "server", id, "error", err)
+				continue
+			}
+			m.log().Warn("the revocation list could not be sent to a server; the others go on", "server", id, "error", err)
+			failed = append(failed, id)
+		}
+	}
+	var errs []error
+	for _, id := range failed {
+		if err := send(id); err != nil {
+			errs = append(errs, fmt.Errorf("sending the revocation list to %s: %w", id, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// revocationTargets are the servers that get a revocation list: the active members, those whose certificates are revoked last (they
+// accept the leader's certificate but must not hold the others up), and the set of the revoked ones.
+func (m *Manager) revocationTargets(ctx context.Context) (ids []string, revoked map[string]bool, err error) {
+	revoked = map[string]bool{}
+	if m.escrowActive != nil {
+		ids, err = m.escrowActive(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		if m.escrowRevoked != nil {
+			if revoked, err = m.escrowRevoked(ctx); err != nil {
+				return nil, nil, err
+			}
+		}
+	} else {
+		rows, lerr := m.listServers(ctx)
+		if lerr != nil {
+			return nil, nil, lerr
+		}
+		for _, r := range rows {
+			if r.Status == StatusActive && r.ID != m.Self {
+				ids = append(ids, r.ID)
+				if r.RevokedAt != nil {
+					revoked[r.ID] = true
+				}
+			}
+		}
+	}
+	ids = slices.Clone(ids)
+	slices.SortStableFunc(ids, func(a, b string) int {
+		switch {
+		case revoked[a] == revoked[b]:
+			return 0
+		case revoked[a]:
+			return 1
+		}
+		return -1
+	})
+	return ids, revoked, nil
+}
+
 // AdoptEscrow is called on a server that has become the manager leader (step B8 of the failover of the map group). When it
 // holds no usable CA key it makes one from its sealed copy; when it holds one (a former leader that is back) it keeps it.
 // Either way it merges every revocation it can learn of before it distributes anything, takes a new epoch (so that copies
@@ -282,6 +463,7 @@ func (m *Manager) AdoptEscrow(ctx context.Context) (bool, error) {
 	m.escrow.mu.Lock()
 	defer m.escrow.mu.Unlock()
 	dir := m.Svc.PKIDir()
+	pki.CleanTempFiles(dir, 5*time.Minute, 3)
 	res, err := pki.AdoptEscrow(dir, m.Self, time.Now())
 	switch {
 	case err != nil:
@@ -313,9 +495,15 @@ func (m *Manager) AdoptEscrow(ctx context.Context) (bool, error) {
 	if found {
 		known = true
 		st.Enabled = sh.Enabled
-		st.Generation = max(st.Generation, sh.Generation)
-		st.Epoch = max(st.Epoch, sh.Epoch)
-		for _, id := range sh.Holders {
+		// The row is read from a replica and can be wrong or hostile: the counters are bounded (no overflow at the next increment), the holders
+		// are valid server ids and few.
+		st.Generation = max(st.Generation, min(max(sh.Generation, 0), maxCounter))
+		st.Epoch = max(st.Epoch, min(max(sh.Epoch, 0), maxCounter))
+		for i, id := range sh.Holders {
+			if i >= maxHolders || !validServerID(id) {
+				m.log().Warn("a holder in the state of the CA key escrow was ignored", "holder", fmt.Sprintf("%.40q", id))
+				continue
+			}
 			if _, ok := st.Recipients[id]; !ok {
 				st.Recipients[id] = pki.EscrowRecipientState{}
 			}
@@ -326,8 +514,8 @@ func (m *Manager) AdoptEscrow(ctx context.Context) (bool, error) {
 		st.Enabled = true
 	}
 	if herr == nil {
-		st.Generation = max(st.Generation, held.Position.Generation)
-		st.Epoch = max(st.Epoch, held.Position.Epoch)
+		st.Generation = max(st.Generation, min(held.Position.Generation, maxCounter))
+		st.Epoch = max(st.Epoch, min(held.Position.Epoch, maxCounter))
 	}
 	if !known {
 		return true, nil
@@ -489,6 +677,7 @@ func (m *Manager) SyncEscrow(ctx context.Context) error {
 
 // RunEscrow runs SyncEscrow every interval until ctx ends.
 func (m *Manager) RunEscrow(ctx context.Context, interval time.Duration) {
+	pki.CleanTempFiles(m.Svc.PKIDir(), 5*time.Minute, 3)
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -501,6 +690,13 @@ func (m *Manager) RunEscrow(ctx context.Context, interval time.Duration) {
 		case <-t.C:
 		}
 	}
+}
+
+// dropDue counts the rounds of a record whose copy could not be deleted: after 30 failed rounds the server is tried only every tenth round
+// (a server that is gone for good must not cost a timeout in every round).
+func dropDue(rs *pki.EscrowRecipientState) bool {
+	rs.Misses++
+	return rs.Misses < 30 || rs.Misses%10 == 0
 }
 
 // markDropFailed keeps the record of a server whose copy could not be deleted, so that the drop is tried again.
@@ -540,6 +736,10 @@ func (m *Manager) syncEscrowLocked(ctx context.Context, ca *pki.CA, rotate bool)
 			if rs.Misses < escrowDropAfterMisses {
 				continue
 			}
+		}
+		if rs.DropPending && !dropDue(&rs) {
+			st.Recipients[id] = rs
+			continue
 		}
 		if err := m.dropEscrowAt(ctx, id, st.Epoch); err != nil {
 			m.markDropFailed(&st, id, err)
@@ -614,14 +814,13 @@ func (m *Manager) sendEscrow(ctx context.Context, ca *pki.CA, id string, st *pki
 	}
 	// The recipient holds a copy of a leader of a newer epoch than this one: this server is a former leader (or lost its record). It must
 	// not override the newer leader, so it seals nothing; only the operator's rotation, made on the leader of the moment, takes a higher epoch.
+	if offer.HeldEpoch < 0 || offer.HeldEpoch > maxCounter || offer.HeldGeneration < 0 || offer.HeldGeneration > maxCounter {
+		return fmt.Errorf("the server %s reports a position of its copy that is not valid", id)
+	}
 	if offer.HeldEpoch > st.Epoch {
-		if !rotate {
-			return fmt.Errorf("the server holds a copy of epoch %d, above this leader's %d: a newer leader has sealed it", offer.HeldEpoch, st.Epoch)
-		}
-		st.Epoch = offer.HeldEpoch + 1
-		st.Seq = 0
-		st.Generation = max(st.Generation, offer.HeldGeneration) + 1
-		m.log().Warn("a recipient holds a copy of a newer epoch than this leader's; the rotation takes a higher one", "server", id, "epoch", st.Epoch)
+		// Not even the operator's rotation takes an epoch above a server's: that would make the real leader the one that is refused. The leader of
+		// a newer epoch seals; this one does not.
+		return fmt.Errorf("the server holds a copy of epoch %d, above this leader's %d: a newer leader has sealed it", offer.HeldEpoch, st.Epoch)
 	}
 	st.Seq++
 	now := time.Now()
@@ -669,6 +868,11 @@ func (r *Receiver) handleEscrowCall(_ context.Context, key string, body []byte) 
 		}
 		m.escrow.mu.Lock()
 		defer m.escrow.mu.Unlock()
+		if req.Rotate {
+			if err := stale(req.Epoch); err != nil {
+				return nil, true, err
+			}
+		}
 		id, pub, err := pki.RecipientOffer(dir, req.Rotate, time.Now())
 		if err != nil {
 			return nil, true, err
@@ -711,22 +915,4 @@ func (m *Manager) escrowAfterRevocation(ctx context.Context) {
 	if err := m.SyncEscrow(ctx); err != nil {
 		m.log().Warn("sending the sealed copies of the CA key after a revocation", "error", err)
 	}
-}
-
-// revocationPeers are the servers whose revocation lists a leader reads before it distributes its own.
-func (m *Manager) revocationPeers(ctx context.Context) ([]string, error) {
-	if m.escrowActive != nil {
-		return m.escrowActive(ctx)
-	}
-	rows, err := m.listServers(ctx)
-	if err != nil {
-		return nil, err
-	}
-	var out []string
-	for _, r := range rows {
-		if r.Status == StatusActive && r.ID != m.Self {
-			out = append(out, r.ID)
-		}
-	}
-	return out, nil
 }
