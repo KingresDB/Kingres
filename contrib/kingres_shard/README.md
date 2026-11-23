@@ -1198,6 +1198,14 @@ on each node and then `sync_catalog()` on the map group primary.
   of the hook that runs as the calling role is qualified the same way. `t/252_extension_search_path` plants such an operator and fails
   if it is ever called.
 
+- The library is preloaded, so its hooks run in every database, and the owner of a database that does not have the extension can make
+  a schema `kingres` with relations named like the catalog tables. The catalog is trusted only when the extension is installed in the
+  database, each catalog relation is a member of it and the schema `kingres` belongs to a superuser; the decision is kept for the
+  transaction and dropped by relcache, extension, schema and role invalidations and around every utility statement. Otherwise the
+  extension acts as if it were not installed there (no routing, no hook acting, one `LOG` line per session), and the code that runs
+  a function of the schema as the bootstrap superuser refuses with an error. A catalog table that is not an ordinary table, or whose
+  first columns have other types than the loader reads, is an `ERROR`, not a crash. `t/253_catalog_spoof` makes the look-alikes, with a
+  listener on the port that a fake node names, and fails on any crash, connection or marker.
 ## DDL on distributed and reference tables
 
 On a cluster with more than one shard group, a utility statement that names a

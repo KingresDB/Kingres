@@ -127,6 +127,8 @@ extern bool kingres_shard_previous_secret(unsigned char *buf, int bufsize, int *
 extern bool kingres_shard_cluster_secret_for_names(unsigned char *buf, int bufsize, int *len);
 extern int kingres_shard_local_node_id_raw(void);
 extern void kingres_shard_catalog_invalidate(void);
+extern void kingres_shard_trust_invalidate(void);
+extern void kingres_shard_require_catalog(void);
 extern int64 kingres_shard_catalog_generation(void);
 extern KsColocation *kingres_shard_coloc_copy(const KsColocation *coloc);
 extern KsColocation *kingres_shard_coloc_make(int colocation_id, int nbuckets, Oid dist_type, Oid collation,

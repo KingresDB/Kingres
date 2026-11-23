@@ -2260,8 +2260,31 @@ map_partition_statement(Node *parsetree, QueryCompletion *qc)
 	return false;
 }
 
+static void process_utility_body(PlannedStmt *pstmt, const char *queryString,
+								 bool readOnlyTree, ProcessUtilityContext context,
+								 ParamListInfo params, QueryEnvironment *queryEnv,
+								 DestReceiver *dest, QueryCompletion *qc);
+
+/*
+ * The hook proper: whether the catalog of the database is the one of the extension is decided
+ * again before and after every statement, because ALTER EXTENSION ... ADD and CREATE/ALTER/DROP of
+ * the extension and of the schema change it without a message that every cache hears.
+ */
 static void
 kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
+							   bool readOnlyTree,
+							   ProcessUtilityContext context,
+							   ParamListInfo params,
+							   QueryEnvironment *queryEnv,
+							   DestReceiver *dest, QueryCompletion *qc)
+{
+	kingres_shard_trust_invalidate();
+	process_utility_body(pstmt, queryString, readOnlyTree, context, params, queryEnv, dest, qc);
+	kingres_shard_trust_invalidate();
+}
+
+static void
+process_utility_body(PlannedStmt *pstmt, const char *queryString,
 							   bool readOnlyTree,
 							   ProcessUtilityContext context,
 							   ParamListInfo params,
