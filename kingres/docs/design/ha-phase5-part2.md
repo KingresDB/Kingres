@@ -950,6 +950,15 @@ survivable for a long while but not acceptable for ever.
     keeps its copy.
 11. *Durability* (CAE-5): `ca.key` is written with the durable write; a `ca.key` that is not the key of `ca.crt` is put
     aside, and without a copy the alert is raised.
+12. *What a server may say about revocations* (CAF-1, fixed 2026-11-23): the leader merges the list of another server only for serials this CA
+    issued, at most 10000 and 64 characters each, never from a server whose certificates are revoked, and never when the issued serials cannot
+    be read. Without this a single server could make the leader revoke any certificate, and the rule that a list never shrinks would make it
+    permanent. The remaining power of a member is to name a certificate that exists; it is the trust of every member (D3).
+13. *Clocks and the number of a list* (CAF-2): the number is at least the time in seconds, and a leader raises it above every number it learns from
+    the servers (their answers and their refusals). A number more than a day above the leader's clock is not followed.
+14. *The epoch is not a second fence* (CAF-4): two servers that take over without seeing each other's epoch both take the next one; the lease of the map
+    group is what prevents that, and the epoch only keeps the copies of a former leader from winning. A rotation does not take an epoch above what a server
+    holds.
 
 **What this does not do.** It does not rotate the CA (the CA lasts 10 years), does not protect a cluster whose
 leader and every standby of the map group are lost at once (restore from a backup as before), and does not

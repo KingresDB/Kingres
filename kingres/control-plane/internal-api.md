@@ -45,7 +45,7 @@ version 1, the caller \"2\"."}` when the number is missing or different.
 |---|---|---|
 | `GET /internal/v1/state` | any peer | server id, node state, versions (kingresd, internal protocol, the PostgreSQL version and the version of each KingresDB extension its instance offers, for the leader's check `versionMismatch`), uptime |
 | `GET /internal/v1/leader` | any peer | the server id this server believes to be the manager leader |
-| `GET /internal/v1/revoked` | any peer | revoked certificate serial numbers (hex) |
+| `GET /internal/v1/revoked` | any peer | revoked certificate serial numbers (hex) and `crlNumber`, the number of the revocation list the server holds (0 when none); a leader that distributes merges only the serials this CA issued and raises its next list number above the numbers it learns here |
 | `GET /internal/v1/resources` | leader | CPU, memory and disks of the server |
 | `GET /internal/v1/logs` | leader | local log entries (query: `level`, `from`, `to`, `limit`, `cursor`) |
 | `GET /internal/v1/metrics` | leader | latest metric samples |
@@ -71,7 +71,7 @@ version 1, the caller \"2\"."}` when the number is missing or different.
 | `POST /internal/v1/instance/create` | leader, or any peer while joining | create, configure and start the instance for the cluster's settings and managed rules |
 | `POST /internal/v1/instance/start`, `/stop`, `/remove` | leader | start or stop the instance; stop and delete it and its credentials |
 | `POST /internal/v1/instance/trust` | leader, or any peer while joining | the servers to trust (certificate rules and map), the managed network rules, TLS settings; reload |
-| `POST /internal/v1/pki/install` | leader, or any peer while joining | revocation list (PEM CRL and serial numbers) and, when renewed, the server certificate; a list that takes a revocation back (a lower number, or a serial the held list has that it lacks) is refused with 409 `stale_revocations` |
+| `POST /internal/v1/pki/install` | leader, or any peer while joining | revocation list (PEM CRL and serial numbers) and, when renewed, the server certificate; a list that takes a revocation back (a lower number, or a serial the held list has that it lacks) is refused with 409 `stale_revocations` (the message ends with `held number N`; the body limit of this call is 16 MiB) |
 | `POST /internal/v1/peers` | leader, or any peer while joining | the peer directory (server id, internal address and ordinal of every server) |
 | `POST /internal/v1/globals/apply` | leader, or any peer while joining | create roles (with password verifiers, never passwords) and databases with their extensions |
 | `POST /internal/v1/node/finish` | leader, or any peer while joining | the server becomes clustered and its setup token is removed |
