@@ -247,6 +247,26 @@ unlike($err, qr/not supported on distributed tables/, 'C: ... no refusal of the 
 ($rc, $out, $err) = as_super('postgres', q{ALTER TABLE public.t DROP COLUMN id});
 like($err, qr/not supported on distributed tables/, 'C: after the rollback the catalog is the catalog again');
 
+# another session that has already decided that the catalog is the catalog hears of ALTER EXTENSION ... DROP TABLE (a decision
+# is kept across transactions, so the DROP must reach it)
+{
+	my $sess = $node->background_psql('postgres');
+	$sess->query_safe(q{SET client_min_messages = warning});
+	$sess->query_safe(q{SELECT count(*) FROM public.t});
+	my $probe = q{
+		DO $$ DECLARE m text; BEGIN
+			BEGIN EXECUTE 'ALTER TABLE public.t DROP COLUMN id'; EXCEPTION WHEN OTHERS THEN m := SQLERRM; END;
+			CREATE TEMP TABLE IF NOT EXISTS probe (m text); DELETE FROM probe; INSERT INTO probe VALUES (m);
+		END $$;
+		SELECT m FROM probe;};
+	like($sess->query_safe($probe), qr/not supported on distributed tables/, 'C: the second session refuses by the catalog');
+	su(q{ALTER EXTENSION kingres_shard DROP TABLE kingres.local_node});
+	like($sess->query_safe($probe), qr/part of the partition key/, 'C: after another session dropped a catalog table from the extension, this one no longer trusts the catalog');
+	su(q{ALTER EXTENSION kingres_shard ADD TABLE kingres.local_node});
+	like($sess->query_safe($probe), qr/not supported on distributed tables/, 'C: ... and trusts it again when the table is added back');
+	$sess->quit;
+}
+
 # the schema must belong to a superuser
 su(q{CREATE ROLE other SUPERUSER});
 ($rc, $out, $err) = as_super('postgres', q{

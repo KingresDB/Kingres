@@ -10,7 +10,7 @@
 #   A. a database without the extension: a registry and an index that look like the ledger's (the
 #      index is the index of another table), and a function that writes a marker: ordinary DDL and
 #      DML work, nothing crashes, no function of the tenant runs
-#   B. the ledger installed in a schema that the owner of the database made first, with tables
+#   B. the ledger installed, its schema given to the owner of the database, with tables
 #      that describe a distributed schema that another shard group holds: kingres_shard is not
 #      installed, so the description is not the catalog of a cluster and ledger_enable is not
 #      refused because of it
@@ -76,23 +76,24 @@ unlike($err, qr/server closed the connection|terminated/i, 'A: the extension doe
 is($node->safe_psql('spoofdb', q{SELECT count(*) FROM public.marker}), '0', 'A: no function of the tenant ran');
 
 # B
+($rc, $out, $err) = psql_as('tenant', 'shdb', q{CREATE SCHEMA s; CREATE TABLE s.t (id int PRIMARY KEY, v text)});
+is($rc, 0, 'B: the tenant makes a table in a schema of its own') or diag($err);
+# the superuser installs the ledger (the schema is made by the install) and gives the schema to the tenant; in a build
+# that refuses to install into a schema of somebody else this is the way to get one
+($rc, $out, $err) = psql_as(undef, 'shdb', q{CREATE EXTENSION kingres_ledger; ALTER SCHEMA kingres OWNER TO tenant});
+is($rc, 0, 'B: the superuser installs the ledger and gives its schema to the tenant') or diag($err);
 ($rc, $out, $err) = psql_as('tenant', 'shdb', q{
-	CREATE SCHEMA kingres;
 	CREATE TABLE kingres.dist_schema (nsp regnamespace NOT NULL, colocation_id int NOT NULL);
 	CREATE TABLE kingres.bucket_map (colocation_id int NOT NULL, bucket int NOT NULL, group_id int NOT NULL, state text NOT NULL DEFAULT 'active');
 	CREATE TABLE kingres.local_node (node_id int NOT NULL);
 	CREATE TABLE kingres.node (node_id int NOT NULL, group_id int NOT NULL, role text NOT NULL, is_active bool NOT NULL DEFAULT true);
 	CREATE TABLE kingres.bucket_move (colocation_id int, phase text);
-	CREATE SCHEMA s;
-	CREATE TABLE s.t (id int PRIMARY KEY, v text);
 	INSERT INTO kingres.node VALUES (1, 1, 'primary'), (2, 7, 'primary');
 	INSERT INTO kingres.local_node VALUES (1);
 	INSERT INTO kingres.dist_schema VALUES ('s'::regnamespace, 5);
 	INSERT INTO kingres.bucket_map VALUES (5, 0, 7, 'active');
 });
-is($rc, 0, 'B: the owner makes tables that say that group 7 holds the schema s, and this node is of group 1') or diag($err);
-($rc, $out, $err) = psql_as(undef, 'shdb', q{CREATE EXTENSION kingres_ledger});
-is($rc, 0, 'B: the superuser installs the ledger into the schema of the tenant') or diag($err);
+is($rc, 0, 'B: the owner of the schema makes tables that say that group 7 holds the schema s, and this node is of group 1') or diag($err);
 ($rc, $out, $err) = psql_as(undef, 'shdb', q{SELECT kingres.ledger_enable('s.t')});
 isnt($rc, 0, 'B: while the schema is the tenant\'s, ledger_enable refuses (the registry cannot be trusted)');
 like($err, qr/cannot be trusted/, 'B: ... and says why') or diag($err);

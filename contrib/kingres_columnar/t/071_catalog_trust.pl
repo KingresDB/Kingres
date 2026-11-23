@@ -74,11 +74,10 @@ unlike($err, qr/server closed the connection|terminated/i, 'A: ... and no crash'
 ($rc, $out, $err) = as_super('spoofdb', q{SELECT count(*) FROM public.marker});
 like($out, qr/^0$/m, 'A: nothing wrote a marker');
 
-# B: the extension in a schema that a role that is not a superuser made first
-($rc, $out, $err) = as_tenant('ownerdb', q{CREATE SCHEMA kingres});
-is($rc, 0, 'B: the owner makes the schema first') or diag($err);
-($rc, $out, $err) = as_super('ownerdb', q{CREATE EXTENSION kingres_columnar});
-is($rc, 0, 'B: the superuser installs the extension into it') or diag($err);
+# B: the extension installed, and its schema then given to a role that is not a superuser (an install into a schema that such a
+# role made first is refused by the install script where that check exists; this is the state that is left to the C code)
+($rc, $out, $err) = as_super('ownerdb', q{CREATE EXTENSION kingres_columnar; ALTER SCHEMA kingres OWNER TO tenant});
+is($rc, 0, 'B: the superuser installs the extension and gives its schema to the tenant') or diag($err);
 ($rc, $out, $err) = as_super('ownerdb', q{CREATE TABLE c (id int) USING columnar; INSERT INTO c VALUES (1)});
 isnt($rc, 0, 'B: a columnar table cannot be written: the schema is not the extension\'s');
 like($err, qr/cannot be used: the schema of the extension is not owned by a superuser/, 'B: ... the error says why') or diag($err);

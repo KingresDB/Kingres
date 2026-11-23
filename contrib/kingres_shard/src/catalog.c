@@ -210,8 +210,14 @@ catalog_xact_callback(XactEvent event, void *arg)
 
 	if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT && event != XACT_EVENT_PREPARE)
 		return;
-	/* the next transaction decides again whether the catalog may be trusted */
-	trust.valid = false;
+	/*
+	 * What was decided inside a transaction that ended in an abort may rest on changes that were rolled
+	 * back (an ALTER EXTENSION ... ADD that no message announced): decide again.  After a commit the
+	 * decision stands until a message says otherwise (relcache, extension, schema, role) or the utility
+	 * hook sees ALTER EXTENSION ... ADD/DROP, which also tells every other backend.
+	 */
+	if (event == XACT_EVENT_ABORT)
+		trust.valid = false;
 	foreach(lc, retired_cxts)
 		MemoryContextDelete((MemoryContext) lfirst(lc));
 	list_free(retired_cxts);
@@ -222,7 +228,8 @@ static void
 catalog_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 						 SubTransactionId parentSubid, void *arg)
 {
-	trust.valid = false;
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+		trust.valid = false;
 }
 
 static void
@@ -242,6 +249,39 @@ void
 kingres_shard_trust_invalidate(void)
 {
 	trust.valid = false;
+}
+
+/*
+ * kingres_shard_trust_broadcast
+ *
+ * ALTER EXTENSION kingres_shard ADD/DROP changes which relations are members, and no message of
+ * PostgreSQL tells the other backends.  The relcache of the catalog tables is invalidated here, so
+ * that every backend of the database hears it (catalog_inval_callback) and decides again.
+ */
+void
+kingres_shard_trust_broadcast(void)
+{
+	static const char *const more[] = {"cluster_secret", "dist_schema", "sharding_settings"};
+	Oid			nsp = get_namespace_oid(KINGRES_SHARD_SCHEMA, true);
+	int			i;
+
+	trust.valid = false;
+	if (!OidIsValid(nsp))
+		return;
+	for (i = 0; i < (int) NUM_CATALOG_TABLES; i++)
+	{
+		Oid			relid = get_relname_relid(catalog_tables[i], nsp);
+
+		if (OidIsValid(relid))
+			CacheInvalidateRelcacheByRelid(relid);
+	}
+	for (i = 0; i < (int) lengthof(more); i++)
+	{
+		Oid			relid = get_relname_relid(more[i], nsp);
+
+		if (OidIsValid(relid))
+			CacheInvalidateRelcacheByRelid(relid);
+	}
 }
 
 /*
