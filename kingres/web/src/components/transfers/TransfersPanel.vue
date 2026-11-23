@@ -76,10 +76,19 @@ const remove = useMutation({
 })
 
 function nameOf(e: DataExport): string {
+  if (e.kind === 'databaseExport') return `${e.database ?? ''} (archive)`
   return [e.database, e.schema, e.table].filter((p) => p !== null && p !== undefined).join('.')
 }
 function levels(e: DataExport): string {
   if (!e.consistency || e.consistency.length === 0) return ''
+  if (e.kind === 'databaseExport') {
+    const perGroup = e.consistency.filter(
+      (c) => c.level !== 'archive-single-snapshot' && c.level !== 'single-snapshot',
+    ).length
+    return perGroup === 0
+      ? `${e.consistency.length} tables, one snapshot`
+      : `${e.consistency.length} tables, ${perGroup} per group`
+  }
   return e.consistency
     .map((c) => (c.level === 'single-snapshot' ? 'one snapshot' : `per group (${c.groups})`))
     .join(', ')
@@ -199,7 +208,10 @@ function levels(e: DataExport): string {
         <li v-for="u in uploads" :key="u.uploadId" class="row-between">
           <span
             ><SafeName :value="u.fileName" :max="80" />
-            <span class="muted"
+            <span v-if="u.purpose === 'databaseArchive'" class="muted"
+              >({{ formatBytes(u.sizeBytes) }}, a database archive)</span
+            >
+            <span v-else class="muted"
               >({{ formatBytes(u.sizeBytes) }}, for
               <SafeName :value="`${u.database}.${u.schema}.${u.table}`" :max="80" />)</span
             ></span

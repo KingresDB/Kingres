@@ -123,6 +123,9 @@ export const EXPORT_STATE: Record<DataExport['state'], StatusMeta> = tolerant({
 export const UPLOAD_STATE: Record<DataUpload['state'], StatusMeta> = tolerant({
   receiving: { tone: 'info', icon: HALF, label: 'Receiving' },
   complete: { tone: 'ok', icon: OK, label: 'Complete' },
+  validating: { tone: 'info', icon: HALF, label: 'Being validated' },
+  valid: { tone: 'ok', icon: OK, label: 'Valid archive' },
+  invalid: { tone: 'danger', icon: BAD, label: 'Invalid archive' },
   lost: {
     tone: 'warn',
     icon: WARN,
@@ -294,6 +297,8 @@ export const TASK_KIND_LABEL: Record<TaskKind, string> = {
   'partition.maintain': 'Maintain the partitions of a table',
   'table.export': 'Export a table as CSV',
   'table.import': 'Import a CSV file into a table',
+  'database.export': 'Export a database to an archive',
+  'archive.validate': 'Validate a database archive',
   rebalance: 'Rebalance',
   'replication.restorePreferredPrimaries': 'Restore preferred primaries',
   'ledger.verify': 'Verify the ledger',
@@ -486,6 +491,8 @@ export const AUDIT_ACTION_LABEL: Record<AuditAction, string> = {
   acknowledgeLedgerDivergence: 'Acknowledge a diverged ledger chain',
   exportTable: 'Export a table as CSV',
   importTable: 'Import a CSV file into a table',
+  exportDatabase: 'Export a database to an archive',
+  validateDatabaseArchive: 'Validate a database archive',
   createDataUpload: 'Start an upload',
   deleteDataUpload: 'Delete an upload',
   downloadDataExport: 'Download an export file',

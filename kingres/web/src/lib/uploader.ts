@@ -89,6 +89,8 @@ export interface UploaderOptions {
   /** The largest staged file of the cluster (`dataTransfer.maxFileBytes`), when known. */
   maxFileBytes?: number | null
   compressed?: boolean
+  /** What the file is for (contract 0.40.0): a CSV for an import (the default) or a database archive. An archive is not capped by the size of one import. */
+  purpose?: 'tableImport' | 'databaseArchive'
   onChange?: (snapshot: UploadSnapshot) => void
   /** Called with the id when an upload exists, and with null when it is finished or gone (the tab's memory of it). */
   onUpload?: (uploadId: string | null) => void
@@ -156,7 +158,11 @@ export class Uploader {
     this.set({ failure: null, problem: null })
     if (file.size < 1) return this.fail('empty')
     // The cap is enforced here, before a byte is sent: a file above it is refused, not uploaded and then refused.
-    if (!this.o.compressed && file.size > (this.o.maxAtomicBytes ?? MAX_ATOMIC_BYTES))
+    if (
+      this.o.purpose !== 'databaseArchive' &&
+      !this.o.compressed &&
+      file.size > (this.o.maxAtomicBytes ?? MAX_ATOMIC_BYTES)
+    )
       return this.fail('too_large')
     if (this.o.maxFileBytes && file.size > this.o.maxFileBytes) return this.fail('too_large')
     const mine = ++this.run
@@ -178,7 +184,7 @@ export class Uploader {
   private async startNew(mine: number): Promise<void> {
     try {
       this.upload = await this.o.api.createDataUpload({
-        purpose: 'tableImport',
+        purpose: this.o.purpose ?? 'tableImport',
         sizeBytes: this.o.file.size,
         fileName: this.o.file.name,
       })
@@ -316,7 +322,9 @@ export class Uploader {
     const finished = await this.read(id)
     if (finished === 'stopped') return
     if (finished === 'gone') return this.fail('lost')
-    if (this.upload?.state !== 'complete') return this.fail('other')
+    // An archive that was validated before (contract 0.40.0) is complete as well: all its bytes are in.
+    const whole = ['complete', 'validating', 'valid', 'invalid']
+    if (!this.upload || !whole.includes(this.upload.state)) return this.fail('other')
     this.set({ phase: 'complete', sha256: this.upload.sha256 ?? null })
   }
 

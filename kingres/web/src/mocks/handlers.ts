@@ -10,6 +10,7 @@ import { ledgerHandlers } from './ledger'
 import { decorateStatus, distributedSchemaCount, elasticityHandlers } from './elasticity'
 import { analyticsHandlers, describePartitions, describeTable, explainPlan } from './analytics'
 import { transferHandlers } from './transfer'
+import { archiveHandlers } from './transfer-archive'
 import { AGGREGATE_SIZE, anchoringOf, digestAnchorsOf, l7, publicationOf } from './ledger-view'
 import type { HttpHandler } from 'msw'
 import type { components } from '@/api/schema'
@@ -1358,6 +1359,7 @@ export function createHandlers(): HttpHandler[] {
     ...ledgerHandlers(),
     ...elasticityHandlers(),
     ...analyticsHandlers(),
+    ...archiveHandlers(),
     ...transferHandlers((rec, t) =>
       (rec.extraColumns?.[t.name] ?? columnsFor(rec, t)).map((col) => col.name),
     ),

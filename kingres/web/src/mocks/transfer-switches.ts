@@ -70,6 +70,10 @@ export function applyTransferSwitch(entry: string, s: MockState): void {
     transferSwitches.cutAnswers400 = true
   }
   if (entry === 'short') transferSwitches.truncateDownloadAt = 8
+  if (entry === 'lobs') transferSwitches.largeObjects = true
+  if (entry === 'unreadable') transferSwitches.unreadable = true
+  if (entry === 'dbfail') transferSwitches.dbExportFails = true
+  if (entry === 'changed') transferSwitches.schemaChanges = true
   if (entry === 'exports') {
     seedExport(s, 'ready', 'orders', 20)
     seedExport(s, 'building', 'customers', 24)
