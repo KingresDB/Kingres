@@ -277,7 +277,9 @@ func TestSchemaSpoofIsNeverExecuted(t *testing.T) {
 	}
 	// The ledger operations of the control plane (digests, verifications, client keys): the extension is not there, or its schema cannot be trusted, so they refuse.
 	for _, db := range []string{"nox", "tpx"} {
-		if _, err := o.GenerateDigest(ctx, db, "a"); err == nil {
+		_, err := o.GenerateDigest(ctx, db, "a")
+		t.Logf("%s: GenerateDigest: %v", db, err)
+		if err == nil {
 			t.Errorf("%s: a digest was made", db)
 		}
 		// the lists are empty for a database without a ledger; what matters is that nothing of the tenant ran (the markers below)
