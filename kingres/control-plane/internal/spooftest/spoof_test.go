@@ -83,6 +83,7 @@ func (e *env) plant(t *testing.T, db string, schemas ...string) {
 		t.Fatal(err)
 	}
 	cfg.User, cfg.Password = "tenant", "tenant-pw"
+	cfg.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
 	c, err := pgx.ConnectConfig(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
