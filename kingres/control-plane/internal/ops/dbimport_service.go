@@ -40,8 +40,13 @@ const (
 	ApplyImportSequences = "import.sequences"
 	// ApplyImportRename: take the final name, make the importing role the owner.
 	ApplyImportRename = "import.rename"
-	// ApplyImportDrop is ApplyDatabaseDrop for a private database only.
+	// ApplyImportDrop: drop the private database of a task that failed, if this server made it for that task.
+	ApplyImportDrop = "import.drop"
 )
+
+type importDropOp struct {
+	Name string `json:"name"`
+}
 
 type importSeqItem struct {
 	Schema string `json:"schema"`
@@ -86,6 +91,12 @@ func (o *Ops) applyImportKind(ctx context.Context, kind string, raw json.RawMess
 			return true, err
 		}
 		return true, o.importSequencesLocal(ctx, p)
+	case ApplyImportDrop:
+		var p importDropOp
+		if err := strictJSON(raw, &p); err != nil {
+			return true, err
+		}
+		return true, o.importDropLocal(ctx, p.Name)
 	case ApplyImportRename:
 		var p importRenameOp
 		if err := strictJSON(raw, &p); err != nil {
@@ -773,6 +784,10 @@ func (o *Ops) importRenameLocal(ctx context.Context, op importRenameOp) error {
 	if err := run(ctx, c, stmt().Text("ALTER DATABASE").ID(to).Text("OWNER TO").ID(owner)); err != nil {
 		return err
 	}
+	// The marker of the private database goes with the name.
+	if err := run(ctx, c, stmt().Text("COMMENT ON DATABASE").ID(to).Text("IS NULL")); err != nil {
+		return err
+	}
 	// The default of a database that database.create makes: PUBLIC may connect.
 	return run(ctx, c, stmt().Text("GRANT CONNECT ON DATABASE").ID(to).Text("TO PUBLIC"))
 }
@@ -924,17 +939,44 @@ func (o *Ops) importOnFailHook(ctx context.Context, t task.Task) {
 	bg := context.WithoutCancel(ctx)
 	priv := privateName(t.ID)
 	if o.Service != nil {
-		if err := o.dropDB(bg, dropParams{Name: priv}); err != nil && o.Log != nil {
+		if err := o.importDropLocal(bg, priv); err != nil && o.Log != nil {
 			o.Log.Warn("the private database of a failed import could not be dropped", "database", priv, "error", err)
 		}
 	}
 	if o.Fanout != nil {
 		for _, s := range p.Servers {
-			if err := o.Fanout.Apply(bg, s, ApplyDatabaseDrop, dropParams{Name: priv}); err != nil && o.Log != nil {
+			if err := o.Fanout.Apply(bg, s, ApplyImportDrop, importDropOp{Name: priv}); err != nil && o.Log != nil {
 				o.Log.Warn("the private database of a failed import could not be dropped on a server", "database", priv, "server", s, "error", err)
 			}
 		}
 	}
+}
+
+// importDropLocal drops the private database of a task on this server, and only when this server made it for that task: the name starts with the prefix, the
+// database is owned by the service role (a database that a role made with a guessed name is not) and it carries the marker of the task. A database that is not
+// there is not an error.
+func (o *Ops) importDropLocal(ctx context.Context, name string) error {
+	if !strings.HasPrefix(name, privatePrefix) || !dbNameRE.MatchString(name) || protectedDB[name] {
+		return errors.New("this database cannot be dropped")
+	}
+	c, err := o.Service.ServiceConn(ctx, "postgres")
+	if err != nil {
+		return err
+	}
+	var mine bool
+	err = c.QueryRow(ctx, `SELECT pg_catalog.pg_get_userbyid(d.datdba) = current_user AND coalesce(pg_catalog.shobj_description(d.oid, 'pg_database'), '') = $2::pg_catalog.text
+		FROM pg_catalog.pg_database d WHERE d.datname = $1::pg_catalog.text::pg_catalog.name`, name, importMarker(name)).Scan(&mine)
+	_ = c.Close(context.WithoutCancel(ctx))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !mine {
+		return errors.New("the database was not made by this import")
+	}
+	return o.dropDB(ctx, dropParams{Name: name})
 }
 
 // sortedKeys of a set.

@@ -20,7 +20,7 @@ import (
 
 func TestDatabaseImportOverThreeServers(t *testing.T) {
 	c := clustertest.FormTLS(t, 3, nil, func(leader *clustertest.Node) {
-		body := leader.Expect(202, "POST", "/databases", map[string]any{"name": "dbm3", "sharding": map[string]any{"enabled": true, "bucketCount": 12},
+		body := leader.Expect(202, "POST", "/databases", map[string]any{"name": "dbm3", "sharding": map[string]any{"enabled": true, "bucketCount": 12, "mode": "both"},
 			"ledger": map[string]any{"mode": "optIn"}})
 		leader.WaitTaskDone(clustertest.TaskID(body), 4*time.Minute)
 	})
@@ -54,9 +54,13 @@ func TestDatabaseImportOverThreeServers(t *testing.T) {
 		"create table public.d_part (id bigint not null, ts timestamptz not null, v text, primary key (id, ts)) partition by range (ts)",
 		"create table public.c_events (id bigint, v text)",
 		"create table public.acc (id bigint primary key, bal int)",
+		"create schema tn",
+		"create table tn.docs (id bigint primary key, v text)",
 	} {
 		q("dbm3", s)
 	}
+	// A distributed schema: its tables live together on one group.
+	task("PUT", "/databases/dbm3/schemas/tn/distribution", nil)
 	task("PUT", tbl("refdata")+"/distribution", map[string]any{"method": "reference"})
 	task("PUT", tbl("d_hash")+"/distribution", map[string]any{"method": "hash", "distributionColumn": "id"})
 	task("PUT", tbl("d_two")+"/distribution", map[string]any{"method": "hash", "distributionColumn": "id", "colocateWith": map[string]any{"schema": "public", "table": "d_hash"}})
@@ -73,6 +77,7 @@ func TestDatabaseImportOverThreeServers(t *testing.T) {
 		"insert into public.d_part select g, '2026-02-01'::timestamptz + (g || ' hours')::interval, 'p' || g from generate_series(1, 90) g",
 		"insert into public.c_events select g, 'e' || g from generate_series(1, 120) g",
 		"insert into public.acc values (1, 10), (2, 20)",
+		"insert into tn.docs select g, 'doc' || g from generate_series(1, 60) g",
 	} {
 		q("dbm3", s)
 	}
@@ -118,7 +123,7 @@ func TestDatabaseImportOverThreeServers(t *testing.T) {
 		r := q(db, "select count(*), coalesce(md5(string_agg(x::text, '|' order by x::text)), '') from "+tb+" x")
 		return fmt.Sprint(r["rows"])
 	}
-	for _, tb := range []string{"public.t_plain", "public.refdata", "public.d_hash", "public.d_two", "public.d_part", "public.c_events", "public.acc"} {
+	for _, tb := range []string{"public.t_plain", "public.refdata", "public.d_hash", "public.d_two", "public.d_part", "public.c_events", "public.acc", "tn.docs"} {
 		if a, b := digest("dbm3", tb), digest("dbm3_copy", tb); a != b {
 			t.Errorf("table %s: source %s, imported %s", tb, a, b)
 		}
@@ -129,6 +134,10 @@ func TestDatabaseImportOverThreeServers(t *testing.T) {
 	}
 	if got := fmt.Sprint(q("dbm3_copy", "select count(distinct colocation_id) from kingres.dist_table where method = 'hash'")["rows"]); got != fmt.Sprint(q("dbm3", "select count(distinct colocation_id) from kingres.dist_table where method = 'hash'")["rows"]) {
 		t.Errorf("the colocation groups differ: %s", got)
+	}
+	// The schema is distributed here too, and its table is the schema's.
+	if a, b := fmt.Sprint(q("dbm3", "select count(*) from kingres.dist_schema")["rows"]), fmt.Sprint(q("dbm3_copy", "select count(*) from kingres.dist_schema")["rows"]); a != b || a != "[[1]]" {
+		t.Errorf("distributed schemas: source %s, imported %s", a, b)
 	}
 	// The sequence of the serial column continues above the rows on the node that takes the insert.
 	if got := fmt.Sprint(q("dbm3_copy", "insert into public.t_plain (name) values ('z') returning id")["rows"]); got != "[[3]]" {

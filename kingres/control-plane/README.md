@@ -435,6 +435,34 @@ placeholder.
   (`TestDatabaseExport*`, `TestSpikeS3DumpOfEveryTableKind`) and `internal/clustertest` (`TestDatabaseExportOverThreeServers`); run on PostgreSQL 18 and 19 with
   `scripts/run-integration.ps1`.
 
+## Database import (phase 14c, contract 0.41.0)
+
+One more operation of the tag `Data transfer` and one task (design: `docs/design/data-export-import.md`, "The task database.import", "What may run: the shape grammar (14c)"
+and "Results of the spikes and changes made by the code (phase 14c)"). The revision number is a placeholder.
+
+- **`importDatabase`** starts `database.import` (subject: the new database). The archive is hostile input and is read again from its bytes (the SHA-256 of the file against
+  `expectedSha256`, the whole validator, the shape grammar over the three SQL files), whatever the state of the upload says; a cached report may only make a request fail early.
+  Steps: *Check the archive* (versions, the closed list of extensions, the plan, the ledger acknowledgement, `maxImportBytes`), *Create the private database* (and one step for each
+  other server), *Install the extensions*, *Check the functions* (every function that an expression calls is looked up in `pg_proc` of the new database and must be builtin and not
+  on the list of the dangerous ones, or belong to a contrib extension of the manifest), *Create the tables* (the statements of `pre-data.sql` as the signed-in role), *Distribute the
+  tables* (from the catalog document, while they are empty), *Create the views*, *Load the data* (one transaction per table, the rows counted against the manifest), *Create the
+  indexes and constraints*, *Set the sequences* (on every node), *Enable the ledger and the policies* (new chain, policy set again, time-partition policies disabled), *Verify* and
+  *Take the final name* (the rename on every server, the owner, the registry).
+- **As the signed-in role, one statement per round trip.** `sqlshape.Each` hands out the exact text that the grammar consumed completely; the text is lexed again alone and must read
+  the same; it runs through the extended protocol (the server refuses several statements), on a connection with `search_path = pg_catalog`, after the dangerous-role check, which is
+  made again at every step. The service role runs only calls that the control plane writes from the catalog document with identifiers that passed `sqlx`, and only while the role
+  cannot connect (`CONNECT` is withdrawn and its sessions are ended); a table that the role made is first checked in the catalog (no trigger of its own, no rule, no policy, no
+  call of a function that is not allowed in a default, constraint or index) and the schema of an extension is verified by `extguard` before a call into it.
+- **A private name.** `kingres_import_<task id>`, made by the service role (a database that exists is a failure) with a marker comment; the failure hook drops a database only if
+  this server made it for that task. A failed or cancelled import leaves nothing under the final name.
+- **Flags.** `-max-import-bytes` (100 GiB), next to `-max-atomic-bytes`.
+- **Packages and files.** `internal/sqlshape/exec.go` (the execution mode of the grammar), `internal/archive/entry.go` and `assemble.go`, `internal/archive/archivetest`
+  (archives that lie, for tests), `internal/ops/dbimport*.go`.
+- **Tests.** Unit tests of every package, PostgreSQL tests of the function check, the check of a table, the extended protocol, the search path and the foreign keys
+  (`dbimport_pg_test.go`), cluster tests in `cmd/kingresd` (`TestDatabaseImport*`: the round trip, 45 hostile archives, hidden text, a dangerous role, the access of the role, cleanup,
+  a database that the task did not make, the archive of another major) and `internal/clustertest` (`TestDatabaseImportOverThreeServers`); run on PostgreSQL 18 and 19 with
+  `scripts/run-integration.ps1`.
+
 ## What is implemented
 
 The server implements revision **0.19.0** of the contract (171 operations, 136

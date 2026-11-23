@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -130,18 +131,19 @@ func TestDatabaseImportRoundTrip(t *testing.T) {
 	e, off := transferOn(t)
 	defer off()
 	buildExportFixture(t, e, "dbsrc")
+	// A ledger table whose signature policy is required: the import enters its rows first and sets the policy again after the verification.
+	ssrc := e.serviceConn(t, "dbsrc")
+	if _, err := ssrc.Exec(context.Background(), "select kingres.ledger_set_signature_policy('public.audit_rows'::regclass, 'required')"); err != nil {
+		t.Fatal(err)
+	}
+	_ = ssrc.Close(context.Background())
 	id := e.exportDB(t, "dbsrc", map[string]any{})
 	st, _, body := e.download(t, id, nil)
 	if st != 200 {
 		t.Fatalf("download: %d", st)
 	}
-	major := query(t, e, "postgres", "select current_setting('server_version_num')::int / 10000")
-	if dir := os.Getenv("KINGRES_ARCHIVE_DIR"); dir != "" {
-		// For the test of the other major: the archive of this one is kept (the cross-major tests read it).
-		if err := os.MkdirAll(dir, 0o700); err == nil {
-			_ = os.WriteFile(filepath.Join(dir, "archive-"+strings.Trim(major, "[]")+".zip"), body, 0o600)
-		}
-	}
+	// For the test of the other major: the archive of this one is kept with the digests of its source.
+	writeArchiveKept(t, e, body, digests(t, e, "dbsrc"))
 	up := e.uploadArchive(t, body)
 	// An archive with ledger tables needs the acknowledgement.
 	if st, out := e.importDB(t, map[string]any{"uploadId": up, "database": "dbdst"}); st != 202 {
@@ -188,8 +190,8 @@ func TestDatabaseImportRoundTrip(t *testing.T) {
 	defer func() { _ = ssc.Close(context.Background()) }()
 	dsc := e.serviceConn(t, "dbdst")
 	defer func() { _ = dsc.Close(context.Background()) }()
-	if a, b := rowsText(t, ssc, led), rowsText(t, dsc, led); a != b {
-		t.Errorf("ledger tables: source %s, imported %s", a, b)
+	if a, b := rowsText(t, ssc, led), rowsText(t, dsc, led); a != b || !strings.Contains(a, "required") {
+		t.Errorf("ledger tables: source %s, imported %s (the policy of audit_rows must be required in both)", a, b)
 	}
 	sc := e.serviceConn(t, "dbdst")
 	defer func() { _ = sc.Close(context.Background()) }()
@@ -242,5 +244,69 @@ func TestDatabaseImportRoundTrip(t *testing.T) {
 	// A second import under the same name is refused at the request.
 	if st, out := e.importDB(t, map[string]any{"uploadId": up, "database": "dbdst", "acknowledgeLedgerRestart": true}); st != 409 || problemCode(out) != "already_exists" {
 		t.Errorf("a second import under the same name: %d %v", st, out)
+	}
+}
+
+// writeArchiveKept keeps the archive and the digests of the source for the cross-major test (KINGRES_ARCHIVE_DIR): the other major imports them.
+func writeArchiveKept(t testing.TB, e *cp, body []byte, src map[string]string) {
+	dir := os.Getenv("KINGRES_ARCHIVE_DIR")
+	if dir == "" {
+		return
+	}
+	major := strings.Trim(query(t, e, "postgres", "select current_setting('server_version_num')::int / 10000"), "[]")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Logf("the directory of the archives: %v", err)
+		return
+	}
+	_ = os.WriteFile(filepath.Join(dir, "archive-"+major+".zip"), body, 0o600)
+	b, _ := json.Marshal(src)
+	_ = os.WriteFile(filepath.Join(dir, "digests-"+major+".json"), b, 0o600)
+}
+
+// An archive made on another major: one of an older major is imported and equals what its source was; one of a later major is refused as incompatible and nothing is
+// made. The archives are made by TestDatabaseImportRoundTrip of the other major (KINGRES_ARCHIVE_DIR names the directory both runs share).
+func TestDatabaseImportOfAnArchiveFromAnotherMajor(t *testing.T) {
+	dir := os.Getenv("KINGRES_ARCHIVE_DIR")
+	if dir == "" {
+		t.Skip("KINGRES_ARCHIVE_DIR is not set; the archives of the other major are not there")
+	}
+	e, off := transferOn(t)
+	defer off()
+	here := 0
+	fmt.Sscan(strings.Trim(query(t, e, "postgres", "select current_setting('server_version_num')::int / 10000"), "[]"), &here)
+	found := 0
+	for _, major := range []int{18, 19} {
+		body, err := os.ReadFile(filepath.Join(dir, fmt.Sprintf("archive-%d.zip", major)))
+		if err != nil {
+			continue
+		}
+		found++
+		var want map[string]string
+		if b, err := os.ReadFile(filepath.Join(dir, fmt.Sprintf("digests-%d.json", major))); err == nil {
+			_ = json.Unmarshal(b, &want)
+		}
+		up := e.uploadArchive(t, body)
+		name := fmt.Sprintf("dbfrom%d", major)
+		req := map[string]any{"uploadId": up, "database": name, "acknowledgeLedgerRestart": true}
+		if major > here {
+			e.importFails(t, req, "archive_incompatible")
+			if e.databaseExists(t, name) || len(e.waitNoPrivate(t)) != 0 {
+				t.Errorf("an archive of major %d on %d left something", major, here)
+			}
+			continue
+		}
+		e.importOK(t, req)
+		got := digests(t, e, name)
+		for _, tb := range roundTripTables {
+			if want[tb] == "" || got[tb] != want[tb] {
+				t.Errorf("the archive of major %d imported on %d: table %s is %s, its source was %s", major, here, tb, got[tb], want[tb])
+			}
+		}
+		if q := query(t, e, name, "select count(*) from kingres.dist_table"); q == "[[0]]" {
+			t.Errorf("no distributed table after the import of the archive of major %d", major)
+		}
+	}
+	if found == 0 {
+		t.Fatalf("no archive in %s: run TestDatabaseImportRoundTrip of a major first", dir)
 	}
 }

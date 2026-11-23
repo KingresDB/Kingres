@@ -134,7 +134,10 @@ const sqlshapeMaxTotal = 3 * 200000
 
 // importCreateOp is what a server needs to make the private database (the kind ApplyImportCreate, parameters that are structured values).
 type importCreateOp struct {
-	Name      string `json:"name"`
+	Name string `json:"name"`
+	// Marker is written as the comment of the database when it is made (kingres-import:<task id>): the compensation of the task drops a database only when it
+	// is owned by the service role and carries this marker, so a task never drops a database that it did not make.
+	Marker    string `json:"marker,omitempty"`
 	Encoding  string `json:"encoding"`
 	LcCollate string `json:"lcCollate,omitempty"`
 	LcCtype   string `json:"lcCtype,omitempty"`
@@ -185,7 +188,13 @@ func (o *Ops) createPrivateLocal(ctx context.Context, op importCreateOp) error {
 	if err := run(ctx, c, b); err != nil {
 		return err
 	}
-	return run(ctx, c, stmt().Text("REVOKE ALL ON DATABASE").ID(sqlx.MustIdent(op.Name)).Text("FROM PUBLIC"))
+	if err := run(ctx, c, stmt().Text("REVOKE ALL ON DATABASE").ID(sqlx.MustIdent(op.Name)).Text("FROM PUBLIC")); err != nil {
+		return err
+	}
+	if op.Marker != "" {
+		return run(ctx, c, stmt().Text("COMMENT ON DATABASE").ID(sqlx.MustIdent(op.Name)).Text("IS").Lit(op.Marker))
+	}
+	return nil
 }
 
 // setupPrivateLocal installs, in the private database of this server, the schemas and the extensions of the closed list (never kingres_shard: it is installed
@@ -285,9 +294,14 @@ func hasInstalled(l []importExtSpec, prefix string) bool {
 	return false
 }
 
+// importMarker is the comment that marks a private database as the one that a task made: its name already says which task it is.
+func importMarker(priv string) string {
+	return "kingres-import:" + strings.TrimPrefix(priv, privatePrefix)
+}
+
 // createOp builds the parameters of the creation from the manifest: the locale of the source, the schemas and the extensions other than the sharding one.
 func importCreateOpOf(priv, role string, m archive.Manifest) importCreateOp {
-	op := importCreateOp{Name: priv, Encoding: m.Source.Encoding, LcCollate: m.Source.LcCollate, LcCtype: m.Source.LcCtype, Role: role}
+	op := importCreateOp{Name: priv, Marker: importMarker(priv), Encoding: m.Source.Encoding, LcCollate: m.Source.LcCollate, LcCtype: m.Source.LcCtype, Role: role}
 	seen := map[string]bool{}
 	for _, e := range m.Extensions {
 		if e.Name == extguard.Shard || e.Name == "plpgsql" {

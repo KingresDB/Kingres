@@ -418,6 +418,8 @@ func TestExprFunctionNames(t *testing.T) {
 		{"(x)::character varying(5)", ""},
 		{"nextval('s'::regclass)", "nextval"},
 		{"a IN (1, 2)", ""},
+		{"FOREIGN KEY (plain_id) REFERENCES public.t_plain(id) ON DELETE CASCADE", ""},
+		{"FOREIGN KEY (a) REFERENCES \"My Table\"(id) CHECK (lower(x) = x)", "lower"},
 		{"ARRAY[1, 2]", ""},
 		{"a.b.c.d(1)", "b.c.d"},
 		{"pg_sleep(1), pg_sleep(2), lower(x)", "pg_sleep,lower"},

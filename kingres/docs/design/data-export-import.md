@@ -1948,3 +1948,68 @@ every table with a policy is refused.
 - **Names are pairs** (B10): a schema or a table with a dot in its name is refused at the export and by the validator; the console keys the tables to leave out as the pair. The number of data
   entries is checked at the request (at most 19 992).
 - **The check for an export and the start of a table task are one step** (P2): `StartTask` for a table kind and the start of `database.export` take `dbTaskMu` around check and submit.
+
+## Results of the spikes and changes made by the code (phase 14c)
+
+This section is written by the writer of 14c. The text above is left as the design was reviewed; where the two disagree, this section is right. The contract revision of 14c is
+**0.41.0**, a placeholder (the sections above name it 0.21.0); the contract has 174 operations (the design counted from 140). The packages are `sqlshape` (the execution mode, `Each`),
+`archive` (`OpenEntry`, `ReadManifest`, `Assemble`, and `archivetest` for tests) and `ops/dbimport*.go`.
+
+### V8: the rename of a database (passed)
+
+`ALTER DATABASE ... RENAME` works, on one server and on three, with the background workers of the extensions connected: the sessions of the database (workers included) are ended with
+`pg_terminate_backend` and the rename is tried again on `55006` (up to 40 times, 250 ms apart); nothing in the shard catalog keeps the name of the database (the extension reads
+`current_database()` when it opens a connection), so a registered node, the colocation groups and the buckets follow the rename. `TestDatabaseImportOverThreeServers` renames on every
+server, then puts the name back if a later server fails. **The fallback of the design (the final name from the start with a marker) was not needed.** The private database carries a
+comment `kingres-import:<task id>`; the failure hook drops a database only if it is owned by the service role and carries the marker of its task, so a database that a role with
+`CREATEDB` made under a guessed private name is left alone (`TestDatabaseImportNeverUsesADatabaseItDidNotMake`).
+
+### What the service role does after the role, and how the role is kept out of it
+
+The role has `CREATEDB`, may connect to every database and has sessions of its own. The design says that the guarantee is PostgreSQL's privileges; what remains is that the service
+role (a superuser) must never act on what the role made while the role can change it. The import therefore works in **phases**:
+
+| Phase | Who | Can the role connect? |
+|---|---|---|
+| Create the database, the extensions, the check of the functions | service role | no (`REVOKE ALL ... FROM PUBLIC` at creation; the role has no grant yet) |
+| Tables | the role | yes (`CONNECT`, `CREATE` and `TEMPORARY` on the database, `USAGE, CREATE` on `public`, `USAGE` on the schemas of the extensions) |
+| Distribute | service role | **no**: `CONNECT` is withdrawn and the sessions of the role in the database are ended, on every server |
+| Views, load, constraints | the role | yes |
+| Sequences (the maximum of the column is read **as the role**), ledger, policies, verification, rename | service role | **no** |
+
+The database is owned by the service role until the last step (an owner can change `ALTER DATABASE ... SET` from any database); the role becomes the owner when the name is taken. Before
+a service call into a table of the role, `tableTrusted` reads the catalog: an ordinary or partitioned table owned by the role, no trigger of its own (the triggers of `kingres_ledger` are
+fine), no rule, no policy, no row-level security, and every function that its defaults, generated columns, constraints and indexes call is allowed in an expression. **PostgreSQL records
+no dependency on a builtin function** (pinned objects), so the functions are read from the deparsed text of the expressions (`pg_get_expr`, `pg_get_constraintdef`,
+`pg_get_indexdef`) under `search_path = pg_catalog`, and not from `pg_depend`. Every read of `kingres.*` on a service session is preceded by `extguard` (the three KingresDB extensions)
+or by the shard check of 14b (`shardUsable`, because `kingres_shard` is created in `pg_catalog`).
+
+### The function check
+
+The plan of the grammar collects the names that an expression calls. In the new database (the builtin functions and the extensions of the manifest, and nothing else: the role has not been
+able to connect) every name is looked up in `pg_proc`: it must exist where the role's search path finds it (`pg_catalog`, or the schema it names); a function of `pg_catalog` must not
+be a member of an extension of KingresDB and must not be one of the dangerous ones (prefixes: `pg_sleep`, `pg_read_`, `pg_ls_`, `lo_`, `set_config`, `setval`, `pg_terminate`, `pg_advisory_`,
+`query_to_xml`, `dblink`, and the other file, signal, setting and replication functions); a function of another schema must be a member of a contrib extension of the manifest (or
+`kingres_sketch`) installed in that schema; never of `kingres_shard`, `kingres_ledger`, `kingres_timepart` or `kingres_columnar`; none may be `SECURITY DEFINER`. The list is a floor: the
+privileges of the role still decide.
+
+### Changes made by the code
+
+- **A request does not read the archive.** An archive of 100 GiB cannot be read inside a request (`RequestTimeout` is 30 s). The request checks the role, the upload, the name and the
+  database, and uses a cached report **only to refuse early** (`archive_invalid`, `archive_incompatible`, `archive_statement_refused`, `ledger_restart_not_acknowledged`); everything else
+  is a code of the failed first step. Every hostile archive is therefore refused by the task, with nothing made.
+- **No commit intent.** A table is loaded in one transaction (the rows the server counted must equal the scanner's and the manifest's), but there is no marker and no `import_outcome_unknown`: a failure
+  of any kind drops the whole database, so there is nothing to decide. Statements of the pre-data and post-data files are not grouped in a transaction per table; each runs on its own.
+- **Reference tables** are loaded through the temporary table of 14a (`loadReference`), with its cap of 256 MiB; a reference table with a column of an array type is refused.
+- **Foreign keys.** With `fail`, a violated key is counted by adding `NOT VALID` (a suffix of the control plane) inside a transaction that is rolled back, and the task fails with
+  `foreign_key_violation`, the constraint and the count; with `keepNotValid` the key stays `NOT VALID` and the task's detail lists the keys with their counts.
+- **Materialized views** are made `WITH NO DATA` and refreshed after the constraints (a refresh, not a copy: the content is the one of a refresh at import time).
+- **Extension schemas** that the manifest names (not `public`, not `pg_catalog`) are made by the control plane before the role runs, so the `CREATE SCHEMA` and `COMMENT ON SCHEMA` of the
+  archive for them are skipped (the role could not own them).
+- **Distributed schemas** are distributed after the tables exist (`distribute_schema` takes a schema that already has tables) with the sharding mode `both`; the placement group is not carried.
+- **The detail** of the finished task is the lines that the console shows: `ledger: <table> starts a new chain ...`, `policy disabled: <table> ...`, `NOT VALID: ...`.
+- **The manifest of 14b wrote the locale provider of a libc database as `builtin`** (`datlocprovider` `c` is libc, `b` is builtin); fixed in the facts. An archive made by the first 14b
+  build says `builtin` and is refused as incompatible.
+- **Not done:** the free space of the data nodes against `maxImportBytes` (the sum of the sizes is checked, the disk is not asked), a leader change at every step (the codes are those of 14a; a
+  step that finds the upload on another server fails `transfer_leader_changed` and the hook drops the private database; a leader that is gone leaves its private database until someone drops it, and
+  its name says whose it is), and a distributed-schema database in the round trip (the call is made and the catalog is read; no test builds one).

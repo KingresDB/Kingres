@@ -30,6 +30,10 @@ func exprFunctionNames(text string) []string {
 	var out []string
 	for _, m := range callRE.FindAllStringSubmatchIndex(text, -1) {
 		name := text[m[2]:m[3]]
+		// A foreign key names the table that it references, then its columns in parentheses: that is not a call.
+		if strings.HasSuffix(strings.ToLower(strings.TrimRight(text[:m[2]], " ")), "references") {
+			continue
+		}
 		parts := splitIdent(name)
 		if len(parts) == 1 && sqlshape.IsSyntaxWord(parts[0]) {
 			continue

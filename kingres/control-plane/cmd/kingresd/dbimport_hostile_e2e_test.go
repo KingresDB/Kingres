@@ -104,7 +104,9 @@ func TestDatabaseImportRefusesHostileArchives(t *testing.T) {
 		{"a second action in one alter table", func(v *variant) {
 			v.Files[archive.PostDataName] += "ALTER TABLE public.victim ENABLE ROW LEVEL SECURITY, OWNER TO postgres;\n"
 		}, "archive_statement_refused"},
-		{"create table as", func(v *variant) { v.Files[archive.PreDataName] += "CREATE TABLE public.ctas AS SELECT * FROM pg_authid;\n" }, "archive_statement_refused"},
+		{"create table as", func(v *variant) {
+			v.Files[archive.PreDataName] += "CREATE TABLE public.ctas AS SELECT * FROM pg_authid;\n"
+		}, "archive_statement_refused"},
 		{"schema element", func(v *variant) {
 			v.Files[archive.PreDataName] += "CREATE SCHEMA s2 CREATE TABLE t (a int) CREATE TRIGGER x BEFORE INSERT ON t EXECUTE FUNCTION f();\n"
 		}, "archive_statement_refused"},
@@ -419,4 +421,86 @@ func (e *cp) waitNoPrivate(t testing.TB) []string {
 		}
 	}
 	return names
+}
+
+// A task works only in a database that it made. A database with its private name that someone else made is a failure and is left alone; a final name that is taken
+// at the last moment fails the import, the other database stays, and the private one is removed.
+func TestDatabaseImportNeverUsesADatabaseItDidNotMake(t *testing.T) {
+	e, off := transferOn(t)
+	defer off()
+	base := smallArchive(t, e, "dbnever")
+	up := e.uploadArchive(t, base)
+	var mu sync.Mutex
+	var taskID string
+	waitID := func() string {
+		for i := 0; i < 100; i++ {
+			mu.Lock()
+			id := taskID
+			mu.Unlock()
+			if id != "" {
+				return id
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		return ""
+	}
+	sc := e.serviceConn(t, "postgres")
+	defer func() { _ = sc.Close(context.Background()) }()
+	defer func() { ops.ImportHook = nil }()
+	// 1. The private name exists already (made by the service role's own hand here, without the marker of a task).
+	ops.ImportHook = func(ctx context.Context, step string) error {
+		if step == "Create the private database" {
+			if _, err := sc.Exec(ctx, "create database kingres_import_"+waitID()); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	st, out := e.importDB(t, map[string]any{"uploadId": up, "database": "dbnever_a"})
+	if st != 202 {
+		t.Fatalf("%d %v", st, out)
+	}
+	mu.Lock()
+	taskID = idOf(out)
+	mu.Unlock()
+	done := e.waitTask(t, out)
+	if done["state"] != "failed" || taskCode(done) != "forbidden" {
+		t.Fatalf("a private name that exists: %v %q (%s)", done["state"], taskCode(done), taskMessage(done))
+	}
+	time.Sleep(3 * time.Second)
+	if names := e.privateDatabases(t); len(names) != 1 || names[0] != "kingres_import_"+taskID {
+		t.Errorf("the database that the task did not make was dropped or something else is left: %v", names)
+	}
+	if _, err := sc.Exec(context.Background(), "drop database kingres_import_"+taskID); err != nil {
+		t.Fatal(err)
+	}
+	// 2. The final name is taken after the work was done and before the name is taken.
+	mu.Lock()
+	taskID = ""
+	mu.Unlock()
+	ops.ImportHook = func(ctx context.Context, step string) error {
+		if step == "Take the final name" {
+			if _, err := sc.Exec(ctx, "create database dbnever_b"); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	st, out = e.importDB(t, map[string]any{"uploadId": up, "database": "dbnever_b"})
+	if st != 202 {
+		t.Fatalf("%d %v", st, out)
+	}
+	done = e.waitTask(t, out)
+	if done["state"] != "failed" || taskCode(done) != "forbidden" {
+		t.Fatalf("a final name that is taken: %v %q (%s)", done["state"], taskCode(done), taskMessage(done))
+	}
+	if names := e.waitNoPrivate(t); len(names) != 0 {
+		t.Errorf("the private database stays: %v", names)
+	}
+	if got := query(t, e, "dbnever_b", "select count(*) from pg_tables where schemaname = 'public'"); got != "[[0]]" {
+		t.Errorf("the database that was there is not the one that was there: %s", got)
+	}
+	if _, err := sc.Exec(context.Background(), "drop database dbnever_b"); err != nil {
+		t.Fatal(err)
+	}
 }

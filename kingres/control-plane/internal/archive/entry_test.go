@@ -136,10 +136,12 @@ func TestAssembleMakesArchivesThatLie(t *testing.T) {
 		t.Errorf("assembled from the manifest of the writer: %v", err)
 	}
 	for name, mod := range map[string]func(m *Manifest){
-		"rows":      func(m *Manifest) { m.Totals.Rows += 5 },
-		"extension": func(m *Manifest) { m.Extensions = append(m.Extensions, ManifestExtension{Name: "dblink", Version: "1", Schema: "public"}) },
-		"size":      func(m *Manifest) { m.Entries[1].Size++ },
-		"sha":       func(m *Manifest) { m.Entries[2].SHA256 = sha([]byte("x")) },
+		"rows": func(m *Manifest) { m.Totals.Rows += 5 },
+		"extension": func(m *Manifest) {
+			m.Extensions = append(m.Extensions, ManifestExtension{Name: "dblink", Version: "1", Schema: "public"})
+		},
+		"size": func(m *Manifest) { m.Entries[1].Size++ },
+		"sha":  func(m *Manifest) { m.Entries[2].SHA256 = sha([]byte("x")) },
 	} {
 		m := res.Manifest
 		m.Entries = append([]ManifestEntry(nil), m.Entries...)
