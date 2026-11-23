@@ -419,7 +419,11 @@ func (s *Service) applyDatabase(ctx context.Context, id int, c *pgx.Conn, d wire
 		if err != nil {
 			return errors.New("invalid extension name")
 		}
-		if err := execB(ctx, dc, new(sqlx.Builder).Text("CREATE EXTENSION IF NOT EXISTS").ID(id)); err != nil {
+		b := new(sqlx.Builder).Text("CREATE EXTENSION IF NOT EXISTS").ID(id)
+		if e == StatStatementsExtension {
+			b.Text("SCHEMA public") // the session has search_path = pg_catalog, and this extension has no schema of its own
+		}
+		if err := execB(ctx, dc, b); err != nil {
 			return fmt.Errorf("installing extension %s failed", truncName(e))
 		}
 	}

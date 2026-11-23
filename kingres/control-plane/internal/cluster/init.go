@@ -385,6 +385,13 @@ func (s *Service) stepCatalog(ctx context.Context, env *task.Env) error {
 			return fmt.Errorf("installing kingres_ledger: %w", err)
 		}
 	}
+	// pg_stat_statements in the databases the cluster makes itself; the databases of the users get it when they are made (ops installAnalytics), and a server
+	// that is added gets it with every database of the leader (ApplyDatabases).
+	for _, db := range []string{"postgres", sysdb.Database} {
+		if err := s.installStatStatements(ctx, db); err != nil {
+			return err
+		}
+	}
 	tx, err := c.Begin(ctx)
 	if err != nil {
 		return err
@@ -497,4 +504,31 @@ func (s *Service) archive(t task.Task) {
 	if err != nil {
 		s.log.Error("archiving the setup task", "error", err)
 	}
+}
+
+// StatStatementsExtension is the extension that every database made by kingresd carries, so that the statistics of the statements of the instance can be read
+// from any database. Its library is in shared_preload_libraries of every instance (instance.PreloadLibraries).
+const StatStatementsExtension = "pg_stat_statements"
+
+// installStatStatements creates pg_stat_statements in database db when the package of this server has it. A package without it (an older one) leaves the database as
+// it is: setting up a cluster does not fail for the statistics.
+func (s *Service) installStatStatements(ctx context.Context, db string) error {
+	c, err := s.connect(ctx, db)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	var avail bool
+	if err := c.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_available_extensions WHERE name = $1)", StatStatementsExtension).Scan(&avail); err != nil {
+		return err
+	}
+	if !avail {
+		s.log.Info("the package of this server does not contain pg_stat_statements; the database is made without it", "database", db)
+		return nil
+	}
+	// SCHEMA public: the service session runs with search_path = pg_catalog, and an extension without a schema of its own would be made there (and refused).
+	if err := execB(ctx, c, new(sqlx.Builder).Text("CREATE EXTENSION IF NOT EXISTS").ID(sqlx.MustIdent(StatStatementsExtension)).Text("SCHEMA public")); err != nil {
+		return fmt.Errorf("installing pg_stat_statements in %s: %w", db, err)
+	}
+	return nil
 }

@@ -25,10 +25,13 @@ const (
 	ExtSketch   = "kingres_sketch"
 	ExtColumnar = "kingres_columnar"
 	ExtTimepart = "kingres_timepart"
+	// ExtStatStatements is pg_stat_statements of PostgreSQL (contrib): its library is preloaded by every instance (instance.PreloadLibraries), and every database
+	// that kingresd makes carries the extension.
+	ExtStatStatements = "pg_stat_statements"
 )
 
 // analyticsExtensions is the closed set of extensions the operations of this file install and check on other servers.
-var analyticsExtensions = map[string]bool{ExtSketch: true, ExtColumnar: true, ExtTimepart: true}
+var analyticsExtensions = map[string]bool{ExtSketch: true, ExtColumnar: true, ExtTimepart: true, ExtStatStatements: true}
 
 // Kinds of ApplyLocal of the extensions: each acts on one database of the server that receives it, with parameters that are structured values.
 const (
@@ -182,7 +185,11 @@ func (p pgExt) Install(ctx context.Context, db, ext string) error {
 	var cur, def string
 	err = c.QueryRow(ctx, "SELECT extversion FROM pg_catalog.pg_extension WHERE extname = $1", ext).Scan(&cur)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return run(ctx, c, stmt().Text("CREATE EXTENSION IF NOT EXISTS").ID(sqlx.MustIdent(ext)))
+		b := stmt().Text("CREATE EXTENSION IF NOT EXISTS").ID(sqlx.MustIdent(ext))
+		if ext == ExtStatStatements {
+			b.Text("SCHEMA public") // the service session runs with search_path = pg_catalog: without a schema of its own the extension would be made there, and refused
+		}
+		return run(ctx, c, b)
 	}
 	if err != nil {
 		return err

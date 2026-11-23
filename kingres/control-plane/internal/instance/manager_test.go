@@ -88,7 +88,7 @@ func TestLifecycle(t *testing.T) {
 		}
 		return v
 	}
-	if got := show(conn, "shared_preload_libraries"); got != "kingres_shard,kingres_ledger,kingres_columnar" {
+	if got := show(conn, "shared_preload_libraries"); got != "kingres_shard,kingres_ledger,kingres_columnar,pg_stat_statements" {
 		t.Errorf("shared_preload_libraries = %q", got)
 	}
 	if got := show(conn, "password_encryption"); got != "scram-sha-256" {
