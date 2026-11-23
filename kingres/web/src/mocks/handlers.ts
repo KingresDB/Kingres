@@ -11,6 +11,7 @@ import { decorateStatus, distributedSchemaCount, elasticityHandlers } from './el
 import { analyticsHandlers, describePartitions, describeTable, explainPlan } from './analytics'
 import { transferHandlers } from './transfer'
 import { archiveHandlers } from './transfer-archive'
+import { importHandlers } from './transfer-import'
 import { AGGREGATE_SIZE, anchoringOf, digestAnchorsOf, l7, publicationOf } from './ledger-view'
 import type { HttpHandler } from 'msw'
 import type { components } from '@/api/schema'
@@ -1360,6 +1361,7 @@ export function createHandlers(): HttpHandler[] {
     ...elasticityHandlers(),
     ...analyticsHandlers(),
     ...archiveHandlers(),
+    ...importHandlers(),
     ...transferHandlers((rec, t) =>
       (rec.extraColumns?.[t.name] ?? columnsFor(rec, t)).map((col) => col.name),
     ),

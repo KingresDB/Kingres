@@ -559,6 +559,19 @@ const entries: Record<ProblemCode, Entry> = {
       'The versions, the locale or the extensions of the archive cannot be used here. The reasons are listed.',
     withDetail: true,
   },
+  archive_statement_refused: {
+    tone: 'danger',
+    heading: 'The archive has a statement that is not allowed',
+    message:
+      'The import runs only the statements that pg_dump writes for schemas, tables, sequences, types, domains, indexes, constraints, views and comments. Code in a schema (functions, triggers, policies, rules), grants and settings are refused. The text of a statement is never shown: the reasons give its kind, its position and a fingerprint. Such a database is a job for pg_dump and pg_restore.',
+    withDetail: true,
+  },
+  ledger_restart_not_acknowledged: {
+    tone: 'warning',
+    heading: 'The ledger restart is not acknowledged',
+    message:
+      'The archive has ledger tables, and an import starts a new chain for them. Tick the acknowledgement and try again.',
+  },
   chain_not_diverged: {
     tone: 'info',
     heading: 'This chain has not diverged',
