@@ -1576,6 +1576,7 @@ claimed_relid_check(Oid relid)
 	int64		op_id = 0;
 	Oid			save_userid;
 	int			save_sec;
+	int			nest;
 
 	if (!OidIsValid(kingres_shard_catalog_relid("table_operation_item")))
 		return;
@@ -1599,11 +1600,19 @@ claimed_relid_check(Oid relid)
 		SetUserIdAndSecContext(save_userid, save_sec);
 		return;
 	}
+	/*
+	 * The statement runs as the bootstrap superuser in the session's own
+	 * search_path, which the owner of the database or of a role may set: the
+	 * system catalogs alone, for the duration of the block (XSP-01).
+	 */
+	nest = NewGUCNestLevel();
+	(void) set_config_option("search_path", "pg_catalog, pg_temp", PGC_USERSET,
+							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	values[0] = ObjectIdGetDatum(relid);
 	ret = SPI_execute_with_args("SELECT i.op_id FROM " KINGRES_SHARD_SCHEMA ".table_operation_item i "
 								"JOIN " KINGRES_SHARD_SCHEMA ".table_operation o ON o.op_id OPERATOR(pg_catalog.=) i.op_id "
 								"WHERE i.relid OPERATOR(pg_catalog.=) $1::pg_catalog.oid::pg_catalog.regclass "
-								"AND o.phase IN ('preparing', 'shadow', 'copying', 'catching_up', 'switching') LIMIT 1",
+								"AND o.phase OPERATOR(pg_catalog.=) ANY (ARRAY['preparing', 'shadow', 'copying', 'catching_up', 'switching']::pg_catalog.text[]) LIMIT 1",
 								1, argtypes, values, NULL, true, 1);
 	if (ret == SPI_OK_SELECT && SPI_processed > 0)
 	{
@@ -1611,6 +1620,7 @@ claimed_relid_check(Oid relid)
 
 		op_id = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
 	}
+	AtEOXact_GUC(true, nest);
 	SPI_finish();
 	SetUserIdAndSecContext(save_userid, save_sec);
 	if (op_id != 0)
@@ -2059,7 +2069,7 @@ is_user_partitioned(Oid relid)
 	values[0] = ObjectIdGetDatum(relid);
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
-	if (SPI_execute_with_args("SELECT 1 FROM " KINGRES_SHARD_SCHEMA ".dist_table WHERE relid = $1::pg_catalog.oid::pg_catalog.regclass AND partition_method IS NOT NULL",
+	if (SPI_execute_with_args("SELECT 1 FROM " KINGRES_SHARD_SCHEMA ".dist_table WHERE relid OPERATOR(pg_catalog.=) $1::pg_catalog.oid::pg_catalog.regclass AND partition_method IS NOT NULL",
 							  1, argtypes, values, NULL, true, 1) < 0)
 		elog(ERROR, "could not read the catalog");
 	result = SPI_processed > 0;
@@ -2079,7 +2089,7 @@ user_partition_exists(Oid parent, const char *name)
 	values[1] = CStringGetTextDatum(name);
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
-	if (SPI_execute_with_args("SELECT 1 FROM " KINGRES_SHARD_SCHEMA ".dist_partition WHERE parent = $1::pg_catalog.oid::pg_catalog.regclass AND partition_name = $2",
+	if (SPI_execute_with_args("SELECT 1 FROM " KINGRES_SHARD_SCHEMA ".dist_partition WHERE parent OPERATOR(pg_catalog.=) $1::pg_catalog.oid::pg_catalog.regclass AND partition_name OPERATOR(pg_catalog.=) $2",
 							  2, argtypes, values, NULL, true, 1) < 0)
 		elog(ERROR, "could not read the catalog");
 	result = SPI_processed > 0;
@@ -2222,8 +2232,8 @@ map_partition_statement(Node *parsetree, QueryCompletion *qc)
 		values[1] = ObjectIdGetDatum(nsp);
 		if (SPI_connect() != SPI_OK_CONNECT)
 			elog(ERROR, "SPI_connect failed");
-		if (SPI_execute_with_args("SELECT p.parent::pg_catalog.oid FROM " KINGRES_SHARD_SCHEMA ".dist_partition p JOIN pg_catalog.pg_class c ON c.oid = p.parent::pg_catalog.oid "
-								  "WHERE p.partition_name = $1 AND c.relnamespace = $2",
+		if (SPI_execute_with_args("SELECT p.parent::pg_catalog.oid FROM " KINGRES_SHARD_SCHEMA ".dist_partition p JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) p.parent::pg_catalog.oid "
+								  "WHERE p.partition_name OPERATOR(pg_catalog.=) $1 AND c.relnamespace OPERATOR(pg_catalog.=) $2",
 								  2, argtypes, values, NULL, true, 1) < 0)
 			elog(ERROR, "could not read the catalog");
 		if (SPI_processed == 0)

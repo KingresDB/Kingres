@@ -1189,6 +1189,12 @@ on each node and then `sync_catalog()` on the map group primary.
   (the user needs no privilege on it); recovery runs as the role that calls it
   (superuser) or as the bootstrap superuser in the worker.
 - `dtx_log` and `pending_node` are readable by their owner only.
+- The two checks that the ProcessUtility hook runs as the bootstrap superuser (`claimed_relid_check`, `kingres_shard_assert_no_move`)
+  open a GUC nest level and force `search_path = pg_catalog, pg_temp` for the block, and write every comparison as
+  `OPERATOR(pg_catalog.=)` (an `IN` list as `OPERATOR(pg_catalog.=) ANY (ARRAY[...]::pg_catalog.text[])`), because the session's path is
+  chosen by the owner of the database or of the role and an unqualified `=` would find an operator planted in its schema. The SQL
+  of the hook that runs as the calling role is qualified the same way. `t/252_extension_search_path` plants such an operator and fails
+  if it is ever called.
 
 ## DDL on distributed and reference tables
 
