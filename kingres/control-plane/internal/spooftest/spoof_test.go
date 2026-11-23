@@ -313,6 +313,34 @@ func TestSchemaSpoofIsNeverExecuted(t *testing.T) {
 		t.Errorf("nothing was installed over the schema of the tenant: %d %v", installed, err)
 	}
 
+	// 5. The system database: when someone can create there, the monitor raises the alert for it (the readers of kingres_cp in it do not check an extension).
+	if page, _ := monitor.List(ctx, sysc, "open", "", store.Page{Limit: 50}); func() bool {
+		for _, a := range page.Items {
+			if strings.Contains(a.Message, "kingres_system") {
+				return true
+			}
+		}
+		return false
+	}() {
+		t.Error("an alert for the system database before anything is wrong with it")
+	}
+	exec(t, sysc, "GRANT CREATE ON SCHEMA public TO PUBLIC")
+	for i := 0; i < 3; i++ {
+		r.Once(ctx, time.Now())
+	}
+	page, err = monitor.List(ctx, sysc, "open", "", store.Page{Limit: 50})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sysAlert := false
+	for _, a := range page.Items {
+		if a.Kind == "extensionSchemaUntrusted" && strings.Contains(a.Message, "database kingres_system") && strings.Contains(a.Message, "schemaCreate") {
+			sysAlert = true
+		}
+	}
+	if !sysAlert {
+		t.Errorf("no alert extensionSchemaUntrusted for kingres_system: %+v", page.Items)
+	}
 	// What none of it did: nothing of the tenant was run, in either database.
 	for _, db := range []string{"nox", "tpx"} {
 		if m := e.markers(t, db); len(m) != 0 {
