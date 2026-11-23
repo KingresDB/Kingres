@@ -193,6 +193,41 @@ None checked in this entry.
 - The old leader's resolution of a hold waits for a standby to be shown in recovery; with every other server gone it does not resume (the lease would protect it, but the proof is
   missing): an operator starts it by the abandon call once a standby answers.
 
+## 2026-11-22: the search_path of the privileged SQL of kingres_shard (XSP-01 to XSP-03)
+
+Covers the fix of the three findings of the static audit `extaudit/2026-11-22-extension-search-path-static` on branch xsp-fix (kingres_shard 0.8).
+
+### What was done
+
+- **XSP-01** (`claimed_relid_check`, `utility.c`) and **XSP-02** (`kingres_shard_assert_no_move`, `bucket_move.c`): both run SQL as the bootstrap superuser from the ProcessUtility hook, in the session's own `search_path`, and
+  their `phase IN (...)` lists were parsed with an unqualified `=`.  A database owner (`ALTER DATABASE ... SET search_path`) could plant an `=(text, text)` operator in a schema of its own and have its function
+  run as the bootstrap superuser.  Each block now opens a GUC nest level and forces `search_path = pg_catalog, pg_temp` (as `acl_query()` in `node_admin.c` does) until the block ends, and every list is
+  `OPERATOR(pg_catalog.=) ANY (ARRAY[...]::pg_catalog.text[])`.
+- **XSP-03** (hook statements that run as the calling role): `is_user_partitioned`, `user_partition_exists` and the DROP TABLE lookup of `map_partition_statement` in `utility.c` write every comparison as
+  `OPERATOR(pg_catalog.=)`.  They do not force the path: the caller's own path is what resolves the names of the user's statement elsewhere, and the statements name no object but `kingres.*` and `pg_catalog.*`.
+  The text of `schema_ctas` is left as it is: it replays the user's own query, and adds no operator.
+- **The sweep of the rest of the source**: every SPI statement and every raise of privileges in `contrib/kingres_shard/src` was read again.  The other raises (`schema_ddl.c`, `node_admin.c`) already call only
+  `kingres.internal_*` functions or use `OPERATOR(pg_catalog.x)`; the other statements with `IN`, `=` or `LIKE` run inside SQL-callable functions or workers that pin `pg_catalog` first.  Nothing else changed.
+- **`t/252_extension_search_path.pl`**: a database owner without superuser rights plants `=(text, text)` and `=(name, text)` in its own schema (the functions only record the call, in a table the owner owns), sets
+  `ALTER DATABASE ... SET search_path = evil, pg_catalog`, and runs ADD COLUMN, CREATE INDEX, CREATE TABLE IF NOT EXISTS ... PARTITION OF and DROP TABLE IF EXISTS on its distributed tables.  History rows of a finished
+  table operation, move and split are in the catalog, because an operator is called only for a row that the statement reads.  The test asserts that no planted function ran and that the DDL reached both nodes.
+- README, "Security notes": one item on the forced path and the qualified operators.
+
+### How it was verified
+
+- The new test passes on 18.7 and 19.0.  Four mutants, each built with -Werror and each failing test 11 (calls of the planted operator): the sources of `utility.c` and `bucket_move.c` as before the fix (29 calls), `utility.c`
+  alone as before (13), `bucket_move.c` alone as before (16), only the qualification of the XSP-03 statements removed (3).
+- The full `kingres_shard` suite (clean -Werror build, regress, every TAP file) on PostgreSQL 18.7 and 19.0: 219 TAP files, 48074 tests on 18 and 48770 on 19, all passed (one file skipped by design on each major, as always).  `kingres_ledger` built into both installations first.
+
+### Decisions and deviations
+
+- The XSP-03 statements are qualified but not run under a forced path, on purpose (see above).
+- The block of the two privileged checks has no PG_TRY: an error inside it ends the transaction, which restores the GUC and the user id.
+
+### Still open
+
+- Nothing from the three findings.
+
 ### Core patches
 
 None.
