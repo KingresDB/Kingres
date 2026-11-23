@@ -17644,3 +17644,310 @@ REVOKE ALL ON FUNCTION
 -- =========================================================================
 -- PHASE 11, the leftovers                                                    [end]
 -- =========================================================================
+
+-- =========================================================================
+-- Time partitions of distributed tables (design/analytics-phase12-storage.md, section 11; increments St-D1a and St-D1b)
+-- =========================================================================
+--
+-- kingres_timepart 0.3 runs a time partitioning policy on a user-partitioned distributed table with the partition functions of
+-- phase 9 (create_partition, drop_partition, detach_partition).  What it needs of this extension is here: a leaf budget that the
+-- partition functions enforce, the storage of the leaves of a table on every node, and the claim of a colocation group that
+-- keeps a bucket move and the other table operations away while the leaves of one partition are converted.
+
+-- The leaves of a user-partitioned table: its buckets times its partitions, against kingres_shard.max_partition_leaves.
+CREATE FUNCTION kingres.partition_leaf_budget(parent regclass)
+    RETURNS TABLE (buckets int, partitions int, leaves bigint, max_leaves int)
+    LANGUAGE sql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+SELECT b.n, p.n, (b.n::pg_catalog.int8 OPERATOR(pg_catalog.*) p.n::pg_catalog.int8),
+       pg_catalog.current_setting('kingres_shard.max_partition_leaves')::pg_catalog.int4
+  FROM (SELECT pg_catalog.count(*)::pg_catalog.int4 AS n
+          FROM kingres.bucket_map m JOIN kingres.dist_table d ON d.colocation_id OPERATOR(pg_catalog.=) m.colocation_id
+         WHERE d.relid OPERATOR(pg_catalog.=) partition_leaf_budget.parent) b,
+       (SELECT pg_catalog.count(*)::pg_catalog.int4 AS n FROM kingres.dist_partition x
+         WHERE x.parent OPERATOR(pg_catalog.=) partition_leaf_budget.parent) p
+ WHERE EXISTS (SELECT 1 FROM kingres.dist_table d2 WHERE d2.relid OPERATOR(pg_catalog.=) partition_leaf_budget.parent AND d2.partition_method IS NOT NULL);
+$$;
+COMMENT ON FUNCTION kingres.partition_leaf_budget(regclass) IS
+    'The buckets, the user partitions, the leaves (their product) and kingres_shard.max_partition_leaves of a user-partitioned distributed table';
+
+-- One more user partition must keep the table within kingres_shard.max_partition_leaves (create_distributed_table checks the same for the
+-- partitions the table has when it is distributed).
+CREATE FUNCTION kingres.internal_check_leaf_budget(p_parent regclass)
+    RETURNS void
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_b pg_catalog.record;
+BEGIN
+    SELECT * INTO v_b FROM kingres.partition_leaf_budget(p_parent);
+    IF FOUND AND v_b.buckets::pg_catalog.int8 OPERATOR(pg_catalog.*) (v_b.partitions OPERATOR(pg_catalog.+) 1)::pg_catalog.int8 OPERATOR(pg_catalog.>) v_b.max_leaves::pg_catalog.int8 THEN
+        RAISE EXCEPTION 'table "%" would have % leaves (% buckets, % partitions); kingres_shard.max_partition_leaves is %',
+            p_parent, v_b.buckets::pg_catalog.int8 OPERATOR(pg_catalog.*) (v_b.partitions OPERATOR(pg_catalog.+) 1)::pg_catalog.int8, v_b.buckets, v_b.partitions OPERATOR(pg_catalog.+) 1, v_b.max_leaves
+            USING ERRCODE = 'program_limit_exceeded',
+                  HINT = 'Drop or detach old partitions, use a wider partition interval, or raise kingres_shard.max_partition_leaves.';
+    END IF;
+END;
+$$;
+
+-- create_partition and attach_partition check the budget before they make a leaf.
+CREATE OR REPLACE FUNCTION kingres.create_partition(parent regclass, partition_name text, bound text, if_not_exists bool DEFAULT false)
+    RETURNS void
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    SET client_min_messages = warning
+    AS $$
+DECLARE
+    c pg_catalog.record;
+BEGIN
+    SELECT * INTO c FROM kingres.internal_partition_context(parent);
+    PERFORM kingres.internal_fault_point('partition_after_lock');
+    IF partition_name IS NULL OR pg_catalog.octet_length(partition_name) OPERATOR(pg_catalog.>) 57 THEN
+        RAISE EXCEPTION 'partition name "%" is too long or missing: leaf names append 6 characters (_bNNNN), at most 57 bytes', partition_name USING ERRCODE = 'invalid_name';
+    END IF;
+    IF EXISTS (SELECT 1 FROM kingres.dist_partition p WHERE p.parent OPERATOR(pg_catalog.=) create_partition.parent AND p.partition_name OPERATOR(pg_catalog.=) create_partition.partition_name) THEN
+        IF if_not_exists THEN
+            RETURN;
+        END IF;
+        RAISE EXCEPTION 'partition "%" of table "%" already exists', partition_name, parent USING ERRCODE = 'duplicate_table';
+    END IF;
+    IF pg_catalog.to_regclass(pg_catalog.format('%I.%I', c.nsp, partition_name)) IS NOT NULL THEN
+        RAISE EXCEPTION 'relation "%" already exists', partition_name USING ERRCODE = 'duplicate_table';
+    END IF;
+    PERFORM kingres.internal_check_leaf_budget(parent);
+    PERFORM kingres.internal_leaf_everywhere('create', c.colocation, c.nsp, c.rname, partition_name::pg_catalog.name, bound);
+    PERFORM kingres.internal_fault_point('partition_after_leaves');
+    INSERT INTO kingres.dist_partition (parent, partition_name, bound) VALUES (parent, partition_name, bound);
+    PERFORM kingres.sync_catalog();
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION kingres.attach_partition(parent regclass, partition regclass, bound text)
+    RETURNS void
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    SET client_min_messages = warning
+    AS $$
+DECLARE
+    c        pg_catalog.record;
+    v_dt     kingres.dist_table%ROWTYPE;
+    v_name   pg_catalog.name;
+    v_nsp    pg_catalog.name;
+    v_cnt    pg_catalog.int8;
+    v_own    pg_catalog.text;
+BEGIN
+    SELECT * INTO c FROM kingres.internal_partition_context(parent);
+    PERFORM kingres.internal_fault_point('partition_after_lock');
+    SELECT * INTO v_dt FROM kingres.dist_table d WHERE d.relid OPERATOR(pg_catalog.=) partition;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'table "%" is not a distributed table of the group of "%"', partition, parent USING ERRCODE = 'wrong_object_type',
+              HINT = 'Create the partition with create_partition() and insert the rows into the parent.';
+    END IF;
+    IF v_dt.method OPERATOR(pg_catalog.<>) 'hash' OR v_dt.colocation_id OPERATOR(pg_catalog.<>) c.colocation OR v_dt.dist_column OPERATOR(pg_catalog.<>) c.dist_column OR v_dt.partition_method IS NOT NULL THEN
+        RAISE EXCEPTION 'table "%" must be a distributed table of the colocation group of "%", on the same distribution column, and not partitioned', partition, parent USING ERRCODE = 'wrong_object_type';
+    END IF;
+    SELECT n.nspname, cl.relname INTO v_nsp, v_name FROM pg_catalog.pg_class cl JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) cl.relnamespace
+     WHERE cl.oid OPERATOR(pg_catalog.=) partition::pg_catalog.oid;
+    IF v_nsp OPERATOR(pg_catalog.<>) c.nsp THEN
+        RAISE EXCEPTION 'the partition must be in the schema of the table' USING ERRCODE = 'invalid_schema_name';
+    END IF;
+    -- A bucket move makes the leaves again from the definition of the table and of its partitions: an index, a constraint, a default, a
+    -- storage parameter, an owner or privileges that the table has of its own would be lost at the first move (P9C-03)
+    SELECT pg_catalog.string_agg(m.what, '; ' ORDER BY m.what) INTO v_own FROM kingres.internal_attach_differences(parent, partition) m(what);
+    IF v_own IS NOT NULL THEN
+        RAISE EXCEPTION 'table "%" has objects of its own that table "%" does not have: %', partition, parent, v_own
+            USING ERRCODE = 'feature_not_supported',
+                  DETAIL = 'A bucket move creates the leaves of a partition from the definition of the partitioned table, so they would be lost.',
+                  HINT = 'Give the table the same indexes and constraints, owner and privileges as the partitioned table, or create the partition with create_partition() and copy the rows.';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint k WHERE k.contype OPERATOR(pg_catalog.=) 'f'
+                AND (k.conrelid OPERATOR(pg_catalog.=) partition::pg_catalog.oid OR k.confrelid OPERATOR(pg_catalog.=) partition::pg_catalog.oid) AND k.conparentid OPERATOR(pg_catalog.=) 0) THEN
+        RAISE EXCEPTION 'table "%" has foreign keys: it cannot be attached in this version', partition USING ERRCODE = 'feature_not_supported';
+    END IF;
+    IF pg_catalog.octet_length(v_name) OPERATOR(pg_catalog.>) 57 THEN
+        RAISE EXCEPTION 'partition name "%" is too long', v_name USING ERRCODE = 'invalid_name';
+    END IF;
+    PERFORM kingres.internal_check_leaf_budget(parent);
+    PERFORM kingres.internal_leaf_everywhere('attach', c.colocation, c.nsp, c.rname, v_name, bound);
+    PERFORM kingres.internal_leaf_everywhere('drop_parent', c.colocation, c.nsp, c.rname, v_name, NULL);
+    PERFORM kingres.internal_fault_point('partition_after_leaves');
+    DELETE FROM kingres.dist_table d WHERE d.relid OPERATOR(pg_catalog.=) partition;
+    INSERT INTO kingres.dist_partition (parent, partition_name, bound) VALUES (parent, v_name, bound);
+    PERFORM kingres.sync_catalog();
+END;
+$$;
+
+-- The access method of every leaf of a table on the node that holds it (null for a leaf that is missing there): the way to see that
+-- a partition is heap, columnar or mixed after a conversion that stopped half way.  Asks every node that holds a leaf; superusers only.
+CREATE FUNCTION kingres.partition_leaf_storage(parent regclass)
+    RETURNS TABLE (partition_name text, node_id int, bucket int, leaf text, access_method name)
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_nsp   pg_catalog.name;
+    n       pg_catalog.record;
+    x       pg_catalog.record;
+    r       pg_catalog.jsonb;
+    v_names pg_catalog.text[];
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    IF NOT EXISTS (SELECT 1 FROM kingres.dist_table d WHERE d.relid OPERATOR(pg_catalog.=) partition_leaf_storage.parent AND d.partition_method IS NOT NULL) THEN
+        RAISE EXCEPTION 'table "%" is not a user-partitioned distributed table', parent USING ERRCODE = 'wrong_object_type';
+    END IF;
+    SELECT s.nspname INTO v_nsp FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace s ON s.oid OPERATOR(pg_catalog.=) c.relnamespace
+     WHERE c.oid OPERATOR(pg_catalog.=) parent::pg_catalog.oid;
+    FOR n IN SELECT DISTINCT nd.node_id AS id
+               FROM kingres.dist_table d
+               JOIN kingres.bucket_map m ON m.colocation_id OPERATOR(pg_catalog.=) d.colocation_id
+               JOIN kingres.node nd ON nd.group_id OPERATOR(pg_catalog.=) m.group_id AND nd.role OPERATOR(pg_catalog.=) 'primary' AND nd.is_active
+              WHERE d.relid OPERATOR(pg_catalog.=) partition_leaf_storage.parent
+              ORDER BY nd.node_id
+    LOOP
+        SELECT pg_catalog.array_agg(p.partition_name::pg_catalog.text OPERATOR(pg_catalog.||) '_b' OPERATOR(pg_catalog.||) pg_catalog.lpad(m.bucket::pg_catalog.text, 4, '0'))
+          INTO v_names
+          FROM kingres.dist_partition p
+          JOIN kingres.dist_table d ON d.relid OPERATOR(pg_catalog.=) p.parent
+          JOIN kingres.bucket_map m ON m.colocation_id OPERATOR(pg_catalog.=) d.colocation_id
+          JOIN kingres.node nd ON nd.group_id OPERATOR(pg_catalog.=) m.group_id AND nd.role OPERATOR(pg_catalog.=) 'primary' AND nd.is_active AND nd.node_id OPERATOR(pg_catalog.=) n.id
+         WHERE p.parent OPERATOR(pg_catalog.=) partition_leaf_storage.parent;
+        IF v_names IS NULL THEN
+            CONTINUE;
+        END IF;
+        r := ((kingres.internal_node_exec(n.id, pg_catalog.format(
+                  'SELECT COALESCE(pg_catalog.jsonb_object_agg(c.relname, a.amname), ''{}''::pg_catalog.jsonb)::pg_catalog.text '
+                  'FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace s ON s.oid OPERATOR(pg_catalog.=) c.relnamespace '
+                  'LEFT JOIN pg_catalog.pg_am a ON a.oid OPERATOR(pg_catalog.=) c.relam '
+                  'WHERE s.nspname OPERATOR(pg_catalog.=) %L AND c.relkind OPERATOR(pg_catalog.=) ''r'' AND c.relispartition AND c.relname OPERATOR(pg_catalog.=) ANY (%L::pg_catalog.text[])',
+                  v_nsp, v_names), 60000) OPERATOR(pg_catalog.->) 0) OPERATOR(pg_catalog.->>) 0)::pg_catalog.jsonb;
+        FOR x IN SELECT p.partition_name AS pn, m.bucket AS b,
+                        p.partition_name::pg_catalog.text OPERATOR(pg_catalog.||) '_b' OPERATOR(pg_catalog.||) pg_catalog.lpad(m.bucket::pg_catalog.text, 4, '0') AS rel
+                   FROM kingres.dist_partition p
+                   JOIN kingres.dist_table d ON d.relid OPERATOR(pg_catalog.=) p.parent
+                   JOIN kingres.bucket_map m ON m.colocation_id OPERATOR(pg_catalog.=) d.colocation_id
+                   JOIN kingres.node nd ON nd.group_id OPERATOR(pg_catalog.=) m.group_id AND nd.role OPERATOR(pg_catalog.=) 'primary' AND nd.is_active AND nd.node_id OPERATOR(pg_catalog.=) n.id
+                  WHERE p.parent OPERATOR(pg_catalog.=) partition_leaf_storage.parent
+                  ORDER BY p.partition_name, m.bucket
+        LOOP
+            partition_name := x.pn::pg_catalog.text;
+            node_id := n.id;
+            bucket := x.b;
+            leaf := pg_catalog.format('%I.%I', v_nsp, x.rel);
+            access_method := (r OPERATOR(pg_catalog.->>) x.rel)::pg_catalog.name;
+            RETURN NEXT;
+        END LOOP;
+    END LOOP;
+END;
+$$;
+COMMENT ON FUNCTION kingres.partition_leaf_storage(regclass) IS
+    'The access method of every leaf of a user-partitioned distributed table, read on the node that holds it (superusers only)';
+
+-- ---------------------------------------------------------------------------
+-- The claim of a colocation group for the conversion of the leaves of one partition (St-D1b)
+-- ---------------------------------------------------------------------------
+--
+-- A leaf is replaced on its node by a copy in another access method.  While the leaves of one partition are converted, no bucket of the
+-- group may move (the copy on the target and the publication name the leaves), no table operation may copy the tables of the group, and
+-- no partition may be created, dropped or detached: those refuse an object-in-use error as long as table_operation_lock holds the
+-- group.  The claim is a record of kind convert_leaf in table_operation (phase done, so that the table operations that resume and clean
+-- up what is unfinished leave it alone), and a row of table_operation_lock, which every one of those checks already reads.
+ALTER TABLE kingres.table_operation DROP CONSTRAINT table_operation_kind_check;
+ALTER TABLE kingres.table_operation ADD CONSTRAINT table_operation_kind_check
+    CHECK (kind IN ('distribute', 'distribute_reference', 'undistribute', 'alter', 'convert_leaf'));
+
+-- Claim the group of a table for the conversion of the leaves of one of its partitions; returns the number of the claim.  A claim that
+-- nobody renewed for six hours is taken over.  Run on the map group primary, committed at once by the session that calls it (kingres_timepart
+-- calls it through kingres.internal_node_exec on the node itself); the claim stays until end_leaf_conversion().
+CREATE FUNCTION kingres.begin_leaf_conversion(parent regclass, partition_name text, target text DEFAULT 'columnar')
+    RETURNS bigint
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_dt kingres.dist_table%ROWTYPE;
+    v_id pg_catalog.int8;
+    v_op pg_catalog.int8;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    PERFORM kingres.internal_require_map_group();
+    PERFORM kingres.internal_require_version((SELECT e.extversion FROM pg_catalog.pg_extension e WHERE e.extname OPERATOR(pg_catalog.=) 'kingres_shard'));
+    PERFORM pg_catalog.set_config('lock_timeout', '5s', true);
+    LOCK TABLE kingres.map_version IN EXCLUSIVE MODE;
+    SELECT * INTO v_dt FROM kingres.dist_table d WHERE d.relid OPERATOR(pg_catalog.=) begin_leaf_conversion.parent;
+    IF NOT FOUND OR v_dt.partition_method IS NULL THEN
+        RAISE EXCEPTION 'table "%" is not a user-partitioned distributed table', parent USING ERRCODE = 'wrong_object_type';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM kingres.dist_partition p WHERE p.parent OPERATOR(pg_catalog.=) begin_leaf_conversion.parent AND p.partition_name OPERATOR(pg_catalog.=) begin_leaf_conversion.partition_name) THEN
+        RAISE EXCEPTION 'partition "%" of table "%" does not exist', partition_name, parent USING ERRCODE = 'undefined_table';
+    END IF;
+    IF target IS NULL OR target NOT IN ('columnar', 'heap') THEN
+        RAISE EXCEPTION 'the storage of a leaf is columnar or heap, not "%"', target USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    -- a claim of a conversion that stopped without releasing it
+    FOR v_op IN SELECT l.op_id FROM kingres.table_operation_lock l JOIN kingres.table_operation o ON o.op_id OPERATOR(pg_catalog.=) l.op_id
+                 WHERE l.colocation_id OPERATOR(pg_catalog.=) v_dt.colocation_id AND o.kind OPERATOR(pg_catalog.=) 'convert_leaf'
+                   AND o.updated_at OPERATOR(pg_catalog.<) (pg_catalog.clock_timestamp() OPERATOR(pg_catalog.-) interval '6 hours')
+    LOOP
+        PERFORM kingres.end_leaf_conversion(v_op, 'the claim was not renewed for six hours');
+    END LOOP;
+    IF EXISTS (SELECT 1 FROM kingres.table_operation_lock l WHERE l.colocation_id OPERATOR(pg_catalog.=) v_dt.colocation_id)
+       OR EXISTS (SELECT 1 FROM kingres.bucket_move m WHERE m.colocation_id OPERATOR(pg_catalog.=) v_dt.colocation_id AND m.phase IN ('preparing', 'copying', 'catching_up', 'switching'))
+       OR EXISTS (SELECT 1 FROM kingres.bucket_map b WHERE b.colocation_id OPERATOR(pg_catalog.=) v_dt.colocation_id AND b.state OPERATOR(pg_catalog.<>) 'active') THEN
+        RAISE EXCEPTION 'colocation group % is busy: a table operation or a bucket move uses it', v_dt.colocation_id USING ERRCODE = 'object_in_use';
+    END IF;
+    INSERT INTO kingres.table_operation (kind, mode, phase, spec, detail, colocation_id, started_at, updated_at)
+    VALUES ('convert_leaf', 'online', 'done',
+            pg_catalog.jsonb_build_object('relid', parent::pg_catalog.oid, 'table', parent::pg_catalog.text, 'partition', partition_name, 'target', target),
+            pg_catalog.format('the leaves of partition %s are converted to %s', partition_name, target),
+            v_dt.colocation_id, pg_catalog.clock_timestamp(), pg_catalog.clock_timestamp())
+    RETURNING op_id INTO v_id;
+    INSERT INTO kingres.table_operation_lock (colocation_id, op_id) VALUES (v_dt.colocation_id, v_id);
+    RETURN v_id;
+END;
+$$;
+
+-- The claim shows that the conversion lives: kingres_timepart renews it after each leaf.
+CREATE FUNCTION kingres.renew_leaf_conversion(op_id bigint)
+    RETURNS void
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    UPDATE kingres.table_operation o SET updated_at = pg_catalog.clock_timestamp()
+     WHERE o.op_id OPERATOR(pg_catalog.=) renew_leaf_conversion.op_id AND o.kind OPERATOR(pg_catalog.=) 'convert_leaf';
+END;
+$$;
+
+-- Release the claim (idempotent); the reason, if any, is kept in the record.
+CREATE FUNCTION kingres.end_leaf_conversion(op_id bigint, reason text DEFAULT NULL)
+    RETURNS void
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    DELETE FROM kingres.table_operation_lock l
+     WHERE l.op_id OPERATOR(pg_catalog.=) end_leaf_conversion.op_id
+       AND EXISTS (SELECT 1 FROM kingres.table_operation o WHERE o.op_id OPERATOR(pg_catalog.=) l.op_id AND o.kind OPERATOR(pg_catalog.=) 'convert_leaf');
+    UPDATE kingres.table_operation o
+       SET finished_at = COALESCE(o.finished_at, pg_catalog.clock_timestamp()), updated_at = pg_catalog.clock_timestamp(),
+           detail = COALESCE(end_leaf_conversion.reason, o.detail)
+     WHERE o.op_id OPERATOR(pg_catalog.=) end_leaf_conversion.op_id AND o.kind OPERATOR(pg_catalog.=) 'convert_leaf';
+END;
+$$;
+
+COMMENT ON FUNCTION kingres.begin_leaf_conversion(regclass, text, text) IS
+    'Claim the colocation group of a user-partitioned table for the conversion of the leaves of one partition (map group primary, superuser)';
+COMMENT ON FUNCTION kingres.renew_leaf_conversion(bigint) IS 'Renew the claim of a leaf conversion (a claim not renewed for six hours is taken over)';
+COMMENT ON FUNCTION kingres.end_leaf_conversion(bigint, text) IS 'Release the claim of a leaf conversion; also the way to remove one that a stopped conversion left behind';
+
+REVOKE ALL ON FUNCTION
+    kingres.internal_check_leaf_budget(regclass),
+    kingres.partition_leaf_storage(regclass),
+    kingres.begin_leaf_conversion(regclass, text, text),
+    kingres.renew_leaf_conversion(bigint),
+    kingres.end_leaf_conversion(bigint, text)
+    FROM PUBLIC;

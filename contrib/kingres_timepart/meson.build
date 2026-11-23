@@ -7,6 +7,8 @@ install_data(
   'kingres_timepart--0.1.sql',
   'kingres_timepart--0.1--0.2.sql',
   'kingres_timepart--0.2.sql',
+  'kingres_timepart--0.2--0.3.sql',
+  'kingres_timepart--0.3.sql',
   'kingres_timepart.control',
   kwargs: contrib_data_args,
 )
@@ -53,6 +55,7 @@ tests += {
       't/007_convert_standby.pl',
       't/008_convert_prepared.pl',
       't/009_convert_ddl_race.pl',
+      't/010_install_script_current.pl',
     ],
   },
 }

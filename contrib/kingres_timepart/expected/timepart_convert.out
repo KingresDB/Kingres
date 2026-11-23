@@ -17,7 +17,7 @@ RESET client_min_messages;
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_timepart';
  extversion 
 ------------
- 0.2
+ 0.3
 (1 row)
 
 SET client_min_messages = warning;
