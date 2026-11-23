@@ -33,11 +33,14 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/indexing.h"
+#include "catalog/dependency.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_authid.h"
 #include "catalog/pg_extension.h"
+#include "catalog/pg_namespace.h"
 #include "commands/extension.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
@@ -94,6 +97,47 @@ static Oid	cached_index_oid = InvalidOid;
  * ------------------------------------------------------------------------
  */
 
+/*
+ * The catalog is the one of the extension only when its table and its index are members of the
+ * extension that is installed in this database, the schema of the extension belongs to a superuser
+ * and the table is an ordinary table of a known number of columns.  The names are found by looking
+ * in the schema of the extension, and anybody who can create relations in that schema (a database
+ * owner who made the schema before the extension was installed) could otherwise stand in for the
+ * catalog.  Returns NULL when all is well, or what is wrong.
+ */
+static const char *
+kc_catalog_check(Oid extoid, Oid nspoid, Oid catoid, Oid idxoid)
+{
+	HeapTuple	tup;
+	Form_pg_class cls;
+	const char *what = NULL;
+	Oid			owner = InvalidOid;
+
+	tup = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(nspoid));
+	if (HeapTupleIsValid(tup))
+	{
+		owner = ((Form_pg_namespace) GETSTRUCT(tup))->nspowner;
+		ReleaseSysCache(tup);
+	}
+	if (!OidIsValid(owner) || !superuser_arg(owner))
+		return "the schema of the extension is not owned by a superuser";
+	/* the index of a member table is the table's own (its constraint index is not recorded as a member itself) */
+	if (getExtensionOfObject(RelationRelationId, catoid) != extoid ||
+		(getExtensionOfObject(RelationRelationId, idxoid) != extoid &&
+		 IndexGetRelation(idxoid, true) != catoid))
+		return "it is not a member of the extension";
+	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(catoid));
+	if (!HeapTupleIsValid(tup))
+		return "it has no definition";
+	cls = (Form_pg_class) GETSTRUCT(tup);
+	if (cls->relkind != RELKIND_RELATION)
+		what = "it is not an ordinary table";
+	else if (cls->relnatts != Natts_kc_stripe && cls->relnatts != Natts_kc_stripe_v01)
+		what = "it does not have the columns of the catalog";
+	ReleaseSysCache(tup);
+	return what;
+}
+
 static void
 kc_resolve_catalog(void)
 {
@@ -120,6 +164,18 @@ kc_resolve_catalog(void)
 				(errcode(ERRCODE_UNDEFINED_TABLE),
 				 errmsg("the stripe catalog of \"%s\" is missing",
 						KC_EXTENSION_NAME)));
+	{
+		const char *bad = kc_catalog_check(extoid, nspoid, cached_catalog_oid, cached_index_oid);
+
+		if (bad != NULL)
+		{
+			cached_catalog_oid = InvalidOid;
+			cached_index_oid = InvalidOid;
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("the stripe catalog of \"%s\" cannot be used: %s", KC_EXTENSION_NAME, bad)));
+		}
+	}
 }
 
 Oid
@@ -1425,13 +1481,28 @@ kc_catalog_available(void)
 {
 	Oid			extoid = get_extension_oid(KC_EXTENSION_NAME, true);
 	Oid			nspoid;
+	Oid			catoid;
+	Oid			idxoid;
+	const char *bad;
 
 	if (!OidIsValid(extoid))
 		return false;
 	nspoid = get_extension_schema(extoid);
-	return OidIsValid(get_relname_relid(KC_CATALOG_NAME, nspoid)) &&
-		OidIsValid(get_relname_relid(KC_CATALOG_PKEY, nspoid));
+	catoid = get_relname_relid(KC_CATALOG_NAME, nspoid);
+	idxoid = get_relname_relid(KC_CATALOG_PKEY, nspoid);
+	if (!OidIsValid(catoid) || !OidIsValid(idxoid))
+		return false;
+	/* a look-alike is not the catalog: nothing is cleaned up in it (a table of somebody else) */
+	bad = kc_catalog_check(extoid, nspoid, catoid, idxoid);
+	if (bad != NULL)
+	{
+		ereport(LOG,
+				(errmsg("kingres_columnar: the stripe catalog is not used in database with OID %u: %s", MyDatabaseId, bad)));
+		return false;
+	}
+	return true;
 }
+
 /*
  * A table access method has no callback at DROP, and a rewrite leaves the old
  * file's rows behind, so the rows whose stored content no relation owns any

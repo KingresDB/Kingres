@@ -155,6 +155,7 @@ tests += {
       't/068_vacuum_giveback.pl',
       't/069_vacuum_merge_safe.pl',
       't/070_vacuum_order_and_skip.pl',
+      't/071_catalog_trust.pl',
     ],
   },
 }
