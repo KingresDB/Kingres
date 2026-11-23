@@ -444,6 +444,54 @@ Covers branch p12-storage (from p12f-fix, kingres_shard 0.8 with the review fixe
   An earlier gate of the S1 commit alone had the same version failures and one failure of `t/085` on 18 that did not repeat (a wait for a WAL segment; it passes alone).
 - `kingres_ledger` (regress and 39 TAP files, 2587 tests) on 18 and 19 with the check of rule L1: all pass.
 
+## 2026-11-22 (later): fixes of the independent review of phase 14a
+
+### What was done
+
+- The review (0 critical, 1 high, 4 medium, 7 low) is in `docs/reviews/2026-11-22-data-export-import-14a.md` with a section "Fixes". The high finding (the commit intent
+  was overwritten after COMMIT, so a re-run said "nothing stored" and a retry doubled the rows) is fixed by a marker row that commits with the data; load and commit are one
+  step. The mediums: the staged files are adopted at start (quota), a dangerous role is refused for import and the owner test of the export no longer trusts a superuser, the
+  header cells are guarded, the checks of the export are repeated at step time. The lows: no `lost` mark from a poll, the size cap reads the file, the column types are compared,
+  `skipBom` only for UTF-8, xml guarded, the janitor re-reads before its alarm, one transfer per role without a race, refused requests leave no record.
+- Contract 0.19.0 texts only (steps, the 403 and 400 cases, `import_outcome_unknown` now rare); logged in `contract-changes.txt`.
+
+### How it was verified
+
+- New tests (`review14_e2e_test.go`, `review14_restart_e2e_test.go`, `TestImportCrashAfterCommit`) on PostgreSQL 18 and 19; each was shown to fail with its fix removed (mutants:
+  header guard, owner test, dangerous role, skipBom, types, lock, adoption, setting, record removal, gzip look, marker read, `row_security`, untrusted check).
+
+### Still open
+
+- The xml guard cannot be run here (the test build of PostgreSQL has no libxml); the janitor retry has no test that fails without it (the race needs a hook inside the sweep).
+- A real failover of the leader at every step and a shard group lost exactly at COMMIT, as before.
+
+---
+
+## 2026-11-22: data export and import of tables (phase 14a, control plane): contract 0.19.0, the relay, uploads, downloads, the export and the import
+
+### What was done
+
+- **Contract 0.19.0** (cb4afe3757): ten operations, the vendor extension `x-streams`, the setting `dataTransfer`, twelve problem codes, two task kinds, the
+  checker rules and the generated files; two texts corrected later (validation_failed is 400, insufficient_disk 409).
+- **CP1:** the table `kingres_cp.data_transfer` (migration 0035), the setting, the flags, the check of the role between steps, `transfer.SafeError` with the canary and
+  fuzz tests. **CP2** came from the second writer (`internal/staging`, merged). **S1:** the relay spike (5 GiB each way, heap growth 3 and 13 MiB; it found that the idle
+  body must move the write deadline too). **CP3:** `POST /internal/v1/forward-stream`, the guards (TLS, the setting), uploads, downloads with Range, the janitor.
+  **CP4:** the task `table.export`. **CP5:** the task `table.import` (all or nothing, the commit intent, reference tables through typed arrays, S2 applied).
+- The design note has a section with the spike results and every place where the code differs from the text.
+
+### How it was verified
+
+- Unit tests of the relay, the internal call against a real mutual TLS listener, the guards and the relayed operations, SafeError (canary in every class, fuzz), the scanner
+  (against a reference, fuzz), the options and statements; PostgreSQL 18 and 19: the record and the setting, uploads, exports, downloads, imports of every kind of table, the
+  error classes with a canary, the commit fault points, cancel, demotion; three servers: uploads, import, export and download through followers, a follower that dies
+  in the middle of an upload.
+- Mutants killed: SafeError copying the message; the body limit on the relay call; the proof check of the relay; the TLS guard; the setting guard; the stream limits and
+  the relay in the guard; the chunk timeout; four of the scanner (quote toggle, record limit, the end-marker check; the fourth was not confirmed); the count comparison
+  of the import.
+
+### Still open
+
+- The independent review of the relay and of the import transaction, the leader-change fault tests of a real failover at every step, the console (second writer), the batches (14a+).
 ## 2026-11-22 (later): the search path of the service connections (DX16-01, branch sp-fix)
 
 ### What was done

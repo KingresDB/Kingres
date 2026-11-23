@@ -70,6 +70,9 @@ var leaderBoundReads = map[string]bool{
 	"getLedgerPublication": true, "getLedgerAggregate": true, "listLedgerAggregates": true, "listLedgerDigests": true,
 	// The anchor targets and records are in the leader's system database too (phase 7, step 10).
 	"listLedgerAnchorTargets": true, "getLedgerAnchorTarget": true, "listLedgerAnchors": true, "downloadLedgerAnchor": true, "getLedgerBundle": true,
+	// The staged files of the data transfer and their records are on the leader (contract 0.19.0). The other operations of the tag
+	// change something and go to the leader as every mutating operation does; the two streaming ones are relayed.
+	"getDataUpload": true, "listDataExports": true, "getDataExport": true, "downloadDataExport": true,
 }
 
 // forwardsToLeader tells whether an operation is run by the leader. Mutating
@@ -122,6 +125,10 @@ func (s *Server) tryForward(c *call, w http.ResponseWriter, r *http.Request) (bo
 	}
 	if done, err := s.mapFailoverIntercept(c, w, r); done {
 		return true, err
+	}
+	if c.op.Streams != "" {
+		// The relay does not buffer: the body goes to the leader as it is read and the answer comes back as it is written.
+		return s.tryForwardStream(c, w, r)
 	}
 	leaderID, self, err := fw.Leader(r.Context())
 	if err != nil || leaderID == "" {

@@ -22,6 +22,7 @@ export const operations = {
   checkSetupToken: { role: 'none', method: 'POST', path: '/setup/token-check' },
   configureApproximateAggregates: { role: 'kingres_admin', method: 'PUT', path: '/databases/{databaseName}/approximate-aggregates' },
   createDatabase: { role: 'kingres_admin', method: 'POST', path: '/databases' },
+  createDataUpload: { role: 'kingres_admin', method: 'POST', path: '/data-uploads' },
   createGrant: { role: 'kingres_admin', method: 'POST', path: '/grants' },
   createInclusionProof: { role: 'kingres_readonly', method: 'POST', path: '/databases/{databaseName}/ledger/inclusion-proofs' },
   createLedgerAnchorTarget: { role: 'kingres_admin', method: 'POST', path: '/ledger/anchor-targets' },
@@ -30,6 +31,8 @@ export const operations = {
   createRole: { role: 'kingres_admin', method: 'POST', path: '/roles' },
   createServerGroup: { role: 'kingres_ops', method: 'POST', path: '/server-groups' },
   createTablePartition: { role: 'kingres_admin', method: 'POST', path: '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partitions' },
+  deleteDataExport: { role: 'kingres_admin', method: 'DELETE', path: '/data-exports/{exportId}' },
+  deleteDataUpload: { role: 'kingres_admin', method: 'DELETE', path: '/data-uploads/{uploadId}' },
   deleteLedgerAnchorTarget: { role: 'kingres_admin', method: 'DELETE', path: '/ledger/anchor-targets/{targetId}' },
   deletePartitionPolicy: { role: 'kingres_admin', method: 'DELETE', path: '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partition-policy' },
   deleteRole: { role: 'kingres_admin', method: 'DELETE', path: '/roles/{roleName}' },
@@ -37,12 +40,14 @@ export const operations = {
   detachTablePartition: { role: 'kingres_admin', method: 'POST', path: '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partitions/{partitionName}/detach' },
   distributeSchema: { role: 'kingres_admin', method: 'PUT', path: '/databases/{databaseName}/schemas/{schemaName}/distribution' },
   distributeTable: { role: 'kingres_admin', method: 'PUT', path: '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/distribution' },
+  downloadDataExport: { role: 'kingres_admin', method: 'GET', path: '/data-exports/{exportId}/content' },
   downloadLedgerAnchor: { role: 'kingres_readonly', method: 'GET', path: '/databases/{databaseName}/ledger/anchors/{anchorId}/evidence' },
   drainServer: { role: 'kingres_ops', method: 'POST', path: '/servers/{serverId}/drain' },
   dropDatabase: { role: 'kingres_admin', method: 'DELETE', path: '/databases/{databaseName}' },
   dropTablePartition: { role: 'kingres_admin', method: 'DELETE', path: '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partitions/{partitionName}' },
   enableTableLedger: { role: 'kingres_admin', method: 'PUT', path: '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/ledger' },
   executeQuery: { role: 'kingres_readonly', method: 'POST', path: '/query' },
+  exportTable: { role: 'kingres_admin', method: 'POST', path: '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/export' },
   failoverServer: { role: 'kingres_ops', method: 'POST', path: '/servers/{serverId}/failover' },
   generateLedgerDigest: { role: 'kingres_ops', method: 'POST', path: '/databases/{databaseName}/ledger/digests' },
   getApproximateAggregates: { role: 'kingres_readonly', method: 'GET', path: '/databases/{databaseName}/approximate-aggregates' },
@@ -55,6 +60,8 @@ export const operations = {
   getConfigSummary: { role: 'kingres_readonly', method: 'GET', path: '/config/summary' },
   getDatabase: { role: 'kingres_readonly', method: 'GET', path: '/databases/{databaseName}' },
   getDatabaseCreateOptions: { role: 'kingres_readonly', method: 'GET', path: '/database-create-options' },
+  getDataExport: { role: 'kingres_admin', method: 'GET', path: '/data-exports/{exportId}' },
+  getDataUpload: { role: 'kingres_admin', method: 'GET', path: '/data-uploads/{uploadId}' },
   getFailoverReport: { role: 'kingres_readonly', method: 'GET', path: '/failover/reports/{reportId}' },
   getFailoverStatus: { role: 'kingres_readonly', method: 'GET', path: '/failover' },
   getHealth: { role: 'none', method: 'GET', path: '/healthz' },
@@ -85,6 +92,7 @@ export const operations = {
   getThisServerInstance: { role: 'kingres_readonly', method: 'GET', path: '/this-server/instances/{instanceId}' },
   getThisServerResources: { role: 'kingres_readonly', method: 'GET', path: '/this-server/resources' },
   getThisServerSettings: { role: 'kingres_readonly', method: 'GET', path: '/this-server/settings' },
+  importTable: { role: 'kingres_admin', method: 'POST', path: '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/import' },
   initCluster: { role: 'none', method: 'POST', path: '/setup/init-cluster' },
   joinCluster: { role: 'none', method: 'POST', path: '/setup/join-cluster' },
   leaveCluster: { role: 'kingres_admin', method: 'POST', path: '/this-server/leave-cluster' },
@@ -97,6 +105,7 @@ export const operations = {
   listConfigParameters: { role: 'kingres_readonly', method: 'GET', path: '/config/parameters' },
   listConfigServers: { role: 'kingres_readonly', method: 'GET', path: '/config/servers' },
   listDatabases: { role: 'kingres_readonly', method: 'GET', path: '/databases' },
+  listDataExports: { role: 'kingres_admin', method: 'GET', path: '/data-exports' },
   listFailoverReports: { role: 'kingres_readonly', method: 'GET', path: '/failover/reports' },
   listGrants: { role: 'kingres_admin', method: 'GET', path: '/grants' },
   listLedgerAggregates: { role: 'kingres_readonly', method: 'GET', path: '/databases/{databaseName}/ledger/aggregates' },
@@ -169,6 +178,7 @@ export const operations = {
   updateServer: { role: 'kingres_ops', method: 'PATCH', path: '/servers/{serverId}' },
   updateThisServerSettings: { role: 'kingres_admin', method: 'PATCH', path: '/this-server/settings' },
   upgradeLedgerExtension: { role: 'kingres_admin', method: 'POST', path: '/databases/{databaseName}/ledger/upgrade' },
+  uploadDataChunk: { role: 'kingres_admin', method: 'PATCH', path: '/data-uploads/{uploadId}' },
 } as const satisfies Record<
   string,
   { role: RequiredRole; method: string; path: string }
@@ -177,4 +187,4 @@ export const operations = {
 export type OperationId = keyof typeof operations
 
 /** The closed list of audit actions (components/schemas/AuditAction). */
-export const auditActions = ['login', 'logout', 'loginFailed', 'setupTokenRejected', 'initCluster', 'joinCluster', 'updateThisServerSettings', 'restartThisServerInstance', 'stopThisServerInstance', 'startThisServerInstance', 'leaveCluster', 'addServer', 'updateServer', 'removeServer', 'failoverServer', 'abandonMapGroupBootstrap', 'autoFailover', 'createServerGroup', 'deleteServerGroup', 'createDatabase', 'updateDatabase', 'dropDatabase', 'distributeTable', 'enableTableLedger', 'restorePreferredPrimaries', 'startRebalance', 'stopRebalance', 'cancelTask', 'createRole', 'updateRole', 'deleteRole', 'setRoleMemberships', 'setRoleClusterRoles', 'createGrant', 'revokeGrants', 'applyGrantTemplate', 'replaceNetworkAccess', 'updateClusterSettings', 'generateLedgerDigest', 'startLedgerVerification', 'executeQuery', 'acknowledgeAlert', 'renewServerCertificates', 'revokeServerCertificates', 'certificateRenewed', 'certificateRenewalFailed', 'cancelStatement', 'leaseLost', 'leaseFenced', 'leaseAcquired', 'standbyCreated', 'standbyRemoved', 'standbyRebuilt', 'standbyInstanceStarted', 'standbyInstanceRemoved', 'standbyInstanceRebuilt', 'synchronousStandbyNamesChanged', 'replicationSlotDropped', 'applyConfigChange', 'revertConfigChange', 'restartPendingInstances', 'resetAutoFailoverCounter', 'failoverGroupStarted', 'failoverGroupPromoted', 'failoverGroupFailed', 'oldPrimaryRebuilt', 'updateLedgerSettings', 'createLedgerSigningKey', 'retireLedgerSigningKey', 'revokeLedgerSigningKey', 'createLedgerAnchorTarget', 'updateLedgerAnchorTarget', 'deleteLedgerAnchorTarget', 'testLedgerAnchorTarget', 'anchorLedgerNow', 'retryLedgerAnchor', 'createLedgerBundle', 'registerLedgerClientKey', 'revokeLedgerClientKey', 'setTableSignaturePolicy', 'upgradeLedgerExtension', 'acknowledgeLedgerDivergence', 'previewTableChange', 'undistributeTable', 'alterTableDistribution', 'createTablePartition', 'attachTablePartition', 'detachTablePartition', 'dropTablePartition', 'drainServer', 'splitBucket', 'previewBucketSplit', 'distributeSchema', 'undistributeSchema', 'moveSchema', 'configureApproximateAggregates', 'setTableStorage', 'setPartitionStorage', 'putPartitionPolicy', 'deletePartitionPolicy', 'runPartitionPolicy'] as const
+export const auditActions = ['login', 'logout', 'loginFailed', 'setupTokenRejected', 'initCluster', 'joinCluster', 'updateThisServerSettings', 'restartThisServerInstance', 'stopThisServerInstance', 'startThisServerInstance', 'leaveCluster', 'addServer', 'updateServer', 'removeServer', 'failoverServer', 'abandonMapGroupBootstrap', 'autoFailover', 'createServerGroup', 'deleteServerGroup', 'createDatabase', 'updateDatabase', 'dropDatabase', 'distributeTable', 'enableTableLedger', 'restorePreferredPrimaries', 'startRebalance', 'stopRebalance', 'cancelTask', 'createRole', 'updateRole', 'deleteRole', 'setRoleMemberships', 'setRoleClusterRoles', 'createGrant', 'revokeGrants', 'applyGrantTemplate', 'replaceNetworkAccess', 'updateClusterSettings', 'generateLedgerDigest', 'startLedgerVerification', 'executeQuery', 'acknowledgeAlert', 'renewServerCertificates', 'revokeServerCertificates', 'certificateRenewed', 'certificateRenewalFailed', 'cancelStatement', 'leaseLost', 'leaseFenced', 'leaseAcquired', 'standbyCreated', 'standbyRemoved', 'standbyRebuilt', 'standbyInstanceStarted', 'standbyInstanceRemoved', 'standbyInstanceRebuilt', 'synchronousStandbyNamesChanged', 'replicationSlotDropped', 'applyConfigChange', 'revertConfigChange', 'restartPendingInstances', 'resetAutoFailoverCounter', 'failoverGroupStarted', 'failoverGroupPromoted', 'failoverGroupFailed', 'oldPrimaryRebuilt', 'updateLedgerSettings', 'createLedgerSigningKey', 'retireLedgerSigningKey', 'revokeLedgerSigningKey', 'createLedgerAnchorTarget', 'updateLedgerAnchorTarget', 'deleteLedgerAnchorTarget', 'testLedgerAnchorTarget', 'anchorLedgerNow', 'retryLedgerAnchor', 'createLedgerBundle', 'registerLedgerClientKey', 'revokeLedgerClientKey', 'setTableSignaturePolicy', 'upgradeLedgerExtension', 'acknowledgeLedgerDivergence', 'previewTableChange', 'undistributeTable', 'alterTableDistribution', 'createTablePartition', 'attachTablePartition', 'detachTablePartition', 'dropTablePartition', 'drainServer', 'splitBucket', 'previewBucketSplit', 'distributeSchema', 'undistributeSchema', 'moveSchema', 'configureApproximateAggregates', 'setTableStorage', 'setPartitionStorage', 'putPartitionPolicy', 'deletePartitionPolicy', 'runPartitionPolicy', 'exportTable', 'importTable', 'createDataUpload', 'deleteDataUpload', 'downloadDataExport', 'deleteDataExport', 'dataTransfer.completed', 'dataTransfer.purged'] as const

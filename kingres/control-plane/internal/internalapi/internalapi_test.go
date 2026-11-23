@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -35,6 +36,8 @@ type env struct {
 	// VerifyAssertion refuse.
 	gather      func()
 	noAssertion bool
+	// stream is the streaming operation of the backend (nil: it counts the body and answers 204).
+	stream func(ctx context.Context, peer string, r ForwardRequest, body io.Reader, w http.ResponseWriter) error
 }
 
 // cert issues a certificate for cn from ca and returns it as a TLS pair.
@@ -72,6 +75,15 @@ func newEnv(t *testing.T) *env {
 		Forward: func(_ context.Context, peer string, r ForwardRequest) (ForwardResponse, error) {
 			e.forwarded = append(e.forwarded, peer+":"+r.OperationID+":"+r.Identity.Username)
 			return ForwardResponse{Status: 201, Header: map[string]string{"Content-Type": "application/json"}, Body: []byte(`{"ok":true}`)}, nil
+		},
+		ForwardStream: func(ctx context.Context, peer string, r ForwardRequest, body io.Reader, w http.ResponseWriter) error {
+			if e.stream != nil {
+				return e.stream(ctx, peer, r, body, w)
+			}
+			n, _ := io.Copy(io.Discard, body)
+			w.Header().Set("Upload-Offset", strconv.FormatInt(n, 10))
+			w.WriteHeader(http.StatusNoContent)
+			return nil
 		},
 		Member:         func(_ context.Context, peer string) (bool, error) { return !e.pending[peer], nil },
 		VerifyIdentity: func(context.Context, fwdproof.Kind, string, ForwardRequest) error { return e.unproven },

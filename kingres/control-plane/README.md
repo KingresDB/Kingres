@@ -340,14 +340,87 @@ handlers in `internal/httpapi/handlers_config.go`, wiring in `cmd/kingresd/confi
   value that PostgreSQL rejects in the file (the file is restored and the text is reported), a database time zone seen
   on a standby, and the warnings of the preview.
 
+## Data transfer: table CSV export and import (phase 14a, contract 0.19.0)
+
+Design: [../docs/design/data-export-import.md](../docs/design/data-export-import.md) (its last section before "Known limits" says where the code
+differs from the text). Ten operations, tag `Data transfer`: two tasks (`table.export`, `table.import`) and eight operations on staged files.
+
+**Who and what is checked.** Every operation needs `kingres_admin`, the cluster setting `dataTransfer.enabled` (off by default; the leader reads it, a
+follower cannot) and a request that arrived over TLS (the server that received it decides; start `kingresd` with `-tls-cert-file` and `-tls-key-file`).
+The data is bound by the PostgreSQL privileges of the signed-in role: the connection of an export or an import is the role's. A staged file belongs to
+its creator by **name and OID**; another role sees 404 (also another administrator), only a delete is open to every administrator. The role is checked again
+at the start of every step and before the commit (`CurrentRoles`, the OID): a role that signed out, was demoted, expired or was replaced ends the task with
+the code `forbidden` and stores nothing.
+
+**Where files live.** `-transfer-dir` (default `<data-dir>/transfer`, mode 0700, marked by `.kingres-transfer`; refused when it is not empty and unmarked, or is or
+holds the data directory), the master key `-transfer-key-file` (default `<data-dir>/transfer.key`, never inside the staging directory, in file-level
+backups of the data directory), `-transfer-max-duration` (24h; the COPY carries the time left as its `statement_timeout`) and `-max-atomic-bytes` (2 GiB of
+decompressed CSV per import). Files are sealed in 64 KiB segments with AES-256-GCM (package `staging`, increment CP2). Limits and the janitor are
+in the design note; the janitor runs on the leader every 5 minutes and once before the first transfer, expires files, deletes the files of dropped roles and
+stops when the files show an id the system database never issued (a restored database).
+
+**Streaming relay.** `uploadDataChunk` and `downloadDataExport` carry `x-streams`; they leave the 30 s request timeout and the 1 MiB body limit and use idle
+deadlines that move with the bytes (package `relay`, `internal-api.md`, "The streaming relay"). A follower relays them to the leader through
+`POST /internal/v1/forward-stream` without buffering. Spike S1 moved 5 GiB each way with a heap growth of 3 and 13 MiB.
+
+**Export.** One `COPY (SELECT ...) TO STDOUT` of the table in a read-only `READ COMMITTED` transaction of the role, `row_security = off`, fixed session formats
+(`DateStyle`, `IntervalStyle`, `extra_float_digits`, `bytea_output`, `TimeZone`, `lc_monetary`, `client_encoding`), through the compression and the seal; at most
+three attempts for a read that a moved bucket or a lost connection interrupted. The statement is built from names that passed `sqlx` and from checked options;
+`spreadsheetSafe` (default on) prefixes risky text cells with an apostrophe in SQL (a convenience, not a security feature; it loses the padding of `char(n)` and
+the value it changes). The consistency label is `single-snapshot` for a local or reference table and for a distributed table on one group, `per-group` otherwise;
+**there is no global snapshot**. A table with row-level security is exported only by its owner or a role with `BYPASSRLS`, and a read that would run a function
+of another role needs `acknowledgeOtherRolesCode`.
+
+**Import.** All or nothing, in one step (*Load rows*): `BEGIN`, `COPY ... FROM STDIN`, the count of the server compared with the records the scanner counted, an
+insert into `kingres_transfer.import_marker` (a row keyed by a random 128-bit nonce that the task carries, written through the security definer function
+`kingres_transfer.mark(nonce, task, rows, tag)`, which inserts only when `tag` is SHA-256 of a per-database secret and of `nonce:task:rows`; only the control plane can compute it, so no
+role can forge, pre-empt or hold a marker, and the role needs no grant and can still be dropped; the secret and the table are readable by the service role only; markers older than
+30 days are deleted; the schema, tables and function are created and checked by the service role on every use and the import fails closed when the schema exists with another
+owner or holds a trigger, rule, policy, other column or other function, so a database owner cannot plant `kingres_transfer`; an operator removes a planted schema), the commit intent written in the detail of the task under the lease, `COMMIT`. No transaction lives between steps. The marker commits with the rows or not at
+all, so after any interruption the answer to "did it commit" is read from the database: a run that finds the intent asks the marker; a row `committed` finishes the task
+(*Confirm the commit* records the count and the audit event); otherwise the run inserts a tombstone `aborted` for the task (it waits up to 60 seconds for a transaction
+that holds the key) after which no transaction of that task can commit, and fails `copy_interrupted` (retryable) with the proof that nothing was stored. `nothing was
+stored` is never said without that proof. When the question cannot be asked (the lock wait ran out, or the marker is on the server that was the leader before a
+change of leader) the task fails `import_outcome_unknown` and is never retried. A cancel is accepted until the intent is written. The role is refused at the request
+and in the step when it has SUPERUSER, REPLICATION or BYPASSRLS or reaches server files, programs or logs (an import runs the triggers and defaults of the table as that
+role). The setting `dataTransfer.enabled` is read again by the first step of a task: turning it off ends a task that has not begun to move data; a task that is moving
+data is cancelled with `cancelTask`. A transient error of the role check is retryable (`transfer_session_lost`), not a refusal. `done` means the local commit happened; a group whose `COMMIT PREPARED` is still pending
+may show its rows a moment later. A file exported with the spreadsheet guard and a header has an apostrophe in front of a header cell that starts like a formula; import it with `header: skip`
+(`match` compares the names). The marker table is local to the database of the server that loaded (design: a reference table for the batch import of 14c). A reference table is loaded through a temporary table and
+inserts from typed arrays (`unnest($1::int[], ...)`), cap 256 MiB, and refuses array columns. The scanner refuses an unquoted `\.` line (`import_end_marker`;
+on PostgreSQL 18 and 19 it is data in CSV, the refusal is the conservative choice) and a record above 16 MiB; a gzip stream is counted against the limit. **Identity
+columns of a distributed table draw from the sequence of the node the statement runs on** (design F18): rows loaded without the column from different servers can
+repeat values; list the column in the file.
+
+**Errors.** One function, `transfer.SafeError`, builds every error of a transfer from the SQLSTATE, a sentence per state, the names of the schema, table, column and
+constraint (the table is the task's own; a bucket partition name is dropped) and the absolute line number; never the message, detail, hint, context or the row, and
+never the `where` of the router (it holds the socket directory of a node). No problem, task error, task detail, audit event or log line of a transfer has a value
+of the data (tests plant a canary in the failing row of every class).
+
+**Tests.** `internal/relay` (spike S1, `KINGRES_SPIKE_BYTES=5368709120` for the full size), `internal/transfer` (SafeError, scanner, options, record; the record tests
+need PostgreSQL), `internal/staging` (CP2), `internal/httpapi` (guards, relay), `internal/internalapi` (the call against a real mutual TLS listener),
+`cmd/kingresd` (`TestUpload*`, `TestExport*`, `TestImport*`: real kingresd over HTTPS, `-max-atomic-bytes 4194304`), `internal/clustertest`
+(`TestDataTransferThroughAFollower`: three servers, uploads, downloads, import and export through followers, a follower that dies in the middle of an upload).
+Run the PostgreSQL ones with `scripts\run-integration.ps1 -Packages ./cmd/kingresd -Run 'TestUpload|TestExport|TestImport'` on both majors.
+
+**Not built in 14a.** Batches, `skipRows`, `onError` (the router refuses `ON_ERROR`; the console never offers it, nor `LOG_VERBOSITY`), a real failover of the manager leader at every step (the tests restart the leader on its own disk and stop a shard group instead).
+
+**Metrics and alert (added to 0.19.0 before its release).** `transferStagingUsedBytes`, `transferStagingFreeBytes`, `transfersRunning`, `transfersStaged` (server metrics of the
+server that holds the files) and the alert `transferStagingLow` (warning at 90 percent of the staging quota, critical at 98).
+
+**Fault tests added after the first review round.** `TestImportRecordNearTheLimit` (15.5 MiB through PostgreSQL, 16 MiB and 1 byte refused), `TestImportCancelAfterTheIntent` (409,
+the import completes once), `TestImportLeaseLostBeforeTheIntent` (the write of the intent refused: a take-over loads once, no doubled rows), `TestImportCrashAfterCommit` (the lease lost after COMMIT: the marker finishes the task with exactly the rows), `TestImportCommitFaultPoints` (a connection killed after the intent: the marker proves that nothing was stored), the tests of the fixes of the review in `review14_e2e_test.go`, `TestExportUntrustedFunction` (a policy
+of another role: `export_untrusted_code`), `TestStagingMetricsAndAlert`, and on three servers `TestDataTransferLeaderRestartMidTransfer` and
+`TestDataTransferShardGroupLostMidCopy` (rows are all or none; no prepared transaction is left).
+
 ## What is implemented
 
-The server implements revision **0.18.0** of the contract (161 operations, 129
+The server implements revision **0.19.0** of the contract (171 operations, 136
 paths; what is not done is in "Not done in this increment"). "Real" means the operation works against PostgreSQL or the local node
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **161 of 161 operations are real; 0 answer "not yet".**
+authenticated operation lists in 0.2.0. **171 of 171 operations are real; 0 answer "not yet".**
 
 | Tag | Real | Not yet |
 |---|---|---|
@@ -373,6 +446,7 @@ authenticated operation lists in 0.2.0. **161 of 161 operations are real; 0 answ
 | Configuration | `listConfigParameters`, `getConfigParameter`, `previewConfigChange`, `applyConfigChange`, `listConfigChanges`, `revertConfigChange`, `listConfigServers`, `getConfigSummary`, `getClusterTime`, `listTimeZones`, `restartPendingInstances` |  |
 | Settings | `getClusterSettings`, `updateClusterSettings`, `resetAutoFailoverCounter` |  |
 | Network access | `getNetworkAccess`, `replaceNetworkAccess` |  |
+| Data transfer | `exportTable`, `importTable`, `createDataUpload`, `getDataUpload`, `uploadDataChunk`, `deleteDataUpload`, `listDataExports`, `getDataExport`, `downloadDataExport`, `deleteDataExport` |  |
 | Setup | `initCluster`, `joinCluster`, `getNodeState`, `checkSetupToken` |  |
 | Tasks | `listTasks`, `getTask`, `cancelTask` |  |
 | This server | `getThisServer`, `listThisServerInstances`, `getThisServerInstance`, `restartThisServerInstance`, `listThisServerLogs`, `getThisServerResources`, `startThisServerInstance`, `stopThisServerInstance`, `leaveCluster`, `getThisServerSettings`, `updateThisServerSettings` |  |

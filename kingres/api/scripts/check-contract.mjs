@@ -189,8 +189,9 @@ for (const o of operations) {
 
 // Audit actions: operationIds plus a small closed list of non-operation events.
 // certificateRenewed and certificateRenewalFailed are the events of the certificate renewal job (0.5.0).
-const NON_OPERATION_EVENTS = ['loginFailed', 'setupTokenRejected', 'autoFailover', 'certificateRenewed', 'certificateRenewalFailed', 'leaseLost', 'leaseFenced', 'leaseAcquired', 'standbyCreated', 'standbyRemoved', 'standbyRebuilt', 'standbyInstanceStarted', 'standbyInstanceRemoved', 'standbyInstanceRebuilt', 'synchronousStandbyNamesChanged', 'replicationSlotDropped', 'failoverGroupStarted', 'failoverGroupPromoted', 'failoverGroupFailed', 'oldPrimaryRebuilt'];
-const NOT_AUDITED_MUTATIONS = ['previewRebalancePlan', 'createInclusionProof', 'checkSetupToken', 'previewConfigChange', 'planPartitionPolicy'];
+const NON_OPERATION_EVENTS = ['loginFailed', 'setupTokenRejected', 'autoFailover', 'certificateRenewed', 'certificateRenewalFailed', 'leaseLost', 'leaseFenced', 'leaseAcquired', 'standbyCreated', 'standbyRemoved', 'standbyRebuilt', 'standbyInstanceStarted', 'standbyInstanceRemoved', 'standbyInstanceRebuilt', 'synchronousStandbyNamesChanged', 'replicationSlotDropped', 'failoverGroupStarted', 'failoverGroupPromoted', 'failoverGroupFailed', 'oldPrimaryRebuilt', 'dataTransfer.completed', 'dataTransfer.purged'];
+// uploadDataChunk: a chunk of an upload is not an event (the creation, the completion and the use of the upload are).
+const NOT_AUDITED_MUTATIONS = ['previewRebalancePlan', 'createInclusionProof', 'checkSetupToken', 'previewConfigChange', 'planPartitionPolicy', 'uploadDataChunk'];
 const auditEnum = schemas.AuditAction?.enum;
 if (!Array.isArray(auditEnum)) fail('components.schemas.AuditAction', 'must be an enum');
 else {
@@ -387,11 +388,12 @@ const MUST_MENTION = {
   '0.18.0': ['abandonMapGroupBootstrap', 'skipped', 'mapGroup', 'additive'],
   '0.14.0': ['previewTableChange', 'undistributeTable', 'alterTableDistribution', 'createTablePartition', 'table_not_eligible', 'dependentViews', 'additive'],
   '0.16.0': ['previewConfigChange', 'warnings', 'config_value_unusual', 'config_reserved_connections', 'additive'],
+  '0.19.0': ['exportTable', 'importTable', 'createDataUpload', 'uploadDataChunk', 'downloadDataExport', 'x-streams', 'dataTransfer', 'data_transfer_disabled', 'import_outcome_unknown', 'Upload-Offset', 'additive'],
   '0.12.0': ['completedWithWarnings', 'failover_needs_decision', 'plan', 'notScheduled', 'additive'],
   '0.9.0': ['startRebalance', 'previewRebalancePlan', 'nothing_to_rebalance', 'cluster_inconsistent', 'skipped', 'ledgerSummary', 'Prefer', 'additive'],
   '0.5.0': ['renewServerCertificates', 'revokeServerCertificates', 'certificate_authority_unavailable', 'certificate_revoked', 'certificateRenewalFailed', 'partial', 'additive'],
 };
-for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0', '0.10.0', '0.11.0', '0.12.0', '0.13.0', '0.14.0', '0.15.0', '0.16.0', '0.17.0', '0.18.0']) {
+for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0', '0.10.0', '0.11.0', '0.12.0', '0.13.0', '0.14.0', '0.15.0', '0.16.0', '0.17.0', '0.18.0', '0.19.0']) {
   const changelog = changelogOf(version);
   if (!changelog) { fail('README.md', `changelog heading for ${version} is missing`); continue; }
   for (const h of ['#### Breaking', '#### Additive', '#### Documentation']) if (!changelog.includes(h)) fail('README.md', `changelog of ${version} lacks "${h}"`);
@@ -403,7 +405,7 @@ for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0', '0.
   if (!m) fail('README.md', `the changelog summary of ${version} must state "N operations added (M operations, P paths)"`);
   else if (version === doc.info?.version && (Number(m[2]) !== operations.length || Number(m[3]) !== Object.keys(doc.paths ?? {}).length)) fail('README.md', `changelog says ${m[2]} operations and ${m[3]} paths, the contract has ${operations.length} and ${Object.keys(doc.paths ?? {}).length}`);
 }
-if (doc.info?.version !== '0.18.0') fail('info.version', 'the contract is revision 0.18.0');
+if (doc.info?.version !== '0.19.0') fail('info.version', 'the contract is revision 0.19.0');
 
 
 // 0.5.0 rules: certificate operations, partial answers, additive changes only.
@@ -579,6 +581,66 @@ for (const [n, prop] of [['SetupTaskSummary', 'detail'], ['NodeStateInfo', 'inte
   if (!schemas.LedgerDigest?.properties?.aggregateSize || (schemas.LedgerDigest?.required ?? []).includes('aggregateSize')) fail('LedgerDigest', 'aggregateSize must exist and stay optional');
   if (!opDesc('getLedgerSigning').includes('No private key')) fail('getLedgerSigning', 'must say that no private key is ever part of the answer');
   if (!opDesc('getLedgerTrustFile').includes('first trust')) fail('getLedgerTrustFile', 'must say that the file is not a source of first trust');
+}
+// 0.19.0 rules, data transfer (additive only): the ten operations, the x-streams extension (exactly one upload and one
+// download operation, with the headers a resumable transfer needs), the setting, the closed import request, the codes and
+// the kinds. Every request and response of the data transfer operations has an example (the console mock and the contract
+// tests of the server use them).
+{
+  const need = { exportTable: ['post', 202], importTable: ['post', 202], createDataUpload: ['post', 201], getDataUpload: ['get', 200], uploadDataChunk: ['patch', 204], deleteDataUpload: ['delete', 204], listDataExports: ['get', 200], getDataExport: ['get', 200], downloadDataExport: ['get', 200], deleteDataExport: ['delete', 204] };
+  for (const [id, [method, ok]] of Object.entries(need)) {
+    const o = opById.get(id);
+    if (!o) { fail(id, 'operation of 0.19.0 does not exist'); continue; }
+    if (o.method !== method) fail(id, 'must be a ' + method.toUpperCase());
+    if (o.op['x-required-role'] !== 'kingres_admin') fail(id, 'x-required-role must be kingres_admin');
+    if (!(o.op.tags ?? []).includes('Data transfer')) fail(id, 'must have the tag Data transfer');
+    if (!respCodes(id).includes(String(ok))) fail(id, 'must list ' + ok);
+    if (!respCodes(id).includes('403')) fail(id, 'must list 403');
+    // An example for every request body and every 2xx response with a body.
+    const body = deref(o.op.requestBody);
+    for (const [mt, media] of Object.entries(body?.content ?? {})) if (!media.examples && media.example === undefined) fail(id, 'request ' + mt + ' has no example');
+    for (const [code, r] of Object.entries(o.op.responses ?? {})) {
+      const resp = deref(r);
+      for (const [mt, media] of Object.entries(resp?.content ?? {})) if (!media.examples && media.example === undefined) fail(id + ' ' + code, mt + ' has no example');
+    }
+  }
+  // x-streams: the extension is known to the checker. Exactly these two operations carry it, with these values.
+  const streams = operations.filter((o) => o.op['x-streams'] !== undefined);
+  for (const o of streams) {
+    const id = o.op.operationId;
+    const v = o.op['x-streams'];
+    if (!(id === 'uploadDataChunk' && v === 'upload') && !(id === 'downloadDataExport' && v === 'download')) fail(id, 'x-streams ' + JSON.stringify(v) + ' is not known (uploadDataChunk is upload, downloadDataExport is download)');
+  }
+  if (streams.length !== 2) fail('x-streams', 'exactly two operations stream in 0.19.0, found ' + streams.length);
+  const headerParams = (id) => (opById.get(id)?.op.parameters ?? []).map((p) => deref(p)).filter((p) => p?.in === 'header');
+  const up = headerParams('uploadDataChunk').find((p) => p.name === 'Upload-Offset');
+  if (!up || up.required !== true) fail('uploadDataChunk', 'must have the required header parameter Upload-Offset');
+  const uploadOk = deref(opById.get('uploadDataChunk')?.op.responses?.['204']);
+  if (!uploadOk?.headers?.['Upload-Offset']) fail('uploadDataChunk 204', 'must have the response header Upload-Offset');
+  if (!deref(opById.get('uploadDataChunk')?.op.responses?.['409'])?.headers?.['Upload-Offset']) fail('uploadDataChunk 409', 'must have the response header Upload-Offset');
+  if (!headerParams('downloadDataExport').some((p) => p.name === 'Range')) fail('downloadDataExport', 'must have the header parameter Range');
+  for (const code of ['200', '206']) {
+    const h = deref(opById.get('downloadDataExport')?.op.responses?.[code])?.headers ?? {};
+    for (const n of ['Content-Length', 'Accept-Ranges', 'ETag', 'Content-Disposition', 'Cache-Control', 'X-Content-Type-Options', ...(code === '206' ? ['Content-Range'] : [])]) if (!h[n]) fail('downloadDataExport ' + code, 'must have the response header ' + n);
+  }
+  for (const code of ['410', '416']) if (!respCodes('downloadDataExport').includes(code)) fail('downloadDataExport', 'must list ' + code);
+  if (!respCodes('uploadDataChunk').includes('413')) fail('uploadDataChunk', 'must list 413');
+  // The import request is closed; there are no members for skipping rows or batches in this revision.
+  if (schemas.ImportTableRequest?.additionalProperties !== false) fail('ImportTableRequest', 'must be closed (additionalProperties: false)');
+  if (JSON.stringify(schemas.ImportTableRequest?.required) !== '["uploadId"]') fail('ImportTableRequest', 'only uploadId is required');
+  for (const n of ['onError', 'batchRows', 'skipRows']) if (schemas.ImportTableRequest?.properties?.[n]) fail('ImportTableRequest', n + ' has no place in an all-or-nothing import');
+  // The setting is optional in the answer (additive) and its update is partial.
+  if ((schemas.ClusterSettings?.required ?? []).includes('dataTransfer')) fail('ClusterSettings', 'dataTransfer must stay optional (additive change)');
+  if (!schemas.ClusterSettings?.properties?.dataTransfer || !schemas.ClusterSettingsUpdateRequest?.properties?.dataTransfer) fail('ClusterSettings', 'dataTransfer is missing');
+  if (schemas.DataTransferSettings?.properties?.enabled?.default !== false) fail('DataTransferSettings.enabled', 'must default to false');
+  if (JSON.stringify(schemas.DataUpload?.properties?.chunkAlign?.enum) !== '[65536]') fail('DataUpload.chunkAlign', 'must be the enum [65536]');
+  for (const c of ['data_transfer_disabled', 'insecure_transport', 'transfer_quota_exceeded', 'upload_incomplete', 'upload_offset_mismatch', 'chunk_too_large', 'upload_checksum_mismatch', 'import_header_mismatch', 'import_ledger_policy', 'import_too_large', 'import_end_marker', 'export_untrusted_code']) if (!problemCodes.has(c)) fail('ProblemCode', 'missing ' + c);
+  for (const k of ['table.export', 'table.import']) if (!(schemas.TaskKind?.enum ?? []).includes(k)) fail('TaskKind', 'missing ' + k);
+  for (const a of ['exportTable', 'importTable', 'createDataUpload', 'deleteDataUpload', 'downloadDataExport', 'deleteDataExport', 'dataTransfer.completed', 'dataTransfer.purged']) if (!(schemas.AuditAction?.enum ?? []).includes(a)) fail('AuditAction', 'missing ' + a);
+  if (!schemas.Problem?.properties?.reasons || (schemas.Problem?.required ?? []).includes('reasons')) fail('Problem', 'reasons must exist and stay optional');
+  // The text says what a reader must not assume.
+  for (const needle of ['global snapshot', 'not a security feature']) if (!opDesc('exportTable').includes(needle)) fail('exportTable', 'description must mention ' + needle);
+  for (const needle of ['All or nothing', 'import_outcome_unknown']) if (!opDesc('importTable').includes(needle)) fail('importTable', 'description must mention ' + needle);
 }
 // ------------------------------------------------------------------ report
 const pathCount = Object.keys(doc.paths ?? {}).length;

@@ -79,6 +79,8 @@ var Calls = map[string]Policy{
 	"GET /revoked":   AnyPeer,
 	"GET /leader":    AnyPeer,
 	"POST /forward":  ToLeader,
+	// The streaming relay of the data transfer (contract 0.19.0): a frame and then raw bytes each way, with no size limit on the body.
+	"POST /forward-stream": ToLeader,
 	// Cluster-wide reads: a server asks the others for their part of the logs, alerts or
 	// metrics (and an acknowledgement that belongs to one server); every server answers
 	// after it has checked the identity the leader's assertion vouches for.
@@ -311,6 +313,8 @@ type ForwardRequest struct {
 	Pin string `json:"pin,omitempty"`
 	// Prefer is the Prefer header of the request (updateClusterSettings: respond-async).
 	Prefer string `json:"prefer,omitempty"`
+	// Header holds the request headers a streaming call carries (POST /forward-stream only): Range, Upload-Offset, Content-Length, Content-Type.
+	Header map[string]string `json:"header,omitempty"`
 	// Proof shows that the sending server holds a session of Identity.Username
 	// (package fwdproof). Forward and gather-authorize calls are refused without
 	// it; a gather call never carries one (it would reveal the user's ClientKey
@@ -327,7 +331,7 @@ func (r ForwardRequest) ProofMessage(kind fwdproof.Kind, from, to string) fwdpro
 	return fwdproof.Message{
 		Kind: kind, From: from, To: to, Username: r.Identity.Username, Roles: r.Identity.ClusterRoles,
 		Operation: r.OperationID, PathParams: r.PathParams, Query: r.Query, ContentType: r.ContentType, Body: r.Body,
-		RequestID: r.RequestID, Source: r.Source, SourceAddress: r.SourceAddress, Pin: r.Pin, Ordinal: r.Ordinal,
+		RequestID: r.RequestID, Source: r.Source, SourceAddress: r.SourceAddress, Pin: r.Pin, Ordinal: r.Ordinal, Headers: r.Header,
 	}
 }
 
@@ -346,6 +350,9 @@ type Backend struct {
 	// Forward runs a forwarded operation as the identity in the request; peer is
 	// the verified server id of the caller. It is only called on the leader.
 	Forward func(ctx context.Context, peer string, req ForwardRequest) (ForwardResponse, error)
+	// ForwardStream runs a streaming operation as the identity in the request: body is the raw body that followed the frame, and the answer is
+	// written to w (a writer whose first WriteHeader sends the frame of the answer). It is only called on the leader, after the proof was checked.
+	ForwardStream func(ctx context.Context, peer string, req ForwardRequest, body io.Reader, w http.ResponseWriter) error
 	// State reports this server.
 	State func(ctx context.Context) State
 	// Leader returns the server id of the manager leader, "" when unknown (then
@@ -496,7 +503,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			failNotReady(w)
 			return
 		}
-		if l := s.leader(r.Context()); l == "" || l != s.be.Self || (key == "POST /forward" && s.be.Forward == nil) {
+		if l := s.leader(r.Context()); l == "" || l != s.be.Self || ((key == "POST /forward" && s.be.Forward == nil) || (key == "POST /forward-stream" && s.be.ForwardStream == nil)) {
 			fail(w, http.StatusConflict, "not_leader", "This server is not the manager leader.")
 			return
 		}
@@ -547,7 +554,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// A forwarded operation is gated by the backend's Forward (it must answer the stopped
 	// instance of the leader in the documented way, see cmd/kingresd forwardGate).
-	if policy == ToLeader && key != "POST /forward" && s.be.Member != nil {
+	if policy == ToLeader && key != "POST /forward" && key != "POST /forward-stream" && s.be.Member != nil {
 		member, err := s.isMember(r.Context(), peer)
 		switch {
 		case err != nil:
@@ -564,7 +571,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if policy == ToLeader || key == "POST /globals/apply" || key == "POST /apply" {
 		limit = 16 << 20
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	if key != "POST /forward-stream" {
+		// The body of a streaming call is the frame and then the raw bytes of a chunk (up to 256 MiB) and has no limit here: its size is
+		// the operation's to check, and the connection's idle deadline is moved by the reads (package relay).
+		r.Body = http.MaxBytesReader(w, r.Body, limit)
+	}
 	ctx := r.Context()
 	switch key {
 	case "GET /state":
@@ -589,6 +600,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.exec(w, r, peer)
 	case "POST /forward":
 		s.forward(w, r, peer)
+	case "POST /forward-stream":
+		s.forwardStream(w, r, peer)
 	case "POST /gather":
 		s.gather(w, r, peer)
 	case "POST /gather-authorize":

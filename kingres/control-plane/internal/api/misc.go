@@ -306,12 +306,30 @@ type ClusterSettings struct {
 	Clock *ClockSettings `json:"clock,omitempty"`
 	// Analytics holds the settings of the analytics (contract 0.17.0).
 	Analytics *AnalyticsSettings `json:"analytics,omitempty"`
+	// DataTransfer holds the settings of the table export and import (contract 0.19.0).
+	DataTransfer *DataTransferSettings `json:"dataTransfer,omitempty"`
 }
 
 // AnalyticsSettings are the analytics settings of the cluster.
 type AnalyticsSettings struct {
 	// AllowNonSuperuserOwners allows conversions and policy runs for tables whose owner is not a superuser (default false).
 	AllowNonSuperuserOwners bool `json:"allowNonSuperuserOwners"`
+}
+
+// DataTransferSettings are the cluster settings of the data transfer (contract 0.19.0).
+type DataTransferSettings struct {
+	// Enabled is false until an administrator turns the data transfer on.
+	Enabled bool `json:"enabled"`
+	// RetentionHours is how long an export file is kept by default.
+	RetentionHours int `json:"retentionHours"`
+	// MaxFileBytes is the largest staged file.
+	MaxFileBytes int64 `json:"maxFileBytes"`
+	// StagingQuotaBytes is the sum of the reservations of the staging area.
+	StagingQuotaBytes int64 `json:"stagingQuotaBytes"`
+	// MaxConcurrent is the number of transfers running at once in the cluster.
+	MaxConcurrent int `json:"maxConcurrent"`
+	// MaxAtomicBytes is the largest decompressed file that one import of this server accepts (a flag of the server); read only.
+	MaxAtomicBytes int64 `json:"maxAtomicBytes,omitempty"`
 }
 
 // ClockSettings are the clock settings of the cluster.

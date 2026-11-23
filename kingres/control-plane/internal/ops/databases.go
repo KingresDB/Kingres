@@ -76,6 +76,8 @@ func (o *Ops) baseDefinitions() []task.Definition {
 		o.approxDefinition(),
 		o.storageDefinition(),
 		o.maintainDefinition(),
+		o.exportDefinition(),
+		o.importDefinition(),
 		{Kind: KindDatabaseCreate, Dynamic: func(in json.RawMessage) ([]task.Step, error) {
 			p, err := rawInput[createParams](in)
 			if err != nil {

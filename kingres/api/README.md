@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.18.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.19.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and, when it is built, the planned `kingres-cli` (it does not exist yet). Lint it and run the mechanical rule check with:
 
 ```
@@ -153,6 +153,7 @@ Each task kind has exactly one `subject.type`; `subject.id` is always a string.
 | `table.setStorage` (0.17.0) | `table` | `database/schema.table`; for one partition (`setPartitionStorage`) `database/schema.partition`. Steps of a table: `Check the table`, `Convert the storage` (the detail says that `ALTER TABLE ... SET ACCESS METHOD` takes an `ACCESS EXCLUSIVE` lock), `Analyze the table`; of a partition: `Check the partition`, `Convert the partition`, `Analyze the partition` |
 | `partition.maintain` (0.17.0) | `table` | `database/schema.table`: one run of the time-partitioning policy of the table. Steps: `Begin the run`, `Create partitions`, `Convert partitions`, `Retire partitions`, `Finish the run`. The task's `createdBy` is `system` for a scheduled run and the role for `runPartitionPolicy` |
 | `table.distribute`, `table.undistribute`, `table.alter`, `table.partition` | `table` | `database/schema.table` (0.14.0: the table the request named; one table task per colocation group) |
+| `table.export`, `table.import` (0.19.0) | `table` | `database/schema.table`: one unfinished task per table. `table.export` steps: `Check the request`, `Read the table class`, `Write the file`, `Seal`; its `detail` is `transfer <id>` when done. `table.import` steps: `Check the upload`, `Check the table`, `Load rows` (load and commit), `Confirm the commit`, `Clean up`; `Task.cancellable` is false once the commit was sent |
 | `rebalance` | `cluster` | `cluster` (0.9.0; one rebalance at a time, cluster-wide; the task id is the report id): steps `Check that the cluster can rebalance`, `Compute the plan`, `Move buckets`, `Write the report`; a stopped run is `paused` |
 | `schema.distribute`, `schema.move`, `schema.undistribute` (0.15.0) | `schema` | `database/schema`: steps `Check the schema`, `Set REPLICA IDENTITY FULL`, `Make the schema distributed`, `Verify on every server`; `Check the move`, `Copy the data`, `Switch`, `Clean up the old copy`; `Check the schema`, `Move first`, `Make the schema local`, `Verify on every server`; one schema task at a time per schema |
 | `bucket.split` (0.15.0) | `bucket` | `database/colocationId/bucket`: steps `Check that the split can start`, `Split the bucket`, `Check the new buckets`; one split per colocation group at a time |
@@ -219,6 +220,45 @@ for an unknown user), `setupTokenRejected` and `autoFailover` (actor `system`; 0
 operation is recorded under that operation's id with `outcome` `denied` or `failure`. Read-only operations are not
 audited except `executeQuery`. The list is the closed enum `AuditAction`, which is also the type of the `action`
 filter of `GET /audit`.
+
+## Data transfer (0.19.0)
+
+Tag `Data transfer`: export a table to a CSV file, upload a CSV file, import it into a table. Ten operations (`exportTable`, `importTable`,
+`createDataUpload`, `getDataUpload`, `uploadDataChunk`, `deleteDataUpload`, `listDataExports`, `getDataExport`, `downloadDataExport`,
+`deleteDataExport`). The design is `kingres/docs/design/data-export-import.md` (phase 14a).
+
+- **Who.** Every operation needs `kingres_admin` and the cluster setting `ClusterSettings.dataTransfer.enabled` (off by default; 403
+  `data_transfer_disabled`), and refuses a request that did not arrive over TLS (403 `insecure_transport`). The PostgreSQL privileges of the signed-in role
+  (`SELECT` to export, `INSERT` to import) decide what data can be read or written. A staged file belongs to the role that made it: `getDataUpload`, `getDataExport`
+  and `downloadDataExport` answer 404 to another role, `listDataExports` lists only the caller's files. `deleteDataExport` also accepts any `kingres_admin`.
+  This is defence in depth, not a boundary: an administrator can often become another role.
+- **Staged files.** An export and an upload are files on the manager leader, encrypted at rest, with a retention time (`retentionHours`, 24 by default; an
+  upload that received nothing for 48 hours, or that was complete and unused for 24 hours, is deleted). Limits: `maxFileBytes` (20 GiB), `stagingQuotaBytes`,
+  `maxConcurrent` (2 in the cluster, 1 per role), and an import of at most 2 GiB decompressed (`import_too_large`: split the file).
+- **Consistency of an export.** `DataExport.consistency` says, per table, `single-snapshot` (a local table, a reference table, or a distributed table whose buckets are
+  all on one group), `per-group` (each group's rows are one snapshot of that group; the groups' snapshots are not one instant) or `per-group-and-partition`.
+  Every row was committed. **There is no global snapshot.** Exporting twice and getting the same SHA-256 means nothing changed in between.
+- **Streaming operations.** `uploadDataChunk` carries `x-streams: upload` and `downloadDataExport` carries `x-streams: download`. They do not use the 30 s request timeout,
+  the 60 s write timeout and the 1 MiB body limit of the other operations; they use an idle limit of 60 s, and a follower relays them to the leader without buffering.
+  The checker knows the extension: exactly these two operations carry it, and they carry the headers below.
+- **Resumable upload.** `createDataUpload` declares the size and reserves the quota; the client sends chunks with `PATCH` and the header `Upload-Offset`, strictly in
+  order, each a multiple of `chunkAlign` (65536) except the last and at most `chunkBytesMax`; 409 `upload_offset_mismatch` answers with the right `Upload-Offset`;
+  after a break the client reads `offset` from `getDataUpload`. When the last byte is in the server computes the SHA-256 (`upload_checksum_mismatch` when it differs
+  from a declared one) and the upload is `complete`.
+- **Download.** `Range` (one range) answers 206 with `Content-Range`; every answer has `Content-Length`, `Accept-Ranges`, `ETag` (the SHA-256),
+  `Content-Disposition` (a name the server builds), `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`. 410: expired. 416: bad range.
+- **Import is all or nothing.** One transaction: the number of rows PostgreSQL reports must equal the number of records the control plane counted, or nothing is stored. The outcome
+  is read from a marker that commits with the rows; only when it cannot be read (a change of leader) does a task fail with `import_outcome_unknown` (not retryable): check the table before repeating.
+- **Error text.** No problem, task error, task detail or audit event of a data transfer carries a value, a row, a key or the message of PostgreSQL. The text is a fixed sentence per
+  SQLSTATE, the names of the column and the constraint, and the absolute line number.
+- **Task codes** (`TaskError.code`): `export_too_large`, `insufficient_disk`, `transfer_quota_exceeded`, `transfer_timeout`, `transfer_leader_changed` (retryable),
+  `transfer_session_lost` (retryable), `transfer_key_lost`, `copy_interrupted` (retryable), `row_count_mismatch`, `import_outcome_unknown`, `forbidden`, `cancelled`, `sql_error`; the import finds
+  in the file itself: `import_header_mismatch` (`header: match` failed; PostgreSQL checks it at load time and its text is not passed on), `import_end_marker` (with the line),
+  `import_record_too_large` (with the line) and `import_too_large` (the decompressed file passes the limit).
+- **Identity columns.** The sequences behind the identity or serial columns of a distributed table are node-local: rows loaded without the column from different servers
+  can repeat values. List the column in the file. The console should warn for such a table.
+- **Audit.** The mutating operations, `downloadDataExport` (a read, audited because data leaves; written when the stream ends), and the system events `dataTransfer.completed` and
+  `dataTransfer.purged`. An upload chunk is not an event.
 
 ## Inclusion proofs and `kingres-verify`
 
@@ -322,6 +362,35 @@ Where the architecture document leaves something open, the simplest option was c
     range and the cluster's replica count.
 
 ## Changelog
+
+### 0.19.0
+
+Revision written first for the data transfer of phase 14a (`kingres/docs/design/data-export-import.md`), so that the control plane and the console are built against it. Summary for the panel:
+10 operations added (171 operations, 136 paths); one setting, two task kinds, twelve problem codes and the vendor extension `x-streams` added; **no change that is not additive**.
+
+#### Breaking
+
+None.
+
+#### Additive
+- Tag `Data transfer` with `exportTable` (`POST .../tables/{tableName}/export`, task kind `table.export`), `importTable` (`POST .../import`, task kind `table.import`), `createDataUpload`,
+  `getDataUpload`, `uploadDataChunk` (header `Upload-Offset`, binary body), `deleteDataUpload`, `listDataExports`, `getDataExport`, `downloadDataExport` (header `Range`, 200 or 206) and `deleteDataExport`.
+  All need `kingres_admin`.
+- `uploadDataChunk` carries `x-streams: upload` and `downloadDataExport` carries `x-streams: download`: they leave the request timeout and the body limit of the other operations.
+- `ClusterSettings.dataTransfer` (optional) and `ClusterSettingsUpdateRequest.dataTransfer`: `enabled` (default false), `retentionHours`, `maxFileBytes`, `stagingQuotaBytes`, `maxConcurrent`.
+- `ProblemCode` has `data_transfer_disabled`, `insecure_transport`, `transfer_quota_exceeded`, `upload_incomplete`, `upload_offset_mismatch`, `chunk_too_large`, `upload_checksum_mismatch`,
+  `import_header_mismatch`, `import_ledger_policy`, `import_too_large`, `import_end_marker` and `export_untrusted_code`; `Problem` has the optional `reasons`; an expired file is 410 with the code `not_found`.
+- `MetricName` has `transferStagingUsedBytes`, `transferStagingFreeBytes`, `transfersRunning` and `transfersStaged`, and `AlertKind` has `transferStagingLow` (added later in 0.19.0, before its release).
+- `TaskKind` has `table.export` and `table.import`; `AuditAction` has `exportTable`, `importTable`, `createDataUpload`, `deleteDataUpload`, `downloadDataExport`, `deleteDataExport`, `dataTransfer.completed`
+  and `dataTransfer.purged` (`uploadDataChunk` is not audited).
+- Schemas: `ExportTableRequest`, `ImportTableRequest` (closed), `CreateDataUploadRequest`, `DataUpload`, `DataExport`, `DataExportPage`, `TableConsistency`, `DataTransferSettings`, `DataTransferSettingsUpdate`.
+
+#### Documentation
+
+- The section "Data transfer" states who may use the operations, the limits, the consistency labels (**there is no global snapshot**), the resumable upload, the download, the all-or-nothing import (a task that fails after the commit was sent has the code `import_outcome_unknown`, not retryable) and the rule
+  that no error carries a value or the text of PostgreSQL. Every request and response has an example.
+- `DataUpload.state`, `DataExport.kind`, `DataExport.format`, `CreateDataUploadRequest.purpose` and `TableConsistency.level` list the values of this revision; later revisions add values (`validating`, `valid`, `invalid`,
+  `databaseExport`, `archive/1`, `databaseArchive`, `archive-single-snapshot`), so clients must tolerate values they do not know.
 
 ### 0.18.0
 

@@ -9,6 +9,7 @@ import (
 	"net/http"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fwdproof"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/relay"
 )
 
 // verifyIdentity checks the proof of a forwarded or gathered request and
@@ -150,4 +151,52 @@ func (s *Server) gather(w http.ResponseWriter, r *http.Request, peer string) {
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// forwardStream serves POST /forward-stream (contract 0.19.0, the streaming relay of the data transfer). The body is a frame (4-byte length,
+// at most 64 KiB, then JSON: the operation, its path parameters and query, the request headers the operation uses, the source address, the
+// identity and its proof) and then the raw bytes of an upload chunk, and the answer is a frame (status and the headers of an allowlist)
+// and then the raw bytes of the operation's answer. The proof is checked exactly as for /forward before anything runs, and the proof does
+// not cover the raw body: it is bytes of any size on the mutual TLS connection between two servers of the cluster. Nothing is buffered
+// beyond one segment.
+func (s *Server) forwardStream(w http.ResponseWriter, r *http.Request, peer string) {
+	var req ForwardRequest
+	if err := relay.ReadFrame(r.Body, &req); err != nil {
+		switch {
+		case errors.Is(err, relay.ErrFrameTooLarge):
+			fail(w, http.StatusRequestEntityTooLarge, "frame_too_large", "The frame is larger than 64 KiB.")
+		default:
+			fail(w, http.StatusBadRequest, "bad_request", "The body does not start with a valid frame.")
+		}
+		return
+	}
+	if req.OperationID == "" || req.Identity.Username == "" || len(req.Body) != 0 || req.Assertion != nil {
+		fail(w, http.StatusBadRequest, "bad_request", "operationId and identity are required, and the frame holds no body.")
+		return
+	}
+	for k := range req.Header {
+		if !relay.Allowed(k, relay.RequestHeaders) {
+			fail(w, http.StatusBadRequest, "bad_request", "The frame carries a header that is not one of the streaming operations'.")
+			return
+		}
+	}
+	if s.be.ForwardStream == nil {
+		fail(w, http.StatusNotImplemented, "not_available", "This server cannot run streaming operations.")
+		return
+	}
+	if !s.verifyIdentity(w, r, fwdproof.KindForwardStream, peer, req) {
+		return
+	}
+	s.log.Info("internal forward-stream", "peer", peer, "operation", req.OperationID, "actor", req.Identity.Username)
+	out := relay.NewResponseWriter(w)
+	if err := s.be.ForwardStream(r.Context(), peer, req, r.Body, out); err != nil {
+		s.log.Warn("streamed operation refused", "peer", peer, "operation", req.OperationID, "error", err)
+		if out.Sent() {
+			// The status is out and a part of the body may be too: the only honest end is a cut that the other side sees as a short body.
+			panic(http.ErrAbortHandler)
+		}
+		fail(w, http.StatusBadRequest, "bad_request", "The streamed operation was refused.")
+		return
+	}
+	out.Finish()
 }

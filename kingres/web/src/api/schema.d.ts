@@ -1680,6 +1680,100 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Export a table to a CSV file
+         * @description Added in 0.19.0 (data transfer, phase 14a). Starts the task `table.export` (subject `database/schema.table`): one
+         *     `COPY (SELECT ...) TO STDOUT` of the table, as the signed-in role, written to a file that is staged on the manager leader, sealed
+         *     (encrypted at rest) and kept for `retentionHours`. The answer is the task; when it is `done` its `detail` is `transfer <id>` and
+         *     `getDataExport` with that id says size, rows, SHA-256 and the consistency label of the file, and `downloadDataExport` serves it.
+         *     The request has no `WHERE`, no order and no SQL of any kind. The same statement is used for local, reference, distributed and partitioned
+         *     tables.
+         *
+         *     Needs `kingres_admin`, the cluster setting `dataTransfer.enabled` (403 `data_transfer_disabled` while it is off), a request that arrived
+         *     over TLS (403 `insecure_transport`), and the PostgreSQL privilege `SELECT` on every exported column (the connection is the role's).
+         *     A table that does not exist is 404; a view, a foreign table, a bucket partition named directly and a table of the schemas `kingres`,
+         *     `pg_catalog` and `information_schema` are 403 `forbidden` for a role with SUPERUSER, REPLICATION or BYPASSRLS or access to server files, programs or logs; 422 `table_not_eligible` with `blockers`. 422 `export_untrusted_code`: the table is owned by another
+         *     role and a column that is read calls a function owned by a role that is neither the caller nor a superuser (`acknowledgeOtherRolesCode`
+         *     accepts the risk); 409 `insufficient_disk`: the staging area has too little free space; 400 `validation_failed` for an option that is not valid.
+         *     409 `operation_in_progress`: the table has an unfinished task, or the cluster or the role is at the limit `maxConcurrent`;
+         *     409 `transfer_quota_exceeded`: the reservation does not fit into `stagingQuotaBytes`.
+         *
+         *     What the file guarantees is stated in `DataExport.consistency`: every row was committed; a local table, a reference table and a distributed table
+         *     whose buckets are all on one group are one snapshot (`single-snapshot`); a table over several groups is read per group (`per-group`) and the groups'
+         *     snapshots are not one instant. Writers are not stopped. **There is no global snapshot.** Two exports of a table that give the same SHA-256 saw the same data.
+         *
+         *     `spreadsheetSafe` (default `true`) prefixes with an apostrophe a text cell that a spreadsheet would read as a formula. It is lossy and **not a security feature**. With a header, a column name that starts like a formula gets the apostrophe too, so import such a file with `header: skip` (`match` compares the names).
+         *     The task codes of a failed export are: `export_too_large`, `insufficient_disk`, `transfer_quota_exceeded`, `transfer_timeout`, `transfer_leader_changed` (retryable),
+         *     `transfer_session_lost` (retryable), `transfer_key_lost`, `copy_interrupted` (retryable), `forbidden` (the role lost its right between two steps), `cancelled`.
+         *     The error of a task never carries a value, a row or text of the server.
+         */
+        post: operations["exportTable"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Import an uploaded CSV file into a table
+         * @description Added in 0.19.0 (data transfer, phase 14a). Starts the task `table.import` (subject `database/schema.table`) that loads a complete upload
+         *     (`createDataUpload`, `uploadDataChunk`) into an existing table with `COPY ... FROM STDIN`, as the signed-in role, through the row router
+         *     for a distributed table. **All or nothing:** the load is one explicit transaction; the number of rows the server reports is compared with the
+         *     number of records the control plane counted, and the transaction commits only when they are equal. The import adds rows; it never replaces
+         *     or merges, and it cannot skip bad rows. A file above 2 GiB (decompressed) is refused with 422 `import_too_large`: split the file.
+         *
+         *     Needs `kingres_admin`, `dataTransfer.enabled` (403 `data_transfer_disabled`), a request over TLS (403 `insecure_transport`) and the PostgreSQL privilege
+         *     `INSERT` on the loaded columns. 404: the table or the upload (also one of another role) does not exist; 409 `upload_incomplete`: the upload has not
+         *     received all its bytes; 409 `operation_in_progress`: an unfinished task on the table or the transfer limit; 422 `table_not_eligible` with `blockers`
+         *     (a view, a foreign table, a bucket partition, a system schema, a table with row-level security, a generated column in `columns`, a reference table of a cluster with
+         *     several groups); 422 `import_header_mismatch` (`header: match` failed; the first difference is named), `import_ledger_policy` (a ledger table whose signature policy is
+         *     `required`), `import_too_large`, `import_end_marker` (the file has an unquoted `\.` line; the line number is given) and `validation_failed`.
+         *
+         *     A task that is `done` means that the local commit happened; on a distributed table a group whose `COMMIT PREPARED` is still pending may show its rows a moment later. A task can fail `forbidden` when the schema `kingres_transfer` of the database is not the control plane's own (an operator must remove it); a transient failure of the role check is retryable (`transfer_session_lost`). The task `table.import` has the steps *Check the upload*, *Check the table*, *Load rows* (the load and the commit), *Confirm the commit* and *Clean up*. `Task.cancellable` is true until the commit has been
+         *     sent. The outcome of the commit is read from a marker that commits with the rows: a commit that did not happen fails with `copy_interrupted` (retryable) and nothing stored; a task that fails after the commit was sent and whose marker could not be read (a change of leader, a lock wait that ran out) has the code `import_outcome_unknown` (`retryable: false`): **N rows may have been loaded; check
+         *     the table before repeating the import.** Other task codes: `row_count_mismatch`, `transfer_timeout`, `transfer_leader_changed` (retryable), `transfer_session_lost`
+         *     (retryable), `copy_interrupted` (retryable), `forbidden`, `cancelled`, and `sql_error` with a `sqlState`. **No error of a task, no problem and no audit event carries a value,
+         *     a row, a key or the text of PostgreSQL**: the message is a fixed sentence per SQLSTATE plus the names of the column and the constraint and the absolute line number.
+         */
+        post: operations["importTable"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/ledger": {
         parameters: {
             query?: never;
@@ -3750,6 +3844,152 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/data-uploads": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start a resumable upload
+         * @description Added in 0.19.0 (data transfer, phase 14a). Creates an upload: a file that the console or a client sends in chunks (`uploadDataChunk`) and that an import then uses
+         *     (`importTable`). The size is declared and the staging quota is reserved when the upload is created. `purpose` is `tableImport` (0.20.0 adds `databaseArchive`).
+         *     `fileName` is for display only and is never used in a path. `sha256` is for command-line clients that hash the file first; a browser cannot hash a large file
+         *     incrementally, so the server computes the SHA-256 itself when the last byte is in and compares it with the declared one (422 `upload_checksum_mismatch`, the upload is deleted).
+         *     The answer says the chunk rules: `chunkBytesMax` (at most 256 MiB, 64 MiB offered) and `chunkAlign` (65536: every chunk but the last is a multiple of it).
+         *
+         *     Needs `kingres_admin`, `dataTransfer.enabled` (403 `data_transfer_disabled`) and a request over TLS (403 `insecure_transport`). 409 `transfer_quota_exceeded`: the declared
+         *     size does not fit into the quota. 400 `validation_failed` on `/sizeBytes` when the size is above `maxFileBytes`, and 409 `insufficient_disk`. Only the creator can read, continue or delete the upload.
+         *     An upload that received nothing for 48 hours, or that was complete and was not used for 24 hours, is deleted; `getDataUpload` then answers 404.
+         */
+        post: operations["createDataUpload"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/data-uploads/{uploadId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Identifier of an upload (added in 0.19.0), a decimal string. An upload of another role is 404. */
+                uploadId: components["parameters"]["UploadId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read an upload
+         * @description Added in 0.19.0 (data transfer, phase 14a). The state of an upload and the **offset** at which the next chunk must start. The server reads the offset from the staged
+         *     file (the whole sealed segments), never from the record, so it is right after a crash; a client that lost its place asks here and continues. `sha256` is set once the
+         *     upload is complete. 404 for an upload that does not exist, that belongs to another role, or that was lost (the console starts a new one).
+         */
+        get: operations["getDataUpload"];
+        put?: never;
+        post?: never;
+        /**
+         * Delete an upload
+         * @description Added in 0.19.0 (data transfer, phase 14a). Deletes the staged file and frees the reservation. 404 for an upload that does not exist or belongs to another role; 409
+         *     `operation_in_progress` while a task uses the upload.
+         */
+        delete: operations["deleteDataUpload"];
+        options?: never;
+        head?: never;
+        /**
+         * Send one chunk of an upload
+         * @description Added in 0.19.0 (data transfer, phase 14a). Appends one chunk. `x-streams: upload`: the body is streamed to the manager leader without being held in memory by any server, the
+         *     request is not subject to the 30 s request timeout and the 1 MiB body limit of the other operations (an idle limit of 60 s and a limit of 15 minutes per chunk apply), and a
+         *     follower relays it to the leader. The header `Upload-Offset` must equal the server's offset (409 `upload_offset_mismatch`; the response header `Upload-Offset` has the right one).
+         *     `Content-Length` is needed, is at most `chunkBytesMax` (413 `chunk_too_large`; also for a chunk that reaches past `sizeBytes`) and is a **multiple of 65536 unless the chunk is the last one**
+         *     (400 `validation_failed` on `Content-Length`). A request that breaks off keeps the whole sealed segments it delivered and drops the rest; the client reads the offset with `getDataUpload` and
+         *     continues. The answer is 204 with the new `Upload-Offset`; after the last chunk the server computes the SHA-256 of the file (422 `upload_checksum_mismatch` when it differs from the declared one;
+         *     the upload is deleted) and the upload is `complete`. Two chunks at one offset: one wins, the other gets 409. Needs `kingres_admin`, `dataTransfer.enabled` and a request over TLS. A chunk is not an audit event.
+         */
+        patch: operations["uploadDataChunk"];
+        trace?: never;
+    };
+    "/data-exports": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the exports of the signed-in role
+         * @description Added in 0.19.0 (data transfer, phase 14a). The staged export files of the caller, newest first. A file of another role is not listed and its existence is never revealed.
+         *     Cursor pagination: `limit`, `cursor`, `nextCursor`.
+         */
+        get: operations["listDataExports"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/data-exports/{exportId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Identifier of a staged export file (added in 0.19.0), a decimal string. A file of another role is 404. */
+                exportId: components["parameters"]["ExportId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read an export
+         * @description Added in 0.19.0 (data transfer, phase 14a). One staged export: state, size, SHA-256, rows, the consistency label of every table, expiry and the task that made it.
+         *     404 for a file that does not exist or belongs to another role (the existence of a file is not leaked).
+         */
+        get: operations["getDataExport"];
+        put?: never;
+        post?: never;
+        /**
+         * Delete an export
+         * @description Added in 0.19.0 (data transfer, phase 14a). Deletes the staged file and frees its reservation. The creator **or any `kingres_admin`** may delete (to free the disk of a colleague who left;
+         *     deleting reveals nothing); the audit event names the creator when the actor is another role. 404 for a file that does not exist.
+         */
+        delete: operations["deleteDataExport"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/data-exports/{exportId}/content": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Identifier of a staged export file (added in 0.19.0), a decimal string. A file of another role is 404. */
+                exportId: components["parameters"]["ExportId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Download an export file
+         * @description Added in 0.19.0 (data transfer, phase 14a). The plaintext file. `x-streams: download`: streamed from the manager leader through whichever server received the request, with no
+         *     buffering and without the 60 s write timeout of the other operations. `Range: bytes=a-b` (one range) answers 206 with `Content-Range`. Every answer has `Content-Length` of the bytes it
+         *     carries (the whole file for 200), `Accept-Ranges: bytes`, `ETag` (the SHA-256), `Cache-Control: no-store`, `X-Content-Type-Options: nosniff` and `Content-Disposition: attachment; filename="..."`
+         *     with a name the server builds from the database, the table and the UTC time (never from a client string). A stream that fails half way cannot change its status: the `Content-Length` makes a short file
+         *     visible, and the SHA-256 of `getDataExport` lets the user check the file. The audit event `downloadDataExport` is written when the stream ends and says whether the last byte was served.
+         *     Only the creator downloads (404 otherwise). 410: the file has expired. 416: the range cannot be served. Needs `kingres_admin`, `dataTransfer.enabled` and a request over TLS.
+         */
+        get: operations["downloadDataExport"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -3758,6 +3998,8 @@ export interface components {
          * @description Stable machine-readable error code. Clients branch on this, not on `title` or `detail`.
          *
          *     422: `table_not_eligible` (added in 0.14.0: the table cannot take the requested change; `blockers` says why).
+         *
+         *     Added in 0.19.0 (data transfer): 403 `data_transfer_disabled` (the cluster setting is off) and `insecure_transport` (the request did not arrive over TLS); 409 `transfer_quota_exceeded` (the staging quota or the number of running transfers; `Retry-After` for the second), `upload_incomplete` and `upload_offset_mismatch` (the response header `Upload-Offset` has the right offset); 413 `chunk_too_large`; 422 `upload_checksum_mismatch`, `import_header_mismatch`, `import_ledger_policy`, `import_too_large` (a file above 2 GiB decompressed: split it), `import_end_marker` (an unquoted `.` line) and `export_untrusted_code`. An expired file is 410 with the code `not_found`. The error text of a data transfer never carries a value, a row or text of the server. Clients must tolerate codes they do not know.
          *
          *     409 (state conflict): `conflict` (generic), `already_exists`, `immutable_field`,
          *     `rebalance_in_progress`, `operation_in_progress`, `task_not_cancellable`, `last_admin`, `role_in_use`,
@@ -3800,7 +4042,7 @@ export interface components {
          *     system database was stopped on purpose; start it with `startThisServerInstance`).
          * @enum {string}
          */
-        ProblemCode: "bad_request" | "validation_failed" | "unauthenticated" | "invalid_credentials" | "session_expired" | "csrf_token_invalid" | "forbidden" | "setup_token_invalid" | "not_found" | "method_not_allowed" | "conflict" | "already_exists" | "immutable_field" | "rebalance_in_progress" | "operation_in_progress" | "task_not_cancellable" | "last_admin" | "role_in_use" | "optimistic_lock_failed" | "no_replica_available" | "instance_already_running" | "instance_already_stopped" | "server_owns_buckets" | "server_hosts_map_group" | "last_server" | "server_group_not_empty" | "ledger_entry_pending" | "quorum_unavailable" | "system_database_stopped" | "unprocessable" | "sql_error" | "unsupported_operation" | "node_state_invalid" | "node_uninitialized" | "map_group_unavailable" | "leader_unavailable" | "rate_limited" | "service_unavailable" | "internal_error" | "certificate_revoked" | "certificate_authority_unavailable" | "internal_api_disabled" | "workbench_busy" | "config_parameter_unknown" | "config_parameter_managed" | "config_parameter_refused" | "config_level_not_allowed" | "config_value_below_floor" | "config_change_superseded" | "config_restart_order_conflict" | "nothing_pending" | "nothing_to_rebalance" | "rebalance_not_running" | "cluster_inconsistent" | "version_mismatch" | "failover_in_progress" | "group_degraded" | "insufficient_disk" | "no_receiving_server" | "replicas_cannot_be_kept" | "sharding_mode_in_use" | "schema_not_distributable" | "schema_pinned" | "schema_move_in_progress" | "bucket_busy" | "split_unsupported" | "failover_needs_decision" | "lease_settings_differ" | "ledger_not_published" | "origin_prefix_locked" | "signing_key_missing" | "last_signing_key" | "chain_not_diverged" | "table_not_eligible" | "extension_unavailable" | "extension_version_mismatch" | "sketch_hash_mismatch" | "extension_missing" | "conversion_refused" | "partition_policy_conflict";
+        ProblemCode: "bad_request" | "validation_failed" | "unauthenticated" | "invalid_credentials" | "session_expired" | "csrf_token_invalid" | "forbidden" | "setup_token_invalid" | "not_found" | "method_not_allowed" | "conflict" | "already_exists" | "immutable_field" | "rebalance_in_progress" | "operation_in_progress" | "task_not_cancellable" | "last_admin" | "role_in_use" | "optimistic_lock_failed" | "no_replica_available" | "instance_already_running" | "instance_already_stopped" | "server_owns_buckets" | "server_hosts_map_group" | "last_server" | "server_group_not_empty" | "ledger_entry_pending" | "quorum_unavailable" | "system_database_stopped" | "unprocessable" | "sql_error" | "unsupported_operation" | "node_state_invalid" | "node_uninitialized" | "map_group_unavailable" | "leader_unavailable" | "rate_limited" | "service_unavailable" | "internal_error" | "certificate_revoked" | "certificate_authority_unavailable" | "internal_api_disabled" | "workbench_busy" | "config_parameter_unknown" | "config_parameter_managed" | "config_parameter_refused" | "config_level_not_allowed" | "config_value_below_floor" | "config_change_superseded" | "config_restart_order_conflict" | "nothing_pending" | "nothing_to_rebalance" | "rebalance_not_running" | "cluster_inconsistent" | "version_mismatch" | "failover_in_progress" | "group_degraded" | "insufficient_disk" | "no_receiving_server" | "replicas_cannot_be_kept" | "sharding_mode_in_use" | "schema_not_distributable" | "schema_pinned" | "schema_move_in_progress" | "bucket_busy" | "split_unsupported" | "failover_needs_decision" | "lease_settings_differ" | "ledger_not_published" | "origin_prefix_locked" | "signing_key_missing" | "last_signing_key" | "chain_not_diverged" | "table_not_eligible" | "extension_unavailable" | "extension_version_mismatch" | "sketch_hash_mismatch" | "extension_missing" | "conversion_refused" | "partition_policy_conflict" | "data_transfer_disabled" | "insecure_transport" | "transfer_quota_exceeded" | "upload_incomplete" | "upload_offset_mismatch" | "chunk_too_large" | "upload_checksum_mismatch" | "import_header_mismatch" | "import_ledger_policy" | "import_too_large" | "import_end_marker" | "export_untrusted_code";
         /** @description One invalid field of a request. */
         ValidationIssue: {
             /** @description JSON Pointer (RFC 6901) to the invalid property of the request body, or the name of the invalid query or path parameter. */
@@ -3839,6 +4081,8 @@ export interface components {
             sqlPosition?: number;
             /** @description Added in 0.14.0. The lines of the report of the sharding extension that make a table not eligible; present for `table_not_eligible` and, from 0.17.0, for `conversion_refused` (the reasons of the refusal, one entry each). */
             blockers?: components["schemas"]["TableBlocker"][];
+            /** @description Added in 0.19.0, optional. Further reasons in the shape of `blockers`; reserved for the archive codes of later revisions, empty or absent for the codes of 0.19.0. */
+            reasons?: components["schemas"]["TableBlocker"][];
             /** @description Added in 0.12.0, optional. The whole plan of the request (the same body as `dryRun` answers), present only when `code` is `failover_needs_decision`: the console shows the groups, the candidates and the verdict without asking again. */
             plan?: components["schemas"]["FailoverPlan"];
             /** @description Added in 0.9.0, optional. Servers that can be opened instead; set for `leader_unavailable`: the manager leader first when this server knows it, then the other servers of the cluster as this server knows them. Empty or absent when it knows none. */
@@ -6613,10 +6857,10 @@ export interface components {
         };
         /**
          * @description Kind of task. Each kind has one fixed `subject.type`; the table is in the README
-         *     (section "Task kinds and subjects"). `standby.reconcile` is added in 0.7.0; the `ledger.key.*`, `ledger.bundle.create`, `ledger.epoch.start` and `ledger.upgrade` kinds in 0.11.0.
+         *     (section "Task kinds and subjects"). `standby.reconcile` is added in 0.7.0; the `ledger.key.*`, `ledger.bundle.create`, `ledger.epoch.start` and `ledger.upgrade` kinds in 0.11.0; `table.export` and `table.import` (subject `database/schema.table`) in 0.19.0.
          * @enum {string}
          */
-        TaskKind: "cluster.init" | "cluster.join" | "server.add" | "server.remove" | "server.failover" | "server.leave" | "instance.start" | "instance.stop" | "instance.restart" | "database.create" | "database.update" | "database.drop" | "table.distribute" | "rebalance" | "bucket.split" | "schema.distribute" | "schema.move" | "schema.undistribute" | "replication.restorePreferredPrimaries" | "ledger.verify" | "networkAccess.apply" | "replicate.apply" | "certificate.renew" | "certificate.revoke" | "standby.reconcile" | "config.apply" | "config.restart" | "ledger.key.create" | "ledger.key.rotate" | "ledger.key.retire" | "ledger.key.revoke" | "ledger.key.distribute" | "ledger.bundle.create" | "ledger.epoch.start" | "ledger.upgrade" | "table.undistribute" | "table.alter" | "table.partition" | "database.approximateAggregates" | "table.setStorage" | "partition.maintain";
+        TaskKind: "cluster.init" | "cluster.join" | "server.add" | "server.remove" | "server.failover" | "server.leave" | "instance.start" | "instance.stop" | "instance.restart" | "database.create" | "database.update" | "database.drop" | "table.distribute" | "rebalance" | "bucket.split" | "schema.distribute" | "schema.move" | "schema.undistribute" | "replication.restorePreferredPrimaries" | "ledger.verify" | "networkAccess.apply" | "replicate.apply" | "certificate.renew" | "certificate.revoke" | "standby.reconcile" | "config.apply" | "config.restart" | "ledger.key.create" | "ledger.key.rotate" | "ledger.key.retire" | "ledger.key.revoke" | "ledger.key.distribute" | "ledger.bundle.create" | "ledger.epoch.start" | "ledger.upgrade" | "table.undistribute" | "table.alter" | "table.partition" | "database.approximateAggregates" | "table.setStorage" | "partition.maintain" | "table.export" | "table.import";
         /** @description One step of a task. */
         TaskStep: {
             /** @description Step name. */
@@ -6969,10 +7213,10 @@ export interface components {
          *     operation: `loginFailed` (a sign-in attempt that was rejected, also for an unknown user), `setupTokenRejected`
          *     (a wrong setup token), `autoFailover` (a failover started by the manager, actor `system`). From 0.5.0 also `certificateRenewed` and `certificateRenewalFailed` (a server renewed its certificates by itself, or failed to; actor `system`). From 0.7.0 also `leaseLost`, `leaseFenced` and `leaseAcquired` (the lease of a shard group, actor `system`, resource type `shardGroup`, resource id the group id) and the operation `cancelStatement`; and the standby events `standbyCreated`, `standbyRemoved`, `standbyRebuilt` (resource type `standby`, by the leader), `standbyInstanceStarted`, `standbyInstanceRemoved`, `standbyInstanceRebuilt` (by the server that runs the instance), `synchronousStandbyNamesChanged` and `replicationSlotDropped` (by the server that runs the primary), all with actor `system` unless an administrator started the task. A denied
          *     or failed call of an operation is recorded under that operation's id with `outcome` `denied` or
-         *     `failure`. Read-only operations are not audited except `executeQuery`.
+         *     `failure`. Read-only operations are not audited except `executeQuery` and (0.19.0) `downloadDataExport`, because it is where data leaves. From 0.19.0 also `dataTransfer.completed` (a data transfer task ended, written by the task) and `dataTransfer.purged` (the janitor deleted staged files), actor `system`. An upload chunk is not an event.
          * @enum {string}
          */
-        AuditAction: "login" | "logout" | "loginFailed" | "setupTokenRejected" | "initCluster" | "joinCluster" | "updateThisServerSettings" | "restartThisServerInstance" | "stopThisServerInstance" | "startThisServerInstance" | "leaveCluster" | "addServer" | "updateServer" | "removeServer" | "failoverServer" | "abandonMapGroupBootstrap" | "autoFailover" | "createServerGroup" | "deleteServerGroup" | "createDatabase" | "updateDatabase" | "dropDatabase" | "distributeTable" | "enableTableLedger" | "restorePreferredPrimaries" | "startRebalance" | "stopRebalance" | "cancelTask" | "createRole" | "updateRole" | "deleteRole" | "setRoleMemberships" | "setRoleClusterRoles" | "createGrant" | "revokeGrants" | "applyGrantTemplate" | "replaceNetworkAccess" | "updateClusterSettings" | "generateLedgerDigest" | "startLedgerVerification" | "executeQuery" | "acknowledgeAlert" | "renewServerCertificates" | "revokeServerCertificates" | "certificateRenewed" | "certificateRenewalFailed" | "cancelStatement" | "leaseLost" | "leaseFenced" | "leaseAcquired" | "standbyCreated" | "standbyRemoved" | "standbyRebuilt" | "standbyInstanceStarted" | "standbyInstanceRemoved" | "standbyInstanceRebuilt" | "synchronousStandbyNamesChanged" | "replicationSlotDropped" | "applyConfigChange" | "revertConfigChange" | "restartPendingInstances" | "resetAutoFailoverCounter" | "failoverGroupStarted" | "failoverGroupPromoted" | "failoverGroupFailed" | "oldPrimaryRebuilt" | "updateLedgerSettings" | "createLedgerSigningKey" | "retireLedgerSigningKey" | "revokeLedgerSigningKey" | "createLedgerAnchorTarget" | "updateLedgerAnchorTarget" | "deleteLedgerAnchorTarget" | "testLedgerAnchorTarget" | "anchorLedgerNow" | "retryLedgerAnchor" | "createLedgerBundle" | "registerLedgerClientKey" | "revokeLedgerClientKey" | "setTableSignaturePolicy" | "upgradeLedgerExtension" | "acknowledgeLedgerDivergence" | "previewTableChange" | "undistributeTable" | "alterTableDistribution" | "createTablePartition" | "attachTablePartition" | "detachTablePartition" | "dropTablePartition" | "drainServer" | "splitBucket" | "previewBucketSplit" | "distributeSchema" | "undistributeSchema" | "moveSchema" | "configureApproximateAggregates" | "setTableStorage" | "setPartitionStorage" | "putPartitionPolicy" | "deletePartitionPolicy" | "runPartitionPolicy";
+        AuditAction: "login" | "logout" | "loginFailed" | "setupTokenRejected" | "initCluster" | "joinCluster" | "updateThisServerSettings" | "restartThisServerInstance" | "stopThisServerInstance" | "startThisServerInstance" | "leaveCluster" | "addServer" | "updateServer" | "removeServer" | "failoverServer" | "abandonMapGroupBootstrap" | "autoFailover" | "createServerGroup" | "deleteServerGroup" | "createDatabase" | "updateDatabase" | "dropDatabase" | "distributeTable" | "enableTableLedger" | "restorePreferredPrimaries" | "startRebalance" | "stopRebalance" | "cancelTask" | "createRole" | "updateRole" | "deleteRole" | "setRoleMemberships" | "setRoleClusterRoles" | "createGrant" | "revokeGrants" | "applyGrantTemplate" | "replaceNetworkAccess" | "updateClusterSettings" | "generateLedgerDigest" | "startLedgerVerification" | "executeQuery" | "acknowledgeAlert" | "renewServerCertificates" | "revokeServerCertificates" | "certificateRenewed" | "certificateRenewalFailed" | "cancelStatement" | "leaseLost" | "leaseFenced" | "leaseAcquired" | "standbyCreated" | "standbyRemoved" | "standbyRebuilt" | "standbyInstanceStarted" | "standbyInstanceRemoved" | "standbyInstanceRebuilt" | "synchronousStandbyNamesChanged" | "replicationSlotDropped" | "applyConfigChange" | "revertConfigChange" | "restartPendingInstances" | "resetAutoFailoverCounter" | "failoverGroupStarted" | "failoverGroupPromoted" | "failoverGroupFailed" | "oldPrimaryRebuilt" | "updateLedgerSettings" | "createLedgerSigningKey" | "retireLedgerSigningKey" | "revokeLedgerSigningKey" | "createLedgerAnchorTarget" | "updateLedgerAnchorTarget" | "deleteLedgerAnchorTarget" | "testLedgerAnchorTarget" | "anchorLedgerNow" | "retryLedgerAnchor" | "createLedgerBundle" | "registerLedgerClientKey" | "revokeLedgerClientKey" | "setTableSignaturePolicy" | "upgradeLedgerExtension" | "acknowledgeLedgerDivergence" | "previewTableChange" | "undistributeTable" | "alterTableDistribution" | "createTablePartition" | "attachTablePartition" | "detachTablePartition" | "dropTablePartition" | "drainServer" | "splitBucket" | "previewBucketSplit" | "distributeSchema" | "undistributeSchema" | "moveSchema" | "configureApproximateAggregates" | "setTableStorage" | "setPartitionStorage" | "putPartitionPolicy" | "deletePartitionPolicy" | "runPartitionPolicy" | "exportTable" | "importTable" | "createDataUpload" | "deleteDataUpload" | "downloadDataExport" | "deleteDataExport" | "dataTransfer.completed" | "dataTransfer.purged";
         /** @description One audit log entry. */
         AuditEvent: {
             /**
@@ -7066,6 +7310,7 @@ export interface components {
                  */
                 allowNonSuperuserOwners: boolean;
             };
+            dataTransfer?: components["schemas"]["DataTransferSettings"];
             /** @description Pending restart caused by enabling a feature. */
             restart: {
                 /** @description True while some server must restart to load an enabled extension. */
@@ -7259,6 +7504,7 @@ export interface components {
                 /** @description See `ClusterSettings.analytics`. Turning it on is a decision about the trust in the owners of the tables; it can be turned off again, and a policy that is refused then raises one alert. */
                 allowNonSuperuserOwners?: boolean;
             };
+            dataTransfer?: components["schemas"]["DataTransferSettingsUpdate"];
             /** @description Features to turn on. `false` is rejected for a feature that is already on. */
             features?: {
                 /** @description Turn the sharding extension on. */
@@ -8765,7 +9011,7 @@ export interface components {
             confirm: string;
         };
         /**
-         * @description Alert type. Clients must tolerate kinds they do not know. Added in 0.15.0: `rebalanceFailed` (the last automatic rebalance failed and the mode is suspended until an operator starts a rebalance; subject `cluster`; `warning`). Added in 0.13.0: `certificateAuthorityUnavailable` (the map group was failed over and the new manager leader holds no key of the certificate authority, so no certificate can be issued, renewed or revoked until the operator restores `pki/ca.key` and `pki/revoked.json` from the backup of the old leader; subject `cluster`; `critical`). Added in 0.11.0 (ledger phase 7; subjects at `AlertSubject`): `ledgerNotAnchored` (a database has ledger tables and no anchor target is enabled; `info`, `warning` when the setting `anchor.required` is on), `ledgerAnchorBehind` (`warning`, `critical`), `ledgerAnchorFailed` (an anchor record is `failed` or `expired`; `critical`), `ledgerAnchorConflict` (the store holds a different object under the name of an anchor; `critical`), `ledgerChainDiverged` (a chain no longer extends its published log; `critical`), `ledgerGroupUnread` (a shard group's chain could not be read; `warning`, `critical`), `ledgerPublicationBehind` (the newest signed checkpoint of a chain is older than five publication intervals while its head advanced; `warning`), `ledgerSignerUnavailable` (no checkpoint could be signed for two rounds, or the key set is damaged, or the key file is missing on the leader; `critical`) and `ledgerDigestOverdue` (no digest within twice `digestIntervalSeconds`; `warning`). Added in 0.8.0: `clockDifference` (a server's clock differs from the manager leader's by more than `ClusterSettings.clock.maxDifferenceMs`, less the uncertainty of the measurement; `warning`, `critical` at ten times the threshold; `kingresd` does not set the system clock, run NTP or chrony). Added in 0.7.0: `leaseLost` (the `kingresd` that
+         * @description Alert type. Clients must tolerate kinds they do not know. Added in 0.19.0: `transferStagingLow` (the reservations of the staged files of the data transfer hold 90 percent of `dataTransfer.stagingQuotaBytes`, `critical` at 98 percent; subject `server`; raised by the server that holds the files, the manager leader). Added in 0.15.0: `rebalanceFailed` (the last automatic rebalance failed and the mode is suspended until an operator starts a rebalance; subject `cluster`; `warning`). Added in 0.13.0: `certificateAuthorityUnavailable` (the map group was failed over and the new manager leader holds no key of the certificate authority, so no certificate can be issued, renewed or revoked until the operator restores `pki/ca.key` and `pki/revoked.json` from the backup of the old leader; subject `cluster`; `critical`). Added in 0.11.0 (ledger phase 7; subjects at `AlertSubject`): `ledgerNotAnchored` (a database has ledger tables and no anchor target is enabled; `info`, `warning` when the setting `anchor.required` is on), `ledgerAnchorBehind` (`warning`, `critical`), `ledgerAnchorFailed` (an anchor record is `failed` or `expired`; `critical`), `ledgerAnchorConflict` (the store holds a different object under the name of an anchor; `critical`), `ledgerChainDiverged` (a chain no longer extends its published log; `critical`), `ledgerGroupUnread` (a shard group's chain could not be read; `warning`, `critical`), `ledgerPublicationBehind` (the newest signed checkpoint of a chain is older than five publication intervals while its head advanced; `warning`), `ledgerSignerUnavailable` (no checkpoint could be signed for two rounds, or the key set is damaged, or the key file is missing on the leader; `critical`) and `ledgerDigestOverdue` (no digest within twice `digestIntervalSeconds`; `warning`). Added in 0.8.0: `clockDifference` (a server's clock differs from the manager leader's by more than `ClusterSettings.clock.maxDifferenceMs`, less the uncertainty of the measurement; `warning`, `critical` at ten times the threshold; `kingresd` does not set the system clock, run NTP or chrony). Added in 0.7.0: `leaseLost` (the `kingresd` that
          *     runs the primary of a shard group could not renew the group's lease in time; for a group with a standby the
          *     instance was stopped (fenced), for a group without one it keeps running and this alert is the only effect;
          *     `critical`), `groupWithoutSynchronousStandby` (the group's standby has been unreachable for longer than the
@@ -8779,7 +9025,7 @@ export interface components {
          *     `server:<leader>|behind:<server>`, `warning` after a minute, `critical` after ten).
          * @enum {string}
          */
-        AlertKind: "serverDown" | "serverSuspect" | "underReplicatedBuckets" | "unavailableBuckets" | "replicationLagHigh" | "diskSpaceLow" | "memoryPressure" | "rebalanceNeeded" | "autoFailoverTriggered" | "autoFailoverLimitReached" | "mapGroupUnavailable" | "ledgerVerificationFailed" | "ledgerPendingTooOld" | "versionMismatch" | "certificateExpiring" | "certificateRenewalFailed" | "replicationPending" | "taskFailed" | "rebalanceFailed" | "leaseLost" | "groupWithoutSynchronousStandby" | "groupUnderReplicated" | "clockDifference" | "failoverNeedsDecision" | "failoverBlocked" | "failoverDataLoss" | "splitPromotion" | "oldPrimaryRunning" | "oldPrimaryNotStopped" | "oldPrimaryNotRebuilt" | "ledgerNotAnchored" | "ledgerAnchorBehind" | "ledgerAnchorFailed" | "ledgerAnchorConflict" | "ledgerChainDiverged" | "ledgerGroupUnread" | "ledgerPublicationBehind" | "ledgerSignerUnavailable" | "ledgerDigestOverdue" | "certificateAuthorityUnavailable" | "partitionsAheadLow" | "partitionPolicyFailed";
+        AlertKind: "serverDown" | "serverSuspect" | "underReplicatedBuckets" | "unavailableBuckets" | "replicationLagHigh" | "diskSpaceLow" | "memoryPressure" | "rebalanceNeeded" | "autoFailoverTriggered" | "autoFailoverLimitReached" | "mapGroupUnavailable" | "ledgerVerificationFailed" | "ledgerPendingTooOld" | "versionMismatch" | "certificateExpiring" | "certificateRenewalFailed" | "replicationPending" | "taskFailed" | "rebalanceFailed" | "leaseLost" | "groupWithoutSynchronousStandby" | "groupUnderReplicated" | "clockDifference" | "failoverNeedsDecision" | "failoverBlocked" | "failoverDataLoss" | "splitPromotion" | "oldPrimaryRunning" | "oldPrimaryNotStopped" | "oldPrimaryNotRebuilt" | "ledgerNotAnchored" | "ledgerAnchorBehind" | "ledgerAnchorFailed" | "ledgerAnchorConflict" | "ledgerChainDiverged" | "ledgerGroupUnread" | "ledgerPublicationBehind" | "ledgerSignerUnavailable" | "ledgerDigestOverdue" | "certificateAuthorityUnavailable" | "partitionsAheadLow" | "partitionPolicyFailed" | "transferStagingLow";
         /** @description An alert. */
         Alert: {
             /**
@@ -8873,10 +9119,12 @@ export interface components {
          *     the `Active` ones): `clientConnectionsAccepted`, `clientConnectionsActive`, `clientConnectionsRefused` (over the
          *     cap), `clientConnectFailures`, `clientConnectionsMoved` (closed because the destination changed),
          *     `clientConnectionsIdleClosed`, `clientBytesIn`, `clientBytesOut`, and the same with `clientStandby` for the
-         *     standby entry point.
+         *     standby entry point. Added in 0.19.0, server-scoped, only on a server that holds staged files of the data transfer (the manager leader):
+         *     `transferStagingUsedBytes` (the room the reservations hold), `transferStagingFreeBytes` (free on the file system of the staging directory),
+         *     `transfersRunning` (uploads being received and exports being written) and `transfersStaged` (ready files that are kept).
          * @enum {string}
          */
-        MetricName: "cpuUsagePercent" | "memoryUsedBytes" | "diskUsedBytes" | "connections" | "replicationLagBytes" | "replicationLagSeconds" | "databaseSizeBytes" | "transactionsPerSecond" | "queriesPerSecond" | "bucketsUnderReplicated" | "clientConnectionsAccepted" | "clientConnectionsActive" | "clientConnectionsRefused" | "clientConnectFailures" | "clientConnectionsMoved" | "clientConnectionsIdleClosed" | "clientBytesIn" | "clientBytesOut" | "clientStandbyConnectionsAccepted" | "clientStandbyConnectionsActive" | "clientStandbyConnectionsRefused" | "clientStandbyConnectFailures" | "clientStandbyConnectionsMoved" | "clientStandbyConnectionsIdleClosed" | "clientStandbyBytesIn" | "clientStandbyBytesOut";
+        MetricName: "cpuUsagePercent" | "memoryUsedBytes" | "diskUsedBytes" | "connections" | "replicationLagBytes" | "replicationLagSeconds" | "databaseSizeBytes" | "transactionsPerSecond" | "queriesPerSecond" | "bucketsUnderReplicated" | "clientConnectionsAccepted" | "clientConnectionsActive" | "clientConnectionsRefused" | "clientConnectFailures" | "clientConnectionsMoved" | "clientConnectionsIdleClosed" | "clientBytesIn" | "clientBytesOut" | "clientStandbyConnectionsAccepted" | "clientStandbyConnectionsActive" | "clientStandbyConnectionsRefused" | "clientStandbyConnectFailures" | "clientStandbyConnectionsMoved" | "clientStandbyConnectionsIdleClosed" | "clientStandbyBytesIn" | "clientStandbyBytesOut" | "transferStagingUsedBytes" | "transferStagingFreeBytes" | "transfersRunning" | "transfersStaged";
         /** @description One sample. */
         MetricPoint: {
             /**
@@ -8924,6 +9172,294 @@ export interface components {
             partial?: boolean;
             /** @description Added in 0.5.0, optional. The servers that did not answer, sorted by id; absent when `partial` is false. */
             missingServers?: components["schemas"]["MissingServer"][];
+        };
+        /**
+         * @description Added in 0.19.0. The field delimiter of a CSV file.
+         * @default ,
+         * @enum {string}
+         */
+        CsvDelimiter: "," | ";" | "\t" | "|" | ":";
+        /**
+         * @description Added in 0.19.0. The character encoding of a CSV file, by the name PostgreSQL gives it. `SJIS`, `BIG5` and `GBK` are client-only encodings.
+         * @default UTF8
+         * @enum {string}
+         */
+        CsvEncoding: "UTF8" | "LATIN1" | "LATIN2" | "LATIN9" | "WIN1250" | "WIN1251" | "WIN1252" | "WIN1256" | "ISO_8859_6" | "SJIS" | "EUC_JP" | "GBK" | "BIG5" | "KOI8R";
+        /** @description Added in 0.19.0. Options of a table export. Every member is optional; the server never accepts a `WHERE`, an order or SQL of any kind. */
+        ExportTableRequest: {
+            /** @description Column names to export, in this order; validated against the catalog. Default all columns in table order. Generated columns are exported (they are values). */
+            columns?: string[];
+            delimiter?: components["schemas"]["CsvDelimiter"];
+            /**
+             * @description The text of a null. The default, an empty string, writes a null as an unquoted empty field. It must not contain a quote, the delimiter, a carriage return or a line feed.
+             * @default
+             */
+            nullString?: string;
+            /**
+             * @description The quote character, one byte. The escape character is the quote.
+             * @default "
+             */
+            quote?: string;
+            /**
+             * @description Whether the first record holds the column names.
+             * @default true
+             */
+            header?: boolean;
+            encoding?: components["schemas"]["CsvEncoding"];
+            /**
+             * @description Write a UTF-8 byte order mark (some spreadsheets need one). Only with `encoding` `UTF8`.
+             * @default false
+             */
+            utf8Bom?: boolean;
+            /**
+             * @description `gzip` compresses the file; its `format` is then `csv.gz`.
+             * @default none
+             * @enum {string}
+             */
+            compression?: "none" | "gzip";
+            /**
+             * @description Write a text cell that begins with `=`, `+`, `-`, `@`, `|`, `%`, a tab, a carriage return, the full-width forms of `=`, `+`, `-` and `@`, or a no-break space or spaces before such a character, with an apostrophe in front.
+             *     Numeric, date and boolean columns are not changed. **It is lossy** (importing the file puts the apostrophe in) and **not a security feature**.
+             * @default true
+             */
+            spreadsheetSafe?: boolean;
+            /**
+             * @description Accept that the read runs code of another role (a virtual generated column or a row-level-security expression of a table that another role owns). Recorded in the audit event.
+             * @default false
+             */
+            acknowledgeOtherRolesCode?: boolean;
+            /** @description How long the file is kept. Default the cluster setting `dataTransfer.retentionHours`. */
+            retentionHours?: number;
+        };
+        /**
+         * @description Added in 0.19.0. Options of a table import. The schema is closed: members for batches can be added later without changing the meaning of these. There is no `onError`, no `batchRows`
+         *     and no `skipRows`: the import is all or nothing.
+         */
+        ImportTableRequest: {
+            /** @description A complete upload of the caller. */
+            uploadId: string;
+            /**
+             * @description `none`: the file has no header. `skip`: it has one, which is ignored. `match`: it has one and its names must equal `columns` (422 `import_header_mismatch` names the first difference).
+             * @default skip
+             * @enum {string}
+             */
+            header?: "none" | "skip" | "match";
+            /** @description The columns, in the file's order. Default the non-generated columns of the table in table order. A generated column is refused (400 `validation_failed`). */
+            columns?: string[];
+            delimiter?: components["schemas"]["CsvDelimiter"];
+            /**
+             * @description The text of a null, as in `ExportTableRequest`.
+             * @default
+             */
+            nullString?: string;
+            /**
+             * @description The quote character, one byte. With the client-only encodings `SJIS`, `BIG5` and `GBK` it must be an ASCII byte below 0x40.
+             * @default "
+             */
+            quote?: string;
+            encoding?: components["schemas"]["CsvEncoding"];
+            /**
+             * @description Default detected from the upload. The expansion is counted against the 2 GiB limit.
+             * @enum {string}
+             */
+            compression?: "none" | "gzip";
+            /** @description Columns in which an empty unquoted field is an empty string, not a null. */
+            forceNotNull?: string[];
+            /** @description Columns in which a quoted `nullString` is a null. */
+            forceNull?: string[];
+            /**
+             * @description Remove a UTF-8 byte order mark at the start of the decompressed stream.
+             * @default true
+             */
+            skipBom?: boolean;
+            /**
+             * @description Keep the upload after a successful import (until its retention time).
+             * @default false
+             */
+            keepUpload?: boolean;
+        };
+        /** @description Added in 0.19.0. A new resumable upload. */
+        CreateDataUploadRequest: {
+            /**
+             * @description What the file is for. 0.20.0 adds `databaseArchive`.
+             * @enum {string}
+             */
+            purpose: "tableImport";
+            /**
+             * Format: int64
+             * @description The size of the file in bytes; at most `dataTransfer.maxFileBytes`. The staging quota for this size is reserved.
+             */
+            sizeBytes: number;
+            /** @description The SHA-256 of the file in lower-case hexadecimal; for clients that can hash the file first. The server checks it when the last byte is in. */
+            sha256?: string;
+            /** @description For display only. It is never used in a path and never appears in an audit event. */
+            fileName?: string;
+        };
+        /** @description Added in 0.19.0. A resumable upload. */
+        DataUpload: {
+            /** @description Identifier, a decimal string. */
+            uploadId: string;
+            /**
+             * @description `receiving`: bytes are missing. `complete`: all bytes are in and the SHA-256 is known. `lost`: the staged file is gone (404 is the usual answer). 0.20.0 adds `validating`, `valid` and `invalid`.
+             * @enum {string}
+             */
+            state: "receiving" | "complete" | "lost" | "deleted";
+            /**
+             * Format: int64
+             * @description The declared size.
+             */
+            sizeBytes: number;
+            /**
+             * Format: int64
+             * @description Where the next chunk must start; read from the staged file.
+             */
+            offset: number;
+            /**
+             * Format: int64
+             * @description The largest chunk the server accepts (256 MiB). The console sends 64 MiB.
+             */
+            chunkBytesMax: number;
+            /**
+             * @description Every chunk except the last is a multiple of this many bytes.
+             * @enum {integer}
+             */
+            chunkAlign: 65536;
+            /** @description The SHA-256 of the file in lower-case hexadecimal, once the upload is complete; null before. */
+            sha256?: string | null;
+            /**
+             * Format: date-time
+             * @description When the server deletes the upload if nothing happens (48 hours without data, 24 hours when complete and unused).
+             */
+            expiresAt: string;
+        };
+        /**
+         * @description Added in 0.19.0. What the file guarantees for one table. Every row in a file was committed. `single-snapshot`: one snapshot (a local table, a reference table, or a distributed table whose buckets are all on one
+         *     group). `per-group`: each group's rows come from one snapshot of that group and the groups' snapshots are **not** one instant. `per-group-and-partition`: as `per-group`, and the partitions of one group may be
+         *     different snapshots. **There is no global snapshot** (phase 8, future).
+         */
+        TableConsistency: {
+            /** @description `schema.table`. */
+            table: string;
+            /** @enum {string} */
+            level: "single-snapshot" | "per-group" | "per-group-and-partition";
+            /** @description Number of groups that hold buckets of the table. */
+            groups: number;
+        };
+        /** @description Added in 0.19.0. A staged export file and what is known about it. */
+        DataExport: {
+            /** @description Identifier, a decimal string. */
+            exportId: string;
+            /**
+             * @description 0.20.0 adds `databaseExport`.
+             * @enum {string}
+             */
+            kind: "tableExport";
+            /**
+             * @description `building`: the task writes it. `ready`: it can be downloaded. `failed`: the task failed and the partial file was removed. `expired`: its time has passed. `lost`: the file or the key is gone.
+             * @enum {string}
+             */
+            state: "building" | "ready" | "failed" | "expired" | "lost" | "deleted";
+            database?: string | null;
+            schema?: string | null;
+            table?: string | null;
+            /**
+             * Format: int64
+             * @description Size of the plaintext file; null while it is built.
+             */
+            sizeBytes?: number | null;
+            /** @description SHA-256 of the plaintext file; null while it is built. Two exports with the same value saw the same data. */
+            sha256?: string | null;
+            /**
+             * Format: int64
+             * @description Rows in the file; null while it is built.
+             */
+            rows?: number | null;
+            /** @description One entry for the table; null while it is built. */
+            consistency?: components["schemas"]["TableConsistency"][] | null;
+            /** @description Whether the file was written with the spreadsheet guard (`spreadsheetSafe` of the request); null while it is built. Added to 0.19.0 before its release. */
+            spreadsheetSafe?: boolean | null;
+            /** @description Whether row-level security shortened the file. Always false: a table with row-level security is exported only with `row_security = off`, so a policy that hides rows fails the export. */
+            rlsApplied?: boolean;
+            /**
+             * @description 0.20.0 adds `archive/1`.
+             * @enum {string}
+             */
+            format?: "csv" | "csv.gz";
+            /**
+             * Format: int64
+             * @description The task that builds the file.
+             */
+            taskId?: number;
+            /** Format: date-time */
+            createdAt: string;
+            /**
+             * Format: date-time
+             * @description The retention time; the file is deleted after it.
+             */
+            expiresAt: string;
+            /**
+             * Format: date-time
+             * @description When the last byte was served; null when no download has finished.
+             */
+            downloadedAt?: string | null;
+        };
+        /** @description Added in 0.19.0. A page of the caller's exports, newest first. */
+        DataExportPage: {
+            items: components["schemas"]["DataExport"][];
+            nextCursor: components["schemas"]["NextCursor"];
+        };
+        /** @description Added in 0.19.0. The cluster settings of table export and import. */
+        DataTransferSettings: {
+            /**
+             * @description While false every data transfer operation answers 403 `data_transfer_disabled`.
+             * @default false
+             */
+            enabled: boolean;
+            /**
+             * @description How long an export file is kept by default.
+             * @default 24
+             */
+            retentionHours: number;
+            /**
+             * Format: int64
+             * @description The largest staged file (20 GiB).
+             * @default 21474836480
+             */
+            maxFileBytes: number;
+            /**
+             * Format: int64
+             * @description The sum of the reservations of the staging area; the default is the smaller of 100 GiB and 25 percent of the file system.
+             */
+            stagingQuotaBytes: number;
+            /**
+             * @description Transfers running at once in the cluster (one per role).
+             * @default 2
+             */
+            maxConcurrent: number;
+            /**
+             * Format: int64
+             * @description The largest decompressed file that one import accepts on the server that answers (a flag of the server, 256 MiB for a reference table whatever the flag). Not part of the update; added to 0.19.0 before its release.
+             */
+            readonly maxAtomicBytes?: number;
+        };
+        /** @description Added in 0.19.0. A partial update of `DataTransferSettings`. */
+        DataTransferSettingsUpdate: {
+            /** @description Turn the data transfer operations on or off. */
+            enabled?: boolean;
+            /** @description New default retention. */
+            retentionHours?: number;
+            /**
+             * Format: int64
+             * @description New largest staged file.
+             */
+            maxFileBytes?: number;
+            /**
+             * Format: int64
+             * @description New staging quota.
+             */
+            stagingQuotaBytes?: number;
+            /** @description New limit of running transfers. */
+            maxConcurrent?: number;
         };
     };
     responses: {
@@ -9055,6 +9591,101 @@ export interface components {
             };
         };
         /**
+         * @description The export was accepted and runs as the task `table.export` (added in 0.19.0). Poll `GET /tasks/{taskId}` (the `Location` header) until `state` is `done` or `failed`; when it is `done`,
+         *     `detail` is `transfer <id>`, the id to give to `getDataExport` and `downloadDataExport`.
+         */
+        AcceptedTableExport: {
+            headers: {
+                /** @description URL of the task, `/api/v1/tasks/{taskId}`. */
+                Location?: string;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Task"];
+            };
+        };
+        /**
+         * @description The import was accepted and runs as the task `table.import` (added in 0.19.0). Poll `GET /tasks/{taskId}` (the `Location` header). A failed task never carries a value or text of the
+         *     server; `import_outcome_unknown` means that the commit was sent and its outcome could not be read from the marker in the database.
+         */
+        AcceptedTableImport: {
+            headers: {
+                /** @description URL of the task, `/api/v1/tasks/{taskId}`. */
+                Location?: string;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Task"];
+            };
+        };
+        /**
+         * @description Not allowed (added in 0.19.0 for the data transfer operations): `forbidden` (the role is below `kingres_admin`), `data_transfer_disabled` (the cluster setting
+         *     `dataTransfer.enabled` is off) or `insecure_transport` (the request did not arrive over TLS).
+         */
+        DataTransferForbidden: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/problem+json": components["schemas"]["Problem"];
+            };
+        };
+        /**
+         * @description A conflict of the data transfer operations (added in 0.19.0): `operation_in_progress` (an unfinished task on the table, a task that uses the upload, or the limit `maxConcurrent`;
+         *     `Retry-After` for the limit), `transfer_quota_exceeded` (the reservation does not fit into the staging quota; the detail says how much is free) or `upload_incomplete`
+         *     (an import names an upload that has not received all its bytes).
+         */
+        DataTransferConflict: {
+            headers: {
+                /** @description Seconds to wait before retrying; present for the concurrency limit. */
+                "Retry-After"?: number;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/problem+json": components["schemas"]["Problem"];
+            };
+        };
+        /** @description The `Upload-Offset` of the request is not the offset of the server (`upload_offset_mismatch`); the response header has the right one. Added in 0.19.0. */
+        UploadOffsetMismatch: {
+            headers: {
+                /** @description The offset at which the next chunk must start. */
+                "Upload-Offset"?: number;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/problem+json": components["schemas"]["Problem"];
+            };
+        };
+        /** @description A chunk beyond `chunkBytesMax`, or that reaches past the declared size (`chunk_too_large`). Added in 0.19.0. */
+        ChunkTooLarge: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/problem+json": components["schemas"]["Problem"];
+            };
+        };
+        /** @description The resource has expired (code `not_found`, status 410, as for a ledger bundle). Added in 0.19.0 for `downloadDataExport`. */
+        Gone: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/problem+json": components["schemas"]["Problem"];
+            };
+        };
+        /** @description The range cannot be served. Added in 0.19.0 for `downloadDataExport`. */
+        RangeNotSatisfiable: {
+            headers: {
+                /** @description `bytes *\/size`. */
+                "Content-Range"?: string;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/problem+json": components["schemas"]["Problem"];
+            };
+        };
+        /**
          * @description The operation was accepted and runs as a durable task. Poll `GET /tasks/{taskId}` (the `Location`
          *     header) until `state` is `done` or `failed`. Exception: the setup operations (`initCluster`,
          *     `joinCluster`) are polled through `GET /setup/state` (`setupTask`), because the caller has no session yet.
@@ -9109,6 +9740,14 @@ export interface components {
         DryRunStorage: boolean;
         /** @description Identifier of a run of a time-partitioning policy (added in 0.17.0). */
         PartitionRunId: number;
+        /** @description Identifier of an upload (added in 0.19.0), a decimal string. An upload of another role is 404. */
+        UploadId: string;
+        /** @description Identifier of a staged export file (added in 0.19.0), a decimal string. A file of another role is 404. */
+        ExportId: string;
+        /** @description The offset of the first byte of the chunk; it must equal the offset the server holds (409 `upload_offset_mismatch` otherwise). */
+        UploadOffset: number;
+        /** @description One byte range of the plaintext file, `bytes=first-last`, `bytes=first-` or `bytes=-suffix`. More than one range is answered with the whole file. */
+        RangeHeader: string;
         /** @description Colocation group identifier. */
         ColocationId: number;
         /** @description Bucket number. */
@@ -11135,6 +11774,68 @@ export interface operations {
             404: components["responses"]["NotFound"];
             405: components["responses"]["MethodNotAllowed"];
             409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    exportTable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ExportTableRequest"];
+            };
+        };
+        responses: {
+            202: components["responses"]["AcceptedTableExport"];
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["DataTransferForbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["DataTransferConflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    importTable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ImportTableRequest"];
+            };
+        };
+        responses: {
+            202: components["responses"]["AcceptedTableImport"];
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["DataTransferForbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["DataTransferConflict"];
             422: components["responses"]["UnprocessableEntity"];
             503: components["responses"]["ServiceUnavailable"];
         };
@@ -14019,6 +14720,294 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    createDataUpload: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateDataUploadRequest"];
+            };
+        };
+        responses: {
+            /** @description The upload, at offset 0. */
+            201: {
+                headers: {
+                    /** @description URL of the upload, `/api/v1/data-uploads/{uploadId}`. */
+                    Location?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DataUpload"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["DataTransferForbidden"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["DataTransferConflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getDataUpload: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Identifier of an upload (added in 0.19.0), a decimal string. An upload of another role is 404. */
+                uploadId: components["parameters"]["UploadId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The upload. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DataUpload"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["DataTransferForbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    deleteDataUpload: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Identifier of an upload (added in 0.19.0), a decimal string. An upload of another role is 404. */
+                uploadId: components["parameters"]["UploadId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The upload was deleted. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["DataTransferForbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["DataTransferConflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    uploadDataChunk: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description The offset of the first byte of the chunk; it must equal the offset the server holds (409 `upload_offset_mismatch` otherwise). */
+                "Upload-Offset": components["parameters"]["UploadOffset"];
+            };
+            path: {
+                /** @description Identifier of an upload (added in 0.19.0), a decimal string. An upload of another role is 404. */
+                uploadId: components["parameters"]["UploadId"];
+            };
+            cookie?: never;
+        };
+        /** @description The bytes of the chunk. The example is the first chunk of an upload (a multiple of 65536 bytes). */
+        requestBody: {
+            content: {
+                "application/octet-stream": string;
+            };
+        };
+        responses: {
+            /** @description The chunk was stored. `Upload-Offset` is the next offset (the size of the file when it is complete). */
+            204: {
+                headers: {
+                    /** @description The offset at which the next chunk must start. */
+                    "Upload-Offset"?: number;
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["DataTransferForbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["UploadOffsetMismatch"];
+            413: components["responses"]["ChunkTooLarge"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    listDataExports: {
+        parameters: {
+            query?: {
+                /** @description Maximum number of items to return. */
+                limit?: components["parameters"]["Limit"];
+                /** @description Opaque cursor taken from `nextCursor` of the previous page. Omit for the first page. */
+                cursor?: components["parameters"]["Cursor"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A page of exports. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DataExportPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["DataTransferForbidden"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getDataExport: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Identifier of a staged export file (added in 0.19.0), a decimal string. A file of another role is 404. */
+                exportId: components["parameters"]["ExportId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The export. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DataExport"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["DataTransferForbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    deleteDataExport: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Identifier of a staged export file (added in 0.19.0), a decimal string. A file of another role is 404. */
+                exportId: components["parameters"]["ExportId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The export was deleted. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["DataTransferForbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    downloadDataExport: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description One byte range of the plaintext file, `bytes=first-last`, `bytes=first-` or `bytes=-suffix`. More than one range is answered with the whole file. */
+                Range?: components["parameters"]["RangeHeader"];
+            };
+            path: {
+                /** @description Identifier of a staged export file (added in 0.19.0), a decimal string. A file of another role is 404. */
+                exportId: components["parameters"]["ExportId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The whole file. */
+            200: {
+                headers: {
+                    /** @description Size of the file in bytes. */
+                    "Content-Length"?: number;
+                    /** @description Always `bytes`. */
+                    "Accept-Ranges"?: "bytes";
+                    /** @description The SHA-256 of the plaintext file in quotes. */
+                    ETag?: string;
+                    /** @description `attachment` with a file name built by the server. */
+                    "Content-Disposition"?: string;
+                    /** @description Always `no-store`. */
+                    "Cache-Control"?: string;
+                    /** @description Always `nosniff`. */
+                    "X-Content-Type-Options"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/csv": string;
+                    "application/gzip": string;
+                };
+            };
+            /** @description One range of the file. */
+            206: {
+                headers: {
+                    /** @description Size of the range in bytes. */
+                    "Content-Length"?: number;
+                    /** @description `bytes first-last/size`. */
+                    "Content-Range"?: string;
+                    /** @description Always `bytes`. */
+                    "Accept-Ranges"?: "bytes";
+                    /** @description The SHA-256 of the plaintext file in quotes. */
+                    ETag?: string;
+                    /** @description `attachment` with a file name built by the server. */
+                    "Content-Disposition"?: string;
+                    /** @description Always `no-store`. */
+                    "Cache-Control"?: string;
+                    /** @description Always `nosniff`. */
+                    "X-Content-Type-Options"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/csv": string;
+                    "application/gzip": string;
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["DataTransferForbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            410: components["responses"]["Gone"];
+            416: components["responses"]["RangeNotSatisfiable"];
             422: components["responses"]["UnprocessableEntity"];
             503: components["responses"]["ServiceUnavailable"];
         };

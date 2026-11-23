@@ -28,6 +28,8 @@ var metricUnits = map[string]struct {
 	"connections": {"count", true}, "replicationLagBytes": {"bytes", false}, "replicationLagSeconds": {"seconds", false},
 	"databaseSizeBytes": {"bytes", true}, "transactionsPerSecond": {"countPerSecond", true},
 	"queriesPerSecond": {"countPerSecond", true}, "bucketsUnderReplicated": {"count", true},
+	// The data transfer (contract 0.19.0): the room the staged files hold, what is free on their file system, and the transfers that run and that are kept.
+	"transferStagingUsedBytes": {"bytes", true}, "transferStagingFreeBytes": {"bytes", true}, "transfersRunning": {"count", true}, "transfersStaged": {"count", true},
 }
 
 func init() {

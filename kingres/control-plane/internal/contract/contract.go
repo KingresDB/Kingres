@@ -47,6 +47,10 @@ type Operation struct {
 	PathParams []string
 	// QueryParams are the declared query parameter names, sorted.
 	QueryParams []string
+	// Streams is the value of the extension x-streams of the contract:
+	// "upload" or "download" for the two operations whose body is relayed
+	// without being held in memory (added in 0.19.0), empty otherwise.
+	Streams string
 }
 
 // Operations returns a copy of the generated operation table.
