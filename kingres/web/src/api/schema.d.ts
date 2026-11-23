@@ -3873,7 +3873,7 @@ export interface paths {
          *     Ledger tables are carried as data and restart their chain when imported (ADR 0028); the history of an updatable ledger table is exported for the record.
          *
          *     Needs `kingres_admin`, the cluster setting `dataTransfer.enabled` (403 `data_transfer_disabled`), a request over TLS (403 `insecure_transport`), and the PostgreSQL privileges `USAGE` on every
-         *     schema and `SELECT` on every table (and column) of the database for the signed-in role: otherwise 422 `export_not_readable`, whose detail names the first 20 objects the role cannot read, and nothing is written.
+         *     schema and `SELECT` on every table (and column) of the database for the signed-in role: otherwise 422 `export_not_readable`, whose `reasons` name the first 20 objects the role cannot read (the detail says how many more), and nothing is written.
          *     404: the database does not exist. 409 `operation_in_progress`: a table task or another database export or import is unfinished in this database, or the transfer limit is reached;
          *     409 `transfer_quota_exceeded` and `insufficient_disk` as for `exportTable`. While the task runs, table tasks of the database are refused with 409 `operation_in_progress`.
          *
@@ -4161,7 +4161,7 @@ export interface components {
             sqlPosition?: number;
             /** @description Added in 0.14.0. The lines of the report of the sharding extension that make a table not eligible; present for `table_not_eligible` and, from 0.17.0, for `conversion_refused` (the reasons of the refusal, one entry each). */
             blockers?: components["schemas"]["TableBlocker"][];
-            /** @description Added in 0.19.0, optional. Further reasons in the shape of `blockers`; reserved for the archive codes of later revisions, empty or absent for the codes of 0.19.0. */
+            /** @description Added in 0.19.0, optional. Further reasons in the shape of `blockers`. From 0.40.0: for `export_not_readable` one entry per object the role cannot read (at most 20; `code` is `no_privilege` or `no_usage`, `object` the name), and for `archive_incompatible` the reasons the archive does not fit. */
             reasons?: components["schemas"]["TableBlocker"][];
             /** @description Added in 0.12.0, optional. The whole plan of the request (the same body as `dryRun` answers), present only when `code` is `failover_needs_decision`: the console shows the groups, the candidates and the verdict without asking again. */
             plan?: components["schemas"]["FailoverPlan"];
@@ -6998,11 +6998,11 @@ export interface components {
              * @description Resource type.
              * @enum {string}
              */
-            type: "cluster" | "server" | "instance" | "database" | "table" | "rebalance" | "replication" | "ledgerVerification" | "networkAccess" | "config" | "ledgerKey" | "bucket" | "schema";
+            type: "cluster" | "server" | "instance" | "database" | "table" | "rebalance" | "replication" | "ledgerVerification" | "networkAccess" | "config" | "ledgerKey" | "bucket" | "schema" | "upload";
             /**
              * @description Resource identifier: database name; server id (`ServerId`); instance id (`node_id`) as a decimal
              *     string; `database/schema.table` for a table; the verification id; the task id for a rebalance;
-             *     the literal `cluster`, `preferred-primaries`, `network-access` or (0.11.0, type `ledgerKey`) `signing` for the singleton subjects.
+             *     the literal `cluster`, `preferred-primaries`, `network-access` or (0.11.0, type `ledgerKey`) `signing` for the singleton subjects; the upload id for type `upload` (0.40.0).
              *     See the README table "Task kinds and subjects".
              */
             id: string;
