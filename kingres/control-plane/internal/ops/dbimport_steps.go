@@ -197,6 +197,23 @@ func (o *Ops) setupPrivateLocal(ctx context.Context, op importCreateOp) error {
 	if len(op.Extensions) == 0 && len(op.Schemas) == 0 {
 		return nil
 	}
+	// The whole request is checked before a connection is used: a schema or an extension that is not allowed is refused whatever else is in it.
+	for _, s := range op.Schemas {
+		if _, err := sqlx.NewIdent(s); err != nil || s == "public" || strings.HasPrefix(s, "pg_") || s == "information_schema" {
+			return errors.New("a schema of an extension is not valid")
+		}
+	}
+	for _, e := range op.Extensions {
+		if !archive.AllowedExtension(e.Name) || e.Name == extguard.Shard || e.Name == "plpgsql" {
+			return errors.New("this extension cannot be installed by an import")
+		}
+		if _, err := sqlx.NewIdent(e.Name); err != nil {
+			return errors.New("this extension cannot be installed by an import")
+		}
+		if _, err := sqlx.NewIdent(e.Schema); err != nil {
+			return errors.New("a schema of an extension is not valid")
+		}
+	}
 	c, err := o.Service.ServiceConn(ctx, op.Name)
 	if err != nil {
 		return err

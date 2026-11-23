@@ -198,9 +198,8 @@ func (o *Ops) importAccessLocal(ctx context.Context, op importAccessOp) error {
 		if err := run(ctx, c, stmt().Text("GRANT").Text(sqlx.Fixed(priv)).Text("ON DATABASE").ID(db).Text("TO").ID(role)); err != nil {
 			return err
 		}
-		if !op.Full {
-			return nil
-		}
+		// The role needs CREATE on the schema public on every server: the distribution makes the tables there with the owner of the table, and the extension
+		// refuses an owner who may create in the schema on one server and not on another.
 		d, err := o.Service.ServiceConn(ctx, op.Name)
 		if err != nil {
 			return err

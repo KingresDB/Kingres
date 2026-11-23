@@ -4,14 +4,10 @@
 package main
 
 import (
-	"archive/zip"
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -20,105 +16,16 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/archive"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/archive/archivetest"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ops"
 )
 
 // The hostile archives of the database import. Every one is made from a good archive by changing a part of it, and every one must be refused, with nothing left
 // behind: no database, no role, no setting, no private database.
 
-// variant is the content of an archive that a test may change before it is written again.
-type variant struct {
-	Cat   archive.Catalog
-	Man   archive.Manifest
-	Files map[string]string // every entry but the manifest, by name
-	Names []string          // the entries, in order, without the manifest
-	// Patch changes the manifest as it is about to be written (after the sizes and sums were recomputed), so that it can lie.
-	Patch func(m *archive.Manifest)
-}
+type variant = archivetest.Variant
 
-func readVariant(t testing.TB, b []byte) *variant {
-	t.Helper()
-	zr, err := zip.NewReader(bytes.NewReader(b), int64(len(b)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	v := &variant{Files: map[string]string{}}
-	for _, f := range zr.File {
-		rc, err := f.Open()
-		if err != nil {
-			t.Fatal(err)
-		}
-		data, _ := io.ReadAll(rc)
-		_ = rc.Close()
-		switch f.Name {
-		case archive.ManifestName:
-			if err := json.Unmarshal(data, &v.Man); err != nil {
-				t.Fatal(err)
-			}
-		case archive.CatalogName:
-			if err := json.Unmarshal(data, &v.Cat); err != nil {
-				t.Fatal(err)
-			}
-			v.Names = append(v.Names, f.Name)
-		default:
-			v.Files[f.Name] = string(data)
-			v.Names = append(v.Names, f.Name)
-		}
-	}
-	return v
-}
-
-// bytes writes the archive again: the catalog as JSON, the sizes and sums of the manifest recomputed.
-func (v *variant) bytes(t testing.TB) []byte {
-	t.Helper()
-	var parts []archive.Part
-	m := v.Man
-	m.Entries = nil
-	var oldEntries = map[string]archive.ManifestEntry{}
-	for _, e := range v.Man.Entries {
-		oldEntries[e.Name] = e
-	}
-	m.Totals = archive.Totals{}
-	for _, n := range v.Names {
-		var data []byte
-		if n == archive.CatalogName {
-			var err error
-			if data, err = json.Marshal(v.Cat); err != nil {
-				t.Fatal(err)
-			}
-		} else {
-			data = []byte(v.Files[n])
-		}
-		parts = append(parts, archive.Part{Name: n, Data: data})
-		sum := sha256.Sum256(data)
-		e := oldEntries[n]
-		e.Name, e.Size, e.SHA256 = n, int64(len(data)), hex.EncodeToString(sum[:])
-		if _, ok := archive.IsData(n); ok && !e.LedgerHistory {
-			m.Totals.Tables++
-			m.Totals.Rows += e.Rows
-		}
-		m.Totals.UncompressedBytes += e.Size
-		m.Entries = append(m.Entries, e)
-	}
-	if v.Patch != nil {
-		v.Patch(&m)
-	}
-	mj, err := json.Marshal(m)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var buf bytes.Buffer
-	if err := archive.Assemble(&buf, parts, mj); err != nil {
-		t.Fatal(err)
-	}
-	return buf.Bytes()
-}
-
-// addTable lists a table in the catalog and in the options as a table without data (so that no data entry is needed).
-func (v *variant) addTable(schema, name string, cols ...string) {
-	v.Cat.Tables = append(v.Cat.Tables, archive.CatalogTable{Schema: schema, Name: name, Kind: "local", TreeRole: "standalone", Columns: cols, AccessMethod: "heap"})
-	v.Man.Options.ExcludedTables = append(v.Man.Options.ExcludedTables, schema+"."+name)
-}
+func readVariant(t testing.TB, b []byte) *variant { return archivetest.Read(t, b) }
 
 // snapshot is what a refused import must leave exactly as it was: the databases, the roles and the per-database settings.
 func snapshot(t testing.TB, e *cp) string {
@@ -211,11 +118,11 @@ func TestDatabaseImportRefusesHostileArchives(t *testing.T) {
 		{"an oversized statement", func(v *variant) { v.Files[archive.PreDataName] += big }, "archive_statement_refused"},
 		{"pg_sleep in a default", func(v *variant) {
 			v.Files[archive.PreDataName] += "CREATE TABLE public.f1 (a int DEFAULT pg_sleep(100)::text::int);\n"
-			v.addTable("public", "f1", "a")
+			v.AddTable("public", "f1", "a")
 		}, "archive_statement_refused"},
 		{"pg_read_file in a generated column", func(v *variant) {
 			v.Files[archive.PreDataName] += "CREATE TABLE public.f2 (a text GENERATED ALWAYS AS (pg_read_file('/etc/passwd')) STORED);\n"
-			v.addTable("public", "f2", "a")
+			v.AddTable("public", "f2", "a")
 		}, "archive_statement_refused"},
 		{"pg_sleep in a view", func(v *variant) { v.Files[archive.ViewsName] += "CREATE VIEW public.v1 AS SELECT pg_sleep(100);\n" }, "archive_statement_refused"},
 		{"a function that does not exist", func(v *variant) {
@@ -226,10 +133,10 @@ func TestDatabaseImportRefusesHostileArchives(t *testing.T) {
 		}, "archive_statement_refused"},
 		{"set_config in a check", func(v *variant) {
 			v.Files[archive.PreDataName] += "CREATE TABLE public.f3 (a int CHECK (set_config('search_path', 'public', false) <> ''));\n"
-			v.addTable("public", "f3", "a")
+			v.AddTable("public", "f3", "a")
 		}, "archive_statement_refused"},
 		{"a table the catalog does not list", func(v *variant) { v.Files[archive.PreDataName] += "CREATE TABLE public.sneaky (a int);\n" }, "archive_invalid"},
-		{"a table of the catalog that the files do not create", func(v *variant) { v.addTable("public", "ghost", "a") }, "archive_invalid"},
+		{"a table of the catalog that the files do not create", func(v *variant) { v.AddTable("public", "ghost", "a") }, "archive_invalid"},
 		{"an extension outside the closed list", func(v *variant) {
 			v.Man.Extensions = append(v.Man.Extensions, archive.ManifestExtension{Name: "dblink", Version: "1.2", Schema: "public"})
 		}, "archive_invalid"},
@@ -275,7 +182,7 @@ func TestDatabaseImportRefusesHostileArchives(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			v := readVariant(t, base)
 			tc.mod(v)
-			up := e.uploadArchive(t, v.bytes(t))
+			up := e.uploadArchive(t, v.Bytes(t))
 			st, out := e.importDB(t, map[string]any{"uploadId": up, "database": "dbhostile_x"})
 			if st != 202 {
 				// A refusal at the request is as good: nothing was started.
@@ -316,9 +223,9 @@ func TestDatabaseImportHiddenTextIsNotRun(t *testing.T) {
 		"CREATE TABLE public.h_line (a int) -- ; DROP TABLE public.victim\n;\n" +
 		"CREATE TABLE public.h_e (a text DEFAULT E'\\'; DROP TABLE public.victim; --');\n"
 	for _, n := range []string{"h_comment", "h_dollar", "h_string", "h_line", "h_e"} {
-		v.addTable("public", n, "a")
+		v.AddTable("public", n, "a")
 	}
-	up := e.uploadArchive(t, v.bytes(t))
+	up := e.uploadArchive(t, v.Bytes(t))
 	before := snapshot(t, e)
 	e.importOK(t, map[string]any{"uploadId": up, "database": "dbhidden_ok"})
 	if got := query(t, e, "dbhidden_ok", "select count(*) from public.victim"); got != "[[2]]" {
@@ -440,7 +347,7 @@ func TestDatabaseImportCleansUp(t *testing.T) {
 			}
 		}
 	}
-	bad := e.uploadArchive(t, v.bytes(t))
+	bad := e.uploadArchive(t, v.Bytes(t))
 	e.waitNoPrivate(t)
 	before := snapshot(t, e)
 	e.importFails(t, map[string]any{"uploadId": bad, "database": "dbclean_x"}, "row_count_mismatch")

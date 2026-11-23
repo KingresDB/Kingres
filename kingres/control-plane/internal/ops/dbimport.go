@@ -187,6 +187,12 @@ func refusalFromReport(rep *api.ArchiveReport) error {
 	return problem.New(code, text).WithReasons(rs)
 }
 
+// usableImportName says whether a name may be the final name of an imported database: a valid name that is not a system database and can never be the name
+// that a task works in (a request cannot name the private database of a task, so a task cannot be made to work in, or to drop, another task's database).
+func usableImportName(n string) bool {
+	return dbNameRE.MatchString(n) && !protectedDB[n] && !strings.HasPrefix(n, privatePrefix)
+}
+
 // StartDatabaseImport answers importDatabase. It checks what is cheap and certain at the request; the archive itself is read again by the first step of the task
 // (an archive of 100 GiB cannot be read inside a request), and a cached report is used only to refuse early.
 func (o *Ops) StartDatabaseImport(ctx context.Context, actor string, req api.ImportDatabaseRequest) (task.Task, error) {
@@ -203,7 +209,7 @@ func (o *Ops) StartDatabaseImport(ctx context.Context, actor string, req api.Imp
 	default:
 		errs = append(errs, field("/onForeignKeyViolation", "must be fail or keepNotValid", "unknown_value"))
 	}
-	if req.Database != "" && (!dbNameRE.MatchString(req.Database) || protectedDB[req.Database] || strings.HasPrefix(req.Database, privatePrefix)) {
+	if req.Database != "" && !usableImportName(req.Database) {
 		errs = append(errs, field("/database", "must match ^[a-z_][a-z0-9_]{0,62}$, not be a system database and not start with "+privatePrefix, "pattern"))
 	}
 	if req.ExpectedSHA256 != "" && !sha256RE.MatchString(req.ExpectedSHA256) {
@@ -260,7 +266,7 @@ func (o *Ops) StartDatabaseImport(ctx context.Context, actor string, req api.Imp
 			return task.Task{}, merr
 		}
 		name = m.Source.Database
-		if !dbNameRE.MatchString(name) || protectedDB[name] || strings.HasPrefix(name, privatePrefix) {
+		if !usableImportName(name) {
 			return task.Task{}, problem.Validation("The import request is invalid.", field("/database", "the name in the archive is not usable here; give a name", "pattern"))
 		}
 	}
