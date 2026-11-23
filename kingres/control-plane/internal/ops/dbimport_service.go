@@ -931,7 +931,12 @@ func (o *Ops) importOnFailHook(ctx context.Context, t task.Task) {
 	}
 	kept := p.KeepOnFailure
 	if o.Transfer != nil && o.Transfer.Audit != nil {
-		o.Transfer.Audit(ctx, "dataTransfer.completed", map[string]any{"kind": "databaseImport", "database": p.Database, "uploadId": idText(p.UploadID), "outcome": "failure", "code": code, "kept": kept})
+		// The text of the error is a fixed sentence with the kind, the position and the fingerprint of a refused statement, never its text.
+		msg := ""
+		if t.Error != nil {
+			msg = safeSentence(t.Error.Message)
+		}
+		o.Transfer.Audit(ctx, "dataTransfer.completed", map[string]any{"kind": "databaseImport", "database": p.Database, "uploadId": idText(p.UploadID), "outcome": "failure", "code": code, "message": msg, "kept": kept})
 	}
 	if kept {
 		return
@@ -944,7 +949,16 @@ func (o *Ops) importOnFailHook(ctx context.Context, t task.Task) {
 		}
 	}
 	if o.Fanout != nil {
-		for _, s := range p.Servers {
+		// Every server that the task made the database on, and every server that is there now: the leader that runs this hook may not be the one that started the task.
+		seen := map[string]bool{o.ServerHost: true}
+		var servers []string
+		for _, s := range append(append([]string(nil), p.Servers...), ids(o.others(bg))...) {
+			if !seen[s] {
+				seen[s] = true
+				servers = append(servers, s)
+			}
+		}
+		for _, s := range servers {
 			if err := o.Fanout.Apply(bg, s, ApplyImportDrop, importDropOp{Name: priv}); err != nil && o.Log != nil {
 				o.Log.Warn("the private database of a failed import could not be dropped on a server", "database", priv, "server", s, "error", err)
 			}

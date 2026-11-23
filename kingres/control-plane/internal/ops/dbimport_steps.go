@@ -237,11 +237,15 @@ func (o *Ops) setupPrivateLocal(ctx context.Context, op importCreateOp) error {
 			return err
 		}
 	}
-	grant := func(schema string) error {
+	grant := func(schema string, create bool) error {
 		if op.Role == "" {
 			return nil
 		}
-		return run(ctx, c, stmt().Text("GRANT USAGE ON SCHEMA").ID(sqlx.MustIdent(schema)).Text("TO").ID(role))
+		what := sqlx.Fixed("USAGE")
+		if create {
+			what = "USAGE, CREATE"
+		}
+		return run(ctx, c, stmt().Text("GRANT").Text(what).Text("ON SCHEMA").ID(sqlx.MustIdent(schema)).Text("TO").ID(role))
 	}
 	for _, s := range op.Schemas {
 		id, err := sqlx.NewIdent(s)
@@ -251,7 +255,8 @@ func (o *Ops) setupPrivateLocal(ctx context.Context, op importCreateOp) error {
 		if err := run(ctx, c, stmt().Text("CREATE SCHEMA IF NOT EXISTS").ID(id)); err != nil {
 			return err
 		}
-		if err := grant(s); err != nil {
+		// A schema that the archive's extension lives in may hold tables of the database too.
+		if err := grant(s, true); err != nil {
 			return err
 		}
 	}
@@ -278,7 +283,7 @@ func (o *Ops) setupPrivateLocal(ctx context.Context, op importCreateOp) error {
 	// The schema that a KingresDB extension makes (kingres) is used by the role's own statements only through names that the grammar refuses, but the role must
 	// see it to use the types and the access method of the extensions.
 	if hasInstalled(op.Extensions, "kingres_") {
-		if err := grant("kingres"); err != nil {
+		if err := grant("kingres", false); err != nil {
 			return err
 		}
 	}
