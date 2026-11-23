@@ -5,6 +5,8 @@
 - Date: 2026-11-22
 - Source: [../design/data-export-import.md](../design/data-export-import.md) ("Ledger tables"), `contrib/kingres_ledger/README.md` ("Dump, restore and replication", "Updatable tables", "Copies of the database")
 
+Scope: this decision applies to the database export and import of phase 14c, which is not built and comes after the first release; it is not implemented in the first release.
+
 ## Context
 
 A ledger table is a user table with capture triggers whose rows are entered into a hash chain; its updatable form has a

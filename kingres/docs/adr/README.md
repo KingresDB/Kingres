@@ -33,7 +33,7 @@ An ADR records one decision: the context, the decision, its consequences and the
 | [0024](0024-agpl-for-kingresdb-code.md) | KingresDB's own code is licensed under the GNU Affero General Public License, version 3 | Accepted | 2026-11-15 | 3 (supersedes 0004) |
 | [0025](0025-restore-of-the-system-database-is-accepted-by-an-operator.md) | A restored system database is accepted by an operator, and the acceptance is a signed event | Accepted | 2026-11-23 | - |
 | [0026](0026-the-candidate-of-the-map-group-receives-the-proof-of-the-operators-session.md) | The candidate of a map group failover receives the proof of the operator's session | Accepted | 2026-11-23 | - |
-| [0027](0027-transfers-are-staged-encrypted-files-run-as-the-requesting-role.md) | Exports are staged encrypted files, and transfers run as the role that asked | Proposed | 2026-11-22 | - |
+| [0027](0027-transfers-are-staged-encrypted-files-run-as-the-requesting-role.md) | Exports are staged encrypted files, and transfers run as the role that asked | Accepted | 2026-11-23 | - |
 | [0028](0028-ledger-tables-are-carried-as-data-and-restart-their-chain.md) | Ledger tables are carried as data, and the imported ledger starts a new chain | Proposed | 2026-11-22 | - |
 "Open decision #" refers to the table "Open decisions" in architecture.md.
 
