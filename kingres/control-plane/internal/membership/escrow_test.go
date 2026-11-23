@@ -33,6 +33,7 @@ type escrowCluster struct {
 	mu      sync.Mutex
 	calls   []string
 	paths   []string
+	stale   int // lists that a holder refused because they take a revocation back
 	db      *memEscrowDB
 }
 
@@ -135,6 +136,11 @@ func (c *escrowCluster) transport(from *Manager) func(context.Context, string, s
 		res, err := (&Receiver{M: to}).Handle(ctx, method+" "+path, from.Self, body)
 		var ce *internalapi.CallError
 		if errors.As(err, &ce) {
+			if ce.Code == codeStaleRevocations {
+				c.mu.Lock()
+				c.stale++
+				c.mu.Unlock()
+			}
 			return &peerclient.APIError{Status: ce.Status, Code: ce.Code, Message: ce.Message}
 		}
 		if err != nil {

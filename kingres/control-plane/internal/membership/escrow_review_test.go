@@ -455,3 +455,21 @@ func TestALeaderWhoseListWentBackIsRefusedAndRepairs(t *testing.T) {
 		t.Fatalf("the revocation of bb02 was lost: leader %v holder %v", ca1.Revoked(), c.crlSerials("db2"))
 	}
 }
+
+// CAE-4: a leader asks the servers what they hold before it sends; it does not rely on being refused.
+func TestADistributionAsksTheServersFirst(t *testing.T) {
+	c := newEscrowCluster(t, "db1", "db2")
+	ctx := context.Background()
+	if err := c.install("db2", []string{"bb02"}, c.forgeCRL([]string{"bb02"}, 1, time.Now())); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.servers["db1"].distributeRevocations(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if c.stale != 0 {
+		t.Fatalf("the leader sent a list that was refused %d times: it did not read the lists of the servers first", c.stale)
+	}
+	if !c.mgrCA("db1").IsRevoked("bb02") || !c.crlSerials("db2")["bb02"] {
+		t.Fatal("the revocation was lost")
+	}
+}
