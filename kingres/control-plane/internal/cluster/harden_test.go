@@ -5,6 +5,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -59,7 +60,7 @@ func TestHardenSystemDatabase(t *testing.T) {
 	}
 	err := connect("mallory", "pw-m")
 	var pe *pgconn.PgError
-	if errAs(err, &pe); pe == nil || pe.Code != "42501" {
+	if !errors.As(err, &pe) || pe == nil || pe.Code != "42501" {
 		t.Errorf("a role without a cluster role cannot connect: %v", err)
 	}
 	var can bool
@@ -69,24 +70,4 @@ func TestHardenSystemDatabase(t *testing.T) {
 	if probs, err := extguard.SystemDatabaseProblems(ctx, sys); err != nil || len(probs) != 0 {
 		t.Errorf("%v %v", probs, err)
 	}
-}
-
-func errAs(err error, target **pgconn.PgError) {
-	if pe, ok := err.(*pgconn.PgError); ok {
-		*target = pe
-		return
-	}
-	var pe *pgconn.PgError
-	for e := err; e != nil; {
-		if x, ok := e.(*pgconn.PgError); ok {
-			pe = x
-			break
-		}
-		u, ok := e.(interface{ Unwrap() error })
-		if !ok {
-			break
-		}
-		e = u.Unwrap()
-	}
-	*target = pe
 }

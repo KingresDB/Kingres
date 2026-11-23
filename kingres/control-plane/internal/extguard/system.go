@@ -42,6 +42,7 @@ UNION ALL
 SELECT n.nspname::pg_catalog.text, 'schemaOwner'
   FROM pg_catalog.pg_namespace n
  WHERE n.nspname IN ('kingres', 'kingres_cp', 'public')
+   AND n.nspowner <> 6171 -- pg_database_owner: the schema public of PostgreSQL 15 and later; the owner of the database is checked on its own
    AND NOT COALESCE((SELECT r.rolsuper FROM pg_catalog.pg_roles r WHERE r.oid = n.nspowner), false)
 UNION ALL
 SELECT n.nspname::pg_catalog.text, 'schemaCreate'
