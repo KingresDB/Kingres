@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/instance"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sqlx"
@@ -37,8 +38,13 @@ func ledgerDB(db string) (string, error) {
 
 // ledgerRecords reports whether the database has the 0.2 records.
 func ledgerRecords(ctx context.Context, x execer) (installed, records bool, err error) {
-	err = x.QueryRow(ctx, `SELECT to_regclass('kingres.ledger_blocks') IS NOT NULL,
-		to_regclass('kingres.ledger_digest') IS NOT NULL AND to_regclass('kingres.ledger_verification') IS NOT NULL`).Scan(&installed, &records)
+	// The extension first (extguard): nothing of the schema kingres is read before it is known to be the extension's own.
+	info, err := extPresent(ctx, x, extguard.Ledger)
+	if err != nil || !info.Present {
+		return false, false, err
+	}
+	err = x.QueryRow(ctx, `SELECT pg_catalog.to_regclass('kingres.ledger_blocks') IS NOT NULL,
+		pg_catalog.to_regclass('kingres.ledger_digest') IS NOT NULL AND pg_catalog.to_regclass('kingres.ledger_verification') IS NOT NULL`).Scan(&installed, &records)
 	return
 }
 
@@ -65,10 +71,8 @@ func needRecords(ctx context.Context, x execer) error {
 // working in such a database; what waits for the update is everything that
 // this file and EnableLedger call.
 func needCurrentLedger(ctx context.Context, x execer) error {
-	var have, want string
-	if err := x.QueryRow(ctx, `SELECT
-		coalesce((SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'kingres_ledger'), ''),
-		coalesce((SELECT default_version FROM pg_catalog.pg_available_extensions WHERE name = 'kingres_ledger'), '')`).Scan(&have, &want); err != nil {
+	have, want, err := ledgerVersions(ctx, x)
+	if err != nil {
 		return err
 	}
 	if have == "" || want == "" || have == want {
@@ -325,6 +329,10 @@ func (o *Ops) stepVerifyChain(ctx context.Context, env *task.Env) error {
 		return err
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	// The extension is checked before anything of its schema is read or called (extguard).
+	if err := needRecords(ctx, c); err != nil {
+		return err
+	}
 	from := int64(0)
 	if p.Scope == "sinceLastVerified" {
 		// Continue after the last clean verification.

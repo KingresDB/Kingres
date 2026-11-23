@@ -12,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/peerclient"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
@@ -165,12 +166,20 @@ func (p pgExt) Installed(ctx context.Context, db, ext string) (string, error) {
 		return "", err
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
-	var v string
-	err = c.QueryRow(ctx, "SELECT extversion FROM pg_catalog.pg_extension WHERE extname = $1", ext).Scan(&v)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return "", nil
+	// Found by extguard, not by name alone: an extension whose schema cannot be trusted is refused, never reported as installed or absent.
+	info, err := extguard.Verify(ctx, c, ext)
+	if err != nil {
+		return "", extUntrusted(err)
 	}
-	return v, err
+	return info.Version, nil
+}
+
+// extUntrusted turns the refusal of extguard into the error of the extension operations (the text crosses servers); another error is returned as it is.
+func extUntrusted(err error) error {
+	if u, ok := extguard.IsUntrusted(err); ok {
+		return extErr(problem.ExtensionUnavailable, "the schema %s of %s in this database cannot be trusted (%s): it is not owned by a superuser, a role that is not a superuser can create objects in it, or it holds an object that is not a member of an extension; an operator must restore it", u.Schema, u.Extension, u.Reason)
+	}
+	return err
 }
 
 func (p pgExt) Install(ctx context.Context, db, ext string) error {
@@ -179,13 +188,19 @@ func (p pgExt) Install(ctx context.Context, db, ext string) error {
 		return err
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
-	var cur, def string
-	err = c.QueryRow(ctx, "SELECT extversion FROM pg_catalog.pg_extension WHERE extname = $1", ext).Scan(&cur)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return run(ctx, c, stmt().Text("CREATE EXTENSION IF NOT EXISTS").ID(sqlx.MustIdent(ext)))
-	}
+	var def string
+	// An extension that is there must be trusted before it is updated; one that is not there is created only when the schema it goes into is not one that a
+	// tenant made (extguard.PreInstall): the control file of an extension with "schema = ..." would use it, and the tenant would own what the service role runs.
+	info, err := extguard.Verify(ctx, c, ext)
 	if err != nil {
-		return err
+		return extUntrusted(err)
+	}
+	cur := info.Version
+	if !info.Present {
+		if err := extguard.PreInstallExtension(ctx, c, ext); err != nil {
+			return extUntrusted(err)
+		}
+		return run(ctx, c, stmt().Text("CREATE EXTENSION IF NOT EXISTS").ID(sqlx.MustIdent(ext)))
 	}
 	if err := c.QueryRow(ctx, "SELECT default_version FROM pg_catalog.pg_available_extensions WHERE name = $1", ext).Scan(&def); err != nil {
 		return err
@@ -202,6 +217,14 @@ func (p pgExt) SelfTest(ctx context.Context, db string) (string, error) {
 		return "", err
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	// self_test runs as the service role: the extension and its schema are checked first (extguard), so the function is the extension's own.
+	info, err := extguard.Verify(ctx, c, ExtSketch)
+	if err != nil {
+		return "", extUntrusted(err)
+	}
+	if !info.Present {
+		return "", extErr(problem.ExtensionUnavailable, "%s is not installed in the database", ExtSketch)
+	}
 	var s string
 	err = c.QueryRow(ctx, "SELECT kingres_sketch.self_test()").Scan(&s)
 	return s, err

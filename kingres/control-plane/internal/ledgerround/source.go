@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/peerclient"
 )
@@ -77,9 +78,20 @@ func (s *ClusterSource) Groups(ctx context.Context, db string) ([]Group, error) 
 		return nil, err
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
-	var sharded bool
-	if err := c.QueryRow(ctx, `SELECT to_regclass('kingres.node') IS NOT NULL`).Scan(&sharded); err != nil {
+	// Before anything of the schema kingres is read: the sharding extension must be there and its schema must be the extension's alone (extguard); a schema
+	// that a database owner made would run its functions as the service role.
+	info, err := extguard.Verify(ctx, c, extguard.Shard)
+	if err != nil {
+		if _, bad := extguard.IsUntrusted(err); bad {
+			return nil, fmt.Errorf("the groups of database %s are not read: %w", db, err)
+		}
 		return nil, err
+	}
+	var sharded bool
+	if info.Present {
+		if err := c.QueryRow(ctx, `SELECT pg_catalog.to_regclass('kingres.node') IS NOT NULL`).Scan(&sharded); err != nil {
+			return nil, err
+		}
 	}
 	if !sharded {
 		return []Group{{ID: 0, Server: s.Self}}, nil

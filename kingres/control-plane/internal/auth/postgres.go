@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/cluster"
 	"sync"
 	"time"
 
@@ -90,7 +91,10 @@ func (p *Postgres) SetDSN(dsn string) error {
 func (p *Postgres) config() *pgx.ConnConfig {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.base.Copy()
+	// The search path is fixed in the startup parameters (cluster.SafeSession): a database setting cannot change what the statements below resolve to.
+	cfg := p.base.Copy()
+	cluster.SafeSession(cfg)
+	return cfg
 }
 
 // Authenticate implements Authenticator.

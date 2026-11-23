@@ -7,6 +7,7 @@ import (
 	"math"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 )
 
 // storagePredicate is the SQL condition of the storage filter of listTables: the table, or any partition of it, uses the access method. An empty
@@ -84,8 +85,12 @@ func (s *Store) addColumnarStats(ctx context.Context, h *dbHandle, ts []api.Tabl
 	if len(which) == 0 {
 		return
 	}
+	// The functions are read only when the extension is installed and its schema is trusted (extguard).
+	if ok, err := s.extReady(ctx, h.pool, extguard.Columnar); err != nil || !ok {
+		return
+	}
 	var have bool
-	if err := h.pool.QueryRow(ctx, `SELECT to_regprocedure('kingres.columnar_info(regclass)') IS NOT NULL AND to_regprocedure('kingres.columnar_options(regclass)') IS NOT NULL`).Scan(&have); err != nil || !have {
+	if err := h.pool.QueryRow(ctx, `SELECT pg_catalog.to_regprocedure('kingres.columnar_info(regclass)') IS NOT NULL AND pg_catalog.to_regprocedure('kingres.columnar_options(regclass)') IS NOT NULL`).Scan(&have); err != nil || !have {
 		return
 	}
 	schemas, names := make([]string, len(which)), make([]string, len(which))
@@ -145,8 +150,8 @@ func (s *Store) addTimePartitioning(ctx context.Context, h *dbHandle, ts []api.T
 	if len(schemas) == 0 {
 		return
 	}
-	var policies bool
-	if err := h.pool.QueryRow(ctx, `SELECT to_regclass('kingres.timepart_policy') IS NOT NULL`).Scan(&policies); err != nil {
+	policies, err := s.regclassExists(ctx, h.pool, "kingres.timepart_policy")
+	if err != nil {
 		return
 	}
 	policy := "false"

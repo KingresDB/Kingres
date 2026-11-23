@@ -323,7 +323,7 @@ func TestMutantsAreKilled(t *testing.T) {
 			"ALTER SCHEMA kingres_sketch OWNER TO tenant", "ALTER SCHEMA kingres_sketch OWNER TO kingresd", ReasonSchemaOwner},
 		{"CREATE of a role not checked", "a.privilege_type = 'CREATE'", "a.privilege_type = 'NOPE'",
 			"GRANT CREATE ON SCHEMA kingres_sketch TO tenant", "REVOKE CREATE ON SCHEMA kingres_sketch FROM tenant", ReasonSchemaCreate},
-		{"CREATE of PUBLIC not checked", "a.grantee = 0 OR ", "",
+		{"CREATE of PUBLIC not checked", "a.grantee = 0 OR NOT EXISTS", "a.grantee <> 0 AND NOT EXISTS",
 			"GRANT CREATE ON SCHEMA kingres_sketch TO PUBLIC", "REVOKE CREATE ON SCHEMA kingres_sketch FROM PUBLIC", ReasonSchemaCreate},
 		{"the grantee that is a superuser is not excused", "g.rolsuper)", "true)",
 			"GRANT CREATE ON SCHEMA kingres_sketch TO tenant", "REVOKE CREATE ON SCHEMA kingres_sketch FROM tenant", ReasonSchemaCreate},
