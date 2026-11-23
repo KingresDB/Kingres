@@ -61,6 +61,9 @@ type Record struct {
 	ExpiresAt     time.Time
 	DownloadedAt  *time.Time
 	TaskID        *int64
+	// Purpose is what an upload is for (tableImport or databaseArchive); ArchiveState is the state of the validation of an archive (validating, valid, invalid).
+	Purpose      string
+	ArchiveState string
 }
 
 // IDString is the identifier as the contract shows it, a decimal string.
@@ -75,14 +78,14 @@ type Records struct{ Run Tx }
 const recordColumns = `transfer_id, kind, state, server_id, created_by, created_by_oid,
 	coalesce(database_name, ''), coalesce(schema_name, ''), coalesce(table_name, ''),
 	size_bytes, declared_bytes, reserved_bytes, coalesce(sha256, ''), coalesce(format, ''), report,
-	coalesce(key_id, ''), wrapped_key, created_at, updated_at, expires_at, downloaded_at, task_id`
+	coalesce(key_id, ''), wrapped_key, created_at, updated_at, expires_at, downloaded_at, task_id, coalesce(purpose, ''), coalesce(archive_state, '')`
 
 func scanRecord(row pgx.Row) (Record, error) {
 	var r Record
 	err := row.Scan(&r.ID, &r.Kind, &r.State, &r.ServerID, &r.Owner.Name, &r.Owner.OID,
 		&r.Database, &r.Schema, &r.Table,
 		&r.SizeBytes, &r.DeclaredBytes, &r.ReservedBytes, &r.SHA256, &r.Format, &r.Report,
-		&r.KeyID, &r.WrappedKey, &r.CreatedAt, &r.UpdatedAt, &r.ExpiresAt, &r.DownloadedAt, &r.TaskID)
+		&r.KeyID, &r.WrappedKey, &r.CreatedAt, &r.UpdatedAt, &r.ExpiresAt, &r.DownloadedAt, &r.TaskID, &r.Purpose, &r.ArchiveState)
 	r.CreatedAt, r.UpdatedAt, r.ExpiresAt = r.CreatedAt.UTC(), r.UpdatedAt.UTC(), r.ExpiresAt.UTC()
 	if r.DownloadedAt != nil {
 		t := r.DownloadedAt.UTC()
@@ -109,10 +112,10 @@ func (rs Records) Create(ctx context.Context, r Record) (int64, error) {
 	var id int64
 	err := rs.Run(ctx, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `INSERT INTO kingres_cp.data_transfer
-			(kind, state, server_id, created_by, created_by_oid, database_name, schema_name, table_name, declared_bytes, reserved_bytes, format, expires_at, task_id)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING transfer_id`,
+			(kind, state, server_id, created_by, created_by_oid, database_name, schema_name, table_name, declared_bytes, reserved_bytes, format, expires_at, task_id, purpose)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING transfer_id`,
 			r.Kind, r.State, r.ServerID, r.Owner.Name, r.Owner.OID, nullable(r.Database), nullable(r.Schema), nullable(r.Table),
-			r.DeclaredBytes, r.ReservedBytes, nullable(r.Format), r.ExpiresAt, r.TaskID).Scan(&id)
+			r.DeclaredBytes, r.ReservedBytes, nullable(r.Format), r.ExpiresAt, r.TaskID, nullable(r.Purpose)).Scan(&id)
 	})
 	return id, err
 }
@@ -181,6 +184,8 @@ type Update struct {
 	WrappedKey    []byte
 	ExpiresAt     *time.Time
 	TaskID        *int64
+	// ArchiveState sets archive_state (the validation of an archive).
+	ArchiveState *string
 	// Touch sets updated_at (bytes arrived).
 	Touch bool
 	// Downloaded sets downloaded_at (the last byte of a download was served).
@@ -195,11 +200,11 @@ func (rs Records) Apply(ctx context.Context, id int64, u Update) error {
 			state = coalesce($2, state), size_bytes = coalesce($3, size_bytes), reserved_bytes = coalesce($4, reserved_bytes),
 			sha256 = coalesce($5, sha256), format = coalesce($6, format), report = coalesce($7, report),
 			key_id = coalesce($8, key_id), wrapped_key = coalesce($9, wrapped_key), expires_at = coalesce($10, expires_at),
-			task_id = coalesce($11, task_id),
+			task_id = coalesce($11, task_id), archive_state = coalesce($14, archive_state),
 			updated_at = CASE WHEN $12 THEN now() ELSE updated_at END,
 			downloaded_at = CASE WHEN $13 THEN now() ELSE downloaded_at END
 			WHERE transfer_id = $1 AND state <> 'deleted'`,
-			id, u.State, u.SizeBytes, u.ReservedBytes, u.SHA256, u.Format, nilIfEmpty(u.Report), u.KeyID, nilIfEmptyBytes(u.WrappedKey), u.ExpiresAt, u.TaskID, u.Touch, u.Downloaded)
+			id, u.State, u.SizeBytes, u.ReservedBytes, u.SHA256, u.Format, nilIfEmpty(u.Report), u.KeyID, nilIfEmptyBytes(u.WrappedKey), u.ExpiresAt, u.TaskID, u.Touch, u.Downloaded, u.ArchiveState)
 		n = tag.RowsAffected()
 		return err
 	})

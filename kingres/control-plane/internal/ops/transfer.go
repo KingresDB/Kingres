@@ -243,6 +243,8 @@ type uploadReport struct {
 	// DeclaredSHA256 is the checksum the client declared, "" when it declared none.
 	DeclaredSHA256 string `json:"declaredSha256,omitempty"`
 	Purpose        string `json:"purpose,omitempty"`
+	// Archive is the report of the last validation of a database archive (contract 0.40.0); Source is the SHA-256 of the file that it read.
+	Archive *api.ArchiveReport `json:"archive,omitempty"`
 }
 
 func quotaProblem(err error) error {
@@ -268,8 +270,8 @@ func (o *Ops) CreateUpload(ctx context.Context, actor string, req api.CreateData
 		return api.DataUpload{}, 0, err
 	}
 	var errs []problem.FieldError
-	if req.Purpose != "tableImport" {
-		errs = append(errs, field("/purpose", "must be tableImport", "unknown_value"))
+	if req.Purpose != "tableImport" && req.Purpose != "databaseArchive" {
+		errs = append(errs, field("/purpose", "must be tableImport or databaseArchive", "unknown_value"))
 	}
 	if req.SizeBytes < 1 {
 		errs = append(errs, field("/sizeBytes", "must be at least 1", "out_of_range"))
@@ -295,7 +297,7 @@ func (o *Ops) CreateUpload(ctx context.Context, actor string, req api.CreateData
 	rs := o.records()
 	now := o.transferNow()
 	id, err := rs.Create(ctx, transfer.Record{Kind: transfer.KindUpload, State: transfer.StateReceiving, ServerID: o.ServerHost, Owner: who,
-		DeclaredBytes: &req.SizeBytes, ReservedBytes: reserve, Format: "csv", ExpiresAt: now.Add(UploadIdleKeep)})
+		DeclaredBytes: &req.SizeBytes, ReservedBytes: reserve, Format: uploadFormat(req.Purpose), Purpose: req.Purpose, ExpiresAt: now.Add(UploadIdleKeep)})
 	if err != nil {
 		return api.DataUpload{}, 0, wrap(err)
 	}
@@ -385,11 +387,23 @@ func (o *Ops) uploadOffset(x *xferState, rec transfer.Record) (int64, error) {
 	return 0, staging.ErrNotFound
 }
 
+// uploadFormat is the format a staged upload has: a CSV file, or the zip archive of a database export.
+func uploadFormat(purpose string) string {
+	if purpose == "databaseArchive" {
+		return "archive/1"
+	}
+	return "csv"
+}
+
 func uploadState(rec transfer.Record) string {
 	switch rec.State {
 	case transfer.StateReceiving:
 		return "receiving"
 	case transfer.StateReady:
+		switch rec.ArchiveState {
+		case "validating", "valid", "invalid":
+			return rec.ArchiveState
+		}
 		return "complete"
 	case transfer.StateDeleted:
 		return "deleted"
@@ -415,6 +429,12 @@ func (o *Ops) uploadView(x *xferState, rec transfer.Record) (api.DataUpload, err
 	if rec.SHA256 != "" {
 		s := rec.SHA256
 		out.SHA256 = &s
+	}
+	if rec.Purpose == "databaseArchive" {
+		var rep uploadReport
+		if json.Unmarshal(rec.Report, &rep) == nil && rep.Archive != nil && rep.Archive.SHA256 == rec.SHA256 {
+			out.Report = rep.Archive
+		}
 	}
 	return out, nil
 }
@@ -608,7 +628,9 @@ func (o *Ops) DeleteUpload(ctx context.Context, actor, idText string) (int64, er
 
 // exportReport is what the record of an export keeps in its report: facts about the file, never values.
 type exportReport struct {
-	Rows        int64                  `json:"rows"`
+	Rows int64 `json:"rows"`
+	// Warnings are the warnings of the manifest of a database archive.
+	Warnings    []string               `json:"warnings,omitempty"`
 	Encoding    string                 `json:"encoding"`
 	Compression string                 `json:"compression,omitempty"`
 	Consistency []api.TableConsistency `json:"consistency"`
@@ -637,8 +659,11 @@ func exportView(rec transfer.Record) api.DataExport {
 			out.Rows = &r
 			out.Consistency = rep.Consistency
 			out.RLSApplied = rep.RLSApplied
-			safe := rep.Safe
-			out.SpreadsheetSafe = &safe
+			out.Warnings = rep.Warnings
+			if rec.Kind == transfer.KindTableExport {
+				safe := rep.Safe
+				out.SpreadsheetSafe = &safe
+			}
 		}
 	}
 	return out
