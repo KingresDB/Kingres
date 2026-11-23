@@ -464,3 +464,38 @@ func idOf(task map[string]any) string {
 	}
 	return ""
 }
+
+// A database whose archive grows beyond the largest staged file stops with export_too_large and leaves no file; the same database passes under a larger limit.
+func TestDatabaseExportTooLarge(t *testing.T) {
+	e, off := transferOn(t)
+	defer off()
+	e.mustTask(t, "POST", "/databases", map[string]any{"name": "dbx_big"})
+	q := func(sql string) {
+		e.expect(t, 200, "POST", "/query", map[string]any{"database": "dbx_big", "sql": sql})
+	}
+	q("create table public.big (id int primary key, a text, b text)")
+	q("insert into public.big select g, md5(g::text) || md5((g + 1)::text), md5((g + 2)::text) || md5((g + 3)::text) from generate_series(1, 60000) g")
+	e.expect(t, 200, "PATCH", "/settings/cluster", map[string]any{"dataTransfer": map[string]any{"maxFileBytes": 1 << 20}})
+	st, out := e.startDBExport(t, "dbx_big", map[string]any{})
+	if st != 202 {
+		t.Fatalf("export: %d %v", st, out)
+	}
+	done := e.waitTask(t, out)
+	if done["state"] != "failed" || done["error"].(map[string]any)["code"] != "export_too_large" {
+		t.Fatalf("the export of a database larger than the largest file: %v %v", done["state"], done["error"])
+	}
+	list := e.expect(t, 200, "GET", "/data-exports", nil)
+	for _, it := range list["items"].([]any) {
+		m := it.(map[string]any)
+		if m["database"] == "dbx_big" && m["state"] != "failed" {
+			t.Errorf("the export that was too large is %v", m["state"])
+		}
+	}
+	e.expect(t, 200, "PATCH", "/settings/cluster", map[string]any{"dataTransfer": map[string]any{"maxFileBytes": 1 << 30}})
+	id := e.exportDB(t, "dbx_big", map[string]any{})
+	_, _, body := e.download(t, id, nil)
+	res := checkArchive(t, body)
+	if res.Manifest.Totals.Rows != 60000 {
+		t.Errorf("rows: %d", res.Manifest.Totals.Rows)
+	}
+}
