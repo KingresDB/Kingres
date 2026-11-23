@@ -700,3 +700,14 @@ func (n *Node) DoRaw(method, path string, body []byte) (int, []byte) {
 	raw, _ := io.ReadAll(resp.Body)
 	return resp.StatusCode, raw
 }
+
+// PGAt is PG on another port of the loopback address (an instance of this server that is not the first one, for example the standby of a group).
+func (n *Node) PGAt(ctx context.Context, port int, user, pass, db string) (*pgx.Conn, error) {
+	cfg, err := pgx.ParseConfig("")
+	if err != nil {
+		return nil, err
+	}
+	cfg.Host, cfg.Port, cfg.Database, cfg.User, cfg.Password = "127.0.0.1", uint16(port), db, user, pass //nolint:gosec // test ports
+	cfg.TLSConfig, cfg.Fallbacks, cfg.ConnectTimeout = nil, nil, 10*time.Second
+	return pgx.ConnectConfig(ctx, cfg)
+}

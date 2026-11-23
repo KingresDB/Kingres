@@ -136,7 +136,7 @@ func mapAckedExcept(t *testing.T, c *clustertest.Cluster, port int, pool *x509.C
 func TestHardFailoverOfTheMapGroupWhileItsServerIsAlive(t *testing.T) {
 	c, port, pool, leader, nw, w := mapSwitchoverEnv(t)
 	sampler := startMapSampler(c)
-	probe := startWriteProbe(t, leader, nw)
+	probe := startWriteProbe(t, mapProbeTargets(t, leader, nw))
 	id := mapHardRequest(t, leader, nw, true)
 	mapHardDone(t, leader, nw, id)
 	checkProbe(t, probe(), leader, nw)
@@ -149,7 +149,7 @@ func TestHardFailoverOfTheMapGroupWhileItsServerIsAlive(t *testing.T) {
 func TestHardFailoverOfTheMapGroupWhoseOldPrimaryDoesNotStop(t *testing.T) {
 	c, port, pool, leader, nw, w := mapSwitchoverEnv(t)
 	sampler := startMapSampler(c)
-	probe := startWriteProbe(t, leader, nw)
+	probe := startWriteProbe(t, mapProbeTargets(t, leader, nw))
 	leader.SetFaults(fault.Spec{FailoverPoint: "demote:nostop", FailoverMode: "skip"})
 	id := mapHardRequest(t, leader, nw, true)
 	mapHardDone(t, leader, nw, id)
@@ -255,7 +255,7 @@ func TestHardFailoverOfTheMapGroupPausesAfterTheStopAndTheRepeatedRequestFinishe
 	if code, err := leader.InternalCall(nw, "GET", "/failover/state?group=0", nil, &sn); err == nil && code == 200 && len(sn.OutOfRecovery()) != 0 {
 		t.Fatalf("the standby was promoted although the loss was not accepted: %+v", sn)
 	}
-	st, resp = nw.DoThroughRestart("POST", "/servers/"+leader.Host+"/failover", map[string]any{"mode": "hard", "allowDataLoss": true, "comment": "repeated"}, nil)
+	st, resp = nw.DoThroughRestart("POST", "/servers/"+leader.Host+"/failover", map[string]any{"mode": "hard", "allowDataLoss": true, "comment": "repeated", "targets": []map[string]any{{"shardGroupId": 0, "serverId": nw.Host}}}, nil)
 	if st != 202 {
 		t.Fatalf("the repeated request: %d %v\n%s", st, resp, quietLog(nw.LogTail(20000)))
 	}
@@ -346,19 +346,43 @@ type writeProbe struct {
 	n           int
 }
 
-func startWriteProbe(t *testing.T, nodes ...*clustertest.Node) (stop func() []writeProbe) {
+// probeTarget is the instance of the map group on one server: the port of the primary of the map group on the leader's server, and the port of its standby (from the catalog)
+// on the standby's server, which is not the port the node's own kingresd opened first (that instance may serve another group).
+type probeTarget struct {
+	node *clustertest.Node
+	port int
+}
+
+// mapProbeTargets finds the instances of group 0 on the old leader and on the standby's server.
+func mapProbeTargets(t *testing.T, leader, nw *clustertest.Node) []probeTarget {
 	t.Helper()
+	out := []probeTarget{{leader, leader.PGPort}, {nw, 0}}
+	for _, s := range catalogStandbys(t, leader) {
+		if s.group == 0 && s.host == nw.Host {
+			out[1].port = s.port
+		}
+	}
+	if out[1].port == 0 {
+		t.Fatalf("no standby of the map group on %s in the catalog", nw.Host)
+	}
+	return out
+}
+
+func startWriteProbe(t *testing.T, targets []probeTarget) (stop func() []writeProbe) {
+	t.Helper()
+	nodes := targets
 	out := make([]writeProbe, len(nodes))
 	quit := make(chan struct{})
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	for i, n := range nodes {
-		pw, err := os.ReadFile(filepath.Join(n.DataDir, "service-credentials"))
+		// the standby has the roles of the primary: the leader's service password opens both
+		pw, err := os.ReadFile(filepath.Join(targets[0].node.DataDir, "service-credentials"))
 		if err != nil {
-			t.Fatalf("service credentials of %s: %v", n.Host, err)
+			t.Fatalf("service credentials: %v", err)
 		}
 		wg.Add(1)
-		go func(i int, n *clustertest.Node, pass string) {
+		go func(i int, n probeTarget, pass string) {
 			defer wg.Done()
 			var c *pgx.Conn
 			defer func() {
@@ -375,7 +399,7 @@ func startWriteProbe(t *testing.T, nodes ...*clustertest.Node) (stop func() []wr
 				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 				if c == nil {
 					var err error
-					if c, err = n.PG(ctx, "kingresd", pass, "kingres_system"); err != nil {
+					if c, err = n.node.PGAt(ctx, n.port, "kingresd", pass, "kingres_system"); err != nil {
 						c = nil
 						cancel()
 						continue
