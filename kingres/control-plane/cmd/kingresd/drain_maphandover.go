@@ -5,8 +5,10 @@ package main
 
 import (
 	"context"
+	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fault"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/rebalance"
 )
@@ -16,8 +18,17 @@ import (
 // returns once the failover task exists; the drain is paused meanwhile and the watch of the new manager leader resumes it
 // (rebalance/handover.go). It refuses while any failover task is unfinished: Start would otherwise resume a paused failover of this
 // server (an unrelated one, waiting for an operator) instead of making the switchover.
-func wireMapGroupHandOver(rbs *rebalance.Service, fos *failover.Service) {
+//
+// A test can hold the request at the fault point "drain:handover" (mode "hold") after the marker says requesting, to end the server there.
+func wireMapGroupHandOver(rbs *rebalance.Service, fos *failover.Service, fh *fault.Hook) {
 	rbs.HandOverMapGroup = handOverHook(fos.Unfinished, func(ctx context.Context, actor, server string) error {
+		for fh.FailoverInjection("drain:handover") == "hold" {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(200 * time.Millisecond):
+			}
+		}
 		_, _, err := fos.Start(ctx, actor, server, failover.Request{Mode: failover.ModeGraceful, ShardGroupIDs: []int32{0},
 			Comment: "hand over the map group: drain of server " + server})
 		return err

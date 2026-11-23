@@ -158,7 +158,7 @@ func Resolve(o Options, s Settings) Options {
 func OptionsFromAPI(r api.RebalanceOptions) Options {
 	return Options{Databases: r.Databases, MaxConcurrentMoves: r.MaxConcurrentMoves, Strategy: r.Strategy, Threshold: r.Threshold,
 		DrainOnly: r.DrainOnly, MaxMovesPerServer: r.MaxMovesPerServer, AcknowledgeFailures: r.AcknowledgeFailures,
-		CleanupDelaySeconds: r.CleanupDelaySeconds}
+		CleanupDelaySeconds: r.CleanupDelaySeconds, Force: r.Force}
 }
 
 // validateNew checks the members of the options that contract 0.15.0 added.

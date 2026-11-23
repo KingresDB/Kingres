@@ -232,3 +232,51 @@ func TestTheLagQueryReadsOnlyPhysicalStandbys(t *testing.T) {
 		t.Fatalf("a standby without a replayed position: %d, want -1", n)
 	}
 }
+
+// A manual start is refused with group_degraded while a standby lags by more than the limit, unless the request says force; a drain, an
+// automatic run and a cluster that wants no standbys are not asked.
+func TestAManualStartIsRefusedWhileAStandbyLagsUnlessForced(t *testing.T) {
+	ctx := context.Background()
+	lag := int64(65 << 20)
+	s, e := lagEnv(t, nil, nil)
+	s.StandbyLag = func(_ context.Context, g int32) (int64, error) {
+		if g == 2 {
+			return lag, nil
+		}
+		return 0, nil
+	}
+	manual := Options{Trigger: TriggerManual}
+	err := s.manualLagGate(ctx, manual, false)
+	var p *problem.Problem
+	if !errors.As(err, &p) || p.Code != problem.GroupDegraded || !strings.Contains(p.Detail, "[2]") {
+		t.Fatalf("a lagging group: %v", err)
+	}
+	for name, c := range map[string]struct {
+		o     Options
+		drain bool
+	}{
+		"force":     {Options{Trigger: TriggerManual, Force: true}, false},
+		"a drain":   {manual, true},
+		"automatic": {Options{Trigger: TriggerAutomatic}, false},
+	} {
+		if err := s.manualLagGate(ctx, c.o, c.drain); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	lag = 64 << 20 // exactly the limit is allowed
+	if err := s.manualLagGate(ctx, manual, false); err != nil {
+		t.Errorf("at the limit: %v", err)
+	}
+	// a primary that cannot be asked cannot show that its standby is in step
+	s.StandbyLag = func(context.Context, int32) (int64, error) { return 0, errors.New("no answer") }
+	if err := s.manualLagGate(ctx, manual, false); err == nil {
+		t.Error("unreadable lag was accepted")
+	}
+	// no standby wanted: nobody is asked
+	if _, err := e.sys.Exec(ctx, `DELETE FROM kingres.node WHERE role = 'standby'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.manualLagGate(ctx, manual, false); err != nil {
+		t.Errorf("no standbys: %v", err)
+	}
+}

@@ -364,6 +364,9 @@ func (s *Service) start(ctx context.Context, actor string, o Options, drain bool
 	if a != nil && a.State != task.Paused {
 		return task.Task{}, problem.New(problem.RebalanceInProgress, "A rebalance is already running (task "+strconv.FormatInt(a.ID, 10)+").")
 	}
+	if err := s.manualLagGate(ctx, o, drain); err != nil {
+		return task.Task{}, err
+	}
 	dbs, err := s.Backend.Databases(ctx, o)
 	if err != nil {
 		s.log().Warn("rebalance: listing the databases", "error", err)

@@ -1101,6 +1101,7 @@ func lagSQL(stat, slots string) string {
 
 func (b *PG) standbyLagOf(ctx context.Context, group int32, stat, slots string) (int64, error) {
 	var res *string
+	// extguard: kingres.internal_group_node is called on the system database (where the extension is installed), not on a user database; it has no presence check.
 	err := b.with(ctx, sysdb.Database, func(c *pgx.Conn) error {
 		var node int32
 		if err := c.QueryRow(ctx, `SELECT kingres.internal_group_node($1)`, group).Scan(&node); err != nil {

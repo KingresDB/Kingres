@@ -20,6 +20,8 @@ type RebalanceOptions struct {
 	AcknowledgeFailures bool `json:"acknowledgeFailures,omitempty"`
 	// CleanupDelaySeconds overrides the orphan delay for the run.
 	CleanupDelaySeconds int `json:"cleanupDelaySeconds,omitempty"`
+	// Force starts a manual run although a standby lags by more than maxStandbyLagBytes (contract 0.21.0).
+	Force bool `json:"force,omitempty"`
 }
 
 // RebalancePlanRequest is the body of previewRebalancePlan.

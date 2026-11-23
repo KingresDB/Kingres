@@ -760,3 +760,39 @@ func (l *lagStreak) observe(lagging bool) bool {
 }
 
 func (l *lagStreak) reset() { l.mu.Lock(); l.n = 0; l.mu.Unlock() }
+
+// manualLagGate is the rule "group without a healthy standby" for a manual start (design 8.3, marked (M)): a start, or the resumption of a
+// stopped run, is refused with group_degraded while a group has a standby that is behind its primary by more than maxStandbyLagBytes
+// (the limit of a start, as for the automatic mode), unless the request says force. A drain has its own refusals and the automatic mode its
+// own rule; nothing is read when no standby is wanted.
+func (s *Service) manualLagGate(ctx context.Context, o Options, drain bool) error {
+	if o.Force || drain || o.Trigger != TriggerManual {
+		return nil
+	}
+	nodes, err := s.readNodes(ctx)
+	if err != nil {
+		return asProblem(err)
+	}
+	standbys := map[int32]int{}
+	primaries := map[int32]bool{}
+	replicas := 0
+	for _, n := range nodes {
+		if n.Active && n.Role == "standby" {
+			standbys[n.Group]++
+		}
+		if n.Active && n.Role == "primary" {
+			primaries[n.Group] = true
+		}
+	}
+	for _, c := range standbys {
+		replicas = max(replicas, c)
+	}
+	if replicas == 0 {
+		return nil
+	}
+	if g := s.laggingGroups(ctx, primaries, 1); len(g) > 0 {
+		return problem.New(problem.GroupDegraded, fmt.Sprintf(
+			"Shard group %v has a standby that is behind its primary by more than maxStandbyLagBytes (or whose lag cannot be read); moves would copy through a group that is not protected. Wait until it has caught up, or start again with force.", g))
+	}
+	return nil
+}

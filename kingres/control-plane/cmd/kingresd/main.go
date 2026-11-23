@@ -374,7 +374,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 			deps.MapFailover = foDeps.mf
 		}
 		if rbs != nil {
-			wireMapGroupHandOver(rbs, fos)
+			wireMapGroupHandOver(rbs, fos, faultHook)
 		}
 	}
 	// The signing keys of the ledger and the scheduler that runs their jobs on the manager leader.

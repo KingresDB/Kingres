@@ -89,6 +89,7 @@ func TestDrainHandsOverTheMapGroup(t *testing.T) {
 	if rep["outcome"] != "completed" {
 		t.Fatalf("the first rebalance: %v", rep)
 	}
+	until(t, 2*time.Minute, "the first rebalance to have ended", func() bool { return rbStatus(old)["state"] == "idle" })
 	if primaryBuckets(t, old)[old.Host] == 0 {
 		t.Fatalf("the map group server owns no bucket: %v", primaryBuckets(t, old))
 	}
@@ -192,6 +193,7 @@ func TestDrainWhoseSwitchoverOfTheMapGroupIsGivenUpFailsAndLeavesTheServerDraini
 		t.Fatalf("the standby of the map group is on %q", views[0].server)
 	}
 	waitReport(t, old, clustertest.TaskID(old.Expect(202, "POST", "/rebalance", nil)), 10*time.Minute)
+	until(t, 2*time.Minute, "the first rebalance to have ended", func() bool { return rbStatus(old)["state"] == "idle" })
 	nw.SetFaults(fault.Spec{FailoverPoint: "promote:unavailable", FailoverMode: "unavailable"})
 	defer nw.Heal()
 	body := old.Expect(202, "POST", "/servers/"+old.Host+"/drain", map[string]any{})
@@ -314,4 +316,132 @@ func TestAutomaticRebalanceWaitsForAStandbyThatLags(t *testing.T) {
 	if want := rows + 8001; total != want {
 		t.Errorf("%d rows after the run, want %d", total, want)
 	}
+}
+
+// A manual start is refused with group_degraded while a standby lags by more than maxStandbyLagBytes (the same code as the automatic rule), and goes
+// on with force: true.
+func TestManualRebalanceRefusesAStandbyThatLagsUnlessForced(t *testing.T) {
+	const rows = 300
+	c := p10Cluster(t, "rb", 12, rows, append([]string{"-rebalance-retry-backoff", "1s"}, standbyArgs...))
+	waitStandbys(t, c, 1)
+	l := c.Leader()
+	until(t, 3*time.Minute, "every standby to be registered in the catalog", func() bool {
+		var n int
+		err := l.ServicePG("rb").QueryRow(context.Background(), `SELECT count(*) FROM kingres.node WHERE role = 'standby' AND is_active`).Scan(&n)
+		return err == nil && n >= len(c.Nodes)
+	})
+	var g int
+	if err := l.ServicePG("rb").QueryRow(context.Background(), `SELECT group_id FROM kingres.bucket_map GROUP BY group_id ORDER BY count(*) DESC LIMIT 1`).Scan(&g); err != nil {
+		t.Fatal(err)
+	}
+	views := topology(t, l)[g]
+	if len(views) == 0 {
+		t.Fatalf("group %d has no standby: %v", g, topology(t, l))
+	}
+	sc := standbyConn(t, nodeOf(c, views[0].server), g, views[0].port, "postgres")
+	if _, err := sc.Exec(context.Background(), `SELECT pg_wal_replay_pause()`); err != nil {
+		t.Fatal(err)
+	}
+	resumed := false
+	resume := func() {
+		if !resumed {
+			resumed = true
+			if _, err := sc.Exec(context.Background(), `SELECT pg_wal_replay_resume()`); err != nil {
+				t.Errorf("resuming the replay: %v", err)
+			}
+		}
+	}
+	defer resume()
+	l.Expect(200, "PATCH", "/settings/cluster", map[string]any{"rebalance": map[string]any{"maxStandbyLagBytes": 1 << 20}})
+	if _, err := l.ServicePG("rb").Exec(context.Background(), `INSERT INTO items SELECT g, repeat('x', 800) FROM generate_series(100000, 108000) g`); err != nil {
+		t.Fatal(err)
+	}
+	st, p := l.Do("POST", "/rebalance", nil, nil)
+	if st != 409 || p["code"] != "group_degraded" {
+		t.Fatalf("a manual start while a standby lags: %d %v", st, p)
+	}
+	if st := rbStatus(l); st["state"] != "idle" {
+		t.Fatalf("a run exists after the refusal: %v", st)
+	}
+	if st, p := l.Do("POST", "/rebalance", map[string]any{"force": false}, nil); st != 409 || p["code"] != "group_degraded" {
+		t.Fatalf("force false: %d %v", st, p)
+	}
+	body := l.Expect(202, "POST", "/rebalance", map[string]any{"force": true})
+	rep := waitReport(t, l, clustertest.TaskID(body), 10*time.Minute)
+	if rep["outcome"] != "completed" {
+		t.Fatalf("the forced run: %v", rep)
+	}
+	resume()
+}
+
+// The server that runs the map group dies while the drain asks for the switchover (the marker says requesting; the request is held at a fault point and
+// then kingresd and the instances of the server are killed by pid): the map group is failed over by an operator, and the drain ends cleanly on the new
+// leader, done or failed with a reason, with no marker left and the rebalance lock free.
+func TestDrainWhoseServerDiesWhileTheMapGroupIsHandedOver(t *testing.T) {
+	c := p10d4Cluster(t, 300)
+	old := c.Leader()
+	views := topology(t, old)[0]
+	if len(views) == 0 {
+		t.Fatalf("the map group has no standby: %v", topology(t, old))
+	}
+	cand := nodeOf(c, views[0].server)
+	if cand == nil || cand == old {
+		t.Fatalf("the standby of the map group is on %q", views[0].server)
+	}
+	var other *clustertest.Node
+	for _, n := range c.Nodes {
+		if n != old && n != cand {
+			other = n
+		}
+	}
+	waitReport(t, old, clustertest.TaskID(old.Expect(202, "POST", "/rebalance", nil)), 10*time.Minute)
+	until(t, 2*time.Minute, "the first rebalance to have ended", func() bool { return rbStatus(old)["state"] == "idle" })
+	waitFacts(t, old, 0)
+	old.SetFaults(fault.Spec{FailoverPoint: "drain:handover", FailoverMode: "hold"})
+	id := clustertest.TaskID(old.Expect(202, "POST", "/servers/"+old.Host+"/drain", map[string]any{}))
+	markerState := func(n *clustertest.Node) string {
+		conn := n.ServicePG("kingres_system")
+		defer func() { _ = conn.Close(context.Background()) }()
+		var s string
+		if err := conn.QueryRow(context.Background(), `SELECT coalesce((SELECT value->>'state' FROM kingres_cp.cluster_setting WHERE key = 'drain.mapHandover'), '')`).Scan(&s); err != nil {
+			return ""
+		}
+		return s
+	}
+	until(t, 20*time.Minute, "the marker to say requesting", func() bool { return markerState(old) == "requesting" })
+	foKillServer(old)
+
+	m := &mapCluster{c: c, old: old, cand: cand, other: other, survivors: []*clustertest.Node{cand, other}}
+	m.request(t, other)
+	fid := m.recordedTask(t)
+	cand.WaitTaskDone(fid, 12*time.Minute)
+
+	var task map[string]any
+	defer func() {
+		if t.Failed() {
+			_, rb := cand.Do("GET", "/rebalance", nil, nil)
+			t.Logf("drain task %v: %v\nrebalance status: %v", id, task, rb)
+			t.Logf("new leader log: %s", quietLogWithout(cand.LogTail(90000), "\"msg\":\"request\""))
+		}
+	}()
+	until(t, 45*time.Minute, "the drain to end on the new leader", func() bool {
+		st, b := cand.Do("GET", fmt.Sprintf("/tasks/%v", id), nil, nil)
+		if st != 200 {
+			return false
+		}
+		task = b
+		s, _ := b["state"].(string)
+		return s == "done" || s == "failed" || s == "cancelled"
+	})
+	if s := markerState(cand); s != "" {
+		t.Errorf("the marker says %q after the drain ended", s)
+	}
+	if st := rbStatus(cand); st["state"] == "running" || st["state"] == "stopping" || st["state"] == "stopped" {
+		t.Errorf("the drain still holds the rebalance: %v", st)
+	}
+	// the lock is free: a rebalance is not refused because of an unfinished one
+	if st, p := cand.Do("POST", "/rebalance", nil, nil); st == 409 && p["code"] == "rebalance_in_progress" {
+		t.Errorf("a rebalance is refused after the drain ended: %v", p)
+	}
+	t.Logf("the drain ended %v: %v", task["state"], task["error"])
 }

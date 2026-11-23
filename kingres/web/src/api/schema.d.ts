@@ -2171,7 +2171,7 @@ export interface paths {
          *     removes or detaches a server); `failover_in_progress` (these two also when the other task is created at the same moment: the check and the creation are one step in the system database, so a rebalance and a server operation are never both created); `version_mismatch` (the servers do not run the same
          *     version of the sharding extension and the same PostgreSQL major); `cluster_inconsistent` (`kingres.check_cluster()`
          *     reports something that makes moving unsafe; the detail names it); `no_receiving_server` (no server should hold
-         *     shards); `nothing_to_rebalance` (the plan is empty). The same conditions are checked again before every move; one
+         *     shards); `nothing_to_rebalance` (the plan is empty); `group_degraded` (0.21.0: a group has a standby that is behind its primary by more than `maxStandbyLagBytes`, or whose lag cannot be read; `force: true` overrides this and only this). The same conditions are checked again before every move; one
          *     that stops holding stops the run (`stopped`, `stoppedBy` `safetyRule`) instead of failing it. Returns 503
          *     (`map_group_unavailable`) while the map group is failing over.
          */
@@ -6243,6 +6243,8 @@ export interface components {
             acknowledgeFailures?: boolean;
             /** @description Added in 0.15.0. Overrides, for this run, the delay before the source copy of a moved bucket is dropped. */
             cleanupDelaySeconds?: number;
+            /** @description Added in 0.21.0. Starts a manual run although a group has a standby that is behind its primary by more than `maxStandbyLagBytes` (409 `group_degraded` without it). It lifts only that refusal, and only for this start; the guard of a run that is going on and the automatic mode do not read it. */
+            force?: boolean;
         };
         /** @description Added in 0.15.0. Body of `drainServer`; every member is optional. */
         DrainRequest: {

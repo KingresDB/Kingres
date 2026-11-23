@@ -381,6 +381,8 @@ None.
 - `RebalanceAutomatic.lastEvaluation.blockedBy` `groupDegraded` also names a group whose standby is behind its primary by more than `rebalance.maxStandbyLagBytes` (default 64 MiB) when a run is started or resumed; inside a run the lag has to be over twice the limit on three evaluations in a row (the run's own writes make the standbys lag for a while); a pause of a run by this rule
   is the same `stoppedBy: safetyRule` as for the other rules.
 
+- `RebalanceOptions.force` (boolean, optional): a manual start (`startRebalance`) is refused with 409 `group_degraded` while a group has a standby that is behind its primary by more than `maxStandbyLagBytes` or whose lag cannot be read, unless `force` is true; it lifts only that refusal.
+
 #### Documentation
 
 - `drainServer`: 409 `server_hosts_map_group` is now only for a server that runs the primary of the map group when no other server runs a standby of it (before: always).

@@ -348,6 +348,10 @@ func (s *Service) stepDrainStandbys(ctx context.Context, env *task.Env, _ *PGRow
 	}
 	deadline := time.Now().Add(s.drainWait())
 	for {
+		// A server that died during the drain cannot give up its instances (they cannot be removed or rebuilt): the wait would run to its bound.
+		if s.ServerStatus != nil && s.ServerStatus(ctx, o.DrainServer) == "dead" {
+			return problem.New(problem.NodeStateInvalid, "Server "+o.DrainServer+" died during the drain, so its standbys cannot be moved. Fail it over first, then remove it.")
+		}
 		left, err := s.RelocateStandbys(ctx, o.DrainServer, false)
 		if err != nil {
 			return err
