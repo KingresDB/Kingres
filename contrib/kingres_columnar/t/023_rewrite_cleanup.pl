@@ -518,7 +518,8 @@ COMMIT;");
 		  SELECT rel_uid, stripe_id, first_row, row_count, chunk_groups, natts, first_block, block_count,
 		         blob_len, raw_bytes, footer_offset, cid_points, col_stats
 		    FROM kingres.columnar_stripe_new;
-		DROP TABLE kingres.columnar_stripe_new;");
+		DROP TABLE kingres.columnar_stripe_new;
+		ALTER EXTENSION kingres_columnar ADD TABLE kingres.columnar_stripe;");
 	is(q1("SELECT count(*) FROM pg_attribute WHERE attrelid = 'kingres.columnar_stripe'::regclass AND attnum > 0 AND NOT attisdropped"),
 		13, 'the catalog now has the 13 columns of the earlier build');
 

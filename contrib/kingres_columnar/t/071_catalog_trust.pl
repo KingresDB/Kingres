@@ -102,7 +102,7 @@ like($err, qr/cannot be used: it is not a member of the extension/, 'C: ... the 
 	ROLLBACK;
 });
 isnt($rc, 0, 'C: a member table of another shape is refused');
-like($err, qr/cannot be used: it does not have the columns of the catalog|is not a member/, 'C: ... the error says why') or diag($err);
+like($err, qr/the stripe catalog has 1 columns|is not a member/, 'C: ... the error says why') or diag($err);
 unlike($err, qr/server closed the connection|terminated/i, 'C: ... and no crash');
 ($rc, $out, $err) = as_super('postgres', q{INSERT INTO c VALUES (100, 'x'); SELECT count(*) FROM c});
 is($rc, 0, 'C: the real catalog works') or diag($err);

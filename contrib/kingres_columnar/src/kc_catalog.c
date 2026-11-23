@@ -132,8 +132,6 @@ kc_catalog_check(Oid extoid, Oid nspoid, Oid catoid, Oid idxoid)
 	cls = (Form_pg_class) GETSTRUCT(tup);
 	if (cls->relkind != RELKIND_RELATION)
 		what = "it is not an ordinary table";
-	else if (cls->relnatts != Natts_kc_stripe && cls->relnatts != Natts_kc_stripe_v01)
-		what = "it does not have the columns of the catalog";
 	ReleaseSysCache(tup);
 	return what;
 }
