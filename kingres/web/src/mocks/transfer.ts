@@ -38,27 +38,27 @@ const MAX_ATOMIC = 2 * GiB
 /** A reference table is written on every group, so the server lowers the cap of one import to 256 MiB. */
 const MAX_ATOMIC_REFERENCE = 256 * MiB
 
-function db(s: MockState, name: string): DbRec {
+export function db(s: MockState, name: string): DbRec {
   const rec = s.databases.find((d) => d.info.name === name)
   if (!rec) throw problem('not_found', `Database "${name}" does not exist.`)
   return rec
 }
 
-function settings(s: MockState): S['DataTransferSettings'] {
+export function settings(s: MockState): S['DataTransferSettings'] {
   const d = s.settings.dataTransfer
   if (!d) throw new Error('The mock cluster has no data transfer settings.')
   return d
 }
 
 /** The guards every transfer operation has: the transport and the cluster setting. */
-function guard(s: MockState): void {
+export function guard(s: MockState): void {
   if (transferSwitches.insecure)
     throw problem('insecure_transport', 'The request did not arrive over TLS.')
   if (!settings(s).enabled)
     throw problem('data_transfer_disabled', 'The data transfer is turned off for this cluster.')
 }
 
-function me(s: MockState): string {
+export function me(s: MockState): string {
   return s.session?.username ?? 'admin'
 }
 
@@ -79,17 +79,22 @@ const subjectOf = (c: Ctx): string =>
 export type ColumnsOf = (rec: DbRec, t: Table) => string[]
 
 /** Bytes reserved in the staging area: the declared size of every upload and the size of every export. */
-function reserved(s: MockState): number {
+export function reserved(s: MockState): number {
   let sum = 0
   for (const u of s.transfer.uploads) sum += u.upload.sizeBytes
   for (const e of s.transfer.exports) sum += e.meta.sizeBytes ?? 4 * MiB
   return sum
 }
 
-const isTransfer = (kind: string): boolean => kind === 'table.export' || kind === 'table.import'
+const isTransfer = (kind: string): boolean =>
+  kind === 'table.export' || kind === 'table.import' || kind === 'database.export'
 
-function checkConcurrency(s: MockState, subject: string): void {
+export function checkConcurrency(s: MockState, subject: string): void {
   const busy = s.tasks.filter((t) => t.task.state === 'running' && isTransfer(t.task.kind))
+  // A database export holds the structure of its database: a table task of the database is refused while it runs (and the reverse).
+  const dbOf = subject.split('/')[0]
+  if (busy.some((t) => t.task.kind === 'database.export' && t.task.subject?.id === dbOf))
+    throw problem('operation_in_progress', 'A database export is running in this database.')
   if (busy.some((t) => t.task.subject?.id === subject))
     throw problem('operation_in_progress', 'A transfer of this table is running.')
   if (busy.length >= settings(s).maxConcurrent)
@@ -118,7 +123,7 @@ function ownExport(c: Ctx): ExportRec {
   return e
 }
 
-function ownUpload(c: Ctx): UploadRec {
+export function ownUpload(c: Ctx): UploadRec {
   const u = c.s.transfer.uploads.find((x) => x.upload.uploadId === c.params.uploadId)
   if (!u || u.creator !== me(c.s)) throw problem('not_found', 'The upload does not exist.')
   return u
@@ -395,6 +400,10 @@ export function transferHandlers(columnsOf: ColumnsOf): Partial<Record<Operation
       if (errors.length) throw validationFailed(errors)
       const u = s.transfer.uploads.find((x) => x.upload.uploadId === b.uploadId)
       if (!u || u.creator !== me(s)) throw problem('not_found', 'The upload does not exist.')
+      if (u.purpose !== 'tableImport')
+        throw validationFailed([
+          { field: 'uploadId', message: 'This upload is a database archive, not a CSV file.' },
+        ])
       if (u.upload.state !== 'complete')
         throw problem('upload_incomplete', 'The upload has not received all its bytes.')
       if (t.name === FIXTURE_TABLES.blockme)
@@ -474,8 +483,8 @@ export function transferHandlers(columnsOf: ColumnsOf): Partial<Record<Operation
       guard(s)
       const b = body<S['CreateDataUploadRequest']>(c)
       const errors: Field[] = []
-      if (b.purpose !== 'tableImport')
-        errors.push({ field: 'purpose', message: 'Use tableImport.' })
+      if (b.purpose !== 'tableImport' && b.purpose !== 'databaseArchive')
+        errors.push({ field: 'purpose', message: 'Use tableImport or databaseArchive.' })
       if (!Number.isInteger(b.sizeBytes) || b.sizeBytes < 1)
         errors.push({
           field: 'sizeBytes',
@@ -501,6 +510,8 @@ export function transferHandlers(columnsOf: ColumnsOf): Partial<Record<Operation
         },
         creator: me(s),
         fileName: b.fileName ?? null,
+        purpose: b.purpose,
+        report: null,
         data: b.sizeBytes <= KEEP_BYTES ? [] : null,
         usedBy: null,
       }
@@ -513,7 +524,8 @@ export function transferHandlers(columnsOf: ColumnsOf): Partial<Record<Operation
 
     getDataUpload: (c) => {
       guard(c.s)
-      return ok(structuredClone(ownUpload(c).upload))
+      const u = ownUpload(c)
+      return ok(structuredClone({ ...u.upload, report: u.report }))
     },
 
     uploadDataChunk: async (c): Promise<Reply> => {
@@ -693,16 +705,18 @@ export function transferHandlers(columnsOf: ColumnsOf): Partial<Record<Operation
       const slice = all.slice(first, last + 1)
       const tag =
         sw.changeEtagOnResume && sw.downloadRequests > 1 ? hex64('other') : (e.meta.sha256 ?? '')
-      const ext = e.meta.format === 'csv.gz' ? 'csv.gz' : 'csv'
+      const archive = e.meta.format === 'archive/1'
+      const ext = archive ? 'kdx.zip' : e.meta.format === 'csv.gz' ? 'csv.gz' : 'csv'
       const headers: Record<string, string> = {
-        'Content-Type':
-          e.meta.format === 'csv.gz'
+        'Content-Type': archive
+          ? 'application/zip'
+          : e.meta.format === 'csv.gz'
             ? 'application/gzip'
             : `text/csv; charset=${charsetOf(e.encoding)}`,
         'Content-Length': String(slice.length),
         'Accept-Ranges': 'bytes',
         ETag: `"${tag}"`,
-        'Content-Disposition': `attachment; filename="${e.meta.database}-${e.meta.table}.${ext}"`,
+        'Content-Disposition': `attachment; filename="${archive ? e.meta.database : `${e.meta.database}-${e.meta.table}`}.${ext}"`,
         'Cache-Control': 'no-store',
         'X-Content-Type-Options': 'nosniff',
         ...(partial ? { 'Content-Range': `bytes ${first}-${last}/${size}` } : {}),

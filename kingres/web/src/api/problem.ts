@@ -524,6 +524,41 @@ const entries: Record<ProblemCode, Entry> = {
       'The table is owned by another role, and reading it runs an expression (a generated column or a row-level security policy) that calls a function owned by a role that is neither you nor a superuser. Export only if you trust that code.',
     withDetail: true,
   },
+  export_not_readable: {
+    tone: 'warning',
+    heading: 'The role cannot read the whole database',
+    message:
+      'An archive holds every table, so the signed-in role needs USAGE on every schema and SELECT on every table. The detail names the first objects it cannot read. Nothing was written. Ask the owner for the privileges, or sign in as a role that has them.',
+    withDetail: true,
+  },
+  large_objects_present: {
+    tone: 'warning',
+    heading: 'The database has large objects',
+    message:
+      'Large objects, and columns of the types oid and reg*, are not carried by an archive: their numbers do not mean anything in another database. Export anyway only if you accept that they are lost; the archive will say so in its warnings.',
+    withDetail: true,
+  },
+  schema_unrecognised: {
+    tone: 'warning',
+    heading: 'The schema has something an archive does not carry',
+    message:
+      'The database uses an object kind that an archive does not hold (a function, a trigger, a policy, a rule, an unlogged table and others). The detail names the kind. Such a database is a job for pg_dump and pg_restore.',
+    withDetail: true,
+  },
+  archive_invalid: {
+    tone: 'danger',
+    heading: 'The archive is not valid',
+    message:
+      'The file is not an archive this version made, or it was damaged or changed. The report of the validation says what is wrong.',
+    withDetail: true,
+  },
+  archive_incompatible: {
+    tone: 'warning',
+    heading: 'The archive does not fit this cluster',
+    message:
+      'The versions, the locale or the extensions of the archive cannot be used here. The reasons are listed.',
+    withDetail: true,
+  },
   chain_not_diverged: {
     tone: 'info',
     heading: 'This chain has not diverged',

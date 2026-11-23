@@ -30,8 +30,8 @@ describe('labels', () => {
     // 0.11.0 added eight: ledger.key.create, .rotate, .retire, .revoke, .distribute, ledger.bundle.create, ledger.epoch.start
     // and ledger.upgrade: 31.
     // 0.14.0 added table.undistribute, table.alter and table.partition: 34.
-    // 0.15.0 added bucket.split, schema.distribute, schema.move and schema.undistribute: 38; 0.17.0 added database.approximateAggregates, table.setStorage and partition.maintain: 41; 0.19.0 added table.export and table.import: 43; transferStagingLow: 43 alert kinds.
-    expect(Object.keys(TASK_KIND_LABEL)).toHaveLength(43)
+    // 0.15.0 added bucket.split, schema.distribute, schema.move and schema.undistribute: 38; 0.17.0 added database.approximateAggregates, table.setStorage and partition.maintain: 41; 0.19.0 added table.export and table.import: 43; transferStagingLow: 43 alert kinds; 0.40.0 added database.export and archive.validate: 45 task kinds.
+    expect(Object.keys(TASK_KIND_LABEL)).toHaveLength(45)
   })
   it('shows an unknown kind as sent', () => {
     expect(alertKindLabel('somethingNew')).toBe('somethingNew')
