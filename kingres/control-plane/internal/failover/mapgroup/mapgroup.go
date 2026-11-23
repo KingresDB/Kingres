@@ -521,7 +521,15 @@ func (r *Runner) pin(ctx context.Context, j journal.Journal) (bool, error) {
 			return false, failover.Fail(failover.CodeLeaseLost, true, "the lease of the map group could not be handed to %s", pinned.Server)
 		}
 		cur, _ := r.Journal.Current()
-		if err := r.P.Continue(ctx, pinned.Server, cur); err != nil {
+		if err := r.P.Continue(ctx, pinned.Server, cur); failover.IsCode(err, "conflict") {
+			// P3: another bootstrap of this term is in progress on the better candidate (an operator's request, or its own monitor): this one gives up instead of
+			// repeating a call that cannot succeed. The lease it handed over lapses or is used by that bootstrap; nothing was promoted here.
+			_ = r.Journal.Event(journal.StepPin, "handOverRefused", map[string]any{"to": pinned.Server, "error": err.Error()})
+			if aerr := r.Journal.AbandonUnpromoted("another bootstrap of this term runs on " + pinned.Server); aerr != nil {
+				return false, aerr
+			}
+			return false, failover.Fail(failover.CodeSwitchoverUnproven, false, "another bootstrap of the map group is in progress on %s; this one was given up", pinned.Server)
+		} else if err != nil {
 			return false, fmt.Errorf("asking %s to continue the bootstrap: %w", pinned.Server, err)
 		}
 		_ = r.Journal.Event(journal.StepPin, "handedOver", map[string]any{"to": pinned.Server})

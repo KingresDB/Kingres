@@ -55,6 +55,7 @@ type world struct {
 	plannedDL                 [][]byte
 	fenceRefusals             int   // the fence lease is refused this many times (the old leader still holds it)
 	plannedErr                error // RecordPlanned answers this
+	continueErr               error // Continue answers this
 }
 
 func newWorld() *world {
@@ -198,7 +199,7 @@ func (p ports) FreezeLocal(context.Context, time.Duration) error {
 }
 func (p ports) Continue(_ context.Context, s string, j journal.Journal) error {
 	p.w.rec("continue %s id=%s", s, j.ID)
-	return nil
+	return p.w.continueErr
 }
 func (p ports) Catalog() failover.Catalog { return fcat{p.w} }
 func (p ports) PauseRebalance(context.Context) (int, error) {

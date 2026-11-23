@@ -312,3 +312,19 @@ func TestAMissingRowOfTheOldLeadersTaskPausesTheBootstrap(t *testing.T) {
 		t.Fatalf("event %v recorded %v", found, cur.Recorded)
 	}
 }
+
+// P3. The better candidate already runs another bootstrap of this term (its Continue answers a conflict): this bootstrap gives up and says so, and promotes nothing.
+func TestABootstrapWhoseHandOverMeetsAnotherBootstrapGivesUp(t *testing.T) {
+	w := hardWorld()
+	w.pos["s3"] = failover.Position{Server: "s3", InRecovery: true, Timeline: 1, ReceiveLsn: "0/6000000", ReplayLsn: "0/6000000", SystemIdentifier: "9"}
+	w.continueErr = &failover.CallError{Status: 409, Code: "conflict", Message: "another bootstrap of this term is in progress"}
+	r, js := w.runner(t)
+	_, err := r.Run(context.Background(), hardRequest())
+	var fe *failover.Error
+	if !errors.As(err, &fe) || fe.Retryable {
+		t.Fatalf("want a final failure: %v", err)
+	}
+	if js.Active() || w.count("promote ") != 0 {
+		t.Fatalf("active %v:\n%s", js.Active(), strings.Join(w.log, "\n"))
+	}
+}
