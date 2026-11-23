@@ -62,3 +62,24 @@ func TestTheIdleRefreshNeverKeepsTheWatchdogFileOfARelinquishedGroupAlive(t *tes
 		t.Fatal("the end of the hold must give the group back to the plan")
 	}
 }
+
+// M1. The record of the candidate of a hand-over is not moved to another server while it exists.
+func TestTheRecordedCandidateIsNotOverwrittenByAnotherServer(t *testing.T) {
+	r := newRig(t, []string{"a", "b", "c"}, true)
+	if err := r.m.RecordCandidate(1, "b"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.m.RecordCandidate(1, "b"); err != nil {
+		t.Fatalf("the same again: %v", err)
+	}
+	if err := r.m.RecordCandidate(1, "c"); err == nil {
+		t.Fatal("another server replaced the record")
+	}
+	if got := r.m.Candidate(1); got != "b" {
+		t.Fatalf("the record: %q", got)
+	}
+	r.m.ForgetCandidate(1)
+	if err := r.m.RecordCandidate(1, "c"); err != nil {
+		t.Fatalf("after the record was forgotten: %v", err)
+	}
+}

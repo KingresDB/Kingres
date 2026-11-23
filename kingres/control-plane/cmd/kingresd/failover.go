@@ -890,6 +890,8 @@ type immediateManager interface {
 
 type fenceLeases interface {
 	RecordCandidate(group int32, server string) error
+	Candidate(group int32) string
+	ForgetCandidate(group int32)
 	Relinquish(group int32) error
 	Transfer(ctx context.Context, group int32, to string) (lease.TransferResult, error)
 }
@@ -900,12 +902,17 @@ type fenceLeases interface {
 // instance is stopped with an immediate shutdown. (4) Only when it is seen stopped is the lease handed to the server the call names: a primary that is still running
 // keeps a lease that is no longer renewed, which runs out and takes the primary with it (the watchdog), and nobody else holds it before that.
 func fencedStop(ctx context.Context, mgr immediateManager, lm fenceLeases, fh *fault.Hook, log *slog.Logger, id int, r failover.DemoteRequest) (any, error) {
+	wrote := false
 	if r.Group == 0 && r.Candidate != "" {
+		wrote = lm.Candidate(0) == ""
 		if err := lm.RecordCandidate(0, r.Candidate); err != nil {
 			return nil, err
 		}
 	}
 	if err := lm.Relinquish(r.Group); err != nil {
+		if wrote {
+			lm.ForgetCandidate(0) // nothing was changed: the record must not outlive the call that made it
+		}
 		return nil, err
 	}
 	out := failover.DemoteAnswer{}

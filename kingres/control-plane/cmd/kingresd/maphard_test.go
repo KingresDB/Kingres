@@ -27,6 +27,7 @@ type fenceWorld struct {
 	candErr   error
 	transErr  error
 	granted   int
+	cand      string
 }
 
 func (f *fenceWorld) StopImmediate(context.Context, int) error {
@@ -38,6 +39,9 @@ func (f *fenceWorld) StopImmediate(context.Context, int) error {
 }
 func (f *fenceWorld) Running(context.Context, int) (bool, error) { return f.running, nil }
 func (f *fenceWorld) RecordCandidate(_ int32, s string) error {
+	if f.candErr == nil {
+		f.cand = s
+	}
 	f.calls = append(f.calls, "candidate "+s)
 	return f.candErr
 }
@@ -188,5 +192,37 @@ func TestOnlyAHardFailoverOfALiveLeadersServerIsInProgress(t *testing.T) {
 	_, _ = js.SetPlanned(journal.Planned{TaskID: 7, StandbyID: 3, Hard: true})
 	if !m.runner.HardInProgress("s1") || m.runner.HardInProgress("s0") {
 		t.Fatal("HardInProgress")
+	}
+}
+
+func (f *fenceWorld) Candidate(int32) string { return f.cand }
+func (f *fenceWorld) ForgetCandidate(int32) {
+	f.calls = append(f.calls, "forget")
+	f.cand = ""
+}
+
+// M1. A record that names another server is not overwritten (the real manager refuses it), nothing is stopped; a record this call wrote is removed when the
+// marker cannot be written.
+func TestAFencedStopDoesNotMoveARecordedCandidateAndDoesNotLeaveItsOwn(t *testing.T) {
+	w := &fenceWorld{running: true, granted: 2, cand: "s3", candErr: errors.New("handed to s3 already")}
+	if _, err := runFence(t, w, failover.DemoteRequest{Group: 0, Mode: "immediate", TransferTo: "s2", Candidate: "s2"}); err == nil {
+		t.Fatal("a different candidate was accepted")
+	}
+	for _, c := range w.calls {
+		if c == "stop" || c == "relinquish" {
+			t.Fatalf("something was done after the refusal: %v", w.calls)
+		}
+	}
+	w = &fenceWorld{running: true, relErr: errors.New("disk full")}
+	if _, err := runFence(t, w, failover.DemoteRequest{Group: 0, Mode: "immediate", TransferTo: "s2", Candidate: "s2"}); err == nil {
+		t.Fatal("no error")
+	}
+	if w.cand != "" {
+		t.Fatalf("the record outlived the failed call: %q", w.cand)
+	}
+	w = &fenceWorld{running: true, relErr: errors.New("disk full"), cand: "s2"}
+	_, _ = runFence(t, w, failover.DemoteRequest{Group: 0, Mode: "immediate", TransferTo: "s2", Candidate: "s2"})
+	if w.cand != "s2" {
+		t.Fatal("a record of an earlier attempt was removed by a call that did not write it")
 	}
 }
