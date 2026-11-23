@@ -6,8 +6,11 @@ package rebalance
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -92,16 +95,140 @@ func TestNoLagIsReadWithoutStandbys(t *testing.T) {
 	}
 }
 
-// The guard that runs before each move of an automatic run stops it on a lagging standby, with the rule in the text.
-func TestTheGuardStopsAnAutomaticRunOnALaggingStandby(t *testing.T) {
-	s, _ := lagEnv(t, map[int32]int64{1: 200 << 20}, nil)
-	err := s.autoGuard(context.Background(), Options{})
+// M3. Inside a run the limit is twice the setting and the guard pauses on the third lagging evaluation in a row, not on the first.
+func TestTheGuardPausesAnAutomaticRunOnlyOnThreeEvaluationsOverTwiceTheLimit(t *testing.T) {
+	ctx := context.Background()
+	const limit = int64(64 << 20)
+	lag := int64(100 << 20) // over the limit of a start, under twice it
+	s, _ := lagEnv(t, nil, nil)
+	s.StandbyLag = func(_ context.Context, g int32) (int64, error) {
+		if g == 1 {
+			return lag, nil
+		}
+		return 0, nil
+	}
+	for i := 0; i < 5; i++ {
+		if err := s.autoGuard(ctx, Options{}); err != nil {
+			t.Fatalf("a lag of %d under twice the limit %d paused the run at evaluation %d: %v", lag, limit, i, err)
+		}
+	}
+	// a start (facts at the plain limit) does see it
+	if f := facts(t, s); len(f.GroupsLagging) != 1 {
+		t.Fatalf("at the start the limit is the setting: %v", f.GroupsLagging)
+	}
+	lag = 3 * limit
+	for i := 0; i < 2; i++ {
+		if err := s.autoGuard(ctx, Options{}); err != nil {
+			t.Fatalf("paused at evaluation %d of 3: %v", i, err)
+		}
+	}
+	err := s.autoGuard(ctx, Options{})
 	var p *problem.Problem
 	if !errors.As(err, &p) || !strings.Contains(p.Detail, RuleDegraded) {
-		t.Fatalf("the guard: %v", err)
+		t.Fatalf("the third evaluation: %v", err)
 	}
-	s.StandbyLag = func(context.Context, int32) (int64, error) { return 0, nil }
-	if err := s.autoGuard(context.Background(), Options{}); err != nil {
-		t.Fatalf("in step: %v", err)
+	// the row starts again after the pause, and a clean evaluation ends a row
+	lag = 0
+	for i := 0; i < 5; i++ {
+		if err := s.autoGuard(ctx, Options{}); err != nil {
+			t.Fatalf("in step: %v", err)
+		}
+	}
+	lag = 3 * limit
+	_ = s.autoGuard(ctx, Options{})
+	_ = s.autoGuard(ctx, Options{})
+	lag = 0
+	_ = s.autoGuard(ctx, Options{})
+	lag = 3 * limit
+	if err := s.autoGuard(ctx, Options{}); err != nil {
+		t.Fatalf("a clean evaluation did not end the row: %v", err)
+	}
+}
+
+// M3. The groups are asked at the same time: a source that waits for the others to be asked too would wait for ever one group at a time.
+func TestTheLagOfTheGroupsIsReadInParallel(t *testing.T) {
+	s, _ := lagEnv(t, nil, nil)
+	var arrived atomic.Int32
+	s.StandbyLag = func(ctx context.Context, g int32) (int64, error) {
+		arrived.Add(1)
+		deadline := time.Now().Add(5 * time.Second)
+		for arrived.Load() < 3 {
+			if time.Now().After(deadline) {
+				return 0, errors.New("the other groups were not asked at the same time")
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		return 0, nil
+	}
+	if f := facts(t, s); len(f.GroupsLagging) != 0 {
+		t.Fatalf("lagging %v: the groups were asked one after the other", f.GroupsLagging)
+	}
+}
+
+// M2. The query reads the physical standbys only: a base backup, a logical walsender and a sender without a slot are ignored; a standby that
+// has no replayed position yet is unreadable (-1, lagging); no sender is no lag. The views are given as tables of the same columns.
+func TestTheLagQueryReadsOnlyPhysicalStandbys(t *testing.T) {
+	e, _ := newGuardEnv(t)
+	ctx := context.Background()
+	for _, q := range []string{
+		`CREATE TABLE fake_stat (pid int, state text, replay_lsn pg_lsn)`,
+		`CREATE TABLE fake_slots (active_pid int, slot_type text)`,
+	} {
+		if _, err := e.sys.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := func() int64 {
+		t.Helper()
+		var out string
+		if err := e.sys.QueryRow(ctx, lagSQL("fake_stat", "fake_slots")).Scan(&out); err != nil {
+			t.Fatal(err)
+		}
+		n, err := strconv.ParseInt(out, 10, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	add := func(pid int, state, replay, slotType string) {
+		t.Helper()
+		r := "NULL"
+		if replay != "" {
+			r = replay
+		}
+		if _, err := e.sys.Exec(ctx, fmt.Sprintf(`INSERT INTO fake_stat VALUES (%d, '%s', %s)`, pid, state, r)); err != nil {
+			t.Fatal(err)
+		}
+		if slotType != "" {
+			if _, err := e.sys.Exec(ctx, fmt.Sprintf(`INSERT INTO fake_slots VALUES (%d, '%s')`, pid, slotType)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if n := read(); n != 0 {
+		t.Fatalf("no sender: %d", n)
+	}
+	behind := `(pg_current_wal_lsn() - 5000000)`
+	add(1, "streaming", behind, "physical")
+	if n := read(); n < 5000000 || n > 6000000 {
+		t.Fatalf("a standby 5 MB behind: %d", n)
+	}
+	// ignored: a base backup, a logical walsender, a sender with no slot, a state that is not catching up or streaming
+	add(2, "backup", "NULL::pg_lsn", "physical")
+	add(3, "streaming", "'0/0'::pg_lsn", "logical")
+	add(4, "streaming", "'0/0'::pg_lsn", "")
+	add(5, "startup", "NULL::pg_lsn", "physical")
+	if n := read(); n < 5000000 || n > 6000000 {
+		t.Fatalf("senders that are not standbys were read: %d", n)
+	}
+	// the largest lag of the physical standbys
+	add(6, "catchup", `(pg_current_wal_lsn() - 20000000)`, "physical")
+	if n := read(); n < 20000000 || n > 21000000 {
+		t.Fatalf("two standbys: %d", n)
+	}
+	// a standby that streams and has no replayed position: unreadable
+	add(7, "streaming", "NULL::pg_lsn", "physical")
+	if n := read(); n != -1 {
+		t.Fatalf("a standby without a replayed position: %d, want -1", n)
 	}
 }

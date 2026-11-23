@@ -44,7 +44,7 @@ func wireStandbyRelocation(rbs *rebalance.Service, l *standby.Leader, o *ops.Ops
 		defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
 		return read(ctx, c)
 	}
-	rbs.RelocateStandbys = func(ctx context.Context, server string) (int, error) {
+	rbs.RelocateStandbys = func(ctx context.Context, server string, force bool) (int, error) {
 		c, err := svc.ServiceConn(ctx, sysdb.Database)
 		if err != nil {
 			return 0, err
@@ -52,12 +52,13 @@ func wireStandbyRelocation(rbs *rebalance.Service, l *standby.Leader, o *ops.Ops
 		defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
 		set := read(ctx, c)
 		// The standby that a planned switchover of the map group made of the old leader (its former primary is rebuilt as a standby by the
-		// reconcile) is not taken out of the ring before it is ready: an instance that is still being rebuilt cannot be removed, only finished.
+		// reconcile) is not taken out of the ring before it is ready: an instance that is still being rebuilt cannot be removed, only finished. Only the states that can still
+		// become ready count (a failed or a removing row does not hold the drain); force (the bound has passed with acceptFewerReplicas) takes it out anyway.
 		var rebuilding int
-		if err := c.QueryRow(ctx, `SELECT count(*)::int FROM kingres_cp.standby WHERE server_id = $1 AND group_id = 0 AND state <> 'ready'`, server).Scan(&rebuilding); err != nil {
+		if err := c.QueryRow(ctx, `SELECT count(*)::int FROM kingres_cp.standby WHERE server_id = $1 AND group_id = 0 AND state IN ('creating', 'rebuilding')`, server).Scan(&rebuilding); err != nil {
 			return 0, err
 		}
-		if !set[server] && rebuilding == 0 {
+		if !set[server] && (rebuilding == 0 || force) {
 			set[server] = true
 			list := make([]string, 0, len(set))
 			for s := range set {

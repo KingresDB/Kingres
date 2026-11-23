@@ -188,3 +188,48 @@ func TestTheWatchResumesAMarkerThatWasLeftBehind(t *testing.T) {
 		t.Fatalf("resumed %v: %v", ok, err)
 	}
 }
+
+// M1. A marker that says requesting, with a failover that began after it and has ended (the record of started could not be made because the
+// system database of the old leader stopped), is resumed, and the marker is turned into started so that the step fails if the server still
+// runs the map group (the switchover was rolled back).
+func TestTheWatchResumesARequestingMarkerWhoseFailoverHasEnded(t *testing.T) {
+	s, e := resumeEnv(t, &MapHandover{State: HandoverRequesting, Server: "a", Attempt: "x"})
+	ctx := context.Background()
+	if ok, err := s.ResumeDrain(ctx); err != nil || ok {
+		t.Fatalf("resumed %v with no failover at all: %v", ok, err)
+	}
+	if _, err := e.sys.Exec(ctx, `INSERT INTO kingres_cp.task (kind, state, subject_type, subject_id, created_by) VALUES ('server.failover', 'done', 'server', 'a', 'admin')`); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.ResumeDrain(ctx); err != nil || !ok {
+		t.Fatalf("resumed %v: %v", ok, err)
+	}
+	if m, _ := (sysHandover{s}).Get(ctx); m == nil || m.State != HandoverStarted || m.Attempt != "x" {
+		t.Fatalf("the marker: %+v", m)
+	}
+}
+
+// M1. A failover that began before the marker does not count.
+func TestAFailoverThatEndedBeforeTheMarkerIsNotTheOnesOfTheRequest(t *testing.T) {
+	s, e := resumeEnv(t, nil)
+	ctx := context.Background()
+	if _, err := e.sys.Exec(ctx, `INSERT INTO kingres_cp.task (kind, state, subject_type, subject_id, created_by) VALUES ('server.failover', 'done', 'server', 'a', 'admin')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := (sysHandover{s}).Put(ctx, MapHandover{TaskID: e.id, State: HandoverRequesting, Server: "a"}); err != nil {
+		t.Fatal(err)
+	}
+	if m, _ := (sysHandover{s}).Get(ctx); m == nil || m.FailoverEnded {
+		t.Fatalf("an older failover counts: %+v", m)
+	}
+}
+
+// L4. A drain that is cancelled or fails (also while paused for the hand-over) leaves no marker.
+func TestTheMarkerIsClearedWhenTheDrainFailsOrIsCancelled(t *testing.T) {
+	s, e := resumeEnv(t, &MapHandover{State: HandoverStarted, Server: "a"})
+	ctx := context.Background()
+	s.onFail(ctx, task.Task{ID: e.id, Error: &task.Error{Code: task.CodeCanceled, Message: "cancelled"}})
+	if m, err := (sysHandover{s}).Get(ctx); err != nil || m != nil {
+		t.Fatalf("the marker stays after the cancel: %+v %v", m, err)
+	}
+}

@@ -56,6 +56,17 @@ func p10d4Leader(t *testing.T, c *clustertest.Cluster, not string) *clustertest.
 	return found
 }
 
+// quietLogWithout is quietLog without the lines that contain skip (the polling of the test and a repeated warning).
+func quietLogWithout(log, skip string) string {
+	var out []string
+	for _, l := range strings.Split(quietLog(log), "\n") {
+		if !strings.Contains(l, skip) {
+			out = append(out, l)
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
 func taskSteps(body map[string]any) map[string]string {
 	out := map[string]string{}
 	prog, _ := body["progress"].(map[string]any)
@@ -90,15 +101,23 @@ func TestDrainHandsOverTheMapGroup(t *testing.T) {
 	}
 
 	w := p10WriteTries(t, c.Nodes[1], "rb", 3_000_000, 1800)
+	var nl *clustertest.Node
+	var id any
 	defer func() {
 		if t.Failed() {
-			t.Logf("old leader log: %s", quietLog(old.LogTail(60000)))
+			t.Logf("old leader log: %s", quietLogWithout(old.LogTail(60000), "checking the instance"))
+			if nl != nil {
+				_, tk := nl.Do("GET", fmt.Sprintf("/tasks/%v", id), nil, nil)
+				_, rb := nl.Do("GET", "/rebalance", nil, nil)
+				t.Logf("task %v on the new leader: %v\nrebalance status: %v", id, tk, rb)
+				t.Logf("new leader log: %s", quietLogWithout(nl.LogTail(90000), "\"msg\":\"request\""))
+			}
 		}
 	}()
 	body := old.Expect(202, "POST", "/servers/"+old.Host+"/drain", map[string]any{})
-	id := clustertest.TaskID(body)
+	id = clustertest.TaskID(body)
 
-	nl := p10d4Leader(t, c, old.Host)
+	nl = p10d4Leader(t, c, old.Host)
 	var task map[string]any
 	until(t, 25*time.Minute, "the drain to end on the new manager leader", func() bool {
 		st, b := nl.Do("GET", fmt.Sprintf("/tasks/%v", id), nil, nil)

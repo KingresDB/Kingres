@@ -47,3 +47,25 @@ func TestALaggingStandbyBlocksTheRunLikeADegradedGroup(t *testing.T) {
 		t.Fatalf("both: %v", got)
 	}
 }
+
+// M3. Inside a run the guard pauses only on the third lagging evaluation in a row; a clean one ends the row.
+func TestLagStreak(t *testing.T) {
+	var l lagStreak
+	seq := []struct {
+		lagging bool
+		pause   bool
+	}{{true, false}, {true, false}, {false, false}, {true, false}, {true, false}, {true, true}, {true, false}, {true, false}, {true, true}}
+	for i, c := range seq {
+		if got := l.observe(c.lagging); got != c.pause {
+			t.Fatalf("evaluation %d: pause %v, want %v", i, got, c.pause)
+		}
+	}
+	l.observe(true)
+	l.reset()
+	if l.observe(true) || l.observe(true) {
+		t.Fatal("a reset starts the row again")
+	}
+	if lagRunFactor != 2 || lagRunStreak != 3 {
+		t.Fatalf("the rule of design 8.3 is twice the limit on three evaluations: %d %d", lagRunFactor, lagRunStreak)
+	}
+}

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/audit"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
 )
@@ -19,6 +20,8 @@ import (
 type memHandover struct {
 	mu sync.Mutex
 	m  *MapHandover
+	// failPut, when set, can refuse a record.
+	failPut func(MapHandover) error
 }
 
 func (h *memHandover) Get(context.Context) (*MapHandover, error) {
@@ -33,6 +36,11 @@ func (h *memHandover) Get(context.Context) (*MapHandover, error) {
 func (h *memHandover) Put(_ context.Context, m MapHandover) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.failPut != nil {
+		if err := h.failPut(m); err != nil {
+			return err
+		}
+	}
 	h.m = &m
 	return nil
 }
@@ -64,7 +72,10 @@ func TestDecideHandover(t *testing.T) {
 		{"not hosted, marker started", mk(HandoverStarted), false, handoverDone, ""},
 		{"hosted, no marker", nil, true, handoverRequest, ""},
 		{"hosted, marker of another task", &MapHandover{TaskID: 3, State: HandoverStarted}, true, handoverRequest, ""},
-		{"hosted, requested (leader ended before the pause)", mk(HandoverRequested), true, handoverRequest, ""},
+		{"hosted, requested a moment ago (a request is on its way)", mk(HandoverRequested), true, handoverWait, ""},
+		{"hosted, requesting a moment ago", mk(HandoverRequesting), true, handoverWait, ""},
+		{"hosted, requested long ago (the leader ended before the call)", &MapHandover{TaskID: 7, State: HandoverRequested, Age: handoverGrace + time.Second}, true, handoverRequest, ""},
+		{"hosted, requesting long ago", &MapHandover{TaskID: 7, State: HandoverRequesting, Age: handoverGrace + time.Second}, true, handoverRequest, ""},
 		{"hosted, started and back (rolled back)", mk(HandoverStarted), true, handoverFail, "server_hosts_map_group"},
 		{"hosted, refused with a code", &MapHandover{TaskID: 7, State: HandoverRefused, Code: "no_replica_available", Message: "none"}, true, handoverFail, "no_replica_available"},
 		{"hosted, refused without a code", mk(HandoverRefused), true, handoverFail, "server_hosts_map_group"},
@@ -93,6 +104,9 @@ func TestHandoverReady(t *testing.T) {
 		{"requested just now", MapHandover{State: HandoverRequested, Age: time.Second}, false},
 		{"requested exactly at the grace", MapHandover{State: HandoverRequested, Age: handoverGrace}, false},
 		{"requested long ago", MapHandover{State: HandoverRequested, Age: handoverGrace + time.Second}, true},
+		{"requesting just now", MapHandover{State: HandoverRequesting, Age: time.Second}, false},
+		{"requesting, a failover that began after it has ended", MapHandover{State: HandoverRequesting, Age: time.Second, FailoverEnded: true}, true},
+		{"requested, a failover that began after it has ended", MapHandover{State: HandoverRequested, Age: time.Second, FailoverEnded: true}, true},
 		{"unknown", MapHandover{State: "x", Age: time.Hour}, false},
 	} {
 		if got := handoverReady(&c.m); got != c.want {
@@ -153,6 +167,8 @@ type handoverEnv struct {
 	hosts bool
 	asked []string
 	err   error
+	// block holds the hook until it is closed.
+	block chan struct{}
 }
 
 func newHandoverEnv(t *testing.T) *handoverEnv {
@@ -161,6 +177,9 @@ func newHandoverEnv(t *testing.T) *handoverEnv {
 	h.s = &Service{Handover: h.store, DrainPoll: time.Millisecond,
 		HostsMapGroup: func(context.Context, string) (bool, error) { h.mu.Lock(); defer h.mu.Unlock(); return h.hosts, nil },
 		HandOverMapGroup: func(_ context.Context, actor, server string) error {
+			if h.block != nil {
+				<-h.block
+			}
 			h.mu.Lock()
 			defer h.mu.Unlock()
 			h.asked = append(h.asked, actor+"@"+server)
@@ -297,7 +316,8 @@ func TestHandOverWaitsForThePauseAndRefusesWhenThereIsNone(t *testing.T) {
 	// a task that is pending (never runs): no pause comes
 	tk, _ := h.eng.Submit(ctx, Kind, task.Subject{Type: SubjectType, ID: SubjectID}, input{}, "admin")
 	done := make(chan struct{})
-	go func() { h.s.handOverAfter(tk.ID, "a", "admin"); close(done) }()
+	_ = h.store.Put(ctx, MapHandover{TaskID: tk.ID, Server: "a", State: HandoverRequested, Attempt: "mine"})
+	go func() { h.s.handOverAfter(tk.ID, "a", "admin", "mine"); close(done) }()
 	time.Sleep(300 * time.Millisecond)
 	if a := h.askedNow(); len(a) != 0 {
 		t.Fatalf("asked while the drain was not paused: %v", a)
@@ -330,4 +350,168 @@ func contains(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+func (h *handoverEnv) submit(t *testing.T) task.Task {
+	t.Helper()
+	tk, err := h.eng.Submit(context.Background(), Kind, task.Subject{Type: SubjectType, ID: SubjectID}, input{}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tk
+}
+
+// M1. The record that the switchover was asked for cannot be made (the system database of the old leader is going away): the request was made once,
+// the marker says requesting, and nothing is asked again.
+func TestAMarkerThatCannotBeRecordedAsStartedLeavesRequesting(t *testing.T) {
+	old := handoverPutPause
+	handoverPutPause = time.Millisecond
+	defer func() { handoverPutPause = old }()
+	h := newHandoverEnv(t)
+	ctx := context.Background()
+	puts := 0
+	h.store.failPut = func(m MapHandover) error {
+		if m.State == HandoverStarted {
+			puts++
+			return errors.New("the system database is stopped")
+		}
+		return nil
+	}
+	h.s.BGFn = func() context.Context { return ctx }
+	tk := h.submit(t)
+	if err := h.eng.RunNow(ctx, tk.ID, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the switchover to be asked for", func() bool { return len(h.askedNow()) == 1 })
+	waitFor(t, "the tries to record it", func() bool { return puts == 5 })
+	if st := h.store.state(); st != HandoverRequesting {
+		t.Fatalf("the marker says %q, want requesting", st)
+	}
+	if a := h.askedNow(); len(a) != 1 {
+		t.Fatalf("asked %v", a)
+	}
+}
+
+// M1. The marker says requesting before the hook is called, and the audit event comes after the record of started.
+func TestTheMarkerSaysRequestingWhileTheSwitchoverIsBeingAskedFor(t *testing.T) {
+	h := newHandoverEnv(t)
+	ctx := context.Background()
+	h.block = make(chan struct{})
+	h.s.BGFn = func() context.Context { return ctx }
+	var events []string
+	h.s.Audit = func(_ context.Context, ev audit.Event) {
+		st := h.store.state()
+		h.mu.Lock()
+		events = append(events, ev.Action+"/"+st)
+		h.mu.Unlock()
+	}
+	tk := h.submit(t)
+	if err := h.eng.RunNow(ctx, tk.ID, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "requesting", func() bool { return h.store.state() == HandoverRequesting })
+	close(h.block)
+	waitFor(t, "started", func() bool { return h.store.state() == HandoverStarted })
+	waitFor(t, "the audit event", func() bool { h.mu.Lock(); defer h.mu.Unlock(); return len(events) == 1 })
+	if events[0] != "rebalance.mapGroupHandover/started" {
+		t.Fatalf("the event was written when the marker said otherwise: %v", events)
+	}
+}
+
+// L1. A manual resume of the paused drain while the request is on its way makes no second request: the step pauses again.
+func TestAManualResumeWhileTheRequestIsOnItsWayAsksOnce(t *testing.T) {
+	h := newHandoverEnv(t)
+	ctx := context.Background()
+	h.block = make(chan struct{})
+	h.s.BGFn = func() context.Context { return ctx }
+	tk := h.submit(t)
+	if err := h.eng.RunNow(ctx, tk.ID, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "requesting", func() bool { return h.store.state() == HandoverRequesting })
+	m, _ := h.store.Get(ctx)
+	first := m.Attempt
+	if first == "" {
+		t.Fatal("the marker has no attempt")
+	}
+	if err := h.eng.Resume(ctx, tk.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.eng.RunNow(ctx, tk.ID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := h.eng.Get(ctx, tk.ID); got.State != task.Paused {
+		t.Fatalf("the drain is %s after the manual resume, want paused again", got.State)
+	}
+	if m, _ := h.store.Get(ctx); m.Attempt != first || m.State != HandoverRequesting {
+		t.Fatalf("the manual resume changed the marker: %+v", m)
+	}
+	close(h.block)
+	waitFor(t, "started", func() bool { return h.store.state() == HandoverStarted })
+	if a := h.askedNow(); len(a) != 1 {
+		t.Fatalf("asked %d times", len(a))
+	}
+}
+
+// L1. The step does not overwrite a young marker of the same task that says requested; it makes no goroutine.
+func TestTheStepKeepsAYoungRequestedMarker(t *testing.T) {
+	h := newHandoverEnv(t)
+	ctx := context.Background()
+	h.s.BGFn = func() context.Context { return ctx }
+	tk := h.submit(t)
+	_ = h.store.Put(ctx, MapHandover{TaskID: tk.ID, Server: "a", State: HandoverRequested, Attempt: "first"})
+	if err := h.eng.RunNow(ctx, tk.ID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := h.eng.Get(ctx, tk.ID); got.State != task.Paused {
+		t.Fatalf("the drain is %s", got.State)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if m, _ := h.store.Get(ctx); m.Attempt != "first" || m.State != HandoverRequested {
+		t.Fatalf("the marker was overwritten: %+v", m)
+	}
+	if a := h.askedNow(); len(a) != 0 {
+		t.Fatalf("asked %v", a)
+	}
+}
+
+// L1. A goroutine of an earlier attempt asks for nothing once the marker carries another attempt (or is gone).
+func TestTheGoroutineOfAnEarlierAttemptAsksForNothing(t *testing.T) {
+	h := newHandoverEnv(t)
+	ctx := context.Background()
+	h.s.BGFn = func() context.Context { return ctx }
+	tk := h.submit(t)
+	if err := h.eng.RunNow(ctx, tk.ID, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "started", func() bool { return h.store.state() == HandoverStarted })
+	_ = h.store.Put(ctx, MapHandover{TaskID: tk.ID, Server: "a", State: HandoverRequested, Attempt: "second"})
+	h.s.handOverAfter(tk.ID, "a", "admin", "first")
+	if a := h.askedNow(); len(a) != 1 {
+		t.Fatalf("asked %v", a)
+	}
+	if m, _ := h.store.Get(ctx); m.Attempt != "second" || m.State != HandoverRequested {
+		t.Fatalf("the old goroutine changed the marker: %+v", m)
+	}
+	_ = h.store.Clear(ctx)
+	h.s.handOverAfter(tk.ID, "a", "admin", "second")
+	if a := h.askedNow(); len(a) != 1 {
+		t.Fatalf("asked after the marker was gone: %v", a)
+	}
+}
+
+// L4. The marker of a task is cleared when the task ends, and only the marker of that task.
+func TestClearHandoverRemovesOnlyTheMarkerOfTheTask(t *testing.T) {
+	ctx := context.Background()
+	h := &memHandover{}
+	s := &Service{Handover: h}
+	_ = h.Put(ctx, MapHandover{TaskID: 5, State: HandoverStarted})
+	s.clearHandover(ctx, 6)
+	if h.state() != HandoverStarted {
+		t.Fatal("the marker of another task was removed")
+	}
+	s.clearHandover(ctx, 5)
+	if h.state() != "" {
+		t.Fatal("the marker of the task stays")
+	}
 }

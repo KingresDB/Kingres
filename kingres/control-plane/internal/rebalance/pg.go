@@ -1085,6 +1085,21 @@ func (b *PG) maxCallWait() time.Duration {
 // any of its connected standbys has replayed; 0 when none is connected (the missing standby is the business of the other rules). The
 // primary of the group answers, through the node call of the map group's connection.
 func (b *PG) StandbyLag(ctx context.Context, group int32) (int64, error) {
+	return b.standbyLagOf(ctx, group, "pg_catalog.pg_stat_replication", "pg_catalog.pg_replication_slots")
+}
+
+// lagSQL reads the lag on a primary. Only the physical standbys count: the walsenders whose slot is physical (the reconcile gives every standby
+// one) and that are catching up or streaming; a base backup (state backup), a logical walsender and a sender without a slot are ignored. A
+// standby that is catching up or streaming and has no replayed position yet is unreadable: the answer is -1, which counts as lagging. A
+// standby that is fed by another standby (cascading) is not a sender of this primary and is not seen. stat and slots name the two views (a
+// test gives tables of the same columns).
+func lagSQL(stat, slots string) string {
+	return `SELECT CASE WHEN bool_or(w.replay_lsn IS NULL) THEN -1 ELSE coalesce(max(pg_wal_lsn_diff(pg_current_wal_lsn(), w.replay_lsn)), 0) END::bigint::text
+		FROM ` + stat + ` w JOIN ` + slots + ` s ON s.active_pid = w.pid AND s.slot_type = 'physical'
+		WHERE w.state IN ('catchup', 'streaming')`
+}
+
+func (b *PG) standbyLagOf(ctx context.Context, group int32, stat, slots string) (int64, error) {
 	var res *string
 	err := b.with(ctx, sysdb.Database, func(c *pgx.Conn) error {
 		var node int32
@@ -1092,7 +1107,7 @@ func (b *PG) StandbyLag(ctx context.Context, group int32) (int64, error) {
 			return err
 		}
 		var err error
-		res, err = onNode(ctx, c, node, `SELECT coalesce(max(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)), 0)::bigint::text FROM pg_stat_replication`)
+		res, err = onNode(ctx, c, node, lagSQL(stat, slots))
 		return err
 	})
 	if err != nil {
@@ -1105,5 +1120,5 @@ func (b *PG) StandbyLag(ctx context.Context, group int32) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("the lag of shard group %d is not a number: %w", group, err)
 	}
-	return max(n, 0), nil
+	return n, nil
 }

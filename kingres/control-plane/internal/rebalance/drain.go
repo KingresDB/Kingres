@@ -348,7 +348,7 @@ func (s *Service) stepDrainStandbys(ctx context.Context, env *task.Env, _ *PGRow
 	}
 	deadline := time.Now().Add(s.drainWait())
 	for {
-		left, err := s.RelocateStandbys(ctx, o.DrainServer)
+		left, err := s.RelocateStandbys(ctx, o.DrainServer, false)
 		if err != nil {
 			return err
 		}
@@ -357,8 +357,12 @@ func (s *Service) stepDrainStandbys(ctx context.Context, env *task.Env, _ *PGRow
 		}
 		if time.Now().After(deadline) {
 			if o.AcceptFewerReplicas {
+				// the server leaves the ring whatever is left (a standby that is still being rebuilt is given up): the drain ends with fewer standbys
+				if _, err := s.RelocateStandbys(ctx, o.DrainServer, true); err != nil {
+					return err
+				}
 				if env != nil {
-					_ = env.SetDetail(ctx, fmt.Sprintf("%d standbys stay on %s: no other server can take them", left, o.DrainServer))
+					_ = env.SetDetail(ctx, fmt.Sprintf("acceptFewerReplicas: %d standby copies could not be moved off %s or made again elsewhere before the bound; the drain ends with fewer standbys", left, o.DrainServer))
 				}
 				return nil
 			}
