@@ -108,6 +108,8 @@ type entryWriter struct {
 	closed bool
 	// usizeLie is a test hook: the size that the descriptor and the central record say, when a test needs an entry that lies about its size.
 	usizeLie *uint64
+	// junk is a test hook: bytes written after the deflate stream and counted in the compressed size.
+	junk []byte
 }
 
 // compressedSink counts the compressed bytes that the deflate writer hands to the destination.
@@ -199,6 +201,11 @@ func (e *entryWriter) Close() error {
 	w := e.w
 	if err := e.fw.Close(); err != nil {
 		return err
+	}
+	if len(e.junk) > 0 {
+		if _, err := (compressedSink{e}).Write(e.junk); err != nil {
+			return err
+		}
 	}
 	usize := e.usize
 	if e.usizeLie != nil {

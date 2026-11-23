@@ -211,6 +211,17 @@ func corpus() []corpusCase {
 			ents[3].gapAfter = []byte("hidden")
 			return rawArchive(t, ents, rawOpts{})
 		}, Limits{}},
+		{"hidden bytes between the last entry and the central directory", inv, func(t testing.TB) []byte {
+			ents := goodRaw(t, nil)
+			ents[len(ents)-1].gapAfter = []byte("hidden")
+			return rawArchive(t, ents, rawOpts{})
+		}, Limits{}},
+		{"junk inside the compressed extent after the deflate stream", inv, func(t testing.TB) []byte {
+			ents := goodRaw(t, nil)
+			ents[4].junk = []byte("junkjunk")
+			return rawArchive(t, ents, rawOpts{})
+		}, Limits{}},
+		{"end record claims a comment that the file lacks", inv, patch(func(t testing.TB, b []byte, l located) { binary.LittleEndian.PutUint16(b[len(b)-2:], 9) }), Limits{}},
 		{"hidden bytes after the central directory", inv, func(t testing.TB) []byte {
 			return rawArchive(t, goodRaw(t, nil), rawOpts{beforeEnd: []byte("hidden")})
 		}, Limits{}},
@@ -394,5 +405,26 @@ func TestZip64CorpusSample(t *testing.T) {
 	b = rawArchive(t, goodRaw(t, nil), rawOpts{force64: true})
 	if _, err := validate(b, Limits{}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// The extent check on its own: a central record that says an entry starts anywhere but where the one before it ended is refused by the check of the
+// extents itself, not only by what is read afterwards.
+func TestExtentsRefuseAMovedOffset(t *testing.T) {
+	b, _ := buildGood(t, nil)
+	c := ctx{ra: bytes.NewReader(b), size: int64(len(b))}
+	ents, cdOff, err := c.directory(Limits{MaxEntries: MaxEntries})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.extents(ents, cdOff); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []int64{-1, 1, 30} {
+		moved := append([]central(nil), ents...)
+		moved[5].offset = uint64(int64(moved[5].offset) + d)
+		if err := c.extents(moved, cdOff); err == nil {
+			t.Errorf("an offset moved by %d was accepted", d)
+		}
 	}
 }

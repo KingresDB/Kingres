@@ -137,6 +137,7 @@ type raw struct {
 	name     string
 	data     []byte
 	lieUsize *uint64 // what the descriptor and the central record say, when it is not the truth
+	junk     []byte  // bytes inside the compressed extent after the end of the deflate stream
 	gapAfter []byte  // bytes between this entry and the next that no record accounts for
 }
 
@@ -189,6 +190,7 @@ func rawArchive(t testing.TB, ents []raw, o rawOpts) []byte {
 		if _, err := e.Write(r.data); err != nil {
 			t.Fatal(err)
 		}
+		e.junk = r.junk
 		if r.lieUsize != nil {
 			e.usizeLie = r.lieUsize
 		}
