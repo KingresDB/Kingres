@@ -21,6 +21,7 @@ import (
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/archive"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/dumpnorm"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 )
 
 // dbTable is a user table of the database.
@@ -136,6 +137,10 @@ func hasTable(ctx context.Context, tx pgx.Tx, rel string) bool {
 
 // readDBFacts reads the catalogs. tx is a transaction of the service role on the database.
 func readDBFacts(ctx context.Context, tx pgx.Tx) (*dbFacts, error) {
+	// The names of this session are those of the catalog and nothing a database owner set with ALTER DATABASE ... SET search_path.
+	if _, err := tx.Exec(ctx, "SET LOCAL search_path = pg_catalog"); err != nil {
+		return nil, err
+	}
 	f := &dbFacts{byOID: map[int64]*dbTable{}, Colocs: map[int]*dbColoc{}, UserPart: map[int64][]dbPartition{}, PartKey: map[int64]string{}, Buckets: map[int64]bool{}, Hash: map[string]dumpnorm.HashTable{}}
 	if err := tx.QueryRow(ctx, `SELECT pg_encoding_to_char(encoding), datcollate, datctype, CASE datlocprovider WHEN 'c' THEN 'builtin' WHEN 'i' THEN 'icu' ELSE 'libc' END,
 			(current_setting('server_version_num')::int / 10000)
@@ -229,23 +234,46 @@ func readDBFacts(ctx context.Context, tx pgx.Tx) (*dbFacts, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	if hasTable(ctx, tx, "kingres.dist_table") {
+	// Nothing in the schema kingres is read or called before extguard has shown that it belongs to the extension that is named: the service role is a superuser
+	// and a database owner can make a schema of that name with views and functions of its own. An untrusted schema is a refusal, an absent extension is not.
+	guard := extguard.NewGuard(tx)
+	if err := f.checkFixedSchemas(ctx, tx, guard); err != nil {
+		return nil, err
+	}
+	use := func(ext, rel string) (bool, error) {
+		info, err := guard.Verify(ctx, ext)
+		if err != nil {
+			return false, err
+		}
+		return info.Present && hasTable(ctx, tx, rel), nil
+	}
+	if ok, err := use(extguard.Shard, "kingres.dist_table"); err != nil {
+		return nil, err
+	} else if ok {
 		if err := f.readDistribution(ctx, tx); err != nil {
 			return nil, err
 		}
 	}
-	if hasTable(ctx, tx, "kingres.ledger_table") {
+	if ok, err := use(extguard.Ledger, "kingres.ledger_table"); err != nil {
+		return nil, err
+	} else if ok {
 		if err := f.readLedger(ctx, tx); err != nil {
 			return nil, err
 		}
 	}
-	if hasTable(ctx, tx, "kingres.timepart_policy_data") {
+	if ok, err := use(extguard.Timepart, "kingres.timepart_policy_data"); err != nil {
+		return nil, err
+	} else if ok {
 		if err := f.readPolicies(ctx, tx); err != nil {
 			return nil, err
 		}
 	}
 	for _, t := range f.Tables {
 		if t.AM == "columnar" {
+			// A table of the columnar access method needs the extension; the call below is the extension's own function.
+			if _, err := guard.Require(ctx, extguard.Columnar); err != nil {
+				return nil, err
+			}
 			if err := f.readColumnar(ctx, tx); err != nil {
 				return nil, err
 			}
@@ -261,6 +289,13 @@ func readDBFacts(ctx context.Context, tx pgx.Tx) (*dbFacts, error) {
 	if err := tx.QueryRow(ctx, `SELECT count(*)::int8 FROM pg_largeobject_metadata`).Scan(&f.LargeObjects); err != nil {
 		return nil, err
 	}
+	// A name with a dot is ambiguous in "schema.table" (the manifest and the catalog write names so): it is refused instead of guessed.
+	for _, t := range f.Tables {
+		if strings.Contains(t.Schema, ".") || strings.Contains(t.Name, ".") {
+			f.Unsupported = append(f.Unsupported, "name with a dot: a schema or a table")
+			break
+		}
+	}
 	sort.Strings(f.OIDColumns)
 	return f, nil
 }
@@ -270,6 +305,45 @@ func boolText(b bool, s string) string {
 		return s
 	}
 	return ""
+}
+
+// checkFixedSchemas refuses a database that has a schema of the name of the control plane's own (kingres, kingres_transfer) that does not belong to it: the
+// schema kingres must be owned by a superuser (extguard decides about its objects when an extension is installed, and no object may be in it when none is), and
+// the schema kingres_transfer must be owned by the service role that makes it.
+func (f *dbFacts) checkFixedSchemas(ctx context.Context, tx pgx.Tx, g *extguard.Guard) error {
+	anyExt := false
+	for _, e := range extguard.All {
+		info, err := g.Verify(ctx, e)
+		if err != nil {
+			return err
+		}
+		anyExt = anyExt || info.Present
+	}
+	var owner string
+	var super bool
+	var objects int
+	err := tx.QueryRow(ctx, `SELECT pg_get_userbyid(n.nspowner)::text, (SELECT rolsuper FROM pg_roles WHERE oid = n.nspowner),
+			(SELECT count(*) FROM pg_class WHERE relnamespace = n.oid) + (SELECT count(*) FROM pg_proc WHERE pronamespace = n.oid) + (SELECT count(*) FROM pg_type WHERE typnamespace = n.oid)
+		FROM pg_namespace n WHERE n.nspname = 'kingres'`).Scan(&owner, &super, &objects)
+	switch {
+	case err == pgx.ErrNoRows:
+	case err != nil:
+		return err
+	case !super:
+		return &extguard.UntrustedError{Extension: "kingres", Schema: "kingres", Reason: extguard.ReasonSchemaOwner, Detail: "the schema kingres is owned by a role that is not a superuser"}
+	case !anyExt && objects > 0:
+		return &extguard.UntrustedError{Extension: "kingres", Schema: "kingres", Reason: extguard.ReasonForeignObject, Detail: "the schema kingres holds objects and no extension of KingresDB is installed"}
+	}
+	var ours bool
+	err = tx.QueryRow(ctx, `SELECT n.nspowner = (SELECT oid FROM pg_roles WHERE rolname = current_user) FROM pg_namespace n WHERE n.nspname = 'kingres_transfer'`).Scan(&ours)
+	switch {
+	case err == pgx.ErrNoRows:
+	case err != nil:
+		return err
+	case !ours:
+		return &extguard.UntrustedError{Extension: "kingres", Schema: "kingres_transfer", Reason: extguard.ReasonSchemaOwner, Detail: "the schema kingres_transfer is not owned by the service role"}
+	}
+	return nil
 }
 
 func (f *dbFacts) readDistribution(ctx context.Context, tx pgx.Tx) error {

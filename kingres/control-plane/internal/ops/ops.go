@@ -135,8 +135,10 @@ type Ops struct {
 	startMu sync.Mutex
 	xferSt  *xferState
 	// dbw holds the structure of the database exports that run, vals the validations of archives that run (dbexport.go, archivevalidate.go).
-	dbw  dbWorks
-	vals validations
+	dbw dbWorks
+	// dbTaskMu makes the check "a database export runs" and the start of a table task one step (and the reverse).
+	dbTaskMu sync.Mutex
+	vals     validations
 }
 
 // SetEngine installs the task engine once the system database exists.

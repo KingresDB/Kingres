@@ -249,6 +249,9 @@ type uploadReport struct {
 	Purpose        string `json:"purpose,omitempty"`
 	// Archive is the report of the last validation of a database archive (contract 0.40.0); Source is the SHA-256 of the file that it read.
 	Archive *api.ArchiveReport `json:"archive,omitempty"`
+	// Version is the version of the validator and of the shape grammar that made Archive: a report of another version is stale and is made again. An import
+	// (phase 14c) validates the archive again whatever the state of the upload says.
+	Version string `json:"validatorVersion,omitempty"`
 }
 
 func quotaProblem(err error) error {
@@ -435,9 +438,11 @@ func (o *Ops) uploadView(x *xferState, rec transfer.Record) (api.DataUpload, err
 		out.SHA256 = &s
 	}
 	if rec.Purpose == "databaseArchive" {
-		var rep uploadReport
-		if json.Unmarshal(rec.Report, &rep) == nil && rep.Archive != nil && rep.Archive.SHA256 == rec.SHA256 {
-			out.Report = rep.Archive
+		if rep := cachedReport(rec); rep != nil {
+			out.Report = rep
+		} else if out.State == "valid" || out.State == "invalid" {
+			// The report is for other bytes or for an older validator: the upload is complete and is validated again on request.
+			out.State = "complete"
 		}
 	}
 	return out, nil

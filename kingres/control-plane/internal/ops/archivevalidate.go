@@ -22,6 +22,26 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/transfer"
 )
 
+// ValidatorVersion is the version of the validator (package archive) and of the shape grammar (package sqlshape) that the cached reports carry. Change it when
+// either changes what it accepts: every cached report is then stale. The cache says what a validation found once; an import never trusts it.
+const ValidatorVersion = "archive-1/sqlshape-1"
+
+// MaxExpansion is how many times the size of the staged file the entries of an archive may add up to (a ratio of a deflate stream cannot honestly pass about
+// 1000, and a CSV of a real table is 5 to 20); MaxEntryRatio is the same for one entry.
+const (
+	MaxExpansion  = 200
+	MaxEntryRatio = 500
+)
+
+// archiveLimits are the limits of a validation of a file of this size: the smaller of the limit of the import and MaxExpansion times the file.
+func archiveLimits(fileSize int64) archive.Limits {
+	max := int64(100) << 30
+	if m := fileSize * MaxExpansion; m < max {
+		max = m
+	}
+	return archive.Limits{MaxImportBytes: max, MaxRatio: MaxEntryRatio}
+}
+
 // Step names of archive.validate.
 const (
 	stepVCheck  = "Check the upload"
@@ -183,7 +203,7 @@ func (o *Ops) stepVCheck(ctx context.Context, env *task.Env) error {
 // cachedReport is the report that was made for these bytes, if there is one.
 func cachedReport(rec transfer.Record) *api.ArchiveReport {
 	var rep uploadReport
-	if json.Unmarshal(rec.Report, &rep) != nil || rep.Archive == nil || rec.SHA256 == "" || rep.Archive.SHA256 != rec.SHA256 {
+	if json.Unmarshal(rec.Report, &rep) != nil || rep.Archive == nil || rec.SHA256 == "" || rep.Archive.SHA256 != rec.SHA256 || rep.Version != ValidatorVersion {
 		return nil
 	}
 	return rep.Archive
@@ -202,8 +222,9 @@ func (o *Ops) readArchive(ctx context.Context, x *xferState, rec transfer.Record
 		return v
 	}
 	defer func() { _ = r.Close() }()
-	max := int64(100) << 30
-	res, err := archive.Validate(r, r.Size(), archive.Limits{MaxImportBytes: max, SQLFor: func(cat *archive.Catalog) archive.SQLChecker { return sqlChecker(catalogInheritance(cat)) }})
+	lim := archiveLimits(r.Size())
+	lim.SQLFor = func(cat *archive.Catalog) archive.SQLChecker { return sqlChecker(catalogInheritance(cat)) }
+	res, err := archive.Validate(r, r.Size(), lim)
 	if err != nil {
 		var ae *archive.Error
 		if errors.As(err, &ae) {
@@ -264,15 +285,40 @@ func (o *Ops) target(ctx context.Context) (archive.Target, error) {
 	return t, err
 }
 
+const claimedRows = "the row counts are those that the manifest claims; the records of the CSV entries were not counted"
+
+func hasText(l []string, s string) bool {
+	for _, x := range l {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+// validationOf is the validation of the file of this record: the one that an earlier step made in this process, or a new one. A failure that is not a verdict
+// about the archive (the key, the file, a cancel, a read error) fails the task: a report is never made, or cached, from a read that did not finish.
+func (o *Ops) validationOf(ctx context.Context, x *xferState, rec transfer.Record) (*validation, error) {
+	v := o.validation(rec.ID)
+	if v == nil {
+		v = o.readArchive(ctx, x, rec)
+		var ae *archive.Error
+		if v.err != nil && !errors.As(v.err, &ae) {
+			return nil, v.err
+		}
+		o.setValidation(rec.ID, v)
+	}
+	return v, nil
+}
+
 func (o *Ops) stepVPlan(ctx context.Context, env *task.Env) error {
 	_, rec, x, err := o.loadValidate(ctx, env)
 	if err != nil {
 		return err
 	}
-	v := o.validation(rec.ID)
-	if v == nil {
-		v = o.readArchive(ctx, x, rec)
-		o.setValidation(rec.ID, v)
+	v, err := o.validationOf(ctx, x, rec)
+	if err != nil {
+		return err
 	}
 	if v.report != nil || v.res == nil {
 		return nil
@@ -293,19 +339,18 @@ func (o *Ops) stepVReport(ctx context.Context, env *task.Env) error {
 	if err != nil {
 		return err
 	}
-	v := o.validation(rec.ID)
-	if v == nil || v.report == nil && v.res != nil {
-		v2 := o.readArchive(ctx, x, rec)
-		if v2.res != nil {
-			tgt, terr := o.target(ctx)
-			if terr != nil {
-				return transfer.Errorf(transfer.CodeSessionLost, true, "the service role cannot connect to this cluster now; repeat the operation")
-			}
-			reasons := append(archive.CheckCompatibility(v2.res.Manifest, tgt), archive.CheckCatalogCompatibility(v2.res.Catalog, tgt)...)
-			rep := archive.BuildReport(v2.res, reasons, tgt)
-			v2.report = &rep
+	v, err := o.validationOf(ctx, x, rec)
+	if err != nil {
+		return err
+	}
+	if v.report == nil && v.res != nil {
+		tgt, terr := o.target(ctx)
+		if terr != nil {
+			return transfer.Errorf(transfer.CodeSessionLost, true, "the service role cannot connect to this cluster now; repeat the operation")
 		}
-		v = v2
+		reasons := append(archive.CheckCompatibility(v.res.Manifest, tgt), archive.CheckCatalogCompatibility(v.res.Catalog, tgt)...)
+		rep := archive.BuildReport(v.res, reasons, tgt)
+		v.report = &rep
 	}
 	rep := v.report
 	if rep == nil {
@@ -315,9 +360,14 @@ func (o *Ops) stepVReport(ctx context.Context, env *task.Env) error {
 		rep = &r
 	}
 	rep.SHA256 = rec.SHA256
+	// The manifest says how many rows each entry has; the records of the CSV entries are not counted by a validation.
+	if rep.Valid && !hasText(rep.Warnings, claimedRows) {
+		rep.Warnings = append(rep.Warnings, claimedRows)
+	}
 	var up uploadReport
 	_ = json.Unmarshal(rec.Report, &up)
 	up.Archive = rep
+	up.Version = ValidatorVersion
 	b, _ := json.Marshal(up)
 	state := "invalid"
 	if rep.Valid {

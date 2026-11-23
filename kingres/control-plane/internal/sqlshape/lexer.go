@@ -148,7 +148,7 @@ func (l *lexer) skipComment() bool {
 				return true
 			}
 			l.adv(1)
-			if b == '\n' {
+			if b == 10 || b == 13 {
 				return true
 			}
 		}
@@ -396,7 +396,7 @@ func (l *lexer) dollar() {
 	}
 	// $tag$ or $$
 	i := 1
-	if isIdentStart(l.pk(1)) && l.pk(1) < 0x80 {
+	if isIdentStart(l.pk(1)) {
 		for isIdentPart(l.pk(i)) && l.pk(i) != '$' && i <= maxTag {
 			i++
 		}

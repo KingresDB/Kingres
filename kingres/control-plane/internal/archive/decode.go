@@ -326,6 +326,10 @@ func (c *Catalog) check() *Error {
 		case "kingres", "pg_catalog", "information_schema", "pg_toast":
 			return invalid("system_schema", t.Schema, "a table is in a schema of the system")
 		}
+		// A name is written "schema.table" in the manifest and the catalog; a dot in either part would make two tables the same text.
+		if strings.Contains(t.Schema, ".") || strings.Contains(t.Name, ".") {
+			return invalid("tables", q, "a schema or a table has a dot in its name")
+		}
 		if byName[q] != nil {
 			return invalid("tables", q, "a table is listed twice")
 		}

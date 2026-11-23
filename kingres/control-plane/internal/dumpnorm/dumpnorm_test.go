@@ -167,3 +167,13 @@ func TestSplitter(t *testing.T) {
 	}
 	_ = bucketName
 }
+
+// The splitter finds the statements that PostgreSQL finds in the corpus of the lexer (carriage returns, tags of high bytes, nested comments).
+func TestSplitterAgreesWithTheCorpus(t *testing.T) {
+	for i, c := range sqlshape.LexCorpus() {
+		n, err := CountStatements(c.SQL)
+		if err != nil || n != c.N {
+			t.Errorf("case %d %q: %d statements (%v), PostgreSQL sees %d", i, c.SQL, n, err, c.N)
+		}
+	}
+}

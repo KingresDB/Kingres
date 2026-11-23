@@ -116,7 +116,7 @@ func TestReadFactsAndDumpOfARealDatabase(t *testing.T) {
 	}
 
 	// The dump of the build of the instance, in the snapshot of a read-only transaction.
-	o := &Ops{Transfer: &TransferConfig{PGBinDir: pgtest.BinDir()}}
+	o := &Ops{Transfer: &TransferConfig{PGBinDir: pgtest.BinDir(), Dir: t.TempDir()}}
 	tx, err := c.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
 		t.Fatal(err)
@@ -127,11 +127,11 @@ func TestReadFactsAndDumpOfARealDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := c.Config()
-	pre, err := o.runDump(ctx, cfg, "pre-data", snap)
+	pre, err := o.runDump(ctx, cfg, "pre-data", snap, f.PGMajor)
 	if err != nil {
 		t.Fatalf("pg_dump pre-data: %v", err)
 	}
-	post, err := o.runDump(ctx, cfg, "post-data", snap)
+	post, err := o.runDump(ctx, cfg, "post-data", snap, f.PGMajor)
 	if err != nil {
 		t.Fatalf("pg_dump post-data: %v", err)
 	}

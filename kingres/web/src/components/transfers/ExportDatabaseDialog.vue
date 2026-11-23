@@ -21,6 +21,7 @@ import {
   READ_ORDER_TEXT,
   readPlan,
   tableKey,
+  tableLabel,
   unreadableObjects,
 } from '@/lib/archive'
 import { formatBytes, formatNumber } from '@/lib/format'
@@ -173,7 +174,7 @@ const objectsOf = (error: unknown): string[] =>
           >
             <label v-for="t in rows" :key="tableKey(t)" class="check"
               ><input v-model="excluded" type="checkbox" :value="tableKey(t)" />
-              <code><SafeName :value="tableKey(t)" :max="100" /></code>
+              <code><SafeName :value="tableLabel(t)" :max="100" /></code>
               <span class="muted">
                 {{ formatBytes(t.sizeBytes)
                 }}<template v-if="t.classes.includes('distributed')">, distributed</template

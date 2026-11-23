@@ -8,6 +8,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/staging"
+	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -329,17 +332,17 @@ func TestDumpArgumentsAndEnvironment(t *testing.T) {
 		}
 	}
 	cfg, _ := pgx.ParseConfig("postgres://kingresd:secret@127.0.0.1:5432/shop")
-	env := strings.Join(dumpEnv(cfg), " ")
-	if !strings.Contains(env, "PGPASSWORD=secret") || strings.Contains(env, "PGPASSFILE") || strings.Contains(env, "PGSERVICE") || strings.Contains(args, "secret") {
+	env := strings.Join(dumpEnv(cfg, "/x/pgpass"), " ")
+	if !strings.Contains(env, "PGPASSFILE=/x/pgpass") || !strings.Contains(env, "PGOPTIONS=-c search_path=pg_catalog") || strings.Contains(env, "PGPASSWORD") || strings.Contains(env, "secret") || strings.Contains(env, "PGSERVICE") || strings.Contains(args, "secret") {
 		t.Errorf("environment %q", env)
 	}
 	o := &Ops{}
-	_, err := o.runDump(context.Background(), cfg, "pre-data", "x")
+	_, err := o.runDump(context.Background(), cfg, "pre-data", "x", 0)
 	if te := transfer.SafeError(err); te.Code != transfer.CodeDumpFailed {
 		t.Errorf("no directory of the programs: %v", err)
 	}
 	o.Transfer = &TransferConfig{PGBinDir: t.TempDir()}
-	if _, err = o.runDump(context.Background(), cfg, "pre-data", "x"); transfer.SafeError(err).Code != transfer.CodeDumpFailed {
+	if _, err = o.runDump(context.Background(), cfg, "pre-data", "x", 0); transfer.SafeError(err).Code != transfer.CodeDumpFailed {
 		t.Errorf("no pg_dump in the directory: %v", err)
 	}
 	cb := &capBuffer{max: 4}
@@ -369,10 +372,14 @@ func TestUploadStateOfAnArchive(t *testing.T) {
 func TestCachedReportIsByTheChecksum(t *testing.T) {
 	good := strings.Repeat("a", 64)
 	rep := &api.ArchiveReport{Valid: true, SHA256: good}
-	b, _ := json.Marshal(uploadReport{Archive: rep})
+	b, _ := json.Marshal(uploadReport{Archive: rep, Version: ValidatorVersion})
 	rec := transfer.Record{SHA256: good, Report: b}
 	if cachedReport(rec) == nil {
 		t.Error("the report of these bytes is not used")
+	}
+	stale, _ := json.Marshal(uploadReport{Archive: rep, Version: "an older validator"})
+	if cachedReport(transfer.Record{SHA256: good, Report: stale}) != nil {
+		t.Error("the report of another version of the validator is used")
 	}
 	rec.SHA256 = strings.Repeat("b", 64)
 	if cachedReport(rec) != nil {
@@ -381,5 +388,56 @@ func TestCachedReportIsByTheChecksum(t *testing.T) {
 	rec.SHA256 = ""
 	if cachedReport(rec) != nil {
 		t.Error("a report is used for a file without a checksum")
+	}
+}
+
+// The password of pg_dump is in a file of mode 0600 with the escapes of a password file, and nowhere in the arguments or the environment.
+func TestPasswordFileOfPgDump(t *testing.T) {
+	cfg, _ := pgx.ParseConfig("postgres://kingresd:se%3Acr%5Cet@127.0.0.1:5432/shop")
+	dir := t.TempDir()
+	name, err := writePassfile(dir, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(name)
+	if string(b) != `127.0.0.1:5432:shop:kingresd:se\:cr\\et`+"\n" {
+		t.Errorf("the line of the password file: %q", b)
+	}
+	if runtime.GOOS != "windows" {
+		if st, _ := os.Stat(name); st.Mode().Perm() != 0o600 {
+			t.Errorf("mode %v", st.Mode())
+		}
+	}
+}
+
+// A read that did not finish is not a verdict about the archive: the validation fails the task and nothing is cached or made into a report (B3).
+func TestAFailedReadIsNotAReport(t *testing.T) {
+	o := &Ops{}
+	x := &xferState{keys: staging.NewKeysForTest(1)}
+	rec := transfer.Record{ID: 7, KeyID: "no such key", WrappedKey: []byte("x")}
+	v, err := o.validationOf(context.Background(), x, rec)
+	if err == nil || v != nil {
+		t.Fatalf("a failed read gave a validation: %v %v", v, err)
+	}
+	if te := transfer.SafeError(err); te.Code != transfer.CodeKeyLost {
+		t.Errorf("code %q", te.Code)
+	}
+	if o.validation(rec.ID) != nil {
+		t.Error("a failed read was kept for the next step")
+	}
+	// A verdict about the archive is kept.
+	o.setValidation(8, &validation{err: &archive.Error{Code: archive.CodeInvalid}})
+	if v, err := o.validationOf(context.Background(), x, transfer.Record{ID: 8}); err != nil || v == nil {
+		t.Errorf("a verdict was refused: %v", err)
+	}
+}
+
+// The limits of a validation: the smaller of the limit of the import and a multiple of the staged file, and a ratio for one entry (B5).
+func TestArchiveLimitsFollowTheFile(t *testing.T) {
+	if l := archiveLimits(1 << 20); l.MaxImportBytes != (1<<20)*MaxExpansion || l.MaxRatio != MaxEntryRatio {
+		t.Errorf("limits of a small file: %+v", l)
+	}
+	if l := archiveLimits(1 << 40); l.MaxImportBytes != 100<<30 {
+		t.Errorf("limits of a large file: %+v", l)
 	}
 }

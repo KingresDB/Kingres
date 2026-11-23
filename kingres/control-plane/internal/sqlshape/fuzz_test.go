@@ -16,6 +16,9 @@ func fixedKind(k string) bool {
 }
 
 func seeds(f *testing.F) {
+	for _, c := range LexCorpus() {
+		f.Add([]byte(c.SQL))
+	}
 	for _, c := range accepted {
 		f.Add([]byte(c.sql))
 	}

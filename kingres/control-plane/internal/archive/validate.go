@@ -39,6 +39,8 @@ type Limits struct {
 	MaxImportBytes int64 // the sum of the declared sizes of the entries; default 100 GiB
 	MaxEntries     int   // default MaxEntries
 	SQL            SQLChecker
+	// MaxRatio, when positive, refuses an entry whose declared size is more than that many times its compressed size (plus 1 MiB): a bomb is found before it is read.
+	MaxRatio int64
 	// SQLFor, when set, makes the checker of the SQL files from the catalog document (which is read before them): the shape grammar needs to know which
 	// tables inherit. It is used instead of SQL.
 	SQLFor func(cat *Catalog) SQLChecker
@@ -123,6 +125,9 @@ func Validate(ra io.ReaderAt, size int64, lim Limits) (*Result, error) {
 	var sum uint64
 	for _, e := range ents {
 		sum += e.usize
+		if lim.MaxRatio > 0 && e.usize > (1<<20) && e.usize > uint64(lim.MaxRatio)*e.csize+(1<<20) {
+			return nil, invalid("ratio", e.name, "an entry is declared to expand more than %d times", lim.MaxRatio)
+		}
 		if e.usize > uint64(lim.MaxImportBytes) || sum > uint64(lim.MaxImportBytes) {
 			return nil, invalid("size", "", "the declared sizes of the entries are above the limit")
 		}

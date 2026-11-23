@@ -27,6 +27,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/archive"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/dumpnorm"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sqlshape"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/staging"
@@ -184,6 +185,11 @@ func (o *Ops) roleReadable(ctx context.Context, conn *pgx.Conn) ([]api.TableBloc
 			  AND NOT has_table_privilege(c.oid, 'SELECT')
 			  AND (NOT EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped)
 			       OR EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated::text = '' AND NOT has_column_privilege(c.oid, a.attnum, 'SELECT')))
+			UNION ALL
+			SELECT 'no_privilege', n.nspname::text || '.' || c.relname::text, 2 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE c.relkind = 'S' AND `+userSchemaFilter+`
+			  AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e')
+			  AND CASE WHEN c.relkind = 'S' THEN NOT (has_sequence_privilege(c.oid, 'SELECT') OR has_sequence_privilege(c.oid, 'USAGE')) ELSE false END
 			ORDER BY 3, 2`)
 		if err != nil {
 			return err
@@ -253,9 +259,6 @@ func (o *Ops) StartDatabaseExport(ctx context.Context, actor, db string, req api
 	if err := o.concurrency(ctx, st, actor); err != nil {
 		return task.Task{}, err
 	}
-	if err := o.databaseTaskBusy(ctx, db); err != nil {
-		return task.Task{}, err
-	}
 	// The structure, read by the service role (404 when the database does not exist).
 	var facts *dbFacts
 	if err := o.asServiceRO(ctx, db, func(tx pgx.Tx) error {
@@ -263,7 +266,10 @@ func (o *Ops) StartDatabaseExport(ctx context.Context, actor, db string, req api
 		facts, e = readDBFacts(ctx, tx)
 		return e
 	}); err != nil {
-		return task.Task{}, err
+		return task.Task{}, factsProblem(err)
+	}
+	if n := len(facts.dataEntries(nil, "all")); n > archive.MaxEntries-8 {
+		return task.Task{}, problem.New(problem.SchemaUnrecognised, fmt.Sprintf("The database has %d tables with data; an archive holds at most %d entries.", n, archive.MaxEntries-8))
 	}
 	known := map[string]bool{}
 	for _, t := range facts.dataTables() {
@@ -283,6 +289,12 @@ func (o *Ops) StartDatabaseExport(ctx context.Context, actor, db string, req api
 	}
 	sort.Strings(exclude)
 	if err := o.checkExportable(ctx, db, actor, facts, req.AcknowledgeLargeObjectsLost); err != nil {
+		return task.Task{}, err
+	}
+	// From here to the start of the task the check for table tasks and the start are one step (a table task waits for an export in StartTask).
+	o.dbTaskMu.Lock()
+	defer o.dbTaskMu.Unlock()
+	if err := o.databaseTaskBusy(ctx, db); err != nil {
 		return task.Task{}, err
 	}
 	p := dbExportParams{Database: db, Owner: who, Retention: retention, MaxFile: st.MaxFileBytes, Exclude: exclude, DataMode: dataMode, AckLO: req.AcknowledgeLargeObjectsLost}
@@ -384,7 +396,7 @@ func (o *Ops) checkExportable(ctx context.Context, db, role string, f *dbFacts, 
 	if (f.LargeObjects > 0 || len(f.OIDColumns) > 0) && !ackLO {
 		return problem.New(problem.LargeObjectsPresent, fmt.Sprintf("The database has %d large objects and %d columns of type oid or reg* whose values do not carry over to another database; acknowledgeLargeObjectsLost accepts that they are lost.", f.LargeObjects, len(f.OIDColumns)))
 	}
-	conn, err := o.roleConn(ctx, db, role)
+	conn, err := o.dbRoleConn(ctx, db, role)
 	if err != nil {
 		return err
 	}
@@ -492,12 +504,50 @@ func (o *Ops) stepDBCheck(ctx context.Context, env *task.Env) error {
 		facts, e = readDBFacts(ctx, tx)
 		return e
 	}); err != nil {
+		if fe := factsError(err); fe != err {
+			return fe
+		}
 		return transfer.Errorf(transfer.CodeForbidden, false, "the database can no longer be exported as it was requested")
 	}
 	if err := o.checkExportable(ctx, p.Database, rec.Owner.Name, facts, p.AckLO); err != nil {
 		return transfer.Errorf(transfer.CodeForbidden, false, "the database can no longer be exported as it was requested: %s", firstSentence(err))
 	}
 	return env.SetDetail(ctx, "transfer "+idText(p.TransferID))
+}
+
+// dbRoleConn is roleConn with the search path of the session fixed: nothing the control plane asks of the role then depends on a setting of the database or of the role.
+func (o *Ops) dbRoleConn(ctx context.Context, db, role string) (*pgx.Conn, error) {
+	c, err := o.roleConn(ctx, db, role)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := c.Exec(ctx, "SET search_path = pg_catalog"); err != nil {
+		_ = c.Close(context.WithoutCancel(ctx))
+		return nil, connectProblem(err)
+	}
+	return c, nil
+}
+
+// factsError and factsProblem turn the refusal of extguard (a schema of an extension that cannot be trusted, an extension that a table needs and that is not
+// installed) into a code of the export; any other error is returned as it is.
+func factsError(err error) error {
+	if u, ok := extguard.IsUntrusted(err); ok {
+		return transfer.Errorf(transfer.CodeSchemaUnrecognised, false, "the schema %s of the database cannot be trusted (%s); the control plane reads and calls nothing in it", u.Schema, u.Reason)
+	}
+	if errors.Is(err, extguard.ErrAbsent) {
+		return transfer.Errorf(transfer.CodeSchemaUnrecognised, false, "a table of the database needs an extension that is not installed")
+	}
+	return err
+}
+
+func factsProblem(err error) error {
+	if u, ok := extguard.IsUntrusted(err); ok {
+		return problem.New(problem.SchemaUnrecognised, "The schema "+u.Schema+" of the database cannot be trusted ("+string(u.Reason)+"): it is not owned as the schema of a KingresDB extension is, or it holds an object that is not a member of one. The control plane reads and calls nothing in it, so the database cannot be exported.")
+	}
+	if errors.Is(err, extguard.ErrAbsent) {
+		return problem.New(problem.SchemaUnrecognised, "A table of the database needs an extension of KingresDB that is not installed.")
+	}
+	return err
 }
 
 // firstSentence is the text of a problem without anything the problem got from outside (a problem of the checks is built from fixed sentences and names).
@@ -539,7 +589,7 @@ func (o *Ops) takeStructure(ctx context.Context, p dbExportParams) (*dbWork, err
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 	facts, err := readDBFacts(ctx, tx)
 	if err != nil {
-		return nil, err
+		return nil, factsError(err)
 	}
 	var snap string
 	if err := tx.QueryRow(ctx, `SELECT pg_export_snapshot()`).Scan(&snap); err != nil {
@@ -547,10 +597,10 @@ func (o *Ops) takeStructure(ctx context.Context, p dbExportParams) (*dbWork, err
 	}
 	w := &dbWork{facts: facts, fingerprint: facts.fingerprint()}
 	cfg := c.Config()
-	if w.rawPre, err = o.runDump(ctx, cfg, "pre-data", snap); err != nil {
+	if w.rawPre, err = o.runDump(ctx, cfg, "pre-data", snap, facts.PGMajor); err != nil {
 		return nil, err
 	}
-	if w.rawPost, err = o.runDump(ctx, cfg, "post-data", snap); err != nil {
+	if w.rawPost, err = o.runDump(ctx, cfg, "post-data", snap, facts.PGMajor); err != nil {
 		return nil, err
 	}
 	return w, nil
@@ -690,7 +740,7 @@ func (o *Ops) writeArchive(ctx context.Context, env *task.Env, x *xferState, rec
 	excluded := p.excluded()
 	entries := w.facts.dataEntries(excluded, p.DataMode)
 	single := w.facts.singleSnapshot() && len(entries) > 0
-	conn, err := o.roleConn(ctx, p.Database, rec.Owner.Name)
+	conn, err := o.dbRoleConn(ctx, p.Database, rec.Owner.Name)
 	if err != nil {
 		return meta, 0, "", transfer.Errorf(transfer.CodeSessionLost, true, "the role cannot connect to the database from this server now; repeat the operation")
 	}
@@ -699,7 +749,7 @@ func (o *Ops) writeArchive(ctx context.Context, env *task.Env, x *xferState, rec
 	if err != nil {
 		return meta, 0, "", err
 	}
-	setup := append(formats, "SET LOCAL row_security = off", fmt.Sprintf("SET LOCAL statement_timeout = %d", timeout.Milliseconds()))
+	setup := append(formats, "SET LOCAL search_path = pg_catalog", "SET LOCAL row_security = off", fmt.Sprintf("SET LOCAL statement_timeout = %d", timeout.Milliseconds()))
 	begin := func(iso pgx.TxIsoLevel) (pgx.Tx, error) {
 		tx, e := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: iso, AccessMode: pgx.ReadOnly})
 		if e != nil {
@@ -874,7 +924,9 @@ func (o *Ops) stepDBVerify(ctx context.Context, env *task.Env) error {
 		return transfer.Errorf(transfer.CodeLeaderChanged, true, "the file of the export is not there; repeat the operation")
 	}
 	defer func() { _ = r.Close() }()
-	res, verr := archive.Validate(r, r.Size(), archive.Limits{MaxImportBytes: p.MaxFile * 4, SQLFor: func(cat *archive.Catalog) archive.SQLChecker { return sqlChecker(catalogInheritance(cat)) }})
+	lim := archiveLimits(r.Size())
+	lim.SQLFor = func(cat *archive.Catalog) archive.SQLChecker { return sqlChecker(catalogInheritance(cat)) }
+	res, verr := archive.Validate(r, r.Size(), lim)
 	if verr != nil {
 		// The reasons of the validator are fixed codes and bounded names of the archive that this export made: no value of the data.
 		var ae *archive.Error
@@ -895,6 +947,9 @@ func (o *Ops) stepDBVerify(ctx context.Context, env *task.Env) error {
 		facts, e = readDBFacts(ctx, tx)
 		return e
 	}); err != nil {
+		if fe := factsError(err); fe != err {
+			return fe
+		}
 		return transfer.Errorf(transfer.CodeSessionLost, true, "the service role cannot connect to the database now; repeat the operation")
 	}
 	if facts.fingerprint() != w.fingerprint {

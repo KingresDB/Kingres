@@ -127,3 +127,6 @@ func sortedKeys(m map[string]bool) []string {
 	sort.Strings(out)
 	return out
 }
+
+// Count is the number of statements the lexer found: the accepted and the refused.
+func (p *Plan) Count() int { return len(p.Statements) + len(p.Refused) }

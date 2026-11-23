@@ -94,7 +94,7 @@ func split(src string) ([]stmt, error) {
 			i++
 			continue
 		case c == '-' && i+1 < n && src[i+1] == '-':
-			for i < n && src[i] != '\n' {
+			for i < n && src[i] != 10 && src[i] != 13 {
 				i++
 			}
 			continue
@@ -152,7 +152,7 @@ func split(src string) ([]stmt, error) {
 					i++
 				}
 			case c == '-' && i+1 < n && src[i+1] == '-':
-				for i < n && src[i] != '\n' {
+				for i < n && src[i] != 10 && src[i] != 13 {
 					i++
 				}
 			case c == '/' && i+1 < n && src[i+1] == '*':
@@ -260,4 +260,20 @@ func skipDollar(s string, i int) (int, bool) {
 		return len(s), false
 	}
 	return j + 1 + k + len(tag), true
+}
+
+// CountStatements is the number of statements (backslash commands excluded) that the splitter finds in a script; the corpus of package sqlshape is checked
+// against it, and against PostgreSQL.
+func CountStatements(src string) (int, error) {
+	st, err := split(src)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, s := range st {
+		if s.meta == "" {
+			n++
+		}
+	}
+	return n, nil
 }

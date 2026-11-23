@@ -48,16 +48,20 @@ export function exportDatabaseRequest(form: {
   if (form.dataMode !== 'all') request.dataMode = form.dataMode
   if (form.excluded.length > 0 && form.dataMode === 'all')
     request.excludeTables = form.excluded.map((key) => {
-      const dot = key.indexOf('.')
-      return { schema: key.slice(0, dot), table: key.slice(dot + 1) }
+      const [schema, table] = JSON.parse(key) as [string, string]
+      return { schema, table }
     })
   if (form.acknowledgeLargeObjectsLost) request.acknowledgeLargeObjectsLost = true
   request.retentionHours = form.retentionHours
   return request
 }
 
-/** The key of a table in the list of excluded tables (a schema name has no dot in the console's lists; the first dot splits). */
-export const tableKey = (t: Pick<Table, 'schema' | 'name'>): string => `${t.schema}.${t.name}`
+/** The key of a table in the list of excluded tables: the pair, never the two names joined (a dot in a name would make two tables one). */
+export const tableKey = (t: Pick<Table, 'schema' | 'name'>): string =>
+  JSON.stringify([t.schema, t.name])
+
+/** The text that shows a table. */
+export const tableLabel = (t: Pick<Table, 'schema' | 'name'>): string => `${t.schema}.${t.name}`
 
 /** The file name the console offers for an archive (built from the identifier of the database only). */
 export function archiveFileName(e: Pick<DataExport, 'database' | 'exportId'>): string {
