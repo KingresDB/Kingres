@@ -245,9 +245,25 @@ func TestSchemaSpoofIsNeverExecuted(t *testing.T) {
 	for _, kind := range []string{ops.ApplyExtensionInstall, ops.ApplyExtensionVerify} {
 		for _, ext := range []string{extguard.Sketch, extguard.Timepart} {
 			raw, _ := json.Marshal(map[string]any{"database": "nox", "extension": ext, "version": "1.0", "hash": "x"})
-			if err := o.ApplyLocal(ctx, kind, raw); err == nil && kind == ops.ApplyExtensionInstall && ext == extguard.Sketch {
-				t.Errorf("CREATE EXTENSION kingres_sketch was run into the schema that the tenant made")
+			err := o.ApplyLocal(ctx, kind, raw)
+			if kind == ops.ApplyExtensionInstall && ext == extguard.Sketch && (err == nil || !strings.Contains(err.Error(), "cannot be trusted")) {
+				t.Errorf("CREATE EXTENSION kingres_sketch over the schema that the tenant made must be refused by the control plane before the script runs: %v", err)
 			}
+		}
+	}
+	// The ledger operations of the control plane (digests, verifications, client keys): the extension is not there, or its schema cannot be trusted, so they refuse.
+	for _, db := range []string{"nox", "tpx"} {
+		if _, err := o.GenerateDigest(ctx, db, "a"); err == nil {
+			t.Errorf("%s: a digest was made", db)
+		}
+		if _, err := o.ListDigests(ctx, db, store.Page{Limit: 5}); err == nil {
+			t.Errorf("%s: digests were listed", db)
+		}
+		if _, err := o.ListVerifications(ctx, db, store.Page{Limit: 5}); err == nil {
+			t.Errorf("%s: verifications were listed", db)
+		}
+		if _, err := o.ListClientKeys(ctx, db); err == nil {
+			t.Errorf("%s: client keys were listed", db)
 		}
 	}
 	rawT, _ := json.Marshal(map[string]any{"database": "tpx", "extension": extguard.Timepart, "version": "0.2"})
