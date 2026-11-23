@@ -178,6 +178,9 @@ func (m *mapFailover) Start(ctx context.Context, actor string, id internalapi.Fo
 	if req.Mode != failover.ModeHard {
 		return task.Task{}, problem.New(problem.UnsupportedOp, "The map group is failed over in mode hard only.")
 	}
+	if err := m.targetMatchesTheJournal(server, req); err != nil {
+		return task.Task{}, err
+	}
 	body := mapStartBody{Server: server, RequestedBy: actor, AllowDataLoss: req.AllowDataLoss, Comment: req.Comment}
 	cand, err := m.candidate(ctx)
 	if err != nil {
@@ -1215,10 +1218,33 @@ func acceptPlanned(mf *mapFailover, caller string, b *mapStartBody) error {
 	if cur, ok := mf.journal.Current(); ok && !cur.Abandoned.IsZero() && cur.Planned != nil && cur.Planned.TaskID == b.Planned.TaskID {
 		return &internalapi.CallError{Status: http.StatusConflict, Code: "conflict", Message: "The planned switchover of this task was given up; it is not started again."}
 	}
+	if b.Planned.Hard && (b.Planned.Checkpoint != "" || b.Planned.ClusterState != "") {
+		// P6: a hard failover has no proof; one that carries a proof is not the request of an honest task.
+		return badBody("a hard failover request without a proof")
+	}
 	b.Planned.Checkpoint, b.Planned.ClusterState = "", ""
 	if !b.Planned.Hard {
 		b.AllowDataLoss = false
 		b.Planned.Facts = nil
+	}
+	return nil
+}
+
+// targetMatchesTheJournal refuses the repeated request of an operator for a hard failover in progress whose target for the map group is not the one the journal was begun
+// with (P4): the standby was chosen, and the old primary stopped, for that one; the operator gives the bootstrap up first to change it.
+func (m *mapFailover) targetMatchesTheJournal(server string, req failover.Request) error {
+	cur, ok := m.journal.Current()
+	if !ok || !m.journal.Active() || cur.Planned == nil || !cur.Planned.Hard || cur.OldServer != server {
+		return nil
+	}
+	target := ""
+	for _, t := range req.Targets {
+		if t.ShardGroupID == 0 {
+			target = t.ServerID
+		}
+	}
+	if target != cur.Planned.Target {
+		return problem.New(problem.Conflict, "The hard failover of the map group is in progress with target \""+cur.Planned.Target+"\" (empty: the best standby) and this request names \""+target+"\"; give the bootstrap up (abandonMapGroupBootstrap) before asking for another target.")
 	}
 	return nil
 }

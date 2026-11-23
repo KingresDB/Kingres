@@ -75,7 +75,7 @@ type world struct {
 	mapAbandonErr      error           // the candidate answers the abandon with this (a 409 conflict: it promoted)
 	mapRefusal         string
 	mapStartErr        error
-	onMapStart         func() // runs inside the call that starts the bootstrap of the candidate (a test changes the facts there)
+	onMapStart         func()  // runs inside the call that starts the bootstrap of the candidate (a test changes the facts there)
 	markErr            error   // the answer of the mark call
 	undoTerms          []int64 // the terms of the quiesce, unquiesce and resume calls
 	stopErr            error   // the answer of the clean stop call

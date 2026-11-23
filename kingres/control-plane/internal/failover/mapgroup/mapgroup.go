@@ -230,9 +230,6 @@ func (r *Runner) Decide(ctx context.Context, req Request) (journal.Journal, erro
 	} else if req.Planned != nil {
 		return journal.Journal{}, &Refusal{Code: "conflict", Status: 409, Message: "A planned switchover of the map group needs the old leader alive; this server does not hear it."}
 	}
-	if req.Planned != nil && req.Planned.Hard && req.Planned.Checkpoint != "" {
-		return journal.Journal{}, &Refusal{Code: "unprocessable", Status: 422, Message: "A hard failover of the map group carries no proof."}
-	}
 	id := strconv.FormatInt(r.now().UnixNano(), 36)
 	j, err := r.Journal.Begin(id, req.OldServer, term, nonEmpty(req.Trigger, "manual"), req.RequestedBy, req.AllowDataLoss)
 	if err != nil || req.Planned == nil {

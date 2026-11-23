@@ -162,14 +162,9 @@ func TestOnlyAHardFailoverTakesTheRepeatedRequestForALiveOldServer(t *testing.T)
 func TestAHardRequestWithAProofIsRefused(t *testing.T) {
 	w := hardWorld()
 	r, js := w.runner(t)
-	rq := hardRequest()
-	rq.Planned.Checkpoint = "0/6000028"
-	_, err := r.Decide(context.Background(), rq)
+	_ = js
 	var ref *Refusal
-	if !errors.As(err, &ref) || ref.Code != "unprocessable" || js.Active() {
-		t.Fatalf("%v", err)
-	}
-	rq = hardRequest()
+	rq := hardRequest()
 	rq.Trigger = "automatic"
 	if _, err := r.Decide(context.Background(), rq); !errors.As(err, &ref) || ref.Code != "conflict" {
 		t.Fatalf("an automatic hard request: %v", err)

@@ -149,7 +149,7 @@ func TestOnlyTheMapGroupRecordsACandidate(t *testing.T) {
 func TestTheHardRequestOfTheOldLeaderKeepsTheDecisionAndTheFacts(t *testing.T) {
 	m, _ := abandonRig(t)
 	mk := func(hard bool) *mapStartBody {
-		return &mapStartBody{Server: "s1", AllowDataLoss: true, Planned: &journal.Planned{TaskID: 7, StandbyID: 3, Hard: hard, Checkpoint: "x", ClusterState: "y",
+		return &mapStartBody{Server: "s1", AllowDataLoss: true, Planned: &journal.Planned{TaskID: 7, StandbyID: 3, Hard: hard,
 			Facts: &journal.PlannedFacts{SyncStreaming: true}}}
 	}
 	b := mk(true)
@@ -224,5 +224,39 @@ func TestAFencedStopDoesNotMoveARecordedCandidateAndDoesNotLeaveItsOwn(t *testin
 	_, _ = runFence(t, w, failover.DemoteRequest{Group: 0, Mode: "immediate", TransferTo: "s2", Candidate: "s2"})
 	if w.cand != "s2" {
 		t.Fatal("a record of an earlier attempt was removed by a call that did not write it")
+	}
+}
+
+// P6. A hard failover request that carries a proof is refused at the door (it is not the request of an honest task), and a planned switchover's proof is still cleared.
+func TestAHardRequestThatCarriesAProofIsRefused(t *testing.T) {
+	m, _ := abandonRig(t)
+	b := &mapStartBody{Server: "s1", Planned: &journal.Planned{TaskID: 7, StandbyID: 3, Hard: true, Checkpoint: "0/6000028"}}
+	callErr(t, acceptPlanned(m, "s1", b), 400, "bad_request")
+	b = &mapStartBody{Server: "s1", Planned: &journal.Planned{TaskID: 7, StandbyID: 3, Hard: true, ClusterState: "shut down"}}
+	callErr(t, acceptPlanned(m, "s1", b), 400, "bad_request")
+}
+
+// P4. The repeated request of an operator for a hard failover in progress names the target the journal has, or none when it has none.
+func TestARepeatedHardRequestWithAnotherTargetIsRefused(t *testing.T) {
+	m, js := abandonRig(t)
+	_, _ = js.Begin("b1", "s1", 3, "manual", "alice", false)
+	_, _ = js.SetPlanned(journal.Planned{TaskID: 7, StandbyID: 3, Hard: true, Target: "s3"})
+	req := func(target string) failover.Request {
+		r := failover.Request{Mode: failover.ModeHard}
+		if target != "" {
+			r.Targets = []failover.TargetRequest{{ShardGroupID: 0, ServerID: target}}
+		}
+		return r
+	}
+	if err := m.targetMatchesTheJournal("s1", req("s3")); err != nil {
+		t.Fatalf("the same target: %v", err)
+	}
+	for _, other := range []string{"s4", ""} {
+		if err := m.targetMatchesTheJournal("s1", req(other)); err == nil || !strings.Contains(err.Error(), "abandon") {
+			t.Fatalf("target %q: %v", other, err)
+		}
+	}
+	if err := m.targetMatchesTheJournal("s9", req("s4")); err != nil {
+		t.Fatalf("another server is not this journal's: %v", err)
 	}
 }
