@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sqlx"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
@@ -309,6 +310,10 @@ func (o *Ops) installExtensions(ctx context.Context, db string, sharding, ledger
 		if _, err := c.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS kingres_shard"); err != nil {
 			return fmt.Errorf("installing kingres_shard: %w", err)
 		}
+		// the owner of the database may connect between CREATE DATABASE and here: what is read and called next must belong to the extension
+		if err := requireExt(ctx, c, extguard.Shard); err != nil {
+			return err
+		}
 		var nodes int
 		if err := c.QueryRow(ctx, "SELECT count(*) FROM kingres.node").Scan(&nodes); err != nil {
 			return err
@@ -391,9 +396,14 @@ func (o *Ops) stepRecordSettings(ctx context.Context, env *task.Env) error {
 // extension (it names the schemas or tables that stand in the way) is 409 sharding_mode_in_use.
 func (o *Ops) setShardingMode(ctx context.Context, db, mode string, distributeNew *bool) error {
 	return o.withDB(ctx, db, func(c *pgx.Conn) error {
-		var has bool
-		if err := c.QueryRow(ctx, `SELECT to_regprocedure('kingres.set_sharding_mode(text,boolean)') IS NOT NULL`).Scan(&has); err != nil {
-			return PGProblem(err)
+		has, err := extUsable(ctx, c, extguard.Shard)
+		if err != nil {
+			return err
+		}
+		if has {
+			if err := c.QueryRow(ctx, `SELECT to_regprocedure('kingres.set_sharding_mode(text,boolean)') IS NOT NULL`).Scan(&has); err != nil {
+				return PGProblem(err)
+			}
 		}
 		if !has {
 			return problem.New(problem.UnsupportedOp, "The sharding extension of database "+db+" is older than 0.8; it has no sharding modes.")

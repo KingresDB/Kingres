@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/partsched"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
 )
@@ -66,7 +67,7 @@ func (b PartitionBackend) Due(ctx context.Context, asOf time.Time) ([]partsched.
 	}
 	var out []partsched.Due
 	for _, db := range dbs {
-		err := b.O.asService(ctx, db, func(tx pgx.Tx) error {
+		err := b.O.asServiceExt(ctx, db, []string{extguard.Timepart}, func(tx pgx.Tx) error {
 			rows, err := tx.Query(ctx, `SELECT schema_name::text, table_name::text FROM kingres.timepart_due($1)`, asOf)
 			if err != nil {
 				return err
@@ -103,7 +104,7 @@ func (b PartitionBackend) Checks(ctx context.Context) ([]partsched.Check, []stri
 	var out []partsched.Check
 	var unread []string // the databases that exist and could not be read this time (their alerts are left as they are)
 	for _, db := range dbs {
-		err := b.O.asService(ctx, db, func(tx pgx.Tx) error {
+		err := b.O.asServiceExt(ctx, db, []string{extguard.Timepart}, func(tx pgx.Tx) error {
 			rows, err := tx.Query(ctx, `SELECT schema_name::text, table_name::text, problem, coalesce(detail, '') FROM kingres.timepart_check()`)
 			if err != nil {
 				return err

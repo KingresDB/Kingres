@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
 )
@@ -374,9 +375,15 @@ func (o *Ops) setShouldHaveShardsIn(ctx context.Context, db, host string, want b
 		return connectProblem(err)
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
-	var have bool
-	if err := c.QueryRow(ctx, `SELECT to_regclass('kingres.node') IS NOT NULL`).Scan(&have); err != nil {
-		return PGProblem(err)
+	// an untrusted schema is an error: a database that is skipped here would keep the old flag and the drain would think it is done
+	have, err := extUsable(ctx, c, extguard.Shard)
+	if err != nil {
+		return err
+	}
+	if have {
+		if err := c.QueryRow(ctx, `SELECT to_regclass('kingres.node') IS NOT NULL`).Scan(&have); err != nil {
+			return PGProblem(err)
+		}
 	}
 	if !have {
 		return nil
@@ -471,7 +478,14 @@ func (o *Ops) setWeightIn(ctx context.Context, db, host string, w float64) error
 		return connectProblem(err)
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
-	var have, hasFn bool
+	have, err := extUsable(ctx, c, extguard.Shard)
+	if err != nil {
+		return err
+	}
+	if !have {
+		return nil
+	}
+	var hasFn bool
 	if err := c.QueryRow(ctx, `SELECT to_regclass('kingres.node') IS NOT NULL,
 		to_regprocedure('kingres.set_node_property(integer,boolean,double precision)') IS NOT NULL`).Scan(&have, &hasFn); err != nil {
 		return PGProblem(err)

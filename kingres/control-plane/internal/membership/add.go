@@ -20,6 +20,8 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/audit"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/cluster"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extgate"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fault"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fwdproof"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
@@ -699,6 +701,15 @@ func (m *Manager) registerNode(ctx context.Context, db, host string, port int) e
 		return err
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	return registerNodeOn(ctx, c, db, host, port)
+}
+
+// registerNodeOn is registerNode on the session c of the service role, which is open to database db. The catalog is read and called as a superuser: its schema must
+// be the extension's.
+func registerNodeOn(ctx context.Context, c *pgx.Conn, db, host string, port int) error {
+	if err := extgate.Require(ctx, c, extguard.Shard, db); err != nil {
+		return err
+	}
 	var have bool
 	if err := c.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM kingres.node WHERE host = $1 AND port = $2)`, host, port).Scan(&have); err != nil {
 		return err

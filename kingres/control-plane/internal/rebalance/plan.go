@@ -60,7 +60,7 @@ func (b *PG) Plan(ctx context.Context, dbs []string, o Options) ([]Move, error) 
 	var out []Move
 	for _, db := range dbs {
 		var has bool
-		if err := b.with(ctx, db, func(c *pgx.Conn) (err error) { has, err = hasPlanRebalance(ctx, c); return }); err != nil {
+		if err := b.withShard(ctx, db, func(c *pgx.Conn) (err error) { has, err = hasPlanRebalance(ctx, c); return }); err != nil {
 			return nil, err
 		}
 		if !has {
@@ -82,7 +82,7 @@ func (b *PG) Plan(ctx context.Context, dbs []string, o Options) ([]Move, error) 
 			}
 		}
 		var moves []Move
-		err = b.with(ctx, db, func(c *pgx.Conn) error {
+		err = b.withShard(ctx, db, func(c *pgx.Conn) error {
 			var threshold any
 			if o.Threshold != nil {
 				threshold = *o.Threshold
@@ -130,7 +130,7 @@ func (b *PG) Plan(ctx context.Context, dbs []string, o Options) ([]Move, error) 
 // runs no group of the database is an error of the request.
 func (b *PG) groupsOfServers(ctx context.Context, db string, servers []string) ([]int32, error) {
 	var out []int32
-	err := b.with(ctx, db, func(c *pgx.Conn) error {
+	err := b.withShard(ctx, db, func(c *pgx.Conn) error {
 		rows, err := c.Query(ctx, `SELECT DISTINCT group_id FROM kingres.node WHERE role = 'primary' AND is_active AND host = ANY($1) ORDER BY 1`, servers)
 		if err != nil {
 			return err
@@ -193,7 +193,7 @@ func (b *PG) extraLoads(ctx context.Context, dbs []string, o Options) (map[strin
 func (b *PG) Loads(ctx context.Context, dbs []string, o Options) ([]GroupLoad, error) {
 	var out []GroupLoad
 	for _, db := range dbs {
-		err := b.with(ctx, db, func(c *pgx.Conn) error {
+		err := b.withShard(ctx, db, func(c *pgx.Conn) error {
 			var has bool
 			if err := c.QueryRow(ctx, `SELECT to_regprocedure('kingres.group_load(text,jsonb,integer[])') IS NOT NULL`).Scan(&has); err != nil {
 				return err

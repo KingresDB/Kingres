@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/partsched"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
@@ -240,20 +241,27 @@ func (o *Ops) moveSchedule(ctx context.Context, db, schema, table string) {
 
 // maintainConn opens a service connection to the database of the table that trusts the owners of the tables; see trustedConn.
 func (o *Ops) maintainConn(ctx context.Context, db string) (*pgx.Conn, error) {
-	return o.trustedConn(ctx, db)
+	return o.trustedConn(ctx, db, extguard.Timepart)
 }
 
 // trustedConn opens a service connection with kingres_timepart.trust_table_owners on and intervals in ISO 8601. The setting is the rule for every
 // operation that drives the DDL of kingres_timepart (a run of a policy and the conversion of a partition): the owner of the table is a role of this
 // cluster, and the code it can cause to run in the session (an index expression, a default, a trigger on a partition) runs as the service role for the time
 // of the call. The connection is closed when the call ends, which ends whatever the code left in the session. The README and the contract say so.
-func (o *Ops) trustedConn(ctx context.Context, db string) (*pgx.Conn, error) {
+func (o *Ops) trustedConn(ctx context.Context, db string, need ...string) (*pgx.Conn, error) {
 	if o.Service == nil {
 		return nil, problem.New(problem.UnsupportedOp, "This server has no managed instance.")
 	}
 	c, err := o.Service.ServiceConn(ctx, db)
 	if err != nil {
 		return nil, connectProblem(err)
+	}
+	// the session goes on to call the schema kingres as a superuser: the extensions it needs must be there and own it
+	for _, e := range need {
+		if err := requireExt(ctx, c, e); err != nil {
+			_ = c.Close(context.WithoutCancel(ctx))
+			return nil, err
+		}
 	}
 	if _, err := c.Exec(ctx, `SELECT pg_catalog.set_config('kingres_timepart.trust_table_owners', 'on', false), pg_catalog.set_config('intervalstyle', 'iso_8601', false)`); err != nil {
 		_ = c.Close(context.WithoutCancel(ctx))

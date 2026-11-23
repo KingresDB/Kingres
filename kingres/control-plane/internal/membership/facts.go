@@ -9,6 +9,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extgate"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
 )
 
@@ -31,9 +33,7 @@ func (m *Manager) holds(ctx context.Context, server string) ([]bucketHold, error
 		if err != nil {
 			return nil, err
 		}
-		var n int
-		err = c.QueryRow(ctx, `SELECT count(*) FROM kingres.bucket_map b
-			WHERE b.group_id IN (SELECT n.group_id FROM kingres.node n WHERE n.host = $1 AND n.role = 'primary')`, server).Scan(&n)
+		n, err := bucketsOwned(ctx, c, db, server)
 		_ = c.Close(context.WithoutCancel(ctx))
 		if err != nil {
 			return nil, err
@@ -130,4 +130,17 @@ func (m *Manager) InstanceBelongsTo(ctx context.Context, instanceID, server stri
 	var own bool
 	err = c.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM kingres.node WHERE node_id = $1 AND host = $2)`, id, server).Scan(&own)
 	return own, err
+}
+
+// bucketsOwned counts the buckets of the shard groups whose primary the server runs, in the catalog of database db that c is open to. The count is read as a
+// superuser from the schema kingres of a user database: it must be the extension's (the owner of the database could have made a schema of its own), or the
+// removal of a server is refused.
+func bucketsOwned(ctx context.Context, c *pgx.Conn, db, server string) (int, error) {
+	if err := extgate.Require(ctx, c, extguard.Shard, db); err != nil {
+		return 0, err
+	}
+	var n int
+	err := c.QueryRow(ctx, `SELECT count(*) FROM kingres.bucket_map b
+		WHERE b.group_id IN (SELECT n.group_id FROM kingres.node n WHERE n.host = $1 AND n.role = 'primary')`, server).Scan(&n)
+	return n, err
 }

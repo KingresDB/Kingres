@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sqlx"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
@@ -63,6 +64,9 @@ func (o *Ops) stepDistribute(ctx context.Context, env *task.Env) error {
 		return err
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	if err := requireExt(ctx, c, extguard.Shard); err != nil {
+		return err
+	}
 	if p.Method == "reference" {
 		var done bool
 		if err := c.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM kingres.dist_table WHERE relid = $1::regclass)`, qualified(p.Schema, p.Table)).Scan(&done); err != nil {
@@ -109,13 +113,13 @@ func (o *Ops) EnableLedger(ctx context.Context, db, schema, table string, req ap
 		} else if !ok {
 			return problem.New(problem.NotFound, fmt.Sprintf("Table %s.%s does not exist.", schema, table))
 		}
-		var hasLedger bool
-		var version string
-		if err := tx.QueryRow(ctx, `SELECT coalesce((SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'kingres_ledger'), '')`).Scan(&version); err != nil {
+		// the schema kingres is read and called below as a superuser: the extension must be there and the schema its own
+		info, err := verifyExt(ctx, tx, extguard.Ledger)
+		if err != nil {
 			return err
 		}
-		hasLedger = version != ""
-		if !hasLedger {
+		version := info.Version
+		if !info.Present {
 			return problem.New(problem.Conflict, "The ledger is not enabled on this database.")
 		}
 		if mode == "updatable" && !ledgerSupportsUpdatable(version) {
@@ -131,7 +135,7 @@ func (o *Ops) EnableLedger(ctx context.Context, db, schema, table string, req ap
 		if already {
 			return problem.New(problem.Conflict, "The table is already under ledger control; this cannot be changed.")
 		}
-		_, err := tx.Exec(ctx, "SELECT kingres.ledger_enable($1::regclass, $2)", qualified(schema, table), mode)
+		_, err = tx.Exec(ctx, "SELECT kingres.ledger_enable($1::regclass, $2)", qualified(schema, table), mode)
 		return err
 	}))
 }

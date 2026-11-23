@@ -21,6 +21,8 @@ import (
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/audit"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/cluster"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extgate"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fault"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fence"
@@ -274,6 +276,10 @@ func shortControlDeadline(nodeTimeout time.Duration) time.Duration {
 func (c *foCatalog) session(ctx context.Context, db string) (*pgx.Conn, error) {
 	conn, err := c.svc.ServiceConn(ctx, db)
 	if err != nil {
+		return nil, err
+	}
+	if err := requireCatalog(ctx, conn, db); err != nil {
+		_ = conn.Close(context.WithoutCancel(ctx))
 		return nil, err
 	}
 	if _, err := conn.Exec(ctx, `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED`); err != nil {
@@ -1093,6 +1099,12 @@ func handleFailoverPrepared(ctx context.Context, d *haDeps, body []byte) (any, e
 		return nil, &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The instance cannot be reached."}
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	if r.Database != "" && r.Database != sysdb.Database {
+		// the call below runs as a superuser in a database of a client: its schema kingres must be the extension's
+		if err := extgate.Require(ctx, c, extguard.Shard, r.Database); err != nil {
+			return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "extension_unavailable", Message: "The schema kingres of the database is not the extension's (or the extension is missing); nothing was called."}
+		}
+	}
 	if _, err := c.Exec(ctx, `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED`); err != nil {
 		return nil, err
 	}
@@ -1181,9 +1193,12 @@ func catalogDatabases(ctx context.Context, svc *cluster.Service, withSystem bool
 			}
 			return nil, err
 		}
-		var has bool
-		err = c.QueryRow(ctx, `SELECT to_regclass('kingres.node') IS NOT NULL`).Scan(&has)
+		has, err := hasCatalog(ctx, c, n)
 		_ = c.Close(context.WithoutCancel(ctx))
+		if isUntrustedErr(err) {
+			slog.Warn("a database is left out of the catalogs: its schema kingres cannot be trusted", "database", n, "error", err)
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}

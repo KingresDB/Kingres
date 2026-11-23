@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sqlx"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/staging"
@@ -88,11 +89,11 @@ func importFault(point string, conn *pgx.Conn) error {
 func (o *Ops) ledgerPolicy(ctx context.Context, db, schema, table string) (string, error) {
 	var policy string
 	err := o.asService(ctx, db, func(tx pgx.Tx) error {
-		var have bool
-		if e := tx.QueryRow(ctx, `SELECT to_regclass('kingres.ledger_table') IS NOT NULL`).Scan(&have); e != nil || !have {
+		have, e := extUsable(ctx, tx, extguard.Ledger)
+		if e != nil || !have {
 			return e
 		}
-		e := tx.QueryRow(ctx, `SELECT signature_policy FROM kingres.ledger_table WHERE relid = to_regclass($1)`, qualified(schema, table)).Scan(&policy)
+		e = tx.QueryRow(ctx, `SELECT signature_policy FROM kingres.ledger_table WHERE relid = to_regclass($1)`, qualified(schema, table)).Scan(&policy)
 		if errors.Is(e, pgx.ErrNoRows) {
 			return nil
 		}

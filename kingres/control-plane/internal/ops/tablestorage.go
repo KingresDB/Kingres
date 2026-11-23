@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 )
 
 // rangeBoundRE reads the bound of a partition of a table that is range-partitioned on one column: FROM ('2026-01-01') TO ('2026-02-01').
@@ -31,9 +32,14 @@ func (o *Ops) nativePartitions(ctx context.Context, tx pgx.Tx, schema, table, cu
 	if method == "" {
 		return nil
 	}
-	var columnar bool
-	if err := tx.QueryRow(ctx, `SELECT to_regprocedure('kingres.columnar_info(regclass)') IS NOT NULL`).Scan(&columnar); err != nil {
+	columnar, err := extUsable(ctx, tx, extguard.Columnar)
+	if err != nil {
 		return err
+	}
+	if columnar {
+		if err := tx.QueryRow(ctx, `SELECT to_regprocedure('kingres.columnar_info(regclass)') IS NOT NULL`).Scan(&columnar); err != nil {
+			return err
+		}
 	}
 	ratio := "NULL::float8"
 	if columnar {

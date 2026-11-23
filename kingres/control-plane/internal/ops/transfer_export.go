@@ -24,6 +24,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fence"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/staging"
@@ -200,13 +201,17 @@ func (o *Ops) roleConn(ctx context.Context, db, role string) (*pgx.Conn, error) 
 func (o *Ops) distribution(ctx context.Context, db, schema, table string) (class string, groups int, err error) {
 	class, groups = "local", 1
 	err = o.asService(ctx, db, func(tx pgx.Tx) error {
-		var have bool
+		// an untrusted schema is an error: the export would otherwise run with the wrong idea of how many groups hold the table
+		have, e := extUsable(ctx, tx, extguard.Shard)
+		if e != nil || !have {
+			return e
+		}
 		if e := tx.QueryRow(ctx, `SELECT to_regclass('kingres.dist_table') IS NOT NULL`).Scan(&have); e != nil || !have {
 			return e
 		}
 		var method string
 		var coloc *int
-		e := tx.QueryRow(ctx, `SELECT method, colocation_id FROM kingres.dist_table WHERE relid = to_regclass($1)`, qualified(schema, table)).Scan(&method, &coloc)
+		e = tx.QueryRow(ctx, `SELECT method, colocation_id FROM kingres.dist_table WHERE relid = to_regclass($1)`, qualified(schema, table)).Scan(&method, &coloc)
 		if errors.Is(e, pgx.ErrNoRows) {
 			return nil
 		}

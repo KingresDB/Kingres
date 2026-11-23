@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sqlx"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
@@ -517,6 +518,12 @@ func (b pgBackend) with(ctx context.Context, db string, f func(c *pgx.Conn) erro
 		return err
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	// every table operation reads or calls the schema kingres of kingres_shard as the service role
+	if ok, err := extUsable(ctx, c, extguard.Shard); err != nil {
+		return err
+	} else if !ok {
+		return problem.New(problem.UnsupportedOp, "The database has no kingres_shard 0.7 or later, which the table operations need.")
+	}
 	return f(c)
 }
 

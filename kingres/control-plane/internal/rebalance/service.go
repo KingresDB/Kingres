@@ -976,7 +976,7 @@ func (s *Service) loadsOf(ctx context.Context, dbs []string, o Options, moves []
 // buckets are not planned.
 func (s *Service) groupWarnings(ctx context.Context, db string) []string {
 	var out []string
-	_ = s.Backend.with(ctx, db, func(c *pgx.Conn) error {
+	_ = s.Backend.withShard(ctx, db, func(c *pgx.Conn) error {
 		rows, err := c.Query(ctx, `SELECT DISTINCT m.group_id FROM kingres.bucket_map m WHERE NOT EXISTS (
 			SELECT 1 FROM kingres.node n WHERE n.group_id = m.group_id AND n.role = 'primary' AND n.is_active) ORDER BY 1`)
 		if err != nil {

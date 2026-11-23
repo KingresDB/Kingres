@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extgate"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -112,10 +114,14 @@ type PGRegistrar struct {
 func (r *PGRegistrar) in(db string) *PGRegistrar {
 	c := *r
 	c.Databases, c.DBConn, c.DBRemote = nil, nil, nil
-	c.Conn = func(ctx context.Context) (*pgx.Conn, error) { return r.DBConn(ctx, db) }
+	// The sessions of a database of a client are the service role's, a superuser's, and the registrar calls and reads kingres.* on them: nothing is read or called until
+	// extguard says that the schema is the extension's (the owner of the database could have made a schema kingres of its own).
+	c.Conn = func(ctx context.Context) (*pgx.Conn, error) {
+		return trusted(ctx, db, func() (*pgx.Conn, error) { return r.DBConn(ctx, db) })
+	}
 	if r.DBRemote != nil {
 		c.Remote = func(ctx context.Context, host string, port int) (*pgx.Conn, error) {
-			return r.DBRemote(ctx, host, port, db)
+			return trusted(ctx, db, func() (*pgx.Conn, error) { return r.DBRemote(ctx, host, port, db) })
 		}
 	}
 	return &c
@@ -391,4 +397,17 @@ func (r *PGRegistrar) readBackEverywhere(ctx context.Context, c *pgx.Conn, e Ent
 		}
 	}
 	return nil
+}
+
+// trusted opens a session with open and hands it over only when kingres_shard is installed in the database with a schema that can be trusted.
+func trusted(ctx context.Context, db string, open func() (*pgx.Conn, error)) (*pgx.Conn, error) {
+	c, err := open()
+	if err != nil {
+		return nil, err
+	}
+	if err := extgate.Require(ctx, c, extguard.Shard, db); err != nil {
+		_ = c.Close(context.WithoutCancel(ctx))
+		return nil, err
+	}
+	return c, nil
 }
