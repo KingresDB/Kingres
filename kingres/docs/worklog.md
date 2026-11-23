@@ -38,6 +38,17 @@ Branch `p10-drain4` (from the staging branch g16). The two open items of phase 1
 - The lag rule is part of the automatic mode only; a manual start does not read the lag.
 - The removal of the old leader after its drain was not tried in the cluster test: the first server holds the key of the certificate authority and `removeServer` answers `certificate_authority_unavailable` from another leader (an existing limit, unrelated to the drain).
 
+### Fixes after the review of the branch (same day)
+
+- M1: the marker has the states `requested`, `requesting` (written before the hook is called), `started` (after it, tried five times on new sessions) and `refused`; the audit event comes after the record of started; the watch also resumes `requested` or `requesting` when a failover created after the marker has ended (and turns the marker into started, so the resumed step fails if the server still runs the map group).
+- L1, L3: the marker carries an attempt (a random name; ages are by the clock of the database, so no clock of a server is compared). The goroutine acts only while the marker carries its attempt; a young marker of the same task is not overwritten, and a manual resume of the paused drain pauses again.
+- L2: the hook refuses with `failover_in_progress` while any failover task is unfinished, so `failover.Service.Start` never resumes an unrelated paused failover.
+- L4: the marker is cleared when the step ends or fails, in `onFail` (failure and cancel, also while paused) and at the end of the drain (`Write the report`).
+- L5: only `creating` and `rebuilding` standbys of group 0 on the drained server hold it in the ring; at the bound with `acceptFewerReplicas` the server is taken out of the ring anyway (hook argument `force`), and the task detail says that the drain ends with fewer standbys.
+- M2: the lag query joins `pg_stat_replication` with the physical slots, reads only senders that are catching up or streaming, and answers -1 (lagging) for a standby with no replayed position; backup and logical walsenders are ignored; cascading standbys are not seen (documented).
+- M3: inside a run the guard needs more than twice `maxStandbyLagBytes` on three evaluations in a row; the start and the resumption of a run use the limit; the groups are read in parallel under the same 15 s bound. Contract text, README and design section 23 say so.
+- L6: the console mock lists the step `Hand over the map group`; the drain dialog says that the map group is handed over for the server that runs its primary. Vitest of the touched files, `npm run api:check`, eslint, prettier and `vue-tsc` pass (the `node_modules` of another worktree were linked).
+
 ### Still open
 
 - The manual start of a rebalance does not refuse a lagging group (section 8.3 marks it (M)).
