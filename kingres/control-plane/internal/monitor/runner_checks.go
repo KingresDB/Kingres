@@ -62,6 +62,15 @@ func (r *Runner) ledger(ctx context.Context, sys *pgx.Conn, now time.Time, rd *R
 			out = append(out, reading)
 		}
 	}
+	// The system database of the control plane: the service role owns it and nobody else can create there; the readers of kingres_cp and kingres in it do not
+	// check the extension, so what they rely on is this check (extguard.SystemDatabaseProblems).
+	sysProblems, err := extguard.SystemDatabaseProblems(ctx, sys)
+	if err != nil {
+		return
+	}
+	for _, p := range sysProblems {
+		untrusted = append(untrusted, ExtensionReading{Database: r.System, Extension: "the system database", Schema: p.Object, Reason: string(p.Reason)})
+	}
 	rd.LedgerChecked, rd.LedgerPending, rd.LedgerMaxAge = true, out, r.LedgerPendingMaxAge
 	rd.ExtensionsChecked, rd.ExtensionsUntrusted = true, untrusted
 }

@@ -54,3 +54,20 @@ ledger reads and the extension operations against them; one TAP test per extensi
 The call sites that the second change covers (table, partition and storage operations, schemas, server groups, databases, transfers, rebalance, membership,
 failover, standby and the rest of `cmd/kingresd`) use the same helper. Until then they still carry the old tests. An installation that was made before this
 change keeps a schema that a tenant may own; the alert `extensionSchemaUntrusted` shows it, and the operator must restore the owner and the grants.
+
+## Additions
+
+* **kingres_shard and pg_catalog.** kingres_shard is created with `SCHEMA pg_catalog` and its script makes the schema `kingres`. extguard therefore checks
+  the schema `kingres` for it (owner, ACL, foreign objects) and never looks for foreign objects in pg_catalog. The members of kingres_ledger,
+  kingres_timepart and kingres_columnar in `kingres` are not foreign.
+* **The system database `kingres_system`.** The readers of `kingres.*` and `kingres_cp.*` in it do not check an extension, because the service role owns the
+  database and no tenant is meant to have CREATE there. Defence in depth: at cluster init and at every start (`MigrateSystem`) `HardenSystemDatabase` revokes
+  everything of PUBLIC on the database (CONNECT, TEMPORARY) and CREATE in its schema `public`, and grants CONNECT to the cluster roles only (kingres_admin,
+  kingres_ops, kingres_readonly, kingres_stats): a console sign-in connects as the signing-in role, which is a member of one of them. A role with the right
+  password and no cluster role is answered like a wrong password (SQLSTATE 42501 is mapped to invalid credentials). The monitor checks the database in
+  every ledger pass (`extguard.SystemDatabaseProblems`: a superuser owns the database and its schemas kingres, kingres_cp and public, and no role that is not a
+  superuser can create schemas or objects there) and raises `extensionSchemaUntrusted` for `database:kingres_system` when it does not hold.
+* **A finding in the C library (not fixed here).** The library of kingres_shard takes the catalog to be present when relations named node, colocation,
+  dist_table, bucket_map, map_version and local_node exist in the schema `kingres` of any database, without asking whether they belong to the extension, and then
+  scans them. Views of a tenant with those names made the backend fail with a segmentation fault (observed on PostgreSQL 18); tables of a tenant would be taken
+  for the routing catalog. The fix is a separate change (branch xcat-fix); the spoof test leaves two of the six names out so that it does not crash the server.

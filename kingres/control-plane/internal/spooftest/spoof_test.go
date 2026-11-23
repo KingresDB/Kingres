@@ -97,7 +97,8 @@ func (e *env) plant(t *testing.T, db string, schemas ...string) {
 	e.tenant[db] = c
 	exec(t, c, "CREATE SCHEMA ts")
 	exec(t, c, "CREATE TABLE ts.marker (what text)")
-	exec(t, c, "CREATE FUNCTION ts.spoof(w text) RETURNS boolean LANGUAGE sql AS 'INSERT INTO ts.marker VALUES (w) RETURNING true'")
+	exec(t, c, "CREATE SEQUENCE ts.ms")
+	exec(t, c, "CREATE FUNCTION ts.spoof(w text) RETURNS boolean LANGUAGE sql AS 'WITH i AS (INSERT INTO ts.marker VALUES (w) RETURNING 1) SELECT nextval(''ts.ms'') > 0'")
 	exec(t, c, "CREATE SCHEMA evil")
 	exec(t, c, "CREATE FUNCTION evil.to_regclass(text) RETURNS regclass LANGUAGE sql AS 'SELECT CASE WHEN ts.spoof(''evil.to_regclass'') THEN NULL::regclass END'")
 	exec(t, c, "CREATE FUNCTION evil.to_regprocedure(text) RETURNS regprocedure LANGUAGE sql AS 'SELECT CASE WHEN ts.spoof(''evil.to_regprocedure'') THEN NULL::regprocedure END'")
@@ -110,7 +111,12 @@ func (e *env) plant(t *testing.T, db string, schemas ...string) {
 	for _, s := range schemas {
 		exec(t, c, "CREATE SCHEMA IF NOT EXISTS "+s)
 		for _, n := range kingresNames {
-			exec(t, c, "CREATE VIEW "+s+"."+n+" AS SELECT 1::bigint AS ledger_txid, 1::int AS group_id, 'x'::text AS host, 1::bigint AS version, 1::int AS node_id, 1::int AS bucket_count, 1::int AS colocation_id WHERE ts.spoof('"+s+"."+n+"')")
+			cols := "1::bigint AS ledger_txid, 1::int AS group_id, 'x'::text AS host, 1::bigint AS version, 1::int AS node_id, 1::int AS bucket_count, 1::int AS colocation_id"
+			if n == "ledger_digest" {
+				// the columns that the digest operation reads, so that the statements are valid and the function in them is what stops the planted code
+				cols = "1::bigint AS digest_id, now() AS generated_at, 'x'::name AS generated_by, 1::bigint AS height, NULL::bytea AS block_hash, '{}'::jsonb AS digest"
+			}
+			exec(t, c, "CREATE VIEW "+s+"."+n+" AS SELECT "+cols+" WHERE ts.spoof('"+s+"."+n+"')")
 		}
 		exec(t, c, "CREATE FUNCTION "+s+".ledger_head() RETURNS TABLE (chain_id bytea, height bigint, block_hash bytea, closed_at_us bigint) LANGUAGE sql AS 'SELECT NULL::bytea, 1::bigint, NULL::bytea, 1::bigint WHERE ts.spoof(''"+s+".ledger_head'')'")
 		exec(t, c, "CREATE FUNCTION "+s+".ledger_blocks_entries(bigint, integer) RETURNS TABLE (height bigint, entry bytea) LANGUAGE sql AS 'SELECT 1::bigint, NULL::bytea WHERE ts.spoof(''"+s+".ledger_blocks_entries'')'")
@@ -133,10 +139,21 @@ func (e *env) markers(t *testing.T, db string) []string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// the sequence is not rolled back with the transaction of the caller: a planted call in a transaction that failed afterwards is still seen
+	var called bool
+	if err := e.tenant[db].QueryRow(context.Background(), "SELECT is_called FROM ts.ms").Scan(&called); err != nil {
+		t.Fatal(err)
+	}
+	if called {
+		out = append(out, "(a call whose row was rolled back)")
+	}
 	return out
 }
 
-func (e *env) clear(t *testing.T, db string) { exec(t, e.tenant[db], "TRUNCATE ts.marker") }
+func (e *env) clear(t *testing.T, db string) {
+	exec(t, e.tenant[db], "TRUNCATE ts.marker")
+	exec(t, e.tenant[db], "SELECT setval('ts.ms', 1, false)")
+}
 
 func TestSchemaSpoofIsNeverExecuted(t *testing.T) {
 	in := pgtest.Start(t, nil)
@@ -277,13 +294,16 @@ func TestSchemaSpoofIsNeverExecuted(t *testing.T) {
 	}
 	// The ledger operations of the control plane (digests, verifications, client keys): the extension is not there, or its schema cannot be trusted, so they refuse.
 	for _, db := range []string{"nox", "tpx"} {
-		if _, err := o.GenerateDigest(ctx, db, "a"); err == nil {
+		_, err := o.GenerateDigest(ctx, db, "a")
+		t.Logf("%s: GenerateDigest: %v", db, err)
+		if err == nil {
 			t.Errorf("%s: a digest was made", db)
 		}
-		if _, err := o.ListDigests(ctx, db, store.Page{Limit: 5}); err == nil {
+		// the lists are empty for a database without a ledger; what matters is that nothing of the tenant ran (the markers below)
+		if p, err := o.ListDigests(ctx, db, store.Page{Limit: 5}); err == nil && len(p.Items) != 0 {
 			t.Errorf("%s: digests were listed", db)
 		}
-		if _, err := o.ListVerifications(ctx, db, store.Page{Limit: 5}); err == nil {
+		if p, err := o.ListVerifications(ctx, db, store.Page{Limit: 5}); err == nil && len(p.Items) != 0 {
 			t.Errorf("%s: verifications were listed", db)
 		}
 		if _, err := o.ListClientKeys(ctx, db); err == nil {
@@ -313,6 +333,34 @@ func TestSchemaSpoofIsNeverExecuted(t *testing.T) {
 		t.Errorf("nothing was installed over the schema of the tenant: %d %v", installed, err)
 	}
 
+	// 5. The system database: when someone can create there, the monitor raises the alert for it (the readers of kingres_cp in it do not check an extension).
+	if page, _ := monitor.List(ctx, sysc, "open", "", store.Page{Limit: 50}); func() bool {
+		for _, a := range page.Items {
+			if strings.Contains(a.Message, "kingres_system") {
+				return true
+			}
+		}
+		return false
+	}() {
+		t.Error("an alert for the system database before anything is wrong with it")
+	}
+	exec(t, sysc, "GRANT CREATE ON SCHEMA public TO PUBLIC")
+	for i := 0; i < 3; i++ {
+		r.Once(ctx, time.Now())
+	}
+	page, err = monitor.List(ctx, sysc, "open", "", store.Page{Limit: 50})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sysAlert := false
+	for _, a := range page.Items {
+		if a.Kind == "extensionSchemaUntrusted" && strings.Contains(a.Message, "database kingres_system") && strings.Contains(a.Message, "schemaCreate") {
+			sysAlert = true
+		}
+	}
+	if !sysAlert {
+		t.Errorf("no alert extensionSchemaUntrusted for kingres_system: %+v", page.Items)
+	}
 	// What none of it did: nothing of the tenant was run, in either database.
 	for _, db := range []string{"nox", "tpx"} {
 		if m := e.markers(t, db); len(m) != 0 {

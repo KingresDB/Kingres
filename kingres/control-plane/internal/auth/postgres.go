@@ -134,6 +134,11 @@ func classifyConnectError(err error) error {
 		if len(pgErr.Code) >= 2 && pgErr.Code[:2] == "28" {
 			return ErrInvalidCredentials
 		}
+		// 42501: the password was right and the role has no CONNECT on the system database, which only the cluster roles have (cluster.HardenSystemDatabase):
+		// it cannot use the console, and the answer is the one for a wrong password.
+		if pgErr.Code == "42501" {
+			return ErrInvalidCredentials
+		}
 		// Too many connections for the role, database missing, and so on.
 		return fmt.Errorf("%w: SQLSTATE %s", ErrUnavailable, pgErr.Code)
 	}

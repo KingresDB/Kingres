@@ -77,6 +77,7 @@ func (c *countingQ) Query(ctx context.Context, sql string, args ...any) (pgx.Row
 // tenantDB is a database that the tenant role owns, with the schemas of the tests, opened as the service role with a fixed search_path.
 type tenantDB struct {
 	su, tenant *pgx.Conn
+	in         *pgtest.Instance
 }
 
 func (d *tenantDB) mustSU(t *testing.T, sql string) {
@@ -115,7 +116,7 @@ func startTenant(t *testing.T) *tenantDB {
 		t.Cleanup(func() { _ = c.Close(context.Background()) })
 		return c
 	}
-	return &tenantDB{su: open("kingresd", pgtest.Password), tenant: open("tenant", "tenant-pw")}
+	return &tenantDB{su: open("kingresd", pgtest.Password), tenant: open("tenant", "tenant-pw"), in: in}
 }
 
 func (d *tenantDB) install(t *testing.T, ext string) {
@@ -556,5 +557,75 @@ func TestShardIsCheckedInTheSchemaKingres(t *testing.T) {
 		if _, r := verifyReason(t, d.su, Shard); r != "" {
 			t.Fatalf("after %s: %q", c.undo, r)
 		}
+	}
+}
+
+func TestSystemDatabaseProblems(t *testing.T) {
+	d := startTenant(t)
+	ctx := context.Background()
+	// the database that the tenant owns is not a system database
+	probs, err := SystemDatabaseProblems(ctx, d.su)
+	hasOwner := false
+	for _, p := range probs {
+		hasOwner = hasOwner || p == SystemProblem{"database", ReasonDatabaseOwner}
+	}
+	if err != nil || !hasOwner {
+		t.Fatalf("a database of the tenant: %v %v", probs, err)
+	}
+	// the system database as the control plane makes it
+	sys := startSystem(t, d)
+	if probs, err := SystemDatabaseProblems(ctx, sys); err != nil || len(probs) != 0 {
+		t.Fatalf("a clean system database: %v %v", probs, err)
+	}
+	for _, c := range []struct {
+		bad, undo string
+		want      SystemProblem
+	}{
+		{"GRANT CREATE ON DATABASE sysd TO PUBLIC", "REVOKE CREATE ON DATABASE sysd FROM PUBLIC", SystemProblem{"database", ReasonDatabaseCreate}},
+		{"GRANT CREATE ON DATABASE sysd TO tenant", "REVOKE CREATE ON DATABASE sysd FROM tenant", SystemProblem{"database", ReasonDatabaseCreate}},
+		{"GRANT CREATE ON SCHEMA public TO PUBLIC", "REVOKE CREATE ON SCHEMA public FROM PUBLIC", SystemProblem{"public", ReasonSchemaCreate}},
+		{"GRANT CREATE ON SCHEMA kingres_cp TO tenant", "REVOKE CREATE ON SCHEMA kingres_cp FROM tenant", SystemProblem{"kingres_cp", ReasonSchemaCreate}},
+		{"ALTER SCHEMA kingres OWNER TO tenant", "ALTER SCHEMA kingres OWNER TO kingresd", SystemProblem{"kingres", ReasonSchemaOwner}},
+		{"ALTER SCHEMA kingres_cp OWNER TO tenant", "ALTER SCHEMA kingres_cp OWNER TO kingresd", SystemProblem{"kingres_cp", ReasonSchemaOwner}},
+	} {
+		sysExec(t, sys, c.bad)
+		probs, err := SystemDatabaseProblems(ctx, sys)
+		found := false
+		for _, p := range probs {
+			found = found || p == c.want
+		}
+		if err != nil || !found {
+			t.Errorf("%s: %v %v, want %v", c.bad, probs, err, c.want)
+		}
+		sysExec(t, sys, c.undo)
+		if probs, _ := SystemDatabaseProblems(ctx, sys); len(probs) != 0 {
+			t.Fatalf("after %s: %v", c.undo, probs)
+		}
+	}
+}
+
+// startSystem makes a database as the control plane makes its system database (owned by the service role, with the schemas kingres and kingres_cp) and returns a
+// connection to it.
+func startSystem(t *testing.T, d *tenantDB) *pgx.Conn {
+	t.Helper()
+	d.mustSU(t, "CREATE DATABASE sysd")
+	cfg, err := pgx.ParseConfig(d.in.DSN("sysd"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.RuntimeParams["search_path"] = "pg_catalog"
+	c, err := pgx.ConnectConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
+	sysExec(t, c, "CREATE SCHEMA kingres; CREATE SCHEMA kingres_cp")
+	return c
+}
+
+func sysExec(t *testing.T, c *pgx.Conn, sql string) {
+	t.Helper()
+	if _, err := c.Exec(context.Background(), sql); err != nil {
+		t.Fatalf("%s: %v", sql, err)
 	}
 }
