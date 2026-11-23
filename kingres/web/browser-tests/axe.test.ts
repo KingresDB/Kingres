@@ -11,7 +11,8 @@ import {
   HA_SWITCHES,
   ROUTES,
   SECURITY_TABS,
-  STATES,
+  OLDER_STATES,
+  TRANSFER_STATES,
   clickText,
   go,
   launch,
@@ -140,7 +141,25 @@ describe('axe in a real browser', () => {
     ] as const) {
       await page.emulateMediaFeatures([{ name: 'prefers-color-scheme', value: theme }])
       await page.setViewport({ width, height: 800 })
-      for (const state of STATES) {
+      for (const state of OLDER_STATES) {
+        await go(page, state.route)
+        await state.open(page)
+        failures.push(...(await axeViolations(`${state.name} ${theme} ${width}`)))
+        await state.close?.(page)
+      }
+    }
+    expect(failures).toEqual([])
+  })
+
+  it('the data transfer states (0.19.0): the panel, the settings group, the export and import dialogs and their results', async () => {
+    const failures: string[] = []
+    for (const [theme, width] of [
+      ['light', 1366],
+      ['dark', 320],
+    ] as const) {
+      await page.emulateMediaFeatures([{ name: 'prefers-color-scheme', value: theme }])
+      await page.setViewport({ width, height: 800 })
+      for (const state of TRANSFER_STATES) {
         await go(page, state.route)
         await state.open(page)
         failures.push(...(await axeViolations(`${state.name} ${theme} ${width}`)))

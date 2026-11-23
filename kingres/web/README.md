@@ -75,6 +75,7 @@ Development switches in the URL (mock API only):
 | `?anchors=testfail`, `testwarn`                                                       | 0.11.0 (Console B): the test of a target finds a failed check (the store refused the credentials, the authority did not answer, no calendar answered) or a warning. A failed check is a result, never an HTTP error.                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `?anchors=refuse:<code>`                                                              | 0.11.0 (Console B): every change (add, change, delete, test, anchor now, retry) answers that problem code (`validation_failed`, `already_exists`, `immutable_field`, `conflict`, `not_found`, `forbidden`, `leader_unavailable`, `ledger_not_published`, `unprocessable`, ...); reading still works.                                                                                                                                                                                                                                                                                                                                           |
 | `?clock=off:10.0.0.12:-20000`                                                         | 0.8.0: the clock of that server is that many milliseconds ahead (negative: behind). The default is `10.0.0.13` at +1820 ms, which raises the alert `clockDifference`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `?transfer=off,insecure,full,small,session,cut,short,exports`                         | 0.19.0: the states of the data transfer (see `mocks/switches.ts`): the setting off, no TLS, a full staging area, small chunks, the next chunk answered 401, a cut chunk and download, a short download, three export files.                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `?clock=unreachable:10.0.0.12`                                                        | 0.8.0: the clock of that server cannot be read (`reachable: false`, no values, never 0).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `?latency=0`                                                                          | No artificial delay (the default is 150 ms).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 
@@ -443,7 +444,7 @@ tokens instead.
 
 ## Contract revisions and the checks against them
 
-The generated files (`src/api/schema.d.ts`, `src/api/operations.generated.ts`) follow contract **0.12.0** (the last one generated from, in commit "the panel follows contract 0.12.0"; the newest note of a revision in them is "Added in 0.12.0"). The revision of `kingres/api/openapi.yaml` is now **0.13.0** (the switchover of a group, the failover of the map group, the alert `certificateAuthorityUnavailable`), which the generated files do not contain yet. `npm run api:check` and the contract tests compare
+The generated files (`src/api/schema.d.ts`, `src/api/operations.generated.ts`) follow contract **0.19.0** (data transfer, phase 14a). The revision of `kingres/api/openapi.yaml` is the one they are generated from. `npm run api:check` and the contract tests compare
 with that file. While the working tree holds a draft of a later revision they fail, and that failure says nothing about the
 panel; to check against another copy of the contract (for example the committed one), point `KINGRES_API_SPEC` at it:
 
@@ -529,6 +530,72 @@ The Ledger page has a sixth tab, **Client keys** (`?tab=clients`, after Anchorin
 - **Mock.** `?bundle=expired` (a bundle answers 410), `?bundle=refuse:<code>` (a bundle or an acknowledgement answers that code), `?publication=reopened`; `?phase7=today` is the server of today.
 - **Waits for the contract or the server.** The result of the bundle task (an id) is read from the task detail; a verification record has no member that says which checks ran; one proof per bundle is offered
   (the contract takes a list). Tests: `ledger-ops-0-11.test.ts`; the browser tests have three new states (the bundle dialog, the acknowledgement dialog, the audit card).
+
+## What the panel does for contract 0.19.0 (data transfer, phase 14a)
+
+Contract 0.19.0 adds ten operations under the tag `Data transfer`: `exportTable`, `importTable`, the four calls of an upload
+(`createDataUpload`, `getDataUpload`, `uploadDataChunk`, `deleteDataUpload`), the three calls of an export file
+(`listDataExports`, `getDataExport`, `deleteDataExport`) and `downloadDataExport`. They need `kingres_admin`, the cluster
+setting `dataTransfer.enabled` (403 `data_transfer_disabled` while it is off) and a request over TLS. The console part is
+built in five increments (CN1 to CN5 of `docs/design/data-export-import.md`); the generated files are those of 0.19.0.
+
+- **API layer** (`src/api/endpoints.ts`, `queries.ts`). The calls of an upload and `refreshSession` keep the session in
+  place on a 401 (`unwrap(call, { keepSession: true })`): the page is not sent to the sign-in page, the uploader asks for the
+  password and goes on. `uploadDataChunk` returns the offset the server holds; a 409 `upload_offset_mismatch` is not thrown, it
+  is returned with the right offset (`conflict: true`). `downloadDataExport(id, from)` returns the stream and the headers
+  (status, `Content-Length`, `Content-Range`, `ETag`). The texts of the twelve new problem codes are in `problem.ts`.
+- **Settings.** The settings page has a _Data transfer_ group (the switch, retention, largest file, staging quota, transfers
+  at once). Only what the person changed is sent; the sizes are in GiB in the form and in bytes on the wire. The page says that
+  turning it on is recorded in the audit log and that an import takes at most 2 GiB.
+- **Transfers panel** (`components/transfers/TransfersPanel.vue`, on the databases page and on a database page). The export
+  files of the signed-in role with state, size, rows, consistency, SHA-256 and expiry, _Download_ and _Delete_, and the
+  uploads this tab started (from `sessionStorage`; the server lists none) with _Delete upload_. It asks the server for nothing and
+  says why when the setting is off or the role is below administrator.
+- **Row actions** (`TableTransferActions.vue`, in the tables list of a database; mount it in the header of the table page
+  too). _Export CSV_ and _Import CSV_ are disabled with the reason when the role is too low (`GateButton`), when data transfer
+  is off, and while the table has an unfinished task (the subject `database/schema.table`).
+- **Export CSV dialog.** Before the confirmation it says what the file guarantees for the kind of table (one snapshot, or each
+  group at its own moment), explains the spreadsheet guard and says it is a convenience and not a security feature (with a
+  warning when it is off), and checks the options. It asks for the acceptance of code of another role when the server refuses
+  with `export_untrusted_code`. The task shows its steps; the result shows size, rows, SHA-256, expiry, the consistency
+  label, the sentence about exporting twice to compare the sums, and the download.
+- **The download** (`lib/downloader.ts`). It writes to a file the person chooses (File System Access API) so that the size is
+  not limited by memory; for a small file in another browser it keeps the bytes in memory (at most 256 MiB) and verifies the
+  SHA-256 before handing them over; for a larger file there it falls back to the browser's own download of the link. After a
+  break it asks for the rest with `Range: bytes=n-`, checks the status, `Content-Range`, `Content-Length` and `ETag` of every
+  answer (a server that ignores `Range` has its first n bytes skipped), and reports a short, changed, expired or refused file in
+  words that say how many bytes arrived. A file that is short or whose SHA-256 differs is **never** saved.
+- **Import CSV dialog.** Step 1: a drop zone and a file input; the first 64 KiB are read in the browser (`File.slice`) for a
+  preview and a guess of the encoding, delimiter and header, and the size is shown against the 2 GiB limit of one import
+  before anything is sent (a compressed file is counted by the server after expansion). Step 2: the options, the statement that
+  the import is all or nothing, and the columns in the order of the file. Step 3: the upload (`lib/uploader.ts`): `Blob.slice`
+  chunks of 64 MiB (cut to what the server accepts, a multiple of 64 KiB), one at a time; after a break, a conflict or a failure
+  the offset is read again from the server; the session is checked between chunks and on a 401 the uploader stops and asks for
+  the password, then goes on from the server's offset; pause, resume and cancel (which deletes the upload). The id, name, size and
+  modification time are kept in `sessionStorage` inside `try/catch`, so that choosing the same file continues the upload; a file of
+  another size is refused. Step 4: the import as a task. A failed import shows the sentence of the server (it names a column and
+  a line, never a value) and offers to change the options without sending the file again; `import_outcome_unknown` says to check
+  the table and offers no repeat. Names and cells from a file are drawn through `SafeName`.
+- **Mock** (`src/mocks/transfer.ts`, `transfer-data.ts`, `transfer-switches.ts`, `sha256.ts`). It behaves like the server: offsets
+  read from what is held, 409 with the right `Upload-Offset`, 64 KiB alignment, 413, `Range` and 206, 416, 410 after retention,
+  the setting off, no TLS, the role, creator-only files, quota, one task per table. Fixtures: tables `failme` (the export fails),
+  `blockme` (another operation), `skewme` (per group), `othercode` (needs the acceptance); files `badrow.csv`, `toobig.csv`,
+  `outcome.csv`, `endmarker.csv`, `header.csv` (by file name). `?transfer=` switches: `off`, `insecure`, `full`, `small`,
+  `session`, `cut`, `short`, `exports`.
+- **Tests.** `tests/transfer-mock-0-19.test.ts`, `downloader-0-19`, `uploader-0-19`, `csv-guess-0-19`, `transfers-panel-0-19`,
+  `export-dialog-0-19`, `import-dialog-0-19`; the browser tests have fifteen more states (`harness.ts`, `STATES`) in the axe and
+  layout runs, light and dark, at 1366 and 320 px.
+- **After the independent review** (`docs/reviews/2026-11-22-console-data-transfer-14a.md`). The uploader pauses and caps a conflict that does not move
+  the offset (a busy writer), takes a 400 that carries `Upload-Offset` as an answer about the offset, never forgets an upload whose delete was
+  refused (`deletePending`; the panel deletes it), and asks before it cancels much. The tab's uploads are kept per person with a fingerprint of the
+  first and last 64 KiB of the file and are marked after an import with an unknown outcome (the same file then needs a tick). The dialog knows the
+  cap of the table class (2 GiB, 256 MiB for a reference table). The download reports a failing file as `save`, goes on from its bytes after a
+  sign-in, stops when the console's session ends, and its browser-link fallback shows the size and SHA-256 with the commands to check them. The
+  mock switches `busy`, `cut400` and the download that loses its session (`sessionEndsOnDownload`) make these states reachable.
+- **Known limits.** The actions are mounted in the tables list of a database (small buttons) and in the header of the table page of
+  phase 9 (full-size), by the same `TableTransferActions`. No browser test downloads a file (headless Chrome would open the file picker); the
+  download is tested through the same code with a stream that breaks. A pause cuts the request in flight; the server keeps the
+  whole 64 KiB segments it received.
 
 ### The table page and the table lifecycle (increment 9.7 of phase 9, contract 0.14.0)
 

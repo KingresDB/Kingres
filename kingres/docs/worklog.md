@@ -339,25 +339,64 @@ None.
 
 ## 2026-11-22: the table page and the table dialogs of the console (phase 9, increment 9.7) moved onto the control plane of 9.6
 
-Branch web-15b (from m18) carries the one console commit of web-15 for increment 9.7, cherry-picked so that the history stays one commit. web-15 also holds the failover console of contract 0.15.0, which m18 does not have; it is not taken here.
+## 2026-11-22: the console of phase 14a, table CSV export and import (increments CN1 to CN5, contract 0.19.0)
+
+Branch `dx-web`, from the contract commit cb4afe3757 of branch `dx-cp`. The control plane is written on `dx-cp` by another writer; this
+entry covers the console only. No Go code and no contract text was changed.
 
 ### What was done
 
-- The table page `/databases/<name>/tables/<schema>/<table>`, the dialogs distribute, undistribute, change the distribution, create, attach, detach and drop a partition, the preview panel and the task panel, from web-15.
-- The conflicts (README, browser harness, `mocks/http.ts`, `mocks/state.ts`) all came from the 0.15.0 failover console; only the 0.14.0 table parts were kept. The fixed-shape mock handlers that 9.6 put on m18 for the eight operations were replaced by the mock of 9.7 (`src/mocks/tables.ts`); the generated types, operations and problem codes are those of m18, and no stand-in type is left. A doc comment that had slipped above a new constant in `handlers.ts` was put back.
-- Checked against shard-phase9.md: each of the eight operations of 9.6 has its UI (the preview in every dialog, undistribute, alter, create, attach, detach, drop, the list of partitions). Not done as the design describes: the progress indicator on a row of the tables list and the badge on the Shards page need an `operation` field on `Table`, which contract 0.14.0 does not have; "distribute with related tables" (control plane and dialog) stays open, as the README says. The reviews in kingres/docs/reviews say nothing about the console of 9.7 (the review of increments 4 to 9 lists the console as not in the commits).
+- **CN1, API layer and mock.** The ten operations in `endpoints.ts` and `queries.ts`; calls that keep the session in place on a
+  401 (`unwrap(..., { keepSession: true })`) for the uploader; the texts of the twelve new problem codes; the labels of the task
+  kinds `table.export` and `table.import` and of the eight new audit actions (the red tests A0 left); a mock that behaves like
+  the server (offsets, 409 with the right offset, 64 KiB alignment, `Range` and 206, 416, 410, a 401 in the middle of an upload,
+  quota, the setting off, the role, creator-only files) with the fixtures of the design and a real SHA-256, and the `?transfer=` switches.
+- **CN2.** The *Data transfer* group of the settings page; the Transfers panel (export files and the uploads of the tab, Download,
+  Delete) on the databases page and on a database page; the resumable download (`lib/downloader.ts`).
+- **CN3.** *Export CSV* in the tables list: gates, consistency sentence before the confirmation, the spreadsheet text, options,
+  acceptance of code of another role, task progress, result with the SHA-256, the sentence about exporting twice, the download.
+- **CN4.** *Import CSV*: local preview and guess, the limit shown before the upload, options, the uploader (`Blob.slice`, 64 MiB,
+  re-read offset, password on a 401, pause, resume, cancel, `sessionStorage` in `try/catch`), the import task, the whitelisted
+  errors and the wording of `import_outcome_unknown`.
+- **CN5.** Tests, fifteen browser states, mutants (below), README and this entry.
 
-### How it was checked
+### How it was verified
 
-- `npm run typecheck`, `npm run lint` (eslint and prettier) and `npm run api:check`: clean.
-- `npx vitest run`: 92 files, 1513 tests passed.
-- `npm run test:browser` (Chrome): 3 files, 46 tests passed (axe in light and dark at 1366 and 320 px, layout, content security policy), including the table route and the four table states.
-- Mutants, each caught by the tests and reverted: a blocked change no longer holds the start; the partition name limit raised by 100 bytes; "Cancel the task" shown for a task that cannot be cancelled.
-- `go test ./internal/...` on Windows: every package passes except `internal/pgconninfo`, whose test binary Windows refuses to run ("Access is denied", a build failure, repeated). No Go file is changed here. `internalapi` and `ledgersign` failed once under the load of the browser run and passed alone.
+- Typecheck, lint (eslint with no warning, prettier), `npm run api:check`.
+- The full vitest suite: 97 files, 1580 tests, all passed.
+- The browser tests (`npm run test:browser`, 12 minutes): 3 files, 49 tests, all passed. They include the axe run of fourteen states of the data transfer (the settings group, the panel with files and with the setting off, the export dialog and its refusal, its result and its failure, the import dialog with the preview, the options, the stop for the password, the refused size, a failed import and an unknown outcome) in light at 1366 px and dark at 320 px, and the layout run of the same states at 1366 and 320 px.
+- **Mutants of the console** (a defect put in by hand, the tests that must notice it run, the file restored): 31 of 31 killed.
+  They cover the downloader (a short file called complete, the ETag, the SHA-256, a resume from byte 0, `Content-Range`, more bytes
+  than the record), the uploader (a conflict taken from the client, no re-read after a break, the 2 GiB cap missing or applied to a
+  compressed file, a 401 as a failure, no session check between chunks, another size continued, cancel without delete, an unaligned
+  chunk), the dialogs (the limit as `>=`, a repeat offered after an unknown outcome, the upload dropped after a failure), the
+  options (the null limit, `skipBom`, the spreadsheet guard, the consistency sentence), the gates and the panel, the settings
+  (sizes always sent), and the mock (another role sees a file, the alignment, a range past the end, a value in the failure text).
 
-### The review of the console (2026-11-22) and its fixes
+### The review of the console and its fixes
 
-The independent review (docs/reviews/2026-11-22-console-phase9-7.md, no critical or high finding) had seven findings, all fixed in a second commit on web-15b: type-to-confirm and the danger tone for undistribute and alter (C97R-001); no claim that a cancelled task left the table as it was, the detail of the task shown and read again after a cancel (C97R-002); the mock switches blockme, diffme, pending, undo:<ms> and undo:fail with tests of the paused, verification-failed and pending states (C97R-003); a test that the start waits for the preview (C97R-004); a name on every group of radios (C97R-005); a test of the 57 bytes with two-byte letters (C97R-006); pending tasks hold the buttons and the page reads 200 tasks (C97R-007). The runs and the mutants are in the Fixes section of the review and in the final report of the work.
+The independent review ([reviews/2026-11-22-console-data-transfer-14a.md](reviews/2026-11-22-console-data-transfer-14a.md)) found no critical or
+high finding, eight medium (DXW-01 to DXW-08) and nine low ones. All are fixed with tests, with the tip of `dx-cp` (97976b3c44) merged: a conflict
+that does not move the offset waits and stops as busy; a cancel whose delete was refused keeps the upload listed and says so; an import
+repeat after an unknown outcome needs a tick; the cap of a reference table (256 MiB) is known before the upload; a failing file is a
+save error and never hangs the dialog; a download that loses its session asks for the password and goes on from its bytes; the link
+fallback shows the size and the SHA-256 and the commands to check it and is for administrators only; a 400 that carries the offset
+resumes; a stream that fails after the last byte is complete; a download stops when the session of the console ends; uploads are
+kept per person with a fingerprint of the file; a file that cannot be previewed gets no default for its first line. 37 mutants of the
+fixed code were killed. The two contract requests of the review (the spreadsheet option and the effective import cap) were answered in contract 0.19.0
+(`DataExport.spreadsheetSafe`, `DataTransferSettings.maxAtomicBytes`) and the console uses them: the download dialog warns about a file
+written with the guard off, and the cap of one import comes from the server (a reference table stays at 256 MiB). Both are done.
+The transfer actions are also in the header of the table page of phase 9.7 (branch `web-15b` merged).
+
+### Decisions and deviations
+
+- The download is not only the plain link of the design: a fetch with `Range` resumes after a break and reports a short file; the
+  link is the fallback for a large file in a browser that cannot write to a file as it goes.
+- A file kept in memory is checked against the SHA-256 of the export before it is handed over; a mismatch saves nothing.
+- The 2 GiB cap is enforced in the browser before the first byte for an uncompressed file; for a gzip file the server counts after
+  expansion, so only the largest staged file applies.
+- The actions are mounted in the tables list of a database; the table page of phase 9 (branch `web-15b`) is not in this base and
+  takes `TableTransferActions` in its header.
 
 ### Still open
 
@@ -444,6 +483,13 @@ Covers branch p12-storage (from p12f-fix, kingres_shard 0.8 with the review fixe
   An earlier gate of the S1 commit alone had the same version failures and one failure of `t/085` on 18 that did not repeat (a wait for a WAL segment; it passes alone).
 - `kingres_ledger` (regress and 39 TAP files, 2587 tests) on 18 and 19 with the check of rule L1: all pass.
 
+- E1 (the console against a real `kingresd`), after CP3, CP5 and CN4.
+- A browser test that downloads a file (headless Chrome would open the file picker).
+
+### Core patches
+
+None.
+
 ## 2026-11-22 (later): fixes of the independent review of phase 14a
 
 ### What was done
@@ -511,6 +557,33 @@ Covers branch p12-storage (from p12f-fix, kingres_shard 0.8 with the review fixe
 ### Still open
 
 - The connections that the sharding extension opens to other nodes are not audited here.
+
+## 2026-11-22: the table page and the table dialogs of the console (phase 9, increment 9.7) moved onto the control plane of 9.6
+
+Branch web-15b (from m18) carries the one console commit of web-15 for increment 9.7, cherry-picked so that the history stays one commit. web-15 also holds the failover console of contract 0.15.0, which m18 does not have; it is not taken here.
+
+### What was done
+
+- The table page `/databases/<name>/tables/<schema>/<table>`, the dialogs distribute, undistribute, change the distribution, create, attach, detach and drop a partition, the preview panel and the task panel, from web-15.
+- The conflicts (README, browser harness, `mocks/http.ts`, `mocks/state.ts`) all came from the 0.15.0 failover console; only the 0.14.0 table parts were kept. The fixed-shape mock handlers that 9.6 put on m18 for the eight operations were replaced by the mock of 9.7 (`src/mocks/tables.ts`); the generated types, operations and problem codes are those of m18, and no stand-in type is left. A doc comment that had slipped above a new constant in `handlers.ts` was put back.
+- Checked against shard-phase9.md: each of the eight operations of 9.6 has its UI (the preview in every dialog, undistribute, alter, create, attach, detach, drop, the list of partitions). Not done as the design describes: the progress indicator on a row of the tables list and the badge on the Shards page need an `operation` field on `Table`, which contract 0.14.0 does not have; "distribute with related tables" (control plane and dialog) stays open, as the README says. The reviews in kingres/docs/reviews say nothing about the console of 9.7 (the review of increments 4 to 9 lists the console as not in the commits).
+
+### How it was checked
+
+- `npm run typecheck`, `npm run lint` (eslint and prettier) and `npm run api:check`: clean.
+- `npx vitest run`: 92 files, 1513 tests passed.
+- `npm run test:browser` (Chrome): 3 files, 46 tests passed (axe in light and dark at 1366 and 320 px, layout, content security policy), including the table route and the four table states.
+- Mutants, each caught by the tests and reverted: a blocked change no longer holds the start; the partition name limit raised by 100 bytes; "Cancel the task" shown for a task that cannot be cancelled.
+- `go test ./internal/...` on Windows: every package passes except `internal/pgconninfo`, whose test binary Windows refuses to run ("Access is denied", a build failure, repeated). No Go file is changed here. `internalapi` and `ledgersign` failed once under the load of the browser run and passed alone.
+
+### The review of the console (2026-11-22) and its fixes
+
+The independent review (docs/reviews/2026-11-22-console-phase9-7.md, no critical or high finding) had seven findings, all fixed in a second commit on web-15b: type-to-confirm and the danger tone for undistribute and alter (C97R-001); no claim that a cancelled task left the table as it was, the detail of the task shown and read again after a cancel (C97R-002); the mock switches blockme, diffme, pending, undo:<ms> and undo:fail with tests of the paused, verification-failed and pending states (C97R-003); a test that the start waits for the preview (C97R-004); a name on every group of radios (C97R-005); a test of the 57 bytes with two-byte letters (C97R-006); pending tasks hold the buttons and the page reads 200 tasks (C97R-007). The runs and the mutants are in the Fixes section of the review and in the final report of the work.
+
+### Still open
+
+- The progress indicators that need `Table.operation`; distribute with related tables.
+- Not pushed.
 
 ---
 

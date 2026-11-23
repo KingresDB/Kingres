@@ -9,6 +9,7 @@ import { DEFAULT_AUTOMATIC } from './state'
 import { ledgerHandlers } from './ledger'
 import { decorateStatus, distributedSchemaCount, elasticityHandlers } from './elasticity'
 import { analyticsHandlers, describePartitions, describeTable, explainPlan } from './analytics'
+import { transferHandlers } from './transfer'
 import { AGGREGATE_SIZE, anchoringOf, digestAnchorsOf, l7, publicationOf } from './ledger-view'
 import type { HttpHandler } from 'msw'
 import type { components } from '@/api/schema'
@@ -1044,6 +1045,15 @@ function metricValue(metric: S['MetricName'], serverId: number, t: number): numb
       return 1800 + serverId * 120 + wave(500, 5) * 900
     case 'bucketsUnderReplicated':
       return 0
+    // The data transfer (0.19.0): only the manager leader holds staged files.
+    case 'transferStagingUsedBytes':
+      return (2 + wave(1800, 6) * 3) * 1024 * MiB
+    case 'transferStagingFreeBytes':
+      return (80 - wave(1800, 6) * 3) * 1024 * MiB
+    case 'transfersRunning':
+      return Math.round(wave(300, 7) * 2)
+    case 'transfersStaged':
+      return 3
     default:
       return clientMetricValue(metric, serverId, t)
   }
@@ -1126,6 +1136,10 @@ const METRIC_UNIT: Record<S['MetricName'], S['MetricQueryResult']['unit']> = {
   transactionsPerSecond: 'countPerSecond',
   queriesPerSecond: 'countPerSecond',
   bucketsUnderReplicated: 'count',
+  transferStagingUsedBytes: 'bytes',
+  transferStagingFreeBytes: 'bytes',
+  transfersRunning: 'count',
+  transfersStaged: 'count',
   clientConnectionsAccepted: 'count',
   clientConnectionsActive: 'count',
   clientConnectionsRefused: 'count',
@@ -1344,6 +1358,9 @@ export function createHandlers(): HttpHandler[] {
     ...ledgerHandlers(),
     ...elasticityHandlers(),
     ...analyticsHandlers(),
+    ...transferHandlers((rec, t) =>
+      (rec.extraColumns?.[t.name] ?? columnsFor(rec, t)).map((col) => col.name),
+    ),
     getHealth: () => ok({ status: 'ok' }),
     getReadiness: (c) =>
       ok({
@@ -2835,6 +2852,26 @@ export function createHandlers(): HttpHandler[] {
           field: 'analytics.allowNonSuperuserOwners',
           message: 'Say true or false.',
         })
+      const dt = b.dataTransfer
+      if (dt !== undefined) {
+        if (Object.keys(dt).length === 0)
+          errors.push({ field: '/dataTransfer', message: 'at least one property is required' })
+        if (
+          dt.retentionHours !== undefined &&
+          (!Number.isInteger(dt.retentionHours) || dt.retentionHours < 1 || dt.retentionHours > 168)
+        )
+          errors.push({ field: 'dataTransfer.retentionHours', message: 'Between 1 and 168 hours.' })
+        for (const f of ['maxFileBytes', 'stagingQuotaBytes'] as const) {
+          const v = dt[f]
+          if (v !== undefined && (!Number.isInteger(v) || v < 1048576))
+            errors.push({ field: `dataTransfer.${f}`, message: 'At least 1 MiB.' })
+        }
+        if (
+          dt.maxConcurrent !== undefined &&
+          (!Number.isInteger(dt.maxConcurrent) || dt.maxConcurrent < 1 || dt.maxConcurrent > 16)
+        )
+          errors.push({ field: 'dataTransfer.maxConcurrent', message: 'Between 1 and 16.' })
+      }
       if (errors.length) throw validationFailed(errors)
       if (
         (b.features?.sharding === false && s.settings.features.sharding) ||
@@ -2870,6 +2907,11 @@ export function createHandlers(): HttpHandler[] {
       }
       if (b.analytics)
         cur.analytics = { allowNonSuperuserOwners: b.analytics.allowNonSuperuserOwners === true }
+      if (b.dataTransfer && cur.dataTransfer)
+        cur.dataTransfer = {
+          ...cur.dataTransfer,
+          ...Object.fromEntries(Object.entries(b.dataTransfer).filter(([, v]) => v !== undefined)),
+        }
       if (b.clock?.maxDifferenceMs !== undefined)
         cur.clock = { maxDifferenceMs: b.clock.maxDifferenceMs }
       if (b.features?.sharding && !cur.features.sharding) {

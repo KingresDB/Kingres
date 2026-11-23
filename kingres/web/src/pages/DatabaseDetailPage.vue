@@ -22,6 +22,8 @@ import StorageBadge from '@/components/tables/StorageBadge.vue'
 import SetStorageDialog from '@/components/tables/SetStorageDialog.vue'
 import PartitionPolicyDialog from '@/components/tables/PartitionPolicyDialog.vue'
 import { matchesStorage, type StorageFilter } from '@/lib/analytics'
+import TransfersPanel from '@/components/transfers/TransfersPanel.vue'
+import TableTransferActions from '@/components/transfers/TableTransferActions.vue'
 import { endpoints } from '@/api/endpoints'
 import { keys, useDatabase, useTables } from '@/api/queries'
 import { DATABASE_STATUS, DURABILITY_LABEL, LEDGER_MODE_LABEL, LEDGER_STATE } from '@/lib/status'
@@ -311,6 +313,7 @@ function storageBlocked(t: Table): string {
                       >
                         Time partitioning...
                       </GateButton>
+                      <TableTransferActions :database-name="name" :table="t" />
                     </div>
                   </td>
                 </tr>
@@ -326,6 +329,7 @@ function storageBlocked(t: Table): string {
           </p>
         </QueryBoundary>
       </section>
+      <TransfersPanel :database="db.name" />
     </div>
   </QueryBoundary>
 

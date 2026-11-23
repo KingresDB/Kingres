@@ -11,6 +11,7 @@ import { canCall } from '@/api/roles'
 import type { AuditAction, Problem, ProblemCode, Task } from '@/api/types'
 import { syncLedgerAlerts } from './ledger-view'
 import { createMockState, mockConfig, tickTasks, tickHa, findTask, type MockState } from './state'
+import { resetTransferSwitches } from './transfer-data'
 
 let state: MockState = createMockState()
 
@@ -71,6 +72,7 @@ export function resetMockState(options: { uninitialized?: boolean } = {}): MockS
   mockConfig.syncGraceMs = 30000
   mockConfig.leaseDurationMs = 10000
   mockConfig.defaultStatementTimeoutMs = 30000
+  resetTransferSwitches()
   return state
 }
 
@@ -134,6 +136,18 @@ const STATUS: Record<ProblemCode, number> = {
   extension_missing: 409,
   conversion_refused: 409,
   partition_policy_conflict: 409,
+  data_transfer_disabled: 403,
+  insecure_transport: 403,
+  transfer_quota_exceeded: 409,
+  upload_incomplete: 409,
+  upload_offset_mismatch: 409,
+  chunk_too_large: 413,
+  upload_checksum_mismatch: 422,
+  import_header_mismatch: 422,
+  import_ledger_policy: 422,
+  import_too_large: 422,
+  import_end_marker: 422,
+  export_untrusted_code: 422,
   insufficient_disk: 409,
   no_receiving_server: 409,
   replicas_cannot_be_kept: 409,
@@ -204,6 +218,10 @@ export interface Reply {
   rawJson?: string
   /** Bytes sent as they are (an archive, an evidence file); `Content-Type` comes from `headers`. */
   rawBody?: Uint8Array
+  /** A body that is sent as it is read, and can end early or fail (a download that breaks). */
+  stream?: ReadableStream<Uint8Array>
+  /** The connection breaks: the client gets no HTTP response at all. */
+  networkError?: boolean
   headers?: Record<string, string>
 }
 
@@ -304,6 +322,9 @@ export function register(operationId: OperationId, handler: Handler): HttpHandle
       if (MUTATING.has(request.method) && operationId !== 'login' && !dryRun)
         audit(s, operationId, flat, reply.status)
       const headers = { 'X-Request-Id': requestId, ...reply.headers }
+      if (reply.networkError) return HttpResponse.error()
+      if (reply.stream !== undefined)
+        return new HttpResponse(reply.stream, { status: reply.status, headers })
       if (reply.rawJson !== undefined)
         return new HttpResponse(reply.rawJson, {
           status: reply.status,

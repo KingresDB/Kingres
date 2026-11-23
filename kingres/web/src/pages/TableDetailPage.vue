@@ -24,6 +24,7 @@ import TableTasksPanel from '@/components/tables/TableTasksPanel.vue'
 import StorageBadge from '@/components/tables/StorageBadge.vue'
 import SetStorageDialog from '@/components/tables/SetStorageDialog.vue'
 import PartitionPolicyPanel from '@/components/tables/PartitionPolicyPanel.vue'
+import TableTransferActions from '@/components/transfers/TableTransferActions.vue'
 import { useDatabase, useTable, useTablePartitions, useTables, useTasks } from '@/api/queries'
 import { formatBytes, formatNumber } from '@/lib/format'
 import { TABLE_TASKS_LIMIT, runningTaskOfTable, tasksOfTable } from '@/lib/tables'
@@ -208,6 +209,7 @@ const title = computed(() => `Table ${props.schema}.${props.table}`)
       >
         Convert storage
       </GateButton>
+      <TableTransferActions v-if="t" :database-name="name" :table="t" :small="false" />
     </template>
   </PageHeader>
   <p>
