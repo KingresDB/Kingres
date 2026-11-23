@@ -188,37 +188,39 @@ func TestCAEscrowARevocationAfterTheFailoverHoldsWhenTheOldLeaderReturns(t *test
 	m.request(t, m.other)
 	id := m.recordedTask(t)
 	m.cand.WaitTaskDone(id, 12*time.Minute)
-	mapLogin(t, m.cand)
-	body := m.cand.Expect(202, "POST", "/servers/"+m.other.Host+"/certificates/revocations", nil)
-	revokeTask := clustertest.TaskID(body)
-	until(t, 3*time.Minute, "the revocation in the list of the new leader", func() bool {
-		return crlHas(filepath.Join(m.cand.DataDir, "pki", pki.CRLFile), serial)
-	})
-	// The old leader comes back with ca.key and the list it had.
+	// The old leader comes back holding ca.key and the list it had, and is rebuilt as a standby of the new leader.
 	m.old.Start()
 	defer func() {
 		if t.Failed() {
 			t.Logf("log of the old leader: %s", m.old.LogTail(5000))
 		}
 	}()
-	// The task waits for the server that is down. It ends when the old leader answers (done) or refuses (its instance is still being
-	// rebuilt: failed); what must hold in both cases is that no server that holds the revocation loses it.
-	fin := m.cand.WaitTask(revokeTask, 10*time.Minute)
-	t.Logf("the revocation task ended %v: %v", fin["state"], fin["error"])
-	for _, n := range []*clustertest.Node{m.cand, m.other} {
+	mapLogin(t, m.cand)
+	until(t, 10*time.Minute, "the old leader to be a standby of the map group again", func() bool {
+		for _, n := range catalogStandbys(t, m.cand) {
+			if n.group == 0 && n.host == m.old.Host {
+				return true
+			}
+		}
+		return false
+	})
+	if !fileExists(filepath.Join(m.old.DataDir, "pki", pki.CAKeyFile)) {
+		t.Fatal("setup: the old leader holds no ca.key")
+	}
+	// The new leader revokes a certificate. Every server gets the list, the old leader included, and the old leader (it holds ca.key)
+	// takes the revocation into its own list: were it the leader again, it would not undo the revocation.
+	body := m.cand.Expect(202, "POST", "/servers/"+m.other.Host+"/certificates/revocations", nil)
+	m.cand.WaitTaskDone(clustertest.TaskID(body), 6*time.Minute)
+	for _, n := range []*clustertest.Node{m.old, m.other} {
 		d := filepath.Join(n.DataDir, "pki")
 		if !crlHas(filepath.Join(d, pki.CRLFile), serial) || !listHas(d, serial) {
-			t.Errorf("%s lost a revocation", n.Host)
+			t.Errorf("%s trusts a certificate that was revoked", n.Host)
 		}
 	}
-	if fin["state"] == "done" {
-		// The old leader got the list: it holds ca.key and took the revocation into its own list as well.
-		d := filepath.Join(m.old.DataDir, "pki")
-		if !crlHas(filepath.Join(d, pki.CRLFile), serial) || !listHas(d, serial) {
-			t.Errorf("the old leader trusts a certificate that was revoked")
-		}
-		if !caRevokedHas(d, serial) {
-			t.Error("the old leader holds ca.key and did not take the revocation into its own list")
-		}
+	if !crlHas(filepath.Join(m.cand.DataDir, "pki", pki.CRLFile), serial) || !caRevokedHas(filepath.Join(m.cand.DataDir, "pki"), serial) {
+		t.Error("the new leader lost the revocation")
+	}
+	if !caRevokedHas(filepath.Join(m.old.DataDir, "pki"), serial) {
+		t.Error("the old leader holds ca.key and did not take the revocation into its own list")
 	}
 }
