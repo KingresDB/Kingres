@@ -63,7 +63,7 @@ func TestGoldenNormalisation(t *testing.T) {
 		t.Run(major, func(t *testing.T) {
 			out := normaliseGolden(t, major)
 			all := "\n" + out.Pre + out.Views + out.Post
-			for _, bad := range []string{"_b0", "PARTITION BY HASH", "CREATE EXTENSION", "COMMENT ON EXTENSION", "\nSET ","set_config", `\restrict`, `\unrestrict`, "kingres_ledger", "acc_ledger_history", "ON ONLY public.d_hash", "ONLY public.d_hash", "ONLY public.d_part", "modulus"} {
+			for _, bad := range []string{"_b0", "PARTITION BY HASH", "CREATE EXTENSION", "COMMENT ON EXTENSION", "\nSET ", "set_config", `\restrict`, `\unrestrict`, "kingres_ledger", "acc_ledger_history", "ON ONLY public.d_hash", "ONLY public.d_hash", "ONLY public.d_part", "modulus"} {
 				if strings.Contains(all, bad) {
 					t.Errorf("the output still holds %q", bad)
 				}

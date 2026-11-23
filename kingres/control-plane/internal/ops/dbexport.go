@@ -427,16 +427,30 @@ func (o *Ops) checkExportable(ctx context.Context, db, role string, f *dbFacts, 
 	return nil
 }
 
+// DBExportHook is called by a test at the start of each step of database.export (the name of the step); it may block, and an error ends the step.
+var DBExportHook func(ctx context.Context, step string) error
+
+func dbStep(name string, run func(ctx context.Context, env *task.Env) error) func(ctx context.Context, env *task.Env) error {
+	return xferStep(func(ctx context.Context, env *task.Env) error {
+		if h := DBExportHook; h != nil {
+			if err := h(ctx, name); err != nil {
+				return err
+			}
+		}
+		return run(ctx, env)
+	})
+}
+
 func (o *Ops) dbExportDefinition() task.Definition {
 	return task.Definition{
 		Kind: KindDatabaseExport,
 		Steps: []task.Step{
-			{Name: stepDCheck, Run: xferStep(o.stepDBCheck)},
-			{Name: stepDStructure, Run: xferStep(o.stepDBStructure)},
-			{Name: stepDNormalise, Run: xferStep(o.stepDBNormalise)},
-			{Name: stepDData, Interruptible: true, Run: xferStep(o.stepDBData)},
-			{Name: stepDVerify, Run: xferStep(o.stepDBVerify)},
-			{Name: stepDSeal, Run: xferStep(o.stepDBSeal)},
+			{Name: stepDCheck, Run: dbStep(stepDCheck, o.stepDBCheck)},
+			{Name: stepDStructure, Run: dbStep(stepDStructure, o.stepDBStructure)},
+			{Name: stepDNormalise, Run: dbStep(stepDNormalise, o.stepDBNormalise)},
+			{Name: stepDData, Interruptible: true, Run: dbStep(stepDData, o.stepDBData)},
+			{Name: stepDVerify, Run: dbStep(stepDVerify, o.stepDBVerify)},
+			{Name: stepDSeal, Run: dbStep(stepDSeal, o.stepDBSeal)},
 		},
 		OnFail: o.dbExportOnFail,
 	}
@@ -770,7 +784,11 @@ func (o *Ops) writeArchive(ctx context.Context, env *task.Env, x *xferState, rec
 		if single {
 			level, groups = "archive-single-snapshot", 1
 		}
-		me := archive.ManifestEntry{Table: e.Table.qualified(), Columns: e.Cols, Rows: tag.RowsAffected(), Consistency: level, Groups: groups, LedgerHistory: e.History}
+		named := e.Table.qualified()
+		if e.History {
+			named = e.Base
+		}
+		me := archive.ManifestEntry{Table: named, Columns: e.Cols, Rows: tag.RowsAffected(), Consistency: level, Groups: groups, LedgerHistory: e.History}
 		metaEntries[name] = me
 		if !e.History {
 			rows[e.Table.qualified()] = me.Rows
@@ -864,6 +882,11 @@ func (o *Ops) stepDBVerify(ctx context.Context, env *task.Env) error {
 	defer func() { _ = r.Close() }()
 	res, verr := archive.Validate(r, r.Size(), archive.Limits{MaxImportBytes: p.MaxFile * 4, SQLFor: func(cat *archive.Catalog) archive.SQLChecker { return sqlChecker(catalogInheritance(cat)) }})
 	if verr != nil {
+		// The reasons of the validator are fixed codes and bounded names of the archive that this export made: no value of the data.
+		var ae *archive.Error
+		if errors.As(verr, &ae) && len(ae.Reasons) > 0 {
+			return transfer.Errorf(transfer.CodeArchiveInvalid, false, "the archive that was written is not accepted by its own validator (%s: %s)", ae.Reasons[0].Code, ae.Reasons[0].Object)
+		}
 		return transfer.Errorf(transfer.CodeArchiveInvalid, false, "the archive that was written is not accepted by its own validator")
 	}
 	for _, sr := range res.SQL {
@@ -890,7 +913,7 @@ func (o *Ops) stepDBVerify(ctx context.Context, env *task.Env) error {
 func catalogInheritance(cat *archive.Catalog) map[string]bool {
 	out := map[string]bool{}
 	for _, t := range cat.Tables {
-		if t.TreeRole == "inheritanceChild" {
+		if t.Parent != "" && (t.TreeRole == "inheritanceChild" || t.TreeRole == "inheritanceParent") {
 			out[t.Qualified()] = true
 		}
 	}
@@ -922,6 +945,8 @@ func (o *Ops) stepDBSeal(ctx context.Context, env *task.Env) error {
 		return err
 	}
 	o.setWork(rec.ID, nil)
+	// The console reads the transfer from the detail of the task that is done.
+	_ = env.SetDetail(ctx, "transfer "+idText(p.TransferID))
 	if o.Transfer != nil && o.Transfer.Audit != nil {
 		var rep exportReport
 		_ = json.Unmarshal(cur.Report, &rep)

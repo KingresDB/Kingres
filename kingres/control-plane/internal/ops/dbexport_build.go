@@ -119,6 +119,11 @@ func (f *dbFacts) catalog() archive.Catalog {
 		if p := f.byOID[t.Parent]; p != nil && ct.TreeRole == "leaf" {
 			ct.Parent = p.qualified()
 		}
+		if len(t.Inherits) > 0 && ct.TreeRole != "leaf" {
+			if p := f.byOID[t.Inherits[0]]; p != nil {
+				ct.Parent = p.qualified()
+			}
+		}
 		switch t.Method {
 		case "hash":
 			ct.Kind, ct.DistributionColumn, ct.ColocationRef = "hash", t.DistColumn, refs[t.Coloc]
@@ -248,6 +253,8 @@ type dataEntry struct {
 	Cols    []string
 	Only    bool
 	History bool
+	// Base is the ledger table whose history this entry is (the manifest names that table).
+	Base string
 }
 
 // dataEntries are the data entries of an archive with these options, in the order of the catalog; the history of an updatable ledger table follows its table.
@@ -263,7 +270,7 @@ func (f *dbFacts) dataEntries(excluded map[string]bool, dataMode string) []dataE
 		out = append(out, dataEntry{Table: t, Cols: t.Cols, Only: t.Children > 0})
 		if t.Ledger != nil && t.Ledger.HistoryOID != 0 && len(t.Ledger.HistoryCols) > 0 {
 			h := f.byOID[t.Ledger.HistoryOID]
-			out = append(out, dataEntry{Table: *h, Cols: t.Ledger.HistoryCols, History: true})
+			out = append(out, dataEntry{Table: *h, Cols: t.Ledger.HistoryCols, History: true, Base: t.qualified()})
 		}
 	}
 	return out
