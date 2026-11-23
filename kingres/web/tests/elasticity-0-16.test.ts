@@ -8,6 +8,7 @@ import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'
 import { mockServer } from '@/mocks/server'
 import { getState } from '@/mocks/http'
+import { instancesOfServer } from '@/mocks/state'
 import { renderApp, settled } from './helpers'
 
 describe('Rebalance page: strategy, threshold and the automatic mode', () => {
@@ -88,6 +89,44 @@ describe('Servers page: weight, drain and return to service', () => {
       await within(dialog).findByRole('progressbar', { name: /task progress/i }),
     ).toBeInTheDocument()
     expect(getState().tasks[0]!.task.kind).toBe('rebalance')
+  })
+
+  it('says in the drain dialog that the map group is handed over, only for the server that runs it (contract 0.21.0)', async () => {
+    const user = userEvent.setup()
+    await renderApp('/servers')
+    await settled()
+    const state = getState()
+    const hostsMap = (id: string) =>
+      instancesOfServer(state, id).some((i) => i.isMapGroup && i.role === 'primary')
+    const buttons = await screen.findAllByTestId('drain-server')
+    expect(buttons.length).toBe(state.servers.length)
+    const seen = new Set<boolean>()
+    for (const [i, srv] of state.servers.entries()) {
+      await user.click(buttons[i]!)
+      const dialog = await screen.findByRole('dialog', { name: /drain server/i })
+      await within(dialog).findByTestId('drain-preview')
+      const note = within(dialog).queryByTestId('drain-mapgroup')
+      expect(note !== null).toBe(hostsMap(srv.id))
+      if (note) expect(note).toHaveTextContent(/planned switchover/i)
+      seen.add(note !== null)
+      await user.keyboard('{Escape}')
+      await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+    }
+    expect(seen.size).toBe(2)
+  })
+
+  it('lists the step that hands over the map group in the task of a drain', async () => {
+    const user = userEvent.setup()
+    await renderApp('/servers')
+    await settled()
+    await user.click((await screen.findAllByTestId('drain-server'))[0]!)
+    const dialog = await screen.findByRole('dialog', { name: /drain server/i })
+    await within(dialog).findByTestId('drain-preview')
+    await user.click(within(dialog).getByRole('button', { name: /^drain server$/i }))
+    await within(dialog).findByRole('progressbar', { name: /task progress/i })
+    expect(getState().tasks[0]!.task.progress.steps.map((x) => x.name)).toContain(
+      'Hand over the map group',
+    )
   })
 
   it('gives a drained server back to service', async () => {

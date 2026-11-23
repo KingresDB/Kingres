@@ -7459,7 +7459,7 @@ export interface components {
                 at: string;
                 /** @description `started` a run was started; `nothingToDo` the placement is balanced or a run is under way; `blocked` a rule stopped it (see `blockedBy`); `settling` the imbalance is too young or too soon after a change. Clients must tolerate other values. */
                 outcome: string;
-                /** @description The rules that held it back: `window`, `failover`, `groupDegraded` (a group has fewer healthy standbys than the replica count, or a standby is behind its primary by more than `maxStandbyLagBytes`, 0.21.0), `groupUnavailable`, `servers`, `moveFailed`, `consistency`, `operatorStopped`, `running`. */
+                /** @description The rules that held it back: `window`, `failover`, `groupDegraded` (a group has fewer healthy standbys than the replica count, or a standby is behind its primary by more than `maxStandbyLagBytes` when a run is started or resumed, and by more than twice that on three evaluations in a row inside a run, 0.21.0), `groupUnavailable`, `servers`, `moveFailed`, `consistency`, `operatorStopped`, `running`. */
                 blockedBy: string[];
             } | null;
         };

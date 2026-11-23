@@ -378,7 +378,7 @@ None.
   `Relocate the standbys hosted on the server`): it pauses the task, asks for a planned switchover of shard group 0 (`failoverServer`, mode `graceful`) to a standby on another server, and the drain goes on under the
   new manager leader when the switchover has ended. The task keeps its id; `getRebalanceStatus` shows it `stopped` (`stoppedBy` `safetyRule`) while it waits. A switchover that is refused or rolled back fails the task with
   the code of the refusal, or with `server_hosts_map_group` when the server still runs the map group; the server stays `draining`.
-- `RebalanceAutomatic.lastEvaluation.blockedBy` `groupDegraded` also names a group whose standby is behind its primary by more than `rebalance.maxStandbyLagBytes` (default 64 MiB); a pause of a run by this rule
+- `RebalanceAutomatic.lastEvaluation.blockedBy` `groupDegraded` also names a group whose standby is behind its primary by more than `rebalance.maxStandbyLagBytes` (default 64 MiB) when a run is started or resumed; inside a run the lag has to be over twice the limit on three evaluations in a row (the run's own writes make the standbys lag for a while); a pause of a run by this rule
   is the same `stoppedBy: safetyRule` as for the other rules.
 
 #### Documentation
