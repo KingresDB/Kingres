@@ -9,10 +9,11 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extgate"
-	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extgate"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 )
 
 // CatalogStepName is the name of the one step of the reconcile task that records
