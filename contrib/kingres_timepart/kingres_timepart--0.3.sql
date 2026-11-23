@@ -6221,8 +6221,8 @@ BEGIN
 
     v_self := (SELECT l.node_id FROM kingres.local_node l);
     v_op := kingres.internal_exec_scalar(v_self,
-        format('SELECT kingres.begin_leaf_conversion(%s::pg_catalog.oid::pg_catalog.regclass, %L, %L)',
-               p_parent::oid, p_partition, p_target), 60000)::bigint;
+        format('SELECT kingres.begin_leaf_conversion(%s::pg_catalog.oid::pg_catalog.regclass, %L, %L, %s)',
+               p_parent::oid, p_partition, p_target, pg_catalog.pg_backend_pid()), 60000)::bigint;
     BEGIN
         FOR v_leaf IN
             SELECT x.partition_name, x.node_id, x.bucket, x.leaf, x.access_method

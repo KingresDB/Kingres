@@ -33,7 +33,21 @@ func addPartitionJobs(sched *scheduler.Scheduler, o *ops.Ops, sys func(ctx conte
 			return err
 		}
 	}
-	return nil
+	// kingres_timepart is brought to the version of the package on every server of every database (the conversion of the leaves of a distributed table needs it on
+	// each server that holds one): every ten intervals of the scheduler, 10 minutes by default, and the first time soon after the leader starts.
+	every := 10 * interval
+	if every <= 0 {
+		every = 10 * time.Minute
+	}
+	return sched.Add(scheduler.Job{Name: "extension.update", Every: every, Jitter: 0.1, Run: func(ctx context.Context, _ scheduler.Term) error {
+		n, err := o.UpdateTimepart(ctx)
+		if err != nil {
+			log.Warn("updating kingres_timepart failed", "error", err)
+		} else if n > 0 {
+			log.Debug("kingres_timepart is at the version of the package", "servers", n)
+		}
+		return nil
+	}})
 }
 
 // sysAlerts keeps the alerts of the partition jobs in the alert table of the system database, as the other jobs of the leader do.

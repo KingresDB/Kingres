@@ -14,6 +14,7 @@
 #   D. a conversion that a leaf refuses leaves the partition mixed, which reads right and is converted by the next run
 #   E. a converted table moves its buckets (columnar leaves included) and the policy goes on afterwards
 #   F. retention by detach makes a distributed table of the old partition; the owner who is not a superuser cannot run it
+#   G. check_cluster reports a claim that is stale (not renewed for the lease, or held by a session that is gone); the report of a new partition carries the leaf budget
 #
 # Needs kingres_columnar and kingres_timepart built and installed into the same installation as kingres_shard.
 
@@ -25,7 +26,7 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 use IPC::Run ();
-use KingresShardTest qw(make_cluster run_sql prepared_count wait_for_fault_file);
+use KingresShardTest qw(make_cluster run_sql prepared_count wait_for_fault_file start_psql finish_psql);
 
 my @nodes = make_cluster('dtp', 3, logical => 1, extra => "shared_preload_libraries = 'kingres_shard,kingres_columnar'\n");
 my ($n1, $n2, $n3) = @nodes;
@@ -363,5 +364,58 @@ like(q1($n1, q{SELECT string_agg(DISTINCT a.detail, '|') FROM kingres.timepart_r
 is(parts('dt'), 'dt_p20260302,dt_p20260303,dt_p20260304,dt_p20260305,dt_p20260306', 'F: nothing changed');
 is(q1($n1, q{SELECT count(*) FROM kingres.check_cluster()}), '0', 'F: check_cluster() finds nothing');
 is(prepared_count($_), '0', 'F: nothing is prepared on ' . $_->name) for @nodes;
+
+
+# ---------------------------------------------------------------------------
+# G. check_cluster reports a claim that is stale; the report of a change carries the leaf budget
+# ---------------------------------------------------------------------------
+{
+	my $pn = q1($n1, q{SELECT partition_name FROM kingres.dist_partition WHERE parent = 'public.ev'::regclass ORDER BY partition_name LIMIT 1});
+	my $stale = sub { return q1($n1, q{SELECT count(*) FROM kingres.check_cluster() WHERE check_name = 'leaf_conversion_stale'}); };
+	# a claim whose holder is a live session is not stale
+	my $sleeper = start_psql($n1, q{SELECT pg_sleep(120)});
+	my $pid = '';
+	for (1 .. 100)
+	{
+		$pid = q1($n1, q{SELECT coalesce(max(pid), 0) FROM pg_stat_activity WHERE query LIKE 'SELECT pg_sleep(120)%' AND pid <> pg_backend_pid()});
+		last if $pid > 0;
+		select(undef, undef, undef, 0.1);
+	}
+	cmp_ok($pid, '>', 0, 'G: a session that holds a claim');
+	my $o1 = q1($n1, "SELECT kingres.begin_leaf_conversion('public.ev', '$pn', 'columnar', $pid)");
+	is($stale->(), '0', 'G: a claim held by a live session is not stale');
+	is(q1($n1, "SELECT count(*) FROM kingres.check_cluster() WHERE check_name <> 'leaf_conversion_stale'"), '0', 'G: and check_cluster has nothing else to say');
+	# the holder goes: the claim is stale at once, whatever its age
+	q1($n1, "SELECT pg_terminate_backend($pid)");
+	for (1 .. 100) { last if q1($n1, "SELECT count(*) FROM pg_stat_activity WHERE pid = $pid") eq '0'; select(undef, undef, undef, 0.1); }
+	eval { finish_psql($sleeper) };
+	is($stale->(), '1', 'G: a claim whose session is gone is reported');
+	like(q1($n1, q{SELECT object || ' | ' || detail FROM kingres.check_cluster() WHERE check_name = 'leaf_conversion_stale'}),
+		qr/^leaf conversion $o1 of public\.ev \| .*session that holds it is gone.*end_leaf_conversion\($o1\)/, 'G: the report names the claim, the reason and the way out');
+	q1($n1, "SELECT kingres.end_leaf_conversion($o1)");
+	is($stale->(), '0', 'G: a released claim is not reported');
+	# a claim that was not renewed for the lease is stale by its time
+	my $o2 = q1($n1, "SELECT kingres.begin_leaf_conversion('public.ev', '$pn')");
+	is($stale->(), '0', 'G: a fresh claim without a holder is not stale');
+	q1($n1, "UPDATE kingres.table_operation SET updated_at = clock_timestamp() - interval '7 hours' WHERE op_id = $o2");
+	is($stale->(), '1', 'G: a claim not renewed for the lease is reported');
+	unlike(q1($n1, q{SELECT detail FROM kingres.check_cluster() WHERE check_name = 'leaf_conversion_stale'}), qr/is gone/, 'G: and says nothing of a session');
+	q1($n1, "SELECT kingres.end_leaf_conversion($o2)");
+	is($stale->(), '0', 'G: released');
+
+	# the report of a change: the leaf budget
+	my $codes = sub { my ($kind, $rel) = @_; return q1($n1, "SELECT coalesce(string_agg(code, ','), '') FROM kingres.table_change_report('$kind', '$rel'::regclass)"); };
+	is($codes->('create_partition', 'public.bd'), '', 'G: the report of a new partition has no blocker within the budget');
+	$n1->append_conf('postgresql.conf', "kingres_shard.max_partition_leaves = 6\n");
+	$n1->reload;
+	is($codes->('create_partition', 'public.bd'), 'leaf_budget', 'G: it has the leaf budget as a blocker when the partition would pass it');
+	like(q1($n1, q{SELECT detail FROM kingres.table_change_report('create_partition', 'public.bd'::regclass) WHERE code = 'leaf_budget'}),
+		qr/it would have 12 leaves \(6 buckets, 2 partitions\); kingres_shard.max_partition_leaves is 6/, 'G: with the numbers of create_partition itself');
+	is($codes->('attach_partition', 'public.bd'), 'leaf_budget', 'G: and so has the report of an attach');
+	is($codes->('drop_partition', 'public.bd'), '', 'G: not the report of a drop');
+	$n1->append_conf('postgresql.conf', "kingres_shard.max_partition_leaves = 8192\n");
+	$n1->reload;
+	is($codes->('create_partition', 'public.bd'), '', 'G: nothing once the limit is back');
+}
 
 done_testing();

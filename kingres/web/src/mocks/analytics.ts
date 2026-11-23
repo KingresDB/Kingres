@@ -1298,6 +1298,20 @@ export function seedAggregatesOn(s: MockState): void {
 }
 
 /**
+ * `?analytics=mixed` (after `timeseries`): one partition of `metrics` that is half converted, as a distributed table shows one while a conversion of its
+ * leaves is half done (contract 0.23.0: the access method of a partition is `mixed`). It is the third oldest, which is stored as rows otherwise.
+ */
+export function seedMixedPartition(s: MockState): void {
+  const rec = s.databases.find((d) => d.info.name === 'shop')
+  const t = rec?.tables.find((x) => x.name === 'metrics')
+  if (!rec || !t) return
+  const list = partitionsOf(s, rec, t).map((p, i) =>
+    i === 2 ? { ...p, accessMethod: 'mixed' } : p,
+  )
+  setPartitionList(s, rec, t, list)
+}
+
+/**
  * `?analytics=` values, comma separated: `on`, `timeseries`, `ahead-low`, `sketch:missing|mismatch|hash`, `columnar:missing`,
  * `timepart:missing`, `convert:fail`, `run:lock|name|fail`, `publication`, `old` (every operation of 0.18.0 answers
  * 422 `unsupported_operation`).
@@ -1307,6 +1321,7 @@ export function applyAnalyticsSwitch(entry: string, s: MockState): void {
   if (entry === 'on') seedAggregatesOn(s)
   if (entry === 'timeseries') seedTimeseries(s)
   if (entry === 'ahead-low') seedTimeseries(s, 1)
+  if (entry === 'mixed') seedMixedPartition(s)
   const sk = /^sketch:(missing|mismatch|hash)$/.exec(entry)
   if (sk) k.sketch = sk[1] as typeof k.sketch
   if (entry === 'columnar:missing') k.columnarMissing = true

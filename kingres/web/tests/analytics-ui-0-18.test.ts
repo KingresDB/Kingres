@@ -367,6 +367,25 @@ describe('the table page: storage and partitions', () => {
     expect(list.getAllByRole('row').slice(1)).toHaveLength(8)
   })
 
+  it('a partition that is half converted is Mixed, and the format filter finds it (contract 0.23.0)', async () => {
+    sw('analytics=timeseries,mixed')
+    const user = userEvent.setup()
+    await renderApp(table('metrics'))
+    const list = within(await screen.findByTestId('partition-list'))
+    const select = screen.getByTestId('partition-format') as HTMLSelectElement
+    expect([...select.options].map((o) => o.value)).toEqual(['all', 'heap', 'columnar', 'mixed'])
+    await user.selectOptions(select, 'mixed')
+    const rows = list.getAllByRole('row').slice(1)
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toHaveTextContent('Mixed')
+    await user.selectOptions(select, 'columnar')
+    expect(list.getAllByRole('row').slice(1)).toHaveLength(2)
+    await user.selectOptions(select, 'heap')
+    expect(list.getAllByRole('row').slice(1)).toHaveLength(7)
+    await user.selectOptions(select, 'all')
+    expect(list.getAllByRole('row').slice(1)).toHaveLength(10)
+  })
+
   it('a plain partitioned table has no create, attach, detach or drop, but converts a partition', async () => {
     sw('analytics=timeseries')
     await renderApp(table('metrics'))

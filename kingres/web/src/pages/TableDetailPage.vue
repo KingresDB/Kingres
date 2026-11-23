@@ -365,6 +365,7 @@ const title = computed(() => `Table ${props.schema}.${props.table}`)
             <option value="all">All formats</option>
             <option value="heap">Row</option>
             <option value="columnar">Columnar</option>
+            <option value="mixed">Mixed</option>
           </select>
         </div>
         <QueryBoundary

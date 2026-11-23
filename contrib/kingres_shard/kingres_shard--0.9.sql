@@ -16792,9 +16792,22 @@ DECLARE
     nd      pg_catalog.record;
     probe   pg_catalog.text;
     local_id pg_catalog.int4;
+    v_bud   pg_catalog.record;
 BEGIN
     RETURN QUERY SELECT b.severity, b.code, b.object, b.detail
                    FROM kingres.internal_table_change_report_base(kind, relation, options) b;
+    -- one more user partition must keep the table within kingres_shard.max_partition_leaves (create_partition and attach_partition refuse it)
+    IF kind IN ('create_partition', 'attach_partition') THEN
+        SELECT * INTO v_bud FROM kingres.partition_leaf_budget(relation);
+        IF FOUND AND v_bud.buckets::pg_catalog.int8 OPERATOR(pg_catalog.*) (v_bud.partitions OPERATOR(pg_catalog.+) 1)::pg_catalog.int8 OPERATOR(pg_catalog.>) v_bud.max_leaves::pg_catalog.int8 THEN
+            RETURN QUERY SELECT 'blocker'::pg_catalog.text, 'leaf_budget'::pg_catalog.text, relation::pg_catalog.regclass::pg_catalog.text,
+                                pg_catalog.format('cannot change table "%s": it would have %s leaves (%s buckets, %s partitions); kingres_shard.max_partition_leaves is %s',
+                                                  relation::pg_catalog.regclass::pg_catalog.text,
+                                                  v_bud.buckets::pg_catalog.int8 OPERATOR(pg_catalog.*) (v_bud.partitions OPERATOR(pg_catalog.+) 1)::pg_catalog.int8,
+                                                  v_bud.buckets, v_bud.partitions OPERATOR(pg_catalog.+) 1, v_bud.max_leaves);
+        END IF;
+        RETURN;
+    END IF;
     IF kind NOT IN ('distribute', 'distribute_reference', 'undistribute', 'alter') THEN
         RETURN;
     END IF;
@@ -17431,6 +17444,7 @@ BEGIN
     RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_schemas(v_skip) t;
     RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_table_operations(v_skip) t;
     RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_partitions() t;
+    RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_leaf_conversions() t;
 END;
 $$;
 
@@ -17860,7 +17874,7 @@ ALTER TABLE kingres.table_operation ADD CONSTRAINT table_operation_kind_check
 -- Claim the group of a table for the conversion of the leaves of one of its partitions; returns the number of the claim.  A claim that
 -- nobody renewed for six hours is taken over.  Run on the map group primary, committed at once by the session that calls it (kingres_timepart
 -- calls it through kingres.internal_node_exec on the node itself); the claim stays until end_leaf_conversion().
-CREATE FUNCTION kingres.begin_leaf_conversion(parent regclass, partition_name text, target text DEFAULT 'columnar')
+CREATE FUNCTION kingres.begin_leaf_conversion(parent regclass, partition_name text, target text DEFAULT 'columnar', holder_pid int DEFAULT NULL)
     RETURNS bigint
     LANGUAGE plpgsql
     SET search_path = pg_catalog, kingres, pg_temp
@@ -17899,12 +17913,48 @@ BEGIN
     END IF;
     INSERT INTO kingres.table_operation (kind, mode, phase, spec, detail, colocation_id, started_at, updated_at)
     VALUES ('convert_leaf', 'online', 'done',
-            pg_catalog.jsonb_build_object('relid', parent::pg_catalog.oid, 'table', parent::pg_catalog.text, 'partition', partition_name, 'target', target),
+            pg_catalog.jsonb_build_object('relid', parent::pg_catalog.oid, 'table', parent::pg_catalog.text, 'partition', partition_name, 'target', target,
+                                          'holder_pid', holder_pid,
+                                          'holder_start', (SELECT a.backend_start FROM pg_catalog.pg_stat_activity a WHERE a.pid OPERATOR(pg_catalog.=) begin_leaf_conversion.holder_pid)),
             pg_catalog.format('the leaves of partition %s are converted to %s', partition_name, target),
             v_dt.colocation_id, pg_catalog.clock_timestamp(), pg_catalog.clock_timestamp())
     RETURNING op_id INTO v_id;
     INSERT INTO kingres.table_operation_lock (colocation_id, op_id) VALUES (v_dt.colocation_id, v_id);
     RETURN v_id;
+END;
+$$;
+
+-- check_cluster: a claim of a conversion that is stale, not renewed for the six hours after which the next claim takes it over, or held by a
+-- session that is gone (holder_pid names the backend that runs the conversion, with its start time; none given means only the time counts).
+CREATE FUNCTION kingres.internal_check_leaf_conversions()
+    RETURNS TABLE (check_name text, node_id int, object text, detail text)
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    o pg_catalog.record;
+    v_gone pg_catalog.bool;
+BEGIN
+    IF pg_catalog.to_regclass('kingres.table_operation_lock') IS NULL THEN
+        RETURN;
+    END IF;
+    FOR o IN SELECT t.op_id, t.updated_at, t.spec, t.colocation_id
+               FROM kingres.table_operation t JOIN kingres.table_operation_lock l ON l.op_id OPERATOR(pg_catalog.=) t.op_id
+              WHERE t.kind OPERATOR(pg_catalog.=) 'convert_leaf' AND t.finished_at IS NULL ORDER BY t.op_id
+    LOOP
+        v_gone := (o.spec OPERATOR(pg_catalog.->>) 'holder_pid') IS NOT NULL
+                  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity a
+                                   WHERE a.pid OPERATOR(pg_catalog.=) (o.spec OPERATOR(pg_catalog.->>) 'holder_pid')::pg_catalog.int4
+                                     AND a.backend_start OPERATOR(pg_catalog.=) (o.spec OPERATOR(pg_catalog.->>) 'holder_start')::pg_catalog.timestamptz);
+        IF o.updated_at OPERATOR(pg_catalog.<) (pg_catalog.clock_timestamp() OPERATOR(pg_catalog.-) interval '6 hours') OR v_gone THEN
+            check_name := 'leaf_conversion_stale'; node_id := NULL;
+            object := pg_catalog.format('leaf conversion %s of %s', o.op_id, o.spec OPERATOR(pg_catalog.->>) 'table');
+            detail := pg_catalog.format('the claim of colocation group %s for the conversion of partition %s was last renewed at %s%s and keeps bucket moves and partition changes away; kingres.end_leaf_conversion(%s) releases it',
+                                        o.colocation_id, o.spec OPERATOR(pg_catalog.->>) 'partition', o.updated_at,
+                                        CASE WHEN v_gone THEN ' and the session that holds it is gone' ELSE '' END, o.op_id);
+            RETURN NEXT;
+        END IF;
+    END LOOP;
 END;
 $$;
 
@@ -17939,7 +17989,7 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION kingres.begin_leaf_conversion(regclass, text, text) IS
+COMMENT ON FUNCTION kingres.begin_leaf_conversion(regclass, text, text, int) IS
     'Claim the colocation group of a user-partitioned table for the conversion of the leaves of one partition (map group primary, superuser)';
 COMMENT ON FUNCTION kingres.renew_leaf_conversion(bigint) IS 'Renew the claim of a leaf conversion (a claim not renewed for six hours is taken over)';
 COMMENT ON FUNCTION kingres.end_leaf_conversion(bigint, text) IS 'Release the claim of a leaf conversion; also the way to remove one that a stopped conversion left behind';
@@ -17947,7 +17997,8 @@ COMMENT ON FUNCTION kingres.end_leaf_conversion(bigint, text) IS 'Release the cl
 REVOKE ALL ON FUNCTION
     kingres.internal_check_leaf_budget(regclass),
     kingres.partition_leaf_storage(regclass),
-    kingres.begin_leaf_conversion(regclass, text, text),
+    kingres.begin_leaf_conversion(regclass, text, text, int),
+    kingres.internal_check_leaf_conversions(),
     kingres.renew_leaf_conversion(bigint),
     kingres.end_leaf_conversion(bigint, text)
     FROM PUBLIC;

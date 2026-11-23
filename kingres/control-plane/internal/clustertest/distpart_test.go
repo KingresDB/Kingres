@@ -256,3 +256,66 @@ func TestPartitionPolicyOfADistributedTable(t *testing.T) {
 		}
 	})
 }
+
+// A database that was made with kingres_timepart 0.2 (before the conversion of the leaves of a distributed table) is brought to the version of the package on every
+// server by the leader, with no step of an operator, and the conversion then works.
+func TestTimepartUpdatedOnEveryServer(t *testing.T) {
+	c := clustertest.FormWithExtra(t, 3, []string{"-partition-scheduler-interval", "3s"}, func(leader *clustertest.Node) {
+		body := leader.Expect(202, "POST", "/databases", map[string]any{"name": "xu", "sharding": map[string]any{"enabled": true, "bucketCount": 6}})
+		leader.WaitTaskDone(clustertest.TaskID(body), 4*time.Minute)
+	})
+	leader := c.Leader()
+	day := func(offset int) string {
+		return time.Now().UTC().Truncate(24*time.Hour).AddDate(0, 0, offset).Format("2006-01-02")
+	}
+	versions := func() string {
+		var out []string
+		for _, n := range c.Nodes {
+			out = append(out, stScalar(t, n, "xu", `SELECT coalesce(extversion, 'none') FROM (SELECT 1) x LEFT JOIN pg_extension e ON e.extname = 'kingres_timepart'`))
+		}
+		return strings.Join(out, ",")
+	}
+	if got := versions(); got != "0.3,0.3,0.3" {
+		t.Fatalf("a database that was made has %s", got)
+	}
+	// the state of a database from before: version 0.2 everywhere (the extension is dropped and made again at 0.2; it has no policy yet)
+	for _, n := range c.Nodes {
+		stExec(t, n, "xu", `DROP EXTENSION kingres_timepart`, `CREATE EXTENSION kingres_timepart VERSION '0.2'`)
+	}
+	// the leader updates it (the job runs every ten intervals of the scheduler, 30 s here)
+	var got string
+	for end := time.Now().Add(4 * time.Minute); time.Now().Before(end); time.Sleep(2 * time.Second) {
+		if got = versions(); got == "0.3,0.3,0.3" {
+			break
+		}
+	}
+	if got != "0.3,0.3,0.3" {
+		t.Fatalf("kingres_timepart was not updated on every server: %s\n%s", got, leader.LogTail(3000))
+	}
+	// the conversion of the leaves works on what was updated
+	tbl := "/databases/xu/schemas/public/tables/ev"
+	stExec(t, leader, "xu",
+		`CREATE TABLE ev (cust int NOT NULL, ts timestamptz NOT NULL, id int NOT NULL, PRIMARY KEY (cust, ts, id)) PARTITION BY RANGE (ts)`,
+		fmt.Sprintf(`CREATE TABLE ev_third PARTITION OF ev FOR VALUES FROM ('%s 00:00:00+00') TO ('%s 00:00:00+00')`, day(-3), day(-2)),
+		fmt.Sprintf(`INSERT INTO ev SELECT g %% 13, '%s 00:00:00+00'::timestamptz + (g %% 1000) * interval '1 minute', g FROM generate_series(1, 300) g`, day(-3)))
+	dist := leader.Expect(202, "PUT", tbl+"/distribution", map[string]any{"method": "hash", "distributionColumn": "cust", "mode": "blocking"})
+	if r := leader.WaitTask(clustertest.TaskID(dist), 5*time.Minute); r["state"] != "done" {
+		t.Fatalf("distribute: %v", r)
+	}
+	leader.Expect(200, "PUT", tbl+"/partition-policy", map[string]any{"partitionEvery": "P1D", "createAhead": "P1D", "retention": "P30D", "columnarAfter": "P2D", "enabled": false})
+	run := leader.Expect(202, "POST", tbl+"/partition-policy/runs", map[string]any{"asOf": time.Now().UTC().Format(time.RFC3339)})
+	if r := leader.WaitTask(clustertest.TaskID(run), 5*time.Minute); r["state"] != "done" {
+		t.Fatalf("run: %v %v", r["state"], r["error"])
+	}
+	total, columnar, full := dpLeaves(t, c, "xu", `^ev_third_b[0-9]{4}$`)
+	if total != 6 || columnar != 6 || full != 6 {
+		t.Errorf("leaves of the converted partition: %d, columnar %d, with REPLICA IDENTITY FULL %d; want 6, 6, 6", total, columnar, full)
+	}
+	var cnt []string
+	for _, n := range c.Nodes {
+		cnt = append(cnt, stScalar(t, n, "xu", `SELECT count(*) FROM ev`))
+	}
+	if strings.Join(cnt, ",") != "300,300,300" {
+		t.Errorf("rows after the conversion: %v", cnt)
+	}
+}
