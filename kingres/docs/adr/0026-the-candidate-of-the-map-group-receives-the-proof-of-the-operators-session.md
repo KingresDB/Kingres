@@ -1,8 +1,9 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # ADR 0026: The candidate of a map group failover receives the proof of the operator's session
 
-- Status: Proposed
-- Date: 2026-11-21
+- Status: Accepted
+- Date: 2026-11-23 (proposed 2026-11-21)
+- Implemented in: `kingres/control-plane` (`internal/fwdproof`, `failover` and `mapgroup`, failover round 2); built and reviewed on the staging branch of the first release.
 - Source: [../design/ha-phase5-part2.md](../design/ha-phase5-part2.md) (3.4, F4-05) and the independent review of failover round 2 (F5-05)
 
 ## Context

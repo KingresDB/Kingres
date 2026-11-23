@@ -153,7 +153,7 @@ KingresDB does not make backups for you: there is no schedule, no archive config
 
 **Restoring the system database.** After a restore of `kingres_system` from a backup, restart every `kingresd` of the cluster. The manager leader raises the term of the ledger when it takes over, and writes of the ledger's key set from the old term fail until the leader has taken over again, which the restart does.
 
-A restored system database may hold fewer ledger checkpoints and events than were published. The publisher refuses to sign while that is so and raises the critical alert `ledgerSignerUnavailable` (subject `published-state`), which says what was published, what the database holds, and a confirmation of sixteen hexadecimal digits. The operator decides ([../adr/0025-restore-of-the-system-database-is-accepted-by-an-operator.md](../adr/0025-restore-of-the-system-database-is-accepted-by-an-operator.md); the status of this decision is Proposed):
+A restored system database may hold fewer ledger checkpoints and events than were published. The publisher refuses to sign while that is so and raises the critical alert `ledgerSignerUnavailable` (subject `published-state`), which says what was published, what the database holds, and a confirmation of sixteen hexadecimal digits. The operator decides ([../adr/0025-restore-of-the-system-database-is-accepted-by-an-operator.md](../adr/0025-restore-of-the-system-database-is-accepted-by-an-operator.md); the status of this decision is Accepted, 2026-11-23):
 
 1. Read the alert. Check that the database really was restored and that no newer backup of it exists. If a mirror of the publication holds the lost rows, prefer to recover from it (no importer is built).
 2. Restart every `kingresd` after the restore (as above).
