@@ -4,12 +4,17 @@
 package clustertest_test
 
 import (
+	"context"
 	"crypto/x509"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/clustertest"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover"
@@ -131,8 +136,10 @@ func mapAckedExcept(t *testing.T, c *clustertest.Cluster, port int, pool *x509.C
 func TestHardFailoverOfTheMapGroupWhileItsServerIsAlive(t *testing.T) {
 	c, port, pool, leader, nw, w := mapSwitchoverEnv(t)
 	sampler := startMapSampler(c)
+	probe := startWriteProbe(t, leader, nw)
 	id := mapHardRequest(t, leader, nw, true)
 	mapHardDone(t, leader, nw, id)
+	checkProbe(t, probe(), leader, nw)
 	mapHardAfter(t, c, port, pool, leader, nw, w, id)
 	sampler.Stop(t)
 }
@@ -142,12 +149,14 @@ func TestHardFailoverOfTheMapGroupWhileItsServerIsAlive(t *testing.T) {
 func TestHardFailoverOfTheMapGroupWhoseOldPrimaryDoesNotStop(t *testing.T) {
 	c, port, pool, leader, nw, w := mapSwitchoverEnv(t)
 	sampler := startMapSampler(c)
+	probe := startWriteProbe(t, leader, nw)
 	leader.SetFaults(fault.Spec{FailoverPoint: "demote:nostop", FailoverMode: "skip"})
 	id := mapHardRequest(t, leader, nw, true)
 	mapHardDone(t, leader, nw, id)
 	if !strings.Contains(leader.LogTail(400000), "the old primary is not stopped (test fault demote:nostop)") {
 		t.Errorf("the fault did not take effect: the old primary was stopped by the fence")
 	}
+	checkProbe(t, probe(), leader, nw)
 	mapHardAfter(t, c, port, pool, leader, nw, w, id)
 	sampler.Stop(t)
 }
@@ -328,4 +337,88 @@ func (s *mapSampler) Stop(t *testing.T) {
 		t.Errorf("sampler: only %d complete readings were made", s.n)
 	}
 	t.Logf("the sampler made %d complete readings of the map group", s.n)
+}
+
+// writeProbe asks the instance of the map group of one server, every 20 ms through its own connection, to assign a transaction id (txid_current fails on a standby and on a
+// stopped instance, and succeeds only on a writable primary), and keeps the first and the last instant at which it succeeded.
+type writeProbe struct {
+	first, last time.Time
+	n           int
+}
+
+func startWriteProbe(t *testing.T, nodes ...*clustertest.Node) (stop func() []writeProbe) {
+	t.Helper()
+	out := make([]writeProbe, len(nodes))
+	quit := make(chan struct{})
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	for i, n := range nodes {
+		pw, err := os.ReadFile(filepath.Join(n.DataDir, "service-credentials"))
+		if err != nil {
+			t.Fatalf("service credentials of %s: %v", n.Host, err)
+		}
+		wg.Add(1)
+		go func(i int, n *clustertest.Node, pass string) {
+			defer wg.Done()
+			var c *pgx.Conn
+			defer func() {
+				if c != nil {
+					_ = c.Close(context.Background())
+				}
+			}()
+			for {
+				select {
+				case <-quit:
+					return
+				case <-time.After(20 * time.Millisecond):
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				if c == nil {
+					var err error
+					if c, err = n.PG(ctx, "kingresd", pass, "kingres_system"); err != nil {
+						c = nil
+						cancel()
+						continue
+					}
+				}
+				var x int64
+				if err := c.QueryRow(ctx, `SELECT txid_current()`).Scan(&x); err != nil {
+					if c.IsClosed() {
+						c = nil
+					}
+					cancel()
+					continue
+				}
+				cancel()
+				now := time.Now()
+				mu.Lock()
+				if out[i].n == 0 {
+					out[i].first = now
+				}
+				out[i].last, out[i].n = now, out[i].n+1
+				mu.Unlock()
+			}
+		}(i, n, strings.TrimSpace(string(pw)))
+	}
+	return func() []writeProbe {
+		close(quit)
+		wg.Wait()
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]writeProbe(nil), out...)
+	}
+}
+
+// checkProbe asserts what the probe shows of a failover from old to new: the old instance wrote before it (so the probe was live), the new one wrote after, and the old one
+// never accepted a write at or after the first write of the new one.
+func checkProbe(t *testing.T, ps []writeProbe, old, nw *clustertest.Node) {
+	t.Helper()
+	o, n := ps[0], ps[1]
+	t.Logf("write probe: old %s wrote %d times until %s, new %s wrote %d times from %s", old.Host, o.n, o.last.Format("15:04:05.000"), nw.Host, n.n, n.first.Format("15:04:05.000"))
+	if o.n == 0 || n.n == 0 {
+		t.Fatalf("the probe saw no write on one of the instances: old %d, new %d", o.n, n.n)
+	}
+	if !o.last.Before(n.first) {
+		t.Errorf("two writable primaries: the old one accepted a write at %s, the new one at %s", o.last.Format("15:04:05.000"), n.first.Format("15:04:05.000"))
+	}
 }
