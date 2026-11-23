@@ -280,7 +280,15 @@ func opScenario(t *testing.T, failRewind, back bool) {
 		t.Errorf("old primary in the report: %v (want state standby, method %s)", op, wantMethod)
 	}
 	if !failRewind {
-		if db, _ := op["divergenceBytes"].(float64); db <= 0 {
+		// The report says how much the old primary wrote after the divergence: a number (zero when the old WAL ends before the point where the histories parted,
+		// which a failover under load can give: the promoted standby held more than the old primary wrote), or, only when the instance had not finished its crash
+		// recovery, nothing and the documented message that says the old WAL could not be measured.
+		db, isNumber := op["divergenceBytes"].(float64)
+		msg, _ := op["message"].(string)
+		switch {
+		case isNumber && db >= 0:
+		case !isNumber && strings.Contains(msg, "could not measure the old WAL"):
+		default:
 			t.Errorf("the report does not say how much the old primary wrote after the divergence: %v", op)
 		}
 	}

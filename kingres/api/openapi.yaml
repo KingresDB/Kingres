@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: KingresDB Management API
-  version: 0.17.0
+  version: 0.18.0
   summary: REST API of the KingresDB management panel, CLI and manager.
   description: |
     The single REST API served by `kingresd` on every KingresDB server. The web panel
@@ -1061,7 +1061,7 @@ paths:
         that does not succeed in two minutes ends it with `cannot_quiesce`, and prepared transactions that do not end with
         `prepared_transactions_pending`. The task can be cancelled until the promotion has begun (`Task.cancellable`). Refused with 409
         `group_degraded` when no standby of a group streams from its primary (or the named target does not), and with 422
-        `unsupported_operation` for a request that includes the map group (name the other groups in `shardGroupIds`).
+        `unsupported_operation` for a hard failover of a server whose map group primary answers (see 0.18.0 below).
 
         **0.13.0, the map group.** The failover of the server that runs the primary of the map group (and the manager
         leader) is accepted by any server that does not hear it, in mode `hard` only (`dryRun` and `graceful` answer 422
@@ -1070,6 +1070,15 @@ paths:
         the client polls `GET /failover` (answered by that server) until `taskId` is not null, then `GET /tasks/{id}` on the new
         manager leader. The old leader's rebalance is paused (`stoppedBy` `safetyRule`). The key of the certificate authority is not
         copied to the new leader: the alert `certificateAuthorityUnavailable` says what the operator must do.
+
+        **0.18.0, a planned switchover of the map group.** `mode: graceful` for the server that runs the primary of the map group, sent to the
+        leader (that server) while it answers, is a switchover like any other, with the map group last: the task starts the bootstrap of the chosen
+        standby's server, stops the old leader cleanly and sends it the proof, the standby's server promotes on the proof and becomes the manager
+        leader, and its task engine finishes the task (the task is read from the new leader once the old leader's system database is stopped). The
+        steps of the map group that the old leader could not record are the ones before `Verify the new primary`. A hard failover of a server whose
+        map group primary answers is still 422 `unsupported_operation`.
+        When the manager leader is gone and the request is answered by a server that is not the candidate, the request travels to the candidate with the proof of the
+        operator's session (ADR 0026); a session of the token kind has no proof key and gets 503 `service_unavailable` for this case.
 
         The task is `server.failover`, one block of steps per group (`TaskStep.shardGroupId`). A task that
         waits for an operator is `paused`; a repeat of this request for the same server resumes it. From the moment
@@ -2687,8 +2696,15 @@ paths:
         preferred server are skipped. Long-running: returns a task.
 
         **0.10.0.** The body is optional: `shardGroupIds` limits the groups, `dryRun` answers 200
-        `FailoverPlan` and changes nothing. Refused with the same 409 codes as `failoverServer`. This revision's
-        `kingresd` answers 422 `unsupported_operation` (the switchover is a later increment).
+        `FailoverPlan` and changes nothing. Refused with the same 409 codes as `failoverServer`.
+
+        **How the restore works (the text of 0.18.0).** The task is `replication.restorePreferredPrimaries` (subject `replication` / `preferred-primaries`). The
+        preferred server of a group is the server of its first node by id. A group whose primary is not there is handed back by the steps of a
+        planned switchover (see `failoverServer`, mode `graceful`), one group at a time, from the server that took it over to the preferred server.
+        A group whose preferred server has no ready standby, is left alone and listed in the report as
+        `skipped` with the reason `preferredNotReady` (`mapGroup` is reserved and is not produced since the map group is restored like any group). A group that fails before its promotion (a standby that is behind, a proof
+        that cannot be made) is rolled back and reported `failed`; the task goes on with the next group and ends `partial`. 422 `unprocessable`
+        when no group needs to be restored. The report has `kind` `restorePreferredPrimaries`, `mode` `restore` and `serverId` null.
       tags: [Replication]
       x-required-role: kingres_ops
       requestBody:
@@ -2736,6 +2752,42 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /failover/map/abandon:
+    post:
+      operationId: abandonMapGroupBootstrap
+      summary: Give up a stuck bootstrap of the map group
+      description: |
+        Added in 0.18.0. A failover of the map group that the manager leader's loss forces is run by a bootstrap on the server of a standby (not by a
+        task: no task can be recorded while the system database is not writable). A bootstrap that did not reach the promotion and cannot go on (for
+        example it waits for a majority that does not come back) is given up by the candidate monitor after fifteen minutes or when the catalog has a
+        newer term; this operation gives it up at once, so that the gate of the task engine opens and a new request can begin. It is answered by any
+        server (the leader may be the server that is gone): the server asks the servers that host a ready standby of the map group and gives up the
+        bootstrap that one of them runs. `abandoned` is false when no bootstrap is in progress. A bootstrap that already promoted the standby cannot
+        be given up (409 `conflict`): the promoted instance holds the lease and the bootstrap goes on to its end. A bootstrap of a planned switchover that is given up also
+        asks the old leader's server to end the hold of its primary of the map group (the system database), whose task may be gone; `resumedServerId` names the
+        server that was started again. When no bootstrap is in progress anywhere, the call asks every server to end a hold of its primary of the map group that
+        nothing owns (no bootstrap names it, no standby of the map group was promoted, a standby is shown to be in recovery): this is how an operator starts a
+        stranded old leader again, and `resumedServerId` names it (`abandoned` is false then). The audit event is `abandonMapGroupBootstrap`. It needs `kingres_admin`, one role above the failover it undoes (`kingres_ops`): it discards what a bootstrap did and, for a planned switchover, makes the old leader roll back.
+      tags: [Replication]
+      x-required-role: kingres_admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AbandonMapGroupBootstrapRequest' }
+      responses:
+        '200':
+          description: The bootstrap was given up, or none was in progress.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AbandonMapGroupBootstrapResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
         '422': { $ref: '#/components/responses/UnprocessableEntity' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /failover/reports:
@@ -7363,6 +7415,26 @@ components:
           type: [integer, 'null']
           format: int32
         message: { type: string }
+    AbandonMapGroupBootstrapRequest:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 500
+          description: Why the bootstrap is given up; it is kept in the journal of the bootstrap and in the audit event.
+    AbandonMapGroupBootstrapResult:
+      type: object
+      required: [abandoned]
+      properties:
+        abandoned:
+          type: boolean
+          description: True when a bootstrap was in progress and is given up; false when none was.
+        resumedServerId:
+          $ref: '#/components/schemas/ServerId'
+          description: The server whose primary of the map group, held back for a planned switchover, was started again by this call; absent when none was.
     FailoverGroupPlan:
       type: object
       description: The plan for one group.
@@ -7391,6 +7463,18 @@ components:
         movesTheManager:
           type: boolean
           description: True for the map group.
+        skipped:
+          type: object
+          description: |
+            Added in 0.18.0. Present only for a group that a `restorePreferredPrimaries` leaves alone (the plan then has `toServerId` null, no
+            candidates and no steps). The report lists the same group as `skipped` with the same reason.
+          required: [reason, message]
+          properties:
+            reason:
+              type: string
+              enum: [preferredNotReady, mapGroup]
+              description: '`preferredNotReady`: the preferred server has no ready, registered standby of the group. `mapGroup`: reserved; the map group is restored like any group since 0.18.0 and is skipped with `preferredNotReady` when its preferred server has no ready standby of it.'
+            message: { type: string }
     FailoverCandidate:
       type: object
       description: A standby that could be promoted.
@@ -7554,7 +7638,7 @@ components:
       properties:
         state: { type: string, enum: [notScheduled, rebuildScheduled, rebuilding, standby, waitingForServer, removed, failed], description: '`notScheduled`: no rebuild of the old primary is scheduled for the group (for a record of an earlier revision of kingresd that never rebuilt it, and for a group whose old primary has no directory to rebuild); it stays stopped and fenced until an operator acts. From 0.12.0 kingresd rebuilds the old primary of an ordinary group by itself (`rebuildScheduled`, `rebuilding`, `standby`).' }
         method: { type: [string, 'null'], enum: [clean, pgRewind, baseBackup, null] }
-        divergenceBytes: { type: [integer, 'null'], format: int64 }
+        divergenceBytes: { type: [integer, 'null'], format: int64, description: 'What the old primary wrote after the point where the histories parted (the writes that were discarded), at least: the distance to its shutdown checkpoint, whose own record is not counted. Zero when its WAL ends before that point. Null when the instance had not finished its crash recovery and the end of its WAL could not be told (then `message` says so), and for a base backup.' }
         rewindBytes: { type: [integer, 'null'], format: int64 }
         message: { type: [string, 'null'] }
     FailoverEvent:
@@ -10459,6 +10543,7 @@ components:
         - updateServer
         - removeServer
         - failoverServer
+        - abandonMapGroupBootstrap
         - autoFailover
         - createServerGroup
         - deleteServerGroup

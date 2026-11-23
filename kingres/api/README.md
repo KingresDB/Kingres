@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.17.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.18.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and, when it is built, the planned `kingres-cli` (it does not exist yet). Lint it and run the mechanical rule check with:
 
 ```
@@ -322,6 +322,28 @@ Where the architecture document leaves something open, the simplest option was c
     range and the cluster's replica count.
 
 ## Changelog
+
+### 0.18.0
+
+Revision written with the end of the failover increments (`kingres/docs/design/ha-phase5-part2.md`, open items F4-06 and the plan of a restore). Summary for the panel:
+1 operation added (161 operations, 129 paths); one optional member added to `FailoverGroupPlan`; **no change that is not additive**.
+
+#### Breaking
+
+None.
+
+#### Additive
+
+- `abandonMapGroupBootstrap` (`POST /failover/map/abandon`, `kingres_admin`, body `{reason}`, answer `{abandoned, resumedServerId?}`): gives up a bootstrap of the map group that did not reach the promotion
+  (409 `conflict` after it), and ends the hold of the old leader of a planned switchover that it gave up (`resumedServerId` names the server started again; with no bootstrap in progress it asks every server to resume a hold that nothing owns). Any server answers it, because the manager leader may be the server that is gone. `AuditAction` has `abandonMapGroupBootstrap`.
+- `FailoverGroupPlan.skipped` (`{reason, message}`, `reason` is `preferredNotReady` or `mapGroup`): present for a group that a `restorePreferredPrimaries` leaves alone; such a group has
+  no target, no candidates and no steps in the plan (before 0.18.0 the plan listed only the groups that are restored, and the report listed the skipped ones).
+
+#### Documentation
+
+- `restorePreferredPrimaries` (contract of 0.10.0, implemented): no change of schema. The task kind is `replication.restorePreferredPrimaries` with the subject `replication` / `preferred-primaries`; the groups that are left alone are reported `skipped` with the reason in `error` (`preferredNotReady`); a group that fails before its promotion is `failed` and the task ends `partial`; 422 `unprocessable` when nothing needs to be restored. `GET /failover` names the phase of a group of a switchover or a restore (`quiescing`, `waitingForTransactions`, `stopping`, `verifying`, ...) and `writesPausedSince` while its writes are stopped.
+- `failoverServer`, `mode: graceful`: a planned switchover of the map group is accepted by the leader (that server) and handled as described; a hard failover of a server whose map group primary answers is
+  still refused with 422 `unsupported_operation`. `restorePreferredPrimaries` restores the map group like any group (skipped with `preferredNotReady` when its preferred server has no ready standby of it).
 
 ### 0.17.0
 

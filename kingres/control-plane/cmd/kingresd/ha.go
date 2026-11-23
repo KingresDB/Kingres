@@ -11,7 +11,9 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/cluster"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/config"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fault"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fwdproof"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ha"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/leader"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/lease"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/membership"
@@ -47,6 +49,8 @@ type haDeps struct {
 	OnCertificateInstalled func(func())
 	// LastLeader remembers the leader the catalog named last.
 	LastLeader *leaderMemory
+	// IdentityCheck verifies the proof of an operator's session that a member sends with a request it forwards (nil: nothing can be proven and such a request is refused).
+	IdentityCheck func(ctx context.Context, kind fwdproof.Kind, peer string, req internalapi.ForwardRequest) error
 	// Fault is the fault-injection hook of the tests (nil in production); a feature
 	// that makes its own peer client passes it on in peerclient.Config.
 	Fault *fault.Hook

@@ -354,6 +354,7 @@ export const AUDIT_ACTION_LABEL: Record<AuditAction, string> = {
   updateServer: 'Change a server',
   removeServer: 'Remove a server',
   failoverServer: 'Fail over a server',
+  abandonMapGroupBootstrap: 'Give up the bootstrap of the map group',
   autoFailover: 'Automatic failover',
   createServerGroup: 'Create a server group',
   deleteServerGroup: 'Delete a server group',

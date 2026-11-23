@@ -2449,6 +2449,19 @@ export function createHandlers(): HttpHandler[] {
       resetAutoFailoverCounter(c.s)
       return ok(c.s.settings)
     },
+    // The bootstrap of the map group that a leader's loss forces is run by the candidate, not by a task. The mock has the phase only: a run in it has
+    // promoted the standby already (a bootstrap that did not is not shown), which cannot be given up.
+    abandonMapGroupBootstrap: (c) => {
+      const b = body<S['AbandonMapGroupBootstrapRequest']>(c)
+      if (typeof b.reason !== 'string' || b.reason.length === 0)
+        throw problem('unprocessable', 'A reason is needed.')
+      if (failoverStatusView(c.s).phase === 'bootstrap')
+        throw problem(
+          'conflict',
+          'The standby of the map group was promoted already; the bootstrap goes on to its end.',
+        )
+      return ok({ abandoned: false } satisfies S['AbandonMapGroupBootstrapResult'])
+    },
 
     // --- tasks
     listTasks: (c) => {

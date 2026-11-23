@@ -56,8 +56,18 @@ func (m *Manager) writeWatchdogFile(group int32) {
 		m.writeWatchdogIdle(wf)
 		return
 	}
+	// The state is read and the file is written under one lock (F6-05): a round that took its sequence number before a demotion wrote the file of "not a primary" cannot write after it
+	// and arm the watchdog of an instance that is a standby now. The demotion deletes the state first, so a round that comes after it finds none.
+	m.wmu.Lock()
+	defer m.wmu.Unlock()
 	m.mu.Lock()
 	st := m.groups[group]
+	if st == nil {
+		// The state of the group was dropped (a release, an end of adoption, a demotion) between the round that found the lease valid and this write: there
+		// is nothing to write for a lease that is not held any more. Found by a cluster test of the rollback of a map group switchover (a nil dereference).
+		m.mu.Unlock()
+		return
+	}
 	rem := (st.validUntil - m.c.Margin - m.c.Clock.Mono()).Milliseconds()
 	m.seq++
 	seq := m.seq
@@ -85,6 +95,8 @@ func (m *Manager) writeWatchdogIdle(wf string) {
 	if _, err := os.Stat(filepath.Clean(wf)); err != nil {
 		return
 	}
+	m.wmu.Lock()
+	defer m.wmu.Unlock()
 	m.mu.Lock()
 	m.seq++
 	seq := m.seq
@@ -97,6 +109,8 @@ func (m *Manager) writeWatchdogOff(wf string) {
 	if _, err := os.Stat(filepath.Clean(wf)); err != nil {
 		return
 	}
+	m.wmu.Lock()
+	defer m.wmu.Unlock()
 	m.mu.Lock()
 	m.seq++
 	seq := m.seq

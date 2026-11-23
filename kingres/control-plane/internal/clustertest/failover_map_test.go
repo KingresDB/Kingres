@@ -65,9 +65,11 @@ func (m *mapCluster) request(t *testing.T, via *clustertest.Node) map[string]any
 	mapLogin(t, via)
 	var st int
 	var resp map[string]any
+	// The old server was killed just before: the leader's view of it turns to dead after a moment, and until then the request is refused as the failover of a
+	// live leader's server (422 unsupported_operation). Only that answer is waited out, for the same two minutes as a 503; what the test asserts is unchanged.
 	until(t, 2*time.Minute, "the request to be accepted", func() bool {
 		st, resp = via.Do("POST", "/servers/"+m.old.Host+"/failover", map[string]any{"mode": "hard", "allowDataLoss": true, "comment": "map group"}, nil)
-		return st != 503
+		return st != 503 && !(st == 422 && resp["code"] == "unsupported_operation")
 	})
 	if st != 202 {
 		t.Fatalf("request for the failover of the map group: %d %v", st, resp)

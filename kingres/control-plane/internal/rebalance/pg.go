@@ -127,7 +127,7 @@ func (b *PG) Check(ctx context.Context, dbs []string) error {
 	var tasks []string
 	err := b.with(ctx, sysdb.Database, func(c *pgx.Conn) error {
 		rows, err := c.Query(ctx, `SELECT kind || ' ' || subject_id FROM kingres_cp.task
-			WHERE state IN ('pending', 'running', 'paused') AND kind IN ('server.failover', 'server.add', 'server.remove', 'server.leave')`)
+			WHERE state IN ('pending', 'running', 'paused') AND kind IN ('server.failover', 'replication.restorePreferredPrimaries', 'server.add', 'server.remove', 'server.leave')`)
 		if err != nil {
 			return err
 		}
@@ -138,7 +138,7 @@ func (b *PG) Check(ctx context.Context, dbs []string) error {
 		return err
 	}
 	for _, t := range tasks {
-		if strings.HasPrefix(t, "server.failover") {
+		if strings.HasPrefix(t, "server.failover") || strings.HasPrefix(t, "replication.restorePreferredPrimaries") {
 			return problem.New(problem.FailoverInProgress, "A failover is in progress ("+t+"); the buckets stay where they are until it has finished.")
 		}
 	}

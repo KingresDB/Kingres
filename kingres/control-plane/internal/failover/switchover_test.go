@@ -8,6 +8,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
 )
@@ -592,5 +593,466 @@ func TestASwitchoverWithoutAMajorityIsRolledBackNotPaused(t *testing.T) {
 	}
 	if w.index("resume s1") < 0 || w.index("unquiesce s1") < 0 || w.index("promote s") >= 0 {
 		t.Errorf("\n%s", strings.Join(w.log, "\n"))
+	}
+}
+
+// mapWorld is gracefulWorld for the map group: the groups of the nodes, the standbys and the positions are 0, and the server that runs the
+// tasks is the old leader's own (the map group is handed over by the leader's task).
+func mapWorld() *world {
+	w := gracefulWorld()
+	w.mapGroup, w.self = true, "s1"
+	for i := range w.nodes {
+		if w.nodes[i].Group == 1 {
+			w.nodes[i].Group = 0
+		}
+	}
+	for i := range w.standbys {
+		w.standbys[i].Group = 0
+	}
+	for s, p := range w.pos {
+		p.Group = 0
+		w.pos[s] = p
+	}
+	return w
+}
+
+func mapGracefulInput() Input {
+	return Input{Mode: ModeGraceful, ServerID: "s1", Groups: []int32{0}, Trigger: "manual", RequestedBy: "tester", Comment: "map"}
+}
+
+// The map group is handed over by the old leader's task: the bootstrap of the candidate is started BEFORE the old primary is stopped (it waits for the
+// lease that the clean stop releases), and the proof of the stop is sent to it after.
+func TestAMapGroupSwitchoverStartsTheBootstrapBeforeTheStopAndSendsTheProofAfter(t *testing.T) {
+	w := mapWorld()
+	r := w.runner()
+	w.fakeClock(r)
+	if name, err := runAll(t, r, mapGracefulInput()); err != nil {
+		t.Fatalf("%s: %v\n%s", name, err, strings.Join(w.log, "\n"))
+	}
+	start, mark, demote, proof := w.index("map-start s2"), w.index("mark s1"), w.index("demote-fast s1"), w.index("map-proof s2")
+	if start < 0 || mark < 0 || demote < 0 || proof < 0 || !(start < mark && mark < demote && demote < proof) {
+		t.Fatalf("the order of the hand-over (start %d, mark %d, demote %d, proof %d):\n%s", start, mark, demote, proof, strings.Join(w.log, "\n"))
+	}
+	if len(w.mapStarts) != 1 || w.mapStarts[0].Planned == nil || w.mapStarts[0].Planned.StandbyID != 10 || w.mapStarts[0].Planned.TaskID != 1 ||
+		w.mapStarts[0].Server != "s1" || w.mapStarts[0].AllowDataLoss {
+		t.Fatalf("the request of the bootstrap: %+v", w.mapStarts)
+	}
+	if len(w.mapProofs) != 1 || w.mapProofs[0].Checkpoint == "" || w.mapProofs[0].ClusterState != "shut down" {
+		t.Fatalf("the proof: %+v", w.mapProofs)
+	}
+}
+
+// The new leader's engine runs the steps that the old leader could not record: the standby is promoted already, so the steps that act on the old
+// leader or on the lease skip, and nothing starts a second bootstrap.
+func TestTheNewLeaderRunsAgainWhatTheOldLeaderCouldNotRecord(t *testing.T) {
+	w := mapWorld()
+	r := w.runner()
+	w.fakeClock(r)
+	in := mapGracefulInput()
+	raw, _ := json.Marshal(in)
+	steps, err := r.steps(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mark := -1
+	for _, s := range steps {
+		if mark >= 0 && s.Name == StepName(0, StepVerify) {
+			break // the steps of the old leader are over: what follows is the new leader's run
+		}
+		env := &task.Env{Task: task.Task{ID: 1, Input: raw}}
+		if err := s.Run(context.Background(), env); err != nil {
+			var sk *task.SkipError
+			if !errors.As(err, &sk) {
+				t.Fatalf("%s: %v", s.Name, err)
+			}
+		}
+		if s.Name == StepName(0, StepStopClean) {
+			// the old leader stopped; the bootstrap of the candidate promoted the standby and holds the lease
+			w.promoted["s2"], w.lease["s2"] = true, true
+			mark = len(w.log)
+		}
+	}
+	// The new leader's engine: every step of the map group that is not recorded runs again, the stop first.
+	for _, s := range steps {
+		if s.Name != StepName(0, StepStopClean) && s.Name != StepName(0, StepVerify) && s.Name != StepName(0, StepLease) && s.Name != StepName(0, StepHandOver) && s.Name != StepName(0, StepPromote) {
+			continue
+		}
+		env := &task.Env{Task: task.Task{ID: 1, Input: raw}}
+		err := s.Run(context.Background(), env)
+		var sk *task.SkipError
+		if !errors.As(err, &sk) {
+			t.Errorf("%s did not skip on the new leader: %v", s.Name, err)
+		}
+	}
+	after := strings.Join(w.log[mark:], "\n")
+	for _, c := range []string{"map-start", "mark ", "demote", "map-proof", "lease-fence"} {
+		if strings.Contains(after, c) {
+			t.Errorf("a re-run on the new leader made %q:\n%s", c, after)
+		}
+	}
+}
+
+// A failure before the stop gives the bootstrap up and resumes the old leader.
+func TestAFailedMapGroupSwitchoverGivesTheBootstrapUp(t *testing.T) {
+	w := mapWorld()
+	w.mapStartErr = errors.New("the candidate cannot start")
+	r := w.runner()
+	w.fakeClock(r)
+	name, err := runAll(t, r, mapGracefulInput())
+	if err == nil || name != StepName(0, StepStopClean) {
+		t.Fatalf("%s: %v", name, err)
+	}
+	if w.count("map-abandon s2") != 1 || w.count("resume s1") != 1 {
+		t.Fatalf("the rollback:\n%s", strings.Join(w.log, "\n"))
+	}
+	if w.count("demote ") != 0 {
+		t.Fatal("the old leader was stopped although the bootstrap did not start")
+	}
+}
+
+// The map group is the last group of a switchover or a restore.
+func TestTheMapGroupIsTheLastGroupOfAPlannedSwitchover(t *testing.T) {
+	in := Input{Mode: ModeGraceful, Groups: []int32{0, 2, 5}}
+	if got := mapLast(in); len(got) != 3 || got[0] != 2 || got[1] != 5 || got[2] != 0 {
+		t.Fatalf("%v", got)
+	}
+	hard := Input{Mode: ModeHard, Groups: []int32{0, 2, 5}}
+	if got := mapLast(hard); got[0] != 0 {
+		t.Fatalf("a hard failover keeps its order: %v", got)
+	}
+}
+
+// The preflight: the map group is accepted for a planned switchover of the server that runs the task, refused for a hard failover of a live
+// server, and refused when the request is not made on the leader's own server.
+func TestThePreflightOfTheMapGroup(t *testing.T) {
+	w := mapWorld()
+	r := w.runner()
+	if ref := r.Preflight(context.Background(), mapGracefulInput()); ref != nil {
+		t.Fatalf("a planned switchover of the map group: %+v", ref)
+	}
+	hard := mapGracefulInput()
+	hard.Mode = ModeHard
+	if ref := r.Preflight(context.Background(), hard); ref == nil || ref.Code != "unsupported_operation" {
+		t.Fatalf("a hard failover of a live leader's server: %+v", ref)
+	}
+	w.self = "s3"
+	if ref := w.runner().Preflight(context.Background(), mapGracefulInput()); ref == nil || ref.Code != "unsupported_operation" {
+		t.Fatalf("not on the leader's server: %+v", ref)
+	}
+}
+
+// The standby refuses the proof after the old leader stopped: the candidate reports it, the old leader's task rolls back, the old leader is resumed
+// (its lease manager starts the primary, the candidate let go of the lease) and the writes are let in again; nothing was promoted.
+func TestARefusedProofAfterTheStopRollsTheMapGroupSwitchoverBack(t *testing.T) {
+	w := mapWorld()
+	w.mapRefusal = "the standby does not hold everything the old primary wrote"
+	r := w.runner()
+	w.fakeClock(r)
+	name, err := runAll(t, r, mapGracefulInput())
+	failedWith(t, w, err, CodeSwitchoverUnproven)
+	if name != StepName(0, StepStopClean) {
+		t.Fatalf("the step: %s", name)
+	}
+	if w.count("resume s1") != 1 || w.count("unquiesce s1") < 1 || w.count("map-abandon s2") != 1 {
+		t.Fatalf("the rollback:\n%s", strings.Join(w.log, "\n"))
+	}
+	if w.count("promote s2") != 0 || w.promoted["s2"] {
+		t.Fatal("the standby was promoted although the proof was refused")
+	}
+}
+
+// A candidate that says nothing is waited for, then the task rolls back as well (the lease keeps the two from running together).
+func TestACandidateThatNeverAnswersEndsTheMapGroupSwitchoverBySilence(t *testing.T) {
+	w := mapWorld()
+	w.dbDownAfterStop = true // as in the real system: the rows of the task are in the stopped instance (F5-01)
+	w.mapRefusal = ""
+	r := w.runner()
+	w.fakeClock(r)
+	r.MapVerdictWait = 3 * time.Second
+	// the fake candidate does not promote: this world answers State with the standby still in recovery
+	w.noPromoteOnProof = true
+	_, err := runAll(t, r, mapGracefulInput())
+	failedWith(t, w, err, CodeSwitchoverUnproven)
+	if w.count("resume s1") != 1 {
+		t.Fatalf("the old leader was not resumed:\n%s", strings.Join(w.log, "\n"))
+	}
+}
+
+// F5-01. The clean stop did not release the lease at a majority (the old leader's renewal is back): the task rolls back with the rows unreadable and
+// still lets go of the candidate's lease, gives its bootstrap up, and resumes the old leader.
+func TestARollbackAfterAStopThatDidNotReleaseTheLeaseStillReleasesTheCandidate(t *testing.T) {
+	w := mapWorld()
+	w.dbDownAfterStop, w.notReleased = true, true
+	r := w.runner()
+	w.fakeClock(r)
+	name, err := runAll(t, r, mapGracefulInput())
+	failedWith(t, w, err, CodeSwitchoverUnproven)
+	if name != StepName(0, StepStopClean) {
+		t.Fatalf("the step: %s", name)
+	}
+	if w.count("lease-release s2") != 1 || w.count("map-abandon s2") != 1 || w.count("resume s1") != 1 {
+		t.Fatalf("the rollback with unreadable rows:\n%s", strings.Join(w.log, "\n"))
+	}
+}
+
+// F5-03. The rollback asks the candidate first: when it answers that it promoted (or may have), nothing is rolled back: no lease is released and the old
+// leader is not resumed; the step ends as the hand-over it is. In an ordinary rollback the candidate is asked before the leases are released.
+func TestARollbackThatMeetsAPromotedCandidateLeavesTheOldLeaderHeld(t *testing.T) {
+	w := mapWorld()
+	w.dbDownAfterStop = true
+	w.mapRefusal = "the standby could not prove it"
+	w.mapAbandonErr = &CallError{Status: 409, Code: "conflict", Message: "it promoted"}
+	r := w.runner()
+	w.fakeClock(r)
+	raw, _ := json.Marshal(mapGracefulInput())
+	steps, serr := r.steps(raw)
+	if serr != nil {
+		t.Fatal(serr)
+	}
+	for _, s := range steps {
+		err := s.Run(context.Background(), &task.Env{Task: task.Task{ID: 1, Input: raw}})
+		var sk *task.SkipError
+		if err != nil && !errors.As(err, &sk) {
+			t.Fatalf("%s should end as a hand-over: %v\n%s", s.Name, err, strings.Join(w.log, "\n"))
+		}
+		if s.Name == StepName(0, StepStopClean) {
+			break // the old leader's task ends here: its database is stopped
+		}
+	}
+	if w.count("map-abandon s2") != 1 || w.count("resume s1") != 0 || w.count("lease-release") != 0 || w.count("unquiesce s1") != 0 {
+		t.Fatalf("a rollback ran although the candidate promoted:\n%s", strings.Join(w.log, "\n"))
+	}
+}
+
+func TestTheRollbackAsksTheCandidateBeforeItReleasesTheLeasesAndResumes(t *testing.T) {
+	w := mapWorld()
+	w.dbDownAfterStop = true
+	w.mapRefusal = "refused"
+	r := w.runner()
+	w.fakeClock(r)
+	_, err := runAll(t, r, mapGracefulInput())
+	failedWith(t, w, err, CodeSwitchoverUnproven)
+	a, l, rs := w.index("map-abandon s2"), w.index("lease-release"), w.index("resume s1")
+	if a < 0 || l < 0 || rs < 0 || !(a < l && a < rs) {
+		t.Fatalf("the order (abandon %d, release %d, resume %d):\n%s", a, l, rs, strings.Join(w.log, "\n"))
+	}
+}
+
+// F5-06. On the new leader's engine, a state that cannot be read is not "the map group was not handed over": the step fails and is retried, and nothing is
+// started, stopped or rolled back.
+func TestAStateThatCannotBeReadIsNotReadAsNotHandedOver(t *testing.T) {
+	w := mapWorld()
+	r := w.runner()
+	w.fakeClock(r)
+	raw, _ := json.Marshal(mapGracefulInput())
+	steps, err := r.steps(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range steps {
+		if s.Name == StepName(0, StepStopClean) {
+			break
+		}
+		if err := s.Run(context.Background(), &task.Env{Task: task.Task{ID: 1, Input: raw}}); err != nil {
+			var sk *task.SkipError
+			if !errors.As(err, &sk) {
+				t.Fatalf("%s: %v", s.Name, err)
+			}
+		}
+	}
+	// the promotion happened elsewhere and this server cannot read the state of the standby now
+	w.promoted["s2"], w.lease["s2"] = true, true
+	w.stateDown = map[string]bool{"s2": true}
+	mark := len(w.log)
+	for _, s := range steps {
+		if s.Name != StepName(0, StepStopClean) {
+			continue
+		}
+		err := s.Run(context.Background(), &task.Env{Task: task.Task{ID: 1, Input: raw}})
+		var sk *task.SkipError
+		if err == nil || errors.As(err, &sk) {
+			t.Fatalf("the step went on with a state that could not be read: %v", err)
+		}
+	}
+	after := strings.Join(w.log[mark:], "\n")
+	for _, c := range []string{"map-start", "mark ", "demote", "resume", "unquiesce", "lease-release", "map-abandon"} {
+		if strings.Contains(after, c) {
+			t.Errorf("a failed read started or undid something (%s):\n%s", c, after)
+		}
+	}
+}
+
+// A rollback is never made for a group whose row says promoted.
+func TestAGroupThatWasPromotedIsNeverRolledBack(t *testing.T) {
+	w := gracefulWorld()
+	r := w.runner()
+	w.fakeClock(r)
+	w.stopState = "in production" // the stop is not clean: the step would roll back
+	raw, _ := json.Marshal(gracefulInput())
+	steps, _ := r.steps(raw)
+	for _, s := range steps {
+		if s.Name == StepName(1, StepStopClean) {
+			w.rows.mu.Lock()
+			w.rows.groups[1].State = "promoted"
+			w.rows.mu.Unlock()
+			mark := len(w.log)
+			err := s.Run(context.Background(), &task.Env{Task: task.Task{ID: 1, Input: raw}})
+			failedWith(t, w, err, CodeSwitchoverUnproven)
+			if after := strings.Join(w.log[mark:], "\n"); strings.Contains(after, "resume") || strings.Contains(after, "lease-release") {
+				t.Fatalf("a promoted group was rolled back:\n%s", after)
+			}
+			return
+		}
+		if err := s.Run(context.Background(), &task.Env{Task: task.Task{ID: 1, Input: raw}}); err != nil {
+			var sk *task.SkipError
+			if !errors.As(err, &sk) {
+				t.Fatalf("%s: %v", s.Name, err)
+			}
+		}
+	}
+	t.Fatal("no stop step")
+}
+
+// F5-10. The short wait for the old server's answers is the map group's of a planned switchover; every other group and mode keeps the long wait.
+func TestOnlyTheMapGroupOfAPlannedSwitchoverBoundsTheCallsToTheOldServer(t *testing.T) {
+	ctx := context.Background()
+	has := func(sc *stepCtx) bool {
+		c, cancel := sc.oldCtx(ctx)
+		defer cancel()
+		_, ok := c.Deadline()
+		return ok
+	}
+	r := &Runner{}
+	if !has(&stepCtx{r: r, in: Input{Mode: ModeGraceful}, group: 0}) {
+		t.Error("the map group of a planned switchover is not bounded")
+	}
+	if !has(&stepCtx{r: r, in: Input{Mode: ModeRestore}, group: 0}) {
+		t.Error("the map group of a restore is not bounded")
+	}
+	for _, c := range []struct {
+		name string
+		sc   *stepCtx
+	}{
+		{"an ordinary group of a switchover", &stepCtx{r: r, in: Input{Mode: ModeGraceful}, group: 2}},
+		{"an ordinary group of a hard failover", &stepCtx{r: r, in: Input{Mode: ModeHard}, group: 2}},
+		{"the map group of a hard failover", &stepCtx{r: r, in: Input{Mode: ModeHard}, group: 0}},
+	} {
+		if has(c.sc) {
+			t.Errorf("%s is bounded: the fence of last resort would be skipped after 15 s", c.name)
+		}
+	}
+}
+
+// runAllCancelledAtTheStop runs the steps like runAll, with a context that the clean stop cancels (the engine cancels the context of a step whose task lease
+// cannot be renewed, which is what the stopped system database of the map group does ten seconds after the stop).
+func runAllCancelledAtTheStop(t *testing.T, w *world, r *Runner, in Input) (string, error) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.afterStop = cancel
+	raw, _ := json.Marshal(in)
+	steps, err := r.steps(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range steps {
+		err := s.Run(ctx, &task.Env{Task: task.Task{ID: 1, Input: raw}})
+		var sk *task.SkipError
+		if errors.As(err, &sk) {
+			continue
+		}
+		if err != nil {
+			return s.Name, err
+		}
+	}
+	return "", nil
+}
+
+// The cluster tests of the review of round 2 found it: the context of the step ends soon after the clean stop of the map group, and a step that ends with it
+// leaves the old primary stopped and held back, with nobody to roll back. A candidate that never promotes, and a proof that cannot be sent, roll back all the same.
+func TestTheRollbackOfTheMapGroupOutlivesTheContextOfTheStep(t *testing.T) {
+	w := mapWorld()
+	w.dbDownAfterStop, w.noPromoteOnProof = true, true
+	r := w.runner()
+	w.fakeClock(r)
+	r.MapVerdictWait = 3 * time.Second
+	_, err := runAllCancelledAtTheStop(t, w, r, mapGracefulInput())
+	failedWith(t, w, err, CodeSwitchoverUnproven)
+	if w.count("resume s1") != 1 || w.count("map-abandon s2") != 1 || w.count("lease-release s2") != 1 {
+		t.Fatalf("no rollback after the context ended:\n%s", strings.Join(w.log, "\n"))
+	}
+}
+
+func TestAProofThatCannotBeSentRollsTheMapGroupBack(t *testing.T) {
+	w := mapWorld()
+	w.dbDownAfterStop = true
+	w.mapProofErr = &CallError{Status: 409, Code: "conflict", Message: "No planned switchover of the map group is in progress on this server."}
+	r := w.runner()
+	w.fakeClock(r)
+	_, err := runAllCancelledAtTheStop(t, w, r, mapGracefulInput())
+	failedWith(t, w, err, CodeTargetUnavailable)
+	if w.count("resume s1") != 1 || w.count("map-abandon s2") != 1 {
+		t.Fatalf("no rollback after the proof failed:\n%s", strings.Join(w.log, "\n"))
+	}
+}
+
+// A run of the step after the switchover was given up (its rollback could not be recorded) ends as the rollback it was: switchover_unproven, with the
+// old leader resumed, and no second switchover begins.
+func TestAMapGroupSwitchoverThatWasGivenUpEndsAsUnprovenWhenTheStepRunsAgain(t *testing.T) {
+	w := mapWorld()
+	w.mapStartErr = &CallError{Status: 409, Code: "conflict", Message: "The planned switchover of this task was given up; it is not started again."}
+	r := w.runner()
+	w.fakeClock(r)
+	_, err := runAll(t, r, mapGracefulInput())
+	failedWith(t, w, err, CodeSwitchoverUnproven)
+	if w.count("demote-fast s1") != 0 || w.count("resume s1") != 1 {
+		t.Fatalf("a second switchover began or the old leader was not resumed:\n%s", strings.Join(w.log, "\n"))
+	}
+}
+
+// F6-04. The candidate cannot be reached when the rollback asks it to give the bootstrap up (an answer that is not a conflict, so it is not known whether it promoted,
+// and the rows are in the stopped system database): the rollback goes on, because the lease decides which of the two primaries may run, and not silently: the
+// old leader is resumed and the candidate's lease is released at its own server (which refuses it for a promoted, attached instance). The choice is this test.
+func TestARollbackThatCannotAskTheCandidateGoesOnAndTheLeaseDecides(t *testing.T) {
+	w := mapWorld()
+	w.dbDownAfterStop = true
+	w.mapRefusal = "refused"
+	w.mapAbandonErr = errors.New("the candidate cannot be reached")
+	r := w.runner()
+	w.fakeClock(r)
+	_, err := runAll(t, r, mapGracefulInput())
+	failedWith(t, w, err, CodeSwitchoverUnproven)
+	if w.count("map-abandon s2") != 1 || w.count("resume s1") != 1 || w.count("lease-release s2") != 1 {
+		t.Fatalf("the rollback that could not ask the candidate:\n%s", strings.Join(w.log, "\n"))
+	}
+}
+
+// F7-01. The clean stop names the server that the group is handed to, for the map group only: the old leader records it before it stops, and resumes its primary later only
+// on that server's word. The ordinary groups record none.
+func TestTheCleanStopOfTheMapGroupNamesTheCandidate(t *testing.T) {
+	w := mapWorld()
+	r := w.runner()
+	w.fakeClock(r)
+	if name, err := runAll(t, r, mapGracefulInput()); err != nil {
+		t.Fatalf("%s: %v\n%s", name, err, strings.Join(w.log, "\n"))
+	}
+	if len(w.stopCandidates) == 0 {
+		t.Fatalf("no clean stop was asked:\n%s", strings.Join(w.log, "\n"))
+	}
+	for _, c := range w.stopCandidates {
+		if c != "s2" {
+			t.Fatalf("the clean stop of the map group names %q, want s2: %v", c, w.stopCandidates)
+		}
+	}
+	g := gracefulWorld()
+	rg := g.runner()
+	g.fakeClock(rg)
+	if name, err := runAll(t, rg, Input{Mode: ModeGraceful, ServerID: "s1", Groups: []int32{1}, Trigger: "manual", RequestedBy: "tester", Comment: "g"}); err != nil {
+		t.Fatalf("%s: %v\n%s", name, err, strings.Join(g.log, "\n"))
+	}
+	for _, c := range g.stopCandidates {
+		if c != "" {
+			t.Fatalf("the clean stop of an ordinary group names %q: %v", c, g.stopCandidates)
+		}
 	}
 }

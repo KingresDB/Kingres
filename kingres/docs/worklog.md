@@ -69,6 +69,72 @@ See the integration note of this branch (full suite, both majors).
 
 - The step 6 of the drain in the control plane (reading the schemas again) and `previewServerDrain` belong to cp-1011 and can now call `schemas_on_group()`.
 
+## 2026-11-22: failover round 2 (restore, planned switchover, the map group with a live leader), its independent review and the fixes
+
+Covers the branch fo-r2wip, rebased onto kingres-18 at e279c14091 (contract 0.15.0).
+
+### What was done
+
+- **Round 2 of failover:** the restore of the preferred primaries, the plan and phases of a planned switchover, and the map group with a live old leader (a planned switchover
+  and a restore that include group 0): the bootstrap side in `mapgroup`, the leader's side in `failover`, the signed start of an operator's request (ADR 0026), the call that
+  gives up a stuck bootstrap (`abandonMapGroupBootstrap`, contract 0.15.0), `HoldBack` (the lease is renewed until a clean stop is over), and the 15 s bound on calls to the old
+  server.
+- **Independent review**
+  ([reviews/2026-11-21-failover-round-2.md](reviews/2026-11-21-failover-round-2.md)): no critical finding, one high (F5-01), five medium, six low. All twelve are fixed, one commit
+  per finding; the table in the review maps them to commits.
+- **Three defects found by the cluster tests of the fixes** and fixed: the step of the map group ended with the task lease about ten seconds after the clean stop (no rollback ran);
+  a rollback that could not be recorded made the engine run the step again and start a second switchover; and a nil dereference in the lease manager (`writeWatchdogFile`) crashed
+  kingresd in the rollback.
+- **Web:** the generated files and the panel follow contract 0.15.0: audit words, the endpoint, the mock handler, and a button on the failover progress view that gives up the move of
+  the manager (`kingres_admin`).
+- **Test hardening:** the request of the map group failover tests waits out, within two minutes, the 422 of a leader whose view does not yet show the killed server dead.
+- **Second independent review**
+  ([reviews/2026-11-22-failover-round-2-fixes.md](reviews/2026-11-22-failover-round-2-fixes.md)): all F5 fixes hold (22 mutants killed); one high (F6-01: the old leader of a planned
+  switchover of the map group can stay held back with no primary, and nothing repairs it), two medium (F6-02, F6-03), three low (F6-04 to F6-06). All are fixed (the table in the
+  review maps them to commits): the old leader ends a hold that nothing owns by itself, the candidate and the operator ask it to, the abandon works from the control data of a
+  standby it cannot ask and waits for a promotion that is running, and a bootstrap that was given up cannot promote (the lane found the last gap).
+- **Third independent review** ([reviews/2026-11-22-failover-f6-fixes.md](reviews/2026-11-22-failover-f6-fixes.md)): no path to two writable primaries; one high (F7-01: the old
+  leader resumed on the evidence of any standby in recovery, so after a completed switchover whose new primary died it could revive stale data), one medium (F7-02: a failed release of the
+  lease did not fail the abandon), three low. All fixed: the old leader resumes only on the word of the server the group was handed to (recorded at the clean stop), a failed release fails
+  the abandon, an unresolved hold is warned about once a minute and shown in the status.
+- **The report of an old primary** that needed crash recovery carries the divergence in bytes (zero when its WAL ends before the point where the histories parted), measured from its
+  shutdown checkpoint; the cluster test of the old primary accepts a missing number only with the documented message.
+
+### How it was verified
+
+- Unit tests of failover, journal, mapgroup, kingresd, lease, internalapi, httpapi and contract pass; a mutant of every fix (F5-01 to F5-12 except the two documents, and the three
+  later fixes) fails the new test of the fix and is killed. `check-contract.mjs` holds for 0.15.0 (141 operations); `go generate ./internal/contract` changes nothing.
+- Cluster tests in lane l3 on PostgreSQL 18 and 19 with kingres_shard 0.7 (extensions of e279c14091): the switchover, abandon and restore set and the failover, old-primary and
+  map-group set pass on both majors, with the five new tests of the review (a candidate that never promotes, an operator abandon, an abandon while the promoting call is in flight,
+  a standby that is behind, an unreadable `pg_controldata`). `TestMapGroupBootstrapSurvivesKingresdEnding` failed once on PostgreSQL 19 with the 422 described above and then passed
+  three of three reruns; it was hardened as described.
+- F6 and F7: 24 mutants of the F6 fixes and 17 of the F7 fixes (lists in the reviews) are killed. The last full lane l3 run (tip 6170828196, PostgreSQL 18 and 19.0 reinstalled from the
+  reference install, extensions of e279c14091) passed the three new cluster tests on both majors, the switchover and abandon set on PostgreSQL 18, and the failover, old-primary and
+  map-group set on both majors. The switchover and abandon set on PostgreSQL 19.0 failed once, in `TestSwitchoverOfTheMapGroup` (timed out after 10 minutes waiting for the task on the
+  new leader, which answered 503); the other tests of that step passed. Its log was too short to show a cause, and the test passed in 4 of 4 reruns alone (3 on PostgreSQL 19.0, 1 on
+  PostgreSQL 18). The cause is not known; the output of the test on failure was enlarged to show it next time.
+- Web: typecheck, lint, `api:check`, `brand:check` and the full vitest suite pass. The browser and end-to-end suites were not run.
+- Not verified: the review's item 5 (the candidate killed between a refusal and the abandon) has no cluster test of its own; unit tests cover it, and the second case of F6-01
+  (the old leader restarted) is a cluster test now. The tests of `internal/pgconninfo` could not run on the Windows host (the test executable is blocked); they are not related to this work.
+
+### Needs-verification items
+
+None checked in this entry.
+
+### Decisions and deviations
+
+- ADR 0026 (the candidate of a map group failover receives the proof of the operator's session) is accepted as the way to carry an operator's authority to a member that is not the
+  leader; the documents say so.
+- After the clean stop of the map group the step runs on a context that is not cancelled (bounded by the verdict wait of six minutes), because the engine cancels its context when the
+  task lease cannot be renewed.
+
+### Still open
+
+- The map group's hard failover of a live leader's server is still refused (422); only the planned switchover and the restore include group 0.
+- A cluster test for the candidate killed between a refusal and the abandon (unit tests cover it).
+- The old leader's resolution of a hold waits for a standby to be shown in recovery; with every other server gone it does not resume (the lease would protect it, but the proof is
+  missing): an operator starts it by the abandon call once a standby answers.
+
 ### Core patches
 
 None.

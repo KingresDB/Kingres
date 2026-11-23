@@ -90,6 +90,8 @@ type Runner struct {
 	DrainEvery         time.Duration // (default 10 s)
 	MarkWait           time.Duration // the wait for the standby to replay the mark (default 10 s)
 	VerifyWait         time.Duration // the proof is repeated this long (default 30 s)
+	OldServerWait      time.Duration // the calls to the old primary's server after the promotion wait this long (default 15 s)
+	MapVerdictWait     time.Duration // the old leader of a planned switchover of the map group waits this long for the candidate to promote or to refuse (default 6 min)
 	// PromoteNode are the bounds of the repeat loop of kingres.promote_node.
 	PromoteNode PromoteOptions
 	// PositionTimeout is the time of one read of a position (default 5 s).
@@ -144,8 +146,13 @@ func (r *Runner) fault(point string) {
 // Definition is the task definition (kind server.failover): the steps come from the
 // input; a cancel is accepted only before the first destructive step.
 func (r *Runner) Definition(onFail func(ctx context.Context, t task.Task)) task.Definition {
+	return r.DefinitionOf(KindFailover, onFail)
+}
+
+// DefinitionOf is Definition for a kind: server.failover, or replication.restorePreferredPrimaries (the steps come from the input).
+func (r *Runner) DefinitionOf(kind string, onFail func(ctx context.Context, t task.Task)) task.Definition {
 	return task.Definition{
-		Kind:        KindFailover,
+		Kind:        kind,
 		Dynamic:     r.steps,
 		Cancellable: Cancellable,
 		OnFail:      onFail,
@@ -192,6 +199,9 @@ type stepCtx struct {
 	group int32
 	key   string
 	env   *task.Env
+	// newServer is the server of the pinned standby when a step knows it from its own state and cannot read it from the group row: after the clean stop of
+	// the map group the system database is the stopped instance (F5-01).
+	newServer string
 }
 
 func (s *stepCtx) detail(ctx context.Context, format string, a ...any) {
@@ -216,7 +226,7 @@ func (r *Runner) steps(input json.RawMessage) ([]task.Step, error) {
 		return nil, err
 	}
 	out := []task.Step{r.step(StepCheck, -1, StepCheck, false, r.check)}
-	for _, g := range in.Groups {
+	for _, g := range mapLast(in) {
 		g := g
 		if in.graceful() {
 			r.addGraceful(&out, g)
@@ -257,6 +267,13 @@ func (r *Runner) step(name string, group int32, key string, irreversible bool, f
 			in.AllowDataLoss, in.Targets = run.Options.AllowDataLoss, run.Options.Targets
 		}
 		sc := &stepCtx{r: r, in: in, rows: rows, group: group, key: key, env: env}
+		if in.Mode == ModeRestore && group >= 0 {
+			// A group of a restore that failed before its promotion was rolled back: its remaining steps do nothing and the run goes on with the
+			// next group (design 5.5, 4: failing back is not urgent, the report says what happened).
+			if gr, ok, gerr := rows.Group(ctx, group); gerr == nil && ok && gr.State == "failed" {
+				return task.Skip("the group failed earlier in this restore")
+			}
+		}
 		r.fault(name + ":before")
 		if r.Inject != nil {
 			switch r.Inject(name + ":before") {
@@ -267,6 +284,11 @@ func (r *Runner) step(name string, group int32, key string, irreversible bool, f
 			}
 		}
 		err = f(ctx, env, sc)
+		if err != nil && in.Mode == ModeRestore && group >= 0 {
+			if skip := sc.restoreContinues(ctx, err); skip != nil {
+				return skip
+			}
+		}
 		if err == nil {
 			r.fault(name + ":after")
 		}
@@ -275,7 +297,7 @@ func (r *Runner) step(name string, group int32, key string, irreversible bool, f
 }
 
 // oldServerOf is the server whose primary fails: the server of the request.
-func (sc *stepCtx) old() string { return sc.in.ServerID }
+func (sc *stepCtx) old() string { return sc.in.oldOf(sc.group) }
 
 // row reads the group row; a missing row is a defect of the first step.
 func (sc *stepCtx) row(ctx context.Context) (GroupRow, error) {
@@ -310,6 +332,13 @@ func runRowOf(ctx context.Context, rows Rows, in Input, group int32) (RunRow, er
 			break
 		}
 		if gr, found, gerr := rows.Group(ctx, g); gerr == nil && found && gr.TermAfter != nil && *gr.TermAfter > run.ExpectedTerm {
+			run.ExpectedTerm = *gr.TermAfter
+		}
+	}
+	// The map group of a planned switchover is promoted by the bootstrap of the candidate, which raised the term; the new leader's engine runs the steps
+	// that were not recorded with the term its row says (RecordPlanned).
+	if group == 0 && in.graceful() {
+		if gr, found, gerr := rows.Group(ctx, 0); gerr == nil && found && gr.TermAfter != nil && *gr.TermAfter > run.ExpectedTerm {
 			run.ExpectedTerm = *gr.TermAfter
 		}
 	}
@@ -355,24 +384,27 @@ func (r *Runner) Preflight(ctx context.Context, in Input) *Refusal {
 	} else if superseded {
 		return &Refusal{Code: "conflict", Status: 409, Message: "The catalog of this server has been superseded by a newer term."}
 	}
-	on := GroupsOn(nodes, in.ServerID)
 	have := map[int32]bool{}
-	for _, g := range on {
-		have[g] = true
+	for _, n := range nodes {
+		if n.Role == "primary" && n.Host == in.oldOf(n.Group) {
+			have[n.Group] = true
+		}
 	}
 	for _, g := range in.Groups {
 		g := g
 		if !have[g] {
-			return &Refusal{Code: "unprocessable", Status: 422, Message: fmt.Sprintf("Server %s does not run the primary of shard group %d.", in.ServerID, g), Group: &g}
+			return &Refusal{Code: "unprocessable", Status: 422, Message: fmt.Sprintf("Server %s does not run the primary of shard group %d.", in.oldOf(g), g), Group: &g}
 		}
-		if g == 0 {
-			return &Refusal{Code: "unsupported_operation", Status: 422, Message: "The failover of the map group is not supported yet; the operator's way is the documented SQL of the sharding extension.", Group: &g}
+		if g == 0 && !in.graceful() {
+			// A hard failover of a server whose map group primary answers is not built (design, "the map group with a live old leader"): the bootstrap
+			// takes a server that is not heard, and a planned switchover of the map group is the task's own (mode graceful, restore).
+			return &Refusal{Code: "unsupported_operation", Status: 422, Message: "The failover of the map group while its server is alive is not supported yet; use mode graceful (a planned switchover), or the documented SQL of the sharding extension.", Group: &g}
 		}
 	}
 	if len(in.Groups) == 0 {
 		return &Refusal{Code: "unprocessable", Status: 422, Message: "Server " + in.ServerID + " runs the primary of no shard group."}
 	}
-	if in.Mode == ModeGraceful {
+	if in.graceful() {
 		if ref := r.preflightGraceful(ctx, in); ref != nil {
 			return ref
 		}
@@ -404,7 +436,7 @@ func (r *Runner) Preflight(ctx context.Context, in Input) *Refusal {
 		}
 		var oldNode *Node
 		for _, n := range nodes {
-			if n.Group == g && n.Role == "primary" && n.Host == in.ServerID {
+			if n.Group == g && n.Role == "primary" && n.Host == in.oldOf(g) {
 				n := n
 				oldNode = &n
 			}
@@ -414,10 +446,10 @@ func (r *Runner) Preflight(ctx context.Context, in Input) *Refusal {
 		}
 		// F2-13: an old primary that answers and runs without a watchdog is covered by its lease manager alone (a hung
 		// kingresd could not stop it): the failover does not count it as fenceable and refuses until it has one.
-		st, serr := r.Peers.State(ctx, in.ServerID, g)
+		st, serr := r.Peers.State(ctx, in.oldOf(g), g)
 		if serr == nil && st.Watchdog != nil && !*st.Watchdog && len(st.OutOfRecovery()) > 0 {
 			return &Refusal{Code: "cluster_inconsistent", Status: 409, Group: &g,
-				Message: fmt.Sprintf("No watchdog runs for the primary of shard group %d on %s, so a hung kingresd there could not stop it.", g, in.ServerID)}
+				Message: fmt.Sprintf("No watchdog runs for the primary of shard group %d on %s, so a hung kingresd there could not stop it.", g, in.oldOf(g))}
 		}
 		// F3-02, F3-12: a server that does not answer cannot be asked whether its lease would stop its primary. The lease
 		// stops a primary only on a server whose plan says the group has a standby, so the leader asks its own record of
@@ -429,7 +461,7 @@ func (r *Runner) Preflight(ctx context.Context, in Input) *Refusal {
 			}
 			if facts.PrimaryPlanned == 0 {
 				return &Refusal{Code: "cluster_inconsistent", Status: 409, Group: &g,
-					Message: fmt.Sprintf("Server %s does not answer, and the leader has no proof that it knew of a standby of shard group %d at its last check: its lease would then not stop its primary, which clients may still reach. Repeat the request with allowDataLoss set to true to accept that the old primary is not proven fenced.", in.ServerID, g)}
+					Message: fmt.Sprintf("Server %s does not answer, and the leader has no proof that it knew of a standby of shard group %d at its last check: its lease would then not stop its primary, which clients may still reach. Repeat the request with allowDataLoss set to true to accept that the old primary is not proven fenced.", in.oldOf(g), g)}
 			}
 		}
 		if ready == 0 {
@@ -437,7 +469,7 @@ func (r *Runner) Preflight(ctx context.Context, in Input) *Refusal {
 		}
 		// FO-15: a standby that the primary names in synchronous_standby_names and that is not in the
 		// catalog would make every commit on the promoted instance wait for ever.
-		if ids, ok := r.Plan.PrimaryNames(ctx, in.ServerID, g); ok {
+		if ids, ok := r.Plan.PrimaryNames(ctx, in.oldOf(g), g); ok {
 			known := map[int64]bool{}
 			for _, s := range recs {
 				if s.CatalogNode != 0 {
@@ -555,9 +587,9 @@ func (r *Runner) check(ctx context.Context, env *task.Env, sc *stepCtx) error {
 	}
 	var rows []GroupRow
 	for i, g := range sc.in.Groups {
-		gr := GroupRow{Group: g, Seq: i, State: "pending", OldServer: sc.in.ServerID}
+		gr := GroupRow{Group: g, Seq: i, State: "pending", OldServer: sc.in.oldOf(g)}
 		for _, n := range nodes {
-			if n.Group == g && n.Role == "primary" && n.Host == sc.in.ServerID {
+			if n.Group == g && n.Role == "primary" && n.Host == sc.in.oldOf(g) {
 				gr.OldNode = n.ID
 			}
 		}
@@ -565,6 +597,16 @@ func (r *Runner) check(ctx context.Context, env *task.Env, sc *stepCtx) error {
 	}
 	if err := sc.rows.Begin(ctx, sc.in, term, rows); err != nil {
 		return err
+	}
+	// The groups that a restore leaves alone are in the report, as skipped, with the reason.
+	for i, sk := range sc.in.Skipped {
+		if err := sc.rows.Begin(ctx, sc.in, term, []GroupRow{{Group: sk.Group, Seq: len(rows) + i, State: "pending"}}); err != nil {
+			return err
+		}
+		text := sk.Reason + ": " + sk.Text
+		if err := sc.rows.Set(ctx, sk.Group, GroupSet{State: ptr("skipped"), Error: &text, Finished: true}); err != nil {
+			return err
+		}
 	}
 	// The members that did not answer the lease settings, and the servers this one does not hear, are in the first
 	// event: a failover judged on a view that was partial says so.
@@ -699,6 +741,15 @@ func (r *Runner) takeFence(ctx context.Context, env *task.Env, sc *stepCtx) erro
 	run, err := sc.runRow(ctx)
 	if err != nil {
 		return err
+	}
+	if sc.in.graceful() && sc.group == 0 {
+		if nw, _, perr := sc.pinnedStandby(ctx); perr == nil {
+			if handed, herr := sc.mapHandedOver(ctx, nw); herr != nil {
+				return herr
+			} else if handed {
+				return task.Skip("the map group was handed over already")
+			}
+		}
 	}
 	if err := sc.ensureFrozen(ctx); err != nil {
 		return err
@@ -1022,6 +1073,11 @@ func (r *Runner) handOver(ctx context.Context, env *task.Env, sc *stepCtx) error
 	if err != nil {
 		return err
 	}
+	if handed, herr := sc.mapHandedOver(ctx, nw); herr != nil {
+		return herr
+	} else if handed {
+		return task.Skip("the map group was handed over already")
+	}
 	// A repeated run: the new server holds the lease already, or has been promoted.
 	if st, err := r.Peers.State(ctx, nw.Server, sc.group); err == nil && st.Holds && st.Adopted != "" {
 		return task.Skip("the new server holds the lease already")
@@ -1090,6 +1146,13 @@ func (r *Runner) promote(ctx context.Context, env *task.Env, sc *stepCtx) error 
 	nw, _, err := sc.pinnedStandby(ctx)
 	if err != nil {
 		return err
+	}
+	if handed, herr := sc.mapHandedOver(ctx, nw); herr != nil {
+		return herr
+	} else if handed {
+		// The bootstrap of the candidate promoted it (the proof and the lease were its own); what this step records is already in the row.
+		sc.event(ctx, "promoted", map[string]any{"status": "handedOver"})
+		return task.Skip("the map group was promoted by the bootstrap of the new leader")
 	}
 	req := PromoteRequest{Group: sc.group, StandbyID: nw.ID, InstanceID: nw.InstanceID, ExpectedTerm: run.ExpectedTerm}
 	if sc.in.graceful() {
@@ -1396,6 +1459,12 @@ func (r *Runner) checkCatalog(ctx context.Context, env *task.Env, sc *stepCtx) e
 			before := int64(0) // the term before is known for the system catalog only
 			if t.db == SystemDB {
 				before = run.ExpectedTerm
+				if sc.group == 0 && sc.in.graceful() {
+					// The term of the map group's own promotion is what the run row says after it (runRowOf): the term before it is the one the run began with.
+					if raw, ok, rerr := sc.rows.Run(ctx); rerr == nil && ok {
+						before = raw.ExpectedTerm
+					}
+				}
 			}
 			ok, why := catalogMatches(nodes, t.newID, t.oldID, term, before)
 			if ok {
@@ -1414,7 +1483,7 @@ func (r *Runner) checkCatalog(ctx context.Context, env *task.Env, sc *stepCtx) e
 		}
 	}
 	// The fence of last resort.
-	if st, err := r.Peers.State(ctx, sc.old(), sc.group); err == nil {
+	if st, err := sc.oldState(ctx); err == nil {
 		if len(st.OutOfRecovery()) > 0 {
 			r.Plan.Alert(ctx, "oldPrimaryRunning", "critical", subjectOf(sc.group, sc.old()), fmt.Sprintf("The old primary of shard group %d is running on %s after the catalog moved; it is being stopped.", sc.group, sc.old()), true)
 			if _, derr := r.Peers.Demote(ctx, sc.old(), DemoteRequest{Group: sc.group, Mode: "immediate", ExpectedTerm: run.ExpectedTerm}); derr != nil && !errors.Is(derr, ErrUnreachable) {
@@ -1529,7 +1598,7 @@ func (r *Runner) records(ctx context.Context, env *task.Env, sc *stepCtx) error 
 	}
 	// The directory of the old primary, when its server answers: it is the instance whose role file says primary of the
 	// group (stopped by the demote). A server that does not answer finds its own directory when it is rebuilt.
-	if st, err := r.Peers.State(ctx, sc.old(), sc.group); err == nil {
+	if st, err := sc.oldState(ctx); err == nil {
 		for _, i := range st.Instances {
 			if i.Group == sc.group && i.Role == "primary" && !i.Running {
 				old.InstanceID = i.ID
@@ -1661,15 +1730,15 @@ func (r *Runner) unfreeze(ctx context.Context, env *task.Env, sc *stepCtx) error
 		if run, rerr := sc.runRow(ctx); rerr == nil {
 			term = run.ExpectedTerm
 		}
-		if err := r.Peers.Unquiesce(ctx, sc.old(), QuiesceRequest{Group: sc.group, ExpectedTerm: term}); err != nil && !errors.Is(err, ErrUnreachable) && !IsCode(err, "no_instance") {
+		if err := sc.oldUnquiesce(ctx, term); err != nil && !errors.Is(err, ErrUnreachable) && !IsCode(err, "no_instance") {
 			r.log().Warn("failover: putting the access rules back", "group", sc.group, "error", err)
 		}
 	}
-	if err := r.Peers.Unfreeze(ctx, sc.old(), sc.group); err != nil && !errors.Is(err, ErrUnreachable) && !IsCode(err, "no_instance") {
+	if err := sc.oldUnfreeze(ctx); err != nil && !errors.Is(err, ErrUnreachable) && !IsCode(err, "no_instance") {
 		r.log().Warn("failover: lifting the freeze", "group", sc.group, "server", sc.old(), "error", err)
 	}
 	old := "waitingForServer"
-	if st, err := r.Peers.State(ctx, sc.old(), sc.group); err == nil && len(st.OutOfRecovery()) == 0 {
+	if st, err := sc.oldState(ctx); err == nil && len(st.OutOfRecovery()) == 0 {
 		old = "rebuildScheduled" // the reconcile loop rebuilds it (oldprimary.go in internal/standby)
 	}
 	if err := sc.rows.Set(ctx, sc.group, GroupSet{State: ptr("done"), OldPrimary: &old, Finished: true}); err != nil {
@@ -1721,7 +1790,7 @@ func (r *Runner) OnFail(abandon func(ctx context.Context, taskID int64, outcome,
 		}
 		for _, g := range in.Groups {
 			// The task is over: its freeze is lifted whatever epoch holds it (F3-14: only a freeze of this task is lifted).
-			_ = r.Peers.Unfreeze(fence.With(ctx, fence.Token{Task: t.ID, Epoch: math.MaxInt64}), in.ServerID, g)
+			_ = r.Peers.Unfreeze(fence.With(ctx, fence.Token{Task: t.ID, Epoch: math.MaxInt64}), in.oldOf(g), g)
 			// The fence adoption is not renewed any more: it runs out at the grantors.
 			_, _ = r.Peers.Lease(ctx, r.Plan.Self(), LeaseRequest{Group: g, Role: LeaseRelease})
 		}
@@ -1819,4 +1888,43 @@ func (r *Runner) promoteNodePastPromotion(ctx context.Context, sc *stepCtx, nw S
 		return out, sc.targetsPause(ctx, err)
 	}
 	return out, err
+}
+
+// The calls to the old primary's server after the promotion are best effort: its server may be down, or up with its instance held back, in which case it
+// answers "not ready" and a task step would wait for it for minutes (peerclient.NotReadyBound), which stops the failover for a server that is not
+// needed any more (the case of the old leader of a planned switchover of the map group that restarted). They wait for OldServerWait and go on. Only the map group of a planned switchover is bounded: there the old leader's instance is the stopped system database.
+func (sc *stepCtx) oldCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	if sc.group != 0 || !sc.in.graceful() {
+		// Every other group keeps the long wait of a task step: the check that stops an old primary that still runs (the fence of last resort) is reached when the old
+		// server answers late or "not ready", and the lease fences in any case, but the alert and the immediate stop are worth the wait there (F5-10).
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, orDur(sc.r.OldServerWait, 15*time.Second))
+}
+
+// oldErr reports a wait that ran out as a server that did not answer, unless the step's own context ended.
+func (sc *stepCtx) oldErr(ctx, octx context.Context, err error) error {
+	if err != nil && octx.Err() != nil && ctx.Err() == nil {
+		return fmt.Errorf("%w: %v", ErrUnreachable, err)
+	}
+	return err
+}
+
+func (sc *stepCtx) oldState(ctx context.Context) (State, error) {
+	oc, cancel := sc.oldCtx(ctx)
+	defer cancel()
+	st, err := sc.r.Peers.State(oc, sc.old(), sc.group)
+	return st, sc.oldErr(ctx, oc, err)
+}
+
+func (sc *stepCtx) oldUnquiesce(ctx context.Context, term int64) error {
+	oc, cancel := sc.oldCtx(ctx)
+	defer cancel()
+	return sc.oldErr(ctx, oc, sc.r.Peers.Unquiesce(oc, sc.old(), QuiesceRequest{Group: sc.group, ExpectedTerm: term}))
+}
+
+func (sc *stepCtx) oldUnfreeze(ctx context.Context) error {
+	oc, cancel := sc.oldCtx(ctx)
+	defer cancel()
+	return sc.oldErr(ctx, oc, sc.r.Peers.Unfreeze(oc, sc.old(), sc.group))
 }

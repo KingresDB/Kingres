@@ -13,7 +13,7 @@ Settings pages; the third lets a second and a third server join (`joinCluster`, 
 server (`removeServer`) and makes the cluster-wide operations run on every server (see
 [Running several servers](#running-several-servers)). At that time rebalance, failover, restoring preferred primaries
 still answered the contract's "not supported yet" problem (rebalance and failover are built since; the table
-under "What is implemented" is current, and only `restorePreferredPrimaries` and eight ledger operations still answer so). The fourth step added server groups, leaving a cluster,
+under "What is implemented" is current, and no operation answers so any more). The fourth step added server groups, leaving a cluster,
 instance start and stop, local settings, inclusion proofs and verification records, security headers and
 crash-injection tests of the task engine. The fifth step (contract 0.5.0) added certificate renewal and revocation,
 the cluster-wide logs, alerts and metrics, the alert kinds that nothing raised, and the corrections listed in
@@ -342,12 +342,12 @@ handlers in `internal/httpapi/handlers_config.go`, wiring in `cmd/kingresd/confi
 
 ## What is implemented
 
-The server implements revision **0.17.0** of the contract (160 operations, 128
+The server implements revision **0.18.0** of the contract (161 operations, 129
 paths; what is not done is in "Not done in this increment"). "Real" means the operation works against PostgreSQL or the local node
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **159 of 160 operations are real; 1 answer "not yet".**
+authenticated operation lists in 0.2.0. **161 of 161 operations are real; 0 answer "not yet".**
 
 | Tag | Real | Not yet |
 |---|---|---|
@@ -367,7 +367,7 @@ authenticated operation lists in 0.2.0. **159 of 160 operations are real; 1 answ
 | Metrics | `queryMetrics` |  |
 | Query | `executeQuery`, `cancelStatement` |  |
 | Rebalance | `getRebalanceStatus`, `startRebalance`, `previewRebalancePlan`, `listRebalanceReports`, `getRebalanceReport`, `stopRebalance` |  |
-| Replication | `getReplicationTopology`, `getFailoverStatus`, `listFailoverReports`, `getFailoverReport` | `restorePreferredPrimaries` |
+| Replication | `getReplicationTopology`, `getFailoverStatus`, `listFailoverReports`, `getFailoverReport`, `restorePreferredPrimaries`, `abandonMapGroupBootstrap` | |
 | Server groups | `listServerGroups`, `createServerGroup`, `deleteServerGroup` |  |
 | Servers | `listServers`, `getServer`, `addServer`, `removeServer`, `updateServer`, `renewServerCertificates`, `revokeServerCertificates`, `failoverServer`, `drainServer`, `previewServerDrain` |  |
 | Configuration | `listConfigParameters`, `getConfigParameter`, `previewConfigChange`, `applyConfigChange`, `listConfigChanges`, `revertConfigChange`, `listConfigServers`, `getConfigSummary`, `getClusterTime`, `listTimeZones`, `restartPendingInstances` |  |
@@ -1803,7 +1803,7 @@ revocation). Contract 0.6.0 and its breaking and additive changes: `kingres/api/
 
 | Finding | Result | What changed | Test |
 |---|---|---|---|
-| CP2-01 / CP-07 forwarded identity by name | fixed | Per-request SCRAM-style proof of a session of the named user, checked against the user's verifier by the leader only (`internal/fwdproof`, `internal/scram`, `auth/proofkey.go`); cluster-wide reads carry an assertion signed by the leader (`POST /gather-authorize`) instead of a proof, so no other member ever receives a value from which a ClientKey can be derived; pending servers authorize nothing; `Proxy.Allow` runs after the guard. See `internal-api.md`, "Forwarded identities need a proof". | `fwdproof` tests, `internalapi` `TestPendingServerAuthorizesNothing`, `TestUnprovenIdentityIsRefusedBeforeTheBackend`, clustertest `TestForwardedIdentityNeedsTheProofOfASession` (real three-server cluster; with the check switched off the same forward without a proof answered 200) |
+| CP2-01 / CP-07 forwarded identity by name | fixed | Per-request SCRAM-style proof of a session of the named user, checked against the user's verifier by the leader only (`internal/fwdproof`, `internal/scram`, `auth/proofkey.go`); cluster-wide reads carry an assertion signed by the leader (`POST /gather-authorize`) instead of a proof, so no other member receives a value from which a ClientKey can be derived, except the candidate of a failover of the map group, which receives the proof of the operator's request because the leader is gone (F4-05, ADR 0026); pending servers authorize nothing; `Proxy.Allow` runs after the guard. See `internal-api.md`, "Forwarded identities need a proof". | `fwdproof` tests, `internalapi` `TestPendingServerAuthorizesNothing`, `TestUnprovenIdentityIsRefusedBeforeTheBackend`, clustertest `TestForwardedIdentityNeedsTheProofOfASession` (real three-server cluster; with the check switched off the same forward without a proof answered 200) |
 | CP2-02 ops to admin through `addServer` | fixed (breaking) | `addServer` needs `kingres_admin`; a certificate is issued only for a request an administrator made and that names the candidate's certificate; verifiers only after that; a pending server authorizes nothing | clustertest `TestOpsCannotAddAServer`. The run before the fix was not completed, so the first half (the leader signs for an ops caller's server) is confirmed by reading only |
 | CP2-03 pin dropped through a follower | fixed | the receiving server normalizes body and header pin (malformed: 400 everywhere) and forwards one value; the leader uses it for both sources | `httpapi` `TestAddServerPinThroughAFollower` (13 cases) |
 | CP2-05 password before fingerprint | fixed (breaking) | `joinCluster` and `addServer` need a pin or an explicit `allowUnpinned: true` | `TestAddServerPinThroughAFollower`, clustertest `TestJoinPinFlowFromThePanels` |
@@ -1847,7 +1847,7 @@ revocation). Contract 0.6.0 and its breaking and additive changes: `kingres/api/
 
 ### Decisions
 
-1. **Forwarded identities carry a SCRAM-style proof** checked against the user's verifier, sent to the leader only (a receiver of a proof recovers the ClientKey, as a SCRAM server does; a gather therefore carries an assertion signed by the leader, not a proof). A signed assertion of the
+1. **Forwarded identities carry a SCRAM-style proof** checked against the user's verifier, sent to the leader only (the one exception is the request of an operator for the failover of the map group, sent to the candidate that becomes the leader, ADR 0026; a receiver of a proof recovers the ClientKey, as a SCRAM server does; a gather therefore carries an assertion signed by the leader, not a proof). A signed assertion of the
    forwarding server's certificate was rejected: the member's key signs anything, the proof needs a secret that only
    a server that saw the password has.
 2. **A pending server authorizes nothing** except its own join: every call to the leader needs catalog membership.
@@ -3058,6 +3058,8 @@ Built (contract 0.13.0): `internal/failover/journal` (the local journal), `inter
 
 **Not built:** the escrow of the key of the certificate authority (an alert, `certificateAuthorityUnavailable`, says what the operator does by hand: restore `pki/ca.key` and `pki/revoked.json` of the old leader from its backup into the pki directory of the new leader and restart kingresd), the second condition of the gate (the instance of group 0 in recovery), `graceful` for the map group. `Preflight` still refuses the map group with 422 `unsupported_operation` when the leader is alive (the request then goes to the leader).
 
+**The map group with a live old leader (a switchover, a restore, a hard failover).** A planned switchover of the map group (`failoverServer` with `mode: graceful` for the leader's server, and a `restorePreferredPrimaries` that has to move group 0) is built: the map group is the last group of the task; its step `Stop the old primary cleanly` first starts the bootstrap of the chosen standby's server (`POST /failover/map/start` with `planned`, accepted from the old server only), then marks, lets the standby replay the mark, stops the old leader with a fast shutdown, and sends the candidate the proof (`POST /failover/map/proof`); the candidate takes the released lease, promotes on the proof after `switchover_verify`, becomes the leader, marks the task's group 0 row promoted with the new term and opens the gate, and the new leader's engine claims the task and runs again the steps that the old leader could not record (the clean stop, the verification, the lease and the hand-over, the promotion skip because the standby is out of recovery). A **hard** failover of a server whose map group primary answers is still refused with 422 `unsupported_operation`, and the bootstrap itself still refuses a live old server unless the old leader's own task asks (409 `conflict` for an automatic start, 422 `unsupported_operation` for a manual one), and never asks the old server to demote. When the standby refuses the proof after the stop, the candidate lets go of the lease and tells the old leader, whose task rolls back and whose primary is started again by its lease manager; when the old leader's kingresd ends after the stop, the candidate reads the proof from the old leader's server and promotes on it (`docs/design/ha-phase5-part2.md`, "The two open points of the delta, settled").
+
 ## Automatic failover (increment 6 of ha-phase5-part2.md, no change of the contract)
 
 Code: `internal/failover/auto.go` (`Evaluate`, the rule of design 4.2 and 4.3 as a function of a view; `Auto`, the loop every 5 s on the manager leader),
@@ -3081,6 +3083,16 @@ Code: `internal/failover/switchover.go` (the steps), `cmd/kingresd/switchover.go
 Per group (ordinary groups; the map group still answers 422 for `graceful`): `Freeze`, `Choose the standby` (a standby that streams from the primary; the verdict is none), `Stop the writes`, `Let distributed transactions end`, `Stop the old primary cleanly` (mark, the standby replays the mark, fast shutdown, the lease released), `Verify the new primary` (`switchover_verify`, repeated for 30 s), then `Wait for the old lease`, `Hand the lease`, `Promote` and the steps of every failover. Any failure before the promotion rolls back (`rollbackSwitchover`: the leases of the run are released, the old primary is resumed, the writes are let in again) and fails with `standby_behind`, `switchover_unproven`, `cannot_quiesce` or `prepared_transactions_pending`; a cancel does the same through `OnFail`; the cancel guard refuses from the start of `Promote`. The access rules of the old primary are put back in the last step, before its rebuild.
 
 Deviations from the design: the old primary becomes a standby by the rebuild of increment 4 (`pg_rewind`, which finds nothing to rewind after a clean stop), not by the adoption `/standby/adopt {clean}` of 6.3; the phases `quiescing`, `waitingForTransactions`, `stopping`, `verifying` and `writesPausedSince` of `GET /failover` are not reported yet (the steps are named in the task, and the report has the events `quiesced`, `stoppedClean`, `verified` and `writesResumed` with `pauseMs`); `Unquiesce` is not persisted across a restart of kingresd (the failed task puts the rules back).
+
+## The restore of the preferred primaries, the plan of a switchover and the phases (increment 7, round 2; contract 0.13.0 text only)
+
+`POST /replication/restore-preferred-primaries` (optional body `{shardGroupIds, dryRun}`) starts the task `replication.restorePreferredPrimaries`: a switchover (the steps of
+round 1) per group whose primary is not on its preferred server (the server of the group's first node by id), from the server that took it over; code in
+`internal/failover/restore.go` and the per-group `Input.Olds`. Groups at home are not listed, a group whose preferred server has no ready standby and the map group are
+reported `skipped`; a group that fails before its promotion is rolled back and reported `failed` while the task goes on and ends `partial`; 422 `unprocessable` when
+nothing needs to be restored. `dryRun` answers the plan for a restore and for a switchover (`writesPausedSeconds`, the steps, verdict `none`). `GET /failover` names the phase of
+a group of a switchover or restore from the task's steps and `writesPausedSince` from the events `quiesced` and `writesResumed`. See the design ("Increment 7, round 2") for
+what is not built.
 
 ## The signing keys of the ledger (phase 7, steps 3 and 4, contract 0.11.0)
 

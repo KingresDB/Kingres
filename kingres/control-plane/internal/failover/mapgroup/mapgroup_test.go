@@ -19,25 +19,38 @@ import (
 // world models three servers: s1 ran the primary of the map group and the leader (it is dead), s2 (this server) and s3 host the
 // standbys 10 and 11 of group 0 (nodes 4 and 5).
 type world struct {
-	mu        sync.Mutex
-	log       []string
-	self      string
-	term      int64
-	primary   string
-	standbys  []failover.StandbyRec
-	pos       map[string]failover.Position
-	posErr    map[string]error
-	live      map[string]string
-	oldAlive  bool
-	promoted  map[string]bool
-	leaseHeld bool
-	rebalance int
-	taskID    int64
-	recorded  int
-	alerts    []string
-	facts     failover.GroupFacts
-	nodes     []failover.Node
-	noCA      bool
+	mu                        sync.Mutex
+	pulls                     int
+	pullCheckpoint, pullState string
+	pullErr                   error
+	refusedErr                error                                // telling the old leader fails
+	behind                    int                                  // the callee answers standby_behind this many times before it promotes
+	onPromote                 func()                               // runs inside the call that promotes (a test gives the bootstrap up there)
+	resumeOldErr              error                                // the answer of the call that asks the old leader to end its hold
+	onResumeOld               func()                               // runs inside the call that asks the old leader to end its hold
+	onHolderLease             func() (failover.LeaseAnswer, error) // the answer of the holder lease call (a test gives the bootstrap up there)
+	promoteErr                error                                // the callee refuses a promotion that carries a proof
+	promoteReqs               []failover.PromoteRequest
+	freezeErr                 error // FreezeLocal fails from the second call on (the agent was lost with a restart)
+	freezes                   int
+	log                       []string
+	self                      string
+	term                      int64
+	primary                   string
+	standbys                  []failover.StandbyRec
+	pos                       map[string]failover.Position
+	posErr                    map[string]error
+	live                      map[string]string
+	oldAlive                  bool
+	promoted                  map[string]bool
+	leaseHeld                 bool
+	rebalance                 int
+	taskID                    int64
+	recorded                  int
+	alerts                    []string
+	facts                     failover.GroupFacts
+	nodes                     []failover.Node
+	noCA                      bool
 }
 
 func newWorld() *world {
@@ -132,11 +145,29 @@ func (p ports) Lease(_ context.Context, s string, r failover.LeaseRequest) (fail
 		return failover.LeaseAnswer{Transferred: true, Holder: r.TransferTo}, nil
 	default:
 		p.w.rec("lease-%s %s", r.Role, s)
+		if r.Role == failover.LeaseHolder && p.w.onHolderLease != nil {
+			return p.w.onHolderLease()
+		}
 		return failover.LeaseAnswer{Held: true}, nil
 	}
 }
 func (p ports) Promote(_ context.Context, s string, r failover.PromoteRequest) (failover.PromoteAnswer, error) {
 	p.w.mu.Lock()
+	p.w.mu.Unlock()
+	if p.w.onPromote != nil {
+		p.w.onPromote()
+	}
+	p.w.mu.Lock()
+	p.w.promoteReqs = append(p.w.promoteReqs, r)
+	if p.w.promoteErr != nil && r.Checkpoint != "" {
+		p.w.mu.Unlock()
+		return failover.PromoteAnswer{}, p.w.promoteErr
+	}
+	if p.w.behind > 0 && r.Checkpoint != "" {
+		p.w.behind--
+		p.w.mu.Unlock()
+		return failover.PromoteAnswer{}, &failover.CallError{Status: 409, Code: "standby_behind", Message: "the standby is behind"}
+	}
 	already := p.w.promoted[s]
 	p.w.promoted[s] = true
 	p.w.mu.Unlock()
@@ -147,7 +178,16 @@ func (p ports) Promote(_ context.Context, s string, r failover.PromoteRequest) (
 	p.w.rec("promote %s", s)
 	return failover.PromoteAnswer{Status: "promoted", Timeline: 2, Lsn: "0/5000100"}, nil
 }
-func (p ports) FreezeLocal(context.Context, time.Duration) error { p.w.rec("freeze"); return nil }
+func (p ports) FreezeLocal(context.Context, time.Duration) error {
+	p.w.rec("freeze")
+	p.w.mu.Lock()
+	defer p.w.mu.Unlock()
+	p.w.freezes++
+	if p.w.freezes > 1 {
+		return p.w.freezeErr
+	}
+	return nil
+}
 func (p ports) Continue(_ context.Context, s string, j journal.Journal) error {
 	p.w.rec("continue %s id=%s", s, j.ID)
 	return nil
@@ -405,16 +445,21 @@ func TestDecideRefusals(t *testing.T) {
 	}
 }
 
-func TestAnOldServerThatAnswersIsAskedToDemoteFirst(t *testing.T) {
+func TestAnOldServerThatAnswersIsNotAskedToDemoteAndTheRequestIsRefused(t *testing.T) {
 	w := newWorld()
 	w.oldAlive = true
 	w.live["s1"] = "live"
-	r, _ := w.runner(t)
-	if _, err := r.Run(context.Background(), req()); err != nil {
-		t.Fatal(err)
+	r, js := w.runner(t)
+	_, err := r.Run(context.Background(), req())
+	var ref *Refusal
+	if !errors.As(err, &ref) || ref.Code != "unsupported_operation" || ref.Status != 422 {
+		t.Fatalf("a manual request for a live old server: %v", err)
 	}
-	if w.index("demote s1 to=s2") < 0 || w.index("demote s1 to=s2") > w.index("lease-fence s2") {
-		t.Fatalf("log:\n%s", strings.Join(w.log, "\n"))
+	if js.Active() {
+		t.Fatal("a refused request began a journal")
+	}
+	if w.count("demote") != 0 || w.count("lease-") != 0 {
+		t.Fatalf("a call was made to the live old server or a lease was taken:\n%s", strings.Join(w.log, "\n"))
 	}
 }
 
@@ -449,9 +494,13 @@ func TestANewLeaderWithoutTheKeyOfTheCertificateAuthorityRaisesAnAlert(t *testin
 
 // A step that finished is not run again after a crash, and a task that was recorded is not recorded twice.
 func TestAFinishedStepIsNotRepeatedAfterACrash(t *testing.T) {
-	for _, c := range []struct{ point, marker string }{
-		{journal.StepFreeze + ":after", "freeze"},
-		{journal.StepCatalog + ":after", "promote_node"},
+	for _, c := range []struct {
+		point, marker string
+		want          int
+	}{
+		// B2 asks once; each of the six steps after it asks again (the freeze is renewed, and redone after a restart)
+		{journal.StepFreeze + ":after", "freeze", 7},
+		{journal.StepCatalog + ":after", "promote_node", 1},
 	} {
 		w := newWorld()
 		r, _ := w.runner(t)
@@ -469,8 +518,8 @@ func TestAFinishedStepIsNotRepeatedAfterACrash(t *testing.T) {
 		if _, _, err := r.Resume(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		if n := w.count(c.marker); n != 1 {
-			t.Errorf("after a crash at %s the step with %q ran %d times", c.point, c.marker, n)
+		if n := w.count(c.marker); n != c.want {
+			t.Errorf("after a crash at %s the step with %q ran %d times, want %d", c.point, c.marker, n, c.want)
 		}
 	}
 }
@@ -508,7 +557,7 @@ func tempDir(t *testing.T) string {
 	return d
 }
 
-// F4-05. An automatic start for an old server that this server hears is refused; an operator's request is not.
+// F4-05. An automatic start for an old server that this server hears is refused (conflict), and so is an operator's (unsupported_operation) until the live old leader is built.
 func TestAnAutomaticStartForALiveOldServerIsRefused(t *testing.T) {
 	w := newWorld()
 	w.live["s1"] = "live"
@@ -520,7 +569,370 @@ func TestAnAutomaticStartForALiveOldServerIsRefused(t *testing.T) {
 	if !errors.As(err, &ref) || ref.Code != "conflict" {
 		t.Fatalf("an automatic start for a live server: %v", err)
 	}
-	if _, err := r.Decide(context.Background(), req()); err != nil {
-		t.Fatalf("a manual request for a live server: %v", err)
+	_, err = r.Decide(context.Background(), req())
+	if !errors.As(err, &ref) || ref.Code != "unsupported_operation" {
+		t.Fatalf("a manual request for a live server is refused until it is built: %v", err)
+	}
+}
+
+// The freeze is asked for again before every step after B2: when it cannot be had (the agent is gone), the bootstrap does not go on to
+// the promotion without it.
+func TestTheBootstrapDoesNotPromoteWithoutItsFreeze(t *testing.T) {
+	w := newWorld()
+	w.freezeErr = errors.New("the standby agent is not running")
+	r, _ := w.runner(t)
+	if _, err := r.Run(context.Background(), req()); err == nil {
+		t.Fatal("the bootstrap went on without a freeze")
+	}
+	if w.count("promote ") != 0 {
+		t.Fatalf("promoted without the freeze: %v", w.log)
+	}
+}
+
+// The planned switchover of the map group, bootstrap side: the old leader is alive (its own task asked), the lease is won once it stops, the standby
+// it chose is pinned, the promotion waits for the proof it delivers and carries it, and the bootstrap records no task (the task is the leader's).
+func TestAPlannedSwitchoverOfTheMapGroupWaitsForTheProofAndRecordsNoTask(t *testing.T) {
+	w := newWorld()
+	w.live["s1"] = "live"
+	r, js := w.runner(t)
+	sleeps := 0
+	base := r.Sleep
+	r.Sleep = func(ctx context.Context, d time.Duration) error {
+		sleeps++
+		if sleeps == 3 { // the old leader finished its clean stop and sends the proof
+			if err := js.SetProof("0/6000028", "shut down"); err != nil {
+				t.Errorf("the proof: %v", err)
+			}
+		}
+		return base(ctx, d)
+	}
+	rq := req()
+	rq.Planned = &journal.Planned{TaskID: 77, StandbyID: 10}
+	if _, err := r.Run(context.Background(), rq); err != nil {
+		t.Fatalf("%v\n%s", err, strings.Join(w.log, "\n"))
+	}
+	if len(w.promoteReqs) != 1 || w.promoteReqs[0].Checkpoint != "0/6000028" || w.promoteReqs[0].ClusterState != "shut down" || w.promoteReqs[0].StandbyID != 10 {
+		t.Fatalf("the promotion did not carry the proof: %+v", w.promoteReqs)
+	}
+	if w.count("record-planned 77") != 1 {
+		t.Fatalf("the group 0 row of the leader's task was not marked promoted:\n%s", strings.Join(w.log, "\n"))
+	}
+	if w.count("record-task") != 0 {
+		t.Fatalf("a task was recorded for a planned switchover:\n%s", strings.Join(w.log, "\n"))
+	}
+	if cur, _ := js.Current(); !cur.Recorded || cur.TaskID != 77 {
+		t.Fatalf("the journal does not name the task of the old leader: %+v", cur)
+	}
+}
+
+// No proof, no promotion: the bootstrap pauses and nothing is promoted.
+func TestAPlannedSwitchoverWithoutTheProofPausesBeforeThePromotion(t *testing.T) {
+	w := newWorld()
+	w.live["s1"] = "live"
+	r, _ := w.runner(t)
+	rq := req()
+	rq.Planned = &journal.Planned{TaskID: 77, StandbyID: 10}
+	_, err := r.Run(context.Background(), rq)
+	var pe *failover.PauseError
+	if !errors.As(err, &pe) {
+		t.Fatalf("want a pause: %v", err)
+	}
+	if w.count("promote ") != 0 {
+		t.Fatalf("promoted without the proof:\n%s", strings.Join(w.log, "\n"))
+	}
+}
+
+// The standby that the old leader chose must be this server's: another is not a choice.
+func TestAPlannedSwitchoverPinsOnlyTheStandbyOfTheOldLeadersChoice(t *testing.T) {
+	w := newWorld()
+	w.live["s1"] = "live"
+	r, js := w.runner(t)
+	rq := req()
+	rq.Planned = &journal.Planned{TaskID: 77, StandbyID: 11} // the standby on s3, not on this server
+	_, err := r.Run(context.Background(), rq)
+	var fe *failover.Error
+	if !errors.As(err, &fe) || fe.Code != failover.CodeNoCandidate {
+		t.Fatalf("want no_candidate: %v", err)
+	}
+	if cur, _ := js.Current(); cur.Pin != nil {
+		t.Fatalf("a standby was pinned: %+v", cur.Pin)
+	}
+}
+
+// A planned request for a server that this server does not hear is a conflict, and an ordinary one for a live server stays refused.
+func TestAPlannedRequestNeedsALiveOldServer(t *testing.T) {
+	w := newWorld() // s1 is dead
+	r, js := w.runner(t)
+	rq := req()
+	rq.Planned = &journal.Planned{TaskID: 77, StandbyID: 10}
+	_, err := r.Decide(context.Background(), rq)
+	var ref *Refusal
+	if !errors.As(err, &ref) || ref.Code != "conflict" || js.Active() {
+		t.Fatalf("a planned request for a dead server: %v", err)
+	}
+}
+
+func (p ports) RecordPlanned(_ context.Context, taskID, termAfter, timeline int64) error {
+	p.w.rec("record-planned %d term=%d timeline=%d", taskID, termAfter, timeline)
+	return nil
+}
+
+func (p ports) PlannedRefused(_ context.Context, oldServer string, taskID int64, reason string) error {
+	p.w.rec("planned-refused %s task=%d", oldServer, taskID)
+	return p.w.refusedErr
+}
+
+func (p ports) ResumeOldLeader(_ context.Context, oldServer string) error {
+	p.w.rec("resume-old-leader %s", oldServer)
+	if p.w.onResumeOld != nil {
+		p.w.onResumeOld()
+	}
+	return p.w.resumeOldErr
+}
+
+// The standby refuses the proof after the old leader stopped: the candidate lets go of the lease and tells the old leader (planned-refused), gives the
+// bootstrap up and promotes nothing; the old leader's task rolls back and starts its primary again.
+func TestARefusedProofGivesTheBootstrapUpAndTellsTheOldLeader(t *testing.T) {
+	w := newWorld()
+	w.live["s1"] = "live"
+	w.promoteErr = &failover.CallError{Status: 409, Code: "unprovable", Message: "the standby is behind"}
+	r, js := w.runner(t)
+	rq := req()
+	rq.Planned = &journal.Planned{TaskID: 77, StandbyID: 10}
+	if _, err := r.Decide(context.Background(), rq); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.SetProof("0/6000028", "shut down"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := r.Run(context.Background(), rq)
+	var fe *failover.Error
+	if !errors.As(err, &fe) || fe.Code != failover.CodeSwitchoverUnproven {
+		t.Fatalf("want switchover_unproven: %v\n%s", err, strings.Join(w.log, "\n"))
+	}
+	if w.count("planned-refused s1 task=77") != 1 || w.count("promote s2") != 0 {
+		t.Fatalf("the refusal:\n%s", strings.Join(w.log, "\n"))
+	}
+	if js.Active() {
+		t.Fatal("the bootstrap is still in progress after the refusal")
+	}
+}
+
+func (p ports) PullProof(_ context.Context, oldServer string) (string, string, error) {
+	p.w.mu.Lock()
+	defer p.w.mu.Unlock()
+	p.w.pulls++
+	if p.w.pullErr != nil {
+		return "", "", p.w.pullErr
+	}
+	return p.w.pullCheckpoint, p.w.pullState, nil
+}
+
+// The old leader's kingresd ended after the clean stop and did not send the proof: the candidate reads it from the old leader's server once the wait
+// has lasted ProofPullAfter, and promotes on it. A state other than "shut down" is not a proof, and is not taken.
+func TestTheCandidateReadsTheProofItselfWhenTheOldLeaderCannotSendIt(t *testing.T) {
+	w := newWorld()
+	w.live["s1"] = "live"
+	w.pullCheckpoint, w.pullState = "0/6000028", "shut down"
+	r, js := w.runner(t)
+	rq := req()
+	rq.Planned = &journal.Planned{TaskID: 77, StandbyID: 10}
+	if _, err := r.Run(context.Background(), rq); err != nil {
+		t.Fatalf("%v\n%s", err, strings.Join(w.log, "\n"))
+	}
+	if len(w.promoteReqs) != 1 || w.promoteReqs[0].Checkpoint != "0/6000028" || w.pulls < 1 {
+		t.Fatalf("the promotion did not carry the proof that was read: %+v (pulls %d)", w.promoteReqs, w.pulls)
+	}
+	if cur, _ := js.Current(); cur.Planned == nil || cur.Planned.Checkpoint != "0/6000028" {
+		t.Fatalf("%+v", cur.Planned)
+	}
+}
+
+func TestAStateThatIsNotShutDownIsNotAProof(t *testing.T) {
+	w := newWorld()
+	w.live["s1"] = "live"
+	w.pullCheckpoint, w.pullState = "0/6000028", "in production"
+	r, _ := w.runner(t)
+	r.ProofWait = 3 * time.Minute
+	rq := req()
+	rq.Planned = &journal.Planned{TaskID: 77, StandbyID: 10}
+	_, err := r.Run(context.Background(), rq)
+	var pe *failover.PauseError
+	if !errors.As(err, &pe) || len(w.promoteReqs) != 0 {
+		t.Fatalf("want a pause and no promotion: %v %+v", err, w.promoteReqs)
+	}
+}
+
+// F5-03. An abandon that arrives while the call that promotes is in flight is refused: the intent was written before the call.
+func TestAnAbandonWhilePromoteIsInFlightIsRefused(t *testing.T) {
+	w := newWorld()
+	r, js := w.runner(t)
+	var abandonErr error
+	w.onPromote = func() { abandonErr = js.Abandon("an operator") }
+	if _, err := r.Run(context.Background(), req()); err != nil {
+		t.Fatalf("%v\n%s", err, strings.Join(w.log, "\n"))
+	}
+	if !errors.Is(abandonErr, journal.ErrPromoted) {
+		t.Fatalf("the abandon during the promotion: %v", abandonErr)
+	}
+}
+
+// F5-04. The standby has not replayed the shutdown checkpoint yet: the bootstrap asks again for VerifyWait, as the ordinary groups do, and promotes when it has;
+// the standby that stays behind is refused at the end of the wait, and a proof that can never be made at once.
+func TestAStandbyThatIsBehindForAWhileIsWaitedFor(t *testing.T) {
+	w := newWorld()
+	w.live["s1"] = "live"
+	w.behind = 3
+	r, js := w.runner(t)
+	rq := req()
+	rq.Planned = &journal.Planned{TaskID: 77, StandbyID: 10}
+	_, _ = r.Decide(context.Background(), rq)
+	_ = js.SetProof("0/6000028", "shut down")
+	if _, err := r.Run(context.Background(), rq); err != nil {
+		t.Fatalf("%v\n%s", err, strings.Join(w.log, "\n"))
+	}
+	if w.count("planned-refused") != 0 || w.count("promote s2") != 1 {
+		t.Fatalf("the standby that caught up was refused:\n%s", strings.Join(w.log, "\n"))
+	}
+}
+
+func TestAStandbyThatStaysBehindIsRefusedAtTheEndOfTheWait(t *testing.T) {
+	w := newWorld()
+	w.live["s1"] = "live"
+	w.behind = 1000
+	r, js := w.runner(t)
+	r.VerifyWait = 10 * time.Second
+	rq := req()
+	rq.Planned = &journal.Planned{TaskID: 77, StandbyID: 10}
+	_, _ = r.Decide(context.Background(), rq)
+	_ = js.SetProof("0/6000028", "shut down")
+	_, err := r.Run(context.Background(), rq)
+	var fe *failover.Error
+	if !errors.As(err, &fe) || fe.Code != failover.CodeSwitchoverUnproven || w.count("planned-refused s1 task=77") != 1 {
+		t.Fatalf("%v\n%s", err, strings.Join(w.log, "\n"))
+	}
+}
+
+// F5-09. The journal is given up although the old leader could not be told: the lease is let go of already, and an active journal would keep the gate shut.
+func TestAGivenUpJournalDoesNotDependOnTellingTheOldLeader(t *testing.T) {
+	w := newWorld()
+	w.live["s1"] = "live"
+	w.promoteErr = &failover.CallError{Status: 409, Code: "unprovable", Message: "no"}
+	w.refusedErr = errors.New("the old leader does not answer")
+	r, js := w.runner(t)
+	rq := req()
+	rq.Planned = &journal.Planned{TaskID: 77, StandbyID: 10}
+	_, _ = r.Decide(context.Background(), rq)
+	_ = js.SetProof("0/6000028", "shut down")
+	_, err := r.Run(context.Background(), rq)
+	var fe *failover.Error
+	if !errors.As(err, &fe) || js.Active() {
+		t.Fatalf("a journal that could not tell the old leader stays active: %v active=%v", err, js.Active())
+	}
+}
+
+// F6-02. The bootstrap that is given up while the promoting call is repeated (the standby answers standby_behind) does not call again: another call would promote
+// a standby whose lease was let go of, behind the back of the journal.
+func TestAGivenUpBootstrapDoesNotRepeatThePromotingCall(t *testing.T) {
+	w := newWorld()
+	w.live["s1"] = "live"
+	w.behind = 1000
+	r, js := w.runner(t)
+	r.VerifyWait = time.Hour
+	rq := req()
+	rq.Planned = &journal.Planned{TaskID: 77, StandbyID: 10}
+	_, _ = r.Decide(context.Background(), rq)
+	_ = js.SetProof("0/6000028", "shut down")
+	calls := 0
+	w.onPromote = func() {
+		calls++
+		if calls == 2 {
+			if err := js.AbandonUnpromoted("an operator"); err != nil {
+				t.Errorf("the abandon between two calls: %v", err)
+			}
+		}
+	}
+	_, err := r.Run(context.Background(), rq)
+	if err == nil {
+		t.Fatalf("the bootstrap that was given up went on:\n%s", strings.Join(w.log, "\n"))
+	}
+	if calls != 2 {
+		t.Fatalf("the promoting call was made %d times; it must stop after the abandon (2)", calls)
+	}
+}
+
+// F6-01. A refused proof gives the bootstrap up and then asks the old leader's server to end the hold of its primary: the old leader waits for as long as a
+// bootstrap that names it is active, so the call comes after the journal is given up, and a failure of the call does not undo the refusal.
+func TestARefusedProofAsksTheOldLeaderToEndItsHoldAfterTheJournalIsGivenUp(t *testing.T) {
+	w := newWorld()
+	w.live["s1"] = "live"
+	w.promoteErr = &failover.CallError{Status: 409, Code: "unprovable", Message: "the standby is behind"}
+	w.resumeOldErr = errors.New("the old leader cannot be reached")
+	r, js := w.runner(t)
+	activeAtTheCall := true
+	w.onResumeOld = func() { activeAtTheCall = js.Active() }
+	rq := req()
+	rq.Planned = &journal.Planned{TaskID: 77, StandbyID: 10}
+	_, _ = r.Decide(context.Background(), rq)
+	_ = js.SetProof("0/6000028", "shut down")
+	_, err := r.Run(context.Background(), rq)
+	var fe *failover.Error
+	if !errors.As(err, &fe) || fe.Code != failover.CodeSwitchoverUnproven {
+		t.Fatalf("want switchover_unproven: %v", err)
+	}
+	if w.count("resume-old-leader s1") != 1 {
+		t.Fatalf("the old leader was not asked to end its hold:\n%s", strings.Join(w.log, "\n"))
+	}
+	if activeAtTheCall {
+		t.Fatal("the old leader was asked while the bootstrap that names it was still active")
+	}
+}
+
+// F6-02. A bootstrap that is given up while a step runs does not go on to the next step (the abandon released the lease and let the old leader start again): the
+// runner reads the journal before every step, in the wait for the lease, and before the intent to promote, which the journal refuses for a given-up bootstrap.
+func TestABootstrapGivenUpBetweenTwoStepsGoesNoFurther(t *testing.T) {
+	w := newWorld()
+	r, js := w.runner(t)
+	r.Fault = func(point string) error {
+		if point == journal.StepLease+":after" {
+			_ = js.Abandon("an operator")
+		}
+		return nil
+	}
+	if _, err := r.Run(context.Background(), req()); err == nil {
+		t.Fatalf("the bootstrap that was given up went on:\n%s", strings.Join(w.log, "\n"))
+	}
+	if w.count("promote s2") != 0 || js.PromotionStarted() {
+		t.Fatalf("a promotion was begun after the abandon:\n%s", strings.Join(w.log, "\n"))
+	}
+	if js.IsDone(journal.StepPin) {
+		t.Fatalf("the step after the abandon ran:\n%s", strings.Join(w.log, "\n"))
+	}
+}
+
+func TestABootstrapGivenUpWhileItWaitsForTheLeaseDoesNotPromote(t *testing.T) {
+	for _, held := range []bool{false, true} {
+		w := newWorld()
+		r, js := w.runner(t)
+		calls := 0
+		w.onHolderLease = func() (failover.LeaseAnswer, error) {
+			calls++
+			if calls == 1 {
+				_ = js.Abandon("an operator")
+				return failover.LeaseAnswer{Held: held}, nil
+			}
+			return failover.LeaseAnswer{Held: true}, nil
+		}
+		_, err := r.Run(context.Background(), req())
+		var fe *failover.Error
+		if !errors.As(err, &fe) || fe.Code != failover.CodeSwitchoverUnproven {
+			t.Fatalf("held %v: the bootstrap that was given up ended with %v, want switchover_unproven:\n%s", held, err, strings.Join(w.log, "\n"))
+		}
+		if !held && calls != 1 {
+			t.Fatalf("the lease was asked for again (%d calls) after the bootstrap was given up", calls)
+		}
+		if w.count("promote s2") != 0 || js.PromotionStarted() {
+			t.Fatalf("held %v: a promotion was begun after the abandon:\n%s", held, strings.Join(w.log, "\n"))
+		}
 	}
 }

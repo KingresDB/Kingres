@@ -38,3 +38,16 @@ func (n *Node) DoThroughRestart(method, path string, body any, headers map[strin
 		time.Sleep(2 * time.Second)
 	}
 }
+
+// DumpGoroutines makes the process of the node print its goroutines into its log and end, so that a failure shows where it was stuck. The node is
+// not usable afterwards.
+func (n *Node) DumpGoroutines() {
+	n.mu.Lock()
+	cmd := n.cmd
+	n.mu.Unlock()
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	quit(cmd)
+	time.Sleep(3 * time.Second)
+}

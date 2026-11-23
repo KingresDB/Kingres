@@ -867,6 +867,12 @@ func handleFailoverDemote(ctx context.Context, d *haDeps, body []byte) (any, err
 		return nil, err
 	}
 	if r.Mode == "fast" {
+		if r.Group == 0 && r.Candidate != "" {
+			// Before anything is stopped (F7-01): the hold that follows may be ended later only on the word of this server.
+			if err := d.LeaseMgr.RecordCandidate(0, r.Candidate); err != nil {
+				return nil, err
+			}
+		}
 		return demoteClean(ctx, d, r)
 	}
 	li, ok := d.Svc.PrimaryOf(r.Group)
@@ -906,6 +912,23 @@ func handleFailoverPromote(ctx context.Context, d *haDeps, body []byte) (any, er
 	if d.LeaseMgr == nil || d.Standby == nil {
 		return nil, notStarted
 	}
+	// Tests of the planned switchover of the map group: the call answers "unavailable" for as long as the fault is in force (a candidate that never promotes),
+	// or holds for 20 s before it does anything (an abandon that arrives while the call is in flight).
+	// A test (F6-01): the standby's instance cannot be reached at all, neither by the promoting call nor by the question whether it is still in recovery (the answer of its control
+	// data is what then counts).
+	if d.Fault.FailoverInjection("promote:unreachable") == "unreachable" {
+		testInstanceUnreachable.Store(true)
+		return nil, &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The instance cannot be reached."}
+	}
+	if d.Fault.FailoverInjection("promote:unavailable") == "unavailable" {
+		return nil, &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The instance cannot be reached."}
+	}
+	if d.Fault.FailoverInjection("promote:slow") == "slow" {
+		select {
+		case <-time.After(20 * time.Second):
+		case <-ctx.Done():
+		}
+	}
 	started := time.Now()
 	// The promotion runs under the standby agent's lifecycle lock: the agent proves that a directory is a standby and
 	// removes or rebuilds it under the same lock, so a removal cannot be between the proof and the delete while this
@@ -915,6 +938,17 @@ func handleFailoverPromote(ctx context.Context, d *haDeps, body []byte) (any, er
 		return nil, &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "A create, remove or rebuild of a standby is running on this server; repeat the call."}
 	}
 	defer unlock()
+	// A test (F6-02): the call holds inside the lock, as a promotion does, before the lease is checked and the instance is promoted.
+	if d.Fault.FailoverInjection("promote:slowlock") == "slow" {
+		select {
+		case <-time.After(20 * time.Second):
+		case <-ctx.Done():
+		}
+	}
+	// A bootstrap that was given up does not promote (F7-02): the abandon marks the journal under this lock, so a call that waited for it finds the mark here.
+	if err := promoteBlockedByJournal(d.MapFailover, r.Group); err != nil {
+		return nil, err
+	}
 	var li *cluster.LocalInstance
 	for _, x := range d.Svc.LocalInstances() {
 		x := x
@@ -965,6 +999,10 @@ func handleFailoverPromote(ctx context.Context, d *haDeps, body []byte) (any, er
 	//    primary wrote up to its shutdown checkpoint, and nothing beyond it. A standby that is behind, or an old primary that was
 	//    started again and wrote more, is refused before anything is changed: the call is still before the point of no return.
 	if r.Checkpoint != "" && !r.ReapplyList {
+		// A test: the standby has not replayed the shutdown checkpoint yet, for the first FailoverTimes calls (replication lag after the stop).
+		if d.Fault.FailoverInjectionOnce("promote:behind") == "fail" {
+			return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "standby_behind", Message: "The standby does not hold everything the old primary wrote."}
+		}
 		vc, verr := d.Svc.InstanceConn(ctx, li.ID, dbOrSystem(""))
 		if verr != nil {
 			return nil, &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The proof cannot be asked: the instance cannot be reached."}
@@ -978,6 +1016,10 @@ func handleFailoverPromote(ctx context.Context, d *haDeps, body []byte) (any, er
 				return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "unprovable", Message: pe.Message}
 			}
 			return nil, &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The proof cannot be asked: " + verr.Error()}
+		}
+		// A test: the standby cannot prove it (the proof of the planned switchover of the map group is refused after the old leader stopped).
+		if d.Fault.FailoverInjection("promote:unproven") == "fail" {
+			ok = false
 		}
 		if !ok {
 			return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "standby_behind", Message: "The standby does not hold everything the old primary wrote."}
@@ -1076,6 +1118,24 @@ func registerFailoverCallee(d *haDeps) {
 	})
 	d.Calls.Register(callMapContinue, func(ctx context.Context, caller string, body []byte) (any, error) {
 		return handleMapContinue(ctx, d, caller, body)
+	})
+	d.Calls.Register(callMapAbandon, func(ctx context.Context, caller string, body []byte) (any, error) {
+		return handleMapAbandon(ctx, d, caller, body)
+	})
+	d.Calls.Register(callMapCheckpoint, func(ctx context.Context, caller string, body []byte) (any, error) {
+		return handleMapCheckpoint(ctx, d, caller, body)
+	})
+	d.Calls.Register(callMapRefused, func(ctx context.Context, caller string, body []byte) (any, error) {
+		return handleMapRefused(ctx, d, caller, body)
+	})
+	d.Calls.Register(callMapProof, func(ctx context.Context, caller string, body []byte) (any, error) {
+		return handleMapProof(ctx, d, caller, body)
+	})
+	d.Calls.Register(callMapBootstrap, func(ctx context.Context, caller string, body []byte) (any, error) {
+		return handleMapBootstrap(ctx, d, caller, body)
+	})
+	d.Calls.Register(callMapResume, func(ctx context.Context, caller string, body []byte) (any, error) {
+		return handleMapResume(ctx, d, caller, body)
 	})
 }
 
