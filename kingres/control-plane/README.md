@@ -3693,11 +3693,53 @@ D1a and D1b of the design).
 
 ### Preload (the fix that the analytics needed)
 
-`shared_preload_libraries` of every instance is `kingres_shard,kingres_ledger,kingres_columnar` (`instance.PreloadLibraries`). Without `kingres_columnar`
+`shared_preload_libraries` of every instance is `kingres_shard,kingres_ledger,kingres_columnar,pg_stat_statements` (`instance.PreloadLibraries`). Without `kingres_columnar`
 nothing can write a columnar table and `kingres_timepart` refuses every conversion; `kingres_timepart` and `kingres_sketch` need no preload. An instance made
 by an earlier package has the old list in `kingres-managed.conf`: `EnsureConfig` (run when `kingresd` starts) rewrites the file when the list differs, and
 the new list takes effect at the next restart of the instance. A server whose instance has not been restarted answers `409 extension_missing` (naming the
 library and the server) to a storage conversion, and says what to do.
+
+### pg_stat_statements and plpgsql in the first release
+
+`shared_preload_libraries` of every instance is now `kingres_shard,kingres_ledger,kingres_columnar,pg_stat_statements` (`instance.PreloadLibraries`). The
+library is the second one that the installation may lack (`optionalLibraries` in `internal/instance/configfile.go`): the list of an instance leaves out a
+library whose file is not in `pg_config --pkglibdir`, so that a package that was not upgraded with `kingresd` still starts. The two differ in one rule:
+
+- `kingres_columnar` is **sticky**. An instance that has had it keeps it, even when the file is missing now (the marker file `columnar-preload`), because
+  columnar tables cannot be read without the resource manager.
+- `pg_stat_statements` is **not sticky**, and has no marker. It holds no data that anything needs, so a missing file must never be what keeps an instance from
+  starting: the next list that is written leaves it out, and the `EnsureConfig` after the file is back puts it in again. (The marker logic of columnar is
+  followed everywhere else: the library-exists check, the warning, the reload.)
+
+**Upgrade of an existing instance.** `EnsureConfig` (run when `kingresd` starts and by the configuration agent) sees the old list in `kingres-managed.conf`,
+logs a warning, rewrites the managed file from the stored settings (every other setting is kept), and reloads a running instance, so that PostgreSQL shows
+`shared_preload_libraries` as pending a restart (`pg_settings.pending_restart`). The list takes effect at the next restart; the restart of the pending
+instances of the console puts standbys before their primaries. Until then `pg_stat_statements` collects nothing and its views fail with "must be loaded via
+shared_preload_libraries"; nothing else is affected. A file that already has the right list is not rewritten.
+
+**Which databases have the extension.** The ones that `kingresd` makes: `postgres` and `kingres_system` when the cluster is created (`installStatStatements`,
+a package without the extension leaves them as they are), and every database made by `database.create` (`installAnalytics`, on this server and through the
+apply kind on the others). A server that is added gets the extension with each database of the leader (`globals/apply` copies the extension list).
+`ExtStatStatements` is in the closed list of `extension.check`, `extension.install` and `extension.verify`.
+
+**Databases that exist already** get no extension from `kingresd`, neither lazily nor at start. That is a decision: the storage extensions are installed at
+first use because an operation of `kingresd` needs them, and nothing in `kingresd` reads `pg_stat_statements`, so there is no first use to hang the
+installation on, and `CREATE EXTENSION` run by the control plane in a database of a user at an unforeseen time (a superuser statement on the objects of the
+user, a catalog change that every standby replays) is a surprise that is not worth a view. The administrator runs `CREATE EXTENSION IF NOT EXISTS
+pg_stat_statements` once in each database that should have it, on the primary of every server group (a standby gets it through replication; a database of a
+server that is added later gets it with the globals). The guide says so.
+
+**Configuration.** The settings of the extension are not managed and not refused: `pg_stat_statements.max` (restart), `pg_stat_statements.save` (reload),
+`pg_stat_statements.track`, `.track_utility` and `.track_planning` (also per database) can be set at cluster, server group and server level, and none must
+be equal on every server. `shared_preload_libraries` itself stays managed (its reason names the library). The statement texts that the extension keeps live in
+shared memory and in `pg_stat/pgss_query_texts.stat`, never in a log; the rules that keep statement text out of the logs are unchanged.
+
+**plpgsql** is part of the server, is in `template1` of every cluster, and so in every database that `kingresd` makes (the databases are made from
+`template0` with the extensions installed afterwards; `plpgsql` is created by initdb in `template1` and `postgres`, and `database.create` takes
+`template0`, which has it too: the cluster test checks every database on every server). `kingres_shard` does **not** propagate `CREATE FUNCTION`: a function is a
+local object on each server (the list "Propagated" in the README of `kingres_shard`, "DDL on distributed and reference tables", names only statements on tables, and a function of a user is never shipped inside a query). A plpgsql function is
+used against a distributed table from every server, in a filter, in a read and in a write; the same function has to be created on every server, and
+`TestStatStatementsAndPlpgsql` pins both facts.
 
 ### Extensions in databases and on new servers
 
