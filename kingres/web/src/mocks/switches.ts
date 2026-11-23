@@ -74,6 +74,7 @@
 //                                 unreadable   0.40.0: the role cannot read some tables (422 export_not_readable)
 //                                 dbfail       0.40.0: the next database export fails in its data step
 //                                 changed      0.40.0: the next database export fails with schema_changed
+//                                 superuser    0.41.0: the signed-in role is dangerous (importDatabase: 403 forbidden)
 //   ?clock=off:<server>:<ms>      the clock of that server is that many milliseconds ahead (negative: behind).
 //   ?clock=unreachable:<server>   the clock of that server cannot be read.
 import { seedPartitioned } from './tables'

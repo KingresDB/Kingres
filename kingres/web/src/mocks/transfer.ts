@@ -87,7 +87,10 @@ export function reserved(s: MockState): number {
 }
 
 const isTransfer = (kind: string): boolean =>
-  kind === 'table.export' || kind === 'table.import' || kind === 'database.export'
+  kind === 'table.export' ||
+  kind === 'table.import' ||
+  kind === 'database.export' ||
+  kind === 'database.import'
 
 export function checkConcurrency(s: MockState, subject: string): void {
   const busy = s.tasks.filter((t) => t.task.state === 'running' && isTransfer(t.task.kind))

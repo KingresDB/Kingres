@@ -246,10 +246,10 @@ describe('the export database dialog', () => {
 })
 
 describe('the validate an archive dialog', () => {
-  it('explains that no database is touched and that importing is not available', async () => {
+  it('explains that no database is touched and that the Import database action', async () => {
     const { dialog } = await openValidate()
     expect(dialog).toHaveTextContent(/no database is touched/i)
-    expect(dialog).toHaveTextContent(/importing an archive is not available in this version/i)
+    expect(dialog).toHaveTextContent(/use import database on the databases page/i)
     expect(within(dialog).getByTestId('start-validation')).toBeDisabled()
   })
 
@@ -264,7 +264,7 @@ describe('the validate an archive dialog', () => {
     )
     expect(within(report).getByTestId('report-kinds')).toHaveTextContent(/CREATE TABLE/)
     expect(within(report).getByTestId('report-no-import')).toHaveTextContent(
-      /not available in this version/i,
+      /use import database on the databases page/i,
     )
     expect(within(report).queryByTestId('report-ledger')).not.toBeInTheDocument()
   })

@@ -1003,6 +1003,9 @@ export const endpoints = {
       api.POST('/data-uploads/{uploadId}/validation', { params: { path: { uploadId } } }),
     )) as Task,
   // The calls of an upload keep the session in place when the answer is 401: the uploader asks for the password and goes on.
+  /** 202 + task `database.import` (subject type `database`, id the new name); contract 0.41.0, a placeholder revision. */
+  importDatabase: async (body: S['ImportDatabaseRequest']): Promise<Task> =>
+    (await j(api.POST('/database-imports', { body }))) as Task,
   createDataUpload: (body: S['CreateDataUploadRequest']) =>
     j(api.POST('/data-uploads', { body }), { keepSession: true }),
   getDataUpload: (uploadId: string) =>
