@@ -160,3 +160,26 @@ func TestStatStatementsAndPlpgsql(t *testing.T) {
 		}
 	})
 }
+
+// A server that is added gets every extension of the leader's databases in the schema they have on the leader, the schema made as the leader has it
+// (name quoted, same owner), not in the schema of the session (pg_catalog): pgcrypto in a schema of its own, owned by another role.
+func TestAddedServerGetsExtensionsInTheirSchema(t *testing.T) {
+	c := clustertest.FormWith(t, 3, func(leader *clustertest.Node) {
+		body := leader.Expect(202, "POST", "/databases", map[string]any{"name": "ep"})
+		leader.WaitTaskDone(clustertest.TaskID(body), 4*time.Minute)
+		psExec(t, leader, "postgres", `CREATE ROLE ext_owner NOLOGIN`)
+		psExec(t, leader, "ep", `CREATE SCHEMA "Ext Schema" AUTHORIZATION ext_owner`)
+		psExec(t, leader, "ep", `CREATE EXTENSION pgcrypto SCHEMA "Ext Schema"`)
+	})
+	for _, n := range c.Nodes {
+		if got := psScalar(t, n, "ep", `SELECT n.nspname || ':' || r.rolname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace JOIN pg_roles r ON r.oid = n.nspowner WHERE e.extname = 'pgcrypto'`); got != "Ext Schema:ext_owner" {
+			t.Errorf("node %d: pgcrypto is in %q", n.Index, got)
+		}
+		if got := psScalar(t, n, "ep", `SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'Ext Schema' AND p.proname = 'gen_random_bytes'`); got != "1" {
+			t.Errorf("node %d: gen_random_bytes in the schema: %s", n.Index, got)
+		}
+		if got := psScalar(t, n, "ep", `length("Ext Schema".gen_random_bytes(8))`); got != "8" {
+			t.Errorf("node %d: gen_random_bytes: %s", n.Index, got)
+		}
+	}
+}

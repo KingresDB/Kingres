@@ -178,6 +178,9 @@ type DatabaseSpec struct {
 	ConnectionLimit int      `json:"connectionLimit"`
 	Settings        []string `json:"settings"` // name=value pairs of database-wide settings
 	Extensions      []string `json:"extensions"`
+	// ExtensionPlaces says in which schema, and owned by which role, each extension of Extensions is installed on the sender, so that the receiver
+	// installs it in the same place (a service session has search_path = pg_catalog, so an extension without a schema of its own cannot be made without one).
+	ExtensionPlaces map[string]ExtensionPlace `json:"extensionPlaces,omitempty"`
 	// Sharded says the database uses kingres_shard; the extension is then
 	// installed by kingres.add_node, not here.
 	Sharded bool `json:"sharded"`
@@ -191,4 +194,10 @@ type Globals struct {
 	// are not in it (other than its own service role) are left alone anyway;
 	// reserved for later use, always false now.
 	Exact bool `json:"exact,omitempty"`
+}
+
+// ExtensionPlace is the schema an extension is installed in, and the owner of that schema.
+type ExtensionPlace struct {
+	Schema string `json:"schema"`
+	Owner  string `json:"owner"`
 }
