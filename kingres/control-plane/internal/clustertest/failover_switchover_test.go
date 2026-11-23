@@ -361,8 +361,8 @@ func TestSwitchoverOfTheMapGroup(t *testing.T) {
 			st, body := nw.Do("GET", fmt.Sprintf("/tasks/%v", id), nil, nil)
 			t.Logf("task %v on the new leader (%d): %v", id, st, body)
 			t.Logf("failover status: %v", func() any { _, b := nw.Do("GET", "/failover", nil, nil); return b }())
-			t.Logf("new leader log: %s", nw.LogTail(14000))
-			t.Logf("old leader log: %s", leader.LogTail(8000))
+			t.Logf("new leader log: %s", quietLog(nw.LogTail(120000)))
+			t.Logf("old leader log: %s", quietLog(leader.LogTail(120000)))
 		}
 	}()
 	until(t, 10*time.Minute, "the task to end on the new leader", func() bool {
