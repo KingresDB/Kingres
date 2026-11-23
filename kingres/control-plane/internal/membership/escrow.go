@@ -718,14 +718,14 @@ func (m *Manager) revocationPeers(ctx context.Context) ([]string, error) {
 	if m.escrowActive != nil {
 		return m.escrowActive(ctx)
 	}
-	infos, err := m.peerInfos(ctx, "", "")
+	rows, err := m.listServers(ctx)
 	if err != nil {
 		return nil, err
 	}
 	var out []string
-	for _, p := range infos {
-		if p.ServerID != m.Self {
-			out = append(out, p.ServerID)
+	for _, r := range rows {
+		if r.Status == StatusActive && r.ID != m.Self {
+			out = append(out, r.ID)
 		}
 	}
 	return out, nil

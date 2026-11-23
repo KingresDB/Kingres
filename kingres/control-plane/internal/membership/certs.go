@@ -460,19 +460,18 @@ func (m *Manager) stepCertRevokeDistribute(ctx context.Context, env *task.Env) e
 	if err != nil {
 		return err
 	}
-	infos, err := m.peerInfos(ctx, "", "")
+	// The servers are the active members of the table: the address of a server is the peer directory's business (the row of the server that
+	// created the cluster has none, and after a failover of the map group that server is one of the others).
+	ids, err := m.revocationPeers(ctx)
 	if err != nil {
 		return err
 	}
 	req := wire.PKIRequest{CACert: string(ca.CertPEM()), Revoked: ca.Revoked(), CRL: string(crl)}
-	for _, p := range infos {
-		if p.ServerID == m.Self {
-			continue
-		}
-		if err := m.waitUnreachable(ctx, env, p.ServerID, "sending the revocation list", func() error {
-			return m.installRevocations(ctx, p.ServerID, ca, req)
+	for _, id := range ids {
+		if err := m.waitUnreachable(ctx, env, id, "sending the revocation list", func() error {
+			return m.installRevocations(ctx, id, ca, req)
 		}); err != nil {
-			return fmt.Errorf("sending the revocation list to %s: %w", p.ServerID, err)
+			return fmt.Errorf("sending the revocation list to %s: %w", id, err)
 		}
 	}
 	m.escrowAfterRevocation(ctx)
