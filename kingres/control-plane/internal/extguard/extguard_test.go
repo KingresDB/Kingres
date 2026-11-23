@@ -715,7 +715,7 @@ func TestRuntimeRuleMutantsAreKilled(t *testing.T) {
 		want                      Reason // what the real statement says with bad in place ("" for the accepted objects)
 	}{
 		{"every table is accepted", tablePattern, "true)", "CREATE TABLE kingres.ledger_pending (ledger_txid bigint)", "DROP TABLE kingres.ledger_pending", ReasonForeignObject},
-		{"every function is accepted", "p.proname ~ '^split_capture_[0-9]+_[0-9]+$' AND", "true AND", "CREATE FUNCTION kingres.ledger_head() RETURNS int LANGUAGE sql AS 'SELECT 1'", "DROP FUNCTION kingres.ledger_head()", ReasonForeignObject},
+		{"every function is accepted", "p.proname ~ '^split_capture_[0-9]+_[0-9]+$' AND p.prorettype = 'pg_catalog.trigger'::pg_catalog.regtype AND", "true AND", "CREATE FUNCTION kingres.ledger_head() RETURNS int LANGUAGE sql AS 'SELECT 1'", "DROP FUNCTION kingres.ledger_head()", ReasonForeignObject},
 		{"the type of the function is not looked at", "AND p.prorettype = 'pg_catalog.trigger'::pg_catalog.regtype", "", "CREATE FUNCTION kingres.split_capture_3_1() RETURNS int LANGUAGE sql AS 'SELECT 1'", "DROP FUNCTION kingres.split_capture_3_1()", ReasonForeignObject},
 		{"the owners are not collected", "AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles g WHERE g.oid = r.owner AND g.rolsuper)),\n                '{}'", "AND false),\n                '{}'", "CREATE TABLE kingres.orphan_4_4 (a int); ALTER TABLE kingres.orphan_4_4 OWNER TO tenant2", "DROP TABLE kingres.orphan_4_4", ReasonForeignObject},
 		{"the run-time tables are not accepted at all", "c.relkind IN ('r', 'p') AND c.relname ~", "false AND c.relname ~", "CREATE TABLE kingres.orphan_5_3 (a int)", "DROP TABLE kingres.orphan_5_3", ""},
