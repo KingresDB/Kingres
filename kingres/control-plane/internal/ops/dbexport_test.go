@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/archive"
@@ -331,7 +332,7 @@ func TestDumpArgumentsAndEnvironment(t *testing.T) {
 			t.Errorf("pg_dump argument %s", bad)
 		}
 	}
-	cfg, _ := pgx.ParseConfig("postgres://kingresd:secret@127.0.0.1:5432/shop")
+	cfg := &pgx.ConnConfig{Config: pgconn.Config{Host: "127.0.0.1", Port: 5432, User: "kingresd", Password: "secret", Database: "shop"}}
 	env := strings.Join(dumpEnv(cfg, "/x/pgpass"), " ")
 	if !strings.Contains(env, "PGPASSFILE=/x/pgpass") || !strings.Contains(env, "PGOPTIONS=-c search_path=pg_catalog") || strings.Contains(env, "PGPASSWORD") || strings.Contains(env, "secret") || strings.Contains(env, "PGSERVICE") || strings.Contains(args, "secret") {
 		t.Errorf("environment %q", env)
@@ -393,7 +394,7 @@ func TestCachedReportIsByTheChecksum(t *testing.T) {
 
 // The password of pg_dump is in a file of mode 0600 with the escapes of a password file, and nowhere in the arguments or the environment.
 func TestPasswordFileOfPgDump(t *testing.T) {
-	cfg, _ := pgx.ParseConfig("postgres://kingresd:se%3Acr%5Cet@127.0.0.1:5432/shop")
+	cfg := &pgx.ConnConfig{Config: pgconn.Config{Host: "127.0.0.1", Port: 5432, User: "kingresd", Password: "se:cr\\et", Database: "shop"}}
 	dir := t.TempDir()
 	name, err := writePassfile(dir, cfg)
 	if err != nil {

@@ -169,3 +169,40 @@ func TestReadFactsAndDumpOfARealDatabase(t *testing.T) {
 		t.Errorf("oid columns: %v", f3.OIDColumns)
 	}
 }
+
+// A search_path that ALTER DATABASE set, with a schema of the tenant first, is not followed by the catalog reads even on a plain connection (B9, A1): the facts are
+// read under "SET LOCAL search_path = pg_catalog". The functions of the tenant raise when called.
+func TestFactsIgnoreTheSearchPathOfTheDatabase(t *testing.T) {
+	if !pgtest.Available() {
+		t.Skip("KINGRES_PG_BIN is not set; skipping the PostgreSQL integration test")
+	}
+	in := pgtest.Start(t, nil)
+	c := in.Connect(t, "postgres")
+	ctx := context.Background()
+	for _, q := range []string{"create database dbx_sp"} {
+		if _, err := c.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	d := in.Connect(t, "dbx_sp")
+	for _, q := range []string{
+		"create table public.t (id int primary key, v text)",
+		"create schema evil",
+		"create function evil.format_type(oid, integer) returns text language plpgsql as $$ begin raise exception 'the function of the tenant ran'; end $$",
+		"create function evil.pg_get_userbyid(oid) returns name language plpgsql as $$ begin raise exception 'the function of the tenant ran'; end $$",
+		"alter database dbx_sp set search_path = evil, pg_catalog, public",
+	} {
+		if _, err := d.Exec(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	e := in.Connect(t, "dbx_sp")
+	var sp string
+	if err := e.QueryRow(ctx, "show search_path").Scan(&sp); err != nil || !strings.HasPrefix(sp, "evil") {
+		t.Fatalf("the session does not have the search path of the database: %q %v", sp, err)
+	}
+	f := pgFacts(t, e)
+	if len(f.Tables) != 1 || f.Tables[0].Name != "t" {
+		t.Errorf("tables: %+v", f.Tables)
+	}
+}

@@ -57,6 +57,19 @@ func TestExportRefusesAFakeKingresSchema(t *testing.T) {
 	if err := svc.QueryRow(context.Background(), "select count(*) from public.marker").Scan(&n); err != nil || n != 0 {
 		t.Errorf("the function of the tenant ran %d times (%v)", n, err)
 	}
+	// An empty schema kingres of the tenant is refused too (the owner is what counts, not what is in it).
+	for _, sql := range []string{"create database dbx_fake2"} {
+		if _, err := admin.Exec(context.Background(), sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	svc2 := e.serviceConn(t, "dbx_fake2")
+	if _, err := svc2.Exec(context.Background(), "create schema kingres authorization dbx_tenant"); err != nil {
+		t.Fatal(err)
+	}
+	if st, out := e.startDBExport(t, "dbx_fake2", map[string]any{}); st != 422 || out["code"] != "schema_unrecognised" {
+		t.Errorf("an empty schema kingres of the tenant: %d %v", st, out)
+	}
 	// With the schema of the tenant gone the same database is exported.
 	if _, err := svc.Exec(context.Background(), "drop schema kingres cascade"); err != nil {
 		t.Fatal(err)

@@ -1926,3 +1926,25 @@ every table with a policy is refused.
   read into `distributedSchemas` but no test builds one; a columnar **distributed** table; an upload of an archive above 2 GiB.
 - **Not in 14b, by the design's own scope:** the import, `expectedSha256`, the private database; `ArchiveReport.statements` is filled by the shape grammar already, so the
   validation says which statements a 14c importer would refuse.
+
+### Changes made after the security review of 14b (2026-11-23)
+
+- **The service role reads and calls nothing in the schema `kingres` before `extguard` has shown that it is an extension's** (A1). Every read of the catalog of the shard, ledger, timepart and
+  columnar extensions, and the call of `kingres.columnar_options`, are gated by `extguard.Guard` for the extension that owns the object; an untrusted schema is 422
+  `schema_unrecognised` at the request and the task code `schema_unrecognised` in a step. A database whose schema `kingres` is not owned by a superuser, or that holds objects when no
+  extension of KingresDB is installed, and a schema `kingres_transfer` that the service role does not own, are refused the same way (B7). `readDBFacts` runs `SET LOCAL search_path =
+  pg_catalog`, so a `search_path` set with `ALTER DATABASE` finds nothing of the tenant's; `pg_dump` gets `PGOPTIONS=-c search_path=pg_catalog`, its password in a file of mode 0600 in the
+  staging directory (removed afterwards), a version check (the major of the server, at least 18) and a bounded tail of its error output in the log of the server only (A2, B8). The role's
+  connection of an export sets `search_path = pg_catalog` (B9).
+- **The lexers agree with PostgreSQL** (B1, B2): a `--` comment ends at a carriage return as well as at a line feed, and a dollar-quote tag may start with a byte above 0x7f, in `sqlshape` and
+  in `dumpnorm`. The corpus `internal/sqlshape/testdata/lexcorpus.json` (comments that end at `\r`, tags of high bytes, nested comments, `E''`, `U&''`, dollar quotes in strings and comments)
+  holds only harmless `SELECT` scripts; `TestLexersAgreeWithTheServer` sends each to a real server (PostgreSQL 18 and 19) with the simple protocol and counts the results, and the two lexers and
+  the corpus must give the same count. The corpus is also the seed of the fuzz targets.
+- **A validation is made from a whole read of the bytes or not at all** (B3): a failure that is not a verdict about the archive (the key, the file, a cancel, a read error) fails the task and
+  nothing is cached. The cached report carries `ValidatorVersion` and the SHA-256 of the file; a report of another version is stale (the upload is `complete` again). **The cache is per upload
+  row and tells what a validation found once. The import of 14c validates again at import time, whatever `archive_state` says, and never trusts it** (B4). The report says that the row counts
+  are the manifest's claims (P1). A validation is limited to `min(maxImportBytes, 200 times the staged file)`, an entry to 500 times its compressed size plus 1 MiB (B5).
+- **Sequences** (B6): the role needs `SELECT` or `USAGE` on every sequence of the database, or the export is refused with `export_not_readable`.
+- **Names are pairs** (B10): a schema or a table with a dot in its name is refused at the export and by the validator; the console keys the tables to leave out as the pair. The number of data
+  entries is checked at the request (at most 19 992).
+- **The check for an export and the start of a table task are one step** (P2): `StartTask` for a table kind and the start of `database.export` take `dbTaskMu` around check and submit.

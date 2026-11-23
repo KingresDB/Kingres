@@ -7,6 +7,42 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-23 (branch p14b, second entry): the fixes for the security review of phase 14b
+
+### What was done
+
+- A1: `extguard` (commit 13ae51e353 of `sec-ext`, taken alone) gates every read and call of the schema `kingres` in the facts of the export; an untrusted schema is a refusal (422 `schema_unrecognised`, or the task code). B7: a schema `kingres` owned by a role that is not a superuser, one that holds objects when no extension is installed, and a schema `kingres_transfer` that the service role does not own are refused. The facts are read under `SET LOCAL search_path = pg_catalog`, `pg_dump` has `PGOPTIONS=-c search_path=pg_catalog`, a password file of mode 0600 in the staging directory, a version check and a bounded tail of its error output in the server log (A2, B8); the role's connection sets `search_path = pg_catalog` (B9).
+- B1, B2: line comments end at `\r`; dollar-quote tags may start with a high byte (`sqlshape` and `dumpnorm`). A corpus of harmless scripts is checked against a real server of PostgreSQL 18 and 19 (`TestLexersAgreeWithTheServer`) and is the seed of the fuzz targets.
+- B3, B4, B5, B6, B10, P1, P2: a failed read is never a report; a versioned cache (an import validates again); ratio and expansion limits; sequence privileges; names as pairs (a dot is refused, the console keys by the pair); the report says that rows are claimed; the check for an export and the start of a table task are one step.
+
+### How it was verified
+
+| Test | Layer | PG18 | PG19 |
+|---|---|---|---|
+| `TestLexersAgreeWithTheServer` (22 scripts, the server counts the statements) | PG test | pass | pass |
+| `TestLexerAgreesWithTheCorpus`, `TestCarriageReturnAndHighByteTags`, `TestSplitterAgreesWithTheCorpus` | Go unit | pass | pass |
+| `TestFactsIgnoreTheSearchPathOfTheDatabase` (a shadowing schema first in the path of the database) | PG test | pass | pass |
+| `TestExportRefusesAFakeKingresSchema` (a fake schema with a marker function, a full one and an empty one), `TestExportRefusesAFakeTransferSchema`, `TestExportIgnoresASearchPathOfTheDatabase`, `TestExportRefusesASequenceTheRoleCannotRead` | cluster | pass | pass |
+| `TestAFailedReadIsNotAReport`, `TestArchiveLimitsFollowTheFile`, `TestCachedReportIsByTheChecksum` (version), `TestPasswordFileOfPgDump`, `TestRatioCap`, `TestDottedNamesAreRefused`, the keys of the console (`archive-keys-0-40`) | Go and web unit | pass | not applicable |
+| the sweep of the first entry (export, spike, three servers, facts and dump) | cluster and PG | pass | pass |
+
+Mutants of the review, all killed: the lexer of `sqlshape` or the splitter of `dumpnorm` ends a comment only at a line feed (`TestLexerAgreesWithTheCorpus`, `TestSplitterAgreesWithTheCorpus`); a tag may not start with a high byte (same tests); a failed read is made a report (`TestAFailedReadIsNotAReport`); a report of another validator version is used (`TestCachedReportIsByTheChecksum`); no ratio cap (`TestRatioCap`); a dot accepted (`TestDottedNamesAreRefused`); the guard and the check of the fixed schemas removed, and the owner of the schema `kingres` not checked (`TestExportRefusesAFakeKingresSchema`; the owner mutant needed the empty schema that was added); the sequence privilege not checked (`TestExportRefusesASequenceTheRoleCannotRead`); the search path of the facts not pinned (`TestFactsIgnoreTheSearchPathOfTheDatabase`; the end-to-end test could not show it, because the service connection already pins the path in its startup parameters); the schema `kingres_transfer` not checked (`TestExportRefusesAFakeTransferSchema`).
+
+### Decisions and deviations
+
+- The commit of `sec-ext` was cherry-picked alone; the contract text of its alert kind moved into 0.40.0 (placeholder).
+- The tail of the error output of `pg_dump` goes to the server log (the reviewer asked for it); it can name objects.
+
+### Still open
+
+- 14c validates the archive again at import time and never trusts `archive_state` (design note above).
+
+### Core patches
+
+None.
+
+---
+
 ## 2026-11-23 (branch p14b): phase 14b, database export and archive validation
 
 ### What was done
