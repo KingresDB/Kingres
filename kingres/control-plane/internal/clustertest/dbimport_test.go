@@ -83,7 +83,7 @@ func TestDatabaseImportOverThreeServers(t *testing.T) {
 	}
 	st, out := f1.Do("POST", "/databases/dbm3/export", map[string]any{}, nil)
 	if st != 202 {
-		t.Fatalf("export: %d %v", st, out)
+		t.Fatalf("export: %d %v\n%s", st, out, leader.LogTail(6000)+f1.LogTail(3000))
 	}
 	res := f2.WaitTask(clustertest.TaskID(out), 6*time.Minute)
 	if res["state"] != "done" {

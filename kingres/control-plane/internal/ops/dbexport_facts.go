@@ -391,7 +391,7 @@ func (f *dbFacts) checkFixedSchemas(ctx context.Context, tx pgx.Tx, g *extguard.
 }
 
 func (f *dbFacts) readDistribution(ctx context.Context, tx pgx.Tx) error {
-	rows, err := tx.Query(ctx, `SELECT c.colocation_id, c.bucket_count, c.dist_column_type::text, coalesce((SELECT collname::text FROM pg_collation WHERE oid = c.dist_collation), ''),
+	rows, err := tx.Query(ctx, `SELECT c.colocation_id, c.bucket_count, coalesce(c.dist_column_type::text, ''), coalesce((SELECT collname::text FROM pg_collation WHERE oid = c.dist_collation), ''),
 			(SELECT count(DISTINCT m.group_id)::int FROM kingres.bucket_map m WHERE m.colocation_id = c.colocation_id AND m.state IN ('active', 'moving'))
 		FROM kingres.colocation c ORDER BY c.colocation_id`)
 	if err != nil {

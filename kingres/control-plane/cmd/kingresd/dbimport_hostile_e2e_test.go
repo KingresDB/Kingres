@@ -307,7 +307,7 @@ func TestDatabaseImportWithdrawsTheAccessOfTheRole(t *testing.T) {
 		mu.Lock()
 		id := taskID
 		mu.Unlock()
-		if id == "" || (step != "Create the tables" && step != "Distribute the tables" && step != "Load the data" && step != "Enable the ledger and the policies" && step != "Verify") {
+		if id == "" || (step != "Create the tables" && step != "Distribute the tables" && step != "Create the views" && step != "Load the data" && step != "Enable the ledger and the policies" && step != "Verify") {
 			return nil
 		}
 		try(step, "kingres_import_"+id)
@@ -326,7 +326,7 @@ func TestDatabaseImportWithdrawsTheAccessOfTheRole(t *testing.T) {
 		t.Fatalf("import: %v", done["error"])
 	}
 	// Before the tables are made the role cannot connect yet (the step gives the access when it starts: the hook runs just before); the service role's steps are closed.
-	want := map[string]string{"Distribute the tables": "connected", "Load the data": "connected", "Enable the ledger and the policies": "refused", "Verify": "refused"}
+	want := map[string]string{"Distribute the tables": "connected", "Create the views": "refused", "Load the data": "connected", "Enable the ledger and the policies": "refused", "Verify": "refused"}
 	for step, w := range want {
 		if results[step] != w {
 			t.Errorf("at %q the role %s, want %s (%v)", step, results[step], w, results)
