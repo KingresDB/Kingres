@@ -385,6 +385,12 @@ func (p *Problem) WithBlockers(b any) *Problem {
 	return p
 }
 
+// WithReasons attaches the reasons of an archive problem or of export_not_readable, in the shape of the blockers (contract 0.40.0).
+func (p *Problem) WithReasons(r any) *Problem {
+	p.Reasons = r
+	return p
+}
+
 // WithPlan attaches the plan of a failover request to a failover_needs_decision problem (contract 0.12.0).
 func (p *Problem) WithPlan(plan any) *Problem {
 	p.Plan = plan

@@ -260,7 +260,7 @@ func (o *Ops) concurrency(ctx context.Context, st transfer.Settings, role string
 	var total, own int
 	err := wrap(o.asService(ctx, "kingres_system", func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `SELECT count(*)::int, count(*) FILTER (WHERE created_by = $1)::int FROM kingres_cp.task
-			WHERE kind IN ('table.export', 'table.import') AND state IN ('pending', 'running', 'paused')`, role).Scan(&total, &own)
+			WHERE kind IN ('table.export', 'table.import', 'database.export', 'archive.validate') AND state IN ('pending', 'running', 'paused')`, role).Scan(&total, &own)
 	}))
 	if err != nil {
 		return err

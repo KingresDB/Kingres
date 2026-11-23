@@ -68,11 +68,43 @@ func (s *Server) importTable(c *call, w http.ResponseWriter, r *http.Request) er
 	return nil
 }
 
-// exportDatabase and validateDatabaseArchive (contract 0.40.0) answer 501 until the operations behind them are built.
+// exportDatabase starts the task database.export (contract 0.40.0). The audit event names the database and the options as chosen; never a table name from
+// the request, a value or SQL.
 func (s *Server) exportDatabase(c *call, w http.ResponseWriter, r *http.Request) error {
-	return problem.New(problem.UnsupportedOp, "Database export is not available yet.")
+	o, err := s.needOps()
+	if err != nil {
+		return err
+	}
+	db := r.PathValue("databaseName")
+	var req api.ExportDatabaseRequest
+	if err := s.bodyClosed(w, r, &req); err != nil {
+		return err
+	}
+	t, err := o.StartDatabaseExport(r.Context(), c.session.Username, db, req)
+	if err != nil {
+		return s.taskProblem(r, err)
+	}
+	mode := req.DataMode
+	if mode == "" {
+		mode = "all"
+	}
+	c.addDetails(map[string]any{"database": db, "dataMode": mode, "excludedTables": len(req.ExcludeTables), "acknowledgeLargeObjectsLost": req.AcknowledgeLargeObjectsLost, "taskId": t.ID})
+	s.accepted(w, r, t)
+	return nil
 }
 
+// validateDatabaseArchive starts the task archive.validate (contract 0.40.0).
 func (s *Server) validateDatabaseArchive(c *call, w http.ResponseWriter, r *http.Request) error {
-	return problem.New(problem.UnsupportedOp, "Archive validation is not available yet.")
+	o, err := s.needOps()
+	if err != nil {
+		return err
+	}
+	id := r.PathValue("uploadId")
+	t, err := o.StartArchiveValidate(r.Context(), c.session.Username, id)
+	if err != nil {
+		return s.taskProblem(r, err)
+	}
+	c.addDetails(map[string]any{"uploadId": id, "taskId": t.ID})
+	s.accepted(w, r, t)
+	return nil
 }

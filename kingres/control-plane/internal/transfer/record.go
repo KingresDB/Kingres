@@ -200,7 +200,7 @@ func (rs Records) Apply(ctx context.Context, id int64, u Update) error {
 			state = coalesce($2, state), size_bytes = coalesce($3, size_bytes), reserved_bytes = coalesce($4, reserved_bytes),
 			sha256 = coalesce($5, sha256), format = coalesce($6, format), report = coalesce($7, report),
 			key_id = coalesce($8, key_id), wrapped_key = coalesce($9, wrapped_key), expires_at = coalesce($10, expires_at),
-			task_id = coalesce($11, task_id), archive_state = coalesce($14, archive_state),
+			task_id = coalesce($11, task_id), archive_state = CASE WHEN $14::text = '' THEN NULL ELSE coalesce($14::text, archive_state) END,
 			updated_at = CASE WHEN $12 THEN now() ELSE updated_at END,
 			downloaded_at = CASE WHEN $13 THEN now() ELSE downloaded_at END
 			WHERE transfer_id = $1 AND state <> 'deleted'`,

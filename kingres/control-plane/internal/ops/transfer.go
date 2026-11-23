@@ -60,6 +60,10 @@ type TransferConfig struct {
 	Now func() time.Time
 	// Audit writes a system event (dataTransfer.completed, dataTransfer.purged); nil: none.
 	Audit func(ctx context.Context, action string, details map[string]any)
+	// PGBinDir is the directory of the PostgreSQL programs of the instance (pg_dump of the database export is run from it, never from PATH); KingresVersion
+	// is the version that an archive names in its manifest.
+	PGBinDir       string
+	KingresVersion string
 }
 
 type xferState struct {

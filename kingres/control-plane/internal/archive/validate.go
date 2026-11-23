@@ -39,6 +39,9 @@ type Limits struct {
 	MaxImportBytes int64 // the sum of the declared sizes of the entries; default 100 GiB
 	MaxEntries     int   // default MaxEntries
 	SQL            SQLChecker
+	// SQLFor, when set, makes the checker of the SQL files from the catalog document (which is read before them): the shape grammar needs to know which
+	// tables inherit. It is used instead of SQL.
+	SQLFor func(cat *Catalog) SQLChecker
 }
 
 // EntryFact is what the validator found out about one entry.
@@ -173,10 +176,14 @@ func Validate(ra io.ReaderAt, size int64, lim Limits) (*Result, error) {
 				if e.usize > MaxSQLBytes {
 					return invalid("sql_size", e.name, "an SQL file is larger than %d bytes", MaxSQLBytes)
 				}
-				if lim.SQL == nil {
+				check := lim.SQL
+				if lim.SQLFor != nil && cat != nil {
+					check = lim.SQLFor(cat)
+				}
+				if check == nil {
 					return nil
 				}
-				sr, err := lim.SQL(e.name, r)
+				sr, err := check(e.name, r)
 				if err != nil {
 					herr = err
 					return nil

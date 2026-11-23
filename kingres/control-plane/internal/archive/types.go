@@ -285,3 +285,9 @@ var closedExtensions = map[string]bool{
 	"pgcrypto": true, "uuid-ossp": true, "citext": true, "hstore": true, "pg_trgm": true, "btree_gin": true, "btree_gist": true,
 	"ltree": true, "unaccent": true, "fuzzystrmatch": true, "plpgsql": true,
 }
+
+// NewInvalid makes an archive_invalid error with one reason, for the callers that check a part of an archive (the SQL files).
+func NewInvalid(code, object, msg string) *Error { return invalid(code, object, "%s", msg) }
+
+// AllowedExtension reports whether an archive may name the extension (the closed list of the import, design step 5).
+func AllowedExtension(name string) bool { return closedExtensions[name] }
