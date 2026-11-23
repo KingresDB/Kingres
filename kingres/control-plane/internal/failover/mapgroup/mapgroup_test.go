@@ -51,6 +51,9 @@ type world struct {
 	facts                     failover.GroupFacts
 	nodes                     []failover.Node
 	noCA                      bool
+	plannedPins               []*journal.Pin
+	plannedDL                 [][]byte
+	fenceRefusals             int // the fence lease is refused this many times (the old leader still holds it)
 }
 
 func newWorld() *world {
@@ -145,6 +148,10 @@ func (p ports) Lease(_ context.Context, s string, r failover.LeaseRequest) (fail
 		return failover.LeaseAnswer{Transferred: true, Holder: r.TransferTo}, nil
 	default:
 		p.w.rec("lease-%s %s", r.Role, s)
+		if r.Role == failover.LeaseFence && p.w.fenceRefusals > 0 {
+			p.w.fenceRefusals--
+			return failover.LeaseAnswer{Held: false, WaitMs: 9000, RefusedBy: map[string]string{"s2": "s1", "s3": "s1"}}, nil
+		}
 		if r.Role == failover.LeaseHolder && p.w.onHolderLease != nil {
 			return p.w.onHolderLease()
 		}
@@ -672,8 +679,12 @@ func TestAPlannedRequestNeedsALiveOldServer(t *testing.T) {
 	}
 }
 
-func (p ports) RecordPlanned(_ context.Context, taskID, termAfter, timeline int64) error {
+func (p ports) RecordPlanned(_ context.Context, taskID, termAfter, timeline int64, pin *journal.Pin, dl []byte) error {
 	p.w.rec("record-planned %d term=%d timeline=%d", taskID, termAfter, timeline)
+	p.w.mu.Lock()
+	p.w.plannedPins = append(p.w.plannedPins, pin)
+	p.w.plannedDL = append(p.w.plannedDL, dl)
+	p.w.mu.Unlock()
 	return nil
 }
 

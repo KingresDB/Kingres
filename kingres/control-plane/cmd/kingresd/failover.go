@@ -879,23 +879,48 @@ func handleFailoverDemote(ctx context.Context, d *haDeps, body []byte) (any, err
 	if !ok {
 		return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "not_primary", Message: "This server runs no primary of the shard group."}
 	}
-	// No more renewals, and the marker that keeps the primary from starting here again, before anything is stopped.
-	if err := d.LeaseMgr.Relinquish(r.Group); err != nil {
+	return fencedStop(ctx, d.Svc.Manager(), d.LeaseMgr, d.Log, li.ID, r)
+}
+
+// The parts of the instance manager and of the lease manager that the fenced stop uses, so that a test can stand in for them.
+type immediateManager interface {
+	StopImmediate(ctx context.Context, id int) error
+	Running(ctx context.Context, id int) (bool, error)
+}
+
+type fenceLeases interface {
+	RecordCandidate(group int32, server string) error
+	Relinquish(group int32) error
+	Transfer(ctx context.Context, group int32, to string) (lease.TransferResult, error)
+}
+
+// fencedStop is the immediate stop of a failover (mode immediate): the old primary is fenced in this order, each part before the next. (1) A hard failover of the
+// map group of a live leader's server names the server the group is handed to (as the clean stop does, F7-01), so that the hold the marker makes is ended later only on
+// that server's word. (2) The renewal of the lease ends and the marker that keeps the primary from starting here again is written, before anything is stopped. (3) The
+// instance is stopped with an immediate shutdown. (4) Only when it is seen stopped is the lease handed to the server the call names: a primary that is still running
+// keeps a lease that is no longer renewed, which runs out and takes the primary with it (the watchdog), and nobody else holds it before that.
+func fencedStop(ctx context.Context, mgr immediateManager, lm fenceLeases, log *slog.Logger, id int, r failover.DemoteRequest) (any, error) {
+	if r.Group == 0 && r.Candidate != "" {
+		if err := lm.RecordCandidate(0, r.Candidate); err != nil {
+			return nil, err
+		}
+	}
+	if err := lm.Relinquish(r.Group); err != nil {
 		return nil, err
 	}
 	out := failover.DemoteAnswer{}
 	stopCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
-	if err := d.Svc.Manager().StopImmediate(stopCtx, li.ID); err != nil {
-		d.Log.Warn("failover: stopping the old primary", "group", r.Group, "instance", li.ID, "error", err)
+	if err := mgr.StopImmediate(stopCtx, id); err != nil {
+		log.Warn("failover: stopping the old primary", "group", r.Group, "instance", id, "error", err)
 	}
-	running, err := d.Svc.Manager().Running(ctx, li.ID)
+	running, err := mgr.Running(ctx, id)
 	out.Stopped = err == nil && !running
 	if out.Stopped && r.TransferTo != "" {
-		res, terr := d.LeaseMgr.Transfer(ctx, r.Group, r.TransferTo)
+		res, terr := lm.Transfer(ctx, r.Group, r.TransferTo)
 		out.Transferred = terr == nil && res.Granted >= res.Need
 		if terr != nil {
-			d.Log.Warn("failover: the lease was not handed over; it runs out by itself", "group", r.Group, "error", terr)
+			log.Warn("failover: the lease was not handed over; it runs out by itself", "group", r.Group, "error", terr)
 		}
 	}
 	return out, nil

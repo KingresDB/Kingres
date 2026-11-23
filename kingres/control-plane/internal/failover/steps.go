@@ -327,7 +327,8 @@ func runRowOf(ctx context.Context, rows Rows, in Input, group int32) (RunRow, er
 	// The term the destructive calls of this group expect is the one the run read at its start, raised by the groups of
 	// this run that were promoted before it: each promote_node raises it by one, and the run itself did it. Without this
 	// the second group of a server that hosted two primaries met its own run's term and ended "superseded".
-	for _, g := range in.Groups {
+	// The groups are taken in the order they run (the map group is last in a switchover and in a hard failover of a live leader's server).
+	for _, g := range mapLast(in) {
 		if g == group {
 			break
 		}
@@ -337,7 +338,7 @@ func runRowOf(ctx context.Context, rows Rows, in Input, group int32) (RunRow, er
 	}
 	// The map group of a planned switchover is promoted by the bootstrap of the candidate, which raised the term; the new leader's engine runs the steps
 	// that were not recorded with the term its row says (RecordPlanned).
-	if group == 0 && in.graceful() {
+	if group == 0 && (in.graceful() || in.MapLive) {
 		if gr, found, gerr := rows.Group(ctx, 0); gerr == nil && found && gr.TermAfter != nil && *gr.TermAfter > run.ExpectedTerm {
 			run.ExpectedTerm = *gr.TermAfter
 		}
@@ -395,10 +396,14 @@ func (r *Runner) Preflight(ctx context.Context, in Input) *Refusal {
 		if !have[g] {
 			return &Refusal{Code: "unprocessable", Status: 422, Message: fmt.Sprintf("Server %s does not run the primary of shard group %d.", in.oldOf(g), g), Group: &g}
 		}
-		if g == 0 && !in.graceful() {
-			// A hard failover of a server whose map group primary answers is not built (design, "the map group with a live old leader"): the bootstrap
-			// takes a server that is not heard, and a planned switchover of the map group is the task's own (mode graceful, restore).
-			return &Refusal{Code: "unsupported_operation", Status: 422, Message: "The failover of the map group while its server is alive is not supported yet; use mode graceful (a planned switchover), or the documented SQL of the sharding extension.", Group: &g}
+		if g == 0 && !in.graceful() && !in.MapLive {
+			// Only a request that was resolved here for a live leader's server (MapLive) takes the map group in mode hard; a task that is not one (an
+			// automatic failover of the leader's server, which the bootstrap handles when the server is not heard) has no way to hand the map group over.
+			return &Refusal{Code: "unsupported_operation", Status: 422, Message: "The failover of the map group while its server is alive is asked of the manager leader with mode hard or graceful; this task cannot do it.", Group: &g}
+		}
+		if g == 0 && in.MapLive && in.oldOf(0) != r.Plan.Self() {
+			return &Refusal{Code: "unsupported_operation", Status: 422, Group: &g,
+				Message: "The map group is failed over by the task that runs on the server of its primary (the manager leader); ask the leader."}
 		}
 	}
 	if len(in.Groups) == 0 {
@@ -688,6 +693,9 @@ func (r *Runner) stopOld(ctx context.Context, env *task.Env, sc *stepCtx) error 
 	if err != nil {
 		return err
 	}
+	if sc.group == 0 && sc.in.MapLive {
+		return r.stopOldMap(ctx, env, sc, run)
+	}
 	if err := sc.ensureFrozen(ctx); err != nil {
 		return err
 	}
@@ -742,7 +750,7 @@ func (r *Runner) takeFence(ctx context.Context, env *task.Env, sc *stepCtx) erro
 	if err != nil {
 		return err
 	}
-	if sc.in.graceful() && sc.group == 0 {
+	if sc.mapHandedOverByTheCandidate() {
 		if nw, _, perr := sc.pinnedStandby(ctx); perr == nil {
 			if handed, herr := sc.mapHandedOver(ctx, nw); herr != nil {
 				return herr
@@ -874,6 +882,17 @@ func (r *Runner) readPositions(ctx context.Context, group int32, recs []StandbyR
 }
 
 func (r *Runner) choose(ctx context.Context, env *task.Env, sc *stepCtx) error {
+	if sc.group == 0 && sc.in.MapLive {
+		// The standby of the map group of a live leader's server was ranked and pinned by the bootstrap after the stop (the row of the task has the pin since
+		// B7): this step runs on the new leader and has nothing left to choose once the standby is promoted.
+		if nw, _, perr := sc.pinnedStandby(ctx); perr == nil {
+			if handed, herr := sc.mapHandedOver(ctx, nw); herr != nil {
+				return herr
+			} else if handed {
+				return task.Skip("the map group was handed over already")
+			}
+		}
+	}
 	if err := sc.ensureFrozen(ctx); err != nil {
 		return err
 	}
@@ -1459,7 +1478,7 @@ func (r *Runner) checkCatalog(ctx context.Context, env *task.Env, sc *stepCtx) e
 			before := int64(0) // the term before is known for the system catalog only
 			if t.db == SystemDB {
 				before = run.ExpectedTerm
-				if sc.group == 0 && sc.in.graceful() {
+				if sc.mapHandedOverByTheCandidate() {
 					// The term of the map group's own promotion is what the run row says after it (runRowOf): the term before it is the one the run began with.
 					if raw, ok, rerr := sc.rows.Run(ctx); rerr == nil && ok {
 						before = raw.ExpectedTerm
@@ -1894,7 +1913,7 @@ func (r *Runner) promoteNodePastPromotion(ctx context.Context, sc *stepCtx, nw S
 // answers "not ready" and a task step would wait for it for minutes (peerclient.NotReadyBound), which stops the failover for a server that is not
 // needed any more (the case of the old leader of a planned switchover of the map group that restarted). They wait for OldServerWait and go on. Only the map group of a planned switchover is bounded: there the old leader's instance is the stopped system database.
 func (sc *stepCtx) oldCtx(ctx context.Context) (context.Context, context.CancelFunc) {
-	if sc.group != 0 || !sc.in.graceful() {
+	if sc.group != 0 || !sc.mapHandedOverByTheCandidate() {
 		// Every other group keeps the long wait of a task step: the check that stops an old primary that still runs (the fence of last resort) is reached when the old
 		// server answers late or "not ready", and the lease fences in any case, but the alert and the immediate stop are worth the wait there (F5-10).
 		return ctx, func() {}

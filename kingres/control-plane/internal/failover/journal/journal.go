@@ -87,6 +87,18 @@ type Planned struct {
 	StandbyID    int64  `json:"standbyId"`
 	Checkpoint   string `json:"checkpoint,omitempty"`
 	ClusterState string `json:"clusterState,omitempty"`
+	// Hard is a hard failover of a live leader's server: the old leader is stopped fenced (an immediate stop, its lease handed to this server) and no proof
+	// exists or is waited for; the standby is ranked after the stop, and the loss is judged with Facts, which the old leader read just before the stop.
+	Hard  bool          `json:"hard,omitempty"`
+	Facts *PlannedFacts `json:"facts,omitempty"`
+}
+
+// PlannedFacts are what the old leader knew of the replication of the map group when it stopped (the field names of failover.MapFacts).
+type PlannedFacts struct {
+	SyncStreaming  bool     `json:"syncStreaming"`
+	LastKnownLsn   string   `json:"lastKnownLsn,omitempty"`
+	PrimaryPlanned int      `json:"primaryPlanned"`
+	AsyncDatabases []string `json:"asyncDatabases,omitempty"`
 }
 
 // ErrNewerTerm is returned by Begin when the journal on disk belongs to a bootstrap of a higher term than the one asked for.
@@ -174,6 +186,10 @@ func (s *Store) copyLocked() Journal {
 	}
 	if s.j.Planned != nil {
 		p := *s.j.Planned
+		if p.Facts != nil {
+			f := *p.Facts
+			p.Facts = &f
+		}
 		c.Planned = &p
 	}
 	return c
@@ -346,7 +362,7 @@ func (s *Store) SetPlanned(p Planned) (Journal, error) {
 		return Journal{}, errors.New("journal: no bootstrap is in progress")
 	}
 	if s.j.Planned != nil {
-		if s.j.Planned.TaskID == p.TaskID && s.j.Planned.StandbyID == p.StandbyID {
+		if s.j.Planned.TaskID == p.TaskID && s.j.Planned.StandbyID == p.StandbyID && s.j.Planned.Hard == p.Hard {
 			return s.copyLocked(), nil
 		}
 		return Journal{}, errors.New("journal: the bootstrap serves another planned switchover")
@@ -354,7 +370,7 @@ func (s *Store) SetPlanned(p Planned) (Journal, error) {
 	if s.j.Pin != nil {
 		return Journal{}, errors.New("journal: a standby is pinned already")
 	}
-	s.j.Planned = &Planned{TaskID: p.TaskID, StandbyID: p.StandbyID}
+	s.j.Planned = &Planned{TaskID: p.TaskID, StandbyID: p.StandbyID, Hard: p.Hard, Facts: p.Facts}
 	return s.copyLocked(), s.saveLocked()
 }
 

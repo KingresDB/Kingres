@@ -159,6 +159,11 @@ func (m *mapFailover) Handles(ctx context.Context, server string) bool {
 	if err != nil || primary != server {
 		return false
 	}
+	if m.runner != nil && m.runner.HardInProgress(server) {
+		// A hard failover of a live leader's server that paused here (the loss was not accepted after the stop): the old leader's task cannot take the
+		// repeated request, its system database is the stopped primary, so the bootstrap does.
+		return true
+	}
 	return m.pl.Live(ctx, server) != "live"
 }
 
@@ -414,19 +419,10 @@ func handleMapStart(ctx context.Context, d *haDeps, caller string, body []byte) 
 	} else if b.RequestedBy == "" || b.RequestedBy == "system" {
 		b.RequestedBy = "operator (via " + caller + ")"
 	}
-	// A planned switchover is the old leader's own task: only that server may say so, and it says nothing about data loss (there is none to accept).
 	if b.Planned != nil {
-		if caller != b.Server || b.Planned.TaskID <= 0 || b.Planned.StandbyID <= 0 {
-			return nil, &internalapi.CallError{Status: http.StatusForbidden, Code: "forbidden", Message: "A planned switchover of the map group is started by the task of the old leader, on its own server."}
+		if err := acceptPlanned(mf, caller, &b); err != nil {
+			return nil, err
 		}
-		// A planned switchover that was given up is not started again by the same task: the task could not record its rollback (its rows were in the stopped
-		// instance and its lease ran out), so the engine runs the step again when the old leader is back, and that run must end as a failure instead of
-		// beginning a second switchover (found by the cluster tests of the review of round 2).
-		if cur, ok := mf.journal.Current(); ok && !cur.Abandoned.IsZero() && cur.Planned != nil && cur.Planned.TaskID == b.Planned.TaskID {
-			return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "conflict", Message: "The planned switchover of this task was given up; it is not started again."}
-		}
-		b.Planned.Checkpoint, b.Planned.ClusterState = "", ""
-		b.AllowDataLoss = false
 	}
 	if err := mf.begin(ctx, b); err != nil {
 		var p *problem.Problem
@@ -958,16 +954,36 @@ func handleMapProof(_ context.Context, d *haDeps, caller string, body []byte) (a
 
 // RecordPlanned marks the group 0 row of the old leader's task promoted, with the term after the promotion and the timeline, in the system database that
 // this server promoted. The steps of the map group that the new leader's engine runs again read the term from the row (runRowOf).
-func (p *mapPorts) RecordPlanned(ctx context.Context, taskID, termAfter, timeline int64) error {
+func (p *mapPorts) RecordPlanned(ctx context.Context, taskID, termAfter, timeline int64, pin *journal.Pin, dataLoss []byte) error {
 	c, err := p.m.sysConn(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	// A hard failover of a live leader's server pinned its standby after the stop, so the row has none yet: the pin is written only into a row that has none
+	// (a switchover pinned in its task, and keeps its own).
+	var chosen *int64
+	var node *int32
+	var server *string
+	if pin != nil {
+		chosen, node, server = &pin.StandbyID, ptrInt32(pin.Node), &pin.Server
+	}
 	_, err = c.Exec(ctx, `UPDATE kingres_cp.failover_group
-		SET state = 'promoted', term_after = $2, timeline = CASE WHEN $3 > 0 THEN $3 ELSE timeline END, promoted_at = COALESCE(promoted_at, now())
-		WHERE task_id = $1 AND group_id = 0 AND state IN ('pending', 'frozen', 'fenced', 'pinned', 'promoted')`, taskID, termAfter, timeline)
+		SET state = 'promoted', term_after = $2, timeline = CASE WHEN $3 > 0 THEN $3 ELSE timeline END, promoted_at = COALESCE(promoted_at, now()),
+		    chosen_standby_id = COALESCE(chosen_standby_id, $4), new_server = COALESCE(new_server, $5), new_node_id = COALESCE(new_node_id, $6::int),
+		    data_loss = CASE WHEN chosen_standby_id IS NULL AND $7::jsonb IS NOT NULL THEN $7::jsonb ELSE data_loss END
+		WHERE task_id = $1 AND group_id = 0 AND state IN ('pending', 'frozen', 'fenced', 'pinned', 'promoted')`, taskID, termAfter, timeline, chosen, server, node, nullJSON(dataLoss))
 	return err
+}
+
+func ptrInt32(v int32) *int32 { return &v }
+
+// nullJSON is a JSON value for a jsonb parameter, or nil (SQL NULL) for none.
+func nullJSON(b []byte) any {
+	if len(b) == 0 {
+		return nil
+	}
+	return string(b)
 }
 
 // mapStartSigned is the body of POST /failover/map/start that a member sends for a request of an operator (F4-05): the request exactly as it was signed,
@@ -1180,4 +1196,25 @@ func (p *mapPorts) ResumeOldLeader(ctx context.Context, oldServer string) error 
 	}
 	_, err := p.m.resumeOldLeader(ctx, oldServer)
 	return err
+}
+
+// acceptPlanned checks and normalises the request of the old leader's own task (a planned switchover, or a hard failover of a live leader's server). Only that
+// server may say so. A planned switchover says nothing about data loss (there is none to accept); a hard failover carries the acceptance of the operator whose
+// request the leader checked, and the facts of the leader's last check before the stop.
+func acceptPlanned(mf *mapFailover, caller string, b *mapStartBody) error {
+	if caller != b.Server || b.Planned.TaskID <= 0 || b.Planned.StandbyID <= 0 {
+		return &internalapi.CallError{Status: http.StatusForbidden, Code: "forbidden", Message: "A planned switchover of the map group is started by the task of the old leader, on its own server."}
+	}
+	// A planned switchover that was given up is not started again by the same task: the task could not record its rollback (its rows were in the stopped
+	// instance and its lease ran out), so the engine runs the step again when the old leader is back, and that run must end as a failure instead of
+	// beginning a second switchover (found by the cluster tests of the review of round 2).
+	if cur, ok := mf.journal.Current(); ok && !cur.Abandoned.IsZero() && cur.Planned != nil && cur.Planned.TaskID == b.Planned.TaskID {
+		return &internalapi.CallError{Status: http.StatusConflict, Code: "conflict", Message: "The planned switchover of this task was given up; it is not started again."}
+	}
+	b.Planned.Checkpoint, b.Planned.ClusterState = "", ""
+	if !b.Planned.Hard {
+		b.AllowDataLoss = false
+		b.Planned.Facts = nil
+	}
+	return nil
 }
