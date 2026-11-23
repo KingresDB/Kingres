@@ -781,7 +781,7 @@ export interface paths {
          *     task, and no other rebalance or change of the servers can run meanwhile.
          *
          *     Refused before a task exists: 404 for an unknown server; 409 `last_server`; 409 `no_receiving_server` (no other server runs a
-         *     primary and should hold shards); 409 `server_hosts_map_group` (this revision does not hand the map group over: fail it over first, "not built yet");
+         *     primary and should hold shards); 409 `server_hosts_map_group` (the server runs the primary of the map group and no other server runs a standby of it, so the map group cannot be handed over);
          *     409 `replicas_cannot_be_kept` (fewer servers than `replicaCount + 1` would remain; `acceptFewerReplicas` overrides); 409
          *     `group_degraded` (a group of the server has fewer healthy standbys than the replica count); 409 `rebalance_in_progress` and
          *     `operation_in_progress`; 422 `node_state_invalid` for a `dead` server; 422 `unprocessable` when the server holds ordinary
@@ -789,7 +789,11 @@ export interface paths {
          *     relocated by the step `Relocate the standbys hosted on the server`: the server is taken out of the ring of the standbys, the reconcile of the standbys
          *     places the replacements on the other servers before it removes the old ones, and the step waits until none is left (the groups are listed by
          *     `previewServerDrain`, `standbyShardGroupIds`); when another server cannot take them the task fails with `replicas_cannot_be_kept` unless `acceptFewerReplicas`.
-         *     A server that runs the primary of the map group is refused (this revision has no hand-over of the map group). Needs `kingres_ops`.
+         *     A server that runs the primary of the map group (the manager leader) is drained too (0.21.0): once the buckets have moved, the step `Hand over the map group`
+         *     pauses the task, asks for a planned switchover of shard group 0 (`failoverServer`, mode `graceful`) to a standby on another server, and the drain goes on under the
+         *     new manager leader when the switchover has ended. The task is paused meanwhile (`getRebalanceStatus` shows `stopped`, `stoppedBy` `safetyRule`) and keeps its id. A switchover
+         *     that is refused or rolled back fails the task with the code of the refusal, or `server_hosts_map_group` when the server still runs the map group; the server stays `draining`
+         *     and the drain can be started again. Needs `kingres_ops`.
          */
         post: operations["drainServer"];
         delete?: never;
@@ -7455,7 +7459,7 @@ export interface components {
                 at: string;
                 /** @description `started` a run was started; `nothingToDo` the placement is balanced or a run is under way; `blocked` a rule stopped it (see `blockedBy`); `settling` the imbalance is too young or too soon after a change. Clients must tolerate other values. */
                 outcome: string;
-                /** @description The rules that held it back: `window`, `failover`, `groupDegraded`, `groupUnavailable`, `servers`, `moveFailed`, `consistency`, `operatorStopped`, `running`. */
+                /** @description The rules that held it back: `window`, `failover`, `groupDegraded` (a group has fewer healthy standbys than the replica count, or a standby is behind its primary by more than `maxStandbyLagBytes`, 0.21.0), `groupUnavailable`, `servers`, `moveFailed`, `consistency`, `operatorStopped`, `running`. */
                 blockedBy: string[];
             } | null;
         };
