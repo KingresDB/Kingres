@@ -7,6 +7,45 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-23: phase 10 closed in the control plane: the drain hands the map group over, and the automatic mode waits for a standby that lags
+
+### What was done
+
+Branch `p10-drain4` (from the staging branch g16). The two open items of phase 10 ([design section 23](design/shard-phase10.md)):
+
+- **Drain step 4, the hand-over of the map group** (`internal/rebalance/handover.go`, `cmd/kingresd/drain_maphandover.go`). `drainServer` no longer refuses the server that runs the map group primary when another server runs a standby of it. A planned switchover is refused while a rebalance runs
+  (migration 0009), so the new step `Hand over the map group` pauses the drain task, a goroutine asks for the planned switchover of group 0 (`failover.Service.Start`, graceful), and the job `RunDrainWatch` of the new manager leader resumes the drain when the switchover has ended (marker `drain.mapHandover`
+  in `kingres_cp.cluster_setting`). A refused or rolled-back switchover fails the task with its code; the server stays draining. The reconcile of the standbys (step 5) leaves the former primary of group 0 in the ring until it is a ready standby (`cmd/kingresd/drain_standbys.go`):
+  the first cluster run showed that a former primary that is still being rebuilt cannot be removed, and the step waited for the whole bound.
+- **The standby-lag rule of the automatic mode** (`automatic.go`, `pg.go`). The rule "group without a healthy standby" also holds for a standby behind its primary by more than `maxStandbyLagBytes` (default 64 MiB), read on the primary of each group (`pg_stat_replication`); a primary that cannot be asked counts as lagging.
+- Contract text only, placeholder revision **0.21.0**: `drainServer` description, `blockedBy` description, API README changelog, `check-contract.mjs`, the two texts in `web/src/api/schema.d.ts` (by hand).
+- Documents: `control-plane/README.md` (drain, automatic mode, tests), `docs/design/shard-phase10.md` section 23, this entry.
+- Commits: see `git log p10-drain4` (code and tests, contract, documents).
+
+### How it was verified
+
+- Unit tests (`go test ./internal/rebalance ./internal/ops ./internal/failover ./internal/contract`): `handover_test.go` (decision table, readiness of the marker, refusal of the map group server, the step with an engine over memory: pause, one request, resume, refusal code, rollback, a hook error recorded without its text, no request before the pause), `lag_test.go`.
+- With PostgreSQL (lane l8, private installs, PostgreSQL 18 and 19.0): `handover_pg_test.go` (marker in the system database with the age by the clock of the database, the watch resumes a started or refused hand-over, waits for an unfinished failover, leaves a young marker, another task, a manual rebalance and a server that is not the leader alone, resumes a marker left behind), `lag_pg_test.go` (facts, the setting, an unreadable primary, no standbys wanted, the guard).
+- Cluster tests (`internal/clustertest/phase10_drain4_test.go`, PostgreSQL 18 and 19.0): `TestDrainHandsOverTheMapGroup` (three servers, standbys, writers on another server through the whole drain of the manager leader: the drain ends done under the new leader, the step is done, group 0 is elsewhere, the drained server holds no bucket and no instance, the other servers see every row and every acknowledged write, the failover report is there),
+  `TestDrainWhoseSwitchoverOfTheMapGroupIsGivenUpFailsAndLeavesTheServerDraining` (the candidate cannot promote, the bootstrap is given up: the drain fails with `server_hosts_map_group`, the old leader holds the map group again, the flag stays false, the rebalance lock is free), `TestAutomaticRebalanceWaitsForAStandbyThatLags` (replay paused on the standby of the group that owns the buckets, 8000 rows written, limit 1 MiB: blocked by `groupDegraded`, no run for 15 s, then the replay resumes and the run completes).
+  The existing `TestDrainOnACluster` (its preview of the map group server now says it can be drained) and `TestAutomaticRebalanceOnACluster` pass on both majors.
+- `node kingres/api/scripts/check-contract.mjs`: all rules hold (171 operations, 136 paths). Not run: `npm run api:check` of the console (no `node_modules` in the worktree), so the two hand-edited texts of `schema.d.ts` are unchecked against the generator.
+- Mutants: 18 on the unit and PostgreSQL tests (lag comparison, unreadable lag, rule without the lag, rule without the replica count, a started marker that asks again, a step that does not pause, a request without waiting for the pause, a request twice, a marker that is ready at once, a refusal that ignores the standbys of the map group or the hook, a refusal that is not recorded, markers that are not cleared), all killed (two first versions did not compile and were redone); 2 at cluster level (the hook not wired: the preview and the drain refuse the map group server; the lag rule left out: no block), both killed. The wait for the former primary to be a ready standby was found by a failing cluster run (the drain stood in step 5 until the bound) and has no mutant of its own.
+
+### Decisions and deviations
+
+- The drain stays one task of kind `rebalance` (section 22); the hand-over pauses it instead of running the switchover inside the step, because the database excludes the two (see section 23).
+- The lag rule is part of the automatic mode only; a manual start does not read the lag.
+- The removal of the old leader after its drain was not tried in the cluster test: the first server holds the key of the certificate authority and `removeServer` answers `certificate_authority_unavailable` from another leader (an existing limit, unrelated to the drain).
+
+### Still open
+
+- The manual start of a rebalance does not refuse a lagging group (section 8.3 marks it (M)).
+- The console: the mock of the drain task and the drain dialog do not know the new step or the paused state yet.
+- The number 0.21.0 is a placeholder and must be renumbered when the branch is merged.
+
+---
+
 ## 2026-11-22 (staging branch g15): cp-1011, p13-fix and web-15b merged, contract revisions renumbered
 
 The staging branch g15 (from kingres-18) merges cp-1011, p13-fix and web-15b. The contract revisions are renumbered in merge order so that they follow kingres-18's 0.14.0: the control plane of phases 10 and 11 (written as 0.16.0 in cp-1011) is 0.15.0, and the closing of phase 13 (written as 0.17.0 in p13-fix) is 0.16.0. Entries of this log and the review files that were written on those branches still say 0.16.0 and 0.17.0; read them as 0.15.0 and 0.16.0. The failover branch, which carries an older 0.15.0, is renumbered when it merges. Generated files were regenerated; no migration numbers collide (cp-1011 has 0040 and 0041, p13-fix has none).

@@ -1123,7 +1123,7 @@ Steps:
    implementation: both that a graceful switchover of group 0 is an operation `kingresd`
    exposes, and that a task of the old leader survives it. If not available, `drainServer`
    answers 409 `server_hosts_map_group` for such a server at step 1 and the limit of
-   section 14 stands.
+   section 14 stands. **Built, see section 23:** both hold, with a pause of the drain around the switchover.
 5. `Relocate the standbys hosted here`: for each shard group `g` whose standby instance
    runs on this server (chained placement: this server hosts the standby of the group
    whose primary is on the previous server, and of the one before it when
@@ -1789,7 +1789,7 @@ server drained and not removed.
 
 **Automatic mode (section 8).** The safety rules are the pure function `SafetyBlockers`; an automatic run is paused by `autoGuard` before each move (`stoppedBy: safetyRule`) and resumed by the job when the rules have held for
 `settleSeconds`. The "last topology change" is the newest of `server.joined_at`, the end of a server task and `topology.changedAt`, which `updateServer` writes when it changes the flag or the weight. The disk rule uses the existing
-per-move check (`Disk`); the rules `maxStandbyLagBytes` and the window are settings, the lag rule is not evaluated yet (no lag source in the read model of the leader).
+per-move check (`Disk`); the rules `maxStandbyLagBytes` and the window are settings, the lag rule was not evaluated in this round and is since (section 23: the lag is read on the primary of each group).
 
 **Split (section 9.3).** The preview cannot find a table without a primary key (the owner's tables are not readable from the map group primary); the extension refuses it when `split_bucket` starts and the task fails with
 `split_unsupported`. The task does not wait for the orphans to be dropped (`cleanup_bucket_splits` is the recovery worker's). The size estimate comes from the extension's plan inputs (`internal_plan_inputs('by_disk_size', ...)`).
@@ -1800,7 +1800,7 @@ per-move check (`Disk`); the rules `maxStandbyLagBytes` and the window are setti
   `distribute_schema` twice. The step reads `kingres.schemas` before it calls the function and does nothing when the schema is distributed already, which is the design's own remedy for a retry ("its result is known by reading
   `kingres.dist_schema`"). The function is one two-phase transaction, so after an interruption the schema is either distributed or not, and the read says which. With the mark, a crash of the leader between the call and the record of
   the step would fail a task whose work is done and ask a person to look; without it the task finishes. A call that was cut while still running is refused by the extension as "already distributed" only if the transaction committed, which is the case the read finds first.
-- *Step 5 of the drain (section 11.3, the standbys hosted on the server) is built; step 4 (the map group) is not built yet.* Step 5 is the standby reconcile of phase 5 (`standby.Leader`) with the draining server taken out of its ring
+- *Step 5 of the drain (section 11.3, the standbys hosted on the server) is built; step 4 (the map group) was not built in this round and is built since (section 23).* Step 5 is the standby reconcile of phase 5 (`standby.Leader`) with the draining server taken out of its ring
   (the hook `Excluded`, fed by the cluster setting `drain.excludedServers`, which a return to service clears), then a wait until no `kingres.node` row of role standby is on the server. It has unit tests (`standby/exclusion_test.go`, `rebalance/drain_test.go`)
   and no cluster test yet. Step 4 (the map group) is the planned switchover of the map group of the failover branch
   (the old leader hands the bootstrap to a standby of group 0 on another server, `server.failover` graceful for group 0), after which the drain task continues on the new leader. Until step 4 exists `drainServer` refuses a server that
@@ -1812,3 +1812,27 @@ The step `Split the bucket` is not interruptible by the engine (an interrupted s
 (b) the request came too late (the extension refused it, or accepted it and the split completed all the same): the task records in its detail "The cancel request came too late: the split had passed its backfill and goes on to its end", **goes on and ends `done`** (the step `Check the new buckets` runs), and the bucket list shows the children. A task is therefore never `cancelled` while the split completes.
 The cancel guard of the kind (`splitCancellable`) accepts a cancel until the split step is done or the "too late" note is recorded; a cancel after that is answered 409 `task_not_cancellable`, which is the truthful answer. A split whose session is lost (a restart of `kingresd`) is not touched by a lost lease or a shutdown: the task is taken over, finds the record and settles it with
 `resume_bucket_splits()`. The cluster test of the split shows both cases (the gate `split_after_triggers` for the undo, `split_after_backfill` for the late cancel, which ends done with the children in the bucket list).
+
+## 23. Step 4 of the drain (the hand-over of the map group) and the standby-lag rule, as built (placeholder contract 0.21.0)
+
+**Step 4 is built** (`internal/rebalance/handover.go`); it settles the **[Needs verification]** of section 11.3.
+
+- *A graceful switchover of group 0 is an operation `kingresd` exposes:* `failoverServer` with `mode: graceful` and `shardGroupIds: [0]` on the server that runs the map group primary (failover round 2, contract 0.18.0). The drain calls the same
+  service in the process (`failover.Service.Start`), without a target: the service chooses the standby that streams best.
+- *A task of the old leader survives it:* the task rows are in the system database, which the new leader has as the standby that was promoted, so the task can be taken over there. What does not work is a drain that runs while the switchover
+  starts: migration 0009 refuses a failover task while a rebalance is pending or running (`KX002`), and the drain is a rebalance (section 22). So the step does not run the switchover inside itself. **Decision:** the step writes a marker
+  (cluster setting `drain.mapHandover`: task id, server, state), records the run as stopped by `safetyRule` and pauses the task (a paused rebalance does not exclude a failover); a goroutine waits for the pause, asks for the switchover and
+  records `started` or `refused` with the problem; the job `RunDrainWatch` on the manager leader resumes the paused drain when the marker says so and no failover task is unfinished (the database refuses the resume while one is, which is the wait).
+  The step runs again from its start: a server that no longer runs the primary of group 0 is done; one that still does fails the task (the switchover was refused, rolled back or given up) and the server stays `draining`.
+- *Refusal before a task exists:* `server_hosts_map_group` stays for a server that runs the map group primary when no other server runs an active standby of group 0 (or the build has no switchover). It does not read whether that standby is ready: the
+  switchover refuses with its own code when it is not, and the drain then fails at step 4 with that code (after the buckets have moved, which is the cost of not duplicating the switchover's checks).
+- *Departures from section 11.3:* the order of the steps in the task is the one of section 22 (move, wait until empty, hand over, relocate the standbys, report); the design lists the relocation of the standbys after the hand-over as well. The old
+  leader's former instance of group 0 becomes a standby of group 0 on the drained server; step 5 relocates it like any other standby there. The pause is visible: `getRebalanceStatus` says `stopped` with `stoppedBy: safetyRule` while the
+  switchover runs. A drain whose switchover is a failover task that waits for an operator stays paused until the operator ends that task.
+- *Not covered:* a drain whose server dies during the hand-over (the failover rules take over; the drain stays paused until its marker is resumed, and then fails or ends as above); two drains at once (a rebalance is one task at a time).
+
+**The standby-lag rule is built** (`automatic.go`, `LaggingGroups`, `PG.StandbyLag`): the row "Group without a healthy standby" of section 8.3 also holds for a group whose standby is behind its primary by more than `maxStandbyLagBytes` (default 64 MiB).
+The lag source is the primary of each group (`pg_stat_replication`: the largest `pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)` over the standbys that are connected), read through the map group's connection with the extension's node call, once
+per group per evaluation and once per move (the guard). A lag of exactly the limit is allowed. A primary that cannot be asked counts as lagging (what cannot be shown to be in step is not trusted). A standby that is not connected does not appear in
+`pg_stat_replication` and adds no lag; its absence is the business of the other rules (fewer standbys than the replica count, a server that is not live). The rule uses the name `groupDegraded` (no new name in `blockedBy`) and is part of the
+automatic mode only: a manual start does not read the lag (section 8.3 marks the row (M); the manual start still refuses a group that has no synchronous standby in sync, `CheckMove`). **Open:** the manual start does not refuse a lagging group.
