@@ -22,12 +22,8 @@ import (
 // A test can hold the request at the fault point "drain:handover" (mode "hold") after the marker says requesting, to end the server there.
 func wireMapGroupHandOver(rbs *rebalance.Service, fos *failover.Service, fh *fault.Hook) {
 	rbs.HandOverMapGroup = handOverHook(fos.Unfinished, func(ctx context.Context, actor, server string) error {
-		for fh.FailoverInjection("drain:handover") == "hold" {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(200 * time.Millisecond):
-			}
+		if err := holdAtFault(ctx, fh, "drain:handover"); err != nil {
+			return err
 		}
 		_, _, err := fos.Start(ctx, actor, server, failover.Request{Mode: failover.ModeGraceful, ShardGroupIDs: []int32{0},
 			Comment: "hand over the map group: drain of server " + server})
@@ -47,4 +43,16 @@ func handOverHook(unfinished func(context.Context) (bool, error), start func(ctx
 		}
 		return start(ctx, actor, server)
 	}
+}
+
+// holdAtFault waits while the fault file asks to hold at the point (mode "hold"), and returns when the fault is cleared or ctx ends.
+func holdAtFault(ctx context.Context, fh *fault.Hook, point string) error {
+	for fh.FailoverInjection(point) == "hold" {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	return nil
 }

@@ -444,4 +444,8 @@ func TestDrainWhoseServerDiesWhileTheMapGroupIsHandedOver(t *testing.T) {
 		t.Errorf("a rebalance is refused after the drain ended: %v", p)
 	}
 	t.Logf("the drain ended %v: %v", task["state"], task["error"])
+	// The server is dead: its instances can be neither removed nor rebuilt, so the drain fails at once with the code of a dead server (not after the bound of the wait).
+	if e, _ := task["error"].(map[string]any); task["state"] != "failed" || e == nil || !strings.Contains(fmt.Sprint(e["message"]), "node_state_invalid") {
+		t.Errorf("the drain of a server that died ended %v: %v", task["state"], task["error"])
+	}
 }

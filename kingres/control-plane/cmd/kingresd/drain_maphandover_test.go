@@ -5,9 +5,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fault"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 )
 
@@ -35,5 +40,59 @@ func TestTheHandOverHookRefusesWhileAFailoverIsUnfinished(t *testing.T) {
 		func(context.Context, string, string) error { return problem.New(problem.NoReplicaAvailable, "none") })
 	if err := failing(ctx, "admin", "a"); !errors.As(err, &p) || p.Code != problem.NoReplicaAvailable {
 		t.Fatalf("the refusal of the switchover is passed on: %v", err)
+	}
+}
+
+// The fault point holds the request while the fault file says hold, lets go when it is cleared, ignores another point, and ends with the context.
+func TestTheHoldAtAFaultPointEndsWhenTheFaultIsCleared(t *testing.T) {
+	dir := t.TempDir()
+	fh := fault.New(dir)
+	write := func(s fault.Spec) {
+		b, _ := json.Marshal(s)
+		tmp := filepath.Join(dir, "tmp")
+		if err := os.WriteFile(tmp, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(tmp, filepath.Join(dir, fault.FileName)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx := context.Background()
+	if err := holdAtFault(ctx, fh, "drain:handover"); err != nil {
+		t.Fatalf("no fault: %v", err)
+	}
+	write(fault.Spec{FailoverPoint: "another:point", FailoverMode: "hold"})
+	if err := holdAtFault(ctx, fh, "drain:handover"); err != nil {
+		t.Fatalf("a hold at another point: %v", err)
+	}
+	write(fault.Spec{FailoverPoint: "drain:handover", FailoverMode: "hold"})
+	done := make(chan error, 1)
+	go func() { done <- holdAtFault(ctx, fh, "drain:handover") }()
+	select {
+	case err := <-done:
+		t.Fatalf("the hold ended while the fault is in force: %v", err)
+	case <-time.After(700 * time.Millisecond):
+	}
+	write(fault.Spec{})
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("the hold ended with %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the hold did not end when the fault was cleared")
+	}
+	write(fault.Spec{FailoverPoint: "drain:handover", FailoverMode: "hold"})
+	cctx, cancel := context.WithCancel(ctx)
+	go func() { done <- holdAtFault(cctx, fh, "drain:handover") }()
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("the hold ended with %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the hold did not end with the context")
 	}
 }
