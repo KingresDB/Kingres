@@ -249,13 +249,15 @@ func TestMarkerPlantedInTheRaceWindow(t *testing.T) {
 	defer off()
 	q := xferDB(t, e, "db_race")
 	q("create table if not exists public.rw_t (id int)")
+	// A sequence is the evidence that survives the rollback of the import: a role made by the trigger would be rolled back with it.
+	q("create sequence if not exists public.rw_seq")
 	uid := e.uploadFile(t, []byte("1\n"))
 	ops.ImportFault = func(p string, _ uint32) error {
 		if p == "beforeMarkerCreate" {
 			ops.ImportFault = nil
 			q("create schema kingres_transfer")
 			q("create table kingres_transfer.secret (singleton boolean primary key default true, k bytea not null)")
-			q("create function kingres_transfer.boom() returns trigger language plpgsql as $$ begin create role kg_pwned2 superuser; return new; end $$")
+			q("create function kingres_transfer.boom() returns trigger language plpgsql as $$ begin perform nextval('public.rw_seq'); return new; end $$")
 			q("create trigger boom before insert on kingres_transfer.secret for each row execute function kingres_transfer.boom()")
 		}
 		return nil
@@ -265,11 +267,10 @@ func TestMarkerPlantedInTheRaceWindow(t *testing.T) {
 	if task["state"] != "failed" || taskCode(task) != "forbidden" {
 		t.Errorf("an import with a schema planted in the race window: %v", task["error"])
 	}
-	if got := e.svcRow(t, "postgres", "select count(*) from pg_roles where rolname = 'kg_pwned2'"); got != "0" {
+	if got := e.svcRow(t, "db_race", "select is_called from public.rw_seq"); got != "false" {
 		t.Errorf("the planted trigger ran as the service role: %s", got)
 	}
 	q("drop schema kingres_transfer cascade")
-	e.serviceExec(t, "drop role if exists kg_pwned2")
 }
 
 // DX17-02: a lock on the secret table that a role with write rights on all data can hold ends the load step after the lock timeout, with a retryable code, instead of waiting for ever.
