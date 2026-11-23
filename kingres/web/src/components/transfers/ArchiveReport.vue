@@ -10,14 +10,11 @@ import { computed } from 'vue'
 import SafeName from '@/components/SafeName.vue'
 import type { ArchiveReport } from '@/api/types'
 import { formatBytes, formatNumber } from '@/lib/format'
-import {
-  IMPORT_NOT_AVAILABLE_TEXT,
-  LEDGER_RESTART_TEXT,
-  reportHeadline,
-  TABLE_KINDS,
-} from '@/lib/archive'
+import { IMPORT_HINT_TEXT, LEDGER_RESTART_TEXT, reportHeadline, TABLE_KINDS } from '@/lib/archive'
 
-const props = defineProps<{ report: ArchiveReport }>()
+const props = withDefaults(defineProps<{ report: ArchiveReport; showImportHint?: boolean }>(), {
+  showImportHint: true,
+})
 const kinds = computed(() =>
   Object.entries(props.report.statements?.byKind ?? {}).sort(([a], [b]) => a.localeCompare(b)),
 )
@@ -152,7 +149,7 @@ const refused = computed(() => props.report.statements?.refused ?? [])
       </ul>
     </section>
 
-    <p class="muted" data-testid="report-no-import">{{ IMPORT_NOT_AVAILABLE_TEXT }}</p>
+    <p v-if="showImportHint" class="muted" data-testid="report-no-import">{{ IMPORT_HINT_TEXT }}</p>
   </div>
 </template>
 

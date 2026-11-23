@@ -3,7 +3,7 @@
 <script setup lang="ts">
 // Validate a database archive (contract 0.40.0, a placeholder revision): choose the file, send it with the resumable uploader
 // (purpose `databaseArchive`), follow the task `archive.validate`, and read the report. Nothing is imported and no database is
-// touched. The dialog says so, and says that importing an archive is not available in this version.
+// touched. The dialog says so and points to Import database.
 import { computed, ref, watch } from 'vue'
 import { useQuery } from '@tanstack/vue-query'
 import AppDialog from '@/components/AppDialog.vue'
@@ -18,7 +18,7 @@ import { keys, useClusterSettings } from '@/api/queries'
 import { useSessionStore } from '@/stores/session'
 import { useTaskAction } from '@/composables/useTask'
 import { useUpload } from '@/composables/useUpload'
-import { IMPORT_NOT_AVAILABLE_TEXT, isZipName } from '@/lib/archive'
+import { IMPORT_HINT_TEXT, isZipName } from '@/lib/archive'
 import { formatBytes } from '@/lib/format'
 import { findStoredUpload, fingerprintFile } from '@/lib/upload-store'
 
@@ -142,7 +142,7 @@ const busy = computed(() => task.isStarting.value)
         end to end: the shape of the zip file, the checksums of every entry, the manifest and the
         catalog, the versions, and every statement of its SQL.
         <strong>No database is touched</strong> and nothing is imported.
-        {{ IMPORT_NOT_AVAILABLE_TEXT }}
+        {{ IMPORT_HINT_TEXT }}
       </p>
       <label class="field">
         <span>Archive file</span>
