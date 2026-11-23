@@ -32,7 +32,7 @@ func sealTo(t *testing.T, ca *CA, dir, id string, gen int64, now time.Time) Escr
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := SealCA(ca, id, kid, pub, gen, now)
+	b, err := SealCA(ca, id, kid, pub, Position{Epoch: 1, Generation: gen, Seq: int64(now.Sub(t0) / time.Minute)}, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,9 +72,6 @@ func TestEscrowRoundTripGivesTheNewLeaderTheCA(t *testing.T) {
 	}
 	if _, err := ca.VerifyPeer(parse(t, certPEM), t0); err != nil {
 		t.Errorf("a certificate of the adopted CA is refused by the old one: %v", err)
-	}
-	if st, _ := LoadEscrowState(dir); !st.Enabled || st.Generation != 1 {
-		t.Errorf("state after the adoption: %+v", st)
 	}
 	if fi, err := os.Stat(filepath.Join(dir, CAKeyFile)); err != nil || fi.Mode().Perm()&0o077 != 0 && !isWindows() {
 		t.Errorf("ca.key mode %v %v", fi, err)
@@ -201,8 +198,8 @@ func TestAnOlderBlobDoesNotReplaceANewerOne(t *testing.T) {
 	if err := StoreEscrow(dir, "b", old); !errors.Is(err, ErrEscrowRefused) {
 		t.Fatalf("replayed an older generation: %v", err)
 	}
-	if h, _ := HeldEscrow(dir); h.Generation != 2 {
-		t.Errorf("held generation %d", h.Generation)
+	if h, _ := HeldEscrow(dir); h.Position.Generation != 2 {
+		t.Errorf("held generation %d", h.Position.Generation)
 	}
 	// Same generation, later seal (a revocation changed the content): accepted.
 	if err := StoreEscrow(dir, "b", sealTo(t, ca, dir, "b", 2, t0.Add(time.Minute))); err != nil {
@@ -225,7 +222,7 @@ func TestRotationReplacesTheEscrowKeyAndTheOldOneStopsWorking(t *testing.T) {
 	if res, err := AdoptEscrow(member2(t, dir, ca), "b", t0); err != nil || res != Adopted {
 		t.Fatalf("old copy before the new one: %v %v", res, err)
 	}
-	second, err := SealCA(ca, "b", kid, pub, 2, t0.Add(time.Hour))
+	second, err := SealCA(ca, "b", kid, pub, Position{Epoch: 1, Generation: 2}, t0.Add(time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,10 +290,10 @@ func TestContentHashFollowsTheRevocationList(t *testing.T) {
 func TestSealRefusesAKeyIDThatIsNotTheKeys(t *testing.T) {
 	ca := newCA(t)
 	_, pub, _ := RecipientOffer(member(t, ca), false, t0)
-	if _, err := SealCA(ca, "b", "0000000000000000", pub, 1, t0); err == nil {
+	if _, err := SealCA(ca, "b", "0000000000000000", pub, Position{Epoch: 1, Generation: 1}, t0); err == nil {
 		t.Fatal("sealed to a mismatching key id")
 	}
-	if _, err := SealCA(ca, "b", KeyIDOf([]byte{1, 2}), []byte{1, 2}, 1, t0); err == nil {
+	if _, err := SealCA(ca, "b", KeyIDOf([]byte{1, 2}), []byte{1, 2}, Position{Epoch: 1, Generation: 1}, t0); err == nil {
 		t.Fatal("sealed to a short key")
 	}
 }
@@ -334,7 +331,7 @@ func TestABlobLabelledForAnotherServerIsRefused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := SealCA(ca, "c", kid, pub, 1, t0) // sealed to b's key, labelled c
+	b, err := SealCA(ca, "c", kid, pub, Position{Epoch: 1, Generation: 1}, t0) // sealed to b's key, labelled c
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -25,6 +25,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -32,7 +33,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -48,7 +51,7 @@ const (
 
 	recipientKeyPrefix = "recipient-"
 	recipientKeySuffix = ".key"
-	escrowVersion      = 1
+	escrowVersion      = 2
 	escrowInfo         = "kingres ca escrow v1"
 )
 
@@ -68,6 +71,8 @@ type EscrowBlob struct {
 	KeyID         string    `json:"keyId"`
 	CAFingerprint string    `json:"caFingerprint"`
 	Generation    int64     `json:"generation"`
+	Epoch         int64     `json:"epoch"`
+	Seq           int64     `json:"seq"`
 	SealedAt      time.Time `json:"sealedAt"`
 	Ephemeral     []byte    `json:"ephemeral"`
 	Ciphertext    []byte    `json:"ciphertext"` // nonce, then the sealed content
@@ -84,9 +89,41 @@ type revokedDoc struct {
 	CRL     int64                `json:"crlNumber"`
 }
 
-// aad is the authenticated header of a blob.
+// Position orders the copies of a recipient: the epoch of the leader that sealed it (it rises at every change of leader), the
+// generation (it rises at every switching on and every rotation) and a counter of the seals of that leader. The wall clock
+// orders nothing, so a leader whose clock is behind is not refused, and a former leader is (its epoch is lower).
+type Position struct{ Epoch, Generation, Seq int64 }
+
+// Less says whether p comes before q.
+func (p Position) Less(q Position) bool {
+	if p.Epoch != q.Epoch {
+		return p.Epoch < q.Epoch
+	}
+	if p.Generation != q.Generation {
+		return p.Generation < q.Generation
+	}
+	return p.Seq < q.Seq
+}
+
+// Position is the place of the blob in the order of the copies.
+func (b EscrowBlob) Position() Position { return Position{b.Epoch, b.Generation, b.Seq} }
+
+// aad is the authenticated header of a blob: every field is length-prefixed, so no value can shift into another.
 func (b EscrowBlob) aad() []byte {
-	return []byte(fmt.Sprintf("%s|%d|%s|%s|%s|%d|%d", escrowInfo, b.Version, b.ServerID, b.KeyID, b.CAFingerprint, b.Generation, b.SealedAt.UnixNano()))
+	var out []byte
+	put := func(s string) {
+		var n [4]byte
+		binary.BigEndian.PutUint32(n[:], uint32(len(s)))
+		out = append(append(out, n[:]...), s...)
+	}
+	put(escrowInfo)
+	for _, v := range []int64{int64(b.Version), b.Generation, b.Epoch, b.Seq, b.SealedAt.UnixNano()} {
+		put(strconv.FormatInt(v, 10))
+	}
+	put(b.ServerID)
+	put(b.KeyID)
+	put(b.CAFingerprint)
+	return out
 }
 
 // KeyIDOf is the identifier of a recipient's public key: the first 8 bytes of its SHA-256, in hex.
@@ -146,6 +183,11 @@ func readRecipientKeys(pkiDir string) (map[string]recipientKeyFile, error) {
 		n := e.Name()
 		if !strings.HasPrefix(n, recipientKeyPrefix) || !strings.HasSuffix(n, recipientKeySuffix) {
 			continue
+		}
+		if fi, err := os.Stat(filepath.Join(escrowDir(pkiDir), n)); err != nil {
+			return nil, err
+		} else if runtime.GOOS != "windows" && fi.Mode().Perm()&0o077 != 0 {
+			return nil, fmt.Errorf("pki: the escrow key file %s has mode %v; it must not be readable by others (0600)", n, fi.Mode().Perm())
 		}
 		b, err := os.ReadFile(filepath.Join(escrowDir(pkiDir), n)) //nolint:gosec // below the pki directory
 		if err != nil {
@@ -219,13 +261,25 @@ func deriveKey(shared, ephemeral, recipient []byte) ([]byte, error) {
 }
 
 // SealCA seals the CA key and revocation list of ca to the recipient server serverID, whose escrow public key is pub.
-func SealCA(ca *CA, serverID, keyID string, pub []byte, generation int64, now time.Time) (EscrowBlob, error) {
+func SealCA(ca *CA, serverID, keyID string, pub []byte, pos Position, now time.Time) (EscrowBlob, error) {
 	if keyID != KeyIDOf(pub) {
 		return EscrowBlob{}, errors.New("pki: the key id does not belong to the public key")
 	}
+	if _, err := ecdh.X25519().NewPublicKey(pub); err != nil {
+		return EscrowBlob{}, fmt.Errorf("pki: the recipient's escrow key: %w", err)
+	}
+	plain, err := ca.escrowPlain()
+	if err != nil {
+		return EscrowBlob{}, err
+	}
+	return sealPlain(plain, ca.CAFingerprint(), serverID, keyID, pub, pos, now)
+}
+
+// sealPlain seals a content to a recipient (SealCA seals the CA; the tests seal damaged contents).
+func sealPlain(plain []byte, fingerprint, serverID, keyID string, pub []byte, pos Position, now time.Time) (EscrowBlob, error) {
 	rpub, err := ecdh.X25519().NewPublicKey(pub)
 	if err != nil {
-		return EscrowBlob{}, fmt.Errorf("pki: the recipient's escrow key: %w", err)
+		return EscrowBlob{}, err
 	}
 	eph, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
@@ -235,16 +289,13 @@ func SealCA(ca *CA, serverID, keyID string, pub []byte, generation int64, now ti
 	if err != nil {
 		return EscrowBlob{}, err
 	}
-	plain, err := ca.escrowPlain()
-	if err != nil {
-		return EscrowBlob{}, err
-	}
+	defer clear(shared)
 	key, err := deriveKey(shared, eph.PublicKey().Bytes(), pub)
 	if err != nil {
 		return EscrowBlob{}, err
 	}
-	b := EscrowBlob{Version: escrowVersion, ServerID: serverID, KeyID: keyID, CAFingerprint: ca.CAFingerprint(),
-		Generation: generation, SealedAt: now.UTC().Truncate(time.Microsecond), Ephemeral: eph.PublicKey().Bytes()}
+	b := EscrowBlob{Version: escrowVersion, ServerID: serverID, KeyID: keyID, CAFingerprint: fingerprint,
+		Generation: pos.Generation, Epoch: pos.Epoch, Seq: pos.Seq, SealedAt: now.UTC().Truncate(time.Microsecond), Ephemeral: eph.PublicKey().Bytes()}
 	gcm, err := newGCM(key)
 	if err != nil {
 		return EscrowBlob{}, err
@@ -254,6 +305,8 @@ func SealCA(ca *CA, serverID, keyID string, pub []byte, generation int64, now ti
 		return EscrowBlob{}, err
 	}
 	b.Ciphertext = append(nonce, gcm.Seal(nil, nonce, plain, b.aad())...)
+	clear(plain)
+	clear(key)
 	return b, nil
 }
 
@@ -283,6 +336,7 @@ func (b EscrowBlob) open(serverID string, k recipientKeyFile) (escrowPlain, erro
 	if err != nil {
 		return out, ErrEscrowRefused
 	}
+	defer clear(shared)
 	key, err := deriveKey(shared, b.Ephemeral, priv.PublicKey().Bytes())
 	if err != nil {
 		return out, ErrEscrowRefused
@@ -341,9 +395,9 @@ func readBlob(pkiDir string) (EscrowBlob, error) {
 
 // EscrowHeld describes the blob a server holds, without opening it.
 type EscrowHeld struct {
-	KeyID      string
-	Generation int64
-	SealedAt   time.Time
+	KeyID    string
+	Position Position
+	SealedAt time.Time
 }
 
 // HeldEscrow reports the blob of this server (ErrNoEscrow when there is none).
@@ -352,7 +406,7 @@ func HeldEscrow(pkiDir string) (EscrowHeld, error) {
 	if err != nil {
 		return EscrowHeld{}, err
 	}
-	return EscrowHeld{KeyID: b.KeyID, Generation: b.Generation, SealedAt: b.SealedAt}, nil
+	return EscrowHeld{KeyID: b.KeyID, Position: b.Position(), SealedAt: b.SealedAt}, nil
 }
 
 // StoreEscrow checks a blob the leader sent and keeps it. The blob must be for this server and for one of its escrow
@@ -378,10 +432,16 @@ func StoreEscrow(pkiDir, serverID string, b EscrowBlob) error {
 	if _, ok := keyMatchesCert(plain.CAKey, cert); !ok || b.CAFingerprint != Fingerprint(cert.Raw) {
 		return fmt.Errorf("%w: it is not the key of this cluster's CA", ErrEscrowRefused)
 	}
-	if held, err := readBlob(pkiDir); err == nil {
-		if b.Generation < held.Generation || (b.Generation == held.Generation && b.SealedAt.Before(held.SealedAt)) {
-			return fmt.Errorf("%w: older than the copy held", ErrEscrowRefused)
+	var rv revokedDoc
+	if len(plain.Revoked) > 0 {
+		if err := json.Unmarshal(plain.Revoked, &rv); err != nil {
+			return fmt.Errorf("%w: the revocation list in it is not valid", ErrEscrowRefused)
 		}
+	}
+	// A held copy that cannot be read counts as the oldest possible position: it must not make every blob acceptable by
+	// accident, and it must not block a good one.
+	if held, err := readBlob(pkiDir); err == nil && b.Position().Less(held.Position()) {
+		return fmt.Errorf("%w: older than the copy held", ErrEscrowRefused)
 	}
 	raw, err := json.Marshal(b)
 	if err != nil {
@@ -438,8 +498,18 @@ const (
 // of the copy with the list the previous leader last distributed (revoked-serials.json), so that no revocation is lost.
 // A copy that does not open or does not belong to the CA is an error and nothing is written.
 func AdoptEscrow(pkiDir, serverID string, now time.Time) (AdoptResult, error) {
-	if _, err := os.Stat(filepath.Join(pkiDir, CAKeyFile)); err == nil {
+	if valid, err := caKeyUsable(pkiDir); err != nil {
+		return AdoptNone, err
+	} else if valid {
 		return AdoptHeld, nil
+	}
+	// A ca.key that is there but cannot be used (a write that a power failure cut short) is not "key held": it is put aside
+	// and the copy is adopted instead; without a copy the server answers that it has no key and the alert is raised.
+	if _, err := os.Stat(filepath.Join(pkiDir, CAKeyFile)); err == nil {
+		aside := filepath.Join(pkiDir, fmt.Sprintf("%s.unusable-%d", CAKeyFile, now.Unix()))
+		if err := os.Rename(filepath.Join(pkiDir, CAKeyFile), aside); err != nil {
+			return AdoptNone, err
+		}
 	}
 	b, err := readBlob(pkiDir)
 	if errors.Is(err, ErrNoEscrow) {
@@ -448,25 +518,9 @@ func AdoptEscrow(pkiDir, serverID string, now time.Time) (AdoptResult, error) {
 	if err != nil {
 		return AdoptNone, err
 	}
-	keys, err := readRecipientKeys(pkiDir)
+	plain, key, err := openHeld(pkiDir, serverID, b)
 	if err != nil {
 		return AdoptNone, err
-	}
-	k, ok := keys[b.KeyID]
-	if !ok {
-		return AdoptNone, fmt.Errorf("%w: the escrow key of the copy is not on this server", ErrEscrowRefused)
-	}
-	plain, err := b.open(serverID, k)
-	if err != nil {
-		return AdoptNone, err
-	}
-	cert, err := readCACert(pkiDir)
-	if err != nil {
-		return AdoptNone, err
-	}
-	key, ok := keyMatchesCert(plain.CAKey, cert)
-	if !ok || b.CAFingerprint != Fingerprint(cert.Raw) {
-		return AdoptNone, fmt.Errorf("%w: it is not the key of this cluster's CA", ErrEscrowRefused)
 	}
 	var rev revokedDoc
 	if len(plain.Revoked) > 0 {
@@ -477,7 +531,19 @@ func AdoptEscrow(pkiDir, serverID string, now time.Time) (AdoptResult, error) {
 	if rev.Serials == nil {
 		rev.Serials = map[string]time.Time{}
 	}
+	// The list of the copy, the list the previous leader last distributed and the one in the revocation list file
+	// that is published: no revocation is lost, and the number of the lists never goes back.
 	local, _ := LoadRevokedList(pkiDir)
+	if crl, err := os.ReadFile(filepath.Join(pkiDir, CRLFile)); err == nil { //nolint:gosec // fixed name below the pki directory
+		if n, s, err := CRLContent(crl); err == nil {
+			for x := range s {
+				local = append(local, x)
+			}
+			if n > rev.CRL {
+				rev.CRL = n
+			}
+		}
+	}
 	for _, s := range local {
 		if _, ok := rev.Serials[s]; !ok {
 			rev.Serials[s] = now.UTC()
@@ -487,6 +553,8 @@ func AdoptEscrow(pkiDir, serverID string, now time.Time) (AdoptResult, error) {
 	if err != nil {
 		return AdoptNone, err
 	}
+	// revoked.json first, then ca.key, each atomically and durably (temp file, fsync, rename, directory fsync): a crash in
+	// between leaves no key, and the next adoption starts again.
 	if err := WriteFile(filepath.Join(pkiDir, RevokedFile), rb, 0o600); err != nil {
 		return AdoptNone, err
 	}
@@ -494,20 +562,78 @@ func AdoptEscrow(pkiDir, serverID string, now time.Time) (AdoptResult, error) {
 	if err != nil {
 		return AdoptNone, err
 	}
-	if err := writeNew(filepath.Join(pkiDir, CAKeyFile), pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kb}), 0o600); err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return AdoptHeld, nil
-		}
+	defer clear(kb)
+	if err := WriteFile(filepath.Join(pkiDir, CAKeyFile), pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kb}), 0o600); err != nil {
 		return AdoptNone, err
 	}
-	// The new leader goes on with the escrow: its recipients are worked out again from the standbys it has.
-	st, _ := LoadEscrowState(pkiDir)
-	st.Enabled, st.Generation = true, b.Generation
-	st.Recipients = map[string]EscrowRecipientState{}
-	if err := SaveEscrowState(pkiDir, st); err != nil {
-		return Adopted, err
-	}
 	return Adopted, nil
+}
+
+// caKeyUsable reports whether pki/ca.key exists and is the key of ca.crt. A missing file is (false, nil).
+func caKeyUsable(pkiDir string) (bool, error) {
+	raw, err := os.ReadFile(filepath.Join(pkiDir, CAKeyFile)) //nolint:gosec // fixed name below the pki directory
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	cert, err := readCACert(pkiDir)
+	if err != nil {
+		return false, err
+	}
+	_, ok := keyMatchesCert(string(raw), cert)
+	return ok, nil
+}
+
+// openHeld opens a blob with the escrow key of this server and checks that it holds the key of ca.crt.
+func openHeld(pkiDir, serverID string, b EscrowBlob) (escrowPlain, *ecdsa.PrivateKey, error) {
+	keys, err := readRecipientKeys(pkiDir)
+	if err != nil {
+		return escrowPlain{}, nil, err
+	}
+	k, ok := keys[b.KeyID]
+	if !ok {
+		return escrowPlain{}, nil, fmt.Errorf("%w: the escrow key of the copy is not on this server", ErrEscrowRefused)
+	}
+	plain, err := b.open(serverID, k)
+	if err != nil {
+		return plain, nil, err
+	}
+	cert, err := readCACert(pkiDir)
+	if err != nil {
+		return plain, nil, err
+	}
+	key, ok := keyMatchesCert(plain.CAKey, cert)
+	if !ok || b.CAFingerprint != Fingerprint(cert.Raw) {
+		return plain, nil, fmt.Errorf("%w: it is not the key of this cluster's CA", ErrEscrowRefused)
+	}
+	return plain, key, nil
+}
+
+// HeldRevoked opens the copy this server holds and returns the serials of the revocation list in it (nil, ErrNoEscrow
+// when there is no copy). A returning leader merges them into its own list before it distributes anything.
+func HeldRevoked(pkiDir, serverID string) ([]string, error) {
+	b, err := readBlob(pkiDir)
+	if err != nil {
+		return nil, err
+	}
+	plain, _, err := openHeld(pkiDir, serverID, b)
+	if err != nil {
+		return nil, err
+	}
+	var rev revokedDoc
+	if len(plain.Revoked) > 0 {
+		if err := json.Unmarshal(plain.Revoked, &rev); err != nil {
+			return nil, fmt.Errorf("%w: the revocation list", ErrEscrowRefused)
+		}
+	}
+	out := make([]string, 0, len(rev.Serials))
+	for s := range rev.Serials {
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // EscrowRecipientState is what the leader knows of one recipient.
@@ -518,14 +644,24 @@ type EscrowRecipientState struct {
 	ContentHash string    `json:"contentHash"`
 	LastError   string    `json:"lastError,omitempty"`
 	LastRefused bool      `json:"lastRefused,omitempty"`
+	Epoch       int64     `json:"epoch"`
+	// DropPending: the server is not (or no longer) a recipient and its copy has not been deleted yet; the record stays and the
+	// drop is tried every round. Misses counts the rounds in a row in which a member was not a candidate.
+	DropPending bool      `json:"dropPending,omitempty"`
+	Misses      int       `json:"misses,omitempty"`
 	LastTry     time.Time `json:"lastTry"`
 }
 
 // EscrowState is the leader's bookkeeping of the escrow (escrow/state.json). Whether escrow is on follows the CA key: a
 // new leader that adopted a copy is told by Enabled that it goes on.
 type EscrowState struct {
-	Enabled    bool                            `json:"enabled"`
-	Generation int64                           `json:"generation"`
+	Enabled    bool  `json:"enabled"`
+	Generation int64 `json:"generation"`
+	// Epoch rises at every change of leader and Seq at every seal of one leader (Position); Swept says that every member was told
+	// to drop its copy after the escrow was switched off.
+	Epoch      int64                           `json:"epoch"`
+	Seq        int64                           `json:"seq"`
+	Swept      bool                            `json:"swept,omitempty"`
 	Recipients map[string]EscrowRecipientState `json:"recipients"`
 }
 

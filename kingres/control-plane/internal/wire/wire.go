@@ -197,12 +197,23 @@ type Globals struct {
 // EscrowOfferRequest asks a server for the public key of its escrow key (POST /pki/escrow/offer); Rotate makes a new one.
 type EscrowOfferRequest struct {
 	Rotate bool `json:"rotate"`
+	// Epoch is the epoch of the leader that asks (a rotation from a leader older than the copy held is refused).
+	Epoch int64 `json:"epoch"`
+}
+
+// EscrowDropRequest asks a server to delete its copy and escrow keys (POST /pki/escrow/drop); a leader older than the copy held is refused.
+type EscrowDropRequest struct {
+	Epoch int64 `json:"epoch"`
 }
 
 // EscrowOfferResponse is a server's escrow public key (X25519, base64) and its identifier.
 type EscrowOfferResponse struct {
 	KeyID     string `json:"keyId"`
 	PublicKey string `json:"publicKey"`
+	// HeldEpoch and HeldGeneration are the position of the copy the server holds (0 when none): a leader that finds a higher epoch
+	// than its own takes one above it.
+	HeldEpoch      int64 `json:"heldEpoch,omitempty"`
+	HeldGeneration int64 `json:"heldGeneration,omitempty"`
 }
 
 // EscrowStoreRequest hands a server its sealed copy of the CA key (POST /pki/escrow/store).

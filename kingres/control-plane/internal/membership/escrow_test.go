@@ -32,6 +32,37 @@ type escrowCluster struct {
 	active  []string
 	mu      sync.Mutex
 	calls   []string
+	paths   []string
+	db      *memEscrowDB
+}
+
+// memEscrowDB is the system database of the tests: one for the cluster, as the map group replicates it.
+type memEscrowDB struct {
+	mu    sync.Mutex
+	val   escrowShared
+	has   bool
+	down  bool
+	saves int
+}
+
+func (d *memEscrowDB) Load(context.Context) (escrowShared, bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.down {
+		return escrowShared{}, false, errors.New("system database not available")
+	}
+	return d.val, d.has, nil
+}
+
+func (d *memEscrowDB) Save(_ context.Context, s escrowShared) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.down {
+		return errors.New("system database not available")
+	}
+	d.val, d.has = s, true
+	d.saves++
+	return nil
 }
 
 func newEscrowServer(t *testing.T, id string) *Manager {
@@ -50,7 +81,7 @@ func newEscrowServer(t *testing.T, id string) *Manager {
 
 func newEscrowCluster(t *testing.T, ids ...string) *escrowCluster {
 	t.Helper()
-	c := &escrowCluster{t: t, servers: map[string]*Manager{}, down: map[string]bool{}}
+	c := &escrowCluster{t: t, servers: map[string]*Manager{}, down: map[string]bool{}, db: &memEscrowDB{}}
 	leader := newEscrowServer(t, ids[0])
 	ca, err := pki.CreateCA(leader.Svc.PKIDir(), "test", time.Now())
 	if err != nil {
@@ -67,27 +98,41 @@ func newEscrowCluster(t *testing.T, ids ...string) *escrowCluster {
 			t.Fatal(err)
 		}
 		c.servers[id] = m
-		c.active = append(c.active, id)
 	}
+	c.active = append([]string(nil), ids...)
 	for _, m := range c.servers {
-		m.escrowActive = func(context.Context) ([]string, error) { return append([]string(nil), c.active...), nil }
+		m.escrowDB = c.db
+		m.escrowActive = func(context.Context) ([]string, error) {
+			var out []string
+			for _, id := range c.active {
+				if id != m.Self {
+					out = append(out, id)
+				}
+			}
+			return out, nil
+		}
 		m.escrowTransport = c.transport(m)
 	}
 	return c
 }
 
-func (c *escrowCluster) transport(from *Manager) func(context.Context, string, string, any, any) error {
-	return func(ctx context.Context, id, path string, in, out any) error {
+func (c *escrowCluster) transport(from *Manager) func(context.Context, string, string, string, any, any) error {
+	return func(ctx context.Context, id, method, path string, in, out any) error {
 		c.mu.Lock()
 		c.calls = append(c.calls, id+" "+path)
+		c.paths = append(c.paths, method+" "+id+" "+path)
 		down := c.down[id]
 		to := c.servers[id]
 		c.mu.Unlock()
 		if down || to == nil {
 			return peerclient.ErrUnreachable
 		}
+		if method == "GET" && path == "/revoked" {
+			b, _ := json.Marshal(map[string]any{"serials": to.Svc.RevokedSerials()})
+			return json.Unmarshal(b, out)
+		}
 		body, _ := json.Marshal(in)
-		res, err := (&Receiver{M: to}).Handle(ctx, "POST "+path, from.Self, body)
+		res, err := (&Receiver{M: to}).Handle(ctx, method+" "+path, from.Self, body)
 		var ce *internalapi.CallError
 		if errors.As(err, &ce) {
 			return &peerclient.APIError{Status: ce.Status, Code: ce.Code, Message: ce.Message}
@@ -170,7 +215,7 @@ func TestSwitchingOnSealsACopyToEveryRecipientAndANewLeaderAdoptsIt(t *testing.T
 		t.Fatal("a revocation did not make the leader send the copies again")
 	}
 	// The leader's server is lost: db2 becomes the leader.
-	ok, err := c.servers["db2"].AdoptEscrow()
+	ok, err := c.servers["db2"].AdoptEscrow(context.Background())
 	if err != nil || !ok {
 		t.Fatalf("adopt: %v %v", ok, err)
 	}
@@ -197,7 +242,7 @@ func TestSwitchingOnSealsACopyToEveryRecipientAndANewLeaderAdoptsIt(t *testing.T
 
 func TestAdoptWithoutACopyLeavesTheServerWithoutTheKey(t *testing.T) {
 	c := newEscrowCluster(t, "db1", "db2")
-	ok, err := c.servers["db2"].AdoptEscrow()
+	ok, err := c.servers["db2"].AdoptEscrow(context.Background())
 	if err != nil || ok {
 		t.Fatalf("adopt without a copy: %v %v", ok, err)
 	}
@@ -241,14 +286,26 @@ func TestAServerThatIsNoLongerAMemberLosesItsCopy(t *testing.T) {
 	if st := c.status(c.leader()); len(st.current) != 1 || !st.current["db3"] {
 		t.Errorf("recipients %+v", st)
 	}
-	// A removed server that cannot be reached is not a recipient any more either, and the round does not fail.
+	// CAE-2: a removed server that cannot be reached keeps its record (the drop is repeated), and the round does not fail.
 	c.down["db3"] = true
 	c.active = nil
+	for i := 0; i < 3; i++ {
+		if err := c.leader().SyncEscrow(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if st := c.status(c.leader()); st.states["db3"] != "dropPending" {
+		t.Fatalf("recipients %+v", st)
+	}
+	c.down["db3"] = false
 	if err := c.leader().SyncEscrow(ctx); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := held(c.servers["db3"]); !errors.Is(err, pki.ErrNoEscrow) {
+		t.Errorf("the copy was not deleted when the server came back: %v", err)
+	}
 	if st := c.status(c.leader()); len(st.states) != 0 {
-		t.Errorf("recipients %+v", st)
+		t.Errorf("the record was kept after the drop: %+v", st)
 	}
 }
 
@@ -347,11 +404,11 @@ func TestRotationGivesNewKeysAndANewGeneration(t *testing.T) {
 		t.Fatalf("rotate: %+v %v", st, err)
 	}
 	h2, _ := held(c.servers["db2"])
-	if h2.KeyID == h1.KeyID || h2.Generation != 2 {
+	if h2.KeyID == h1.KeyID || h2.Position.Generation != 2 {
 		t.Fatalf("the copy was not resealed to a new key: %+v %+v", h1, h2)
 	}
 	// Still adoptable after the rotation.
-	if ok, err := c.servers["db2"].AdoptEscrow(); err != nil || !ok {
+	if ok, err := c.servers["db2"].AdoptEscrow(context.Background()); err != nil || !ok {
 		t.Fatalf("adopt after rotation: %v %v", ok, err)
 	}
 }

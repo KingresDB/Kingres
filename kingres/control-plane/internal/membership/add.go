@@ -76,7 +76,8 @@ type Manager struct {
 	escrowRecipients EscrowRecipients
 	// escrowActive and escrowTransport are the seams of the tests of the escrow (nil in production).
 	escrowActive    func(ctx context.Context) ([]string, error)
-	escrowTransport func(ctx context.Context, id, path string, in, out any) error
+	escrowTransport func(ctx context.Context, id, method, path string, in, out any) error
+	escrowDB        escrowDB
 
 	gatherMu   sync.Mutex
 	gatherAuth map[string]*gatherAuth
@@ -824,29 +825,29 @@ func (m *Manager) distributePeers(ctx context.Context, env *task.Env, without st
 // distributeRevocations sends the revocation list to every active server and
 // publishes it to the local instance.
 func (m *Manager) distributeRevocations(ctx context.Context) error {
-	if err := m.Svc.PublishLocalCRL(ctx); err != nil {
-		return err
-	}
 	ca, err := m.Svc.CA()
 	if err != nil {
+		return err
+	}
+	// Before anything is sent: what the servers hold is merged in, so that this list is never smaller than theirs (a leader that was
+	// away must not undo the revocations made while it was).
+	m.reconcileRevocations(ctx, ca)
+	if err := m.Svc.PublishLocalCRL(ctx); err != nil {
 		return err
 	}
 	crl, err := m.Svc.CRLPEM()
 	if err != nil {
 		return err
 	}
-	infos, err := m.peerInfos(ctx, "", "")
+	ids, err := m.revocationPeers(ctx)
 	if err != nil {
 		return err
 	}
 	var first error
-	for _, p := range infos {
-		if p.ServerID == m.Self {
-			continue
-		}
+	for _, id := range ids {
 		req := wire.PKIRequest{CACert: string(ca.CertPEM()), Revoked: ca.Revoked(), CRL: string(crl)}
-		if err := m.doUnchecked(ctx, p.ServerID, "POST", "/pki/install", req, nil); err != nil && first == nil {
-			first = fmt.Errorf("sending the revocation list to %s: %w", p.ServerID, err)
+		if err := m.installRevocations(ctx, id, ca, req); err != nil && first == nil {
+			first = fmt.Errorf("sending the revocation list to %s: %w", id, err)
 		}
 	}
 	m.escrowAfterRevocation(ctx)

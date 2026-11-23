@@ -332,6 +332,7 @@ None.
 - `getCaEscrow` (`GET /certificate-authority/escrow`), `setCaEscrow` (`PUT /certificate-authority/escrow`) and `rotateCaEscrow` (`POST /certificate-authority/escrow/rotations`): the escrow of the CA key, on the leader, `kingres_admin`.
   Schemas `CaEscrowStatus`, `CaEscrowRecipient` and `CaEscrowUpdate`. The answers are immediate (no task).
 - `AuditAction` has `setCaEscrow` and `rotateCaEscrow`.
+- `CaEscrowRecipient.state` is `current`, `pending`, `refused` or `dropPending`.
 
 #### Documentation
 

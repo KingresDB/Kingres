@@ -41,6 +41,9 @@ const (
 // leader does not hold the CA key.
 const codeCAUnavailable = "ca_unavailable"
 
+// codeStaleRevocations is the answer of a server that refuses a revocation list that takes a revocation back.
+const codeStaleRevocations = "stale_revocations"
+
 type certInput struct {
 	ServerID string `json:"serverId"`
 }
@@ -445,11 +448,12 @@ func (m *Manager) stepCertRevoke(ctx context.Context, env *task.Env) error {
 // to the local instance. A server that cannot be reached makes the task wait,
 // as in every other cluster-wide task: the list reaches it when it is back.
 func (m *Manager) stepCertRevokeDistribute(ctx context.Context, env *task.Env) error {
-	if err := m.Svc.PublishLocalCRL(ctx); err != nil {
-		return err
-	}
 	ca, err := m.ca()
 	if err != nil {
+		return err
+	}
+	m.reconcileRevocations(ctx, ca)
+	if err := m.Svc.PublishLocalCRL(ctx); err != nil {
 		return err
 	}
 	crl, err := m.Svc.CRLPEM()
@@ -466,7 +470,7 @@ func (m *Manager) stepCertRevokeDistribute(ctx context.Context, env *task.Env) e
 			continue
 		}
 		if err := m.waitUnreachable(ctx, env, p.ServerID, "sending the revocation list", func() error {
-			return m.doUnchecked(ctx, p.ServerID, "POST", "/pki/install", req, nil)
+			return m.installRevocations(ctx, p.ServerID, ca, req)
 		}); err != nil {
 			return fmt.Errorf("sending the revocation list to %s: %w", p.ServerID, err)
 		}

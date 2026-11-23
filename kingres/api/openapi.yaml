@@ -9218,8 +9218,8 @@ components:
         serverId: { type: string }
         state:
           type: string
-          enum: [current, pending, refused]
-          description: '`current`: the copy is the newest. `pending`: not delivered yet or out of date (the leader sends again). `refused`: the server answered the last send with an error, see `error`.'
+          enum: [current, pending, refused, dropPending]
+          description: '`current`: the copy is the newest. `pending`: not delivered yet or out of date (the leader sends again). `refused`: the server answered the last send with an error, see `error`. `dropPending`: the server no longer qualifies (or the escrow is off) and its copy has not been deleted yet; the leader asks again every minute, and until it succeeds the server must be treated as knowing the CA key.'
         keyId: { type: [string, 'null'], description: Identifier of the escrow public key the copy is sealed to. }
         generation: { type: [integer, 'null'], format: int64 }
         sealedAt: { type: [string, 'null'], format: date-time }

@@ -55,7 +55,7 @@ type mapFailover struct {
 	runner  *mapgroup.Runner
 
 	// adoptCA makes this server the holder of the CA from its sealed copy of the key (escrow of the CA key); nil: no escrow.
-	adoptCA func() (bool, error)
+	adoptCA func(ctx context.Context) (bool, error)
 
 	mu      sync.Mutex
 	running bool
@@ -621,14 +621,16 @@ func engineGate(fd *failoverDeps) func() bool {
 	return fd.mf.journal.Gate
 }
 
-func (p *mapPorts) CheckAuthority(context.Context) (bool, error) {
+func (p *mapPorts) CheckAuthority(ctx context.Context) (bool, error) {
 	// The new leader opens its sealed copy of the key first (escrow of the CA key): with it the alert is not raised.
+	// The answer of the adoption is the answer: a ca.key that is there but cannot be used is not a key held (it is put aside, and
+	// without a copy the alert is raised).
 	if p.m.adoptCA != nil {
-		if ok, err := p.m.adoptCA(); ok {
-			return true, nil
-		} else if err != nil {
+		ok, err := p.m.adoptCA(ctx)
+		if err != nil {
 			p.m.log.Warn("the sealed copy of the CA key was not adopted", "error", err)
 		}
+		return ok, nil
 	}
 	_, err := os.Stat(filepath.Join(p.m.svc.PKIDir(), pki.CAKeyFile))
 	if err == nil {

@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -289,4 +290,72 @@ func FormatFingerprint(hexFP string) string {
 		sb.WriteString(strings.ToUpper(hexFP[i : i+2]))
 	}
 	return sb.String()
+}
+
+// ErrStaleRevocations means a revocation list was refused because it would take a revocation back: its number is lower
+// than the one held, or it lacks a serial the held one has.
+var ErrStaleRevocations = errors.New("pki: the revocation list would undo a revocation")
+
+// CRLContent reads the number and the serials (lower-case hex) of a revocation list in PEM.
+func CRLContent(crlPEM []byte) (number int64, serials map[string]bool, err error) {
+	blk, _ := pem.Decode(crlPEM)
+	if blk == nil || blk.Type != "X509 CRL" {
+		return 0, nil, errors.New("pki: the revocation list is not PEM")
+	}
+	crl, err := x509.ParseRevocationList(blk.Bytes)
+	if err != nil {
+		return 0, nil, err
+	}
+	serials = map[string]bool{}
+	for _, e := range crl.RevokedCertificateEntries {
+		serials[SerialHex(e.SerialNumber)] = true
+	}
+	if crl.Number != nil {
+		number = crl.Number.Int64()
+	}
+	return number, serials, nil
+}
+
+// CheckNotStale refuses (ErrStaleRevocations) an incoming list that goes back on the list held: a lower number, or a
+// serial that the held list revokes and the incoming one does not. A held list that cannot be read is no obstacle.
+func CheckNotStale(held, incoming []byte) error {
+	hn, hs, err := CRLContent(held)
+	if err != nil {
+		return nil
+	}
+	in, is, err := CRLContent(incoming)
+	if err != nil {
+		return err
+	}
+	if in < hn {
+		return fmt.Errorf("%w: its number %d is below %d", ErrStaleRevocations, in, hn)
+	}
+	for s := range hs {
+		if !is[s] {
+			return fmt.Errorf("%w: it lacks serial %s", ErrStaleRevocations, s)
+		}
+	}
+	return nil
+}
+
+// UnionSerials returns the sorted union of lists of serials.
+func UnionSerials(lists ...[]string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, l := range lists {
+		for _, s := range l {
+			s = strings.ToLower(s)
+			if s != "" && !seen[s] {
+				seen[s] = true
+				out = append(out, s)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ReadFile reads a file below the pki directory (fixed names only).
+func ReadFile(dir, name string) ([]byte, error) {
+	return os.ReadFile(filepath.Join(dir, name)) //nolint:gosec // callers pass the fixed names of this package
 }

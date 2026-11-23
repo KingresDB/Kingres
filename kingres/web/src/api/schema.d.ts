@@ -5937,10 +5937,10 @@ export interface components {
         CaEscrowRecipient: {
             serverId: string;
             /**
-             * @description `current`: the copy is the newest. `pending`: not delivered yet or out of date (the leader sends again). `refused`: the server answered the last send with an error, see `error`.
+             * @description `current`: the copy is the newest. `pending`: not delivered yet or out of date (the leader sends again). `refused`: the server answered the last send with an error, see `error`. `dropPending`: the server no longer qualifies (or the escrow is off) and its copy has not been deleted yet; the leader asks again every minute, and until it succeeds the server must be treated as knowing the CA key.
              * @enum {string}
              */
-            state: "current" | "pending" | "refused";
+            state: "current" | "pending" | "refused" | "dropPending";
             /** @description Identifier of the escrow public key the copy is sealed to. */
             keyId: string | null;
             /** Format: int64 */

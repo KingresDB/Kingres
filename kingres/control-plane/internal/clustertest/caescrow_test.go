@@ -149,3 +149,70 @@ func TestCAEscrowTamperedCopyIsNotAdopted(t *testing.T) {
 		t.Fatal("ca.key was written from a damaged copy")
 	}
 }
+
+func crlHas(p, serial string) bool {
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return false
+	}
+	_, s, err := pki.CRLContent(b)
+	return err == nil && s[serial]
+}
+
+func listHas(dir, serial string) bool {
+	l, _ := pki.LoadRevokedList(dir)
+	for _, s := range l {
+		if s == serial {
+			return true
+		}
+	}
+	return false
+}
+
+func caRevokedHas(dir, serial string) bool {
+	b, err := os.ReadFile(filepath.Join(dir, pki.RevokedFile))
+	return err == nil && strings.Contains(string(b), `"`+serial+`"`)
+}
+
+// TestCAEscrowARevocationAfterTheFailoverHoldsWhenTheOldLeaderReturns: a certificate is revoked by the new leader while the old one
+// is down; the old leader comes back holding ca.key and an older list. The revocation must reach it, be taken into its CA, and
+// stay in the lists of every server (a list that takes a revocation back is refused and never distributed).
+func TestCAEscrowARevocationAfterTheFailoverHoldsWhenTheOldLeaderReturns(t *testing.T) {
+	m := newMapCluster(t)
+	switchEscrowOn(t, m.old, m.cand)
+	serial := pki.SerialHex(certOf(t, m.other).SerialNumber)
+	if caRevokedHas(filepath.Join(m.old.DataDir, "pki"), serial) {
+		t.Fatal("setup: the serial is revoked already")
+	}
+	foKillServer(m.old)
+	m.request(t, m.other)
+	id := m.recordedTask(t)
+	m.cand.WaitTaskDone(id, 12*time.Minute)
+	mapLogin(t, m.cand)
+	body := m.cand.Expect(202, "POST", "/servers/"+m.other.Host+"/certificates/revocations", nil)
+	revokeTask := clustertest.TaskID(body)
+	until(t, 3*time.Minute, "the revocation in the list of the new leader", func() bool {
+		return crlHas(filepath.Join(m.cand.DataDir, "pki", pki.CRLFile), serial)
+	})
+	// The old leader comes back with ca.key and the list it had.
+	m.old.Start()
+	defer func() {
+		if t.Failed() {
+			t.Logf("log of the old leader: %s", m.old.LogTail(5000))
+		}
+	}()
+	until(t, 10*time.Minute, "the revocation to reach the old leader", func() bool {
+		d := filepath.Join(m.old.DataDir, "pki")
+		return crlHas(filepath.Join(d, pki.CRLFile), serial) && listHas(d, serial)
+	})
+	m.cand.WaitTaskDone(revokeTask, 10*time.Minute)
+	for _, n := range []*clustertest.Node{m.old, m.cand, m.other} {
+		d := filepath.Join(n.DataDir, "pki")
+		if !crlHas(filepath.Join(d, pki.CRLFile), serial) || !listHas(d, serial) {
+			t.Errorf("%s trusts a certificate that was revoked", n.Host)
+		}
+	}
+	if !caRevokedHas(filepath.Join(m.old.DataDir, "pki"), serial) {
+		t.Error("the old leader holds ca.key and did not take the revocation into its own list")
+	}
+}
