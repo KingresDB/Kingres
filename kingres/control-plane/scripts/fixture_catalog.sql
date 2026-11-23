@@ -64,20 +64,6 @@ CREATE TABLE kingres.ledger_blocks (
   block_hash     bytea NOT NULL
 );
 
--- The catalog above is made of plain tables, and the control plane reads the schema kingres only when an extension owned by a superuser has every object in
--- it (extguard).  The fixture records the two extensions and makes the tables members of them, as CREATE EXTENSION would have.
-INSERT INTO pg_catalog.pg_extension (oid, extname, extowner, extnamespace, extrelocatable, extversion)
-SELECT pg_catalog.pg_nextoid('pg_catalog.pg_extension'::pg_catalog.regclass, 'oid', 'pg_catalog.pg_extension_oid_index'::pg_catalog.regclass),
-       v.n, (SELECT r.oid FROM pg_catalog.pg_roles r WHERE r.rolname = current_user), 'kingres'::pg_catalog.regnamespace, false, v.v
-  FROM (VALUES ('kingres_shard', '0.9'), ('kingres_ledger', '0.3')) AS v(n, v);
--- The membership is a dependency row of type e, written directly: ALTER EXTENSION ... ADD is refused for kingres_ledger by the guard of its library, which a
--- server that preloads it runs.
-INSERT INTO pg_catalog.pg_depend (classid, objid, objsubid, refclassid, refobjid, refobjsubid, deptype)
-SELECT 'pg_catalog.pg_class'::pg_catalog.regclass, c.oid, 0, 'pg_catalog.pg_extension'::pg_catalog.regclass, e.oid, 0, 'e'
-  FROM pg_catalog.pg_class c
-  JOIN pg_catalog.pg_extension e ON e.extname = CASE WHEN c.relname LIKE 'ledger\_%' THEN 'kingres_ledger' ELSE 'kingres_shard' END
- WHERE c.relnamespace = 'kingres'::pg_catalog.regnamespace AND c.relkind IN ('r', 'v');
-
 -- The task table of the system schema (shape of sysdb migration 1, columns
 -- that the read side uses).
 CREATE SCHEMA kingres_cp;
@@ -159,3 +145,17 @@ GRANT SELECT, INSERT ON public.orders TO cp_ro;
 GRANT SELECT ON public.settings TO cp_ro;
 
 GRANT SELECT ON ALL TABLES IN SCHEMA kingres_cp TO cp_service;
+
+-- The catalog is made of plain tables, written first (the guard of the ledger library refuses to write the tables of the extension), and the control plane reads the schema kingres only when an extension owned by a superuser has every object in
+-- it (extguard).  The fixture records the two extensions and makes the tables members of them, as CREATE EXTENSION would have.
+INSERT INTO pg_catalog.pg_extension (oid, extname, extowner, extnamespace, extrelocatable, extversion)
+SELECT pg_catalog.pg_nextoid('pg_catalog.pg_extension'::pg_catalog.regclass, 'oid', 'pg_catalog.pg_extension_oid_index'::pg_catalog.regclass),
+       v.n, (SELECT r.oid FROM pg_catalog.pg_roles r WHERE r.rolname = current_user), 'kingres'::pg_catalog.regnamespace, false, v.v
+  FROM (VALUES ('kingres_shard', '0.9'), ('kingres_ledger', '0.3')) AS v(n, v);
+-- The membership is a dependency row of type e, written directly: ALTER EXTENSION ... ADD is refused for kingres_ledger by the guard of its library, which a
+-- server that preloads it runs.
+INSERT INTO pg_catalog.pg_depend (classid, objid, objsubid, refclassid, refobjid, refobjsubid, deptype)
+SELECT 'pg_catalog.pg_class'::pg_catalog.regclass, c.oid, 0, 'pg_catalog.pg_extension'::pg_catalog.regclass, e.oid, 0, 'e'
+  FROM pg_catalog.pg_class c
+  JOIN pg_catalog.pg_extension e ON e.extname = CASE WHEN c.relname LIKE 'ledger\_%' THEN 'kingres_ledger' ELSE 'kingres_shard' END
+ WHERE c.relnamespace = 'kingres'::pg_catalog.regnamespace AND c.relkind IN ('r', 'v');
