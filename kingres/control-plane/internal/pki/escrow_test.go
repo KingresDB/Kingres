@@ -246,6 +246,11 @@ func member2(t *testing.T, from string, ca *CA) string {
 	if err := os.CopyFS(filepath.Join(to, EscrowDir), os.DirFS(filepath.Join(from, EscrowDir))); err != nil {
 		t.Fatal(err)
 	}
+	// A copy of a directory does not keep the modes; the key files must be private again.
+	ents, _ := os.ReadDir(filepath.Join(to, EscrowDir))
+	for _, e := range ents {
+		_ = os.Chmod(filepath.Join(to, EscrowDir, e.Name()), 0o600)
+	}
 	return to
 }
 

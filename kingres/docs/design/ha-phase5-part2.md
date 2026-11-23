@@ -877,8 +877,8 @@ survivable for a long while but not acceptable for ever.
   The additional data bind the blob to its recipient, its escrow key id, the CA certificate's SHA-256, a
   generation and the time, so a blob cannot be moved to another server or relabelled.
 - **A recipient checks what it is sent.** It opens the blob with its own key and accepts it only when the key
-  inside is the key of the `ca.crt` it already holds, and the generation and time are not older than the
-  copy it holds. A blob that anyone else made for it (the public key is public) cannot put another CA in place,
+  inside is the key of the `ca.crt` it already holds, its revocation list parses, and its position (epoch,
+  generation, seq; the clock orders nothing) is not older than the copy it holds. A blob that anyone else made for it (the public key is public) cannot put another CA in place,
   and an old blob cannot replace a new one.
 - **Adoption.** At B8 the new leader calls `AdoptEscrow` through the port `CheckAuthority`: when it has no
   `ca.key`, it opens its copy, checks again that the key is the one of `ca.crt`, merges the revocation list of
@@ -926,10 +926,30 @@ survivable for a long while but not acceptable for ever.
    blob is sealed.
 6. *A tampered or substituted copy* does not open (AES-GCM) or is not the CA's key (the check against
    `ca.crt`); the server keeps its previous copy, the new leader raises the alert and does not write `ca.key`.
-7. *Two holders of the CA key*: the old leader's server, when it returns, still holds its `ca.key`. It is a
-   follower and never issues (every call to the CA goes to the leader), but its `revoked.json` is stale; the
-   rebuild or removal of the old leader's server must remove `pki/ca.key` (open point: the old leader does not
-   do it by itself).
+7. *Two holders of the CA key* (review CAE-4, fixed 2026-11-23): the old leader's server, when it returns, still holds its
+   `ca.key` and the list it had. It is a follower and never issues, but if it became the leader again (a second failover) it
+   would distribute that list and undo every revocation made while it was away. Four defences, each tested: (a) a server that
+   holds `ca.key` and receives a list merges it into its own CA; (b) a leader that takes over, with or without adopting, and
+   every distribution first reads the lists of its own files, its sealed copy and every server and merges them; (c) a holder
+   refuses a list whose number is lower than the one it holds or that lacks a serial it holds (409 `stale_revocations`), and the
+   sender merges and sends again; (d) the number of a list is at least the time in seconds, so the lists of two holders are in
+   the order they were issued in. What is left: the old leader's `ca.key` stays on its disk (it is the same key as the
+   recipients' copies; remove it when the server is rebuilt or retired), and a compromised member can add serials to the
+   merged list (it is trusted as every member is, D3, and the effect is a refused certificate, not an accepted one).
+8. *Rollback and a former leader* (CAE-1): copies are ordered by (epoch, generation, seq), never by time. A leader that takes
+   over takes an epoch above every one it has seen; a recipient refuses a blob, and a drop, of an older epoch, and a leader that
+   finds a copy of a higher epoch seals nothing over it. A former leader that has not heard that it was replaced therefore
+   cannot replace a copy or make a server delete one. Only the operator's `rotateCaEscrow`, made on the leader of the moment,
+   takes an epoch above what a server holds.
+9. *The operator's choice must survive a failover* (CAE-3): `enabled`, the epoch and the holders are kept in the system
+   database (`caEscrow` in `kingres_cp.cluster_setting`), so a stale copy on a server that was down when the escrow was
+   switched off does not switch it on again, and the new leader deletes the copies of servers that no longer qualify. If the
+   system database cannot be read at the failover, the new leader logs it and takes a copy to mean that the escrow was on.
+10. *A copy that cannot be deleted* (CAE-2): the record of a recipient stays, as `dropPending`, until the drop succeeded; until
+    then that server must be treated as knowing the key. A standby that is missing from the list for less than three rounds
+    keeps its copy.
+11. *Durability* (CAE-5): `ca.key` is written with the durable write; a `ca.key` that is not the key of `ca.crt` is put
+    aside, and without a copy the alert is raised.
 
 **What this does not do.** It does not rotate the CA (the CA lasts 10 years), does not protect a cluster whose
 leader and every standby of the map group are lost at once (restore from a backup as before), and does not
@@ -2626,5 +2646,8 @@ recommendation (11.2) and what was found.
   (the leader's side with the receivers of other servers behind a transport seam), `internal/httpapi/handlers_caescrow_test.go`, and in
   `internal/clustertest/caescrow_test.go` the failover of the leader's server with the escrow on (no alert; the new leader holds `ca.key`; the other
   server's renewal job gets a certificate from it without a request; the operator's renewal works) and the same with a tampered copy (no key, alert).
+- **Review (2026-11-22, [report](../reviews/2026-11-22-ca-key-escrow.md)) and its fixes (2026-11-23)**: the cipher was found sound; the findings were about state and
+  failover (a returning leader could undo revocations cluster-wide, a new leader reused a generation, records were forgotten, the operator's choice
+  was lost at a failover, `ca.key` was not written durably). Threats 7 to 11 above and the Fixes section of the report say what changed.
 - **Left**: a console panel for the three operations; an alert for a recipient that stays out of date; the removal of `ca.key` from an old leader that
-  returns (threat 7); the rotation of the CA itself, which the escrow does not replace.
+  returns; the rotation of the CA itself, which the escrow does not replace.

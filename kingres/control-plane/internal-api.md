@@ -71,7 +71,7 @@ version 1, the caller \"2\"."}` when the number is missing or different.
 | `POST /internal/v1/instance/create` | leader, or any peer while joining | create, configure and start the instance for the cluster's settings and managed rules |
 | `POST /internal/v1/instance/start`, `/stop`, `/remove` | leader | start or stop the instance; stop and delete it and its credentials |
 | `POST /internal/v1/instance/trust` | leader, or any peer while joining | the servers to trust (certificate rules and map), the managed network rules, TLS settings; reload |
-| `POST /internal/v1/pki/install` | leader, or any peer while joining | revocation list (PEM CRL and serial numbers) and, when renewed, the server certificate |
+| `POST /internal/v1/pki/install` | leader, or any peer while joining | revocation list (PEM CRL and serial numbers) and, when renewed, the server certificate; a list that takes a revocation back (a lower number, or a serial the held list has that it lacks) is refused with 409 `stale_revocations` |
 | `POST /internal/v1/peers` | leader, or any peer while joining | the peer directory (server id, internal address and ordinal of every server) |
 | `POST /internal/v1/globals/apply` | leader, or any peer while joining | create roles (with password verifiers, never passwords) and databases with their extensions |
 | `POST /internal/v1/node/finish` | leader, or any peer while joining | the server becomes clustered and its setup token is removed |
@@ -280,10 +280,10 @@ server for a request (`GET /pki/csr`), signs it and sends the certificate with `
 The leader keeps a sealed copy of `ca.key` and of the revocation list on the servers that host a ready standby of the map group (design `ha-phase5-part2.md` 3.4.1; the operator switches it on with
 `setCaEscrow`). Three calls, all `LeaderOnly`; the bodies are closed:
 
-- `POST /pki/escrow/offer` `{"rotate": false}` answers `{"keyId": "...", "publicKey": "<base64 X25519>"}`: the newest escrow key of the server, made when there is none or when `rotate` is true.
+- `POST /pki/escrow/offer` `{"rotate": false, "epoch": n}` answers `{"keyId": "...", "publicKey": "<base64 X25519>", "heldEpoch": n, "heldGeneration": n}`: the newest escrow key of the server, made when there is none or when `rotate` is true, and the position of the copy it holds (a leader that finds a higher epoch than its own seals nothing over it).
 - `POST /pki/escrow/store` `{"blob": {version, serverId, keyId, caFingerprint, generation, sealedAt, ephemeral, ciphertext}}`: the copy. The server opens it with its own escrow key and keeps it only when the key
   inside is the key of its `ca.crt` and the generation and time are not older than the copy it holds; it then deletes its other escrow keys. A copy that is refused answers 422 `escrow_refused` and changes nothing.
-- `POST /pki/escrow/drop` `{}`: deletes the copy and every escrow key of the server. Repeating it is not an error.
+- `POST /pki/escrow/drop` `{"epoch": n}`: deletes the copy and every escrow key of the server. Repeating it is not an error; a leader of an older epoch than the copy held is refused with 409 `stale_epoch`.
 
 The calls carry no key in the clear: the blob is AES-256-GCM sealed to the recipient. They are not repeated by the client (the leader's round repeats them every minute). A new leader needs no call: it opens its own copy
 at step B8 of the map-group failover.

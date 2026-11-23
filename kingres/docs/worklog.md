@@ -7,6 +7,29 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+
+## 2026-11-23: the review of the CA key escrow and its fixes (branch ca-escrow)
+
+The independent review (`docs/reviews/2026-11-22-ca-key-escrow.md`) found the cryptography sound and eight findings about state and failover (one high, four medium, three low).
+
+### What was done
+
+- **CAE-4 (high)**: a revocation list never shrinks. Holders refuse a list that takes a revocation back (409 `stale_revocations`); a server that holds `ca.key` merges the lists it receives into its CA; a leader that takes over or distributes merges the lists of its files, its sealed copy and every server first; the list number is at least the time in seconds.
+- **CAE-1**: copies are ordered by (epoch, generation, seq); a new leader takes a higher epoch; recipients refuse a blob and a drop of an older epoch.
+- **CAE-2, CAE-3, CAE-6**: records stay (`dropPending`) until a drop succeeded; the operator's choice, the epoch and the holders are mirrored to `kingres_cp.cluster_setting` (`caEscrow`); a standby missing for less than three rounds keeps its copy; switching off tells every active member.
+- **CAE-5, CAE-7, CAE-8**: durable write of `ca.key`, a truncated key is put aside, the list in a blob is parsed on store, length-prefixed additional data, key file mode check, clearing of secrets where Go allows.
+- Contract 0.22.0 (still the placeholder) gets the value `dropPending` of `CaEscrowRecipient.state`; the internal calls get `epoch`, `heldEpoch` and `heldGeneration`.
+
+### How it was verified
+
+Unit tests of pki, membership, httpapi, internalapi and kingresd; mutants for each fix (listed in the Fixes section of the report); cluster tests on PostgreSQL 18 and 19 (lane l7), among them `TestCAEscrowARevocationAfterTheFailoverHoldsWhenTheOldLeaderReturns`.
+
+### Still open
+
+The `ca.key` of a returning former leader stays on its disk; a removed server that cannot be reached keeps its copy (`dropPending`); a console panel; an alert for a recipient that stays out of date; the rotation of the CA itself.
+
+---
+
 ## 2026-11-22: phase 5, the escrow of the key of the certificate authority (branch ca-escrow)
 
 The last open item of phase 5: after a failover of the leader's server, the new leader raised a critical alert until the operator restored `pki/ca.key` by hand.
