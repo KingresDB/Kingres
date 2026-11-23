@@ -6,6 +6,7 @@ package extguard
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -627,5 +628,113 @@ func sysExec(t *testing.T, c *pgx.Conn, sql string) {
 	t.Helper()
 	if _, err := c.Exec(context.Background(), sql); err != nil {
 		t.Fatalf("%s: %v", sql, err)
+	}
+}
+
+// What kingres_shard leaves in the schema kingres while a bucket moves, splits or drains (the orphan of a move and of a split, the old copy of a rebuilt table,
+// the log of a table operation, the trigger function of a split) is not a member of the extension and is accepted by name, kind and owner; nothing else is.
+func shardWithRuntimeObjects(t *testing.T) *tenantDB {
+	t.Helper()
+	d := startTenant(t)
+	d.install(t, Shard)
+	d.mustSU(t, "CREATE ROLE tenant2 LOGIN")
+	d.mustSU(t, "SELECT kingres.init_cluster('127.0.0.1', "+strconv.Itoa(d.in.Port)+")")
+	// a distributed table of the tenant: the extension keeps the objects of its moves under this owner
+	if _, err := d.tenant.Exec(context.Background(), "CREATE TABLE public.tenant_t (id bigint PRIMARY KEY, v text)"); err != nil {
+		t.Fatal(err)
+	}
+	d.mustSU(t, "SELECT kingres.create_distributed_table('public.tenant_t', 'id')")
+	return d
+}
+
+func TestRuntimeObjectsOfAMoveAreTrusted(t *testing.T) {
+	d := shardWithRuntimeObjects(t)
+	ctx := context.Background()
+	if _, err := Verify(ctx, d.su, Shard); err != nil {
+		t.Fatalf("a distributed table: %v", err)
+	}
+	for _, s := range []string{
+		"CREATE TABLE kingres.orphan_5_3 (a int PRIMARY KEY)", // an orphan of a move, owned by the service role
+		"CREATE TABLE kingres.orphan_5_3_l1 (a int)",
+		"CREATE TABLE kingres.orphan_s2_1 (a int)",
+		"CREATE TABLE kingres.kingres_old_16384 (a int, id int GENERATED ALWAYS AS IDENTITY)",
+		"CREATE TABLE kingres.tlog_7_1 (seq int8 GENERATED ALWAYS AS IDENTITY PRIMARY KEY, op \"char\")",
+		"CREATE TABLE kingres.orphan_9_1 (a int)", "ALTER TABLE kingres.orphan_9_1 OWNER TO tenant", // owned by the owner of the distributed table
+		"CREATE FUNCTION kingres.split_capture_3_1() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS 'BEGIN RETURN NULL; END'",
+		"ALTER FUNCTION kingres.split_capture_3_1() OWNER TO tenant",
+	} {
+		d.mustSU(t, s)
+	}
+	if info, err := Verify(ctx, d.su, Shard); err != nil || !info.Present {
+		t.Fatalf("a database in the middle of a move and a split: %v", err)
+	}
+	if err := PreInstall(ctx, d.su, Timepart, "kingres"); err != nil {
+		t.Fatalf("PreInstall over the same schema: %v", err)
+	}
+}
+
+func TestRuntimeLookingObjectsThatAreNotTheExtensionsAreRefused(t *testing.T) {
+	d := shardWithRuntimeObjects(t)
+	for _, c := range []struct{ name, bad, undo string }{
+		{"a function with the name of the trigger function of a split but another type", "CREATE FUNCTION kingres.split_capture_3_1() RETURNS int LANGUAGE sql AS 'SELECT 1'", "DROP FUNCTION kingres.split_capture_3_1()"},
+		{"a function with another name", "CREATE FUNCTION kingres.split_capture_x() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END'", "DROP FUNCTION kingres.split_capture_x()"},
+		{"a function of a name that the control plane reads", "CREATE FUNCTION kingres.ledger_head() RETURNS int LANGUAGE sql AS 'SELECT 1'", "DROP FUNCTION kingres.ledger_head()"},
+		{"a view with the name of an orphan", "CREATE VIEW kingres.orphan_1_1 AS SELECT 1 AS a", "DROP VIEW kingres.orphan_1_1"},
+		{"a type with the name of an orphan", "CREATE TYPE kingres.orphan_1_2 AS (a int)", "DROP TYPE kingres.orphan_1_2"},
+		{"a table named like a table of the ledger", "CREATE TABLE kingres.ledger_pending (ledger_txid bigint)", "DROP TABLE kingres.ledger_pending"},
+		{"a table named like a table of the sharding catalog", "CREATE TABLE kingres.node_x (a int)", "DROP TABLE kingres.node_x"},
+		{"a sequence with the name of the log of an operation but no table", "CREATE SEQUENCE kingres.tlog_1_1_seq", "DROP SEQUENCE kingres.tlog_1_1_seq"},
+		{"an orphan of a role that owns no distributed table", "CREATE TABLE kingres.orphan_4_4 (a int)", "DROP TABLE kingres.orphan_4_4"},
+		{"a trigger function of a role that owns no distributed table", "CREATE FUNCTION kingres.split_capture_4_4() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END'", "DROP FUNCTION kingres.split_capture_4_4()"},
+	} {
+		d.mustSU(t, c.bad)
+		switch c.name {
+		case "an orphan of a role that owns no distributed table":
+			d.mustSU(t, "ALTER TABLE kingres.orphan_4_4 OWNER TO tenant2")
+		case "a trigger function of a role that owns no distributed table":
+			d.mustSU(t, "ALTER FUNCTION kingres.split_capture_4_4() OWNER TO tenant2")
+		}
+		if _, r := verifyReason(t, d.su, Shard); r != ReasonForeignObject {
+			t.Errorf("%s: %q", c.name, r)
+		}
+		d.mustSU(t, c.undo)
+		if _, r := verifyReason(t, d.su, Shard); r != "" {
+			t.Fatalf("%s: still %q after the undo", c.name, r)
+		}
+	}
+}
+
+// Mutants of the rule for the run-time objects: each one lets one of the refused cases through, or refuses the accepted ones.
+func TestRuntimeRuleMutantsAreKilled(t *testing.T) {
+	d := shardWithRuntimeObjects(t)
+	orig := querySQL
+	defer func() { querySQL = orig }()
+	const tablePattern = "c.relname ~ '^(orphan_s?[0-9]+_[0-9]+|kingres_old_[0-9]+|tlog_[0-9]+_[0-9]+)([A-Za-z0-9_]*)$')"
+	cases := []struct {
+		name, from, to, bad, undo string
+		want                      Reason // what the real statement says with bad in place ("" for the accepted objects)
+	}{
+		{"every table is accepted", tablePattern, "true)", "CREATE TABLE kingres.ledger_pending (ledger_txid bigint)", "DROP TABLE kingres.ledger_pending", ReasonForeignObject},
+		{"every function is accepted", "p.proname ~ '^split_capture_[0-9]+_[0-9]+$' AND p.prorettype = 'pg_catalog.trigger'::pg_catalog.regtype AND", "true AND", "CREATE FUNCTION kingres.ledger_head() RETURNS int LANGUAGE sql AS 'SELECT 1'", "DROP FUNCTION kingres.ledger_head()", ReasonForeignObject},
+		{"the type of the function is not looked at", "AND p.prorettype = 'pg_catalog.trigger'::pg_catalog.regtype", "", "CREATE FUNCTION kingres.split_capture_3_1() RETURNS int LANGUAGE sql AS 'SELECT 1'", "DROP FUNCTION kingres.split_capture_3_1()", ReasonForeignObject},
+		{"the owners are not collected", "AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles g WHERE g.oid = r.owner AND g.rolsuper)),\n                '{}'", "AND false),\n                '{}'", "CREATE TABLE kingres.orphan_4_4 (a int); ALTER TABLE kingres.orphan_4_4 OWNER TO tenant2", "DROP TABLE kingres.orphan_4_4", ReasonForeignObject},
+		{"the run-time tables are not accepted at all", "c.relkind IN ('r', 'p') AND c.relname ~", "false AND c.relname ~", "CREATE TABLE kingres.orphan_5_3 (a int)", "DROP TABLE kingres.orphan_5_3", ""},
+		{"the trigger functions are not accepted at all", "WHERE p.proname ~ '^split_capture", "WHERE false AND p.proname ~ '^split_capture", "CREATE FUNCTION kingres.split_capture_3_1() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END'", "DROP FUNCTION kingres.split_capture_3_1()", ""},
+	}
+	for _, c := range cases {
+		querySQL = orig
+		d.mustSU(t, c.bad)
+		if _, r := verifyReason(t, d.su, Shard); r != c.want {
+			t.Fatalf("%s: the real statement says %q, want %q", c.name, r, c.want)
+		}
+		if !strings.Contains(orig, c.from) {
+			t.Fatalf("%s: %q is not in the statement", c.name, c.from)
+		}
+		querySQL = strings.Replace(orig, c.from, c.to, 1)
+		if _, r := verifyReason(t, d.su, Shard); r == c.want {
+			t.Errorf("mutant survived: %s", c.name)
+		}
+		querySQL = orig
+		d.mustSU(t, c.undo)
 	}
 }

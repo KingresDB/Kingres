@@ -71,3 +71,36 @@ change keeps a schema that a tenant may own; the alert `extensionSchemaUntrusted
   dist_table, bucket_map, map_version and local_node exist in the schema `kingres` of any database, without asking whether they belong to the extension, and then
   scans them. Views of a tenant with those names made the backend fail with a segmentation fault (observed on PostgreSQL 18); tables of a tenant would be taken
   for the routing catalog. The fix is a separate change (branch xcat-fix); the spoof test leaves two of the six names out so that it does not crash the server.
+
+## Run-time objects of kingres_shard (check 4)
+
+A bucket move, a split, a drain and the rebuild of a table make objects in the schema `kingres` that are not members of the extension. They are made by the
+extension's own C code and SQL functions, as the service role, and they keep the owner of the table they come from. The first form of check 4 refused a database
+while one of these operations ran. What the extension makes there, by reading `bucket_move.c` and `kingres_shard--0.9.sql`:
+
+* the orphan of a moved bucket (`orphan_<move>_<bucket>`), its partitions (`..._l<n>`) and the orphan of a split (`orphan_s<split>_<ordinal>`): tables, renamed
+  and moved by `ALTER TABLE ... SET SCHEMA kingres`, owner unchanged (the owner of the distributed table);
+* the old copy of a rebuilt table (`kingres_old_<oid>...`) and its identity sequences (`kingres_old_<oid>_s<attnum>`): the same;
+* the log of a table operation (`tlog_<op>_1`) and its identity sequence: made by the service role;
+* the trigger function of a split (`split_capture_<split>_<ordinal>`): SECURITY DEFINER, `RETURNS trigger`, given to the owner of the table;
+* indexes, TOAST tables and the row types of these tables, which check 4 never looks at on their own.
+
+The rule is the narrowest one that lets these through:
+
+1. The object must be a table or a sequence of one of the name patterns above (a sequence only when it belongs to such a table), or a function of the name
+   `split_capture_<n>_<n>` that returns trigger. A view, a type, an operator or any other function that is not a member is always foreign, whatever its name.
+   A table named like a table that the control plane or the C library reads (node, colocation, dist_table, bucket_map, map_version, local_node, the ledger
+   tables, the timepart policy and so on) matches no pattern and is foreign; the patterns share no prefix with those names.
+2. The owner must be a superuser, or a role that owns a distributed table (`kingres.dist_table`) or a table of a distributed schema (`kingres.dist_schema`).
+   The first statement of Verify returns the owners that are not superusers; a second statement reads the two catalog tables of the extension. That read is
+   done only after checks 1 to 4 passed for everything else, so the catalog tables are members of the extension (a table of their name that is not a member is
+   refused by rule 1), and the schema belongs to a superuser and nobody else can create in it.
+
+Why check 4 still matters when checks 2 and 3 stop non-superusers from creating objects in `kingres`: a schema that a superuser made before the extension
+existed (an operator's mistake, or a restore), objects that `ALTER ... SET SCHEMA` moved in before the grants were fixed, a dump that restored objects into the
+schema, and objects made while an earlier version of the extension was installed. None of them is a member, and the service role reads names in that schema.
+The run-time rule only widens check 4 for what the extension itself makes, by name, kind and owner.
+
+Tests: a real install with a distributed table and an orphan, a split table, an old copy, a log with its identity sequence and a trigger function (superuser
+and table owner) verifies as trusted; a non-member function or view with a run-time looking name, a function of the right name with another type, a table named like a
+catalog table, a sequence of no table and run-time objects of a role that owns no distributed table are refused; six mutants of the rule are killed.
