@@ -1,8 +1,9 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # ADR 0025: A restored system database is accepted by an operator, and the acceptance is a signed event
 
-- Status: Proposed
-- Date: 2026-11-20
+- Status: Accepted
+- Date: 2026-11-23 (proposed 2026-11-20)
+- Implemented in: `kingres/control-plane` (the ledger publisher and `accept-restore`, with the event `restore-acknowledged`); built and reviewed on the staging branch of the first release.
 - Source: [../design/ledger-phase7.md](../design/ledger-phase7.md) (9.4 and correction 230), [../reviews/2026-11-20-kingresd-anchoring-wiring-and-publication-fixes.md](../reviews/2026-11-20-kingresd-anchoring-wiring-and-publication-fixes.md) (P7A-02)
 
 ## Context
