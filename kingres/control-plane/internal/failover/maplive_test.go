@@ -373,3 +373,31 @@ func TestAHardFailoverOfTheMapGroupNamesTheTargetToTheCandidate(t *testing.T) {
 		t.Fatalf("want a pause with nothing started: %v", err)
 	}
 }
+
+// M2. The facts are read again after the bootstrap was started and before the fence: a loss that appeared in between (the synchronous standby stopped confirming, the
+// record of the last check turned old or came from the future) stops the task with nothing stopped and the bootstrap given up.
+func TestAHardFailoverRereadsTheLossBeforeTheFence(t *testing.T) {
+	for name, change := range map[string]func(w *world){
+		"no synchronous standby": func(w *world) { w.facts.SyncStreaming = false },
+		"record too old":         func(w *world) { w.facts.LastKnownAge = time.Hour },
+		"record from the future": func(w *world) { w.facts.LastKnownAge = -time.Second },
+		"another standby became the best": func(w *world) {
+			p := w.pos["s3"]
+			p.ReceiveLsn, p.ReplayLsn = "0/9000000", "0/9000000"
+			w.pos["s3"] = p
+		},
+	} {
+		w := mapWorld()
+		w.onMapStart = func() { change(w) }
+		r := w.runner()
+		w.fakeClock(r)
+		_, err := runThrough(t, r, mapHardInput(), StepName(0, StepStop))
+		var pe *PauseError
+		if !errors.As(err, &pe) {
+			t.Fatalf("%s: want a pause, got %v\n%s", name, err, strings.Join(w.log, "\n"))
+		}
+		if w.index("demote ") >= 0 || w.count("map-abandon s2") != 1 {
+			t.Fatalf("%s: the old primary was fenced or the bootstrap was not given up:\n%s", name, strings.Join(w.log, "\n"))
+		}
+	}
+}

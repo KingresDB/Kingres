@@ -50,22 +50,10 @@ func (r *Runner) stopOldMap(ctx context.Context, env *task.Env, sc *stepCtx, run
 	if len(ready) == 0 {
 		return fail(CodeNoCandidate, true, "the map group has no ready standby, so its primary on %s was not stopped; nothing was changed", sc.old())
 	}
-	cands := make([]Candidate, 0, len(ready))
-	for _, rec := range ready {
-		cctx, cancel := context.WithTimeout(ctx, orDur(r.PositionTimeout, 5*time.Second))
-		p, perr := r.Peers.Position(cctx, rec.Server, 0)
-		cancel()
-		cd := Candidate{StandbyID: rec.ID, Server: rec.Server, Readable: perr == nil, Pos: p, Preferred: r.Plan.Preferred(ctx, 0, rec.Server), RingDist: r.Plan.Ring(sc.old(), rec.Server)}
-		if perr != nil {
-			cd.Err = perr.Error()
-		}
-		cands = append(cands, cd)
-	}
-	facts, err := r.Plan.Facts(ctx, 0)
+	ch, facts, err := r.judgeMapHard(ctx, sc, ready)
 	if err != nil {
 		return err
 	}
-	ch := Choose(ChooseInput{Candidates: cands, Target: sc.in.Targets[0], Facts: facts})
 	if ch.Chosen == nil {
 		return fail(CodeNoCandidate, true, "no standby of the map group can be promoted: %s; its primary on %s was not stopped and nothing was changed", ch.Message, sc.old())
 	}
@@ -83,7 +71,7 @@ func (r *Runner) stopOldMap(ctx context.Context, env *task.Env, sc *stepCtx, run
 		return fail(CodeTargetUnavailable, true, "the standby of the map group on %s is on the server of its primary; nothing was changed", chosen.Server)
 	}
 	sc.event(ctx, "mapHardStop", map[string]any{"candidate": chosen.Server, "standby": chosen.ID, "verdict": ch.Verdict})
-	mf := &MapFacts{SyncStreaming: facts.SyncStreaming && facts.LastKnownAge <= MaxCheckAge, LastKnownLsn: facts.LastKnownLsn, PrimaryPlanned: facts.PrimaryPlanned, AsyncDatabases: facts.AsyncDatabases}
+	mf := &MapFacts{SyncStreaming: facts.SyncStreaming && facts.LastKnownAge >= 0 && facts.LastKnownAge <= MaxCheckAge, LastKnownLsn: facts.LastKnownLsn, PrimaryPlanned: facts.PrimaryPlanned, AsyncDatabases: facts.AsyncDatabases}
 	if r.Inject != nil && r.Inject("maphard:facts") == "async" {
 		// A test: the facts the candidate judges with differ from those this task accepted (a synchronous standby that stopped confirming): the candidate pauses.
 		mf.SyncStreaming = false
@@ -93,6 +81,23 @@ func (r *Runner) stopOldMap(ctx context.Context, env *task.Env, sc *stepCtx, run
 	if err := r.Peers.MapStart(ctx, chosen.Server, MapStartRequest{Server: sc.old(), RequestedBy: sc.in.RequestedBy, Comment: sc.in.Comment, AllowDataLoss: sc.in.AllowDataLoss,
 		Planned: &MapPlanned{TaskID: env.Task.ID, StandbyID: chosen.ID, Hard: true, Facts: mf, Target: sc.in.Targets[0]}}); err != nil {
 		return fail(CodeTargetUnavailable, true, "the bootstrap of the map group could not be started on %s: %v; nothing was changed", chosen.Server, err)
+	}
+	// M2: the facts are read again right before the fence (the bootstrap took time to start, and the primary is alive and writing): the verdict that was accepted must still
+	// hold, for the same standby, or nothing is stopped and the bootstrap is given up.
+	if ch2, f2, jerr := r.judgeMapHard(ctx, sc, ready); jerr != nil || ch2.Chosen == nil || ch2.Chosen.StandbyID != chosen.ID || !Accepts(ch2.Verdict, sc.in.AllowDataLoss) {
+		_ = r.Peers.MapAbandon(context.WithoutCancel(ctx), chosen.Server, "the loss changed before the old primary was fenced")
+		if jerr != nil {
+			return jerr
+		}
+		msg := "the choice changed"
+		if ch2.Chosen != nil {
+			msg = ch2.Message
+		}
+		r.Plan.Alert(ctx, "failoverNeedsDecision", "critical", subjectOf(0, sc.old()), "The failover of the map group could lose data: "+msg, true)
+		return &PauseError{Reason: fmt.Sprintf("The loss of the failover of the map group changed before the old primary was stopped (%s). Nothing was stopped. Repeat the request.", msg)}
+	} else {
+		mf.SyncStreaming = f2.SyncStreaming && f2.LastKnownAge >= 0 && f2.LastKnownAge <= MaxCheckAge && mf.SyncStreaming
+		mf.LastKnownLsn, mf.PrimaryPlanned, mf.AsyncDatabases = f2.LastKnownLsn, f2.PrimaryPlanned, f2.AsyncDatabases
 	}
 	ans, err := r.Peers.Demote(ctx, sc.old(), DemoteRequest{Group: 0, Mode: "immediate", ExpectedTerm: run.ExpectedTerm, TransferTo: chosen.Server, Candidate: chosen.Server})
 	if err != nil {
@@ -109,7 +114,9 @@ func (r *Runner) stopOldMap(ctx context.Context, env *task.Env, sc *stepCtx, run
 	// whose lease can no longer be renewed.
 	ctx = context.WithoutCancel(ctx)
 	if !ans.Stopped {
-		r.Plan.Alert(ctx, "oldPrimaryNotStopped", "critical", subjectOf(0, sc.old()), fmt.Sprintf("The old primary of the map group could not be stopped on %s; its lease is not renewed and the watchdog stops it when it runs out.", sc.old()), true)
+		actx, acancel := context.WithTimeout(ctx, 5*time.Second) // P5: the system database may be the stopped instance
+		defer acancel()
+		r.Plan.Alert(actx, "oldPrimaryNotStopped", "critical", subjectOf(0, sc.old()), fmt.Sprintf("The old primary of the map group could not be stopped on %s; its lease is not renewed and the watchdog stops it when it runs out.", sc.old()), true)
 	}
 	deadline := r.now().Add(orDur(r.MapVerdictWait, 6*time.Minute))
 	for {
@@ -125,4 +132,25 @@ func (r *Runner) stopOldMap(ctx context.Context, env *task.Env, sc *stepCtx, run
 			return err
 		}
 	}
+}
+
+// judgeMapHard reads the positions of the ready standbys of the map group and the leader's facts, and runs the ordinary choice with the target of the request. The primary
+// is alive while it runs, so it is called again right before the fence (M2).
+func (r *Runner) judgeMapHard(ctx context.Context, sc *stepCtx, ready []StandbyRec) (Choice, GroupFacts, error) {
+	cands := make([]Candidate, 0, len(ready))
+	for _, rec := range ready {
+		cctx, cancel := context.WithTimeout(ctx, orDur(r.PositionTimeout, 5*time.Second))
+		p, perr := r.Peers.Position(cctx, rec.Server, 0)
+		cancel()
+		cd := Candidate{StandbyID: rec.ID, Server: rec.Server, Readable: perr == nil, Pos: p, Preferred: r.Plan.Preferred(ctx, 0, rec.Server), RingDist: r.Plan.Ring(sc.old(), rec.Server)}
+		if perr != nil {
+			cd.Err = perr.Error()
+		}
+		cands = append(cands, cd)
+	}
+	facts, err := r.Plan.Facts(ctx, 0)
+	if err != nil {
+		return Choice{}, facts, err
+	}
+	return Choose(ChooseInput{Candidates: cands, Target: sc.in.Targets[0], Facts: facts}), facts, nil
 }
