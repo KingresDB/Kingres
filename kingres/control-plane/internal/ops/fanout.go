@@ -143,6 +143,9 @@ func (o *Ops) ApplyLocal(ctx context.Context, kind string, raw json.RawMessage) 
 			return errors.New("this server has no instance")
 		}
 		return o.Local.DropRole(ctx, p.Name)
+	case ApplyImportCreate, ApplyImportAccess, ApplyImportSequences, ApplyImportRename:
+		_, err := o.applyImportKind(ctx, kind, raw)
+		return err
 	case ApplyLedgerClient:
 		return o.ledgerClientApply(ctx, raw)
 	case ApplyExtensionCheck, ApplyExtensionInstall, ApplyExtensionVerify, ApplyDatabaseSettings:

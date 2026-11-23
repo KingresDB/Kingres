@@ -80,6 +80,7 @@ func (o *Ops) baseDefinitions() []task.Definition {
 		o.dbExportDefinition(),
 		o.archiveValidateDefinition(),
 		o.importDefinition(),
+		o.dbImportDefinition(),
 		{Kind: KindDatabaseCreate, Dynamic: func(in json.RawMessage) ([]task.Step, error) {
 			p, err := rawInput[createParams](in)
 			if err != nil {

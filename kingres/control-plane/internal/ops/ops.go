@@ -139,6 +139,8 @@ type Ops struct {
 	// dbTaskMu makes the check "a database export runs" and the start of a table task one step (and the reverse).
 	dbTaskMu sync.Mutex
 	vals     validations
+	// imps holds what the steps of the database imports that run share in this process (dbimport.go).
+	imps imports
 }
 
 // SetEngine installs the task engine once the system database exists.

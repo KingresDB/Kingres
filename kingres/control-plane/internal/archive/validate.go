@@ -55,6 +55,7 @@ type EntryFact struct {
 	SHA256         string
 	CRC32          uint32
 	Zip64          bool
+	Method         uint16
 }
 
 // Result is the outcome of a validation that found the archive well formed.
@@ -545,7 +546,7 @@ func (c ctx) stream2(e central, handler func(io.Reader) error) (string, EntryFac
 		return "", EntryFact{}, invalid("crc", e.name, "the CRC-32 of an entry is wrong")
 	}
 	s := hex.EncodeToString(sha.Sum(nil))
-	return s, EntryFact{Name: e.name, Offset: int64(e.offset), CompressedSize: int64(e.csize), Size: int64(e.usize), CRC32: e.crc, Zip64: e.zip64}, nil
+	return s, EntryFact{Name: e.name, Offset: int64(e.offset), CompressedSize: int64(e.csize), Size: int64(e.usize), CRC32: e.crc, Zip64: e.zip64, Method: e.method}, nil
 }
 
 // checkHeader compares the first record of a data entry with the columns of the manifest.

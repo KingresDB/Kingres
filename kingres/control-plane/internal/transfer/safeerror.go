@@ -53,6 +53,13 @@ const (
 	CodeSchemaUnrecognised = "schema_unrecognised"
 	CodeDumpFailed         = "schema_dump_failed"
 	CodeArchiveInvalid     = "archive_invalid"
+	// The codes of the database import (contract 0.41.0).
+	CodeArchiveIncompatible = "archive_incompatible"
+	CodeStatementRefused    = "archive_statement_refused"
+	CodeLedgerRestart       = "ledger_restart_not_acknowledged"
+	CodeForeignKey          = "foreign_key_violation"
+	CodeTableNotEligible    = "table_not_eligible"
+	CodeVerification        = "verification_failed"
 	// CodeInternal is every failure the server does not describe to the client.
 	CodeInternal = "internal_error"
 )
@@ -141,6 +148,16 @@ func (e *Error) Problem() *problem.Problem {
 	switch e.Code {
 	case CodeForbidden:
 		code = problem.Forbidden
+	case CodeArchiveInvalid:
+		code = problem.ArchiveInvalid
+	case CodeArchiveIncompatible:
+		code = problem.ArchiveIncompatible
+	case CodeStatementRefused:
+		code = problem.ArchiveStatementRefused
+	case CodeLedgerRestart:
+		code = problem.LedgerRestartNotAcknowledged
+	case CodeImportTooLarge:
+		code = problem.ImportTooLarge
 	case CodeQuotaExceeded:
 		code = problem.TransferQuotaExceeded
 	case CodeInsufficientDisk:

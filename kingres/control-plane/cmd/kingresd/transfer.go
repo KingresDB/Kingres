@@ -32,7 +32,7 @@ func transferConfig(cfg config.Config, authn auth.Authenticator, write func(cont
 		Dir: abs(cfg.TransferDir), KeyFile: abs(cfg.TransferKeyFile),
 		// The staging directory may not be or hold the data directory of kingresd (the instances, the keys, the audit log live there).
 		Forbidden:   []string{abs(cfg.DataDir), abs(filepath.Join(cfg.DataDir, "instances"))},
-		MaxDuration: cfg.TransferMaxDuration, MaxAtomicBytes: cfg.MaxAtomicBytes, PGBinDir: bin, KingresVersion: version,
+		MaxDuration: cfg.TransferMaxDuration, MaxAtomicBytes: cfg.MaxAtomicBytes, MaxImportBytes: cfg.MaxImportBytes, PGBinDir: bin, KingresVersion: version,
 		CurrentRoles: func(ctx context.Context, role string) ([]string, error) { return authn.CurrentRoles(ctx, role) },
 		Audit: func(ctx context.Context, action string, details map[string]any) {
 			write(ctx, audit.Event{Actor: "system", Source: "system", Action: action, ResourceType: "transfer", Outcome: audit.OutcomeSuccess, Details: details})

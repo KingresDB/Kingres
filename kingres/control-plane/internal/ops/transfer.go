@@ -51,6 +51,8 @@ type TransferConfig struct {
 	// MaxDuration is the longest a transfer task may run; MaxAtomicBytes the largest decompressed CSV an import takes.
 	MaxDuration    time.Duration
 	MaxAtomicBytes int64
+	// MaxImportBytes is the largest sum of the sizes of the entries of a database archive that an import takes (0: 100 GiB).
+	MaxImportBytes int64
 	// CurrentRoles re-derives the cluster roles of a role (auth.Authenticator.CurrentRoles).
 	CurrentRoles func(ctx context.Context, role string) ([]string, error)
 	// FS and Reserve are for tests of the disk (nil: the real ones).
