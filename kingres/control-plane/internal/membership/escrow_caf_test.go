@@ -443,3 +443,21 @@ func TestAListSentWithACertificateIsAtLeastWhatTheServersHold(t *testing.T) {
 		t.Fatalf("the list that goes out with a certificate lacks what a server holds: %v", res.Revoked)
 	}
 }
+
+// N30: the number of the next list is above the one of the list this server holds in its own file.
+func TestTheNextNumberIsAboveTheListInTheOwnFile(t *testing.T) {
+	c := newEscrowCluster(t, "db1", "db2")
+	high := time.Now().Unix() + 1000
+	if err := c.install("db1", []string{"aa01"}, c.forgeCRL([]string{"aa01"}, high, time.Now())); err != nil {
+		t.Fatal(err)
+	}
+	ca := c.mgrCA("db1")
+	c.servers["db1"].reconcileRevocations(context.Background(), ca)
+	crl, err := ca.CRL(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, _, _ := pki.CRLContent(crl); n <= high {
+		t.Fatalf("the next list has number %d, not above %d", n, high)
+	}
+}
