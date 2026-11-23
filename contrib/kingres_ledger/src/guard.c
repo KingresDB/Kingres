@@ -290,6 +290,47 @@ kl_catalog_index_relid(const char *idxname, Oid tableoid)
 }
 
 /*
+ * kl_registry_untrusted
+ *		The extension is installed in this database but its schema is not the superuser's: its
+ *		registry cannot be read, so nothing can be said of which tables are ledger tables.  (Not
+ *		installed is not this: that is a clean no-op everywhere.)
+ */
+bool
+kl_registry_untrusted(void)
+{
+	Oid			nspoid;
+
+	if (!OidIsValid(kl_extension_oid()))
+		return false;
+	nspoid = get_namespace_oid(KL_SCHEMA_NAME, true);
+	return !OidIsValid(nspoid) || !kl_schema_trusted(nspoid);
+}
+
+/*
+ * kl_fail_closed
+ *		The guards that look at the registry to see whether there is anything to protect must not
+ *		take "the registry cannot be read" for "nothing is registered": a role that is not a
+ *		superuser is refused whatever would drop or take over the ledger.  A superuser may repair.
+ */
+bool
+kl_fail_closed(void)
+{
+	return kl_registry_untrusted() && !superuser();
+}
+
+/* Raise an error where an operation needs the registry and it cannot be trusted. */
+void
+kl_require_trusted_registry(const char *what)
+{
+	if (kl_registry_untrusted())
+		ereport(ERROR,
+				(errcode(ERRCODE_KL_PROTECTED),
+				 errmsg("cannot %s: the schema \"%s\" is not owned by a superuser, so the registry of the ledger cannot be trusted",
+						what, KL_SCHEMA_NAME),
+				 errhint("A superuser must make the schema its own (ALTER SCHEMA ... OWNER TO) after looking at what is in it.")));
+}
+
+/*
  * kl_write_allowed
  *		The three cases of the file header.
  */

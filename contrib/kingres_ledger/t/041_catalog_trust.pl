@@ -94,8 +94,36 @@ is($rc, 0, 'B: the owner makes tables that say that group 7 holds the schema s, 
 ($rc, $out, $err) = psql_as(undef, 'shdb', q{CREATE EXTENSION kingres_ledger});
 is($rc, 0, 'B: the superuser installs the ledger into the schema of the tenant') or diag($err);
 ($rc, $out, $err) = psql_as(undef, 'shdb', q{SELECT kingres.ledger_enable('s.t')});
+isnt($rc, 0, 'B: while the schema is the tenant\'s, ledger_enable refuses (the registry cannot be trusted)');
+like($err, qr/cannot be trusted/, 'B: ... and says why') or diag($err);
+($rc, $out, $err) = psql_as(undef, 'shdb', q{ALTER SCHEMA kingres OWNER TO CURRENT_USER});
+is($rc, 0, 'B: the superuser takes the schema (the tenant tables stay in it)') or diag($err);
+($rc, $out, $err) = psql_as(undef, 'shdb', q{SELECT kingres.ledger_enable('s.t')});
 is($rc, 0, 'B: ledger_enable does not take the look-alike for the catalog of a cluster') or diag($err);
 unlike($err, qr/distributed schema that shard group/, 'B: ... no refusal because of it');
+
+# B2. the ledger installed in a schema of a superuser, which a superuser then gives to the tenant: the registry cannot be read
+# any more, and that must not read as "there is nothing to protect"
+$node->safe_psql('postgres', q{CREATE DATABASE closeddb OWNER tenant});
+($rc, $out, $err) = psql_as(undef, 'closeddb', q{
+	CREATE EXTENSION kingres_ledger;
+	CREATE TABLE public.w (a int);
+	SELECT kingres.ledger_enable('public.w');
+	INSERT INTO public.w VALUES (1);
+	ALTER SCHEMA kingres OWNER TO tenant;
+});
+is($rc, 0, 'B2: a ledger table, then the schema of the ledger given to the tenant') or diag($err);
+($rc, $out, $err) = psql_as('tenant', 'closeddb', q{DROP SCHEMA kingres CASCADE});
+isnt($rc, 0, 'B2: the tenant cannot drop the schema of the ledger');
+like($err, qr/cannot drop schema|ledger/i, 'B2: ... the ledger refuses') or diag($err);
+($rc, $out, $err) = psql_as('tenant', 'closeddb', q{DROP OWNED BY tenant});
+isnt($rc, 0, 'B2: nor DROP OWNED BY the tenant (the schema is the tenant\'s)');
+is($node->safe_psql('closeddb', q{SELECT count(*) FROM pg_namespace WHERE nspname = 'kingres'}), '1', 'B2: the schema is still there');
+($rc, $out, $err) = psql_as(undef, 'closeddb', q{CREATE TABLE public.w2 (a int); SELECT kingres.ledger_enable('public.w2')});
+isnt($rc, 0, 'B2: ledger_enable refuses while the registry cannot be trusted');
+like($err, qr/cannot be trusted/, 'B2: ... and says why') or diag($err);
+($rc, $out, $err) = psql_as(undef, 'closeddb', q{ALTER SCHEMA kingres OWNER TO CURRENT_USER; SELECT kingres.ledger_enable('public.w2')});
+is($rc, 0, 'B2: a superuser repairs it, and the ledger works again') or diag($err);
 
 # C
 is($node->safe_psql('postgres', q{SELECT pg_postmaster_start_time()::text}), $started, 'C: the postmaster did not restart');

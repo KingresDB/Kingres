@@ -266,6 +266,20 @@ extern bool kl_manual_write_ok(void);
 extern Oid	kl_extension_oid(void);
 extern Oid	kl_catalog_relid(const char *relname);
 extern Oid	kl_catalog_index_relid(const char *idxname, Oid tableoid);
+extern bool kl_registry_untrusted(void);
+extern bool kl_fail_closed(void);
+extern void kl_require_trusted_registry(const char *what);
+
+/*
+ * The SPI statements of the extension (capture.c, row_hash.c, sign.c, write.c, worker.c) name the
+ * tables of the schema "kingres" and its functions qualified and with typed arguments.  The tables
+ * are the extension's own, because their names are taken from the install script on and cannot be
+ * made again, and the functions of the extension cannot be replaced by another of the same
+ * signature; the one thing a schema of somebody else allows is an overload of another signature,
+ * which the install script refuses once the install-time check of the sec-ext branch is merged (the schema must be a superuser's and closed to everybody else).  The
+ * code that reads the registry by name and acts on what it finds, and the block builder, go through
+ * kl_catalog_relid() above, and where the registry cannot be trusted the guards fail closed.
+ */
 
 /* write.c: the functions that write the ledger, and the record of a manual write */
 extern void kl_record_manual_insert(Relation rel, HeapTuple tuple);

@@ -515,7 +515,7 @@ kl_internal_table_unused(Oid relid)
 	{
 		for (i = 0; i < 3; i++)
 		{
-			Oid			oid = get_relname_relid(names[i], nspoid);
+			Oid			oid = kl_catalog_relid(names[i]);
 
 			if (OidIsValid(oid))
 				known[i] = oid;
@@ -1009,7 +1009,7 @@ kl_check_drop(DropStmt *stmt, Oid extoid)
 
 				if (!OidIsValid(nspoid))
 					continue;
-				if (ledgers != NIL &&
+				if ((ledgers != NIL || kl_fail_closed()) &&
 					nspoid == get_namespace_oid(KL_SCHEMA_NAME, true))
 					kl_reject("drop schema", KL_SCHEMA_NAME, KL_CATALOG_LEDGER);
 				foreach(lr, ledgers)
@@ -1028,7 +1028,7 @@ kl_check_drop(DropStmt *stmt, Oid extoid)
 				char	   *name = strVal(lfirst(lc));
 				Oid			dropped;
 
-				if (strcmp(name, KL_EXTENSION_NAME) == 0 && ledgers != NIL)
+				if (strcmp(name, KL_EXTENSION_NAME) == 0 && (ledgers != NIL || kl_fail_closed()))
 					ereport(ERROR,
 							(errcode(ERRCODE_KL_PROTECTED),
 							 errmsg("cannot drop extension \"%s\" while ledger tables exist",
@@ -1121,6 +1121,11 @@ kl_check_drop_owned(DropOwnedStmt *stmt)
 {
 	List	   *ledgers = kl_ledger_relids();
 	ListCell   *lr;
+
+	if (kl_fail_closed())
+		ereport(ERROR,
+				(errcode(ERRCODE_KL_PROTECTED),
+				 errmsg("cannot drop owned objects: the schema \"%s\" is not owned by a superuser, so the ledger tables cannot be told from other tables", KL_SCHEMA_NAME)));
 
 	foreach(lr, ledgers)
 	{
@@ -2216,7 +2221,7 @@ kl_object_access(ObjectAccessType access, Oid classId, Oid objectId,
 		return;
 	if (!kl_drop_protected(classId, objectId, subId, extoid))
 		return;
-	if (kl_ledger_relids() == NIL)
+	if (kl_ledger_relids() == NIL && !kl_fail_closed())
 		return;
 
 	{

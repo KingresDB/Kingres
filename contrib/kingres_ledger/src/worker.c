@@ -978,6 +978,18 @@ kingres_ledger_worker_main(Datum main_arg)
 		kl_worker_report(KL_R_NO_EXTENSION, NULL, NULL);
 		proc_exit(0);
 	}
+	/*
+	 * The worker runs the SQL of the extension with the rights of its owner: only where the registry is
+	 * the extension's own (a member table in a superuser's schema), or the names could be somebody else's.
+	 */
+	if (!OidIsValid(kl_catalog_relid("ledger_pending")))
+	{
+		ereport(LOG,
+				(errmsg("kingres_ledger: the block builder does nothing in this database: the schema \"%s\" is not owned by a superuser", KL_SCHEMA_NAME)));
+		CommitTransactionCommand();
+		kl_worker_report(KL_R_NO_EXTENSION, NULL, NULL);
+		proc_exit(0);
+	}
 	SetUserIdAndSecContext(owner, 0);
 
 	PG_TRY();

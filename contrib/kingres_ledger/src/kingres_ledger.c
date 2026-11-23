@@ -412,6 +412,7 @@ kingres_ledger_lock_table(PG_FUNCTION_ARGS)
 
 	kl_require_own_statement("ledger_enable");
 	kl_check_owner(relid);
+	kl_require_trusted_registry("enable the ledger on a table");
 	kl_check_distributed_owner(relid);
 	/*
 	 * The order of the locks is checked before the wait for the table (L19-04):
