@@ -1,0 +1,78 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
+# Limitations of the first release
+
+Read this before you decide what to run on KingresDB. Each item is a boundary that the design or a review stated, not an accident. Items marked **In progress** are being written and are not in the first release as they stand; items marked **Open** are left open by the design. The state is that of the staging branch of the first release on 2026-11-23.
+
+## Consistency
+
+- **No global snapshot.** A statement that spans shard groups reads each group at its own snapshot. Two-phase commit makes a transaction commit on all nodes or on none, but each node commits at its own moment, so a reader can see a transaction's effects on one group before it sees them on another. In `READ COMMITTED` every scan node of one statement has its own snapshot, so one statement that scans two distributed tables can see the same node in two states. A read that must see one state of several tables should join them on the distribution key (a join of colocated tables is routed to one group). `SERIALIZABLE` is serializable per node only. A global snapshot is **phase 8**, the future roadmap, and is not part of this release ([../architecture.md](../architecture.md), "Scope of the first release").
+- **One ledger chain per shard group**, with the aggregate digest of phase 7 over the chains. There is no multi-node ledger with consensus (also phase 8).
+- **The distributed scan is slow for large tables by design: it moves rows.** It is the fallback that answers every statement correctly ([ADR 0022](../adr/0022-the-complete-scan-stays.md)). Pushdown, partial aggregation, sorted streams and colocated joins are faster paths used when their conditions hold; `EXPLAIN (VERBOSE)` says why a statement was not pushed.
+
+## Sharding
+
+- Differences from a single node that pushdown makes visible: a cursor without `SCROLL` over a pushed ordered statement cannot scan backward; a pushed statement can fail with `KS001` while versions or placement change, and the client repeats it; a floating point aggregate can differ in the last digits; `SET ROLE` to a role that cannot log in breaks reads that span groups.
+- Not pushed (the scan answers): grouping sets, a `FULL JOIN` with a reference table, aggregates without a combine function in a query that is not closed (`json_agg`, `jsonb_agg`, `range_agg`, `xmlagg` and others), `DISTINCT` or `ORDER BY` inside an aggregate, sub-selects, CTEs, views, local tables, tables of two colocation groups, row-level security, row locks.
+- `UPDATE ... FROM` and `DELETE ... USING` that read a distributed table and write another table are refused. A write that uses a function that is not built in cannot be shipped.
+- `MERGE` on distributed tables runs in the shapes the extension README lists ("`MERGE` on distributed tables"); every other shape is refused with the condition named. Refused among others: a `WITH` clause, a sub-select in an expression, a target with a trigger, a rule or row-level security, a `MERGE` through a view, a volatile value (a sequence, an identity column, `random()`), and a source that is a join (put the join in a sub-select). A local source that exists on one node only is refused for a reference target.
+- A repartitioned join moves one table. Not built, and answered by the complete scan with the reason in `EXPLAIN (VERBOSE)`: a preserved side of a `LEFT JOIN` that would move, two moved tables, a closed whole-statement fragment above the repartitioned join, and extension objects in the text of a repartitioned join. `repartition_max_bytes` is capped at 512 MB.
+- Splitting a bucket is refused for a table without a primary key and for a colocation group with a columnar table, and cannot be undone. A distributed schema that holds a ledger table is pinned and cannot move. The control plane does not plan or drain schemas (**Open**): a drain moves buckets only.
+- The number of buckets of a database is fixed at creation (1 to 4096). A table is distributed by hash, or kept whole on every node as a reference table.
+- Nodes must agree: the same collation settings and the same version of the extension. A node of another PostgreSQL major is refused.
+- A cluster runs one PostgreSQL major, and there is no move between majors ([upgrade.md](upgrade.md)).
+- A bucket move waits for long transactions at its switch, and writers of that group's tables wait for a short moment.
+
+## High availability
+
+- Failover, planned switchover (also of the map group), restore of preferred primaries and automatic failover are built into `kingresd`. They were reviewed in three rounds and fixed, and the cluster tests pass on both majors; one test of the switchover set failed once on PostgreSQL 19.0 for a cause that is not known and passed on every rerun. **In progress:** the hardening of the whole part (measured loops, a review of everything together). Treat failover as new.
+- **In progress: escrow of the certificate authority key.** Until it is built the key is not escrowed: after a failover of the map group the new leader raises a critical alert until the operator restores `pki/ca.key` and `pki/revoked.json` from a backup of the old leader.
+- **In progress: a hard failover of a server whose map group leader is alive** is refused with 422 `unsupported_operation`; use the planned switchover. Draining a server that hosts the map group is **Open** (drain step 4), as is the standby lag rule of a rebalance (`maxStandbyLagBytes` is a setting, and the rule is not evaluated yet).
+- An old leader of a map group switchover that cannot resolve its hold because every other server is gone does not resume by itself; an operator ends the hold with the abandon call once a standby answers.
+- Automatic failover is off by default. Two failures at once, and a failure during a rebalance, are not tested on a cluster.
+- A cluster of one server has no failover; the phase 5 design says what two servers can and cannot do.
+- A failover cannot restore data that no standby had. The dry run says whether writes may be lost, and a real request must accept that explicitly.
+
+## The control plane and the console
+
+- **In progress: time partitioning of distributed tables.** The control plane and the console manage policies, storage conversion and approximate aggregates for ordinary tables only. A table that lives on another shard group's instance is answered 404, and a distributed table is refused by a storage conversion.
+- Export and import of a table (CSV, phase 14a) are off by default (`dataTransfer.enabled`), need TLS and `kingres_admin`, take at most 2 GiB of decompressed CSV in one import (256 MiB for a reference table), and have no batches, no skipping of rows and no `onError`. A failover of the manager leader at every step of a transfer is not tested on a cluster (the tests restart the leader and stop a shard group instead). Export and import of a **database** (phases 14b and 14c) come after the first release and are in progress.
+- The conversion of a table or partition to columnar storage and the runs of a policy are open only for tables of superusers unless the cluster setting `analytics.allowNonSuperuserOwners` is on, and a conversion needs the library `kingres_columnar` loaded by every instance of the cluster ([operator-guide.md](operator-guide.md), section 11).
+- `kingres-cli` is planned and not built; use the console and the REST API.
+- The table page does not yet have the progress indicator of a running change on a row of the tables list, and "distribute with related tables" is not built (**Open**).
+- A server whose start went back to the last good configuration file at a reboot is not shown as such on its page, and `max_parallel_workers` and `max_locks_per_transaction` have no floor in the Configuration page (**Open**).
+- A session belongs to the server that issued it.
+
+## The ledger
+
+- A check inside the database is relative to a digest that you keep elsewhere. The verifier proves what is in the files you give it and nothing else; it does not prove that a row was not changed later in the table or that no other rows exist ([../../verifier/README.md](../../verifier/README.md), "What it can and cannot prove").
+- A ledger table cannot be distributed or made a reference table (`create_distributed_table` and `create_reference_table` refuse it with SQLSTATE `KS016`, and `check_cluster` reports one that the catalog distributes); it cannot be columnar. `TRUNCATE` is rejected on ledger tables; ledger tables must be ordinary permanent tables (no partitioned, inheriting, temporary or unlogged tables), and there is no conversion between append-only and updatable for an existing table.
+- A database can be dropped with its ledger by every role that has the privileges of its owner or can `SET ROLE` to it; nothing inside the database prevents that. Publication and anchoring are what makes it visible.
+- Anchoring to RFC 3161 authorities and to OpenTimestamps was tested against local fakes only. The scheduled audit of the publication and the check of anchors inside `startLedgerVerification` are not built.
+- After a restore of the system database the aggregate log and the events cannot be re-derived: the operator accepts the loss, and the logs fork against what was published ([operator-guide.md](operator-guide.md), section 7).
+- The signing key's passphrase and the private keys must be backed up by you, apart from each other.
+
+## Columnar storage, sketches and time partitioning
+
+- `kingres_columnar`: append-only (no update or delete of rows), B-tree indexes only, no TOAST, serial and parallel scans only, no vectorised execution, logical decoding covers inserts only. Up to about 8.8 x 10^12 rows per table.
+- **The library is preloaded by `kingresd`** (`shared_preload_libraries = 'kingres_shard,kingres_ledger,kingres_columnar'`), but the list takes effect only at a restart of each instance. An instance of a package that was made before this change gets the new list when `kingresd` starts, and runs without the library until it is restarted: a columnar table is then read, but creating one, a write, and every conversion are refused with a message that names `shared_preload_libraries`. A primary that was restarted first and then wrote columnar WAL would be ahead of a standby that cannot replay it, so restart standbys of a group before its primary ([../../packaging/README.md](../../packaging/README.md), "The preload of `kingres_columnar`").
+- `kingres_columnar` uses the experimental WAL resource manager id (128). A real id must be reserved before it is used for data that matters; a change of the id changes what replay accepts.
+- Columnar tables in `kingres_shard` 0.9: a hash-distributed table can be columnar and bucket moves carry the access method (with `kingres_columnar` 0.2 or later; run `kingres.columnar_compact` afterwards, the move does not compact). The online variants of the table operations and a bucket split are refused for a columnar table, a reference table is always row storage, a ledger table cannot be columnar, and columnar tables in a distributed schema are not tested.
+- `kingres_sketch` aggregates (distinct count, top-n, percentiles) are approximate by design and can be computed in part by the shard groups. With `kingres_shard.count_distinct_mode = 'approximate'` a `count(DISTINCT x)` over a hash-distributed table is rewritten to an approximate one (`EXPLAIN` shows `approx_count_distinct(...)`, not a separate "Rewritten" line).
+- `kingres_timepart` works on ordinary tables; distributed tables are in progress. A `REPEATABLE READ` or `SERIALIZABLE` transaction whose snapshot is older than a conversion and has not read the table yet sees the converted partition empty. Retention and conversion of columnar partitions need `kingres_columnar` 0.2 on every server; a mixed cluster is not checked by `partition.maintain`.
+
+## Packaging and distribution
+
+- Debian package and container image, amd64, Ubuntu 24.04 only. No RPM, no arm64, no Windows server. No `-dbgsym` package, no `kingres-dev` package.
+- The packages and images are not signed, there is no apt repository, no SBOM, and no published image registry. Checksums are in `SHA256SUMS`, not signed.
+- No Patroni, no etcd and no bundled metrics store (by design: [../adr/0021-failover-in-kingresd.md](../adr/0021-failover-in-kingresd.md), [../adr/0020-no-bundled-metrics-store.md](../adr/0020-no-bundled-metrics-store.md)).
+- No automated backup, no point-in-time recovery archive configuration, and no backup of the certificate authority key ([operator-guide.md](operator-guide.md), section 7).
+- The compose cluster is for development; its test does not exercise removing a server, failover, switchover or rebalance.
+- No NLS, GSSAPI, LDAP, PAM, JIT or procedural languages other than PL/pgSQL are built in.
+- The bases are PostgreSQL 18.7 and PostgreSQL 19.0 ([install.md](install.md)). No release has been made and nothing is tagged.
+
+## Outside the code
+
+- KingresDB is derived from PostgreSQL. It is not PostgreSQL and is not endorsed by the PostgreSQL project. The name deliberately avoids the PostgreSQL marks, and a legal review of the name is still open ([../architecture.md](../architecture.md), the list of decisions).
+- The licence of KingresDB's own code is the GNU Affero General Public License, version 3 only; PostgreSQL's code keeps the PostgreSQL License ([../adr/0024-agpl-for-kingresdb-code.md](../adr/0024-agpl-for-kingresdb-code.md)).
+- The custody of the verifier's release signing key is the project owner's decision and is not made yet.
