@@ -41,6 +41,7 @@
 #include "catalog/pg_authid.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_namespace.h"
+#include "catalog/pg_type.h"
 #include "commands/extension.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
@@ -222,6 +223,33 @@ static struct
 static int	kc_am_cache_n = 0;
 static int	kc_am_cache_next = 0;
 
+/*
+ * The OIDs of the catalog table and of its index are checked (kc_catalog_check) when they are
+ * found, and the answer is kept only for the transaction: a change of the extension, of the
+ * schema or of a role drops it, and so does the end of any transaction (ALTER EXTENSION ... ADD
+ * or DROP of the table in another session sends no message to this one).
+ */
+void
+kc_catalog_reset(void)
+{
+	cached_catalog_oid = InvalidOid;
+	cached_index_oid = InvalidOid;
+}
+
+static void
+kc_catalog_cache_inval(Datum arg, int cacheid, uint32 hashvalue)
+{
+	kc_catalog_reset();
+}
+
+static void
+kc_catalog_xact_callback(XactEvent event, void *arg)
+{
+	if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_ABORT || event == XACT_EVENT_PREPARE)
+		kc_catalog_reset();
+}
+
+
 static void
 kc_am_cache_inval(Datum arg, int cacheid, uint32 hashvalue)
 {
@@ -234,6 +262,11 @@ kc_am_cache_init(void)
 {
 	CacheRegisterSyscacheCallback(AMOID, kc_am_cache_inval, (Datum) 0);
 	CacheRegisterSyscacheCallback(PROCOID, kc_am_cache_inval, (Datum) 0);
+	/* the decision that the catalog is the extension's own is made again after these change, and per transaction */
+	CacheRegisterSyscacheCallback(EXTENSIONOID, kc_catalog_cache_inval, (Datum) 0);
+	CacheRegisterSyscacheCallback(NAMESPACEOID, kc_catalog_cache_inval, (Datum) 0);
+	CacheRegisterSyscacheCallback(AUTHOID, kc_catalog_cache_inval, (Datum) 0);
+	RegisterXactCallback(kc_catalog_xact_callback, NULL);
 }
 
 static bool
@@ -615,7 +648,25 @@ kc_catalog_check_shape(Relation cat)
 	 * reserved (kc_catalog_has_reserved is false).
 	 */
 	if (natts == Natts_kc_stripe || natts == Natts_kc_stripe_v01)
+	{
+		/* the types of the columns too: the rows are read with heap_getattr, which trusts the descriptor */
+		static const Oid want[Natts_kc_stripe] = {INT8OID, INT8OID, INT8OID, INT4OID, INT4OID, INT2OID,
+												  INT8OID, INT4OID, INT8OID, INT8OID, INT8OID, BYTEAOID,
+												  BYTEAOID, BOOLOID, BOOLOID};
+		int			i;
+
+		for (i = 0; i < natts; i++)
+		{
+			Form_pg_attribute att = TupleDescAttr(RelationGetDescr(cat), i);
+
+			if (att->attisdropped || att->atttypid != want[i])
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("column %d of the stripe catalog does not have the type this build expects", i + 1),
+						 errhint("The catalog does not belong to this build and cannot be repaired by it; restore it from a backup of the database.")));
+		}
 		return natts;
+	}
 	if (natts == Natts_kc_stripe_v01 - 1)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),

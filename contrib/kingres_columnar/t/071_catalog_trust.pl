@@ -108,6 +108,30 @@ unlike($err, qr/server closed the connection|terminated/i, 'C: ... and no crash'
 is($rc, 0, 'C: the real catalog works') or diag($err);
 like($out, qr/^21$/m, 'C: ... and the rows are there');
 
+# C2. the right number of columns and the wrong types is refused; and what a session has seen is looked at again after
+# ALTER EXTENSION ... DROP in the same session (the catalog was read first, so its OIDs were cached)
+($rc, $out, $err) = as_super('postgres', q{
+	BEGIN;
+	ALTER TABLE kingres.columnar_stripe RENAME TO columnar_stripe_real;
+	CREATE TABLE kingres.columnar_stripe (c1 bigint, c2 bigint, c3 bigint, c4 bigint, c5 bigint, c6 bigint, c7 bigint, c8 bigint,
+	                                      c9 bigint, c10 bigint, c11 bigint, c12 bytea, c13 bytea, c14 boolean, c15 boolean,
+	                                      CONSTRAINT columnar_stripe_pkey2 PRIMARY KEY (c1, c2));
+	ALTER EXTENSION kingres_columnar ADD TABLE kingres.columnar_stripe;
+	SELECT count(*) FROM c;
+	ROLLBACK;
+});
+isnt($rc, 0, 'C2: the right number of columns with other types is refused');
+like($err, qr/does not have the type this build expects|is not a member/, 'C2: ... the error says why') or diag($err);
+($rc, $out, $err) = as_super('postgres', q{
+	SELECT count(*) FROM c;
+	BEGIN;
+	ALTER EXTENSION kingres_columnar DROP TABLE kingres.columnar_stripe;
+	SELECT count(*) FROM c;
+	ROLLBACK;
+});
+isnt($rc, 0, 'C2: the catalog read before ALTER EXTENSION ... DROP is looked at again in the same session');
+like($err, qr/is not a member of the extension/, 'C2: ... and found not to be a member') or diag($err);
+
 # D
 is(q1($node, q{SELECT pg_postmaster_start_time()::text}), $started, 'D: the postmaster did not restart');
 unlike(log_text(), qr/terminated by signal|was terminated|TRAP:/, 'D: no process ended by a signal');
