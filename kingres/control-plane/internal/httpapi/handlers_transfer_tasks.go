@@ -108,3 +108,8 @@ func (s *Server) validateDatabaseArchive(c *call, w http.ResponseWriter, r *http
 	s.accepted(w, r, t)
 	return nil
 }
+
+// importDatabase starts the task database.import (contract 0.41.0).
+func (s *Server) importDatabase(c *call, w http.ResponseWriter, r *http.Request) error {
+	return problem.New(problem.UnsupportedOp, "Database import is not available yet.")
+}

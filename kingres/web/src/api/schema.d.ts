@@ -3992,6 +3992,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/database-imports": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Import a database archive as a new database
+         * @description Added in 0.41.0 (data transfer, phase 14c; the number is a placeholder). Starts the task `database.import` (subject type `database`, id the name of the new database): the archive of a complete upload
+         *     (purpose `databaseArchive`, made by `exportDatabase`) is loaded into a **new** database. The archive is **hostile input**: the task reads it again from its bytes (the whole validator and the shape grammar, then
+         *     the SHA-256 against `expectedSha256`), whatever `validateDatabaseArchive` said before. The SQL of the archive is never run as it is: a **shape grammar** accepts only the statements `pg_dump` writes for
+         *     schemas, tables, sequences, types, domains, indexes, constraints, views and comments, and **refuses** functions, triggers, policies, rules, `GRANT`, `SET`, `ALTER DATABASE`, `COPY`, `DO` and everything else
+         *     (422 `archive_statement_refused`; `reasons` name the kind, the position and a fingerprint, never the text). There is no `allowCode` and no `privileges: restore`: every object is owned by the importing role.
+         *     The statements run **as the signed-in role**, one per round trip, never as the service role, so PostgreSQL's privileges are the guarantee; a role with `SUPERUSER`, `REPLICATION` or `BYPASSRLS`, or with access to
+         *     server files, programs or logs, is refused with 403 `forbidden` and must sign in as another role. The extensions of the archive are installed from a closed list.
+         *
+         *     The import works in a database with a **private name** (`kingres_import_<task id>`) that only the task uses, and renames it to its final name as its last step; a failed or cancelled import drops the private database
+         *     (unless `keepOnFailure`), and nothing of the final name exists. Order: the extensions, the tables, the distribution of the tables **while they are empty**, the views, the data (one transaction per table, the rows
+         *     counted against the manifest), the indexes and constraints, the sequences, then the ledger and the time-partition policies. **Ledger tables are carried as data and start a new chain** (ADR 0028): the import
+         *     enters their rows as the first entries of a new chain, `ledger_verify` must find nothing, and then the signature policy of the source is set again; it needs `acknowledgeLedgerRestart: true` (422
+         *     `ledger_restart_not_acknowledged` otherwise). **Time-partition policies come back disabled**; the task's last detail lists them with the call that enables each.
+         *
+         *     Needs `kingres_admin`, `dataTransfer.enabled` (403 `data_transfer_disabled`) and a request over TLS (403 `insecure_transport`). 404: the upload does not exist or is another role's. 409 `upload_incomplete`;
+         *     409 `already_exists`: the database exists; 409 `operation_in_progress`: a task uses the upload or the transfer limit is reached. 422 `archive_invalid`, `archive_incompatible` (the PostgreSQL major of the
+         *     target must be at least the source's), `archive_statement_refused`, `import_too_large` (more than `maxImportBytes`, a statement or a count above its limit) and `ledger_restart_not_acknowledged`.
+         *     Steps: *Check the archive*, *Create the private database* (and one step for each other server), *Install the extensions*, *Check the functions*, *Create the tables*, *Distribute the tables*, *Create the views*,
+         *     *Load the data*, *Create the indexes and constraints*, *Set the sequences*, *Enable the ledger and the policies*, *Verify*, *Take the final name*. A task is cancellable until *Set the sequences* starts.
+         *     Task codes: `archive_invalid`, `archive_incompatible`, `archive_statement_refused`, `foreign_key_violation` (the constraint's name and the count), `table_not_eligible`, `row_count_mismatch`, `verification_failed`,
+         *     `transfer_leader_changed` (retryable), `transfer_session_lost` (retryable), `forbidden`, `cancelled`. The error of a task never carries a value, a row, the text of a statement or text of the server.
+         */
+        post: operations["importDatabase"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/data-exports": {
         parameters: {
             query?: never;
@@ -4122,7 +4162,7 @@ export interface components {
          *     system database was stopped on purpose; start it with `startThisServerInstance`).
          * @enum {string}
          */
-        ProblemCode: "bad_request" | "validation_failed" | "unauthenticated" | "invalid_credentials" | "session_expired" | "csrf_token_invalid" | "forbidden" | "setup_token_invalid" | "not_found" | "method_not_allowed" | "conflict" | "already_exists" | "immutable_field" | "rebalance_in_progress" | "operation_in_progress" | "task_not_cancellable" | "last_admin" | "role_in_use" | "optimistic_lock_failed" | "no_replica_available" | "instance_already_running" | "instance_already_stopped" | "server_owns_buckets" | "server_hosts_map_group" | "last_server" | "server_group_not_empty" | "ledger_entry_pending" | "quorum_unavailable" | "system_database_stopped" | "unprocessable" | "sql_error" | "unsupported_operation" | "node_state_invalid" | "node_uninitialized" | "map_group_unavailable" | "leader_unavailable" | "rate_limited" | "service_unavailable" | "internal_error" | "certificate_revoked" | "certificate_authority_unavailable" | "internal_api_disabled" | "workbench_busy" | "config_parameter_unknown" | "config_parameter_managed" | "config_parameter_refused" | "config_level_not_allowed" | "config_value_below_floor" | "config_change_superseded" | "config_restart_order_conflict" | "nothing_pending" | "nothing_to_rebalance" | "rebalance_not_running" | "cluster_inconsistent" | "version_mismatch" | "failover_in_progress" | "group_degraded" | "insufficient_disk" | "no_receiving_server" | "replicas_cannot_be_kept" | "sharding_mode_in_use" | "schema_not_distributable" | "schema_pinned" | "schema_move_in_progress" | "bucket_busy" | "split_unsupported" | "failover_needs_decision" | "lease_settings_differ" | "ledger_not_published" | "origin_prefix_locked" | "signing_key_missing" | "last_signing_key" | "chain_not_diverged" | "table_not_eligible" | "extension_unavailable" | "extension_version_mismatch" | "sketch_hash_mismatch" | "extension_missing" | "conversion_refused" | "partition_policy_conflict" | "data_transfer_disabled" | "insecure_transport" | "transfer_quota_exceeded" | "upload_incomplete" | "upload_offset_mismatch" | "chunk_too_large" | "upload_checksum_mismatch" | "import_header_mismatch" | "import_ledger_policy" | "import_too_large" | "import_end_marker" | "export_untrusted_code" | "export_not_readable" | "large_objects_present" | "schema_unrecognised" | "archive_invalid" | "archive_incompatible";
+        ProblemCode: "bad_request" | "validation_failed" | "unauthenticated" | "invalid_credentials" | "session_expired" | "csrf_token_invalid" | "forbidden" | "setup_token_invalid" | "not_found" | "method_not_allowed" | "conflict" | "already_exists" | "immutable_field" | "rebalance_in_progress" | "operation_in_progress" | "task_not_cancellable" | "last_admin" | "role_in_use" | "optimistic_lock_failed" | "no_replica_available" | "instance_already_running" | "instance_already_stopped" | "server_owns_buckets" | "server_hosts_map_group" | "last_server" | "server_group_not_empty" | "ledger_entry_pending" | "quorum_unavailable" | "system_database_stopped" | "unprocessable" | "sql_error" | "unsupported_operation" | "node_state_invalid" | "node_uninitialized" | "map_group_unavailable" | "leader_unavailable" | "rate_limited" | "service_unavailable" | "internal_error" | "certificate_revoked" | "certificate_authority_unavailable" | "internal_api_disabled" | "workbench_busy" | "config_parameter_unknown" | "config_parameter_managed" | "config_parameter_refused" | "config_level_not_allowed" | "config_value_below_floor" | "config_change_superseded" | "config_restart_order_conflict" | "nothing_pending" | "nothing_to_rebalance" | "rebalance_not_running" | "cluster_inconsistent" | "version_mismatch" | "failover_in_progress" | "group_degraded" | "insufficient_disk" | "no_receiving_server" | "replicas_cannot_be_kept" | "sharding_mode_in_use" | "schema_not_distributable" | "schema_pinned" | "schema_move_in_progress" | "bucket_busy" | "split_unsupported" | "failover_needs_decision" | "lease_settings_differ" | "ledger_not_published" | "origin_prefix_locked" | "signing_key_missing" | "last_signing_key" | "chain_not_diverged" | "table_not_eligible" | "extension_unavailable" | "extension_version_mismatch" | "sketch_hash_mismatch" | "extension_missing" | "conversion_refused" | "partition_policy_conflict" | "data_transfer_disabled" | "insecure_transport" | "transfer_quota_exceeded" | "upload_incomplete" | "upload_offset_mismatch" | "chunk_too_large" | "upload_checksum_mismatch" | "import_header_mismatch" | "import_ledger_policy" | "import_too_large" | "import_end_marker" | "export_untrusted_code" | "export_not_readable" | "large_objects_present" | "schema_unrecognised" | "archive_invalid" | "archive_incompatible" | "archive_statement_refused" | "ledger_restart_not_acknowledged";
         /** @description One invalid field of a request. */
         ValidationIssue: {
             /** @description JSON Pointer (RFC 6901) to the invalid property of the request body, or the name of the invalid query or path parameter. */
@@ -6940,7 +6980,7 @@ export interface components {
          *     (section "Task kinds and subjects"). `standby.reconcile` is added in 0.7.0; the `ledger.key.*`, `ledger.bundle.create`, `ledger.epoch.start` and `ledger.upgrade` kinds in 0.11.0; `table.export` and `table.import` (subject `database/schema.table`) in 0.19.0; `database.export` (subject type `database`) and `archive.validate` (subject type `upload`) in 0.40.0.
          * @enum {string}
          */
-        TaskKind: "cluster.init" | "cluster.join" | "server.add" | "server.remove" | "server.failover" | "server.leave" | "instance.start" | "instance.stop" | "instance.restart" | "database.create" | "database.update" | "database.drop" | "table.distribute" | "rebalance" | "bucket.split" | "schema.distribute" | "schema.move" | "schema.undistribute" | "replication.restorePreferredPrimaries" | "ledger.verify" | "networkAccess.apply" | "replicate.apply" | "certificate.renew" | "certificate.revoke" | "standby.reconcile" | "config.apply" | "config.restart" | "ledger.key.create" | "ledger.key.rotate" | "ledger.key.retire" | "ledger.key.revoke" | "ledger.key.distribute" | "ledger.bundle.create" | "ledger.epoch.start" | "ledger.upgrade" | "table.undistribute" | "table.alter" | "table.partition" | "database.approximateAggregates" | "table.setStorage" | "partition.maintain" | "table.export" | "table.import" | "database.export" | "archive.validate";
+        TaskKind: "cluster.init" | "cluster.join" | "server.add" | "server.remove" | "server.failover" | "server.leave" | "instance.start" | "instance.stop" | "instance.restart" | "database.create" | "database.update" | "database.drop" | "table.distribute" | "rebalance" | "bucket.split" | "schema.distribute" | "schema.move" | "schema.undistribute" | "replication.restorePreferredPrimaries" | "ledger.verify" | "networkAccess.apply" | "replicate.apply" | "certificate.renew" | "certificate.revoke" | "standby.reconcile" | "config.apply" | "config.restart" | "ledger.key.create" | "ledger.key.rotate" | "ledger.key.retire" | "ledger.key.revoke" | "ledger.key.distribute" | "ledger.bundle.create" | "ledger.epoch.start" | "ledger.upgrade" | "table.undistribute" | "table.alter" | "table.partition" | "database.approximateAggregates" | "table.setStorage" | "partition.maintain" | "table.export" | "table.import" | "database.export" | "archive.validate" | "database.import";
         /** @description One step of a task. */
         TaskStep: {
             /** @description Step name. */
@@ -7296,7 +7336,7 @@ export interface components {
          *     `failure`. Read-only operations are not audited except `executeQuery` and (0.19.0) `downloadDataExport`, because it is where data leaves. From 0.19.0 also `dataTransfer.completed` (a data transfer task ended, written by the task) and `dataTransfer.purged` (the janitor deleted staged files), actor `system`. An upload chunk is not an event.
          * @enum {string}
          */
-        AuditAction: "login" | "logout" | "loginFailed" | "setupTokenRejected" | "initCluster" | "joinCluster" | "updateThisServerSettings" | "restartThisServerInstance" | "stopThisServerInstance" | "startThisServerInstance" | "leaveCluster" | "addServer" | "updateServer" | "removeServer" | "failoverServer" | "abandonMapGroupBootstrap" | "autoFailover" | "createServerGroup" | "deleteServerGroup" | "createDatabase" | "updateDatabase" | "dropDatabase" | "distributeTable" | "enableTableLedger" | "restorePreferredPrimaries" | "startRebalance" | "stopRebalance" | "cancelTask" | "createRole" | "updateRole" | "deleteRole" | "setRoleMemberships" | "setRoleClusterRoles" | "createGrant" | "revokeGrants" | "applyGrantTemplate" | "replaceNetworkAccess" | "updateClusterSettings" | "generateLedgerDigest" | "startLedgerVerification" | "executeQuery" | "acknowledgeAlert" | "renewServerCertificates" | "revokeServerCertificates" | "certificateRenewed" | "certificateRenewalFailed" | "cancelStatement" | "leaseLost" | "leaseFenced" | "leaseAcquired" | "standbyCreated" | "standbyRemoved" | "standbyRebuilt" | "standbyInstanceStarted" | "standbyInstanceRemoved" | "standbyInstanceRebuilt" | "synchronousStandbyNamesChanged" | "replicationSlotDropped" | "applyConfigChange" | "revertConfigChange" | "restartPendingInstances" | "resetAutoFailoverCounter" | "failoverGroupStarted" | "failoverGroupPromoted" | "failoverGroupFailed" | "oldPrimaryRebuilt" | "updateLedgerSettings" | "createLedgerSigningKey" | "retireLedgerSigningKey" | "revokeLedgerSigningKey" | "createLedgerAnchorTarget" | "updateLedgerAnchorTarget" | "deleteLedgerAnchorTarget" | "testLedgerAnchorTarget" | "anchorLedgerNow" | "retryLedgerAnchor" | "createLedgerBundle" | "registerLedgerClientKey" | "revokeLedgerClientKey" | "setTableSignaturePolicy" | "upgradeLedgerExtension" | "acknowledgeLedgerDivergence" | "previewTableChange" | "undistributeTable" | "alterTableDistribution" | "createTablePartition" | "attachTablePartition" | "detachTablePartition" | "dropTablePartition" | "drainServer" | "splitBucket" | "previewBucketSplit" | "distributeSchema" | "undistributeSchema" | "moveSchema" | "configureApproximateAggregates" | "setTableStorage" | "setPartitionStorage" | "putPartitionPolicy" | "deletePartitionPolicy" | "runPartitionPolicy" | "exportTable" | "importTable" | "createDataUpload" | "deleteDataUpload" | "downloadDataExport" | "deleteDataExport" | "exportDatabase" | "validateDatabaseArchive" | "dataTransfer.completed" | "dataTransfer.purged";
+        AuditAction: "login" | "logout" | "loginFailed" | "setupTokenRejected" | "initCluster" | "joinCluster" | "updateThisServerSettings" | "restartThisServerInstance" | "stopThisServerInstance" | "startThisServerInstance" | "leaveCluster" | "addServer" | "updateServer" | "removeServer" | "failoverServer" | "abandonMapGroupBootstrap" | "autoFailover" | "createServerGroup" | "deleteServerGroup" | "createDatabase" | "updateDatabase" | "dropDatabase" | "distributeTable" | "enableTableLedger" | "restorePreferredPrimaries" | "startRebalance" | "stopRebalance" | "cancelTask" | "createRole" | "updateRole" | "deleteRole" | "setRoleMemberships" | "setRoleClusterRoles" | "createGrant" | "revokeGrants" | "applyGrantTemplate" | "replaceNetworkAccess" | "updateClusterSettings" | "generateLedgerDigest" | "startLedgerVerification" | "executeQuery" | "acknowledgeAlert" | "renewServerCertificates" | "revokeServerCertificates" | "certificateRenewed" | "certificateRenewalFailed" | "cancelStatement" | "leaseLost" | "leaseFenced" | "leaseAcquired" | "standbyCreated" | "standbyRemoved" | "standbyRebuilt" | "standbyInstanceStarted" | "standbyInstanceRemoved" | "standbyInstanceRebuilt" | "synchronousStandbyNamesChanged" | "replicationSlotDropped" | "applyConfigChange" | "revertConfigChange" | "restartPendingInstances" | "resetAutoFailoverCounter" | "failoverGroupStarted" | "failoverGroupPromoted" | "failoverGroupFailed" | "oldPrimaryRebuilt" | "updateLedgerSettings" | "createLedgerSigningKey" | "retireLedgerSigningKey" | "revokeLedgerSigningKey" | "createLedgerAnchorTarget" | "updateLedgerAnchorTarget" | "deleteLedgerAnchorTarget" | "testLedgerAnchorTarget" | "anchorLedgerNow" | "retryLedgerAnchor" | "createLedgerBundle" | "registerLedgerClientKey" | "revokeLedgerClientKey" | "setTableSignaturePolicy" | "upgradeLedgerExtension" | "acknowledgeLedgerDivergence" | "previewTableChange" | "undistributeTable" | "alterTableDistribution" | "createTablePartition" | "attachTablePartition" | "detachTablePartition" | "dropTablePartition" | "drainServer" | "splitBucket" | "previewBucketSplit" | "distributeSchema" | "undistributeSchema" | "moveSchema" | "configureApproximateAggregates" | "setTableStorage" | "setPartitionStorage" | "putPartitionPolicy" | "deletePartitionPolicy" | "runPartitionPolicy" | "exportTable" | "importTable" | "createDataUpload" | "deleteDataUpload" | "downloadDataExport" | "deleteDataExport" | "exportDatabase" | "validateDatabaseArchive" | "importDatabase" | "dataTransfer.completed" | "dataTransfer.purged";
         /** @description One audit log entry. */
         AuditEvent: {
             /**
@@ -9445,6 +9485,34 @@ export interface components {
             /** @description How long the archive is kept; default the cluster setting. */
             retentionHours?: number;
         };
+        /**
+         * @description Added in 0.41.0. The request of `importDatabase`. A closed schema: there is no `privileges`, no `allowCode` and no `bucketCount` (owners and grants are not restored, functions and triggers are always refused, the
+         *     bucket counts of the archive are kept), so that a later revision can add them without changing what a request means.
+         */
+        ImportDatabaseRequest: {
+            /** @description A complete upload of the caller whose purpose is `databaseArchive`. It need not have been validated: the import reads the archive again. */
+            uploadId: string;
+            /** @description The name of the new database; default the name in the manifest. 409 `already_exists` when it exists at the request, and the task fails when it exists when the final name is taken. */
+            database?: string;
+            /** @description Binds the import to a checksum the operator got elsewhere (the export's SHA-256 as the console shows it); a different file is 422 `archive_invalid`. */
+            expectedSha256?: string;
+            /**
+             * @description Required `true` when the archive has a ledger table; the imported table is a new chain (ADR 0028). 422 `ledger_restart_not_acknowledged` otherwise.
+             * @default false
+             */
+            acknowledgeLedgerRestart?: boolean;
+            /**
+             * @description `fail`: a foreign key that the loaded rows violate fails the task (the code `foreign_key_violation` names the constraint and the count) and the database is removed. `keepNotValid`: the constraint stays `NOT VALID`, the database is kept and the violations are reported by constraint name and count.
+             * @default fail
+             * @enum {string}
+             */
+            onForeignKeyViolation?: "fail" | "keepNotValid";
+            /**
+             * @description Keep the private database if the import fails, to look at it. It stays under its private name until it is dropped.
+             * @default false
+             */
+            keepOnFailure?: boolean;
+        };
         /** @description Added in 0.40.0. The result of the validation of a database archive (`validateDatabaseArchive`, stored with the upload). Nothing in it is a value of the data or the text of a statement. */
         ArchiveReport: {
             valid: boolean;
@@ -9767,6 +9835,21 @@ export interface components {
          *     `detail` is `transfer <id>`, the id to give to `getDataExport` and `downloadDataExport`.
          */
         AcceptedDatabaseExport: {
+            headers: {
+                /** @description URL of the task, `/api/v1/tasks/{taskId}`. */
+                Location?: string;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Task"];
+            };
+        };
+        /**
+         * @description The import was accepted and runs as the task `database.import` (added in 0.41.0). Poll `GET /tasks/{taskId}` (the `Location` header) until `state` is `done` or `failed`. When it is `done` the database
+         *     exists under its final name and `detail` lists what needs a decision (the disabled time-partition policies, the ledger chains that started again); when it failed the private database was removed (or kept, with
+         *     `keepOnFailure`) and the final name was never taken.
+         */
+        AcceptedDatabaseImport: {
             headers: {
                 /** @description URL of the task, `/api/v1/tasks/{taskId}`. */
                 Location?: string;
@@ -15077,6 +15160,30 @@ export interface operations {
         requestBody?: never;
         responses: {
             202: components["responses"]["AcceptedArchiveValidation"];
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["DataTransferForbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["DataTransferConflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    importDatabase: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ImportDatabaseRequest"];
+            };
+        };
+        responses: {
+            202: components["responses"]["AcceptedDatabaseImport"];
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["DataTransferForbidden"];

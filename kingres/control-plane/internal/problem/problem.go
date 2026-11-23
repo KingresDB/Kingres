@@ -138,6 +138,10 @@ const (
 	SchemaUnrecognised  Code = "schema_unrecognised"
 	ArchiveInvalid      Code = "archive_invalid"
 	ArchiveIncompatible Code = "archive_incompatible"
+
+	// Contract 0.41.0 (database import).
+	ArchiveStatementRefused      Code = "archive_statement_refused"
+	LedgerRestartNotAcknowledged Code = "ledger_restart_not_acknowledged"
 )
 
 // FieldError is one entry of the "errors" extension (schema ValidationIssue).
@@ -301,6 +305,8 @@ var specs = map[Code]struct {
 	SchemaUnrecognised:              {422, "The schema has an object the archive does not carry", "schema-unrecognised"},
 	ArchiveInvalid:                  {422, "The archive is not valid", "archive-invalid"},
 	ArchiveIncompatible:             {422, "The archive does not fit this cluster", "archive-incompatible"},
+	ArchiveStatementRefused:         {422, "The archive has a statement that is not allowed", "archive-statement-refused"},
+	LedgerRestartNotAcknowledged:    {422, "The import restarts the ledger chains", "ledger-restart-not-acknowledged"},
 }
 
 // New returns a Problem for the code with the standard status, title and
