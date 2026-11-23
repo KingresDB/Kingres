@@ -114,7 +114,7 @@ func (b *PG) Plan(ctx context.Context, dbs []string, o Options) ([]Move, error) 
 		})
 		var pe *pgconn.PgError
 		switch {
-		case errors.As(err, &pe) && pe.Code == "55000" && strings.Contains(pe.Message, "no shard group accepts"):
+		case noReceivingGroup(err):
 			return nil, problem.New(problem.NoReceivingServer, "No server should hold shards in database "+db+".")
 		case errors.As(err, &pe) && pe.Code == "55000" && strings.Contains(pe.Message, "does not answer"):
 			return nil, problem.New(problem.ServiceUnavailable, "The size of the buckets cannot be read: "+pe.Message).WithRetryAfter(10)
@@ -239,4 +239,20 @@ func (b *PG) Loads(ctx context.Context, dbs []string, o Options) ([]GroupLoad, e
 		return out[i].Group < out[j].Group
 	})
 	return out, nil
+}
+
+// noReceivingGroup tells the refusal of the extension for a database in which no shard group may receive buckets (SQLSTATE 55000). The
+// extension words it differently by version and function ("no shard group accepts buckets", "no shard group can receive buckets",
+// "no shard group can hold buckets"); all of them are the answer no_receiving_server, not an error of the inspection.
+func noReceivingGroup(err error) bool {
+	var pe *pgconn.PgError
+	if !errors.As(err, &pe) || pe.Code != "55000" {
+		return false
+	}
+	for _, w := range []string{"no shard group accepts", "no shard group can receive", "no shard group can hold"} {
+		if strings.Contains(pe.Message, w) {
+			return true
+		}
+	}
+	return false
 }

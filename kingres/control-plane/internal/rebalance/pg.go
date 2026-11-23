@@ -262,8 +262,7 @@ func (b *PG) planLegacy(ctx context.Context, dbs []string) ([]Move, error) {
 			}
 			return rows.Err()
 		})
-		var pe *pgconn.PgError
-		if errors.As(err, &pe) && pe.Code == "55000" && strings.Contains(pe.Message, "no shard group accepts") {
+		if noReceivingGroup(err) {
 			return nil, problem.New(problem.NoReceivingServer, "No server should hold shards in database "+db+".")
 		}
 		if err != nil {
