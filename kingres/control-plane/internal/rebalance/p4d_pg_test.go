@@ -35,6 +35,7 @@ func callStub(t *testing.T, e *guardEnv, seconds int) *pgx.Conn {
 			t.Fatal(err)
 		}
 	}
+	trustStub(t, stub)
 	return stub
 }
 

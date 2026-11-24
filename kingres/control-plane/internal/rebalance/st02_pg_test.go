@@ -50,6 +50,7 @@ func TestABrokenObservationSessionDoesNotCancelARecordedMove(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	trustStub(t, stub)
 	conns := &recordingConns{guardEnv: e}
 	b := &PG{Conns: conns, GuardHold: 1500 * time.Millisecond}
 	b.afterGuard = func(context.Context) {

@@ -34,6 +34,7 @@ func extStub(t *testing.T, e *guardEnv) *pgx.Conn {
 			t.Fatal(err)
 		}
 	}
+	trustStub(t, stub)
 	return stub
 }
 
