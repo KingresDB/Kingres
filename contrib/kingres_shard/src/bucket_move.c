@@ -572,11 +572,14 @@ move_take_bounded(const LOCKTAG *tag, const char *what)
 	}
 }
 
-/* Let go of a session lock when this session holds it (no warning when it does not). */
+/*
+ * Let go of a session lock completely: as often as this session took it (a session that took it twice,
+ * after a leak or a second call, holds a count of two), with no warning when it holds nothing.
+ */
 static void
 move_drop_if_held(const LOCKTAG *tag)
 {
-	if (LockHeldByMe(tag, ExclusiveLock, false))
+	while (LockHeldByMe(tag, ExclusiveLock, false))
 		(void) LockRelease(tag, ExclusiveLock, true);
 }
 
@@ -675,6 +678,32 @@ kingres_internal_move_group_held(PG_FUNCTION_ARGS)
 	require_superuser("kingres.internal_move_group_held()");
 	move_group_locktag(PG_GETARG_INT32(0), PG_GETARG_INT32(1), &tag);
 	PG_RETURN_BOOL(move_probe(&tag));
+}
+
+/*
+ * kingres.internal_move_release(move_id, colocation_id, bucket): lets go of the mark of the move and of the lock of
+ * the start in one call (no interrupt check between the two), whichever of the arguments are null.  The handler of
+ * move_bucket() calls it on every way out, also when a second cancel hit the undo.
+ */
+PG_FUNCTION_INFO_V1(kingres_internal_move_release);
+
+Datum
+kingres_internal_move_release(PG_FUNCTION_ARGS)
+{
+	LOCKTAG		tag;
+
+	require_superuser("kingres.internal_move_release()");
+	if (!PG_ARGISNULL(0))
+	{
+		move_locktag(PG_GETARG_INT64(0), &tag);
+		move_drop_if_held(&tag);
+	}
+	if (!PG_ARGISNULL(1) && !PG_ARGISNULL(2))
+	{
+		move_group_locktag(PG_GETARG_INT32(1), PG_GETARG_INT32(2), &tag);
+		move_drop_if_held(&tag);
+	}
+	PG_RETURN_VOID();
 }
 
 /*

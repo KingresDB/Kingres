@@ -2749,7 +2749,7 @@ reports a `stalled_move`). The record of a move is written and committed by a se
 lock of (colocation group, bucket) that nothing else takes (kept from before the record is written until the mark is held), and the recovery looks at it before the mark, so a move in
 *preparing* is alive however long its session stalls (the grace of `2 x node_timeout` after the last update stays as a second guard, and it is what protects a *switching* move). Both locks are bounded: a wait gives up after `kingres_shard.node_timeout`
 seconds with `object_in_use`, and `move_bucket()` lets go of both in one handler on every way out, an error or a cancel included (fault points `move_after_begin` and `move_after_mark`;
-`t/282_move_start_lock.pl`). A move in *switching* is decided by the two-phase commit: the phase
+`t/282_move_start_lock.pl`; a second cancel during the undo, a lock taken twice and a starter that dies between the record and the mark are tested there too). The lock of the start covers the newest record of the bucket only. A move in *switching* is decided by the two-phase commit: the phase
 becomes *cleaning* in the same transaction as the bucket map, so a *switching* row
 after a crash is a switch that did not commit. `resume` waits `2 x
 kingres_shard.node_timeout` after the last update before it undoes such a move, so
@@ -2779,6 +2779,11 @@ The cleanup and the recovery worker do not warn and do not fail: they leave it a
 and the next pass of `cleanup_moved_buckets()` / `cleanup_bucket_splits()` or of the worker drops the orphan and finishes the move. A superuser who wants the orphan gone at once
 drops the dependents or the orphan with `CASCADE` by hand, knowing what is reached. `t/283_orphan_dependents.pl` has the four kinds of dependent on a move, the record and the check, the
 owner dropping them one by one, the worker's pass, and the same for a split.
+The orphans of one move are dropped in rounds (a foreign key between two of them is resolved), and a move or split is called *done* only when no orphan is left, not when the
+list of dependents is empty: an orphan that is still there with nothing to name is reported as "N orphan table(s) are still there and the DROP was refused". The list of dependents
+covers the table, its leaves, its indexes and its row type with the array type of it. Known limits: the tenant owns the orphan, so a view on it keeps the whole copy on the source node
+for as long as the view exists (the check says so; there is no age limit), and the tenant can keep reading it; a tenant that moves the orphan out of schema `kingres` takes it out of the
+cleanup's sight (not new). A schema move does not drop tables (it empties the shells), so it has no such dependents.
 
 The helper functions `kingres.internal_placement_hash()` and
 `kingres.internal_map_version()` are called by the sessions of other nodes, which

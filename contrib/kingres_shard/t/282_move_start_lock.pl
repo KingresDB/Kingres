@@ -14,6 +14,7 @@
 #   C. a second move of the same bucket waits for the lock of the first, then finds the bucket being moved
 #   D. the waits are bounded: another session holds the lock of the start, or the mark of a move, longer than node_timeout
 #   E. the probe of the lock of the start does not leave a lock behind
+#   F. a second cancel while the undo runs, a lock taken twice, a starter that dies between record and mark, a real error of the begin
 
 use strict;
 use warnings FATAL => 'all';
@@ -238,6 +239,104 @@ is(clean(), '', 'the cluster is clean at the start');
 	is(q1($n1, qq{SELECT kingres.internal_move_group_take($C, 0)::text || kingres.internal_move_group_held($C, 0)::text || (SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid())::text}), q{false1}, q{E: a session holds its own lock and does not see it as held by another});
 	is(advisory_locks(), '0', 'E: and the end of the session lets go of it');
 	is(clean(), '', 'E: check_cluster() finds nothing');
+}
+
+
+# ---------------------------------------------------------------------------
+# F. a second cancel while the undo runs, a double take, a dead starter, a real error of the begin
+# ---------------------------------------------------------------------------
+sub script_session
+{
+	my ($sql, $name) = @_;
+	my $f = "$tmp/script_$name.sql";
+	open(my $fh, '>', $f) or die;
+	print $fh $sql;
+	close($fh);
+	my $pid = fork();
+	die 'fork' unless defined $pid;
+	if ($pid == 0)
+	{
+		system("psql -X -At -h " . $n1->host . " -p " . $n1->port . " -d postgres -f $f > $tmp/out_$name 2>&1");
+		POSIX::_exit(0);
+	}
+	return $pid;
+}
+{
+	# F1. the move is cancelled at move_after_preparing; the undo (a remote call) waits for the cluster lock that a test session holds; a second cancel arrives
+	# while it waits.  The session is pooled (a DO block catches the errors and goes on): it must hold neither the mark nor the lock of the start afterwards.
+	my $b = 0;
+	my $tgt = other($b);
+	my $file = "$tmp/wait_f1";
+	open(my $fh, '>', $file) or die;
+	close($fh);
+	my $pid = script_session(qq{SET kingres_shard.fault_injection = 'move_after_preparing:wait:$file';
+DO \$\$ BEGIN PERFORM kingres.move_bucket($C, $b, $tgt); EXCEPTION WHEN OTHERS OR query_canceled THEN RAISE NOTICE 'caught %', SQLERRM; END \$\$;
+RESET kingres_shard.fault_injection;
+SELECT 'locks=' || count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted AND pid = pg_backend_pid();
+}, 'f1');
+	ok(wait_for_fault_file("$file.reached", 60), 'F1: a move of bucket 0 waits at move_after_preparing');
+	my $h = holder(q{LOCK TABLE kingres.map_version IN EXCLUSIVE MODE}, 'f1h');
+	ok($n1->poll_query_until('postgres', q{SELECT count(*) = 1 FROM pg_locks WHERE locktype = 'relation' AND relation = 'kingres.map_version'::regclass AND granted AND pid <> pg_backend_pid()}), 'F1: a test session holds the cluster lock');
+	my $mp = move_pid();
+	q1($n1, "SELECT pg_cancel_backend($mp)");
+	unlink($file);
+	ok($n1->poll_query_until('postgres', q{SELECT count(*) >= 1 FROM pg_locks WHERE locktype = 'relation' AND relation = 'kingres.map_version'::regclass AND NOT granted}), 'F1: the undo waits for the cluster lock');
+	is(q1($n1, "SELECT pid FROM pg_stat_activity WHERE pid = $mp AND state = 'active'"), $mp, 'F1: the first session is still in its handler');
+	q1($n1, "SELECT pg_cancel_backend($mp)");
+	waitpid($pid, 0);
+	like(out('f1'), qr/locks=0/, 'F1: a second cancel during the undo leaves the session without the mark and without the lock of the start') or diag(out('f1'));
+	end_holder($h);
+	is(advisory_locks(), '0', 'F1: and no session holds a lock');
+	my $id = last_move();
+	q1($n1, "UPDATE kingres.bucket_move SET updated_at = clock_timestamp() - interval '1 hour' WHERE move_id = $id AND phase NOT IN ('failed', 'cancelled')");
+	q1($n1, q{SELECT kingres.resume_bucket_moves()});
+	ok($n1->poll_query_until('postgres', "SELECT phase IN ('failed', 'cancelled') FROM kingres.bucket_move WHERE move_id = $id"), 'F1: the move is undone (by the handler or by the recovery)');
+	is(q1($n1, "SELECT state FROM kingres.bucket_map WHERE colocation_id = $C AND bucket = $b"), 'active', 'F1: the bucket is active');
+	my ($rc, $out, $err) = run_sql($n1, "SELECT kingres.move_bucket($C, $b, $tgt)");
+	is($rc, 0, 'F1: the next move of the bucket works') or diag($err);
+	q1($n1, q{SELECT kingres.cleanup_moved_buckets(true)});
+}
+{
+	# F2. a lock taken twice by one session (a leak that survived, a second call) is let go whole
+	is(q1($n1, qq{SELECT kingres.internal_move_group_take($C, 1)::text || kingres.internal_move_group_take($C, 1)::text || kingres.internal_move_lock(555001)::text || kingres.internal_move_lock(555001)::text;
+	              SELECT kingres.internal_move_group_drop($C, 1)::text || kingres.internal_move_unlock(555001)::text;
+	              SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()}), "\n\n0", 'F2: one drop and one unlock let go of a double take');
+	is(q1($n1, qq{SELECT kingres.internal_move_group_take($C, 1)::text || kingres.internal_move_lock(555002)::text || kingres.internal_move_lock(555002)::text;
+	              SELECT kingres.internal_move_release(555002, $C, 1)::text;
+	              SELECT kingres.internal_move_release(NULL, NULL, NULL)::text;
+	              SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()}), "\n\n\n0", 'F2: internal_move_release lets go of both, whatever the count, and takes nulls');
+}
+{
+	# F3. the starter dies between its record and its mark: the recovery undoes the move (the lock of the start is gone with the session)
+	my $b = 2;
+	my $tgt = other($b);
+	my ($pid, $file) = stopped('move_after_begin', "SELECT kingres.move_bucket($C, $b, $tgt)", 'f3');
+	ok(wait_for_fault_file("$file.reached", 60), 'F3: a move of bucket 2 waits between its record and its live mark');
+	my $id = last_move();
+	q1($n1, 'SELECT pg_terminate_backend(' . move_pid() . ')');
+	release($pid, $file);
+	ok($n1->poll_query_until('postgres', "SELECT kingres.internal_move_alive($id) = false"), 'F3: with the session gone nothing holds the move');
+	is(q1($n1, "SELECT phase FROM kingres.bucket_move WHERE move_id = $id"), 'preparing', 'F3: its record is still there');
+	q1($n1, "UPDATE kingres.bucket_move SET updated_at = clock_timestamp() - interval '1 hour' WHERE move_id = $id");
+	is(q1($n1, q{SELECT kingres.resume_bucket_moves()}), '1', 'F3: a recovery pass undoes it');
+	is(q1($n1, "SELECT phase FROM kingres.bucket_move WHERE move_id = $id"), 'failed', 'F3: the record says failed');
+	is(q1($n1, "SELECT state FROM kingres.bucket_map WHERE colocation_id = $C AND bucket = $b"), 'active', 'F3: the bucket is active');
+	is(advisory_locks(), '0', 'F3: no lock is left');
+}
+{
+	# F4. a real error of the begin (the target takes no buckets): the handler has no move id, and the session is left without the lock of the start
+	my $b = 3;
+	my $tgt = other($b);
+	q1($n1, "UPDATE kingres.node SET should_have_shards = false WHERE group_id = $tgt");
+	my $before = q1($n1, q{SELECT count(*) FROM kingres.bucket_move});
+	is(q1($n1, qq{DO \$\$ BEGIN PERFORM kingres.move_bucket($C, $b, $tgt); EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'caught %', SQLERRM; END \$\$;
+	              SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()}), '0', 'F4: an error of the begin leaves the session without a lock');
+	my ($rc, $out, $err) = run_sql($n1, "SELECT kingres.move_bucket($C, $b, $tgt)");
+	like($err, qr/does not accept buckets|should_have_shards/, 'F4: it is the refusal of the begin');
+	is(q1($n1, q{SELECT count(*) FROM kingres.bucket_move}), $before, 'F4: no record was written');
+	q1($n1, "UPDATE kingres.node SET should_have_shards = true WHERE group_id = $tgt");
+	is(q1($n1, "SELECT state FROM kingres.bucket_map WHERE colocation_id = $C AND bucket = $b"), 'active', 'F4: the bucket is active');
+	is(clean(), '', 'F4: check_cluster() finds nothing');
 }
 
 done_testing();

@@ -13,6 +13,7 @@
 #   B. the owner drops them one by one: the orphan stays while one is left, goes at the next pass after the last, the move is done and the check is clean
 #   C. the recovery worker does the same by itself (a pass is the same call)
 #   D. a split: the old partition with a view on it; same record, same check, same end
+#   G. two orphans in one move (array type of the row type, hostile name, a foreign key between the orphans), H. a partitioned orphan
 #   E. what the extension refuses on a partition (triggers, rules, policies, indexes) is still refused, so none of them can be a dependent
 
 use strict;
@@ -86,10 +87,10 @@ my ($b, $src, $tgt, $move, $on);
 	is(q1($n1, "SELECT phase FROM kingres.bucket_move WHERE move_id = $move"), 'cleaning', 'A: the move is still cleaning');
 	like(q1($n1, "SELECT detail FROM kingres.bucket_move WHERE move_id = $move"), qr/^the old copy cannot be dropped, objects of its owner depend on it: /, 'A: its record says why');
 	my $detail = q1($n1, "SELECT detail FROM kingres.bucket_move WHERE move_id = $move");
-	like($detail, qr/v1/, 'A: the record names the view');
-	like($detail, qr/mv1/, 'A: the materialized view');
-	like($detail, qr/child_fk/, 'A: the foreign key');
-	like($detail, qr/rowfn/, 'A: the function');
+	like($detail, qr/\bv1\b/, 'A: the record names the view');
+	like($detail, qr/\bmv1\b/, 'A: the materialized view');
+	like($detail, qr/\bchild_fk\b/, 'A: the foreign key');
+	like($detail, qr/\browfn\b/, 'A: the function');
 	like(blocked(), qr/^bucket move $move: the old copy cannot be dropped/, 'A: check_cluster() reports it as orphan_blocked');
 	is(q1($n1, q{SELECT count(*) FROM kingres.check_cluster() WHERE check_name = 'orphan_blocked'}), '1', 'A: once');
 	# the tenant's objects are the tenant's: the owner of the view is the tenant
@@ -167,6 +168,107 @@ my ($b, $src, $tgt, $move, $on);
 	is(q1($n1, "SELECT phase || ',' || coalesce(detail, 'null') FROM kingres.bucket_split WHERE split_id = $sid"), 'done,null', 'D: the split is done, with no detail');
 	is(clean(), '', 'D: check_cluster() finds nothing');
 	is(q1($_, q{SELECT count(*) || ',' || sum(id) FROM public.m1}), $digest, 'D: every row is there') for @nodes;
+}
+
+# ---------------------------------------------------------------------------
+# G. two orphans in one move: the array type of the row type, a hostile name, a foreign key between the orphans; one is dropped while the other stays
+# ---------------------------------------------------------------------------
+{
+	q1($n1, q{
+		CREATE TABLE public.m2 (id int PRIMARY KEY, w text);
+		INSERT INTO public.m2 SELECT g, 'w' || g FROM generate_series(1, 400) g;
+		SELECT kingres.create_distributed_table('public.m2', 'id', colocate_with => 'public.m1');
+		ALTER TABLE public.m2 OWNER TO tenant;
+	});
+	my $b4 = 4;
+	my $on4 = $nodes[owner($b4)];
+	my $tgt4 = other($b4);
+	my ($rc, $out, $err) = tenant($on4, q{CREATE FUNCTION public.arrfn(r public.m1_b0004[]) RETURNS int LANGUAGE sql AS 'SELECT 1'});
+	is($rc, 0, 'G: the tenant makes a function on the ARRAY type of the row type of a partition') or diag($err);
+	($rc, $out, $err) = tenant($on4, qq{CREATE VIEW public."v""q\nw" AS SELECT id FROM public.m2_b0004});
+	is($rc, 0, 'G: and a view whose name has a quote and a newline on the partition of the second table') or diag($err);
+	($rc, $out, $err) = run_sql($n1, "SELECT kingres.move_bucket($C, $b4, $tgt4)");
+	is($rc, 0, 'G: the bucket moves, with both tables') or diag($err);
+	my $mv = q1($n1, q{SELECT max(move_id) FROM kingres.bucket_move});
+	is(orphans($on4, "orphan_${mv}_"), '2', 'G: two orphans wait');
+	my @names = split /\n/, q1($on4, "SELECT relname FROM pg_class WHERE relnamespace = 'kingres'::regnamespace AND relname ~ '^orphan_${mv}_[0-9]+\$' ORDER BY relname");
+	# a foreign key between the two orphans: the one that is dropped first is the one the other depends on
+	($rc, $out, $err) = run_sql($on4, "ALTER TABLE kingres.$names[1] ADD CONSTRAINT ks_fk FOREIGN KEY (id) REFERENCES kingres.$names[0] (id) NOT VALID");
+	is($rc, 0, 'G: a foreign key between the two orphans (the later references the earlier)') or diag($err);
+
+	($rc, $out, $err) = run_sql($n1, q{SELECT kingres.cleanup_moved_buckets(true)});
+	is($out, '0', 'G: the cleanup finishes no move') or diag($err);
+	unlike($err, qr/WARNING|ERROR/, 'G: and does not warn');
+	is(orphans($on4, "orphan_${mv}_"), '2', 'G: both orphans stay (each has a dependent)');
+	my $detail = q1($n1, "SELECT detail FROM kingres.bucket_move WHERE move_id = $mv");
+	like($detail, qr/arrfn/, 'G: the record names the function on the array type');
+	like($detail, qr/"v""q\nw"/, 'G: and the view with the hostile name, quoted');
+	unlike($detail, qr/ks_fk/, 'G: the foreign key between the orphans is not a dependent');
+
+	($rc, $out, $err) = tenant($on4, qq{DROP VIEW public."v""q\nw"});
+	is($rc, 0, 'G: the tenant drops the view') or diag($err);
+	($rc, $out, $err) = run_sql($n1, q{SELECT kingres.cleanup_moved_buckets(true)});
+	is($out, '0', 'G: the move is not finished yet');
+	is(orphans($on4, "orphan_${mv}_"), '1', 'G: the orphan with no dependent was dropped, the other stays');
+	$detail = q1($n1, "SELECT detail FROM kingres.bucket_move WHERE move_id = $mv");
+	like($detail, qr/arrfn/, 'G: the record still names the function');
+	unlike($detail, qr/v""q/, 'G: and no longer the view');
+	($rc, $out, $err) = tenant($on4, q{DROP FUNCTION public.arrfn});
+	is($rc, 0, 'G: the tenant drops the function') or diag($err);
+	is(q1($n1, q{SELECT kingres.cleanup_moved_buckets(true)}), '1', 'G: the next pass finishes the move');
+	is(orphans($on4, "orphan_${mv}_"), '0', 'G: no orphan is left');
+	is(q1($n1, "SELECT phase FROM kingres.bucket_move WHERE move_id = $mv"), 'done', 'G: done');
+
+	# G2. only the foreign key between the orphans stands in the way: the cleanup repeats the drop until one pass drops nothing, and does not call the move done with an orphan left
+	my $b5 = 5;
+	my $on5 = $nodes[owner($b5)];
+	($rc, $out, $err) = run_sql($n1, "SELECT kingres.move_bucket($C, $b5, " . other($b5) . ")");
+	is($rc, 0, 'G2: bucket 5 moves') or diag($err);
+	$mv = q1($n1, q{SELECT max(move_id) FROM kingres.bucket_move});
+	@names = split /\n/, q1($on5, "SELECT relname FROM pg_class WHERE relnamespace = 'kingres'::regnamespace AND relname ~ '^orphan_${mv}_[0-9]+\$' ORDER BY relname");
+	is(scalar(@names), 2, 'G2: two orphans wait');
+	($rc, $out, $err) = run_sql($on5, "ALTER TABLE kingres.$names[1] ADD CONSTRAINT ks_fk FOREIGN KEY (id) REFERENCES kingres.$names[0] (id) NOT VALID");
+	is($rc, 0, 'G2: a foreign key between them') or diag($err);
+	is(q1($n1, q{SELECT kingres.cleanup_moved_buckets(true)}), '1', 'G2: the cleanup finishes the move');
+	is(orphans($on5, "orphan_${mv}_"), '0', 'G2: both orphans are gone');
+	is(q1($n1, "SELECT phase || ',' || coalesce(detail, 'null') FROM kingres.bucket_move WHERE move_id = $mv"), 'done,null', 'G2: done, with no detail');
+	is(clean(), '', 'G: check_cluster() finds nothing');
+	is(q1($_, q{SELECT count(*) || ',' || sum(id) FROM public.m1}), $digest, 'G: every row is there') for @nodes;
+}
+
+# ---------------------------------------------------------------------------
+# H. a user-partitioned table: the orphan is a partitioned table, and the dependent is on one of its leaves
+# ---------------------------------------------------------------------------
+{
+	q1($n1, q{
+		CREATE TABLE public.pm (customer int NOT NULL, created date NOT NULL, id int NOT NULL, qty int, PRIMARY KEY (customer, created, id)) PARTITION BY RANGE (created);
+		CREATE TABLE public.pm_p1 PARTITION OF public.pm FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+		CREATE TABLE public.pm_p2 PARTITION OF public.pm FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
+		INSERT INTO public.pm SELECT g % 13, date '2026-01-01' + (g % 55), g, g % 40 FROM generate_series(1, 300) g;
+		SELECT kingres.create_distributed_table('public.pm', 'customer', bucket_count => 5);
+		ALTER TABLE public.pm OWNER TO tenant;
+	});
+	my $PC = q1($n1, q{SELECT colocation_id FROM kingres.dist_table WHERE relid = 'public.pm'::regclass});
+	my $pb = 1;
+	my $pown = q1($n1, "SELECT group_id FROM kingres.bucket_map WHERE colocation_id = $PC AND bucket = $pb");
+	my $pon = $nodes[$pown];
+	my ($rc, $out, $err) = tenant($pon, q{CREATE VIEW public.pv1 AS SELECT id FROM public.pm_p1_b0001});
+	is($rc, 0, 'H: the tenant makes a view on a leaf of the partitioned bucket partition') or diag($err);
+	($rc, $out, $err) = run_sql($n1, "SELECT kingres.move_bucket($PC, $pb, " . (($pown + 1) % 3) . ")");
+	is($rc, 0, 'H: the bucket moves') or diag($err);
+	my $mv = q1($n1, q{SELECT max(move_id) FROM kingres.bucket_move});
+	is(q1($pon, "SELECT count(*) FROM pg_class WHERE relnamespace = 'kingres'::regnamespace AND relname ~ '^orphan_${mv}_[0-9]+\$' AND relkind = 'p'"), '1', 'H: the orphan is a partitioned table');
+	($rc, $out, $err) = run_sql($n1, q{SELECT kingres.cleanup_moved_buckets(true)});
+	is($out, '0', 'H: the cleanup finishes no move') or diag($err);
+	unlike($err, qr/WARNING|ERROR/, 'H: and does not warn');
+	is(q1($pon, "SELECT count(*) FROM pg_class WHERE relnamespace = 'kingres'::regnamespace AND relname ~ '^orphan_${mv}_[0-9]+\$' AND relkind = 'p'"), '1', 'H: the orphan stays');
+	like(q1($n1, "SELECT detail FROM kingres.bucket_move WHERE move_id = $mv"), qr/\bpv1\b/, 'H: the record names the view on the leaf');
+	like(blocked(), qr/^bucket move $mv: /, 'H: check_cluster() reports it');
+	($rc, $out, $err) = tenant($pon, q{DROP VIEW public.pv1});
+	is($rc, 0, 'H: the tenant drops the view') or diag($err);
+	is(q1($n1, q{SELECT kingres.cleanup_moved_buckets(true)}), '1', 'H: the next pass finishes the move');
+	is(q1($pon, "SELECT count(*) FROM pg_class WHERE relnamespace = 'kingres'::regnamespace AND relname ~ '^orphan_${mv}_'"), '0', 'H: the orphan and its leaves are gone');
+	is(clean(), '', 'H: check_cluster() finds nothing');
 }
 
 # ---------------------------------------------------------------------------
