@@ -54,6 +54,11 @@ func (s *Store) extInfo(ctx context.Context, p *pgxpool.Pool, ext string) (extgu
 		}
 		s.opts.Logger.Warn("the schema of a KingresDB extension cannot be trusted; nothing in it is read", "extension", ext, "error", err)
 	}
+	if err == nil && !info.Present {
+		// "Not installed" is never remembered: the control plane installs the extension itself (enabling sharding, creating a database) and
+		// the next read, a moment later, must see it. Only the answers about an installed schema are kept.
+		return info, nil
+	}
 	s.ext.mu.Lock()
 	if s.ext.m == nil || len(s.ext.m) > 256 {
 		s.ext.m = map[extKey]extAnswer{}
