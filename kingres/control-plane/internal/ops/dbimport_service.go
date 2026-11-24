@@ -221,13 +221,18 @@ func (o *Ops) serviceConnFor(ctx context.Context, priv string) (*pgx.Conn, error
 	return c, nil
 }
 
+// extensionsToRequire is the list requireExtensions verifies: the sharding extension first when the archive has it, then the others.
+func extensionsToRequire(shard bool, exts []string) []string {
+	if shard {
+		return append([]string{extguard.Shard}, exts...)
+	}
+	return exts
+}
+
 // requireExtensions verifies the schemas of the extensions that the next calls use, as extguard does for every read of the schema kingres on a service session.
 func requireExtensions(ctx context.Context, c *pgx.Conn, shard bool, exts ...string) error {
-	if shard {
-		exts = append([]string{extguard.Shard}, exts...)
-	}
 	g := extguard.NewGuard(c)
-	for _, e := range exts {
+	for _, e := range extensionsToRequire(shard, exts) {
 		if _, err := g.Require(ctx, e); err != nil {
 			if errors.Is(err, extguard.ErrAbsent) {
 				return transfer.Errorf(transfer.CodeSchemaUnrecognised, false, "the extension %s is not installed in the private database", e)

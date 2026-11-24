@@ -341,7 +341,6 @@ tests += {
       't/275_prepare_confirm.pl',
       't/276_schema_rebalance_plan.pl',
       't/277_schema_check_cluster.pl',
-      't/281_dist_timepart.pl',
       't/260_repartition_join.pl',
       't/261_repartition_security.pl',
       't/262_repartition_moves.pl',
@@ -356,6 +355,7 @@ tests += {
       't/279_old_script_schema_check.pl',
       't/280_runtime_objects_owner.pl',
       't/278_schema_spoof.pl',
+      't/281_dist_timepart.pl',
     ],
   },
 }

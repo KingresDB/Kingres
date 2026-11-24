@@ -582,6 +582,11 @@ func (o *Ops) fillDistPartitions(ctx context.Context, tx pgx.Tx, schema, table s
 			items[i].RangeFrom, items[i].RangeTo = &from, &to
 		}
 	}
+	// kingres_shard is verified before anything is looked up or called in the schema kingres (extguard): a schema that cannot be trusted is not read, and the list
+	// goes on without the access methods, as it does for a node that does not answer.
+	if ok, err := extUsable(ctx, tx, extguard.Shard); err != nil || !ok {
+		return
+	}
 	var have bool
 	if err := tx.QueryRow(ctx, `SELECT to_regprocedure('kingres.partition_leaf_storage(regclass)') IS NOT NULL`).Scan(&have); err != nil || !have {
 		return
