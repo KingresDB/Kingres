@@ -73,8 +73,20 @@ func TestLedgerDigestsVerificationsAndUpdatableTables(t *testing.T) {
 	}
 	dl := e.expect(t, 200, "GET", "/databases/ldb/ledger/digests", nil)
 	valid(t, "listLedgerDigests", "200", dl)
-	if len(dl["items"].([]any)) != 1 {
-		t.Errorf("digests %v", dl)
+	// The scheduler (ledger.digest, a database that never had a digest gets one at its first tick) may record a digest of its own, generatedBy "system", between the
+	// inserts above and the POST: it is not an error. The list must hold the digest of the POST once, and any other item must be the scheduler's.
+	own := 0
+	for _, it := range dl["items"].([]any) {
+		m := it.(map[string]any)
+		switch {
+		case m["id"] == d["id"]:
+			own++
+		case m["generatedBy"] != "system":
+			t.Errorf("a digest that nobody here made: %v", m)
+		}
+	}
+	if own != 1 {
+		t.Errorf("the digest of the POST is in the list %d times: %v", own, dl)
 	}
 	// A verification runs as a task and is recorded.
 	task := e.mustTask(t, "POST", "/databases/ldb/ledger/verifications", map[string]any{"scope": "full"})
