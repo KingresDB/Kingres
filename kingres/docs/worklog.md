@@ -21,8 +21,10 @@ Every statement was read against `kingres/api/openapi.yaml`, the design notes an
 
 ### Still open
 
----
 See the Pending part of the CHANGELOG. Two points of the guide are from the text of the design and not from a run: what exactly repeats the apply of an extension after `extensionSkipped`, and the list of predefined roles that make an importer dangerous.
+
+---
+
 ## 2026-11-24: the integration branch g2 (nine branches merged onto g16s)
 
 Branch `g2`, from g16s (`cc5008adb2`), nine merge commits in this order: `xcat-2`, `split-fix`, `pgss`, `p12-dist-tp`, `ca-escrow`, `p10-drain4`, `p5-hard`, `p14b`, `p14c`.
