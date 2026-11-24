@@ -118,15 +118,10 @@ func IsUntrusted(err error) (*UntrustedError, bool) {
 const verifySQL = verifyHead + verifyTail
 
 // verifyHead selects the extensions named in $1 (the CTE e). preInstallHead selects a schema named in $1 that an extension is about to be created in, as a
-// kingres_shard is created with SCHEMA pg_catalog and its script makes the schema kingres: that schema is the one it populates, and pg_catalog is never searched
-// for foreign objects (it holds the objects of PostgreSQL itself).
 // row with no extension (owned by a superuser, so that only the checks of the schema remain). Both go with verifyTail.
 const verifyHead = `
 WITH e AS (
-  SELECT x.oid, x.extname, x.extversion, x.extowner,
-         CASE WHEN x.extnamespace = 'pg_catalog'::pg_catalog.regnamespace AND x.extname = 'kingres_shard'
-              THEN COALESCE((SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = 'kingres'), x.extnamespace)
-              ELSE x.extnamespace END AS extnamespace
+  SELECT x.oid, x.extname, x.extversion, x.extowner, x.extnamespace
     FROM pg_catalog.pg_extension x
    WHERE x.extname = ANY ($1::pg_catalog.text[])`
 
@@ -139,8 +134,16 @@ WITH e AS (
 
 const verifyTail = `
 ), ns AS (
-  SELECT e.extname, n.oid AS nsoid, n.nspname, n.nspowner, n.nspacl
+  -- The schemas that an extension populates.  Its own (extnamespace) is one of them, except that pg_catalog is never searched for foreign objects: it holds
+  -- the objects of PostgreSQL itself.  kingres_shard is created with SCHEMA pg_catalog and its script makes the schema kingres, so for it the schema kingres is
+  -- always one of them, whatever schema it was created in.  prim marks the schema that Info reports.
+  SELECT e.extname, n.oid AS nsoid, n.nspname, n.nspowner, n.nspacl, (e.extname <> 'kingres_shard' OR n.nspname = 'kingres') AS prim
     FROM e JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace
+   WHERE NOT (e.extname = 'kingres_shard' AND e.extnamespace = 'pg_catalog'::pg_catalog.regnamespace)
+  UNION
+  SELECT e.extname, n.oid, n.nspname, n.nspowner, n.nspacl, true
+    FROM e JOIN pg_catalog.pg_namespace n ON n.nspname = 'kingres'
+   WHERE e.extname = 'kingres_shard'
 ), objs AS (
   SELECT ns.extname, 'pg_catalog.pg_class'::pg_catalog.regclass AS classid, c.oid
     FROM ns JOIN pg_catalog.pg_class c ON c.relnamespace = ns.nsoid WHERE c.relkind NOT IN ('i', 'I', 't')
@@ -193,37 +196,43 @@ const verifyTail = `
   -- objects are not members of the extension.  They are tables and sequences of fixed name patterns (the orphan of a move or of a split, the old copy of a
   -- table that was rebuilt, the log of a table operation, their partitions and identity sequences) and the trigger functions of a split, which the extension
   -- makes SECURITY DEFINER and gives to the owner of the table.  Nothing else is accepted: no view, no type, no operator, no other function, and no table or
-  -- function whose name is one that the control plane or the C library reads.  The owner is checked by Verify.
-  SELECT f.extname, f.classid, f.oid, c.relowner AS owner
+  -- function whose name is one that the control plane or the C library reads.  The owner does not matter: a role that is not a superuser cannot create or
+  -- rename anything in the schema (checks 2 and 3), and the owner of a table that moved can drop it, or can be left with the orphan when its last distributed
+  -- table is gone.  Only the schema kingres counts, whichever schema the extension is in.
+  SELECT f.extname, f.classid, f.oid
     FROM foreign_all f JOIN pg_catalog.pg_class c ON f.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND c.oid = f.oid
-   WHERE (c.relkind IN ('r', 'p') AND c.relname ~ '^(orphan_s?[0-9]+_[0-9]+|kingres_old_[0-9]+|tlog_[0-9]+_[0-9]+)([A-Za-z0-9_]*)$')
+   WHERE c.relnamespace = (SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = 'kingres')
+     AND ((c.relkind IN ('r', 'p') AND c.relname ~ '^(orphan_s?[0-9]+_[0-9]+|kingres_old_[0-9]+|tlog_[0-9]+_[0-9]+)([A-Za-z0-9_]*)$')
       OR (c.relkind = 'S' AND EXISTS (
             SELECT 1 FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_class t ON t.oid = d.refobjid
              WHERE d.classid = f.classid AND d.objid = f.oid AND d.deptype IN ('a', 'i') AND d.refclassid = f.classid
                AND t.relnamespace = c.relnamespace AND t.relkind IN ('r', 'p')
-               AND t.relname ~ '^(orphan_s?[0-9]+_[0-9]+|kingres_old_[0-9]+|tlog_[0-9]+_[0-9]+)([A-Za-z0-9_]*)$'))
+               AND t.relname ~ '^(orphan_s?[0-9]+_[0-9]+|kingres_old_[0-9]+|tlog_[0-9]+_[0-9]+)([A-Za-z0-9_]*)$'))))
   UNION ALL
-  SELECT f.extname, f.classid, f.oid, p.proowner
+  -- The trigger function of a split is the one that the extension makes: SECURITY DEFINER, language plpgsql, search_path = pg_catalog, pg_temp.  The owner of
+  -- the table owns it and could change the attributes of its own function (SECURITY INVOKER, another search_path), so they are part of the test.
+  SELECT f.extname, f.classid, f.oid
     FROM foreign_all f JOIN pg_catalog.pg_proc p ON f.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass AND p.oid = f.oid
-   WHERE p.proname ~ '^split_capture_[0-9]+_[0-9]+$' AND p.prorettype = 'pg_catalog.trigger'::pg_catalog.regtype AND p.prokind = 'f'
+   WHERE p.pronamespace = (SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = 'kingres')
+     AND p.proname ~ '^split_capture_[0-9]+_[0-9]+$' AND p.prorettype = 'pg_catalog.trigger'::pg_catalog.regtype AND p.prokind = 'f'
+     AND p.prosecdef AND p.proconfig = ARRAY['search_path=pg_catalog, pg_temp']::pg_catalog.text[]
+     AND p.prolang = (SELECT l.oid FROM pg_catalog.pg_language l WHERE l.lanname = 'plpgsql')
 ), foreign_objs AS (
   SELECT f.extname, f.classid, f.oid FROM foreign_all f
    WHERE NOT EXISTS (SELECT 1 FROM runtime r WHERE r.classid = f.classid AND r.oid = f.oid)
 )
-SELECT e.extname, e.extversion, ns.nspname,
+SELECT e.extname, e.extversion,
+       (pg_catalog.array_agg(ns.nspname ORDER BY ns.prim DESC, ns.nspname))[1],
        COALESCE((SELECT r.rolsuper FROM pg_catalog.pg_roles r WHERE r.oid = e.extowner), false),
-       COALESCE((SELECT r.rolsuper FROM pg_catalog.pg_roles r WHERE r.oid = ns.nspowner), false),
-       EXISTS (SELECT 1 FROM pg_catalog.aclexplode(COALESCE(ns.nspacl, pg_catalog.acldefault('n', ns.nspowner))) a
+       pg_catalog.bool_and(COALESCE((SELECT r.rolsuper FROM pg_catalog.pg_roles r WHERE r.oid = ns.nspowner), false)),
+       pg_catalog.bool_or(EXISTS (SELECT 1 FROM pg_catalog.aclexplode(COALESCE(ns.nspacl, pg_catalog.acldefault('n', ns.nspowner))) a
                 WHERE a.privilege_type = 'CREATE'
-                  AND (a.grantee = 0 OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles g WHERE g.oid = a.grantee AND g.rolsuper))),
+                  AND (a.grantee = 0 OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles g WHERE g.oid = a.grantee AND g.rolsuper)))),
        (SELECT count(*) FROM foreign_objs f WHERE f.extname = e.extname),
        COALESCE((SELECT pg_catalog.pg_describe_object(f.classid, f.oid, 0) FROM foreign_objs f WHERE f.extname = e.extname
-                  ORDER BY pg_catalog.pg_describe_object(f.classid, f.oid, 0) LIMIT 1), ''),
-       -- the owners of the run-time objects that are not superusers (checked by Verify against the tables of the extension's own catalog)
-       COALESCE((SELECT pg_catalog.array_agg(DISTINCT r.owner) FROM runtime r
-                  WHERE r.extname = e.extname AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles g WHERE g.oid = r.owner AND g.rolsuper)),
-                '{}'::pg_catalog.oid[])
+                  ORDER BY pg_catalog.pg_describe_object(f.classid, f.oid, 0) LIMIT 1), '')
   FROM e JOIN ns ON ns.extname = e.extname
+ GROUP BY e.extname, e.extversion, e.extowner
  ORDER BY e.extname`
 
 // row is one result row of verifySQL.
@@ -234,8 +243,6 @@ type row struct {
 	CreateGrant           bool
 	Foreign               int64
 	FirstForeign          string
-	// RtOwners are the owners, other than superusers, of the run-time objects of kingres_shard in the schema (see verifySQL).
-	RtOwners []uint32
 }
 
 // classify turns a row into the answer: the first failing check, in the order of the list in the package comment.
@@ -274,7 +281,7 @@ func VerifyAll(ctx context.Context, q Querier, names ...string) ([]Result, error
 	var all []row
 	for rows.Next() {
 		var r row
-		if err := rows.Scan(&r.Name, &r.Version, &r.Schema, &r.ExtOwnerSuper, &r.SchemaOwnerSuper, &r.CreateGrant, &r.Foreign, &r.FirstForeign, &r.RtOwners); err != nil {
+		if err := rows.Scan(&r.Name, &r.Version, &r.Schema, &r.ExtOwnerSuper, &r.SchemaOwnerSuper, &r.CreateGrant, &r.Foreign, &r.FirstForeign); err != nil {
 			return nil, err
 		}
 		all = append(all, r)
@@ -286,9 +293,6 @@ func VerifyAll(ctx context.Context, q Querier, names ...string) ([]Result, error
 	found := map[string]Result{}
 	for _, r := range all {
 		info, cerr := classify(r)
-		if cerr == nil && len(r.RtOwners) > 0 {
-			cerr = checkRuntimeOwners(ctx, q, r)
-		}
 		found[r.Name] = Result{Info: info, Err: cerr}
 	}
 	out := make([]Result, 0, len(names))
@@ -410,7 +414,7 @@ func PreInstall(ctx context.Context, q Querier, ext, schema string) error {
 	var all []row
 	for rows.Next() {
 		var r row
-		if err := rows.Scan(&r.Name, &r.Version, &r.Schema, &r.ExtOwnerSuper, &r.SchemaOwnerSuper, &r.CreateGrant, &r.Foreign, &r.FirstForeign, &r.RtOwners); err != nil {
+		if err := rows.Scan(&r.Name, &r.Version, &r.Schema, &r.ExtOwnerSuper, &r.SchemaOwnerSuper, &r.CreateGrant, &r.Foreign, &r.FirstForeign); err != nil {
 			return err
 		}
 		r.Name = ext
@@ -424,60 +428,8 @@ func PreInstall(ctx context.Context, q Querier, ext, schema string) error {
 		if _, err := classify(r); err != nil {
 			return err
 		}
-		if len(r.RtOwners) > 0 {
-			if err := checkRuntimeOwners(ctx, q, r); err != nil {
-				return err
-			}
-		}
 	}
 	return nil
-}
-
-// checkRuntimeOwners is the second part of check 4 for the run-time objects of kingres_shard (see runtime in verifySQL), which the first statement accepts by
-// name and kind: an object that a role other than a superuser owns is accepted only when that role owns a distributed table, or a table in a distributed
-// schema, of the extension's own catalog (kingres.dist_table, kingres.dist_schema), which the extension keeps under the owner of the table that it
-// moves, splits or rebuilds. The catalog is read here only because the checks 1 to 4 have passed: the schema is a superuser's, nobody else can create in it, and
-// a table of the name of a catalog table that is not a member would have been refused as a foreign object.
-func checkRuntimeOwners(ctx context.Context, q Querier, r row) error {
-	bad := func(detail string) error {
-		return &UntrustedError{Extension: r.Name, Schema: r.Schema, Reason: ReasonForeignObject, Detail: detail}
-	}
-	qs := pgx.Identifier{r.Schema}.Sanitize()
-	rows, err := q.Query(ctx, "SELECT pg_catalog.to_regclass($1) IS NOT NULL, pg_catalog.to_regclass($2) IS NOT NULL", qs+".dist_table", qs+".dist_schema")
-	if err != nil {
-		return err
-	}
-	var hasTable, hasSchema bool
-	for rows.Next() {
-		if err := rows.Scan(&hasTable, &hasSchema); err != nil {
-			rows.Close()
-			return err
-		}
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	owned := "false"
-	if hasTable {
-		owned += " OR EXISTS (SELECT 1 FROM " + qs + ".dist_table d JOIN pg_catalog.pg_class c ON c.oid = d.relid::pg_catalog.oid WHERE c.relowner = o.oid)"
-	}
-	if hasSchema {
-		owned += " OR EXISTS (SELECT 1 FROM " + qs + ".dist_schema s JOIN pg_catalog.pg_class c ON c.relnamespace = s.nsp::pg_catalog.oid WHERE c.relowner = o.oid)"
-	}
-	orows, err := q.Query(ctx, "SELECT o.oid::pg_catalog.int8 FROM unnest($1::pg_catalog.oid[]) AS o(oid) WHERE NOT ("+owned+") ORDER BY 1 LIMIT 1", r.RtOwners)
-	if err != nil {
-		return err
-	}
-	defer orows.Close()
-	var oid int64
-	for orows.Next() {
-		if err := orows.Scan(&oid); err != nil {
-			return err
-		}
-		return bad(fmt.Sprintf("a run-time object of kingres_shard is owned by the role with oid %d, which owns no distributed table and no table of a distributed schema", oid))
-	}
-	return orows.Err()
 }
 
 // ExtensionSchema returns the schema that the control file of the extension names ("schema = ..."), as pg_available_extension_versions shows it, for the
@@ -536,5 +488,5 @@ func StatusSQL(ext string) (string, error) {
 	inner := strings.Replace(verifySQL, "$1::pg_catalog.text[]", "ARRAY['"+ext+"']::pg_catalog.text[]", 1)
 	return `SELECT v.extversion, CASE WHEN NOT v.eo THEN '` + string(ReasonExtensionOwner) + `' WHEN NOT v.so THEN '` + string(ReasonSchemaOwner) +
 		`' WHEN v.cg THEN '` + string(ReasonSchemaCreate) + `' WHEN v.fc > 0 THEN '` + string(ReasonForeignObject) + `' ELSE '' END
-  FROM (` + inner + `) AS v(extname, extversion, nspname, eo, so, cg, fc, ff, ro)`, nil
+  FROM (` + inner + `) AS v(extname, extversion, nspname, eo, so, cg, fc, ff)`, nil
 }

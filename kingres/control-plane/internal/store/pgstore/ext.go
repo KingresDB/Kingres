@@ -13,8 +13,10 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 )
 
-// extTTL is how long the answer of extguard is kept for a database. What it decides cannot be changed by a role that is not a superuser (it owns nothing in
-// the schema and cannot create there), so a short memory costs nothing in safety and spares a busy listing one catalog query per statement.
+// extTTL is how long the answer of extguard is kept for a database. A role that is not a superuser cannot create or rename anything in the schema of an
+// extension (checks 2 and 3 of extguard), so it cannot make a trusted schema untrusted or the reverse by adding objects. It can still change what it owns: the
+// owner of a table that moved can drop the orphan, and the owner of a split trigger function can change its attributes (extguard then answers untrusted at once).
+// A short memory therefore delays such a change by at most this time, and spares a busy listing one catalog query per statement.
 const extTTL = 3 * time.Second
 
 type extKey struct {
