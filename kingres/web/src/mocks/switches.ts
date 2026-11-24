@@ -13,6 +13,11 @@
 //   ?workbench=busy               every workbench statement answers 429 workbench_busy with Retry-After.
 //   ?leader=lost                  this server has not heard the manager leader: 503 leader_unavailable for requests
 //                                 that need a session check.
+//   ?escrow=<a>,<b>,...           0.26.0 (the escrow of the CA key; combinable with a comma): on | refused (the recipient refused the send) | pending
+//                                 | standbys (two recipients, one pending) | dropping (off, one copy is still to be deleted)
+//                                 | unavailable (the leader holds no CA key: 503 certificate_authority_unavailable)
+//   ?preload=visible              the value of shared_preload_libraries is shown (PostgreSQL hides it), so the Extensions tab of Configuration
+//                                 can say which libraries are preloaded; without it the tab says that the API does not report it
 //   ?client=on | ?client=standby  the client entry point is on (and the standby entry point too): its metrics exist.
 //   ?ledger=all | ?ledger=absent  the ledger status covers every shard group / carries no coverage (older server).
 //   ?config=failed:<server>       0.8.0: the next configuration change fails on that server (a retry works).
@@ -283,6 +288,19 @@ export function applySwitches(params: URLSearchParams, s: MockState): void {
   else if (commit) mockConfig.commit = commit
   if (params.get('workbench') === 'busy') mockConfig.workbenchBusy = true
   if (params.get('leader') === 'lost') mockConfig.leaderLost = true
+  if (params.get('preload') === 'visible') mockConfig.preloadVisible = true
+  const escrow = (params.get('escrow') ?? '').split(',')
+  for (const e of escrow) {
+    if (e === 'on') mockConfig.caEscrow.enabled = true
+    if (e === 'refused' || e === 'pending' || e === 'standbys') {
+      mockConfig.caEscrow.enabled = true
+      mockConfig.caEscrow.scenario = e
+    }
+    if (e === 'dropping') mockConfig.caEscrow.scenario = 'dropping'
+    if (e === 'unavailable') mockConfig.caUnavailable = true
+  }
+  if (mockConfig.caEscrow.enabled && mockConfig.caEscrow.generation === 0)
+    mockConfig.caEscrow.generation = 1
   const client = params.get('client')
   if (client === 'on' || client === 'standby') mockConfig.clientEntryPoint = client
   const ledger = params.get('ledger')

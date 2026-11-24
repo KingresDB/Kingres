@@ -226,6 +226,7 @@ export const ROUTES = [
   '/configuration',
   '/configuration?tab=changes',
   '/configuration?tab=time',
+  '/configuration?tab=extensions',
   '/this-server',
   '/this-server/logs',
 ]
@@ -237,7 +238,13 @@ export const ROUTES = [
 export const HA_SWITCHES =
   'lease=lost:1&silent=10.0.0.13:dead&standby=stalled:3@10.0.0.11:past&client=standby'
 
-export const SECURITY_TABS = ['Roles', 'Access', 'Network access', 'Audit log']
+export const SECURITY_TABS = [
+  'Roles',
+  'Access',
+  'Network access',
+  'Certificate authority',
+  'Audit log',
+]
 
 /** A page state that needs more than a visit: a dialog opened, a result shown, a special state reached. */
 export interface PageState {
@@ -1802,6 +1809,16 @@ export const ANALYTICS_STATES: PageState[] = [
       await page.waitForSelector('[data-testid="plan-summary"]', { timeout: 20_000 })
       await sleep(250)
     },
+  },
+  {
+    name: 'escrow of the CA key: the switch-on dialog (0.26.0)',
+    route: '/security',
+    open: async (page) => {
+      await clickText(page, 'Certificate authority', '[role="tab"]')
+      await clickWhenThere(page, '[data-testid="ca-escrow-on"]')
+      await dialogOpen(page)
+    },
+    close: cancel,
   },
 ]
 /** The states of the data transfer (contract 0.19.0): they are run apart from the older ones, so that each run stays inside the time of one test. */

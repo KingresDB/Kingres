@@ -134,7 +134,7 @@ jit_provider|CP|s|-|||llvmjit|p|JIT provider to use.
 jit_tuple_deconstruction|DV|b|-|||on|u|Allow JIT compilation of tuple deconstruction.
 local_preload_libraries|CP|s|-||||B|Lists unprivileged shared libraries to preload into each backend.
 session_preload_libraries|CP|s|-||||S|Lists shared libraries to preload into each backend.
-shared_preload_libraries|CP|s|-|||kingres_shard, kingres_ledger|p|Lists shared libraries to preload into server.
+shared_preload_libraries|CP|s|-|||kingres_shard,kingres_ledger,kingres_columnar,pg_stat_statements|p|Lists shared libraries to preload into server.
 oauth_validator_libraries|CA|s|-||||s|Lists libraries that may be called to validate OAuth v2 bearer tokens.
 authentication_timeout|CA|i|s|1|600|60|s|Sets the maximum allowed time to complete client authentication.
 password_encryption|CA|e|-|md5,scram-sha-256||scram-sha-256|u|Chooses the algorithm for encrypting passwords.
