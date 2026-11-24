@@ -109,6 +109,7 @@ func TestAHardFailoverOfTheMapGroupJudgesTheLossBeforeAnythingIsStopped(t *testi
 // synchronous standby" whatever it holds, and the candidate must not be told that one streamed.
 func TestTheFactsOfAHardFailoverAreAsOfTheStop(t *testing.T) {
 	w := mapWorld()
+	w.liveErr = errors.New("the primary does not answer") // the recorded facts are what is left
 	w.facts.LastKnownAge = time.Hour
 	in := mapHardInput()
 	in.AllowDataLoss = true
@@ -388,6 +389,7 @@ func TestAHardFailoverRereadsTheLossBeforeTheFence(t *testing.T) {
 		},
 	} {
 		w := mapWorld()
+		w.liveErr = errors.New("the primary does not answer")
 		w.onMapStart = func() { change(w) }
 		r := w.runner()
 		w.fakeClock(r)
@@ -399,5 +401,65 @@ func TestAHardFailoverRereadsTheLossBeforeTheFence(t *testing.T) {
 		if w.index("demote ") >= 0 || w.count("map-abandon s2") != 1 {
 			t.Fatalf("%s: the old primary was fenced or the bootstrap was not given up:\n%s", name, strings.Join(w.log, "\n"))
 		}
+	}
+}
+
+// M2. The primary of the map group is asked right before the fence what it streams: that is read twice (before the bootstrap starts and before the fence), replaces the
+// recorded check (which may be old), and a primary that does not answer leaves the recorded facts to judge with.
+func TestAHardFailoverJudgesWithWhatTheLivePrimarySays(t *testing.T) {
+	// the record is an hour old, the live primary says a synchronous standby streams: the loss is none
+	w := mapWorld()
+	w.facts.LastKnownAge = time.Hour
+	w.live2 = &LiveReplication{SyncStreaming: true, FlushLsn: "0/5100000", Streaming: 1}
+	r := w.runner()
+	w.fakeClock(r)
+	if name, err := runThrough(t, r, mapHardInput(), StepName(0, StepStop)); err != nil {
+		t.Fatalf("%s: %v\n%s", name, err, strings.Join(w.log, "\n"))
+	}
+	if w.liveReads != 2 {
+		t.Fatalf("the live primary was read %d times, want 2 (before the start and before the fence)", w.liveReads)
+	}
+	if f := w.mapStarts[0].Planned.Facts; f == nil || !f.SyncStreaming || f.LastKnownLsn != "0/5100000" {
+		t.Fatalf("the facts carried: %+v", f)
+	}
+	// the record says a synchronous standby streams, the live primary says none does: the loss needs the acceptance, nothing is stopped
+	w2 := mapWorld()
+	w2.live2 = &LiveReplication{SyncStreaming: false, FlushLsn: "0/5100000", Streaming: 1}
+	r2 := w2.runner()
+	w2.fakeClock(r2)
+	_, err := runThrough(t, r2, mapHardInput(), StepName(0, StepStop))
+	var pe *PauseError
+	if !errors.As(err, &pe) || w2.index("map-start") >= 0 || w2.index("demote ") >= 0 {
+		t.Fatalf("want a pause with nothing started: %v\n%s", err, strings.Join(w2.log, "\n"))
+	}
+	// no standby streams at all: the same
+	w3 := mapWorld()
+	w3.live2 = &LiveReplication{SyncStreaming: true, FlushLsn: "0/5100000", Streaming: 0}
+	r3 := w3.runner()
+	w3.fakeClock(r3)
+	if _, err := runThrough(t, r3, mapHardInput(), StepName(0, StepStop)); !errors.As(err, &pe) {
+		t.Fatalf("a live primary with no streaming standby: %v", err)
+	}
+	// the live primary does not answer: the recorded facts judge, as before
+	w4 := mapWorld()
+	w4.liveErr = errors.New("no answer")
+	r4 := w4.runner()
+	w4.fakeClock(r4)
+	if name, err := runThrough(t, r4, mapHardInput(), StepName(0, StepStop)); err != nil {
+		t.Fatalf("%s: %v", name, err)
+	}
+}
+
+// M2. The live read before the fence can change the verdict that the first read accepted: nothing is stopped then.
+func TestAHardFailoverRereadsTheLivePrimaryBeforeTheFence(t *testing.T) {
+	w := mapWorld()
+	w.live2 = &LiveReplication{SyncStreaming: true, FlushLsn: "0/5100000", Streaming: 1}
+	w.onMapStart = func() { w.live2 = &LiveReplication{SyncStreaming: false, FlushLsn: "0/5200000", Streaming: 1} }
+	r := w.runner()
+	w.fakeClock(r)
+	_, err := runThrough(t, r, mapHardInput(), StepName(0, StepStop))
+	var pe *PauseError
+	if !errors.As(err, &pe) || w.index("demote ") >= 0 || w.count("map-abandon s2") != 1 {
+		t.Fatalf("want a pause before the fence and the bootstrap given up: %v\n%s", err, strings.Join(w.log, "\n"))
 	}
 }

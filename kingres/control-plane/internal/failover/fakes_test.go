@@ -75,6 +75,9 @@ type world struct {
 	mapAbandonErr      error           // the candidate answers the abandon with this (a 409 conflict: it promoted)
 	mapRefusal         string
 	mapStartErr        error
+	liveErr            error            // the primary of the map group cannot be asked
+	live2              *LiveReplication // what it says (nil: what the recorded facts say)
+	liveReads          int
 	onMapStart         func()  // runs inside the call that starts the bootstrap of the candidate (a test changes the facts there)
 	markErr            error   // the answer of the mark call
 	undoTerms          []int64 // the terms of the quiesce, unquiesce and resume calls
@@ -497,6 +500,19 @@ func (p fplan) Standbys(_ context.Context, g int32) ([]StandbyRec, error) {
 	return out, nil
 }
 func (p fplan) Facts(context.Context, int32) (GroupFacts, error) { return p.w.facts, nil }
+
+func (p fplan) LiveReplication(context.Context) (LiveReplication, error) {
+	p.w.mu.Lock()
+	defer p.w.mu.Unlock()
+	p.w.liveReads++
+	if p.w.liveErr != nil {
+		return LiveReplication{}, p.w.liveErr
+	}
+	if p.w.live2 != nil {
+		return *p.w.live2, nil
+	}
+	return LiveReplication{SyncStreaming: p.w.facts.SyncStreaming, FlushLsn: "0/5000000", Streaming: 1}, nil
+}
 func (p fplan) PrimaryNames(context.Context, string, int32) ([]int64, bool) {
 	if p.w.oldAlive && p.w.primaryNames != nil {
 		return p.w.primaryNames, true

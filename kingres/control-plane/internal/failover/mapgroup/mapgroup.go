@@ -76,6 +76,8 @@ type Ports interface {
 	// here on this server is the leader and its system database is the instance it promoted.
 	MoveSystem(ctx context.Context) error
 	Alert(ctx context.Context, kind, severity, subject, message string, raise bool)
+	// Audit writes an audit event of the bootstrap (M3: the row of the old leader's task was missing).
+	Audit(ctx context.Context, action string, group int32, details map[string]any)
 }
 
 // Request is what a manual request says.
@@ -809,6 +811,7 @@ func (r *Runner) makeLeader(ctx context.Context, j journal.Journal) (bool, error
 				// M3: the row of the old leader's task is not in the system database this server promoted (the task was never replicated, or was removed): nothing may be
 				// claimed on it, and the operator has to know.
 				r.P.Alert(ctx, "failoverNeedsDecision", "critical", "group:0", "The map group was promoted, but the task "+strconv.FormatInt(id, 10)+" of the old leader has no row for it in the new leader's system database.", true)
+				r.P.Audit(ctx, "failoverGroupPromoted", Group, map[string]any{"from": cur.OldServer, "to": r.P.Self(), "task": id, "taskRowMissing": true, "pin": pin != nil})
 				_ = r.Journal.Event(journal.StepLeader, "plannedRowMissing", map[string]any{"task": id, "pin": pin != nil, "verdict": string(dl)})
 				return false, &failover.PauseError{Reason: "the map group was promoted, but the row of the old leader's task is missing in the new system database; read the journal events, then repeat the request"}
 			} else if err != nil {

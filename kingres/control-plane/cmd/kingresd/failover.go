@@ -744,6 +744,45 @@ func (p *foPlanner) Audit(ctx context.Context, action string, group int32, detai
 		ResourceID: strconv.Itoa(int(group)), Outcome: audit.OutcomeSuccess, Details: details})
 }
 
+// LiveReplication asks the primary of the map group (the system database of this server, the leader's) for its standbys and its flush position, within three seconds.
+func (p *foPlanner) LiveReplication(ctx context.Context) (failover.LiveReplication, error) {
+	var out failover.LiveReplication
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	err := p.sys(ctx, func(c *pgx.Conn) error {
+		if err := c.QueryRow(ctx, `SELECT pg_current_wal_flush_lsn()::text`).Scan(&out.FlushLsn); err != nil {
+			return err
+		}
+		rows, err := c.Query(ctx, `SELECT state, sync_state, coalesce(sent_lsn::text, ''), coalesce(replay_lsn::text, '') FROM pg_stat_replication WHERE state = 'streaming'`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var st, sync, sent, replay string
+			if err := rows.Scan(&st, &sync, &sent, &replay); err != nil {
+				return err
+			}
+			out.Streaming++
+			if sync == "sync" || sync == "quorum" {
+				out.SyncStreaming = true
+			}
+			if a, ok := failover.ParseLSN(sent); ok {
+				if b, _ := failover.ParseLSN(out.SentLsn); a > b {
+					out.SentLsn = sent
+				}
+			}
+			if a, ok := failover.ParseLSN(replay); ok {
+				if b, _ := failover.ParseLSN(out.ReplayLsn); a > b {
+					out.ReplayLsn = replay
+				}
+			}
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
 // busyGroups are the groups of an unfinished failover run.
 func (p *foPlanner) busyGroups(ctx context.Context) map[int32]bool {
 	out := map[int32]bool{}

@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -258,5 +259,72 @@ func TestARepeatedHardRequestWithAnotherTargetIsRefused(t *testing.T) {
 	}
 	if err := m.targetMatchesTheJournal("s9", req("s4")); err != nil {
 		t.Fatalf("another server is not this journal's: %v", err)
+	}
+}
+
+// P2. The operator declares the candidate lost: the hold of the old leader ends without its word, only when the hold was made for that server (or has no record), the
+// server is not heard, and every other server answers and none is promoted or running a bootstrap.
+func TestADeclaredLostCandidateEndsTheHoldWithoutItsWord(t *testing.T) {
+	ctx := context.Background()
+	in := mapBootstrapStatus{Standby: "in_recovery"}
+	down := errors.New("down")
+	cases := []struct {
+		name    string
+		cand    string
+		lost    string
+		live    string
+		answers map[string]any
+		want    bool
+	}{
+		{"the candidate is lost and the others show a standby in recovery", "s2", "s2", "dead", map[string]any{"s2": down, "s3": in}, true},
+		{"no record of the hold", "", "s2", "dead", map[string]any{"s2": down, "s3": in}, true},
+		{"the hold was made for another server", "s3", "s2", "dead", map[string]any{"s2": down, "s3": in}, false},
+		{"the server is heard", "s2", "s2", "live", map[string]any{"s2": in, "s3": in}, false},
+		{"another server does not answer", "s2", "s2", "dead", map[string]any{"s2": down, "s3": down}, false},
+		{"another standby was promoted", "s2", "s2", "dead", map[string]any{"s2": down, "s3": mapBootstrapStatus{Standby: "primary"}}, false},
+		{"a bootstrap that names the old leader is active elsewhere", "s2", "s2", "dead", map[string]any{"s2": down, "s3": mapBootstrapStatus{Active: true, Standby: "in_recovery"}}, false},
+		{"without the declaration the dead candidate blocks", "s2", "", "dead", map[string]any{"s2": down, "s3": in}, false},
+	}
+	for _, c := range cases {
+		r := newResolveRig(t, c.answers)
+		r.cand = c.cand
+		r.m.heldBack = func() bool { return true }
+		r.m.liveOf = func(context.Context, string) string { return c.live }
+		got, why := r.m.resolveHeldBack(ctx, true, c.lost)
+		if got != c.want || (!got && why == "") || (got && r.ended != 1) {
+			t.Errorf("%s: resumed %v (%q), ended %d; want %v", c.name, got, why, r.ended, c.want)
+		}
+	}
+}
+
+// P2. The operator's call with a lost server: refused (409) while the cluster hears that server, and the declaration reaches the resume call of every server.
+func TestTheOperatorsAbandonCarriesTheLostServerToTheResumeCalls(t *testing.T) {
+	ctx := context.Background()
+	m, _ := abandonRig(t)
+	m.self = "s3"
+	m.memberList = func(context.Context) ([]string, error) { return []string{"s1", "s2", "s3"}, nil }
+	m.heldBack = func() bool { return false }
+	m.liveOf = func(_ context.Context, s string) string {
+		if s == "s2" {
+			return "live"
+		}
+		return "dead"
+	}
+	if _, err := m.Abandon(ctx, "ops", "x", "s2"); err == nil || !strings.Contains(err.Error(), "heard") {
+		t.Fatalf("a heard server was declared lost: %v", err)
+	}
+	var lost []string
+	m.callPeer = func(_ context.Context, server, _, path string, in, out any) error {
+		if path == "/failover/map/resume" {
+			lost = append(lost, in.(mapResumeBody).Lost)
+			b, _ := json.Marshal(mapResumeAnswer{Resumed: server == "s1"})
+			return json.Unmarshal(b, out)
+		}
+		b, _ := json.Marshal(mapAbandonAnswer{})
+		return json.Unmarshal(b, out)
+	}
+	res, err := m.Abandon(ctx, "ops", "x", "s9")
+	if err != nil || res.ResumedServer != "s1" || len(lost) == 0 || lost[0] != "s9" {
+		t.Fatalf("%+v %v %v", res, err, lost)
 	}
 }

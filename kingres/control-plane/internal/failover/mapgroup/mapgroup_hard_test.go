@@ -301,6 +301,9 @@ func TestAMissingRowOfTheOldLeadersTaskPausesTheBootstrap(t *testing.T) {
 	if len(w.alerts) == 0 || w.alerts[len(w.alerts)-1] != "failoverNeedsDecision" {
 		t.Fatalf("alerts %v", w.alerts)
 	}
+	if w.count("audit failoverGroupPromoted 0") != 1 {
+		t.Fatalf("the audit event was not written: %v", w.log)
+	}
 	cur, _ := js.Current()
 	found := false
 	for _, e := range cur.Events {

@@ -577,6 +577,20 @@ type Planner interface {
 	Alert(ctx context.Context, kind, severity, subject, message string, raise bool)
 	// Audit records an event of the failover.
 	Audit(ctx context.Context, action string, group int32, details map[string]any)
+	// LiveReplication reads pg_stat_replication and the flush position from the primary of the map group, which must answer now (M2). An error is a primary that cannot be
+	// asked; the caller then uses the recorded facts.
+	LiveReplication(ctx context.Context) (LiveReplication, error)
+}
+
+// LiveReplication is what the primary of the map group says of its standbys at the moment it is asked.
+type LiveReplication struct {
+	// SyncStreaming says that a standby that streams (state streaming) is synchronous or a quorum member (sync_state sync or quorum) right now.
+	SyncStreaming bool
+	// FlushLsn is pg_current_wal_flush_lsn() of the primary.
+	FlushLsn string
+	// Streaming is the number of standbys in state streaming; SentLsn and ReplayLsn are the highest positions reported.
+	Streaming          int
+	SentLsn, ReplayLsn string
 }
 
 // GroupRow is the record of one group of a run (kingres_cp.failover_group).

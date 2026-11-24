@@ -214,6 +214,9 @@ func (p ports) RecordTask(_ context.Context, j journal.Journal) (int64, error) {
 	p.w.log = append(p.w.log, "record-task")
 	return p.w.taskID, nil
 }
+func (p ports) Audit(_ context.Context, action string, group int32, _ map[string]any) {
+	p.w.rec("audit %s %d", action, group)
+}
 func (p ports) MoveSystem(context.Context) error             { p.w.rec("move-system"); return nil }
 func (p ports) CheckAuthority(context.Context) (bool, error) { return !p.w.noCA, nil }
 func (p ports) Alert(_ context.Context, kind, _, _, _ string, raise bool) {

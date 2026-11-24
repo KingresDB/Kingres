@@ -124,6 +124,8 @@ func (m *mapFailover) localStandbyState(ctx context.Context) string {
 // mapResumeBody is the request of POST /failover/map/resume: Strict asks for the evidence of an operator's call (every server of the cluster must answer).
 type mapResumeBody struct {
 	Strict bool `json:"strict,omitempty"`
+	// Lost is the server that the operator declared lost (P2); the hold is ended without its word.
+	Lost string `json:"lost,omitempty"`
 }
 
 // handleMapResume asks this server to resolve the hold of its primary of the map group. The caller is any member: the callee proves what it needs itself.
@@ -138,7 +140,7 @@ func handleMapResume(ctx context.Context, d *haDeps, _ string, body []byte) (any
 			return nil, badBody("a resume request")
 		}
 	}
-	resumed, detail := mf.resolveHeldBack(ctx, b.Strict)
+	resumed, detail := mf.resolveHeldBack(ctx, b.Strict, b.Lost)
 	return mapResumeAnswer{Resumed: resumed, Detail: detail}, nil
 }
 
@@ -164,19 +166,31 @@ func (m *mapFailover) candidateOfTheHold() string {
 //     recovery: a server that does not answer blocks.
 //
 // The lease stays the final authority for who may run: the primary starts again only when this server wins it.
-func (m *mapFailover) resolveHeldBack(ctx context.Context, strict bool) (bool, string) {
+func (m *mapFailover) resolveHeldBack(ctx context.Context, strict bool, lost string) (bool, string) {
 	if !m.isHeldBack() {
 		return false, "the primary of the map group is not held back for a hand-over on this server"
+	}
+	if lost != "" {
+		// P2: the operator declared the server lost. It has to be the one the hold was made for (or the hold has no record), and this server must not hear it.
+		if rec := m.candidateOfTheHold(); rec != "" && rec != lost {
+			return false, "the hold was made for " + rec + ", not for " + lost
+		}
+		if m.liveState(ctx, lost) == "live" {
+			return false, "the server " + lost + " is heard by this server; it is not lost"
+		}
 	}
 	members, err := m.members(ctx)
 	if err != nil {
 		return false, "the servers of the cluster cannot be read: " + err.Error()
 	}
 	cand := m.candidateOfTheHold()
+	if lost != "" {
+		cand = "" // its word is not asked for; every other server has to answer (below)
+	}
 	all := strict || cand == ""
 	proven, candidateProven := 0, false
 	for _, s := range members {
-		if s == m.self {
+		if s == m.self || (lost != "" && s == lost) {
 			continue
 		}
 		var st mapBootstrapStatus
@@ -249,7 +263,7 @@ func (m *mapFailover) watchOnce(ctx context.Context, now time.Time) {
 		m.setHeldWhy("", now)
 		return
 	}
-	if ok, why := m.resolveHeldBack(ctx, false); ok {
+	if ok, why := m.resolveHeldBack(ctx, false, ""); ok {
 		m.setHeldWhy("", now)
 	} else {
 		m.setHeldWhy(why, now)

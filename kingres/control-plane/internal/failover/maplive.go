@@ -152,5 +152,11 @@ func (r *Runner) judgeMapHard(ctx context.Context, sc *stepCtx, ready []StandbyR
 	if err != nil {
 		return Choice{}, facts, err
 	}
+	// M2: the primary is alive, so it is asked now, with a time bound, what it streams to whom: that replaces the recorded check, which is as old as the last round of the
+	// leader. A primary that does not answer leaves the recorded facts (and their age) to judge with.
+	if live, lerr := r.Plan.LiveReplication(ctx); lerr == nil {
+		facts.SyncStreaming = live.SyncStreaming && live.Streaming > 0
+		facts.LastKnownLsn, facts.LastKnownAge = live.FlushLsn, 0
+	}
 	return Choose(ChooseInput{Candidates: cands, Target: sc.in.Targets[0], Facts: facts}), facts, nil
 }

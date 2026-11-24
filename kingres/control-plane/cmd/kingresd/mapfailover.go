@@ -75,7 +75,8 @@ type mapFailover struct {
 	resumeOldLeader func(ctx context.Context, oldServer string) (bool, error)
 	// The parts of the resolution of a held-back primary that a test stands in for (nil: the real ones): the calls to other servers, the list of servers, the marker, the end of
 	// the hold, and the two ways of asking an instance whether it is in recovery.
-	candidateRecord func() string // the server that the hold was made for (nil: the record of the lease manager)
+	liveOf          func(ctx context.Context, server string) string // the view of a server (nil: the planner's)
+	candidateRecord func() string                                   // the server that the hold was made for (nil: the record of the lease manager)
 	callPeer        func(ctx context.Context, server, method, path string, in, out any) error
 	memberList      func(ctx context.Context) ([]string, error)
 	heldBack        func() bool
@@ -681,6 +682,12 @@ func (p *mapPorts) RecordTask(ctx context.Context, j journal.Journal) (int64, er
 	return id, nil
 }
 
+func (p *mapPorts) Audit(ctx context.Context, action string, group int32, details map[string]any) {
+	if p.m.pl != nil {
+		p.m.pl.Audit(ctx, action, group, details)
+	}
+}
+
 func (p *mapPorts) Alert(ctx context.Context, kind, severity, subject, message string, raise bool) {
 	// Before the promotion the system database of this server cannot be written: the alert is then only logged, and the journal
 	// has the event. The planner writes it when it can.
@@ -734,6 +741,14 @@ func (p *mapPorts) isCandidate(ctx context.Context, server string) (bool, error)
 
 // ---------------------------------------------------------------------------------
 // Giving up a bootstrap (F4-06)
+
+// liveState is this server's view of a server (a test stands in for the tracker).
+func (m *mapFailover) liveState(ctx context.Context, server string) string {
+	if m.liveOf != nil {
+		return m.liveOf(ctx, server)
+	}
+	return m.pl.Live(ctx, server)
+}
 
 type mapAbandonBody struct {
 	Reason string `json:"reason"`
@@ -853,8 +868,18 @@ func promoteBlockedByJournal(mf *mapFailover, group int32) error {
 // Abandon gives up the bootstrap of the map group that is in progress on this server, or on the server of a standby of the map group: the
 // request may arrive anywhere, and the leader may be the server that is gone. When none is in progress anywhere, it asks every server to end the hold of its
 // primary of the map group that nothing owns (F6-03): the operator's way to start a stranded old leader again. The answer says which server was resumed.
-func (m *mapFailover) Abandon(ctx context.Context, actor, reason string) (failover.MapAbandonResult, error) {
+// lostServer, when it is set, is the operator's declaration (P2) that the candidate the map group was handed to is lost: the server must not be heard by this server and
+// must be a member; the old leader then ends its hold without the word of that server, and a new request may choose another standby. What the server may have promoted
+// before it was lost is accepted by the operator with the declaration.
+func (m *mapFailover) Abandon(ctx context.Context, actor, reason, lostServer string) (failover.MapAbandonResult, error) {
 	reason = "given up by " + actor + ": " + reason
+	if lostServer != "" {
+		if m.liveState(ctx, lostServer) == "live" {
+			return failover.MapAbandonResult{}, problem.New(problem.Conflict, "Server "+lostServer+" is heard by the cluster; it is not lost. Give the bootstrap up without naming it, or wait until it is seen dead.")
+		}
+		reason += " (server " + lostServer + " declared lost)"
+		m.log.Warn("a server that the map group was handed to is declared lost", "server", lostServer, "by", actor)
+	}
 	if ans, err := m.abandonLocalFull(ctx, reason); ans.Abandoned || err != nil {
 		return failover.MapAbandonResult{Abandoned: ans.Abandoned, ResumedServer: ans.ResumedServer}, err
 	}
@@ -889,8 +914,8 @@ func (m *mapFailover) Abandon(ctx context.Context, actor, reason string) (failov
 	for _, s := range members {
 		var out mapResumeAnswer
 		if s == m.self {
-			out.Resumed, out.Detail = m.resolveHeldBack(ctx, true)
-		} else if err := m.call(ctx, s, http.MethodPost, "/failover/map/resume", mapResumeBody{Strict: true}, &out); err != nil {
+			out.Resumed, out.Detail = m.resolveHeldBack(ctx, true, lostServer)
+		} else if err := m.call(ctx, s, http.MethodPost, "/failover/map/resume", mapResumeBody{Strict: true, Lost: lostServer}, &out); err != nil {
 			continue
 		}
 		if out.Resumed {
