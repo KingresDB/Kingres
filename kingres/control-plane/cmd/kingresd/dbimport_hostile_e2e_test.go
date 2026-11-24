@@ -449,11 +449,15 @@ func TestDatabaseImportCleansUp(t *testing.T) {
 	}
 }
 
-// waitNoPrivate waits until no database with a private name is left: the compensation of a failed task runs after the task is recorded as failed.
+// waitNoPrivate waits until no private database of an import is left. The failure hook ends in DROP DATABASE, and PostgreSQL makes an immediate checkpoint before
+// it removes the files: the call waits for the checkpointer to write and fsync everything the instance has dirty, which the load of the import has just made. On the
+// disk of the test machine that took 8 to 13 s alone and 20 to 33 s under the load of a full gate (measured: the drop sat in the wait event CheckpointDone, the
+// checkpointer in DataFileSync; the drop of an idle database on an idle instance takes 0.2 s). The wait is that time with a margin of three or more, not the 240 s that
+// hid the cause.
 func (e *cp) waitNoPrivate(t testing.TB) []string {
 	t.Helper()
 	var names []string
-	for deadline := time.Now().Add(240 * time.Second); time.Now().Before(deadline); time.Sleep(500 * time.Millisecond) {
+	for deadline := time.Now().Add(120 * time.Second); time.Now().Before(deadline); time.Sleep(500 * time.Millisecond) {
 		if names = e.privateDatabases(t); len(names) == 0 {
 			return nil
 		}

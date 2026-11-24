@@ -489,6 +489,7 @@ func (o *Ops) dropDB(ctx context.Context, p dropParams) error {
 		return err
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	// DROP DATABASE makes an immediate checkpoint first, so it takes as long as the checkpointer needs to write the dirty data of the instance (seconds after a load).
 	// WITH (FORCE) ends the sessions that are there, but a session that connects in the moment between that and the drop (the collector of the
 	// ledger reads every database) makes the drop fail with 55006: that is tried again a few times before the step fails.
 	var err2 error
@@ -682,7 +683,7 @@ func (o *Ops) stepDropOn(ctx context.Context, env *task.Env, server string) erro
 // clearSkippedExtensionAlerts clears the alerts extensionSkipped of a database that is gone, on this server (every server drops the database and clears its own).
 func (o *Ops) clearSkippedExtensionAlerts(ctx context.Context, database string) {
 	err := o.asService(ctx, sysdb.Database, func(tx pgx.Tx) error {
-		_, e := tx.Exec(ctx, `UPDATE kingres_cp.alert SET cleared_at = now() WHERE kind = $1 AND cleared_at IS NULL AND split_part(subject, '|database:', 2) = $2`, sysdb.AlertExtensionSkipped, database)
+		_, e := tx.Exec(ctx, `UPDATE kingres_cp.alert SET cleared_at = now() WHERE kind = $1 AND cleared_at IS NULL AND split_part(split_part(subject, '|database:', 2), '|', 1) = $2`, sysdb.AlertExtensionSkipped, database)
 		return e
 	})
 	if err != nil && o.Log != nil {
