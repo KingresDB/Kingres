@@ -405,7 +405,7 @@ for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0', '0.
   if (!m) fail('README.md', `the changelog summary of ${version} must state "N operations added (M operations, P paths)"`);
   else if (version === doc.info?.version && (Number(m[2]) !== operations.length || Number(m[3]) !== Object.keys(doc.paths ?? {}).length)) fail('README.md', `changelog says ${m[2]} operations and ${m[3]} paths, the contract has ${operations.length} and ${Object.keys(doc.paths ?? {}).length}`);
 }
-if (doc.info?.version !== '0.19.0') fail('info.version', 'the contract is revision 0.19.0');
+if (doc.info?.version !== '0.25.0') fail('info.version', 'the contract is revision 0.25.0');
 
 
 // 0.5.0 rules: certificate operations, partial answers, additive changes only.

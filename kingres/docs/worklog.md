@@ -29,7 +29,7 @@ See the report of the run for the counts per major; the tests are `instance` (pr
 
 ## 2026-11-23 (second entry): the leftovers of p12-dist-tp and the findings of its review
 
-Branch p12-dist-tp, on top of g16 (merged, `t/252` rerun).  Contract revision still the placeholder 0.23.0.
+Branch p12-dist-tp, on top of g16 (merged, `t/252` rerun).  Contract revision 0.25.0 (numbered when merged into g2; the text is in `api/openapi.yaml` and the changelog of `api/README.md`).
 
 ### What was done
 
@@ -94,7 +94,7 @@ Covers branch p12-dist-tp (from g16), design [analytics-phase12-storage.md](desi
   every DDL statement on a table of the group already read.
 - **kingresd.**  The scheduler, `partition.maintain` and the policy operations needed no change of structure (the leader's instance holds the map group primary, so a distributed table is one of its tables).  Changed:
   the partition column and the health of a policy are read through `kingres_timepart` (they named the distribution column), a policy over the leaf budget is `partition_policy_conflict`, and `listTablePartitions` of a
-  distributed table has `rangeFrom`, `rangeTo` and `accessMethod` (`heap`, `columnar`, `mixed`).  The contract text is in `contract.txt` of the work area (placeholder 0.23.0); the console needs no change.
+  distributed table has `rangeFrom`, `rangeTo` and `accessMethod` (`heap`, `columnar`, `mixed`).  The contract text is in `contract.txt` of the work area (numbered 0.25.0 in g2); the console needs no change.
 - READMEs of `kingres_shard`, `kingres_timepart` and the control plane; section 11.7 of the design.
 
 ### How it was verified

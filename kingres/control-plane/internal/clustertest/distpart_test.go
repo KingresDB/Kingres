@@ -124,7 +124,7 @@ func TestPartitionPolicyOfADistributedTable(t *testing.T) {
 			if m["state"] != "done" {
 				t.Errorf("an action that is not done: %v", m)
 			}
-			// the partitions of a distributed table are not tables of this database: no size before or after (contract 0.23.0)
+			// the partitions of a distributed table are not tables of this database: no size before or after (contract 0.25.0)
 			if m["kind"] != "create" && (m["bytesBefore"] != nil || m["bytesAfter"] != nil) {
 				t.Errorf("an action of a distributed partition has sizes: %v", m)
 			}

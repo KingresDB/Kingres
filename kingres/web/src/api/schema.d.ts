@@ -1564,24 +1564,24 @@ export interface paths {
         /**
          * Get the time-partitioning policy of a table
          * @description Added in 0.17.0. The policy, when it runs next, the last run and the health of the partitions ahead. 404 `not_found` when the table has no policy, and the same code when the table does not exist
-         *     or `kingres_timepart` is not installed in the database; the `detail` says which. The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so. A read never installs an extension.
+         *     or `kingres_timepart` is not installed in the database; the `detail` says which. The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so. A user-partitioned distributed table (hash on top, range partitions below) is a table of that instance, so its policy and its runs are kept on the map group primary, which the manager leader runs. From 0.25.0 a run creates its partitions ahead on every server that holds a bucket, converts the leaves of the old ones to columnar storage on the servers that hold them (`columnarAfter`), and drops or detaches the partitions older than the retention (a partition that is detached becomes a distributed table of the same colocation group). `partitionColumn` and `partitionColumnType` name the key of the partitions, not the distribution column. A read never installs an extension.
          */
         get: operations["getPartitionPolicy"];
         /**
          * Set the time-partitioning policy of a table
          * @description Added in 0.17.0. Creates or replaces the policy. Synchronous: it writes the policy and creates no partition; `nextRunAt` of the answer is now, so the
          *     scheduler takes the table at its next tick. Durations are ISO 8601 (`P1D`, `P1M`, `PT6H`). 400 `validation_failed` with the JSON pointer of the field;
-         *     409 `partition_policy_conflict` when the table is not range-partitioned on a `date`, `timestamp` or `timestamptz` column; 409 `extension_missing`
+         *     409 `partition_policy_conflict` when the table is not range-partitioned on a `date`, `timestamp` or `timestamptz` column, and also for a distributed table whose policy would give it more leaves (buckets times partitions, in the steady state of the retention and `createAhead`) than `kingres_shard.max_partition_leaves` allows (the `detail` has the numbers); 409 `extension_missing`
          *     when `kingres_timepart` is not installed in the database and cannot be installed (the package of the server lacks it). 409 `operation_in_progress` while a run of the policy is going (its end would
          *     move the schedule). The conversion and the runs of a policy drive the DDL of `kingres_timepart` with its setting `trust_table_owners` on: the code of the owner of a table (an index expression, a check, a default) runs **as that owner, inside the session of the service role (a superuser)**, and what it leaves behind in that session (a deferred trigger, a temporary object, a changed setting) would run later with the rights of the service role; the session is closed when the call ends, and the extension refuses the known ways to leave such residue, but the guarantee is the trust in the owner. A policy is also repeated by the scheduler without a person in the loop. Therefore a table whose owner is not a superuser is refused (`conversion_refused` with the blocker `owner_not_trusted`, `partition_policy_conflict` for a policy and a run) unless the cluster setting `analytics.allowNonSuperuserOwners` is on (default off). The answer shows the owner (`tableOwner`) and whether it is trusted now (`ownerTrusted`). `createdBy` of the answer is the service role.
-         *     The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so.
+         *     The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so. A user-partitioned distributed table (hash on top, range partitions below) is a table of that instance, so its policy and its runs are kept on the map group primary, which the manager leader runs. From 0.25.0 a run creates its partitions ahead on every server that holds a bucket, converts the leaves of the old ones to columnar storage on the servers that hold them (`columnarAfter`), and drops or detaches the partitions older than the retention (a partition that is detached becomes a distributed table of the same colocation group). `partitionColumn` and `partitionColumnType` name the key of the partitions, not the distribution column.
          */
         put: operations["putPartitionPolicy"];
         post?: never;
         /**
          * Remove the time-partitioning policy of a table
          * @description Added in 0.17.0. Removes the policy; the partitions stay as they are. 404 `not_found` when the table has no policy; 409 `operation_in_progress`
-         *     while a `partition.maintain` task runs for the table. The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so.
+         *     while a `partition.maintain` task runs for the table. The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so. A user-partitioned distributed table (hash on top, range partitions below) is a table of that instance, so its policy and its runs are kept on the map group primary, which the manager leader runs. From 0.25.0 a run creates its partitions ahead on every server that holds a bucket, converts the leaves of the old ones to columnar storage on the servers that hold them (`columnarAfter`), and drops or detaches the partitions older than the retention (a partition that is detached becomes a distributed table of the same colocation group). `partitionColumn` and `partitionColumnType` name the key of the partitions, not the distribution column.
          */
         delete: operations["deletePartitionPolicy"];
         options?: never;
@@ -1605,7 +1605,7 @@ export interface paths {
         };
         /**
          * List the runs of a time-partitioning policy
-         * @description Added in 0.17.0. The runs of the policy, newest first, with the trigger, the state and the error of each (the `actions` of a listed run are empty). Empty when `kingres_timepart` is not installed. The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so.
+         * @description Added in 0.17.0. The runs of the policy, newest first, with the trigger, the state and the error of each (the `actions` of a listed run are empty). Empty when `kingres_timepart` is not installed. The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so. A user-partitioned distributed table (hash on top, range partitions below) is a table of that instance, so its policy and its runs are kept on the map group primary, which the manager leader runs. From 0.25.0 a run creates its partitions ahead on every server that holds a bucket, converts the leaves of the old ones to columnar storage on the servers that hold them (`columnarAfter`), and drops or detaches the partitions older than the retention (a partition that is detached becomes a distributed table of the same colocation group). `partitionColumn` and `partitionColumnType` name the key of the partitions, not the distribution column.
          */
         get: operations["listPartitionPolicyRuns"];
         put?: never;
@@ -1614,7 +1614,7 @@ export interface paths {
          * @description Added in 0.17.0. Starts a task of kind `partition.maintain` for the table (the console's "Run now"); the run's `trigger` is `manual`.
          *     `asOf`, when given, must be within five minutes of the time of the instance that runs the policy, otherwise 400 `validation_failed` on `/asOf` (a run with a time far from now would retire
          *     or create the partitions of that time and park the schedule there; use `planPartitionPolicy` with `asOf` for a dry replay). 404 `not_found` when the table has no policy; 409 `operation_in_progress`
-         *     while a run is going. 409 `extension_missing` when the policy converts to columnar and the library is not preloaded. The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so.
+         *     while a run is going. 409 `extension_missing` when the policy converts to columnar and the library is not preloaded. The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so. A user-partitioned distributed table (hash on top, range partitions below) is a table of that instance, so its policy and its runs are kept on the map group primary, which the manager leader runs. From 0.25.0 a run creates its partitions ahead on every server that holds a bucket, converts the leaves of the old ones to columnar storage on the servers that hold them (`columnarAfter`), and drops or detaches the partitions older than the retention (a partition that is detached becomes a distributed table of the same colocation group). `partitionColumn` and `partitionColumnType` name the key of the partitions, not the distribution column.
          */
         post: operations["runPartitionPolicy"];
         delete?: never;
@@ -1641,7 +1641,7 @@ export interface paths {
         };
         /**
          * Get one run of a time-partitioning policy
-         * @description Added in 0.17.0. A run with its actions, in the order they were taken. 404 `not_found` for a run that does not exist. The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so.
+         * @description Added in 0.17.0. A run with its actions, in the order they were taken. 404 `not_found` for a run that does not exist. For a distributed table an action may end `failed` with a `detail` that starts with `lock_timeout` followed by `retry_later` when a bucket move, a table operation or another conversion holds the colocation group; the run is then `partial` and comes back within five minutes (the same rule as a lock timeout of an ordinary table). An action `convert` ends `skipped` with a `detail` that starts with `conversion_refused` when a leaf or a server cannot do it; the partition then stays `mixed` and the next run goes on. The action of a distributed partition (`convert`, `drop`, `detach`) has no `bytesBefore` and `bytesAfter` (null, because the leaves are on other servers). The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so. A user-partitioned distributed table (hash on top, range partitions below) is a table of that instance, so its policy and its runs are kept on the map group primary, which the manager leader runs. From 0.25.0 a run creates its partitions ahead on every server that holds a bucket, converts the leaves of the old ones to columnar storage on the servers that hold them (`columnarAfter`), and drops or detaches the partitions older than the retention (a partition that is detached becomes a distributed table of the same colocation group). `partitionColumn` and `partitionColumnType` name the key of the partitions, not the distribution column.
          */
         get: operations["getPartitionPolicyRun"];
         put?: never;
@@ -1671,7 +1671,7 @@ export interface paths {
         /**
          * Preview the actions of a time-partitioning policy
          * @description Added in 0.17.0. A dry run: the actions a run would take now (or at `asOf`), with the stored policy or with the policy in the request.
-         *     Nothing changes. It is a read, so a `kingres_readonly` role may call it, and it is not audited. `asOf` is free here (a dry replay). The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so.
+         *     Nothing changes. It is a read, so a `kingres_readonly` role may call it, and it is not audited. `asOf` is free here (a dry replay). The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so. A user-partitioned distributed table (hash on top, range partitions below) is a table of that instance, so its policy and its runs are kept on the map group primary, which the manager leader runs. From 0.25.0 a run creates its partitions ahead on every server that holds a bucket, converts the leaves of the old ones to columnar storage on the servers that hold them (`columnarAfter`), and drops or detaches the partitions older than the retention (a partition that is detached becomes a distributed table of the same colocation group). `partitionColumn` and `partitionColumnType` name the key of the partitions, not the distribution column.
          */
         post: operations["planPartitionPolicy"];
         delete?: never;
@@ -5815,11 +5815,11 @@ export interface components {
              * @description Size of the leaves that this server holds; null when not available.
              */
             sizeBytes: number | null;
-            /** @description Added in 0.17.0, optional. The storage format of the partition (`heap`, `columnar`). */
+            /** @description Added in 0.17.0, optional. The storage format of the partition (`heap`, `columnar`). From 0.25.0 a user partition of a distributed table has it too: `heap` when every leaf is, `columnar` when every leaf is, `mixed` while the leaves are in both formats (a conversion that stopped half way) and `other` when a leaf is missing or has another access method; it is read on the servers that hold the leaves and is left out when a server does not answer or the sharding extension is older than 0.9. */
             accessMethod?: string | null;
-            /** @description Added in 0.17.0, optional. The lower bound of a range partition, as text. */
+            /** @description Added in 0.17.0, optional. The lower bound of a range partition, as text (a user partition of a distributed table has it from 0.25.0). */
             rangeFrom?: string | null;
-            /** @description Added in 0.17.0, optional. The upper bound of a range partition, as text. */
+            /** @description Added in 0.17.0, optional. The upper bound of a range partition, as text (a user partition of a distributed table has it from 0.25.0). */
             rangeTo?: string | null;
             /**
              * Format: int64

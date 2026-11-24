@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.24.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.25.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and, when it is built, the planned `kingres-cli` (it does not exist yet). Lint it and run the mechanical rule check with:
 
 ```
@@ -362,6 +362,26 @@ Where the architecture document leaves something open, the simplest option was c
     range and the cluster's replica count.
 
 ## Changelog
+
+### 0.25.0
+
+Revision for time partitioning of distributed tables (kingres_timepart 0.3 and kingres_shard 0.9; `kingres/docs/design/analytics-phase12-storage.md`, section 11). Descriptions only.
+0 operations added (171 operations, 136 paths); no setting, task kind or problem code added; **no change that is not additive**.
+
+#### Breaking
+
+None.
+
+#### Additive
+
+- `TablePartition.accessMethod` can be `mixed` (the leaves of a user partition of a distributed table are in both formats) or `other` (a leaf is missing or has another access method); `accessMethod`, `rangeFrom` and `rangeTo` are filled for the user partitions of a distributed table too (a free text member: no schema change).
+
+#### Documentation
+
+- The operations of the time-partitioning policy (`getPartitionPolicy`, `putPartitionPolicy`, `deletePartitionPolicy`, `planPartitionPolicy`, `runPartitionPolicy`, `listPartitionPolicyRuns`, `getPartitionPolicyRun`) say that a user-partitioned distributed table (hash on top, range partitions below) is a table of the instance of the manager leader: a run creates the partitions ahead on every server that holds a bucket, converts the leaves of the old ones to columnar storage on the servers that hold them, and drops or detaches the partitions older than the retention. `partitionColumn` and `partitionColumnType` name the key of the partitions, not the distribution column.
+- `putPartitionPolicy`: 409 `partition_policy_conflict` also when the policy would give a distributed table more leaves (buckets times partitions) than `kingres_shard.max_partition_leaves` allows.
+- `getPartitionPolicyRun`: an action of a distributed table may end `failed` with a detail that starts with `lock_timeout` and `retry_later` (the run is `partial` and comes back within five minutes) or `skipped` with a detail that starts with `conversion_refused`; an action of a distributed partition has no `bytesBefore` and `bytesAfter`.
+- kingresd keeps kingres_timepart at the version of the package on every server of every database (job `extension.update` of the leader): no operator step, no new operation or setting.
 
 ### 0.24.0
 
