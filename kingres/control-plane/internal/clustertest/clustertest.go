@@ -736,3 +736,16 @@ func (n *Node) PGAt(ctx context.Context, port int, user, pass, db string) (*pgx.
 	cfg.TLSConfig, cfg.Fallbacks, cfg.ConnectTimeout = nil, nil, 10*time.Second
 	return pgx.ConnectConfig(ctx, cfg)
 }
+
+// Command runs the binary under test once with the node's settings and the extra arguments (a local command of kingresd such as -release-map-hold) and returns
+// its combined output and its error. The output is appended to the log of the node.
+func (n *Node) Command(extra ...string) (string, error) {
+	n.t.Helper()
+	cmd := exec.CommandContext(context.Background(), os.Getenv("KINGRESD_BIN"), append(n.args(), extra...)...) //nolint:gosec // the binary under test
+	out, err := cmd.CombinedOutput()
+	if lf, ferr := os.OpenFile(n.LogFile, os.O_APPEND|os.O_WRONLY, 0o600); ferr == nil {
+		_, _ = lf.Write(out)
+		_ = lf.Close()
+	}
+	return string(out), err
+}
