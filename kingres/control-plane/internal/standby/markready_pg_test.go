@@ -5,7 +5,9 @@ package standby
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
+	"time"
 )
 
 // The leader makes a record ready only after the primary's server took a list with the entry Ready (M1 of the phase 5
@@ -93,5 +95,83 @@ func TestARecordBecomesReadyOnlyAfterThePrimaryTookTheReadyList(t *testing.T) {
 	l.mu.Unlock()
 	if n != 0 {
 		t.Fatalf("%d forced entries left", n)
+	}
+}
+
+// Phase 5 review M-B: a list that another task builds while a standby becomes ready must not take the Ready flag back.
+// The other task reads the records (the standby is still creating), then markReady writes the record and releases the
+// forced entry, and the other task applies its overlay afterwards: without one step for the two, its list says not Ready
+// with a version higher than the one before, and the primary's server stores it although the record is ready.
+func TestAListBuiltDuringMarkReadyNeverTakesTheReadyFlagBack(t *testing.T) {
+	ctx := context.Background()
+	c, l := systemDB(t)
+	for _, q := range []string{
+		`CREATE SCHEMA IF NOT EXISTS kingres`,
+		`CREATE TABLE kingres.node (node_id serial PRIMARY KEY, group_id int, host text, port int, role text, is_active boolean DEFAULT true, server_group text)`,
+		`INSERT INTO kingres.node (group_id, host, port, role) VALUES (1, 'p', 7001, 'primary'), (2, 's', 7002, 'primary')`,
+	} {
+		if _, err := c.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insertOld(t, c, 11, 1, "s", stateCreating, false, 0)
+	l.Self = "self"
+	own, err := NewAgent(&Agent{DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.Agent = own
+	var mu sync.Mutex
+	var sent []bool // the Ready flag of entry 11 in every list the primary's server was sent
+	l.Call = func(_ context.Context, server, _, _ string, in, _ any) error {
+		if p, ok := in.(PlanRequest); ok && server == "p" {
+			for _, e := range p.Standbys {
+				if e.ID == 11 {
+					mu.Lock()
+					sent = append(sent, e.Ready)
+					mu.Unlock()
+				}
+			}
+		}
+		return nil
+	}
+	rec, _, err := l.st.get(ctx, 11)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed := make(chan struct{})
+	aDone := make(chan struct{})
+	var once sync.Once
+	l.afterList = func() {
+		first := false
+		once.Do(func() { first = true })
+		if !first {
+			return
+		}
+		close(listed)
+		select { // the other task is slow between its two reads; markReady runs meanwhile when it can
+		case <-aDone:
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	bDone := make(chan error, 1)
+	go func() { bDone <- l.publish(ctx) }() // the other task
+	<-listed
+	if err := l.markReady(ctx, rec, "p", 7100); err != nil {
+		t.Fatal(err)
+	}
+	close(aDone)
+	if err := <-bDone; err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sent) < 2 {
+		t.Fatalf("expected two lists, got %v", sent)
+	}
+	for i, r := range sent {
+		if !r {
+			t.Fatalf("list %d took the Ready flag of a standby that became ready back: %v", i, sent)
+		}
 	}
 }
