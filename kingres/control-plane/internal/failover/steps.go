@@ -802,6 +802,7 @@ func (r *Runner) takeFence(ctx context.Context, env *task.Env, sc *stepCtx) erro
 			if quorumSince.IsZero() {
 				quorumSince = r.now()
 			}
+			errSince = time.Time{} // errors on either side of a time without a majority are not one run (phase 5 review L-2)
 			if r.now().Sub(quorumSince) > orDur(r.QuorumWait, time.Minute) {
 				r.Plan.Alert(ctx, "failoverBlocked", "warning", subjectOf(sc.group, sc.old()), "The server that runs the failover cannot hear a majority of the servers.", true)
 				if sc.in.graceful() {

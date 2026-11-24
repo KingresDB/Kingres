@@ -45,6 +45,7 @@ type world struct {
 	// state read says the group is not frozen when renewUnfrozen is set (an old primary that is stopped).
 	renewFreezeErr error
 	renewUnfrozen  bool
+	liveFn         func(server string) string // when set, the liveness view of a server (instead of the live map)
 	promoted       map[string]bool
 	promoteErr     map[string]error // scripted errors for the first calls, by server
 	promoteN       map[string]int
@@ -501,7 +502,12 @@ func (p fplan) Self() string { return p.w.self }
 func (p fplan) Members(context.Context) ([]string, error) {
 	return []string{"s1", "s2", "s3"}, nil
 }
-func (p fplan) Live(_ context.Context, s string) string { return p.w.live[s] }
+func (p fplan) Live(_ context.Context, s string) string {
+	if p.w.liveFn != nil {
+		return p.w.liveFn(s)
+	}
+	return p.w.live[s]
+}
 func (p fplan) Standbys(_ context.Context, g int32) ([]StandbyRec, error) {
 	var out []StandbyRec
 	for _, s := range p.w.standbys {

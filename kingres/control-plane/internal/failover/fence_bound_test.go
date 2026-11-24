@@ -3,6 +3,7 @@
 package failover
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -102,5 +103,34 @@ func TestAFreezeRenewalAnsweredAsFencedStandsTheStepDown(t *testing.T) {
 	_, err := runAll(t, r, gracefulInput())
 	if !errors.Is(err, fence.ErrFenced) {
 		t.Fatalf("want the stand-down, got %v", err)
+	}
+}
+
+// Phase 5 review L-2: errors of the lease call that are separated by a time without a majority are not one continuous run of
+// errors. The time of the first error is forgotten when the majority is lost, so the wait for the lease starts again when it
+// is heard again.
+func TestTheWaitAfterLeaseCallErrorsStartsAgainWhenTheMajorityIsHeardAgain(t *testing.T) {
+	w := newWorld()
+	w.leaseErr = &CallError{Status: 503, Code: "not_available", Message: "the lease manager is not running"}
+	r := w.runner()
+	r.LeaseWait = 3 * time.Second
+	r.QuorumWait = 100 * time.Second
+	start := time.Unix(1_000_000, 0)
+	now := start
+	r.Now = func() time.Time { return now }
+	r.Sleep = func(ctx context.Context, d time.Duration) error { now = now.Add(d); return ctx.Err() }
+	w.liveFn = func(string) string { // no majority from the 2nd to the 60th second
+		if e := now.Sub(start); e >= 2*time.Second && e < 60*time.Second {
+			return ""
+		}
+		return "live"
+	}
+	_, err := runAll(t, r, hardInput())
+	var pe *PauseError
+	if !errors.As(err, &pe) {
+		t.Fatalf("want a pause, got %v", err)
+	}
+	if e := now.Sub(start); e < 63*time.Second {
+		t.Fatalf("paused %v after the start: the errors before the loss of the majority were counted", e)
 	}
 }
