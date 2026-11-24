@@ -102,6 +102,9 @@ func (r *Repair) Step(ctx context.Context) ([]int32, error) {
 		if terr != nil {
 			continue
 		}
+		// POST /failover/resume is leader-only on purpose (it is not "leader or held back"): it starts a primary, which a server whose instance waits
+		// for its lease must not do on the word of the peers alone. A server that is held back answers 503, the group stays in r.since (it is deleted
+		// only after both calls succeeded) and the next round of Run repeats the repair.
 		rerr := errors.Join(r.P.Resume(ctx, server, g, term), r.P.Unquiesce(ctx, server, g, term))
 		if rerr != nil {
 			r.P.Log(fmt.Sprintf("the repair of group %d did not finish; it is repeated", g), "error", rerr.Error())

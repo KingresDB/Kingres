@@ -610,6 +610,15 @@ func TestSwitchoverEndsWhenTheOldServerForgotTheLeader(t *testing.T) {
 	if host := swPrimaryHost(t, leader, g); host != nw.Host {
 		t.Fatalf("the primary of group %d is on %s, want %s", g, host, nw.Host)
 	}
+	// The end of the freeze and of the hold reached the old server, which still cannot read its catalog: its state says so (and the call needs the
+	// fence header of a run, which InternalCall carries).
+	var ost failover.State
+	if code, err := leader.InternalCall(old, "GET", fmt.Sprintf("/failover/state?group=%d", g), nil, &ost); err != nil || code != 200 {
+		t.Fatalf("the state of the old server: %d %v", code, err)
+	}
+	if ost.Frozen || ost.Quiesced {
+		t.Errorf("the old server still holds the freeze (%v) or the hold of the writes (%v) after the switchover ended done", ost.Frozen, ost.Quiesced)
+	}
 	old.Heal()
 	before := w.count()
 	until(t, 2*time.Minute, "writes after the switchover", func() bool { return w.count() > before+30 })

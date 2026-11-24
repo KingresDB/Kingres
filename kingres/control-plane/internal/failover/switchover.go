@@ -159,7 +159,8 @@ func (r *Runner) rollbackSwitchover(ctx context.Context, taskID int64, in Input,
 	}
 	// An error is logged, never swallowed: a server that cannot be reached keeps its hold and its marker, and the loop of Repair undoes them when
 	// the server answers again (F4-02), whatever became of this task. The map group is not in that loop: its old leader resolves a hold that nothing owns
-	// by itself (F6-01, resolveHeldBack of kingresd).
+	// by itself (F6-01, resolveHeldBack of kingresd). POST /failover/resume stays leader-only on purpose, unlike unquiesce, unfreeze and state: it starts a
+	// primary, which a held-back server must not do on the word of its peers; it answers 503 until its instance can be read, and Repair repeats it.
 	if err := r.Peers.Resume(ctx, in.oldOf(g), ResumeRequest{Group: g, ExpectedTerm: term}); err != nil {
 		r.log().Warn("failover: the old primary could not be resumed; the repair of switchovers will try again", "group", g, "server", in.oldOf(g), "error", err)
 	}

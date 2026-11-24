@@ -113,11 +113,18 @@ length and a hash prefix of the statement, never its text.
 
 **The leader of a server that is held back.** A server whose instance waits for its group lease (the old primary of a failover, stopped and kept from
 starting until it is a standby) cannot read its catalog and does not know the leader: its leader-only calls answer `503 service_unavailable`, and a
-task step waits for it. Six calls (`POST /standby/plan`, `POST /standby/rebuild`, `GET /standby/status`, and, for the end of a switchover or failover, `GET /failover/state`, `POST /failover/unquiesce`, `POST /failover/unfreeze`) have the policy "leader or held back": while
-the server is held back it asks the other servers of its peer directory `GET /leader` (any peer answers; the answers count when every server that
-answered names the same leader; kept three seconds) and accepts the call of the server they name. Without an answer it stays `503`. The rebuild of an
-old primary proves what it needs itself (internal-api.md, "Standbys"), so this widens nothing a member could not already do to its own instance.
-
+task step waits for it. Six calls have the policy "leader or held back": `POST /standby/plan`, `POST /standby/rebuild` and `GET /standby/status`
+(the standby calls), and `GET /failover/state`, `POST /failover/unquiesce` and `POST /failover/unfreeze` (the end of a switchover or failover). While the
+server is held back it asks every other server of its peer directory `GET /leader`, which answers `{leader, heldBack}`. An answer counts when it names a
+leader and its sender is not itself held back (it can read its catalog); a call is accepted only when this server and the counted answers are a majority of
+the members, every counted answer names the same leader, and that leader is the caller. Nothing is kept between calls. What this proves is only that a
+majority of the members, which read their own catalogs, name the caller as the leader now. It does not prove that the caller's run is current, and it
+does not prove the term of the catalog (which the server cannot read). So the three failover calls also need the fence header (task and epoch) of a live run
+while the server is held back, and answer `409 fenced` without it or with a superseded one. `POST /failover/unquiesce` is accepted by a server that cannot
+read its term only when the primary of the group does not run here (or there is none); if it runs, or cannot be looked at, the answer is `503`, so the
+writes are never let in again onto a running primary on the word of the peers. `POST /failover/resume` stays leader-only: it starts a primary. The rebuild
+of an old primary proves what it needs itself (internal-api.md, "Standbys"), so the standby calls widen nothing a member could not already do to its own
+instance. Without an accepted answer a call stays `503`.
 ## Forwarding an operation to the leader
 
 `POST /internal/v1/forward` is how a server that is not the manager leader hands a cluster operation to

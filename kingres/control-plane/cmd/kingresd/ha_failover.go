@@ -208,14 +208,16 @@ func peerStateName(s ha.PeerState) string {
 
 // StateInstance is one instance of this server in the answer of GET /failover/state.
 type StateInstance struct {
-	ID         int    `json:"id"`
-	Port       int    `json:"port"`
-	Role       string `json:"role"`
-	Origin     string `json:"origin"`
-	Group      int32  `json:"group"`
-	Term       int64  `json:"term"`
-	Running    bool   `json:"running"`
-	InRecovery *bool  `json:"inRecovery"`
+	ID      int    `json:"id"`
+	Port    int    `json:"port"`
+	Role    string `json:"role"`
+	Origin  string `json:"origin"`
+	Group   int32  `json:"group"`
+	Term    int64  `json:"term"`
+	Running bool   `json:"running"`
+	// RunningUnknown: the instance manager could not say whether the instance runs; Running is false then and means nothing.
+	RunningUnknown bool  `json:"runningUnknown,omitempty"`
+	InRecovery     *bool `json:"inRecovery"`
 }
 
 // StateAnswer is the answer of GET /failover/state: this server's knowledge of one
@@ -248,7 +250,10 @@ func failoverState(ctx context.Context, d *haDeps, group int32) StateAnswer {
 	for _, li := range d.Svc.LocalInstances() {
 		li := li
 		si := StateInstance{ID: li.ID, Port: li.Port, Role: li.Role.Role, Origin: li.Role.Origin, Group: li.Role.Group, Term: li.Role.Term}
-		si.Running, _ = d.Svc.Manager().Running(ctx, li.ID)
+		var rerr error
+		if si.Running, rerr = d.Svc.Manager().Running(ctx, li.ID); rerr != nil {
+			si.Running, si.RunningUnknown = false, true
+		}
 		if si.Running && li.Role.Group == group {
 			if c, err := d.Svc.InstanceConn(ctx, li.ID, "postgres"); err == nil {
 				var rec bool

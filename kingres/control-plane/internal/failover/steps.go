@@ -1738,7 +1738,7 @@ func (r *Runner) unfreeze(ctx context.Context, env *task.Env, sc *stepCtx) error
 		r.log().Warn("failover: lifting the freeze", "group", sc.group, "server", sc.old(), "error", err)
 	}
 	old := "waitingForServer"
-	if st, err := sc.oldState(ctx); err == nil && len(st.OutOfRecovery()) == 0 {
+	if st, err := sc.oldState(ctx); err == nil && len(st.OutOfRecovery()) == 0 && !st.RunningUnknown() { // an instance that cannot be looked at may run: the rebuild waits
 		old = "rebuildScheduled" // the reconcile loop rebuilds it (oldprimary.go in internal/standby)
 	}
 	if err := sc.rows.Set(ctx, sc.group, GroupSet{State: ptr("done"), OldPrimary: &old, Finished: true}); err != nil {

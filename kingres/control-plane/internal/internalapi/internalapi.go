@@ -236,6 +236,10 @@ var fenceRequired = map[string]bool{"POST /failover/demote": true, "POST /failov
 	// behind has no run to show.
 	"POST /failover/quiesce": true, "POST /failover/mark": true, "POST /failover/verify": true}
 
+// heldBackFenced are the calls of policy LeaderOrHeldBack that a held-back server accepts only with the fence header of a task run: the
+// server cannot read its catalog term, so the live run (task and epoch) is what proves that the caller is not a superseded leader.
+var heldBackFenced = map[string]bool{"GET /failover/state": true, "POST /failover/unquiesce": true, "POST /failover/unfreeze": true}
+
 // CallError is an error with the status and code the internal API answers.
 type CallError struct {
 	Status  int
@@ -536,6 +540,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
+			// A held-back server judges these calls by the run that makes them alone: without the header they are refused.
+			if heldBack && r.Header.Get(fence.Header) == "" && heldBackFenced[key] {
+				fail(w, http.StatusConflict, "fenced", "A held-back server accepts this call only with the fence header of a task run.")
+				return
+			}
 			// F3-13: a call that stops or promotes an instance names the run it is made for; one without the header is
 			// refused (a caller that holds the leader's certificate, or a defect, must not stop a primary without a run).
 			if r.Header.Get(fence.Header) == "" && fenceRequired[key] && s.be.Fence != nil {
@@ -586,7 +595,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "GET /state":
 		writeJSON(w, http.StatusOK, s.be.State(ctx))
 	case "GET /leader":
-		writeJSON(w, http.StatusOK, map[string]string{"leader": s.be.Leader()})
+		// heldBack tells a caller that asks the members because it cannot read its own catalog to ignore this answer: this server cannot read
+		// its catalog either, and what it names is only what it remembers.
+		held := s.be.Unavailable != nil && s.be.Unavailable()
+		writeJSON(w, http.StatusOK, map[string]any{"leader": s.be.Leader(), "heldBack": held})
 	case "GET /revoked":
 		writeJSON(w, http.StatusOK, map[string]any{"serials": s.be.Revoked()})
 	case "GET /resources":
