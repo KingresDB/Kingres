@@ -18,6 +18,11 @@ const emit = defineEmits<{ close: [] }>()
 
 const preview = useDrainPreview(props.server.id)
 const p = computed(() => preview.data.value)
+// The server that runs the primary of the map group (the manager leader) is drained too: the task pauses once the buckets have moved,
+// a planned switchover hands the map group to a standby on another server, and the drain goes on under the new leader (contract 0.27.0).
+const hostsMapGroup = computed(() =>
+  props.server.instances.some((i) => i.isMapGroup && i.role === 'primary'),
+)
 const form = reactive({
   removeWhenDone: false,
   acceptFewerReplicas: false,
@@ -76,6 +81,16 @@ const start = () =>
             <span><SafeName :value="b.detail" kind="text" :max="300" /></span>
           </li>
         </ul>
+        <p v-if="hostsMapGroup" class="notice tone-info" data-testid="drain-mapgroup">
+          <span aria-hidden="true">&#9432;</span>
+          <span
+            >This server runs the primary of the map group (the manager leader). After the buckets
+            have moved, the drain pauses (the rebalance shows it as stopped by a safety rule) while
+            a planned switchover hands the map group to a standby on another server; it goes on by
+            itself under the new leader. If the switchover cannot be made the drain fails and the
+            server stays draining.</span
+          >
+        </p>
         <p v-if="p.standbyShardGroupIds.length" class="muted" data-testid="drain-standbys">
           The server hosts a standby of the shard groups {{ p.standbyShardGroupIds.join(', ') }}.
           They are moved to the other servers first. If the servers that remain cannot hold them,

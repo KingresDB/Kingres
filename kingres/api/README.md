@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.26.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.27.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and, when it is built, the planned `kingres-cli` (it does not exist yet). Lint it and run the mechanical rule check with:
 
 ```
@@ -362,6 +362,31 @@ Where the architecture document leaves something open, the simplest option was c
     range and the cluster's replica count.
 
 ## Changelog
+
+### 0.27.0
+
+Revision of the branch `p10-drain4`: the last two open items of phase 10. Summary for the panel:
+0 operations added (174 operations, 138 paths); no schema, no problem code and no task kind added; **no change that is not additive**.
+
+#### Breaking
+
+None.
+
+#### Additive
+
+- `drainServer` also drains the server that runs the primary of the map group (the manager leader). The task of the drain gets the step `Hand over the map group` (between `Wait until the server owns no bucket` and
+  `Relocate the standbys hosted on the server`): it pauses the task, asks for a planned switchover of shard group 0 (`failoverServer`, mode `graceful`) to a standby on another server, and the drain goes on under the
+  new manager leader when the switchover has ended. The task keeps its id; `getRebalanceStatus` shows it `stopped` (`stoppedBy` `safetyRule`) while it waits. A switchover that is refused or rolled back fails the task with
+  the code of the refusal, or with `server_hosts_map_group` when the server still runs the map group; the server stays `draining`.
+- `RebalanceAutomatic.lastEvaluation.blockedBy` `groupDegraded` also names a group whose standby is behind its primary by more than `rebalance.maxStandbyLagBytes` (default 64 MiB) when a run is started or resumed; inside a run the lag has to be over twice the limit on three evaluations in a row (the run's own writes make the standbys lag for a while); a pause of a run by this rule
+  is the same `stoppedBy: safetyRule` as for the other rules.
+
+- `RebalanceOptions.force` (boolean, optional): a manual start (`startRebalance`) is refused with 409 `group_degraded` while a group has a standby that is behind its primary by more than `maxStandbyLagBytes` or whose lag cannot be read, unless `force` is true; it lifts only that refusal.
+
+#### Documentation
+
+- `drainServer`: 409 `server_hosts_map_group` is now only for a server that runs the primary of the map group when no other server runs a standby of it (before: always).
+
 
 ### 0.26.0
 

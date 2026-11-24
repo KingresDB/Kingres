@@ -125,6 +125,66 @@ Covers branch p12-dist-tp (from g16), design [analytics-phase12-storage.md](desi
 
 none.
 
+## 2026-11-23: phase 10 closed in the control plane: the drain hands the map group over, and the automatic mode waits for a standby that lags
+
+### What was done
+
+Branch `p10-drain4` (from the staging branch g16). The two open items of phase 10 ([design section 23](design/shard-phase10.md)):
+
+- **Drain step 4, the hand-over of the map group** (`internal/rebalance/handover.go`, `cmd/kingresd/drain_maphandover.go`). `drainServer` no longer refuses the server that runs the map group primary when another server runs a standby of it. A planned switchover is refused while a rebalance runs
+  (migration 0009), so the new step `Hand over the map group` pauses the drain task, a goroutine asks for the planned switchover of group 0 (`failover.Service.Start`, graceful), and the job `RunDrainWatch` of the new manager leader resumes the drain when the switchover has ended (marker `drain.mapHandover`
+  in `kingres_cp.cluster_setting`). A refused or rolled-back switchover fails the task with its code; the server stays draining. The reconcile of the standbys (step 5) leaves the former primary of group 0 in the ring until it is a ready standby (`cmd/kingresd/drain_standbys.go`):
+  the first cluster run showed that a former primary that is still being rebuilt cannot be removed, and the step waited for the whole bound.
+- **The standby-lag rule of the automatic mode** (`automatic.go`, `pg.go`). The rule "group without a healthy standby" also holds for a standby behind its primary by more than `maxStandbyLagBytes` (default 64 MiB), read on the primary of each group (`pg_stat_replication`); a primary that cannot be asked counts as lagging.
+- Contract text only, placeholder revision **0.27.0**: `drainServer` description, `blockedBy` description, API README changelog, `check-contract.mjs`, the two texts in `web/src/api/schema.d.ts` (by hand).
+- Documents: `control-plane/README.md` (drain, automatic mode, tests), `docs/design/shard-phase10.md` section 23, this entry.
+- Commits: see `git log p10-drain4` (code and tests, contract, documents).
+
+### How it was verified
+
+- Unit tests (`go test ./internal/rebalance ./internal/ops ./internal/failover ./internal/contract`): `handover_test.go` (decision table, readiness of the marker, refusal of the map group server, the step with an engine over memory: pause, one request, resume, refusal code, rollback, a hook error recorded without its text, no request before the pause), `lag_test.go`.
+- With PostgreSQL (lane l8, private installs, PostgreSQL 18 and 19.0): `handover_pg_test.go` (marker in the system database with the age by the clock of the database, the watch resumes a started or refused hand-over, waits for an unfinished failover, leaves a young marker, another task, a manual rebalance and a server that is not the leader alone, resumes a marker left behind), `lag_pg_test.go` (facts, the setting, an unreadable primary, no standbys wanted, the guard).
+- Cluster tests (`internal/clustertest/phase10_drain4_test.go`, PostgreSQL 18 and 19.0): `TestDrainHandsOverTheMapGroup` (three servers, standbys, writers on another server through the whole drain of the manager leader: the drain ends done under the new leader, the step is done, group 0 is elsewhere, the drained server holds no bucket and no instance, the other servers see every row and every acknowledged write, the failover report is there),
+  `TestDrainWhoseSwitchoverOfTheMapGroupIsGivenUpFailsAndLeavesTheServerDraining` (the candidate cannot promote, the bootstrap is given up: the drain fails with `server_hosts_map_group`, the old leader holds the map group again, the flag stays false, the rebalance lock is free), `TestAutomaticRebalanceWaitsForAStandbyThatLags` (replay paused on the standby of the group that owns the buckets, 8000 rows written, limit 1 MiB: blocked by `groupDegraded`, no run for 15 s, then the replay resumes and the run completes).
+  The existing `TestDrainOnACluster` (its preview of the map group server now says it can be drained) and `TestAutomaticRebalanceOnACluster` pass on both majors.
+- `node kingres/api/scripts/check-contract.mjs`: all rules hold (171 operations, 136 paths). Not run: `npm run api:check` of the console (no `node_modules` in the worktree), so the two hand-edited texts of `schema.d.ts` are unchecked against the generator.
+- Mutants: 18 on the unit and PostgreSQL tests (lag comparison, unreadable lag, rule without the lag, rule without the replica count, a started marker that asks again, a step that does not pause, a request without waiting for the pause, a request twice, a marker that is ready at once, a refusal that ignores the standbys of the map group or the hook, a refusal that is not recorded, markers that are not cleared), all killed (two first versions did not compile and were redone); 2 at cluster level (the hook not wired: the preview and the drain refuse the map group server; the lag rule left out: no block), both killed. The wait for the former primary to be a ready standby was found by a failing cluster run (the drain stood in step 5 until the bound) and has no mutant of its own.
+
+### Decisions and deviations
+
+- The drain stays one task of kind `rebalance` (section 22); the hand-over pauses it instead of running the switchover inside the step, because the database excludes the two (see section 23).
+- The lag rule is part of the automatic mode only; a manual start does not read the lag.
+- The removal of the old leader after its drain was not tried in the cluster test: the first server holds the key of the certificate authority and `removeServer` answers `certificate_authority_unavailable` from another leader (an existing limit, unrelated to the drain).
+
+### Fixes after the review of the branch (same day)
+
+- M1: the marker has the states `requested`, `requesting` (written before the hook is called), `started` (after it, tried five times on new sessions) and `refused`; the audit event comes after the record of started; the watch also resumes `requested` or `requesting` when a failover created after the marker has ended (and turns the marker into started, so the resumed step fails if the server still runs the map group).
+- L1, L3: the marker carries an attempt (a random name; ages are by the clock of the database, so no clock of a server is compared). The goroutine acts only while the marker carries its attempt; a young marker of the same task is not overwritten, and a manual resume of the paused drain pauses again.
+- L2: the hook refuses with `failover_in_progress` while any failover task is unfinished, so `failover.Service.Start` never resumes an unrelated paused failover.
+- L4: the marker is cleared when the step ends or fails, in `onFail` (failure and cancel, also while paused) and at the end of the drain (`Write the report`).
+- L5: only `creating` and `rebuilding` standbys of group 0 on the drained server hold it in the ring; at the bound with `acceptFewerReplicas` the server is taken out of the ring anyway (hook argument `force`), and the task detail says that the drain ends with fewer standbys.
+- M2: the lag query joins `pg_stat_replication` with the physical slots, reads only senders that are catching up or streaming, and answers -1 (lagging) for a standby with no replayed position; backup and logical walsenders are ignored; cascading standbys are not seen (documented).
+- M3: inside a run the guard needs more than twice `maxStandbyLagBytes` on three evaluations in a row; the start and the resumption of a run use the limit; the groups are read in parallel under the same 15 s bound. Contract text, README and design section 23 say so.
+- L6: the console mock lists the step `Hand over the map group`; the drain dialog says that the map group is handed over for the server that runs its primary. Vitest of the touched files, `npm run api:check`, eslint, prettier and `vue-tsc` pass (the `node_modules` of another worktree were linked).
+
+Verification of the fixes: unit and PostgreSQL tests of `internal/rebalance` (whole package, PostgreSQL 18 and 19.0), `cmd/kingresd` (hook), console (vitest of the touched file and of the servers pages, `npm run api:check`, eslint, prettier, `vue-tsc`), the five cluster tests on both majors. 16 more mutants, all killed (a lagging row of one evaluation, no `requesting` record, no audit event, a young marker that asks again, the attempt ignored, readiness without the ended failover, the marker of any task cleared, no `force`, streak of one, factor of one, a hook that ignores an unfinished failover, sequential reads, a query without the physical filter, with backups, without the unreadable case, `onFail` that keeps the marker). One cluster run of `TestDrainHandsOverTheMapGroup` on PostgreSQL 19.0 ran into its 25 minute bound (the drain did not end under the new leader) and its log was not kept; six later runs on 19.0 and two on 18 passed. The test now prints the task, the rebalance status and the log of the new leader when it fails, so that the next occurrence can be read; the cause is not known.
+
+Verification of the fixes: unit and PostgreSQL tests of `internal/rebalance` (whole package, PostgreSQL 18 and 19.0), `cmd/kingresd` (hook), console (vitest of the touched file and of the servers pages, `npm run api:check`, eslint, prettier, `vue-tsc`), the five cluster tests on both majors. 16 more mutants, all killed (a lagging row of one evaluation, no `requesting` record, no audit event, a young marker that asks again, the attempt ignored, readiness without the ended failover, the marker of any task cleared, no `force`, streak of one, factor of one, a hook that ignores an unfinished failover, sequential reads, a query without the physical filter, with backups, without the unreadable case, `onFail` that keeps the marker). One cluster run of `TestDrainHandsOverTheMapGroup` on PostgreSQL 19.0 ran into its 25 minute bound (the drain did not end under the new leader) and its log was not kept; six later runs on 19.0 and two on 18 passed. The test now prints the task, the rebalance status and the log of the new leader when it fails, so that the next occurrence can be read; the cause is not known.
+
+### Closing items before gate2 (2026-11-24)
+
+- The timeout of `TestDrainHandsOverTheMapGroup` on PostgreSQL 19.0: ten more runs on 19.0 (nine passed; the tenth stopped in the formation of the cluster, where the standbys were not streaming after three minutes, before any drain began, under the load of the gate) and five on 18 (all passed); a second formation stop on 19.0 hit the death test the same way and its rerun passed. The L5 suspicion was reasoned through: the five states of the CHECK, which are written, and how the former primary of group 0 passes through them (design section 23). It does not leave a state other than the ones that are waited for; the cause of the one timeout stays unknown.
+- A manual start is refused with `group_degraded` while a standby lags by more than the limit, unless `RebalanceOptions.force` (contract 0.27.0, additive): `Service.manualLagGate`, unit and PostgreSQL tests, the cluster test `TestManualRebalanceRefusesAStandbyThatLagsUnlessForced`.
+- A drain whose server dies while the map group is handed over: cluster test `TestDrainWhoseServerDiesWhileTheMapGroupIsHandedOver` (fault point `drain:handover` holds the request after the marker says `requesting`; kingresd and the instances are killed by pid; the map group is failed over by an operator). It found that step 5 waited its whole bound (30 minutes) for a dead server: step 5 now fails at once with `node_state_invalid` when the server is dead. The drain ends failed on the new leader, the marker is gone and the rebalance lock is free.
+- The tests wait for the first rebalance to be idle before they start a drain (a report can exist before its task ends).
+
+Mutants of the closing items, all killed: the manual gate (always allows, force ignored, a lag at the limit refused, an unreadable lag taken as none: the PostgreSQL tests of `internal/rebalance`), the dead-server check of step 5 (removed: the unit test waits out its bound and fails; a wrong code: the unit test; removed with the bound cut to 3 minutes: the cluster test, which now asserts that the drain failed with `node_state_invalid`), and the hold at `drain:handover` (never cleared: the unit test of `holdAtFault` hangs on its first call and is killed by the timeout). The two cluster tests of the drain of a dying server and of a given-up switchover were rerun on both majors on the final code; the cluster of these tests now waits up to ten minutes for its standbys (three formation stops on 19.0 on a machine with a load average of 14, before any drain began).
+
+### Still open
+
+- The cause of the one timeout of the cluster test on PostgreSQL 19.0 is unknown (it did not happen again in 14 runs); the test now prints what is needed to read it.
+- The number 0.27.0 is a placeholder and must be renumbered when the branch is merged.
+
 ---
 
 ## 2026-11-22 (staging branch g15): cp-1011, p13-fix and web-15b merged, contract revisions renumbered

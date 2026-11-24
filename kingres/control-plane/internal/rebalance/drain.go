@@ -29,14 +29,17 @@ import (
 // that only a drain runs (they are skipped by a rebalance): the flag is set first, the move is the rebalance's
 // loop with drainOnly, the end waits until the server owns no bucket and has none arriving, and the removal,
 // when asked for, is made by the "server.remove" task after the drain task has ended (the two exclude each other).
-// Standby relocation and the hand-over of the map group (steps 4 and 5 of the design) are not part of this
-// increment: a server that hosts the map group primary is refused with server_hosts_map_group, and a drain that
-// would leave fewer servers than replicaCount + 1 is refused with replicas_cannot_be_kept.
+// The hand-over of the map group (step 4, handover.go) pauses the task, asks for the planned switchover of group 0 and goes on
+// under the new manager leader; the relocation of the standbys is step 5. A server that hosts the map group primary is
+// refused with server_hosts_map_group only when no other server runs a standby of the map group (or the build has no
+// planned switchover), and a drain that would leave fewer servers than replicaCount + 1 is refused with
+// replicas_cannot_be_kept.
 
 // Drain step names (shown to users); the first of a rebalance's steps is shared.
 const (
 	StepDrainFlag     = "Stop new buckets from landing on the server"
 	StepDrainEmpty    = "Wait until the server owns no bucket"
+	StepDrainMapGroup = "Hand over the map group"
 	StepDrainStandbys = "Relocate the standbys hosted on the server"
 	StepDrainEnd      = "Remove the server"
 )
@@ -85,6 +88,8 @@ type DrainFacts struct {
 	Servers       []string
 	ReplicaCount  int
 	HostsMapGroup bool
+	// MapStandbys are the other servers that run an active standby of the map group (group 0): where the hand-over can go.
+	MapStandbys []string
 	// Receivers are the other servers that hold an active primary and have the flag.
 	Receivers []string
 	// StandbyGroups are the groups whose standby runs on the server.
@@ -133,6 +138,8 @@ func (s *Service) drainFacts(ctx context.Context, id string) (DrainFacts, error)
 			}
 		case n.Host == id && n.Role == "standby":
 			f.StandbyGroups = append(f.StandbyGroups, n.Group)
+		case n.Host != id && n.Role == "standby" && n.Active && n.Group == 0:
+			f.MapStandbys = append(f.MapStandbys, n.Host)
 		case n.Host != id && n.Role == "primary" && n.Active && n.Should:
 			recv[n.Host] = true
 		}
@@ -158,7 +165,12 @@ func (s *Service) drainRefusal(ctx context.Context, id string, req DrainRequest,
 		return problem.New(problem.NoReceivingServer, "No other server should hold shards and runs a primary; the buckets of "+id+" have nowhere to go.")
 	}
 	if f.HostsMapGroup {
-		return problem.New(problem.ServerHostsMapGroup, "Server "+id+" runs the primary of the map group (the manager leader). Fail the map group over to a standby on another server first.")
+		if s.HandOverMapGroup == nil {
+			return problem.New(problem.ServerHostsMapGroup, "Server "+id+" runs the primary of the map group (the manager leader). Fail the map group over to a standby on another server first.")
+		}
+		if len(f.MapStandbys) == 0 {
+			return problem.New(problem.ServerHostsMapGroup, "Server "+id+" runs the primary of the map group (the manager leader) and no other server runs a standby of it, so the map group cannot be handed over. Give the cluster a replica first.")
+		}
 	}
 	if remaining := len(f.Servers) - 1; remaining < f.ReplicaCount+1 && !req.AcceptFewerReplicas {
 		return problem.New(problem.ReplicasCannotBeKept, fmt.Sprintf(
@@ -337,7 +349,11 @@ func (s *Service) stepDrainStandbys(ctx context.Context, env *task.Env, _ *PGRow
 	}
 	deadline := time.Now().Add(s.drainWait())
 	for {
-		left, err := s.RelocateStandbys(ctx, o.DrainServer)
+		// A server that died during the drain cannot give up its instances (they cannot be removed or rebuilt): the wait would run to its bound.
+		if s.ServerStatus != nil && s.ServerStatus(ctx, o.DrainServer) == "dead" {
+			return problem.New(problem.NodeStateInvalid, "Server "+o.DrainServer+" died during the drain, so its standbys cannot be moved. Fail it over first, then remove it.")
+		}
+		left, err := s.RelocateStandbys(ctx, o.DrainServer, false)
 		if err != nil {
 			return err
 		}
@@ -346,8 +362,12 @@ func (s *Service) stepDrainStandbys(ctx context.Context, env *task.Env, _ *PGRow
 		}
 		if time.Now().After(deadline) {
 			if o.AcceptFewerReplicas {
+				// the server leaves the ring whatever is left (a standby that is still being rebuilt is given up): the drain ends with fewer standbys
+				if _, err := s.RelocateStandbys(ctx, o.DrainServer, true); err != nil {
+					return err
+				}
 				if env != nil {
-					_ = env.SetDetail(ctx, fmt.Sprintf("%d standbys stay on %s: no other server can take them", left, o.DrainServer))
+					_ = env.SetDetail(ctx, fmt.Sprintf("acceptFewerReplicas: %d standby copies could not be moved off %s or made again elsewhere before the bound; the drain ends with fewer standbys", left, o.DrainServer))
 				}
 				return nil
 			}

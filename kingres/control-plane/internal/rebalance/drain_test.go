@@ -96,7 +96,7 @@ func TestDrainStandbyStep(t *testing.T) {
 	// the standbys leave in two rounds
 	left := []int{2, 1, 0}
 	calls := 0
-	s = &Service{DrainWait: time.Minute, DrainPoll: time.Millisecond, RelocateStandbys: func(context.Context, string) (int, error) {
+	s = &Service{DrainWait: time.Minute, DrainPoll: time.Millisecond, RelocateStandbys: func(context.Context, string, bool) (int, error) {
 		n := left[min(calls, len(left)-1)]
 		calls++
 		return n, nil
@@ -105,16 +105,36 @@ func TestDrainStandbyStep(t *testing.T) {
 		t.Fatalf("relocation in rounds: %v after %d calls", err, calls)
 	}
 	// nobody can take them: without acceptFewerReplicas the step fails with its code, with it the step ends
-	stuck := &Service{DrainWait: 5 * time.Millisecond, DrainPoll: time.Millisecond, RelocateStandbys: func(context.Context, string) (int, error) { return 1, nil }}
+	forced := 0
+	stuck := &Service{DrainWait: 5 * time.Millisecond, DrainPoll: time.Millisecond, RelocateStandbys: func(_ context.Context, _ string, force bool) (int, error) {
+		if force {
+			forced++
+		}
+		return 1, nil
+	}}
 	err := stuck.stepDrainStandbys(ctx, nil, nil, Options{DrainServer: "a"})
 	if err == nil || codeOf(t, err) != problem.ReplicasCannotBeKept {
 		t.Fatalf("stuck standbys: %v", err)
 	}
+	if forced != 0 {
+		t.Fatal("the server is not forced out of the ring when fewer standbys are not accepted")
+	}
 	if err := stuck.stepDrainStandbys(ctx, nil, nil, Options{DrainServer: "a", AcceptFewerReplicas: true}); err != nil {
 		t.Fatalf("accepted: %v", err)
 	}
+	if forced != 1 {
+		t.Fatalf("with acceptFewerReplicas the server is forced out of the ring once at the bound: %d", forced)
+	}
+	// a server that died during the drain ends the step at once, without asking for the standbys
+	calls = 0
+	dead := &Service{DrainWait: time.Minute, DrainPoll: time.Millisecond,
+		ServerStatus:     func(context.Context, string) string { return "dead" },
+		RelocateStandbys: func(context.Context, string, bool) (int, error) { calls++; return 1, nil }}
+	if err := dead.stepDrainStandbys(ctx, nil, nil, Options{DrainServer: "a", AcceptFewerReplicas: true}); err == nil || codeOf(t, err) != problem.NodeStateInvalid || calls != 0 {
+		t.Fatalf("a dead server: %v after %d calls", err, calls)
+	}
 	// a failure of the hook is the failure of the step
-	boom := &Service{RelocateStandbys: func(context.Context, string) (int, error) { return 0, errors.New("boom") }}
+	boom := &Service{RelocateStandbys: func(context.Context, string, bool) (int, error) { return 0, errors.New("boom") }}
 	if err := boom.stepDrainStandbys(ctx, nil, nil, Options{DrainServer: "a"}); err == nil {
 		t.Fatal("the error of the hook")
 	}

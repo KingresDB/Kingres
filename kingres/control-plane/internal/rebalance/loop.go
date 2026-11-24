@@ -54,6 +54,8 @@ type Options struct {
 	Strict bool `json:"-"`
 	// CleanupDelaySeconds overrides the delay before the source orphan is dropped, for this run.
 	CleanupDelaySeconds int `json:"cleanupDelaySeconds,omitempty"`
+	// Force lets a manual start go on although a standby lags by more than maxStandbyLagBytes; never stored (a resumed run asks again).
+	Force bool `json:"-"`
 	// ExcludeServers plans as if these servers should not hold shards (a preview of a drain); never stored.
 	ExcludeServers []string `json:"-"`
 	// Trigger is manual, automatic or drain.

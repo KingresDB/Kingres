@@ -373,6 +373,9 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		if foDeps.mf != nil {
 			deps.MapFailover = foDeps.mf
 		}
+		if rbs != nil {
+			wireMapGroupHandOver(rbs, fos, faultHook)
+		}
 	}
 	// The signing keys of the ledger and the scheduler that runs their jobs on the manager leader.
 	var lgs *ledgerParts
@@ -482,6 +485,8 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 				rbs.IsLeader = func(ctx context.Context) bool { id, err := leaders.Get(ctx); return err == nil && id == serverHost }
 				wg.Add(1)
 				go func() { defer wg.Done(); rbs.RunAuto(bgCtx) }()
+				wg.Add(1)
+				go func() { defer wg.Done(); rbs.RunDrainWatch(bgCtx) }()
 			}
 			if fos != nil && foDeps.mf != nil {
 				auto := newAutoFailover(foDeps.mf, fos, rbs, leaders, serverHost, cfg.HA.FailureTimeout, log)
