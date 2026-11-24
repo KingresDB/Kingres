@@ -8,7 +8,9 @@ The release script ([packaging/release/release.sh](packaging/release/release.sh)
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **Enabling sharding on a database.** `PATCH /databases/{name}` with `sharding.enabled` answered 200 with sharding still off when the database had been read in the last three seconds: the store remembered "extension not installed" for that time. An absent extension is no longer remembered, and the handler refuses to answer 200 for a sharding change that the database does not show.
 
 ## [0.1.0] - not released
 

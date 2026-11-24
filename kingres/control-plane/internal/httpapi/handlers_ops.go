@@ -391,6 +391,10 @@ func (s *Server) updateDatabase(c *call, w http.ResponseWriter, r *http.Request)
 	if err != nil {
 		return s.storeProblem(r, err, "Database \""+name+"\" does not exist.")
 	}
+	if s := req.Sharding; s != nil && s.Enabled != nil && *s.Enabled && !db.Sharding.Enabled {
+		// the update was applied but the database does not show it: never answer 200 for a change that is not visible
+		return problem.New(problem.InternalError, "Sharding was requested but the database does not report it as enabled.")
+	}
 	s.writeJSON(w, r, http.StatusOK, db)
 	return nil
 }
