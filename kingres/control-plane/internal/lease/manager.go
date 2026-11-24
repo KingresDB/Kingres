@@ -654,9 +654,13 @@ func (m *Manager) refence(ctx context.Context, group int32) {
 
 func (m *Manager) lose(ctx context.Context, group int32) {
 	if a := m.adoptionOf(group); a != nil && !a.attached {
-		// A lease that guards no instance (the fence holder of a failover, or the server that is
-		// about to promote a standby): there is nothing to stop and no marker to write.
+		// The fence holder of a failover guards no instance: there is nothing to stop and no marker to write.
 		m.c.Log.Warn("an adopted group lease was lost", "group", group, "kind", a.kind)
+		if a.kind == AdoptHolder {
+			// The server that promotes a standby (phase 5 review L1): the promoting call writes the role file and promotes before the lease is
+			// attached, so an instance that runs here may already be promoted and guarded by nothing. It is stopped here, not left to the watchdog.
+			m.fenceUnattached(ctx, group)
+		}
 		return
 	}
 	// Nothing runs here that the lease protects: no instance serves the group and none may be its primary. The group is
@@ -966,4 +970,26 @@ func (m *Manager) warnUnattributed(group int32) {
 	m.ambWarned[group] = now
 	m.mu.Unlock()
 	m.c.Log.Error("an instance of this server may be the primary of the group and cannot be attributed to it by its role file: it is held by the start gate, stopped by a fence and counted as running by a hand-over of the lease", "group", group)
+}
+
+// fenceUnattached stops the instance that this server runs as the primary of a group whose adopted lease (the holder of a promotion) was lost before it was attached
+// (phase 5 review L1), whether the group is enforced or not. Nothing is written when none runs.
+func (m *Manager) fenceUnattached(ctx context.Context, group int32) {
+	var insts []Instance
+	if inst, have := m.instance(group); have {
+		insts = append(insts, inst)
+	}
+	insts = append(insts, m.unattributed(group)...)
+	for _, inst := range insts {
+		if up, err := inst.Running(ctx); err != nil || up {
+			m.c.Log.Error("the lease of a promotion was lost before it was attached: the instance is stopped", "group", group)
+			if err := m.Fence(ctx, group); err != nil {
+				m.c.Log.Error("fencing the instance of a promotion whose lease was lost", "group", group, "error", err)
+				if m.c.OnFenceFailed != nil {
+					m.c.OnFenceFailed(group, err)
+				}
+			}
+			return
+		}
+	}
 }

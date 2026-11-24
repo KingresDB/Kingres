@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -41,6 +42,9 @@ const watchdogBinary = "kingres-watchdog"
 func startLeases(d *haDeps) error {
 	if !d.Svc.Enabled() || d.Cfg.InternalListen == "" {
 		return nil
+	}
+	if err := checkWatchdog(d.Cfg.PGBinDir, d.Cfg.HA.AllowNoWatchdog, d.Log); err != nil {
+		return err
 	}
 	leaseDir := filepath.Join(d.Cfg.DataDir, leaseDirName)
 	clk := clock.Stepped{Base: clock.NewReal(), Offset: d.Fault.ClockOffset}
@@ -278,10 +282,13 @@ type watchdogRunner struct {
 	proc   *os.Process
 }
 
-func (w *watchdogRunner) binary() string {
+func (w *watchdogRunner) binary() string { return findWatchdog(w.d.Cfg.PGBinDir) }
+
+// findWatchdog is the path of the watchdog program: in the PostgreSQL program directory or next to this executable; empty when it is in neither.
+func findWatchdog(pgBinDir string) string {
 	var dirs []string
-	if w.d.Cfg.PGBinDir != "" {
-		dirs = append(dirs, w.d.Cfg.PGBinDir)
+	if pgBinDir != "" {
+		dirs = append(dirs, pgBinDir)
 	}
 	if exe, err := os.Executable(); err == nil {
 		dirs = append(dirs, filepath.Dir(exe))
@@ -551,4 +558,18 @@ func formerPrimaryProof(mgr *lease.Manager) func(group int32) error {
 		}
 		return nil
 	}
+}
+
+// checkWatchdog refuses to start a server that runs the lease protocol without the watchdog program (phase 5 review L1). The lease code of kingresd stops a primary
+// whose lease is lost, but only the watchdog stops one when kingresd hangs or is gone, and without it a missing program was only a warning at the first use. The
+// setting allow-no-watchdog (tests, development) lets the server start with the warning.
+func checkWatchdog(pgBinDir string, allowMissing bool, log *slog.Logger) error {
+	if findWatchdog(pgBinDir) != "" {
+		return nil
+	}
+	if allowMissing {
+		log.Warn("the lease watchdog program was not found and allow-no-watchdog is set: a hung or dead kingresd cannot be covered", "program", watchdogBinary)
+		return nil
+	}
+	return fmt.Errorf("the lease watchdog program %s was not found (looked in pg-bin-dir and next to kingresd): without it a primary whose lease is lost keeps running when kingresd hangs or is gone; install the program next to kingresd, or set allow-no-watchdog for a test or development machine", watchdogBinary)
 }
