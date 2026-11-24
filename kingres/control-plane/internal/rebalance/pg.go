@@ -109,7 +109,7 @@ func (b *PG) Databases(ctx context.Context, o Options) ([]string, error) {
 			}
 			return c.QueryRow(ctx, `SELECT to_regclass('kingres.colocation') IS NOT NULL AND EXISTS (SELECT 1 FROM kingres.colocation)`).Scan(&has)
 		})
-		if isUntrusted(err) && !want[n] {
+		if isUntrusted(err) && !want[n] && !o.Strict {
 			// a database nobody asked for is left out, so that one tenant cannot stop the rebalance of the others; the monitor raises the alert
 			b.log().Warn("a database is left out of the rebalance: its schema kingres cannot be trusted", "database", n, "error", err)
 			continue

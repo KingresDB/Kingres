@@ -49,6 +49,9 @@ type Options struct {
 	MaxMovesPerServer int `json:"maxMovesPerServer,omitempty"`
 	// AcknowledgeFailures clears a suspension by failed moves (a manual start).
 	AcknowledgeFailures bool `json:"acknowledgeFailures,omitempty"`
+	// Strict makes a database that cannot be verified (its schema kingres cannot be trusted) an error of Databases instead of a database that is left out. A
+	// drain counts the buckets of a server with it: a database that was not counted must not make the drain report done. Not part of a request.
+	Strict bool `json:"-"`
 	// CleanupDelaySeconds overrides the delay before the source orphan is dropped, for this run.
 	CleanupDelaySeconds int `json:"cleanupDelaySeconds,omitempty"`
 	// ExcludeServers plans as if these servers should not hold shards (a preview of a drain); never stored.

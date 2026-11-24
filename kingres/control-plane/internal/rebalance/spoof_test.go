@@ -109,3 +109,26 @@ func TestUntrustedSchemaIsRefusedByRebalance(t *testing.T) {
 	wantProblem(t, "Placement", err, problem.ExtensionUnavailable)
 	env.NoMarkers(t, "rebalance")
 }
+
+// A drain counts the buckets that are still on the server. A database whose schema cannot be trusted is left out of the plan of a rebalance, but the count of a drain
+// must not treat it as a database without buckets: that would let the drain report done while buckets are still there.
+func TestDrainDoesNotCountAnUnverifiableDatabaseAsEmpty(t *testing.T) {
+	env := spooftest.NewUntrusted(t)
+	ctx := context.Background()
+	b := &PG{Conns: env}
+	s := &Service{Conns: env, Backend: b}
+	if dbs, err := b.Databases(ctx, Options{}); err != nil {
+		t.Fatalf("the plan of a rebalance leaves the database out: %v %v", dbs, err)
+	}
+	n, err := s.bucketsOn(ctx, "10.0.0.1")
+	wantProblem(t, "bucketsOn", err, problem.ExtensionUnavailable)
+	if n != 0 {
+		t.Fatalf("a count with the error: %d", n)
+	}
+	if _, err := b.Databases(ctx, Options{Strict: true}); err == nil {
+		t.Fatal("Databases with Strict listed an unverifiable database")
+	} else {
+		wantProblem(t, "Databases strict", err, problem.ExtensionUnavailable)
+	}
+	env.NoMarkers(t, "bucketsOn")
+}
