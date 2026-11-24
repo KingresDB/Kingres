@@ -3928,6 +3928,53 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/databases/{databaseName}/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Export a database to one archive
+         * @description Added in 0.29.0 (data transfer, phase 14b; the number is a placeholder). Starts the task `database.export` (subject type `database`, id the database name): the structure, the KingresDB
+         *     catalog (how every table is distributed, its access method, ledger and time-partition policies, sequences) and the data of every table are written to one **zip archive**
+         *     that is staged on the manager leader, sealed (encrypted at rest) and kept for `retentionHours`. The answer is the task; when it is `done` its `detail` is `transfer <id>` and
+         *     `getDataExport` (kind `databaseExport`, format `archive/1`) says size, rows, SHA-256 and the consistency label of every table; `downloadDataExport` serves the file as `application/zip`.
+         *     Nothing is imported by this version: the archive is for inspection (`validateDatabaseArchive`) and for loading by hand. Importing an archive is a later revision.
+         *
+         *     The archive holds exactly these entries and no others: `manifest.json` (written last: versions, locale, extensions, the SHA-256 and the columns of every entry, warnings), `catalog.json`,
+         *     `schema/pre-data.sql`, `schema/views.sql`, `schema/post-data.sql` and `data/NNNNN.csv`, one per table (a partition tree is one entry, its root; leaves are structure only). The structure is the
+         *     schema-only output of `pg_dump` of the same PostgreSQL build, taken by the service role in a read-only transaction and rewritten by a closed set of rules; data is read as the signed-in role
+         *     through `COPY (SELECT ...)` as UTF-8 CSV with a distinct null marker (an empty string and a null differ). **What the archive does not carry** is listed in the manifest's `warnings` and refused
+         *     where it would make the archive misleading: large objects and `oid` or `reg*` columns (422 `large_objects_present`, unless `acknowledgeLargeObjectsLost` is true); roles, tablespaces,
+         *     policies, rules, event triggers, functions, triggers, publications, foreign objects, extended statistics, collations and unlogged tables (422 `schema_unrecognised`, naming the kind).
+         *     Ledger tables are carried as data and restart their chain when imported (ADR 0028); the history of an updatable ledger table is exported for the record.
+         *
+         *     Needs `kingres_admin`, the cluster setting `dataTransfer.enabled` (403 `data_transfer_disabled`), a request over TLS (403 `insecure_transport`), and the PostgreSQL privileges `USAGE` on every
+         *     schema and `SELECT` on every table (and column) of the database for the signed-in role: otherwise 422 `export_not_readable`, whose `reasons` name the first 20 objects the role cannot read (the detail says how many more), and nothing is written.
+         *     404: the database does not exist. 409 `operation_in_progress`: a table task or another database export or import is unfinished in this database, or the transfer limit is reached;
+         *     409 `transfer_quota_exceeded` and `insufficient_disk` as for `exportTable`. While the task runs, table tasks of the database are refused with 409 `operation_in_progress`.
+         *
+         *     Consistency: when every table is local, reference or on the group of the connection, the data is read in one `REPEATABLE READ` read-only transaction (`archive-single-snapshot`); otherwise each table is one
+         *     statement and the label of each table is as for `exportTable` (`single-snapshot` or `per-group`). **There is no global snapshot.** The structure is fingerprinted at the start and at the end: a table or a
+         *     column that changed in between fails the task with the code `schema_changed` and no file is kept.
+         *     Steps of the task: *Check the request*, *Take the structure*, *Normalise the schema*, *Write the data*, *Check the archive*, *Seal*.
+         *     Task codes: `schema_changed`, `schema_unrecognised`, `export_too_large`, `insufficient_disk`, `transfer_quota_exceeded`, `transfer_timeout`, `transfer_leader_changed` (retryable), `transfer_session_lost` (retryable),
+         *     `transfer_key_lost`, `copy_interrupted` (retryable), `forbidden`, `cancelled`. The error of a task never carries a value, a row or text of the server.
+         */
+        post: operations["exportDatabase"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/data-uploads": {
         parameters: {
             query?: never;
@@ -3994,6 +4041,39 @@ export interface paths {
          *     the upload is deleted) and the upload is `complete`. Two chunks at one offset: one wins, the other gets 409. Needs `kingres_admin`, `dataTransfer.enabled` and a request over TLS. A chunk is not an audit event.
          */
         patch: operations["uploadDataChunk"];
+        trace?: never;
+    };
+    "/data-uploads/{uploadId}/validation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Identifier of an upload (added in 0.19.0), a decimal string. An upload of another role is 404. */
+                uploadId: components["parameters"]["UploadId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Validate an uploaded database archive
+         * @description Added in 0.29.0 (data transfer, phase 14b; the number is a placeholder). Starts the task `archive.validate` (subject type `upload`, id the upload id) for a complete upload whose purpose is
+         *     `databaseArchive`. It reads the archive once from end to end and **touches no database**: the shape of the zip file (the local headers against the central directory, the descriptors, that the extents
+         *     account for every byte, the names, the sizes counted while reading), the SHA-256 and the CRC-32 of every entry against the manifest, the manifest and the catalog document (strict JSON, closed members, identifiers),
+         *     that the columns of each data entry equal the columns of the schema, the versions (format, PostgreSQL major, extensions, locale) and, with the shape grammar in its validate-only mode, every statement of the three SQL files
+         *     (`statements` of the report; nothing is run). The result is the **archive report** (`ArchiveReport`), stored with the upload (`getDataUpload` returns it as `report`, the state is `valid` or `invalid`)
+         *     and cached by the SHA-256 of the file. An archive that is not valid is not an error of the request: the task is `done` and the report says `valid: false` with the `reasons`.
+         *     The text of a statement of the archive is never shown: the report names the kind, the position and a fingerprint (the length and a hash prefix).
+         *
+         *     Needs `kingres_admin`, `dataTransfer.enabled` and a request over TLS. 404: the upload does not exist or is another role's. 409 `upload_incomplete`: bytes are missing; 409 `operation_in_progress`: a task uses the upload or the
+         *     transfer limit is reached. 422 `validation_failed`: the purpose of the upload is not `databaseArchive`.
+         *     Steps: *Check the upload*, *Read the archive*, *Check the plan*, *Store the report*. The task cannot change the archive, so it is always safe to repeat.
+         */
+        post: operations["validateDatabaseArchive"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/data-exports": {
@@ -4126,7 +4206,7 @@ export interface components {
          *     system database was stopped on purpose; start it with `startThisServerInstance`).
          * @enum {string}
          */
-        ProblemCode: "bad_request" | "validation_failed" | "unauthenticated" | "invalid_credentials" | "session_expired" | "csrf_token_invalid" | "forbidden" | "setup_token_invalid" | "not_found" | "method_not_allowed" | "conflict" | "already_exists" | "immutable_field" | "rebalance_in_progress" | "operation_in_progress" | "task_not_cancellable" | "last_admin" | "role_in_use" | "optimistic_lock_failed" | "no_replica_available" | "instance_already_running" | "instance_already_stopped" | "server_owns_buckets" | "server_hosts_map_group" | "last_server" | "server_group_not_empty" | "ledger_entry_pending" | "quorum_unavailable" | "system_database_stopped" | "unprocessable" | "sql_error" | "unsupported_operation" | "node_state_invalid" | "node_uninitialized" | "map_group_unavailable" | "leader_unavailable" | "rate_limited" | "service_unavailable" | "internal_error" | "certificate_revoked" | "certificate_authority_unavailable" | "internal_api_disabled" | "workbench_busy" | "config_parameter_unknown" | "config_parameter_managed" | "config_parameter_refused" | "config_level_not_allowed" | "config_value_below_floor" | "config_change_superseded" | "config_restart_order_conflict" | "nothing_pending" | "nothing_to_rebalance" | "rebalance_not_running" | "cluster_inconsistent" | "version_mismatch" | "failover_in_progress" | "group_degraded" | "insufficient_disk" | "no_receiving_server" | "replicas_cannot_be_kept" | "sharding_mode_in_use" | "schema_not_distributable" | "schema_pinned" | "schema_move_in_progress" | "bucket_busy" | "split_unsupported" | "failover_needs_decision" | "lease_settings_differ" | "ledger_not_published" | "origin_prefix_locked" | "signing_key_missing" | "last_signing_key" | "chain_not_diverged" | "table_not_eligible" | "extension_unavailable" | "extension_version_mismatch" | "sketch_hash_mismatch" | "extension_missing" | "conversion_refused" | "partition_policy_conflict" | "data_transfer_disabled" | "insecure_transport" | "transfer_quota_exceeded" | "upload_incomplete" | "upload_offset_mismatch" | "chunk_too_large" | "upload_checksum_mismatch" | "import_header_mismatch" | "import_ledger_policy" | "import_too_large" | "import_end_marker" | "export_untrusted_code";
+        ProblemCode: "bad_request" | "validation_failed" | "unauthenticated" | "invalid_credentials" | "session_expired" | "csrf_token_invalid" | "forbidden" | "setup_token_invalid" | "not_found" | "method_not_allowed" | "conflict" | "already_exists" | "immutable_field" | "rebalance_in_progress" | "operation_in_progress" | "task_not_cancellable" | "last_admin" | "role_in_use" | "optimistic_lock_failed" | "no_replica_available" | "instance_already_running" | "instance_already_stopped" | "server_owns_buckets" | "server_hosts_map_group" | "last_server" | "server_group_not_empty" | "ledger_entry_pending" | "quorum_unavailable" | "system_database_stopped" | "unprocessable" | "sql_error" | "unsupported_operation" | "node_state_invalid" | "node_uninitialized" | "map_group_unavailable" | "leader_unavailable" | "rate_limited" | "service_unavailable" | "internal_error" | "certificate_revoked" | "certificate_authority_unavailable" | "internal_api_disabled" | "workbench_busy" | "config_parameter_unknown" | "config_parameter_managed" | "config_parameter_refused" | "config_level_not_allowed" | "config_value_below_floor" | "config_change_superseded" | "config_restart_order_conflict" | "nothing_pending" | "nothing_to_rebalance" | "rebalance_not_running" | "cluster_inconsistent" | "version_mismatch" | "failover_in_progress" | "group_degraded" | "insufficient_disk" | "no_receiving_server" | "replicas_cannot_be_kept" | "sharding_mode_in_use" | "schema_not_distributable" | "schema_pinned" | "schema_move_in_progress" | "bucket_busy" | "split_unsupported" | "failover_needs_decision" | "lease_settings_differ" | "ledger_not_published" | "origin_prefix_locked" | "signing_key_missing" | "last_signing_key" | "chain_not_diverged" | "table_not_eligible" | "extension_unavailable" | "extension_version_mismatch" | "sketch_hash_mismatch" | "extension_missing" | "conversion_refused" | "partition_policy_conflict" | "data_transfer_disabled" | "insecure_transport" | "transfer_quota_exceeded" | "upload_incomplete" | "upload_offset_mismatch" | "chunk_too_large" | "upload_checksum_mismatch" | "import_header_mismatch" | "import_ledger_policy" | "import_too_large" | "import_end_marker" | "export_untrusted_code" | "export_not_readable" | "large_objects_present" | "schema_unrecognised" | "archive_invalid" | "archive_incompatible";
         /** @description One invalid field of a request. */
         ValidationIssue: {
             /** @description JSON Pointer (RFC 6901) to the invalid property of the request body, or the name of the invalid query or path parameter. */
@@ -4165,7 +4245,7 @@ export interface components {
             sqlPosition?: number;
             /** @description Added in 0.14.0. The lines of the report of the sharding extension that make a table not eligible; present for `table_not_eligible` and, from 0.17.0, for `conversion_refused` (the reasons of the refusal, one entry each). */
             blockers?: components["schemas"]["TableBlocker"][];
-            /** @description Added in 0.19.0, optional. Further reasons in the shape of `blockers`; reserved for the archive codes of later revisions, empty or absent for the codes of 0.19.0. */
+            /** @description Added in 0.19.0, optional. Further reasons in the shape of `blockers`. From 0.29.0: for `export_not_readable` one entry per object the role cannot read (at most 20; `code` is `no_privilege` or `no_usage`, `object` the name), and for `archive_incompatible` the reasons the archive does not fit. */
             reasons?: components["schemas"]["TableBlocker"][];
             /** @description Added in 0.12.0, optional. The whole plan of the request (the same body as `dryRun` answers), present only when `code` is `failover_needs_decision`: the console shows the groups, the candidates and the verdict without asking again. */
             plan?: components["schemas"]["FailoverPlan"];
@@ -6951,10 +7031,10 @@ export interface components {
         };
         /**
          * @description Kind of task. Each kind has one fixed `subject.type`; the table is in the README
-         *     (section "Task kinds and subjects"). `standby.reconcile` is added in 0.7.0; the `ledger.key.*`, `ledger.bundle.create`, `ledger.epoch.start` and `ledger.upgrade` kinds in 0.11.0; `table.export` and `table.import` (subject `database/schema.table`) in 0.19.0.
+         *     (section "Task kinds and subjects"). `standby.reconcile` is added in 0.7.0; the `ledger.key.*`, `ledger.bundle.create`, `ledger.epoch.start` and `ledger.upgrade` kinds in 0.11.0; `table.export` and `table.import` (subject `database/schema.table`) in 0.19.0; `database.export` (subject type `database`) and `archive.validate` (subject type `upload`) in 0.29.0.
          * @enum {string}
          */
-        TaskKind: "cluster.init" | "cluster.join" | "server.add" | "server.remove" | "server.failover" | "server.leave" | "instance.start" | "instance.stop" | "instance.restart" | "database.create" | "database.update" | "database.drop" | "table.distribute" | "rebalance" | "bucket.split" | "schema.distribute" | "schema.move" | "schema.undistribute" | "replication.restorePreferredPrimaries" | "ledger.verify" | "networkAccess.apply" | "replicate.apply" | "certificate.renew" | "certificate.revoke" | "standby.reconcile" | "config.apply" | "config.restart" | "ledger.key.create" | "ledger.key.rotate" | "ledger.key.retire" | "ledger.key.revoke" | "ledger.key.distribute" | "ledger.bundle.create" | "ledger.epoch.start" | "ledger.upgrade" | "table.undistribute" | "table.alter" | "table.partition" | "database.approximateAggregates" | "table.setStorage" | "partition.maintain" | "table.export" | "table.import";
+        TaskKind: "cluster.init" | "cluster.join" | "server.add" | "server.remove" | "server.failover" | "server.leave" | "instance.start" | "instance.stop" | "instance.restart" | "database.create" | "database.update" | "database.drop" | "table.distribute" | "rebalance" | "bucket.split" | "schema.distribute" | "schema.move" | "schema.undistribute" | "replication.restorePreferredPrimaries" | "ledger.verify" | "networkAccess.apply" | "replicate.apply" | "certificate.renew" | "certificate.revoke" | "standby.reconcile" | "config.apply" | "config.restart" | "ledger.key.create" | "ledger.key.rotate" | "ledger.key.retire" | "ledger.key.revoke" | "ledger.key.distribute" | "ledger.bundle.create" | "ledger.epoch.start" | "ledger.upgrade" | "table.undistribute" | "table.alter" | "table.partition" | "database.approximateAggregates" | "table.setStorage" | "partition.maintain" | "table.export" | "table.import" | "database.export" | "archive.validate";
         /** @description One step of a task. */
         TaskStep: {
             /** @description Step name. */
@@ -7012,11 +7092,11 @@ export interface components {
              * @description Resource type.
              * @enum {string}
              */
-            type: "cluster" | "server" | "instance" | "database" | "table" | "rebalance" | "replication" | "ledgerVerification" | "networkAccess" | "config" | "ledgerKey" | "bucket" | "schema";
+            type: "cluster" | "server" | "instance" | "database" | "table" | "rebalance" | "replication" | "ledgerVerification" | "networkAccess" | "config" | "ledgerKey" | "bucket" | "schema" | "upload";
             /**
              * @description Resource identifier: database name; server id (`ServerId`); instance id (`node_id`) as a decimal
              *     string; `database/schema.table` for a table; the verification id; the task id for a rebalance;
-             *     the literal `cluster`, `preferred-primaries`, `network-access` or (0.11.0, type `ledgerKey`) `signing` for the singleton subjects.
+             *     the literal `cluster`, `preferred-primaries`, `network-access` or (0.11.0, type `ledgerKey`) `signing` for the singleton subjects; the upload id for type `upload` (0.29.0).
              *     See the README table "Task kinds and subjects".
              */
             id: string;
@@ -7310,7 +7390,7 @@ export interface components {
          *     `failure`. Read-only operations are not audited except `executeQuery` and (0.19.0) `downloadDataExport`, because it is where data leaves. From 0.19.0 also `dataTransfer.completed` (a data transfer task ended, written by the task) and `dataTransfer.purged` (the janitor deleted staged files), actor `system`. An upload chunk is not an event.
          * @enum {string}
          */
-        AuditAction: "login" | "logout" | "loginFailed" | "setupTokenRejected" | "initCluster" | "joinCluster" | "updateThisServerSettings" | "restartThisServerInstance" | "stopThisServerInstance" | "startThisServerInstance" | "leaveCluster" | "addServer" | "updateServer" | "removeServer" | "failoverServer" | "abandonMapGroupBootstrap" | "autoFailover" | "createServerGroup" | "deleteServerGroup" | "createDatabase" | "updateDatabase" | "dropDatabase" | "distributeTable" | "enableTableLedger" | "restorePreferredPrimaries" | "startRebalance" | "stopRebalance" | "cancelTask" | "createRole" | "updateRole" | "deleteRole" | "setRoleMemberships" | "setRoleClusterRoles" | "createGrant" | "revokeGrants" | "applyGrantTemplate" | "replaceNetworkAccess" | "updateClusterSettings" | "generateLedgerDigest" | "startLedgerVerification" | "executeQuery" | "acknowledgeAlert" | "renewServerCertificates" | "revokeServerCertificates" | "certificateRenewed" | "certificateRenewalFailed" | "cancelStatement" | "leaseLost" | "leaseFenced" | "leaseAcquired" | "standbyCreated" | "standbyRemoved" | "standbyRebuilt" | "standbyInstanceStarted" | "standbyInstanceRemoved" | "standbyInstanceRebuilt" | "synchronousStandbyNamesChanged" | "replicationSlotDropped" | "applyConfigChange" | "revertConfigChange" | "restartPendingInstances" | "resetAutoFailoverCounter" | "failoverGroupStarted" | "failoverGroupPromoted" | "failoverGroupFailed" | "oldPrimaryRebuilt" | "updateLedgerSettings" | "createLedgerSigningKey" | "retireLedgerSigningKey" | "revokeLedgerSigningKey" | "createLedgerAnchorTarget" | "updateLedgerAnchorTarget" | "deleteLedgerAnchorTarget" | "testLedgerAnchorTarget" | "anchorLedgerNow" | "retryLedgerAnchor" | "createLedgerBundle" | "registerLedgerClientKey" | "revokeLedgerClientKey" | "setTableSignaturePolicy" | "upgradeLedgerExtension" | "acknowledgeLedgerDivergence" | "previewTableChange" | "undistributeTable" | "alterTableDistribution" | "createTablePartition" | "attachTablePartition" | "detachTablePartition" | "dropTablePartition" | "drainServer" | "splitBucket" | "previewBucketSplit" | "distributeSchema" | "undistributeSchema" | "moveSchema" | "configureApproximateAggregates" | "setTableStorage" | "setPartitionStorage" | "putPartitionPolicy" | "deletePartitionPolicy" | "runPartitionPolicy" | "exportTable" | "importTable" | "createDataUpload" | "deleteDataUpload" | "downloadDataExport" | "deleteDataExport" | "dataTransfer.completed" | "dataTransfer.purged" | "setCaEscrow" | "rotateCaEscrow";
+        AuditAction: "login" | "logout" | "loginFailed" | "setupTokenRejected" | "initCluster" | "joinCluster" | "updateThisServerSettings" | "restartThisServerInstance" | "stopThisServerInstance" | "startThisServerInstance" | "leaveCluster" | "addServer" | "updateServer" | "removeServer" | "failoverServer" | "abandonMapGroupBootstrap" | "autoFailover" | "createServerGroup" | "deleteServerGroup" | "createDatabase" | "updateDatabase" | "dropDatabase" | "distributeTable" | "enableTableLedger" | "restorePreferredPrimaries" | "startRebalance" | "stopRebalance" | "cancelTask" | "createRole" | "updateRole" | "deleteRole" | "setRoleMemberships" | "setRoleClusterRoles" | "createGrant" | "revokeGrants" | "applyGrantTemplate" | "replaceNetworkAccess" | "updateClusterSettings" | "generateLedgerDigest" | "startLedgerVerification" | "executeQuery" | "acknowledgeAlert" | "renewServerCertificates" | "revokeServerCertificates" | "certificateRenewed" | "certificateRenewalFailed" | "cancelStatement" | "leaseLost" | "leaseFenced" | "leaseAcquired" | "standbyCreated" | "standbyRemoved" | "standbyRebuilt" | "standbyInstanceStarted" | "standbyInstanceRemoved" | "standbyInstanceRebuilt" | "synchronousStandbyNamesChanged" | "replicationSlotDropped" | "applyConfigChange" | "revertConfigChange" | "restartPendingInstances" | "resetAutoFailoverCounter" | "failoverGroupStarted" | "failoverGroupPromoted" | "failoverGroupFailed" | "oldPrimaryRebuilt" | "updateLedgerSettings" | "createLedgerSigningKey" | "retireLedgerSigningKey" | "revokeLedgerSigningKey" | "createLedgerAnchorTarget" | "updateLedgerAnchorTarget" | "deleteLedgerAnchorTarget" | "testLedgerAnchorTarget" | "anchorLedgerNow" | "retryLedgerAnchor" | "createLedgerBundle" | "registerLedgerClientKey" | "revokeLedgerClientKey" | "setTableSignaturePolicy" | "upgradeLedgerExtension" | "acknowledgeLedgerDivergence" | "previewTableChange" | "undistributeTable" | "alterTableDistribution" | "createTablePartition" | "attachTablePartition" | "detachTablePartition" | "dropTablePartition" | "drainServer" | "splitBucket" | "previewBucketSplit" | "distributeSchema" | "undistributeSchema" | "moveSchema" | "configureApproximateAggregates" | "setTableStorage" | "setPartitionStorage" | "putPartitionPolicy" | "deletePartitionPolicy" | "runPartitionPolicy" | "exportTable" | "importTable" | "createDataUpload" | "deleteDataUpload" | "downloadDataExport" | "deleteDataExport" | "exportDatabase" | "validateDatabaseArchive" | "dataTransfer.completed" | "dataTransfer.purged" | "setCaEscrow" | "rotateCaEscrow";
         /** @description The escrow of the key of the cluster certificate authority (0.26.0). */
         CaEscrowStatus: {
             /** @description Whether the leader keeps sealed copies of the CA key on the servers that can become leader. */
@@ -9414,10 +9494,10 @@ export interface components {
         /** @description Added in 0.19.0. A new resumable upload. */
         CreateDataUploadRequest: {
             /**
-             * @description What the file is for. 0.20.0 adds `databaseArchive`.
+             * @description What the file is for. `databaseArchive` (0.29.0) is a zip archive made by `exportDatabase`; it is used by `validateDatabaseArchive`.
              * @enum {string}
              */
-            purpose: "tableImport";
+            purpose: "tableImport" | "databaseArchive";
             /**
              * Format: int64
              * @description The size of the file in bytes; at most `dataTransfer.maxFileBytes`. The staging quota for this size is reserved.
@@ -9433,10 +9513,10 @@ export interface components {
             /** @description Identifier, a decimal string. */
             uploadId: string;
             /**
-             * @description `receiving`: bytes are missing. `complete`: all bytes are in and the SHA-256 is known. `lost`: the staged file is gone (404 is the usual answer). 0.20.0 adds `validating`, `valid` and `invalid`.
+             * @description `receiving`: bytes are missing. `complete`: all bytes are in and the SHA-256 is known. `validating`: an `archive.validate` task reads it (0.29.0). `valid`, `invalid`: the result of the validation of an archive (0.29.0); the report is in `report`. `lost`: the staged file is gone (404 is the usual answer).
              * @enum {string}
              */
-            state: "receiving" | "complete" | "lost" | "deleted";
+            state: "receiving" | "complete" | "validating" | "valid" | "invalid" | "lost" | "deleted";
             /**
              * Format: int64
              * @description The declared size.
@@ -9464,6 +9544,8 @@ export interface components {
              * @description When the server deletes the upload if nothing happens (48 hours without data, 24 hours when complete and unused).
              */
             expiresAt: string;
+            /** @description The archive report of the last validation (0.29.0); null before one and for an upload whose purpose is not `databaseArchive`. */
+            report?: components["schemas"]["ArchiveReport"] | null;
         };
         /**
          * @description Added in 0.19.0. What the file guarantees for one table. Every row in a file was committed. `single-snapshot`: one snapshot (a local table, a reference table, or a distributed table whose buckets are all on one
@@ -9474,19 +9556,93 @@ export interface components {
             /** @description `schema.table`. */
             table: string;
             /** @enum {string} */
-            level: "single-snapshot" | "per-group" | "per-group-and-partition";
+            level: "single-snapshot" | "per-group" | "per-group-and-partition" | "archive-single-snapshot";
             /** @description Number of groups that hold buckets of the table. */
             groups: number;
+        };
+        /** @description Added in 0.29.0. Options of a database export. Every member is optional; the server never accepts SQL of any kind. */
+        ExportDatabaseRequest: {
+            /** @description Tables whose rows are left out of the archive (their structure stays). A name that is not a table of the database is 400 `validation_failed`. */
+            excludeTables?: components["schemas"]["TableRef"][];
+            /**
+             * @description `none` writes the structure and the catalog without any data entry.
+             * @default all
+             * @enum {string}
+             */
+            dataMode?: "all" | "none";
+            /**
+             * @description Accept that large objects and `oid` or `reg*` columns are not carried (422 `large_objects_present` otherwise); the archive's warnings say it.
+             * @default false
+             */
+            acknowledgeLargeObjectsLost?: boolean;
+            /** @description How long the archive is kept; default the cluster setting. */
+            retentionHours?: number;
+        };
+        /** @description Added in 0.29.0. The result of the validation of a database archive (`validateDatabaseArchive`, stored with the upload). Nothing in it is a value of the data or the text of a statement. */
+        ArchiveReport: {
+            valid: boolean;
+            /** @description The `format` of the manifest, for example `kingres-export/1`; empty when the manifest could not be read. */
+            format: string;
+            /** @description The SHA-256 of the archive file. */
+            sha256?: string;
+            versions: {
+                postgresMajor: number;
+                kingresVersion: string;
+                extensions: {
+                    name: string;
+                    version: string;
+                    schema: string;
+                    /** @description The version installed on this cluster, or null when it is not installed. */
+                    installed?: string | null;
+                }[];
+                encoding: string;
+                lcCollate: string;
+                lcCtype: string;
+            };
+            tables: {
+                local: number;
+                hash: number;
+                reference: number;
+                ledger: number;
+                columnar: number;
+                /** Format: int64 */
+                rows: number;
+                /** Format: int64 */
+                bytes: number;
+            };
+            /** @description What the shape grammar found in the three SQL files; nothing was run. */
+            statements?: {
+                byKind: {
+                    [key: string]: number;
+                };
+                refused: {
+                    kind: string;
+                    /** @description The file and the statement number, for example `schema/pre-data.sql#12`. */
+                    position: string;
+                    /** @description The length and a hash prefix of the statement; never its text. */
+                    fingerprint: string;
+                    reason: string;
+                }[];
+            };
+            needs?: {
+                /** @description The archive has ledger tables; an import restarts their chain. */
+                ledgerRestart: boolean;
+                /** @description The source had large objects that the archive does not carry (acknowledged at export). */
+                largeObjectsLost: boolean;
+            };
+            warnings?: string[];
+            /** @description Why the archive is not valid or not importable here, in the shape of the blockers of `table_not_eligible`; empty when valid. */
+            reasons: components["schemas"]["TableBlocker"][];
         };
         /** @description Added in 0.19.0. A staged export file and what is known about it. */
         DataExport: {
             /** @description Identifier, a decimal string. */
             exportId: string;
             /**
-             * @description 0.20.0 adds `databaseExport`.
+             * @description `databaseExport` (0.29.0) is a zip archive of a database; `table` is then null and `consistency` has one entry per table.
              * @enum {string}
              */
-            kind: "tableExport";
+            kind: "tableExport" | "databaseExport";
             /**
              * @description `building`: the task writes it. `ready`: it can be downloaded. `failed`: the task failed and the partial file was removed. `expired`: its time has passed. `lost`: the file or the key is gone.
              * @enum {string}
@@ -9507,17 +9663,17 @@ export interface components {
              * @description Rows in the file; null while it is built.
              */
             rows?: number | null;
-            /** @description One entry for the table; null while it is built. */
+            /** @description One entry for the table (one per table for a database archive; `archive-single-snapshot` when all were read in one transaction); null while it is built. */
             consistency?: components["schemas"]["TableConsistency"][] | null;
             /** @description Whether the file was written with the spreadsheet guard (`spreadsheetSafe` of the request); null while it is built. Added to 0.19.0 before its release. */
             spreadsheetSafe?: boolean | null;
             /** @description Whether row-level security shortened the file. Always false: a table with row-level security is exported only with `row_security = off`, so a policy that hides rows fails the export. */
             rlsApplied?: boolean;
             /**
-             * @description 0.20.0 adds `archive/1`.
+             * @description `archive/1` (0.29.0): the zip archive of `exportDatabase`, served as `application/zip`.
              * @enum {string}
              */
-            format?: "csv" | "csv.gz";
+            format?: "csv" | "csv.gz" | "archive/1";
             /**
              * Format: int64
              * @description The task that builds the file.
@@ -9535,6 +9691,8 @@ export interface components {
              * @description When the last byte was served; null when no download has finished.
              */
             downloadedAt?: string | null;
+            /** @description What the file does not carry or how it was read (0.29.0; the warnings of the manifest of a database archive). Absent for a table export. */
+            warnings?: string[];
         };
         /** @description Added in 0.19.0. A page of the caller's exports, newest first. */
         DataExportPage: {
@@ -9728,6 +9886,31 @@ export interface components {
          *     `detail` is `transfer <id>`, the id to give to `getDataExport` and `downloadDataExport`.
          */
         AcceptedTableExport: {
+            headers: {
+                /** @description URL of the task, `/api/v1/tasks/{taskId}`. */
+                Location?: string;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Task"];
+            };
+        };
+        /**
+         * @description The export was accepted and runs as the task `database.export` (added in 0.29.0). Poll `GET /tasks/{taskId}` (the `Location` header) until `state` is `done` or `failed`; when it is `done`,
+         *     `detail` is `transfer <id>`, the id to give to `getDataExport` and `downloadDataExport`.
+         */
+        AcceptedDatabaseExport: {
+            headers: {
+                /** @description URL of the task, `/api/v1/tasks/{taskId}`. */
+                Location?: string;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Task"];
+            };
+        };
+        /** @description The validation was accepted and runs as the task `archive.validate` (added in 0.29.0). Poll `GET /tasks/{taskId}` until it is `done`, then read the report with `getDataUpload`. */
+        AcceptedArchiveValidation: {
             headers: {
                 /** @description URL of the task, `/api/v1/tasks/{taskId}`. */
                 Location?: string;
@@ -14938,6 +15121,33 @@ export interface operations {
             503: components["responses"]["ServiceUnavailable"];
         };
     };
+    exportDatabase: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ExportDatabaseRequest"];
+            };
+        };
+        responses: {
+            202: components["responses"]["AcceptedDatabaseExport"];
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["DataTransferForbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["DataTransferConflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
     createDataUpload: {
         parameters: {
             query?: never;
@@ -15064,6 +15274,29 @@ export interface operations {
             405: components["responses"]["MethodNotAllowed"];
             409: components["responses"]["UploadOffsetMismatch"];
             413: components["responses"]["ChunkTooLarge"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    validateDatabaseArchive: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Identifier of an upload (added in 0.19.0), a decimal string. An upload of another role is 404. */
+                uploadId: components["parameters"]["UploadId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: components["responses"]["AcceptedArchiveValidation"];
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["DataTransferForbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["DataTransferConflict"];
             422: components["responses"]["UnprocessableEntity"];
             503: components["responses"]["ServiceUnavailable"];
         };

@@ -78,6 +78,8 @@ func (o *Ops) baseDefinitions() []task.Definition {
 		o.storageDefinition(),
 		o.maintainDefinition(),
 		o.exportDefinition(),
+		o.dbExportDefinition(),
+		o.archiveValidateDefinition(),
 		o.importDefinition(),
 		{Kind: KindDatabaseCreate, Dynamic: func(in json.RawMessage) ([]task.Step, error) {
 			p, err := rawInput[createParams](in)
@@ -144,6 +146,15 @@ func (o *Ops) StartTask(ctx context.Context, kind, subjType, subjID string, inpu
 	eng := o.Engine()
 	if eng == nil {
 		return task.Task{}, problem.New(problem.ServiceUnavailable, "The task engine is not running yet.").WithRetryAfter(5)
+	}
+	// A table task waits while a database export runs in its database (the catalog, the schema and the data must not be taken at different structural states).
+	if tableTaskKind(kind) {
+		// The check and the start are one step: an export that starts between them would find no table task.
+		o.dbTaskMu.Lock()
+		defer o.dbTaskMu.Unlock()
+		if err := o.exportRunning(ctx, subjType, subjID); err != nil {
+			return task.Task{}, err
+		}
 	}
 	t, err := eng.Submit(ctx, kind, task.Subject{Type: subjType, ID: subjID}, input, actor)
 	if err != nil {

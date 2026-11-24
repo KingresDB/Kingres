@@ -47,6 +47,12 @@ const (
 	CodeImportEndMarker = "import_end_marker"
 	CodeRecordTooLarge  = "import_record_too_large"
 	CodeImportTooLarge  = "import_too_large"
+	// The codes of the database export (contract 0.29.0): the structure changed while the archive was written, the dump holds a construct that
+	// the archive does not carry, the schema dump could not be made, the archive that was written is not valid.
+	CodeSchemaChanged      = "schema_changed"
+	CodeSchemaUnrecognised = "schema_unrecognised"
+	CodeDumpFailed         = "schema_dump_failed"
+	CodeArchiveInvalid     = "archive_invalid"
 	// CodeInternal is every failure the server does not describe to the client.
 	CodeInternal = "internal_error"
 )
@@ -139,7 +145,7 @@ func (e *Error) Problem() *problem.Problem {
 		code = problem.TransferQuotaExceeded
 	case CodeInsufficientDisk:
 		code = problem.InsufficientDisk
-	case CodeCancelled, CodeTimeout, CodeLeaderChanged, CodeSessionLost, CodeCopyInterrupted, CodeRowCountMismatch, CodeOutcomeUnknown, CodeKeyLost, CodeExportTooLarge:
+	case CodeSchemaChanged, CodeDumpFailed, CodeCancelled, CodeTimeout, CodeLeaderChanged, CodeSessionLost, CodeCopyInterrupted, CodeRowCountMismatch, CodeOutcomeUnknown, CodeKeyLost, CodeExportTooLarge:
 		code = problem.Conflict
 	}
 	return problem.New(code, e.Error())

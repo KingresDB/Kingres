@@ -260,7 +260,7 @@ func TestExportRefusals(t *testing.T) {
 	e.expect(t, 200, "PATCH", "/settings/cluster", map[string]any{"dataTransfer": map[string]any{"stagingQuotaBytes": 1 << 30}})
 	if l := e.expect(t, 200, "GET", "/data-exports", nil); len(l["items"].([]any)) != 0 {
 		for _, it := range l["items"].([]any) {
-			if it.(map[string]any)["state"] == "ready" || it.(map[string]any)["state"] == "building" {
+			if m := it.(map[string]any); m["kind"] == "tableExport" && (m["state"] == "ready" || m["state"] == "building") {
 				t.Errorf("a refused export left a file: %v", it)
 			}
 		}

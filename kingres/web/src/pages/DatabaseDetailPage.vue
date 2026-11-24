@@ -23,6 +23,7 @@ import SetStorageDialog from '@/components/tables/SetStorageDialog.vue'
 import PartitionPolicyDialog from '@/components/tables/PartitionPolicyDialog.vue'
 import { matchesStorage, type StorageFilter } from '@/lib/analytics'
 import TransfersPanel from '@/components/transfers/TransfersPanel.vue'
+import DatabaseTransferActions from '@/components/transfers/DatabaseTransferActions.vue'
 import TableTransferActions from '@/components/transfers/TableTransferActions.vue'
 import { endpoints } from '@/api/endpoints'
 import { keys, useDatabase, useTables } from '@/api/queries'
@@ -93,6 +94,7 @@ function storageBlocked(t: Table): string {
 <template>
   <PageHeader :title="`Database ${name}`" :subtitle="createdText">
     <template #actions>
+      <DatabaseTransferActions v-if="db" :database-name="name" />
       <GateButton op="updateDatabase" :disabled="!db" @click="dialog = 'edit'"
         >Edit settings</GateButton
       >

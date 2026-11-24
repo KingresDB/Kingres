@@ -42,11 +42,11 @@ func setTransfer(e *env, enabled bool) {
 
 // The guards of every data transfer operation, in their order: no credential is 401; a role below kingres_admin is 403 forbidden before
 // anything else is said; a request that did not arrive over TLS is 403 insecure_transport; the setting off is 403 data_transfer_disabled.
-// The operations of the tag are the ten of the contract.
+// The operations of the tag are the twelve of the contract.
 func TestDataTransferGuards(t *testing.T) {
 	ops := transferOps()
-	if len(ops) != 10 {
-		t.Fatalf("%d operations have the tag %q, want 10", len(ops), tagDataTransfer)
+	if len(ops) != 12 {
+		t.Fatalf("%d operations have the tag %q, want 12", len(ops), tagDataTransfer)
 	}
 	e := newEnv(t)
 	e.initialize()

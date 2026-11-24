@@ -71,6 +71,10 @@
 //                                 cut400       the next chunk is cut and answered 400 with Upload-Offset
 //                                 short        the next download ends early, without an error
 //                                 exports      three exports exist: ready, building and expired
+//                                 lobs         0.29.0: the database has large objects (export_database: 422 large_objects_present)
+//                                 unreadable   0.29.0: the role cannot read some tables (422 export_not_readable)
+//                                 dbfail       0.29.0: the next database export fails in its data step
+//                                 changed      0.29.0: the next database export fails with schema_changed
 //   ?clock=off:<server>:<ms>      the clock of that server is that many milliseconds ahead (negative: behind).
 //   ?clock=unreachable:<server>   the clock of that server cannot be read.
 import { seedPartitioned } from './tables'

@@ -134,6 +134,11 @@ type Ops struct {
 	// startMu orders the check of the limits of the transfers with the start of the task, so that two requests of one role cannot both pass it.
 	startMu sync.Mutex
 	xferSt  *xferState
+	// dbw holds the structure of the database exports that run, vals the validations of archives that run (dbexport.go, archivevalidate.go).
+	dbw dbWorks
+	// dbTaskMu makes the check "a database export runs" and the start of a table task one step (and the reverse).
+	dbTaskMu sync.Mutex
+	vals     validations
 }
 
 // SetEngine installs the task engine once the system database exists.

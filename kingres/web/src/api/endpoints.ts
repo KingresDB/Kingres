@@ -989,6 +989,23 @@ export const endpoints = {
         body,
       }),
     )) as Task,
+  // --- database archives (0.29.0, a placeholder revision): export a database, validate an uploaded archive
+  /** 202 + task `database.export` (subject type `database`); when it is done its `detail` is `transfer <id>`. */
+  exportDatabase: async (
+    databaseName: string,
+    body: S['ExportDatabaseRequest'] = {},
+  ): Promise<Task> =>
+    (await j(
+      api.POST('/databases/{databaseName}/export', {
+        params: { path: { databaseName } },
+        body,
+      }),
+    )) as Task,
+  /** 202 + task `archive.validate` (subject type `upload`); the report is then `getDataUpload(id).report`. */
+  validateDatabaseArchive: async (uploadId: string): Promise<Task> =>
+    (await j(
+      api.POST('/data-uploads/{uploadId}/validation', { params: { path: { uploadId } } }),
+    )) as Task,
   // The calls of an upload keep the session in place when the answer is 401: the uploader asks for the password and goes on.
   createDataUpload: (body: S['CreateDataUploadRequest']) =>
     j(api.POST('/data-uploads', { body }), { keepSession: true }),

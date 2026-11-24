@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: KingresDB Management API
-  version: 0.28.0
+  version: 0.29.0
   summary: REST API of the KingresDB management panel, CLI and manager.
   description: |
     The single REST API served by `kingresd` on every KingresDB server. The web panel
@@ -5625,6 +5625,60 @@ paths:
         '422': { $ref: '#/components/responses/UnprocessableEntity' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
 
+  /databases/{databaseName}/export:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+    post:
+      operationId: exportDatabase
+      summary: Export a database to one archive
+      description: |
+        Added in 0.29.0 (data transfer, phase 14b; the number is a placeholder). Starts the task `database.export` (subject type `database`, id the database name): the structure, the KingresDB
+        catalog (how every table is distributed, its access method, ledger and time-partition policies, sequences) and the data of every table are written to one **zip archive**
+        that is staged on the manager leader, sealed (encrypted at rest) and kept for `retentionHours`. The answer is the task; when it is `done` its `detail` is `transfer <id>` and
+        `getDataExport` (kind `databaseExport`, format `archive/1`) says size, rows, SHA-256 and the consistency label of every table; `downloadDataExport` serves the file as `application/zip`.
+        Nothing is imported by this version: the archive is for inspection (`validateDatabaseArchive`) and for loading by hand. Importing an archive is a later revision.
+
+        The archive holds exactly these entries and no others: `manifest.json` (written last: versions, locale, extensions, the SHA-256 and the columns of every entry, warnings), `catalog.json`,
+        `schema/pre-data.sql`, `schema/views.sql`, `schema/post-data.sql` and `data/NNNNN.csv`, one per table (a partition tree is one entry, its root; leaves are structure only). The structure is the
+        schema-only output of `pg_dump` of the same PostgreSQL build, taken by the service role in a read-only transaction and rewritten by a closed set of rules; data is read as the signed-in role
+        through `COPY (SELECT ...)` as UTF-8 CSV with a distinct null marker (an empty string and a null differ). **What the archive does not carry** is listed in the manifest's `warnings` and refused
+        where it would make the archive misleading: large objects and `oid` or `reg*` columns (422 `large_objects_present`, unless `acknowledgeLargeObjectsLost` is true); roles, tablespaces,
+        policies, rules, event triggers, functions, triggers, publications, foreign objects, extended statistics, collations and unlogged tables (422 `schema_unrecognised`, naming the kind).
+        Ledger tables are carried as data and restart their chain when imported (ADR 0028); the history of an updatable ledger table is exported for the record.
+
+        Needs `kingres_admin`, the cluster setting `dataTransfer.enabled` (403 `data_transfer_disabled`), a request over TLS (403 `insecure_transport`), and the PostgreSQL privileges `USAGE` on every
+        schema and `SELECT` on every table (and column) of the database for the signed-in role: otherwise 422 `export_not_readable`, whose `reasons` name the first 20 objects the role cannot read (the detail says how many more), and nothing is written.
+        404: the database does not exist. 409 `operation_in_progress`: a table task or another database export or import is unfinished in this database, or the transfer limit is reached;
+        409 `transfer_quota_exceeded` and `insufficient_disk` as for `exportTable`. While the task runs, table tasks of the database are refused with 409 `operation_in_progress`.
+
+        Consistency: when every table is local, reference or on the group of the connection, the data is read in one `REPEATABLE READ` read-only transaction (`archive-single-snapshot`); otherwise each table is one
+        statement and the label of each table is as for `exportTable` (`single-snapshot` or `per-group`). **There is no global snapshot.** The structure is fingerprinted at the start and at the end: a table or a
+        column that changed in between fails the task with the code `schema_changed` and no file is kept.
+        Steps of the task: *Check the request*, *Take the structure*, *Normalise the schema*, *Write the data*, *Check the archive*, *Seal*.
+        Task codes: `schema_changed`, `schema_unrecognised`, `export_too_large`, `insufficient_disk`, `transfer_quota_exceeded`, `transfer_timeout`, `transfer_leader_changed` (retryable), `transfer_session_lost` (retryable),
+        `transfer_key_lost`, `copy_interrupted` (retryable), `forbidden`, `cancelled`. The error of a task never carries a value, a row or text of the server.
+      tags: [Data transfer]
+      x-required-role: kingres_admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExportDatabaseRequest' }
+            examples:
+              defaults: { summary: Everything, value: {} }
+              structure: { summary: The structure and the catalog only, value: { dataMode: none, retentionHours: 48 } }
+              leaveOut: { summary: One table without its rows, value: { excludeTables: [{ schema: public, table: audit_log }] } }
+      responses:
+        '202': { $ref: '#/components/responses/AcceptedDatabaseExport' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/DataTransferForbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/DataTransferConflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
   /data-uploads:
     post:
       operationId: createDataUpload
@@ -5773,6 +5827,37 @@ paths:
       x-required-role: kingres_admin
       responses:
         '204': { description: The upload was deleted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/DataTransferForbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/DataTransferConflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /data-uploads/{uploadId}/validation:
+    parameters:
+      - $ref: '#/components/parameters/UploadId'
+    post:
+      operationId: validateDatabaseArchive
+      summary: Validate an uploaded database archive
+      description: |
+        Added in 0.29.0 (data transfer, phase 14b; the number is a placeholder). Starts the task `archive.validate` (subject type `upload`, id the upload id) for a complete upload whose purpose is
+        `databaseArchive`. It reads the archive once from end to end and **touches no database**: the shape of the zip file (the local headers against the central directory, the descriptors, that the extents
+        account for every byte, the names, the sizes counted while reading), the SHA-256 and the CRC-32 of every entry against the manifest, the manifest and the catalog document (strict JSON, closed members, identifiers),
+        that the columns of each data entry equal the columns of the schema, the versions (format, PostgreSQL major, extensions, locale) and, with the shape grammar in its validate-only mode, every statement of the three SQL files
+        (`statements` of the report; nothing is run). The result is the **archive report** (`ArchiveReport`), stored with the upload (`getDataUpload` returns it as `report`, the state is `valid` or `invalid`)
+        and cached by the SHA-256 of the file. An archive that is not valid is not an error of the request: the task is `done` and the report says `valid: false` with the `reasons`.
+        The text of a statement of the archive is never shown: the report names the kind, the position and a fingerprint (the length and a hash prefix).
+
+        Needs `kingres_admin`, `dataTransfer.enabled` and a request over TLS. 404: the upload does not exist or is another role's. 409 `upload_incomplete`: bytes are missing; 409 `operation_in_progress`: a task uses the upload or the
+        transfer limit is reached. 422 `validation_failed`: the purpose of the upload is not `databaseArchive`.
+        Steps: *Check the upload*, *Read the archive*, *Check the plan*, *Store the report*. The task cannot change the archive, so it is always safe to repeat.
+      tags: [Data transfer]
+      x-required-role: kingres_admin
+      responses:
+        '202': { $ref: '#/components/responses/AcceptedArchiveValidation' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/DataTransferForbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -6379,6 +6464,71 @@ components:
                 createdAt: '2026-11-22T09:30:00Z'
                 updatedAt: '2026-11-22T09:30:00Z'
                 createdBy: alice
+    AcceptedDatabaseExport:
+      description: |
+        The export was accepted and runs as the task `database.export` (added in 0.29.0). Poll `GET /tasks/{taskId}` (the `Location` header) until `state` is `done` or `failed`; when it is `done`,
+        `detail` is `transfer <id>`, the id to give to `getDataExport` and `downloadDataExport`.
+      headers:
+        Location:
+          description: URL of the task, `/api/v1/tasks/{taskId}`.
+          schema: { type: string }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Task' }
+          examples:
+            exportDatabase:
+              value:
+                id: 131
+                kind: database.export
+                state: running
+                progress:
+                  percent: 35
+                  currentStep: Write the data
+                  steps:
+                    - { name: Check the request, state: done, detail: null, itemsDone: 1, itemsTotal: 1, startedAt: '2026-11-22T11:00:00Z', finishedAt: '2026-11-22T11:00:01Z' }
+                    - { name: Take the structure, state: done, detail: null, itemsDone: 1, itemsTotal: 1, startedAt: '2026-11-22T11:00:01Z', finishedAt: '2026-11-22T11:00:04Z' }
+                    - { name: Normalise the schema, state: done, detail: null, itemsDone: 1, itemsTotal: 1, startedAt: '2026-11-22T11:00:04Z', finishedAt: '2026-11-22T11:00:05Z' }
+                    - { name: Write the data, state: running, detail: 'public.orders, 90211333 bytes so far', itemsDone: 4, itemsTotal: 14, startedAt: '2026-11-22T11:00:05Z', finishedAt: null }
+                    - { name: Check the archive, state: pending, detail: null, itemsDone: null, itemsTotal: null, startedAt: null, finishedAt: null }
+                    - { name: Seal, state: pending, detail: null, itemsDone: null, itemsTotal: null, startedAt: null, finishedAt: null }
+                error: null
+                subject: { type: database, id: shop }
+                cancellable: true
+                detail: null
+                createdAt: '2026-11-22T11:00:00Z'
+                updatedAt: '2026-11-22T11:00:40Z'
+                createdBy: alice
+    AcceptedArchiveValidation:
+      description: |
+        The validation was accepted and runs as the task `archive.validate` (added in 0.29.0). Poll `GET /tasks/{taskId}` until it is `done`, then read the report with `getDataUpload`.
+      headers:
+        Location:
+          description: URL of the task, `/api/v1/tasks/{taskId}`.
+          schema: { type: string }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Task' }
+          examples:
+            validateArchive:
+              value:
+                id: 132
+                kind: archive.validate
+                state: running
+                progress:
+                  percent: 25
+                  currentStep: Read the archive
+                  steps:
+                    - { name: Check the upload, state: done, detail: null, itemsDone: 1, itemsTotal: 1, startedAt: '2026-11-22T11:10:00Z', finishedAt: '2026-11-22T11:10:01Z' }
+                    - { name: Read the archive, state: running, detail: 'data/00004.csv', itemsDone: 4, itemsTotal: 17, startedAt: '2026-11-22T11:10:01Z', finishedAt: null }
+                    - { name: Check the plan, state: pending, detail: null, itemsDone: null, itemsTotal: null, startedAt: null, finishedAt: null }
+                    - { name: Store the report, state: pending, detail: null, itemsDone: null, itemsTotal: null, startedAt: null, finishedAt: null }
+                error: null
+                subject: { type: upload, id: '43' }
+                cancellable: true
+                detail: null
+                createdAt: '2026-11-22T11:10:00Z'
+                updatedAt: '2026-11-22T11:10:05Z'
+                createdBy: alice
     AcceptedTableImport:
       description: |
         The import was accepted and runs as the task `table.import` (added in 0.19.0). Poll `GET /tasks/{taskId}` (the `Location` header). A failed task never carries a value or text of the
@@ -6705,6 +6855,11 @@ components:
         - import_too_large
         - import_end_marker
         - export_untrusted_code
+        - export_not_readable
+        - large_objects_present
+        - schema_unrecognised
+        - archive_invalid
+        - archive_incompatible
     ValidationIssue:
       type: object
       description: One invalid field of a request.
@@ -6766,7 +6921,7 @@ components:
           items: { $ref: '#/components/schemas/TableBlocker' }
         reasons:
           type: array
-          description: Added in 0.19.0, optional. Further reasons in the shape of `blockers`; reserved for the archive codes of later revisions, empty or absent for the codes of 0.19.0.
+          description: "Added in 0.19.0, optional. Further reasons in the shape of `blockers`. From 0.29.0: for `export_not_readable` one entry per object the role cannot read (at most 20; `code` is `no_privilege` or `no_usage`, `object` the name), and for `archive_incompatible` the reasons the archive does not fit."
           items: { $ref: '#/components/schemas/TableBlocker' }
         plan:
           $ref: '#/components/schemas/FailoverPlan'
@@ -10751,7 +10906,7 @@ components:
       type: string
       description: |
         Kind of task. Each kind has one fixed `subject.type`; the table is in the README
-        (section "Task kinds and subjects"). `standby.reconcile` is added in 0.7.0; the `ledger.key.*`, `ledger.bundle.create`, `ledger.epoch.start` and `ledger.upgrade` kinds in 0.11.0; `table.export` and `table.import` (subject `database/schema.table`) in 0.19.0.
+        (section "Task kinds and subjects"). `standby.reconcile` is added in 0.7.0; the `ledger.key.*`, `ledger.bundle.create`, `ledger.epoch.start` and `ledger.upgrade` kinds in 0.11.0; `table.export` and `table.import` (subject `database/schema.table`) in 0.19.0; `database.export` (subject type `database`) and `archive.validate` (subject type `upload`) in 0.29.0.
       enum:
         - cluster.init
         - cluster.join
@@ -10796,6 +10951,8 @@ components:
         - partition.maintain
         - table.export
         - table.import
+        - database.export
+        - archive.validate
     TaskStep:
       type: object
       description: One step of a task.
@@ -10888,14 +11045,14 @@ components:
       properties:
         type:
           type: string
-          enum: [cluster, server, instance, database, table, rebalance, replication, ledgerVerification, networkAccess, config, ledgerKey, bucket, schema]
+          enum: [cluster, server, instance, database, table, rebalance, replication, ledgerVerification, networkAccess, config, ledgerKey, bucket, schema, upload]
           description: Resource type.
         id:
           type: string
           description: |
             Resource identifier: database name; server id (`ServerId`); instance id (`node_id`) as a decimal
             string; `database/schema.table` for a table; the verification id; the task id for a rebalance;
-            the literal `cluster`, `preferred-primaries`, `network-access` or (0.11.0, type `ledgerKey`) `signing` for the singleton subjects.
+            the literal `cluster`, `preferred-primaries`, `network-access` or (0.11.0, type `ledgerKey`) `signing` for the singleton subjects; the upload id for type `upload` (0.29.0).
             See the README table "Task kinds and subjects".
     Task:
       type: object
@@ -11431,6 +11588,8 @@ components:
         - deleteDataUpload
         - downloadDataExport
         - deleteDataExport
+        - exportDatabase
+        - validateDatabaseArchive
         - dataTransfer.completed
         - dataTransfer.purged
         - setCaEscrow
@@ -14187,8 +14346,8 @@ components:
       properties:
         purpose:
           type: string
-          enum: [tableImport]
-          description: What the file is for. 0.20.0 adds `databaseArchive`.
+          enum: [tableImport, databaseArchive]
+          description: What the file is for. `databaseArchive` (0.29.0) is a zip archive made by `exportDatabase`; it is used by `validateDatabaseArchive`.
         sizeBytes:
           type: integer
           format: int64
@@ -14212,8 +14371,8 @@ components:
           description: Identifier, a decimal string.
         state:
           type: string
-          enum: [receiving, complete, lost, deleted]
-          description: '`receiving`: bytes are missing. `complete`: all bytes are in and the SHA-256 is known. `lost`: the staged file is gone (404 is the usual answer). 0.20.0 adds `validating`, `valid` and `invalid`.'
+          enum: [receiving, complete, validating, valid, invalid, lost, deleted]
+          description: '`receiving`: bytes are missing. `complete`: all bytes are in and the SHA-256 is known. `validating`: an `archive.validate` task reads it (0.29.0). `valid`, `invalid`: the result of the validation of an archive (0.29.0); the report is in `report`. `lost`: the staged file is gone (404 is the usual answer).'
         sizeBytes:
           type: integer
           format: int64
@@ -14240,6 +14399,11 @@ components:
           type: string
           format: date-time
           description: When the server deletes the upload if nothing happens (48 hours without data, 24 hours when complete and unused).
+        report:
+          description: The archive report of the last validation (0.29.0); null before one and for an upload whose purpose is not `databaseArchive`.
+          oneOf:
+            - $ref: '#/components/schemas/ArchiveReport'
+            - type: 'null'
     TableConsistency:
       type: object
       description: |
@@ -14253,11 +14417,114 @@ components:
           description: '`schema.table`.'
         level:
           type: string
-          enum: [single-snapshot, per-group, per-group-and-partition]
+          enum: [single-snapshot, per-group, per-group-and-partition, archive-single-snapshot]
         groups:
           type: integer
           minimum: 1
           description: Number of groups that hold buckets of the table.
+    ExportDatabaseRequest:
+      type: object
+      description: Added in 0.29.0. Options of a database export. Every member is optional; the server never accepts SQL of any kind.
+      additionalProperties: false
+      properties:
+        excludeTables:
+          type: array
+          maxItems: 10000
+          items: { $ref: '#/components/schemas/TableRef' }
+          description: Tables whose rows are left out of the archive (their structure stays). A name that is not a table of the database is 400 `validation_failed`.
+        dataMode:
+          type: string
+          enum: [all, none]
+          default: all
+          description: '`none` writes the structure and the catalog without any data entry.'
+        acknowledgeLargeObjectsLost:
+          type: boolean
+          default: false
+          description: Accept that large objects and `oid` or `reg*` columns are not carried (422 `large_objects_present` otherwise); the archive's warnings say it.
+        retentionHours:
+          type: integer
+          minimum: 1
+          maximum: 168
+          description: How long the archive is kept; default the cluster setting.
+    ArchiveReport:
+      type: object
+      description: |
+        Added in 0.29.0. The result of the validation of a database archive (`validateDatabaseArchive`, stored with the upload). Nothing in it is a value of the data or the text of a statement.
+      required: [valid, format, versions, tables, reasons]
+      properties:
+        valid:
+          type: boolean
+        format:
+          type: string
+          description: The `format` of the manifest, for example `kingres-export/1`; empty when the manifest could not be read.
+        sha256:
+          type: string
+          description: The SHA-256 of the archive file.
+        versions:
+          type: object
+          required: [postgresMajor, kingresVersion, extensions, encoding, lcCollate, lcCtype]
+          properties:
+            postgresMajor: { type: integer }
+            kingresVersion: { type: string }
+            extensions:
+              type: array
+              items:
+                type: object
+                required: [name, version, schema]
+                properties:
+                  name: { type: string }
+                  version: { type: string }
+                  schema: { type: string }
+                  installed:
+                    type:
+                      - string
+                      - 'null'
+                    description: The version installed on this cluster, or null when it is not installed.
+            encoding: { type: string }
+            lcCollate: { type: string }
+            lcCtype: { type: string }
+        tables:
+          type: object
+          required: [local, hash, reference, ledger, columnar, rows, bytes]
+          properties:
+            local: { type: integer }
+            hash: { type: integer }
+            reference: { type: integer }
+            ledger: { type: integer }
+            columnar: { type: integer }
+            rows: { type: integer, format: int64 }
+            bytes: { type: integer, format: int64 }
+        statements:
+          type: object
+          description: What the shape grammar found in the three SQL files; nothing was run.
+          required: [byKind, refused]
+          properties:
+            byKind:
+              type: object
+              additionalProperties: { type: integer }
+            refused:
+              type: array
+              items:
+                type: object
+                required: [kind, position, fingerprint, reason]
+                properties:
+                  kind: { type: string }
+                  position: { type: string, description: 'The file and the statement number, for example `schema/pre-data.sql#12`.' }
+                  fingerprint: { type: string, description: 'The length and a hash prefix of the statement; never its text.' }
+                  reason: { type: string }
+        needs:
+          type: object
+          required: [ledgerRestart, largeObjectsLost]
+          properties:
+            ledgerRestart: { type: boolean, description: "The archive has ledger tables; an import restarts their chain." }
+            largeObjectsLost: { type: boolean, description: "The source had large objects that the archive does not carry (acknowledged at export)." }
+        warnings:
+          type: array
+          items: { type: string }
+        reasons:
+          type: array
+          description: Why the archive is not valid or not importable here, in the shape of the blockers of `table_not_eligible`; empty when valid.
+          items: { $ref: '#/components/schemas/TableBlocker' }
     DataExport:
       type: object
       description: Added in 0.19.0. A staged export file and what is known about it.
@@ -14268,8 +14535,8 @@ components:
           description: Identifier, a decimal string.
         kind:
           type: string
-          enum: [tableExport]
-          description: 0.20.0 adds `databaseExport`.
+          enum: [tableExport, databaseExport]
+          description: '`databaseExport` (0.29.0) is a zip archive of a database; `table` is then null and `consistency` has one entry per table.'
         state:
           type: string
           enum: [building, ready, failed, expired, lost, deleted]
@@ -14308,7 +14575,7 @@ components:
             - array
             - 'null'
           items: { $ref: '#/components/schemas/TableConsistency' }
-          description: One entry for the table; null while it is built.
+          description: One entry for the table (one per table for a database archive; `archive-single-snapshot` when all were read in one transaction); null while it is built.
         spreadsheetSafe:
           type:
             - boolean
@@ -14319,8 +14586,8 @@ components:
           description: "Whether row-level security shortened the file. Always false: a table with row-level security is exported only with `row_security = off`, so a policy that hides rows fails the export."
         format:
           type: string
-          enum: [csv, csv.gz]
-          description: 0.20.0 adds `archive/1`.
+          enum: [csv, csv.gz, archive/1]
+          description: '`archive/1` (0.29.0): the zip archive of `exportDatabase`, served as `application/zip`.'
         taskId:
           type: integer
           format: int64
@@ -14338,6 +14605,10 @@ components:
             - 'null'
           format: date-time
           description: When the last byte was served; null when no download has finished.
+        warnings:
+          type: array
+          items: { type: string }
+          description: What the file does not carry or how it was read (0.29.0; the warnings of the manifest of a database archive). Absent for a table export.
     DataExportPage:
       type: object
       description: Added in 0.19.0. A page of the caller's exports, newest first.

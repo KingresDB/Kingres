@@ -1808,3 +1808,172 @@ export const ANALYTICS_STATES: PageState[] = [
 export const TRANSFER_STATES = STATES.filter((s) => s.name.includes('(0.19.0)'))
 /** Every state that is not one of the data transfer. */
 export const OLDER_STATES = STATES.filter((s) => !s.name.includes('(0.19.0)'))
+
+/** Chooses an archive in the dialog Validate an archive; the mock reacts to the file name. */
+async function chooseArchive(page: Page, name: string): Promise<void> {
+  await page.evaluate((n) => {
+    const input = document.querySelector<HTMLInputElement>('[data-testid="archive-file"]')
+    if (!input) throw new Error('No file input')
+    const transfer = new DataTransfer()
+    transfer.items.add(
+      new File([new Uint8Array(70_000)], n, { type: 'application/zip', lastModified: 1 }),
+    )
+    input.files = transfer.files
+    input.dispatchEvent(new Event('change', { bubbles: true }))
+  }, name)
+  await page.waitForSelector('[data-testid="archive-chosen"]', { timeout: 20_000 })
+  await sleep(250)
+}
+
+/** Opens Validate an archive, sends a fixture archive and waits for its report. */
+async function validateArchive(page: Page, name: string): Promise<void> {
+  await fastTasks(page)
+  await page.click('[data-testid="validate-archive"]')
+  await page.waitForSelector('[data-testid="archive-file"]', { timeout: 20_000 })
+  await chooseArchive(page, name)
+  await page.click('[data-testid="start-validation"]')
+  await page.waitForSelector('[data-testid="archive-report"]', { timeout: 30_000 })
+  await sleep(250)
+}
+
+/** The states of the database export and the archive validation (contract 0.29.0, a placeholder revision). */
+export const ARCHIVE_STATES: PageState[] = [
+  {
+    name: 'database page with the archive actions (0.29.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await page.waitForSelector('[data-testid="export-database"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+  },
+  {
+    name: 'export database dialog (0.29.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await page.click('[data-testid="export-database"]')
+      await page.waitForSelector('[data-testid="export-db-consistency-before"]', {
+        timeout: 20_000,
+      })
+      await page.waitForSelector('[data-testid="export-db-tables"]', { timeout: 20_000 })
+      await sleep(250)
+    },
+    close: cancel,
+  },
+  {
+    name: 'export database result with the download (0.29.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await fastTasks(page)
+      await page.click('[data-testid="export-database"]')
+      await page.waitForSelector('[data-testid="export-db-consistency-before"]', {
+        timeout: 20_000,
+      })
+      await clickText(page, 'Export database', '[role="dialog"] button')
+      await page.waitForSelector('[data-testid="download-start"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await closeDialogs(page)
+      await slowTasks(page)
+    },
+  },
+  {
+    name: 'export database, the role cannot read every table (0.29.0)',
+    needsMock: true,
+    route: '/databases/reports',
+    open: async (page) => {
+      await page.click('[data-testid="export-database"]')
+      await page.waitForSelector('[data-testid="export-db-consistency-before"]', {
+        timeout: 20_000,
+      })
+      await clickText(page, 'Export database', '[role="dialog"] button')
+      await page.waitForSelector('[data-testid="unreadable-objects"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+    close: cancel,
+  },
+  {
+    name: 'export database failed (0.29.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await fastTasks(page)
+      await urlSwitch(page, 'transfer', 'dbfail')
+      await page.click('[data-testid="export-database"]')
+      await page.waitForSelector('[data-testid="export-db-consistency-before"]', {
+        timeout: 20_000,
+      })
+      await clickText(page, 'Export database', '[role="dialog"] button')
+      await page.waitForSelector('[role="dialog"] [role="alert"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await closeDialogs(page)
+      await slowTasks(page)
+    },
+  },
+  {
+    name: 'validate an archive, file chosen (0.29.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await page.click('[data-testid="validate-archive"]')
+      await page.waitForSelector('[data-testid="archive-file"]', { timeout: 20_000 })
+      await chooseArchive(page, 'shop.kdx.zip')
+    },
+    close: cancel,
+  },
+  {
+    name: 'archive report, valid (0.29.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: (page) => validateArchive(page, 'shop.kdx.zip'),
+    close: async (page) => {
+      await closeDialogs(page)
+      await slowTasks(page)
+    },
+  },
+  {
+    name: 'archive report, refused statements (0.29.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: (page) => validateArchive(page, 'code.kdx.zip'),
+    close: async (page) => {
+      await closeDialogs(page)
+      await slowTasks(page)
+    },
+  },
+  {
+    name: 'archive report, not compatible (0.29.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: (page) => validateArchive(page, 'old.kdx.zip'),
+    close: async (page) => {
+      await closeDialogs(page)
+      await slowTasks(page)
+    },
+  },
+  {
+    name: 'archive report, ledger tables (0.29.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: (page) => validateArchive(page, 'ledger.kdx.zip'),
+    close: async (page) => {
+      await closeDialogs(page)
+      await slowTasks(page)
+    },
+  },
+  {
+    name: 'archive report, invalid (0.29.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: (page) => validateArchive(page, 'hostile.kdx.zip'),
+    close: async (page) => {
+      await closeDialogs(page)
+      await slowTasks(page)
+    },
+  },
+]

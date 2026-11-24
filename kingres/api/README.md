@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.28.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.29.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and, when it is built, the planned `kingres-cli` (it does not exist yet). Lint it and run the mechanical rule check with:
 
 ```
@@ -362,6 +362,29 @@ Where the architecture document leaves something open, the simplest option was c
     range and the cluster's replica count.
 
 ## Changelog
+
+### 0.29.0
+
+Revision written first for the database export and the archive validation of phase 14b (`kingres/docs/design/data-export-import.md`). Summary for the panel:
+2 operations added (176 operations, 140 paths); two task kinds, five problem codes and one object (`ArchiveReport`) added; **no change that is not additive**.
+
+#### Breaking
+
+None.
+
+#### Additive
+- `exportDatabase` (`POST /databases/{databaseName}/export`, task kind `database.export`) and `validateDatabaseArchive` (`POST /data-uploads/{uploadId}/validation`, task kind `archive.validate`). Both need `kingres_admin`.
+- `CreateDataUploadRequest.purpose` has `databaseArchive`; `DataUpload.state` has `validating`, `valid` and `invalid`, and `DataUpload.report` (optional) is the `ArchiveReport` of the last validation.
+- `DataExport.kind` has `databaseExport`, `DataExport.format` has `archive/1`, `DataExport.warnings` (optional) and `TableConsistency.level` has `archive-single-snapshot`.
+- `ProblemCode` has `export_not_readable`, `large_objects_present`, `schema_unrecognised`, `archive_invalid` and `archive_incompatible`; `schema_changed` is a code of a failed task.
+- `TaskKind` has `database.export` and `archive.validate`; `AuditAction` has `exportDatabase` and `validateDatabaseArchive`.
+- Schemas: `ExportDatabaseRequest` (closed), `ArchiveReport`.
+- `AlertKind` has `extensionSchemaUntrusted` (`critical`; subject `server:<id>|database:<name>`): the schema of a KingresDB extension in a database is owned by a role that is not a superuser, holds an object that is not a member of an extension, or lets a role that is not a superuser create objects in it. The control plane then reads and calls nothing in that schema, and the operations that need the extension, the database export among them, are refused.
+
+#### Documentation
+
+- The section "Database archives" states what the archive holds and does not carry, the consistency labels and the report. The archive is for inspection and for loading by hand; the import of an archive is a later revision.
+
 
 ### 0.28.0
 

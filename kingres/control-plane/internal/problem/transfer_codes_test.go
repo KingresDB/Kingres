@@ -23,6 +23,11 @@ func TestTransferCodesOfContract019(t *testing.T) {
 		{ImportTooLarge, "import_too_large", 422},
 		{ImportEndMarker, "import_end_marker", 422},
 		{ExportUntrustedCode, "export_untrusted_code", 422},
+		{ExportNotReadable, "export_not_readable", 422},
+		{LargeObjectsPresent, "large_objects_present", 422},
+		{SchemaUnrecognised, "schema_unrecognised", 422},
+		{ArchiveInvalid, "archive_invalid", 422},
+		{ArchiveIncompatible, "archive_incompatible", 422},
 	} {
 		p := New(tc.c, "d")
 		if string(p.Code) != tc.want || p.Status != tc.status || p.Title == "" || p.Type != "https://kingresdb.dev/problems/"+slug(tc.want) {

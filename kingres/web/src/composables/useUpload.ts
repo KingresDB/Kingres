@@ -47,6 +47,7 @@ export function useUpload(target: UploadTarget) {
     options: {
       existing?: string
       compressed?: boolean
+      purpose?: 'tableImport' | 'databaseArchive'
       maxFileBytes?: number | null
       maxAtomicBytes?: number
       fingerprint?: string | null
@@ -65,6 +66,7 @@ export function useUpload(target: UploadTarget) {
         refreshSession: endpoints.refreshSession,
       },
       compressed: options.compressed,
+      ...(options.purpose ? { purpose: options.purpose } : {}),
       maxFileBytes: options.maxFileBytes,
       maxAtomicBytes: options.maxAtomicBytes,
       onChange: (s) => {
@@ -79,6 +81,7 @@ export function useUpload(target: UploadTarget) {
           rememberUpload({
             uploadId: id,
             fileName: source.name,
+            ...(options.purpose ? { purpose: options.purpose } : {}),
             sizeBytes: source.size,
             lastModified: source.lastModified,
             user: session.username ?? '',

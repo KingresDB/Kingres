@@ -249,6 +249,116 @@ Branch `p5-hard`, from the staging branch g16 (failover round 2 with the F7 fixe
 - The unexplained failure above.
 - A hard failover of the map group when the old leader's kingresd is gone before the call of the fence is the failover of a dead leader (the bootstrap alone), as before.
 
+## 2026-11-23 (branch p14b, second entry): the fixes for the security review of phase 14b
+
+### What was done
+
+- A1: `extguard` (commit 13ae51e353 of `sec-ext`, taken alone) gates every read and call of the schema `kingres` in the facts of the export; an untrusted schema is a refusal (422 `schema_unrecognised`, or the task code). B7: a schema `kingres` owned by a role that is not a superuser, one that holds objects when no extension is installed, and a schema `kingres_transfer` that the service role does not own are refused. The facts are read under `SET LOCAL search_path = pg_catalog`, `pg_dump` has `PGOPTIONS=-c search_path=pg_catalog`, a password file of mode 0600 in the staging directory, a version check and a bounded tail of its error output in the server log (A2, B8); the role's connection sets `search_path = pg_catalog` (B9).
+- B1, B2: line comments end at `\r`; dollar-quote tags may start with a high byte (`sqlshape` and `dumpnorm`). A corpus of harmless scripts is checked against a real server of PostgreSQL 18 and 19 (`TestLexersAgreeWithTheServer`) and is the seed of the fuzz targets.
+- B3, B4, B5, B6, B10, P1, P2: a failed read is never a report; a versioned cache (an import validates again); ratio and expansion limits; sequence privileges; names as pairs (a dot is refused, the console keys by the pair); the report says that rows are claimed; the check for an export and the start of a table task are one step.
+
+### How it was verified
+
+| Test | Layer | PG18 | PG19 |
+|---|---|---|---|
+| `TestLexersAgreeWithTheServer` (22 scripts, the server counts the statements) | PG test | pass | pass |
+| `TestLexerAgreesWithTheCorpus`, `TestCarriageReturnAndHighByteTags`, `TestSplitterAgreesWithTheCorpus` | Go unit | pass | pass |
+| `TestFactsIgnoreTheSearchPathOfTheDatabase` (a shadowing schema first in the path of the database) | PG test | pass | pass |
+| `TestExportRefusesAFakeKingresSchema` (a fake schema with a marker function, a full one and an empty one), `TestExportRefusesAFakeTransferSchema`, `TestExportIgnoresASearchPathOfTheDatabase`, `TestExportRefusesASequenceTheRoleCannotRead` | cluster | pass | pass |
+| `TestAFailedReadIsNotAReport`, `TestArchiveLimitsFollowTheFile`, `TestCachedReportIsByTheChecksum` (version), `TestPasswordFileOfPgDump`, `TestRatioCap`, `TestDottedNamesAreRefused`, the keys of the console (`archive-keys-0-40`) | Go and web unit | pass | not applicable |
+| the sweep of the first entry (export, spike, three servers, facts and dump) | cluster and PG | pass | pass |
+
+Mutants of the review, all killed: the lexer of `sqlshape` or the splitter of `dumpnorm` ends a comment only at a line feed (`TestLexerAgreesWithTheCorpus`, `TestSplitterAgreesWithTheCorpus`); a tag may not start with a high byte (same tests); a failed read is made a report (`TestAFailedReadIsNotAReport`); a report of another validator version is used (`TestCachedReportIsByTheChecksum`); no ratio cap (`TestRatioCap`); a dot accepted (`TestDottedNamesAreRefused`); the guard and the check of the fixed schemas removed, and the owner of the schema `kingres` not checked (`TestExportRefusesAFakeKingresSchema`; the owner mutant needed the empty schema that was added); the sequence privilege not checked (`TestExportRefusesASequenceTheRoleCannotRead`); the search path of the facts not pinned (`TestFactsIgnoreTheSearchPathOfTheDatabase`; the end-to-end test could not show it, because the service connection already pins the path in its startup parameters); the schema `kingres_transfer` not checked (`TestExportRefusesAFakeTransferSchema`).
+
+### Decisions and deviations
+
+- The commit of `sec-ext` was cherry-picked alone; the contract text of its alert kind moved into 0.29.0 (placeholder).
+- The tail of the error output of `pg_dump` goes to the server log (the reviewer asked for it); it can name objects.
+
+### Still open
+
+- 14c validates the archive again at import time and never trusts `archive_state` (design note above).
+
+### Core patches
+
+None.
+
+---
+
+## 2026-11-23 (branch p14b): phase 14b, database export and archive validation
+
+### What was done
+
+- **Contract 0.29.0** (the number it has in g2; 0.40.0 on the branch): `exportDatabase` and `validateDatabaseArchive`, `ExportDatabaseRequest` (closed), `ArchiveReport`, the upload purpose `databaseArchive`, the task kinds `database.export` and `archive.validate` (subject type `upload` is new), five problem codes, the audit actions, `DataExport.warnings`. The checker has the rules of 0.29.0, the README has the section "Database archives" and the changelog; `web/src/api/schema.d.ts` and the operation table are generated (`npm run api:check` and `go generate` agree). Migration `0050_archive_validation.sql` (a placeholder number) adds the purpose of an upload and the state of an archive validation.
+- **Spike S3** was **not done before**; it was done first, on PostgreSQL 18.7 and 19.0, and its result is written into the design ("Results of the spikes and changes made by the code (phase 14b)"). The dump of the two majors is the same except for the version comments and the `\restrict` token. The golden files are `internal/dumpnorm/testdata/pg18` and `pg19`.
+- **Package `dumpnorm`**: the normaliser of the dump (removals and a closed set of rewrites, views moved, the user's partitioning of a distributed table synthesised from the catalog).
+- **Package `archive`** (writer, validator, manifest and catalog decoders, version rules, report; by a second writer) and **package `sqlshape`** (the lexer and the shape grammar in validate-only mode; by a third); both were merged into `p14b`.
+- **The task `database.export`** (`ops/dbexport*.go`): the request checks (unsupported objects, large objects, the privileges of the role on every table, code of other roles), the structure in one `REPEATABLE READ READ ONLY` transaction of the service role with `pg_dump` in its snapshot, the normalisation and the run of the shape grammar over the result, the data written to the streaming zip writer as the role (one transaction when the archive can be one snapshot), the check of the file by the validator and of the fingerprint, the seal. **The task `archive.validate`** (`ops/archivevalidate.go`): the report stored with the upload, cached by the SHA-256 of the file.
+- **Console** (`kingres/web`; a fourth writer): the export dialog, the validation dialog and the report page, the Transfers panel for archives, the mock with the fixtures of the design, 2009 unit tests, and browser and axe tests at three widths.
+
+### How it was verified
+
+The test table is below. PostgreSQL 18.7 and 19.0 in private installations (`~/kw-p14b/pg18` and `pg19`, built from this commit, deleted at the end), lane `l13`, with `control-plane/scripts/run-integration.ps1`.
+
+| Test | Layer | PostgreSQL 18 | PostgreSQL 19 |
+|---|---|---|---|
+| `dumpnorm`: goldens of both majors (`TestGoldenNormalisation`, `TestMajorsAgree`, `TestRefusals`, `TestOtherStatementsAreKept`, `TestSplitter`) | Go unit | pass | pass (same files) |
+| `archive` (19 tests, the hostile corpus of 66 archives, 3 fuzz targets) and `sqlshape` (tables of 47 accepted and 110 refused statements, 2 fuzz targets) | Go unit | pass | pass |
+| `ops`: facts, catalog, normaliser facts, labels, entries, fingerprint, exporter output accepted by the validator, warnings, refusals, dump arguments, cache | Go unit | pass | pass |
+| `TestReadFactsAndDumpOfARealDatabase`: the catalog read, `pg_dump` of the build, the normaliser and the grammar, on a real instance | PG test, private install | pass | pass |
+| `TestSpikeS3DumpOfEveryTableKind` | cluster (one server) | pass | pass |
+| `TestDatabaseExportOfEveryTableKindAndItsValidation` (local, reference, hash, user-partitioned, columnar, updatable and append-only ledger, time-partitioned, inheritance, partitioned, views; download; validation of the upload; a damaged archive) | cluster (one server) | pass | pass |
+| `TestDatabaseExportRefusals` (unknown database, bad options, a function, large objects and their acknowledgement, a role that cannot read: 20 of 25 named, excluded table, data mode none) | cluster (one server) | pass | pass |
+| `TestDatabaseExportBlocksTableTasksAndNoticesChanges` (a table task refused during an export, a cancel leaves no file, a column added fails with `schema_changed`) | cluster (one server) | pass | pass |
+| `TestDatabaseExportTooLarge` (`export_too_large`, no file, then the same database under a larger limit) | cluster (one server) | pass | pass |
+| `TestDatabaseExportOverThreeServers` (per-group labels, a follower makes it, three servers serve the download, an upload through a follower validated through another) | cluster (three servers) | pass | pass |
+| Console: typecheck, lint, 2009 vitest tests (111 files), `archive-0-40` browser and axe tests at 1366, 683 and 320 px in both themes | web | pass | not applicable |
+| Contract: `check-contract.mjs`, `api:check`, `httpapi` and `contract` tests | contract | pass | not applicable |
+
+Mutants (one-line edits, each killed by the named test; the script is not part of the tree): see the report of the unit of work; the list is in "Mutants" below.
+
+### Mutants
+
+| Mutant | Killed by |
+|---|---|
+| the normaliser keeps ONLY on the constraint or ON ONLY on the index of a distributed table | `TestGoldenNormalisation` |
+| the capture triggers of ledger tables are not removed; a trigger of that name on any table is removed | `TestGoldenNormalisation`; `TestOtherStatementsAreKept` |
+| PARTITION BY HASH on another column is accepted; every SET is accepted; another table access method is accepted | `TestRefusals` (three cases) |
+| USING columnar is not added; views stay in pre-data; a bucket partition is not removed | `TestGoldenNormalisation` |
+| a GRANT is dropped instead of kept for the grammar to refuse | `TestOtherStatementsAreKept` |
+| a partition leaf is exported (rows twice) | `TestDataEntriesAndLabels` |
+| the history entry names the history table | `TestExporterOutputIsAcceptedByTheValidator` |
+| the fingerprint ignores the columns | `TestFingerprintChangesWithTheStructure` |
+| large objects are not counted; objects that the archive does not carry are not refused | `TestCheckExportableRefusesWhatTheArchiveDoesNotCarry` |
+| the label is always single-snapshot; the archive is always one snapshot | `TestDataEntriesAndLabels` |
+| the cache of a validation ignores the checksum | `TestCachedReportIsByTheChecksum` |
+| the LIKE escape is a no-op; a columnar table is estimated like a heap table | `TestSplitPartKeyAndEstimates` |
+| the warning for a table read per group is not written | `TestWarningsSayWhatTheArchiveDoesNotCarry` |
+| pg_dump takes no snapshot; pg_dump keeps PGPASSFILE and PGSERVICE of the process | `TestDumpArgumentsAndEnvironment` |
+| the privilege check of the role is removed | `TestDatabaseExportRefusals` (cluster) |
+| the fingerprint is not compared at the end; a table task is not refused while an export runs | `TestDatabaseExportBlocksTableTasksAndNoticesChanges` (cluster) |
+| the limit of the largest file is not applied | `TestDatabaseExportTooLarge` (cluster) |
+| every table is labelled by its own statement although one transaction is used | `TestDatabaseExportOfEveryTableKindAndItsValidation` (cluster) |
+| data mode none still writes the data; an excluded table keeps its data | `TestDatabaseExportRefusals` (cluster) |
+
+All 31 mutants of this list were killed (11 of the normaliser, 13 of the unit tests of the export, 7 in the cluster). The writer of the archive package killed 15 (the writer omits a descriptor; the validator ignores the local name, the local extra field or the descriptor flag; the overlap, hidden-byte, compressed-extent, CRC-32, SHA-256 and entry-count checks removed; the declared-size reader is +1000; the PostgreSQL major compare reversed; the extension version compare is `>`; a symbolic link accepted; a comment in the end record accepted); the overlap-check mutant survived the hostile archives and is killed by `TestExtentsRefuseAMovedOffset`, which calls the check directly. The writer of the shape grammar killed 16 of 17 (the survivor, `CREATE TABLE ... AS` accepted, is equivalent: a second guard refuses it).
+
+### Needs-verification items
+
+- S3 / V1 / V2: done (above). V8 (rename of a database) and the rest of 14c: not checked, as the phase says. V9: a read reaches virtual generated columns only, because policies are refused.
+
+### Decisions and deviations
+
+See "Changes made by the code" in the design: the strictness of the archive shape, the progress in the task detail, a restart of the whole data step, the decision of the single snapshot by the catalog, the refusal of row-level security, the history entry naming its table, the exclusion of table tasks.
+
+### Still open
+
+- Phase 14c: the import (the private database, the shape grammar's import steps, the distribution before the data, the ledger and the policies), `expectedSha256`, the console import dialogs. Not covered by tests: a leader change at every step of the export, a distributed schema, a columnar distributed table, an archive above 2 GiB.
+
+### Core patches
+
+None.
+
 ---
 
 ## 2026-11-22 (staging branch g15): cp-1011, p13-fix and web-15b merged, contract revisions renumbered
