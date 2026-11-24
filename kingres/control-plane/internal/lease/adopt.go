@@ -241,6 +241,13 @@ func (m *Manager) Transfer(ctx context.Context, group int32, to string) (Transfe
 	}
 	members := t.Members
 	need := majority(members)
+	// The marker is on disk before the first request, as ReleaseGroup does (F2-03, phase 5 review L6): a restart of kingresd between the answer
+	// of a majority and the end of this call must not renew, or start a primary, for a group that was handed over. A transfer that fails puts
+	// the state back.
+	markerBefore := markerExists(m.c.Dir, RelinquishedMarker, group)
+	if err := pki.WriteFile(MarkerPath(m.c.Dir, RelinquishedMarker, group), []byte("transferring to "+to+"\n"), 0o600); err != nil {
+		return TransferResult{}, fmt.Errorf("lease: writing the relinquished marker: %w", err)
+	}
 	req := Request{Group: group, DurationMs: m.c.Duration.Milliseconds(), TransferTo: to}
 	rctx, cancel := context.WithTimeout(ctx, m.c.Duration-m.c.Margin)
 	defer cancel()
@@ -269,12 +276,15 @@ func (m *Manager) Transfer(ctx context.Context, group int32, to string) (Transfe
 	}
 	res := TransferResult{Granted: granted, Need: need}
 	if granted < need {
+		if !markerBefore {
+			_ = os.Remove(MarkerPath(m.c.Dir, RelinquishedMarker, group))
+		}
 		return res, fmt.Errorf("lease: only %d of the %d grantors needed moved the lease of shard group %d to %s (a grantor of an older version does not know the call)", granted, need, group, to)
 	}
-	// The lease is `to`'s. This server does not hold it and does not renew it any more. The
-	// marker makes that survive a restart of kingresd.
+	// The lease is `to`'s. This server does not hold it and does not renew it any more. The marker, written before the
+	// requests, makes that survive a restart of kingresd; it now says where the lease went.
 	if err := pki.WriteFile(MarkerPath(m.c.Dir, RelinquishedMarker, group), []byte("transferred to "+to+"\n"), 0o600); err != nil {
-		m.c.Log.Warn("writing the relinquished marker after a transfer", "group", group, "error", err)
+		m.c.Log.Warn("rewriting the relinquished marker after a transfer", "group", group, "error", err)
 	}
 	m.mu.Lock()
 	m.relinq[group] = true
