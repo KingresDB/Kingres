@@ -602,12 +602,18 @@ func (m *Manager) Check(ctx context.Context) {
 		}
 	}
 	m.mu.Unlock()
+	// Each group is fenced in its own goroutine: a stop that hangs (up to 30 s) must not delay the fence of another group past its margin
+	// (phase 5 review L3). Check returns when every one ended.
+	var wg sync.WaitGroup
 	for _, g := range expired {
-		m.lose(ctx, g)
+		wg.Add(1)
+		go func() { defer wg.Done(); m.lose(ctx, g) }()
 	}
 	for _, g := range refence {
-		m.refence(ctx, g)
+		wg.Add(1)
+		go func() { defer wg.Done(); m.refence(ctx, g) }()
 	}
+	wg.Wait()
 }
 
 // FenceRetry is how often the stop of a primary whose lease is lost is tried again while it still runs.

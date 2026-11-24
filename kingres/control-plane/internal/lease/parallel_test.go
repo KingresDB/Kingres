@@ -80,3 +80,45 @@ func TestTheLeasesOfSeveralGroupsAreRenewedSideBySideWithSlowGrantors(t *testing
 		t.Fatal("the instance was fenced")
 	}
 }
+
+// delayedStop is an instance whose immediate stop takes a while.
+type delayedStop struct {
+	*fakeInstance
+	d time.Duration
+}
+
+func (s delayedStop) StopImmediate(ctx context.Context) error {
+	time.Sleep(s.d)
+	return s.fakeInstance.StopImmediate(ctx)
+}
+
+// Phase 5 review L3: the leases of two groups run out together and the stop of each hangs for 600 ms; the fences run side by side, so Check
+// ends after about one stop and not after two.
+func TestTheFencesOfSeveralGroupsRunSideBySide(t *testing.T) {
+	ctx := context.Background()
+	r := newRig(t, []string{"a", "b", "c"}, true)
+	r.m.c.Source = fakeSource{Topology{Groups: []int32{1, 2}, Members: []string{"a", "b", "c"}}}
+	r.m.c.Audit = func(context.Context, string, int32, string) {} // the rig's recorder is not safe for fences that run side by side
+	i1 := &fakeInstance{running: true}
+	i2 := &fakeInstance{running: true}
+	r.m.c.InstanceFor = func(g int32) (Instance, bool) {
+		if g == 1 {
+			return delayedStop{i1, 600 * time.Millisecond}, true
+		}
+		return delayedStop{i2, 600 * time.Millisecond}, true
+	}
+	r.m.Renew(ctx)
+	r.voter.down["b"], r.voter.down["c"] = true, true
+	r.clk.Advance(dur)
+	r.m.Renew(ctx)
+	start := time.Now()
+	r.m.Check(ctx)
+	if took := time.Since(start); took > 1000*time.Millisecond {
+		t.Fatalf("the fences took %v: they ran one after the other", took)
+	}
+	for g, in := range map[int32]*fakeInstance{1: i1, 2: i2} {
+		if up, _, _ := in.state(); up {
+			t.Fatalf("group %d was not fenced", g)
+		}
+	}
+}
