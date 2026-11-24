@@ -455,7 +455,8 @@ type SchemaOnServer struct {
 // schemasOn lists the distributed schemas on the groups whose primary runs on the server, in every database that has the extension function
 // for it (kingres_shard 0.9); the extension asks the owner of each group.
 func (s *Service) schemasOn(ctx context.Context, server string) ([]SchemaOnServer, error) {
-	dbs, err := s.Backend.Databases(ctx, Options{})
+	// Strict, as in bucketsOn: a database whose schema kingres cannot be trusted is an error, never a database without schemas (a pinned schema there would not refuse the drain).
+	dbs, err := s.Backend.Databases(ctx, Options{Strict: true})
 	if err != nil {
 		return nil, err
 	}

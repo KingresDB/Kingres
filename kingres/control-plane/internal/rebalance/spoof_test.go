@@ -132,3 +132,17 @@ func TestDrainDoesNotCountAnUnverifiableDatabaseAsEmpty(t *testing.T) {
 	}
 	env.NoMarkers(t, "bucketsOn")
 }
+
+// The refusal of a drain for a pinned schema reads the schemas of every database strictly: a database whose schema cannot be trusted is an error before the task
+// exists, not a database that is silently left out of the check.
+func TestSchemasOnDoesNotTreatAnUnverifiableDatabaseAsWithoutSchemas(t *testing.T) {
+	env := spooftest.NewUntrusted(t)
+	ctx := context.Background()
+	s := &Service{Conns: env, Backend: &PG{Conns: env}}
+	got, err := s.schemasOn(ctx, "10.0.0.1")
+	wantProblem(t, "schemasOn", err, problem.ExtensionUnavailable)
+	if len(got) != 0 {
+		t.Fatalf("a list with the error: %+v", got)
+	}
+	env.NoMarkers(t, "schemasOn")
+}
