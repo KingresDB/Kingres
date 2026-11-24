@@ -15,17 +15,24 @@ import (
 func TestAMissingWatchdogProgramIsAStartupError(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	empty := t.TempDir()
-	err := checkWatchdog(empty, false, log)
+	// the program may also stand next to the test binary, so the search is of this test's own directory only
+	find := func() string {
+		if st, err := os.Stat(filepath.Join(empty, watchdogBinary)); err == nil && !st.IsDir() {
+			return filepath.Join(empty, watchdogBinary)
+		}
+		return ""
+	}
+	err := checkWatchdog(find, false, log)
 	if err == nil || !strings.Contains(err.Error(), watchdogBinary) || !strings.Contains(err.Error(), "allow-no-watchdog") {
 		t.Fatalf("a missing watchdog program must be an error that names the program and the setting: %v", err)
 	}
-	if err := checkWatchdog(empty, true, log); err != nil {
+	if err := checkWatchdog(find, true, log); err != nil {
 		t.Fatalf("allow-no-watchdog must let the server start: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(empty, watchdogBinary), []byte("x"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := checkWatchdog(empty, false, log); err != nil {
+	if err := checkWatchdog(find, false, log); err != nil {
 		t.Fatalf("a watchdog program in pg-bin-dir is found: %v", err)
 	}
 }

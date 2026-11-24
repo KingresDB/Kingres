@@ -43,7 +43,7 @@ func startLeases(d *haDeps) error {
 	if !d.Svc.Enabled() || d.Cfg.InternalListen == "" {
 		return nil
 	}
-	if err := checkWatchdog(d.Cfg.PGBinDir, d.Cfg.HA.AllowNoWatchdog, d.Log); err != nil {
+	if err := checkWatchdog(func() string { return findWatchdog(d.Cfg.PGBinDir) }, d.Cfg.HA.AllowNoWatchdog, d.Log); err != nil {
 		return err
 	}
 	leaseDir := filepath.Join(d.Cfg.DataDir, leaseDirName)
@@ -563,8 +563,8 @@ func formerPrimaryProof(mgr *lease.Manager) func(group int32) error {
 // checkWatchdog refuses to start a server that runs the lease protocol without the watchdog program (phase 5 review L1). The lease code of kingresd stops a primary
 // whose lease is lost, but only the watchdog stops one when kingresd hangs or is gone, and without it a missing program was only a warning at the first use. The
 // setting allow-no-watchdog (tests, development) lets the server start with the warning.
-func checkWatchdog(pgBinDir string, allowMissing bool, log *slog.Logger) error {
-	if findWatchdog(pgBinDir) != "" {
+func checkWatchdog(find func() string, allowMissing bool, log *slog.Logger) error {
+	if find() != "" {
 		return nil
 	}
 	if allowMissing {
