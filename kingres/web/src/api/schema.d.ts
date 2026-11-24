@@ -716,6 +716,10 @@ export interface paths {
          *     part of the design, the request answers 422 `unsupported_operation`: this revision's server implements
          *     `hard` and `graceful` for ordinary groups.
          *
+         *     **0.33.0, the role for a loss of data.** A hard request that includes the map group of a server that is alive (see 0.28.0) and carries
+         *     `allowDataLoss: true` is refused with 403 `forbidden` unless the session has `kingres_admin`; the operation otherwise needs `kingres_ops`, and the
+         *     same request for an ordinary group, or for the map group without `allowDataLoss`, stays with `kingres_ops`.
+         *
          *     **0.13.0, the planned switchover (`graceful`).** For each group, in this order: the writes of the group stop on the old primary
          *     (new connections go elsewhere, the other sessions are ended), the distributed transactions end, the old primary stops with a fast
          *     shutdown and releases its lease, the standby that streams from it is proven to hold everything the old primary wrote, and only then
