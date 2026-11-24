@@ -5,6 +5,7 @@ package pgstore
 import (
 	"context"
 	"encoding/json"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"sort"
 	"strings"
 
@@ -86,6 +87,14 @@ SELECT (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relname
 		return dbProbe{}
 	}
 	probe.ok = true
+	// A database whose extension schema cannot be trusted, or cannot be checked, is not readable: it is not shown as a database without sharding or ledger
+	// (extguard; the monitor raises the alert).
+	for _, ext := range []string{extguard.Shard, extguard.Ledger} {
+		if _, err := s.extInfo(ctx, p, ext); err != nil {
+			s.opts.Logger.Debug("cannot probe database: its extension schema is not usable", "database", db, "extension", ext, "error", err)
+			return dbProbe{}
+		}
+	}
 	// The relations count only when the extension is installed and its schema is trusted (extguard); the same for the sharding settings below.
 	probe.hasShard, _ = s.regclassExists(ctx, p, "kingres.bucket_map")
 	probe.hasLedger, _ = s.regclassExists(ctx, p, "kingres.ledger_blocks")

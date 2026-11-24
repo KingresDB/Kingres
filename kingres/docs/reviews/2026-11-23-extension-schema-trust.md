@@ -91,16 +91,22 @@ The rule is the narrowest one that lets these through:
    `split_capture_<n>_<n>` that returns trigger. A view, a type, an operator or any other function that is not a member is always foreign, whatever its name.
    A table named like a table that the control plane or the C library reads (node, colocation, dist_table, bucket_map, map_version, local_node, the ledger
    tables, the timepart policy and so on) matches no pattern and is foreign; the patterns share no prefix with those names.
-2. The owner must be a superuser, or a role that owns a distributed table (`kingres.dist_table`) or a table of a distributed schema (`kingres.dist_schema`).
-   The first statement of Verify returns the owners that are not superusers; a second statement reads the two catalog tables of the extension. That read is
-   done only after checks 1 to 4 passed for everything else, so the catalog tables are members of the extension (a table of their name that is not a member is
-   refused by rule 1), and the schema belongs to a superuser and nobody else can create in it.
+2. The owner does not matter. A role that is not a superuser cannot create or rename anything in `kingres` (checks 2 and 3), so the owner adds no
+   information, and an owner test would turn ordinary flows into an untrusted database: the tenant drops or undistributes its last distributed table before
+   the cleanup of a move, the orphan stays under its owner, and a database that disappears from the listings makes a drain count zero buckets. A database that
+   cannot be verified is an error or "not readable" for the listings and the drain, never an empty one.
+3. The trigger function of a split must be what the extension makes: SECURITY DEFINER, language plpgsql, `proconfig` exactly `search_path=pg_catalog, pg_temp`.
+   The owner of the table owns the function and can ALTER it (SECURITY INVOKER, another search_path) without any CREATE privilege; any such change makes it
+   foreign.
+4. Only the schema `kingres` counts for the run-time objects, whichever schema the extension is in. For kingres_shard the schema `kingres` is always checked
+   (owner, ACL, foreign objects) as well as the schema in `pg_extension.extnamespace`, which is pg_catalog when the extension is created as the install script
+   expects; pg_catalog itself is never searched for foreign objects.
 
 Why check 4 still matters when checks 2 and 3 stop non-superusers from creating objects in `kingres`: a schema that a superuser made before the extension
 existed (an operator's mistake, or a restore), objects that `ALTER ... SET SCHEMA` moved in before the grants were fixed, a dump that restored objects into the
 schema, and objects made while an earlier version of the extension was installed. None of them is a member, and the service role reads names in that schema.
 The run-time rule only widens check 4 for what the extension itself makes, by name, kind and owner.
 
-Tests: a real install with a distributed table and an orphan, a split table, an old copy, a log with its identity sequence and a trigger function (superuser
+Tests: a real install with a distributed table and an orphan (also after the last distributed table is dropped, and for an orphan of any owner), a split table, an old copy, a log with its identity sequence and a trigger function (superuser
 and table owner) verifies as trusted; a non-member function or view with a run-time looking name, a function of the right name with another type, a table named like a
 catalog table, a sequence of no table and run-time objects of a role that owns no distributed table are refused; six mutants of the rule are killed.
