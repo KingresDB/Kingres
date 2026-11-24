@@ -5066,6 +5066,14 @@ export interface components {
         AbandonMapGroupBootstrapRequest: {
             /** @description Why the bootstrap is given up; it is kept in the journal of the bootstrap and in the audit event. */
             reason: string;
+            /**
+             * @description Added in 0.22.0. The operator declares that this server, to which the map group was handed (a hard failover of a live leader's server or a planned
+             *     switchover), is lost. It must not be heard by the cluster (409 `conflict` otherwise). The old leader then ends the hold of its primary without the word of that
+             *     server, when the hold was made for it (or has no record), every other server answers, none runs a bootstrap that names the old leader and none was promoted;
+             *     what the lost server may have promoted and acknowledged before it was lost is accepted with the declaration. A new request for the failover may then choose
+             *     another standby. It is part of the audit event.
+             */
+            lostServerId?: components["schemas"]["ServerId"];
         };
         AbandonMapGroupBootstrapResult: {
             /** @description True when a bootstrap was in progress and is given up; false when none was. */

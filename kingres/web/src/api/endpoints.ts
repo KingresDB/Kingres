@@ -621,7 +621,11 @@ export const endpoints = {
     j(api.GET('/failover/reports/{reportId}', { params: { path: { reportId } } })),
   resetAutoFailoverCounter: () => j(api.POST('/settings/cluster/auto-failover/reset')),
   abandonMapGroupBootstrap: (reason: string, lostServerId?: string) =>
-    j(api.POST('/failover/map/abandon', { body: lostServerId ? { reason, lostServerId } : { reason } })),
+    j(
+      api.POST('/failover/map/abandon', {
+        body: lostServerId ? { reason, lostServerId } : { reason },
+      }),
+    ),
 
   // --- tasks
   listTasks: (q: Page & { state?: TaskState; kind?: TaskKind } = {}) =>
