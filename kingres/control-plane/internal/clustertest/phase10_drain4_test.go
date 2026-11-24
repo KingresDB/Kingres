@@ -22,7 +22,7 @@ func p10d4Cluster(t *testing.T, rows int) *clustertest.Cluster {
 	t.Helper()
 	extra := append([]string{"-rebalance-retry-backoff", "1s", "-lease-duration", "12s", "-lease-renew", "2s", "-lease-margin", "3s"}, standbyArgs...)
 	c := p10Cluster(t, "rb", 12, rows, extra)
-	waitStandbys(t, c, 1)
+	waitStreamingStandbys(t, c, 10*time.Minute)
 	l := c.Leader()
 	until(t, 3*time.Minute, "every standby to be registered in the catalog", func() bool {
 		var n int
@@ -31,6 +31,32 @@ func p10d4Cluster(t *testing.T, rows int) *clustertest.Cluster {
 	})
 	p10Cleanup(t, c, "3s")
 	return c
+}
+
+// waitStreamingStandbys is waitStandbys with a bound of the caller: on PostgreSQL 19.0 under the load of a shared machine the standbys of a new cluster
+// were more than the three minutes of waitStandbys in coming up, before anything that these tests look at has begun.
+func waitStreamingStandbys(t *testing.T, c *clustertest.Cluster, bound time.Duration) {
+	t.Helper()
+	defer func() {
+		if t.Failed() {
+			t.Log(standbyLog(c))
+		}
+	}()
+	until(t, bound, "1 streaming standby in every group", func() bool {
+		if st, _ := c.Leader().Do("GET", "/replication/topology", nil, nil); st == 503 {
+			return false
+		}
+		top := topology(t, c.Leader())
+		if len(top) < len(c.Nodes) {
+			return false
+		}
+		for _, v := range top {
+			if len(v) != 1 || streamingCount(v) != 1 {
+				return false
+			}
+		}
+		return true
+	})
 }
 
 // p10d4Leader finds the node that is the manager leader now, asking every server that answers.
