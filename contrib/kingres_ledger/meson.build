@@ -114,6 +114,7 @@ tests += {
       't/037_attest_savepoints.pl',
       't/038_public_key_check.pl',
       't/039_signature_paths.pl',
+      't/040_columnar_refused.pl',
       't/041_schema_spoof.pl',
       't/042_catalog_trust.pl',
       't/043_old_script_schema_check.pl',
