@@ -664,6 +664,11 @@ export const endpoints = {
   applyGrantTemplate: (body: S['GrantTemplateRequest']) =>
     j(api.POST('/grants/template-applications', { body })),
   getNetworkAccess: () => j(api.GET('/settings/network-access')),
+  // --- escrow of the certificate authority key (0.26.0)
+  getCaEscrow: () => j(api.GET('/certificate-authority/escrow')),
+  setCaEscrow: (enabled: boolean) =>
+    j(api.PUT('/certificate-authority/escrow', { body: { enabled } })),
+  rotateCaEscrow: () => j(api.POST('/certificate-authority/escrow/rotations')),
   /** Replaces the rules: 202 + task (the answer of the real change). */
   replaceNetworkAccess: async (body: Omit<NetworkAccess, 'applyStatus'>): Promise<Task> =>
     (await j(api.PUT('/settings/network-access', { body }))) as Task,

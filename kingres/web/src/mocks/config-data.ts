@@ -132,7 +132,7 @@ const MANAGED: [string[], string][] = [
   ],
   [
     ['shared_preload_libraries'],
-    'KingresDB sets the extensions the cluster runs on (kingres_shard, kingres_ledger).',
+    'KingresDB sets the extensions the cluster runs on (kingres_shard, kingres_ledger, kingres_columnar, pg_stat_statements).',
   ],
   [
     [

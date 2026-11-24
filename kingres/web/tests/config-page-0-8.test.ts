@@ -16,7 +16,7 @@ import { renderApp } from './helpers'
 const row = async (name: string) => within(await screen.findByTestId(`param-${name}`))
 
 describe('the page and its tabs', () => {
-  it('is in the Cluster navigation after Settings, with three tabs', async () => {
+  it('is in the Cluster navigation after Settings, with four tabs', async () => {
     await renderApp('/configuration')
     expect(
       await screen.findByRole('heading', { level: 1, name: 'Configuration' }),
@@ -25,7 +25,7 @@ describe('the page and its tabs', () => {
     const links = nav.getAllByRole('link').map((a) => a.textContent?.trim())
     expect(links.indexOf('Configuration')).toBe(links.indexOf('Settings') + 1)
     const tabs = screen.getAllByRole('tab').map((t) => t.textContent)
-    expect(tabs).toEqual(['Parameters', 'Changes', 'Time'])
+    expect(tabs).toEqual(['Parameters', 'Changes', 'Time', 'Extensions'])
     expect(screen.getByRole('tab', { name: 'Parameters' })).toHaveAttribute('aria-selected', 'true')
     expect(screen.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', 'tab-parameters')
   })

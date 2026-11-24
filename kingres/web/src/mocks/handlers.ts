@@ -80,31 +80,46 @@ import {
 
 type S = components['schemas']
 
-// The escrow of the CA key in the mock: one recipient, the standby of the map group.
-const caEscrow = { enabled: false, generation: 0 }
+// The escrow of the CA key in the mock: one recipient, the standby of the map group; `?escrow=` shows the other states.
 function caEscrowStatus(): S['CaEscrowStatus'] {
-  const on = caEscrow.enabled
+  const e = mockConfig.caEscrow
+  const on = e.enabled
   const now = new Date().toISOString()
+  const copy = (
+    serverId: string,
+    state: S['CaEscrowRecipient']['state'],
+    error: string | null = null,
+  ): S['CaEscrowRecipient'] => ({
+    serverId,
+    state,
+    keyId: state === 'current' || state === 'dropPending' ? 'a1b2c3d4e5f60718' : null,
+    generation: state === 'current' || state === 'dropPending' ? e.generation : null,
+    sealedAt: state === 'current' || state === 'dropPending' ? now : null,
+    error,
+  })
+  const recipients: S['CaEscrowRecipient'][] = !on
+    ? e.scenario === 'dropping'
+      ? [copy('10.0.0.12', 'dropPending')]
+      : []
+    : e.scenario === 'refused'
+      ? [copy('10.0.0.12', 'refused', 'the internal API of the server answered 403')]
+      : e.scenario === 'pending'
+        ? [copy('10.0.0.12', 'pending')]
+        : e.scenario === 'standbys'
+          ? [copy('10.0.0.12', 'current'), copy('10.0.0.13', 'pending')]
+          : [copy('10.0.0.12', 'current')]
+  const complete = on && recipients.length > 0 && recipients.every((r) => r.state === 'current')
   return {
     enabled: on,
     holdsKey: true,
-    generation: caEscrow.generation,
-    recipients: on
-      ? [
-          {
-            serverId: '10.0.0.12',
-            state: 'current',
-            keyId: 'a1b2c3d4e5f60718',
-            generation: caEscrow.generation,
-            sealedAt: now,
-            error: null,
-          },
-        ]
-      : [],
-    complete: on,
-    message: on
-      ? 'Every server that can become leader holds a sealed copy of the CA key.'
-      : 'Escrow is off: a new manager leader has no CA key until an operator restores it by hand.',
+    generation: e.generation,
+    recipients,
+    complete,
+    message: !on
+      ? 'Escrow is off: a new manager leader has no CA key until an operator restores it by hand.'
+      : complete
+        ? 'Every server that can become leader holds a sealed copy of the CA key.'
+        : 'Not every server that can become leader holds the newest copy yet; the leader sends again.',
   }
 }
 
@@ -2504,7 +2519,24 @@ export function createHandlers(): HttpHandler[] {
       const b = body<S['AbandonMapGroupBootstrapRequest']>(c)
       if (typeof b.reason !== 'string' || b.reason.length === 0)
         throw problem('unprocessable', 'A reason is needed.')
-      if (failoverStatusView(c.s).phase === 'bootstrap')
+      const view = failoverStatusView(c.s)
+      // 0.28.0: a server declared lost must be the one the map group was handed to, and the cluster must not hear it (409 otherwise).
+      if (b.lostServerId !== undefined) {
+        const candidate = view.groups.find((g) => g.toServerId)?.toServerId ?? null
+        if (view.phase !== 'bootstrap' || b.lostServerId !== candidate)
+          throw problem(
+            'conflict',
+            `Server ${b.lostServerId} is not the server that the map group was handed to.`,
+          )
+        const rec = c.s.servers.find((x) => x.id === b.lostServerId)
+        if (!rec || effectiveStatus(rec) !== 'dead')
+          throw problem(
+            'conflict',
+            `Server ${b.lostServerId} is still heard by the cluster; it cannot be declared lost.`,
+          )
+        return ok({ abandoned: true } satisfies S['AbandonMapGroupBootstrapResult'])
+      }
+      if (view.phase === 'bootstrap')
         throw problem(
           'conflict',
           'The standby of the map group was promoted already; the bootstrap goes on to its end.',
@@ -2516,14 +2548,15 @@ export function createHandlers(): HttpHandler[] {
     setCaEscrow: (c) => {
       const req = body<S['CaEscrowUpdate']>(c)
       if (mockConfig.caUnavailable) throw problem('certificate_authority_unavailable')
-      if (req.enabled && !caEscrow.enabled) caEscrow.generation += 1
-      caEscrow.enabled = req.enabled
+      if (req.enabled && !mockConfig.caEscrow.enabled) mockConfig.caEscrow.generation += 1
+      mockConfig.caEscrow.enabled = req.enabled
       return ok(caEscrowStatus())
     },
     rotateCaEscrow: () => {
       if (mockConfig.caUnavailable) throw problem('certificate_authority_unavailable')
-      if (!caEscrow.enabled) throw problem('conflict')
-      caEscrow.generation += 1
+      if (!mockConfig.caEscrow.enabled)
+        throw problem('conflict', 'The escrow of the CA key is off; there is nothing to rotate.')
+      mockConfig.caEscrow.generation += 1
       return ok(caEscrowStatus())
     },
 

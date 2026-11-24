@@ -14,6 +14,7 @@ import SafeName from '@/components/SafeName.vue'
 import ParametersPanel from '@/components/config/ParametersPanel.vue'
 import ChangesPanel from '@/components/config/ChangesPanel.vue'
 import TimePanel from '@/components/config/TimePanel.vue'
+import ExtensionsPanel from '@/components/config/ExtensionsPanel.vue'
 import ConfigEditDialog from '@/components/config/ConfigEditDialog.vue'
 import RestartPendingDialog from '@/components/config/RestartPendingDialog.vue'
 import { useConfigServers } from '@/api/queries'
@@ -27,6 +28,7 @@ const TABS = [
   { id: 'parameters', label: 'Parameters' },
   { id: 'changes', label: 'Changes' },
   { id: 'time', label: 'Time' },
+  { id: 'extensions', label: 'Extensions' },
 ]
 const tab = computed({
   get: () => {
@@ -124,8 +126,11 @@ const restarting = ref(false)
   >
     <ChangesPanel @revert="reverting = $event" />
   </div>
-  <div v-else id="panel-time" role="tabpanel" aria-labelledby="tab-time">
+  <div v-else-if="tab === 'time'" id="panel-time" role="tabpanel" aria-labelledby="tab-time">
     <TimePanel />
+  </div>
+  <div v-else id="panel-extensions" role="tabpanel" aria-labelledby="tab-extensions">
+    <ExtensionsPanel />
   </div>
 
   <ConfigEditDialog v-if="editing !== null" :name="editing" @close="editing = null" />

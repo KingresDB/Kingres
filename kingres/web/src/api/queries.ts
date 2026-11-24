@@ -125,6 +125,7 @@ export const keys = {
   clusterRoles: ['clusterRoles'] as const,
   grants: ['grants'] as const,
   networkAccess: ['networkAccess'] as const,
+  caEscrow: ['caEscrow'] as const,
   audit: ['audit'] as const,
   clusterSettings: ['clusterSettings'] as const,
   dataExports: ['dataExports'] as const,

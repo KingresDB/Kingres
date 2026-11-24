@@ -72,6 +72,14 @@ export const mockConfig = {
   rejectCursors: false,
   /** True: the manager leader does not hold the CA key, so renew and revoke answer 503. */
   caUnavailable: false,
+  /** True: the value of `shared_preload_libraries` is shown (PostgreSQL hides it from an ordinary user), so the Extensions tab can say what is preloaded. */
+  preloadVisible: false,
+  /** 0.26.0: the escrow of the CA key; `scenario` shows its odd states (refused, pending, dropping) from the switch `?escrow=`. */
+  caEscrow: {
+    enabled: false,
+    generation: 0,
+    scenario: null as null | 'refused' | 'pending' | 'dropping' | 'standbys',
+  },
   /** True: the server runs without its internal API, so add, remove, leave, renew and revoke answer 409 `internal_api_disabled`. */
   internalApiDisabled: false,
   /**
