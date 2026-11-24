@@ -411,6 +411,7 @@ This revision is additive:
 #### Documentation
 
 - `AuditAction` describes the event. The command is not a REST operation.
+- `abandonMapGroupBootstrap`: the text of `lostServerId` now says "seen dead", who receives the proof, and the errors (409 or 503) of a declaration that releases nothing.
 
 ### 0.33.0
 

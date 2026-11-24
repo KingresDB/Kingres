@@ -185,7 +185,7 @@ func openLost(ctx context.Context, d *haDeps, caller string, b mapResumeBody) er
 	}{b.Lost})
 	if err := d.LostIdentityCheck(ctx, fwdproof.KindMapLost, caller, fr); err != nil {
 		if errors.Is(err, fwdproof.ErrUnavailable) {
-			return &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The keys of the administrators cannot be read here (this server has never cached them)."}
+			return &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The keys of the administrators are not available on this server: never cached, older than admin-keys-max-age, or of another cluster. Use the local command on this server (kingresd -release-map-hold)."}
 		}
 		return &internalapi.CallError{Status: http.StatusUnauthorized, Code: "identity_unproven", Message: "The identity of the declaration is not proven."}
 	}

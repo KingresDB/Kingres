@@ -501,6 +501,9 @@ func (s *Service) ResetMember(ctx context.Context) error {
 	if err := os.RemoveAll(s.PKIDir()); err != nil {
 		return err
 	}
+	if err := os.Remove(filepath.Join(s.cfg.DataDir, filepath.FromSlash(AdminKeysCacheFile))); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	return s.setup.Reset()
 }
 
@@ -522,3 +525,7 @@ func (s *Service) ApplyRules(ctx context.Context, rules []api.NetworkAccessRule,
 	}
 	return s.reloadAll(ctx)
 }
+
+// AdminKeysCacheFile is the path, from the data directory, of the cache of the administrators' keys that kingresd keeps for the declaration that a server is lost
+// (cmd/kingresd, adminkeys.go). It holds the keys of the cluster that the server belongs to, so it goes with the server's membership.
+const AdminKeysCacheFile = "failover/admin-keys.json"

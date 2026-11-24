@@ -77,6 +77,7 @@ type mapFailover struct {
 	// The parts of the resolution of a held-back primary that a test stands in for (nil: the real ones): the calls to other servers, the list of servers, the marker, the end of
 	// the hold, and the two ways of asking an instance whether it is in recovery.
 	liveOf          func(ctx context.Context, server string) string // the view of a server (nil: the planner's)
+	oldLeaderOf     func(ctx context.Context) (string, error)       // the server that the catalog names as the primary of the map group (nil: read from the catalog)
 	candidateRecord func() string                                   // the server that the hold was made for (nil: the record of the lease manager)
 	callPeer        func(ctx context.Context, server, method, path string, in, out any) error
 	memberList      func(ctx context.Context) ([]string, error)
@@ -924,79 +925,78 @@ func (m *mapFailover) Abandon(ctx context.Context, actor string, id internalapi.
 	if asked > 0 && failed == asked {
 		return failover.MapAbandonResult{}, problem.New(problem.ServiceUnavailable, "No other server of the cluster answered, so it is not known whether a bootstrap of the map group is in progress there.").WithRetryAfter(5)
 	}
+	if lostServer != "" {
+		return m.declareLost(ctx, id, lostServer)
+	}
 	// No bootstrap is in progress: a held-back old leader that nothing owns is started again (this server too).
 	var res failover.MapAbandonResult
-	var lastErr error
-	var notes []string
-	askedHeld := 0
 	for _, s := range members {
 		var out mapResumeAnswer
 		if s == m.self {
-			out.Resumed, out.Detail = m.resolveHeldBack(ctx, true, lostServer)
-			if lostServer != "" && m.isHeldBack() {
-				askedHeld++
-			}
-		} else {
-			body := mapResumeBody{Strict: true, Lost: lostServer}
-			if lostServer != "" {
-				// The declared server is not asked. The proof of the operator's session goes only to the server that says that its primary of the map group is held
-				// back (phase 5 review M-D, M1): it is the manager leader that was, and no other member receives it.
-				if s == lostServer {
-					continue
-				}
-				var held mapHeldAnswer
-				if err := m.call(ctx, s, http.MethodGet, "/failover/map/held", nil, &held); err != nil {
-					notes = append(notes, s+" does not answer")
-					continue
-				}
-				if !held.Held {
-					continue
-				}
-				askedHeld++
-				if err := m.signLost(id, &body, s); err != nil {
-					return failover.MapAbandonResult{}, problem.New(problem.ServiceUnavailable, "The session cannot prove the declaration to "+s+": "+err.Error()).WithRetryAfter(5)
-				}
-			}
-			if err := m.call(ctx, s, http.MethodPost, "/failover/map/resume", body, &out); err != nil {
-				lastErr = err
-				continue
-			}
+			out.Resumed, out.Detail = m.resolveHeldBack(ctx, true, "")
+		} else if err := m.call(ctx, s, http.MethodPost, "/failover/map/resume", mapResumeBody{Strict: true}, &out); err != nil {
+			continue
 		}
 		if out.Resumed {
 			res.ResumedServer = s
 			break
 		}
-		if out.Detail != "" && lostServer != "" {
-			notes = append(notes, s+": "+out.Detail)
-		}
-	}
-	if res.ResumedServer == "" && lostServer != "" {
-		// The operator declared a server lost: an answer that looks like success while nothing was released is wrong (phase 5 review M3).
-		switch {
-		case lastErr != nil:
-			return failover.MapAbandonResult{}, problem.New(problem.ServiceUnavailable, "The declaration that "+lostServer+" is lost did not reach the old leader of the map group: "+lastErr.Error()).WithRetryAfter(5)
-		case askedHeld == 0:
-			return failover.MapAbandonResult{}, problem.New(problem.ServiceUnavailable, "No server reported that its primary of the map group is held back, so nothing was released"+noteSuffix(notes)+". Try again once the old leader's kingresd answers; if its kingresd is stopped, use the local command on that server (kingresd -release-map-hold).").WithRetryAfter(5)
-		default:
-			return failover.MapAbandonResult{}, problem.New(problem.Conflict, "The old leader of the map group did not release its hold"+noteSuffix(notes)+".")
-		}
 	}
 	return res, nil
 }
 
-// noteSuffix is the reasons that servers gave, for an error message.
-func noteSuffix(notes []string) string {
-	if len(notes) == 0 {
-		return ""
+// oldLeaderOfTheMapGroup is the server that the catalog copy this server reads names as the primary of the map group: while a hand-over of the map group is not finished,
+// the old leader that is held back.
+func (m *mapFailover) oldLeaderOfTheMapGroup(ctx context.Context) (string, error) {
+	if m.oldLeaderOf != nil {
+		return m.oldLeaderOf(ctx)
 	}
-	out := " ("
-	for i, n := range notes {
-		if i > 0 {
-			out += "; "
+	_, host, err := (&mapPorts{m: m}).CatalogTerm(ctx)
+	return host, err
+}
+
+// declareLost is the operator's declaration that the server lost is lost (P2). The proof of the operator's session goes to one server only: the one that the catalog names
+// as the primary of the map group (the old leader, held back for the declared server), and only after that server itself says that its primary is held back. A member that
+// merely claims to be held back is not sent anything (phase 5 review M-D, F10). Every outcome that releases nothing is an error that says why (review M3, F4, F6).
+func (m *mapFailover) declareLost(ctx context.Context, id internalapi.ForwardIdentity, lost string) (failover.MapAbandonResult, error) {
+	old, err := m.oldLeaderOfTheMapGroup(ctx)
+	if err != nil || old == "" {
+		return failover.MapAbandonResult{}, problem.New(problem.ServiceUnavailable, "This server cannot read from the catalog which server ran the map group, so it does not know whom to send the declaration to. Try another server, or use the local command on the server of the old leader (kingresd -release-map-hold).").WithRetryAfter(5)
+	}
+	if old == lost {
+		return failover.MapAbandonResult{}, problem.New(problem.Conflict, "The catalog names "+lost+" as the primary of the map group: it is the leader that is gone, not a candidate that the group was handed to. Fail it over instead (failoverServer, mode hard).")
+	}
+	var out mapResumeAnswer
+	if old == m.self {
+		out.Resumed, out.Detail = m.resolveHeldBack(ctx, true, lost)
+		if out.Resumed {
+			return failover.MapAbandonResult{ResumedServer: old}, nil
 		}
-		out += n
+		return failover.MapAbandonResult{}, problem.New(problem.Conflict, "This server did not release its hold: "+out.Detail+".")
 	}
-	return out + ")"
+	var held mapHeldAnswer
+	if err := m.call(ctx, old, http.MethodGet, "/failover/map/held", nil, &held); err != nil {
+		return failover.MapAbandonResult{}, problem.New(problem.ServiceUnavailable, "The old leader of the map group ("+old+") does not answer: "+err.Error()+". Nothing was released. If its kingresd is stopped, use the local command on that server (kingresd -release-map-hold).").WithRetryAfter(5)
+	}
+	if !held.Held {
+		return failover.MapAbandonResult{}, problem.New(problem.ServiceUnavailable, "The old leader of the map group ("+old+") reports that its primary is not held back, so nothing was released. It may already have been released by an earlier call (then the cluster serves again: check GET /cluster); otherwise try again once its kingresd has marked the hold.").WithRetryAfter(5)
+	}
+	body := mapResumeBody{Strict: true, Lost: lost}
+	if err := m.signLost(id, &body, old); err != nil {
+		return failover.MapAbandonResult{}, problem.New(problem.ServiceUnavailable, "The session cannot prove the declaration to "+old+": "+err.Error()+" (a session without a SCRAM password, for example one that is mapped from another login, cannot; use the local command on the server of the old leader).").WithRetryAfter(5)
+	}
+	if err := m.call(ctx, old, http.MethodPost, "/failover/map/resume", body, &out); err != nil {
+		var ce *failover.CallError
+		if errors.As(err, &ce) && ce.Status >= 400 && ce.Status < 500 {
+			// The old leader refused the declaration (a proof that does not match its cached keys, a hold made for another server): retrying will not change it.
+			return failover.MapAbandonResult{}, problem.New(problem.Conflict, "The old leader of the map group ("+old+") refused the declaration: "+ce.Message+" If its cache of the administrators' keys is stale or older than admin-keys-max-age, use the local command on that server (kingresd -release-map-hold).")
+		}
+		return failover.MapAbandonResult{}, problem.New(problem.ServiceUnavailable, "The declaration that "+lost+" is lost did not reach the old leader of the map group ("+old+"): "+err.Error()).WithRetryAfter(5)
+	}
+	if !out.Resumed {
+		return failover.MapAbandonResult{}, problem.New(problem.Conflict, "The old leader of the map group ("+old+") did not release its hold: "+out.Detail+".")
+	}
+	return failover.MapAbandonResult{ResumedServer: old}, nil
 }
 
 // handleMapAbandon is the call of a server that was asked to give up the bootstrap: it acts on its own journal only.

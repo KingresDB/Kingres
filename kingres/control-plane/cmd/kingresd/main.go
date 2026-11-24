@@ -576,7 +576,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	hd.MapFailover = foDeps.mf
 	hd.IdentityCheck = newIdentityChecker(authn, serverHost)
 	// The declaration that a server is lost is checked at a held-back old leader against the administrators' keys that this server cached on disk (adminkeys.go).
-	adminKeyCache := openAdminKeys(filepath.Join(cfg.DataDir, "failover"))
+	adminKeyCache := openAdminKeys(filepath.Join(cfg.DataDir, "failover"), func() string { return node.Snapshot().ClusterID }, cfg.HA.AdminKeysMaxAge)
 	hd.LostIdentityCheck = newIdentityChecker(adminKeyCache, serverHost)
 	if svc.Enabled() {
 		wg.Add(1)

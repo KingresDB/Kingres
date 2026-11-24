@@ -304,6 +304,7 @@ func TestTheOperatorsAbandonCarriesTheLostServerToTheResumeCalls(t *testing.T) {
 	m, _ := abandonRig(t)
 	m.self = "s3"
 	m.memberList = func(context.Context) ([]string, error) { return []string{"s1", "s2", "s3", "s4"}, nil }
+	m.oldLeaderOf = func(context.Context) (string, error) { return "s4", nil } // the catalog names s4 as the primary of the map group
 	m.heldBack = func() bool { return false }
 	m.liveOf = func(_ context.Context, s string) string {
 		if s == "s2" {

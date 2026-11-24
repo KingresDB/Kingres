@@ -8507,9 +8507,13 @@ components:
           $ref: '#/components/schemas/ServerId'
           description: |
             Added in 0.28.0. The operator declares that this server, to which the map group was handed (a hard failover of a live leader's server or a planned
-            switchover), is lost. It must not be heard by the cluster (409 `conflict` otherwise). The old leader then ends the hold of its primary without the word of that
-            server, when the hold was made for it (or has no record), every other server answers, none runs a bootstrap that names the old leader and none was promoted;
-            what the lost server may have promoted and acknowledged before it was lost is accepted with the declaration. A new request for the failover may then choose
+            switchover), is lost. It must be seen dead by the cluster, that is silent for the failure timeout (409 `conflict` while it is heard, suspect or not known yet). The server that
+            answers sends the proof of the operator's session only to the old leader of the map group, the server that the catalog names as its primary, after that server says that
+            its primary is held back; the old leader checks it against the keys of the administrators that it cached while its system database ran. The old leader then ends the hold
+            of its primary without the word of that server, when the hold was made for it (or has no record), the lost server is seen dead again right before the release and does not
+            answer, every other server answers, none runs a bootstrap that names the old leader and none was promoted; what the lost server may have promoted and acknowledged
+            before it was lost is accepted with the declaration. A call that releases nothing is an error, never an empty success: 409 `conflict` when the old leader refuses (its
+            reason is in the message; a stale cache of the administrators' keys is one), 503 when no old leader answers, reports a hold or can be found. A new request for the failover may then choose
             another standby. It is part of the audit event.
     AbandonMapGroupBootstrapResult:
       type: object

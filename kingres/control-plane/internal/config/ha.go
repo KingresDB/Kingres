@@ -74,13 +74,18 @@ type HAConfig struct {
 	// leaves a primary that lost its lease running (phase 5 review L1), so a server that runs the lease protocol refuses to start
 	// without the program. The setting is for tests and for development machines only.
 	AllowNoWatchdog bool
+	// AdminKeysMaxAge is how old the cache of the administrators' keys may be before the declaration that a server is lost refuses it (0: no bound). The cache is
+	// refreshed every 30 seconds while the system database runs, so its age is how long this server could not read it. 72 hours is the longest hold that the REST
+	// declaration is meant to serve: beyond it the operator is expected to act on the server of the old leader (kingresd -release-map-hold), and a revoked administrator or an
+	// old password is not accepted for longer than that.
+	AdminKeysMaxAge time.Duration
 }
 
 // DefaultHA returns the built-in HA settings.
 func DefaultHA() HAConfig {
 	return HAConfig{
 		HeartbeatInterval: time.Second, SuspectTimeout: 5 * time.Second, FailureTimeout: 10 * time.Second, LeaderLossBound: 30 * time.Second,
-		LeaseDuration: 10 * time.Second, LeaseRenew: 2 * time.Second, LeaseMargin: 3 * time.Second,
+		AdminKeysMaxAge: 72 * time.Hour, LeaseDuration: 10 * time.Second, LeaseRenew: 2 * time.Second, LeaseMargin: 3 * time.Second,
 		StandbySyncGrace: 30 * time.Second, StandbyReplaceAfter: 30 * time.Minute, SlotWarnBytes: 1 << 30, SlotLimitBytes: 4 << 30,
 		ClientMaxConnections: 1000, ClientConnectTimeout: 5 * time.Second, ClientIdleTimeout: time.Hour,
 	}
@@ -169,6 +174,8 @@ func init() {
 			apply: haInt(func(c *Config) *int { return &c.HA.StandbyPortEnd }, 1024)},
 		setting{key: "slot-retention-limit-bytes", env: "KINGRES_SLOT_RETENTION_LIMIT_BYTES", usage: "WAL a standby's slot may retain before it is dropped (default 4294967296)",
 			apply: integer(func(c *Config) *int64 { return &c.HA.SlotLimitBytes }, 1)},
+		setting{key: "admin-keys-max-age", env: "KINGRES_ADMIN_KEYS_MAX_AGE", usage: "how old the cache of the administrators' keys may be before a declaration that a server is lost refuses it (default 72h; 0 means no bound)",
+			apply: dur(func(c *Config) *time.Duration { return &c.HA.AdminKeysMaxAge })},
 		setting{key: "allow-no-watchdog", env: "KINGRES_ALLOW_NO_WATCHDOG", usage: "true lets kingresd start without the lease watchdog program kingres-watchdog (default false; for tests and development only: a hung kingresd then leaves a primary that lost its lease running)",
 			apply: func(c *Config, v string) error {
 				b, err := strconv.ParseBool(v)

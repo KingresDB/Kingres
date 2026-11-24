@@ -20,7 +20,7 @@ func lostRig(t *testing.T, key []byte) (m *mapFailover, d *haDeps, cache *adminK
 	t.Helper()
 	m, _ = abandonRig(t) // the old leader is s2
 	m.self = "s1"
-	cache = openAdminKeys(t.TempDir())
+	cache = openAdminKeys(t.TempDir(), nil, 0)
 	if err := cache.Replace(map[string][]byte{"alice": scram.Stored(key)}); err != nil {
 		t.Fatal(err)
 	}
@@ -120,11 +120,11 @@ func TestTheCacheOfTheAdministratorsKeys(t *testing.T) {
 	if err := m.signLost(id, &b, "s2"); err != nil {
 		t.Fatal(err)
 	}
-	empty := &haDeps{ServerHost: "s2", LostIdentityCheck: newIdentityChecker(openAdminKeys(t.TempDir()), "s2")}
+	empty := &haDeps{ServerHost: "s2", LostIdentityCheck: newIdentityChecker(openAdminKeys(t.TempDir(), nil, 0), "s2")}
 	callErr(t, openLost(ctx, empty, "s1", b), 503, "unavailable")
 
 	// the file survives a restart of kingresd
-	reopened := openAdminKeys(filepath.Dir(cache.path))
+	reopened := openAdminKeys(filepath.Dir(cache.path), nil, 0)
 	if got, err := reopened.StoredKey(ctx, "alice"); err != nil || len(got) != sha256.Size {
 		t.Fatalf("the cache after a restart: %x %v", got, err)
 	}
