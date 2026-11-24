@@ -105,8 +105,8 @@ The rule is the narrowest one that lets these through:
 Why check 4 still matters when checks 2 and 3 stop non-superusers from creating objects in `kingres`: a schema that a superuser made before the extension
 existed (an operator's mistake, or a restore), objects that `ALTER ... SET SCHEMA` moved in before the grants were fixed, a dump that restored objects into the
 schema, and objects made while an earlier version of the extension was installed. None of them is a member, and the service role reads names in that schema.
-The run-time rule only widens check 4 for what the extension itself makes, by name, kind and owner.
+The run-time rule only widens check 4 for what the extension itself makes, by name, kind and, for the function, attributes.
 
 Tests: a real install with a distributed table and an orphan (also after the last distributed table is dropped, and for an orphan of any owner), a split table, an old copy, a log with its identity sequence and a trigger function (superuser
 and table owner) verifies as trusted; a non-member function or view with a run-time looking name, a function of the right name with another type, a table named like a
-catalog table, a sequence of no table and run-time objects of a role that owns no distributed table are refused; six mutants of the rule are killed.
+catalog table, a sequence of no table and a trigger function that was made SECURITY INVOKER or given another search_path are refused; six mutants of the rule are killed.
