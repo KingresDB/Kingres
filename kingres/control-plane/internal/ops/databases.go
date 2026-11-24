@@ -489,6 +489,7 @@ func (o *Ops) dropDB(ctx context.Context, p dropParams) error {
 		return err
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	// DROP DATABASE makes an immediate checkpoint first, so it takes as long as the checkpointer needs to write the dirty data of the instance (seconds after a load).
 	// WITH (FORCE) ends the sessions that are there, but a session that connects in the moment between that and the drop (the collector of the
 	// ledger reads every database) makes the drop fail with 55006: that is tried again a few times before the step fails.
 	var err2 error
