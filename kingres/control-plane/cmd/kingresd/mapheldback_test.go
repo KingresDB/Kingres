@@ -321,7 +321,7 @@ func TestTheOperatorsAbandonResumesAnOldLeaderThatNothingOwns(t *testing.T) {
 		}
 		return fmt.Errorf("unexpected %s", path)
 	}
-	res, err := m.Abandon(ctx, "ops", "stranded", "")
+	res, err := m.Abandon(ctx, "ops", opID, "stranded", "")
 	if err != nil || res.Abandoned || res.ResumedServer != "s1" {
 		t.Fatalf("%+v %v\n%v", res, err, calls)
 	}
@@ -334,7 +334,7 @@ func TestTheOperatorsAbandonResumesAnOldLeaderThatNothingOwns(t *testing.T) {
 		b, _ := json.Marshal(mapAbandonAnswer{})
 		return json.Unmarshal(b, out)
 	}
-	res, err = m.Abandon(ctx, "ops", "stuck", "")
+	res, err = m.Abandon(ctx, "ops", opID, "stuck", "")
 	if err != nil || !res.Abandoned || res.ResumedServer != "s1" {
 		t.Fatalf("%+v %v", res, err)
 	}
@@ -347,7 +347,7 @@ func TestTheOperatorsAbandonResumesAnOldLeaderThatNothingOwns(t *testing.T) {
 		b, _ := json.Marshal(mapAbandonAnswer{})
 		return json.Unmarshal(b, out)
 	}
-	if res, err = m.Abandon(ctx, "ops", "x", ""); err != nil || res != (failover.MapAbandonResult{}) {
+	if res, err = m.Abandon(ctx, "ops", opID, "x", ""); err != nil || res != (failover.MapAbandonResult{}) {
 		t.Fatalf("%+v %v", res, err)
 	}
 }

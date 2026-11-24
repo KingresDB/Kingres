@@ -167,7 +167,8 @@ type MapFailoverer interface {
 	TaskZero() (task.Task, bool)
 	Status() (failover.Status, bool)
 	// Abandon gives up the bootstrap of the map group that is in progress on this server or on a standby's server (F4-06): false when none is.
-	Abandon(ctx context.Context, actor, reason, lostServer string) (failover.MapAbandonResult, error)
+	// id is the identity of the operator's session: a declaration that a server is lost travels to the old leader with its proof.
+	Abandon(ctx context.Context, actor string, id internalapi.ForwardIdentity, reason, lostServer string) (failover.MapAbandonResult, error)
 }
 
 // mapFailoverIntercept answers the operations of the bootstrap of the map group on this server. It returns true when it answered.
@@ -232,7 +233,7 @@ func (s *Server) abandonMapGroupBootstrap(c *call, w http.ResponseWriter, r *htt
 	if mf == nil {
 		return problem.New(problem.UnsupportedOp, "This server cannot give up a bootstrap of the map group (no managed instance or no internal API).")
 	}
-	res, err := mf.Abandon(r.Context(), c.session.Username, reason, strings.TrimSpace(req.LostServerID))
+	res, err := mf.Abandon(r.Context(), c.session.Username, identityOf(c.session), reason, strings.TrimSpace(req.LostServerID))
 	if err != nil {
 		return s.failoverProblem(r, err)
 	}

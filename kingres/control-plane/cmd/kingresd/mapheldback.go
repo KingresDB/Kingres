@@ -4,6 +4,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,7 +14,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/auth"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fwdproof"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
 )
@@ -124,12 +128,68 @@ func (m *mapFailover) localStandbyState(ctx context.Context) string {
 // mapResumeBody is the request of POST /failover/map/resume: Strict asks for the evidence of an operator's call (every server of the cluster must answer).
 type mapResumeBody struct {
 	Strict bool `json:"strict,omitempty"`
-	// Lost is the server that the operator declared lost (P2); the hold is ended without its word.
-	Lost string `json:"lost,omitempty"`
+	// Lost is the server that the operator declared lost (P2); the hold is ended without its word. The declaration is accepted only with the
+	// proof of the operator's session (Username, Roles, RequestID, Proof), made for the receiving server and checked against the copy of the
+	// system database that it holds; the roles must allow kingres_admin (phase 5 review L2).
+	Lost      string          `json:"lost,omitempty"`
+	Username  string          `json:"username,omitempty"`
+	Roles     []string        `json:"clusterRoles,omitempty"`
+	RequestID string          `json:"requestId,omitempty"`
+	Proof     *fwdproof.Proof `json:"proof,omitempty"`
+}
+
+// lostMessage is what the proof of a declaration covers: the kind, the two servers, the user and roles, the operation and the declared server.
+func lostMessage(from, to string, b mapResumeBody) fwdproof.Message {
+	raw, _ := json.Marshal(struct {
+		Lost string `json:"lost"`
+	}{b.Lost})
+	return internalapi.ForwardRequest{Identity: internalapi.ForwardIdentity{Username: b.Username, ClusterRoles: b.Roles}, OperationID: "abandonMapGroupBootstrap",
+		ContentType: "application/json", Body: raw, RequestID: b.RequestID}.ProofMessage(fwdproof.KindMapLost, from, to)
+}
+
+// signLost adds the proof of the operator's session for the old leader to.
+func (m *mapFailover) signLost(id internalapi.ForwardIdentity, b *mapResumeBody, to string) error {
+	var nonce [8]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return err
+	}
+	b.Username, b.Roles, b.RequestID = id.Username, id.ClusterRoles, hex.EncodeToString(nonce[:])
+	p, err := fwdproof.Sign(id.ProofKey, lostMessage(m.self, to, *b), time.Now())
+	if err != nil {
+		return err
+	}
+	b.Proof = &p
+	return nil
+}
+
+// openLost checks the proof of a declaration that a server is lost: the operator's session must prove itself over exactly these bytes and hold
+// kingres_admin.
+func openLost(ctx context.Context, d *haDeps, caller string, b mapResumeBody) error {
+	if b.Proof == nil || b.Username == "" {
+		return &internalapi.CallError{Status: http.StatusUnauthorized, Code: "identity_unproven", Message: "The declaration that a server is lost comes with the proof of the operator's session."}
+	}
+	if d.IdentityCheck == nil {
+		return &internalapi.CallError{Status: http.StatusUnauthorized, Code: "identity_unproven", Message: "This server cannot check the proof of a session."}
+	}
+	fr := internalapi.ForwardRequest{Identity: internalapi.ForwardIdentity{Username: b.Username, ClusterRoles: b.Roles}, OperationID: "abandonMapGroupBootstrap",
+		ContentType: "application/json", RequestID: b.RequestID, Proof: b.Proof}
+	fr.Body, _ = json.Marshal(struct {
+		Lost string `json:"lost"`
+	}{b.Lost})
+	if err := d.IdentityCheck(ctx, fwdproof.KindMapLost, caller, fr); err != nil {
+		if errors.Is(err, fwdproof.ErrUnavailable) {
+			return &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The identity cannot be checked now."}
+		}
+		return &internalapi.CallError{Status: http.StatusUnauthorized, Code: "identity_unproven", Message: "The identity of the declaration is not proven."}
+	}
+	if !auth.Allows(auth.Normalize(b.Roles), auth.RoleAdmin) {
+		return &internalapi.CallError{Status: http.StatusForbidden, Code: "forbidden", Message: "Declaring a server lost needs the role kingres_admin."}
+	}
+	return nil
 }
 
 // handleMapResume asks this server to resolve the hold of its primary of the map group. The caller is any member: the callee proves what it needs itself.
-func handleMapResume(ctx context.Context, d *haDeps, _ string, body []byte) (any, error) {
+func handleMapResume(ctx context.Context, d *haDeps, caller string, body []byte) (any, error) {
 	mf := d.MapFailover
 	if mf == nil {
 		return nil, notStarted
@@ -138,6 +198,11 @@ func handleMapResume(ctx context.Context, d *haDeps, _ string, body []byte) (any
 	if len(body) > 0 {
 		if err := json.Unmarshal(body, &b); err != nil {
 			return nil, badBody("a resume request")
+		}
+	}
+	if b.Lost != "" {
+		if err := openLost(ctx, d, caller, b); err != nil {
+			return nil, err
 		}
 	}
 	resumed, detail := mf.resolveHeldBack(ctx, b.Strict, b.Lost)
