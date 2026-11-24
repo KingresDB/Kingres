@@ -483,6 +483,19 @@ sub split_pid
 	is(split_locks(), '0', 'G2: and leaves no lock');
 }
 {
+	# G2b. the same inside one session, which is what a pooled connection is: an error at each of the points, caught by the caller, leaves the session holding no lock
+	# (a lock that stayed would be let go only when the connection ends, which the test above cannot tell from the end of the psql process)
+	for my $point ('split_after_begin', 'split_after_mark', 'split_after_preparing', 'split_after_triggers')
+	{
+		is(q1($n1, qq{SET kingres_shard.fault_injection = '$point:error';
+			DO \$\$ BEGIN PERFORM kingres.split_bucket($C, 5, 2); EXCEPTION WHEN OTHERS THEN NULL; END \$\$;
+			RESET kingres_shard.fault_injection;
+			SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted AND pid = pg_backend_pid()}), '0', "G2b: an error at $point leaves the session without a lock");
+		ok($n1->poll_query_until('postgres', q{SELECT phase = 'failed' FROM kingres.bucket_split ORDER BY split_id DESC LIMIT 1}), "G2b: $point: the record is undone");
+	}
+	is(q1($n1, "SELECT state FROM kingres.bucket_map WHERE colocation_id = $C AND bucket = 5"), 'active', 'G2b: the bucket is active');
+}
+{
 	# G3. a second split of the group waits for the lock of the first (which is between its record and its mark), then finds the group being split: it neither hangs nor splits twice
 	my ($pid, $file) = stopped('split_after_begin', "SELECT kingres.split_bucket($C, 6, 2)", 'g3a');
 	ok(wait_for_fault_file("$file.reached", 60), 'G3: a split of bucket 6 waits between its record and its live mark');
