@@ -4,7 +4,9 @@ package pgtest
 
 import (
 	"os"
+	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"testing"
 )
@@ -59,7 +61,7 @@ func scriptVar(t *testing.T, src, name string) int {
 // ports STANDBY_LO + N*STANDBY_SIZE ..+STANDBY_SIZE-1. No two runs may share a port of either kind, a standby port may
 // not be a slice port of any run, and none may reach the range the kernel hands out to outgoing connections.
 func TestRunPortRangesNeverOverlap(t *testing.T) {
-	b, err := os.ReadFile("../../scripts/run-wsl-tests.sh")
+	b, err := readRunScript()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,4 +103,25 @@ func TestRunPortRangesNeverOverlap(t *testing.T) {
 			t.Errorf("run-wsl-tests.sh lacks %q", want)
 		}
 	}
+}
+
+// readRunScript finds scripts/run-wsl-tests.sh: beside this source (the path the compiler recorded), then relative to the
+// working directory, then in KINGRES_TEST_BIN/src, where run-integration.ps1 stages a copy for a prebuilt test binary.
+func readRunScript() ([]byte, error) {
+	var paths []string
+	if _, self, _, ok := runtime.Caller(0); ok {
+		paths = append(paths, filepath.Join(filepath.Dir(self), "..", "..", "scripts", "run-wsl-tests.sh"))
+	}
+	paths = append(paths, filepath.Join("..", "..", "scripts", "run-wsl-tests.sh"))
+	if bin := os.Getenv("KINGRES_TEST_BIN"); bin != "" {
+		paths = append(paths, filepath.Join(bin, "src", "run-wsl-tests.sh"))
+	}
+	var err error
+	for _, p := range paths {
+		var b []byte
+		if b, err = os.ReadFile(p); err == nil {
+			return b, nil
+		}
+	}
+	return nil, err
 }
