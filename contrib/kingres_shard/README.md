@@ -2745,8 +2745,11 @@ run `SELECT kingres.resume_bucket_moves()` on the map group primary. The recover
 worker of the map group primary does it, and calls `cleanup_moved_buckets()` after it,
 every `kingres_shard.recovery_interval` once it has resolved the prepared transactions
 (review finding S4-02; with the interval at 0 nobody does, and `check_cluster()`
-reports a `stalled_move`). A move in *preparing* is recorded a moment before its
-session takes the live mark, so it too is left alone for `2 x node_timeout`. A move in *switching* is decided by the two-phase commit: the phase
+reports a `stalled_move`). The record of a move is written and committed by a session of its own, and the caller takes the live mark afterwards. Between the two the session holds a
+lock of (colocation group, bucket) that nothing else takes (kept from before the record is written until the mark is held), and the recovery looks at it before the mark, so a move in
+*preparing* is alive however long its session stalls (the grace of `2 x node_timeout` after the last update stays as a second guard, and it is what protects a *switching* move). Both locks are bounded: a wait gives up after `kingres_shard.node_timeout`
+seconds with `object_in_use`, and `move_bucket()` lets go of both in one handler on every way out, an error or a cancel included (fault points `move_after_begin` and `move_after_mark`;
+`t/282_move_start_lock.pl`; a second cancel during the undo, a lock taken twice and a starter that dies between the record and the mark are tested there too). The lock of the start covers the newest record of the bucket only. A move in *switching* is decided by the two-phase commit: the phase
 becomes *cleaning* in the same transaction as the bucket map, so a *switching* row
 after a crash is a switch that did not commit. `resume` waits `2 x
 kingres_shard.node_timeout` after the last update before it undoes such a move, so
@@ -2757,6 +2760,30 @@ as a superuser or a role that was granted `SELECT` on it, `kingres.bucket_move` 
 also holds `detail`, the last error with the text of remote errors and node
 addresses, and the slot and subscription names; review finding S4-07);
 `cancel_bucket_move()` stops a running move.
+
+### An old copy that objects of its owner depend on
+
+The old copy of a moved bucket (and the old partition of a split) waits in schema `kingres` as an orphan table until the cleanup drops it. The owner of a distributed table can make
+objects that depend on one of its bucket partitions, with the statements that the extension does not refuse on one (a view or a materialized view that selects from it, a table
+with a foreign key to it, a function that takes its row type; a trigger, a rule, a policy, an index or a change of the table are refused, `t/283` E). Those objects stay with the
+old copy after the move, and a plain `DROP TABLE` refuses a table that something depends on (before this version the cleanup failed with that error at every pass and the move stayed
+in *cleaning* without a word).
+
+What the cleanup does: it **never drops what the owner made**. It does not use `CASCADE`, because that would drop the view, the materialized view with its rows, the table or the function
+of a tenant as a superuser, and the cleanup cannot know what a cascade reaches. (A plain `DROP TABLE` removes only what belongs to the table itself, its indexes, constraints, triggers,
+rules, policies, statistics, comments, privileges and its membership in a publication; it runs none of it, so no code of the owner runs as a superuser, and the event triggers that run at a
+`DROP` are those of a superuser.) An orphan with such dependents is left as it is, the other orphans of the move are dropped, and the move (or split) stays in *cleaning* with the reason
+in its record: `kingres.bucket_move.detail` (`kingres.bucket_split.detail`) reads `the old copy cannot be dropped, objects of its owner depend on it: <object> depends on <table>; ...`.
+`kingres.check_cluster()` reports it as `orphan_blocked` (object `bucket move <id>` or `bucket split <id>`, the same text), next to the `orphan_table` that says the orphan is overdue.
+The cleanup and the recovery worker do not warn and do not fail: they leave it and look again at every pass. The owner (or an operator, as the owner or as a superuser) drops the dependents,
+and the next pass of `cleanup_moved_buckets()` / `cleanup_bucket_splits()` or of the worker drops the orphan and finishes the move. A superuser who wants the orphan gone at once
+drops the dependents or the orphan with `CASCADE` by hand, knowing what is reached. `t/283_orphan_dependents.pl` has the four kinds of dependent on a move, the record and the check, the
+owner dropping them one by one, the worker's pass, and the same for a split.
+The orphans of one move are dropped in rounds (a foreign key between two of them is resolved), and a move or split is called *done* only when no orphan is left, not when the
+list of dependents is empty: an orphan that is still there with nothing to name is reported as "N orphan table(s) are still there and the DROP was refused". The list of dependents
+covers the table, its leaves, its indexes and its row type with the array type of it. Known limits: the tenant owns the orphan, so a view on it keeps the whole copy on the source node
+for as long as the view exists (the check says so; there is no age limit), and the tenant can keep reading it; a tenant that moves the orphan out of schema `kingres` takes it out of the
+cleanup's sight (not new). A schema move does not drop tables (it empties the shells), so it has no such dependents.
 
 The helper functions `kingres.internal_placement_hash()` and
 `kingres.internal_map_version()` are called by the sessions of other nodes, which
@@ -2771,7 +2798,7 @@ On the map group primary, superuser: per active primary node `catalog_differs` (
 version counter is not compared), `partition_missing` (a bucket's partition absent
 on its owner), `partition_misplaced` (attached where the group does not own the
 bucket), `stray_bucket_table` (a table with the name of a bucket partition that is not
-attached), `orphan_table` (no record, a move that is not cleaning, or overdue by
+attached), `orphan_blocked` (an orphan table that objects of its owner depend on: the cleanup leaves it and says which, see "An old copy that objects of its owner depend on"), `orphan_table` (no record, a move that is not cleaning, or overdue by
 `2 x (node_timeout + recovery_interval)` after its cleanup time), `stalled_move` (a
 move in a phase before *done* that no session runs and that nobody has touched for that
 long, or a *cleaning* move that is overdue by it: the worker would resolve it, or

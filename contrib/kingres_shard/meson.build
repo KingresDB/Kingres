@@ -356,6 +356,8 @@ tests += {
       't/280_runtime_objects_owner.pl',
       't/278_schema_spoof.pl',
       't/281_dist_timepart.pl',
+      't/282_move_start_lock.pl',
+      't/283_orphan_dependents.pl',
     ],
   },
 }
