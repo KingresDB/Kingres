@@ -89,6 +89,8 @@ type Leader struct {
 	underFor map[int32]int
 	// alertedOld are the servers with a raised oldPrimaryNotRebuilt (so that the alert is cleared when the cause is gone).
 	alertedOld map[string]bool
+	// early are the standbys whose entry goes out as Ready before the record is ready (see markReady).
+	early map[int64]bool
 }
 
 // NewLeader prepares the leader's side; Run starts it.
@@ -97,6 +99,7 @@ func NewLeader(l *Leader) *Leader {
 	l.kick = make(chan struct{}, 1)
 	l.lastTry = map[int64]time.Time{}
 	l.underFor = map[int32]int{}
+	l.early = map[int64]bool{}
 	if l.Interval == 0 {
 		l.Interval = 10 * time.Second
 	}
@@ -638,7 +641,13 @@ func (l *Leader) buildPlan(ctx context.Context, version int64) (PlanRequest, top
 			continue // a standby on its way out is not named any more
 		}
 		if g, ok := t.group(r.Group); ok {
-			p.Standbys = append(p.Standbys, r.Entry(g.Port))
+			e := r.Entry(g.Port)
+			l.mu.Lock()
+			if l.early[r.ID] {
+				e.Ready = true
+			}
+			l.mu.Unlock()
+			p.Standbys = append(p.Standbys, e)
 		}
 	}
 	return p, t, nil
@@ -778,12 +787,33 @@ func (l *Leader) createStandby(ctx context.Context, env *task.Env, e Entry) erro
 		_ = l.call(ctx, e.Server, CallRemove, RemoveRequest{Entry: entry}, nil)
 		return nil
 	}
-	if err := l.st.setState(ctx, rec.ID, stateReady, res.Port); err != nil {
+	if err := l.markReady(ctx, rec, g.Primary, res.Port); err != nil {
 		return err
 	}
 	_ = env.SetDetail(ctx, "")
 	l.audit(ctx, env, "standbyCreated", entry, audit.OutcomeSuccess, map[string]any{"port": res.Port})
 	return l.publish(ctx)
+}
+
+// markReady makes the standby of rec ready. The order is the safety rule: a standby a failover may use (a record in the
+// state ready, which Preflight needs) must never exist while the primary's server does not know it as ready, because
+// that server arms the lease fence of the group only from a ready entry (Agent.HasStandby). So the list with the entry
+// as Ready goes to the primary's server first and has to be taken (the call fails otherwise), and only then does the
+// record change. The entry stays Ready in every list the leader builds until the record is written, so that a list
+// of another task in between does not take it back.
+func (l *Leader) markReady(ctx context.Context, rec Record, primary string, port int) error {
+	l.mu.Lock()
+	l.early[rec.ID] = true
+	l.mu.Unlock()
+	defer func() {
+		l.mu.Lock()
+		delete(l.early, rec.ID)
+		l.mu.Unlock()
+	}()
+	if err := l.publish(ctx, primary); err != nil {
+		return err
+	}
+	return l.st.setState(ctx, rec.ID, stateReady, port)
 }
 
 func (l *Leader) removeStandby(ctx context.Context, env *task.Env, e Entry) error {
@@ -883,7 +913,7 @@ func (l *Leader) rebuildStandby(ctx context.Context, env *task.Env, e Entry) err
 			}
 		}
 	}
-	if err := l.st.setState(ctx, rec.ID, stateReady, res.Port); err != nil {
+	if err := l.markReady(ctx, rec, g.Primary, res.Port); err != nil {
 		return err
 	}
 	if rec.Diverged {

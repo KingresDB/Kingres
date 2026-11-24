@@ -144,9 +144,19 @@ func (a *Agent) List(context.Context) ([]ha.Standby, error) {
 	return out, nil
 }
 
-// HasStandby implements ha.Standbys from the local copy of the list.
+// HasStandby implements ha.Standbys from the local copy of the list. It is true when a standby exists that a failover
+// may use: an entry that is Ready, or one that was ready once and is being rebuilt (generation above 0: the old primary
+// of a failover, or a standby in a rebuild, keep the fence of the group). A standby that is still being created is not
+// counted: nothing can be promoted to it, so a lost lease would stop the only copy for no gain. The leader makes a
+// record ready only after this server took a list with the entry Ready (Leader.markReady), so the fence is armed
+// before a failover can choose the standby.
 func (a *Agent) HasStandby(group int32) bool {
-	return len(a.local.snapshot().entriesOfGroup(group)) > 0
+	for _, e := range a.local.snapshot().entriesOfGroup(group) {
+		if e.Ready || e.Generation > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *Agent) mgr() *instance.Manager { return a.Svc.Manager() }

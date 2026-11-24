@@ -2169,8 +2169,11 @@ What exists (design `ha-phase5.md`, "Fencing by lease"; code in `internal/lease`
   the start at kingresd's own start is skipped with a warning; decision 7 adds the wait marker for a cold start). The next successful round removes the marker, starts
   the instance and audits `leaseAcquired`. The marker is on disk, so a restart of kingresd or of the machine does not
   start the primary without a lease either.
-- **Enforcement rule (decided).** Self-fencing is enforced only for a group that has at least one standby (the standby
-  manager answers `Standbys().HasStandby(group)` from local knowledge). For a group without a standby nothing could be
+- **Enforcement rule (decided).** Self-fencing is enforced only for a group that has at least one standby a failover may use (the standby
+  manager answers `Standbys().HasStandby(group)` from local knowledge: a `ready` entry of the list, or one in a rebuild; a
+  standby that is still being created does not count, so a primary is not fenced while the first copy of it is made, when
+  nothing could be promoted anyway). The leader makes a record `ready` only after the primary's server took a list with the entry
+  `ready`, so the fence is armed before a failover can choose the standby. For a group without a standby nothing could be
   promoted, so stopping the only copy would cost availability and buy nothing: the lease is still acquired, renewed and
   reported, and its loss raises the alert `leaseLost` (critical, subject `server:<id>|group:<n>`) and the audit event
   `leaseLost`, without stopping the instance for a lapsed lease (only a `kingresd` that stopped running, through the watchdog file that is refreshed by a loop of its own, F2-07). A one-server cluster has one member and a majority of one: it grants itself
@@ -2559,7 +2562,7 @@ the store's epoch check refuses it.
 
 1. **Heartbeats are all-to-all and measured on the receiver** with a monotonic clock; nothing but durations ever crosses the wire. `dead` and `suspect` are the answering server's view.
 2. **A follower distrusts its cache after `leader-loss-bound` (30 s)** for session-authorized requests (503 `leader_unavailable`); a shorter blip changes nothing, probes and the leader itself are exempt.
-3. **Self-fencing is enforced only for a group that has a standby** (decided by the coordinator); a group without one only raises `leaseLost`. A one-server cluster grants itself.
+3. **Self-fencing is enforced only for a group that has a ready standby (or one in a rebuild)** (decided by the coordinator); a group without one only raises `leaseLost`. A one-server cluster grants itself.
 4. **The watchdog is started by kingresd next to the running instance**, not as its parent, so every existing start, stop, restart, reload and leave path is unchanged. It watches a sequence number, not a time of day.
 5. **The cross-server leg of the client entry point goes to the other server's entry point**, not its instance (the instances refuse client addresses of peers); the local leg is TCP loopback because TLS is impossible on a unix socket. The instance therefore sees a proxy address (see "The client entry point").
 6. **Cancel is local to the server that runs the statement** and is not forwarded; a client chooses the statement id; no pid comes from a client.
