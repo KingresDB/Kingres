@@ -495,7 +495,7 @@ func TestDatabaseImportRefusesAnExtraRelationInADistributedSchema(t *testing.T) 
 // import cannot go on; what must hold is the end state: the task ends (done or failed) on the new leader, a failed import leaves no private database and no final database on
 // any server that is alive, and a finished one has every row. Never half applied. One cluster per case: the lost server does not come back.
 func TestDatabaseImportAfterTheFailoverOfTheLeader(t *testing.T) {
-t.Skip("known bug (suspected): after the failover of the map group that was lost together with an import's leader, the failover does not end within 15 minutes in 22 of 24 runs on PostgreSQL 18 and 19 while the private database kingres_import_<id> of the import exists; the new leader logs the refusal KS010 (the node was promoted and the catalog has not recognised the promotion) for that database every round. Remove this skip when it is fixed")
+	t.Skip("known bug (suspected): after the failover of the map group that was lost together with an import's leader, the failover does not end within 15 minutes in 22 of 24 runs on PostgreSQL 18 and 19 while the private database kingres_import_<id> of the import exists; the new leader logs the refusal KS010 (the node was promoted and the catalog has not recognised the promotion) for that database every round. Remove this skip when it is fixed")
 	cases := []struct {
 		step  string
 		index int
