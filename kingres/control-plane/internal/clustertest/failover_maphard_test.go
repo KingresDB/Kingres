@@ -497,3 +497,52 @@ func checkSwitchPoint(t *testing.T, ps []writeProbe, leader *clustertest.Node, t
 		t.Errorf("an acknowledged commit is not in the new history: the old primary acknowledged up to %s and the new timeline began at %s", failover.FormatLSN(ps[0].ackLsn), failover.FormatLSN(switchLsn))
 	}
 }
+
+// P2. The candidate takes the lease and dies before it promotes (its promoting call never answers and then its server is killed): the old leader's primary is stopped and
+// held back for a server that cannot answer. Without the declaration the hold stays; with it (naming the dead server) the old leader ends the hold and serves the map group
+// again, and no acknowledged row is lost.
+func TestADeadCandidateDeclaredLostReleasesTheOldLeader(t *testing.T) {
+	c, port, pool, leader, nw, w := mapSwitchoverEnv(t)
+	var third *clustertest.Node
+	for _, n := range c.Nodes {
+		if n != leader && n != nw {
+			third = n
+		}
+	}
+	nw.SetFaults(fault.Spec{FailoverPoint: "promote:unavailable", FailoverMode: "unavailable"})
+	_ = mapHardRequest(t, leader, nw, true)
+	mapStopped(t, leader)
+	until(t, 3*time.Minute, "the candidate to hold the lease and wait for its promotion", func() bool {
+		s, b := nw.Do("GET", "/failover", nil, nil)
+		return s == 200 && b["state"] == "running"
+	})
+	foKillServer(nw)
+	mapLogin(t, third)
+	// the cluster has to see the server dead first: until then the declaration is refused (409), and without it nothing resumes the old leader
+	var st int
+	var body map[string]any
+	until(t, 5*time.Minute, "the declaration to be accepted", func() bool {
+		st, body = third.Do("POST", "/failover/map/abandon", map[string]any{"reason": "the candidate died", "lostServerId": nw.Host}, nil)
+		return st != 409 && st != 503
+	})
+	if st != 200 {
+		t.Fatalf("the declaration: %d %v", st, body)
+	}
+	if body["resumedServerId"] != leader.Host {
+		t.Fatalf("the old leader was not resumed: %v\n%s", body, quietLog(leader.LogTail(30000)))
+	}
+	until(t, 5*time.Minute, "the old leader to hold the map group again", func() bool {
+		hosts, _ := primaryOf(t, leader)
+		return hosts[0] == leader.Host
+	})
+	before := w.count()
+	until(t, 5*time.Minute, "writes after the release", func() bool { return w.count() > before+30 })
+	acked := w.Stop()
+	have := foReadIDs(t, leader, port, pool)
+	for rid := range acked {
+		if !have[rid] {
+			t.Errorf("acknowledged row %d is missing when read through %s", rid, leader.Host)
+			break
+		}
+	}
+}
