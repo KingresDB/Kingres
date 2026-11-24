@@ -139,7 +139,20 @@ func TestUploadLifecycle(t *testing.T) {
 	}
 
 	// Resume at the offset the server holds; the second chunk of two segments, then the last.
-	if st, h, out := e.chunk(id, seg, data[seg:3*seg]); st != 204 || h.Get("Upload-Offset") != strconv.Itoa(3*seg) {
+	// The offset shows as soon as the first segment is on the disk, while the abandoned request may still be closing the file (truncate,
+	// sync, close) and holds the writer of the upload; a resume in that window is answered 409 "Another request is writing this upload",
+	// which a client retries. The test retries the same way, for a bounded time.
+	var st int
+	var h http.Header
+	var out map[string]any
+	for i := 0; i < 100; i++ {
+		st, h, out = e.chunk(id, seg, data[seg:3*seg])
+		if detail, _ := out["detail"].(string); st != 409 || !strings.Contains(detail, "Another request is writing") {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if st != 204 || h.Get("Upload-Offset") != strconv.Itoa(3*seg) {
 		t.Fatalf("resume: %d %v %v", st, h, out)
 	}
 	// A second request at the same offset loses.

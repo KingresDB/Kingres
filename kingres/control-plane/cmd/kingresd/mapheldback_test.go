@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -442,10 +441,7 @@ func TestTheLifecycleLockIsHeldUntilTheLeaseIsLetGoOf(t *testing.T) {
 
 // F7-04 (M18b). The loop that resolves a hold is started by kingresd: a test of the wiring, since the loop tests call it directly.
 func TestTheLoopThatResolvesAHoldIsStartedByMain(t *testing.T) {
-	src, err := os.ReadFile("main.go")
-	if err != nil {
-		t.Fatal(err)
-	}
+	src := readSource(t, "main.go")
 	if !strings.Contains(string(src), "MapFailover.WatchHeldBack(") {
 		t.Fatal("main.go does not start WatchHeldBack")
 	}
@@ -544,10 +540,7 @@ func TestEachRuleThatKeepsAHoldSaysItsReason(t *testing.T) {
 
 // F7-02. The promoting call consults the journal of the bootstrap (a test of the wiring: the handler needs a whole server to run).
 func TestThePromotingCallConsultsTheJournalOfTheBootstrap(t *testing.T) {
-	src, err := os.ReadFile("failover.go")
-	if err != nil {
-		t.Fatal(err)
-	}
+	src := readSource(t, "failover.go")
 	if !strings.Contains(string(src), "promoteBlockedByJournal(d.MapFailover, r.Group)") {
 		t.Fatal("handleFailoverPromote does not ask the journal of the bootstrap")
 	}
