@@ -632,7 +632,8 @@ func sysExec(t *testing.T, c *pgx.Conn, sql string) {
 }
 
 // What kingres_shard leaves in the schema kingres while a bucket moves, splits or drains (the orphan of a move and of a split, the old copy of a rebuilt table,
-// the log of a table operation, the trigger function of a split) is not a member of the extension and is accepted by name, kind and owner; nothing else is.
+// the log of a table operation, the trigger function of a split) is not a member of the extension and is accepted by name, kind and, for the function, attributes;
+// nothing else is.
 func shardWithRuntimeObjects(t *testing.T) *tenantDB {
 	t.Helper()
 	d := startTenant(t)
@@ -645,6 +646,11 @@ func shardWithRuntimeObjects(t *testing.T) *tenantDB {
 	}
 	d.mustSU(t, "SELECT kingres.create_distributed_table('public.tenant_t', 'id')")
 	return d
+}
+
+// splitFn is the trigger function of a split as the extension makes it (kingres_shard--0.9.sql, internal_split_*).
+func splitFn(name string) string {
+	return "CREATE FUNCTION kingres." + name + "() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS 'BEGIN RETURN NULL; END'"
 }
 
 func TestRuntimeObjectsOfAMoveAreTrusted(t *testing.T) {
@@ -660,8 +666,7 @@ func TestRuntimeObjectsOfAMoveAreTrusted(t *testing.T) {
 		"CREATE TABLE kingres.kingres_old_16384 (a int, id int GENERATED ALWAYS AS IDENTITY)",
 		"CREATE TABLE kingres.tlog_7_1 (seq int8 GENERATED ALWAYS AS IDENTITY PRIMARY KEY, op \"char\")",
 		"CREATE TABLE kingres.orphan_9_1 (a int)", "ALTER TABLE kingres.orphan_9_1 OWNER TO tenant", // owned by the owner of the distributed table
-		"CREATE FUNCTION kingres.split_capture_3_1() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS 'BEGIN RETURN NULL; END'",
-		"ALTER FUNCTION kingres.split_capture_3_1() OWNER TO tenant",
+		splitFn("split_capture_3_1"), "ALTER FUNCTION kingres.split_capture_3_1() OWNER TO tenant",
 	} {
 		d.mustSU(t, s)
 	}
@@ -671,29 +676,39 @@ func TestRuntimeObjectsOfAMoveAreTrusted(t *testing.T) {
 	if err := PreInstall(ctx, d.su, Timepart, "kingres"); err != nil {
 		t.Fatalf("PreInstall over the same schema: %v", err)
 	}
+	// The tenant drops its last distributed table before the cleanup of the move: the orphan stays, owned by the tenant, and the database is still the
+	// extension's (it must not disappear from the listings that a drain relies on).
+	if _, err := d.tenant.Exec(ctx, "DROP TABLE public.tenant_t"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Verify(ctx, d.su, Shard); err != nil {
+		t.Fatalf("an orphan of a role that owns no distributed table any more: %v", err)
+	}
+	// and an orphan of a role that never owned one
+	d.mustSU(t, "CREATE TABLE kingres.orphan_4_4 (a int); ALTER TABLE kingres.orphan_4_4 OWNER TO tenant2")
+	if _, err := Verify(ctx, d.su, Shard); err != nil {
+		t.Fatalf("an orphan of any owner: %v", err)
+	}
 }
 
 func TestRuntimeLookingObjectsThatAreNotTheExtensionsAreRefused(t *testing.T) {
 	d := shardWithRuntimeObjects(t)
 	for _, c := range []struct{ name, bad, undo string }{
 		{"a function with the name of the trigger function of a split but another type", "CREATE FUNCTION kingres.split_capture_3_1() RETURNS int LANGUAGE sql AS 'SELECT 1'", "DROP FUNCTION kingres.split_capture_3_1()"},
-		{"a function with another name", "CREATE FUNCTION kingres.split_capture_x() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END'", "DROP FUNCTION kingres.split_capture_x()"},
+		{"a function with another name", splitFn("split_capture_x"), "DROP FUNCTION kingres.split_capture_x()"},
+		{"a trigger function that is not SECURITY DEFINER", "CREATE FUNCTION kingres.split_capture_3_1() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS 'BEGIN RETURN NULL; END'", "DROP FUNCTION kingres.split_capture_3_1()"},
+		{"a trigger function that the owner made SECURITY INVOKER", splitFn("split_capture_3_1") + "; ALTER FUNCTION kingres.split_capture_3_1() SECURITY INVOKER", "DROP FUNCTION kingres.split_capture_3_1()"},
+		{"a trigger function with another search_path", splitFn("split_capture_3_1") + "; ALTER FUNCTION kingres.split_capture_3_1() SET search_path = public", "DROP FUNCTION kingres.split_capture_3_1()"},
+		{"a trigger function with no search_path", splitFn("split_capture_3_1") + "; ALTER FUNCTION kingres.split_capture_3_1() RESET ALL", "DROP FUNCTION kingres.split_capture_3_1()"},
+		{"a trigger function with a setting more", splitFn("split_capture_3_1") + "; ALTER FUNCTION kingres.split_capture_3_1() SET work_mem = '1MB'", "DROP FUNCTION kingres.split_capture_3_1()"},
 		{"a function of a name that the control plane reads", "CREATE FUNCTION kingres.ledger_head() RETURNS int LANGUAGE sql AS 'SELECT 1'", "DROP FUNCTION kingres.ledger_head()"},
 		{"a view with the name of an orphan", "CREATE VIEW kingres.orphan_1_1 AS SELECT 1 AS a", "DROP VIEW kingres.orphan_1_1"},
 		{"a type with the name of an orphan", "CREATE TYPE kingres.orphan_1_2 AS (a int)", "DROP TYPE kingres.orphan_1_2"},
 		{"a table named like a table of the ledger", "CREATE TABLE kingres.ledger_pending (ledger_txid bigint)", "DROP TABLE kingres.ledger_pending"},
 		{"a table named like a table of the sharding catalog", "CREATE TABLE kingres.node_x (a int)", "DROP TABLE kingres.node_x"},
 		{"a sequence with the name of the log of an operation but no table", "CREATE SEQUENCE kingres.tlog_1_1_seq", "DROP SEQUENCE kingres.tlog_1_1_seq"},
-		{"an orphan of a role that owns no distributed table", "CREATE TABLE kingres.orphan_4_4 (a int)", "DROP TABLE kingres.orphan_4_4"},
-		{"a trigger function of a role that owns no distributed table", "CREATE FUNCTION kingres.split_capture_4_4() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END'", "DROP FUNCTION kingres.split_capture_4_4()"},
 	} {
 		d.mustSU(t, c.bad)
-		switch c.name {
-		case "an orphan of a role that owns no distributed table":
-			d.mustSU(t, "ALTER TABLE kingres.orphan_4_4 OWNER TO tenant2")
-		case "a trigger function of a role that owns no distributed table":
-			d.mustSU(t, "ALTER FUNCTION kingres.split_capture_4_4() OWNER TO tenant2")
-		}
 		if _, r := verifyReason(t, d.su, Shard); r != ReasonForeignObject {
 			t.Errorf("%s: %q", c.name, r)
 		}
@@ -704,22 +719,51 @@ func TestRuntimeLookingObjectsThatAreNotTheExtensionsAreRefused(t *testing.T) {
 	}
 }
 
+// The schema kingres is checked for kingres_shard whichever schema the extension is in (the row of pg_extension is moved here to show it).
+func TestShardChecksTheSchemaKingresWhateverTheExtensionSchema(t *testing.T) {
+	d := shardWithRuntimeObjects(t)
+	ctx := context.Background()
+	d.mustSU(t, "CREATE SCHEMA elsewhere")
+	d.mustSU(t, "UPDATE pg_catalog.pg_extension SET extnamespace = 'elsewhere'::pg_catalog.regnamespace WHERE extname = 'kingres_shard'")
+	info, err := Verify(ctx, d.su, Shard)
+	if err != nil || info.Schema != "kingres" {
+		t.Fatalf("a clean schema elsewhere and a clean kingres: %+v %v", info, err)
+	}
+	d.mustSU(t, "CREATE VIEW kingres.ledger_pending AS SELECT 1 AS ledger_txid")
+	if _, r := verifyReason(t, d.su, Shard); r != ReasonForeignObject {
+		t.Fatalf("a view in kingres: %q", r)
+	}
+	d.mustSU(t, "DROP VIEW kingres.ledger_pending; ALTER SCHEMA kingres OWNER TO tenant")
+	if _, r := verifyReason(t, d.su, Shard); r != ReasonSchemaOwner {
+		t.Fatalf("kingres of a tenant: %q", r)
+	}
+	d.mustSU(t, "ALTER SCHEMA kingres OWNER TO kingresd; GRANT CREATE ON SCHEMA elsewhere TO PUBLIC")
+	if _, r := verifyReason(t, d.su, Shard); r != ReasonSchemaCreate {
+		t.Fatalf("CREATE on the schema of the extension: %q", r)
+	}
+}
+
 // Mutants of the rule for the run-time objects: each one lets one of the refused cases through, or refuses the accepted ones.
 func TestRuntimeRuleMutantsAreKilled(t *testing.T) {
 	d := shardWithRuntimeObjects(t)
 	orig := querySQL
 	defer func() { querySQL = orig }()
 	const tablePattern = "c.relname ~ '^(orphan_s?[0-9]+_[0-9]+|kingres_old_[0-9]+|tlog_[0-9]+_[0-9]+)([A-Za-z0-9_]*)$')"
+	invoker := splitFn("split_capture_3_1") + "; ALTER FUNCTION kingres.split_capture_3_1() SECURITY INVOKER"
+	other := splitFn("split_capture_3_1") + "; ALTER FUNCTION kingres.split_capture_3_1() SET search_path = public"
 	cases := []struct {
 		name, from, to, bad, undo string
 		want                      Reason // what the real statement says with bad in place ("" for the accepted objects)
 	}{
 		{"every table is accepted", tablePattern, "true)", "CREATE TABLE kingres.ledger_pending (ledger_txid bigint)", "DROP TABLE kingres.ledger_pending", ReasonForeignObject},
-		{"every function is accepted", "p.proname ~ '^split_capture_[0-9]+_[0-9]+$' AND p.prorettype = 'pg_catalog.trigger'::pg_catalog.regtype AND", "true AND", "CREATE FUNCTION kingres.ledger_head() RETURNS int LANGUAGE sql AS 'SELECT 1'", "DROP FUNCTION kingres.ledger_head()", ReasonForeignObject},
-		{"the type of the function is not looked at", "AND p.prorettype = 'pg_catalog.trigger'::pg_catalog.regtype", "", "CREATE FUNCTION kingres.split_capture_3_1() RETURNS int LANGUAGE sql AS 'SELECT 1'", "DROP FUNCTION kingres.split_capture_3_1()", ReasonForeignObject},
-		{"the owners are not collected", "AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles g WHERE g.oid = r.owner AND g.rolsuper)),\n                '{}'", "AND false),\n                '{}'", "CREATE TABLE kingres.orphan_4_4 (a int); ALTER TABLE kingres.orphan_4_4 OWNER TO tenant2", "DROP TABLE kingres.orphan_4_4", ReasonForeignObject},
+		{"every function is accepted", "p.proname ~ '^split_capture_[0-9]+_[0-9]+$' AND p.prorettype = 'pg_catalog.trigger'::pg_catalog.regtype AND", "true AND", "CREATE FUNCTION kingres.ledger_head() RETURNS int LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS 'BEGIN RETURN 1; END'", "DROP FUNCTION kingres.ledger_head()", ReasonForeignObject},
+		{"the type of the function is not looked at", "AND p.prorettype = 'pg_catalog.trigger'::pg_catalog.regtype", "", "CREATE FUNCTION kingres.split_capture_3_1() RETURNS int LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS 'BEGIN RETURN 1; END'", "DROP FUNCTION kingres.split_capture_3_1()", ReasonForeignObject},
+		{"SECURITY DEFINER is not required", "AND p.prosecdef AND", "AND", invoker, "DROP FUNCTION kingres.split_capture_3_1()", ReasonForeignObject},
+		{"the search_path is not required", "AND p.proconfig = ARRAY['search_path=pg_catalog, pg_temp']::pg_catalog.text[]", "", other, "DROP FUNCTION kingres.split_capture_3_1()", ReasonForeignObject},
+		{"the schema kingres is not required for the run-time objects", "WHERE c.relnamespace = (SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = 'kingres')\n     AND (", "WHERE (", "CREATE SCHEMA elsewhere; UPDATE pg_catalog.pg_extension SET extnamespace = 'elsewhere'::pg_catalog.regnamespace WHERE extname = 'kingres_shard'; CREATE TABLE elsewhere.orphan_5_3 (a int)", "UPDATE pg_catalog.pg_extension SET extnamespace = 'pg_catalog'::pg_catalog.regnamespace WHERE extname = 'kingres_shard'; DROP SCHEMA elsewhere CASCADE", ReasonForeignObject},
+		{"the schema kingres is not added for kingres_shard", "    FROM e JOIN pg_catalog.pg_namespace n ON n.nspname = 'kingres'\n   WHERE e.extname = 'kingres_shard'", "    FROM e JOIN pg_catalog.pg_namespace n ON n.nspname = 'kingres'\n   WHERE false", "CREATE SCHEMA elsewhere; UPDATE pg_catalog.pg_extension SET extnamespace = 'elsewhere'::pg_catalog.regnamespace WHERE extname = 'kingres_shard'; CREATE VIEW kingres.ledger_pending AS SELECT 1 AS ledger_txid", "UPDATE pg_catalog.pg_extension SET extnamespace = 'pg_catalog'::pg_catalog.regnamespace WHERE extname = 'kingres_shard'; DROP VIEW kingres.ledger_pending; DROP SCHEMA elsewhere", ReasonForeignObject},
 		{"the run-time tables are not accepted at all", "c.relkind IN ('r', 'p') AND c.relname ~", "false AND c.relname ~", "CREATE TABLE kingres.orphan_5_3 (a int)", "DROP TABLE kingres.orphan_5_3", ""},
-		{"the trigger functions are not accepted at all", "WHERE p.proname ~ '^split_capture", "WHERE false AND p.proname ~ '^split_capture", "CREATE FUNCTION kingres.split_capture_3_1() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END'", "DROP FUNCTION kingres.split_capture_3_1()", ""},
+		{"the trigger functions are not accepted at all", "AND p.proname ~ '^split_capture", "AND false AND p.proname ~ '^split_capture", splitFn("split_capture_3_1"), "DROP FUNCTION kingres.split_capture_3_1()", ""},
 	}
 	for _, c := range cases {
 		querySQL = orig

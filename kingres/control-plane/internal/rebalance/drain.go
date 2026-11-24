@@ -302,7 +302,8 @@ func (s *Service) drainWait() time.Duration {
 // bucketsOn counts, over the databases with distributed tables, the buckets that groups with a primary on the
 // server own plus the moves that are not finished with them (a bucket in cleaning still has its old copy).
 func (s *Service) bucketsOn(ctx context.Context, server string) (int, error) {
-	dbs, err := s.Backend.Databases(ctx, Options{})
+	// Strict: a database that cannot be verified is an error here, never a database with no buckets (the drain would report done with buckets still on the server).
+	dbs, err := s.Backend.Databases(ctx, Options{Strict: true})
 	if err != nil {
 		return 0, err
 	}
