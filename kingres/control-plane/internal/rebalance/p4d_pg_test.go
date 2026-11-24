@@ -25,7 +25,7 @@ func callStub(t *testing.T, e *guardEnv, seconds int) *pgx.Conn {
 	ctx := context.Background()
 	stub := e.in.Connect(t, "postgres")
 	for _, q := range []string{
-		`CREATE SCHEMA kingres`,
+		`CREATE SCHEMA IF NOT EXISTS kingres`,
 		`CREATE TABLE kingres.bucket_move (move_id bigserial PRIMARY KEY, colocation_id int, bucket int, phase text, detail text, started_at timestamptz DEFAULT now())`,
 		`CREATE TABLE kingres.call_ended (n int)`,
 		fmt.Sprintf(`CREATE FUNCTION kingres.move_bucket(int, int, int) RETURNS bigint LANGUAGE plpgsql AS $$
