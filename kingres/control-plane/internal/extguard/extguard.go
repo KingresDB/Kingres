@@ -207,7 +207,7 @@ const verifyTail = `
             SELECT 1 FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_class t ON t.oid = d.refobjid
              WHERE d.classid = f.classid AND d.objid = f.oid AND d.deptype IN ('a', 'i') AND d.refclassid = f.classid
                AND t.relnamespace = c.relnamespace AND t.relkind IN ('r', 'p')
-               AND t.relname ~ '^(orphan_s?[0-9]+_[0-9]+|kingres_old_[0-9]+|tlog_[0-9]+_[0-9]+)([A-Za-z0-9_]*)$'))))
+               AND t.relname ~ '^(orphan_s?[0-9]+_[0-9]+|kingres_old_[0-9]+|tlog_[0-9]+_[0-9]+)([A-Za-z0-9_]*)$')))
   UNION ALL
   -- The trigger function of a split is the one that the extension makes: SECURITY DEFINER, language plpgsql, search_path = pg_catalog, pg_temp.  The owner of
   -- the table owns it and could change the attributes of its own function (SECURITY INVOKER, another search_path), so they are part of the test.
