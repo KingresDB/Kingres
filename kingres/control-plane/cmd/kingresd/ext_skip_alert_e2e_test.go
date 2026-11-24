@@ -34,7 +34,7 @@ func TestExtensionSkippedAlertIsRaisedAndCleared(t *testing.T) {
 		defer func() { _ = sc.Close(ctx) }()
 		return rowsText(t, sc, "select severity, subject, message from kingres_cp.alert where kind = 'extensionSkipped' and cleared_at is null order by subject")
 	}
-	if got := open(); got != "[]" {
+	if got := open(); !isNone(got) {
 		t.Fatalf("alerts before: %s", got)
 	}
 	raise(ctx, "dbskip", "pgcrypto", "schema x of extension pgcrypto is owned by intruder on this server and by o on the leader")
@@ -54,24 +54,27 @@ func TestExtensionSkippedAlertIsRaisedAndCleared(t *testing.T) {
 	clear(ctx, "other", "hstore")
 	clearOther := clearExtensionSkipped(sys, "h2", log)
 	clearOther(ctx, "dbskip", "hstore")
-	if got := open(); got == "[]" {
+	if got := open(); isNone(got) {
 		t.Errorf("the apply of the extension elsewhere cleared the alert")
 	}
 	clear(ctx, "dbskip", "hstore")
-	if got := open(); got != "[]" {
+	if got := open(); !isNone(got) {
 		t.Errorf("the apply of the extension on this server did not clear the alert: %s", got)
 	}
 	// A dropped database clears its alerts.
 	raise(ctx, "dbskip", "pgcrypto", "schema x of extension pgcrypto is owned by intruder on this server and by o on the leader")
-	if got := open(); got == "[]" {
+	if got := open(); isNone(got) {
 		t.Fatal("the alert was not raised again")
 	}
 	e.mustTask(t, "DELETE", "/databases/dbskip", nil)
 	deadline := time.Now().Add(30 * time.Second)
-	for open() != "[]" && time.Now().Before(deadline) {
+	for !isNone(open()) && time.Now().Before(deadline) {
 		time.Sleep(200 * time.Millisecond)
 	}
-	if got := open(); got != "[]" {
+	if got := open(); !isNone(got) {
 		t.Errorf("the alert of a dropped database is open: %s", got)
 	}
 }
+
+// isNone says that the rows are empty (rowsText writes nothing or an empty list).
+func isNone(rows string) bool { return rows == "" || rows == "[]" }
