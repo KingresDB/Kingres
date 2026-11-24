@@ -79,6 +79,18 @@ type Move struct {
 	Cost int64
 	// Reason is balance or drain; empty when unknown.
 	Reason string
+	// Schema is the name of the distributed schema when the item is one (the single bucket of the schema's colocation group, moved by
+	// move_schema); empty for a bucket of a hash group.
+	Schema string
+}
+
+// Kind is what the move moves, as the contract names it: "schema" with the schema's name for a distributed schema, "move" and nil for a bucket.
+func (m Move) Kind() (string, *string) {
+	if m.Schema == "" {
+		return "move", nil
+	}
+	n := m.Schema
+	return "schema", &n
 }
 
 // Key identifies the bucket, whatever the groups.

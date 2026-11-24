@@ -62,8 +62,9 @@ const start = () =>
     @close="emit('close')"
   >
     <p>
-      The server stops receiving new buckets, then every bucket it owns moves to the other servers
-      while the cluster stays in service. A server with no bucket can be removed.
+      The server stops receiving new buckets, then every bucket and every distributed schema it owns
+      moves to the other servers while the cluster stays in service. A server with no bucket can be
+      removed.
     </p>
     <QueryBoundary
       :loading="preview.isPending.value"
@@ -76,7 +77,7 @@ const start = () =>
           <NullableValue :value="p.totalBytes" :format="formatBytes" />.
         </p>
         <ul v-if="p.blockers.length" class="plain" data-testid="drain-blockers">
-          <li v-for="b in p.blockers" :key="b.code" class="notice tone-warn">
+          <li v-for="b in p.blockers" :key="`${b.code}-${b.detail}`" class="notice tone-warn">
             <span aria-hidden="true">&#9650;</span>
             <span><SafeName :value="b.detail" kind="text" :max="300" /></span>
           </li>

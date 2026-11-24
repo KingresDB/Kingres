@@ -96,8 +96,12 @@ func (b *PG) Plan(ctx context.Context, dbs []string, o Options) ([]Move, error) 
 			if len(excl) > 0 {
 				exclArg = excl
 			}
-			rows, err := c.Query(ctx, `SELECT colocation_id, bucket, source_group, target_group, cost, size_bytes, reason
-				FROM kingres.plan_rebalance($1, $2::float8, NULL, $3, $4::jsonb, $5::int[], NULL) ORDER BY seq`,
+			// the item of a distributed schema is the one bucket of its colocation group (design 9.9); its name comes from dist_schema
+			rows, err := c.Query(ctx, `SELECT p.colocation_id, p.bucket, p.source_group, p.target_group, p.cost, p.size_bytes, p.reason, coalesce(ns.nspname::text, '')
+				FROM kingres.plan_rebalance($1, $2::float8, NULL, $3, $4::jsonb, $5::int[], NULL) p
+				LEFT JOIN kingres.dist_schema s ON s.colocation_id = p.colocation_id
+				LEFT JOIN pg_catalog.pg_namespace ns ON ns.oid = s.nsp::oid
+				ORDER BY p.seq`,
 				strategy, threshold, o.DrainOnly, extraJSON, exclArg)
 			if err != nil {
 				return err
@@ -105,7 +109,7 @@ func (b *PG) Plan(ctx context.Context, dbs []string, o Options) ([]Move, error) 
 			defer rows.Close()
 			for rows.Next() {
 				m := Move{Database: db}
-				if err := rows.Scan(&m.Colocation, &m.Bucket, &m.From, &m.To, &m.Cost, &m.Size, &m.Reason); err != nil {
+				if err := rows.Scan(&m.Colocation, &m.Bucket, &m.From, &m.To, &m.Cost, &m.Size, &m.Reason, &m.Schema); err != nil {
 					return err
 				}
 				moves = append(moves, m)

@@ -25,6 +25,28 @@ See the Pending part of the CHANGELOG. Two points of the guide are from the text
 
 ---
 
+## 2026-11-24 (branch p11-cp, from g2): the distributed schemas in the rebalance and the drain
+
+### What was done
+
+What the code showed first: the extension already plans a distributed schema as an item of `plan_rebalance` (the item `(colocation_id, 0)` of its schema group; a pinned schema is left out, 9.9) and `move_bucket` dispatches to the schema mover, so the control plane planned and ran schema items as buckets without knowing it. What was missing: the item had no name or kind anywhere (plan, status, report), the run called `move_bucket` and not the extension's schema move, and a drain of a server with a schema that cannot move (a ledger table, a table that is not logged, a table with no key and no full replica identity) started, did not empty the server, and failed after the 30 minutes of its wait.
+
+- `rebalance`: `Move.Schema` (the name, read in `PG.Plan` by joining the plan with `kingres.dist_schema`; empty for a bucket), `Move.Kind()`. `RunMove` calls `kingres.move_schema(quote_ident(name)::regnamespace, target)` for a schema item, inside the same guard, fence and gate (`withShard` and `extgate`) as `move_bucket`; retries, skips, the audit and the alerts are the loop's and are unchanged. Migration `0044_rebalance_schema_move.sql` adds `rebalance_move.schema_name`, kept by `StartMove` and `AddSkipped` and read by `ScanMove`, so the status and the report name the schema after a restart or a change of leader.
+- The drain: `Service.schemasOn` reads `kingres.schemas_on_group` of every group whose primary runs on the server (extension 0.9, in every trusted database, through `withShard`). `DrainPreview` lists a schema that cannot move as a blocker (`schema_pinned` for a ledger pin, `unprocessable` for the other reasons, each naming the schema and the database) and `Drain` refuses with the first of them before a task exists. `bucketsOn` already counted the one bucket of a schema group (and a move in `cleaning`); the comment says so and the wait of the end step names how many of the remaining buckets are schemas.
+- Contract 0.31.0 (placeholder; additive only): `kind` and `schemaName` on the result of one move of `getRebalanceReport` (`PlannedMove` and `BucketMove` had them since 0.15.0 and are now filled); the descriptions of `drainServer` and `previewServerDrain`. `check-contract.mjs`, the README changelog, `schema.d.ts` and `ContractRevision` follow. Console: the report dialog shows a schema as `Schema <name>` like the plan and the progress do, the drain dialog says that schemas move and keys its blockers by code and text.
+
+### How it was verified
+
+Windows only (a full gate runs in WSL): `go build ./...`, `go vet ./...`, `go test ./...` in `kingres/control-plane` (the database tests skip), `node scripts/check-contract.mjs`, `npm run api:check`, typecheck, lint and vitest of `kingres/web`. Written and not run: the database tests of `internal/rebalance` (`schema_items_pg_test.go`, on a stand-in catalog recorded by `trustStub`) and the cluster test `TestDrainOfAServerThatHostsADistributedSchema` (`internal/clustertest/schemas_drain_test.go`: the preview and the refusal by a schema without a replica identity, a drain that moves two schemas and the buckets and ends empty, a rebalance by disk size that moves a schema).
+
+### Open
+
+- The tests that were written and not run are the list in the report of the branch; they run in WSL after the timing gate.
+- A schema that is only pinned by a ledger table keeps the drain refused until the operator decides about that data (design 9.9).
+- The drain does not offer `setReplicaIdentityFull` for the schemas; the operator sets the identity (the preview says which table).
+
+---
+
 ## 2026-11-24: the integration branch g2 (nine branches merged onto g16s)
 
 Branch `g2`, from g16s (`cc5008adb2`), nine merge commits in this order: `xcat-2`, `split-fix`, `pgss`, `p12-dist-tp`, `ca-escrow`, `p10-drain4`, `p5-hard`, `p14b`, `p14c`.

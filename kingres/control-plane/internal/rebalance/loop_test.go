@@ -162,6 +162,10 @@ type fakeCluster struct {
 	skip      map[int32]*SkipError
 	recovered string
 	cleaned   int
+	// schema names the buckets that are distributed schemas (the item is the one bucket of a schema group; its move is a schema move).
+	schema map[int32]string
+	// ran records the moves as RunMove got them.
+	ran []Move
 }
 
 func newCluster(owner, target map[int32]int32) *fakeCluster {
@@ -183,7 +187,7 @@ func (f *fakeCluster) Plan(_ context.Context, _ []string, _ Options) ([]Move, er
 	for b := int32(0); b < 16; b++ {
 		if f.owner[b] != f.target[b] {
 			sz := int64(1000)
-			out = append(out, Move{Database: "shop", Colocation: 1, Bucket: b, From: f.owner[b], To: f.target[b], Size: &sz})
+			out = append(out, Move{Database: "shop", Colocation: 1, Bucket: b, From: f.owner[b], To: f.target[b], Size: &sz, Schema: f.schema[b]})
 		}
 	}
 	return out, nil
@@ -205,6 +209,7 @@ func (f *fakeCluster) CheckMove(_ context.Context, m Move) error {
 func (f *fakeCluster) Mark(context.Context, Move) (int64, error) { return 0, nil }
 func (f *fakeCluster) RunMove(ctx context.Context, m Move, _ int64) error {
 	f.mu.Lock()
+	f.ran = append(f.ran, m)
 	f.runs = append(f.runs, fmt.Sprintf("%d", m.Bucket))
 	ch := f.block[m.Bucket]
 	fail := f.failFor[m.Bucket] > 0

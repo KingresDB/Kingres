@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.30.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.31.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and, when it is built, the planned `kingres-cli` (it does not exist yet). Lint it and run the mechanical rule check with:
 
 ```
@@ -392,6 +392,22 @@ Where the architecture document leaves something open, the simplest option was c
     range and the cluster's replica count.
 
 ## Changelog
+
+### 0.31.0
+
+Revision written first for the schema items of the rebalance and the drain (phase 11, `kingres/docs/design/shard-phase11.md` section 9.9; the number is a placeholder that the integration branch settles). Summary for the panel:
+0 operations added (177 operations, 141 paths); two optional members added; **no change that is not additive**.
+
+#### Breaking
+
+None.
+
+#### Additive
+- The result of one move in `getRebalanceReport` (`RebalanceReport.moves[]`) has the optional `kind` (`schema` for a distributed schema, absent for a bucket) and `schemaName`, as `PlannedMove` and `BucketMove` have had since 0.15.0. The plan, the status and the drain preview fill the same two members for a schema now: a rebalance and a drain move the distributed schemas of the extension as items of the plan.
+
+#### Documentation
+
+- `drainServer` and `previewServerDrain` say that the distributed schemas of the server move with the buckets, and which blockers a schema gives (`schema_pinned`, `unprocessable`); the drain ends only when no bucket and no schema is left on the server.
 
 ### 0.30.0
 

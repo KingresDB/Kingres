@@ -253,7 +253,10 @@ type ReportMove struct {
 	Attempts         int     `json:"attempts"`
 	SkipReason       *string `json:"skipReason"`
 	// Reason is balance or drain (contract 0.15.0, optional).
-	Reason          string  `json:"reason,omitempty"`
+	Reason string `json:"reason,omitempty"`
+	// Kind is schema and SchemaName the schema when the move was a distributed schema (contract 0.31.0, optional); both absent for a bucket.
+	Kind            string  `json:"kind,omitempty"`
+	SchemaName      *string `json:"schemaName,omitempty"`
 	DurationSeconds float64 `json:"durationSeconds"`
 	Error           *string `json:"error"`
 }

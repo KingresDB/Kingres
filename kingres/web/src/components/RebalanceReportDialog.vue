@@ -156,7 +156,12 @@ const RUN_OUTCOME: Record<string, string> = {
                 :key="`${i}-${m.databaseName}-${m.colocationId}-${m.bucket}`"
               >
                 <td><SafeName :value="m.databaseName" :max="60" /></td>
-                <td class="num">{{ m.bucket }}</td>
+                <td class="num" :data-kind="m.kind ?? 'move'">
+                  <template v-if="m.kind === 'schema'"
+                    >Schema <SafeName :value="m.schemaName ?? ''" :max="60"
+                  /></template>
+                  <template v-else>{{ m.bucket }}</template>
+                </td>
                 <td>
                   <SafeName v-if="m.fromServerId" :value="m.fromServerId" :max="80" />
                   <template v-else>group {{ m.fromShardGroupId }}</template>
