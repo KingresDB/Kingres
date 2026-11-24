@@ -681,3 +681,76 @@ func foCheckAckedByKey(t *testing.T, acked map[int64]time.Time, nodes []*cluster
 		}
 	}
 }
+
+// P2 (REST). With a second standby of the map group the operator declares the dead candidate lost through REST, on a third server, and the proof of his session reaches the
+// held-back old leader, which checks it against the keys of the administrators that it cached while its system database ran, releases its hold, and serves again. The
+// old leader's kingresd runs and its instance is stopped; the session that signs is made after the hold began, so the key of the session comes from a server that can still
+// read a verifier. A server that is alive and a server that is no candidate are refused first.
+func TestTheRESTDeclarationOfALostServerWorksAcrossRealServers(t *testing.T) {
+	c := clustertest.FormWithExtra(t, 3, append([]string{"-lease-duration", "12s", "-lease-renew", "2s", "-lease-margin", "3s"}, standbyArgs...), nil)
+	leader := c.Leader()
+	if st, body := leader.Do("PATCH", "/settings/cluster", map[string]any{"defaultReplicaCount": 2}, nil); st != 200 && st != 202 {
+		t.Fatalf("two standbys for every group: %d %v", st, body)
+	}
+	waitStandbys(t, c, 2)
+	views := topology(t, leader)[0]
+	var nw, third *clustertest.Node
+	for _, n := range c.Nodes {
+		switch {
+		case n == leader:
+		case n.Host == views[0].server:
+			nw = n
+		default:
+			third = n
+		}
+	}
+	if nw == nil || third == nil {
+		t.Fatalf("the two standbys of the map group are on %v", views)
+	}
+	defer func() {
+		if t.Failed() {
+			t.Logf("old leader log:\n%s\nthird log:\n%s", quietLog(leader.LogTail(40000)), quietLog(third.LogTail(20000)))
+		}
+	}()
+	until(t, 2*time.Minute, "the cache of the administrators' keys on the old leader", func() bool {
+		b, err := os.ReadFile(filepath.Join(leader.DataDir, "failover", "admin-keys.json"))
+		return err == nil && strings.Contains(string(b), clustertest.AdminUser)
+	})
+	nw.SetFaults(fault.Spec{FailoverPoint: "promote:unavailable", FailoverMode: "unavailable"})
+	_ = mapHardRequest(t, leader, nw, true)
+	mapStopped(t, leader)
+	until(t, 3*time.Minute, "the candidate to hold the lease and wait for its promotion", func() bool {
+		s, b := nw.Do("GET", "/failover", nil, nil)
+		return s == 200 && b["state"] == "running"
+	})
+	foKillServer(nw)
+	// the session of the operator is made now, while the old leader's system database is stopped
+	until(t, 3*time.Minute, "the operator to sign in on the third server", func() bool { return third.Login(clustertest.AdminUser, clustertest.AdminPass) })
+	declare := func(lost string) (int, map[string]any) {
+		return third.Do("POST", "/failover/map/abandon", map[string]any{"reason": "the candidate is dead", "lostServerId": lost}, nil)
+	}
+	// a server that is alive is no lost server
+	if st, body := declare(third.Host); st != 409 {
+		t.Fatalf("a live server was declared lost: %d %v", st, body)
+	}
+	var res map[string]any
+	until(t, 8*time.Minute, "the declaration to release the old leader", func() bool {
+		st, body := declare(nw.Host)
+		t.Logf("declaration: %d %v", st, body)
+		if st == 200 {
+			res = body
+			return true
+		}
+		return false
+	})
+	if res["resumedServerId"] != leader.Host {
+		t.Fatalf("the declaration resumed %v, not the old leader %s", res["resumedServerId"], leader.Host)
+	}
+	until(t, 8*time.Minute, "the cluster to serve again through the old leader", func() bool {
+		return leader.Login(clustertest.AdminUser, clustertest.AdminPass) && func() bool { s, _ := leader.Do("GET", "/cluster", nil, nil); return s == 200 }()
+	})
+	// a rerun after the release says that nothing is held back: an error that says so, not an empty success
+	if st, body := declare(nw.Host); st == 200 {
+		t.Errorf("a second declaration answered a success: %v", body)
+	}
+}
