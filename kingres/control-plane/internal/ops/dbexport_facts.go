@@ -147,7 +147,10 @@ func readDBFacts(ctx context.Context, tx pgx.Tx) (*dbFacts, error) {
 		FROM pg_database WHERE datname = current_database()`).Scan(&f.Encoding, &f.Collate, &f.Ctype, &f.Provider, &f.PGMajor); err != nil {
 		return nil, err
 	}
-	rows, err := tx.Query(ctx, `SELECT e.extname::text, e.extversion, n.nspname::text FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace ORDER BY e.extname`)
+	// pg_stat_statements is in every database that KingresDB makes (it is not data of the database, its views hold the statistics of the server, and it is not on the
+	// list of the extensions that an archive may carry): it is left out of the manifest.
+	rows, err := tx.Query(ctx, `SELECT e.extname::text, e.extversion, n.nspname::text FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace
+			WHERE e.extname <> 'pg_stat_statements' ORDER BY e.extname`)
 	if err != nil {
 		return nil, err
 	}

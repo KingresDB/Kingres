@@ -39,7 +39,7 @@ func (e *cp) exportDB(t testing.TB, db string, req map[string]any) string {
 	validTask(t, out)
 	done := e.waitTask(t, out)
 	if done["state"] != "done" {
-		t.Fatalf("the export task failed: %v", done["error"])
+		t.Fatalf("the export task failed: %v\nlogs:\n%s", done["error"], tailOf(e.logs.String(), 5000))
 	}
 	d, _ := done["detail"].(string)
 	if !strings.HasPrefix(d, "transfer ") {
