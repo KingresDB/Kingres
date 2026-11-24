@@ -159,7 +159,10 @@ type Manager struct {
 	// lease in that time must not start the instance: the start would find it still running (and do nothing),
 	// the stop would then end it, and the markers the start removed would leave nothing to start it again.
 	fencing map[int32]bool
-	wg      sync.WaitGroup
+	// fenceRun is set from the moment Check hands a fence of the group to a goroutine until that goroutine ended: a second
+	// fence of the same group is never started while one runs (phase 5 review M-A).
+	fenceRun map[int32]bool
+	wg       sync.WaitGroup
 	// enf is what the lease manager last knew about which groups are enforced
 	// (loaded lazily from the lease directory, see recordEnforced).
 	enf map[int32]bool
@@ -194,7 +197,7 @@ func New(c Config) (*Manager, error) {
 	if err := os.MkdirAll(c.Dir, 0o700); err != nil {
 		return nil, fmt.Errorf("lease: creating %s: %w", c.Dir, err)
 	}
-	m := &Manager{c: c, rmus: map[int32]*sync.Mutex{}, rsem: make(chan struct{}, maxParallelRounds), groups: map[int32]*groupState{}, starting: map[int32]bool{}, fencing: map[int32]bool{}, adopted: map[int32]*adoption{}, relinq: map[int32]bool{}, base: uint64(time.Now().UnixNano())}
+	m := &Manager{c: c, rmus: map[int32]*sync.Mutex{}, rsem: make(chan struct{}, maxParallelRounds), groups: map[int32]*groupState{}, starting: map[int32]bool{}, fencing: map[int32]bool{}, fenceRun: map[int32]bool{}, adopted: map[int32]*adoption{}, relinq: map[int32]bool{}, base: uint64(time.Now().UnixNano())}
 	m.loadRelinquished()
 	if b, err := os.ReadFile(filepath.Join(c.Dir, topologyFile)); err == nil {
 		var t Topology
@@ -570,7 +573,13 @@ func (m *Manager) afterAcquired(ctx context.Context, group int32, wasLost bool) 
 // succeed; that window is at most one round (duration minus margin), and a
 // primary that was stopped while kingresd was away stays stopped (the fence
 // marker).
-func (m *Manager) Check(ctx context.Context) {
+//
+// Check returns when the fences it started ended (tests rely on that); Run uses check without waiting.
+func (m *Manager) Check(ctx context.Context) { m.check(ctx, true) }
+
+// check is Check; without wait it returns as soon as the fences are on their way, tracked by m.wg. A stop that hangs
+// (up to 30 s) must not keep the next pass from judging the other groups (phase 5 review M-A).
+func (m *Manager) check(ctx context.Context, wait bool) {
 	m.mu.Lock()
 	var expired, refence []int32
 	now := m.c.Clock.Mono()
@@ -579,8 +588,9 @@ func (m *Manager) Check(ctx context.Context) {
 			// The lease is over and was not won again: the stop is repeated until it succeeds, and whether the group is
 			// enforced is asked every time (a group that became enforced after its lease ran out must not keep a primary
 			// that runs with no lease, F2-05).
-			if !st.triedFence || now-st.lastFence >= FenceRetry {
+			if (!st.triedFence || now-st.lastFence >= FenceRetry) && !m.fenceRun[g] {
 				st.triedFence, st.lastFence = true, now
+				m.fenceRun[g] = true
 				refence = append(refence, g)
 			}
 			continue
@@ -598,22 +608,36 @@ func (m *Manager) Check(ctx context.Context) {
 		if !st.have || m.c.Clock.Mono() >= st.validUntil-m.c.Margin {
 			st.lost = true
 			st.triedFence, st.lastFence = true, now
-			expired = append(expired, g)
+			if !m.fenceRun[g] {
+				// A fence of an earlier loss may still run; the retry path above takes the group after it ended.
+				m.fenceRun[g] = true
+				expired = append(expired, g)
+			}
 		}
 	}
 	m.mu.Unlock()
 	// Each group is fenced in its own goroutine: a stop that hangs (up to 30 s) must not delay the fence of another group past its margin
-	// (phase 5 review L3). Check returns when every one ended.
+	// (phase 5 review L3). With wait, check returns when every one ended.
 	var wg sync.WaitGroup
-	for _, g := range expired {
+	run := func(g int32, f func(context.Context, int32)) {
 		wg.Add(1)
-		go func() { defer wg.Done(); m.lose(ctx, g) }()
+		m.wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer m.wg.Done()
+			defer func() { m.mu.Lock(); delete(m.fenceRun, g); m.mu.Unlock() }()
+			f(ctx, g)
+		}()
+	}
+	for _, g := range expired {
+		run(g, m.lose)
 	}
 	for _, g := range refence {
-		wg.Add(1)
-		go func() { defer wg.Done(); m.refence(ctx, g) }()
+		run(g, m.refence)
 	}
-	wg.Wait()
+	if wait {
+		wg.Wait()
+	}
 }
 
 // FenceRetry is how often the stop of a primary whose lease is lost is tried again while it still runs.
@@ -781,7 +805,7 @@ func (m *Manager) Run(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				m.Check(ctx)
+				m.check(ctx, false)
 			}
 		}
 	}()
