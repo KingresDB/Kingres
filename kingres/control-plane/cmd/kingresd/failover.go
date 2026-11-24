@@ -1241,23 +1241,32 @@ var _ = url.Values{}
 
 // catalogDatabases lists the databases that have a sharding catalog (kingres.node): every sharded database has one of
 // its own, with its own node ids, besides the system database. withSystem puts the system database first.
+//
+// The private database of a running import (kingres_import_<task id>_<nonce>, marked with the comment of its task) is not listed: it is
+// the task's own work in progress, its catalog knows the primaries of the servers that the task registered and no standby, and the
+// task makes it again or drops it. Listed, it stops every catalog follow-up: the promotion of the map group needs the standby in the
+// catalog of each database, and the registration of a standby there needs the promotion to be recognised first, so the two wait for
+// each other and the failover never ends. An import that goes on after a failover ends by its own checks, and one that ends drops it.
 func catalogDatabases(ctx context.Context, svc *cluster.Service, withSystem bool) ([]string, error) {
 	pc, err := svc.ServiceConn(ctx, "postgres")
 	if err != nil {
 		return nil, err
 	}
-	rows, err := pc.Query(ctx, `SELECT datname FROM pg_catalog.pg_database WHERE NOT datistemplate AND datallowconn ORDER BY datname`)
+	rows, err := pc.Query(ctx, `SELECT datname, coalesce(pg_catalog.shobj_description(oid, 'pg_database'), '') FROM pg_catalog.pg_database WHERE NOT datistemplate AND datallowconn ORDER BY datname`)
 	if err != nil {
 		_ = pc.Close(context.WithoutCancel(ctx))
 		return nil, err
 	}
 	var names []string
 	for rows.Next() {
-		var n string
-		if err := rows.Scan(&n); err != nil {
+		var n, comment string
+		if err := rows.Scan(&n, &comment); err != nil {
 			rows.Close()
 			_ = pc.Close(context.WithoutCancel(ctx))
 			return nil, err
+		}
+		if ops.IsPrivateImportDatabase(n, comment) {
+			continue
 		}
 		names = append(names, n)
 	}
