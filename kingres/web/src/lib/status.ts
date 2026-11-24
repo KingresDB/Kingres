@@ -263,6 +263,7 @@ export const ALERT_KIND_LABEL: Record<AlertKind, string> = {
   partitionPolicyFailed: 'A partitioning policy failed',
   transferStagingLow: 'The staging area of the data transfer is nearly full',
   extensionSchemaUntrusted: 'The schema of a KingresDB extension cannot be trusted',
+  extensionSkipped: 'An extension was not installed in a database on a server',
 }
 
 /** The label of an alert kind; a kind from a newer server is shown as sent (through SafeName). */
@@ -341,6 +342,8 @@ export function taskKindLabel(kind: string): string {
  * reaches the server, an account that was disabled, changed or dropped may still work there.
  */
 const ALERT_KIND_HINT: Partial<Record<AlertKind, string>> = {
+  extensionSkipped:
+    'A role of the database made a schema of an extension its own on this server, so its owner here differs from the owner on the leader, and the extension was left out of this database here. The operation that found it went on. Make the owner of the schema the same as on the leader, then apply the database to the server again; the alert clears when the extension is installed, or when the database is dropped.',
   leaseLost:
     'The server that runs the primary of this shard group could not renew the lease of the group in time. If the group has a standby, the primary was stopped on purpose, so that two primaries can never run for one group; it starts again when the lease is obtained again. If the group has no standby, the primary keeps running and this alert is the only effect.',
   groupWithoutSynchronousStandby:
