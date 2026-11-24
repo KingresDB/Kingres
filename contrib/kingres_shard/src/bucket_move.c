@@ -542,15 +542,66 @@ move_locktag(int64 move_id, LOCKTAG *tag)
 PG_FUNCTION_INFO_V1(kingres_internal_move_lock);
 PG_FUNCTION_INFO_V1(kingres_internal_move_unlock);
 PG_FUNCTION_INFO_V1(kingres_internal_move_alive);
+PG_FUNCTION_INFO_V1(kingres_internal_move_group_take);
+PG_FUNCTION_INFO_V1(kingres_internal_move_group_drop);
+PG_FUNCTION_INFO_V1(kingres_internal_move_group_held);
+
+/*
+ * Take a session lock by trying, until kingres_shard.node_timeout seconds have
+ * passed (a cancel is honoured between two tries); object_in_use when it is
+ * not got.  The only other holders of these tags are the probes below, which
+ * hold a tag for an instant, and a session that really holds it.
+ */
+static void
+move_take_bounded(const LOCKTAG *tag, const char *what)
+{
+	TimestampTz end = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+												  kingres_shard_node_timeout * 1000);
+
+	for (;;)
+	{
+		if (LockAcquire(tag, ExclusiveLock, true, true) != LOCKACQUIRE_NOT_AVAIL)
+			return;
+		CHECK_FOR_INTERRUPTS();
+		if (GetCurrentTimestamp() >= end)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_IN_USE),
+					 errmsg("%s", what),
+					 errhint("Another session holds it; see kingres.bucket_move and pg_locks.")));
+		pg_usleep(20000L);
+	}
+}
+
+/* Let go of a session lock when this session holds it (no warning when it does not). */
+static void
+move_drop_if_held(const LOCKTAG *tag)
+{
+	if (LockHeldByMe(tag, ExclusiveLock, false))
+		(void) LockRelease(tag, ExclusiveLock, true);
+}
+
+/*
+ * Whether another session holds the lock.  There is no interrupt check between
+ * the try and the release, so a cancel cannot leave the probe's lock behind.
+ */
+static bool
+move_probe(const LOCKTAG *tag)
+{
+	if (LockAcquire(tag, ExclusiveLock, true, true) == LOCKACQUIRE_NOT_AVAIL)
+		return true;
+	(void) LockRelease(tag, ExclusiveLock, true);
+	return false;
+}
 
 Datum
 kingres_internal_move_lock(PG_FUNCTION_ARGS)
 {
 	LOCKTAG		tag;
+	int64		id = PG_GETARG_INT64(0);
 
 	require_superuser("kingres.internal_move_lock()");
-	move_locktag(PG_GETARG_INT64(0), &tag);
-	(void) LockAcquire(&tag, ExclusiveLock, true, false);
+	move_locktag(id, &tag);
+	move_take_bounded(&tag, psprintf("the live mark of bucket move " INT64_FORMAT " is held by another session", id));
 	PG_RETURN_VOID();
 }
 
@@ -561,23 +612,69 @@ kingres_internal_move_unlock(PG_FUNCTION_ARGS)
 
 	require_superuser("kingres.internal_move_unlock()");
 	move_locktag(PG_GETARG_INT64(0), &tag);
-	(void) LockRelease(&tag, ExclusiveLock, true);
+	move_drop_if_held(&tag);
 	PG_RETURN_VOID();
 }
 
+/* The probe of the mark alone; SQL kingres.internal_move_mark_held().  internal_move_alive() in SQL looks at the lock of the start first. */
 Datum
 kingres_internal_move_alive(PG_FUNCTION_ARGS)
 {
 	LOCKTAG		tag;
-	LockAcquireResult res;
 
 	require_superuser("kingres.internal_move_alive()");
 	move_locktag(PG_GETARG_INT64(0), &tag);
-	res = LockAcquire(&tag, ExclusiveLock, true, true);
-	if (res == LOCKACQUIRE_NOT_AVAIL)
-		PG_RETURN_BOOL(true);
-	(void) LockRelease(&tag, ExclusiveLock, true);
-	PG_RETURN_BOOL(false);
+	PG_RETURN_BOOL(move_probe(&tag));
+}
+
+/*
+ * The lock of the start of a move.  The record of a move is written and
+ * committed by a session of its own, and the live mark above is taken by the
+ * caller afterwards; in between the record is visible and nobody holds the
+ * mark, so the recovery worker (or a check) would take the move for dead and
+ * undo it under the caller.  The caller therefore holds this lock, keyed by
+ * (colocation group, bucket), from before the record is written until it holds
+ * the mark, and the probe (internal_move_alive in SQL) looks at it first.  Like
+ * the mark it has a fourth field that the SQL advisory functions never use.
+ */
+static void
+move_group_locktag(int32 colo, int32 bucket, LOCKTAG *tag)
+{
+	SET_LOCKTAG_ADVISORY(*tag, MyDatabaseId, (uint32) colo, (uint32) bucket, 4);
+}
+
+Datum
+kingres_internal_move_group_take(PG_FUNCTION_ARGS)
+{
+	LOCKTAG		tag;
+	int32		colo = PG_GETARG_INT32(0);
+	int32		bucket = PG_GETARG_INT32(1);
+
+	require_superuser("kingres.internal_move_group_take()");
+	move_group_locktag(colo, bucket, &tag);
+	move_take_bounded(&tag, psprintf("bucket %d of colocation group %d is being started by another session", bucket, colo));
+	PG_RETURN_VOID();
+}
+
+Datum
+kingres_internal_move_group_drop(PG_FUNCTION_ARGS)
+{
+	LOCKTAG		tag;
+
+	require_superuser("kingres.internal_move_group_drop()");
+	move_group_locktag(PG_GETARG_INT32(0), PG_GETARG_INT32(1), &tag);
+	move_drop_if_held(&tag);
+	PG_RETURN_VOID();
+}
+
+Datum
+kingres_internal_move_group_held(PG_FUNCTION_ARGS)
+{
+	LOCKTAG		tag;
+
+	require_superuser("kingres.internal_move_group_held()");
+	move_group_locktag(PG_GETARG_INT32(0), PG_GETARG_INT32(1), &tag);
+	PG_RETURN_BOOL(move_probe(&tag));
 }
 
 /*

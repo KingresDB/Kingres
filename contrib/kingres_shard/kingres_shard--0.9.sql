@@ -19671,6 +19671,71 @@ END;
 $$;
 
 
+-- =========================================================================
+-- Moves: the lock of the start is held from before the record is written until the live mark is held                 [begin]
+-- =========================================================================
+
+-- A move is begun by one session (the record is written and committed by a session of its own) and then marked alive by the caller, which takes a lock on the
+-- id of the move.  Between the two the record existed with nobody holding the mark, and the only protection was the grace time of resume_bucket_moves() (a
+-- session that stalls for longer than the grace still lost its move to the worker).  Now the caller holds a lock of (colocation group, bucket) from before the
+-- record is written until it holds the mark, the mark is waited for (the probes hold it for an instant), both are bounded by kingres_shard.node_timeout
+-- (object_in_use), and internal_move_alive() looks at both, the lock of the start first.  move_bucket() lets go of both in its one protected block.
+-- The probes are in C and have no interrupt check between the try and the release, so a cancel cannot leave one behind.
+CREATE FUNCTION kingres.internal_move_group_take(p_colocation int, p_bucket int)
+    RETURNS void
+    AS 'MODULE_PATHNAME', 'kingres_internal_move_group_take'
+    LANGUAGE C STRICT
+    SET search_path = pg_catalog, kingres, pg_temp;
+
+CREATE FUNCTION kingres.internal_move_group_drop(p_colocation int, p_bucket int)
+    RETURNS void
+    AS 'MODULE_PATHNAME', 'kingres_internal_move_group_drop'
+    LANGUAGE C STRICT
+    SET search_path = pg_catalog, kingres, pg_temp;
+
+CREATE FUNCTION kingres.internal_move_group_held(p_colocation int, p_bucket int)
+    RETURNS bool
+    AS 'MODULE_PATHNAME', 'kingres_internal_move_group_held'
+    LANGUAGE C STRICT
+    SET search_path = pg_catalog, kingres, pg_temp;
+
+-- The probe of the mark alone (the function that was internal_move_alive()).
+CREATE FUNCTION kingres.internal_move_mark_held(p_move bigint)
+    RETURNS bool
+    AS 'MODULE_PATHNAME', 'kingres_internal_move_alive'
+    LANGUAGE C STRICT
+    SET search_path = pg_catalog, kingres, pg_temp;
+
+-- Whether a session runs the move: it holds the lock of the start (between the record and the mark), or it holds the mark.  The lock of the start is looked at
+-- first: the caller lets it go only after it holds the mark, so a move whose record is visible is seen alive by one of the two.
+CREATE OR REPLACE FUNCTION kingres.internal_move_alive(move_id bigint)
+    RETURNS bool
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_colo   pg_catalog.int4;
+    v_bucket pg_catalog.int4;
+BEGIN
+    SELECT b.colocation_id, b.bucket INTO v_colo, v_bucket FROM kingres.bucket_move b WHERE b.move_id OPERATOR(pg_catalog.=) internal_move_alive.move_id;
+    IF FOUND AND kingres.internal_move_group_held(v_colo, v_bucket) THEN
+        RETURN true;
+    END IF;
+    RETURN kingres.internal_move_mark_held(internal_move_alive.move_id);
+END;
+$$;
+
+REVOKE ALL ON FUNCTION
+    kingres.internal_move_group_take(int, int),
+    kingres.internal_move_group_drop(int, int),
+    kingres.internal_move_group_held(int, int),
+    kingres.internal_move_mark_held(bigint)
+    FROM PUBLIC;
+
+-- =========================================================================
+-- Moves: the lock of the start                                                                                         [end]
+-- =========================================================================
+
 CREATE OR REPLACE FUNCTION kingres.move_bucket(colocation_id int, bucket int, target_group int)
     RETURNS bigint
     LANGUAGE plpgsql
@@ -19831,17 +19896,24 @@ BEGIN
     END IF;
     PERFORM kingres.internal_fault_point('move_after_precheck');
 
-    -- 1. Preparing: the cluster lock, the record, the state "moving" on every node.
-    v_id := kingres.internal_exec_scalar(v_self, pg_catalog.format('SELECT kingres.internal_begin_move(%s, %s, %s)',
-                                                                   v_colo, v_bucket, v_target))::pg_catalog.int8;
-    v_name := pg_catalog.format('ks_move_%s', v_id);
-    -- The mark of a live move: whoever finds this lock held knows the session is
-    -- still running it (resume_bucket_moves() skips it).  It is released when the
-    -- function ends, or with the session.
-    PERFORM kingres.internal_move_lock(v_id);
-    v_stage := 1;
-
     BEGIN
+        -- 1. Preparing: the cluster lock, the record, the state "moving" on every node.
+        -- The lock of the start of the move is held from before the record is written until the live mark is held: the record is committed by a session of its
+        -- own, and between that commit and the mark the recovery worker would take the move for dead and undo it under this session.  Both locks are bounded
+        -- (node_timeout, object_in_use) and the one protected block lets go of them whatever happens.
+        PERFORM kingres.internal_move_group_take(v_colo, v_bucket);
+        v_id := kingres.internal_exec_scalar(v_self, pg_catalog.format('SELECT kingres.internal_begin_move(%s, %s, %s)',
+                                                                       v_colo, v_bucket, v_target))::pg_catalog.int8;
+        v_name := pg_catalog.format('ks_move_%s', v_id);
+        v_stage := 1;
+        PERFORM kingres.internal_fault_point('move_after_begin');
+        -- The mark of a live move: whoever finds this lock held knows the session is
+        -- still running it (resume_bucket_moves() skips it).  It is released when the
+        -- function ends, or with the session.
+        PERFORM kingres.internal_move_lock(v_id);
+        PERFORM kingres.internal_fault_point('move_after_mark');
+        PERFORM kingres.internal_move_group_drop(v_colo, v_bucket);
+
         PERFORM kingres.internal_fault_point('move_after_preparing');
 
         -- 2. Copying.
@@ -20008,6 +20080,8 @@ BEGIN
             END;
         END IF;
         PERFORM kingres.internal_move_unlock(v_id);
+        -- the lock of the start goes last: while it is held, a probe sees the move alive, also while the undo above runs
+        PERFORM kingres.internal_move_group_drop(v_colo, v_bucket);
         RAISE;
     END;
     PERFORM kingres.internal_move_unlock(v_id);
