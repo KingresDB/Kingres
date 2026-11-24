@@ -844,14 +844,125 @@ lost (`failoverServer` on it with `allowDataLoss: true`), which promotes the nex
 report states.
 
 **The certificate authority.** The new leader needs `ca.key` and `revoked.json` to issue and revoke
-certificates (README "What has to move with the manager"). **Decision:** the leader keeps an encrypted copy
-of both on the servers that host a ready standby of group 0 (`<data-dir>/pki/escrow/`, mode 0600, sealed with
-a key derived from the cluster secret that every server already holds for node sessions; sent by the internal
-call `POST /pki/escrow` after every change of `revoked.json` and every 6 hours), and B8 adopts it before the
-gate opens. Without the escrow the new leader answers `certificate_authority_unavailable` (an existing
-problem code) for the operations that need the CA, and the renewal jobs of the other servers fail visibly
-until it is adopted; their certificates last a year, so a failover without escrow is survivable for a long
-while but not acceptable for ever. Open point 11.2.
+certificates (README "What has to move with the manager"). **Decision (revised 2026-11-22, built as contract
+0.26.0):** the leader keeps a *sealed* copy of both on each server that hosts a ready standby of group 0,
+and the new leader opens its own copy at B8. The first text of this section sealed the copy with "a key
+derived from the cluster secret that every server already holds for node sessions"; that secret lives in
+the extension, not in `kingresd` (see "Found while building", increment 5), so the construction below
+replaces it. The full design, its alternatives and its threat model are in section 3.4.1. Without a copy
+the new leader answers `certificate_authority_unavailable` for the operations that need the CA and raises
+the critical alert `certificateAuthorityUnavailable`; the renewal jobs of the other servers fail visibly
+until the operator restores the key by hand; their certificates last a year, so a failover without a copy is
+survivable for a long while but not acceptable for ever.
+
+#### 3.4.1 Escrow of the CA key: construction, alternatives, threat model
+
+**Alternatives.**
+
+| Option | Failover without an operator | Key readable by PostgreSQL roles | New secrets to look after | Verdict |
+|---|---|---|---|---|
+| Wrapped to a key of each server that may become leader | yes | no (files of the server, outside the databases) | none for the operator; one small key file per recipient | **chosen** |
+| Key derived from an operator passphrase | no: someone has to type it during the failover | no | the passphrase | rejected: the failover would wait for a person, and the passphrase is one more secret to lose |
+| Shares split over the servers (Shamir) | yes, with a quorum of servers during a failover that has just lost one | no | none | rejected: the new leader must collect shares from other servers at the worst moment, a changed set of servers needs a new split, and it buys little: with 3 servers it is no better than a copy on the standby's server |
+| Encrypted in the system database with a key only servers hold | yes | the ciphertext is, the key is not | a key that would itself have to reach every server | rejected: that key is the same problem again, and a blob in the database is in every backup and every replica |
+
+**Construction (`internal/pki/escrow.go`, `internal/membership/escrow.go`).**
+
+- Every recipient has an **escrow key**: an X25519 key pair in `<data-dir>/pki/escrow/recipient-<id>.key`
+  (mode 0600). It is made on the first offer, never leaves the server, and is **not** the server's TLS key
+  (no signing key is used for key agreement).
+- The leader asks the recipient for the public key (`POST /pki/escrow/offer`, `LeaderOnly`), seals the CA key
+  and the content of `revoked.json` to it, and sends the blob (`POST /pki/escrow/store`). The seal is an
+  ephemeral X25519 key agreement, HKDF-SHA256 (salt: both public keys; info: a fixed label) and AES-256-GCM.
+  The additional data bind the blob to its recipient, its escrow key id, the CA certificate's SHA-256, a
+  generation and the time, so a blob cannot be moved to another server or relabelled.
+- **A recipient checks what it is sent.** It opens the blob with its own key and accepts it only when the key
+  inside is the key of the `ca.crt` it already holds, its revocation list parses, and its position (epoch,
+  generation, seq; the clock orders nothing) is not older than the copy it holds. A blob that anyone else made for it (the public key is public) cannot put another CA in place,
+  and an old blob cannot replace a new one.
+- **Adoption.** At B8 the new leader calls `AdoptEscrow` through the port `CheckAuthority`: when it has no
+  `ca.key`, it opens its copy, checks again that the key is the one of `ca.crt`, merges the revocation list of
+  the copy with the list the previous leader last distributed (`revoked-serials.json`, the union, so a
+  revocation sent after the last copy is not lost), and writes `revoked.json` and then `ca.key` (mode 0600,
+  never over an existing file). Only then does it answer "key held" and the alert is not raised. Only the
+  new leader at B8 adopts; a server that merely holds a copy never turns it into a key.
+- **Distribution.** The escrow is **off until the operator switches it on** (`setCaEscrow`, section 7): it puts
+  copies of the most sensitive key on more disks, which is the operator's decision. When on, the leader
+  reconciles every minute: it sends to every recipient whose copy is missing, older than the revocation list
+  (a hash of the content), from an older generation, or older than 6 hours, and sends again at once after
+  every revocation. The recipients are the servers that host a ready standby of group 0 (the servers that can
+  win a map-group failover) and are active members whose certificates are not revoked. A server that stops
+  being a recipient (removed, revoked, standby gone) is told to delete its copy and its escrow key, and the
+  new leader goes on with the same bookkeeping (`escrow/state.json`, rebuilt from the adopted copy: `enabled`).
+- **Rotation** (`rotateCaEscrow`): every recipient makes a new escrow key, the leader seals a new generation to
+  it, and the recipient deletes its old key and copy when the new one is stored. Until then the old copy still
+  opens, so a failover during a rotation still works. **Revocation** keeps working as before: the leader
+  that holds the key revokes, the revocation list is sent to every server, and it is sealed again at once.
+- The key is never in a REST answer, a task, an audit event, a log or PostgreSQL. The sealed copy is a file in
+  the pki directory, read by `kingresd` only.
+
+**Threat model, stated honestly.**
+
+1. *A role in PostgreSQL* (even a superuser, who can read the files the instance's OS user can read): the
+   copies and the escrow keys are files beside `ca.key` and `server.key`, so a superuser role that can read
+   server files can read them. This is exactly as before for `ca.key` on the leader; escrow adds no new path
+   for a role that cannot read files, and nothing is stored in a table.
+2. *The disk of one recipient* (a stolen disk, a backup of the pki directory, a read-everything compromise of
+   the host): **the attacker has the CA key.** The copy and the key that opens it are on the same disk, so
+   the seal does not protect against the disk's owner; it protects the copy where the escrow key is absent
+   (a copy that is moved alone, a log or a trace, a database dump). The escrow therefore
+   **widens the set of disks that can hold the CA key from one (the leader's) to the leader's plus every
+   server that hosts a standby of the map group.** Every server is already fully trusted by every other
+   (README, decision D3), and the set is small, but the operator must know it: that is why it is off until
+   switched on, and why only the standbys of group 0 receive a copy.
+3. *A server that is removed while it holds a copy*: the leader tells it to delete the copy and key (and it is
+   dropped from the recipients at once); if the server cannot be reached, it keeps the copy and must be
+   treated as knowing the CA key. The rotation of the CA itself (a new CA key and a re-issue of every
+   certificate) is **not built**, so the only remedy today is to rebuild the cluster's trust by hand; the
+   contract text says so.
+4. *Rotation of the escrow* limits how long an old escrow key opens a copy; it does not change the CA key, so
+   an attacker who took a copy and its key earlier keeps the CA key.
+5. *A man in the middle* sees nothing useful: the calls are the internal API, mutual TLS, `LeaderOnly`, and the
+   blob is sealed.
+6. *A tampered or substituted copy* does not open (AES-GCM) or is not the CA's key (the check against
+   `ca.crt`); the server keeps its previous copy, the new leader raises the alert and does not write `ca.key`.
+7. *Two holders of the CA key* (review CAE-4, fixed 2026-11-23): the old leader's server, when it returns, still holds its
+   `ca.key` and the list it had. It is a follower and never issues, but if it became the leader again (a second failover) it
+   would distribute that list and undo every revocation made while it was away. Four defences, each tested: (a) a server that
+   holds `ca.key` and receives a list merges it into its own CA; (b) a leader that takes over, with or without adopting, and
+   every distribution first reads the lists of its own files, its sealed copy and every server and merges them; (c) a holder
+   refuses a list whose number is lower than the one it holds or that lacks a serial it holds (409 `stale_revocations`), and the
+   sender merges and sends again; (d) the number of a list is at least the time in seconds, so the lists of two holders are in
+   the order they were issued in. What is left: the old leader's `ca.key` stays on its disk (it is the same key as the
+   recipients' copies; remove it when the server is rebuilt or retired), and a compromised member can add serials to the
+   merged list (it is trusted as every member is, D3, and the effect is a refused certificate, not an accepted one).
+8. *Rollback and a former leader* (CAE-1): copies are ordered by (epoch, generation, seq), never by time. A leader that takes
+   over takes an epoch above every one it has seen; a recipient refuses a blob, and a drop, of an older epoch, and a leader that
+   finds a copy of a higher epoch seals nothing over it. A former leader that has not heard that it was replaced therefore
+   cannot replace a copy or make a server delete one. Only the operator's `rotateCaEscrow`, made on the leader of the moment,
+   takes an epoch above what a server holds.
+9. *The operator's choice must survive a failover* (CAE-3): `enabled`, the epoch and the holders are kept in the system
+   database (`caEscrow` in `kingres_cp.cluster_setting`), so a stale copy on a server that was down when the escrow was
+   switched off does not switch it on again, and the new leader deletes the copies of servers that no longer qualify. If the
+   system database cannot be read at the failover, the new leader logs it and takes a copy to mean that the escrow was on.
+10. *A copy that cannot be deleted* (CAE-2): the record of a recipient stays, as `dropPending`, until the drop succeeded; until
+    then that server must be treated as knowing the key. A standby that is missing from the list for less than three rounds
+    keeps its copy.
+11. *Durability* (CAE-5): `ca.key` is written with the durable write; a `ca.key` that is not the key of `ca.crt` is put
+    aside, and without a copy the alert is raised.
+12. *What a server may say about revocations* (CAF-1, fixed 2026-11-23): the leader merges the list of another server only for serials this CA
+    issued, at most 10000 and 64 characters each, never from a server whose certificates are revoked, and never when the issued serials cannot
+    be read. Without this a single server could make the leader revoke any certificate, and the rule that a list never shrinks would make it
+    permanent. The remaining power of a member is to name a certificate that exists; it is the trust of every member (D3).
+13. *Clocks and the number of a list* (CAF-2): the number is at least the time in seconds, and a leader raises it above every number it learns from
+    the servers (their answers and their refusals). A number more than a day above the leader's clock is not followed.
+14. *The epoch is not a second fence* (CAF-4): two servers that take over without seeing each other's epoch both take the next one; the lease of the map
+    group is what prevents that, and the epoch only keeps the copies of a former leader from winning. A rotation does not take an epoch above what a server
+    holds.
+
+**What this does not do.** It does not rotate the CA (the CA lasts 10 years), does not protect a cluster whose
+leader and every standby of the map group are lost at once (restore from a backup as before), and does not
+escrow `server.key` of any server (a key never leaves its server).
 
 ### 3.5 (c) The old primary is reachable
 
@@ -1847,7 +1958,7 @@ Each has a recommendation, so that the implementer does not have to stop and ask
    both*: F7 treats them alike (repeat within the budget, record the text), F0b empties the lists of the groups
    whose standby sat on the failed server, and test T15 records which message really comes. *Recommendation*:
    keep the two branches until the README says; then delete one.
-2. **The certificate authority on a map-group failover.** `ca.key` and `revoked.json` live on the first
+2. **The certificate authority on a map-group failover (resolved 2026-11-22: 3.4.1).** `ca.key` and `revoked.json` live on the first
    server. *Recommendation*: the encrypted escrow of 3.4 to the servers that host standbys of group 0, adopted
    at B8, in increment 5. Alternative: a map failover that leaves the CA unavailable (acceptable for a short
    time, not for a year). Risk: more copies of the key; every server is already fully trusted by every other
@@ -1914,7 +2025,7 @@ is in the section named).
 6. `standbys-gone` empties the lists of the other groups at once when a server is failed over (3.3 F0b).
 7. The map group is promoted by a bootstrap run by a follower, with a local journal, the lease and the
    extension's majority rule as its authority; the task is recorded afterwards; the engine has a gate (3.4).
-8. The certificate authority is escrowed, sealed, to the servers that host standbys of the map group (3.4).
+8. The certificate authority is escrowed, sealed, to the servers that host standbys of the map group (3.4, 3.4.1; built 2026-11-22 once the operator switches it on).
 9. Instance directories keep their ids; a role file says what an instance serves; the catalog and the role
    files replace "instance 1" everywhere (3.7).
 10. The old primary is rebuilt by the reconcile loop, not inside the task; it counts as a planned standby for
@@ -2379,7 +2490,7 @@ never names a stored task. REST contract 0.13.0 (additive) has this, and the ale
 
 **Departures from the design.**
 
-- **The key of the certificate authority is not escrowed** (section 11.2). No sealing key could be
+- **The key of the certificate authority is not escrowed** (section 11.2; built later, see "The escrow of the key of the certificate authority (2026-11-22)"). No sealing key could be
   derived from what exists without a new construction, and the cluster secret lives in the
   extension, not in `kingresd`. The bootstrap runs without it. A new leader that has no
   `pki/ca.key` raises the critical alert `certificateAuthorityUnavailable` at B8. No certificate can
@@ -2722,3 +2833,30 @@ what guards that. So:
 - A bootstrap that was given up whose lease could not be let go of fails the abandon (503) and leaves the repeat to finish the release; the promoting call refuses a journal that was given up.
 - A hold that cannot be resolved is named in the log at warning level once a minute and in the failover status (`paused`, with the reason); the system database is the held-back primary, so an alert
   cannot be recorded, and the status can only be read where a session can be made.
+
+### The escrow of the key of the certificate authority (2026-11-22, contract 0.26.0)
+
+Built: the last open item of phase 5. Section 3.4.1 has the construction and the threat model; this is what changed from the first
+recommendation (11.2) and what was found.
+
+- **The sealing key is not derived from the cluster secret.** That secret is in the extension, not in `kingresd`; the copy is sealed to a
+  per-server escrow key (X25519, `pki/escrow/recipient-<id>.key`) that the recipient makes and the leader learns by asking over the internal
+  API (`POST /pki/escrow/offer`, `store`, `drop`, all `LeaderOnly`). Nothing about the cluster secret changes.
+- **Off until switched on.** The operator decides (`setCaEscrow`) because every recipient's disk then can hold the CA key (3.4.1, threat 2). The alert
+  `certificateAuthorityUnavailable` stays for a failover without a copy, and its text now says what to do before the next one.
+- **Adoption is at B8**, through the existing port `CheckAuthority` (`membership.Manager.AdoptEscrow`); the failover runner is unchanged. The copy is
+  checked against `ca.crt` before `ca.key` is written, and the revocation list is the union of the copy and `revoked-serials.json` (the list the
+  previous leader last sent to every server), so a revocation made after the last copy is not lost.
+- **Recipients** are the servers that host a ready standby of group 0 (`kingres_cp.standby`), restricted to active members with valid certificates;
+  the leader reconciles every minute and after every revocation (`distributeRevocations`, the revoke task's distribute step).
+- **Operator path**: `getCaEscrow`, `setCaEscrow`, `rotateCaEscrow` (contract 0.26.0, a placeholder number the integrator renumbers). No console part:
+  the three are REST only for now.
+- **Tests**: `internal/pki/escrow_test.go` (round trip, hostile blobs, wrong key, foreign CA, replay, rotation, drop), `internal/membership/escrow_test.go`
+  (the leader's side with the receivers of other servers behind a transport seam), `internal/httpapi/handlers_caescrow_test.go`, and in
+  `internal/clustertest/caescrow_test.go` the failover of the leader's server with the escrow on (no alert; the new leader holds `ca.key`; the other
+  server's renewal job gets a certificate from it without a request; the operator's renewal works) and the same with a tampered copy (no key, alert).
+- **Review (2026-11-22, [report](../reviews/2026-11-22-ca-key-escrow.md)) and its fixes (2026-11-23)**: the cipher was found sound; the findings were about state and
+  failover (a returning leader could undo revocations cluster-wide, a new leader reused a generation, records were forgotten, the operator's choice
+  was lost at a failover, `ca.key` was not written durably). Threats 7 to 11 above and the Fixes section of the report say what changed.
+- **Left**: a console panel for the three operations; an alert for a recipient that stays out of date; the removal of `ca.key` from an old leader that
+  returns; the rotation of the CA itself, which the escrow does not replace.

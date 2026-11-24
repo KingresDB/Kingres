@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.25.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.26.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and, when it is built, the planned `kingres-cli` (it does not exist yet). Lint it and run the mechanical rule check with:
 
 ```
@@ -362,6 +362,27 @@ Where the architecture document leaves something open, the simplest option was c
     range and the cluster's replica count.
 
 ## Changelog
+
+### 0.26.0
+
+Revision written with the escrow of the key of the certificate authority (phase 5, `kingres/docs/design/ha-phase5-part2.md`, section 3.4). Summary for the panel:
+3 operations added (174 operations, 138 paths); two values added to an enum; **no change that is not additive**.
+
+#### Breaking
+
+None.
+
+#### Additive
+
+- `getCaEscrow` (`GET /certificate-authority/escrow`), `setCaEscrow` (`PUT /certificate-authority/escrow`) and `rotateCaEscrow` (`POST /certificate-authority/escrow/rotations`): the escrow of the CA key, on the leader, `kingres_admin`.
+  Schemas `CaEscrowStatus`, `CaEscrowRecipient` and `CaEscrowUpdate`. The answers are immediate (no task).
+- `AuditAction` has `setCaEscrow` and `rotateCaEscrow`.
+- `CaEscrowRecipient.state` is `current`, `pending`, `refused` or `dropPending`.
+
+#### Documentation
+
+- `certificateAuthorityUnavailable` is no longer raised after a failover of the map group when the escrow was on and complete before it; the new leader adopts its sealed copy.
+
 
 ### 0.25.0
 

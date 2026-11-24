@@ -28,6 +28,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover/mapgroup"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fwdproof"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/membership"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pki"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/rebalance"
@@ -82,6 +83,8 @@ type mapFailover struct {
 	endHold         func(ctx context.Context) error
 	queryInRec      func(ctx context.Context, id int) (bool, error)
 	controlDataOf   func(ctx context.Context, id int) (map[string]string, error)
+	// adoptCA makes this server the holder of the CA from its sealed copy of the key (escrow of the CA key); nil: no escrow.
+	adoptCA func(ctx context.Context) (bool, error)
 
 	mu      sync.Mutex
 	running bool
@@ -699,7 +702,17 @@ func engineGate(fd *failoverDeps) func() bool {
 	return fd.mf.journal.Gate
 }
 
-func (p *mapPorts) CheckAuthority(context.Context) (bool, error) {
+func (p *mapPorts) CheckAuthority(ctx context.Context) (bool, error) {
+	// The new leader opens its sealed copy of the key first (escrow of the CA key): with it the alert is not raised.
+	// The answer of the adoption is the answer: a ca.key that is there but cannot be used is not a key held (it is put aside, and
+	// without a copy the alert is raised).
+	if p.m.adoptCA != nil {
+		ok, err := p.m.adoptCA(ctx)
+		if err != nil {
+			p.m.log.Warn("the sealed copy of the CA key was not adopted", "error", err)
+		}
+		return ok, nil
+	}
 	_, err := os.Stat(filepath.Join(p.m.svc.PKIDir(), pki.CAKeyFile))
 	if err == nil {
 		return true, nil
@@ -1180,4 +1193,24 @@ func (p *mapPorts) ResumeOldLeader(ctx context.Context, oldServer string) error 
 	}
 	_, err := p.m.resumeOldLeader(ctx, oldServer)
 	return err
+}
+
+// wireEscrow connects the escrow of the CA key to the failover of the map group: the recipients are the servers that host a
+// ready standby of group 0 (the only servers that can become the manager leader), and the new leader of the failover adopts its
+// sealed copy at B8.
+func wireEscrow(members *membership.Manager, mf *mapFailover) {
+	mf.adoptCA = members.AdoptEscrow
+	members.SetEscrowRecipients(func(ctx context.Context) ([]string, error) {
+		recs, err := mf.pl.Standbys(ctx, 0)
+		if err != nil {
+			return nil, err
+		}
+		var out []string
+		for _, s := range recs {
+			if s.State == "ready" {
+				out = append(out, s.Server)
+			}
+		}
+		return out, nil
+	})
 }

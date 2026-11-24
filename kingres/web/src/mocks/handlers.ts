@@ -78,6 +78,34 @@ import {
 
 type S = components['schemas']
 
+// The escrow of the CA key in the mock: one recipient, the standby of the map group.
+const caEscrow = { enabled: false, generation: 0 }
+function caEscrowStatus(): S['CaEscrowStatus'] {
+  const on = caEscrow.enabled
+  const now = new Date().toISOString()
+  return {
+    enabled: on,
+    holdsKey: true,
+    generation: caEscrow.generation,
+    recipients: on
+      ? [
+          {
+            serverId: '10.0.0.12',
+            state: 'current',
+            keyId: 'a1b2c3d4e5f60718',
+            generation: caEscrow.generation,
+            sealedAt: now,
+            error: null,
+          },
+        ]
+      : [],
+    complete: on,
+    message: on
+      ? 'Every server that can become leader holds a sealed copy of the CA key.'
+      : 'Escrow is off: a new manager leader has no CA key until an operator restores it by hand.',
+  }
+}
+
 /**
  * A digest document as the extension prints it: its own key order and spacing, and an integer a
  * float cannot hold. The panel must save these characters unchanged.
@@ -2478,6 +2506,21 @@ export function createHandlers(): HttpHandler[] {
           'The standby of the map group was promoted already; the bootstrap goes on to its end.',
         )
       return ok({ abandoned: false } satisfies S['AbandonMapGroupBootstrapResult'])
+    },
+    // --- escrow of the key of the certificate authority (0.26.0): the standby of the map group is the one recipient
+    getCaEscrow: () => ok(caEscrowStatus()),
+    setCaEscrow: (c) => {
+      const req = body<S['CaEscrowUpdate']>(c)
+      if (mockConfig.caUnavailable) throw problem('certificate_authority_unavailable')
+      if (req.enabled && !caEscrow.enabled) caEscrow.generation += 1
+      caEscrow.enabled = req.enabled
+      return ok(caEscrowStatus())
+    },
+    rotateCaEscrow: () => {
+      if (mockConfig.caUnavailable) throw problem('certificate_authority_unavailable')
+      if (!caEscrow.enabled) throw problem('conflict')
+      caEscrow.generation += 1
+      return ok(caEscrowStatus())
     },
 
     // --- tasks

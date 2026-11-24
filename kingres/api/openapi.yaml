@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: KingresDB Management API
-  version: 0.25.0
+  version: 0.26.0
   summary: REST API of the KingresDB management panel, CLI and manager.
   description: |
     The single REST API served by `kingresd` on every KingresDB server. The web panel
@@ -1256,6 +1256,97 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /certificate-authority/escrow:
+    get:
+      operationId: getCaEscrow
+      summary: Get the escrow of the certificate authority key
+      description: |
+        Added in 0.26.0. Whether the escrow of the key of the cluster certificate authority is on, which servers hold
+        a sealed copy of the key and whether each copy is the newest. The escrow lets a new manager leader (after the
+        failover of the map group) issue, renew and revoke certificates without the old leader: it opens its own copy
+        and goes on. Without it the new leader raises the alert `certificateAuthorityUnavailable` until an operator
+        restores `pki/ca.key` and `pki/revoked.json` by hand. The answer is the leader's (the request is forwarded).
+        Needs `kingres_admin`. The key itself is never in an answer, in a task, in an audit event or in the
+        PostgreSQL instances.
+      tags: [Servers]
+      x-required-role: kingres_admin
+      responses:
+        '200':
+          description: The escrow of the CA key.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CaEscrowStatus' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+    put:
+      operationId: setCaEscrow
+      summary: Switch the escrow of the certificate authority key on or off
+      description: |
+        Added in 0.26.0. `enabled: true` makes the leader seal the CA key and the revocation list to every server that
+        hosts a ready standby of the map group (the servers that can become leader) and send each its copy over the
+        internal API; the leader then keeps the copies current (after every revocation, when the standbys change, and at
+        least every 6 hours). `enabled: false` takes every copy and every escrow key away from the servers; a server that
+        cannot be reached is asked again every minute and stays listed until it has deleted its copy. The answer is the
+        status after the first round; a recipient that could not be reached is `pending` and the leader sends again.
+
+        Each copy is encrypted so that only the escrow key of its server opens it (X25519 and AES-256-GCM); that key
+        is a file of the server and is not its TLS key. **A server that holds a copy can become the CA: its disk is as
+        sensitive as the leader's.** Switch the escrow on only when the servers that host standbys of the map group are
+        as trusted as the leader. A server that is removed while it holds a copy, and that cannot be reached to delete
+        it, must be treated as knowing the CA key (the rotation of the CA itself is not part of this contract).
+
+        The operation needs the CA key on the leader: 503 `certificate_authority_unavailable` when it does not. It is
+        audited under `setCaEscrow`.
+      tags: [Servers]
+      x-required-role: kingres_admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CaEscrowUpdate' }
+            examples:
+              on: { value: { enabled: true } }
+      responses:
+        '200':
+          description: The escrow after the operation.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CaEscrowStatus' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /certificate-authority/escrow/rotations:
+    post:
+      operationId: rotateCaEscrow
+      summary: Rotate the escrow keys and reseal the copies
+      description: |
+        Added in 0.26.0. Every recipient makes a new escrow key, the leader seals a new generation of the copy to it,
+        and the recipient deletes its old key and old copy when the new copy is stored. Use it when the escrow keys
+        may have been exposed without the CA key being known to be (a copy of an old disk image, a retired server).
+        It does not change the CA key: a copy that an attacker already took together with the escrow key that opens it
+        still opens. 409 `conflict` while the escrow is off; 503 `certificate_authority_unavailable` when the leader
+        has no CA key. Audited under `rotateCaEscrow`.
+      tags: [Servers]
+      x-required-role: kingres_admin
+      responses:
+        '200':
+          description: The escrow after the rotation.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CaEscrowStatus' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '405': { $ref: '#/components/responses/MethodNotAllowed' }
         '409': { $ref: '#/components/responses/Conflict' }
         '422': { $ref: '#/components/responses/UnprocessableEntity' }
@@ -11316,6 +11407,42 @@ components:
         - deleteDataExport
         - dataTransfer.completed
         - dataTransfer.purged
+        - setCaEscrow
+        - rotateCaEscrow
+    CaEscrowStatus:
+      type: object
+      description: The escrow of the key of the cluster certificate authority (0.26.0).
+      required: [enabled, holdsKey, generation, recipients, complete, message]
+      properties:
+        enabled: { type: boolean, description: Whether the leader keeps sealed copies of the CA key on the servers that can become leader. }
+        holdsKey: { type: boolean, description: Whether the server that answers holds the CA key (the manager leader does). }
+        generation: { type: integer, format: int64, description: Rises when the escrow is switched on again and at every rotation. }
+        recipients:
+          type: array
+          description: The servers that hold, or should hold, a copy.
+          items: { $ref: '#/components/schemas/CaEscrowRecipient' }
+        complete: { type: boolean, description: Whether at least one recipient exists and every recipient holds the newest copy. }
+        message: { type: string, description: What the state means for the operator. }
+    CaEscrowRecipient:
+      type: object
+      description: One server of the escrow.
+      required: [serverId, state, keyId, generation, sealedAt, error]
+      properties:
+        serverId: { type: string }
+        state:
+          type: string
+          enum: [current, pending, refused, dropPending]
+          description: '`current`: the copy is the newest. `pending`: not delivered yet or out of date (the leader sends again). `refused`: the server answered the last send with an error, see `error`. `dropPending`: the server no longer qualifies (or the escrow is off) and its copy has not been deleted yet; the leader asks again every minute, and until it succeeds the server must be treated as knowing the CA key.'
+        keyId: { type: [string, 'null'], description: Identifier of the escrow public key the copy is sealed to. }
+        generation: { type: [integer, 'null'], format: int64 }
+        sealedAt: { type: [string, 'null'], format: date-time }
+        error: { type: [string, 'null'], description: The last error of a send. }
+    CaEscrowUpdate:
+      type: object
+      description: Request of setCaEscrow.
+      required: [enabled]
+      properties:
+        enabled: { type: boolean }
     AuditEvent:
       type: object
       description: One audit log entry.

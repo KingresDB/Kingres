@@ -426,6 +426,8 @@ export const AUDIT_ACTION_LABEL: Record<AuditAction, string> = {
   putPartitionPolicy: 'Set a partitioning policy',
   deletePartitionPolicy: 'Remove a partitioning policy',
   runPartitionPolicy: 'Run a partitioning policy',
+  setCaEscrow: 'Switch the escrow of the certificate authority key on or off',
+  rotateCaEscrow: 'Rotate the escrow of the certificate authority key',
   enableTableLedger: 'Enable the ledger of a table',
   restorePreferredPrimaries: 'Restore preferred primaries',
   startRebalance: 'Start a rebalance',

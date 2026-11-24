@@ -552,6 +552,9 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	foDeps.d = hd
 	hd.MapFailover = foDeps.mf
 	hd.IdentityCheck = newIdentityChecker(authn, serverHost)
+	if members != nil && foDeps.mf != nil {
+		wireEscrow(members, foDeps.mf)
+	}
 	if cfgp != nil {
 		cfgp.start(hd, haCalls)
 	}
@@ -604,6 +607,9 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		job := members.NewRenewalJob(cfg.CertificateRenewFraction, cfg.CertificateCheckInterval, cfg.CertificateRetryInterval)
 		wg.Add(1)
 		go func() { defer wg.Done(); job.Run(bgCtx) }()
+		// The leader keeps the sealed copies of the CA key on the servers that can become leader (when the operator switched the escrow on).
+		wg.Add(1)
+		go func() { defer wg.Done(); members.RunEscrow(bgCtx, time.Minute) }()
 	}
 
 	serveErr := make(chan error, 1)

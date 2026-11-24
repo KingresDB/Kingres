@@ -17,6 +17,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/peerclient"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/peers"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pki"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/wire"
 )
@@ -106,6 +107,9 @@ func (r *Receiver) Handle(ctx context.Context, key, peer string, body []byte) (a
 			return nil, err
 		}
 		if err := svc.InstallPKI(ctx, req); err != nil {
+			if errors.Is(err, pki.ErrStaleRevocations) {
+				return nil, &internalapi.CallError{Status: http.StatusConflict, Code: codeStaleRevocations, Message: err.Error()}
+			}
 			return nil, err
 		}
 		if req.ServerCert != "" && m.OnCertificateInstalled != nil {
@@ -193,6 +197,9 @@ func (r *Receiver) Handle(ctx context.Context, key, peer string, body []byte) (a
 		return wire.Empty{}, nil
 	}
 	if res, ok, err := r.handleCertCall(ctx, key, peer, body); ok {
+		return res, err
+	}
+	if res, ok, err := r.handleEscrowCall(ctx, key, body); ok {
 		return res, err
 	}
 	return nil, &internalapi.CallError{Status: http.StatusNotFound, Code: "not_found", Message: "No such call."}

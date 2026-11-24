@@ -116,6 +116,11 @@ var Calls = map[string]Policy{
 	"POST /pki/renew": ToLeader,
 	"GET /pki/csr":    LeaderOnly,
 
+	// Escrow of the CA key: the leader asks a server for its escrow public key, sends it its sealed copy and takes the copy away.
+	"POST /pki/escrow/offer": LeaderOnly,
+	"POST /pki/escrow/store": LeaderOnly,
+	"POST /pki/escrow/drop":  LeaderOnly,
+
 	// Leaving the cluster (D5, mirror of removing a server): the leaving server
 	// asks the leader, which answers only for the caller named by the certificate.
 	"POST /leave-cluster": ToLeader,
@@ -210,6 +215,7 @@ var handled = map[string]bool{
 	"POST /instance/stop": true, "POST /instance/remove": true, "POST /instance/trust": true, "POST /pki/install": true,
 	"POST /peers": true, "POST /globals/apply": true, "POST /node/finish": true, "POST /node/reset": true, "POST /apply": true,
 	"POST /pki/renew": true, "GET /pki/csr": true,
+	"POST /pki/escrow/offer": true, "POST /pki/escrow/store": true, "POST /pki/escrow/drop": true,
 	"POST /heartbeat": true, "POST /lease/grant": true, "GET /lease/state": true, "POST /standby/plan": true,
 	"POST /standby/create": true, "POST /standby/remove": true, "POST /standby/rebuild": true, "GET /standby/status": true,
 	"GET /failover/position": true, "GET /liveness": true, "GET /catalog/nodes": true, "POST /failover/map/start": true, "POST /failover/map/continue": true, "POST /failover/map/abandon": true, "POST /failover/map/proof": true, "POST /failover/map/refused": true, "GET /failover/map/checkpoint": true, "GET /failover/map/bootstrap": true, "POST /failover/map/resume": true, "GET /failover/state": true, "POST /failover/freeze": true,
@@ -360,6 +366,9 @@ type Backend struct {
 	Leader func() string
 	// Revoked returns the revoked serial numbers (hex).
 	Revoked func() []string
+	// CRLNumber is the number of the revocation list this server holds (0 when none): a leader that distributes learns from it the number its
+	// next list must exceed. Nil answers 0.
+	CRLNumber func() int64
 	// Resources, Logs, Metrics return JSON-encodable values.
 	Resources func(ctx context.Context) (any, error)
 	Logs      func(ctx context.Context, query map[string]string) (any, error)
@@ -568,7 +577,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	limit := int64(1 << 20)
-	if policy == ToLeader || key == "POST /globals/apply" || key == "POST /apply" {
+	if policy == ToLeader || key == "POST /globals/apply" || key == "POST /apply" || key == "POST /pki/install" {
 		limit = 16 << 20
 	}
 	if key != "POST /forward-stream" {
@@ -583,7 +592,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "GET /leader":
 		writeJSON(w, http.StatusOK, map[string]string{"leader": s.be.Leader()})
 	case "GET /revoked":
-		writeJSON(w, http.StatusOK, map[string]any{"serials": s.be.Revoked()})
+		out := map[string]any{"serials": s.be.Revoked()}
+		if s.be.CRLNumber != nil {
+			out["crlNumber"] = s.be.CRLNumber()
+		}
+		writeJSON(w, http.StatusOK, out)
 	case "GET /resources":
 		s.answer(w, func() (any, error) { return s.be.Resources(ctx) })
 	case "GET /metrics":
@@ -783,3 +796,6 @@ func (s *Server) isMember(ctx context.Context, peer string) (bool, error) {
 		}
 	}
 }
+
+// Handled reports whether a call is dispatched to Backend.Handle (the tests of other packages check their calls with it).
+func Handled(key string) bool { return handled[key] }

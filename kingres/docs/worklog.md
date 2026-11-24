@@ -743,6 +743,66 @@ The independent review (docs/reviews/2026-11-22-console-phase9-7.md, no critical
 ---
 
 
+
+
+## 2026-11-23: the review of the CA key escrow and its fixes (branch ca-escrow)
+
+The independent review (`docs/reviews/2026-11-22-ca-key-escrow.md`) found the cryptography sound and eight findings about state and failover (one high, four medium, three low).
+
+### What was done
+
+- **CAE-4 (high)**: a revocation list never shrinks. Holders refuse a list that takes a revocation back (409 `stale_revocations`); a server that holds `ca.key` merges the lists it receives into its CA; a leader that takes over or distributes merges the lists of its files, its sealed copy and every server first; the list number is at least the time in seconds.
+- **CAE-1**: copies are ordered by (epoch, generation, seq); a new leader takes a higher epoch; recipients refuse a blob and a drop of an older epoch.
+- **CAE-2, CAE-3, CAE-6**: records stay (`dropPending`) until a drop succeeded; the operator's choice, the epoch and the holders are mirrored to `kingres_cp.cluster_setting` (`caEscrow`); a standby missing for less than three rounds keeps its copy; switching off tells every active member.
+- **CAE-5, CAE-7, CAE-8**: durable write of `ca.key`, a truncated key is put aside, the list in a blob is parsed on store, length-prefixed additional data, key file mode check, clearing of secrets where Go allows.
+- The cluster test of CAE-4 found that every revocation task on the new leader failed after a failover of the map group (the row of the server that created the cluster has no address); the task now takes the ids of the active members and leaves the address to the peer client.
+- Contract 0.26.0 (still the placeholder) gets the value `dropPending` of `CaEscrowRecipient.state`; the internal calls get `epoch`, `heldEpoch` and `heldGeneration`.
+
+### How it was verified
+
+Unit tests of pki, membership, httpapi, internalapi and kingresd; mutants for each fix (listed in the Fixes section of the report); cluster tests on PostgreSQL 18 and 19 (lane l7), among them `TestCAEscrowARevocationAfterTheFailoverHoldsWhenTheOldLeaderReturns`.
+
+### Still open
+
+The `ca.key` of a returning former leader stays on its disk; a removed server that cannot be reached keeps its copy (`dropPending`); a console panel; an alert for a recipient that stays out of date; the rotation of the CA itself.
+
+---
+
+## 2026-11-22: phase 5, the escrow of the key of the certificate authority (branch ca-escrow)
+
+The last open item of phase 5: after a failover of the leader's server, the new leader raised a critical alert until the operator restored `pki/ca.key` by hand.
+
+### What was done
+
+- **The design** is in `docs/design/ha-phase5-part2.md`, section 3.4.1: the alternatives (a copy wrapped to each server that may become leader; a key from an operator passphrase;
+  split shares; a blob in the system database), the choice of the first, the construction (X25519 key agreement, HKDF-SHA256, AES-256-GCM, additional data that bind the recipient,
+  key id, CA fingerprint, generation and time), the checks of a recipient and of the adoption, and the threat model. The first design (a key derived from the cluster secret) was
+  not buildable: the secret lives in the extension, not in `kingresd`.
+- **The control plane**: `internal/pki/escrow.go` (escrow keys, seal, open, store, drop, adopt, the leader's bookkeeping), `internal/membership/escrow.go` (recipients from the standbys of group 0,
+  the minute-by-minute reconcile and the resend after every revocation, the three internal calls `POST /pki/escrow/offer`, `store` and `drop`, all `LeaderOnly`), the adoption at B8 through the
+  port `CheckAuthority` (`cmd/kingresd/mapfailover.go`), the text of the alert.
+- **The operator path**: contract 0.26.0 (a placeholder number; the integrator renumbers): `getCaEscrow`, `setCaEscrow`, `rotateCaEscrow`, the schemas `CaEscrowStatus`, `CaEscrowRecipient`,
+  `CaEscrowUpdate`, two audit actions. The escrow is off until switched on. The shapes are in the scratch file `ca-escrow/contract.txt` for the integrator. No console part (the operations are REST only).
+
+### How it was verified
+
+- Unit tests: `internal/pki/escrow_test.go`, `internal/membership/escrow_test.go`, `internal/httpapi/handlers_caescrow_test.go`; the contract check (`node api/scripts/check-contract.mjs`), the generated operation table and the
+  README table test. Cluster tests (`internal/clustertest/caescrow_test.go`): the failover of the leader's server with the escrow on, and with a tampered copy. Results: both cluster tests pass on PostgreSQL 18 and 19 (lane l7, private installs of the extensions of 908518fa05).
+  Mutants killed: a recipient or the adoption that skips the check against `ca.crt`, no replay check, no label check, no merge of the revocation list, an adoption over a held key, no pruning of old escrow keys,
+  a content hash that ignores the revocation list, no drop of a server that is no longer a member, a recipient outside the standbys, no resend after a revocation, a non-leader that sends, escrow calls not `LeaderOnly`
+  or not dispatched, and (cluster, 18) a `CheckAuthority` that does not adopt. The cluster test found one defect that no unit test had: the three calls were missing from `internalapi.handled` and answered an empty body.
+
+### Decisions and deviations
+
+- Off by default, because every recipient's disk then can hold the CA key (threat model, 3.4.1). Recipients: only the servers that host a ready standby of group 0.
+- The alert `certificateAuthorityUnavailable` stays for a failover without a copy; no new alert kind was added.
+
+### Still open
+
+- A console panel for the three operations; an alert for a recipient that stays out of date; the removal of `ca.key` from an old leader that returns; the rotation of the CA itself.
+
+---
+
 ## 2026-11-22: phase 11 (distributed schemas), the extension: the scale work (step 12), the review fixes and the documentation (step 15)
 
 Covers the work on branch shard-p1011 after the second review of phase 11 (the review fixes of 2026-11-21 are in the entry of that day).
