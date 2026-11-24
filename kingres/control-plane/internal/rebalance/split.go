@@ -442,12 +442,16 @@ func (s *Service) settleSplit(ctx context.Context, v splitInput, id int64, callE
 	var pe *pgconn.PgError
 	if errors.As(callErr, &pe) {
 		msg := clipText(pe.Message, 500)
+		// The code decides. KS0C1 is in the released extension 0.8 too, so the cancel needs no text. The texts below are read only for
+		// the extension 0.8, which answers a table without a primary key with 55000 (0.9: 0A000) and a split or a bucket that is busy
+		// with 55000 or 55006 (0.9: KS019); remove them when 0.8 is no longer a supported version.
+		old08 := pe.Code == sqlstateNotInPrerequisiteState || pe.Code == "55006"
 		switch {
-		case pe.Code == "KS0C1" || strings.Contains(pe.Message, "was cancelled"):
+		case pe.Code == "KS0C1":
 			return splitCancelled{}
-		case pe.Code == "0A000" || strings.Contains(pe.Message, "primary key") || strings.Contains(pe.Message, "not supported"):
+		case pe.Code == "0A000" || old08 && (strings.Contains(pe.Message, "primary key") || strings.Contains(pe.Message, "not supported")):
 			return problem.New(problem.SplitUnsupported, msg)
-		case strings.Contains(pe.Message, "is not active") || strings.Contains(pe.Message, "unfinished") || strings.Contains(pe.Message, "already"):
+		case pe.Code == sqlstateBucketBusy || old08 && (strings.Contains(pe.Message, "is not active") || strings.Contains(pe.Message, "unfinished") || strings.Contains(pe.Message, "already")):
 			return problem.New(problem.BucketBusy, msg)
 		}
 		return fmt.Errorf("the split failed: %s", msg)

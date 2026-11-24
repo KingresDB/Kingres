@@ -1476,7 +1476,7 @@ kingres_internal_switch_bucket(PG_FUNCTION_ARGS)
 
 			PQclear(res);
 			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					(errcode(ERRCODE_KINGRES_SCHEMA_PINNED),
 					 errmsg("the schema cannot move any more: %s", why)));
 		}
 		PQclear(res);

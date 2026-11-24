@@ -441,7 +441,7 @@ func setNodeProperty(ctx context.Context, c *pgx.Conn, db string, ids []int32, w
 	})
 	var pe *pgconn.PgError
 	switch {
-	case errors.Is(err, errNotMapPrimary) || errors.As(err, &pe) && pe.Code == "55000":
+	case errors.Is(err, errNotMapPrimary) || errors.As(err, &pe) && isNotMapPrimary(pe):
 		return problem.New(problem.NodeStateInvalid, "This server does not hold the primary of the map group in database "+db+"; shouldHaveShards can only be changed through it.")
 	}
 	return err
@@ -516,13 +516,18 @@ func (o *Ops) setWeightIn(ctx context.Context, db, host string, w float64) error
 		return nil
 	})
 	var pe *pgconn.PgError
-	if errors.As(err, &pe) && pe.Code == "55000" {
+	if errors.As(err, &pe) && isNotMapPrimary(pe) {
 		return problem.New(problem.NodeStateInvalid, "This server does not hold the primary of the map group in database "+db+"; the weight can only be changed through it.")
 	}
 	return err
 }
 
 var errNotMapPrimary = errors.New("not the map group primary")
+
+// isNotMapPrimary tells the refusal of a catalog function that was called on a node that is not the map group primary: SQLSTATE KS010 (the
+// call went to the wrong node), which kingres_shard_require_map_group raises. 55000, which this code matched alone before, is kept for
+// the other refusals of the same call that the extension gives with that code.
+func isNotMapPrimary(pe *pgconn.PgError) bool { return pe.Code == "KS010" || pe.Code == "55000" }
 
 // ValidGroupName reports whether name can be the name of a group.
 func ValidGroupName(name string) bool { return groupNameRE.MatchString(name) }
