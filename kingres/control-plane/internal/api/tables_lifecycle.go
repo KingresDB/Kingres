@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"time"
 )
 
 // The types of the table lifecycle (contract 0.14.0, increment 9.6 of the shard design).
@@ -162,3 +163,48 @@ type AttachTablePartitionRequest struct {
 
 // DetachTablePartitionRequest is the (empty) body of POST .../partitions/{partitionName}/detach.
 type DetachTablePartitionRequest struct{}
+
+// TableOperation is the long operation that runs on a table (contract 0.32.0, Table.operation).
+type TableOperation struct {
+	// Kind is distribute, undistribute, alter, partition, convertStorage, maintain, export, import or other.
+	Kind string `json:"kind"`
+	// Role is subject, or related for a table that a distribute with related tables of another table takes along.
+	Role string `json:"role"`
+	// Source is task (a task of the control plane) or extension (an operation recorded by the sharding extension).
+	Source string `json:"source"`
+	// TaskID is null for an operation that was started from SQL.
+	TaskID *int64 `json:"taskId"`
+	// State is the state of the task or the phase of the extension's record.
+	State     string     `json:"state"`
+	StartedAt *time.Time `json:"startedAt"`
+	Percent   *float64   `json:"percent"`
+	Step      *string    `json:"step"`
+}
+
+// RelatedKey is a foreign key between two tables of a distribute with related tables (contract 0.32.0).
+type RelatedKey struct {
+	Name             string `json:"name"`
+	Schema           string `json:"schema"`
+	Table            string `json:"table"`
+	ReferencesSchema string `json:"referencesSchema"`
+	ReferencesTable  string `json:"referencesTable"`
+	Definition       string `json:"definition"`
+}
+
+// RelatedTable is a table of the foreign key closure of a table (contract 0.32.0).
+type RelatedTable struct {
+	Schema             string  `json:"schema"`
+	Table              string  `json:"table"`
+	DistributionColumn *string `json:"distributionColumn"`
+	EstimatedRows      *int64  `json:"estimatedRows"`
+	SizeBytes          *int64  `json:"sizeBytes"`
+}
+
+// RelatedTablesPlan is the answer of listRelatedTables (contract 0.32.0).
+type RelatedTablesPlan struct {
+	Tables       []RelatedTable `json:"tables"`
+	Keys         []RelatedKey   `json:"keys"`
+	Blockers     []TableBlocker `json:"blockers"`
+	Warnings     []TableBlocker `json:"warnings"`
+	ColocateWith TableRef       `json:"colocateWith"`
+}

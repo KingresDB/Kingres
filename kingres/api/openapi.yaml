@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: KingresDB Management API
-  version: 0.30.0
+  version: 0.32.0
   summary: REST API of the KingresDB management panel, CLI and manager.
   description: |
     The single REST API served by `kingresd` on every KingresDB server. The web panel
@@ -1969,6 +1969,15 @@ paths:
         a materialized view that uses it). The free space of every destination server is checked first (step *Check free space*). A RANGE or LIST partitioned table
         becomes a user-partitioned distributed table (blocking only). The text below, that the table must be empty, holds for contract versions before 0.14.0.
 
+        **0.32.0: distribute with related tables.** `relatedTables` lists the ordinary tables that are linked to the table by foreign keys, directly or through
+        each other (`listRelatedTables` gives the list). They are distributed together with the table, in one task, colocated with it (the table joins the group
+        of `colocateWith` or opens a new one; the related tables join the group of the table). The task drops the keys between the tables, distributes the table
+        and then each related table (one step each; a repeated run goes on with the tables that are not distributed yet), adds the keys back `NOT VALID` and
+        validates them. No key between these tables is enforced from the first drop to the last add; the task says so on its detail, and it takes the blocking
+        copy only (`mode` `online` is refused with 400 `validation_failed`). The list must be the whole set (a missing table is the blocker `related_table_missing`),
+        and every related table needs a distribution column (`distributionColumn`, or the one that follows from the keys). A failure puts the keys back where it
+        can and says in the task error which keys were not restored.
+
         **What the sharding extension can do, and what this operation refuses (0.9.0 states exactly that).**
         *Hash* (`kingres.create_distributed_table`): the table must be **empty** (422 `unprocessable`: distributing a
         table that has rows is a later phase; create an empty copy, distribute it and insert the rows), have a primary
@@ -2097,6 +2106,42 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/TableChangePreview' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/related-tables:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+      - $ref: '#/components/parameters/SchemaName'
+      - $ref: '#/components/parameters/TableName'
+    get:
+      operationId: listRelatedTables
+      summary: List the tables linked to a table by foreign keys
+      description: |
+        Added in 0.32.0. The plan of "distribute with related tables": the ordinary tables that are linked to the table by foreign keys, directly or through
+        each other, with the distribution column each of them would get (the column that the keys tie to `distributionColumn`), the keys that the task would drop
+        and add again, and what would stop the change (`blockers`, for example a related table that is already distributed, a key that does not use a column
+        that follows from the distribution column, a table with an unfinished table task). The related tables join the colocation group of the table.
+        Synchronous; reads only. A table without links has an empty `tables` list.
+      tags: [Tables]
+      x-required-role: kingres_readonly
+      parameters:
+        - name: distributionColumn
+          in: query
+          required: false
+          description: The distribution column of the table; without it the columns of the related tables are left empty.
+          schema: { type: string, maxLength: 63 }
+      responses:
+        '200':
+          description: The plan.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RelatedTablesPlan' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -9286,6 +9331,11 @@ components:
           format: int64
           minimum: 0
           description: Table size over all shards (primary copies); null when not available.
+        operation:
+          description: Added in 0.32.0, optional. The long operation that runs on the table now; null when there is none.
+          oneOf:
+            - $ref: '#/components/schemas/TableOperation'
+            - type: 'null'
         partitioning:
           description: Added in 0.14.0, optional. How the user partitioned the table (a user-partitioned distributed table is also `distributed`); null when it is not partitioned.
           oneOf:
@@ -9408,6 +9458,11 @@ components:
           $ref: '#/components/schemas/TableChangeMode'
         dependentViews:
           $ref: '#/components/schemas/DependentViews'
+        relatedTables:
+          type: array
+          maxItems: 100
+          description: 'Added in 0.32.0, optional, for method `hash` only. The tables linked to this one by foreign keys that are distributed together with it (see `listRelatedTables`); an empty or missing list distributes the table alone.'
+          items: { $ref: '#/components/schemas/RelatedTableChoice' }
 
     TableChangeMode:
       type: string
@@ -9492,6 +9547,88 @@ components:
             name: { type: string }
             bound: { type: string }
             table: { $ref: '#/components/schemas/TableRef' }
+    RelatedTableChoice:
+      type: object
+      description: Added in 0.32.0. A table that is distributed together with the table of the request.
+      required: [schema, table]
+      properties:
+        schema: { type: string }
+        table: { type: string }
+        distributionColumn:
+          type: string
+          description: The column to hash; when left out, the column that follows from the foreign keys is used (a table whose column does not follow from them is refused).
+    RelatedKey:
+      type: object
+      description: Added in 0.32.0. A foreign key between two tables of the set, which the task drops and adds again.
+      required: [name, schema, table, referencesSchema, referencesTable, definition]
+      properties:
+        name: { type: string }
+        schema: { type: string, description: The schema of the table that has the key. }
+        table: { type: string, description: The table that has the key. }
+        referencesSchema: { type: string }
+        referencesTable: { type: string }
+        definition: { type: string, description: 'The definition of the key as PostgreSQL prints it (`FOREIGN KEY (...) REFERENCES ...`).' }
+    RelatedTable:
+      type: object
+      description: Added in 0.32.0. A table of the foreign key closure of the table.
+      required: [schema, table, distributionColumn, estimatedRows, sizeBytes]
+      properties:
+        schema: { type: string }
+        table: { type: string }
+        distributionColumn:
+          type: [string, 'null']
+          description: The column the table would be distributed by; null when it does not follow from the keys and was not given.
+        estimatedRows: { type: [integer, 'null'], format: int64, minimum: 0 }
+        sizeBytes: { type: [integer, 'null'], format: int64, minimum: 0 }
+    RelatedTablesPlan:
+      type: object
+      description: Added in 0.32.0. The answer of `listRelatedTables`.
+      required: [tables, keys, blockers, warnings, colocateWith]
+      properties:
+        tables:
+          type: array
+          description: The related tables (not the table itself), in the order the task distributes them.
+          items: { $ref: '#/components/schemas/RelatedTable' }
+        keys:
+          type: array
+          items: { $ref: '#/components/schemas/RelatedKey' }
+        blockers:
+          type: array
+          items: { $ref: '#/components/schemas/TableBlocker' }
+        warnings:
+          type: array
+          items: { $ref: '#/components/schemas/TableBlocker' }
+        colocateWith:
+          $ref: '#/components/schemas/TableRef'
+    TableOperation:
+      type: object
+      description: |
+        Added in 0.32.0. The long operation that is running on a table: a task of the control plane that has the table as its subject or among its related tables, or
+        an unfinished operation that the sharding extension recorded for it (one that was started from SQL). Clients tolerate kinds they do not know. While it is
+        set, the changes of the table (distribute, undistribute, alter, the partition operations, the storage format, the ledger) conflict with it and the
+        console does not offer them.
+      required: [kind, role, source, taskId, state, startedAt, percent, step]
+      properties:
+        kind:
+          type: string
+          description: 'The change: `distribute`, `undistribute`, `alter`, `partition`, `convertStorage`, `maintain` (time partitions), `export`, `import`, or `other`.'
+        role:
+          type: string
+          enum: [subject, related]
+          description: '`related` when the table is one of the related tables of a distribute with related tables whose subject is another table.'
+        source:
+          type: string
+          enum: [task, extension]
+        taskId:
+          type: [integer, 'null']
+          format: int64
+          description: The task, when the control plane runs it; null for an operation that was started from SQL.
+        state:
+          type: string
+          description: The state of the task (`pending`, `running`, `paused`), or the phase that the extension recorded (`preparing`, `shadow`, `copying`, `catching_up`, `switching`, `cleaning`).
+        startedAt: { type: [string, 'null'], format: date-time }
+        percent: { type: [number, 'null'], minimum: 0, maximum: 100, description: Progress when known. }
+        step: { type: [string, 'null'], description: The name of the step that runs. }
     TableChangeTable:
       type: object
       description: Added in 0.14.0. A table that a change would touch.
@@ -9501,7 +9638,7 @@ components:
         name: { type: string }
         role:
           type: string
-          enum: [source, colocated, linked]
+          enum: [source, colocated, linked, related]
         sizeBytes:
           type: [integer, 'null']
           format: int64

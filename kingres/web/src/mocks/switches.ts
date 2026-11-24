@@ -78,7 +78,7 @@
 //                                 superuser    0.30.0: the signed-in role is dangerous (importDatabase: 403 forbidden)
 //   ?clock=off:<server>:<ms>      the clock of that server is that many milliseconds ahead (negative: behind).
 //   ?clock=unreachable:<server>   the clock of that server cannot be read.
-import { seedPartitioned } from './tables'
+import { seedPartitioned, startDistribute } from './tables'
 import { applyAnalyticsSwitch } from './analytics'
 import type { MockState } from './state'
 import { applyTransferSwitch } from './transfer-switches'
@@ -107,9 +107,13 @@ import {
  * `busy` says that another operation holds the colocation groups; `blockme` makes the next change wait (paused) at its switch for a
  * transaction that holds the table, `diffme` makes it end with `verification_failed`, `pending` leaves it `pending`, and `undo:<ms>` or
  * `undo:fail` set how long the undo of a cancelled task takes to be reported and whether one server could not be reached; `fk:<table>` gives a table a foreign key to an ordinary table.
+ * 0.32.0: `related` makes `orders` and `customers` of `shop` ordinary tables, which a foreign key links (distribute with related tables), and
+ * `related:running` also starts that distribute, slowly, so that the tables show their operation.
  */
 function applyTablesSwitch(entry: string, s: MockState): void {
   if (entry === 'partitions') seedPartitioned(s)
+  if (entry === 'related' || entry === 'related:running')
+    seedRelated(s, entry === 'related:running')
   if (entry === 'fail:space') mockConfig.tableFail = 'space'
   if (entry === 'fail:copy') mockConfig.tableFail = 'copy'
   if (entry === 'slow') mockConfig.tableSlow = true
@@ -122,6 +126,28 @@ function applyTablesSwitch(entry: string, s: MockState): void {
   if (undo) mockConfig.tableUndoMs = Number(undo[1])
   const fk = /^fk:(.+)$/.exec(entry)
   if (fk) mockConfig.tableForeignKeys.push(fk[1] as string)
+}
+
+/** `orders` and `customers` of `shop` as two ordinary tables linked by a foreign key; with `running` their distribute with related tables is under way. */
+function seedRelated(s: MockState, running: boolean): void {
+  const rec = s.databases.find((d) => d.info.name === 'shop')
+  if (!rec) return
+  for (const name of ['orders', 'customers']) {
+    const t = rec.tables.find((x) => x.name === name)
+    if (!t) continue
+    t.classes = ['plain']
+    t.distribution = null
+    t.ledger = null
+    t.homeShardGroupId = 0
+  }
+  const orders = rec.tables.find((x) => x.name === 'orders')
+  if (!running || !orders) return
+  mockConfig.tableSlow = true
+  startDistribute(s, rec, orders, {
+    method: 'hash',
+    distributionColumn: 'customer_id',
+    relatedTables: [{ schema: 'public', table: 'customers', distributionColumn: 'customer_id' }],
+  })
 }
 
 function applyFailoverSwitch(entry: string, s: MockState): void {

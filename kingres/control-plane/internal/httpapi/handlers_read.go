@@ -235,6 +235,9 @@ func (s *Server) listTables(_ *call, w http.ResponseWriter, r *http.Request) err
 	if err != nil {
 		return s.storeProblem(r, err, "Database \""+db+"\" does not exist.")
 	}
+	if o, oerr := s.needOps(); oerr == nil {
+		o.AnnotateTables(r.Context(), db, v.Items) // Table.operation (contract 0.32.0)
+	}
 	s.writeJSON(w, r, http.StatusOK, v)
 	return nil
 }
@@ -248,6 +251,11 @@ func (s *Server) getTable(_ *call, w http.ResponseWriter, r *http.Request) error
 	t, err := s.deps.Store.Table(r.Context(), db, schema, name)
 	if err != nil {
 		return s.storeProblem(r, err, "Table \""+schema+"."+name+"\" does not exist in database \""+db+"\".")
+	}
+	if o, oerr := s.needOps(); oerr == nil {
+		one := []api.Table{t.Table}
+		o.AnnotateTables(r.Context(), db, one)
+		t.Table = one[0]
 	}
 	s.writeJSON(w, r, http.StatusOK, t)
 	return nil

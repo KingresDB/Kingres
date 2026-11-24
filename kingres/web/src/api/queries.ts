@@ -100,6 +100,8 @@ export const keys = {
     ['tablePartitions', db, schema, table] as const,
   tableChange: (db: string, schema: string, table: string, request: string) =>
     ['tableChange', db, schema, table, request] as const,
+  relatedTables: (db: string, schema: string, table: string, column: string) =>
+    ['relatedTables', db, schema, table, column] as const,
   approximateAggregates: (name: string) => ['approximateAggregates', name] as const,
   partitionPolicy: (db: string, schema: string, table: string) =>
     ['partitionPolicy', db, schema, table] as const,
@@ -295,6 +297,28 @@ export const useTablePartitions = (
       ),
     enabled: computed(() => toValue(enabled)),
     refetchInterval: every(POLL.normal),
+  })
+
+/**
+ * The tables linked to a plain table by foreign keys (`listRelatedTables`, contract 0.32.0), read again when the distribution column changes.
+ */
+export const useRelatedTables = (
+  db: MaybeRefOrGetter<string>,
+  schema: MaybeRefOrGetter<string>,
+  table: MaybeRefOrGetter<string>,
+  column: MaybeRefOrGetter<string>,
+  enabled: MaybeRefOrGetter<boolean> = true,
+) =>
+  useQuery({
+    enabled: computed(() => toValue(enabled)),
+    queryKey: computed(() =>
+      keys.relatedTables(toValue(db), toValue(schema), toValue(table), toValue(column)),
+    ),
+    queryFn: () =>
+      endpoints.listRelatedTables(toValue(db), toValue(schema), toValue(table), toValue(column)),
+    retry: false,
+    staleTime: 0,
+    gcTime: 0,
   })
 
 /**

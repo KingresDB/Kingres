@@ -11,6 +11,7 @@ import type {
   TableBlocker,
   TableChangeMode,
   TableChangePreview,
+  TableOperation,
 } from '@/api/types'
 
 export const TABLE_TASK_KINDS = [
@@ -194,4 +195,56 @@ export function runningTaskOfTable(
 /** The blockers that make a change refused (they disable the start button); the warnings and notes never do. */
 export function previewBlocked(preview: TableChangePreview | undefined): boolean {
   return (preview?.blockers.length ?? 0) > 0
+}
+
+// --- the operation indicator of a table (contract 0.32.0, `Table.operation`) -------------------------------------------
+
+/** What an operation is called in a sentence ("A distribution of this table is running"). */
+const OPERATION_NOUN: Record<string, string> = {
+  distribute: 'distribution',
+  undistribute: 'undistribution',
+  alter: 'change of the distribution',
+  partition: 'change of the partitions',
+  convertStorage: 'conversion of the storage format',
+  maintain: 'run of the time-partitioning policy',
+  export: 'export',
+  import: 'import',
+}
+
+/** The short word of the badge. A kind that a newer server sends is shown as it was sent (the component puts it through SafeName). */
+export const OPERATION_SHORT: Record<string, string> = {
+  distribute: 'Distributing',
+  undistribute: 'Undistributing',
+  alter: 'Changing distribution',
+  partition: 'Changing partitions',
+  convertStorage: 'Converting storage',
+  maintain: 'Maintaining partitions',
+  export: 'Exporting',
+  import: 'Importing',
+}
+
+export function operationShort(op: TableOperation): string {
+  return OPERATION_SHORT[op.kind] ?? op.kind
+}
+
+/** The sentence that says why the changes of a table are off: the operation that runs, and the task that has it (it starts as the sentence of the tasks of a table: "A change of this table is running"). */
+export function operationReason(op: TableOperation | null | undefined): string {
+  if (!op) return ''
+  const noun = OPERATION_NOUN[op.kind] ?? `operation (${op.kind})`
+  const who =
+    op.taskId !== null
+      ? ` (task ${op.taskId})`
+      : op.source === 'extension'
+        ? ' (started from SQL)'
+        : ''
+  const subject =
+    op.role === 'related'
+      ? 'A change of another table that takes this table along'
+      : 'A change of this table'
+  return `${subject} is running${who}: ${noun}.`
+}
+
+/** The progress text of the badge: the percent when it is known, the state otherwise. */
+export function operationProgress(op: TableOperation): string {
+  return op.percent !== null && op.state !== 'pending' ? `${Math.round(op.percent)}%` : op.state
 }

@@ -71,6 +71,15 @@ type DistributeTableRequest struct {
 	BucketCount    *int   `json:"bucketCount,omitempty"`
 	Mode           string `json:"mode,omitempty"`
 	DependentViews string `json:"dependentViews,omitempty"`
+	// RelatedTables (contract 0.32.0, optional) are the tables linked by foreign keys that are distributed together with the table.
+	RelatedTables []RelatedTableChoice `json:"relatedTables,omitempty"`
+}
+
+// RelatedTableChoice is a table that is distributed together with the table of the request (contract 0.32.0).
+type RelatedTableChoice struct {
+	Schema             string `json:"schema"`
+	Table              string `json:"table"`
+	DistributionColumn string `json:"distributionColumn,omitempty"`
 }
 
 // TableRef names a table.

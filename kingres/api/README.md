@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.30.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.32.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and, when it is built, the planned `kingres-cli` (it does not exist yet). Lint it and run the mechanical rule check with:
 
 ```
@@ -392,6 +392,25 @@ Where the architecture document leaves something open, the simplest option was c
     range and the cluster's replica count.
 
 ## Changelog
+
+### 0.32.0
+
+Revision written first for the two open items of phase 9 (`kingres/docs/design/shard-phase9.md`): distribute with related tables and the operation indicator of a table (the number is a placeholder until the revisions of the other branches are merged). Summary for the panel:
+1 operation added (178 operations, 142 paths); six objects added; **no change that is not additive**.
+
+#### Breaking
+
+None.
+
+#### Additive
+- `listRelatedTables` (`GET .../tables/{tableName}/related-tables`, needs `kingres_readonly`): the plan of "distribute with related tables".
+- `DistributeTableRequest.relatedTables` (optional): the tables linked by foreign keys that `distributeTable` distributes together with the table, colocated with it, in one `table.distribute` task. `previewTableChange` accepts the same field and lists those tables with the role `related` (`TableChangeTable.role` has the new value `related`).
+- `Table.operation` (optional, nullable `TableOperation`: `kind`, `role`, `source`, `taskId`, `state`, `startedAt`, `percent`, `step`) in `listTables`, `getTable` and the answers that return a table: the long operation that runs on the table now.
+- Schemas: `RelatedTableChoice`, `RelatedKey`, `RelatedTable`, `RelatedTablesPlan`, `TableOperation`. The blocker code `related_table_missing` (and `related_column_unknown`, `related_table_distributed`, `related_table_busy`) comes in `TableBlocker.code`; clients tolerate codes they do not know.
+
+#### Documentation
+
+- `distributeTable` says what the task does with the keys between the tables, that no key between them is enforced from the first drop to the last add, and that only the blocking copy is used.
 
 ### 0.30.0
 

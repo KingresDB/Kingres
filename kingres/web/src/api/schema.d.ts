@@ -1369,6 +1369,15 @@ export interface paths {
          *     a materialized view that uses it). The free space of every destination server is checked first (step *Check free space*). A RANGE or LIST partitioned table
          *     becomes a user-partitioned distributed table (blocking only). The text below, that the table must be empty, holds for contract versions before 0.14.0.
          *
+         *     **0.32.0: distribute with related tables.** `relatedTables` lists the ordinary tables that are linked to the table by foreign keys, directly or through
+         *     each other (`listRelatedTables` gives the list). They are distributed together with the table, in one task, colocated with it (the table joins the group
+         *     of `colocateWith` or opens a new one; the related tables join the group of the table). The task drops the keys between the tables, distributes the table
+         *     and then each related table (one step each; a repeated run goes on with the tables that are not distributed yet), adds the keys back `NOT VALID` and
+         *     validates them. No key between these tables is enforced from the first drop to the last add; the task says so on its detail, and it takes the blocking
+         *     copy only (`mode` `online` is refused with 400 `validation_failed`). The list must be the whole set (a missing table is the blocker `related_table_missing`),
+         *     and every related table needs a distribution column (`distributionColumn`, or the one that follows from the keys). A failure puts the keys back where it
+         *     can and says in the task error which keys were not restored.
+         *
          *     **What the sharding extension can do, and what this operation refuses (0.9.0 states exactly that).**
          *     *Hash* (`kingres.create_distributed_table`): the table must be **empty** (422 `unprocessable`: distributing a
          *     table that has rows is a later phase; create an empty copy, distribute it and insert the rows), have a primary
@@ -1432,6 +1441,37 @@ export interface paths {
          *     Synchronous; reads only.
          */
         post: operations["previewTableChange"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/related-tables": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List the tables linked to a table by foreign keys
+         * @description Added in 0.32.0. The plan of "distribute with related tables": the ordinary tables that are linked to the table by foreign keys, directly or through
+         *     each other, with the distribution column each of them would get (the column that the keys tie to `distributionColumn`), the keys that the task would drop
+         *     and add again, and what would stop the change (`blockers`, for example a related table that is already distributed, a key that does not use a column
+         *     that follows from the distribution column, a table with an unfinished table task). The related tables join the colocation group of the table.
+         *     Synchronous; reads only. A table without links has an empty `tables` list.
+         */
+        get: operations["listRelatedTables"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -5827,6 +5867,8 @@ export interface components {
              * @description Table size over all shards (primary copies); null when not available.
              */
             sizeBytes: number | null;
+            /** @description Added in 0.32.0, optional. The long operation that runs on the table now; null when there is none. */
+            operation?: components["schemas"]["TableOperation"] | null;
             /** @description Added in 0.14.0, optional. How the user partitioned the table (a user-partitioned distributed table is also `distributed`); null when it is not partitioned. */
             partitioning?: {
                 /** @enum {string} */
@@ -5913,6 +5955,8 @@ export interface components {
             bucketCount?: number;
             mode?: components["schemas"]["TableChangeMode"];
             dependentViews?: components["schemas"]["DependentViews"];
+            /** @description Added in 0.32.0, optional, for method `hash` only. The tables linked to this one by foreign keys that are distributed together with it (see `listRelatedTables`); an empty or missing list distributes the table alone. */
+            relatedTables?: components["schemas"]["RelatedTableChoice"][];
         };
         /**
          * @description Added in 0.14.0. How a table operation copies the rows. `auto` (the default): online when the table has a usable key and more than 100000 estimated rows, otherwise blocking.
@@ -5973,12 +6017,81 @@ export interface components {
                 table?: components["schemas"]["TableRef"];
             };
         };
+        /** @description Added in 0.32.0. A table that is distributed together with the table of the request. */
+        RelatedTableChoice: {
+            schema: string;
+            table: string;
+            /** @description The column to hash; when left out, the column that follows from the foreign keys is used (a table whose column does not follow from them is refused). */
+            distributionColumn?: string;
+        };
+        /** @description Added in 0.32.0. A foreign key between two tables of the set, which the task drops and adds again. */
+        RelatedKey: {
+            name: string;
+            /** @description The schema of the table that has the key. */
+            schema: string;
+            /** @description The table that has the key. */
+            table: string;
+            referencesSchema: string;
+            referencesTable: string;
+            /** @description The definition of the key as PostgreSQL prints it (`FOREIGN KEY (...) REFERENCES ...`). */
+            definition: string;
+        };
+        /** @description Added in 0.32.0. A table of the foreign key closure of the table. */
+        RelatedTable: {
+            schema: string;
+            table: string;
+            /** @description The column the table would be distributed by; null when it does not follow from the keys and was not given. */
+            distributionColumn: string | null;
+            /** Format: int64 */
+            estimatedRows: number | null;
+            /** Format: int64 */
+            sizeBytes: number | null;
+        };
+        /** @description Added in 0.32.0. The answer of `listRelatedTables`. */
+        RelatedTablesPlan: {
+            /** @description The related tables (not the table itself), in the order the task distributes them. */
+            tables: components["schemas"]["RelatedTable"][];
+            keys: components["schemas"]["RelatedKey"][];
+            blockers: components["schemas"]["TableBlocker"][];
+            warnings: components["schemas"]["TableBlocker"][];
+            colocateWith: components["schemas"]["TableRef"];
+        };
+        /**
+         * @description Added in 0.32.0. The long operation that is running on a table: a task of the control plane that has the table as its subject or among its related tables, or
+         *     an unfinished operation that the sharding extension recorded for it (one that was started from SQL). Clients tolerate kinds they do not know. While it is
+         *     set, the changes of the table (distribute, undistribute, alter, the partition operations, the storage format, the ledger) conflict with it and the
+         *     console does not offer them.
+         */
+        TableOperation: {
+            /** @description The change: `distribute`, `undistribute`, `alter`, `partition`, `convertStorage`, `maintain` (time partitions), `export`, `import`, or `other`. */
+            kind: string;
+            /**
+             * @description `related` when the table is one of the related tables of a distribute with related tables whose subject is another table.
+             * @enum {string}
+             */
+            role: "subject" | "related";
+            /** @enum {string} */
+            source: "task" | "extension";
+            /**
+             * Format: int64
+             * @description The task, when the control plane runs it; null for an operation that was started from SQL.
+             */
+            taskId: number | null;
+            /** @description The state of the task (`pending`, `running`, `paused`), or the phase that the extension recorded (`preparing`, `shadow`, `copying`, `catching_up`, `switching`, `cleaning`). */
+            state: string;
+            /** Format: date-time */
+            startedAt: string | null;
+            /** @description Progress when known. */
+            percent: number | null;
+            /** @description The name of the step that runs. */
+            step: string | null;
+        };
         /** @description Added in 0.14.0. A table that a change would touch. */
         TableChangeTable: {
             schema: string;
             name: string;
             /** @enum {string} */
-            role: "source" | "colocated" | "linked";
+            role: "source" | "colocated" | "linked" | "related";
             /** Format: int64 */
             sizeBytes: number | null;
             /** Format: int64 */
@@ -11747,6 +11860,43 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["TableChangePreview"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    listRelatedTables: {
+        parameters: {
+            query?: {
+                /** @description The distribution column of the table; without it the columns of the related tables are left empty. */
+                distributionColumn?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The plan. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelatedTablesPlan"];
                 };
             };
             400: components["responses"]["BadRequest"];

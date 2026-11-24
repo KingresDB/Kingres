@@ -157,6 +157,8 @@ type Table struct {
 	Partitioning *TablePartitioning `json:"partitioning,omitempty"`
 	// Storage is the storage format (contract 0.17.0, optional); null when it is not known.
 	Storage *TableStorage `json:"storage,omitempty"`
+	// Operation is the long operation that runs on the table now (contract 0.32.0); null when there is none.
+	Operation *TableOperation `json:"operation"`
 }
 
 // TablePartitioning is the partitioning member of Table.

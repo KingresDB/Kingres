@@ -6,6 +6,9 @@
 // rows to copy, the mode of the copy, the bucket count of a new colocation group and what happens to the views that use the
 // table are asked here, and the preview says what the sharding extension finds before anything starts: a blocker keeps the
 // start button off, and a refusal (422 `table_not_eligible`) lists the same lines.
+// Contract 0.32.0, distribute with related tables: when foreign keys link the table to other plain tables, the dialog lists them (with the
+// column each gets and the keys that are taken out and added again) and distributes them together with the table, colocated with it, in one
+// task. That copy is the blocking one, and the dialog says that no key between the tables is enforced meanwhile.
 import { computed, reactive, ref, useId, watch } from 'vue'
 import { safeText } from '@/lib/safe-text'
 import SafeName from './SafeName.vue'
@@ -16,7 +19,7 @@ import TableChangeOptions from './tables/TableChangeOptions.vue'
 import TableChangePanel from './tables/TableChangePanel.vue'
 import TableChangeRefusal from './tables/TableChangeRefusal.vue'
 import { endpoints } from '@/api/endpoints'
-import { keys, useTableDetail } from '@/api/queries'
+import { keys, useRelatedTables, useTableDetail } from '@/api/queries'
 import { useTableChange } from '@/composables/useTableChange'
 import { bucketCountError, CANCELLED_TEXT, ONLINE_ROWS_THRESHOLD } from '@/lib/tables'
 import { formatNumber } from '@/lib/format'
@@ -81,11 +84,46 @@ const asksBuckets = computed(() => form.method === 'hash' && !target.value)
 const bucketError = computed(() => (asksBuckets.value ? bucketCountError(form.bucketCount) : null))
 const rows = computed(() => props.table.estimatedRows)
 
+// The tables that foreign keys link to this one (hash method, once a column is chosen).
+const related = useRelatedTables(
+  () => props.databaseName,
+  () => props.table.schema,
+  () => props.table.name,
+  () => form.column,
+  () => form.method === 'hash' && form.column !== '',
+)
+const relatedTables = computed(() => related.data.value?.tables ?? [])
+const withRelated = ref(true)
+/** The columns the user typed for related tables whose column does not follow from the keys. */
+const relatedColumns = reactive<Record<string, string>>({})
+const relatedKey = (r: { schema: string; table: string }): string =>
+  JSON.stringify([r.schema, r.table])
+const relatedColumn = (r: { schema: string; table: string; distributionColumn: string | null }) =>
+  (relatedColumns[relatedKey(r)] ?? '').trim() || r.distributionColumn || ''
+/** Related tables go with the request when there are some and the user did not turn them off. */
+const together = computed(
+  () => form.method === 'hash' && withRelated.value && relatedTables.value.length > 0,
+)
+const relatedError = computed(() =>
+  together.value && relatedTables.value.some((r) => relatedColumn(r) === '')
+    ? 'Name the distribution column of every related table.'
+    : undefined,
+)
+
 /** The request; the defaults of the contract (`auto`, `refuse`) are left out. */
 function request(): DistributeTableRequest {
   return {
     method: form.method,
     ...(form.method === 'hash' ? { distributionColumn: form.column } : {}),
+    ...(together.value
+      ? {
+          relatedTables: relatedTables.value.map((r) => ({
+            schema: r.schema,
+            table: r.table,
+            ...(relatedColumn(r) ? { distributionColumn: relatedColumn(r) } : {}),
+          })),
+        }
+      : {}),
     colocateWith:
       form.method === 'hash' && target.value
         ? { schema: target.value.schema, table: target.value.name }
@@ -108,7 +146,10 @@ const change = useTableChange(
   () => props.table.name,
   previewRequest,
 )
-const onlineAvailable = computed(() => change.preview.value?.estimate.onlineAvailable ?? true)
+// Tables distributed together are copied in the blocking mode only.
+const onlineAvailable = computed(
+  () => !together.value && (change.preview.value?.estimate.onlineAvailable ?? true),
+)
 // An online copy that the preview says is impossible cannot stay chosen.
 watch(onlineAvailable, (available) => {
   if (!available && form.mode === 'online') form.mode = 'auto'
@@ -116,7 +157,7 @@ watch(onlineAvailable, (available) => {
 
 const validate = (): boolean => {
   submitted.value = true
-  return !columnError.value && !bucketError.value
+  return !columnError.value && !bucketError.value && !relatedError.value
 }
 const start = () =>
   endpoints.distributeTable(props.databaseName, props.table.schema, props.table.name, request())
@@ -235,6 +276,50 @@ const start = () =>
             />
           </FormField>
         </template>
+        <fieldset
+          v-if="form.method === 'hash' && relatedTables.length > 0"
+          data-testid="related-tables"
+        >
+          <legend>Related tables</legend>
+          <label class="check"
+            ><input v-model="withRelated" type="checkbox" data-testid="related-together" />
+            Distribute the {{ relatedTables.length }} related
+            {{ relatedTables.length === 1 ? 'table' : 'tables' }} together with this one</label
+          >
+          <p class="muted">
+            Foreign keys link these tables to this one. They are distributed in one task, colocated
+            with this table, and copied in the blocking mode. The keys between the tables are taken
+            out first and added again at the end: no key between them is enforced meanwhile.
+          </p>
+          <ul v-if="withRelated" class="related" data-testid="related-list">
+            <li v-for="r in relatedTables" :key="relatedKey(r)">
+              <code><SafeName :value="`${r.schema}.${r.table}`" :max="120" /></code>
+              <template v-if="r.distributionColumn"
+                >by <code><SafeName :value="r.distributionColumn" :max="60" /></code
+              ></template>
+              <template v-else>
+                <label>
+                  distribution column
+                  <input
+                    v-model="relatedColumns[relatedKey(r)]"
+                    autocomplete="off"
+                    :data-testid="`related-column-${r.table}`"
+                  />
+                </label>
+              </template>
+              <span v-if="r.estimatedRows !== null" class="muted">
+                about {{ formatNumber(r.estimatedRows) }} rows</span
+              >
+            </li>
+          </ul>
+          <p v-if="submitted && relatedError" class="error" role="alert">{{ relatedError }}</p>
+          <ul v-if="withRelated && related.data.value?.keys.length" class="related muted">
+            <li v-for="k in related.data.value.keys" :key="k.name" data-testid="related-key">
+              key <code><SafeName :value="k.name" :max="80" /></code> of
+              <SafeName :value="`${k.schema}.${k.table}`" :max="120" />
+            </li>
+          </ul>
+        </fieldset>
         <TableChangeOptions
           v-model:mode="form.mode"
           v-model:views="form.views"
@@ -253,6 +338,11 @@ const start = () =>
 </template>
 
 <style scoped>
+.related {
+  margin: 0;
+  padding-left: var(--s-4);
+  font-size: var(--fs-sm);
+}
 .blocked {
   margin: 0;
   padding-left: var(--s-4);

@@ -52,6 +52,8 @@ var leaderBoundReads = map[string]bool{
 	"getApproximateAggregates": true,
 	// The policies, their runs and the partitions of a plain table are read from the instance that the leader runs.
 	"getPartitionPolicy": true, "listPartitionPolicyRuns": true, "getPartitionPolicyRun": true, "listTablePartitions": true,
+	// The operation indicator of a table (contract 0.32.0) reads the tasks of the leader's system database; the related tables are read on the instance of the leader.
+	"listTables": true, "getTable": true, "listRelatedTables": true,
 	// Configuration from the console (phase 13): the leader can ask every server.
 	"listConfigParameters": true, "getConfigParameter": true, "listConfigChanges": true, "listConfigServers": true,
 	"getConfigSummary": true, "getClusterTime": true, "listTimeZones": true,

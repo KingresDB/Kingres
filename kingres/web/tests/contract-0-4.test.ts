@@ -56,6 +56,7 @@ describe('contract 0.4.0', () => {
       '0.28.0',
       '0.29.0',
       '0.30.0',
+      '0.32.0',
     ]).toContain(spec.info.version)
     // 0.8.0 added the eleven operations of the Configuration tag: 100. 0.10.0 added four (getFailoverStatus,
     // listFailoverReports, getFailoverReport, resetAutoFailoverCounter): 104. 0.11.0 added the 28 operations of the ledger of
@@ -84,6 +85,7 @@ describe('contract 0.4.0', () => {
       '0.28.0': 174,
       '0.29.0': 176,
       '0.30.0': 177,
+      '0.32.0': 178,
     }
     expect(Object.keys(operations)).toHaveLength(operationsOf[spec.info.version]!)
   })

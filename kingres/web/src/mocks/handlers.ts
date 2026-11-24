@@ -72,10 +72,12 @@ import {
 import {
   columnDefsOf,
   previewChange,
+  relatedPlan,
   startAlter,
   startDistribute,
   startPartition,
   startUndistribute,
+  withOperation,
 } from './tables'
 
 type S = components['schemas']
@@ -2092,7 +2094,7 @@ export function createHandlers(): HttpHandler[] {
                 (!schema || t.schema === schema) &&
                 (!cls || t.classes.includes(cls as Table['classes'][number])),
             )
-            .map((t) => describeTable(c.s, rec, t))
+            .map((t) => withOperation(c.s, rec, describeTable(c.s, rec, t)))
             // A partitioned table matches columnar when any of its partitions is columnar (contract 0.18.0).
             .filter((t) => {
               if (storage === null) return true
@@ -2105,6 +2107,12 @@ export function createHandlers(): HttpHandler[] {
       )
     },
     // The table lifecycle of contract 0.14.0 (increment 9.7): src/mocks/tables.ts.
+    listRelatedTables: (c) => {
+      const { rec, t } = tableOf(c)
+      if (!t.classes.includes('plain'))
+        throw problem('unprocessable', 'The table is already distributed or a reference table.')
+      return ok(relatedPlan(rec, t, c.url.searchParams.get('distributionColumn')))
+    },
     previewTableChange: (c) => {
       const { s, rec, t } = tableOf(c)
       const b = body<S['TableChangeRequest']>(c)
@@ -2190,7 +2198,7 @@ export function createHandlers(): HttpHandler[] {
       )
       if (!t) throw problem('not_found', 'Table does not exist.')
       return ok({
-        ...describeTable(c.s, rec, t),
+        ...withOperation(c.s, rec, describeTable(c.s, rec, t)),
         columns: rec.extraColumns?.[t.name] ?? columnsFor(rec, t),
       } satisfies S['TableDetail'])
     },
