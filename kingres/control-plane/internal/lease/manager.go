@@ -146,7 +146,11 @@ type Manager struct {
 	// The rounds of different groups run side by side (phase 5 review M2), so each group has its own lock; rsem bounds how
 	// many rounds run at once.
 	rmus map[int32]*sync.Mutex
-	rsem chan struct{}
+	// rsem is taken before a round lock (a group that waits in the queue holds nothing a release waits for), and hands its
+	// places on in the order of asking (phase 5 review M-C).
+	rsem *fairSem
+	// renewing is the set of groups with a round that runs or waits for a place (the loop starts no second one).
+	renewing map[int32]bool
 
 	// fl counts the renewal requests that are on their way to a grantor (flights.go).
 	fl flights
@@ -197,7 +201,7 @@ func New(c Config) (*Manager, error) {
 	if err := os.MkdirAll(c.Dir, 0o700); err != nil {
 		return nil, fmt.Errorf("lease: creating %s: %w", c.Dir, err)
 	}
-	m := &Manager{c: c, rmus: map[int32]*sync.Mutex{}, rsem: make(chan struct{}, maxParallelRounds), groups: map[int32]*groupState{}, starting: map[int32]bool{}, fencing: map[int32]bool{}, fenceRun: map[int32]bool{}, adopted: map[int32]*adoption{}, relinq: map[int32]bool{}, base: uint64(time.Now().UnixNano())}
+	m := &Manager{c: c, rmus: map[int32]*sync.Mutex{}, rsem: newFairSem(maxParallelRounds), renewing: map[int32]bool{}, groups: map[int32]*groupState{}, starting: map[int32]bool{}, fencing: map[int32]bool{}, fenceRun: map[int32]bool{}, adopted: map[int32]*adoption{}, relinq: map[int32]bool{}, base: uint64(time.Now().UnixNano())}
 	m.loadRelinquished()
 	if b, err := os.ReadFile(filepath.Join(c.Dir, topologyFile)); err == nil {
 		var t Topology
@@ -304,40 +308,43 @@ func (m *Manager) renewGroups(ctx context.Context, wait bool) {
 	}
 	var local sync.WaitGroup
 	for _, g := range groups {
-		rl := m.rmuFor(g)
-		if !wait && !rl.TryLock() {
-			continue // the round of this group is still on its way
-		}
-		work := func() {
-			if wait {
-				rl.Lock()
-			}
-			m.renewOne(ctx, g, t, rl)
-		}
 		if wait {
 			local.Add(1)
-			go func() { defer local.Done(); work() }()
-		} else {
-			m.wg.Add(1)
-			go func() { defer m.wg.Done(); work() }()
+			go func() { defer local.Done(); m.renewOne(ctx, g) }()
+			continue
 		}
+		m.mu.Lock()
+		busy := m.renewing[g]
+		m.renewing[g] = true
+		m.mu.Unlock()
+		if busy {
+			continue // the round of this group is still on its way (or waits for a place)
+		}
+		m.wg.Add(1)
+		go func() {
+			defer m.wg.Done()
+			defer func() { m.mu.Lock(); delete(m.renewing, g); m.mu.Unlock() }()
+			m.renewOne(ctx, g)
+		}()
 	}
 	local.Wait()
 }
 
-// renewOne runs the round of one group; rl is the group's round lock, held by the caller, and released here.
-func (m *Manager) renewOne(ctx context.Context, g int32, t Topology, rl *sync.Mutex) {
-	select {
-	case m.rsem <- struct{}{}:
-		defer func() { <-m.rsem }()
-	case <-ctx.Done():
-		rl.Unlock()
+// renewOne runs the round of one group. It takes a place of the semaphore first and the round lock of the group after it:
+// a group that waits for a place holds no lock, so ReleaseGroup waits only for a round of its own group that really runs
+// (phase 5 review M-C). The topology is read once both are held, not the one of the start of the pass: after a wait in the
+// queue it may be several round times old, and a group removed or moved meanwhile must not be renewed.
+func (m *Manager) renewOne(ctx context.Context, g int32) {
+	if !m.rsem.acquire(ctx) {
 		return
 	}
-	// The list was taken before the rounds began; a group that was released or handed over meanwhile is not
-	// asked for (F2-02). The check is made with the round lock held, which ReleaseGroup waits for.
+	defer m.rsem.release()
+	rl := m.rmuFor(g)
+	rl.Lock()
+	// A group that was released or handed over meanwhile is not asked for (F2-02). The check is made with the round lock
+	// held, which ReleaseGroup waits for.
 	m.warnUnattributed(g)
-	if m.mayRenew(g, t) {
+	if t, ok := m.topologyNow(); ok && m.mayRenew(g, t) {
 		m.round(ctx, g, t.Members)
 	}
 	rl.Unlock()
