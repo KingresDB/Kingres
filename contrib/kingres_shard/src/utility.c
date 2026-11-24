@@ -2260,8 +2260,42 @@ map_partition_statement(Node *parsetree, QueryCompletion *qc)
 	return false;
 }
 
+static void process_utility_body(PlannedStmt *pstmt, const char *queryString,
+								 bool readOnlyTree, ProcessUtilityContext context,
+								 ParamListInfo params, QueryEnvironment *queryEnv,
+								 DestReceiver *dest, QueryCompletion *qc);
+
+/*
+ * The hook proper: whether the catalog of the database is the one of the extension is decided
+ * again before and after every statement, because ALTER EXTENSION ... ADD and CREATE/ALTER/DROP of
+ * the extension and of the schema change it without a message that every cache hears.
+ */
 static void
 kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
+							   bool readOnlyTree,
+							   ProcessUtilityContext context,
+							   ParamListInfo params,
+							   QueryEnvironment *queryEnv,
+							   DestReceiver *dest, QueryCompletion *qc)
+{
+	/*
+	 * ALTER EXTENSION kingres_shard ADD/DROP changes which relations are members without a message to
+	 * any cache: this backend decides again, and the other backends are told (the catalog tables are
+	 * invalidated).  Every other statement is announced by the relcache, extension, namespace and role
+	 * messages that the cache listens to, so BEGIN, SAVEPOINT and the like cost nothing here.
+	 */
+	bool		members = IsA(pstmt->utilityStmt, AlterExtensionContentsStmt) &&
+		strcmp(((AlterExtensionContentsStmt *) pstmt->utilityStmt)->extname, "kingres_shard") == 0;
+
+	if (members)
+		kingres_shard_trust_invalidate();
+	process_utility_body(pstmt, queryString, readOnlyTree, context, params, queryEnv, dest, qc);
+	if (members)
+		kingres_shard_trust_broadcast();
+}
+
+static void
+process_utility_body(PlannedStmt *pstmt, const char *queryString,
 							   bool readOnlyTree,
 							   ProcessUtilityContext context,
 							   ParamListInfo params,

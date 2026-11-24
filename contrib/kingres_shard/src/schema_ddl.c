@@ -467,6 +467,7 @@ set_schema_table(Node *parsetree, Oid relid, Oid src_ns, Oid target, const KsCat
 
 		values[0] = ObjectIdGetDatum(relid);
 		values[1] = ObjectIdGetDatum(target);
+		kingres_shard_require_catalog();
 		GetUserIdAndSecContext(&save_uid, &save_sec);
 		SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, save_sec | SECURITY_LOCAL_USERID_CHANGE);
 		PG_TRY();
@@ -1072,6 +1073,7 @@ run_as_bootstrap(const char *sql, int nargs, Oid *argtypes, Datum *values, bool 
 	int			save_sec;
 	int			result = 0;
 
+	kingres_shard_require_catalog();
 	GetUserIdAndSecContext(&save_uid, &save_sec);
 	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, save_sec | SECURITY_LOCAL_USERID_CHANGE);
 	PG_TRY();
@@ -1204,6 +1206,7 @@ kingres_shard_schema_table_statements_local(Oid relid)
 	MemoryContext callercxt = CurrentMemoryContext;
 
 	values[0] = ObjectIdGetDatum(relid);
+	kingres_shard_require_catalog();
 	GetUserIdAndSecContext(&save_uid, &save_sec);
 	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, save_sec | SECURITY_LOCAL_USERID_CHANGE);
 	PG_TRY();

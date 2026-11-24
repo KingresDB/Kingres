@@ -201,6 +201,8 @@ kc_process_utility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTre
 	else
 		standard_ProcessUtility(pstmt, queryString, readOnlyTree, context, params,
 								queryEnv, dest, qc);
+	/* ALTER EXTENSION ... ADD/DROP of the catalog table sends no message: look at it again (kc_catalog_reset) */
+	kc_catalog_reset();
 }
 
 void

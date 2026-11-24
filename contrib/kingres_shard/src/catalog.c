@@ -37,8 +37,16 @@
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "access/skey.h"
+#include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_authid.h"
+#include "catalog/pg_class.h"
+#include "catalog/pg_extension.h"
+#include "catalog/pg_namespace.h"
+#include "catalog/pg_type.h"
+#include "commands/extension.h"
+#include "miscadmin.h"
 #include "catalog/pg_inherits.h"
 #include "commands/trigger.h"
 #include "executor/spi.h"
@@ -49,6 +57,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 
 #include "catalog.h"
 #include "kingres_shard.h"
@@ -78,6 +87,40 @@ static struct
 	HTAB	   *cohash;			/* colocation id -> KsColocation *, of the cached list */
 }			ks;
 
+/*
+ * Whether the catalog tables of this database are the ones of the extension.
+ *
+ * The library is preloaded, so its hooks run in every database, and the schema "kingres" and the
+ * relations in it can be made by the owner of any database.  A relation is trusted only when the
+ * extension kingres_shard is installed in this database, the relation is a member of it, and the
+ * schema belongs to a superuser.  Anything else is "the extension is not installed here": no
+ * routing, no hook acting, no connection to a node that a table names.  The result is kept for
+ * the transaction and dropped by relcache, extension, namespace and role invalidations, at the
+ * end of every transaction and around every utility statement.
+ */
+#define TRUST_MAX_RELS 40
+
+typedef struct TrustRel
+{
+	char		name[NAMEDATALEN];
+	Oid			relid;			/* InvalidOid: absent, or not a member of the extension */
+} TrustRel;
+
+static struct
+{
+	bool		valid;
+	bool		trusted;
+	Oid			dboid;
+	Oid			extoid;
+	Oid			nspoid;
+	int			nrels;
+	TrustRel	rels[TRUST_MAX_RELS];
+}			trust;
+
+/* what this backend has logged: once per database and reason */
+static Oid	trust_logged_db = InvalidOid;
+static int	trust_logged_mask = 0;
+
 typedef struct ColocEntry
 {
 	int			cid;
@@ -88,6 +131,12 @@ static void catalog_inval_callback(Datum arg, Oid relid);
 static void catalog_load(void);
 static void catalog_retire(MemoryContext cxt);
 static void catalog_xact_callback(XactEvent event, void *arg);
+static void catalog_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+									 SubTransactionId parentSubid, void *arg);
+static void trust_syscache_callback(Datum arg, int cacheid, uint32 hashvalue);
+static void trust_refresh(void);
+static bool trust_is_member(Oid relid);
+static void catalog_note_spoof(const Oid *relids);
 
 /*
  * kingres_shard_catalog_init
@@ -98,7 +147,11 @@ void
 kingres_shard_catalog_init(void)
 {
 	CacheRegisterRelcacheCallback(catalog_inval_callback, (Datum) 0);
+	CacheRegisterSyscacheCallback(EXTENSIONOID, trust_syscache_callback, (Datum) 0);
+	CacheRegisterSyscacheCallback(NAMESPACEOID, trust_syscache_callback, (Datum) 0);
+	CacheRegisterSyscacheCallback(AUTHOID, trust_syscache_callback, (Datum) 0);
 	RegisterXactCallback(catalog_xact_callback, NULL);
+	RegisterSubXactCallback(catalog_subxact_callback, NULL);
 }
 
 /*
@@ -111,6 +164,9 @@ static void
 catalog_inval_callback(Datum arg, Oid relid)
 {
 	int			i;
+
+	/* membership and the owner of the schema are decided again after any relation changed */
+	trust.valid = false;
 
 	if (!ks.valid)
 		return;
@@ -154,10 +210,292 @@ catalog_xact_callback(XactEvent event, void *arg)
 
 	if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT && event != XACT_EVENT_PREPARE)
 		return;
+	/*
+	 * What was decided inside a transaction that ended in an abort may rest on changes that were rolled
+	 * back (an ALTER EXTENSION ... ADD that no message announced): decide again.  After a commit the
+	 * decision stands until a message says otherwise (relcache, extension, schema, role) or the utility
+	 * hook sees ALTER EXTENSION ... ADD/DROP, which also tells every other backend.
+	 */
+	if (event == XACT_EVENT_ABORT)
+		trust.valid = false;
 	foreach(lc, retired_cxts)
 		MemoryContextDelete((MemoryContext) lfirst(lc));
 	list_free(retired_cxts);
 	retired_cxts = NIL;
+}
+
+static void
+catalog_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+						 SubTransactionId parentSubid, void *arg)
+{
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+		trust.valid = false;
+}
+
+static void
+trust_syscache_callback(Datum arg, int cacheid, uint32 hashvalue)
+{
+	trust.valid = false;
+}
+
+/*
+ * kingres_shard_trust_invalidate
+ *
+ * Forget the decision whether the catalog of this database is the one of the extension.  The
+ * utility hook calls it around every statement: ALTER EXTENSION ... ADD changes the membership
+ * of a relation without a message that reaches the relcache.
+ */
+void
+kingres_shard_trust_invalidate(void)
+{
+	trust.valid = false;
+}
+
+/*
+ * kingres_shard_trust_broadcast
+ *
+ * ALTER EXTENSION kingres_shard ADD/DROP changes which relations are members, and no message of
+ * PostgreSQL tells the other backends.  The relcache of the catalog tables is invalidated here, so
+ * that every backend of the database hears it (catalog_inval_callback) and decides again.
+ */
+void
+kingres_shard_trust_broadcast(void)
+{
+	static const char *const more[] = {"cluster_secret", "dist_schema", "sharding_settings"};
+	Oid			nsp = get_namespace_oid(KINGRES_SHARD_SCHEMA, true);
+	int			i;
+
+	trust.valid = false;
+	if (!OidIsValid(nsp))
+		return;
+	for (i = 0; i < (int) NUM_CATALOG_TABLES; i++)
+	{
+		Oid			relid = get_relname_relid(catalog_tables[i], nsp);
+
+		if (OidIsValid(relid))
+			CacheInvalidateRelcacheByRelid(relid);
+	}
+	for (i = 0; i < (int) lengthof(more); i++)
+	{
+		Oid			relid = get_relname_relid(more[i], nsp);
+
+		if (OidIsValid(relid))
+			CacheInvalidateRelcacheByRelid(relid);
+	}
+}
+
+/*
+ * kingres_shard_require_catalog
+ *
+ * Before code runs a function of the schema "kingres" by name with the rights of the bootstrap
+ * superuser: the extension must be installed in this database and the schema must be a superuser's,
+ * or the function could be one that the owner of the database made.
+ */
+void
+kingres_shard_require_catalog(void)
+{
+	trust_refresh();
+	if (!trust.trusted)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("the extension kingres_shard is not installed in this database, or its schema \"" KINGRES_SHARD_SCHEMA "\" is not a superuser's")));
+}
+
+/* One LOG line per backend, database and reason; never a message to the session. */
+static void
+trust_log(int reason, const char *what)
+{
+	if (trust_logged_db != MyDatabaseId)
+	{
+		trust_logged_db = MyDatabaseId;
+		trust_logged_mask = 0;
+	}
+	if (trust_logged_mask & reason)
+		return;
+	trust_logged_mask |= reason;
+	ereport(LOG,
+			(errmsg("kingres_shard: %s in database with OID %u; the extension is treated as not installed there",
+					what, MyDatabaseId)));
+}
+
+/* Is the relation a member of the extension that is installed in this database? */
+static bool
+trust_is_member(Oid relid)
+{
+	return OidIsValid(trust.extoid) && getExtensionOfObject(RelationRelationId, relid) == trust.extoid;
+}
+
+/*
+ * trust_refresh
+ *
+ * Decide again, if anything may have changed, whether the extension is installed in this database
+ * and its schema is in the hands of a superuser.  When the answer changed, the catalog cache is
+ * dropped with it.
+ */
+static void
+trust_refresh(void)
+{
+	bool		was_trusted;
+	Oid			was_ext;
+	HeapTuple	tup;
+
+	if (trust.valid && trust.dboid == MyDatabaseId)
+		return;
+	/* the catalogs cannot be read outside a transaction: nothing is trusted then, and nothing is remembered */
+	if (!IsTransactionState())
+	{
+		trust.trusted = false;
+		trust.extoid = InvalidOid;
+		trust.nrels = 0;
+		return;
+	}
+
+	was_trusted = trust.trusted;
+	was_ext = trust.extoid;
+	memset(&trust, 0, sizeof(trust));
+	trust.dboid = MyDatabaseId;
+	trust.extoid = get_extension_oid("kingres_shard", true);
+	trust.nspoid = get_namespace_oid(KINGRES_SHARD_SCHEMA, true);
+	if (OidIsValid(trust.extoid) && !OidIsValid(trust.nspoid))
+		trust_log(1, "the extension kingres_shard is installed but the schema \"" KINGRES_SHARD_SCHEMA "\" is missing");
+	else if (OidIsValid(trust.extoid))
+	{
+		tup = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(trust.nspoid));
+		if (HeapTupleIsValid(tup))
+		{
+			Oid			owner = ((Form_pg_namespace) GETSTRUCT(tup))->nspowner;
+
+			/* a superuser owns it: that covers the owner of the extension when that is a superuser */
+			trust.trusted = superuser_arg(owner);
+			ReleaseSysCache(tup);
+		}
+		if (!trust.trusted)
+			trust_log(2, "the schema \"" KINGRES_SHARD_SCHEMA "\" is not owned by a superuser");
+	}
+	trust.valid = true;
+	if (was_trusted != trust.trusted || was_ext != trust.extoid)
+		ks.valid = false;
+	else if (ks.valid && ks.cat.present && !ks.loading)
+	{
+		int			i;
+
+		/* ALTER EXTENSION ... DROP TABLE sends no message to the cache: look at the members it was made from */
+		for (i = 0; i < (int) NUM_CATALOG_TABLES; i++)
+		{
+			if (!trust_is_member(ks.relids[i]))
+			{
+				ks.valid = false;
+				break;
+			}
+		}
+	}
+}
+
+/*
+ * kingres_shard_catalog_relid
+ *
+ * The OID of one of the relations of the extension, or InvalidOid when the extension is not
+ * installed in this database, or the relation of that name is not a member of it.
+ */
+Oid
+kingres_shard_catalog_relid(const char *relname)
+{
+	Oid			relid;
+	int			i;
+
+	trust_refresh();
+	if (!trust.trusted)
+		return InvalidOid;
+	for (i = 0; i < trust.nrels; i++)
+		if (strcmp(trust.rels[i].name, relname) == 0)
+			return trust.rels[i].relid;
+
+	relid = get_relname_relid(relname, trust.nspoid);
+	if (OidIsValid(relid) && !trust_is_member(relid))
+	{
+		trust_log(4, "a relation of the schema \"" KINGRES_SHARD_SCHEMA "\" has the name of a catalog table of kingres_shard but is not a member of the extension");
+		relid = InvalidOid;
+	}
+	if (strlen(relname) < NAMEDATALEN && trust.nrels < TRUST_MAX_RELS)
+	{
+		strlcpy(trust.rels[trust.nrels].name, relname, NAMEDATALEN);
+		trust.rels[trust.nrels].relid = relid;
+		trust.nrels++;
+	}
+	return relid;
+}
+
+/*
+ * What a catalog table must look like for the heap reads of the loader: the types of its first
+ * columns (the ones from "nreq" on exist only in a later version of the tables, and are checked when
+ * they are there).  The tables are read with heap_getattr(), which trusts the descriptor.
+ */
+typedef struct CatShape
+{
+	const char *name;
+	int			nreq;
+	int			ntypes;
+	Oid			types[8];
+} CatShape;
+
+static const CatShape catalog_shapes[] = {
+	{"node", 7, 7, {INT4OID, INT4OID, TEXTOID, INT4OID, TEXTOID, BOOLOID, BOOLOID}},
+	{"colocation", 4, 6, {INT4OID, INT4OID, REGTYPEOID, OIDOID, INT4OID, INT8OID}},
+	{"dist_table", 4, 4, {REGCLASSOID, TEXTOID, NAMEOID, INT4OID}},
+	{"bucket_map", 3, 5, {INT4OID, INT4OID, INT4OID, TEXTOID, INT4OID}},
+	{"map_version", 1, 3, {INT8OID, INT8OID, INT8OID}},
+	{"local_node", 1, 2, {INT4OID, INT4OID}},
+	{"dist_schema", 2, 2, {REGNAMESPACEOID, INT4OID}},
+	{"sharding_settings", 2, 2, {TEXTOID, BOOLOID}}
+};
+
+static void
+catalog_check_shape(Relation rel)
+{
+	TupleDesc	desc = RelationGetDescr(rel);
+	const char *name = RelationGetRelationName(rel);
+	int			i;
+	int			j;
+
+	if (rel->rd_rel->relkind != RELKIND_RELATION && rel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s.%s\" is not a table, so it cannot be a catalog table of kingres_shard", KINGRES_SHARD_SCHEMA, name)));
+	for (i = 0; i < (int) lengthof(catalog_shapes); i++)
+	{
+		const CatShape *sh = &catalog_shapes[i];
+
+		if (strcmp(sh->name, name) != 0)
+			continue;
+		if (desc->natts < sh->nreq)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("catalog table \"%s.%s\" has %d columns, kingres_shard needs at least %d", KINGRES_SHARD_SCHEMA, name, desc->natts, sh->nreq)));
+		for (j = 0; j < sh->ntypes && j < desc->natts; j++)
+		{
+			Form_pg_attribute att = TupleDescAttr(desc, j);
+
+			if (att->attisdropped || att->atttypid != sh->types[j])
+				ereport(ERROR,
+						(errcode(ERRCODE_DATATYPE_MISMATCH),
+						 errmsg("column %d of the catalog table \"%s.%s\" does not have the type that kingres_shard expects", j + 1, KINGRES_SHARD_SCHEMA, name)));
+		}
+		return;
+	}
+}
+
+/* A column that is read as a pointer must not be null: the table may have been altered after it was made. */
+static Datum
+catalog_text_attr(HeapTuple tup, int attno, TupleDesc desc, const char *relname)
+{
+	bool		isnull;
+	Datum		d = heap_getattr(tup, attno, desc, &isnull);
+
+	if (isnull)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("column %d of the catalog table \"%s.%s\" is null", attno, KINGRES_SHARD_SCHEMA, relname)));
+	return d;
 }
 
 /*
@@ -186,6 +524,7 @@ kingres_shard_catalog(void)
 
 	if (ks.loading)
 		return &empty;
+	trust_refresh();
 	if (!ks.valid)
 		catalog_load();
 	return &ks.cat;
@@ -207,21 +546,6 @@ kingres_shard_catalog_generation(void)
 	return catalog_generation;
 }
 
-/*
- * kingres_shard_catalog_relid
- *
- * The OID of one of the catalog tables, or InvalidOid when the extension is
- * not installed.
- */
-Oid
-kingres_shard_catalog_relid(const char *relname)
-{
-	Oid			nsp = get_namespace_oid(KINGRES_SHARD_SCHEMA, true);
-
-	if (!OidIsValid(nsp))
-		return InvalidOid;
-	return get_relname_relid(relname, nsp);
-}
 
 /*
  * Begin a scan of one catalog table with a snapshot that sees this
@@ -238,6 +562,7 @@ static void
 catscan_begin(CatScan *cs, Oid relid)
 {
 	cs->rel = table_open(relid, AccessShareLock);
+	catalog_check_shape(cs->rel);
 	/*
 	 * GetLatestSnapshot() cannot be used in parallel mode (a parallel worker,
 	 * or the leader while workers run): it raises "cannot update
@@ -283,6 +608,7 @@ read_secret_attr(int attno, bool committed_view, unsigned char *buf, int bufsize
 	if (!OidIsValid(relid))
 		return false;
 	rel = table_open(relid, AccessShareLock);
+	catalog_check_shape(rel);
 
 	/*
 	 * A catalog snapshot, not the snapshot of the transaction: the first
@@ -379,6 +705,7 @@ kingres_shard_local_node_id_raw(void)
 	if (!OidIsValid(relid))
 		return 0;
 	rel = table_open(relid, AccessShareLock);
+	catalog_check_shape(rel);
 	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
 	tup = systable_getnext(scan);
 	if (tup != NULL)
@@ -392,6 +719,32 @@ kingres_shard_local_node_id_raw(void)
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
 	return id;
+}
+
+/*
+ * catalog_note_spoof
+ *
+ * The catalog is not complete as far as this backend may trust it.  When that is because the schema
+ * "kingres" holds relations of the names of the catalog tables that are not members of the
+ * extension, say so once in the server log: the database is not where the extension is installed, or
+ * somebody made look-alikes.  Silent when the extension is simply not there.
+ */
+static void
+catalog_note_spoof(const Oid *relids)
+{
+	Oid			nsp = get_namespace_oid(KINGRES_SHARD_SCHEMA, true);
+	int			i;
+
+	if (!OidIsValid(nsp))
+		return;
+	for (i = 0; i < (int) NUM_CATALOG_TABLES; i++)
+	{
+		if (!OidIsValid(relids[i]) && OidIsValid(get_relname_relid(catalog_tables[i], nsp)))
+		{
+			trust_log(8, "the schema \"" KINGRES_SHARD_SCHEMA "\" has relations named like the catalog tables of kingres_shard that are not part of the extension");
+			return;
+		}
+	}
 }
 
 /*
@@ -410,7 +763,6 @@ catalog_load(void)
 	MemoryContext prevcxt;
 	KsCatalog	cat;
 	Oid			relids[NUM_CATALOG_TABLES];
-	Oid			nsp;
 	int			i;
 	bool		complete = true;
 	CatScan		cs;
@@ -424,14 +776,16 @@ catalog_load(void)
 	cat.local_group_id = -1;
 	catalog_generation++;
 
-	nsp = get_namespace_oid(KINGRES_SHARD_SCHEMA, true);
+	/* only relations that are members of the extension, in a database where it is installed (trust_refresh) */
+	trust_refresh();
 	for (i = 0; i < (int) NUM_CATALOG_TABLES; i++)
 	{
-		relids[i] = OidIsValid(nsp) ?
-			get_relname_relid(catalog_tables[i], nsp) : InvalidOid;
+		relids[i] = kingres_shard_catalog_relid(catalog_tables[i]);
 		if (!OidIsValid(relids[i]))
 			complete = false;
 	}
+	if (!complete)
+		catalog_note_spoof(relids);
 
 	newcxt = AllocSetContextCreate(CacheMemoryContext,
 								   "kingres_shard catalog cache",
@@ -495,9 +849,9 @@ catalog_load(void)
 
 				n->node_id = DatumGetInt32(heap_getattr(tup, 1, desc, &isnull));
 				n->group_id = DatumGetInt32(heap_getattr(tup, 2, desc, &isnull));
-				n->host = TextDatumGetCString(heap_getattr(tup, 3, desc, &isnull));
+				n->host = TextDatumGetCString(catalog_text_attr(tup, 3, desc, "node"));
 				n->port = DatumGetInt32(heap_getattr(tup, 4, desc, &isnull));
-				role = TextDatumGetCString(heap_getattr(tup, 5, desc, &isnull));
+				role = TextDatumGetCString(catalog_text_attr(tup, 5, desc, "node"));
 				n->is_primary = (strcmp(role, "primary") == 0);
 				n->is_active = DatumGetBool(heap_getattr(tup, 6, desc, &isnull));
 				n->should_have_shards =
@@ -654,6 +1008,10 @@ catalog_load(void)
 					cat.nschema_tables++;
 					continue;
 				}
+				if (m_null)
+					ereport(ERROR,
+							(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+							 errmsg("column \"method\" of the catalog table \"%s.dist_table\" is null", KINGRES_SHARD_SCHEMA)));
 				method = TextDatumGetCString(mdat);
 				is_ref = (strcmp(method, "reference") == 0);
 
@@ -703,8 +1061,8 @@ catalog_load(void)
 			 * distributed schema and the mode "row".
 			 */
 			{
-				Oid			ds_rel = OidIsValid(nsp) ? get_relname_relid("dist_schema", nsp) : InvalidOid;
-				Oid			ss_rel = OidIsValid(nsp) ? get_relname_relid("sharding_settings", nsp) : InvalidOid;
+				Oid			ds_rel = kingres_shard_catalog_relid("dist_schema");
+				Oid			ss_rel = kingres_shard_catalog_relid("sharding_settings");
 
 				cat.sharding_mode = KS_MODE_ROW;
 				if (OidIsValid(ss_rel))
@@ -714,7 +1072,7 @@ catalog_load(void)
 					{
 						TupleDesc	desc = RelationGetDescr(cs.rel);
 						bool		isnull;
-						char	   *mode = TextDatumGetCString(heap_getattr(tup, 1, desc, &isnull));
+						char	   *mode = TextDatumGetCString(catalog_text_attr(tup, 1, desc, "sharding_settings"));
 
 						cat.sharding_mode = strcmp(mode, "schema") == 0 ? KS_MODE_SCHEMA :
 							strcmp(mode, "both") == 0 ? KS_MODE_BOTH : KS_MODE_ROW;
@@ -970,6 +1328,7 @@ placement_epoch_now(int colocation_id)
 	if (!OidIsValid(relid))
 		return 0;
 	rel = table_open(relid, AccessShareLock);
+	catalog_check_shape(rel);
 	if (RelationGetDescr(rel)->natts < 6)
 	{
 		table_close(rel, AccessShareLock);
@@ -1025,7 +1384,7 @@ kingres_shard_placement_hash_now(int colocation_id)
 		{
 			TupleDesc	desc = RelationGetDescr(cs.rel);
 			bool		isnull;
-			char	   *role = TextDatumGetCString(heap_getattr(tup, 5, desc, &isnull));
+			char	   *role = TextDatumGetCString(catalog_text_attr(tup, 5, desc, "node"));
 			bool		active = DatumGetBool(heap_getattr(tup, 6, desc, &isnull));
 
 			if (strcmp(role, "primary") == 0 && active)
@@ -1058,6 +1417,7 @@ kingres_shard_placement_hash_now(int colocation_id)
 		ScanKeyData key;
 		SysScanDesc mscan;
 
+		catalog_check_shape(maprel);
 		ScanKeyInit(&key, 1, BTEqualStrategyNumber, F_INT4EQ, Int32GetDatum(colocation_id));
 		mscan = systable_beginscan(maprel, pkey, OidIsValid(pkey), snap, 1, &key);
 		while ((tup = systable_getnext(mscan)) != NULL)
@@ -1121,6 +1481,7 @@ lazy_fetch(Oid heapoid, Oid key, SysScanDesc *sd, Relation *rel, Snapshot *snap)
 
 	stat_lazy_lookups++;
 	*rel = table_open(heapoid, AccessShareLock);
+	catalog_check_shape(*rel);
 	/*
 	 * The index is the one that the open relation has now, not an OID kept from the load: REINDEX CONCURRENTLY replaces it without a write to the
 	 * catalog table (P12R-03).  A table that has lost its primary key is scanned with no index: the answer stays right (it is never "this is a

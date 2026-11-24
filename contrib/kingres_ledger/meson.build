@@ -115,6 +115,7 @@ tests += {
       't/038_public_key_check.pl',
       't/039_signature_paths.pl',
       't/041_schema_spoof.pl',
+      't/042_catalog_trust.pl',
     ],
   },
 }

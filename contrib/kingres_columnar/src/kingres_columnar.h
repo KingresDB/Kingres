@@ -405,6 +405,7 @@ extern KcAmClass kc_am_class_memo(Oid amoid, KcAmMemo *memo);
 extern bool kc_am_is_columnar(Oid amoid);
 extern void kc_am_failed_reset(void);
 extern void kc_am_cache_init(void);
+extern void kc_catalog_reset(void);
 extern bool kc_rel_is_columnar(Relation rel);
 
 /* the test gates of the check (kingres_columnar.c) */

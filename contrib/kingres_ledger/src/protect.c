@@ -338,8 +338,8 @@ kl_is_registered(Oid relid)
 
 	if (!OidIsValid(nspoid))
 		return false;
-	tableoid = get_relname_relid("ledger_table", nspoid);
-	idxoid = get_relname_relid("ledger_table_relid_key", nspoid);
+	tableoid = kl_catalog_relid("ledger_table");
+	idxoid = kl_catalog_index_relid("ledger_table_relid_key", tableoid);
 	if (!OidIsValid(tableoid) || !OidIsValid(idxoid))
 		return false;
 
@@ -378,8 +378,8 @@ kl_is_history(Oid relid)
 
 	if (!OidIsValid(nspoid))
 		return false;
-	tableoid = get_relname_relid("ledger_table", nspoid);
-	idxoid = get_relname_relid("ledger_table_history_relid_key", nspoid);
+	tableoid = kl_catalog_relid("ledger_table");
+	idxoid = kl_catalog_index_relid("ledger_table_history_relid_key", tableoid);
 	if (!OidIsValid(tableoid) || !OidIsValid(idxoid))
 		return false;
 
@@ -515,7 +515,7 @@ kl_internal_table_unused(Oid relid)
 	{
 		for (i = 0; i < 3; i++)
 		{
-			Oid			oid = get_relname_relid(names[i], nspoid);
+			Oid			oid = kl_catalog_relid(names[i]);
 
 			if (OidIsValid(oid))
 				known[i] = oid;
@@ -531,6 +531,9 @@ kl_internal_table_unused(Oid relid)
 	/* Gone already: it was dropped by a statement that was allowed to. */
 	if (get_rel_name(relid) == NULL)
 		return true;
+	/* only an ordinary table is read (a look-alike of the schema may be a view) */
+	if (get_rel_relkind(relid) != RELKIND_RELATION)
+		return false;
 	rel = table_open(relid, AccessShareLock);
 	snap = RegisterSnapshot(GetLatestSnapshot());
 	scan = systable_beginscan(rel, InvalidOid, false, snap, 0, NULL);
@@ -562,7 +565,7 @@ kl_ledger_relids(void)
 
 	if (!OidIsValid(nspoid))
 		return NIL;
-	tableoid = get_relname_relid("ledger_table", nspoid);
+	tableoid = kl_catalog_relid("ledger_table");
 	if (!OidIsValid(tableoid))
 		return NIL;
 
@@ -1006,7 +1009,7 @@ kl_check_drop(DropStmt *stmt, Oid extoid)
 
 				if (!OidIsValid(nspoid))
 					continue;
-				if (ledgers != NIL &&
+				if ((ledgers != NIL || kl_fail_closed()) &&
 					nspoid == get_namespace_oid(KL_SCHEMA_NAME, true))
 					kl_reject("drop schema", KL_SCHEMA_NAME, KL_CATALOG_LEDGER);
 				foreach(lr, ledgers)
@@ -1025,7 +1028,7 @@ kl_check_drop(DropStmt *stmt, Oid extoid)
 				char	   *name = strVal(lfirst(lc));
 				Oid			dropped;
 
-				if (strcmp(name, KL_EXTENSION_NAME) == 0 && ledgers != NIL)
+				if (strcmp(name, KL_EXTENSION_NAME) == 0 && (ledgers != NIL || kl_fail_closed()))
 					ereport(ERROR,
 							(errcode(ERRCODE_KL_PROTECTED),
 							 errmsg("cannot drop extension \"%s\" while ledger tables exist",
@@ -1118,6 +1121,11 @@ kl_check_drop_owned(DropOwnedStmt *stmt)
 {
 	List	   *ledgers = kl_ledger_relids();
 	ListCell   *lr;
+
+	if (kl_fail_closed())
+		ereport(ERROR,
+				(errcode(ERRCODE_KL_PROTECTED),
+				 errmsg("cannot drop owned objects: the schema \"%s\" is not owned by a superuser, so the ledger tables cannot be told from other tables", KL_SCHEMA_NAME)));
 
 	foreach(lr, ledgers)
 	{
@@ -2213,7 +2221,7 @@ kl_object_access(ObjectAccessType access, Oid classId, Oid objectId,
 		return;
 	if (!kl_drop_protected(classId, objectId, subId, extoid))
 		return;
-	if (kl_ledger_relids() == NIL)
+	if (kl_ledger_relids() == NIL && !kl_fail_closed())
 		return;
 
 	{

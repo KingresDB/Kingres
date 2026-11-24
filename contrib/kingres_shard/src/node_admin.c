@@ -1987,6 +1987,7 @@ kingres_shard_reload_catalog(void)
 	 * superuser (review S-B).  The function pins its own search_path and
 	 * qualifies every name it uses (see the install script).
 	 */
+	kingres_shard_require_catalog();
 	funcid = LookupFuncName(list_make2(makeString(KINGRES_SHARD_SCHEMA),
 									   makeString("internal_apply_catalog")),
 							1, argtypes, false);
