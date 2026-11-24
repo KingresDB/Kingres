@@ -141,9 +141,12 @@ type Manager struct {
 
 	op sync.Mutex // serializes fencing and starting the instance
 
-	// rmu is held by a renewal round of a group while it runs; a release takes it after the group is marked as
-	// given up, so that a renewal sent before the release cannot be received by a grantor after it (FO-13).
-	rmu sync.Mutex
+	// rmus holds, per group, the lock a renewal round of that group keeps while it runs; a release takes it after the group
+	// is marked as given up, so that a renewal sent before the release cannot be received by a grantor after it (FO-13).
+	// The rounds of different groups run side by side (phase 5 review M2), so each group has its own lock; rsem bounds how
+	// many rounds run at once.
+	rmus map[int32]*sync.Mutex
+	rsem chan struct{}
 
 	// fl counts the renewal requests that are on their way to a grantor (flights.go).
 	fl flights
@@ -191,7 +194,7 @@ func New(c Config) (*Manager, error) {
 	if err := os.MkdirAll(c.Dir, 0o700); err != nil {
 		return nil, fmt.Errorf("lease: creating %s: %w", c.Dir, err)
 	}
-	m := &Manager{c: c, groups: map[int32]*groupState{}, starting: map[int32]bool{}, fencing: map[int32]bool{}, adopted: map[int32]*adoption{}, relinq: map[int32]bool{}, base: uint64(time.Now().UnixNano())}
+	m := &Manager{c: c, rmus: map[int32]*sync.Mutex{}, rsem: make(chan struct{}, maxParallelRounds), groups: map[int32]*groupState{}, starting: map[int32]bool{}, fencing: map[int32]bool{}, adopted: map[int32]*adoption{}, relinq: map[int32]bool{}, base: uint64(time.Now().UnixNano())}
 	m.loadRelinquished()
 	if b, err := os.ReadFile(filepath.Join(c.Dir, topologyFile)); err == nil {
 		var t Topology
@@ -237,24 +240,56 @@ func (m *Manager) state(g int32) *groupState {
 	return s
 }
 
-// Renew runs one renewal round for every group this server runs the primary
-// of. The lease obtained is valid from the START of the round, never from the
-// moment the answers arrived.
+// maxParallelRounds bounds how many renewal rounds of different groups run at the same time.
+const maxParallelRounds = 8
+
+// rmuFor returns the round lock of a group.
+func (m *Manager) rmuFor(g int32) *sync.Mutex {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	l := m.rmus[g]
+	if l == nil {
+		l = &sync.Mutex{}
+		m.rmus[g] = l
+	}
+	return l
+}
+
+// Renew reads the topology and runs one renewal round for every group this server runs the primary of, and returns when
+// all of them ended. The lease obtained is valid from the START of the round, never from the moment the answers arrived.
 func (m *Manager) Renew(ctx context.Context) {
-	// The catalog is read within one renewal period: a catalog that does not answer (its instance is busy, or starting again) must not
-	// keep the rounds from being asked, the cached topology serves (as for any error), or the lease runs out because nothing asked for it.
+	m.refreshTopology(ctx)
+	m.renewGroups(ctx, true)
+}
+
+// refreshTopology reads the catalog's list of groups and members into the cache the rounds use. The catalog is read
+// within one renewal period: a catalog that does not answer (its instance is busy, or starting again) must not keep the
+// rounds from being asked, the cached topology serves (as for any error), or the lease runs out because nothing asked for
+// it. Run calls it from a loop of its own, so that a slow catalog never delays a round (phase 5 review M2).
+func (m *Manager) refreshTopology(ctx context.Context) {
 	tctx, tcancel := context.WithTimeout(ctx, max(m.c.Renew, 500*time.Millisecond))
 	topo, err := m.c.Source.Topology(tctx)
 	tcancel()
-	m.mu.Lock()
-	if err == nil {
-		changed := !sameTopology(m.topo, topo)
-		migrateLegacyMarkers(m.c.Dir, topo.Groups)
-		m.topo, m.haveT = topo, true
-		if changed {
-			m.saveTopologyLocked()
-		}
+	if err != nil {
+		return
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	changed := !sameTopology(m.topo, topo)
+	migrateLegacyMarkers(m.c.Dir, topo.Groups)
+	m.topo, m.haveT = topo, true
+	if changed {
+		m.saveTopologyLocked()
+	}
+}
+
+// renewGroups runs a round for every group from the cached topology, side by side (at most maxParallelRounds at once):
+// the rounds of the groups of one server must not wait for each other, or the lease of a later group lapses although
+// every round succeeds (phase 5 review M2). With wait the call returns when every round ended; without it a group whose
+// previous round still runs is skipped (its next round follows at the next tick) and the rounds go on in the background,
+// tracked by m.wg.
+func (m *Manager) renewGroups(ctx context.Context, wait bool) {
+	m.mu.Lock()
 	t, ok := m.topo, m.haveT
 	var groups []int32
 	if ok {
@@ -264,19 +299,48 @@ func (m *Manager) Renew(ctx context.Context) {
 	if !ok {
 		return
 	}
+	var local sync.WaitGroup
 	for _, g := range groups {
-		m.rmu.Lock()
-		// The list was taken before the rounds began; a group that was released or handed over meanwhile is not
-		// asked for (F2-02). The check is made with the round lock held, which ReleaseGroup waits for.
-		m.warnUnattributed(g)
-		if m.mayRenew(g, t) {
-			m.round(ctx, g, t.Members)
+		rl := m.rmuFor(g)
+		if !wait && !rl.TryLock() {
+			continue // the round of this group is still on its way
 		}
-		m.rmu.Unlock()
-		// A group that is not enforced keeps its watchdog file fresh whether or not the round succeeded (FO-01).
-		if wf := m.watchdogFile(g); wf != "" && !m.enforced(g) {
-			m.writeWatchdogIdle(wf)
+		work := func() {
+			if wait {
+				rl.Lock()
+			}
+			m.renewOne(ctx, g, t, rl)
 		}
+		if wait {
+			local.Add(1)
+			go func() { defer local.Done(); work() }()
+		} else {
+			m.wg.Add(1)
+			go func() { defer m.wg.Done(); work() }()
+		}
+	}
+	local.Wait()
+}
+
+// renewOne runs the round of one group; rl is the group's round lock, held by the caller, and released here.
+func (m *Manager) renewOne(ctx context.Context, g int32, t Topology, rl *sync.Mutex) {
+	select {
+	case m.rsem <- struct{}{}:
+		defer func() { <-m.rsem }()
+	case <-ctx.Done():
+		rl.Unlock()
+		return
+	}
+	// The list was taken before the rounds began; a group that was released or handed over meanwhile is not
+	// asked for (F2-02). The check is made with the round lock held, which ReleaseGroup waits for.
+	m.warnUnattributed(g)
+	if m.mayRenew(g, t) {
+		m.round(ctx, g, t.Members)
+	}
+	rl.Unlock()
+	// A group that is not enforced keeps its watchdog file fresh whether or not the round succeeded (FO-01).
+	if wf := m.watchdogFile(g); wf != "" && !m.enforced(g) {
+		m.writeWatchdogIdle(wf)
 	}
 }
 
@@ -733,14 +797,32 @@ func (m *Manager) Run(ctx context.Context) {
 			}
 		}
 	}()
+	// The topology is read first (the cache of the last run serves when the catalog does not answer), then by a loop of its
+	// own: a slow catalog must not delay a round, and a round of one group must not delay another group (phase 5 review M2).
+	m.refreshTopology(ctx)
+	topoDone := make(chan struct{})
+	go func() {
+		defer close(topoDone)
+		tt := time.NewTicker(m.c.Renew)
+		defer tt.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tt.C:
+				m.refreshTopology(ctx)
+			}
+		}
+	}()
 	t := time.NewTicker(m.c.Renew)
 	defer t.Stop()
 	for {
-		m.Renew(ctx)
+		m.renewGroups(ctx, false)
 		select {
 		case <-ctx.Done():
 			<-done
 			<-idleDone
+			<-topoDone
 			m.wg.Wait()
 			return
 		case <-t.C:

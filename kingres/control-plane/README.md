@@ -2169,6 +2169,10 @@ What exists (design `ha-phase5.md`, "Fencing by lease"; code in `internal/lease`
   the start at kingresd's own start is skipped with a warning; decision 7 adds the wait marker for a cold start). The next successful round removes the marker, starts
   the instance and audits `leaseAcquired`. The marker is on disk, so a restart of kingresd or of the machine does not
   start the primary without a lease either.
+- **Rounds of several groups.** A server that runs the primaries of several groups renews them side by side (at most eight rounds at
+  once, one round lock per group; a group whose previous round still runs is skipped until the next tick), and the catalog
+  topology is read by a loop of its own into a cache, never inside a round. Rounds that followed each other would make the
+  renewal period of every group the sum of all round times, so that the leases lapse under load although each round succeeds.
 - **Enforcement rule (decided).** Self-fencing is enforced only for a group that has at least one standby a failover may use (the standby
   manager answers `Standbys().HasStandby(group)` from local knowledge: a `ready` entry of the list, or one in a rebuild; a
   standby that is still being created does not count, so a primary is not fenced while the first copy of it is made, when

@@ -304,8 +304,9 @@ func (m *Manager) ReleaseGroup(ctx context.Context, group int32) (TransferResult
 	was := m.relinq[group]
 	m.relinq[group] = true
 	m.mu.Unlock()
-	m.rmu.Lock()
-	m.rmu.Unlock() //nolint:staticcheck // waiting for the round in flight is the point
+	rl := m.rmuFor(group)
+	rl.Lock()
+	rl.Unlock() //nolint:staticcheck // waiting for the round in flight is the point
 	// A round ends when a majority answered: the request to the last grantor may still be on its way, and must not be
 	// received after the release (FO-13).
 	m.fl.wait(group)
