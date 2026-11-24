@@ -131,6 +131,19 @@ like($err, qr/does not have the type this build expects|is not a member/, 'C2: .
 isnt($rc, 0, 'C2: the catalog read before ALTER EXTENSION ... DROP is looked at again in the same session');
 like($err, qr/is not a member of the extension/, 'C2: ... and found not to be a member') or diag($err);
 
+# L1: CREATE on the schema granted to PUBLIC or to a role that is not a superuser: the catalog cannot be used either
+for my $grantee ('PUBLIC', 'tenant')
+{
+	($rc, $out, $err) = as_super('postgres', qq{
+		BEGIN;
+		GRANT CREATE ON SCHEMA kingres TO $grantee;
+		SELECT count(*) FROM c;
+		ROLLBACK;
+	});
+	isnt($rc, 0, "L1: CREATE on the schema granted to $grantee: the catalog is refused");
+	like($err, qr/cannot be used: the schema of the extension is not owned by a superuser, or allows/, 'L1: ... the error says why') or diag($err);
+}
+
 # D
 is(q1($node, q{SELECT pg_postmaster_start_time()::text}), $started, 'D: the postmaster did not restart');
 unlike(log_text(), qr/terminated by signal|was terminated|TRAP:/, 'D: no process ended by a signal');

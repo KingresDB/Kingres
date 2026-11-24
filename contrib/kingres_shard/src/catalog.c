@@ -57,6 +57,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
+#include "utils/acl.h"
 #include "utils/syscache.h"
 
 #include "catalog.h"
@@ -326,6 +327,40 @@ trust_is_member(Oid relid)
 }
 
 /*
+ * Does the schema (its pg_namespace tuple) belong to a superuser and let nobody who is not a superuser create objects in it?
+ * CREATE granted to PUBLIC or to a role that is not a superuser means that such a role can put its own relations and functions
+ * next to the extension's (the install script refuses such a schema; this is the same test at run time).
+ */
+static bool
+catalog_schema_closed(HeapTuple nsptup)
+{
+	Form_pg_namespace ns = (Form_pg_namespace) GETSTRUCT(nsptup);
+	bool		isnull;
+	Datum		d;
+	Acl		   *acl;
+	AclItem    *aip;
+	int			i;
+	bool		closed = true;
+
+	if (!superuser_arg(ns->nspowner))
+		return false;
+	d = SysCacheGetAttr(NAMESPACEOID, nsptup, Anum_pg_namespace_nspacl, &isnull);
+	if (isnull)
+		return true;			/* the default: only the owner */
+	acl = DatumGetAclP(d);
+	aip = ACL_DAT(acl);
+	for (i = 0; i < ACL_NUM(acl); i++)
+	{
+		if ((ACLITEM_GET_PRIVS(aip[i]) & ACL_CREATE) &&
+			(aip[i].ai_grantee == ACL_ID_PUBLIC || !superuser_arg(aip[i].ai_grantee)))
+			closed = false;
+	}
+	if ((Pointer) acl != DatumGetPointer(d))
+		pfree(acl);
+	return closed;
+}
+
+/*
  * trust_refresh
  *
  * Decide again, if anything may have changed, whether the extension is installed in this database
@@ -363,14 +398,12 @@ trust_refresh(void)
 		tup = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(trust.nspoid));
 		if (HeapTupleIsValid(tup))
 		{
-			Oid			owner = ((Form_pg_namespace) GETSTRUCT(tup))->nspowner;
-
-			/* a superuser owns it: that covers the owner of the extension when that is a superuser */
-			trust.trusted = superuser_arg(owner);
+			/* a superuser owns it and nobody else may create in it */
+			trust.trusted = catalog_schema_closed(tup);
 			ReleaseSysCache(tup);
 		}
 		if (!trust.trusted)
-			trust_log(2, "the schema \"" KINGRES_SHARD_SCHEMA "\" is not owned by a superuser");
+			trust_log(2, "the schema \"" KINGRES_SHARD_SCHEMA "\" is not owned by a superuser, or lets a role that is not a superuser create objects in it");
 	}
 	trust.valid = true;
 	if (was_trusted != trust.trusted || was_ext != trust.extoid)

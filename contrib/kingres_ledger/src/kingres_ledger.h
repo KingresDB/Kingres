@@ -266,7 +266,9 @@ extern bool kl_manual_write_ok(void);
 extern Oid	kl_extension_oid(void);
 extern Oid	kl_catalog_relid(const char *relname);
 extern Oid	kl_catalog_index_relid(const char *idxname, Oid tableoid);
+extern bool kl_schema_trusted(Oid nspoid);
 extern bool kl_registry_untrusted(void);
+extern void kl_refuse_untrusted_write(Oid relid, Oid extoid, const char *what);
 extern bool kl_fail_closed(void);
 extern void kl_require_trusted_registry(const char *what);
 

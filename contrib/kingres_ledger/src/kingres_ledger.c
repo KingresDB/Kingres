@@ -268,19 +268,11 @@ kl_shard_catalog_trusted(void)
 	static const char *const names[] = {"dist_schema", "bucket_map", "local_node", "node", "bucket_move"};
 	Oid			extoid = get_extension_oid("kingres_shard", true);
 	Oid			nspoid = get_namespace_oid(KL_SCHEMA_NAME, true);
-	HeapTuple	tup;
-	bool		owner_ok = false;
 	int			i;
 
 	if (!OidIsValid(extoid) || !OidIsValid(nspoid))
 		return false;
-	tup = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(nspoid));
-	if (HeapTupleIsValid(tup))
-	{
-		owner_ok = superuser_arg(((Form_pg_namespace) GETSTRUCT(tup))->nspowner);
-		ReleaseSysCache(tup);
-	}
-	if (!owner_ok)
+	if (!kl_schema_trusted(nspoid))
 		return false;
 	for (i = 0; i < (int) lengthof(names); i++)
 	{

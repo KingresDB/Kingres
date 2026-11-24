@@ -49,6 +49,8 @@
 #include "storage/predicate.h"
 #include "storage/procarray.h"
 #include "storage/smgr.h"
+#include "utils/array.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/inval.h"
@@ -112,16 +114,36 @@ kc_catalog_check(Oid extoid, Oid nspoid, Oid catoid, Oid idxoid)
 	HeapTuple	tup;
 	Form_pg_class cls;
 	const char *what = NULL;
-	Oid			owner = InvalidOid;
+	bool		closed = false;
 
 	tup = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(nspoid));
 	if (HeapTupleIsValid(tup))
 	{
-		owner = ((Form_pg_namespace) GETSTRUCT(tup))->nspowner;
+		Form_pg_namespace ns = (Form_pg_namespace) GETSTRUCT(tup);
+		bool		isnull;
+		Datum		d = SysCacheGetAttr(NAMESPACEOID, tup, Anum_pg_namespace_nspacl, &isnull);
+
+		/* a superuser owns it, and CREATE is granted to no role that is not a superuser (nor to PUBLIC) */
+		closed = superuser_arg(ns->nspowner);
+		if (closed && !isnull)
+		{
+			Acl		   *acl = DatumGetAclP(d);
+			AclItem    *aip = ACL_DAT(acl);
+			int			i;
+
+			for (i = 0; i < ACL_NUM(acl); i++)
+			{
+				if ((ACLITEM_GET_PRIVS(aip[i]) & ACL_CREATE) &&
+					(aip[i].ai_grantee == ACL_ID_PUBLIC || !superuser_arg(aip[i].ai_grantee)))
+					closed = false;
+			}
+			if ((Pointer) acl != DatumGetPointer(d))
+				pfree(acl);
+		}
 		ReleaseSysCache(tup);
 	}
-	if (!OidIsValid(owner) || !superuser_arg(owner))
-		return "the schema of the extension is not owned by a superuser";
+	if (!closed)
+		return "the schema of the extension is not owned by a superuser, or allows a role that is not a superuser to create objects in it";
 	/* the index of a member table is the table's own (its constraint index is not recorded as a member itself) */
 	if (getExtensionOfObject(RelationRelationId, catoid) != extoid ||
 		(getExtensionOfObject(RelationRelationId, idxoid) != extoid &&
