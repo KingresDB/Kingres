@@ -303,6 +303,10 @@ func leaderOf(d internalDeps) func() string {
 		if d.ops != nil && d.ops.LocalInstanceDown() {
 			return d.lastLeader.get()
 		}
+		if d.fault.FailoverInjection("leader:forget") == "forget" {
+			// A test: the server has forgotten the leader it last verified, as it does once remembered (60 s) has passed since its instance stopped.
+			return ""
+		}
 		return d.lastLeader.recent()
 	}
 }

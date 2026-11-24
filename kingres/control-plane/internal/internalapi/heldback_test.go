@@ -74,3 +74,58 @@ func TestAHeldBackServerAcceptsTheStandbyCallsFromTheLeaderTheOthersName(t *test
 		t.Errorf("a server that is not held back accepted a call of a server that is not its leader: %d", w.Code)
 	}
 }
+
+// The calls that a switchover makes to the old primary's server after the promotion (the state, the end of the hold, the end of the freeze) are accepted
+// from the leader the other members name while that server is held back: it forgot the leader it had verified, its instance cannot be read, and the
+// end of the freeze must not wait for the instance that waits for the rebuild, which waits for the end of the freeze. A caller that is not the named
+// leader, or nobody named, still gets the 503; the calls that stop or start an instance stay leader only.
+func TestAHeldBackServerAcceptsTheCallsThatEndASwitchover(t *testing.T) {
+	named := "s1"
+	handled := ""
+	be := Backend{
+		Leader:      func() string { return "" },
+		Unavailable: func() bool { return true },
+		PeerLeader:  func(context.Context) string { return named },
+		Handle: func(_ context.Context, key, peer string, _ []byte) (any, error) {
+			handled = key + " from " + peer
+			return map[string]any{}, nil
+		},
+	}
+	s := New(fakeVerifier{peer: "s1"}, be, nil, nil)
+	calls := []struct{ method, path string }{{http.MethodPost, "/failover/unfreeze"}, {http.MethodPost, "/failover/unquiesce"}, {http.MethodGet, "/failover/state"}}
+	for _, c := range calls {
+		handled = ""
+		if w := heldBackRequest(s, c.method, c.path); w.Code != 200 || !strings.Contains(handled, c.path) {
+			t.Errorf("%s %s from the leader the others name: %d %s (handled %q)", c.method, c.path, w.Code, w.Body.String(), handled)
+		}
+	}
+	// another server than the one named, and nobody named
+	for _, c := range calls {
+		handled = ""
+		if w := heldBackRequest(New(fakeVerifier{peer: "s2"}, be, nil, nil), c.method, c.path); w.Code != 503 || handled != "" {
+			t.Errorf("%s %s from a server that is not the named leader: %d (handled %q)", c.method, c.path, w.Code, handled)
+		}
+	}
+	named = ""
+	for _, c := range calls {
+		if w := heldBackRequest(s, c.method, c.path); w.Code != 503 {
+			t.Errorf("%s %s with no leader named: %d", c.method, c.path, w.Code)
+		}
+	}
+	// the calls that stop, promote or hand over an instance are not among them
+	named = "s1"
+	for _, p := range []string{"/failover/demote", "/failover/promote", "/failover/quiesce", "/failover/freeze"} {
+		handled = ""
+		if w := heldBackRequest(s, http.MethodPost, p); w.Code != 503 || handled != "" {
+			t.Errorf("POST %s of a held-back server: %d (handled %q)", p, w.Code, handled)
+		}
+	}
+	// a server that is not held back keeps the rule: only the leader of its own catalog
+	be.Unavailable = func() bool { return false }
+	be.Leader = func() string { return "s9" }
+	for _, c := range calls {
+		if w := heldBackRequest(New(fakeVerifier{peer: "s1"}, be, nil, nil), c.method, c.path); w.Code != 403 {
+			t.Errorf("%s %s: a server that is not held back accepted a call of a server that is not its leader: %d", c.method, c.path, w.Code)
+		}
+	}
+}

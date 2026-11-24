@@ -60,7 +60,8 @@ const (
 	// LeaderOrHeldBack: the leader, and also, while this server's instance is held back (so that it cannot read its
 	// catalog and does not know the leader), the server that the other members name as the leader. The old primary of a
 	// failover is in that state when it is rebuilt: its instance is stopped and may not start before it is a standby, and
-	// the leader has to be able to tell it so. The call proves what it needs itself (the rebuild of an old primary does).
+	// the leader has to be able to tell it so; the end of the freeze, the end of the hold and the state of a failover
+	// are made to it in that state too. The call proves what it needs itself (the rebuild of an old primary does).
 	LeaderOrHeldBack
 	// Bootstrap: no client certificate. The first contact of a join, before
 	// the two sides share a CA: authenticated by the new server's setup token
@@ -141,8 +142,12 @@ var Calls = map[string]Policy{
 	// The read calls and the freeze of the failover (internal-api.md, "Failover groundwork").
 	"GET /failover/position": AnyPeer,
 	"GET /liveness":          AnyPeer,
-	"GET /failover/state":    LeaderOnly,
-	"GET /catalog/nodes":     AnyPeer,
+	// The calls that a switchover or a failover makes to the old primary's server after the promotion (the check that its primary does not run, the
+	// end of the hold, the end of the freeze) are "leader or held back": that server's instance is stopped and may not start before it is a
+	// standby, so once the leader it last verified is forgotten it cannot read the catalog, and the end of the freeze, which the rebuild waits for,
+	// must not wait for an instance that waits for the rebuild.
+	"GET /failover/state": LeaderOrHeldBack,
+	"GET /catalog/nodes":  AnyPeer,
 	// The bootstrap of the map group runs while the manager leader is gone: any member may ask a candidate, and the candidate proves what it needs itself.
 	"POST /failover/map/start":     AnyPeer,
 	"POST /failover/map/continue":  AnyPeer,
@@ -153,7 +158,7 @@ var Calls = map[string]Policy{
 	"GET /failover/map/bootstrap":  AnyPeer,
 	"POST /failover/map/resume":    AnyPeer,
 	"POST /failover/freeze":        LeaderOnly,
-	"POST /failover/unfreeze":      LeaderOnly,
+	"POST /failover/unfreeze":      LeaderOrHeldBack,
 	"POST /failover/standbys-gone": LeaderOnly,
 
 	// The calls of the failover task (internal-api.md, "Failover"): all from the leader, each acting on the
@@ -164,7 +169,7 @@ var Calls = map[string]Policy{
 	"POST /failover/prepared": LeaderOnly,
 	// The calls of the planned switchover (design 5.2): stop the writes of a group, mark the position, ask a standby for the proof, undo.
 	"POST /failover/quiesce":   LeaderOnly,
-	"POST /failover/unquiesce": LeaderOnly,
+	"POST /failover/unquiesce": LeaderOrHeldBack,
 	"POST /failover/mark":      LeaderOnly,
 	"POST /failover/verify":    LeaderOnly,
 	"POST /failover/resume":    LeaderOnly,
