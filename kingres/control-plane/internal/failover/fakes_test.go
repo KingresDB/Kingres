@@ -39,6 +39,7 @@ type world struct {
 	live           map[string]string
 	lease          map[string]bool // server holds the lease of group 1
 	leaseHeldByOld bool            // the grantors still renew the old holder
+	leaseErr       error           // the call that takes the fence lease fails with this error
 	frozen         bool
 	promoted       map[string]bool
 	promoteErr     map[string]error // scripted errors for the first calls, by server
@@ -354,6 +355,9 @@ func (p fpeers) Lease(_ context.Context, server string, r LeaseRequest) (LeaseAn
 		return LeaseAnswer{Transferred: true, Holder: r.TransferTo}, nil
 	}
 	p.w.rec("lease-%s %s", r.Role, server)
+	if p.w.leaseErr != nil {
+		return LeaseAnswer{}, p.w.leaseErr
+	}
 	if p.w.leaseHeldByOld {
 		return LeaseAnswer{Held: false, WaitMs: 9000, RefusedBy: map[string]string{"s2": "s1", "s3": "s1"}}, nil
 	}

@@ -884,7 +884,7 @@ for `hard` on ordinary groups; 2 problem codes, 7 alert kinds, 5 audit actions, 
 
 The meaning of `graceful` (the planned switchover), of `Task.cancellable` (false from the moment the task starts to stop the old primary of a group), of the counter's reset and
 of the task steps of `server.failover` (one block per group, `TaskStep.shardGroupId`). The task error codes of the failover are
-not an enum of the contract (clients tolerate codes they do not know): `superseded`, `lease_still_held`, `lease_held_elsewhere`,
+not an enum of the contract (clients tolerate codes they do not know): `superseded`, `lease_still_held`, `lease_held_elsewhere`, `lease_unavailable`,
 `lease_lost`, `quorum_unavailable`, `no_candidate`, `target_not_available`, `split_promotion`, `promote_timeout`,
 `promote_incomplete`, `bad_promote_target`, `standby_behind`, `prepared_transactions_pending`, `cancelled`. The failover
 statuses in `FailoverReportSummary.outcome` add `paused` (a run that waits for an operator).

@@ -745,6 +745,9 @@ func subjectOf(group int32, server string) string {
 // ---------------------------------------------------------------------------------
 // F3
 
+// freezeRenewEvery is how often a step that waits renews the freeze of the group.
+const freezeRenewEvery = 30 * time.Second
+
 func (r *Runner) takeFence(ctx context.Context, env *task.Env, sc *stepCtx) error {
 	run, err := sc.runRow(ctx)
 	if err != nil {
@@ -768,9 +771,20 @@ func (r *Runner) takeFence(ctx context.Context, env *task.Env, sc *stepCtx) erro
 		return err
 	}
 	quorumSince := time.Time{}
+	// errSince is when the fence lease call began to fail with an error that is not an answer about the lease; the wait for
+	// the lease is bounded for such an error as it is for an answer that says "held by the old holder" (phase 5 review M3).
+	errSince := time.Time{}
+	frozenAt := r.now()
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		// The freeze of the group lapses (default five minutes): it is kept while the step waits.
+		if r.now().Sub(frozenAt) >= freezeRenewEvery {
+			if err := sc.ensureFrozen(ctx); err != nil {
+				return err
+			}
+			frozenAt = r.now()
 		}
 		if !r.hearsMajority(ctx, members) {
 			if quorumSince.IsZero() {
@@ -797,6 +811,17 @@ func (r *Runner) takeFence(ctx context.Context, env *task.Env, sc *stepCtx) erro
 				if !errors.Is(err, ErrUnreachable) {
 					r.log().Warn("failover: asking for the fence lease", "group", sc.group, "error", err)
 				}
+				if errSince.IsZero() {
+					errSince = r.now()
+				}
+				sc.detail(ctx, "the lease of the group cannot be taken: %v", err)
+				if r.now().Sub(errSince) > orDur(r.LeaseWait, 25*time.Second) {
+					r.Plan.Alert(ctx, "failoverBlocked", "warning", subjectOf(sc.group, sc.old()), fmt.Sprintf("The lease of shard group %d could not be taken from this server: %v.", sc.group, err), true)
+					if sc.in.graceful() {
+						return sc.rollbackFailed(ctx, CodeLeaseUnavailable, true, "the lease of shard group %d could not be taken (%v); shard group %d was given back to %s", sc.group, err, sc.group, sc.old())
+					}
+					return &PauseError{Reason: fmt.Sprintf("The lease of shard group %d could not be taken from this server (%v); nothing was promoted. Repair the cause and repeat the request.", sc.group, err)}
+				}
 			} else if ans.Held {
 				waited := int(r.now().Sub(started).Milliseconds())
 				if err := sc.rows.Set(ctx, sc.group, GroupSet{LeaseWaitMs: &waited, State: ptr("fenced")}); err != nil {
@@ -805,6 +830,7 @@ func (r *Runner) takeFence(ctx context.Context, env *task.Env, sc *stepCtx) erro
 				sc.event(ctx, "leaseHeld", map[string]any{"waitMs": waited})
 				return nil
 			} else {
+				errSince = time.Time{}
 				sc.detail(ctx, "waiting for the old lease: %d ms left at the grantors that refused", ans.WaitMs)
 				if r.now().Sub(started) > orDur(r.LeaseWait, 25*time.Second) {
 					stillOld := false

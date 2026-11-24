@@ -89,6 +89,7 @@ const (
 	CodeLeaseStillHeld     = "lease_still_held"
 	CodeLeaseHeldElsewhere = "lease_held_elsewhere"
 	CodeLeaseLost          = "lease_lost"
+	CodeLeaseUnavailable   = "lease_unavailable"
 	CodeQuorumUnavailable  = "quorum_unavailable"
 	CodeNoCandidate        = "no_candidate"
 	CodeTargetUnavailable  = "target_not_available"
