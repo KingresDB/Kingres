@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/instance"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sqlx"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/wire"
@@ -406,9 +407,13 @@ func (s *Service) applyDatabase(ctx context.Context, id int, c *pgx.Conn, d wire
 		// kingres_shard creates the schema kingres itself and fails when another
 		// extension made it first, so the others wait until kingres.add_node
 		// installed it (the leader applies the databases again after that).
-		var have bool
-		if err := dc.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'kingres_shard')").Scan(&have); err != nil || !have {
-			return err
+		// Found by extguard, not by name alone: a schema of the tenant is not the extension's (the check is the owner, the grants and the members).
+		info, err := extguard.Verify(ctx, dc, extguard.Shard)
+		if err != nil {
+			return fmt.Errorf("the extension kingres_shard of database %s is not used: %w", truncName(d.Name), err)
+		}
+		if !info.Present {
+			return nil
 		}
 	}
 	for _, e := range d.Extensions {
@@ -418,6 +423,17 @@ func (s *Service) applyDatabase(ctx context.Context, id int, c *pgx.Conn, d wire
 		id, err := sqlx.NewIdent(e)
 		if err != nil {
 			return errors.New("invalid extension name")
+		}
+		// Before CREATE EXTENSION: an extension that is there must be trusted, and the schema it would be created in must not be one that a tenant made (the
+		// control file of an extension with "schema = ..." uses an existing schema, and the tenant would own what the service role runs).
+		if extguard.IsKingres(e) {
+			if info, err := extguard.Verify(ctx, dc, e); err != nil {
+				return fmt.Errorf("extension %s of database %s is not used: %w", truncName(e), truncName(d.Name), err)
+			} else if !info.Present {
+				if err := extguard.PreInstallExtension(ctx, dc, e); err != nil {
+					return fmt.Errorf("extension %s is not installed in database %s: %w", truncName(e), truncName(d.Name), err)
+				}
+			}
 		}
 		if err := execB(ctx, dc, new(sqlx.Builder).Text("CREATE EXTENSION IF NOT EXISTS").ID(id)); err != nil {
 			return fmt.Errorf("installing extension %s failed", truncName(e))

@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,6 +29,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/cluster"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ha"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/store"
 )
@@ -70,6 +73,7 @@ type Store struct {
 	mu     sync.Mutex
 	pools  map[string]*pgxpool.Pool
 	closed bool
+	ext    extState
 }
 
 var _ store.Store = (*Store)(nil)
@@ -90,6 +94,7 @@ func New(opts Options) (*Store, error) {
 	cfg.MinConns = 0
 	cfg.MaxConnIdleTime = time.Minute
 	cfg.ConnConfig.RuntimeParams["application_name"] = "kingresd"
+	cluster.SafeSession(cfg.ConnConfig)
 	now := opts.Now
 	if now == nil {
 		now = time.Now
@@ -128,6 +133,7 @@ func (s *Store) SetDSN(dsn string) error {
 	cfg.ConnConfig.ConnectTimeout = s.opts.ConnectTimeout
 	cfg.MaxConns, cfg.MinConns, cfg.MaxConnIdleTime = 4, 0, time.Minute
 	cfg.ConnConfig.RuntimeParams["application_name"] = "kingresd"
+	cluster.SafeSession(cfg.ConnConfig)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, p := range s.pools {
@@ -245,8 +251,15 @@ func (s *Store) PostgresVersion(ctx context.Context) (string, error) {
 // regclassExists reports whether a relation such as "kingres.node" exists
 // in the database. A missing extension is not an error.
 func (s *Store) regclassExists(ctx context.Context, p *pgxpool.Pool, name string) (bool, error) {
+	// A relation of the schema kingres counts only when the extension that defines it is installed and its schema is trusted (extguard): a name says nothing about
+	// who made the object, and the readers that follow run it as the service role, a superuser.
+	if strings.HasPrefix(name, "kingres.") {
+		if ok, err := s.extReady(ctx, p, extguard.ObjectExtension(name)); err != nil || !ok {
+			return false, err
+		}
+	}
 	var ok bool
-	if err := p.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", name).Scan(&ok); err != nil {
+	if err := p.QueryRow(ctx, "SELECT pg_catalog.to_regclass($1) IS NOT NULL", name).Scan(&ok); err != nil {
 		return false, s.wrap("checking for "+name, err)
 	}
 	return ok, nil

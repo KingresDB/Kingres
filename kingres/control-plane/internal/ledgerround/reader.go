@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sqlx"
 )
@@ -104,11 +105,14 @@ func mapPG(err error) error {
 }
 
 func run(ctx context.Context, c *pgx.Conn, req ReadRequest) (ReadResponse, error) {
+	if err := requireLedger(ctx, c); err != nil {
+		return ReadResponse{}, err
+	}
 	var hasBlocks, hasRecords, hasHead, hasEntries bool
-	if err := c.QueryRow(ctx, `SELECT to_regclass('kingres.ledger_blocks') IS NOT NULL,
-		to_regclass('kingres.ledger_digest') IS NOT NULL AND to_regclass('kingres.ledger_verification') IS NOT NULL,
-		to_regprocedure('kingres.ledger_head()') IS NOT NULL,
-		to_regprocedure('kingres.ledger_blocks_entries(bigint,integer)') IS NOT NULL`).Scan(&hasBlocks, &hasRecords, &hasHead, &hasEntries); err != nil {
+	if err := c.QueryRow(ctx, `SELECT pg_catalog.to_regclass('kingres.ledger_blocks') IS NOT NULL,
+		pg_catalog.to_regclass('kingres.ledger_digest') IS NOT NULL AND pg_catalog.to_regclass('kingres.ledger_verification') IS NOT NULL,
+		pg_catalog.to_regprocedure('kingres.ledger_head()') IS NOT NULL,
+		pg_catalog.to_regprocedure('kingres.ledger_blocks_entries(bigint,integer)') IS NOT NULL`).Scan(&hasBlocks, &hasRecords, &hasHead, &hasEntries); err != nil {
 		return ReadResponse{}, err
 	}
 	if !hasBlocks {
@@ -198,4 +202,22 @@ func digest(ctx context.Context, c *pgx.Conn) (ReadResponse, error) {
 	}
 	out.Digest = &d
 	return out, nil
+}
+
+// requireLedger checks the extension before anything of the schema kingres is read or called (extguard): the session is the service role's, a superuser, and a
+// schema that a database owner made would run its functions as that role. An extension that is not installed is the answer "no ledger"; one whose schema cannot be
+// trusted is refused, and nothing in it is touched.
+func requireLedger(ctx context.Context, c *pgx.Conn) error {
+	info, err := extguard.Verify(ctx, c, extguard.Ledger)
+	if u, bad := extguard.IsUntrusted(err); bad {
+		return callErr(http.StatusUnprocessableEntity, CodeLedgerBroken,
+			"The schema "+u.Schema+" of kingres_ledger cannot be trusted ("+string(u.Reason)+"); the ledger of this database is not read.")
+	}
+	if err != nil {
+		return err
+	}
+	if !info.Present {
+		return callErr(http.StatusConflict, CodeNoLedger, "The ledger is not enabled on this database.")
+	}
+	return nil
 }

@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sqlx"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
@@ -189,8 +190,10 @@ func (o *Ops) PrepareDistribute(ctx context.Context, db, schema, table string, r
 			}
 		}
 		var ledgerTable, haveLedger bool
-		if err := tx.QueryRow(ctx, `SELECT to_regclass('kingres.ledger_table') IS NOT NULL`).Scan(&haveLedger); err != nil {
-			return err
+		var lerr error
+		haveLedger, lerr = extUsable(ctx, tx, extguard.Ledger)
+		if lerr != nil {
+			return lerr
 		}
 		if haveLedger {
 			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM kingres.ledger_table WHERE relid = to_regclass($1))`, qualified(schema, table)).Scan(&ledgerTable); err != nil {
@@ -240,7 +243,7 @@ func (o *Ops) PrepareUndistribute(ctx context.Context, db, schema, table string,
 
 // mustBeDistributed reads the method of the table (hash or reference) and counts the tables its foreign keys link to it.
 func (o *Ops) mustBeDistributed(ctx context.Context, p *tableParams) error {
-	return wrap(o.asService(ctx, p.Database, func(tx pgx.Tx) error {
+	return wrap(o.asServiceExt(ctx, p.Database, []string{extguard.Shard}, func(tx pgx.Tx) error {
 		if ok, err := tableExists(ctx, tx, p.Schema, p.Table); err != nil {
 			return err
 		} else if !ok {
@@ -338,7 +341,7 @@ func (o *Ops) PreparePartition(ctx context.Context, db, schema, table, op, name 
 		return nil, problem.Validation("The partition request is invalid.", errs...)
 	}
 	var exists, partitioned bool
-	err := o.asService(ctx, db, func(tx pgx.Tx) error {
+	err := o.asServiceExt(ctx, db, []string{extguard.Shard}, func(tx pgx.Tx) error {
 		if ok, err := tableExists(ctx, tx, schema, table); err != nil {
 			return err
 		} else if !ok {
@@ -514,9 +517,14 @@ func (o *Ops) ListTablePartitions(ctx context.Context, db, schema, table string,
 		} else if !ok {
 			return problem.New(problem.NotFound, fmt.Sprintf("Table %s.%s does not exist.", schema, table))
 		}
-		var have bool
-		if err := tx.QueryRow(ctx, `SELECT to_regclass('kingres.partitions') IS NOT NULL`).Scan(&have); err != nil {
+		have, err := extUsable(ctx, tx, extguard.Shard)
+		if err != nil {
 			return err
+		}
+		if have {
+			if err := tx.QueryRow(ctx, `SELECT to_regclass('kingres.partitions') IS NOT NULL`).Scan(&have); err != nil {
+				return err
+			}
 		}
 		if !have {
 			return o.nativePartitions(ctx, tx, schema, table, cursor, limit, &page)

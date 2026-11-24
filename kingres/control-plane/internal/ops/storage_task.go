@@ -16,6 +16,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extgate"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sqlx"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
@@ -371,7 +373,7 @@ type storageInfo struct {
 func (o *Ops) storageRefusals(ctx context.Context, p storageParams) ([]api.TableBlocker, storageInfo, error) {
 	var blockers []api.TableBlocker
 	var info storageInfo
-	err := o.policyTx(ctx, p.Database, func(tx pgx.Tx) error {
+	err := o.isoTx(ctx, p.Database, nil, func(tx pgx.Tx) error {
 		var kind, am string
 		var isPart bool
 		var parentOK bool
@@ -419,6 +421,18 @@ func (o *Ops) storageRefusals(ctx context.Context, p storageParams) ([]api.Table
 			blockers = append(blockers, api.TableBlocker{Code: code, Object: object, Message: msg})
 		}
 		obj := p.Schema + "." + firstNonEmpty(p.Partition, p.Table)
+		// the rest reads kingres.ledger_table, kingres.dist_table and kingres.timepart__convert_refusal as a superuser: only what extguard has verified is read
+		seen, err := extguard.VerifyAll(ctx, tx, extguard.Shard, extguard.Ledger, extguard.Timepart)
+		if err != nil {
+			return err
+		}
+		usable := map[string]bool{}
+		for _, r := range seen {
+			if u, ok := extguard.IsUntrusted(r.Err); ok {
+				return extgate.Problem(u, p.Database)
+			}
+			usable[r.Info.Name] = r.Info.Present
+		}
 		switch {
 		case kind == "p":
 			add("partitioned_table", obj, "a partitioned table has no storage of its own, convert its partitions")
@@ -429,8 +443,11 @@ func (o *Ops) storageRefusals(ctx context.Context, p storageParams) ([]api.Table
 			return nil
 		}
 		if p.Partition == "" {
-			blockers = append(blockers, tableConversionReasons(ctx, tx, p)...)
+			blockers = append(blockers, tableConversionReasons(ctx, tx, p, usable)...)
 			return nil
+		}
+		if !usable[extguard.Timepart] {
+			return problem.New(problem.ExtensionMissing, extguard.Timepart+" is not installed in this database.")
 		}
 		var r *string
 		if err := tx.QueryRow(ctx, `SELECT kingres.timepart__convert_refusal($1::text::regclass::oid, $2::text::regclass::oid, $3::name, $4::text[], $5::jsonb)`,
@@ -473,7 +490,7 @@ func parentOf(p storageParams) string {
 // tableConversionReasons are the reasons that stop a plain table from being converted that the catalog shows: a ledger table (its history is
 // append-only and hash-chained), a distributed or reference table (they are converted through their partitions, and the sharding extension owns
 // their storage), a table of a publication (the columnar format has no logical decoding of updates), and foreign keys.
-func tableConversionReasons(ctx context.Context, tx pgx.Tx, p storageParams) []api.TableBlocker {
+func tableConversionReasons(ctx context.Context, tx pgx.Tx, p storageParams, usable map[string]bool) []api.TableBlocker {
 	var out []api.TableBlocker
 	one := func(q string, args ...any) bool {
 		var yes bool
@@ -485,16 +502,19 @@ func tableConversionReasons(ctx context.Context, tx pgx.Tx, p storageParams) []a
 	rel := p.rel()
 	obj := p.Schema + "." + p.Table
 	// A statement that names a table the extension has not made fails when it is parsed and would abort the transaction: ask for the table first.
-	registered := func(table string) bool {
+	registered := func(ext, table string) bool {
+		if !usable[ext] {
+			return false
+		}
 		if !one(`SELECT to_regclass($1) IS NOT NULL`, table) {
 			return false
 		}
 		return one(`SELECT EXISTS (SELECT 1 FROM `+table+` WHERE relid = $1::regclass)`, rel)
 	}
-	if registered("kingres.ledger_table") {
+	if registered(extguard.Ledger, "kingres.ledger_table") {
 		out = append(out, api.TableBlocker{Code: "ledger_table", Object: obj, Message: "it is a ledger table"})
 	}
-	if registered("kingres.dist_table") {
+	if registered(extguard.Shard, "kingres.dist_table") {
 		out = append(out, api.TableBlocker{Code: "distributed_table", Object: obj, Message: "it is a distributed or reference table"})
 	}
 	if p.AccessMethod == "columnar" {
@@ -591,6 +611,9 @@ func (o *Ops) stepStorageConvert(ctx context.Context, env *task.Env) error {
 			if _, err := tx.Exec(ctx, `SELECT pg_catalog.set_config('lock_timeout', $1, true)`, strconv.FormatInt(storageLockTimeout.Milliseconds(), 10)+"ms"); err != nil {
 				return err
 			}
+			if err := requireExt(ctx, tx, extguard.Columnar); err != nil {
+				return err
+			}
 			if _, err := tx.Exec(ctx, `SELECT kingres.columnar_set_options($1::regclass, $2, $3, $4, $5)`, p.rel(), nullStr(p.Compression), nullInt(p.CompressionLevel), nullInt(p.StripeRowCount), nullInt(p.ChunkRowCount)); err != nil {
 				return err
 			}
@@ -599,6 +622,9 @@ func (o *Ops) stepStorageConvert(ctx context.Context, env *task.Env) error {
 	}
 	if p.Partition != "" {
 		_ = env.SetDetail(ctx, "Writers of the partition wait only while the new partition is swapped in.")
+		if err := requireExt(ctx, c, extguard.Timepart); err != nil {
+			return err
+		}
 		_, err := c.Exec(ctx, `CALL kingres.convert_partition($1::text::regclass, $2::text::regclass, $3::name, $4::text[], $5::jsonb)`,
 			qualified(p.Schema, p.Table), p.rel(), p.AccessMethod, nullableList(p.SortBy), p.optionsJSON())
 		return storageSQLError(err)

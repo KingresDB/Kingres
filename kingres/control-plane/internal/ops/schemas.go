@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/store"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
@@ -55,9 +56,14 @@ var systemSchemas = `n.nspname !~ '^pg_' AND n.nspname NOT IN ('information_sche
 
 // schemaRows reads the schemas of a database from the map group primary (this server).
 func (o *Ops) schemaRows(ctx context.Context, c *pgx.Conn, only string) ([]api.SchemaSummary, error) {
-	var dist bool
-	if err := c.QueryRow(ctx, `SELECT to_regclass('kingres.schemas') IS NOT NULL`).Scan(&dist); err != nil {
-		return nil, PGProblem(err)
+	dist, err := extUsable(ctx, c, extguard.Shard)
+	if err != nil {
+		return nil, err
+	}
+	if dist {
+		if err := c.QueryRow(ctx, `SELECT to_regclass('kingres.schemas') IS NOT NULL`).Scan(&dist); err != nil {
+			return nil, PGProblem(err)
+		}
 	}
 	join, cols := "", "NULL::int, NULL::int, NULL::text, NULL::text, NULL::bigint, NULL::int"
 	if dist {
@@ -109,6 +115,8 @@ func (o *Ops) logSchemaErr(what, db string, err error) {
 	}
 }
 
+// withDB runs f on a service connection to db. A database whose sharding schema cannot be trusted is refused: f reads it as a superuser. A database without
+// kingres_shard is not: f has to ask extUsable before it reads kingres.* (schemaRows does).
 func (o *Ops) withDB(ctx context.Context, db string, f func(c *pgx.Conn) error) error {
 	c, err := o.Service.ServiceConn(ctx, db)
 	if err != nil {
@@ -119,7 +127,22 @@ func (o *Ops) withDB(ctx context.Context, db string, f func(c *pgx.Conn) error) 
 		return connectProblem(err)
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	if err := refuseUntrusted(ctx, c, extguard.Shard); err != nil {
+		return err
+	}
 	return f(c)
+}
+
+// withShardDB is withDB for what cannot do without the sharding extension.
+func (o *Ops) withShardDB(ctx context.Context, db string, f func(c *pgx.Conn) error) error {
+	return o.withDB(ctx, db, func(c *pgx.Conn) error {
+		if ok, err := extUsable(ctx, c, extguard.Shard); err != nil {
+			return err
+		} else if !ok {
+			return problem.New(problem.UnsupportedOp, "Database "+db+" has no sharding catalog of version 0.8; distributed schemas need it.")
+		}
+		return f(c)
+	})
 }
 
 // ListSchemas is listSchemas: every schema of the database that is not a system schema, ordered by name.
@@ -183,9 +206,14 @@ func (o *Ops) GetSchema(ctx context.Context, db, name string) (api.SchemaDetail,
 		}
 		d.SchemaSummary = rows[0]
 		d.DistributionBlockers, d.TablesWithoutKey = []api.SchemaBlocker{}, []string{}
-		var has bool
-		if err := c.QueryRow(ctx, `SELECT to_regprocedure('kingres.schema_inventory(regnamespace)') IS NOT NULL`).Scan(&has); err != nil {
-			return PGProblem(err)
+		has, err := extUsable(ctx, c, extguard.Shard)
+		if err != nil {
+			return err
+		}
+		if has {
+			if err := c.QueryRow(ctx, `SELECT to_regprocedure('kingres.schema_inventory(regnamespace)') IS NOT NULL`).Scan(&has); err != nil {
+				return PGProblem(err)
+			}
 		}
 		if !has {
 			return nil
@@ -246,9 +274,14 @@ func (o *Ops) unfinishedSchemaTask(ctx context.Context, db, schema, kind string)
 
 // sharding mode of the database and whether the extension has distributed schemas.
 func schemaMode(ctx context.Context, c *pgx.Conn, db string) (string, error) {
-	var has bool
-	if err := c.QueryRow(ctx, `SELECT to_regclass('kingres.sharding_settings') IS NOT NULL`).Scan(&has); err != nil {
-		return "", PGProblem(err)
+	has, err := extUsable(ctx, c, extguard.Shard)
+	if err != nil {
+		return "", err
+	}
+	if has {
+		if err := c.QueryRow(ctx, `SELECT to_regclass('kingres.sharding_settings') IS NOT NULL`).Scan(&has); err != nil {
+			return "", PGProblem(err)
+		}
 	}
 	if !has {
 		return "", problem.New(problem.UnsupportedOp, "Database "+db+" has no sharding catalog of version 0.8; distributed schemas need it.")
@@ -274,7 +307,7 @@ func (o *Ops) groupReceives(ctx context.Context, c *pgx.Conn, g int32) (bool, er
 // PrepareDistributeSchema validates distributeSchema and returns the task input.
 func (o *Ops) PrepareDistributeSchema(ctx context.Context, db, schema string, req api.DistributeSchemaRequest) (any, error) {
 	in := schemaInput{Database: db, Schema: schema, GroupID: req.ShardGroupID, ReplicaIDFull: req.SetReplicaIdentityFull}
-	err := o.withDB(ctx, db, func(c *pgx.Conn) error {
+	err := o.withShardDB(ctx, db, func(c *pgx.Conn) error {
 		mode, err := schemaMode(ctx, c, db)
 		if err != nil {
 			return err
@@ -339,7 +372,7 @@ func (o *Ops) distributedRow(ctx context.Context, c *pgx.Conn, db, schema string
 // PrepareMoveSchema validates moveSchema.
 func (o *Ops) PrepareMoveSchema(ctx context.Context, db, schema string, req api.MoveSchemaRequest) (any, error) {
 	in := schemaInput{Database: db, Schema: schema, Target: req.TargetShardGroupID, HasTarget: true, ReplicaIDFull: req.SetReplicaIdentityFull}
-	err := o.withDB(ctx, db, func(c *pgx.Conn) error {
+	err := o.withShardDB(ctx, db, func(c *pgx.Conn) error {
 		s, err := o.distributedRow(ctx, c, db, schema)
 		if err != nil {
 			return err
@@ -416,7 +449,7 @@ func (o *Ops) refusePin(ctx context.Context, c *pgx.Conn, colocation int32) erro
 // PrepareUndistributeSchema validates undistributeSchema; target (nil: where it is) names a group to move it to first.
 func (o *Ops) PrepareUndistributeSchema(ctx context.Context, db, schema string, target *int32) (any, error) {
 	in := schemaInput{Database: db, Schema: schema}
-	err := o.withDB(ctx, db, func(c *pgx.Conn) error {
+	err := o.withShardDB(ctx, db, func(c *pgx.Conn) error {
 		s, err := o.distributedRow(ctx, c, db, schema)
 		if err != nil {
 			return err
@@ -552,7 +585,7 @@ func (o *Ops) sDistCheck(ctx context.Context, env *task.Env) error {
 	if err != nil {
 		return err
 	}
-	return o.withDB(ctx, in.Database, func(c *pgx.Conn) error {
+	return o.withShardDB(ctx, in.Database, func(c *pgx.Conn) error {
 		if rows, err := o.schemaRows(ctx, c, in.Schema); err == nil && len(rows) == 1 && rows[0].Distribution != nil {
 			return nil // a repeated step: it is distributed already
 		}
@@ -575,7 +608,7 @@ func (o *Ops) sDistIdentity(ctx context.Context, env *task.Env) error {
 	if !in.ReplicaIDFull {
 		return task.Skip("not asked for")
 	}
-	return o.withDB(ctx, in.Database, func(c *pgx.Conn) error {
+	return o.withShardDB(ctx, in.Database, func(c *pgx.Conn) error {
 		return o.setIdentityFull(ctx, c, in.Schema)
 	})
 }
@@ -599,7 +632,7 @@ func (o *Ops) sDistMake(ctx context.Context, env *task.Env) error {
 	if err != nil {
 		return err
 	}
-	return o.withDB(ctx, in.Database, func(c *pgx.Conn) error {
+	return o.withShardDB(ctx, in.Database, func(c *pgx.Conn) error {
 		if rows, err := o.schemaRows(ctx, c, in.Schema); err == nil && len(rows) == 1 && rows[0].Distribution != nil {
 			return nil
 		}
@@ -647,7 +680,7 @@ func (o *Ops) recoverCall(ctx context.Context, env *task.Env, wantDistributed bo
 		return false, err
 	}
 	took := false
-	err = o.withDB(ctx, in.Database, func(c *pgx.Conn) error {
+	err = o.withShardDB(ctx, in.Database, func(c *pgx.Conn) error {
 		rows, err := o.schemaRows(ctx, c, in.Schema)
 		if err != nil {
 			return err
@@ -701,7 +734,7 @@ func (o *Ops) sVerifyDistributed(ctx context.Context, env *task.Env) error {
 	if err != nil {
 		return err
 	}
-	return o.withDB(ctx, in.Database, func(c *pgx.Conn) error {
+	return o.withShardDB(ctx, in.Database, func(c *pgx.Conn) error {
 		rows, err := o.schemaRows(ctx, c, in.Schema)
 		if err != nil {
 			return err
@@ -718,7 +751,7 @@ func (o *Ops) sVerifyLocal(ctx context.Context, env *task.Env) error {
 	if err != nil {
 		return err
 	}
-	return o.withDB(ctx, in.Database, func(c *pgx.Conn) error {
+	return o.withShardDB(ctx, in.Database, func(c *pgx.Conn) error {
 		rows, err := o.schemaRows(ctx, c, in.Schema)
 		if err != nil {
 			return err
@@ -735,7 +768,7 @@ func (o *Ops) sMoveCheck(ctx context.Context, env *task.Env) error {
 	if err != nil {
 		return err
 	}
-	return o.withDB(ctx, in.Database, func(c *pgx.Conn) error {
+	return o.withShardDB(ctx, in.Database, func(c *pgx.Conn) error {
 		s, err := o.distributedRow(ctx, c, in.Database, in.Schema)
 		if err != nil {
 			return err
@@ -823,7 +856,7 @@ func (moveCancelled) TaskRetryable() bool { return false }
 func (o *Ops) runSchemaMove(ctx context.Context, env *task.Env, in schemaInput) error {
 	var colo int32
 	var onTarget bool
-	if err := o.withDB(ctx, in.Database, func(c *pgx.Conn) error {
+	if err := o.withShardDB(ctx, in.Database, func(c *pgx.Conn) error {
 		s, err := o.distributedRow(ctx, c, in.Database, in.Schema)
 		if err != nil {
 			return err
@@ -845,6 +878,10 @@ func (o *Ops) runSchemaMove(ctx context.Context, env *task.Env, in schemaInput) 
 		return connectProblem(err)
 	}
 	defer func() { _ = watch.Close(context.WithoutCancel(ctx)) }()
+	// the watching session reads kingres.bucket_move and calls kingres.resume_bucket_moves as a superuser
+	if err := requireExt(ctx, watch, extguard.Shard); err != nil {
+		return err
+	}
 	asked := false
 	for try := 0; try < moveTries; try++ {
 		s, err := o.distributedRow(ctx, watch, in.Database, in.Schema)
@@ -875,7 +912,7 @@ func (o *Ops) runSchemaMove(ctx context.Context, env *task.Env, in schemaInput) 
 			// The call is made in a session of its own that stays open until the move has ended: its live mark is a session
 			// lock, which is how the extension tells a running move from an abandoned one.
 			go func() {
-				errc <- o.withDB(context.WithoutCancel(ctx), in.Database, func(c *pgx.Conn) error {
+				errc <- o.withShardDB(context.WithoutCancel(ctx), in.Database, func(c *pgx.Conn) error {
 					_, err := c.Exec(context.WithoutCancel(ctx), `SELECT kingres.move_schema($1::regnamespace, $2::int)`, quoteIdent(in.Schema), in.Target)
 					return schemaError(err)
 				})
@@ -1033,7 +1070,7 @@ func (o *Ops) sMoveSwitch(ctx context.Context, env *task.Env) error {
 	if err != nil {
 		return err
 	}
-	return o.withDB(ctx, in.Database, func(c *pgx.Conn) error {
+	return o.withShardDB(ctx, in.Database, func(c *pgx.Conn) error {
 		s, err := o.distributedRow(ctx, c, in.Database, in.Schema)
 		if err != nil {
 			return err
@@ -1059,7 +1096,7 @@ func (o *Ops) sUndistCheck(ctx context.Context, env *task.Env) error {
 	if err != nil {
 		return err
 	}
-	return o.withDB(ctx, in.Database, func(c *pgx.Conn) error {
+	return o.withShardDB(ctx, in.Database, func(c *pgx.Conn) error {
 		rows, err := o.schemaRows(ctx, c, in.Schema)
 		if err != nil {
 			return err
@@ -1095,7 +1132,7 @@ func (o *Ops) sUndistMake(ctx context.Context, env *task.Env) error {
 	if err != nil {
 		return err
 	}
-	return o.withDB(ctx, in.Database, func(c *pgx.Conn) error {
+	return o.withShardDB(ctx, in.Database, func(c *pgx.Conn) error {
 		if rows, err := o.schemaRows(ctx, c, in.Schema); err == nil && len(rows) == 1 && rows[0].Distribution == nil {
 			return nil
 		}

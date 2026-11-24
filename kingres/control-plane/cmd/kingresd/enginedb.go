@@ -10,6 +10,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/cluster"
 )
 
 // swapDB is the database of the task store: a pool that is replaced when the system database moves (the new manager leader of a
@@ -49,7 +51,7 @@ func (s *swapDB) Reconnect(ctx context.Context, dsn string) error {
 	if same {
 		return nil
 	}
-	p, err := pgxpool.New(ctx, dsn)
+	p, err := cluster.NewSafePool(ctx, dsn)
 	if err != nil {
 		return err
 	}

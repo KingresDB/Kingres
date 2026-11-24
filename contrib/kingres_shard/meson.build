@@ -351,6 +351,7 @@ tests += {
       't/266_merge_faults.pl',
       't/268_merge_review_fixes.pl',
       't/252_extension_search_path.pl',
+      't/278_schema_spoof.pl',
     ],
   },
 }

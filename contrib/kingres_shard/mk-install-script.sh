@@ -47,7 +47,47 @@ out9=${KS_INSTALL_SCRIPT_OUT_09:-$d/kingres_shard--0.9.sql}
 --
 HDR
   n=$(grep -n "^.echo Use \"CREATE EXTENSION" "$d/kingres_shard--0.8.sql" | head -1 | cut -d: -f1)
-  tail -n +"$n" "$d/kingres_shard--0.8.sql"
+  # The 0.9 install script makes the schema kingres only when it does not exist, and refuses one that a role that is not a superuser made in advance (or
+  # that grants CREATE to such a role): that role would own what the service role runs.  The 0.8 script has the line that is replaced; it stays as it is
+  # (the older versions are only upgraded from, and the control plane refuses such a schema at run time as well).
+  KS_BLOCK=$(cat <<'BLK'
+-- The schema kingres is made here, or it exists already (another KingresDB extension made it).  Not CREATE SCHEMA IF NOT EXISTS: PostgreSQL refuses that in
+-- a script when the schema exists and is not a member of the extension.  An existing schema must be owned by a superuser and give CREATE to no role that is
+-- not a superuser: a role that made it in advance would otherwise own what the service role, a superuser, reads and runs.
+DO $ks$
+DECLARE
+    v_owner pg_catalog.name;
+BEGIN
+    IF pg_catalog.to_regnamespace('kingres') IS NULL THEN
+        CREATE SCHEMA kingres;
+        RETURN;
+    END IF;
+    SELECT r.rolname INTO v_owner
+      FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) n.nspowner
+     WHERE n.nspname OPERATOR(pg_catalog.=) 'kingres' AND NOT r.rolsuper;
+    IF v_owner IS NOT NULL THEN
+        RAISE EXCEPTION 'the schema kingres already exists and is owned by %, which is not a superuser', v_owner
+            USING ERRCODE = 'insufficient_privilege',
+                  HINT = 'Drop the schema, or make a superuser its owner, before CREATE EXTENSION kingres_shard.';
+    END IF;
+    IF EXISTS (SELECT 1
+                 FROM pg_catalog.pg_namespace n,
+                      LATERAL pg_catalog.aclexplode(COALESCE(n.nspacl, pg_catalog.acldefault('n', n.nspowner))) a
+                WHERE n.nspname OPERATOR(pg_catalog.=) 'kingres'
+                  AND a.privilege_type OPERATOR(pg_catalog.=) 'CREATE'
+                  AND (a.grantee OPERATOR(pg_catalog.=) 0
+                       OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles g WHERE g.oid OPERATOR(pg_catalog.=) a.grantee AND g.rolsuper))) THEN
+        RAISE EXCEPTION 'the schema kingres grants CREATE to a role that is not a superuser (or to PUBLIC)'
+            USING ERRCODE = 'insufficient_privilege',
+                  HINT = 'Revoke CREATE on the schema before CREATE EXTENSION kingres_shard.';
+    END IF;
+END
+$ks$;
+BLK
+)
+  export KS_BLOCK
+  tail -n +"$n" "$d/kingres_shard--0.8.sql" | awk 'BEGIN { old = "DO $ks$ BEGIN IF pg_catalog.to_regnamespace(\047kingres\047) IS NULL THEN CREATE SCHEMA kingres; END IF; END $ks$;" }
+    $0 == old && !done { print ENVIRON["KS_BLOCK"]; done = 1; next } { print } END { if (!done) exit 3 }'
   echo
   echo "-- ---------------------------------------------------------------------------"
   echo "-- Version 0.9: columnar storage in the sharding extension (the upgrade script 0.8--0.9, appended)"

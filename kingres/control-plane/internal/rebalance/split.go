@@ -93,7 +93,7 @@ type bucketRow struct {
 // readBucket reads the bucket from the catalog of db (404 for a colocation group or bucket that does not exist).
 func (s *Service) readBucket(ctx context.Context, db string, colocation, bucket int32) (bucketRow, error) {
 	var b bucketRow
-	err := s.Backend.with(ctx, db, func(c *pgx.Conn) error {
+	err := s.Backend.withShard(ctx, db, func(c *pgx.Conn) error {
 		return c.QueryRow(ctx, `SELECT m.group_id, m.state, m.modulus, co.kind::text, co.bucket_count, co.max_modulus
 			FROM kingres.bucket_map m JOIN kingres.colocation co ON co.colocation_id = m.colocation_id
 			WHERE m.colocation_id = $1 AND m.bucket = $2`, colocation, bucket).Scan(&b.Group, &b.State, &b.Modulus, &b.Kind, &b.Base, &b.Max)
@@ -123,7 +123,7 @@ func SplitChildren(bucket int32, modulus, parts int) []api.BucketSplitChild {
 // own plan inputs (the sizes the plan by disk size uses); nil when they cannot be read.
 func (s *Service) bucketSize(ctx context.Context, db string, colocation, bucket int32) *int64 {
 	var size *int64
-	_ = s.Backend.with(ctx, db, func(c *pgx.Conn) error {
+	_ = s.Backend.withShard(ctx, db, func(c *pgx.Conn) error {
 		return c.QueryRow(ctx, `SELECT (i->>'size')::bigint FROM jsonb_array_elements(kingres.internal_plan_inputs('by_disk_size', NULL, NULL, ARRAY[$1::int])->'items') i
 			WHERE (i->>'c')::int = $1 AND (i->>'b')::int = $2`, colocation, bucket).Scan(&size)
 	})
@@ -187,7 +187,7 @@ func (s *Service) SplitPreview(ctx context.Context, db string, colocation, bucke
 
 func (s *Service) hasPrimary(ctx context.Context, db string, group int32) (bool, error) {
 	var has bool
-	err := s.Backend.with(ctx, db, func(c *pgx.Conn) error {
+	err := s.Backend.withShard(ctx, db, func(c *pgx.Conn) error {
 		return c.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM kingres.node WHERE group_id = $1 AND role = 'primary' AND is_active)`, group).Scan(&has)
 	})
 	return has, err
@@ -196,7 +196,7 @@ func (s *Service) hasPrimary(ctx context.Context, db string, group int32) (bool,
 // unfinishedSplit tells whether a split of the colocation group is not finished (one at a time per group).
 func (s *Service) unfinishedSplit(ctx context.Context, db string, colocation int32) bool {
 	var n int
-	_ = s.Backend.with(ctx, db, func(c *pgx.Conn) error {
+	_ = s.Backend.withShard(ctx, db, func(c *pgx.Conn) error {
 		return c.QueryRow(ctx, `SELECT count(*) FROM kingres.bucket_split WHERE colocation_id = $1 AND phase NOT IN ('cleaning', 'done', 'failed', 'cancelled')`, colocation).Scan(&n)
 	})
 	return n > 0
@@ -310,7 +310,7 @@ type splitRecord struct {
 func (s *Service) findSplit(ctx context.Context, v splitInput) (splitRecord, bool) {
 	var r splitRecord
 	var detail *string
-	err := s.Backend.with(ctx, v.Database, func(c *pgx.Conn) error {
+	err := s.Backend.withShard(ctx, v.Database, func(c *pgx.Conn) error {
 		return c.QueryRow(ctx, `SELECT split_id, phase, detail, rows_done, rows_total FROM kingres.bucket_split
 			WHERE colocation_id = $1 AND bucket = $2 AND phase NOT IN ('failed', 'cancelled') ORDER BY split_id DESC LIMIT 1`, v.Colocation, v.Bucket).
 			Scan(&r.ID, &r.Phase, &detail, &r.RowsDone, &r.RowsTotal)
@@ -324,7 +324,7 @@ func (s *Service) findSplit(ctx context.Context, v splitInput) (splitRecord, boo
 func (s *Service) readSplit(ctx context.Context, db string, id int64) (splitRecord, error) {
 	r := splitRecord{ID: id}
 	var detail *string
-	err := s.Backend.with(ctx, db, func(c *pgx.Conn) error {
+	err := s.Backend.withShard(ctx, db, func(c *pgx.Conn) error {
 		return c.QueryRow(ctx, `SELECT phase, detail, rows_done, rows_total FROM kingres.bucket_split WHERE split_id = $1`, id).Scan(&r.Phase, &detail, &r.RowsDone, &r.RowsTotal)
 	})
 	if detail != nil {
@@ -353,7 +353,7 @@ func (s *Service) runSplit(ctx context.Context, env *task.Env, v splitInput) err
 	// session lock, which is how the extension tells a running split from an abandoned one.
 	go func() {
 		var id int64
-		err := s.Backend.with(context.WithoutCancel(ctx), v.Database, func(c *pgx.Conn) error {
+		err := s.Backend.withShard(context.WithoutCancel(ctx), v.Database, func(c *pgx.Conn) error {
 			return c.QueryRow(context.WithoutCancel(ctx), `SELECT kingres.split_bucket($1, $2, $3, $4)`, v.Colocation, v.Bucket, v.Parts, v.Verify).Scan(&id)
 		})
 		finished <- result{id, err}
@@ -380,7 +380,7 @@ func (s *Service) runSplit(ctx context.Context, env *task.Env, v splitInput) err
 			rec, found := s.findSplit(ctx, v)
 			if !asked && found && s.cancelRequested(ctx, env) {
 				asked = true
-				if err := s.Backend.with(ctx, v.Database, func(c *pgx.Conn) error {
+				if err := s.Backend.withShard(ctx, v.Database, func(c *pgx.Conn) error {
 					_, err := c.Exec(ctx, `SELECT kingres.cancel_bucket_split($1)`, rec.ID)
 					return err
 				}); err != nil {
@@ -453,7 +453,7 @@ func (s *Service) settleSplit(ctx context.Context, v splitInput, id int64, callE
 		return fmt.Errorf("the split failed: %s", msg)
 	}
 	// the connection broke: the extension's own recovery settles the record; ask for it and look
-	_ = s.Backend.with(ctx, v.Database, func(c *pgx.Conn) error {
+	_ = s.Backend.withShard(ctx, v.Database, func(c *pgx.Conn) error {
 		_, err := c.Exec(ctx, `SELECT kingres.resume_bucket_splits()`)
 		return err
 	})
@@ -476,7 +476,7 @@ func (s *Service) followSplit(ctx context.Context, env *task.Env, v splitInput, 
 		}
 		_ = env.SetDetail(ctx, splitDetail(rec))
 		if resume {
-			_ = s.Backend.with(ctx, v.Database, func(c *pgx.Conn) error {
+			_ = s.Backend.withShard(ctx, v.Database, func(c *pgx.Conn) error {
 				_, err := c.Exec(ctx, `SELECT kingres.resume_bucket_splits()`)
 				return err
 			})
@@ -492,7 +492,7 @@ func (s *Service) followSplit(ctx context.Context, env *task.Env, v splitInput, 
 // verifySplit checks that the map has the children with the new modulus.
 func (s *Service) verifySplit(ctx context.Context, v splitInput) error {
 	var n int
-	err := s.Backend.with(ctx, v.Database, func(c *pgx.Conn) error {
+	err := s.Backend.withShard(ctx, v.Database, func(c *pgx.Conn) error {
 		return c.QueryRow(ctx, `SELECT count(*) FROM kingres.bucket_map WHERE colocation_id = $1 AND modulus = $3::int * $4::int AND bucket % $3::int = $2::int % $3::int`,
 			v.Colocation, v.Bucket, v.Modulus, v.Parts).Scan(&n)
 	})

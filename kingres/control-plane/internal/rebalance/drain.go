@@ -209,7 +209,7 @@ func (s *Service) localData(ctx context.Context, id string) []api.DrainLocalData
 		return out
 	}
 	for _, db := range dbs {
-		_ = s.Backend.with(ctx, db, func(c *pgx.Conn) error {
+		_ = s.Backend.withShard(ctx, db, func(c *pgx.Conn) error {
 			var n int
 			var size *int64
 			// the catalog's node on this server; the table list is the local one of the node that answers
@@ -309,7 +309,7 @@ func (s *Service) bucketsOn(ctx context.Context, server string) (int, error) {
 	total := 0
 	for _, db := range dbs {
 		var n int
-		err := s.Backend.with(ctx, db, func(c *pgx.Conn) error {
+		err := s.Backend.withShard(ctx, db, func(c *pgx.Conn) error {
 			return c.QueryRow(ctx, `SELECT
 				(SELECT count(*) FROM kingres.bucket_map m JOIN kingres.node n ON n.group_id = m.group_id AND n.role = 'primary' AND n.is_active AND n.host = $1)
 				+ coalesce((SELECT count(*) FROM kingres.bucket_move mv JOIN kingres.node n ON n.group_id = mv.source_group AND n.role = 'primary' AND n.is_active AND n.host = $1

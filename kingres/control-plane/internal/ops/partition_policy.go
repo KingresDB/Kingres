@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sqlx"
 )
@@ -151,9 +152,15 @@ func policySQLError(err error) error {
 	return wrap(err)
 }
 
-// policyTx runs f in a transaction on the service connection with intervals written as ISO 8601.
+// policyTx runs f in a transaction on the service connection with intervals written as ISO 8601. f reads and calls kingres_timepart, so the extension must be
+// installed and its schema trusted (extgate.go).
 func (o *Ops) policyTx(ctx context.Context, db string, f func(tx pgx.Tx) error) error {
-	return o.asService(ctx, db, func(tx pgx.Tx) error {
+	return o.isoTx(ctx, db, []string{extguard.Timepart}, f)
+}
+
+// isoTx is policyTx with the extensions the caller needs named: a caller that reads only the catalog of PostgreSQL names none and checks what it reads itself.
+func (o *Ops) isoTx(ctx context.Context, db string, need []string, f func(tx pgx.Tx) error) error {
+	return o.asServiceExt(ctx, db, need, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_catalog.set_config('intervalstyle', 'iso_8601', true)`); err != nil {
 			return err
 		}

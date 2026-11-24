@@ -80,21 +80,22 @@ func (s *Store) probeDatabase(ctx context.Context, db string) dbProbe {
 SELECT (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE c.relkind IN ('r', 'p') AND NOT c.relispartition
           AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'kingres', 'kingres_cp')
-          AND n.nspname !~ '^pg_(toast|temp)'),
-       to_regclass('kingres.bucket_map') IS NOT NULL,
-       to_regclass('kingres.ledger_blocks') IS NOT NULL`).Scan(&probe.tableCount, &probe.hasShard, &probe.hasLedger)
+          AND n.nspname !~ '^pg_(toast|temp)')`).Scan(&probe.tableCount)
 	if err != nil {
 		s.opts.Logger.Debug("cannot probe database", "database", db, "error", err)
 		return dbProbe{}
 	}
 	probe.ok = true
+	// The relations count only when the extension is installed and its schema is trusted (extguard); the same for the sharding settings below.
+	probe.hasShard, _ = s.regclassExists(ctx, p, "kingres.bucket_map")
+	probe.hasLedger, _ = s.regclassExists(ctx, p, "kingres.ledger_blocks")
 	if probe.hasShard {
 		var n *int
 		if err := p.QueryRow(ctx, "SELECT max(bucket_count) FROM kingres.colocation").Scan(&n); err == nil {
 			probe.bucketCount = n
 		}
 		var hasMode bool
-		if err := p.QueryRow(ctx, "SELECT to_regclass('kingres.sharding_settings') IS NOT NULL").Scan(&hasMode); err == nil && hasMode {
+		if hasMode, _ = s.regclassExists(ctx, p, "kingres.sharding_settings"); hasMode {
 			_ = p.QueryRow(ctx, "SELECT mode, distribute_new_schemas FROM kingres.sharding_settings").Scan(&probe.mode, &probe.distributeNew)
 			var n int
 			if err := p.QueryRow(ctx, "SELECT count(*) FROM kingres.dist_schema").Scan(&n); err == nil {
@@ -262,10 +263,13 @@ func (s *Store) ClusterSettings(ctx context.Context) (api.ClusterSettings, error
 	if err := p.QueryRow(ctx, "SELECT current_setting('synchronous_commit')").Scan(&sc); err != nil {
 		return api.ClusterSettings{}, s.wrap("reading synchronous_commit", err)
 	}
-	var shard, ledger bool
-	if err := p.QueryRow(ctx, `SELECT to_regclass('kingres.node') IS NOT NULL,
-		to_regclass('kingres.ledger_blocks') IS NOT NULL`).Scan(&shard, &ledger); err != nil {
-		return api.ClusterSettings{}, s.wrap("checking features", err)
+	shard, err := s.regclassExists(ctx, p, "kingres.node")
+	if err != nil {
+		return api.ClusterSettings{}, err
+	}
+	ledger, err := s.regclassExists(ctx, p, "kingres.ledger_blocks")
+	if err != nil {
+		return api.ClusterSettings{}, err
 	}
 	out := api.ClusterSettings{
 		DefaultReplicaCount: cat.replicaCount(),

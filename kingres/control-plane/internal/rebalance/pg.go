@@ -15,6 +15,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extgate"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fence"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
@@ -100,8 +102,18 @@ func (b *PG) Databases(ctx context.Context, o Options) ([]string, error) {
 		}
 		var has bool
 		err := b.with(ctx, n, func(c *pgx.Conn) error {
+			// not before extguard says that the schema is the extension's: a database owner can make a schema kingres of its own
+			ok, err := extgate.Usable(ctx, c, extguard.Shard, n)
+			if err != nil || !ok {
+				return err
+			}
 			return c.QueryRow(ctx, `SELECT to_regclass('kingres.colocation') IS NOT NULL AND EXISTS (SELECT 1 FROM kingres.colocation)`).Scan(&has)
 		})
+		if isUntrusted(err) && !want[n] {
+			// a database nobody asked for is left out, so that one tenant cannot stop the rebalance of the others; the monitor raises the alert
+			b.log().Warn("a database is left out of the rebalance: its schema kingres cannot be trusted", "database", n, "error", err)
+			continue
+		}
 		if err != nil {
 			// A database that cannot be read has no distributed tables for this purpose
 			// only when it does not exist any more; anything else is an error.
@@ -154,7 +166,7 @@ func (b *PG) Check(ctx context.Context, dbs []string) error {
 }
 
 func (b *PG) checkDatabase(ctx context.Context, db string) error {
-	return b.with(ctx, db, func(c *pgx.Conn) error {
+	return b.withShard(ctx, db, func(c *pgx.Conn) error {
 		var receivers int
 		if err := c.QueryRow(ctx, `SELECT count(DISTINCT group_id) FROM kingres.node WHERE role = 'primary' AND is_active AND should_have_shards`).Scan(&receivers); err != nil {
 			return err
@@ -247,7 +259,7 @@ func clipText(s string, n int) string {
 func (b *PG) planLegacy(ctx context.Context, dbs []string) ([]Move, error) {
 	var out []Move
 	for _, db := range dbs {
-		err := b.with(ctx, db, func(c *pgx.Conn) error {
+		err := b.withShard(ctx, db, func(c *pgx.Conn) error {
 			rows, err := c.Query(ctx, `SELECT colocation_id, bucket, source_group, target_group, size_bytes FROM kingres.rebalance_plan()`)
 			if err != nil {
 				return err
@@ -276,7 +288,7 @@ func (b *PG) planLegacy(ctx context.Context, dbs []string) ([]Move, error) {
 func (b *PG) Placement(ctx context.Context, dbs []string) ([]Placement, error) {
 	var out []Placement
 	for _, db := range dbs {
-		err := b.with(ctx, db, func(c *pgx.Conn) error {
+		err := b.withShard(ctx, db, func(c *pgx.Conn) error {
 			rows, err := c.Query(ctx, `SELECT n.host, count(*) FROM kingres.bucket_map b
 				JOIN kingres.node n ON n.group_id = b.group_id AND n.role = 'primary' AND n.is_active
 				GROUP BY n.host ORDER BY n.host`)
@@ -303,7 +315,7 @@ func (b *PG) Placement(ctx context.Context, dbs []string) ([]Placement, error) {
 // ServerOf implements Backend. An unknown group gives the empty string.
 func (b *PG) ServerOf(ctx context.Context, db string, group int32) string {
 	var host string
-	_ = b.with(ctx, db, func(c *pgx.Conn) error {
+	_ = b.withShard(ctx, db, func(c *pgx.Conn) error {
 		return c.QueryRow(ctx, `SELECT host FROM kingres.node WHERE group_id = $1 AND role = 'primary' AND is_active`, group).Scan(&host)
 	})
 	return host
@@ -351,7 +363,7 @@ func (b *PG) CheckMove(ctx context.Context, m Move) error {
 // target: with no synchronous standby every one of those commits would wait.
 func (b *PG) syncStandbyMissing(ctx context.Context, db string, group int32) (bool, error) {
 	var res *string
-	err := b.with(ctx, db, func(c *pgx.Conn) error {
+	err := b.withShard(ctx, db, func(c *pgx.Conn) error {
 		var node int32
 		if err := c.QueryRow(ctx, `SELECT kingres.internal_group_node($1)`, group).Scan(&node); err != nil {
 			return err
@@ -371,7 +383,7 @@ func (b *PG) syncStandbyMissing(ctx context.Context, db string, group int32) (bo
 // database the move is in.
 func (b *PG) Mark(ctx context.Context, m Move) (int64, error) {
 	var after int64
-	err := b.with(ctx, m.Database, func(c *pgx.Conn) error {
+	err := b.withShard(ctx, m.Database, func(c *pgx.Conn) error {
 		return c.QueryRow(ctx, `SELECT coalesce(max(move_id), 0) FROM kingres.bucket_move`).Scan(&after)
 	})
 	return after, err
@@ -412,11 +424,18 @@ func (b *PG) RunMove(ctx context.Context, m Move, after int64) error {
 		return notStartedUnless(err)
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	// the call and the observation run as a superuser in a user database: nothing is called before the schema is known to be the extension's
+	if err := extgate.Require(ctx, c, extguard.Shard, m.Database); err != nil {
+		return notStartedUnless(err)
+	}
 	watch, err := b.Conns.ServiceConn(ctx, m.Database)
 	if err != nil {
 		return notStartedUnless(err)
 	}
 	defer func() { _ = watch.Close(context.WithoutCancel(ctx)) }()
+	if err := extgate.Require(ctx, watch, extguard.Shard, m.Database); err != nil {
+		return notStartedUnless(err)
+	}
 	if b.afterGuard != nil {
 		b.afterGuard(ctx)
 	}
@@ -442,6 +461,10 @@ func (b *PG) RunMove(ctx context.Context, m Move, after int64) error {
 	// pass tries again.
 	reopen := func() {
 		if nw, err := b.Conns.ServiceConn(ctx, m.Database); err == nil {
+			if extgate.Require(ctx, nw, extguard.Shard, m.Database) != nil {
+				_ = nw.Close(context.WithoutCancel(ctx))
+				return
+			}
 			_ = watch.Close(context.WithoutCancel(ctx))
 			watch = nw
 		}
@@ -623,7 +646,7 @@ func phasePercent(phase string) float64 {
 // Progress implements Backend.
 func (b *PG) Progress(ctx context.Context, m Move, ref Ref) (Progress, error) {
 	var p Progress
-	err := b.with(ctx, m.Database, func(c *pgx.Conn) error {
+	err := b.withShard(ctx, m.Database, func(c *pgx.Conn) error {
 		e, ok, err := b.findMove(ctx, c, m.Colocation, m.Bucket, ref, 0)
 		if err != nil || !ok {
 			return err
@@ -637,7 +660,7 @@ func (b *PG) Progress(ctx context.Context, m Move, ref Ref) (Progress, error) {
 // CancelMove implements Backend.
 func (b *PG) CancelMove(ctx context.Context, m Move, ref Ref) (bool, error) {
 	var stopped bool
-	err := b.with(ctx, m.Database, func(c *pgx.Conn) error {
+	err := b.withShard(ctx, m.Database, func(c *pgx.Conn) error {
 		e, ok, err := b.findMove(ctx, c, m.Colocation, m.Bucket, ref, 0)
 		if err != nil || !ok {
 			return err
@@ -675,7 +698,7 @@ func (b *PG) Recover(ctx context.Context, r MoveRow) (string, string, error) {
 	for {
 		var state, text string
 		var settled, alive bool
-		err := b.with(ctx, r.Move.Database, func(c *pgx.Conn) error {
+		err := b.withShard(ctx, r.Move.Database, func(c *pgx.Conn) error {
 			ref := Ref{After: r.After}
 			if !r.Marked {
 				ref.Since = r.StartedAt
@@ -742,7 +765,7 @@ func (b *PG) Cleanup(ctx context.Context) {
 		return
 	}
 	for _, db := range dbs {
-		if err := b.with(ctx, db, func(c *pgx.Conn) error {
+		if err := b.withShard(ctx, db, func(c *pgx.Conn) error {
 			_, err := c.Exec(ctx, `SELECT kingres.cleanup_moved_buckets()`)
 			return err
 		}); err != nil {
