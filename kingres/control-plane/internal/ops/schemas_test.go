@@ -66,9 +66,9 @@ func TestSchemaErrorMapsTheExtensionsSQLSTATEs(t *testing.T) {
 	}
 }
 
-// A catalog function called on a node that is not the map group primary answers KS010 (55000 stays accepted).
+// A catalog function called on a node that is not the map group primary answers KS022 (KS010 of the extension 0.8 and 55000 stay accepted).
 func TestIsNotMapPrimary(t *testing.T) {
-	for code, want := range map[string]bool{"KS010": true, "55000": true, "KS011": false, "XX000": false, "": false} {
+	for code, want := range map[string]bool{"KS022": true, "KS010": true, "55000": true, "KS011": false, "XX000": false, "": false} {
 		if got := isNotMapPrimary(&pgconn.PgError{Code: code, Message: "this function can only run on the map group primary"}); got != want {
 			t.Errorf("%q: %v", code, got)
 		}

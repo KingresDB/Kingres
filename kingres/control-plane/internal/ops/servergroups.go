@@ -524,10 +524,12 @@ func (o *Ops) setWeightIn(ctx context.Context, db, host string, w float64) error
 
 var errNotMapPrimary = errors.New("not the map group primary")
 
-// isNotMapPrimary tells the refusal of a catalog function that was called on a node that is not the map group primary: SQLSTATE KS010 (the
-// call went to the wrong node), which kingres_shard_require_map_group raises. 55000, which this code matched alone before, is kept for
-// the other refusals of the same call that the extension gives with that code.
-func isNotMapPrimary(pe *pgconn.PgError) bool { return pe.Code == "KS010" || pe.Code == "55000" }
+// isNotMapPrimary tells the refusal of a catalog function that was called on a node that is not the map group primary: SQLSTATE KS022, which
+// kingres_shard_require_map_group raises. KS010 is what a library of the extension 0.8 (released) raises for it. 55000, which this code
+// matched alone before, is kept for the other refusals of the same call that the extension gives with that code.
+func isNotMapPrimary(pe *pgconn.PgError) bool {
+	return pe.Code == "KS022" || pe.Code == "KS010" || pe.Code == "55000"
+}
 
 // ValidGroupName reports whether name can be the name of a group.
 func ValidGroupName(name string) bool { return groupNameRE.MatchString(name) }
