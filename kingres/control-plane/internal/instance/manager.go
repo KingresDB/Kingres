@@ -383,6 +383,11 @@ func (m *Manager) start(ctx context.Context, id int) error {
 			out, err = pgStart()
 		}
 		if err != nil {
+			// pg_ctl only says that the postmaster stopped; the reason (a port that is taken, a recovery that
+			// failed) is in the startup log, so the end of it goes into the error, which the log of kingresd keeps.
+			if tail := startupLogTail(data); tail != "" {
+				out += "\nstartup log: " + tail
+			}
 			return fmt.Errorf("instance: pg_ctl start: %w: %s", err, out)
 		}
 	}
@@ -560,6 +565,27 @@ func writeAtomic(path string, b []byte) error {
 		return err
 	}
 	return nil
+}
+
+// startupLogTail returns the end (at most 2 KiB, newlines folded to " | ") of kingres-startup.log of the data directory, or "".
+func startupLogTail(data string) string {
+	f, err := os.Open(filepath.Join(data, "kingres-startup.log")) //nolint:gosec // a fixed name below the data directory
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = f.Close() }()
+	st, err := f.Stat()
+	if err != nil {
+		return ""
+	}
+	const keep = 2048
+	off := int64(0)
+	if st.Size() > keep {
+		off = st.Size() - keep
+	}
+	b := make([]byte, st.Size()-off)
+	n, _ := f.ReadAt(b, off)
+	return strings.Join(strings.Fields(strings.ReplaceAll(string(b[:n]), "\n", " | ")), " ")
 }
 
 func secs(d time.Duration) string { return strconv.Itoa(int(d.Seconds())) }
