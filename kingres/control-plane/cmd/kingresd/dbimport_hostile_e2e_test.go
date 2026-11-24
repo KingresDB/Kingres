@@ -263,6 +263,8 @@ func TestDatabaseImportHiddenTextIsNotRun(t *testing.T) {
 	}
 	up := imp.uploadArchive(t, v.Bytes(t))
 	before := snapshot(t, e)
+	// Other tests of this binary leave a search path on a database of theirs: only a change made by this import counts.
+	searchPaths := query(t, e, "postgres", "select count(*) from pg_db_role_setting where setconfig::text like '%search_path%'")
 	imp.importOK(t, map[string]any{"uploadId": up, "database": "dbhidden_ok"})
 	if got := query(t, e, "dbhidden_ok", "select count(*) from public.victim"); got != "[[2]]" {
 		t.Errorf("victim after the import: %s", got)
@@ -270,8 +272,8 @@ func TestDatabaseImportHiddenTextIsNotRun(t *testing.T) {
 	if got := query(t, e, "dbhidden_ok", "select count(*) from pg_tables where schemaname = 'public' and tablename like 'h\\_%'"); got != "[[5]]" {
 		t.Errorf("tables made: %s", got)
 	}
-	// The new database is the only change: no setting of a database carries a search path.
-	if got := query(t, e, "postgres", "select count(*) from pg_db_role_setting where setconfig::text like '%search_path%'"); got != "[[0]]" {
+	// The new database is the only change: the import adds no setting of a database with a search path.
+	if got := query(t, e, "postgres", "select count(*) from pg_db_role_setting where setconfig::text like '%search_path%'"); got != searchPaths {
 		t.Errorf("settings of databases with a search path: %s", got)
 	}
 	if after := snapshot(t, e); after == before {
