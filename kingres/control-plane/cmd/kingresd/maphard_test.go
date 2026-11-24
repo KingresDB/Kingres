@@ -15,6 +15,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover/journal"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover/mapgroup"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/lease"
 )
 
@@ -310,7 +311,7 @@ func TestTheOperatorsAbandonCarriesTheLostServerToTheResumeCalls(t *testing.T) {
 		}
 		return "dead"
 	}
-	if _, err := m.Abandon(ctx, "ops", "x", "s2"); err == nil || !strings.Contains(err.Error(), "heard") {
+	if _, err := m.Abandon(ctx, "ops", opID, "x", "s2"); err == nil || !strings.Contains(err.Error(), "heard") {
 		t.Fatalf("a heard server was declared lost: %v", err)
 	}
 	var lost []string
@@ -323,8 +324,11 @@ func TestTheOperatorsAbandonCarriesTheLostServerToTheResumeCalls(t *testing.T) {
 		b, _ := json.Marshal(mapAbandonAnswer{})
 		return json.Unmarshal(b, out)
 	}
-	res, err := m.Abandon(ctx, "ops", "x", "s9")
+	res, err := m.Abandon(ctx, "ops", opID, "x", "s9")
 	if err != nil || res.ResumedServer != "s1" || len(lost) == 0 || lost[0] != "s9" {
 		t.Fatalf("%+v %v %v", res, err, lost)
 	}
 }
+
+// opID is the identity of an operator's session in the tests of the abandon call.
+var opID = internalapi.ForwardIdentity{Username: "ops", ClusterRoles: []string{"kingres_admin"}, ProofKey: make([]byte, 32)}

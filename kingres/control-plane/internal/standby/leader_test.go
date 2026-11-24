@@ -149,14 +149,27 @@ func TestAgentAnswersFromItsList(t *testing.T) {
 	if err := a.Plan(context.Background(), PlanRequest{Version: 1, Standbys: []Entry{{ID: 3, Group: 1, Server: "b", PrimaryServer: "a", PrimaryPort: 5000}}}); err != nil {
 		t.Fatal(err)
 	}
+	if a.HasStandby(1) {
+		t.Fatal("a standby that is still being created does not arm the lease fence")
+	}
+	if err := a.Plan(context.Background(), PlanRequest{Version: 2, Standbys: []Entry{{ID: 3, Group: 1, Server: "b", PrimaryServer: "a", PrimaryPort: 5000, Ready: true}}}); err != nil {
+		t.Fatal(err)
+	}
 	if !a.HasStandby(1) || a.HasStandby(0) {
-		t.Fatal("HasStandby follows the list")
+		t.Fatal("HasStandby follows the ready entries of the list")
+	}
+	// A standby that is rebuilt (generation above 0, not ready) and the old primary of a failover keep the fence.
+	if err := a.Plan(context.Background(), PlanRequest{Version: 3, Standbys: []Entry{{ID: 3, Group: 1, Server: "b", PrimaryServer: "a", PrimaryPort: 5000, Generation: 1}}}); err != nil {
+		t.Fatal(err)
+	}
+	if !a.HasStandby(1) {
+		t.Fatal("a standby in a rebuild keeps the fence")
 	}
 	list, _ := a.List(context.Background())
 	if len(list) != 1 || list[0].State != "starting" || list[0].ServerID != "b" {
 		t.Fatalf("%+v", list)
 	}
-	if err := a.Plan(context.Background(), PlanRequest{Version: 2, Standbys: []Entry{{ID: 0}}}); err == nil {
+	if err := a.Plan(context.Background(), PlanRequest{Version: 4, Standbys: []Entry{{ID: 0}}}); err == nil {
 		t.Fatal("an invalid entry must be refused")
 	}
 }

@@ -65,3 +65,18 @@ func TestSupersededRunIsRefused(t *testing.T) {
 }
 
 func jsonDecode(resp *http.Response, v any) error { return json.NewDecoder(resp.Body).Decode(v) }
+
+// Phase 5 review L5: the freeze of a group is a call that only a live task run makes; it is refused without the fence header.
+func TestTheFreezeCallNeedsTheFenceHeader(t *testing.T) {
+	if !fenceRequired["POST /failover/freeze"] {
+		t.Fatal("POST /failover/freeze must be in fenceRequired")
+	}
+	if fenceRequired["POST /failover/unfreeze"] {
+		t.Fatal("the undo call stays unfenced")
+	}
+	for key := range fenceRequired {
+		if _, ok := Calls[key]; !ok {
+			t.Fatalf("%s has no policy", key)
+		}
+	}
+}

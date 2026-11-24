@@ -240,7 +240,10 @@ var fenceRequired = map[string]bool{"POST /failover/demote": true, "POST /failov
 	// The forward calls of a planned switchover (F4-09): they end sessions, replace access rules, stop writes and prove a replay, so a leader that
 	// is not a live run of the task cannot make them. The undo calls (unquiesce, resume) are not fenced: the repair of a switchover that a task left
 	// behind has no run to show.
-	"POST /failover/quiesce": true, "POST /failover/mark": true, "POST /failover/verify": true}
+	"POST /failover/quiesce": true, "POST /failover/mark": true, "POST /failover/verify": true,
+	// The freeze blocks every commit of a group that has a dead synchronous standby: a leader whose run was superseded must not set it (phase 5 review L5).
+	// Every caller is a step of a task run; the lifting of a freeze is an undo call and stays unfenced.
+	"POST /failover/freeze": true}
 
 // heldBackFenced are the calls of policy LeaderOrHeldBack that a held-back server accepts only with the fence header of a task run: the
 // server cannot read its catalog term, so the live run (task and epoch) is what proves that the caller is not a superseded leader.

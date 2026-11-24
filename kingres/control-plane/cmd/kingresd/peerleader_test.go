@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 )
@@ -100,5 +101,27 @@ func TestUnquiesceOfAServerThatCannotReadItsTerm(t *testing.T) {
 		if !errors.As(err, &ce) || ce.Status != http.StatusServiceUnavailable {
 			t.Errorf("the primary %s: %v, want 503", name, err)
 		}
+	}
+}
+
+// Phase 5 review L4: the members are asked side by side; six that hold the call for the whole timeout cost the call one timeout, not six.
+func TestTheMembersAreAskedSideBySide(t *testing.T) {
+	slow := func(ctx context.Context, peer string) (peerAnswer, error) {
+		if peer == "up" {
+			return peerAnswer{Leader: "a"}, nil
+		}
+		<-ctx.Done()
+		return peerAnswer{}, ctx.Err()
+	}
+	start := time.Now()
+	got := agreedLeader(context.Background(), []string{"up", "d1", "d2", "d3", "d4", "d5"}, 7, slow)
+	if took := time.Since(start); took > 3*time.Second {
+		t.Fatalf("the call took %v: the members were asked one after the other", took)
+	}
+	if got != "" {
+		t.Fatalf("one answer of seven servers is not a majority with this one: %q", got)
+	}
+	if got := agreedLeader(context.Background(), []string{"up", "d1"}, 3, slow); got != "a" {
+		t.Fatalf("this server and one answer are a majority of three: %q", got)
 	}
 }

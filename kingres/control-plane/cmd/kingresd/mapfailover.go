@@ -884,7 +884,7 @@ func promoteBlockedByJournal(mf *mapFailover, group int32) error {
 // lostServer, when it is set, is the operator's declaration (P2) that the candidate the map group was handed to is lost: the server must not be heard by this server and
 // must be a member; the old leader then ends its hold without the word of that server, and a new request may choose another standby. What the server may have promoted
 // before it was lost is accepted by the operator with the declaration.
-func (m *mapFailover) Abandon(ctx context.Context, actor, reason, lostServer string) (failover.MapAbandonResult, error) {
+func (m *mapFailover) Abandon(ctx context.Context, actor string, id internalapi.ForwardIdentity, reason, lostServer string) (failover.MapAbandonResult, error) {
 	reason = "given up by " + actor + ": " + reason
 	if lostServer != "" {
 		if m.liveState(ctx, lostServer) == "live" {
@@ -928,8 +928,18 @@ func (m *mapFailover) Abandon(ctx context.Context, actor, reason, lostServer str
 		var out mapResumeAnswer
 		if s == m.self {
 			out.Resumed, out.Detail = m.resolveHeldBack(ctx, true, lostServer)
-		} else if err := m.call(ctx, s, http.MethodPost, "/failover/map/resume", mapResumeBody{Strict: true, Lost: lostServer}, &out); err != nil {
-			continue
+		} else {
+			body := mapResumeBody{Strict: true, Lost: lostServer}
+			if lostServer != "" {
+				// The old leader does not take the word of a member for the declaration of an operator (phase 5 review L2): it comes with the proof
+				// of the operator's session, made for that server.
+				if err := m.signLost(id, &body, s); err != nil {
+					return failover.MapAbandonResult{}, problem.New(problem.ServiceUnavailable, "The session cannot prove the declaration to "+s+": "+err.Error()).WithRetryAfter(5)
+				}
+			}
+			if err := m.call(ctx, s, http.MethodPost, "/failover/map/resume", body, &out); err != nil {
+				continue
+			}
 		}
 		if out.Resumed {
 			res.ResumedServer = s

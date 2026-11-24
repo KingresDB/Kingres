@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.32.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.33.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and, when it is built, the planned `kingres-cli` (it does not exist yet). Lint it and run the mechanical rule check with:
 
 ```
@@ -392,6 +392,23 @@ Where the architecture document leaves something open, the simplest option was c
     range and the cluster's replica count.
 
 ## Changelog
+
+### 0.33.0
+
+Revision of the review of phase 5 (high availability). Summary for the panel:
+0 operations added (178 operations, 142 paths); **one stricter role for a request that accepts a loss of data**; nothing else changes in the contract.
+
+#### Breaking
+
+- `failoverServer`: a hard request that includes the map group of a server that is alive and carries `allowDataLoss: true` needs `kingres_admin` (403 `forbidden` otherwise). Every other request keeps `kingres_ops`.
+
+#### Additive
+
+None.
+
+#### Documentation
+
+- `failoverServer` names the role for that request. `abandonMapGroupBootstrap` is unchanged; a declaration `lostServerId` is now proven to the old leader of the map group by the operator's session (internal, no change for clients).
 
 ### 0.32.0
 
@@ -884,7 +901,7 @@ for `hard` on ordinary groups; 2 problem codes, 7 alert kinds, 5 audit actions, 
 
 The meaning of `graceful` (the planned switchover), of `Task.cancellable` (false from the moment the task starts to stop the old primary of a group), of the counter's reset and
 of the task steps of `server.failover` (one block per group, `TaskStep.shardGroupId`). The task error codes of the failover are
-not an enum of the contract (clients tolerate codes they do not know): `superseded`, `lease_still_held`, `lease_held_elsewhere`,
+not an enum of the contract (clients tolerate codes they do not know): `superseded`, `lease_still_held`, `lease_held_elsewhere`, `lease_unavailable`,
 `lease_lost`, `quorum_unavailable`, `no_candidate`, `target_not_available`, `split_promotion`, `promote_timeout`,
 `promote_incomplete`, `bad_promote_target`, `standby_behind`, `prepared_transactions_pending`, `cancelled`. The failover
 statuses in `FailoverReportSummary.outcome` add `paused` (a run that waits for an operator).

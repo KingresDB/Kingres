@@ -168,10 +168,40 @@ func TestARoundIsNotSentForAGroupReleasedInTheMiddleOfAPass(t *testing.T) {
 		case "release:2":
 			sawRelease = true
 		case "grant:2":
-			t.Fatalf("a renewal of group 2 was sent in the pass that released it: %v", after)
+			// The rounds of the groups run side by side: a renewal of group 2 may have been sent before the release was
+			// asked for (the release waits for it), never after the release began.
+			if sawRelease {
+				t.Fatalf("a renewal of group 2 was sent after its release: %v", after)
+			}
 		}
 	}
 	if !sawRelease {
 		t.Fatalf("no release was sent: %v", after)
+	}
+}
+
+// The check that a round makes with the lock of its group held: a group that was released after the list of the pass was
+// taken is not asked for (F2-02). Seen directly, since the rounds of a pass no longer follow each other.
+func TestARoundIsNotSentForAGroupThatWasReleasedAfterTheListWasTaken(t *testing.T) {
+	ctx := context.Background()
+	r := newRig(t, []string{"a", "b", "c"}, false)
+	top := Topology{Groups: []int32{1, 2}, Members: []string{"a", "b", "c"}}
+	r.m.c.Source = fakeSource{top}
+	rv := &recordingVoter{fakeVoter: r.voter}
+	r.m.c.Voter = rv
+	r.m.Renew(ctx)
+	r.m.fl.waitAll()
+	mark := len(rv.seen())
+	r.m.mu.Lock()
+	r.m.relinq[2] = true // released after the pass took its list
+	r.m.mu.Unlock()
+	rl := r.m.rmuFor(2)
+	rl.Lock()
+	r.m.renewOne(ctx, 2, top, rl)
+	r.m.fl.waitAll()
+	for _, c := range rv.seen()[mark:] {
+		if c == "grant:2" {
+			t.Fatal("a renewal was sent for a group that was released")
+		}
 	}
 }
