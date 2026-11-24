@@ -392,7 +392,7 @@ const MUST_MENTION = {
   '0.27.0': ['drainServer', 'server_hosts_map_group', 'Hand over the map group', 'maxStandbyLagBytes', 'groupDegraded', 'RebalanceOptions.force', 'additive'],
   '0.28.0': ['failoverServer', 'unsupported_operation', 'lostServerId', 'additive'],
   '0.29.0': ['exportDatabase', 'validateDatabaseArchive', 'database.export', 'archive.validate', 'ArchiveReport', 'export_not_readable', 'archive_invalid', 'databaseArchive', 'additive'],
-  '0.30.0': ['importDatabase', 'database.import', 'ImportDatabaseRequest', 'archive_statement_refused', 'ledger_restart_not_acknowledged', 'acknowledgeLedgerRestart', 'private', 'additive'],
+  '0.30.0': ['importDatabase', 'database.import', 'ImportDatabaseRequest', 'archive_statement_refused', 'ledger_restart_not_acknowledged', 'acknowledgeLedgerRestart', 'private', 'extensionSkipped', 'additive'],
   '0.19.0': ['exportTable', 'importTable', 'createDataUpload', 'uploadDataChunk', 'downloadDataExport', 'x-streams', 'dataTransfer', 'data_transfer_disabled', 'import_outcome_unknown', 'Upload-Offset', 'additive'],
   '0.12.0': ['completedWithWarnings', 'failover_needs_decision', 'plan', 'notScheduled', 'additive'],
   '0.9.0': ['startRebalance', 'previewRebalancePlan', 'nothing_to_rebalance', 'cluster_inconsistent', 'skipped', 'ledgerSummary', 'Prefer', 'additive'],
@@ -709,6 +709,9 @@ for (const [n, prop] of [['SetupTaskSummary', 'detail'], ['NodeStateInfo', 'inte
   if (!(schemas.AuditAction?.enum ?? []).includes('importDatabase')) fail('AuditAction', 'missing importDatabase');
   for (const needle of ['hostile', 'as the signed-in role', 'private name', 'new chain', 'disabled', 'never the text']) if (!opDesc('importDatabase').includes(needle)) fail('importDatabase', 'description must mention ' + needle);
 }
+// 0.30.0: the alert extensionSkipped (an extension left out of a database on a server because a tenant made its schema its own).
+if (!(schemas.AlertKind?.enum ?? []).includes('extensionSkipped')) fail('AlertKind', 'missing extensionSkipped');
+if (!String(schemas.AlertKind?.description ?? '').includes('extensionSkipped')) fail('AlertKind', 'the description does not explain extensionSkipped');
 // ------------------------------------------------------------------ report
 const pathCount = Object.keys(doc.paths ?? {}).length;
 console.log(`openapi ${doc.openapi}, info.version ${doc.info?.version}`);
