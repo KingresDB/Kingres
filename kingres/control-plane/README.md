@@ -3807,6 +3807,20 @@ that fails (a lock timeout) does not fail the step: the run ends `partial` and t
 the leader the new leader asks again), and `partition.alerts` every five minutes reads `kingres.timepart_check()` and raises or clears `partitionsAheadLow` and `partitionPolicyFailed` (the last run failed, or was
 `partial` twice in a row), subject `database:<db>|tableschema:<s>|tablename:<t>` (see below). The counters `kingres_partition_runs_total`, `kingres_partition_runs_failed_total` and `kingres_partition_actions_failed_total` are on `/metrics`.
 
+**A distributed table (St-D1a, St-D1b).** A user-partitioned distributed table is a table of the instance of the manager leader, which holds the map group primary, so its policy, its plan, its runs and the scheduler
+are the same operations on the same records; nothing in `partsched` or in the task changed. What differs is inside `kingres_timepart` 0.3: a run creates, drops or detaches the partitions with the partition functions of
+`kingres_shard` on every node (a group that a bucket move or a conversion claims is `retry_later`: the action fails with that detail, the run is `partial` and comes back in five minutes), converts the leaves of
+an old partition on the nodes that hold them (one action per partition; a leaf that refuses leaves the partition `mixed`, and the next run goes on) and refuses a policy that would give the table more leaves than
+`kingres_shard.max_partition_leaves` (409 `partition_policy_conflict`, with the numbers). `partitionColumn` and the health come from the extension, so they name the key of the partitions and not the distribution column.
+`listTablePartitions` of a distributed table gives `rangeFrom`, `rangeTo` and an `accessMethod` of `heap`, `columnar` or `mixed`, read on the nodes. A run needs `kingres_timepart` 0.3 in the database of every server that holds a
+leaf and `kingres_columnar` for the conversion (`database.create` installs them on every server and the job `extension.update` brings `kingres_timepart` up to date); a server that lacks one makes the conversion `skipped` with the server named. The service role is a superuser, as
+the partition functions need. Test: `internal/clustertest/distpart_test.go` (`TestPartitionPolicyOfADistributedTable`).
+
+**The update of `kingres_timepart`.** The job `extension.update` of the leader's scheduler (every ten intervals of `partition-scheduler-interval`, 10 minutes by default, and soon after the leader starts) brings
+`kingres_timepart` to the version of the package in every database of this server that has it, and in the same databases on the other servers, with the update path of the extension steps
+(`extension.install` of the internal `apply`: `ALTER EXTENSION UPDATE` to the default version of the package of that server, nothing when it is there already), so that a database that was made with
+0.2 has the procedure that converts a leaf on every server without a step of an operator. A server that cannot be reached is named in the log and asked again at the next pass. Test: `TestTimepartUpdatedOnEveryServer`.
+
 ### Tests
 
 Unit: `internal/ops` (`approx_test.go`: the five steps with fake servers, a version that differs, a package that lacks the extension, the hash, a server that is down, a failure at every call, the process that dies at every

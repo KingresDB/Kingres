@@ -1022,7 +1022,7 @@ the files of the extension, because the dump creates the extension.
 | `kingres_shard.insert_batch_rows` | 1000 | Rows per batch that the row router sends to one group (1 to 100000). |
 | `kingres_shard.insert_batch_bytes` | 1MB | Text bytes per batch per group, the sum of the lengths of the values (16kB to 64MB). The memory of a bulk write is about two batches per group, whatever the number of rows. |
 | `kingres_shard.dependent_views` | refuse | `refuse` or `recreate`: what a table operation does with the plain views that use the table (see "Dependent views"). `USERSET`. |
-| `kingres_shard.max_partition_leaves` | 8192 | Most leaves (buckets times user partitions) one distributed table may have; a user-partitioned table over the limit is refused. `USERSET`. |
+| `kingres_shard.max_partition_leaves` | 8192 | Most leaves (buckets times user partitions) one distributed table may have; a user-partitioned table over the limit is refused, and from 0.9 so are `create_partition` and `attach_partition` of the partition that would pass it. `USERSET`. |
 | `kingres_shard.rebuild_batch_rows` | 10000 | Rows per chunk of the copy and of the replay of an online table operation (one transaction on every group it writes). `USERSET`. |
 | `kingres_shard.rebuild_drain_threshold` | 1000 | Entries of the capture log under which the switch is attempted. `USERSET`. |
 | `kingres_shard.rebuild_lock_timeout` | 200ms | The longest a lock request of the switch is queued behind other sessions. `USERSET`. |
@@ -2493,6 +2493,37 @@ afterwards when many small transactions wrote during a long move).  Test: `t/274
 by `kingres.internal_columnar_args()` and applied with `columnar_set_options` to every bucket partition that `create_distributed_table` and the rebuilds make, to the plain table
 that `undistribute_table` makes, to each leaf of a user-partitioned table, and to the copy of a bucket move (the bucket partition and each leaf).  For a distributed table that is rebuilt or
 undistributed the options are those of its first columnar bucket partition by name on the node that runs the call (a node that holds none gives the defaults).
+
+## Time partitions of distributed tables (version 0.9, phase 12, increments St-D1a and St-D1b)
+
+Design: [`analytics-phase12-storage.md`](../../kingres/docs/design/analytics-phase12-storage.md), section 11.  `kingres_timepart` 0.3 runs a time
+partitioning policy on a user-partitioned distributed table (its README, "Distributed tables"); this extension gives it what it needs.
+
+- **The leaf budget is enforced by the partition functions.**  `create_partition` and `attach_partition` refuse (SQLSTATE 54000, `program_limit_exceeded`) the
+  partition that would give the table more than `kingres_shard.max_partition_leaves` leaves, with the same message as `create_distributed_table`
+  (`table "public.ev" would have 24 leaves (6 buckets, 4 partitions); kingres_shard.max_partition_leaves is 18`).  Before 0.9 only the distribution of a table checked it.
+  `kingres.partition_leaf_budget(table)` returns the buckets, the partitions, their product and the limit.
+- **`kingres.partition_leaf_storage(table)`** (superusers) asks every node that holds a leaf for its access method and returns `(partition_name, node_id, bucket, leaf,
+  access_method)` (null for a leaf that is missing): the way to see that a partition is heap, columnar or mixed after a conversion that stopped half way.  The control plane
+  lists it as the `accessMethod` of a partition.
+- **The claim of a colocation group for a conversion of leaves.**  `kingres.begin_leaf_conversion(table, partition, target)` (map group primary, superuser, committed at
+  once by the session that calls it) takes the group the way a table operation does: a record of kind `convert_leaf` in `kingres.table_operation` (phase `done`, so that
+  `resume_table_operations` and `cleanup_table_operations` leave it alone, listed by `kingres.table_operations`) and a row of `kingres.table_operation_lock`, which a bucket
+  move, the online table operations, the partition functions and a DDL statement on a table of the group already read: they refuse with
+  `object_in_use` and "used by table operation N" or "colocation group N is busy" while it is held.  The claim is refused when a bucket of the group moves or another
+  operation holds it.  `renew_leaf_conversion(op)` shows that the conversion lives, `end_leaf_conversion(op, reason)` releases it (idempotent); a claim that nobody renewed for six
+  hours, or whose session is gone, is taken over by the next `begin_leaf_conversion`.  The optional fourth argument `holder_pid` names the session that drives the conversion
+  (its start time is kept with it): `check_cluster()` reports `leaf_conversion_stale` for a claim whose session is gone or that was not renewed for six hours, and
+  `cancel_table_operation(op)` releases such a claim (it refuses one whose session lives).  The refusals that a claim causes name these actions in their hint.  The claim is a
+  record of the map group primary, like every table operation: DDL reaches the other nodes through it (a statement on another node is refused there), so the claim needs
+  no copy on the nodes.  `partition_leaf_storage` raises an error for a bucket whose group has no active primary.  `partition_leaf_budget` reads the limit with a fallback of
+  8192 when the setting is not known, and `table_change_report('create_partition' | 'attach_partition', table)` has the blocker `leaf_budget` when one more partition would pass it.
+- The conversion itself is `kingres.convert_leaf` of `kingres_timepart` 0.3, run on the node that holds the leaf with `kingres_shard.enable_routing` off for the transaction of the
+  swap (the hook refuses `ATTACH`, `DETACH`, `RENAME` and `DROP` of a bucket partition or a leaf otherwise: requirement R4 of the design).  The claim is requirement R5: a move cannot start
+  while leaves are converted, and a conversion cannot start while a bucket moves.
+
+The SQL is in `kingres_shard--0.8--0.9.sql` (the two partition functions by `CREATE OR REPLACE`, the check constraint of `table_operation.kind` extended, five new functions and
+`internal_check_leaf_budget`); `kingres_shard--0.9.sql` is regenerated by `mk-install-script.sh`.  Test: `t/281_dist_timepart.pl`.
 
 ## Approximate `count(DISTINCT x)` (version 0.9, phase 12)
 

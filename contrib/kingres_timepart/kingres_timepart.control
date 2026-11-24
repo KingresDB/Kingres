@@ -2,7 +2,7 @@
 #
 # Portions Copyright (c) 2026, RooyeKhat Media Co
 # SPDX-License-Identifier: AGPL-3.0-only
-comment = 'KingresDB time partitioning: creation ahead, retention and a run history for ordinary partitioned tables'
-default_version = '0.2'
+comment = 'KingresDB time partitioning: creation ahead, retention and a run history for partitioned tables, ordinary and distributed'
+default_version = '0.3'
 relocatable = false
 schema = kingres

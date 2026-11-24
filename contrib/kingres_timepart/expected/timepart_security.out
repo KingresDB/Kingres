@@ -34,11 +34,12 @@ SELECT proname, prokind FROM members
  ORDER BY proname;
         proname         | prokind 
 ------------------------+---------
+ convert_leaf           | p
  convert_old_partitions | p
  convert_partition      | p
  timepart_run           | p
  timepart_run_phase     | p
-(4 rows)
+(5 rows)
 
 -- SECURITY DEFINER is used by the functions that write the policy and
 -- history tables for a caller that has no right on them, and by nothing else.
@@ -47,6 +48,7 @@ SELECT proname FROM members WHERE prosecdef ORDER BY proname;
 --------------------------------
  timepart__begin_run
  timepart__convert_note
+ timepart__dist_kinds
  timepart__finish_run
  timepart__is_sealed
  timepart__on_ddl_end
@@ -56,7 +58,7 @@ SELECT proname FROM members WHERE prosecdef ORDER BY proname;
  timepart__special_table
  timepart__step_begin
  timepart__step_end
-(11 rows)
+(12 rows)
 
 -- No function is executable by PUBLIC except the pure helpers and the two
 -- DDL steps that run with the caller's own rights.
@@ -77,6 +79,10 @@ SELECT proname FROM members
  timepart__convert_stmts
  timepart__create_rows
  timepart__create_stmts
+ timepart__dist
+ timepart__dist_bounds
+ timepart__dist_budget
+ timepart__dist_kinds
  timepart__eff
  timepart__exec_direct
  timepart__is_sealed
@@ -88,6 +94,7 @@ SELECT proname FROM members
  timepart__oid
  timepart__on_grid
  timepart__owns
+ timepart__part_name
  timepart__plan_rows
  timepart__policy_stamp
  timepart__policy_trg
@@ -111,7 +118,7 @@ SELECT proname FROM members
  timepart_interval_parts
  timepart_part_name
  timepart_retire_one
-(47 rows)
+(52 rows)
 
 -- The policy and the history are shown to a role through security_barrier
 -- views (the rows of the tables it owns); the base tables and the lock table
@@ -150,13 +157,14 @@ SELECT count(*) AS outside_schema FROM pg_depend d
 -- Every function and table of the interface has a comment.
 SELECT proname FROM members m
  WHERE proname NOT LIKE 'timepart\_\_%' AND obj_description(oid, 'pg_proc') IS NULL ORDER BY 1;
-         proname         
--------------------------
+            proname            
+-------------------------------
+ convert_distributed_partition
  timepart_action_timeout
  timepart_grant_driver
  timepart_revoke_driver
  timepart_run_action
-(4 rows)
+(5 rows)
 
 -- Tables of the owner.
 GRANT USAGE ON SCHEMA tpo TO tp_other, tp_member, tp_noinherit, tp_nogrant;

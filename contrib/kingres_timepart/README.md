@@ -2,16 +2,17 @@
 <!-- Portions Copyright (c) 2026, RooyeKhat Media Co -->
 # kingres_timepart
 
-Time partitioning of ordinary (non-distributed) tables for KingresDB (a thin
-fork of PostgreSQL 18.7), version 0.2. For a table partitioned by `RANGE` on a
+Time partitioning of ordinary and of distributed tables for KingresDB (a thin
+fork of PostgreSQL 18.7), version 0.3. For a table partitioned by `RANGE` on a
 time column it creates the partitions for a period ahead, converts the
 partitions that have become older than a period to columnar storage
 (`kingres_columnar`), drops or detaches the partitions that have become older
 than a retention period, and keeps a policy per table and a history of runs.
 The design is section 10 of
 [`kingres/docs/design/analytics-phase12-storage.md`](../../kingres/docs/design/analytics-phase12-storage.md)
-(increments T1 and T2); the departures from it are listed at the end of this
-file.
+(increments T1 and T2) and section 11 for distributed tables (increments
+St-D1a and St-D1b, version 0.3); the departures from it are listed at the end
+of this file.
 
 The extension is written in SQL and PL/pgSQL. It has no C code, needs no
 `shared_preload_libraries` entry, and starts no background process: a run
@@ -21,8 +22,12 @@ KingresDB control plane). The same install script works on PostgreSQL 18 and
 
 Conversion needs the extension `kingres_columnar` in the same database (and its
 library in `shared_preload_libraries`, see its README); everything else works
-without it. Not in this version: distributed tables (they need the shard
-extension, phase 9), and the scheduler, the REST contract and the web console.
+without it. The scheduler, the REST contract and the web console are the
+control plane's (`kingresd`).
+
+A user-partitioned distributed table (`kingres_shard` 0.9: hash on top, the
+user's range partitions below) has a policy like any other table; see
+"Distributed tables".
 
 ## Install
 
@@ -875,8 +880,9 @@ silently:
 * the transaction isolation is not `READ COMMITTED` (under a snapshot older
   than the lock, a row committed in between would be dropped uncopied);
 * the table or the partition belongs to a ledger table (`kingres_ledger`) or to
-  a distributed table (`kingres_shard`; distributed tables are for a later
-  phase);
+  a distributed table (`kingres_shard`; the leaves of a distributed table are
+  converted the way "Distributed tables" describes, with the bucket partition
+  as the table);
 * the partition has a trigger of its own (a row-level or statement-level
   trigger that is not cloned from the parent), a rule, row-level security or a
   policy, extended statistics, an identity column, a sequence it owns, is in a
@@ -1065,7 +1071,143 @@ the table in `kingres`, and such tables make a later `DROP SCHEMA kingres` harde
 Nothing of the extension is affected (everything it does is qualified); give
 tables a schema, or set `search_path` for that role.
 
+## Distributed tables
+
+Version 0.3 runs the policy of a table that `kingres_shard` 0.9 distributed and
+partitioned by `RANGE` of a `date`, `timestamp` or `timestamptz` column (design
+section 11). The table is hash-partitioned by the distribution column; each
+bucket partition is partitioned by the key of the user; a time partition such as
+`events_p20261101` is one logical object, a row of `kingres.dist_partition`,
+with one leaf (`events_p20261101_b0007`) per bucket on the node that holds the
+bucket. Everything is done on the map group primary, by a superuser, and the
+extension must be installed there and, for the conversion, on every node. Only
+the node that runs the policy needs `kingres_shard`; a database without it has
+no distributed table and the functions below see none.
+
+* **The policy** is set with `timepart_set_policy` as for any table: the key is
+  the partition key of the partitions of the user (one column, not an
+  expression; `list` partitions and a DEFAULT partition are refused). The
+  policy is in the tables of this extension on the map group primary and is not
+  synchronized to the other nodes. A partition name has at most 57 bytes (the
+  leaf appends `_bNNNN`); the generated names cut the name of the table to fit.
+* **Create** is `kingres.create_partition(table, name, bound, if_not_exists =>
+  true)`: one two-phase transaction on every node, always heap. **Retire** is
+  `kingres.drop_partition(table, name, missing_ok => true)` or, for
+  `retention_action = 'detach'`, `kingres.detach_partition(table, name)`, which
+  makes the partition a distributed table of its own in the same colocation
+  group. A partition that is not on the grid is reported and left alone, as for
+  any table.
+* **The leaf budget.** A distributed table has a leaf for every bucket of every
+  partition, and `kingres_shard.max_partition_leaves` (8192) bounds the number.
+  `timepart_set_policy` refuses a policy whose steady state (the retention, one
+  year when there is none, plus `create_ahead`, in partitions, times the buckets)
+  would pass it (SQLSTATE 54000, with the numbers), and `create_partition` and
+  `attach_partition` refuse the partition that would pass it. A daily policy on
+  128 buckets adds 128 leaves a day: use a wider `partition_every` or a shorter
+  retention. `kingres.partition_leaf_budget(table)` shows the numbers.
+* **Retry.** `create_partition`, `drop_partition` and `detach_partition` refuse
+  with `object_in_use` (55006) while a bucket move, a table operation or a leaf
+  conversion claims the colocation group. The action is tried again
+  `kingres_timepart.lock_retries` times with a wait that doubles at each attempt
+  (from a random time between `retry_sleep_min_ms` and `retry_sleep_max_ms`, at
+  most a minute); if it is still refused it is recorded `failed` with the detail
+  `lock_timeout: retry_later: ...`, the run is `partial` and `next_run_at` is
+  set to `least(run_every, 5 minutes)` after the time of the run, as for a lock
+  timeout of an ordinary table. Keep `create_ahead` longer than the longest
+  bucket move you expect.
+* **Conversion** (`columnar_after`, or by hand with
+  `convert_distributed_partition(table, partition, 'columnar')`). One action of
+  a run converts the leaves of one logical partition: the colocation group is
+  claimed (`kingres.begin_leaf_conversion`, so that no bucket moves, no table
+  operation copies the group and no partition is created or dropped meanwhile),
+  and each leaf that is not columnar yet is converted on its node by
+  `kingres.convert_leaf(bucket_partition, leaf, ...)`, in a session of its own
+  that commits: the algorithm of `convert_partition` with the bucket partition as
+  the table, REPLICA IDENTITY FULL on the new leaf (which the logical
+  replication of a bucket move needs), and the swap under
+  `kingres_shard.enable_routing = off` (the ProcessUtility hook of `kingres_shard`
+  refuses DDL on a bucket partition otherwise; the setting is for superusers
+  and is local to the transaction of the swap). The claim is renewed after each
+  leaf and released at the end, also when a leaf fails. A leaf that is refused
+  (`conversion_refused: ...`: a trigger of its own, a foreign key, ...) or fails
+  leaves the partition **mixed**: the leaves converted before stay converted,
+  the table reads right (the distributed scan reads a heap leaf and a columnar
+  leaf the same way), `timepart_dist_partitions` says `mixed`, and the next run
+  converts the rest. A converted leaf moves with its bucket (bucket moves of
+  columnar relations, `kingres_shard` 0.9).
+* **What is read.** `timepart_dist_partitions(table)` lists the partitions with
+  the bounds, the number of leaves, the number of columnar leaves and the
+  storage (`heap`, `columnar`, `mixed`); `timepart_partitions` refuses a
+  distributed table and says so. The storage of the leaves is read on the nodes
+  that hold them (`kingres.partition_leaf_storage`), so the plan of a policy
+  with `columnar_after` asks every node.
+* **Who.** A run of a distributed table is driven by a superuser (the service
+  role of the control plane): the partition functions of `kingres_shard` and the
+  conversion run the code of the owner of the table (an index expression, a
+  default) in the session of the superuser on every node, so the rule of
+  `kingres_timepart.trust_table_owners` applies as for any table, and the owner
+  who is not a superuser cannot drive it: the action is recorded `failed` with
+  the reason. `create_time_partitions` and `drop_old_time_partitions` work on a
+  distributed table too, as a superuser.
+* **What it needs of the nodes.** `kingres_timepart` 0.3 must be installed in
+  the database of every node that holds a leaf, and `kingres_columnar` for a
+  conversion to columnar (the control plane installs both with the database); a
+  node that lacks one makes the action `skipped` with `conversion_refused` and
+  the number of the node, before any leaf is touched (the claim is taken first
+  and every error after it, this one included, releases it).
+* **A claim that is left behind.** The claim names the session that drives the
+  conversion (`holder_pid` and its start time in the `spec` of the record, shown
+  by `kingres.table_operations`), and the driver renews it after each leaf.
+  `kingres.check_cluster()` reports `leaf_conversion_stale` for a claim whose
+  session is gone or that was not renewed for six hours, with the way out. The
+  way out is `kingres.cancel_table_operation(op_id)`, which releases a claim
+  that nobody holds (it refuses one whose session lives: cancel that session
+  with `pg_cancel_backend`, and the driver releases the claim itself) or
+  `kingres.end_leaf_conversion(op_id)`; the next claim also takes over a claim
+  that is stale, and the refusals that a claim causes (a bucket move, a
+  partition function, `begin_leaf_conversion`) say so in their hint. When the
+  driver stops on an error or a cancel, the `CALL` that it left on the node is
+  ended there before the claim is released, so that no leaf is converted after
+  the group is free. A driver that is killed outright cannot do that: the leaf
+  that was running ends by itself (it is one transaction) and the claim is
+  reported until it is released.
+* **Time limits.** A leaf is bounded by `kingres_timepart.dist_leaf_timeout_ms`
+  (4 hours; at most 5, below the six hours of the lease of the claim, which the
+  driver renews after each leaf). A driver that sets `statement_timeout` for an
+  action bounds the whole conversion of a partition, all its leaves: the control
+  plane sets none, and a driver that does should set it for the largest
+  partition (`timepart_action_timeout()` is the 5 minutes meant for the
+  actions of ordinary tables). A leaf that waits for a lock gives way after
+  `kingres_timepart.create_lock_timeout_ms` and the swap after 500 ms
+  (`swap_lock_timeout`): the partition is then mixed and the next run goes on.
+* **What the history shows.** The action of a distributed partition has no size
+  before or after (the leaves are on other nodes: `bytes_before` and
+  `bytes_after` stay null), and `object_in_use` is a `retry_later` only for a
+  distributed table (for an ordinary table it is an error of the action).
+  `timepart__dist_budget` reads the limit that is configured
+  (`pg_settings.reset_val`), not the value that the session of the owner set: a
+  role that owns a table cannot raise it for the policy. `partition_leaf_storage`
+  raises an error when a bucket belongs to a group that has no active primary,
+  and does not leave its leaves out.
+
 ## Upgrade path
+
+Version 0.3 adds the distributed tables: `ALTER EXTENSION kingres_timepart
+UPDATE` runs `kingres_timepart--0.2--0.3.sql` and a new installation runs
+`kingres_timepart--0.3.sql`, which `mk-install-script.sh` makes from the 0.2
+install script and the 0.2--0.3 script (the TAP test `t/010` fails when it is
+stale; the regression test `upgrade` shows that the upgrade from 0.1 and from
+0.2 gives the catalog of a new installation). It replaces eleven functions
+by `CREATE OR REPLACE` (`timepart__key_info`, `timepart__children`,
+`timepart__create_rows`, `timepart__plan_rows`, `timepart_run_action`,
+`timepart_set_policy`, `create_time_partitions`, `drop_old_time_partitions`,
+`timepart_partitions`, `timepart__convert_note`, `timepart_part_name`), replaces
+`timepart__convert_stmts` by one with a sixth argument, and adds nine
+(`timepart__dist`, `timepart__dist_bounds`, `timepart__part_name`,
+`timepart__dist_kinds`, `timepart__dist_budget`, `timepart__dist_convert`,
+`timepart_dist_partitions`, `convert_distributed_partition` and the procedure
+`convert_leaf`). The tables and views are unchanged and an ordinary table
+behaves as before.
 
 Version 0.1 was the first version, 0.2 adds the conversion: `ALTER EXTENSION
 kingres_timepart UPDATE` runs `kingres_timepart--0.1--0.2.sql`, and a new
@@ -1123,8 +1265,8 @@ with an upgrade script.
 - A conversion needs a partition that has no hash, GiST, GIN, BRIN or SP-GiST
   index, exclusion constraint, deferrable unique key, foreign key, row trigger,
   rule, view or publication of the kinds listed in "Conversion", and the owner
-  of the table owns the partition. A table with distributed partitions is not
-  converted. A partition with indexes needs about twice the time of the copy
+  of the table owns the partition. A distributed table is not converted by
+  `convert_partition`; `convert_distributed_partition` does it. A partition with indexes needs about twice the time of the copy
   alone (the indexes are built from the new rows), and room for the indexes of
   both tables until the swap.
 - A conversion is tried once per run and not retried; a partition that is
@@ -1258,6 +1400,12 @@ The design is `kingres/docs/design/analytics-phase12-storage.md`, section 4.4 an
 
 ## Tests
 
+The distributed tables are tested in `contrib/kingres_shard/t/281_dist_timepart.pl` (a cluster of three
+nodes: creation ahead, conversion, retention, the leaf budget, a claimed group, a leaf that refuses,
+a bucket move of a converted table, retention by detach, the owner who is not a superuser) and, through
+the REST API, in `kingres/control-plane/internal/clustertest/distpart_test.go`. `t/012_install_script_current.pl`
+checks that the install script is what `mk-install-script.sh` makes.
+
 `sql/` and `expected/` hold the pg_regress tests (`timepart_setup`,
 `timepart_grid`, `timepart_create`, `timepart_policy`, `timepart_run`,
 `timepart_retention`, `timepart_names`, `timepart_hostile`, `timepart_security`, `timepart_history` (who
@@ -1273,7 +1421,7 @@ schema; a name of multibyte letters with two indexes; another table access
 method; a partition off the grid in the convert phase of a run; a superuser
 that switched to the owner; the helper that knows the ledger and distributed
 tables, and that it answers only about the table and its own partitions; a `NOT ENFORCED` check carried both ways; a default partition that is itself partitioned; a partition dropped between the plan and the block), `timepart_drop` (`DROP EXTENSION` and `CREATE EXTENSION`, also where
-the user has objects of the same names), and `upgrade` (0.1 to 0.2 against a new installation of 0.2)).
+the user has objects of the same names), and `upgrade` (0.1 and 0.2 to 0.3 against a new installation of 0.3)).
 `timepart_convert` needs `kingres_columnar` in the installation and preloaded
 (`kingres_timepart.conf` does it; for a build outside the tree, install
 `kingres_columnar` 0.2 first). Every one passes an `as_of` time; none reads the clock. `t/` holds the TAP tests:

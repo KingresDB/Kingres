@@ -48,7 +48,7 @@ export const COUNT_DISTINCT_LABEL: Record<'exact' | 'approximate', string> = {
 
 // --- storage ---------------------------------------------------------------------------------------------
 
-export type StorageFilter = 'all' | 'heap' | 'columnar'
+export type StorageFilter = 'all' | 'heap' | 'columnar' | 'mixed'
 
 export const STORAGE_ROW: StatusMeta = {
   tone: 'neutral',
@@ -61,6 +61,13 @@ export const STORAGE_COLUMNAR: StatusMeta = {
   icon: '●',
   label: 'Columnar',
   hint: 'Stored by column, compressed. Fast to scan, no indexes, no UPDATE or DELETE.',
+}
+/** A partition of a distributed table whose leaves are in both formats (a conversion that is half done; the next run of the policy goes on). */
+export const STORAGE_MIXED: StatusMeta = {
+  tone: 'warn',
+  icon: '◐',
+  label: 'Mixed',
+  hint: 'Some leaves of this partition are columnar and some are rows: a conversion is half done. The policy converts the rest at its next run.',
 }
 
 /** A table's format: columnar, row, a mix of both (a partitioned table), or unknown (null: not available). */
@@ -123,6 +130,7 @@ export const CHUNK_ROWS_MIN = 100
 export function partitionStorageMeta(p: Pick<TablePartition, 'accessMethod'>): StatusMeta | null {
   if (p.accessMethod === 'columnar') return STORAGE_COLUMNAR
   if (p.accessMethod === 'heap') return STORAGE_ROW
+  if (p.accessMethod === 'mixed') return STORAGE_MIXED
   return null
 }
 

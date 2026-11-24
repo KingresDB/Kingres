@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 EXTENSION = kingres_timepart
-DATA = kingres_timepart--0.1.sql kingres_timepart--0.1--0.2.sql kingres_timepart--0.2.sql
+DATA = kingres_timepart--0.1.sql kingres_timepart--0.1--0.2.sql kingres_timepart--0.2.sql kingres_timepart--0.2--0.3.sql kingres_timepart--0.3.sql
 PGFILEDESC = "kingres_timepart - time partitioning for KingresDB"
 
 REGRESS = timepart_setup timepart_grid timepart_create timepart_policy timepart_run timepart_retention timepart_names timepart_hostile timepart_security timepart_history timepart_privilege timepart_forged timepart_owner_code timepart_convert timepart_convert_more timepart_drop upgrade

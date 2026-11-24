@@ -15,8 +15,8 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 
 my $ext = 'kingres_timepart';
-my @installs = ('0.1', '0.2');
-my @upgrades = (['0.1','0.2']);
+my @installs = ('0.1', '0.2', '0.3');
+my @upgrades = (['0.1','0.2'], ['0.2','0.3']);
 
 my $node = PostgreSQL::Test::Cluster->new('os');
 $node->init;

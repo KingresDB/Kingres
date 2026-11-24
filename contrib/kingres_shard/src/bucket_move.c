@@ -851,6 +851,7 @@ kingres_shard_assert_no_move(int colocation_id)
 	Datum		values[1];
 	int			found = 0;
 	int64		claimed = 0;
+	bool		claim_is_conversion = false;
 	int64		splitting = 0;
 	Oid			save_uid;
 	int			save_sec;
@@ -890,7 +891,8 @@ kingres_shard_assert_no_move(int colocation_id)
 	/* A table operation that claims the group (0.7) is the other thing a move must not meet. */
 	if (found == 0 && OidIsValid(kingres_shard_catalog_relid("table_operation_lock")))
 	{
-		ret = SPI_execute_with_args("SELECT l.op_id FROM " KINGRES_SHARD_SCHEMA ".table_operation_lock l "
+		ret = SPI_execute_with_args("SELECT l.op_id, (o.kind OPERATOR(pg_catalog.=) 'convert_leaf') FROM " KINGRES_SHARD_SCHEMA ".table_operation_lock l "
+									"JOIN " KINGRES_SHARD_SCHEMA ".table_operation o ON o.op_id OPERATOR(pg_catalog.=) l.op_id "
 									"WHERE l.colocation_id OPERATOR(pg_catalog.=) $1",
 									1, argtypes, values, NULL, true, 0);
 		if (ret != SPI_OK_SELECT)
@@ -901,6 +903,8 @@ kingres_shard_assert_no_move(int colocation_id)
 
 			claimed = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
 												  SPI_tuptable->tupdesc, 1, &isnull));
+			claim_is_conversion = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+															 SPI_tuptable->tupdesc, 2, &isnull));
 		}
 	}
 	/* A split of a bucket of the group (0.8): its children are copies that do not see a change of the tables. */
@@ -941,6 +945,8 @@ kingres_shard_assert_no_move(int colocation_id)
 				 errmsg("colocation group %d is used by table operation " INT64_FORMAT,
 						colocation_id, claimed),
 				 errdetail("The statement would change the tables of the group while the operation copies them."),
+				 claim_is_conversion ?
+				 errhint("The leaves of a partition are being converted: wait for the conversion to end. A claim that nobody holds any more is reported by kingres.check_cluster() and released by kingres.cancel_table_operation(" INT64_FORMAT ").", claimed) :
 				 errhint("Wait for the operation to finish, or cancel it; see kingres.table_operations.")));
 }
 

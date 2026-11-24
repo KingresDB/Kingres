@@ -18,7 +18,7 @@ SET intervalstyle = postgres;
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_timepart';
  extversion 
 ------------
- 0.2
+ 0.3
 (1 row)
 
 SELECT count(*) FILTER (WHERE c.relkind = 'r') AS tables,

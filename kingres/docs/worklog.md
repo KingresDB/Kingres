@@ -27,6 +27,104 @@ See the report of the run for the counts per major; the tests are `instance` (pr
 - The shell tests of the package and the image (`test-deb.sh`, `test-image.sh`, `test-compose.sh`) were changed but not run here (they need a built package and Docker); `test-modules.sh` was run on installed trees.
 - No console page for `pg_stat_statements`; the view is SQL only.
 
+## 2026-11-23 (second entry): the leftovers of p12-dist-tp and the findings of its review
+
+Branch p12-dist-tp, on top of g16 (merged, `t/252` rerun).  Contract revision still the placeholder 0.23.0.
+
+### What was done
+
+- **g16 merged** into the branch (the search_path hardening and `t/252`); the branch had been made from the merge before it.
+- **Stale claims.**  `begin_leaf_conversion` takes the pid of the driver (`holder_pid`, with its start time); `check_cluster()` reports `leaf_conversion_stale` (the session is gone, or the claim was not renewed for six hours);
+  `cancel_table_operation` releases such a claim (and refuses one whose session lives); the next claim takes it over; the hints of the refusals that a claim causes name these actions (the C check of `assert_no_move`, `internal_begin_move`,
+  `begin_leaf_conversion`).
+- **`timepart__dist_convert`** takes the claim first, reads the leaves and checks the nodes inside the block that releases it on every error, ends the `CALL` that a failed or timed-out leaf left on its node before it releases the claim, and its leaf limit
+  is at most 5 hours (the lease is 6).  `partition_leaf_storage` raises an error for a bucket whose group has no active primary.  A distributed action has no sizes (the sentinel `bytes_after = 0` is gone).  `object_in_use` is `retry_later` for a
+  distributed table only.  The budget of a policy reads the configured limit (`reset_val`) and `partition_leaf_budget` has a fallback; the budget of an attach is tested; `table_change_report('create_partition' | 'attach_partition')` has the blocker `leaf_budget`.
+- **kingresd** keeps `kingres_timepart` at the version of the package on every server of every database (the job `extension.update` of the leader, through the `extension.install` apply); `listTablePartitions` says `mixed` and `other` as `timepart__dist_kinds` does.
+- **Console:** the Format filter has `Mixed`, with a badge, a mock switch (`?analytics=timeseries,mixed`) and a vitest.
+- Tests in `t/278`: stale claims (a live and a gone holder, the lease), the 6-hour takeover and the renewal, the attach budget, a multibyte name, the way back to heap, readers (one statement at a time, always complete rows), `convert_leaf` by a role that is not a
+  superuser, DDL on a server that is not the map group primary (the claim is a record of the map group primary and is not needed on the nodes: DDL and the partition functions reach them through it), an error between the claim and the first leaf, and a killed driver
+  (reported, released by `cancel_table_operation`, the leaf that was running ends).  In `distpart_test.go`: no sizes in the actions, and `TestTimepartUpdatedOnEveryServer` (a database on 0.2 is updated on three servers, then converts).
+- READMEs of the three components and section 11.7 of the design say what changed, and that a `statement_timeout` of a driver covers the whole partition.
+
+### How it was verified
+
+- PostgreSQL 18.7 and 19.0, private installs, lane l10, `-Werror`: `kingres_shard` TAP in full, 236 files (59,827 tests on 18, 59,790 on 19, with `t/046_two_majors` run separately with both installs: 30 more), regress 25 of 25; `t/252` and `t/278` twice more each (224 tests per round);
+  `kingres_timepart` regress 17 of 17 and TAP 693 tests (10 files); the cluster tests `TestPartitionPolicyOfADistributedTable`, `TestTimepartUpdatedOnEveryServer`, `TestTableStorageAndPartitionPolicies`, `TestTableLifecycle`; `go test` of `ops`, `partsched`, `httpapi`, `kingresd`; the 215 vitest tests of the analytics console,
+  `vue-tsc`, eslint and prettier.
+- Mutants, killed: the claim not released on an error (T9: also `D` and `H` fail), the budget of an attach removed (S5), the holder never gone (S6), `cancel_table_operation` not releasing (S7), the budget of `create_partition` removed (S1);
+  the job `extension.update` never run (Go, `TestTimepartUpdatedOnEveryServer`); the `Mixed` option removed (vitest).
+
+### Decisions and deviations
+
+- A reader that holds a transaction open on the table makes the swap of a leaf give way (`swap_lock_timeout`): it is the behaviour of the conversion of an ordinary table, and the next run goes on; the test of readers uses one statement at a time.
+- The listing of the partitions reads every node on each page; it is not cached (a cache would show a finished conversion as half done).
+
+### Still open
+
+- A driver that is killed outright cannot end the `CALL` that it left on a node: the leaf ends by itself, and the claim is reported and released by `cancel_table_operation`.
+- `openapi.yaml` and the generated contract files wait for the revision number.
+
+### Core patches
+
+none.
+
+---
+
+## 2026-11-23: time partition policies on distributed tables (phase 12, St-D1a and St-D1b)
+
+Covers branch p12-dist-tp (from g16), design [analytics-phase12-storage.md](design/analytics-phase12-storage.md) section 11 (new 11.7 says what was built).  These were the last two items of phase 12.
+
+### What was done
+
+- **kingres_timepart 0.3** (`kingres_timepart--0.2--0.3.sql`; `kingres_timepart--0.3.sql` is generated by the new `mk-install-script.sh`, which `t/010` checks).  A user-partitioned distributed table (hash on top, range partitions below, `kingres_shard` 0.9) has a policy like any other table:
+  `timepart__key_info` and `timepart__children` read its key and its partitions (rows of `kingres.dist_partition`, one logical object with a leaf per bucket) and the plan, the checks and the history work on them unchanged.
+  A run creates a partition with `kingres.create_partition(..., if_not_exists => true)`, retires it with `drop_partition` or `detach_partition` (on every node, one two-phase transaction), and converts the leaves of an old one
+  (`timepart__dist_convert`, `kingres.convert_leaf`).  A group that a bucket move or a conversion claims (`object_in_use`) is tried again inside the action, with a wait that doubles, and then recorded `failed` with
+  `lock_timeout: retry_later`: the run is `partial` and comes back within five minutes, by the existing rule.  The names of generated partitions are cut to 57 bytes (the leaves append `_bNNNN`).  The leaf budget is
+  checked by `timepart_set_policy` (steady state: retention, or one year, plus `create_ahead`, times the buckets; SQLSTATE 54000 with the numbers).  New: `timepart_dist_partitions`, `convert_distributed_partition`.
+  Only a superuser drives a distributed table (the partition functions of `kingres_shard` need one); an owner who is not one gets `failed` actions with the reason.
+- **Conversion of the leaves (St-D1b).**  One action converts the leaves of one logical partition.  The colocation group is claimed first, then each leaf that is not columnar is converted on its node by
+  `CALL kingres.convert_leaf(bucket_partition, leaf, ...)` through `kingres.internal_node_exec` (a session of its own, so the procedure commits): the algorithm of `convert_partition` with the bucket partition as the
+  table, `REPLICA IDENTITY FULL` on the new columnar leaf, and the swap under `kingres_shard.enable_routing = off` (requirement R4: no new authorization was needed).  A leaf that refuses leaves the partition mixed
+  (reads are right, the next run goes on).  A converted bucket moves (St-S3), tested.
+- **kingres_shard 0.9** (`kingres_shard--0.8--0.9.sql`, `kingres_shard--0.9.sql` regenerated): `create_partition` and `attach_partition` enforce `kingres_shard.max_partition_leaves` (before, only the distribution of a table did),
+  `partition_leaf_budget()`, `partition_leaf_storage()` (the access method of every leaf, read on its node), and the claim of a colocation group for a conversion (requirement R5): `begin_leaf_conversion`,
+  `renew_leaf_conversion`, `end_leaf_conversion`, a record of kind `convert_leaf` in `table_operation` (phase `done`) with a row of `table_operation_lock`, which the moves, the table operations, the partition functions and
+  every DDL statement on a table of the group already read.
+- **kingresd.**  The scheduler, `partition.maintain` and the policy operations needed no change of structure (the leader's instance holds the map group primary, so a distributed table is one of its tables).  Changed:
+  the partition column and the health of a policy are read through `kingres_timepart` (they named the distribution column), a policy over the leaf budget is `partition_policy_conflict`, and `listTablePartitions` of a
+  distributed table has `rangeFrom`, `rangeTo` and `accessMethod` (`heap`, `columnar`, `mixed`).  The contract text is in `contract.txt` of the work area (placeholder 0.23.0); the console needs no change.
+- READMEs of `kingres_shard`, `kingres_timepart` and the control plane; section 11.7 of the design.
+
+### How it was verified
+
+- PostgreSQL 18.7 and 19.0 (private installs, one source, `-Werror`): `kingres_timepart` regress 17 of 17 and TAP 10 files with 693 tests on each major (`upgrade` compares the upgrade from 0.1 and from 0.2 with a new install of 0.3; `t/010` the generated install script);
+  `kingres_shard` regress 25 of 25 and the whole TAP suite, 236 files: 59812 tests on 18 and 59741 on 19, all pass (`t/046_two_majors` run with both installs, 30 tests; `t/250` holds for 0.8 and 0.9); the new `t/281_dist_timepart.pl` has 145 tests on each major
+  (creation ahead, conversion with `REPLICA IDENTITY FULL`, retention, the leaf budget, the 57-byte names, a claimed group and a held bucket move in both directions, a leaf that refuses, a move of converted buckets, detach, the owner who is not a superuser).
+- Control plane: `go test` of `internal/ops`, `internal/partsched`, `internal/api`, `internal/httpapi` and `internal/contract` pass; the cluster test `TestPartitionPolicyOfADistributedTable` (three servers, lane l10: policy, plan, a run by hand with three conversions and a drop, a busy group, the scheduler) passes on 18 and on 19;
+  `TestTableStorageAndPartitionPolicies` and `TestTableLifecycle` (the listing of partitions and the policy of an ordinary table) pass on 18.
+- Mutants (each applied alone to a copy of the extension, the real one reinstalled after each, `t/278` run): the leaf budget of `create_partition` removed (S1), the claim without its lock row (S2), `partition_leaf_storage` without
+  the access method (S3), the claim without its busy check (S4), `object_in_use` not retried (T1), `REPLICA IDENTITY FULL` not set (T2), the policy without the budget check (T3), the plan that does not read the storage of the
+  leaves (T4), the claim not released after a conversion (T5), the swap without `enable_routing = off` (T6), detach replaced by drop (T7), the 57-byte name replaced by 63 (T8); Go: the partition column from `pg_partitioned_table`
+  (G1), the listing without the storage and the budget error without its mapping (G2, G3); all killed, each by the test that names its behaviour.
+
+### Decisions and deviations
+
+- The retry is the existing loop of the extension (`lock_retries`, a doubling wait) and the action is `failed` with `retry_later`, not the 5 s to `partition_retry_window` and `skipped` of the first sketch; the run's end rule (partial, five minutes) is the one that was there.
+- The claim reuses `table_operation_lock` with a record of kind `convert_leaf` in phase `done`, instead of a lock of its own: every exclusion that exists already honours it, and the machinery that resumes unfinished table operations does not see it.
+  The claim is not renewed by a heartbeat process: the conversion renews it after each leaf, and a claim of six hours without renewal is taken over.
+- The leaf budget is `kingres_shard.max_partition_leaves` (8192), not the 20 000 of the first sketch of the design.
+
+### Still open
+
+- Closed by the leftovers entry of the same date below: the stale claim in `check_cluster()`, the update of `kingres_timepart` on every server, the Mixed filter and the leaf budget in `table_change_report`.
+- The contract text is not in `api/openapi.yaml` (the revision number is assigned at the merge).
+
+### Core patches
+
+none.
+
 ---
 
 ## 2026-11-22 (staging branch g15): cp-1011, p13-fix and web-15b merged, contract revisions renumbered
