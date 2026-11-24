@@ -9,6 +9,7 @@
 #   D. refusals: no primary key, a user-partitioned table, a bucket that is not active, the same group twice, DDL during a split, parts, a move of the bucket
 #   E. cancel; a killed session before the switch (undone), after it (finished), the recovery worker alone
 #   F. a split bucket moves, and a table made later has its layout
+#   G. the recovery worker leaves a split alone between its record and the live mark (fault point split_after_begin)
 
 use strict;
 use warnings FATAL => 'all';
@@ -104,6 +105,9 @@ is(clean(), '', 'the cluster is clean at the start');
 {
 	my $g = owner(2);
 	my $e = epoch();
+	# the recovery worker drops the orphans of a finished split after move_cleanup_delay (1 s for the other sections); here the test looks at them first, which a loaded machine
+	# does later than that, so the delay is long until they are checked
+	q1($n1, q{ALTER SYSTEM SET kingres_shard.move_cleanup_delay = 600; SELECT pg_reload_conf()});
 	my ($rc, $out, $err) = run_sql($n1, "SELECT kingres.split_bucket($C, 2, 2)");
 	is($rc, 0, 'A: split_bucket(2, 2)') or diag($err);
 	my $id = $out; $id =~ s/\s+//g;
@@ -121,6 +125,7 @@ is(clean(), '', 'the cluster is clean at the start');
 	is(q1($nodes[$g], q{SELECT count(*) FROM pg_class WHERE relnamespace = 'kingres'::regnamespace AND relname LIKE 'orphan_s%' AND relkind = 'r'}), '2', 'A: the old partitions wait as orphans on the owner');
 	is(q1($n1, q{SELECT kingres.cleanup_bucket_splits(true)}), '1', 'A: the cleanup drops them');
 	is(q1($nodes[$g], q{SELECT count(*) FROM pg_class WHERE relnamespace = 'kingres'::regnamespace AND relname LIKE 'orphan_s%'}), '0', 'A: they are gone');
+	q1($n1, q{ALTER SYSTEM RESET kingres_shard.move_cleanup_delay; SELECT pg_reload_conf()});
 	is(q1($n1, "SELECT phase FROM kingres.bucket_split WHERE split_id = $id"), 'done', 'A: the split is done');
 	verify_all('A2');
 
@@ -418,6 +423,28 @@ sub kill_split
 	q1($n3, q{DROP TABLE public.loose; DROP FUNCTION kingres.split_capture_999_1()});
 	is(clean(), '', 'F: clean again');
 	model_check('F');
+}
+
+
+# ---------------------------------------------------------------------------
+# G. between the record of a split and its live mark the recovery worker leaves it alone
+# ---------------------------------------------------------------------------
+{
+	# The session that begins a split writes its record in a session of its own and takes the live mark afterwards.  Stopped between the two (the fault point), the
+	# split has a record and no mark: a recovery pass (here called by hand, the worker does the same every 2 s) must still see it alive and not undo it.
+	my ($pid, $file) = stopped('split_after_begin', "SELECT kingres.split_bucket($C, 4, 2)", 'g1');
+	ok(wait_for_fault_file("$file.reached", 60), 'G: a split of bucket 4 waits between its record and its live mark');
+	my $sid = q1($n1, q{SELECT split_id FROM kingres.bucket_split ORDER BY split_id DESC LIMIT 1});
+	is(q1($n1, "SELECT phase FROM kingres.bucket_split WHERE split_id = $sid"), 'preparing', 'G: the record is there');
+	is(q1($n1, "SELECT kingres.internal_split_alive($sid)"), 't', 'G: the split is alive');
+	is(q1($n1, q{SELECT kingres.resume_bucket_splits()}), '0', 'G: a recovery pass leaves it alone');
+	is(q1($n1, "SELECT phase FROM kingres.bucket_split WHERE split_id = $sid"), 'preparing', 'G: and the record is as it was');
+	release($pid, $file);
+	unlike(out('g1'), qr/ERROR|WARNING/, 'G: the split goes on and ends without a warning') or diag(out('g1'));
+	like(q1($n1, "SELECT phase FROM kingres.bucket_split WHERE split_id = $sid"), qr/^(cleaning|done)$/, 'G: it is finished');
+	is(q1($n1, "SELECT kingres.internal_split_alive($sid)"), 'f', 'G: and nobody holds its mark any more');
+	q1($n1, q{SELECT kingres.cleanup_bucket_splits(true)});
+	verify_all('G');
 }
 
 done_testing();

@@ -1320,7 +1320,7 @@ pg_regress (one node, no replication):
 - Upgrade 0.6 to 0.7 against a fresh install; `set_node_property` call forms.
 
 TAP (three nodes unless stated), each with fault points at every phase boundary
-(`split_after_preparing`, `split_after_children`, `split_after_triggers`,
+(`split_after_begin`, `split_after_preparing`, `split_after_children`, `split_after_triggers`,
 `split_mid_backfill` (after n batches), `split_after_backfill`, `split_before_switch`,
 `split_switch_after_lock`, `_after_verify`, `_after_detach`, `_after_attach`,
 `_after_local`, `split_after_switch`, `split_undo_after_triggers`,
