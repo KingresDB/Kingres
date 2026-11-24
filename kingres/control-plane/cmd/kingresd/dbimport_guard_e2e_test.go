@@ -57,7 +57,7 @@ func TestDatabaseImportEndsTheSessionOfAMember(t *testing.T) {
 	var mu sync.Mutex
 	var held *pgx.Conn
 	var heldErr error
-	ops.ImportHook = func(ctx context.Context, step string) error {
+	ops.ImportHook = func(ctx context.Context, step, private string) error {
 		mu.Lock()
 		defer mu.Unlock()
 		switch step {
@@ -70,7 +70,7 @@ func TestDatabaseImportEndsTheSessionOfAMember(t *testing.T) {
 				return err
 			}
 			cfg, _ := pgx.ParseConfig("")
-			cfg.Host, cfg.Port, cfg.Database, cfg.User, cfg.Password = "127.0.0.1", uint16(e.pgPort), ops.ImportPrivateName(), "dbx_sub", "sub-Passw0rd-1" //nolint:gosec // test port
+			cfg.Host, cfg.Port, cfg.Database, cfg.User, cfg.Password = "127.0.0.1", uint16(e.pgPort), private, "dbx_sub", "sub-Passw0rd-1" //nolint:gosec // test port
 			cfg.TLSConfig, cfg.Fallbacks = nil, nil
 			held, heldErr = pgx.ConnectConfig(ctx, cfg)
 		}
@@ -111,9 +111,9 @@ func TestDatabaseImportRollsBackAPreparedTransaction(t *testing.T) {
 	defer off()
 	imp := importerOf(t, e)
 	base := smallArchive(t, e, "dbprep")
-	prepare := func(ctx context.Context) error {
+	prepare := func(ctx context.Context, private string) error {
 		cfg, _ := pgx.ParseConfig("")
-		cfg.Host, cfg.Port, cfg.Database, cfg.User, cfg.Password = "127.0.0.1", uint16(e.pgPort), ops.ImportPrivateName(), importerName, importerPass //nolint:gosec // test port
+		cfg.Host, cfg.Port, cfg.Database, cfg.User, cfg.Password = "127.0.0.1", uint16(e.pgPort), private, importerName, importerPass //nolint:gosec // test port
 		cfg.TLSConfig, cfg.Fallbacks = nil, nil
 		c, err := pgx.ConnectConfig(ctx, cfg)
 		if err != nil {
@@ -129,9 +129,9 @@ func TestDatabaseImportRollsBackAPreparedTransaction(t *testing.T) {
 	}
 	var once sync.Once
 	var prepErr error
-	ops.ImportHook = func(ctx context.Context, step string) error {
+	ops.ImportHook = func(ctx context.Context, step, private string) error {
 		if step == "Load the data" {
-			once.Do(func() { prepErr = prepare(ctx) })
+			once.Do(func() { prepErr = prepare(ctx, private) })
 		}
 		return nil
 	}
@@ -149,9 +149,9 @@ func TestDatabaseImportRollsBackAPreparedTransaction(t *testing.T) {
 	// A failed import drops the database although a transaction is prepared in it (the final name is taken at the last moment).
 	once = sync.Once{}
 	prepErr = nil
-	ops.ImportHook = func(ctx context.Context, step string) error {
+	ops.ImportHook = func(ctx context.Context, step, private string) error {
 		if step == "Load the data" {
-			once.Do(func() { prepErr = prepare(ctx) })
+			once.Do(func() { prepErr = prepare(ctx, private) })
 		}
 		if step == "Take the final name" {
 			_, err := sc.Exec(ctx, "create database dbprep_x")
@@ -193,7 +193,7 @@ func TestDatabaseImportOfACreateRoleImporterThatMakesALoginRoleMidImport(t *test
 	var held []*pgx.Conn
 	var once sync.Once
 	var hookErr error
-	ops.ImportHook = func(ctx context.Context, step string) error {
+	ops.ImportHook = func(ctx context.Context, step, private string) error {
 		if step != "Load the data" {
 			return nil
 		}
@@ -201,7 +201,7 @@ func TestDatabaseImportOfACreateRoleImporterThatMakesALoginRoleMidImport(t *test
 			mu.Lock()
 			defer mu.Unlock()
 			// The importer's own session in the private database and in the cluster database.
-			own, err := connect(ctx, ops.ImportPrivateName(), importerName, importerPass)
+			own, err := connect(ctx, private, importerName, importerPass)
 			if err != nil {
 				hookErr = err
 				return
@@ -219,8 +219,8 @@ func TestDatabaseImportOfACreateRoleImporterThatMakesALoginRoleMidImport(t *test
 				return
 			}
 			_, _ = adm.Exec(ctx, "grant "+importerName+" to dbx_cr")
-			_, _ = adm.Exec(ctx, "grant connect on database "+ops.ImportPrivateName()+" to dbx_cr")
-			if c, err := connect(ctx, ops.ImportPrivateName(), "dbx_cr", "cr-Passw0rd-1"); err == nil {
+			_, _ = adm.Exec(ctx, "grant connect on database "+private+" to dbx_cr")
+			if c, err := connect(ctx, private, "dbx_cr", "cr-Passw0rd-1"); err == nil {
 				held = append(held, c)
 			}
 		})
@@ -281,13 +281,13 @@ func TestDatabaseImportCountsTheRowsAsTheRole(t *testing.T) {
 	var once sync.Once
 	var hookErr error
 	var listener *pgx.Conn
-	ops.ImportHook = func(ctx context.Context, step string) error {
+	ops.ImportHook = func(ctx context.Context, step, private string) error {
 		if step != "Set the sequences" {
 			return nil
 		}
 		once.Do(func() {
 			cfg, _ := pgx.ParseConfig("")
-			cfg.Host, cfg.Port, cfg.Database, cfg.User, cfg.Password = "127.0.0.1", uint16(e.pgPort), ops.ImportPrivateName(), importerName, importerPass //nolint:gosec // test port
+			cfg.Host, cfg.Port, cfg.Database, cfg.User, cfg.Password = "127.0.0.1", uint16(e.pgPort), private, importerName, importerPass //nolint:gosec // test port
 			cfg.TLSConfig, cfg.Fallbacks = nil, nil
 			l, err := pgx.ConnectConfig(ctx, cfg)
 			if err != nil {

@@ -384,8 +384,16 @@ func TestTableTrustedWalksTheCatalog(t *testing.T) {
 		"create table public.t_part (id int, d date) partition by range (d)",
 		"create table public.t_part_1 partition of public.t_part for values from ('2026-01-01') to ('2027-01-01')",
 		"create table public.t_idx (id int, v int)",
-		"create index on public.t_idx ((v operator(public.===) v))", "reset role")
-	for table, ok := range map[string]bool{"t_ok": true, "t_part": true, "t_op": false, "t_dom": false, "t_dom2": false, "t_stat": false, "t_idx": false} {
+		"create index on public.t_idx ((v operator(public.===) v))",
+		// A domain with a function of the role in its CHECK, reached only through a composite type, an array of it, a range or a multirange (the review of 14c, L-A).
+		"create type public.comp as (a public.dom, b int)", "create table public.t_comp (id int, v public.comp)", "create table public.t_comp_arr (id int, v public.comp[])",
+		"create type public.comp_ok as (a public.dom_ok, b int)", "create table public.t_comp_ok (id int, v public.comp_ok)",
+		"create function public.dfn(int, int) returns float8 language sql immutable as 'select 1.0::float8'",
+		"create type public.rng as range (subtype = int4, subtype_diff = public.dfn)",
+		"create table public.t_rng (id int, v public.rng)", "create table public.t_mrng (id int, v public.rng_multirange)",
+		"reset role")
+	for table, ok := range map[string]bool{"t_ok": true, "t_part": true, "t_op": false, "t_dom": false, "t_dom2": false, "t_stat": false, "t_idx": false,
+		"t_comp": false, "t_comp_arr": false, "t_comp_ok": true, "t_rng": false, "t_mrng": false} {
 		tx, err := c.Begin(ctx)
 		if err != nil {
 			t.Fatal(err)
@@ -448,5 +456,97 @@ func TestWithdrawalLooksAgainAfterAQuietRound(t *testing.T) {
 	defer cancel()
 	if err := late.Ping(pctx); err == nil {
 		t.Error("the session that appeared after a quiet round survives the withdrawal")
+	}
+}
+
+// L-B (the second review of 14c): the undoing of a rename on a peer only touches a database that carries the marker of the task. A peer where the final name is a
+// database of somebody else (the rename failed there, so it was never ours) is left as it is; the marker stays on the final name until the rename is finished.
+func TestRenameBackLeavesAForeignDatabaseAlone(t *testing.T) {
+	_, c, o := newGuardInstance(t)
+	ctx := context.Background()
+	pgExecAll(t, c, "create role stranger login", "create database shop_final owner stranger", "create database shop_other owner stranger", "comment on database shop_other is 'something else'")
+	state := func(name string) string {
+		var s string
+		if err := c.QueryRow(ctx, `select pg_get_userbyid(datdba) || '/' || coalesce(shobj_description(oid, 'pg_database'), '') from pg_database where datname = $1`, name).Scan(&s); err != nil {
+			return "missing"
+		}
+		return s
+	}
+	for _, name := range []string{"shop_final", "shop_other"} {
+		before := state(name)
+		if err := o.importRenameLocal(ctx, importRenameOp{From: name, To: privDB, Back: true, Marker: importMarker(privDB)}); err != nil {
+			t.Errorf("%s: the undoing of a rename that was not ours returned %v", name, err)
+		}
+		if state(name) != before || state(privDB) != "missing" {
+			t.Errorf("%s: a database that is not ours was changed: %q, the private name is %q", name, state(name), state(privDB))
+		}
+	}
+	// A marker that is not the task's, or none, is refused outright.
+	for _, m := range []string{"", importMarker("kingres_import_8_001122334455")} {
+		if err := o.importRenameLocal(ctx, importRenameOp{From: "shop_final", To: privDB, Back: true, Marker: m}); err == nil {
+			t.Errorf("a rename back with the marker %q is accepted", m)
+		}
+	}
+	// The marker stays on the final name until the rename is finished, and the undoing works while it is there.
+	pgExecAll(t, c, "drop database shop_final", "drop database shop_other")
+	makePrivate(t, o, c)
+	if err := o.importRenameLocal(ctx, importRenameOp{From: privDB, To: "shop_final", Owner: "imp"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := state("shop_final"); got != "imp/"+importMarker(privDB) {
+		t.Errorf("the final name after the rename: %q", got)
+	}
+	if err := o.importRenameLocal(ctx, importRenameOp{From: "shop_final", To: privDB, Back: true, Marker: importMarker(privDB)}); err != nil {
+		t.Fatal(err)
+	}
+	if state("shop_final") != "missing" || state(privDB) != "kingresd/"+importMarker(privDB) {
+		t.Errorf("after the undoing: final %q, private %q", state("shop_final"), state(privDB))
+	}
+	if err := o.importRenameLocal(ctx, importRenameOp{From: privDB, To: "shop_final", Owner: "imp"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.importRenameLocal(ctx, importRenameOp{From: "shop_final", To: privDB, Finish: true, Marker: importMarker(privDB)}); err != nil {
+		t.Fatal(err)
+	}
+	if got := state("shop_final"); got != "imp/" {
+		t.Errorf("the final name after the finish: %q", got)
+	}
+	if err := o.importRenameLocal(ctx, importRenameOp{From: "shop_final", To: privDB, Back: true, Marker: importMarker(privDB)}); err != nil || state("shop_final") != "imp/" {
+		t.Errorf("a finished rename was undone: %v %q", err, state("shop_final"))
+	}
+}
+
+// L-C: every relation of a schema that is distributed is listed, locked and checked; a table that the archive's catalog does not name is refused.
+func TestLockSchemaTablesRefusesWhatTheCatalogDoesNotName(t *testing.T) {
+	_, c, _ := newGuardInstance(t)
+	ctx := context.Background()
+	pgExecAll(t, c, "create role imp_owner", "create schema s1", "create table s1.a (id int primary key)", "create table s1.b (id int primary key)",
+		"create table s1.c (id int, v int, check (v > 0))", "alter table s1.a owner to imp_owner", "alter table s1.b owner to imp_owner", "alter table s1.c owner to imp_owner")
+	cases := []struct {
+		name  string
+		known map[string]bool
+		extra string
+		ok    bool
+	}{
+		{"every table named", map[string]bool{"a": true, "b": true, "c": true}, "", true},
+		{"a table that the catalog does not name", map[string]bool{"a": true, "c": true}, "", false},
+		{"a view in the schema", map[string]bool{"a": true, "b": true, "c": true}, "create view s1.v as select 1", false},
+		{"a table that holds code of the role", map[string]bool{"a": true, "b": true, "c": true, "d": true}, "create function public.chk(int) returns boolean language sql immutable as 'select true'; alter function public.chk(int) owner to imp_owner; create table s1.d (id int, v int, check (public.chk(v))); alter table s1.d owner to imp_owner", false},
+	}
+	for _, tc := range cases {
+		tx, err := c.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tc.extra != "" {
+			if _, err := tx.Exec(ctx, tc.extra); err != nil {
+				t.Fatal(err)
+			}
+		}
+		err = lockSchemaTables(ctx, tx, "s1", tc.known, "imp_owner", map[string]string{})
+		_ = tx.Rollback(ctx)
+		if (err == nil) != tc.ok {
+			t.Errorf("%s: %v, want ok=%v", tc.name, err, tc.ok)
+		}
 	}
 }

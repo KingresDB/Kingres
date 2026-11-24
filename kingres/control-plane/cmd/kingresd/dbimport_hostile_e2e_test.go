@@ -319,14 +319,14 @@ func TestDatabaseImportWithdrawsTheAccessOfTheRole(t *testing.T) {
 		results[step] = "connected"
 	}
 	var taskID string
-	ops.ImportHook = func(ctx context.Context, step string) error {
+	ops.ImportHook = func(ctx context.Context, step, private string) error {
 		mu.Lock()
 		id := taskID
 		mu.Unlock()
 		if id == "" || (step != "Create the tables" && step != "Distribute the tables" && step != "Create the views" && step != "Load the data" && step != "Enable the ledger and the policies" && step != "Verify") {
 			return nil
 		}
-		try(step, ops.ImportPrivateName())
+		try(step, private)
 		return nil
 	}
 	defer func() { ops.ImportHook = nil }()
@@ -393,7 +393,7 @@ func TestDatabaseImportCleansUp(t *testing.T) {
 	reached := make(chan struct{})
 	release := make(chan struct{})
 	var once sync.Once
-	ops.ImportHook = func(ctx context.Context, step string) error {
+	ops.ImportHook = func(ctx context.Context, step, private string) error {
 		if step == "Load the data" {
 			once.Do(func() { close(reached) })
 			select {
@@ -453,9 +453,9 @@ func TestDatabaseImportNeverUsesADatabaseItDidNotMake(t *testing.T) {
 	defer func() { _ = sc.Close(context.Background()) }()
 	defer func() { ops.ImportHook = nil }()
 	// 1. The private name exists already (made by the service role's own hand here, without the marker of a task).
-	ops.ImportHook = func(ctx context.Context, step string) error {
+	ops.ImportHook = func(ctx context.Context, step, private string) error {
 		if step == "Create the private database" {
-			made = ops.ImportPrivateName()
+			made = private
 			if _, err := sc.Exec(ctx, "create database "+made); err != nil {
 				return err
 			}
@@ -482,7 +482,7 @@ func TestDatabaseImportNeverUsesADatabaseItDidNotMake(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 2. The final name is taken after the work was done and before the name is taken.
-	ops.ImportHook = func(ctx context.Context, step string) error {
+	ops.ImportHook = func(ctx context.Context, step, private string) error {
 		if step == "Take the final name" {
 			if _, err := sc.Exec(ctx, "create database dbnever_b"); err != nil {
 				return err
