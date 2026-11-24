@@ -587,21 +587,30 @@ func stuckStacks(log string) string {
 
 // The old primary's server forgets the leader it last verified once its instance has been stopped for a while (60 s): its instance cannot read the
 // catalog, so every leader call to it was answered "the instance waits for its group lease", and the last step of the switchover ("Lift the freeze"),
-// which comes before the rebuild that starts that instance, waited for it until the task ran into its bound. The fault `leader:forget` makes the server
-// forget at once, so that the race does not depend on how long the steps take: the switchover ends done, because the calls to the old server after the
-// promotion (the state, the end of the hold, the end of the freeze) are accepted from the server that the other members name as the leader.
+// which comes before the rebuild that starts that instance, waited for it until the task ran into its bound. The task is paused before that step, the
+// fault `leader:forget` makes the old server forget at once (so that the race does not depend on how long the steps take), and the task goes on: it
+// ends done, because the calls to the old server after the promotion (the state, the end of the hold, the end of the freeze) are accepted from the
+// server that the other members name as the leader.
 func TestSwitchoverEndsWhenTheOldServerForgotTheLeader(t *testing.T) {
 	e := swCluster(t)
 	c, port, pool, leader, g, old, nw, w := e.c, e.port, e.pool, e.leader, e.g, e.old, e.nw, e.w
-	old.SetFaults(fault.Spec{FailoverPoint: "leader:forget", FailoverMode: "forget"})
+	leader.SetFaults(fault.Spec{FailoverPoint: fmt.Sprintf("Group %d: %s:before", g, failover.StepUnfreeze), FailoverMode: "pause"})
 	id := swRequest(t, leader, old, nw, g)
-	swWait(t, e, id, 4*time.Minute)
+	task := foWaitTask(t, leader, id, 8*time.Minute, "paused", "failed", "done")
+	if task["state"] != "paused" {
+		t.Fatalf("the task did not pause before the end of the freeze: %v", task)
+	}
+	old.SetFaults(fault.Spec{FailoverPoint: "leader:forget", FailoverMode: "forget"})
+	leader.Heal()
+	st, resp := leader.DoThroughRestart("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "graceful", "shardGroupIds": []int{g}}, nil)
+	if st != 202 && st != 200 {
+		t.Fatalf("the repeated request: %d %v", st, resp)
+	}
+	swWait(t, e, id, 3*time.Minute)
 	if host := swPrimaryHost(t, leader, g); host != nw.Host {
 		t.Fatalf("the primary of group %d is on %s, want %s", g, host, nw.Host)
 	}
-	if strings.Contains(leader.LogTail(200000), "was still waiting for its group lease") {
-		t.Errorf("the leader gave up waiting for the old server's lease")
-	}
+	old.Heal()
 	before := w.count()
 	until(t, 2*time.Minute, "writes after the switchover", func() bool { return w.count() > before+30 })
 	acked := w.Stop()
