@@ -13,6 +13,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/archive"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/archive/archivetest"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/clustertest"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fault"
 )
 
@@ -506,6 +507,14 @@ func TestDatabaseImportAfterTheFailoverOfTheLeader(t *testing.T) {
 				return s != 200
 			})
 			foKillServer(old)
+			defer func() {
+				if t.Failed() {
+					_, fs := other.Do("GET", "/failover", nil, nil)
+					t.Logf("failover status on %s: %v", other.Host, fs)
+					t.Logf("log of %s: %s", cand.Host, quietLog(cand.LogTail(30000)))
+					t.Logf("log of %s: %s", other.Host, quietLog(other.LogTail(30000)))
+				}
+			}()
 			mapLogin(t, other)
 			var st int
 			var resp map[string]any
@@ -518,16 +527,23 @@ func TestDatabaseImportAfterTheFailoverOfTheLeader(t *testing.T) {
 			}
 			mapLogin(t, cand)
 			e.adm[other], e.adm[cand] = other.Token, cand.Token
-			var fid any
-			until(t, 10*time.Minute, "the task of the failover to be recorded", func() bool {
-				s, body := cand.Do("GET", "/failover", nil, nil)
-				if s == 200 && body["taskId"] != nil {
-					fid = body["taskId"]
+			// The task of the failover is recorded on the new leader once the map group is promoted (it may be over by the time it is looked for).
+			var ft map[string]any
+			until(t, 15*time.Minute, "the task of the failover of the map group to end on the new leader", func() bool {
+				s, body := cand.Do("GET", "/tasks?kind="+failover.KindFailover+"&limit=1", nil, nil)
+				items := anyList(body["items"])
+				if s != 200 || len(items) == 0 {
+					return false
+				}
+				if it, _ := items[0].(map[string]any); it["state"] == "done" || it["state"] == "failed" {
+					ft = it
 					return true
 				}
 				return false
 			})
-			cand.WaitTaskDone(fid, 12*time.Minute)
+			if ft["state"] != "done" {
+				t.Fatalf("the failover of the map group ended %v: %v", ft["state"], ft["error"])
+			}
 			var res map[string]any
 			defer func() {
 				if t.Failed() {
