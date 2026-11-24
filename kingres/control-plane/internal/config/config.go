@@ -497,6 +497,10 @@ func (c *Config) Validate() error {
 	if err := c.HA.validate(); err != nil {
 		errs = append(errs, err)
 	}
+	// The first port tried for a standby is standby-port-base, or pg-port plus 1000 when it is not set: the end must not lie below it.
+	if base := c.HA.EffectiveStandbyPortBase(c.PGPort); c.HA.StandbyPortEnd != 0 && c.HA.StandbyPortEnd < base {
+		errs = append(errs, fmt.Errorf("standby-port-end %d is below the first standby port %d (standby-port-base, or pg-port plus 1000)", c.HA.StandbyPortEnd, base))
+	}
 	return errors.Join(errs...)
 }
 

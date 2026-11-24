@@ -115,7 +115,11 @@ func New(t testing.TB, n int) *Cluster {
 			Dir: dir, DataDir: filepath.Join(dir, "data"), LogFile: filepath.Join(dir, "kingresd.log"),
 			client: &http.Client{Timeout: 3 * time.Minute, Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}} //nolint:gosec // the node under test, on loopback
 		nd.IntPort = nd.APIPort + 1
-		nd.StandbyBase, nd.StandbyEnd, _ = pgtest.StandbyPortRange(i, n)
+		var rangeOK bool
+		nd.StandbyBase, nd.StandbyEnd, rangeOK = pgtest.StandbyPortRange(i, n)
+		if !rangeOK && (os.Getenv("KINGRES_TEST_STANDBY_PORT_BASE") != "" || os.Getenv("KINGRES_TEST_STANDBY_PORT_END") != "") {
+			t.Logf("WARNING: node %d: the standby port range %s-%s of this run cannot be split into %d parts; kingresd's default (pg-port plus 1000) is used and can collide with another run", i, os.Getenv("KINGRES_TEST_STANDBY_PORT_BASE"), os.Getenv("KINGRES_TEST_STANDBY_PORT_END"), n)
+		}
 		if err := os.MkdirAll(dir, 0o700); err != nil { //nolint:gosec // a directory of the test root
 			t.Fatal(err)
 		}

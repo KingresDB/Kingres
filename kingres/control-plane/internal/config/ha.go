@@ -80,6 +80,14 @@ func DefaultHA() HAConfig {
 	}
 }
 
+// EffectiveStandbyPortBase is the first port tried for a new standby instance: StandbyPortBase, or pgPort plus 1000.
+func (h HAConfig) EffectiveStandbyPortBase(pgPort int) int {
+	if h.StandbyPortBase != 0 {
+		return h.StandbyPortBase
+	}
+	return pgPort + 1000
+}
+
 func (h HAConfig) validate() error {
 	var errs []error
 	if h.SuspectTimeout >= h.FailureTimeout {

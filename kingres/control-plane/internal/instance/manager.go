@@ -89,6 +89,8 @@ type Manager struct {
 	gate                func(id int) error
 	// runner replaces the execution of the PostgreSQL programs in a test (nil: run them).
 	runner func(ctx context.Context, prog string, args ...string) (string, error)
+	// afterPortStep ends setStandbyPort after a step in a test, as a crash would (nil: never).
+	afterPortStep func(step string) error
 }
 
 // New validates the options and returns a Manager.
@@ -355,12 +357,21 @@ func (m *Manager) start(ctx context.Context, id int) error {
 		return err
 	}
 	if up, err := m.Running(ctx, id); err != nil || up {
+		if err == nil {
+			// Found running (a start whose pg_ctl -w ran out of time, but whose postmaster went on): it bound its port, so the
+			// port is not provisional any more.
+			m.clearNeverStarted(id)
+		}
 		return err
 	}
 	if m.gate != nil {
 		if err := m.gate(id); err != nil {
 			return err
 		}
+	}
+	// A change of the port of a standby that never ran may have been cut short: the files follow the marker before the start.
+	if err := m.reconcileStandbyPort(id); err != nil {
+		return err
 	}
 	// The socket directory may be gone (a reboot empties /run): it is created
 	// before every start, not only when the instance is created.
@@ -626,7 +637,7 @@ func startupLogSince(path string, from int64) (tail string, bind bool) {
 	n, _ := f.ReadAt(b, off)
 	b = b[:n]
 	text := string(b)
-	bind = strings.Contains(text, "Address already in use") || strings.Contains(text, "could not bind")
+	bind = bindFailure(text)
 	if len(b) > keep {
 		text = string(b[len(b)-keep:])
 	}

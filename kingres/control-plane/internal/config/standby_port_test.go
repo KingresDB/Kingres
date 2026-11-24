@@ -28,3 +28,19 @@ func TestStandbyPortRange(t *testing.T) {
 		t.Fatalf("an end below the base is refused: %v", err)
 	}
 }
+
+func TestStandbyPortEndIsCheckedAgainstTheEffectiveBase(t *testing.T) {
+	// No base: the first port is pg-port plus 1000 (5432 + 1000 = 6432 by default).
+	if _, err := Load([]string{"-standby-port-end", "6000"}, envOf(nil), &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "standby-port-end") {
+		t.Fatalf("an end below pg-port plus 1000 is refused: %v", err)
+	}
+	if _, err := Load([]string{"-standby-port-end", "6432"}, envOf(nil), &bytes.Buffer{}); err != nil {
+		t.Fatalf("the end may equal the first port: %v", err)
+	}
+	if _, err := Load([]string{"-pg-port", "20000", "-standby-port-end", "21000"}, envOf(nil), &bytes.Buffer{}); err != nil {
+		t.Fatalf("%v", err)
+	}
+	if _, err := Load([]string{"-pg-port", "20000", "-standby-port-end", "20999"}, envOf(nil), &bytes.Buffer{}); err == nil {
+		t.Fatal("an end below the other server's pg-port plus 1000 is refused")
+	}
+}

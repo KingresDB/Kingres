@@ -285,6 +285,12 @@ func (a *Agent) superviseStandbys(ctx context.Context) {
 			}
 			continue
 		}
+		// Running or not, the port in the meta file is the port of the instance.
+		if ne, merr := a.reconcileMetaPort(id, e); merr != nil {
+			a.Log.Warn("standby: recording the port of a standby", "group", e.Group, "error", merr)
+		} else {
+			e = ne
+		}
 		up, err := a.mgr().Running(ctx, id)
 		if err != nil {
 			continue
@@ -473,16 +479,33 @@ func (a *Agent) LockLifecycle(ctx context.Context) (unlock func(), err error) {
 // not be bound (another program took it) is given another port once by the instance manager; the standby's meta file
 // is written with the port the instance has afterwards, whether or not the start worked, before anything reports it.
 func (a *Agent) startStandbyInstance(ctx context.Context, id int, e Entry) error {
-	before, _ := a.mgr().Managed(id)
 	err := a.mgr().StartStandby(ctx, id, a.freePort)
-	if mk, merr := a.mgr().Managed(id); merr == nil && mk.Port != before.Port && mk.Port != 0 {
-		e.Port = mk.Port
-		if werr := a.writeMeta(id, e); werr != nil {
-			a.Log.Error("standby: recording the new port of a standby", "group", e.Group, "port", mk.Port, "error", werr)
-			if err == nil {
-				err = werr
-			}
-		}
+	// The marker has the port the instance has: the meta file follows it, whether or not the start worked.
+	if _, werr := a.reconcileMetaPort(id, e); werr != nil && err == nil {
+		err = werr
 	}
 	return err
+}
+
+// reconcileMetaPort makes the port in the meta file of a standby the port of its marker (instance.Manager.Managed), which
+// is the authority: a re-pick of the port, a crash in the middle of it, or an older version may have left the two apart.
+// It returns the entry with the port the instance has.
+func (a *Agent) reconcileMetaPort(id int, e Entry) (Entry, error) {
+	return syncMetaPort(func() (int, bool) {
+		mk, err := a.mgr().Managed(id)
+		return mk.Port, err == nil
+	}, id, e, a.writeMeta)
+}
+
+// syncMetaPort is reconcileMetaPort with the marker's port (and whether there is a marker) given by portOf.
+func syncMetaPort(portOf func() (int, bool), id int, e Entry, write func(int, Entry) error) (Entry, error) {
+	port, ok := portOf()
+	if !ok || port == 0 || port == e.Port {
+		return e, nil
+	}
+	e.Port = port
+	if err := write(id, e); err != nil {
+		return e, fmt.Errorf("standby: recording the port %d of a standby: %w", port, err)
+	}
+	return e, nil
 }
