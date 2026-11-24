@@ -174,7 +174,8 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	if err != nil {
 		return fmt.Errorf("preparing instance management: %w", err)
 	}
-	svc.SetExtensionSkippedHandler(raiseExtensionSkipped(svc, serverHost, log))
+	svc.SetExtensionSkippedHandler(raiseExtensionSkipped(serviceAlertSys(svc), serverHost, log))
+	svc.SetExtensionAppliedHandler(clearExtensionSkipped(serviceAlertSys(svc), serverHost, log))
 	if svc.Enabled() {
 		// An instance that fenced itself (its group lease was lost) is not started as a
 		// primary again until the lease manager holds a lease (package lease).

@@ -34,14 +34,21 @@ type extTarget interface {
 // together: the extensions that the package of this server lacks in one message, a schema that exists with another owner than on the leader, a failed
 // statement. pg_stat_statements that the package lacks is only a warning, as when a database is made on a server with an older package.
 func applyExtensions(ctx context.Context, log *slog.Logger, t extTarget, d wire.DatabaseSpec) error {
-	return applyExtensionsSkipping(ctx, log, t, d, nil)
+	return applyExtensionsSkipping(ctx, log, t, d, extHooks{})
+}
+
+// extHooks are the callbacks of applyExtensionsSkipping, each of which may be nil: skipped is called with an extension that is left out and why, applied with an
+// extension that is installed (or was already). The service raises the alert extensionSkipped from the first and clears it from the second.
+type extHooks struct {
+	skipped func(ext, reason string)
+	applied func(ext string)
 }
 
 // applyExtensionsSkipping is applyExtensions with a callback for an extension that is left out because of something in the database that the operator must look at
-// (skipped may be nil). A cluster operation never fails for what a tenant did in its own database: the schema of an extension that exists on this server with
+// (each hook may be nil). A cluster operation never fails for what a tenant did in its own database: the schema of an extension that exists on this server with
 // another owner than on the leader (the owner of a database can make itself the owner of a schema, public among them) is not compared for public and pg_catalog, and
 // elsewhere it skips that extension, logs it and calls skipped, which raises the alert.
-func applyExtensionsSkipping(ctx context.Context, log *slog.Logger, t extTarget, d wire.DatabaseSpec, skipped func(ext, reason string)) error {
+func applyExtensionsSkipping(ctx context.Context, log *slog.Logger, t extTarget, d wire.DatabaseSpec, h extHooks) error {
 	avail, err := t.Available(ctx)
 	if err != nil {
 		return err
@@ -81,14 +88,16 @@ func applyExtensionsSkipping(ctx context.Context, log *slog.Logger, t extTarget,
 				reason := fmt.Sprintf("schema %s of extension %s is owned by %s on this server and by %s on the leader; the extension is not installed in this database here until the owner is the same",
 					truncName(place.Schema), truncName(e), truncName(owner), truncName(place.Owner))
 				log.Warn("an extension of a database is skipped", "database", d.Name, "extension", e, "reason", reason)
-				if skipped != nil {
-					skipped(e, reason)
+				if h.skipped != nil {
+					h.skipped(e, reason)
 				}
 				continue
 			}
 		}
 		if err := t.Run(ctx, stmts); err != nil {
 			errs = append(errs, fmt.Errorf("installing extension %s failed", truncName(e)))
+		} else if h.applied != nil {
+			h.applied(e)
 		}
 	}
 	if len(missing) > 0 {

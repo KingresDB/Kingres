@@ -97,6 +97,8 @@ type Service struct {
 	dsnSinks []func(dsn string) error
 	// onExtSkipped is called when an extension of a database is left out on this server (see applyExtensionsSkipping).
 	onExtSkipped func(ctx context.Context, database, extension, reason string)
+	// onExtApplied is called when an extension of a database is installed on this server (or was).
+	onExtApplied func(ctx context.Context, database, extension string)
 	// catalogPrimaries is what the last SyncRoles read: the TCP ports of this server's primary rows of the catalog,
 	// by group (roles.go, Unattributed).
 	catalogPrimaries map[int32][]int
@@ -472,4 +474,17 @@ func (s *Service) extSkipped() func(ctx context.Context, database, extension, re
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.onExtSkipped
+}
+
+// SetExtensionAppliedHandler sets what is called when an extension of a database is installed on this server (the handler clears the alert of an earlier skip).
+func (s *Service) SetExtensionAppliedHandler(h func(ctx context.Context, database, extension string)) {
+	s.mu.Lock()
+	s.onExtApplied = h
+	s.mu.Unlock()
+}
+
+func (s *Service) extApplied() func(ctx context.Context, database, extension string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.onExtApplied
 }

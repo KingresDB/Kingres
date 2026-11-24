@@ -495,7 +495,11 @@ func (o *Ops) dropDB(ctx context.Context, p dropParams) error {
 	var err2 error
 	for attempt := 0; attempt < 6; attempt++ {
 		err2 = run(ctx, c, stmt().Text("DROP DATABASE IF EXISTS").ID(sqlx.MustIdent(p.Name)).Text("WITH (FORCE)"))
-		if err2 == nil || !strings.Contains(err2.Error(), "55006") {
+		if err2 == nil {
+			o.clearSkippedExtensionAlerts(ctx, p.Name)
+			return nil
+		}
+		if !strings.Contains(err2.Error(), "55006") {
 			return err2
 		}
 		select {
@@ -673,4 +677,15 @@ func (o *Ops) stepDropOn(ctx context.Context, env *task.Env, server string) erro
 		return err
 	}
 	return o.Fanout.Apply(ctx, server, ApplyDatabaseDrop, p)
+}
+
+// clearSkippedExtensionAlerts clears the alerts extensionSkipped of a database that is gone, on this server (every server drops the database and clears its own).
+func (o *Ops) clearSkippedExtensionAlerts(ctx context.Context, database string) {
+	err := o.asService(ctx, sysdb.Database, func(tx pgx.Tx) error {
+		_, e := tx.Exec(ctx, `UPDATE kingres_cp.alert SET cleared_at = now() WHERE kind = $1 AND cleared_at IS NULL AND split_part(subject, '|database:', 2) = $2`, sysdb.AlertExtensionSkipped, database)
+		return e
+	})
+	if err != nil && o.Log != nil {
+		o.Log.Warn("the alerts of the skipped extensions of a dropped database could not be cleared", "database", database, "error", err)
+	}
 }

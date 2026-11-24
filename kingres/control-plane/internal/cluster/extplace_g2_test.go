@@ -18,7 +18,7 @@ func TestApplyExtensionsIgnoresTheOwnerOfPublic(t *testing.T) {
 	ft := &fakeTarget{avail: map[string]bool{"pg_stat_statements": true}, schemas: map[string]string{"public": "tenant"}}
 	d := wire.DatabaseSpec{Name: "db", Extensions: []string{"pg_stat_statements"}, ExtensionPlaces: map[string]wire.ExtensionPlace{"pg_stat_statements": {Schema: "public", Owner: "pg_database_owner"}}}
 	called := false
-	if err := applyExtensionsSkipping(context.Background(), log, ft, d, func(string, string) { called = true }); err != nil {
+	if err := applyExtensionsSkipping(context.Background(), log, ft, d, extHooks{skipped: func(string, string) { called = true }}); err != nil {
 		t.Fatalf("a tenant-owned public schema fails the operation: %v", err)
 	}
 	if called || len(ft.ran) != 1 || len(ft.ran[0]) != 1 || !strings.Contains(ft.ran[0][0], `SCHEMA "public"`) {
@@ -41,5 +41,18 @@ func TestApplyExtensionsRefusesAReservedSchema(t *testing.T) {
 	d := wire.DatabaseSpec{Name: "db", Extensions: []string{"kingres_columnar"}, ExtensionPlaces: map[string]wire.ExtensionPlace{"kingres_columnar": {Schema: "kingres", Owner: "o"}}}
 	if err := applyExtensions(context.Background(), log, ft, d); err != nil || len(ft.ran) != 1 {
 		t.Errorf("kingres_columnar: %v %q", err, ft.ran)
+	}
+}
+
+// The hook of an applied extension is called for every extension that is installed, and not for one that is skipped.
+func TestApplyExtensionsCallsTheAppliedHook(t *testing.T) {
+	log, _ := quietLog()
+	ft := &fakeTarget{avail: map[string]bool{"pgcrypto": true, "hstore": true, "citext": true}, schemas: map[string]string{"x": "intruder"}, failOn: "citext"}
+	d := wire.DatabaseSpec{Name: "db", Extensions: []string{"citext", "hstore", "pgcrypto"}, ExtensionPlaces: map[string]wire.ExtensionPlace{
+		"pgcrypto": {Schema: "x", Owner: "o"}, "hstore": {Schema: "y", Owner: "o"}, "citext": {Schema: "z", Owner: "o"}}}
+	var applied, skipped []string
+	_ = applyExtensionsSkipping(context.Background(), log, ft, d, extHooks{applied: func(e string) { applied = append(applied, e) }, skipped: func(e, _ string) { skipped = append(skipped, e) }})
+	if strings.Join(applied, ",") != "hstore" || strings.Join(skipped, ",") != "pgcrypto" {
+		t.Errorf("applied %v, skipped %v (citext fails, pgcrypto is skipped)", applied, skipped)
 	}
 }

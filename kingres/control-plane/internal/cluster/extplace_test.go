@@ -139,7 +139,7 @@ func TestApplyExtensionsRefusesASchemaOfAnotherOwner(t *testing.T) {
 	d := wire.DatabaseSpec{Name: "db", Extensions: []string{"hstore", "pgcrypto"}, ExtensionPlaces: map[string]wire.ExtensionPlace{
 		"pgcrypto": {Schema: "x", Owner: "o"}, "hstore": {Schema: "y", Owner: "o"}}}
 	var skippedExt, skippedWhy string
-	err := applyExtensionsSkipping(context.Background(), log, ft, d, func(e, why string) { skippedExt, skippedWhy = e, why })
+	err := applyExtensionsSkipping(context.Background(), log, ft, d, extHooks{skipped: func(e, why string) { skippedExt, skippedWhy = e, why }})
 	if err != nil {
 		t.Fatalf("a schema that a tenant made its own fails the operation: %v", err)
 	}
