@@ -34,6 +34,14 @@ type extTarget interface {
 // together: the extensions that the package of this server lacks in one message, a schema that exists with another owner than on the leader, a failed
 // statement. pg_stat_statements that the package lacks is only a warning, as when a database is made on a server with an older package.
 func applyExtensions(ctx context.Context, log *slog.Logger, t extTarget, d wire.DatabaseSpec) error {
+	return applyExtensionsSkipping(ctx, log, t, d, nil)
+}
+
+// applyExtensionsSkipping is applyExtensions with a callback for an extension that is left out because of something in the database that the operator must look at
+// (skipped may be nil). A cluster operation never fails for what a tenant did in its own database: the schema of an extension that exists on this server with
+// another owner than on the leader (the owner of a database can make itself the owner of a schema, public among them) is not compared for public and pg_catalog, and
+// elsewhere it skips that extension, logs it and calls skipped, which raises the alert.
+func applyExtensionsSkipping(ctx context.Context, log *slog.Logger, t extTarget, d wire.DatabaseSpec, skipped func(ext, reason string)) error {
 	avail, err := t.Available(ctx)
 	if err != nil {
 		return err
@@ -70,8 +78,12 @@ func applyExtensions(ctx context.Context, log *slog.Logger, t extTarget, d wire.
 				continue
 			}
 			if exists && place.Owner != "" && owner != place.Owner {
-				errs = append(errs, fmt.Errorf("schema %s of extension %s is owned by %s on this server and by %s on the leader: make the owner the same, then add the server again",
-					truncName(place.Schema), truncName(e), truncName(owner), truncName(place.Owner)))
+				reason := fmt.Sprintf("schema %s of extension %s is owned by %s on this server and by %s on the leader; the extension is not installed in this database here until the owner is the same",
+					truncName(place.Schema), truncName(e), truncName(owner), truncName(place.Owner))
+				log.Warn("an extension of a database is skipped", "database", d.Name, "extension", e, "reason", reason)
+				if skipped != nil {
+					skipped(e, reason)
+				}
 				continue
 			}
 		}
@@ -107,6 +119,14 @@ func extensionStatements(e string, place wire.ExtensionPlace, known, fixed bool)
 	if err != nil {
 		return nil, errors.New("invalid schema name")
 	}
+	// kingres and kingres_* are the schemas of KingresDB: only its own extensions are in them (and they make the schema themselves).
+	if reservedSchema(place.Schema) && !strings.HasPrefix(e, "kingres_") {
+		return nil, fmt.Errorf("extension %s cannot be installed in the schema %s, which KingresDB keeps for itself", truncName(e), truncName(place.Schema))
+	}
+	// public is there in every database and belongs to whoever the database owner made it belong to: it is neither made nor compared.
+	if place.Schema == "public" {
+		return []*sqlx.Builder{create.Text("SCHEMA").ID(sch)}, nil
+	}
 	mk := new(sqlx.Builder).Text("CREATE SCHEMA IF NOT EXISTS").ID(sch)
 	if place.Owner != "" {
 		owner, err := sqlx.NewIdent(place.Owner)
@@ -116,6 +136,12 @@ func extensionStatements(e string, place wire.ExtensionPlace, known, fixed bool)
 		mk.Text("AUTHORIZATION").ID(owner)
 	}
 	return []*sqlx.Builder{mk, create.Text("SCHEMA").ID(sch)}, nil
+}
+
+// reservedSchema says whether the schema name is one that KingresDB keeps for itself.
+func reservedSchema(s string) bool {
+	l := strings.ToLower(s)
+	return l == "kingres" || strings.HasPrefix(l, "kingres_")
 }
 
 // pgTarget is the extTarget of a connection to the database.

@@ -61,7 +61,7 @@ func TestExtensionStatementsWithoutAClause(t *testing.T) {
 		}
 	}
 	got := buildAll(t, "pg_stat_statements", wire.ExtensionPlace{Schema: "public"}, true, false)
-	if len(got) != 2 || got[1] != `CREATE EXTENSION IF NOT EXISTS "pg_stat_statements" SCHEMA "public"` {
+	if len(got) != 1 || got[0] != `CREATE EXTENSION IF NOT EXISTS "pg_stat_statements" SCHEMA "public"` {
 		t.Errorf("public without owner: %q", got)
 	}
 }
@@ -70,7 +70,7 @@ func TestExtensionStatementsWithoutAClause(t *testing.T) {
 // another extension is made without a clause, as before.
 func TestExtensionStatementsForALeaderThatSendsNoPlaces(t *testing.T) {
 	got := buildAll(t, "pg_stat_statements", wire.ExtensionPlace{}, false, false)
-	if len(got) != 2 || got[1] != `CREATE EXTENSION IF NOT EXISTS "pg_stat_statements" SCHEMA "public"` {
+	if len(got) != 1 || got[0] != `CREATE EXTENSION IF NOT EXISTS "pg_stat_statements" SCHEMA "public"` {
 		t.Errorf("pg_stat_statements: %q", got)
 	}
 	if got := buildAll(t, "pgcrypto", wire.ExtensionPlace{}, false, false); len(got) != 1 || got[0] != `CREATE EXTENSION IF NOT EXISTS "pgcrypto"` {
@@ -126,20 +126,25 @@ func TestApplyExtensionsFollowsTheLeader(t *testing.T) {
 		t.Fatal(err)
 	}
 	// one Run per extension (a schema and its extension together), kingres_shard left to add_node, the fixed one without a schema
-	if len(ft.ran) != 3 || len(ft.ran[0]) != 1 || len(ft.ran[1]) != 2 || len(ft.ran[2]) != 2 {
+	if len(ft.ran) != 3 || len(ft.ran[0]) != 1 || len(ft.ran[1]) != 1 || len(ft.ran[2]) != 2 {
 		t.Fatalf("ran %q", ft.ran)
 	}
 }
 
-// A schema that exists on this server with another owner than on the leader is refused, naming both; the other extensions are still installed.
+// A schema that exists on this server with another owner than on the leader skips that extension (logged, reported to the handler of the alert) and never fails
+// the operation; the other extensions are still installed.
 func TestApplyExtensionsRefusesASchemaOfAnotherOwner(t *testing.T) {
 	log, _ := quietLog()
 	ft := &fakeTarget{avail: map[string]bool{"pgcrypto": true, "hstore": true}, schemas: map[string]string{"x": "intruder"}}
 	d := wire.DatabaseSpec{Name: "db", Extensions: []string{"hstore", "pgcrypto"}, ExtensionPlaces: map[string]wire.ExtensionPlace{
 		"pgcrypto": {Schema: "x", Owner: "o"}, "hstore": {Schema: "y", Owner: "o"}}}
-	err := applyExtensions(context.Background(), log, ft, d)
-	if err == nil || !strings.Contains(err.Error(), "owned by intruder on this server and by o on the leader") {
-		t.Fatalf("error %v", err)
+	var skippedExt, skippedWhy string
+	err := applyExtensionsSkipping(context.Background(), log, ft, d, func(e, why string) { skippedExt, skippedWhy = e, why })
+	if err != nil {
+		t.Fatalf("a schema that a tenant made its own fails the operation: %v", err)
+	}
+	if skippedExt != "pgcrypto" || !strings.Contains(skippedWhy, "owned by intruder on this server and by o on the leader") {
+		t.Errorf("skipped %q: %q", skippedExt, skippedWhy)
 	}
 	if len(ft.ran) != 1 || !strings.Contains(ft.ran[0][1], `"hstore"`) {
 		t.Errorf("ran %q", ft.ran)

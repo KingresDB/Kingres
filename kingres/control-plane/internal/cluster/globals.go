@@ -437,7 +437,11 @@ func (s *Service) applyDatabase(ctx context.Context, id int, c *pgx.Conn, d wire
 			}
 		}
 	}
-	return applyExtensions(ctx, s.log, pgTarget{dc}, d)
+	var skipped func(ext, reason string)
+	if h := s.extSkipped(); h != nil {
+		skipped = func(ext, reason string) { h(ctx, d.Name, ext, reason) }
+	}
+	return applyExtensionsSkipping(ctx, s.log, pgTarget{dc}, d, skipped)
 }
 
 // ApplyGlobals applies roles, then databases.
