@@ -57,7 +57,7 @@
 //   ?analytics=<a>,<b>,...        0.18.0 (phase 12; combinable with a comma): on (approximate aggregates are on in shop) | timeseries (in shop: the table
 //                                 clicks that can be converted, and metrics, partitioned by day, with a policy, its runs and columnar partitions)
 //                                 | ahead-low (the same, with one day ahead and the alert partitionsAheadLow) | mixed (after timeseries: one partition of metrics is
-//                                 half converted, accessMethod mixed, contract 0.23.0) | sketch:missing|mismatch|hash
+//                                 half converted, accessMethod mixed, contract 0.25.0) | sketch:missing|mismatch|hash
 //                                 | columnar:missing | timepart:missing | convert:fail | run:lock|name|fail | publication
 //                                 | old (the 11 new operations answer 422 unsupported_operation)
 //   ?transfer=<a>,<b>,...         0.19.0 (the data transfer; combinable with a comma):

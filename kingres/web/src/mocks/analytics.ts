@@ -1299,7 +1299,7 @@ export function seedAggregatesOn(s: MockState): void {
 
 /**
  * `?analytics=mixed` (after `timeseries`): one partition of `metrics` that is half converted, as a distributed table shows one while a conversion of its
- * leaves is half done (contract 0.23.0: the access method of a partition is `mixed`). It is the third oldest, which is stored as rows otherwise.
+ * leaves is half done (contract 0.25.0: the access method of a partition is `mixed`). It is the third oldest, which is stored as rows otherwise.
  */
 export function seedMixedPartition(s: MockState): void {
   const rec = s.databases.find((d) => d.info.name === 'shop')

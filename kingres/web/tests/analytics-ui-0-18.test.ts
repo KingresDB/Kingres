@@ -367,7 +367,7 @@ describe('the table page: storage and partitions', () => {
     expect(list.getAllByRole('row').slice(1)).toHaveLength(8)
   })
 
-  it('a partition that is half converted is Mixed, and the format filter finds it (contract 0.23.0)', async () => {
+  it('a partition that is half converted is Mixed, and the format filter finds it (contract 0.25.0)', async () => {
     sw('analytics=timeseries,mixed')
     const user = userEvent.setup()
     await renderApp(table('metrics'))
