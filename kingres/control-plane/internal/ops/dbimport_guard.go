@@ -287,7 +287,27 @@ reach(classid, objid) AS (
          WHERE d.classid = r.classid AND d.objid = r.objid AND d.deptype <> 'e' AND d.refclassid <> 'pg_catalog.pg_extension'::pg_catalog.regclass
         UNION ALL
         SELECT 'pg_catalog.pg_constraint'::pg_catalog.regclass::pg_catalog.oid, c.oid FROM pg_catalog.pg_constraint c
-         WHERE r.classid = 'pg_catalog.pg_type'::pg_catalog.regclass::pg_catalog.oid AND c.contypid = r.objid) x(classid, objid))
+         WHERE r.classid = 'pg_catalog.pg_type'::pg_catalog.regclass::pg_catalog.oid AND c.contypid = r.objid
+        -- A composite type has no dependency record on the class row that holds its attributes: the row is reached here, and its attributes then lead to their types.
+        UNION ALL
+        SELECT 'pg_catalog.pg_class'::pg_catalog.regclass::pg_catalog.oid, ty.typrelid FROM pg_catalog.pg_type ty
+         WHERE r.classid = 'pg_catalog.pg_type'::pg_catalog.regclass::pg_catalog.oid AND ty.oid = r.objid AND ty.typtype = 'c' AND ty.typrelid <> 0
+        -- An array reaches its element; a range reaches its subtype, its operator class and its canonical and difference functions; a multirange reaches its range.
+        UNION ALL
+        SELECT 'pg_catalog.pg_type'::pg_catalog.regclass::pg_catalog.oid, ty.typelem FROM pg_catalog.pg_type ty
+         WHERE r.classid = 'pg_catalog.pg_type'::pg_catalog.regclass::pg_catalog.oid AND ty.oid = r.objid AND ty.typelem <> 0
+        UNION ALL
+        SELECT 'pg_catalog.pg_type'::pg_catalog.regclass::pg_catalog.oid, g.rngsubtype FROM pg_catalog.pg_range g
+         WHERE r.classid = 'pg_catalog.pg_type'::pg_catalog.regclass::pg_catalog.oid AND g.rngtypid = r.objid
+        UNION ALL
+        SELECT 'pg_catalog.pg_type'::pg_catalog.regclass::pg_catalog.oid, g.rngtypid FROM pg_catalog.pg_range g
+         WHERE r.classid = 'pg_catalog.pg_type'::pg_catalog.regclass::pg_catalog.oid AND g.rngmultitypid = r.objid
+        UNION ALL
+        SELECT 'pg_catalog.pg_opclass'::pg_catalog.regclass::pg_catalog.oid, g.rngsubopc FROM pg_catalog.pg_range g
+         WHERE r.classid = 'pg_catalog.pg_type'::pg_catalog.regclass::pg_catalog.oid AND g.rngtypid = r.objid
+        UNION ALL
+        SELECT 'pg_catalog.pg_proc'::pg_catalog.regclass::pg_catalog.oid, f.fn FROM pg_catalog.pg_range g CROSS JOIN LATERAL (VALUES (g.rngcanonical::pg_catalog.oid), (g.rngsubdiff::pg_catalog.oid)) f(fn)
+         WHERE r.classid = 'pg_catalog.pg_type'::pg_catalog.regclass::pg_catalog.oid AND g.rngtypid = r.objid AND f.fn <> 0) x(classid, objid))
 SELECT pg_catalog.pg_describe_object(r.classid, r.objid, 0)
 FROM reach r
 WHERE r.objid <> 0 AND (`
@@ -334,4 +354,87 @@ func reachFinding(ctx context.Context, tx pgx.Tx, rel string) (string, error) {
 		return "", nil
 	}
 	return *what, nil
+}
+
+// ------------------------------------------------------------------ the tables of a schema, and the ledger
+
+// lockSchemaTables runs in a transaction of the service role, before a call of the extension that reads or moves every table of a schema (distribute_schema): it
+// lists every relation of the schema, refuses one that is not a table of the archive's catalog (the SQL of an archive may have made another) or that is not an
+// ordinary or partitioned table, locks and checks each of them (lockTrusted), and lists the schema again to see that nothing came in between.
+func lockSchemaTables(ctx context.Context, tx pgx.Tx, schema string, known map[string]bool, owner string, extSchema map[string]string) error {
+	list := func() ([]string, error) {
+		rows, err := tx.Query(ctx, `SELECT c.relname::pg_catalog.text, c.relkind::pg_catalog.text FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+			WHERE n.nspname = $1::pg_catalog.text AND c.relkind IN ('r', 'p', 'v', 'm', 'f') ORDER BY c.relname::pg_catalog.text`, schema)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var names []string
+		for rows.Next() {
+			var n, k string
+			if err := rows.Scan(&n, &k); err != nil {
+				return nil, err
+			}
+			if k != "r" && k != "p" {
+				return nil, fmt.Errorf("%s.%s is not an ordinary table, and the schema is distributed as it is", schema, n)
+			}
+			if !known[n] {
+				return nil, fmt.Errorf("%s.%s is not a table of the archive's catalog, and the schema is distributed as it is", schema, n)
+			}
+			names = append(names, n)
+		}
+		return names, rows.Err()
+	}
+	names, err := list()
+	if err != nil {
+		return &untrustedErr{err}
+	}
+	for _, n := range names {
+		if err := lockTrusted(ctx, tx, schema, n, owner, extSchema); err != nil {
+			return &untrustedErr{err}
+		}
+	}
+	again, err := list()
+	if err != nil {
+		return &untrustedErr{err}
+	}
+	if strings.Join(again, "\x00") != strings.Join(names, "\x00") {
+		return &untrustedErr{fmt.Errorf("the tables of schema %s changed while they were locked", schema)}
+	}
+	return nil
+}
+
+// ledgerVerifyLocked runs kingres.ledger_verify() in a transaction that has locked and checked every table that is registered with the ledger (lockTrusted: ACCESS
+// EXCLUSIVE, which also holds off a rename, a drop or a swap with a view; the ledger tables of the extension itself are not user tables and are not touched).
+// ledger_verify reads the rows of those tables and runs the output functions of their types, so what it reads must be what was checked. It returns the findings.
+func ledgerVerifyLocked(ctx context.Context, c *pgx.Conn, owner string, extSchema map[string]string) (int, error) {
+	var findings int
+	err := inTx(ctx, c, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT n.nspname::pg_catalog.text, c.relname::pg_catalog.text FROM kingres.ledger_table l JOIN pg_catalog.pg_class c ON c.oid = l.relid
+			JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+			WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.objid = c.oid AND d.deptype = 'e') ORDER BY 1, 2`)
+		if err != nil {
+			return err
+		}
+		var rels [][2]string
+		for rows.Next() {
+			var s, t string
+			if err := rows.Scan(&s, &t); err != nil {
+				rows.Close()
+				return err
+			}
+			rels = append(rels, [2]string{s, t})
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		for _, r := range rels {
+			if err := lockTrusted(ctx, tx, r[0], r[1], owner, extSchema); err != nil {
+				return &untrustedErr{err}
+			}
+		}
+		return tx.QueryRow(ctx, `SELECT pg_catalog.count(*)::pg_catalog.int4 FROM kingres.ledger_verify()`).Scan(&findings)
+	})
+	return findings, err
 }

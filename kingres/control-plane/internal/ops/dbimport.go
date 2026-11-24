@@ -31,7 +31,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 
 	"github.com/jackc/pgx/v5"
 
@@ -74,15 +73,6 @@ func privateName(taskID int64, nonce string) string {
 
 // private is the private name of the task with this id.
 func (p dbImportParams) private(taskID int64) string { return privateName(taskID, p.Nonce) }
-
-// lastPrivate is the private name of the step that ran last, for the tests that need to act on the database of a task (the hook of a test is called before the step).
-var lastPrivate atomic.Value
-
-// ImportPrivateName returns the private name that the last step of a database import ran for ("" before any).
-func ImportPrivateName() string {
-	s, _ := lastPrivate.Load().(string)
-	return s
-}
 
 // The limits of the plan of an import (design "Limits and timeouts"): the sizes of the statements are the grammar's (200 000 statements of at most 1 MiB).
 const (
@@ -377,7 +367,7 @@ func (o *Ops) dbImportDefinition() task.Definition {
 			}
 			steps = append(steps, o.perServer(p.Servers, "Create the private database on server %s", func(ctx context.Context, env *task.Env, s string) error {
 				if h := ImportHook; h != nil {
-					if err := h(ctx, "Create the private database on server "+s); err != nil {
+					if err := h(ctx, "Create the private database on server "+s, ""); err != nil {
 						return err
 					}
 				}
@@ -411,16 +401,18 @@ func (o *Ops) dbImportDefinition() task.Definition {
 	}
 }
 
-// ImportHook is called by a test at the start of each step of database.import (the name of the step); it may block, and an error ends the step.
-var ImportHook func(ctx context.Context, step string) error
+// ImportHook is called by a test at the start of each step of database.import (the name of the step and the private name of the task, empty for a step that runs
+// on one server); it may block, and an error ends the step.
+var ImportHook func(ctx context.Context, step, private string) error
 
 func importStep(name string, run func(ctx context.Context, env *task.Env) error) func(ctx context.Context, env *task.Env) error {
 	return xferStep(func(ctx context.Context, env *task.Env) error {
-		if p, err := inputOf[dbImportParams](env.Task); err == nil {
-			lastPrivate.Store(p.private(env.Task.ID))
-		}
 		if h := ImportHook; h != nil {
-			if err := h(ctx, name); err != nil {
+			private := ""
+			if p, err := inputOf[dbImportParams](env.Task); err == nil {
+				private = p.private(env.Task.ID)
+			}
+			if err := h(ctx, name, private); err != nil {
 				return err
 			}
 		}

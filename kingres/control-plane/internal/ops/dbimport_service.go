@@ -74,6 +74,8 @@ type importRenameOp struct {
 	// loses CONNECT again, so that the database is as the failure hook expects it.
 	Back   bool   `json:"back,omitempty"`
 	Marker string `json:"marker,omitempty"`
+	// Finish ends the rename once every server has taken the final name: the marker of the task, which stays on the final name until then, is removed. From is the final name.
+	Finish bool `json:"finish,omitempty"`
 }
 
 // applyImportKind runs the kinds of this file for ApplyLocal; it reports whether the kind was one of them.
@@ -318,14 +320,17 @@ func (o *Ops) stepIMDistribute(ctx context.Context, env *task.Env) error {
 		if done {
 			continue
 		}
-		// Every table of the schema is locked and verified, in one transaction, before the extension reads or moves it.
+		// Every relation of the schema is listed, locked and verified, in one transaction, before the extension reads or moves it; a table that the catalog of
+		// the archive does not name is refused.
+		known := map[string]bool{}
+		for _, ct := range cat.Tables {
+			if ct.Schema == ds.Schema {
+				known[ct.Name] = true
+			}
+		}
 		if err := inTx(ctx, c, func(tx pgx.Tx) error {
-			for _, ct := range cat.Tables {
-				if ct.Schema == ds.Schema && ct.TreeRole != "leaf" {
-					if err := lockTrusted(ctx, tx, ct.Schema, ct.Name, p.Owner.Name, extSchema); err != nil {
-						return &untrustedErr{err}
-					}
-				}
+			if err := lockSchemaTables(ctx, tx, ds.Schema, known, p.Owner.Name, extSchema); err != nil {
+				return err
 			}
 			_, e := tx.Exec(ctx, `SELECT kingres.distribute_schema($1::pg_catalog.text::pg_catalog.regnamespace, NULL::pg_catalog.int4)`, id.String())
 			return e
@@ -678,9 +683,9 @@ func (o *Ops) stepIMLedger(ctx context.Context, env *task.Env) error {
 		notes = append(notes, fmt.Sprintf("ledger: %s.%s starts a new chain (the source had its head at height %d)", ct.Schema, ct.Name, ct.Ledger.HeadHeight))
 	}
 	if len(ledgers) > 0 {
-		var findings int
-		if err := c.QueryRow(ctx, `SELECT pg_catalog.count(*)::pg_catalog.int4 FROM kingres.ledger_verify()`).Scan(&findings); err != nil {
-			return transfer.SafeError(err)
+		findings, verr := ledgerVerifyLocked(ctx, c, p.Owner.Name, extSchema)
+		if verr != nil {
+			return wrapTrust(verr, "", "")
 		}
 		if findings > 0 {
 			return transfer.Errorf(transfer.CodeVerification, false, "ledger_verify reports %d findings on the new chain", findings)
@@ -772,9 +777,9 @@ func (o *Ops) stepIMVerify(ctx context.Context, env *task.Env) error {
 		if err := requireExtensions(ctx, c, false, extguard.Ledger); err != nil {
 			return err
 		}
-		var findings int
-		if err := c.QueryRow(ctx, `SELECT pg_catalog.count(*)::pg_catalog.int4 FROM kingres.ledger_verify()`).Scan(&findings); err != nil {
-			return transfer.SafeError(err)
+		findings, verr := ledgerVerifyLocked(ctx, c, p.Owner.Name, extensionSchemas(res.Manifest))
+		if verr != nil {
+			return wrapTrust(verr, "", "")
 		}
 		if findings > 0 {
 			return transfer.Errorf(transfer.CodeVerification, false, "ledger_verify reports %d findings", findings)
@@ -798,8 +803,16 @@ func (o *Ops) stepIMVerify(ctx context.Context, env *task.Env) error {
 
 // importRenameLocal gives the private database of this server its final name and makes the importing role its owner. The name must be free at that moment.
 func (o *Ops) importRenameLocal(ctx context.Context, op importRenameOp) error {
+	if op.Finish {
+		if !dbNameRE.MatchString(op.From) || protectedDB[op.From] || strings.HasPrefix(op.From, privatePrefix) || !strings.HasPrefix(op.To, privatePrefix) || op.Marker != importMarker(op.To) {
+			return errors.New("this rename is not allowed")
+		}
+		return o.finishRename(ctx, op.From, op.Marker)
+	}
 	if op.Back {
-		if !strings.HasPrefix(op.To, privatePrefix) || !dbNameRE.MatchString(op.To) || !dbNameRE.MatchString(op.From) || protectedDB[op.From] || strings.HasPrefix(op.From, privatePrefix) {
+		// The marker of the task is the proof that the database at the final name is the one that this task renamed: without it nothing is touched.
+		if !strings.HasPrefix(op.To, privatePrefix) || !dbNameRE.MatchString(op.To) || !dbNameRE.MatchString(op.From) || protectedDB[op.From] || strings.HasPrefix(op.From, privatePrefix) ||
+			op.Marker == "" || op.Marker != importMarker(op.To) {
 			return errors.New("this rename is not allowed")
 		}
 		return o.renameBack(ctx, op.From, op.To, op.Marker)
@@ -865,10 +878,8 @@ func (o *Ops) importRenameLocal(ctx context.Context, op importRenameOp) error {
 	if err := run(ctx, c, stmt().Text("ALTER DATABASE").ID(to).Text("OWNER TO").ID(owner)); err != nil {
 		return undo(err)
 	}
-	// The marker of the private database goes with the name.
-	if err := run(ctx, c, stmt().Text("COMMENT ON DATABASE").ID(to).Text("IS NULL")); err != nil {
-		return undo(err)
-	}
+	// The marker of the private database goes with the name and stays on the final name until every server has taken it (finishRename): a rename that is undone
+	// on a peer only ever touches a database that carries it.
 	// The default of a database that database.create makes: PUBLIC may connect.
 	if err := run(ctx, c, stmt().Text("GRANT CONNECT ON DATABASE").ID(to).Text("TO PUBLIC")); err != nil {
 		return undo(err)
@@ -944,7 +955,8 @@ func (o *Ops) stepIMRename(ctx context.Context, env *task.Env) error {
 			break
 		}
 		if err := o.onServer(ctx, env, s, "take the final name", func() error { return o.Fanout.Apply(ctx, s, ApplyImportRename, op) }); err != nil {
-			// The server may have renamed before it failed to answer: it is put back too.
+			// The server may have renamed before it failed to answer: it is put back too, but only if the database at the final name carries the marker of this task
+			// (renameBack leaves any other database alone).
 			done = append(done, s)
 			note := revert()
 			return fmt.Errorf("%w%s", err, note)
@@ -967,6 +979,19 @@ func (o *Ops) stepIMRename(ctx context.Context, env *task.Env) error {
 	if err := o.recordImportedSettings(ctx, p, sharded, buckets, ledgerMode); err != nil {
 		note := revert()
 		return transfer.Errorf(transfer.CodeSQLError, false, "the settings of the database could not be recorded, so the import was undone%s", note)
+	}
+	// Every server has the final name and the registry has the settings: the marker of the task goes. An error here leaves a comment on a finished database.
+	fin := importRenameOp{From: p.Database, To: priv, Finish: true, Marker: importMarker(priv)}
+	for _, s := range append([]string{""}, p.Servers...) {
+		var ferr error
+		if s == "" {
+			ferr = o.finishRename(ctx, p.Database, fin.Marker)
+		} else if o.Fanout != nil {
+			ferr = o.Fanout.Apply(ctx, s, ApplyImportRename, fin)
+		}
+		if ferr != nil && o.Log != nil {
+			o.Log.Error("the marker of an import could not be removed", "server", s, "database", p.Database, "error", ferr)
+		}
 	}
 	detail := "imported " + p.Database
 	if st := o.importState(env.Task.ID); st != nil && len(st.notes) > 0 {
@@ -991,11 +1016,29 @@ func revertNote(err error) string {
 // renameBack undoes the rename of this server (a failure after this one was renamed): the final name goes back to the private one, the service role owns the
 // database again, the marker is written again and PUBLIC may not connect. Every part is tried and the errors are joined.
 func (o *Ops) renameBack(ctx context.Context, from, to, marker string) error {
+	if marker == "" {
+		return errors.New("the marker of the task is needed to put a name back")
+	}
 	c, err := o.Service.ServiceConn(ctx, "postgres")
 	if err != nil {
 		return err
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	// Only the database that this task renamed is put back: it carries the marker. Another database at that name (a peer that did not rename because the name was
+	// taken, a database that a role made in the meantime) is left as it is.
+	var comment *string
+	if err := c.QueryRow(ctx, `SELECT pg_catalog.shobj_description(d.oid, 'pg_database') FROM pg_catalog.pg_database d WHERE d.datname = $1::pg_catalog.text::pg_catalog.name`, from).Scan(&comment); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+	if comment == nil || *comment != marker {
+		if o.Log != nil {
+			o.Log.Warn("a database at the final name of an import was left alone: it does not carry the marker of the task", "database", from)
+		}
+		return nil
+	}
 	var errs []error
 	if err := o.rollbackPreparedLocal(ctx, c, from); err != nil {
 		errs = append(errs, err)
@@ -1026,6 +1069,26 @@ func (o *Ops) renameBack(ctx context.Context, from, to, marker string) error {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
+}
+
+// finishRename removes the marker of the task from the database at the final name, if it still carries it.
+func (o *Ops) finishRename(ctx context.Context, name, marker string) error {
+	c, err := o.Service.ServiceConn(ctx, "postgres")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	var comment *string
+	if err := c.QueryRow(ctx, `SELECT pg_catalog.shobj_description(d.oid, 'pg_database') FROM pg_catalog.pg_database d WHERE d.datname = $1::pg_catalog.text::pg_catalog.name`, name).Scan(&comment); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+	if comment == nil || *comment != marker {
+		return nil
+	}
+	return run(ctx, c, stmt().Text("COMMENT ON DATABASE").ID(sqlx.MustIdent(name)).Text("IS NULL"))
 }
 
 func (o *Ops) recordImportedSettings(ctx context.Context, p dbImportParams, sharded bool, buckets int, ledgerMode string) error {
