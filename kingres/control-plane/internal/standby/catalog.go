@@ -29,6 +29,7 @@ const (
 	sqlstateCatalogBusy    = "KS008" // another catalog call is running: repeat later
 	sqlstateCannotCommit   = "KS009" // a primary's synchronous standbys do not confirm: fix the list first
 	sqlstateWrongNode      = "KS010" // the call went to the wrong node
+	sqlstateNotMapPrimary  = "KS022" // the call went to a node that is not the map group primary
 	sqlstateLockNotAvail   = "55P03" // a lock held on a node: repeat when it is gone
 	sqlstateAlreadyThere   = "42710" // the node is registered already
 	sqlstateNoSuchNode     = "42704" // the node (or the group) does not exist
@@ -60,7 +61,7 @@ func classify(call string, err error) error {
 	switch pe.Code {
 	case sqlstateNodeNoAnswer, sqlstateCatalogBusy, sqlstateCannotCommit, sqlstateLockNotAvail:
 		return &CatalogError{Call: call, Code: pe.Code, Msg: pe.Message, Retry: true}
-	case sqlstateWrongNode:
+	case sqlstateWrongNode, sqlstateNotMapPrimary:
 		return &CatalogError{Call: call, Code: pe.Code, Msg: pe.Message}
 	}
 	return err

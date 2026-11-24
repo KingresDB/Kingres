@@ -38,6 +38,8 @@ type fakeBackend struct {
 	servers     []string
 	// failOn is a phase whose Advance fails (a node is down).
 	failOn string
+	// failErr is the error of that Advance when it is not the plain "node is down".
+	failErr error
 	// lockFails is the number of Advance(..., "shadow") calls that fail because a transaction holds the table (55P03).
 	lockFails int
 }
@@ -86,6 +88,9 @@ func (f *fakeBackend) Advance(_ context.Context, _ tableParams, _ int64, to stri
 		return f.phase, "", &pgconn.PgError{Code: "55P03", Message: "could not lock table public.orders in SHARE ROW EXCLUSIVE mode", Detail: "Held by: pid 7"}
 	}
 	if f.failOn == to {
+		if f.failErr != nil {
+			return f.phase, "", f.failErr
+		}
 		return f.phase, "", errors.New("node 3 is down")
 	}
 	switch to {
@@ -630,5 +635,31 @@ func TestAStepWaitsForALongTransactionThatHoldsTheTable(t *testing.T) {
 	}
 	if n := b.count("advance shadow"); n != 4 {
 		t.Errorf("the layout was asked for %d times, want 4 (three refused for the lock, one made)", n)
+	}
+}
+
+// The verification that fails is told by the SQLSTATE KS021 of the extension 0.9, whatever the wording; the extension 0.8 answered XX001 with
+// the text. Another error, or the wording under another code, is a plain failure of the step.
+func TestVerificationRefusalIsToldBySQLSTATE(t *testing.T) {
+	for _, c := range []struct {
+		err  *pgconn.PgError
+		want string
+	}{
+		{&pgconn.PgError{Code: "KS021", Message: "verification of table operation 7 failed: the new table holds 300 rows"}, CodeVerificationFail},
+		{&pgconn.PgError{Code: "KS021", Message: "any other wording"}, CodeVerificationFail},
+		{&pgconn.PgError{Code: "XX001", Message: "verification of table operation 7 failed: x"}, CodeVerificationFail}, // extension 0.8
+		{&pgconn.PgError{Code: "XX000", Message: "verification of table operation 7 failed: x"}, ""},
+	} {
+		b := &fakeBackend{failOn: "cleaning", failErr: c.err}
+		_, e, _, _ := newTableOps(t, b, task.Options{})
+		tk, _ := e.Submit(context.Background(), KindTableDistribute, task.Subject{Type: "table", ID: "x"}, onlineParams("distribute"), "u")
+		_, _ = e.RunOnce(context.Background())
+		got, _ := e.Get(context.Background(), tk.ID)
+		if got.State != task.Failed || got.Error == nil {
+			t.Fatalf("%s %q: %s %+v", c.err.Code, c.err.Message, got.State, got.Error)
+		}
+		if (c.want == CodeVerificationFail) != (got.Error.Code == CodeVerificationFail) {
+			t.Errorf("%s %q: code %q", c.err.Code, c.err.Message, got.Error.Code)
+		}
 	}
 }

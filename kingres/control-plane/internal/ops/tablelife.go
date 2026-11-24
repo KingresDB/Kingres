@@ -113,6 +113,9 @@ func (p tableParams) subject() string { return p.Database + "/" + p.Schema + "."
 
 func (p tableParams) rel() string { return qualified(p.Schema, p.Table) }
 
+// sqlstateVerificationFailed (KS021) is the refusal of table_operation_advance when the verification of the new table failed.
+const sqlstateVerificationFailed = "KS021"
+
 // tableTaskError is a failure of a step that carries the code and the retry hint the task is recorded with (task.Coded).
 type tableTaskError struct {
 	code  string
@@ -439,7 +442,9 @@ func (o *Ops) stepFinishOp(ctx context.Context, env *task.Env, p tableParams) er
 	}
 	if _, d, err := b.Advance(ctx, p, op, "cleaning"); err != nil {
 		var pe *pgconn.PgError
-		if errors.As(err, &pe) && strings.Contains(pe.Message, "verification") {
+		// KS021 is the code of the extension 0.9. The extension 0.8 (released) answered XX001 (data_corrupted) with "verification of table
+		// operation N failed"; that text is read only for 0.8 and goes when 0.8 is no longer a supported version.
+		if errors.As(err, &pe) && (pe.Code == sqlstateVerificationFailed || pe.Code == "XX001" && strings.Contains(pe.Message, "verification")) {
 			return &tableTaskError{code: CodeVerificationFail, msg: pe.Message}
 		}
 		return err

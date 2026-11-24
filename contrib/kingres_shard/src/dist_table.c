@@ -493,7 +493,7 @@ kingres_shard_choose_colocation(Oid coltype, Oid collation, Oid colocate_with,
 				0, NULL, NULL);
 		if (SPI_processed == 0)
 			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					(errcode(ERRCODE_KINGRES_NO_RECEIVING_GROUP),
 					 errmsg("no shard group can hold buckets"),
 					 errhint("Register a node with kingres.add_node() or set should_have_shards.")));
 		initStringInfo(&arr);

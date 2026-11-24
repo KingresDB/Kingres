@@ -25,8 +25,9 @@ use KingresShardTest qw(make_cluster make_standby register_standby wait_catchup
 {
 	my ($n1, $n2, $n3) = make_cluster('sa1', 3, replication => 1);
 	my $s2 = make_standby($n2, 'sa1_s2');
-	my ($rc, $out, $err) = run_sql($n2, sprintf("SELECT kingres.add_node('%s', %d, 1, 'standby')", $s2->host, $s2->port));
+	my ($rc, $out, $err) = run_sql($n2, "\\set VERBOSITY verbose\n" . sprintf("SELECT kingres.add_node('%s', %d, 1, 'standby')", $s2->host, $s2->port));
 	like($err, qr/this function can only run on the map group primary/, '[1] add_node on a node that is not MAP');
+	like($err, qr/\bKS022\b/, '[1] with its own SQLSTATE KS022');
 	($rc, $out, $err) = run_sql($n1, sprintf("SELECT kingres.add_node('%s', %d, 2, 'standby')", $s2->host, $s2->port));
 	like($err, qr/is not a copy of the primary of group 2/, '[1] a standby of another group');
 	my $id = register_standby($n1, $s2, 1);
@@ -59,8 +60,9 @@ use KingresShardTest qw(make_cluster make_standby register_standby wait_catchup
 	($rc, $out, $err) = run_sql($n1, 'SELECT kingres.promote_node(NULL)');
 	is($rc, 0, '[2] promote_node(NULL) is not an error');
 	is($out, '', '[2] and returns NULL');
-	($rc, $out, $err) = run_sql($n3, "SELECT kingres.promote_node($id)");
+	($rc, $out, $err) = run_sql($n3, "\\set VERBOSITY verbose\n" . "SELECT kingres.promote_node($id)");
 	like($err, qr/this function can only run on the map group primary/, '[2] promote_node on a node that is not MAP');
+	like($err, qr/\bKS022\b/, '[2] with its own SQLSTATE KS022');
 	($rc, $out, $err) = run_sql($n1, "SELECT kingres.promote_node($id)");
 	like($err, qr/node $id \([^)]*\) is still in recovery/, '[2] promote_node before pg_promote() has finished');
 }

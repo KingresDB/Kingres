@@ -192,10 +192,10 @@ foreach my $control ('', 'SELECT kingres.sync_catalog();', 'SELECT kingres.rotat
 	my ($map, $g1, $g2) = @$n;
 	$map->safe_psql('postgres', "INSERT INTO public.kv VALUES ($_, 'orig')") for @$k2;
 	$g1->safe_psql('postgres', "SELECT 1");
-	my $wrong = 'SELECT kingres.sync_catalog();';		# on node 2: KS010
+	my $wrong = 'SELECT kingres.sync_catalog();';		# on node 2: KS022 (not the map group primary)
 	my @cases = (
-		[ 'KS010 (wrong node), next transaction', $g1, [ $wrong ], [ 'BEGIN' ] ],
-		[ 'KS010 swallowed by a PL/pgSQL block, same transaction', $g1,
+		[ 'KS022 (not the map group primary), next transaction', $g1, [ $wrong ], [ 'BEGIN' ] ],
+		[ 'KS022 swallowed by a PL/pgSQL block, same transaction', $g1,
 		  [ 'BEGIN', "DO \$\$ BEGIN BEGIN PERFORM kingres.sync_catalog(); EXCEPTION WHEN OTHERS THEN NULL; END; END \$\$;" ], [] ],
 		[ 'a control call in a rolled back subtransaction', $map,
 		  [ 'BEGIN', 'SAVEPOINT s1', 'SELECT kingres.sync_catalog()', 'ROLLBACK TO s1' ], [] ],

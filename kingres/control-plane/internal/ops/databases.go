@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -499,7 +498,8 @@ func (o *Ops) dropDB(ctx context.Context, p dropParams) error {
 			o.clearSkippedExtensionAlerts(ctx, p.Name)
 			return nil
 		}
-		if !strings.Contains(err2.Error(), "55006") {
+		var pe *pgconn.PgError // object_in_use is told by its code, not by the text of the error
+		if !errors.As(err2, &pe) || pe.Code != "55006" {
 			return err2
 		}
 		select {

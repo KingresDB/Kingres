@@ -320,8 +320,9 @@ is(q1($nodes[$g], q{SELECT coalesce(sum(n_tup_upd), 0) FROM (SELECT pg_stat_forc
 	isnt($rc, 0, 'D: only a superuser splits');
 	# a table without a primary key, a table partitioned by the user
 	q1($n1, q{CREATE TABLE public.np (id int, v text); SELECT kingres.create_distributed_table('public.np', 'id', colocate_with => 'public.s1')});
-	($rc, $out, $err) = run_sql($n1, "SELECT kingres.split_bucket($C, 1, 2)");
+	($rc, $out, $err) = run_sql($n1, "\\set VERBOSITY verbose\n" . "SELECT kingres.split_bucket($C, 1, 2)");
 	like($err, qr/table public\.np has no primary key/, 'D: a table without a primary key refuses the split');
+	like($err, qr/\b0A000\b/, 'D: with SQLSTATE 0A000 (feature_not_supported), which the control plane maps to split_unsupported');
 	q1($n1, q{SELECT kingres.undistribute_table('public.np')});
 	q1($n1, q{CREATE TABLE public.up (id int, d date, PRIMARY KEY (id, d)) PARTITION BY RANGE (d); CREATE TABLE public.up_2024 PARTITION OF public.up FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
 	          SELECT kingres.create_distributed_table('public.up', 'id', colocate_with => 'public.s1')});
@@ -344,8 +345,9 @@ is(q1($nodes[$g], q{SELECT coalesce(sum(n_tup_upd), 0) FROM (SELECT pg_stat_forc
 	# a split that runs: a second one, a move of its bucket, DDL on its group
 	($pid, $file) = stopped('split_after_triggers', "SELECT kingres.split_bucket($C, 1, 2)", 'd2');
 	ok(wait_for_fault_file("$file.reached", 60), 'D: a split of bucket 1 waits');
-	($rc, $out, $err) = run_sql($n1, "SELECT kingres.split_bucket($C, 2, 2)");
+	($rc, $out, $err) = run_sql($n1, "\\set VERBOSITY verbose\n" . "SELECT kingres.split_bucket($C, 2, 2)");
 	like($err, qr/already being split/, 'D: the colocation group is not split twice');
+	like($err, qr/\bKS019\b/, 'D: with its own SQLSTATE KS019 (bucket busy), which the control plane matches instead of the text');
 	($rc, $out, $err) = run_sql($n1, "SELECT kingres.move_bucket($C, 1, " . ((owner(1) + 1) % 3) . ")");
 	like($err, qr/is in state "splitting"/, 'D: the bucket that is split does not move');
 	q1($n1, q{CREATE TABLE public.late (id int PRIMARY KEY)});

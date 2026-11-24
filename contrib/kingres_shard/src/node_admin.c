@@ -108,7 +108,7 @@ kingres_shard_require_map_group(void)
 	if (self == NULL || self->group_id != KINGRES_SHARD_MAP_GROUP ||
 		!self->is_primary)
 		ereport(ERROR,
-				(errcode(ERRCODE_KINGRES_WRONG_NODE),
+				(errcode(ERRCODE_KINGRES_NOT_MAP_PRIMARY),
 				 errmsg("this function can only run on the map group primary"),
 				 errdetail("This node is node %d.", cat->local_node_id)));
 	if (!kingres_shard_is_recognized_map_primary())

@@ -218,6 +218,8 @@ UPDATE kingres.bucket_map SET state = 'active';
 SELECT group_id, arriving, drained FROM kingres.drain_status() WHERE group_id = 2;
 UPDATE kingres.node SET should_have_shards = false;
 SELECT * FROM kingres.plan_rebalance();
+-- the refusal has its own SQLSTATE (KS017), which the control plane matches instead of the text
+DO $$ BEGIN PERFORM * FROM kingres.plan_rebalance(); EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'sqlstate %', SQLSTATE; END $$;
 UPDATE kingres.node SET should_have_shards = true;
 
 -- ---------------------------------------------------------------------------
