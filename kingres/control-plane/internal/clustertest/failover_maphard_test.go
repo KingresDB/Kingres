@@ -623,6 +623,23 @@ func foCheckAckedByKey(t *testing.T, acked map[int64]time.Time, nodes []*cluster
 		ids = picked
 	}
 	for _, n := range nodes {
+		// the entry point of a node that was just restarted needs a moment before the first key is answered (the groups that are alive answer for some keys)
+		until(t, 3*time.Minute, "a key answered through the entry point of "+n.Host, func() bool {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			c, err := foConn(ctx, n, port, pool, "fo")
+			if err != nil {
+				return false
+			}
+			defer func() { _ = c.Close(context.Background()) }()
+			for _, rid := range ids {
+				var got int64
+				if c.QueryRow(ctx, `SELECT id FROM items WHERE id = $1`, rid).Scan(&got) == nil {
+					return true
+				}
+			}
+			return false
+		})
 		found, unreachable := 0, 0
 		var conn *pgx.Conn
 		for _, rid := range ids {
