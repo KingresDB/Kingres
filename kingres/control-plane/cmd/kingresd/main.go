@@ -575,9 +575,15 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	foDeps.d = hd
 	hd.MapFailover = foDeps.mf
 	hd.IdentityCheck = newIdentityChecker(authn, serverHost)
-	hd.VerifyAttestation = (&fwdproof.AssertionVerifier{Certs: svc}).CheckAttestation
-	if foDeps.mf != nil {
-		foDeps.mf.attest = gatherSigner.Attest
+	// The declaration that a server is lost is checked at a held-back old leader against the administrators' keys that this server cached on disk (adminkeys.go).
+	adminKeyCache := openAdminKeys(filepath.Join(cfg.DataDir, "failover"))
+	hd.LostIdentityCheck = newIdentityChecker(adminKeyCache, serverHost)
+	if svc.Enabled() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runAdminKeys(bgCtx, adminKeyCache, serviceAdminVerifiers(svc), adminKeysEvery, log)
+		}()
 	}
 	if members != nil && foDeps.mf != nil {
 		wireEscrow(members, foDeps.mf)

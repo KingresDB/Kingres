@@ -176,3 +176,46 @@ func TestTheReleaseCommandEndsTheHoldAndRecordsIt(t *testing.T) {
 		t.Error("a second release found a hold")
 	}
 }
+
+// The command can be run again after a crash between the markers and the freeze: the second run lifts the freeze and says so; one with nothing left to do refuses.
+func TestTheReleaseCommandFinishesAnInterruptedRelease(t *testing.T) {
+	dir, args := holdRig(t, "s3")
+	if _, err := runCommand(args("-lost", "s3", "-accept-data-loss")); err != nil {
+		t.Fatal(err)
+	}
+	// the crash: the markers are gone and the freeze is still on disk
+	freeze := filepath.Join(dir, "failover-freeze.json")
+	if err := os.WriteFile(freeze, []byte(`{"frozen":{"0":99999999999999}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := runCommand(args("-lost", "s3", "-accept-data-loss")); err != nil {
+		t.Fatalf("the second run did not finish the release: %v\n%s", err, out)
+	}
+	if b, _ := os.ReadFile(freeze); strings.Contains(string(b), "99999999999999") {
+		t.Fatalf("the freeze is still on disk: %s", b)
+	}
+	if got := auditText(dir); !strings.Contains(got, `"completedEarlierRun":true`) {
+		t.Errorf("the finished run is not in the audit record: %s", got)
+	}
+	if _, err := runCommand(args("-lost", "s3", "-accept-data-loss")); err == nil {
+		t.Error("a run with nothing left to do succeeded")
+	}
+}
+
+// A mistyped data directory is not made into one: no lock file, no audit log, no directory.
+func TestTheReleaseCommandCreatesNothingForAWrongDataDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "typo")
+	if _, err := runCommand([]string{"-data-dir", dir, "-server-host", "s1", "-release-map-hold", "-lost", "s3", "-accept-data-loss"}); err == nil || !strings.Contains(err.Error(), "not the data directory") {
+		t.Fatalf("a directory that is none: %v", err)
+	}
+	if _, err := os.Stat(dir); err == nil {
+		t.Fatal("the command made the directory")
+	}
+	other := t.TempDir() // exists, has no lease directory
+	if _, err := runCommand([]string{"-data-dir", other, "-server-host", "s1", "-release-map-hold", "-lost", "s3", "-accept-data-loss"}); err == nil {
+		t.Fatal("a directory without a lease directory was accepted")
+	}
+	if entries, _ := os.ReadDir(other); len(entries) != 0 {
+		t.Fatalf("the command wrote into a directory that is none: %v", entries)
+	}
+}

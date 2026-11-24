@@ -622,6 +622,15 @@ const FenceRetry = 5 * time.Second
 // refence stops the primary of a group whose lease is still lost, when it runs and the group is enforced now.
 func (m *Manager) refence(ctx context.Context, group int32) {
 	if a := m.adoptionOf(group); a != nil && !a.attached {
+		if a.kind == AdoptHolder {
+			// The holder of a promotion: a stop of its promoted instance that failed is repeated like any other (phase 5 review M5).
+			m.mu.Lock()
+			busy := m.fencing[group]
+			m.mu.Unlock()
+			if !busy {
+				m.fenceUnattached(ctx, group)
+			}
+		}
 		return
 	}
 	m.mu.Lock()

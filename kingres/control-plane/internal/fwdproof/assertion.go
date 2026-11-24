@@ -121,15 +121,6 @@ type AssertionVerifier struct {
 // knows, the signature is valid, the time is within the window, and the
 // assertion was not used before.
 func (v *AssertionVerifier) Check(_ context.Context, m Message, a Assertion) error {
-	return v.check(a, func(issued int64, nonce []byte) []byte { return assertionDigest(m, issued, nonce) }, func(id string) error {
-		if l := v.Leader(); l == "" || l != id {
-			return fmt.Errorf("%w: the signer is not the manager leader", ErrInvalid)
-		}
-		return nil
-	})
-}
-
-func (v *AssertionVerifier) check(a Assertion, digest func(issued int64, nonce []byte) []byte, signerOK func(id string) error) error {
 	now := time.Now
 	if v.Now != nil {
 		now = v.Now
@@ -152,11 +143,11 @@ func (v *AssertionVerifier) check(a Assertion, digest func(issued int64, nonce [
 	if err != nil {
 		return fmt.Errorf("%w: the signer's certificate is not accepted: %w", ErrInvalid, err)
 	}
-	if err := signerOK(id); err != nil {
-		return err
+	if l := v.Leader(); l == "" || l != id {
+		return fmt.Errorf("%w: the signer is not the manager leader", ErrInvalid)
 	}
 	pub, ok := cert.PublicKey.(*ecdsa.PublicKey)
-	if !ok || !ecdsa.VerifyASN1(pub, digest(a.IssuedAt, a.Nonce), a.Signature) {
+	if !ok || !ecdsa.VerifyASN1(pub, assertionDigest(m, a.IssuedAt, a.Nonce), a.Signature) {
 		return ErrInvalid
 	}
 	var key [16]byte
@@ -182,61 +173,4 @@ func (v *AssertionVerifier) check(a Assertion, digest func(issued int64, nonce [
 	}
 	v.seen[key] = now()
 	return nil
-}
-
-// A member's attestation (phase 5 review H1 and M-D). The declaration that a server is lost goes to the old leader of the map group, whose instance (the system
-// database) is stopped while it is held back, so it cannot read a verifier and cannot check the proof of the operator's session, and the proof must not be sent to a
-// member that is not the leader anyway (the receiver learns the password-equivalent ClientKey). The member that received the operator's request has a live store and
-// has authenticated the session; it signs the declaration with the key of its server certificate and sends that, never the proof. The receiver checks that the
-// signer is the server it is talking to, that its certificate is accepted by the cluster, the freshness and that it was not used before.
-
-func attestationDigest(m Message, issuedAt int64, nonce []byte) []byte {
-	h := sha256.New()
-	h.Write([]byte("kingres member attestation v1"))
-	h.Write(m.digest())
-	var t [8]byte
-	binary.BigEndian.PutUint64(t[:], uint64(issuedAt))
-	h.Write(t[:])
-	h.Write(nonce)
-	return h.Sum(nil)
-}
-
-// Attest signs the exact message m (m.From is this server): an attestation is for one receiver and one request.
-func (s *Signer) Attest(m Message) (Assertion, error) {
-	pair, err := s.Load()
-	if err != nil {
-		return Assertion{}, fmt.Errorf("fwdproof: loading the server certificate: %w", err)
-	}
-	signer, ok := pair.PrivateKey.(crypto.Signer)
-	if !ok || len(pair.Certificate) == 0 {
-		return Assertion{}, errors.New("fwdproof: the server certificate has no usable key")
-	}
-	now := time.Now
-	if s.Now != nil {
-		now = s.Now
-	}
-	nonce := make([]byte, 16)
-	if _, err := rand.Read(nonce); err != nil {
-		return Assertion{}, fmt.Errorf("fwdproof: random nonce: %w", err)
-	}
-	issued := now().Unix()
-	sig, err := signer.Sign(rand.Reader, attestationDigest(m, issued, nonce), crypto.SHA256)
-	if err != nil {
-		return Assertion{}, fmt.Errorf("fwdproof: signing: %w", err)
-	}
-	return Assertion{Leader: pair.Certificate[0], IssuedAt: issued, Nonce: nonce, Signature: sig}, nil
-}
-
-// CheckAttestation verifies the attestation a of the message m: the signing certificate is accepted by the cluster and names the server m.From (the caller of the
-// internal API, verified by its certificate), the signature is valid, the time is within the window, and it was not used before. Leader is not used.
-func (v *AssertionVerifier) CheckAttestation(_ context.Context, m Message, a Assertion) error {
-	if m.Kind != KindMapLost {
-		return fmt.Errorf("%w: an attestation is made for the declaration that a server is lost only", ErrInvalid)
-	}
-	return v.check(a, func(issued int64, nonce []byte) []byte { return attestationDigest(m, issued, nonce) }, func(id string) error {
-		if m.From == "" || id != m.From {
-			return fmt.Errorf("%w: the signer is not the server that sent the request", ErrInvalid)
-		}
-		return nil
-	})
 }

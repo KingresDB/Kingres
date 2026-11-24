@@ -71,3 +71,19 @@ func TestAHolderWithoutARunningInstanceWritesNoMarker(t *testing.T) {
 		t.Fatal("a fence marker was written for an instance that does not run")
 	}
 }
+
+// Phase 5 review M5: a stop of the promoted instance that failed is repeated every FenceRetry until it works, and the failure is reported meanwhile.
+func TestAFailedStopOfAPromotedInstanceWhoseLeaseWasLostIsRepeated(t *testing.T) {
+	r := unattachedRig(t, AdoptHolder, true)
+	fs := &failingStop{fakeInstance: r.inst, fails: 2}
+	r.m.c.Instance = fs
+	failed := 0
+	r.m.c.OnFenceFailed = func(int32, error) { failed++ }
+	runPast(r)
+	if running, stops, _ := r.inst.state(); running || stops == 0 {
+		t.Fatalf("the instance still runs after the failed stops were repeated (stops %d)", stops)
+	}
+	if failed < 2 {
+		t.Fatalf("the failed stops were reported %d times, want 2", failed)
+	}
+}

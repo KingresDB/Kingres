@@ -18,8 +18,15 @@ var errDataDirInUse = errors.New("another kingresd, or a command of kingresd, is
 // lockDataDir takes the lock of the data directory for the life of the process. It waits up to wait for a process that is just ending (a restart by the service
 // manager starts the new process before the old one has gone).
 func lockDataDir(dir string, wait time.Duration) (func(), error) {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, err
+	return lockDataDirOpts(dir, wait, true)
+}
+
+// lockDataDirOpts is lockDataDir that makes the directory only when create is set: a local command must not make a directory of a mistyped path.
+func lockDataDirOpts(dir string, wait time.Duration, create bool) (func(), error) {
+	if create {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return nil, err
+		}
 	}
 	deadline := time.Now().Add(wait)
 	for {

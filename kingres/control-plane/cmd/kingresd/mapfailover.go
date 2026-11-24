@@ -94,9 +94,6 @@ type mapFailover struct {
 	// releasePending says that the lease of a bootstrap that was given up could not be let go of: the next abandon finishes the release (F7-02).
 	releasePending atomic.Bool
 
-	// attest signs a message with the key of this server's certificate (fwdproof.Signer.Attest).
-	attest func(fwdproof.Message) (fwdproof.Assertion, error)
-
 	// heldWhy is why the hold of this server's primary of the map group cannot be resolved (empty: it can, or there is none); heldWarned is when it was last named in the log.
 	heldWhy    string
 	heldWarned time.Time
@@ -890,8 +887,10 @@ func promoteBlockedByJournal(mf *mapFailover, group int32) error {
 func (m *mapFailover) Abandon(ctx context.Context, actor string, id internalapi.ForwardIdentity, reason, lostServer string) (failover.MapAbandonResult, error) {
 	reason = "given up by " + actor + ": " + reason
 	if lostServer != "" {
-		if m.liveState(ctx, lostServer) == "live" {
-			return failover.MapAbandonResult{}, problem.New(problem.Conflict, "Server "+lostServer+" is heard by the cluster; it is not lost. Give the bootstrap up without naming it, or wait until it is seen dead.")
+		// Positive evidence of silence is needed (phase 5 review M2): "dead" is a silence of the failure timeout since the later of this server's start and the last
+		// contact. "live", "suspect" and "unknown" (not heard yet since this server started) are not lost.
+		if st := m.liveState(ctx, lostServer); st != "dead" {
+			return failover.MapAbandonResult{}, problem.New(problem.Conflict, "Server "+lostServer+" is not seen dead by the cluster (it is "+st+"): it is heard, or has not been silent for the failure timeout yet. Give the bootstrap up without naming it, or wait until it is seen dead.")
 		}
 		reason += " (server " + lostServer + " declared lost)"
 		m.log.Warn("a server that the map group was handed to is declared lost", "server", lostServer, "by", actor)
@@ -928,24 +927,34 @@ func (m *mapFailover) Abandon(ctx context.Context, actor string, id internalapi.
 	// No bootstrap is in progress: a held-back old leader that nothing owns is started again (this server too).
 	var res failover.MapAbandonResult
 	var lastErr error
+	var notes []string
+	askedHeld := 0
 	for _, s := range members {
 		var out mapResumeAnswer
 		if s == m.self {
 			out.Resumed, out.Detail = m.resolveHeldBack(ctx, true, lostServer)
+			if lostServer != "" && m.isHeldBack() {
+				askedHeld++
+			}
 		} else {
 			body := mapResumeBody{Strict: true, Lost: lostServer}
 			if lostServer != "" {
-				// The declared server is not asked: it is not heard. A proof is never sent (phase 5 review M-D), and the attestation goes only to the server
-				// that says that its primary of the map group is held back, so that no other member sees the declaration (phase 5 review H1).
+				// The declared server is not asked. The proof of the operator's session goes only to the server that says that its primary of the map group is held
+				// back (phase 5 review M-D, M1): it is the manager leader that was, and no other member receives it.
 				if s == lostServer {
 					continue
 				}
 				var held mapHeldAnswer
-				if err := m.call(ctx, s, http.MethodGet, "/failover/map/held", nil, &held); err != nil || !held.Held {
+				if err := m.call(ctx, s, http.MethodGet, "/failover/map/held", nil, &held); err != nil {
+					notes = append(notes, s+" does not answer")
 					continue
 				}
+				if !held.Held {
+					continue
+				}
+				askedHeld++
 				if err := m.signLost(id, &body, s); err != nil {
-					return failover.MapAbandonResult{}, problem.New(problem.ServiceUnavailable, "The declaration cannot be attested to "+s+": "+err.Error()).WithRetryAfter(5)
+					return failover.MapAbandonResult{}, problem.New(problem.ServiceUnavailable, "The session cannot prove the declaration to "+s+": "+err.Error()).WithRetryAfter(5)
 				}
 			}
 			if err := m.call(ctx, s, http.MethodPost, "/failover/map/resume", body, &out); err != nil {
@@ -957,12 +966,37 @@ func (m *mapFailover) Abandon(ctx context.Context, actor string, id internalapi.
 			res.ResumedServer = s
 			break
 		}
+		if out.Detail != "" && lostServer != "" {
+			notes = append(notes, s+": "+out.Detail)
+		}
 	}
-	if res.ResumedServer == "" && lastErr != nil && lostServer != "" {
-		// the declaration was refused or could not be delivered to the held-back server: the operator must hear it
-		return failover.MapAbandonResult{}, problem.New(problem.ServiceUnavailable, "The declaration that "+lostServer+" is lost did not reach the old leader of the map group: "+lastErr.Error()).WithRetryAfter(5)
+	if res.ResumedServer == "" && lostServer != "" {
+		// The operator declared a server lost: an answer that looks like success while nothing was released is wrong (phase 5 review M3).
+		switch {
+		case lastErr != nil:
+			return failover.MapAbandonResult{}, problem.New(problem.ServiceUnavailable, "The declaration that "+lostServer+" is lost did not reach the old leader of the map group: "+lastErr.Error()).WithRetryAfter(5)
+		case askedHeld == 0:
+			return failover.MapAbandonResult{}, problem.New(problem.ServiceUnavailable, "No server reported that its primary of the map group is held back, so nothing was released"+noteSuffix(notes)+". Try again once the old leader's kingresd answers; if its kingresd is stopped, use the local command on that server (kingresd -release-map-hold).").WithRetryAfter(5)
+		default:
+			return failover.MapAbandonResult{}, problem.New(problem.Conflict, "The old leader of the map group did not release its hold"+noteSuffix(notes)+".")
+		}
 	}
 	return res, nil
+}
+
+// noteSuffix is the reasons that servers gave, for an error message.
+func noteSuffix(notes []string) string {
+	if len(notes) == 0 {
+		return ""
+	}
+	out := " ("
+	for i, n := range notes {
+		if i > 0 {
+			out += "; "
+		}
+		out += n
+	}
+	return out + ")"
 }
 
 // handleMapAbandon is the call of a server that was asked to give up the bootstrap: it acts on its own journal only.

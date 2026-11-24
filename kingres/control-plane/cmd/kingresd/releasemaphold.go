@@ -77,8 +77,12 @@ func splitReleaseHold(args []string) (rest []string, r releaseHoldArgs, err erro
 // auditActionReleaseMapGroupHold is the action of the audit event that the command writes (contract 0.34.0).
 const auditActionReleaseMapGroupHold = "releaseMapGroupHold"
 
-// releaseMapHold is the command. It refuses unless the server is declared lost and the loss of data accepted, unless the server is not this one, and unless nothing else
-// is using the data directory (kingresd is stopped).
+// releaseMapHold is the command. It refuses unless the server is declared lost and the loss of data accepted, unless the server is not this one, unless the data
+// directory is the one of a KingresDB server, and unless nothing else is using it (kingresd is stopped).
+//
+// The command is repeatable: the markers go first, then the freeze of the synchronous list, and a run that finds the hold gone but the wait marker still there (an
+// earlier run that ended between the two) finishes the freeze and says so. Its audit record is written after the change, with its outcome: a crash in between leaves a
+// released hold without a record, which the log line and the wait marker still show; the other order would record a release that did not happen.
 func releaseMapHold(cfg config.Config, r releaseHoldArgs, log *slog.Logger, out io.Writer) error {
 	if r.lost == "" || !r.accept {
 		return errors.New("-release-map-hold needs both -lost <serverId>, the server that the map group was handed to and that is lost, and -accept-data-loss, your word that what that server may have promoted and written is given up")
@@ -94,7 +98,12 @@ func releaseMapHold(cfg config.Config, r releaseHoldArgs, log *slog.Logger, out 
 	if r.lost == self {
 		return fmt.Errorf("-lost names this server (%s): the server that is lost cannot be the one whose hold is released; run the command on the server of the old leader", self)
 	}
-	unlock, err := lockDataDir(cfg.DataDir, 0)
+	leaseDir := filepath.Join(cfg.DataDir, leaseDirName)
+	if st, err := os.Stat(leaseDir); err != nil || !st.IsDir() {
+		// Nothing is created for a mistyped -data-dir: no lock file, no audit log.
+		return fmt.Errorf("%s is not the data directory of a KingresDB server (it has no %s directory)", cfg.DataDir, leaseDirName)
+	}
+	unlock, err := lockDataDirOpts(cfg.DataDir, 0, false)
 	if err != nil {
 		return fmt.Errorf("%w: stop kingresd on this server first (data directory %s)", err, cfg.DataDir)
 	}
@@ -115,18 +124,25 @@ func releaseMapHold(cfg config.Config, r releaseHoldArgs, log *slog.Logger, out 
 		return errors.New("a bootstrap of the map group is in progress on this server (its journal is active); start kingresd and give it up with abandonMapGroupBootstrap")
 	}
 	const group = 0
-	candidate, rerr := lease.ReleaseHold(filepath.Join(cfg.DataDir, leaseDirName), group, r.lost)
+	candidate, rerr := lease.ReleaseHold(leaseDir, group, r.lost)
+	completed := false
+	if errors.Is(rerr, lease.ErrNotHeldBack) && lease.Waiting(leaseDir, group) {
+		// An earlier run released the hold and ended before it lifted the freeze: this run finishes it.
+		rerr, completed = nil, true
+	}
 	freezeCleared := false
 	if rerr == nil {
 		// the failover that froze the synchronous list is given up with the hold; a frozen list would keep the primary waiting for the lost standby until the freeze lapses
-		if cleared, ferr := standby.ClearFreezeOnDisk(cfg.DataDir, group); ferr != nil {
-			log.Warn("the freeze of the synchronous standby list could not be removed; it lapses by itself", "error", ferr)
-		} else {
-			freezeCleared = cleared
+		cleared, ferr := standby.ClearFreezeOnDisk(cfg.DataDir, group)
+		freezeCleared = cleared
+		if ferr != nil {
+			rerr = fmt.Errorf("the hold is released but the freeze of the synchronous standby list could not be lifted (run the command again): %w", ferr)
 		}
 	}
-	details := map[string]any{"lostServerId": r.lost, "serverId": self, "acceptDataLoss": true, "recordedCandidate": candidate}
-	details["freezeCleared"] = freezeCleared
+	if completed && !freezeCleared && rerr == nil {
+		rerr = lease.ErrNotHeldBack // the hold is gone and there was no freeze left to lift: nothing to do
+	}
+	details := map[string]any{"lostServerId": r.lost, "serverId": self, "acceptDataLoss": true, "recordedCandidate": candidate, "freezeCleared": freezeCleared, "completedEarlierRun": completed}
 	if u, uerr := user.Current(); uerr == nil {
 		details["osUser"] = u.Username
 	}
@@ -143,7 +159,7 @@ func releaseMapHold(cfg config.Config, r releaseHoldArgs, log *slog.Logger, out 
 		return rerr
 	}
 	log.Warn("the hold of the primary of the map group was released by the operator: the server that the group was handed to is declared lost and the loss of data accepted; start kingresd, the primary starts when this server holds the lease",
-		"lostServer", r.lost, "server", self)
+		"lostServer", r.lost, "server", self, "completedEarlierRun", completed)
 	fmt.Fprintf(out, "The hold of the primary of the map group on %s is released. Server %s is declared lost: never start it again with its old data directory; remove it from the cluster afterwards.\nStart kingresd now; the primary of the map group starts when this server holds its lease.\n", self, r.lost)
 	if aerr != nil {
 		return fmt.Errorf("the hold is released, but the audit record could not be written: %w", aerr)
