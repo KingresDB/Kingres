@@ -7,6 +7,11 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-24 (branch p14c): fixes after the security review of 14c
+
+Answered C1, M1 to M3, L1 to L6 and the free-space check (design note, "Changes made after the independent security review of 14c"). New files: `ops/dbimport_guard.go` (the withdrawal of every role, the importer rule, the lock and
+the catalog walk), `ops/dbimport_guard_pg_test.go` and `cmd/kingresd/dbimport_guard_e2e_test.go`. The importer may have `CREATEROLE` (a role of `kingres_admin` made through the API has it, and import works for it as it is); an importer with a member that can log in (a member with neither SET nor INHERIT, as the creator is, does not count) is refused, and `SUPERUSER`, `REPLICATION`, `BYPASSRLS` and the `pg_*` file, program and log roles stay refused. A test makes a login role as such an importer in the middle of an import.
+
 ## 2026-11-24 (branch p14c): phase 14c, database import
 
 ### What was done
