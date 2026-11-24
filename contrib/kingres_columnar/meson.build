@@ -157,6 +157,7 @@ tests += {
       't/070_vacuum_order_and_skip.pl',
       't/071_schema_spoof.pl',
       't/072_catalog_trust.pl',
+      't/073_old_script_schema_check.pl',
     ],
   },
 }

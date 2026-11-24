@@ -12,6 +12,36 @@
 --
 \echo Use "CREATE EXTENSION kingres_shard" to load this file. \quit
 
+-- The schema of the extension must not be one that a role that is not a superuser holds or can create objects in: that role would own what the service role, a
+-- superuser, reads and runs.  The check is the same in every script of the extension, the install scripts of the older versions and the upgrade scripts too (a
+-- schema that was made, or given away, after the install is met by ALTER EXTENSION ... UPDATE).  A schema that does not exist yet is made by the script.
+DO $kgchk$
+DECLARE
+    v_schema pg_catalog.text := 'kingres';
+    v_owner  pg_catalog.name;
+BEGIN
+    SELECT r.rolname INTO v_owner
+      FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) n.nspowner
+     WHERE n.nspname OPERATOR(pg_catalog.=) v_schema AND NOT r.rolsuper;
+    IF v_owner IS NOT NULL THEN
+        RAISE EXCEPTION 'the schema % already exists and is owned by %, which is not a superuser', v_schema, v_owner
+            USING ERRCODE = 'insufficient_privilege',
+                  HINT = 'Drop the schema, or make a superuser its owner, before CREATE EXTENSION or ALTER EXTENSION ... UPDATE.';
+    END IF;
+    IF EXISTS (SELECT 1
+                 FROM pg_catalog.pg_namespace n,
+                      LATERAL pg_catalog.aclexplode(COALESCE(n.nspacl, pg_catalog.acldefault('n', n.nspowner))) a
+                WHERE n.nspname OPERATOR(pg_catalog.=) v_schema
+                  AND a.privilege_type OPERATOR(pg_catalog.=) 'CREATE'
+                  AND (a.grantee OPERATOR(pg_catalog.=) 0
+                       OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles g WHERE g.oid OPERATOR(pg_catalog.=) a.grantee AND g.rolsuper))) THEN
+        RAISE EXCEPTION 'the schema % grants CREATE to a role that is not a superuser (or to PUBLIC)', v_schema
+            USING ERRCODE = 'insufficient_privilege',
+                  HINT = 'Revoke CREATE on the schema before CREATE EXTENSION or ALTER EXTENSION ... UPDATE.';
+    END IF;
+END
+$kgchk$;
+
 -- Every object is qualified.  The schema may exist already (another KingresDB
 -- extension made it); see below for whose it is.  Not CREATE SCHEMA IF NOT EXISTS:
 -- PostgreSQL refuses that in a script when the schema exists and is not a member of

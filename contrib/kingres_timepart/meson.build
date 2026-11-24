@@ -54,6 +54,7 @@ tests += {
       't/008_convert_prepared.pl',
       't/009_convert_ddl_race.pl',
       't/010_schema_spoof.pl',
+      't/011_old_script_schema_check.pl',
     ],
   },
 }
