@@ -43,3 +43,22 @@ func ArchiveCopySQL(schema, table string, columns []string, only bool) (string, 
 	}
 	return "COPY (SELECT " + strings.Join(sel, ", ") + " FROM " + from + ") TO STDOUT WITH (" + ArchiveCopyOptions + ")", nil
 }
+
+// ArchiveCopyFromOptions are the options of the load of one data entry of a database archive: the options that wrote it, read back.
+const ArchiveCopyFromOptions = `FORMAT csv, HEADER true, NULL '\N', ENCODING 'UTF8'`
+
+// ArchiveCopyFromSQL is the statement that loads one data entry: COPY into the table with the columns of the entry. The names passed sqlx; the options are fixed.
+func ArchiveCopyFromSQL(schema, table string, columns []string) (string, error) {
+	rel, err := sqlx.QualifiedIdent(schema, table)
+	if err != nil {
+		return "", err
+	}
+	if len(columns) == 0 {
+		return "", fmt.Errorf("an archive entry needs at least one column")
+	}
+	cols, err := identList(columns)
+	if err != nil || cols == "" {
+		return "", fmt.Errorf("the columns are not valid")
+	}
+	return "COPY " + rel.String() + " (" + cols + ") FROM STDIN WITH (" + ArchiveCopyFromOptions + ")", nil
+}

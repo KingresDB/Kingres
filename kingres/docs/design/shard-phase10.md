@@ -1813,7 +1813,7 @@ The step `Split the bucket` is not interruptible by the engine (an interrupted s
 The cancel guard of the kind (`splitCancellable`) accepts a cancel until the split step is done or the "too late" note is recorded; a cancel after that is answered 409 `task_not_cancellable`, which is the truthful answer. A split whose session is lost (a restart of `kingresd`) is not touched by a lost lease or a shutdown: the task is taken over, finds the record and settles it with
 `resume_bucket_splits()`. The cluster test of the split shows both cases (the gate `split_after_triggers` for the undo, `split_after_backfill` for the late cancel, which ends done with the children in the bucket list).
 
-## 23. Step 4 of the drain (the hand-over of the map group) and the standby-lag rule, as built (placeholder contract 0.27.0)
+## 23. Step 4 of the drain (the hand-over of the map group) and the standby-lag rule, as built (contract 0.27.0)
 
 **Step 4 is built** (`internal/rebalance/handover.go`); it settles the **[Needs verification]** of section 11.3.
 

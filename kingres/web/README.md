@@ -531,6 +531,16 @@ The Ledger page has a sixth tab, **Client keys** (`?tab=clients`, after Anchorin
 - **Waits for the contract or the server.** The result of the bundle task (an id) is read from the task detail; a verification record has no member that says which checks ran; one proof per bundle is offered
   (the contract takes a list). Tests: `ledger-ops-0-11.test.ts`; the browser tests have three new states (the bundle dialog, the acknowledgement dialog, the audit card).
 
+## What the panel does for contract 0.30.0 (database import, phase 14c)
+
+_Import database_ sits in the header of the Databases page, next to _Create database_. It is for administrators; others see it disabled with the reason, and so does everyone while `dataTransfer` is off. The dialog (`ImportDatabaseDialog.vue`) goes in three steps:
+
+1. **The file.** An archive made by _Export database_, sent with the resumable uploader (purpose `databaseArchive`, the same one as _Validate an archive_).
+2. **The validation and the report.** `validateDatabaseArchive` with progress, then the archive report page of 14b: versions, extensions, tables, the statements the shape grammar refuses (kind, position, fingerprint; never the text; with the sentence that such a database is a job for pg_dump), reasons that stop the dialog, and below it the options: the name of the new database (default from the file name, checked live against `^[a-z_][a-z0-9_]{0,62}$` and the databases that exist), an optional SHA-256 to compare, the **required** acknowledgement of ADR 0028 when the archive has ledger tables, the statement that time-partition policies come back disabled, `onForeignKeyViolation` and `keepOnFailure`. The confirm button is disabled while a blocker shows, and the blockers are listed.
+3. **The task** `database.import` with its thirteen steps (and a step for each other server after the second). On failure the dialog names the step and says whether the private database was removed or kept; on success it links to the new database and lists the lines of the task's detail (the policies that were imported disabled, the ledger chains that started again, the constraints that stay NOT VALID). A role the server refuses as dangerous (superuser, replication, bypass of row-level security, access to server files) is told to sign in as another administrator.
+
+The server reads the archive again whatever the validation said; the dialog only shows what the import will do. **Mock:** `importDatabase` behaves like the server. Fixtures by file name: `ledger.kdx.zip` (needs the acknowledgement), `code.kdx.zip` (`archive_statement_refused`), `hostile.kdx.zip` (`archive_invalid`), `old.kdx.zip` (`archive_incompatible`), `failload.kdx.zip` (fails in _Load the data_ with `row_count_mismatch`), `fkviolation.kdx.zip` (`foreign_key_violation`, or finished with `keepNotValid`). The switch `?transfer=superuser` makes the role dangerous (403 `forbidden`; `ordinaryrole` undoes it). Tests: `tests/import-mock-0-41.test.ts`, `tests/import-ui-0-41.test.ts`, `browser-tests/import-0-30.test.ts`.
+
 ## What the panel does for contract 0.19.0 (data transfer, phase 14a)
 
 Contract 0.19.0 adds ten operations under the tag `Data transfer`: `exportTable`, `importTable`, the four calls of an upload

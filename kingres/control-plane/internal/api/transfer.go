@@ -167,3 +167,13 @@ type ArchiveReport struct {
 	Warnings   []string           `json:"warnings,omitempty"`
 	Reasons    []TableBlocker     `json:"reasons"`
 }
+
+// ImportDatabaseRequest is the body of importDatabase (contract 0.30.0). It is a closed schema: there is no privileges, no allowCode and no bucketCount.
+type ImportDatabaseRequest struct {
+	UploadID                 string `json:"uploadId"`
+	Database                 string `json:"database,omitempty"`
+	ExpectedSHA256           string `json:"expectedSha256,omitempty"`
+	AcknowledgeLedgerRestart bool   `json:"acknowledgeLedgerRestart,omitempty"`
+	OnForeignKeyViolation    string `json:"onForeignKeyViolation,omitempty"`
+	KeepOnFailure            bool   `json:"keepOnFailure,omitempty"`
+}

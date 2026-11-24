@@ -329,7 +329,7 @@ func (s *Server) listTasks(_ *call, w http.ResponseWriter, r *http.Request) erro
 			"replication.restorePreferredPrimaries", "ledger.verify", "networkAccess.apply", "replicate.apply",
 			"certificate.renew", "certificate.revoke", "standby.reconcile", "config.apply", "config.restart",
 			"ledger.key.create", "ledger.key.rotate", "ledger.key.retire", "ledger.key.revoke", "ledger.key.distribute",
-			"ledger.bundle.create", "ledger.epoch.start", "ledger.upgrade", "table.export", "table.import", "database.export", "archive.validate"),
+			"ledger.bundle.create", "ledger.epoch.start", "ledger.upgrade", "table.export", "table.import", "database.export", "archive.validate", "database.import"),
 	}
 	page := pp.page()
 	if p := pp.err(); p != nil {

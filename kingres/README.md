@@ -36,12 +36,12 @@ There is one product branch per PostgreSQL major, with the same KingresDB code o
 | 7 Signing, anchoring, publication, aggregate digest | Done except step 24, which is dropped from the first release; fix rounds reviewed and merged | [ledger-phase7](docs/design/ledger-phase7.md) |
 | 8 Global snapshot, multi-node ledger | Future roadmap, not part of the first release | [architecture](docs/architecture.md) |
 | 9 Table lifecycle | Done (`kingres_shard` extension work, control plane, console pages of increment 9.7); reviewed. Open: distribute with related tables, the operation indicator on a table | [shard-phase9](docs/design/shard-phase9.md) |
-| 10 Elasticity | Built (`kingres_shard` 0.8, control plane, console): strategies, weights, automatic mode, drain, bucket split. Open: drain step 4 (hand-over of the map group) and the standby lag rule | [shard-phase10](docs/design/shard-phase10.md) |
+| 10 Elasticity | Built (`kingres_shard` 0.8, control plane, console): strategies, weights, automatic mode, drain, bucket split. Drain step 4 (hand-over of the map group, contract 0.27.0) and the standby lag rule are built | [shard-phase10](docs/design/shard-phase10.md) |
 | 11 Distributed schemas | Built (extension, schema tasks, console). Schema items in rebalance plans and in `check_cluster` are in `kingres_shard` 0.9; the control plane does not use them yet | [shard-phase11](docs/design/shard-phase11.md) |
-| 12 Real-time analytics | Built: `kingres_sketch` 1.0, `kingres_columnar` 0.2, `kingres_timepart` 0.2; in `kingres_shard` 0.9 repartitioned joins, `MERGE`, columnar tables, approximate `count(DISTINCT)`; control plane (contract 0.18.0) and console. Open: time partitioning of distributed tables (in progress) | [queries](docs/design/analytics-phase12-queries.md), [storage](docs/design/analytics-phase12-storage.md) |
+| 12 Real-time analytics | Built: `kingres_sketch` 1.0, `kingres_columnar` 0.2, `kingres_timepart` 0.2; in `kingres_shard` 0.9 repartitioned joins, `MERGE`, columnar tables, approximate `count(DISTINCT)`; control plane (contract 0.18.0) and console. Time partitioning of distributed tables is built (contract 0.25.0) | [queries](docs/design/analytics-phase12-queries.md), [storage](docs/design/analytics-phase12-storage.md) |
 | 13 Configuration from the console | Done; reviewed twice and fixed | [config-phase13](docs/design/config-phase13.md) |
 | 14a Table CSV export and import | Done (control plane and console, contract 0.19.0); reviewed and fixed | [data-export-import](docs/design/data-export-import.md) |
-| 14b, 14c Database export and import | After the first release (in progress) | [data-export-import](docs/design/data-export-import.md) |
+| 14b, 14c Database export and import | Built (contract 0.29.0 and 0.30.0); the archive is checked as hostile input; after the first release | [data-export-import](docs/design/data-export-import.md) |
 
 The detail of each phase, with every review and what it found, is in the [work log](docs/worklog.md) and in [docs/reviews/](docs/reviews/); the extension READMEs list the limits of each extension.
 

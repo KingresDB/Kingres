@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <script setup lang="ts">
-// The report of the validation of a database archive (contract 0.29.0, a placeholder revision): whether it is valid, the
+// The report of the validation of a database archive (contract 0.29.0): whether it is valid, the
 // versions and the locale of its source, the extensions and what is installed here, the tables by kind, the statements by
 // kind, the statements the shape grammar refused, what an import would need, the warnings and the reasons. The text of a
 // statement of an archive is never shown, and the console never gets it: a refused statement is a kind, a position and a
@@ -10,14 +10,11 @@ import { computed } from 'vue'
 import SafeName from '@/components/SafeName.vue'
 import type { ArchiveReport } from '@/api/types'
 import { formatBytes, formatNumber } from '@/lib/format'
-import {
-  IMPORT_NOT_AVAILABLE_TEXT,
-  LEDGER_RESTART_TEXT,
-  reportHeadline,
-  TABLE_KINDS,
-} from '@/lib/archive'
+import { IMPORT_HINT_TEXT, LEDGER_RESTART_TEXT, reportHeadline, TABLE_KINDS } from '@/lib/archive'
 
-const props = defineProps<{ report: ArchiveReport }>()
+const props = withDefaults(defineProps<{ report: ArchiveReport; showImportHint?: boolean }>(), {
+  showImportHint: true,
+})
 const kinds = computed(() =>
   Object.entries(props.report.statements?.byKind ?? {}).sort(([a], [b]) => a.localeCompare(b)),
 )
@@ -152,7 +149,7 @@ const refused = computed(() => props.report.statements?.refused ?? [])
       </ul>
     </section>
 
-    <p class="muted" data-testid="report-no-import">{{ IMPORT_NOT_AVAILABLE_TEXT }}</p>
+    <p v-if="showImportHint" class="muted" data-testid="report-no-import">{{ IMPORT_HINT_TEXT }}</p>
   </div>
 </template>
 

@@ -3,8 +3,8 @@
 
 // Package sqlshape is the shape grammar of the SQL files of a database archive (design data-export-import.md, "What may run: the shape
 // grammar"). A statement is accepted only if a parser of its exact kind consumes all of it, and each parser accepts only the clauses that
-// pg_dump writes for that kind. This version is the validate-only mode: it classifies and checks, it runs nothing and it creates nothing; the
-// import steps of phase 14c are built on the Plan it returns.
+// pg_dump writes for that kind. ParseFile is the validate-only mode: it classifies and checks, it runs nothing and it creates nothing; Each (exec.go) is the
+// execution mode of phase 14c, which hands out the exact text that the grammar consumed completely.
 //
 // The guarantee that an archive cannot do more than the importing role could do by hand rests on PostgreSQL's privileges. The grammar narrows
 // what is attempted, bounds the resources (statement count and size) and makes the plan checkable before a database exists.

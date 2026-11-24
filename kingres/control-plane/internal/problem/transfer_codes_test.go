@@ -28,6 +28,8 @@ func TestTransferCodesOfContract019(t *testing.T) {
 		{SchemaUnrecognised, "schema_unrecognised", 422},
 		{ArchiveInvalid, "archive_invalid", 422},
 		{ArchiveIncompatible, "archive_incompatible", 422},
+		{ArchiveStatementRefused, "archive_statement_refused", 422},
+		{LedgerRestartNotAcknowledged, "ledger_restart_not_acknowledged", 422},
 	} {
 		p := New(tc.c, "d")
 		if string(p.Code) != tc.want || p.Status != tc.status || p.Title == "" || p.Type != "https://kingresdb.dev/problems/"+slug(tc.want) {

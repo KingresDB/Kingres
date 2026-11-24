@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.29.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.30.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and, when it is built, the planned `kingres-cli` (it does not exist yet). Lint it and run the mechanical rule check with:
 
 ```
@@ -153,6 +153,9 @@ Each task kind has exactly one `subject.type`; `subject.id` is always a string.
 | `table.setStorage` (0.17.0) | `table` | `database/schema.table`; for one partition (`setPartitionStorage`) `database/schema.partition`. Steps of a table: `Check the table`, `Convert the storage` (the detail says that `ALTER TABLE ... SET ACCESS METHOD` takes an `ACCESS EXCLUSIVE` lock), `Analyze the table`; of a partition: `Check the partition`, `Convert the partition`, `Analyze the partition` |
 | `partition.maintain` (0.17.0) | `table` | `database/schema.table`: one run of the time-partitioning policy of the table. Steps: `Begin the run`, `Create partitions`, `Convert partitions`, `Retire partitions`, `Finish the run`. The task's `createdBy` is `system` for a scheduled run and the role for `runPartitionPolicy` |
 | `table.distribute`, `table.undistribute`, `table.alter`, `table.partition` | `table` | `database/schema.table` (0.14.0: the table the request named; one table task per colocation group) |
+| `database.export` (0.29.0) | `database` | The database name: one unfinished database task per database, and a table task of the database is refused while it runs (and the reverse). Steps: `Check the request`, `Take the structure`, `Normalise the schema`, `Write the data`, `Check the archive`, `Seal`; its `detail` is `transfer <id>` when done. Failing codes of its own: `schema_changed`, `schema_unrecognised` |
+| `database.import` (0.30.0) | `database` | The name of the new database (the final name; the work is done in `kingres_import_<task id>`): one unfinished database task per database. Steps: `Check the archive`, `Create the private database` (and `Create the private database on server <id>` for each other server), `Install the extensions`, `Check the functions`, `Create the tables`, `Distribute the tables`, `Create the views`, `Load the data`, `Create the indexes and constraints`, `Set the sequences`, `Enable the ledger and the policies`, `Verify`, `Take the final name`; its `detail` when done lists the disabled time-partition policies and the ledger chains that started again. Failing codes of its own: `archive_statement_refused`, `foreign_key_violation` |
+| `archive.validate` (0.29.0) | `upload` | `<upload id>`. Steps: `Check the upload`, `Read the archive`, `Check the plan`, `Store the report`; the report is stored with the upload and read with `getDataUpload` |
 | `table.export`, `table.import` (0.19.0) | `table` | `database/schema.table`: one unfinished task per table. `table.export` steps: `Check the request`, `Read the table class`, `Write the file`, `Seal`; its `detail` is `transfer <id>` when done. `table.import` steps: `Check the upload`, `Check the table`, `Load rows` (load and commit), `Confirm the commit`, `Clean up`; `Task.cancellable` is false once the commit was sent |
 | `rebalance` | `cluster` | `cluster` (0.9.0; one rebalance at a time, cluster-wide; the task id is the report id): steps `Check that the cluster can rebalance`, `Compute the plan`, `Move buckets`, `Write the report`; a stopped run is `paused` |
 | `schema.distribute`, `schema.move`, `schema.undistribute` (0.15.0) | `schema` | `database/schema`: steps `Check the schema`, `Set REPLICA IDENTITY FULL`, `Make the schema distributed`, `Verify on every server`; `Check the move`, `Copy the data`, `Switch`, `Clean up the old copy`; `Check the schema`, `Move first`, `Make the schema local`, `Verify on every server`; one schema task at a time per schema |
@@ -260,6 +263,33 @@ Tag `Data transfer`: export a table to a CSV file, upload a CSV file, import it 
 - **Audit.** The mutating operations, `downloadDataExport` (a read, audited because data leaves; written when the stream ends), and the system events `dataTransfer.completed` and
   `dataTransfer.purged`. An upload chunk is not an event.
 
+### Database archives (0.29.0)
+
+`exportDatabase` writes one zip archive of a database and `validateDatabaseArchive` checks an uploaded one without touching any database. Importing an archive is a later revision.
+The design is `kingres/docs/design/data-export-import.md` (phase 14b).
+
+- **The archive.** Exactly these entries: `manifest.json` (written last, read first), `catalog.json`, `schema/pre-data.sql`, `schema/views.sql`, `schema/post-data.sql` and `data/NNNNN.csv` (one per table that is a standalone table
+  or a partition root; leaves are structure only). Data is UTF-8 CSV with `NULL '\N'` and every field quoted, so an empty string and a null differ. The file is a zip file with data descriptors (the shape a streaming writer produces); the validator
+  accepts that shape and no other. The checksums find damage; they are **not** signatures. `DataExport.sha256` is the SHA-256 of the whole file.
+- **What it does not carry.** Large objects and `oid` or `reg*` columns (422 `large_objects_present` unless acknowledged), roles, tablespaces, policies, rules, event triggers, functions, triggers, publications, foreign objects, extended
+  statistics, collations, unlogged tables (422 `schema_unrecognised`, naming the kind), the placement of buckets, the history of the ledger and of the time-partition runs, and node-local sequence state other than the coordinator's.
+- **Who and what is checked.** `kingres_admin`, `dataTransfer.enabled`, TLS, and the privileges of the signed-in role on **every** table: the first 20 objects it cannot read are named in the 422 `export_not_readable`.
+- **Consistency.** `archive-single-snapshot` when every table is local, reference or on the group of the connection (one `REPEATABLE READ` transaction); otherwise one label per table as for a table export.
+  A change of the structure while the export runs fails the task with `schema_changed`. **There is no global snapshot.**
+- **The report.** `DataUpload.report` (`ArchiveReport`) after a validation: the versions, the tables by kind, the statements by kind and the ones the shape grammar refused (kind, position, fingerprint; never the text), what the
+  archive needs, warnings and `reasons`. An archive that is not valid is a finished task whose report says `valid: false`.
+
+### Database import (0.30.0)
+
+`importDatabase` (`POST /database-imports`) loads a database archive into a **new** database. The design is `kingres/docs/design/data-export-import.md` (phase 14c).
+
+- **The archive is hostile.** The task reads it again from its bytes (the validator, the shape grammar, `expectedSha256`), whatever the state of the upload says. A statement that the shape grammar does not consume completely is never run;
+  a refusal is 422 `archive_statement_refused` and names the kind, the position and a fingerprint, never the text. There is no `allowCode` and no `privileges`.
+- **As the signed-in role.** Statements run on a connection of the role, one per round trip, with `search_path = pg_catalog`; PostgreSQL's privileges are the guarantee, and a role that is a superuser, replicates, bypasses
+  row-level security or reads server files, programs or logs is refused (403 `forbidden`).
+- **A private name.** The work is done in `kingres_import_<task id>`; the last step renames it. A failed or cancelled task drops it (not with `keepOnFailure`).
+- **Ledger and policies.** Ledger tables start a new chain (`acknowledgeLedgerRestart`); time-partition policies come back disabled.
+
 ## Inclusion proofs and `kingres-verify`
 
 `POST /databases/{databaseName}/ledger/inclusion-proofs` answers with the proof document of
@@ -362,6 +392,25 @@ Where the architecture document leaves something open, the simplest option was c
     range and the cluster's replica count.
 
 ## Changelog
+
+### 0.30.0
+
+Revision written first for the database import of phase 14c (`kingres/docs/design/data-export-import.md`). Summary for the panel:
+1 operation added (177 operations, 141 paths); one task kind, two problem codes and one object (`ImportDatabaseRequest`) added; **no change that is not additive**.
+
+#### Breaking
+
+None.
+
+#### Additive
+- `importDatabase` (`POST /database-imports`, task kind `database.import`; needs `kingres_admin`).
+- `ProblemCode` has `archive_statement_refused` and `ledger_restart_not_acknowledged`; `foreign_key_violation` is a code of a failed task.
+- `TaskKind` has `database.import`; `AuditAction` has `importDatabase`.
+- Schemas: `ImportDatabaseRequest` (closed; `acknowledgeLedgerRestart`, `onForeignKeyViolation`, `keepOnFailure`). The work is done in a private database name.
+
+#### Documentation
+
+- The section "Database import" states what the import runs, as whom, under which name, and what it does with ledger tables and time-partition policies.
 
 ### 0.29.0
 
@@ -473,7 +522,7 @@ None.
 
 ### 0.24.0
 
-Placeholder revision for the security fix of the extension schemas (`kingres/docs/reviews/2026-11-23-extension-schema-trust.md`); the number is set when the revision is merged. **No change that is not additive.**
+Revision for the security fix of the extension schemas (`kingres/docs/reviews/2026-11-23-extension-schema-trust.md`). **No change that is not additive.**
 
 #### Additive
 

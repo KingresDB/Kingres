@@ -989,7 +989,7 @@ export const endpoints = {
         body,
       }),
     )) as Task,
-  // --- database archives (0.29.0, a placeholder revision): export a database, validate an uploaded archive
+  // --- database archives (0.29.0): export a database, validate an uploaded archive
   /** 202 + task `database.export` (subject type `database`); when it is done its `detail` is `transfer <id>`. */
   exportDatabase: async (
     databaseName: string,
@@ -1007,6 +1007,9 @@ export const endpoints = {
       api.POST('/data-uploads/{uploadId}/validation', { params: { path: { uploadId } } }),
     )) as Task,
   // The calls of an upload keep the session in place when the answer is 401: the uploader asks for the password and goes on.
+  /** 202 + task `database.import` (subject type `database`, id the new name); contract 0.30.0. */
+  importDatabase: async (body: S['ImportDatabaseRequest']): Promise<Task> =>
+    (await j(api.POST('/database-imports', { body }))) as Task,
   createDataUpload: (body: S['CreateDataUploadRequest']) =>
     j(api.POST('/data-uploads', { body }), { keepSession: true }),
   getDataUpload: (uploadId: string) =>

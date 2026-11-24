@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <script setup lang="ts">
-// Export a whole database to one archive (contract 0.29.0, a placeholder revision). The dialog says, before the person
+// Export a whole database to one archive (contract 0.29.0). The dialog says, before the person
 // confirms, what the archive holds and does not hold, how the tables will be read (one snapshot or per group, and that
 // there is no global snapshot), that the role needs to read every table, and that an import checks the foreign keys at its end.
 // It follows the export as a task, by table, and then shows the archive with its SHA-256 and a download that resumes.

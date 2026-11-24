@@ -1977,3 +1977,134 @@ export const ARCHIVE_STATES: PageState[] = [
     },
   },
 ]
+
+/** Chooses an archive in the Import database dialog; the mock reacts to the file name. */
+async function chooseImportArchive(page: Page, name: string): Promise<void> {
+  await page.evaluate((n) => {
+    const input = document.querySelector<HTMLInputElement>('[data-testid="import-file"]')
+    if (!input) throw new Error('No file input')
+    const transfer = new DataTransfer()
+    transfer.items.add(
+      new File([new Uint8Array(70_000)], n, { type: 'application/zip', lastModified: 1 }),
+    )
+    input.files = transfer.files
+    input.dispatchEvent(new Event('change', { bubbles: true }))
+  }, name)
+  await page.waitForSelector('[data-testid="import-chosen"]', { timeout: 20_000 })
+  await sleep(250)
+}
+
+/** Opens Import database, sends a fixture archive and waits for its report and options (or the reasons). */
+async function validateForImport(page: Page, name: string, ready: string): Promise<void> {
+  await fastTasks(page)
+  await page.click('[data-testid="import-database"]')
+  await page.waitForSelector('[data-testid="import-file"]', { timeout: 20_000 })
+  await chooseImportArchive(page, name)
+  await page.click('[data-testid="import-start"]')
+  await page.waitForSelector(ready, { timeout: 30_000 })
+  await sleep(250)
+}
+
+const importClose = async (page: Page): Promise<void> => {
+  await closeDialogs(page)
+  await slowTasks(page)
+}
+
+/** Each run of the finished import makes a database of its own, so a second run finds its name free. */
+let importRuns = 0
+
+/** The states of the database import (contract 0.30.0, a placeholder revision). */
+export const IMPORT_STATES: PageState[] = [
+  {
+    name: 'databases page with the import action (0.30.0)',
+    needsMock: true,
+    route: '/databases',
+    open: async (page) => {
+      await page.waitForSelector('[data-testid="import-database"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+  },
+  {
+    name: 'import database, file chosen (0.30.0)',
+    needsMock: true,
+    route: '/databases',
+    open: async (page) => {
+      await page.click('[data-testid="import-database"]')
+      await page.waitForSelector('[data-testid="import-file"]', { timeout: 20_000 })
+      await chooseImportArchive(page, 'shop_copy.kdx.zip')
+    },
+    close: cancel,
+  },
+  {
+    name: 'import database, report and options (0.30.0)',
+    needsMock: true,
+    route: '/databases',
+    open: (page) => validateForImport(page, 'shop_copy.kdx.zip', '[data-testid="import-options"]'),
+    close: importClose,
+  },
+  {
+    name: 'import database, ledger acknowledgement (0.30.0)',
+    needsMock: true,
+    route: '/databases',
+    open: (page) => validateForImport(page, 'ledger.kdx.zip', '[data-testid="import-ledger"]'),
+    close: importClose,
+  },
+  {
+    name: 'import database, refused statements (0.30.0)',
+    needsMock: true,
+    route: '/databases',
+    open: (page) => validateForImport(page, 'code.kdx.zip', '[data-testid="import-cannot"]'),
+    close: importClose,
+  },
+  {
+    name: 'import database, not compatible (0.30.0)',
+    needsMock: true,
+    route: '/databases',
+    open: (page) => validateForImport(page, 'old.kdx.zip', '[data-testid="import-cannot"]'),
+    close: importClose,
+  },
+  {
+    name: 'import database, done (0.30.0)',
+    needsMock: true,
+    route: '/databases',
+    open: async (page) => {
+      await validateForImport(
+        page,
+        `browser_copy_${(importRuns += 1)}.kdx.zip`,
+        '[data-testid="import-options"]',
+      )
+      await page.click('[data-testid="import-confirm"]')
+      await page.waitForSelector('[data-testid="import-done"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+    close: importClose,
+  },
+  {
+    name: 'import database, failed (0.30.0)',
+    needsMock: true,
+    route: '/databases',
+    open: async (page) => {
+      await validateForImport(page, 'failload.kdx.zip', '[data-testid="import-options"]')
+      await page.click('[data-testid="import-confirm"]')
+      await page.waitForSelector('[data-testid="import-failed"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+    close: importClose,
+  },
+  {
+    name: 'import database, dangerous role (0.30.0)',
+    needsMock: true,
+    route: '/databases',
+    open: async (page) => {
+      await urlSwitch(page, 'transfer', 'superuser')
+      await validateForImport(page, 'danger.kdx.zip', '[data-testid="import-options"]')
+      await page.click('[data-testid="import-confirm"]')
+      await page.waitForSelector('[data-testid="import-dangerous"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await importClose(page)
+      await urlSwitch(page, 'transfer', 'ordinaryrole')
+    },
+  },
+]

@@ -49,6 +49,10 @@ export const FIXTURE_ARCHIVES = {
   ledger: 'ledger.kdx.zip',
   /** A statement of the SQL is refused by the shape grammar: kind, position and fingerprint, never its text. */
   code: 'code.kdx.zip',
+  /** The load fails at the table `public.orders` (`row_count_mismatch`): the private database is removed. */
+  failload: 'failload.kdx.zip',
+  /** The loaded rows violate a foreign key: `foreign_key_violation`, or with `keepNotValid` a finished import that lists the violations. */
+  fkviolation: 'fkviolation.kdx.zip',
 } as const
 
 export interface UploadRec {
@@ -124,6 +128,8 @@ export const transferSwitches = {
   dbExportFails: false,
   /** The next database export fails with `schema_changed` (the fingerprint differs at the end). */
   schemaChanges: false,
+  /** The signed-in role is a superuser (or can read server files): 403 `forbidden` for an import of a database. */
+  dangerousRole: false,
 }
 
 export function resetTransferSwitches(): void {
@@ -144,6 +150,7 @@ export function resetTransferSwitches(): void {
   transferSwitches.unreadable = false
   transferSwitches.dbExportFails = false
   transferSwitches.schemaChanges = false
+  transferSwitches.dangerousRole = false
 }
 
 /** The default `dataTransfer` setting of the mock: on, so that the console can be tried; tests turn it off. */

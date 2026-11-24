@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: KingresDB Management API
-  version: 0.29.0
+  version: 0.30.0
   summary: REST API of the KingresDB management panel, CLI and manager.
   description: |
     The single REST API served by `kingresd` on every KingresDB server. The web panel
@@ -5632,7 +5632,7 @@ paths:
       operationId: exportDatabase
       summary: Export a database to one archive
       description: |
-        Added in 0.29.0 (data transfer, phase 14b; the number is a placeholder). Starts the task `database.export` (subject type `database`, id the database name): the structure, the KingresDB
+        Added in 0.29.0 (data transfer, phase 14b). Starts the task `database.export` (subject type `database`, id the database name): the structure, the KingresDB
         catalog (how every table is distributed, its access method, ledger and time-partition policies, sequences) and the data of every table are written to one **zip archive**
         that is staged on the manager leader, sealed (encrypted at rest) and kept for `retentionHours`. The answer is the task; when it is `done` its `detail` is `transfer <id>` and
         `getDataExport` (kind `databaseExport`, format `archive/1`) says size, rows, SHA-256 and the consistency label of every table; `downloadDataExport` serves the file as `application/zip`.
@@ -5842,7 +5842,7 @@ paths:
       operationId: validateDatabaseArchive
       summary: Validate an uploaded database archive
       description: |
-        Added in 0.29.0 (data transfer, phase 14b; the number is a placeholder). Starts the task `archive.validate` (subject type `upload`, id the upload id) for a complete upload whose purpose is
+        Added in 0.29.0 (data transfer, phase 14b). Starts the task `archive.validate` (subject type `upload`, id the upload id) for a complete upload whose purpose is
         `databaseArchive`. It reads the archive once from end to end and **touches no database**: the shape of the zip file (the local headers against the central directory, the descriptors, that the extents
         account for every byte, the names, the sizes counted while reading), the SHA-256 and the CRC-32 of every entry against the manifest, the manifest and the catalog document (strict JSON, closed members, identifiers),
         that the columns of each data entry equal the columns of the schema, the versions (format, PostgreSQL major, extensions, locale) and, with the shape grammar in its validate-only mode, every statement of the three SQL files
@@ -5857,6 +5857,54 @@ paths:
       x-required-role: kingres_admin
       responses:
         '202': { $ref: '#/components/responses/AcceptedArchiveValidation' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/DataTransferForbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/DataTransferConflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /database-imports:
+    post:
+      operationId: importDatabase
+      summary: Import a database archive as a new database
+      description: |
+        Added in 0.30.0 (data transfer, phase 14c). Starts the task `database.import` (subject type `database`, id the name of the new database): the archive of a complete upload
+        (purpose `databaseArchive`, made by `exportDatabase`) is loaded into a **new** database. The archive is **hostile input**: the task reads it again from its bytes (the whole validator and the shape grammar, then
+        the SHA-256 against `expectedSha256`), whatever `validateDatabaseArchive` said before. The SQL of the archive is never run as it is: a **shape grammar** accepts only the statements `pg_dump` writes for
+        schemas, tables, sequences, types, domains, indexes, constraints, views and comments, and **refuses** functions, triggers, policies, rules, `GRANT`, `SET`, `ALTER DATABASE`, `COPY`, `DO` and everything else
+        (422 `archive_statement_refused`; `reasons` name the kind, the position and a fingerprint, never the text). There is no `allowCode` and no `privileges: restore`: every object is owned by the importing role.
+        The statements run **as the signed-in role**, one per round trip, never as the service role, so PostgreSQL's privileges are the guarantee; a role with `SUPERUSER`, `REPLICATION` or `BYPASSRLS`, or with access to
+        server files, programs or logs, is refused with 403 `forbidden` and must sign in as another role. The extensions of the archive are installed from a closed list.
+
+        The import works in a database with a **private name** (`kingres_import_<task id>`) that only the task uses, and renames it to its final name as its last step; a failed or cancelled import drops the private database
+        (unless `keepOnFailure`), and nothing of the final name exists. Order: the extensions, the tables, the distribution of the tables **while they are empty**, the views, the data (one transaction per table, the rows
+        counted against the manifest), the indexes and constraints, the sequences, then the ledger and the time-partition policies. **Ledger tables are carried as data and start a new chain** (ADR 0028): the import
+        enters their rows as the first entries of a new chain, `ledger_verify` must find nothing, and then the signature policy of the source is set again; it needs `acknowledgeLedgerRestart: true` (422
+        `ledger_restart_not_acknowledged` otherwise). **Time-partition policies come back disabled**; the task's last detail lists them with the call that enables each.
+
+        Needs `kingres_admin`, `dataTransfer.enabled` (403 `data_transfer_disabled`) and a request over TLS (403 `insecure_transport`). 404: the upload does not exist or is another role's. 409 `upload_incomplete`;
+        409 `already_exists`: the database exists; 409 `operation_in_progress`: a task uses the upload or the transfer limit is reached. 422 `archive_invalid`, `archive_incompatible` (the PostgreSQL major of the
+        target must be at least the source's), `archive_statement_refused`, `import_too_large` (more than `maxImportBytes`, a statement or a count above its limit) and `ledger_restart_not_acknowledged`.
+        Steps: *Check the archive*, *Create the private database* (and one step for each other server), *Install the extensions*, *Check the functions*, *Create the tables*, *Distribute the tables*, *Create the views*,
+        *Load the data*, *Create the indexes and constraints*, *Set the sequences*, *Enable the ledger and the policies*, *Verify*, *Take the final name*. A task is cancellable until *Set the sequences* starts.
+        Task codes: `archive_invalid`, `archive_incompatible`, `archive_statement_refused`, `foreign_key_violation` (the constraint's name and the count), `table_not_eligible`, `row_count_mismatch`, `verification_failed`,
+        `transfer_leader_changed` (retryable), `transfer_session_lost` (retryable), `forbidden`, `cancelled`. The error of a task never carries a value, a row, the text of a statement or text of the server.
+      tags: [Data transfer]
+      x-required-role: kingres_admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ImportDatabaseRequest' }
+            examples:
+              defaults: { summary: The archive under the name it was exported with, value: { uploadId: '43' } }
+              renamed: { summary: Under a new name, with the checksum the operator got elsewhere, value: { uploadId: '43', database: shop_copy, expectedSha256: 3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1b } }
+              ledger: { summary: An archive with ledger tables, value: { uploadId: '44', acknowledgeLedgerRestart: true, onForeignKeyViolation: keepNotValid, keepOnFailure: true } }
+      responses:
+        '202': { $ref: '#/components/responses/AcceptedDatabaseImport' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/DataTransferForbidden' }
@@ -6498,6 +6546,48 @@ components:
                 createdAt: '2026-11-22T11:00:00Z'
                 updatedAt: '2026-11-22T11:00:40Z'
                 createdBy: alice
+    AcceptedDatabaseImport:
+      description: |
+        The import was accepted and runs as the task `database.import` (added in 0.30.0). Poll `GET /tasks/{taskId}` (the `Location` header) until `state` is `done` or `failed`. When it is `done` the database
+        exists under its final name and `detail` lists what needs a decision (the disabled time-partition policies, the ledger chains that started again); when it failed the private database was removed (or kept, with
+        `keepOnFailure`) and the final name was never taken.
+      headers:
+        Location:
+          description: URL of the task, `/api/v1/tasks/{taskId}`.
+          schema: { type: string }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Task' }
+          examples:
+            importDatabase:
+              value:
+                id: 141
+                kind: database.import
+                state: running
+                progress:
+                  percent: 45
+                  currentStep: Load the data
+                  steps:
+                    - { name: Check the archive, state: done, detail: null, itemsDone: 1, itemsTotal: 1, startedAt: '2026-11-22T12:00:00Z', finishedAt: '2026-11-22T12:00:09Z' }
+                    - { name: Create the private database, state: done, detail: null, itemsDone: 1, itemsTotal: 1, startedAt: '2026-11-22T12:00:09Z', finishedAt: '2026-11-22T12:00:11Z' }
+                    - { name: Install the extensions, state: done, detail: null, itemsDone: 1, itemsTotal: 1, startedAt: '2026-11-22T12:00:11Z', finishedAt: '2026-11-22T12:00:13Z' }
+                    - { name: Check the functions, state: done, detail: null, itemsDone: 1, itemsTotal: 1, startedAt: '2026-11-22T12:00:13Z', finishedAt: '2026-11-22T12:00:13Z' }
+                    - { name: Create the tables, state: done, detail: null, itemsDone: 1, itemsTotal: 1, startedAt: '2026-11-22T12:00:13Z', finishedAt: '2026-11-22T12:00:15Z' }
+                    - { name: Distribute the tables, state: done, detail: null, itemsDone: 1, itemsTotal: 1, startedAt: '2026-11-22T12:00:15Z', finishedAt: '2026-11-22T12:00:19Z' }
+                    - { name: Create the views, state: done, detail: null, itemsDone: 1, itemsTotal: 1, startedAt: '2026-11-22T12:00:19Z', finishedAt: '2026-11-22T12:00:20Z' }
+                    - { name: Load the data, state: running, detail: 'public.orders (4 of 14), 90211333 bytes so far', itemsDone: 4, itemsTotal: 14, startedAt: '2026-11-22T12:00:20Z', finishedAt: null }
+                    - { name: Create the indexes and constraints, state: pending, detail: null, itemsDone: null, itemsTotal: null, startedAt: null, finishedAt: null }
+                    - { name: Set the sequences, state: pending, detail: null, itemsDone: null, itemsTotal: null, startedAt: null, finishedAt: null }
+                    - { name: Enable the ledger and the policies, state: pending, detail: null, itemsDone: null, itemsTotal: null, startedAt: null, finishedAt: null }
+                    - { name: Verify, state: pending, detail: null, itemsDone: null, itemsTotal: null, startedAt: null, finishedAt: null }
+                    - { name: Take the final name, state: pending, detail: null, itemsDone: null, itemsTotal: null, startedAt: null, finishedAt: null }
+                error: null
+                subject: { type: database, id: shop_copy }
+                cancellable: true
+                detail: null
+                createdAt: '2026-11-22T12:00:00Z'
+                updatedAt: '2026-11-22T12:00:40Z'
+                createdBy: alice
     AcceptedArchiveValidation:
       description: |
         The validation was accepted and runs as the task `archive.validate` (added in 0.29.0). Poll `GET /tasks/{taskId}` until it is `done`, then read the report with `getDataUpload`.
@@ -6860,6 +6950,8 @@ components:
         - schema_unrecognised
         - archive_invalid
         - archive_incompatible
+        - archive_statement_refused
+        - ledger_restart_not_acknowledged
     ValidationIssue:
       type: object
       description: One invalid field of a request.
@@ -10953,6 +11045,7 @@ components:
         - table.import
         - database.export
         - archive.validate
+        - database.import
     TaskStep:
       type: object
       description: One step of a task.
@@ -11590,6 +11683,7 @@ components:
         - deleteDataExport
         - exportDatabase
         - validateDatabaseArchive
+        - importDatabase
         - dataTransfer.completed
         - dataTransfer.purged
         - setCaEscrow
@@ -13916,7 +14010,7 @@ components:
     AlertKind:
       type: string
       description: |
-        Alert type. Clients must tolerate kinds they do not know. Added in 0.24.0 (placeholder revision): `extensionSchemaUntrusted` (the schema of a KingresDB extension in a database is not owned by a superuser, or an object in it is not a member of an extension, or a role that is not a superuser can create objects in it, so the service role does not read or call anything in it; the monitor raises it for the database and the readings of that database that depend on the extension are not available; subject `server` and `database`; `critical`). Added in 0.19.0: `transferStagingLow` (the reservations of the staged files of the data transfer hold 90 percent of `dataTransfer.stagingQuotaBytes`, `critical` at 98 percent; subject `server`; raised by the server that holds the files, the manager leader). Added in 0.15.0: `rebalanceFailed` (the last automatic rebalance failed and the mode is suspended until an operator starts a rebalance; subject `cluster`; `warning`). Added in 0.13.0: `certificateAuthorityUnavailable` (the map group was failed over and the new manager leader holds no key of the certificate authority, so no certificate can be issued, renewed or revoked until the operator restores `pki/ca.key` and `pki/revoked.json` from the backup of the old leader; subject `cluster`; `critical`). Added in 0.11.0 (ledger phase 7; subjects at `AlertSubject`): `ledgerNotAnchored` (a database has ledger tables and no anchor target is enabled; `info`, `warning` when the setting `anchor.required` is on), `ledgerAnchorBehind` (`warning`, `critical`), `ledgerAnchorFailed` (an anchor record is `failed` or `expired`; `critical`), `ledgerAnchorConflict` (the store holds a different object under the name of an anchor; `critical`), `ledgerChainDiverged` (a chain no longer extends its published log; `critical`), `ledgerGroupUnread` (a shard group's chain could not be read; `warning`, `critical`), `ledgerPublicationBehind` (the newest signed checkpoint of a chain is older than five publication intervals while its head advanced; `warning`), `ledgerSignerUnavailable` (no checkpoint could be signed for two rounds, or the key set is damaged, or the key file is missing on the leader; `critical`) and `ledgerDigestOverdue` (no digest within twice `digestIntervalSeconds`; `warning`). Added in 0.8.0: `clockDifference` (a server's clock differs from the manager leader's by more than `ClusterSettings.clock.maxDifferenceMs`, less the uncertainty of the measurement; `warning`, `critical` at ten times the threshold; `kingresd` does not set the system clock, run NTP or chrony). Added in 0.7.0: `leaseLost` (the `kingresd` that
+        Alert type. Clients must tolerate kinds they do not know. Added in 0.24.0: `extensionSchemaUntrusted` (the schema of a KingresDB extension in a database is not owned by a superuser, or an object in it is not a member of an extension, or a role that is not a superuser can create objects in it, so the service role does not read or call anything in it; the monitor raises it for the database and the readings of that database that depend on the extension are not available; subject `server` and `database`; `critical`). Added in 0.19.0: `transferStagingLow` (the reservations of the staged files of the data transfer hold 90 percent of `dataTransfer.stagingQuotaBytes`, `critical` at 98 percent; subject `server`; raised by the server that holds the files, the manager leader). Added in 0.15.0: `rebalanceFailed` (the last automatic rebalance failed and the mode is suspended until an operator starts a rebalance; subject `cluster`; `warning`). Added in 0.13.0: `certificateAuthorityUnavailable` (the map group was failed over and the new manager leader holds no key of the certificate authority, so no certificate can be issued, renewed or revoked until the operator restores `pki/ca.key` and `pki/revoked.json` from the backup of the old leader; subject `cluster`; `critical`). Added in 0.11.0 (ledger phase 7; subjects at `AlertSubject`): `ledgerNotAnchored` (a database has ledger tables and no anchor target is enabled; `info`, `warning` when the setting `anchor.required` is on), `ledgerAnchorBehind` (`warning`, `critical`), `ledgerAnchorFailed` (an anchor record is `failed` or `expired`; `critical`), `ledgerAnchorConflict` (the store holds a different object under the name of an anchor; `critical`), `ledgerChainDiverged` (a chain no longer extends its published log; `critical`), `ledgerGroupUnread` (a shard group's chain could not be read; `warning`, `critical`), `ledgerPublicationBehind` (the newest signed checkpoint of a chain is older than five publication intervals while its head advanced; `warning`), `ledgerSignerUnavailable` (no checkpoint could be signed for two rounds, or the key set is damaged, or the key file is missing on the leader; `critical`) and `ledgerDigestOverdue` (no digest within twice `digestIntervalSeconds`; `warning`). Added in 0.8.0: `clockDifference` (a server's clock differs from the manager leader's by more than `ClusterSettings.clock.maxDifferenceMs`, less the uncertainty of the measurement; `warning`, `critical` at ten times the threshold; `kingresd` does not set the system clock, run NTP or chrony). Added in 0.7.0: `leaseLost` (the `kingresd` that
         runs the primary of a shard group could not renew the group's lease in time; for a group with a standby the
         instance was stopped (fenced), for a group without one it keeps running and this alert is the only effect;
         `critical`), `groupWithoutSynchronousStandby` (the group's standby has been unreachable for longer than the
@@ -14446,6 +14540,38 @@ components:
           minimum: 1
           maximum: 168
           description: How long the archive is kept; default the cluster setting.
+    ImportDatabaseRequest:
+      type: object
+      description: |
+        Added in 0.30.0. The request of `importDatabase`. A closed schema: there is no `privileges`, no `allowCode` and no `bucketCount` (owners and grants are not restored, functions and triggers are always refused, the
+        bucket counts of the archive are kept), so that a later revision can add them without changing what a request means.
+      required: [uploadId]
+      additionalProperties: false
+      properties:
+        uploadId:
+          type: string
+          description: "A complete upload of the caller whose purpose is `databaseArchive`. It need not have been validated: the import reads the archive again."
+        database:
+          type: string
+          pattern: '^[a-z_][a-z0-9_]{0,62}$'
+          description: The name of the new database; default the name in the manifest. 409 `already_exists` when it exists at the request, and the task fails when it exists when the final name is taken.
+        expectedSha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: Binds the import to a checksum the operator got elsewhere (the export's SHA-256 as the console shows it); a different file is 422 `archive_invalid`.
+        acknowledgeLedgerRestart:
+          type: boolean
+          default: false
+          description: Required `true` when the archive has a ledger table; the imported table is a new chain (ADR 0028). 422 `ledger_restart_not_acknowledged` otherwise.
+        onForeignKeyViolation:
+          type: string
+          enum: [fail, keepNotValid]
+          default: fail
+          description: '`fail`: a foreign key that the loaded rows violate fails the task (the code `foreign_key_violation` names the constraint and the count) and the database is removed. `keepNotValid`: the constraint stays `NOT VALID`, the database is kept and the violations are reported by constraint name and count.'
+        keepOnFailure:
+          type: boolean
+          default: false
+          description: Keep the private database if the import fails, to look at it. It stays under its private name until it is dropped.
     ArchiveReport:
       type: object
       description: |

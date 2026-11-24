@@ -32,6 +32,7 @@ func (s *Server) transferHandlers() map[string]handlerFunc {
 		"importTable":             s.importTable,
 		"exportDatabase":          s.exportDatabase,
 		"validateDatabaseArchive": s.validateDatabaseArchive,
+		"importDatabase":          s.importDatabase,
 	}
 }
 

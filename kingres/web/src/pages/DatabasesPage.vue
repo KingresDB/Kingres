@@ -14,7 +14,8 @@ import SafeName from '@/components/SafeName.vue'
 import { isAddressableSegment } from '@/lib/path-segment'
 import CreateDatabaseDialog from '@/components/CreateDatabaseDialog.vue'
 import TransfersPanel from '@/components/transfers/TransfersPanel.vue'
-import { useDatabaseCreateOptions, useDatabases } from '@/api/queries'
+import ImportDatabaseDialog from '@/components/transfers/ImportDatabaseDialog.vue'
+import { useClusterSettings, useDatabaseCreateOptions, useDatabases } from '@/api/queries'
 import { DATABASE_STATUS, DURABILITY_LABEL, LEDGER_MODE_LABEL, LEDGER_STATE } from '@/lib/status'
 import { formatBytes, formatNumber } from '@/lib/format'
 
@@ -23,6 +24,13 @@ const databases = useDatabases()
 useDatabaseCreateOptions()
 const rows = computed(() => databases.data.value?.items ?? [])
 const creating = ref(false)
+const importing = ref(false)
+const settings = useClusterSettings()
+const importBlocked = computed(() =>
+  settings.data.value?.dataTransfer?.enabled === false
+    ? 'Data transfer is turned off for this cluster (Settings, Data transfer).'
+    : '',
+)
 </script>
 
 <template>
@@ -31,6 +39,13 @@ const creating = ref(false)
     subtitle="Databases with their sharding, replication and ledger settings."
   >
     <template #actions>
+      <GateButton
+        op="importDatabase"
+        :blocked-reason="importBlocked"
+        data-testid="import-database"
+        @click="importing = true"
+        >Import database</GateButton
+      >
       <GateButton op="createDatabase" variant="primary" @click="creating = true"
         >Create database</GateButton
       >
@@ -137,4 +152,5 @@ const creating = ref(false)
   <div style="margin-top: var(--s-5)"><TransfersPanel /></div>
 
   <CreateDatabaseDialog v-if="creating" @close="creating = false" />
+  <ImportDatabaseDialog v-if="importing" @close="importing = false" />
 </template>

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
-// The two operations that contract 0.29.0 (a placeholder revision) added to the tag `Data transfer` for the mock API:
+// The two operations that contract 0.29.0 added to the tag `Data transfer` for the mock API:
 // `exportDatabase` (task `database.export`, a zip archive of a database) and `validateDatabaseArchive` (task
 // `archive.validate`, the report of an uploaded archive). They behave like the server: the checks of the request come
 // first (the large objects, the privileges of the role on every table, a table that is left out), the task writes one

@@ -136,7 +136,7 @@ Branch `p10-drain4` (from the staging branch g16). The two open items of phase 1
   in `kingres_cp.cluster_setting`). A refused or rolled-back switchover fails the task with its code; the server stays draining. The reconcile of the standbys (step 5) leaves the former primary of group 0 in the ring until it is a ready standby (`cmd/kingresd/drain_standbys.go`):
   the first cluster run showed that a former primary that is still being rebuilt cannot be removed, and the step waited for the whole bound.
 - **The standby-lag rule of the automatic mode** (`automatic.go`, `pg.go`). The rule "group without a healthy standby" also holds for a standby behind its primary by more than `maxStandbyLagBytes` (default 64 MiB), read on the primary of each group (`pg_stat_replication`); a primary that cannot be asked counts as lagging.
-- Contract text only, placeholder revision **0.27.0**: `drainServer` description, `blockedBy` description, API README changelog, `check-contract.mjs`, the two texts in `web/src/api/schema.d.ts` (by hand).
+- Contract text only, revision **0.27.0**: `drainServer` description, `blockedBy` description, API README changelog, `check-contract.mjs`, the two texts in `web/src/api/schema.d.ts` (by hand).
 - Documents: `control-plane/README.md` (drain, automatic mode, tests), `docs/design/shard-phase10.md` section 23, this entry.
 - Commits: see `git log p10-drain4` (code and tests, contract, documents).
 
@@ -183,11 +183,11 @@ Mutants of the closing items, all killed: the manual gate (always allows, force 
 ### Still open
 
 - The cause of the one timeout of the cluster test on PostgreSQL 19.0 is unknown (it did not happen again in 14 runs); the test now prints what is needed to read it.
-- The number 0.27.0 is a placeholder and must be renumbered when the branch is merged.
+- The number 0.27.0 is the one the revision has in g2 (0.21.0 on the branch).
 
 ## 2026-11-23: phase 5 closing: the hard failover of the map group while its server is alive, and the hardening loops (increment 9)
 
-Branch `p5-hard`, from the staging branch g16 (failover round 2 with the F7 fixes). Contract revision 0.28.0 (a placeholder number; documentation of `failoverServer` only, see below).
+Branch `p5-hard`, from the staging branch g16 (failover round 2 with the F7 fixes). Contract revision 0.28.0 (documentation of `failoverServer` only, see below).
 
 ### What was done
 
@@ -201,7 +201,7 @@ Branch `p5-hard`, from the staging branch g16 (failover round 2 with the F7 fixe
 - **Two defects found while building it, fixed.** The bootstrap looked for the old holder among the grantors that refused (the keys of `RefusedBy`) and not among the holders they name, so a lease that was still
   renewed was reported as `lease_held_elsewhere` with no alert; and the term that the calls of a group expect was taken from the groups before it in the order of `Groups` and not in the order they run, which
   put the map group of a planned switchover with other groups on the server on a stale term.
-- **Contract 0.28.0 (placeholder), documentation only:** the text of `failoverServer`; `info.version`, the changelog, `check-contract.mjs`, the README of the control plane and the web contract test follow.
+- **Contract 0.28.0, documentation only:** the text of `failoverServer`; `info.version`, the changelog, `check-contract.mjs`, the README of the control plane and the web contract test follow.
   The contract log of this branch lists the files so that the merge can renumber.
 - **Test faults** (`demote:nostop`, `demote:exit` for the fenced stop, `maphard:facts`, `pin:unreadable`), a sampler of the map group in the cluster tests that fails at two writable instances on two
   readings of one asker, and the lease, fence and stop lines of every server in the failure output of a switchover test.
@@ -249,6 +249,83 @@ Branch `p5-hard`, from the staging branch g16 (failover round 2 with the F7 fixe
 - The unexplained failure above.
 - A hard failover of the map group when the old leader's kingresd is gone before the call of the fence is the failover of a dead leader (the bootstrap alone), as before.
 
+## 2026-11-24 (branch p14c): the four low findings of the second review of 14c
+
+L-A (the walk follows composite, array, range and multirange types), L-B (the marker stays on the final name until the rename is finished and the undoing only touches a database that carries it),
+L-C (every relation of a distributed schema is listed, locked and checked; one that the archive does not name is refused) and L-D (`ledger_verify()` runs after the registered ledger tables are locked and
+checked). The test hook `lastPrivate` is gone (`ImportHook` gets the private name). See the design note, "Changes made after the second review of 14c".
+
+---
+
+## 2026-11-24 (branch p14c): fixes after the security review of 14c
+
+Answered C1, M1 to M3, L1 to L6 and the free-space check (design note, "Changes made after the independent security review of 14c"). New files: `ops/dbimport_guard.go` (the withdrawal of every role, the importer rule, the lock and
+the catalog walk), `ops/dbimport_guard_pg_test.go` and `cmd/kingresd/dbimport_guard_e2e_test.go`. The importer may have `CREATEROLE` (a role of `kingres_admin` made through the API has it, and import works for it as it is); an importer with a member that can log in (a member with neither SET nor INHERIT, as the creator is, does not count) is refused, and `SUPERUSER`, `REPLICATION`, `BYPASSRLS` and the `pg_*` file, program and log roles stay refused. A test makes a login role as such an importer in the middle of an import.
+
+## 2026-11-24 (branch p14c): phase 14c, database import
+
+### What was done
+
+- **Contract 0.30.0**: `importDatabase` (`POST /database-imports`), the closed `ImportDatabaseRequest`, the task kind `database.import`, the codes
+  `archive_statement_refused` and `ledger_restart_not_acknowledged`, the checker rules, the README (174 operations, 139 paths), the generated types. It is its own commit (C0), and the console was built against it by a second writer.
+- **The shape grammar in execution mode** (`sqlshape.Each`): the exact text that the grammar consumed completely, lexed again alone (a text that reads differently is refused); a refusal ends the walk.
+  **`archive.OpenEntry`** reads an entry again and checks its size, CRC-32 and SHA-256 at the end of the stream; `archive.ReadManifest`; `archive.Assemble` and `archive/archivetest` for archives that lie.
+- **The task `database.import`** (`ops/dbimport*.go`): the archive is read again from its bytes (file SHA-256 against `expectedSha256`, the validator, the grammar, the plan against the catalog, versions, the
+  closed list of extensions, the ledger acknowledgement, `maxImportBytes`); a private database `kingres_import_<task id>` made strictly by the service role on every server, with a marker; the extensions; the
+  function check against `pg_proc`; the statements of the archive **as the signed-in role**, one per round trip through the extended protocol with `search_path = pg_catalog`; the distribution from the catalog
+  while the tables are empty (colocation groups, reference tables, columnar options, distributed schemas); the views; the data (one transaction per table, the rows against the manifest, reference tables through
+  the temporary table of 14a); the constraints (a violated foreign key is counted and named); the sequences on every node; the ledger (new chain, `ledger_verify`, the policy set again) and the time-partition
+  policies **disabled**; the verification; the rename on every server, the owner, the registry. The hook of a failed or cancelled task drops the private database (only one that it made).
+- **The role is kept out while the service role works** (`CONNECT` is withdrawn and its sessions are ended, on every server, before every service phase), the service role touches a table of the role only after
+  the catalog shows that it holds no code (`tableTrusted`, from the deparsed expressions: PostgreSQL records no dependency on a builtin function), and `extguard` (or the shard check of 14b) precedes every read of `kingres.*`.
+- **V8 passed**: the rename of a database works on one and on three servers with the background workers connected. The fallback of the design was not needed.
+- **Fixes of 14b that the import found**: the locale provider of a libc database was written as `builtin`; the colocation group of a distributed schema has no column type (the export failed with a 500).
+- **Console** (a second writer, merged): the *Import database* dialog, the report page with the statements the plan refuses, the acknowledgement of the ledger restart, progress, the result and the failure text, the
+  mock with the fixtures of the design, 2050 unit tests and browser and axe tests at three widths.
+
+### How it was verified
+
+PostgreSQL 18.7 and 19.0 in private installations (`~/kw-p14c/pg18` and `pg19`, the extensions built from this commit, each major built clean, deleted at the end), lane `l13`, `control-plane/scripts/run-integration.ps1`.
+
+| Test | Layer | PostgreSQL 18 | PostgreSQL 19 |
+|---|---|---|---|
+| `sqlshape` (`Each`, hidden statements, the maximum, a fuzz target of 3.5 million runs), `archive` (`OpenEntry`, `ReadManifest`, `Assemble`), `ops` unit tests of the import (revalidation from bytes, plan, verdict about functions, names, steps, cancel guard, cached report, expressions), `transfer`, `problem`, `httpapi`, `config` | Go unit | pass | pass (same files) |
+| `TestLexersAgreeWithTheServer` with 19 more scripts of the import statement kinds | PG test | pass | pass |
+| `TestImportFunctionCheckOnARealCatalog`, `TestTableTrustedOnARealCatalog`, `TestExecOneIsOneStatement`, `TestUnqualifiedNamesDoNotLandAnywhere`, `TestForeignKeyViolationsAreCounted` | PG test, private install | pass | pass |
+| `TestDatabaseImportRoundTrip`: every table kind, compared row for row, distribution, colocation sets, ledger (new chain, entries, `ledger_verify`, policy `required` back), policies disabled, sequences, owners, comments, views | cluster (one server) | pass | pass |
+| `TestDatabaseImportRefusesHostileArchives`: 45 archives (comments, `\r`, dollar quotes, `SET ROLE`, `SET SESSION AUTHORIZATION`, `ALTER DATABASE`, a grant to PUBLIC on `pg_catalog`, extensions outside the list, an oversized statement, a zip bomb, manifests that lie, dangerous functions): refused, no database, role or setting left | cluster (one server) | pass | pass |
+| `TestDatabaseImportHiddenTextIsNotRun`, `...RefusesADangerousRole`, `...WithdrawsTheAccessOfTheRole`, `...CleansUp` (failure, `keepOnFailure`, cancel), `...NeverUsesADatabaseItDidNotMake` | cluster (one server) | pass | pass |
+| `TestDatabaseImportOfAnArchiveFromAnotherMajor` (18 into 19: imported and equal to its source; 19 into 18: `archive_incompatible`, nothing made) | cluster (one server) | pass | pass |
+| `TestDatabaseImportOverThreeServers` (through followers, buckets in several groups, colocation, a distributed schema, ledger verification, the private database removed from every server after a failure) | cluster (three servers) | pass | pass |
+| 14b regression: `TestDatabaseExport*`, `TestSpikeS3`, `TestDatabaseExportOverThreeServers` | cluster | pass | pass |
+| Console: typecheck, lint, `api:check`, 114 files and 2050 vitest tests, `import-0-30` browser and axe tests at 1366, 683 and 320 px in both themes | web | pass | not applicable |
+| Contract: `check-contract.mjs`, `httpapi` and `contract` tests | contract | pass | not applicable |
+
+**Mutants** (one-line edits, each killed by the named test): the text of a statement is not lexed again alone (`TestSameTokensGuard`); the walk goes on after a refusal; a carriage return does not end a comment; the
+grammar allows `SET`; the dangerous functions are not known; an extension outside the list is installed (`TestSetupRefusesAnExtensionOutsideTheList`); the checksum of an entry is not compared; `expectedSha256` is not compared;
+the refusals of the grammar are not applied at import (both layers); a statement runs through the simple protocol (`TestExecOneIsOneStatement`); the session has the default search path; a table with a trigger of the
+role is touched; the functions of the expressions of a table are not checked; the statements run as the service role (`TestDatabaseImportRoundTrip`); a private database that exists is a success; the final rename does
+not check the name; `dblink` is in the closed list; the history rows of a ledger table are loaded; the ledger policy is not set again; time-partition policies are enabled; the failure hook drops nothing, or another
+name; the access of the role is not withdrawn; the function check is skipped; a dangerous role may import; the rows are not compared with the manifest; the ledger restart is not acknowledged (`TestDatabaseImportRoundTrip`: the first import without the acknowledgement must fail). **All 27 are killed** (the runner and the list of the mutants are in the scratch area of the writer, not in the tree).
+
+### Decisions and deviations
+
+- A request does not read the archive (it cannot, for 100 GiB inside a request); a cached report only refuses early. Every hostile archive is refused by the first step of the task, with nothing made.
+- No commit intent: a failure drops the whole database, so a table is one transaction with its count and nothing more. Statements are not grouped in a transaction per table.
+- The service role works only while the role cannot connect (a design addition, "What the service role does after the role, and how the role is kept out of it" in the design note).
+- The task drops a database only if the service role owns it and it carries its marker (a role with `CREATEDB` can make a database with a guessed private name).
+- The free space of the data nodes against `maxImportBytes` is not checked; the leader change at every step is not tested with a real failover; no archive of 2 GiB or more was imported.
+
+### Still open
+
+- The integrator renumbers the contract (0.30.0 here) and the migration is none; the console and the server agree on the detail lines of the finished task (`ledger: ...`, `policy disabled: ...`, `NOT VALID: ...`).
+
+### Core patches
+
+None.
+
+---
+
 ## 2026-11-23 (branch p14b, second entry): the fixes for the security review of phase 14b
 
 ### What was done
@@ -272,7 +349,7 @@ Mutants of the review, all killed: the lexer of `sqlshape` or the splitter of `d
 
 ### Decisions and deviations
 
-- The commit of `sec-ext` was cherry-picked alone; the contract text of its alert kind moved into 0.29.0 (placeholder).
+- The commit of `sec-ext` was cherry-picked alone; the contract text of its alert kind moved into 0.29.0.
 - The tail of the error output of `pg_dump` goes to the server log (the reviewer asked for it); it can name objects.
 
 ### Still open
@@ -312,7 +389,7 @@ The test table is below. PostgreSQL 18.7 and 19.0 in private installations (`~/k
 | `TestDatabaseExportBlocksTableTasksAndNoticesChanges` (a table task refused during an export, a cancel leaves no file, a column added fails with `schema_changed`) | cluster (one server) | pass | pass |
 | `TestDatabaseExportTooLarge` (`export_too_large`, no file, then the same database under a larger limit) | cluster (one server) | pass | pass |
 | `TestDatabaseExportOverThreeServers` (per-group labels, a follower makes it, three servers serve the download, an upload through a follower validated through another) | cluster (three servers) | pass | pass |
-| Console: typecheck, lint, 2009 vitest tests (111 files), `archive-0-40` browser and axe tests at 1366, 683 and 320 px in both themes | web | pass | not applicable |
+| Console: typecheck, lint, 2009 vitest tests (111 files), `archive-0-29` browser and axe tests at 1366, 683 and 320 px in both themes | web | pass | not applicable |
 | Contract: `check-contract.mjs`, `api:check`, `httpapi` and `contract` tests | contract | pass | not applicable |
 
 Mutants (one-line edits, each killed by the named test; the script is not part of the tree): see the report of the unit of work; the list is in "Mutants" below.
@@ -990,7 +1067,7 @@ The independent review (`docs/reviews/2026-11-22-ca-key-escrow.md`) found the cr
 - **CAE-2, CAE-3, CAE-6**: records stay (`dropPending`) until a drop succeeded; the operator's choice, the epoch and the holders are mirrored to `kingres_cp.cluster_setting` (`caEscrow`); a standby missing for less than three rounds keeps its copy; switching off tells every active member.
 - **CAE-5, CAE-7, CAE-8**: durable write of `ca.key`, a truncated key is put aside, the list in a blob is parsed on store, length-prefixed additional data, key file mode check, clearing of secrets where Go allows.
 - The cluster test of CAE-4 found that every revocation task on the new leader failed after a failover of the map group (the row of the server that created the cluster has no address); the task now takes the ids of the active members and leaves the address to the peer client.
-- Contract 0.26.0 (still the placeholder) gets the value `dropPending` of `CaEscrowRecipient.state`; the internal calls get `epoch`, `heldEpoch` and `heldGeneration`.
+- Contract 0.26.0 gets the value `dropPending` of `CaEscrowRecipient.state`; the internal calls get `epoch`, `heldEpoch` and `heldGeneration`.
 
 ### How it was verified
 
@@ -1015,7 +1092,7 @@ The last open item of phase 5: after a failover of the leader's server, the new 
 - **The control plane**: `internal/pki/escrow.go` (escrow keys, seal, open, store, drop, adopt, the leader's bookkeeping), `internal/membership/escrow.go` (recipients from the standbys of group 0,
   the minute-by-minute reconcile and the resend after every revocation, the three internal calls `POST /pki/escrow/offer`, `store` and `drop`, all `LeaderOnly`), the adoption at B8 through the
   port `CheckAuthority` (`cmd/kingresd/mapfailover.go`), the text of the alert.
-- **The operator path**: contract 0.26.0 (a placeholder number; the integrator renumbers): `getCaEscrow`, `setCaEscrow`, `rotateCaEscrow`, the schemas `CaEscrowStatus`, `CaEscrowRecipient`,
+- **The operator path**: contract 0.26.0: `getCaEscrow`, `setCaEscrow`, `rotateCaEscrow`, the schemas `CaEscrowStatus`, `CaEscrowRecipient`,
   `CaEscrowUpdate`, two audit actions. The escrow is off until switched on. The shapes are in the scratch file `ca-escrow/contract.txt` for the integrator. No console part (the operations are REST only).
 
 ### How it was verified

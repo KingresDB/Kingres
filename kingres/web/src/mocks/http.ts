@@ -153,6 +153,8 @@ const STATUS: Record<ProblemCode, number> = {
   schema_unrecognised: 422,
   archive_invalid: 422,
   archive_incompatible: 422,
+  archive_statement_refused: 422,
+  ledger_restart_not_acknowledged: 422,
   insufficient_disk: 409,
   no_receiving_server: 409,
   replicas_cannot_be_kept: 409,

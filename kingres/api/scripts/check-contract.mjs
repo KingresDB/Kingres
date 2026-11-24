@@ -392,12 +392,13 @@ const MUST_MENTION = {
   '0.27.0': ['drainServer', 'server_hosts_map_group', 'Hand over the map group', 'maxStandbyLagBytes', 'groupDegraded', 'RebalanceOptions.force', 'additive'],
   '0.28.0': ['failoverServer', 'unsupported_operation', 'lostServerId', 'additive'],
   '0.29.0': ['exportDatabase', 'validateDatabaseArchive', 'database.export', 'archive.validate', 'ArchiveReport', 'export_not_readable', 'archive_invalid', 'databaseArchive', 'additive'],
+  '0.30.0': ['importDatabase', 'database.import', 'ImportDatabaseRequest', 'archive_statement_refused', 'ledger_restart_not_acknowledged', 'acknowledgeLedgerRestart', 'private', 'additive'],
   '0.19.0': ['exportTable', 'importTable', 'createDataUpload', 'uploadDataChunk', 'downloadDataExport', 'x-streams', 'dataTransfer', 'data_transfer_disabled', 'import_outcome_unknown', 'Upload-Offset', 'additive'],
   '0.12.0': ['completedWithWarnings', 'failover_needs_decision', 'plan', 'notScheduled', 'additive'],
   '0.9.0': ['startRebalance', 'previewRebalancePlan', 'nothing_to_rebalance', 'cluster_inconsistent', 'skipped', 'ledgerSummary', 'Prefer', 'additive'],
   '0.5.0': ['renewServerCertificates', 'revokeServerCertificates', 'certificate_authority_unavailable', 'certificate_revoked', 'certificateRenewalFailed', 'partial', 'additive'],
 };
-for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0', '0.10.0', '0.11.0', '0.12.0', '0.13.0', '0.14.0', '0.15.0', '0.16.0', '0.17.0', '0.18.0', '0.19.0', '0.26.0', '0.27.0', '0.28.0', '0.29.0']) {
+for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0', '0.10.0', '0.11.0', '0.12.0', '0.13.0', '0.14.0', '0.15.0', '0.16.0', '0.17.0', '0.18.0', '0.19.0', '0.26.0', '0.27.0', '0.28.0', '0.29.0', '0.30.0']) {
   const changelog = changelogOf(version);
   if (!changelog) { fail('README.md', `changelog heading for ${version} is missing`); continue; }
   for (const h of ['#### Breaking', '#### Additive', '#### Documentation']) if (!changelog.includes(h)) fail('README.md', `changelog of ${version} lacks "${h}"`);
@@ -409,7 +410,7 @@ for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0', '0.
   if (!m) fail('README.md', `the changelog summary of ${version} must state "N operations added (M operations, P paths)"`);
   else if (version === doc.info?.version && (Number(m[2]) !== operations.length || Number(m[3]) !== Object.keys(doc.paths ?? {}).length)) fail('README.md', `changelog says ${m[2]} operations and ${m[3]} paths, the contract has ${operations.length} and ${Object.keys(doc.paths ?? {}).length}`);
 }
-if (doc.info?.version !== '0.29.0') fail('info.version', 'the contract is revision 0.29.0');
+if (doc.info?.version !== '0.30.0') fail('info.version', 'the contract is revision 0.30.0');
 
 
 // 0.5.0 rules: certificate operations, partial answers, additive changes only.
@@ -646,7 +647,7 @@ for (const [n, prop] of [['SetupTaskSummary', 'detail'], ['NodeStateInfo', 'inte
   for (const needle of ['global snapshot', 'not a security feature']) if (!opDesc('exportTable').includes(needle)) fail('exportTable', 'description must mention ' + needle);
   for (const needle of ['All or nothing', 'import_outcome_unknown']) if (!opDesc('importTable').includes(needle)) fail('importTable', 'description must mention ' + needle);
 }
-// 0.29.0 rules, database export and archive validation (additive only; the number is a placeholder): the two operations, the
+// 0.29.0 rules, database export and archive validation (additive only): the two operations, the
 // kinds, the codes, the report, and the sentences a reader must not miss. Every request and response has an example.
 {
   const need = { exportDatabase: ['post', 202], validateDatabaseArchive: ['post', 202] };
@@ -680,6 +681,33 @@ for (const [n, prop] of [['SetupTaskSummary', 'detail'], ['NodeStateInfo', 'inte
   for (const a of ['exportDatabase', 'validateDatabaseArchive']) if (!(schemas.AuditAction?.enum ?? []).includes(a)) fail('AuditAction', 'missing ' + a);
   for (const needle of ['global snapshot', 'export_not_readable', 'large_objects_present', 'schema_changed']) if (!opDesc('exportDatabase').includes(needle)) fail('exportDatabase', 'description must mention ' + needle);
   for (const needle of ['touches no database', 'never shown']) if (!opDesc('validateDatabaseArchive').includes(needle)) fail('validateDatabaseArchive', 'description must mention ' + needle);
+}
+// 0.30.0 rules, database import (additive only): the operation, the closed request, the kind, the codes and the sentences a reader must not miss.
+{
+  const o = opById.get('importDatabase');
+  if (!o) fail('importDatabase', 'operation of 0.30.0 does not exist');
+  else {
+    if (o.method !== 'post') fail('importDatabase', 'must be a POST');
+    if (o.op['x-required-role'] !== 'kingres_admin') fail('importDatabase', 'x-required-role must be kingres_admin');
+    if (!(o.op.tags ?? []).includes('Data transfer')) fail('importDatabase', 'must have the tag Data transfer');
+    if (o.op['x-streams'] !== undefined) fail('importDatabase', 'must not stream');
+    for (const c of ['202', '403', '404', '409', '422']) if (!respCodes('importDatabase').includes(c)) fail('importDatabase', 'must list ' + c);
+    const body = deref(o.op.requestBody);
+    for (const [mt, media] of Object.entries(body?.content ?? {})) if (!media.examples && media.example === undefined) fail('importDatabase', 'request ' + mt + ' has no example');
+    for (const [code, r] of Object.entries(o.op.responses ?? {})) {
+      const resp = deref(r);
+      for (const [mt, media] of Object.entries(resp?.content ?? {})) if (!media.examples && media.example === undefined) fail('importDatabase ' + code, mt + ' has no example');
+    }
+  }
+  const req = schemas.ImportDatabaseRequest;
+  if (req?.additionalProperties !== false) fail('ImportDatabaseRequest', 'must be closed (additionalProperties: false)');
+  if (JSON.stringify(req?.required ?? []) !== JSON.stringify(['uploadId'])) fail('ImportDatabaseRequest', 'uploadId is the only required member');
+  for (const n of ['privileges', 'allowCode', 'bucketCount', 'sql', 'owner', 'path']) if (req?.properties?.[n]) fail('ImportDatabaseRequest', n + ' is not part of the request (owners and grants are not restored, code is refused, the archive keeps its bucket counts)');
+  for (const n of ['uploadId', 'database', 'expectedSha256', 'acknowledgeLedgerRestart', 'onForeignKeyViolation', 'keepOnFailure']) if (!req?.properties?.[n]) fail('ImportDatabaseRequest', 'missing ' + n);
+  for (const c of ['archive_statement_refused', 'ledger_restart_not_acknowledged']) if (!problemCodes.has(c)) fail('ProblemCode', 'missing ' + c);
+  if (!(schemas.TaskKind?.enum ?? []).includes('database.import')) fail('TaskKind', 'missing database.import');
+  if (!(schemas.AuditAction?.enum ?? []).includes('importDatabase')) fail('AuditAction', 'missing importDatabase');
+  for (const needle of ['hostile', 'as the signed-in role', 'private name', 'new chain', 'disabled', 'never the text']) if (!opDesc('importDatabase').includes(needle)) fail('importDatabase', 'description must mention ' + needle);
 }
 // ------------------------------------------------------------------ report
 const pathCount = Object.keys(doc.paths ?? {}).length;
