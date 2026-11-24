@@ -14,6 +14,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pgtest"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
 )
 
@@ -28,6 +29,11 @@ func storageOps(t *testing.T) (*Ops, *pgx.Conn) {
 	}
 	in := pgtest.Start(t, nil)
 	c := in.Connect(t, "postgres")
+	// A table task first asks the system database whether a database export runs (exportRunning); the service connection of the test reaches
+	// this database, so it carries the schema of the system database.
+	if _, err := sysdb.Migrate(context.Background(), c); err != nil {
+		t.Fatal(err)
+	}
 	o := &Ops{Service: testService{in, t}, ServerHost: "s1", Log: slog.New(slog.DiscardHandler)}
 	e, err := task.NewEngine(task.NewMemStore(), o.Definitions(), task.Options{Holder: "A", Lease: time.Minute, StoreTries: 1})
 	if err != nil {
