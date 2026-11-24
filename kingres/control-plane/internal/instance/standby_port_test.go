@@ -444,6 +444,7 @@ func TestBindFailure(t *testing.T) {
 		"an address that is not ours": {"LOG:  could not bind IPv4 address \"10.9.9.9\": Cannot assign requested address\nFATAL:  could not create any TCP/IP sockets\n", false},
 		"the word bind elsewhere":     {"LOG:  could not bind to the replication slot\n", false},
 		"address in use elsewhere":    {"LOG:  could not connect to the primary: Address already in use\n", false},
+		"another family":              {"LOG:  could not bind AF_NETLINK socket: Address already in use\n", false},
 		"nothing":                     {"LOG:  database system is ready to accept read-only connections\n", false},
 		"Unix and then IPv4":          {"LOG:  could not bind Unix address \"/s/.s.PGSQL.5432\": Address already in use\nLOG:  could not bind IPv4 address \"127.0.0.1\": Address already in use\n", true},
 	} {
@@ -571,4 +572,34 @@ func TestAStartThatFindsTheInstanceRunningEndsTheProvisionalPort(t *testing.T) {
 	if err := m.setStandbyPort(id, 57999); err == nil {
 		t.Fatal("the port of an instance that ran must not change")
 	}
+}
+
+func TestReconcileRepairsTheSettingsAlone(t *testing.T) {
+	fs := &fakeServer{}
+	m := newFakeManager(t, fs)
+	id := newStandbyDir(t, m, 57002, true)
+	s, _ := m.Settings(id)
+	s.Port = 57555 // the conf and the marker say 57002
+	if err := m.saveSettings(id, s); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.reconcileStandbyPort(id); err != nil {
+		t.Fatal(err)
+	}
+	wantPort(t, m, id, 57002)
+}
+
+func TestReconcileRepairsTheConfAlone(t *testing.T) {
+	fs := &fakeServer{}
+	m := newFakeManager(t, fs)
+	id := newStandbyDir(t, m, 57002, true)
+	s, _ := m.Settings(id)
+	s.Port = 57555
+	if err := m.writeManagedConf(id, s); err != nil { // only the conf has the other port
+		t.Fatal(err)
+	}
+	if err := m.reconcileStandbyPort(id); err != nil {
+		t.Fatal(err)
+	}
+	wantPort(t, m, id, 57002)
 }
