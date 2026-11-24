@@ -811,6 +811,7 @@ func (r *Runner) takeFence(ctx context.Context, env *task.Env, sc *stepCtx) erro
 					// repair of switchovers finishes what a server that cannot be reached still holds (F4-02).
 					return sc.rollbackFailed(ctx, CodeQuorumUnavailable, true, "this server cannot hear a majority of the servers; shard group %d was given back to %s", sc.group, sc.old())
 				}
+				sc.releaseFenceAdoption(ctx)
 				return &PauseError{Reason: "This server cannot hear a majority of the servers (quorum_unavailable); nothing was done. Repair the network or repeat the request from a server that can."}
 			}
 			sc.detail(ctx, "waiting for a majority of the servers to be heard")
@@ -833,6 +834,7 @@ func (r *Runner) takeFence(ctx context.Context, env *task.Env, sc *stepCtx) erro
 					if sc.in.graceful() {
 						return sc.rollbackFailed(ctx, CodeLeaseUnavailable, true, "the lease of shard group %d could not be taken (%v); shard group %d was given back to %s", sc.group, err, sc.group, sc.old())
 					}
+					sc.releaseFenceAdoption(ctx)
 					return &PauseError{Reason: fmt.Sprintf("The lease of shard group %d could not be taken from this server (%v); nothing was promoted. Repair the cause and repeat the request.", sc.group, err)}
 				}
 			} else if ans.Held {
@@ -864,6 +866,14 @@ func (r *Runner) takeFence(ctx context.Context, env *task.Env, sc *stepCtx) erro
 			return err
 		}
 	}
+}
+
+// releaseFenceAdoption stops this server renewing the fence lease it may have adopted for the group before a pause. An adoption has no
+// lifetime of its own: left in place it is renewed for as long as the server runs, the old primary (which may be alive and cut off)
+// cannot renew its lease, and the group would stay without a primary while the task waits for an operator, although nothing was
+// promoted. The repeat of the request takes the lease again (phase 5 review L-3). Best effort; an adoption of an attached primary is never released.
+func (sc *stepCtx) releaseFenceAdoption(ctx context.Context) {
+	_, _ = sc.r.Peers.Lease(context.WithoutCancel(ctx), sc.r.Plan.Self(), LeaseRequest{Group: sc.group, Role: LeaseRelease})
 }
 
 func ptr[T any](v T) *T { return &v }

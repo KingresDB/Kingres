@@ -134,3 +134,48 @@ func TestTheWaitAfterLeaseCallErrorsStartsAgainWhenTheMajorityIsHeardAgain(t *te
 		t.Fatalf("paused %v after the start: the errors before the loss of the majority were counted", e)
 	}
 }
+
+// Phase 5 review L-3: a failover that pauses in the wait for the lease does not leave this server renewing the fence lease it
+// may have adopted (the call that failed may have been answered after the adoption, and a lease taken before the majority was
+// lost is still renewed): the adoption has no lifetime, and the old primary could not renew meanwhile. The pause releases it.
+func TestAPausedWaitForTheLeaseReleasesTheFenceAdoption(t *testing.T) {
+	t.Run("lease call fails", func(t *testing.T) {
+		w := newWorld()
+		w.leaseErr = &CallError{Status: 503, Code: "not_available", Message: "the lease manager is not running"}
+		r := w.runner()
+		w.fakeClock(r)
+		_, err := runAll(t, r, hardInput())
+		var pe *PauseError
+		if !errors.As(err, &pe) {
+			t.Fatalf("want a pause, got %v", err)
+		}
+		if w.index("lease-release s2") < 0 {
+			t.Fatalf("the adoption was not released:\n%s", strings.Join(w.log, "\n"))
+		}
+	})
+	t.Run("majority lost while waiting", func(t *testing.T) {
+		w := newWorld()
+		w.leaseHeldByOld = true
+		r := w.runner()
+		r.QuorumWait = 5 * time.Second
+		r.LeaseWait = 100 * time.Second
+		start := time.Unix(1_000_000, 0)
+		now := start
+		r.Now = func() time.Time { return now }
+		r.Sleep = func(ctx context.Context, d time.Duration) error { now = now.Add(d); return ctx.Err() }
+		w.liveFn = func(string) string {
+			if now.Sub(start) >= 2*time.Second {
+				return ""
+			}
+			return "live"
+		}
+		_, err := runAll(t, r, hardInput())
+		var pe *PauseError
+		if !errors.As(err, &pe) {
+			t.Fatalf("want a pause, got %v", err)
+		}
+		if w.index("lease-release s2") < 0 {
+			t.Fatalf("the adoption was not released:\n%s", strings.Join(w.log, "\n"))
+		}
+	})
+}
