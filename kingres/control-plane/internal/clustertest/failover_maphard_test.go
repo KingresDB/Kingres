@@ -513,6 +513,11 @@ func TestADeadOnlyCandidateIsReleasedByTheLocalCommand(t *testing.T) {
 			third = n
 		}
 	}
+	// the old leader keeps the keys of the administrators on disk, so that it can check the declaration of a lost server while its system database is stopped
+	until(t, 2*time.Minute, "the cache of the administrators' keys on the old leader", func() bool {
+		b, err := os.ReadFile(filepath.Join(leader.DataDir, "failover", "admin-keys.json"))
+		return err == nil && strings.Contains(string(b), clustertest.AdminUser)
+	})
 	nw.SetFaults(fault.Spec{FailoverPoint: "promote:unavailable", FailoverMode: "unavailable"})
 	_ = mapHardRequest(t, leader, nw, true)
 	mapStopped(t, leader)
