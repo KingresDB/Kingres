@@ -85,15 +85,17 @@ func TestDrainOfAServerThatHostsADistributedSchema(t *testing.T) {
 
 	// two schemas on the victim's group, and a third with a table that no move can copy
 	for _, s := range []string{"dr_a", "dr_b"} {
-		skMake(t, c, s, rows)
+		sdLocal(t, victim, `CREATE SCHEMA `+s)
+		sdLocal(t, victim, `CREATE TABLE `+s+`.t (id bigint PRIMARY KEY, v text)`)
+		sdLocal(t, victim, `INSERT INTO `+s+`.t SELECT g, repeat('r', 100) FROM generate_series(1, $1) g`, rows)
 		l.WaitTaskDone(clustertest.TaskID(l.Expect(202, "PUT", "/databases/sk/schemas/"+s+"/distribution", map[string]any{"shardGroupId": victimGroup})), 3*time.Minute)
 		if host, _ := sdOwner(t, l, s); host != victim.Host {
 			t.Fatalf("schema %s is on %s, want %s", s, host, victim.Host)
 		}
 	}
-	skExec(t, c, "sk", `CREATE SCHEMA dr_c`)
-	skExec(t, c, "sk", `CREATE TABLE dr_c.t (a int, b text)`)
-	skExec(t, c, "sk", `INSERT INTO dr_c.t SELECT g, 'k' FROM generate_series(1, 50) g`)
+	sdLocal(t, victim, `CREATE SCHEMA dr_c`)
+	sdLocal(t, victim, `CREATE TABLE dr_c.t (a int, b text)`)
+	sdLocal(t, victim, `INSERT INTO dr_c.t SELECT g, 'k' FROM generate_series(1, 50) g`)
 	l.WaitTaskDone(clustertest.TaskID(l.Expect(202, "PUT", "/databases/sk/schemas/dr_c/distribution", map[string]any{"shardGroupId": victimGroup})), 3*time.Minute)
 
 	t.Run("a schema that cannot be moved is a blocker of the preview and refuses the drain before a task exists", func(t *testing.T) {
@@ -243,4 +245,15 @@ func TestDrainOfAServerThatHostsADistributedSchema(t *testing.T) {
 			}
 		}
 	})
+}
+
+// sdLocal runs a statement on the given server, where a local schema has to be made: the rows of a schema decide the shard group it is distributed to,
+// so a schema meant for the group of the victim is made on the victim and not on the leader.
+func sdLocal(t *testing.T, n *clustertest.Node, sql string, args ...any) {
+	t.Helper()
+	conn := n.ServicePG("sk")
+	defer func() { _ = conn.Close(context.Background()) }()
+	if _, err := conn.Exec(context.Background(), sql, args...); err != nil {
+		t.Fatalf("%s: %v", sql, err)
+	}
 }

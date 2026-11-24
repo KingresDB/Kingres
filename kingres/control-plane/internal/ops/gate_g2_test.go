@@ -17,6 +17,9 @@ import (
 // kingres.partition_leaf_storage and before the call of it (the service role is a superuser; the schema may be a tenant's).
 func TestDistPartitionStorageIsReadAfterTheTrustCheck(t *testing.T) {
 	src, err := os.ReadFile("tableprep.go")
+	if os.IsNotExist(err) {
+		t.Skip("the sources of the package are not beside a test binary that runs outside the source tree")
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
