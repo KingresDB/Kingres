@@ -521,7 +521,10 @@ func TestADeadOnlyCandidateIsReleasedByTheLocalCommand(t *testing.T) {
 	foKillServer(nw)
 	defer func() {
 		if t.Failed() {
-			t.Logf("leader log:\n%s\nthird log:\n%s", leader.LogTail(12000), third.LogTail(4000))
+			t.Logf("leader log:\n%s", quietLog(leader.LogTail(60000)))
+			mc, _ := os.ReadFile(filepath.Join(leader.DataDir, "instances", "1", "pgdata", "kingres-managed.conf"))
+			pl := leader.InstanceLogs()
+			t.Logf("managed settings of the old primary:\n%s\nits log (tail):\n%s", mc, pl[max(0, len(pl)-5000):])
 		}
 	}()
 	// the old leader cannot serve the REST API: its system database is the held-back primary, and the only other copy is on the dead candidate
@@ -559,7 +562,11 @@ func TestADeadOnlyCandidateIsReleasedByTheLocalCommand(t *testing.T) {
 	}
 	t.Logf("the command said: %s", out)
 	leader.Start()
+	// the sessions of kingresd are in its memory: the operator signs in again once the system database is back
 	until(t, 8*time.Minute, "the cluster to serve again through the old leader", func() bool {
+		if !leader.Login(clustertest.AdminUser, clustertest.AdminPass) {
+			return false
+		}
 		s, _ := leader.Do("GET", "/cluster", nil, nil)
 		return s == 200
 	})
