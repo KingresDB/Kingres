@@ -392,13 +392,14 @@ const MUST_MENTION = {
   '0.27.0': ['drainServer', 'server_hosts_map_group', 'Hand over the map group', 'maxStandbyLagBytes', 'groupDegraded', 'RebalanceOptions.force', 'additive'],
   '0.28.0': ['failoverServer', 'unsupported_operation', 'lostServerId', 'additive'],
   '0.29.0': ['exportDatabase', 'validateDatabaseArchive', 'database.export', 'archive.validate', 'ArchiveReport', 'export_not_readable', 'archive_invalid', 'databaseArchive', 'additive'],
+  '0.31.0': ['schemaName', 'kind', 'schema_pinned', 'drainServer', 'previewServerDrain', 'additive'],
   '0.30.0': ['importDatabase', 'database.import', 'ImportDatabaseRequest', 'archive_statement_refused', 'ledger_restart_not_acknowledged', 'acknowledgeLedgerRestart', 'private', 'extensionSkipped', 'additive'],
   '0.19.0': ['exportTable', 'importTable', 'createDataUpload', 'uploadDataChunk', 'downloadDataExport', 'x-streams', 'dataTransfer', 'data_transfer_disabled', 'import_outcome_unknown', 'Upload-Offset', 'additive'],
   '0.12.0': ['completedWithWarnings', 'failover_needs_decision', 'plan', 'notScheduled', 'additive'],
   '0.9.0': ['startRebalance', 'previewRebalancePlan', 'nothing_to_rebalance', 'cluster_inconsistent', 'skipped', 'ledgerSummary', 'Prefer', 'additive'],
   '0.5.0': ['renewServerCertificates', 'revokeServerCertificates', 'certificate_authority_unavailable', 'certificate_revoked', 'certificateRenewalFailed', 'partial', 'additive'],
 };
-for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0', '0.10.0', '0.11.0', '0.12.0', '0.13.0', '0.14.0', '0.15.0', '0.16.0', '0.17.0', '0.18.0', '0.19.0', '0.26.0', '0.27.0', '0.28.0', '0.29.0', '0.30.0']) {
+for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0', '0.10.0', '0.11.0', '0.12.0', '0.13.0', '0.14.0', '0.15.0', '0.16.0', '0.17.0', '0.18.0', '0.19.0', '0.26.0', '0.27.0', '0.28.0', '0.29.0', '0.30.0', '0.31.0']) {
   const changelog = changelogOf(version);
   if (!changelog) { fail('README.md', `changelog heading for ${version} is missing`); continue; }
   for (const h of ['#### Breaking', '#### Additive', '#### Documentation']) if (!changelog.includes(h)) fail('README.md', `changelog of ${version} lacks "${h}"`);
@@ -410,7 +411,7 @@ for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0', '0.
   if (!m) fail('README.md', `the changelog summary of ${version} must state "N operations added (M operations, P paths)"`);
   else if (version === doc.info?.version && (Number(m[2]) !== operations.length || Number(m[3]) !== Object.keys(doc.paths ?? {}).length)) fail('README.md', `changelog says ${m[2]} operations and ${m[3]} paths, the contract has ${operations.length} and ${Object.keys(doc.paths ?? {}).length}`);
 }
-if (doc.info?.version !== '0.30.0') fail('info.version', 'the contract is revision 0.30.0');
+if (doc.info?.version !== '0.31.0') fail('info.version', 'the contract is revision 0.31.0');
 
 
 // 0.5.0 rules: certificate operations, partial answers, additive changes only.
@@ -712,6 +713,16 @@ for (const [n, prop] of [['SetupTaskSummary', 'detail'], ['NodeStateInfo', 'inte
 // 0.30.0: the alert extensionSkipped (an extension left out of a database on a server because a tenant made its schema its own).
 if (!(schemas.AlertKind?.enum ?? []).includes('extensionSkipped')) fail('AlertKind', 'missing extensionSkipped');
 if (!String(schemas.AlertKind?.description ?? '').includes('extensionSkipped')) fail('AlertKind', 'the description does not explain extensionSkipped');
+// 0.31.0: the schema items of the rebalance (additive only): the report move names the schema like the plan and the in-flight move do.
+for (const [name, props] of [['PlannedMove', schemas.PlannedMove?.properties], ['BucketMove', schemas.BucketMove?.properties]]) {
+  for (const n of ['kind', 'schemaName']) if (!props?.[n]) fail(name, 'missing ' + n);
+}
+{
+  const reportMove = schemas.RebalanceReport?.allOf?.flatMap((s) => (s.properties?.moves?.items?.properties ? [s.properties.moves.items.properties] : []))[0];
+  for (const n of ['kind', 'schemaName']) if (!reportMove?.[n]) fail('getRebalanceReport', 'the result of a move lacks ' + n + ' (0.31.0)');
+  if (!problemCodes.has('schema_pinned')) fail('ProblemCode', 'missing schema_pinned');
+  for (const id of ['drainServer', 'previewServerDrain']) if (!opDesc(id).includes('schema')) fail(id, 'the description does not say that distributed schemas move with the drain (0.31.0)');
+}
 // ------------------------------------------------------------------ report
 const pathCount = Object.keys(doc.paths ?? {}).length;
 console.log(`openapi ${doc.openapi}, info.version ${doc.info?.version}`);

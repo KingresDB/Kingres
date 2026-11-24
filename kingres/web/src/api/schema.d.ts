@@ -796,7 +796,7 @@ export interface paths {
          *     409 `replicas_cannot_be_kept` (fewer servers than `replicaCount + 1` would remain; `acceptFewerReplicas` overrides); 409
          *     `group_degraded` (a group of the server has fewer healthy standbys than the replica count); 409 `rebalance_in_progress` and
          *     `operation_in_progress`; 422 `node_state_invalid` for a `dead` server; 422 `unprocessable` when the server holds ordinary
-         *     (not distributed) tables that leave with it and `acknowledgeLocalData` is not true. The standbys that the server hosts are
+         *     (not distributed) tables that leave with it and `acknowledgeLocalData` is not true. Changed in 0.31.0 (additive; no member changes): the distributed schemas (phase 11) of the server's groups move off it with the buckets, as items of the plan with `kind` `schema`, and the drain is refused with 409 `schema_pinned` (a schema holds a ledger table) or 422 `unprocessable` (a table of a schema is not logged or has neither a key nor a full replica identity, or its group does not answer) when a schema cannot be moved, naming the schema; the task ends only when no bucket and no schema is left on the server. The standbys that the server hosts are
          *     relocated by the step `Relocate the standbys hosted on the server`: the server is taken out of the ring of the standbys, the reconcile of the standbys
          *     places the replacements on the other servers before it removes the old ones, and the step waits until none is left (the groups are listed by
          *     `previewServerDrain`, `standbyShardGroupIds`); when another server cannot take them the task fails with `replicas_cannot_be_kept` unless `acceptFewerReplicas`.
@@ -828,7 +828,7 @@ export interface paths {
          * @description Added in 0.15.0. What `drainServer` would do now and what stands in its way, without changing anything: the moves (the plan
          *     of `previewRebalancePlan` with the server excluded and `drainOnly`), their bytes, the groups whose standby runs on the server,
          *     whether the replica count can be kept on the servers that remain, the databases in which the server holds ordinary tables that
-         *     leave with it, and the blockers (each with the problem code `drainServer` would answer). 404 for an unknown server.
+         *     leave with it, and the blockers (each with the problem code `drainServer` would answer). From 0.31.0 the moves include the distributed schemas of the server (`kind` `schema`, `schemaName`), and a schema that cannot move is a blocker (`schema_pinned`, `unprocessable`). 404 for an unknown server.
          */
         get: operations["previewServerDrain"];
         put?: never;
@@ -6806,6 +6806,10 @@ export interface components {
                 attempts?: number;
                 /** @description Added in 0.15.0, optional. `balance` or `drain`. */
                 reason?: string;
+                /** @description Added in 0.31.0, optional. `schema` when the move was a distributed schema (the one bucket of its colocation group, moved by the extension's schema move); absent for a bucket. Clients must tolerate other values. */
+                kind?: string;
+                /** @description Added in 0.31.0, optional. The schema, for kind `schema`; a name can be any text, so show it as text. */
+                schemaName?: string | null;
                 /** @description Added in 0.9.0, optional. For outcome `skipped`: `stopped` (cancelled by a stop), `targetDiskLow`, `groupDegraded` or `groupLeaseLost`. Clients must tolerate other values. */
                 skipReason?: string | null;
                 /**

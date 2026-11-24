@@ -456,6 +456,11 @@ func (b *PG) RunMove(ctx context.Context, m Move, after int64) error {
 	errc := make(chan error, 1)
 	go func() {
 		var id int64
+		if m.Schema != "" {
+			// a distributed schema moves by the extension's own function for it (the same procedure as a bucket move, design 9.9)
+			errc <- c.QueryRow(callCtx, `SELECT kingres.move_schema(pg_catalog.quote_ident($1)::pg_catalog.regnamespace, $2)`, m.Schema, m.To).Scan(&id)
+			return
+		}
 		errc <- c.QueryRow(callCtx, `SELECT kingres.move_bucket($1, $2, $3)`, m.Colocation, m.Bucket, m.To).Scan(&id)
 	}()
 	// reopen replaces the observation session after it failed; if that fails too the old one stays and the next
@@ -900,10 +905,10 @@ func (r *PGRows) StartMove(ctx context.Context, m Move, fromServer, toServer str
 			return err
 		}
 		return tx.QueryRow(ctx, `INSERT INTO kingres_cp.rebalance_move (task_id, seq, database_name, colocation_id, bucket, from_group, to_group,
-			from_server, to_server, state, attempts, size_bytes, started_at, round, ext_mark, reason, cost)
-			SELECT $1, coalesce(max(seq), 0) + 1, $2, $3, $4, $5, $6, $7, $8, 'running', $9, $10, clock_timestamp(), (SELECT round FROM kingres_cp.rebalance_run WHERE task_id = $1), $11::bigint, $12, $13
+			from_server, to_server, state, attempts, size_bytes, started_at, round, ext_mark, reason, cost, schema_name)
+			SELECT $1, coalesce(max(seq), 0) + 1, $2, $3, $4, $5, $6, $7, $8, 'running', $9, $10, clock_timestamp(), (SELECT round FROM kingres_cp.rebalance_run WHERE task_id = $1), $11::bigint, $12, $13, $14::text
 			FROM kingres_cp.rebalance_move WHERE task_id = $1 RETURNING seq`,
-			r.TaskID, m.Database, m.Colocation, m.Bucket, m.From, m.To, fromServer, toServer, attempts, m.Size, mark, nullIfEmpty(m.Reason), m.Cost).Scan(&seq)
+			r.TaskID, m.Database, m.Colocation, m.Bucket, m.From, m.To, fromServer, toServer, attempts, m.Size, mark, nullIfEmpty(m.Reason), m.Cost, nullIfEmpty(m.Schema)).Scan(&seq)
 	})
 	return seq, err
 }
@@ -941,19 +946,19 @@ func (r *PGRows) FinishMove(ctx context.Context, seq int, state, errText, skipRe
 func (r *PGRows) AddSkipped(ctx context.Context, m Move, fromServer, toServer, reason, detail string) error {
 	return r.leased(ctx, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `INSERT INTO kingres_cp.rebalance_move (task_id, seq, database_name, colocation_id, bucket, from_group, to_group,
-			from_server, to_server, state, attempts, size_bytes, started_at, finished_at, error, round)
-			SELECT $1, coalesce(max(seq), 0) + 1, $2, $3, $4, $5, $6, $7, $8, 'skipped', 0, $9, clock_timestamp(), clock_timestamp(), $10, (SELECT round FROM kingres_cp.rebalance_run WHERE task_id = $1)
+			from_server, to_server, state, attempts, size_bytes, started_at, finished_at, error, round, schema_name)
+			SELECT $1, coalesce(max(seq), 0) + 1, $2, $3, $4, $5, $6, $7, $8, 'skipped', 0, $9, clock_timestamp(), clock_timestamp(), $10, (SELECT round FROM kingres_cp.rebalance_run WHERE task_id = $1), $11::text
 			FROM kingres_cp.rebalance_move WHERE task_id = $1
 			HAVING NOT EXISTS (SELECT 1 FROM kingres_cp.rebalance_move WHERE task_id = $1 AND database_name = $2 AND colocation_id = $3
 				AND bucket = $4 AND state = 'skipped' AND error = $10
 				AND round = (SELECT round FROM kingres_cp.rebalance_run WHERE task_id = $1))`,
-			r.TaskID, m.Database, m.Colocation, m.Bucket, m.From, m.To, fromServer, toServer, m.Size, clipText(reason+": "+detail, 500))
+			r.TaskID, m.Database, m.Colocation, m.Bucket, m.From, m.To, fromServer, toServer, m.Size, clipText(reason+": "+detail, 500), nullIfEmpty(m.Schema))
 		return err
 	})
 }
 
 const moveCols = `seq, database_name, colocation_id, bucket, from_group, to_group, coalesce(from_server, ''), coalesce(to_server, ''), state, attempts,
-	coalesce(move_id, 0), coalesce(phase, ''), percent, size_bytes, started_at, finished_at, coalesce(error, ''), round, ext_mark, coalesce(reason, ''), coalesce(cost, 0)`
+	coalesce(move_id, 0), coalesce(phase, ''), percent, size_bytes, started_at, finished_at, coalesce(error, ''), round, ext_mark, coalesce(reason, ''), coalesce(cost, 0), coalesce(schema_name, '')`
 
 // ScanMove reads a move from a row of moveCols.
 func ScanMove(row pgx.Row) (MoveRow, error) {
@@ -961,7 +966,7 @@ func ScanMove(row pgx.Row) (MoveRow, error) {
 	var pct float32
 	var mark *int64
 	err := row.Scan(&m.Seq, &m.Move.Database, &m.Move.Colocation, &m.Move.Bucket, &m.Move.From, &m.Move.To, &m.FromServer, &m.ToServer,
-		&m.State, &m.Attempts, &m.ExtMoveID, &m.Phase, &pct, &m.Size, &m.StartedAt, &m.FinishedAt, &m.Error, &m.Round, &mark, &m.Move.Reason, &m.Move.Cost)
+		&m.State, &m.Attempts, &m.ExtMoveID, &m.Phase, &pct, &m.Size, &m.StartedAt, &m.FinishedAt, &m.Error, &m.Round, &mark, &m.Move.Reason, &m.Move.Cost, &m.Move.Schema)
 	if mark != nil {
 		m.After, m.Marked = *mark, true
 	}

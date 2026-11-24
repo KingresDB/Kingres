@@ -655,9 +655,11 @@ func (s *Service) Status(ctx context.Context) (api.RebalanceStatus, error) {
 			if ph == "" {
 				ph = "preparing"
 			}
-			st.InFlightMoves = append(st.InFlightMoves, api.BucketMove{DatabaseName: m.Move.Database, ColocationID: m.Move.Colocation,
+			bm := api.BucketMove{DatabaseName: m.Move.Database, ColocationID: m.Move.Colocation,
 				Bucket: m.Move.Bucket, FromShardGroupID: m.Move.From, ToShardGroupID: m.Move.To, FromServerID: m.FromServer, ToServerID: m.ToServer,
-				Phase: phaseOf(ph), Percent: m.Percent, SizeBytes: m.Size})
+				Phase: phaseOf(ph), Percent: m.Percent, SizeBytes: m.Size}
+			bm.Kind, bm.SchemaName = schemaOf(m.Move)
+			st.InFlightMoves = append(st.InFlightMoves, bm)
 		}
 	}
 	st.Automatic = s.AutoStatus(ctx)
@@ -839,6 +841,7 @@ func reportMoves(moves []MoveRow) []api.ReportMove {
 		rm := api.ReportMove{DatabaseName: m.Move.Database, ColocationID: m.Move.Colocation, Bucket: m.Move.Bucket,
 			FromShardGroupID: m.Move.From, ToShardGroupID: m.Move.To, FromServerID: m.FromServer, ToServerID: m.ToServer,
 			SizeBytes: m.Size, Attempts: m.Attempts, Error: strp(m.Error), Reason: m.Move.Reason}
+		rm.Kind, rm.SchemaName = schemaOf(m.Move)
 		if m.FinishedAt != nil {
 			rm.DurationSeconds = m.FinishedAt.Sub(m.StartedAt).Seconds()
 		}
@@ -930,6 +933,7 @@ func (s *Service) Preview(ctx context.Context, req api.RebalancePlanRequest) (ap
 				c := m.Cost
 				pm.Cost = &c
 			}
+			pm.Kind, pm.SchemaName = schemaOf(m)
 			plan.Moves = append(plan.Moves, pm)
 		}
 	}
@@ -1010,4 +1014,13 @@ func (s *Service) groupWarnings(ctx context.Context, db string) []string {
 		return err
 	})
 	return out
+}
+
+// schemaOf gives the kind and the schema name that the contract shows for a move of a distributed schema (the optional fields
+// kind and schemaName); a move of a bucket has neither, so its output is what it always was.
+func schemaOf(m Move) (string, *string) {
+	if m.Schema == "" {
+		return "", nil
+	}
+	return m.Kind()
 }
