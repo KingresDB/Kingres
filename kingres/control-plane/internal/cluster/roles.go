@@ -26,10 +26,14 @@ import (
 
 // LocalInstance is one instance directory of this server with what it serves.
 type LocalInstance struct {
-	// ID is the directory id; Port the TCP port the instance listens on.
+	// ID is the directory id; Port the TCP port the instance listens on. Port 0 means "not chosen yet": a standby
+	// whose copy is not complete (Unfinished) gets its port after the base backup, so a caller that connects to an
+	// instance must skip one with Port 0 or Unfinished, never dial port 0.
 	ID   int
 	Port int
 	Role instance.Role
+	// Unfinished is true while the copy that makes the instance is not complete (instance.Manager.CopyUnfinished).
+	Unfinished bool
 }
 
 // HomeID is the directory id of the home instance.
@@ -42,7 +46,7 @@ func (s *Service) LocalInstances() []LocalInstance {
 	}
 	var out []LocalInstance
 	for _, id := range s.mgr.IDs() {
-		li := LocalInstance{ID: id, Role: s.mgr.MustRole(id)}
+		li := LocalInstance{ID: id, Role: s.mgr.MustRole(id), Unfinished: s.mgr.CopyUnfinished(id)}
 		if mk, err := s.mgr.Managed(id); err == nil {
 			li.Port = mk.Port
 		}
@@ -123,6 +127,9 @@ func (s *Service) Unattributed(group int32) []LocalInstance {
 	}
 	var out, claims []LocalInstance
 	for _, li := range s.LocalInstances() {
+		if li.Unfinished {
+			continue // a copy that is being made has no port yet (Port 0 would match anything below)
+		}
 		switch {
 		case li.Role.Role == instance.RoleUnknown:
 			if li.Port == 0 || slices.Contains(ports, li.Port) {

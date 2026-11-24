@@ -1,3 +1,4 @@
+| `standby-port-end` | `standby-port-base + 499` | last port tried for a new standby instance; with the base it gives a server a range of its own (a one-machine cluster, a test run) |
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # kingresd: the KingresDB control plane
 
@@ -2382,7 +2383,7 @@ Multi-server, in WSL (`internal/clustertest/standby_test.go`): `TestStandbysAreC
 1. The leader pushes the whole list of standbys to every server (`POST /standby/plan`), not only to the primary's server: the
    replication view and `HasStandby` (which decides whether a lease is enforced) must work on every server without the leader.
 2. Standby instances are the directories `100 + group` of the instance manager; the port is the first free one from `standby-port-base` (default `pg-port + 1000`; not
-   `pg-port + 1`, which on a one-machine cluster is the port the next server will bind), recorded in the standby record.
+   `pg-port + 1`, which on a one-machine cluster is the port the next server will bind), recorded in the standby record. The port is chosen after the base backup, right before the first start (not before the copy, which can take minutes), within `standby-port-base` to `standby-port-end`. If that first start fails because the port could not be bound (the startup log says "Address already in use" or "could not bind"), one other free port is chosen and recorded, in the managed file, the settings, the marker and the standby record together, and the start is tried once more. A standby that has run keeps its port; only an instance that has never run (the file `kingres-never-started` in its directory) may change it.
 3. The standby's server creates the slot on the primary itself (one call to the target), over the same certificate
    connection as everything else; the primary's own loop only maintains and drops.
 4. A lost or dropped slot is never recreated in place (the new one would start at the current position and the standby needs

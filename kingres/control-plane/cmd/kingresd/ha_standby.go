@@ -40,7 +40,7 @@ type standbyParts struct {
 func newStandbyParts(cfg config.Config, svc *cluster.Service, self string, log *slog.Logger, auditFn func(context.Context, audit.Event),
 	members *membership.Manager, opsSvc *ops.Ops, reg *ha.Registry) (*standbyParts, error) {
 	agent, err := standby.NewAgent(&standby.Agent{Svc: svc, Self: self, DataDir: cfg.DataDir, Log: log, Audit: auditFn,
-		Grace: cfg.HA.StandbySyncGrace, SlotWarn: cfg.HA.SlotWarnBytes, SlotLimit: cfg.HA.SlotLimitBytes, PortBase: cfg.HA.StandbyPortBase})
+		Grace: cfg.HA.StandbySyncGrace, SlotWarn: cfg.HA.SlotWarnBytes, SlotLimit: cfg.HA.SlotLimitBytes, PortBase: cfg.HA.StandbyPortBase, PortEnd: cfg.HA.StandbyPortEnd})
 	if err != nil {
 		return nil, err
 	}

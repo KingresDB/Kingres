@@ -42,6 +42,9 @@ type StandbySpec struct {
 	// Conninfo is the replication connection string of pg_basebackup: host, port,
 	// user and the certificate options, never a password.
 	Conninfo string
+	// PickPort, when set, chooses the port of the instance after the base backup, right before the first start, and
+	// Settings.Port is ignored (the port is chosen at the last moment, so that another program cannot take it during the copy).
+	PickPort func() (int, error)
 	// Slot is the physical slot created on the primary beforehand.
 	Slot string
 }
@@ -93,8 +96,12 @@ func (m *Manager) InitStandby(ctx context.Context, s StandbySpec) (err error) {
 	}
 	s.Settings.SocketDir = filepath.ToSlash(sock)
 	s.Settings.Preload = m.preloadListFor(s.ID)
-	managed, err := RenderManaged(s.Settings)
-	if err != nil {
+	chk := s.Settings
+	if s.PickPort != nil {
+		chk.Port = 1024 // a placeholder: the real port comes after the copy; this render only checks the other settings
+		s.Settings.Port = 0
+	}
+	if _, err := RenderManaged(chk); err != nil {
 		return err
 	}
 	if err := os.Mkdir(dir, 0o700); err != nil {
@@ -119,6 +126,9 @@ func (m *Manager) InitStandby(ctx context.Context, s StandbySpec) (err error) {
 	if err := m.MarkCopyUnfinished(s.ID); err != nil {
 		return err
 	}
+	if err := m.markNeverStarted(s.ID); err != nil {
+		return err
+	}
 	if err := m.WriteRole(s.ID, Role{Group: int32(s.ID - StandbyBaseID), Role: RoleStandby, Origin: OriginCopy}); err != nil {
 		return err
 	}
@@ -132,6 +142,23 @@ func (m *Manager) InitStandby(ctx context.Context, s StandbySpec) (err error) {
 		"--checkpoint=fast", "-w", "--no-password")
 	if runErr != nil {
 		return fmt.Errorf("instance: pg_basebackup: %w: %s", runErr, out)
+	}
+	if s.PickPort != nil {
+		// The port is chosen now, after the copy that took the time, so that the time between the choice and the first start
+		// is short. The marker is written again with it: until then it said 0.
+		p, perr := s.PickPort()
+		if perr != nil {
+			return perr
+		}
+		s.Settings.Port = p
+		mk, _ := json.Marshal(Marker{NodeID: s.ID, Port: p, CreatedAt: time.Now().UTC(), Magic: markerMagic})
+		if err := writeAtomic(filepath.Join(dir, MarkerName), mk); err != nil {
+			return err
+		}
+	}
+	managed, err := RenderManaged(s.Settings)
+	if err != nil {
+		return err
 	}
 	if err := os.WriteFile(filepath.Join(data, "kingres-managed.conf"), []byte(managed), 0o600); err != nil {
 		return err
