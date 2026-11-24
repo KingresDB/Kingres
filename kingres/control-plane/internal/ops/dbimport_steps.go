@@ -112,6 +112,17 @@ func (o *Ops) stepIMCheck(ctx context.Context, env *task.Env) error {
 	if plan.Statements > sqlshapeMaxTotal {
 		return transfer.Errorf(transfer.CodeImportTooLarge, false, "the SQL files hold more statements than an import takes")
 	}
+	// Every server needs room for the expanded archive before anything is made.
+	if err := o.freeSpaceFor(ctx, append([]string{o.ServerHost}, p.Servers...), res.Manifest.Totals.UncompressedBytes); err != nil {
+		return err
+	}
+	// A sequence is set only when it belongs to a schema that is not the system's or an extension's and to a column of a table of the catalog.
+	for _, sq := range res.Catalog.Sequences {
+		parts := strings.Split(sq.OwnedBy, ".")
+		if protectedSequenceSchema(sq.Schema) || len(parts) != 3 || !cat[parts[0]+"."+parts[1]] {
+			return transfer.Errorf(transfer.CodeArchiveInvalid, false, "the catalog names a sequence that an import does not set (%s)", safeName(sq.Schema+"."+sq.Name))
+		}
+	}
 	// The final name must still be free (it is checked again when it is taken).
 	var exists bool
 	if err := o.asService(ctx, "postgres", func(tx pgx.Tx) error {
@@ -336,7 +347,7 @@ func (o *Ops) stepIMCreate(ctx context.Context, env *task.Env) error {
 		return err
 	}
 	defer a.close()
-	priv := privateName(env.Task.ID)
+	priv := p.private(env.Task.ID)
 	op := importCreateOpOf(priv, p.Owner.Name, a.st.res.Manifest)
 	if err := o.createPrivateLocal(ctx, op); err != nil {
 		if errors.Is(err, errDatabaseExists) {
@@ -358,7 +369,7 @@ func (o *Ops) stepIMCreateOn(ctx context.Context, env *task.Env, server string) 
 		return err
 	}
 	defer a.close()
-	op := importCreateOpOf(privateName(env.Task.ID), "", a.st.res.Manifest)
+	op := importCreateOpOf(p.private(env.Task.ID), "", a.st.res.Manifest)
 	if o.Fanout == nil {
 		return nil
 	}
@@ -378,7 +389,7 @@ func (o *Ops) stepIMInstall(ctx context.Context, env *task.Env) error {
 	}
 	defer a.close()
 	m := a.st.res.Manifest
-	priv := privateName(env.Task.ID)
+	priv := p.private(env.Task.ID)
 	sharded := hasExt(m, extguard.Shard)
 	if sharded {
 		if err := o.installShardLocal(ctx, priv); err != nil {
@@ -587,7 +598,7 @@ func (o *Ops) stepIMFunctions(ctx context.Context, env *task.Env) error {
 		return err
 	}
 	defer a.close()
-	priv := privateName(env.Task.ID)
+	priv := p.private(env.Task.ID)
 	var refused []string
 	if err := o.asService(ctx, priv, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, "SET LOCAL search_path = pg_catalog"); err != nil {

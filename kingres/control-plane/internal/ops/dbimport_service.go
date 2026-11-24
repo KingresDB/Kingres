@@ -52,19 +52,28 @@ type importSeqItem struct {
 	Schema string `json:"schema"`
 	Name   string `json:"name"`
 	Value  int64  `json:"value"`
+	// Table and Column are the column that owns the sequence, as the catalog of the archive says; the server checks that the sequence is linked to it.
+	Table  string `json:"table"`
+	Column string `json:"column"`
 }
 
 type importSeqOp struct {
 	Name  string          `json:"name"`
 	Items []importSeqItem `json:"items"`
+	// Owner is the importing role: a sequence that another role owns (the sequences of the extensions among them) is never touched.
+	Owner string `json:"owner"`
+	// Full is set on the server that holds the coordinator, where the link of every sequence to its column can be checked.
+	Full bool `json:"full,omitempty"`
 }
 
 type importRenameOp struct {
 	From  string `json:"from"`
 	To    string `json:"to"`
 	Owner string `json:"owner"`
-	// Back undoes a rename (a later server failed): the final name goes back to the private one, and nothing else changes.
-	Back bool `json:"back,omitempty"`
+	// Back undoes a rename (a later server failed): the final name goes back to the private one, the owner back to the service role, the marker back and PUBLIC
+	// loses CONNECT again, so that the database is as the failure hook expects it.
+	Back   bool   `json:"back,omitempty"`
+	Marker string `json:"marker,omitempty"`
 }
 
 // applyImportKind runs the kinds of this file for ApplyLocal; it reports whether the kind was one of them.
@@ -142,8 +151,15 @@ func tableTrusted(ctx context.Context, tx pgx.Tx, schema, table, owner string, e
 	case trig || rule || pol || rls:
 		return fmt.Errorf("%s.%s has a trigger, a rule, a policy or row-level security", schema, table)
 	}
-	// The expressions of the table, as the catalog deparses them with the search path of this session.
+	// The catalog walk: every object that carries code and is reached from the table, its columns, constraints, indexes, types (domains and their checks included),
+	// statistics, triggers and partitions must be owned by a superuser or belong to an extension of the closed list.
 	rel := qualifiedText(schema, table)
+	if what, err := reachFinding(ctx, tx, rel); err != nil {
+		return err
+	} else if what != "" {
+		return fmt.Errorf("%s.%s reaches %s, which carries code that is not trusted", schema, table, what)
+	}
+	// The expressions of the table, as the catalog deparses them with the search path of this session.
 	rows, err := tx.Query(ctx, `SELECT pg_catalog.pg_get_expr(ad.adbin, ad.adrelid) FROM pg_catalog.pg_attrdef ad WHERE ad.adrelid = $1::pg_catalog.text::pg_catalog.regclass
 		UNION ALL SELECT pg_catalog.pg_get_constraintdef(c.oid) FROM pg_catalog.pg_constraint c WHERE c.conrelid = $1::pg_catalog.text::pg_catalog.regclass
 		UNION ALL SELECT pg_catalog.pg_get_indexdef(i.indexrelid) FROM pg_catalog.pg_index i WHERE i.indrelid = $1::pg_catalog.text::pg_catalog.regclass`, rel)
@@ -240,7 +256,7 @@ func (o *Ops) stepIMDistribute(ctx context.Context, env *task.Env) error {
 		return err
 	}
 	defer a.close()
-	priv := privateName(env.Task.ID)
+	priv := p.private(env.Task.ID)
 	// The service role works alone from here until the role is given access again.
 	if err := o.importAccess(ctx, env, p, priv, false); err != nil {
 		return err
@@ -276,11 +292,17 @@ func (o *Ops) stepIMDistribute(ctx context.Context, env *task.Env) error {
 		err := c.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM kingres.dist_table WHERE relid = $1::pg_catalog.text::pg_catalog.regclass)`, rel).Scan(&done)
 		return done, err
 	}
-	trusted := func(schema, table string) error {
-		if err := inTx(ctx, c, func(tx pgx.Tx) error { return tableTrusted(ctx, tx, schema, table, p.Owner.Name, extSchema) }); err != nil {
-			return untrustedError(err)
+	// call runs f in a transaction that holds a lock on the table and has checked it (lockTrusted): what was checked is what is acted on.
+	call := func(schema, table string, f func(tx pgx.Tx) error) error {
+		err := withTrustedTable(ctx, c, schema, table, p.Owner.Name, extSchema, f)
+		if err == nil {
+			return nil
 		}
-		return nil
+		var u *untrustedErr
+		if errors.As(err, &u) {
+			return untrustedError(u.err)
+		}
+		return o.distError(err, schema, table)
 	}
 	n := 0
 	// Distributed schemas: the schema and its tables move to a group while the tables are empty.
@@ -296,15 +318,22 @@ func (o *Ops) stepIMDistribute(ctx context.Context, env *task.Env) error {
 		if done {
 			continue
 		}
-		// Every table of the schema is verified before the extension reads or moves it.
-		for _, ct := range cat.Tables {
-			if ct.Schema == ds.Schema && ct.TreeRole != "leaf" {
-				if err := trusted(ct.Schema, ct.Name); err != nil {
-					return err
+		// Every table of the schema is locked and verified, in one transaction, before the extension reads or moves it.
+		if err := inTx(ctx, c, func(tx pgx.Tx) error {
+			for _, ct := range cat.Tables {
+				if ct.Schema == ds.Schema && ct.TreeRole != "leaf" {
+					if err := lockTrusted(ctx, tx, ct.Schema, ct.Name, p.Owner.Name, extSchema); err != nil {
+						return &untrustedErr{err}
+					}
 				}
 			}
-		}
-		if _, err := c.Exec(ctx, `SELECT kingres.distribute_schema($1::pg_catalog.text::pg_catalog.regnamespace, NULL::pg_catalog.int4)`, id.String()); err != nil {
+			_, e := tx.Exec(ctx, `SELECT kingres.distribute_schema($1::pg_catalog.text::pg_catalog.regnamespace, NULL::pg_catalog.int4)`, id.String())
+			return e
+		}); err != nil {
+			var u *untrustedErr
+			if errors.As(err, &u) {
+				return untrustedError(u.err)
+			}
 			return o.distError(err, ds.Schema, "")
 		}
 		n++
@@ -320,18 +349,15 @@ func (o *Ops) stepIMDistribute(ctx context.Context, env *task.Env) error {
 			return transfer.Errorf(transfer.CodeArchiveInvalid, false, "a table has a name that is not valid")
 		}
 		switch ct.Kind {
-		case "reference", "hash":
-			if err := trusted(ct.Schema, ct.Name); err != nil {
-				return err
-			}
-		}
-		switch ct.Kind {
 		case "reference":
 			if done, err := isDist(rel); err != nil {
 				return transfer.SafeError(err)
 			} else if !done {
-				if _, err := c.Exec(ctx, `SELECT kingres.create_reference_table($1::pg_catalog.text::pg_catalog.regclass)`, rel); err != nil {
-					return o.distError(err, ct.Schema, ct.Name)
+				if err := call(ct.Schema, ct.Name, func(tx pgx.Tx) error {
+					_, e := tx.Exec(ctx, `SELECT kingres.create_reference_table($1::pg_catalog.text::pg_catalog.regclass)`, rel)
+					return e
+				}); err != nil {
+					return err
 				}
 				n++
 			}
@@ -352,8 +378,11 @@ func (o *Ops) stepIMDistribute(ctx context.Context, env *task.Env) error {
 					b := g.BucketCount
 					buckets = &b
 				}
-				if _, err := c.Exec(ctx, `SELECT kingres.create_distributed_table($1::pg_catalog.text::pg_catalog.regclass, $2::pg_catalog.name, $3::pg_catalog.text::pg_catalog.regclass, $4::pg_catalog.int4)`, rel, col.Name(), coloc, buckets); err != nil {
-					return o.distError(err, ct.Schema, ct.Name)
+				if err := call(ct.Schema, ct.Name, func(tx pgx.Tx) error {
+					_, e := tx.Exec(ctx, `SELECT kingres.create_distributed_table($1::pg_catalog.text::pg_catalog.regclass, $2::pg_catalog.name, $3::pg_catalog.text::pg_catalog.regclass, $4::pg_catalog.int4)`, rel, col.Name(), coloc, buckets)
+					return e
+				}); err != nil {
+					return err
 				}
 				n++
 			}
@@ -365,8 +394,11 @@ func (o *Ops) stepIMDistribute(ctx context.Context, env *task.Env) error {
 				// Two groups of the source that have the same shape would join into one here; a group that the source kept apart is kept apart.
 				for ref, other := range colocID {
 					if other == id && ref != ct.ColocationRef {
-						if _, err := c.Exec(ctx, `SELECT kingres.alter_distributed_table($1::pg_catalog.text::pg_catalog.regclass, NULL, NULL, 'none', false)`, rel); err != nil {
-							return o.distError(err, ct.Schema, ct.Name)
+						if err := call(ct.Schema, ct.Name, func(tx pgx.Tx) error {
+							_, e := tx.Exec(ctx, `SELECT kingres.alter_distributed_table($1::pg_catalog.text::pg_catalog.regclass, NULL, NULL, 'none', false)`, rel)
+							return e
+						}); err != nil {
+							return err
 						}
 						if err := c.QueryRow(ctx, `SELECT colocation_id FROM kingres.dist_table WHERE relid = $1::pg_catalog.text::pg_catalog.regclass`, rel).Scan(&id); err != nil {
 							return transfer.SafeError(err)
@@ -379,7 +411,7 @@ func (o *Ops) stepIMDistribute(ctx context.Context, env *task.Env) error {
 			}
 		}
 		if len(ct.Columnar) > 0 && ct.AccessMethod == "columnar" {
-			if err := o.setColumnarOptions(ctx, c, ct, trusted); err != nil {
+			if err := o.setColumnarOptions(ctx, c, ct, p.Owner.Name, extSchema); err != nil {
 				return err
 			}
 		}
@@ -398,10 +430,7 @@ func (o *Ops) distError(err error, schema, table string) error {
 
 var columnarKeys = map[string][2]int{"compressionLevel": {1, 19}, "stripeRowCount": {1000, 10000000}, "chunkRowCount": {100, 100000}}
 
-func (o *Ops) setColumnarOptions(ctx context.Context, c *pgx.Conn, ct archive.CatalogTable, trusted func(schema, table string) error) error {
-	if err := trusted(ct.Schema, ct.Name); err != nil {
-		return err
-	}
+func (o *Ops) setColumnarOptions(ctx context.Context, c *pgx.Conn, ct archive.CatalogTable, owner string, extSchema map[string]string) error {
 	var comp *string
 	ints := map[string]*int{}
 	for k, v := range ct.Columnar {
@@ -424,8 +453,11 @@ func (o *Ops) setColumnarOptions(ctx context.Context, c *pgx.Conn, ct archive.Ca
 		}
 	}
 	rel := qualifiedText(ct.Schema, ct.Name)
-	if _, err := c.Exec(ctx, `SELECT kingres.columnar_set_options($1::pg_catalog.text::pg_catalog.regclass, $2, $3, $4, $5)`, rel, comp, ints["compressionLevel"], ints["stripeRowCount"], ints["chunkRowCount"]); err != nil {
-		return transfer.SafeError(err).ForTarget(ct.Schema, ct.Name)
+	if err := withTrustedTable(ctx, c, ct.Schema, ct.Name, owner, extSchema, func(tx pgx.Tx) error {
+		_, e := tx.Exec(ctx, `SELECT kingres.columnar_set_options($1::pg_catalog.text::pg_catalog.regclass, $2, $3, $4, $5)`, rel, comp, ints["compressionLevel"], ints["stripeRowCount"], ints["chunkRowCount"])
+		return e
+	}); err != nil {
+		return wrapTrust(err, ct.Schema, ct.Name)
 	}
 	return nil
 }
@@ -465,17 +497,23 @@ func (o *Ops) stepIMSequences(ctx context.Context, env *task.Env) error {
 			v = s.LastValue
 		}
 		if v > 0 {
-			items = append(items, importSeqItem{Schema: s.Schema, Name: s.Name, Value: v})
+			items = append(items, importSeqItem{Schema: s.Schema, Name: s.Name, Value: v, Table: parts[0] + "." + parts[1], Column: parts[2]})
 		}
+	}
+	// The rows of every table, counted as the role (the service role scans no table of the role): the rows must equal the manifest's.
+	if bad := o.countRows(ctx, conn, a); bad != "" {
+		_ = conn.Close(context.WithoutCancel(ctx))
+		return transfer.Errorf(transfer.CodeVerification, false, "the rows do not equal the manifest's: %s", bad)
 	}
 	_ = conn.Close(context.WithoutCancel(ctx))
 	if err := o.importAccess(ctx, env, p, priv, false); err != nil {
 		return err
 	}
-	op := importSeqOp{Name: priv, Items: items}
+	op := importSeqOp{Name: priv, Items: items, Owner: p.Owner.Name, Full: true}
 	if err := o.importSequencesLocal(ctx, op); err != nil {
 		return transfer.SafeError(err)
 	}
+	op.Full = false
 	for _, s := range p.Servers {
 		s := s
 		if o.Fanout == nil {
@@ -486,6 +524,67 @@ func (o *Ops) stepIMSequences(ctx context.Context, env *task.Env) error {
 		}
 	}
 	return env.SetDetail(ctx, fmt.Sprintf("%d sequences", len(items)))
+}
+
+// protectedSequenceSchema says that a schema is the system's or the extensions' (kingres and kingres_*, pg_*, information_schema): no sequence of it is set.
+func protectedSequenceSchema(s string) bool {
+	l := strings.ToLower(s)
+	return l == "kingres" || strings.HasPrefix(l, "kingres_") || strings.HasPrefix(l, "pg_") || l == "information_schema"
+}
+
+// raiseSequence sets one sequence, in ONE statement that holds the conditions: it is a sequence of a schema that is not the system's or an extension's, the importing
+// role owns it, and (where full is set) it is linked, as an owned or an identity sequence, to the column that the catalog of the archive names. A sequence that is
+// refused is an error on the server that holds the coordinator (full), and is skipped elsewhere (the node may not have the sequence). setval runs no code.
+func raiseSequence(ctx context.Context, c *pgx.Conn, it importSeqItem, owner string, full bool) error {
+	if _, err := sqlx.QualifiedIdent(it.Schema, it.Name); err != nil || protectedSequenceSchema(it.Schema) {
+		return errors.New("a sequence is refused: its schema is not one that an import may change")
+	}
+	ts, tn, ok := splitQualified(it.Table)
+	if !ok {
+		return errors.New("a sequence is refused: its column is not named")
+	}
+	tag, err := c.Exec(ctx, `SELECT pg_catalog.setval(c.oid, GREATEST($3::pg_catalog.int8, coalesce(pg_catalog.pg_sequence_last_value(c.oid), 0)), true)
+		FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1::pg_catalog.text AND c.relname = $2::pg_catalog.text AND c.relkind = 'S'
+		  AND n.nspname !~ '^(pg_|kingres$|kingres_|information_schema$)' AND pg_catalog.pg_get_userbyid(c.relowner) = $4::pg_catalog.text
+		  AND ($5::pg_catalog.bool = false OR EXISTS (SELECT 1 FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_class t ON t.oid = d.refobjid JOIN pg_catalog.pg_namespace tn ON tn.oid = t.relnamespace
+		        JOIN pg_catalog.pg_attribute a ON a.attrelid = t.oid AND a.attnum = d.refobjsubid
+		        WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.objid = c.oid AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.deptype IN ('a', 'i')
+		          AND tn.nspname = $6::pg_catalog.text AND t.relname = $7::pg_catalog.text AND a.attname = $8::pg_catalog.text))`,
+		it.Schema, it.Name, it.Value, owner, full, ts, tn, it.Column)
+	if err != nil {
+		return err
+	}
+	if full && tag.RowsAffected() != 1 {
+		return errors.New("a sequence is refused: it is not owned by the importing role, or not linked to the column that the archive names")
+	}
+	return nil
+}
+
+// countRows counts the rows of every data table as the role, and says what is wrong ("" when every count is the manifest's).
+func (o *Ops) countRows(ctx context.Context, conn *pgx.Conn, a *archiveFile) string {
+	byTable := map[string]archive.CatalogTable{}
+	for _, ct := range a.st.res.Catalog.Tables {
+		byTable[ct.Qualified()] = ct
+	}
+	var bad []string
+	for _, me := range dataEntriesOf(a.st.res.Manifest) {
+		ct := byTable[me.Table]
+		q := "SELECT pg_catalog.count(*) FROM "
+		if ct.TreeRole == "inheritanceParent" {
+			q += "ONLY "
+		}
+		var n int64
+		if err := conn.QueryRow(ctx, q+qualifiedText(ct.Schema, ct.Name)).Scan(&n); err != nil {
+			bad = append(bad, safeName(me.Table)+" could not be counted")
+		} else if n != me.Rows {
+			bad = append(bad, fmt.Sprintf("%s has %d rows and the manifest says %d", safeName(me.Table), n, me.Rows))
+		}
+		if len(bad) >= 5 {
+			break
+		}
+	}
+	return strings.Join(bad, "; ")
 }
 
 // importSequencesLocal raises the sequences to the values: setval(seq, greatest(value, the state here)). A sequence that this server does not have is skipped.
@@ -501,17 +600,14 @@ func (o *Ops) importSequencesLocal(ctx context.Context, op importSeqOp) error {
 	if _, err := c.Exec(ctx, "SET search_path = pg_catalog"); err != nil {
 		return err
 	}
+	if _, err := sqlx.NewIdent(op.Owner); err != nil {
+		return errors.New("the importing role is not valid")
+	}
 	for _, it := range op.Items {
 		if it.Value <= 0 {
 			continue
 		}
-		if _, err := sqlx.QualifiedIdent(it.Schema, it.Name); err != nil {
-			return errors.New("a sequence name is not valid")
-		}
-		// Only a sequence (relkind S) is touched; nothing that the role could have put under that name in another kind is read.
-		if _, err := c.Exec(ctx, `SELECT pg_catalog.setval(c.oid, GREATEST($3::pg_catalog.int8, coalesce(pg_catalog.pg_sequence_last_value(c.oid), 0)), true)
-			FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::pg_catalog.text AND c.relname = $2::pg_catalog.text AND c.relkind = 'S'`,
-			it.Schema, it.Name, it.Value); err != nil {
+		if err := raiseSequence(ctx, c, it, op.Owner, op.Full); err != nil {
 			return err
 		}
 	}
@@ -532,7 +628,7 @@ func (o *Ops) stepIMLedger(ctx context.Context, env *task.Env) error {
 		return err
 	}
 	defer a.close()
-	priv := privateName(env.Task.ID)
+	priv := p.private(env.Task.ID)
 	res := a.st.res
 	cat := res.Catalog
 	var ledgers []archive.CatalogTable
@@ -563,11 +659,8 @@ func (o *Ops) stepIMLedger(ctx context.Context, env *task.Env) error {
 	if err := requireExtensions(ctx, c, hasExt(res.Manifest, extguard.Shard), need...); err != nil {
 		return err
 	}
-	trusted := func(schema, table string) error {
-		if err := inTx(ctx, c, func(tx pgx.Tx) error { return tableTrusted(ctx, tx, schema, table, p.Owner.Name, extSchema) }); err != nil {
-			return untrustedError(err)
-		}
-		return nil
+	locked := func(schema, table string, f func(tx pgx.Tx) error) error {
+		return wrapTrust(withTrustedTable(ctx, c, schema, table, p.Owner.Name, extSchema, f), schema, table)
 	}
 	var notes []string
 	// The rows were loaded first; ledger_enable enters them as the first entries of a new chain.
@@ -576,11 +669,11 @@ func (o *Ops) stepIMLedger(ctx context.Context, env *task.Env) error {
 		if mode == "" {
 			return transfer.Errorf(transfer.CodeArchiveInvalid, false, "a ledger table has a mode that is not known")
 		}
-		if err := trusted(ct.Schema, ct.Name); err != nil {
+		if err := locked(ct.Schema, ct.Name, func(tx pgx.Tx) error {
+			_, e := tx.Exec(ctx, `SELECT kingres.ledger_enable($1::pg_catalog.text::pg_catalog.regclass, $2::pg_catalog.text)`, qualifiedText(ct.Schema, ct.Name), mode)
+			return e
+		}); err != nil {
 			return err
-		}
-		if _, err := c.Exec(ctx, `SELECT kingres.ledger_enable($1::pg_catalog.text::pg_catalog.regclass, $2::pg_catalog.text)`, qualifiedText(ct.Schema, ct.Name), mode); err != nil {
-			return transfer.SafeError(err).ForTarget(ct.Schema, ct.Name)
 		}
 		notes = append(notes, fmt.Sprintf("ledger: %s.%s starts a new chain (the source had its head at height %d)", ct.Schema, ct.Name, ct.Ledger.HeadHeight))
 	}
@@ -595,8 +688,11 @@ func (o *Ops) stepIMLedger(ctx context.Context, env *task.Env) error {
 		// The policy of the source is set again after the verification: a copy that accepts unattested writes would be a downgrade of the protection.
 		for _, ct := range ledgers {
 			if ct.Ledger.Policy == "required" {
-				if _, err := c.Exec(ctx, `SELECT kingres.ledger_set_signature_policy($1::pg_catalog.text::pg_catalog.regclass, 'required')`, qualifiedText(ct.Schema, ct.Name)); err != nil {
-					return transfer.SafeError(err).ForTarget(ct.Schema, ct.Name)
+				if err := locked(ct.Schema, ct.Name, func(tx pgx.Tx) error {
+					_, e := tx.Exec(ctx, `SELECT kingres.ledger_set_signature_policy($1::pg_catalog.text::pg_catalog.regclass, 'required')`, qualifiedText(ct.Schema, ct.Name))
+					return e
+				}); err != nil {
+					return err
 				}
 				notes = append(notes, fmt.Sprintf("ledger: %s.%s has the signature policy required again", ct.Schema, ct.Name))
 			}
@@ -604,11 +700,12 @@ func (o *Ops) stepIMLedger(ctx context.Context, env *task.Env) error {
 	}
 	// Time-partition policies come back DISABLED: a retention policy would drop old partitions on a schedule the user did not choose.
 	for _, tp := range cat.TimepartPolicies {
-		if err := trusted(tp.Schema, tp.Table); err != nil {
-			return err
-		}
-		if err := o.setPolicyDisabled(ctx, c, tp); err != nil {
-			notes = append(notes, fmt.Sprintf("policy: %s.%s was not imported (%s)", tp.Schema, tp.Table, firstSentence(err)))
+		if err := locked(tp.Schema, tp.Table, func(tx pgx.Tx) error { return o.setPolicyDisabled(ctx, tx, tp) }); err != nil {
+			var te *transfer.Error
+			if errors.As(err, &te) && te.Code == transfer.CodeTableNotEligible {
+				return err
+			}
+			notes = append(notes, fmt.Sprintf("policy: %s.%s was not imported (%s)", safeName(tp.Schema), safeName(tp.Table), firstSentence(err)))
 			continue
 		}
 		notes = append(notes, fmt.Sprintf("policy disabled: %s.%s; enable it with PUT partition-policy and enabled true", tp.Schema, tp.Table))
@@ -620,7 +717,7 @@ func (o *Ops) stepIMLedger(ctx context.Context, env *task.Env) error {
 }
 
 // setPolicyDisabled calls kingres.timepart_set_policy with enabled = false; every argument is a bound parameter.
-func (o *Ops) setPolicyDisabled(ctx context.Context, c *pgx.Conn, tp archive.TimepartPolicy) error {
+func (o *Ops) setPolicyDisabled(ctx context.Context, c execer, tp archive.TimepartPolicy) error {
 	nilIfEmpty := func(s string) any {
 		if s == "" {
 			return nil
@@ -657,45 +754,16 @@ func (o *Ops) stepIMVerify(ctx context.Context, env *task.Env) error {
 		return err
 	}
 	defer a.close()
-	priv := privateName(env.Task.ID)
+	priv := p.private(env.Task.ID)
 	if err := o.importAccess(ctx, env, p, priv, false); err != nil {
 		return err
 	}
 	res := a.st.res
-	extSchema := extensionSchemas(res.Manifest)
 	c, err := o.serviceConnFor(ctx, priv)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
-	byTable := map[string]archive.CatalogTable{}
-	for _, ct := range res.Catalog.Tables {
-		byTable[ct.Qualified()] = ct
-	}
-	var bad []string
-	for _, me := range dataEntriesOf(res.Manifest) {
-		ct := byTable[me.Table]
-		if err := inTx(ctx, c, func(tx pgx.Tx) error { return tableTrusted(ctx, tx, ct.Schema, ct.Name, p.Owner.Name, extSchema) }); err != nil {
-			return untrustedError(err)
-		}
-		q := "SELECT pg_catalog.count(*) FROM "
-		if ct.TreeRole == "inheritanceParent" {
-			q += "ONLY "
-		}
-		var n int64
-		if err := c.QueryRow(ctx, q+qualifiedText(ct.Schema, ct.Name)).Scan(&n); err != nil {
-			return transfer.SafeError(err).ForTarget(ct.Schema, ct.Name)
-		}
-		if n != me.Rows {
-			bad = append(bad, fmt.Sprintf("%s has %d rows and the manifest says %d", me.Table, n, me.Rows))
-		}
-	}
-	if len(bad) > 0 {
-		if len(bad) > 5 {
-			bad = bad[:5]
-		}
-		return transfer.Errorf(transfer.CodeVerification, false, "the rows do not equal the manifest's: %s", strings.Join(bad, "; "))
-	}
 	hasLedger := false
 	for _, ct := range res.Catalog.Tables {
 		hasLedger = hasLedger || ct.Ledger != nil
@@ -722,6 +790,7 @@ func (o *Ops) stepIMVerify(ctx context.Context, env *task.Env) error {
 			return transfer.Errorf(transfer.CodeVerification, false, "%d constraints are not valid", notValid)
 		}
 	}
+	// The rows were counted as the role (the step before the withdrawal): the service role reads the catalog and the ledger only.
 	return env.SetDetail(ctx, fmt.Sprintf("%d tables verified", len(dataEntriesOf(res.Manifest))))
 }
 
@@ -733,7 +802,7 @@ func (o *Ops) importRenameLocal(ctx context.Context, op importRenameOp) error {
 		if !strings.HasPrefix(op.To, privatePrefix) || !dbNameRE.MatchString(op.To) || !dbNameRE.MatchString(op.From) || protectedDB[op.From] || strings.HasPrefix(op.From, privatePrefix) {
 			return errors.New("this rename is not allowed")
 		}
-		return o.renameBack(ctx, op.From, op.To)
+		return o.renameBack(ctx, op.From, op.To, op.Marker)
 	}
 	if !strings.HasPrefix(op.From, privatePrefix) || !dbNameRE.MatchString(op.From) || !dbNameRE.MatchString(op.To) || protectedDB[op.To] || strings.HasPrefix(op.To, privatePrefix) {
 		return errors.New("this rename is not allowed")
@@ -760,6 +829,10 @@ func (o *Ops) importRenameLocal(ctx context.Context, op importRenameOp) error {
 	} else if ok {
 		return errDatabaseExists
 	}
+	// A prepared transaction keeps the database in use for ever: it is rolled back first.
+	if err := o.rollbackPreparedLocal(ctx, c, op.From); err != nil {
+		return err
+	}
 	// A rename needs a database that nobody is connected to. The sessions that are there (the background workers of the extensions among them) are ended and the
 	// rename is tried again when one of them came back in between.
 	var last error
@@ -781,15 +854,26 @@ func (o *Ops) importRenameLocal(ctx context.Context, op importRenameOp) error {
 	if last != nil {
 		return last
 	}
-	if err := run(ctx, c, stmt().Text("ALTER DATABASE").ID(to).Text("OWNER TO").ID(owner)); err != nil {
+	// From here the name is taken: every failure puts the private name, the owner, the marker and the closed door back before it is returned, so that the failure
+	// hook finds the database as it expects it (and an error of the undoing is part of the error).
+	undo := func(err error) error {
+		if uerr := o.renameBack(context.WithoutCancel(ctx), op.To, op.From, importMarker(op.From)); uerr != nil {
+			return fmt.Errorf("%w; the private name could not be put back: %v", err, uerr)
+		}
 		return err
+	}
+	if err := run(ctx, c, stmt().Text("ALTER DATABASE").ID(to).Text("OWNER TO").ID(owner)); err != nil {
+		return undo(err)
 	}
 	// The marker of the private database goes with the name.
 	if err := run(ctx, c, stmt().Text("COMMENT ON DATABASE").ID(to).Text("IS NULL")); err != nil {
-		return err
+		return undo(err)
 	}
 	// The default of a database that database.create makes: PUBLIC may connect.
-	return run(ctx, c, stmt().Text("GRANT CONNECT ON DATABASE").ID(to).Text("TO PUBLIC"))
+	if err := run(ctx, c, stmt().Text("GRANT CONNECT ON DATABASE").ID(to).Text("TO PUBLIC")); err != nil {
+		return undo(err)
+	}
+	return nil
 }
 
 func (o *Ops) stepIMRename(ctx context.Context, env *task.Env) error {
@@ -805,7 +889,7 @@ func (o *Ops) stepIMRename(ctx context.Context, env *task.Env) error {
 	if err := o.refuseDangerousImporter(ctx, p.Owner.Name); err != nil {
 		return err
 	}
-	priv := privateName(env.Task.ID)
+	priv := p.private(env.Task.ID)
 	if err := o.importAccess(ctx, env, p, priv, false); err != nil {
 		return err
 	}
@@ -825,24 +909,33 @@ func (o *Ops) stepIMRename(ctx context.Context, env *task.Env) error {
 	done := []string{}
 	// A server that fails after another one was renamed puts the others back, so that the private name is the only name of the work in progress and the hook of
 	// the task finds all of it.
-	revert := func() {
+	revert := func() string {
 		bg := context.WithoutCancel(ctx)
+		var failed []string
 		for _, s := range done {
+			var err error
 			if s == "" {
-				_ = o.renameBack(bg, p.Database, priv)
-				continue
+				err = o.renameBack(bg, p.Database, priv, importMarker(priv))
+			} else if o.Fanout != nil {
+				err = o.Fanout.Apply(bg, s, ApplyImportRename, importRenameOp{From: p.Database, To: priv, Back: true, Marker: importMarker(priv)})
 			}
-			if o.Fanout != nil {
-				_ = o.Fanout.Apply(bg, s, ApplyImportRename, importRenameOp{From: p.Database, To: priv, Back: true})
+			if err != nil {
+				if o.Log != nil {
+					o.Log.Error("the private name of an import could not be put back", "server", s, "database", priv, "error", err)
+				}
+				failed = append(failed, safeName(s))
 			}
 		}
+		if len(failed) > 0 {
+			return fmt.Sprintf("; the private name could not be put back on %s (an operator must drop %s there)", strings.Join(failed, ", "), priv)
+		}
+		return ""
 	}
 	if err := o.importRenameLocal(ctx, op); err != nil {
 		if errors.Is(err, errDatabaseExists) {
 			return transfer.Errorf(transfer.CodeForbidden, false, "the database %s exists; the import is not finished and the private database is removed", p.Database)
 		}
-		revert()
-		return transfer.Errorf(transfer.CodeSQLError, false, "the private database could not be renamed to its final name")
+		return transfer.Errorf(transfer.CodeSQLError, false, "the private database could not be renamed to its final name%s", revertNote(err))
 	}
 	done = append(done, "")
 	for _, s := range p.Servers {
@@ -851,8 +944,10 @@ func (o *Ops) stepIMRename(ctx context.Context, env *task.Env) error {
 			break
 		}
 		if err := o.onServer(ctx, env, s, "take the final name", func() error { return o.Fanout.Apply(ctx, s, ApplyImportRename, op) }); err != nil {
-			revert()
-			return err
+			// The server may have renamed before it failed to answer: it is put back too.
+			done = append(done, s)
+			note := revert()
+			return fmt.Errorf("%w%s", err, note)
 		}
 		done = append(done, s)
 	}
@@ -870,8 +965,8 @@ func (o *Ops) stepIMRename(ctx context.Context, env *task.Env) error {
 		}
 	}
 	if err := o.recordImportedSettings(ctx, p, sharded, buckets, ledgerMode); err != nil {
-		revert()
-		return transfer.Errorf(transfer.CodeSQLError, false, "the settings of the database could not be recorded, so the import was undone")
+		note := revert()
+		return transfer.Errorf(transfer.CodeSQLError, false, "the settings of the database could not be recorded, so the import was undone%s", note)
 	}
 	detail := "imported " + p.Database
 	if st := o.importState(env.Task.ID); st != nil && len(st.notes) > 0 {
@@ -885,15 +980,52 @@ func (o *Ops) stepIMRename(ctx context.Context, env *task.Env) error {
 	return env.SetDetail(ctx, detail)
 }
 
-// renameBack undoes the rename of this server (a failure on another server after this one was renamed).
-func (o *Ops) renameBack(ctx context.Context, from, to string) error {
+// revertNote is the text that an error of the undoing adds to the error of the rename: nothing for a plain failure.
+func revertNote(err error) string {
+	if i := strings.Index(err.Error(), "; the private name could not be put back"); i >= 0 {
+		return "; the private name could not be put back"
+	}
+	return ""
+}
+
+// renameBack undoes the rename of this server (a failure after this one was renamed): the final name goes back to the private one, the service role owns the
+// database again, the marker is written again and PUBLIC may not connect. Every part is tried and the errors are joined.
+func (o *Ops) renameBack(ctx context.Context, from, to, marker string) error {
 	c, err := o.Service.ServiceConn(ctx, "postgres")
 	if err != nil {
 		return err
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
-	_, _ = c.Exec(ctx, `SELECT pg_catalog.pg_terminate_backend(pid) FROM pg_catalog.pg_stat_activity WHERE datname = $1 AND pid <> pg_catalog.pg_backend_pid()`, from)
-	return run(ctx, c, stmt().Text("ALTER DATABASE").ID(sqlx.MustIdent(from)).Text("RENAME TO").ID(sqlx.MustIdent(to)))
+	var errs []error
+	if err := o.rollbackPreparedLocal(ctx, c, from); err != nil {
+		errs = append(errs, err)
+	}
+	var rerr error
+	for attempt := 0; attempt < 40; attempt++ {
+		_, _ = c.Exec(ctx, `SELECT pg_catalog.pg_terminate_backend(pid) FROM pg_catalog.pg_stat_activity WHERE datname = $1 AND pid <> pg_catalog.pg_backend_pid()`, from)
+		rerr = run(ctx, c, stmt().Text("ALTER DATABASE").ID(sqlx.MustIdent(from)).Text("RENAME TO").ID(sqlx.MustIdent(to)))
+		var pe *pgconn.PgError
+		if rerr == nil || !errors.As(rerr, &pe) || pe.Code != "55006" {
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if rerr != nil {
+		return rerr
+	}
+	t := sqlx.MustIdent(to)
+	if err := run(ctx, c, stmt().Text("ALTER DATABASE").ID(t).Text("OWNER TO CURRENT_USER")); err != nil {
+		errs = append(errs, err)
+	}
+	if marker != "" {
+		if err := run(ctx, c, stmt().Text("COMMENT ON DATABASE").ID(t).Text("IS").Lit(marker)); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := run(ctx, c, stmt().Text("REVOKE CONNECT ON DATABASE").ID(t).Text("FROM PUBLIC")); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 func (o *Ops) recordImportedSettings(ctx context.Context, p dbImportParams, sharded bool, buckets int, ledgerMode string) error {
@@ -938,11 +1070,13 @@ func (o *Ops) importOnFailHook(ctx context.Context, t task.Task) {
 		}
 		o.Transfer.Audit(ctx, "dataTransfer.completed", map[string]any{"kind": "databaseImport", "database": p.Database, "uploadId": idText(p.UploadID), "outcome": "failure", "code": code, "message": msg, "kept": kept})
 	}
+	bg := context.WithoutCancel(ctx)
 	if kept {
+		// The database stays for the operator to look at; the role that made it may not connect to it, on any server.
+		o.withdrawEverywhere(bg, p, p.private(t.ID))
 		return
 	}
-	bg := context.WithoutCancel(ctx)
-	priv := privateName(t.ID)
+	priv := p.private(t.ID)
 	if o.Service != nil {
 		if err := o.importDropLocal(bg, priv); err != nil && o.Log != nil {
 			o.Log.Warn("the private database of a failed import could not be dropped", "database", priv, "error", err)
@@ -962,6 +1096,31 @@ func (o *Ops) importOnFailHook(ctx context.Context, t task.Task) {
 			if err := o.Fanout.Apply(bg, s, ApplyImportDrop, importDropOp{Name: priv}); err != nil && o.Log != nil {
 				o.Log.Warn("the private database of a failed import could not be dropped on a server", "database", priv, "server", s, "error", err)
 			}
+		}
+	}
+}
+
+// withdrawEverywhere withdraws the importing role from the private database on this server and on every other, logging what fails (the failure hook cannot wait).
+func (o *Ops) withdrawEverywhere(ctx context.Context, p dbImportParams, priv string) {
+	if o.Service == nil {
+		return
+	}
+	op := importAccessOp{Name: priv, Role: p.Owner.Name, Allow: false, Full: true}
+	if err := o.importAccessLocal(ctx, op); err != nil && o.Log != nil {
+		o.Log.Warn("the access of the role to a kept private database could not be withdrawn", "database", priv, "error", err)
+	}
+	if o.Fanout == nil {
+		return
+	}
+	op.Full = false
+	seen := map[string]bool{o.ServerHost: true}
+	for _, s := range append(append([]string(nil), p.Servers...), ids(o.others(ctx))...) {
+		if seen[s] {
+			continue
+		}
+		seen[s] = true
+		if err := o.Fanout.Apply(ctx, s, ApplyImportAccess, op); err != nil && o.Log != nil {
+			o.Log.Warn("the access of the role to a kept private database could not be withdrawn on a server", "database", priv, "server", s, "error", err)
 		}
 	}
 }
@@ -989,6 +1148,16 @@ func (o *Ops) importDropLocal(ctx context.Context, name string) error {
 	}
 	if !mine {
 		return errors.New("the database was not made by this import")
+	}
+	// A prepared transaction keeps the database in use: DROP ... WITH (FORCE) fails for ever while one is there.
+	pc, err := o.Service.ServiceConn(ctx, "postgres")
+	if err != nil {
+		return err
+	}
+	perr := o.rollbackPreparedLocal(ctx, pc, name)
+	_ = pc.Close(context.WithoutCancel(ctx))
+	if perr != nil {
+		return perr
 	}
 	return o.dropDB(ctx, dropParams{Name: name})
 }

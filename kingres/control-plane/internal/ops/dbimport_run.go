@@ -52,6 +52,13 @@ func (o *Ops) importRoleConn(ctx context.Context, priv, role string) (*pgx.Conn,
 		_ = c.Close(context.WithoutCancel(ctx))
 		return nil, transfer.Errorf(transfer.CodeForbidden, false, "the role has the SUPERUSER, REPLICATION or BYPASSRLS attribute or access to server files, programs or logs; the statements of an archive run as that role")
 	}
+	if why, ierr := importerRefusal(ctx, c, role); ierr != nil {
+		_ = c.Close(context.WithoutCancel(ctx))
+		return nil, transfer.Errorf(transfer.CodeSessionLost, true, "the check of the role could not be made now; repeat the operation")
+	} else if why != "" {
+		_ = c.Close(context.WithoutCancel(ctx))
+		return nil, transfer.Errorf(transfer.CodeForbidden, false, "%s", importerText)
+	}
 	for _, s := range importSession {
 		if _, err := c.Exec(ctx, s); err != nil {
 			_ = c.Close(context.WithoutCancel(ctx))
@@ -207,11 +214,7 @@ func (o *Ops) importAccessLocal(ctx context.Context, op importAccessOp) error {
 		defer func() { _ = d.Close(context.WithoutCancel(ctx)) }()
 		return run(ctx, d, stmt().Text("GRANT USAGE, CREATE ON SCHEMA public TO").ID(role))
 	}
-	if err := run(ctx, c, stmt().Text("REVOKE CONNECT ON DATABASE").ID(db).Text("FROM").ID(role)); err != nil {
-		return err
-	}
-	_, err = c.Exec(ctx, `SELECT pg_catalog.pg_terminate_backend(pid) FROM pg_catalog.pg_stat_activity WHERE datname = $1 AND usename = $2 AND pid <> pg_catalog.pg_backend_pid()`, op.Name, op.Role)
-	return err
+	return o.withdrawLocal(ctx, c, op.Name, db, role)
 }
 
 // importAccess gives the importing role access to the private database of this server and of every other, or takes it away.
@@ -249,7 +252,7 @@ func (o *Ops) openForRole(ctx context.Context, env *task.Env) (p dbImportParams,
 	if a, err = o.openImport(ctx, x, rec, p, env.Task.ID); err != nil {
 		return
 	}
-	priv = privateName(env.Task.ID)
+	priv = p.private(env.Task.ID)
 	if err = o.importAccess(ctx, env, p, priv, true); err != nil {
 		a.close()
 		return
@@ -370,7 +373,7 @@ func (o *Ops) stepIMData(ctx context.Context, env *task.Env) error {
 		}
 		total += read
 		if rows != me.Rows {
-			return transfer.Errorf(transfer.CodeRowCountMismatch, false, "the database loaded %d rows into %s and the manifest says %d", rows, me.Table, me.Rows)
+			return transfer.Errorf(transfer.CodeRowCountMismatch, false, "the database loaded %d rows into %s and the manifest says %d", rows, safeName(me.Table), me.Rows)
 		}
 	}
 	return env.SetDetail(ctx, fmt.Sprintf("%d tables, %d bytes", len(entries), total))
@@ -381,7 +384,7 @@ func (o *Ops) stepIMData(ctx context.Context, env *task.Env) error {
 func (o *Ops) loadTable(ctx context.Context, conn *pgx.Conn, env *task.Env, a *archiveFile, p dbImportParams, ct archive.CatalogTable, me archive.ManifestEntry,
 	fact archive.EntryFact, left time.Duration, read *int64, note func()) (int64, error) {
 	if ct.Kind == "reference" && me.Size > MaxAtomicReferenceBytes {
-		return 0, transfer.Errorf(transfer.CodeImportTooLarge, false, "the reference table %s is larger than %d bytes, which is the most that one transaction takes", me.Table, MaxAtomicReferenceBytes)
+		return 0, transfer.Errorf(transfer.CodeImportTooLarge, false, "the reference table %s is larger than %d bytes, which is the most that one transaction takes", safeName(me.Table), MaxAtomicReferenceBytes)
 	}
 	er := archive.OpenEntry(a.r, fact, me.SHA256)
 	defer func() { _ = er.Close() }()
@@ -396,7 +399,7 @@ func (o *Ops) loadTable(ctx context.Context, conn *pgx.Conn, env *task.Env, a *a
 	if ct.Kind == "reference" {
 		var terr error
 		if refCols, refTypes, terr = o.importTarget(ctx, conn, schema, table, me.Columns, "reference"); terr != nil {
-			return 0, transfer.Errorf(transfer.CodeTableNotEligible, false, "the reference table %s cannot take the load", me.Table)
+			return 0, transfer.Errorf(transfer.CodeTableNotEligible, false, "the reference table %s cannot take the load", safeName(me.Table))
 		}
 	}
 	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
@@ -436,7 +439,7 @@ func (o *Ops) loadTable(ctx context.Context, conn *pgx.Conn, env *task.Env, a *a
 		want = 0
 	}
 	if rows != want {
-		return 0, transfer.Errorf(transfer.CodeRowCountMismatch, false, "the database loaded %d rows into %s and the file has %d records", rows, me.Table, want)
+		return 0, transfer.Errorf(transfer.CodeRowCountMismatch, false, "the database loaded %d rows into %s and the file has %d records", rows, safeName(me.Table), want)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, transfer.SafeError(err)
@@ -530,7 +533,7 @@ func (o *Ops) stepIMPost(ctx context.Context, env *task.Env) error {
 			return &transfer.Error{Code: transfer.CodeForeignKey, Sentence: fmt.Sprintf("%d rows violate a foreign key", cnt), Constraint: safeNameText(pe.ConstraintName),
 				Schema: safeNameText(pe.SchemaName), Table: safeNameText(pe.TableName)}
 		}
-		if err2 := execOne(ctx, c, text+" NOT VALID"); err2 != nil {
+		if err2 := execOne(ctx, c, notValidText(text)); err2 != nil {
 			return statementError(st, err2)
 		}
 		cnt, cerr := fkViolations(ctx, c, pe.ConstraintName, qualifiedText(pe.SchemaName, pe.TableName))
@@ -570,6 +573,15 @@ func (o *Ops) stepIMPost(ctx context.Context, env *task.Env) error {
 	return env.SetDetail(ctx, detail)
 }
 
+// notValidText is the statement with NOT VALID at its end: the control plane's suffix, on a line of its own so that a comment that ends the text of the archive
+// cannot swallow it. A statement that is NOT VALID already is returned as it is.
+func notValidText(text string) string {
+	if sqlshape.EndsWithNotValid(text) {
+		return text
+	}
+	return text + "\n NOT VALID"
+}
+
 func qualifiedText(schema, table string) string {
 	id, err := sqlx.QualifiedIdent(schema, table)
 	if err != nil {
@@ -587,7 +599,7 @@ func (o *Ops) countByRollback(ctx context.Context, c *pgx.Conn, text, constraint
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-	if err := execOne(ctx, c, text+" NOT VALID"); err != nil {
+	if err := execOne(ctx, c, notValidText(text)); err != nil {
 		return 0, err
 	}
 	return fkViolations(ctx, c, constraint, qualifiedText(schema, table))

@@ -95,3 +95,15 @@ func sameTokens(text string, first *rawStmt) error {
 // IsSyntaxWord reports whether a word that is followed by an opening parenthesis is a word of the SQL syntax (an operator, a clause, a type that is written like a
 // call) and not a call of a function: the words that the grammar does not report as functions.
 func IsSyntaxWord(w string) bool { return notFunctions[strings.ToLower(w)] }
+
+// EndsWithNotValid says whether the last two tokens of one statement are NOT VALID, as the lexer reads it (a comment, a string or a quoted name that holds the words
+// is not the clause).
+func EndsWithNotValid(text string) bool {
+	l := newLexer(strings.NewReader(text + "\n;"))
+	raw, err := l.next()
+	if err != nil || raw == nil || len(raw.toks) < 2 {
+		return false
+	}
+	a, b := raw.toks[len(raw.toks)-2], raw.toks[len(raw.toks)-1]
+	return a.k == tIdent && a.s == "not" && b.k == tIdent && b.s == "valid"
+}

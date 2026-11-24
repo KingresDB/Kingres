@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/jackc/pgx/v5"
 
@@ -65,8 +66,23 @@ const (
 // privatePrefix is the start of the name of the database that a task works in; the rest is the id of the task.
 const privatePrefix = "kingres_import_"
 
-// privateName is the name of the database that task id works in, and the only database that its failure hook may drop.
-func privateName(taskID int64) string { return privatePrefix + strconv.FormatInt(taskID, 10) }
+// privateName is the name of the database that task id works in, and the only database that its failure hook may drop. The nonce is random and made at the request:
+// a role with CREATEDB cannot make a database under the name of a task that has not started.
+func privateName(taskID int64, nonce string) string {
+	return privatePrefix + strconv.FormatInt(taskID, 10) + "_" + nonce
+}
+
+// private is the private name of the task with this id.
+func (p dbImportParams) private(taskID int64) string { return privateName(taskID, p.Nonce) }
+
+// lastPrivate is the private name of the step that ran last, for the tests that need to act on the database of a task (the hook of a test is called before the step).
+var lastPrivate atomic.Value
+
+// ImportPrivateName returns the private name that the last step of a database import ran for ("" before any).
+func ImportPrivateName() string {
+	s, _ := lastPrivate.Load().(string)
+	return s
+}
 
 // The limits of the plan of an import (design "Limits and timeouts"): the sizes of the statements are the grammar's (200 000 statements of at most 1 MiB).
 const (
@@ -84,6 +100,8 @@ type dbImportParams struct {
 	KeepOnFailure  bool              `json:"keepOnFailure"`
 	// Servers are the other servers of the cluster at the time of the request: the private database is made on each of them.
 	Servers []string `json:"servers,omitempty"`
+	// Nonce is the random part of the private name and of its marker.
+	Nonce string `json:"nonce"`
 }
 
 func (p dbImportParams) keepNotValid() bool { return p.ForeignKeys == "keepNotValid" }
@@ -274,14 +292,32 @@ func (o *Ops) StartDatabaseImport(ctx context.Context, actor string, req api.Imp
 		return task.Task{}, problem.New(problem.UnsupportedOp, "This server has no managed instance.")
 	}
 	var exists, bad bool
+	var why string
 	if err := o.asService(ctx, "postgres", func(tx pgx.Tx) error {
 		var e error
 		if exists, e = dbExists(ctx, tx, name); e != nil {
 			return e
 		}
-		return tx.QueryRow(ctx, dangerousRolesSQL, DangerousPredefinedRoles, actor).Scan(&bad)
+		if e = tx.QueryRow(ctx, dangerousRolesSQL, DangerousPredefinedRoles, actor).Scan(&bad); e != nil {
+			return e
+		}
+		why, e = importerRefusal(ctx, tx, actor)
+		return e
 	}); err != nil {
 		return task.Task{}, wrap(err)
+	}
+	if why != "" {
+		return task.Task{}, problem.New(problem.Forbidden, importerText)
+	}
+	// The free space of every server against the size of the archive once it is expanded: refused before anything is made.
+	if m, merr := o.manifestOf(ctx, x, up); merr == nil {
+		if err := o.freeSpaceFor(ctx, append([]string{o.ServerHost}, ids(o.others(ctx))...), m.Totals.UncompressedBytes); err != nil {
+			return task.Task{}, transfer.SafeError(err).Problem()
+		}
+	}
+	nonce, nerr := newNonce()
+	if nerr != nil {
+		return task.Task{}, problem.New(problem.InternalError, "A random value could not be made.")
 	}
 	if exists {
 		return task.Task{}, problem.New(problem.AlreadyExists, fmt.Sprintf("Database %q already exists.", name))
@@ -295,7 +331,7 @@ func (o *Ops) StartDatabaseImport(ctx context.Context, actor string, req api.Imp
 		return task.Task{}, err
 	}
 	p := dbImportParams{UploadID: up.ID, Owner: who, Database: name, ExpectedSHA256: req.ExpectedSHA256, AckLedger: req.AcknowledgeLedgerRestart, ForeignKeys: fk,
-		KeepOnFailure: req.KeepOnFailure, Servers: ids(o.others(ctx))}
+		KeepOnFailure: req.KeepOnFailure, Servers: ids(o.others(ctx)), Nonce: nonce}
 	t, err := o.StartTask(ctx, KindDatabaseImport, "database", name, p, actor)
 	if err != nil {
 		return task.Task{}, err
@@ -380,6 +416,9 @@ var ImportHook func(ctx context.Context, step string) error
 
 func importStep(name string, run func(ctx context.Context, env *task.Env) error) func(ctx context.Context, env *task.Env) error {
 	return xferStep(func(ctx context.Context, env *task.Env) error {
+		if p, err := inputOf[dbImportParams](env.Task); err == nil {
+			lastPrivate.Store(p.private(env.Task.ID))
+		}
 		if h := ImportHook; h != nil {
 			if err := h(ctx, name); err != nil {
 				return err
@@ -423,6 +462,32 @@ func (o *Ops) refuseDangerousImporter(ctx context.Context, role string) error {
 	}
 	if bad {
 		return transfer.Errorf(transfer.CodeForbidden, false, "the role has the SUPERUSER, REPLICATION or BYPASSRLS attribute or access to server files, programs or logs; the statements of an archive run as that role")
+	}
+	var why string
+	if err := o.asService(ctx, "postgres", func(tx pgx.Tx) error {
+		var e error
+		why, e = importerRefusal(ctx, tx, role)
+		return e
+	}); err != nil {
+		return transfer.Errorf(transfer.CodeSessionLost, true, "the check of the role could not be made now; repeat the operation")
+	}
+	if why != "" {
+		return transfer.Errorf(transfer.CodeForbidden, false, "%s", importerText)
+	}
+	return nil
+}
+
+// freeSpaceFor refuses an import when a server cannot hold the archive once it is expanded (the whole of it may land on one server, and the indexes and the work
+// need room besides). A server that cannot tell is not checked.
+func (o *Ops) freeSpaceFor(ctx context.Context, servers []string, bytes int64) error {
+	if o.DiskFree == nil || bytes <= 0 {
+		return nil
+	}
+	need := bytes + bytes/2 + 64<<20
+	for _, s := range servers {
+		if free, known := o.DiskFree(ctx, s); known && free < need {
+			return transfer.Errorf(transfer.CodeInsufficientDisk, false, "server %s has %d bytes free and the archive needs about %d once it is loaded", safeName(s), free, need)
+		}
 	}
 	return nil
 }
@@ -597,7 +662,7 @@ func archiveTaskError(ae *archive.Error) error {
 	}
 	text := "the archive is not valid"
 	if len(ae.Reasons) > 0 {
-		text = fmt.Sprintf("the archive is not valid (%s: %s)", ae.Reasons[0].Code, ae.Reasons[0].Object)
+		text = fmt.Sprintf("the archive is not valid (%s: %s)", safeName(ae.Reasons[0].Code), safeName(ae.Reasons[0].Object))
 	}
 	return transfer.Errorf(code, false, "%s", text)
 }
