@@ -27,6 +27,7 @@ import {
   groupStateMeta,
   groupTitle,
   KIND_LABEL,
+  mapGroupPauseHint,
   phaseLabel,
   runStateMeta,
   TRIGGER_LABEL,
@@ -291,6 +292,12 @@ watch(
         </p>
         <p v-else-if="g.phase === 'waitingForLease'" class="muted" data-testid="group-message">
           Waiting for the old primary's lease to run out.
+        </p>
+        <p v-if="mapGroupPauseHint(g.message)" data-testid="map-pause-hint">
+          The old leader was stopped and cannot take the request. Repeat the failover request on
+          server
+          <SafeName :value="mapGroupPauseHint(g.message)!.server" kind="text" :max="80" />, which
+          runs the bootstrap; or give the bootstrap up to start the old leader again.
         </p>
       </li>
     </ul>

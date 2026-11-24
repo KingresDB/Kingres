@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.27.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.28.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and, when it is built, the planned `kingres-cli` (it does not exist yet). Lint it and run the mechanical rule check with:
 
 ```
@@ -362,6 +362,25 @@ Where the architecture document leaves something open, the simplest option was c
     range and the cluster's replica count.
 
 ## Changelog
+
+### 0.28.0
+
+Revision written for the hard failover of the map group while its server is alive (`kingres/docs/design/ha-phase5-part2.md`, "a hard failover of a live leader's server").
+0 operations added (174 operations, 138 paths); the text of `failoverServer` changes; **no change that is not additive**, and no schema, member, code or enum value changes.
+
+#### Breaking
+
+None.
+
+#### Additive
+
+- `AbandonMapGroupBootstrapRequest.lostServerId` (optional): the operator declares the server the map group was handed to lost, so that the old leader ends its hold without its word (`abandonMapGroupBootstrap`, audited, `kingres_admin`).
+- A request that was answered 422 `unsupported_operation` (mode `hard` for the server that runs the primary of the map group, sent to the leader while it answers) is accepted and answered 202 like any failover.
+
+#### Documentation
+
+- `failoverServer` (0.28.0 paragraph): how a hard failover of the map group of a live leader's server runs (the loss is judged before anything is stopped, the old primary is fenced in one step, the lease is handed to the standby's server only after the stop, the map group is the last group), what a pause after the stop means and where the repeated request goes.
+
 
 ### 0.27.0
 

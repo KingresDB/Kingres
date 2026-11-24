@@ -76,7 +76,8 @@ type mapFailover struct {
 	resumeOldLeader func(ctx context.Context, oldServer string) (bool, error)
 	// The parts of the resolution of a held-back primary that a test stands in for (nil: the real ones): the calls to other servers, the list of servers, the marker, the end of
 	// the hold, and the two ways of asking an instance whether it is in recovery.
-	candidateRecord func() string // the server that the hold was made for (nil: the record of the lease manager)
+	liveOf          func(ctx context.Context, server string) string // the view of a server (nil: the planner's)
+	candidateRecord func() string                                   // the server that the hold was made for (nil: the record of the lease manager)
 	callPeer        func(ctx context.Context, server, method, path string, in, out any) error
 	memberList      func(ctx context.Context) ([]string, error)
 	heldBack        func() bool
@@ -162,6 +163,11 @@ func (m *mapFailover) Handles(ctx context.Context, server string) bool {
 	if err != nil || primary != server {
 		return false
 	}
+	if m.runner != nil && m.runner.HardInProgress(server) {
+		// A hard failover of a live leader's server that paused here (the loss was not accepted after the stop): the old leader's task cannot take the
+		// repeated request, its system database is the stopped primary, so the bootstrap does.
+		return true
+	}
 	return m.pl.Live(ctx, server) != "live"
 }
 
@@ -175,6 +181,9 @@ func (m *mapFailover) Active() bool { return m.active() }
 func (m *mapFailover) Start(ctx context.Context, actor string, id internalapi.ForwardIdentity, server string, req failover.Request) (task.Task, error) {
 	if req.Mode != failover.ModeHard {
 		return task.Task{}, problem.New(problem.UnsupportedOp, "The map group is failed over in mode hard only.")
+	}
+	if err := m.targetMatchesTheJournal(server, req); err != nil {
+		return task.Task{}, err
 	}
 	body := mapStartBody{Server: server, RequestedBy: actor, AllowDataLoss: req.AllowDataLoss, Comment: req.Comment}
 	cand, err := m.candidate(ctx)
@@ -417,19 +426,10 @@ func handleMapStart(ctx context.Context, d *haDeps, caller string, body []byte) 
 	} else if b.RequestedBy == "" || b.RequestedBy == "system" {
 		b.RequestedBy = "operator (via " + caller + ")"
 	}
-	// A planned switchover is the old leader's own task: only that server may say so, and it says nothing about data loss (there is none to accept).
 	if b.Planned != nil {
-		if caller != b.Server || b.Planned.TaskID <= 0 || b.Planned.StandbyID <= 0 {
-			return nil, &internalapi.CallError{Status: http.StatusForbidden, Code: "forbidden", Message: "A planned switchover of the map group is started by the task of the old leader, on its own server."}
+		if err := acceptPlanned(mf, caller, &b); err != nil {
+			return nil, err
 		}
-		// A planned switchover that was given up is not started again by the same task: the task could not record its rollback (its rows were in the stopped
-		// instance and its lease ran out), so the engine runs the step again when the old leader is back, and that run must end as a failure instead of
-		// beginning a second switchover (found by the cluster tests of the review of round 2).
-		if cur, ok := mf.journal.Current(); ok && !cur.Abandoned.IsZero() && cur.Planned != nil && cur.Planned.TaskID == b.Planned.TaskID {
-			return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "conflict", Message: "The planned switchover of this task was given up; it is not started again."}
-		}
-		b.Planned.Checkpoint, b.Planned.ClusterState = "", ""
-		b.AllowDataLoss = false
 	}
 	if err := mf.begin(ctx, b); err != nil {
 		var p *problem.Problem
@@ -566,6 +566,10 @@ func (p *mapPorts) Facts(ctx context.Context) (failover.GroupFacts, error) {
 }
 
 func (p *mapPorts) Position(ctx context.Context, s string) (failover.Position, error) {
+	// A test: the position of this server's own standby cannot be read when the bootstrap ranks the standbys (the verdict is then unknown and the bootstrap pauses).
+	if d := p.m.fd.d; d != nil && s == p.m.self && d.Fault.FailoverInjection("pin:unreadable") == "fail" {
+		return failover.Position{}, errors.New("the position cannot be read (injected)")
+	}
 	return p.m.peers.Position(ctx, s, 0)
 }
 func (p *mapPorts) State(ctx context.Context, s string) (failover.State, error) {
@@ -681,6 +685,12 @@ func (p *mapPorts) RecordTask(ctx context.Context, j journal.Journal) (int64, er
 	return id, nil
 }
 
+func (p *mapPorts) Audit(ctx context.Context, action string, group int32, details map[string]any) {
+	if p.m.pl != nil {
+		p.m.pl.Audit(ctx, action, group, details)
+	}
+}
+
 func (p *mapPorts) Alert(ctx context.Context, kind, severity, subject, message string, raise bool) {
 	// Before the promotion the system database of this server cannot be written: the alert is then only logged, and the journal
 	// has the event. The planner writes it when it can.
@@ -744,6 +754,14 @@ func (p *mapPorts) isCandidate(ctx context.Context, server string) (bool, error)
 
 // ---------------------------------------------------------------------------------
 // Giving up a bootstrap (F4-06)
+
+// liveState is this server's view of a server (a test stands in for the tracker).
+func (m *mapFailover) liveState(ctx context.Context, server string) string {
+	if m.liveOf != nil {
+		return m.liveOf(ctx, server)
+	}
+	return m.pl.Live(ctx, server)
+}
 
 type mapAbandonBody struct {
 	Reason string `json:"reason"`
@@ -863,8 +881,18 @@ func promoteBlockedByJournal(mf *mapFailover, group int32) error {
 // Abandon gives up the bootstrap of the map group that is in progress on this server, or on the server of a standby of the map group: the
 // request may arrive anywhere, and the leader may be the server that is gone. When none is in progress anywhere, it asks every server to end the hold of its
 // primary of the map group that nothing owns (F6-03): the operator's way to start a stranded old leader again. The answer says which server was resumed.
-func (m *mapFailover) Abandon(ctx context.Context, actor, reason string) (failover.MapAbandonResult, error) {
+// lostServer, when it is set, is the operator's declaration (P2) that the candidate the map group was handed to is lost: the server must not be heard by this server and
+// must be a member; the old leader then ends its hold without the word of that server, and a new request may choose another standby. What the server may have promoted
+// before it was lost is accepted by the operator with the declaration.
+func (m *mapFailover) Abandon(ctx context.Context, actor, reason, lostServer string) (failover.MapAbandonResult, error) {
 	reason = "given up by " + actor + ": " + reason
+	if lostServer != "" {
+		if m.liveState(ctx, lostServer) == "live" {
+			return failover.MapAbandonResult{}, problem.New(problem.Conflict, "Server "+lostServer+" is heard by the cluster; it is not lost. Give the bootstrap up without naming it, or wait until it is seen dead.")
+		}
+		reason += " (server " + lostServer + " declared lost)"
+		m.log.Warn("a server that the map group was handed to is declared lost", "server", lostServer, "by", actor)
+	}
 	if ans, err := m.abandonLocalFull(ctx, reason); ans.Abandoned || err != nil {
 		return failover.MapAbandonResult{Abandoned: ans.Abandoned, ResumedServer: ans.ResumedServer}, err
 	}
@@ -899,8 +927,8 @@ func (m *mapFailover) Abandon(ctx context.Context, actor, reason string) (failov
 	for _, s := range members {
 		var out mapResumeAnswer
 		if s == m.self {
-			out.Resumed, out.Detail = m.resolveHeldBack(ctx, true)
-		} else if err := m.call(ctx, s, http.MethodPost, "/failover/map/resume", mapResumeBody{Strict: true}, &out); err != nil {
+			out.Resumed, out.Detail = m.resolveHeldBack(ctx, true, lostServer)
+		} else if err := m.call(ctx, s, http.MethodPost, "/failover/map/resume", mapResumeBody{Strict: true, Lost: lostServer}, &out); err != nil {
 			continue
 		}
 		if out.Resumed {
@@ -971,16 +999,39 @@ func handleMapProof(_ context.Context, d *haDeps, caller string, body []byte) (a
 
 // RecordPlanned marks the group 0 row of the old leader's task promoted, with the term after the promotion and the timeline, in the system database that
 // this server promoted. The steps of the map group that the new leader's engine runs again read the term from the row (runRowOf).
-func (p *mapPorts) RecordPlanned(ctx context.Context, taskID, termAfter, timeline int64) error {
+func (p *mapPorts) RecordPlanned(ctx context.Context, taskID, termAfter, timeline int64, pin *journal.Pin, dataLoss []byte) error {
 	c, err := p.m.sysConn(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
-	_, err = c.Exec(ctx, `UPDATE kingres_cp.failover_group
-		SET state = 'promoted', term_after = $2, timeline = CASE WHEN $3 > 0 THEN $3 ELSE timeline END, promoted_at = COALESCE(promoted_at, now())
-		WHERE task_id = $1 AND group_id = 0 AND state IN ('pending', 'frozen', 'fenced', 'pinned', 'promoted')`, taskID, termAfter, timeline)
+	// A hard failover of a live leader's server pinned its standby after the stop, so the row has none yet: the pin is written only into a row that has none
+	// (a switchover pinned in its task, and keeps its own).
+	var chosen *int64
+	var node *int32
+	var server *string
+	if pin != nil {
+		chosen, node, server = &pin.StandbyID, ptrInt32(pin.Node), &pin.Server
+	}
+	tag, err := c.Exec(ctx, `UPDATE kingres_cp.failover_group
+		SET state = 'promoted', term_after = $2, timeline = CASE WHEN $3 > 0 THEN $3 ELSE timeline END, promoted_at = COALESCE(promoted_at, now()),
+		    chosen_standby_id = COALESCE(chosen_standby_id, $4), new_server = COALESCE(new_server, $5), new_node_id = COALESCE(new_node_id, $6::int),
+		    data_loss = CASE WHEN chosen_standby_id IS NULL AND $7::jsonb IS NOT NULL THEN $7::jsonb ELSE data_loss END
+		WHERE task_id = $1 AND group_id = 0 AND state IN ('pending', 'frozen', 'fenced', 'pinned', 'promoted')`, taskID, termAfter, timeline, chosen, server, node, nullJSON(dataLoss))
+	if err == nil && tag.RowsAffected() == 0 {
+		return mapgroup.ErrNoPlannedRow
+	}
 	return err
+}
+
+func ptrInt32(v int32) *int32 { return &v }
+
+// nullJSON is a JSON value for a jsonb parameter, or nil (SQL NULL) for none.
+func nullJSON(b []byte) any {
+	if len(b) == 0 {
+		return nil
+	}
+	return string(b)
 }
 
 // mapStartSigned is the body of POST /failover/map/start that a member sends for a request of an operator (F4-05): the request exactly as it was signed,
@@ -1213,4 +1264,48 @@ func wireEscrow(members *membership.Manager, mf *mapFailover) {
 		}
 		return out, nil
 	})
+}
+
+// acceptPlanned checks and normalises the request of the old leader's own task (a planned switchover, or a hard failover of a live leader's server). Only that
+// server may say so. A planned switchover says nothing about data loss (there is none to accept); a hard failover carries the acceptance of the operator whose
+// request the leader checked, and the facts of the leader's last check before the stop.
+func acceptPlanned(mf *mapFailover, caller string, b *mapStartBody) error {
+	if caller != b.Server || b.Planned.TaskID <= 0 || b.Planned.StandbyID <= 0 {
+		return &internalapi.CallError{Status: http.StatusForbidden, Code: "forbidden", Message: "A planned switchover of the map group is started by the task of the old leader, on its own server."}
+	}
+	// A planned switchover that was given up is not started again by the same task: the task could not record its rollback (its rows were in the stopped
+	// instance and its lease ran out), so the engine runs the step again when the old leader is back, and that run must end as a failure instead of
+	// beginning a second switchover (found by the cluster tests of the review of round 2).
+	if cur, ok := mf.journal.Current(); ok && !cur.Abandoned.IsZero() && cur.Planned != nil && cur.Planned.TaskID == b.Planned.TaskID {
+		return &internalapi.CallError{Status: http.StatusConflict, Code: "conflict", Message: "The planned switchover of this task was given up; it is not started again."}
+	}
+	if b.Planned.Hard && (b.Planned.Checkpoint != "" || b.Planned.ClusterState != "") {
+		// P6: a hard failover has no proof; one that carries a proof is not the request of an honest task.
+		return badBody("a hard failover request without a proof")
+	}
+	b.Planned.Checkpoint, b.Planned.ClusterState = "", ""
+	if !b.Planned.Hard {
+		b.AllowDataLoss = false
+		b.Planned.Facts = nil
+	}
+	return nil
+}
+
+// targetMatchesTheJournal refuses the repeated request of an operator for a hard failover in progress whose target for the map group is not the one the journal was begun
+// with (P4): the standby was chosen, and the old primary stopped, for that one; the operator gives the bootstrap up first to change it.
+func (m *mapFailover) targetMatchesTheJournal(server string, req failover.Request) error {
+	cur, ok := m.journal.Current()
+	if !ok || !m.journal.Active() || cur.Planned == nil || !cur.Planned.Hard || cur.OldServer != server {
+		return nil
+	}
+	target := ""
+	for _, t := range req.Targets {
+		if t.ShardGroupID == 0 {
+			target = t.ServerID
+		}
+	}
+	if target != cur.Planned.Target {
+		return problem.New(problem.Conflict, "The hard failover of the map group is in progress with target \""+cur.Planned.Target+"\" (empty: the best standby) and this request names \""+target+"\"; give the bootstrap up (abandonMapGroupBootstrap) before asking for another target.")
+	}
+	return nil
 }

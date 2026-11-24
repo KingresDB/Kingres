@@ -13,6 +13,7 @@ package mapgroup
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -57,7 +58,8 @@ type Ports interface {
 	RecordTask(ctx context.Context, j journal.Journal) (int64, error)
 	// RecordPlanned marks the group 0 row of the old leader's task (a planned switchover) promoted, with the term and the timeline of the promotion, in the system
 	// database that this server promoted: the steps that the new leader's engine runs again read the term from it. It is idempotent.
-	RecordPlanned(ctx context.Context, taskID, termAfter, timeline int64) error
+	// A hard failover of a live leader's server passes the standby that was pinned after the stop and the verdict (a switchover pinned in its task and passes nil).
+	RecordPlanned(ctx context.Context, taskID, termAfter, timeline int64, pin *journal.Pin, dataLoss []byte) error
 	// PlannedRefused is what a planned switchover of the map group does when the standby could not prove the old leader's stop: this server lets go of the fence
 	// lease it holds (so that the old leader can win its own lease again) and tells the old leader, whose task rolls back and starts its primary again.
 	PlannedRefused(ctx context.Context, oldServer string, taskID int64, reason string) error
@@ -74,6 +76,8 @@ type Ports interface {
 	// here on this server is the leader and its system database is the instance it promoted.
 	MoveSystem(ctx context.Context) error
 	Alert(ctx context.Context, kind, severity, subject, message string, raise bool)
+	// Audit writes an audit event of the bootstrap (M3: the row of the old leader's task was missing).
+	Audit(ctx context.Context, action string, group int32, details map[string]any)
 }
 
 // Request is what a manual request says.
@@ -90,6 +94,9 @@ type Request struct {
 	// old server.
 	Planned *journal.Planned
 }
+
+// ErrNoPlannedRow is what RecordPlanned answers when the group 0 row of the old leader's task is not there to be marked.
+var ErrNoPlannedRow = errors.New("mapgroup: the group 0 row of the task is not in the system database")
 
 // Result says how the run ended when it did not fail.
 type Result struct {
@@ -217,11 +224,14 @@ func (r *Runner) Decide(ctx context.Context, req Request) (journal.Journal, erro
 		if nonEmpty(req.Trigger, "manual") == "automatic" {
 			return journal.Journal{}, &Refusal{Code: "conflict", Status: 409, Message: "The old server of the map group is live for this server; an automatic failover does not start."}
 		}
-		if req.Planned == nil {
-			return journal.Journal{}, &Refusal{Code: "unsupported_operation", Status: 422, Message: "The failover of the map group while its server is alive is not supported yet; stop that server, or use the documented SQL of the sharding extension."}
+		if req.Planned == nil && !r.hardInProgress(req.OldServer) {
+			return journal.Journal{}, &Refusal{Code: "unsupported_operation", Status: 422, Message: "The failover of the map group while its server is alive goes through the manager leader (its task), which stops the old primary fenced and then asks this server; it cannot be started here."}
 		}
 		// A planned switchover: the old leader's own task made the request (the caller is checked by the receiver), it stops its primary cleanly
-		// and sends the proof; this server waits for its lease to be released and for the proof.
+		// and sends the proof; this server waits for its lease to be released and for the proof. A hard failover of a live leader's server is the
+		// same request with Planned.Hard: the old leader stops its primary fenced (an immediate stop, the lease handed to this server), and this server
+		// waits for that lease; no proof exists. The repeated request of an operator for a hard failover that paused (the loss was not accepted
+		// after the stop) is the other case that is accepted: its journal is in progress on this server.
 	} else if req.Planned != nil {
 		return journal.Journal{}, &Refusal{Code: "conflict", Status: 409, Message: "A planned switchover of the map group needs the old leader alive; this server does not hear it."}
 	}
@@ -231,6 +241,12 @@ func (r *Runner) Decide(ctx context.Context, req Request) (journal.Journal, erro
 		return j, err
 	}
 	return r.Journal.SetPlanned(*req.Planned)
+}
+
+// hardInProgress says that a hard failover of the map group of oldServer, begun by the old leader's task, is in progress on this server.
+func (r *Runner) hardInProgress(oldServer string) bool {
+	cur, ok := r.Journal.Current()
+	return ok && r.Journal.Active() && cur.OldServer == oldServer && cur.Planned != nil && cur.Planned.Hard
 }
 
 func nonEmpty(s, d string) string {
@@ -397,7 +413,7 @@ func (r *Runner) takeFence(ctx context.Context, j journal.Journal) (bool, error)
 				waited := int(r.now().Sub(started).Milliseconds())
 				return false, r.Journal.Event(journal.StepLease, "leaseHeld", map[string]any{"waitMs": waited})
 			case err == nil && r.now().Sub(started) > leaseWait:
-				for h := range ans.RefusedBy {
+				for _, h := range ans.RefusedBy {
 					if h == j.OldServer {
 						r.P.Alert(ctx, "failoverBlocked", "warning", "group:0", "A majority of the servers still hear the holder of the lease of the map group ("+h+"); its primary is alive for the cluster.", true)
 						return false, failover.Fail(failover.CodeLeaseStillHeld, true, "the lease of the map group is still held by %s and renewed", h)
@@ -429,7 +445,7 @@ func (r *Runner) pin(ctx context.Context, j journal.Journal) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if j.Planned != nil {
+	if j.Planned != nil && !j.Planned.Hard {
 		// The old leader's task chose this standby and had the mark replayed on it: no other one can be proven, so no other one is a choice.
 		for _, s := range recs {
 			if s.ID == j.Planned.StandbyID && s.State == "ready" && s.Server == r.P.Self() {
@@ -467,16 +483,31 @@ func (r *Runner) pin(ctx context.Context, j journal.Journal) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	if j.Planned != nil && j.Planned.Hard && j.Planned.Facts != nil {
+		// The old leader read these just before it stopped its primary, and no check can follow the stop: the record in the system database grows old from
+		// that moment, and the verdict would turn into "possible" after thirty seconds for a group that streamed a synchronous standby when it stopped.
+		f := j.Planned.Facts
+		facts = failover.GroupFacts{SyncStreaming: f.SyncStreaming, LastKnownLsn: f.LastKnownLsn, PrimaryPlanned: f.PrimaryPlanned, AsyncDatabases: f.AsyncDatabases}
+	}
 	for i := range cands {
 		cands[i].Preferred = false
 	}
-	ch := failover.Choose(failover.ChooseInput{Candidates: cands, Facts: facts})
+	target := ""
+	if j.Planned != nil && j.Planned.Hard {
+		target = j.Planned.Target // the server the request named: ranked and judged as for the ordinary groups
+	}
+	ch := failover.Choose(failover.ChooseInput{Candidates: cands, Target: target, Facts: facts})
 	if ch.Chosen == nil {
 		return false, failover.Fail(failover.CodeNoCandidate, true, "no standby of the map group can be promoted: %s", ch.Message)
 	}
 	if !failover.Accepts(ch.Verdict, j.AllowDataLoss) {
 		r.P.Alert(ctx, "failoverNeedsDecision", "critical", "group:0", "The failover of the map group could lose data: "+ch.Message, true)
-		return false, &failover.PauseError{Reason: fmt.Sprintf("The failover of the map group could lose data (%s): %s Repeat the request with allowDataLoss set to true if you accept it.", ch.Verdict, ch.Message)}
+		reason := fmt.Sprintf("The failover of the map group could lose data (%s): %s Repeat the request with allowDataLoss set to true if you accept it.", ch.Verdict, ch.Message)
+		if j.Planned != nil && j.Planned.Hard {
+			// The old leader is stopped and its task cannot take a request: the one that runs this bootstrap does.
+			reason += " Send the request to server " + r.P.Self() + ", which runs the bootstrap; the old leader was stopped."
+		}
+		return false, &failover.PauseError{Reason: reason}
 	}
 	chosen := ready[indexOf(ready, ch.Chosen.StandbyID)]
 	p := journal.Pin{StandbyID: chosen.ID, Server: chosen.Server, Node: chosen.CatalogNode, Instance: chosen.InstanceID}
@@ -492,7 +523,15 @@ func (r *Runner) pin(ctx context.Context, j journal.Journal) (bool, error) {
 			return false, failover.Fail(failover.CodeLeaseLost, true, "the lease of the map group could not be handed to %s", pinned.Server)
 		}
 		cur, _ := r.Journal.Current()
-		if err := r.P.Continue(ctx, pinned.Server, cur); err != nil {
+		if err := r.P.Continue(ctx, pinned.Server, cur); failover.IsCode(err, "conflict") {
+			// P3: another bootstrap of this term is in progress on the better candidate (an operator's request, or its own monitor): this one gives up instead of
+			// repeating a call that cannot succeed. The lease it handed over lapses or is used by that bootstrap; nothing was promoted here.
+			_ = r.Journal.Event(journal.StepPin, "handOverRefused", map[string]any{"to": pinned.Server, "error": err.Error()})
+			if aerr := r.Journal.AbandonUnpromoted("another bootstrap of this term runs on " + pinned.Server); aerr != nil {
+				return false, aerr
+			}
+			return false, failover.Fail(failover.CodeSwitchoverUnproven, false, "another bootstrap of the map group is in progress on %s; this one was given up", pinned.Server)
+		} else if err != nil {
 			return false, fmt.Errorf("asking %s to continue the bootstrap: %w", pinned.Server, err)
 		}
 		_ = r.Journal.Event(journal.StepPin, "handedOver", map[string]any{"to": pinned.Server})
@@ -568,7 +607,7 @@ func (r *Runner) promote(ctx context.Context, j journal.Journal) (bool, error) {
 		}
 	}
 	req := failover.PromoteRequest{Group: Group, StandbyID: j.Pin.StandbyID, InstanceID: j.Pin.Instance, ExpectedTerm: j.Term}
-	if j.Planned != nil {
+	if j.Planned != nil && !j.Planned.Hard {
 		// A planned switchover promotes only with the proof of the old leader's clean stop; the callee checks it against what the standby replayed.
 		cp, state, err := r.waitProof(ctx)
 		if err != nil {
@@ -598,7 +637,7 @@ func (r *Runner) promote(ctx context.Context, j journal.Journal) (bool, error) {
 			// this bootstrap; a proof that can never be made (unprovable) is refused at once (F5-04).
 		case failover.IsCode(err, "unprovable"), failover.IsCode(err, "standby_behind"):
 			// Nothing was promoted, and the old leader is stopped: this server cannot start it again (that is the leader's call). It asks for a decision.
-			if j.Planned == nil {
+			if j.Planned == nil || j.Planned.Hard {
 				return false, &failover.PauseError{Reason: "the standby of the map group cannot prove what it must (" + err.Error() + "); nothing was promoted"}
 			}
 			// The old leader is stopped and nothing was promoted: this server lets go of the fence lease and tells the old leader, whose task rolls back and
@@ -749,7 +788,33 @@ func (r *Runner) makeLeader(ctx context.Context, j journal.Journal) (bool, error
 					}
 				}
 			}
-			if err := r.P.RecordPlanned(ctx, id, term, timeline); err != nil {
+			// A hard failover of a live leader's server pinned its standby here, after the stop; the old leader's task could not (its system database was the
+			// stopped instance), so the row of group 0 gets the pin and the verdict now. A switchover pinned before and keeps its own row.
+			var pin *journal.Pin
+			var dl []byte
+			if cur.Planned.Hard && cur.Pin != nil {
+				pin = cur.Pin
+				v := failover.DataLoss{Verdict: failover.VerdictUnknown, AsyncDatabases: []string{}, UnreadableServerIDs: []string{}}
+				for _, e := range cur.Events {
+					if e.Kind == "pinned" {
+						if s, ok := e.Detail["verdict"].(string); ok {
+							v.Verdict = s
+						}
+						if s, ok := e.Detail["message"].(string); ok {
+							v.Message = s
+						}
+					}
+				}
+				dl, _ = json.Marshal(v)
+			}
+			if err := r.P.RecordPlanned(ctx, id, term, timeline, pin, dl); errors.Is(err, ErrNoPlannedRow) {
+				// M3: the row of the old leader's task is not in the system database this server promoted (the task was never replicated, or was removed): nothing may be
+				// claimed on it, and the operator has to know.
+				r.P.Alert(ctx, "failoverNeedsDecision", "critical", "group:0", "The map group was promoted, but the task "+strconv.FormatInt(id, 10)+" of the old leader has no row for it in the new leader's system database.", true)
+				r.P.Audit(ctx, "failoverGroupPromoted", Group, map[string]any{"from": cur.OldServer, "to": r.P.Self(), "task": id, "taskRowMissing": true, "pin": pin != nil})
+				_ = r.Journal.Event(journal.StepLeader, "plannedRowMissing", map[string]any{"task": id, "pin": pin != nil, "verdict": string(dl)})
+				return false, &failover.PauseError{Reason: "the map group was promoted, but the row of the old leader's task is missing in the new system database; read the journal events, then repeat the request"}
+			} else if err != nil {
 				return false, fmt.Errorf("marking the map group of the task promoted: %w", err)
 			}
 		} else {
@@ -817,3 +882,7 @@ func (r *Runner) waitProof(ctx context.Context) (checkpoint, state string, err e
 		}
 	}
 }
+
+// HardInProgress says that a hard failover of the map group of oldServer, begun by the old leader's task, is in progress on this server: the request of
+// an operator that repeats it (a pause for a loss that was not accepted) is taken here.
+func (r *Runner) HardInProgress(oldServer string) bool { return r.hardInProgress(oldServer) }

@@ -238,6 +238,9 @@ func swWait(t *testing.T, e swEnv, id any, d time.Duration) map[string]any {
 			t.Logf("task %v after the wait (%d): %v", id, st, body)
 			t.Logf("failover status: %v", e.leader.Expect(200, "GET", "/failover", nil))
 			t.Logf("leader log: %s", e.leader.LogTail(12000))
+			for _, n := range e.c.Nodes {
+				t.Logf("the lease, fence and stop lines of %s: %s", n.Host, leaseLines(n.LogTail(8000000)))
+			}
 		}
 	}()
 	body := foWaitTask(t, e.leader, id, d, "done", "failed")
@@ -583,4 +586,27 @@ func stuckStacks(log string) string {
 		out = out[:9000]
 	}
 	return out
+}
+
+// leaseLines keeps the first and the last warnings and errors of a server's log that name a lease, a fence, a watchdog or a stop: what a failure that took a
+// server's instance down needs, and what the tail of the log (the repeated errors that followed) has pushed out.
+func leaseLines(log string) string {
+	var keep []string
+	for _, l := range strings.Split(log, "\n") {
+		if !strings.Contains(l, `"level":"WARN"`) && !strings.Contains(l, `"level":"ERROR"`) {
+			continue
+		}
+		low := strings.ToLower(l)
+		if !(strings.Contains(low, "lease") || strings.Contains(low, "fenc") || strings.Contains(low, "watchdog") || strings.Contains(low, "stopp")) || strings.Contains(l, "internal call failed") {
+			continue
+		}
+		if len(l) > 320 {
+			l = l[:320]
+		}
+		keep = append(keep, l)
+	}
+	if len(keep) > 80 {
+		keep = append(append(keep[:40:40], "..."), keep[len(keep)-40:]...)
+	}
+	return "\n" + strings.Join(keep, "\n")
 }

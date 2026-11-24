@@ -61,6 +61,10 @@ type Input struct {
 	Comment       string           `json:"comment,omitempty"`
 	Trigger       string           `json:"trigger"`
 	RequestedBy   string           `json:"requestedBy"`
+	// MapLive says that this hard failover includes the map group while its server is alive (the task runs on that server, the manager leader): group 0
+	// is then the last group, its old primary is stopped fenced and the standby's server finishes the work (design ha-phase5-part2.md, "a hard failover
+	// of a live leader's server"). It is set when the request is resolved; a task that the bootstrap of a dead leader recorded has it false.
+	MapLive bool `json:"mapLive,omitempty"`
 }
 
 // SkippedGroup is a group that a restore leaves alone.
@@ -573,6 +577,20 @@ type Planner interface {
 	Alert(ctx context.Context, kind, severity, subject, message string, raise bool)
 	// Audit records an event of the failover.
 	Audit(ctx context.Context, action string, group int32, details map[string]any)
+	// LiveReplication reads pg_stat_replication and the flush position from the primary of the map group, which must answer now (M2). An error is a primary that cannot be
+	// asked; the caller then uses the recorded facts.
+	LiveReplication(ctx context.Context) (LiveReplication, error)
+}
+
+// LiveReplication is what the primary of the map group says of its standbys at the moment it is asked.
+type LiveReplication struct {
+	// SyncStreaming says that a standby that streams (state streaming) is synchronous or a quorum member (sync_state sync or quorum) right now.
+	SyncStreaming bool
+	// FlushLsn is pg_current_wal_flush_lsn() of the primary.
+	FlushLsn string
+	// Streaming is the number of standbys in state streaming; SentLsn and ReplayLsn are the highest positions reported.
+	Streaming          int
+	SentLsn, ReplayLsn string
 }
 
 // GroupRow is the record of one group of a run (kingres_cp.failover_group).
@@ -686,6 +704,21 @@ const CountAutomaticSQL = `WITH c AS (UPDATE kingres_cp.failover_run SET counted
 type MapPlanned struct {
 	TaskID    int64 `json:"taskId"`
 	StandbyID int64 `json:"standbyId"`
+	// Hard says that the old leader is stopped fenced (an immediate stop, its lease handed to the candidate) and not cleanly: there is no proof, the
+	// candidate ranks the standbys after the stop and judges the loss with Facts, which the old leader read just before the stop (no check can follow it).
+	Hard  bool      `json:"hard,omitempty"`
+	Facts *MapFacts `json:"facts,omitempty"`
+	// Target is the server the request named for the map group (empty: the best standby); the candidate ranks with it as the ordinary groups do.
+	Target string `json:"target,omitempty"`
+}
+
+// MapFacts are the facts of the old leader's last check that a hard failover of the map group carries to the candidate (the field names of
+// journal.PlannedFacts).
+type MapFacts struct {
+	SyncStreaming  bool     `json:"syncStreaming"`
+	LastKnownLsn   string   `json:"lastKnownLsn,omitempty"`
+	PrimaryPlanned int      `json:"primaryPlanned"`
+	AsyncDatabases []string `json:"asyncDatabases,omitempty"`
 }
 
 // MapStartRequest is the body of POST /failover/map/start for a planned switchover (cmd/kingresd mapStartBody).

@@ -596,11 +596,11 @@ func (sc *stepCtx) mapHandedOver(ctx context.Context, nw StandbyRec) (bool, erro
 	return false, err
 }
 
-// mapLast is the order of the groups of a planned switchover: the map group is the last. Its hand-over ends the old leader's task (its system
-// database is stopped), and the new leader's engine finishes what is left, so nothing after it may depend on the old leader. A hard failover keeps
-// the order of the groups as they are.
+// mapLast is the order of the groups of a planned switchover, and of a hard failover that includes the map group of a live leader's server: the map group
+// is the last. Its hand-over ends the old leader's task (its system database is stopped), and the new leader's engine finishes what is left, so nothing
+// after it may depend on the old leader. Any other hard failover keeps the order of the groups as they are.
 func mapLast(in Input) []int32 {
-	if !in.graceful() {
+	if !in.graceful() && !in.MapLive {
 		return in.Groups
 	}
 	out := make([]int32, 0, len(in.Groups))
@@ -616,6 +616,13 @@ func mapLast(in Input) []int32 {
 		out = append(out, 0)
 	}
 	return out
+}
+
+// mapHandedOverByTheCandidate says that this step is a step of the map group whose hand-over is made by the bootstrap of the candidate's server: a
+// planned switchover (and a restore) and a hard failover of a live leader's server. Its steps run again on the new leader's engine and skip what the
+// bootstrap did.
+func (sc *stepCtx) mapHandedOverByTheCandidate() bool {
+	return sc.group == 0 && (sc.in.graceful() || sc.in.MapLive)
 }
 
 // candidateOf is the server that the old leader records as the one the map group is handed to; the other groups record none.

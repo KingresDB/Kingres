@@ -244,3 +244,39 @@ func TestThePromotionIntentIsRefusedAfterTheAbandon(t *testing.T) {
 		t.Fatalf("the intent after the abandon: %v (started %v)", err, s.PromotionStarted())
 	}
 }
+
+// A hard failover of a live leader's server marks the journal as hard, with the facts of the old leader's stop; both survive a restart and a copy, the flag is part of the
+// identity of the request (the same task as a planned switchover is another request), and a copy does not share the facts with the journal.
+func TestTheHardFlagAndTheFactsOfAPlannedJournal(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Begin("b", "s1", 3, "manual", "op", true); err != nil {
+		t.Fatal(err)
+	}
+	f := &PlannedFacts{SyncStreaming: true, LastKnownLsn: "0/5000000", PrimaryPlanned: 1, AsyncDatabases: []string{"a"}}
+	if _, err := s.SetPlanned(Planned{TaskID: 9, StandbyID: 4, Hard: true, Facts: f}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SetPlanned(Planned{TaskID: 9, StandbyID: 4, Hard: true, Facts: f}); err != nil {
+		t.Fatalf("the same again: %v", err)
+	}
+	if _, err := s.SetPlanned(Planned{TaskID: 9, StandbyID: 4}); err == nil {
+		t.Fatal("the same task as a planned switchover was taken for the hard failover that began")
+	}
+	cur, _ := s.Current()
+	cur.Planned.Facts.SyncStreaming = false
+	if again, _ := s.Current(); !again.Planned.Facts.SyncStreaming {
+		t.Fatal("a copy shares the facts with the journal")
+	}
+	s2, err := Open(filepath.Dir(s.path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s2.Current()
+	if got.Planned == nil || !got.Planned.Hard || got.Planned.Facts == nil || !got.Planned.Facts.SyncStreaming || got.Planned.Facts.LastKnownLsn != "0/5000000" ||
+		got.Planned.Facts.PrimaryPlanned != 1 || len(got.Planned.Facts.AsyncDatabases) != 1 || !got.AllowDataLoss {
+		t.Fatalf("after a restart: %+v", got.Planned)
+	}
+}

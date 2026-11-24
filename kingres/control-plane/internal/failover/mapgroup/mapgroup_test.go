@@ -51,6 +51,11 @@ type world struct {
 	facts                     failover.GroupFacts
 	nodes                     []failover.Node
 	noCA                      bool
+	plannedPins               []*journal.Pin
+	plannedDL                 [][]byte
+	fenceRefusals             int   // the fence lease is refused this many times (the old leader still holds it)
+	plannedErr                error // RecordPlanned answers this
+	continueErr               error // Continue answers this
 }
 
 func newWorld() *world {
@@ -145,6 +150,10 @@ func (p ports) Lease(_ context.Context, s string, r failover.LeaseRequest) (fail
 		return failover.LeaseAnswer{Transferred: true, Holder: r.TransferTo}, nil
 	default:
 		p.w.rec("lease-%s %s", r.Role, s)
+		if r.Role == failover.LeaseFence && p.w.fenceRefusals > 0 {
+			p.w.fenceRefusals--
+			return failover.LeaseAnswer{Held: false, WaitMs: 9000, RefusedBy: map[string]string{"s2": "s1", "s3": "s1"}}, nil
+		}
 		if r.Role == failover.LeaseHolder && p.w.onHolderLease != nil {
 			return p.w.onHolderLease()
 		}
@@ -190,7 +199,7 @@ func (p ports) FreezeLocal(context.Context, time.Duration) error {
 }
 func (p ports) Continue(_ context.Context, s string, j journal.Journal) error {
 	p.w.rec("continue %s id=%s", s, j.ID)
-	return nil
+	return p.w.continueErr
 }
 func (p ports) Catalog() failover.Catalog { return fcat{p.w} }
 func (p ports) PauseRebalance(context.Context) (int, error) {
@@ -204,6 +213,9 @@ func (p ports) RecordTask(_ context.Context, j journal.Journal) (int64, error) {
 	p.w.taskID = 77
 	p.w.log = append(p.w.log, "record-task")
 	return p.w.taskID, nil
+}
+func (p ports) Audit(_ context.Context, action string, group int32, _ map[string]any) {
+	p.w.rec("audit %s %d", action, group)
 }
 func (p ports) MoveSystem(context.Context) error             { p.w.rec("move-system"); return nil }
 func (p ports) CheckAuthority(context.Context) (bool, error) { return !p.w.noCA, nil }
@@ -672,8 +684,15 @@ func TestAPlannedRequestNeedsALiveOldServer(t *testing.T) {
 	}
 }
 
-func (p ports) RecordPlanned(_ context.Context, taskID, termAfter, timeline int64) error {
+func (p ports) RecordPlanned(_ context.Context, taskID, termAfter, timeline int64, pin *journal.Pin, dl []byte) error {
 	p.w.rec("record-planned %d term=%d timeline=%d", taskID, termAfter, timeline)
+	p.w.mu.Lock()
+	p.w.plannedPins = append(p.w.plannedPins, pin)
+	p.w.plannedDL = append(p.w.plannedDL, dl)
+	p.w.mu.Unlock()
+	if p.w.plannedErr != nil {
+		return p.w.plannedErr
+	}
 	return nil
 }
 

@@ -185,6 +185,70 @@ Mutants of the closing items, all killed: the manual gate (always allows, force 
 - The cause of the one timeout of the cluster test on PostgreSQL 19.0 is unknown (it did not happen again in 14 runs); the test now prints what is needed to read it.
 - The number 0.27.0 is a placeholder and must be renumbered when the branch is merged.
 
+## 2026-11-23: phase 5 closing: the hard failover of the map group while its server is alive, and the hardening loops (increment 9)
+
+Branch `p5-hard`, from the staging branch g16 (failover round 2 with the F7 fixes). Contract revision 0.28.0 (a placeholder number; documentation of `failoverServer` only, see below).
+
+### What was done
+
+- **The last refusal of the failover is gone.** `failoverServer` with `mode: hard` for the leader's own server (the map group's primary answers) used to be 422 `unsupported_operation`. The design
+  ([ha-phase5-part2.md](design/ha-phase5-part2.md), "A hard failover of a live leader's server", with the fencing argument) reuses the shape of the planned switchover of the map group: the map group is the
+  last group of the task; its step `Stop the old primary` judges the loss before anything changes (a verdict the request did not accept pauses the task with the old leader running), starts the bootstrap of a
+  standby's server (`planned.hard` with the leader's facts as of the stop), fences the leader's own primary in one call (`fencedStop`: the candidate is recorded, the renewal ends and the marker is written,
+  an immediate stop, and the lease is handed over only after the stop is seen), and waits for the standby to be promoted. The candidate waits for the lease, ranks the standbys after the stop (the named
+  target as for any group), promotes without a proof, marks the old leader's task with the pin and the verdict, and its engine finishes the task. A primary that does not stop is stopped by its watchdog when the
+  unrenewed lease runs out, and the candidate takes the lease after that. A loss that shows only after the stop pauses the bootstrap, the pause names the server, and the repeated request goes there.
+- **Two defects found while building it, fixed.** The bootstrap looked for the old holder among the grantors that refused (the keys of `RefusedBy`) and not among the holders they name, so a lease that was still
+  renewed was reported as `lease_held_elsewhere` with no alert; and the term that the calls of a group expect was taken from the groups before it in the order of `Groups` and not in the order they run, which
+  put the map group of a planned switchover with other groups on the server on a stale term.
+- **Contract 0.28.0 (placeholder), documentation only:** the text of `failoverServer`; `info.version`, the changelog, `check-contract.mjs`, the README of the control plane and the web contract test follow.
+  The contract log of this branch lists the files so that the merge can renumber.
+- **Test faults** (`demote:nostop`, `demote:exit` for the fenced stop, `maphard:facts`, `pin:unreadable`), a sampler of the map group in the cluster tests that fails at two writable instances on two
+  readings of one asker, and the lease, fence and stop lines of every server in the failure output of a switchover test.
+- **Increment 9, hardening:** `run-failover-loops.ps1` now runs round by round with one build per round, a bound on the time (`-MaxMinutes`), a lane, and a summary per test read from the logs; the group
+  `map-hard` was added. The README and `internal-api.md` of the control plane describe the new behaviour; ADR 0021 says what `HoldBack` and the fenced stop do to the lease.
+
+### How it was verified
+
+- Unit: 33 new tests (`maplive_test.go`, `mapgroup_hard_test.go`, `maphard_test.go`, the journal; the crash test has 16 subtests) and 5 cluster tests. **Mutants:** 31 on the unit tests (the order of start and fence, the loss check, the lease hand-over, the facts as of the
+  stop, the context of the step, the order of the groups, the bound on the old server, the skips on the new leader, the preflight, the term, the lease wait, the proof, the pin, the repeated request, the
+  journal fields, the transfer while the primary runs, the order of the fenced stop, the candidate record, the target, and others) and one on the cluster; all killed. Three first attempts did not count and were redone: one used a test
+  name that did not exist, one was an equivalent mutation, one did not compile.
+- Cluster, PostgreSQL 18.7 and 19.0 (private installs, lane l9): the five `TestHardFailoverOfTheMapGroup*` tests pass on both: the live leader's server (31 to 34 s from the request to the end of the task),
+  the primary that does not stop (30 to 42 s: the watchdog and the lapse), the old leader's kingresd that ends after the fence (1 min 31 s to 1 min 34 s, the old leader away for 5 s), no readable standby
+  (nothing changed), and the pause after the stop with the repeated request. The sampler saw no instant of two writable primaries (12 to 94 readings per test). **Cluster mutant:** the fenced stop without
+  `Relinquish` fails `...WhoseOldPrimaryDoesNotStop` (the old leader keeps renewing, nothing is promoted: `promote_timeout`).
+- **The loops** (`run-failover-loops.ps1`, one round of every group: 25 tests, 28 with subtests; the machine was shared with a full gate and other lanes, so the times are those of a loaded machine; the
+  bound of two hours per major allowed one round and a few repeats): PostgreSQL 19.0: 28 of 28 passed, 113 minutes. PostgreSQL 18.7: 27 of 28 passed in 95 minutes; the failure is below. Times per test are in
+  the table of the summary; the measured ones of section 2.5 of the design: an ordinary group, request to the end of the task after a kill, 45 s (18) and 40 s (19); the hard failover of the map group
+  of a live leader's server 31 to 42 s; the planned switchover of the map group 129 to 208 s test time.
+- **The one failure of the loops** (18.7): `TestSwitchoverSurvivesACleanStopThatOutlastsTheLease` timed out after 8 minutes because the leader's own system database (the map group's primary on the
+  leader's server) was down and nothing could be read; four repeats of the test alone passed (about 3 minutes each) and the test passed in the round on 19.0. The log of the cluster was lost with the
+  test's directory, so the cause is **not found**. It is the case the review of the whole part named (items 3 and 6: a leader's own lease lost on a loaded machine, a primary stopped by its watchdog while
+  `kingresd` was late; the lease of these clusters is 12 s with a margin of 3 s); the output of a failing switchover test now has the lease, fence and stop lines of every server, so a next occurrence can be read.
+
+### 2026-11-24 (second entry): P2, the live read of the primary, the switch point, the audit of the missing row
+
+- **P2:** `abandonMapGroupBootstrap` takes an optional `lostServerId` (contract 0.28.0, additive, `kingres_admin`, audited with the server in its details). The server must not be heard by the server that answers (409 otherwise); the old leader then ends the hold of its primary without the word of that server when the hold was made for it (or has no record), it does not hear it either, every other server answers and none runs a bootstrap that names the old leader or was promoted. What the lost server promoted before it was lost is accepted with the declaration. Afterwards a new hard request may choose another standby (M1's refusal stands until the hold ends). Six mutants killed. **Console: API only** (`endpoints.abandonMapGroupBootstrap` takes the argument; the progress panel has no field for it). **Limit:** in a cluster with one standby of the map group, a dead candidate leaves no system database copy that sessions can be checked against, so every REST call is 503; the cluster test makes the old leader's resume call directly and shows that, with one standby, the declaration does not release the old leader (no other standby shows that nothing was promoted). The positive cluster test (a second standby of the map group) is not done; the unit tests show it.
+- **M2:** the primary of the map group is asked (`pg_stat_replication`, state streaming, sync or quorum, and `pg_current_wal_flush_lsn()`, within three seconds) before the bootstrap starts and again right before the fence; it replaces the recorded check, and a primary that does not answer leaves the recorded facts. Four mutants killed.
+- **Switch point:** the write probe emits a transactional WAL message on each instance (committed and acknowledged when the statement answers) and keeps the highest position; the test reads the last timeline history file of the new primary and asserts that its switch point is not before that position. The check of the old primary's WAL end with `pg_waldump` or `pg_rewind --dry-run` is not done.
+- **M3:** the missing group 0 row is audited too (one mutant killed).
+
+### 2026-11-24: review of the branch (P1, M1 to M3, P3 to P6) and the console
+
+- **P1:** a group with the hand-over marker on disk counts as enforced everywhere in the lease manager (`enforced`), so an unstopped old primary is stopped by its lapsed lease although the plan lists no standby, and the idle refresh never keeps its watchdog file alive (also after a restart of kingresd). **M1:** the record of the candidate is not overwritten by another server and a failed fence removes the record it wrote. **M2:** the loss is judged again right before the fence. **M3:** a missing group 0 row pauses the bootstrap. **P3:** a hand-over that meets another bootstrap gives up. **P4:** a repeated request with another target is refused. **P5:** the post-stop alert is bounded. **P6:** a hard request with a proof is refused at the door. Each has a unit test that fails without it; the mutants were killed (P1: two tests; M1: three; M2: two; M3, P3, P4, P6: one each).
+- **Console:** the refusal text for the map group, the hint that names the server that takes the repeated request, the generated schema for 0.28.0; vitest 1963 tests pass, `api:check` holds.
+- **Write probe** in the hard failover tests (txid_current on the map group instance of the old and of the new primary every 20 ms): the old instance's last write is 2 to 3 s before the new one's first in the fence case and about 10 s before in the no-stop case (the watchdog); all five tests pass on 18.7 and 19.0.
+- **The flake** (`TestSwitchoverSurvivesACleanStopThatOutlastsTheLease`, 18.7, 20 runs each): base 714b48be55: 14 passed, 6 failed (5 timeouts of 8 minutes, four in the step `Lift the freeze`); this tip: 19 passed, 1 failed (the same step: the old primary's server answers "waits for its group lease" and the step waits for it). It is not caused by the hard failover work; the cause (the unfreeze call to a former primary that is held back waits for minutes) is not fixed.
+- **Not done:** P2 (an operator's way to declare a dead candidate lost), the LSN stronger tests (2: the switch point against the highest acknowledged LSN), the direct `pg_stat_replication` read right before the fence (M2 re-reads the leader's facts and positions instead), reuse of an earlier attempt's candidate by `stopOldMap` (a different candidate is refused with a message).
+
+### Still open
+
+- **Not done:** the escrow of the key of the certificate authority (an alert says what the operator does); the loops were run once per group (not 30 times: one round takes about 95 to 113 minutes on this machine);
+  the independent review of the whole part after this increment (the design asks for one); the console has no text for the new pause (it shows the message of the status).
+- The unexplained failure above.
+- A hard failover of the map group when the old leader's kingresd is gone before the call of the fence is the failover of a dead leader (the bootstrap alone), as before.
+
 ---
 
 ## 2026-11-22 (staging branch g15): cp-1011, p13-fix and web-15b merged, contract revisions renumbered

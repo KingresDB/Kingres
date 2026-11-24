@@ -987,9 +987,8 @@ differs from a dead OLD:
   stops with it; the task row (replicated to the candidate before the stop, and `switchover_verify` asks the
   same thing for the data) is claimed by the new leader's engine after B8, and its step "hand over" finds the
   work done.
-  **Status (2026-11-21): not built.** A failover, a switchover or a restore that involves the map group while the server of its primary is alive is
-  refused today with 422 `unsupported_operation`, and the bootstrap refuses a live old server (it cannot ask it to demote: those calls are the
-  leader's). The delta that builds it is the last section of this document.
+  **Status (2026-11-23): built** for a planned switchover, a restore and a hard failover (the last section of this document). Until 2026-11-21 any request that involved the
+  map group while the server of its primary was alive was refused with 422 `unsupported_operation`, because the calls that stop a primary are the leader's and the bootstrap is not the leader.
 
 ### 3.6 Choosing the standby
 
@@ -2719,7 +2718,7 @@ What a reviewer who did not write it should read, in the order of the risk, and 
 1. **The proof around a promotion** (`internal/failover/steps.go` promote, `cmd/kingresd/failover.go` promote handler, `internal/standby` freeze): the term, the fence of the run, the lease attached to the promoted instance, the checkpoint proof of a switchover. Try: a late call of a superseded run at every step; a promote whose answer is lost; a restart of the leader between the promotion and its record.
 2. **The rollback paths** (`switchover.go`: `rollbackSwitchover`, `failedPastPromotion`, `rollbackFailed`; `repair.go`): a group must never be resumed once the promotion may have happened, and a held group must never stay held. Try: every failure and cancel at every step with the leader's kingresd ended at the same time.
 3. **The leases** (`internal/lease`): the fence lease adoption and its attach, the markers and the start gate, the bounded topology read, the log of a lost lease. Try: a loaded machine (rounds that arrive late), a killed server out of three, a catalog that does not answer, a watchdog that stops a primary whose kingresd was away longer than the lease (the case of the catalog step, where the new primary's lease lived only in the memory of the killed kingresd).
-4. **The map group bootstrap** (`internal/failover/mapgroup`, `journal`, `cmd/kingresd/mapfailover.go`, `mapmonitor.go`): the freeze that is asked for again, the candidate monitor, the abandon of a stuck journal, the engine gate. Try: two candidates; a candidate that is restarted at every boundary; a leader that comes back after the promotion. A live old leader: a planned switchover and a restore move the map group (built, round 2); a hard failover of a live leader's server is refused.
+4. **The map group bootstrap** (`internal/failover/mapgroup`, `journal`, `cmd/kingresd/mapfailover.go`, `mapmonitor.go`): the freeze that is asked for again, the candidate monitor, the abandon of a stuck journal, the engine gate. Try: two candidates; a candidate that is restarted at every boundary; a leader that comes back after the promotion. A live old leader: a planned switchover, a restore and a hard failover of a live leader's server move the map group (built; the last is the last section of this document).
 5. **The old primary** (`internal/standby/oldprimary.go`, `internal/instance/quiesce.go`, `standby.go` `SyncAccess`): the proof that a directory is the former primary of the group, the hold rules and their backup, the rules that are copied to the standbys of a server. Try: a directory that looks like the old primary and is not; a rebuild interrupted at every step; a server whose only instance is a standby.
 6. **What the tests cannot show**: the gate runs of 2026-11-20 and 21 found instances of the shared cluster down, a leader's own lease lost a few seconds after a kill, and a new primary stopped while its server's kingresd was away; the first two are not explained (the logs that would explain them are now written). A review should read the code that stops an instance and ask who restarts it in every case.
 
@@ -2860,3 +2859,71 @@ recommendation (11.2) and what was found.
   was lost at a failover, `ca.key` was not written durably). Threats 7 to 11 above and the Fixes section of the report say what changed.
 - **Left**: a console panel for the three operations; an alert for a recipient that stays out of date; the removal of `ca.key` from an old leader that
   returns; the rotation of the CA itself, which the escrow does not replace.
+
+### A hard failover of a live leader's server (phase 5 closing, 2026-11-23)
+
+What was refused: `mode: hard` for the server that runs the primary of the map group while that server answers (422 `unsupported_operation`). The case is the server that is
+alive for the cluster but whose primary of the map group is sick or unwanted (a disk that fails, a postmaster that hangs, an operator who wants it gone now and does not want to wait for
+a clean stop and a proof). A planned switchover needs a streaming standby and ends with no loss; this needs neither, and may lose what the request accepted.
+
+**Decision.** It reuses the shape of the planned switchover of the map group (round 2) and changes the stop and the proof. The leader's task runs the other groups of the server first (the map
+group is last, `Input.MapLive`), and for group 0 the step `Stop the old primary` is one step that does, in this order:
+
+1. *Judge the loss, change nothing.* The leader reads the positions of the ready standbys of group 0 and its own facts (`Facts`: did a synchronous standby stream at the last check, which
+   databases commit asynchronously) and runs the ordinary choice. A verdict that the request did not accept (`allowDataLoss`) pauses the task here, with the old leader running, as it does for
+   any group; the plan of a `dryRun` and the 409 `failover_needs_decision` of the request say the same before the task exists. No standby that can be read, or none ready, fails the step with
+   the old primary running.
+2. *Start the bootstrap.* `POST /failover/map/start` on the chosen standby's server, from the old leader's own task, with `planned.hard`, the id of the task, the standby, the acceptance of the
+   operator and the facts of step 1. The candidate runs B1 and B2 (the old server is heard, so the plain request of an operator is still refused; only this one, from the old leader itself, is taken) and waits at B3
+   for the lease.
+3. *Fence the old primary, in one call to its own server* (`POST /failover/demote`, mode `immediate`, `transferTo` and `candidate` the candidate's server): (a) the candidate is written to disk
+   (so that the hold can be ended later only on its word, F7-01); (b) the lease renewal ends and the marker that keeps the primary from starting is written, before anything is stopped
+   (`Relinquish`); (c) the instance is stopped with an immediate shutdown; (d) **only when it is seen stopped** the lease is handed to the candidate's server (`Transfer`: the grantors that
+   have the old server as holder make the candidate the holder for a fresh duration, with no moment in which nobody or somebody else holds it).
+4. *Wait.* The task cannot record anything after (c): its system database is the instance that was stopped. The step waits (on a context that is not the task's) for a standby of group 0 to be
+   out of recovery, for `MapVerdictWait`, and returns. The new leader's engine claims the task after B8 and runs again the steps that were not recorded; the stop, the lease, the choice, the hand-over and
+   the promotion skip because the standby is promoted (`mapHandedOver`), and the rest (catalog check, repoint, records, synchronous names, prepared transactions, clients, unfreeze, report) run from the new leader.
+5. *The candidate.* B3 takes the fence lease (waiting `PlannedWait`, 4 min: what it waits for is the call of step 3, not the lapse of a lease), B4 **ranks all the standbys after the stop**, when their
+   positions have stopped moving, with the same choice as for a dead leader but with the facts of step 1 (the record in the system database stops growing at the stop and would turn "a synchronous standby
+   streamed" into "possible loss" after thirty seconds), and may hand the lease to a better candidate as always; a standby that the request named for the map group (`targets`) is ranked and judged as for any group (`Planned.Target`: chosen although another is better, and a loss the operator must accept when it is behind). B5 promotes **without a proof** (there is none: the stop was not clean). B6, B7, B8 are
+   as for any bootstrap, except that B7 marks the old leader's task (`RecordPlanned`) and writes into its row of group 0 the pin and the verdict that the old leader could not write.
+
+**The fencing argument, stated plainly.** The old primary must not accept a write after any other instance of the group does, and the new primary must not be promoted while the old one can.
+
+- *The only thing that lets a standby of the map group be promoted is the fence lease of group 0 held by its server at a majority of all the servers* (B3, then the holder adoption at B5 before the call, and the callee
+  refuses `lease_not_held`). Nothing in this design promotes without it; the proof of a clean stop is not needed because the lease is.
+- *The lease cannot be held by two servers.* A grantor gives it to a server only when it has no valid lease for another, or on a `Transfer` from the holder itself. So the candidate holds it at a majority only
+  after the old holder's lease ran out at a majority, or after the old holder handed it over.
+- *The old holder hands it over only after its primary is seen stopped* (3d), and it ended its own renewal and wrote the marker before it stopped anything (3b). So when the candidate holds the lease by a hand-over, the
+  old instance is down; and the marker keeps it down: the start gate refuses `relinquished`, so neither the lease manager nor a restart of kingresd starts it.
+- *When the stop did not happen* (the instance does not stop, or the hand-over fails, or kingresd of the old leader ends in the middle of the call) nothing is handed over. The renewal has ended (or
+  never happens again: it needs this kingresd), so the lease the old primary holds lasts at most `duration - margin` after its last renewal for its own watchdog, and `duration` at the grantors; the
+  watchdog of the group (the preflight refuses a primary that runs without one) stops the primary when its lease file runs out, `margin` before any other server can be granted the lease.
+  The candidate takes the lease after that and not before. This is the argument of the failover of a dead server, and it does not depend on anything the old leader's kingresd does after step 3b.
+- *The old leader cannot start again by itself.* The marker and `candidate.0` stay on disk. The loop that ends a hold nobody owns (F6-01, F7-01) ends it only when the candidate answers, shows its standby in
+  recovery, and no bootstrap that names the old leader is active anywhere: an active or a promoted candidate keeps the hold. The lease is the final authority in any case: a restarted primary starts only when
+  its server wins the lease, and the candidate has it.
+- *The leader cannot be superseded in the middle.* Every call of the task carries the term of the run; a term that moved (another failover) is `stale_term` and fails the step before the fence. The re-run on the new
+  leader has the term after the promotion (`runRowOf` takes the term of the groups that ran before it, in the order they run, and of group 0's own row).
+
+**What can be lost, and who decides.** An acknowledged write is lost only when the chosen standby lacks it, which the verdict says before anything is stopped (`none` only when a synchronous standby streamed at
+the last check and the best standby is chosen; `asyncOnly`, `possible`, `unknown` need `allowDataLoss`). The same verdict is recomputed by the candidate after the stop with the same facts; if the best standby
+cannot be read any more (it died in the meantime) the bootstrap pauses with `failoverNeedsDecision`, nothing is promoted, and the old primary stays down and held (it has no leader to resume it: the same state as the
+dead leader's case). The operator repeats the request, **sent to the server of the standby that runs the bootstrap**, which takes it because a hard bootstrap is in progress there (`Handles`); a request sent to
+any other server goes to the old leader, whose system database is stopped. The pause message names that server.
+
+**What is not new.** The CA key is not escrowed (an alert says what the operator does). A rebalance that was running is paused by B7. A hard failover of a server that does not answer still goes through the bootstrap
+alone (`mapFailover.Handles`).
+
+**Refused and rolled back.** Before step 3 nothing is changed: a failure of the choice, of the start of the bootstrap or of the call of the fence (an error answer means the renewal did not end) fails the step
+(`no_candidate`, `target_not_available`, `superseded`), gives the bootstrap up (`POST /failover/map/abandon`) and lifts the freeze (the hook of a failed task). After step 3 there is no rollback: the group has no primary
+until a standby is promoted, as for any hard failover.
+
+**Found while building.** `mapgroup.takeFence` looked for the old holder among the *keys* of `RefusedBy` (the grantors) and not among its values (the holders it names), so a bootstrap whose lease was still held
+by a renewed old leader failed with `lease_held_elsewhere` and raised no alert instead of `lease_still_held` with the alert. Fixed with a test. `runRowOf` took the term of the groups "before" the group in the order
+of `Groups` (the map group first) and not in the order they run, so the map group of a planned switchover with other groups on the server would have called the old primary with the term from before their promotions;
+it uses the order they run now.
+
+**Tests.** Unit: the task side (`maplive_test.go`: the order of start and fence, the loss judged before anything is stopped, the facts as of the stop, the context that outlives the step, a candidate that never promotes, the
+failures before the fence, the re-run on the new leader, the order of the groups, the term, the preflight); the bootstrap (`mapgroup_hard_test.go`: no proof, the row of the old leader's task, the facts, the repeated request, a better
+candidate, the wait for the lease, a crash at every boundary); the callee (`maphard_test.go`: the order of the fenced stop, no hand-over while the primary runs, the markers). Cluster: see the worklog.

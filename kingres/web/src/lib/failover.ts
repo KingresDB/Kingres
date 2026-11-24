@@ -557,7 +557,7 @@ export function failoverRefusal(error: unknown, ctx: RefusalContext): FailoverRe
         )
       if (ctx.includesMapGroup)
         parts.push(
-          'Moving the manager of the cluster (the map group) is not part of this server version yet. Choose only the other groups.',
+          'The map group (the manager of the cluster) is moved by the request that is sent to the manager leader, for the server of the leader itself only. Ask the leader, or choose only the other groups.',
         )
       if (parts.length === 0)
         parts.push('This server version does not do what the request asks for yet.')
@@ -672,3 +672,12 @@ export const AUTO_FAILOVER_REQUIREMENTS: readonly string[] = [
   'A standby for every shard group the failed server leads; a group without one cannot be failed over.',
   'A synchronous standby for a failover that cannot lose data. Without one the failover waits for a person to accept the loss.',
 ]
+
+/**
+ * What an operator does about a hard failover of the map group that paused after the old leader was stopped (0.28.0): the server that runs the bootstrap names itself in the
+ * message ("Send the request to server X"), because the old leader's own system database is stopped and cannot take the repeated request. Null for any other message.
+ */
+export function mapGroupPauseHint(message: string | null | undefined): { server: string } | null {
+  const m = /Send the request to server (\S+?),? which runs the bootstrap/.exec(message ?? '')
+  return m ? { server: m[1]! } : null
+}

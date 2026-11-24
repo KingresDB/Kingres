@@ -495,8 +495,13 @@ func (m *Manager) HandOverMarked(group int32) bool {
 // stopped for the hand-over, removed when the hold ends. The old leader of the map group resumes its primary only on the word of that server.
 const CandidateMarker = "candidate"
 
-// RecordCandidate names the server that the group is being handed to.
+// RecordCandidate names the server that the group is being handed to. A record that names another server is refused (M1 of the review of the hard failover of the map
+// group): a rerun of a failover must not move the word that ends the hold to a server that did not take the group; only ForgetCandidate, Unrelinquish and
+// BecameStandby change it.
 func (m *Manager) RecordCandidate(group int32, server string) error {
+	if have := m.Candidate(group); have != "" && have != server {
+		return fmt.Errorf("lease: the group is being handed to %s already; give that hand-over up before naming %s", have, server)
+	}
 	return pki.WriteFile(MarkerPath(m.c.Dir, CandidateMarker, group), []byte(server+"\n"), 0o600)
 }
 

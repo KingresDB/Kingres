@@ -52,7 +52,7 @@ func (m *Manager) writeWatchdogFile(group int32) {
 	if wf == "" {
 		return
 	}
-	if !m.c.Enforced(group) {
+	if !m.enforced(group) {
 		m.writeWatchdogIdle(wf)
 		return
 	}
@@ -126,4 +126,11 @@ func (m *Manager) DisarmWatchdog(group int32) {
 	if wf := m.watchdogFile(group); wf != "" {
 		m.writeWatchdogOff(wf)
 	}
+}
+
+// enforced is Config.Enforced, and true for a group whose primary was given away (the hand-over marker is on disk, written by Relinquish and HoldBack before anything
+// is stopped, so it also holds after a restart of kingresd): a relinquished primary that does not stop must be stopped by its lapsed lease, whether or not the plan of this
+// server still lists a standby of the group (a plan push during a hard failover may have emptied the list), and its watchdog file must never be refreshed as idle.
+func (m *Manager) enforced(group int32) bool {
+	return m.c.Enforced(group) || markerExists(m.c.Dir, RelinquishedMarker, group)
 }

@@ -75,6 +75,10 @@ type world struct {
 	mapAbandonErr      error           // the candidate answers the abandon with this (a 409 conflict: it promoted)
 	mapRefusal         string
 	mapStartErr        error
+	liveErr            error            // the primary of the map group cannot be asked
+	live2              *LiveReplication // what it says (nil: what the recorded facts say)
+	liveReads          int
+	onMapStart         func()  // runs inside the call that starts the bootstrap of the candidate (a test changes the facts there)
 	markErr            error   // the answer of the mark call
 	undoTerms          []int64 // the terms of the quiesce, unquiesce and resume calls
 	stopErr            error   // the answer of the clean stop call
@@ -89,8 +93,11 @@ type world struct {
 	verifyErr          error
 	verifyN            int
 	quiesced           bool
-	oldSrv             string // the server whose primary is handed over (default s1)
-	self               string // the leader's server (default s2)
+	immediate          []DemoteRequest // the immediate stops that were asked for
+	hardLate           int             // a hard failover of the map group: the candidate shows as promoted after this many reads of its state (0: at once)
+	hardPending        string          // the candidate that promotes late
+	oldSrv             string          // the server whose primary is handed over (default s1)
+	self               string          // the leader's server (default s2)
 }
 
 func newWorld() *world {
@@ -189,6 +196,13 @@ func (p fpeers) State(_ context.Context, server string, g int32) (State, error) 
 		return State{}, err
 	}
 	p.w.rec("state %s", server)
+	p.w.mu.Lock()
+	if p.w.hardPending != "" && server == p.w.hardPending {
+		if p.w.hardLate--; p.w.hardLate <= 0 {
+			p.w.promoted[server], p.w.lease[server], p.w.hardPending = true, true, ""
+		}
+	}
+	p.w.mu.Unlock()
 	st := State{Server: server, Group: g, Holds: p.w.lease[server], Frozen: p.w.frozen}
 	if server == p.w.oldSrv {
 		f := false
@@ -295,8 +309,29 @@ func (p fpeers) Demote(_ context.Context, server string, r DemoteRequest) (Demot
 		}
 		return DemoteAnswer{Stopped: true, ClusterState: state, Checkpoint: "0/6000028", Released: !p.w.notReleased}, nil
 	}
+	p.w.mu.Lock()
+	p.w.immediate = append(p.w.immediate, r)
+	p.w.mu.Unlock()
 	p.w.rec("demote %s to=%s", server, r.TransferTo)
 	p.w.oldWritable = false
+	if n := len(p.w.mapStarts); r.Group == 0 && p.w.mapGroup && n > 0 && p.w.mapStarts[n-1].Planned != nil && p.w.mapStarts[n-1].Planned.Hard && !p.w.noPromoteOnProof {
+		// the candidate of a hard failover of the map group waited for the lease, promotes and holds it
+		p.w.mu.Lock()
+		if p.w.hardLate > 0 {
+			p.w.hardPending = r.TransferTo
+		} else {
+			p.w.promoted[r.TransferTo], p.w.lease[r.TransferTo] = true, true
+		}
+		p.w.mu.Unlock()
+	}
+	if p.w.dbDownAfterStop && p.w.rows != nil {
+		p.w.rows.mu.Lock()
+		p.w.rows.down = true
+		p.w.rows.mu.Unlock()
+	}
+	if p.w.afterStop != nil {
+		p.w.afterStop()
+	}
 	if r.TransferTo != "" {
 		p.w.lease[r.TransferTo] = true
 		p.w.leaseHeldByOld = false
@@ -465,6 +500,19 @@ func (p fplan) Standbys(_ context.Context, g int32) ([]StandbyRec, error) {
 	return out, nil
 }
 func (p fplan) Facts(context.Context, int32) (GroupFacts, error) { return p.w.facts, nil }
+
+func (p fplan) LiveReplication(context.Context) (LiveReplication, error) {
+	p.w.mu.Lock()
+	defer p.w.mu.Unlock()
+	p.w.liveReads++
+	if p.w.liveErr != nil {
+		return LiveReplication{}, p.w.liveErr
+	}
+	if p.w.live2 != nil {
+		return *p.w.live2, nil
+	}
+	return LiveReplication{SyncStreaming: p.w.facts.SyncStreaming, FlushLsn: "0/5000000", Streaming: 1}, nil
+}
 func (p fplan) PrimaryNames(context.Context, string, int32) ([]int64, bool) {
 	if p.w.oldAlive && p.w.primaryNames != nil {
 		return p.w.primaryNames, true
@@ -806,6 +854,9 @@ func (p fpeers) MapStart(_ context.Context, server string, r MapStartRequest) er
 		return err
 	}
 	p.w.rec("map-start %s", server)
+	if p.w.onMapStart != nil {
+		p.w.onMapStart()
+	}
 	return p.w.mapStartErr
 }
 
