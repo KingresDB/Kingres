@@ -332,13 +332,13 @@ func (o *Ops) installExtensions(ctx context.Context, db string, sharding, ledger
 	return o.installAnalytics(ctx, db)
 }
 
-// installAnalytics installs the storage and partitioning extensions of phase 12, kingres_columnar and kingres_timepart, in a database that is made
+// installAnalytics installs the storage and partitioning extensions of phase 12, kingres_columnar and kingres_timepart, and pg_stat_statements, in a database that is made
 // on this server (the other servers do it in the same step of their own, and a server that is added later gets every extension of the database
 // from the leader). An extension that the package of this server does not contain is left out: a database must still be made with an older package.
 // kingres_sketch is not installed here; the task database.approximateAggregates does it.
 func (o *Ops) installAnalytics(ctx context.Context, db string) error {
 	b := o.ext()
-	for _, e := range []string{ExtColumnar, ExtTimepart} {
+	for _, e := range []string{ExtColumnar, ExtTimepart, ExtStatStatements} {
 		v, err := b.Available(ctx, db, e)
 		if err != nil {
 			return fmt.Errorf("looking for %s: %w", e, err)

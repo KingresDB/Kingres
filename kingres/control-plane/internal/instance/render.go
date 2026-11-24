@@ -218,8 +218,9 @@ type ManagedSettings struct {
 
 // PreloadLibraries is the value of shared_preload_libraries of every instance. kingres_columnar is preloaded because it registers a WAL
 // resource manager: without it a columnar table is refused every write and kingres_timepart cannot convert a partition. kingres_shard stays
-// first. kingres_timepart and kingres_sketch need no preload.
-const PreloadLibraries = "kingres_shard,kingres_ledger,kingres_columnar"
+// first. pg_stat_statements is preloaded because it needs shared memory that only the postmaster can set up: without it nothing is collected and its views
+// fail. kingres_timepart and kingres_sketch need no preload. The manager leaves out a library the installation lacks (see optionalLibraries).
+const PreloadLibraries = "kingres_shard,kingres_ledger,kingres_columnar,pg_stat_statements"
 
 // preloadValue is the list the settings ask for.
 func preloadValue(s ManagedSettings) string {

@@ -154,6 +154,11 @@ func (s *Service) CollectGlobals(ctx context.Context) (wire.Globals, error) {
 			}
 		}
 		d.Extensions = exts
+		places, err := s.databaseExtensionPlaces(ctx, d.Name)
+		if err != nil {
+			return g, err
+		}
+		d.ExtensionPlaces = places
 	}
 	return g, nil
 }
@@ -352,12 +357,14 @@ func (s *Service) applyDatabasesAt(ctx context.Context, id int, dbs []wire.Datab
 		return fmt.Errorf("connecting to the instance: %w", err)
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	// A database that cannot be copied does not stop the others: every database is tried, and the errors come back together.
+	var errs []error
 	for _, d := range dbs {
 		if err := s.applyDatabase(ctx, id, c, d); err != nil {
-			return fmt.Errorf("copying database %s: %w", truncName(d.Name), err)
+			errs = append(errs, fmt.Errorf("copying database %s: %w", truncName(d.Name), err))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (s *Service) applyDatabase(ctx context.Context, id int, c *pgx.Conn, d wire.DatabaseSpec) error {
@@ -416,30 +423,21 @@ func (s *Service) applyDatabase(ctx context.Context, id int, c *pgx.Conn, d wire
 			return nil
 		}
 	}
+	// Before CREATE EXTENSION: an extension of KingresDB that is there must be trusted, and the schema it would be created in must not be one that a tenant made
+	// (the control file of an extension with "schema = ..." uses an existing schema, and the tenant would own what the service role runs).
 	for _, e := range d.Extensions {
-		if e == "kingres_shard" {
+		if e == "kingres_shard" || !extguard.IsKingres(e) {
 			continue
 		}
-		id, err := sqlx.NewIdent(e)
-		if err != nil {
-			return errors.New("invalid extension name")
-		}
-		// Before CREATE EXTENSION: an extension that is there must be trusted, and the schema it would be created in must not be one that a tenant made (the
-		// control file of an extension with "schema = ..." uses an existing schema, and the tenant would own what the service role runs).
-		if extguard.IsKingres(e) {
-			if info, err := extguard.Verify(ctx, dc, e); err != nil {
-				return fmt.Errorf("extension %s of database %s is not used: %w", truncName(e), truncName(d.Name), err)
-			} else if !info.Present {
-				if err := extguard.PreInstallExtension(ctx, dc, e); err != nil {
-					return fmt.Errorf("extension %s is not installed in database %s: %w", truncName(e), truncName(d.Name), err)
-				}
+		if info, err := extguard.Verify(ctx, dc, e); err != nil {
+			return fmt.Errorf("extension %s of database %s is not used: %w", truncName(e), truncName(d.Name), err)
+		} else if !info.Present {
+			if err := extguard.PreInstallExtension(ctx, dc, e); err != nil {
+				return fmt.Errorf("extension %s is not installed in database %s: %w", truncName(e), truncName(d.Name), err)
 			}
 		}
-		if err := execB(ctx, dc, new(sqlx.Builder).Text("CREATE EXTENSION IF NOT EXISTS").ID(id)); err != nil {
-			return fmt.Errorf("installing extension %s failed", truncName(e))
-		}
 	}
-	return nil
+	return applyExtensions(ctx, s.log, pgTarget{dc}, d)
 }
 
 // ApplyGlobals applies roles, then databases.
@@ -461,4 +459,29 @@ func pgReason(err error) error {
 		return errors.New("the statement could not be built")
 	}
 	return errors.New("the statement failed")
+}
+
+// databaseExtensionPlaces reads, for every extension of the database (plpgsql excepted), the schema it is installed in and the owner of that schema.
+func (s *Service) databaseExtensionPlaces(ctx context.Context, db string) (map[string]wire.ExtensionPlace, error) {
+	c, err := s.InstanceConn(ctx, s.ConnectID(), db)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	rows, err := c.Query(ctx, `SELECT e.extname, n.nspname, r.rolname FROM pg_catalog.pg_extension e
+		JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace JOIN pg_catalog.pg_roles r ON r.oid = n.nspowner WHERE e.extname <> 'plpgsql'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]wire.ExtensionPlace{}
+	for rows.Next() {
+		var name string
+		var p wire.ExtensionPlace
+		if err := rows.Scan(&name, &p.Schema, &p.Owner); err != nil {
+			return nil, err
+		}
+		out[name] = p
+	}
+	return out, rows.Err()
 }

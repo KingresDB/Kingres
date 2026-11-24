@@ -126,3 +126,31 @@ func TestPickPrecedence(t *testing.T) {
 		t.Error("no overrides")
 	}
 }
+
+// The settings of pg_stat_statements are the operator's: max and save need a restart or a reload and are set at the three file levels, track and the
+// other session settings may also be set for a database. None is managed or refused (the library itself is loaded through the managed
+// shared_preload_libraries, which cannot be set), and none must be equal on every server.
+func TestStatStatementsSettingsAreSettable(t *testing.T) {
+	for _, s := range []Setting{
+		{Name: "pg_stat_statements.max", Context: "postmaster"},
+		{Name: "pg_stat_statements.save", Context: "sighup"},
+		{Name: "pg_stat_statements.track", Context: "superuser"},
+		{Name: "pg_stat_statements.track_utility", Context: "superuser"},
+		{Name: "pg_stat_statements.track_planning", Context: "superuser"},
+	} {
+		c := Classify(s, false)
+		if c.Kind != KindSettable || c.ClusterOnly != "" || !c.Allows(LevelCluster) || !c.Allows(LevelServerGroup) || !c.Allows(LevelServer) {
+			t.Errorf("%s: %+v", s.Name, c)
+		}
+		if Dropped(s.Name) {
+			t.Errorf("%s is dropped", s.Name)
+		}
+		if want := s.Context == "superuser"; c.Allows(LevelDatabase) != want {
+			t.Errorf("%s at database level: %v", s.Name, c.Allows(LevelDatabase))
+		}
+	}
+	// the library list that loads the extension stays managed
+	if c := Classify(Setting{Name: "shared_preload_libraries", Context: "postmaster"}, false); c.Kind != KindManaged {
+		t.Errorf("shared_preload_libraries: %+v", c)
+	}
+}

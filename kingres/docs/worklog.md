@@ -7,6 +7,28 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-23 (branch pgss, from g16): pg_stat_statements and plpgsql in the first release
+
+### What was done
+
+- **Preload.** `instance.PreloadLibraries` is `kingres_shard,kingres_ledger,kingres_columnar,pg_stat_statements`. The library-exists check of columnar became a table (`optionalLibraries`): a library whose file is not in `pg_config --pkglibdir` is left out of the list. `kingres_columnar` stays sticky (marker file `columnar-preload`); `pg_stat_statements` is deliberately not sticky and has no marker: a missing file must never keep an instance from starting, and the statistics hold nothing to protect. `EnsureConfig` upgrades an existing instance as before: warning, managed file rewritten with every other setting kept, a reload of a running instance so that `shared_preload_libraries` is pending a restart, and the console's restart of pending instances puts standbys first.
+- **Install in databases.** `postgres` and `kingres_system` get the extension when the cluster is created (`installStatStatements`); every database of `database.create` gets it through `installAnalytics`, on every server; a server that is added gets it with the databases of the leader (`globals/apply`). `ExtStatStatements` joined the closed list of the extension apply kinds. **Existing databases:** an explicit `CREATE EXTENSION IF NOT EXISTS pg_stat_statements` by the administrator, not a lazy install (nothing in `kingresd` uses the view, so there is no first use to hang it on, and a superuser DDL in a user's database at an unforeseen time is not worth a view); the guide text says so.
+- **Configuration API.** `pg_stat_statements.max`, `.save`, `.track`, `.track_utility` and `.track_planning` are settable (cluster, server group, server; the three session ones also per database), not managed, not refused, not cluster-only; `shared_preload_libraries` stays managed and its reason names the library. A test pins the classification.
+- **Packaging.** meson builds every contrib module and PL/pgSQL, and the deb and the image take the whole staged tree, so both modules were already shipped for both majors (nothing in `meson_opts` leaves them out). Added: `build.sh` stops when either is missing from the staged tree; `check_postgres_modules` in `test/lib.sh` (package, image and compose tests); `test/test-modules.sh --deb|--tree|--list`; the flow checks the new preload value, the view in `postgres` and a plpgsql function.
+- **plpgsql.** In every database `kingresd` makes (checked on every server by the cluster test). `kingres_shard` does **not** propagate `CREATE FUNCTION`: the function is local to each server (the cluster test pins it, so a later change of that fact fails the test and the guide gets corrected); a plpgsql function in a filter, a read and a write against a distributed table works from every server. `t/013_dist_scan.pl`, `t/124_pushdown_closed.pl` and `t/057_scan_errors.pl` already cover plpgsql functions in distributed queries, so no new TAP was added.
+- Guide text for the integrator (a section on the statistics, their settings and PL/pgSQL) was written as a separate file, outside the repository; the branch rel-docs2 was not touched.
+
+### How it was verified
+
+See the report of the run for the counts per major; the tests are `instance` (preload, the upgrade of an existing instance, the library that the installation lacks, not sticky), `ops` (`installAnalytics`), `pgconfig` (the classification), the cluster test `TestStatStatementsAndPlpgsql` (three servers, PostgreSQL 18 and 19, lane l11) and `test/test-modules.sh`.
+
+### Still open
+
+- The shell tests of the package and the image (`test-deb.sh`, `test-image.sh`, `test-compose.sh`) were changed but not run here (they need a built package and Docker); `test-modules.sh` was run on installed trees.
+- No console page for `pg_stat_statements`; the view is SQL only.
+
+---
+
 ## 2026-11-22 (staging branch g15): cp-1011, p13-fix and web-15b merged, contract revisions renumbered
 
 The staging branch g15 (from kingres-18) merges cp-1011, p13-fix and web-15b. The contract revisions are renumbered in merge order so that they follow kingres-18's 0.14.0: the control plane of phases 10 and 11 (written as 0.16.0 in cp-1011) is 0.15.0, and the closing of phase 13 (written as 0.17.0 in p13-fix) is 0.16.0. Entries of this log and the review files that were written on those branches still say 0.16.0 and 0.17.0; read them as 0.15.0 and 0.16.0. The failover branch, which carries an older 0.15.0, is renumbered when it merges. Generated files were regenerated; no migration numbers collide (cp-1011 has 0040 and 0041, p13-fix has none).
