@@ -17,7 +17,7 @@ import (
 )
 
 // ContractRevision is the revision of the contract that the archives written by this build name in their manifest.
-const ContractRevision = "0.31.0"
+const ContractRevision = "0.32.0"
 
 // isBucket reports whether a table exists only because of the distribution (a bucket partition of a hash table or a leaf under one).
 func (f *dbFacts) isBucket(t dbTable) bool { return f.Buckets[t.OID] }

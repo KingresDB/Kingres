@@ -212,6 +212,9 @@ func (o *Ops) PrepareDistribute(ctx context.Context, db, schema, table string, r
 	if err := o.rebalanceRunning(ctx); err != nil {
 		return nil, err
 	}
+	if len(req.RelatedTables) > 0 {
+		return o.prepareRelated(ctx, p, req)
+	}
 	p, err = o.resolveMode(ctx, req.Mode, p)
 	if err != nil {
 		return nil, err
@@ -409,6 +412,7 @@ func (o *Ops) PreviewTableChange(ctx context.Context, db, schema, table string, 
 	}
 	p := tableParams{V: 2, Database: db, Schema: schema, Table: table}
 	mode := ""
+	var relReq *api.DistributeTableRequest
 	switch req.Kind {
 	case "distribute":
 		d := req.Distribute
@@ -416,6 +420,9 @@ func (o *Ops) PreviewTableChange(ctx context.Context, db, schema, table string, 
 			return api.TableChangePreview{}, problem.Validation("The request is invalid.", field("/distribute", "is required for kind distribute", "required"))
 		}
 		p.Op, p.Method, p.Column, p.DependentViews, mode = "distribute", d.Method, d.DistributionColumn, d.DependentViews, d.Mode
+		if len(d.RelatedTables) > 0 {
+			relReq = d
+		}
 		if d.BucketCount != nil {
 			p.BucketCount = *d.BucketCount
 		}
@@ -469,7 +476,7 @@ func (o *Ops) PreviewTableChange(ctx context.Context, db, schema, table string, 
 	if err != nil {
 		return api.TableChangePreview{}, wrap(err)
 	}
-	onlineOK := len(onlBlockers) == 0 && p.Op != "partition"
+	onlineOK := len(onlBlockers) == 0 && p.Op != "partition" && relReq == nil
 	run := p
 	run.Online = onlineOK && (mode == "online" || (mode != "blocking" && rows > onlineRowsThreshold))
 	blockers, warnings, notes, err := b.Report(ctx, run)
@@ -492,6 +499,11 @@ func (o *Ops) PreviewTableChange(ctx context.Context, db, schema, table string, 
 	if !onlineOK && p.Op != "partition" {
 		r := describeBlockers(onlBlockers)
 		out.Estimate.OnlineUnavailableReason = &r
+	}
+	if relReq != nil {
+		if err := o.previewRelated(ctx, p, relReq, &out); err != nil {
+			return api.TableChangePreview{}, err
+		}
 	}
 	return out, nil
 }

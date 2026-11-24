@@ -471,7 +471,7 @@ paths; what is not done is in "Not done in this increment"). "Real" means the op
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **177 of 177 operations are real; 0 answer "not yet".**
+authenticated operation lists in 0.2.0. **178 of 178 operations are real; 0 answer "not yet".**
 
 | Tag | Real | Not yet |
 |---|---|---|
@@ -484,7 +484,7 @@ authenticated operation lists in 0.2.0. **177 of 177 operations are real; 0 answ
 | Schemas | `listSchemas`, `getSchema`, `distributeSchema`, `undistributeSchema`, `moveSchema` |  |
 | Shards | `getBucketDistribution`, `listColocationGroups`, `listBuckets`, `previewBucketSplit`, `splitBucket` |  |
 | Ledger | `getLedgerStatus`, `listLedgerBlocks`, `listLedgerDigests`, `generateLedgerDigest`, `startLedgerVerification`, `listLedgerStatus`, `createInclusionProof`, `listLedgerVerifications`, `getLedgerVerification`, `getLedgerSettings`, `updateLedgerSettings`, `getLedgerSigning`, `createLedgerSigningKey`, `retireLedgerSigningKey`, `revokeLedgerSigningKey`, `getLedgerTrustFile`, `getLedgerPublication`, `getLedgerAggregate`, `listLedgerAggregates`, `listLedgerAnchorTargets`, `createLedgerAnchorTarget`, `getLedgerAnchorTarget`, `updateLedgerAnchorTarget`, `deleteLedgerAnchorTarget`, `testLedgerAnchorTarget`, `listLedgerAnchors`, `anchorLedgerNow`, `retryLedgerAnchor`, `downloadLedgerAnchor`, `listLedgerClientKeys`, `registerLedgerClientKey`, `revokeLedgerClientKey`, `setTableSignaturePolicy`, `upgradeLedgerExtension`, `createLedgerBundle`, `getLedgerBundle`, `acknowledgeLedgerDivergence` | |
-| Tables | `getTable`, `distributeTable`, `enableTableLedger`, `listTables`, `previewTableChange`, `undistributeTable`, `alterTableDistribution`, `listTablePartitions`, `createTablePartition`, `attachTablePartition`, `detachTablePartition`, `dropTablePartition`, `setTableStorage`, `setPartitionStorage`, `getPartitionPolicy`, `putPartitionPolicy`, `deletePartitionPolicy`, `runPartitionPolicy`, `listPartitionPolicyRuns`, `getPartitionPolicyRun`, `planPartitionPolicy` |  |
+| Tables | `getTable`, `distributeTable`, `enableTableLedger`, `listTables`, `previewTableChange`, `listRelatedTables`, `undistributeTable`, `alterTableDistribution`, `listTablePartitions`, `createTablePartition`, `attachTablePartition`, `detachTablePartition`, `dropTablePartition`, `setTableStorage`, `setPartitionStorage`, `getPartitionPolicy`, `putPartitionPolicy`, `deletePartitionPolicy`, `runPartitionPolicy`, `listPartitionPolicyRuns`, `getPartitionPolicyRun`, `planPartitionPolicy` |  |
 | Grants | `listGrants`, `createGrant`, `revokeGrants`, `applyGrantTemplate` |  |
 | Health | `getHealth`, `getReadiness` |  |
 | Logs | `listLogs` |  |
@@ -3676,8 +3676,13 @@ blockers, free space, validation). Integration, with a cluster: `internal/cluste
 that is refused, alter, undistribute, a cancel, a switch held by a transaction, partitions, views), run only with `scripts/run-integration.ps1 -Packages ./internal/clustertest -Run TestTableLifecycle` after the extension of this
 increment is installed in the installation of the tests.
 
-Not done: the rebalance does not look for an unfinished table task before it moves a bucket of the group (the extension refuses a move of a group that an operation claims; the rebalance then reports the move as failed); `Table.operation`
-(the unfinished task of a table) of the design is not in the contract yet; `relatedTables` of the distribute request (distribute with related tables) is increment 9.7; the free space of other servers.
+Not done: the rebalance does not look for an unfinished table task before it moves a bucket of the group (the extension refuses a move of a group that an operation claims; the rebalance then reports the move as failed); the free space of other servers.
+
+### Distribute with related tables and the operation indicator (contract 0.32.0)
+
+`internal/ops/tablerelated.go`: the foreign key closure of a plain table (`Graph`: a recursive query over `pg_constraint` that does not go through a table in `kingres.dist_table`, behind the extension guard), the pure planner (`planRelated`: order, the column each table gets from the keys, `related_column_unknown`; `checkChoice`: `related_table_missing`, `related_table_unrelated`), `listRelatedTables`, and the task. `PrepareDistribute` with `relatedTables` captures the keys (`pg_get_constraintdef`, `convalidated`) in the input of the task, refuses `mode` `online`, a busy table and a report blocker that the removal of the keys does not clear (`filterSetBlockers`), and the task is `table.distribute` with the steps *Check the tables*, *Check free space*, *Take the foreign keys between the tables out*, one *Distribute schema.table* per table (the table first with its own `colocateWith`, the others `colocate_with` the table), *Add the foreign keys again* (`NOT VALID`, without it when the extension refuses that), *Validate the foreign keys*. Every step checks what exists (`kingres.dist_table`, `pg_constraint`), so a task that is run again skips what is done. A failing step puts the keys back (`AddKeys` of the missing ones) and names the keys that it could not put back in the task error. Cancellable until the keys are taken out (`tableCancellable`).
+
+`internal/ops/tableops.go`: `TableOperations(db)` builds `Table.operation` from the active tasks with subject type `table` (kinds `table.distribute`, `table.undistribute`, `table.alter`, `table.partition`, `table.setStorage`, `partition.maintain`, `table.export`, `table.import`; the related tables of a distribute with related tables with role `related`) and from `kingres.table_operation` and `kingres.table_operation_item` (read after `extUsable`; an untrusted or absent extension gives no records; a record of a table that has a task is left out). `listTables`, `getTable` and `listRelatedTables` are leader-bound reads (`forward.go`). Tests: `tablerelated_test.go`, `tableops_test.go` (in memory), `tablerelated_pg_test.go` (a real catalog with a stand-in of the schema `kingres`; skips without `KINGRES_PG_BIN`).
 
 ## Elasticity (phase 10, contract 0.15.0): strategies and weights, drain, automatic mode, split
 

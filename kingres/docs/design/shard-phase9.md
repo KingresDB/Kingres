@@ -1307,3 +1307,11 @@ commit; the tests are in t/197 and t/198.
   t/197 D asserts that the group is free while the move is in `cleaning` with its orphan table present.
 - P9F-06 (the version 0.7 is changed in place) and P9F-07 (claims not checked) are notes; a database made from the earlier build of 0.7 is made again, and the
   deadlock pass of the recovery worker is described in the README as the mechanism that is there, not as something these tests show.
+
+## Implementation note: distribute with related tables and `Table.operation` (contract 0.32.0, a placeholder)
+
+The two open items of increment 9.7 are built as the design says (decision 11): **distribute with related tables** is a control-plane task and the option `relatedTables` of `distributeTable` (and of `previewTableChange`), with the read `listRelatedTables` for the plan; the extension has no new function. What the extension gives is used as it is: `kingres.dist_table` (a closure does not go through a distributed table, and a repeated step skips a table that is distributed), `kingres.table_change_report` (read for each table, with the lines about the keys of the set filtered out), `create_distributed_table(..., colocate_with)`. The closure over ordinary tables is read from `pg_constraint`, because `internal_fk_component` knows only tables of the catalog.
+
+The task: *Check the tables*, *Check free space*, *Take the foreign keys between the tables out*, *Distribute `s.t`* for the table and for each related table, *Add the foreign keys again*, *Validate the foreign keys*. The definitions of the keys are in the input of the task (a crash after the drop loses nothing); a failing step adds the missing keys back and names the ones it could not. Only the blocking copy is used (no capture trigger on a set of tables). Cancellable until the keys are taken out.
+
+**`Table.operation`** is read from the active tasks whose subject is a table (and the related tables of a distribute) and from `kingres.table_operation` and `table_operation_item` of the extension, behind the extension guard, so that an operation started from SQL shows too. It is a nullable object (`kind`, `role`, `source`, `taskId`, `state`, `startedAt`, `percent`, `step`); the console turns the changes of the table off while it is set.

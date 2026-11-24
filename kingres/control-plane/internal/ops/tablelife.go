@@ -107,6 +107,10 @@ type tableParams struct {
 	EstRows      int64  `json:"estimatedRows,omitempty"`
 	EstBytes     int64  `json:"estimatedBytes,omitempty"`
 	LinkedTables int    `json:"linkedTables,omitempty"`
+	// distribute with related tables (contract 0.32.0): the related tables in the order they are distributed, and the keys between the tables of the
+	// set as they were when the request was made
+	Related []relatedParam `json:"related,omitempty"`
+	Keys    []relatedKey   `json:"keys,omitempty"`
 }
 
 func (p tableParams) subject() string { return p.Database + "/" + p.Schema + "." + p.Table }
@@ -195,7 +199,7 @@ func stepState(t task.Task, name string) string {
 
 // tableCancellable: a table task is cancellable until its switch has started (cancelling it afterwards would not undo the swap).
 func tableCancellable(t task.Task) bool {
-	for _, name := range []string{stepSwitch, stepFinish, stepBlocking, stepPartitions} {
+	for _, name := range []string{stepSwitch, stepFinish, stepBlocking, stepPartitions, stepRelDrop} {
 		switch stepState(t, name) {
 		case task.StepDone, task.StepRunning, task.StepSkipped:
 			if name == stepSwitch && stepState(t, name) == task.StepRunning {
@@ -225,6 +229,9 @@ func (o *Ops) tableOnFail(ctx context.Context, t task.Task) {
 }
 
 func (o *Ops) tableSteps(p tableParams) []task.Step {
+	if p.Op == "distribute" && len(p.Related) > 0 {
+		return o.relatedSteps(p)
+	}
 	switch p.Op {
 	case "partition":
 		return []task.Step{

@@ -122,6 +122,7 @@ export const operations = {
   listLogs: { role: 'kingres_ops', method: 'GET', path: '/logs' },
   listPartitionPolicyRuns: { role: 'kingres_readonly', method: 'GET', path: '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partition-policy/runs' },
   listRebalanceReports: { role: 'kingres_readonly', method: 'GET', path: '/rebalance/reports' },
+  listRelatedTables: { role: 'kingres_readonly', method: 'GET', path: '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/related-tables' },
   listRoles: { role: 'kingres_admin', method: 'GET', path: '/roles' },
   listSchemas: { role: 'kingres_readonly', method: 'GET', path: '/databases/{databaseName}/schemas' },
   listServerGroups: { role: 'kingres_readonly', method: 'GET', path: '/server-groups' },

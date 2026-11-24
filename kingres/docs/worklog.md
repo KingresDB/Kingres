@@ -47,6 +47,28 @@ Windows only (a full gate runs in WSL): `go build ./...`, `go vet ./...`, `go te
 
 ---
 
+## 2026-11-24 (branch p9-rel, from g2): distribute with related tables and `Table.operation` (phase 9, last two items)
+
+Branch `p9-rel` from `g2` (`771af7587d`). Contract **0.32.0** (a placeholder; 0.31.0 is taken by another branch): 1 operation added (178 operations, 142 paths), additive only.
+
+### What was done
+
+- **(A) Distribute with related tables.** Design choice: a control-plane task and an option of the existing operation, as `shard-phase9.md` says ("it is a control-plane feature because it is a sequence of ordinary statements"; decision 11), not a new endpoint and not a function of the extension. The extension offers `internal_fk_component` (the component of keys over tables that are already in `kingres.dist_table`, used by undistribute and alter), which cannot see ordinary tables, so the closure over ordinary tables is read from `pg_constraint` by the control plane (`Graph`, behind the extension guard for `kingres.dist_table`), and `create_distributed_table(..., colocate_with)` is what puts the related tables in the group of the table. `listRelatedTables` (new, read-only) is the plan; `previewTableChange` and `distributeTable` take `relatedTables`. The plan is a pure function (`planRelated`: breadth first order, the column of each table derived through the keys, blockers `related_column_unknown`, `related_table_missing`, `related_table_unrelated`, `related_table_busy`; warning `related_table_distributed`). The task has one step per table and resumes at the first step that is not done (`kingres.dist_table` and `pg_constraint` are looked at). The keys are captured when the request is made and kept in the input of the task.
+- **(B) The operation indicator.** `Table.operation` (nullable `TableOperation`: kind, role, source, taskId, state, startedAt, percent, step) in `listTables` and `getTable`, from the active tasks with a table subject (and the related tables of a distribute) and from `kingres.table_operation(_item)` through `extUsable`. Both reads became leader-bound (the tasks are in the leader's system database).
+- **Console.** Related tables in the Distribute dialog (the list, the columns, the keys, the warning that no key is enforced meanwhile, online off), `TableOperationBadge` on the rows of the list and a line "Running now" on the table page, the change buttons off with the reason from the operation. The mock has the plan, the related distribute and `operation`.
+- **Docs:** operator guide (section 5), limitations, control-plane README, CHANGELOG (the Pending item is gone), `api/README.md` changelog 0.32.0, `check-contract.mjs`.
+
+### How it was verified
+
+Windows only (a timing-sensitive gate runs in WSL; no WSL test was run): `go build`, `go vet`, `go test ./...` in `kingres/control-plane`, `node api/scripts/check-contract.mjs`, `npm run api:check`, `typecheck`, `lint`, `vitest run` and the new `tests/tables-related-0-32.test.ts` in `kingres/web`. The database tests (`ops/tablerelated_pg_test.go`) skip on Windows.
+
+### Open
+
+- Tests to run in WSL: see the report of the branch (`TestRelated*`, `TestTableOperations*` of `internal/ops` with `KINGRES_PG_BIN`; a cluster test `TestTableLifecycleRelated` of `internal/clustertest`; the browser tests).
+- A failed related task has no retry: the tables that are still ordinary are distributed with a new request. A distribute with related tables whose tables are in several schemas of other servers' instances is not covered.
+
+---
+
 ## 2026-11-24: the integration branch g2 (nine branches merged onto g16s)
 
 Branch `g2`, from g16s (`cc5008adb2`), nine merge commits in this order: `xcat-2`, `split-fix`, `pgss`, `p12-dist-tp`, `ca-escrow`, `p10-drain4`, `p5-hard`, `p14b`, `p14c`.

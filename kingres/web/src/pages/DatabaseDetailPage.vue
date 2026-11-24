@@ -29,6 +29,8 @@ import { endpoints } from '@/api/endpoints'
 import { keys, useDatabase, useTables } from '@/api/queries'
 import { DATABASE_STATUS, DURABILITY_LABEL, LEDGER_MODE_LABEL, LEDGER_STATE } from '@/lib/status'
 import { formatBytes, formatDateTime, formatNumber } from '@/lib/format'
+import TableOperationBadge from '@/components/tables/TableOperationBadge.vue'
+import { operationReason } from '@/lib/tables'
 import type { Table, TableClass } from '@/api/types'
 
 const props = defineProps<{ name: string }>()
@@ -84,6 +86,7 @@ const createdText = computed(() => {
 const shardingOn = computed(() => db.value?.sharding.enabled === true)
 /** Why a table cannot be converted from this list (the dialog says the rest); empty when it can. */
 function storageBlocked(t: Table): string {
+  if (t.operation) return operationReason(t.operation)
   if (t.classes.includes('distributed') || t.classes.includes('reference'))
     return 'Converting a distributed table is not available in this version.'
   if (t.partitioning) return 'Convert one partition at a time, on the page of the table.'
@@ -255,6 +258,7 @@ function storageBlocked(t: Table): string {
                     >
                       <SafeName :value="`${t.schema}.${t.name}`" :max="120" />
                     </RouterLink>
+                    <TableOperationBadge v-if="t.operation" :operation="t.operation" />
                   </th>
                   <td>
                     <span class="row" style="gap: var(--s-1)">
@@ -282,10 +286,11 @@ function storageBlocked(t: Table): string {
                         v-if="t.classes.includes('plain')"
                         op="distributeTable"
                         small
-                        :disabled="!shardingOn"
-                        :title="
-                          shardingOn ? undefined : 'Turn on sharding for this database first.'
+                        :blocked-reason="
+                          operationReason(t.operation) ||
+                          (shardingOn ? '' : 'Turn on sharding for this database first.')
                         "
+                        :data-testid="`distribute-${t.name}`"
                         @click="distributing = t"
                       >
                         Distribute table
@@ -294,6 +299,7 @@ function storageBlocked(t: Table): string {
                         v-if="!t.classes.includes('ledger')"
                         op="enableTableLedger"
                         small
+                        :blocked-reason="operationReason(t.operation)"
                         @click="ledgerFor = t"
                       >
                         Enable ledger
@@ -310,6 +316,7 @@ function storageBlocked(t: Table): string {
                       <GateButton
                         op="putPartitionPolicy"
                         small
+                        :blocked-reason="operationReason(t.operation)"
                         :data-testid="`policy-${t.name}`"
                         @click="policyFor = t"
                       >

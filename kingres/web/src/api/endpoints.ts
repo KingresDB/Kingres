@@ -255,6 +255,21 @@ export const endpoints = {
         body,
       }),
     ),
+  /** The tables linked to a plain table by foreign keys, with the column each would get (distribute with related tables, contract 0.32.0). */
+  listRelatedTables: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    distributionColumn?: string,
+  ) =>
+    j(
+      api.GET('/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/related-tables', {
+        params: {
+          path: { databaseName, schemaName, tableName },
+          query: distributionColumn ? { distributionColumn } : {},
+        },
+      }),
+    ),
   /** What a change would do, without doing it (blockers, warnings, notes, the tables it touches, an estimate). */
   previewTableChange: (
     databaseName: string,

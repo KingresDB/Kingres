@@ -108,6 +108,92 @@ function linked(rec: DbRec, t: Table): Table[] {
   }
   return out
 }
+/** The related tables that a running `table.distribute` takes along: task id to the `database/schema.table` subjects (the contract's role `related`). */
+const RELATED_OF = new Map<number, string[]>()
+const OPERATION_KINDS: Record<string, string> = {
+  'table.distribute': 'distribute',
+  'table.undistribute': 'undistribute',
+  'table.alter': 'alter',
+  'table.partition': 'partition',
+  'table.setStorage': 'convertStorage',
+  'partition.maintain': 'maintain',
+}
+
+/** The plan of listRelatedTables (contract 0.32.0): the plain tables that a foreign key links to the table, with the column each would get. */
+export function relatedPlan(rec: DbRec, t: Table, column: string | null): S['RelatedTablesPlan'] {
+  const tables: S['RelatedTable'][] = []
+  const keys: S['RelatedKey'][] = []
+  const blockers: Line[] = []
+  for (const [from, to] of FOREIGN_KEYS) {
+    const other = t.name === from ? to : t.name === to ? from : null
+    const o = other ? rec.tables.find((x) => x.name === other) : undefined
+    if (!o || !o.classes.includes('plain')) continue
+    const has = column !== null && columnDefsOf(o).some((c) => c.name === column)
+    tables.push({
+      schema: o.schema,
+      table: o.name,
+      distributionColumn: has ? column : null,
+      estimatedRows: o.estimatedRows,
+      sizeBytes: o.sizeBytes,
+    })
+    const child = t.name === from ? t : o
+    const parent = t.name === from ? o : t
+    keys.push({
+      name: `${child.name}_${parent.name}_fk`,
+      schema: child.schema,
+      table: child.name,
+      referencesSchema: parent.schema,
+      referencesTable: parent.name,
+      definition: `FOREIGN KEY (${column ?? 'id'}) REFERENCES ${parent.schema}.${parent.name}(${column ?? 'id'})`,
+    })
+    if (column !== null && !has)
+      blockers.push(
+        line(
+          'related_column_unknown',
+          name(o),
+          `The distribution column of ${name(o)} does not follow from the foreign keys; name it.`,
+        ),
+      )
+  }
+  return { tables, keys, blockers, warnings: [], colocateWith: { schema: t.schema, table: t.name } }
+}
+
+/** Table.operation of a table (contract 0.32.0): the unfinished table task that has it as its subject, or among its related tables. */
+export function operationOf(s: MockState, rec: DbRec, t: Table): S['TableOperation'] | null {
+  tickTasks(s)
+  const subject = `${rec.info.name}/${name(t)}`
+  let found: S['TableOperation'] | null = null
+  for (const r of s.tasks) {
+    const kind = OPERATION_KINDS[r.task.kind]
+    if (!kind || !['pending', 'running', 'paused'].includes(r.task.state)) continue
+    const role =
+      r.task.subject?.id === subject
+        ? 'subject'
+        : RELATED_OF.get(r.task.id)?.includes(subject)
+          ? 'related'
+          : null
+    if (!role) continue
+    const op: S['TableOperation'] = {
+      kind,
+      role,
+      source: 'task',
+      taskId: r.task.id,
+      state: r.task.state,
+      startedAt: r.task.createdAt,
+      percent: r.task.state === 'pending' ? null : r.task.progress.percent,
+      step: r.task.progress.currentStep ?? null,
+    }
+    if (role === 'subject') return op
+    found = found ?? op
+  }
+  return found
+}
+/** A table with its operation. */
+export const withOperation = (s: MockState, rec: DbRec, t: Table): Table => ({
+  ...t,
+  operation: operationOf(s, rec, t),
+})
+
 /** The tables of the colocation group of a table, itself left out. */
 function colocated(rec: DbRec, t: Table): Table[] {
   const id = t.distribution?.colocationId
@@ -358,7 +444,68 @@ export function previewChange(
           ),
         )
       views(chosen.views, 'distribute')
-      if (hasForeignKeys(rec, t))
+      if (d.relatedTables && d.relatedTables.length > 0) {
+        const plan = relatedPlan(rec, t, d.distributionColumn ?? null)
+        const named = new Set(d.relatedTables.map((r) => `${r.schema}.${r.table}`))
+        const inPlan = new Set(plan.tables.map((r) => `${r.schema}.${r.table}`))
+        for (const r of plan.tables)
+          if (!named.has(`${r.schema}.${r.table}`))
+            blockers.push(
+              line(
+                'related_table_missing',
+                `${r.schema}.${r.table}`,
+                `Table ${r.schema}.${r.table} is linked by foreign keys and must be distributed with ${name(t)}.`,
+              ),
+            )
+        for (const n of named)
+          if (!inPlan.has(n))
+            blockers.push(
+              line(
+                'related_table_unrelated',
+                n,
+                `Table ${n} is not linked to ${name(t)} by foreign keys.`,
+              ),
+            )
+        for (const r of d.relatedTables) {
+          const col =
+            r.distributionColumn ?? plan.tables.find((x) => x.table === r.table)?.distributionColumn
+          if (!col)
+            blockers.push(
+              line(
+                'related_column_unknown',
+                `${r.schema}.${r.table}`,
+                'Name the distribution column of this table.',
+              ),
+            )
+        }
+        if (chosen.mode === 'online')
+          blockers.push(
+            line(
+              'related_online',
+              name(t),
+              'Tables distributed together are copied in the blocking mode only.',
+            ),
+          )
+        for (const r of plan.tables) {
+          const other = findTable(rec, { schema: r.schema, table: r.table })
+          if (other) touched.push(affected(other, 'related'))
+        }
+        for (const k of plan.keys)
+          notes.push(
+            line(
+              'related_key',
+              k.name,
+              `Key ${k.name} of ${k.schema}.${k.table} is dropped and added again.`,
+            ),
+          )
+        warnings.push(
+          line(
+            'related_keys_not_enforced',
+            name(t),
+            'No foreign key between these tables is enforced from the moment the keys are taken out until they are added again.',
+          ),
+        )
+      } else if (hasForeignKeys(rec, t))
         blockers.push(
           line('foreign_key_linked', name(t), `${name(t)} has a foreign key to an ordinary table.`),
         )
@@ -572,6 +719,7 @@ function refuseWhenHeld(s: MockState, rec: DbRec, t: Table): void {
     const id = r.task.subject?.id ?? ''
     if (!id.startsWith(`${rec.info.name}/`)) return false
     if (id === `${rec.info.name}/${name(t)}`) return true
+    if (RELATED_OF.get(r.task.id)?.includes(`${rec.info.name}/${name(t)}`)) return true
     const other = rec.tables.find((x) => `${rec.info.name}/${name(x)}` === id)
     return group != null && other?.distribution?.colocationId === group
   })
@@ -729,19 +877,35 @@ export function startDistribute(
       },
     ])
   refuseWhenHeld(s, rec, t)
+  for (const r of b.relatedTables ?? []) {
+    const other = findTable(rec, r)
+    if (other) refuseWhenHeld(s, rec, other)
+  }
   refuseWhenBlocked(previewChange(s, rec, t, { kind: 'distribute', distribute: b }))
+  const related = (b.relatedTables ?? []).flatMap((r) => findTable(rec, r) ?? [])
   const target = b.colocateWith ? findTable(rec, b.colocateWith) : undefined
   const est = estimate(t, chosenOf(b.mode, b.dependentViews))
   const online =
     (b.mode ?? 'auto') === 'auto' ? est.modeRecommended === 'online' : b.mode === 'online'
-  const steps = [
-    'Check free space',
-    'Create shards',
-    online ? 'Copy rows (online)' : 'Copy rows',
-    'Switch over',
-    'Clean up',
-  ]
-  return startTask(
+  const steps =
+    related.length > 0
+      ? [
+          'Check the tables',
+          'Check free space',
+          'Take the foreign keys between the tables out',
+          `Distribute ${name(t)}`,
+          ...related.map((r) => `Distribute ${name(r)}`),
+          'Add the foreign keys again',
+          'Validate the foreign keys',
+        ]
+      : [
+          'Check free space',
+          'Create shards',
+          online ? 'Copy rows (online)' : 'Copy rows',
+          'Switch over',
+          'Clean up',
+        ]
+  const started = startTask(
     s,
     rec,
     t,
@@ -770,11 +934,30 @@ export function startDistribute(
           bucketCount: groupOf(rec, colocationId)?.bucketCount ?? bucketCount,
         }
         t.homeShardGroupId = null
+        for (const r of related) {
+          r.classes = r.ledger ? ['distributed', 'ledger'] : ['distributed']
+          r.distribution = {
+            method: 'hash',
+            column:
+              b.relatedTables?.find((x) => x.table === r.name)?.distributionColumn ??
+              b.distributionColumn ??
+              null,
+            colocationId,
+            bucketCount: groupOf(rec, colocationId)?.bucketCount ?? bucketCount,
+          }
+          r.homeShardGroupId = null
+        }
         recount(rec)
       }
     },
-    { cancellable: true },
+    { cancellable: related.length === 0 },
   )
+  if (related.length > 0)
+    RELATED_OF.set(
+      started.id,
+      related.map((r) => `${rec.info.name}/${name(r)}`),
+    )
+  return started
 }
 
 export function startUndistribute(
