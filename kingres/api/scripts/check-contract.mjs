@@ -388,7 +388,7 @@ const MUST_MENTION = {
   '0.18.0': ['abandonMapGroupBootstrap', 'skipped', 'mapGroup', 'additive'],
   '0.14.0': ['previewTableChange', 'undistributeTable', 'alterTableDistribution', 'createTablePartition', 'table_not_eligible', 'dependentViews', 'additive'],
   '0.16.0': ['previewConfigChange', 'warnings', 'config_value_unusual', 'config_reserved_connections', 'additive'],
-  '0.22.0': ['failoverServer', 'unsupported_operation', 'additive'],
+  '0.22.0': ['failoverServer', 'unsupported_operation', 'lostServerId', 'additive'],
   '0.19.0': ['exportTable', 'importTable', 'createDataUpload', 'uploadDataChunk', 'downloadDataExport', 'x-streams', 'dataTransfer', 'data_transfer_disabled', 'import_outcome_unknown', 'Upload-Offset', 'additive'],
   '0.12.0': ['completedWithWarnings', 'failover_needs_decision', 'plan', 'notScheduled', 'additive'],
   '0.9.0': ['startRebalance', 'previewRebalancePlan', 'nothing_to_rebalance', 'cluster_inconsistent', 'skipped', 'ledgerSummary', 'Prefer', 'additive'],

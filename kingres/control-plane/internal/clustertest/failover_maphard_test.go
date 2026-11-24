@@ -136,10 +136,13 @@ func mapAckedExcept(t *testing.T, c *clustertest.Cluster, port int, pool *x509.C
 func TestHardFailoverOfTheMapGroupWhileItsServerIsAlive(t *testing.T) {
 	c, port, pool, leader, nw, w := mapSwitchoverEnv(t)
 	sampler := startMapSampler(c)
-	probe := startWriteProbe(t, mapProbeTargets(t, leader, nw))
+	targets := mapProbeTargets(t, leader, nw)
+	probe := startWriteProbe(t, targets)
 	id := mapHardRequest(t, leader, nw, true)
 	mapHardDone(t, leader, nw, id)
-	checkProbe(t, probe(), leader, nw)
+	ps := probe()
+	checkProbe(t, ps, leader, nw)
+	checkSwitchPoint(t, ps, leader, targets[1])
 	mapHardAfter(t, c, port, pool, leader, nw, w, id)
 	sampler.Stop(t)
 }
@@ -149,14 +152,17 @@ func TestHardFailoverOfTheMapGroupWhileItsServerIsAlive(t *testing.T) {
 func TestHardFailoverOfTheMapGroupWhoseOldPrimaryDoesNotStop(t *testing.T) {
 	c, port, pool, leader, nw, w := mapSwitchoverEnv(t)
 	sampler := startMapSampler(c)
-	probe := startWriteProbe(t, mapProbeTargets(t, leader, nw))
+	targets := mapProbeTargets(t, leader, nw)
+	probe := startWriteProbe(t, targets)
 	leader.SetFaults(fault.Spec{FailoverPoint: "demote:nostop", FailoverMode: "skip"})
 	id := mapHardRequest(t, leader, nw, true)
 	mapHardDone(t, leader, nw, id)
 	if !strings.Contains(leader.LogTail(400000), "the old primary is not stopped (test fault demote:nostop)") {
 		t.Errorf("the fault did not take effect: the old primary was stopped by the fence")
 	}
-	checkProbe(t, probe(), leader, nw)
+	ps := probe()
+	checkProbe(t, ps, leader, nw)
+	checkSwitchPoint(t, ps, leader, targets[1])
 	mapHardAfter(t, c, port, pool, leader, nw, w, id)
 	sampler.Stop(t)
 }
@@ -344,6 +350,9 @@ func (s *mapSampler) Stop(t *testing.T) {
 type writeProbe struct {
 	first, last time.Time
 	n           int
+	// ackLsn is the highest position of a transactional WAL message that the instance acknowledged to the probe (pg_logical_emit_message in its own transaction, which
+	// the instance has committed when the statement answers): every commit acknowledged to a client up to it must be in the history of the new primary.
+	ackLsn uint64
 }
 
 // probeTarget is the instance of the map group on one server: the port of the primary of the map group on the leader's server, and the port of its standby (from the catalog)
@@ -405,8 +414,8 @@ func startWriteProbe(t *testing.T, targets []probeTarget) (stop func() []writePr
 						continue
 					}
 				}
-				var x int64
-				if err := c.QueryRow(ctx, `SELECT txid_current()`).Scan(&x); err != nil {
+				var lsn string
+				if err := c.QueryRow(ctx, `SELECT pg_logical_emit_message(true, 'p5probe', 'x')::text`).Scan(&lsn); err != nil {
 					if c.IsClosed() {
 						c = nil
 					}
@@ -420,6 +429,9 @@ func startWriteProbe(t *testing.T, targets []probeTarget) (stop func() []writePr
 					out[i].first = now
 				}
 				out[i].last, out[i].n = now, out[i].n+1
+				if v, ok := failover.ParseLSN(lsn); ok && v > out[i].ackLsn {
+					out[i].ackLsn = v
+				}
 				mu.Unlock()
 			}
 		}(i, n, strings.TrimSpace(string(pw)))
@@ -444,5 +456,44 @@ func checkProbe(t *testing.T, ps []writeProbe, old, nw *clustertest.Node) {
 	}
 	if !o.last.Before(n.first) {
 		t.Errorf("two writable primaries: the old one accepted a write at %s, the new one at %s", o.last.Format("15:04:05.000"), n.first.Format("15:04:05.000"))
+	}
+}
+
+// checkSwitchPoint asserts that the new timeline began at or after the highest position that the old primary acknowledged to the probe before the fence: the switch point is
+// the position in the last timeline history file of the new primary (read as the service role).
+func checkSwitchPoint(t *testing.T, ps []writeProbe, leader *clustertest.Node, target probeTarget) {
+	t.Helper()
+	pw, err := os.ReadFile(filepath.Join(leader.DataDir, "service-credentials"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	c, err := target.node.PGAt(ctx, target.port, "kingresd", strings.TrimSpace(string(pw)), "kingres_system")
+	if err != nil {
+		t.Fatalf("connecting to the new primary: %v", err)
+	}
+	defer func() { _ = c.Close(context.Background()) }()
+	var name, hist string
+	if err := c.QueryRow(ctx, `SELECT name FROM pg_ls_waldir() WHERE name LIKE '%.history' ORDER BY name DESC LIMIT 1`).Scan(&name); err != nil {
+		t.Fatalf("the timeline history file of the new primary: %v", err)
+	}
+	if err := c.QueryRow(ctx, `SELECT pg_read_file('pg_wal/' || $1)`, name).Scan(&hist); err != nil {
+		t.Fatalf("reading %s: %v", name, err)
+	}
+	var switchLsn uint64
+	for _, l := range strings.Split(strings.TrimSpace(hist), "\n") {
+		if f := strings.Fields(l); len(f) >= 2 {
+			if v, ok := failover.ParseLSN(f[1]); ok {
+				switchLsn = v
+			}
+		}
+	}
+	t.Logf("the old primary acknowledged WAL messages up to %s; the new timeline (%s) began at %s", failover.FormatLSN(ps[0].ackLsn), name, failover.FormatLSN(switchLsn))
+	if ps[0].ackLsn == 0 || switchLsn == 0 {
+		t.Fatalf("nothing to compare: acknowledged %d, switch point %d (history %q)", ps[0].ackLsn, switchLsn, hist)
+	}
+	if switchLsn < ps[0].ackLsn {
+		t.Errorf("an acknowledged commit is not in the new history: the old primary acknowledged up to %s and the new timeline began at %s", failover.FormatLSN(ps[0].ackLsn), failover.FormatLSN(switchLsn))
 	}
 }

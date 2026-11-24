@@ -374,7 +374,8 @@ None.
 
 #### Additive
 
-None. A request that was answered 422 `unsupported_operation` (mode `hard` for the server that runs the primary of the map group, sent to the leader while it answers) is accepted and answered 202 like any failover.
+- `AbandonMapGroupBootstrapRequest.lostServerId` (optional): the operator declares the server the map group was handed to lost, so that the old leader ends its hold without its word (`abandonMapGroupBootstrap`, audited, `kingres_admin`).
+- A request that was answered 422 `unsupported_operation` (mode `hard` for the server that runs the primary of the map group, sent to the leader while it answers) is accepted and answered 202 like any failover.
 
 #### Documentation
 
